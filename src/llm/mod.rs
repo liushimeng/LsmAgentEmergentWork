@@ -169,6 +169,9 @@ pub trait LlmClient: Send + Sync {
         tools: &[ToolDef],
         meta: &RequestMeta,
     ) -> Result<Completion>;
+
+    /// 当前客户端使用的协议(用于系统提示词按协议渲染)。
+    fn protocol(&self) -> Protocol;
 }
 
 /// 根据数据库记录创建对应协议的用户端(注入 User-Agent)。

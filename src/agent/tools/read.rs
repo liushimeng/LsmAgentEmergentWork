@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::agent::tools::Tool;
 use crate::error::{AgentError, Result};
-use crate::tool::Tool;
 
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LIMIT: usize = 4000;
@@ -87,7 +87,12 @@ impl Tool for ReadTool {
         for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
             let line_num = start_idx + i + 1;
             let display = if line.len() > 4000 {
-                format!("{}...[截断]", &line[..line.char_indices().nth(4000).map(|(n, _)| n).unwrap_or(line.len())])
+                let cut = line
+                    .char_indices()
+                    .nth(4000)
+                    .map(|(n, _)| n)
+                    .unwrap_or(line.len());
+                format!("{}...[截断]", &line[..cut])
             } else {
                 line.trim_end_matches('\n').to_string()
             };

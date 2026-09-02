@@ -440,9 +440,8 @@ fn build_agent_with_active(db: &Arc<Mutex<Db>>) -> Result<Agent> {
     match db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
         Some(r) => build_agent_with_record(&r, &user_agent),
         None => {
-            let system = profile.system_prompt
-                + "\n[系统] 当前尚未配置大模型接入记录。请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置后再开始对话。";
-            let profile = AgentProfile::new(&profile.name, system);
+            let warn_tail = "\n[系统] 当前尚未配置大模型接入记录。请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置后再开始对话。";
+            let profile = profile.with_env_tail(warn_tail);
             Ok(Agent::new(Arc::new(NoopLlm), profile))
         }
     }
@@ -471,6 +470,11 @@ impl crate::llm::LlmClient for NoopLlm {
             usage: Default::default(),
             stop_reason: None,
         })
+    }
+
+    /// 占位客户端默认返回 Anthropic(仅影响系统提示词渲染,不会实际发起请求)。
+    fn protocol(&self) -> crate::config::Protocol {
+        crate::config::Protocol::Anthropic
     }
 }
 

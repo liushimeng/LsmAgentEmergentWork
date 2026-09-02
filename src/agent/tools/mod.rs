@@ -1,4 +1,7 @@
 //! 工具抽象与注册表。
+//!
+//! 定义 [`Tool`] trait、[`ToolRegistry`] 注册表,以及内置 Bash / Read / Write
+//! 工具的注册入口 [`builtin_registry`]。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,18 +78,4 @@ pub fn builtin_registry() -> ToolRegistry {
         .register(Arc::new(bash::BashTool))
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(write::WriteTool))
-}
-
-/// 给模型看的统一系统说明(描述当前可用的工具)
-pub fn builtin_system_prompt() -> String {
-    String::from(
-        "你是一个基于工具调用的 Agent。可使用工具完成任务,完成后用一段简洁中文回答用户。\n\
-         工具调用规范:\n\
-         - 仅在必要时调用工具;能用更专用工具(如 Read/Write)完成的事不要退化为 Bash。\n\
-         - 工具参数需严格遵守给定 JSON Schema。\n\
-         - 并行无依赖的工具调用请一次性发出。\n\n可用工具:\n\
-         - Bash(command, timeout_ms?, description?): 在工作目录下执行 bash 命令并返回 stdout/stderr/退出码。\n\
-         - Read(file_path, offset?, limit?): 读取文本文件,带行号。offset/limit 用于分页。\n\
-         - Write(file_path, content): 覆盖写入(或新建)文件,自动创建父目录。\n",
-    )
 }

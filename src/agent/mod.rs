@@ -1,6 +1,8 @@
 //! Agent 核心循环:协议无关的 LLM 规划 -> 工具执行 -> 观察。
 
 pub mod profile;
+pub mod system_prompt;
+pub mod tools;
 
 use std::sync::Arc;
 
@@ -60,9 +62,11 @@ impl Agent {
 
         for iter in 0..self.max_iterations {
             info!(iteration = iter, "agent step");
+            // 按当前 LLM 协议渲染系统提示词(支持多协议差异化)
+            let system = self.profile.system_prompt.render(self.llm.protocol());
             let completion: Completion = self
                 .llm
-                .complete(&self.profile.system_prompt, session.context(), &tool_defs, &meta)
+                .complete(&system, session.context(), &tool_defs, &meta)
                 .await?;
 
             // 累计 usage

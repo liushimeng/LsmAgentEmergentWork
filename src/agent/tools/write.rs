@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::agent::tools::Tool;
 use crate::error::{AgentError, Result};
-use crate::tool::Tool;
 
 pub struct WriteTool;
 

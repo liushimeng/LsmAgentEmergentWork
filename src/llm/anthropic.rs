@@ -12,6 +12,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::config::Protocol;
 use crate::error::{AgentError, Result};
 use crate::llm::sse::{DeltaEvent, ParseSink, SseStream};
 use crate::llm::{
@@ -300,6 +301,10 @@ impl LlmClient for AnthropicClient {
             parser.feed(&ev, &mut sink)?;
         }
         sink.finish()
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::Anthropic
     }
 }
 

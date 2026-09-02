@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+use crate::agent::tools::Tool;
 use crate::error::{AgentError, Result};
-use crate::tool::Tool;
 
 /// 默认超时与上限
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;

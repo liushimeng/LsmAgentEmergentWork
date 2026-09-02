@@ -15,6 +15,7 @@ use reqwest::header::{ACCEPT, HeaderValue};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::config::Protocol;
 use crate::error::{AgentError, Result};
 use crate::llm::sse::{DeltaEvent, ParseSink, SseEvent, SseStream};
 use crate::llm::{
@@ -359,6 +360,10 @@ impl LlmClient for OpenAiClient {
         }
         parser.finish_into(&mut sink)?;
         sink.finish()
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::OpenAi
     }
 }
 

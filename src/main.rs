@@ -138,17 +138,16 @@ async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
     let profile = AgentProfile::default_profile();
     let user_agent = profile.user_agent();
     let llm = client_from_record(&active, &user_agent).map_err(anyhow::Error::from)?;
-    let mut system = profile.system_prompt.clone();
-    system.push_str(&format!(
+    // 在默认系统提示词基础上追加环境上下文(根目录 / 工作目录 / 当前模型)
+    let env_tail = format!(
         "\n[环境] 根目录: {}  工作目录: {}  当前模型: [{:}] {}/{}",
         paths.root_dir.display(),
         paths.work_dir.display(),
         active.protocol.as_str(),
         active.provider_name,
         active.model_name
-    ));
-    // 用带环境上下文的系统提示词构造临时 profile
-    let profile = AgentProfile::new(&profile.name, system);
+    );
+    let profile = profile.with_env_tail(&env_tail);
 
     let agent = Agent::new(llm, profile).with_max_iterations(max_iterations);
     eprintln!("[laew] 单轮模式: protocol={} provider={} model={}",
