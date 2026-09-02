@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::agent::profile::AgentProfile;
 use crate::error::{AgentError, Result};
-use crate::llm::{ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta};
+use crate::llm::{ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta, Usage};
 use crate::session::Session;
 
 const DEFAULT_MAX_ITERATIONS: usize = 16;
@@ -41,17 +41,22 @@ impl Agent {
     pub fn profile(&self) -> &AgentProfile { &self.profile }
     pub fn max_iterations(&self) -> usize { self.max_iterations }
 
-    /// 单轮任务:传入用户提示,返回最终文本(内部构造临时 Session)。
-    pub async fn run_once(&self, user_input: &str) -> Result<String> {
+    /// 单轮任务:传入用户提示,返回最终文本与本次累计 token 用量。
+    pub async fn run_once(&self, user_input: &str) -> Result<(String, Usage)> {
         let mut session = Session::new();
         session.context_mut().push(ChatMessage::user(user_input));
         self.run_session(&mut session).await
     }
 
     /// 复用 Session 上下文的对话循环(用于 TUI 多轮对话)。
-    pub async fn run_session(&self, session: &mut Session) -> Result<String> {
+    ///
+    /// 返回 `(最终回复文本, 本次循环累计 token 用量)`。后者包含所有 LLM 调用的
+    /// input/output tokens 之和(由 LlmClient 在 SSE 流中收集)。
+    pub async fn run_session(&self, session: &mut Session) -> Result<(String, Usage)> {
         let tool_defs = self.profile.tools.defs();
         let meta: RequestMeta = session.meta();
+        let mut total_usage = Usage::default();
+        let final_text;
 
         for iter in 0..self.max_iterations {
             info!(iteration = iter, "agent step");
@@ -60,6 +65,14 @@ impl Agent {
                 .complete(&self.profile.system_prompt, session.context(), &tool_defs, &meta)
                 .await?;
 
+            // 累计 usage
+            total_usage.input_tokens = total_usage.input_tokens.saturating_add(completion.usage.input_tokens);
+            total_usage.output_tokens = total_usage.output_tokens.saturating_add(completion.usage.output_tokens);
+            total_usage.cache_read_input_tokens =
+                total_usage.cache_read_input_tokens.saturating_add(completion.usage.cache_read_input_tokens);
+            total_usage.cache_creation_input_tokens =
+                total_usage.cache_creation_input_tokens.saturating_add(completion.usage.cache_creation_input_tokens);
+
             if !completion.has_tool_calls() {
                 info!("agent finished with text answer");
                 if !completion.text.trim().is_empty() {
@@ -67,7 +80,8 @@ impl Agent {
                         completion.text.clone(),
                     )]));
                 }
-                return Ok(completion.text);
+                final_text = completion.text;
+                return Ok((final_text, total_usage));
             }
 
             // 记录 assistant 的工具调用请求(同时附带文本,如果有)

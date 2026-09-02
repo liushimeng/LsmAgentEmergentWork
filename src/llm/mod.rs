@@ -15,6 +15,7 @@ use crate::error::{AgentError, Result};
 
 pub mod anthropic;
 pub mod openai;
+pub mod sse;
 
 /// 请求元数据:会话 / 设备标识,由协议层写入 HTTP 头与请求体。
 #[derive(Debug, Clone)]
@@ -125,12 +126,29 @@ impl ToolDef {
 pub struct Completion {
     pub text: String,
     pub tool_calls: Vec<ToolCallReq>,
+    /// Token 用量(由 SSE 流中的 message_start / message_delta / 尾部 usage chunk 汇总)。
+    pub usage: Usage,
+    /// 终止原因(Anthropic stop_reason / OpenAI finish_reason),可选。
+    pub stop_reason: Option<String>,
 }
 
 impl Completion {
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
     }
+}
+
+/// Token 用量统计。所有字段为 0 表示上游未提供。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    /// 输入侧 token 数(Anthropic input_tokens / OpenAI prompt_tokens)。
+    pub input_tokens: u32,
+    /// 输出侧 token 数(Anthropic output_tokens / OpenAI completion_tokens)。
+    pub output_tokens: u32,
+    /// Anthropic cache_read_input_tokens / OpenAI prompt_tokens_details.cached_tokens。
+    pub cache_read_input_tokens: u32,
+    /// Anthropic cache_creation_input_tokens(可选,OpenAI 不发)。
+    pub cache_creation_input_tokens: u32,
 }
 
 /// 一次工具调用请求(协议无关)

@@ -131,7 +131,7 @@ impl TuiSession {
         // 普通提示词
         self.session.context_mut().push(ChatMessage::user(line));
         match self.agent.run_session(&mut self.session).await {
-            Ok(text) => {
+            Ok((text, usage)) => {
                 if !text.is_empty() {
                     println!();
                     println!("  [assistant]");
@@ -141,6 +141,17 @@ impl TuiSession {
                     println!();
                 } else {
                     println!("  (模型未返回文本)");
+                }
+                if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                    let cache = if usage.cache_read_input_tokens > 0 {
+                        format!("  cache_read={}", usage.cache_read_input_tokens)
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "  本次用量: input={}  output={}{}",
+                        usage.input_tokens, usage.output_tokens, cache
+                    );
                 }
             }
             Err(e) => {
@@ -457,6 +468,8 @@ impl crate::llm::LlmClient for NoopLlm {
         Ok(crate::llm::Completion {
             text: "尚未配置大模型接入记录, 请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置。".to_string(),
             tool_calls: vec![],
+            usage: Default::default(),
+            stop_reason: None,
         })
     }
 }

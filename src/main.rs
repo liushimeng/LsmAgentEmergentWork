@@ -156,8 +156,20 @@ async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
     // -p 单轮模式每次生成独立 Session
     let mut session = Session::new();
     session.context_mut().push(lsm_agent::llm::ChatMessage::user(prompt));
-    let answer = agent.run_session(&mut session).await.map_err(anyhow::Error::from)?;
+    let (answer, usage) = agent.run_session(&mut session).await.map_err(anyhow::Error::from)?;
     println!("{answer}");
+    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+        eprintln!(
+            "[laew] 用量: input={}  output={}{}",
+            usage.input_tokens,
+            usage.output_tokens,
+            if usage.cache_read_input_tokens > 0 {
+                format!("  cache_read={}", usage.cache_read_input_tokens)
+            } else {
+                String::new()
+            }
+        );
+    }
     Ok(())
 }
 
