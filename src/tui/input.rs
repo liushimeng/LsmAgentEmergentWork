@@ -220,10 +220,9 @@ impl InputHandler {
     }
 
     /// 接受补全：用替换文本替换当前输入。
+    /// `replacement` 已包含 `/` 前缀与尾随空格,直接写入缓冲区即可。
     fn accept_completion(&self, stdout: &mut impl Write, buffer: &mut String, cursor: &mut usize, prompt_width: u16, replacement: &str) -> io::Result<()> {
         *buffer = replacement.to_string();
-        // 追加一个空格，方便用户继续输入参数
-        buffer.push(' ');
         *cursor = buffer.len();
         self.redraw_line(stdout, ">> ", buffer, *cursor, prompt_width)
     }
