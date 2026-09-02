@@ -6,12 +6,12 @@
 //! - 消息 content: `text` / `tool_use` / `tool_result`
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::error::{AgentError, Result};
-use crate::llm::{normalize_endpoint, ChatMessage, Completion, ContentBlock, LlmClient, ToolCallReq, ToolDef};
+use crate::llm::{build_common_headers, normalize_endpoint, ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta, ToolCallReq, ToolDef};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
@@ -21,29 +21,50 @@ pub struct AnthropicClient {
     url: String,
     api_key: String,
     model: String,
+    user_agent: String,
 }
 
 impl AnthropicClient {
-    pub fn new(end_point: &str, api_key: &str, model: &str) -> Result<Self> {
+    pub fn new(end_point: &str, api_key: &str, model: &str, user_agent: &str) -> Result<Self> {
         let url = format!("{}/v1/messages", normalize_endpoint(end_point));
         Ok(Self {
             http: reqwest::Client::new(),
             url,
             api_key: api_key.to_string(),
             model: model.to_string(),
+            user_agent: user_agent.to_string(),
         })
     }
 }
 
 #[derive(Serialize)]
-struct AnthropicRequest<'a> {
-    model: &'a str,
+struct AnthropicRequest {
+    model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<String>,
     messages: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
+    /// Anthropic 会话/设备标识(metadata.user_id)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Metadata>,
+}
+
+#[derive(Serialize)]
+struct Metadata {
+    /// JSON 字符串,形如: {"device_id":"...","account_uuid":"","session_id":"..."}
+    user_id: String,
+}
+
+/// 构造 metadata.user_id 的 JSON 字符串。
+fn build_user_id(device_id: &str, session_id: &str) -> String {
+    json!({
+        "device_id": device_id,
+        "account_uuid": "",
+        "session_id": session_id,
+    })
+    .to_string()
 }
 
 fn convert_messages(messages: &[ChatMessage]) -> Vec<Value> {
@@ -104,17 +125,22 @@ impl LlmClient for AnthropicClient {
         system: &str,
         messages: &[ChatMessage],
         tools: &[ToolDef],
+        meta: &RequestMeta,
     ) -> Result<Completion> {
         let req = AnthropicRequest {
-            model: &self.model,
+            model: self.model.clone(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            system: if system.trim().is_empty() { None } else { Some(system) },
+            system: if system.trim().is_empty() { None } else { Some(system.to_string()) },
             messages: convert_messages(messages),
             tools: convert_tools(tools),
+            metadata: Some(Metadata {
+                user_id: build_user_id(&meta.device_id, &meta.session_id),
+            }),
         };
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // 通用头:Content-Type / User-Agent / Authorization / X-Session-Id
+        let mut headers = build_common_headers(&self.api_key, meta, &self.user_agent)?;
+        // Anthropic 专属头:x-api-key + anthropic-version(保留官方 SDK 风格)
         headers.insert(
             HeaderName::from_static("x-api-key"),
             HeaderValue::from_str(&self.api_key)
@@ -178,13 +204,13 @@ mod tests {
 
     #[test]
     fn url_appends_v1_messages() {
-        let c = AnthropicClient::new("https://api.example.com/", "k", "m").unwrap();
+        let c = AnthropicClient::new("https://api.example.com/", "k", "m", "ua").unwrap();
         assert_eq!(c.url, "https://api.example.com/v1/messages");
     }
 
     #[test]
     fn url_trims_trailing_slash() {
-        let c = AnthropicClient::new("https://api.example.com", "k", "m").unwrap();
+        let c = AnthropicClient::new("https://api.example.com", "k", "m", "ua").unwrap();
         assert_eq!(c.url, "https://api.example.com/v1/messages");
     }
 
@@ -237,14 +263,37 @@ mod tests {
     fn request_skips_empty_system() {
         // 确认 system 字段在 system 为空时被跳过
         let req = AnthropicRequest {
-            model: "m",
+            model: "m".into(),
             max_tokens: 1,
             system: None,
             messages: vec![],
             tools: vec![],
+            metadata: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("system"));
+    }
+
+    #[test]
+    fn request_metadata_user_id_is_json_string() {
+        let req = AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 1,
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            metadata: Some(Metadata {
+                user_id: build_user_id("dev1234567890", "sess-1"),
+            }),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        // metadata.user_id 应为 JSON 字符串
+        let v: Value = serde_json::from_str(&s).unwrap();
+        let uid = v["metadata"]["user_id"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(uid).unwrap();
+        assert_eq!(parsed["device_id"], "dev1234567890");
+        assert_eq!(parsed["session_id"], "sess-1");
+        assert_eq!(parsed["account_uuid"], "");
     }
 
     #[test]

@@ -6,14 +6,44 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Protocol, ProviderRecord};
-use crate::error::Result;
+use crate::error::{AgentError, Result};
 
 pub mod anthropic;
 pub mod openai;
+
+/// 请求元数据:会话 / 设备标识,由协议层写入 HTTP 头与请求体。
+#[derive(Debug, Clone)]
+pub struct RequestMeta {
+    pub session_id: String,
+    pub device_id: String,
+}
+
+/// 构造两协议通用的请求头:`Content-Type` / `User-Agent` / `Authorization` / `X-Session-Id`。
+pub fn build_common_headers(api_key: &str, meta: &RequestMeta, user_agent: &str) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        HeaderName::from_static("user-agent"),
+        HeaderValue::from_str(user_agent)
+            .map_err(|e| AgentError::Llm(format!("User-Agent header 非法: {e}")))?,
+    );
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|e| AgentError::Llm(format!("Authorization header 非法: {e}")))?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-session-id"),
+        HeaderValue::from_str(&meta.session_id)
+            .map_err(|e| AgentError::Llm(format!("X-Session-Id header 非法: {e}")))?,
+    );
+    Ok(headers)
+}
 
 /// 对话角色
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,17 +149,19 @@ pub trait LlmClient: Send + Sync {
         system: &str,
         messages: &[ChatMessage],
         tools: &[ToolDef],
+        meta: &RequestMeta,
     ) -> Result<Completion>;
 }
 
-/// 根据数据库记录创建对应协议的客户端
-pub fn client_from_record(record: &ProviderRecord) -> Result<Arc<dyn LlmClient>> {
+/// 根据数据库记录创建对应协议的用户端(注入 User-Agent)。
+pub fn client_from_record(record: &ProviderRecord, user_agent: &str) -> Result<Arc<dyn LlmClient>> {
     match record.protocol {
         Protocol::Anthropic => {
             let c = anthropic::AnthropicClient::new(
                 &record.end_point,
                 &record.api_key,
                 &record.model_name,
+                user_agent,
             )?;
             Ok(Arc::new(c))
         }
@@ -138,6 +170,7 @@ pub fn client_from_record(record: &ProviderRecord) -> Result<Arc<dyn LlmClient>>
                 &record.end_point,
                 &record.api_key,
                 &record.model_name,
+                user_agent,
             )?;
             Ok(Arc::new(c))
         }
@@ -147,4 +180,30 @@ pub fn client_from_record(record: &ProviderRecord) -> Result<Arc<dyn LlmClient>>
 /// 规整 end_point:去除尾部 `/`
 pub fn normalize_endpoint(ep: &str) -> String {
     ep.trim().trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_common_headers_contains_all() {
+        let meta = RequestMeta {
+            session_id: "20260902-153012-abcd1234-1700000000000-1a2b3c".into(),
+            device_id: "45d277355416ee1b2f42758fb292b60b45170a57a5b4dec5cb7fa1a40fdd17ec".into(),
+        };
+        let headers = build_common_headers("sk-xxx", &meta, "LsmAgentEmergentWork/0.1.0 2026-09-02 15:30:12 CST").unwrap();
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
+        let ua = headers
+            .get("user-agent")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ua, "LsmAgentEmergentWork/0.1.0 2026-09-02 15:30:12 CST");
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer sk-xxx");
+        assert_eq!(
+            headers.get("x-session-id").unwrap(),
+            "20260902-153012-abcd1234-1700000000000-1a2b3c"
+        );
+    }
 }

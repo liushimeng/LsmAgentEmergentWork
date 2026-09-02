@@ -49,8 +49,14 @@ impl CompletionEngine {
             SlashCommand {
                 name: "clear",
                 aliases: &["c"],
-                description: "清空当前对话历史",
+                description: "清空对话历史并开启新会话",
                 usage: "/clear",
+            },
+            SlashCommand {
+                name: "new",
+                aliases: &["n"],
+                description: "开启新会话(同 /clear)",
+                usage: "/new",
             },
             SlashCommand {
                 name: "model",

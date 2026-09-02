@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use lsm_agent::agent::Agent;
+use lsm_agent::agent::{profile::AgentProfile, Agent};
 use lsm_agent::config::{Db, Paths, Protocol};
 use lsm_agent::llm::client_from_record;
-use lsm_agent::tool::{builtin_registry, builtin_system_prompt};
+use lsm_agent::session::Session;
 
 const VERSION_INFO: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -135,9 +135,10 @@ async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
         .get_active()
         .map_err(anyhow::Error::from)?
         .ok_or_else(|| anyhow::anyhow!("尚未配置当前模型,请先执行 `laew provider add` 添加接入记录。"))?;
-    let llm = client_from_record(&active).map_err(anyhow::Error::from)?;
-    let tools = builtin_registry();
-    let mut system = builtin_system_prompt();
+    let profile = AgentProfile::default_profile();
+    let user_agent = profile.user_agent();
+    let llm = client_from_record(&active, &user_agent).map_err(anyhow::Error::from)?;
+    let mut system = profile.system_prompt.clone();
     system.push_str(&format!(
         "\n[环境] 根目录: {}  工作目录: {}  当前模型: [{:}] {}/{}",
         paths.root_dir.display(),
@@ -146,11 +147,16 @@ async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
         active.provider_name,
         active.model_name
     ));
+    // 用带环境上下文的系统提示词构造临时 profile
+    let profile = AgentProfile::new(&profile.name, system);
 
-    let agent = Agent::new(llm, tools, system).with_max_iterations(max_iterations);
+    let agent = Agent::new(llm, profile).with_max_iterations(max_iterations);
     eprintln!("[laew] 单轮模式: protocol={} provider={} model={}",
         active.protocol.as_str(), active.provider_name, active.model_name);
-    let answer = agent.run_once(&prompt).await.map_err(anyhow::Error::from)?;
+    // -p 单轮模式每次生成独立 Session
+    let mut session = Session::new();
+    session.context_mut().push(lsm_agent::llm::ChatMessage::user(prompt));
+    let answer = agent.run_session(&mut session).await.map_err(anyhow::Error::from)?;
     println!("{answer}");
     Ok(())
 }

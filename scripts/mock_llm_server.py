@@ -30,8 +30,19 @@ class Handler(BaseHTTPRequestHandler):
         key = "oai" if "chat/completions" in self.path else "anth"
         n = STATE.get(key, 0) + 1
         STATE[key] = n
+        # 记录关键请求头(User-Agent / Authorization / X-Session-Id / x-api-key / anthropic-version)
+        headers = {
+            "user-agent": self.headers.get("User-Agent", ""),
+            "authorization": self.headers.get("Authorization", ""),
+            "x-session-id": self.headers.get("X-Session-Id", ""),
+            "x-api-key": self.headers.get("x-api-key", ""),
+            "anthropic-version": self.headers.get("anthropic-version", ""),
+        }
         with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"path": self.path, "call_no": n, "body": body}, ensure_ascii=False) + "\n")
+            f.write(json.dumps(
+                {"path": self.path, "call_no": n, "headers": headers, "body": body},
+                ensure_ascii=False,
+            ) + "\n")
 
         if key == "oai":
             if n == 1:

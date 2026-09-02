@@ -1,29 +1,33 @@
 //! Agent 核心循环:协议无关的 LLM 规划 -> 工具执行 -> 观察。
 
+pub mod profile;
+
 use std::sync::Arc;
 
 use tracing::{info, warn};
 
+use crate::agent::profile::AgentProfile;
 use crate::error::{AgentError, Result};
-use crate::llm::{ChatMessage, Completion, ContentBlock, LlmClient};
-use crate::tool::ToolRegistry;
+use crate::llm::{ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta};
+use crate::session::Session;
 
 const DEFAULT_MAX_ITERATIONS: usize = 16;
 
-/// 一个可运行的 Agent 实例
+/// 一个可运行的 Agent 实例。
+///
+/// 持有 [`AgentProfile`](profile::AgentProfile)(名称 / 系统提示词 / 工具集),
+/// 为后续多 Agent 切换预留扩展口。
 pub struct Agent {
     llm: Arc<dyn LlmClient>,
-    tools: ToolRegistry,
-    system_prompt: String,
+    profile: AgentProfile,
     max_iterations: usize,
 }
 
 impl Agent {
-    pub fn new(llm: Arc<dyn LlmClient>, tools: ToolRegistry, system_prompt: impl Into<String>) -> Self {
+    pub fn new(llm: Arc<dyn LlmClient>, profile: AgentProfile) -> Self {
         Self {
             llm,
-            tools,
-            system_prompt: system_prompt.into(),
+            profile,
             max_iterations: DEFAULT_MAX_ITERATIONS,
         }
     }
@@ -34,31 +38,32 @@ impl Agent {
     }
 
     pub fn llm(&self) -> Arc<dyn LlmClient> { self.llm.clone() }
-    pub fn tools(&self) -> &ToolRegistry { &self.tools }
-    pub fn system_prompt(&self) -> &str { &self.system_prompt }
+    pub fn profile(&self) -> &AgentProfile { &self.profile }
     pub fn max_iterations(&self) -> usize { self.max_iterations }
 
-    /// 单轮任务:传入用户提示,返回最终文本
+    /// 单轮任务:传入用户提示,返回最终文本(内部构造临时 Session)。
     pub async fn run_once(&self, user_input: &str) -> Result<String> {
-        let mut history = vec![ChatMessage::user(user_input)];
-        self.run_with_history(&mut history).await
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user(user_input));
+        self.run_session(&mut session).await
     }
 
-    /// 复用历史上下文的对话循环(用于 TUI 多轮对话)
-    pub async fn run_with_history(&self, history: &mut Vec<ChatMessage>) -> Result<String> {
-        let tool_defs = self.tools.defs();
+    /// 复用 Session 上下文的对话循环(用于 TUI 多轮对话)。
+    pub async fn run_session(&self, session: &mut Session) -> Result<String> {
+        let tool_defs = self.profile.tools.defs();
+        let meta: RequestMeta = session.meta();
 
         for iter in 0..self.max_iterations {
             info!(iteration = iter, "agent step");
             let completion: Completion = self
                 .llm
-                .complete(&self.system_prompt, history, &tool_defs)
+                .complete(&self.profile.system_prompt, session.context(), &tool_defs, &meta)
                 .await?;
 
             if !completion.has_tool_calls() {
                 info!("agent finished with text answer");
                 if !completion.text.trim().is_empty() {
-                    history.push(ChatMessage::assistant(vec![ContentBlock::text(
+                    session.context_mut().push(ChatMessage::assistant(vec![ContentBlock::text(
                         completion.text.clone(),
                     )]));
                 }
@@ -77,7 +82,7 @@ impl Agent {
                     input: call.arguments.clone(),
                 });
             }
-            history.push(ChatMessage::assistant(assistant_blocks));
+            session.context_mut().push(ChatMessage::assistant(assistant_blocks));
 
             // 逐个执行工具并把结果回填上下文(失败也作为 tool_result,is_error=true)
             for call in completion.tool_calls {
@@ -86,7 +91,7 @@ impl Agent {
                 let args = call.arguments;
                 info!(tool = %name, "executing tool");
 
-                let (output, is_error) = match self.tools.get(&name) {
+                let (output, is_error) = match self.profile.tools.get(&name) {
                     Ok(tool) => match tool.execute(args).await {
                         Ok(out) => (out, false),
                         Err(e) => {
@@ -99,7 +104,7 @@ impl Agent {
                     },
                     Err(e) => (format!("{e}"), true),
                 };
-                history.push(ChatMessage::tool_result(id, output, is_error));
+                session.context_mut().push(ChatMessage::tool_result(id, output, is_error));
             }
         }
 

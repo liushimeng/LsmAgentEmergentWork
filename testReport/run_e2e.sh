@@ -89,17 +89,43 @@ if oai:
     chk(any(t.get("type") == "function" and "parameters" in t.get("function", {}) for t in b.get("tools", [])), "openai: tools[].function.parameters")
 if len(oai) >= 2:
     chk(any(m.get("role") == "tool" for m in oai[1]["body"]["messages"]), "openai: 第2次请求含 role=tool 消息")
+
+# --- 请求头校验(User-Agent / Authorization / X-Session-Id) ---
+def non_empty(v): return isinstance(v, str) and v.strip() != ""
+if anth:
+    h = anth[0]["headers"]
+    chk(non_empty(h.get("user-agent")), f"anthropic: User-Agent 已携带 ({h.get('user-agent','')[:40]})")
+    chk(h.get("authorization","").startswith("Bearer "), "anthropic: Authorization: Bearer <key>")
+    chk(non_empty(h.get("x-session-id")), "anthropic: X-Session-Id 已携带")
+    chk(non_empty(h.get("x-api-key")), "anthropic: x-api-key 保留")
+    # metadata.user_id 解析
+    meta = anth[0]["body"].get("metadata", {})
+    uid_str = meta.get("user_id", "")
+    try:
+        uid = json.loads(uid_str)
+        chk(non_empty(uid.get("device_id")), "anthropic: metadata.user_id.device_id")
+        chk(non_empty(uid.get("session_id")), "anthropic: metadata.user_id.session_id")
+        chk(uid.get("account_uuid") == "", "anthropic: metadata.user_id.account_uuid 为空")
+    except Exception as e:
+        chk(False, f"anthropic: metadata.user_id 解析失败: {e}")
+if oai:
+    h = oai[0]["headers"]
+    chk(non_empty(h.get("user-agent")), f"openai: User-Agent 已携带 ({h.get('user-agent','')[:40]})")
+    chk(h.get("authorization","").startswith("Bearer "), "openai: Authorization: Bearer <key>")
+    chk(non_empty(h.get("x-session-id")), "openai: X-Session-Id 已携带")
 sys.exit(0 if ok else 1)
 PYEOF
 check $? "协议 wire 格式校验"
 
 # --- 7. TUI 冒烟(管道喂命令) ---
 section "7. TUI 冒烟测试"
-OUT=$(printf '/help\n/model\n/provider list\n/exit\n' | run "$LAEW")
+OUT=$(printf '/help\n/model\n/provider list\n/new\n/exit\n' | run "$LAEW")
 echo "$OUT" | grep -q "根目录"; check $? "TUI 横幅显示根目录"
 echo "$OUT" | grep -q "工作目录"; check $? "TUI 横幅显示工作目录"
 echo "$OUT" | grep -q "当前模型"; check $? "TUI 横幅显示当前模型"
+echo "$OUT" | grep -q "Session"; check $? "TUI 横幅显示 Session ID"
 echo "$OUT" | grep -q "provider add"; check $? "/help 输出命令指南"
+echo "$OUT" | grep -q "开启新会话\|已开启新会话"; check $? "/new 命令生效"
 
 # --- 8. provider delete ---
 section "8. provider delete"

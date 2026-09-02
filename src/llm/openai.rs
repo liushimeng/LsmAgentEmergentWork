@@ -6,28 +6,29 @@
 //! - 助手消息的 `tool_calls` / 工具消息 `role: "tool", tool_call_id`
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::error::{AgentError, Result};
-use crate::llm::{normalize_endpoint, ChatMessage, Completion, ContentBlock, LlmClient, Role, ToolCallReq, ToolDef};
+use crate::llm::{build_common_headers, normalize_endpoint, ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta, Role, ToolCallReq, ToolDef};
 
 pub struct OpenAiClient {
     http: reqwest::Client,
     url: String,
     api_key: String,
     model: String,
+    user_agent: String,
 }
 
 impl OpenAiClient {
-    pub fn new(end_point: &str, api_key: &str, model: &str) -> Result<Self> {
+    pub fn new(end_point: &str, api_key: &str, model: &str, user_agent: &str) -> Result<Self> {
         let url = format!("{}/chat/completions", normalize_endpoint(end_point));
         Ok(Self {
             http: reqwest::Client::new(),
             url,
             api_key: api_key.to_string(),
             model: model.to_string(),
+            user_agent: user_agent.to_string(),
         })
     }
 }
@@ -139,6 +140,7 @@ impl LlmClient for OpenAiClient {
         system: &str,
         messages: &[ChatMessage],
         tools: &[ToolDef],
+        meta: &RequestMeta,
     ) -> Result<Completion> {
         let converted = convert_messages(system, messages);
         let req = OpenAiRequest {
@@ -148,13 +150,8 @@ impl LlmClient for OpenAiClient {
             tool_choice: Some("auto"),
         };
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key))
-                .map_err(|e| AgentError::Llm(format!("Authorization header 非法: {e}")))?,
-        );
+        // 通用头:Content-Type / User-Agent / Authorization / X-Session-Id
+        let headers = build_common_headers(&self.api_key, meta, &self.user_agent)?;
 
         let resp = self
             .http
@@ -220,13 +217,13 @@ mod tests {
 
     #[test]
     fn url_appends_chat_completions() {
-        let c = OpenAiClient::new("https://api.openai.com/v1", "k", "m").unwrap();
+        let c = OpenAiClient::new("https://api.openai.com/v1", "k", "m", "ua").unwrap();
         assert_eq!(c.url, "https://api.openai.com/v1/chat/completions");
     }
 
     #[test]
     fn url_without_v1_still_works() {
-        let c = OpenAiClient::new("https://example.com", "k", "m").unwrap();
+        let c = OpenAiClient::new("https://example.com", "k", "m", "ua").unwrap();
         assert_eq!(c.url, "https://example.com/chat/completions");
     }
 

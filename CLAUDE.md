@@ -14,8 +14,8 @@ TUI 支持斜杠命令自动补全（Tab 补全 + 行内提示）和文件路径
 ```bash
 ./rebuild.sh                 # 杀 laew 进程 → cargo build --release → 拷贝 ./laew 到根目录(改代码后必跑)
 cargo build                  # 快速编译检查
-cargo test                   # 单元测试(32 个)
-bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key,18 项)
+cargo test                   # 单元测试(61 个)
+bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key,20 项)
 ./laew --version             # 版本 + 编译时间 + git hash
 ./laew --help                # CLI 指南
 ./laew                       # TUI 交互模式
@@ -33,6 +33,9 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key,18 项)
 - **接入记录（完整的大模型接入记录）** = `protocol(anthropic|openai) + provider_name + model_name + end_point + api_key` 五元组，存 SQLite `providers` 表，可多条，`is_active` 唯一。
 - **接入点补全**：Anthropic → `{end_point}/v1/messages`；OpenAI → `{end_point}/chat/completions`；尾部 `/` 自动裁剪。
 - **工具定义协议差异**：Anthropic 用 `tools[].{name,description,input_schema}`；OpenAI 用 `tools[].{type:"function",function:{name,description,parameters}}`（function 风格）。
+- **AgentProfile**：Agent 身份档案（名称 / 系统提示词 / 工具集），默认 AgentName = `LsmAgentEmergentWork`，为后续多 Agent 预留。
+- **Session**：进程内会话，拥有独立 Session ID 与对话上下文（context）；TUI 启动或 `/new` `/clear` 时生成新 Session。
+- **请求头**：两协议统一携带 `User-Agent: {AgentName}/{版本} {编译时间}`、`Authorization: Bearer {api_key}`、`X-Session-Id`；Anthropic 请求体 additionally 携带 `metadata.user_id`（含 `device_id/account_uuid/session_id`）。
 
 ## 架构（src/）
 
@@ -49,15 +52,17 @@ tui/
     provider_list.rs   /provider list —— Tab 化展示 + 操作按钮
     provider_form.rs   /provider add  —— 5+1 Tab 表单
     provider_del.rs    /provider del  —— Picker + 二次确认
-agent/mod.rs   协议无关循环:complete → tool_calls → 执行 → tool_result 回填 → 直至纯文本
-llm/mod.rs     统一消息模型 ChatMessage/ContentBlock/ToolDef + LlmClient trait(client_from_record 工厂)
-llm/anthropic.rs  Anthropic wire 转换(x-api-key + anthropic-version)
-llm/openai.rs      OpenAI wire 转换(Bearer)
-tool/mod.rs    Tool trait + ToolRegistry(有序) + builtin_system_prompt
+agent/profile.rs  AgentProfile(AgentName / 系统提示词 / 工具集,多 Agent 预留) + User-Agent 构造
+agent/mod.rs     协议无关循环:run_session(Session) → complete → tool_calls → 执行 → tool_result 回填 → 直至纯文本
+session.rs       Session:本机指纹 device_id + Session ID 生成 + 独立对话上下文 context
+llm/mod.rs       统一消息模型 + LlmClient trait + RequestMeta + build_common_headers(common 头工厂)
+llm/anthropic.rs  Anthropic wire 转换(x-api-key + anthropic-version + metadata.user_id)
+llm/openai.rs     OpenAI wire 转换(Bearer)
+tool/mod.rs      Tool trait + ToolRegistry(有序) + builtin_system_prompt
 tool/bash|read|write.rs  三个内置工具
-config/mod.rs  Paths::detect()(根/工作目录) + Db(SQLite CRUD)
-error.rs       AgentError
-build.rs       注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
+config/mod.rs    Paths::detect()(根/工作目录) + Db(SQLite CRUD)
+error.rs         AgentError
+build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 ```
 
 统一消息模型是关键设计：Agent 循环与工具层永远不接触协议细节，协议差异封闭在 `llm/*` 两个客户端内部。
@@ -66,9 +71,20 @@ build.rs       注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 
 ### 屏幕拓扑
 
-- **REPL 主屏**：`InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。
+- **REPL 主屏**：保留 0.1.2 的 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。
 - **子屏（Modal）**：`engine.rs` 的 Screen 栈接管 `/provider *` 系列，进入 alternate screen + 原始模式，Esc 退回主屏。
 - **非 TTY 回退**：stdin 不是终端时（管道 / e2e），子屏与主屏都回退到 print 输出，保证 `run_e2e.sh` 兼容。
+
+### 斜杠命令
+
+| 命令 | 行为 |
+|------|------|
+| `/help` (h, ?) | 显示帮助 |
+| `/exit` (quit, q) | 退出 TUI |
+| `/clear` (c) | 清空对话历史，开启新 Session |
+| `/new` (n) | 同 `/clear`（开启新 Session） |
+| `/model` | 显示当前模型 |
+| `/provider` | 管理接入记录（默认进入 list 屏） |
 
 ### `/provider` 系列交互
 
@@ -100,6 +116,7 @@ build.rs       注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/工程初始化方案/` — 从 0 到 1 的分阶段解决方案（架构 / 任务分解 / 技术设计）
 - `docs/TUI交互优化与-f命令设计.md` — TUI 自动补全与 `-f` 文件参数的产品和技术设计
 - `docs/TUI界面与CLI渲染引擎/` — 独立 CLI 渲染引擎 + Tab 表单 + `/provider` 系列交互（01-产品设计 / 02-技术设计 / 03-Tab表单与Provider操作设计）
+- `docs/Agent身份与Session管理/` — AgentProfile / Session / 请求头 User-Agent·Authorization·X-Session-Id / Anthropic metadata.user_id 设计（01-设计与解决方案）
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
 

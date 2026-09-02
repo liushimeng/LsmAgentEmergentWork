@@ -10,10 +10,10 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 
-use crate::agent::Agent;
+use crate::agent::{profile::AgentProfile, Agent};
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::llm::{client_from_record, ChatMessage};
-use crate::tool::{builtin_registry, builtin_system_prompt};
+use crate::session::Session;
 
 pub mod completion;
 pub mod engine;
@@ -30,7 +30,7 @@ pub struct TuiSession {
     pub paths: Paths,
     pub db: Arc<Mutex<Db>>,
     pub agent: Agent,
-    pub history: Vec<ChatMessage>,
+    pub session: Session,
 }
 
 impl TuiSession {
@@ -38,8 +38,9 @@ impl TuiSession {
         let paths = Paths::detect().map_err(anyhow::Error::from)?;
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
         let db = Arc::new(Mutex::new(db));
-        let (agent, history) = build_agent_with_active(&db)?;
-        Ok(Self { paths, db, agent, history })
+        let agent = build_agent_with_active(&db)?;
+        let session = Session::new();
+        Ok(Self { paths, db, agent, session })
     }
 
     pub fn print_banner(&self) {
@@ -60,6 +61,7 @@ impl TuiSession {
             ),
             None => println!("║  当前模型: <未配置, 使用 /provider add 添加>{:<14} ║", ""),
         }
+        println!("║  Session: {:<46} ║", truncate(&self.session.id, 46));
         println!("╚══════════════════════════════════════════════════════════╝");
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
         println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出");
@@ -70,10 +72,14 @@ impl TuiSession {
     pub fn switch_provider(&mut self, id: i64) -> Result<()> {
         let record = self.db.lock().expect("db").get(id).map_err(anyhow::Error::from)?;
         self.db.lock().expect("db").set_active(id).map_err(anyhow::Error::from)?;
-        let (agent, history) = build_agent_with_record(record)?;
-        self.agent = agent;
-        self.history = history;
+        let user_agent = self.agent.profile().user_agent();
+        self.agent = build_agent_with_record(&record, &user_agent)?;
         Ok(())
+    }
+
+    /// 重置会话:清空上下文并生成新 Session ID。
+    pub fn reset_session(&mut self) {
+        self.session = Session::new();
     }
 
     pub fn add_provider_interactive(&self) -> Result<i64> {
@@ -123,8 +129,8 @@ impl TuiSession {
             return self.handle_slash(rest).await;
         }
         // 普通提示词
-        self.history.push(ChatMessage::user(line));
-        match self.agent.run_with_history(&mut self.history).await {
+        self.session.context_mut().push(ChatMessage::user(line));
+        match self.agent.run_session(&mut self.session).await {
             Ok(text) => {
                 if !text.is_empty() {
                     println!();
@@ -156,8 +162,12 @@ impl TuiSession {
                 return Ok(true);
             }
             "clear" | "c" => {
-                self.history.clear();
-                println!("  已清空当前对话历史。");
+                self.reset_session();
+                println!("  已清空对话历史并开启新会话, Session ID: {}", self.session.id);
+            }
+            "new" | "n" => {
+                self.reset_session();
+                println!("  已开启新会话, Session ID: {}", self.session.id);
             }
             "model" => {
                 if let Some(r) = self.db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
@@ -232,9 +242,7 @@ impl TuiSession {
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
         // 重建 Agent(可能切换了 use)
-        let (agent, history) = build_agent_with_active(&self.db)?;
-        self.agent = agent;
-        self.history = history;
+        self.agent = build_agent_with_active(&self.db)?;
         result
     }
 
@@ -254,9 +262,7 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        let (agent, history) = build_agent_with_active(&self.db)?;
-        self.agent = agent;
-        self.history = history;
+        self.agent = build_agent_with_active(&self.db)?;
         result
     }
 
@@ -274,9 +280,7 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        let (agent, history) = build_agent_with_active(&self.db)?;
-        self.agent = agent;
-        self.history = history;
+        self.agent = build_agent_with_active(&self.db)?;
         result
     }
 
@@ -313,6 +317,7 @@ fn suggest_similar_commands(input: &str) -> Vec<String> {
         "help", "h", "?",
         "exit", "quit", "q",
         "clear", "c",
+        "new", "n",
         "model",
         "provider", "provider list", "provider add", "provider use", "provider del",
     ];
@@ -398,7 +403,8 @@ fn print_help() {
     println!("  ├──────────────────────────────────────────────────────────┤");
     println!("  │  /help (h, ?)      显示本帮助                            │");
     println!("  │  /exit (quit, q)   退出 TUI                              │");
-    println!("  │  /clear (c)        清空当前对话历史                       │");
+    println!("  │  /clear (c)        清空对话历史并开启新会话                 │");
+    println!("  │  /new (n)          开启新会话(同 /clear)                   │");
     println!("  │  /model            显示当前模型                           │");
     println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
     println!("  │  /provider list    列出所有接入记录                       │");
@@ -417,24 +423,23 @@ fn print_help() {
 }
 
 /// 启动活跃 agent;若未配置,使用占位提示信息
-fn build_agent_with_active(db: &Arc<Mutex<Db>>) -> Result<(Agent, Vec<ChatMessage>)> {
+fn build_agent_with_active(db: &Arc<Mutex<Db>>) -> Result<Agent> {
+    let profile = AgentProfile::default_profile();
+    let user_agent = profile.user_agent();
     match db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
-        Some(r) => build_agent_with_record(r),
+        Some(r) => build_agent_with_record(&r, &user_agent),
         None => {
-            let tools = builtin_registry();
-            let system = builtin_system_prompt()
+            let system = profile.system_prompt
                 + "\n[系统] 当前尚未配置大模型接入记录。请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置后再开始对话。";
-            let agent = Agent::new(Arc::new(NoopLlm), tools, system);
-            Ok((agent, Vec::new()))
+            let profile = AgentProfile::new(&profile.name, system);
+            Ok(Agent::new(Arc::new(NoopLlm), profile))
         }
     }
 }
 
-fn build_agent_with_record(r: ProviderRecord) -> Result<(Agent, Vec<ChatMessage>)> {
-    let llm = client_from_record(&r).map_err(anyhow::Error::from)?;
-    let tools = builtin_registry();
-    let agent = Agent::new(llm, tools, builtin_system_prompt());
-    Ok((agent, Vec::new()))
+fn build_agent_with_record(r: &ProviderRecord, user_agent: &str) -> Result<Agent> {
+    let llm = client_from_record(r, user_agent).map_err(anyhow::Error::from)?;
+    Ok(Agent::new(llm, AgentProfile::default_profile()))
 }
 
 /// 未配置模型时的占位 LLM(避免 null deref);`complete` 返回错误提示。
@@ -447,6 +452,7 @@ impl crate::llm::LlmClient for NoopLlm {
         _system: &str,
         _messages: &[ChatMessage],
         _tools: &[crate::llm::ToolDef],
+        _meta: &crate::llm::RequestMeta,
     ) -> crate::error::Result<crate::llm::Completion> {
         Ok(crate::llm::Completion {
             text: "尚未配置大模型接入记录, 请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置。".to_string(),
