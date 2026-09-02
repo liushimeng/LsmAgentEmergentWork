@@ -1,8 +1,14 @@
+//! Agent 工程统一错误类型
+
 use thiserror::Error;
 
-/// Agent 工程统一错误类型
+use crate::config::ConfigError;
+
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error("配置错误: {0}")]
+    Config(#[from] ConfigError),
+
     #[error("LLM 调用失败: {0}")]
     Llm(String),
 
@@ -20,6 +26,12 @@ pub enum AgentError {
 
     #[error("JSON 序列化错误: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("I/O 错误: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;

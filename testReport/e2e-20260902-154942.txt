@@ -1,0 +1,104 @@
+laew e2e 验证 @ Wed Sep  2 03:49:42 PM CST 2026
+根目录: /usr/local/LsmGitOpenSource/LsmAgentEmergentWork
+
+==== 1. --version / --help ====
+laew 0.1.0 (build 2026-09-02 15:46:47 CST, git c88b357)
+  [PASS] --version 可用
+LsmAgentEmergentWork - LLM Agent CLI
+
+Usage: laew [OPTIONS] [COMMAND]
+
+Commands:
+  provider  管理大模型接入记录(增/删/列/切换)
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -p, --prompt <TEXT>                    单轮任务提示词(不进入 TUI)
+      --max-iterations <MAX_ITERATIONS>  最大 Agent 迭代次数 [default: 16]
+  -h, --help                             Print help
+  -V, --version                          Print version
+  [PASS] --help 含 provider 指南
+
+==== 2. 未配置模型时 -p 的引导提示 ====
+Error: 尚未配置当前模型,请先执行 `laew provider add` 添加接入记录。
+  [PASS] 提示先 provider add
+
+==== 3. provider CRUD ====
+✓ 已新增接入记录 id=1
+  [PASS] add anthropic 记录
+✓ 已新增接入记录 id=2
+  [PASS] add openai 记录
+* id=1   [anthropic] mockA/claude-mock              @ http://127.0.0.1:18899  (key 末4位: -ant)
+  id=2   [openai   ] mockO/gpt-mock                 @ http://127.0.0.1:18899/v1  (key 末4位: -oai)
+  [PASS] list 显示 mockA
+✓ 已切换当前模型为 id=2
+  [PASS] use 切换到 openai 记录
+  id=1   [anthropic] mockA/claude-mock              @ http://127.0.0.1:18899  (key 末4位: -ant)
+* id=2   [openai   ] mockO/gpt-mock                 @ http://127.0.0.1:18899/v1  (key 末4位: -oai)
+  [PASS] openai 记录被标记为当前
+  [PASS] 数据库生成在根目录
+
+==== 4. OpenAI 协议端到端(工具调用循环) ====
+[laew] 单轮模式: protocol=openai provider=mockO model=gpt-mock
+[2m2026-09-02T07:49:43.187401Z[0m [32m INFO[0m agent step [3miteration[0m[2m=[0m0
+[2m2026-09-02T07:49:43.188706Z[0m [32m INFO[0m executing tool [3mtool[0m[2m=[0mBash
+[2m2026-09-02T07:49:43.191997Z[0m [32m INFO[0m agent step [3miteration[0m[2m=[0m1
+[2m2026-09-02T07:49:43.192809Z[0m [32m INFO[0m agent finished with text answer
+MOCK_FINAL_ANSWER: laew 端到端链路验证通过。
+  [PASS] 返回最终文本
+✓ 已切换当前模型为 id=1
+
+==== 5. Anthropic 协议端到端(工具调用循环) ====
+[laew] 单轮模式: protocol=anthropic provider=mockA model=claude-mock
+[2m2026-09-02T07:49:43.211166Z[0m [32m INFO[0m agent step [3miteration[0m[2m=[0m0
+[2m2026-09-02T07:49:43.212228Z[0m [32m INFO[0m executing tool [3mtool[0m[2m=[0mBash
+[2m2026-09-02T07:49:43.216258Z[0m [32m INFO[0m agent step [3miteration[0m[2m=[0m1
+[2m2026-09-02T07:49:43.216995Z[0m [32m INFO[0m agent finished with text answer
+MOCK_FINAL_ANSWER: laew Anthropic 链路验证通过。
+  [PASS] 返回最终文本
+
+==== 6. 请求格式校验(mock_requests) ====
+  [PASS] 两种协议均有 ≥2 次请求 (anthropic=2, openai=2)
+  [PASS] anthropic: system 为顶层字符串
+  [PASS] anthropic: tools 含 Bash 且带 input_schema
+  [PASS] anthropic: 第2次请求含 tool_result 块
+  [PASS] openai: system 转为首条 system 消息
+  [PASS] openai: tools[].function.parameters
+  [PASS] openai: 第2次请求含 role=tool 消息
+  [PASS] 协议 wire 格式校验
+
+==== 7. TUI 冒烟测试 ====
+╔══════════════════════════════════════════════════════════
+║  LsmAgentEmergentWork  ·  laew  TUI  ·  v0.1.0
+║  编译时间: 2026-09-02 15:46:47 CST
+║  根目录 : /tmp/laew-e2e-root
+║  工作目录: /usr/local/LsmGitOpenSource/LsmAgentEmergentWork
+║  数据库  : /tmp/laew-e2e-root/LsmAgentEmergentWork.db
+║  当前模型: [anthropic] mockA / claude-mock  @ http://127.0.0.1:18899
+╚══════════════════════════════════════════════════════════
+输入提示词开始对话;斜杠命令 /help 查看帮助。
+可用命令:
+/help, /h, /?        显示本帮助
+/provider list       列出所有接入记录
+/provider add        交互式新增接入记录
+/provider use <id>   切换当前模型
+/provider del <id>   删除接入记录
+/model               显示当前模型
+/clear, /c           清空当前对话历史
+/exit, /quit, /q     退出
+其他输入             作为提示词进入多轮对话
+[anthropic] mockA / claude-mock  @ http://127.0.0.1:18899
+* id=1 [anthropic] mockA/claude-mock @ http://127.0.0.1:18899  key=****-ant  (2026-09-02 15:49:42)
+  id=2 [   openai] mockO/gpt-mock @ http://127.0.0.1:18899/v1  key=****-oai  (2026-09-02 15:49:42)
+  [PASS] TUI 横幅显示根目录
+  [PASS] TUI 横幅显示工作目录
+  [PASS] TUI 横幅显示当前模型
+  [PASS] /help 输出命令指南
+
+==== 8. provider delete ====
+✓ 已删除 id=2
+  [PASS] 删除 openai 记录
+* id=1   [anthropic] mockA/claude-mock              @ http://127.0.0.1:18899  (key 末4位: -ant)
+  [PASS] list 不再显示 mockO
+
+==== 汇总: PASS=18 FAIL=0 ====

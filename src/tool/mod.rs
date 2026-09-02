@@ -1,44 +1,41 @@
-//! 工具抽象、注册表与内置工具。
+//! 工具抽象与注册表。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::error::{AgentError, Result};
-use crate::llm::ToolSchema;
+use crate::llm::ToolDef;
 
-/// Agent 可调用的工具
+pub mod bash;
+pub mod read;
+pub mod write;
+
+/// 工具需要实现的异步 trait
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// 工具名(function calling 中的 name)
     fn name(&self) -> &str;
 
-    /// 给模型看的功能描述
     fn description(&self) -> &str;
 
-    /// 参数 JSON Schema
+    /// JSON Schema 对象
     fn parameters(&self) -> Value;
 
-    /// 执行工具, 输入为模型给出的 JSON 参数
-    async fn execute(&self, args: Value) -> Result<String>;
-
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            schema_type: "function".into(),
-            function: crate::llm::FunctionSchema {
-                name: self.name().to_string(),
-                description: self.description().to_string(),
-                parameters: self.parameters(),
-            },
-        }
+    /// 给协议无关层消费的 `ToolDef`
+    fn def(&self) -> ToolDef {
+        ToolDef::new(self.name(), self.description(), self.parameters())
     }
+
+    /// 执行工具
+    async fn execute(&self, args: Value) -> Result<String>;
 }
 
-/// 工具注册表
+/// 工具注册表(保持注册顺序,保证 tools 列表稳定)
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
+    order: Vec<String>,
     tools: HashMap<String, Arc<dyn Tool>>,
 }
 
@@ -48,7 +45,11 @@ impl ToolRegistry {
     }
 
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        if !self.tools.contains_key(&name) {
+            self.order.push(name.clone());
+        }
+        self.tools.insert(name, tool);
         self
     }
 
@@ -58,93 +59,34 @@ impl ToolRegistry {
             .ok_or_else(|| AgentError::ToolNotFound(name.to_string()))
     }
 
-    pub fn schemas(&self) -> Vec<ToolSchema> {
-        self.tools.values().map(|t| t.schema()).collect()
+    /// 协议无关层的工具定义列表(按注册顺序)
+    pub fn defs(&self) -> Vec<ToolDef> {
+        self.order
+            .iter()
+            .filter_map(|n| self.tools.get(n))
+            .map(|t| t.def())
+            .collect()
     }
 }
 
-/// 内置示例工具: 原样回显输入
-pub struct EchoTool;
-
-#[async_trait]
-impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        "echo"
-    }
-
-    fn description(&self) -> &str {
-        "将输入文本原样返回, 用于测试工具调用链路"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "text": { "type": "string", "description": "要回显的文本" }
-            },
-            "required": ["text"]
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<String> {
-        let text = args
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AgentError::ToolExecution {
-                tool: self.name().into(),
-                reason: "缺少 string 类型参数 text".into(),
-            })?;
-        Ok(text.to_string())
-    }
-}
-
-/// 内置示例工具: 返回当前 UTC 时间
-pub struct NowTool;
-
-#[async_trait]
-impl Tool for NowTool {
-    fn name(&self) -> &str {
-        "now"
-    }
-
-    fn description(&self) -> &str {
-        "返回当前 UTC 时间(秒级 Unix 时间戳)"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
-    }
-
-    async fn execute(&self, _args: Value) -> Result<String> {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        Ok(secs.to_string())
-    }
-}
-
-/// 内置工具注册表
+/// 默认注册表:内置 Bash / Read / Write
 pub fn builtin_registry() -> ToolRegistry {
     ToolRegistry::new()
-        .register(Arc::new(EchoTool))
-        .register(Arc::new(NowTool))
+        .register(Arc::new(bash::BashTool))
+        .register(Arc::new(read::ReadTool))
+        .register(Arc::new(write::WriteTool))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn echo_tool_returns_input() {
-        let out = EchoTool.execute(json!({ "text": "hello" })).await.unwrap();
-        assert_eq!(out, "hello");
-    }
-
-    #[tokio::test]
-    async fn registry_finds_registered_tool() {
-        let reg = builtin_registry();
-        assert!(reg.get("echo").is_ok());
-        assert!(reg.get("missing").is_err());
-    }
+/// 给模型看的统一系统说明(描述当前可用的工具)
+pub fn builtin_system_prompt() -> String {
+    String::from(
+        "你是一个基于工具调用的 Agent。可使用工具完成任务,完成后用一段简洁中文回答用户。\n\
+         工具调用规范:\n\
+         - 仅在必要时调用工具;能用更专用工具(如 Read/Write)完成的事不要退化为 Bash。\n\
+         - 工具参数需严格遵守给定 JSON Schema。\n\
+         - 并行无依赖的工具调用请一次性发出。\n\n可用工具:\n\
+         - Bash(command, timeout_ms?, description?): 在工作目录下执行 bash 命令并返回 stdout/stderr/退出码。\n\
+         - Read(file_path, offset?, limit?): 读取文本文件,带行号。offset/limit 用于分页。\n\
+         - Write(file_path, content): 覆盖写入(或新建)文件,自动创建父目录。\n",
+    )
 }

@@ -1,11 +1,25 @@
+# Rust / Cargo
 /target
 **/*.rs.bk
-Cargo.lock.bak
 
-# IDE
-.idea/
+# 构建产物
+/laew
+
+# 运行时数据
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# tmpPlan(临时计划,不入库)
+tmpPlan/
+
+# 编辑器
 .vscode/
+.idea/
 *.swp
+.DS_Store
 
-# 本地环境变量（API Key 等）
-.env
+# testReport:保留报告与脚本,仅忽略大体量原始产物
+/testReport/build.log
+/testReport/mock_requests-*.jsonl

@@ -1,0 +1,42 @@
+{
+  "id": "04e1a1ab7812489eb9e9b5e7f016a666",
+  "object": "chat.completion",
+  "created": 1787305406,
+  "model": "LongCat-2.0",
+  "usage": {
+    "completion_tokens": 191,
+    "prompt_tokens": 41602,
+    "total_tokens": 41793,
+    "completion_tokens_details": {
+      "reasoning_tokens": 120
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 38528,
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "video_tokens": 0,
+      "text_tokens": 0
+    }
+  },
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "\nThe user wants to see the latest month's K-line (candlestick) charts for gold and oil, priced in RMB (人民币). I need to:\n\n1. Search for gold and oil K-line data in RMB pricing for the latest month\n2. Generate an HTML report with candlestick charts using ECharts\n\nLet me first delegate the search to agentic_search to get the data. I need to search for gold and oil K-line data denominated in RMB for the past month.\n\nI'll do two parallel searches - one for gold and one for oil.",
+        "tool_calls": [
+          {
+            "id": "call_8c96e02218fc4a219c856d8d",
+            "type": "function",
+            "function": {
+              "name": "DeferExecuteTool",
+              "arguments": "{\"toolName\": \"agentic_search\", \"params\": {\"query\": \"获取黄金（Au9999）和原油期货（SC）最近一个月以人民币计价的日K线数据，包括开盘价、收盘价、最高价、最低价和成交量\"}}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ]
+}

@@ -1,54 +1,175 @@
-use std::sync::Arc;
+//! laew — LsmAgentEmergentWork 命令行入口。
 
-use clap::Parser;
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
 use lsm_agent::agent::Agent;
-use lsm_agent::llm::OpenAiClient;
-use lsm_agent::tool::builtin_registry;
+use lsm_agent::config::{Db, Paths, Protocol};
+use lsm_agent::llm::client_from_record;
+use lsm_agent::tool::{builtin_registry, builtin_system_prompt};
 
-/// LsmAgentEmergentWork - 命令行 Agent
-#[derive(Parser)]
-#[command(name = "lsm-agent", version, about)]
+const VERSION_INFO: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (build ",
+    env!("LAEW_BUILD_TIME"),
+    ", git ",
+    env!("LAEW_GIT_HASH"),
+    ")",
+);
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "laew",
+    bin_name = "laew",
+    version = VERSION_INFO,
+    about = "LsmAgentEmergentWork - LLM Agent CLI",
+    long_about = None,
+    disable_help_subcommand = false
+)]
 struct Cli {
-    /// 任务/问题
-    task: String,
+    /// 单轮任务提示词(不进入 TUI)
+    #[arg(short = 'p', long = "prompt", value_name = "TEXT")]
+    prompt: Option<String>,
 
-    /// OpenAI 兼容接口地址, 也可用环境变量 LLM_BASE_URL
-    #[arg(long, env = "LLM_BASE_URL", default_value = "https://api.openai.com")]
-    base_url: String,
-
-    /// API Key, 也可用环境变量 LLM_API_KEY
-    #[arg(long, env = "LLM_API_KEY")]
-    api_key: String,
-
-    /// 模型名, 也可用环境变量 LLM_MODEL
-    #[arg(long, env = "LLM_MODEL", default_value = "gpt-4o-mini")]
-    model: String,
-
-    /// 最大迭代次数
-    #[arg(long, default_value_t = 10)]
+    /// 最大 Agent 迭代次数
+    #[arg(long, default_value_t = 16, global = true)]
     max_iterations: usize,
+
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// 管理大模型接入记录(增/删/列/切换)
+    #[command(subcommand)]
+    Provider(ProviderCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderCmd {
+    /// 新增一条接入记录(若库为空则自动激活)
+    Add {
+        #[arg(long, value_parser = parse_protocol)]
+        protocol: Protocol,
+        #[arg(long)]
+        provider_name: String,
+        #[arg(long)]
+        model_name: String,
+        #[arg(long)]
+        end_point: String,
+        #[arg(long)]
+        api_key: String,
+    },
+    /// 列出全部接入记录
+    List,
+    /// 把指定 id 设为当前使用
+    Use { id: i64 },
+    /// 删除一条接入记录
+    Delete { id: i64 },
+}
+
+fn parse_protocol(s: &str) -> std::result::Result<Protocol, String> {
+    Protocol::parse(s).map_err(|e| e.to_string())
+}
+
+fn open_db() -> Result<(Paths, Db)> {
+    let paths = Paths::detect().map_err(anyhow::Error::from)?;
+    let db = Db::open(&paths).map_err(anyhow::Error::from)?;
+    Ok((paths, db))
+}
+
+async fn cmd_provider(p: ProviderCmd) -> Result<()> {
+    let (_paths, db) = open_db()?;
+    match p {
+        ProviderCmd::Add { protocol, provider_name, model_name, end_point, api_key } => {
+            let id = db
+                .add(protocol, &provider_name, &model_name, &end_point, &api_key)
+                .map_err(anyhow::Error::from)?;
+            println!("✓ 已新增接入记录 id={id}");
+        }
+        ProviderCmd::List => {
+            let records = db.list().map_err(anyhow::Error::from)?;
+            if records.is_empty() {
+                println!("(空)尚未配置任何接入记录。");
+                return Ok(());
+            }
+            for r in records {
+                let marker = if r.is_active { "*" } else { " " };
+                println!(
+                    "{marker} id={:<3} [{:<9}] {}/{:<24} @ {}  (key 末4位: {})",
+                    r.id,
+                    r.protocol.as_str(),
+                    r.provider_name,
+                    r.model_name,
+                    r.end_point,
+                    tail(&r.api_key, 4)
+                );
+            }
+        }
+        ProviderCmd::Use { id } => {
+            db.set_active(id).map_err(anyhow::Error::from)?;
+            println!("✓ 已切换当前模型为 id={id}");
+        }
+        ProviderCmd::Delete { id } => {
+            db.delete(id).map_err(anyhow::Error::from)?;
+            println!("✓ 已删除 id={id}");
+        }
+    }
+    Ok(())
+}
+
+fn tail(s: &str, n: usize) -> String {
+    s.chars().rev().take(n).collect::<String>().chars().rev().collect()
+}
+
+async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
+    let (paths, db) = open_db()?;
+    let active = db
+        .get_active()
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| anyhow::anyhow!("尚未配置当前模型,请先执行 `laew provider add` 添加接入记录。"))?;
+    let llm = client_from_record(&active).map_err(anyhow::Error::from)?;
+    let tools = builtin_registry();
+    let mut system = builtin_system_prompt();
+    system.push_str(&format!(
+        "\n[环境] 根目录: {}  工作目录: {}  当前模型: [{:}] {}/{}",
+        paths.root_dir.display(),
+        paths.work_dir.display(),
+        active.protocol.as_str(),
+        active.provider_name,
+        active.model_name
+    ));
+
+    let agent = Agent::new(llm, tools, system).with_max_iterations(max_iterations);
+    eprintln!("[laew] 单轮模式: protocol={} provider={} model={}",
+        active.protocol.as_str(), active.provider_name, active.model_name);
+    let answer = agent.run_once(&prompt).await.map_err(anyhow::Error::from)?;
+    println!("{answer}");
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
+        .with_target(false)
         .init();
 
     let cli = Cli::parse();
 
-    let llm = Arc::new(OpenAiClient::new(cli.base_url, cli.api_key, cli.model));
-    let agent = Agent::new(
-        llm,
-        builtin_registry(),
-        "你是一个乐于助人的 Agent, 可以使用提供的工具完成任务。",
-    )
-    .with_max_iterations(cli.max_iterations);
-
-    let answer = agent.run(&cli.task).await?;
-    println!("{answer}");
-    Ok(())
+    match cli.cmd {
+        Some(Cmd::Provider(p)) => cmd_provider(p).await,
+        None => {
+            if let Some(prompt) = cli.prompt {
+                run_one_shot(prompt, cli.max_iterations).await
+            } else {
+                lsm_agent::tui::run().await
+            }
+        }
+    }
 }
+
