@@ -38,7 +38,17 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key,18 项)
 
 ```
 main.rs        clap CLI:默认进 tui; -p 单轮; -f 文件提示词; provider 子命令
-tui/mod.rs     rustyline REPL:横幅 + 斜杠命令 + 自动补全(Tab/行内提示) + 路径补全
+tui/
+  mod.rs       会话编排:REPL 主屏循环 + Screen 栈;暴露 pub async fn run()
+  engine.rs    CLI 渲染引擎 —— Screen trait + Frame + 全量重绘 present
+  form.rs      通用 Tab 表单状态机(被 ProviderForm 屏复用)
+  input.rs     单行输入(主屏用):含行内提示 + 补全(crossterm 原始模式)
+  completion.rs 斜杠命令补全引擎
+  theme.rs     ANSI 颜色 / mask_key 脱敏 集中管理
+  screen/
+    provider_list.rs   /provider list —— Tab 化展示 + 操作按钮
+    provider_form.rs   /provider add  —— 5+1 Tab 表单
+    provider_del.rs    /provider del  —— Picker + 二次确认
 agent/mod.rs   协议无关循环:complete → tool_calls → 执行 → tool_result 回填 → 直至纯文本
 llm/mod.rs     统一消息模型 ChatMessage/ContentBlock/ToolDef + LlmClient trait(client_from_record 工厂)
 llm/anthropic.rs  Anthropic wire 转换(x-api-key + anthropic-version)
@@ -52,10 +62,44 @@ build.rs       注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 
 统一消息模型是关键设计：Agent 循环与工具层永远不接触协议细节，协议差异封闭在 `llm/*` 两个客户端内部。
 
+## TUI 界面（独立 CLI 渲染引擎）
+
+### 屏幕拓扑
+
+- **REPL 主屏**：`InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。
+- **子屏（Modal）**：`engine.rs` 的 Screen 栈接管 `/provider *` 系列，进入 alternate screen + 原始模式，Esc 退回主屏。
+- **非 TTY 回退**：stdin 不是终端时（管道 / e2e），子屏与主屏都回退到 print 输出，保证 `run_e2e.sh` 兼容。
+
+### `/provider` 系列交互
+
+| 输入 | 行为 |
+|------|------|
+| `/provider` | **默认等价 `/provider list`**，进入 ProviderList 屏 |
+| `/provider list` (ls) | ProviderList 屏：5 只读字段 Tab + 操作按钮（设为当前 / 删除 / 返回） |
+| `/provider add` | ProviderForm 屏：5+1 Tab 表单（protocol / provider_name / model_name / end_point / api_key / 确认） |
+| `/provider use <id>` | 后台 set_active + 重建 Agent，回到主屏打印 `✓ 已切换` |
+| `/provider del` | ProviderDelPicker 屏 → ProviderDelConfirm 屏（二次确认） |
+
+### Tab 表单交互（ProviderForm）
+
+- 5 个数据 Tab + 1 个确认 Tab；`←` / `→` 环回切换；`Enter` 进入编辑态。
+- protocol Tab：Enter 切换 `anthropic ⇄ openai`。
+- 文本 Tab：进入行输入，Enter / Esc 退出编辑态（保留修改）。
+- 确认 Tab：`[ 确认 ]` / `[ 取消 ]`，左右切换，Enter 触发。
+- **API Key 全程脱敏**：浏览态显示 `****<末4位>`；仅进入 Tab 5 编辑态时显示明文。
+
+### 关键约定
+
+- 新增子屏：实现 `engine::Screen` trait，在 `mod.rs::handle_slash` 中路由。
+- 不引入新 crate（crossterm 已满足）。
+- 子屏不直接写 stdout；通过 `Frame` → `engine::present` 统一绘制。
+- 文档：`docs/TUI界面与CLI渲染引擎/`（01-产品设计 / 02-技术设计 / 03-Tab表单与Provider操作设计）。
+
 ## 文档地图（docs/）
 
 - `docs/工程初始化方案/` — 从 0 到 1 的分阶段解决方案（架构 / 任务分解 / 技术设计）
 - `docs/TUI交互优化与-f命令设计.md` — TUI 自动补全与 `-f` 文件参数的产品和技术设计
+- `docs/TUI界面与CLI渲染引擎/` — 独立 CLI 渲染引擎 + Tab 表单 + `/provider` 系列交互（01-产品设计 / 02-技术设计 / 03-Tab表单与Provider操作设计）
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
 

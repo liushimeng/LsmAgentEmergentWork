@@ -1,13 +1,12 @@
-//! TUI 交互界面（基于 crossterm 的自定义输入处理器）。
+//! TUI 交互界面 —— 独立 CLI 渲染引擎 + 斜杠命令 + 多轮对话。
 //!
-//! 提供:
-//! - 启动横幅展示根目录 / 工作目录 / 当前 provider_name / model_name
-//! - 多轮对话(直接输入提示词)
-//! - 斜杠命令: /help /provider /model /clear /exit
-//! - 下拉式斜杠命令补全（上下箭头导航, Enter/Tab 接受, Esc 关闭）
-//! - 未选中项显示灰色（未确认状态）
+//! 架构见 `docs/TUI界面与CLI渲染引擎/02-技术设计.md`。
+//! - 主屏:保留 0.1.2 的 `InputHandler` 单行输入 + 斜杠命令补全。
+//! - 子屏:`engine.rs` 的 Screen 栈,接管 `/provider *` 系列。
+//! - `/provider` 单独输入默认路由到 `/provider list`。
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Result;
 
@@ -17,14 +16,19 @@ use crate::llm::{client_from_record, ChatMessage};
 use crate::tool::{builtin_registry, builtin_system_prompt};
 
 pub mod completion;
-pub mod input;
+pub mod engine;
+pub mod form;
+pub mod screen;
+pub mod theme;
+
+mod input;
 
 use completion::CompletionEngine;
 use input::{InputHandler, InputResult};
 
 pub struct TuiSession {
     pub paths: Paths,
-    pub db: Db,
+    pub db: Arc<Mutex<Db>>,
     pub agent: Agent,
     pub history: Vec<ChatMessage>,
 }
@@ -33,12 +37,13 @@ impl TuiSession {
     pub fn bootstrap() -> Result<Self> {
         let paths = Paths::detect().map_err(anyhow::Error::from)?;
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
+        let db = Arc::new(Mutex::new(db));
         let (agent, history) = build_agent_with_active(&db)?;
         Ok(Self { paths, db, agent, history })
     }
 
     pub fn print_banner(&self) {
-        let active = self.db.get_active().ok().flatten();
+        let active = self.db.lock().expect("db").get_active().ok().flatten();
         println!("╔══════════════════════════════════════════════════════════╗");
         println!("║  LsmAgentEmergentWork  ·  laew  TUI  ·  v{}           ║", env!("CARGO_PKG_VERSION"));
         println!("║  编译时间: {}                          ║", env!("LAEW_BUILD_TIME"));
@@ -63,8 +68,8 @@ impl TuiSession {
 
     /// 切换当前 provider(根据 id),并重新构造 Agent
     pub fn switch_provider(&mut self, id: i64) -> Result<()> {
-        let record = self.db.get(id).map_err(anyhow::Error::from)?;
-        self.db.set_active(id).map_err(anyhow::Error::from)?;
+        let record = self.db.lock().expect("db").get(id).map_err(anyhow::Error::from)?;
+        self.db.lock().expect("db").set_active(id).map_err(anyhow::Error::from)?;
         let (agent, history) = build_agent_with_record(record)?;
         self.agent = agent;
         self.history = history;
@@ -82,6 +87,8 @@ impl TuiSession {
         let api_key = read_line_prompt("    api_key: ")?;
         let id = self
             .db
+            .lock()
+            .expect("db")
             .add(
                 protocol,
                 provider_name.trim(),
@@ -95,13 +102,13 @@ impl TuiSession {
     }
 
     pub fn list_providers(&self) -> Result<()> {
-        let records = self.db.list().map_err(anyhow::Error::from)?;
+        let records = self.db.lock().expect("db").list().map_err(anyhow::Error::from)?;
         if records.is_empty() {
             println!("  (空)尚未配置任何接入记录。");
             return Ok(());
         }
-        for r in records {
-            print_record(&r);
+        for r in &records {
+            print_record(r);
         }
         Ok(())
     }
@@ -153,7 +160,7 @@ impl TuiSession {
                 println!("  已清空当前对话历史。");
             }
             "model" => {
-                if let Some(r) = self.db.get_active().map_err(anyhow::Error::from)? {
+                if let Some(r) = self.db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
                     println!(
                         "  [{}] {} / {}  @ {}",
                         r.protocol.as_str(),
@@ -168,16 +175,13 @@ impl TuiSession {
             "provider" | "p" => {
                 let sub = it.next().unwrap_or("");
                 match sub {
-                    "list" | "ls" => self.list_providers()?,
+                    "list" | "ls" => {
+                        // 进入 ProviderList 屏
+                        self.run_provider_list_screen().await?;
+                    }
                     "add" => {
-                        let id = self.add_provider_interactive()?;
-                        // 首次添加会自动激活;若想立即启用
-                        if let Ok(Some(r)) = self.db.get_active() {
-                            if r.id == id {
-                                self.switch_provider(id)?;
-                                println!("  ✓ 已切换到 id={id}");
-                            }
-                        }
+                        // 进入 ProviderForm 屏(add 模式)
+                        self.run_provider_add_screen().await?;
                     }
                     "use" => {
                         let id_str = it.next().unwrap_or("");
@@ -189,20 +193,12 @@ impl TuiSession {
                         }
                     }
                     "del" | "delete" | "rm" => {
-                        let id_str = it.next().unwrap_or("");
-                        if let Ok(id) = id_str.parse::<i64>() {
-                            self.db.delete(id).map_err(anyhow::Error::from)?;
-                            println!("  ✓ 已删除 id={id}");
-                        } else {
-                            println!("  用法: /provider del <id>");
-                        }
+                        // 进入 ProviderDelPicker 屏
+                        self.run_provider_del_screen().await?;
                     }
                     "" => {
-                        println!("/provider 子命令:");
-                        println!("  add          交互式新增接入记录");
-                        println!("  list         列出所有接入记录");
-                        println!("  use <id>     切换当前模型");
-                        println!("  del <id>     删除接入记录");
+                        // 单独 /provider 默认路由到 list
+                        self.run_provider_list_screen().await?;
                     }
                     other => println!("  未知 /provider 子命令: {other}"),
                 }
@@ -210,7 +206,6 @@ impl TuiSession {
             "" => {}
             other => {
                 println!("  未知斜杠命令: /{other}");
-                // 给出相似命令建议
                 let suggestions = suggest_similar_commands(other);
                 if !suggestions.is_empty() {
                     println!("  您是否想输入: {}", suggestions.join(", "));
@@ -219,6 +214,96 @@ impl TuiSession {
             }
         }
         Ok(false)
+    }
+
+    /// 进入 ProviderList 屏(子屏通过 engine 渲染)。
+    /// 当 stdin 不是 TTY(如 e2e 管道)时,回退到 print 输出以保持兼容。
+    async fn run_provider_list_screen(&mut self) -> Result<()> {
+        use crate::tui::engine::{enter_alt, leave_alt, present, read_key, Outcome};
+        use crate::tui::screen::provider_list::ProviderList;
+
+        if !atty() {
+            // 非 TTY:回退到 print 输出
+            return self.list_providers();
+        }
+
+        let screen = ProviderList::new(self.db.clone(), self.paths.clone());
+        enter_alt().map_err(anyhow::Error::from)?;
+        let result = Self::run_screen_loop(screen).await;
+        leave_alt().map_err(anyhow::Error::from)?;
+        // 重建 Agent(可能切换了 use)
+        let (agent, history) = build_agent_with_active(&self.db)?;
+        self.agent = agent;
+        self.history = history;
+        result
+    }
+
+    async fn run_provider_add_screen(&mut self) -> Result<()> {
+        use crate::tui::engine::{enter_alt, leave_alt, present, read_key, Outcome};
+        use crate::tui::screen::provider_form::ProviderForm;
+
+        if !atty() {
+            return self.add_provider_interactive().map(|_| ());
+        }
+
+        let db = self.db.clone();
+        let on_done = Box::new(move |id: i64| {
+            let _ = db.lock().expect("db").set_active(id);
+        });
+        let screen = ProviderForm::new_add(self.db.clone(), self.paths.clone(), on_done);
+        enter_alt().map_err(anyhow::Error::from)?;
+        let result = Self::run_screen_loop(screen).await;
+        leave_alt().map_err(anyhow::Error::from)?;
+        let (agent, history) = build_agent_with_active(&self.db)?;
+        self.agent = agent;
+        self.history = history;
+        result
+    }
+
+    async fn run_provider_del_screen(&mut self) -> Result<()> {
+        use crate::tui::engine::{enter_alt, leave_alt, present, read_key, Outcome};
+        use crate::tui::screen::provider_del::ProviderDelPicker;
+
+        if !atty() {
+            // 非 TTY:提示使用 CLI 子命令
+            println!("  非交互模式请使用: laew provider del <id>");
+            return Ok(());
+        }
+
+        let screen = ProviderDelPicker::new(self.db.clone(), self.paths.clone(), -1);
+        enter_alt().map_err(anyhow::Error::from)?;
+        let result = Self::run_screen_loop(screen).await;
+        leave_alt().map_err(anyhow::Error::from)?;
+        let (agent, history) = build_agent_with_active(&self.db)?;
+        self.agent = agent;
+        self.history = history;
+        result
+    }
+
+    /// 通用子屏循环:渲染 → 读键 → 处理 Outcome。
+    async fn run_screen_loop(mut screen: impl crate::tui::engine::Screen) -> Result<()> {
+        use crate::tui::engine::{present, read_key, Outcome, Rect, Frame};
+
+        screen.on_enter();
+        loop {
+            let area = Rect::full_screen();
+            let mut frame = Frame::new(area);
+            screen.render(&mut frame);
+            present(&frame).map_err(anyhow::Error::from)?;
+
+            let key = read_key().map_err(anyhow::Error::from)?;
+            match screen.handle_key(key) {
+                Outcome::Continue => {}
+                Outcome::Pop | Outcome::Toast(_) => break,
+                Outcome::Push(_) => {
+                    // 简化:不支持嵌套 push;当作 Pop 处理(后续可扩展为栈)
+                    break;
+                }
+                Outcome::Quit => std::process::exit(0),
+            }
+        }
+        screen.on_exit();
+        Ok(())
     }
 }
 
@@ -235,7 +320,6 @@ fn suggest_similar_commands(input: &str) -> Vec<String> {
     all_commands
         .iter()
         .filter(|cmd| {
-            // 简单启发：前缀重叠或包含关系
             let cmd_lower = cmd.to_lowercase();
             cmd_lower.starts_with(&input_lower)
                 || input_lower.starts_with(&cmd_lower)
@@ -316,6 +400,7 @@ fn print_help() {
     println!("  │  /exit (quit, q)   退出 TUI                              │");
     println!("  │  /clear (c)        清空当前对话历史                       │");
     println!("  │  /model            显示当前模型                           │");
+    println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
     println!("  │  /provider list    列出所有接入记录                       │");
     println!("  │  /provider add     交互式新增接入记录                     │");
     println!("  │  /provider use <id>  切换当前模型                        │");
@@ -332,8 +417,8 @@ fn print_help() {
 }
 
 /// 启动活跃 agent;若未配置,使用占位提示信息
-fn build_agent_with_active(db: &Db) -> Result<(Agent, Vec<ChatMessage>)> {
-    match db.get_active().map_err(anyhow::Error::from)? {
+fn build_agent_with_active(db: &Arc<Mutex<Db>>) -> Result<(Agent, Vec<ChatMessage>)> {
+    match db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
         Some(r) => build_agent_with_record(r),
         None => {
             let tools = builtin_registry();
@@ -370,35 +455,54 @@ impl crate::llm::LlmClient for NoopLlm {
     }
 }
 
+/// 检测 stdin 是否为 TTY(终端)。非 TTY 时(管道 / 重定向)子屏回退到 print 输出。
+fn atty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
 /// 启动 TUI 交互式 REPL
 pub async fn run() -> Result<()> {
     let mut session = TuiSession::bootstrap()?;
     session.print_banner();
 
-    let input_handler = InputHandler::new();
-    let completion_engine = CompletionEngine::new();
+    if atty() {
+        let input_handler = InputHandler::new();
+        let completion_engine = CompletionEngine::new();
 
-    loop {
-        // 使用自定义输入处理器读取一行
-        let line = match input_handler.read_line(">> ", &completion_engine)? {
-            InputResult::Submitted(l) => l,
-            InputResult::Exit => {
-                println!("  再见。");
-                break;
-            }
-            InputResult::Interrupted => {
-                println!("  (中断) 输入 /exit 或 Ctrl-D 退出。");
+        loop {
+            let line = match input_handler.read_line(">> ", &completion_engine)? {
+                InputResult::Submitted(l) => l,
+                InputResult::Exit => {
+                    println!("  再见。");
+                    break;
+                }
+                InputResult::Interrupted => {
+                    println!("  (中断) 输入 /exit 或 Ctrl-D 退出。");
+                    continue;
+                }
+            };
+
+            if line.trim().is_empty() {
                 continue;
             }
-        };
 
-        if line.trim().is_empty() {
-            continue;
+            if session.handle_user_input(&line).await? {
+                break;
+            }
         }
-
-        // 处理输入
-        if session.handle_user_input(&line).await? {
-            break;
+    } else {
+        // 非 TTY:回退到阻塞式 stdin 行读取(用于管道 / e2e)
+        use std::io::{self, BufRead};
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if session.handle_user_input(&line).await? {
+                break;
+            }
         }
     }
     Ok(())

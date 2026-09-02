@@ -21,5 +21,4 @@ tmpPlan/
 .DS_Store
 
 # testReport:保留报告与脚本,仅忽略大体量原始产物
-/testReport/build.log
-/testReport/mock_requests-*.jsonl
+/testReport/
