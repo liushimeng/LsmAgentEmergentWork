@@ -79,3 +79,9 @@ pub fn builtin_registry() -> ToolRegistry {
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(write::WriteTool))
 }
+
+/// Yolo Agent 工具注册表:仅 Read(用于理解上下文,不修改系统状态)
+pub fn yolo_registry() -> ToolRegistry {
+    ToolRegistry::new()
+        .register(Arc::new(read::ReadTool))
+}

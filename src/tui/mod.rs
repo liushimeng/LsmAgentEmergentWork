@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 
-use crate::agent::{profile::AgentProfile, Agent};
+use crate::agent::yolo::YoloRunner;
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::llm::{client_from_record, ChatMessage};
 use crate::session::Session;
@@ -29,7 +29,7 @@ use input::{InputHandler, InputResult};
 pub struct TuiSession {
     pub paths: Paths,
     pub db: Arc<Mutex<Db>>,
-    pub agent: Agent,
+    pub yolo: YoloRunner,
     pub session: Session,
 }
 
@@ -38,9 +38,9 @@ impl TuiSession {
         let paths = Paths::detect().map_err(anyhow::Error::from)?;
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
         let db = Arc::new(Mutex::new(db));
-        let agent = build_agent_with_active(&db)?;
+        let yolo = build_yolo_with_active(&db)?;
         let session = Session::new();
-        Ok(Self { paths, db, agent, session })
+        Ok(Self { paths, db, yolo, session })
     }
 
     pub fn print_banner(&self) {
@@ -68,12 +68,12 @@ impl TuiSession {
         println!();
     }
 
-    /// 切换当前 provider(根据 id),并重新构造 Agent
+    /// 切换当前 provider(根据 id),并重新构造 YoloRunner
     pub fn switch_provider(&mut self, id: i64) -> Result<()> {
         let record = self.db.lock().expect("db").get(id).map_err(anyhow::Error::from)?;
         self.db.lock().expect("db").set_active(id).map_err(anyhow::Error::from)?;
-        let user_agent = self.agent.profile().user_agent();
-        self.agent = build_agent_with_record(&record, &user_agent)?;
+        let user_agent = self.yolo.work_agent().profile().user_agent();
+        self.yolo = build_yolo_with_record(&record, &user_agent)?;
         Ok(())
     }
 
@@ -128,9 +128,10 @@ impl TuiSession {
             // 斜杠命令
             return self.handle_slash(rest).await;
         }
-        // 普通提示词
+        // 普通提示词: Yolo 分类 → 直接回答 / 委派 Work
         self.session.context_mut().push(ChatMessage::user(line));
-        match self.agent.run_session(&mut self.session).await {
+        println!("  [yolo 分析中...]");
+        match self.yolo.handle(&mut self.session).await {
             Ok((text, usage)) => {
                 if !text.is_empty() {
                     println!();
@@ -252,8 +253,8 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        // 重建 Agent(可能切换了 use)
-        self.agent = build_agent_with_active(&self.db)?;
+        // 重建 YoloRunner(可能切换了 use)
+        self.yolo = build_yolo_with_active(&self.db)?;
         result
     }
 
@@ -273,7 +274,7 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        self.agent = build_agent_with_active(&self.db)?;
+        self.yolo = build_yolo_with_active(&self.db)?;
         result
     }
 
@@ -291,7 +292,7 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        self.agent = build_agent_with_active(&self.db)?;
+        self.yolo = build_yolo_with_active(&self.db)?;
         result
     }
 
@@ -433,23 +434,27 @@ fn print_help() {
     println!("    Esc            关闭列表");
 }
 
-/// 启动活跃 agent;若未配置,使用占位提示信息
-fn build_agent_with_active(db: &Arc<Mutex<Db>>) -> Result<Agent> {
-    let profile = AgentProfile::default_profile();
-    let user_agent = profile.user_agent();
+/// 启动 YoloRunner(双 Agent);若未配置,使用占位提示信息
+fn build_yolo_with_active(db: &Arc<Mutex<Db>>) -> Result<YoloRunner> {
+    let work_profile = crate::agent::profile::AgentProfile::work_profile();
+    let user_agent = work_profile.user_agent();
     match db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
-        Some(r) => build_agent_with_record(&r, &user_agent),
+        Some(r) => build_yolo_with_record(&r, &user_agent),
         None => {
             let warn_tail = "\n[系统] 当前尚未配置大模型接入记录。请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置后再开始对话。";
-            let profile = profile.with_env_tail(warn_tail);
-            Ok(Agent::new(Arc::new(NoopLlm), profile))
+            // 未配置时,Yolo 和 Work 都用 NoopLlm
+            let yolo_profile = crate::agent::profile::AgentProfile::yolo_profile();
+            let work_profile = work_profile.with_env_tail(warn_tail);
+            let yolo_agent = crate::agent::Agent::new(Arc::new(NoopLlm), yolo_profile);
+            let work_agent = crate::agent::Agent::new(Arc::new(NoopLlm), work_profile);
+            Ok(YoloRunner::from_agents(yolo_agent, work_agent))
         }
     }
 }
 
-fn build_agent_with_record(r: &ProviderRecord, user_agent: &str) -> Result<Agent> {
+fn build_yolo_with_record(r: &ProviderRecord, user_agent: &str) -> Result<YoloRunner> {
     let llm = client_from_record(r, user_agent).map_err(anyhow::Error::from)?;
-    Ok(Agent::new(llm, AgentProfile::default_profile()))
+    Ok(YoloRunner::new(llm))
 }
 
 /// 未配置模型时的占位 LLM(避免 null deref);`complete` 返回错误提示。

@@ -1,14 +1,25 @@
-//! Agent 身份档案(为多 Agent 架构预留)。
+//! Agent 身份档案(多 Agent 架构)。
 //!
-//! 当前仅构造一份默认 profile(`LsmAgentEmergentWork`),但 [`Agent`] 通过持有
-//! [`AgentProfile`] 来获取系统提示词与工具集,后续扩展为「多 profile 切换」时,
-//! Agent 循环无需改动。
+//! 内置两种 Agent profile:
+//! - **Work Agent** (`LsmAgentEmergentWork-Work`): 工作级 Agent,持有 Bash/Read/Write
+//!   全套工具,负责实际执行任务。
+//! - **Yolo Agent** (`LsmAgentEmergentWork-Yolo`): 入口级 Agent,负责目标识别、
+//!   意图识别、任务分类与拆解。
+//!
+//! [`Agent`] 通过持有 [`AgentProfile`] 来获取系统提示词与工具集,
+//! 后续扩展为更多 profile 时,Agent 循环无需改动。
 
 use crate::agent::system_prompt::SystemPrompt;
-use crate::agent::tools::{builtin_registry, ToolRegistry};
+use crate::agent::tools::{builtin_registry, yolo_registry, ToolRegistry};
 
-/// 默认 Agent 名称。
-pub const DEFAULT_AGENT_NAME: &str = "LsmAgentEmergentWork";
+/// Work Agent 名称(工作级 Agent,执行实际任务)。
+pub const WORK_AGENT_NAME: &str = "LsmAgentEmergentWork-Work";
+
+/// Yolo Agent 名称(入口级 Agent,任务识别与分类)。
+pub const YOLO_AGENT_NAME: &str = "LsmAgentEmergentWork-Yolo";
+
+/// 默认 Agent 名称(兼容别名,指向 Work Agent)。
+pub const DEFAULT_AGENT_NAME: &str = WORK_AGENT_NAME;
 
 /// 一个 Agent 身份档案:名称 / 系统提示词 / 工具集。
 #[derive(Clone)]
@@ -19,13 +30,27 @@ pub struct AgentProfile {
 }
 
 impl AgentProfile {
-    /// 构造默认 profile(使用内置工具与默认系统提示词)。
-    pub fn default_profile() -> Self {
+    /// 构造 Work Agent profile(工作级 Agent,全套 Bash/Read/Write 工具)。
+    pub fn work_profile() -> Self {
         Self {
-            name: DEFAULT_AGENT_NAME.to_string(),
+            name: WORK_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::default(),
             tools: builtin_registry(),
         }
+    }
+
+    /// 构造 Yolo Agent profile(入口级 Agent,任务识别与分类,仅含 Read 工具)。
+    pub fn yolo_profile() -> Self {
+        Self {
+            name: YOLO_AGENT_NAME.to_string(),
+            system_prompt: SystemPrompt::yolo(),
+            tools: yolo_registry(),
+        }
+    }
+
+    /// 构造默认 profile(兼容别名,等价于 work_profile)。
+    pub fn default_profile() -> Self {
+        Self::work_profile()
     }
 
     /// 自定义名称与系统提示词,仍使用内置工具集。
@@ -79,23 +104,53 @@ mod tests {
     #[test]
     fn default_profile_name() {
         let p = AgentProfile::default_profile();
+        assert_eq!(p.name, WORK_AGENT_NAME);
         assert_eq!(p.name, DEFAULT_AGENT_NAME);
         // 默认系统提示词渲染后非空
         assert!(!p.system_prompt.render(crate::config::Protocol::Anthropic).is_empty());
     }
 
     #[test]
+    fn work_profile_has_full_tools() {
+        let p = AgentProfile::work_profile();
+        assert_eq!(p.name, WORK_AGENT_NAME);
+        assert!(p.tools.defs().len() >= 3, "Work Agent 应有至少 3 个工具");
+    }
+
+    #[test]
+    fn yolo_profile_has_read_only() {
+        let p = AgentProfile::yolo_profile();
+        assert_eq!(p.name, YOLO_AGENT_NAME);
+        let defs = p.tools.defs();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        // Yolo 只有 Read 工具
+        assert!(names.contains(&"Read"), "Yolo Agent 应包含 Read 工具");
+        assert!(!names.contains(&"Bash"), "Yolo Agent 不应包含 Bash 工具");
+        assert!(!names.contains(&"Write"), "Yolo Agent 不应包含 Write 工具");
+    }
+
+    #[test]
     fn user_agent_format() {
-        let p = AgentProfile::default_profile();
+        let p = AgentProfile::work_profile();
         let ua = p.user_agent();
-        // 形如: LsmAgentEmergentWork/0.1.0 2026-09-02 15:30:12 CST
+        // 形如: LsmAgentEmergentWork-Work/0.1.0 2026-09-02 15:30:12 CST
         assert!(
-            ua.starts_with(&format!("{}/", DEFAULT_AGENT_NAME)),
-            "UA 应以 AgentName/ 开头: {ua}"
+            ua.starts_with(&format!("{}/", WORK_AGENT_NAME)),
+            "UA 应以 WorkAgentName/ 开头: {ua}"
         );
         assert!(ua.contains('/'), "UA 应含版本号分隔符");
         // 至少含一个空格(版本号与编译时间之间)
         assert!(ua.contains(' '), "UA 应含空格分隔版本与编译时间");
+    }
+
+    #[test]
+    fn yolo_user_agent_format() {
+        let p = AgentProfile::yolo_profile();
+        let ua = p.user_agent();
+        assert!(
+            ua.starts_with(&format!("{}/", YOLO_AGENT_NAME)),
+            "Yolo UA 应以 YoloAgentName/ 开头: {ua}"
+        );
     }
 
     #[test]

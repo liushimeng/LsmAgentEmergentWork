@@ -21,6 +21,9 @@ pub enum AgentError {
     #[error("达到最大迭代次数({0})仍未得到最终答案")]
     MaxIterationsExceeded(usize),
 
+    #[error("Yolo 分类解析失败: {0}")]
+    YoloParse(String),
+
     #[error("HTTP 请求错误: {0}")]
     Http(#[from] reqwest::Error),
 

@@ -213,14 +213,14 @@ mod tests {
             session_id: "20260902-153012-abcd1234-1700000000000-1a2b3c".into(),
             device_id: "45d277355416ee1b2f42758fb292b60b45170a57a5b4dec5cb7fa1a40fdd17ec".into(),
         };
-        let headers = build_common_headers("sk-xxx", &meta, "LsmAgentEmergentWork/0.1.0 2026-09-02 15:30:12 CST").unwrap();
+        let headers = build_common_headers("sk-xxx", &meta, "LsmAgentEmergentWork-Work/0.1.0 2026-09-02 15:30:12 CST").unwrap();
         assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
         let ua = headers
             .get("user-agent")
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(ua, "LsmAgentEmergentWork/0.1.0 2026-09-02 15:30:12 CST");
+        assert_eq!(ua, "LsmAgentEmergentWork-Work/0.1.0 2026-09-02 15:30:12 CST");
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer sk-xxx");
         assert_eq!(
             headers.get("x-session-id").unwrap(),

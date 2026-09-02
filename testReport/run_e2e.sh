@@ -79,7 +79,13 @@ chk(len(anth) >= 2 and len(oai) >= 2, f"两种协议均有 ≥2 次请求 (anthr
 if anth:
     b = anth[0]["body"]
     chk("system" in b and isinstance(b["system"], str), "anthropic: system 为顶层字符串")
-    chk(any(t.get("name") == "Bash" and "input_schema" in t for t in b.get("tools", [])), "anthropic: tools 含 Bash 且带 input_schema")
+    # 双 Agent 架构:Yolo(入口层,仅 Read)+ Work(执行层,全套工具)
+    # 找 tools 中含 Bash 的请求(即 Work Agent 的请求),校验工具定义格式
+    work_req = next((r for r in anth if any(
+        t.get("name") == "Bash" for t in r["body"].get("tools", [])
+    )), anth[-1])
+    b_tools = work_req["body"].get("tools", [])
+    chk(any(t.get("name") == "Bash" and "input_schema" in t for t in b_tools), "anthropic: tools 含 Bash 且带 input_schema")
 if len(anth) >= 2:
     b2 = anth[1]["body"]
     chk(any(c.get("type") == "tool_result" for m in b2["messages"] for c in m["content"]), "anthropic: 第2次请求含 tool_result 块")

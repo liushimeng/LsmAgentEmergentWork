@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use lsm_agent::agent::{profile::AgentProfile, Agent};
+use lsm_agent::agent::profile::AgentProfile;
+use lsm_agent::agent::yolo::YoloRunner;
 use lsm_agent::config::{Db, Paths, Protocol};
 use lsm_agent::llm::client_from_record;
 use lsm_agent::session::Session;
@@ -135,10 +136,17 @@ async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
         .get_active()
         .map_err(anyhow::Error::from)?
         .ok_or_else(|| anyhow::anyhow!("尚未配置当前模型,请先执行 `laew provider add` 添加接入记录。"))?;
-    let profile = AgentProfile::default_profile();
-    let user_agent = profile.user_agent();
+    // 用 Work Agent 的名称构造 User-Agent(作为主标识)
+    let work_profile = AgentProfile::work_profile();
+    let user_agent = work_profile.user_agent();
     let llm = client_from_record(&active, &user_agent).map_err(anyhow::Error::from)?;
-    // 在默认系统提示词基础上追加环境上下文(根目录 / 工作目录 / 当前模型)
+
+    eprintln!("[laew] 单轮模式: protocol={} provider={} model={}",
+        active.protocol.as_str(), active.provider_name, active.model_name);
+
+    // 构造 YoloRunner(Yolo + Work 双 Agent)
+    let yolo_runner = YoloRunner::with_work_max_iterations(llm, max_iterations);
+    // 环境上下文追加到 Work Agent 的系统提示词
     let env_tail = format!(
         "\n[环境] 根目录: {}  工作目录: {}  当前模型: [{:}] {}/{}",
         paths.root_dir.display(),
@@ -147,15 +155,12 @@ async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
         active.provider_name,
         active.model_name
     );
-    let profile = profile.with_env_tail(&env_tail);
+    let yolo_runner = yolo_runner.with_work_env_tail(&env_tail);
 
-    let agent = Agent::new(llm, profile).with_max_iterations(max_iterations);
-    eprintln!("[laew] 单轮模式: protocol={} provider={} model={}",
-        active.protocol.as_str(), active.provider_name, active.model_name);
     // -p 单轮模式每次生成独立 Session
     let mut session = Session::new();
     session.context_mut().push(lsm_agent::llm::ChatMessage::user(prompt));
-    let (answer, usage) = agent.run_session(&mut session).await.map_err(anyhow::Error::from)?;
+    let (answer, usage) = yolo_runner.handle(&mut session).await.map_err(anyhow::Error::from)?;
     println!("{answer}");
     if usage.input_tokens > 0 || usage.output_tokens > 0 {
         eprintln!(

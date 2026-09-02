@@ -3,6 +3,7 @@
 pub mod profile;
 pub mod system_prompt;
 pub mod tools;
+pub mod yolo;
 
 use std::sync::Arc;
 
