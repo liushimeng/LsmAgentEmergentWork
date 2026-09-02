@@ -5,7 +5,8 @@
 ## 工程是什么
 
 由 LLM 驱动的 Rust Agent CLI（二进制名 **`laew`**）。支持 Anthropic（anthropic-messages）与
-OpenAI（openai-completions）双协议，内置 Bash / Read / Write 三个工具，TUI 多轮对话 + `-p` 单轮模式。
+OpenAI（openai-completions）双协议，内置 Bash / Read / Write 三个工具，TUI 多轮对话 + `-p` 单轮模式 + `-f` 文件提示词模式。
+TUI 支持斜杠命令自动补全（Tab 补全 + 行内提示）和文件路径补全。
 配置持久化在 **根目录** SQLite（`LsmAgentEmergentWork.db`），不使用配置文件。
 
 ## 常用命令
@@ -19,6 +20,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key,18 项)
 ./laew --help                # CLI 指南
 ./laew                       # TUI 交互模式
 ./laew -p "任务描述"          # 单轮任务模式
+./laew -f /path/to/prompt.md # 从文件读取提示词执行(支持绝对/相对路径)
 ./laew provider add|list|use|delete ...
 ```
 
@@ -35,8 +37,8 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key,18 项)
 ## 架构（src/）
 
 ```
-main.rs        clap CLI:默认进 tui; -p 单轮; provider 子命令
-tui/mod.rs     rustyline REPL:横幅(根目录/工作目录/当前模型) + 斜杠命令(/provider /model /clear /exit)
+main.rs        clap CLI:默认进 tui; -p 单轮; -f 文件提示词; provider 子命令
+tui/mod.rs     rustyline REPL:横幅 + 斜杠命令 + 自动补全(Tab/行内提示) + 路径补全
 agent/mod.rs   协议无关循环:complete → tool_calls → 执行 → tool_result 回填 → 直至纯文本
 llm/mod.rs     统一消息模型 ChatMessage/ContentBlock/ToolDef + LlmClient trait(client_from_record 工厂)
 llm/anthropic.rs  Anthropic wire 转换(x-api-key + anthropic-version)
@@ -53,6 +55,7 @@ build.rs       注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 ## 文档地图（docs/）
 
 - `docs/工程初始化方案/` — 从 0 到 1 的分阶段解决方案（架构 / 任务分解 / 技术设计）
+- `docs/TUI交互优化与-f命令设计.md` — TUI 自动补全与 `-f` 文件参数的产品和技术设计
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
 

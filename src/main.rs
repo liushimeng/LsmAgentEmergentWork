@@ -1,5 +1,7 @@
 //! laew — LsmAgentEmergentWork 命令行入口。
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -28,8 +30,12 @@ const VERSION_INFO: &str = concat!(
 )]
 struct Cli {
     /// 单轮任务提示词(不进入 TUI)
-    #[arg(short = 'p', long = "prompt", value_name = "TEXT")]
+    #[arg(short = 'p', long = "prompt", value_name = "TEXT", conflicts_with = "file")]
     prompt: Option<String>,
+
+    /// 从文件读取提示词(支持绝对路径和相对路径,与 -p 互斥)
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    file: Option<PathBuf>,
 
     /// 最大 Agent 迭代次数
     #[arg(long, default_value_t = 16, global = true)]
@@ -149,6 +155,27 @@ async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
     Ok(())
 }
 
+/// 从文件读取提示词并执行单轮任务
+async fn run_from_file(file_path: PathBuf, max_iterations: usize) -> Result<()> {
+    // 相对路径基于工作目录解析
+    let absolute_path = if file_path.is_absolute() {
+        file_path
+    } else {
+        std::env::current_dir()?.join(file_path)
+    };
+
+    let content = std::fs::read_to_string(&absolute_path)
+        .map_err(|e| anyhow::anyhow!("无法读取文件 '{}': {}", absolute_path.display(), e))?;
+
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        anyhow::bail!("文件 '{}' 内容为空", absolute_path.display());
+    }
+
+    eprintln!("[laew] 从文件读取提示词: {} ({} 字符)", absolute_path.display(), content.len());
+    run_one_shot(content, max_iterations).await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -166,6 +193,8 @@ async fn main() -> Result<()> {
         None => {
             if let Some(prompt) = cli.prompt {
                 run_one_shot(prompt, cli.max_iterations).await
+            } else if let Some(file_path) = cli.file {
+                run_from_file(file_path, cli.max_iterations).await
             } else {
                 lsm_agent::tui::run().await
             }

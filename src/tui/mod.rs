@@ -4,17 +4,41 @@
 //! - 启动横幅展示根目录 / 工作目录 / 当前 provider_name / model_name
 //! - 多轮对话(直接输入提示词)
 //! - 斜杠命令:/help /provider /model /clear /exit
+//! - 斜杠命令自动补全(Tab 补全 + 行内提示)
+//! - 文件路径自动补全(Tab 补全目录/文件)
 
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{completion::{Completer, Pair}, hint::Hinter, validate::Validator, highlight::Highlighter, Helper, Context, Editor, DefaultEditor};
 
 use crate::agent::Agent;
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::llm::{client_from_record, ChatMessage};
 use crate::tool::{builtin_registry, builtin_system_prompt};
+
+/// 斜杠命令完整列表(含子命令,用于补全)
+const SLASH_COMMANDS: &[&str] = &[
+    "help",
+    "h",
+    "?",
+    "exit",
+    "quit",
+    "q",
+    "clear",
+    "c",
+    "model",
+    "provider list",
+    "provider ls",
+    "provider add",
+    "provider use",
+    "provider del",
+    "provider delete",
+    "provider rm",
+];
 
 pub struct TuiSession {
     pub paths: Paths,
@@ -199,6 +223,179 @@ impl TuiSession {
     }
 }
 
+// ==================== 自动补全 ====================
+
+/// TUI 辅助器:提供斜杠命令补全 + 路径补全 + 行内提示
+struct TuiHelper;
+
+impl Helper for TuiHelper {}
+
+impl Highlighter for TuiHelper {}
+impl Validator for TuiHelper {}
+
+impl Completer for TuiHelper {
+    type Candidate = Pair;
+
+    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // 空输入不补全
+        if line.is_empty() || pos == 0 {
+            return Ok((pos, vec![]));
+        }
+
+        // 斜杠命令补全(输入以 '/' 开头)
+        if line.starts_with('/') {
+            let cmd_matches = complete_slash_command(line, pos);
+            if !cmd_matches.is_empty() {
+                return Ok((1, cmd_matches)); // 起始位置 1,跳过 '/'
+            }
+            // 命令无匹配,尝试路径补全(如 /home/...)
+            return complete_path(line, pos);
+        }
+
+        // 路径模式检测(用于未来工具参数补全)
+        if looks_like_path(line) {
+            return complete_path(line, pos);
+        }
+
+        // 普通提示词不补全
+        Ok((pos, vec![]))
+    }
+}
+
+impl Hinter for TuiHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        // 仅对斜杠命令提供行内提示
+        if !line.starts_with('/') || line.len() < 2 || pos < 2 {
+            return None;
+        }
+        // 已有空格(进入子命令/参数阶段)不提示
+        if line.contains(' ') {
+            return None;
+        }
+        let input = &line[1..]; // 去掉 '/'
+        if input.is_empty() {
+            return None;
+        }
+
+        // 查找唯一前缀匹配(排除完全匹配)
+        let matches: Vec<&&str> = SLASH_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.starts_with(input) && **cmd != input)
+            .collect();
+
+        if matches.len() == 1 {
+            Some(matches[0][input.len()..].to_string())
+        } else {
+            None
+        }
+    }
+}
+
+/// 斜杠命令补全:返回匹配的命令候选列表
+fn complete_slash_command(line: &str, _pos: usize) -> Vec<Pair> {
+    let input = line[1..].trim(); // 去掉开头的 '/'
+    let input_lower = input.to_lowercase();
+
+    SLASH_COMMANDS
+        .iter()
+        .filter(|cmd| cmd.starts_with(&input_lower) && **cmd != input)
+        .map(|cmd| Pair {
+            display: format!("/{}", cmd),
+            replacement: format!("/{}", cmd),
+        })
+        .collect()
+}
+
+/// 检测输入是否看起来像路径
+fn looks_like_path(line: &str) -> bool {
+    line.starts_with('/')
+        || line.starts_with("./")
+        || line.starts_with("../")
+        || line.starts_with("~/")
+}
+
+/// 路径补全:返回匹配的目录/文件候选列表
+fn complete_path(line: &str, _pos: usize) -> rustyline::Result<(usize, Vec<Pair>)> {
+    let expanded = expand_tilde(line);
+
+    // 分离目录部分和文件名前缀
+    let (dir, prefix) = if expanded.ends_with('/') && expanded.len() > 1 {
+        // 以 / 结尾:列出该目录下全部内容
+        (expanded.trim_end_matches('/').to_string(), String::new())
+    } else if let Some(parent) = Path::new(&expanded).parent() {
+        let dir_str = parent.display().to_string();
+        let prefix_str = Path::new(&expanded).file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (dir_str, prefix_str)
+    } else {
+        (expanded.clone(), String::new())
+    };
+
+    let dir_path = Path::new(&dir);
+    if !dir_path.is_dir() {
+        return Ok((line.len(), vec![]));
+    }
+
+    let mut pairs: Vec<Pair> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with(&prefix) {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            let display_name = if is_dir {
+                format!("{}/", name_str)
+            } else {
+                name_str.to_string()
+            };
+            // 构造完整替换路径
+            let replacement = if dir == "/" {
+                format!("/{}", name_str)
+            } else if dir == "~" || dir.starts_with("~/") {
+                format!("{}/{}", dir, name_str)
+            } else {
+                format!("{}/{}", dir, name_str)
+            };
+            pairs.push(Pair {
+                display: display_name,
+                replacement,
+            });
+        }
+    }
+
+    // 目录优先,按名称排序
+    pairs.sort_by(|a, b| {
+        let a_is_dir = a.display.ends_with('/');
+        let b_is_dir = b.display.ends_with('/');
+        match (b_is_dir, a_is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.display.cmp(&b.display),
+        }
+    });
+
+    Ok((line.len(), pairs))
+}
+
+/// 展开家目录 '~' → $HOME
+fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return path.replacen("~", &home, 1);
+        }
+    } else if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return home;
+        }
+    }
+    path.to_string()
+}
+
 fn readline_single(prompt: &str) -> Result<DefaultEditor> {
     let mut rl = DefaultEditor::new()?;
     if !prompt.is_empty() {
@@ -238,7 +435,13 @@ fn print_help() {
          /model               显示当前模型\n\
          /clear, /c           清空当前对话历史\n\
          /exit, /quit, /q     退出\n\
-         其他输入             作为提示词进入多轮对话"
+         其他输入             作为提示词进入多轮对话\n\
+         \n\
+         补全提示:\n\
+         - 输入 / 后按 Tab    列出/补全斜杠命令\n\
+         - 输入路径时按 Tab   补全目录/文件名\n\
+         - 唯一匹配时显示灰色提示,按 → 或 End 接受\n\
+         - Ctrl-J 插入换行(多行输入)"
     );
 }
 
@@ -286,7 +489,9 @@ pub async fn run() -> Result<()> {
     let mut session = TuiSession::bootstrap()?;
     session.print_banner();
 
-    let mut rl = DefaultEditor::new()?;
+    let mut rl = Editor::new()?;
+    // 注册自动补全 Helper
+    rl.set_helper(Some(TuiHelper));
     loop {
         let prompt = ">> ";
         let line = match rl.readline(prompt) {
