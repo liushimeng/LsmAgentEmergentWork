@@ -55,7 +55,12 @@ impl TaskLevel {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskClassification {
     pub task_level: TaskLevel,
+    /// 三步识别之一:用户目的(为什么问)。旧格式 JSON 缺省为空。
+    #[serde(default)]
+    pub purpose: String,
+    /// 三步识别之二:目标(要达成什么)。
     pub goal_summary: String,
+    /// 三步识别之三:意图标签。
     pub intent: String,
     #[serde(default)]
     pub decomposition_plan: Vec<String>,
@@ -121,7 +126,16 @@ impl YoloRunner {
     ///
     /// - `session`: 主会话(包含历史上下文);Yolo 阶段的输出会入栈
     /// - 返回:(最终回复文本, 累计 token 用量)
+    ///
+    /// 每轮开始前做幂等的项目上下文注入:每个 Session 首次处理时把
+    /// 「工作目录 + 当前项目说明文件内容」作为带标记的独立消息插入 index 0
+    /// (见 `agent::project_context`)。
     pub async fn handle(&self, session: &mut Session) -> Result<(String, Usage)> {
+        // --- 阶段 0: 项目上下文首次注入(幂等) ---
+        if let Some(work_dir) = crate::agent::project_context::current_work_dir() {
+            crate::agent::project_context::inject_once(session, work_dir);
+        }
+
         // --- 阶段 1: Yolo 分类 ---
         let outcome = run_yolo(&self.yolo_agent, session.context()).await?;
 
@@ -137,10 +151,16 @@ impl YoloRunner {
                         text.clone(),
                     )]));
                 // 在文本末尾附上 Yolo 分类标记(便于调试/透明性)
+                let purpose_tag = if classification.purpose.is_empty() {
+                    String::new()
+                } else {
+                    format!(" / 目的: {}", classification.purpose)
+                };
                 let final_text = format!(
-                    "{}\n\n[yolo 分类: {} / 意图: {}]",
+                    "{}\n\n[yolo 分类: {}{} / 意图: {}]",
                     text,
                     classification.task_level.display_name(),
+                    purpose_tag,
                     classification.intent
                 );
                 Ok((final_text, total_usage))
@@ -211,6 +231,7 @@ async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<YoloOut
             tracing::warn!("Yolo 分类解析失败,降级为 simple: {}", e);
             TaskClassification {
                 task_level: TaskLevel::Simple,
+                purpose: String::new(),
                 goal_summary: "(解析失败,已降级)".to_string(),
                 intent: "unknown".to_string(),
                 decomposition_plan: vec![],
@@ -328,6 +349,9 @@ fn extract_standalone_json(text: &str) -> Option<&str> {
 fn build_work_prompt(classification: &TaskClassification) -> String {
     let mut prompt = String::new();
     prompt.push_str("【任务计划】\n");
+    if !classification.purpose.is_empty() {
+        prompt.push_str(&format!("目的: {}\n", classification.purpose));
+    }
     prompt.push_str(&format!("目标: {}\n", classification.goal_summary));
     prompt.push_str(&format!(
         "难度: {} ({})\n",
@@ -408,6 +432,7 @@ mod tests {
                 r#"```json
 {{
   "task_level": "{}",
+  "purpose": "测试目的",
   "goal_summary": "测试目标",
   "intent": "test",
   "decomposition_plan": ["步骤1"],
@@ -422,6 +447,7 @@ mod tests {
                 }
             );
             let result = parse_classification(&json).unwrap();
+            assert_eq!(result.purpose, "测试目的");
             assert_eq!(result.goal_summary, "测试目标");
             assert_eq!(result.intent, "test");
             if level == "trivial" {
@@ -438,20 +464,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_classification_legacy_json_without_purpose() {
+        // 旧格式 JSON 无 purpose 字段,serde default 兼容
+        let json = r#"```json
+{
+  "task_level": "simple",
+  "goal_summary": "旧目标",
+  "intent": "legacy",
+  "decomposition_plan": [],
+  "direct_answer": null
+}
+```"#;
+        let result = parse_classification(json).unwrap();
+        assert_eq!(result.task_level, TaskLevel::Simple);
+        assert_eq!(result.purpose, "");
+        assert_eq!(result.goal_summary, "旧目标");
+    }
+
+    #[test]
     fn build_work_prompt_contains_all_fields() {
         let c = TaskClassification {
             task_level: TaskLevel::Medium,
+            purpose: "验证任务计划构造".into(),
             goal_summary: "测试目标".into(),
             intent: "code_change".into(),
             decomposition_plan: vec!["第一步".into(), "第二步".into()],
             direct_answer: None,
         };
         let prompt = build_work_prompt(&c);
+        assert!(prompt.contains("验证任务计划构造"));
         assert!(prompt.contains("测试目标"));
         assert!(prompt.contains("中等难度"));
         assert!(prompt.contains("code_change"));
         assert!(prompt.contains("第一步"));
         assert!(prompt.contains("第二步"));
+    }
+
+    #[test]
+    fn build_work_prompt_empty_purpose_omitted() {
+        let c = TaskClassification {
+            task_level: TaskLevel::Simple,
+            purpose: String::new(),
+            goal_summary: "目标".into(),
+            intent: "chat".into(),
+            decomposition_plan: vec![],
+            direct_answer: None,
+        };
+        let prompt = build_work_prompt(&c);
+        assert!(!prompt.contains("目的:"));
     }
 
     #[test]

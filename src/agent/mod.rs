@@ -1,6 +1,7 @@
 //! Agent 核心循环:协议无关的 LLM 规划 -> 工具执行 -> 观察。
 
 pub mod profile;
+pub mod project_context;
 pub mod system_prompt;
 pub mod tools;
 pub mod yolo;

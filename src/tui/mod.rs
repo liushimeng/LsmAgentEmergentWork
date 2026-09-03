@@ -51,6 +51,9 @@ impl TuiSession {
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║  根目录 : {:<46} ║", truncate(&self.paths.root_dir.display().to_string(), 46));
         println!("║  工作目录: {:<45} ║", truncate(&self.paths.work_dir.display().to_string(), 45));
+        // 项目说明文件状态(纯探测,不触发生成;发现规则见 docs/Yolo项目上下文注入/)
+        let doc_source = crate::agent::project_context::probe(&self.paths.work_dir);
+        println!("║  项目说明: {:<45} ║", truncate(doc_source.as_str(), 45));
         match active {
             Some(r) => println!(
                 "║  当前模型: [{}] {}/{} {:<25} ║",

@@ -60,6 +60,88 @@ run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 section "5. Anthropic 协议端到端(工具调用循环)"
 OUT=$(run "$LAEW" -p "请帮我执行一个测试命令"); echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "返回最终文本"
 
+# --- 5b. 项目说明文件发现与首次注入(工作目录五级链) ---
+# 规则: CLAUDE.md > AGENTS.md > README.md > 根目录 Markdown 自动生成 README.md > 空
+# 设计见 docs/Yolo项目上下文注入/02-技术实现文档.md §6
+section "5b. 项目上下文注入(说明文件五级链)"
+CTX_BASE=/tmp/laew-e2e-ctx; rm -rf "$CTX_BASE"
+
+# 场景A:三级并存 → 只注入 CLAUDE.md 内容
+CTX_A="$CTX_BASE/a"; mkdir -p "$CTX_A"
+printf '# 项目A\n\nPROJ-A-CLAUDE 标记内容\n'   > "$CTX_A/CLAUDE.md"
+printf '# 项目A代理\n\nPROJ-A-AGENTS 标记内容\n' > "$CTX_A/AGENTS.md"
+printf '# 项目A自述\n\nPROJ-A-README 标记内容\n' > "$CTX_A/README.md"
+CA0=$(wc -l < "$MOCK_LOG"); (cd "$CTX_A" && run "$LAEW" -p "场景A测试") >/dev/null 2>&1; CA1=$(wc -l < "$MOCK_LOG")
+
+# 场景B:仅有其它 md → 自动分析生成 README.md 并注入其内容
+CTX_B="$CTX_BASE/b"; mkdir -p "$CTX_B"
+printf '# 架构总览\n\n本项目采用双 Agent 架构。\n\n## 模块\n\n- agent\n' > "$CTX_B/架构说明.md"
+printf '# 备忘\n\n日常备忘。\n' > "$CTX_B/notes.md"
+CB0=$(wc -l < "$MOCK_LOG"); (cd "$CTX_B" && run "$LAEW" -p "场景B测试") >/dev/null 2>&1; CB1=$(wc -l < "$MOCK_LOG")
+[ -f "$CTX_B/README.md" ]; check $? "场景B: README.md 已自动生成"
+grep -q "laew:auto-generated" "$CTX_B/README.md" 2>/dev/null; check $? "场景B: 生成文件含自动生成标记"
+grep -q "架构总览" "$CTX_B/README.md" 2>/dev/null; check $? "场景B: 生成文件含文档标题"
+
+# 场景C:无任何 Markdown → 说明文件为空,不注入
+CTX_C="$CTX_BASE/c"; mkdir -p "$CTX_C"
+CC0=$(wc -l < "$MOCK_LOG"); (cd "$CTX_C" && run "$LAEW" -p "场景C测试") >/dev/null 2>&1; CC1=$(wc -l < "$MOCK_LOG")
+
+python3 - "$MOCK_LOG" "$CA0" "$CA1" "$CB0" "$CB1" "$CC0" "$CC1" <<'PYEOF' 2>&1 | tee -a "$REPORT"
+import json, sys
+path = sys.argv[1]
+args = [int(x) for x in sys.argv[2:8]]
+ranges = {"A": (args[0], args[1]), "B": (args[2], args[3]), "C": (args[4], args[5])}
+reqs = [json.loads(l) for l in open(path, encoding="utf-8")]
+ok = True
+def chk(cond, name):
+    global ok
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+    ok = ok and cond
+def anth_in(rng):
+    s, e = rng
+    return [req for i, req in enumerate(reqs, 1) if s < i <= e and "v1/messages" in req["path"]]
+def block_texts(m):
+    c = m.get("content")
+    if isinstance(c, list):
+        return [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+    return [c] if isinstance(c, str) else []
+def all_texts(req):
+    return [t for m in req["body"].get("messages", []) for t in block_texts(m)]
+def user_texts(req):
+    return [t for m in req["body"].get("messages", []) if m.get("role") == "user" for t in block_texts(m)]
+
+# 场景A:优先级 CLAUDE.md
+ra = anth_in(ranges["A"])
+chk(len(ra) >= 1, f"场景A: 有 anthropic 请求 ({len(ra)})")
+if ra:
+    texts = "\n".join(all_texts(ra[0]))
+    chk("LAEW:PROJECT_CONTEXT" in texts, "场景A: 首请求含项目上下文标记")
+    chk("PROJ-A-CLAUDE" in texts, "场景A: 注入 CLAUDE.md 内容")
+    chk("PROJ-A-AGENTS" not in texts, "场景A: 未注入 AGENTS.md 内容(优先级正确)")
+    chk("PROJ-A-README" not in texts, "场景A: 未注入 README.md 内容(优先级正确)")
+    users = user_texts(ra[0])
+    chk(len(users) == 2 and users[-1].strip() == "场景A测试", "场景A: 用户提示词独立成条且未被改写")
+
+# 场景B:自动生成 README.md 并注入
+rb = anth_in(ranges["B"])
+chk(len(rb) >= 1, f"场景B: 有 anthropic 请求 ({len(rb)})")
+if rb:
+    texts = "\n".join(all_texts(rb[0]))
+    chk("LAEW:PROJECT_CONTEXT" in texts, "场景B: 首请求含项目上下文标记")
+    chk("架构总览" in texts, "场景B: 注入自动生成的 README 内容")
+
+# 场景C:无 Markdown,不注入
+rc = anth_in(ranges["C"])
+chk(len(rc) >= 1, f"场景C: 有 anthropic 请求 ({len(rc)})")
+if rc:
+    chk(all("LAEW:PROJECT_CONTEXT" not in t for req in rc for t in all_texts(req)), "场景C: 所有请求均无注入标记")
+    users = user_texts(rc[0])
+    chk(len(users) == 1 and users[0].strip() == "场景C测试", "场景C: user 消息仅用户提示词一条")
+sys.exit(0 if ok else 1)
+PYEOF
+check $? "5b 三场景注入行为校验(mock 日志)"
+
+rm -rf "$CTX_BASE"
 kill $MOCK_PID 2>/dev/null
 
 # --- 6. 协议请求格式校验(抓包日志) ---
@@ -86,6 +168,21 @@ if anth:
     )), anth[-1])
     b_tools = work_req["body"].get("tools", [])
     chk(any(t.get("name") == "Bash" and "input_schema" in t for t in b_tools), "anthropic: tools 含 Bash 且带 input_schema")
+    # 项目上下文注入断言(本节 -p 在仓库根目录运行,工作目录=仓库根,命中 CLAUDE.md)
+    def _texts(m):
+        c = m.get("content")
+        if isinstance(c, list):
+            return [x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"]
+        return [c] if isinstance(c, str) else []
+    msgs = b.get("messages", [])
+    ctx_msgs = [m for m in msgs if any("LAEW:PROJECT_CONTEXT" in t for t in _texts(m))]
+    chk(len(ctx_msgs) == 1, "anthropic: 首请求含且仅含 1 条项目上下文注入消息")
+    if len(ctx_msgs) == 1:
+        t0 = "\n".join(_texts(ctx_msgs[0]))
+        chk("工作目录:" in t0 and "CLAUDE.md" in t0, "anthropic: 注入消息含工作目录与说明文件来源")
+    users = [m for m in msgs if m.get("role") == "user"]
+    last_user = _texts(users[-1])[0].strip() if users else ""
+    chk(last_user == "请帮我执行一个测试命令", "anthropic: 用户提示词原文独立成条(未与上下文混淆)")
 if len(anth) >= 2:
     b2 = anth[1]["body"]
     chk(any(c.get("type") == "tool_result" for m in b2["messages"] for c in m["content"]), "anthropic: 第2次请求含 tool_result 块")
@@ -128,6 +225,7 @@ section "7. TUI 冒烟测试"
 OUT=$(printf '/help\n/model\n/provider list\n/new\n/exit\n' | run "$LAEW")
 echo "$OUT" | grep -q "根目录"; check $? "TUI 横幅显示根目录"
 echo "$OUT" | grep -q "工作目录"; check $? "TUI 横幅显示工作目录"
+echo "$OUT" | grep -q "项目说明"; check $? "TUI 横幅显示项目说明状态"
 echo "$OUT" | grep -q "当前模型"; check $? "TUI 横幅显示当前模型"
 echo "$OUT" | grep -q "Session"; check $? "TUI 横幅显示 Session ID"
 echo "$OUT" | grep -q "provider add"; check $? "/help 输出命令指南"
@@ -191,6 +289,7 @@ else
   # 1) 横幅
   texpect "根目录" "tmux: 横幅显示根目录"
   texpect "工作目录" "tmux: 横幅显示工作目录"
+  texpect "项目说明" "tmux: 横幅显示项目说明状态"
   texpect "Session" "tmux: 横幅显示 Session ID"
   texpect "当前模型" "tmux: 横幅显示当前模型"
 
