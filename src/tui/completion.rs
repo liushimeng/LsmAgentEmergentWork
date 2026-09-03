@@ -207,4 +207,49 @@ mod tests {
         let items = engine.complete("xyz");
         assert!(items.is_empty());
     }
+
+    #[test]
+    fn test_complete_backspace_scenario() {
+        // 模拟退格场景：/provider lis → /provider li → /provider l → ...
+        // 每次退格后补全引擎应正确返回匹配项
+        let engine = CompletionEngine::new();
+
+        // /provider lis → 匹配 "provider list"(以 "provider lis" 开头)
+        let items = engine.complete("/provider lis");
+        assert!(items.iter().any(|i| i.replacement == "/provider list "));
+
+        // /provider li → 匹配 "provider list"（"ls" 不以 "li" 开头）
+        let items = engine.complete("/provider li");
+        assert!(items.iter().any(|i| i.replacement == "/provider list "));
+        assert!(!items.iter().any(|i| i.replacement == "/provider ls "));
+
+        // /provider l → 匹配 "provider list"("ls" 是别名,不出现在 replacement 中)
+        let items = engine.complete("/provider l");
+        assert!(items.iter().any(|i| i.replacement == "/provider list "));
+        assert!(!items.iter().any(|i| i.replacement == "/provider ls "));
+
+        // /provider  → 匹配所有 provider 子命令
+        let items = engine.complete("/provider ");
+        assert!(items.len() >= 4); // list, add, use, del
+
+        // /provider → 匹配所有 provider 子命令
+        let items = engine.complete("/provider");
+        assert!(items.len() >= 4);
+
+        // /provid → 匹配 provider
+        let items = engine.complete("/provid");
+        assert!(items.iter().any(|i| i.replacement == "/provider "));
+
+        // /pro → 匹配 provider 及其子命令
+        let items = engine.complete("/pro");
+        assert!(items.iter().any(|i| i.replacement == "/provider "));
+
+        // /pr → 匹配 provider 及其子命令
+        let items = engine.complete("/pr");
+        assert!(items.iter().any(|i| i.replacement == "/provider "));
+
+        // /p → 匹配 provider 及其子命令
+        let items = engine.complete("/p");
+        assert!(items.iter().any(|i| i.replacement == "/provider "));
+    }
 }

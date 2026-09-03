@@ -159,6 +159,17 @@ impl InputHandler {
                                 self.update_completion(&mut stdout, &buffer, prompt_width, &mut completion_active, &mut completion_index, &mut completion_items, engine)?;
                             }
                         }
+                        // 兜底：某些终端环境下 crossterm 未将退格映射为 KeyCode::Backspace，
+                        // 而是作为 Char('\x7f') (DEL) 或 Char('\x08') (BS) 传递。
+                        // 此处显式拦截，避免退格字符落入 Char(c) 分支被当作普通字符插入。
+                        KeyCode::Char('\x7f') | KeyCode::Char('\x08') => {
+                            if cursor > 0 {
+                                cursor -= 1;
+                                buffer.remove(cursor);
+                                self.redraw_line(&mut stdout, prompt, &buffer, cursor, prompt_width)?;
+                                self.update_completion(&mut stdout, &buffer, prompt_width, &mut completion_active, &mut completion_index, &mut completion_items, engine)?;
+                            }
+                        }
                         KeyCode::Delete => {
                             // Delete：删除光标处字符
                             if cursor < buffer.len() {

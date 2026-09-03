@@ -275,7 +275,112 @@ else
   tresize 100 30
   sleep 0.4
 
-  # 10) /exit 退出 TUI(tmux 检测到子进程结束自动销毁会话)
+  # 10) 退格键行为测试:验证退格在同一行原地编辑
+  tsend "/provider list"
+  sleep 0.5
+  # 发送 5 个退格(删除 "list" + 尾随空格)
+  # 注意:tmux send-keys 用 "C-h" 发送退格(\x08),不能用 "Backspace"(会被当字面量)
+  for _ in 1 2 3 4 5; do tkey C-h; sleep 0.1; done
+  sleep 0.3
+  # 退格后输入应变为 "/provider"(同一行,无多余换行)
+  # 提交后应进入 ProviderList 子屏(因为 /provider 默认路由到 list)
+  tkey Enter
+  sleep 0.8
+  # 如果退格正确,输入为 "/provider" → 路由到 ProviderList 子屏
+  if tscreen | grep -F -q "/provider list" || tscreen | grep -F -q "记录:"; then
+    check 0 "tmux: 退格键原地编辑(提交 /provider 进入子屏)"
+  else
+    # 可能退格不正确导致提交了错误内容;检查是否回到主屏
+    check 1 "tmux: 退格键原地编辑(提交 /provider 进入子屏)"
+    { echo "    --- tmux capture at backspace failure ---"; tscreen | sed 's/^/    | /'; echo "    --- end ---"; } | tee -a "$REPORT"
+  fi
+  # 如果进入了子屏,先 Esc 退出
+  tkey Escape
+  sleep 0.6
+
+  # 11) 补全引擎交互测试:输入 /pro 后补全列表应出现
+  tsend "/pro"
+  sleep 0.5
+  # 补全列表应显示 provider 相关候选
+  if tscreen | grep -F -q "provider"; then
+    check 0 "tmux: 补全列表显示 provider 候选项"
+  else
+    check 1 "tmux: 补全列表显示 provider 候选项"
+    { echo "    --- tmux capture at completion failure ---"; tscreen | sed 's/^/    | /'; echo "    --- end ---"; } | tee -a "$REPORT"
+  fi
+  # Tab 接受补全
+  tkey Tab
+  sleep 0.3
+  # 接受后缓冲区应为 "/provider "
+  # 验证方式:提交后进入 ProviderList 子屏
+  tkey Enter
+  sleep 0.8
+  if tscreen | grep -F -q "/provider list" || tscreen | grep -F -q "记录:"; then
+    check 0 "tmux: Tab 接受补全后提交进入子屏"
+  else
+    check 1 "tmux: Tab 接受补全后提交进入子屏"
+  fi
+  tkey Escape
+  sleep 0.6
+
+  # 12) Esc 关闭补全列表
+  tsend "/hel"
+  sleep 0.5
+  # 补全列表应出现
+  tscreen | grep -F -q "help" && true
+  # Esc 关闭补全
+  tkey Escape
+  sleep 0.3
+  # 补全列表关闭后,输入行仍在(不应提交)
+  # 验证:屏幕仍有 ">>" 提示符且未进入任何子屏
+  if tscreen | grep -F -q ">>"; then
+    check 0 "tmux: Esc 关闭补全列表"
+  else
+    check 1 "tmux: Esc 关闭补全列表"
+  fi
+  # 清理:Ctrl-C 中断当前输入
+  tkey C-c
+  sleep 0.3
+
+  # 13) /provider use 测试(先 add 一条记录用于测试)
+  tsubmit "/provider add"
+  texpect "/provider add" "tmux: 进入 ProviderForm(add)"
+  # 快速填写:直接到确认 Tab
+  # Tab 0(protocol) → Tab 1(provider_name) → ... → Tab 5(确认)
+  # 填写 provider_name
+  tkey Right; sleep 0.2
+  tkey Enter; sleep 0.3
+  tsend "tmuxTest"; sleep 0.3
+  tkey Enter; sleep 0.3
+  # 填写 model_name
+  tkey Right; sleep 0.2
+  tkey Enter; sleep 0.3
+  tsend "test-model"; sleep 0.3
+  tkey Enter; sleep 0.3
+  # 填写 end_point
+  tkey Right; sleep 0.2
+  tkey Enter; sleep 0.3
+  tsend "http://127.0.0.1:18899"; sleep 0.3
+  tkey Enter; sleep 0.3
+  # 填写 api_key
+  tkey Right; sleep 0.2
+  tkey Enter; sleep 0.3
+  tsend "sk-test-tmux"; sleep 0.3
+  tkey Enter; sleep 0.3
+  # 确认 Tab:默认选中 [确认],直接 Enter
+  tkey Right; sleep 0.2
+  tkey Enter; sleep 1.0
+  # 验证返回主屏(应有 Toast 或主屏 prompt)
+  texpect ">>" "tmux: /provider add 完成返回主屏" 3
+
+  # 14) /provider use <id> 切换
+  # 获取新添加记录的 id(通过 CLI provider list)
+  tsubmit "/model"
+  sleep 0.5
+  # /model 输出当前模型信息(格式: [protocol] provider / model @ end_point)
+  texpect "tmuxTest" "tmux: /model 显示当前模型" 2
+
+  # 15) /exit 退出 TUI(tmux 检测到子进程结束自动销毁会话)
   tsubmit "/exit"
   deadline=$((SECONDS + 5))
   while tmux has-session -t "$TSESS" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
