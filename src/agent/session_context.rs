@@ -169,20 +169,6 @@ pub fn is_history_injected(context: &[ChatMessage]) -> bool {
     })
 }
 
-/// 把最近 N 条 Summary 摘要注入 Session 上下文(幂等)。
-pub fn inject_history_once(session: &mut session::Session, n: usize) -> bool {
-    if is_history_injected(session.context()) {
-        return false;
-    }
-    let entries = session
-        .id()
-        .to_string();
-    let _ = entries; // placeholder
-    // 真实的获取:由 Orchestrator 持有 db,这里签名稍作调整
-    // 实际由 inject_history_with_entries 提供完整能力
-    false
-}
-
 /// 由 Orchestrator 调用,把指定条目注入 Session 上下文(幂等)。
 pub fn inject_history_with_entries(
     session: &mut session::Session,

@@ -112,7 +112,7 @@ fn format_readable(secs: u64, _subsec: u32) -> String {
         Err(_) => base,
     };
     dt.format(
-        &time::format_description::parse("[year][month][day]-[hour][minute][second]")
+        &time::format_description::parse_borrowed::<2>("[year][month][day]-[hour][minute][second]")
             .expect("format"),
     )
     .expect("fmt")

@@ -12,7 +12,7 @@ use crate::agent::memory;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
-use crate::llm::{ChatMessage, Usage};
+use crate::llm::ChatMessage;
 
 /// 单个 WorkFlow 规格(Main-Work 输出)
 #[derive(Debug, Clone, Serialize, Deserialize)]

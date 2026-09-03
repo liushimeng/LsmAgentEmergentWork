@@ -9,7 +9,7 @@ use crate::agent::memory;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::Result;
-use crate::llm::{ChatMessage, Usage};
+use crate::llm::ChatMessage;
 use crate::session;
 
 /// 质检结论。

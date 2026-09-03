@@ -33,4 +33,12 @@ fn main() {
 
     // 源文件变化时重新运行
     println!("cargo:rerun-if-changed=build.rs");
+    // Git HEAD 变化时重新运行,保证 --version 的编译时间与 hash 实时准确
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    // 分支引用变化时重新运行(提交后 HEAD 指向的 ref 文件会更新)
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(refname) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed=.git/{}", refname);
+        }
+    }
 }
