@@ -139,7 +139,7 @@ impl Completion {
 }
 
 /// Token 用量统计。所有字段为 0 表示上游未提供。
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     /// 输入侧 token 数(Anthropic input_tokens / OpenAI prompt_tokens)。
     pub input_tokens: u32,

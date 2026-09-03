@@ -1,7 +1,25 @@
 //! Agent 核心循环:协议无关的 LLM 规划 -> 工具执行 -> 观察。
+//!
+//! 多 Agent 架构(6 角色):
+//! - Yolo:入口层(任务识别 / 难度分级 / 失败回流)
+//! - Plan:规划层(hard 档 Markdown 方案)
+//! - Main-Work:流程层(WorkFlow 编排)
+//! - SubAgent-Work:执行层(最小单元)
+//! - Quality-Check:质检层
+//! - SessionContext:会话层
+//!
+//! 设计见 `docs/多Agent架构重构/01-设计与解决方案.md`。
 
+pub mod context;
+pub mod main_work;
+pub mod memory;
+pub mod orchestrator;
+pub mod plan;
 pub mod profile;
 pub mod project_context;
+pub mod quality;
+pub mod session_context;
+pub mod subagent;
 pub mod system_prompt;
 pub mod tools;
 pub mod yolo;

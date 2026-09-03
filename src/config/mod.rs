@@ -1,6 +1,6 @@
 //! 配置层:
 //! - 解析「根目录」(二进制所在目录) 与「工作目录」(启动目录);
-//! - 使用 SQLite(`LsmAgentEmergentWork.db`)持久化大模型接入记录。
+//! - 使用 SQLite(`LsmAgentEmergentWork.db`)持久化大模型接入记录、Session 记忆、Agent 记忆。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -8,6 +8,9 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use thiserror::Error;
+
+pub mod agent_memory;
+pub mod session_memory;
 
 const DB_FILE_NAME: &str = "LsmAgentEmergentWork.db";
 
@@ -30,6 +33,9 @@ pub enum ConfigError {
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
+
+pub use agent_memory::{AgentMemoryEntry, AgentMemoryRow};
+pub use session_memory::{EventType, SessionMemoryEntry, SessionMemoryRow};
 
 /// LLM 接入协议
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -105,6 +111,19 @@ pub struct Db {
     db_path: PathBuf,
 }
 
+// 手动实现 Clone:Mutex 不可 Clone,但 Connection 可在同进程内通过 path 复用。
+// 这里采用「按路径重新打开」的策略:Clone 后操作的是同一 SQLite 文件(独立 Connection)。
+impl Clone for Db {
+    fn clone(&self) -> Self {
+        // 通过 db_path 重新打开,保留 Mutex 语义
+        let conn = Connection::open(&self.db_path).expect("Db::clone: re-open failed");
+        Self {
+            conn: Mutex::new(conn),
+            db_path: self.db_path.clone(),
+        }
+    }
+}
+
 impl Db {
     /// 打开(或创建)数据库,自动建表
     pub fn open(paths: &Paths) -> Result<Self> {
@@ -133,6 +152,35 @@ impl Db {
                 created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 UNIQUE(protocol, provider_name, model_name, end_point)
             );
+
+            CREATE TABLE IF NOT EXISTS session_memory (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   TEXT NOT NULL,
+                seq          INTEGER NOT NULL,
+                role         TEXT NOT NULL CHECK(role IN ('yolo','plan','main','subagent','quality','session','user')),
+                event_type   TEXT NOT NULL CHECK(event_type IN ('input','output','failure','suggestion','summary')),
+                content      TEXT NOT NULL,
+                usage_input  INTEGER NOT NULL DEFAULT 0,
+                usage_output INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                UNIQUE(session_id, seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_memory (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   TEXT NOT NULL,
+                agent_role   TEXT NOT NULL CHECK(agent_role IN ('yolo','plan','main','subagent','quality')),
+                input_summary  TEXT NOT NULL,
+                output_summary TEXT NOT NULL,
+                error_summary  TEXT,
+                artifacts    TEXT,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_memory_session_seq
+                ON session_memory(session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_agent_memory_role
+                ON agent_memory(agent_role, id);
             "#,
         )?;
         Ok(())

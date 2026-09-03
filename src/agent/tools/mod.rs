@@ -72,7 +72,7 @@ impl ToolRegistry {
     }
 }
 
-/// 默认注册表:内置 Bash / Read / Write
+/// 默认注册表:内置 Bash / Read / Write(SubAgent-Work / 兼容别名)
 pub fn builtin_registry() -> ToolRegistry {
     ToolRegistry::new()
         .register(Arc::new(bash::BashTool))
@@ -84,4 +84,33 @@ pub fn builtin_registry() -> ToolRegistry {
 pub fn yolo_registry() -> ToolRegistry {
     ToolRegistry::new()
         .register(Arc::new(read::ReadTool))
+}
+
+/// Plan Agent 工具注册表:Read + Write(允许写 plans/ 目录)
+pub fn plan_registry() -> ToolRegistry {
+    ToolRegistry::new()
+        .register(Arc::new(read::ReadTool))
+        .register(Arc::new(write::WriteTool))
+}
+
+/// Main-Work Agent 工具注册表:Bash + Read(只读 / 检查类)
+pub fn main_work_registry() -> ToolRegistry {
+    ToolRegistry::new()
+        .register(Arc::new(bash::BashTool))
+        .register(Arc::new(read::ReadTool))
+}
+
+/// SubAgent-Work Agent 工具注册表:全套工具(执行层最小单元)
+pub fn sub_agent_work_registry() -> ToolRegistry {
+    builtin_registry()
+}
+
+/// Quality-Check Agent 工具注册表:仅 Read(可选辅助判断)
+pub fn quality_registry() -> ToolRegistry {
+    ToolRegistry::new().register(Arc::new(read::ReadTool))
+}
+
+/// SessionContext Agent 工具注册表:无工具(纯文本生成)
+pub fn session_context_registry() -> ToolRegistry {
+    ToolRegistry::new()
 }

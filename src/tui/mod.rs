@@ -5,12 +5,13 @@
 //! - 子屏:`engine.rs` 的 Screen 栈,接管 `/provider *` 系列。
 //! - `/provider` 单独输入默认路由到 `/provider list`。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::Result;
 
-use crate::agent::yolo::YoloRunner;
+use crate::agent::orchestrator::{MultiAgentOrchestrator, OrchestrationOutcome};
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::llm::{client_from_record, ChatMessage};
 use crate::session::Session;
@@ -29,7 +30,7 @@ use input::{InputHandler, InputResult};
 pub struct TuiSession {
     pub paths: Paths,
     pub db: Arc<Mutex<Db>>,
-    pub yolo: YoloRunner,
+    pub orchestrator: MultiAgentOrchestrator,
     pub session: Session,
 }
 
@@ -38,9 +39,10 @@ impl TuiSession {
         let paths = Paths::detect().map_err(anyhow::Error::from)?;
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
         let db = Arc::new(Mutex::new(db));
-        let yolo = build_yolo_with_active(&db)?;
+        let plans_dir = paths.root_dir.join("plans");
+        let orchestrator = build_orchestrator_with_active(&db, plans_dir)?;
         let session = Session::new();
-        Ok(Self { paths, db, yolo, session })
+        Ok(Self { paths, db, orchestrator, session })
     }
 
     pub fn print_banner(&self) {
@@ -71,12 +73,12 @@ impl TuiSession {
         println!();
     }
 
-    /// 切换当前 provider(根据 id),并重新构造 YoloRunner
+    /// 切换当前 provider(根据 id),并重新构造 MultiAgentOrchestrator
     pub fn switch_provider(&mut self, id: i64) -> Result<()> {
         let record = self.db.lock().expect("db").get(id).map_err(anyhow::Error::from)?;
         self.db.lock().expect("db").set_active(id).map_err(anyhow::Error::from)?;
-        let user_agent = self.yolo.work_agent().profile().user_agent();
-        self.yolo = build_yolo_with_record(&record, &user_agent)?;
+        let plans_dir = self.paths.root_dir.join("plans");
+        self.orchestrator = build_orchestrator_with_record(&record, plans_dir, &self.db)?;
         Ok(())
     }
 
@@ -131,38 +133,87 @@ impl TuiSession {
             // 斜杠命令
             return self.handle_slash(rest).await;
         }
-        // 普通提示词: Yolo 分类 → 直接回答 / 委派 Work
+        // 普通提示词:Orchestrator 编排
         self.session.context_mut().push(ChatMessage::user(line));
-        println!("  [yolo 分析中...]");
-        match self.yolo.handle(&mut self.session).await {
-            Ok((text, usage)) => {
-                if !text.is_empty() {
+        println!("  [orchestrator 调度中...]");
+        match self.orchestrator.handle(&mut self.session).await {
+            Ok(outcome) => match outcome {
+                OrchestrationOutcome::DirectAnswer { text, usage, .. } => {
+                    self.print_assistant_text(&text, &usage);
+                }
+                OrchestrationOutcome::Executed { result } => {
+                    self.print_task_result(&result);
+                }
+                OrchestrationOutcome::Failed { suggestion, usage, .. } => {
                     println!();
-                    println!("  [assistant]");
-                    for line in text.lines() {
-                        println!("  {line}");
+                    println!("  [agent failed]");
+                    println!("  建议: {suggestion}");
+                    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                        println!(
+                            "  本次用量: input={}  output={}",
+                            usage.input_tokens, usage.output_tokens
+                        );
                     }
-                    println!();
-                } else {
-                    println!("  (模型未返回文本)");
                 }
-                if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                    let cache = if usage.cache_read_input_tokens > 0 {
-                        format!("  cache_read={}", usage.cache_read_input_tokens)
-                    } else {
-                        String::new()
-                    };
-                    println!(
-                        "  本次用量: input={}  output={}{}",
-                        usage.input_tokens, usage.output_tokens, cache
-                    );
-                }
-            }
+            },
             Err(e) => {
                 eprintln!("  [agent error] {e}");
             }
         }
         Ok(false)
+    }
+
+    fn print_assistant_text(&self, text: &str, usage: &crate::llm::Usage) {
+        if !text.is_empty() {
+            println!();
+            println!("  [assistant]");
+            for line in text.lines() {
+                println!("  {line}");
+            }
+            println!();
+        } else {
+            println!("  (模型未返回文本)");
+        }
+        self.print_usage(usage);
+    }
+
+    fn print_task_result(&self, result: &crate::agent::orchestrator::TaskResult) {
+        println!();
+        println!(
+            "  [task executed: difficulty={}, plan_doc={:?}, workflows={}]",
+            result.classification.task_level.display_name(),
+            result.plan_doc,
+            result.workflows.len()
+        );
+        // 打印每个 WorkFlow 的 subflow 输出
+        for wf in &result.workflows {
+            println!("  --- WorkFlow {} ({}) ---", wf.id, wf.name);
+            for line in wf.subflow_outcome.lines() {
+                println!("  {line}");
+            }
+        }
+        if !result.summary.is_empty() {
+            println!();
+            println!("  [session_context 摘要]");
+            for line in result.summary.lines() {
+                println!("  {line}");
+            }
+        }
+        self.print_usage(&result.total_usage);
+    }
+
+    fn print_usage(&self, usage: &crate::llm::Usage) {
+        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            let cache = if usage.cache_read_input_tokens > 0 {
+                format!("  cache_read={}", usage.cache_read_input_tokens)
+            } else {
+                String::new()
+            };
+            println!(
+                "  本次用量: input={}  output={}{}",
+                usage.input_tokens, usage.output_tokens, cache
+            );
+        }
     }
 
     async fn handle_slash(&mut self, cmd: &str) -> Result<bool> {
@@ -258,7 +309,7 @@ impl TuiSession {
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
         // 重建 YoloRunner(可能切换了 use)
-        self.yolo = build_yolo_with_active(&self.db)?;
+        self.orchestrator = build_orchestrator_with_active(&self.db, self.paths.root_dir.join("plans"))?;
         result
     }
 
@@ -279,7 +330,7 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        self.yolo = build_yolo_with_active(&self.db)?;
+        self.orchestrator = build_orchestrator_with_active(&self.db, self.paths.root_dir.join("plans"))?;
         result
     }
 
@@ -298,7 +349,7 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        self.yolo = build_yolo_with_active(&self.db)?;
+        self.orchestrator = build_orchestrator_with_active(&self.db, self.paths.root_dir.join("plans"))?;
         result
     }
 
@@ -462,27 +513,39 @@ fn print_help() {
     println!("    Esc            关闭列表");
 }
 
-/// 启动 YoloRunner(双 Agent);若未配置,使用占位提示信息
-fn build_yolo_with_active(db: &Arc<Mutex<Db>>) -> Result<YoloRunner> {
+/// 启动 MultiAgentOrchestrator(6 角色);若未配置,使用占位提示信息
+fn build_orchestrator_with_active(
+    db: &Arc<Mutex<Db>>,
+    plans_dir: PathBuf,
+) -> Result<MultiAgentOrchestrator> {
     let work_profile = crate::agent::profile::AgentProfile::work_profile();
     let user_agent = work_profile.user_agent();
+    // 把 db 从 Mutex 拷一份裸出来(本次只读使用);Db 内部已有自己的 Mutex
+    let db_clone = db.lock().expect("db").clone();
+    let db_arc = Arc::new(db_clone);
     match db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
-        Some(r) => build_yolo_with_record(&r, &user_agent),
+        Some(r) => {
+            let llm = client_from_record(&r, &user_agent).map_err(anyhow::Error::from)?;
+            Ok(MultiAgentOrchestrator::new(llm, db_arc, plans_dir))
+        }
         None => {
-            let warn_tail = "\n[系统] 当前尚未配置大模型接入记录。请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置后再开始对话。";
-            // 未配置时,Yolo 和 Work 都用 NoopLlm
-            let yolo_profile = crate::agent::profile::AgentProfile::yolo_profile();
-            let work_profile = work_profile.with_env_tail(warn_tail);
-            let yolo_agent = crate::agent::Agent::new(Arc::new(NoopLlm), yolo_profile);
-            let work_agent = crate::agent::Agent::new(Arc::new(NoopLlm), work_profile);
-            Ok(YoloRunner::from_agents(yolo_agent, work_agent))
+            // 未配置时,6 个 Agent 都用 NoopLlm
+            Ok(MultiAgentOrchestrator::new(
+                Arc::new(NoopLlm),
+                db_arc,
+                plans_dir,
+            ))
         }
     }
 }
 
-fn build_yolo_with_record(r: &ProviderRecord, user_agent: &str) -> Result<YoloRunner> {
-    let llm = client_from_record(r, user_agent).map_err(anyhow::Error::from)?;
-    Ok(YoloRunner::new(llm))
+fn build_orchestrator_with_record(
+    _r: &ProviderRecord,
+    _plans_dir: PathBuf,
+    _db: &Arc<Mutex<Db>>,
+) -> Result<MultiAgentOrchestrator> {
+    // 简化:复用 build_orchestrator_with_active(切换 provider 时重新构造)
+    build_orchestrator_with_active(_db, _plans_dir)
 }
 
 /// 未配置模型时的占位 LLM(避免 null deref);`complete` 返回错误提示。

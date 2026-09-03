@@ -94,7 +94,7 @@ pub fn generate_session_id(device: &str) -> String {
 }
 
 /// 当前本地可读时间 `YYYY-MM-DD HH:MM:SS`。
-pub(crate) fn now_readable() -> String {
+pub fn now_readable() -> String {
     let now = SystemTime::now();
     let secs = now
         .duration_since(SystemTime::UNIX_EPOCH)

@@ -24,6 +24,21 @@ pub enum AgentError {
     #[error("Yolo 分类解析失败: {0}")]
     YoloParse(String),
 
+    #[error("质量检查失败: {0} (源: {1})")]
+    QualityFail(String, String),
+
+    #[error("方案生成失败: {0}")]
+    PlanGen(String),
+
+    #[error("WorkFlow 解析失败: {0}")]
+    WorkflowParse(String),
+
+    #[error("WorkFlow 拓扑错误: {0}")]
+    WorkflowTopology(String),
+
+    #[error("编排失败: {0}")]
+    Orchestration(String),
+
     #[error("HTTP 请求错误: {0}")]
     Http(#[from] reqwest::Error),
 
