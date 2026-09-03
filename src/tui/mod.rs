@@ -244,7 +244,7 @@ impl TuiSession {
     /// 进入 ProviderList 屏(子屏通过 engine 渲染)。
     /// 当 stdin 不是 TTY(如 e2e 管道)时,回退到 print 输出以保持兼容。
     async fn run_provider_list_screen(&mut self) -> Result<()> {
-        use crate::tui::engine::{enter_alt, leave_alt, present, read_key, Outcome};
+        use crate::tui::engine::{enter_alt, leave_alt};
         use crate::tui::screen::provider_list::ProviderList;
 
         if !atty() {
@@ -252,7 +252,8 @@ impl TuiSession {
             return self.list_providers();
         }
 
-        let screen = ProviderList::new(self.db.clone(), self.paths.clone());
+        let screen: Box<dyn crate::tui::engine::Screen> =
+            Box::new(ProviderList::new(self.db.clone(), self.paths.clone()));
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
@@ -262,7 +263,7 @@ impl TuiSession {
     }
 
     async fn run_provider_add_screen(&mut self) -> Result<()> {
-        use crate::tui::engine::{enter_alt, leave_alt, present, read_key, Outcome};
+        use crate::tui::engine::{enter_alt, leave_alt};
         use crate::tui::screen::provider_form::ProviderForm;
 
         if !atty() {
@@ -273,7 +274,8 @@ impl TuiSession {
         let on_done = Box::new(move |id: i64| {
             let _ = db.lock().expect("db").set_active(id);
         });
-        let screen = ProviderForm::new_add(self.db.clone(), self.paths.clone(), on_done);
+        let screen: Box<dyn crate::tui::engine::Screen> =
+            Box::new(ProviderForm::new_add(self.db.clone(), self.paths.clone(), on_done));
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
@@ -282,7 +284,7 @@ impl TuiSession {
     }
 
     async fn run_provider_del_screen(&mut self) -> Result<()> {
-        use crate::tui::engine::{enter_alt, leave_alt, present, read_key, Outcome};
+        use crate::tui::engine::{enter_alt, leave_alt};
         use crate::tui::screen::provider_del::ProviderDelPicker;
 
         if !atty() {
@@ -291,7 +293,8 @@ impl TuiSession {
             return Ok(());
         }
 
-        let screen = ProviderDelPicker::new(self.db.clone(), self.paths.clone(), -1);
+        let screen: Box<dyn crate::tui::engine::Screen> =
+            Box::new(ProviderDelPicker::new(self.db.clone(), self.paths.clone(), -1));
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
@@ -300,28 +303,50 @@ impl TuiSession {
     }
 
     /// 通用子屏循环:渲染 → 读键 → 处理 Outcome。
-    async fn run_screen_loop(mut screen: impl crate::tui::engine::Screen) -> Result<()> {
-        use crate::tui::engine::{present, read_key, Outcome, Rect, Frame};
+    /// 屏幕栈:`Vec<Box<dyn Screen>>`,top 是当前屏;`Push` 压栈、`Pop` 出栈。
+    /// 当栈清空时退出循环(回到主屏)。
+    async fn run_screen_loop(initial: Box<dyn crate::tui::engine::Screen>) -> Result<()> {
+        use crate::tui::engine::{present, read_key, Frame, Outcome, Rect};
 
-        screen.on_enter();
-        loop {
+        let mut stack: Vec<Box<dyn crate::tui::engine::Screen>> = Vec::new();
+        stack.push(initial);
+
+        // 栈中每层屏都进入一次
+        for s in stack.iter_mut() {
+            s.on_enter();
+        }
+
+        while let Some(top) = stack.last_mut() {
             let area = Rect::full_screen();
             let mut frame = Frame::new(area);
-            screen.render(&mut frame);
+            top.render(&mut frame);
             present(&frame).map_err(anyhow::Error::from)?;
 
             let key = read_key().map_err(anyhow::Error::from)?;
-            match screen.handle_key(key) {
+            // 用 take() 取出 Outcome 后再处理,避免借用冲突
+            let outcome = top.handle_key(key);
+            match outcome {
                 Outcome::Continue => {}
-                Outcome::Pop | Outcome::Toast(_) => break,
-                Outcome::Push(_) => {
-                    // 简化:不支持嵌套 push;当作 Pop 处理(后续可扩展为栈)
+                Outcome::Pop => {
+                    let mut popped = stack.pop().unwrap();
+                    popped.on_exit();
+                }
+                Outcome::Push(mut new_screen) => {
+                    new_screen.on_enter();
+                    stack.push(new_screen);
+                }
+                Outcome::Toast(msg) => {
+                    // Toast:弹出现有屏栈,在主屏展示消息。
+                    // 适合"操作成功/失败"的反馈,用户能立即看到。
+                    while let Some(mut s) = stack.pop() {
+                        s.on_exit();
+                    }
+                    println!("  {msg}");
                     break;
                 }
                 Outcome::Quit => std::process::exit(0),
             }
         }
-        screen.on_exit();
         Ok(())
     }
 }

@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crossterm::style::Attribute;
 
 use crate::config::{Db, Paths, Protocol, ProviderRecord};
-use crate::tui::engine::{Cell, Frame, Outcome, Rect, Screen};
+use crate::tui::engine::{Frame, Outcome, Rect, Screen};
 use crate::tui::form::{ConfirmAction, FormOutcome, TabForm, Tab};
 use crate::tui::theme;
 

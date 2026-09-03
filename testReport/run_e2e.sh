@@ -479,6 +479,48 @@ else
   # /model 输出当前模型信息(格式: [protocol] provider / model @ end_point)
   texpect "tmuxTest" "tmux: /model 显示当前模型" 2
 
+  # 14b) 屏幕栈测试:ProviderList → 按 d → ProviderDelPicker → Enter → ProviderDelConfirm
+  #     验证 Push 不被当 Pop 处理(旧 bug:push 被吞掉,直接退出 ProviderList)
+  tsubmit "/provider list"
+  texpect "/provider list" "tmux(栈): 进入 ProviderList 子屏"
+  # 按 'd' 触发 push 到 ProviderDelPicker
+  tkey d
+  sleep 0.5
+  # 应进入 ProviderDelPicker(title 不同)
+  if tscreen | grep -F -q "/provider del"; then
+    check 0 "tmux(栈): d 键从 ProviderList Push 到 ProviderDelPicker(不退出)"
+  else
+    check 1 "tmux(栈): d 键从 ProviderList Push 到 ProviderDelPicker(不退出)"
+    { echo "    --- tmux capture at stack push failure ---"; tscreen | sed 's/^/    | /'; echo "    --- end ---"; } | tee -a "$REPORT"
+  fi
+  # Enter 推进到 ProviderDelConfirm(确认页)
+  tkey Enter
+  sleep 0.5
+  if tscreen | grep -F -q "确认删除"; then
+    check 0 "tmux(栈): Enter 进入 ProviderDelConfirm 二次确认页"
+  else
+    check 1 "tmux(栈): Enter 进入 ProviderDelConfirm 二次确认页"
+  fi
+  # Esc 取消 → 回到 ProviderDelPicker(不退到主屏)
+  tkey Escape
+  sleep 0.5
+  if tscreen | grep -F -q "/provider del"; then
+    check 0 "tmux(栈): Esc 从 ProviderDelConfirm 回到 ProviderDelPicker"
+  else
+    check 1 "tmux(栈): Esc 从 ProviderDelConfirm 回到 ProviderDelPicker"
+  fi
+  # 再 Esc 退出 ProviderDelPicker → 回到 ProviderList
+  tkey Escape
+  sleep 0.5
+  if tscreen | grep -F -q "/provider list"; then
+    check 0 "tmux(栈): Esc 从 ProviderDelPicker 回到 ProviderList"
+  else
+    check 1 "tmux(栈): Esc 从 ProviderDelPicker 回到 ProviderList"
+  fi
+  # Esc 再退出 ProviderList
+  tkey Escape
+  sleep 0.6
+
   # 15) /exit 退出 TUI(tmux 检测到子进程结束自动销毁会话)
   tsubmit "/exit"
   deadline=$((SECONDS + 5))

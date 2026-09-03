@@ -8,7 +8,7 @@
 //! - 消息 content: `text` / `tool_use` / `tool_result`
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
+use reqwest::header::{HeaderName, HeaderValue, ACCEPT};
 use serde::Serialize;
 use serde_json::{json, Value};
 

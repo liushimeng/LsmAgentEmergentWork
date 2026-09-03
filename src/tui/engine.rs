@@ -215,9 +215,9 @@ pub fn present(frame: &Frame) -> io::Result<()> {
     execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
     let w = frame.area.width as usize;
-    let mut prev_fg = Color::Reset;
-    let mut prev_bg = Color::Reset;
-    let mut prev_attr = Attribute::Reset;
+    let prev_fg = Color::Reset;
+    let prev_bg = Color::Reset;
+    let prev_attr = Attribute::Reset;
 
     for y in 0..frame.area.height {
         // 移到行首
