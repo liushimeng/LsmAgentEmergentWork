@@ -126,8 +126,16 @@ impl InputHandler {
                         KeyCode::Tab | KeyCode::Enter => {
                             // Tab 或 Enter：接受当前选中项或提交输入
                             if completion_active && !completion_items.is_empty() {
-                                // 接受补全
                                 let item = &completion_items[completion_index];
+                                // 若缓冲区已等于补全目标(忽略尾随空格),直接提交而非接受补全。
+                                // 避免用户已完整输入命令名时 Enter 被吞成"接受补全 + 加尾随空格"。
+                                if buffer.trim() == item.replacement.trim() {
+                                    self.clear_completion_list(&mut stdout, prompt_width, &buffer, completion_active, &completion_items)?;
+                                    execute!(stdout, Print("\r\n"))?;
+                                    stdout.flush()?;
+                                    return Ok(InputResult::Submitted(buffer));
+                                }
+                                // 接受补全
                                 self.accept_completion(&mut stdout, &mut buffer, &mut cursor, prompt_width, &item.replacement)?;
                                 // 接受后关闭补全列表
                                 self.clear_completion_list(&mut stdout, prompt_width, &buffer, completion_active, &completion_items)?;

@@ -123,7 +123,7 @@ sys.exit(0 if ok else 1)
 PYEOF
 check $? "协议 wire 格式校验"
 
-# --- 7. TUI 冒烟(管道喂命令) ---
+# --- 7. TUI 冒烟(管道喂命令,非 TTY 回退路径) ---
 section "7. TUI 冒烟测试"
 OUT=$(printf '/help\n/model\n/provider list\n/new\n/exit\n' | run "$LAEW")
 echo "$OUT" | grep -q "根目录"; check $? "TUI 横幅显示根目录"
@@ -133,8 +133,166 @@ echo "$OUT" | grep -q "Session"; check $? "TUI 横幅显示 Session ID"
 echo "$OUT" | grep -q "provider add"; check $? "/help 输出命令指南"
 echo "$OUT" | grep -q "开启新会话\|已开启新会话"; check $? "/new 命令生效"
 
-# --- 8. provider delete ---
-section "8. provider delete"
+# --- 8. TUI 子屏自动化(tmux control-mode,真 PTY 渲染) ---
+# 详见 docs/TUI自动化测试/01-设计与解决方案.md
+section "8. TUI 子屏自动化(tmux control-mode)"
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "  [SKIP] 系统未安装 tmux,跳过子屏自动化测试" | tee -a "$REPORT"
+else
+  TSESS="laew_e2e_$$_${RANDOM}"
+  TMUX_LOG="testReport/tmux-${TSESS}.log"
+  : > "$TMUX_LOG"
+  # 任一路径退出都杀会话,避免污染
+  trap 'tmux kill-session -t "$TSESS" 2>/dev/null || true' RETURN
+
+  # ----- tmux helpers -----
+  tnew() {  # 创建后台会话并启动 laew,固定 100x30
+    tmux new-session -d -s "$TSESS" -x 100 -y 30 "$LAEW" 2>>"$TMUX_LOG"
+    # 等待 bootstrap(banner 是首屏内容,出现即说明已就绪)
+    sleep 0.5
+  }
+  tsend() { tmux send-keys -t "$TSESS" -l "$1" 2>>"$TMUX_LOG"; }
+  tkey()  { tmux send-keys -t "$TSESS" "$1" 2>>"$TMUX_LOG"; }
+  tresize() { tmux resize-window -t "$TSESS" -x "$1" -y "$2" 2>>"$TMUX_LOG"; }
+  # 抓取面板到 stdout(-p),不带 -e 剥掉 ANSI,便于 grep -F
+  tscreen() { tmux capture-pane -p -t "$TSESS" 2>/dev/null; }
+  # 轮询断言:$1=pattern $2=label $3=timeout(秒,默认 3)
+  texpect() {
+    local pat="$1" label="$2" timeout="${3:-3}"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      tscreen | grep -F -q -- "$pat" && { check 0 "$label"; return 0; }
+      sleep 0.1
+    done
+    check 1 "$label"
+    { echo "    --- tmux capture at failure ---"; tscreen | sed 's/^/    | /'; echo "    --- end ---"; } | tee -a "$REPORT"
+    return 1
+  }
+  # 提交一行文本到主屏提示行:
+  # raw mode 下 send-keys 一次灌入多字符会与 main loop 抢事件,
+  # 故:tsend 后 sleep → 等提示行已显示完整文本 → 再 tkey Enter。
+  # 提交流程封成一个原子,避免外部忘记加等待。
+  tsubmit() {
+    local text="$1" wait="${2:-1.5}"
+    tsend "$text"
+    sleep 0.3
+    # 等待提示行累积到完整文本(input handler 已读完所有字符并重绘)
+    if ! tscreen | grep -F -q -- "$text"; then
+      sleep 0.5
+      tscreen | grep -F -q -- "$text" || return 1
+    fi
+    sleep 0.2
+    tkey Enter
+    sleep 0.3
+  }
+
+  tnew
+
+  # 1) 横幅
+  texpect "根目录" "tmux: 横幅显示根目录"
+  texpect "工作目录" "tmux: 横幅显示工作目录"
+  texpect "Session" "tmux: 横幅显示 Session ID"
+  texpect "当前模型" "tmux: 横幅显示当前模型"
+
+  # 2) /model 命令(主屏行为,不走子屏)
+  tsubmit "/model"
+  texpect "当前模型" "tmux: /model 输出当前模型" 2
+
+  # 3) /provider list 子屏(边框 title "/provider list")
+  tsubmit "/provider list"
+  texpect "/provider list" "tmux: 进入 ProviderList 子屏"
+  texpect "记录:" "tmux: 子屏显示记录统计"
+  # 单记录视图:cursor 默认 0 → 第一条;断言 mockA(首条)可见
+  tscreen | grep -F -q "mockA" && check 0 "tmux: 子屏列出 mockA(cursor=0)" || check 1 "tmux: 子屏列出 mockA(cursor=0)"
+  # 切到第二条记录,断言 mockO 可见
+  tkey Down
+  sleep 0.3
+  tscreen | grep -F -q "mockO" && check 0 "tmux: 子屏列出 mockO(cursor=1)" || check 1 "tmux: 子屏列出 mockO(cursor=1)"
+  # 再切回第一条,准备后续操作
+  tkey Up
+  sleep 0.3
+
+  # 4) Esc 退出 ProviderList(Outcome::Pop → leave_alt → 回到主屏)
+  tkey Escape
+  sleep 0.6
+  # 子屏栈 Pop 后主屏 redraw,屏幕底部应是空 prompt ">> "。
+  # 锚点:屏幕最后非空行只剩 ">> "(无子屏边框 ║ ╔ ╚ ═)。
+  last_line=$(tscreen | grep -v '^$' | tail -1)
+  if echo "$last_line" | grep -F -q "║" || echo "$last_line" | grep -F -q "╔"; then
+    check 1 "tmux: Esc 退出 ProviderList 子屏"
+  else
+    check 0 "tmux: Esc 退出 ProviderList 子屏"
+  fi
+
+  # 5) /provider add 子屏(Tab 表单 title)
+  tsubmit "/provider add"
+  texpect "/provider add" "tmux: 进入 ProviderForm 子屏"
+  texpect "切换 Tab" "tmux: 表单 hint 显示"
+
+  # 6) api_key Tab 浏览态应见脱敏占位;Enter 进入编辑态应仍在表单屏
+  tkey Right; tkey Right; tkey Right; tkey Right
+  sleep 0.4
+  # 浏览态:api_key Tab 因 masked 走 mask_key("") 分支,空值显示 "****"(即脱敏锚点)
+  # add 模式 value 为空,所以一定见到 "****" 或 placeholder "<sk-...>" 之一
+  if tscreen | grep -E -q '\*{2,}|<sk-\.\.\.>'; then
+    check 0 "tmux: api_key Tab 浏览态脱敏占位"
+  else
+    check 1 "tmux: api_key Tab 浏览态脱敏占位"
+    { echo "    --- tmux capture at api_key browse failure ---"; tscreen | sed 's/^/    | /'; echo "    --- end ---"; } | tee -a "$REPORT"
+  fi
+  tkey Enter
+  sleep 0.5
+  # 编辑态:Enter 后仍在 api_key Tab + 表单屏未退出
+  if tscreen | grep -F -q "/provider add"; then
+    check 0 "tmux: api_key Tab 进入编辑态"
+  else
+    check 1 "tmux: api_key Tab 进入编辑态"
+  fi
+  tkey Escape  # 退出编辑态
+  sleep 0.4
+  tkey Escape  # 退出 ProviderForm
+  sleep 0.6
+
+  # 7) /provider del picker
+  tsubmit "/provider del"
+  texpect "/provider del" "tmux: 进入 ProviderDelPicker 子屏"
+  texpect "请选择要删除" "tmux: picker 提示语出现"
+
+  # 8) Esc 退出 picker
+  tkey Escape
+  sleep 0.6
+  last_line=$(tscreen | grep -v '^$' | tail -1)
+  if echo "$last_line" | grep -F -q "║" || echo "$last_line" | grep -F -q "╔"; then
+    check 1 "tmux: Esc 退出 ProviderDelPicker"
+  else
+    check 0 "tmux: Esc 退出 ProviderDelPicker"
+  fi
+
+  # 9) resize 到 80x24,验证终端尺寸自适应(已在主屏,断言主屏 prompt 仍可渲染)
+  tresize 80 24
+  sleep 0.5
+  texpect ">>" "tmux: 80x24 仍渲染主屏提示行" 2
+  tresize 100 30
+  sleep 0.4
+
+  # 10) /exit 退出 TUI(tmux 检测到子进程结束自动销毁会话)
+  tsubmit "/exit"
+  deadline=$((SECONDS + 5))
+  while tmux has-session -t "$TSESS" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 0.1
+  done
+  if tmux has-session -t "$TSESS" 2>/dev/null; then
+    check 1 "tmux: /exit 后会话自动销毁"
+  else
+    check 0 "tmux: /exit 后会话自动销毁"
+  fi
+
+  trap - RETURN
+  rm -f "$TMUX_LOG"
+fi
+
+# --- 9. provider delete ---
+section "9. provider delete"
 run "$LAEW" provider delete "$ID_O"; check $? "删除 openai 记录"
 OUT=$(run "$LAEW" provider list); echo "$OUT" | grep -vq mockO; check $? "list 不再显示 mockO"
 

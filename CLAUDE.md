@@ -13,10 +13,10 @@ TUI 支持斜杠命令自动补全（Tab 补全 + 行内提示）和文件路径
 ## 常用命令
 
 ```bash
-./rebuild.sh                 # 杀 laew 进程 → cargo build --release → 拷贝 ./laew 到根目录(改代码后必跑)
+./rebuild_restart_app.sh      # cargo build --release → 拷贝 ./laew 到根目录(改代码后必跑);支持 --debug
 cargo build                  # 快速编译检查
-cargo test                   # 单元测试(98 个)
-bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key,20 项)
+cargo test                   # 单元测试
+bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子屏 tmux 自动化用例)
 ./laew --version             # 版本 + 编译时间 + git hash
 ./laew --help                # CLI 指南
 ./laew                       # TUI 交互模式
@@ -131,8 +131,52 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/Agent身份与Session管理/` — AgentProfile / Session / 请求头 User-Agent·Authorization·X-Session-Id / Anthropic metadata.user_id 设计（01-设计与解决方案）
 - `docs/Agent系统提示词与工具架构重构/` — 系统提示词独立模块 + 工具迁移到 agent 域 设计文档
 - `docs/YoloAgent设计/` — 双 Agent 架构 / Yolo 入口层 / 任务四级分类 / 任务拆解 设计（01-设计与解决方案 / 02-系统提示词设计）
+- `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
+
+## 自动化测试
+
+测试分三层,放在 `testReport/` 下:
+
+| 层 | 入口 | 用途 |
+|----|------|------|
+| 单元测试 | `cargo test` | Rust 函数级覆盖(模块、解析、转换、工具) |
+| 端到端(CLI) | `bash testReport/run_e2e.sh` | mock LLM,跑 `-p` / `provider add|list|use|delete` / 协议 wire 校验 / TUI 管道冒烟 / **TUI 子屏 tmux 自动化** |
+| TUI 子屏自动化 | `testReport/run_e2e.sh` 第 8 节 | tmux control-mode 真 PTY 渲染,验证 alternate screen + raw mode + Screen::title() |
+
+### TUI 自动化:**优先使用 tmux control-mode**
+
+`src/tui/mod.rs::run` 对 `atty()` 做了分流:
+
+- **TTY**(包括 tmux 内) → `InputHandler` 全交互(原始模式 + alternate screen + 子屏栈)。
+- **非 TTY**(管道 / 重定向) → 行读取回退,**子屏走 print 输出,不是真实渲染**。
+
+> 因此:`/provider list`、`/provider add`、`/provider del` 等**子屏行为必须用 tmux**。
+> 管道冒烟仅适合主屏纯文本命令(`/help` `/model` `/new` `/exit`)。
+
+核心命令速查(完整封装见 `run_e2e.sh` 第 8 节,设计见 `docs/TUI自动化测试/`):
+
+```bash
+# 1) 起后台会话并启动 TUI,固定 100x30
+tmux new-session -d -s laew_e2e -x 100 -y 30 "$LAEW"
+# 2) 发送按键(整串字面量必须 -l)
+tmux send-keys -t laew_e2e -l "/provider list"
+tmux send-keys -t laew_e2e Enter        # 回车
+tmux send-keys -t laew_e2e Escape       # Esc 退子屏
+# 3) 抓取面板到 stdout(不带 -e 剥离 ANSI,便于 grep)
+SCREEN=$(tmux capture-pane -p -t laew_e2e)
+# 4) 断言:echo "$SCREEN" | grep -F -q "/provider list"
+# 5) 调试:tmux attach -t laew_e2e  可肉眼回放
+# 6) 收尾:tmux kill-session -t laew_e2e
+```
+
+扩展指引(新增子屏断言):
+
+1. 在 `src/tui/screen/*` 找到 `fn title() -> &str`,title 字符串本身就是断言锚点。
+2. 在 `run_e2e.sh` 第 8 节 `texpect "<title>" "..."` 即可。
+3. 若断言失败,报告自动 dump 当前面板(带 `|` 前缀),便于排查。
+4. CI 环境需 `apt-get install -y tmux`;缺 tmux 时整节 SKIP,不影响其它 9 节通过。
 
 ## 约定
 
