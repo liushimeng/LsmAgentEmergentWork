@@ -147,7 +147,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
-- `docs/Agent源码调研/` — 6 个外部 Agent 源码的系统调研与深度分析,共 3 层文档(源码调研 → 深度分析 → 核心机制深度分析),覆盖架构/多轮对话/Context/Yolo/质检/任务拆解/分类/工具/MCP/SKILL 10 维度:
+- `docs/Agent源码调研/` — 6 个外部 Agent 源码的系统调研与深度分析,共 3 层文档(源码调研 → 深度分析 → 核心机制深度分析),覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL 16 维度:
   - `atomcode-*.md` — Rust, L0/L1/L2 分层 + cargo feature gating, ~150k 行
   - `claudecode-*.md` — TypeScript/Bun, 四级压缩管线 + 27 种 Hook, ~218k 行
   - `deepseek-harness-*.md` — TypeScript, Cordis Everything-is-a-Plugin, ~80+ 包
@@ -155,7 +155,19 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
   - `opencode-*.md` — TypeScript/Bun, Effect + Schema 全栈 DI, ~18k 行
   - `pi-*.md` — TypeScript, lane 并发 + 一等公民 Skill, ~12 包
   - `*-核心机制深度分析.md` — 第二轮深入钻取,6 个专题(每个项目):核心代码路径/函数名/代码片段/对 laew 借鉴
-  - `专题-横向对比深度分析合集.md` — 6 个横向专题(Context/MCP/Skill/质检/任务拆解/多Agent)深度对比,含横向对比表+设计模式+laew 综合建议
+  - `专题-Context上下文管理深度分析.md` — Context 压缩管线横向对比(4级/3级/2级/可插拔/投影)
+  - `专题-MCP架构深度分析.md` — MCP 传输层/工具注册/资源/认证/双向支持横向对比
+  - `专题-Skill系统深度分析.md` — Skill 文件格式/注册/加载/触发/内置数量横向对比
+  - `专题-SubAgent与多Agent架构深度分析.md` — 多 Agent 编排模式/上下文传递/并发/通信横向对比
+  - `专题-任务拆解与分类深度分析.md` — 任务分类/拆解粒度/失败回流横向对比
+  - `专题-质检机制深度分析.md` — 质检形式/触发/检查项/自动修复/失败回流横向对比
+  - `专题-多轮对话与循环架构深度分析.md` — agentic loop 驱动/终止/续轮/流式耦合横向对比
+  - `专题-工具调用深度分析.md` — 工具定义/Schema/消息流/并发/权限拦截横向对比
+  - `专题-记忆系统与管理深度分析.md` — 记忆分层/持久化/检索注入/压缩横向对比
+  - `专题-Workflow设计深度分析.md` — workflow 定义/编排拓扑/执行引擎横向对比
+  - `专题-Yolo目标意图识别与目标规划深度分析.md` — 目标识别/意图/生命周期/规划生成横向对比
+  - `专题-Agent协作与调度深度分析.md` — 主/Sub 委派/并发调度/通信/失败回流横向对比
+  - `专题-横向对比深度分析合集.md` — 横向专题索引(Context/MCP/Skill/质检/任务拆解/多Agent 6 专题 + 新增 6 专题),含横向对比表+设计模式+laew 综合建议
 - `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 10 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
 
 ## 自动化测试
