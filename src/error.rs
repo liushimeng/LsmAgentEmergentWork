@@ -50,6 +50,14 @@ pub enum AgentError {
 
     #[error("{0}")]
     Other(String),
+
+    #[error("[沙箱拦截] 工具 {tool} 无法写入路径 \"{path}\"。\n允许范围:\n  - 工作目录: {work_dir}\n  - 系统临时目录: {temp_dir}\n请调整目标路径或使用允许目录内的路径。")]
+    SandboxViolation {
+        tool: String,
+        path: String,
+        work_dir: String,
+        temp_dir: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;

@@ -1,18 +1,23 @@
 //! 工具抽象与注册表。
 //!
-//! 定义 [`Tool`] trait、[`ToolRegistry`] 注册表,以及内置 Bash / Read / Write
-//! 工具的注册入口 [`builtin_registry`]。
+//! 定义 [`Tool`] trait、[`ToolRegistry`] 注册表,以及内置 Bash / Read / Write /
+//! Edit / Glob / Grep 工具的注册入口 [`builtin_registry`]。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::agent::sandbox_hook::SandboxConfig;
 use crate::error::{AgentError, Result};
 use crate::llm::ToolDef;
 
 pub mod bash;
+pub mod edit;
+pub mod glob;
+pub mod grep;
 pub mod read;
 pub mod write;
 
@@ -72,12 +77,42 @@ impl ToolRegistry {
     }
 }
 
-/// 默认注册表:内置 Bash / Read / Write(SubAgent-Work / 兼容别名)
+/// 构造沙箱配置。
+/// 实际工作目录由调用方提供;临时目录使用系统默认。
+fn default_sandbox() -> SandboxConfig {
+    let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    SandboxConfig::new(work_dir)
+}
+
+/// 从指定工作目录构造沙箱配置。
+fn sandbox_with(work_dir: PathBuf) -> SandboxConfig {
+    SandboxConfig::new(work_dir)
+}
+
+/// 默认注册表:内置 Bash / Read / Write / Edit / Glob / Grep(SubAgent-Work / 兼容别名)
+///
+/// 写操作(Write / Edit)带有沙箱拦截,限制在工作目录与系统临时目录。
 pub fn builtin_registry() -> ToolRegistry {
+    let sandbox = default_sandbox();
     ToolRegistry::new()
         .register(Arc::new(bash::BashTool))
         .register(Arc::new(read::ReadTool))
-        .register(Arc::new(write::WriteTool))
+        .register(Arc::new(write::WriteTool::new(sandbox.clone())))
+        .register(Arc::new(edit::EditTool::new(sandbox.clone())))
+        .register(Arc::new(glob::GlobTool))
+        .register(Arc::new(grep::GrepTool))
+}
+
+/// 带指定工作目录的沙箱注册表(供编排器使用)。
+pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
+    let sandbox = sandbox_with(work_dir);
+    ToolRegistry::new()
+        .register(Arc::new(bash::BashTool))
+        .register(Arc::new(read::ReadTool))
+        .register(Arc::new(write::WriteTool::new(sandbox.clone())))
+        .register(Arc::new(edit::EditTool::new(sandbox.clone())))
+        .register(Arc::new(glob::GlobTool))
+        .register(Arc::new(grep::GrepTool))
 }
 
 /// Yolo Agent 工具注册表:仅 Read(用于理解上下文,不修改系统状态)
@@ -86,18 +121,24 @@ pub fn yolo_registry() -> ToolRegistry {
         .register(Arc::new(read::ReadTool))
 }
 
-/// Plan Agent 工具注册表:Read + Write(允许写 plans/ 目录)
+/// Plan Agent 工具注册表:Read + Write + Edit + Glob + Grep(规划与调研)
 pub fn plan_registry() -> ToolRegistry {
+    let sandbox = default_sandbox();
     ToolRegistry::new()
         .register(Arc::new(read::ReadTool))
-        .register(Arc::new(write::WriteTool))
+        .register(Arc::new(write::WriteTool::new(sandbox.clone())))
+        .register(Arc::new(edit::EditTool::new(sandbox)))
+        .register(Arc::new(glob::GlobTool))
+        .register(Arc::new(grep::GrepTool))
 }
 
-/// Main-Work Agent 工具注册表:Bash + Read(只读 / 检查类)
+/// Main-Work Agent 工具注册表:Bash + Read + Glob + Grep(流程层可检索,不写文件)
 pub fn main_work_registry() -> ToolRegistry {
     ToolRegistry::new()
         .register(Arc::new(bash::BashTool))
         .register(Arc::new(read::ReadTool))
+        .register(Arc::new(glob::GlobTool))
+        .register(Arc::new(grep::GrepTool))
 }
 
 /// SubAgent-Work Agent 工具注册表:全套工具(执行层最小单元)
@@ -105,9 +146,12 @@ pub fn sub_agent_work_registry() -> ToolRegistry {
     builtin_registry()
 }
 
-/// Quality-Check Agent 工具注册表:仅 Read(可选辅助判断)
+/// Quality-Check Agent 工具注册表:Read + Glob + Grep(质检时可检索与读取)
 pub fn quality_registry() -> ToolRegistry {
-    ToolRegistry::new().register(Arc::new(read::ReadTool))
+    ToolRegistry::new()
+        .register(Arc::new(read::ReadTool))
+        .register(Arc::new(glob::GlobTool))
+        .register(Arc::new(grep::GrepTool))
 }
 
 /// SessionContext Agent 工具注册表:无工具(纯文本生成)

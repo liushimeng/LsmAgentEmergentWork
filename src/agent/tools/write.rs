@@ -1,4 +1,6 @@
 //! Write 工具:覆盖写入/新建文件,自动创建父目录。
+//!
+//! 受 sandbox-hook 拦截:目标路径必须在工作目录或系统临时目录下。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,10 +8,27 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::agent::sandbox_hook::{check_write_path, SandboxConfig};
 use crate::agent::tools::Tool;
 use crate::error::{AgentError, Result};
 
-pub struct WriteTool;
+pub struct WriteTool {
+    sandbox: SandboxConfig,
+}
+
+impl WriteTool {
+    pub fn new(sandbox: SandboxConfig) -> Self {
+        Self { sandbox }
+    }
+
+    /// 向后兼容:无沙箱限制(仅测试用)。
+    #[cfg(test)]
+    pub fn without_sandbox() -> Self {
+        Self {
+            sandbox: SandboxConfig::for_test(PathBuf::from("/"), PathBuf::from("/")),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for WriteTool {
@@ -19,7 +38,8 @@ impl Tool for WriteTool {
         "将 content 完整写入 file_path(覆盖式)。\n\
          - file_path 应为绝对路径或相对工作目录的路径。\n\
          - 父目录不存在会自动创建。\n\
-         - 写入成功后返回写入字节数与目标路径。"
+         - 写入成功后返回写入字节数与目标路径。\n\
+         - [沙箱] 仅可在工作目录或系统临时目录内写入文件。"
     }
 
     fn parameters(&self) -> Value {
@@ -49,6 +69,9 @@ impl Tool for WriteTool {
                 tool: self.name().into(),
                 reason: "缺少 string 类型参数 content".into(),
             })?;
+
+        // 沙箱拦截
+        check_write_path(&self.sandbox, self.name(), path_str)?;
 
         let path = resolve_path(path_str);
         if let Some(parent) = path.parent() {
@@ -94,7 +117,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("a/b/c.txt");
         let path_str = target.to_str().unwrap().to_string();
-        let out = WriteTool
+        let out = WriteTool::without_sandbox()
             .execute(json!({"file_path": path_str, "content": "hi\n"}))
             .await
             .unwrap();
@@ -108,7 +131,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("f.txt");
         fs::write(&target, "old").unwrap();
-        WriteTool
+        WriteTool::without_sandbox()
             .execute(json!({
                 "file_path": target.to_str().unwrap(),
                 "content": "new"
@@ -120,10 +143,31 @@ mod tests {
 
     #[tokio::test]
     async fn missing_content_argument_errors() {
-        let err = WriteTool
+        let err = WriteTool::without_sandbox()
             .execute(json!({"file_path": "/tmp/x"}))
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::ToolExecution { .. }));
+    }
+
+    #[tokio::test]
+    async fn sandbox_blocks_outside_write() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("f.txt");
+        fs::write(&target, "old").unwrap();
+
+        // 沙箱配置为完全不同的目录
+        let tool = WriteTool::new(SandboxConfig::for_test(
+            PathBuf::from("/home/user/proj"),
+            PathBuf::from("/var/tmp"),
+        ));
+        let err = tool
+            .execute(json!({
+                "file_path": target.to_str().unwrap(),
+                "content": "new"
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::SandboxViolation { .. }));
     }
 }

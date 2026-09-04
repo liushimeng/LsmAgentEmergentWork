@@ -18,6 +18,7 @@ pub mod plan;
 pub mod profile;
 pub mod project_context;
 pub mod quality;
+pub mod sandbox_hook;
 pub mod session_context;
 pub mod subagent;
 pub mod system_prompt;
