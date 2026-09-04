@@ -1214,7 +1214,7 @@ deepseek-harness 的 Skill 系统采用 Provider 模式，将 Skill 的发现和
 
 ## 八、Skill 系统的演进路径分析
 
-### 7.1 行业演进时间线
+### 8.1 行业演进时间线
 
 Skill 系统在 Agent 生态中的演进可以划分为三个阶段：
 
@@ -1228,7 +1228,7 @@ Skill 系统在 Agent 生态中的演进可以划分为三个阶段：
 - V1 -> V2：从"纯文本"到"结构化元数据"，Frontmatter 引入了 `allowed-tools`、`context`、`paths` 等控制字段
 - V2 -> V3：从"人工维护"到"自动演化"，OpenClaw 的 Workshop 让 Skill 从使用经验中自动改进
 
-### 7.2 各项目的 Skill 系统成熟度评估
+### 8.2 各项目的 Skill 系统成熟度评估
 
 | 项目 | 成熟度 | 核心能力 | 缺失能力 |
 |------|--------|---------|---------|
@@ -1246,7 +1246,7 @@ Skill 系统在 Agent 生态中的演进可以划分为三个阶段：
 - L4（生产级）：有权限控制、预算管理、热更新、使用追踪等生产特性
 - L5（前沿级）：有自演化、远程分发、多租户隔离等前沿特性
 
-### 7.3 laew 的 Skill 系统演进路线图
+### 8.3 laew 的 Skill 系统演进路线图
 
 ```
 Phase 1 (P0)         Phase 2 (P1)         Phase 3 (P2)         Phase 4 (P3)
@@ -1406,9 +1406,9 @@ impl Skill {
 
 ---
 
-## 十一、Skill 的 Prompt 工程最佳实践
+## 十二、Skill 的 Prompt 工程最佳实践
 
-### 11.1 Prompt 注入格式对比
+### 12.1 Prompt 注入格式对比
 
 **XML 格式**（Claude Code / OpenClaw / pi 采用）：
 
@@ -1441,7 +1441,7 @@ code-review: Review code changes with checklist
 2. escapeXml 是成熟的安全实践
 3. 未来如果需要嵌套属性（如 `<metadata>`），XML 天然支持
 
-### 11.2 系统提示词中的 Skill 引导语
+### 12.2 系统提示词中的 Skill 引导语
 
 **pi 的引导语**（最简洁）：
 
@@ -1464,7 +1464,7 @@ Skill 文件中的相对路径基于 Skill 所在目录解析。
 使用 use_skill 工具可以显式加载指定 Skill。
 ```
 
-### 11.3 Skill 正文写作规范
+### 12.3 Skill 正文写作规范
 
 基于 6 个项目中实际 Skill 文件的分析，总结最佳实践：
 
@@ -1480,7 +1480,7 @@ Skill 文件中的相对路径基于 Skill 所在目录解析。
 
 ---
 
-## 十二、附录
+## 十三、附录
 
 ### 附录 A：关键源文件索引
 
