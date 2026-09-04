@@ -147,8 +147,14 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
-- `docs/Agent源码调研/` — 6 个外部 Agent 源码的系统调研(atomcode / claudecode / deepseek-harness / openclaw / opencode / pi),每个含「源码调研」+「深度分析」两份文档,覆盖多轮对话/Context/Yolo/质检/任务拆解/分类/工具/MCP/SKILL 8 维度
-- `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 8 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
+- `docs/Agent源码调研/` — 6 个外部 Agent 源码的系统调研,每个含「源码调研」+「深度分析」两份文档,覆盖架构/多轮对话/Context/Yolo/质检/任务拆解/分类/工具/MCP/SKILL 10 维度:
+  - `atomcode-*.md` — Rust, L0/L1/L2 分层 + cargo feature gating, ~150k 行
+  - `claudecode-*.md` — TypeScript/Bun, 四级压缩管线 + 27 种 Hook, ~218k 行
+  - `deepseek-harness-*.md` — TypeScript, Cordis Everything-is-a-Plugin, ~80+ 包
+  - `openclaw-*.md` — TypeScript, Gateway + Harness + 双向 MCP, ~201 万行
+  - `opencode-*.md` — TypeScript/Bun, Effect + Schema 全栈 DI, ~18k 行
+  - `pi-*.md` — TypeScript, lane 并发 + 一等公民 Skill, ~12 包
+- `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 10 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
 
 ## 自动化测试
 

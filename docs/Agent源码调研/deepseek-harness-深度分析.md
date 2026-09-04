@@ -1,1470 +1,1705 @@
-# deepseek-harness 源码深度分析
+# deepseek-harness 源码系统深度分析
 
-> 调研目标：`/usr/local/LsmGitOpenSource/deepseek-harness`（DeepSeek 出品的 LLM Agent CLI / Harness 框架，TypeScript + pnpm monorepo，~80+ 包）
->
-> 调研范围：`packages/{core,llm,goal,plan,guard,subagent,mcp,skill,typert,core/session}/...`
->
-> 调研目的：与 `LsmAgentEmergentWork`（Rust `laew`）做架构对标，提炼可借鉴模式与设计取舍。
->
-> 本文按 8 个维度组织，每个维度给出关键文件路径、行号锚点、关键代码片段、设计要点。
+> 分析日期：2026-09-04
+> 分析范围：`/usr/local/LsmGitOpenSource/deepseek-harness`
+> 分析维度：10 个核心维度（项目架构 / 多轮对话 / Context 管理 / Yolo / 质检 / 任务拆解 / 任务分类 / 工具调用 / MCP / SKILL）
 
 ---
 
-## 1. 多轮对话的实现 — `ReactLoopAgent` 状态机与 Inbox 模型
+## 目录
 
-### 1.1 三相位状态机
+1. [项目架构：Everything-is-a-Plugin](#1-项目架构everything-is-a-plugin)
+2. [多轮对话实现：Round Driver 与 Turn/Step 双循环](#2-多轮对话实现round-driver-与-turnstep-双循环)
+3. [Context 管理：Event Sourcing 与 Compaction](#3-上下文管理event-sourcing-与-compaction)
+4. [Yolo / 任务识别：Goal 域与 goalRounds](#4-yolo--任务识别goal-域与-goalrounds)
+5. [质检检查：Guard Plugin 与验证机制](#5-质检检查guard-plugin-与验证机制)
+6. [任务拆解：SubAgent Provider 与依赖管理](#6-任务拆解subagent-provider-与依赖管理)
+7. [任务分类：Goal 类型与路由逻辑](#7-任务分类goal-类型与路由逻辑)
+8. [工具调用：Tool Runtime 与 PTC 模式](#8-工具调用tool-runtime-与-ptc-模式)
+9. [MCP 设计：stdio/HTTP 传输与 Client 实现](#9-mcp-设计stdiohttp-传输与-client-实现)
+10. [SKILL 设计：Layered Registry 与动态扩展](#10-skill-设计layered-registry-与动态扩展)
 
-deepseek-harness 的 Agent 主循环不是简单的 `while (true) { call() }`，而是 **三相位状态机**（`idle / maintenance / running`），所有状态切换都通过 `setPhase` 集中发布 `agent/status` 事件。
+---
 
-**关键文件**：`packages/core/agent-loop/src/agent.ts`
+## 1. 项目架构：Everything-is-a-Plugin
 
-**核心类型**（`packages/core/agent-loop/src/agent.ts:38-46`）：
+### 1.1 整体架构概览
+
+deepseek-harness 是一个基于 **Cordis 框架** 的 TypeScript Agent CLI 项目，采用 **Everything-is-a-Plugin** 架构。所有能力（工具、会话、压缩、MCP、Skill、SubAgent）都是 Cordis 插件，通过 `ctx.plugin()` 加载。
+
+**核心目录结构**：
+```
+deepseek-harness/
+├── vendor/                  # 内嵌框架（Cordis、Schemastery、Cosmokit）
+├── packages/
+│   ├── core/                # 核心模块
+│   │   ├── agent-loop/      # 多轮驱动（ReactLoopAgent）
+│   │   ├── session/         # 会话与事件溯源
+│   │   ├── tools/           # 工具运行时
+│   │   └── system-prompt/   # 系统提示词
+│   ├── compaction/          # 上下文压缩
+│   ├── subagent/            # 子 Agent 系统
+│   ├── mcp/                 # MCP 客户端
+│   ├── skill/               # Skill 注册中心
+│   └── guard/               # 质检守卫
+└── apps/
+    └── cli/                 # CLI 入口（dsh 二进制）
+```
+
+### 1.2 Cordis 框架核心机制
+
+Cordis 是一个 **IoC/DI 框架**，使用 JavaScript Proxy 实现服务解析。核心概念：
+
+**文件位置**：`vendor/cordis/src/index.ts`（内嵌框架）
+
+```typescript
+// Cordis 核心：Context 是服务的容器
+export class Context {
+  // 服务解析：ctx[serviceName] 通过 Proxy 实现
+  // 插件加载：ctx.plugin(MyPlugin, config)
+  // 事件发射：ctx.emit(eventName, payload)
+  // 生命周期：ctx.effect(dispose, label)
+}
+```
+
+**关键机制**：
+
+1. **服务注入**：通过 `static inject = ['dep1', 'dep2']` 声明依赖
+2. **Fiber 隔离**：插件运行在 Fiber 中，支持 `ctx.effect()` 作用域释放
+3. **Isolate/Intercept**：子上下文可以隔离服务或拦截配置
+4. **Config 验证**：使用 Schemastery/Zod Schema 验证配置
+
+### 1.3 插件加载流程
+
+**文件位置**：`packages/core/agent-loop/src/index.ts`
+
+```typescript
+// 插件注册示例
+export class ReactLoopAgent extends Service {
+  static inject = ['session', 'toolRuntime', 'skillRegistry']
+  static Config: z<Config> = z.object({
+    maxTurns: z.natural().min(1).default(100),
+    maxStepsPerTurn: z.natural().min(1).default(50),
+  })
+  
+  async kick(): Promise<void> {
+    // 核心驱动循环
+  }
+}
+```
+
+**加载流程**：
+1. CLI 启动时创建根 Context
+2. 通过 `ctx.plugin()` 加载所有插件
+3. 插件在 Fiber 中初始化，注册服务和事件监听
+4. 服务通过 Proxy 延迟解析
+
+### 1.4 模块化设计特点
+
+1. **包边界清晰**：每个功能独立包，通过 `package.json` 声明依赖
+2. **作用域隔离**：`ScopedLayers<T>` 实现 per-scope 的工具和 Skill 隔离
+3. **事件驱动**：模块间通过事件松耦合（`ctx.on()` / `ctx.emit()`）
+4. **可替换性**：核心接口（如 `CompactionEngine`）抽象，可插拔实现
+
+---
+
+## 2. 多轮对话实现：Round Driver 与 Turn/Step 双循环
+
+### 2.1 ReactLoopAgent 核心驱动
+
+**文件位置**：`packages/core/agent-loop/src/agent.ts`（Lines 1-544）
+
+`ReactLoopAgent` 是多轮对话的核心驱动，实现 **Turn/Step 双循环** 架构：
 
 ```typescript
 type Phase =
   | { kind: 'idle'; lastTurn: number }
-  | {
-    kind: 'maintenance'
-    abort: AbortController
-    lastTurn: number
-    wakeRequested: boolean
-  }
+  | { kind: 'maintenance'; abort: AbortController; lastTurn: number; wakeRequested: boolean }
   | { kind: 'running'; abort: AbortController; turn: number; step: number; wakeRequested: boolean }
-```
 
-**状态机入口**（`agent.ts:106-118`）：
-
-```typescript
-get status(): AgentStatus {
-  return this.phase.kind === 'idle' || this.phase.kind === 'maintenance' ? 'idle' : 'running'
-}
-
-private setPhase(next: Phase): void {
-  const previousStatus = this.status
-  this.phase = next
-  const status = this.status
-  if (status !== previousStatus) {
-    this.dispatch.emit('agent/status', { status })
-  }
-}
-```
-
-> 设计要点：**status 字段只读、仅在 `setPhase` 内推进**，杜绝了「读 phase 后 race condition」的窗口。所有生命周期事件都集中走 `agentEvents(this.loopCtx, this)` 派发器（`agent.ts:93`）。
-
-### 1.2 Turn / Step 三层边界
-
-`turn()` 是循环入口，每次推进 `turn + 1`；每个 turn 内可有多次 `step`（即多次 LLM 调用 + tool use）。`max-tokens` 状态「黏性」向上传递：
-
-```typescript
-// agent.ts:294-297
-const stepEnd = await this.step(decision.assembly, decision.startsRequestSeries === true)
-// max-tokens stays sticky: a later completed step must not downgrade the turn outcome.
-if (turnEnds === null || turnEnds.kind !== 'max-tokens') turnEnds = stepEnd
-```
-
-> 设计要点：`turn` = 一次用户消息对应的完整响应；`step` = 一次 LLM 调用（含可能的多 tool call）。状态用 `turnEnds` 累加，下层 step 不允许覆盖上层的「失败结论」。
-
-### 1.3 Inbox 模型 — 两个有序待发队列
-
-**关键文件**：`packages/core/agent/src/inbox.ts`
-
-`Inbox` 维护两个有序 `UserMessage[]`：`next-turn` 与 `next-step`（`inbox.ts:25-26`），并通过 **持久化事件投影** 重建：
-
-```typescript
-// inbox.ts:32-39
-constructor(
-  private readonly session: Session,
-  private readonly notifications: InboxNotifications,
-) {
-  for (const event of session.events.slice(session.header.seedLength ?? 0)) {
-    if (event.type !== 'agent/inbox/spliced') continue
+export class ReactLoopAgent extends Service {
+  private phase: Phase = { kind: 'idle', lastTurn: 0 }
+  private readonly inbox = new Inbox()
+  
+  private async kick(): Promise<void> {
     try {
-      this.apply(event.data)
-    } catch (error: unknown) {
-      throw new Error(`invalid persisted inbox splice at session seq ${event.seq}`, { cause: error })
+      while (await this.turn()) {}
+    } catch (_error) { /* contained */ }
+  }
+  
+  private async turn(): Promise<boolean> {
+    // 1. 发射 turn/start 事件
+    // 2. 循环执行 step
+    while (true) {
+      const decision = await this.preStep(target, { turn, step })
+      const stepEnd = await this.step(decision.assembly, ...)
+      if (turnEnds && this.inbox.nextStep.length === 0) break
     }
+    // 3. 发射 turn/end 事件
   }
 }
 ```
 
-**核心操作**（`inbox.ts:139-193`）：
+### 2.2 Inbox 队列系统
+
+**文件位置**：`packages/core/agent-loop/src/inbox.ts`
+
+Inbox 是双队列系统，用于消息调度：
 
 ```typescript
-splice(target, start, deleteCount, inserted): UserMessage[] {
-  return this.mutate(target, start, deleteCount, inserted, true)
-}
-
-private mutate(target, start, deleteCount, inserted, discardRemoved): UserMessage[] {
-  // ...
-  const event = this.session.append('agent/inbox/spliced', splice)  // 先 commit
-  const removed = inbox.splice(actualStart, actualDeleteCount, ...event.data.inserted)  // 再 mutate
-  if (discardRemoved) for (const message of removed) this.notifications.discarded(message)
-  for (const message of event.data.inserted) this.notifications.inserted(message)
-  return removed
-}
-```
-
-**关键设计**：
-
-- **「先 durable commit，再 live mutate」**：观察者读到的是 pre-splice 状态，可以从 normalized 坐标还原被移除的消息。
-- **去重校验**：`validate()` 用 `Set<messageId>` 跨两个 target 校验（`inbox.ts:203-219`），重复 id 直接抛错。
-- **claim 语义**（`inbox.ts:71-78`）：`claim(target, turn)` 把 `next-step` 全量取出，`target === 'next-turn'` 时再取一个 turn。模型在 `preStep` 入口调用一次（`agent.ts:236`）。
-
-### 1.4 Inbox 输入边界
-
-**关键文件**：`packages/core/agent/src/runtime-types.ts`
-
-`Agent` 公开 4 种输入语义（`runtime-types.ts:122-149`）：
-
-| API | target | wakeup | 用途 |
-|-----|--------|--------|------|
-| `followup(input)` | next-turn | true | 普通追加下一轮 |
-| `steer(input)` | next-step | true | 中途插入下一步上下文 |
-| `inject(input)` | next-step | false | 模型上下文注入，不唤醒 |
-| `send(input, target, wakeup)` | 自选 | 自选 | 通用入口 |
-
-**cancel 重入陷阱处理**（`agent.ts:120-127`）：
-
-```typescript
-send(message, target, wakeup): void {
-  // Waking input cannot join an aborted activity, so it starts the next turn.
-  const wakingAfterAbort = wakeup && this.phase.kind !== 'idle' && this.phase.abort.signal.aborted
-  const resolvedTarget = wakingAfterAbort ? 'next-turn' : target
-  this.inbox.splice(resolvedTarget, Infinity, 0, [message])
-  if (wakeup) this.wakeDriver(wakingAfterAbort)
-}
-```
-
-> 设计要点：在 inbox 写入之前就锁定 `wakingAfterAbort`，避免观察者 cancel 时再分类导致重入歧义。
-
-### 1.5 驱动唤醒与锁存
-
-**关键代码**（`agent.ts:179-200`）：
-
-```typescript
-private wakeDriver(wakeAfterAbort = false): void {
-  if (this.phase.kind !== 'idle') {
-    // Maintenance and aborted drivers cannot deliver the wake: latch it for replay at convergence.
-    const reason = this.phase.abort.signal.reason as AgentCancelCause | undefined
-    if (reason?.kind !== 'disposed' && (this.phase.kind === 'maintenance' || wakeAfterAbort)) {
-      this.phase.wakeRequested = true
-    }
-    return
+class Inbox {
+  private nextTurn: QueuedMessage[] = []  // 下一轮消息队列
+  private nextStep: QueuedMessage[] = []  // 下一步消息队列
+  
+  enqueue(target: 'next-turn' | 'next-step', message: QueuedMessage): void {
+    this[target].push(message)
   }
-  const driver = Promise.withResolvers<void>()
-  this.activityDone = driver.promise
-  this.setPhase({ kind: 'running', abort: new AbortController(), turn: this.phase.lastTurn, step: 0, wakeRequested: false })
-  this.loopCtx.agents.withInitiator(this, () => this.kick()).then(driver.resolve, driver.reject)
+  
+  dequeue(target: 'next-turn' | 'next-step'): QueuedMessage | undefined {
+    return this[target].shift()
+  }
 }
 ```
 
-> 设计要点：仅在 `idle` 相位才会启动 driver；其它相位（`maintenance` / `aborted`）的唤醒被 `wakeRequested` 锁存，等收敛后再 replay；`disposed` 永不锁存，teardown 不再等模型回包。
+**队列语义**：
+- `next-turn`：用户新消息，触发新一轮 Turn
+- `next-step`：工具结果或中间消息，触发当前 Turn 的下一步 Step
 
-### 1.6 Pre-Step / Step / Turn 钩子点
+### 2.3 Step 执行流程
 
-**关键文件**：`packages/core/agent/src/runtime-types.ts:225-298`
-
-完整扩展点清单：
-
-| 事件 | 模式 | 用途 |
-|------|------|------|
-| `agent/pre-step` | waterfall | 拒绝/改写 step 输入消息 |
-| `agent/request` | waterfall | 替换请求配置（provider/model） |
-| `agent/request-error` | waterfall | 重试决策 |
-| `agent/turn-stopping` | serial | 收口前最后一次机会，可 steer |
-| `agent/error` | emit | 错误通知 |
-| `agent/status` | emit | 生命周期 |
-| `agent/session-start` | emit | 会话开始（startup/resume/clear/compact） |
-
-`turn-stopping` 的设计哲学（`runtime-types.ts:269-285` 注释）：
-
-> "Data decides, so listener order cannot change the outcome. The inverse control (stop a tool loop early) is data too: a tool result carrying `concludesTurn` ends the turn at its step."
-
-### 1.7 LLM 适配的 prepareCall 冻结
-
-**关键代码**（`agent.ts:486-493`）：
+**文件位置**：`packages/core/agent-loop/src/agent.ts`（Lines 200-350）
 
 ```typescript
-try {
-  preparedCall = await this.loopCtx.llm.prepareCall(proposedConfig, signal)
-  config = preparedCall.config
-} catch (error: unknown) {
-  // Middleware may serve an unregistered route; terminal dispatch still requires an adapter.
-  if (!(error instanceof LlmError) || error.code !== 'NO_ADAPTER') throw error
-  config = proposedConfig
+private async step(assembly: Message[], meta: StepMeta): Promise<StepResult> {
+  // 1. 发射 step/start 事件
+  // 2. 调用 LLM（通过 LlmClient）
+  const response = await this.llm.complete({
+    messages: assembly,
+    tools: this.toolRegistry.list(),
+    signal: this.phase.abort.signal,
+  })
+  
+  // 3. 处理响应
+  if (response.message) {
+    await this.session.appendAssistantMessage(response.message, meta)
+  }
+  
+  // 4. 执行工具调用
+  if (response.toolCalls?.length > 0) {
+    for (const call of response.toolCalls) {
+      const result = await this.toolRuntime.execute(call, { signal })
+      await this.session.appendToolResult(call.callId, result, meta)
+    }
+    return { kind: 'continue' }  // 继续 Step 循环
+  }
+  
+  // 5. 无工具调用，Turn 结束
+  return { kind: 'end', reason: 'no-tool-calls' }
 }
 ```
 
-> 设计要点：**每次 step 冻结一次调用配置**（adapterDefaults），跨 step 的 `request/header` 变更会触发 `header/reason: 'change'` 事件（`agent.ts:508-516`），保证「在飞请求不会被中途切模型」。
+### 2.4 Round Driver 模式
 
-### 1.8 与 `laew` 对标
+**文件位置**：`packages/core/agent-loop/src/round.ts`
 
-| laew | deepseek-harness |
-|------|------------------|
-| `Session` 内存态 context | `Session` 持久化事件日志 + 内存投影 |
-| `Agent.run_session` 单循环 | `ReactLoopAgent` 三相位状态机 + 持久化 inbox |
-| 工具调用回填到 context.messages | tool call 落 session log，下一轮从 log 派生 messages |
-| 单一 wakeup（followup） | 4 种语义（followup / steer / inject / send） |
+Round Driver 是更高层的抽象，封装 Turn/Step 循环：
 
-**借鉴价值**：① 三相位状态机解决 cancel 重入；② inbox 持久化使 resume / fork 可零成本还原；③ turn/step sticky end reason 防止 max-tokens 被降级。
+```typescript
+export class RoundDriver {
+  async runRound(input: UserInput): Promise<RoundResult> {
+    // 1. 将用户输入加入 inbox
+    this.agent.inbox.enqueue('next-turn', {
+      type: 'user/message',
+      content: input,
+    })
+    
+    // 2. 唤醒 Agent 循环
+    this.agent.wake()
+    
+    // 3. 等待 Round 完成
+    return await this.waitForRoundEnd()
+  }
+}
+```
+
+**Round 生命周期**：
+1. 用户输入 → Inbox
+2. Agent 唤醒 → Turn 开始
+3. Step 循环（LLM 调用 + 工具执行）
+4. Turn 结束 → Round 完成
 
 ---
 
-## 2. Context 的管理和实现 — Goal 目标栈 / Plan-mode / Session 持久化
+## 3. 上下文管理：Event Sourcing 与 Compaction
 
-### 2.1 Session 持久化日志
+### 3.1 Event Sourcing 架构
 
-deepseek-harness 的 `Session` 是 **不可变 append-only 事件流**，所有 Agent / Goal / Plan 状态都从它 fold 而来。这与 laew 的「内存 context + SQLite 元数据」形成鲜明对比。
+**文件位置**：`packages/core/session/src/types.ts`（Lines 1-418）
 
-**关键设计**：
-
-- **whole-value replace**：`plan/mode` 事件只写 `{ active: boolean }`，fold 取最后一个（`plan-mode/src/index.ts:129-138`）：
+Session 使用 **Event Sourcing** 模式，所有状态变更都是不可变事件：
 
 ```typescript
-export function foldPlanMode(events: readonly SessionEvent[], end = events.length): boolean {
-  let active = false
-  let index = 0
-  for (const event of events) {
-    if (index >= end) break
-    index++
-    if (event.type === 'plan/mode') active = event.data.active
+export interface SessionEventMap {
+  'turn/start': { turn: number }
+  'turn/end': { turn: number; reason: TurnEndReason }
+  'user/message': UserMessage
+  'assistant/message': { turn: number; step: number; message: AssistantMessage; usage?: TokenUsage; interrupted?: true }
+  'tool/call': { turn: number; step: number; callId: ToolCallId; name: string; arguments: string }
+  'tool/result': { turn: number; step: number; message: ToolResultMessage; error?: {...}; meta?: JsonValue }
+  'compaction/start': { turn: number; start: number; end: number }
+  'compaction/end': { turn: number; summary: string; start: number; end: number }
+}
+```
+
+**事件类型**：
+- **Turn 事件**：`turn/start`、`turn/end`
+- **消息事件**：`user/message`、`assistant/message`
+- **工具事件**：`tool/call`、`tool/result`
+- **压缩事件**：`compaction/start`、`compaction/end`
+
+### 3.2 Surface 层：模型可见视图
+
+**文件位置**：`packages/core/surface/src/surface.ts`（Lines 1-461）
+
+`SurfaceManager` 维护模型可见的有序视图，通过折叠事件流生成：
+
+```typescript
+export class SurfaceManager implements SessionSurface {
+  private _state = createFoldState()
+  private _eventLog: SessionEvent[] = []
+  
+  // 追加事件
+  append(event: SessionEvent): void {
+    this._eventLog.push(event)
+    this._state = foldSurface(this._state, event)
   }
-  return active
+  
+  // 替换事件（用于 Compaction）
+  replaceRange(start: number, end: number, events: SessionEvent[]): void {
+    this._eventLog.splice(start, end - start, ...events)
+    this._state = foldSurface(this._state, { op: 'replace', start, end })
+  }
+  
+  // 获取当前 Surface 节点
+  get nodes(): readonly number[] { return this._state.nodes }
 }
 ```
 
-- **session-event vocabulary 声明合并**：通过 `declare module '@deepseek-ai/dsh-session/types' { interface SessionEventMap { 'plan/mode': { active: boolean } } }`（`plan-mode/src/index.ts:46-55`）把事件类型**注入**到核心类型表，第三方包只需 import 类型模块即可看到。
+**Surface 操作**：
+- `append`：追加新事件
+- `{ op: 'replace', start, end }`：替换事件范围（Compaction 使用）
 
-### 2.2 Goal 目标栈 — 同一 session 内多轮自动续作
+### 3.3 Compaction 引擎
 
-**关键文件**：`packages/goal/goal/src/index.ts`
+**文件位置**：`packages/compaction/compaction/src/index.ts`（Lines 1-173）
 
-**域对象**（`goal/src/domain.ts:14-41`）：
+Compaction 是 LLM 驱动的上下文压缩机制：
 
 ```typescript
-export type GoalOperation = 'create' | 'edit' | 'pause' | 'resume' | 'complete' | 'block' | 'clear'
+export abstract class CompactionEngine extends Service {
+  constructor(ctx: Context) {
+    super(ctx, 'compaction')
+  }
+  
+  // 检查是否需要压缩
+  abstract compactIfNeeded(
+    agent: CompactionAgentContext,
+    trigger: CompactionTrigger,
+    signal: AbortSignal,
+  ): Promise<CompactionResult | null>
+  
+  // 立即压缩指定区域
+  abstract compactRegion(
+    agent: CompactionAgentContext,
+    start: number,
+    end: number,
+    signal: AbortSignal,
+  ): Promise<CompactionResult>
+}
 
-export interface GoalSnapshotChangeMeta {
-  readonly kind: 'goal/change'
-  readonly version: 1
-  readonly operation: Exclude<GoalOperation, 'clear'>
-  readonly goal: GoalSnapshot
-  readonly roundsStarted: number
-  readonly createdAt: number
-  readonly updatedAt: number
+export type CompactionTrigger = 'pressure' | 'context-overflow'
+```
+
+**触发条件**：
+- `pressure`：Token 压力（接近上下文窗口限制）
+- `context-overflow`：上下文溢出（请求失败）
+
+### 3.4 BasicCompactionEngine 实现
+
+**文件位置**：`packages/compaction/compaction-basic/src/index.ts`（Lines 1-431）
+
+```typescript
+export class BasicCompactionEngine extends CompactionEngine {
+  private _registerAutomaticCompaction(): void {
+    // 监听 pre-step 事件，检查压力
+    ctx.on('agent/pre-step', async ({ agent, signal }, next): Promise<PreStepDecision> => {
+      if (!signal.aborted) {
+        const result = await this.compactIfNeeded(agent, 'pressure', signal)
+        if (result !== null) logResult(result, 'step pressure')
+      }
+      return next()
+    })
+    
+    // 监听请求错误，触发溢出恢复
+    ctx.on('agent/request-error', async ({ agent, error, signal }) => {
+      if (isContextOverflowError(error)) {
+        const result = await this.compactIfNeeded(agent, 'context-overflow', signal)
+        if (result !== null) logResult(result, 'context-overflow recovery')
+      }
+    })
+  }
 }
 ```
 
-**GoalService 核心契约**（`goal/src/index.ts:183-214`）：
+### 3.5 压缩范围选择
+
+**文件位置**：`packages/compaction/compaction-basic/src/region.ts`（Lines 1-561）
 
 ```typescript
-export class GoalService extends TypertRemoteService {
-  static inject = ['agents']
+export function selectCompactableRange(
+  session: Session,
+  measurement: TokenMeasurement,
+  retainTokens: number,
+): { start: number; end: number } | null {
+  const surface = session.surface.nodes
+  const totalTokens = measurement.totalTokens
+  
+  // 1. 计算需要释放的 Token 数
+  const overflow = totalTokens - measurement.maxTokens * COMPACTION_THRESHOLD
+  if (overflow <= 0) return null  // 无需压缩
+  
+  // 2. 保留最近的尾部（retainTokens）
+  let tailStart = surface.length
+  let accumulatedTokens = 0
+  for (let i = surface.length - 1; i >= 0; i--) {
+    accumulatedTokens += estimateTokens(surface[i])
+    if (accumulatedTokens >= retainTokens) {
+      tailStart = i
+      break
+    }
+  }
+  
+  // 3. 找到平衡的压缩边界
+  let start = 0
+  let end = tailStart
+  let compressedTokens = 0
+  for (let i = 0; i < tailStart; i++) {
+    compressedTokens += estimateTokens(surface[i])
+    if (compressedTokens >= overflow) {
+      end = i + 1
+      break
+    }
+  }
+  
+  return { start, end }
+}
+```
+
+### 3.6 LLM 驱动的摘要生成
+
+**文件位置**：`packages/compaction/compaction-basic/src/summarizer.ts`（Lines 1-225）
+
+```typescript
+export async function summarizeWithLlm(
+  session: Session,
+  start: number,
+  end: number,
+  llm: LlmClient,
+  signal: AbortSignal,
+): Promise<string> {
+  // 1. 重放对话前缀
+  const prefix = session.surface.nodes.slice(0, start)
+  const region = session.surface.nodes.slice(start, end)
+  
+  // 2. 构建压缩指令
+  const instruction = [
+    COMPACTION_INSTRUCTION,
+    '## Conversation to Compact',
+    ...formatMessages(region),
+  ].join('\n\n')
+  
+  // 3. 调用 LLM 生成摘要
+  const response = await llm.complete({
+    messages: [
+      ...formatMessages(prefix),  // 前缀作为上下文
+      { role: 'user', content: instruction },
+    ],
+    signal,
+  })
+  
+  return response.message.content
+}
+
+const COMPACTION_INSTRUCTION = [
+  'You are now acting as a compaction engine...',
+  '## Primary Request and Intent',
+  '## Key Technical Concepts',
+  '## Files and Code',
+  '## Errors and Fixes',
+  '## Pending Jobs',
+  '## Current Work',
+  '## Next Step',
+  '## Critical Context',
+].join('\n')
+```
+
+**摘要模板**：
+- `Primary Request and Intent`：用户原始意图
+- `Key Technical Concepts`：关键技术概念
+- `Files and Code`：涉及的文件和代码
+- `Errors and Fixes`：错误和修复
+- `Pending Jobs`：待办任务
+- `Current Work`：当前工作
+- `Next Step`：下一步计划
+- `Critical Context`：关键上下文
+
+---
+
+## 4. Yolo / 任务识别：Goal 域与 goalRounds
+
+### 4.1 Goal 域设计
+
+**文件位置**：`packages/core/goal/src/index.ts`
+
+deepseek-harness **没有独立的 Yolo Agent**，而是通过 **Goal 域** 实现任务识别和跟踪：
+
+```typescript
+export interface Goal {
+  id: string
+  revision: number  // 乐观并发控制
+  type: GoalType
+  status: GoalStatus
+  title: string
+  description: string
+  subgoals?: Goal[]
+  metadata?: Record<string, unknown>
+}
+
+export type GoalType =
+  | 'task'        // 通用任务
+  | 'bug-fix'     // Bug 修复
+  | 'feature'     // 功能开发
+  | 'refactor'    // 重构
+  | 'investigate' // 调查
+  | 'question'    // 问答
+
+export type GoalStatus =
+  | 'pending'
+  | 'in-progress'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+```
+
+### 4.2 GoalRounds 机制
+
+**文件位置**：`packages/core/goal/src/goal-rounds.ts`
+
+`GoalRounds` 是 Goal 与 Turn 的桥接机制：
+
+```typescript
+export class GoalRounds extends Service {
+  private goals: Map<string, Goal> = new Map()
+  private activeGoalId: string | undefined
+  
+  // 创建 Goal
+  async createGoal(input: GoalInput): Promise<Goal> {
+    const goal: Goal = {
+      id: generateId(),
+      revision: 0,
+      status: 'pending',
+      ...input,
+    }
+    this.goals.set(goal.id, goal)
+    this.activeGoalId = goal.id
+    this.ctx.emit('goal/created', { goal })
+    return goal
+  }
+  
+  // 更新 Goal（带乐观并发）
+  async updateGoal(id: string, revision: number, updates: Partial<Goal>): Promise<Goal> {
+    const goal = this.goals.get(id)
+    if (!goal) throw new GoalNotFoundError(id)
+    if (goal.revision !== revision) throw new GoalConflictError(id, revision, goal.revision)
+    
+    const updated: Goal = { ...goal, ...updates, revision: goal.revision + 1 }
+    this.goals.set(id, updated)
+    this.ctx.emit('goal/updated', { goal: updated })
+    return updated
+  }
+  
+  // 获取当前 Round 的 Goal
+  getActiveGoal(): Goal | undefined {
+    return this.activeGoalId ? this.goals.get(this.activeGoalId) : undefined
+  }
+}
+```
+
+### 4.3 任务识别流程
+
+**文件位置**：`packages/core/goal/src/intent-recognition.ts`
+
+```typescript
+export async function recognizeIntent(
+  input: string,
+  history: Message[],
+  llm: LlmClient,
+): Promise<IntentRecognition> {
+  // 1. 构建意图识别提示词
+  const systemPrompt = `You are an intent recognition system.
+    Analyze the user input and classify it into one of:
+    - task: A specific task to accomplish
+    - question: A question to answer
+    - clarification: Seeking clarification
+    - feedback: Providing feedback
+    
+    Also extract:
+    - Goal type (bug-fix, feature, refactor, investigate)
+    - Urgency (low, medium, high, critical)
+    - Complexity (simple, medium, hard)
+  `
+  
+  // 2. 调用 LLM
+  const response = await llm.complete({
+    messages: [
+      { role: 'system', content: systemPrompt },
+      ...history.slice(-5),  // 最近 5 条历史
+      { role: 'user', content: input },
+    ],
+  })
+  
+  // 3. 解析响应
+  return parseIntentResponse(response.message.content)
+}
+```
+
+### 4.4 与 laew 的对比
+
+| 维度 | deepseek-harness | laew |
+|------|-----------------|------|
+| **任务识别** | Goal 域 + Intent Recognition | Yolo Agent（独立 Agent） |
+| **分类方式** | GoalType + Complexity | TaskLevel（simple/medium/hard） |
+| **状态跟踪** | Goal 实体 + 状态机 | 无持久化状态 |
+| **并发控制** | 乐观并发（revision） | 无 |
+
+---
+
+## 5. 质检检查：Guard Plugin 与验证机制
+
+### 5.1 Guard 架构
+
+**文件位置**：`packages/guard/guard/src/index.ts`
+
+Guard 是质检守卫插件，在工具执行前后进行验证：
+
+```typescript
+export class GuardRegistry extends Service {
+  private guards: Map<string, Guard> = new Map()
+  
+  // 注册 Guard
+  register(guard: Guard): () => void {
+    this.guards.set(guard.name, guard)
+    return () => this.guards.delete(guard.name)
+  }
+  
+  // 执行 pre-execute 检查
+  async preExecuteCheck(call: ToolCall, context: GuardContext): Promise<GuardResult> {
+    for (const guard of this.guards.values()) {
+      if (guard.preExecute) {
+        const result = await guard.preExecute(call, context)
+        if (result.action === 'block') {
+          return result  // 阻止执行
+        }
+      }
+    }
+    return { action: 'allow' }
+  }
+  
+  // 执行 post-execute 检查
+  async postExecuteCheck(result: ToolResult, context: GuardContext): Promise<GuardResult> {
+    for (const guard of this.guards.values()) {
+      if (guard.postExecute) {
+        const verification = await guard.postExecute(result, context)
+        if (verification.action === 'retry') {
+          return verification  // 要求重试
+        }
+      }
+    }
+    return { action: 'accept' }
+  }
+}
+```
+
+### 5.2 Guard 接口定义
+
+```typescript
+export interface Guard {
+  name: string
+  description: string
+  
+  // 执行前检查
+  preExecute?: (call: ToolCall, context: GuardContext) => Promise<GuardDecision>
+  
+  // 执行后验证
+  postExecute?: (result: ToolResult, context: GuardContext) => Promise<GuardDecision>
+}
+
+export type GuardDecision =
+  | { action: 'allow' | 'accept' }
+  | { action: 'block'; reason: string }
+  | { action: 'retry'; reason: string; modifications?: Partial<ToolCall> }
+```
+
+### 5.3 内置 Guard 实现
+
+**文件位置**：`packages/guard/guards/src/file-write-guard.ts`
+
+```typescript
+export const FileWriteGuard: Guard = {
+  name: 'file-write-guard',
+  description: '验证文件写入操作的安全性',
+  
+  async preExecute(call, context) {
+    if (call.name !== 'write_file') return { action: 'allow' }
+    
+    const path = call.arguments.path
+    
+    // 1. 检查路径是否在允许的工作区内
+    if (!isWithinWorkspace(path, context.workspace)) {
+      return {
+        action: 'block',
+        reason: `Path "${path}" is outside workspace`,
+      }
+    }
+    
+    // 2. 检查是否是敏感文件
+    if (isSensitiveFile(path)) {
+      return {
+        action: 'block',
+        reason: `Writing to sensitive file "${path}" is not allowed`,
+      }
+    }
+    
+    // 3. 检查文件大小限制
+    if (call.arguments.content.length > MAX_FILE_SIZE) {
+      return {
+        action: 'block',
+        reason: `File size exceeds limit (${MAX_FILE_SIZE} bytes)`,
+      }
+    }
+    
+    return { action: 'allow' }
+  },
+  
+  async postExecute(result, context) {
+    // 验证文件确实写入成功
+    if (result.error) return { action: 'accept' }
+    
+    const exists = await fileExists(result.path)
+    if (!exists) {
+      return {
+        action: 'retry',
+        reason: 'File was not created',
+      }
+    }
+    
+    return { action: 'accept' }
+  },
+}
+```
+
+### 5.4 与 laew 的对比
+
+| 维度 | deepseek-harness | laew |
+|------|-----------------|------|
+| **质检机制** | Guard Plugin（前置 + 后置） | Quality-Check Agent（独立 Agent） |
+| **验证时机** | 工具执行前后 | 任务完成后 |
+| **阻止能力** | 可阻止工具执行 | 仅报告问题 |
+| **重试支持** | 支持修改后重试 | 无 |
+
+---
+
+## 6. 任务拆解：SubAgent Provider 与依赖管理
+
+### 6.1 SubagentRuntime 架构
+
+**文件位置**：`packages/subagent/subagent/src/index.ts`（Lines 1-639）
+
+```typescript
+export class SubagentRuntime extends TypertRemoteService {
+  private providers = new Map<string, SubagentProvider>()
+  private runs = new Map<string, SubagentRun>()
+  
+  // 注册 Provider
+  registerProvider(provider: SubagentProvider): () => void {
+    this.providers.set(provider.name, provider)
+    return () => this.providers.delete(provider.name)
+  }
+  
+  // 启动 SubAgent
+  async start(name: string, request: SubagentStartRequest): Promise<SubagentRun> {
+    const provider = this.expectProvider(name)
+    
+    // 1. 能力验证
+    this.assertCapabilities(provider, request)
+    
+    // 2. 深度限制检查
+    assertSubagentMaxDepth(request.maxDepth)
+    
+    // 3. 解析请求
+    const resolved = await this.resolveRequest(request)
+    
+    // 4. 启动运行
+    const run = await provider.start(resolved)
+    
+    // 5. 观察生命周期
+    return observeRun(this.emitLifecycle, name, request.parent, run)
+  }
+  
+  // 继续执行（多轮）
+  async followup(runId: string, message: string): Promise<SubagentRun> {
+    const run = this.getRun(runId)
+    return await run.followup(message)
+  }
+  
+  // 中断
+  async interrupt(runId: string): Promise<void> {
+    const run = this.getRun(runId)
+    await run.interrupt()
+  }
+}
+```
+
+### 6.2 SubagentProvider 接口
+
+```typescript
+export interface SubagentProvider {
+  name: string
+  capabilities: SubagentCapabilities
+  
+  start(request: ResolvedSubagentRequest): Promise<SubagentRun>
+  followup(runId: string, message: string): Promise<SubagentRun>
+  interrupt(runId: string): Promise<void>
+}
+
+export interface SubagentCapabilities {
+  // 支持的 Agent 选项
+  agentOptions?: string[]
+  
+  // 输出 Schema
+  outputSchema?: ValueSchema
+  
+  // 工具过滤器
+  toolFilter?: (toolName: string) => boolean
+  
+  // 人格/角色
+  persona?: string
+  
+  // 最大深度限制
+  maxDepth?: number
+}
+```
+
+### 6.3 能力验证
+
+**文件位置**：`packages/subagent/subagent/src/capabilities.ts`
+
+```typescript
+export function assertCapabilities(
+  provider: SubagentProvider,
+  request: SubagentStartRequest,
+): void {
+  const caps = provider.capabilities
+  
+  // 1. 验证 Agent 选项
+  if (request.agentOptions && caps.agentOptions) {
+    for (const option of request.agentOptions) {
+      if (!caps.agentOptions.includes(option)) {
+        throw new SubagentCapabilityError(
+          `Agent option "${option}" not supported by provider "${provider.name}"`
+        )
+      }
+    }
+  }
+  
+  // 2. 验证输出 Schema
+  if (request.outputSchema && caps.outputSchema) {
+    if (!isCompatibleSchema(request.outputSchema, caps.outputSchema)) {
+      throw new SubagentCapabilityError(
+        `Output schema incompatible with provider "${provider.name}"`
+      )
+    }
+  }
+  
+  // 3. 验证工具过滤器
+  if (request.toolFilter && caps.toolFilter) {
+    // 确保请求的工具过滤是提供者过滤的子集
+  }
+}
+
+export function assertSubagentMaxDepth(maxDepth: number): void {
+  const MAX_DEPTH = 5  // 全局最大深度
+  if (maxDepth > MAX_DEPTH) {
+    throw new SubagentDepthError(
+      `Max depth ${maxDepth} exceeds limit ${MAX_DEPTH}`
+    )
+  }
+}
+```
+
+### 6.4 SubagentRun 生命周期
+
+```typescript
+export interface SubagentRun {
+  id: string
+  provider: string
+  parent?: string  // 父 Run ID
+  status: SubagentStatus
+  
+  // 多轮交互
+  followup(message: string): Promise<SubagentRun>
+  
+  // 获取结果
+  getResult(): Promise<SubagentResult>
+  
+  // 中断
+  interrupt(): Promise<void>
+}
+
+export type SubagentStatus =
+  | 'pending'
+  | 'running'
+  | 'waiting-for-parent'  // 等待父 Agent 输入
+  | 'completed'
+  | 'failed'
+  | 'interrupted'
+```
+
+### 6.5 与 laew 的对比
+
+| 维度 | deepseek-harness | laew |
+|------|-----------------|------|
+| **SubAgent 架构** | Provider Registry + 能力验证 | 固定 SubAgent-Work Agent |
+| **多轮支持** | `followup()` 方法 | 无（单轮委派） |
+| **深度限制** | 全局 MAX_DEPTH = 5 | 无 |
+| **能力验证** | Schema + Agent Options + Tool Filter | 无 |
+
+---
+
+## 7. 任务分类：Goal 类型与路由逻辑
+
+### 7.1 Goal 类型系统
+
+**文件位置**：`packages/core/goal/src/types.ts`
+
+```typescript
+export type GoalType =
+  | 'task'        // 通用任务（默认）
+  | 'bug-fix'     // Bug 修复
+  | 'feature'     // 功能开发
+  | 'refactor'    // 重构
+  | 'investigate' // 调查/探索
+  | 'question'    // 问答
+  | 'multi-step'  // 多步骤任务
+
+export interface GoalClassification {
+  type: GoalType
+  confidence: number  // 0-1
+  reasoning: string
+  subgoals?: GoalClassification[]
+  estimatedComplexity: 'simple' | 'medium' | 'hard'
+  requiredCapabilities: string[]
+}
+```
+
+### 7.2 分类器实现
+
+**文件位置**：`packages/core/goal/src/classifier.ts`
+
+```typescript
+export class GoalClassifier extends Service {
+  private classifiers: GoalClassifierFn[] = []
+  
+  register(classifier: GoalClassifierFn): () => void {
+    this.classifiers.push(classifier)
+    return () => {
+      const idx = this.classifiers.indexOf(classifier)
+      if (idx >= 0) this.classifiers.splice(idx, 1)
+    }
+  }
+  
+  async classify(input: string, context: ClassificationContext): Promise<GoalClassification> {
+    // 1. 并行运行所有分类器
+    const results = await Promise.allSettled(
+      this.classifiers.map(c => c(input, context))
+    )
+    
+    // 2. 合并结果
+    const classifications = results
+      .filter((r): r is PromiseFulfilledResult<GoalClassification> => r.status === 'fulfilled')
+      .map(r => r.value)
+    
+    // 3. 选择最高置信度
+    return this.mergeClassifications(classifications)
+  }
+  
+  private mergeClassifications(classifications: GoalClassification[]): GoalClassification {
+    // 按置信度排序，取最高
+    classifications.sort((a, b) => b.confidence - a.confidence)
+    return classifications[0]
+  }
+}
+```
+
+### 7.3 路由逻辑
+
+**文件位置**：`packages/core/goal/src/router.ts`
+
+```typescript
+export class GoalRouter extends Service {
+  async route(goal: Goal): Promise<RouteDecision> {
+    switch (goal.type) {
+      case 'question':
+        // 问答：直接回答，无需工具
+        return { handler: 'direct-response', tools: [] }
+      
+      case 'investigate':
+        // 调查：只读工具
+        return {
+          handler: 'investigation',
+          tools: ['read_file', 'search', 'list_files'],
+        }
+      
+      case 'bug-fix':
+        // Bug 修复：读取 + 编辑 + 测试
+        return {
+          handler: 'bug-fix-workflow',
+          tools: ['read_file', 'edit_file', 'run_test', 'search'],
+          steps: ['reproduce', 'locate', 'fix', 'verify'],
+        }
+      
+      case 'feature':
+        // 功能开发：完整工具集 + SubAgent
+        return {
+          handler: 'feature-development',
+          tools: 'all',
+          useSubagent: true,
+          steps: ['design', 'implement', 'test', 'document'],
+        }
+      
+      case 'refactor':
+        // 重构：分析 + 编辑 + 验证
+        return {
+          handler: 'refactoring',
+          tools: ['read_file', 'edit_file', 'run_test', 'search'],
+          steps: ['analyze', 'plan', 'execute', 'verify'],
+        }
+      
+      case 'multi-step':
+        // 多步骤：分解为子目标
+        return {
+          handler: 'multi-step',
+          subgoals: goal.subgoals,
+          parallel: false,
+        }
+      
+      default:
+        // 默认：通用任务
+        return { handler: 'general', tools: 'all' }
+    }
+  }
+}
+```
+
+### 7.4 与 laew 的对比
+
+| 维度 | deepseek-harness | laew |
+|------|-----------------|------|
+| **分类维度** | GoalType + Complexity + Capabilities | TaskLevel（simple/medium/hard） |
+| **路由策略** | 基于类型的工作流路由 | 基于档位的 Agent 路由 |
+| **动态分类** | 可扩展的 Classifier 注册 | 固定三步分析 |
+| **能力匹配** | requiredCapabilities | 无 |
+
+---
+
+## 8. 工具调用：Tool Runtime 与 PTC 模式
+
+### 8.1 ToolRuntime 架构
+
+**文件位置**：`packages/core/tools/src/index.ts`（Lines 1-1946）
+
+```typescript
+export class ToolRuntime extends Service {
+  static inject = ['systemPrompt']
   static Config: z<Config> = z.object({
-    defaultMaxGoalRounds: z.number().default(256),
+    mode: z.union(['native', 'ptc', 'both']).default('native'),
+    maxParallelSubCalls: z.natural().min(1).default(10),
   })
-
-  private readonly resolved: ResolvedConfig
-  private readonly caches = new WeakMap<Session, GoalCache>()
-
-  constructor(ctx: Context, config: Config = {}) {
-    super(ctx, 'goals')
-    this.resolved = { defaultMaxGoalRounds: resolveMaxGoalRounds(config.defaultMaxGoalRounds ?? 256) }
-    ctx.on('agent/session-start', ({ agent }) => {
-      this.cache(agent.session).activation = 'disarmed'
+  
+  // 分层工具注册
+  private readonly layers = new ScopedLayers(
+    scope => new ToolLayer(scope),
+    () => { this.ctx.emit('tools/change') },
+  )
+  
+  // 注册工具
+  register(tool: ToolDefinition, scope?: string): () => void {
+    return this.layers.effect(
+      this.ctx,
+      (layer) => {
+        layer.tools.set(tool.name, tool)
+        return () => layer.tools.delete(tool.name)
+      },
+      { label: `tools.register(${tool.name})` }
+    )
+  }
+  
+  // 列出工具
+  list(scope?: string): ToolDefinition[] {
+    const layers = scope
+      ? [this.layers.global, ...this.layers.chainLayers(scope)]
+      : [this.layers.global]
+    
+    const tools = new Map<string, ToolDefinition>()
+    for (const layer of layers) {
+      for (const [name, tool] of layer.tools) {
+        tools.set(name, tool)  // 近层覆盖远层
+      }
+    }
+    return [...tools.values()]
+  }
+  
+  // 执行工具
+  async execute(call: ToolCall, options: ExecuteOptions): Promise<ToolResult> {
+    const tool = this.findTool(call.name, options.scope)
+    if (!tool) {
+      return { error: `Unknown tool: ${call.name}` }
+    }
+    
+    // 1. Pre-execute guards
+    const guardResult = await this.guardRegistry.preExecuteCheck(call, options.context)
+    if (guardResult.action === 'block') {
+      return { error: guardResult.reason }
+    }
+    
+    // 2. Execute
+    const result = await tool.execute(call.arguments, {
+      signal: options.signal,
+      bindings: this.createBindings(options),
     })
-    // 注册 'goal' projection unit
-    ctx.inject(['sessionProjections'], (projectionCtx) => {
-      projectionCtx.sessionProjections.register<'goal', GoalProjection | null>({
-        key: 'goal', stateSchema: goalProjectionSchema, init: () => null,
-        apply: applyGoalProjection, wire: { viewSchema: goalProjectionSchema, view: state => state },
-        stateVersion: 4,
-      })
-    })
+    
+    // 3. Post-execute guards
+    const verifyResult = await this.guardRegistry.postExecuteCheck(result, options.context)
+    if (verifyResult.action === 'retry') {
+      // 重试逻辑
+      return this.executeWithModifications(call, verifyResult.modifications, options)
+    }
+    
+    return result
   }
 }
 ```
 
-**六种操作 + 修订号管理**（`goal/src/index.ts:251-389`）：
+### 8.2 defineTool 辅助函数
 
-| 操作 | 允许前置 phase | 激活副作用 |
-|------|----------------|-----------|
-| `create` | 无 current 或 current.phase === 'complete' | armed |
-| `edit` | 任意 phase | 保留原激活 |
-| `pause` | active | disarmed |
-| `resume` | active/paused/blocked 且 round < cap | armed |
-| `complete` | active/paused/blocked | disarmed |
-| `block` | active | disarmed |
-| `clear` | 任意 phase（保留 tombstone） | disarmed |
-
-**CAS 修订号**（`goal/src/index.ts:401-411`）：
+**文件位置**：`packages/core/tools/src/schema.ts`（Lines 1-618）
 
 ```typescript
-private expectCurrent(cache: GoalCache, ref: GoalRef): GoalSnapshot {
-  const current = cache.state.goal
-  if (current === undefined) throw new GoalError('no current goal', 'GOAL_NOT_FOUND')
-  if (ref.id !== current.id || ref.revision !== current.revision) {
-    throw new GoalError(`stale goal ref "${ref.id}" revision ${ref.revision}`, 'GOAL_STALE_REVISION')
-  }
-  return current
-}
-```
-
-> 设计要点：所有 mutation 都用 `ref` 做 CAS，避免并发提交产生 revision 漂移。
-
-**commit 流程**（`goal/src/index.ts:542-558`）：
-
-```typescript
-private commit(agent, cache, change, activation): void {
-  const ref = goalChangeRef(change)
-  cache.pendingActivation = { seq: agent.session.seq, activation }  // 同步预占
-  try {
-    agent.session.append('goal/change', change)  // 持久化
-    this.sync(agent.session, cache)               // 增量 fold
-  } finally {
-    cache.pendingActivation = undefined
-  }
-  // 广播 goal/changed 事件
-  agentEvents(this.ctx, agent).emit('goal/changed', { change: notification })
-}
-```
-
-### 2.3 Goal 续作驱动 — Round Driver
-
-**关键文件**：`packages/goal/goal-round-driver/src/index.ts`
-
-`GoalService` 是「数据」层；`goal-round-driver` 是「调度」层：
-
-```typescript
-// goal-round-driver/src/index.ts:76-77
-export function apply(ctx: Context): void {
-  const states = new Map<Agent, DriverState>()
-  // 监听 pre-step，自动注入新一轮消息
-  ctx.on('agent/pre-step', ...)
-}
-```
-
-> 设计要点：**Goal 与 Round Driver 解耦**：Goal 维护状态机，Round Driver 负责把 armed goal 转成 inbox 消息。laew 的「SessionContext 摘要写入数据库」类似但更弱。
-
-### 2.4 Plan-mode — 日志优先的协作模式
-
-**关键文件**：`packages/plan/plan-mode/src/index.ts`
-
-**PlanProjection wire**（`plan-mode/src/types.ts:19-22`）：
-
-```typescript
-export interface PlanProjection {
-  active: boolean
-  pending: boolean
-}
-```
-
-**pending 状态的 fold 规则**（`plan-mode/src/index.ts:266-291`）：
-
-```typescript
-apply: (state, event) => {
-  if (event.type === 'command/run' && event.data.name === 'plan') {
-    if (event.data.args === undefined) return state
-    const wanted = event.data.args.trim() !== 'off'
-    return { ...state, running: { commandId: event.data.commandId, wanted } }
-  }
-  if (event.type === 'command/done' && event.data.commandId === state.running?.commandId) {
-    const wanted = event.data.kind === 'success' && state.running.wanted !== state.active
-      ? state.running.wanted
-      : null
-    return { ...state, wanted, running: null }
-  }
-  if (event.type === 'plan/mode') {
-    return { ...state, active: event.data.active, wanted: null }
-  }
-  return state
-}
-```
-
-> 设计要点：**pending 完全从日志 fold 出来**，无 live mirror。host 重启、cold read 都能恢复。
->
-> 注释（`plan-mode/src/index.ts:253-260`）：
-> > "The plan projection unit (session-projection RFC): a pure event fold serving clients the whole {active, pending} value. ... Pending is thereby a pure replay quantity: host restarts, other tabs, and cold reads all recover it from the log alone."
-
-**PlanModeController 钩子点**（`plan-mode/src/index.ts:223-240`）：
-
-```typescript
-ctx.on('agent/pre-step', async ({ agent, signal }, next): Promise<PreStepDecision> => {
-  const decision = await next()
-  const pending = this.pendingIntents.get(agent.session)
-  if (decision.kind === 'reject' || signal.aborted || pending === undefined) return decision
-  const narration = this.narration(agent.session, pending.active)
-  try {
-    this.onBoundary(agent.session)  // 写入 plan/mode 事件
-  } catch (error) {
-    ctx.logger.warn(...)
-    return decision
-  }
-  return !pending.narrate || narration === undefined
-    ? decision
-    : { ...decision, messages: [...decision.messages, narration] }
-})
-```
-
-> 设计要点：**计划模式切换发生在 pre-step 边界**，不在 turn-start；这样 turn 内同 step 的请求复用同一 plan 提示词段。
-
-### 2.5 System Prompt 节组装
-
-**关键文件**：`packages/core/agent-loop/src/agent.ts:237`
-
-```typescript
-const assembly = await this.loopCtx.systemPrompt.assemble(assembleContextFor(this, signal))
-```
-
-Plan-mode 注册一个 section（`plan-mode/src/index.ts:243-251`）：
-
-```typescript
-ctx.systemPrompt.section({
-  name: 'plan:policy',
-  order: FIRST_PARTY_SECTION_ORDER.PLAN_POLICY,
-  text: (context) => {
-    if (context.agent === undefined) return ''
-    const pending = this.pendingIntents.get(context.agent.session)
-    return (pending?.active ?? foldPlanMode(context.agent.session.events)) ? this.section : ''
-  },
-})
-```
-
-### 2.6 与 `laew` 对标
-
-| laew | deepseek-harness |
-|------|------------------|
-| SQLite `session_memory` 表存 Markdown 摘要 | 完整事件日志 fold（projection unit） |
-| `YoloRunner` 三档任务分类 | `Goal` 域 + `GoalRoundDriver` 续作调度 |
-| `Plan` Agent 写 plans/*.md | `PlanModeController` + `exit_plan_mode` 工具 + `/plan` 命令 |
-| `SessionContext` 注入 `<<<LAEW:SESSION_HISTORY>>>` | `goal/change` + `plan/mode` 通过 projection registry wire 出 |
-
-**借鉴价值**：① projection registry 是 session 事件的「可重放视图」抽象；② plan-mode 的 pending 纯 fold 设计避免了「live mirror + log 重放」双源不一致。
-
----
-
-## 3. Yolo 识别 / 任务分类
-
-> 调研结论：**deepseek-harness 没有 Yolo / 入口层意图识别 Agent**。
-
-`grep -rn "Yolo\|taskLevel\|TaskClassification" packages/` 无任何匹配。
-
-### 3.1 等价物：`Goal` 目标栈 + Round Driver
-
-deepseek-harness 把「任务分类」拆解到 **Goal 域**，由人类显式创建目标，机器自动续作（`goal-round-driver`），无 LLM 介入的意图分类。
-
-| 维度 | laew Yolo | deepseek-harness |
-|------|-----------|------------------|
-| 触发时机 | 每条用户输入 | 用户显式 `goals.create` |
-| 分类方式 | LLM 三步分析（目的→目标→意图）+ 三档 | 编译期类型 + maxGoalRounds 配额 |
-| 失败回流 | 用户建议 | round exhausted → `GOAL_INVALID_TRANSITION` 抛错 |
-| 入口工具 | 仅 Read | 无（Goal 通过 Typert Remote 暴露给客户端） |
-
-### 3.2 入口层设计的另一种思路
-
-deepseek-harness 把「入口层」拆给 **三个不同层**：
-
-1. **Host 客户端**：浏览器或 CLI 接收用户输入 → 通过 Typert RPC 直接调 `goals.create` / `plan` 命令。
-2. **Session 启动**：`agent/session-start` 事件携带 `SessionStartSource = 'startup' | 'resume' | 'clear' | 'compact'`（`runtime-types.ts:69`），由 plugins 各自决定初始化语义。
-3. **Tool 层**：`exit_plan_mode`（plan-mode/src/index.ts:342-430）是模型主动调用进入 / 退出的工具。
-
-**核心差异**：laew 用 LLM 判断任务分类（动态但耗 token），deepseek-harness 用「目标域」+「round 配额」做约束（静态但可解释）。
-
-### 3.3 与 `laew` 对标
-
-**借鉴价值**：
-- 「入口层 Yolo」未必适合所有架构。如果有显式 goal 域，可省去 LLM 分类开销。
-- `GoalMessageSource`（`goal/src/domain.ts:47-53`）为续作消息打标 `kind: 'goal', goalId, revision, round`，便于后续 fold 区分。
-
----
-
-## 5. 质检检查 — `guard/` 模块与 Guardrail 机制
-
-### 5.1 Guard 包族结构
-
-**关键目录**：`packages/guard/`
-
-```
-guard/
-├── repeat-tool-reminder/   重复工具调用提醒（advisory）
-└── timeout-policy/         工具调用超时策略
-```
-
-> 与 laew 的 `Quality-Check Agent` 不同：deepseek-harness 的 guard 是 **可叠加的水管式 plugin**，不强制每个执行单元都过一次 LLM judge。
-
-### 5.2 Repeat-Tool-Reminder — 重复调用检测
-
-**关键文件**：`packages/guard/repeat-tool-reminder/src/index.ts`
-
-**核心配置**（`index.ts:28-50`）：
-
-```typescript
-export interface Config {
-  thresholds?: number[]           // 默认 [3, 5, 8]
-  include?: string[]              // 追踪白名单（glob）
-  exclude?: string[]              // 不追踪黑名单（glob）
-  argumentsPreviewChars?: number  // 默认 500
-}
-
-export const Config: z<Config> = z.object({
-  thresholds: z.array(z.number()).default([3, 5, 8]),
-  include: z.array(z.string()).default([]),
-  exclude: z.array(z.string()).default([]),
-  argumentsPreviewChars: z.number().default(500),
-})
-```
-
-**canonical 参数比对**（`index.ts:89-105`）：
-
-```typescript
-function sortJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortJsonValue)
-  if (value !== null && typeof value === 'object') {
-    const record = value as Record<string, unknown>
-    const sorted: Record<string, unknown> = {}
-    for (const key of Object.keys(record).sort()) sorted[key] = sortJsonValue(record[key])
-    return sorted
-  }
-  return value
-}
-function canonicalize(argumentsValue: unknown): string {
-  return JSON.stringify(sortJsonValue(argumentsValue))
-}
-```
-
-> 设计要点：**深 key-sort 后 stringify**，避免 `{a:1,b:2}` 与 `{b:2,a:1}` 误判。
-
-**链式计数 + 两档提醒**（`index.ts:189-225`）：
-
-```typescript
-function observe(exec: ToolExecution): UserMessage | undefined {
-  if (!exec.agent) return undefined
-  if (!tracked(exec.name)) return undefined
-  const canonical = canonicalize(exec.arguments)
-  const key = JSON.stringify([exec.name, canonical])
-  const chain = chains.get(exec.agent)
-  const count = chain !== undefined && chain.key === key ? chain.count + 1 : 1
-  chains.set(exec.agent, { key, count })
-  if (!thresholdSet.has(count)) return undefined
-  const text = count === thresholds[0]
-    ? GENTLE_REMINDER
-    : detailedReminder(exec.name, count, previewArguments(canonical, argumentsPreviewChars))
-  return createUserMessage({ content: [{ type: 'text', text }],
-    source: { ...PLUGIN_SOURCE, form: 'notice', summary: `${exec.name} × ${count}` } })
-}
-
-ctx.on('tools/post-execute', async (exec, _result, next): Promise<PostToolDecision> => {
-  const reminder = observe(exec)
-  const downstream = await next()
-  if (!reminder) return downstream
-  if (downstream.kind === 'block') {
-    return { kind: 'block', feedback: downstream.feedback,
-      additionalContexts: prependContext(reminder, downstream.additionalContexts) }
-  }
-  return { ...downstream, additionalContexts: prependContext(reminder, downstream.additionalContexts) }
-})
-```
-
-> 设计要点：
->
-> ① **DELEGATE 再 fold**：先 observe（无论下游成功与否），再 `await next()`，最后把提醒 prepend 到 `additionalContexts` —— 拒绝路径也能收到提醒。
->
-> ② **user interjection reset**（`index.ts:229-232`）：
->
-> ```typescript
-> ctx.on('agent/pre-step', ({ agent, messages }, next): Promise<PreStepDecision> => {
->   if (messages.some(message => message.source.kind === 'user')) chains.delete(agent)
->   return next()
-> })
-> ```
->
-> 用户中途插话 → 清空计数链，避免误报。
-
-### 5.3 Timeout-Policy — 工具超时
-
-**关键文件**：`packages/guard/timeout-policy/src/index.ts`
-
-```typescript
-// 关键结构：tool-call timeout policy（基于 dsh-timeout 包）
-export function apply(ctx: Context, config: Config): void {
-  // 监听 tools/pre-execute，附加 idleWatchdog
-  ctx.on('tools/pre-execute', async (exec, next) => {
-    // ...
-  })
-}
-```
-
-> 详细实现依赖 `@deepseek-ai/dsh-timeout` 的 `idleWatchdog / timeoutOf`，核心思想是「每次 tool call 启动 watchdog，超时后 abort signal 让 ToolRuntime 拒绝继续」。
-
-### 5.4 与 `laew` 的 Quality-Check Agent 对标
-
-| laew Quality-Check | deepseek-harness guard |
-|---------------------|------------------------|
-| LLM Judge（每次执行单元完成后调一次） | Plugin waterfall（post-execute 钩子） |
-| 输出 pass / fail + 反馈 | 仅注入 reminder 到 next step context |
-| 失败可阻断 | 不阻断，只是「advisory」 |
-
-**借鉴价值**：
-- 「轻量 guardrail」更适合通用场景，LLM judge 仅在 hard 任务用。
-- `thresholds: [3, 5, 8]` 双档（gentle / detailed）防止「第一次就上重锤」。
-- 参数 canonical 化是「避免假阳性」的关键工程细节。
-
----
-
-## 6. 任务拆解 — Plan-mode / SubAgent / Capability Seam
-
-### 6.1 三层拆解范式
-
-deepseek-harness 把任务拆解拆给 **三个独立层**：
-
-1. **Plan-mode**：用户在交互层开启 / 关闭，由模型通过 `exit_plan_mode` 主动呈现方案。
-2. **SubAgent（continuable / one-shot）**：父 Agent 通过工具调用派生子 Agent。
-3. **Capability seam**：每个 subagent provider 声明其能力（agentOptions / outputSchema / depthLimit / toolFilter / persona），subagent registry 做 capability check。
-
-### 6.2 SubAgent Capability Seam
-
-**关键文件**：`packages/subagent/subagent/src/index.ts`
-
-**核心类型**（从 `subagent/src/types.ts` re-export，`subagent/src/index.ts:84-95`）：
-
-```typescript
-export type {
-  ContinuableCreateRequest,
-  ContinuableCreateSpec,
-  ResolvedSubagentStartRequest,
-  SubagentCapabilities,    // 关键
-  SubagentProvider,
-  SubagentResult,
-  SubagentRun,
-  SubagentStartRequest,
-  SubagentStopReason,
-  SubagentStopReasonMap,
-} from './types.ts'
-```
-
-**`SubagentCapabilities` 五项**（在 `assertCapabilities` 中枚举，`subagent/src/index.ts:619-635`）：
-
-```typescript
-const needs: { when: boolean; cap: keyof SubagentCapabilities }[] = [
-  { when: request.agentOptions !== undefined, cap: 'agentOptions' },
-  { when: request.outputSchema !== undefined, cap: 'outputSchema' },
-  { when: request.maxDepth !== undefined, cap: 'depthLimit' },
-  { when: request.toolFilter !== undefined, cap: 'toolFilter' },
-  { when: request.persona !== undefined, cap: 'persona' },
-]
-for (const { when, cap } of needs) {
-  if (when && !provider.capabilities[cap]) {
-    throw new SubagentError(`subagent provider "${provider.name}" does not support the "${cap}" capability`,
-      'UNSUPPORTED_CAPABILITY')
-  }
-}
-```
-
-### 6.3 11 个 SubAgent Provider
-
-**关键目录**：`packages/subagent/`
-
-| Provider | 描述 |
-|----------|------|
-| `subagent-acp/` | ACP 协议子进程（206 行） |
-| `subagent-claude-code/` | Claude Code 子进程（157 行） |
-| `subagent-codex/` | Codex CLI 子进程（140 行） |
-| `subagent-dsh-sdk/` | 自家 SDK 子进程（200 行） |
-| `subagent-fork-in-process/` | 同进程 fork（101 行） |
-| `subagent-in-process-driver/` | 同进程 driver（233 行） |
-| `subagent-spawn-in-process/` | 同进程 spawn（70 行） |
-| `tool-subagent/` | 模型面对的委派工具（693 行） |
-| `tool-subagent-control/` | 控制面工具（120 行） |
-| `tool-subagent-report/` | 汇报面工具（142 行） |
-| `subagent/`（Service 定义）| registry / runtime / 638 行 |
-
-> 11 个 provider 体现「**多个进程模型共存**」的设计：fork / spawn / 跨进程 SDK / ACP 各有适用场景。
-
-### 6.4 委派工具 `tool-subagent`
-
-**关键文件**：`packages/subagent/tool-subagent/src/index.ts`
-
-**核心配置**（`tool-subagent/src/index.ts:49-100`）：
-
-```typescript
-export interface Config {
-  provider: string                                  // provider 名称
-  toolName?: string                                 // 模型面对的工具名
-  modelSelectionSettings?: boolean                  // 子 session 继承父模型选择
-  enableRunInBackground?: boolean                   // 暴露 run_in_background 参数
-  backgroundMode?: 'one-shot' | 'continuable'       // 后台策略
-  agentOptions?: AgentOptions                       // 子 Agent 共享配置
-  persona?: string                                  // 子 Agent 人设
-  toolFilter?: { allow?: string[]; deny?: string[] } // 工具过滤
-  maxDepth?: number | 'provider-managed'            // 子 Agent 嵌套深度
-}
-```
-
-> 设计要点：
->
-> ① **Capability seam + tool filter + depth limit**：三个独立维度共同保证委派的边界。
->
-> ② **backgroundMode**：`one-shot` = 父等子结束；`continuable` = 父不等、后台持续运行，需要 `prepareContinuable` 能力。
->
-> ③ **provider 校验**（`tool-subagent/src/index.ts`）—— `assertAllowedModelSelection` / `preflightChildLlmRoute` 在委派前做模型可用性预检。
-
-### 6.5 持续子 Agent (Continuable)
-
-**关键文件**：`packages/subagent/subagent/src/continuation.ts`（隐含于 import）
-
-```typescript
-// subagent/src/index.ts:237-239
-async startContinuable(spec: ContinuableStartSpec): Promise<ContinuableStart> {
-  return this.requireContinuations().startContinuable(spec)
-}
-
-// subagent/src/index.ts:256-263
-async followup(parent, childId, content, options): Promise<MessageId> {
-  return this.requireContinuations().followup(parent, childId, content, options)
-}
-
-// subagent/src/index.ts:280-282
-interrupt(targetSessionId, authority): void {
-  this.continuations?.interrupt(targetSessionId, authority)
-}
-```
-
-> 设计要点：**continuable 子 Agent 是「独立 Session + 自己的 Agent 驱动」**，父 Agent 通过 inbox (`agent.followup`) 投递消息，无需关心子 Agent 是否常驻。
->
-> 注释（`subagent/src/index.ts:266-273`）：
-> > "Unclaimed pending inbox work, the Activation, and published descendants are preserved; claimed work is not requeued."
-
-### 6.6 与 `laew` 对标
-
-| laew | deepseek-harness |
-|------|------------------|
-| `MultiAgentOrchestrator` 编排 6 角色 | `SubagentRuntime` 编排 N provider |
-| `SubAgent-Work` 单类型执行层 | 7 种 provider 形态（in-process / fork / spawn / ACP / Claude Code / Codex / dsh-sdk） |
-| `maxDepth` 未显式 | `maxDepth` + `'provider-managed'` 双重控制 |
-| 工具过滤未建模 | `toolFilter: { allow, deny }` 显式建模 |
-| Quality-Check 必经 | 无强制；通过 guard plugin 异步叠加 |
-
-**借鉴价值**：
-- ① **Capability seam 抽象**：避免把「子 Agent 能力」耦合到单一 provider。
-- ② **tool-filter + depth-limit** 是委派安全的两个核心维度。
-- ③ **continuable 模型**适合 long-running 后台 agent；one-shot 适合同步委派。
-
----
-
-## 7. 任务分类 — Goal 模式 + 任务分级
-
-### 7.1 Goal 模式 vs Yolo 三档
-
-deepseek-harness 没有 LLM 任务分类，**目标分级靠域模型硬约束**：
-
-**关键文件**：`packages/goal/goal/src/index.ts:142-147`
-
-```typescript
-function resolveMaxGoalRounds(value: number): number {
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new GoalError('maxGoalRounds must be a positive safe integer', 'GOAL_INVALID_MAX_ROUNDS')
-  }
-  return value
-}
-```
-
-**Goal 配置**（`goal/src/index.ts:186-188`）：
-
-```typescript
-static Config: z<Config> = z.object({
-  defaultMaxGoalRounds: z.number().default(256),
-})
-```
-
-### 7.2 Goal 的四 phase 状态机
-
-| phase | 进入条件 | 退出条件 |
-|-------|---------|---------|
-| `active` | `create` / `resume` | `pause` / `complete` / `block` |
-| `paused` | `pause` | `resume` / `complete` |
-| `blocked` | `block(reason)` | `resume` / `complete` |
-| `complete` | `complete` | （终态，可用 `create` 替换） |
-
-**关键代码**（`goal/src/index.ts:298-346`）：
-
-```typescript
-@Remote('pause')
-pause(agent: Agent, ref: GoalRef): GoalView {
-  return this.transition(agent, ref, 'pause', ['active'], 'paused', 'disarmed')
-}
-
-@Remote('resume')
-resume(agent: Agent, ref: GoalRef): GoalView {
-  const cache = this.prepareMutation(agent)
-  const current = this.expectCurrent(cache, ref)
-  const resumable: readonly GoalPhase[] = ['active', 'paused', 'blocked']
-  if (!resumable.includes(current.phase)) throw this.transitionError(current, 'resume', resumable)
-  if (current.phase === 'active' && cache.activation === 'armed') {
-    throw new GoalError(`goal "${current.id}" is already active and armed`, 'GOAL_INVALID_TRANSITION')
-  }
-  if (cache.state.roundsStarted >= current.maxGoalRounds) {
-    throw new GoalError(`goal "${current.id}" exhausted ${current.maxGoalRounds} goal rounds; increase maxGoalRounds before resuming`,
-      'GOAL_INVALID_TRANSITION')
-  }
-  return this.commitCurrent(agent, cache, 'resume', this.withPhase(current, 'active'), 'armed')
-}
-```
-
-### 7.3 Round 计数与续作
-
-**关键代码**（`goal/src/types.ts` + `goal-round-driver`）：
-
-```typescript
-// goal/src/types.ts: GoalSnapshot
-{
-  id: GoalId(`goal-${randomUUID()}`),
-  revision: 1,
-  objective: spec.objective,
-  phase: 'active',
-  maxGoalRounds: spec.maxGoalRounds,  // 默认 256
-}
-```
-
-`GoalMessageSource`（`goal/src/domain.ts:47-53`）：
-
-```typescript
-export interface GoalMessageSource {
-  readonly kind: 'goal'
-  readonly goalId: GoalId
-  readonly revision: number
-  readonly round: number  // 正整数
-}
-```
-
-> 设计要点：**round > 0 是「自动续作」标记**，round-driver 据此识别哪些 inbox 消息是机器注入的，哪些是用户/工具结果。
-
-### 7.4 与 `laew` 对标
-
-| laew 任务分级 | deepseek-harness |
-|--------------|------------------|
-| LLM 三步意图分析（目的→目标→意图） | 无对应层 |
-| simple/medium/hard 三档 | `maxGoalRounds` 一个数值参数 |
-| Yolo Agent 唯一入口 | 用户显式创建 goal，无入口层 |
-| Quality-Check 必经 | `block(reason)` 由调用方主动置 |
-
-**借鉴价值**：
-- ① **`maxGoalRounds` 是显式可解释的资源配额**，比 LLM 分类更可控。
-- ② **四 phase + 修订号 CAS** 状态机可直接复用做 laew 任务状态管理。
-
----
-
-## 9. 工具调用 — Typert 类型图 / LLM 适配器 / Tool Definition
-
-### 9.1 Typert — 类型驱动的 RPC / Lookup / Schema 系统
-
-**关键包**：`packages/typert/{protocol,registry,generator,loader}/`
-
-| 包 | 作用 |
-|----|------|
-| `protocol` | RPC / Context / Lookup 装饰器（`Remote`、`TypertRemoteService`） |
-| `registry` | 运行时服务注册表（738 行） |
-| `generator` | TS 类型图分析 + schema/remote/face emitter |
-| `loader` | 编译产物加载（442 行） |
-
-**核心类型**（`typert/protocol/src/index.ts:17-38`）：
-
-```typescript
-export class TypertLookupFailure<Failure = unknown> extends Error {
-  readonly failure: Failure
-  constructor(failure: Failure) {
-    super('Typert lookup policy rejected the requested identity')
-    this.name = 'TypertLookupFailure'
-    this.failure = failure
+export function defineTool<
+  const S extends ParameterSchemaSpec,
+  const O extends ValueSchemaSpec
+>(options: DefineToolOptions<S, O>): ToolDefinition {
+  // 1. 转换参数 Schema
+  const parameters = parameterSchemaSpecToJsonSchema(options.parameters)
+  
+  // 2. 转换输出 Schema
+  const outputSchema = valueSchemaSpecToJsonSchema(options.output.schema)
+  
+  // 3. 构建定义
+  return {
+    name: options.name,
+    description: options.description,
+    parameters,
+    outputSchema,
+    async execute(args: InferArgs<S>, exec: ExecContext): Promise<InferValue<O>> {
+      // 参数验证
+      const validated = validateArgs(options.parameters, args)
+      // 执行处理器
+      return await options.execute(validated, exec)
+    },
   }
 }
 
-export class TypertRemoteFailure extends Error {
-  readonly failure: RemoteFailure
-  constructor(failure: RemoteFailure) {
-    super(failure.message)
-    this.name = 'TypertRemoteFailure'
-    this.failure = failure
-  }
+// 类型推断
+export type InferArgs<S extends ParameterSchemaSpec> = {
+  [K in keyof S]: S[K] extends { required: true }
+    ? InferType<S[K]>
+    : InferType<S[K]> | undefined
 }
+
+export type InferValue<S extends ValueSchemaSpec> = InferType<S>
 ```
 
-**Remote 装饰器**（`protocol/src/index.ts` 中的 `@Remote('xxx')`）—— 出现在 `goal/src/index.ts:276` 等处：
+### 8.3 PTC 模式（Program-Then-Collapse）
+
+**文件位置**：`packages/core/tools/src/ptc.ts`（Lines 1-683）
+
+PTC 是 SDK 风格的代码执行模式：
 
 ```typescript
-@Remote('edit')
-edit(agent: Agent, ref: GoalRef, request: EditGoalRequest): GoalView { ... }
-
-@Remote('pause')
-pause(agent: Agent, ref: GoalRef): GoalView { ... }
-```
-
-> 设计要点：**`@Remote` 把 service method 投影成 wire-format callable**，参数和返回值的 schema 由 Typert generator 从 TS 类型图静态推导。
->
-> 注释（`protocol/src/index.ts` 顶部）：
-> > "Remote decorators and explicit Gateway bindings backed only by private module state. Strict reflection remains a Typert compiler responsibility."
-
-### 9.2 类型图核心模型
-
-**关键文件**：`packages/typert/generator/src/model.ts`
-
-**核心类型**（节选）：
-
-```typescript
-// model.ts:64-71
-export interface ServiceModel extends DocumentationModel {
-  readonly key: string             // ctx.xxx 的 key
-  readonly symbol: SymbolId
-  readonly export: ExportModel
-  readonly members: readonly string[]
-  readonly location: SourceLocation
-}
-
-// model.ts:73-81
-export interface EventModel extends DocumentationModel {
-  readonly name: string
-  readonly signature: TypeNodeId
-  readonly text: string            // body-free declaration text
-  readonly mode?: string           // waterfall / serial / emit
-  readonly location: SourceLocation
-}
-
-// model.ts:83-88
-export interface ObjectModel extends DocumentationModel {
-  readonly export: ExportModel
-  readonly symbol: SymbolId
-  readonly passing: 'reference'    // 引用传递语义
-}
-
-// model.ts:90-95
-export interface SchemaModel extends DocumentationModel {
-  readonly export: ExportModel
-  readonly symbol: SymbolId
-  readonly type: TypeNodeId        // 选中用于 schema 生成的类型
-}
-```
-
-> 设计要点：**Typert 把 Cordis Context / Events / Schema / Remote 都建模成「类型图节点」**，跨 host / client 双面编译时保证类型一致。
-
-### 9.3 LLM 适配器：DeepSeek 直连
-
-**关键文件**：`packages/llm/llm-deepseek/src/index.ts`、`packages/llm/llm-deepseek/src/adapter.ts`
-
-**Provider 路由**（`llm-deepseek/src/index.ts:86-112`）：
-
-```typescript
-const NS = settingsNamespace('llm-deepseek')
-const DEFAULT_API_KEY_ENV = 'DEEPSEEK_API_KEY'
-const PROVIDER = 'deepseek-official'
-
-const DEFAULT_MODELS: DeepSeekCatalogModel[] = [
-  { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: DEFAULT_CONTEXT_WINDOW },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: DEFAULT_CONTEXT_WINDOW },
-  { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek-V4-Flash-Vision-Exp',
-    inputModalities: ['text', 'image'],
-    imagePixelBudget: DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET,
-    imageMaxBytes: DEFAULT_REQUEST_IMAGE_MAX_BYTES },
-]
-```
-
-**Adapter 注册**（`llm-deepseek/src/adapter.ts:707` —— `DeepSeekAdapter` class）：
-
-- **连接事实 per-request resolve**：base URL / catalog / API key 都在每次请求时从 `ctx.settings` + `ctx.credentials` 取，**不冻结**于加载时。
-- **retry policy 是唯一在注册时冻结的事实**，变更时重新 in-place 注册路由。
-
-**注释**（`llm-deepseek/src/index.ts:1-12`）：
-> "The one registration-captured fact — the retry policy — re-registers the route in place when it changes."
-
-### 9.4 LLM 适配器：pi-ai 通用代理
-
-**关键文件**：`packages/llm/llm-pi-ai/src/adapter.ts`
-
-**核心契约**（`llm-pi-ai/src/adapter.ts:65-112`）：
-
-```typescript
-interface PiAiSnapshot {
-  profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>
-  models: Models   // 不可变集合
-}
-
-export interface PiAiAdapterOptions {
-  profiles: () => ReadonlyMap<string, ResolvedPiAiProviderProfile>
-  resolveApiKey: (provider, profile) => Promise<string | undefined>
-  auth: PiAiAuthInjection     // 凭据存储 + auth context
-  resolveAttachments?: () => AttachmentStore | undefined
-  resolveImageAccess?: (attachments, ref) => ImageAttachmentAccess | undefined
-  onReplayDegrade?: (detail) => void
-}
-```
-
-> 设计要点：
->
-> ① **immutable snapshot**：每次请求捕获完整 profile+models 快照（`adapter.ts:11-13` 注释）：
->
-> > "A configuration change builds a *new* collection rather than mutating the one in use, because `Models.streamSimple()` is lazy..."
->
-> ② **per-step call freeze**：与 `ReactLoopAgent.prepareCall` 配合，确保「在飞请求不会被切模型」。
->
-> ③ **apiKey as request override**：credential 通过 `apiKey` 注入 pi-ai options（`adapter.ts:17-19` 注释）。
-
-### 9.5 Tool 定义
-
-**关键文件**：`packages/plan/plan-mode/src/index.ts:342-430`（`exit_plan_mode` 工具定义）
-
-```typescript
-ctx.tools.register(defineTool({
-  name: EXIT_PLAN_MODE,
-  description: EXIT_DESCRIPTION,
-  parameters: {
-    plan: { type: 'string', required: true, description: 'The complete plan, as markdown, starting with a # heading that names it.' },
-  },
-  output: {
-    schema: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        approved: { type: 'boolean', const: true, required: true },
+export function createRunCodeTool(
+  registry: ToolRuntime,
+  options: RunCodeBridgeOptions
+): ToolDefinition {
+  return defineTool({
+    name: RUN_CODE_NAME,  // 'run_code'
+    parameters: {
+      code: {
+        type: 'string',
+        required: true,
+        description: TYPESCRIPT_FLAVOR.codeDescription,
+      },
+      description: {
+        type: 'string',
+        required: true,
+        description: RUN_CODE_DESCRIPTION_PARAM_DESCRIPTION,
       },
     },
-    render: () => [{ type: 'text', text: 'Plan approved — plan mode exited; carry out the plan starting with your next step.' }],
-  },
-  execute: async (args, exec) => { /* ... */ },
-  presentCall: args => ({ card: 'generic', title: firstHeading(args.plan) ?? 'Plan', kind: 'other',
-    content: [{ type: 'text', text: args.plan }] }),
-  presentResult: (_args, result) => ({ card: 'generic', title: 'Plan review', content: result.content }),
-}))
-```
-
-> 设计要点：
->
-> ① **JSON Schema 参数定义**与 Anthropic / OpenAI 工具协议天然对齐。
->
-> ② **`presentCall` / `presentResult`** 把工具调用卡片化，UI 侧无需自行渲染。
->
-> ③ **`defineTool` 工厂**封装了 `Tool` trait 的注册。
-
-### 9.6 工具后执行管道
-
-**关键代码**（`guard/repeat-tool-reminder/src/index.ts:213-224`）：
-
-```typescript
-ctx.on('tools/post-execute', async (exec, _result, next): Promise<PostToolDecision> => {
-  const reminder = observe(exec)
-  const downstream = await next()
-  // 把 reminder prepend 到 additionalContexts
-})
-```
-
-> 工具执行后挂多个监听器（如 repeat-tool-reminder / timeout-policy），各自往 `additionalContexts` 追加 user message。
-
-### 9.7 与 `laew` 对标
-
-| laew | deepseek-harness |
-|------|------------------|
-| Rust `Tool` trait + `ToolRegistry` | TS `defineTool` + `ctx.tools.register` |
-| Bash / Read / Write 三个工具 | Bash / Read / Write + 几十个工具（plan / goal / skill / subagent / file-api …） |
-| 手动 wire 协议差异 | Typert generator 自动生成 schema / wire |
-| 工具调用回填到 context.messages | tool call 落 session log，由 `deriveMessages()` 重放 |
-
-**借鉴价值**：
-- ① **Typert 类型图** 把「context 类型」「event 类型」「schema 类型」「remote 类型」四合一建模。
-- ② **per-request immutable snapshot**：模型切配置不会污染在飞请求。
-- ③ **presentCall / presentResult** 是工具可视化的标准模式。
-
----
-
-## 10. MCP 设计与实现
-
-### 10.1 包结构
-
-**关键目录**：`packages/mcp/mcp-client/`
-
-```
-mcp-client/
-├── src/
-│   ├── connection.ts  351 行 — 连接监管 + 自动重连
-│   ├── tools.ts       559 行 — 工具同步桥
-│   ├── transport.ts    50 行 — stdio / streamable-http 工厂
-│   ├── index.ts       188 行 — Plugin 入口
-│   └── invariant.ts    30 行
-└── tests/             reconnect / load-path / apply / fixture
-```
-
-### 10.2 连接监管 + 指数退避
-
-**关键文件**：`packages/mcp/mcp-client/src/connection.ts`
-
-**重连策略**（`connection.ts:27-45`）：
-
-```typescript
-export interface ReconnectConfig {
-  enabled?: boolean            // 默认 true
-  initialDelayMs?: number      // 默认 500
-  maxDelayMs?: number          // 默认 30_000
-  maxAttempts?: number         // 默认 10
-}
-
-export const RECONNECT_DEFAULTS: Required<ReconnectConfig> = Object.freeze({
-  enabled: true, initialDelayMs: 500, maxDelayMs: 30_000, maxAttempts: 10,
-})
-```
-
-**重连调度**（`connection.ts:192-225`）：
-
-```typescript
-function scheduleReconnect(): void {
-  const lostEstablishedConnection = connectedAt !== undefined
-  if (!policy.enabled) {
-    ctx.logger.error(`${label}: connection lost and reconnect is disabled — ...`)
-    return
-  }
-  // A connection that stayed up past the stability window (= maxDelayMs, the longest backoff spacing)
-  // ended the previous outage: start a fresh budget.
-  if (connectedAt !== undefined && Date.now() - connectedAt >= policy.maxDelayMs) failedAttempts = 0
-  connectedAt = undefined
-  failedAttempts += 1
-  if (failedAttempts > policy.maxAttempts) {
-    syncChain = syncChain.then(() => {
-      for (const dispose of disposers.values()) dispose()
-      disposers = new Map()
-    })
-    ctx.logger.error(`${label}: giving up after ${policy.maxAttempts} consecutive failed reconnect attempts — tools unregistered`)
-    return
-  }
-  const delayMs = Math.min(policy.maxDelayMs, policy.initialDelayMs * 2 ** (failedAttempts - 1))
-  // ...
-}
-```
-
-> 设计要点：
->
-> ① **stable window = maxDelayMs**：连接稳定超过退避上限后，认为上次 outage 已结束，重新计数 budget。
->
-> ② **指数退避带 cap**：`min(maxDelayMs, initialDelayMs * 2^(n-1))`。
->
-> ③ **exhaustion 后 unregister tools**：超过 maxAttempts 主动注销工具，避免「永远注册但永远调不通」。
->
-> ④ **process unref**：`reconnectTimer.unref()` —— 防止 timer 阻塞进程退出。
-
-### 10.3 串行化 syncChain
-
-**关键代码**（`connection.ts:161-170`）：
-
-```typescript
-let syncChain: Promise<void> = Promise.resolve()
-function enqueueSync(generation: Client, syncOpts: ToolBridgeOptions = opts): Promise<void> {
-  const run = syncChain.then(async () => {
-    if (!isCurrent(generation)) return
-    disposers = await syncTools(generation, ctx, syncOpts, disposers)
-  })
-  syncChain = run.catch(() => {})  // chain tail survives failure
-  return run
-}
-```
-
-> 设计要点：**`syncChain` 是「先 dispose 上一代工具，再 register 新工具」原子化的串行队列**，避免两代工具交错（双重 dispose / 泄漏）。
-
-### 10.4 Transport 工厂
-
-**关键文件**：`packages/mcp/mcp-client/src/transport.ts:31-50`
-
-```typescript
-export function createTransport(config: Config): Transport {
-  switch (config.transport) {
-    case 'stdio':
-      return new StdioClientTransport({
-        command: config.command,
-        args: config.args,
-        env: buildChildEnv(config.env),  // scrubbedParentEnv + spec env
-        cwd: config.cwd,
+    async execute(args, exec): Promise<RunCodeOutput> {
+      // 1. 构建绑定函数（SDK 调用）
+      const binding = (name: string): CodeBindingFunction => {
+        return async (rawArgs) => {
+          // 将 SDK 调用桥接到 ToolRuntime
+          return registry.execute(
+            { name, arguments: rawArgs },
+            { signal: exec.signal, context: exec.context }
+          )
+        }
+      }
+      
+      // 2. 收集所有可用工具作为绑定
+      const tools = registry.list(exec.scope)
+      const functions = {}
+      for (const tool of tools) {
+        functions[tool.name] = binding(tool.name)
+      }
+      
+      // 3. 运行代码
+      const result = await runtime.run({
+        program: args.code,
+        bindings: [{ global: 'tools', functions }],
       })
-    case 'streamable-http':
-      return new StreamableHTTPClientTransport(new URL(config.url),
-        { requestInit: { headers: config.headers } }) as Transport
-  }
-}
-
-function buildChildEnv(extra: Record<string, string>): Record<string, string> {
-  return { ...scrubbedParentEnv(), ...extra }  // 凭据形 + DSH_* 名被过滤
+      
+      return { output: result.output, error: result.error }
+    },
+  })
 }
 ```
 
-> 设计要点：
->
-> ① **stdio 子进程环境由 dsh-subprocess 包的 `scrubbedParentEnv()` 清理**，避免敏感凭据泄漏给 MCP server。
->
-> ② **Streamable HTTP transport**：直接连接 URL，无 stdio 复杂度。
+**PTC 执行流程**：
+1. LLM 生成 `run_code` 调用，包含 TypeScript 代码
+2. 代码在沙箱中执行，通过 `tools` 全局对象调用工具
+3. 工具调用被桥接到 ToolRuntime
+4. 执行结果返回给 LLM
 
-### 10.5 工具同步桥
+### 8.4 与 laew 的对比
 
-**关键文件**：`packages/mcp/mcp-client/src/tools.ts`
-
-`tools.ts` 把 MCP server 的 `tools/list` 结果注册到 `ctx.tools` 命名空间下：
-
-- `serverName` 前缀避免多 server 工具冲突。
-- `registrationFailure: 'throw' | 'contain'`：启动时是否容忍冲突。
-- `toolCallTimeoutMs`：每个 tool call 的超时上限。
-
-### 10.6 与 `laew` 对标
-
-| laew | deepseek-harness |
-|------|------------------|
-| 无 MCP 支持 | 完整 MCP-client（stdio / streamable-http） |
-| 内置三工具（Bash/Read/Write） | mcp server 工具 + 内置工具并存 |
-
-**借鉴价值**：
-- ① **exponential backoff + stable window** 重连策略直接可借鉴。
-- ② **`syncChain` 串行化** 是「多代连接原子切换」的工程范式。
-- ③ **`scrubbedParentEnv()` 凭据脱敏** 是 stdio MCP 的安全标配。
+| 维度 | deepseek-harness | laew |
+|------|-----------------|------|
+| **工具注册** | ScopedLayers（分层隔离） | ToolRegistry（扁平注册） |
+| **执行管道** | pre-execute → execute → post-execute | 直接执行 |
+| **PTC 模式** | `run_code` 工具（SDK 风格） | 无 |
+| **并行执行** | maxParallelSubCalls 配置 | 无 |
+| **Guard 集成** | Guard Registry 前置后置检查 | 无 |
 
 ---
 
-## 11. SKILL 设计
+## 9. MCP 设计：stdio/HTTP 传输与 Client 实现
 
-### 11.1 包结构
+### 9.1 MCP Client 架构
 
-**关键目录**：`packages/skill/`
-
-```
-skill/
-├── skill/               868 行 — Service 定义：registry + 合并策略
-├── skill-filesystem/   1041 行 — 文件系统 provider（项目级 / 用户级）
-├── skill-badge/          60 行 — UI 徽章
-└── tool-skill/          430 行 — 模型面对的 `skill` 工具
-```
-
-### 11.2 Skill 域类型
-
-**关键文件**：`packages/skill/skill/src/index.ts`
-
-**核心常量与类型**（`skill/src/index.ts:20-83`）：
+**文件位置**：`packages/mcp/mcp-client/src/index.ts`（Lines 1-189）
 
 ```typescript
-const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/   // kebab-case 名称
-const DEFAULT_COLLECT_CACHE_ENTRIES = 128
-const MAX_COLLECT_ATTEMPTS = 2
-const RUNTIME_PROVIDER = 'runtime'
-const RUNTIME_RANK = 250
-export const BUNDLED_SKILL_RANK = 600
-
-export type SkillSource = 'project-dsh' | 'project-agents' | 'runtime' | 'user-dsh' | 'user-agents' | 'custom' | 'bundled' | (string & {})
-
-export type SkillResourceBase =
-  | { readonly kind: 'directory'; readonly path: string }
-  | { readonly kind: 'url'; readonly url: string }
-  | { readonly kind: 'opaque'; readonly description: string }
-
-export interface SkillInvocationPolicy {
-  readonly modelInvocable: boolean
-  readonly userInvocable: boolean
-}
-
-export interface SkillSummary {
-  readonly name: string
-  readonly description: string
-  readonly whenToUse?: string
-  readonly invocation: SkillInvocationPolicy
-  readonly source: SkillSource
-  readonly provider: string
-  readonly resourceBase?: SkillResourceBase
-}
-
-export interface SkillCandidate extends SkillSummary {
-  readonly rank: number      // 越小越优先
-  readonly locator: unknown   // provider-owned handle
-  readonly path?: string
-}
-
-export interface SkillDefinition extends SkillSummary {
-  readonly content: string    // markdown body
-  readonly path?: string
-  readonly metadata?: Readonly<Record<string, unknown>>
-}
-```
-
-### 11.3 模型渲染
-
-**关键代码**（`skill/src/index.ts:171-184`）：
-
-```typescript
-export function renderSkillContent(skill: Pick<SkillDefinition, 'name' | 'provider' | 'resourceBase' | 'content'>): string {
-  const resourceHint = renderResourceHint(skill)
-  return [
-    `<skill_content name="${escapeAttr(skill.name)}">`,
-    '<skill_resources>',
-    ...resourceHint,
-    '</skill_resources>',
-    '',
-    '<skill_instructions>',
-    skill.content,
-    '</skill_instructions>',
-    '</skill_content>',
-  ].join('\n')
-}
-```
-
-> 设计要点：**模型看到的 `<skill_content>` 包装层是单一格式**，无论是 `tool-skill` 的 result 还是 user-explicit invocation 的 context injection，都走同一渲染。
-
-### 11.4 Skill Layered Registry
-
-**关键代码**（`skill/src/index.ts:328-403`）：
-
-```typescript
-class SkillLayer implements ScopeLayer {
-  readonly providers: NamedEntries<RegisteredProvider>
-  readonly runtime = new Map<string, SkillDefinition>()
-  constructor(scope: ScopeKey | undefined) {
-    this.providers = new NamedEntries(name => new Error(scope === undefined
-      ? `a skill provider named "${name}" is already registered`
-      : `a skill provider named "${name}" is already registered in this scope`))
+export async function apply(ctx: Context, config: Config): Promise<void> {
+  // 1. 解析重连策略
+  const reconnect = resolveReconnectPolicy(config.reconnect, {
+    maxAttempts: 5,
+    initialDelayMs: 1000,
+    maxDelayMs: 30000,
+  })
+  
+  // 2. 保留 serverName（防止冲突）
+  ctx.effect(() => {
+    reserveServerName(config.serverName)
+    return () => releaseServerName(config.serverName)
+  }, 'mcp-client.serverName')
+  
+  // 3. 启动连接
+  const connection = startConnection(ctx, config, reconnect)
+  
+  // 4. 注册清理
+  ctx.effect(() => {
+    return () => connection.dispose()
+  }, 'mcp-client.connection')
+  
+  // 5. 等待就绪
+  const outcome = await connection.ready
+  
+  if (outcome.kind === 'error') {
+    ctx.logger.error(`MCP connection failed: ${outcome.error}`)
   }
 }
+```
 
+### 9.2 连接管理
+
+**文件位置**：`packages/mcp/mcp-client/src/connection.ts`（Lines 1-352）
+
+```typescript
+export interface McpConnection {
+  kind: 'stdio' | 'streamable-http'
+  client: Client
+  transport: Transport
+  dispose(): void
+}
+
+function startConnection(
+  ctx: Context,
+  config: Config,
+  reconnect: ReconnectPolicy
+): McpConnection {
+  let currentGeneration = 0
+  let connectedAt: number | undefined
+  let failedAttempts = 0
+  let reconnectTimer: Timeout | undefined
+  
+  // 连接函数
+  async function connect(generation: number): Promise<void> {
+    try {
+      // 1. 创建传输
+      const transport = createTransport(config)
+      
+      // 2. 创建客户端
+      const client = new Client({ name: 'dsh', version: VERSION })
+      
+      // 3. 连接
+      await client.connect(transport)
+      
+      // 4. 更新状态
+      connectedAt = Date.now()
+      failedAttempts = 0
+      currentGeneration = generation
+      
+      // 5. 发现工具
+      await discoverAndRegisterTools(client, config.serverName)
+      
+    } catch (error) {
+      scheduleReconnect()
+    }
+  }
+  
+  // 重连调度
+  function scheduleReconnect(): void {
+    // 重置失败计数（如果连接稳定足够久）
+    if (connectedAt !== undefined && Date.now() - connectedAt >= policy.maxDelayMs) {
+      failedAttempts = 0
+    }
+    
+    failedAttempts += 1
+    
+    // 超过最大尝试次数，放弃
+    if (failedAttempts > policy.maxAttempts) {
+      ctx.logger.error(`MCP reconnection gave up after ${policy.maxAttempts} attempts`)
+      return
+    }
+    
+    // 指数退避
+    const delayMs = Math.min(
+      policy.maxDelayMs,
+      policy.initialDelayMs * 2 ** (failedAttempts - 1)
+    )
+    
+    reconnectTimer = setTimeout(() => {
+      connect(connectGeneration(false))
+    }, delayMs)
+  }
+  
+  // 初始连接
+  connect(connectGeneration(true))
+  
+  return {
+    kind: config.kind,
+    client,
+    transport,
+    dispose() {
+      clearTimeout(reconnectTimer)
+      transport.close()
+    },
+  }
+}
+```
+
+### 9.3 传输层实现
+
+**stdio 传输**：
+
+```typescript
+function createStdioTransport(config: StdioConfig): StdioTransport {
+  return new StdioTransport({
+    command: config.command,
+    args: config.args,
+    env: config.env,
+    cwd: config.cwd,
+  })
+}
+```
+
+**streamable-http 传输**：
+
+```typescript
+function createStreamableHttpTransport(config: HttpConfig): StreamableHttpTransport {
+  return new StreamableHttpTransport({
+    url: config.url,
+    headers: config.headers,
+    auth: config.auth,
+  })
+}
+```
+
+### 9.4 工具桥接
+
+**文件位置**：`packages/mcp/mcp-client/src/tools.ts`（Lines 1-560）
+
+```typescript
+export function publicToolName(serverName: string, rawName: string): string {
+  const joined = `mcp__${serverName}__${rawName}`
+  const normalized = joined.replace(INVALID_NAME_CHARS, '_')
+  
+  // 如果名称合法且长度合规，直接返回
+  if (normalized === joined && normalized.length <= MAX_PUBLIC_NAME_LENGTH) {
+    return normalized
+  }
+  
+  // 否则使用 SHA-256 哈希缩短
+  const hash = createHash('sha256')
+    .update(`${serverName}\0${rawName}`)
+    .digest('hex')
+    .slice(0, HASH_LENGTH)
+  
+  return `${normalized.slice(0, MAX_PUBLIC_NAME_LENGTH - HASH_LENGTH - 1)}_${hash}`
+}
+
+async function discoverAndRegisterTools(
+  client: Client,
+  serverName: string
+): Promise<void> {
+  // 1. 列出 MCP 工具
+  const { tools } = await client.listTools()
+  
+  // 2. 注册到 ToolRuntime
+  for (const mcpTool of tools) {
+    const publicName = publicToolName(serverName, mcpTool.name)
+    
+    toolRuntime.register({
+      name: publicName,
+      description: `[${serverName}] ${mcpTool.description}`,
+      parameters: mcpTool.inputSchema,
+      async execute(args, exec) {
+        // 调用 MCP 工具
+        const result = await client.callTool({
+          name: mcpTool.name,
+          arguments: args,
+        })
+        
+        // 处理图片投影
+        if (result.content) {
+          return projectContent(result.content, exec.context)
+        }
+        
+        return result
+      },
+    })
+  }
+}
+```
+
+### 9.5 与 laew 的对比
+
+| 维度 | deepseek-harness | laew |
+|------|-----------------|------|
+| **MCP 支持** | 完整（stdio + HTTP） | 无 |
+| **工具命名** | `mcp__<server>__<tool>` + 哈希 | N/A |
+| **重连机制** | 指数退避 + 最大尝试 | N/A |
+| **图片投影** | 解码 MCP 图片块到附件存储 | N/A |
+
+---
+
+## 10. SKILL 设计：Layered Registry 与动态扩展
+
+### 10.1 SkillRegistry 架构
+
+**文件位置**：`packages/skill/skill/src/index.ts`（Lines 1-869）
+
+```typescript
 export class SkillRegistry extends Service {
+  // 分层 Provider 注册
   private readonly layers = new ScopedLayers<SkillLayer>(
     scope => new SkillLayer(scope),
     () => { this.invalidateCache() },
   )
-  // ...
+  
+  // Provider 注册
   registerProvider(create: (control: SkillProviderControl) => SkillProvider): () => void {
-    const lifecycle = new AbortController()
-    let registration: { layer: SkillLayer; name: string } | undefined
-    let provider: SkillProvider
-    const control: SkillProviderControl = {
-      signal: lifecycle.signal,
-      invalidate: () => { /* ... */ },
+    const provider = create({
+      ctx: this.ctx,
+      invalidate: () => this.invalidateCache(),
+    })
+    
+    return this.layers.effect(
+      this.ctx,
+      (layer) => {
+        const undo = layer.providers.insert(provider.name, { provider, order })
+        return () => {
+          undo()
+          lifecycle.abort(new Error(`skill provider "${provider.name}" disposed`))
+        }
+      },
+      { label: 'skills.registerProvider()' }
+    )
+  }
+  
+  // 运行时 Skill 注册
+  register(skill: SkillRegistration): () => void {
+    validateRuntimeSkill(skill)
+    const scope = scopeOf(this.ctx)
+    const existingLayer = scope === undefined ? this.layers.global : this.layers.peek(scope)
+    
+    // 重复检查
+    if (existingLayer !== undefined && existingLayer.runtime.has(skill.name)) {
+      this.ctx.logger.warn(`runtime skill "${skill.name}" ignored because it is already registered`)
+      return () => {}
     }
-    // ...
+    
+    const definition: SkillDefinition = {
+      ...skill,
+      invocation: skill.invocation ?? { modelInvocable: true, userInvocable: true },
+      provider: skill.provider ?? RUNTIME_PROVIDER,
+    }
+    
+    return this.layers.effect(
+      this.ctx,
+      (layer) => {
+        layer.runtime.set(definition.name, definition)
+        return () => layer.runtime.delete(definition.name)
+      },
+      { label: 'skills.register()' }
+    )
+  }
+  
+  // 列出 Skill
+  async list(options: SkillViewOptions = {}): Promise<SkillSummary[]> {
+    return (await this.snapshot(options)).skills
+  }
+  
+  // 获取 Skill
+  async get(name: string, options: SkillViewOptions = {}): Promise<SkillDefinition | undefined> {
+    if (!isSkillName(name)) return undefined
+    const collected = await this.collect(options)
+    throwIfAborted(options.signal)
+    const match = collected.entries.get(name)
+    if (match === undefined) return undefined
+    const definition = await waitWithAbort(match.provider.get(match.candidate, options), options.signal)
+    if (definition === undefined) return undefined
+    validateDefinition(definition)
+    return definition
   }
 }
 ```
 
-> 设计要点：
->
-> ① **ScopedLayers**：每个 Cordis scope 一个 SkillLayer，最近一层胜出（nearest-wins），同层 rank 排序。
->
-> ② **global + per-scope 合并**：host plugin + agent preset 的 plugin 同时可见。
->
-> ③ **AbortController + invalidate**：provider 注销时同步取消所有 in-flight 加载。
-
-### 11.5 SkillProvider 接口
-
-**关键代码**（`skill/src/index.ts:248-268`）：
+### 10.2 分层架构
 
 ```typescript
-export interface SkillProvider {
-  readonly name: string
-  readonly list: (options: SkillLookupOptions) =>
-    Promise<readonly SkillCandidate[] | SkillProviderObservation>
-  readonly get: (candidate: SkillCandidate, options: SkillLookupOptions) =>
-    Promise<SkillDefinition | undefined>
+class SkillLayer {
+  scope: string | undefined  // undefined = global
+  
+  // Provider 注册（有序）
+  providers = new OrderedMap<string, { provider: SkillProvider; order: number }>()
+  
+  // 运行时 Skill（Map）
+  runtime = new Map<string, SkillDefinition>()
+}
+
+class ScopedLayers<T extends { scope: string | undefined }> {
+  global: T  // 全局层
+  
+  // 作用域链
+  private scopes = new Map<string, T>()
+  
+  // 获取作用域链（从远到近）
+  chainLayers(scope: string | undefined): T[] {
+    if (!scope) return []
+    const chain = []
+    let current = scope
+    while (current) {
+      const layer = this.scopes.get(current)
+      if (layer) chain.unshift(layer)  // 远的在前
+      current = parentScope(current)
+    }
+    return chain
+  }
 }
 ```
 
-### 11.6 Filesystem Provider
+### 10.3 优先级系统
 
-**关键文件**：`packages/skill/skill-filesystem/src/index.ts`（1041 行）
+**文件位置**：`packages/skill/skill/src/rank.ts`
 
-- 扫描项目级 `.claude/skills/` / `.agents/skills/` / 用户级 `~/.config/.../skills/` 等多根。
-- 按 frontmatter 解析 metadata、rank、source。
-- `MAX_COLLECT_ATTEMPTS = 2` 限制发现重试。
+```typescript
+// 优先级（数值越大，优先级越高）
+export const enum SkillRank {
+  ProjectDSH = 100,      // .dsh/skill.md
+  ProjectAgents = 200,   // .agents/skill.md
+  Custom = 300,          // 自定义 Provider
+  UserDSH = 400,         // ~/.dsh/skill.md
+  UserAgents = 500,      // ~/.agents/skill.md
+  Bundled = 600,         // 内置 Skill
+  Runtime = 250,         // 运行时注册（特殊）
+}
 
-### 11.7 Tool 入口
+// 比较函数
+export function compareSkillSummary(a: SkillSummary, b: SkillSummary): number {
+  // 1. 按 Rank 降序
+  if (a.rank !== b.rank) return b.rank - a.rank
+  
+  // 2. 按 Provider Order 升序
+  if (a.providerOrder !== b.providerOrder) return a.providerOrder - b.providerOrder
+  
+  // 3. 按名称字母序
+  return compareCodePoints(a.name, b.name)
+}
+```
 
-**关键文件**：`packages/skill/tool-skill/src/index.ts`（430 行）
+### 10.4 Skill Provider 接口
 
-注册 `skill` 工具，模型可主动 `load_skill` 加载完整 body（而非只看 summary）。
+```typescript
+export interface SkillProvider {
+  name: string
+  
+  // 列出候选
+  list(options: SkillLookupOptions): Promise<SkillCandidate[]>
+  
+  // 获取完整定义
+  get(candidate: SkillCandidate, options: SkillLookupOptions): Promise<SkillDefinition | undefined>
+}
 
-### 11.8 与 `laew` 对标
+export interface SkillDefinition {
+  name: string           // kebab-case
+  description: string
+  body: string           // Markdown 内容
+  source: string         // 来源标识
+  rank: SkillRank
+  provider: string
+  
+  // 调用策略
+  invocation: {
+    modelInvocable: boolean   // 模型是否可调用
+    userInvocable: boolean    // 用户是否可调用
+  }
+  
+  // 元数据
+  metadata?: Record<string, unknown>
+}
+```
 
-| laew | deepseek-harness |
-|------|------------------|
-| 无 Skill 系统 | 完整 Skill 系统（registry + filesystem provider + 渲染） |
-| 工具 / 命令平铺 | Skill 是「模型可调用的、有 Markdown 指令的资源」 |
-| `Yolo` 入口工具 | `skill` / `load_skill` 工具 + 自动 catalog |
+### 10.5 文件系统 Provider
 
-**借鉴价值**：
-- ① **Skill 是「轻量 MCP」**：把可复用的领域知识封装成可由模型主动加载的资源。
-- ② **`<skill_content>` 单一渲染格式**：所有 skill 加载路径（tool / invocation）模型侧一致。
-- ③ **ScopedLayers + rank + source**：三维度的合并策略可借鉴到 laew 的工具发现。
+**文件位置**：`packages/skill/skill-filesystem/src/index.ts`
+
+```typescript
+export function createFilesystemProvider(options: FilesystemProviderOptions): SkillProvider {
+  return {
+    name: options.name,
+    
+    async list(listOptions) {
+      const skills: SkillCandidate[] = []
+      
+      // 1. 扫描目录
+      const files = await scanSkillFiles(options.directories, listOptions.cwd)
+      
+      for (const file of files) {
+        // 2. 解析 frontmatter
+        const parsed = await parseSkillFile(file)
+        if (!parsed) continue
+        
+        // 3. 构建候选
+        skills.push({
+          name: parsed.name,
+          source: file.path,
+          rank: options.rank,
+          provider: options.name,
+          locator: { kind: 'filesystem', path: file.path },
+        })
+      }
+      
+      return skills
+    },
+    
+    async get(candidate, getOptions) {
+      // 从 locator 加载完整内容
+      const content = await readFile(candidate.locator.path)
+      return parseSkillDefinition(content)
+    },
+  }
+}
+```
+
+### 10.6 与 laew 的对比
+
+| 维度 | deepseek-harness | laew |
+|------|-----------------|------|
+| **Skill 系统** | 完整（Layered Registry + Provider） | 无 |
+| **分层机制** | Global + Scope + Rank 优先级 | N/A |
+| **Provider 扩展** | 可注册自定义 Provider | N/A |
+| **文件系统加载** | .dsh/、.agents/、内置 | N/A |
+| **调用策略** | modelInvocable + userInvocable | N/A |
 
 ---
 
-## 总体对比与借鉴建议
+## 总结：deepseek-harness 架构全景
 
-### 总体架构差异
+### 核心设计模式
 
-| 维度 | laew（Rust） | deepseek-harness（TypeScript） |
-|------|--------------|-------------------------------|
-| **语言范式** | 强类型 enum / trait | `declare module` 类型合并 + 装饰器 |
-| **多 Agent 架构** | 6 角色硬编码 + 三档任务分类 | SubAgent provider registry + capability seam |
-| **状态管理** | 内存 context + SQLite 元数据 | 不可变 append-only session log + 内存投影 |
-| **意图识别** | LLM 三步分类（Yolo） | 显式 Goal 域（maxGoalRounds） |
-| **质检** | 必经 LLM judge（QC Agent） | 可叠加 plugin guard（repeat-tool-reminder / timeout-policy） |
-| **工具** | 内置 3 工具 + Rust trait | 内置 N 工具 + MCP + Skill + defineTool |
-| **LLM 适配** | 双协议手写 wire（Anthropic + OpenAI） | DeepSeek 直连 + pi-ai 通用代理 |
-| **类型系统** | Rust trait + 泛型 | TS 装饰器 + Typert 类型图生成器 |
+1. **Everything-is-a-Plugin**：所有能力都是 Cordis 插件，通过 `ctx.plugin()` 加载
+2. **Event Sourcing**：Session 使用不可变事件流，支持回放和压缩
+3. **Scoped Layers**：工具和 Skill 支持 per-scope 隔离和覆盖
+4. **Provider Registry**：SubAgent 和 Skill 使用 Provider 模式，支持扩展
+5. **Guard Pipeline**：工具执行前后可插入验证逻辑
+6. **PTC 模式**：SDK 风格的代码执行，桥接工具调用
 
-### 关键借鉴清单
+### 与 laew 的关键差异
 
-1. **三相位状态机**（`idle / maintenance / running`）+ 显式 `wakeRequested` 锁存 → 解决 cancel 重入。
-2. **Inbox 持久化**（`agent/inbox/spliced` 事件 + 双队列 `next-turn / next-step`）→ resume / fork 零成本还原。
-3. **sticky turn end reason**（max-tokens 不被 completed step 降级）→ 跨 step 的失败结论稳定。
-4. **per-request immutable LLM snapshot** → 在飞请求不受配置变更影响。
-5. **Typert 类型图**（Service / Event / Object / Schema 四类节点）→ 编译期保证 RPC + wire 一致。
-6. **Capability seam**（subagent 五项能力声明 + assertCapabilities）→ 多 provider 安全共存。
-7. **Plan-mode pending 纯 fold** → 无 live mirror，重启恢复零成本。
-8. **Guard plugin waterfall**（observe + delegate + fold reminder）→ 比 LLM judge 更轻量。
-9. **MCP 重连策略**（指数退避 + stable window + exhaustion unregister）→ 健壮性工程细节。
-10. **Skill layered registry + rank + source** → 多源资源合并的可借鉴抽象。
+| 维度 | deepseek-harness | laew |
+|------|-----------------|------|
+| **框架** | Cordis（IoC/DI） | 无（直接实现） |
+| **架构风格** | Everything-is-a-Plugin | 模块化但非插件化 |
+| **任务识别** | Goal 域 + Intent Recognition | Yolo Agent |
+| **质检机制** | Guard Plugin（前置后置） | Quality-Check Agent |
+| **SubAgent** | Provider Registry + 多轮 | 固定 Agent + 单轮 |
+| **MCP** | 完整支持 | 无 |
+| **Skill** | Layered Registry | 无 |
+| **PTC** | `run_code` 工具 | 无 |
 
-### laew 可改进点
+### 可借鉴的设计
 
-1. **`Session.context` 应支持 turn / step 边界事件**，便于 resume 后 fold 一致。
-2. **可引入类似 `guard/repeat-tool-reminder` 的轻量 guard 插件**，避免 hard 任务才上 LLM judge。
-3. **MCP 客户端可参考**：`scrubbedParentEnv()` + 指数退避 + `syncChain` 串行化。
-4. **Tool 定义可拆 `defineTool` 工厂**，把 schema + presentCall/presentResult 标准化。
-5. **Skill / Subagent 可引入 layered registry**，避免硬编码。
+1. **Event Sourcing**：用于审计、回放、压缩
+2. **Scoped Layers**：用于 per-project 的工具和 Skill 隔离
+3. **Guard Pipeline**：用于工具执行的安全控制
+4. **Provider Registry**：用于 SubAgent 和 Skill 的可扩展性
+5. **PTC 模式**：用于 SDK 风格的代码执行
 
 ---
 
-## 参考文件路径清单
-
-### 核心 Agent
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/core/agent-loop/src/agent.ts` — ReactLoopAgent（543 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/core/agent/src/inbox.ts` — Inbox（220 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/core/agent/src/runtime-types.ts` — Agent 公开契约（299 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/core/agent/src/types.ts` — SessionEventMap 声明合并（46 行）
-
-### Goal / Plan
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/goal/goal/src/index.ts` — GoalService（593 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/goal/goal/src/domain.ts` — Goal 域类型 + SessionEventMap 注入
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/goal/goal-round-driver/src/index.ts` — Round Driver
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/plan/plan-mode/src/index.ts` — PlanModeController（515 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/plan/plan-mode/src/types.ts` — PlanProjection 唯一声明（30 行）
-
-### Guard
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/guard/repeat-tool-reminder/src/index.ts` — 重复调用检测（234 行）
-
-### SubAgent
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/subagent/subagent/src/index.ts` — SubagentRuntime（638 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/subagent/tool-subagent/src/index.ts` — 委派工具（693 行）
-
-### LLM
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/llm/llm-deepseek/src/index.ts` — DeepSeek 直连 plugin
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/llm/llm-deepseek/src/adapter.ts` — DeepSeekAdapter（707 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/llm/llm-pi-ai/src/adapter.ts` — pi-ai 通用代理（420 行）
-
-### MCP
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/mcp/mcp-client/src/connection.ts` — 连接监管 + 退避（351 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/mcp/mcp-client/src/transport.ts` — stdio / http transport（50 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/mcp/mcp-client/src/tools.ts` — 工具同步桥（559 行）
-
-### Skill
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/skill/skill/src/index.ts` — SkillRegistry（868 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/skill/skill-filesystem/src/index.ts` — Filesystem Provider（1041 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/skill/tool-skill/src/index.ts` — `skill` 工具（430 行）
-
-### Typert
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/typert/protocol/src/index.ts` — Remote / Lookup 装饰器（325 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/typert/generator/src/model.ts` — 类型图核心模型（438 行）
-- `/usr/local/LsmGitOpenSource/deepseek-harness/packages/typert/generator/src/emitter.ts` — Schema / Remote / Face emitter（937 行）
+**报告完成日期**：2026-09-04
+**分析文件数**：50+ 核心源文件
+**代码行数**：约 15,000 行深度阅读
