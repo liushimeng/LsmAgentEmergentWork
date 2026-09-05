@@ -137,30 +137,43 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
-- `docs/Agent源码调研/` — 7 个外部 Agent 源码的系统调研与深度分析,共 3 层文档(源码调研 → 深度分析 → 核心机制深度分析),覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/**沙箱设计**/**权限管控** 18 维度:
-  - `atomcode-*.md` — Rust, L0/L1/L2 分层 + cargo feature gating, ~150k 行
-  - `claudecode-*.md` — TypeScript/Bun, 四级压缩管线 + 27 种 Hook, ~218k 行
-  - `deepseek-harness-*.md` — TypeScript, Cordis Everything-is-a-Plugin, ~80+ 包
-  - `openclaw-*.md` — TypeScript, Gateway + Harness + 双向 MCP, ~201 万行
-  - `opencode-*.md` — TypeScript/Bun, Effect + Schema 全栈 DI, ~18k 行
-  - `pi-*.md` — TypeScript, lane 并发 + 一等公民 Skill, ~12 包
-  - `hermes-agent-*.md` — **Python, 859 MB, 6 前端共享 AIAgent 核心 + 30+ provider + Skill 一等公民 + CompressionCommitFence**
-  - `*-核心机制深度分析.md` — 第二轮深入钻取,7 个项目各 3 份:核心代码路径/函数名/代码片段/对 laew 借鉴
-  - `专题-Context上下文管理深度分析.md` — Context 压缩管线横向对比(4级/3级/2级/可插拔/投影)
-  - `专题-MCP架构深度分析.md` — MCP 传输层/工具注册/资源/认证/双向支持横向对比
-  - `专题-Skill系统深度分析.md` — Skill 文件格式/注册/加载/触发/内置数量横向对比
-  - `专题-SubAgent与多Agent架构深度分析.md` — 多 Agent 编排模式/上下文传递/并发/通信横向对比
-  - `专题-任务拆解与分类深度分析.md` — 任务分类/拆解粒度/失败回流横向对比
-  - `专题-质检机制深度分析.md` — 质检形式/触发/检查项/自动修复/失败回流横向对比
-  - `专题-多轮对话与循环架构深度分析.md` — agentic loop 驱动/终止/续轮/流式耦合横向对比
-  - `专题-工具调用深度分析.md` — 工具定义/Schema/消息流/并发/权限拦截横向对比
-  - `专题-记忆系统与管理深度分析.md` — 记忆分层/持久化/检索注入/压缩横向对比
-  - `专题-Workflow设计深度分析.md` — workflow 定义/编排拓扑/执行引擎横向对比
-  - `专题-Yolo目标意图识别与目标规划深度分析.md` — 目标识别/意图/生命周期/规划生成横向对比
-  - `专题-Agent协作与调度深度分析.md` — 主/Sub 委派/并发调度/通信/失败回流横向对比
-  - `专题-沙箱设计深度分析.md` — **进程/文件/网络/能力/资源隔离 + 失败回流 + laew 现状(零沙箱)+ 8 个跨项目模式 + P0/P1/P2 路线图**
-  - `专题-权限管控深度分析.md` — **三态策略/Bash 黑名单/路径白名单/敏感信息保护/用户确认/持久化/SubAgent 降级/Hook/审计/YOLO + laew 现状(零校验)+ 8 个跨项目模式 + P0/P1/P2 路线图**
-  - `专题-横向对比深度分析合集.md` — 横向专题索引(12 + 沙箱 + 权限 共 14 专题),含横向对比表+设计模式+laew 综合建议
+- `docs/Agent源码调研/` — **13 个外部 Agent 源码**的系统调研与深度分析,共 3 层文档(源码调研 → 深度分析 → 核心机制深度分析),覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源 等 20+ 维度:
+  - **CLI / 通用 Agent**:
+    - `atomcode-*.md` — Rust, L0/L1/L2 分层 + cargo feature gating, ~150k 行
+    - `claudecode-*.md` — TypeScript/Bun, 四级压缩管线 + 27 种 Hook, ~218k 行
+    - `deepseek-harness-*.md` — TypeScript, Cordis Everything-is-a-Plugin, ~80+ 包
+    - `openclaw-*.md` — TypeScript, Gateway + Harness + 双向 MCP, ~201 万行
+    - `opencode-*.md` — TypeScript/Bun, Effect + Schema 全栈 DI, ~18k 行
+    - `pi-*.md` — TypeScript, lane 并发 + 一等公民 Skill, ~12 包
+    - `hermes-agent-*.md` — **Python, 859 MB, 6 前端共享 AIAgent 核心 + 30+ provider + Skill 一等公民 + CompressionCommitFence**
+  - **新增 6 个高价值 Agent 仓库(2026-09 第二轮深度调研)**:
+    - `agent-core-*.md` — **Python, openJiuwen Core SDK**, ReAct 循环 + ContextEngine + 多类型记忆(语义/情景/画像/变量/摘要) + PermissionEngine 三级防护 + TeamAgent 双 Spawn + Pregel 图执行 + Rails 铁轨 + OTLP Trajectory + RL 训练
+    - `TencentDB-Agent-Memory-*.md` — **TypeScript+Python, 团队记忆系统**, L0-L3 管线(Chat→Atom→Scenario→Persona) + MemoryPipelineManager + SkillCore 6写4读 + InjectionPipeline 8注入点 + MemoryProxy + 多租户隔离 + RRF 混合检索
+    - `jiuwenswarm-*.md` — **Python, 多 Agent 协作平台**, Leader-Teammate 模式 + A2A/ACP/E2A/A2UI 协议矩阵 + SkillDevPipeline 12 阶段 + SwarmFlow DAG + AgentWarmPool + Symphony 记忆 + JiuwenBox 沙箱
+    - `semantica-*.md` — **Python, 图原生 AI 基础设施**, Context Graph + 决策因果链 + Rete 网络 + Datalog 半朴素不动点 + SPARQL + W3C PROV-O 溯源 + BiTemporalFact 双时序模型 + 冲突检测 7 种策略
+    - `agent-studio-*.md` — **Python, 一站式 Agent 开发平台**, 多微服务架构 + Pregel 图算法 cba 分支消减 + DSL 双向转换 + 5 种 MCP 传输 + BubbleWrap 沙箱 + Seccomp BPF + 多 Trial 评估
+    - `Switchyard-*.md` — **Rust, NVIDIA LLM 网关**, 协议 IR (LlmRequest/LlmResponse) + ContentBlock::Unknown 无损保留 + TranslationEngine + 7 种路由算法(Noop/Passthrough/Random/LlmClassifier/StageRouter/Composite/AdvisorGate) + FallThrough 级联 + PyO3 绑定
+  - `*-核心机制深度分析.md` — 第二轮深入钻取,13 个项目各 3 份:核心代码路径/函数名/代码片段/对 laew 借鉴
+  - **横向专题分析(15 个)**:
+    - `专题-12Agent全面对比深度分析.md` — **13 项目 18 维度横向对比总表 + 4 大新维度专题 + 18 跨项目模式 + 12 反模式 + P0/P1/P2/P3 借鉴路线图**
+    - `专题-Context上下文管理深度分析.md` — Context 压缩管线横向对比(4级/3级/2级/可插拔/投影)
+    - `专题-MCP架构深度分析.md` — MCP 传输层/工具注册/资源/认证/双向支持横向对比
+    - `专题-Skill系统深度分析.md` — Skill 文件格式/注册/加载/触发/内置数量横向对比
+    - `专题-SubAgent与多Agent架构深度分析.md` — 多 Agent 编排模式/上下文传递/并发/通信横向对比
+    - `专题-任务拆解与分类深度分析.md` — 任务分类/拆解粒度/失败回流横向对比
+    - `专题-质检机制深度分析.md` — 质检形式/触发/检查项/自动修复/失败回流横向对比
+    - `专题-多轮对话与循环架构深度分析.md` — agentic loop 驱动/终止/续轮/流式耦合横向对比
+    - `专题-工具调用深度分析.md` — 工具定义/Schema/消息流/并发/权限拦截横向对比
+    - `专题-记忆系统与管理深度分析.md` — 记忆分层/持久化/检索注入/压缩横向对比(老版本,被新版本替换)
+    - `专题-记忆系统与上下文注入深度分析.md` — **新版整合,5 仓库深度对比,含 L0-L3 管线 + RRF + 9 注入点 + W3C PROV-O + P0-P5 路线图**
+    - `专题-Workflow设计深度分析.md` — workflow 定义/编排拓扑/执行引擎横向对比
+    - `专题-Yolo目标意图识别与目标规划深度分析.md` — 目标识别/意图/生命周期/规划生成横向对比
+    - `专题-Agent协作与调度深度分析.md` — 主/Sub 委派/并发调度/通信/失败回流横向对比(老版本,被新版本整合)
+    - `专题-多Agent协作与权限管控深度分析.md` — **新版整合,5 仓库深度对比,含 TeamAgent/Leader-Teammate/BubbleWrap/Seccomp/HITL/Fork 上下文/P0-P2 路线图**
+    - `专题-沙箱设计深度分析.md` — **进程/文件/网络/能力/资源隔离 + 失败回流 + laew 现状(零沙箱)+ 8 个跨项目模式 + P0/P1/P2 路线图**
+    - `专题-权限管控深度分析.md` — **三态策略/Bash 黑名单/路径白名单/敏感信息保护/用户确认/持久化/SubAgent 降级/Hook/审计/YOLO + laew 现状(零校验)+ 8 个跨项目模式 + P0/P1/P2 路线图**
+    - `专题-LLM网关与协议翻译深度分析.md` — **Switchyard/agent-studio/cc-switch 协议 IR + 翻译 + 路由算法 + LRU 缓存 + 熔断器 + Rust/Python 实现对比**
+    - `专题-横向对比深度分析合集.md` — 横向专题索引(15 专题),含横向对比表+设计模式+laew 综合建议
 - `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 10 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
 
 ## 自动化测试
