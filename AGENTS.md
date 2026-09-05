@@ -137,7 +137,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
-- `docs/Agent源码调研/` — **13 个外部 Agent 源码**的系统调研与深度分析,共 3 层文档(源码调研 → 深度分析 → 核心机制深度分析),覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源 等 20+ 维度:
+- `docs/Agent源码调研/` — **14 个外部 Agent 源码**的系统调研与深度分析,共 3 层文档(源码调研 → 深度分析 → 核心机制深度分析),覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源 等 20+ 维度:
   - **CLI / 通用 Agent**:
     - `atomcode-*.md` — Rust, L0/L1/L2 分层 + cargo feature gating, ~150k 行
     - `claudecode-*.md` — TypeScript/Bun, 四级压缩管线 + 27 种 Hook, ~218k 行
@@ -153,6 +153,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
     - `semantica-*.md` — **Python, 图原生 AI 基础设施**, Context Graph + 决策因果链 + Rete 网络 + Datalog 半朴素不动点 + SPARQL + W3C PROV-O 溯源 + BiTemporalFact 双时序模型 + 冲突检测 7 种策略
     - `agent-studio-*.md` — **Python, 一站式 Agent 开发平台**, 多微服务架构 + Pregel 图算法 cba 分支消减 + DSL 双向转换 + 5 种 MCP 传输 + BubbleWrap 沙箱 + Seccomp BPF + 多 Trial 评估
     - `Switchyard-*.md` — **Rust, NVIDIA LLM 网关**, 协议 IR (LlmRequest/LlmResponse) + ContentBlock::Unknown 无损保留 + TranslationEngine + 7 种路由算法(Noop/Passthrough/Random/LlmClassifier/StageRouter/Composite/AdvisorGate) + FallThrough 级联 + PyO3 绑定
+    - `cc-switch-*.md` — **Tauri 2 + Rust + React, AI 工具配置管理桌面应用**, 8 款工具适配(Claude/Codex/Gemini/OpenCode/Hermes 等) + 本地代理 + 熔断器(三态 Closed/Open/HalfOpen) + thinking_rectifier 整流 + MCP 多工具 SSOT + 17 schema 版本迁移 + WebDAV/S3 云同步
   - `*-核心机制深度分析.md` — 第二轮深入钻取,13 个项目各 3 份:核心代码路径/函数名/代码片段/对 laew 借鉴
   - **横向专题分析(15 个)**:
     - `专题-12Agent全面对比深度分析.md` — **13 项目 18 维度横向对比总表 + 4 大新维度专题 + 18 跨项目模式 + 12 反模式 + P0/P1/P2/P3 借鉴路线图**
