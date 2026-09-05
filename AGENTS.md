@@ -175,6 +175,18 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
     - `专题-权限管控深度分析.md` — **三态策略/Bash 黑名单/路径白名单/敏感信息保护/用户确认/持久化/SubAgent 降级/Hook/审计/YOLO + laew 现状(零校验)+ 8 个跨项目模式 + P0/P1/P2 路线图**
     - `专题-LLM网关与协议翻译深度分析.md` — **Switchyard/agent-studio/cc-switch 协议 IR + 翻译 + 路由算法 + LRU 缓存 + 熔断器 + Rust/Python 实现对比**
     - `专题-横向对比深度分析合集.md` — 横向专题索引(15 专题),含横向对比表+设计模式+laew 综合建议
+
+  **第二轮深挖（8 份，2026-09-05 完成，本轮新增 ~8,200 行 Markdown）**:
+    - `专题-第二轮深挖合集.md` — **本轮 8 份深挖合集索引 + 三大共性模式 + 6 周 P0 路线图**
+    - `atomcode-第二轮深度分析.md` — **Rust 三层 workspace + cargo feature gating 物理边界 + kernel 内部 trait + AgentCommand/AgentEvent 双向消息协议 + MCP 7 子模块 + Skill + CodeIntel 七件套**
+    - `claudecode-第二轮深度分析.md` — **27 种 Hook 触发点 + 5 种执行器 + 4 级压缩管线 + 9 段固定摘要结构 + 6 阶段权限判定 + TodoWrite/Worktree**
+    - `openclaw-第二轮深度分析.md` — **Gateway / Harness / Adapter 三层契约 + Capability Cross Type + 双向 MCP + 11-capability harness + Lane 调度器 + Workshop 自演化**
+    - `opencode-第二轮深度分析.md` — **Effect 4 全栈 DI + LayerNode 拓扑 + 78 Service Tag + packages/llm 4 轴组合 + 15 种 LLMEvent + 34 包 workspace**
+    - `deepseek-harness-第二轮深度分析.md` — **Cordis 三原语 + Service + Fiber epoch 算法 + apps/cli 50 行入口 + 4 层 patch 叠加 + WriteBehind 200ms 批 + ScopedLayers**
+    - `pi-第二轮深度分析.md` — **Operation Lane 三态 + reduceLaneState 事件溯源 + 14 种损坏检测 + Skill 文本注入 + 20+ compat 开关 + 11 种 thinkingFormat + 树状 Session + JSONL 撕裂尾部修复**
+    - `hermes-agent-第二轮深度分析.md` — **6 前端共享 AIAgent + ProviderProfile 38 provider 声明式 + CompressionCommitFence 四重防护 + agentskills.io 标准 + FTS5 + Trigram**
+    - `cc-switch-核心机制深度分析.md` — **Tauri 2 桌面壳 + 本地 LLM 代理 + 熔断器三态 Closed/Open/HalfOpen + thinking_rectifier 7 模式 + 8 工具配置适配 + MCP 多工具 SSOT + 17 schema 迁移 + SQL authorizer 防御 + WebDAV/S3 云同步**
+
 - `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 10 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
 
 ## 自动化测试
