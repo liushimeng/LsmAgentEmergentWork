@@ -3154,3 +3154,1263 @@ function toIMFDate (date) {
 
 **性能优化**: 使用预计算的查找表 (`IMFPaddedNumbers[0..60]`, `IMFDays`, `IMFMonths`) 避免运行时格式化开销。这种微优化在高频场景 (大量 Set-Cookie) 下有意义。
 
+
+---
+
+## 7. WebIDL 类型系统深度分析
+
+**文件**: `lib/web/webidl/index.js` (1,004 行)
+
+### 7.1 架构概览
+
+undici 的 WebIDL 实现是一个精简但完整的类型系统，包含：
+- **类型转换器** (`converters.*`): JavaScript 值 -> WebIDL 类型
+- **类型检查器** (`is.*`): 值是否是某种类型
+- **工具函数** (`util.*`): 类型判定、整数转换等
+- **错误工厂** (`errors.*`): 标准化的类型错误
+- **属性标志** (`attributes.*`): Clamp/EnforceRange/AllowShared 等
+
+### 7.2 Brand Check
+
+Brand check 是 Web API 安全的基础，防止用户将一个类的实例传给另一个类的方法：
+
+```javascript
+// 单类型 brand check
+webidl.brandCheck = function (V, I) {
+  // 使用 Symbol.hasInstance (Function.prototype[Symbol.hasInstance])
+  if (!FunctionPrototypeSymbolHasInstance(I, V)) {
+    const err = new TypeError('Illegal invocation')
+    err.code = 'ERR_INVALID_THIS'  // Node.js 兼容错误码
+    throw err
+  }
+}
+
+// 多类型 brand check (任一类型匹配即可)
+webidl.brandCheckMultiple = function (List) {
+  const prototypes = List.map(c => webidl.util.MakeTypeAssertion(c))
+  return (V) => {
+    if (prototypes.every(typeCheck => !typeCheck(V))) {
+      const err = new TypeError('Illegal invocation')
+      err.code = 'ERR_INVALID_THIS'
+      throw err
+    }
+  }
+}
+```
+
+**设计意义**: `brandCheck` 通过 `Symbol.hasInstance` 实现精确的实例类型检查，比 `instanceof` 更严格 (不易被原型链篡改绕过)。
+
+### 7.3 基础类型转换器
+
+```javascript
+// DOMString: 类型安全的字符串
+webidl.converters.DOMString = function (V) {
+  // [LegacyNullToEmptyString] 扩展属性: null -> ''
+  if (V === null && HasFlag(flags, attributes.LegacyNullToEmptyString)) {
+    return ''
+  }
+  if (typeof V === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string')
+  return String(V)
+}
+
+// USVString: Unicode 标量值字符串
+webidl.converters.USVString = function (value) {
+  if (typeof value === 'string') return value.toWellFormed()
+  return `${value}`.toWellFormed()  // 替换不配对的代理项
+}
+
+// ByteString: 字节字符串 (所有字符 <= 0xFF)
+webidl.converters.ByteString = function (V) {
+  const x = String(V)
+  for (let i = 0; i < x.length; i++) {
+    if (x.charCodeAt(i) > 255) {
+      throw new TypeError('Argument is not a valid ByteString')
+    }
+  }
+  return x
+}
+
+// boolean
+webidl.converters.boolean = function (V) {
+  return Boolean(V)
+}
+
+// 整数类型
+webidl.converters['long long'] = function (V) {
+  return webidl.util.ConvertToInt(V, 64, 'signed')
+}
+
+webidl.converters['unsigned long'] = function (V) {
+  return webidl.util.ConvertToInt(V, 32, 'unsigned')
+}
+
+webidl.converters['unsigned long long'] = function (V) {
+  return webidl.util.ConvertToInt(V, 64, 'unsigned')
+}
+
+webidl.converters['unsigned short'] = function (V, prefix, argument, flags) {
+  return webidl.util.ConvertToInt(V, 16, 'unsigned', flags)
+}
+```
+
+### 7.4 `ConvertToInt()` -- 整数转换核心
+
+```javascript
+webidl.util.ConvertToInt = function (V, bitLength, signedness, flags) {
+  let upperBound, lowerBound
+
+  if (bitLength === 64) {
+    // 64 位: 使用 JS 安全整数范围 (2^53 - 1)
+    upperBound = Math.pow(2, 53) - 1
+    lowerBound = signedness === 'unsigned' ? 0 : -Math.pow(2, 53) + 1
+  } else if (signedness === 'unsigned') {
+    lowerBound = 0
+    upperBound = Math.pow(2, bitLength) - 1
+  } else {
+    lowerBound = -Math.pow(2, bitLength - 1)
+    upperBound = Math.pow(2, bitLength - 1) - 1
+  }
+
+  let x = Number(V)
+  if (x === 0) x = 0  // -0 -> +0
+
+  // === [EnforceRange]: 严格范围检查 ===
+  if (webidl.util.HasFlag(flags, webidl.attributes.EnforceRange)) {
+    if (Number.isNaN(x) || !Number.isFinite(x)) {
+      throw TypeError('Value is not a finite number')
+    }
+    x = webidl.util.IntegerPart(x)
+    if (x < lowerBound || x > upperBound) {
+      throw TypeError('Value is outside the valid range')
+    }
+    return x
+  }
+
+  // === [Clamp]: 钳位到范围 ===
+  if (!Number.isNaN(x) && webidl.util.HasFlag(flags, webidl.attributes.Clamp)) {
+    x = Math.min(Math.max(x, lowerBound), upperBound)
+    // Banker's rounding (四舍六入五成双)
+    if (Math.floor(x) % 2 === 0) x = Math.floor(x)
+    else x = Math.ceil(x)
+    return x
+  }
+
+  // === 默认: 模运算 ===
+  if (Number.isNaN(x) || x === 0 || !Number.isFinite(x)) return 0
+  x = webidl.util.IntegerPart(x)
+  x = x % Math.pow(2, bitLength)
+  if (signedness === 'signed' && x >= Math.pow(2, bitLength - 1)) {
+    x -= Math.pow(2, bitLength)
+  }
+  return x
+}
+```
+
+**三种整数处理模式**: EnforceRange(严格，越界抛异常)、Clamp(钳位到边界 + Banker's rounding)、默认(模运算溢出回绕) -- 与 WebIDL 规范完全对齐。
+
+### 7.5 BufferSource 处理
+
+```javascript
+webidl.util.getCopyOfBytesHeldByBufferSource = function (bufferSource) {
+  let jsArrayBuffer = bufferSource
+  let offset = 0, length = 0
+
+  // TypedArray/DataView: 提取底层 buffer + offset + length
+  if (types.isTypedArray(bufferSource) || types.isDataView(bufferSource)) {
+    jsArrayBuffer = bufferSource.buffer
+    offset = bufferSource.byteOffset
+    length = bufferSource.byteLength
+  } else {
+    // ArrayBuffer: 直接使用
+    length = bufferSource.byteLength
+  }
+
+  // 已分离的 buffer 返回空
+  if (jsArrayBuffer.detached) return new Uint8Array(0)
+
+  // 拷贝字节 (安全: 防止原始 buffer 后续被修改)
+  const bytes = new Uint8Array(length)
+  const view = new Uint8Array(jsArrayBuffer, offset, length)
+  bytes.set(view)
+  return bytes
+}
+```
+
+**安全设计**: 始终拷贝字节而非引用，防止原始 buffer 被分离(detached)或修改影响已提取的数据。
+
+### 7.6 序列与记录转换器
+
+```javascript
+// 序列转换器: iterable -> 类型化数组
+webidl.sequenceConverter = function (converter) {
+  return (V, prefix, argument, Iterable) => {
+    if (webidl.util.Type(V) !== OBJECT) throw TypeError(...)
+
+    // 获取迭代器
+    const method = typeof Iterable === 'function' ? Iterable() : V?.[Symbol.iterator]?.()
+    if (method === undefined || typeof method.next !== 'function') throw TypeError(...)
+
+    // 迭代并转换每个元素
+    const seq = []
+    let index = 0
+    while (true) {
+      const { done, value } = method.next()
+      if (done) break
+      seq.push(converter(value, prefix, `${argument}[${index++}]`))
+    }
+    return seq
+  }
+}
+
+// 记录转换器: object -> 键值对记录
+webidl.recordConverter = function (keyConverter, valueConverter) {
+  return (O, prefix, argument) => {
+    if (webidl.util.Type(O) !== OBJECT) throw TypeError(...)
+
+    const result = {}
+
+    // 区分 Proxy 和普通对象的键获取方式
+    if (!types.isProxy(O)) {
+      const keys = [
+        ...Object.getOwnPropertyNames(O),
+        ...Object.getOwnPropertySymbols(O)
+      ]
+      for (const key of keys) {
+        result[keyConverter(key, ...)] = valueConverter(O[key], ...)
+      }
+    } else {
+      // Proxy 对象: 使用 Reflect API 避免触发副作用
+      const keys = Reflect.ownKeys(O)
+      for (const key of keys) {
+        const desc = Reflect.getOwnPropertyDescriptor(O, key)
+        if (desc?.enumerable) {
+          result[keyConverter(key, ...)] = valueConverter(O[key], ...)
+        }
+      }
+    }
+
+    return result
+  }
+}
+```
+
+### 7.7 字典转换器
+
+```javascript
+webidl.dictionaryConverter = function (converters) {
+  // WebIDL 规范要求字典键按字典序排序
+  converters.sort((a, b) => (a.key > b.key) - (a.key < b.key))
+
+  return (dictionary, prefix, argument) => {
+    const dict = {}
+
+    // 验证输入是对象
+    if (dictionary != null && webidl.util.Type(dictionary) !== OBJECT) {
+      throw webidl.errors.exception(...)
+    }
+
+    for (const options of converters) {
+      const { key, defaultValue, required, converter, allowedValues } = options
+
+      // 必需键检查
+      if (required && (dictionary == null || !Object.hasOwn(dictionary, key))) {
+        throw webidl.errors.exception({
+          header: prefix,
+          message: `Missing required key "${key}".`
+        })
+      }
+
+      let value = dictionary?.[key]
+
+      // 默认值处理 (工厂函数)
+      if (defaultValue !== undefined && value === undefined) {
+        value = defaultValue()
+      }
+
+      // 类型转换
+      if (required || defaultValue !== undefined || value !== undefined) {
+        value = converter(value, prefix, `${argument}.${key}`)
+
+        // 允许值枚举检查
+        if (allowedValues && !allowedValues.includes(value)) {
+          throw webidl.errors.exception(...)
+        }
+
+        dict[key] = value
+      }
+    }
+
+    return dict
+  }
+}
+```
+
+**字典序排序**: WebIDL 规范要求字典成员按字典序处理，这确保了不同实现间的确定性行为。
+
+### 7.8 属性标志系统
+
+```javascript
+webidl.attributes = {
+  Clamp: 1 << 0,                    // 0b00001
+  EnforceRange: 1 << 1,             // 0b00010
+  AllowShared: 1 << 2,              // 0b00100
+  AllowResizable: 1 << 3,           // 0b01000
+  LegacyNullToEmptyString: 1 << 4   // 0b10000
+}
+
+webidl.util.HasFlag = function (flags, attributes) {
+  return typeof flags === 'number' && (flags & attributes) === attributes
+}
+```
+
+**位标志设计**: 使用位运算高效检查多个属性标志，比对象属性查找更快。单次检查只需一次 AND 运算。
+
+---
+
+## 8. 基础设施模块
+
+### 8.1 WHATWG Infra 规范
+
+**文件**: `lib/web/infra/index.js` (230 行)
+
+#### 8.1.1 序列收集
+
+```javascript
+// 通用版本: 条件函数驱动
+function collectASequenceOfCodePoints (condition, input, position) {
+  let result = ''
+  while (position.position < input.length &&
+         condition(input[position.position])) {
+    result += input[position.position]
+    position.position++
+  }
+  return result
+}
+
+// 快速版本: 单字符比较 (使用 String.indexOf)
+function collectASequenceOfCodePointsFast (char, input, position) {
+  const idx = input.indexOf(char, position.position)
+  const start = position.position
+
+  if (idx === -1) {
+    position.position = input.length
+    return input.slice(start)
+  }
+
+  position.position = idx
+  return input.slice(start, idx)
+}
+```
+
+**性能优化**: `Fast` 版本使用 `String.indexOf()` 替代逐字符比较，对于简单分隔符场景快 10-100 倍。`String.indexOf` 内部使用 SIMD 优化的 memchr 实现。
+
+#### 8.1.2 Forgiving Base64
+
+```javascript
+function forgivingBase64 (data) {
+  // 1. 移除 ASCII 空白 (TAB, LF, CR, SPACE)
+  data = data.replace(/[\t\n\r ]/g, '')
+
+  let dataLength = data.length
+
+  // 2. 处理 padding (=)
+  if (dataLength % 4 === 0) {
+    if (data.charCodeAt(dataLength - 1) === 0x003D) {
+      --dataLength
+      if (data.charCodeAt(dataLength - 1) === 0x003D) --dataLength
+    }
+  }
+
+  // 3. 长度校验: 去掉 padding 后长度不能是 4n+1
+  if (dataLength % 4 === 1) return 'failure'
+
+  // 4. 字符校验: 只允许 + / 0-9 A-Z a-z
+  if (/[^+/0-9A-Za-z]/.test(data.slice(0, dataLength))) return 'failure'
+
+  // 5. 解码
+  const buffer = Buffer.from(data, 'base64')
+  return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+}
+```
+
+**"Forgiving"**: 与标准 Base64 的区别在于允许忽略 padding 和空白，这是 Web 标准中常见的容错设计。
+
+#### 8.1.3 同构编解码
+
+```javascript
+// 同构解码: 字节 -> 字符串 (每个字节映射到同值的码点)
+function isomorphicDecode (input) {
+  const length = input.length
+  // 批量处理 (每次 65535 字节, 避免 apply 参数过多)
+  const batchSize = (2 << 15) - 1  // 65535
+
+  if (batchSize > length) {
+    return String.fromCharCode.apply(null, input)
+  }
+
+  let result = ''
+  let i = 0
+  while (i < length) {
+    let end = i + batchSize
+    if (end > length) end = length
+    result += String.fromCharCode.apply(null, input.subarray(i, end))
+    i = end
+  }
+  return result
+}
+
+// 同构编码: 字符串 -> 字节 (每个码点映射到同值的字节)
+function isomorphicEncode (input) {
+  // 断言所有字符在 0x00-0xFF 范围内
+  for (let i = 0; i < input.length; i++) {
+    if (input.charCodeAt(i) > 0xFF) throw new TypeError('...')
+  }
+  return input
+}
+```
+
+### 8.2 WHATWG Encoding
+
+**文件**: `lib/encoding/index.js` (34 行)
+
+```javascript
+const textDecoder = new TextDecoder()  // 复用单个实例
+
+function utf8DecodeBytes (buffer) {
+  if (buffer.length === 0) return ''
+
+  // 跳过 UTF-8 BOM (0xEF 0xBB 0xBF)
+  if (buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF) {
+    buffer = buffer.subarray(3)
+  }
+
+  return textDecoder.decode(buffer)
+}
+```
+
+**设计**: 复用单个 `TextDecoder` 实例避免重复创建。`TextDecoder` 内部维护编码状态，对于 UTF-8 来说是无状态的，可以安全复用。
+
+### 8.3 Data URL 与 MIME 解析
+
+**文件**: `lib/web/fetch/data-url.js` (596 行)
+
+#### 8.3.1 Data URL 处理器
+
+```javascript
+function dataURLProcessor (dataURL) {
+  // 1. 序列化 URL (排除 fragment)
+  let input = URLSerializer(dataURL, true)
+
+  // 2. 去掉 "data:" 前缀
+  input = input.slice(5)
+
+  // 3. 提取 MIME 类型 (逗号前的部分)
+  const position = { position: 0 }
+  let mimeType = collectASequenceOfCodePointsFast(',', input, position)
+  mimeType = removeASCIIWhitespace(mimeType, true, true)  // 去首尾空白
+
+  // 4. 提取编码后的 body (逗号后的部分)
+  const encodedBody = input.slice(mimeType.length + 1)
+  let body = stringPercentDecode(encodedBody)
+
+  // 5. Base64 检测: MIME 类型以 ;base64 结尾
+  if (/;(?: *)base64$/ui.test(mimeType)) {
+    const stringBody = isomorphicDecode(body)
+    body = forgivingBase64(stringBody)
+    if (body === 'failure') return 'failure'
+
+    // 清理 MIME 类型中的 ;base64 后缀
+    mimeType = mimeType.slice(0, -6).replace(/( +)$/u, '').slice(0, -1)
+  }
+
+  // 6. 默认 MIME 类型: 如果以 ; 开头, 补充 text/plain
+  if (mimeType.startsWith(';')) mimeType = 'text/plain' + mimeType
+
+  // 7. 解析 MIME 类型
+  let mimeTypeRecord = parseMIMEType(mimeType)
+  if (mimeTypeRecord === 'failure') {
+    // 默认: text/plain;charset=US-ASCII
+    mimeTypeRecord = parseMIMEType('text/plain;charset=US-ASCII')
+  }
+
+  return { mimeType: mimeTypeRecord, body }
+}
+```
+
+#### 8.3.2 MIME 类型解析
+
+```javascript
+function parseMIMEType (input) {
+  input = removeHTTPWhitespace(input, true, true)
+  const position = { position: 0 }
+
+  // 提取 type (slash 之前的部分)
+  const type = collectASequenceOfCodePointsFast('/', input, position)
+  if (type.length === 0 || !HTTP_TOKEN_CODEPOINTS.test(type)) return 'failure'
+
+  position.position++  // 跳过 /
+
+  // 提取 subtype (分号或末尾之前的部分)
+  let subtype = collectASequenceOfCodePointsFast(';', input, position)
+  subtype = removeHTTPWhitespace(subtype, false, true)
+  if (subtype.length === 0 || !HTTP_TOKEN_CODEPOINTS.test(subtype)) return 'failure'
+
+  // 创建 MIME 记录
+  const mimeType = {
+    type: type.toLowerCase(),
+    subtype: subtype.toLowerCase(),
+    parameters: new Map(),
+    essence: `${type.toLowerCase()}/${subtype.toLowerCase()}`
+  }
+
+  // 解析参数 (分号分隔)
+  while (position.position < input.length) {
+    position.position++  // 跳过 ;
+
+    // 跳过空白
+    collectASequenceOfCodePoints(
+      char => HTTP_WHITESPACE_REGEX.test(char), input, position
+    )
+
+    // 参数名 (到 = 或 ; 或末尾)
+    let parameterName = collectASequenceOfCodePoints(
+      char => char !== ';' && char !== '=', input, position
+    ).toLowerCase()
+
+    if (position.position < input.length) {
+      if (input[position.position] === ';') continue  // 空参数值
+      position.position++  // 跳过 =
+    }
+
+    // 参数值 (可能带引号)
+    let parameterValue
+    if (input[position.position] === '"') {
+      // 引号值: 支持转义
+      parameterValue = collectAnHTTPQuotedString(input, position, true)
+      collectASequenceOfCodePointsFast(';', input, position)
+    } else {
+      // 非引号值
+      parameterValue = collectASequenceOfCodePointsFast(';', input, position)
+      parameterValue = removeHTTPWhitespace(parameterValue, false, true)
+    }
+
+    // 去重: 同名参数只保留第一个
+    if (parameterName.length !== 0 && !mimeType.parameters.has(parameterName)) {
+      mimeType.parameters.set(parameterName, parameterValue)
+    }
+  }
+
+  return mimeType
+}
+```
+
+#### 8.3.3 HTTP 引用字符串收集
+
+```javascript
+function collectAnHTTPQuotedString (input, position, extractValue = false) {
+  const positionStart = position.position
+  let value = ''
+
+  assert(input[position.position] === '"')
+  position.position++  // 跳过开头引号
+
+  while (true) {
+    // 收集非 " 和 \ 的字符
+    value += collectASequenceOfCodePoints(
+      char => char !== '"' && char !== '\\', input, position
+    )
+
+    if (position.position >= input.length) break
+
+    const quoteOrBackslash = input[position.position]
+    position.position++
+
+    if (quoteOrBackslash === '\\') {
+      // 转义字符
+      if (position.position >= input.length) { value += '\\'; break }
+      value += input[position.position]  // 取转义后的字符
+      position.position++
+    } else {
+      break  // 关闭引号
+    }
+  }
+
+  // extractValue: true 返回值, false 返回完整引号字符串
+  return extractValue ? value : input.slice(positionStart, position.position)
+}
+```
+
+---
+
+## 9. FormData 模块深度分析
+
+**文件**: `lib/web/fetch/formdata.js` (278 行)
+
+### 9.1 FormData 类
+
+```javascript
+class FormData {
+  #state = []    // { name, value }[] 数组
+
+  append (name, value, filename) {
+    name = webidl.converters.USVString(name)
+
+    if (webidl.is.Blob(value)) {
+      // Blob/File 值
+      value = webidl.converters.Blob(value)
+      if (filename !== undefined) {
+        filename = webidl.converters.USVString(filename)
+      }
+    } else {
+      // 字符串值
+      value = webidl.converters.USVString(value)
+    }
+
+    const entry = makeEntry(name, value, filename)
+    this.#state.push(entry)
+  }
+
+  delete (name) {
+    name = webidl.converters.USVString(name)
+    this.#state = this.#state.filter(entry => entry.name !== name)
+  }
+
+  get (name) {
+    name = webidl.converters.USVString(name)
+    const idx = this.#state.findIndex(entry => entry.name === name)
+    return idx === -1 ? null : this.#state[idx].value
+  }
+
+  getAll (name) {
+    name = webidl.converters.USVString(name)
+    return this.#state
+      .filter(entry => entry.name === name)
+      .map(entry => entry.value)
+  }
+
+  has (name) {
+    name = webidl.converters.USVString(name)
+    return this.#state.some(entry => entry.name === name)
+  }
+
+  set (name, value, filename) {
+    name = webidl.converters.USVString(name)
+    // ... WebIDL 转换
+
+    const entry = makeEntry(name, value, filename)
+    const idx = this.#state.findIndex(entry => entry.name === name)
+
+    if (idx !== -1) {
+      // 替换第一个匹配项, 删除其余同名项
+      this.#state = [
+        ...this.#state.slice(0, idx),
+        entry,
+        ...this.#state.slice(idx + 1).filter(e => e.name !== name)
+      ]
+    } else {
+      this.#state.push(entry)
+    }
+  }
+}
+```
+
+### 9.2 Entry 创建与边界生成
+
+```javascript
+function makeEntry (name, value, filename) {
+  if (typeof value === 'string') {
+    // 字符串值: 直接使用
+  } else {
+    // Blob/File 值
+    if (!webidl.is.File(value)) {
+      // 非 File 的 Blob 包装为 File (名称 "blob")
+      value = new File([value], 'blob', { type: value.type })
+    }
+    if (filename !== undefined) {
+      // 用指定文件名创建新 File
+      value = new File([value], filename, {
+        type: value.type,
+        lastModified: value.lastModified
+      })
+    }
+  }
+  return { name, value }
+}
+
+// Boundary 生成: "----formdata-undici-0" + 11 位随机数
+static getFormDataBoundary (formData) {
+  const boundary = formData.#boundary
+  if (boundary != null) return boundary
+
+  return formData.#boundary =
+    `----formdata-undici-0${random(1e11).toString().padStart(11, '0')}`
+}
+```
+
+### 9.3 迭代器支持
+
+```javascript
+iteratorMixin('FormData', FormData, getFormDataState, 'name', 'value')
+```
+
+这使得 `FormData` 支持 `for...of` 迭代:
+```javascript
+for (const [name, value] of formData) {
+  console.log(name, value)
+}
+```
+
+`iteratorMixin` 是 undici 的通用迭代器混入工具，为任何类添加 `entries()`, `keys()`, `values()`, `forEach()`, `Symbol.iterator` 方法。
+
+---
+
+## 10. 自定义事件体系
+
+**文件**: `lib/web/websocket/events.js` (332 行)
+
+### 10.1 MessageEvent
+
+```javascript
+class MessageEvent extends Event {
+  #eventInit
+
+  constructor (type, eventInitDict = {}) {
+    // 快速构造路径 (内部使用): 跳过 WebIDL 验证
+    if (type === kConstruct) {
+      super(arguments[1], arguments[2])
+      return
+    }
+
+    // 正常构造路径
+    super(type, eventInitDict)
+    this.#eventInit = eventInitDict
+  }
+
+  get data () { return this.#eventInit.data }
+  get origin () { return this.#eventInit.origin ?? '' }
+  get lastEventId () { return this.#eventInit.lastEventId ?? '' }
+  get source () { return this.#eventInit.source ?? null }
+  get ports () {
+    if (!Object.isFrozen(this.#eventInit.ports)) {
+      Object.freeze(this.#eventInit.ports)  // 惰性冻结
+    }
+    return this.#eventInit.ports ?? Object.freeze([])
+  }
+
+  // 高速工厂方法: 跳过 WebIDL 类型检查
+  static createFastMessageEvent (type, init) {
+    const messageEvent = new MessageEvent(kConstruct, type, init)
+    messageEvent.#eventInit = init
+    return messageEvent
+  }
+}
+```
+
+**性能优化**: `createFastMessageEvent()` 通过 `kConstruct` 哨兵值跳过构造器中的 WebIDL 验证，用于高频的内部事件分发。在 SSE 解析器的热路径中，每条消息都会创建 MessageEvent，这个优化很重要。
+
+### 10.2 CloseEvent
+
+```javascript
+class CloseEvent extends Event {
+  #eventInit
+
+  constructor (type, eventInitDict = {}) {
+    super(type, eventInitDict)
+    this.#eventInit = eventInitDict
+  }
+
+  get wasClean () { return this.#eventInit.wasClean ?? false }
+  get code () { return this.#eventInit.code ?? 0 }
+  get reason () { return this.#eventInit.reason ?? '' }
+}
+```
+
+### 10.3 ErrorEvent
+
+```javascript
+class ErrorEvent extends Event {
+  #eventInit
+
+  constructor (type, eventInitDict = {}) {
+    super(type, eventInitDict)
+    this.#eventInit = eventInitDict
+  }
+
+  get message () { return this.#eventInit.message ?? '' }
+  get filename () { return this.#eventInit.filename ?? '' }
+  get lineno () { return this.#eventInit.lineno ?? 0 }
+  get colno () { return this.#eventInit.colno ?? 0 }
+  get error () { return this.#eventInit.error ?? undefined }
+}
+```
+
+**共同设计模式**: 所有自定义事件都使用 `#eventInit` 私有字段存储初始化字典，getter 方法提供安全的默认值。这避免了直接暴露可变状态。
+
+
+---
+
+## 11. 对 AI Agent HTTP 传输层的借鉴
+
+### 11.1 Fetch 流式回调模式 -> laew Agent 循环
+
+undici 的 `fetching()` 使用回调驱动的异步模式，而不是简单的 `await`:
+
+```javascript
+// undici 模式: 回调驱动
+fetching({
+  request,
+  processResponse (response) { ... },      // 响应头到达
+  processResponseEndOfBody (response) { ... }, // 响应体完成
+  processResponseConsumeBody (response, data) { ... } // 响应体数据
+})
+```
+
+**laew 借鉴**: Agent 循环可以采用类似的回调驱动模式:
+
+```
+// laew 可以借鉴的模式
+runAgentLoop({
+  onTaskStart (task) { ... },       // 任务开始
+  onLLMResponse (response) { ... }, // LLM 响应头/首 token
+  onToolCall (tool) { ... },        // 工具调用
+  onToolResult (result) { ... },    // 工具结果
+  onTaskComplete (result) { ... }   // 任务完成
+})
+```
+
+回调驱动模式的优势是将异步流程分解为多个阶段，每个阶段可以独立处理错误和状态转换。
+
+### 11.2 Content-Encoding 管线 -> Agent 响应解压
+
+undici 支持 5 种内容编码 (gzip, deflate, br, zstd)，通过流式管线解压:
+
+```javascript
+pipeline = response.body.stream
+pipeline = pipeline.pipe(zlib.createGunzip())
+pipeline = pipeline.pipe(zlib.createBrotliDecompress())
+```
+
+**laew 借鉴**: 如果 LLM API 返回压缩响应 (如 Anthropic 支持 br)，可以复用 undici 的解压管线设计。
+
+### 11.3 Headers Guard -> Agent 权限控制
+
+undici 的 Headers Guard 系统可以借鉴到 Agent 的请求权限控制:
+
+```
+AgentRequest {
+  guard: 'none' | 'restricted' | 'immutable'
+  // restricted: 禁止修改 Authorization 等敏感 header
+  // immutable: 子 Agent 不能修改父 Agent 的请求头
+}
+```
+
+### 11.4 Proxy 过滤响应 -> Agent 响应脱敏
+
+undici 的 `filterResponse()` 使用 Proxy 实现透明的响应过滤:
+
+```javascript
+const filtered = new Proxy(response, {
+  get (target, prop) {
+    if (prop === 'status') return type === 'opaque' ? 0 : target.status
+    return Reflect.get(target, prop)
+  }
+})
+```
+
+**laew 借鉴**: 可以用 Proxy 对 LLM 响应进行脱敏处理，过滤敏感信息后再传递给上层 Agent。例如，SubAgent 的响应可以过滤掉包含 API key 的内容。
+
+### 11.5 WebSocketStream -> Agent 双向通信
+
+WebSocketStream 将 WebSocket 包装为标准的 ReadableStream + WritableStream:
+
+```javascript
+const { readable, writable } = await wsStream.opened
+// 可以与 pipeTo/pipeFrom 集成
+readable.pipeTo(transformStream).pipeTo(writable)
+```
+
+**laew 借鉴**: 如果需要与 LLM 建立持久连接 (如 WebSocket API)，可以用类似的 Stream 包装模式。
+
+### 11.6 FinalizationRegistry -> Agent 资源清理
+
+undici 使用 `FinalizationRegistry` 自动清理未消费的请求:
+
+```javascript
+const requestFinalizer = new FinalizationRegistry(({ stream, controller }) => {
+  if (stream && !stream.locked) {
+    controller.abort(new TypeError('Request was garbage collected'))
+  }
+})
+```
+
+**laew 借鉴**: Agent 的 AbortController 和 Session 资源可以用类似模式自动清理，防止内存泄漏。
+
+### 11.7 SSE 流式解析 -> LLM 流式响应
+
+undici 的 `EventSourceStream` 是一个完整的 SSE 解析器:
+
+- BOM 处理
+- 逐字节解析
+- 跨 chunk 行读取
+- 自动重连 + Last-Event-ID 断点续传
+
+**laew 借鉴**: LLM 的流式响应 (SSE) 解析可以直接复用 `EventSourceStream`，或者参考其设计实现专用的 SSE 解析器。关键优化点:
+- 零拷贝 `subarray()` 用于单 chunk 行
+- `Buffer` 比较避免 UTF-8 解码开销
+- 及时释放已消费 chunk 防止内存泄漏
+
+### 11.8 permessage-deflate -> Agent 消息压缩
+
+undici 的 WebSocket 压缩扩展:
+
+```javascript
+class PerMessageDeflate {
+  decompress (chunk, fin, callback) {
+    this.#inflate.write(chunk)
+    if (fin) this.#inflate.write(Buffer.from([0x00, 0x00, 0xFF, 0xFF]))
+    this.#inflate.flush(() => callback(null, Buffer.concat(...)))
+  }
+}
+```
+
+**laew 借鉴**: 对于大规模 Agent 协作场景，消息压缩可以显著减少传输开销。
+
+### 11.9 Cookie 管理 -> Agent Session 持久化
+
+undici 的 Cookie 管理模式:
+
+```javascript
+getCookies(headers)
+setCookie(headers, { name, value, expires, maxAge, domain, path, secure, httpOnly, sameSite })
+deleteCookie(headers, name)
+```
+
+**laew 借鉴**: Agent 的 Session 状态可以借鉴 Cookie 的过期策略 (expires/maxAge) 和域隔离 (domain/path) 机制。
+
+### 11.10 kConstruct 快速路径 -> Agent 内部高性能通道
+
+undici 使用 `kConstruct` 哨兵值区分内部和外部构造:
+
+```javascript
+// 构造器: 检查哨兵值
+constructor (type, eventInitDict) {
+  if (type === kConstruct) {
+    super(arguments[1], arguments[2])
+    return  // 跳过 WebIDL 验证
+  }
+  // ... 正常构造 (带 WebIDL 验证)
+}
+
+// 内部工厂: 传入哨兵值
+static createFast (type, init) {
+  return new MyClass(kConstruct, type, init)  // 跳过验证
+}
+```
+
+**laew 借鉴**: Agent 内部消息传递可以使用类似的模式，区分公开 API (严格验证) 和内部通道 (快速路径)。
+
+---
+
+## 12. 跨模块设计模式汇总
+
+### 12.1 规范步骤注释
+
+undici 的每个函数都严格按规范步骤注释:
+
+```javascript
+// 1. Let ev be a new EventSource object.
+// 2. Let settings be ev's relevant settings object.
+// 3. Let urlRecord be the result of encoding-parsing a URL given url.
+// 4. If urlRecord is failure, then throw a "SyntaxError" DOMException.
+// 5. Set ev's url to urlRecord.
+```
+
+这种注释方式使得代码审查和规范更新追踪变得容易。当规范更新时，只需找到对应步骤的代码进行修改。
+
+### 12.2 Inner/Outer 分离
+
+Request 和 Response 都有 inner state 和 outer wrapper 两层:
+
+- `makeRequest()` / `fromInnerRequest()`: 创建内部状态 / 从内部状态创建公开对象
+- `getRequestState()` / `getResponseState()`: 获取内部状态 (通过 `kState` 符号)
+
+这种分离使得:
+1. 内部操作不需要 WebIDL 验证 (直接操作 inner state)
+2. 公开 API 可以设置不同的 Guard (request/response/immutable)
+3. 克隆操作只影响内部状态，不影响持有引用的代码
+
+### 12.3 kConstruct 快速路径
+
+```javascript
+// 区分公开构造和内部构造
+if (type === kConstruct) {
+  super(arguments[1], arguments[2])
+  return  // 跳过 WebIDL 验证
+}
+```
+
+**性能收益**: 内部高频路径 (如 SSE 事件创建) 跳过 WebIDL 验证，减少对象创建开销。
+
+### 12.4 FinalizationRegistry + WeakRef
+
+用于自动资源清理:
+- `requestFinalizer`: Request 被 GC 时自动 abort
+- `streamRegistry`: Response 被 GC 时自动取消未消费的 stream
+- `dependentControllerMap`: WeakMap 跟踪克隆关系
+
+### 12.5 Proxy 过滤模式
+
+Response 的 filtered 版本使用 Proxy，无需创建子类:
+- `basic`: 过滤 Set-Cookie
+- `cors`: 只暴露 CORS 允许的 header
+- `opaque`: 隐藏所有信息
+
+### 12.6 位标志属性
+
+WebIDL 属性使用位运算:
+```javascript
+Clamp: 1 << 0, EnforceRange: 1 << 1, AllowShared: 1 << 2
+HasFlag = (flags, attr) => (flags & attr) === attr
+```
+
+### 12.7 预计算查找表
+
+Cookie 模块使用预计算的查找表:
+```javascript
+const IMFPaddedNumbers = Array.from({ length: 61 }, (_, i) =>
+  i.toString().padStart(2, '0')
+)
+```
+
+### 12.8 零拷贝 Buffer 操作
+
+多个模块使用 `subarray()` 避免内存分配:
+- ByteParser: 单 buffer 场景使用 `subarray()`
+- EventSourceStream: 单 chunk 行使用 `subarray()`
+- FormData: entries 使用 `subarray()`
+
+### 12.9 条件函数 vs 快速路径
+
+infra 模块提供两个版本的序列收集:
+- `collectASequenceOfCodePoints(condition, ...)`: 通用版本
+- `collectASequenceOfCodePointsFast(char, ...)`: 快速版本 (indexOf)
+
+根据场景选择合适的版本。
+
+### 12.10 事件工厂方法
+
+所有自定义事件都提供静态工厂方法:
+```javascript
+static createFastMessageEvent (type, init) {
+  return new MessageEvent(kConstruct, type, init)  // 跳过验证
+}
+```
+
+---
+
+## 13. laew 借鉴路线图
+
+### P0 (立即可做)
+
+| 编号 | 借鉴项 | 来源模块 | 说明 |
+|------|--------|---------|------|
+| P0-1 | SSE 流式解析器 | EventSourceStream | 复用或参考其 SSE 解析器处理 LLM 流式响应 |
+| P0-2 | WebIDL brand check | webidl/index.js | 为 Agent 公开 API 添加类型安全检查 |
+| P0-3 | Inner/Outer 分离 | request.js / response.js | Agent 内部状态与外部 API 分离 |
+| P0-4 | Content-Encoding 管线 | fetch/index.js | 支持 gzip/br/zstd 响应解压 |
+| P0-5 | 零拷贝 Buffer 处理 | receiver.js / eventsource-stream.js | 工具输出的 Buffer 处理优化 |
+
+### P1 (近期规划)
+
+| 编号 | 借鉴项 | 来源模块 | 说明 |
+|------|--------|---------|------|
+| P1-1 | 回调驱动异步模式 | fetching() | Agent 循环用回调替代阻塞 await |
+| P1-2 | Proxy 响应过滤 | response.js | LLM 响应脱敏 |
+| P1-3 | Headers Guard | headers.js | Agent 请求权限控制 |
+| P1-4 | FinalizationRegistry | request.js / body.js | Agent 资源自动清理 |
+| P1-5 | kConstruct 快速路径 | events.js | 内部高频路径跳过验证 |
+| P1-6 | 预计算查找表 | cookies/util.js | IMF 日期/常量表预计算 |
+
+### P2 (长期规划)
+
+| 编号 | 借鉴项 | 来源模块 | 说明 |
+|------|--------|---------|------|
+| P2-1 | WebSocketStream 包装 | stream/websocketstream.js | Agent 双向持久通信 |
+| P2-2 | permessage-deflate | permessage-deflate.js | Agent 消息压缩 |
+| P2-3 | Cookie 过期策略 | cookies/ | Session 状态过期管理 |
+| P2-4 | Cache 事务性操作 | cache/cache.js | Agent 结果缓存 (带原子批量操作) |
+| P2-5 | Port 安全列表 | fetch/constants.js | Agent 网络访问控制 |
+| P2-6 | 字典转换器 | webidl/index.js | Agent 配置验证 |
+
+---
+
+## 附录 A: 文件索引
+
+| 文件路径 | 行数 | 职责 |
+|---------|------|------|
+| `lib/web/fetch/index.js` | 2,426 | Fetch 核心循环 (fetching/mainFetch/schemeFetch/httpFetch) |
+| `lib/web/fetch/util.js` | 1,525 | 规范工具函数 (referrer/MIME/InflateStream/端口检查) |
+| `lib/web/fetch/request.js` | 1,144 | Request 类 (41 步构造器/AbortController/克隆) |
+| `lib/web/fetch/response.js` | 639 | Response 类 (Proxy 过滤/静态工厂) |
+| `lib/web/fetch/headers.js` | 719 | Headers + HeadersList (Guard/二分排序/cookie 特殊) |
+| `lib/web/fetch/body.js` | 547 | Body mixin (extractBody/consumeBody/7 种消费方式) |
+| `lib/web/fetch/data-url.js` | 596 | Data URL 处理 + MIME 类型解析 |
+| `lib/web/fetch/formdata.js` | 278 | FormData (append/delete/get/set + iterator) |
+| `lib/web/fetch/constants.js` | 131 | 规范常量 (CORS/重定向/禁止端口/策略) |
+| `lib/web/fetch/global.js` | 40 | 全局 Origin 管理 |
+| `lib/web/websocket/websocket.js` | 781 | WebSocket 主类 (send/close/handler) |
+| `lib/web/websocket/connection.js` | 330 | WebSocket 握手 (nonce/SHA-1 验证) |
+| `lib/web/websocket/frame.js` | 128 | 帧编解码 (masking/快速文本帧) |
+| `lib/web/websocket/receiver.js` | 508 | 接收解析器 (状态机/零拷贝/控制帧) |
+| `lib/web/websocket/sender.js` | 110 | 发送队列 (cork/uncork 优化) |
+| `lib/web/websocket/permessage-deflate.js` | 100 | 压缩扩展 (RFC 7692) |
+| `lib/web/websocket/events.js` | 332 | MessageEvent/CloseEvent/ErrorEvent |
+| `lib/web/websocket/constants.js` | 127 | WebSocket 常量 |
+| `lib/web/websocket/stream/websocketstream.js` | 498 | WebSocketStream (Readable+Writable) |
+| `lib/web/websocket/stream/websocketerror.js` | 104 | WebSocketError (closeCode/reason) |
+| `lib/web/eventsource/eventsource.js` | 493 | EventSource 主类 (连接/重连/事件分发) |
+| `lib/web/eventsource/eventsource-stream.js` | 521 | SSE 流解析器 (逐字节/BOM/跨 chunk) |
+| `lib/web/eventsource/util.js` | 60 | CORS 请求创建 |
+| `lib/web/cache/cache.js` | 862 | Cache 类 (匹配/批量操作/事务) |
+| `lib/web/cache/cachestorage.js` | 152 | CacheStorage (open/delete/keys) |
+| `lib/web/cache/util.js` | 45 | URL 比较 + Vary 处理 |
+| `lib/web/cookies/index.js` | 199 | Cookie API (get/set/delete) |
+| `lib/web/cookies/parse.js` | 317 | Set-Cookie 解析器 (RFC 6265bis) |
+| `lib/web/cookies/util.js` | 353 | Cookie 验证 + 序列化 + IMF 日期 |
+| `lib/web/cookies/constants.js` | 12 | Cookie 大小限制 |
+| `lib/web/webidl/index.js` | 1,004 | WebIDL 类型系统 (转换/检查/属性) |
+| `lib/web/infra/index.js` | 230 | WHATWG Infra (序列收集/Base64/同构) |
+| `lib/encoding/index.js` | 34 | UTF-8 解码 |
+
+**总计**: ~14,060+ 行代码，覆盖 Fetch API / WebSocket / EventSource / Cache / Cookies / WebIDL / Infra / Encoding 8 大模块。
+
+---
+
+## 附录 B: 关键函数名速查
+
+### Fetch API
+- `fetch()` -- 公共入口
+- `fetching()` -- 主编排器
+- `Fetch` -- 内部状态机类 (ongoing/terminated/aborted)
+- `mainFetch()` -- 协议路由
+- `schemeFetch()` -- 本地协议处理 (about/blob/data/file)
+- `httpFetch()` -- HTTP 请求处理
+- `httpRedirectFetch()` -- 重定向处理 (最多 20 次)
+- `httpNetworkOrCacheFetch()` -- 网络/缓存协商
+- `httpNetworkFetch()` -- 网络分发 (agent.dispatch)
+- `abortFetch()` -- 中止处理
+- `finalizeAndReportTiming()` -- 性能计时
+
+### Headers
+- `HeadersList.append()` -- 追加 header
+- `HeadersList.toSortedArray()` -- 二分排序 (HPACK)
+- `Headers.getSetCookie()` -- 获取 Set-Cookie 列表
+- `filterHeadersList()` -- 过滤响应头
+
+### Body
+- `extractBody()` -- 提取 body (7 种类型)
+- `consumeBody()` -- 消费 body
+- `fullyReadBody()` -- 完全读取 body
+- `readAllBytes()` -- 读取所有字节
+- `bodyMixinMethods()` -- 7 种消费方法
+
+### Request/Response
+- `makeRequest()` -- 创建内部请求 (30+ 默认字段)
+- `fromInnerRequest()` / `fromInnerResponse()` -- 从内部状态创建公开对象
+- `cloneRequest()` / `cloneResponse()` -- 克隆请求/响应
+- `filterResponse()` -- Proxy 过滤响应
+- `makeNetworkError()` -- 创建网络错误响应
+- `makeResponse()` -- 创建响应
+
+### WebSocket
+- `establishWebSocketConnection()` -- 建立连接 (握手)
+- `closeWebSocketConnection()` -- 关闭连接
+- `failWebsocketConnection()` -- 连接失败处理
+- `ByteParser` -- 帧解析状态机 (INFO/PAYLOADLENGTH_16/PAYLOADLENGTH_64/READ_DATA)
+- `WebsocketFrameSend` -- 帧发送 (mask + FIN + opcode)
+- `SendQueue` -- 发送队列 (cork/uncork)
+- `PerMessageDeflate.decompress()` -- 压缩解压 (RFC 7692 tail bytes)
+
+### EventSource
+- `EventSource.#connect()` -- 连接
+- `EventSource.#reconnect()` -- 重连 (reconnectionTime + Last-Event-ID)
+- `EventSourceStream._transform()` -- SSE 主解析循环
+- `EventSourceStream.#parseLine()` -- 行解析 (DATA/EVENT/ID/RETRY)
+- `EventSourceStream.#processEvent()` -- 事件分发
+- `EventSourceStream.#handleBOM()` -- BOM 处理
+- `EventSourceStream.#readLine()` -- 跨 chunk 行读取
+
+### Cache
+- `Cache.#queryCache()` -- 缓存查询
+- `Cache.#batchCacheOperations()` -- 原子批量操作 (备份/回滚)
+- `Cache.#requestMatchesCachedItem()` -- 匹配算法 (URL + Vary)
+- `Cache.addAll()` -- 并发 fetch + 批量写入
+
+### Cookies
+- `parseSetCookie()` -- Set-Cookie 解析 (RFC 6265bis)
+- `parseUnparsedAttributes()` -- 属性递归解析
+- `stringify()` -- Cookie 序列化 (含 __Secure-/__Host- 前缀处理)
+- `validateCookieName()` / `validateCookieValue()` / `validateCookieDomain()` -- 验证
+- `toIMFDate()` -- RFC 7231 日期格式 (预计算查找表)
+
+### WebIDL
+- `webidl.brandCheck()` -- 品牌检查 (Symbol.hasInstance)
+- `webidl.converters.*` -- 类型转换器 (DOMString/USVString/boolean/整数/...)
+- `webidl.util.ConvertToInt()` -- 整数转换 (EnforceRange/Clamp/默认)
+- `webidl.dictionaryConverter()` -- 字典转换器 (字典序排序)
+- `webidl.sequenceConverter()` -- 序列转换器 (Symbol.iterator)
+- `webidl.recordConverter()` -- 记录转换器 (Proxy 感知)
+- `webidl.util.getCopyOfBytesHeldByBufferSource()` -- BufferSource 字节拷贝
+- `webidl.attributes.*` -- 属性位标志
+
+### Infra
+- `collectASequenceOfCodePoints()` / `collectASequenceOfCodePointsFast()` -- 序列收集
+- `forgivingBase64()` -- Base64 解码 (容错)
+- `isomorphicDecode()` / `isomorphicEncode()` -- 同构编解码
+- `parseMIMEType()` -- MIME 类型解析 (type/subtype/parameters)
+- `dataURLProcessor()` -- Data URL 处理
+- `collectAnHTTPQuotedString()` -- HTTP 引用字符串收集
+- `utf8DecodeBytes()` -- UTF-8 解码 (BOM 剥离)
+
+---
+
+## 附录 C: 协议规范对齐索引
+
+| 模块 | 对齐规范 | 关键条款 |
+|------|---------|---------|
+| Fetch API | WHATWG Fetch Standard | Section 2: Fetching, Section 5: Fetch API |
+| Headers | WHATWG Fetch Standard | Section 2.1: Headers class |
+| Request | WHATWG Fetch Standard | Section 2.2: Request class (41 步构造器) |
+| Response | WHATWG Fetch Standard | Section 2.3: Response class |
+| WebSocket | RFC 6455 | Section 4: Opening Handshake, Section 5: Data Framing |
+| WebSocketStream | W3C WebSocketStream | Stream-based WebSocket API |
+| EventSource | WHATWG HTML Standard | Section 9.2.6: Server-sent events |
+| Cache API | W3C Service Worker | Section 4: Cache API |
+| Cookies | RFC 6265bis | Section 5.4: Set-Cookie, Section 5.5: Cookie |
+| WebIDL | W3C WebIDL | Section 3.2: Types, Section 3.3: Dictionary |
+| Infra | WHATWG Infra Standard | Section 4: Byte sequences, Section 8: Encoding |
+| MIME | WHATWG MIME Sniffing | Section 2: MIME Type |
+
+---
+
+## 附录 D: 安全设计汇总
+
+| 安全机制 | 来源模块 | 说明 |
+|---------|---------|------|
+| 端口安全列表 | fetch/constants.js | 70+ 已知不安全端口 (SMTP/Telnet/RPC/NFS) |
+| 内容编码层数限制 | fetch/index.js | 最多 5 层 (CVE 修复, 防止解压炸弹) |
+| CORS 机制 | fetch/index.js | 三种模式 (no-cors/cors/same-origin) |
+| Referrer 策略 | fetch/util.js | 8 种策略 (no-referrer -> unsafe-url) |
+| Header Guard | fetch/headers.js | 5 级 guard (none/request/response/immutable/request-no-cors) |
+| Brand Check | webidl/index.js | Symbol.hasInstance 精确类型检查 |
+| BufferSource 拷贝 | webidl/index.js | 始终拷贝字节, 防止后续修改 |
+| WebSocket Mask | websocket/frame.js | 4 字节随机 mask (防缓存投毒) |
+| Sec-WebSocket-Accept | websocket/connection.js | SHA-1 + 固定 UID (防握手伪造) |
+| permessage-deflate 大小限制 | websocket/permessage-deflate.js | maxPayloadSize 防止解压炸弹 |
+| Cookie CTL 检查 | cookies/parse.js | 控制字符过滤 |
+| Cookie 大小限制 | cookies/parse.js | name+value <= 4096 字节 |
+| Cookie Domain 验证 | cookies/util.js | RFC 1034/1123 标签规则 |
+| Cookie 安全前缀 | cookies/util.js | __Secure- 和 __Host- 前缀强制安全属性 |
+| Data URL BOM | eventsource/eventsource-stream.js | BOM 自动剥离 |
+| Event ID NULL 检查 | eventsource/util.js | Last-Event-ID 不允许 NULL 字符 |
+
