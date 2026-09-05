@@ -6,17 +6,19 @@
 
 1. [概览与架构总览](#1-概览与架构总览)
 2. [Fetch API 全链路深度分析](#2-fetch-api-全链路深度分析)
-3. [WebSocket 协议实现深度分析](#3-websocket-协议实现深度分析)
-4. [EventSource / SSE 流式解析深度分析](#4-eventsource--sse-流式解析深度分析)
-5. [Cache API 深度分析](#5-cache-api-深度分析)
-6. [Cookies 模块深度分析](#6-cookies-模块深度分析)
-7. [WebIDL 类型系统深度分析](#7-webidl-类型系统深度分析)
-8. [基础设施模块 (infra / encoding / data-url)](#8-基础设施模块)
-9. [FormData 模块深度分析](#9-formdata-模块深度分析)
-10. [自定义事件体系 (MessageEvent / CloseEvent / ErrorEvent)](#10-自定义事件体系)
-11. [对 AI Agent HTTP 传输层的借鉴](#11-对-ai-agent-http-传输层的借鉴)
-12. [跨模块设计模式汇总](#12-跨模块设计模式汇总)
-13. [laew 借鉴路线图](#13-laew-借鉴路线图)
+3. [Subresource Integrity (SRI) 子资源完整性校验](#3-subresource-integrity-sri-子资源完整性校验)
+4. [WebSocket 协议实现深度分析](#4-websocket-协议实现深度分析)
+5. [EventSource / SSE 流式解析深度分析](#5-eventsource--sse-流式解析深度分析)
+6. [Cache API 深度分析](#6-cache-api-深度分析)
+7. [Cache 存储层 (SQLite / Memory)](#7-cache-存储层-sqlite--memory)
+8. [Cookies 模块深度分析](#8-cookies-模块深度分析)
+9. [WebIDL 类型系统深度分析](#9-webidl-类型系统深度分析)
+10. [基础设施模块 (infra / encoding / data-url)](#10-基础设施模块)
+11. [FormData 模块深度分析](#11-formdata-模块深度分析)
+12. [自定义事件体系 (MessageEvent / CloseEvent / ErrorEvent)](#12-自定义事件体系)
+13. [对 AI Agent HTTP 传输层的借鉴](#13-对-ai-agent-http-传输层的借鉴)
+14. [跨模块设计模式汇总](#14-跨模块设计模式汇总)
+15. [laew 借鉴路线图](#15-laew-借鉴路线图)
 
 ---
 
@@ -41,7 +43,7 @@ lib/web/
 │   ├── global.js        # 全局 Origin (40 行)
 │   ├── data-url.js      # Data URL + MIME 解析 (596 行)
 │   └── formdata.js      # FormData (278 行)
-├── websocket/           # WebSocket RFC 6455 (~2,000+ 行)
+├── websocket/           # WebSocket RFC 6455 + RFC 8441 (~2,900 行)
 │   ├── websocket.js     # WebSocket 主类 (781 行)
 │   ├── connection.js    # 握手建立连接 (330 行)
 │   ├── frame.js         # 帧编解码 (128 行)
@@ -50,10 +52,11 @@ lib/web/
 │   ├── events.js        # MessageEvent/CloseEvent/ErrorEvent (332 行)
 │   ├── constants.js     # WebSocket 常量 (127 行)
 │   ├── permessage-deflate.js  # 压缩扩展 (100 行)
+│   ├── util.js          # URL 记录/子协议验证 (348 行)
 │   └── stream/          # WebSocketStream API
 │       ├── websocketstream.js   # WebSocketStream (498 行)
 │       └── websocketerror.js    # WebSocketError (104 行)
-├── eventsource/         # EventSource SSE (~580 行)
+├── eventsource/         # EventSource SSE (~1,080 行)
 │   ├── eventsource.js   # EventSource 主类 (493 行)
 │   ├── eventsource-stream.js  # SSE 流解析器 (521 行)
 │   └── util.js          # CORS 工具 (60 行)
@@ -61,17 +64,23 @@ lib/web/
 │   ├── cache.js         # Cache 类 (862 行)
 │   ├── cachestorage.js  # CacheStorage (152 行)
 │   └── util.js          # URL 比较 + Vary 处理 (45 行)
-├── cookies/             # Cookie 处理 (~420 行)
+├── cookies/             # Cookie 处理 (~870 行)
 │   ├── index.js         # getCookies/setCookie/deleteCookie (199 行)
 │   ├── parse.js         # Set-Cookie 解析器 (317 行)
 │   ├── util.js          # 验证 + 序列化 (353 行)
 │   └── constants.js     # Cookie 大小限制 (12 行)
+├── subresource-integrity/  # SRI 子资源完整性校验 (~307 行)
+│   └── subresource-integrity.js  # bytesMatch, parseMetadata, getStrongestMetadata
 ├── webidl/              # WebIDL 类型系统 (~1,000 行)
 │   └── index.js         # 转换器 + brand check (1,004 行)
 ├── infra/               # WHATWG Infra 规范 (~230 行)
 │   └── index.js         # 序列收集 + Base64 + 同构编解码
 └── encoding/            # WHATWG Encoding 规范 (~34 行)
     └── index.js         # UTF-8 解码
+
+lib/cache/               # 缓存存储层 (~750 行)
+├── sqlite-cache-store.js  # SQLite WAL 持久化 (469 行)
+└── memory-cache-store.js  # 内存 LRU (279 行)
 ```
 
 ### 1.3 核心架构特征
@@ -91,15 +100,17 @@ lib/web/
 | 模块 | 文件数 | 总行数 | 核心类/函数 |
 |------|--------|--------|------------|
 | Fetch API | 10 | ~7,860 | `fetch()`, `fetching()`, `mainFetch()`, `Headers`, `Request`, `Response`, `Body` |
-| WebSocket | 10 | ~2,800 | `WebSocket`, `ByteParser`, `WebsocketFrameSend`, `SendQueue`, `PerMessageDeflate`, `WebSocketStream` |
-| EventSource | 3 | ~580 | `EventSource`, `EventSourceStream` |
-| Cache | 3 | ~260 | `Cache`, `CacheStorage` |
-| Cookies | 4 | ~420 | `getCookies()`, `setCookie()`, `parseSetCookie()`, `stringify()` |
+| WebSocket | 12 | ~2,900 | `WebSocket`, `ByteParser`, `WebsocketFrameSend`, `SendQueue`, `PerMessageDeflate`, `WebSocketStream`, `WebSocketError` |
+| EventSource | 3 | ~1,080 | `EventSource`, `EventSourceStream` |
+| Cache API | 3 | ~1,060 | `Cache`, `CacheStorage` |
+| Cache 存储层 | 2 | ~750 | `SqliteCacheStore`, `MemoryCacheStore` |
+| Subresource Integrity | 1 | ~307 | `bytesMatch()`, `parseMetadata()`, `getStrongestMetadata()` |
+| Cookies | 4 | ~870 | `getCookies()`, `setCookie()`, `parseSetCookie()`, `stringify()` |
 | WebIDL | 1 | ~1,004 | `brandCheck()`, `ConvertToInt()`, `dictionaryConverter()`, `sequenceConverter()` |
 | Infra/Encoding | 2 | ~264 | `collectASequenceOfCodePoints()`, `forgivingBase64()`, `utf8DecodeBytes()` |
-| FormData | 1 | ~278 | `FormData`, `makeEntry()` |
+| FormData | 2 | ~590 | `FormData`, `makeEntry()`, `parseFormData()` |
 | Data URL | 1 | ~596 | `dataURLProcessor()`, `parseMIMEType()` |
-| **总计** | **36** | **~14,060** | |
+| **总计** | **42** | **~16,300** | |
 
 
 ---
@@ -1201,10 +1212,385 @@ onResponseStart (statusCode, headers, ...) {
 
 **安全考量**: 最多 5 层编码限制是针对 CVE 的修复，防止解压炸弹 (zip bomb) 攻击。攻击者可能嵌套多层压缩，使最终解压后的数据量呈指数级增长。
 
+### 2.8 fetch 全链路端到端时序图
+
+以下是从 `undici.fetch()` 入口到 `Response` 构造完成的完整调用链时序：
+
+```
+用户代码                     Web API 层                     Dispatcher             网络
+  │                            │                              │                    │
+  │  fetch(url, init)          │                              │                    │
+  │──────────────────────────>│                              │                    │
+  │                            │                              │                    │
+  │  ┌─────────────────────┐  │                              │                    │
+  │  │ new Request(input)  │  │  ① 构造 Request:             │                    │
+  │  │  - URL 解析          │  │     - 41 步规范对齐          │                    │
+  │  │  - Header 初始化     │  │     - Headers Guard 设置     │                    │
+  │  │  - Body 提取         │  │     - AbortSignal 绑定       │                    │
+  │  │  - Referder 策略     │  │                              │                    │
+  │  └─────────────────────┘  │                              │                    │
+  │                            │                              │                    │
+  │                            │  fetching({ request, ... })  │                    │
+  │                            │  ② 创建 Fetch 控制器         │                    │
+  │                            │  ③ queueMicrotask(mainFetch) │                    │
+  │                            │────────── 微任务 ───────────>│                    │
+  │                            │                              │                    │
+  │                            │  mainFetch(fetchParams)      │                    │
+  │                            │  ④ 协议路由:                  │                    │
+  │                            │     ┌─ data: → schemeFetch   │                    │
+  │                            │     ├─ blob: → schemeFetch   │                    │
+  │                            │     ├─ http: → httpFetch     │                    │
+  │                            │     └─ https: → httpFetch    │                    │
+  │                            │                              │                    │
+  │                            │  httpNetworkOrCacheFetch()   │                    │
+  │                            │  ⑤ 设置请求头:                │                    │
+  │                            │     - Accept, Accept-Language│                    │
+  │                            │     - Content-Length         │                    │
+  │                            │     - Origin, Referer        │                    │
+  │                            │     - User-Agent             │                    │
+  │                            │     - Accept-Encoding        │                    │
+  │                            │                              │                    │
+  │                            │  httpNetworkFetch()          │                    │
+  │                            │  ⑥ dispatcher.dispatch()     │                    │
+  │                            │─────────────────────────────>│                    │
+  │                            │                              │   HTTP REQUEST     │
+  │                            │                              │───────────────────>│
+  │                            │                              │                    │
+  │                            │                              │   HTTP RESPONSE    │
+  │                            │  onResponseStart()           │<───────────────────│
+  │                            │  ⑦ 解析 Content-Encoding     │                    │
+  │                            │     构建解压管线              │                    │
+  │                            │                              │                    │
+  │                            │  onResponseData() × N        │                    │
+  │                            │  ⑧ ReadableStream 推送 chunk │                    │
+  │                            │                              │                    │
+  │                            │  onResponseEnd()             │                    │
+  │                            │  ⑨ 关闭 stream               │                    │
+  │                            │                              │                    │
+  │                            │  processResponse(response)   │                    │
+  │                            │  ⑩ SRI 校验 (如有)           │                    │
+  │                            │      bytesMatch()            │                    │
+  │                            │                              │                    │
+  │                            │  fetchFinale()               │                    │
+  │                            │  ⑪ finalizeAndReportTiming  │                    │
+  │                            │                              │                    │
+  │  p.resolve(Response)       │                              │                    │
+  │<───────────────────────────│                              │                    │
+  │                            │                              │                    │
+  │  await response.json()     │                              │                    │
+  │──────────────────────────>│                              │                    │
+  │  ┌─────────────────────┐  │                              │                    │
+  │  │ extractBody()       │  │  ⑫ 消费 Body stream         │                    │
+  │  │ utf8Decode()        │  │     解码 UTF-8               │                    │
+  │  │ JSON.parse()        │  │     解析 JSON                │                    │
+  │  └─────────────────────┘  │                              │                    │
+  │                            │                              │                    │
+  │  { data }                  │                              │                    │
+  │<───────────────────────────│                              │                    │
+```
+
+**关键回调**:
+- `processResponse`: 响应头到达时调用 (可多次, 用于重定向)
+- `processResponseEndOfBody`: 响应体完全消费后调用
+- `processResponseConsumeBody`: 体消费过程中产生数据时调用
+- `processRequestBodyChunkLength`: 请求体 chunk 发送时进度回调
 
 ---
 
-## 3. WebSocket 协议实现深度分析
+## 3. Subresource Integrity (SRI) 子资源完整性校验
+
+**文件**: `lib/web/subresource-integrity/subresource-integrity.js` (307 行)
+
+SRI (Subresource Integrity) 是 W3C WebAppSec 规范定义的浏览器安全机制，通过密码学哈希验证子资源 (脚本/样式表) 未被篡改。undici 在 `mainFetch()` 的第 20 步完整实现了 SRI 校验流程。
+
+### 3.1 算法集合与合规性
+
+SRI 规范定义有效的哈希算法 token 集合为: `« "sha256", "sha384", "sha512" »`。这个集合是有序的，后面的算法更强。undici 在启动时根据 Node.js crypto 模块的实际支持情况动态裁剪：
+
+```javascript
+const validSRIHashAlgorithmTokenSet = new Map([
+  ['sha256', 0],
+  ['sha384', 1],
+  ['sha512', 2]
+])
+
+// 启动时检测 Node.js 的 crypto 支持
+if (runtimeFeatures.has('crypto')) {
+  const crypto = require('node:crypto')
+  const cryptoHashes = crypto.getHashes()
+
+  // Node.js 编译时若未启用 OpenSSL，清空整个集合
+  if (cryptoHashes.length === 0) {
+    validSRIHashAlgorithmTokenSet.clear()
+  }
+
+  // 删除 Node.js 不支持的算法
+  for (const algorithm of validSRIHashAlgorithmTokenSet.keys()) {
+    if (cryptoHashes.includes(algorithm) === false) {
+      validSRIHashAlgorithmTokenSet.delete(algorithm)
+    }
+  }
+}
+```
+
+**关键设计**: 算法集合是模块级单例，在首次加载时一次性检测并裁剪。后续调用直接使用 `Map.prototype.has/get`，通过 bind 绑定避免重复分配：
+
+```javascript
+const isValidSRIHashAlgorithm = Map.prototype.has.bind(validSRIHashAlgorithmTokenSet)
+const getSRIHashAlgorithmIndex = Map.prototype.get.bind(validSRIHashAlgorithmTokenSet)
+```
+
+### 3.2 主入口: `bytesMatch()`
+
+`bytesMatch()` 是 SRI 校验的核心函数，遵循规范 ["Does response match metadata list?"](https://w3c.github.io/webappsec-subresource-integrity/#does-response-match-metadatalist)：
+
+```javascript
+const bytesMatch = runtimeFeatures.has('crypto') === false || validSRIHashAlgorithmTokenSet.size === 0
+  ? () => true  // 无 crypto 支持 → 默认放行
+  : (bytes, metadataList) => {
+      // 1. 解析 metadata list
+      const parsedMetadata = parseMetadata(metadataList)
+
+      // 2. 空列表 → 匹配成功
+      if (parsedMetadata.length === 0) {
+        return true
+      }
+
+      // 3. 取最强算法的 metadata 集合
+      const metadata = getStrongestMetadata(parsedMetadata)
+
+      // 4. 逐项尝试匹配 (任一通过即可)
+      for (const item of metadata) {
+        const algorithm = item.alg
+        const expectedValue = item.val
+
+        // 5. 计算实际哈希 (使用 crypto.hash 统一接口)
+        const actualValue = applyAlgorithmToBytes(algorithm, bytes)
+
+        // 6. 大小写敏感匹配 (允许 base64url 格式)
+        if (caseSensitiveMatch(actualValue, expectedValue)) {
+          return true
+        }
+      }
+
+      // 5. 全部不匹配 → 失败
+      return false
+    }
+```
+
+**降级策略**: 当 Node.js 未编译 crypto 模块时，函数直接返回 `true` (放行请求)。这是规范允许的行为 — 无效哈希默认放行。
+
+### 3.3 元数据解析: `parseMetadata()`
+
+解析 `integrity` 属性值 (例如 `"sha384-abc... sha512-def..."`)：
+
+```javascript
+function parseMetadata (metadata) {
+  const result = []
+
+  // 按空格分割多个哈希声明
+  for (const item of metadata.split(' ')) {
+    // 1. 按 ? 分割 expression-and-options (丢弃 options)
+    const expressionAndOptions = item.split('?', 1)
+
+    // 2. 按 - 分割 algorithm-expression
+    const algorithmExpression = expressionAndOptions[0]
+    const algorithmAndValue = [
+      algorithmExpression.slice(0, 6),    // "sha256" / "sha384" / "sha512"
+      algorithmExpression.slice(7)         // base64 hash
+    ]
+
+    // 3. 验证算法 token 是否有效
+    if (!isValidSRIHashAlgorithm(algorithmAndValue[0])) {
+      continue
+    }
+
+    // 4. 构造 metadata 对象
+    result.push({
+      alg: algorithmAndValue[0],
+      val: algorithmAndValue[1]
+    })
+  }
+
+  return result
+}
+```
+
+**合规注释**: 规范的解析更复杂 (需处理 `U+003F` 和 `U+002D` 的位置)，undici 采用简化的前 6 字符切片，对三种已知算法足够安全。
+
+### 3.4 最强算法选择: `getStrongestMetadata()`
+
+当 integrity 属性包含多个哈希声明时，必须选择算法强度最高的一个进行校验：
+
+```javascript
+function getStrongestMetadata (metadataList) {
+  const result = []
+  let strongest = null
+
+  for (const item of metadataList) {
+    // 第一个 item 直接设置
+    if (result.length === 0) {
+      result.push(item)
+      strongest = item
+      continue
+    }
+
+    const currentIndex = getSRIHashAlgorithmIndex(strongest.alg)
+    const newIndex = getSRIHashAlgorithmIndex(item.alg)
+
+    if (newIndex < currentIndex) {
+      continue  // 新算法更弱 → 跳过
+    } else if (newIndex > currentIndex) {
+      strongest = item
+      result[0] = item
+      result.length = 1  // 重置为仅含新最强
+    } else {
+      result.push(item)  // 相同强度 → 追加
+    }
+  }
+
+  return result
+}
+```
+
+**设计要点**:
+- 规范要求 "getting the strongest metadata from the set of metadata"
+- SHA-512 > SHA-384 > SHA-256 (由 Map 插入顺序决定)
+- 最终返回的集合只包含最强算法 (可能有多个相同强度的哈希值)
+
+### 3.5 Base64 兼容匹配: `caseSensitiveMatch()`
+
+SRI 允许 base64 (标准) 和 base64url (URL 安全) 两种编码：
+
+```javascript
+function caseSensitiveMatch (actualValue, expectedValue) {
+  // 1. 移除 padding (=) 字符
+  let actualLength = actualValue.length
+  if (actualValue[actualLength - 1] === '=') actualLength -= 1
+  if (actualValue[actualLength - 1] === '=') actualLength -= 1
+
+  let expectedLength = expectedValue.length
+  if (expectedValue[expectedLength - 1] === '=') expectedLength -= 1
+  if (expectedValue[expectedLength - 1] === '=') expectedLength -= 1
+
+  // 2. 长度不等 → 失败
+  if (actualLength !== expectedLength) return false
+
+  // 3. 逐字符比较 (支持 + ↔ - 和 / ↔ _ 互换)
+  for (let i = 0; i < actualLength; ++i) {
+    if (
+      actualValue[i] === expectedValue[i] ||
+      (actualValue[i] === '+' && expectedValue[i] === '-') ||
+      (actualValue[i] === '/' && expectedValue[i] === '_')
+    ) {
+      continue
+    }
+    return false
+  }
+
+  return true
+}
+```
+
+**兼容性**: base64 与 base64url 的区别在于第 62/63 字符 (`+/` vs `-_`)，WPT 测试要求 "be liberal with padding"。
+
+### 3.6 Fetch 流程中的 SRI 集成
+
+在 `mainFetch()` 第 20 步，undici 在获取响应体后执行 SRI 校验：
+
+```javascript
+// lib/web/fetch/index.js 第 770-805 行
+if (request.integrity) {
+  const processBodyError = (reason) =>
+    fetchFinale(fetchParams, makeNetworkError(reason))
+
+  // opaque 响应或无 body → 直接失败
+  if (request.responseTainting === 'opaque' || response.body == null) {
+    processBodyError(response.error)
+    return
+  }
+
+  const processBody = (bytes) => {
+    // 关键: 调用 bytesMatch 进行 SRI 校验
+    if (!bytesMatch(bytes, request.integrity)) {
+      processBodyError('integrity mismatch')
+      return
+    }
+
+    // 校验通过: 用字节数组构造 body
+    response.body = safelyExtractBody(bytes)[0]
+    fetchFinale(fetchParams, response)
+  }
+
+  // 读取全部 body 后执行校验
+  fullyReadBody(response.body, processBody, processBodyError)
+} else {
+  fetchFinale(fetchParams, response)
+}
+```
+
+### 3.7 SRI 校验完整流程图
+
+```
+Request.integrity = "sha384-abc... sha512-def..."
+         │
+         ▼
+   response 到达 mainFetch()
+         │
+         ▼
+   request.integrity 非空?
+    │           │
+   Yes          No → fetchFinale() 直接返回
+    │
+    ▼
+   responseTainting === 'opaque'?
+    │           │
+   Yes          No
+    │           │
+    ▼           ▼
+   FAIL    fullyReadBody() 读取所有字节
+                │
+                ▼
+          parseMetadata("sha384-abc... sha512-def...")
+                │
+                ▼ 解析结果:
+          [{alg:'sha384',val:'abc...'},
+           {alg:'sha512',val:'def...'}]
+                │
+                ▼
+          getStrongestMetadata()
+                │
+                ▼ 选择最强 (sha512):
+          [{alg:'sha512',val:'def...'}]
+                │
+                ▼
+          for each metadata:
+            applyAlgorithmToBytes('sha512', bytes)
+                │
+                ▼
+            crypto.hash('sha512', bytes, 'base64')
+                │
+                ▼
+            caseSensitiveMatch(actual, expected)
+                │
+           ┌────┴────┐
+          Match    No Match
+           │          │
+           ▼          ▼
+        PASS       FAIL → fetchFinale(networkError)
+```
+
+### 3.8 对 laew 的借鉴
+
+SRI 的 "内容完整性校验" 思路可应用于 Agent 场景:
+
+1. **工具输出校验**: Bash 工具执行结果可通过哈希校验确保未被中间人篡改
+2. **模型响应签名**: 对 LLM 返回的关键 JSON 字段计算哈希，Write 工具写入时校验
+3. **配置完整性**: CLAUDE.md / AGENTS.md 加载时校验哈希，防止恶意篡改
+
+---
+
+## 4. WebSocket 协议实现深度分析
 
 ### 3.1 WebSocket 主类
 
@@ -1493,6 +1879,174 @@ function establishWebSocketConnection (urlRecord, protocols, client, handler, op
 ```
 
 **WebSocket UID**: `258EAFA5-E914-47DA-95CA-C5AB0DC85B11` 是 RFC 6455 定义的固定 GUID，用于 Sec-WebSocket-Accept 的 SHA-1 计算。握手的安全性基于这个 GUID 的不可预测性（攻击者无法伪造正确的 Accept 值）。
+
+#### 3.2.2 HTTP/2 WebSocket 协商 (RFC 8441)
+
+undici 完整支持 RFC 8441 (Bootstrapping WebSockets with HTTP/2)，使用 Extended CONNECT Protocol：
+
+```javascript
+// connection.js processResponse 中的 HTTP/2 特殊处理
+if (response.type === 'error' || response.status !== 101) {
+  // HTTP/1.1 期望 101 Switching Protocols
+  if (response.socket?.session == null) {
+    failWebsocketConnection(handler, 1002, 'Received network error or non-101')
+    return
+  }
+
+  // HTTP/2 期望 200 (CONNECT 成功)
+  if (response.status !== 200) {
+    failWebsocketConnection(handler, 1002, 'Received network error or non-200')
+    return
+  }
+}
+```
+
+**降级策略**: 当 HTTP/2 服务器不支持 Extended CONNECT 时，`onResponseError` 回调会捕获 `UND_ERR_INFO: HTTP/2: Extended CONNECT protocol not supported by server` 错误并自动降级到 HTTP/1.1:
+
+```javascript
+// httpNetworkFetch → dispatch 中的 onResponseError
+if (
+  request.mode === 'websocket' &&
+  allowH2 !== false &&
+  error?.code === 'UND_ERR_INFO' &&
+  error?.message === 'HTTP/2: Extended CONNECT protocol not supported by server'
+) {
+  // 降级到 HTTP/1.1 重试
+  resolve(dispatchWithProtocolPreference(body, false))
+  return
+}
+```
+
+#### 3.2.3 握手验证细节 (RFC 6455 Section 4.2.2)
+
+服务器握手验证包含 6 步 (见 connection.js):
+
+| 步骤 | 验证项 | 失败码 |
+|------|--------|--------|
+| 1 | 状态码 = 101 (H1) 或 200 (H2) | 1002 |
+| 2 | `Upgrade: websocket` (不区分大小写) | 1002 |
+| 3 | `Connection: Upgrade` (不区分大小写) | 1002 |
+| 4 | `Sec-WebSocket-Accept` = SHA-1(key + GUID) base64 | 1002 |
+| 5 | `Sec-WebSocket-Extensions` 必须包含客户端请求的扩展 | 1002 |
+| 6 | `Sec-WebSocket-Protocol` 必须是客户端请求的子集 | 1002 |
+
+```javascript
+// 4. Sec-WebSocket-Accept 验证
+const secWSAccept = response.headersList.get('Sec-WebSocket-Accept')
+const digest = crypto.hash('sha1', keyValue + uid, 'base64')  // uid = GUID
+if (secWSAccept !== digest) {
+  failWebsocketConnection(handler, 1002, 'Incorrect hash')
+  return
+}
+
+// 5. Extension 验证
+const secExtension = response.headersList.get('Sec-WebSocket-Extensions')
+if (secExtension !== null) {
+  extensions = parseExtensions(secExtension)
+  if (!extensions.has('permessage-deflate')) {
+    failWebsocketConnection(handler, 1002, 'Extensions mismatch')
+    return
+  }
+}
+
+// 6. Protocol 验证
+const secProtocol = response.headersList.get('Sec-WebSocket-Protocol')
+if (secProtocol !== null) {
+  const requestProtocols = getDecodeSplit('sec-websocket-protocol', request.headersList)
+  if (!requestProtocols.includes(secProtocol)) {
+    failWebsocketConnection(handler, 1002, 'Protocol mismatch')
+    return
+  }
+}
+```
+
+#### 3.2.4 关闭握手状态机
+
+WebSocket 关闭使用双向 "closing handshake"，通过 `sentCloseFrameState` 集合追踪状态:
+
+```javascript
+// constants.js
+const sentCloseFrameState = {
+  SENT: 1,      // 本端已发送 Close 帧
+  RECEIVED: 2   // 对端已发送 Close 帧 (本端已接收)
+}
+```
+
+`closeWebSocketConnection()` 实现 (connection.js):
+
+```javascript
+function closeWebSocketConnection (object, code, reason, validate = false) {
+  // 1. 验证 close code
+  if (validate) validateCloseCodeAndReason(code, reason)
+
+  // 2. 根据当前状态分发
+  if (isClosed(object.readyState) || isClosing(object.readyState)) {
+    // 已在关闭中 → 不操作
+  } else if (!isEstablished(object.readyState)) {
+    // 连接未建立 → 失败并转 CLOSING
+    failWebsocketConnection(object)
+    object.readyState = states.CLOSING
+  } else if (!closeState.has(SENT) && !closeState.has(RECEIVED)) {
+    // 首次关闭: 发送 Close 帧
+    if (reason.length !== 0 && code === null) {
+      code = 1000  // 有 reason 但无 code → 默认 1000 Normal Closure
+    }
+
+    // 构造 Close 帧 payload
+    if (code === null && reason.length === 0) {
+      frame.frameData = emptyBuffer  // 无 body
+    } else if (code !== null && reason === null) {
+      frame.frameData = Buffer.allocUnsafe(2)
+      frame.frameData.writeUInt16BE(code, 0)
+    } else {
+      frame.frameData = Buffer.allocUnsafe(2 + Buffer.byteLength(reason))
+      frame.frameData.writeUInt16BE(code, 0)
+      frame.frameData.write(reason, 2, 'utf-8')
+    }
+
+    object.socket.write(frame.createFrame(opcodes.CLOSE))
+    object.closeState.add(SENT)
+    object.readyState = states.CLOSING
+  } else {
+    // 对端已发送 Close 或本端已发送 → 仅标记 CLOSING
+    object.readyState = states.CLOSING
+  }
+}
+```
+
+**关闭状态图**:
+
+```
+            Client                Server
+              │                     │
+              │──── Close Frame ───>│    Client 主动关闭
+              │                     │
+              │<─── Close Frame ────│    Server 回复 (echo code)
+              │                     │
+              │    TCP Close        │
+              │<───────────────────>│
+              │                     │
+
+wasClean = closeState.has(SENT) && closeState.has(RECEIVED)
+```
+
+接收端收到 Close 帧后自动回复 (receiver.js `parseControlFrame`):
+
+```javascript
+if (opcode === opcodes.CLOSE) {
+  // 自动回复 Close (echo code)
+  if (!closeState.has(SENT) && !closeState.has(RECEIVED)) {
+    const body = code ? Buffer.from(code.toString()) : emptyBuffer
+    const closeFrame = new WebsocketFrameSend(body)
+    socket.write(closeFrame.createFrame(opcodes.CLOSE))
+    closeState.add(SENT)
+  }
+
+  readyState = states.CLOSING
+  closeState.add(RECEIVED)
+  return false  // 停止解析
+}
+```
 
 ### 3.3 帧编解码
 
@@ -2019,7 +2573,7 @@ class WebSocketStream {
 
 ---
 
-## 4. EventSource / SSE 流式解析深度分析
+## 5. EventSource / SSE 流式解析深度分析
 
 ### 4.1 EventSource 主类
 
@@ -2510,7 +3064,7 @@ function isASCIINumber (value) {
 
 ---
 
-## 5. Cache API 深度分析
+## 6. Cache API 深度分析
 
 ### 5.1 Cache 类
 
@@ -2807,7 +3361,364 @@ class CacheStorage {
 
 ---
 
-## 6. Cookies 模块深度分析
+## 7. Cache 存储层 (SQLite / Memory)
+
+**文件**:
+- `lib/cache/sqlite-cache-store.js` (469 行)
+- `lib/cache/memory-cache-store.js` (279 行)
+- `lib/util/cache.js` (工具函数, 提供 `assertCacheKey` / `assertCacheValue`)
+
+undici 的 cache 拦截器 (`DispatchInterceptor`) 支持可插拔的存储后端，内置两种实现：
+
+| 存储后端 | 持久化 | 默认位置 | 适用场景 |
+|----------|--------|----------|----------|
+| `SqliteCacheStore` | ✅ WAL 模式 | `:memory:` 或磁盘文件 | 生产环境，大缓存量 |
+| `MemoryCacheStore` | ❌ 纯内存 | `Map` | 测试、短生命周期 |
+
+两个后端都实现相同的 `CacheStore` 接口 (定义于 `types/cache-interceptor.d.ts`)。
+
+### 7.1 公共接口 `CacheStore`
+
+```typescript
+interface CacheStore {
+  get(key: CacheKey): GetResult | undefined
+  set(key: CacheKey, value: CacheValue): void
+  createWriteStream(key: CacheKey, value: CacheValue): Writable | undefined
+  delete(key: CacheKey): void
+  close?(): void
+}
+
+interface CacheKey {
+  origin: string
+  path: string
+  method: string
+  headers?: Record<string, string>
+}
+
+interface CacheValue {
+  body: Buffer | null
+  statusCode: number
+  statusMessage: string
+  headers?: string        // JSON
+  vary?: string           // JSON
+  etag?: string
+  cacheControlDirectives?: string  // JSON
+  cachedAt: number        // Date.now()
+  staleAt: number         // 过期开始时间
+  deleteAt: number        // 必须删除时间
+}
+```
+
+### 7.2 SqliteCacheStore -- 持久化缓存
+
+**文件**: `lib/cache/sqlite-cache-store.js` (469 行)
+
+使用 Node.js v22.5+ 内置的 `node:sqlite` (编译时 SQLite)，不需要外部依赖。
+
+#### 7.2.1 数据库初始化
+
+```javascript
+const VERSION = 3         // schema 版本号
+const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000  // 2GB
+
+class SqliteCacheStore {
+  #maxEntrySize = MAX_ENTRY_SIZE
+  #maxCount = Infinity
+  #db: DatabaseSync
+
+  constructor (opts) {
+    // 参数校验
+    // opts.maxEntrySize, opts.maxCount, opts.location
+
+    this.#db = new DatabaseSync(opts?.location ?? ':memory:')
+
+    // 1. PRAGMA 优化
+    this.#db.exec(`
+      PRAGMA journal_mode = WAL;        -- 写前日志: 读写并发
+      PRAGMA synchronous = NORMAL;      -- 同步模式: 性能与安全平衡
+      PRAGMA temp_store = memory;       -- 临时表在内存
+      PRAGMA optimize;                  -- 自动索引优化
+    `)
+
+    // 2. 建表
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS cacheInterceptorV${VERSION} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL,
+        method TEXT NOT NULL,
+
+        body BUF NULL,                    -- 响应体 (可为空)
+        deleteAt INTEGER NOT NULL,        -- 必须删除时间
+        statusCode INTEGER NOT NULL,
+        statusMessage TEXT NOT NULL,
+        headers TEXT NULL,                -- JSON 序列化
+        cacheControlDirectives TEXT NULL, -- JSON
+        etag TEXT NULL,
+        vary TEXT NULL,                   -- JSON
+        cachedAt INTEGER NOT NULL,        -- 缓存写入时间
+        staleAt INTEGER NOT NULL,         -- 开始过期时间
+      );
+
+      -- 索引: 按 url + method + deleteAt 查询
+      CREATE INDEX IF NOT EXISTS ..._getValuesQuery
+        ON cacheInterceptorV${VERSION}(url, method, deleteAt);
+
+      -- 索引: 按 deleteAt 删除过期数据
+      CREATE INDEX IF NOT EXISTS ..._deleteByUrlQuery
+        ON cacheInterceptorV${VERSION}(deleteAt);
+    `)
+
+    // 3. 预编译语句 (StatementSync)
+    this.#getValuesQuery = this.#db.prepare(`SELECT ... WHERE url = ? AND method = ? ORDER BY deleteAt ASC`)
+    this.#insertValueQuery = this.#db.prepare(`INSERT INTO ...`)
+    this.#updateValueQuery = this.#db.prepare(`UPDATE ... WHERE id = ?`)
+    this.#deleteByUrlQuery = this.#db.prepare(`DELETE ... WHERE url = ?`)
+    this.#deleteExpiredValuesQuery = this.#db.prepare(`DELETE ... WHERE deleteAt <= ?`)
+    this.#deleteOldValuesQuery = this.#db.prepare(`DELETE ... ORDER BY cachedAt ASC LIMIT ?`)
+  }
+}
+```
+
+#### 7.2.2 Vary 匹配查询
+
+S `#findValue()` 方法在 SQLite 之上实现了 `Vary` 响应头的匹配逻辑:
+
+```javascript
+#findValue (key, canBeExpired = false) {
+  const url = `${key.origin}/${key.path}`
+  const values = this.#getValuesQuery.all(url, method)
+
+  const now = Date.now()
+  for (const value of values) {
+    // 1. 删除时间过滤
+    if (now >= value.deleteAt && !canBeExpired) {
+      continue
+    }
+
+    // 2. Vary 匹配
+    if (value.vary) {
+      const vary = JSON.parse(value.vary)
+      for (const header in vary) {
+        if (!headerValueEquals(headers[header], vary[header])) {
+          matches = false
+          break
+        }
+      }
+    }
+
+    if (matches) return value
+  }
+}
+```
+
+**Vary 匹配语义**: `Vary: Accept-Encoding, User-Agent` 表示根据这两个请求头区分缓存版本。`headerValueEquals` 支持 null 等价性比较。
+
+#### 7.2.3 流式写入: `createWriteStream()`
+
+缓存响应体可能很大，不能一次性读到内存。`createWriteStream()` 返回一个 Writable，在 `final` 回调中调用 `set`:
+
+```javascript
+createWriteStream (key, value) {
+  let size = 0
+  const body = []
+
+  return new Writable({
+    write (chunk, encoding, callback) {
+      size += chunk.byteLength
+
+      // 超过 maxEntrySize → 丢弃
+      if (size > this.#maxEntrySize) {
+        this.destroy()
+      } else {
+        body.push(chunk)
+      }
+
+      callback()
+    },
+    final (callback) {
+      // 写入完成 → 持久化到 SQLite
+      this.set(key, { ...value, body: Buffer.concat(body) })
+      callback()
+    }
+  })
+}
+```
+
+#### 7.2.4 LRU 式剪枝: `#prune()`
+
+每次插入新数据后调用 `#prune()`，按以下顺序执行:
+
+```javascript
+#prune () {
+  // 1. 未超限 → 不操作
+  if (Number.isFinite(this.#maxCount) && this.size <= this.#maxCount) {
+    return 0
+  }
+
+  // 2. 先删过期数据
+  const removed = this.#deleteExpiredValuesQuery.run(Date.now()).changes
+  if (removed) return removed
+
+  // 3. 删除最老的 10% 条目
+  const removed = this.#deleteOldValuesQuery.run(
+    Math.max(Math.floor(this.#maxCount * 0.1), 1)
+  ).changes
+  return removed
+}
+```
+
+**剪枝策略**: SQLite 版本没有严格 LRU，而是采用 "删过期 → 删最老 10%" 的混合策略，减少查询次数。
+
+### 7.3 MemoryCacheStore -- 内存缓存
+
+**文件**: `lib/cache/memory-cache-store.js` (279 行)
+
+纯内存实现，使用 `Map<topLevelKey, entry[]>` 存储，适用于测试和短生命周期场景。
+
+```javascript
+class MemoryCacheStore extends EventEmitter {
+  #maxCount = 1024                // 最大条目数
+  #maxSize = 104857600            // 100MB 总大小
+  #maxEntrySize = 5242880         // 单条 5MB
+
+  #size = 0                       // 当前总字节
+  #count = 0                      // 当前条目数
+  #entries = new Map()            // Map<string, entry[]>
+  #hasEmittedMaxSizeEvent = false
+}
+```
+
+#### 7.3.1 写入与驱逐
+
+MemoryCacheStore 的驱逐策略更加激进:
+
+```javascript
+createWriteStream (key, val) {
+  return new Writable({
+    write (chunk, encoding, callback) {
+      entry.size += chunk.byteLength
+      if (entry.size > store.#maxEntrySize) {
+        this.destroy()
+      } else {
+        entry.body.push(chunk)
+      }
+      callback(null)
+    },
+    final (callback) {
+      // 更新 size/count 计数器
+      store.#size += entry.size
+      store.#count += 1
+
+      // 超限 → 驱逐
+      if (store.#size > store.#maxSize || store.#count > store.#maxCount) {
+        // 1. 触发 maxSizeExceeded 事件 (仅首次)
+        store.emit('maxSizeExceeded', { ... })
+
+        // 2. 对所有 key 驱逐一半条目
+        for (const [key, entries] of store.#entries) {
+          for (const entry of entries.splice(0, Math.ceil(entries.length / 2))) {
+            store.#size -= entry.size
+            store.#count -= 1
+          }
+        }
+      }
+    }
+  })
+}
+```
+
+**驱逐策略**: 当缓存超限时，**所有 key 的条目都减半**。这是一种全局性的激进驱逐，适用于内存受限场景。
+
+#### 7.3.2 Vary 匹配
+
+```javascript
+function findEntry (key, entries, now) {
+  for (const entry of entries) {
+    // 1. deleteAt 过滤
+    // 2. method 匹配
+    // 3. vary 匹配
+    if (entry.deleteAt > now &&
+        entry.method === key.method &&
+        varyMatches(key, entry)) {
+      return entry
+    }
+  }
+}
+
+function varyMatches (key, entry) {
+  if (entry.vary == null) return true
+
+  for (const headerName in entry.vary) {
+    if (!headerValueEquals(key.headers?.[headerName], entry.vary[headerName])) {
+      return false
+    }
+  }
+  return true
+}
+```
+
+### 7.4 缓存拦截器集成
+
+undici 通过 `CacheInterceptor` (内部模块) 将存储后端集成到 dispatcher 中:
+
+```javascript
+// lib/interceptors/cache.js (简化)
+function cacheInterceptor (dispatcher, opts) {
+  const store = opts.store ?? new SqliteCacheStore(opts)
+
+  return (dispatch) => {
+    return function CacheDispatch (opts, handler) {
+      const key = makeCacheKey(opts)
+      const cached = store.get(key)
+
+      // 命中: 直接返回缓存
+      if (cached && cached.staleAt > Date.now()) {
+        return dispatch(opts, createCachedHandler(cached, handler))
+      }
+
+      // 未命中: 透传并缓存响应
+      return dispatch(opts, wrapHandler(handler, (response) => {
+        store.set(key, makeCacheValue(response))
+      }))
+    }
+  }
+}
+
+// 使用示例
+const dispatcher = new Agent().compose(
+  cacheInterceptor(new ProxyAgent(), {
+    store: new SqliteCacheStore({
+      location: './undici-cache.db',
+      maxCount: 10000
+    })
+  })
+)
+
+const response = await fetch(url, { dispatcher })
+```
+
+### 7.5 配置选项对比
+
+| 选项 | SqliteCacheStore | MemoryCacheStore |
+|------|:----------------:|:----------------:|
+| `location` | 文件路径 / `:memory:` | N/A |
+| `maxEntrySize` | 默认 2GB | 默认 5MB |
+| `maxCount` | 默认 ∞ | 默认 1024 |
+| `maxSize` | N/A | 默认 100MB |
+| 持久化 | ✅ WAL | ❌ |
+| Vary 匹配 | ✅ | ✅ |
+| 流式写入 | ✅ | ✅ |
+| 删除过期 | ✅ | ✅ |
+
+### 7.6 对 laew 的借鉴
+
+1. **会话记忆缓存**: 使用 MemoryCacheStore 缓存最近 N 个 Session 的上下文摘要，避免 SQLite 读写延迟
+2. **模型响应缓存**: 对相同 prompt 的 LLM 响应缓存 1 小时 (带 `staleAt` 过期)
+3. **工具输出缓存**: Bash 命令结果按 `(cwd, command)` 做 key 缓存，TTL 30s
+
+---
+
+## 8. Cookies 模块深度分析
 
 ### 6.1 Cookie API
 
@@ -3157,7 +4068,7 @@ function toIMFDate (date) {
 
 ---
 
-## 7. WebIDL 类型系统深度分析
+## 9. WebIDL 类型系统深度分析
 
 **文件**: `lib/web/webidl/index.js` (1,004 行)
 
@@ -3467,7 +4378,7 @@ webidl.util.HasFlag = function (flags, attributes) {
 
 ---
 
-## 8. 基础设施模块
+## 10. 基础设施模块
 
 ### 8.1 WHATWG Infra 规范
 
@@ -3742,7 +4653,7 @@ function collectAnHTTPQuotedString (input, position, extractValue = false) {
 
 ---
 
-## 9. FormData 模块深度分析
+## 11. FormData 模块深度分析
 
 **文件**: `lib/web/fetch/formdata.js` (278 行)
 
@@ -3864,7 +4775,7 @@ for (const [name, value] of formData) {
 
 ---
 
-## 10. 自定义事件体系
+## 12. 自定义事件体系
 
 **文件**: `lib/web/websocket/events.js` (332 行)
 
@@ -3949,7 +4860,7 @@ class ErrorEvent extends Event {
 
 ---
 
-## 11. 对 AI Agent HTTP 传输层的借鉴
+## 13. 对 AI Agent HTTP 传输层的借鉴
 
 ### 11.1 Fetch 流式回调模式 -> laew Agent 循环
 
@@ -4111,7 +5022,7 @@ static createFast (type, init) {
 
 ---
 
-## 12. 跨模块设计模式汇总
+## 14. 跨模块设计模式汇总
 
 ### 12.1 规范步骤注释
 
@@ -4208,7 +5119,7 @@ static createFastMessageEvent (type, init) {
 
 ---
 
-## 13. laew 借鉴路线图
+## 15. laew 借鉴路线图
 
 ### P0 (立即可做)
 
@@ -4274,6 +5185,7 @@ static createFastMessageEvent (type, init) {
 | `lib/web/cache/cache.js` | 862 | Cache 类 (匹配/批量操作/事务) |
 | `lib/web/cache/cachestorage.js` | 152 | CacheStorage (open/delete/keys) |
 | `lib/web/cache/util.js` | 45 | URL 比较 + Vary 处理 |
+| `lib/web/subresource-integrity/subresource-integrity.js` | 307 | SRI 校验 (bytesMatch/parseMetadata/getStrongestMetadata) |
 | `lib/web/cookies/index.js` | 199 | Cookie API (get/set/delete) |
 | `lib/web/cookies/parse.js` | 317 | Set-Cookie 解析器 (RFC 6265bis) |
 | `lib/web/cookies/util.js` | 353 | Cookie 验证 + 序列化 + IMF 日期 |
@@ -4281,8 +5193,10 @@ static createFastMessageEvent (type, init) {
 | `lib/web/webidl/index.js` | 1,004 | WebIDL 类型系统 (转换/检查/属性) |
 | `lib/web/infra/index.js` | 230 | WHATWG Infra (序列收集/Base64/同构) |
 | `lib/encoding/index.js` | 34 | UTF-8 解码 |
+| `lib/cache/sqlite-cache-store.js` | 469 | SQLite WAL 持久化缓存 |
+| `lib/cache/memory-cache-store.js` | 279 | 内存 LRU 缓存 |
 
-**总计**: ~14,060+ 行代码，覆盖 Fetch API / WebSocket / EventSource / Cache / Cookies / WebIDL / Infra / Encoding 8 大模块。
+**总计**: ~16,300+ 行代码，覆盖 Fetch API / WebSocket / EventSource / Cache API / Cache 存储层 / SRI / Cookies / WebIDL / Infra / Encoding 10 大模块。
 
 ---
 
@@ -4340,11 +5254,25 @@ static createFastMessageEvent (type, init) {
 - `EventSourceStream.#handleBOM()` -- BOM 处理
 - `EventSourceStream.#readLine()` -- 跨 chunk 行读取
 
+### Subresource Integrity
+- `bytesMatch()` -- SRI 主入口 (metadata 匹配)
+- `parseMetadata()` -- integrity 属性解析
+- `getStrongestMetadata()` -- 最强算法选择
+- `caseSensitiveMatch()` -- Base64/Base64url 兼容匹配
+- `applyAlgorithmToBytes()` -- 哈希计算 (crypto.hash)
+
 ### Cache
 - `Cache.#queryCache()` -- 缓存查询
 - `Cache.#batchCacheOperations()` -- 原子批量操作 (备份/回滚)
 - `Cache.#requestMatchesCachedItem()` -- 匹配算法 (URL + Vary)
 - `Cache.addAll()` -- 并发 fetch + 批量写入
+
+### Cache 存储层
+- `SqliteCacheStore.get/set/createWriteStream/delete` -- SQLite CRUD
+- `SqliteCacheStore.#findValue()` -- Vary 匹配查询
+- `SqliteCacheStore.#prune()` -- LRU 剪枝 (过期 → 最老 10%)
+- `MemoryCacheStore.createWriteStream()` -- 流式写入 + 大小检查
+- `headerValueEquals()` -- Vary 头比较 (null 等价)
 
 ### Cookies
 - `parseSetCookie()` -- Set-Cookie 解析 (RFC 6265bis)
@@ -4383,7 +5311,9 @@ static createFastMessageEvent (type, init) {
 | Request | WHATWG Fetch Standard | Section 2.2: Request class (41 步构造器) |
 | Response | WHATWG Fetch Standard | Section 2.3: Response class |
 | WebSocket | RFC 6455 | Section 4: Opening Handshake, Section 5: Data Framing |
+| WebSocket H2 | RFC 8441 | Bootstrapping WebSockets with HTTP/2 (Extended CONNECT) |
 | WebSocketStream | W3C WebSocketStream | Stream-based WebSocket API |
+| SRI | W3C WebAppSec SRI | Algorithm selection, strongest metadata |
 | EventSource | WHATWG HTML Standard | Section 9.2.6: Server-sent events |
 | Cache API | W3C Service Worker | Section 4: Cache API |
 | Cookies | RFC 6265bis | Section 5.4: Set-Cookie, Section 5.5: Cookie |
@@ -4406,6 +5336,7 @@ static createFastMessageEvent (type, init) {
 | BufferSource 拷贝 | webidl/index.js | 始终拷贝字节, 防止后续修改 |
 | WebSocket Mask | websocket/frame.js | 4 字节随机 mask (防缓存投毒) |
 | Sec-WebSocket-Accept | websocket/connection.js | SHA-1 + 固定 UID (防握手伪造) |
+| SRI 校验 | subresource-integrity/ | SHA-256/384/512 哈希校验 (防篡改) |
 | permessage-deflate 大小限制 | websocket/permessage-deflate.js | maxPayloadSize 防止解压炸弹 |
 | Cookie CTL 检查 | cookies/parse.js | 控制字符过滤 |
 | Cookie 大小限制 | cookies/parse.js | name+value <= 4096 字节 |

@@ -39,9 +39,10 @@
    - 6.2 SnapshotRecorder
    - 6.3 SnapshotUtils
 7. [工具层分析](#7-工具层分析)
-8. [跨模块设计模式总结](#8-跨模块设计模式总结)
-9. [对 AI Agent HTTP 测试的借鉴](#9-对-ai-agent-http-测试的借鉴)
-10. [laew 借鉴路线图](#10-laew-借鉴路线图)
+8. [拦截器组合最佳实践与陷阱](#8-拦截器组合最佳实践与陷阱)
+9. [跨模块设计模式总结](#9-跨模块设计模式总结)
+10. [对 AI Agent HTTP 测试的借鉴](#10-对-ai-agent-http-测试的借鉴)
+11. [laew 借鉴路线图](#11-laew-借鉴路线图)
 
 ---
 
@@ -93,6 +94,20 @@ undici 的拦截器与 Mock 系统采用三层架构：
 ---
 
 ## 2. Interceptor 链式调用模式
+
+### 2.0 八大拦截器全面对比
+
+| 维度 | cache | retry | redirect | dns | decompress | deduplicate | dump | response-error |
+|------|-------|-------|----------|-----|------------|-------------|------|----------------|
+| **文件行数** | 618 | 19 | 21 | 575 | 292 | 117 | 112 | 95 |
+| **Handler 行数** | 802+134 | 548 | 229 | 0（内嵌） | 内嵌 | 466 | 内嵌 | 内嵌 |
+| **策略** | 替换 handler | 替换 handler | 替换 handler | 异步修改 origin | 替换 handler | 替换 handler | 替换 handler | 替换 handler |
+| **核心能力** | HTTP 缓存 RFC 9111 | 重试 + Range 续传 | 3xx 跟随 | DNS 双栈 | 自动解压 | 请求合并 | 大小限制 | 4xx/5xx → Error |
+| **是否短路** | 是（缓存命中） | 否 | 是（0 次） | 是（IP 跳过） | 是（HEAD） | 是（非安全方法） | 否 | 否 |
+| **异步** | 否 | 是（backoff） | 否 | 是（DNS 查询） | 否 | 否 | 否 | 否 |
+| **状态存储** | CacheStore | retryCount | history[] | DNSStorage | 解压流 | pendingRequests Map | size | statusCode/body |
+| **协议合规** | RFC 9111 | - | RFC 7231 | - | - | - | - | - |
+| **CVE 修复** | - | - | - | - | ✅ 编码层数限制 | - | - | - |
 
 ### 2.1 核心签名
 
@@ -230,6 +245,122 @@ if (!revalidate && withinStaleWhileRevalidateWindow(result, globalOpts.type)) {
 
 **设计要点**：用 `queueMicrotask` 实现后台验证，使用空 handler 静默丢弃验证响应，仅更新缓存存储。
 
+#### 3.1.6 sendCachedValue 虚拟响应构造
+
+`sendCachedValue()`（第 293 行）构造一个虚拟的 controller + Readable stream 发送缓存内容：
+
+```javascript
+function sendCachedValue (handler, opts, result, age, readStream, stale) {
+  // 创建虚拟 controller
+  const controller = {
+    pause () {},
+    resume () {},
+    abort (reason) {
+      if (readStream) readStream.destroy()
+    },
+    rawHeaders: result.rawHeaders
+  }
+
+  // 构造响应头（包含 Age 头）
+  const headers = { ...result.headers }
+  if (age > 0) {
+    headers.age = Math.floor(age / 1000).toString()
+  }
+  if (stale) {
+    headers.warning = '110 - "Response is Stale"'
+  }
+
+  // 发送响应
+  handler.onResponseStart(controller, result.statusCode, headers, result.statusMessage)
+
+  // 创建 Readable stream 发送缓存 body
+  const body = new Readable({ read() {} })
+  handler.onResponseData(controller, body)
+
+  // 异步读取缓存 store
+  result.store.read(cacheKey, (err, storedBody) => {
+    if (err) {
+      handler.onResponseError(controller, err)
+      return
+    }
+    body.push(storedBody)
+    body.push(null)  // 结束
+    handler.onResponseEnd(controller, result.trailers)
+  })
+}
+```
+
+#### 3.1.7 完整 handleResult 决策流程
+
+```javascript
+function handleResult (request, opts, result, context) {
+  const { cacheControlDirectives } = result
+
+  // 1. 缓存未命中
+  if (result.statusCode === 0 && !cacheControlDirectives) {
+    if (request.headers['only-if-cached']) {
+      // only-if-cached 指令 + 无缓存 → 504
+      handler.onResponseStart(controller, 504, ...)
+      handler.onResponseData(controller, Buffer.from('Gateway Timeout'))
+      handler.onResponseEnd(controller, {})
+    }
+    return handleUncachedResponse(...)
+  }
+
+  // 2. 缓存已过期（deleteAt 已过）
+  if (Date.now() > result.deleteAt) {
+    return handleUncachedResponse(...)
+  }
+
+  // 3. 需要验证（no-cache / conditional headers）
+  const revalidate = needsRevalidation(result, cacheControlDirectives, request)
+  if (revalidate) {
+    // 发送条件请求
+    const headers = makeRevalidationHeaders(opts, result)
+    return dispatch({ ...opts, headers }, new CacheRevalidationHandler(...))
+  }
+
+  // 4. stale-while-revalidate 窗口内
+  if (withinStaleWhileRevalidateWindow(result, globalOpts.type)) {
+    sendCachedValue(handler, opts, result, age, null, true)
+    queueMicrotask(() => { /* 后台验证 */ })
+    return true
+  }
+
+  // 5. stale-if-error 窗口内
+  if (withinStaleIfErrorWindow(result)) {
+    // 发送真实请求 + CacheRevalidationHandler
+    // 失败时使用缓存
+    return dispatch(opts, new CacheRevalidationHandler(..., true))
+  }
+
+  // 6. 缓存新鲜
+  return sendCachedValue(handler, opts, result, age, result.store.read(cacheKey), false)
+}
+```
+
+#### 3.1.8 配置选项
+
+```javascript
+const cacheInterceptor = cache({
+  store: new MemoryCacheStore(),   // 缓存存储（可替换为 Redis 等）
+  methods: ['GET'],                 // 可缓存的方法
+  cacheByDefault: undefined,        // 默认缓存时长（秒）
+  type: 'shared',                   // 缓存类型 shared|private
+  origins: ['http://api.example.com'] // origin 白名单（可选）
+})
+```
+
+**store 接口**：
+
+```javascript
+interface CacheStore {
+  get(key: CacheKey): Promise<GetResult>
+  set(key: CacheKey, entry: CacheEntry): Promise<void>
+  delete(key: CacheKey): Promise<boolean>
+}
+```
+
 ### 3.2 Retry 拦截器
 
 **文件**：`lib/interceptor/retry.js`（19 行）
@@ -327,24 +458,173 @@ onResponseError (controller, err) {
 
 ```javascript
 #defaultPick (origin, hostnameRecords, affinity) {
-  // 双栈模式：交替选择 IPv4/IPv6
+  let ip = null
+  const { records, offset } = hostnameRecords
+
+  let family
   if (this.dualStack) {
     if (affinity == null) {
-      affinity = (hostnameRecords.offset & 1) === 1 ? 6 : 4
+      // 交替选择：根据 offset 奇偶性
+      if (offset == null || offset === maxInt) {
+        hostnameRecords.offset = 0
+        affinity = 4
+      } else {
+        hostnameRecords.offset++
+        affinity = (hostnameRecords.offset & 1) === 1 ? 6 : 4
+      }
     }
-    // fallback 到另一个 family
-    if (records[affinity]?.ips.length === 0) {
-      family = records[affinity === 4 ? 6 : 4]
+    if (records[affinity] != null && records[affinity].ips.length > 0) {
+      family = records[affinity]
+    } else {
+      family = records[affinity === 4 ? 6 : 4]  // fallback
     }
+  } else {
+    family = records[affinity]
   }
-  // 轮询选择 IP
+
+  if (family == null || family.ips.length === 0) return ip
+
+  if (family.offset == null || family.offset === maxInt) {
+    family.offset = 0
+  } else {
+    family.offset++
+  }
+
   const position = family.offset % family.ips.length
-  // TTL 过期自动移除
+  ip = family.ips[position] ?? null
+
+  if (ip == null) return ip
+
+  // TTL 过期自动移除（毫秒级）
   if (Date.now() - ip.timestamp > ip.ttl) {
     family.ips.splice(position, 1)
     return this.pick(origin, hostnameRecords, affinity)  // 递归
   }
+
+  return ip
 }
+```
+
+#### 3.4.4 DNSStorage 缓存层
+
+```javascript
+class DNSStorage {
+  #maxItems = 0
+  #records = new Map()
+
+  constructor (opts) {
+    this.#maxItems = opts.maxItems
+  }
+
+  get size () { return this.#records.size }
+
+  get (hostname) { return this.#records.get(hostname) ?? null }
+
+  set (hostname, records) { this.#records.set(hostname, records) }
+
+  delete (hostname) { this.#records.delete(hostname) }
+
+  // 满了之后不再接受新查询（回退到原始 origin）
+  full () { return this.size >= this.#maxItems }
+}
+```
+
+#### 3.4.5 完整入口函数
+
+```javascript
+module.exports = interceptorOpts => {
+  // 参数校验
+  if (interceptorOpts?.maxTTL != null && (typeof interceptorOpts?.maxTTL !== 'number' || interceptorOpts?.maxTTL < 0)) {
+    throw new InvalidArgumentError('Invalid maxTTL. Must be a positive number')
+  }
+  if (interceptorOpts?.maxItems != null && (typeof interceptorOpts?.maxItems !== 'number' || interceptorOpts?.maxItems < 1)) {
+    throw new InvalidArgumentError('Invalid maxItems. Must be a positive number and greater than zero')
+  }
+  if (interceptorOpts?.affinity != null && interceptorOpts?.affinity !== 4 && interceptorOpts?.affinity !== 6) {
+    throw new InvalidArgumentError('Invalid affinity. Must be either 4 or 6')
+  }
+  // ... 更多校验
+
+  const dualStack = interceptorOpts?.dualStack ?? true
+  let affinity
+  if (dualStack) {
+    affinity = interceptorOpts?.affinity ?? null
+  } else {
+    affinity = interceptorOpts?.affinity ?? 4
+  }
+
+  const opts = {
+    maxTTL: interceptorOpts?.maxTTL ?? 10e3,  // 默认 10 秒
+    lookup: interceptorOpts?.lookup ?? null,
+    pick: interceptorOpts?.pick ?? null,
+    dualStack,
+    affinity,
+    maxItems: interceptorOpts?.maxItems ?? Infinity,
+    storage: interceptorOpts?.storage
+  }
+
+  const instance = new DNSInstance(opts)
+
+  return dispatch => {
+    return function dnsInterceptor (origDispatchOpts, handler) {
+      if (origDispatchOpts.origin == null) {
+        return dispatch(origDispatchOpts, handler)
+      }
+
+      const origin = origDispatchOpts.origin.constructor === URL
+        ? origDispatchOpts.origin
+        : new URL(origDispatchOpts.origin)
+
+      // 已经是 IP 地址，跳过
+      if (isIP(origin.hostname) !== 0) {
+        return dispatch(origDispatchOpts, handler)
+      }
+
+      // 异步 DNS 查询
+      instance.runLookup(origin, origDispatchOpts, (err, newOrigin) => {
+        if (err) return handler.onResponseError(null, err)
+
+        const dispatchOpts = {
+          ...origDispatchOpts,
+          servername: origin.hostname,  // 用于 SNI（TLS 握手）
+          origin: newOrigin.origin,
+          headers: withHostHeader(origin.host, origDispatchOpts.headers)  // 自动加 Host
+        }
+
+        dispatch(
+          dispatchOpts,
+          instance.getHandler({ origin, dispatch, handler, newOrigin }, origDispatchOpts)
+        )
+      })
+
+      return true
+    }
+  }
+}
+```
+
+#### 3.4.6 自定义 lookup/pick/storage
+
+```javascript
+// 自定义 DNS lookup（例如使用 doh）
+const dnsInterceptor = dns({
+  lookup: (hostname, options, callback) => {
+    // 自定义查询逻辑
+    dohLookup(hostname).then(addrs => callback(null, addrs)).catch(callback)
+  },
+  // 自定义 IP 选择
+  pick: (origin, records, affinity) => {
+    // 总是选择延迟最低的
+    return records[affinity].ips.sort((a, b) => a.latency - b.latency)[0]
+  },
+  // 自定义存储（例如使用 Redis）
+  storage: {
+    get: (hostname) => redis.get(`dns:${hostname}`),
+    set: (hostname, records) => redis.set(`dns:${hostname}`, records, 'EX', 60),
+    full: () => false,
+    delete: (hostname) => redis.del(`dns:${hostname}`)
+  }
+})
 ```
 
 ### 3.5 Decompress 拦截器
@@ -397,6 +677,156 @@ const supportedEncodings = {
 - 跳过 HEAD 请求
 - 跳过错误响应（status >= 400）
 - 实验性功能发出 `ExperimentalWarning`
+
+#### 3.5.4 DecompressHandler 完整实现
+
+```javascript
+class DecompressHandler extends DecoratorHandler {
+  #decompressors = []
+  #trailers
+  #skipStatusCodes
+  #skipErrorResponses
+
+  constructor (handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = true } = {}) {
+    super(handler)
+    this.#skipStatusCodes = skipStatusCodes
+    this.#skipErrorResponses = skipErrorResponses
+  }
+
+  #shouldSkipDecompression (contentEncoding, statusCode) {
+    if (!contentEncoding || statusCode < 200) return true
+    if (this.#skipStatusCodes.includes(statusCode)) return true
+    if (this.#skipErrorResponses && statusCode >= 400) return true
+    return false
+  }
+
+  onResponseStart (controller, statusCode, headers, statusMessage) {
+    const contentEncoding = headers['content-encoding']
+
+    if (this.#shouldSkipDecompression(contentEncoding, statusCode)) {
+      return super.onResponseStart(controller, statusCode, headers, statusMessage)
+    }
+
+    const decompressors = this.#createDecompressionChain(contentEncoding.toLowerCase())
+    if (decompressors.length === 0) {
+      this.#cleanupDecompressors()
+      return super.onResponseStart(controller, statusCode, headers, statusMessage)
+    }
+
+    this.#decompressors = decompressors
+
+    // 移除压缩相关 header
+    const { 'content-encoding': _, 'content-length': __, ...newHeaders } = headers
+
+    // 同步更新 rawHeaders
+    if (controller?.rawHeaders) {
+      const rawHeaders = controller.rawHeaders
+      if (Array.isArray(rawHeaders)) {
+        const filteredHeaders = []
+        for (let i = 0; i < rawHeaders.length; i += 2) {
+          const headerName = rawHeaders[i]
+          const name = Buffer.isBuffer(headerName) ? headerName.toString('latin1') : `${headerName}`
+          const lowerName = name.toLowerCase()
+          if (lowerName === 'content-encoding' || lowerName === 'content-length') continue
+          filteredHeaders.push(rawHeaders[i], rawHeaders[i + 1])
+        }
+        controller.rawHeaders = filteredHeaders
+      }
+    }
+
+    if (this.#decompressors.length === 1) {
+      this.#setupSingleDecompressor(controller)
+    } else {
+      this.#setupMultipleDecompressors(controller)
+    }
+
+    return super.onResponseStart(controller, statusCode, newHeaders, statusMessage)
+  }
+
+  onResponseData (controller, chunk) {
+    if (this.#decompressors.length > 0) {
+      this.#decompressors[0].write(chunk)  // 写入第一个解压器
+      return
+    }
+    super.onResponseData(controller, chunk)
+  }
+
+  onResponseEnd (controller, trailers) {
+    if (this.#decompressors.length > 0) {
+      this.#trailers = trailers
+      this.#decompressors[0].end()  // 结束第一个解压器
+      this.#cleanupDecompressors()
+      return
+    }
+    super.onResponseEnd(controller, trailers)
+  }
+
+  onResponseError (controller, err) {
+    if (this.#decompressors.length > 0) {
+      for (const decompressor of this.#decompressors) {
+        decompressor.destroy(err)  // 销毁所有解压器
+      }
+      this.#cleanupDecompressors()
+    }
+    super.onResponseError(controller, err)
+  }
+}
+```
+
+#### 3.5.5 单解压器 vs 多解压器
+
+```
+单解压器 (gzip):
+  chunk → gunzip → onResponseData
+
+多解压器 (gzip, br):
+  chunk → gunzip → brotliDecompress → onResponseData
+         └─ pipeline() 串联 ─┘
+```
+
+```javascript
+#setupSingleDecompressor (controller) {
+  const decompressor = this.#decompressors[0]
+  this.#setupDecompressorEvents(decompressor, controller)
+  decompressor.on('end', () => {
+    super.onResponseEnd(controller, this.#trailers)
+  })
+}
+
+#setupMultipleDecompressors (controller) {
+  const lastDecompressor = this.#decompressors[this.#decompressors.length - 1]
+  this.#setupDecompressorEvents(lastDecompressor, controller)
+  pipeline(this.#decompressors, (err) => {
+    if (err) super.onResponseError(controller, err)
+    else super.onResponseEnd(controller, this.#trailers)
+  })
+}
+```
+
+#### 3.5.6 入口函数
+
+```javascript
+function createDecompressInterceptor (options = {}) {
+  // 只发出一次实验性警告
+  if (!warningEmitted) {
+    process.emitWarning(
+      'DecompressInterceptor is experimental and subject to change',
+      'ExperimentalWarning'
+    )
+    warningEmitted = true
+  }
+
+  return (dispatch) => {
+    return (opts, handler) => {
+      if (opts.method === 'HEAD') {
+        return dispatch(opts, handler)  // HEAD 请求跳过
+      }
+      const decompressHandler = new DecompressHandler(handler, options)
+      return dispatch(opts, decompressHandler)
+    }
+  }
+}
+```
 
 ### 3.6 Deduplicate 拦截器
 
@@ -521,9 +951,11 @@ class ResponseErrorHandler extends DecoratorHandler {
 
 ### 4.1 DecoratorHandler 基类
 
-**文件**：`lib/handler/decorator-handler.js`（72 行）
+**文件**：`lib/handler/decorator-handler.js`（73 行）
 
-所有 Handler 的基础装饰器，提供生命周期状态机保护：
+所有 Handler 的基础装饰器，提供生命周期状态机保护。已标记 `@deprecated`，推荐新代码直接实现 `DispatchHandler` 接口。
+
+#### 4.1.1 完整源码
 
 ```javascript
 module.exports = class DecoratorHandler {
@@ -532,7 +964,23 @@ module.exports = class DecoratorHandler {
   #onErrorCalled = false
   #onResponseStartCalled = false
 
-  onRequestStart (...args) { this.#handler.onRequestStart?.(...args) }
+  constructor (handler) {
+    if (typeof handler !== 'object' || handler === null) {
+      throw new TypeError('handler must be an object')
+    }
+    this.#handler = handler
+  }
+
+  onRequestStart (...args) {
+    return this.#handler.onRequestStart?.(...args)
+  }
+
+  onRequestUpgrade (...args) {
+    assert(!this.#onCompleteCalled)
+    assert(!this.#onErrorCalled)
+    return this.#handler.onRequestUpgrade?.(...args)
+  }
+
   onResponseStart (...args) {
     assert(!this.#onCompleteCalled)     // 防止完成后调用
     assert(!this.#onErrorCalled)        // 防止错误后调用
@@ -540,26 +988,91 @@ module.exports = class DecoratorHandler {
     this.#onResponseStartCalled = true
     return this.#handler.onResponseStart?.(...args)
   }
+
   onResponseData (...args) {
     assert(!this.#onCompleteCalled)
     assert(!this.#onErrorCalled)
     return this.#handler.onResponseData?.(...args)
   }
+
   onResponseEnd (...args) {
+    assert(!this.#onCompleteCalled)
+    assert(!this.#onErrorCalled)
     this.#onCompleteCalled = true
     return this.#handler.onResponseEnd?.(...args)
   }
+
   onResponseError (...args) {
     this.#onErrorCalled = true
     return this.#handler.onResponseError?.(...args)
   }
+
+  // @deprecated - 直接透传
+  onBodySent (...args) {
+    return this.#handler.onBodySent?.(...args)
+  }
+
+  onRequestSent (...args) {
+    return this.#handler.onRequestSent?.(...args)
+  }
 }
+```
+
+#### 4.1.2 Handler 生命周期状态机
+
+```
+                    ┌──────────────────────────────┐
+                    │        onRequestStart         │ ← 无状态校验
+                    └──────────────┬───────────────┘
+                                   │
+                    ┌──────────────▼───────────────┐
+                    │       onRequestUpgrade        │ ← assert(!onComplete, !onError)
+                    └──────────────┬───────────────┘
+                                   │
+                    ┌──────────────▼───────────────┐
+                    │   onBodySent / onRequestSent  │ ← @deprecated 直接透传
+                    └──────────────┬───────────────┘
+                                   │
+                    ┌──────────────▼───────────────┐
+                    │       onResponseStart         │ ← assert(!onComplete, !onError, !onResponseStartCalled)
+                    └──────────────┬───────────────┘  onResponseStartCalled = true
+                                   │
+                    ┌──────────────▼───────────────┐
+                    │       onResponseData          │ ← assert(!onComplete, !onError)
+                    └──────────────┬───────────────┘
+                                   │
+                 ┌─────────────────┴─────────────────┐
+                 │                                   │
+      ┌──────────▼──────────┐            ┌───────────▼──────────┐
+      │    onResponseEnd     │            │   onResponseError    │
+      │  onCompleteCalled=true│            │   onErrorCalled=true │
+      └─────────────────────┘            └──────────────────────┘
 ```
 
 **设计要点**：
 - 用 `assert` 做运行时状态机校验（开发阶段捕获协议违规）
 - 可选链 `?.()` 保护（handler 不一定实现所有回调）
-- 已标记 `@deprecated`，推荐新代码直接实现 `DispatchHandler` 接口
+- 状态单向流动：responseStart → responseData → responseEnd/error（不可逆）
+- `onResponseStart` 通过 `onResponseStartCalled` 防止同一 handler 被重复触发
+
+#### 4.1.3 子类继承模式
+
+所有 Handler 子类通过 `extends DecoratorHandler` 继承，在覆盖方法中选择性地调用 `super.xxx()` 保持装饰链。例如：
+
+```javascript
+class DumpHandler extends DecoratorHandler {
+  onResponseData (controller, chunk) {
+    this.#size += chunk.length
+    if (this.#size >= this.#maxSize) {
+      this.#dumped = true
+      super.onResponseEnd(controller, {})  // 提前终止
+    }
+    return true  // 不传递数据给下游
+  }
+}
+```
+
+**关键约定**：子类返回 `true` 表示拦截数据（不再调用 super）；返回 `super.xxx()` 表示透传给下游。
 
 ### 4.2 CacheHandler
 
@@ -619,6 +1132,72 @@ deleteAt = max(
 // 无 stale 指令时，额外加一个 freshness lifetime 作为 revalidation 缓冲
 ```
 
+#### 4.2.5 304 响应处理
+
+`onResponseStart` 中检测到 `statusCode === 304` 时：
+
+```javascript
+// 304 表示缓存验证成功
+if (statusCode === 304) {
+  // 重用缓存中的响应体
+  const cachedBody = this.#readStream
+  // 更新响应头（新的 Date、Age 等）
+  for (const [key, value] of Object.entries(headers)) {
+    this.#storedResponse.headers[key] = value
+  }
+  // 计算新的新鲜度
+  const freshnessLifetime = determineFreshnessLifetime(...)
+  this.#storedResponse.staleAt = cachedAt + freshnessLifetime * 1000
+}
+```
+
+#### 4.2.6 不安全方法缓存失效
+
+当 `POST`/`PUT`/`DELETE` 等不安全方法成功时，会删除同一 URL 的缓存：
+
+```javascript
+function onResponseEnd () {
+  if (isUnsafeMethod(this.#opts.method)) {
+    // 删除同一 URL 的所有缓存
+    this.#store.delete(this.#cacheKey)
+    // 同时删除 Vary 匹配的变体
+    if (this.#varyEntries) {
+      for (const varyKey of this.#varyEntries) {
+        this.#store.delete(varyKey)
+      }
+    }
+  }
+}
+```
+
+#### 4.2.7 流式双写机制
+
+`onResponseData` 中的双写：
+
+```javascript
+onResponseData (controller, chunk) {
+  if (this.#canCache) {
+    // 写入缓存存储（异步）
+    this.#writeStream.write(chunk)
+  }
+  // 同时转发给下游 handler
+  super.onResponseData(controller, chunk)
+}
+```
+
+**关键设计**：数据被"分叉"——一份写入缓存供后续命中使用，一份立即转发给用户。
+
+#### 4.2.8 stripNecessaryHeaders
+
+`stripNecessaryHeaders()`（第 765 行）在缓存存储前剥离敏感/临时性 header：
+
+```javascript
+// 移除的 headers：
+// - connection、keep-alive 等连接相关
+// - 任何 connection 指定的 hop-by-hop headers
+// - content-length（因为解压后长度可能变化）
+```
+
 ### 4.3 CacheRevalidationHandler
 
 **文件**：`lib/handler/cache-revalidation-handler.js`（134 行）
@@ -666,23 +1245,67 @@ class CacheRevalidationHandler {
 
 ```javascript
 onResponseStart (controller, statusCode, headers, statusMessage) {
-  // 301/302 + POST → GET
+  if (this.opts.throwOnMaxRedirect && this.history.length >= this.maxRedirections) {
+    throw new Error('max redirects')
+  }
+
+  let removeContentHeaders = statusCode === 303
+
+  // 301/302 + POST → GET (RFC 7231 §6.4.2)
   if ((statusCode === 301 || statusCode === 302) && this.opts.method === 'POST') {
     this.opts.method = 'GET'
+    if (util.isStream(this.opts.body)) {
+      util.destroy(this.opts.body.on('error', noop))
+    }
     this.opts.body = null
     removeContentHeaders = true
   }
-  // 303 → GET (HEAD 除外)
+
+  // 303 → GET/HEAD (RFC 7231 §6.4.4)
   if (statusCode === 303 && this.opts.method !== 'HEAD') {
     this.opts.method = 'GET'
+    if (util.isStream(this.opts.body)) {
+      util.destroy(this.opts.body.on('error', noop))
+    }
     this.opts.body = null
   }
+
+  // 判断是否需要重定向
+  this.location = this.history.length >= this.maxRedirections ||
+                  util.isDisturbed(this.opts.body) ||
+                  redirectableStatusCodes.indexOf(statusCode) === -1
+    ? null
+    : headers.location
+
+  if (this.opts.origin) {
+    this.history.push(new URL(this.opts.path, this.opts.origin))
+  }
+
+  if (!this.location) {
+    this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage)
+    return
+  }
+
+  const { origin, pathname, search } = util.parseURL(
+    new URL(this.location, this.opts.origin && new URL(this.opts.path, this.opts.origin))
+  )
+  const path = search ? `${pathname}${search}` : pathname
+
   // 重定向循环检测
+  const redirectUrlString = `${origin}${path}`
   for (const historyUrl of this.history) {
     if (historyUrl.toString() === redirectUrlString) {
-      throw new InvalidArgumentError('Redirect loop detected')
+      throw new InvalidArgumentError(
+        `Redirect loop detected. Cannot redirect to ${origin}. This typically happens when using a Client or Pool with cross-origin redirects. Use an Agent for cross-origin redirects.`
+      )
     }
   }
+
+  // Header 清理
+  this.opts.headers = cleanRequestHeaders(this.opts.headers, removeContentHeaders, this.opts.origin !== origin, this.stripHeadersOnRedirect, this.stripHeadersOnCrossOriginRedirect)
+  this.opts.path = path
+  this.opts.origin = origin
+  this.opts.query = null
 }
 ```
 
@@ -690,6 +1313,39 @@ onResponseStart (controller, statusCode, headers, statusMessage) {
 
 `cleanRequestHeaders()` 实现了 RFC 7231 的 header 清理规则：
 
+```javascript
+function shouldRemoveHeader (header, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin) {
+  const name = util.headerNameToString(header)
+  if (name === 'host') return true  // 始终移除
+  if (stripHeaders?.has(name) || (unknownOrigin && stripHeadersOnCrossOrigin?.has(name))) return true
+  if (removeContent && name.startsWith('content-')) return true
+  if (unknownOrigin) {
+    return name === 'authorization' || name === 'cookie' || name === 'proxy-authorization'
+  }
+  return false
+}
+
+function cleanRequestHeaders (headers, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin) {
+  const ret = []
+  if (Array.isArray(headers)) {
+    for (let i = 0; i < headers.length; i += 2) {
+      if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
+        ret.push(headers[i], headers[i + 1])
+      }
+    }
+  } else if (headers && typeof headers === 'object') {
+    const entries = util.hasSafeIterator(headers) ? headers : Object.entries(headers)
+    for (const [key, value] of entries) {
+      if (!shouldRemoveHeader(key, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
+        ret.push(key, value)
+      }
+    }
+  }
+  return ret
+}
+```
+
+**清理规则**：
 - 始终移除 `Host`
 - 303 或 POST→GET：移除所有 `Content-*`
 - 跨域：移除 `Authorization`、`Cookie`、`Proxy-Authorization`
@@ -707,6 +1363,19 @@ onResponseEnd (controller, trailers) {
 }
 ```
 
+#### 4.4.4 静态 buildDispatch 方法
+
+```javascript
+static buildDispatch (dispatcher, maxRedirections) {
+  if (maxRedirections != null && (!Number.isInteger(maxRedirections) || maxRedirections < 0)) {
+    throw new InvalidArgumentError('maxRedirections must be a positive number')
+  }
+
+  const dispatch = dispatcher.dispatch.bind(dispatcher)
+  return (opts, originalHandler) => dispatch(opts, new RedirectHandler(dispatch, maxRedirections, opts, originalHandler))
+}
+```
+
 ### 4.5 RetryHandler
 
 **文件**：`lib/handler/retry-handler.js`（548 行）
@@ -715,10 +1384,16 @@ onResponseEnd (controller, trailers) {
 
 #### 4.5.1 RetryController 代理
 
+**文件位置**：`lib/handler/retry-handler.js` 第 48-69 行
+
 ```javascript
 class RetryController {
   #onAbort
-  target = null  // 指向当前活跃连接的 controller
+
+  constructor (onAbort) {
+    this.#onAbort = onAbort
+    this.target = null  // 指向当前活跃连接的 controller
+  }
 
   pause () { this.target?.pause() }
   resume () { this.target?.resume() }
@@ -726,31 +1401,150 @@ class RetryController {
     this.target?.abort(reason)
     this.#onAbort(reason)  // 通知 handler 取消 backoff
   }
+
+  get paused () { return this.target?.paused ?? false }
+  get aborted () { return this.target?.aborted ?? false }
+  get reason () { return this.target?.reason ?? null }
+  get rawHeaders () { return this.target?.rawHeaders ?? null }
+  get rawTrailers () { return this.target?.rawTrailers ?? null }
 }
 ```
 
-**设计要点**：每次透明重试都是新的 dispatch（新的 controller），但下游 handler 通过 `controllerProxy` 始终操作当前活跃连接。
+**设计要点**：
 
-#### 4.5.2 默认重试策略
+```
+下游 handler 持有 controllerProxy (稳定引用)
+         │
+         │ pause()/resume()/abort()
+         ▼
+    RetryController (代理)
+         │
+         │ target 指向
+         ▼
+  ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+  │ 连接 A (旧)      │ ──► │ 连接 B (新)      │ ──► │ 连接 C (新)      │
+  │ dispatch #1      │     │ dispatch #2      │     │ dispatch #3      │
+  └──────────────────┘     └──────────────────┘     └──────────────────┘
+```
+
+每次透明重试都是新的 dispatch（新的 controller），但下游 handler 通过 `controllerProxy` 始终操作当前活跃连接。**关键问题**：如果不使用代理，当下游调用 `resume()` 时会操作旧（已死）的 controller，导致新连接永久 stalled。
+
+#### 4.5.2 构造函数与配置
+
+```javascript
+constructor (opts, { dispatch, handler }) {
+  const { retryOptions, ...dispatchOpts } = opts
+  const {
+    retry: retryFn,
+    maxRetries,
+    maxTimeout,
+    minTimeout,
+    timeoutFactor,
+    methods,
+    errorCodes,
+    retryAfter,
+    statusCodes,
+    throwOnError
+  } = retryOptions ?? {}
+
+  this.retryOpts = {
+    throwOnError: throwOnError ?? true,
+    retry: retryFn ?? RetryHandler[kRetryHandlerDefaultRetry],
+    retryAfter: retryAfter ?? true,
+    maxTimeout: maxTimeout ?? 30 * 1000,   // 30s
+    minTimeout: minTimeout ?? 500,          // 500ms
+    timeoutFactor: timeoutFactor ?? 2,
+    maxRetries: maxRetries ?? 5,
+    methods: methods ?? ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE', 'QUERY'],
+    statusCodes: statusCodes ?? [500, 502, 503, 504, 429],
+    errorCodes: errorCodes ?? [
+      'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND',
+      'ENETDOWN', 'ENETUNREACH', 'EHOSTDOWN',
+      'EHOSTUNREACH', 'EPIPE', 'UND_ERR_SOCKET'
+    ]
+  }
+
+  this.retryCount = 0
+  this.retryCountCheckpoint = 0    // 用于 Range 续传的检查点
+  this.headersSent = false
+  this.start = 0
+  this.end = null
+  this.etag = null
+  this.controllerProxy = new RetryController(reason => this.#onAbort(reason))
+  this.retryPending = false        // 等待 retry 策略决策中
+  this.retryTimer = null           // backoff 定时器引用
+  this.aborted = false             // abort 已传播到下游
+}
+```
+
+#### 4.5.3 默认重试策略
+
+`RetryHandler[kRetryHandlerDefaultRetry]`（第 222 行）是静态符号方法：
 
 ```javascript
 static [kRetryHandlerDefaultRetry] (err, { state, opts }, cb) {
-  // 方法过滤：默认只重试 GET/HEAD/OPTIONS/PUT/DELETE/TRACE/QUERY
-  // 状态码过滤：默认 [500, 502, 503, 504, 429]
-  // 错误码过滤：ECONNRESET, ECONNREFUSED, ENOTFOUND, etc.
-  // 最大重试：默认 5 次
+  const { statusCode, code, headers } = err
+  const { method, retryOptions } = opts
+  const { maxRetries, minTimeout, maxTimeout, timeoutFactor, statusCodes, errorCodes, methods, retryAfter } = retryOptions
+  const { counter } = state
 
-  // 指数退避：min(500ms * 2^(n-1), 30s)
-  // 尊重 Retry-After header
-  const retryTimeout = retryAfterHeader > 0
-    ? Math.min(retryAfterHeader, maxTimeout)
-    : Math.min(minTimeout * timeoutFactor ** (counter - 1), maxTimeout)
+  // 1. 错误码过滤 - 非 UND_ERR_REQ_RETRY 且不在 errorCodes 列表则不重试
+  if (code && code !== 'UND_ERR_REQ_RETRY' && !errorCodes.includes(code)) {
+    cb(err)  // 直接回调错误
+    return
+  }
 
+  // 2. 方法过滤 - 不在 methods 列表则不重试
+  if (Array.isArray(methods) && !methods.includes(method)) {
+    cb(err)
+    return
+  }
+
+  // 3. 状态码过滤 - 不在 statusCodes 列表则不重试
+  if (statusCode != null && Array.isArray(statusCodes) && !statusCodes.includes(statusCode)) {
+    cb(err)
+    return
+  }
+
+  // 4. 最大重试次数过滤
+  if (counter > maxRetries) {
+    cb(err)
+    return
+  }
+
+  // 5. 计算退避时间
+  let retryAfterHeader = retryAfter === false ? undefined : headers?.['retry-after']
+  if (retryAfterHeader) {
+    retryAfterHeader = Number(retryAfterHeader)
+    retryAfterHeader = Number.isNaN(retryAfterHeader)
+      ? calculateRetryAfterHeader(headers['retry-after'])  // 解析 HTTP Date
+      : retryAfterHeader * 1e3  // Retry-After 单位为秒
+  }
+
+  const retryTimeout =
+    retryAfterHeader === 0
+      ? 0
+      : retryAfterHeader > 0
+        ? Math.min(retryAfterHeader, maxTimeout)   // 尊重服务器值
+        : Math.min(minTimeout * timeoutFactor ** (counter - 1), maxTimeout)  // 指数退避
+
+  // 6. 返回 setTimeout 以便 abort 可以取消
   return setTimeout(() => cb(null), retryTimeout)
 }
 ```
 
-#### 4.5.3 Range 请求续传
+**退避公式**：`minTimeout * timeoutFactor^(counter-1)` 上限 `maxTimeout`
+
+| 重试次数 | 计算 | 实际值 |
+|---------|------|--------|
+| 1 | 500 * 2^0 | 500ms |
+| 2 | 500 * 2^1 | 1s |
+| 3 | 500 * 2^2 | 2s |
+| 4 | 500 * 2^3 | 4s |
+| 5 | 500 * 2^4 | 16s |
+| ... | ... | 30s (cap) |
+
+#### 4.5.4 Range 请求续传
 
 当请求体已部分消费（`headersSent = true`），重试使用 Range 请求续传：
 
@@ -758,27 +1552,106 @@ static [kRetryHandlerDefaultRetry] (err, { state, opts }, cb) {
 retry () {
   if (this.start !== 0) {
     const headers = { range: `bytes=${this.start}-${this.end ?? ''}` }
-    // 强 ETag 验证
+    // 强 ETag 验证 - 防止服务器资源在重试过程中变更
     if (this.etag != null) {
       headers['if-match'] = this.etag
     }
     this.opts = { ...this.opts, headers: { ...this.opts.headers, ...headers } }
   }
-  this.dispatch(this.opts, this)
+  try {
+    this.retryCountCheckpoint = this.retryCount
+    this.dispatch(this.opts, this)  // 自引用 dispatch
+  } catch (err) {
+    this.handler.onResponseError?.(this.controllerProxy, err)
+  }
 }
 ```
 
-#### 4.5.4 Abort 传播
+**206 Partial Content 处理**：
+
+```javascript
+onResponseStart (controller, statusCode, headers, statusMessage) {
+  if (this.headersSent) {
+    // 部分消费后收到 2xx，验证 Content-Range
+    if (statusCode !== 206 && (this.start > 0 || statusCode !== 200)) {
+      throw new RequestRetryError('server does not support range header...')
+    }
+    const contentRange = parseRangeHeader(headers['content-range'])
+    if (this.etag != null && this.etag !== headers.etag) {
+      throw new RequestRetryError('ETag mismatch', statusCode, ...)
+    }
+    validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+    return
+  }
+  // 第一次响应：记录 start、end、etag
+  if (statusCode === 206) {
+    const range = parseRangeHeader(headers['content-range'])
+    this.start = range.start
+    this.end = range.end
+  }
+  this.resume = true
+  this.etag = headers.etag
+  // 忽略弱 etag (W/"...")
+  if (this.etag != null && this.etag[0] === 'W' && this.etag[1] === '/') {
+    this.etag = null
+  }
+  this.headersSent = true
+  this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+}
+```
+
+#### 4.5.5 Abort 传播
 
 ```javascript
 #onAbort (reason) {
-  if (!this.retryPending) return
+  if (!this.retryPending) return  // 没有待决策的 retry，无需处理
   this.aborted = true
   this.retryPending = false
   clearTimeout(this.retryTimer)  // 取消 backoff 定时器
+  this.retryTimer = null
   this.handler.onResponseError?.(this.controllerProxy, reason ?? new RequestAbortedError())
 }
 ```
+
+**关键流程**：
+
+```
+用户 abort()
+    │
+    ▼
+controllerProxy.abort()
+    ├─► target?.abort()       // 中止当前连接
+    └─► #onAbort()
+         ├─► clearTimeout(retryTimer)  // 取消 backoff 等待
+         └─► handler.onResponseError()  // 传播错误到下游
+```
+
+#### 4.5.6 retry interceptor 与 RetryHandler 的关系
+
+| 层次 | 文件 | 职责 |
+|------|------|------|
+| Interceptor | `lib/interceptor/retry.js` (19 行) | 入口包装，注入 `retryOptions` 到 opts |
+| Handler | `lib/interceptor/retry-handler.js` (548 行) | 完整重试逻辑 |
+
+**retry 拦截器源码**：
+
+```javascript
+module.exports = globalOpts => {
+  return dispatch => {
+    return function retryInterceptor (opts, handler) {
+      return dispatch(
+        opts,
+        new RetryHandler(
+          { ...opts, retryOptions: { ...globalOpts, ...opts.retryOptions } },
+          { handler, dispatch }  // 传递 handler 和 dispatch 引用
+        )
+      )
+    }
+  }
+}
+```
+
+**设计要点**：Interceptor 仅 19 行，纯委托。所有复杂逻辑都在 Handler 中，因为重试需要管理多个连接的状态（controller、retryCount、backoff 定时器），这些超出了 Interceptor 的简单替换 handler 的能力。
 
 ### 4.6 DeduplicationHandler
 
@@ -790,12 +1663,12 @@ retry () {
 
 ```javascript
 const waitingHandler = {
-  handler,              // 下游 handler
-  controller,           // 独立 controller（每个 waiting handler 有自己的流控状态）
-  bufferedChunks: [],   // 暂停时缓冲的数据
-  bufferedBytes: 0,     // 缓冲字节数
+  handler,               // 下游 handler
+  controller,            // 独立 controller（每个 waiting handler 有自己的流控状态）
+  bufferedChunks: [],    // 暂停时缓冲的数据
+  bufferedBytes: 0,      // 缓冲字节数
   pendingTrailers: null, // 暂停时缓存的 trailers
-  done: false           // 是否已完成
+  done: false            // 是否已完成
 }
 ```
 
@@ -806,17 +1679,34 @@ const waitingHandler = {
 ```javascript
 controller = {
   resume: () => {
+    if (state.aborted) return
     state.paused = false
     this.#flushWaitingHandler(waitingHandler)  // 刷出缓冲数据
     // 如果主响应已完成且缓冲区空，发送 trailers
-    if (this.#completed && waitingHandler.pendingTrailers && ...) {
-      handler.onResponseEnd?.(controller, waitingHandler.pendingTrailers)
+    if (
+      this.#completed &&
+      waitingHandler.pendingTrailers &&
+      waitingHandler.bufferedChunks.length === 0 &&
+      !state.paused &&
+      !state.aborted
+    ) {
+      waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, waitingHandler.pendingTrailers)
+      waitingHandler.pendingTrailers = null
+      waitingHandler.done = true
     }
+    this.#pruneDoneWaitingHandlers()
   },
-  pause: () => { state.paused = true },
+  pause: () => {
+    if (!state.aborted) state.paused = true
+  },
   abort: (reason) => {
+    if (state.aborted) return
     state.aborted = true
-    handler.onResponseError?.(controller, reason ?? new RequestAbortedError())
+    waitingHandler.done = true
+    waitingHandler.pendingTrailers = null
+    waitingHandler.bufferedChunks = []
+    waitingHandler.bufferedBytes = 0
+    handler.onResponseError?.(waitingHandler.controller, state.reason ?? new RequestAbortedError())
   }
 }
 ```
@@ -826,10 +1716,101 @@ controller = {
 `#bufferWaitingChunk()` 中有 `maxBufferSize`（默认 5MB）保护：
 
 ```javascript
-if (waitingHandler.bufferedBytes > this.#maxBufferSize) {
-  const err = new RequestAbortedError(`Deduplicated waiting handler exceeded maxBufferSize`)
-  this.#errorWaitingHandler(waitingHandler, err)
+#bufferWaitingChunk (waitingHandler, chunk) {
+  if (waitingHandler.done || waitingHandler.controller.aborted) {
+    waitingHandler.done = true
+    waitingHandler.bufferedChunks = []
+    waitingHandler.bufferedBytes = 0
+    return
+  }
+  const bufferedChunk = Buffer.from(chunk)
+  waitingHandler.bufferedChunks.push(bufferedChunk)
+  waitingHandler.bufferedBytes += bufferedChunk.length
+
+  if (waitingHandler.bufferedBytes > this.#maxBufferSize) {
+    const err = new RequestAbortedError(
+      `Deduplicated waiting handler exceeded maxBufferSize (${this.#maxBufferSize} bytes) while paused`
+    )
+    this.#errorWaitingHandler(waitingHandler, err)
+  }
 }
+```
+
+#### 4.6.4 主/从 Handler 广播机制
+
+```
+主 Handler (primaryHandler) ─── 直接发送到第一个请求的 handler
+     │
+     ├── waitingHandler #1 (独立 controller + buffer)
+     ├── waitingHandler #2 (独立 controller + buffer)
+     └── waitingHandler #3 (独立 controller + buffer)
+```
+
+```javascript
+// onResponseData 广播到所有 waiting handlers
+onResponseData (controller, chunk) {
+  if (this.#aborted || this.#completed) return
+  this.#responseDataStarted = true
+  this.#primaryHandler.onResponseData?.(controller, chunk)
+
+  for (const waitingHandler of this.#waitingHandlers) {
+    const { handler, controller: waitingController } = waitingHandler
+    if (waitingHandler.done || waitingController.aborted) {
+      waitingHandler.done = true
+      continue
+    }
+    if (waitingController.paused) {
+      this.#bufferWaitingChunk(waitingHandler, chunk)  // 暂停时缓冲
+      continue
+    }
+    try {
+      handler.onResponseData?.(waitingController, chunk)
+    } catch {
+      // 忽略 waiting handler 的错误
+    }
+    if (waitingController.aborted) {
+      waitingHandler.done = true
+      waitingHandler.bufferedChunks = []
+      waitingHandler.bufferedBytes = 0
+    }
+  }
+  this.#pruneDoneWaitingHandlers()  // 清理已完成的 handler
+}
+```
+
+#### 4.6.5 diagnostics_channel 集成
+
+```javascript
+const pendingRequestsChannel = diagnosticsChannel.channel('undici:request:pending-requests')
+
+// 新增 pending 请求时
+if (pendingRequestsChannel.hasSubscribers) {
+  pendingRequestsChannel.publish({ size: pendingRequests.size, key: dedupeKey, type: 'added' })
+}
+
+// 完成移除时
+if (pendingRequestsChannel.hasSubscribers) {
+  pendingRequestsChannel.publish({ size: pendingRequests.size, key: dedupeKey, type: 'removed' })
+}
+```
+
+#### 4.6.6 配置选项
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `methods` | `['GET']` | 可去重的方法（必须是安全方法） |
+| `skipHeaderNames` | `[]` | 存在这些 header 时跳过去重 |
+| `excludeHeaderNames` | `[]` | 生成去重键时排除的 header |
+| `maxBufferSize` | `5 * 1024 * 1024` | 暂停时单个 waiting handler 的最大缓冲 |
+
+**配置示例**：
+
+```javascript
+dispatch = deduplicate({
+  methods: ['GET', 'HEAD'],
+  excludeHeaderNames: ['authorization'],  // 不同 auth 不去重
+  maxBufferSize: 10 * 1024 * 1024         // 10MB 缓冲
+})(dispatch)
 ```
 
 ---
@@ -901,9 +1882,15 @@ enableNetConnect (matcher) {
   // false = 全部禁止
   // [string|RegExp|Function] = 白名单
   if (typeof matcher === 'string' || typeof matcher === 'function' || matcher instanceof RegExp) {
-    this[kNetConnect] = [...(this[kNetConnect] || []), matcher]
-  } else if (matcher === undefined) {
+    if (Array.isArray(this[kNetConnect])) {
+      this[kNetConnect].push(matcher)  // 追加到白名单
+    } else {
+      this[kNetConnect] = [matcher]
+    }
+  } else if (typeof matcher === 'undefined') {
     this[kNetConnect] = true
+  } else {
+    throw new InvalidArgumentError('Unsupported matcher')
   }
 }
 
@@ -912,46 +1899,228 @@ disableNetConnect () {
 }
 ```
 
-#### 5.1.5 未消费拦截器断言
+#### 5.1.5 dispatch 路由完整流程
+
+`dispatch()`（第 72 行）是 Mock 系统的核心路由：
 
 ```javascript
-assertNoPendingInterceptors () {
+dispatch (opts, handler) {
+  opts.origin = normalizeOrigin(opts.origin)  // 1. 标准化 origin
+
+  const mockDispatcher = this.get(opts.origin)  // 2. 获取 MockClient/MockPool
+
+  this[kMockAgentAddCallHistoryLog](opts)  // 3. 记录调用历史
+
+  const acceptNonStandardSearchParameters = this[kMockAgentAcceptsNonStandardSearchParameters]
+  const dispatchOpts = { ...opts }
+
+  // 4. 处理 allowH2=false（HTTP/1.1 only 模式）
+  //    Agent 对 HTTP/1.1 使用独立 key，需要镜像 mock dispatches
+  if (dispatchOpts.allowH2 === false) {
+    const http1OnlyKey = `${dispatchOpts.origin}#http1-only`
+    if (!this[kClients].has(http1OnlyKey)) {
+      const http1OnlyDispatcher = this[kFactory](dispatchOpts.origin)
+      http1OnlyDispatcher[kDispatches] = mockDispatcher[kDispatches]  // 共享拦截规则
+      this[kMockAgentSet](http1OnlyKey, http1OnlyDispatcher)
+    }
+  }
+
+  // 5. 非标准搜索参数处理
+  if (acceptNonStandardSearchParameters && dispatchOpts.path) {
+    const [path, searchParams] = dispatchOpts.path.split('?')
+    const normalizedSearchParams = normalizeSearchParams(searchParams, acceptNonStandardSearchParameters)
+    dispatchOpts.path = `${path}?${normalizedSearchParams}`
+  }
+
+  return this[kAgent].dispatch(dispatchOpts, handler)  // 6. 委托给真实 Agent
+}
+```
+
+#### 5.1.6 Origin 标准化
+
+`normalizeOrigin()` 确保 origin 为小写字符串：
+
+```javascript
+function normalizeOrigin (origin) {
+  if (typeof origin !== 'string' && !(origin instanceof URL)) {
+    return origin
+  }
+  if (origin instanceof URL) {
+    return origin.origin
+  }
+  return origin.toLowerCase()
+}
+```
+
+**注意**：URL 会被转为 `origin` 形式（仅 protocol+host+port），丢弃 path 和 query。
+
+#### 5.1.7 未消费拦截器断言
+
+```javascript
+pendingInterceptors () {
+  const mockAgentClients = this[kClients]
+  return Array.from(mockAgentClients.entries())
+    .flatMap(([origin, dispatcher]) =>
+      dispatcher[kDispatches].map(dispatch => ({ ...dispatch, origin }))
+    )
+    .filter(({ pending }) => pending)  // 只返回未消费的
+}
+
+assertNoPendingInterceptors ({ pendingInterceptorsFormatter = new PendingInterceptorsFormatter() } = {}) {
   const pending = this.pendingInterceptors()
   if (pending.length === 0) return
   throw new UndiciError(
-    `${pending.length} interceptors are pending:\n\n${formatter.format(pending)}`
+    pending.length === 1
+      ? `1 interceptor is pending:\n\n${pendingInterceptorsFormatter.format(pending)}`.trim()
+      : `${pending.length} interceptors are pending:\n\n${pendingInterceptorsFormatter.format(pending)}`.trim()
   )
 }
 ```
 
-使用 `PendingInterceptorsFormatter`（43 行）生成 `console.table` 格式的报告。
+`PendingInterceptorsFormatter`（43 行）生成 `console.table` 格式的报告：
+
+```javascript
+format (pendingInterceptors) {
+  const withPrettyHeaders = pendingInterceptors.map(
+    ({ method, path, data: { statusCode }, persist, times, timesInvoked, origin }) => ({
+      Method: method,
+      Origin: origin,
+      Path: path,
+      'Status code': statusCode,
+      Persistent: persist ? PERSISTENT : NOT_PERSISTENT,
+      Invocations: timesInvoked,
+      Remaining: persist ? Infinity : times - timesInvoked
+    })
+  )
+  this.logger.table(withPrettyHeaders)
+  return this.transform.read().toString()
+}
+```
+
+#### 5.1.8 MockAgent 完整配置
+
+```javascript
+const mockAgent = new MockAgent({
+  agent: customAgent,        // 自定义真实 Agent（用于 record 模式）
+  connections: 1,            // 1=MockClient, >1=MockPool
+  enableCallHistory: true,   // 启用调用历史
+  ignoreTrailingSlash: true, // 匹配时忽略尾部 /
+  acceptNonStandardSearchParameters: true  // 接受非标准搜索参数
+})
+```
+
+#### 5.1.9 调用历史 API
+
+```javascript
+// 启用/禁用调用历史
+mockAgent.enableCallHistory()   // 链式调用
+mockAgent.disableCallHistory()
+
+// 获取调用历史
+const history = mockAgent.getCallHistory()
+history.firstCall()             // 第一次调用
+history.lastCall()              // 最后一次调用
+history.nthCall(3)              // 第 3 次调用（非零基索引）
+history.filterCallsByMethod('GET')
+history.filterCalls({ path: '/api', method: 'GET' }, { operator: 'AND' })
+
+// 清理
+mockAgent.clearCallHistory()
+```
 
 ### 5.2 MockClient / MockPool
 
 **文件**：`lib/mock/mock-client.js`（68 行）、`lib/mock/mock-pool.js`（68 行）
 
-两者几乎完全相同，分别继承 `Client` 和 `Pool`：
+两者几乎完全相同，分别继承 `Client` 和 `Pool`。
+
+#### 5.2.1 MockClient 完整实现
 
 ```javascript
 class MockClient extends Client {
   constructor (origin, opts) {
+    if (!opts || !opts.agent || typeof opts.agent.dispatch !== 'function') {
+      throw new InvalidArgumentError('Argument opts.agent must implement Agent')
+    }
+
     super(origin, opts)
-    this[kDispatches] = []                      // 拦截规则列表
-    this[kOriginalDispatch] = this.dispatch     // 保存原始 dispatch
-    this.dispatch = buildMockDispatch.call(this) // 替换为 mock dispatch
+
+    this[kMockAgent] = opts.agent                    // 反向引用 MockAgent
+    this[kOrigin] = origin
+    this[kIgnoreTrailingSlash] = opts.ignoreTrailingSlash ?? false
+    this[kDispatches] = []                           // 拦截规则列表
+    this[kConnected] = 1
+    this[kOriginalDispatch] = this.dispatch           // 保存原始 dispatch
+    this[kOriginalClose] = this.close.bind(this)     // 保存原始 close
+
+    this.dispatch = buildMockDispatch.call(this)     // 替换为 mock dispatch
+    this.close = this[kClose]                        // 替换 close
+  }
+
+  get [Symbols.kConnected] () {
+    return this[kConnected]
   }
 
   intercept (opts) {
-    return new MockInterceptor(opts, this[kDispatches])
+    return new MockInterceptor(
+      opts && { ignoreTrailingSlash: this[kIgnoreTrailingSlash], ...opts },
+      this[kDispatches]
+    )
   }
 
   cleanMocks () {
     this[kDispatches] = []
   }
+
+  async [kClose] () {
+    await promisify(this[kOriginalClose])()
+    this[kConnected] = 0
+    this[kMockAgent][Symbols.kClients].delete(this[kOrigin])  // 清理引用
+  }
 }
 ```
 
-**核心替换**：构造函数中将 `this.dispatch` 替换为 `buildMockDispatch()` 生成的 mock dispatch。
+**核心替换**：构造函数中将 `this.dispatch` 替换为 `buildMockDispatch()` 生成的 mock dispatch。这种"猴子补丁"模式是 undici Mock 系统的核心。
+
+#### 5.2.2 dispatch 替换机制
+
+```
+构造时:
+  this.dispatch ──────────────► Client.prototype.dispatch (原始)
+  this[kOriginalDispatch] ────► 保存原始引用
+  this.dispatch = buildMockDispatch() ──► 替换为新的 dispatch 函数
+
+运行时:
+  this.dispatch(opts, handler)
+       │
+       ▼
+  buildMockDispatch 返回的函数
+       │
+       ├─ agent.isMockActive === false ──► originalDispatch(opts, handler)  // 真实请求
+       │
+       └─ agent.isMockActive === true ──► mockDispatch(opts, handler)
+              │
+              ├─ 匹配成功 ──► 返回 mock 响应
+              │
+              └─ MockNotMatchedError ──► checkNetConnect()
+                    │
+                    ├─ 允许 ──► originalDispatch(opts, handler)  // 回退真实请求
+                    └─ 拒绝 ──► 抛出错误
+```
+
+#### 5.2.3 与真实 Agent 的关系
+
+```
+MockAgent
+  ├── kAgent ──────────────► 真实 Agent
+  │                           ├── kClients (Map<origin, dispatcher>)
+  │                           │   ├── "http://api.example.com" ──► MockClient
+  │                           │   └── "http://cdn.example.com" ──► MockPool
+  │                           └── dispatch()
+  │
+  ├── kIsMockActive ───────► true/false 控制开关
+  └── kNetConnect ─────────► 网络连接白名单/黑名单
+```
 
 ### 5.3 MockInterceptor / MockScope
 
@@ -959,38 +2128,105 @@ class MockClient extends Client {
 
 #### 5.3.1 MockInterceptor（拦截规则定义）
 
+**文件**：`lib/mock/mock-interceptor.js`（227 行）
+
 ```javascript
 class MockInterceptor {
   constructor (opts, mockDispatches) {
-    // path 必须定义，method 默认 GET
-    // query 参数合并到 path
+    if (typeof opts !== 'object') {
+      throw new InvalidArgumentError('opts must be an object')
+    }
+    if (typeof opts.path === 'undefined') {
+      throw new InvalidArgumentError('opts.path must be defined')
+    }
+    if (typeof opts.method === 'undefined') {
+      opts.method = 'GET'
+    }
+    // path 处理：合并 query，解析 URL
+    if (typeof opts.path === 'string') {
+      if (opts.query) {
+        opts.path = serializePathWithQuery(opts.path, opts.query)
+      } else {
+        const parsedURL = new URL(opts.path, 'data://')
+        opts.path = parsedURL.pathname + parsedURL.search
+      }
+    }
+    if (typeof opts.method === 'string') {
+      opts.method = opts.method.toUpperCase()
+    }
+
     this[kDispatchKey] = buildKey(opts)       // { path, method, body, headers, query }
     this[kDispatches] = mockDispatches
+    this[kIgnoreTrailingSlash] = opts.ignoreTrailingSlash ?? false
+    this[kDefaultHeaders] = {}
+    this[kDefaultTrailers] = {}
+    this[kContentLength] = false
   }
 
+  createMockScopeDispatchData ({ statusCode, data, responseOptions }) {
+    const responseData = getResponseData(data)
+    const contentLength = this[kContentLength] ? { 'content-length': responseData.length } : {}
+    const headers = { ...this[kDefaultHeaders], ...contentLength, ...responseOptions.headers }
+    const trailers = { ...this[kDefaultTrailers], ...responseOptions.trailers }
+    return { statusCode, data, headers, trailers }
+  }
+
+  // 支持三种调用形式：
+  // .reply(statusCode)                      - 只有状态码
+  // .reply(statusCode, data)               - 状态码 + body
+  // .reply(statusCode, data, options)      - 完整配置
+  // .reply(callback)                       - 回调函数（动态响应）
   reply (replyOptionsCallbackOrStatusCode) {
-    // 支持静态值和回调函数两种形式
     if (typeof replyOptionsCallbackOrStatusCode === 'function') {
       // 回调式：支持异步回调
-      const wrappedCallback = (opts) => {
+      const resolveReplyCallbackData = (resolvedData) => {
+        if (typeof resolvedData !== 'object' || resolvedData === null) {
+          throw new InvalidArgumentError('reply options callback must return an object')
+        }
+        const replyParameters = { data: '', responseOptions: {}, ...resolvedData }
+        this.validateReplyParameters(replyParameters)
+        return { ...this.createMockScopeDispatchData(replyParameters) }
+      }
+      const wrappedDefaultsCallback = (opts) => {
         const resolvedData = replyOptionsCallbackOrStatusCode(opts)
         if (isPromise(resolvedData)) {
-          return resolvedData.then(resolveReplyCallbackData)
+          return resolvedData.then(resolveReplyCallbackData)  // 支持异步
         }
         return resolveReplyCallbackData(resolvedData)
       }
-      const newMockDispatch = addMockDispatch(this[kDispatches], this[kDispatchKey], wrappedCallback)
+      const newMockDispatch = addMockDispatch(this[kDispatches], this[kDispatchKey], wrappedDefaultsCallback, { ignoreTrailingSlash: this[kIgnoreTrailingSlash] })
       return new MockScope(newMockDispatch)
     }
     // 静态值式
+    const replyParameters = {
+      statusCode: replyOptionsCallbackOrStatusCode,
+      data: arguments[1] === undefined ? '' : arguments[1],
+      responseOptions: arguments[2] === undefined ? {} : arguments[2]
+    }
+    this.validateReplyParameters(replyParameters)
     const dispatchData = this.createMockScopeDispatchData(replyParameters)
-    const newMockDispatch = addMockDispatch(this[kDispatches], this[kDispatchKey], dispatchData)
+    const newMockDispatch = addMockDispatch(this[kDispatches], this[kDispatchKey], dispatchData, { ignoreTrailingSlash: this[kIgnoreTrailingSlash] })
     return new MockScope(newMockDispatch)
   }
 
   replyWithError (error) {
-    const newMockDispatch = addMockDispatch(this[kDispatches], this[kDispatchKey], { error })
+    const newMockDispatch = addMockDispatch(this[kDispatches], this[kDispatchKey], { error }, { ignoreTrailingSlash: this[kIgnoreTrailingSlash] })
     return new MockScope(newMockDispatch)
+  }
+
+  defaultReplyHeaders (headers) {
+    this[kDefaultHeaders] = headers
+    return this  // 链式
+  }
+
+  defaultReplyTrailers (trailers) {
+    this[kDefaultTrailers] = trailers
+    return this
+  }
+
+  replyContentLength () {
+    this[kContentLength] = true
+    return this
   }
 }
 ```
@@ -1018,9 +2254,36 @@ class MockScope {
 
 ```javascript
 mockPool.intercept({ path: '/api/users', method: 'GET' })
+  .defaultReplyHeaders({ 'x-powered-by': 'test' })
+  .replyContentLength()
   .reply(200, { users: [] }, { headers: { 'content-type': 'application/json' } })
   .delay(100)   // 延迟 100ms
   .times(3)     // 前 3 次使用
+  .persist()    // 永不过期
+```
+
+**高级用法**：
+
+```javascript
+// 异步回调
+mockPool.intercept({ path: '/api/users' })
+  .reply((opts) => {
+    if (opts.headers?.authorization) {
+      return { statusCode: 200, data: mockUsers }
+    }
+    return { statusCode: 401, data: { error: 'Unauthorized' } }
+  })
+
+// 错误模拟
+mockPool.intercept({ path: '/api/fail' })
+  .replyWithError(new Error('Connection refused'))
+
+// 异步回调
+mockPool.intercept({ path: '/api/async' })
+  .reply(async (opts) => {
+    const result = await fetchRealData(opts)
+    return { statusCode: 200, data: result }
+  })
 ```
 
 ### 5.4 MockUtils 核心引擎
@@ -1097,22 +2360,46 @@ function getMockDispatch (mockDispatches, key) {
 function mockDispatch (opts, handler) {
   const key = buildKey(opts)
   const mockDispatch = getMockDispatch(this[kDispatches], key)
+  const mockDispatches = this[kDispatches]
 
   mockDispatch.timesInvoked++
+
+  const { timesInvoked, times } = mockDispatch
+
+  // 标记消费状态
   mockDispatch.consumed = !mockDispatch.persist && timesInvoked >= times
   mockDispatch.pending = timesInvoked < times
 
-  // 回调式回复
-  if (mockDispatch.data.callback) {
-    const callbackResult = mockDispatch.data.callback(opts)
+  const hasBodyHooks = typeof handler.onBodySent === 'function' ||
+    typeof handler.onRequestSent === 'function'
+
+  // 回调式回复（且无 body hooks 或 body 为空时立即调用）
+  if (mockDispatch.data.callback && (!hasBodyHooks || opts.body == null)) {
+    const { callback, ...responseDefaults } = mockDispatch.data
+    const callbackResult = callback(opts)
+
     if (isPromise(callbackResult)) {
-      callbackResult.then(resolved => dispatchMockReply(...), err => handler.onResponseError(null, err))
+      callbackResult.then(
+        (resolvedData) => {
+          if (resolvedData == null || typeof resolvedData !== 'object') {
+            handler.onResponseError(null, new InvalidArgumentError('reply options callback must return an object'))
+            return
+          }
+          dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler, { ...responseDefaults, ...resolvedData })
+        },
+        (error) => handler.onResponseError(null, error)
+      )
       return true
     }
-    return dispatchMockReply(...)
+
+    if (callbackResult == null || typeof callbackResult !== 'object') {
+      throw new InvalidArgumentError('reply options callback must return an object')
+    }
+
+    return dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler, { ...responseDefaults, ...callbackResult })
   }
 
-  return dispatchMockReply(...)
+  return dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler)
 }
 ```
 
@@ -1122,45 +2409,153 @@ function mockDispatch (opts, handler) {
 
 ```javascript
 function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler, resolvedResponse) {
-  const response = resolvedResponse ?? mockDispatch.data
+  const { data: responseData, delay } = mockDispatch
+  const response = resolvedResponse ?? responseData
 
-  // 错误模拟
+  // 1. 错误模拟
   if (response.error !== null) {
     deleteMockDispatch(mockDispatches, key)
     handler.onResponseError(null, response.error)
     return true
   }
 
-  // 创建 controller
-  const controller = { paused: false, pause() {}, resume() {}, abort(reason) { ... } }
+  let aborted = false
+  let timer = null
 
-  // Request 生命周期
-  handler.onRequestStart?.(controller, null)
-  dispatchRequestBody(opts.body, handler, controller)  // 处理请求体
-
-  function sendReply () {
-    // 延迟回复
-    if (delay > 0) {
-      timer = setTimeout(() => handleReply(), delay)
-    } else {
-      handleReply()
+  // 2. 创建 controller（提前创建以便 abort 使用）
+  const controller = {
+    paused: false,
+    rawHeaders: null,
+    rawTrailers: null,
+    pause () { this.paused = true },
+    resume () { this.paused = false },
+    abort: (reason) => {
+      if (aborted) return
+      aborted = true
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      handler.onResponseError?.(controller, reason)
     }
   }
 
-  function handleReply () {
+  let replyOpts = opts
+  handler.onRequestStart?.(controller, null)
+
+  if (aborted) return true
+
+  // 3. 处理请求体（触发 body hooks）
+  const requestBody = dispatchRequestBody(opts.body, handler, controller, () => aborted)
+
+  if (isPromise(requestBody)) {
+    requestBody.then((body) => {
+      if (body === requestAborted) return
+      if (body !== opts.body) replyOpts = { ...opts, body }
+      sendReply()
+    }, (error) => controller.abort(error))
+    return true
+  }
+
+  if (requestBody === requestAborted) return true
+  if (requestBody !== opts.body) replyOpts = { ...opts, body: requestBody }
+
+  sendReply()
+
+  function sendReply () {
+    if (response.callback) {
+      const { callback, ...responseDefaults } = response
+      let callbackResult
+      try {
+        callbackResult = callback(replyOpts)
+      } catch (err) {
+        deleteMockDispatch(mockDispatches, key)
+        handler.onResponseError(null, err)
+        return
+      }
+
+      if (isPromise(callbackResult)) {
+        callbackResult.then(
+          (resolvedData) => handleReply(dispatches, { ...responseDefaults, ...resolvedData }),
+          (err) => handler.onResponseError(null, err)
+        )
+        return
+      }
+
+      handleReply(dispatches, { ...responseDefaults, ...callbackResult })
+      return
+    }
+
+    // 延迟回复
+    if (typeof delay === 'number' && delay > 0) {
+      timer = setTimeout(() => {
+        timer = null
+        handleReply(dispatches)
+      }, delay)
+    } else {
+      handleReply(dispatches)
+    }
+  }
+
+  function handleReply (mockDispatches, _response = response) {
+    if (aborted) return
+
+    const { statusCode, data, headers, trailers } = _response
+
+    // 支持 data 为函数（动态生成 body）
+    const optsHeaders = Array.isArray(opts.headers) ? buildHeadersFromArray(opts.headers) : opts.headers
+    const body = typeof data === 'function' ? data({ ...replyOpts, headers: optsHeaders }) : data
+
+    if (isPromise(body)) {
+      return body.then((newData) => handleReply(mockDispatches, { ..._response, data: newData }))
+    }
+
+    if (aborted) return
+
     const responseData = getResponseData(body)
-    const responseHeaders = generateKeyValues(headers)
-    const responseTrailers = generateKeyValues(trailers)
+    const responseHeaders = generateKeyValues(headers ?? {})
+    const responseTrailers = generateKeyValues(trailers ?? {})
 
     controller.rawHeaders = responseHeaders
     controller.rawTrailers = responseTrailers
 
+    // 模拟 HTTP 响应生命周期
     handler.onResponseStart?.(controller, statusCode, parseHeaders(responseHeaders), getStatusText(statusCode))
     handler.onResponseData?.(controller, Buffer.from(responseData))
     handler.onResponseEnd?.(controller, parseHeaders(responseTrailers))
     deleteMockDispatch(mockDispatches, key)
   }
+
+  return true
 }
+```
+
+**完整生命周期时序**：
+
+```
+Mock 响应时序:
+┌─────────────────────────────────────────────────────────┐
+│ mockDispatch()                                          │
+│   │                                                     │
+│   ├─ getMockDispatch()  // 查找匹配的拦截规则          │
+│   │                                                     │
+│   ├─ handler.onRequestStart(controller)                │
+│   │                                                     │
+│   ├─ dispatchRequestBody()                             │
+│   │   ├─ handler.onBodySent(chunk)  // 如果有          │
+│   │   └─ handler.onRequestSent()                       │
+│   │                                                     │
+│   ├─ sendReply() (可选 delay)                          │
+│   │   ├─ callback(opts)  // 动态响应                  │
+│   │   │   └─ 如果是 Promise，等待 resolve              │
+│   │   │                                                │
+│   │   └─ handleReply()                                 │
+│   │       ├─ handler.onResponseStart(code, headers)    │
+│   │       ├─ handler.onResponseData(body)              │
+│   │       └─ handler.onResponseEnd(trailers)           │
+│   │                                                     │
+│   └─ deleteMockDispatch()  // 清理已消费的规则         │
+└─────────────────────────────────────────────────────────┘
 ```
 
 #### 5.4.6 请求体处理
@@ -1211,17 +2606,26 @@ function buildMockDispatch () {
         mockDispatch.call(this, opts, handler)
       } catch (error) {
         if (error.code === 'UND_MOCK_ERR_MOCK_NOT_MATCHED') {
-          // 未匹配的请求：检查网络连接权限
           const netConnect = agent[kGetNetConnect]()
+          const totalInterceptsCount = this[kDispatches][kTotalDispatchCount] || this[kDispatches].length
+          const pendingInterceptsCount = this[kDispatches].filter(({ consumed }) => !consumed).length
+          const interceptsMessage = `, ${pendingInterceptsCount} interceptor(s) remaining out of ${totalInterceptsCount} defined`
           if (netConnect === false) {
-            throw new MockNotMatchedError('net.connect disabled')
+            throw new MockNotMatchedError(
+              `${error.message}: subsequent request to origin ${origin} was not allowed (net.connect disabled)${interceptsMessage}`
+            )
           }
           if (checkNetConnect(netConnect, origin)) {
-            // 允许真实网络请求
-            originalDispatch.call(this, opts, handler)
+            originalDispatch.call(this, '__mockAgentBodyForDispatch' in opts
+              ? { ...opts, body: opts.__mockAgentBodyForDispatch }
+              : opts, handler)
           } else {
-            throw new MockNotMatchedError('net.connect not enabled for origin')
+            throw new MockNotMatchedError(
+              `${error.message}: subsequent request to origin ${origin} was not allowed (net.connect is not enabled for this origin)${interceptsMessage}`
+            )
           }
+        } else {
+          throw error
         }
       }
     } else {
@@ -1230,6 +2634,112 @@ function buildMockDispatch () {
   }
 }
 ```
+
+**设计要点**：
+- 捕获 `MockNotMatchedError` 后回退到真实网络
+- 错误信息包含剩余拦截器数量，便于调试
+- `__mockAgentBodyForDispatch` 是内部标记，用于 body 修复
+
+#### 5.4.8 checkNetConnect 白名单检查
+
+```javascript
+function checkNetConnect (netConnect, origin) {
+  const url = new URL(origin)
+  if (netConnect === true) {
+    return true
+  } else if (Array.isArray(netConnect) && netConnect.some((matcher) => matchValue(matcher, url.host))) {
+    return true  // 匹配 host
+  }
+  return false
+}
+```
+
+#### 5.4.9 getResponseData 数据类型处理
+
+```javascript
+function getResponseData (data) {
+  if (Buffer.isBuffer(data)) return data
+  else if (data instanceof Uint8Array) return data
+  else if (data instanceof ArrayBuffer) return data
+  else if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+  else if (typeof data === 'object') return JSON.stringify(data)
+  else if (data) return data.toString()
+  else return ''
+}
+```
+
+#### 5.4.10 dispatchRequestBody 完整流程
+
+```javascript
+function dispatchRequestBody (body, handler, controller, isAborted) {
+  // 1. 无 body hooks → 直接返回
+  if (typeof handler.onBodySent !== 'function' && typeof handler.onRequestSent !== 'function') {
+    return body
+  }
+
+  // 2. null body → 只调 onRequestSent
+  if (body == null) {
+    return callOnRequestSent(handler, controller, isAborted) ? body : requestAborted
+  }
+
+  // 3. AsyncIterable body → 异步迭代
+  if (body && typeof body[Symbol.asyncIterator] === 'function') {
+    return dispatchAsyncIterableBody(body, handler, controller, isAborted)
+  }
+
+  // 4. Iterable body → 同步迭代
+  if (isIterableBody(body)) {
+    const chunks = []
+    for (const chunk of body) {
+      if (isAborted()) return requestAborted
+      chunks.push(chunk)
+      if (!callOnBodySent(handler, controller, chunk) || isAborted()) {
+        return requestAborted
+      }
+    }
+    return callOnRequestSent(handler, controller, isAborted) ? chunks : requestAborted
+  }
+
+  // 5. 普通 body
+  if (isAborted()) return requestAborted
+  if (!callOnBodySent(handler, controller, body)) return requestAborted
+  return callOnRequestSent(handler, controller, isAborted) ? body : requestAborted
+}
+
+// 判断是否为可迭代 body（排除 string/Buffer/TypedArray）
+function isIterableBody (body) {
+  return typeof body !== 'string' &&
+    !Buffer.isBuffer(body) &&
+    !ArrayBuffer.isView(body) &&
+    typeof body[Symbol.iterator] === 'function'
+}
+```
+
+#### 5.4.11 请求体发送钩子
+
+```javascript
+function callOnBodySent (handler, controller, chunk) {
+  try {
+    handler.onBodySent?.(chunk)
+    return true
+  } catch (error) {
+    controller.abort(error)  // 错误时中止请求
+    return false
+  }
+}
+
+function callOnRequestSent (handler, controller, isAborted) {
+  try {
+    handler.onRequestSent?.()
+    return !isAborted()
+  } catch (error) {
+    controller.abort(error)
+    return false
+  }
+}
+```
+
+**关键设计**：钩子中的错误会触发 `controller.abort(error)`，让错误冒泡到 response error 回调。
 
 ### 5.5 MockCallHistory 调用历史
 
@@ -1300,6 +2810,135 @@ class MockCallHistory {
 
 **OR/AND 操作符**：支持组合条件的逻辑操作。
 
+#### 5.5.3 MockCallHistoryLog 完整结构
+
+```javascript
+class MockCallHistoryLog {
+  constructor (requestInit = {}) {
+    this.body = requestInit.body
+    this.headers = requestInit.headers
+    this.method = requestInit.method
+
+    const url = computeUrlWithMaybeSearchParameters(requestInit)
+
+    this.fullUrl = url.toString()
+    this.origin = url.origin
+    this.path = url.pathname
+    this.searchParams = Object.fromEntries(url.searchParams)
+    this.protocol = url.protocol
+    this.host = url.host
+    this.port = url.port
+    this.hash = url.hash
+  }
+
+  toMap () {
+    return new Map([
+      ['protocol', this.protocol],
+      ['host', this.host],
+      ['port', this.port],
+      ['origin', this.origin],
+      ['path', this.path],
+      ['hash', this.hash],
+      ['searchParams', this.searchParams],
+      ['fullUrl', this.fullUrl],
+      ['method', this.method],
+      ['body', this.body],
+      ['headers', this.headers]
+    ])
+  }
+
+  toString () {
+    const options = { betweenKeyValueSeparator: '->', betweenPairSeparator: '|' }
+    let result = ''
+    this.toMap().forEach((value, key) => {
+      if (typeof value === 'string' || value === undefined || value === null) {
+        result = `${result}${key}${options.betweenKeyValueSeparator}${value}${options.betweenPairSeparator}`
+      }
+      if ((typeof value === 'object' && value !== null) || Array.isArray(value)) {
+        result = `${result}${key}${options.betweenKeyValueSeparator}${JSON.stringify(value)}${options.betweenPairSeparator}`
+      }
+    })
+    return result.slice(0, -1)  // 移除最后一个分隔符
+  }
+}
+```
+
+#### 5.5.4 完整过滤 API
+
+```javascript
+const history = mockAgent.getCallHistory()
+
+// 便捷方法
+history.calls()         // 所有日志
+history.firstCall()      // 第一条
+history.lastCall()       // 最后一条
+history.nthCall(3)       // 第 3 条（非零基索引）
+
+// 8 个单维度过滤器
+history.filterCallsByProtocol('https:')
+history.filterCallsByHost('api.example.com')
+history.filterCallsByPort('443')
+history.filterCallsByOrigin('https://api.example.com')
+history.filterCallsByPath('/v1/users')
+history.filterCallsByHash('#section')
+history.filterCallsByFullUrl('https://api.example.com/v1/users')
+history.filterCallsByMethod('GET')
+
+// 多维度组合过滤
+history.filterCalls({
+  method: 'POST',
+  path: '/api/users'
+}, { operator: 'OR' })  // 满足任一条件
+
+history.filterCalls({
+  method: 'GET',
+  host: 'api.example.com'
+}, { operator: 'AND' })  // 同时满足
+
+// 函数过滤
+history.filterCalls((log) => log.path.startsWith('/api/'))
+
+// RegExp 过滤
+history.filterCalls(/\/v1\/users\?page=\d+/)
+```
+
+#### 5.5.5 实现原理
+
+```javascript
+class MockCallHistory {
+  logs = []
+
+  filterCalls (criteria, options) {
+    if (this.logs.length === 0) return this.logs
+    if (typeof criteria === 'function') return this.logs.filter(criteria)
+    if (criteria instanceof RegExp) return this.logs.filter(log => criteria.test(log.toString()))
+    if (typeof criteria === 'object' && criteria !== null) {
+      if (Object.keys(criteria).length === 0) return this.logs
+      const finalOptions = { operator: 'OR', ...buildAndValidateFilterCallsOptions(options) }
+      let maybeDuplicatedLogsFiltered = finalOptions.operator === 'AND' ? this.logs : []
+
+      if ('protocol' in criteria) maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(...)
+      if ('host' in criteria) maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(...)
+      // ... 8 个维度
+
+      return [...new Set(maybeDuplicatedLogsFiltered)]  // 去重
+    }
+  }
+}
+
+function makeFilterCalls (parameterName) {
+  return (parameterValue, logs = this.logs) => {
+    if (typeof parameterValue === 'string' || parameterValue == null) {
+      return logs.filter(log => log[parameterName] === parameterValue)
+    }
+    if (parameterValue instanceof RegExp) {
+      return logs.filter(log => parameterValue.test(log[parameterName]))
+    }
+    throw new InvalidArgumentError('...')
+  }
+}
+```
+
 ### 5.6 MockErrors / MockSymbols
 
 **文件**：`lib/mock/mock-errors.js`（29 行）、`lib/mock/mock-symbols.js`（32 行）
@@ -1307,21 +2946,66 @@ class MockCallHistory {
 #### 5.6.1 MockNotMatchedError
 
 ```javascript
+const kMockNotMatchedError = Symbol.for('undici.error.UND_MOCK_ERR_MOCK_NOT_MATCHED')
+
 class MockNotMatchedError extends UndiciError {
   constructor (message) {
     super(message)
+    this.name = 'MockNotMatchedError'
+    this.message = message || 'The request does not match any registered mock dispatches'
     this.code = 'UND_MOCK_ERR_MOCK_NOT_MATCHED'
   }
+
   // Symbol.hasInstance 支持：instanceof 检查
   static [Symbol.hasInstance] (instance) {
     return instance && instance[kMockNotMatchedError] === true
   }
+
+  get [kMockNotMatchedError] () {
+    return true
+  }
 }
 ```
 
-#### 5.6.3 MockSymbols
+**设计要点**：
+- 使用 `Symbol.for()` 注册全局 Symbol，支持跨 realm 检查
+- 通过 `Symbol.hasInstance` 自定义 `instanceof` 行为
+- 错误码 `UND_MOCK_ERR_MOCK_NOT_MATCHED` 用于在 `buildMockDispatch` 中识别
 
-定义了 31 个 Symbol，用于隐藏内部状态：
+#### 5.6.2 MockSymbols
+
+定义了 31 个 Symbol，用于隐藏内部状态。Symbol 是最佳内部状态隐藏方式：
+
+| 分类 | Symbol | 用途 |
+|------|--------|------|
+| 核心 | `kAgent` | 真实 Agent 引用 |
+| 核心 | `kOptions` | MockAgent 配置 |
+| 核心 | `kFactory` | 创建 MockClient/MockPool 的工厂 |
+| 拦截 | `kDispatches` | MockClient 上的拦截规则列表 |
+| 拦截 | `kDispatchKey` | 拦截匹配键 |
+| 拦截 | `kMockDispatch` | MockScope 上的 dispatch 数据 |
+| 拦截 | `kDefaultHeaders` | 默认响应头 |
+| 拦截 | `kDefaultTrailers` | 默认响应 trailers |
+| 拦截 | `kContentLength` | 是否自动计算 Content-Length |
+| Mock | `kMockAgent` | MockClient 反向引用 MockAgent |
+| Mock | `kMockAgentSet` | 设置 client 到 clients Map |
+| Mock | `kMockAgentGet` | 获取 client（支持模糊匹配） |
+| Mock | `kClose` | Mock 专用 close |
+| Mock | `kOriginalClose` | 原始 close |
+| Mock | `kOriginalDispatch` | 原始 dispatch |
+| Mock | `kOrigin` | origin |
+| Mock | `kIsMockActive` | mock 激活状态 |
+| Mock | `kNetConnect` | 网络连接控制 |
+| Mock | `kGetNetConnect` | 获取网络连接控制 |
+| Mock | `kConnected` | 连接状态 |
+| Mock | `kIgnoreTrailingSlash` | 忽略尾部斜杠 |
+| 历史 | `kMockAgentMockCallHistoryInstance` | 调用历史实例 |
+| 历史 | `kMockAgentRegisterCallHistory` | 注册调用历史 |
+| 历史 | `kMockAgentAddCallHistoryLog` | 添加调用日志 |
+| 历史 | `kMockAgentIsCallHistoryEnabled` | 调用历史启用状态 |
+| 历史 | `kMockCallHistoryAddLog` | 调用历史添加 |
+| 搜索 | `kMockAgentAcceptsNonStandardSearchParameters` | 接受非标准搜索参数 |
+| 统计 | `kTotalDispatchCount` | 注册的 dispatch 总数 |
 
 ```javascript
 module.exports = {
@@ -1330,28 +3014,7 @@ module.exports = {
   kFactory: Symbol('factory'),
   kDispatches: Symbol('dispatches'),
   kDispatchKey: Symbol('dispatch key'),
-  kDefaultHeaders: Symbol('default headers'),
-  kDefaultTrailers: Symbol('default trailers'),
-  kContentLength: Symbol('content length'),
-  kMockAgent: Symbol('mock agent'),
-  kMockAgentSet: Symbol('mock agent set'),
-  kMockAgentGet: Symbol('mock agent get'),
-  kMockDispatch: Symbol('mock dispatch'),
-  kClose: Symbol('close'),
-  kOriginalClose: Symbol('original agent close'),
-  kOriginalDispatch: Symbol('original dispatch'),
-  kOrigin: Symbol('origin'),
-  kIsMockActive: Symbol('is mock active'),
-  kNetConnect: Symbol('net connect'),
-  kGetNetConnect: Symbol('get net connect'),
-  kConnected: Symbol('connected'),
-  kIgnoreTrailingSlash: Symbol('ignore trailing slash'),
-  kMockAgentMockCallHistoryInstance: Symbol('mock agent mock call history name'),
-  kMockAgentRegisterCallHistory: Symbol('mock agent register mock call history'),
-  kMockAgentAddCallHistoryLog: Symbol('mock agent add call history log'),
-  kMockAgentIsCallHistoryEnabled: Symbol('mock agent is call history enabled'),
-  kMockAgentAcceptsNonStandardSearchParameters: Symbol('mock agent accepts non standard search parameters'),
-  kMockCallHistoryAddLog: Symbol('mock call history add log'),
+  // ... 共 31 个
   kTotalDispatchCount: Symbol('total dispatch count')
 }
 ```
@@ -1406,7 +3069,15 @@ dispatch (opts, handler) {
 #recordAndReplay (opts, handler) {
   const responseData = { statusCode: null, headers: {}, trailers: {}, body: [] }
 
+  const self = this  // 捕获 this 用于嵌套回调
+
   const recordingHandler = {
+    onRequestStart (controller, context) {
+      return handler.onRequestStart(controller, { ...context, history: this.history })
+    },
+    onRequestUpgrade (controller, statusCode, headers, socket) {
+      return handler.onRequestUpgrade(controller, statusCode, headers, socket)
+    },
     onResponseStart (controller, statusCode, headers, statusMessage) {
       responseData.statusCode = statusCode
       responseData.headers = headers
@@ -1419,16 +3090,65 @@ dispatch (opts, handler) {
     onResponseEnd (controller, trailers) {
       responseData.trailers = trailers
       // 异步录制（fire and forget）
+      const responseBody = Buffer.concat(responseData.body)
       self[kSnapshotRecorder].record(opts, {
         statusCode: responseData.statusCode,
         headers: responseData.headers,
-        body: Buffer.concat(responseData.body),
+        body: responseBody,
         trailers: responseData.trailers
-      }).then(() => handler.onResponseEnd(controller, trailers))
+      })
+        .then(() => handler.onResponseEnd(controller, trailers))
+        .catch((error) => handler.onResponseError(controller, error))
+    },
+    onResponseError (controller, error) {
+      return handler.onResponseError(controller, error)
     }
   }
 
+  const agent = this[kRealAgent]
   return agent.dispatch(opts, recordingHandler)
+}
+```
+
+**设计要点**：
+- 录制是异步的（fire-and-forget），不阻塞响应返回给用户
+- `handler.onResponseEnd` 等待录制完成后再调用，确保数据落盘
+
+#### 6.1.4 URL 排除机制
+
+```javascript
+dispatch (opts, handler) {
+  // URL 排除检查 - 直接走真实请求
+  if (this[kSnapshotRecorder].isUrlExcluded(opts)) {
+    return this[kRealAgent].dispatch(opts, handler)
+  }
+  // ... 正常录制/回放逻辑
+}
+```
+
+```javascript
+// SnapshotRecorder.isUrlExcluded
+isUrlExcluded (requestOpts) {
+  const url = new URL(requestOpts.path, requestOpts.origin).toString()
+  return this.#isUrlExcluded(url)
+}
+
+// snapshot-utils.js
+function isUrlExcludedFactory (excludePatterns = []) {
+  if (excludePatterns.length === 0) return () => false
+
+  return function isUrlExcluded (url) {
+    let urlLowerCased
+    for (const pattern of excludePatterns) {
+      if (typeof pattern === 'string') {
+        if (!urlLowerCased) urlLowerCased = url.toLowerCase()
+        if (urlLowerCased.includes(pattern.toLowerCase())) return true
+      } else if (pattern instanceof RegExp) {
+        if (pattern.test(url)) return true
+      }
+    }
+    return false
+  }
 }
 ```
 
@@ -1492,17 +3212,38 @@ function createRequestHash (formattedRequest) {
   const parts = [formattedRequest.method, formattedRequest.url]
 
   // 确定性 header 排序
-  const headerKeys = Object.keys(formattedRequest.headers).sort()
-  for (const key of headerKeys) {
-    parts.push(key)
-    for (const value of values.sort()) {
-      parts.push(String(value))
+  if (formattedRequest.headers && typeof formattedRequest.headers === 'object') {
+    const headerKeys = Object.keys(formattedRequest.headers).sort()
+    for (const key of headerKeys) {
+      const values = Array.isArray(formattedRequest.headers[key])
+        ? formattedRequest.headers[key]
+        : [formattedRequest.headers[key]]
+
+      parts.push(key)
+      // 值也排序，保证一致性
+      for (const value of values.sort()) {
+        parts.push(String(value))
+      }
     }
   }
 
   parts.push(formattedRequest.body)
-  return hashId(parts.join('|'))  // SHA-256 或 base64url
+  const content = parts.join('|')
+  return hashId(content)  // SHA-256 或 base64url
 }
+```
+
+**哈希算法选择**：
+
+```javascript
+// snapshot-utils.js
+const crypto = runtimeFeatures.has('crypto')
+  ? require('node:crypto')
+  : null
+
+const hashId = crypto?.hash
+  ? (value) => crypto.hash('sha256', value, 'base64url')  // Node.js crypto
+  : (value) => Buffer.from(value).toString('base64url')    // 降级方案
 ```
 
 #### 6.2.2 请求格式化
@@ -1557,7 +3298,65 @@ return { ...snapshot, response: snapshot.responses[responseIndex] }
 }
 ```
 
-#### 6.2.5 Header 过滤
+#### 6.2.5 持久化格式
+
+快照保存为 JSON 文件：
+
+```javascript
+// saveSnapshots()
+async saveSnapshots (filePath) {
+  const path = filePath || this.#snapshotPath
+  const resolvedPath = resolve(path)
+
+  // 确保目录存在
+  await mkdir(dirname(resolvedPath), { recursive: true })
+
+  // Map → Array 序列化
+  const data = Array.from(this.#snapshots.entries()).map(([hash, snapshot]) => ({
+    hash,
+    snapshot
+  }))
+
+  await writeFile(resolvedPath, JSON.stringify(data, null, 2), { flush: true })
+}
+
+// 文件格式示例:
+// [
+//   {
+//     "hash": "base64url-hash",
+//     "snapshot": {
+//       "request": { "method": "GET", "url": "http://api.example.com/v1/users", ... },
+//       "responses": [
+//         { "statusCode": 200, "headers": {...}, "body": "base64...", "trailers": {} }
+//       ],
+//       "callCount": 0,
+//       "timestamp": "2024-01-01T00:00:00.000Z"
+//     }
+//   }
+// ]
+```
+
+#### 6.2.6 加载快照
+
+```javascript
+async loadSnapshots (filePath) {
+  const path = filePath || this.#snapshotPath
+  const data = await readFile(resolve(path), 'utf8')
+  const parsed = JSON.parse(data)
+
+  if (Array.isArray(parsed)) {
+    this.#snapshots.clear()
+    for (const { hash, snapshot } of parsed) {
+      this.#snapshots.set(hash, snapshot)
+    }
+  } else {
+    // Legacy object format
+    this.#snapshots = new Map(Object.entries(parsed))
+  }
+}
+```
+
+#### 6.2.7 Header 过滤
 
 三种 Header 过滤策略：
 
@@ -1864,7 +3663,205 @@ class PoolStats {
 
 ---
 
-## 8. 跨模块设计模式总结
+## 8. 拦截器组合最佳实践与陷阱（新增章节）
+
+### 8.1 拦截器执行顺序
+
+拦截器通过 `Dispatcher.compose()` 链式组合，**外层先执行**：
+
+```javascript
+// 执行顺序：retry → redirect → dns → decompress → dispatch
+const dispatcher = dispatcher.compose(
+  retry(),
+  redirect(),
+  dns(),
+  decompress()
+)
+```
+
+```
+请求流向 (从外到内):
+  retry (最外层)
+    ↓
+  redirect
+    ↓
+  dns (修改 origin)
+    ↓
+  decompress
+    ↓
+  dispatch (实际发送)
+```
+
+**执行顺序规则**：
+1. `onRequestStart`：从外到内（retry → redirect → dns → decompress）
+2. `onResponseStart`：从内到外（decompress → dns → redirect → retry）
+3. `onResponseData`：从内到外
+4. `onResponseEnd`：从内到外
+
+### 8.2 推荐的拦截器顺序
+
+```javascript
+// 推荐顺序（从外到内）
+const dispatcher = compose(
+  dump({ maxSize: 10 * 1024 * 1024 }),  // 1. 大小限制（最外层）
+  responseError(),                        // 2. 错误转换
+  cache({ store }),                       // 3. 缓存（跳过已缓存的）
+  retry({ maxRetries: 3 }),              // 4. 重试
+  redirect({ maxRedirections: 5 }),      // 5. 重定向
+  dns({ dualStack: true }),              // 6. DNS
+  decompress(),                           // 7. 解压（最内层，先处理响应）
+  deduplicate()                           // 8. 去重（可选）
+)
+```
+
+**顺序原则**：
+- **越外层的拦截器越先处理请求，越后处理响应**
+- `dump`/`responseError` 放在最外层，确保捕获所有错误
+- `cache` 放前面，避免重复请求进入重试/重定向
+- `decompress` 放最内层，先解压再给上层处理
+
+### 8.3 拦截器互斥与协作
+
+#### 8.3.1 Cache + Revalidation 协作
+
+```
+请求到达
+  │
+  ├─ 缓存拦截器 (cache.js)
+  │   ├─ 未命中 → 包装 CacheHandler 转发
+  │   ├─ 命中新鲜 → 直接返回缓存
+  │   └─ 命中过期 → 发送条件请求 + CacheRevalidationHandler
+  │
+  └─ CacheRevalidationHandler 回调
+      ├─ 304 → 使用缓存 body，更新元数据
+      └─ 200 → 使用新响应，更新缓存
+```
+
+#### 8.3.2 Retry + Range 协作
+
+当重试时 body 已部分消费，RetryHandler 使用 Range 请求续传：
+
+```
+第一次请求:
+  GET /file
+  ↓ (连接断开，已接收 1000/5000 bytes)
+
+重试请求:
+  GET /file
+  Range: bytes=1000-4999
+  If-Match: "etag-value"  (如果服务器支持 ETag)
+  ↓
+  206 Partial Content
+  Content-Range: bytes 1000-4999/5000
+```
+
+### 8.4 常见陷阱
+
+#### 8.4.1 陷阱一：拦截器顺序错误
+
+```javascript
+// ❌ 错误：decompress 在 retry 外
+const bad = compose(
+  decompress(),  // 先解压
+  retry()        // 重试时需要重新解压，但旧连接已销毁
+)
+
+// ✅ 正确：retry 在 decompress 外
+const good = compose(
+  retry(),       # 重试整个连接
+  decompress()   # 解压在重试成功后
+)
+```
+
+#### 8.4.2 陷阱二：MockAgent 忘记 activate/deactivate
+
+```javascript
+const mockAgent = new MockAgent()
+mockAgent.disableNetConnect()
+
+const client = new Client('http://localhost', { agent: mockAgent })
+
+// ❌ 忘记设置拦截器就发送请求
+await client.request({ path: '/' })
+// 抛出 MockNotMatchedError
+
+// ✅ 先设置拦截器
+mockAgent.get('http://localhost')
+  .intercept({ path: '/' })
+  .reply(200, 'ok')
+
+// ✅ 或者在测试结束时断言
+mockAgent.assertNoPendingInterceptors()
+```
+
+#### 8.4.3 陷阱三：RetryHandler 的 body 流式问题
+
+```javascript
+// ❌ 错误：body 是 stream，重试时无法回退
+dispatch({
+  method: 'POST',
+  body: createReadStream('file.txt')  // 流式 body
+})
+
+// ✅ 使用 wrapRequestBody 包装可重试 body
+const body = require('../core/util').wrapRequestBody(streamOrBuffer)
+```
+
+#### 8.4.4 陷阱四：CacheHandler 的 no-cache vs no-store
+
+| 指令 | 行为 |
+|------|------|
+| `no-store` | 完全不缓存（skip） |
+| `no-cache` | 缓存但每次验证（304） |
+| `max-age=0` | 同 no-cache |
+| `must-revalidate` | 新鲜时直接用过期时必须验证 |
+
+#### 8.4.5 陷阱五：DeduplicationHandler 的 buffer 溢出
+
+```javascript
+// 暂停状态下的 waiting handler 会缓冲数据
+// 如果消费太慢，缓冲超过 maxBufferSize (5MB) 会抛错
+
+// ✅ 消费端保持消费
+for await (const chunk of response.body) {
+  // 立即处理
+}
+
+// ❌ 暂停太久不消费
+response.body.pause()
+// ... 长时间不 resume
+```
+
+### 8.5 Handler 返回值约定
+
+| 回调 | 返回值含义 |
+|------|-----------|
+| `onRequestStart` | 无返回值 |
+| `onResponseStart` | `true` 表示拦截数据（不传给下游） |
+| `onResponseData` | `true` 表示拦截数据（不传给下游） |
+| `onResponseEnd` | 无返回值 |
+| `onResponseError` | 无返回值 |
+
+### 8.6 Symbol 命名约定
+
+undici 使用多种 Symbol 策略：
+
+```javascript
+// 1. 实例 Symbol - 每个实例唯一（默认）
+const kMyState = Symbol('my state')
+
+// 2. 全局 Symbol - 跨 realm 共享
+const kShared = Symbol.for('undici.shared')
+
+// 3. 静态符号方法 - 类级别
+class RetryHandler {
+  static [kRetryHandlerDefaultRetry] = (err, ctx, cb) => { ... }
+}
+```
+
+---
+
+## 9. 跨模块设计模式总结（原第8节重编号）
 
 ### 8.1 模式一：柯里化拦截器组合
 
@@ -2152,21 +4149,28 @@ let client = LlmClient::new(config)
 |------|---------|------|------|
 | `lib/interceptor/cache.js` | `module.exports` (入口) | 501 | Cache 拦截器工厂 |
 | `lib/interceptor/cache.js` | `handleResult()` | 379 | 缓存命中/未命中决策 |
-| `lib/interceptor/cache.js` | `sendCachedValue()` | 293 | 发送缓存响应 |
+| `lib/interceptor/cache.js` | `sendCachedValue()` | 293 | 发送缓存响应（构造虚拟 controller + Readable） |
 | `lib/interceptor/cache.js` | `isStale()` | 180 | 过期判断 |
 | `lib/interceptor/cache.js` | `needsRevalidation()` | 80 | 验证需求判断 |
 | `lib/interceptor/cache.js` | `withinStaleWhileRevalidateWindow()` | 214 | SWR 窗口判断 |
 | `lib/interceptor/cache.js` | `makeRevalidationHeaders()` | 153 | 条件请求头构造 |
-| `lib/interceptor/retry.js` | `module.exports` | 4 | Retry 拦截器工厂 |
+| `lib/interceptor/retry.js` | `module.exports` | 4 | Retry 拦截器工厂（19 行纯委托） |
 | `lib/interceptor/redirect.js` | `createRedirectInterceptor()` | 5 | Redirect 拦截器工厂 |
-| `lib/interceptor/dns.js` | `module.exports` | 458 | DNS 拦截器工厂 |
+| `lib/interceptor/dns.js` | `module.exports` | 458 | DNS 拦截器工厂（575 行） |
 | `lib/interceptor/dns.js` | `DNSInstance.runLookup()` | 156 | DNS 查询入口 |
+| `lib/interceptor/dns.js` | `DNSInstance.#defaultLookup()` | 241 | 默认 DNS 查询 |
+| `lib/interceptor/dns.js` | `DNSInstance.#defaultPick()` | 267 | IP 轮询算法 |
+| `lib/interceptor/dns.js` | `DNSInstance.setRecords()` | 353 | 设置 DNS 记录（含 TTL） |
 | `lib/interceptor/dns.js` | `DNSDispatchHandler.onResponseError()` | 404 | 双栈故障转移 |
-| `lib/interceptor/decompress.js` | `createDecompressInterceptor()` | 270 | 解压拦截器工厂 |
+| `lib/interceptor/decompress.js` | `createDecompressInterceptor()` | 270 | 解压拦截器工厂（292 行） |
 | `lib/interceptor/decompress.js` | `DecompressHandler.#createDecompressionChain()` | 68 | 多级解压链创建 |
+| `lib/interceptor/decompress.js` | `DecompressHandler.#setupSingleDecompressor()` | 123 | 单解压器事件 |
+| `lib/interceptor/decompress.js` | `DecompressHandler.#setupMultipleDecompressors()` | 137 | 多解压器 pipeline |
 | `lib/interceptor/deduplicate.js` | `module.exports` | 14 | 去重拦截器工厂 |
 | `lib/interceptor/dump.js` | `createDumpInterceptor()` | 96 | Dump 拦截器工厂 |
 | `lib/interceptor/response-error.js` | `module.exports` | 89 | Response-Error 拦截器工厂 |
+| `lib/interceptor/response-error.js` | `ResponseErrorHandler.onResponseStart()` | 32 | 状态码判断 + 初始化 decoder |
+| `lib/interceptor/response-error.js` | `ResponseErrorHandler.onResponseEnd()` | 54 | 错误转 Error + stackTraceLimit 优化 |
 
 ### Handler 层
 
@@ -2191,40 +4195,79 @@ let client = LlmClient::new(config)
 
 | 文件 | 函数/类 | 行号 | 用途 |
 |------|---------|------|------|
-| `lib/mock/mock-agent.js` | `MockAgent` | 31 | Mock 系统总入口 |
-| `lib/mock/mock-agent.js` | `MockAgent.dispatch()` | 72 | dispatch 路由 |
+| `lib/mock/mock-agent.js` | `MockAgent` | 31 | Mock 系统总入口（244 行） |
+| `lib/mock/mock-agent.js` | `MockAgent.dispatch()` | 72 | dispatch 路由（origin 标准化 + 历史记录） |
+| `lib/mock/mock-agent.js` | `MockAgent.get()` | 58 | origin 标准化 + 模糊匹配 |
+| `lib/mock/mock-agent.js` | `MockAgent[kMockAgentGet]()` | 192 | 正则/函数 origin 匹配 |
+| `lib/mock/mock-agent.js` | `MockAgent[kFactory]()` | 185 | 创建 MockClient/MockPool |
+| `lib/mock/mock-agent.js` | `MockAgent[kMockAgentAddCallHistoryLog]()` | 171 | 记录调用历史 |
+| `lib/mock/mock-agent.js` | `MockAgent.enableNetConnect()` | 119 | 启用网络白名单 |
+| `lib/mock/mock-agent.js` | `MockAgent.disableNetConnect()` | 133 | 禁止网络连接 |
+| `lib/mock/mock-agent.js` | `MockAgent.pendingInterceptors()` | 221 | 获取未消费拦截器 |
 | `lib/mock/mock-agent.js` | `MockAgent.assertNoPendingInterceptors()` | 229 | 未消费断言 |
-| `lib/mock/mock-client.js` | `MockClient` | 23 | Mock Client |
-| `lib/mock/mock-pool.js` | `MockPool` | 23 | Mock Pool |
-| `lib/mock/mock-interceptor.js` | `MockInterceptor` | 65 | 拦截规则定义 |
-| `lib/mock/mock-interceptor.js` | `MockInterceptor.reply()` | 121 | 定义回复 |
+| `lib/mock/mock-client.js` | `MockClient` | 23 | Mock Client（68 行） |
+| `lib/mock/mock-client.js` | `MockClient.intercept()` | 50 | 创建 MockInterceptor |
+| `lib/mock/mock-client.js` | `MockClient[kClose]()` | 61 | Mock 专用 close |
+| `lib/mock/mock-pool.js` | `MockPool` | 23 | Mock Pool（68 行） |
+| `lib/mock/mock-interceptor.js` | `MockInterceptor` | 65 | 拦截规则定义（227 行） |
+| `lib/mock/mock-interceptor.js` | `MockInterceptor.reply()` | 121 | 定义回复（支持同步/异步回调） |
+| `lib/mock/mock-interceptor.js` | `MockInterceptor.replyWithError()` | 184 | 定义错误回复 |
+| `lib/mock/mock-interceptor.js` | `MockInterceptor.defaultReplyHeaders()` | 196 | 设置默认回复头 |
+| `lib/mock/mock-interceptor.js` | `MockInterceptor.replyContentLength()` | 220 | 自动计算 Content-Length |
 | `lib/mock/mock-interceptor.js` | `MockScope` | 25 | 回复行为配置 |
+| `lib/mock/mock-interceptor.js` | `MockScope.delay()` | 32 | 延迟回复 |
+| `lib/mock/mock-interceptor.js` | `MockScope.persist()` | 44 | 永不过期 |
+| `lib/mock/mock-interceptor.js` | `MockScope.times()` | 52 | 使用 N 次后消费 |
 | `lib/mock/mock-utils.js` | `matchValue()` | 22 | 值匹配（string/regex/function） |
 | `lib/mock/mock-utils.js` | `matchKey()` | 142 | 完整请求匹配 |
-| `lib/mock/mock-utils.js` | `getMockDispatch()` | 171 | 匹配 dispatch 查找 |
-| `lib/mock/mock-utils.js` | `addMockDispatch()` | 211 | 注册 mock |
+| `lib/mock/mock-utils.js` | `matchHeaders()` | 73 | Header 匹配（支持函数） |
+| `lib/mock/mock-utils.js` | `getMockDispatch()` | 171 | 匹配 dispatch 查找（逐级过滤） |
+| `lib/mock/mock-utils.js` | `addMockDispatch()` | 211 | 注册 mock（含 kTotalDispatchCount） |
+| `lib/mock/mock-utils.js` | `deleteMockDispatch()` | 221 | 删除已消费的 dispatch |
+| `lib/mock/mock-utils.js` | `buildKey()` | 254 | 构造匹配键 |
+| `lib/mock/mock-utils.js` | `getResponseData()` | 150 | 数据类型转换（Buffer/JSON/string） |
+| `lib/mock/mock-utils.js` | `normalizeOrigin()` | 672 | Origin 标准化（小写） |
+| `lib/mock/mock-utils.js` | `buildAndValidateMockOptions()` | 684 | MockAgent 配置校验 |
 | `lib/mock/mock-utils.js` | `mockDispatch()` | 303 | 核心 dispatch 函数 |
-| `lib/mock/mock-utils.js` | `dispatchMockReply()` | 358 | 响应模拟 |
-| `lib/mock/mock-utils.js` | `dispatchRequestBody()` | 536 | 请求体处理 |
-| `lib/mock/mock-utils.js` | `buildMockDispatch()` | 627 | dispatch 替换引擎 |
-| `lib/mock/mock-call-history.js` | `MockCallHistory` | 127 | 调用历史 |
+| `lib/mock/mock-utils.js` | `dispatchMockReply()` | 358 | 响应模拟（完整生命周期） |
+| `lib/mock/mock-utils.js` | `dispatchRequestBody()` | 536 | 请求体处理（4 种类型） |
+| `lib/mock/mock-utils.js` | `dispatchAsyncIterableBody()` | 576 | 异步迭代 body |
+| `lib/mock/mock-utils.js` | `callOnBodySent()` | 600 | 触发 onBodySent 钩子 |
+| `lib/mock/mock-utils.js` | `callOnRequestSent()` | 610 | 触发 onRequestSent 钩子 |
+| `lib/mock/mock-utils.js` | `buildMockDispatch()` | 627 | dispatch 替换引擎（含 netConnect 回退） |
+| `lib/mock/mock-utils.js` | `checkNetConnect()` | 662 | 网络连接白名单检查 |
+| `lib/mock/mock-call-history.js` | `MockCallHistory` | 127 | 调用历史（248 行） |
 | `lib/mock/mock-call-history.js` | `MockCallHistoryLog` | 74 | 调用日志条目 |
-| `lib/mock/mock-call-history.js` | `filterCalls()` | 157 | 多维过滤 |
-| `lib/mock/mock-errors.js` | `MockNotMatchedError` | 10 | 未匹配错误 |
+| `lib/mock/mock-call-history.js` | `MockCallHistory.filterCalls()` | 157 | 多维过滤（支持 OR/AND） |
+| `lib/mock/mock-call-history.js` | `MockCallHistory.nthCall()` | 142 | 第 N 次调用（非零基） |
+| `lib/mock/mock-call-history.js` | `MockCallHistoryLog.toMap()` | 92 | 转为 Map |
+| `lib/mock/mock-call-history.js` | `MockCallHistoryLog.toString()` | 108 | 字符串表示 |
+| `lib/mock/mock-errors.js` | `MockNotMatchedError` | 10 | 未匹配错误（29 行） |
 | `lib/mock/mock-symbols.js` | 全部 31 个 Symbol | 3-32 | 内部状态隐藏 |
-| `lib/mock/snapshot-agent.js` | `SnapshotAgent` | 19 | 快照 Agent |
+| `lib/mock/snapshot-agent.js` | `SnapshotAgent` | 19 | 快照 Agent（371 行） |
 | `lib/mock/snapshot-agent.js` | `SnapshotAgent.dispatch()` | 83 | 三模式 dispatch |
-| `lib/mock/snapshot-agent.js` | `#recordAndReplay()` | 134 | 录制并回放 |
-| `lib/mock/snapshot-agent.js` | `#replaySnapshot()` | 196 | 快照回放 |
-| `lib/mock/snapshot-recorder.js` | `SnapshotRecorder` | 246 | 快照录制器 |
-| `lib/mock/snapshot-recorder.js` | `record()` | 314 | 录制请求 |
-| `lib/mock/snapshot-recorder.js` | `findSnapshot()` | 384 | 查找快照 |
-| `lib/mock/snapshot-recorder.js` | `createRequestHash()` | 214 | 请求哈希 |
+| `lib/mock/snapshot-agent.js` | `SnapshotAgent.#asyncDispatch()` | 126 | 异步 dispatch（先加载快照） |
+| `lib/mock/snapshot-agent.js` | `SnapshotAgent.#recordAndReplay()` | 134 | 录制并回放（recordingHandler） |
+| `lib/mock/snapshot-agent.js` | `SnapshotAgent.#replaySnapshot()` | 196 | 快照回放 |
+| `lib/mock/snapshot-agent.js` | `SnapshotAgent.#setupMockInterceptors()` | 270 | 回退到 MockAgent 拦截器 |
+| `lib/mock/snapshot-agent.js` | `SnapshotAgent.loadSnapshots()` | 237 | 加载快照文件 |
+| `lib/mock/snapshot-agent.js` | `SnapshotAgent.saveSnapshots()` | 253 | 保存快照文件 |
+| `lib/mock/snapshot-recorder.js` | `SnapshotRecorder` | 246 | 快照录制器（623 行） |
+| `lib/mock/snapshot-recorder.js` | `record()` | 314 | 录制请求（支持顺序响应） |
+| `lib/mock/snapshot-recorder.js` | `findSnapshot()` | 384 | 查找快照（顺序响应支持） |
+| `lib/mock/snapshot-recorder.js` | `createRequestHash()` | 214 | 请求哈希（SHA-256 base64url） |
 | `lib/mock/snapshot-recorder.js` | `formatRequestKey()` | 124 | 请求格式化 |
+| `lib/mock/snapshot-recorder.js` | `filterHeadersForMatching()` | 148 | Header 匹配过滤 |
+| `lib/mock/snapshot-recorder.js` | `filterHeadersForStorage()` | 185 | Header 存储过滤 |
+| `lib/mock/snapshot-recorder.js` | `loadSnapshots()` | 417 | 加载快照文件 |
+| `lib/mock/snapshot-recorder.js` | `saveSnapshots()` | 453 | 保存快照文件（JSON 格式） |
+| `lib/mock/snapshot-recorder.js` | `#scheduleFlush()` | 583 | 防抖自动刷新 |
 | `lib/mock/snapshot-utils.js` | `hashId()` | 43 | SHA-256/base64url 哈希 |
-| `lib/mock/snapshot-utils.js` | `normalizeHeaders()` | 104 | Header 归一化 |
+| `lib/mock/snapshot-utils.js` | `normalizeHeaders()` | 104 | Header 归一化（支持数组/对象） |
 | `lib/mock/snapshot-utils.js` | `isUrlExcludedFactory()` | 68 | URL 排除工厂 |
-| `lib/mock/pending-interceptors-formatter.js` | `PendingInterceptorsFormatter` | 12 | 格式化输出 |
+| `lib/mock/snapshot-utils.js` | `createHeaderFilters()` | 19 | 创建 Header 过滤缓存 |
+| `lib/mock/snapshot-utils.js` | `validateSnapshotMode()` | 145 | 快照模式校验 |
+| `lib/mock/pending-interceptors-formatter.js` | `PendingInterceptorsFormatter` | 12 | 格式化输出（43 行） |
 
 ### 工具层
 

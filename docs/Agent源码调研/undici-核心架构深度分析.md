@@ -651,6 +651,264 @@ pool.on('connectionError', () => {
 
 与 BalancedPool 的区别：不维护权重，每次选下一个，简单公平。
 
+### 4.9 Dispatcher 完整继承体系图
+
+undici 的 dispatcher 体系由 17 个文件组成，核心继承链如下（ASCII 类图）：
+
+```
+EventEmitter (node:events)
+  └── Dispatcher (lib/dispatcher/dispatcher.js, 54 行)
+        │ 抽象基类。定义 dispatch/close/destroy 三个抽象方法 + compose() 拦截器链。
+        │ 关键方法签名：
+        │   dispatch(opts, handler)           → boolean | void
+        │   close([cb])                        → Promise | void
+        │   destroy([err, cb])                 → Promise | void
+        │   compose(...interceptors)           → Proxy<Dispatcher>
+        │
+        ├── DispatcherBase (lib/dispatcher/dispatcher-base.js, 197 行)
+        │      │ 生命周期管理：kDestroyed/kClosed 状态机 + 回调聚合。
+        │      │ dispatch() 前置守卫 + 转发到子类 this[kDispatch](opts, handler)。
+        │      │
+        │      │ 关键内部 Symbol：
+        │      │   kDestroyed / kClosed / kOnDestroyed / kOnClosed
+        │      │   kWebSocketOptions / kEventSourceOptions
+        │      │
+        │      ├── Client (lib/dispatcher/client.js, 741 行)
+        │      │      │ 单 origin 的 HTTP 连接抽象。三段式队列 + resume 循环。
+        │      │      │
+        │      │      │ 关键方法签名：
+        │      │      │   [kDispatch](opts, handler)  → boolean  入队 + 触发 resume
+        │      │      │   [kConnect](cb)               → void    异步建连
+        │      │      │   [kDestroy](err)              → Promise 销毁 + 失败所有 pending
+        │      │      │   get [kPending] / [kRunning] / [kSize] / [kBusy] / [kConnected]
+        │      │      │
+        │      │      │ 关键 Symbol 配置：
+        │      │      │   kUrl / kConnector / kServerName / kPipelining
+        │      │      │   kHTTPContext / kHTTP2Options / kMaxConcurrentStreams
+        │      │      │
+        │      │      └── H2CClient (lib/dispatcher/h2c-client.js, 51 行)
+        │      │            仅用于明文 HTTP/2 (h2c)。强制 useH2c:true + allowH2:true。
+        │      │            校验 origin 必须是 http://，否则抛 InvalidArgumentError。
+        │      │            pipelining 默认 100 但不可超过 maxConcurrentStreams。
+        │      │
+        │      ├── PoolBase (lib/dispatcher/pool-base.js, 232 行)
+        │      │      │ 多连接池基类。clients[] 数组 + FixedQueue 排队。
+        │      │      │
+        │      │      │ 关键方法签名：
+        │      │      │   [kDispatch](opts, handler)   → boolean  选 dispatcher 或入队
+        │      │      │   [kGetDispatcher]()           → Dispatcher | void  子类多态
+        │      │      │   [kHasDispatcher]()           → boolean
+        │      │      │   [kAddClient](client)         → this     注册 + 绑定事件
+        │      │      │   [kRemoveClient](client)      → void     解绑 + 清理
+        │      │      │
+        │      │      ├── Pool (lib/dispatcher/pool.js, 143 行)
+        │      │      │     │ 同 origin 多连接。kGetDispatcher() 线性扫描 + 按需扩容。
+        │      │      │     │ 支持 connections 上限、clientTtl 过期清理。
+        │      │      │     │ connectionError 时立即从 clients 移除，避免复用坏连接。
+        │      │      │     │
+        │      │      │     ├── BalancedPool (lib/dispatcher/balanced-pool.js, 214 行)
+        │      │      │     │     │ 多 upstream 加权负载均衡。Nginx 风格平滑加权轮询。
+        │      │      │     │     │ kWeight[] 权重数组 + kCurrentWeight + GCD 步长递减。
+        │      │      │     │     │ addUpstream/removeUpstream 动态增删上游。
+        │      │      │     │     │ 每个 upstream 是一个 Pool 实例（嵌套 PoolBase 调度）。
+        │      │      │     │
+        │      │      │     └── RoundRobinPool (lib/dispatcher/round-robin-pool.js, 159 行)
+        │      │      │           纯轮询 + 跳过 busy 客户端 + 全部 busy 时按需扩容。
+        │      │      │           kIndex 全局自增取模。无权重、无故障降级。
+        │      │      │
+        │      │      └── Agent (lib/dispatcher/agent.js, 177 行)
+        │      │            顶层多 origin 路由器。Map<origin, dispatcher> 按 origin 选择。
+        │      │            maxOrigins 限制 + 自动 GC 空闲 origin。
+        │      │            allowH2=false 时 origin key 追加 "#http1-only" 隔离。
+        │      │            disconnect 事件触发 closeClientIfUnused 清理。
+        │      │
+        │      ├── ProxyAgent (lib/dispatcher/proxy-agent.js, 378 行)
+        │      │     │ HTTP 代理调度器。三种模式分支：
+        │      │     │   (1) socks5:// → 委托给 Socks5ProxyAgent
+        │      │     │   (2) http 目标 + proxyTunnel=false → Http1ProxyWrapper 改写 path
+        │      │     │   (3) 其他 → CONNECT 隧道，内层用 Agent 调度真实连接
+        │      │     │ 安全措施：禁止请求头携带 Proxy-Authorization。
+        │      │     │ 嵌套 Agent: this[kAgent] 内部用 Pool/Client 建立到 proxy 的连接。
+        │      │     │
+        │      │     └── Http1ProxyWrapper (内部类, ~65 行)
+        │      │           仅用于 HTTP 正向代理非隧道模式。重写 opts.path = origin + path。
+        │      │           拦截 407 响应转 InvalidArgumentError。
+        │      │
+        │      ├── EnvHttpProxyAgent (lib/dispatcher/env-http-proxy-agent.js, 175 行)
+        │      │      │ 自动从 process.env.http_proxy/https_proxy/no_proxy 读取代理配置。
+        │      │      │ 持有三个子 Agent：noProxyAgent、httpProxyAgent、httpsProxyAgent。
+        │      │      │ #shouldProxy(): NO_PROXY 解析（IPv6/端口/子域名/通配符*）。
+        │      │      │ #noProxyChanged getter: 监听环境变量变化触发重新解析。
+        │      │      │
+        │      │      └── NO_PROXY 解析支持：
+        │      │            "*.example.com" → 子域名匹配
+        │      │            "[::1]:443"  → IPv6 + 端口
+        │      │            "*"          → 全不走代理
+        │      │
+        │      ├── Socks5ProxyAgent (lib/dispatcher/socks5-proxy-agent.js, 282 行)
+        │      │      │ 实验性 SOCKS5 代理。按 origin 维护 Map<origin, Pool>。
+        │      │      │ createSocks5Connection(): 连接代理 → 握手 → 认证 → CONNECT → 隧道。
+        │      │      │ Pool 的 connect 函数被替换为 SOCKS5 隧道建立。
+        │      │      │ 支持用户名/密码认证；超时 5 秒；ExperimentalWarning 仅弹一次。
+        │      │      │
+        │      │      └── 使用 Socks5Client (lib/core/socks5-client.js) 状态机：
+        │      │            STATES: INITIAL → GREETING → AUTH → CONNECTING → CONNECTED
+        │      │
+        │      ├── Dispatcher1Wrapper (lib/dispatcher/dispatcher1-wrapper.js, 107 行)
+        │      │      │ v1 API 向后兼容层。强制 allowH2:false（v1 不支持 H2）。
+        │      │      │ wrapHandler(): 检测 handler 是否含 v2 接口(onRequestStart)，
+        │      │      │   否则包一层 LegacyHandlerWrapper 桥接：
+        │      │      │     onConnect      → onRequestStart
+        │      │      │     onHeaders      → onResponseStart (含 resume 暂停)
+        │      │      │     onData         → onResponseData
+        │      │      │     onComplete     → onResponseEnd
+        │      │      │     onError        → onResponseError
+        │      │      │     onUpgrade      → onRequestUpgrade
+        │      │      │     onBodySent / onRequestSent / onResponseStarted 透传
+        │      │      │
+        │      │      └── 继承 Dispatcher (非 DispatcherBase)，因为 v1 无 close/destroy 生命周期
+        │      │
+        │      └── RetryAgent (lib/dispatcher/retry-agent.js, 35 行)
+        │            极简装饰器。dispatch 时把 handler 包进 RetryHandler，
+        │            再交给内部 this.#agent.dispatch()。重试逻辑全在 handler 中。
+        │            自身继承 Dispatcher，close/destroy 透传内部 agent。
+        │
+        └── RetryHandler 实际定义在 lib/handler/retry-handler.js (~548 行)
+              独立于 dispatcher 继承链，是 handler 层装饰器。
+```
+
+**设计模式总结**：
+
+| 模式 | 应用位置 | 说明 |
+|------|---------|------|
+| 模板方法 | DispatcherBase → Client/Pool/Agent | dispatch() 守卫固定，子类实现 kDispatch |
+| 策略 | PoolBase → Pool/BalancedPool/RoundRobinPool | kGetDispatcher() 多态 |
+| 装饰器 | ProxyAgent/Dispatcher1Wrapper | 嵌套内部 dispatcher，功能增强 |
+| 组合拦截器 | Dispatcher.compose() | Proxy 模式 + 函数组合 |
+| 桥接 | connectH1/connectH2 返回统一上下文对象 | Client 不直接依赖具体协议实现 |
+| 工厂 | Agent/Pool 的 factory 函数 | 创建 Client 或 Pool 子类可替换 |
+
+### 4.10 Pool 三种负载均衡算法深度对比
+
+Pool 体系三种实现都继承 `PoolBase`，差异仅在 `kGetDispatcher()`。下表从源码级对比：
+
+```
+                  Pool                       BalancedPool                    RoundRobinPool
+──────────────┼──────────────────────────┼───────────────────────────────┼──────────────────────
+ 适用场景      │ 同 origin 多连接          │ 多 origin 加权负载均衡          │ 同 origin 简单轮询
+ 上游数量      │ 1 个 origin               │ N 个 upstream (动态增删)        │ 1 个 origin
+ 上层结构      │ 独立使用                  │ 内含多个 Pool（每个 upstream 一个）│ 独立使用
+ 扩容触发      │ 全部 Client busy          │ 子 Pool 内部同左                │ 全部 Client busy
+ 扩容上限      │ connections 参数          │ 子 Pool 的 connections          │ connections 参数
+ 核心索引      │ 无（线性扫描）             │ kIndex + kCurrentWeight + GCD   │ kIndex（自增取模）
+ 权重          │ 无                        │ kWeight[] 动态调整               │ 无
+ 故障响应      │ connectionError 时移除     │ weight -= errorPenalty(15)       │ connectionError 时移除
+ 恢复机制      │ 无（永久移除）             │ connect 成功 weight += 15        │ 无
+ 空闲 TTL      │ clientTtl 过期移除         │ 无                              │ clientTtl 过期移除
+ 子 Dispatcher │ Client 或 Pool (factory)   │ Pool (嵌套)                     │ Client (默认 factory)
+ 代码量        │ 143 行                     │ 214 行                          │ 159 行
+```
+
+**BalancedPool 的平滑加权轮询算法详解**（源自 Nginx 的 SWRR）：
+
+```javascript
+[kGetDispatcher] () {
+  if (this[kClients].length === 0) throw new BalancedPoolMissingUpstreamError()
+
+  let counter = 0
+  let maxWeightIndex = -1
+
+  while (counter++ < this[kClients].length) {
+    // 1. 轮转索引
+    this[kIndex] = (this[kIndex] + 1) % this[kClients].length
+    const pool = this[kClients][this[kIndex]]
+
+    // 2. 每轮起始降低 currentWeight
+    if (this[kIndex] === 0) {
+      this[kCurrentWeight] -= this[kGreatestCommonDivisor]  // GCD 步长
+      if (this[kCurrentWeight] <= 0) {
+        this[kCurrentWeight] = this[kMaxWeightPerServer]     // 重置为 max
+      }
+    }
+
+    // 3. 跳过不可用
+    if (pool[kNeedDrain] || pool.closed || pool.destroyed) continue
+
+    // 4. 记录最大权重 fallback
+    if (maxWeightIndex === -1 || pool[kWeight] > this[kClients][maxWeightIndex][kWeight]) {
+      maxWeightIndex = this[kIndex]
+    }
+
+    // 5. 权重 ≥ 当前权重 → 选中
+    if (pool[kWeight] >= this[kCurrentWeight]) return pool
+  }
+
+  // 6. fallback 到最大权重
+  if (maxWeightIndex !== -1) {
+    this[kCurrentWeight] = this[kClients][maxWeightIndex][kWeight]
+    return this[kClients][maxWeightIndex]
+  }
+}
+```
+
+**算法关键点**：
+
+1. **GCD 步长递减**：`kCurrentWeight` 每次减少所有节点权重的最大公约数，确保遍历所有可能的权重值。
+2. **maxWeightPerServer 重置**：当 currentWeight 降到 ≤0 时重置到最大值，开始新一轮。
+3. **权重动态调整**：
+   - 连接成功：`weight = min(maxWeight, weight + errorPenalty)`（默认 +15）
+   - 连接错误/UND_ERR_SOCKET 断连：`weight = max(1, weight - errorPenalty)`（默认 -15）
+4. **maxWeightIndex fallback**：若一轮遍历无满足 weight ≥ currentWeight 的节点，选最大权重的可用节点。
+
+**三种 Pool 选型决策树**：
+
+```
+请求多个不同 origin？
+  ├── 是 → 用 Agent（顶层多 origin 路由器）
+  └── 否 → 单 origin
+            │
+            ├── 多 upstream 需要权重/故障降级？
+            │     └── 是 → BalancedPool
+            │
+            └── 否
+                  ├── 纯平均分配，无状态？
+                  │     └── 是 → RoundRobinPool
+                  │
+                  └── 需要 TTL 清理、按需扩容、线性扫描空闲优先？
+                        └── 是 → Pool
+```
+
+**Pool 嵌套组合关系**：
+
+undici 支持 Pool 的多层嵌套。BalancedPool 每个 upstream 内部就是一个 Pool，Agent 每个 origin 可映射到 Pool 或 Client。多层嵌套的 busy/needDrain 判断递归进行：
+
+```
+BalancedPool (多 upstream)
+  ├── Pool("https://api-us.example.com")    ← 每个 upstream 一个 Pool
+  │     ├── Client(socket-1)
+  │     ├── Client(socket-2)
+  │     └── Client(socket-3)
+  └── Pool("https://api-eu.example.com")
+        ├── Client(socket-4)
+        └── Client(socket-5)
+```
+
+**各 Pool 与事件转发链**：
+
+```
+Client (emit drain/connect/disconnect/connectionError)
+  ↑ kAddClient 时绑定事件
+  │
+PoolBase (emit 同名事件)
+  ↑ kAddClient 时绑定事件
+  │
+Pool / BalancedPool / RoundRobinPool / Agent (emit 同名事件)
+  ↑
+用户代码 listener
+```
+
+`kOnDrain` 回调在 PoolBase 内部实现：当某个 Client 发出 drain 时，从 FixedQueue 中取出等待的请求继续 dispatch。若队列清空，emit 自己的 drain 事件。
+
 ---
 
 ## 5. HTTP/1.1 vs HTTP/2 双协议实现
@@ -843,7 +1101,240 @@ ALPNProtocols: allowH2 ? (preferH2 ? ['h2', 'http/1.1'] : ['http/1.1', 'h2']) : 
 
 默认 `preferH2` 为 false，即优先 HTTP/1.1 但接受 HTTP/2。设为 `preferH2: true` 则优先 H2。
 
-### 5.4 双协议关键差异对比
+### 5.4 双协议状态机深度对比
+
+**Client (kHTTPContext) 状态机**：
+
+```
+                   ┌──────────────────────────────────┐
+                   │          Client 状态机             │
+                   └──────────────────────────────────┘
+
+  ┌──────────┐  dispatch()   ┌──────────────┐   connect()   ┌─────────────┐
+  │  IDLE    │ ────────────> │  RESUMING    │ ────────────> │  CONNECTING │
+  │ kQueue=0 │               │ kResuming=2  │               │ kConnecting │
+  └──────────┘               └──────────────┘               └──────┬──────┘
+       ^                           │  ▲                            │
+       │                           │  │                            │
+       │                     write │  │ idle                       │ connect cb
+       │                     busy  │  │                            ▼
+       │                           ▼  │                     ┌─────────────┐
+       │                     ┌──────────────┐   alpn=h2      │  CONNECTED  │
+       └──────────────────── │   BUSY       │ ─────────────>  │  kHTTPContext│
+            kNeedDrain=0     │ kNeedDrain=2 │                 └──────┬──────┘
+                             └──────────────┘                        │
+                                         │                     h1 ╱   ╲ h2
+                                         ▼                     ╱       ║
+                                   ┌──────────────┐    ┌────────┐  ┌────────┐
+                                   │   DRAINING   │    │  H1    │  │  H2    │
+                                   │ 等所有请求完成  │    │Context │  │Session │
+                                   └──────────────┘    └────────┘  └────────┘
+```
+
+**HTTP/1.1 socket 状态标志**：
+
+| Symbol | 含义 | 触发条件 |
+|--------|------|---------|
+| `kWriting` | 正在写请求体 | writeStream / writeBuffer / writeIterable 期间 |
+| `kReset` | 需要重置连接 | HEAD/CONNECT/Upgrade 后、maxRequests 达到、body 不期待 |
+| `kBlocking` | 阻塞流水线 | 请求头带 `connection: close` 或 blocking=true |
+| `kNoRef` | socket 已 unref | 空闲时 keepAlive 期间 |
+| `kIdleSocketValidation` | 空闲验证中 | 0=正常 1=scheduled 2=checked |
+
+**HTTP/2 session 状态**：
+
+| Symbol | 含义 | 触发条件 |
+|--------|------|---------|
+| `kHTTP2SessionState.idleTimeout` | 空闲关闭定时器 | 所有 stream 关闭 + 队列为空 |
+| `kHTTP2SessionState.noStreamsTimeout` | 无流可用超时 | maxConcurrentStreams=0 |
+| `kHTTP2SessionState.refed` | session ref 状态 | 有活跃 stream 时 ref，否则 unref |
+| `kHTTP2SessionState.ping.interval` | PING 定时器 | 默认 60s，可设为 0 禁用 |
+| `kReceivedGoAway` | 收到 GOAWAY | 服务端主动关闭或重启 |
+| `kRemoteSettings` | 收到 SETTINGS | 初始 false，收到后为 true |
+| `kEnableConnectProtocol` | 支持 Extended CONNECT | 来自 SETTINGS_ENABLE_CONNECT_PROTOCOL |
+
+**双协议并发策略差异**：
+
+```
+            HTTP/1.1 (client-h1)                     HTTP/2 (client-h2)
+      ┌────────────────────────────┐         ┌────────────────────────────────┐
+      │    单个 TCP Socket          │         │     单个 TCP Socket             │
+      │                            │         │                                │
+      │  Req1 ──> Req2 ──> Req3   │         │  Stream1 ─┐                    │
+      │  (严格顺序,默认深度1)        │         │  Stream2 ─┼── 多路复用并发       │
+      │                            │         │  Stream3 ─┘   (默认100路)       │
+      │  响应必须按请求顺序          │         │  响应可以乱序到达               │
+      │  队头阻塞(HOL blocking)     │         │  无队头阻塞                    │
+      └────────────────────────────┘         └────────────────────────────────┘
+
+  判断 busy:                                 判断 busy:
+  socket[kWriting]                         session[kRemoteSettings]=false && running>0
+  || socket[kReset]                        || running >= maxConcurrentStreams
+  || socket[kBlocking]                     || (upgrade/CONNECT) && !remoteSettings
+  || (running>0 && !idempotent)
+  || (running>0 && upgrade)
+  || (running>0 && stream body)
+
+  扩容条件 (Pool 创建新 Client):            扩容条件 (Pool 创建新 Client):
+  kPending > 0 (H1 视排队为 busy)          kSize >= maxConcurrentStreams
+  kSize >= pipelining (默认1)
+```
+
+### 5.5 dispatch() 完整调度链路时序图
+
+从用户调用到响应回调的全链路时序：
+
+```
+用户代码                 API层                Dispatcher                 Client                协议层
+   │                      │                      │                        │                    │
+   │ undici.request(opts) │                      │                        │                    │
+   │─────────────────────>│                      │                        │                    │
+   │                      │                      │                        │                    │
+   │                      │ new RequestHandler   │                        │                    │
+   │                      │ dispatch(opts,h)     │                        │                    │
+   │                      │─────────────────────>│                        │                    │
+   │                      │                      │                        │                    │
+   │                      │                      │ 1. 守卫检查             │                    │
+   │                      │                      │   (handler/destroyed/   │                    │
+   │                      │                      │    closed 校验)         │                    │
+   │                      │                      │                        │                    │
+   │                      │                      │ 2. ProxyAgent/Pool 分支 │                    │
+   │                      │                      │   ┌─── kGetDispatcher ─┤                    │
+   │                      │                      │   │   (选 Client)       │                    │
+   │                      │                      │   │                     │                    │
+   │                      │                      │   │ 3. Client[kDispatch]│                    │
+   │                      │                      │───┼────────────────────>│                    │
+   │                      │                      │   │                     │                    │
+   │                      │                      │   │  new Request(origin, │                    │
+   │                      │                      │   │    opts, handler)   │                    │
+   │                      │                      │   │                     │                    │
+   │                      │                      │   │  kQueue.push(request)│                   │
+   │                      │                      │   │                     │                    │
+   │                      │                      │   │  [kResume](sync)    │                    │
+   │                      │                      │<──┼─────────────────────│                    │
+   │                      │                      │   │                     │                    │
+   │                      │                      │ 4. _resume() 循环      │                    │
+   │                      │                      │   ┌─ destroyed? return │                    │
+   │                      │                      │   ├─ kClosedResolve?   │                    │
+   │                      │                      │   │   resolve & return │                    │
+   │                      │                      │   ├─ kBusy? needDrain  │                    │
+   │                      │                      │   ├─ kPending=0? return │                    │
+   │                      │                      │   ├─ kRunning>=max?    │                    │
+   │                      │                      │   │   return            │                    │
+   │                      │                      │   │                     │                    │
+   │                      │                      │   │ 5. !kHTTPContext?   │                    │
+   │                      │                      │   │    connect(client)  │                    │
+   │                      │                      │   │    (异步 TLS/TCP)   │                    │
+   │                      │                      │   │         │           │                    │
+   │                      │                      │   │         │           │ connect(cb)        │
+   │                      │                      │   │         │           │───────────────────>│
+   │                      │                      │   │         │           │                    │
+   │                      │                      │   │         │           │  6. TCP+TLS 握手   │
+   │                      │                      │   │         │           │  ALPN 协商         │
+   │                      │                      │   │         │           │                    │
+   │                      │                      │   │         │           │  callback(err,     │
+   │                      │                      │   │         │           │          socket)   │
+   │                      │                      │   │         │           │<───────────────────│
+   │                      │                      │   │         │           │                    │
+   │                      │                      │   │    7. socket.alpnProtocol          │
+   │                      │                      │   │    ┌─── h2? connectH2()             │
+   │                      │                      │   │    │    : connectH1()               │
+   │                      │                      │   │    │                                 │
+   │                      │                      │   │    │  kHTTPContext = {              │
+   │                      │                      │   │    │    write(), resume(),          │
+   │                      │                      │   │    │    busy(), destroy()           │
+   │                      │                      │   │    │  }                             │
+   │                      │                      │   │    │                                 │
+   │                      │                      │   │ 8. emit('connect')                 │
+   │                      │                      │   │    client[kResume]()                │
+   │                      │                      │   │         │                            │
+   │                      │                      │   │ 9. HTTP 上下文 resume()             │
+   │                      │                      │   │    (h1: resumeH1 /                  │
+   │                      │                      │   │     h2: resumeH2)                   │
+   │                      │                      │   │         │                            │
+   │                      │                      │   │ 10. 重新进入 _resume()              │
+   │                      │                      │   │    取 request = kQueue[kPendingIdx]│
+   │                      │                      │   │         │                            │
+   │                      │                      │   │ 11. kHTTPContext.write(request)     │
+   │                      │                      │   │────────────────────────────────────>│
+   │                      │                      │   │         │                            │
+   │                      │                      │   │     12. H1: writeH1()               │
+   │                      │                      │   │         拼接 request line + headers │
+   │                      │                      │   │         分发 body 写入策略           │
+   │                      │                      │   │                            │         │
+   │                      │                      │   │        或 H2: writeH2()               │
+   │                      │                      │   │         构造 HTTP/2 headers           │
+   │                      │                      │   │         session.request(headers)       │
+   │                      │                      │   │         创建 stream                    │
+   │                      │                      │   │         stream.write(body)              │
+   │                      │                      │   │                            │              │
+   │                      │                      │   │  13. 返回 true/false            │              │
+   │                      │                      │   │<───────────────────────────────────────────│
+   │                      │                      │   │         │                            │
+   │                      │                      │   │  14. kPendingIdx++               │
+   │                      │                      │   │         │                            │
+   │                      │                      │   │  ┌─── 网络传输...                  │
+   │                      │                      │   │  │                                  │
+   │                      │                      │   │  │  H1: Parser.execute() 逐字节解析  │
+   │                      │                      │   │  │  H2: Node http2 模块内部解析      │
+   │                      │                      │   │  │                                  │
+   │                      │                      │   │  │  ┌─── 响应到达 ──────────────┐  │
+   │                      │                      │   │  │  │ H1: parser callback       │  │
+   │                      │                      │   │  │  │ H2: stream.emit('response')│  │
+   │                      │                      │   │  │  └───────────────────────────┘  │
+   │                      │                      │   │  │                                  │
+   │                      │                      │   │  15. handler.onResponseStart()       │
+   │                      │                      │   │     (statusCode, headers, resume)   │
+   │                      │                      │   │     │                                │
+   │                      │                      │   │     │  RequestHandler.onResponseStart    │
+   │                      │                      │   │     │  new Readable + callback(null,     │
+   │                      │                      │   │     │    {statusCode, body, ...})        │
+   │                      │                      │   │     │                                │
+   │                      │<─────────────────────│<────┼─────│                                │
+   │                      │                      │     │     │                                │
+   │  Promise  resolve    │                      │     │ 16. handler.onResponseData()       │
+   │  {statusCode, body}  │                      │     │     │  res.push(chunk)                  │
+   │<─────────────────────│                      │     │     │  (用户消费 Readable)               │
+   │                      │                      │     │     │                                │
+   │  for await(chunk)    │                      │     │ 17. handler.onResponseEnd()        │
+   │<─────────────────────│                      │     │     │  res.push(null)  // EOF          │
+   │                      │                      │     │     │  client[kQueue][kRunningIdx++]=null│
+   │                      │                      │     │     │                                │
+```
+
+**关键步骤解读**：
+
+1. **守卫检查**（DispatcherBase.dispatch）：handler 必须是对象、opts 必须无 dispatcher 字段、client 不能 destroyed/closed。
+2. **路由选择**（PoolBase.kGetDispatcher）：线性扫描 / 加权轮询 / 简单轮询，选空闲 Client。若全部 busy 则返回 undefined → 入 FixedQueue 等待 drain。
+3. **入队 + resume 触发**（Client[kDispatch]）：新建 Request 推入 kQueue。根据 body 类型：
+   - 同步 body（Buffer/string） → 立即 `kResume(true)` 同步调度
+   - 异步 iterable → `queueMicrotask(() => resume(this))` 延迟一 tick 等 body 就绪
+   - 已在 resume 中 → 不操作
+4. **_resume 循环**：while(true) 逐次检查 destroyed/closed/busy/pending=0/running>=max 退出条件。
+5. **servername 切换**：HTTPS 下若请求 servername 与当前连接不一致，且 running=0 时才重建连接。
+6. **connect 异步建连**：调用用户配置的 connector（默认 buildConnector），内部做 DNS 解析 + TCP 连接 + TLS 握手 + ALPN 协商。
+7. **协议上下文创建**：根据 ALPN 结果选择 connectH1 或 connectH2，返回 `{ write, resume, busy, destroy, destroyed }` 上下文对象。
+8. **emit connect**：触发用户监听的 connect 事件。
+9. **resumeH1/resumeH2**：H1 先处理 idleSocketValidation 和 ref/unref 状态；H2 设置 ref/unref + 空闲定时器 + noStreamsTimeout。
+10. **write 发送请求**：
+    - H1 writeH1：构造请求行 + headers + Content-Length/chunked 编码。对 stream body 用 AsyncWriter 流式写入；对 Buffer 一次性写入。
+    - H2 writeH2：构造 HTTP/2 headers（:method/:path/:scheme/:authority），调用 session.request() 创建 Http2Stream，绑定 stream 事件（response/end/error/data/trailers/aborted）。
+11. **响应回调**：H1 通过 Parser.execute() 逐字节触发回调；H2 通过 stream 事件触发。
+12. **EOF 处理**：onMessageComplete（H1）或 onEnd/stream close（H2）→ handler.onResponseEnd → res.push(null)。
+13. **队首推进**：`client[kQueue][kRunningIdx++] = null`，标记完成。
+14. **keep-alive / reset**：shouldKeepAlive=true 时复用连接，设置 keepAlive timer；否则 destroy socket。
+
+**dispatch() 返回值语义**：
+
+```javascript
+// client.js [kDispatch] 返回值
+return this[kNeedDrain] < 2   // true=空闲可继续发, false=队列满需要等待 drain
+```
+
+`true`：连接仍可接受更多请求（未达并发上限）；
+`false`：连接已满，发出 drain 事件后客户端应暂停发送。
+
+### 5.6 双协议关键差异对比表
 
 | 维度 | HTTP/1.1 (client-h1) | HTTP/2 (client-h2) |
 |------|---------------------|-------------------|
@@ -990,6 +1481,236 @@ this.timeout = timers.setFastTimeout(onParserTimeout, delay, this.timeoutWeakRef
 
 定时器回调通过 `WeakRef` 持有 Parser，如果 Parser 已被 GC，定时器回调直接返回。
 
+### 6.5 llhttp WASM 解析器与 Client 回调衔接完整链路
+
+**WASM 模块文件结构**：
+
+```
+lib/llhttp/
+├── constants.js         # 531 行：ERROR/TYPE/FLAGS/METHODS 等枚举
+├── constants.d.ts       # TypeScript 类型声明
+├── llhttp.wasm          # 标准 WASM 二进制
+├── llhttp-wasm.js       # 15 行：Base64 编码的 WASM 导出
+├── llhttp_simd.wasm     # SIMD 加速 WASM 二进制
+├── llhttp_simd-wasm.js  # 15 行：SIMD 版本导出
+├── utils.js             # 12 行：辅助函数
+└── utils.d.ts           # TypeScript 类型声明
+```
+
+**WASM 导出接口**（`exports` 对象）：
+
+```javascript
+// llhttp-wasm.js 导出的 Instance.exports 包含：
+{
+  llhttp_alloc: (type) => ptr,           // 分配解析器实例
+  llhttp_free: (ptr) => void,            // 释放解析器实例
+  llhttp_execute: (ptr, ptr, len) => err,// 执行解析
+  llhttp_finish: (ptr) => err,           // 通知 EOF
+  llhttp_resume: (ptr) => void,          // 恢复暂停的解析器
+  llhttp_get_error_pos: (ptr) => pos,    // 获取错误位置
+  llhttp_get_error_reason: (ptr) => ptr, // 获取错误原因字符串
+  llhttp_settings_init: (ptr) => void,   // 初始化 settings
+  malloc: (size) => ptr,                 // WASM 内存分配
+  free: (ptr) => void,                   // WASM 内存释放
+  memory: WebAssembly.Memory             // WASM 线性内存
+}
+```
+
+**JS-WASM 回调桥完整实现**（`lazyllhttp` 的 env 参数）：
+
+```javascript
+return new WebAssembly.Instance(mod, {
+  env: {
+    // URL 解析回调（响应解析中未使用，返回 0）
+    wasm_on_url: (p, at, len) => 0,
+
+    // 状态行解析：HTTP/1.1 200 OK 中的 "OK"
+    wasm_on_status: (p, at, len) => {
+      assert(currentParser.ptr === p)
+      const start = at - currentBufferPtr + currentBufferRef.byteOffset
+      return currentParser.onStatus(new FastBuffer(currentBufferRef.buffer, start, len))
+    },
+
+    // 消息开始（每个响应触发一次）
+    wasm_on_message_begin: (p) => {
+      assert(currentParser.ptr === p)
+      return currentParser.onMessageBegin()
+    },
+
+    // 头部字段名
+    wasm_on_header_field: (p, at, len) => {
+      assert(currentParser.ptr === p)
+      const start = at - currentBufferPtr + currentBufferRef.byteOffset
+      return currentParser.onHeaderField(new FastBuffer(currentBufferRef.buffer, start, len))
+    },
+
+    // 头部值
+    wasm_on_header_value: (p, at, len) => {
+      assert(currentParser.ptr === p)
+      const start = at - currentBufferPtr + currentBufferRef.byteOffset
+      return currentParser.onHeaderValue(new FastBuffer(currentBufferRef.buffer, start, len))
+    },
+
+    // 头部解析完成
+    wasm_on_headers_complete: (p, statusCode, upgrade, shouldKeepAlive) => {
+      assert(currentParser.ptr === p)
+      return currentParser.onHeadersComplete(statusCode, upgrade === 1, shouldKeepAlive === 1)
+    },
+
+    // 响应体数据块
+    wasm_on_body: (p, at, len) => {
+      assert(currentParser.ptr === p)
+      const start = at - currentBufferPtr + currentBufferRef.byteOffset
+      return currentParser.onBody(new FastBuffer(currentBufferRef.buffer, start, len))
+    },
+
+    // 消息完成
+    wasm_on_message_complete: (p) => {
+      assert(currentParser.ptr === p)
+      return currentParser.onMessageComplete()
+    }
+  }
+})
+```
+
+**回调返回值语义**：
+
+| 返回值 | 含义 |
+|--------|------|
+| `0` | 继续解析 |
+| `-1` | 错误，终止解析（HPE 错误） |
+| `constants.ERROR.PAUSED (21)` | 暂停解析（用于 Upgrade 场景） |
+| `1` | 跳过 body（用于 HEAD 响应或 1xx 信息响应） |
+| `2` | Upgrade 请求，暂停解析 |
+
+**Parser 回调 → Request handler 回调 → 用户回调 的完整链路**：
+
+```
+socket 收到数据
+    │
+    ▼
+onHttpSocketReadable() → parser.readMore()
+    │
+    ▼
+parser.execute(chunk)
+    │ 调用 WASM: llhttp_execute(ptr, bufferPtr, chunk.length)
+    │
+    ▼ (WASM 内部逐字节状态机)
+    │
+    ├── onMessageBegin() ──→ request.onResponseStarted()
+    │
+    ├── onHeaderField(buf) ──→ parser.headers.push(buf)
+    │
+    ├── onHeaderValue(buf) ──→ parser.headers.push(buf)
+    │                          + 解析 keep-alive / connection / content-length
+    │
+    ├── onHeadersComplete(statusCode, upgrade, keepAlive)
+    │      │
+    │      ├── 设置 keepAlive 超时
+    │      ├── 切换到 TIMEOUT_BODY
+    │      └── request.onResponseStart(statusCode, headers, resume, statusText)
+    │            │
+    │            └── handler.onResponseStart(controller, statusCode, headers, statusText)
+    │                  │
+    │                  └── 用户代码：new Readable + callback(null, {statusCode, body, ...})
+    │
+    ├── onBody(buf) ──→ request.onResponseData(buf)
+    │                     │
+    │                     └── handler.onResponseData(controller, chunk)
+    │                           │
+    │                           └── res.push(chunk)  ← 用户消费
+    │                               若 push 返回 false → controller.pause()
+    │
+    └── onMessageComplete()
+           │
+           ├── 校验 contentLength === bytesRead
+           ├── request.onResponseEnd(headers)
+           │     │
+           │     └── handler.onResponseEnd(controller, trailers)
+           │           │
+           │           └── res.push(null)  ← EOF
+           │
+           ├── client[kQueue][kRunningIdx++] = null  ← 推进队首
+           └── 设置 keep-alive timer 或 destroy socket
+```
+
+**WASM 内存管理**：
+
+```javascript
+// 初始分配（4096 对齐）
+currentBufferSize = Math.ceil(chunk.length / 4096) * 4096
+currentBufferPtr = llhttp.malloc(currentBufferSize)
+
+// 视图映射（零拷贝）
+currentBuffer = new Uint8Array(llhttp.memory.buffer, currentBufferPtr, currentBufferSize)
+
+// 每次 execute 前复制数据到 WASM 内存
+currentBuffer.set(chunk)
+
+// 解析完成后释放（destroy 时）
+llhttp.free(currentBufferPtr)
+```
+
+**错误码完整清单**（`lib/llhttp/constants.js`）：
+
+```javascript
+exports.ERROR = {
+  OK: 0,                          // 成功
+  INTERNAL: 1,                    // 内部错误
+  STRICT: 2,                      // 严格模式错误
+  LF_EXPECTED: 3,                 // 期望 LF
+  UNEXPECTED_CONTENT_LENGTH: 4,   // 意外的 Content-Length
+  CLOSED_CONNECTION: 5,           // 连接关闭
+  INVALID_METHOD: 6,              // 无效方法
+  INVALID_URL: 7,                 // 无效 URL
+  INVALID_CONSTANT: 8,            // 无效常量
+  INVALID_VERSION: 9,             // 无效版本
+  INVALID_HEADER_TOKEN: 10,       // 无效头部 token
+  INVALID_CONTENT_LENGTH: 11,     // 无效 Content-Length
+  INVALID_CHUNK_SIZE: 12,         // 无效 chunk 大小
+  INVALID_STATUS: 13,             // 无效状态码
+  INVALID_EOF_STATE: 14,          // 无效 EOF 状态
+  INVALID_TRANSFER_ENCODING: 15,  // 无效传输编码
+  CB_MESSAGE_BEGIN: 16,           // 回调：消息开始
+  CB_HEADERS_COMPLETE: 17,        // 回调：头部完成
+  CB_MESSAGE_COMPLETE: 18,        // 回调：消息完成
+  CB_CHUNK_HEADER: 19,            // 回调：chunk 头
+  CB_CHUNK_COMPLETE: 20,          // 回调：chunk 完成
+  PAUSED: 21,                     // 暂停
+  PAUSED_UPGRADE: 22,             // 暂停（Upgrade）
+  PAUSED_H2_UPGRADE: 23,          // 暂停（H2 Upgrade）
+  USER: 24,                       // 用户自定义
+  CR_EXPECTED: 25,                // 期望 CR
+  CB_URL_COMPLETE: 26,            // 回调：URL 完成
+  CB_STATUS_COMPLETE: 27,         // 回调：状态完成
+  CB_HEADER_FIELD_COMPLETE: 28,   // 回调：头字段完成
+  CB_HEADER_VALUE_COMPLETE: 29,   // 回调：头值完成
+  UNEXPECTED_SPACE: 30,           // 意外空格
+  CB_RESET: 31,                   // 回调：重置
+  CB_METHOD_COMPLETE: 32,         // 回调：方法完成
+  CB_VERSION_COMPLETE: 33,        // 回调：版本完成
+  CB_CHUNK_EXTENSION_NAME_COMPLETE: 34,
+  CB_CHUNK_EXTENSION_VALUE_COMPLETE: 35,
+  CB_PROTOCOL_COMPLETE: 38        // 回调：协议完成
+}
+```
+
+**SIMD 版本选择逻辑**：
+
+```javascript
+// 默认启用 SIMD，但排除 ppc64 架构（Power 9 上 SIMD 有 bug）
+let useWasmSIMD = process.arch !== 'ppc64'
+
+// 环境变量强制控制
+if (process.env.UNDICI_NO_WASM_SIMD === '1') useWasmSIMD = false
+else if (process.env.UNDICI_NO_WASM_SIMD === '0') useWasmSIMD = true
+
+// Jest 测试环境强制使用非 SIMD（避免 WASM 编译开销）
+const llhttpWasmData = process.env.JEST_WORKER_ID
+  ? require('../llhttp/llhttp-wasm.js')
+  : undefined
+```
+
 ---
 
 ## 7. 连接器与 TLS
@@ -1055,7 +1776,24 @@ class WeakSessionCache {
 
 ## 8. 代理体系
 
-### 8.1 ProxyAgent — HTTP CONNECT 隧道
+### 8.1 代理体系完整对比
+
+undici 提供三种代理实现，核心差异如下：
+
+```
+                ProxyAgent                EnvHttpProxyAgent             Socks5ProxyAgent
+──────────────┼─────────────────────────┼────────────────────────────┼──────────────────────
+ 配置方式      │ 构造函数参数 uri         │ 环境变量 / 构造函数覆盖      │ 构造函数参数 uri
+ 协议支持      │ HTTP/HTTPS/SOCKS5       │ HTTP/HTTPS                 │ SOCKS5
+ 隧道模式      │ CONNECT / 正向(非隧道)   │ CONNECT                    │ SOCKS5 CONNECT
+ NO_PROXY     │ 不支持                  │ 完整支持                    │ 不支持
+ 认证方式      │ auth/token/URL 用户名密码 │ 同左                       │ 用户名/密码
+ 嵌套结构      │ 内嵌 Agent+Client       │ 内嵌 3 个子 Agent           │ 按 origin 分 Pool
+ 代码量        │ 378 行                  │ 175 行                      │ 282 行
+ 适用场景      │ 显式指定代理             │ 透明读取环境代理配置         │ SOCKS5 代理需求
+```
+
+### 8.2 ProxyAgent — HTTP CONNECT 隧道
 
 `lib/dispatcher/proxy-agent.js` 支持三种代理模式：
 
@@ -1342,15 +2080,101 @@ function upgrade (opts, callback) {
 - 用于 HTTP Upgrade（如 WebSocket）
 - 校验状态码为 101（H1）或 200（H2 Extended CONNECT）
 
-### 5 种 API 对比表
+### 10.6 5 种 API 调用方式、返回类型与内部实现完整对比
 
-| API | 请求体 | 响应体 | 返回值 | 适用场景 |
-|-----|--------|--------|--------|---------|
-| `request` | opts.body | Readable 流 | Promise/callback | 通用 HTTP 请求 |
-| `stream` | opts.body | factory 返回的 Writable | Promise/callback | 流式写入（写文件等） |
-| `pipeline` | Duplex 写入端 | handler 返回的 Readable | Duplex 流 | 管道化处理 |
-| `connect` | 无 | 原始 socket | Promise/callback | HTTP CONNECT 隧道 |
-| `upgrade` | 无 | 原始 socket | Promise/callback | WebSocket 升级 |
+| API | 调用签名 | 返回类型 | 内部 Handler | 核心差异 |
+|-----|---------|---------|-------------|---------|
+| `request` | `(opts, callback?)` → Promise | `{statusCode, statusText, headers, trailers, body: Readable, opaque, context}` | `RequestHandler` | 通用请求；body 是 Readable；callback 或 Promise 二选一 |
+| `stream` | `(opts, factory, callback?)` → Promise | `undefined`（factory 的 Writable 是响应体） | `StreamHandler` | 用户创建 Writable factory，数据写入用户流；背压通过 writableNeedDrain 传递 |
+| `pipeline` | `(opts, handler)` → Duplex | `Duplex`（写入=请求体，读取=响应体） | `PipelineHandler` | 返回 Duplex；req/ret 两个内部流；request body 不能跨 redirect 重放 |
+| `connect` | `(opts, callback?)` → Promise | `{statusCode, headers, socket, opaque, context}` | `ConnectHandler` | 底层 dispatch `{method:'CONNECT'}`；onResponseStart 故意抛错（不应有正常响应） |
+| `upgrade` | `(opts, callback?)` → Promise | `{headers, socket, opaque, context}` | `UpgradeHandler` | 底层 dispatch `{method: opts.method\|\|'GET', upgrade: opts.protocol\|\|'Websocket'}`；H1 校验 101，H2 校验 200 |
+
+**内部调用链统一视图**：
+
+```
+request(opts, cb)          stream(opts, factory, cb)       pipeline(opts, handler)
+     │                           │                               │
+     ▼                           ▼                               ▼
+new RequestHandler          new StreamHandler              new PipelineHandler
+     │                           │                               │
+     ▼                           ▼                               ▼
+this.dispatch(opts, h)      this.dispatch(opts, h)         this.dispatch(
+     │                           │                            {...opts,
+     │                           │                             body: handler.req},
+     │                           │                            handler)
+     │                           │                               │
+     │                           │                               ▼
+     │                           │                          return handler.ret
+     │                           │                          (Duplex)
+     ▼                           ▼
+  所有路径最终走到：dispatcher.dispatch(opts, handler)
+     │
+     ▼
+  ProxyAgent / Agent / PoolBase 路由
+     │
+     ▼
+  Client[kDispatch] → _resume() → write → HTTP 上下文
+     │
+     ▼
+  协议回调 → handler.onResponseStart / onResponseData / onResponseEnd
+     │
+     ▼
+  RequestHandler:   StreamHandler:       PipelineHandler:
+  new Readable →    factory() →          user handler(res) →
+  callback(null,    writable.write(chunk)  ret.push(transformed)
+  {body: res})      drain → resume
+```
+
+**body 在各 API 中的处理差异**：
+
+```
+              request/stream/pipeline          connect/upgrade
+              ────────────────────────         ──────────────
+请求体来源    │ opts.body 直接传入             │ 无 body（opts.body 被忽略）
+              │ pipeline 时 opts.body 被       │
+              │ 替换为 PipelineRequest         │
+                                      │
+响应体处理    │ RequestHandler:                │ ConnectHandler/UpgradeHandler:
+              │   内部 new Readable +          │   onRequestUpgrade(statusCode,
+              │   push(chunk) 由用户消费        │                       headers, socket)
+                                      │
+背压实现      │ onResponseData push=false      │ 不涉及背压，直接返回 socket
+              │ → controller.pause()           │
+                                      │
+重定向支持    │ 由 RedirectHandler 在          │ 不支持重定向（隧道/升级）
+              │ handler 外层包装实现            │
+```
+
+**callback 与 Promise 模式切换**（所有 API 统一范式）：
+
+```javascript
+function xxx (opts, callback) {
+  if (callback === undefined) {
+    return new Promise((resolve, reject) => {
+      xxx.call(this, opts, (err, data) => {
+        return err ? reject(err) : resolve(data)
+      })
+    })
+  }
+  // ... callback 逻辑
+}
+```
+
+每个 API 都支持同步错误 + 异步错误处理：同步参数校验错误直接 throw（Promise 模式）或 callback(err)（callback 模式）。
+
+### 10.7 API 选择决策树
+
+```
+需要处理响应流？
+├── 是，需要读取响应体
+│   ├── 只需读取，不需要写入 → request（最简单）
+│   ├── 需要写文件/Writable → stream（用户创建 Writable）
+│   └── 需要管道转换（transform）→ pipeline（返回 Duplex）
+└── 不需要响应体，需要底层 socket
+    ├── HTTP CONNECT 隧道 → connect
+    └── WebSocket/协议升级 → upgrade
+```
 
 ---
 
@@ -1488,58 +2312,241 @@ function onError (client, err) {
 
 `lib/core/diagnostics.js` 基于 Node.js `diagnostics_channel` 模块提供全面的可观测性。
 
-**通道列表**：
+### 13.1 通道完整清单与 Payload 结构
 
 ```javascript
 const channels = {
-  // Client 级别
-  beforeConnect: channel('undici:client:beforeConnect'),    // 连接前
-  connected: channel('undici:client:connected'),             // 连接成功
-  connectError: channel('undici:client:connectError'),       // 连接失败
-  sendHeaders: channel('undici:client:sendHeaders'),         // 发送请求头
+  // ─── Client 级别（4 个） ───────────────────────────────────────────────
+  beforeConnect: diagnosticsChannel.channel('undici:client:beforeConnect'),
+  connected: diagnosticsChannel.channel('undici:client:connected'),
+  connectError: diagnosticsChannel.channel('undici:client:connectError'),
+  sendHeaders: diagnosticsChannel.channel('undici:client:sendHeaders'),
 
-  // Request 级别
-  create: channel('undici:request:create'),                   // 请求创建
-  bodySent: channel('undici:request:bodySent'),               // 请求体发送完成
-  bodyChunkSent: channel('undici:request:bodyChunkSent'),     // 请求体块发送
-  bodyChunkReceived: channel('undici:request:bodyChunkReceived'), // 响应体块接收
-  headers: channel('undici:request:headers'),                 // 响应头接收
-  trailers: channel('undici:request:trailers'),               // trailer 接收
-  error: channel('undici:request:error'),                     // 请求错误
+  // ─── Request 级别（8 个） ─────────────────────────────────────────────
+  create: diagnosticsChannel.channel('undici:request:create'),
+  bodySent: diagnosticsChannel.channel('undici:request:bodySent'),
+  bodyChunkSent: diagnosticsChannel.channel('undici:request:bodyChunkSent'),
+  bodyChunkReceived: diagnosticsChannel.channel('undici:request:bodyChunkReceived'),
+  headers: diagnosticsChannel.channel('undici:request:headers'),
+  trailers: diagnosticsChannel.channel('undici:request:trailers'),
+  error: diagnosticsChannel.channel('undici:request:error'),
 
-  // WebSocket 级别
-  open: channel('undici:websocket:open'),
-  close: channel('undici:websocket:close'),
-  socketError: channel('undici:websocket:socket_error'),
-  ping: channel('undici:websocket:ping'),
-  pong: channel('undici:websocket:pong'),
+  // ─── WebSocket 级别（5 个） ───────────────────────────────────────────
+  open: diagnosticsChannel.channel('undici:websocket:open'),
+  close: diagnosticsChannel.channel('undici:websocket:close'),
+  socketError: diagnosticsChannel.channel('undici:websocket:socket_error'),
+  ping: diagnosticsChannel.channel('undici:websocket:ping'),
+  pong: diagnosticsChannel.channel('undici:websocket:pong'),
 
-  // Proxy 级别
-  proxyConnected: channel('undici:proxy:connected')           // 代理隧道建立
+  // ─── Proxy 级别（1 个） ───────────────────────────────────────────────
+  proxyConnected: diagnosticsChannel.channel('undici:proxy:connected')
 }
 ```
 
-**懒加载订阅**：
+### 13.2 各通道 Payload 数据结构（含 publish 位置）
+
+**`undici:client:beforeConnect`** — 建连前（client.js connect()）
+
+```javascript
+// lib/dispatcher/client.js  line ~516
+channels.beforeConnect.publish({
+  connectParams: {
+    host, hostname, protocol, port,        // URL 解析结果
+    version: client[kHTTPContext]?.version, // 'h1' | 'h2' | undefined
+    servername: client[kServerName],        // TLS SNI
+    localAddress: client[kLocalAddress]     // 绑定的本地 IP
+  },
+  connector: client[kConnector]             // 连接工厂函数
+})
+```
+
+**`undici:client:connected`** — 建连成功（client.js connect() callback）
+
+```javascript
+// lib/dispatcher/client.js  line ~572
+channels.connected.publish({
+  connectParams: { host, hostname, protocol, port, version, servername, localAddress },
+  connector: client[kConnector],
+  socket                          // 已连接的 net.Socket / tls.TLSSocket
+})
+```
+
+**`undici:client:connectError`** — 建连失败（handleConnectError）
+
+```javascript
+// lib/dispatcher/client.js  line ~605
+channels.connectError.publish({
+  connectParams: { host, hostname, protocol, port, version, servername, localAddress },
+  connector: client[kConnector],
+  error                           // Error 实例（含 code/message）
+})
+```
+
+**`undici:client:sendHeaders`** — 发送请求头（writeH1 / writeH2）
+
+```javascript
+// lib/dispatcher/client-h1.js  line ~1345
+channels.sendHeaders.publish({
+  request: { method, path, origin },  // Request 的部分字段
+  headers: header,                    // 完整的 HTTP 头字符串
+  socket                              // 底层 socket
+})
+
+// lib/dispatcher/client-h2.js  line ~1221
+channels.sendHeaders.publish({
+  request: { method, path, origin },
+  headers: header,                    // 拼接后的头字符串
+  socket: session[kSocket]
+})
+```
+
+**`undici:request:headers`** — 收到响应头（onHeadersComplete / onResponse）
+
+```javascript
+// 通过 lib/core/request.js 内部触发
+channels.headers.publish({
+  request: { method, path, origin },
+  response: { statusCode }
+})
+```
+
+**`undici:request:trailers`** — 收到 trailers（H2 trailers / H1 trailers）
+
+```javascript
+channels.trailers.publish({
+  request: { method, path, origin }
+})
+```
+
+**`undici:request:error`** — 请求错误
+
+```javascript
+channels.error.publish({
+  request: { method, path, origin },
+  error     // Error 实例
+})
+```
+
+**`undici:websocket:open`** — WebSocket 连接打开
+
+```javascript
+channels.open({
+  address: { address, port }   // 服务端地址，可能为 null
+})
+```
+
+**`undici:websocket:close`** — WebSocket 连接关闭
+
+```javascript
+channels.close({
+  websocket,   // WebSocket 实例
+  code,        // 关闭码 (1000=normal, 1006=abnormal)
+  reason       // 关闭原因字符串
+})
+```
+
+**`undici:websocket:socket_error`** — WebSocket 底层 socket 错误
+
+```javascript
+channels.socketError(err)   // Error 实例
+```
+
+**`undici:websocket:ping` / `undici:websocket:pong`** — WebSocket 心跳
+
+```javascript
+channels.ping()   // 收到 ping
+channels.pong()   // 收到 pong
+```
+
+**`undici:proxy:connected`** — 代理隧道建立
+
+```javascript
+channels.proxyConnected({
+  // 代理连接信息
+})
+```
+
+### 13.3 三个 track 函数（懒订阅 + 去重）
+
+**`trackClientEvents()`**：
+
+```javascript
+function trackClientEvents (debugLog = undiciDebugLog) {
+  if (isTrackingClientEvents) return
+  // 已有订阅者 → 幂等返回（处理 npm undici 与 Node 内置 undici 共存场景）
+  if (channels.beforeConnect.hasSubscribers || channels.connected.hasSubscribers ||
+      channels.connectError.hasSubscribers || channels.sendHeaders.hasSubscribers) {
+    isTrackingClientEvents = true
+    return
+  }
+  isTrackingClientEvents = true
+
+  diagnosticsChannel.subscribe('undici:client:beforeConnect',
+    evt => { debugLog('connecting to %s%s using %s%s', host, port, protocol, version) })
+  diagnosticsChannel.subscribe('undici:client:connected',
+    evt => { debugLog('connected to %s%s using %s%s', ...) })
+  diagnosticsChannel.subscribe('undici:client:connectError',
+    evt => { debugLog('connection to %s%s using %s%s errored - %s', ..., error.message) })
+  diagnosticsChannel.subscribe('undici:client:sendHeaders',
+    evt => { debugLog('sending request to %s %s%s', method, origin, path) })
+}
+```
+
+**`trackRequestEvents()`**：订阅 request:headers / request:trailers / request:error。
+
+**`trackWebSocketEvents()`**：订阅 websocket:open / close / socket_error / ping / pong。
+
+### 13.4 订阅触发条件
 
 ```javascript
 if (undiciDebugLog.enabled || fetchDebuglog.enabled) {
-  trackClientEvents()
-  trackRequestEvents()
+  trackClientEvents(fetchDebuglog.enabled ? fetchDebuglog : undiciDebugLog)
+  trackRequestEvents(fetchDebuglog.enabled ? fetchDebuglog : undiciDebugLog)
+}
+
+if (websocketDebuglog.enabled) {
+  trackClientEvents(undiciDebugLog.enabled ? undiciDebugLog : websocketDebuglog)
+  trackWebSocketEvents(websocketDebuglog)
 }
 ```
 
-只有在 `NODE_DEBUG=undici` 或 `NODE_DEBUG=fetch` 环境变量启用时才订阅诊断通道，零开销。
+环境变量控制：
+- `NODE_DEBUG=undici` → 启用 client + request 调试
+- `NODE_DEBUG=fetch` → 同上（用 fetch Debuglog）
+- `NODE_DEBUG=websocket` → 启用 client + websocket 调试
 
-**订阅去重**：
+### 13.5 用户自定义订阅示例
 
 ```javascript
-if (channels.beforeConnect.hasSubscribers) {
-  isTrackingClientEvents = true
-  return  // 已有订阅者，不重复订阅
-}
+const diagnosticsChannel = require('diagnostics_channel')
+
+// 订阅所有连接事件
+diagnosticsChannel.subscribe('undici:client:beforeConnect', (evt) => {
+  console.log('准备连接:', evt.connectParams.hostname, evt.connectParams.port)
+  // 可以修改 evt.connectParams（虽然这里只是 observable）
+})
+
+// 订阅请求错误
+diagnosticsChannel.subscribe('undici:request:error', (evt) => {
+  telemetry.recordError({
+    origin: evt.request.origin,
+    path: evt.request.path,
+    error: evt.error.message,
+    code: evt.error.code
+  })
+})
+
+// 订阅 WebSocket 事件
+diagnosticsChannel.subscribe('undici:websocket:close', (evt) => {
+  console.log('WebSocket 关闭:', evt.code, evt.reason)
+})
 ```
 
-防止 Node.js 内置 undici 和 npm 安装的 undici 重复订阅。
+### 13.6 diagnostics_channel 订阅最佳实践
+
+1. **在 import undici 前订阅**：因为首次 require 时会检查 `hasSubscribers`，已在的订阅者会触发跟踪注册。
+2. **使用 channel.channel() 而非 channel.tracingChannel()**：undici 使用的是稳定版的 channel API。
+3. **副作用注意**：publish 是同步的，订阅者的回调执行会阻塞 publish 返回。避免在订阅者中做重操作。
 
 ---
 
@@ -1547,16 +2554,64 @@ if (channels.beforeConnect.hasSubscribers) {
 
 `lib/dispatcher/fixed-queue.js` 是从 Node.js 内部提取的高性能队列实现。
 
-**数据结构**：单向链表 + 固定大小环形缓冲区
+**数据结构**：单向链表 + 固定大小环形缓冲区（完整 ASCII 结构图）：
 
 ```
-  head (写入端)                                  tail (读取端)
-    |                                               |
-    v                                               v
- +-----------+       +-----------+       +-----------+
- | Buffer N  | ----> | Buffer N-1| ----> | Buffer 0  |
- | (newest)  |       |           |       | (oldest)  |
- +-----------+       +-----------+       +-----------+
+  注释（源码内嵌）描述了三种形态：
+
+  形态 A: 多缓冲区链表（head 在右，tail 在左， oldest 先出）
+
+   head                                                        tail
+     |                                                           |
+     v                                                           v
+  +-----------+ <-----\       +-----------+ <------\         +-----------+
+  |  [null]   |        \----- |   next    |         \------- |   next    |
+  +-----------+               +-----------+                  +-----------+
+  |   item    | <-- bottom    |   item    | <-- bottom       | undefined |
+  |   item    |               |   item    |                  | undefined |
+  |   item    |               |   item    |                  | undefined |
+  |   item    |               |   item    |                  | undefined |
+  |   item    |               |   item    |       bottom --> |   item    |
+  |   item    |               |   item    |                  |   item    |
+  |    ...    |               |    ...    |                  |    ...    |
+  |   item    |               |   item    |                  |   item    |
+  |   item    |               |   item    |                  |   item    |
+  | undefined | <-- top       |   item    |                  |   item    |
+  | undefined |               |   item    |                  |   item    |
+  | undefined |               | undefined | <-- top  top -->| undefined |
+  +-----------+               +-----------+                  +-----------+
+
+  形态 B: 单缓冲区，有数据
+
+   head   tail
+     |     |
+     v     v
+  +-----------+
+  |  [null]   |
+  +-----------+
+  | undefined |
+  | undefined |
+  |   item    | <-- bottom            top --> | undefined |
+  |   item    |                               | undefined |
+  | undefined | <-- top            bottom --> |   item    |
+  | undefined |                               |   item    |
+  +-----------+
+
+  形态 C: 单缓冲区，空
+
+   head   tail
+     |     |
+     v     v
+  +-----------+
+  |  [null]   |
+  +-----------+
+  | undefined |                               | undefined |
+  | undefined |                               | undefined |
+  | undefined | <-- bottom            top --> | undefined |
+  | undefined |                               | undefined |
+  | undefined | <-- top            bottom --> | undefined |
+  | undefined |                               | undefined |
+  +-----------+
 ```
 
 每个 `FixedCircularBuffer` 大小为 2048（V8 优化测试得出的最佳大小，必须是 2 的幂）。
@@ -1566,13 +2621,14 @@ if (channels.beforeConnect.hasSubscribers) {
 ```javascript
 push (data) {
   if (this.head.isFull()) {
+    // Head 满了：创建新缓冲区，链接到旧 head.next，并作为新 head
     this.head = this.head.next = new FixedCircularBuffer()
   }
   this.head.push(data)
 }
 ```
 
-当前缓冲区满时自动创建新的缓冲区链接到链表末尾。
+当前缓冲区满时自动创建新的缓冲区链接到链表末尾。注意：判断 `isFull()` 使用的是 `((top + 1) & kMask) === bottom`——即只浪费一个槽位，这是经典的环形缓冲区判满策略。
 
 **shift（出队）**：
 
@@ -1581,8 +2637,9 @@ shift () {
   const tail = this.tail
   const next = tail.shift()
   if (tail.isEmpty() && tail.next !== null) {
-    this.tail = tail.next  // 回收空缓冲区
-    tail.next = null
+    // tail 已空，且有下一个缓冲区：回收当前 tail，前进到下一个
+    this.tail = tail.next
+    tail.next = null   // 断开引用，便于 GC
   }
   return next
 }
@@ -1590,11 +2647,58 @@ shift () {
 
 出队时如果当前 tail 缓冲区为空且有下一个，自动前进并释放旧缓冲区。
 
-**性能优势**：
-- 数组固定大小，V8 可以优化为连续内存
-- 环形缓冲区避免了数组的 shift/unshift（O(n)）操作
-- 链表分段避免了单个大数组的 GC 压力
-- 2048 大小经过 V8 基准测试优化
+**FixedCircularBuffer 内部实现**：
+
+```javascript
+const kSize = 2048
+const kMask = kSize - 1   // 位掩码用于快速取模
+
+class FixedCircularBuffer {
+  bottom = 0                        // 读取指针
+  top = 0                           // 写入指针
+  list = new Array(kSize).fill(undefined)  // 固定大小数组
+  next = null                       // 链表指针
+
+  isEmpty () { return this.top === this.bottom }
+
+  // 经典环形缓冲区判满：牺牲一个槽位避免判空/判满混淆
+  isFull () { return ((this.top + 1) & kMask) === this.bottom }
+
+  push (data) {
+    this.list[this.top] = data
+    this.top = (this.top + 1) & kMask    // 位运算取模，等价于 (top+1) % 2048
+  }
+
+  shift () {
+    const nextItem = this.list[this.bottom]
+    if (nextItem === undefined) return null
+    this.list[this.bottom] = undefined    // 释放引用
+    this.bottom = (this.bottom + 1) & kMask
+    return nextItem
+  }
+}
+```
+
+**复杂度分析**：
+
+| 操作 | FixedQueue | 原生 Array | 说明 |
+|------|-----------|-----------|------|
+| push 均摊 | O(1) | O(1) 均摊 | 满时创建新缓冲区，一次性分配 2048 槽位 |
+| shift 均摊 | O(1) | O(n) | Array.shift() 需要移动所有元素 |
+| 内存连续性 | 每 2048 项连续 | 整体连续 | V8 优化为 packed array |
+| GC 压力 | 分段释放 | 整体释放 | 空缓冲区即丢即收 |
+| 判满策略 | 浪费 1 槽 | N/A | 经典环形缓冲区 |
+
+**在 undici 中的使用场景**：
+
+1. **PoolBase.kQueue**：`new FixedQueue()` — 当所有 Client 都 busy 时，pending 请求入此队列等待 drain。
+2. **PoolBase[kOnDrain]()**：drain 事件触发时，`queue.shift()` 出队并 dispatch 到空闲 Client。
+
+**性能优势总结**：
+- 数组固定大小（2048），V8 可优化为连续 packed array，CPU 缓存友好
+- 环形缓冲区用位运算 `& kMask` 替代 `% kSize`，避免除法
+- 链表分段避免了单个大数组的 GC 压力（百万级请求时显著）
+- 2048 大小经过 V8 6.0-6.6 基准测试，是缓存行与内存占用的平衡点
 
 ---
 
@@ -1604,33 +2708,165 @@ shift () {
 
 **用途**：将头部名称 Buffer（来自 llhttp 解析）快速映射为小写字符串，避免逐字节 `toLowerCase()` 和对象查找。
 
-**search 方法**：
+**完整实现代码**（含注释）：
 
 ```javascript
-search (key) {  // key: Uint8Array
-  let index = 0
-  let node = this
-  while (node !== null && index < keylength) {
-    let code = key[index]
-    // 内联大写转小写：A-Z (0x41-0x5A) → a-z (0x61-0x7A)
-    if (code <= 0x5a && code >= 0x41) code |= 32
-    while (node !== null) {
-      if (code === node.code) {
-        if (keylength === ++index) return node
-        node = node.middle
-        break
-      }
-      node = node.code < code ? node.left : node.right
+// lib/core/tree.js (160 行)
+
+class TstNode {
+  value = null              // 终止节点存储的值（小写字符串）
+  left = null               // 小于当前字符的子树
+  middle = null             // 等于当前字符的子树（匹配路径继续）
+  right = null              // 大于当前字符的子树
+  code                     // 当前节点存储的字符 charCode
+
+  constructor (key, value, index) {
+    if (index === undefined || index >= key.length) throw new TypeError('Unreachable')
+    const code = this.code = key.charCodeAt(index)
+    if (code > 0x7F) throw new TypeError('key must be ascii string')
+    if (key.length !== ++index) {
+      this.middle = new TstNode(key, value, index)   // 递归创建子节点
+    } else {
+      this.value = value                              // 终止节点存储值
     }
   }
-  return null
+
+  add (key, value) {
+    let index = 0
+    let node = this
+    while (true) {
+      const code = key.charCodeAt(index)
+      if (code > 0x7F) throw new TypeError('key must be ascii string')
+      if (node.code === code) {
+        if (length === ++index) { node.value = value; break }  // 覆盖
+        else if (node.middle !== null) { node = node.middle }
+        else { node.middle = new TstNode(key, value, index); break }
+      } else if (node.code < code) {
+        if (node.left !== null) { node = node.left }
+        else { node.left = new TstNode(key, value, index); break }
+      } else {  // node.code > code
+        if (node.right !== null) { node = node.right }
+        else { node.right = new TstNode(key, value, index); break }
+      }
+    }
+  }
+
+  search (key) {
+    const keylength = key.length
+    let index = 0
+    let node = this
+    while (node !== null && index < keylength) {
+      let code = key[index]
+      // 内联大写转小写：A-Z (0x41-0x5A) → a-z (0x61-0x7A)
+      if (code <= 0x5a && code >= 0x41) code |= 32
+      while (node !== null) {
+        if (code === node.code) {
+          if (keylength === ++index) return node   // 完全匹配
+          node = node.middle                       // 继续匹配下一个字符
+          break
+        }
+        node = node.code < code ? node.left : node.right
+      }
+    }
+    return null
+  }
+}
+
+class TernarySearchTree {
+  node = null
+
+  insert (key, value) {
+    if (this.node === null) {
+      this.node = new TstNode(key, value, 0)
+    } else {
+      this.node.add(key, value)
+    }
+  }
+
+  lookup (key) {
+    return this.node?.search(key)?.value ?? null
+  }
 }
 ```
 
+**内部树结构示例**（存储 "host", "connection", "content-type" 后）：
+
+```
+                     h (0x68)
+                    / \
+                   /   \
+                 a(0x61) e(0x65)
+                /        |
+              s(0x73)    a(0x65)
+              /          |
+            t(0x74)      d(0x64)
+            value:        |
+          "host"        e(0x65)
+                        |
+                      r(0x72)
+                    value:
+                   "header"
+```
+
+**初始化与导出**（从 well-known 头部构建）：
+
+```javascript
+const tree = new TernarySearchTree()
+
+for (let i = 0; i < wellknownHeaderNames.length; ++i) {
+  const key = headerNameLowerCasedRecord[wellknownHeaderNames[i]]
+  tree.insert(key, key)   // key = value = 小写字符串
+}
+
+module.exports = { TernarySearchTree, tree }
+```
+
+`wellknownHeaderNames` 和 `headerNameLowerCasedRecord` 定义在 `lib/core/constants.js`，包含约 100 个标准 HTTP 头部。
+
+**使用场景**（在 Parser.onHeaderField 中）：
+
+```javascript
+// lib/dispatcher/client-h1.js
+onHeaderField (buf) {
+  const len = this.headers.length
+  if ((len & 1) === 0) {
+    this.headers.push(buf)
+  } else {
+    this.headers[len - 1] = Buffer.concat([this.headers[len - 1], buf])
+  }
+  this.trackHeader(buf.length)
+  return 0
+}
+
+onHeaderValue (buf) {
+  // ...
+  const key = this.headers[len - 2]
+  if (key.length === 10) {
+    const headerName = util.bufferToLowerCasedHeaderName(key)  // ← 使用 tree
+    if (headerName === 'keep-alive') { ... }
+  }
+  // ...
+}
+```
+
+`bufferToLowerCasedHeaderName` 在 `lib/core/util.js` 中：先用 TST 查表，命中直接返回预计算的小写字符串；否则逐字节转小写。
+
 **优化点**：
-- 使用位运算 `|= 32` 代替条件判断做大小写转换
+- 使用位运算 `|= 32` 代替条件判断做大小写转换（ASCII 大写转小写的最快方法）
 - 三叉搜索树相比 HashMap 对短字符串（头部名称通常 < 30 字符）有更好的缓存局部性
-- 树中存储了约 100 个 well-known 头部名称
+- 树中存储了约 100 个 well-known 头部名称，命中即免计算
+- 使用 `Uint8Array` 搜索而非 `Buffer.toString()` 避免字符串分配
+
+**TST vs 其他数据结构对比**：
+
+| 数据结构 | 短字符串查找 | 内存占用 | 缓存局部性 | 实现复杂度 |
+|---------|-------------|---------|-----------|----------|
+| TernarySearchTree | O(L·logN) L=长度 | 中（每个字符一个节点） | 好（树遍历） | 中 |
+| HashMap | O(L) 平均 | 高（hash 计算+桶） | 一般 | 低 |
+| 线性扫描 | O(N·L) | 低 | 好 | 低 |
+| 有序数组+二分 | O(L·logN) | 低 | 好 | 低 |
+
+TST 的优势在于**前缀共享**（如 "content-length" 和 "content-type" 共享 "content-" 前缀路径），节省内存。
 
 ---
 
@@ -4121,7 +5357,7 @@ struct MockAgent {
 
 ---
 
-> 文档完成日期：2026-09-05
+> 文档完成日期：2026-09-05（初版），2026-09-06（深化补全）
 > 分析文件数：40+ 源码文件
-> 文档总行数：4000+
+> 文档总行数：5300+（从 4127 行深化至 5363 行，新增 1236 行）
 > 章节数：36 个编号章节 + 目录 + 3 个附录
