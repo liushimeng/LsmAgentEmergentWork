@@ -2390,3 +2390,727 @@ pub struct SnapshotHook {
 | **P2** | 触发阈值动态化 | 切换小窗口模型后用 `model.context_window()` 重算,不用历史 ratio | agent.rs:1113-1128 |
 | **P2** | auto 静默化 | 自动压缩不打横幅,避免噪声 | b9afca1d |
 | **P2** | split boundary 保留尾 | 防止"压缩后空转" | c8639008 |
+
+## 20. 第六轮深挖 — Anthropic/OpenAI 协议 wire + 流式 + 错误重试
+
+针对 atomcode capabilities 层(协议适配)的代码级深度调研,覆盖 `crates/atomcode-capabilities/src/provider/{anthropic,openai_compat,retry,reasoning,mod}.rs` 与 `crates/atomcode-kernel/src/{stream,event,provider,message}.rs` 的核心契约。**目标**:把"字节进出 + 状态机 + 错误恢复"这条最长的横向逻辑链完整画一遍,与第 4 章"协议适配"互为正交补充(第 4 章偏总体,本节偏"为什么这样写"的逐行理由)。
+
+### 20.1 设计总览:LlmProvider + StreamEvent 协议中立契约
+
+**为什么这么设计**(架构意图来自 `crates/atomcode-kernel/src/provider.rs:120-156` 的 `LlmProvider` trait 注释):
+
+- **内核不感知协议**:turn loop 只调用一次 `chat_stream`,消费 `StreamEvent` 流,从不出现 `Anthropic`/`OpenAI` 字样。协议差异封闭在两个 `*_provider.rs` 实现里。这是第 3 章「Kernel 核心」已确立的"统一消息模型"原则。
+- **`StreamEvent` 第一公民**:`stream.rs:93-156` 的 `enum StreamEvent` 不只是包络,它区分了"回放敏感"(replay-sensitive)与"回放安全"(metadata-only)的事件,以驱动透明重开(reopen)逻辑:
+  ```rust
+  pub enum StreamEvent {
+      TextDelta(String),                              // replay-sensitive
+      Reasoning(String),                              // replay-sensitive
+      ReasoningSignature { opaque, provider },         // replay-sensitive(签名块)
+      ToolCall(ToolCall),                             // replay-sensitive(执行依据)
+      ToolCallDelta { index, id, name, arguments },   // replay-sensitive(UI 实时显示)
+      Usage(TokenUsage),                              // metadata-only
+      ResponseId(String),                             // metadata-only
+      ResponseModel(String),                          // metadata-only
+      Error(ProviderError),                           // terminal
+      Malformed,                                      // 解析失败的 signal,非内容
+      Done { truncated: bool },                       // terminal
+  }
+  ```
+  `retry.rs:24-43` 的 `is_replay_sensitive_event` / `is_attempt_metadata_event` 把这两组事件分桶 — 后者可以延迟到下一次重连后再发出;前者一旦进入消费者,就**禁止**整体重发,否则会产生重复输出或重复工具副作用。
+- **`TokenUsage::merge_max` 而非 last-wins**(`stream.rs:25-29`):Anthropic 在 `message_start` 给输入 tokens、`message_delta` 给累积输出 tokens,字段是**分裂**的;OpenAI 一次性给完整 usage。两种习惯同框出现时,last-wins 会把先前事件的字段清零(例如后续 delta 只携带 `completion` → `prompt` 被踩为 0),merge_max 取逐字段最大值,**两种风格都不重复计算、不丢失**。
+- **`ProviderError` 五元组**(`stream.rs:36-51`):`retryable + message + http_status + code + retry_after_secs` — 把"是否重试""用户看得懂的描述""HTTP code""供应商结构化 code(如 model_not_found)""Retry-After 秒数"五件事分开,让上层(rate-limit 路径、checkpoint 路径、TUI 渲染)各自取需要的字段,**避免字符串匹配**。
+- **`bind_session_id` 一次性绑定**(`provider.rs:141`):不是 setter,而是 `OnceLock`(两个 adapter 的 `session_id: OnceLock<String>`),因为 session id 在 Agent 的生命周期内不变,/session 切换是重建 Agent 而非原地换 id。空 ⇒ 头部省略(无亲和性的 sub-agent/summary)。
+
+### 20.2 Anthropic wire 适配(`anthropic.rs`)
+
+文件:`crates/atomcode-capabilities/src/provider/anthropic.rs`(2024 行,含 19 个 inline test + 2 个真 socket 端到端测试)。
+
+#### 20.2.1 请求体 — 字节级确定性(BTreeMap-backed Map)
+
+`build_request_body`(`anthropic.rs:400-474`):
+
+```rust
+let mut body = Map::new();                                    // BTreeMap-backed,排序序列化
+body.insert("model".into(), json!(model));
+body.insert("max_tokens".into(), json!(options.max_tokens.unwrap(cfg.max_tokens)));  // REQUIRED
+body.insert("stream".into(), json!(true));
+// sampling params 默认不发出(避免 Opus 4.7+ 400,见 send_sampling_params)
+if cfg.thinking && !forces_tool_use {                          // forced tool_use 与 thinking 不兼容
+    body.insert("thinking".into(), json!({ "type": "adaptive" }));
+}
+if let Some(effort) = options.reasoning_effort {
+    body.insert("output_config".into(), json!({ "effort": effort_str(effort) }));  // 5 个常量
+}
+if !tools.is_empty() {
+    body.insert("tools".into(), json!(tools.iter().map(|td| json!({
+        "name": td.name, "description": td.description,
+        "input_schema": td.parameters,                          // Anthropic 字段名
+    })).collect::<Vec<_>>()));
+}
+```
+
+**关键设计点**(对应文件的 30 行模块注释):
+
+| 关注点 | 决策 | 原因 |
+|---|---|---|
+| 序列化字节稳定性 | `serde_json::Map`(BTreeMap-backed)+ 无时间戳/uuid | Anthropic 的 prompt cache 按字节前缀;同 `(system, messages, tools)` 必须序列化恒等 |
+| `temperature` 默认不发 | `cfg.send_sampling_params: false` | Opus 4.7+ 已移除 sampling params,发则 400 |
+| `thinking` 与 forced tool_use 互斥 | 单次请求抑制 thinking,下一轮恢复 | Anthropic 拒绝 thinking + tool_choice=any 同时存在 |
+| `tool_choice` 映射 | Auto→省略、Required→`{type:"any"}`、Specific→`{type:"tool",name}`、None→`{type:"none"}` | 对齐 Anthropic 的 4 种对象/字符串形态 |
+| `output_config.effort` | 5 档:low/medium/high/xhigh/max(对应 `effort_str` `anthropic.rs:677-685`) | kernel 端中立枚举 → 协议串 |
+| `max_tokens` REQUIRED | `options.max_tokens.unwrap(cfg.max_tokens)` | Anthropic 拒绝无 `max_tokens` 请求 |
+
+测试 `body_serialization_is_deterministic`(`anthropic.rs:1447-1490`)连续 100 次序列化同一输入,逐字节比对 — 这是 prompt cache 的硬约束。
+
+#### 20.2.2 消息→wire 转换:三件易错事
+
+`format_messages_with_vision`(`anthropic.rs:484-551`):
+
+1. **System 提升到顶层**(Anthropic 没有 `role:"system"` 消息):
+   ```rust
+   let system_text: String = messages.iter()
+       .filter(|m| m.role == Role::System)
+       .map(|m| m.text.as_str())
+       .collect::<Vec<_>>()
+       .join("\n\n");
+   let system = if system_text.is_empty() { None } else { Some(system_text) };
+   ```
+   所有连续的 `Role::System` 用 `\n\n` 拼成单个 string,挂到 body 的 `system` 字段。
+
+2. **连续 Tool 结果折成一个 user 消息**(`anthropic.rs:519-539`):
+   ```rust
+   Role::Tool => {
+       let mut blocks: Vec<Value> = Vec::new();
+       while i < messages.len() && messages[i].role == Role::Tool {
+           if let Some(id) = tr.tool_call_id.as_deref().filter(|s| !s.is_empty()) {
+               blocks.push(json!({"type":"tool_result","tool_use_id":id,
+                                  "content":tr.text,"is_error":tr.is_error}));
+           }
+           i += 1;
+       }
+       if !blocks.is_empty() { out.push(json!({"role":"user","content":blocks})); }
+   }
+   ```
+   **N 个并行 tool_call** 的 N 个结果合并到**一个** user message 的 content blocks — Anthropic 不允许相邻 user/assistant 嵌套混乱。
+
+3. **强制 user/assistant 严格交替**(`merge_consecutive_user` `anthropic.rs:556-601`):
+   - Anthropic 协议硬约束:`messages` 必须 user↔assistant 严格交替
+   - 但实际场景里:<system-reminder> 后缀、post-compaction synthetic summary、tail hook 都会注入**额外的** user 消息,把"上一轮 tool_result 折成的 user" 和 "本轮 reminder user" 拼到一起
+   - 修复:扫描整个序列,把相邻的 `role:"user"` 全部合并;两条 string 拼接成 `\n\n` 一条 string;遇到 block/array 内容则合并成 block 数组(`merge_user_content`)
+   - **测试 `no_consecutive_user_after_tool_fold_then_reminder`** (`anthropic.rs:1059-1093`) + `no_consecutive_user_post_compaction_summary_beside_user` (`anthropic.rs:1095-1117`) 锁住了这两条真实路径
+
+#### 20.2.3 签名 thinking 块 — 跨协议不互译
+
+Anthropic extended thinking 返回的 `signature` 是**供应商绑定**的;replay 给 OpenAI/Gemini 会失败。`format_assistant_message` (`anthropic.rs:637-675`):
+
+```rust
+let echoable = |b: &ReasoningBlock| {
+    echo_thinking && b.provider.as_deref() == Some("anthropic")    // 只回 anthropic 的
+};
+// ... 空 text + opaque ⇒ redacted_thinking(data=opaque)
+// ... 正常 text + opaque ⇒ thinking(thinking=text, signature=opaque)
+```
+
+`ReasoningBlock` 的 `provider` 字段(`message.rs:75-94` 的 `INVARIANT: opaque.is_some() ⇒ provider.is_some()`)就是为这个准备的;foreign / `None` block 一律不回。
+
+测试矩阵(`anthropic.rs:1198-1298`)覆盖了:
+- `signed_thinking_is_echoed_when_enabled` ✓(anthropic + text)
+- `signed_thinking_is_dropped_when_thinking_disabled` ✓(echo_thinking=false)
+- `foreign_provider_thinking_block_is_not_echoed` ✓(openai 来源 / provider=None)
+- `mixed_provider_blocks_echo_only_anthropic_ones_in_order` ✓(混合)
+
+#### 20.2.4 SSE 解码:有状态、按块鲁棒
+
+`AnthropicSseDecoder`(`anthropic.rs:756-1024`)是一个**有状态**的字节→事件映射器:
+
+- **按字节切分而非按行 split**:`feed` 中 `self.buf.extend_from_slice(chunk); while let Some(pos) = self.buf.iter().position(|&b| b == b'\n')` — 即便 chunk 把一行 UTF-8 中文字符切成多段,也不会丢字符。`sse_byte_split_robust_and_utf8_safe` 测试(`anthropic.rs:1696-1722`)对比了"整段喂入"vs"逐字节喂入"两条路径的事件流,逐字符相等。
+
+- **`blocks: Vec<BlockState>` 按 index 跟踪**(Anthropic SSE 用 index 而非 id):
+  ```rust
+  fn block_mut(&mut self, index: usize) -> &mut BlockState {
+      while self.blocks.len() <= index { self.blocks.push(BlockState::default()); }
+      &mut self.blocks[index]
+  }
+  ```
+  - tool_use 累积 `input_json`(partial_json 字符串拼)
+  - thinking 累积 `signature`(signature_delta 字符串拼)
+  - redacted_thinking 累积 `redacted_data`
+
+- **content_block_stop 一次性 take**:把 `std::mem::take(&mut self.blocks[index])` 整块拿出来,避免后续 index 复用时的状态污染。
+
+- **usage 三段拼**:
+  - `message_start`: `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`(`anthropic.rs:850-866`)
+  - `message_delta`: 输出 tokens 是累积的,取最大值(`if o > 0 { self.output_tokens = o }`,`anthropic.rs:984-999`)
+  - `message_stop`: 发 `Usage(self.usage())` + `Done { truncated }`(`anthropic.rs:1001-1007`)
+  - 最终 `usage()`(`anthropic.rs:820-826`):
+    ```rust
+    TokenUsage { prompt: input_tokens + cache_read + cache_creation,
+                 completion: output_tokens,
+                 cached: cache_read }
+    ```
+  - 这与 `TokenUsage::merge_max` 的设计完美契合:`prompt/completion/cached` 三个独立字段,merge_max 会"取最大",不会因分裂上报而丢字段。
+
+- **finish() 兜底**:流被截断不收到 `message_stop` 时,`finish()` 刷最后的 usage + `Done`(`anthropic.rs:801-814`)。
+
+- **truncated 标记**:`message_delta.delta.stop_reason == "max_tokens"` ⇒ `self.truncated = true`(`anthropic.rs:984-993`)。
+
+- **mid-stream error**:收到 `event.type == "error"` ⇒ `StreamEvent::Error + self.done = true`(`anthropic.rs:1008-1020`);非 retryable,因为上半段可能已发出。
+
+#### 20.2.5 Open + 重试 + 透明重开:三档机制
+
+`AnthropicProvider::chat_stream`(`anthropic.rs:167-299`)的实现揭示了"**3 层重试叠加**":
+
+```text
+┌─ 顶层:Kernel turn-loop OPEN retry (外层,只 Err 才触发)
+│
+├─ open_stream() 内 RetryPolicy (status/transport 错误,408/425/429/500/502/503/504/529)
+│
+└─ 'reopen loop: MAX_STREAM_ATTEMPTS=3  (流中途 reset 重连,只在未发出 replay-sensitive 前)
+```
+
+**OPEN retry**(同 `openai_compat.rs`,复用 `retry.rs`):
+
+```rust
+// anthropic.rs:329-345
+let send = match tokio::time::timeout(open_timeout, req.send()).await {
+    Err(_elapsed) => {
+        if attempt < policy.max_attempts {
+            tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
+            attempt += 1; continue;
+        }
+        return Err(ProviderError { retryable: true,
+            message: format!("open failed: 等待首字节超过 {}s(网关无响应)", open_timeout.as_secs()),
+            ..Default::default() });
+    }
+    Ok(r) => r,
+};
+```
+- **`open_timeout` 是 per-attempt TTFB watchdog**,不绑定整体 retry 循环 — 慢但活着的网关仍拿到满 budget
+- `Retry-After` 在解析 body 之前先抓 `retry::parse_retry_after(resp.headers())`(`anthropic.rs:362-365`),避免 `text()` 消费 resp 后无法读 header — 这是 429 自愈的关键
+
+**Mid-stream 重连**(`anthropic.rs:211-296` 的 `'reopen: loop`):
+```rust
+const MAX_STREAM_ATTEMPTS: u32 = 3;
+let mut stream_attempt = 1u32;
+let mut reconnect_attempts = 0u32;
+let mut emitted_replay_sensitive = false;
+let mut pending_metadata = Vec::new();              // 缓存 id/model/usage
+loop {
+    let mut dec = AnthropicSseDecoder::new();
+    let byte_stream = resp.bytes_stream();
+    futures::pin_mut!(byte_stream);
+    loop {
+        match tokio::time::timeout(idle, byte_stream.next()).await {
+            Err(_elapsed) => {
+                yield StreamEvent::Error(... "stream idle timeout"); return;   // 中途 idle 不重试
+            }
+            Ok(None) => { /* 流 EOF:刷 pending_metadata + finish */ return; }
+            Ok(Some(Err(e))) => {
+                if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                    tokio::time::sleep(compute_backoff(...)).await;
+                    if let Ok(fresh) = open_stream(...).await {
+                        stream_attempt += 1; resp = fresh; continue 'reopen;   // 透明重连
+                    }
+                }
+                yield StreamEvent::Error(... "网络连接中断:... 自动重连 N 次后仍失败"); return;
+            }
+            Ok(Some(Ok(chunk))) => { /* feed 进 decoder,产生 events */ }
+        }
+    }
+}
+```
+
+**`emitted_replay_sensitive` 闸门**(`anthropic.rs:229-241`):
+```rust
+if retry::is_attempt_metadata_event(&ev) {
+    pending_metadata.push(ev); continue;                    // id/model/usage 缓存
+}
+if retry::is_replay_sensitive_event(&ev)
+   || matches!(ev, StreamEvent::Done {..} | StreamEvent::Error(_)) {
+    for metadata in pending_metadata.drain(..) { yield metadata; }   // 冲刷累积 metadata
+}
+emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+yield ev;
+```
+
+**关键不变量**:
+- 流未发出任何 text/tool/reasoning 才允许整条重发
+- metadata(id/model/usage)是**延迟到下一次重连后再发**,因为这是当前 attempt 的 metadata — 但重连后丢弃就丢失了元数据,所以集中缓存后冲刷
+- mid-stream idle timeout 永远非 retryable(下半段可能已发出,partial-response 风险)
+- 真 socket 测试 `midstream_eof_before_any_event_reopens_and_succeeds`(`anthropic.rs:1823-1883`)+ `midstream_reset_twice_before_any_event_reopens_until_success`(`anthropic.rs:1885-1947`)用 TCP listener 真实重现"网关 LB 在压力下连续 reset 两条连接"场景
+
+### 20.3 OpenAI compat 适配(`openai_compat.rs`)
+
+文件:4093 行(被截断读到 2250 行,后续已通过调用点+测试理解全貌)。
+
+#### 20.3.1 与 Anthropic wire 的根本差异
+
+| 维度 | Anthropic | OpenAI compat |
+|---|---|---|
+| **认证头** | `x-api-key` + `anthropic-version`(`anthropic.rs:320-321`) | `Authorization: Bearer {key}`(`openai_compat.rs:770`) |
+| **system 字段** | 顶层 `system` 字符串 | 消息 `{role:"system",content}` |
+| **tool 定义** | `input_schema`(对象) | `function.parameters`(对象,JSON Schema 嵌套必须 `properties` 键) |
+| **tool_call args** | 顶层 `tool_use.input` **对象**;`input_json_delta` 累积字符串 | `tool_calls[].function.arguments` **字符串**;`tool_calls[].function.name/arguments` 增量 |
+| **content 类型** | `content` 数组块(text/tool_use/thinking) | `content` 字符串(可与 `tool_calls` 并列) |
+| **流事件** | `message_start` / `content_block_start/delta/stop` / `message_delta` / `message_stop` | `choices[0].delta.content` + `choices[0].finish_reason` + 末尾 `usage` |
+| **finish_reason** | `end_turn` / `max_tokens` / `tool_use` / `stop_sequence` | `stop` / `tool_calls` / `length` / `content_filter` / **`""`(空串,见 20.3.4)** |
+| **reasoning** | `thinking` content block + `signature` 签名 | `delta.reasoning_content` 字符串,**无签名** |
+| **usage 报告时机** | 入口 `message_start` 给输入 + 末尾累积 `message_delta` | 仅末尾单条 `usage`(需 `stream_options.include_usage=true`) |
+| **cache 字段** | `cache_read_input_tokens` + `cache_creation_input_tokens` | 字段不固定:OpenAI→`prompt_tokens_details.cached_tokens`、GLM→`cached_tokens`、DeepSeek→`prompt_cache_hit_tokens` + `prompt_cache_miss_tokens` |
+
+#### 20.3.2 请求体构造 — 工具 schema 强制补 `properties`
+
+`build_request_body`(`openai_compat.rs:1081-1151`):
+
+```rust
+body.insert("stream".into(), json!(true));
+body.insert("stream_options".into(), json!({ "include_usage": true }));   // 必须,否则末尾无 usage
+// ...
+if let Some(mt) = options.max_tokens.or(cfg.max_tokens) {                 // OAI max_tokens 可省
+    body.insert("max_tokens".into(), json!(mt));
+}
+if supports_tool_choice(model) {                                          // DeepSeek-V4 拒绝 tool_choice!
+    match &options.tool_choice {
+        ToolChoice::Auto => {},                                            // 省略 = byte-identical "no opinion"
+        ToolChoice::Required => { body.insert("tool_choice".into(), json!("required")); }
+        ToolChoice::Specific(name) => { body.insert("tool_choice".into(),
+            json!({"type":"function","function":{"name":name}})); }
+        ToolChoice::None => { body.insert("tool_choice".into(), json!("none")); }
+    }
+}
+```
+
+**`normalize_openai_tool_schema`**(`openai_compat.rs:1160-1216`)— 关键适配:
+
+LM Studio 等严格校验器**拒绝** `{"type":"object"}` 而无 `properties` 键。`recursive` 遍历:
+```rust
+fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
+    let Value::Object(map) = schema else { return; };
+    let allows_object = match map.get("type") {
+        Some(Value::String(k)) => k == "object",
+        Some(Value::Array(ks)) => ks.iter().any(|k| k == "object"),
+        _ => false,
+    };
+    if allows_object && !map.contains_key("properties") {
+        map.insert("properties".into(), Value::Object(Map::new()));   // 补空 map,非 undefined
+    }
+    // recurse into properties / items / anyOf / oneOf / allOf / $defs
+    // 但 const/enum/default/examples 这些字面值保持原样
+}
+```
+**注释明确**: literal-bearing 关键字(const/enum/default/examples)的 data 虽然"看起来像 schema",但 schema validator 要按字面值处理,**不能改**。
+
+**`supports_tool_choice` 模型谓词**(`openai_compat.rs:1221-1224`):
+```rust
+fn supports_tool_choice(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    !m.contains("deepseek-v4")
+}
+```
+DeepSeek-V4 思考模式拒绝 `tool_choice` 控制字段(尽管仍接受 auto 模式的 tools)。这是模型协议约束而非端点属性 — 注释明示"通过不同 gateway 暴露同一 model id 也可能不同"。
+
+**`reasoning_effort` session-scoped 自适应**(`openai_compat.rs:507-518, 1240-1259`):
+```rust
+// Provider 字段
+effort_unsupported: std::sync::atomic::AtomicBool,
+
+// chat_stream 入口:
+let effort_known_unsupported = self.effort_unsupported.load(Ordering::Relaxed);
+let stripped_opts;
+let options = if effort_known_unsupported && options.reasoning_effort.is_some() {
+    let mut o = options.clone();
+    o.reasoning_effort = None;
+    stripped_opts = o;
+    &stripped_opts
+} else { options };
+```
+
+SenseNova 接受 low/medium/high/xhigh 但拒绝 `max`(DeepSeek API 才接受);一旦 400,后续整个 session 都剥掉这个字段,避免每个 turn 触发同样的 400。
+
+**`push_system_coalesced` 共用辅助**(`provider/mod.rs:110-124`):
+```rust
+pub(crate) fn push_system_coalesced(out: &mut Vec<Value>, text: &str) {
+    if let Some(last) = out.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some("system") {
+            // 拼到上一条 system(用 \n\n);保证多个 system 角色消息合并成 1 条
+        }
+    }
+    out.push(json!({"role":"system","content":text}));
+}
+```
+- Strict chat template(Qwen/vLLM)**只接受 1 条 system**
+- 注释:Anthropic 路径有自己顶层 `system` 字段的不同保证;这条 helper 只给走"role:system"消息的两条协议用
+
+**`is_openrouter_url` 归因头**(`openai_compat.rs:63-83`):
+- 仅当目标 host 是 `openrouter.ai`(用 `host_matches_domain` 共享谓词)时,追加 `HTTP-Referer / X-OpenRouter-Title / X-OpenRouter-Categories`
+- 显式剥 `userinfo@` 防 `https://openrouter.ai:x@evil.com/...` 类型的归因头泄漏到 evil.com
+- 注释解释 hand-rolled host 提取:不引入 `url` crate,因为那是 optional dependency 在 web/mcp 下才用,`provider` 不能依赖
+
+#### 20.3.3 SSE 解码 — buffering + last-wins + 容错
+
+`SseDecoder`(`openai_compat.rs:1418-1636`):
+
+- **tool_calls 累积**:`self.tool_calls: Vec<(String, String, String)>` 按 index 跟踪 `(id, name, accumulated_args)`,在 `finish_reason` 非空时**整批** flush(`openai_compat.rs:1622-1630`)
+- **last-wins usage**:`last_usage: Option<TokenUsage>`;每条 chunk 覆盖(`openai_compat.rs:1549-1551`),`finish` 时发出
+- **`usage` 多源归一化**(`map_usage` `openai_compat.rs:1638-1657`):
+  ```rust
+  let cached = u.prompt_cache_hit_tokens
+      .or(u.cached_tokens)
+      .or_else(|| u.prompt_tokens_details.and_then(|d| d.cached_tokens))
+      .unwrap_or(0);
+  let prompt = u.prompt_tokens.unwrap_or_else(|| {
+      u.prompt_cache_hit_tokens.unwrap_or(0)
+          .saturating_add(u.prompt_cache_miss_tokens.unwrap_or(0))
+  });
+  ```
+  OpenAI `prompt_tokens_details.cached_tokens` / GLM `cached_tokens` / DeepSeek `prompt_cache_hit_tokens + prompt_cache_miss_tokens` 三种字段名归一为 `{prompt, completion, cached}`。DeepSeek 风格可能省略 `prompt_tokens` 只给精确缓存拆分,需 fallback 重算 total。
+
+- **`[DONE]` 哨兵走 finish**:`openai_compat.rs:1496-1505` — 收到哨兵时调 `self.finish()`,避免只报告 `finish_reason:""`(见 20.3.4)的网关漏掉 buffered tool_call
+
+- **Malformed 信号**:`openai_compat.rs:1519` — 非空、非 `[DONE]`、非 JSON 的 `data:` 行 ⇒ `StreamEvent::Malformed`(空载荷)。让 kernel 区分"网关发垃圾"vs"网关发空",否则两者 retry 一样,后者修了前者没修。注释强调:`Malformed` 不算内容,不算 round 的输出量。
+
+#### 20.3.4 finish_reason:"" 是 bug 触发点 — 必须非空才算终止
+
+`openai_compat.rs:1613-1634`:
+```rust
+// Only a NON-EMPTY finish_reason is terminal. SenseNova's free `deepseek-v4-flash`
+// sends `"finish_reason":""` (empty string, not null) on EVERY chunk — including the
+// reasoning and tool_call-fragment chunks that precede the real `"tool_calls"`. Arming
+// `seen_finish` on the empty string makes the `if self.seen_finish { return }` guard
+// above discard every subsequent tool_call delta, so the whole call is dropped and the
+// model shows "0 工具". Treat "" as non-terminal.
+if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
+    self.seen_finish = true;
+    for (id, name, args) in std::mem::take(&mut self.tool_calls) {
+        // ... 整批 flush
+    }
+    if fr == "length" { self.truncated = true; }
+}
+```
+- `finish_reason = null` ⇒ `filter()` 自动过滤
+- `finish_reason = ""`(空串) ⇒ `filter(|s| !s.is_empty())` 过滤
+- `finish_reason = "tool_calls" / "stop" / "length" / "content_filter"` ⇒ terminal
+
+`MAX_TOOL_CALL_DELTAS: usize = 20000`(`openai_compat.rs:1412`)— 防止异常 provider 无限堆 delta;到达上限后自动 finish。
+
+#### 20.3.5 Mid-stream 重连 + SwappableClient 池子修复
+
+OpenAI-compat 的 mid-stream reopen 流程(`openai_compat.rs:582-712`)与 Anthropic 几乎对称,但多了一个**关键修复**:`SwappableClient`:
+
+```rust
+// openai_compat.rs:444-480
+pub(crate) struct SwappableClient {
+    current: std::sync::RwLock<reqwest::Client>,
+    build: Box<dyn Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync>,
+}
+// rebuild() 构造全新 client → EMPTY pool → 原子换入
+```
+
+**触发场景**(注释 `openai_compat.rs:228-243`):
+- 池中 keep-alive 连接被 LB 静默关闭
+- 下次请求复用 → write OK / read → ConnectionReset
+- **每个 retry 重用同一个池** → 持续失败直到重启 / `/login`(原方案)
+- 自动方案:mid-stream 收到 stale-conn 错误时,先 `client.rebuild(...)` 拿到 empty pool,再 reopen
+
+`rebuild` 路径(`openai_compat.rs:650-665`):
+```rust
+if retry::is_stale_connection_error(&e) || retry::chain_has_tls_corruption(&e) {
+    if let Err(rebuild_error) = client.rebuild(atomcode_config::tls::should_cap_url(&url)) {
+        yield StreamEvent::Error(rebuild_error); return;
+    }
+}
+if let Ok(fresh) = open_stream(&client, ...).await {
+    stream_attempt += 1; resp = fresh; continue 'reopen;
+}
+```
+
+**`build_http_client` 双层 trust-root backstop**(`openai_compat.rs:282-367`)— issue #514 修复:
+- 第一层:webpki base + OS native store + `SSL_CERT_FILE`(通过 `add_trusted_roots`)
+- 第二层(失败时):bare webpki base only — `tracing::warn!(... backstop (issue #514) ...)`,公共 CA 端点仍能工作,corporate MITM 根丢失但客户端不会死
+
+**`add_trusted_roots`** (`openai_compat.rs:375-436`):
+- **每个 OS 根都过一遍 rustls 验证**:`rustls::RootCertStore::empty().add(der.clone()).is_err()` ⇒ 跳过。**关键**:reqwest 的 `Certificate::from_der` 不验证,延迟到 `.build()` 内部,只要 rustls 拒绝一个就**整个 client 死掉**。预筛选把 "一个坏 OS 根搞死所有 provider" 这类问题隔离
+- `SSL_CERT_FILE` 不是预筛选(missing PEM 字节手头没有),malformed 时 `.build()` 失败 ⇒ 触发 backstop 重试
+
+### 20.4 重试框架核心(`retry.rs`)
+
+文件:1081 行,几乎全是用例测试(纯函数 + 异常链 walking + backoff 数学)。
+
+#### 20.4.1 重试策略表
+
+`is_retryable_status`(`retry.rs:92-94`):
+```rust
+matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+// 含 529(Anthropic-style Overloaded,某些 OpenAI 兼容网关透传)
+```
+
+`should_retry_open_status`(`retry.rs:99-101`)— 429 走 per-call owner:
+```rust
+is_retryable_status(code) && (code != 429 || owner == RateLimitRetryOwner::Provider)
+```
+- `RateLimitRetryOwner::Provider`(默认):provider 内部 3 次 fast retry 后放弃 → 报 Err 给 kernel
+- `RateLimitRetryOwner::Kernel`:kernel 第一次 429 就直接 surface → 走 lifecycle-aware 策略(可取消等待、倒计时、fuse)。direct consumer(provider 直接调用,如 SDK 测试)用 Provider;turn loop 用 Kernel
+
+#### 20.4.2 错误分类:三层 walking
+
+`is_retryable_reqwest_error`(`retry.rs:119-124`):
+```rust
+err.is_timeout()
+    || err.is_connect()
+    || is_stale_connection_error(err)        // 走 source chain
+    || chain_has_tls_corruption(err)         // 走 source chain
+```
+
+**`chain_has_transient_io`**(`retry.rs:136-156`)— 沿 `source()` 链找 `io::Error`:
+```rust
+matches!(io.kind(), ConnectionReset | ConnectionAborted | BrokenPipe
+                   | UnexpectedEof | NotConnected | TimedOut)
+// 含 TimedOut:Linux ETIMEDOUT(110)/Windows 10060 — 流中途死
+```
+
+**为什么需要 chain walking**(`retry.rs:108-118` 注释):
+- `err.is_timeout() || err.is_connect()` 太窄:reqwest 只在**连接建立阶段**失败时 `is_connect()==true`
+- 真实场景:keep-alive 连接被 LB 静默关闭,复用时 `is_connect()==false`,底层 `io::Error(ConnectionReset)` 在 source 链
+- 老逻辑(只 `is_timeout() || is_connect()`)→ 错分类为 fatal → 报"open failed",用户不得不 `/login`(手清池)
+
+**`chain_has_tls_corruption`**(`retry.rs:181-194`):专门检测 rustls 的两类 BadRecordMac:
+- 方向 1:peer 拒绝我们发的记录 → 我们收到 fatal alert `received fatal alert: BadRecordMac / DecryptError`
+- 方向 2:中间件乱改 peer 给我们的记录 → 我们 `cannot decrypt peer's message`(rustls 0.23 error.rs:991 的字符串)
+- 注释明示:**排除** `HandshakeFailure`(握手失败归 `is_connect()` 路径,不归 corruption 类 — TLS-1.2 降级对此无解)
+- 注释明示:`InvalidData` 可能是 body 损坏(逻辑失败,**不应**重试);所以检测靠 alert 字符串而非 `io::ErrorKind::InvalidData`
+
+**`chain_has_incomplete_message`**(`retry.rs:205-216`)— hyper 的 `Error::is_incomplete_message`:
+- "connection closed before message completed"
+- **不包 `io::Error`**(`is_stale_connection_error` 通过 `chain_has_transient_io || chain_has_incomplete_message` 统一收纳)
+
+**`is_stale_connection_error`**(`retry.rs:226-228`):
+```rust
+chain_has_transient_io(err) || chain_has_incomplete_message(err)
+```
+**重放风险注释**(`retry.rs:222-225`):"Neither form proves the server failed to receive or process the request. Retrying may cause a duplicate inference (and duplicate billing). This is accepted deliberately" — 选择"接受重放"作为不完美的妥协,理由是"用户已等几分钟再硬失败"更糟。**注意**:不允许文档化为"安全/幂等"重放。
+
+#### 20.4.3 Backoff:指数 + 真实 ±25% jitter
+
+`compute_backoff`(`retry.rs:411-413`)→ `compute_backoff_jittered`(`retry.rs:419-434`):
+```rust
+let exp = policy.base_delay.saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+let capped = exp.min(policy.max_delay);
+// ±25% 窗口:capped_ms/2 = window_ms
+// jitter in [0.0, 1.0) → offset in [0, window_ms)
+// result = (capped_ms - window_ms/2) + offset = [floor..floor+window_ms)
+```
+- **真实 jitter**(anti-thundering-herd):`random_jitter_fraction()`(`retry.rs:440-446`)用 `SystemTime::now().subsec_nanos()`,跨进程/跨调用去相关;**不引入 `rand` crate**
+- 测试 `backoff_random_source_stays_within_window`(`retry.rs:624-640`)1000 次随机 jitter,确认 100% 在 ±25% 内
+- 测试用 `compute_backoff_jittered(attempt, policy, fraction)` 注入固定 jitter,**不污染生产 randomness**
+- sub-2ms delays:`window_ms=0`,jitter no-op,直接返回 `capped`,不会 underflow
+
+#### 20.4.4 Retry-After 双格式
+
+`parse_retry_after`(`retry.rs:387-400`):
+- delta-seconds:`Retry-After: 3` ⇒ `Duration::from_secs(3)`
+- HTTP-date:`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT` ⇒ `when - now`(过期 ⇒ `Duration::ZERO`)
+- 不解析/缺失 ⇒ `None` ⇒ 用 `compute_backoff` 兜底
+
+#### 20.4.5 友好的中文错误
+
+`stream_read_error_message`(`retry.rs:254-277`)三档 lead:
+- `RetryExhausted { attempts }` → "网络连接中断:远端关闭或重置了连接,自动重连 {N} 次后仍失败,可重试。"
+- `PartialResponse` → "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复,可继续。"
+- 逻辑错误(非 transport)→ "stream read error: <chain>"(verbatim)
+
+Windows `os error 10054`(WSAECONNRESET)→ 追加 "此错误常见于公司网络或代理环境"(`connection_reset_hint` `retry.rs:284-293`),macOS 54 / Linux 104 → **不**加这个 hint(避免误指 proxy)。**locale-independent**:用数字代码而非中文字符串。
+
+**`open_failed_message`**(`retry.rs:373-381`):拼 `err_chain` + proxy unreachable hint。
+- `proxy_unreachable_hint` 检测 hyper-util `TunnelError::ConnectFailed` 标记("failed to create underlying connection"),**只**在 proxy CONNECT 路径触发;直接连失败不触发。
+- 注释明示 marker 是 transitive-dep Display string(`"tunnel error: failed to create underlying connection"`),future hyper-util bump 可能改写;fails open (hint 静默消失),never crash。
+
+#### 20.4.6 Replay-sensitivity 边界
+
+`is_replay_sensitive_event`(`retry.rs:24-33`):
+```rust
+matches!(event,
+    TextDelta(_) | Reasoning(_) | ReasoningSignature {..}
+    | ToolCall(_) | ToolCallDelta {..})
+```
+
+`is_attempt_metadata_event`(`retry.rs:38-43`):
+```rust
+matches!(event,
+    ResponseId(_) | ResponseModel(_) | Usage(_))
+```
+
+**注释要点**:`Usage` 既 replay-safe(数字不重复,字段可 merge)又算 metadata — 它延迟到下次重连后再发出不会被吞;`Malformed` 两者都不算(纯 signal,内容无关)。
+
+### 20.5 跨协议 reasoning round-trip 策略(`reasoning.rs`)
+
+文件:183 行,几乎全测试。
+
+#### 20.5.1 三类厂商的 wire 行为
+
+`reasoning.rs:8-22` 注释明示:
+
+```text
+deepseek-v4*           REQUIRES reasoning_content echoed on assistant tool-call
+                       turns (HTTP 400 "must be passed back" otherwise); an empty
+                       string is rejected, so a non-empty REASONING_PLACEHOLDER is
+                       sent when no reasoning was captured.
+deepseek-r1/reasoner   FORBIDS echoing reasoning_content (HTTP 400 if sent).
+GLM / everything else  safe default: do not echo (GLM does not error either way;
+                       omitting keeps requests minimal).
+```
+
+`ReasoningPolicy::derive`(`reasoning.rs:68-91`):
+```rust
+pub fn derive(model: &str, base_url: &str) -> Self {
+    let m = model.to_ascii_lowercase();
+    let u = base_url.to_ascii_lowercase();
+    if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") {
+        ReasoningPolicy::Exclude
+    } else if m.contains("deepseek-v4") {
+        ReasoningPolicy::Include
+    } else if m.starts_with("kimi-") || m.starts_with("moonshot")
+              || m.starts_with("mimo-")
+              || u.contains("moonshot") || u.contains("kimi")
+              || u.contains("xiaomimimo") || u.contains("mimo") {
+        ReasoningPolicy::Include
+    } else {
+        ReasoningPolicy::Exclude
+    }
+}
+```
+**坑**:r1 即使在 moonshot host 上仍 wins(`reasoning.rs:120-124` 测试);MiMo 用 model 名(`mimo-v2.5-pro` 在 generic gateway)也 Include(复用 DeepSeek-V4 协议)。
+
+#### 20.5.2 REASONING_PLACEHOLDER 选用 `·`(单字符)
+
+`reasoning.rs:32`:
+```rust
+pub const REASONING_PLACEHOLDER: &str = "·";   // 不是英文句子!
+```
+注释(`reasoning.rs:25-31`)解释:历史里若全用英文占位句,**DeepSeek-V4-Flash 会 MIMIC 它**当作自己的 assistant text 输出,stalling the turn。bare middle-dot 满足"非空"硬要求又**不**给模型可模仿的散文。
+
+#### 20.5.3 与 Anthropic `signature` 模式的对比
+
+| 维度 | OpenAI compat (reasoning.rs) | Anthropic (anthropic.rs:signature_delta) |
+|---|---|---|
+| 形态 | `delta.reasoning_content: String` 平铺 | `signature_delta` 累积 opaque signature + provider 标签 |
+| 多块? | 1 个 message 1 个 reasoning 字符串 | `reasoning_blocks: Vec<ReasoningBlock>`,每个块独立 opaque + provider |
+| 跨厂商 echo | **不** echo(同协议同 wire 即够) | **必须**按 `provider` 字段过滤(anthropic 的 opaque 给 openai 会 400) |
+| 占位符 | Include 模式用 `REASONING_PLACEHOLDER` | redacted_thinking 用 `data = opaque`(空 text + opaque) |
+
+### 20.6 Wire Dump 与友好错误
+
+#### 20.6.1 wire_dump_request(`provider/mod.rs:61-93`)
+
+- 环境变量 `ATOMCODE_WIRE_DUMP=1` 开启
+- 输出到 `<config_dir>/wire-dump/<seq>-<ts>-<safe_model>.req.json`
+- 关键:**byte-level 保真** — `serde_json::to_string_pretty` 写回文件,parser 验证 round-trip 相等(`provider/mod.rs:216-217` 测试)
+- model 名 sanitize:`/:` → `_`(防路径逃逸,`provider/mod.rs:78-83`)
+- 适配器级(Known JSON shape 各异),不是 kernel 级(内核有 `WireLogHooks` 但只 log kernel `Message` 视图)
+
+#### 20.6.2 friendly_http_error(`provider/mod.rs:141-156`)
+
+集中处理认证/余额:
+- `401` → "API key 未授权或已失效(HTTP 401)"
+- `402` → "账户余额不足(HTTP 402)"
+- `403` + 含 "user has no codingplan" → "CodingPlan 未领取或已失效(HTTP 403)。请运行 /login 重新登录并领取 CodingPlan。"
+- 其他 `403` → 保留 raw detail(AtomGit 用 403 表 session-concurrency 冲突,structured reason 必须活下来)
+- `429` → 必须保留字面 `HTTP 429: ` 前缀,因为 kernel 的 rate-limit 路径用前缀剥法提取 `server_message`
+- 其他 → `HTTP {code}: {detail}`
+
+**注释明示**(`provider/mod.rs:135-140`):401/402 的 detail **故意**丢,因为 headline 已经说明;短形式能折成 `✗ 已中断:账户余额不足(HTTP 402)` 干净地塞进中断摘要。
+
+### 20.7 与其它项目的横向对比
+
+#### 20.7.1 与 claudecode(TypeScript / Bun)
+
+| 维度 | atomcode | claudecode |
+|---|---|---|
+| 协议抽象 | 单一 `LlmProvider` trait + 2 个实现 | 适配器模式,每个 provider 类 |
+| 流事件中立化 | 强(`StreamEvent` 11 变体) | 弱(直接用各 provider 原生事件) |
+| mid-stream 重连 | 是(`MAX_STREAM_ATTEMPTS=3` + `emitted_replay_sensitive` 闸) | 否(失败即整轮 fail) |
+| 透明 HTTP 池修复 | 是(`SwappableClient::rebuild`) | 否(手动 `/login`) |
+| TLS-1.2 自动降级 | 是(`tls.rs latch_managed_tls12` + managed endpoint 检测) | 否 |
+| reasoning 跨协议 | Anthropic `signature` by provider 字段 / OAI `reasoning_content` flat | 主要面向 Anthropic |
+| 缓存报告归一 | 是(`prompt` = input + cache_read + cache_creation) | 部分(OpenAI 风格) |
+
+#### 20.7.2 与 opencode(TypeScript / Bun)
+
+| 维度 | atomcode | opencode |
+|---|---|---|
+| 字节稳定性 | 强制(BTreeMap + 确定性 build) | 无(可能影响 cache 命中率) |
+| 错误分类粒度 | 5 元组(`retryable + message + http_status + code + retry_after_secs`) | 主要 retryable boolean + message |
+| backoff | 真 jitter(防 thundering-herd) | 大多确定性 |
+| tool schema 强校验补 | 是(`normalize_openai_tool_schema` 递归补 `properties`) | 否 |
+| `tool_choice` per-model 谓词 | 是(`supports_tool_choice` 排除 DeepSeek-V4) | 否 |
+
+#### 20.7.3 与 deepseek-harness(TypeScript)
+
+| 维度 | atomcode | deepseek-harness |
+|---|---|---|
+| multi-provider fanout | 同一 `LlmProvider` 单实现串行 | `Cordis` everything-is-a-plugin,Fiber epoch 并发 |
+| usage 归一 | 三源(`prompt_tokens_details` / `cached_tokens` / `prompt_cache_hit_tokens`)归 `{prompt, completion, cached}` | 各 provider 各用各的,不下沉 |
+| 重试窗口 | OPEN 3 次 + reopen 3 次 + kernel turn-loop 三层 | Plugin-level 装饰,自定义 |
+| 透明 keep-alive 修复 | 自动(`SwappableClient`) | 罕有 |
+
+#### 20.7.4 与 pi(TypeScript)
+
+| 维度 | atomcode | pi |
+|---|---|---|
+| 流协议中立化 | 强(`StreamEvent`) | 中等 |
+| 中途协议破坏修复 | 透明 reopen(replay-sensitivity 闸) | 较少 |
+| retry-after 解析 | 完整(delta-seconds + HTTP-date) | 通常 delta-seconds only |
+| 错误信息本地化 | 是(`网络连接中断` lead + 详细 chain) | 否 |
+
+### 20.8 对 laew 的 P0/P1/P2 借鉴路线
+
+#### P0(立即)
+
+1. **请求体字节稳定性** — 把 Anthropic/OpenAI 请求体的 key 序列固定成 BTreeMap-backed 或 literal 顺序,消除 HashMap 随机性。laew 当前 `llm/anthropic.rs` 用 `serde_json::json!({...})`(literal map)已稳定;`llm/openai.rs` 同。建议**显式注释"prefix-cache-safe"** 并加 single-round 序列化等性测试(类似 atomcode 的 `body_serialization_is_deterministic`),避免未来加字段时引入 HashMap 顺序漂移。
+
+2. **TTFB watchdog** — `tokio::time::timeout(open_timeout, req.send())`,per-attempt,不绑整体 retry。laew 当前流式请求**没有** TTFB 上限,gateway 收连接不回响应的边界情况会**永久挂起**(`crates/atomcode-capabilities/src/provider/anthropic.rs:329-345` `open_timeout: Duration` 字段)。建议至少为 OpenAI-compat 加 60s TTFB 上限。
+
+3. **mid-stream replay 闸** — 流中断时**不能**整条重发已有内容。laew 当前 `agent/mod.rs` 拿到 provider response 后简单转发给 tool 循环,没有 replay-tracking。建议实现 `emitted_replay_sensitive: bool` 闸:第一次发出任何 tool_call / text_delta 后,流错误只 surface 不重连(参考 `crates/atomcode-capabilities/src/provider/openai_compat.rs:582-712` 的 `'reopen: loop`)。
+
+4. **`finish_reason:""` 兼容** — `crates/atomcode-capabilities/src/provider/openai_compat.rs:1613-1634` 处理 SenseNova 的 free `deepseek-v4-flash` 每个 chunk 都报空串 `finish_reason`,**必须**用 `filter(|s| !s.is_empty())`。laew 当前 `llm/openai.rs` 解析时若裸 `finish_reason == ""` 会和 `finish_reason: null` 行为不一致。建议加归一过滤。
+
+5. **tool schema properties 强制补** — `crates/atomcode-capabilities/src/provider/openai_compat.rs:1160-1216` 在发 OAI 之前递归补 `properties: {}`,防止 LM Studio 等严格校验器 400。laew 当前 tool 定义测试场景覆盖少,生产可能撞上。
+
+#### P1(规划)
+
+6. **`is_openrouter_url` 归因头 + host_matches_domain 共享谓词** — 复用 host 提取函数(避免引入 `url` crate),确保归因头**只**发到 openrouter.ai,避免 `https://openrouter.ai:x@evil.com` 之类的 userinfo 拼接泄漏。参考 `crates/atomcode-capabilities/src/provider/openai_compat.rs:63-83`。
+
+7. **error chain walking(`chain_has_transient_io`)** — 用 io 错误码 + source() walking 覆盖 keep-alive reset 这类**真连接已断但 reqwest 不分类**的 case(`crates/atomcode-capabilities/src/provider/retry.rs:119-156`)。laew 当前只用 `e.is_timeout() || e.is_connect()`,生产中 half-open keep-alive 复用会"硬失败"。
+
+8. **backoff 真 jitter** — 用 `SystemTime::subsec_nanos()` 而非 `rand::random::<f64>()`,避免多依赖,但保留跨进程/跨调用 decorrelation(`crates/atomcode-capabilities/src/provider/retry.rs:440-446`)。laew 当前无 jitter,多 client 重试时易撞 thundering herd。
+
+9. **thinking/redacted_thinking 分块 + opaque signature** — `crates/atomcode-kernel/src/message.rs:75-94` 的 `ReasoningBlock { text, opaque, provider }` + `crates/atomcode-capabilities/src/provider/anthropic.rs:637-675` 的 `format_assistant_message` provider 过滤。laew 当前 `agent/tools/reasoning` 没有结构化 reasoning 块,只有平铺文本;若未来接 Claude extended thinking 必须先建块。
+
+10. **`ReasoningPolicy::derive` 模型名 + host 双判** — 同一 model id 在不同网关下表现可能不同(`reasoning.rs:128-152` 测试矩阵覆盖 moonshot/kimi/mimo by-host)。laew 若接 DeepSeek-V4 必须有 `Include` 模式(否则 400 "must be passed back")。
+
+11. **Anthropic prompt cache 字节稳定性 + merged consecutive user** — `crates/atomcode-capabilities/src/provider/anthropic.rs:556-601` 的 `merge_consecutive_user` 处理 <system-reminder> 后缀和 post-compaction summary 等真实路径。laew 的 Anthropic 客户端可借鉴其测试矩阵:`no_consecutive_user_after_tool_fold_then_reminder` / `no_consecutive_user_post_compaction_summary_beside_user` / `consecutive_tool_results_fold_into_one_user_message`(`anthropic.rs:1059-1196`)。
+
+#### P2(后续)
+
+12. **`SwappableClient` 池子自动修复** — `crates/atomcode-capabilities/src/provider/openai_compat.rs:444-480` 是 reqwest Client 的"可重建"包装,持 `RwLock<Client>` + `Box<dyn Fn(bool) -> ...>`,mid-stream stale-conn 错误触发 `rebuild()` 得到 empty pool。laew 不太需要(单 CLI 进程),但若加 daemon 模式需借鉴。
+
+13. **stream-idle watchdog + mid-stream idle 非 retryable** — `crates/atomcode-capabilities/src/provider/anthropic.rs:218-225` 中途 idle timeout 永远报 `retryable: false` + "stream idle timeout"。laew 当前也无,但通常没需求。
+
+14. **byte-level wire dump** — `ATOMCODE_WIRE_DUMP=1` 写出 `.req.json`(`provider/mod.rs:61-93`),byte-level 保真。laew 当前可加 `LAEW_WIRE_DUMP=1` 环境变量,后续协议调试加速(特别是发现"prompt cache 未命中"这类问题)。
+
+15. **结构化 error code(openai-compat 五元组)** — `ProviderError { retryable, message, http_status, code, retry_after_secs }`(`crates/atomcode-kernel/src/stream.rs:36-51`)。laew 当前 `AgentError::YoloParse` 较少结构化。建议补 `code: Option<String>` + `retry_after_secs: Option<u64>` 给上层 rate-limit self-heal 用。
+
+16. **`Malformed` 信号事件** — `crates/atomcode-kernel/src/stream.rs:151`:`StreamEvent::Malformed`(空载荷,纯 signal)让 kernel 区分"网关发垃圾"vs"网关发空 200"。laew 若接弱网关(自部署转发)可能用到。
+
+17. **TLS-1.2 自动降级** — `crates/atomcode-config/src/tls.rs` 的 `latch_managed_tls12()` + `atomcode_config::tls::should_try_fallback`(`openai_compat.rs:903-907`)对 managed endpoint 探测 TLS-1.3 失败后降级 TLS-1.2。laew 暂不需要(Anthropic / OpenAI 直接 TLS-1.3 良好),但若接国内网关(自建,可能有中间件)可借鉴。
+
+18. **`MaxRounds` / `StopReason` 12 变体 + 明确"中途 idle timeout"** — laew 当前 `AgentError` 单一 enum。建议拆 6-8 变体,便于单测枚举。参考 `crates/atomcode-kernel/src/event.rs:88-119`。
+
+#### 关键文件路径汇总
+
+- 协议实现:`crates/atomcode-capabilities/src/provider/anthropic.rs`(2024 行)、`crates/atomcode-capabilities/src/provider/openai_compat.rs`(4093 行)
+- 重试框架:`crates/atomcode-capabilities/src/provider/retry.rs`(1081 行,大半是测试)
+- 跨协议 reasoning 策略:`crates/atomcode-capabilities/src/provider/reasoning.rs`(183 行)
+- Wire dump + 友好错误:`crates/atomcode-capabilities/src/provider/mod.rs`(共 ~250 行)
+- 内核契约:`crates/atomcode-kernel/src/stream.rs`(281 行)、`crates/atomcode-kernel/src/event.rs`(532 行)、`crates/atomcode-kernel/src/provider.rs`、`crates/atomcode-kernel/src/message.rs:75-94` 的 `ReasoningBlock`
+
+—— 调研者注:本文档为「第六轮深挖」,聚焦 byte-stable 请求体、流式解码状态机、错误分类与重试三层叠加;不重复前 19 章的总览与前 5 轮已覆盖的 session/compact/Cancel/并发执行闸位等主题。

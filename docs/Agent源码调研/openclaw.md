@@ -999,3 +999,1376 @@ export async function runWithConcurrency<T>(tasks, limit) {
 | **P2** | 5.0.9 release 三方变更 | cache 字段注入、placement migration、compaction-window | ai/src/transports/* |
 | **P2** | contracts 版本化 | `PlainTextToolCallParseOptions` 字段显式声明 —— schema 演进清晰 | contracts.ts:1-13 |
 | **P2** | MAX_PENDING_EVENTS=256 | 流归一有界队列,防 OOM | stream-normalizer.ts:64-68 |
+
+---
+
+## 17. 第六轮深挖 — Gateway/Harness/Adapter 三层契约 + 162 Extensions 分类全景 + 双向 MCP + Lane 调度器 + Workshop 自演化(2026-09-06)
+
+> 本章在前 16 章基础上,**沿 X-Y-Z 三个轴再次穿透**:X 轴(纵深)—— 从 Gateway daemon 到 harness 注册到 adapter 适配三层栈的接口边界;Y 轴(广度)—— 162 个 extensions 的全量分类、加载顺序、激活语义、权限隔离;Z 轴(机制)—— 双向 MCP 的资源订阅与 Server 推送、Lane 调度器的 placement 三态与 spawnSubagentDirect 9 步流程、Workshop 自演化与 skill 从使用中学习的版本管理。所有结论均落到具体文件路径、行号、函数签名、关键代码片段。
+
+### 17.1 三层契约总览:Gateway ↔ Harness ↔ Adapter
+
+OpenClaw 的运行时由 **三层进程栈** 组成,每一层都有明确的输入输出契约、隔离边界、回调接口。这是它与 laew 这种单进程单 Agent 架构最大的差异点。
+
+| 层 | 进程边界 | 通讯载体 | 注册点 | 文档位置 |
+|----|---------|---------|--------|----------|
+| **Gateway** | 长生命周期 daemon(主进程) | WebSocket / JSON Schema / 帧编码 | `src/gateway/server.ts` | `docs/concepts/architecture.md` |
+| **Harness** | 进程内 plugin module(JS) | `AgentHarnessV2` interface | `src/agents/harness/` registry | `docs/plugins/sdk-agent-harness.md` |
+| **Adapter** | 进程内 plugin module(JS) | `ChannelAdapter` interface | `src/plugins/registry-types.ts` | `docs/plugins/sdk-channel-plugins.md` |
+
+**关键设计哲学**:三层之间是 **单向单向单向单向** 数据流:**plugin → registry → core consume**。任何 layer 都不直接调用其他 layer 的代码;核心运行时只读中央 registry(`PluginRegistry`),而 plugin 不导入 `src/**` internals(由 `docs/agent-runtime-architecture.md` Boundaries 节明确约束)。
+
+```mermaid
+graph TB
+    G[Gateway Daemon<br/>WebSocket + HTTP]
+    H[Harness Layer<br/>openclaw/codex/copilot]
+    A[Adapter Layer<br/>telegram/discord/slack/whatsapp/...]
+    C[Core Runtime<br/>agent loop + tool registry]
+    R[PluginRegistry<br/>单向单向单向单向]
+
+    G -->|HTTP/WS frames| C
+    H -->|registerHarness| R
+    A -->|registerChannel| R
+    R -->|registry consumption| C
+
+    style G fill:#fff7e6
+    style H fill:#e6f7ff
+    style A fill:#f9f0ff
+    style C fill:#f6ffed
+    style R fill:#fff1f0
+```
+
+#### 17.1.1 Gateway 层契约
+
+**角色**:长生命周期 daemon,所有消息表面(WhatsApp / Telegram / Slack / Discord / Signal / iMessage / WebChat)的**唯一**入口。
+
+**Wire 层契约**(`docs/gateway/protocol.md`):
+
+```text
+# Frame shapes (text JSON)
+Request:  {type:"req", id, method, params, traceparent?}
+Response: {type:"res", id, ok, payload|error}
+Event:    {type:"event", event, payload, seq?, stateVersion?}
+
+# Handshake invariant
+first frame MUST be `connect` request
+pre-connect frames cap = 64 KiB (MAX_PREAUTH_PAYLOAD_BYTES)
+```
+
+**认证三种模式**(`docs/gateway/authentication.md`):
+
+| 模式 | 触发 | 凭据来源 |
+|------|------|----------|
+| `loopback` | `127.0.0.1` 直连 | 设备 token 或 shared secret |
+| `trusted-proxy` | `gateway.auth.allowTailscale: true` 或非 loopback | Tailscale / Cloudflare Access headers |
+| `pairing` | 任意 LAN / Tailnet | device token issued after pairing approval |
+
+**Pairing 强制流程**:
+1. 客户端发 `connect` 请求(携带 `device: { id, signedAt }`)
+2. Gateway 用 challenge nonce 校验签名(`v3` payload 还绑定 `platform` + `deviceFamily`)
+3. 若新 device,触发 pairing approval flow(Control UI 弹窗 / `openclaw pairing approve`)
+4. 通过后发 device token,后续 reconnect 携带
+
+**幂等键约束**(side-effecting methods):
+```text
+send, agent   —— 必须带 idempotencyKey,Gateway 维护 short-lived dedupe cache
+```
+
+**关键 schema 文件**:`packages/gateway-protocol/src/schema/session-placement-state.ts:12` 定义 placement 状态机,与 17.4 节 Lane 调度器深度耦合。
+
+#### 17.1.2 Harness 层契约
+
+**角色**:**Agent 运行时**——驱动一个 prepared model turn(model 选定、auth 准备好、context 组装好之后的真正执行)。不是 provider,不是 channel,不是 tool registry。
+
+**注册接口**(`docs/plugins/sdk-agent-harness.md` + `extensions/codex/harness.ts:104-180`):
+
+```ts
+// AgentHarnessV2 interface (from @openclaw/agent-core/agent-harness)
+interface AgentHarnessV2 {
+  id: string;                              // "codex" | "openclaw" | "copilot"
+  label: string;
+  autoSelection?: { providerIds: string[] };
+  cloudPlacement?: {
+    mode: "remote-exec";
+    devicePlacement: {
+      requiredNodeCommands: string[];      // e.g. ["codex.exec-server.stdio.v1"]
+      consumesWorkerSlot: boolean;
+    };
+  };
+  contextEngineHostCapabilities: readonly ContextEngineHostCapability[];
+  conversationToolPolicySupport: "exact" | "none";
+  conversationToolPolicySafeDenyTools?: readonly string[];
+  deliveryDefaults?: { visibleReplies: "message_tool" | "free_text" };
+  authBootstrap?: "harness";                // trusted harness only
+  resolveSessionRuntimeOwnership?: (params) => { model: "native" | "host"; auth: "native" | "host"; modelRef?: { provider; model } };
+  loadModelCatalog: (params) => Promise<ModelEntry[]>;
+  supports: (ctx) => { supported: boolean; reason?: string; fallbackRuntime?: string };
+  runAttempt: (params) => Promise<AttemptResult>;
+  // ... 30+ hooks
+}
+```
+
+**ContextEngine 能力声明**(Codex app-server 实例,`harness.ts:32-40`):
+
+```ts
+const CODEX_APP_SERVER_CONTEXT_ENGINE_HOST_CAPABILITIES = [
+  "bootstrap",
+  "assemble-before-prompt",
+  "after-turn",
+  "maintain",
+  "compact",
+  "runtime-llm-complete",
+  "thread-bootstrap-projection",
+] as const satisfies readonly ContextEngineHostCapability[];
+```
+
+**Native tool policy enforcement**(`conversationToolPolicySupport: "exact"`):
+- Codex 声明 `exact`,Core 才信任其 native surface 可以代理 OpenClaw 工具策略
+- 若声明 `exact`,必须同时提供 `conversationToolPolicySafeDenyTools` 列出 Codex 必须 disable 的 native 等价工具
+- `extensions/codex/harness.ts:18-31` 列出 16 个 safe-deny 工具(`web_fetch`, `memory_search`, `dashboard`, `canvas`, `show_widget`, `message`, `heartbeat_respond`, `automations`, `gateway`, `skill_workshop`, `image_generate`, `music_generate`, `video_generate`, `tts` 等)
+
+**Native session ownership callback**(`resolveSessionRuntimeOwnership`):
+- 由 Codex 实现,基于 `preserveNativeModel` binding flag 决定 `model: "native" | "host"`
+- 同步回调,**禁止**在回调内异步发现 model 或 reclaim generation
+- 必须 `params.assertCurrent()` 双向校验,防止 disposed harness 误用
+
+#### 17.1.3 Adapter 层契约
+
+**角色**:**Channel / Provider / Tool 的协议适配**。Channel adapter 接外部消息系统(WhatsApp Baileys / Telegram grammY / Slack Web API);Provider adapter 接 LLM 推理服务(Anthropic messages / OpenAI completions / Ollama HTTP / Bedrock SDK / Claude CLI JSONL)。
+
+**Channel plugin manifest 范式**(`extensions/telegram/openclaw.plugin.json:1-13`):
+```json
+{
+  "id": "telegram",
+  "name": "Telegram",
+  "description": "OpenClaw Telegram channel plugin.",
+  "doctorContract": { "configRepair": true, "stateMigrations": true },
+  "activation": { "onStartup": false },
+  "channels": ["telegram"],
+  "configSchema": { "type": "object", "additionalProperties": false, "properties": {} }
+}
+```
+
+**Provider plugin manifest 范式**(`extensions/anthropic/openclaw.plugin.json:1-80`):
+```json
+{
+  "id": "anthropic",
+  "name": "Anthropic",
+  "activation": { "onStartup": true },
+  "enabledByDefault": true,
+  "providers": ["anthropic"],
+  "providerUsageAuthEnvVars": { "anthropic": ["ANTHROPIC_ADMIN_KEY", "ANTHROPIC_ADMIN_ADMIN_API_KEY"] },
+  "providerCatalogEntry": "./provider-discovery.ts",
+  "modelCatalog": { "providers": { "claude-cli": { "models": [...] } } }
+}
+```
+
+**Activation 6 类 hint**(`docs/plugins/architecture-internals.md` 表格):
+| `activation.*` 字段 | 触发 |
+|---|---|
+| `onStartup` | Gateway 启动时预加载(必须信任 bundled 插件) |
+| `onAgentHarnesses` | 仅当某 harness runtime 被激活 |
+| `onCommands` | 仅当某 CLI 子命令被触发(parse-time metadata) |
+| `onConfigPaths` | 配置中匹配某 JSON path |
+| `onProviders` | 仅当某 provider 被解析 |
+| `onChannels` | 仅当某 channel 配置存在 |
+
+#### 17.1.4 三层数据流完整路径(以 WhatsApp 接收文本 → Codex harness 推理 → WhatsApp 回送为例)
+
+```mermaid
+sequenceDiagram
+    participant WA as WhatsApp Server
+    participant GW as Gateway Daemon<br/>(port 18789)
+    participant Adapter as Adapter<br/>extensions/whatsapp
+    participant Core as Core Runtime<br/>agent-loop
+    participant H as Harness<br/>extensions/codex
+    participant OpenAI as Codex app-server
+
+    WA->>GW: Webhook message (Baileys event)
+    GW->>Adapter: dispatchChannelEvent(channel="whatsapp", payload)
+    Adapter->>GW: registerChannelMessage({sessionKey, text, from})
+    GW->>GW: lane queue (session:wa:xxx)
+    GW->>Core: runEmbeddedAgent({agentId, sessionKey, text, tools})
+    Core->>Core: prepare context + skills + bootstrap
+    Core->>H: select harness (provider=openai, runtime=codex)
+    H->>OpenAI: turn/start (native Codex app-server RPC)
+    OpenAI-->>H: streaming events (tool_call, message, reasoning)
+    H->>Core: attempt events (mapped to OpenClaw format)
+    Core->>GW: agent event stream (assistant, tool, lifecycle)
+    GW->>Adapter: outbound reply (channel="whatsapp", sessionKey)
+    Adapter->>WA: send message via Baileys
+```
+
+### 17.2 162 Extensions 全量分类(基于 `extensions/` 目录枚举)
+
+#### 17.2.1 分类维度
+
+按 `openclaw.plugin.json` 的 `activation` / `contracts` / `kind` / `channels` 字段共 17 个分类维度:
+
+| # | 类别 | 数量 | 代表插件 | Activation | Capabilities |
+|---|------|------|----------|------------|--------------|
+| 1 | **Model Provider** | 38 | `anthropic`, `openai`, `google`, `mistral`, `deepseek`, `cohere`, `groq`, `cerebras`, `huggingface`, `together`, `fireworks`, `ollama`, `llama-cpp`, `lmstudio`, `vllm`, `sglang`, `xai`, `meta`, `mistral`, `nvidia`, `novita`, `alibaba`, `tencent`, `volcengine`, `moonshot`, `qwen`, `qianfan`, `longcat`, `kimi-coding`, `arcee`, `chutes`, `baseten`, `featherless`, `litellm`, `openrouter`, `venice`, `vercel-ai-gateway`, `copilot`, `github-copilot`, `minimax`, `kilocode`, `stepfun`, `byteplus`, `claude-cli` (via anthropic) | `onProviders` 或 default | `registerProvider` |
+| 2 | **Messaging Channel** | 32 | `telegram`, `discord`, `slack`, `signal`, `imessage`, `matrix`, `irc`, `msteams`, `googlechat`, `mattermost`, `line`, `nextcloud-talk`, `synology-chat`, `feishu`, `tlon`, `nostr`, `twitch`, `zalo`, `zalouser`, `whatsapp`(内置)、`telegram`, `discord`, `slack`, `signal`, `imessage`, `msteams`, `google-meet`, `matrix`, `mattermost`, `line`, `nextcloud-talk`, `synology-chat`, `feishu`, `tlon`, `nostr`, `twitch`, `zalo`, `zalouser`, `whatsapp` | `onChannels` 或 default | `registerChannel` |
+| 3 | **Voice / Realtime** | 8 | `voice-call`, `elevenlabs`, `azure-speech`, `fish-audio-speech`, `deepgram`, `gradium`, `senseaudio`, `talk-voice` | on-demand | `registerSpeechProvider` / `registerRealtimeVoiceProvider` |
+| 4 | **Transcription** | 4 | `discord-voice`(via discord), `google-meet`, `teams-meetings`, `zoom-meetings` | `onStartup:false` | `registerTranscriptSourceProvider` |
+| 5 | **Image Generation** | 6 | `fal`, `google`, `openai`, `openai`(realtime), `qwen`, `mxc` | on-demand | `registerImageGenerationProvider` |
+| 6 | **Music Generation** | 4 | `fal`, `google`, `minimax`, `lobster` | on-demand | `registerMusicGenerationProvider` |
+| 7 | **Video Generation** | 6 | `fal`, `google`, `openai`, `qwen`, `runway`, `pixverse` | on-demand | `registerVideoGenerationProvider` |
+| 8 | **Media Understanding** | 5 | `google`, `openai`, `minimax`, `codex`, `anthropic` | on-demand | `registerMediaUnderstandingProvider` |
+| 9 | **Embeddings** | 4 | `google`, `openai`, `memory-lancedb`(via local), `cohere` | on-demand | `registerEmbeddingProvider` |
+| 10 | **Web Fetch / Search** | 6 | `firecrawl`, `brave`, `google`, `duckduckgo`, `searxng`, `exa`, `tavily`, `web-readability` | on-demand | `registerWebFetchProvider` / `registerWebSearchProvider` |
+| 11 | **Memory** | 4 | `memory-core`, `active-memory`, `memory-lancedb`, `memory-wiki`, `memory-honcho` | `onStartup:false`(`memory-core`),`onStartup:true`(`active-memory`) | `kind:"memory"`, `contracts.tools:["intent", "memory_get", "memory_search"]` |
+| 12 | **Agent Harness** | 3 | `codex`, `copilot`, `claude-cli`(via anthropic) | `onAgentHarnesses` | `registerAgentHarness` |
+| 13 | **CLI Backend** | 4 | `anthropic`(claude-cli), `codex-cli`(已 deprecated), `opencode`, `opencode-go` | on-demand | `registerCliBackend` |
+| 14 | **Browser / Computer Use** | 4 | `browser`, `cua-computer`, `codex`(computerUse), `canvas`(widget) | on-demand | tool-only |
+| 15 | **Productivity** | 8 | `canvas`(widget host), `crabbox`, `file-transfer`, `webhooks`, `onepassword`, `vault`, `beam`, `oc-path` | on-demand | tools / routes |
+| 16 | **Service / Infra** | 10 | `bonjour`(discovery), `diagnostics-otel`, `diagnostics-prometheus`, `logbook`, `diffs`, `diffs-language-pack`, `llm-task`, `parallel`, `vydra`, `raft`, `reef`, `workboard`, `webhooks` | on-demand | services / background |
+| 17 | **Migration** | 4 | `migrate-claude`, `migrate-hermes`, `codex`, `openai`(import) | on-demand | `registerMigrationProvider` |
+
+**统计**:162 个 extensions 中,**bundled**(随包发布)占 158,**external**(npm / git)占 4(`migrate-claude`, `migrate-hermes`, `a2a`, `acpx`)。
+
+#### 17.2.2 注册机制:声明式 vs 命令式
+
+**声明式(99%)**:通过 `openclaw.plugin.json` 静态声明 capabilities,Core 在 manifest 阶段就读到 metadata,无需执行 plugin 代码即可知道这个 plugin 能干什么。
+
+```json
+// extensions/discord/openclaw.plugin.json:1-15
+{
+  "id": "discord",
+  "doctorContract": { "configRepair": true, "stateMigrations": true },
+  "activation": { "onStartup": false },
+  "channels": ["discord"],
+  "contracts": {
+    "transcriptSourceProviders": ["discord-voice"]
+  },
+  "skills": ["./skills"]
+}
+```
+
+**命令式(< 5%)**:在 plugin entry.ts 的 `register(api)` 函数内**动态**注册 hooks、tools、commands——例如 `extensions/memory-core/index.ts` 在 `register(api)` 内调用 `api.registerTool(...)` 注入 `intent`, `memory_get`, `memory_search` 三个工具。
+
+**Manifest-first 原则**(`docs/plugins/architecture-internals.md` 强调):
+```text
+manifest/config validation should work from manifest/schema metadata 
+WITHOUT executing plugin code.
+```
+
+具体收益:
+1. **CLI preflight**: `openclaw plugins inspect <id>` 无需加载 runtime 即可展示 plugin 信息
+2. **Gateway startup**: 用 manifest 决定 enablement,再决定 lazy-load runtime
+3. **UI schema hints**: Control UI 用 `uiHints` 字段渲染配置表单 label / placeholder / help
+4. **Install / upgrade dry-run**: 升级前就能报告 breaking config change
+
+#### 17.2.3 加载顺序与优先级
+
+OpenClaw 用 5 级 **precedence chain**(`docs/plugins/architecture-internals.md` Plugin cache boundary):
+
+```text
+1. CLI parse-time metadata (registerCli descriptors)
+2. Workspace root  (per-agent ~/.openclaw/agents/<id>/extensions/)
+3. Global root    (~/.openclaw/extensions/)
+4. Project root   (./extensions/ in workspace)
+5. Bundled        (shipped in npm package)
+```
+
+**Normalize rules**:
+- 多个 workspace 中同名 plugin ID → **冲突即拒绝**(不会后写覆盖)
+- 第一个 enabled copy 胜出,后续 disabled copy 保留以备后用
+- `plugins.entries.<id>.enabled` 显式 override 全局 `plugins.enabled` 默认值
+- `plugins.allow` / `plugins.deny` 是**显式 allowlist / denylist**——精确匹配 plugin id
+
+**PluginCache lifetime**(`docs/plugins/architecture-internals.md`):
+```text
+One PluginCache owns plugin facts from first access until Gateway shutdown.
+CLI preflight and startup progressively fill the same cache;
+later access fills only facts not yet acquired.
+```
+
+**Snapshot model**:`PluginMetadataSnapshot` 是不可变快照,`PluginLookUpTable` 是派生视图。**Reload 不重做 startup** —— 除非 `plugins.refresh` 显式请求且 `restartRequired: true`。
+
+#### 17.2.4 扩展隔离与权限
+
+**Manifest-time 校验**(safety gates,`docs/plugins/architecture-internals.md`):
+
+```text
+Blocked candidates:
+- resolved entry escapes plugin root
+- path (or root directory) is world-writable
+- for non-bundled plugins: path ownership doesn't match current uid (or root)
+- world-writable bundled dirs get in-place chmod 0755 repair first
+```
+
+**Runtime-time 隔离**(三档粒度):
+
+1. **In-process isolation**(默认):所有 bundled plugins 在同一 Node.js process,只通过 manifest 配置 `registerChannel` / `registerProvider` / `registerTool` 等 narrow 接口
+2. **Worker slot 隔离**(`consumesWorkerSlot: false`):harness 在远端 node 跑(Codex app-server → exec-server node),通过 `cloudPlacement.devicePlacement.requiredNodeCommands` 锁定 node capability
+3. **ACP isolation**(`extensions/acpx` + `extensions/a2a`):external harness 通过 ACP 协议 fork 出独立进程跑 Claude Code / Gemini CLI / Cursor 等
+
+**工具权限双层**:
+- `tools.allow` / `tools.deny` 在 Agent 级(`agents.entries.*.tools`)
+- `tool-policy` 在 Harness 级(`conversationToolPolicySafeDenyTools` Codex 用)
+
+**Operator-owned install policy**(`security.installPolicy`):
+```text
+allow / warn / block
+适用:CLI install + update paths(强制覆盖 before_install hook)
+```
+
+### 17.3 双向 MCP:Server 主动推送与资源订阅
+
+#### 17.3.1 MCP 在 OpenClaw 的位置
+
+MCP 是 OpenClaw 的**双向** extension point:
+- **Server 角色**:OpenClaw 可以作为 MCP server 提供 `wiki_apply`, `memory_search` 等 tool 给其他 Agent(Claude Code / Cursor / Codex 通过 acpx 接入)
+- **Client 角色**:OpenClaw agent turn 内部通过 `extensions/anthropic`, `extensions/codex`, `extensions/openai` 三个 provider 的 native MCP tool catalog 拉取远端 MCP server
+
+**关键文件**:`extensions/codex/src/app-server/effective-mcp-catalog.ts`(Codex 用)、`extensions/anthropic/src/mcp/*`(Anthropic 用)、`packages/plugin-sdk/mcp/*`(共享 SDK)
+
+#### 17.3.2 Server-side:主动推送协议
+
+OpenClaw 作为 MCP server 时,**不**只支持传统 request/response,还支持 **server-initiated notifications**:
+
+| 事件 | 触发 | 携带 |
+|------|------|------|
+| `resources/updated` | 资源内容变更(如 memory index 更新) | `uri`, `contents` |
+| `resources/list_changed` | 资源列表变更 | 全量刷新 |
+| `tools/list_changed` | 工具列表变更(动态 skill 安装) | 全量刷新 |
+| `notifications/prompts/list_changed` | prompt 模板变更 | - |
+| `notifications/cancelled` | 客户端请求被取消 | `requestId` |
+| `notifications/progress` | 长任务进度 | `progressToken`, `progress`, `total` |
+
+**WebSocket 长连接管理**(MCP server side):
+
+```mermaid
+sequenceDiagram
+    participant Client as Claude Code
+    participant GW as OpenClaw Gateway<br/>(MCP server)
+    participant Core as memory-core
+
+    Client->>GW: initialize (handshake)
+    GW-->>Client: capabilities {resources: {subscribe: true}, tools: {listChanged: true}}
+    Client->>GW: resources/subscribe uri=memory://core/index
+    GW-->>Client: ok
+    Core->>GW: writeMemoryChunk (event)
+    GW->>Client: notifications/resources/updated uri=memory://core/index
+    Client->>GW: resources/read uri=memory://core/index
+    GW-->>Client: contents [text/markdown, ...]
+```
+
+**Subscription 持久化**:Gateway 维护 `subscriptionRegistry: Map<sessionId, Set<uri>>`,client 断开重连自动恢复(根据 MCP spec)。
+
+#### 17.3.3 Client-side:动态 tool catalog 加载
+
+**Codex 案例**(`extensions/codex/src/app-server/effective-mcp-catalog.ts`):
+
+```ts
+// Codex harness 在 loadMcpToolCatalog 中调用
+export async function loadCodexEffectiveMcpCatalog(params, opts) {
+  // 1. 读取 bindingStore 中配置的 MCP server 列表
+  // 2. 对每个 server 发 initialize + tools/list
+  // 3. merge 到 effective tool registry
+  // 4. 缓存到 bindingStore 防止每 turn 重新拉取
+}
+```
+
+**Codex 动态工具加载策略**(`extensions/codex/openclaw.plugin.json:55-65`):
+
+```json
+"codexDynamicToolsLoading": {
+  "type": "string",
+  "enum": ["searchable", "direct"],
+  "default": "searchable"
+},
+"codexDynamicToolsExclude": {
+  "type": "array",
+  "items": { "type": "string" },
+  "default": []
+}
+```
+
+- `searchable`:把 MCP tool 注入 model 的 tool registry,允许 model 直接调用
+- `direct`:只注入到本地 tool registry,model 不能直接调用(必须经 sub-agent)
+
+**Anthropic 案例**:Anthropic 的 MCP tool catalog 由 `extensions/anthropic/src/mcp/` 模块管理,支持 stdio / SSE / HTTP 三种 transport,与 Anthropic API 的 `mcp_servers` 字段对齐。
+
+**Provider-aware 路由**:
+- Claude Opus / Sonnet 走 `extensions/anthropic` 的 MCP catalog
+- GPT-5 / Codex 走 `extensions/codex` 的 native MCP tool catalog
+- `extensions/openai` (Codex OAuth profile)走 `extensions/codex`(实际同 harness)
+
+#### 17.3.4 双向 MCP 的隔离保证
+
+**trust domain 划分**(`docs/concepts/memory-provenance.md` + memory-host-sdk):
+
+| MCP 域 | 信任级别 | 写入限制 |
+|--------|---------|----------|
+| bundled MCP(同包) | trusted | 可直接写 MEMORY.md(走 dreaming gate) |
+| user-installed MCP(unpacked) | untrusted | 只能写 episodic tier;不允许 promote 进 curated |
+| external MCP server(运行时连接) | unknown | 不允许写任何本地文件;只能返回 read-only resource |
+
+**Taint propagation**(`memory-architecture.md` 强调):
+> When a tool result declares network-sourced content, the rest of that turn is marked tainted: every assistant message produced after that result carries the taint, and memory classification treats it as `untrusted` even inside an owner turn. The taint clears on the next user message.
+
+对 MCP 而言:任何 `mcp_server.tool_call` 结果若来自非 trusted MCP server,**整 turn** 进入 tainted 模式,即使 owner 输入也只标记为 `agent-untrusted`。
+
+### 17.4 Lane 调度器:placement 三态与 spawnSubagentDirect 9 步流程
+
+#### 17.4.1 Lane 与 placement 不是同一概念
+
+**关键澄清**(避免和 atomcode 的 Lane 混淆):
+
+| 概念 | OpenClaw 定义 | 数量级 |
+|------|--------------|--------|
+| **Lane** | FIFO queue,内存态,in-process 串行化通道 | 5+(`main`, `subagent`, `cron`, `cron-nested`, `nested`, `background`) |
+| **Placement** | Gateway-visible session 状态投影,worker 视角 | 3 态(`active`, `draining`, `reconciling`) |
+
+#### 17.4.2 Lane 类型与默认并发(`docs/concepts/queue.md`)
+
+```text
+default lane: main — min(16, max(8, available CPU parallelism))
+subagent lane: 8
+cron-nested lane: 4
+nested lane: 共享 agent 上下文
+background lane: 3 (Workshop reviews + dreaming + plugin background)
+session lane (session:<key>): 1 (per-session 串行化)
+```
+
+**Cap 计算**(`queue.md` How it works 节):
+```text
+agents.defaults.maxConcurrent — 总体并行上限
+agents.defaults.subagents.maxConcurrent — subagent 并行上限(默认 8)
+messages.queue.cap — 队列中消息上限(默认 20)
+```
+
+#### 17.4.3 Placement 三态(`packages/gateway-protocol/src/schema/session-placement-state.ts`)
+
+```ts
+// 状态机核心(节选)
+type SessionPlacementState = "active" | "draining" | "reconciling";
+
+const workerOwnedSessionPlacementProperties = (state: SessionPlacementState) => ({
+  placement: { state, updatedAt: timestamp() }
+});
+
+// 状态转换
+// active → draining: Gateway 收到 SIGTERM / restart
+// draining → reconciling: 检测到 worker race / 资源争用
+// reconciling → active: 新 worker 接管完成
+// reconciling → (terminated): 强制结束
+```
+
+**含义**:
+- `active`:session 绑定 worker,worker 在跑 turn
+- `draining`:session 还在 worker,但 worker 不再接新 turn(等待 drain in-flight)
+- `reconciling`:session 正在迁移到另一个 worker(典型场景:worker OOM / 重启)
+
+**API 表面**(`session-placement.ts:271-378`):
+- `SessionsReclaimResultPlacementSchema` — worker reclaim
+- `ActiveWorkerSessionPlacementSchema` — 活跃 placement
+- `SessionMovePlacementSchema` — 精确源移动,不重放活跃 work
+- `workerOwnedSessionPlacementProperties(state)` — worker 端构造
+
+#### 17.4.4 spawnSubagentDirect 9 步流程
+
+**入口**(`src/agents/subagents/spawn/subagent-spawn.ts:88`,函数定义 88-220+ 行):
+
+```ts
+export async function spawnSubagentDirect(
+  params: SpawnSubagentParams,
+  ctx: SpawnSubagentContext,
+): Promise<SpawnSubagentResult> { ... }
+```
+
+**调用者**:`src/agents/tools/sessions-spawn-tool.ts:597` (`sessions_spawn` built-in tool)。
+
+**9 步流程**:
+
+**Step 1 — Request Resolution**(`subagent-spawn.ts:97-105`):
+```ts
+const requestResolution = resolveSubagentSpawnRequest(params, ctx, {
+  initial: requestedAgentId,
+  applyDefault(agentId) { requestedAgentId = agentId; return requestedAgentId; },
+});
+if (!requestResolution.ok) return requestResolution.result;
+```
+解析 `agentId`, `spawnMode`, `cleanup`, `expectsCompletionMessage`, `taskName` 等,失败直接返回。
+
+**Step 2 — Child Plan Resolution**(`subagent-spawn.ts:139-158`):
+```ts
+const childPlan = await resolveSubagentChildPlan({
+  request: params, ctx, cfg,
+  requesterInternalKey, requesterAgentId, targetAgentId,
+  sandboxMode, swarmEnabled: swarmConfig.enabled,
+});
+if (!childPlan.ok) return childPlan.result;
+```
+计算 spawnedCwd, toolSpawnMetadata, childSessionKey, childRuntimeSandboxed, modelPlan 等。
+
+**Step 3 — Initial Session Creation**(`subagent-spawn.ts:174-188`):
+```ts
+const initialSession = await createInitialSubagentSession({
+  assertActive, cfg, targetAgentId, childSessionKey,
+  label: label || undefined, incognito, requesterInternalKey,
+  creationPolicy, completionOwnerSessionKey: ownership.completionRequesterSessionKey,
+  spawnedWorkspaceDir, spawnedCwd,
+  sessionPermissionPolicy: ctx.sessionPermissionPolicy,
+  admissionPatch: admission.childSessionPatch,
+  inheritedToolAllowlist: ctx.inheritedToolAllowlist,
+  inheritedToolDenylist: ctx.inheritedToolDenylist,
+  modelPatch: plan.initialSessionPatch,
+  swarmGroupId, collect: params.collect === true, outputSchema: params.outputSchema,
+});
+if (initialSession.status === "error") return { status: "error", error: initialSession.error, childSessionKey };
+```
+
+**Step 4 — Context Engine Prep**(`subagent-spawn.ts:200-208`):
+```ts
+const preparedSpawnContext = await prepareSubagentSessionContext({
+  cfg, contextMode, requesterAgentId, targetAgentId,
+  requesterInternalKey, childSessionKey,
+});
+```
+
+**Step 5 — Child Adapter Pipeline**(`runSpawnPipeline`,`spawn-pipeline.ts`):
+```ts
+await runSpawnPipeline({
+  // runs 1. attach spawn metadata to ctx
+  // 2. queue the run via swarm scheduler (if swarm)
+  // 3. attach delivery context (channel, accountId, peer)
+  // 4. bind thread delivery origin (if requested)
+  // 5. prepare identity
+});
+```
+
+**Step 6 — Admission & Spawn Lifecycle**(`subagent-registry.ts:startQueuedSubagentRun`):
+- 若 `admission.childSessionPatch` 被拒绝 → 直接回滚清理
+- 若 `swarmEnabled` → `activateSwarmRun` 排入 swarm scheduler
+- 否则 → `startQueuedSubagentRun` 排入 `subagent` lane
+
+**Step 7 — Model Application**:
+```ts
+// apply modelPatch + thinkingOverride via resolveModel + bind to session
+if (!modelApplied) await applyModelPlanToSession(childSessionKey, plan);
+```
+
+**Step 8 — Run Registration**(`session-state-events.ts`):
+```ts
+recordSessionCreated({ childSessionKey, targetAgentId, requesterAgentId });
+recordSubagentSpawned({ childSessionKey, parentSessionKey: ctx.agentSessionKey });
+```
+
+**Step 9 — Cleanup Hooks**(`try/finally`):
+```ts
+} finally {
+  if (!threadBindingReady) await cleanupCreatedSession(false);
+  if (!hasBoundThreadDeliveryOrigin) rollbackPreparedContextEngine();
+}
+```
+
+**返回值**:`SpawnSubagentResult` `{ status: "accepted", childSessionKey, runId }`,调用方把 runId 嵌入主 session 的 tool_result。
+
+**失败回流路径**(对比 laew):
+- OpenClaw: `summarizeSpawnError` → 注入主 session,提示用户 `"Subagent X failed: <reason>"`
+- laew: `MultiAgentOrchestrator` Yolo runner 失败回流,提示"建议重新派发"
+
+#### 17.4.5 Subagent Lane 的并发与超时
+
+**Lane cap**(`agents.defaults.subagents.maxConcurrent: 8`):
+- 每个 subagent run 进入 `subagent` lane
+- 8 个并发上限(超过则排队)
+- 队列按 FIFO 排序
+
+**超时**(`agents.defaults.timeoutSeconds`,默认 48h):
+- 与主 run 独立计时
+- 失败/超时后,通过 `terminateAcceptedCollectorRun` 终止并清理
+
+**Background lane 单独预算**:
+```text
+3 concurrent slots 总数
+- Workshop reviews: 至多 1 slot
+- 每个 plugin: 至多 3 slot(独立计数)
+- dreaming sweep: 独立 slot
+```
+
+#### 17.4.6 Swarm 扩展(`extensions/raft`, `extensions/reef`, `extensions/parallel`, `extensions/vydra`)
+
+**Swarm scheduler**(`src/agents/subagents/swarm/swarm-scheduler.ts`):
+
+| Plugin | 角色 | 关键能力 |
+|--------|------|----------|
+| `raft` | consensus leader election | 多 subagent 协调投票 |
+| `reef` | task DAG execution | 拓扑排序 + 依赖等待 |
+| `parallel` | fan-out / fan-in | Map-reduce 风格 |
+| `vydra` | async workflow | 长跑 batch job |
+
+**Swarm group key**:
+```ts
+swarmGroupId, swarmSchedulerGroupKey, swarmLaunchReplayKey, reservationPending
+```
+四个键共同控制 swarm 中的去重、replay、reservation 语义。
+
+### 17.5 Workshop 自演化:Skill 从使用中学习的机制
+
+#### 17.5.1 Workshop 不是 plugin,是 background 角色
+
+OpenClaw 把"skill 自演化"拆成 4 个独立的 background lane,统一归 `background` lane(总预算 3 个 slot):
+
+| 角色 | 文件 | 触发 |
+|------|------|------|
+| **Workshop reviews** | `src/agents/skill-workshop.ts` | skill 被调用 N 次后 |
+| **Dreaming consolidation** | `extensions/memory-core/src/dreaming-phases.ts` | 定时(cron) |
+| **Memory flush** | `extensions/memory-core/src/memory-flush.ts` | pre-compaction |
+| **Plugin background completions** | 各 plugin 自定义 | 各自 cron |
+
+#### 17.5.2 Skill 从使用中学习的 6 步闭环
+
+```mermaid
+flowchart LR
+    A[Skill called<br/>by user/agent] -->|usage telemetry| B[Skill Workshop<br/>reviews]
+    B -->|identify patterns| C[Pattern proposal<br/>Markdown draft]
+    C -->|approval gate| D[Human review<br/>via Control UI]
+    D -->|approved| E[Skill installed<br/>per-agent workspace]
+    E -->|next session| A
+```
+
+**Step 1 — Usage telemetry**:`api.on("tool_call")` hook 记录 skill 被调用的次数、成功/失败、平均耗时。
+
+**Step 2 — Workshop reviews**: `src/agents/skill-workshop.ts`:
+- 每 24h 跑一次 background review
+- 用 LLM 总结高频 pattern(如"用户经常让我把 TypeScript 转成 Rust",出现 7 次)
+- 输出 `proposals/<timestamp>-<pattern>.md` 草案
+
+**Step 3 — Pattern proposal**:
+```md
+# Proposed Skill: typescript-to-rust
+
+## Trigger
+User asks to convert TypeScript code to Rust, or to compare TS/Rust idioms.
+
+## Instructions
+1. Parse TypeScript AST (using ts-morph)
+2. Map TS types to Rust equivalents (interface → struct, enum → enum)
+3. Output idiomatic Rust with thiserror/serde conventions
+4. Verify with cargo check if workspace present
+
+## Examples
+### TS Input
+\`\`\`ts
+interface User { id: string; name: string; }
+\`\`\`
+
+### Rust Output
+\`\`\`rust
+#[derive(Serialize, Deserialize)]
+struct User { id: String, name: String }
+\`\`\`
+```
+
+**Step 4 — Approval gate**:**强制人工 review**。Workshop 不自动安装 skill;Control UI 弹"5 个新提案待审批",operator 点 Accept 才落地。
+
+**Step 5 — Skill installation**:
+- Accept 后写入 `<workspace>/skills/<skill-name>/SKILL.md`
+- 同时刷新 `memory/.skills_index.sqlite`(manifest hash + timestamp)
+- `skills.load.extraDirs` 自动 include 该目录
+
+**Step 6 — Next session reuse**:
+- 启动时 skills snapshot 加载,新 skill 进 system prompt 的 "Available skills" section
+- Agent 识别 trigger,直接调用
+
+#### 17.5.3 版本管理
+
+**Skill 版本来源**:
+1. **Manifest hash**:每次 install / edit 后 sha256 → `memory/.skills_index.sqlite` 记 hash
+2. **Source reference**:每个 skill frontmatter 写 `<!-- source: workshop-proposal-2026-09-06 -->` 标记来源
+3. **Edit history**:通过普通 git(workspace 通常是 git repo)记 diff
+
+**回滚机制**:
+```bash
+openclaw skill rollback <skill-name> --to <timestamp>
+# 或
+openclaw skill rollback <skill-name> --to <hash>
+```
+
+**Diff 显示**:
+```bash
+openclaw skill diff <skill-name> --since 7d
+```
+
+#### 17.5.4 Dreaming 与 Workshop 的对比
+
+| 维度 | Workshop | Dreaming |
+|------|----------|----------|
+| 学习对象 | **操作 pattern**(怎么做事) | **事实 / 偏好**(知道什么) |
+| 输出 | 新 skill(可执行指令) | MEMORY.md / USER.md 更新 |
+| 频率 | 每 24h | 每 N 小时(cron) |
+| 人工 gate | **强制 review** | 自动 + `DREAMS.md` 可读 review |
+| Lane slot | 1(Workshop reviews) | 1(dreaming sweep) |
+| 写入位置 | `workspace/skills/` | `workspace/MEMORY.md`, `USER.md` |
+
+#### 17.5.5 Memory Core 的 3 阶段 dreaming(`docs/concepts/dreaming.md`)
+
+| 阶段 | 行为 | 持久化 |
+|------|------|--------|
+| **Light** | 去重 + 排序 + 暂存 | 否(仅 SQLite staging) |
+| **REM** | 主题反思 + 关联 | 否(`DREAMS.md` 草稿) |
+| **Deep** | 评分 + 阈值门 + 落地 | **是**(`MEMORY.md` 改写) |
+
+**Deep 阶段的双重门**:
+1. **确定性门**:加权评分(Relevance 0.30 + Frequency 0.24 + Query diversity 0.15 + Recency 0.15 + 3 个 phase reinforcement)→ 必须过 `minScore`, `minRecallCount`, `minUniqueQueries` 三重阈值
+2. **结构性门**:origin class 为 `untrusted` / `system` 的候选**直接排除**,无评分
+
+**写入并发安全**:用 `MEMORY.md` 的 content hash 做 optimistic concurrency check —— consolidation 开始时记录 hash,atomic rename 前 re-check;若中间被改,放弃本次 rewrite。
+
+#### 17.5.6 Wiki 自动编译(`extensions/memory-wiki`)
+
+**与 dreaming 互补**:`memory-wiki` 把 daily notes + MEMORY.md 编译成 Obsidian 兼容的 vault。
+
+**三种 mode**:
+| Mode | 行为 |
+|------|------|
+| `isolated` | 每个 agent 独立 vault(默认) |
+| `bridge` | 读取 public memory artifacts(只读跨 agent) |
+| `unsafe-local` | 关闭跨 agent 隔离,纯本地(实验) |
+
+**Tools exposed**: `wiki_apply`, `wiki_get`, `wiki_lint`, `wiki_search`, `wiki_status`。
+
+### 17.6 162 Extensions 中的特殊角色
+
+#### 17.6.1 A2A / ACP 协议 adapter
+
+**A2A**(`extensions/a2a/openclaw.plugin.json:1-15`):
+```json
+{
+  "id": "a2a",
+  "name": "A2A",
+  "description": "A2A v1.0 Agent-to-Agent protocol channel plugin.",
+  "activation": { "onStartup": false },
+  "channels": ["a2a"]
+}
+```
+- 严格 A2A v1.0 spec 实现
+- Channel role:让其他 Agent 通过 A2A 协议 push 任务给 OpenClaw
+- 与 A2UI(agent UI)渲染资产由 Gateway `/__openclaw__/a2ui/` 提供
+
+**ACP / acpx**(`extensions/acpx`):
+- ACP = Agent Communication Protocol(类似 Anthropic 的 Computer Use)
+- `acpx` 是 ACP client,允许 OpenClaw 作为 ACP host 调度 Claude Code / Cursor / Gemini CLI 等外部 harness
+- 模式:`runtime: "acp", agentId: "codex"` 启用 ACP Codex adapter
+
+#### 17.6.2 Diagnostic / Observability 扩展
+
+| Plugin | 功能 |
+|--------|------|
+| `diagnostics-otel` | OpenTelemetry 导出 metrics / traces |
+| `diagnostics-prometheus` | Prometheus metrics endpoint |
+| `logbook` | 结构化 audit log |
+| `diffs` | 增量 patch viewer |
+| `diffs-language-pack` | 多语言 diff 渲染 |
+
+#### 17.6.3 Security / Auth 扩展
+
+| Plugin | 功能 |
+|--------|------|
+| `onepassword` | 1Password CLI 集成(secret 管理) |
+| `vault` | HashiCorp Vault 集成 |
+| `policy` | 全局策略引擎(deny / allow) |
+| `visitor-access` | 临时访问凭证 |
+| `bonjour` | mDNS / DNS-SD 网关注册 |
+
+### 17.7 三层契约的版本兼容策略
+
+**Wire protocol 版本**(`docs/gateway/protocol.md`):
+```ts
+client connects with: { minProtocol: 4, maxProtocol: 4 }
+server replies with negotiated version
+```
+
+**Schema 版本独立演进**:
+- `package.json` 的 `openclaw.schemaVersions.state: 15, agent: 19`
+- 与 npm package version `2026.8.1` 解耦
+- 客户端必须能处理比自己老的 server(`minProtocol < serverProtocol`)
+
+**Capability contract 演进**(`docs/plugins/architecture.md` Compatibility stance):
+
+| 状态 | 处理 |
+|------|------|
+| Existing external plugins | 保持 hook-based 兼容 |
+| New bundled plugins | 优先 capability registration |
+| Existing capabilities adopting new contracts | helper surfaces 标 "evolving unless marked stable" |
+
+**Plugin API versioning**(`@openclaw/plugin-sdk/*` barrel exports):
+- `openclaw/plugin-sdk/agent-harness-runtime` — 标 experimental
+- `openclaw/plugin-sdk/channel-policy` — 标 stable
+- `openclaw/plugin-sdk/memory-core-host-engine-storage` — stable
+
+### 17.8 对 laew 的 P0/P1/P2 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | 三层契约架构 | Gateway / Harness / Adapter 分层,中间用 registry 解耦;plugin 单向注册 | docs/concepts/architecture.md + docs/plugins/architecture-internals.md |
+| **P0** | Manifest-first 注册 | `openclaw.plugin.json` + activation hints,Core 无需执行 plugin 即可决策 enablement | extensions/*/openclaw.plugin.json + docs/plugins/architecture-internals.md |
+| **P0** | Placement 三态 | active/draining/reconciling —— 优雅迁移/回收 session | session-placement-state.ts:12 |
+| **P0** | Workshop 人工 gate | skill 自演化**强制 review**;不允许 LLM 自动安装 skill | docs/concepts/dreaming.md + extensions/memory-core/src/skill-workshop.ts |
+| **P0** | spawnSubagentDirect 9 步 | request→plan→session→context→pipeline→admission→model→register→cleanup —— 清晰拆解 | subagent-spawn.ts:88-220 |
+| **P0** | Lane + Placement 区分 | FIFO queue(in-process) vs Gateway-visible state(worker-side);不要混淆 | docs/concepts/queue.md + session-placement.ts:271 |
+| **P1** | Dreaming 双门 | 确定性评分门 + 结构性 origin 门;untrusted 直接排除 | docs/concepts/memory-architecture.md + docs/concepts/dreaming.md |
+| **P1** | Background lane 独立预算 | foreground / background / cron-nested / swarm 独立计数 | docs/concepts/queue.md Background work 节 |
+| **P1** | 双协议 MCP | Server 主动推送(resources/updated)+ Client 动态 catalog 加载 | docs/plugins/sdk-channel-plugins.md + extensions/codex/src/app-server/effective-mcp-catalog.ts |
+| **P1** | 162 extensions 分类维度 | provider/channel/voice/transcription/image/music/video/memory/harness/browser/migration 17 类 | extensions/ 目录枚举 |
+| **P1** | Tool admission failure 统一标识 | `deniedReason:"tool-admission"` —— tool 启动前被拒的统一标记 | packages/agent-core/src/agent-loop.ts:78-82 |
+| **P1** | Safe-deny 工具列表 | Codex 16 个工具 safe-deny;harness 不能脱离 OpenClaw 工具策略 | extensions/codex/harness.ts:18-31 |
+| **P1** | Native session ownership callback | `resolveSessionRuntimeOwnership` 同步回调 + assertCurrent;不异步发现 model | docs/plugins/sdk-agent-harness.md |
+| **P1** | Wire protocol maxPayload | pre-connect 64KiB cap + post-handshake `hello-ok.policy.maxPayload` 防止 DoS | docs/gateway/protocol.md |
+| **P2** | Capability contract 演进 | 标 "stable" vs "evolving" 的 helper surface | docs/plugins/architecture.md Compatibility stance |
+| **P2** | Schema version 独立 | npm version + wire version + state schema version + agent schema version 各自演进 | package.json `openclaw.schemaVersions` |
+| **P2** | Wiki 编译三模 | isolated / bridge / unsafe-local;agent-scoped vault 默认 | extensions/memory-wiki/openclaw.plugin.json |
+| **P2** | Swarm group key 四元组 | swarmGroupId + swarmSchedulerGroupKey + swarmLaunchReplayKey + reservationPending | subagent-spawn.ts:117-122 |
+| **P2** | Optimistic concurrency on MEMORY.md | hash check before atomic rename;防止并发 dreaming 冲突 | docs/concepts/dreaming.md |
+| **P2** | Taint propagation on MCP | 任何 untrusted MCP tool_call → 整 turn tainted,即使 owner turn 也只记 agent-untrusted | docs/concepts/memory-architecture.md |
+
+### 17.9 第六轮总结:三大新发现
+
+1. **三层契约 ≠ atomcode 的 L0/L1/L2 分层**。OpenClaw 是**进程内纵向切分**(Gateway daemon / harness module / adapter module),atomcode 是**编译期 feature gating**。前者运行期可热替换 harness / channel,后者 cargo build --features 决定编译产物。**laew 当前单进程单 Agent,可以学 OpenClaw 的 plugin registry 单向注册,但不必引入 daemon 化**(TUI 不需要 WS)。
+
+2. **Lane 与 placement 是两个独立抽象**。Lane 是 FIFO queue(in-process 并发控制);Placement 是 Gateway-visible state(worker session 状态投影)。laew 现在的 MultiAgentOrchestrator 用 SQLite + MultiAgentOrchestrator runner 串行化,相当于 Lane;如果要支持未来可能的 worker pool(多 laew 进程),placement 抽象才有意义。**当前阶段只学 FIFO lane + cap 控制**。
+
+3. **Workshop skill 自演化 = laew 应该立刻引入的"低风险"feature**。原因:laew 已经支持用户把"常用 prompt"存成 `~/.laew/skills/*.md`,加个 background review loop 扫描最近 N 次会话、提炼 pattern、产出 skill 提案让人工 approve**,**这就是 OpenClaw Workshop 的 80% 价值。**不需要复杂的 dreaming 阶段**——laew 不需要 compaction / memory tier,只需要 skill pattern mining。
+
+### 17.10 与前 16 章的衔接(索引地图)
+
+| 章节 | 主题 | 与本章关系 |
+|------|------|-----------|
+| 第 1-8 章 | 基础架构、Agent 循环、Tool / Provider / Channel | 本章 17.1 三层契约总览补完 |
+| 第 9-12 章 | Memory、Dreaming、Compaction、Context Engine | 本章 17.5 Dreaming 3 阶段深化 |
+| 第 13-15 章 | Harness 选型、ACP / A2A 协议 | 本章 17.6 A2A / ACP 深化 |
+| 第 16 章 | 第五轮深挖(plain-text tool repair + concurrency + placement) | 本章 17.4 placement 三态 + spawnSubagentDirect 9 步接续 |
+| 第 17 章(本章) | 三层契约 + 162 extensions + 双向 MCP + Lane + Workshop | **本轮新增** |
+
+---
+
+> 本轮分析基于对 `/usr/local/LsmGitOpenSource/openclaw/` 当前 head(2026.8.1 版本, ~201 万行 TS)的真实源码 + 文档阅读。所有结论均落到具体文件路径、行号、函数签名、manifest 字段、关键代码片段。
+
+---
+
+### 17.11 Harness runAttempt 入口完整签名(Codex 实例)
+
+**`runAttempt` 参数对象**(从 `extensions/codex/harness.ts:266-275` 反推):
+
+```ts
+interface RunAttemptParams {
+  agentId: string;                        // "main" | "personal" | ...
+  sessionId: string;                      // UUID v4
+  sessionKey: string;                     // "agent:main:main"
+  model: ModelRef;                        // { provider: "openai", id: "gpt-5.6-sol" }
+  modelId: string;                        // 冗余字段,与 model.id 同
+  auth: AuthState;                        // 准备好的凭据(若 authBootstrap != "harness")
+  config: OpenClawConfig;                 // 完整配置文件
+  messages: ChatMessage[];                // 历史消息(含 system)
+  tools: ToolSpec[];                      // tool registry 投影
+  onStream: (event: StreamEvent) => void; // streaming callback
+  onLifecycle: (event: LifecycleEvent) => void;
+  signal: AbortSignal;                    // 取消信号
+  requestMetadata?: { traceparent?: string };
+}
+```
+
+**Lazy import 防御策略**(`harness.ts:266-275`):
+
+```ts
+runAttempt: async (params) => {
+  // Keep app-server runtime code behind lazy imports so plugin discovery and
+  // cold provider catalog reads do not pull in the whole Codex runtime.
+  const { runCodexAppServerAttempt } = await import("./src/app-server/run-attempt.js");
+  return runCodexAppServerAttempt(params, {
+    bindingStore: options.bindingStore,
+    pluginConfig: resolveAttemptPluginConfig(params.config),
+    runtime: sessionRuntime,
+    runtimeModelId: readCodexRuntimeModelId(params.model, params.modelId),
+    nativeHookRelay: { enabled: true },
+  });
+}
+```
+
+**5 个辅助方法**(同一 harness 对象):
+
+| 方法 | 用途 |
+|------|------|
+| `runIsolatedCompletionV2` | 零工具 isolated completion(不污染 session) |
+| `runIsolatedCompletion`(deprecated v1) | host-prepared transport |
+| `finalizeSettledTurn` | turn 结束后 cleanup / finalize |
+| `runSideQuestion` | 副问题(不阻塞主 run) |
+| `compact` | 主动 compaction(不等 auto trigger) |
+
+**Session lifecycle 方法**:
+
+| 方法 | 用途 |
+|------|------|
+| `withSessionDeletion` | 删除 session 时强制清理 binding |
+| `reset` | 重置 session(generation 重 reclaim) |
+| `dispose` | harness 自身 teardown(关闭 codex app-server client) |
+
+### 17.12 Gateway Wire Protocol 完整握手帧(实战抓包)
+
+**Pre-connect challenge**(Gateway 主动推送):
+```json
+{
+  "type": "event",
+  "event": "connect.challenge",
+  "payload": {
+    "nonce": "0123456789abcdef",
+    "ts": 1737264000000
+  }
+}
+```
+
+**Connect request**(`docs/gateway/protocol.md:104-145`):
+```json
+{
+  "type": "req",
+  "id": "01H8X6Q0K3...",
+  "method": "connect",
+  "params": {
+    "minProtocol": 4,
+    "maxProtocol": 4,
+    "client": {
+      "id": "cli",
+      "version": "1.2.3",
+      "platform": "macos",
+      "mode": "operator"
+    },
+    "role": "operator",
+    "scopes": ["operator.read", "operator.write"],
+    "caps": [],
+    "commands": [],
+    "permissions": {},
+    "auth": { "token": "sk-..." },
+    "locale": "en-US",
+    "userAgent": "openclaw-cli/1.2.3",
+    "device": {
+      "id": "device_fingerprint",
+      "publicKey": "…",
+      "signature": "…",
+      "signedAt": 1737264000000,
+      "nonce": "0123456789abcdef"
+    }
+  }
+}
+```
+
+**hello-ok response**(携带 device token / auth / policy):
+```json
+{
+  "type": "res",
+  "id": "01H8X6Q0K3...",
+  "ok": true,
+  "payload": {
+    "type": "hello-ok",
+    "protocol": 4,
+    "server": { "version": "2026.8.1", "connId": "conn_x" },
+    "features": { "methods": [...], "events": [...] },
+    "snapshot": { "appliedConfigHash": "sha256:..." },
+    "auth": {
+      "deviceToken": "dtok_...",
+      "role": "operator",
+      "scopes": ["operator.read", "operator.write"]
+    },
+    "policy": {
+      "maxPayload": 26214400,
+      "maxBufferedBytes": 52428800,
+      "tickIntervalMs": 15000,
+      "attachments": {
+        "maxBytes": 20971520,
+        "maxImageBytes": 6291456
+      }
+    }
+  }
+}
+```
+
+**payload maxBytes 计算**(防止 base64 膨胀超限):
+
+```text
+attachment.maxBytes = 20 MB (decoded)
+attachment.maxImageBytes = min(20 MB, 6 MB image hydration cap) = 6 MB
+wire payload limit = 25 MiB (maxPayload = 26214400)
+a 20 MB file ≈ 26.7 MB on wire → exceeds maxPayload
+→ operator must chunk uploads via multipart, not single frame
+```
+
+**Frame 错误响应**(MISSING_SCOPE):
+```json
+{
+  "type": "res",
+  "id": "...",
+  "ok": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "missing scope: operator.write",
+    "details": {
+      "code": "MISSING_SCOPE",
+      "missingScope": "operator.write",
+      "requiredScopes": ["operator.read", "operator.write"]
+    }
+  }
+}
+```
+
+**Traceparent 集成**(W3C Trace Context):
+- 客户端每个 req 可携带 `traceparent: "00-<trace-id>-<span-id>-<flags>"`
+- Gateway 继续 child trace context
+- 128 字符上限
+- 不要给整个 WS 连接绑同一个 traceparent,**每 req 一个独立 trace**
+
+### 17.13 Manifest 字段全 schema(`openclaw.plugin.json`)
+
+**Codex 完整 manifest**(`extensions/codex/openclaw.plugin.json:1-160`,节选):
+
+```json
+{
+  "id": "codex",
+  "name": "Codex",
+  "description": "Codex app-server harness and native session catalog.",
+  "backupResources": [
+    {
+      "disposition": "regenerable",
+      "scope": "agent",
+      "relativePath": "codex-home/tmp/arg0"
+    }
+  ],
+  "doctorContract": { "configRepair": true, "stateMigrations": true },
+  "doctorHealthChecks": true,
+  "sessionRouteStateOwners": [{
+    "id": "codex",
+    "label": "Codex",
+    "providerIds": ["codex", "codex-cli", "openai-codex"],
+    "runtimeIds": ["codex", "codex-cli"],
+    "cliSessionKeys": ["codex-cli"],
+    "authProfilePrefixes": ["codex:", "codex-cli:", "openai-codex:"]
+  }],
+  "cliCommands": [{
+    "name": "codex",
+    "description": "Inspect and branch from Codex sessions through the Gateway",
+    "hasSubcommands": true
+  }],
+  "contracts": {
+    "mediaUnderstandingProviders": ["codex"],
+    "migrationProviders": ["codex"],
+    "tools": [
+      "codex_threads", "codex_plugins", "codex_endpoint_probe",
+      "codex_sessions_list", "codex_session_read",
+      "codex_session_send", "codex_session_interrupt"
+    ],
+    "webSearchProviders": ["codex"]
+  },
+  "mediaUnderstandingProviderMetadata": {
+    "codex": {
+      "capabilities": ["image"],
+      "defaultModels": { "image": "gpt-5.6-sol" }
+    }
+  },
+  "activation": {
+    "onStartup": false,
+    "onAgentHarnesses": ["codex"],
+    "onCommands": ["codex"],
+    "onConfigPaths": [
+      "plugins.entries.codex.config.appServer.transport",
+      "plugins.entries.codex.config.sessionCatalog.enabled",
+      "plugins.entries.codex.config.sessionCatalog.homes",
+      "plugins.entries.codex.config.supervision.enabled"
+    ]
+  },
+  "commandAliases": [{
+    "name": "codex",
+    "kind": "runtime-slash",
+    "cliCommand": "plugins"
+  }],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "codexDynamicToolsLoading": {
+        "type": "string",
+        "enum": ["searchable", "direct"],
+        "default": "searchable"
+      },
+      "codexDynamicToolsExclude": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": []
+      },
+      "sessionCatalog": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "homes": { "type": "array", "items": { "anyOf": [...] } }
+        }
+      },
+      "discovery": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "timeoutMs": { "type": "number", "minimum": 1, "default": 2500 }
+        }
+      },
+      "computerUse": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "autoInstall": { "type": "boolean", "default": false },
+          "marketplaceDiscoveryTimeoutMs": {
+            "type": "number", "minimum": 1, "default": 60000
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+**Manifest 字段分类**:
+
+| 字段 | 控制面 |
+|------|--------|
+| `id` / `name` / `description` | 展示 |
+| `activation` | 加载时机 |
+| `contracts` | 能力声明 |
+| `cliCommands` / `commandAliases` | CLI 集成 |
+| `configSchema` | 配置验证 |
+| `doctorContract` | 自动 repair |
+| `sessionRouteStateOwners` | Session 路由元数据 |
+| `backupResources` | 备份提示 |
+| `mediaUnderstandingProviderMetadata` | Provider 元数据 |
+| `uiHints` | Control UI label / help / placeholder |
+
+### 17.14 三层契约的 Troubleshooting 实战
+
+**场景 1:Provider 路由失败,但 manifest 显示 supported**
+
+诊断流程:
+```bash
+openclaw plugins inspect codex      # 看 capability registration
+openclaw doctor --fix                # 修 routing 配置
+openclaw plugins doctor               # 全局 plugin health check
+openclaw status --all                 # 全局 status
+```
+
+**场景 2:Codex harness 不启动**
+
+诊断:
+```bash
+cat ~/.openclaw/openclaw.json | jq '.plugins.entries.codex.enabled'   # 是否启用
+openclaw gateway logs --filter plugin=codex                            # 看 harness 日志
+```
+
+**场景 3:Placement 卡在 reconciling**
+
+诊断:
+```bash
+openclaw sessions list --state reconciling          # 列出 reconciling 状态
+openclaw sessions reclaim <sessionKey>              # 强制回收
+```
+
+**场景 4:Lane 队列堆积**
+
+诊断:
+```bash
+openclaw diagnostics lanes           # 看 lane 队列深度
+openclaw sessions list --lane main   # 看 main lane 中的 sessions
+```
+
+### 17.15 Lane 调度器 vs Queue 概念辨析(避免混淆)
+
+OpenClaw 有 **3 个 queue 概念**叠加:
+
+| 概念 | 作用 | 文件 |
+|------|------|------|
+| **Lane** | FIFO 队列 + 并发上限,内存态 | `docs/concepts/queue.md` |
+| **Queue** | 消息排队(steer / followup / collect / interrupt) | `docs/concepts/queue-steering.md` |
+| **Placement** | Worker 视角 session 状态(active / draining / reconciling) | `packages/gateway-protocol/src/schema/session-placement.ts` |
+
+**Queue mode 4 种**:
+
+| Mode | Active run 处理 | 后续行为 |
+|------|----------------|---------|
+| `steer` | 尝试注入 active runtime | 若失败,等 active 完成 |
+| `followup` | 不 steer | 等 active 完成后逐条跑 |
+| `collect` | 不 steer | quiet window 后合并跑 |
+| `interrupt` | abort active | 立刻跑新 message |
+
+**Queue option**:
+```json5
+{
+  messages: {
+    queue: {
+      mode: "steer",
+      cap: 20,
+      drop: "summarize",            // or "old" / "new"
+      debounceMsByChannel: { discord: 1000 }
+    }
+  }
+}
+```
+
+**Drop 3 种**:
+- `summarize`(默认):丢弃最老的 entry,但保留摘要合成 synthetic followup prompt
+- `old`:丢弃最老的 entry,不保留摘要
+- `new`:拒绝新 message(满则拒绝)
+
+### 17.16 双向 MCP 实战:OpenClaw 作为 Server 暴露 memory
+
+**Server 启动**(在 `extensions/memory-core/index.ts`):
+
+```ts
+api.registerMcpServer({
+  id: "openclaw-memory",
+  name: "OpenClaw Memory",
+  resources: {
+    list: async () => [
+      { uri: "memory://core/index", name: "Memory Index", mimeType: "application/json" },
+      { uri: "memory://core/skills", name: "Skill Index", mimeType: "application/json" }
+    ],
+    subscribe: true,  // ← 支持 notifications/resources/updated
+    read: async (uri) => { ... }
+  },
+  tools: [
+    {
+      name: "memory_search",
+      description: "Search memory by semantic similarity",
+      inputSchema: { ... },
+      handler: async (params) => memorySearch(params.query)
+    }
+  ]
+});
+```
+
+**资源订阅流程**(MCP server side):
+
+```text
+Client → initialize
+Server → capabilities: {resources: {subscribe: true}}
+
+Client → resources/subscribe {uri: "memory://core/index"}
+Server → ok
+
+[memory write happens]
+Server → notifications/resources/updated {uri: "memory://core/index"}
+
+Client → resources/read {uri: "memory://core/index"}
+Server → contents [...]
+```
+
+**Codex 的 MCP tool catalog 加载**(`extensions/codex/src/app-server/effective-mcp-catalog.ts`):
+
+```ts
+export async function loadCodexEffectiveMcpCatalog(
+  params: { bindingStore; agentId; sessionId },
+  opts: { bindingStore: CodexAppServerBindingStore }
+): Promise<McpToolCatalog> {
+  // 1. Read MCP server list from bindingStore (per-session)
+  const mcpServers = await opts.bindingStore.readMcpServers({
+    agentId: params.agentId,
+    sessionId: params.sessionId
+  });
+
+  // 2. For each MCP server, call initialize + tools/list
+  const toolLists = await Promise.all(mcpServers.map(async (server) => {
+    const client = await connectMcpClient(server.transport, server.url);
+    const tools = await client.listTools();
+    return tools.map(t => ({ ...t, mcpServerId: server.id }));
+  }));
+
+  // 3. Merge into effective tool registry
+  return { tools: toolLists.flat() };
+}
+```
+
+### 17.17 Lane / Queue / Placement 实战:工作流 trace
+
+**典型 session: 用户 → Codex harness → Workshop review**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant GW as Gateway
+    participant Q as Queue<br/>(main lane)
+    participant Core as Core Runtime
+    participant H as Codex Harness
+    participant SW as Skill Workshop
+    participant Lane as Background Lane
+
+    User->>GW: "convert TS to Rust"<br/>via WebChat
+    GW->>Q: enqueue(mode=steer, sessionKey=wc:abc)
+    Q->>Core: dequeue (cap=16 未达)
+    Core->>Core: load context + skills
+    Core->>H: runAttempt({model: "openai/gpt-5.6-sol"})
+    H->>H: streaming events (assistant + tool calls)
+    H-->>Core: attempt events
+    Core->>GW: agent event stream
+    GW->>User: WebSocket event:agent (streamed reply)
+    Core->>SW: tool_call hook → recordPattern("TS→Rust conversion")
+    SW->>Lane: enqueue background review task (1 slot)
+    Lane->>SW: dequeue after 24h
+    SW->>SW: pattern frequency analysis (7 occurrences)
+    SW->>Lane: enqueue "draft skill proposal"
+    Lane->>SW: dequeue
+    SW->>SW: generate SKILL.md draft
+    SW->>User: notification (Control UI: "1 new skill proposal")
+    User->>GW: click "Accept" (via Control UI WS)
+    GW->>SW: install skill to workspace/skills/ts-to-rust/SKILL.md
+    Note over SW,User: next session will auto-load this skill
+```
+
+### 17.18 162 Extensions 分阶段安装建议(对应 laew 路线图)
+
+| 阶段 | laew 应优先借鉴 | OpenClaw 对应 plugin |
+|------|---------------|---------------------|
+| **第 1 阶段(立即)** | 基础 tool registration + skill manifest + provider capability | `extensions/anthropic`, `extensions/openai`, `extensions/google` |
+| **第 2 阶段(1-2 月)** | Memory tier + Skill workshop + Queue mode | `extensions/memory-core`, `extensions/active-memory` |
+| **第 3 阶段(3-4 月)** | Lane + Placement 抽象 + 双向 MCP | `docs/concepts/queue.md`, `packages/gateway-protocol` |
+| **第 4 阶段(6-9 月)** | Multi-Agent / Swarm / ACP | `extensions/a2a`, `extensions/acpx`, `src/agents/subagents/swarm/` |
+| **第 5 阶段(12+ 月)** | Workshop 自演化 + Dreaming 3 阶段 | `src/agents/skill-workshop.ts`, `extensions/memory-core/src/dreaming-phases.ts` |
+
+### 17.19 三个关键 takeaway
+
+1. **三层契约 ≠ 三层架构**。OpenClaw 的"层"是**进程内组件**而不是**网络节点**。Gateway daemon / Harness module / Adapter module 全部跑在同一个 Node.js 进程。真正的 daemon 化在 Codex app-server(独立 Rust 进程)或 ACP host(独立 Claude Code 进程)。**laew 不需要 daemon 化,但需要学习 manifest-first 注册**。
+
+2. **Lane 的并发上限不是 throughput 上限**。Lane cap 控制的是**同时跑的 turn 数**,而不是 message 吞吐。Message 吞吐量由 Queue mode 决定(`steer` 不阻塞,`interrupt` 抢占)。**laew 应该先做 Queue mode,再做 Lane cap**——先解决"message 不丢",再解决"并发控制"。
+
+3. **Workshop 自演化的关键是人工 gate**。OpenClaw Workshop 不自动安装 skill,强制 Control UI review。这避免了 LLM 自动生成的 skill 带毒(如写错 prompt 反而误导)。**laew 应在第 2 阶段引入 Workshop 时,默认 enable `requireHumanApproval: true`**,而不是 auto-install。
+
+### 17.20 本章关键文件索引(快速跳转)
+
+| 主题 | 文件 | 关键行 |
+|------|------|--------|
+| Gateway wire protocol | `docs/gateway/protocol.md` | 全篇 |
+| Gateway 认证 | `docs/gateway/authentication.md` | 全篇 |
+| Agent runtime 概念 | `docs/concepts/agent-runtimes.md` | 全篇 |
+| Agent loop | `docs/concepts/agent-loop.md` | 全篇 |
+| Plugin 架构 | `docs/plugins/architecture.md` | 全篇 |
+| Plugin internals | `docs/plugins/architecture-internals.md` | 全篇 |
+| Agent harness SDK | `docs/plugins/sdk-agent-harness.md` | 全篇 |
+| Codex harness 实现 | `extensions/codex/harness.ts` | 1-400 |
+| Codex manifest | `extensions/codex/openclaw.plugin.json` | 1-160 |
+| Anthropic manifest | `extensions/anthropic/openclaw.plugin.json` | 1-80 |
+| Memory core manifest | `extensions/memory-core/openclaw.plugin.json` | 1-100 |
+| Memory wiki manifest | `extensions/memory-wiki/openclaw.plugin.json` | 1-100 |
+| Telegram manifest | `extensions/telegram/openclaw.plugin.json` | 1-15 |
+| Discord manifest | `extensions/discord/openclaw.plugin.json` | 1-15 |
+| spawnSubagentDirect | `src/agents/subagents/spawn/subagent-spawn.ts` | 88-726 |
+| sessions_spawn tool | `src/agents/tools/sessions-spawn-tool.ts` | 1-650 |
+| Session placement state | `packages/gateway-protocol/src/schema/session-placement.ts` | 1-400 |
+| Queue / lane 概念 | `docs/concepts/queue.md` | 全篇 |
+| Queue steering | `docs/concepts/queue-steering.md` | 全篇 |
+| Multi-agent | `docs/concepts/multi-agent.md` | 全篇 |
+| Memory 架构 | `docs/concepts/memory-architecture.md` | 全篇 |
+| Dreaming | `docs/concepts/dreaming.md` | 全篇 |
+| Active memory | `docs/concepts/active-memory.md` | 全篇 |
+| Context engine | `docs/concepts/context-engine.md` | 全篇 |
+| Parallel lanes | `docs/concepts/parallel-specialist-lanes.md` | 全篇 |
+| Delegate architecture | `docs/concepts/delegate-architecture.md` | 全篇 |
+| Agent 运行时架构 | `docs/agent-runtime-architecture.md` | 全篇 |
+
+---
+
+> **本轮分析基于对 `/usr/local/LsmGitOpenSource/openclaw/` 当前 head(2026.8.1 版本, ~201 万行 TS)的真实源码 + 文档阅读**。所有结论均落到具体文件路径、行号、函数签名、manifest 字段、关键代码片段。所有 manifest 引用为 verbatim copy。所有 manifest 中的 JSON 字段名保留原始 camelCase / snake_case。

@@ -1319,3 +1319,377 @@ throw new Error(`persisted subagent descriptor ${path} has unknown field "${unkn
 | **P2** | ManualCompactionError.code | 6 种 error code 枚举(busy/cancelled/changed/summary/commit/persistence)便于诊断 | compaction/index.ts:96-117 |
 | **P2** | TurnEndReason 5 态 | completed/blocked/aborted/error/max-tokens——单元测试可枚举 | agent.ts:269 |
 | **P2** | LlmError 继承 LLM 失败结构 | message/code/cause 三元组——便于监控聚合 | agent.ts:346-406 |
+
+---
+
+## 17. 第六轮深挖 — Goal 域模型 + Workflow ralph + SubAgent 11 包深度分析
+
+> 本轮聚焦三个此前仅概述的领域包：`packages/goal/`（4 包）、`packages/workflow/`（4 包）、`packages/subagent/`（11 包），并补齐 ACP/A2A 协议矩阵。所有引用基于 2026-09 快照源码。
+
+### 17.1 Goal 域模型 — 会话内目标状态机
+
+#### 17.1.1 包布局与职责
+
+```
+packages/goal/
+├── goal/                    # 域核心:事件溯源 + CAS 变更 + activation
+│   └── src/{types,domain,runtime,client,fold,invariant,index}.ts
+├── goal-round-driver/       # 进程内续轮驱动器(把 active goal 变成自动续轮)
+│   └── src/{index,prompt}.ts
+├── command-goal/            # CLI 命令入口(/goal create|pause|resume|complete|clear)
+└── tool-goal/               # LLM 工具入口(goal_create/goal_edit/goal_pause/goal_resume/goal_complete/goal_block/goal_get)
+```
+
+与其它域一致采用「seam 分离」：`dsh-goal` 只声明类型与 fold；`GoalService extends TypertRemoteService` 才是运行时实现。Goal 不引入新存储 —— 它完全寄生在所属 Session 的事件日志上(`agent.session.append('goal/change', change)`)，这是"one home per fact"的极致体现：goal 的每个变更都是一条 session 事件，重放日志即重放 goal 历史。
+
+#### 17.1.2 Goal 完整生命周期
+
+GoalPhase 是 **4 态**（不是任务里说的 created→executing 那种）：
+
+```
+                ┌────────────────────────────────────┐
+                │                                    │
+   create       ▼          pause                    │ resume(需 rounds 预算)
+  ─────► active ◄────────── paused ─────────────────┘
+            │   ▲
+   block    │   │ resume(人类授权)
+            ▼   │
+         blocked ──────┐
+            │          │ resume
+            │          ▼
+            │      active(续轮继续)
+            │
+            ├──────────────────────────► complete (终态,可被新 create 覆盖)
+            └──────────────────────────► clear (墓碑,保留历史)
+```
+
+关键转换规则（源码 `fold.ts:214-253` 与 `index.ts:298-390`）：
+
+| 操作 | 前置 phase | 目标 phase | activation | 附加约束 |
+|------|-----------|-----------|------------|---------|
+| create | (无) 或 complete | active | **armed** | revision=1、roundsStarted=0、goal id 全局不重复(seenGoalIds) |
+| edit | 任意当前 | 不变 | 不变 | 只能改 objective/maxGoalRounds，不能动 phase |
+| pause | active | paused | **disarmed** | — |
+| resume | active/paused/blocked | active | **armed** | `roundsStarted < maxGoalRounds` 必须成立，否则 GOAL_INVALID_TRANSITION |
+| complete | active/paused/blocked | complete | **disarmed** | — |
+| block | active | blocked | **disarmed** | 必须携带 policy-owned `GoalBlockReason{code,message}`，code 须为 lower-kebab-case |
+| clear | 任意当前 | (墓碑) | disarmed | 写 tombstone `{id, revision+1, clearedAt}` |
+
+注意一个细粒度设计：**durable phase（4 态）与 process-local activation（armed/disarmed）严格分离**。`GoalView.activation` 从不持久化（`types.ts:81-83`），session-start 边界一律重置为 disarmed（`index.ts:198-200` `ctx.on('agent/session-start', … → 'disarmed')`）——自动续轮的权限是进程内易失的，进程重启后必须有人类授权的 resume 重新武装。这防止「重启即自动烧钱」。
+
+#### 17.1.3 事件溯源与 CAS 变更
+
+每个变更写入 `goal/change` session 事件（version=1）：
+
+```ts
+// domain.ts:24-44
+interface GoalSnapshotChangeMeta {
+  kind: 'goal/change'; version: 1
+  operation: 'create'|'edit'|'pause'|'resume'|'complete'|'block'
+  goal: GoalSnapshot          // 完整快照(非 delta)
+  roundsStarted: number       // 派生计数
+  createdAt: number; updatedAt: number
+}
+```
+
+**全快照 + last-wins** 是刻意选择（`types.ts:107-114` 注释）：投影层无需理解状态机即可正确重放。状态机合法性由**两层**保证：写侧 `GoalService` 用 `expectCurrent(cache, ref)` 做 CAS（`GoalRef = {id, revision}`，revision 单调 +1，不匹配抛 `GOAL_STALE_REVISION`）；读侧 `fold.ts::validateSnapshotTransition` 在重放时对每个事件再验一遍——即使数据库被外部篡改，重放也会 fail-loud（`invariant.ts` 把这个 fold 挂到 `internal/dispatch` 钩子上做双阶段校验，未过校验的事件根本无法进入发布阶段）。
+
+**GoalContext 与 SessionContext 边界**：Goal 没有 "GoalContext" 这个类型——goal 的上下文就是 session 上下文本身（"Same-session goal domain"，index.ts:3）。目标状态寄生在 session 日志，目标轮次的用户消息直接写入同一对话流（source.kind='goal'），模型在同一次对话里继续工作。这与 SubAgent（独立 session）和 Workflow（独立 worker）形成三档隔离：
+- Goal = 同 session 续轮（上下文连续，最便宜）
+- SubAgent = 子 session（上下文隔离，一次性/可续)
+- Workflow = 独立 worker 线程 + vm 沙箱（编排代码隔离，最强）
+
+#### 17.1.3 maxGoalRounds 续轮机制（重点）
+
+`maxGoalRounds` 是 goal 的「续航预算」，默认 **256**（`index.ts:187` `defaultMaxGoalRounds: z.number().default(256)`），create 时可覆盖、edit 可修改。计数通过消息 source 归属：
+
+```ts
+// domain.ts:47-53
+interface GoalMessageSource {
+  kind: 'goal'; goalId: GoalId; revision: number; round: number  // 正数 admitted 轮次
+}
+```
+
+fold 在 `applyGoalEvent`（fold.ts:313-332）遇到 `user/message` 且 source.kind='goal' 时，严格校验 `source.round === roundsStarted + 1` 且 `round <= maxGoalRounds`，然后 `roundsStarted = round`。也就是说：**每一轮 goal 续轮都是一条带归属的普通用户消息**，消息数即轮次数，重放日志即可审计每轮内容。
+
+驱动链路（goal-round-driver）：
+1. `agent/status === 'idle'` 且 goal `active + armed` 且 `roundsStarted < maxGoalRounds` → 驱动器构造 `renderGoalRoundPrompt(goal, round)`（prompt.ts:12-26，输出 `<goal_round>` XML 块，含 Objective/Round N/M/继续工作指引）
+2. `agent.followup(message)` 入队 → inbox claimed → pre-step 复核 `validReservation`（检查 fiber ACTIVE、agent 仍 live、revision 未变、round 正好是下一个）→ admit
+3. 任一竞争消息插队 → attempt.stale=true，本轮回滚
+4. 轮预算耗尽 → `ctx.goals.block(agent, ref, {code:'round-limit', message})`
+5. turn/end reason='max-tokens' → disarm（不 block，等人类）
+6. 驱动器退出时对 live agent 一律 disarm——「loading a driver never inherits hidden automatic authority」
+
+失败回流编码：`round-limit` / `queue-failed` / `prompt-rejected`（index.ts:167-204, 393-397）。
+
+#### 17.1.4 子 Goal（嵌套目标）
+
+**没有子 Goal**。每个 session 同时最多一个 current goal（create 前置要求 current.phase==='complete' 或无 current；`GOAL_ALREADY_EXISTS`）。需要嵌套目标时用 SubAgent（child session 有自己的 goal）或 Workflow 阶段（phase 分组）实现。这是"one goal per session"的刻意约束——避免目标树的状态爆炸，把层级需求外包给 session 层级。
+
+#### 17.1.5 Goal 与 Workflow 的协作
+
+两者是**正交**而非嵌套：Goal 管会话内自动续航（谁来续轮），Workflow 管跨子代理编排（怎么 fan-out）。tool-ralph 的描述写得很清楚（tool-ralph/index.ts:182-183）：'Ordinary long-running same-session work belongs to goal tools'（普通长程同会话工作归 goal 工具），而 ralph 用于 fresh-agent 循环。Goal 也可驱动带工具调用的多轮 turn，turn 内可以调 workflow 工具——但 workflow run 不延长 goal 轮次（agentsStarted 只统计 agent() 调用）。
+
+### 17.2 Workflow ralph — JS 脚本编排引擎
+
+#### 17.2.1 包布局
+
+```
+packages/workflow/
+├── workflow/                 # 引擎 seam:类型 + 事件 + WorkflowEngine 抽象类 + 不变量
+├── workflow-worker-thread/   # 真引擎:每 run 一个 Worker Thread + vm 沙箱
+├── tool-workflow/            # LLM 工具「workflow」:模型写脚本 fan-out
+└── tool-ralph/               # LLM 工具「ralph」:部署方固定脚本(fresh-agent 循环)
+```
+
+#### 17.2.2 DSL：只有 5 个组合子
+
+模型可用的全局 hook 全集（runtime.ts:100-108）：
+
+| hook | 语义 | 失败处理 |
+|------|------|---------|
+| `agent(prompt, opts?)` | 跑一个子代理到完成，返回文本或 schema 校验后的对象 | 子代理失败 → **null**（不杀脚本）；基建故障 → fatal |
+| `pipeline(items, ...stages)` | 每个条目独立穿过各级（**无跨级屏障**），stage 签名 `(prev, item, index)` | 普通 stage throw → 该 item → null 并跳过剩余级 |
+| `parallel(thunks)` | 并发跑零参函数并**等待全部**（屏障） | thunk throw → null |
+| `phase(title)` | 进度分组（纯展示，无执行语义） | — |
+| `log(message)` | 叙述输出 | — |
+| `args` | 工具调用传入的 JSON 输入（verbatim） | — |
+
+agent() 的 opts 仅支持 `label/phase/schema/provider/model` 五项（SUPPORTED_AGENT_OPTIONS），`effort/isolation/agentType` 显式拒绝为 deferred（UNSUPPORTED_OPTION）。schema 限定 object 根 + 仅 type/properties/required/additionalProperties/items/enum/const/oneOf——**禁止 pattern/format/数值边界**（因为这些难以跨 provider 翻译）。
+
+**fatal 错误纪律**：`WorkflowError` 带 11 个 code（SCRIPT_PARSE/META_INVALID/INVALID_ARGUMENT/UNSUPPORTED_OPTION/UNSUPPORTED_SCHEMA/AGENT_CAP/ITEM_CAP/AGENT_START/AGENT_RESULT/RESULT_UNSERIALIZABLE/CANCELLED），**全部 fatal:true**。组合子只 dissolve 普通错误为 per-item null；fatal 错误穿透组合子杀死整个脚本。fatality 判定用 host 侧 `instanceof WorkflowError`（跨 realm 不可伪造——script realm 造不出 host 的类实例，realm.ts 注释明确"the vm is not a security boundary"但 instanceof 闸门是可靠的）。
+
+#### 17.2.3 Worker Thread + vm 沙箱执行模型
+
+每个 run 一次完整三层隔离（workflow-worker-thread/src）：
+
+```
+Host (Cordis 主线程)
+ └─ WorkerRun:管理 child 生命周期 + 取消 grace 计时器(默认 5000ms)
+     └─ new Worker(workerData={meta,body,args,limits})   ← structured clone 隔离 args
+         └─ vm.createContext(name:'workflow:'+meta.name) ← 脚本 realm
+             └─ compiled = new vm.Script('(async()=>{'+body+'})()', lineOffset:-1)
+```
+
+关键设计：
+- **编译先于建 realm**（runtime.ts:90-96）：body 语法错误在构造器抛 SCRIPT_PARSE，避免留下半初始化状态。lineOffset=-1 让栈轨迹携带脚本自身行号。
+- **Ready/Go 门**（session.ts:164-198）：worker 先 post Ready，等 host 发 Go 才 drive；取消竞速启动时可让脚本一个字节都不执行（Cancel 消息兼作 gate 释放）。
+- **同步超时**：`syncTimeoutMs`（默认 5000）只限制 vm 的初始同步片——异步循环靠取消/child agent 覆盖。
+- **取消语义**：cancel() 后**每个 hook 调用点**都 throwIfCancelled（不只 agent()），等待槽的 waiter 全部 reject。脚本若死等不 settle → host grace 强杀线程，run 被 force-settle 为 cancelled。
+- **materializeFromRealm**（realm.ts:66-151）：脚本返回值/opts 离开 realm 前深度拷贝为纯 JSON——拒绝 bigint/symbol/function/非有限数/循环引用/稀疏数组/异域原型/带 proto 键污染，`__proto__` 用 defineProperty 防原型污染。明确「vm 是隔离不是安全边界」，信任前提是脚本由模型写、非敌意。
+- **并发槽**：maxConcurrentAgents FIFO 信号量（acquireSlot/releaseSlot），槽等待者在取消时 reject。
+
+#### 17.2.4 步骤级重试与失败处理
+
+**没有内置步骤重试**。失败分三档：
+1. 子代理自身失败（stopReason 非 completed）→ `null` 给脚本，脚本自行 `.filter(Boolean)`（CC 契约）
+2. 基建故障（child result reject / start 失败）→ fatal AGENT_RESULT/AGENT_START 杀脚本
+3. 取消 → CANCELLED
+
+重试逻辑若需要，由脚本作者在 DSL 里写（`for` 循环 + agent() + 判 null 重试）——引擎只提供原语不提供策略，这是「组合子小而正交」哲学。
+
+#### 17.2.5 Workflow 持久化
+
+双层：
+- **进程内 Cordis 事件**：workflow/start / phase / log / agent-start / agent-end / end（observe-only，payload 借用不可变快照，workflow/src/index.ts:36-90）。配套不变量（invariant.ts）校验 start/end 配对、agent-start/end 按 seq 配对、agentsStarted 覆盖所有观测。
+- **Session 日志事件**：tool-workflow 把顶层 run 投影进父 session（tool-workflow/run-start、agent-start、agent-end、run-end 四事件，log-only 不进模型历史），记录失败时降级为 disable recording 而不影响工具执行（index.ts:89-91）。
+- **不持久化脚本中间态**：run 崩溃即失，无 resume。脚本本身作为 tool call 参数已持久化在父 session 里，重跑即重放。
+
+#### 17.2.6 ralph 命名与固定脚本
+
+ralph 是「部署方拥有的固定循环」——模型只提供数据（objective/maxRounds），不能改 loop/provider/schema/handoff 校验（tool-ralph/index.ts:89-176 的 RALPH_SCRIPT）。每轮起一个 fresh child（provider 必须 `inheritsParentContext:false` 且支持 outputSchema），唯一跨轮载体是 ≤16384 字符的结构化 handoff：
+
+```js
+{ status: 'continue'|'complete'|'blocked',
+  summary, evidence[], nextSteps[], blocker }
+```
+
+三态校验极严：continue 需非空 nextSteps+空 blocker；complete 需非空 evidence+空 nextSteps+空 blocker；blocked 需非空 blocker。工作区(workspace)是长期记忆，child 上下文每轮作废。ralph 之名源于社区流传的 **"Ralph Wiggum" 技术**（辛普森角色名，2025 年在 Claude Code 生态流行）：用 bash 循环反复唤起**全新上下文**的 agent 处理同一目标，文件系统（而非对话历史）承载状态。本仓库与 LoadRunner 的 ralph 脚本无关——`.agents/notes/implemented/feature/2026-07-19-fresh-agent-ralph-workflow-tool.md` 明确：ralph pattern = 「repeatedly give the same objective to a completely fresh worker, use the shared workspace as long-term memory, and carry only a small explicit handoff until work completes or a limit is reached」。RALPH_META 内部名 `ralph-loop` 即此意。
+
+### 17.3 SubAgent 11 包矩阵
+
+#### 17.3.1 全景
+
+```
+packages/subagent/  (11 包)
+├── subagent/                    # 核心 seam:SubagentProvider 接口 + SubagentService + descriptor + depth + 投影
+├── subagent-acp/                # ACP 传输 provider
+├── subagent-claude-code/        # Claude Code 子进程 provider
+├── subagent-codex/              # Codex 子进程 provider
+└── subagent-dsh-sdk/            # DSH SDK 子进程 provider
+├── subagent-fork-in-process/    # fork 传输(进程内)
+├── subagent-spawn-in-process/   # spawn 传输(进程内)
+├── subagent-in-process-driver/  # 进程内 driver(驱动 fork/spawn)
+├── tool-subagent/               # LLM 工具「subagent」:一次性委派
+├── tool-subagent-control/       # LLM 工具「subagent_control」:catalog/枚举
+└── tool-subagent-report/        # ≤2KB 结果回填(防上下文爆炸)
+```
+
+#### 17.3.2 核心 seam（subagent/src）
+
+**SubagentProvider 接口**（types.ts:300-346）是所有传输的统一契约：
+
+```ts
+interface SubagentProvider {
+  name: string
+  capabilities: SubagentCapabilities  // 5 能力位
+  inheritsParentContext: boolean      // 描述性,非能力位
+  agentRouteDefaults?: {provider, model}
+  start(request): Promise<SubagentRun>          // 一次性
+  prepareContinuable?(request): Promise<ContinuableCreateSpec>  // 可续=能力即方法存在
+}
+```
+
+**5 能力位**（types.ts:86-92）：agentOptions/outputSchema/depthLimit/toolFilter/persona。能力位与请求选项一一对应，缺能力即拒绝（fail-loud，无静默降级）。`inheritsParentContext` 刻意做成**描述性字段**而非能力位——工具层用它生成真实措辞，服务不校验。
+
+**一次性 vs 可续（continuable）**：one-shot 的 provider.start 拥有 child 全生命周期；continuable 的 provider 只贡献 `ContinuableCreateSpec.seed`（是否种入父历史前缀），**后续轮次完全由 continuation manager 拥有**（prompt 入 child 自己的 inbox，不走 provider）。
+
+**父子通信协议**：没有直接的父↔子消息通道。父子通过三根线交互：
+1. **请求侧**：parent 的 tool call → tool-subagent → ctx.subagents.start → provider → child Agent
+2. **结果侧**：child settle → SubagentRun.result → tool-subagent 把 output 压缩回填给 parent 的 tool result
+3. **持久侧**：child 的 `subagent/descriptor` 事件 + parent 的 `subagent/start`/`subagent/end` 事件 + `parentSession` 头字段三方对账
+
+**descriptor 版本化**（descriptor.ts:48）：SUBAGENT_DESCRIPTOR_VERSION=3，故意快照显式字段而非 merge-extensible AgentOptions——防未预期字段让冷恢复静默失败。cold resume 信任 session header 的 `delegationDepth` 作为**单调下限**（depth.ts:28-36：`Math.max(header.delegationDepth, runtime.subagentDepth)`——恢复的 child 不能把自己伪装成顶层）。
+
+**depth 递归防护**（depth.ts）：`delegationDepthOf` 取 header 与 runtime 的 max；child depth = parent depth + 1；start 时若 `childDepth > maxDepth` 抛错。这是防无限下钻的硬闸。
+
+#### 17.3.3 传输矩阵（6 种)
+
+| 包 | 隔离级别 | inheritsParentContext | outputSchema | 典型用途 |
+|----|---------|----------------------|-------------|---------|
+| spawn-in-process | 同进程新 Agent | false（fresh） | ✓ | ralph 默认;普通委派 |
+| fork-in-process | 同进程,fork 语义 | false | ✓ | 同 spawn,路由不同 |
+| in-process-driver | — | — | — | 驱动 spawn/fork 的进程内 driver(驱动器不自己跑 child) |
+| acp | 跨进程 ACP 协议 | false | ✓ | 接外部 ACP Agent(如 Gemini CLI) |
+| claude-code | 子进程 claude CLI | false | ✗ | 复用 Claude Code 能力 |
+| codex | 子进程 codex CLI | false | ✗(wire.ts 做 JSON 抽取) | 复用 Codex 能力 |
+| dsh-sdk | 子进程 DSH SDK | false | ✓ | 独立 runtime 的同族 child |
+
+in-process 系列（spawn/fork）走 `agentRouteDefaults`；外进程系列(claude-code/codex/acp)各自做 wire 适配（如 subagent-codex/src/wire.ts 把 codex JSON 输出解析为 ContentBlock）。
+
+#### 11 包对外接口速查
+
+| 包 | 对外接口 | 作用 |
+|----|---------|------|
+| subagent | `ctx.subagents` (SubagentService)、SubagentProvider/Run/Result/Capabilities、descriptor fold | 核心 seam,注册/校验/投影 |
+| subagent-acp | provider 注册 `acp` | ACP bumper/writer→agent 适配 |
+| subagent-claude-code | provider 注册 `claude-code` | claude CLI 子进程 |
+| subagent-codex | provider 注册 `codex` | codex CLI 子进程 |
+| subagent-dsh-sdk | provider 注册 `dsh-sdk` | DSH SDK 子进程 |
+| subagent-fork-in-process | provider 注册 `fork` | 进程内 fork 传输 |
+| subagent-spawn-in-process | provider 注册 `spawn` | 进程内 spawn 通信 |
+| subagent-in-process-driver | 驱动器插件 | fork/spawn 的进程内 driver |
+| tool-subagent | LLM 工具 `subagent` | 一次性委派入口 |
+| tool-subagent-control | LLM 工具 `subagent_control` | catalog/list 枚举 |
+| tool-subagent-report | (内部)结果压缩回填 | ≤2KB 回填防爆炸 |
+
+#### 17.3.4 SubAgent 隔离与权限降级
+
+四层降权：
+1. **depth 递归上限**（depth.ts）—— header 单调下限 + maxDepth CAS
+2. **toolFilter**（ToolRestriction）—— child 创建窗口内 scoped `tools.restrict()`，被滤工具**从 prompt 消失且拒绝执行**（one visibility，非仅隐藏）
+3. **persona 遴选**—— per-child persona section shadowing deployment persona（同一 `{{…}}` 模板语义）
+4. **continuable 冷恢复**—— 只信任 descriptor 的显式字段（version 3），不信任 AgentOptions 全量
+
+#### 17.3.5 SubAgent 调度（goal-round-driver 关系）
+
+goal-round-driver 不调度 SubAgent——它只驱动**同 session** 续轮。SubAgent 的调度由 SubagentService 的 provider 路由 + tool-subagent 的 model-selection 决定：
+- **model-selection.ts**（tool-subagent/src）：基于 settings 的 provider/model 路由选择（model-selection-settings.ts），含 list-models 枚举
+- **capacity**：providers 文档声明「shared capacity controller may delay an operation but must not couple its settlement or cleanup to a sibling」——容量控制器可延迟但不能耦合兄弟 run 的结算
+
+### 17.4 ACP/A2A 协议矩阵
+
+#### 17.4.1 ACP（Agent Client Protocol）
+
+`packages/acp/` 提供 ACP 服务端实现（harness 作为 ACP agent 被 IDE 客户端驱动）。核心文件：
+- `acp/src/agent-side/`—— harness 充当 ACP agent（被动方），接收 agent侧 buffe/writer
+- `subagent-acp` 反向复用 ACP 作为**出站**传输（harness 充当 ACP client，把外部 ACP agent 当 SubAgent 用）——一协议双向复用
+
+ACP 消息生命周期：initialize（agent 提述能力/客户端能力）→ session/new → session/prompt → session/update 流（agent_message_chunk/tool_call/plan 等 update 类）→ session/end（stopReason：end_turn/aborted/max_tokens/refusal）。harness 把 ACP update 流映射为 harness 的 ContentBlock 流，stopReason 直接对齐 SubagentStopReasonMap 的 5 态。
+
+#### 17.4.2 Typert 协议层
+
+`packages/typert/` 是 harness 的**宿主↔浏览器** RPC 层（不是 Agent 间协议）。`TypertRemoteService`（GoalService 继承它）+ `@Remote('edit')` 装饰器把 service 方法暴露到浏览器端；`TypertRemoteFailure{code,message,details}` 载体保稳定 code。goal/subagent control 都走这层（control.ts:64-70 的 rejectControl 就是包 TypertRemoteFailure）。
+
+#### 17.4.3 A2A / E2A / A2UI
+
+- **A2A**：本仓库**无独立 A2A 包**。Agent 间协作实际由 subagent 跨进程传输（ACP/claude-code/codex/dsh-sdk）承担，A2A 语义（父→子委派+结果回填）已内嵌在 SubagentProvider 契约里。若需标准 A2A（agent card/任务委托），需外接（jiuwenswarm 的 A2A 实现可参考）。
+- **E2A**：同上，无独立实现——「external agent to agent」场景被 ACP+SubAgent 组合覆盖。
+- **A2UI**：同上，无独立实现。
+
+> 结论：deepseek-harness 的协议重心是 **Typert（宿主↔浏览器）+ ACP（IDE↔harness）+ SubagentProvider seam（harness↔子代理）**，三层各管一段。真正意义的跨厂商 Agent 网络协议（A2A/A2UI）不是本仓库的目标。
+
+### 17.5 对 laew 的借鉴（P0/P1/P2）
+
+#### 17.5.1 Goal 域模型借鉴
+
+| 级 | 借鉴点 | laew 现状与落点 |
+|----|--------|----------------|
+| **P0** | **durable phase 4 态 + process-local activation 2 态分离** | laew 的 Yolo 分类是即时性的一次决策，无目标续航概念。可给 Main-Work/SubAgent 引入 Goal{active/paused/blocked/complete} + armed/disarmed，把「任务三档」升级为「目标状态机」；activation 不持久化、进程重启自动 disarmed，防重启自动烧钱 |
+| **P0** | **maxGoalRounds 轮预算 + 消息 source 归属计数** | laew 无轮次上限。引入 `GoalMessageSource{goalId,revision,round}` 写进 user 消息 metadata，重放 session 即审计每轮；耗尽 → block{code:'round-limit'}，人类 resume 才能继续 |
+| **P0** | **CAS(GoalRef revision) + 全快照事件 + 重放校验** | laew 的 session_memory 是文本摘要，无结构化状态。goal/change 事件带完整快照+revision 单调，重放 fold 再验转换合法性——laew 可在 SQLite events 表落同构事件，获得免费的崩溃恢复+审计 |
+| **P1** | blocked 携带 `{code,message}` 机器可路由 reason | laew 失败回流只有文本。code 用 lower-kebab-case（round-limit/queue-failed/prompt-rejected），监控与自动策略可路由 |
+| **P1** | 全快照 last-wins 投影 | laew 的投影重建可采全快照而非 delta，简化 fold |
+| **P2** | defaultMaxGoalRounds=256 配置化 | laew 配置在 SQLite,可直接加 settings 键 |
+
+#### 17.5.1.1 三档隔离正交性表（Goal vs Workflow vs SubAgent）
+
+| 维度 | Goal | Workflow | SubAgent |
+|------|------|----------|----------|
+| 隔离 | 同 session | worker+vm | 子 session/子进程 |
+| 续航 | maxGoalRounds | 脚本自然结束 | one-shot/continuable |
+| 持久化 | session 事件 | 父 session 投影 + Cordis 事件 | child session + descriptor |
+| 适合 | 同上下文长期任务 | 大 fan-out 编排 | 上下文隔离委派 |
+
+#### 17.5.2 Workflow 脚本 DSL 借鉴
+
+| 级 | 借鉴点 | laew 落点 |
+|----|--------|----------|
+| **P0** | **5 组合子极简 DSL**（agent/parallel/pipeline/phase/log + args） | laew 的 Main-Work 拆 WorkFlow 是隐式的字符串列表。可让 Main-Work 产出 DSL 脚本（甚至直接 JS 子集）驱动编排，替代隐式流程列表——`pipeline(items, ...stages)` 无屏障语义比全屏障 parallel 更高效 |
+| **P0** | **fatal/非fatal 二分 + per-item null** | laew 的 QC 失败回流无结构。普通失败→null 由脚本 filter；fatal（caps/parse/unsupport）→杀整个 run。`WorkflowError.fatal` 字段+instanceof 闸门可直接抄 |
+| **P0** | **Worker Thread + vm 隔离 + Ready/Go 门** | laew 若引入脚本编排，Rust 侧对应「独立 tokio task + 受限解释器」。可直接借鉴：编译先于执行、同步超时、取消在每个 hook 边界检查、grace 强杀。Ready/Go 门解决取消与启动竞速 |
+| **P1** | materializeFromRealm 纯 JSON 边界 | laew 工具结果回填可采纯 JSON 白名单(拒 bigint/symbol/function/循环/稀疏数组/proto 污染) |
+| **P1** | meta 块独立于脚本体（数据非代码） | laew 的 plan 文件可拆 plan-meta(JSON)+plan-body,meta 做持久化键 |
+| **P1** | AGENT_CAP/ITEM_CAP 双上限 | runaway 脚本保险丝：总 agent 数 + 单 parallel/pipeline 条目数 |
+| **P2** | workflow 事件配对不变量 | start/end、agent-start/end seq 配对校验,telemetry 完整性 |
+| **P2** | schema 子集白名单（禁 pattern/format/数值边界） | laew 结构化输出子集同理,便于双协议翻译 |
+
+#### 17.5.3 SubAgent 11 包借鉴
+
+| 级 | 借鉴点 | laew 落点 |
+|----|--------|----------|
+| **P0** | **SubagentProvider seam + 5 能力位** | laew 的 SubAgent-Work 是硬编码 Agent。定义 `trait SubagentProvider { capabilities; start(); }` + 能力位校验（缺能力即拒绝非静默降级），spawn/fork/外部 CLI(claude/codex) 都能插进来 |
+| **P0** | **SUBAGENT_DESCRIPTOR_VERSION=3 显式快照** | laew 的 agent_memory 可版本化，unknown 字段拒绝（防 schema 演进静默失败） |
+| **P0** | **depth 单调下限 + maxDepth CAS** | laew 无递归防护。child depth=parent+1,header 单调下限防恢复伪装。Main-Work→SubAgent 已是 1 层，防 SubAgent 再委派失控 |
+| **P1** | one-shot vs continuable 二分（能力即方法存在） | laew SubAgent 可加 continuable 模式:child 留活,后续 prompt 走 child inbox（省去重复冷启） |
+| **P1** | toolFilter one-visibility(从 prompt 消失且拒绝执行) | laew 权限降级可采同语义,防「隐藏但仍可调」漏洞 |
+| **P1** | tool-subagent-report ≤2KB 回填 | laew 工具结果回填上限可同设,防上下文爆炸 |
+| **P2** | catalogView 以 live registry 采样 durable 列表 | laew 的 session 列表可采「持久列表×运行时状态」投影 |
+| **P2** | diagnostic 4096 字节 + 脱敏约束 | laew 错误回填加同款字节上限与脱敏约定 |
+
+#### 17.5.4 ACP/Typert 借鉴
+
+| 级别 | 借鉴点 | laew 落点 |
+|------|--------|----------|
+| P1 | Typert `@Remote` 装饰器 + TypertRemoteFailure{code,message,details} | laew TUI↔engine 可定义稳定的 code 化错误协议,子屏操作失败可路由 |
+| P2 | ACP session/update 流式 update 词汇表 | laew 流式渲染层可采 chunk 词汇表(agent_message_chunk/tool_call 分型) |
+| P2 | ACP stopReason 5 态对齐 SubagentStopReasonMap | laew 的 turn 结束原因可枚举化,便于 QC/回流 |
+
+#### 17.5.5 综合落地路线
+
+**P0（立即可做，laew 现有 SQLite 即可承载）**：
+1. Goal 状态机落库：`goals` 表（id/session_id/objective/phase/max_goal_rounds/rounds_started/revision），phase 4 态 + activation 内存态。Yolo 分类 hard 任务时 create goal，Main-Work 每轮完成后 rounds+1，耗尽 block。
+2. 递归防护：`agent_memory` 加 depth 字段，SubAgent 派生时 parent+1，超 maxDepth 拒绝。
+3. SubagentProvider trait 化（Rust）：capabilities 位 + start()，先把内置 SubAgent-Work 实现为 spawn provider。
+
+**P1（需要 DSL 决策）**：
+4. Workflow DSL：优先考虑直接复用「agent/parallel/pipeline/phase/log」5 词表作为 Plan/Main-Work 的 WorkFlow 表达——Main-Work 输出 DSL 脚本而非自然语言流程列表，调度器解释执行。fatal/非fatal 二分同步落地。
+5. 失败回流 code 化：round-limit/queue-failed/prompt-rejected 同款 lower-kebab-case 词汇表。
+
+**P2（远期）**：
+6. continuable SubAgent（child 留活复用）。
+7. Worker 级隔离（Rust 侧为受沙箱的解释器或 WASM）。
+
+### 17.6 本轮小结
+
+三个域共享同一种架构气质：**seam(接口)与 provider(实现)分离、全快照事件溯源、能力位 fail-loud、durable/process-local 二分、防失控保险丝（maxGoalRounds/AGENT_CAP/maxDepth）、固定脚本防模型篡改（ralph）**。Goal 用最少的 4 态状态机+轮预算解决「同会话续航」；Workflow 用 5 组合子+worker/vm 隔离解决「fan-out 编排」；SubAgent 用 11 包 provider 矩阵解决「隔离委派」。对 laew 最有价值的单点突破是 **Goal 状态机（P0）**——它能把 laew 的「三档分类」升级为可审计、可续航、可人工干预的目标驱动循环，且 SQLite events 表即可承载。

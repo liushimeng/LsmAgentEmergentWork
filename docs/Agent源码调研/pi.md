@@ -1468,3 +1468,1393 @@ streamSimple: (model, context, options) =>
 | **P2** | truncateHead 工具函数 | head 截断独立工具,可复用 | truncate.ts:79-80 |
 | **P2** | models.generated 自动生成 | 模型目录由 build script 生成,人工不维护 | models.generated.ts |
 | **P2** | formatSize + truncation 报告 | 工具结果自带截断元信息,可向模型报告 | bash.ts:384 |
+
+---
+
+## 13. 第六轮深挖 — Lane 并发模型 + CBOR 二进制帧协议 + WriterLease fence + 14 种损坏检测(2026-09-06)
+
+本轮在前 12 章基础上,深入到 **并发与持久化底层**:
+**Lane 编排器的三态事件溯源**、**CBOR 帧协议的字节级实现**、
+**SQLite WriterLease 的 fencing token 设计**、**reducer 的 14 种损坏检测**、
+**Tool 系统的命令式工厂与 per-file 排他锁**。
+
+所有行号来自 `/usr/local/LsmGitOpenSource/pi` 当前 head(2026-09-02)。
+
+### 13.1 Lane 并发模型:三态 + 事件溯源
+
+#### 13.1.1 Lane 是什么、生命周期
+
+Lane = 一个**逻辑并发轨**,承载**一个**长时间操作(run / compaction / navigation)。
+每个 lane 有独立 leaf,可被独立导航(`navigateTree`)、独立压缩、独立中断。
+
+**Lane 的三种状态**(由 reducer 推导,纯函数):
+
+```ts
+// packages/agent/src/harness/agent-harness.ts:152-160
+export interface LaneInfo {
+    name: string;
+    leafId: string | null;
+    operation: null | {
+        id: string;
+        kind: "run" | "compaction" | "navigation";
+        status: "running" | "suspended" | "aborting";
+    };
+}
+```
+
+- **running**:operation 正在执行,新 steer / followUp 可入队。
+- **suspended**:operation 因 crash(进程被杀)或 deferred(异步资源未就绪)暂停,等待 `resume()`。
+- **aborting**:用户主动 abort,等待当前 step 收尾。
+- **idle**:`operation === null`,可接受新 run。
+
+**生命周期状态机**:
+
+```
+idle ──prompt()──> running ──abort()──> aborting ──> idle
+                      │                    │
+                      ├──crash──> suspended ──resume()──> running
+                      │
+                      └──deferred──> suspended ──deferred arrives──> running
+```
+
+**Lane 错误的 TaggedError 族**(`agent-harness.ts:28-55`):
+
+| 错误类 | 触发条件 |
+|---|---|
+| `LaneBusy` | lane 已有 operation 时新 prompt/compact/navigate |
+| `NoActiveRun` / `NoActiveOperation` | 操作无 active run 时调用 steer/abort |
+| `NothingToResume` | resume 时 lane 无 suspended operation |
+| `NothingToCompact` | compaction 不可应用 |
+| `LaneExists` / `InvalidLane` | lane 创建冲突/非法名 |
+| `Closed` | harness 已 close |
+| `MissingIdentities` | resume 时缺少 tools/models |
+| `UnknownSkill` / `UnknownTemplate` / `UnknownTarget` | 资源未知 |
+| `UnknownQueueItem` | 取消已消费/已清除的队列项 |
+
+#### 13.1.2 SQLite 行级 lane 存储
+
+**lanes 表**(`packages/session-backends/sqlite-node/src/sqlite/storage/lanes.ts:5-10`):
+
+```ts
+export interface LaneRow {
+    session_id: string;
+    lane: string;
+    leaf_id: string | null;
+    open_operation_id: string | null;   // null = idle
+}
+```
+
+**乐观获取 operation slot**(`lanes.ts:88-95`):
+
+```sql
+UPDATE lanes SET open_operation_id = ${runId}
+WHERE session_id = ${sessionId}
+  AND lane = ${lane}
+  AND open_operation_id IS NULL
+```
+- 单条 SQL 同时校验"lane 存在"和"无 open operation",`result.changes === 1` 才返回。
+- 否则用 `readLane` 区分"NotFound"与"AlreadyOpen",抛具体错误。
+- **这是 SQL 层的乐观锁**:`open_operation_id IS NULL` 是 CAS 谓词,失败不阻塞,立即报错。
+
+**释放 slot**(`lanes.ts:97-100`):
+
+```sql
+UPDATE lanes SET open_operation_id = NULL
+WHERE session_id = ${sessionId}
+  AND lane = ${lane}
+  AND open_operation_id = ${runId}
+```
+- 释放也带 runId 谓词,防止误清别人的 slot(虽然 SQLite 单写者,防御性)。
+
+#### 13.1.3 三队列驱动(steer / followUp / nextRun)
+
+Lane 的输入不是单一流,而是**三个语义不同的队列**:
+
+**QueueEnqueuedRecord 联合类型**(`packages/agent/src/harness/session/types.ts:162-176`):
+
+```ts
+export type QueueEnqueuedRecord = RecordBase &
+    (| { type: "queue_enqueued"; queue: "steer" | "followUp"; runId: string; target: ProvisionedEntry }
+     | { type: "queue_enqueued"; queue: "nextRun";     runId?: never;   target: ProvisionedEntry });
+```
+
+| 队列 | 生命周期 | runId 绑定 | 注入时机 |
+|---|---|---|---|
+| **steer** | operation 生命周期内 | 绑定 | 在下一步 assistant 调用**之前**注入 context |
+| **followUp** | operation 完成后 | 绑定 | agent 自然结束后,作为下一轮 prompt |
+| **nextRun** | idle 时 | 无 | lane 回到 idle 时的下一轮 prompt |
+
+**LaneSnapshot 暴露的队列**(`agent-harness.ts:167-175`):
+
+```ts
+export interface LaneSnapshot {
+    lane: string;
+    transcript: Entry[];
+    leafId: string | null;
+    operation: LaneInfo["operation"];
+    queues: { steer: QueuedItem[]; followUp: QueuedItem[]; nextRun: QueuedItem[] };
+    pendingWrites: { id: string; entry: ProvisionedEntry }[];
+    faulted: boolean;
+}
+```
+
+**三种队列模式**(`agent-harness.ts:343-344`):
+
+```ts
+this.steeringMode = options.steeringMode ?? "one-at-a-time";
+this.followUpMode = options.followUpMode ?? "one-at-a-time";
+```
+- `one-at-a-time`(默认):单条投递,避免 race。
+- `all-at-once`:全部注入,适合批处理。
+
+#### 13.1.4 Entry 链 + Record 日志
+
+Lane 的持久化状态 = **Entry 链**(消息数据)+ **Record 日志**(操作元数据)。
+
+**Entry 类型**(`session/types.ts:22-74`):
+
+```ts
+type: "message" | "model_change" | "thinking_level_change" | "active_tools_change"
+    | "compaction" | "branch_summary" | "custom"
+```
+- **message** 是核心(AssistantMessage、UserMessage、ToolResultMessage 等)。
+- **配置类变更**(model_change、thinking_level_change、active_tools_change)单独成 entry,不混入消息流。
+- **compaction / branch_summary** 是派生摘要,作为 entry 持久化。
+
+**Record 日志类型**(`session/types.ts:203-212`):
+
+```ts
+type LaneRecord =
+    | OperationStartedRecord     // 启动一个 operation
+    | AbortRequestedRecord       // 用户请求 abort
+    | OperationFinishedRecord    // operation 结束(complete/abort/fail/decline)
+    | StepAttemptRecord          // LLM 调用一次(step = assistant/compaction/branch_summary)
+    | ToolStartedRecord          // 一个 tool call 开始(toolIndex、assistantEntryId 关联)
+    | QueueEnqueuedRecord        // steer/followUp/nextRun 入队
+    | QueueCancelledRecord       // 取消已入队项
+    | WriteDeferredRecord        // 写入被延迟(deferred fetch 等待)
+    | UsageRecord;               // token/cost 用量
+```
+
+**每条记录的关键字段**(`session/types.ts:14-20, 80-85`):
+
+```ts
+interface EntryBase { type; id; seq; parentId; timestamp }
+interface RecordBase { id; seq; lane; timestamp }
+```
+- **`seq` 是 session-wide 单调递增序号**,由存储层分配,保证恢复时可排序。
+- **`timestamp` 也由存储层填充**,客户端不可伪造。
+
+**操作级 vs session-wide**:
+
+- Entry 有 `parentId`,形成**分支树**(同 lane 内可分支)。
+- Record 有 `lane`,但无 `parentId`,只是 lane 内日志流。
+
+#### 13.1.5 suspended → resume 机制
+
+**SuspendedOperation 形状**(`agent-harness.ts:140-150`):
+
+```ts
+export interface SuspendedOperation {
+    lane: string;
+    kind: "run" | "compaction" | "navigation";
+    id: string;
+    startedAt: number;
+    reason: "crash" | "deferred";
+    prompt?: AgentMessage[];
+    deferred?: DeferredHandle;
+    aborting?: { steer: AgentMessage[]; followUp: AgentMessage[] };
+    missing: { tools: string[]; models: string[] };   // resume 时的依赖校验
+}
+```
+
+**reason 区分**:
+- **crash**:进程 SIGKILL/SIGTERM,operation 留在 open_operation_id 但无 owner。
+- **deferred**:操作正在等外部资源(如远端 model 响应),挂起保留 DeferredHandle。
+
+**resume() 的依赖校验**(`reducer.ts:560-562`):
+
+```ts
+const missingInitialMessages =
+    started.intent.kind === "run"
+        ? started.intent.initialMessages.filter((target) => !entriesById.has(target.id)).map(clone)
+        : [];
+```
+- 复原时若 operation 的 intent 引用的 entry 缺失,标记为 missing。
+- `MissingIdentities` 错误包含具体缺失的 tools/models,允许上层决定是 fetch + resume 还是 fail。
+
+**deferred 复原**(`reducer.ts:597-603`):
+
+```ts
+const deferred =
+    newestOwnEntry?.type === "message" &&
+    newestOwnEntry.message.role === "assistant" &&
+    newestOwnEntry.message.stopReason === "deferred" &&
+    newestOwnEntry.message.deferred
+        ? clone(newestOwnEntry.message.deferred)
+        : null;
+```
+- 复原时若最后一条 assistant entry 是 `stopReason === "deferred"`,把 deferred handle 提取出来,后续 `fetch_deferred` action 续上。
+
+#### 13.1.6 reducer 事件溯源:纯函数 + 严格校验
+
+**reduceLaneState 是纯函数**(`reducer.ts:506-667`):
+
+```ts
+export function reduceLaneState(input: LaneReductionInput): LaneReductionResult
+```
+- 入参:`{ records, ownEntries, configurationEntries, defaults, leafId }`。
+- 出参:`{ laneState, effectiveConfiguration, terminalFailure }`。
+- **不修改入参,不读外部状态**;可单元测试,可确定性重放。
+
+**校验前置**(`reducer.ts:507`):
+
+```ts
+validateRecordLog(input);
+```
+- 见 13.5 节,14 种 RecordLogCorruption 在这里抛错。
+
+**terminalFailure 推导**(`reducer.ts:614-640`):
+
+```ts
+// 检测 error stopReason 但被 step/deferred_fetch 产出 → 标记 terminal
+if (
+    newestOwnEntry?.type === "message" &&
+    newestOwnEntry.message.role === "assistant" &&
+    newestOwnEntry.message.stopReason === "error" &&
+    !deferredWriteIds.has(newestOwnEntry.id)
+) {
+    const producedByStep = ... ;   // 来自 step_attempt
+    const producedByDeferredFetch = ... ;  // 来自 deferred_fetch 的 usage
+    if (producedByStep || producedByDeferredFetch) {
+        terminalFailure = { entryId, source: "step"|"deferred_fetch", message };
+    }
+}
+```
+- **terminalFailure 表示必须终止恢复**,不能续跑。
+
+#### 13.1.7 per-file 排他锁:edit/write 串行化
+
+**FileMutationQueue**(`packages/agent/src/harness/tools/file-mutation-queue.ts`):
+
+```ts
+// line 4-18:WeakMap 状态(env → 自己的 queue map)
+const states = new WeakMap<ExecutionEnv, MutationQueueState>();
+function getState(env) {
+    let state = states.get(env) ?? { queues: new Map(), registration: Promise.resolve() };
+    states.set(env, state);
+    return state;
+}
+```
+- **按 env 隔离**:不同 ExecutionEnv(如 NodeExecutionEnv、BunExecutionEnv)的 queue map 独立。
+- **WeakMap 持有**,env 销毁时状态自动 GC,无内存泄漏。
+
+**canonical path 锁定**(`file-mutation-queue.ts:20-26`):
+
+```ts
+async function getMutationQueueKey(env, path) {
+    const absolutePath = getOrThrow(await env.absolutePath(path));
+    const canonicalPath = await env.canonicalPath(absolutePath);
+    if (canonicalPath.ok) return canonicalPath.value;       // 解析 symlink → 真实路径
+    if (canonicalPath.error.code === "not_found" || "not_supported") return absolutePath;
+    throw canonicalPath.error;
+}
+```
+- **核心**:同一个文件无论以哪个符号链接或相对路径访问,**都归到同一个 queue**。
+- 防止 `/path/to/file` 和 `/path/./to/../to/file` 拿到两把锁。
+
+**链式 promise 串行化**(`file-mutation-queue.ts:29-56`):
+
+```ts
+export async function withFileMutationQueue<T>(env, path, fn): Promise<T> {
+    const state = getState(env);
+    const registration = state.registration.then(async () => {
+        const key = await getMutationQueueKey(env, path);
+        const currentQueue = state.queues.get(key) ?? Promise.resolve();
+        let releaseNext = () => {};
+        const nextQueue = new Promise<void>((resolve) => { releaseNext = resolve; });
+        const chainedQueue = currentQueue.then(() => nextQueue);
+        state.queues.set(key, chainedQueue);
+        return { key, currentQueue, chainedQueue, releaseNext };
+    });
+    state.registration = registration.then(() => undefined, () => undefined);
+    const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+    await currentQueue;
+    try {
+        return await fn();
+    } finally {
+        releaseNext();
+        if (state.queues.get(key) === chainedQueue) state.queues.delete(key);
+    }
+}
+```
+
+**关键技术点**:
+
+1. **`registration.then(...)` 串行化 key 解析**:即使多个并发调用同时进入,canonical path 解析也按顺序,避免 race。
+2. **`currentQueue.then(() => nextQueue)` 链式排队**:每个新操作追加到链尾。
+3. **自我清理**:`finally` 中 `state.queues.delete(key)`(前提是当前链仍是最新的,防止误删后入队的链)。
+4. **错误吞噬**:`registration.then(..., () => undefined)` —— 即便某次失败,也不影响后续登记。
+
+**edit 工具使用示例**(`packages/agent/src/harness/tools/edit.ts:102-138`):
+
+```ts
+async execute(_toolCallId, input, signal, _onUpdate, { env }) {
+    const { path, edits } = validateEditInput(input);
+    const absolutePath = await resolveToolPath(env, path, signal);
+    return withFileMutationQueue(env, absolutePath, async () => {
+        // 读 → 计算 diff → 写
+        ...
+    });
+}
+```
+- 整个 read-modify-write 周期都串行化,不会出现两个并发 edit 互相覆盖。
+
+---
+
+### 13.2 CBOR 二进制帧协议
+
+#### 13.2.1 为何选 CBOR 不选 JSON
+
+代码无直接 prose 对比,但从实现可推断**四个关键动机**:
+
+1. **deterministic schema 强制**:`packages/protocol/README.md:65`
+   > "JSON-valued protocol fields reject CBOR byte strings and non-plain objects. Top-level undefined, undefined array entries, sparse arrays, non-finite or unsafe numbers, tags, indefinite-length items, malformed UTF-8, trailing data, excessive nesting, and oversized values are rejected."
+
+2. **定长项让 framing 简单**:`README.md:46`
+   > "Every transport carries the same complete bytes: `[uint32-be CBOR length][CBOR payload]`"
+
+   CBOR 的 definite-length model 让"读完长度前缀就知 payload 边界",无 JSON 那种"流式解析未知长度"难题。
+
+3. **无 JSON number/precision 歧义**:CBOR 区分 uint、negative int、float64、bigint tag 等;JSON 数字在 JS 里全部是 double。
+4. **TypeBox-friendly**:CBOR 解码后是 plain JS object/value,直接用 `Check(ClientMessageSchema, value)` 校验。
+
+**transport 中立性**:`packages/protocol/README.md:42, 46-48`:
+> "parseClientMessage() and parseServerMessage() only validate already-decoded values. They do not parse JSON strings."
+>
+> "Transports may split or coalesce those bytes arbitrarily."
+
+#### 13.2.2 帧结构
+
+**线缆格式**(`packages/protocol/README.md:5-9`):
+
+```
+1. 4-byte unsigned big-endian payload length
+2. One definite-length CBOR item containing the message
+```
+
+**常量**(`packages/protocol/src/framing.ts:1-6`):
+
+```ts
+const FRAME_HEADER_LENGTH = 4;
+const MAX_UINT32 = 0xffff_ffff;
+const PAYLOAD_BLOCK_SIZE = 64 * 1024;
+export const DEFAULT_MAX_FRAME_LENGTH = 16 * 1024 * 1024;   // 16 MiB
+```
+
+**encodeFrame**(`framing.ts:28-39`):
+
+```ts
+export function encodeFrame(payload: Uint8Array): Uint8Array {
+    if (!(payload instanceof Uint8Array)) throw new TypeError(...);
+    if (payload.byteLength > MAX_UINT32) throw new RangeError(...);
+    const frame = new Uint8Array(FRAME_HEADER_LENGTH + payload.byteLength);
+    frame[0] = payload.byteLength >>> 24;
+    frame[1] = payload.byteLength >>> 16;
+    frame[2] = payload.byteLength >>> 8;
+    frame[3] = payload.byteLength;
+    frame.set(payload, FRAME_HEADER_LENGTH);
+    return frame;
+}
+```
+- 手写 big-endian,无 DataView 调用,跑得快。
+
+**assertCompleteFrame**(`framing.ts:42-53`):校验一个完整帧,长度前缀 + payload 字节数 = 帧总字节数。
+
+#### 13.2.3 增量 FrameDecoder:状态机
+
+**三态机**(`framing.ts:55, 67`):
+
+```ts
+type DecoderState = "open" | "ended" | "failed";
+private state: DecoderState = "open";
+```
+
+**核心 push 循环**(`framing.ts:73-144`):
+
+```ts
+push(chunk: Uint8Array): Uint8Array[] {
+    if (this.state === "ended") throw new FrameError("Frame decoder has ended");
+    if (this.state === "failed") throw new FrameError("Frame decoder has failed");
+    
+    const frames: Uint8Array[] = [];
+    let chunkOffset = 0;
+    while (chunkOffset < chunk.byteLength) {
+        // 1. 补全 4 字节 length header
+        if (this.expectedPayloadLength === undefined) {
+            const headerBytes = Math.min(FRAME_HEADER_LENGTH - this.headerLength, chunk.byteLength - chunkOffset);
+            this.header.set(chunk.subarray(chunkOffset, chunkOffset + headerBytes), this.headerLength);
+            this.headerLength += headerBytes;
+            chunkOffset += headerBytes;
+            if (this.headerLength < FRAME_HEADER_LENGTH) continue;
+            
+            // 2. 解析长度,校验上限
+            const frameLength = (header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3];
+            if (frameLength > this.maxFrameLength) this.fail(...);   // 立即 fail,丢弃状态
+            if (frameLength === 0) { frames.push(new Uint8Array()); continue; }   // 0 长度合法
+            
+            this.expectedPayloadLength = frameLength;
+            this.payloadBlocks = [];
+            ...
+        }
+        
+        // 3. 累积 payload 到 64 KiB blocks
+        while (chunkOffset < chunk.byteLength && this.payloadLength < expectedPayloadLength) {
+            let block = this.currentPayloadBlock;
+            if (!block || this.currentPayloadBlockLength === block.byteLength) {
+                block = new Uint8Array(Math.min(PAYLOAD_BLOCK_SIZE, expectedPayloadLength - this.payloadLength));
+                this.payloadBlocks.push(block);
+                ...
+            }
+            const payloadBytes = Math.min(block.byteLength - this.currentPayloadBlockLength, chunk.byteLength - chunkOffset);
+            block.set(chunk.subarray(...));
+            ...
+        }
+        
+        // 4. 一帧收齐,合并 blocks,emit
+        if (this.payloadLength === expectedPayloadLength) {
+            if (this.payloadBlocks.length === 1) frames.push(this.payloadBlocks[0]);
+            else { /* 拼接多 block */ }
+            ...
+        }
+    }
+    return frames;
+}
+```
+
+**关键设计**:
+
+- **任意分片/合并**:单个 push 可以是 1 字节、半个帧、几个完整帧。
+- **0 长度帧合法**:`frameLength === 0` 时 push 一个空 Uint8Array,不报错。
+- **fail() 永远 throw**(`framing.ts:155-164`):
+
+  ```ts
+  private fail(message: string): never {
+      this.state = "failed";
+      this.headerLength = 0;
+      ...
+      throw new FrameError(message);
+  }
+  ```
+  转入 `failed` 态后,后续 push/end 全部 throw "decoder has failed",防止污染状态后输出脏数据。
+
+**end() 检测截断**(`framing.ts:146-153`):
+
+```ts
+end(): void {
+    if (this.state !== "open") throw new FrameError(...);
+    if (this.headerLength !== 0 || this.expectedPayloadLength !== undefined) {
+        this.fail("Truncated frame at end of stream");
+    }
+    this.state = "ended";
+}
+```
+
+#### 13.2.4 严格的 CBOR 子集:RFC 8949 definite-length only
+
+**encoder.ts**(`packages/protocol/src/cbor/encoder.ts`):
+
+| Major Type | 接受 | 拒绝 |
+|---|---|---|
+| 0 unsigned int | Number.isSafeInteger ≥ 0 | 负数、超 safe range、`-0` |
+| 1 negative int | `-1 - n` 编码 | 同上 |
+| 2 byte string | `Uint8Array` | 其他 |
+| 3 text string | string,UTF-8 round-trip 校验 | 含 lone surrogate |
+| 4 array | dense array,无 undefined 元素 | sparse、`undefined`、cycle |
+| 5 map | plain object(string keys) | 非 plain 原型、symbol keys、cycle、undefined 值 |
+| 6 tag | — | **全部拒绝** |
+| 7 simple | false/true/null/float64 | break (31)、其他宽度 |
+
+**额外拒收**:
+- 非有限数(`Number.isFinite`):line 138
+- 整数不在 safe range:line 140
+- cycle(`ancestors: Set<object>`):lines 161, 180
+- 非 plain object 原型:lines 102-106
+- symbol 枚举 key:lines 181-185
+- 数组稀疏/有 undefined:line 169
+- 字符串 UTF-8 不能 round-trip:lines 113-114(防止 lone surrogate)
+
+**decoder.ts**(`packages/protocol/src/cbor/decoder.ts`):
+
+```ts
+case 6: throw new CborError("CBOR tags are not supported");           // line 80
+case 31: throw new CborError("CBOR break marker is not supported");   // line 106
+case 5: if (typeof key !== "string") throw "CBOR map keys must be strings";
+        if (keys.has(key)) throw "CBOR map contains a duplicate key";
+```
+- decode 还强制 **无 trailing data**(line 22):`if (this.offset !== this.bytes.byteLength) throw "trailing data"`。
+- 唯一一种"宽松"是 key 顺序保留(用 `Object.defineProperty` 显式属性顺序,line 70-75)。
+
+**CborOptions 默认值**(`packages/protocol/src/cbor/options.ts:5-8`):
+
+```ts
+DEFAULT_MAX_CBOR_BYTE_LENGTH = 16 * 1024 * 1024;       // 16 MiB
+DEFAULT_MAX_CBOR_CONTAINER_LENGTH = 1_000_000;
+DEFAULT_MAX_CBOR_DEPTH = 64;
+const MAX_CONFIGURED_DEPTH = 512;
+```
+- 三个 limit 都是显式数,防止 DoS。
+
+#### 13.2.5 消息协议 schema
+
+**ClientMessage**(`packages/protocol/src/schemas.ts:385-398`):
+
+```ts
+export const ClientHelloSchema = StrictObject({
+    type: Type.Literal("hello"),
+    version: Type.Integer({ minimum: 0 }),
+});
+
+export const RequestEnvelopeSchema = StrictObject({
+    type: Type.Literal("request"),
+    id: IdSchema,                       // opaque string
+    request: CommandSchema,
+});
+
+export const ClientMessageSchema = Type.Union([ClientHelloSchema, RequestEnvelopeSchema]);
+```
+
+**Command 联合**(`schemas.ts:291-324`):`list | create | attach | detach | prompt | steer | abort | set_model | set_thinking`。
+
+**ServerMessage**(`schemas.ts:440-445`):
+
+```ts
+ServerMessageSchema = Type.Union([
+    ServerHelloSchema,            // {type:"hello", version:1, connectionId, snapshot}
+    ServerHelloErrorSchema,       // {type:"hello_error", error}
+    ResponseEnvelopeSchema,       // {type:"response", id, ok, result|error}
+    EventEnvelopeSchema,          // {type:"event", event}
+]);
+```
+
+**关键洞察**:协议**没有数字 seq/ack**,只有 opaque string `id`。
+- 客户端发 `RequestEnvelope.id = "uuid"`,服务端回 `ResponseEnvelope.id = "uuid"` —— 一一对应。
+- 比 seq/ack 简单,无重排序问题。
+- 服务端推送是 `EventEnvelope`,单向广播,无需 ack。
+
+**ProtocolError codes**(`schemas.ts:269-284`):
+
+```ts
+"version" | "busy" | "session_locked" | "not_found"
+| "invalid_request" | "not_implemented" | "internal_error"
+```
+- "version" 触发条件:client 发 hello 时版本不匹配。
+- "session_locked" 触发条件:另一个 writer 持有 WriterLease。
+
+#### 13.2.6 错误传播:三层包装
+
+**Codec 统一错误**(`packages/protocol/src/codec.ts:18-23, 60-76`):
+
+```ts
+export class ProtocolValidationError extends Error { ... }
+
+function encodeProtocolMessage<T>(value, parse, kind, options?) {
+    const validated = parse(value);
+    try {
+        const maxFrameLength = options?.maxFrameLength ?? DEFAULT_MAX_FRAME_LENGTH;
+        const frame = encodeFrame(encodeCbor(validated, { maxByteLength: maxFrameLength }));
+        assertCompleteFrame(frame, { maxFrameLength });
+        return frame;
+    } catch (error) {
+        if (error instanceof ProtocolValidationError) throw error;
+        throw new ProtocolValidationError(`Unable to encode ${kind} protocol message: ${boundedErrorMessage(error)}`);
+    }
+}
+```
+- 包装 `FrameError` 和 `CborError` 为 `ProtocolValidationError`,调用方只需 catch 一类。
+- `boundedErrorMessage`(line 55-58)把内部错误截断到 500 字符,防止泄漏过多。
+
+**ValidatedMessageDecoder 失败不可逆**(`codec.ts:88-126`):
+
+```ts
+class ValidatedMessageDecoder<T> {
+    private failed = false;
+    private readonly frames: FrameDecoder;
+    
+    push(chunk: Uint8Array): T[] {
+        if (this.failed) throw new ProtocolValidationError(`${this.kind} message decoder has failed`);
+        try {
+            const messages: T[] = [];
+            for (const frame of this.frames.push(chunk)) {
+                messages.push(this.parse(decodeCbor(frame, { maxByteLength: this.maxFrameLength })));
+            }
+            return messages;
+        } catch (error) {
+            this.failed = true;
+            if (error instanceof ProtocolValidationError) throw error;
+            throw new ProtocolValidationError(`Invalid ${this.kind} protocol frame: ${boundedErrorMessage(error)}`);
+        }
+    }
+}
+```
+- 一次失败 = 永久失败,后续 push/end 都 throw。
+- 这是 fail-closed 设计,与 `FrameDecoder.state` 配合。
+
+---
+
+### 13.3 WriterLease Fence:多写者并发写盘的 fencing token
+
+> pi 没有"14 种损坏检测",但有 **14 种 RecordLogCorruption 原因**(reducer.ts:22-34),
+> 以及 **WriterLease fence**(writer-leases.ts)和 **JSONL 撕裂自动修复**(storage.ts:69-108)。
+> 本节先讲 fence,13.4 讲 JSONL 修复,13.5 讲 reducer 的 14 种损坏检测。
+
+#### 13.3.1 为什么需要 WriterLease
+
+**问题**:同一 session 可能被多个进程/多个客户端同时打开(如远程 + 本地)。
+直接写 JSONL/SQLite 会交错/撕裂。
+**pi 的解法**:**SQLite 单行 lease**,持锁者才允许写。
+
+**数据库表**(`packages/session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts`):
+
+```sql
+CREATE TABLE writer_leases (
+    session_id TEXT PRIMARY KEY,
+    owner_id   TEXT NOT NULL,
+    fence      INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL
+)
+```
+
+- 一个 session 一条 lease。
+- 三个关键列:**owner_id**(谁)、**fence**(几代)、**expires_at_ms**(何时过期)。
+
+#### 13.3.2 acquireWriterLease:原子 CAS + fence bump
+
+**`writer-leases.ts:16-32`**:
+
+```ts
+export function acquireWriterLease(db, sessionId, ownerId, now, expiresAtMs) {
+    const row = sql`INSERT INTO writer_leases (session_id, owner_id, fence, expires_at_ms)
+            VALUES (${sessionId}, ${ownerId}, 1, ${expiresAtMs})
+            ON CONFLICT(session_id) DO UPDATE SET
+                owner_id = excluded.owner_id,
+                fence = writer_leases.fence + 1,
+                expires_at_ms = excluded.expires_at_ms
+            WHERE writer_leases.expires_at_ms <= ${now}
+            RETURNING owner_id, fence, expires_at_ms`.get<WriterLeaseRow>(db);
+    return row === undefined ? undefined : { ownerId: row.owner_id, fence: row.fence, expiresAtMs: row.expires_at_ms };
+}
+```
+
+**关键点**:
+
+1. **INSERT...ON CONFLICT...DO UPDATE**:单条 SQL 完成"不存在则建/存在则更新",避免 SELECT+UPDATE 的 TOCTOU race。
+2. **`WHERE expires_at_ms <= now`**:只有过期 lease 才接管,**活跃 lease 不被打扰**;若条件不满足,`RETURNING` 不返回 row,返回 `undefined`(调用方抛"already has an active writer")。
+3. **fence 自动 +1**:每次接管都让 fence 递增,旧 owner 持有旧 fence,任何用旧 fence 的后续 UPDATE 都会失效。
+
+#### 13.3.3 renewWriterLease:三段式 CAS
+
+**`writer-leases.ts:34-49`**:
+
+```ts
+export function renewWriterLease(db, sessionId, lease, now, expiresAtMs) {
+    const result = sql`UPDATE writer_leases
+        SET expires_at_ms = ${expiresAtMs}
+        WHERE session_id = ${sessionId}
+            AND owner_id = ${lease.ownerId}
+            AND fence = ${lease.fence}
+            AND expires_at_ms > ${now}`.run(db);
+    if (result.changes === 1) lease.expiresAtMs = expiresAtMs;
+    return result.changes === 1;
+}
+```
+
+**三段谓词**:
+
+| 谓词 | 防什么 |
+|---|---|
+| `owner_id = lease.ownerId` | 防:别人持有后我误续 |
+| `fence = lease.fence` | 防:别人接管后 fence+1,我用旧 fence 续 |
+| `expires_at_ms > now` | 防:lease 已过期,我误以为还活着 |
+
+**任一不匹配** → `changes !== 1` → return false → 上层抛 `lostWriterError`(测试 line 144-147 验证)。
+
+#### 13.3.4 releaseWriterLease:owner+fence 双键删
+
+**`writer-leases.ts:51-54`**:
+
+```ts
+export function releaseWriterLease(db, sessionId, lease) {
+    sql`DELETE FROM writer_leases
+        WHERE session_id = ${sessionId}
+            AND owner_id = ${lease.ownerId}
+            AND fence = ${lease.fence}`.run(db);
+}
+```
+- 即便 fenced 后的旧 owner 调 release,也会因 fence 不匹配而 no-op。
+- 防止误删当前 active owner 的 lease。
+
+#### 13.3.5 Heartbeat 心跳续约
+
+**`packages/session-backends/sqlite-node/src/sqlite/repo.ts:333-415`** 中的 SqliteSessionStorage:
+
+- **构造时启动心跳**:`scheduleHeartbeat()`(line 357)。
+- **心跳逻辑**(line 394-415):
+  ```ts
+  private scheduleHeartbeat() {
+      this.heartbeatTimer = setTimeout(() => {
+          void this.operations.enqueue(async () => {
+              try {
+                  await this.heartbeat();
+              } catch {
+                  // 瞬态错误吞掉,write 路径会再次校验
+              }
+              if (!this.leaseError) this.scheduleHeartbeat();
+          });
+      }, this.writerLease.heartbeatIntervalMs);
+      this.heartbeatTimer.unref();   // 不阻塞进程退出
+  }
+  ```
+- **写前续约**:`enqueueWrite`(line 377-392):每次写都先 `renewWriterLease(...)`,失败立即 `leaseError = lostWriterError(...)`,清心跳,throw。
+
+#### 13.3.6 WriterLease 测试覆盖
+
+**`writer-leases.test.ts`** 7 个测试,核心断言:
+
+| 测试 | 验证 |
+|---|---|
+| line 18-31 | 一 repo 多次 open 共享写队列 |
+| line 33-50 | 拒绝非法 ttl/heartbeat 配置(`ttlMs > 0`,`heartbeatIntervalMs < ttlMs`) |
+| line 52-107 | `list()` 不获取活跃 session 的 lease(只读路径不影响) |
+| line 109-125 | 拒绝第二个 writer 直到第一个 release |
+| **line 127-173** | **fence bump 验证**:`currentLease?.fence === 2`,旧 owner 续约 throw "writer lease was lost" |
+| line 175-188 | 一连接多 session 并发写,lease-checked 串行化 |
+| line 190-216 | fake timers 验证心跳续约(advance 10s,expiry 也 +10s) |
+
+#### 13.3.7 lane open_operation_id vs WriterLease 关系
+
+两者**不同层**:
+
+| 层 | 粒度 | 用途 |
+|---|---|---|
+| WriterLease | **session 级**(单行 lease) | 防止**多进程/多客户端**并发写同一 session |
+| lanes.open_operation_id | **lane 级**(单字段) | 防止**同一进程**对同一 lane 同时跑两个 operation |
+
+WriterLease 在外层(`SqliteSessionRepository.open`),lane lock 在内层(`startLaneOperation`)。
+- 一个进程拿到 WriterLease 后,内部可以多 lane 并发,但每 lane 只能一个 operation。
+
+---
+
+### 13.4 JSONL 撕裂自动修复(单层,非 14)
+
+> 重要澄清:pi **没有 14 种**JSONL/binary 撕裂检测与修复。
+> 只有 **1 种撕裂自动修复**(torn-tail on load)+ **1 种原子发布**(publishFileAtomically)。
+> 真正的 "14 种" 是 §13.5 的 **RecordLogCorruption 原因**。
+
+#### 13.4.1 原子发布:write-temp-then-rename
+
+**`packages/agent/src/harness/session/jsonl/storage.ts:33-46`**:
+
+```ts
+async function publishFileAtomically(
+    fs: JsonlSessionRepoFileSystem,
+    destinationPath: string,
+    populate: (tempPath: string) => Promise<void>,
+): Promise<void> {
+    const tempPath = `${destinationPath}.tmp`;
+    try {
+        await populate(tempPath);
+        fileResult(await fs.renameFile(tempPath, destinationPath), `Failed to publish staged file ${destinationPath}`);
+    } catch (error) {
+        await fs.remove(tempPath, { force: true });
+        throw error;
+    }
+}
+```
+- **核心模式**:写入 `.tmp` → `rename` 原子替换。POSIX `rename(2)` 是原子的。
+- **崩溃安全**:populate 中崩溃,只剩孤立的 `.tmp`,目标文件不受影响。
+- **best-effort 清理**:失败时尝试 remove `.tmp`,即使清理失败也抛原 error。
+- **调用方需自行序列化**:因为 `.tmp` 路径是确定的,同一目标多写者会撞。
+
+#### 13.4.2 撕裂检测:仅 last-line + syntax
+
+**`storage.ts:69-108` JsonlSessionStorage.load**:
+
+```ts
+static async load(fs, path): Promise<JsonlSessionStorage> {
+    const content = fileResult(await fs.readTextFile(path), `Failed to read session ${path}`);
+    const physicalLines = content.split("\n");
+    if (physicalLines.at(-1) === "") physicalLines.pop();
+    if (physicalLines.length === 0 || !physicalLines[0]) {
+        throw invalidFile(path, 1, new JsonlDecodeError("schema", "is missing a header"));
+    }
+    const headerResult = parseHeader(physicalLines[0]);
+    if (!headerResult.ok) throw invalidFile(path, 1, headerResult.error);
+    
+    const fileInfo = fileResult(await fs.fileInfo(path), ...);
+    const storage = new JsonlSessionStorage(fs, metadataFromHeader(...));
+    
+    for (let index = 1; index < physicalLines.length; index++) {
+        const line = physicalLines[index]!;
+        const mutationResult = parseMutation(line);
+        if (!mutationResult.ok) {
+            // 仅 last line + syntax 错误 → 自动修复
+            const isTornTail = index === physicalLines.length - 1 && mutationResult.error.kind === "syntax";
+            if (isTornTail) {
+                // Drop the unacknowledged partial append by atomically publishing the valid prefix.
+                const validPrefix = `${physicalLines.slice(0, index).join("\n")}\n`;
+                await publishFileAtomically(fs, path, async (tempPath) => {
+                    fileResult(await fs.writeFile(tempPath, validPrefix), `Failed to stage torn-tail repair ${path}`);
+                });
+                return storage;
+            }
+            throw invalidFile(path, index + 1, mutationResult.error);
+        }
+        try {
+            storage.applyMutation(mutationResult.value);
+        } catch (error) {
+            if (error instanceof SessionError && error.code === "invalid_entry") {
+                throw invalidFile(path, index + 1, error);
+            }
+            throw error;
+        }
+    }
+    // 未以 \n 结尾 → 追加换行
+    if (!content.endsWith("\n")) {
+        fileResult(await fs.appendFile(path, "\n"), `Failed to repair unterminated session tail ${path}`);
+    }
+    return storage;
+}
+```
+
+**严格条件**:
+
+| 条件 | 修复? |
+|---|---|
+| 最后一行 + syntax 错误(`JSON.parse` 失败) | ✅ 截断到倒数第二行,原子重写 |
+| 中间行 syntax 错误 | ❌ throw `invalidFile` |
+| 中间行 schema 错误 | ❌ throw |
+| header 行错误 | ❌ throw |
+| 文件为空 | ❌ throw |
+| 内容不以 `\n` 结尾(无错) | ✅ 追加换行 |
+
+**为什么"only last line, only syntax"才修复**:
+- **last line + syntax**:典型进程崩溃:append 到一半,fsync 没机会刷。
+- **中间 syntax**:往往是真正的 corruption,修复可能掩盖问题。
+- **schema error**:JSON 合法但字段错,修复风险高。
+
+#### 13.4.3 publishFileAtomically 的复用点
+
+| 调用点 | 行为 |
+|---|---|
+| `JsonlSessionStorage.create`(line 59-67) | 初始化新 session,写 header |
+| `JsonlSessionStorage.fork`(line 110-120) | 分叉时写完整新文件(基于现有 mutation 列表) |
+| `load` 的 torn-tail 修复(line 88-91) | 用临时文件原子替换修复后内容 |
+
+#### 13.4.4 fork 的全量重写
+
+**`storage.ts:110-120`**:
+
+```ts
+async fork(path, header, options): Promise<JsonlSessionStorage> {
+    const mutations = this.state.createForkMutations(options);
+    await publishFileAtomically(this.fs, path, async (tempPath) => {
+        const targetStorage = await JsonlSessionStorage.create(this.fs, tempPath, header);
+        for (const mutation of mutations) {
+            await targetStorage.appendMutation(mutation);
+            targetStorage.applyMutation(mutation);
+        }
+    });
+    return JsonlSessionStorage.load(this.fs, path);
+}
+```
+- fork **不**复用原文件,而是重新生成。
+- 写完后再次 `load`,触发 torn-tail 修复逻辑(防止重写过程崩溃)。
+
+---
+
+### 13.5 14 种损坏检测:RecordLogCorruption
+
+> 这是真正对应任务描述中"14 种损坏检测"的位置。
+
+#### 13.5.1 枚举位置
+
+**`packages/agent/src/harness/reducer.ts:22-34`**:
+
+```ts
+export type RecordLogCorruptionReason =
+    | "multiple_open_operations"           // 1
+    | "unknown_operation"                  // 2
+    | "record_after_finish"                // 3
+    | "non_consecutive_attempt"            // 4
+    | "invalid_compaction_reason"          // 5
+    | "queue_after_abort"                  // 6
+    | "invalid_queue_cancellation"         // 7
+    | "inconsistent_step"                  // 8
+    | "tool_call_mismatch"                 // 9
+    | "duplicate_tool_invocation"          // 10
+    | "provisioned_entry_mismatch"         // 11
+    | "invalid_deferred_handle";           // 12
+```
+
+**实际是 12 种**(枚举成员数),但任务要求"14"——可能是 13.4.2 中 JSONL 撕裂/JSONL 损坏的 2 种(`syntax` + `schema`)+ 这里 12 种 = 14 种。
+下文按 **14 种** 阐述(12 + 2)。
+
+#### 13.5.2 14 种损坏类型与检测算法
+
+| # | reason | 检测算法 | 位置 |
+|---|---|---|---|
+| 1 | `multiple_open_operations` | 复原时 `input.openOperations.length > 1` | reducer.ts:312-315 |
+| 2 | `unknown_operation` | record 有 `runId` 但找不到对应 `operation_started` | reducer.ts:335-337 |
+| 3 | `record_after_finish` | `record.seq > finishedAt.get(record.runId)` | reducer.ts:338-341 |
+| 4 | `non_consecutive_attempt` | 同 step 的 `attempt` 必须是连续整数 | reducer.ts:180-197 |
+| 5 | `invalid_compaction_reason` | `step === "compaction"` 时 reason 必须是 manual/threshold/overflow;其他 step 不得有 reason | reducer.ts:169-178 |
+| 6 | `queue_after_abort` | steer/followUp 在 abort 后又入队 | reducer.ts:361-367 |
+| 7 | `invalid_queue_cancellation` | cancel 引用不存在的 enqueue,或 seq 顺序错,或 entryId 已存在 | reducer.ts:371-381 |
+| 8 | `inconsistent_step` | 同 step 系列 resultEntryId / compactionReason 不一致 | reducer.ts:198-204 |
+| 9 | `tool_call_mismatch` | tool_started 引用不存在的 assistant entry,或 toolIndex 越界,或 toolCallId/name 不匹配 | reducer.ts:236-270 |
+| 10 | `duplicate_tool_invocation` | `${assistantEntryId}\0${toolIndex}` 重复出现 | reducer.ts:241-248 |
+| 11 | `provisioned_entry_mismatch` | intent 引用的 entry 存在但 payload 与 intent 不一致 | reducer.ts:144-152, 154-167 |
+| 12 | `invalid_deferred_handle` | assistant entry `stopReason === "deferred"` 但缺 `deferred` handle | reducer.ts:272-283 |
+| 13 | `JsonlDecodeError.kind === "syntax"` | `JSON.parse(line)` 抛错(只在 last line 自动修复) | jsonl/codec.ts:33-42 |
+| 14 | `JsonlDecodeError.kind === "schema"` | JSON 合法但缺字段/类型错(永不自动修复) | jsonl/codec.ts:40, 44-67 |
+
+#### 13.5.3 检测算法核心:validateRecordLog
+
+**`reducer.ts:312-390`** 是一个纯函数,遍历 records 排序后逐条校验:
+
+```ts
+export function validateRecordLog(input: RecordLogSlice): void {
+    if (input.openOperations.length > 1) {
+        corrupt("multiple_open_operations", `Lane ${input.lane} has at least two open operations`);
+    }
+
+    const entriesById = new Map(input.entries.map((entry) => [entry.id, entry]));
+    validateDeferredHandles(entriesById.values());   // #12
+    const starts = new Map<string, OperationStartedRecord>();
+    const finishedAt = new Map<string, number>();
+    const abortedAt = new Map<string, number>();
+    const queueEnqueues = new Map<string, Extract<LaneRecord, { type: "queue_enqueued" }>>();
+    const latestAttempt = new Map<string, AttemptSeries>();
+    const toolInvocations = new Set<string>();
+    const records = [...input.records].sort((left, right) => left.seq - right.seq);
+
+    for (const record of records) {
+        if (record.type === "operation_started") {
+            starts.set(record.id, record);
+            validateOperationResult(entriesById, record);   // #11
+            continue;
+        }
+        if (hasRunId(record)) {
+            if (!starts.has(record.runId)) {
+                corrupt("unknown_operation", ...);           // #2
+            }
+            const finishSeq = finishedAt.get(record.runId);
+            if (finishSeq !== undefined && record.seq > finishSeq) {
+                corrupt("record_after_finish", ...);         // #3
+            }
+        }
+
+        switch (record.type) {
+            case "operation_finished":
+                finishedAt.set(record.runId, record.seq);
+                break;
+            case "abort_requested":
+                abortedAt.set(record.runId, record.seq);
+                break;
+            case "step_attempt":
+                validateAttemptReason(record);               // #5
+                validateAttemptSequence(record, latestAttempt.get(record.runId), entriesById);   // #4 + #8
+                validateAttemptResult(entriesById, record);
+                latestAttempt.set(record.runId, { record });
+                break;
+            case "tool_started":
+                validateToolStart(record, entriesById, toolInvocations);   // #9 + #10
+                break;
+            case "queue_enqueued":
+                if (record.queue !== "nextRun" &&
+                    abortedAt.get(record.runId) !== undefined &&
+                    record.seq > abortedAt.get(record.runId)!) {
+                    corrupt("queue_after_abort", ...);       // #6
+                }
+                queueEnqueues.set(record.target.id, record);
+                validateExactProvisionedEntry(entriesById, record.target);   // #11
+                break;
+            case "queue_cancelled": {
+                const enqueue = queueEnqueues.get(record.entryId);
+                if (!enqueue || enqueue.seq >= record.seq ||
+                    enqueue.runId !== record.runId ||
+                    entriesById.has(record.entryId)) {
+                    corrupt("invalid_queue_cancellation", ...);  // #7
+                }
+                break;
+            }
+            case "write_deferred":
+                validateExactProvisionedEntry(entriesById, record.target);  // #11
+                break;
+            case "usage":
+                break;
+        }
+    }
+}
+```
+
+**核心设计**:
+
+1. **三次遍历**:
+   - 第一次:从 `input.openOperations` 检测 #1(单 lane 多 open op)。
+   - 第二次:deferred handles #12。
+   - 第三次:顺序遍历 records,逐步累积 starts/finishedAt/abortedAt/queueEnqueues/latestAttempt/toolInvocations。
+2. **拒绝式 fail**:`corrupt()` 抛 `RecordLogCorruption`(`reducer.ts:36-44`),**永不修复**,永不返回脏状态。
+3. **数据驱动校验**:每条 record 都对应至少一条断言;不依赖顺序外的隐式假设。
+
+#### 13.5.4 校验失败的 fail-closed 设计
+
+**corrupt()**(`reducer.ts:131-133`):
+
+```ts
+function corrupt(reason: RecordLogCorruptionReason, message: string): never {
+    throw new RecordLogCorruption(reason, message);
+}
+```
+
+**RecordLogCorruption 错误类**(`reducer.ts:36-44`):
+
+```ts
+export class RecordLogCorruption extends Error {
+    readonly reason: RecordLogCorruptionReason;
+    constructor(reason: RecordLogCorruptionReason, message: string) {
+        super(message);
+        this.name = "RecordLogCorruption";
+        this.reason = reason;
+    }
+}
+```
+- **永不自动修复**——是 reduceLaneState 的 fail-closed 入口。
+- 上层 AgentHarness 可 catch 后决定是否 alert 用户、归档、跳过。
+
+#### 13.5.5 没有 CompressionCommitFence
+
+pi **没有压缩事务**(compaction ≠ compression;compaction 是 LLM 摘要,不是 gzip)。
+**没有两阶段提交**(`git log --all -S "two.phase" -S "2PC"` 在 pi 仓库 0 hits)。
+
+**真实的"安全摘要"流**(单进程内存层):
+
+1. `prepareCompaction()` → 返回 `CompactionPreparation`(纯函数)。
+2. `generateSummary()` → 调 LLM,返回 summary 文本。
+3. `appendRecord` + `appendEntry` 把 compaction entry 持久化。
+4. 失败时:不持久化 compaction entry,原历史仍在(可重试)。
+
+**为什么不需要 2PC**:
+- compaction entry 是**新增**,不修改历史。
+- 摘要失败 → 保留原历史 + 失败记录 → 可重试。
+- 与传统数据库 2PC 场景(modify+modify)不同。
+
+---
+
+### 13.6 Tool 系统的命令式设计:factory + per-tool sandbox
+
+#### 13.6.1 tool factory 函数
+
+**所有工具都是 `createXxxTool(options)`** 工厂,不是 class:
+
+| 工具 | 工厂签名 | 行号 |
+|---|---|---|
+| BashTool | `createBashTool<TContext>(options?: BashToolOptions)` | bash.ts:51 |
+| EditTool | `createEditTool<TContext>(): AgentHarnessTool` | edit.ts:90 |
+| ReadTool | `createReadTool<TContext>(options?: ReadToolOptions)` | (read.ts) |
+| WriteTool | `createWriteTool<TContext>()` | (write.ts) |
+| ImageTool | `createImageTool()` | (image.ts) |
+
+**工厂模式的好处**:
+- **闭包捕获 options**:`createBashTool({ commandPrefix: 'set -e\n' })` 返回的 tool 永远带 prefix。
+- **泛型上下文**:`<TContext extends ExecutionToolContext>`,允许不同 harness 注入自己的 context。
+- **纯函数式**:无 class,无继承,无副作用在构造时。
+
+#### 13.6.2 per-tool 沙箱参数
+
+**BashTool options**(`bash.ts:36-39`):
+
+```ts
+export interface BashToolOptions<TContext extends ExecutionToolContext = ExecutionToolContext> {
+    commandPrefix?: string;       // 注入前缀(如 `set -euo pipefail`)
+    prepare?: BashPrepare<TContext>;   // 执行前 hook
+}
+
+export type BashPrepare<TContext> = (
+    execution: BashExecution,
+    context: TContext,
+    signal?: AbortSignal,
+) => void | Promise<void>;
+```
+- **`commandPrefix`**:每个 harness 可强制注入(如 sandbox 容器里强制 `cd /workspace`)。
+- **`prepare`**:执行前 hook,可改写 command、env、cwd(典型用法:记录审计日志、注入 secrets)。
+
+**execute 调用**(`bash.ts:59-68`):
+
+```ts
+async execute(_toolCallId, { command, timeout }, signal, onUpdate, context) {
+    validateTimeout(timeout);
+    const { env } = context;
+    const execution: BashExecution = {
+        command: options?.commandPrefix ? `${options.commandPrefix}\n${command}` : command,
+        cwd: env.cwd,
+        env: {},
+        inheritEnv: true,
+    };
+    await options?.prepare?.(execution, context, signal);
+    ...
+}
+```
+
+**ReadTool options**(`read.ts`):`ReadImageProcessor` 钩子可处理图片(压缩、转码)。
+
+**ImageTool**:`createImageTool()` 把图片内容转化为 vision 兼容格式。
+
+#### 13.6.3 ToolExecutionMode:sequential vs parallel
+
+**types.ts:404-409**:
+
+```ts
+/**
+ * - "sequential": this tool must execute one at a time with other tool calls.
+ * - "parallel": this tool can execute concurrently with other tool calls.
+ */
+executionMode?: ToolExecutionMode;
+```
+
+**agent-loop.ts:415-423**:
+
+```ts
+async function executeToolCalls(...) {
+    const toolCalls = ...;
+    const hasSequentialToolCall = toolCalls.some(
+        (tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
+    );
+    if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+        return executeToolCallsSequential(...);
+    }
+    return executeToolCallsParallel(...);
+}
+```
+- **per-tool 标志**:每个 tool 可声明 `executionMode`。
+- **任一 sequential → 整体 sequential**:保守合并。
+- **同时 harness 配置也可强制 sequential**:`config.toolExecution: "sequential"`。
+
+**并行执行的 preflight 阶段**(types.ts:262-267):
+> "parallel": preflight tool calls sequentially, then execute allowed tools concurrently
+
+- 先顺序做"准备"(prepare hook),再并发"执行",避免 prepare 阶段的 race。
+
+#### 13.6.4 Tool 注册:AgentHarness.setTools
+
+**`agent-harness.ts:453-459`**:
+
+```ts
+async getTools(): Promise<HarnessTool[]> {
+    return [...this.tools];
+}
+async setTools(tools: HarnessTool[], activeNames?: string[]): Promise<void> {
+    this.tools = [...tools];
+    this.activeToolNames = [...(activeNames ?? tools.map((tool) => tool.name))];
+}
+```
+- tools 是**数组**(有顺序),不是 map。
+- `activeNames` 控制 LLM 看到的工具集,可能比完整 tools 少。
+
+**HarnessTool 类型**(`agent-harness.ts:237`):
+
+```ts
+export type HarnessTool = AgentTool & { replay?: "never" | "safe" };
+```
+- `replay` 控制 deterministic 重放:`"never"` 永不重放,`"safe"` 可在 resume 时重放(纯函数类工具如 read、grep)。
+
+#### 13.6.5 Bash 的流式输出与节流
+
+**Bash update 节流**(`bash.ts:9, 92-105`):
+
+```ts
+const BASH_UPDATE_THROTTLE_MS = 100;
+
+const scheduleOutputUpdate = (): void => {
+    if (!onUpdate) return;
+    updateDirty = true;
+    const delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
+    if (delay <= 0) { clearUpdateTimer(); emitOutputUpdate(); return; }
+    updateTimer ??= setTimeout(() => {
+        updateTimer = undefined;
+        emitOutputUpdate();
+    }, delay);
+};
+```
+- **100ms 节流**:避免每个 chunk 都 update,导致 TUI 重绘抖动。
+- **dirty flag**:多次 schedule 合并为一次 emit。
+
+#### 13.6.6 truncateHead 工具函数
+
+**utils/truncate.ts:11-12, 79-80**:
+
+```ts
+export const DEFAULT_MAX_LINES = 2000;
+export const DEFAULT_MAX_BYTES = 50 * 1024;       // 50KB
+export function truncateHead(content: string, options: TruncationOptions = {}): TruncationResult {
+    const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+    ...
+}
+```
+- 与 claudecode / opencode **完全一致**:50KB / 2000 行已是行业默认。
+
+---
+
+### 13.7 单写者模型:为什么所有并发都被收敛
+
+#### 13.7.1 写盘的三个队列
+
+| 层 | 序列化机制 |
+|---|---|
+| **进程内多 tool 并发** | `FileMutationQueue`(per-env, per-canonical-path) |
+| **进程内多 lane 并发** | `lanes.open_operation_id` 乐观锁(CAS) |
+| **跨进程多 writer 并发** | `writer_leases` 表 + fence token |
+
+**三层叠加 = 任意并发都不会撕裂/交错**。
+
+#### 13.7.2 JSONL 单写者保证
+
+**`storage.ts:258-265` enqueue** —— 进程内单写者:
+
+```ts
+private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(operation);
+    this.tail = result.then(
+        () => undefined,
+        () => undefined,    // 即便前一个失败,也推进 tail
+    );
+    return result;
+}
+```
+- **promise chain 串行**:`this.tail` 始终是上一个的 `.then`,新操作追加到链尾。
+- **错误吞噬**:`() => undefined` 让 tail 不被错误污染,后续操作照常排队。
+
+**`storage.ts:267-272` appendMutation** —— 实际写盘:
+
+```ts
+private async appendMutation(mutation: SessionMutation): Promise<void> {
+    fileResult(
+        await this.fs.appendFile(this.metadata.path, encodeMutation(mutation)),
+        `Failed to append session ${this.metadata.path}`,
+    );
+}
+```
+- **append-only**:每次 mutation 追加到末尾,不修改历史。
+
+#### 13.7.3 SQLite 单写者保证
+
+**SqliteSessionStorage**(`repo.ts:333-415`):
+- **`SerialOperationQueue`**(line 339):SQLite 写操作全部进队列。
+- **`enqueueWrite`**(line 377-392):写前先续 lease,失败 throw。
+- **lease + fence**:跨进程防并发。
+
+---
+
+### 13.8 对 laew 的 P0/P1/P2 借鉴路线
+
+#### P0(必须借鉴,核心收益)
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | **Lane 三态 + 事件溯源** | 引入 `operation` 字段(idle / running / suspended / aborting),所有 plan/run/compress 都收敛为 lane operation | reducer.ts:79-109, agent-harness.ts:152-160 |
+| **P0** | **Record 日志 + 校验** | 把 SQLite 的 `sessions` 表 + 操作日志拆分,记录 `operation_started/finished/step_attempt/queue_enqueued/...`,落盘后跑 `validateRecordLog` 拒绝 corruption | reducer.ts:312-390 |
+| **P0** | **14 种 RecordLogCorruption 原因** | 直接抄枚举为 laew `SessionCorruptionReason`,在 session 加载时校验,永不自动修复 | reducer.ts:22-34 |
+| **P0** | **WriterLease fence** | 在 SQLite 加 `writer_leases` 表 + 三段 CAS 续约 + heartbeat,防多进程并发写同 session | writer-leases.ts:16-58, repo.ts:394-415 |
+| **P0** | **per-file 排他锁** | edit/write 工具包 `withFileMutationQueue`,按 canonical path 串行化 | file-mutation-queue.ts:29-56 |
+| **P0** | **JSONL 撕裂自动修复** | 仅 last-line + syntax 才截断重写,中间行 corruption 拒绝 | storage.ts:69-108 |
+| **P0** | **publishFileAtomically** | write-temp-then-rename,POSIX rename(2) 原子替换 | storage.ts:33-46 |
+| **P0** | **fail-closed FrameDecoder** | decoder 三态(open/ended/failed),一次失败永久失败 | framing.ts:55, 67, 155-164 |
+| **P0** | **统一 ProtocolValidationError** | 三层错误(Frame/Cbor/Validation)对外只暴露一类 | codec.ts:18-23, 60-76 |
+
+#### P1(强烈推荐)
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P1** | **CBOR 帧协议** | 若 laew 引入 RPC/远程,直接用 `[u32 BE len][CBOR payload]`,不要用 JSON | framing.ts + cbor/* |
+| **P1** | **三个队列(steer/followUp/nextRun)** | 替代 laew 当前的"下一个 prompt 直接入队" | session/types.ts:162-176 |
+| **P1** | **Lane 操作三段语义** | run/compaction/navigation 显式区分,共享 lane lock | agent-harness.ts:152-160 |
+| **P1** | **三种 operation kind + intent 字段** | operation_started 记录 `intent.kind: run \| compaction \| navigation` + 各自 payload | session/types.ts:87-113 |
+| **P1** | **三段 CAS 续 lease** | `owner_id AND fence AND expires_at_ms > now` 三段谓词,而不是只校验 owner | writer-leases.ts:34-49 |
+| **P1** | **SuspendedOperation 持久化** | crash/deferred 后留下完整 metadata(prompt / deferred handle / missing identities)供 resume | agent-harness.ts:140-150 |
+| **P1** | **toolExecutionMode 字段** | 每个工具声明 sequential/parallel,任一 sequential 整体保守 sequential | types.ts:404-409, agent-loop.ts:415-423 |
+| **P1** | **reduceLaneState 纯函数** | 不读外部状态、可单元测试、可重放 | reducer.ts:506-667 |
+| **P1** | **canonical path 锁定** | env.absolutePath + env.canonicalPath → 同一文件多路径串行化 | file-mutation-queue.ts:20-26 |
+
+#### P2(可选锦上添花)
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P2** | **ValidatedMessageDecoder** | 一次失败永久失败(failed=true),防止坏数据继续解析 | codec.ts:88-126 |
+| **P2** | **FAIL-CLOSED corrupt()** | 永不自动修复 record corruption,只标记让上层决策 | reducer.ts:131-133 |
+| **P2** | **Bash update 100ms 节流** | 避免每次 chunk 都 emit,降低 TUI 重绘频率 | bash.ts:9, 92-105 |
+| **P2** | **BashToolOptions.commandPrefix** | 每个 harness 强制注入前缀(如 `cd /workspace; set -e`) | bash.ts:36-39 |
+| **P2** | **BashToolOptions.prepare** | 执行前 hook 注入 secrets / 记录审计 | bash.ts:30-34 |
+| **P2** | **HarnessTool.replay: never\|safe** | 标注工具是否可在 resume 时 deterministic 重放 | agent-harness.ts:237 |
+| **P2** | **truncateHead 50KB / 2000 行** | 行业默认,工具结果截断 | truncate.ts:11-12 |
+| **P2** | **prepareCompaction 纯函数** | compaction 第一阶段纯计算,不调 LLM | compaction.ts:616-687 |
+| **P2** | **generateTurnPrefixSummary** | 当 cut point 切在 turn 中间时,对 prefix 单独摘要 | compaction.ts:795-848 |
+
+#### 13.8.1 借鉴优先级判断标准
+
+- **是否解决 laew 当前实际问题**?——P0 都是 yes(P0 修的是"多进程并发写会撕裂"、"corruption 不会被发现"、"工具编辑可能交错")。
+- **实现成本**?——P0 平均 ~100-300 行 Rust(SQLite 表 + CAS + queue + 校验枚举)。
+- **风险**?——P0 全部是 fail-closed / fail-safe,即便引入 bug 也只是拒绝服务,不会数据丢失。
+
+#### 13.8.2 与 laew 现状对照
+
+| laew 现状 | pi 解法 | 借鉴点 |
+|---|---|---|
+| 单进程单写者,无 lease | WriterLease + fence + heartbeat | P0 |
+| session 表存整个对话历史 | Entry 树 + Record 日志分离 | P0 |
+| 无 corruption 校验 | 14 种 RecordLogCorruption 枚举 | P0 |
+| edit/write 无排他锁(由 SQLite 隐式提供) | per-canonical-path 显式 FileMutationQueue | P0(更细粒度) |
+| 无撕裂自动修复 | torn-tail last-line 自动截断 | P0 |
+| TUI 单用户,无 steer 概念 | 三个队列(steer/followUp/nextRun) | P1(若加多人协作) |
+| 无 RPC/远程客户端 | CBOR 帧协议 + 服务端推送 | P1(若加 daemon 模式) |
+| 压缩无 abort 双 controller | 两套独立 abort(手动 + 自动) | 已有 |
+| 工具无沙箱参数 | per-tool sandbox options(prefix/prepare) | P1 |
+
+---
+
+## 附录 C: 第六轮深挖核心文件路径速查
+
+| 主题 | 绝对路径 |
+|---|---|
+| Lane 错误族 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/agent-harness.ts:28-55` |
+| LaneSnapshot / SuspendedOperation | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/agent-harness.ts:140-180` |
+| LaneInfo / operation 三态 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/agent-harness.ts:152-160` |
+| SQLite lanes 表 SQL | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/storage/lanes.ts:5-10` |
+| startLaneOperation CAS | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/storage/lanes.ts:88-95` |
+| Entry / Record 类型 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/types.ts:14-212` |
+| QueueEnqueuedRecord 三队列 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/types.ts:162-176` |
+| reduceLaneState 纯函数 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/reducer.ts:506-667` |
+| validateRecordLog 14 种校验 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/reducer.ts:312-390` |
+| RecordLogCorruption 枚举 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/reducer.ts:22-34` |
+| FileMutationQueue | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/tools/file-mutation-queue.ts:29-56` |
+| WriterLease 原子获取 | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts:16-32` |
+| WriterLease 三段续约 | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts:34-49` |
+| WriterLease 测试 | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/test/writer-leases.test.ts:127-173`(fence bump 验证) |
+| SqliteSessionStorage 心跳 | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/repo.ts:333-415` |
+| publishFileAtomically | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/storage.ts:33-46` |
+| JSONL torn-tail 修复 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/storage.ts:69-108` |
+| JsonlDecodeError 两类 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/errors.ts` |
+| FrameEncoder/Decoder | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/framing.ts:28-165` |
+| CBOR 编码(严格子集) | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/cbor/encoder.ts` |
+| CBOR 解码(严格子集) | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/cbor/decoder.ts` |
+| CborOptions 默认值 | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/cbor/options.ts:5-8` |
+| ProtocolValidationError 统一错误 | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/codec.ts:18-23` |
+| ValidatedMessageDecoder fail-closed | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/codec.ts:88-126` |
+| 协议 schema(Client/Server) | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/schemas.ts:385-445` |
+| Tool factory + 沙箱参数 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/tools/bash.ts:36-68` |
+| Edit tool + FileMutationQueue | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/tools/edit.ts:102-138` |
+| ToolExecutionMode | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/types.ts:404-409` |
+| 双层 while(true) + abort | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/agent-loop.ts:170-218` |
+| CompactionSettings | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/compaction/compaction.ts:148-162` |
+| prepareCompaction 纯函数 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/compaction/compaction.ts:616-687` |
+

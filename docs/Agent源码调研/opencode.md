@@ -1127,3 +1127,1204 @@ const providerOptions = {
 | **P2** | finish 写入位置 | `assistantMessage.finish = value.reason` 来自流 `step-finish` 事件 | processor.ts:457 |
 | **P2** | MAX_LINE_LENGTH=2000 | 行级截断，比字节截断保留可读性 | read.ts:14-17 |
 | **P2** | session 状态机 | `status.set({ type: "busy" })` 在 loop 入口，TUI 可观测 | prompt.ts:1081-1098 |
+
+---
+
+## 第六轮深挖 — Effect 异步运行时 + Schema 验证 + LayerNode DI + Durable Object
+
+> **调研窗口**：2026-09-06  
+> **焦点**：Effect 异步运行时（Stream / Deferred / Ref / Scope）、Effect Schema 全栈 DI、LayerNode 拓扑与循环检测、`@opencode-ai/llm` 协议分层、provider 适配器 6 套差异化、Cloudflare Durable Object + R2 共享存储、enterprise 多端同步。  
+> **样本**：第三轮 (Effect 重构 / Schema 全栈 / LayerNode 拓扑) 已完成、本轮 (企业版 DO+R2、provider 6 套差异化、protocol 4 套 wire schema、34 包结构) 是其延续与延伸。  
+> **本轮新增洞察**：相较前五轮更偏运行时基础设施 + 部署形态。
+
+### 6.1 Effect 异步运行时基础
+
+opencode 完全基于 `effect` v3 重写，没有用 `Promise` 直接编排。Effect 在 opencode 中不是 `await this()`，而是"基于代数效应的描述式运行时 + Context 注入 + Schema 验证 + Stream/Ref/Deferred 并发原语"。`packages/core/src/effect/runtime.ts`（21 行）即把所有 Effect 计算折叠进一个 `ManagedRuntime.ManagedRuntime<I, E>`，并复用全局 `memoMap` 让所有 Effect 共享服务缓存：
+
+```ts
+// packages/core/src/effect/runtime.ts:5
+export function makeRuntime<I, S, E>(service: Context.Service<I, S>, layer: Layer.Layer<I, E>) {
+  let rt: ManagedRuntime.ManagedRuntime<I, E> | undefined
+  const getRuntime = () =>
+    (rt ??= ManagedRuntime.make(Layer.provideMerge(layer, Observability.layer) as Layer.Layer<I, E>, {
+      memoMap,
+    }))
+  return {
+    runSync: <A, Err>(fn: (svc: S) => Effect.Effect<A, Err, I>) => getRuntime().runSync(service.use(fn)),
+    runPromiseExit: ...,
+    runPromise: ...,
+    runFork: ...,
+    runCallback: ...,
+  }
+}
+```
+
+关键设计：
+
+1. **懒构造 + 单例**：只在第一次调用 `getRuntime()` 时构建 `ManagedRuntime`，之后所有 Effect 调用复用同一个 memoMap。
+2. **Observability 透明叠加**：每次构建 runtime 都用 `Layer.provideMerge(layer, Observability.layer)` —— 这意味着任何 logger / trace / span 都是"先于业务"的，没有遗漏窗口。
+3. **5 种执行语义**：同步 (`runSync`)、Promise + Exit (`runPromiseExit`)、Promise + value-or-throw (`runPromise`)、Fork（独立 fiber，`runFork`）、回调 (`runCallback`) —— 不同边界（CLI 同步、TUI 异步、SSE 流式）各自选最合适的那一个。
+
+#### 6.1.1 `serviceUse` — 类型安全的 Service 访问器代理
+
+`packages/core/src/effect/service-use.ts`（43 行）实现了一个精妙的 proxy：把 `Context.Service<Identifier, Shape>` 转成一个"只暴露 Service 中返回 `Effect.Effect<...>` 的那些方法"的访问器。这样业务代码不必每次写 `yield* Tag.use(svc => svc.method())`，可以直接 `serviceUse(Tag).method()`：
+
+```ts
+// packages/core/src/effect/service-use.ts:5
+type ServiceUse<Identifier, Shape> = {
+  readonly [Key in keyof Shape as Shape[Key] extends EffectMethod ? Key : never]: Shape[Key] extends (
+    ...args: infer Args
+  ) => infer Return
+    ? Args extends ReadonlyArray<unknown>
+      ? Return extends Effect.Effect<infer A, infer E, infer R>
+        ? (...args: Args) => Effect.Effect<A, E, R | Identifier>
+        : never
+      : never
+    : never
+}
+```
+
+实现用 `Proxy` + `Map<string, fn>` 缓存访问器，避免每次属性访问都创建闭包；同时把服务方法"重新绑定"到 `Effect<..., R | Identifier>`，确保 R 通道上一定包含 Identifier —— 也就是说调用该方法时 R 上必须有该 Service 存在。这是一种"在 proxy 层强制 DI 完整性"的模式。
+
+#### 6.1.2 `KeyedMutex` — 按 key 分桶的内存互斥
+
+`packages/core/src/effect/keyed-mutex.ts`（45 行）实现 `KeyedMutex<Key>`：同一个 key 串行执行，不同 key 完全独立，内部用 `Map<Key, { semaphore, users }>` 维护，"无持有者也无等待者"时自动 `delete` 释放桶：
+
+```ts
+// packages/core/src/effect/keyed-mutex.ts:20
+export const makeUnsafe = <Key>(): KeyedMutex<Key> => {
+  const locks = new Map<Key, { readonly semaphore: Semaphore.Semaphore; users: number }>()
+  const withLock = (key: Key) => <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.suspend(() => {
+      const current = locks.get(key)
+      const entry = current ?? { semaphore: Semaphore.makeUnsafe(1), users: 0 }
+      if (!current) locks.set(key, entry)
+      entry.users++
+      return entry.semaphore.withPermit(effect).pipe(
+        Effect.ensuring(Effect.sync(() => {
+          entry.users--
+          if (entry.users === 0) locks.delete(key)
+        })),
+      )
+    })
+  return { size: Effect.sync(() => locks.size), withLock }
+}
+```
+
+**对 laew 的启发**：laew 当前的 SQLite 写并发是单文件 WAL 模式，如果未来要做"同一 session 多终端 TUI 同步编辑"，KeyedMutex<SessionID> 就是按会话串行的天然模型 —— 比起锁整库更精细。
+
+### 6.2 LayerNode DI 拓扑
+
+`packages/core/src/effect/layer-node.ts`（333 行）是 opencode 的"自研 Effect Layer 拓扑层"。Effect 原生的 `Layer.provide` 在大规模 DI 图里会写出 O(N²) 边、循环依赖要靠堆栈报错，于是 opencode 在 Effect 之上自建了一层"编译 + 拓扑排序 + 替换 + 循环检测"。
+
+#### 6.2.1 节点类型
+
+```ts
+// packages/core/src/effect/layer-node.ts:22
+export interface Node<A, E = never, T extends Tag | undefined = undefined> {
+  readonly kind: "layer" | "unbound" | "group"
+  readonly name: string
+  readonly service?: Context.Service.Any
+  readonly implementation?: Layer.Any
+  readonly dependencies: readonly AnyNode[]
+  readonly tag?: T
+  ...
+}
+```
+
+- **layer**：一个真正的 `Layer` + 它所依赖的子节点（DI 边）。
+- **unbound**：声明 Service 类型但暂未提供实现（"待填空"），如 `LocationServiceMap` 在没有替换时会自动由 `app-node-builder.ts` 注入运行时构造的实例。
+- **group**：把若干 Node 打包成一个复合节点，便于一次性 provide 一组。
+
+#### 6.2.2 编译与循环检测
+
+```ts
+// packages/core/src/effect/layer-node.ts:171
+function walk<Result>(
+  root: AnyNode,
+  visit: Visit<Result>,
+  options: { readonly cache?: Map<AnyNode, Result>; readonly resolve?: (node: AnyNode) => AnyNode; readonly detectCycles?: boolean } = {},
+) {
+  const cache = options.cache ?? new Map<AnyNode, Result>()
+  const visiting = new Set<AnyNode>()
+  const stack: AnyNode[] = []
+  const recur = (node: AnyNode): Result => {
+    const target = options.resolve?.(node) ?? node
+    const cached = cache.get(target)
+    if (cached !== undefined || cache.has(target)) return cached!
+    if (options.detectCycles !== false && visiting.has(target)) {
+      const start = stack.indexOf(target)
+      throw new Error(`Cycle detected in layer tree: ${[...stack.slice(start), target].map((item) => item.name).join(" -> ")}`)
+    }
+    visiting.add(target)
+    stack.push(target)
+    try {
+      const result = visit(target, { cache, visit: recur })
+      if (!cache.has(target)) cache.set(target, result)
+      return result
+    } finally {
+      stack.pop()
+      visiting.delete(target)
+    }
+  }
+  return recur(root)
+}
+```
+
+这是教科书式的 DFS + 三色标记：
+
+- **cache**（白）：已完成。
+- **visiting**（灰）：当前栈帧。
+- **未访问**（黑）：还没进来。
+
+循环检测时把 `stack` 切片成 `start = stack.indexOf(target)`，得到的就是"环上"的节点列表，再 `.map(item => item.name).join(" -> ")` 打印成 `A -> B -> C -> A` 形式的错误信息。比堆栈跟踪更直观。
+
+#### 6.2.3 `hoist` — 把同一 tag 的 Node 上提到根
+
+```ts
+// packages/core/src/effect/layer-node.ts:211
+export function hoist<A, E, T extends Tag, const Items extends Replacements = readonly []>(
+  root: Node<A, E, any>, tag: T, replacements?: ValidReplacements<Items>,
+): { readonly node: Node<A, E>; readonly hoisted: Node<unknown, E> } { ... }
+```
+
+**用途**：当 root 是 per-location 的（每个 Location 一份实例），但其中某些 Service 应该是 per-global（全局单例，如 `FileSystem.FileSystem`、`HttpClient`）—— `hoist(globalTag)` 会把这些节点从 root 中抽出来，组成独立的 `hoisted` 节点组，然后由"全局层"提供一次即可，避免每个 location 重建一份。
+
+`app-node.ts`（14 行）就定义了这套语义：
+
+```ts
+// packages/core/src/effect/app-node.ts:3
+export const tags = LayerNode.tags({
+  location: ["global"],
+  global: [],
+})
+export const makeGlobalNode = tags.make("global")
+export const makeLocationNode = tags.make("location")
+```
+
+#### 6.2.4 `compile` — 把节点图折叠成单个 `Layer.Layer<A, E>`
+
+```ts
+// packages/core/src/effect/layer-node.ts:250
+export function compile<A, E, const Items extends Replacements = readonly []>(
+  root: Node<A, E, any>, replacements?: ValidReplacements<Items>,
+): Layer.Layer<A, E> {
+  const replacementMap = replacementMapFrom(replacements)
+  const cache = new Map<AnyNode, RuntimeLayer>()
+  const compileNode = (node: AnyNode) =>
+    walk<RuntimeLayer>(node, (node, context) => {
+      if (node.kind === "unbound") throw new Error(`Unbound layer node: ${node.name}`)
+      const dependencies = node.dependencies.flatMap(flatten).map(context.visit)
+      const implementation = node.implementation! as RuntimeLayer
+      return dependencies.length === 0 ? implementation : implementation.pipe(Layer.provide(dependencies as [RuntimeLayer, ...RuntimeLayer[]]))
+    }, { cache, resolve: (node) => replacementMap.get(node.name) ?? node })
+  const layers = flatten(root).map((node) => compileNode(node))
+  const layer = layers.reduce<RuntimeLayer>((result, layer) => layer.pipe(Layer.provideMerge(result)), Layer.empty)
+  return layer as Layer.Layer<A, E>
+}
+```
+
+注意四点：
+
+1. **缓存复用**：`cache` 让每个 Node 只编译一次。
+2. **替换（Replacement）**：测试时 `replacementMap` 把 `Local` 节点用 `Mock` 替换；保留 `tag`，所以"标签一致性"约束可被静态检查（参见 `CheckReplacement`）。
+3. **`flatten` 处理 group**：把 group 节点的 dependencies 平铺成一维数组。
+4. **`Layer.provideMerge` 归约**：所有顶层 layer 用 `provideMerge` 合到一起。
+
+#### 6.2.5 真实例子 — 平台层 DI
+
+`packages/core/src/effect/app-node-platform.ts`（18 行）实例：
+
+```ts
+export const filesystem = makeGlobalNode({ service: FileSystem.FileSystem, layer: NodeFileSystem.layer, deps: [] })
+export const path = makeGlobalNode({ service: Path.Path, layer: NodePath.layer, deps: [] })
+export const httpClient = makeGlobalNode({ service: HttpClient.HttpClient, layer: FetchHttpClient.layer, deps: [] })
+export const requestExecutor = makeGlobalNode({
+  service: RequestExecutor.Service, layer: RequestExecutor.layer, deps: [httpClient],
+})
+export const llmClient = makeGlobalNode({
+  service: LLMClient.Service, layer: LLMClient.layer, deps: [requestExecutor],
+})
+```
+
+这就是个清晰的 DAG：`FileSystem ← Path → HttpClient → RequestExecutor → LLMClient`。每个 Node 用 `makeGlobalNode` 标记 `tag: "global"`，编译时被 hoist 出去不参与 Location 重建。
+
+而 `ToolRegistry.node`（`packages/core/src/tool/registry.ts:137`）则是 `makeLocationNode`，每次切换工作目录都会重建 Tool Registry 的实例（permission、location 都会变）。
+
+#### 6.2.6 `app-node-builder.ts` 的 unbound 兜底
+
+```ts
+// packages/core/src/effect/app-node-builder.ts:6
+export function build<A, E>(root: LayerNode.Node<A, E, any>, replacements: LayerNode.Replacements = []) {
+  let allReplacements = replacements
+  if (LayerNode.hasUnbound(root, LocationServiceMap.node) && !hasReplacement(replacements, LocationServiceMap.node)) {
+    const locationMap = buildLocationServiceMap(replacements)
+    const locationMapNode = makeGlobalNode({ service: LocationServiceMap.Service, layer: locationMap, deps: [] })
+    allReplacements = replacements.concat([[LocationServiceMap.node, locationMapNode]])
+  }
+  return LayerNode.compile(root, allReplacements)
+}
+```
+
+**用法**：调用 `AppNodeBuilder.build(root)` 时，自动检测 root 图中是否有 unbound 的 `LocationServiceMap.node`，如果有就动态生成一个，并把生成结果作为 replacement 注入编译流水线。**这是个杀手锏**：测试时可以传 `replacements` 自己 mock；生产代码不传也能跑通。
+
+#### 6.2.7 对 laew 的 P0/P1 借鉴
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | DI 拓扑层 | 引入"节点 + 依赖图 + 编译"模式，替代 laew 当前的"手动构造 Tool/Bash/Read/Write 单例"模式 | layer-node.ts:81-96 |
+| **P0** | 循环检测 | DFS + 三色标记在编译期报错，把"运行时栈溢出"提前到启动期 | layer-node.ts:171-209 |
+| **P0** | hoist(globalTag) | 把 `SqlitePool`、`HttpClient`、`Logger` 标记为 global，从根节点剥离避免重复构建 | layer-node.ts:211-248 |
+| **P0** | unbound + replacement | 测试时用 replacement mock Service，编译期就保证 tag 一致性 | layer-node.ts:117-135 |
+| **P1** | tag 拓扑分类 | `tags({ location: ["global"], global: [] })` 显式声明"location 依赖 global"层级 —— 避免手抄依赖图 | app-node.ts:3-7 |
+| **P1** | `serviceUse` proxy | 把 `Context.Service` 转成"只暴露 Effect-返回方法"的 proxy，避免在调用层写 `yield* Tag.use(...)` | service-use.ts:5-43 |
+| **P1** | ManagedRuntime 懒构造 | 第一次调用才构建 + `Layer.provideMerge(Observability.layer)` 透明注入 | runtime.ts:5-21 |
+| **P2** | KeyedMutex<SessionID> | "按 key 分桶"模型可作为 laew 后续"多端同步编辑同一 session"的串行原语 | keyed-mutex.ts:20-42 |
+| **P2** | build() 自动填 unbound | 检测 unbound 节点动态注入 replacement —— 让测试和生产代码共用同一入口 | app-node-builder.ts:6-17 |
+
+### 6.3 Schema 全栈 DI（vs Zod 的本质差异）
+
+opencode 用 `effect` 的 `Schema` 模块做"全栈数据契约"：`Schema.Struct({ ... })` 一处定义、同时生成（a）TypeScript 类型、（b）运行时 validator、（c）JSON Schema、（d）Encoder/Decoder Effect。这跟 Zod 的本质区别不是语法，而是**与 Effect runtime 的深度融合**。
+
+#### 6.3.1 基础 — `Schema.Class` 与 brand
+
+```ts
+// packages/llm/src/schema/ids.ts:14
+export const ModelID = Schema.String.pipe(Schema.brand("LLM.ModelID"))
+export const ProviderID = Schema.String.pipe(Schema.brand("LLM.ProviderID"))
+```
+
+`brand("LLM.ModelID")` 创建 nominal type：编译期 `ModelID` 不能直接赋给 `string`，运行时就是个普通 string，但 brand 让 TS 区分它们。laew 现在的 `protocol(anthropic|openai) + provider_name + model_name + end_point + api_key` 五元组可以用 brand 防止混用。
+
+#### 6.3.2 Tagged union — 协议中立错误模型
+
+`packages/llm/src/schema/errors.ts`（207 行）定义了一套 `_tag` 化的错误联合：
+
+```ts
+// packages/llm/src/schema/errors.ts:160
+export const LLMErrorReason = Schema.Union([
+  InvalidRequestReason,        // _tag: "InvalidRequest"
+  NoRouteReason,                // _tag: "NoRoute"
+  AuthenticationReason,         // _tag: "Authentication"
+  RateLimitReason,              // _tag: "RateLimit" — retryable=true
+  QuotaExceededReason,          // _tag: "QuotaExceeded"
+  ContentPolicyReason,          // _tag: "ContentPolicy"
+  ProviderInternalReason,       // _tag: "ProviderInternal" — retryable=true
+  TransportReason,              // _tag: "Transport"
+  InvalidProviderOutputReason,  // _tag: "InvalidProviderOutput"
+  UnknownProviderReason,        // _tag: "UnknownProvider"
+]).pipe(Schema.toTaggedUnion("_tag"))
+```
+
+每个 Reason class 都带 `get retryable()` —— 把"是否可重试"作为协议错误的属性。`RequestExecutor` 用 `Effect.catchTag(effect, "LLM.Error", ...)` 就能针对 `retryable` 字段决定是否 backoff：
+
+```ts
+// packages/llm/src/route/client.ts:353
+const retryStatusFailures = <A, R>(effect: Effect.Effect<A, LLMError, R>, retries = MAX_RETRIES, attempt = 0) =>
+  Effect.catchTag(effect, "LLM.Error", (error) => {
+    if (!error.retryable || retries <= 0) return Effect.fail(error)
+    return retryDelay(error, attempt).pipe(
+      Effect.flatMap((delay) => Effect.sleep(delay)),
+      Effect.flatMap(() => retryStatusFailures(effect, retries - 1, attempt + 1)),
+    )
+  })
+```
+
+**对比 laew**：laew 当前的 `AgentError` 没有 `_tag`，错误处理靠 `match` + 手动 if-else。引入 `_tag` + `retryable` 后，可以直接 `Error::retryable()` 做策略分发。
+
+#### 6.3.3 `CachePolicy` — 自适应的 cache 断点注入
+
+```ts
+// packages/llm/src/schema/options.ts:261
+export const CachePolicyObject = Schema.Struct({
+  tools: Schema.optional(Schema.Boolean),
+  system: Schema.optional(Schema.Boolean),
+  messages: Schema.optional(Schema.Union([
+    Schema.Literal("latest-user-message"),
+    Schema.Literal("latest-assistant"),
+    Schema.Struct({ tail: Schema.Number }),
+  ])),
+  ttlSeconds: Schema.optional(Schema.Number),
+})
+export const CachePolicy = Schema.Union([Schema.Literal("auto"), Schema.Literal("none"), CachePolicyObject])
+```
+
+设计思路（注释直接引述）：
+
+> `"auto"` is the recommended default for agent loops — it places one breakpoint at the last tool definition, one at the last system part, and one at the latest user message. The combination of provider invalidation hierarchy (tools → system → messages) and Anthropic/Bedrock's 20-block lookback means three trailing breakpoints reliably cover the static prefix.
+
+这一段把 cache 策略变成了一等公民 Schema —— 用户可以 `"auto"` 走默认、可以用 `"none"` 关掉、可以用 `CachePolicyObject` 精细控制每个轴的断点。`applyCachePolicy`（`cache-policy.ts`）拿到 `LLMRequest` 后自动注入 `CacheHint` 到对应位置，再由 provider wire 层翻译成各家缓存字段名（`anthropic: cache_control` / `bedrock: cachePoint` / `copilot: copilot_cache_control` 等）。
+
+#### 6.3.4 Tool 系统集成 — Schema 即协议
+
+`packages/core/src/tool/tool.ts`（162 行）展示了"用 Schema 定义 Tool 的"完整范式：
+
+```ts
+// packages/core/src/tool/tool.ts:71
+export function make<Input extends SchemaType<any>, Output extends SchemaType<any>, Structured = Output>(config: Config<Input, Output, Structured>): Definition<Input, Structured> {
+  const tool = Object.freeze({}) as Definition<Input, Structured>
+  const definitions = new Map<string, ToolDefinition>()
+  runtimes.set(tool, {
+    definition: (name) => {
+      const cached = definitions.get(name)
+      if (cached) return cached
+      const definition = new ToolDefinition({
+        name, description: config.description,
+        inputSchema: toJsonSchema(config.input),
+        outputSchema: toJsonSchema(config.structured ?? config.output),
+      })
+      definitions.set(name, definition)
+      return definition
+    },
+    settle: (call, context) =>
+      Schema.decodeUnknownEffect(config.input)(call.input).pipe(
+        Effect.mapError((error) => new ToolFailure({ message: `Invalid tool input: ${error.message}` })),
+        Effect.flatMap((input) =>
+          config.execute(input, context).pipe(
+            Effect.flatMap((output) =>
+              Schema.encodeEffect(config.output)(output).pipe(
+                Effect.flatMap((output) => {
+                  if (!config.structured || !config.toStructuredOutput) return Effect.succeed({ output, structured: output })
+                  return Schema.encodeEffect(config.structured)(config.toStructuredOutput({ input, output })).pipe(
+                    Effect.map((structured) => ({ output, structured })),
+                  )
+                }),
+                Effect.mapError((error) => new ToolFailure({ message: `Tool returned an invalid value for its output schema: ${error.message}` })),
+              ),
+            ),
+            ...
+          ),
+        ),
+      ),
+  })
+  return tool
+}
+
+function toJsonSchema(schema: Schema.Top): JsonSchema.JsonSchema {
+  const document = Schema.toJsonSchemaDocument(schema)
+  if (Object.keys(document.definitions).length === 0) return document.schema
+  return { ...document.schema, $defs: document.definitions }
+}
+```
+
+整个流程：
+
+1. **`Schema.Struct` 定义 input/output**：编译期推导类型，运行时做 decode/encode。
+2. **`toJsonSchema(config.input)`**：把 Schema 转成 `{ $defs, ...schema }` —— 这是发给 LLM 的 tool definition 的 `parameters` 字段。
+3. **缓存**：每次调用 `definition(name)` 缓存到 `Map`，避免重复 JSON Schema 转换。
+4. **`Schema.decodeUnknownEffect(config.input)(call.input)`**：模型返回的 `tool_call.input` 是 `unknown`（模型可能编出非法 JSON），用 Schema decode 校验，失败抛 `ToolFailure`。
+5. **`Schema.encodeEffect(config.output)`**：tool 执行的输出 encode 回 wire 格式。
+6. **`structured` 双重 schema**：可选的 `Structured` + `toStructuredOutput`，把 raw output 投影成更结构化的"模型友好"版本。
+
+#### 6.3.5 BashTool / EditTool / ReadTool — 实际 Schema 定义
+
+`packages/core/src/tool/bash.ts:23`：
+
+```ts
+export const Input = Schema.Struct({
+  command: Schema.String.annotate({ description: "Shell command string to execute" }),
+  workdir: Schema.String.pipe(Schema.optional).annotate({
+    description: "Working directory. Defaults to the active Location; relative paths resolve from that Location.",
+  }),
+  timeout: PositiveInt.check(Schema.isLessThanOrEqualTo(MAX_TIMEOUT_MS))
+    .pipe(Schema.optional)
+    .annotate({
+      description: `Timeout in milliseconds. Defaults to ${DEFAULT_TIMEOUT_MS} and may not exceed ${MAX_TIMEOUT_MS}.`,
+    }),
+})
+```
+
+注意 `PositiveInt.check(Schema.isLessThanOrEqualTo(MAX_TIMEOUT_MS))` —— 用 Schema 校验"上限 600 秒"，省掉了手动写 `if (input.timeout > MAX_TIMEOUT_MS) throw` 的代码。`MAX_TIMEOUT_MS = 10 * 60 * 1_000` 在同文件第 20 行。
+
+#### 6.3.6 与 Zod 的核心差异
+
+| 维度 | Zod | Effect Schema |
+|---|---|---|
+| 类型推导 | `z.infer<typeof schema>` | `Schema.Schema.Type<typeof schema>` / `Encoded` / `DecodingContext` |
+| 校验产物 | `safeParse()` 返 `{ success, data, error }` | `Schema.decodeUnknownEffect(s)(input)` 返 `Effect<A, ParseError, R>` |
+| JSON Schema | `z.toJSONSchema(schema)` | `Schema.toJsonSchemaDocument(schema)` 返 `{ schema, definitions }` |
+| 与 runtime 集成 | 无（Zod 4 加了 `safeParseAsync` 但缺 fiber 概念） | 深度集成 —— decode 是 Effect，可与 `Effect.catchTag`、`Effect.retry`、`Stream.mapEffect` 组合 |
+| 错误模型 | `ZodError` 单类，多 issue | `ParseIssue` 树，支持 `catchTag` 精确定位 |
+| Encoder/Decoder 分离 | 单一 parser | encode/decode 双向，decode-only Schema 用 `decodeUnknown` |
+| 校验表达式 | `.refine()` 自定义 | `.check(predicate)` / `.filter(predicate)` + `pipe` 组合 |
+
+**关键差异**：Effect Schema 是 **Effect-returning**。这意味着 `decodeUnknownEffect` 可以 `pipe(Effect.retry(...))`、`pipe(Effect.catchTag(...))`、`pipe(Stream.mapEffect(...))`。Zod 即便有 `safeParseAsync`，本质还是 Promise 包装，**没有 fiber 语义**。
+
+#### 6.3.7 对 laew 的 P0/P1 借鉴
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | ToolDefinition 一体化 | 把当前 `BashTool` 的 `description + input_schema` 改用 Schema 定义，runtime 自动 derive JSON Schema 喂给模型 | tool.ts:71-132 |
+| **P0** | decode 输入校验 | `Schema.decodeUnknownEffect(config.input)(call.input)` —— 模型吐非法 JSON 自动 fallback 到 `ToolFailure` | tool.ts:92-93 |
+| **P0** | Schema 数值边界 | `PositiveInt.check(Schema.isLessThanOrEqualTo(MAX_TIMEOUT_MS))` —— 校验替代手写 if | bash.ts:28-32 |
+| **P1** | Tagged Error | `AgentError` 加 `_tag`，`Error::retryable()` 一行决定是否 backoff | errors.ts:160-172 |
+| **P1** | brand 区分协议 | `ProviderID.brand("Anthropic")` 与 `ProviderID.brand("OpenAI")` 类型不互通 | ids.ts:14-19 |
+| **P1** | CachePolicy Schema | 把缓存策略从代码常量升级成可序列化 Schema，支持用户配置覆盖 | options.ts:261-276 |
+| **P2** | toJsonSchema 缓存 | `Map<string, ToolDefinition>` —— 同一工具多 session 复用 JSON Schema | tool.ts:77 |
+| **P2** | Structured 输出 | `Structured = Output` + `toStructuredOutput` —— raw 输出投影成模型友好版本 | tool.ts:44-53 |
+
+### 6.4 LLM 协议分层 — Protocol / Endpoint / Auth / Framing / Transport
+
+`packages/llm/src/route/executor.ts`（385 行）定义了"协议分层"的 4 轴模型。注释原话：
+
+```ts
+// packages/llm/src/route/executor.ts:303
+// - `Protocol` — what is the API I'm speaking?
+// - `Endpoint` — where do I send the request?
+// - `Auth` — how do I authenticate it?
+// - `Framing` — how do I cut the response stream into protocol frames?
+```
+
+加 `Transport`（HTTP / WebSocket）是第 5 轴。这五轴构成一个 5-tuple，任意组合就能生成一个新部署。
+
+#### 6.4.1 Route 五元组
+
+```ts
+// packages/llm/src/route/executor.ts:36
+export interface Route<Body, Prepared = unknown> {
+  readonly id: string
+  readonly provider?: ProviderID
+  readonly protocol: ProtocolID
+  readonly endpoint: Endpoint<Body>
+  readonly auth: AuthDef
+  readonly transport: Transport<Body, Prepared, unknown>
+  readonly defaults: RouteDefaults
+  readonly body: RouteBody<Body>
+  readonly with: (patch: RoutePatch<Body, Prepared>) => Route<Body, Prepared>
+  readonly model: (input: RouteMappedModelInput) => Model
+  readonly prepareTransport: (body: Body, request: LLMRequest) => Effect.Effect<Prepared, LLMError>
+  readonly streamPrepared: (
+    prepared: Prepared,
+    request: LLMRequest,
+    runtime: TransportRuntime,
+  ) => Stream.Stream<LLMEvent, LLMError>
+}
+```
+
+#### 6.4.2 Protocol — 协议语义
+
+```ts
+// packages/llm/src/route/protocol.ts:36
+export interface Protocol<Body, Frame, Event, State> {
+  readonly id: ProtocolID
+  readonly body: ProtocolBody<Body>
+  readonly stream: ProtocolStream<Frame, Event, State>
+}
+```
+
+四个类型参数：
+
+- **`Body`**：provider-native 请求体。`body.schema` 是 Schema Codec（同时 encode + decode）；`body.from(request)` 把通用 `LLMRequest` 转成 Body。
+- **`Frame`**：响应流的一个 frame（SSE 是 string、AWS event stream 是 parsed binary）。
+- **`Event`**：从 Frame decode 出的单个事件。
+- **`State`**：`stream.step(state, event)` 的累加器。
+
+实现示例：
+
+```ts
+// packages/llm/src/protocols/anthropic-messages.ts:35
+const AnthropicCacheControl = Schema.Struct({
+  type: Schema.tag("ephemeral"),
+  ttl: Schema.optional(Schema.Literals(["5m", "1h"])),
+})
+const AnthropicTextBlock = Schema.Struct({ type: Schema.tag("text"), text: Schema.String, cache_control: Schema.optional(AnthropicCacheControl) })
+const AnthropicImageBlock = Schema.Struct({ type: Schema.tag("image"), source: Schema.Struct({ ... }), cache_control: Schema.optional(AnthropicCacheControl) })
+const AnthropicToolUseBlock = Schema.Struct({ type: Schema.tag("tool_use"), id: Schema.String, name: Schema.String, input: Schema.Unknown, cache_control: Schema.optional(AnthropicCacheControl) })
+```
+
+整个 anthropic-messages protocol 文件 855 行，100% Schema 描述 wire format。
+
+#### 6.4.3 Endpoint / Auth / Framing 三轴
+
+**Endpoint**（`endpoint.ts:53`）：URL 模板，支持 path 替换和 query 注入。
+
+**Auth**（`auth.ts:156`）：模块化的 auth DSL：
+
+```ts
+// packages/llm/src/route/auth.ts:112
+export function bearer(source: Secret | Credential): Auth
+export function header(name: string): (source: Secret | Credential) => Auth
+export function bearerHeader(name: string): (source: Secret | Credential) => Auth
+```
+
+`Auth` 是 composable 的：
+
+```ts
+// packages/llm/src/route/auth.ts:54
+const auth = (apply: Auth["apply"]): Auth => {
+  const self: Auth = {
+    apply,
+    andThen: (that) => auth((input) => apply(input).pipe(Effect.flatMap((headers) => that.apply({ ...input, headers })))),
+    orElse: (that) => auth((input) => apply(input).pipe(Effect.catch(() => that.apply(input)))),
+    pipe: (f) => f(self),
+  }
+  return self
+}
+```
+
+`andThen` / `orElse` 把多个 auth 策略串起来 —— 比如"Bearer 优先，否则 ANTHROPIC_API_KEY"。
+
+**Framing**（`framing.ts:27`）：流分帧，目前主要是 SSE（OpenAI/Anthropic 风格）和 AWS event stream（Bedrock）。
+
+#### 6.4.4 Transport — HTTP / WebSocket 双通道
+
+`packages/llm/src/route/transport/http.ts` 和 `transport/websocket.ts`：
+
+- HTTP transport：标准 JSON over HTTPS，复用 `effect/unstable/http` 的 `HttpClient`。
+- WebSocket transport：openai-compatible 的 Realtime API 用，路径在 `transport/websocket.ts`。
+
+`executor.ts` 的 `streamPrepared`（`executor.ts:279`）展示了 transport 与 protocol 的协同：
+
+```ts
+const events = routeInput.transport.frames(prepared, request, runtime)
+  .pipe(
+    Stream.mapEffect(decodeEvent(route)),
+    protocol.stream.terminal ? Stream.takeUntil(protocol.stream.terminal) : (stream) => stream,
+  )
+return events.pipe(
+  Stream.mapAccumEffect(() => protocol.stream.initial(request), protocol.stream.step, protocol.stream.onHalt ? { onHalt: protocol.stream.onHalt } : undefined),
+  Stream.catchCause((cause) => Stream.fail(streamError(route, `Failed to read ${route} stream`, cause))),
+)
+```
+
+三阶段管道：
+
+1. **`Stream.mapEffect(decodeEvent)`**：frame (SSE string) → provider Event。
+2. **`Stream.takeUntil(terminal)`**：如果 protocol 有明确终止条件（如 `[DONE]` 哨兵），提前截断。
+3. **`Stream.mapAccumEffect(initial, step, onHalt?)`**：状态机累加，输出 `LLMEvent` 序列；`onHalt` 在流结束时 flush 残余事件。
+
+#### 6.4.5 RequestExecutor — 重试 / 脱敏 / 限流
+
+`packages/llm/src/route/client.ts`（385 行）的 `RequestExecutor`：
+
+```ts
+// packages/llm/src/route/client.ts:91
+const retryableStatus = (status: number) => status === 429 || status === 503 || status === 504 || status === 529
+```
+
+**重试策略**：
+
+- `MAX_RETRIES = 2`（同文件第 36 行），**最多 2 次**（加上原请求共 3 次尝试）。
+- `BASE_DELAY_MS = 500`，`MAX_DELAY_MS = 10_000`。
+- 退避：`Math.min(BASE_DELAY_MS * 2 ** attempt * 0.8, MAX_DELAY_MS) ~ Math.min(BASE_DELAY_MS * 2 ** attempt * 1.2, MAX_DELAY_MS)` —— 指数退避加 ±20% jitter。
+- 如果 provider 返回 `retry-after-ms` 或 `retry-after`，**优先使用 provider 的指示**。
+
+**脱敏**（`client.ts:48-66`）：
+
+```ts
+const SENSITIVE_NAME_SOURCE =
+  "authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|token|secret|credential|signature|x-amz-signature"
+const SENSITIVE_NAME = new RegExp(SENSITIVE_NAME_SOURCE, "i")
+const SHORT_QUERY_NAME = /^(key|sig)$/i
+const SENSITIVE_BODY_FIELD = new RegExp(`(?:${SENSITIVE_NAME_SOURCE}|key)`, "i")
+const REDACT_JSON_FIELD = new RegExp(`("(?:${SENSITIVE_BODY_FIELD.source})"\\s*:\\s*)"[^"]*"`, "gi")
+const REDACT_QUERY_FIELD = new RegExp(`((?:${SENSITIVE_BODY_FIELD.source})=)[^&\\s"]+`, "gi")
+```
+
+**两层脱敏**：
+
+1. **结构性**：正则替换 `"key": "secret"` → `"key": "<redacted>"`、`?sig=xxx` → `?sig=<redacted>`。
+2. **字面值**：把请求中实际发的 secret 字符串（auth 头里的 bearer 值、query 里的 key）也替换掉 —— 防 provider 把 secret 原样 echo 回 response body。
+
+**Rate limit 解析**（`client.ts:112-148`）：
+
+```ts
+Object.entries(headers).forEach(([name, value]) => {
+  const openaiLimit = /^x-ratelimit-limit-(.+)$/.exec(name)?.[1]
+  if (openaiLimit) return addRateLimitValue(limit, openaiLimit, value)
+  const anthropic = /^anthropic-ratelimit-(.+)-(limit|remaining|reset)$/.exec(name)
+  ...
+})
+```
+
+同时识别 OpenAI（`x-ratelimit-limit-{kind}`）和 Anthropic（`anthropic-ratelimit-{kind}-{limit|remaining|reset}`）两种命名规范，写入统一 `HttpRateLimitDetails`。
+
+#### 6.4.6 Provider 6 套差异化
+
+`packages/llm/src/providers/` 目录列了 9 个 provider facade 文件。每个 facade 都是薄壳：声明 `id`、`routes`、可选 `Config`，主要工作是 `route.with(...)` 注入 provider-specific 的 defaults 和 auth。
+
+##### 6.4.6.1 Anthropic
+
+```ts
+// packages/llm/src/providers/anthropic.ts:25
+export const configure = (input: Config = {}) => {
+  const route = configuredRoute(input)
+  return { id, model: (modelID: string | ModelID) => route.model({ id: modelID }), configure }
+}
+const auth = (options: ProviderAuthOption<"optional">) => {
+  if ("auth" in options && options.auth) return options.auth
+  return Auth.optional("apiKey" in options ? options.apiKey : undefined, "apiKey")
+    .orElse(Auth.config("ANTHROPIC_API_KEY"))
+    .pipe(Auth.header("x-api-key"))  // ← Anthropic 用 x-api-key，不是 Bearer
+}
+```
+
+关键差异：**Anthropic 用 `x-api-key` 头，不是 `Authorization: Bearer`**。所以走专用 `Auth.header("x-api-key")`。
+
+##### 6.4.6.2 OpenAI
+
+```ts
+// packages/llm/src/providers/openai.ts:63
+export const routes = [OpenAIResponses.route, OpenAIChat.route]
+```
+
+**双路由**：OpenAI 同时支持 chat completions 和 responses（GPT-5 新接口）。每个路由的 `body.from` 不同，模型 router 根据 `model.id` 自动选 —— 老的用 chat、新的用 responses。
+
+##### 6.4.6.3 OpenRouter
+
+```ts
+// packages/llm/src/providers/openrouter.ts:33
+const OpenRouterBody = Schema.StructWithRest(Schema.Struct(OpenAIChat.bodyFields), [
+  Schema.Record(Schema.String, Schema.Any),
+])
+export const protocol = Protocol.make({
+  id: "openrouter-chat",
+  body: {
+    schema: OpenRouterBody,
+    from: (request) => OpenAIChat.protocol.body.from(request).pipe(
+      Effect.map((body) => ({ ...body, ...bodyOptions(request.providerOptions?.openrouter) }) as OpenRouterBody),
+    ),
+  },
+  stream: OpenAIChat.protocol.stream,
+})
+```
+
+**关键 trick**：`Schema.StructWithRest(Struct(bodyFields), [Record(String, Any)])` —— 前部分是 OpenAI chat 的字段、后部分是 openrouter 的任意扩展字段（`usage`、`reasoning`、`prompt_cache_key`）。这样 `body.from` 把 openai 的 body 生成出来后再 spread `bodyOptions(...)` 注入 openrouter 专属选项，**不完全 fork 协议**。
+
+##### 6.4.6.4 Amazon Bedrock
+
+```ts
+// packages/llm/src/providers/amazon-bedrock.ts:18
+export const routes = [BedrockConverse.route]
+const bedrockBaseURL = (region: string) => `https://bedrock-runtime.${region}.amazonaws.com`
+```
+
+**关键差异**：
+
+- 协议：Bedrock Converse API（AWS 自有协议，不同于 Anthropic native）—— 走 `bedrock-converse.ts`（674 行）。
+- 区域 URL：`bedrock-runtime.{region}.amazonaws.com`，默认 `us-east-1`。
+- Auth：**AWS SigV4**（`BedrockConverse.sigV4Auth(credentials)`），不是 Bearer。
+- Framing：AWS event stream binary（不是 SSE），需要单独 `bedrock-event-stream.ts`（87 行）做 decoder。
+
+##### 6.4.6.5 GitHub Copilot
+
+```ts
+// packages/llm/src/providers/github-copilot.ts:19
+export const shouldUseResponsesApi = (modelID: string | ModelID, endpoint?: ModelOptions["endpoint"]) => {
+  if (endpoint) return endpoint === "responses"
+  const model = String(modelID)
+  const match = /^gpt-(\d+)/.exec(model)
+  if (!match) return false
+  return Number(match[1]) >= 5 && !model.startsWith("gpt-5-mini")
+}
+```
+
+**关键 trick**：
+
+- 没有规范 URL，调用方必须显式传 `baseURL`（注释原话："GitHub Copilot has no canonical public URL — callers (opencode, etc.) must supply `baseURL` explicitly."）。
+- 模型路由：`gpt-5` 以上的走 Responses API（`/responses`），其他走 chat completions。但 `gpt-5-mini` 例外 —— 还是 chat。
+- Auth：Bearer（`AuthOptions.bearer(options, [])`），环境变量列表是空数组（`[]`），意思是"不读环境变量，必须显式传 apiKey"。
+
+##### 6.4.6.6 OpenAI-Compatible 家族（含 alibaba / baseten / cerebras / deepinfra / deepseek / fireworks / groq / togetherai）
+
+```ts
+// packages/llm/src/providers/openai-compatible-profile.ts:6
+export const profiles = {
+  baseten: { provider: "baseten", baseURL: "https://inference.baseten.co/v1" },
+  cerebras: { provider: "cerebras", baseURL: "https://api.cerebras.ai/v1" },
+  deepinfra: { provider: "deepinfra", baseURL: "https://api.deepinfra.com/v1/openai" },
+  deepseek: { provider: "deepseek", baseURL: "https://api.deepseek.com/v1" },
+  fireworks: { provider: "fireworks", baseURL: "https://api.fireworks.ai/inference/v1" },
+  groq: { provider: "groq", baseURL: "https://api.groq.com/openai/v1" },
+  openrouter: { provider: "openrouter", baseURL: "https://openrouter.ai/api/v1" },
+  togetherai: { provider: "togetherai", baseURL: "https://api.together.xyz/v1" },
+  xai: { provider: "xai", baseURL: "https://api.x.ai/v1" },
+} as const
+```
+
+**关键设计**：所有兼容 OpenAI chat 协议的 provider 复用同一 `OpenAICompatibleChat.route`，只换 `baseURL` + provider name。
+
+`alibaba`（通义千问，DashScope 的 OpenAI-compatible 入口）虽然在 CLAUDE.md 描述中出现，但在源码 profiles 里**目前没列** —— 推测是配置文件层做的（不在 `packages/llm/src/providers/` 而是在 `models-dev.ts` 之类的 model registry 里）。
+
+##### 6.4.6.7 差异化总结表
+
+| Provider | 协议 | Auth | Framing | 路由选择 | 特殊点 |
+|---|---|---|---|---|---|
+| **Anthropic** | anthropic-messages | `x-api-key` | SSE | 单路由 | cache_control TTL 5m/1h |
+| **OpenAI** | chat + responses | Bearer | SSE | 按 model 自动选 | GPT-5+ → responses，其他 → chat |
+| **OpenRouter** | openai-chat (扩展) | Bearer | SSE | 单路由 | `prompt_cache_key`、`usage`、`reasoning` 透传 |
+| **Bedrock** | converse (binary) | SigV4 | event stream | 单路由 | 区域 URL、SigV4 签名 |
+| **Copilot** | chat + responses | Bearer (显式) | SSE | `gpt-5+` 且非 `gpt-5-mini` → responses | 无规范 URL，调用方必须传 baseURL |
+| **OpenAI-compatible** | openai-chat | Bearer | SSE | 单路由 | profile 化 baseURL，9 套预设 |
+| **Google Gemini** | generateContent | API key | SSE | 单路由 | 独立 `gemini.ts` 协议 |
+| **Cloudflare AI** | workers-ai | API token | SSE | 单路由 | Workers AI gateway |
+| **Azure** | openai-chat | API key + deployment | SSE | 单路由 | 走 Azure-specific endpoint |
+
+#### 6.4.7 对 laew 的 P0/P1 借鉴
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | 5 元组协议 | `Route = Protocol × Endpoint × Auth × Framing × Transport` —— 让 laew 的 `provider.rs` 从"大 if-else"变成组合 | route/executor.ts:36-53 |
+| **P0** | 协议分层 | `Protocol` 只关心"模型说什么"，`Endpoint` / `Auth` 只关心"发给谁 / 怎么鉴权" | route/protocol.ts:36-43 |
+| **P0** | 脱敏 2 层 | 结构脱敏 + 字面值脱敏 —— laew 的 `mask_key` 应该也做"原值 echo 防漏" | route/client.ts:48-66 |
+| **P1** | retryable 标记 | `Error::retryable()` 决定 backoff，无需在 retry 代码里枚举错误 | schema/errors.ts:160-172 |
+| **P1** | rate limit 双命名 | 同时识别 OpenAI / Anthropic 命名规范 —— laew 可统一 `RateLimitDetails` | route/client.ts:112-148 |
+| **P1** | takeUntil + mapAccumEffect | 流终止条件 + 状态机累加，让 Anthropic 的 `[DONE]` 和 Bedrock 的事件终止条件统一 | route/executor.ts:279-294 |
+| **P2** | provider profile | OpenAI-compatible 9 套 profile —— laew 接入"小众 provider"（如 deepseek、together）时不用写一整条 if 分支 | providers/openai-compatible-profile.ts:6 |
+| **P2** | StructWithRest | OpenRouter 风格 —— 在 OpenAI body schema 后面加开放字段，扩展兼容 provider 而不 fork 协议 | providers/openrouter.ts:33-35 |
+
+### 6.5 Tool 系统的全栈集成
+
+#### 6.5.1 BuiltInTools 静态组合
+
+`packages/core/src/tool/builtins.ts`（48 行）显式列出 12 个内置工具节点：
+
+```ts
+// packages/core/src/tool/builtins.ts:31
+export const node = makeLocationNode({
+  name: "built-in-tools",
+  layer: Layer.empty,  // ← 注意：这一层是 Layer.empty
+  deps: [
+    ApplyPatchTool.node, BashTool.node, EditTool.node, GlobTool.node,
+    GrepTool.node, QuestionTool.node, ReadTool.node, SkillTool.node,
+    TodoWriteTool.node, WebFetchTool.node, WebSearchTool.node, WriteTool.node,
+  ],
+})
+```
+
+**关键 trick**：`layer: Layer.empty` —— 这一层本身不贡献 Service，只把 12 个子节点的 deps"挂"上来。编译时所有 12 个子节点会通过 `Layer.provideMerge` 一起合并到 root layer。所以最终 root layer 包含所有 12 个 tool 的注册副作用。
+
+#### 6.5.2 ApplicationTools — 动态注册
+
+`packages/core/src/tool/application-tools.ts`（57 行）：与 BuiltInTools 不同的是 dynamic register。注释解释："动态 MCP 和 plugin tools 之后用 separate scoped canonical registrations"。
+
+```ts
+const state = State.create<Data, Draft>({
+  initial: () => ({ entries: new Map() }),
+  draft: (draft) => ({
+    set: (name, tool) => { draft.entries.set(name, tool) },
+  }),
+})
+```
+
+`State.create` 是 opencode 自研的"可读写 state"抽象，支持 transform with draft。ApplicationTools 节点（`makeGlobalNode`）注册后，全局任何 Tool 注册请求都通过 `state.transform(d => d.set(name, tool))`。
+
+#### 6.5.3 ToolRegistry — 合并 + 权限过滤
+
+`packages/core/src/tool/registry.ts`（147 行）：
+
+```ts
+// packages/core/src/tool/registry.ts:106
+materialize: Effect.fn("ToolRegistry.materialize")(function* (permissions = []) {
+  const registrations = new Map(applications.entries())
+  for (const [name, entries] of local) {
+    const registration = entries.at(-1)?.registration
+    if (registration) registrations.set(name, registration)
+  }
+  for (const [name, registration] of registrations)
+    if (whollyDisabled(permission(registration.tool, name), permissions)) registrations.delete(name)
+  return {
+    definitions: Array.from(registrations, ([name, registration]) => definition(name, registration.tool)),
+    settle: (input) => {
+      const registration = registrations.get(input.call.name)
+      if (registration) return settleWith(input, registration.identity)
+      return Effect.succeed({ result: { type: "error", value: `Unknown tool: ${input.call.name}` } })
+    },
+  }
+})
+```
+
+**关键设计**：
+
+1. **`local` 栈**：Local 注册有 `token`（finalizer 标记），注销时清理。同名工具后注册的覆盖先注册的（`entries.at(-1)`）。
+2. **Materialize**：把 application + local 合并成最终 `Map<name, registration>`。
+3. **权限过滤**：调用 `whollyDisabled(action, permissions)` 删掉被 deny 的工具。`Wildcard.match(action, rule.action)` 处理 `*` 通配。
+4. **`settle` 处理 stale call**：模型可能在工具已经被卸载后发来 `tool_call.name`，返回 `"Stale tool call"` 错误而不是崩溃。
+
+#### 6.5.4 SessionCompaction — 自动摘要管线
+
+`packages/core/src/session/compaction.ts`（248 行）展示了 Session 级别的智能化：
+
+```ts
+// packages/core/src/session/compaction.ts:12
+const DEFAULT_BUFFER = 20_000
+const DEFAULT_KEEP_TOKENS = 8_000
+const TOOL_OUTPUT_MAX_CHARS = 2_000
+const SUMMARY_OUTPUT_TOKENS = 4_096
+const SUMMARY_TEMPLATE = `...Objective / Important Details / Work State / Next Move / Relevant Files...`
+```
+
+**关键设计**：
+
+1. **Token 估算**（`Token.estimate`）：用 `JSON.stringify(value).length / 4` 估算 token 数（粗略但够用）。
+2. **`select(entries, tokens)`** 反向累加：从最近的 entry 开始累加 token 数，直到超过 `keep_tokens`，把 conversation 切成 `head` + `recent`。
+3. **`buildPrompt` 模板**：根据是否存在 `previousSummary` 选两种 prompt 之一 —— 新建 summary 或更新已有 summary。
+4. **`compactAfterOverflow`** 主动调用 LLM 生成摘要，监听 `LLMEvent.is.textDelta` 累加 chunks。
+5. **`compactIfNeeded`** 总入口，根据 `auto + buffer + tokens` 配置判断。
+6. **两条 event**：`SessionEvent.Compaction.Started` / `Compaction.Ended`，TUI 可见。
+
+#### 6.5.5 BashTool / EditTool 的 30 行级细节
+
+**BashTool**（`packages/core/src/tool/bash.ts:79-95`）的 token-based 外部目录检测：
+
+```ts
+const shellTokens = (command: string) => command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []
+const unquote = (value: string) => value.replace(/^(['"])(.*)\1$/, "$2")
+const externalCommandDirectories = Effect.fn("BashTool.externalCommandDirectories")(function* (fs, command, cwd) {
+  const directories = new Set<string>()
+  for (const token of shellTokens(command)) {
+    const value = unquote(token).replace(/[;,|&]+$/, "")
+    if (!path.isAbsolute(value)) continue
+    const resolved = yield* fs.resolve(value)
+    if (FSUtil.contains(cwd, resolved)) continue
+    directories.add(yield* fs.resolve(path.dirname(resolved)))
+  }
+  return [...directories]
+})
+```
+
+**关键**：
+
+- 用 regex 解析 shell 命令的 tokens（保留引号）。
+- 对每个 token 判断是不是 absolute path 且不在 cwd 内。
+- 收集所有外部目录，作为 permission 检查的 resource —— 比简单的"命令是否含 `..`"更精细。
+
+**EditTool**（`packages/core/src/tool/edit.ts:73-80`）的 diff 输出格式：
+
+```ts
+export const toModelOutput = (output: Output, oldString: string, newString: string) => [
+  `Edited file successfully: ${output.files[0]?.file}`,
+  `Replacements: ${output.replacements}`,
+  "```diff",
+  ...previewLines(oldString, "-"),
+  ...previewLines(newString, "+"),
+  "```",
+]
+```
+
+模型看到的反馈是**真实 diff 风格**，便于它下一轮调整。
+
+#### 6.5.6 对 laew 的 P0/P1 借鉴
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | BuiltInTools 静态组合 | `Layer.empty` + 12 个子节点 deps —— 等价于 laew 的 `builtin_registry()` | builtins.ts:31-48 |
+| **P0** | Stale tool call 处理 | 模型发来已卸载工具的调用 → 返回 `"Stale tool call"`，不崩溃 | registry.ts:117-119 |
+| **P0** | Tool output 截断 | `TOOL_OUTPUT_MAX_CHARS = 2_000` 防止大输出撑爆 context | compaction.ts:14 |
+| **P1** | Token 估算 | `Token.estimate(value)` —— laew 可用同样公式做 compaction 决策 | compaction.ts:83 |
+| **P1** | 反向累加切分 | 从最新 entry 倒着累加直到超阈值 —— 比"从头累加"更稳 | compaction.ts:148-157 |
+| **P1** | external directory 检测 | shell token 解析判断 absolute + 不在 cwd → 收集为 permission resource | bash.ts:79-95 |
+| **P1** | Summary 模板 | `Objective / Important Details / Work State / Next Move / Relevant Files` —— laew 可借鉴 session memory 摘要结构 | compaction.ts:16-40 |
+| **P2** | diff 输出格式 | `\`\`\`diff\n-...\n+...\n\`\`\`` 让模型下一轮调整更精确 | edit.ts:73-80 |
+
+### 6.6 Enterprise — Cloudflare Durable Object + R2 共享存储
+
+`packages/enterprise/`（35 个 .ts/.tsx 文件）实现了"在 Cloudflare Workers 上托管 opencode 共享会话"的能力。核心是把 share snapshot 存到 R2（兼容 S3），worker 进程无状态，靠 R2 持久化。
+
+#### 6.6.1 Storage Adapter
+
+`packages/enterprise/src/core/storage.ts`（129 行）：
+
+```ts
+// packages/enterprise/src/core/storage.ts:12
+function createAdapter(client: AwsClient, endpoint: string, bucket: string): Adapter {
+  const base = `${endpoint}/${bucket}`
+  return {
+    async read(path: string): Promise<string | undefined> {
+      const response = await client.fetch(`${base}/${path}`)
+      if (response.status === 404) return undefined
+      if (!response.ok) throw new Error(`Failed to read ${path}: ${response.status}`)
+      return response.text()
+    },
+    async write(path: string, value: string): Promise<void> {
+      const response = await client.fetch(`${base}/${path}`, {
+        method: "PUT", body: value, headers: { "Content-Type": "application/json" },
+      })
+      if (!response.ok) throw new Error(`Failed to write ${path}: ${response.status}`)
+    },
+    async remove(path: string): Promise<void> {
+      const response = await client.fetch(`${base}/${path}`, { method: "DELETE" })
+      if (!response.ok) throw new Error(`Failed to remove ${path}: ${response.status}`)
+    },
+    async list(options?: { prefix?: string; limit?: number; after?: string; before?: string }): Promise<string[]> {
+      const prefix = options?.prefix || ""
+      const params = new URLSearchParams({ "list-type": "2", prefix })
+      if (options?.limit) params.set("max-keys", options.limit.toString())
+      if (options?.after) {
+        const afterPath = prefix + options.after + ".json"
+        params.set("start-after", afterPath)
+      }
+      const response = await client.fetch(`${base}?${params}`)
+      if (!response.ok) throw new Error(`Failed to list ${prefix}: ${response.status}`)
+      const xml = await response.text()
+      const keys: string[] = []
+      const regex = /<Key>([^<]+)<\/Key>/g
+      let match
+      while ((match = regex.exec(xml)) !== null) keys.push(match[1])
+      if (options?.before) {
+        const beforePath = prefix + options.before + ".json"
+        return keys.filter((key) => key < beforePath)
+      }
+      return keys
+    },
+  }
+}
+```
+
+**关键设计**：
+
+1. **`aws4fetch`**（不是 AWS SDK）：用 `fetch` 直接打 S3-compatible API，避免在 Workers 里引入庞大的 AWS SDK。
+2. **双后端支持**：`s3()` 和 `r2()` 两个工厂，通过 `OPENCODE_STORAGE_ADAPTER` 环境变量选择。R2 endpoint 是 `${accountId}.r2.cloudflarestorage.com`。
+3. **`list` 用 S3 list-type=2 + max-keys + start-after**：标准 S3 listing，可分页。
+4. **`{prefix, after, before}` 范围扫描**：`after` / `before` 用于"snapshot 之后增量同步"。
+5. **`update<T>(key, fn)` 读改写**：`update` 内部用 `read` → 修改 → `write`，没有事务保证但大多数场景够用。
+
+#### 6.6.2 Share — 多端同步核心
+
+`packages/enterprise/src/core/share.ts`（232 行）实现 session 共享协议：
+
+```ts
+// packages/enterprise/src/core/share.ts:18
+export const Data = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("session"), data: z.custom<Session>() }),
+  z.object({ type: z.literal("message"), data: z.custom<Message>() }),
+  z.object({ type: z.literal("part"), data: z.custom<Part>() }),
+  z.object({ type: z.literal("session_diff"), data: z.custom<SnapshotFileDiff[]>() }),
+  z.object({ type: z.literal("model"), data: z.custom<Model[]>() }),
+])
+```
+
+5 种数据类型，discriminated by `type`。
+
+**Sync 协议**（`share.ts:156`）：
+
+```ts
+export const sync = fn(z.object({ share: Info.pick({ id: true, secret: true }), data: Data.array() }), async (input) => {
+  const share = await get(input.share.id)
+  if (!share) throw new Errors.NotFound(input.share.id)
+  if (share.secret !== input.share.secret) throw new Errors.InvalidSecret(input.share.id)
+  const data = (await readSnapshot(input.share.id)) ?? (await legacy(input.share.id))
+  await writeSnapshot(input.share.id, merge(data, input.data))
+})
+```
+
+**关键流程**：
+
+1. **校验 secret**：share ID + secret 必须匹配，否则 403。
+2. **读 snapshot**：从 R2 读 `share_snapshot/{id}`，拿当前完整 state。
+3. **合并新 data**：客户端发来的增量与现有数据按 `key(item)` 合并去重。
+4. **写 snapshot**：原子地写回（虽然 R2 不保证原子，但通常足够）。
+
+**legacy 兼容**（`share.ts:86`）：老的 share 是按"event 流"存的（每次增量存一个文件），新代码读出来后会**一次性 merge 成 snapshot**，并存一份 snapshot 副本。下次 sync 直接走 snapshot 路径。
+
+#### 6.6.3 entry-server.tsx — SolidStart SSR
+
+`packages/enterprise/src/entry-server.tsx`（Cloudflare Workers 入口）：
+
+- 用 SolidStart 做 SSR。
+- API 路由在 `routes/api/[...path].ts`（Catch-all API），所有 `/api/*` 请求都过这里。
+- 前端页面 `routes/share.tsx` + `share/[shareID].tsx` —— 公开访问 share ID 对应的 session。
+
+#### 6.6.4 对 laew 的 P0/P1 借鉴
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | aws4fetch 替代 SDK | Workers / 边缘场景用 fetch 直打 S3-compatible API，避免 AWS SDK 体积 | storage.ts:1-64 |
+| **P0** | 共享 ID + secret | share 创建时生成 crypto.randomUUID 作为 secret，删除/更新都要 secret 校验 | share.ts:117-128 |
+| **P0** | 数据类型 discriminated union | `type: "session" | "message" | "part" | "session_diff" | "model"` —— 单一 sync 入口 | share.ts:18-39 |
+| **P1** | legacy 兼容 | 老 event 流格式 → 一次性 merge 成 snapshot —— 协议升级无需客户端配合 | share.ts:86-115 |
+| **P1** | start-after + before 范围 | 增量同步用 `after: cursor` + `before: cursor` | storage.ts:40-62 |
+| **P1** | update<T> 读改写 | 没有事务，但 `update<T>(key, fn)` 是常用语义 | storage.ts:122-128 |
+| **P2** | Cloudflare Workers 部署 | laew 如果未来做"网页端查看 session"，可以借鉴 Workers + R2 模式 | entry-server.tsx |
+| **P2** | snapshot + event 双轨 | 老的 event 流 + 新的 snapshot 并行 —— 兼容旧客户端 | share.ts:78-83 |
+
+### 6.7 34 包结构全景
+
+`/usr/local/LsmGitOpenSource/opencode/packages/` 下 34 个包，按职责归类：
+
+#### 6.7.1 核心运行时（5 个）
+
+| 包 | 作用 | 关键文件 |
+|---|---|---|
+| **opencode** | CLI 入口（`packages/opencode/src/cli/`） | `cli/cmd/run.ts`、`cli/cmd/tui.ts`、`cli/cmd/serve.ts` |
+| **core** | 主逻辑、agent、session、tool、permission、plugin、mcp、skill、effect、project、filesystem | 70+ 目录，~3 万行 |
+| **llm** | LLM 协议客户端（Protocol × Endpoint × Auth × Framing × Transport） | `route/`、`protocols/`、`providers/`、`schema/` |
+| **schema** | 跨包共享的 Schema 定义（Message、ToolDefinition、LLMRequest） | `src/llm.ts`、`src/file-diff.ts` |
+| **protocol** | 服务端到客户端的 RPC 协议 | `src/` |
+
+#### 6.7.2 工具 / 文件系统（3 个）
+
+| 包 | 作用 |
+|---|---|
+| **ripgrep** | ripgrep 封装（grep / glob 工具的后端） |
+| **filesystem** | FileSystem + Path + GrepInput + Entry + Match 等 Schema |
+| **tool-output-store** | Tool 输出的有界存储（preview + 完整内容分轨） |
+
+#### 6.7.3 数据 / 持久化（4 个）
+
+| 包 | 作用 |
+|---|---|
+| **effect-drizzle-sqlite** | 基于 effect + drizzle 的 SQLite 客户端 |
+| **effect-sqlite-node** | SQLite Node 绑定 |
+| **console-core** | Drizzle schema + migration（~30 个表：users / workspaces / billing / keys / subscriptions 等） |
+| **database** | core 包内的 SQLite session storage |
+
+#### 6.7.4 网络 / 安全（4 个）
+
+| 包 | 作用 |
+|---|---|
+| **identity** | OAuth + 用户身份 |
+| **credential** | 凭证管理（API key 等） |
+| **plugin** | 插件系统（TUI shell + workspace + tool 三个 layer） |
+| **mcp** | MCP client/server（待补） |
+
+#### 6.7.5 部署 / UI（11 个）
+
+| 包 | 作用 |
+|---|---|
+| **cli** | 命令行参数解析 |
+| **tui** | 终端 UI（curses 风格） |
+| **web** | Web UI |
+| **app** | opencode-app（Electron / 桌面） |
+| **desktop** | 桌面应用 |
+| **session-ui** | session 分享页面 |
+| **storybook** | Storybook（UI 组件库） |
+| **ui** | 共享 UI 组件 |
+| **slack** | Slack 集成 |
+| **console-app** | 后台管理 web |
+| **stats** | 统计（server / core / app 三件套） |
+
+#### 6.7.6 企业版 / 商业（3 个）
+
+| 包 | 作用 |
+|---|---|
+| **enterprise** | Cloudflare Workers 部署 + R2 + share 协议 |
+| **function** | Cloudflare Functions（独立部署的 worker） |
+| **sdks / sdk-next** | 客户端 SDK（v1 / v2） |
+
+#### 6.7.7 工具链（4 个）
+
+| 包 | 作用 |
+|---|---|
+| **codemode** | "代码模式"运行时（待补） |
+| **containers** | 容器化部署 |
+| **http-recorder** | HTTP 请求录制 / 回放（测试用） |
+| **httpapi-codegen** | HTTP API 代码生成 |
+| **script** | 通用脚本运行时 |
+| **perf** | 性能基准 |
+
+#### 6.7.8 与 laew 的对比
+
+laew 的目录（参考 CLAUDE.md）：
+
+```
+main.rs        clap CLI
+tui/           REPL 主屏 + 子屏
+agent/         Agent loop + tools + system prompt
+llm/           anthropic + openai 客户端
+config/        SQLite + paths
+error.rs       AgentError
+build.rs       git hash + build time
+```
+
+opencode 是 **N 倍复杂度** —— 34 包、5 种前端（TUI / Web / Desktop / Slack / Session UI）、4 种部署形态（CLI / Docker / Workers / Electron）、6 套 provider。laew 当前是单一 Rust crate + TUI + CLI。
+
+#### 6.7.9 对 laew 的 P0/P1 借鉴
+
+| 优先级 | 模块 | 借鉴内容 |
+|---|---|---|
+| **P2** | 包拆分 | 未来如果 laew 要做 web 版本，可以先抽出 `web/` 包（共享 schema / core / llm） |
+| **P2** | stats 包 | 拆出 `stats-core` + `stats-app` —— 调用链 / token 用量 / 失败率打点 |
+| **P2** | http-recorder | `http-recorder` 录制 / 回放 LLM 响应 —— laew 端到端测试可以从真交互降级到录制 |
+
+### 6.8 关键洞察汇总
+
+#### 6.8.1 Effect Schema = "全栈数据契约"
+
+opencode 的核心架构选择是：**协议中立数据模型（Message、ToolDefinition、LLMRequest）+ Schema 一处定义、TypeScript 类型 + 运行时校验 + JSON Schema + Encoder/Decoder 都自动生成**。这跟 Zod 的"运行时校验 + 类型推导"很像，但有 3 个本质差异：
+
+1. **Effect-returning**：decode 是 Effect，可以 pipe 进 retry / catchTag / mapEffect，**与运行时深度融合**。
+2. **双向 Codec**：encode + decode 分开，可以有 decode-only Schema（用于 parse 不信任输入）。
+3. **Brand + Tagged Union**：`_tag` 让协议中立错误模型自带 `_tag: "RateLimit" | "Authentication" | "ProviderInternal" | ...`，`retryable` getter 决定重试。
+
+#### 6.8.2 LayerNode DI = "显式拓扑 + 编译期检测"
+
+Effect 原生 `Layer.provide` 在大规模图里不够用 —— opencode 在 Effect 之上建了：
+
+- **节点（layer / unbound / group）**：DI 边显式化。
+- **Tag（global / location）**：声明"哪些服务是全局共享、哪些是 per-会话"。
+- **compile**：DFS + 三色标记 + cache 折叠。
+- **hoist**：把 global tag 上提，避免重复构建。
+- **replacement**：测试 mock 的统一入口。
+
+#### 6.8.3 Protocol × Endpoint × Auth × Framing × Transport = 协议分层
+
+5 个轴独立变化，组合出新部署。OpenAI-compatible 9 套 profile 是这套模型的极致 —— 共享同一 protocol 只换 baseURL。Anthropic 用 `x-api-key`、OpenAI 用 Bearer、Bedrock 用 SigV4 —— Auth 轴独立配置。
+
+#### 6.8.4 共享存储 = "数据格式 + secret 鉴权 + legacy 兼容"
+
+`packages/enterprise/` 把 share 协议抽象成：
+
+- **5 种数据类型 discriminated union**（session / message / part / session_diff / model）。
+- **secret 鉴权**（crypto.randomUUID + secret 校验）。
+- **legacy 兼容**（老 event 流一次性 merge 成 snapshot）。
+
+#### 6.8.5 Tool 系统的"静态 + 动态"双轨
+
+- **BuiltInTools**：12 个工具静态组合，`Layer.empty` + 12 个子节点 deps，编译时合并。
+- **ApplicationTools**：动态注册 + finalizer，token 标记生命周期。
+- **ToolRegistry**：合并 + 权限过滤 + stale call 处理。
+
+#### 6.8.6 SessionCompaction = "token 估算 + 反向累加 + LLM 摘要"
+
+- `Token.estimate` 粗略估算。
+- `select(entries, tokens)` 反向累加。
+- `compactAfterOverflow` 调 LLM 生成 markdown 摘要。
+- `compactIfNeeded` 总入口。
+- `Compaction.Started` / `Compaction.Ended` event 触发 TUI 更新。
+
+#### 6.8.7 对 laew 的 P0/P1 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | Effect Schema | laew 的 `BashTool` / `ReadTool` / `WriteTool` 改用 Schema 定义 input/output，runtime 自动 derive JSON Schema | tool.ts:71-132 |
+| **P0** | LayerNode DI | 把当前"手动构造 Agent 实例"换成节点图 + compile 流程 | layer-node.ts:81-272 |
+| **P0** | 协议分层 | `LlmClient` 拆成 Protocol × Endpoint × Auth × Framing × Transport | route/executor.ts:36-53 |
+| **P0** | Tagged Error | `AgentError` 加 `_tag`，`Error::retryable()` 决定重试 | schema/errors.ts:160-172 |
+| **P0** | 脱敏 2 层 | 结构脱敏 + 字面值脱敏 | route/client.ts:48-66 |
+| **P1** | 5 元组协议 + 9 profile | OpenAI-compatible 9 套 profile + DeepSeek、Together、Groq 等小众 provider 接入成本几乎为零 | providers/openai-compatible-profile.ts:6 |
+| **P1** | Token 估算 + 反向累加 | `Token.estimate` + `select(entries, tokens)` 做 compaction 决策 | compaction.ts:83 + 148-157 |
+| **P1** | stale tool call | 模型发来已卸载工具的调用 → `"Stale tool call"` 而非崩溃 | registry.ts:117-119 |
+| **P1** | 共享 secret | session 分享 / 多端同步用 `crypto.randomUUID()` 生成 secret + 校验 | share.ts:117-128 |
+| **P2** | 34 包结构 | laew 未来做 web / 桌面时抽 `web/` / `desktop/` 包 | 34 包全景 |
+| **P2** | aws4fetch 替代 SDK | 边缘场景避免 AWS SDK 体积 | storage.ts:1-64 |
+| **P2** | update<T> 读改写 | SQLite 上做"读 → 改 → 写"的语义抽象 | storage.ts:122-128 |
+
+### 6.9 与前五轮的纵向对比
+
+| 维度 | 前五轮主要发现 | 本轮新增 |
+|---|---|---|
+| 架构 | Effect-based 重构、LayerNode 拓扑、Tool registry、SSE 流式 | **Provider 6 套差异**（Anthropic x-api-key / Bedrock SigV4 / Copilot 自定义路由） |
+| 协议 | OpenAI Chat / Responses + Anthropic Messages | **Protocol × Endpoint × Auth × Framing × Transport 五元组** + 协议分层极致抽象 |
+| DI | Tool / LLM Provider 注册 | **Tag 拓扑分类（global / location）+ unbound 兜底 + replacement mock** |
+| 持久化 | SQLite session storage | **Cloudflare Durable Object + R2 共享 + 5 种数据类型 discriminated union + legacy 兼容** |
+| 压缩 | prompt.ts compaction | **Token 估算 + 反向累加切分 + LLM 摘要 + Compaction.Started/Ended event** |
+| Tool | Bash/Read/Write + 27 工具 | **Schema 即协议（toJsonSchemaDocument 一次定义、5 处生成）+ structured 输出投影** |
+| 错误 | LLMError retryable | **Tagged union（_tag: "RateLimit" \| "Authentication" \| ...）+ retryable getter** |
+| 部署 | 单进程 | **34 包结构 + 5 种前端 + 4 种部署形态（CLI / Docker / Workers / Electron）** |
+| 协议中立 | Message / ContentPart | **CachePolicy Schema 化 + cache 6 provider 分发（anthropic/openrouter/bedrock/openaiCompatible/copilot/alibaba）** |
+| 鉴权 | ToolPermission V2 + saved | **Auth DSL（bearer / header / bearerHeader + andThen / orElse 组合）+ AWS SigV4** |
+
+### 6.10 总结
+
+opencode 第六轮深挖的核心结论：
+
+1. **Effect Schema = 全栈数据契约**：TypeScript 类型 + 运行时校验 + JSON Schema + Encoder/Decoder 都从一个 `Schema.Struct(...)` 自动生成；与 Effect runtime 深度融合（`Schema.decodeUnknownEffect` 返回 `Effect`）。
+2. **LayerNode DI = 显式拓扑**：节点 + 依赖图 + 编译 + 循环检测 + tag 分类（global / location）+ replacement mock，比 Effect 原生 `Layer.provide` 更可控。
+3. **5 元组协议**：Protocol × Endpoint × Auth × Framing × Transport 任意组合，OpenAI-compatible 9 套 profile + Anthropic + Bedrock SigV4 + Copilot 双路由。
+4. **Cloudflare Durable Object + R2**：aws4fetch 替代 SDK，5 种数据类型 discriminated union，secret 鉴权 + legacy event 流兼容。
+5. **Tool 系统静态 + 动态双轨**：BuiltInTools 静态组合、ApplicationTools 动态注册、ToolRegistry 合并 + 权限 + stale call。
+6. **SessionCompaction 三段式**：token 估算 + 反向累加切分 + LLM 摘要，event 驱动 TUI 可见。
+7. **34 包结构**：核心 5 + 工具 3 + 数据 4 + 网络 4 + UI 11 + 企业 3 + 工具链 4 —— 对应 5 种前端、4 种部署、6 套 provider。
+
+**对 laew 的核心启发**：把"协议中立数据模型 + Schema 一处定义"作为第一性原则；DI 拓扑显式化；Tool 系统支持 stale call 处理；Compaction 用反向累加 + LLM 摘要；多端同步用 secret 鉴权 + 数据类型 discriminated union。
