@@ -1114,3 +1114,208 @@ Inbox 是双队列系统:`next-turn`(用户新消息,触发新一轮)、`next-st
 **原始文档**:8 份(源码调研 + 深度分析 + 核心机制 + 第二轮深挖 + 第三轮-apps&native + 第四轮-Cordis核心 + 补充-中断传播背压与Typert + 补充-流式ACP与决策溯源)
 **原始总行数**:~8,857 行
 **合并策略**:第四轮 > 第三轮 > 第二轮 > 第一轮 > 补充,按功能模块重组章节,去重保留独特贡献
+
+---
+
+## 14. 第五轮深挖补充(2026-09-06)
+
+补充前 13 章覆盖薄弱的代码级事实。所有行号来自 `/usr/local/LsmGitOpenSource/deepseek-harness` 当前 head(2026-08-28 release/dsh-0.1.2-alpha.1 merge 后)。
+
+### 14.1 AIAgent 主循环:kick() / turn() / step() 三层
+
+**kick()**(`packages/core/agent-loop/src/agent.ts:217-230`):
+```ts
+private async kick(): Promise<void> {
+    try {
+        while (await this.turn()) {}
+    } catch (_error) {
+        // Reported failures and cancellation are contained at the driver boundary.
+    }
+}
+```
+**Turn 内 step 嵌套 while(true)**(`agent.ts:269-308`):
+```ts
+while (true) {
+    signal.throwIfAborted()
+    const step = phase.step + 1
+    const decision = await this.preStep(target, { turn, step })
+    // ...
+    const stepEnd = await this.step(decision.assembly, decision.startsRequestSeries === true)
+    // max-tokens stays sticky: ...
+    if (turnEnds && this.inbox.nextStep.length === 0) break
+    target = 'next-step'
+}
+```
+- `TurnEndReason = 'completed' | 'blocked' | 'aborted' | 'error' | 'max-tokens'`
+
+**Step 内 LLM 重试循环**(`agent.ts:346-406`):
+```ts
+while (true) {
+    // ...
+    const stream = preparedCall?.stream(request) ?? this.loopCtx.llm.stream(request)
+    // ...
+    if (finish.kind === 'error' || finish.kind === 'aborted') {
+        const action = await this.dispatch.waterfall('agent/request-error', ...)
+        if (action?.kind !== 'retry') {
+            throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
+        }
+        continue
+    }
+}
+```
+- **关键设计**:LLM 错误通过 `agent/request-error` 钩子决策,**插件/中间件可改变重试策略**(不只依赖主循环内部)——比纯 retry-loop 更可扩展。
+
+**Wake/abort 模型**(`agent.ts:192-199`):
+```ts
+this.setPhase({
+    kind: 'running',
+    abort: new AbortController(),
+    turn: this.phase.lastTurn, step: 0, wakeRequested: false,
+})
+this.loopCtx.agents.withInitiator(this, () => this.kick())
+```
+- 每个 run 持独立 AbortController,通过 `setPhase` 记录当前 phase,可在外部 kick 唤醒。
+- **无 hard maxTurns 上限**——靠 inbox 清空或 turn-end 退出。
+
+### 14.2 Compaction 完整抽象 + Commit Fence
+
+**Seam 抽象类**(`packages/compaction/compaction/src/index.ts:96-117`):
+```ts
+export abstract class CompactionEngine extends Service {
+    abstract compactIfNeeded(agent, trigger: 'pressure'|'context-overflow', signal): Promise<CompactionResult|null>
+    abstract compactNow(agent, signal, sourceCommandId?): Promise<CompactionResult|null>
+    abstract compactRegion(start, end, agent, signal?): Promise<CompactionResult>
+}
+```
+- trigger 仅两态:`pressure`(主动阈值)与 `context-overflow`(API 拒绝后被动)。
+- `ManualCompactionError.code` ∈ `{busy, cancelled, changed, summary, commit, persistence}`。
+
+**Commit Fence**(`packages/compaction/compaction-basic/src/region.ts:191-218`):
+```ts
+const startEvent = session.append('compaction/start', lifecycle)   // 持久开锁
+const assertStable: StabilityCheck = options.stability === 'whole-surface'
+    ? assertWholeSurfaceUnchanged
+    : assertSelectedSpanStable
+let failure: TransactionFailure | undefined
+// ... try {
+const prepared = prepareCompaction(...)
+const summarized = await summarizeCompaction(...)
+stage = 'commit'
+const pending = commitCompactionBody(session, startEvent, summarized)
+closing = true
+const endEvent = session.append('compaction/end', lifecycle)       // 持久关锁
+closed = true
+result = completeCompaction(pending, endEvent)
+} catch (error: unknown) {
+    failure = { error, stage: closing ? 'commit' : stage }
+    if (!closing) {
+        closing = true
+        try { session.append('compaction/end', { ...lifecycle, error: errorChain(error) }) ... }
+```
+- **设计要点**:`compaction/start` → `compaction/end` 是**两事件事务**——任意步骤失败必写带 error 的 end 事件;否则 abandoned 中间态会永久污染 session。
+- **Stage 字段**(`TransactionFailure['stage']`):`'summary' | 'commit'`,用于诊断失败点。
+
+**Region 范围选择**(保留 priced tail,工具对配对)(`region.ts:100-136`):
+```ts
+export function selectCompactableRange(session, measurement, retainTokens) {
+    const pricedNodes = measurement.nodes
+    // ...
+    let accumulated = 0
+    let keepFromIdx = pricedNodes.length
+    for (let index = pricedNodes.length - 1; index >= 0; index -= 1) {
+        accumulated += pricedNodes[index]!.tokens
+        keepFromIdx = index
+        if (accumulated >= retainTokens) break
+    }
+    if (keepFromIdx === 0) return null
+    while (keepFromIdx > 0) {
+        if (toolPairingBalancedBefore(session, surfaceNodes[keepFromIdx]!)) break
+        keepFromIdx -= 1
+    }
+    // ...
+    return { start: first, end: cutoff }
+}
+```
+- **工具对配对保护**:`toolPairingBalancedBefore`/`After`(`region.ts:317-338`)防止切断 tool-call/result 对——region 边界必须落在 `paired=true` 位置。
+- 失败时退到 `keepFromIdx--` 直到配对平衡。
+
+**Checkpoint 标识**(替换用户消息的 source)(`packages/compaction/compaction/src/checkpoint.ts:19,33-51`):
+```ts
+const COMPACT_CHECKPOINT_MARKER = Object.freeze({ kind: 'plugin', plugin: 'compact' } as const)
+// ...
+export function compactCheckpointSource(compactionId, sourceCommandId?) {
+    return Object.freeze({ ...COMPACT_CHECKPOINT_MARKER, compactionId, ...sourceCommandId === undefined ? {} : { sourceCommandId } })
+}
+export function isCompactCheckpointSource(source) {
+    return source.kind === 'plugin' && source.plugin === COMPACT_CHECKPOINT_MARKER.plugin
+}
+```
+- **设计要点**:压缩产物在 session 中**保留为 user 消息**(`source.kind='plugin'`),而不是删除原消息——保证 session 历史是 append-only 真相源,可从任意点回放。
+
+**Hook 接入**(`packages/compaction/compaction-basic/src/index.ts:147-223`):
+```ts
+ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    if (!signal.aborted) {
+        try {
+            const result = await this.compactIfNeeded(agent, 'pressure', signal)
+            // ...
+        }
+    }
+    return next()
+})
+
+ctx.on('agent/request-error', async ({ agent, failure, signal }, next) => {
+    if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted) return next()
+    // ...
+    result = await this.compactIfNeeded(agent, 'context-overflow', signal)
+    // ...
+    return { kind: 'retry' }
+})
+```
+- **双触发点**:pre-step(主动 pressure)+ request-error(被动 overflow),后者返回 `{kind:'retry'}` 让 LLM 重新发起请求——无缝衔接。
+
+### 14.3 Subagent 多形态
+
+`packages/subagent/` 子包(11 个):
+`subagent`、`subagent-codex`、`subagent-spawn-in-process`、`subagent-fork-in-process`、`subagent-claude-code`、`subagent-in-process-driver`、`subagent-dsh-sdk`、`subagent-acp`、`tool-subagent`、`tool-subagent-control`、`tool-subagent-report`
+
+**核心 ChildAgent**(`packages/subagent/subagent/src/child-agent.ts:34,114,151,206`):
+```ts
+super(`subagent depth ${attemptedDepth} exceeds maxDepth ${maxDepth}`)
+// ...
+subagentDepth: childDepth,
+// ...
+origin: 'subagent',
+// ...
+childCtx.systemPrompt.context({ name: 'subagent:delegation', order: 120, text: SUBAGENT_DELEGATION_CONTEXT })
+```
+- **深度防护**:递归调用 maxDepth 显式抛错。
+- **origin 标记**:`'subagent'` 写入 message origin——上溯可达。
+- **System Prompt 段**:`subagent:delegation` 注入(`order: 120` 控制拼接位置)——子代理知道自己是被调用的,不是顶级 Agent。
+
+**版本化、持久化描述符**(`packages/subagent/subagent/src/descriptor.ts:88,156`):
+```ts
+/** The supported durable subagent identity and optional continuation composition. */
+// ...
+throw new Error(`persisted subagent descriptor ${path} has unknown field "${unknown}"`)
+```
+- 描述符**版本化 + unknown 字段拒绝**——schema 演进时拒绝静默。
+
+**单次运行的结算**:`packages/subagent/subagent/src/run-settlement.ts` 将 ONE-SHOT 子代理结算为 background-Task 结局——统一的"任务完结"抽象。
+
+### 14.4 对 laew 的 P0/P1/P2 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | Compaction 两事件事务 | `compaction/start` → `compaction/end`,失败必写带 error 的 end——防止 abandoned 中间态 | region.ts:191-218 |
+| **P0** | Region 工具对配对保护 | 边界必须落在 `toolPairingBalancedBefore` 位置,防止切断 call/result 对 | region.ts:317-338 |
+| **P0** | Checkpoint as User Message | 压缩产物保留为 `source.kind='plugin'` user 消息——append-only 真相源 | checkpoint.ts:33-51 |
+| **P0** | SubAgent depth 防护 | 递归 maxDepth 显式抛错——防止无限下钻 | child-agent.ts:34 |
+| **P1** | LLM 错误由钩子决策 | `agent/request-error` 钩子可决定重试/换 prompt/放弃——扩展性远超内置 retry | agent.ts:346-406 |
+| **P1** | 双触发压缩 | pre-step pressure + request-error overflow 互补,无缝衔接 | compaction-basic/index.ts:147-223 |
+| **P1** | SubAgent origin 标记 | `origin:'subagent'` 写入消息,上溯可达 | child-agent.ts:151 |
+| **P1** | SubAgent delegation 段 | systemPrompt 注入 `subagent:delegation`,order=120 控制拼接位置 | child-agent.ts:206 |
+| **P1** | 描述符版本化 | unknown 字段拒绝——schema 演进时拒绝静默 | descriptor.ts:156 |
+| **P2** | ManualCompactionError.code | 6 种 error code 枚举(busy/cancelled/changed/summary/commit/persistence)便于诊断 | compaction/index.ts:96-117 |
+| **P2** | TurnEndReason 5 态 | completed/blocked/aborted/error/max-tokens——单元测试可枚举 | agent.ts:269 |
+| **P2** | LlmError 继承 LLM 失败结构 | message/code/cause 三元组——便于监控聚合 | agent.ts:346-406 |

@@ -1317,3 +1317,154 @@ export async function withFileMutationQueue<T>(env: ExecutionEnv, path: string, 
 ---
 
 *文档生成时间: 2026-09-06 | 基于 pi monorepo @ main 分支源码 | 综合合并自 7 份原始文档*
+
+---
+
+## 12. 第五轮深挖补充(2026-09-06)
+
+补充前 11 章覆盖薄弱的代码级事实。所有行号来自 `/usr/local/LsmGitOpenSource/pi` 当前 head(2026-09-02)。
+
+### 12.1 coding-agent 双层 while(true) + abort
+
+**外/内双层 while**(`packages/agent/src/agent-loop.ts:170-175`):
+```ts
+// Outer loop: continues when queued follow-up messages arrive after agent would stop
+while (true) {
+    let hasMoreToolCalls = true;
+    // Inner loop: process tool calls and steering messages
+    while (hasMoreToolCalls || pendingMessages.length > 0) {
+```
+**中止短路**(`agent-loop.ts:215-218`):
+```ts
+if (message.stopReason === "error" || message.stopReason === "aborted") {
+    await emit({ type: "turn_end", message, toolResults: [] });
+    await emit({ type: "agent_end", messages: newMessages });
+    return;
+}
+```
+**无 maxTurns 上限**,循环纯由 stopReason/queue 退出。
+
+**运行时 abort**(`packages/agent/src/agent.ts:319-320`):
+```ts
+abort(): void {
+    this.activeRun?.abortController.abort();
+}
+```
+**每次 run 新建 AbortController**(`agent.ts:491-505`):
+```ts
+const abortController = new AbortController();
+// ...
+await executor(abortController.signal);
+// ...
+await this.handleRunFailure(error, abortController.signal.aborted);
+```
+
+### 12.2 内置工具的截断与 abort 监听
+
+**read 工具**(`packages/coding-agent/src/core/tools/read.ts:19,218,232-241`):
+```ts
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+// ...
+if (signal?.aborted) { reject(new Error("Operation aborted")); ... }
+const aborted = false; ... signal?.addEventListener("abort", onAbort, { once: true });
+```
+- **once: true**:abort listener 只触发一次,避免泄漏。
+
+**truncate 常量**(`packages/coding-agent/src/core/tools/truncate.ts:11-12,79-80`):
+```ts
+export const DEFAULT_MAX_LINES = 2000;
+export const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB
+export function truncateHead(content: string, options: TruncationOptions = {}): TruncationResult {
+    const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+```
+- 与 opencode / claudecode 完全一致 —— 50KB / 2000 行已是行业默认。
+
+**bash 工具**(`packages/coding-agent/src/core/tools/bash.ts:350,384`):
+```ts
+description: `Execute a ${config.shellName} command... Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first)...`
+truncation: snapshot.truncation.truncated ? snapshot.truncation : undefined,
+```
+- **head 截断** 与 claudecode / opencode 一致。
+
+**edit / write 工具**:同目录(`packages/coding-agent/src/core/tools/{edit.ts, write.ts}`)。
+
+### 12.3 压缩:CompactionSettings + RPC
+
+**配置**(`packages/coding-agent/src/core/compaction/compaction.ts:126-136`):
+```ts
+export interface CompactionSettings {
+    enabled: boolean;
+    reserveTokens: number;     // 16384
+    keepRecentTokens: number;  // 20000
+}
+export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
+    enabled: true, reserveTokens: 16384, keepRecentTokens: 20000,
+};
+```
+
+**触发**(`compaction.ts:235-238`):
+```ts
+export function shouldCompact(contextTokens, contextWindow, settings) {
+    if (!settings.enabled) return false;
+    return contextTokens > contextWindow - settings.reserveTokens;
+}
+```
+- **公式**:`contextTokens > window - reserve` —— 给输出预留 `reserve` token 缓冲。
+
+**Session 入口持久化结构**(`packages/coding-agent/src/core/compaction/index.ts:36-50`):导出 `compact` 函数族。
+
+**RPC 类型**(`packages/coding-agent/src/modes/rpc/rpc-types.ts:47-48`):
+```ts
+| { id?: string; type: "compact"; customInstructions?: string }
+| { id?: string; type: "set_auto_compaction"; enabled: boolean }
+```
+- 用户可通过 RPC 触发手动压缩(`customInstructions`)或开关自动压缩。
+
+**Abort 控制**(`packages/coding-agent/src/core/agent-session.ts:2092-2094`):
+```ts
+abortCompaction(): void {
+    this._compactionAbortController?.abort();
+    this._autoCompactionAbortController?.abort();
+}
+```
+- **两个独立的 abort controller** —— 手动与自动压缩互不干扰。
+
+### 12.4 Provider 适配层 87 provider
+
+**API 适配目录**(`packages/ai/src/api/`):
+- `anthropic-messages.ts`、`anthropic-messages.lazy.ts`
+- `openai-responses.ts`、`openai-responses.lazy.ts`、`openai-completions.ts`
+- `bedrock-converse-stream.lazy.ts`、`google-vertex.lazy.ts`、`cloudflare.ts`
+
+**Providers 目录**(`packages/ai/src/providers/`):87 个 .ts,含 anthropic/openai/bedrock/google-vertex/together/nvidia/opencode/qwen/xiaomi/cerebras/fireworks/zai-coding 等。
+
+**模型目录**:
+- `packages/ai/src/model-catalog.ts`
+- `packages/ai/src/models.ts`、`models.generated.ts`
+- `packages/ai/src/images-models.ts`、`image-models.generated.ts`
+
+**streamSimple 派发**(`models.ts:690-703, 830-831`):
+```ts
+streamSimple(model: Model<Api>, context, options?): AssistantMessageEventStream {
+    // ...
+    return provider.streamSimple(requestModel, context, requestOptions);
+}
+// 动态派发
+streamSimple: (model, context, options) =>
+    dispatch(model, (streams) => streams.streamSimple(model, context, options)),
+```
+
+### 12.5 对 laew 的 P0/P1/P2 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | once: true abort listener | 信号只触发一次,避免 listener 泄漏 | read.ts:232-241 |
+| **P0** | RPC compact 协议 | 支持手动触发 + 自定义 instructions + 远程控制开关 | rpc-types.ts:47-48 |
+| **P0** | 压缩 abort 双 controller | 手动/自动各持独立 controller,互不干扰 | agent-session.ts:2092-2094 |
+| **P1** | CompactionSettings 三字段 | enabled/reserveTokens/keepRecentTokens —— 比 atomcode 的常量更可配置 | compaction.ts:126-136 |
+| **P1** | 触发公式 | `tokens > window - reserve` 比"阈值比例"更直观 | compaction.ts:235-238 |
+| **P1** | 87 provider 动态派发 | dispatch(model, streams => streams.streamSimple(...)) —— 单点适配 | models.ts:830-831 |
+| **P1** | 双层 while(true) | 外层等 follow-up / 内层处理 tool+steer —— 与 atomcode 同思路 | agent-loop.ts:170-175 |
+| **P2** | truncateHead 工具函数 | head 截断独立工具,可复用 | truncate.ts:79-80 |
+| **P2** | models.generated 自动生成 | 模型目录由 build script 生成,人工不维护 | models.generated.ts |
+| **P2** | formatSize + truncation 报告 | 工具结果自带截断元信息,可向模型报告 | bash.ts:384 |

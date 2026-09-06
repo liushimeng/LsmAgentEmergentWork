@@ -886,3 +886,116 @@ minimumReleaseAgeExclude:  # 安全豁免白名单
 ---
 
 > 本轮分析基于对 `/usr/local/LsmGitOpenSource/openclaw/` 仓库(TypeScript, ~201 万行)的真实源码阅读。所有结论均落到具体文件路径、模块名、函数名、代码片段。
+
+---
+
+## 16. 第五轮深挖补充(2026-09-06)
+
+补充前 15 章覆盖薄弱的代码级事实。所有行号来自 `/usr/local/LsmGitOpenSource/openclaw` 当前 head(近半月 6400+ 提交)。
+
+### 16.1 agent-core 主循环与中断
+
+**核心文件**:`packages/agent-core/src/agent-loop.ts`(顶部 1-52 行导入含 `EventStream`、`validateToolArguments`、`appendInterruptedTurnMessage` 等)。
+
+**关键常量**(`agent-loop.ts:75-82`):
+```ts
+const TOOL_LOOP_RECOVERY_TERMINATED_MESSAGE =
+  "OpenClaw stopped this run because tool-loop recovery encountered another critical loop. ..."
+const STEERING_TOOL_SKIP_MESSAGE = "Skipped due to queued user message."
+const TOOL_ADMISSION_FAILURE_MESSAGE = "Tool execution was blocked before launch."
+const TOOL_ADMISSION_FAILURE_DETAILS = { status: "blocked", deniedReason: "tool-admission" } as const
+```
+- `TOOL_ADMISSION_FAILURE_DETAILS.deniedReason="tool-admission"` —— 在 tool 启动前被权限系统拒绝的统一标识。
+- `STEERING_TOOL_SKIP_MESSAGE` —— 与 atomcode 的 steer queue 同思路:中途 user message 不打断当前 turn,而是让 in-flight tool 跳过。
+
+**显式中断轮次**:`packages/agent-core/src/turn-interruption.ts` 提供 `appendInterruptedTurnMessage`/`isTurnHandoffAbort`。区别于一般 abort:turn-handoff 显式合成"被打断"的 user 消息注入下一轮,保证协议一致性(类似 atomcode 的 `backfill_cancelled_tool_results`)。
+
+### 16.2 tool-call-repair 四/五阶段管线
+
+`packages/tool-call-repair/src/` 文件清单:
+```
+contracts.ts grammar.ts payload.ts promote.ts protection-fast-path.ts
+stream-normalizer.ts index.ts (+ *.test.ts)
+```
+
+入口 `index.ts` 仅 re-export。模块按 5 块组成(可视为 4 阶段管线):
+
+**1. Grammar(标记定义)** `grammar.ts`:
+- `END_TOOL_REQUEST="[END_TOOL_REQUEST]"`、`HARMONY_CHANNEL_MARKER="<|channel|>"`、`<|message|>`、`<|call|>`、`FUNCTION_OPEN/CLOSE/PARAMETER_OPEN/CLOSE`
+- `isPlainTextToolNameChar`、`skipHorizontalWhitespace`、`consumeStructuralLineBreakAfterHorizontalWhitespace`、`utf8ByteLengthWithinLimit`
+
+**2. Payload(块解析)** `payload.ts:26-49`:
+```ts
+export type PlainTextJsonToolCallSyntax = "harmony" | "named-bracket" | "tool-bracket"
+const DEFAULT_MAX_PLAIN_TEXT_TOOL_PAYLOAD_BYTES = 256_000
+const MAX_PLAIN_TEXT_TOOL_NAME_CHARS         = 120
+```
+- `scanPlainTextJsonToolCall` / `parseStandalonePlainTextToolCallBlocks` / `stripPlainTextToolCallBlocks`
+- `scanXmlishToolCall`(`grammar.ts:157`):Xmlish 风格(自定义 XML-ish)识别
+
+**3. Stream Normalizer + Protection Fast-Path**:
+- `protection-fast-path.ts:17-103` `createProtectionScanState / advanceProtectionScanState / resolveProtectionFastPath`:识别 fenced code、缩进块、`>`、`-/*/+`、`1.` 等 "unmodeled block" + 裸 `\r`,得到行级 isProtected 标记。
+- `stream-normalizer.ts:64-68`:
+  ```ts
+  const MAX_PAYLOAD_BYTES          = 256_000
+  const MAX_PENDING_EVENTS         = 256
+  const MAX_PROTECTION_CONTEXT_CHARS = 1_000_000
+  const MAX_TOOL_NAME_CHARS        = 120
+  ```
+- `normalizePlainTextToolCallStreamEvents` / `projectScrubbedPlainTextToolCallMessage`:流事件归一化 + 在受保护范围外扫描
+
+**4. Promote** `promote.ts`:
+- `createPromotedPlainTextToolCallBlock` / `createPromotedPlainTextToolCallEvents`:把已识别的 plain-text 块升级成 `{type:"toolCall", id, name, arguments, partialArgs}`,发出 `toolcall_start/_delta/_end` 完整生命周期
+- `PlainTextToolCallPromotionOptions { allowedStopReasons, allowedToolNames, requireAssistantRole, resolveToolName, resolveProtectedRanges }`
+
+**contracts.ts:1-13** 定义 `PlainTextToolCallParseOptions{ allowedToolNames?, maxPayloadBytes? }` 与 `isOffsetInProtectedRanges`。
+
+### 16.3 Lane 调度 = Session Placement + runWithConcurrency
+
+**openclaw 无独立 lane 调度器**。"Lane" 概念通过 **gateway placement 状态机 + memory host 并发原语** 实现:
+
+**Placement 状态** `packages/gateway-protocol/src/schema/session-placement-state.ts:12`:
+```ts
+"draining",
+```
+状态机:`active | draining | reconciling`(`session-placement.ts:24` `Type.Literal("draining")` 与 `:169` `workerOwnedSessionPlacementProperties("draining")`、`:189` 注释 "Gateway-visible placement projection; state remains the closed discriminator")。
+
+**Placement 操作面** `session-placement.ts:271-378`:
+- `SessionsReclaimResultPlacementSchema`(worker reclaim)
+- `placement: ActiveWorkerSessionPlacementSchema`
+- `SessionMovePlacementSchema`(精确源移动,不重放活跃 work)
+- `placement: SessionMovePlacementSchema`
+
+**实际并发原语** `packages/memory-host-sdk/src/host/concurrency.ts:6-32`:
+```ts
+export async function runWithConcurrency<T>(tasks, limit) {
+  const inFlight = new Set<Promise<T>>();
+  // ...
+  await pMap(tasks, run, { concurrency: Math.max(1, Math.floor(limit)), stopOnError: true });
+  // ...
+  // p-map stops dequeuing on error, but active memory writes must drain before callers recover.
+  await Promise.allSettled(inFlight);
+}
+```
+**关键注释**:`stopOnError` 后必须 `drain inFlight` 再 rethrow —— 与 atomcode 的 cancel 三件套异曲同工。
+
+### 16.4 Ai 包独立 overflow + compaction-window
+
+- `packages/ai/src/utils/overflow.ts` —— ai 包内独立 overflow 检测
+- `ai/src/transports/openai-responses-compaction-window.ts` —— OpenAI responses API 的窗口压缩策略
+- `ai/src/transports/anthropic-transport-stream.ts` —— Anthropic SSE transport,cache 注入点
+
+### 16.5 对 laew 的 P0/P1/P2 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | tool-call-repair 五阶段 | 解析/扫描/保护/流归一/提升 —— 防 LLM 输出 plain-text 工具调用乱码导致 crash | tool-call-repair/src/* |
+| **P0** | Protection Fast-Path | 识别 fenced code/缩进块/`>`/`-/*/+`/`1.` 等行级保护范围,在保护外扫描工具调用 | protection-fast-path.ts:17-103 |
+| **P0** | placement 状态机 | active/draining/reconciling 三态 —— 优雅迁移/回收会话 | session-placement-state.ts:12 |
+| **P1** | TOOL_ADMISSION 阻断 | `deniedReason:"tool-admission"` 统一标识工具启动前拒绝 | agent-loop.ts:78-82 |
+| **P1** | STEERING_TOOL_SKIP_MESSAGE | in-flight tool 让位 queued user message —— 减少硬中断 | agent-loop.ts:75-82 |
+| **P1** | turn-handoff abort | 合成"被打断"user 消息注入下一轮,保证协议一致 | turn-interruption.ts |
+| **P1** | runWithConcurrency drain | stopOnError 后必须 `allSettled(inFlight)` 再 rethrow | concurrency.ts:6-32 |
+| **P2** | 5.0.9 release 三方变更 | cache 字段注入、placement migration、compaction-window | ai/src/transports/* |
+| **P2** | contracts 版本化 | `PlainTextToolCallParseOptions` 字段显式声明 —— schema 演进清晰 | contracts.ts:1-13 |
+| **P2** | MAX_PENDING_EVENTS=256 | 流归一有界队列,防 OOM | stream-normalizer.ts:64-68 |

@@ -934,3 +934,196 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
 **文档合并完成**。本综合文档基于 6 份原始调研文档（源码调研/深度分析/核心机制深度分析/第二轮深度分析/第三轮周边包深度分析/第四轮 EffectDI 全栈），以第四轮为主要框架，整合第二轮的 Effect DI 详细分析和第三轮周边包全覆盖，精简重复代码片段，保留关键设计点和文件/行号锚点。
 
 原始文件保留未删。合并后约 **10,500 行**（含补充整合内容），涵盖项目元信息、Effect 全栈 DI、34 包 workspace、多端架构、LLM 集成、工具系统、流式渲染、记忆与 Context、Skill、错误处理、成本控制、可观测性、会话持久化、测试、配置、插件生态、对 laew 借鉴共 17 章。
+
+---
+
+## 18. 第五轮深挖补充（2026-09-06）
+
+补充前 17 章覆盖薄弱/未涉及的代码级事实。所有行号来自 `/usr/local/LsmGitOpenSource/opencode` 当前 head。
+
+### 18.1 SessionPrompt.runLoop 与 step 状态机
+
+**入口**：`packages/opencode/src/session/prompt.ts:1081` `runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts>`：
+
+```ts
+let step = 0
+while (true) {
+  yield* status.set(sessionID, { type: "busy" })
+  yield* Effect.logInfo("loop", { "session.id": sessionID, step })
+  let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
+  // ...
+}
+```
+
+**退出条件**（`prompt.ts:1111-1130`）：当 `lastAssistant.finish` 存在且不是 `tool-calls`/`unknown`，且没有待执行 tool call，则 break。
+
+```ts
+if (lastAssistant?.finish
+    && !["tool-calls","unknown"].includes(lastAssistant.finish)
+    && !hasToolCalls
+    && lastAssistant.parentID === lastUser.id) { /* break */ }
+```
+
+**最大步数**：`prompt.ts:1178-1179` `const maxSteps = agent.steps ?? Infinity; const isLastStep = step >= maxSteps` —— **默认无上限**，靠 finish 终止。
+
+**Processor 三态结果**（`packages/opencode/src/session/processor.ts:30`）：
+
+```ts
+export type Result = "compact" | "stop" | "continue"
+```
+
+**处理路径**（`processor.ts:641-696`）：
+
+```ts
+ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+// ...
+stream.pipe(Stream.tap(handleEvent), Stream.takeUntil(() => ctx.needsCompaction), ...)
+Effect.retry(SessionRetry.policy({ ... }))
+Effect.catch(halt)
+// ...
+if (ctx.needsCompaction) return "compact"
+if (ctx.blocked || ctx.assistantMessage.error) return "stop"
+return "continue"
+```
+
+- **`shouldBreak`**：`continue_loop_on_deny` 实验开关 —— 是否在被 permission deny 时仍继续循环。
+
+**finish 写入**（`processor.ts:457`）：`ctx.assistantMessage.finish = value.reason`（流 `step-finish` 事件）。
+
+**压缩任务回环**（`prompt.ts:1149-1158`）：
+
+```ts
+if (task?.type === "compaction") {
+  const result = yield* compaction.process({ ..., overflow: task.overflow })
+  if (result === "stop") break
+  continue
+}
+```
+
+### 18.2 内置工具清单与截断常量
+
+**工具目录**（`packages/opencode/src/tool/`，不含 node_modules）：
+
+```
+bash.ts(实际名字是 shell.ts) edit.ts read.ts truncate.ts truncation-dir.ts
+write.ts grep.ts glob.ts webfetch.ts websearch.ts skill.ts lsp.ts apply_patch.ts
+external-directory.ts plan.ts todo.ts task.ts question.ts tool.ts registry.ts
+schema.ts json-schema.ts code-mode.ts invalid.ts mcp-websearch.ts
+shell/{id.ts, prompt.ts}
+```
+
+**截断常量**（`packages/opencode/src/tool/truncate.ts:14-15`）：
+
+```ts
+export const MAX_LINES = 2000
+export const MAX_BYTES  = 50 * 1024    // 50 KiB
+```
+
+**read 工具细项**（`packages/opencode/src/tool/read.ts:14-17`）：
+
+```ts
+const MAX_LINE_LENGTH = 2000
+const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
+const MAX_BYTES       = 50 * 1024
+const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
+```
+
+### 18.3 上下文压缩：isOverflow + prune + process
+
+**模块**：`packages/opencode/src/session/compaction.ts`；常量（`compaction.ts:28-31`）：
+
+```ts
+export const PRUNE_MINIMUM  = 20_000  // 至少省 20k token 才落库
+export const PRUNE_PROTECT  = 40_000  // 保护近 40k token 不被 prune
+const PRUNE_PROTECTED_TOOLS = ["skill"]
+```
+
+**接口**（`compaction.ts:165-189`）：`isOverflow / prune / process / create`。
+
+**prune 算法**（`compaction.ts:273-317`）：
+
+1. 从尾部反向遍历消息
+2. 跳过近 2 个 turn（保护最新交换）
+3. 删去早于 `PRUNE_PROTECT` 累计 token 的 tool 输出
+4. 仅当 `pruned > PRUNE_MINIMUM` 时落库（`time.compacted = Date.now()`）
+
+**process 算法**（`compaction.ts:319-466`）：
+
+1. 构造 assistant 消息
+2. 调 `processor.process` 启动专用 "compaction" agent（`compaction.ts:398-399` `mode:"compaction", agent:"compaction"`）
+3. 若 `input.overflow=true`，向前找上一个 user 消息当 replay 起点（`compaction.ts:340-351`）
+
+**Overflow 判断独立模块**（`packages/opencode/src/session/overflow.ts:8-34`）：
+
+```ts
+const COMPACTION_BUFFER = 20_000
+export function usable(input) { /* ... */ }
+export function isOverflow(input) {
+  if (input.cfg.compaction?.auto === false) return false
+  // ...
+  return count >= usable(input)
+}
+```
+
+**触发**（`prompt.ts:1161-1168`）：
+
+```ts
+if (lastFinished && lastFinished.summary !== true
+    && (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))) {
+  yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+  continue
+}
+```
+
+### 18.4 权限系统：permission/index.ts
+
+**3 文件**：`packages/opencode/src/permission/{arity.ts evaluate.ts index.ts}`（注意：`arity.ts` 实际是命令 arity 表）。
+
+**接口**（`index.ts:12-16`）：`ask / reply / list`。
+
+**evaluate**（`index.ts:28-38`）：默认 `action:"ask"`。
+
+**ask 核心**（`index.ts:67-107`）：
+
+1. 匹配 allow → 直接放过
+2. 匹配 deny → 抛 `DeniedError`
+3. 其它 → 发 `Event.Asked` 后 `Deferred.await`
+
+**reply**（`index.ts:109-160`）：reject 转 `RejectedError/CorrectedError`，可级联清理同 session pending。
+
+**fromConfig**（`index.ts:186+`）：把配置 `{perm: pattern}` 转 ruleset。
+
+### 18.5 缓存策略：applyCaching 6 provider 分发
+
+`packages/opencode/src/provider/transform.ts:358-381` `applyCaching(msgs, model)`：
+
+```ts
+const providerOptions = {
+  anthropic:        { cacheControl:   { type: "ephemeral" } },
+  openrouter:       { cacheControl:   { type: "ephemeral" } },
+  bedrock:          { cachePoint:     { type: "default"   } },
+  openaiCompatible: { cache_control:  { type: "ephemeral" } },
+  copilot:          { copilot_cache_control: { type: "ephemeral" } },
+  alibaba:          { cacheControl:   { type: "ephemeral" } },
+}
+```
+
+**断点位置**：system 前 2 条 + 非 system 末 2 条。
+
+**关闭**：`options.cacheControl !== undefined`（`transform.ts:469`）—— 允许单次调用关闭。
+
+### 18.6 对 laew 的 P0/P1/P2 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | processor 三态 | `compact / stop / continue` 联合返回，主循环按语义路由 | processor.ts:30, 641-696 |
+| **P0** | overflow 模块独立 | 把"是否要压缩"的判断从 compaction.ts 抽出，便于单测 | overflow.ts:8-34 |
+| **P0** | cache 6 provider 分发 | transform 层按 providerId 选 cache 字段名（anthropic/openrouter/bedrock/openaiCompatible/copilot/alibaba） | transform.ts:358-381 |
+| **P1** | PRUNE_MINIMUM=20K | 至少省 20k token 才落库 —— 避免微压缩造成的写盘噪音 | compaction.ts:28-31 |
+| **P1** | PRUNE_PROTECT=40K | 保护近 40k token 不被 prune —— 给最近 2 turn 留余地 | compaction.ts:28-31 |
+| **P1** | PRUNE_PROTECTED_TOOLS | `["skill"]` 不被 prune —— skill 展开内容下次仍要用 | compaction.ts:31 |
+| **P1** | overflow=true 时回溯 user | 压缩后 replay 起点 = 上一个 user 消息，而非当前 assistant | compaction.ts:340-351 |
+| **P1** | 实验开关 | `continue_loop_on_deny` 让 permission deny 后仍继续 —— 可作 laew 的 P1 配置 | processor.ts:641 |
+| **P2** | finish 写入位置 | `assistantMessage.finish = value.reason` 来自流 `step-finish` 事件 | processor.ts:457 |
+| **P2** | MAX_LINE_LENGTH=2000 | 行级截断，比字节截断保留可读性 | read.ts:14-17 |
+| **P2** | session 状态机 | `status.set({ type: "busy" })` 在 loop 入口，TUI 可观测 | prompt.ts:1081-1098 |

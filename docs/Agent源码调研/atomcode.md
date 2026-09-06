@@ -2046,3 +2046,347 @@ pub fn asset_or_index(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
 ---
 
 > **本轮合并基于真实源码阅读,所有行号与代码片段均来自 `/usr/local/LsmGitOpenSource/atomcode` 仓库(版本 5.0.9)。合并策略:以第四轮为主要框架,补充第二轮 kernel/agent loop 详细代码分析,补充第三轮边缘模块独立成章,删除明显重复段落。**
+
+---
+
+## 19. 第五轮深挖补充(2026-09-06)
+
+针对前 18 章覆盖薄弱/遗漏的代码级细节,基于真实源码再核一遍。**与前文不重复**:仅补足 loop 内 select 驱动、Cancel 双路传播、压缩两层策略、并发执行闸位、Session append-only + inflight 恢复、5.0.9 release 真实变更点。
+
+### 19.1 session_loop 与 run_turn 的 select 驱动
+
+**顶层 session_loop**(`crates/atomcode-kernel/src/agent.rs:1283`):
+
+```rust
+async fn session_loop(self, mut cmd_rx: UnboundedReceiver<AgentCommand>) {
+    loop {
+        let cmd = cmd_rx.recv().await;  // L1361
+        match cmd { /* 处理 SendMessage/Snapshot/Compact/Cancel/Shutdown/Respond */ }
+    }
+}
+```
+- spawn 入口:`agent.rs:966` `tokio::spawn(running.session_loop(cmd_rx));`
+
+**单轮 select 驱动(turn + 中途命令)**(`agent.rs:1541-1624`):核心是把 `run_turn` 的 future 与命令接收 race 在一起:
+
+```rust
+let mut turn = Box::pin(self.run_turn(..., turn_token.clone(), internal_cancel.clone(), ...));
+let mut shutdown = false;
+loop {
+    tokio::select! {
+        _ = &mut turn => break,  // turn 自身完成
+        maybe = cmd_rx.recv() => match maybe {
+            Some(AgentCommand::Shutdown) => { shutdown=true; internal_cancel.store(true, Release); turn_token.cancel(); self.rt.cancel_pending(); ... }
+            Some(AgentCommand::Cancel)   => { turn_token.cancel(); self.rt.cancel_pending(); ... }
+            Some(c @ AgentCommand::Snapshot)            => pending.push_back(c),
+            Some(c @ AgentCommand::SendSyntheticMessage) => pending.push_back(c),
+            Some(c @ AgentCode::SendMessageWithContext) => pending.push_back(c),
+            Some(AgentCommand::SendMessage{text,images})=> steer.lock().push_back(SteerInput{...}),
+            Some(c @ AgentCommand::Compact{..})         => pending.push_back(c),
+            None => { shutdown=true; break; }
+        }
+    }
+}
+```
+- **Steer vs Pending 的区分**:`SendMessage`(用户新增消息)在 turn 进行中**入 steer 队列**(`agent.rs:1606`),不是 pending——下一轮请求会把它 fold 进同轮;其它命令入 `pending: VecDeque<AgentCommand>`(`agent.rs:1663` `while let Some(queued) = pending.pop_front()`)。
+- 这种"中途用户消息不打断 turn 而是排队"的语义是 steering(steer queue),区别于 explicit cancel——后者会立刻终止 turn。
+
+### 19.2 StopReason 完整 12 变体与熔断点
+
+`crates/atomcode-kernel/src/event.rs:88-119`:
+
+```rust
+pub enum StopReason {
+    #[default] Stopped,            // 自然停止
+    MaxRounds,                     // LLM 轮数熔断
+    MaxContinuations,              // offer_continuation 钩子无限续轮熔断
+    RepeatLoop,                    // 粗粒度重复熔断
+    ToolLoopDetected,              // 精确工具循环熔断
+    ProviderError,                 // 流打开/中途错误
+    Timeout,                       // stream_timeout
+    Cancelled,                     // 协作式取消
+    PromptRejected,                // user_prompt_submit 钩子拒绝
+    PolicyDenied,                  // 工具中间件硬阻断
+    RateLimited,                   // 429 host 选 PAUSE
+}
+```
+
+各触发点:
+- `MaxRounds`:`agent.rs:1999 / 2010`
+- `MaxContinuations`:`agent.rs:3086`(钩子在 `hook.rs:293` `offer_continuation`)
+- `RepeatLoop`(粗):`agent.rs:3931`
+- `ToolLoopDetected`(精):`agent.rs:3895`
+- `RateLimited`:`agent.rs:2247 / 2296 / 2692 / 2709 / 2758`
+- `ProviderError`:`agent.rs:2349 / 2782 / 2907`
+
+**finishing 汇聚点**:`agent.rs:1745` `async fn finish_turn(&self, convo, reason: StopReason, ctx: &TurnCtx)`;`Outcome.stop: StopReason`(`agent.rs:761`)。**Cancelled 路径**:`agent.rs:1831` 直接 `finish_turn(convo, StopReason::Cancelled, ctx)`。
+
+熔断默认 ON:`max_continuations: Some(50)`(`agent.rs:809-815`)。
+
+### 19.3 Cancel 双路传播(CancellationToken + cancel_pending)
+
+**类型**:统一用 `tokio_util::sync::CancellationToken`(不是 `Notify`)。
+
+```rust
+// agent.rs:880 字段
+cancel_token: Option<tokio_util::sync::CancellationToken>;
+// setter
+pub fn cancel_token(mut self, t: tokio_util::sync::CancellationToken) -> Self { ... } // L4274
+
+// agent.rs:1096-1101 派生
+fn new_turn_token(&self) -> CancellationToken {
+    self.cancel_token.as_ref().map(|t| t.child_token()).unwrap_or_default()
+}
+```
+
+**两路 cancel(turn 路径)**(`agent.rs:1567-1580`):
+
+```rust
+internal_cancel.store(true, Ordering::Release);  // ① AtomicBool 协作信号
+turn_token.cancel();                              // ② CancellationToken 协作信号
+self.rt.cancel_pending();                         // ③ 强解 oneshot 等待的中间件(审批等)
+```
+
+`cancel_pending`(`crates/atomcode-kernel/src/request.rs:84-94`):
+
+```rust
+/// Resolve EVERY pending request to Value::Null ... Called on AgentCommand::Cancel.
+pub(crate) fn cancel_pending(&self) {
+    for (_, tx) in self.pending.lock().unwrap().drain() {
+        let _ = tx.send(Value::Null);  // JSON-RPC null,fail-closed
+    }
+}
+```
+- 注释明确:oneshot `pending` 是中间件/审批等待,token 触不到——必须用 `Null` flush。
+
+**流与工具执行中的取消检查点**:
+- 串行路径 between-tools 兜底:注释 `agent.rs:3613` `INSIDE-EXECUTE backstop: poll cancel while the tool future runs`。
+- 并发批次路径:`agent.rs:3561` `if cancel.is_cancelled() { return (idx, None); }`(cancel-skipped,不发 `ToolStarted`)。
+- 工具内 `tokio::select!`:`agent.rs:3619-3628`:
+  ```rust
+  let mut r = tokio::select! {
+      biased;
+      r = tool.execute(&call.arguments, &ctx) => r,
+      _ = cancel.cancelled() => ToolResult {
+          call_id, content: "(cancelled — side effects unknown)".into(),
+          is_error: true, ...
+      },
+  };
+  ```
+- 工具上下文暴露 cancel:`agent.rs:3591` `ToolContext { ... cancel: cancel.clone(), ... }`。
+
+**Cancel 后消息层 backfill**(`crates/atomcode-kernel/src/message.rs:438-439`):
+```rust
+pub fn backfill_cancelled_tool_results(&mut self) {
+    self.backfill_missing_tool_results("(cancelled)");
+}
+```
+- **保证**:取消发生后,任何已发出 `tool_use` 都补回配对 `tool_result` 再发模型——这是协议一致性的硬要求(anthropic/openai 都拒绝 orphan tool_use)。
+
+### 19.4 压缩:StubCompaction + OverflowCompaction 双层
+
+`crates/atomcode-capabilities/src/compaction.rs:143-192` 核心常量:
+
+```rust
+const RECENT_KEEP_FRACTION: f32 = 0.25;          // 保留 25% 最近内容
+const MIN_RECENT_KEEP_TOKENS: usize = 8_000;
+const MAX_RECENT_KEEP_TOKENS: usize = 256_000;
+const MAX_SUMMARY_BYTES:   usize = 64 * 1024;    // 摘要 64 KiB 硬上限 (#747)
+const MAX_SUMMARY_TOKENS:  u32    = 16_000;     // 摘要软上限
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
+const SUMMARY_TOOL_OUTPUT_MAX_CHARS: usize = 2_000;  // 摘要输入截断头
+const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;   // 摘要输入保留尾
+```
+
+**两层策略**:
+- `StubCompaction`(温和,内层)(`compaction.rs:101-105`):仅原地 stub 旧 tool result,**无** summary/drain/resume note,常用于"自动压缩一律静默"(5.0.9 `b9afca1d` 提交实现)。
+- `OverflowCompaction`(硬阶梯,外层)(`compaction.rs:194-214`):
+  - attempt 0:aggressive stub
+  - attempt 1:hard-truncate 超大消息
+  - attempt 2:drain 老轮到 1 个 LLM summary(`summary_provider=None` 时退化 plain drain)
+
+**触发判断**(`agent.rs:1113-1128`):
+```rust
+fn should_compact(&self, convo) -> Option<CompactTrigger> {
+    // 按当前模型 context_window() 重算 used/window >= thresh
+    // 不依赖历史记录里的 ratio(防切换小窗口模型后误判)
+}
+```
+- `compact_threshold: Option<f32>`(`agent.rs:836`),默认 `None` = 永不自动压缩;setter `agent.rs:4182`,默认填充 `0.7`(`compaction.rs:127` 注释)。
+- **续轮前补一次**:`agent.rs:1138` `compact_before_internal_continuation`,每 policy stage 至多一次——防 thrashing。
+- **手动 `/compact`**:`AgentCommand::Compact { focus }`(`event.rs:166-168`)无视 auto threshold 强制执行;`apply_plan` 拒绝 net-loss/no-op。
+
+### 19.5 工具并发:Semaphore + RwLock 双闸 + FuturesOrdered
+
+`agent.rs:3480-3653` Phase ② 并发执行骨架:
+
+```rust
+use futures::stream::FuturesOrdered;
+let gate = Arc::new(tokio::sync::RwLock::new(()));   // 闸
+let cap  = self.max_parallel_tools
+    .unwrap_or_else(env_max_parallel_tools)
+    .clamp(1, MAX_PARALLEL_TOOLS_CEILING);
+let sem  = Arc::new(tokio::sync::Semaphore::new(cap));  // 容量
+// ...
+let mut ordered: FuturesOrdered<...> = (0..plans.len()).map(|idx| {
+    let sem2 = sem.clone(); let gate2 = gate.clone();
+    async move {
+        let _g = gate2.read().await;       // ① 默认 read-lock 允许并行
+        let _p = sem2.acquire_owned().await; // ② 容量许可
+        // execute tool ...
+    }
+}).collect();
+// ...
+while let Some((idx, r)) = ordered.next().await { results[idx] = r; }
+```
+
+**常量与配置**(`agent.rs:204-225`):
+- `MAX_PARALLEL_TOOLS_CEILING = 256`
+- `ATOMCODE_MAX_PARALLEL_TOOLS` 环境变量默认 4
+- setter `agent.rs:4147` `max_parallel_tools(n)`
+
+**write-lock 排他屏障**(`agent.rs:3546-3551`):有 mutating tool 时可 upgrade 到 write-lock,**全局串行化**,用于强一致批操作(如对同一文件的多个 edit)。
+
+**为什么用 `FuturesOrdered` 而不是 `FuturesUnordered`**(`agent.rs` Phase ③ 应用):应用阶段按原始 `plans` 顺序消费结果,**保持 emission 顺序与发起顺序一致**——这对后续模型看到 tool_result 顺序、replay 起点选取都至关重要。
+
+**进程级并发**(能力层,MCP/CC hooks):
+- `mcp/registry.rs:608` `futures::future::join_all(tasks).await;`
+- `mcp/registry.rs:740` `FuturesUnordered<...> = server_snapshot...`
+- CC hooks 并发:`cc_hooks.rs:600/634/694/727` 均 `join_all(...)`。
+
+**CPU/IO 隔离**(常用 `spawn_blocking` 位置):
+- `tools/list.rs:81`、`tools/glob.rs:96`、`tools/grep.rs:120`、`tools/parallel_edit.rs:324`、`tools/search_replace.rs:109`、`tools/bash.rs:2679`
+- `tools/mod.rs:517` `tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await;`
+- `tools/task.rs:934` Semaphore 限并发
+- `codeintel/*` 多个文件均 `spawn_blocking`(CPU bound);`provider/atomgit_sign.rs:64`、`skills/use_skill.rs:84`、`session/snapshot.rs:761/843` 同。
+
+### 19.6 Session 持久化:jsonl + meta + inflight + snapshot
+
+**4 件套**(路径在 `crates/atomcode-capabilities/src/session/manager.rs:999` `path_for(id, ext)`):
+- `<id>.jsonl` — append-only transcript
+- `<id>.meta` — 元数据
+- `<id>.inflight` — 正在写未 commit 的工作集
+- `<id>.snapshot` — 工作集快照
+
+**Append-only 写**( `manager.rs:2859-2895` `append_jsonl_line`):
+
+```rust
+pub(crate) fn append_jsonl_line(&self, id: &str, line: &[u8]) -> SessionResult<()> {
+    self.ensure_native_writable(id, "append transcript")?;
+    if line.len() > MAX_JSONL_LINE_BYTES { return Err(...); }
+    let path = self.jsonl_path(id)?;
+    let mut file = retry_transient_file_access(|| open_append_file(&path))?;
+    fs2::FileExt::lock_exclusive(&file).map_err(...)?;  // 进程间文件锁
+    let current = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let next = current.checked_add(line.len()).ok_or(TooLarge{...})?;
+    if next > MAX_JSONL_BYTES { return Err(TooLarge{...}); }
+    file.write_all(line).map_err(|e| io_at(&path, e))
+}
+```
+
+**上限常量**(`manager.rs:40-42`):
+```rust
+pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;  // 单行 16 MiB
+pub const MAX_JSONL_BYTES:      usize = 512 * 1024 * 1024; // 文件 512 MiB
+pub const MAX_JSONL_LINES:      usize = 1_000_000;
+```
+
+**崩溃恢复(Inflight)**(`manager.rs:1235-1283` `load_native_session_for_resume`):
+
+```rust
+pub fn load_native_session_for_resume(&self, lease: &SessionLease)
+    -> SessionResult<(LoadedSession, Option<Message>)> {
+    self.validate_active_lease(lease)?;
+    let mut loaded = self.load_native_session(lease.id())?;
+    let inflight = match self.load_inflight_snapshot(lease.id()) { ... };
+    let canonical_len = loaded.snapshot.messages.len();
+    let recoverable = inflight.snapshot.messages.len() == canonical_len.saturating_add(1)
+        && inflight.snapshot.messages[..canonical_len] == loaded.snapshot.messages
+        && inflight.snapshot.messages.last().is_some_and(|m| {
+            m.role == Role::User && !m.synthetic
+                && m.internal_origin.is_none() && m.tool_calls.is_empty()
+        });
+    if recoverable {
+        if inflight.replay_safe {
+            Ok((loaded, inflight.snapshot.messages.last().cloned()))
+        } else {
+            loaded.snapshot = inflight.snapshot;
+            Ok((loaded, None))
+        }
+    } else {
+        self.clear_inflight_snapshot(lease.id());  // 不污染 committed
+        Ok((loaded, None))
+    }
+}
+```
+**接受条件**:canonical prefix + exactly 1 final accepted user message(`!synthetic && internal_origin.is_none() && tool_calls.is_empty()`)。
+
+**Orphan 修复**(`agent.rs:1302`):`Conversation::repair_pairing(&mut c.messages);`——resume seed 时调用,处理 dangling tool_call / orphan tool_result。
+
+**Lease(互斥)**(`manager.rs:1300-1304`):`acquire_lease` 保证同时只有一个 active runtime,错误为 `SessionStoreError::SessionInUse`。
+
+**Snapshot hook**(`session/snapshot.rs:98-105`):
+```rust
+pub struct SnapshotHook {
+    persistence_status: SnapshotPersistenceStatus,  // 持久化状态信号
+    checkpoint: SnapshotCheckpoint,                  // 检查点
+    target_snapshot: Option<SessionSnapshot>,        // 目标快照
+    // ...
+}
+```
+- 注释明示:"persists the working-set snapshot + session metadata every turn. Hangs off `turn_complete`"——每个 turn 完成后落一次。
+
+### 19.7 v5.0.9 真实近期变更(2026-08-25 ~ 2026-09-03)
+
+`git log --oneline --since=2026-08-25 | head -30` 中关键条目分类:
+
+**压缩/TUI 体验打磨**:
+- `7f21f6cd` 压缩 spinner 只显示时钟,去掉误导的 token 计数
+- `fcd3855d` spinner 格式对齐 thinking spinner + 去掉"较慢"变体
+- `c561984c` 手动 /compact 微小节省显示"当前会话无需压缩"而非成功横幅
+- `16f548ff` CompactionMark 主题感知 muted 色
+- `c8639008` **split boundary 永不 drain 整条尾部**——保留至少最近一条真实交换(防"压缩后空转")
+- `18246520` **单个巨型回合可被压缩**——drain 活动回合旧前缀 + overflow 阶梯不再被中间空转挡打断
+- `b9afca1d` **自动压缩一律静默**——不再打 "Tool output folded · saved ~N tok" 横幅
+- `a8df1838` `/compact` 摘要防弱模型重跑旧问题 + 记录被压缩的图片
+
+**CLI/TUIX 体验**:
+- `6d9328df` `cli`: resume 指定会话(`-p --resume` / `resume` 子命令) + 退出展示会话 id
+- `a4276cf2` `tuix`: /resume 放宽准备超时并修正误导文案
+- `ee8d2dfb` `tuix`: Tab 接受下一条建议 + 输入框显示 `Tab:` 提示
+- `67c9888b` `webui`: @ 提及支持递归模糊匹配
+- `dbf75063` `tuix`: MCP 工具调用渲染优化——去 mcp 前缀 + 参数不转义/摘要化 + 剥离结果标题
+- `d080cce5` `tuix`: 工具调用成功时 ● 圆点变绿(串行/并行/resume 一致)
+- `f65994ad` `tuix`: 面板/spinner 标签统一驼峰(Subtasks→SubTasks 等)
+- `c34bda74` `webui`: 强度下拉补上缺失的 xhigh 选项
+- `e39fd066` `tuix`: Bash 多行命令保留换行 + 封顶 3 行
+- `725defca` `tuix`: /provider 编辑账号保存后进入该账号模型列表
+
+**Provider / 模型**:
+- `33057fc7` revert next-prompt-suggestion cap to 128(1024 hit the gateway limit)
+- `90085dae` raise next-prompt-suggestion token cap 让 reasoning 模型能 emit 建议
+- `64e7f8f6` provider:为 OpenRouter 请求注入 app 归因头
+- `9c3c443a` provider:is_openrouter_url 剥离 userinfo 防归因头泄漏 + 复用 host_matches_domain
+- `13ab87f5` provider:死代理连不上时报错给出 /proxy 引导
+- `04d3cc16` kernel:重试通知断言同步 ProviderRetry 结构化事件
+
+**版本同步**:`287bff70` `chore: sync latest.json from release v5.0.9`、`52ca5e6c` merge release/v5.0.9 into main、`eda3e3ef` 更新 5.0.8→5.0.9、`525a9bf7` bump v5.0.9、`8c837360` merge release/v5.0.9 into main。
+
+### 19.8 对 laew 的 P0/P1/P2 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | Cancel 双路 | `CancellationToken + AtomicBool + cancel_pending(oneshot→Null)` 三件套,孤儿 tool_result 自动 backfill | agent.rs:1541-1624, message.rs:438-439, request.rs:84-94 |
+| **P0** | 消息层 backfill | 取消后 `backfill_missing_tool_results("(cancelled)")`——协议硬一致 | message.rs:438-439 |
+| **P0** | 持久化 4 件套 | jsonl + meta + inflight + snapshot,inflight 只在 prefix + 1 message 完全匹配时采纳 | manager.rs:2859-2895, 1235-1283 |
+| **P0** | 进程间文件锁 | `fs2::FileExt::lock_exclusive` 防并发 append 损坏 | manager.rs:2859-2895 |
+| **P0** | repair_pairing | resume seed 时调用,处理 dangling tool_call / orphan tool_result | agent.rs:1302 |
+| **P1** | 双层压缩 | StubCompaction(内层静默 stub)+ OverflowCompaction(外层三阶梯)——自动/手动分离 | compaction.rs:101-214 |
+| **P1** | 压缩摘要硬限 | MAX_SUMMARY_BYTES=64KiB,MAX_SUMMARY_TOKENS=16k;超时 180s 降级 | compaction.rs:143-192 |
+| **P1** | 工具并发 | Semaphore + RwLock 双闸 + FuturesOrdered 保持 emission 顺序 | agent.rs:3480-3653 |
+| **P1** | steer queue | 用户中途消息入 steer(下一轮 fold)而非 pending(打断 turn)——区分主动取消 vs 自然增信 | agent.rs:1606, 1663 |
+| **P1** | 摘要 anchor | `<previous-summary>` 提示让模型续写而非重写,防弱模型退化 | compaction.rs:184-192, a8df1838 |
+| **P2** | StopReason 12 变体 | 完备终态枚举,使单元测试可枚举 | event.rs:88-119 |
+| **P2** | 触发阈值动态化 | 切换小窗口模型后用 `model.context_window()` 重算,不用历史 ratio | agent.rs:1113-1128 |
+| **P2** | auto 静默化 | 自动压缩不打横幅,避免噪声 | b9afca1d |
+| **P2** | split boundary 保留尾 | 防止"压缩后空转" | c8639008 |

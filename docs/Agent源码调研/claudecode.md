@@ -1004,3 +1004,224 @@ graph TB
 > **产出说明**:本文档基于 `/usr/local/LsmGitOpenSource/claudecode` 真实源码阅读,所有代码片段、文件路径、行号均来自源文件直接引用。合并策略:第四轮 > 第三轮 > 第二轮 > 第一轮核心机制 > 深度分析 > 源码调研,保留独特细节,删除纯重复段落。
 >
 > **合并时间**: 2026-09-06
+
+---
+
+## 17. 第五轮深挖补充(2026-09-06)
+
+补充前 16 章未覆盖或一笔带过的代码级事实。所有行号来自 `/usr/local/LsmGitOpenSource/claudecode` 当前 head。
+
+### 17.1 主循环 query() 与 stop_reason 捕获
+
+**主循环位置**:`src/query.ts:307`(generator `query()`),`src/QueryEngine.ts` 提供封装层。
+
+```ts
+// src/query.ts:306-307
+// eslint-disable-next-line no-constant-condition
+while (true) {
+```
+
+**maxTurns 终止**(`src/query.ts:1704-1712`):
+```ts
+if (maxTurns && nextTurnCount > maxTurns) {
+  yield createAttachmentMessage({ type: 'max_turns_reached', maxTurns, turnCount: nextTurnCount })
+  return { reason: 'max_turns', turnCount: nextTurnCount }
+}
+```
+
+**Abort 短路**(`src/query.ts:1500-1515`):
+```ts
+if (toolUseContext.abortController.signal.reason !== 'interrupt') {
+  yield createUserInterruptionMessage({ toolUse: true })
+}
+const nextTurnCountOnAbort = turnCount + 1
+if (maxTurns && nextTurnCountOnAbort > maxTurns) { /* ... */ }
+return { reason: 'aborted_tools' }
+```
+
+**stop_reason 跟踪**(`src/QueryEngine.ts:762-807`):
+```ts
+// Capture stop_reason if already set (synthetic messages). For...
+if (message.message.stop_reason != null) { lastStopReason = message.message.stop_reason }
+// Capture stop_reason from message_delta. The assistant message...
+if (message.event.delta.stop_reason != null) { lastStopReason = message.event.delta.stop_reason }
+```
+注释 `src/query.ts:554`：「`stop_reason === 'tool_use'` is unreliable — it's not always set correctly.」
+
+**maxTurns 传递链**:`QueryEngine.ts:684` → `query.ts:260` → `tools/AgentTool/runAgent.ts:756`(子代理也独立 `maxTurns ?? agentDefinition.maxTurns`)。`forkSubagent.ts:65` 子代理默认 `maxTurns: 200`。
+
+### 17.2 AbortController 全链路
+
+**QueryEngine 创建**(`src/QueryEngine.ts:203`):
+```ts
+this.abortController = config.abortController ?? createAbortController()
+```
+- 触发:`QueryEngine.ts:1159` `this.abortController.abort()`
+- 透传:`query.ts` 把 controller 装进 `toolUseContext.abortController` 传给所有工具(`Tool.ts:180`)
+- SIGINT 桥:`src/utils/abortController.ts` 的工厂函数包装 SIGINT
+
+**Bash 子进程中断**(`src/tools/BashTool/BashTool.tsx:881`):
+```ts
+const shellCommand = await exec(command, abortController.signal, 'bash', { timeout: timeoutMs, ... })
+```
+后台任务走 `spawnShellTask(...)`(`src/tasks/LocalShellTask/LocalShellTask.ts`)。
+
+**子代理 abort**(`src/tools/AgentTool/runAgent.ts:524-535`):
+```ts
+const agentAbortController = override?.abortController ?? new AbortController()
+agentAbortController.signal,
+```
+
+**注释里值得注意的设计**:`src/tools/GrepTool/GrepTool.ts:438` ——「We don't use AbortController for timeout to avoid interrupting the agent loop」。即:某些工具的**超时**故意不用 AbortController,以免把整个 agent loop 拽下来。
+
+### 17.3 工具结果截断常量与预算执行
+
+**核心常量**(`src/constants/toolLimits.ts`):
+```ts
+export const DEFAULT_MAX_RESULT_SIZE_CHARS = 50_000   // 单工具结果默认
+export const MAX_TOOL_RESULT_TOKENS         = 100_000  // ~400KB
+export const BYTES_PER_TOKEN                = 4
+export const MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000  // 单 user message 聚合上限
+export const TOOL_SUMMARY_MAX_LENGTH        = 50         // 紧凑视图摘要
+```
+
+**Bash 工具覆盖默认**(`src/tools/BashTool/BashTool.tsx:424`):
+```ts
+maxResultSizeChars: 30_000,
+```
+
+**FileRead 不限**(`src/tools/FileReadTool/FileReadTool.ts:342`):
+```ts
+maxResultSizeChars: Infinity,
+```
+
+**每条 user message 预算执行点**(`src/query.ts:379`):`await applyToolResultBudget(messagesForQuery, ...)`——注释解释:大块按 `tool_use_id` 替换为文件路径 preview。
+
+**Bash 截断实现**(`src/tools/BashTool/utils.ts:156-162`):
+```ts
+const truncatedPart = content.slice(0, maxOutputLength)
+const truncated = `${truncatedPart}\n\n... [${remainingLines} lines truncated] ...`
+```
+
+### 17.4 BashTool 关键细节(1143 行)
+
+- **持久化文件**:`BashTool.tsx:732` `MAX_PERSISTED_SIZE = 64 * 1024 * 1024`;超过用 `fsTruncate` 截到 64MB。
+- **后台任务生成**:`BashTool.tsx:904` `spawnShellTask(...)`。
+- **进度回调**:`onProgress(lastLines, allLines, totalLines, totalBytes, isIncomplete)`——generator 持续唤醒。
+- **安全子命令上限**:`src/tools/BashTool/bashPermissions.ts:103` `MAX_SUBCOMMANDS_FOR_SECURITY_CHECK = 50`(超过拒绝解析)。
+
+### 17.5 FileReadTool 关键细节(1183 行)
+
+- **PDF 分页上限**(`FileReadTool.ts:433`):`if (rangeSize > PDF_MAX_PAGES_PER_READ)` 报错。
+- **默认输出 tokens**(`src/tools/FileReadTool/limits.ts:18`):`DEFAULT_MAX_OUTPUT_TOKENS = 25000`。
+- **优先级**(`limits.ts:47`):env var > GrowthBook > DEFAULT,环境变量 `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS`。
+- **LSP 文件大小门**:`src/tools/LSPTool/LSPTool.ts:53` `MAX_LSP_FILE_SIZE_BYTES = 10_000_000`(10MB 拒收)。
+- **中文 prompt 默认行数**:`src/tools/FileReadTool/prompt_cn.ts:10` `MAX_LINES_TO_READ = 2000`。
+
+### 17.6 FileEditTool 匹配算法
+
+**匹配定位**(`src/tools/FileEditTool/FileEditTool.ts:316`):
+```ts
+const actualOldString = findActualString(file, old_string)
+```
+- `findActualString` 内部处理 trim/换行归一/空白容忍。
+
+**多匹配判定**(`FileEditTool.ts:329-336`):
+```ts
+const matches = file.split(actualOldString).length - 1
+if (matches > 1 && !replace_all) {
+  return { result: false, behavior: 'ask',
+    message: `Found ${matches} matches ... set replace_all to true ...` }
+}
+```
+
+**同字面拒绝**(`FileEditTool.ts:148`):「No changes to make: old_string and new_string are exactly the same.」
+
+**替换**(`FileEditTool.ts:352`):`file.replaceAll(actualOldString, new_string)`(换行归一在 `:214` `replaceAll('\r\n', '\n')`)。
+
+**双 Edit 工具融合**(`FileEditTool.ts:369/379`):通过 `input1`/`input2` 字段把 WriteFile 与 Edit 合并为同工具。
+
+**diff 上报**(`FileEditTool.ts:551`):`const diff = await fetchSingleFileGitDiff(absoluteFilePath)`,并 `logEvent('tengu_tool_use_diff_computed', ...)`。
+
+### 17.7 上下文组装(SystemPrompt 顺序)
+
+**QueryEngine 层拼接**(`src/QueryEngine.ts:321-325`):
+```ts
+const systemPrompt = asSystemPrompt([
+  ...(customPrompt !== undefined ? [customPrompt] : defaultSystemPrompt),
+  ...(memoryMechanicsPrompt ? [memoryMechanicsPrompt] : []),
+  ...(appendSystemPrompt ? [appendSystemPrompt] : []),
+])
+```
+- 类型/容器:`src/utils/systemPromptType.ts` 提供 `asSystemPrompt`、`SystemPrompt`。
+- 工具追加:`src/Tool.ts:174` `appendSystemPrompt?: string` 让工具可往 system 加 prompt。
+
+**query.ts 拼接**(`src/query.ts:449-451`):
+```ts
+const fullSystemPrompt = asSystemPrompt(
+  appendSystemContext(systemPrompt, systemContext),
+)
+```
+
+**CLAUDE.md 加载**:`src/utils/claudemd.ts`(约 1258+ 行),三种作用域:
+- Managed:`/etc/claude-code/CLAUDE.md`
+- User:`~/.claude/CLAUDE.md`
+- Project:`CLAUDE.md`、`.claude/CLAUDE.md`、`.claude/rules/*.md`
+- 路径解析:`claudemd.ts:888` `join(dir, 'CLAUDE.md')`、`:899` `join(dir, '.claude', 'CLAUDE.md')`、`:944` `--add-dir` 额外目录。
+- 排除规则:`claudemd.ts:540` `claudeMdExcludes`。
+- 主入口 `loadClaudeMdForDirectory(dir)` 在 `:1242`。
+
+**每轮 prefetch**(`query.ts:301`):`startRelevantMemoryPrefetch` + skill discovery(`query.ts:331`)——prompt 入参不变,但每轮按需 prefetch。
+
+### 17.8 context overflow 触发压缩
+
+**触发判断**(`src/services/compact/autoCompact.ts:218-238`):
+```ts
+const tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed
+const threshold = getAutoCompactThreshold(model)
+const effectiveWindow = getEffectiveContextWindowSize(model)
+const { isAboveAutoCompactThreshold } = calculateTokenWarningState(tokenCount, model)
+return isAboveAutoCompactThreshold
+```
+
+**环境变量覆写**(`autoCompact.ts:40-42`):
+```ts
+const autoCompactWindow = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+if (autoCompactWindow) { /* parseInt + 应用 */ }
+```
+
+**执行入口**(`autoCompact.ts:241`):`autoCompactIfNeeded(...)`;调用方:`src/query/deps.ts:3` `import { autoCompactIfNeeded }`,`src/query.ts:12`、`src/query.ts:454` `await deps.autocompact(...)`。
+
+**断路器**(`autoCompact.ts:260-264`):连续失败 ≥ `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES` 后停止重试。
+
+**Server-side 409 overflow**(`src/services/api/withRetry.ts:391-420`):
+```ts
+const { inputTokens, contextLimit } = overflowData
+// contextLimit - inputTokens - safetyBuffer
+```
+API 返回 `context_length_exceeded` 时走被动压缩。
+
+**Snip 子路径**(`query.ts:401-408`):`feature('HISTORY_SNIP')` 启用 `snipModule.snipCompactIfNeeded`,`snipTokensFreed` 回馈到 autocompact 阈值判断。
+
+**配置项**:`src/tools/ConfigTool/supportedSettings.ts:54` 暴露 `autoCompactEnabled`。
+
+### 17.9 对 laew 的 P0/P1/P2 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | 工具结果预算 | 单 message 聚合 ≤200k 字符,超出按 `tool_use_id` 替换为文件路径 preview | query.ts:379, toolLimits.ts |
+| **P0** | AbortController 三层 | QueryEngine → toolUseContext → 子进程 + 子代理全链路共享 controller | QueryEngine.ts:203, Tool.ts:180 |
+| **P0** | maxTurns 传递 | 子代理独立 `maxTurns ?? agentDefinition.maxTurns`,默认 fork=200 | runAgent.ts:756, forkSubagent.ts:65 |
+| **P0** | Bash 持久化截断 | 输出落盘 64MB 上限(fsTruncate 兜底) | BashTool.tsx:732 |
+| **P1** | 工具截断差异化 | Bash 30k/FileRead Infinity/FileEdit 默认 50k,按工具特性单独覆盖 | toolLimits.ts + 各工具 |
+| **P1** | 工具超时不用 Abort | GrepTool 注释明确"避免打断 agent loop"——可取消与超时分离 | GrepTool.ts:438 |
+| **P1** | LSP 拒收大门 | MAX_LSP_FILE_SIZE_BYTES=10MB 防止 LSP 服务被打爆 | LSPTool.ts:53 |
+| **P1** | Edit 多匹配 ask | 严格拒绝歧义匹配,逼模型传 replace_all | FileEditTool.ts:329-336 |
+| **P1** | Edit 同字面拒绝 | 旧=新 直接报错,节省一次往返 | FileEditTool.ts:148 |
+| **P1** | systemPrompt 三段 | customPrompt + memoryMechanics + appendSystemPrompt 顺序拼接 | QueryEngine.ts:321-325 |
+| **P1** | CLAUDE.md 三作用域 | Managed / User / Project 优先级链 | claudemd.ts:4-6 |
+| **P1** | 409 overflow 触发压缩 | API 报错后被动触发,与主动阈值互补 | withRetry.ts:391-420 |
+| **P2** | PDF 分页上限 | 防止模型一次读 GB 大小 PDF | FileReadTool.ts:433 |
+| **P2** | PDF 中文 prompt | 2000 行默认,工程化默认值 | prompt_cn.ts:10 |
+| **P2** | 双 Edit 工具 | 通过 input1/input2 把 WriteFile 与 Edit 合并,减少工具爆炸 | FileEditTool.ts:369/379 |
+| **P2** | 断路器 | autocompact 连续失败熔断,防无限重试 | autoCompact.ts:260-264 |

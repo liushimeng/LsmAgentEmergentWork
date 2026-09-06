@@ -7637,3 +7637,195 @@ struct MockAgent {
 > 合并后文档行数: ~3,500 行(综合提炼自 19,635 行原始文档)
 > 合并策略: 核心架构 > WebAPI层 > 拦截器与Mock > 核心机制 > HTTP传输层 > 源码调研(去重优先级)
 > 原始文件保留,未删除
+
+---
+
+## 第五轮深挖补充(2026-09-06)
+
+针对 laew 的 reqwest HTTP 层,补充前文覆盖薄弱的客户端实现细节。所有行号来自 `/usr/local/LsmGitOpenSource/undici` 当前 head(2026-09-02)。
+
+### A. Client / Pool / Agent 调度对比
+
+**类定义位置**:
+- `Client`:`/usr/local/LsmGitOpenSource/undici/lib/dispatcher/client.js:102`,构造参数:
+  ```js
+  constructor(url, { maxHeaderSize, headersTimeout, socketTimeout, requestTimeout,
+      connectTimeout, bodyTimeout, idleTimeout, keepAlive, keepAliveTimeout,
+      maxKeepAliveTimeout, pipelining, tls, maxRequestsPerClient, localAddress,
+      maxResponseSize, autoSelectFamily, autoSelectFamilyAttemptTimeout,
+      // h2
+      maxConcurrentStreams, allowH2, useH2c, initialWindowSize, connectionWindowSize,
+      pingInterval } = {})
+  ```
+- `Pool`:`lib/dispatcher/pool-base.js:21` `class PoolBase extends DispatcherBase { [kQueue] = new FixedQueue(); [kClients] = []; ... }`
+- `Agent`:`lib/dispatcher/agent.js:24` `class Agent extends DispatcherBase { constructor({ factory = defaultFactory, maxOrigins = Infinity, ... })`
+- `ProxyAgent`:`lib/dispatcher/proxy-agent.js:110`
+
+**Default factory**(`agent.js:18-22`):
+```js
+function defaultFactory(origin, opts) {
+  return opts && opts.connections === 1
+      ? new Client(origin, opts)
+      : new Pool(origin, opts)
+}
+```
+
+### B. h2:GOAWAY 重放预算与并发流
+
+**完整 h2 client**:`/usr/local/LsmGitOpenSource/undici/lib/dispatcher/client-h2.js`(独立于 h1);h2c 透明升级在 `lib/dispatcher/h2c-client.js`。
+
+**GOAWAY 重放预算(RFC 9113 §8.7 防无限重试)**(`client-h2.js:53-61,196-205`):
+```js
+const kReceivedGoAway       = Symbol('received goaway')
+const kGoAwayReplayAttempts = Symbol('goaway replay attempts')
+const kRefusedStreamRetry   = Symbol('refused stream retry')
+const MAX_GOAWAY_REPLAY_ATTEMPTS = 1
+// RFC 9113 section 8.7: a client SHOULD NOT automatically retry a request more than once.
+return attempts <= MAX_GOAWAY_REPLAY_ATTEMPTS
+```
+
+**maxConcurrentStreams 透传**(`client-h2.js:255-263`):
+```js
+const session = http2.connect(client[kUrl], {
+  createConnection: () => socket,
+  peerMaxConcurrentStreams: client[kHTTP2Options].maxConcurrentStreams,
+  settings: { enablePush: false, ... }
+})
+```
+**设置更新**:`client-h2.js:545` `this[kClient][kMaxConcurrentStreams] = settings.maxConcurrentStreams ?? this[kClient][kMaxConcurrentStreams]`
+
+**MAX_CONCURRENT_STREAMS=0 退避**(`client-h2.js:269-273`):
+```js
+// Armed while the peer advertises MAX_CONCURRENT_STREAMS = 0 and we have
+// work that cannot start. See setNoStreamsTimeout.
+noStreamsTimeout: null,
+```
+- **关键防御**:peer 报 0 并发流时,客户端设 noStreamsTimeout,工作不被卡死。
+
+**GOAWAY session 处理**(`client-h2.js:89-93,298`):
+```js
+function getGoAwayError(session, errorCode) {
+  return session[kError] ||
+    (errorCode === NGHTTP2_NO_ERROR
+        ? new InformationalError(`HTTP/2: "GOAWAY" frame received with code ${errorCode}`)
+        : new SocketError(`HTTP/2: "GOAWAY" frame received with code ${errorCode}`, ...))
+}
+// ...
+util.addListener(session, 'goaway', onHttp2SessionGoAway)
+```
+
+### C. Happy Eyeballs 与 ConnectTimeoutError 标准化
+
+**透传**:`Client/Pool/Agent/RoundRobinPool` 都透传 `autoSelectFamily`、`autoSelectFamilyAttemptTimeout`(`client.js:130-131,290`、`pool.js:37-38,64`、`round-robin-pool.js:38-39,63`)。
+
+**AggregateError → ConnectTimeoutError 标准化**(`lib/core/connect.js:167-189`):
+```js
+// `net.connect` with `autoSelectFamily` raises an `AggregateError` when every
+// attempted address fails.
+function maybeNormalizeConnectError(err, socket, opts) {
+  if (err instanceof AggregateError
+      && (err.code === 'ETIMEDOUT' || err.errors.some((e) => e != null && e.code === 'ETIMEDOUT'))) {
+    let message = 'Connect Timeout Error'
+    if (Array.isArray(socket.autoSelectFamilyAttemptedAddresses)) {
+      message += ` (attempted addresses: ${socket.autoSelectFamilyAttemptedAddresses.join(', ')},`
+    }
+    // ...
+    const wrapped = new ConnectTimeoutError(message)
+    wrapped.cause = err
+    return wrapped
+  }
+}
+```
+- **关键设计**:undici 把"多个 address family 都超时"统一为 ConnectTimeoutError,避免内部计时器与 net 内核 race——错误类型稳定才能上层重试。
+
+**ALPN 协议协商**(`lib/core/connect.js:92`):
+```js
+ALPNProtocols: allowH2 ? (preferH2 ? ['h2', 'http/1.1'] : ['http/1.1', 'h2']) : ['http/1.1'],
+```
+
+### D. diagnostics-channel 13 个命名通道
+
+**Channels 全清单**(`lib/core/diagnostics.js:10-32`):
+```js
+const channels = {
+  beforeConnect:    diagnosticsChannel.channel('undici:client:beforeConnect'),
+  connected:        diagnosticsChannel.channel('undici:client:connected'),
+  connectError:     diagnosticsChannel.channel('undici:client:connectError'),
+  sendHeaders:      diagnosticsChannel.channel('undici:client:sendHeaders'),
+  create:           diagnosticsChannel.channel('undici:request:create'),
+  bodySent:         diagnosticsChannel.channel('undici:request:bodySent'),
+  bodyChunkSent:    diagnosticsChannel.channel('undici:request:bodyChunkSent'),
+  bodyChunkReceived:diagnosticsChannel.channel('undici:request:bodyChunkReceived'),
+  headers:          diagnosticsChannel.channel('undici:request:headers'),
+  trailers:         diagnosticsChannel.channel('undici:request:trailers'),
+  error:            diagnosticsChannel.channel('undici:request:error'),
+  open:             diagnosticsChannel.channel('undici:websocket:open'),
+  close:            diagnosticsChannel.channel('undici:websocket:close'),
+  socketError:      diagnosticsChannel.channel('undici:websocket:socket_error'),
+  ping:             diagnosticsChannel.channel('undici:websocket:ping'),
+  pong:             diagnosticsChannel.channel('undici:websocket:pong'),
+  proxyConnected:   diagnosticsChannel.channel('undici:proxy:connected')
+}
+```
+
+**Publish 点**:`client.js:515-516`(beforeConnect)、`571-572`(connected)、`603-604`(connectError);`client-h1.js:1345-1346`、`client-h2.js:1221-1226`(sendHeaders):
+```js
+if (channels.sendHeaders.hasSubscribers) {
+  channels.sendHeaders.publish({ request, headers: header, socket: session[kSocket] })
+}
+```
+- **`hasSubscribers` 守门**:无订阅者时跳过 publish,零开销。
+
+### E. fetch 中断:AbortController 完整生命周期
+
+**controller.abort()**(`lib/web/fetch/index.js:127-151`):
+```js
+// https://fetch.spec.whatwg.org/#fetch-controller-abort
+abort(error) {
+  if (this.state !== 'ongoing') return
+  this.state = 'aborted'
+  // ...
+  if (!error) error = new DOMException('The operation was aborted.', 'AbortError')
+  // ...
+  this.connection?.destroy(error)
+  this.emit('terminated', error)
+}
+```
+
+**Request 内部 AbortController**(`lib/web/fetch/request.js:1,31,424,436`):
+```js
+/* globals AbortController */
+const kAbortController = Symbol('abortController')
+// ...
+const ac = new AbortController()
+// ...
+this[kAbortController] = ac
+```
+
+**主流程 abort 触发**(`fetch/index.js:221,1979,2036,2231`):
+```js
+controller.abort(requestObject.signal.reason)        // L221
+fetchParams.controller.abort()                        // L1979
+fetchParams.controller.abort(reason)                  // L2036
+const abort = (reason) => controller.abort(reason)    // L2231
+```
+
+**防 AbortController GC 泄漏**(参考 issue #4627,注释散落在 `fetch/index.js:293,415,470`):fetch 内部引用 Request → Request 引用 AC → AC 引用 callback。需手动 unref 否则长 fetch 期间 GC 不回收。
+
+### F. 对 laew 的 P0/P1/P2 借鉴路线
+
+| 优先级 | 模块 | 借鉴内容 | 来源 |
+|---|---|---|---|
+| **P0** | Client 5 类超时 | connect/headers/socket/request/body/idle 各有独立超时 | client.js:102 |
+| **P0** | h2 GOAWAY 重放预算 | `MAX_GOAWAY_REPLAY_ATTEMPTS=1` 防 RFC 9113 §8.7 无限循环 | client-h2.js:53-61 |
+| **P0** | MAX_CONCURRENT_STREAMS=0 退避 | peer 报 0 时启用 `noStreamsTimeout`,不卡死 | client-h2.js:269-273 |
+| **P0** | ConnectTimeoutError 标准化 | AggregateError → ConnectTimeoutError,稳定错误类型便于上层重试 | connect.js:167-189 |
+| **P0** | diagnostics hasSubscribers 守门 | 无订阅者跳过 publish,零开销 | client.js:515-516 |
+| **P1** | peerMaxConcurrentStreams 透传 | settings 帧立即更新 maxConcurrentStreams | client-h2.js:255-263, 545 |
+| **P1** | ALPN 协商顺序 | preferH2 时 `['h2', 'http/1.1']`,否则 `['http/1.1', 'h2']` | connect.js:92 |
+| **P1** | autoSelectFamilyAttemptTimeout | 每个 family 独立超时,Happy Eyeballs 标准 | client.js:131 |
+| **P1** | Pool vs Client 选择 | connections=1 用 Client(无池化),>1 用 Pool | agent.js:18-22 |
+| **P2** | websocket 5 通道 | open/close/socket_error/ping/pong 完整生命周期 | diagnostics.js:21-25 |
+| **P2** | trailer 通道 | `undici:request:trailers` 单独通道,便于区分 headers/trailers | diagnostics.js:19 |
+| **P2** | sendHeaders 时机 | 字节级 sendHeaders publish,可做慢请求探测 | client-h2.js:1221-1226 |
+| **P2** | GC 泄漏防护 | 长 fetch 期间 AbortController 引用链——laew 用 reqwest 不直接踩,但要给 LLM 长流留 hint | fetch/index.js:293,415,470 |
