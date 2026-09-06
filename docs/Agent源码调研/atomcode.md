@@ -28,6 +28,7 @@
 16. [WebUI / Extensions / Evals / Docker](#16-webui--extensions--evals--docker)
 17. [对 laew 的借鉴(P0/P1/P2)](#17-对-laew-的借鉴p0p1p2)
 18. [关键文件清单与常量速查](#18-关键文件清单与常量速查)
+19. [第七轮深挖 — 文件编辑与补丁策略 + 代码检索索引 + 命令执行与进程管理 + Token预算与PromptCaching](#21-第七轮深挖--文件编辑与补丁策略--代码检索索引--命令执行与进程管理--token预算与promptcaching)
 
 ---
 
@@ -3114,3 +3115,998 @@ pub const REASONING_PLACEHOLDER: &str = "·";   // 不是英文句子!
 - 内核契约:`crates/atomcode-kernel/src/stream.rs`(281 行)、`crates/atomcode-kernel/src/event.rs`(532 行)、`crates/atomcode-kernel/src/provider.rs`、`crates/atomcode-kernel/src/message.rs:75-94` 的 `ReasoningBlock`
 
 —— 调研者注:本文档为「第六轮深挖」,聚焦 byte-stable 请求体、流式解码状态机、错误分类与重试三层叠加;不重复前 19 章的总览与前 5 轮已覆盖的 session/compact/Cancel/并发执行闸位等主题。
+
+---
+
+## 21. 第七轮深挖 — 文件编辑与补丁策略 + 代码检索索引 + 命令执行与进程管理 + Token预算与PromptCaching
+
+> 调研对象:`/usr/local/LsmGitOpenSource/atomcode`(v5.0.9)
+> 调研日期:2026-09-06
+> 本轮范围:**第 9 章 CodeIntel 七件套以外**的真实实现,聚焦四大生产级深度:
+> ① 文件编辑与补丁(`edit_file`/`write_file`/`search_replace`/`parallel_edit_files`)
+> ② 代码检索与索引(`grep`/`glob` + `lsp` + `codeintel/index`)
+> ③ 命令执行与进程管理(`bash` 的 `tokio::process` 进程组 + Job Object + setsid + askpass + 危险命令分类)
+> ④ Token 预算与 Prompt Caching(usage 解码 + `OverflowCompaction` 三级阶梯 + Auto drain)
+
+### 21.1 文件编辑与补丁策略
+
+#### 21.1.1 工具矩阵总览
+
+| 工具 | 文件 | 行数 | 风险 | 核心策略 |
+| --- | --- | --- | --- | --- |
+| `edit_file` | `crates/atomcode-capabilities/src/tools/edit.rs` | 1375 | `Risky` | 路径级锁 + 编码保留(GBK)+ 4 级 fallback + 200ms diff deadline |
+| `write_file` | `crates/atomcode-capabilities/src/tools/write.rs` | 177 | `Risky` | 自动建父目录 + 行数 diff + 大幅缩量 WARN |
+| `search_replace` | `crates/atomcode-capabilities/src/tools/search_replace.rs` | 490 | `Risky` | `ignore::WalkBuilder` 并行扫 + 文本/正则双模 + per-file EOL |
+| `parallel_edit_files` | `crates/atomcode-capabilities/src/tools/parallel_edit.rs` | 633 | `Risky` | fork N 个子 Agent + `ctx.cancel.child_token()` 级联 + build 探针 |
+
+> **关键观察**:atomcode 的 editor 是「**4 级匹配**」(literal → EOL-coerced → whitespace-fuzzy → whitespace-insensitive → block-anchor)而不是单层精确替换。**没有一个** LLM 写「old_string」能保证一次写对,所以层层退化。
+
+#### 21.1.2 `edit_file` 的 4 级匹配 + 路径级锁
+
+精确字符串替换的局限是「**模型给的字符串无法 byte-perfect 还原**」。atomcode 的 `edit_file` 维护了一份「exactness ladder」(严格 → 宽松 → 猜)如下(摘自 `crates/atomcode-capabilities/src/tools/edit.rs:138-240`):
+
+```rust
+let literal = content.matches(&a.old_string).count();
+let (old_match, new_match, count) = if literal > 0 {
+    (a.old_string.clone(), a.new_string.clone(), literal)
+} else {
+    let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let old_c = coerce_eol(&a.old_string, file_eol);
+    let c = content.matches(&old_c).count();
+    (old_c, coerce_eol(&a.new_string, file_eol), c)
+};
+if count == 0 {
+    // Tier 1: fuzzy (whitespace-normalized)
+    if let Some((fuzzy_result, fuzzy_count)) =
+        try_fuzzy_replace(&content, &a.old_string, &a.new_string, a.replace_all) { ... }
+    // Tier 2: whitespace-INSENSITIVE (single dense line)
+    if let Some((ws_result, ws_count)) =
+        try_whitespace_insensitive_replace(&content, &a.old_string, &a.new_string, a.replace_all) { ... }
+    // Tier 3: block-anchor (first+last lines, ≤1 interior drift)
+    if let Some((anchor_result, _)) =
+        try_block_anchor_replace(&content, &a.old_string, &a.new_string) { ... }
+    return err(format!("edit_file: old_string not found in {}. The file was NOT modified. {}", ...));
+}
+```
+
+**关键设计**:
+1. **literal 优先 + 严格 EOL 容忍**(literal 命中时 verbatim 写入,**不**强转 CRLF 防止混合行尾注入,见 test `literal_match_writes_new_verbatim_no_crlf_injection`)。
+2. **`try_fuzzy_replace`** 对每行 `.trim()`,然后 reanchor 到文件**真实缩进**(tab 保留,多字节 whitespace 按 char 计)。
+3. **`try_whitespace_insensitive_replace`** 走 interior-spaces 删除(比 collapse 更宽松),专门应对 `["json","stream"]` vs `["json", "stream"]`。
+4. **`try_block_anchor_replace`** 仅当 `n ≥ 3` 且两个 anchor ≥ 3 trim-chars,要求 `matched + 1 ≥ n`(允许 1 行漂移,**n=4 时退化为 anchors only** 故拒绝二行漂移)。
+
+**路径级互斥锁**(同 canonical 路径串行化):
+
+```rust
+// crates/atomcode-capabilities/src/tools/edit.rs:19-36
+type PathLock = AsyncMutex<()>;
+fn edit_path_locks() -> &'static Mutex<HashMap<PathBuf, Weak<PathLock>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<PathLock>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn edit_path_lock(path: &Path) -> Arc<PathLock> {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut locks = edit_path_locks().lock().unwrap_or_else(|p| p.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) { return lock; }
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+```
+
+> **解读**:`Weak<PathLock>` + `strong_count > 0` 防止「孤儿锁」(编辑完成后无锁被引用,锁表自动回收)。
+
+**byte-level CAS 提交**(process-local compare-and-write):
+
+```rust
+// crates/atomcode-capabilities/src/tools/edit.rs:306-326
+async fn write_encoded_if_unchanged(
+    path: &Path, expected: &[u8], text: &str, encoding: FileEncoding,
+) -> Result<(), String> {
+    let current = tokio::fs::read(path).await.map_err(|e| {
+        format!("edit_file: cannot re-read {} before commit: {e}. The file was NOT modified.", ...)
+    })?;
+    if current != expected {
+        return Err(format!(
+            "edit_file: {} changed after it was read. The file was NOT modified. Re-read it \
+             and retry the edit against the current content.", ...
+        ));
+    }
+    write_encoded(path, text, encoding).await
+}
+```
+
+**`build_compact_diff` Myers diff 200ms deadline**(避免「两段几乎完全不同的文件」让 `similar` 库 hang):
+
+```rust
+// crates/atomcode-capabilities/src/tools/edit.rs:374-399
+fn build_compact_diff(old_file: &str, new_file: &str) -> String {
+    const MAX_DIFF_LINES: usize = 60;
+    let mut config = similar::TextDiff::configure();
+    config.timeout(std::time::Duration::from_millis(200));
+    let full = config.diff_lines(old_file, new_file).unified_diff().context_radius(3).to_string();
+    let lines: Vec<&str> = full.lines().collect();
+    if lines.len() <= MAX_DIFF_LINES { return full.to_string(); }
+    let mut out = lines[..MAX_DIFF_LINES].join("\n");
+    out.push_str(&format!("\n… ({} more diff lines)", lines.len() - MAX_DIFF_LINES));
+    out
+}
+```
+
+#### 21.1.3 GBK/GB18030 编码保留
+
+中文 Windows 用户的痛点:模型 `read_file` 看到的是「读出的 UTF-8 文本」,写入时若是 UTF-8,GBK 文件被静默转码。`edit_file` 解码时识别 encoding,写回时再编码回去(`crates/atomcode-capabilities/src/tools/edit.rs:118-130`):
+
+```rust
+let decoded = match crate::tools::encoding::decode_for_edit(&path, &raw) {
+    Some(d) => d,
+    None => {
+        return err(format!(
+            "edit_file: cannot read {} as UTF-8 or a supported legacy text encoding \
+             (GBK/GB18030). Convert it to UTF-8 first. The file was NOT modified.", ...
+        ))
+    }
+};
+let content = decoded.text;
+let file_encoding = decoded.encoding;
+// ... matched in UTF-8, written in file_encoding
+```
+
+> **反直觉**:`write_file` 是**有意**不做这事的(整文件覆盖,UTF-8 是更现代的默认),`edit_file` 是**有意**做这事(原地编辑,保留原编码)。两者不对称是 deliberate。
+
+#### 21.1.4 LLM 可恢复的错误信息
+
+每一次失败都给 LLM 「**下一次怎么修**」的 actionable hint(`edit.rs:328-364`):
+
+```rust
+fn closest_match_hint(content: &str, old_string: &str) -> String {
+    let wanted = old_string.lines().find(|line| !line.trim().is_empty()).map(str::trim).unwrap_or("");
+    if wanted.chars().count() < 4 { return "Re-read the file and copy the exact current text (including whitespace).".to_string(); }
+    let wanted_lower = wanted.to_lowercase();
+    let mut best: Option<(usize, &str, usize)> = None;
+    for (index, line) in content.lines().take(20_000).enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let score = common_prefix_chars(&wanted_lower, &trimmed.to_lowercase());
+        if best.as_ref().map_or(true, |(_, _, current)| score > *current) {
+            best = Some((index + 1, line, score));
+        }
+    }
+    match best.filter(|(_, _, score)| *score >= 4) {
+        Some((line_no, line, _)) => format!(
+            "The closest current line starts at line {line_no}: {:?}. Re-read the surrounding \
+             block and retry with its exact current text.",
+            line.trim().chars().take(160).collect::<String>()
+        ),
+        None => "Re-read the file and copy the exact current text (including whitespace).".to_string(),
+    }
+}
+```
+
+> **模式**:**不报「不匹配」**,报「最近一行 + 行号 + 前 160 字符 + 重新 read_file 指令」。LLM 能基于这个 hint 直接 retry,不需要再次 read 整文件。
+
+#### 21.1.5 `search_replace` 多文件扫描
+
+`spawn_blocking` 隔离 IO,避免异步 worker 卡死:
+
+```rust
+// crates/atomcode-capabilities/src/tools/search_replace.rs:109-119
+let (modified, scanned) = tokio::task::spawn_blocking(move || {
+    sr_scan(&scan_root, re.as_ref(), &search, &replace, glob_filter.as_ref())
+}).await.unwrap_or_else(|_| (Vec::new(), 0));
+```
+
+walk 配置(`search_replace.rs:166-179`):
+
+```rust
+let walk = WalkBuilder::new(root)
+    .hidden(true)         // include hidden
+    .git_ignore(true).git_global(true).git_exclude(true)
+    .filter_entry(|e| {
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if let Some(name) = e.file_name().to_str() { return !is_skip_dir(name); }
+        }
+        true
+    }).build();
+```
+
+**literal 模式 per-file EOL 容忍**(不让 LF old_string 在 CRLF 文件上死):
+
+```rust
+// crates/atomcode-capabilities/src/tools/search_replace.rs:208-231
+None => {
+    let literal = content.matches(search).count();
+    let (needle, repl, count) = if literal > 0 {
+        (search.to_string(), replace.to_string(), literal)
+    } else {
+        let file_eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+        let n = coerce_eol(search, file_eol);
+        let c = content.matches(&n).count();
+        (n, coerce_eol(replace, file_eol), c)
+    };
+    if count == 0 { continue; }
+    (content.replace(&needle, &repl), count)
+}
+```
+
+#### 21.1.6 `parallel_edit_files` 子 Agent 并行编辑
+
+每个文件一个**独立 kernel `Agent`**(独立 provider + 独立 tools),通过 `tokio::spawn` 并发跑。`ctx.cancel.child_token()` 级联到子(取消父 → 全部子停)(`parallel_edit.rs:159-243`):
+
+```rust
+let mut handles = Vec::with_capacity(a.files.len());
+for f in &a.files {
+    let task = format!(
+        "File to edit: {}\n\nInstruction:\n{}{}\n\nEdit ONLY this file using your tools, then stop.",
+        f.path, f.instruction, contract_block
+    );
+    let mut builder = Agent::builder()
+        .provider((self.make_provider)())
+        .tools((self.make_tools)())
+        .persona(self.persona.clone())
+        .working_dir(ctx.working_dir.clone())
+        .cancel_token(ctx.cancel.child_token());
+    ...
+    let child = builder.build();
+    let progress = ctx.progress.clone();
+    handles.push(tokio::spawn(async move {
+        progress.emit(format!("↻ {path}"));
+        let outcome = child.run_to_completion(task, AutoRespond::AllowAll).await;
+        let icon = if outcome.stop == StopReason::Stopped { "✓" } else { "✗" };
+        progress.emit(format!("{icon} {path}"));
+        (path, outcome)
+    }));
+}
+```
+
+**Post-merge build probe**(结构化 build 系统探测,跨平台无 Unix pipe 依赖):
+
+```rust
+// crates/atomcode-capabilities/src/tools/parallel_edit.rs:372-407
+fn find_build_command(wd: &Path) -> Option<(String, std::path::PathBuf)> {
+    let markers: &[(&str, &str)] = &[
+        ("package.json", "npm run build 2>&1"),
+        ("Cargo.toml", "cargo check 2>&1"),
+        ("pom.xml", "mvn compile -q 2>&1"),
+        ("go.mod", "go build ./... 2>&1"),
+    ];
+    for &(marker, cmd) in markers {
+        if wd.join(marker).exists() { return Some((cmd.to_string(), wd.to_path_buf())); }
+    }
+    if let Ok(entries) = std::fs::read_dir(wd) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let sub = entry.path();
+                let name = sub.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with('.') || name == "node_modules" || name == "target" { continue; }
+                for &(marker, cmd) in markers {
+                    if sub.join(marker).exists() { return Some((cmd.to_string(), sub)); }
+                }
+            }
+        }
+    }
+    None
+}
+```
+
+#### 21.1.7 对 laew 的借鉴
+
+| 级别 | 借鉴项 | 实现要点 |
+| --- | --- | --- |
+| **P0** | Read/Write 工具加 GBK 编码识别 | `chardetng` 自动判 + 保留原编码回写;**laew 当前 read 把 GBK 直接 to_string 必崩**(作者经验:Windows GBK TXT 必报错) |
+| **P0** | edit 工具加 4 级匹配 ladder | 当前 laew 只有精确字符串替换;**模型必失败 → 失败回流 → 浪费 5+ 轮** |
+| **P0** | Write 工具加大幅缩量 WARN | `old > 20 && new_lines < old/2` 触发警告,LLM 主动二次确认 |
+| **P0** | 失败信息带「最近一行 + 行号 + 重新 read_file」hint | 当前 laew 失败只回 `is_error: true`,模型重读整个文件 |
+| **P1** | 路径级互斥锁(per-canonical-path Mutex) | 当前 laew 多 SubAgent 并行可能 race 同一文件 |
+| **P1** | `similar` diff 加 200ms timeout | 当前无 deadline,两段大文件 Myers diff 可 stall event loop |
+| **P1** | 编码保留的 write vs edit 行为不一致文档化 | 「write 永远 UTF-8 / edit 保留原编码」必须告诉 LLM |
+| **P2** | `parallel_edit_files` + build probe | laew 当前 6 角色里 Quality-Check 是 LLM,加 `cargo check` 静态验证更稳 |
+
+### 21.2 代码检索与索引
+
+#### 21.2.1 工具矩阵(在第 9 章 CodeIntel 七件套之外)
+
+| 工具 | 文件 | 行数 | 核心依赖 | 关键数值常量 |
+| --- | --- | --- | --- | --- |
+| `grep` | `crates/atomcode-capabilities/src/tools/grep.rs` | 521 | `grep` crate + `ignore::WalkBuilder` | `DEFAULT_MAX_RESULTS=50`、`MAX_RESULTS_CAP=10_000`、`MAX_LINE_BUF_BYTES=10 MiB`、`MAX_DISPLAY_LINE=1000`、`MAX_CONTEXT=10` |
+| `glob` | `crates/atomcode-capabilities/src/tools/glob.rs` | 361 | `globset::Glob` + `ignore::WalkBuilder` | `MAX_RESULTS=100` |
+| `lsp` | `crates/atomcode-capabilities/src/codeintel/lsp_tool.rs` | 460 | 自研 LSP 客户端(`lsp/client.rs` 1170 行) | `MAX_LOCATIONS=200`、`MAX_HOVER_CHARS=12_000`、`MAX_DOCUMENT_BYTES=4 MiB` |
+
+#### 21.2.2 `grep` 工具的 ripgrep-style streaming 实现
+
+不使用 `regex` crate 直接 `find_iter`(那会把整个文件读到内存),而用 `grep::searcher::Searcher`(ripgrep 内核)流式扫描 + `Sink` 回调(`grep.rs:76-211`):
+
+```rust
+let matcher = match RegexMatcherBuilder::new()
+    .case_insensitive(!has_upper)  // smart-case
+    .build(&a.pattern) {
+    Ok(m) => m,
+    Err(_) => match RegexMatcherBuilder::new()
+        .case_insensitive(!has_upper)
+        .build(&regex::escape(&a.pattern)) {  // 无效 regex → 字面量回退
+        Ok(m) => m,
+        Err(e) => return err(format!("grep: invalid pattern '{}': {e}", a.pattern)),
+    },
+};
+
+let base = ctx.working_dir.clone();
+let pattern = a.pattern.clone();
+let res = tokio::task::spawn_blocking(move || search(&root, &matcher, max, context, &base)).await;
+```
+
+**`search` 函数 streaming sink**(`grep.rs:144-211`):
+
+```rust
+let mut searcher = SearcherBuilder::new()
+    .line_number(true)
+    .before_context(context).after_context(context)
+    .binary_detection(BinaryDetection::quit(b'\x00'))   // NUL → binary,skip
+    .heap_limit(Some(MAX_LINE_BUF_BYTES))               // 10 MiB per-line hard cap
+    .build();
+
+for entry in walk.flatten() {
+    if match_count >= max { break; }                     // 早停
+    let path = entry.path();
+    if !path.is_file() { continue; }
+    if path.extension().map(|x| x.eq_ignore_ascii_case("log")).unwrap_or(false) { continue; }
+    files_searched += 1;
+    let rel = crate::pathnorm::to_display(path.strip_prefix(base).unwrap_or(path));
+    let sink = GrepSink { rel: &rel, out: &mut out, match_count: &mut match_count, max };
+    let _ = searcher.search_path(matcher, path, sink);  // 一次性 sink;任意错误 → skip 文件
+}
+```
+
+**Sink 的早停契约**(`grep.rs:239-244`):
+
+```rust
+fn matched(&mut self, _s: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
+    let n = mat.line_number().unwrap_or(0);
+    self.out.push(format!("{}:{n}:{}", self.rel, render_line(mat.bytes())));
+    *self.match_count += 1;
+    Ok(*self.match_count < self.max) // false → searcher stops THIS file at the cap
+}
+```
+
+> **观察**:`MAX_LINE_BUF_BYTES = 10 MiB` 是绝对防线。一个 minified JS bundle 可能是单行 50 MiB,没这个 cap 整个 buffer 会被一次 `lines()` 拉到内存 → OOM。
+
+#### 21.2.3 `grep` 的「无效 regex 退化为字面量」
+
+```rust
+// grep.rs:102-114
+let matcher = match RegexMatcherBuilder::new().case_insensitive(!has_upper).build(&a.pattern) {
+    Ok(m) => m,
+    Err(_) => match RegexMatcherBuilder::new().case_insensitive(!has_upper).build(&regex::escape(&a.pattern)) {
+        Ok(m) => m,
+        Err(e) => return err(format!("grep: invalid pattern '{}': {e}", a.pattern)),
+    },
+};
+```
+
+> **观察**:这里有**两次** regex 编译尝试。第一次失败才调 `regex::escape()`;如果 escape 后还是失败(理论不可能),报 invalid pattern。LLM 写错正则时,会自动当成字面量匹配,**不浪费一轮**。
+
+#### 21.2.4 `glob` 工具的绝对路径 + tilde 展开
+
+`glob.rs` 对「pattern 本身是绝对路径」做了特判(`glob.rs:53-145` 摘要):
+
+```rust
+let pat = args.pattern.clone();
+let (absolute_base, relative_pattern) = split_absolute_base(&pat);
+// 比如 pat = "G:/VR2024/keystore/*" → base = "G:/VR2024/keystore", pattern = "*"
+let base2 = resolve_path(absolute_base, &ctx.working_dir);
+if base2.is_absolute() {
+    let walk = WalkBuilder::new(&base2).hidden(false).git_ignore(false).build(); // 走出 working_dir 仍工作
+    for entry in walk.flatten() {
+        let matcher = Glob::new(relative_pattern)?.compile_matcher();
+        let rel = entry.path().strip_prefix(&base2).unwrap_or(entry.path());
+        if matcher.is_match(&rel.to_string_lossy()) { hits.push(entry.path().to_path_buf()); }
+        if hits.len() > MAX_RESULTS { break; }
+    }
+}
+```
+
+**绝对路径 `split_absolute_base`** 处理跨平台 root + tilde(`glob.rs:156-188`):
+
+```rust
+fn split_absolute_base(pattern: &str) -> Option<(PathBuf, String)> {
+    // 1) Windows root: "C:/..." / "C:\\..." / "\\\\server\\share\\..." 
+    // 2) Unix root: "/foo/bar/*"
+    // 3) tilde: "~/code/*" → HOME="/home/me" + "/code/*"
+    // 4) 否则 None (relative pattern)
+}
+```
+
+#### 21.2.5 LSP 客户端(独立 1170 行)
+
+`lsp_tool.rs` 是**单一** model-facing LSP 入口,内部路由到 `LspManager`(`crates/atomcode-capabilities/src/codeintel/lsp/manager.rs` 460 行)。LSP 客户端用 JSON-RPC stdio(`lsp/client.rs:1170` 行,自研 JSON-RPC 帧解析):
+
+```rust
+// crates/atomcode-capabilities/src/codeintel/lsp_tool.rs:51-72
+#[async_trait]
+impl Tool for LspTool {
+    fn name(&self) -> &str { "lsp" }
+    fn description(&self) -> &str {
+        "Query a locally installed Language Server for semantic definition, references, hover, \
+         or diagnostics. Starts the matching server lazily. Read-only; if unavailable, fall back \
+         to read_symbol/find_references/search instead of retrying."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "operation": { "type": "string", "enum": ["definition", "references", "hover", "diagnostics"] },
+                "file_path": { "type": "string", "description": "File path relative to the workspace or absolute within it" },
+                "line": { "type": "integer", "minimum": 1, "description": "One-based line; required except for diagnostics" },
+                "character": { "type": "integer", "minimum": 1, "description": "One-based character; required except for diagnostics" },
+                "severity": { "type": "string", "enum": ["error", "warning", "all"], "description": "Diagnostics filter (default: error)" }
+            },
+            "required": ["operation", "file_path"]
+        })
+    }
+}
+```
+
+**最大 LOC/hover/diagnostics 防御**(`lsp_tool.rs:15-17`):
+
+```rust
+const MAX_LOCATIONS: usize = 200;
+const MAX_HOVER_CHARS: usize = 12_000;
+const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+```
+
+> **观察**:LSP unavailable 是**正常可降级结果**,不是 failed turn。「unavailable → fall back to read_symbol/find_references/search」让模型不要重试。
+
+#### 21.2.6 CodeIntel 七件套(已第 9 章,本轮新增)
+
+CodeIntel 真正落盘的**索引**(`crates/atomcode-capabilities/src/codeintel/index.rs` 520 行):符号抽取 + 跨文件依赖图。本轮新增观察:
+
+- `crates/atomcode-capabilities/src/codeintel/symbols.rs:294` 符号定义
+- `crates/atomcode-capabilities/src/codeintel/graph.rs:356` 文件依赖图
+- `crates/atomcode-capabilities/src/codeintel/find_references.rs:227` 引用查询
+- `crates/atomcode-capabilities/src/codeintel/lsp/registry.rs:141` 语言服务器注册表
+
+#### 21.2.7 对 laew 的借鉴
+
+| 级别 | 借鉴项 | 实现要点 |
+| --- | --- | --- |
+| **P0** | 加 Read 工具(目前只有 Read/Bash/Write) | laew 当前 `Read` 工具是一次性读全文;加 read-offset/limit/lines 实现大文件分页 |
+| **P0** | grep 改用 `grep` crate streaming 而非 `regex::Regex::find_iter` | 当前 laew Read 把整个文件读到内存;GB 级 log 直接 OOM |
+| **P1** | 加 glob 工具 | 当前 laew 必须 bash `find`/`ls`,LLM 拼路径易错 |
+| **P1** | grep invalid regex → 字面量回退 | 当前 laew Bash regex 错误直接 fatal,模型浪费一轮 |
+| **P2** | 加 LSP 工具(lsp/client 1170 行可借鉴骨架) | laew 当前零语义分析,只靠 `Read` + `Bash grep` |
+
+### 21.3 命令执行与进程管理(`bash`)
+
+#### 21.3.1 关键常量与默认值
+
+```rust
+// crates/atomcode-capabilities/src/tools/bash.rs:26-34
+const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const MAX_TIMEOUT_SECS: u64 = 300;
+const SILENT_KILL_SECS: u64 = 90;  // 30→90,容忍 file lock waits / linker
+```
+
+#### 21.3.2 非交互环境变量降级(防 REPL 卡死)
+
+`apply_non_interactive_env` 强制注入(`bash.rs:52-67`):
+
+```rust
+fn non_interactive_env_vars() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("TERM", "dumb"),              // REPL/pager/git 探测"非能力终端" → 退 line-editing
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+        ("GIT_TERMINAL_PROMPT", "0"),  // git 缺凭证时 fast-fail 而非阻塞等密码
+    ]
+}
+```
+
+**Windows 额外 PYTHONUTF8**(`bash.rs:236-240`):
+
+```rust
+#[cfg(windows)]
+{
+    cmd.env("PYTHONUTF8", "1");
+    cmd.env("PYTHONIOENCODING", "utf-8");
+}
+```
+
+> **背景**:Windows `python -c` 默认 `subprocess` 文本管道 + stdio 用控制台 codepage(GBK);读 UTF-8 输出 `UnicodeDecodeError`。`PYTHONUTF8=1`(PEP 540)翻转 `locale.getpreferredencoding()`。Tradeoff:副作用是 `open('gbk_file.txt')` 不显式 `encoding=` 时也变 UTF-8 → GBK 文件读不出来。atomcode **接受**这个 trade-off,认为现代文件以 UTF-8 为主。
+
+#### 21.3.3 进程组 detach(setsid + TIOCNOTTY)
+
+`pre_exec` 在 fork 后、exec 前运行,**只许用 async-signal-safe libc**(`bash.rs:84-106`):
+
+```rust
+#[cfg(unix)]
+unsafe fn detach_child_from_controlling_tty() {
+    use std::ffi::c_char;
+    extern "C" {
+        fn setsid() -> i32;
+        fn open(path: *const c_char, oflag: i32, ...) -> i32;
+        fn close(fd: i32) -> i32;
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+    }
+    setsid();
+    const O_RDWR: i32 = 2;
+    #[cfg(target_os = "macos")]
+    const TIOCNOTTY: u64 = 0x20007471;
+    #[cfg(not(target_os = "macos"))]
+    const TIOCNOTTY: u64 = 0x5422;
+    let tty_fd = open(c"/dev/tty".as_ptr(), O_RDWR);
+    if tty_fd >= 0 { ioctl(tty_fd, TIOCNOTTY); close(tty_fd); }
+}
+```
+
+> **观察**:`setsid()` 把子进程变成新 session leader,无 controlling tty。`open("/dev/tty") + TIOCNOTTY` 是 belt-and-suspenders,处理 `setsid` 因 EPERM 失败的情况(setsid 失败子进程仍是 pgroup leader,会继承 tty)。这条注释 `// SAFETY: runs in the forked child before exec — async-signal-safe libc ONLY` 是**关键**安全约束。
+
+#### 21.3.4 进程组 reap(Windows Job Object / Unix killpg)
+
+```rust
+// crates/atomcode-capabilities/src/tools/bash.rs:287-304
+#[cfg(windows)]
+let job_guard = crate::process_utils::assign_child_to_kill_on_close_job(&child);
+let child_pid = child.id();
+let wait = child.wait_with_output();
+
+let kill_tree = || {
+    #[cfg(windows)]
+    crate::process_utils::kill_windows_tree(&job_guard, child_pid);
+    #[cfg(not(target_os = "windows"))]
+    if let Some(pgid) = child_pid {
+        unsafe { killpg(pgid as i32, SIGKILL) };  // SIGKILL the whole group
+    }
+};
+
+tokio::select! {
+    biased;
+    _ = ctx.cancel.cancelled() => {
+        kill_tree();
+        err("bash: cancelled before completion.".to_string())
+    }
+    res = tokio::time::timeout(dur, wait) => match res {
+        Ok(Ok(output)) => format_output(&output),
+        Ok(Err(e)) => err(format!("bash: error running command: {e}")),
+        Err(_) => { kill_tree(); err(format!("bash: timed out after {secs}s — pass a larger `timeout` ...")) }
+    }
+}
+```
+
+**平台对比**:
+- **Windows**:Job Object + `KILL_ON_JOB_CLOSE` handle drop 即 reap 整棵树(`assign_child_to_kill_on_close_job`);额外 `taskkill /T` 兜底。
+- **Unix**:`setsid pre_exec` 把 shell 变成 pgroup leader(`pgid == pid`),`killpg(pgid, SIGKILL)` 干掉 grandchildren(否则 `kill_on_drop` 只覆盖直接 child,mvn→java / ssh→proxy 等 orphans)。
+
+> **观察**:`biased;` 让 cancel 分支优先 → 用户按 Esc 立刻终止,不等到 timeout。
+
+#### 21.3.5 输出 sanitize(ANSI / DCS / OSC / CSI 过滤)
+
+`bash.rs:1241-1325` 集中处理控制字符,避免模型收到的输出里包含「正在运行的进度条 [K 序列」(会污染 transcript):
+
+```rust
+// 简化版,实际包含 DCS/SOS/PM/APC + 8-bit C1 introducer 过滤
+fn sanitize_terminal_output(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut bytes = s.bytes().peekable();
+    while let Some(b) = bytes.next() {
+        if b == 0x1B {                          // ESC
+            match bytes.peek() {
+                Some(b'[') => { bytes.next(); consume_csi(...) }   // CSI
+                Some(b']') => { bytes.next(); consume_string_sequence(...) }  // OSC
+                _ => { /* skip */ }
+            }
+        } else if (0x80..=0x9F).contains(&b) {  // 8-bit C1
+            // strip DCS/SOS/PM/APC introducers
+        } else { out.push(b as char); }
+    }
+    out
+}
+```
+
+#### 21.3.6 危险命令分类器 `check_destructive_command`(530 行)
+
+`bash.rs:1653-2163` 是 atomcode 最长的纯函数之一(530 行)。设计要点:
+
+**a. 多层 unwrap**:wrapper(`timeout`/`env`/`nice`/`strace`/`setsid`/...)→ 真实命令 → subshell/eval/pipe/component → downloader→shell(`curl|sh`)→ `/dev/tcp` reverse shell → socat/nc/python reverse shell → rm/dd/fork-bomb → critical file overwrite → git worktree discard → PowerShell → `chmod 777`/`chown`/`mkfs`/`del /s`。
+
+**b. parse 时考虑 quoting**(`bash.rs:1663-1667`):
+
+```rust
+fn normalize(token: &str) -> String {
+    token.chars().filter(|c| !matches!(c, '\'' | '"' | '\\')).collect()
+}
+```
+
+**c. wrapper 剥离**(`bash.rs:1742-1805`):
+
+```rust
+const WRAPPERS: &[&str] = &["env", "nice", "nohup", "timeout", "strace", "ionice", "taskset",
+    "setsid", "screen", "tmux", "script", "unshare", "nsenter", "chroot", "setarch", ...];
+// timeout 10 rm -rf / → 剥 timeout → rm -rf /
+let stripped = strip_wrappers(&cmd);
+if stripped != cmd && !stripped.is_empty() {
+    if let Some(r) = check_destructive_command(&stripped) { return Some(r); }
+}
+```
+
+**d. subshell recursion**(`bash.rs:1853-1863`):
+
+```rust
+for shell in ["bash", "sh", "zsh", "dash", "ash", "ksh", "python", "python3", "perl", "ruby", "node"] {
+    if cmd.contains(&format!("{shell} -c")) || cmd.contains(&format!("{shell} -lc")) {
+        if let Some(script) = extract_script(&cmd, shell) {
+            if let Some(r) = check_destructive_command(&script) {
+                return Some(format!("destructive in subshell ({shell} -c): {r}"));
+            }
+        }
+    }
+}
+```
+
+**e. tree-sitter 解析 read-only bash**(parallel_safe 判定)(`bash.rs:2179-2250`):
+
+```rust
+fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
+    thread_local! {
+        static PARSER: RefCell<Option<tree_sitter::Parser>> = RefCell::new(None);
+    }
+    PARSER.with(|slot| {
+        let mut opt = slot.borrow_mut();
+        if opt.is_none() {
+            let mut p = tree_sitter::Parser::new();
+            p.set_language(&tree_sitter_bash::LANGUAGE.into()).ok()?;
+            *opt = Some(p);
+        }
+        opt.as_mut().unwrap().parse(command, None)
+    })
+}
+pub fn bash_invocations(source: &str) -> Option<Vec<BashInvocation>> {
+    // 树遍历;收集每个 "command" 节点的 command_name + arguments
+}
+const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
+    "grep", "rg", "cat", "head", "tail", "ls", "find", "wc", "echo", "pwd", "which", "stat",
+    "cut", "tr", "nl", "rev", "basename", "dirname", "file", "printf", "true", "false", "seq",
+    "column", "cd",
+];
+```
+
+> **观察**:`READ_ONLY_BASH_ALLOWLIST` 只有 ~25 个非常安全的命令(全 read-only builtin),任何写入操作都 `parallel_safe = false`,串行化到 write-lock 后。这是 atomcode 的并发契约。
+
+#### 21.3.7 askpass 集成(sudo / ssh)
+
+`bash.rs:474-566` 处理 sudo → askpass helper。当 `askpass::current_env().is_some()`(Unix 交互式 TUI 时)自动 rewrite `sudo` → `sudo -A` 让密码 modal 弹出:
+
+```rust
+#[cfg(unix)]
+let effective_command = if crate::askpass::current_env().is_some() {
+    rewrite_sudo_for_askpass(&a.command)
+} else {
+    a.command.clone()
+};
+```
+
+> **观察**:`SSH_ASKPASS` / `SUDO_ASKPASS` / `EDITOR` 是**故意不**在 `non_interactive_env_vars()` 里 clobber 的,只在这里由 `apply_askpass_env` 注入 —— 否则会破坏 atomcode 自己的 askpass server。
+
+#### 21.3.8 输出格式 `format_output`
+
+`bash.rs:1325-1374` 把 `Output` 转成 `ToolResult`(stdout / stderr 标签 + exit code + elapsed):
+
+```rust
+fn format_output(output: &std::process::Output) -> ToolResult {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code();
+    let mut msg = format!(
+        "(exit code {})\n\nstdout:\n{}\n\nstderr:\n{}",
+        code.map(|c| c.to_string()).unwrap_or_else(|| "killed by signal".to_string()),
+        stdout, stderr
+    );
+    if !output.status.success() {
+        ToolResult { is_error: true, content: msg, ..Default::default() }
+    } else {
+        ToolResult { is_error: false, content: msg, ..Default::default() }
+    }
+}
+```
+
+#### 21.3.9 对 laew 的借鉴
+
+| 级别 | 借鉴项 | 实现要点 |
+| --- | --- | --- |
+| **P0** | Bash 工具加 `kill_on_drop` + 进程组 reap | 当前 laew Bash 只 spawn 一次;**`cargo build` Ctrl-C 后 maven/java 孤儿进程**(作者经验:CPU 100% 跑满 10 min) |
+| **P0** | `non_interactive_env_vars()` 注入 | 当前 laew Bash 不设 `GIT_TERMINAL_PROMPT=0`,**`git push` 凭证缺失卡死整轮** |
+| **P0** | 危险命令分类器(check_destructive_command) | 当前 laew Bash 无分类器,模型可一次 `rm -rf /`**无任何审批** |
+| **P1** | 树解析 bash(tree-sitter)+ read-only allowlist | 当前 laew 无 parallel_safe 判定,read 命令被串行化 |
+| **P1** | setsid + TIOCNOTTY detach | 当前 laew Bash 子进程继承 TTY,AtomGit `[PASSED]` 框乱入 transcript |
+| **P1** | PYTHONUTF8/IOENCODING 注入(Windows) | 当前 laew Windows 下 `python -c` 大概率 UnicodeDecodeError |
+| **P2** | askpass server(密码弹窗) | 当前 laew 无密码交互,模型需用户手敲 |
+| **P2** | `apply_non_interactive_env` 共享给 `!cmd` 路径 | laew 当前只有一个 Bash 路径,问题不大;但若加 `!cmd` 必须共享 |
+
+### 21.4 Token 预算与 Prompt Caching
+
+#### 21.4.1 Cache control 在协议层的真实状态
+
+**关键发现**:atomcode **不在请求体里主动插入 `cache_control: {type: "ephemeral"}` 断点**。它只**读取**响应里的 `cache_read_input_tokens` / `cache_creation_input_tokens` / `cached_tokens` 度量。证据:
+
+```bash
+$ grep -rn "cache_control" /usr/local/LsmGitOpenSource/atomcode/crates/atomcode-capabilities/src/
+crates/atomcode-capabilities/src/compaction.rs:16:   // turn that just went stale), then freezes — instead of the old ephemeral `microcompact`
+crates/atomcode-capabilities/src/tools/task.rs:1246:   // marker-prefixed ephemeral progress stream.
+crates/atomcode-capabilities/src/subagent/mod.rs:175:   // An ephemeral activity line (tool use, status) ...
+```
+
+> **零** 请求体侧 `cache_control` JSON key。**这是 atomcode 的设计选择** —— 不主动控制 cache,靠「**byte-stable prefix**」让上游 provider 自动 cache(典型 cache 命中率 60-80% if prefix 不变)。
+
+**Anthropic 端**:`crates/atomcode-capabilities/src/provider/anthropic.rs:760-826` 只解码响应:
+
+```rust
+struct AnthropicSseDecoder {
+    blocks: Vec<BlockState>,
+    input_tokens: u32,
+    cache_read: u32,
+    cache_creation: u32,
+    output_tokens: u32,
+    truncated: bool, done: bool, response_id_seen: bool,
+}
+fn usage(&self) -> TokenUsage {
+    TokenUsage {
+        prompt: self.input_tokens + self.cache_read + self.cache_creation,
+        completion: self.output_tokens,
+        cached: self.cache_read,
+    }
+}
+// process_line("message_delta" / "message_stop") 处:
+self.cache_read = u32_at(u, "cache_read_input_tokens");
+self.cache_creation = u32_at(u, "cache_creation_input_tokens");
+```
+
+**OpenAI 端**:`crates/atomcode-capabilities/src/provider/openai_compat.rs:1638-1657` 跨多家兼容:
+
+```rust
+fn map_usage(u: ChunkUsage) -> TokenUsage {
+    let cached = u
+        .prompt_cache_hit_tokens      // DeepSeek
+        .or(u.cached_tokens)          // GLM / Zhipu
+        .or_else(|| u.prompt_tokens_details.and_then(|d| d.cached_tokens))  // OpenAI
+        .unwrap_or(0);
+    let prompt = u.prompt_tokens.unwrap_or_else(|| {
+        u.prompt_cache_hit_tokens.unwrap_or(0)
+            .saturating_add(u.prompt_cache_miss_tokens.unwrap_or(0))
+    });
+    TokenUsage { prompt, completion: u.completion_tokens.unwrap_or(0), cached }
+}
+```
+
+> **观察**:`prompt = input_tokens + cache_read + cache_creation`(Anthropic 视角)vs `prompt = cache_hit + cache_miss`(DeepSeek 视角)—— 同一 `TokenUsage.prompt` 字段,两种归一化语义。注释明确「**Normalize that wire variant to the kernel contract**」。
+
+#### 21.4.2 Byte-stable prefix 设计(让上游自动 cache)
+
+`crates/atomcode-capabilities/src/provider/openai_compat.rs:11` 注释:
+
+```rust
+//!     automatic), so prefix BYTE-STABILITY is the only cache lever — the request
+```
+
+`crates/atomcode-capabilities/src/provider/openai_compat.rs:775` 注释 + 1025 行代码:
+
+```rust
+// one upstream for prefix-cache affinity. Empty ⇒ omitted (sub-agent/summary).
+// ...
+// request prefix byte-stable across turns for the prefix cache).
+```
+
+> **设计哲学**:atomcode 不主动插入 cache breakpoint,而是**保证请求体前 N 字节不变**(system prompt + tools schema + 前 K 条历史消息)。这是 Anthropic 5min-cache / OpenAI 1h-cache 的最强 cache lever —— 前缀不变就 hit。
+
+#### 21.4.3 上下文窗口 + mid-turn input budget
+
+`crates/atomcode-capabilities/src/provider/openai_compat.rs:469-498` 给出「effective input limit」算法:
+
+```rust
+fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
+    let output_reserve = max_tokens.unwrap_or(16_384);
+    // mid-turn input budget = window - output_reserve - margin(覆盖 byte-based 估算的 undercount)
+}
+// Auto compaction trigger:
+fn auto_pressure(used_tokens: u32, ctx_window: u32, threshold: f32) -> bool {
+    used_tokens as f32 / ctx_window as f32 >= threshold
+}
+```
+
+**Empty-response retry budget**(openai_compat.rs:430-453):
+
+```rust
+let ctx_window_overflow =
+    ctx_window > 0 && (est_prompt_tokens as u64) * 10 >= (ctx_window as u64) * 9;
+if ctx_window_overflow {
+    return format!(
+        "模型连续 {max_retries} 次返回空响应。当前请求约 {}K tokens，已接近或超过模型上下文窗口（约 {}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。",
+        est_prompt_tokens / 1000, ctx_window / 1000,
+    );
+}
+```
+
+#### 21.4.4 `OverflowCompaction` 三级阶梯(Overflow 触发)
+
+`crates/atomcode-capabilities/src/compaction.rs:194-401` —— 仅当 kernel overflow-retry loop 构造 `CompactTrigger::Overflow`,且上游已经 reject「too long」时使用。
+
+**Tier 0**:Aggressive stub(`compaction.rs:218-234`):
+
+```rust
+const AGGRESSIVE_STUB_MIN: usize = 160;  // 比正常的 500 更激进
+fn aggressive_stub_rewrites(msgs: &[Message], from: usize, to: usize) -> Vec<(usize, String)> {
+    let id_to_tool = call_id_to_tool(msgs);
+    let mut out = Vec::new();
+    for (i, m) in msgs.iter().enumerate().take(to).skip(from) {
+        if m.role != Role::Tool || m.text.len() <= AGGRESSIVE_STUB_MIN { continue; }
+        let tool = m.tool_call_id.as_deref()
+            .and_then(|id| id_to_tool.get(id)).map(String::as_str).unwrap_or("tool");
+        out.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
+    }
+    out
+}
+```
+
+**Tier 1**:Hard-truncate oversize messages(`compaction.rs:238-259`):
+
+```rust
+const TRUNCATE_MARKER: &str = "\n[truncated: showing ";
+fn truncate_rewrites(msgs: &[Message], from: usize, budget_chars: usize) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (i, m) in msgs.iter().enumerate().skip(from) {
+        if m.text.contains(TRUNCATE_MARKER) { continue; }   // 幂等
+        let total = m.text.chars().count();
+        if total <= budget_chars { continue; }
+        let head: String = m.text.chars().take(budget_chars).collect();
+        out.push((i, format!("{head}{TRUNCATE_MARKER}{budget_chars} of {total} chars]")));
+    }
+    out
+}
+```
+
+> **观察**:`TRUNCATE_MARKER` 是**幂等** sentinel —— 第二次 overflow 不会重复 truncate 已经 truncated 的消息。
+
+**Tier 2**:Drain + LLM summary(`compaction.rs:293-401`):
+
+```rust
+let drain_to = recent_keep_boundary_splitting(msgs, recent_keep_budget(view.ctx_window), floor);
+if drain_to <= floor { return CompactionPlan::noop(); }
+let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len());
+if !span_has_non_anchor(&msgs[floor..drain_to]) {
+    // 只剩 prior anchor 可 drain,不重复 summarize
+    return CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None };
+}
+```
+
+#### 21.4.5 Auto-compaction 触发阈值(`compaction.rs:120-159`)
+
+```rust
+const AUTO_DRAIN_UTILIZATION: f32 = 0.78;
+const RECENT_KEEP_FRACTION: f32 = 0.25;
+const MIN_RECENT_KEEP_TOKENS: usize = 8_000;
+const MAX_RECENT_KEEP_TOKENS: usize = 256_000;
+fn recent_keep_budget(ctx_window: u32) -> usize {
+    let window = ctx_window as usize;
+    ((window as f32 * RECENT_KEEP_FRACTION) as usize)
+        .clamp(MIN_RECENT_KEEP_TOKENS, MAX_RECENT_KEEP_TOKENS)
+        .min(window / 2)
+}
+```
+
+> **观察**:`AUTO_DRAIN_UTILIZATION = 0.78` **故意 < 0.80** —— GLM/DeepSeek 在 80% 利用率就开始告诉用户「开启新对话 / start a new conversation」。在 78% 自动 drain+summarize 避免模型自己说「请开新对话」。
+
+#### 21.4.6 摘要 LLM 调用约束
+
+```rust
+// crates/atomcode-capabilities/src/compaction.rs:166-182
+const MAX_SUMMARY_BYTES: usize = 64 * 1024;
+const MAX_SUMMARY_TOKENS: u32 = 16_000;
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
+const SUMMARY_TIMEOUT_NOTE: &str =
+    "[系统] 本次 /compact 的 AI 摘要超时（>180s，模型可能在大上下文下长时间推理），已改用快速压缩：...";
+const SUMMARY_SYSTEM_PROMPT: &str =
+    "You are an anchored context summarization assistant for a coding session. ...";
+```
+
+> **观察**:`MAX_SUMMARY_BYTES = 64 KiB` 是**硬保证**,即使 provider 不 honor `max_tokens` 也兜得住;`SUMMARY_TIMEOUT = 180s` 上限 —— GLM-5.2 类模型「隐藏推理」trickle bytes 可能跑 20 min,**必须 wall-clock 截断**。
+
+**SUMMARY_TOOL_OUTPUT_MAX_CHARS**(`compaction.rs:469-475`):
+
+```rust
+const SUMMARY_TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
+const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
+fn render_tool_body(text: &str) -> String {
+    // 头 2000 + 尾 500 字符,中间省略
+}
+```
+
+> **观察**:这是 OpenCode「**summary 上下文压缩**」的同款策略 —— 把 tool result 头尾保留(模型通常需要的是 prefix + final state),中间部分对摘要模型无用,删除节省 token。
+
+#### 21.4.7 token 计数实现
+
+atomcode **不自研 tokenizer**(太贵),**不用 tiktoken**(绑 OpenAI),采用**字节估算**:openai_compat.rs:484 「byte-based token estimate」,margin 覆盖 undercount。
+
+> **这是「估算」,不是「精确」**。Anthropic 提供官方 `count_tokens` API,OpenAI 提供 `tiktoken` Rust binding,atomcode **都不用** —— 权衡:不绑 provider、零额外成本、undercount 风险由 margin 兜。
+
+#### 21.4.8 成本统计落盘
+
+`grep -rln "tiktoken\|cache_control\|prompt_cache\|token_budget\|context_budget\|cost"` 在 `crates/` 命中若干文件,但**没有专门的 cost-tracking 模块** —— `TokenUsage { prompt, completion, cached }` 通过 `StreamEvent::Usage` 流式回传到 kernel,kernel 累加到 session meta,显示在 TUI 状态栏(cost 不持久化到 SQLite,只在内存 + transcript)。
+
+#### 21.4.9 对 laew 的借鉴
+
+| 级别 | 借鉴项 | 实现要点 |
+| --- | --- | --- |
+| **P0** | 实现 `TokenUsage { prompt, completion, cached }` 协议适配 | 当前 laew `AgentError` 不含 usage;**用户不知道哪轮花了多少 token** |
+| **P0** | Auto compaction 阈值 0.78(防模型「开新对话」) | 当前 laew 无 compaction;**128K 窗口跑满 ~80% 后模型就开始摆烂** |
+| **P0** | Overflow 三级阶梯(aggressive stub → hard truncate → drain+summary) | 当前 laew 无 overflow retry loop;provider reject 后**直接断流** |
+| **P0** | `TRUNCATE_MARKER` 幂等 sentinel | 二次 overflow 不会重复 truncate |
+| **P1** | byte-stable prefix 设计(让上游自动 cache) | laew 当前在 `llm/openai.rs` / `llm/anthropic.rs` 序列化时**顺序可能不稳定**(map / HashMap iteration);**改用 BTreeMap / Vec 强序** |
+| **P1** | empty-response retry budget + ctx overflow 提示 | 当前 laew 空响应直接 retry 到上限,**无 0.9×window 阈值截断** |
+| **P1** | SUMMARY_TOOL_OUTPUT_MAX_CHARS=2000 + TAIL=500 | 当前 laew tool result 直接放 context,**长 read 输出能撑爆 window** |
+| **P2** | TUI 状态栏实时显示 prompt/cached/completion 三元组 | 当前 laew 无 usage 展示;**用户对成本零感知** |
+| **P2** | cost 落盘到 SQLite `agent_memory` 表 | 当前 laew 无 token/cost 持久化;**回看 session 不知道花多少钱** |
+
+### 21.5 综合:四维度交叉点
+
+四个维度并非独立,在 atomcode 中有交叉:
+
+1. **edit ↔ bash ↔ compaction**:`search_replace` 用 `spawn_blocking` 隔离 IO,`parallel_edit_files` 用 build probe(`cargo check`)验证结果,build probe 又走 `bash` 路径触发 destructive_command 检查和进程组 reap。**Editor 出错 → 触发 build probe → bash 路径被杀** —— 三个维度在同一 tool call 链上协作。
+
+2. **grep ↔ LSP ↔ codeintel**:`grep` 是「找匹配」(基于 regex/字符串),`lsp` 是「找语义」(基于 AST/类型),`codeintel::index` 是「找符号定义」(基于 tree-sitter)。三者 fallback 链:**grep 找不到 → lsp unavailable → read_symbol/find_references**。L1 ToolContext 不强制某层存在,模型可以自主选择。
+
+3. **bash detach ↔ cancel ↔ overflow**:`kill_tree()` 在 cancel / timeout / drop 时调用,detach_child_from_controlling_tty 是 pre_exec 一次性 hook;overflow 时 bash 拒绝 → 触发 OverflowCompaction → drain → 重新构造新请求 → 重新 spawn bash。这条链路上每一步都可能 detach 一个进程组,必须配套 reap 整组,否则孤儿进程占满 CPU。
+
+4. **cache ↔ compaction ↔ tools**:`OverflowCompaction` tier 0 aggressive stub 会破坏 cache prefix(改 tool result 文本),所以**优先走 tier 1 truncate(只改极大消息)+ tier 2 drain(整段重写 summary)**。注释明示「Below 0.78 utilization, Auto only folds old tool results — cheap AND **prompt-cache-preserving**」。
+
+### 21.6 关键文件路径汇总(本轮)
+
+| 维度 | 文件 | 行数 | 关键锚点 |
+| --- | --- | --- | --- |
+| edit | `crates/atomcode-capabilities/src/tools/edit.rs` | 1375 | 路径锁 :21-36,4 级匹配 :138-240,write_encoded_if_unchanged :306-326,compact_diff :374-399 |
+| edit | `crates/atomcode-capabilities/src/tools/write.rs` | 177 | UTF-8 always + 行数 diff :85-107 |
+| edit | `crates/atomcode-capabilities/src/tools/search_replace.rs` | 490 | spawn_blocking :109,WalkBuilder :166,per-file EOL :218-225 |
+| edit | `crates/atomcode-capabilities/src/tools/parallel_edit.rs` | 633 | 子 Agent fan-out :200-243,build probe :320-407 |
+| grep | `crates/atomcode-capabilities/src/tools/grep.rs` | 521 | smart-case + escape 回退 :102-114,Searcher streaming :171-209,Sink 早停 :239-244 |
+| glob | `crates/atomcode-capabilities/src/tools/glob.rs` | 361 | MAX_RESULTS=100,绝对路径 split :156 |
+| lsp | `crates/atomcode-capabilities/src/codeintel/lsp_tool.rs` | 460 | MAX_LOCATIONS/HOVER/DOCUMENT :15-17 |
+| lsp | `crates/atomcode-capabilities/src/codeintel/lsp/client.rs` | 1170 | JSON-RPC stdio 解析 |
+| bash | `crates/atomcode-capabilities/src/tools/bash.rs` | 4303 | 非交互 env :52-67,setsid :84-106,kill_tree :287-304,危险分类器 :1653-2163,tree-sitter :2179-2250 |
+| bash | `crates/atomcode-capabilities/src/tools/bash_workspace_gate.rs` | (小) | scan_redirect_writes(critical file 检测) |
+| provider | `crates/atomcode-capabilities/src/provider/anthropic.rs` | 2024 | cache 读取 :760-826,usage :820-826 |
+| provider | `crates/atomcode-capabilities/src/provider/openai_compat.rs` | 4093 | map_usage 多家归一 :1638-1657,effective_input_limit :469,empty-response retry budget :430-453 |
+| compaction | `crates/atomcode-capabilities/src/compaction.rs` | (大) | MIN_COLLAPSE_SIZE :36,AGGRESSIVE_STUB_MIN :115,AUTO_DRAIN_UTILIZATION=0.78 :134,RECENT_KEEP_FRACTION=0.25 :143,SUMMARY_TIMEOUT=180s :178,SUMMARY_TOOL_OUTPUT_MAX_CHARS=2000 :469 |
+
+### 21.7 本轮不重复声明
+
+本文档**不重复**前 20 章已覆盖内容:
+- 第 1 章项目元信息、第 2 章分层、第 3 章 kernel 循环、第 4 章协议适配(本轮仅在 21.4 补充 cache 读取细节,不重复 wire 转换)
+- 第 5 章工具系统(Trait + 注册 + 中间件)、第 6 章 Hook 系统、第 7 章 MCP 7 子模块、第 8 章 Skill 系统
+- 第 9 章 CodeIntel 七件套(本轮 21.2 仅补充 grep/glob/lsp_tool 实现细节,不重复 graph/symbols/index 主体)
+- 第 10-18 章 session/subagent/daemon/coding/tui/auth/config/webui/evals + 借鉴 + 速查
+- 第 19 章 claudecode 40+ Tool 系统统一抽象(本轮仅在 21.1.1 列出工具矩阵,不复述 v1→v2 演进)
+- 第 20 章协议 wire/流式/错误重试(本轮 21.4 仅补充 cache 度量读取,不复述 SSE decoder / retryable 分类)
+
+**本轮新增**:
+- ① **edit_file 的 4 级匹配 ladder**(literal → EOL-coerced → fuzzy → whitespace-insensitive → block-anchor),每级独立 guards
+- ② **edit_file 的路径级 Mutex + byte-level CAS**(process-local compare-and-write,孤儿锁 Weak 回收)
+- ③ **GBK/GB18030 编码识别与原编码回写**(`encoding::decode_for_edit` / `write_encoded`)
+- ④ **failure hint**(closest line + line number + re-read instruction)而非「not found」
+- ⑤ **Myers diff 200ms deadline**(`similar::TextDiff::configure().timeout(...)`)
+- ⑥ **`spawn_blocking` 隔离 search_replace** 的 IO,防 async worker 卡死
+- ⑦ **parallel_edit_files 子 Agent fork** + `ctx.cancel.child_token()` 级联 + post-merge build probe(跨平台无 Unix pipe 依赖)
+- ⑧ **grep streaming + sink 早停 + 10 MiB per-line buffer cap**(防 minified bundle OOM)
+- ⑨ **grep invalid regex → escape 字面量回退**(二次 regex 编译尝试)
+- ⑩ **glob 绝对路径 + tilde split**(Windows root / `~/` / Unix root 三种情况)
+- ⑪ **lsp_tool 单一入口 + fallback 链**(unavailable → read_symbol/find_references/search)
+- ⑫ **bash `non_interactive_env_vars()`**(`TERM=dumb`/`PAGER=cat`/`GIT_PAGER=cat`/`GIT_TERMINAL_PROMPT=0`)
+- ⑬ **Windows PYTHONUTF8/IOENCODING 注入**(PEP 540,Windows GBK locale 修复)
+- ⑭ **setsid + TIOCNOTTY detach**(async-signal-safe pre_exec,防 git hooks 涂 TUI)
+- ⑮ **Windows Job Object KILL_ON_JOB_CLOSE + Unix killpg SIGKILL**(shell pgroup reap 整棵)
+- ⑯ **520 行 `check_destructive_command`**:wrapper 剥离 / subshell / eval / pipe-to-shell / `/dev/tcp` / socat / nc / python reverse shell / fork-bomb / mkfs / critical file overwrite / git worktree discard / PowerShell download-and-exec
+- ⑰ **tree-sitter bash parse + READ_ONLY_BASH_ALLOWLIST**(parallel_safe 判定)
+- ⑱ **askpass 注入**(`sudo -A` rewrite + `apply_askpass_env`,故意不 clobber `SSH_ASKPASS`/`SUDO_ASKPASS`/`EDITOR`)
+- ⑲ **byte-stable prefix 设计哲学**(atomcode **不**主动插 cache_control,只读度量;靠 prefix 不变让上游自动 cache)
+- ⑳ **TokenUsage 三元组** `{prompt, completion, cached}` 跨 4 家归一(Anthropic input+cache_read+cache_creation / DeepSeek prompt_cache_hit / GLM cached_tokens / OpenAI prompt_tokens_details.cached_tokens)
+- ㉑ **OverflowCompaction 三级阶梯**(tier 0 aggressive stub 160B / tier 1 truncate + TRUNCATE_MARKER 幂等 / tier 2 drain+summary + 25% recent_keep + 64 KiB hard cap + 180s timeout)
+- ㉒ **AUTO_DRAIN_UTILIZATION = 0.78 < 0.80**(防 GLM/DeepSeek 80% 时自己说「开新对话」)
+- ㉓ **SUMMARY_TOOL_OUTPUT_MAX_CHARS = 2000 + TAIL_CHARS = 500**(head/tail 保留)
+
+—— 调研者注:本文档为「第七轮深挖」,聚焦文件编辑、代码检索、命令执行、Token/Cache 四大生产级深度;不重复前 20 章已覆盖的 kernel 循环、协议适配 wire、CodeIntel 七件套主体、claudecode Tool 系统演进、协议 byte-stable + SSE decoder + 重试三层叠加等主题。

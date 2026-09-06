@@ -24,6 +24,9 @@
 13. [配置与多环境](#13-配置与多环境)
 14. [遥测与可观测性](#14-遥测与可观测性)
 15. [对 laew 的借鉴(P0/P1/P2 路线图)](#15-对-laew-的借鉴p0p1p2-路线图)
+16. [第五轮深挖补充(2026-09-06)](#16-第五轮深挖补充2026-09-06)
+17. [第六轮深挖 — Gateway/Harness/Adapter 三层契约 + 162 Extensions 分类全景 + 双向 MCP + Lane 调度器 + Workshop 自演化(2026-09-06)](#17-第六轮深挖--gatewayharnessadapter-三层契约--162-extensions-分类全景--双向-mcp--lane-调度器--workshop-自演化2026-09-06)
+18. [第七轮深挖 — Git 与版本控制集成 + 多模态与文件处理 + Web 检索与网络访问 + Prompt Caching 与成本预算](#18-第七轮深挖--git-与版本控制集成--多模态与文件处理--web-检索与网络访问--prompt-caching-与成本预算)
 
 ---
 
@@ -2372,3 +2375,2217 @@ sequenceDiagram
 ---
 
 > **本轮分析基于对 `/usr/local/LsmGitOpenSource/openclaw/` 当前 head(2026.8.1 版本, ~201 万行 TS)的真实源码 + 文档阅读**。所有结论均落到具体文件路径、行号、函数签名、manifest 字段、关键代码片段。所有 manifest 引用为 verbatim copy。所有 manifest 中的 JSON 字段名保留原始 camelCase / snake_case。
+
+---
+
+## 18. 第七轮深挖 — Git 与版本控制集成 + 多模态与文件处理 + Web 检索与网络访问 + Prompt Caching 与成本预算(2026-09-06)
+
+> 调研日期:2026-09-06 · 对象:`/usr/local/LsmGitOpenSource/openclaw`(version `2026.8.1`,`package.json:2`)
+> 本章全部结论来自真实源码(文件路径 + 行号 + 代码片段),与前 17 章、第 16/17 章(第五/第六轮)无重叠:
+> 前六轮覆盖 Gateway/Harness/Adapter 三层、162 extensions 分类、双向 MCP、Lane/placement、Workshop 自演化、
+> 记忆 dreaming、tool-call-repair 等;**Git 集成、多模态文件链路、Web 检索、Prompt Caching/成本预算四个维度在本知识库中首次出现**。
+
+### 18.0 本章覆盖文件索引(45 文件,~12k 行)
+
+| 模块 | 关键文件 | 行数 |
+|------|---------|------|
+| **Git 集成** | `src/infra/git-exec.ts` / `src/snapshot/git-backup.ts` / `src/snapshot/git-backup-codec.ts` / `src/snapshot/manifest.ts` / `src/snapshot/local-repository.ts` | 526 / 675 / 306 / 1610 |
+| **多模态** | `src/media/media-facts.ts` / `src/media/store.ts` / `src/media/local-media-access.ts` / `src/media/prompt-image-order.ts` / `src/media/sniff-mime-from-base64.ts` / `src/media/file-context.ts` / `src/media/audio.ts` / `src/media/pdf-extract.ts` / `src/media/anthropic-inline-images.ts` | ~3,400 |
+| **Web 检索** | `src/agents/tools/web-search-provider-common.ts` / `src/agents/tools/web-search-provider-config.ts` / `src/agents/tools/web-search-provider-credentials.ts` / `src/agents/tools/web-shared.ts` / `src/agents/tools/web-fetch-utils.ts` / `src/agents/tools/web-guarded-fetch.ts` / `src/infra/net/ssrf.ts` / `src/infra/net/fetch-guard.ts` / `src/link-understanding/runner.ts` / `extensions/brave/src/brave-web-search-provider.ts` / `extensions/exa/...` / `extensions/tavily/...` / `extensions/firecrawl/...` | ~5,600 |
+| **Prompt Caching** | `packages/llm-core/src/types.ts` / `packages/ai/src/transports/anthropic-payload-policy.ts` / `packages/ai/src/utils/system-prompt-cache-boundary.ts` / `packages/ai/src/providers/anthropic.ts` / `packages/ai/src/providers/openai-completions.ts` / `packages/ai/src/providers/openai-responses.ts` | ~3,200 |
+| **成本预算** | `src/infra/provider-usage.types.ts` / `src/infra/provider-usage.fetch.claude.ts` / `src/infra/provider-usage.fetch.codex.ts` / `extensions/clawrouter/usage.ts` / `extensions/clawrouter/index.ts` / `extensions/tokenjuice/index.ts` | ~2,800 |
+
+### 18.0.1 与前六轮的边界
+
+| 维度 | 前六轮覆盖(章节号) | 本轮增量 |
+|------|------------------|---------|
+| Git 集成 | **零**(只在 `git-backup.test.ts` 测试文件出现) | 完整的 `git-exec` → `git-backup` → `git-backup-codec` 链路 + manifest SHA-256 校验 |
+| 多模态 | 第 3 章提到 image extensions;第 8 章 Workshop 用 image 生成 | 完整的 `media-facts` → `store` → `local-media-access` → `file-context` → `anthropic-inline-images` 链路 + base64 sniff + 64MB 上限 |
+| Web 检索 | 第 3 章列 8 个 web extension 名称;第 4 章列工具契约 | 完整的 SSRF 守卫 → `web-shared` 缓存 → `web-search-provider-common` 16 工具 + Brave/Exa/Tavily 实现 + `link-understanding` 自动 URL 处理 |
+| Prompt Caching | **零** | `cache_control` 三档 ephemeral/5m/1h + 4 个断点上限 + `OPENCLAW_CACHE_BOUNDARY` 魔法标记 + Anthropic/OpenAI 双协议投影 |
+| 成本预算 | 第 3 章 tokenjuice 一行简介 | `ProviderUsageSnapshot` 完整契约 + 6 provider 实现 + ClawRouter managed budget + 5h/7d 窗口 |
+
+---
+
+## 18.1 Git 与版本控制集成
+
+### 18.1.1 Git 命令执行底层:`src/infra/git-exec.ts`(81 行)
+
+openclaw 把 Git 视作外部命令而非进程内 API,所有调用走 `runCommandWithTimeout("git", -C, cwd, ...args)`,默认 120 秒超时(`GIT_TIMEOUT_MS = 120_000`):
+
+```ts
+// src/infra/git-exec.ts:5-25
+export const GIT_TIMEOUT_MS = 120_000;
+
+export async function executeGitCommand(
+  cwd: string,
+  args: string[],
+  options: {
+    env?: NodeJS.ProcessEnv;
+    input?: string | Uint8Array;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<SpawnResult & { timeoutMs: number }> {
+  const timeoutMs = options.timeoutMs ?? GIT_TIMEOUT_MS;
+  const result = await runCommandWithTimeout(["git", "-C", cwd, ...args], {
+    timeoutMs,
+    env: options.env,
+    input: options.input,
+    signal: options.signal,
+  });
+  return { ...result, timeoutMs };
+}
+```
+
+三档命令构造器(`src/infra/git-exec.ts:41-80`):
+- `requireGitCommand` — 返回 trim 后的 stdout 字符串,失败抛 `createGitCommandError`;超时信息追加 "Check repository access and disk space."(`git-exec.ts:36`)
+- `requireGitCommandRaw` — 返回未 trim 的 stdout
+- `requireGitCommandBuffer` — 走 `runCommandBuffered`(全量装载到内存),支持 `maxOutputBytes`,用于 64MB 表 dump 等大输出
+
+### 18.1.2 Git 备份:6 阶段流水线
+
+`src/snapshot/git-backup.ts:266-382` 的 `createGitBackup` 实现了 SQLite 状态 → Git 备份仓库的完整流程:
+
+| 阶段 | 行号 | 说明 |
+|------|------|------|
+| 1. 初始化仓库 | `git-backup.ts:153-159` | `git init` / `rev-parse --show-toplevel`,**强校验**顶层路径 = repo 路径 |
+| 2. 远程绑定 | `git-backup.ts:160-175` | 已有 origin 校验一致性;否则 `git remote add origin` |
+| 3. 临时 staging | `git-backup.ts:282-283` | `fs.mkdtemp(path.join(os.tmpdir(), "openclaw-git-backup-"))`,chmod 0700 |
+| 4. 拷贝数据库 | `git-backup.ts:286-303` | 调 `createOpenClawSnapshotCopy` 写 staged SQLite,然后 dump 为 manifest+tables |
+| 5. 提交 | `git-backup.ts:244-263` | 自动注入 `user.name=OpenClaw` / `user.email=backup@openclaw.local` |
+| 6. 推送 | `git-backup.ts:351-373` | `rev-list --invert-grep --grep=^openclaw backup --count` 校验纯备份 history 才 push |
+
+```ts
+// src/snapshot/git-backup.ts:244-263 commitGitBackup
+async function commitGitBackup(params: {
+  repositoryPath: string;
+  message: string;
+  scopes: string[];
+  env?: NodeJS.ProcessEnv;
+}): Promise<string> {
+  const email = await runGit(params.repositoryPath, ["config", "--get", "user.email"], {
+    env: params.env,
+  });
+  const identityArgs =
+    email.code === 0 && email.stdout.trim()
+      ? []
+      : ["-c", "user.name=OpenClaw", "-c", "user.email=backup@openclaw.local"];
+  await requireGit(
+    params.repositoryPath,
+    [...identityArgs, "commit", "-m", params.message, "--", ...params.scopes],
+    { env: params.env },
+  );
+  return await requireGit(params.repositoryPath, ["rev-parse", "HEAD"], { env: params.env });
+}
+```
+
+**关键设计**:
+- `--invert-grep` 守卫防止非备份 commit 污染 remote history(`git-backup.ts:357-358`)
+- 自动注入 backup 身份,避免依赖用户全局 git config
+- Path-scope `add -A -- global agents` 限定跟踪范围,符合 OpenClaw stateDir 是 SQLite 仓的事实
+
+### 18.1.3 备份 manifest SHA-256 校验:`src/snapshot/manifest.ts:166-210`
+
+`parseSnapshotManifest` 用 `requireExactKeys` **白名单字段 + 严格 schemaVersion=1 校验**:
+
+```ts
+// src/snapshot/manifest.ts:166-210
+function parseSnapshotManifest(
+  value: unknown,
+  manifestPath: string,
+  expectedSnapshotId: string,
+): SnapshotManifest {
+  const record = requireRecord(value, "manifest", manifestPath);
+  requireExactKeys(record, ["schemaVersion", "snapshotId", "createdAt", "database", "artifact"]);
+  if (record.schemaVersion !== 1) {
+    throw new Error(
+      `Unsupported snapshot manifest schemaVersion ${String(record.schemaVersion)}: ${manifestPath}`,
+    );
+  }
+  // ...
+  if (typeof artifactRecord.sha256 !== "string" || !SHA256_PATTERN.test(artifactRecord.sha256)) {
+    throw new Error(`Snapshot manifest artifact.sha256 is invalid: ${manifestPath}`);
+  }
+  if (!Number.isSafeInteger(artifactRecord.sizeBytes) || Number(artifactRecord.sizeBytes) <= 0) {
+    throw new Error(`Snapshot manifest artifact.sizeBytes is invalid: ${manifestPath}`);
+  }
+  // ...
+}
+```
+
+**SHA-256 模式** `^[a-f0-9]{64}$`(`manifest.ts:20`),64 字节固定长度,白名单字符,直接防注入。
+
+`requireExactKeys` 用 `toSorted()` 比较,**多余字段直接拒绝**(`manifest.ts:251-258`):
+
+```ts
+function requireExactKeys(record: Record<string, unknown>, expectedKeys: readonly string[]): void {
+  const actual = Object.keys(record).toSorted();
+  const expected = [...expectedKeys].toSorted();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw new Error(
+      `Snapshot manifest fields must be exactly ${expectedKeys.join(", ")}; got ${actual.join(", ")}`,
+    );
+  }
+}
+```
+
+时间戳要求 canonical ISO 8601(往返验证 `parsed.toISOString() !== value` 则拒绝)— 防止序列化漂移破坏缓存键。
+
+### 18.1.4 拷贝过程 mutation fingerprint 校验
+
+`src/snapshot/manifest.ts:84-130` 的 `hashFileHandle` 在拷贝过程中持续校验:
+
+```ts
+// src/snapshot/manifest.ts:84-119
+async function hashFileHandle(
+  source: OpenFileHandle,
+  target?: OpenFileHandle,
+): Promise<Omit<SnapshotArtifactDigest, "stat">> {
+  const initialStat = await source.stat({ bigint: true });
+  let sizeBytes = 0;
+  if (target) {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    while (true) {
+      const { bytesRead } = await source.read(buffer, 0, buffer.length, sizeBytes);
+      if (bytesRead === 0) break;
+      // ... write
+      sizeBytes += bytesRead;
+    }
+  }
+  const hashed = await sha256File(target ?? source);
+  const finalStat = await source.stat({ bigint: true });
+  if (!sameMutationFingerprint(initialStat, finalStat) || (target && sizeBytes !== hashed.bytes)) {
+    throw new Error("Snapshot artifact changed while being read.");
+  }
+  return { sha256: hashed.digest, sizeBytes: hashed.bytes };
+}
+```
+
+`sameMutationFingerprint` 同时比对 **6 个 stat 字段**(birthtimeNs / ctimeNs / dev / ino / mtimeNs / size)— 杜绝 TOCTOU 攻击和并发写入。
+
+### 18.1.5 隐私补救建议
+
+`src/snapshot/git-backup.ts:99-111` 在 `init` 失败时根据平台生成 fix 建议:
+
+```ts
+function gitBackupRepositoryPrivacyRemediation(repositoryPath: string, cause: unknown): string {
+  if (process.platform === "win32") {
+    const detail =
+      cause instanceof Error && cause.message
+        ? ` ${sanitizeGitBackupDiagnostic(cause.message)}`
+        : "";
+    return (
+      `${detail} Remove non-user ACL grants from ${repositoryPath} or choose a private local directory. ` +
+      "Do not use a shared or synced folder for SQLite backups."
+    );
+  }
+  return `Fix its ownership and run chmod 700 ${repositoryPath}.`;
+}
+```
+
+**平台分支**:Windows 提示移除非用户 ACL,POSIX 提示 `chmod 700`。同时校验 backup 仓库不能与 stateDir 互嵌(`git-backup.ts:137-144`)。
+
+### 18.1.6 凭据脱敏
+
+`git-backup.ts:44-49` 的 `redactGitBackupText` 用 `redactSensitiveUrlLikeString`(来自 `@openclaw/net-policy/redact-sensitive-url`)对所有 stderr/stdout 行脱敏,避免把含 token 的 git error 写进日志。
+
+`GIT_BACKUP_DIAGNOSTIC_MAX_LENGTH = 500`(`git-backup.ts:31`)防止诊断文本爆栈。
+
+### 18.1.7 备份日志展示
+
+`src/snapshot/git-backup.ts:488-526` 的 `readGitBackupLog` 用 `git log --pretty=format:%H%x09%cI%x09%s` 输出 `<commit>\t<date>\t<message>`,头指针先 `symbolic-ref --quiet` + `show-ref --verify` 二级校验,空 head ref 返回空数组(优雅降级)。
+
+---
+
+## 18.2 多模态与文件处理
+
+### 18.2.1 MediaFact 统一抽象:`src/media/media-facts.ts`(长 200+)
+
+```ts
+// src/media/media-facts.ts:17-36
+export type MediaFact = {
+  path?: string;
+  url?: string;
+  contentType?: string;
+  kind?: MediaKind;
+  fileName?: string;
+  sizeBytes?: number;
+  durationMs?: number;
+  width?: number;
+  height?: number;
+  transcribed?: boolean;
+  messageId?: string;
+  workspaceDir?: string;
+  /** Internal proof that this exact fact was covered by a legacy staged projection. */
+  staged?: boolean;
+  // Declared field, not a symbol: suppression must survive every fact copy or
+  // reprojection boundary; described images otherwise rehydrate or count failed.
+  // Structured persistence may retain it; legacy Media* projections never emit it.
+  hydrationSuppressed?: boolean;
+};
+```
+
+**关键设计点**:
+1. **位置即身份** — 数组 index 即对齐身份,显式声明于注释 "array position is its alignment identity"(`media-facts.ts:16`)
+2. **`hydrationSuppressed` 是字段而非 Symbol** — `media-facts.ts:31-35` 注释解释原因:压制信息必须**跨 fact 拷贝和 reprojection 边界存活**,Symbol 在结构化持久化路径下会丢失
+3. **`RUNTIME_PROMPT_MEDIA_FACTS = Symbol.for("openclaw.runtimePromptMediaFacts")`**(`media-facts.ts:42`)— 跨模块 Symbol 共享,用 `Object.defineProperty` 挂到 message 上,避免污染序列化/模型可见字节
+
+### 18.2.2 三层持久化键
+
+`media-facts.ts:97-107` 列出 **legacy persisted keys**(老格式直存于 message):
+
+```ts
+export const PERSISTED_LEGACY_MEDIA_KEYS = [
+  "MediaPath", "MediaPaths", "MediaUrl", "MediaUrls",
+  "MediaType", "MediaTypes", "MediaTranscribedIndexes",
+  "MediaStaged", "MediaWorkspaceDir",
+] as const;
+```
+
+`hasMeaningfulRetiredMediaCarrier`(`media-facts.ts:110-138`)用于兼容迁移:同时检查 `media[]` 数组 + 任一 legacy 字段,**任一非空就触发迁移**。
+
+### 18.2.3 media store 安全守护:`src/media/store.ts:29-119`
+
+```ts
+// src/media/store.ts:29-47
+const resolveMediaDir = () => path.join(resolveConfigDir(), "media");
+/** Default per-file media-store byte cap used by store and plugin SDK callers. */
+export const MEDIA_MAX_BYTES = 5 * 1024 * 1024;  // 5 MB
+export const PLAYBACK_TRANSCODE_SUBDIR = "playback-transcode";
+
+const MANAGED_OUTGOING_SUBDIR = "outgoing";
+const OUTBOUND_STAGING_SUBDIR = "outbound";
+// Match delivery-queue orphan grace: staged files get a full day to reach
+// every direct, streamed, fan-out, or queue-owned delivery path.
+const OUTBOUND_STAGING_TTL_MS = 24 * 60 * 60_000;  // 24h
+/** Fixed disk budget for cached playback renditions; oldest outputs are evicted first. */
+const PLAYBACK_TRANSCODE_MAX_CACHE_BYTES = 512 * 1024 * 1024;  // 512 MB
+/** Playback renditions outlive transient media but are still retired after one week. */
+const PLAYBACK_TRANSCODE_TTL_MS = 7 * 24 * 60 * 60 * 1000;  // 7d
+const MAX_BYTES = MEDIA_MAX_BYTES;
+const DEFAULT_TTL_MS = 2 * 60 * 1000;  // 2min
+```
+
+**5 个核心限制常量**:
+- `MEDIA_MAX_BYTES = 5MB` — 单文件硬上限
+- `OUTBOUND_STAGING_TTL_MS = 24h` — 与 delivery-queue orphan grace 对齐
+- `PLAYBACK_TRANSCODE_MAX_CACHE_BYTES = 512MB` — playback 转码缓存预算
+- `PLAYBACK_TRANSCODE_TTL_MS = 7d` — playback 存活
+- `DEFAULT_TTL_MS = 2min` — 通用 transient 媒体
+
+`resolveMediaSubdir`(`store.ts:72-92`)的子目录路径防御:检查 `\0`、绝对路径、`..` 段、空段,**全部拒绝**。
+
+### 18.2.4 路径沙箱:`src/media/local-media-access.ts`
+
+`resolveLocalMediaBoundary`(`local-media-access.ts:99+`)枚举的 `LocalMediaAccessErrorCode`(`local-media-access.ts:13-22`):
+
+| code | 触发场景 |
+|------|---------|
+| `path-not-allowed` | 路径不在 allowlist |
+| `invalid-root` | `path.parse(resolved).root` 是文件系统根,拒绝 |
+| `invalid-file-url` | file:// URL 解析失败 |
+| `network-path-not-allowed` | Windows 网络路径(`\\server\share`) |
+| `unsafe-bypass` | "any" 旁路绕过 |
+| `unsupported-media-type` | MIME 类型不在白名单 |
+| `not-found` | 路径不存在 |
+| `not-file` | 路径是目录或符号链接(后者通常再拒绝) |
+
+**Windows 路径**:`assertNoWindowsNetworkPath`(`local-media-access.ts:7`)显式拒绝 `\\` 起始的 UNC 路径,防止穿透到 SMB 服务器。
+
+**symlink 感知**:`resolveLocalMediaPathForContainment`(`local-media-access.ts:78-90`)用 `realpath()` 后比对,**再回退到 `dirname(realpath) + basename`** 处理 staged 文件(尚未存在的临时文件)。
+
+### 18.2.5 base64 MIME 嗅探:`src/media/sniff-mime-from-base64.ts`(29 行)
+
+```ts
+// src/media/sniff-mime-from-base64.ts:5-28
+const BASE64_SNIFF_PREFIX_CHARS = 256;
+
+export async function sniffMimeFromBase64(base64: string): Promise<string | undefined> {
+  const canonical = canonicalizeBase64(base64);
+  if (!canonical) return undefined;
+
+  const take = Math.min(BASE64_SNIFF_PREFIX_CHARS, canonical.length);
+  const sliceLength = take - (take % 4);
+  // Keep the existing minimum so short magic-byte prefixes are not treated as complete media.
+  if (sliceLength < 8) {
+    return undefined;
+  }
+
+  try {
+    const canonicalPrefix = canonical.slice(0, sliceLength);
+    const head = Buffer.from(canonicalPrefix, "base64");
+    return await detectMime({ buffer: head });
+  } catch {
+    return undefined;
+  }
+}
+```
+
+**关键 trick**:
+- 只取前缀 256 字符,避免解码整个 payload
+- `take - (take % 4)` 保证 base64 4 字符对齐,base64 解码器不会报错
+- 最小 8 字符下限 — 避免把太短的前缀误判为完整媒体
+- 嗅探失败不抛错,返回 `undefined`
+
+### 18.2.6 Anthropic 图片内联预算:`packages/ai/src/internal/anthropic-inline-images.ts`
+
+```ts
+// packages/ai/src/internal/anthropic-inline-images.ts:5-16
+const ANTHROPIC_IMAGE_MEDIA_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
+export type AnthropicImageMediaType = (typeof ANTHROPIC_IMAGE_MEDIA_TYPES)[number];
+const ANTHROPIC_IMAGE_MEDIA_TYPE_SET = new Set<string>(ANTHROPIC_IMAGE_MEDIA_TYPES);
+// Resource-safety ceiling above Anthropic's direct request envelope; route-specific
+// API limits remain provider policy rather than a shared payload-conversion rule.
+const ANTHROPIC_INLINE_IMAGES_DECODE_SAFETY_BYTES = 64 * 1024 * 1024;
+
+export type AnthropicInlineImageBudget = { totalBytes: number };
+
+export function createAnthropicInlineImageBudget(): AnthropicInlineImageBudget {
+  return { totalBytes: 0 };
+}
+```
+
+**白名单 4 种 MIME**:jpeg / png / gif / webp。`resolveAnthropicImageMediaType`(`anthropic-inline-images.ts:18-23`)在白名单外**抛错**(`Unsupported Anthropic image media type after normalization`)。
+**64MB 聚合硬上限**:`ANTHROPIC_INLINE_IMAGES_DECODE_SAFETY_BYTES`,超出抛错 `Anthropic inline images exceed the 64 MB aggregate decoded safety limit.`,由 `normalizeAnthropicInlineContent`(`anthropic-inline-images.ts:25-63`)**双重校验**输入和输出字节,杜绝 base64 撑爆。
+
+`createAnthropicInlineImageBudget()` 返回 `totalBytes: 0` 的空预算,调用方用 `estimateBase64DecodedBytes`(来自 `@openclaw/media-core/base64`)累加。
+
+### 18.2.7 文件内容注入与 XML 注入防护:`src/media/file-context.ts`
+
+```ts
+// src/media/file-context.ts:30-52
+export function renderFileContextBlock(params: {
+  filename?: string | null;
+  fallbackName?: string;
+  mimeType?: string | null;
+  content: string;
+  surroundContentWithNewlines?: boolean;
+}): string {
+  const fallbackName = normalizeOptionalString(params.fallbackName) ?? "attachment";
+  const safeName = sanitizeFileName(params.filename, fallbackName);
+  const safeContent = escapeFileBlockContent(params.content);
+  const mimeType = normalizeOptionalString(params.mimeType);
+  const attrs = [
+    `name="${xmlEscapeAttr(safeName)}"`,
+    mimeType ? `mime="${xmlEscapeAttr(mimeType)}"` : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  if (params.surroundContentWithNewlines === false) {
+    return `<file ${attrs}>${safeContent}</file>`;
+  }
+  return `<file ${attrs}>\n${safeContent}\n</file>`;
+}
+```
+
+**注入防御三层**:
+1. `sanitizeFileName`(来自 `infra/fs-safe-advanced`)— 文件名白名单字符集
+2. `xmlEscapeAttr`(`file-context.ts:13-15`)— 5 个 XML 特殊字符转义
+3. `escapeFileBlockContent`(`file-context.ts:17-19`)— 转义 `</file>` 关闭标签和 `<file` 起始标签,**防止内容中嵌入 `</file>` 提前闭合注入**:
+   ```ts
+   function escapeFileBlockContent(value: string): string {
+     return value.replace(/<\s*\/\s*file\s*>/gi, "&lt;/file&gt;").replace(/<\s*file\b/gi, "&lt;file");
+   }
+   ```
+
+### 18.2.8 image-order 追踪:`src/media/prompt-image-order.ts`
+
+```ts
+// src/media/prompt-image-order.ts:2
+export type PromptImageOrderEntry = "inline" | "offloaded";
+```
+
+`hasPromptImageInput`(`src/media/prompt-image-input.ts:7-28`)聚合 3 个数据源(`images` / `imageOrder` / `media`)判断是否需要图片字节,以及 `userTurnTranscriptRecorder.message` 持久化布局,过滤 `hydrationSuppressed` 的事实。
+
+### 18.2.9 与 laew 对照:多模态差异
+
+| 维度 | openclaw | laew 现状 |
+|------|----------|----------|
+| 单文件大小上限 | 5MB 硬编码 | 无显式上限(全文件读入内存) |
+| 多模态持久化 | `MediaFact` + `__openclaw.media` 元数据字段 + legacy 9 keys 迁移 | 无(全在 SQLite 消息流) |
+| 内联图片聚合上限 | 64MB(Anthropic 特定) | N/A |
+| MIME 白名单 | 4 种(Anthropic)/探测自 magic bytes | 无 |
+| XML 注入防御 | `escapeFileBlockContent` + `xmlEscapeAttr` + `sanitizeUntrustedFileName` 三层 | 无(直接字符串拼接) |
+| 沙箱路径 | `LocalMediaAccessErrorCode` 7 种 + `realpath` symlink 感知 | 无(工作目录全开) |
+
+---
+
+## 18.3 Web 检索与网络访问
+
+### 18.3.1 SSRF 守卫核心:`src/infra/net/ssrf.ts`(330+ 行)
+
+```ts
+// src/infra/net/ssrf.ts:40-70
+export class SsrFBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SsrFBlockedError";
+  }
+}
+
+export type SsrFPolicy = {
+  allowPrivateNetwork?: boolean;
+  dangerouslyAllowPrivateNetwork?: boolean;
+  allowRfc2544BenchmarkRange?: boolean;
+  /**
+   * Exempt addresses in `fc00::/7` (IPv6 Unique Local Address block, RFC 4193)
+   * from the SSRF private-IP block. Companion to
+   * `allowRfc2544BenchmarkRange` for fake-ip proxy stacks (sing-box, Clash,
+   * Surge) that resolve foreign domains to ULA addresses alongside the IPv4
+   * 198.18.0.0/15 range. See #74351.
+   */
+  allowIpv6UniqueLocalRange?: boolean;
+  allowedHostnames?: string[];
+  /**
+   * Exact HTTP origins that may promote only the current request hostname into
+   * `allowedHostnames`. Evaluated per URL inside the redirect loop.
+   */
+  allowedOrigins?: string[];
+  hostnameAllowlist?: string[];
+  /** Deny exact hosts or wildcard subdomains; "*.example.com" excludes the apex. */
+  blockedHostnames?: string[];
+};
+```
+
+**`allowIpv6UniqueLocalRange`** 注释(`ssrf.ts:53-60`)专门解释 sing-box / Clash / Surge 的 fake-IP 模式 — 解析外部域名到 `fc00::/7` ULA 地址,需配合 `allowRfc2544BenchmarkRange` 一起开。
+
+**`normalizeSsrFPolicyForComparison`**(`ssrf.ts:76-99`)做**配置等价比较**:host/origin 全小写 + sorted,保证相同语义的 policy 比较相等(用于缓存命中)。
+
+### 18.3.2 三种 fetch 模式:`src/infra/net/fetch-guard.ts:59-65`
+
+```ts
+// src/infra/net/fetch-guard.ts:59-65
+export const GUARDED_FETCH_MODE = {
+  STRICT: "strict",
+  TRUSTED_ENV_PROXY: "trusted_env_proxy",
+  TRUSTED_EXPLICIT_PROXY: "trusted_explicit_proxy",
+} as const;
+
+export type GuardedFetchMode = (typeof GUARDED_FETCH_MODE)[keyof typeof GUARDED_FETCH_MODE];
+```
+
+| 模式 | 用途 | DNS 固定 | 代理 |
+|------|------|---------|------|
+| STRICT | 用户/agent 发起的 URL | 强制 | 不走 env proxy |
+| TRUSTED_ENV_PROXY | 受信 provider API(Anthropic/OpenAI) | 可关闭 | 走 HTTP_PROXY env |
+| TRUSTED_EXPLICIT_PROXY | 显式 proxy 配置 | 强制(仅 HTTPS) | 显式 proxy URL |
+
+`resolveGuardedFetchMode`(`fetch-guard.ts:173-183`)的默认策略:`STRICT` 为 user-influenced URL 的默认,legacy `proxy: "env"` 映射到 `TRUSTED_ENV_PROXY`。
+
+`OPENCLAW_DEBUG_PROXY_ENABLED`(`fetch-guard.ts:145`)是审计开关,完全小写严格匹配(`fetch-guard.ts:151-155`),防空白绕过:
+
+```ts
+function isTruthyEnvValue(value: string | undefined): boolean {
+  // This flag relaxes an outbound-network security boundary. Keep exact lowercase
+  // tokens so whitespace or case variation cannot accidentally widen access.
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+```
+
+### 18.3.3 重定向管理:`GuardedFetchRedirectError`
+
+```ts
+// src/infra/net/fetch-guard.ts:117-127
+export class GuardedFetchRedirectError extends Error {
+  readonly status: number;
+  readonly maxRedirects: number;
+
+  constructor(params: { status: number; maxRedirects: number }) {
+    super(`Too many redirects (limit: ${params.maxRedirects})`);
+    this.name = "GuardedFetchRedirectError";
+    this.status = params.status;
+  }
+}
+```
+
+**`DEFAULT_MAX_REDIRECTS = 3`**(`fetch-guard.ts:144`),循环 SSRF 攻击的最常见载体 — 每个 hop 都会重新跑 hostname policy 检查。
+
+`retainSafeHeadersForCrossOriginRedirect`(`fetch-guard.ts:19`)剥离跨域敏感头(Authorization / Cookie),`allowCrossOriginUnsafeRedirectReplay`(`fetch-guard.ts:84-86`)默认 false 防止 PUT with body 重放。
+
+### 18.3.4 web 工具共享缓存:`src/agents/tools/web-shared.ts`
+
+```ts
+// src/agents/tools/web-shared.ts:19-21
+export const DEFAULT_TIMEOUT_SECONDS = 30;
+export const DEFAULT_CACHE_TTL_MINUTES = 15;
+const DEFAULT_CACHE_MAX_ENTRIES = 100;
+```
+
+**缓存策略**:
+- 默认 TTL 15 分钟
+- LRU 上限 100 条目,`pruneMapToMaxSize` 强制(`web-shared.ts:78`)
+- `readCache` 支持**调用方单独缩短 TTL** 而不破坏其他调用方的缓存(`web-shared.ts:60-62`)
+
+```ts
+export function writeCache<T>(
+  cache: Map<string, CacheEntry<T>>,
+  key: string,
+  value: T,
+  ttlMs: number,
+) {
+  if (ttlMs <= 0) return;
+  const now = Date.now();
+  const expiresAt = resolveExpiresAtMsFromDurationMs(ttlMs, { nowMs: now });
+  if (expiresAt === undefined) return;
+  pruneMapToMaxSize(cache, DEFAULT_CACHE_MAX_ENTRIES - 1);
+  cache.set(key, { value, expiresAt, insertedAt: now });
+}
+```
+
+### 18.3.5 响应体字节保护:`src/agents/tools/web-shared.ts:200-320`
+
+`readResponseText`(`web-shared.ts:200-319`)**双层保护**:
+1. 有 `getReader` 的 stream — 增量读取 + `chunk = chunk.subarray(0, remaining)`(`web-shared.ts:233-243`),超长主动 `cancel()`(`web-shared.ts:273-277`)
+2. 没 stream 也没 `arrayBuffer` 的兜底 — 直接返回 `{text: "", truncated: true}`(`web-shared.ts:294-297`),**fail-closed**
+
+**charset 嗅探**(`web-shared.ts:133-170`)做 BOM 检测 + XML encoding 声明 + `<meta charset>` 扫描,latin1 解码避免 UTF-8 误码。
+
+### 18.3.6 web search provider 16 工具契约
+
+`src/plugin-sdk/provider-web-search.ts` 暴露所有公开助手,核心列表(`provider-web-search.ts:10-82`):
+
+| 导出 | 来源 | 用途 |
+|------|------|------|
+| `jsonResult` | `agents/tools/common.ts` | 工具结果 JSON 包装 |
+| `readNonNegativeIntegerParam` / `readPositiveIntegerParam` | 同上 | 整数参数校验 |
+| `buildSearchCacheKey` / `readCachedSearchPayload` / `writeCachedSearchPayload` / `resolveSearchCacheTtlMs` | `web-search-provider-common.ts` | 缓存四件套 |
+| `DEFAULT_SEARCH_COUNT = 5` / `MAX_SEARCH_COUNT = 10` | 同上 | 默认 5 结果,最大 10 |
+| `FRESHNESS_TO_RECENCY` / `normalizeFreshness` / `parseIsoDateRange` / `parseWebSearchTimeFilters` | 同上 | 时间过滤归一化 |
+| `withTrustedWebSearchEndpoint` / `withSelfHostedWebSearchEndpoint` / `withTrustedWebToolsJson` | `web-guarded-fetch.ts` | SSRF 守卫的 lazy import 入口 |
+| `resolveSearchCount` | `web-search-provider-common.ts:66-70` | clamp 到 [1, 10] |
+| `resolveSearchTimeoutSeconds` | 同上 | 默认 30s |
+| `resolveWebSearchProviderCredential` | `web-search-provider-credentials.ts` | 跨 scope 凭证解析 |
+| `resolveCitationRedirectUrl` | `web-search-citation-redirect.ts` | 引用链接重定向 |
+| `throwWebSearchApiError` | 同上 | API 错误抛出 |
+| `markdownToText` / `truncateWebFetchText` | `web-fetch-utils.ts` | HTML→Markdown→text |
+| `DEFAULT_CACHE_TTL_MINUTES = 15` / `DEFAULT_TIMEOUT_SECONDS = 30` | `web-shared.ts` | 缓存/超时默认值 |
+| `enablePluginInConfig` | `plugins/enable.ts` | plugin entry 注册 |
+
+### 18.3.7 provider 配置投影:`src/agents/tools/web-search-provider-config.ts`
+
+`mergeScopedSearchConfig`(`web-search-provider-config.ts:50-78`)是**provider-scoped 投影**的核心 — `Object.defineProperty` 把 provider 私有 config 挂为 **non-enumerable**:
+
+```ts
+export function mergeScopedSearchConfig(
+  searchConfig: Record<string, unknown> | undefined,
+  key: string,
+  pluginConfig: Record<string, unknown> | undefined,
+  options?: { mirrorApiKeyToTopLevel?: boolean },
+): Record<string, unknown> | undefined {
+  const next: Record<string, unknown> = { ...searchConfig };
+  delete next.apiKey;
+  if (isLegacyWebSearchProviderConfigKey(key)) {
+    delete next[key];
+  }
+  if (!pluginConfig) {
+    return Object.keys(next).length > 0 ? next : undefined;
+  }
+
+  // Provider-local projections are runtime-only and must never reserialize into tools.web.search.
+  Object.defineProperty(next, key, {
+    value: { ...pluginConfig },
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+
+  if (options?.mirrorApiKeyToTopLevel && pluginConfig.apiKey !== undefined) {
+    next.apiKey = pluginConfig.apiKey;
+  }
+
+  return next;
+}
+```
+
+注释直说:**"Provider-local projections are runtime-only and must never reserialize into tools.web.search"** — 防 plugin 私有 config 污染全局配置序列化。
+
+### 18.3.8 Brave Search 真实实现
+
+`extensions/brave/src/brave-web-search-provider.ts:72-94` 暴露工具 schema 与 executor:
+
+```ts
+const BraveSearchSchema = {
+  type: "object",
+  properties: {
+    query: { type: "string", description: "Search query string." },
+    count: {
+      type: "integer",
+      description: "Number of results to return (1-10).",
+      minimum: 1,
+      maximum: 10,
+    },
+    country: { type: "string", description: "2-letter country code for region-specific results (e.g., 'DE', 'US', 'ALL'). Default: 'US'." },
+    language: { type: "string", description: "ISO 639-1 language code for results (e.g., 'en', 'de', 'fr')." },
+    freshness: { type: "string", description: "Filter by time: 'day' (24h), 'week', 'month', or 'year'." },
+    date_after: { type: "string", description: "Only results published after this date (YYYY-MM-DD)." },
+    date_before: { type: "string", description: "Only results published before this date (YYYY-MM-DD)." },
+    search_lang: { type: "string", description: "Brave language code for search results (e.g., 'en', 'de', 'en-gb', 'zh-hans', 'zh-hant', 'pt-br')." },
+    ui_lang: { type: "string", description: "Locale code for UI elements in language-region format (e.g., 'en-US', 'de-DE', 'fr-FR', 'tr-TR'). Must include region subtag." },
+  },
+} satisfies Record<string, unknown>;
+
+function resolveBraveMode(searchConfig?: Record<string, unknown>): "web" | "llm-context" {
+  const brave = isRecord(searchConfig?.brave) ? searchConfig.brave : undefined;
+  return brave?.mode === "llm-context" ? "llm-context" : "web";
+}
+```
+
+`resolveBraveMode`(`brave-web-search-provider.ts:67-70`)双模式:标准 web 搜索 vs `llm-context`(返回预抽取的 page content chunks/tables/code blocks,专门为 LLM grounding 优化)。
+
+### 18.3.9 SSRF 守卫二次校验 Brave endpoint
+
+```ts
+// extensions/brave/src/brave-web-search-provider.runtime.ts:124-144
+async function braveEndpointTargetsPrivateNetwork(
+  url: URL,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (isBlockedHostnameOrIp(url.hostname)) {
+    return true;
+  }
+  try {
+    const pinned = await resolvePinnedHostnameWithPolicy(url.hostname, {
+      signal,
+      policy: {
+        allowPrivateNetwork: true,
+        allowRfc2544BenchmarkRange: true,
+      },
+    });
+    return pinned.addresses.every((address) => isPrivateIpAddress(address));
+  } catch {
+    signal?.throwIfAborted();
+    return false;
+  }
+}
+```
+
+即便 Brave 本身是可信 provider,**baseUrl 自定义时仍走 DNS pinning + IP 分类**,防止 operator 配置 `baseUrl` 指向内网。
+
+### 18.3.10 link-understanding 自动 URL 处理:`src/link-understanding/runner.ts`(150+ 行)
+
+```ts
+// src/link-understanding/runner.ts:77-105
+async function fetchLinkContent(params: {
+  timeoutMs: number;
+  url: string;
+  signal?: AbortSignal;
+}): Promise<{ content: string; finalUrl: string } | null> {
+  const { response, finalUrl, release } = await fetchWithSsrFGuard({
+    url: params.url,
+    timeoutMs: params.timeoutMs,
+    mode: GUARDED_FETCH_MODE.STRICT,
+    auditContext: "link-understanding",
+    signal: params.signal,
+    init: {
+      headers: {
+        Accept: "text/*,application/json,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "OpenClaw-LinkUnderstanding/1.0",
+      },
+    },
+  });
+  try {
+    if (!response.ok) {
+      void cancelUnreadResponseBody(response);
+      throw new Error(`Link fetch failed with HTTP ${response.status}`);
+    }
+    const buffer = await readResponseWithLimit(response, CLI_OUTPUT_MAX_BUFFER);
+    const content = new TextDecoder().decode(buffer).trim();
+    if (!content) return null;
+    return { content, finalUrl };
+  } finally {
+    await release();
+  }
+}
+```
+
+**关键点**:
+- `GUARDED_FETCH_MODE.STRICT` — 用户 URL 严格守卫
+- `auditContext: "link-understanding"` — 审计日志归类
+- `void cancelUnreadResponseBody(response)` — `void` 标注注释(`runner.ts:92`)说 "a debug-capture tee settles only after its sibling branch cancels" — fire-and-forget 但不丢错误
+
+### 18.3.11 curl/wget 模板解析:`runner.ts:107-150`
+
+```ts
+function isUrlFetcherCommand(command: string): boolean {
+  return commandName(command) === "curl" || commandName(command) === "wget";
+}
+
+async function runCliEntry(params: {...}): Promise<string | null> {
+  // ...
+  if (isUrlFetcherCommand(command) && args.some(isLinkUrlTemplate)) {
+    // curl/wget URL templates mark the entry as a fetcher; guarded fetch already supplied content.
+    return params.content;
+  }
+  // ...
+  if (shouldLogVerbose()) {
+    logVerbose(`Link understanding via CLI: ${argv.join(" ")}`);
+  }
+  const result = await runCommandWithTimeout(argv, {
+    timeoutMs,
+    input: params.content,
+    signal: params.signal,
+    killProcessTree: true,  // 整进程树取消
+    env: {/* 注入 env */},
+  });
+}
+```
+
+**核心 trick**:`isUrlFetcherCommand` 短路 — 如果用户配置 `curl {{LinkUrl}}` 做 fetcher,**直接复用 guarded fetch 已经取回的内容**,不再二次 HTTP 请求(避免 SSRF 绕过 + 重复网络)。
+
+`killProcessTree: true`(`runner.ts:149`)— 取消时杀进程树,防 child orphan。
+
+### 18.3.12 link URL 模板:`runner.ts:44-70`
+
+```ts
+function isLinkUrlTemplate(value: string): boolean {
+  return value.includes("LinkUrl") || value.includes("LinkFinalUrl");
+}
+
+function buildLinkCliArgs(params: {
+  args: string[];
+  ctx: MsgContext;
+  finalUrl: string;
+  url: string;
+}): string[] {
+  const templCtx = {
+    ...params.ctx,
+    LinkFinalUrl: params.finalUrl,
+    LinkUrl: params.url,
+  };
+  return params.args
+    .filter((arg) => !isLinkUrlTemplate(arg))  // 模板字段从 argv 移除
+    .map((arg) => applyTemplate(arg, templCtx));
+}
+```
+
+**LinkUrl / LinkFinalUrl 模板**:URL 在 `applyTemplate` 阶段替换,argv 中不出现 `{{LinkUrl}}` 字面量,防 shell 注入。
+
+### 18.3.13 其他 web search provider 一览
+
+| extension | 入口 | 模式 |
+|-----------|------|------|
+| **Brave** | `extensions/brave/src/brave-web-search-provider.ts` | web + llm-context 双模式 |
+| **Exa** | `extensions/exa/web-search-provider.ts` | neural search |
+| **Tavily** | `extensions/tavily/src/...` | RAG 优化 |
+| **Firecrawl** | `extensions/firecrawl/src/...` | web search + **web fetch** 双模式 |
+| **SearXNG** | `extensions/searxng/web-search-provider.ts` | self-hosted meta-search |
+| **DuckDuckGo** | `extensions/duckduckgo/web-search-provider.ts` | instant answer |
+| **Web Readability** | `extensions/web-readability/web-content-extractor.ts` | Mozilla Readability 提取 |
+
+`extensions/tavily/web-search-shared.ts` 与 Brave 共享 schema 共建器。`firecrawl/src/` 同时提供 `web-fetch-provider.ts`,这是**唯一一个同时支持 fetch+search 的 provider**。
+
+### 18.3.14 与 laew 对照:Web 检索差异
+
+| 维度 | openclaw | laew 现状 |
+|------|----------|----------|
+| SSRF 守卫 | `SsrFPolicy` 8 维字段 + 3 模式 + DNS pinning | 无 |
+| 重定向上限 | `DEFAULT_MAX_REDIRECTS = 3` | 无 |
+| 缓存 | `Map<string, CacheEntry<T>>` + 100 条 LRU + 15min TTL | 无 |
+| 响应体上限 | 双层(stream + arrayBuffer)+ fail-closed | Bash 工具全量返回 |
+| 域名 allowlist/blocklist | `allowedHostnames` + `blockedHostnames`(通配符) | 无 |
+| mode 切换 | STRICT / TRUSTED_ENV_PROXY / TRUSTED_EXPLICIT_PROXY | N/A |
+| 7 个 provider 即插即用 | Brave / Exa / Tavily / Firecrawl / SearXNG / DDG / Readability | 无 |
+
+---
+
+## 18.4 Prompt Caching 与成本/预算
+
+### 18.4.1 缓存能力契约:`packages/llm-core/src/types.ts:529-583`
+
+```ts
+// packages/llm-core/src/types.ts:529-583
+/** Cache control convention for prompt caching. "anthropic" applies Anthropic-style `cache_control` markers to the system prompt, last tool definition, and last user/assistant text content. */
+cacheControlFormat?: "anthropic";
+/** Whether to send known session-affinity headers (`session_id`, `x-client-request-id`, `x-session-affinity`) from `options.sessionId` when caching is enabled. Default: false. */
+sendSessionAffinityHeaders?: boolean;
+/** Whether the provider supports OpenAI-style `prompt_cache_key`. Default: false for third-party completions providers. */
+supportsPromptCacheKey?: boolean;
+/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
+supportsLongCacheRetention?: boolean;
+```
+
+**4 字段在 `OpenAICompletionsCompat`**:
+- `cacheControlFormat?: "anthropic"` — 协议形态选择
+- `sendSessionAffinityHeaders?: boolean` — session 亲和头
+- `supportsPromptCacheKey?: boolean` — OpenAI prompt_cache_key 支持
+- `supportsLongCacheRetention?: boolean` — 24h 长保留
+
+**4 字段在 `OpenAIResponsesCompat`**(`llm-core/src/types.ts:540-551`):
+- `supportsDeveloperRole` / `supportsTemperature` / `sendSessionIdHeader` / `supportsLongCacheRetention` / `supportsInstructions`
+
+**6 字段在 `AnthropicMessagesCompat`**(`llm-core/src/types.ts:554-583`):
+- `supportsEagerToolInputStreaming` / `supportsLongCacheRetention` / `sendSessionAffinityHeaders` / `supportsCacheControlOnTools` / `allowEmptySignature` ...
+
+### 18.4.2 Anthropic 4 断点上限:`packages/ai/src/transports/anthropic-payload-policy.ts:43`
+
+```ts
+// packages/ai/src/transports/anthropic-payload-policy.ts:43
+const ANTHROPIC_CACHE_CONTROL_LIMIT = 4;
+const ANTHROPIC_COMPACT_THRESHOLD_MIN = 50_000;
+```
+
+**ANTHROPIC_CACHE_CONTROL_LIMIT = 4** — Anthropic API 单请求 `cache_control` 标记**最多 4 个**。`applyAnthropicPayloadPolicyToParams`(`anthropic-payload-policy.ts:549-583`)用 `ANTHROPIC_CACHE_CONTROL_LIMIT - usedMarkers` 计算剩余配额给 messages:
+
+```ts
+const usedMarkers =
+  countAnthropicCacheControlMarkers(payloadObj.system) +
+  countAnthropicCacheControlMarkers(payloadObj.tools);
+applyAnthropicCacheControlToMessages(
+  payloadObj.messages,
+  policy.cacheControl,
+  ANTHROPIC_CACHE_CONTROL_LIMIT - usedMarkers,
+  cacheBreakpointOptOutMessageIndexes,
+);
+```
+
+**ANTHROPIC_COMPACT_THRESHOLD_MIN = 50_000** — 服务端 compaction 阈值下限(由 `resolveAnthropicCompactThreshold` 在 `anthropic-payload-policy.ts:61-73` 强制应用)。
+
+### 18.4.3 缓存保留 TTL 决策:`anthropic-payload-policy.ts:155-170`
+
+```ts
+function isLongTtlEligibleEndpoint(baseUrl: string | undefined): boolean {
+  if (typeof baseUrl !== "string") return false;
+  const hostname = resolveBaseUrlHostname(baseUrl);
+  if (!hostname) return false;
+  return (
+    hostname === "api.anthropic.com" ||
+    hostname === "aiplatform.googleapis.com" ||
+    hostname === "aiplatform.us.rep.googleapis.com" ||
+    hostname === "aiplatform.eu.rep.googleapis.com" ||
+    hostname.endsWith("-aiplatform.googleapis.com")
+  );
+}
+
+/** Resolve Anthropic cache-control marker retention for a request endpoint. */
+export function resolveAnthropicEphemeralCacheControl(
+  baseUrl: string | undefined,
+  cacheRetention: AnthropicPayloadPolicyInput["cacheRetention"],
+): AnthropicEphemeralCacheControl | undefined {
+  const retention = resolveCacheRetention(cacheRetention);
+  if (retention === "none") return undefined;
+  // Trust explicit long-retention opt-ins for Anthropic-compatible custom providers.
+  // Keep hostname gating for implicit/env-driven long retention so defaults stay conservative.
+  const ttl =
+    retention === "long" && (cacheRetention === "long" || isLongTtlEligibleEndpoint(baseUrl))
+      ? "1h"
+      : undefined;
+  return { type: "ephemeral", ...(ttl ? { ttl } : {}) };
+}
+```
+
+**5 个白名单主机**:Anthropic + Google Vertex 4 域名 + 通配 `*-aiplatform.googleapis.com`。**`1h` TTL 仅在显式 opt-in `cacheRetention: "long"` OR 命中白名单时启用**,防止隐式长缓存撑爆计费。
+
+### 18.4.4 系统提示词缓存边界魔法标记:`packages/ai/src/utils/system-prompt-cache-boundary.ts`
+
+```ts
+// packages/ai/src/utils/system-prompt-cache-boundary.ts:8
+export const SYSTEM_PROMPT_CACHE_BOUNDARY = "\n<!-- OPENCLAW_CACHE_BOUNDARY -->\n";
+```
+
+**核心 trick**:把系统提示词切成 **stable prefix(放 cache_control)** + **dynamic suffix(不放 cache_control)**。`stripSystemPromptCacheBoundary`(`boundary.ts:10-12`)出栈时移除标记。`splitSystemPromptCacheBoundary`(`boundary.ts:25-36`)二分切。
+
+`ensureSystemPromptCacheBoundary`(`boundary.ts:14-23`)注释:`#85203` 解释 hook systemPrompt 覆盖场景 — 没有边界标记时动态追加会污染 cached prefix。
+
+`prependSystemPromptAdditionAfterCacheBoundary`(`boundary.ts:38-66`)保证 **Hook 注入永远进 dynamic suffix**:
+
+```ts
+return `${split.stablePrefix}${SYSTEM_PROMPT_CACHE_BOUNDARY}${systemPromptAddition}\n\n${dynamicSuffix}`;
+```
+
+### 18.4.5 Anthropic 消息断点反向遍历:`anthropic-payload-policy.ts:236-330`
+
+```ts
+export function applyAnthropicCacheControlToMessages(
+  messages: unknown,
+  cacheControl: AnthropicEphemeralCacheControl,
+  markerLimit: number,
+  cacheBreakpointOptOutMessageIndexes: ReadonlySet<number>,
+): void {
+  if (!Array.isArray(messages) || messages.length === 0 || markerLimit <= 0) return;
+
+  let fallbackToolResult: Record<string, unknown> | undefined;
+
+  for (let i = messages.length - 1; i >= 0; i--) {  // 反向遍历!
+    const message = messages[i];
+    if (!message || typeof message !== "object") continue;
+    const record = message as Record<string, unknown>;
+    if (record.role !== "user" || cacheBreakpointOptOutMessageIndexes.has(i)) continue;
+    // ...
+  }
+}
+```
+
+**反向遍历算法**(`anthropic-payload-policy.ts:249-319`):
+1. 从最新 user message 向旧遍历
+2. 跳过 `cacheBreakpointOptOutMessageIndexes` 中的索引(由协议层显式 opt-out)
+3. 命中 string content / text block / image block → 挂 `cache_control`
+4. **`fallbackToolResult` 机制** — 之前轮的工具结果可被多个 user message 复用,在合适位置挂 fallback 标记,减少标记数
+
+**markerLimit 处理**(`anthropic-payload-policy.ts:262-264`):
+```ts
+if (fallbackToolResult && markerLimit === 1) {
+  fallbackToolResult.cache_control = cacheControl;
+  return;
+}
+```
+配额只剩 1 时,**优先复用之前的 tool_result 标记**,不消耗新配额。
+
+### 18.4.6 Anthropic 工具定义最后一项缓存:`anthropic.ts:1469-1482`
+
+```ts
+for (const [index, tool] of projection.tools.entries()) {
+  const convertedTool: Anthropic.Messages.Tool = {
+    name: tool.wireName,
+    description: tool.description,
+    input_schema: tool.inputSchema,
+  };
+  if (supportsEagerToolInputStreaming) {
+    convertedTool.eager_input_streaming = true;
+  }
+  if (cacheControl && index === projection.tools.length - 1) {
+    convertedTool.cache_control = cacheControl;  // 只挂最后一项
+  }
+  convertedTools.push(convertedTool);
+}
+```
+
+**工具定义缓存只挂最后一项** — Anthropic cache 必须连续 prefix,工具列表整体作为一个 prefix。
+
+### 18.4.7 OAuth 标记路径特殊处理:`anthropic.ts:1378-1395`
+
+```ts
+if (isOAuthTokenResult) {
+  blocks.push({
+    type: "text",
+    text: ANTHROPIC_CLAUDE_CODE_BILLING_SYSTEM_BLOCK,  // OAuth billing block
+  });
+  blocks.push({
+    type: "text",
+    text: "You are Claude Code, Anthropic's official CLI for Claude.",
+    ...(cacheControl ? { cache_control: cacheControl } : {}),
+  });
+}
+```
+
+OAuth token 第一个 block 路由 Claude 订阅计费(`anthropic.ts:1381` 注释),第二个挂缓存点。
+
+### 18.4.8 OpenAI 缓存断点:`openai-completions.ts:635-703`
+
+```ts
+// packages/ai/src/providers/openai-completions.ts:635
+lastTool.cache_control = cacheControl;
+```
+
+```ts
+// packages/ai/src/providers/openai-completions.ts:691-703
+const split = splitSystemPromptCacheBoundary(text);
+return [{ type: "text", text, cache_control: cacheControl }];  // 单 block 形式
+// ... 多 block 形式:
+{
+  type: "text",
+  text: split.stablePrefix,
+  cache_control: cacheControl,
+},
+```
+
+### 18.4.9 OpenAI `prompt_cache_key` 注入:`openai-completions-params.ts:326-334`
+
+```ts
+params.prompt_cache_key = promptCacheKey;
+// canonical prompt_cache_retention value alongside the cache key so
+params.prompt_cache_retention = "24h";
+```
+
+**`prompt_cache_retention: "24h"`** — OpenAI 24h 延长缓存,等价于 Anthropic `cache_control.ttl: "1h"`。
+
+### 18.4.10 OpenAI Responses 断点:`openai-responses-compaction-window.ts:48`
+
+```ts
+const breakpoint = value.prompt_cache_breakpoint;
+// { mode: "explicit" }
+```
+
+测试样例(`openai-responses-retained-compaction-replay.test.ts:171`):
+```ts
+{ type: "input_text", text: "saved", prompt_cache_breakpoint: { mode: "explicit" } }
+```
+
+### 18.4.11 成本/预算统一类型:`src/infra/provider-usage.types.ts`
+
+```ts
+// src/infra/provider-usage.types.ts:1-94
+/** One quota window reported by a provider usage endpoint. */
+export type UsageWindow = {
+  label: string;
+  usedPercent: number;
+  resetAt?: number;
+};
+
+/** Provider-reported monetary or credit facts. Units may be ISO currencies or provider credits. */
+export type ProviderUsageBilling =
+  | { type: "balance"; label?: string; amount: number; unit: string; }
+  | { type: "spend"; label?: string; amount: number; unit: string; period?: string; resetAt?: number; }
+  | { type: "budget"; label?: string; used: number; limit: number; unit: string; period?: string; resetAt?: number; };
+
+/** Provider-reported daily cost and token totals. Costs are actual provider billing, not estimates. */
+export type ProviderUsageCostDaily = {
+  date: string;
+  amount: number;
+  requests?: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
+export type ProviderUsageModelBreakdown = {
+  name: string;
+  requests?: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
+export type ProviderUsageCostBreakdown = {
+  name: string;
+  amount: number;
+};
+
+export type ProviderUsageCostHistory = {
+  unit: string;
+  periodDays: number;
+  scope?: string;
+  daily: ProviderUsageCostDaily[];
+  models: ProviderUsageModelBreakdown[];
+  categories: ProviderUsageCostBreakdown[];
+};
+
+export type ProviderUsageSnapshot = {
+  provider: UsageProviderId;
+  displayName: string;
+  windows: UsageWindow[];
+  billing?: ProviderUsageBilling[];
+  costHistory?: ProviderUsageCostHistory;
+  summary?: string;
+  plan?: string;
+  accountEmail?: string;
+  error?: string;
+};
+
+export type UsageSummary = {
+  updatedAt: number;
+  providers: ProviderUsageSnapshot[];
+  refreshing?: boolean;
+};
+```
+
+**关键设计**:
+- 注释明说 `Costs are actual provider billing, not estimates`(`types.ts:34`)— 不用 token 估算
+- **3 种 billing 类型**:balance(余额) / spend(实际花费) / budget(配额上限),支持 period + resetAt
+- **daily / models / categories 三维 cost history** — 按日、按模型、按类别(输入/缓存/输出)
+- **cacheReadTokens / cacheWriteTokens 单独追踪** — 用于计算缓存命中率与节省成本
+
+### 18.4.12 Claude usage 真实实现:`provider-usage.fetch.claude.ts`
+
+```ts
+// src/infra/provider-usage.fetch.claude.ts:204-290
+export async function fetchClaudeUsage(
+  token: string,
+  timeoutMs: number,
+  fetchFn: typeof fetch,
+): Promise<ProviderUsageSnapshot> {
+  const res = await fetchJson(
+    "https://api.anthropic.com/api/oauth/usage",
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "User-Agent": "openclaw",
+        Accept: "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20",  // OAuth usage beta
+      },
+    },
+    timeoutMs,
+    fetchFn,
+  );
+
+  if (!res.ok) {
+    // ...
+    // Claude Code CLI setup-token yields tokens that can be used for inference, but may not
+    // include user:profile scope required by the OAuth usage endpoint. When a claude.ai
+    // browser sessionKey is available, fall back to the web API.
+    if (res.status === 403 && message?.includes("scope requirement user:profile")) {
+      const sessionKey = resolveClaudeWebSessionKey();
+      if (sessionKey) {
+        const web = await fetchClaudeWebUsage(sessionKey, timeoutMs, fetchFn);
+        if (web) return web;
+      }
+    }
+    return buildUsageHttpErrorSnapshot({...});
+  }
+  // ...
+}
+```
+
+**OAuth usage endpoint** + **session key fallback 双路径**(`fetch.claude.ts:241-249`):
+- 主路径:Anthropic OAuth `/api/oauth/usage`,需 `oauth-2025-04-20` beta + `user:profile` scope
+- 失败回退:`claude.ai/api/organizations/{uuid}/usage`(从 cookie 拿 sessionKey)
+
+**5h / Week / Sonnet / Opus 4 窗口**(`fetch.claude.ts:65-86`):
+```ts
+const fiveHour = readClaudeWindow(data, "five_hour", "5h");
+const sevenDay = readClaudeWindow(data, "seven_day", "Week");
+const modelWindow =
+  readClaudeWindow(data, "seven_day_sonnet", "Sonnet") ??
+  readClaudeWindow(data, "seven_day_opus", "Opus");
+```
+
+`extra_usage` 货币按**分**单位返回(`fetch.claude.ts:275-276`),除以 100 转美元。
+
+### 18.4.13 ClawRouter managed budget:`extensions/clawrouter/usage.ts`
+
+```ts
+// extensions/clawrouter/usage.ts:15-22
+type ClawRouterBudget = {
+  configured?: unknown;
+  ledger?: unknown;
+  windowKey?: unknown;       // /YYYY-MM
+  limitMicros?: unknown;     // 1 USD = 1,000,000 micros
+  spentMicros?: unknown;
+  remainingMicros?: unknown;
+};
+
+// extensions/clawrouter/usage.ts:35-37
+function formatUsd(micros: number): string {
+  const dollars = micros / 1_000_000;
+  return dollars < 0.01 && dollars > 0 ? `$${dollars.toFixed(4)}` : `$${dollars.toFixed(2)}`;
+}
+```
+
+**微秒精度计费**(`micros / 1_000_000`):规避浮点漂移,等同于 Stripe 的 cents 设计。`windowKey` 解析月度重置时间(`usage.ts:44-57`):
+
+```ts
+function resolveMonthlyResetAt(windowKey: unknown): number | undefined {
+  if (typeof windowKey !== "string") return undefined;
+  const match = windowKey.match(/\/(\d{4})-(\d{2})$/u);
+  if (!match) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  return Number.isSafeInteger(year) && month >= 1 && month <= 12
+    ? Date.UTC(year, month, 1)
+    : undefined;
+}
+```
+
+**billing type 决策**(`usage.ts:142-157`):
+- `budget.configured === true` 且 `limit`/`spent` 存在 → `type: "budget"`(配额制)
+- 否则 `costMicros` 存在 → `type: "spend"`(按量)
+
+```ts
+const windows = [];
+if (budget?.configured === true && limitMicros !== undefined && spentMicros !== undefined) {
+  windows.push({
+    label: "Monthly budget",
+    usedPercent: limitMicros === 0 ? 100 : Math.min(100, (spentMicros / limitMicros) * 100),
+    resetAt,
+  });
+}
+```
+
+**0 limit 短路**(`usage.ts:139`):`limitMicros === 0` 直接 100%,防除零。
+
+### 18.4.14 ClawRouter 集成架构:`extensions/clawrouter/index.ts`
+
+```ts
+// extensions/clawrouter/index.ts:118-260
+export default defineSingleProviderPluginEntry({
+  id: PROVIDER_ID,
+  name: "ClawRouter",
+  description: "Managed multi-provider model routing and quotas",
+  // ...
+  resolveUsageAuth: async (ctx) => {
+    const apiKey = ctx.resolveApiKeyFromConfigAndStore({
+      envDirect: [ctx.env[ENV_VAR]],  // CLAWROUTER_API_KEY
+    });
+    return apiKey ? { token: apiKey } : null;
+  },
+  fetchUsageSnapshot: async (ctx) =>
+    await fetchClawRouterUsage({
+      token: ctx.token,
+      baseUrl: configuredBaseUrl(ctx.config),
+      timeoutMs: ctx.timeoutMs,
+    }),
+});
+```
+
+**双层 routing**:
+1. provider 路由(anthropic/openai/google/perplexity/deepseek 共 5 家族)
+2. **usage 路由**(独立 `/v1/usage` 端点 + 微秒精度 ledger)
+
+`dynamicModelScope`(`index.ts:72-79`)用 `agentDir + workspaceDir + baseUrl + authProfileId` 4 元组做 **scope 隔离**,同一 baseUrl 下不同 agent/workspace 看到不同 model 集合。
+
+### 18.4.15 Tokenjuice 工具结果压缩:`extensions/tokenjuice/index.ts`
+
+```ts
+// extensions/tokenjuice/index.ts:1-14
+export default definePluginEntry({
+  id: "tokenjuice",
+  name: "tokenjuice",
+  description: "Compacts exec and bash tool results with tokenjuice reducers.",
+  register(api) {
+    api.registerAgentToolResultMiddleware(createTokenjuiceAgentToolResultMiddleware(), {
+      runtimes: ["openclaw", "codex"],
+    });
+  },
+});
+```
+
+**`registerAgentToolResultMiddleware`** — hook 在 tool result 回填到 context 前压缩,**与 Anthropic cache 配合**:压缩节省的是 cache hit 时的 cache_read 成本(通常 90% 折扣)。
+
+### 18.4.16 缓存命中计费字段:cross-provider 提取
+
+`packages/ai/src/transports/openai-transport-shared.ts:209-220`:
+
+```ts
+rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? 0;
+```
+
+**3 个字段优先级回退**:`prompt_tokens_details.cached_tokens` → `prompt_cache_hit_tokens` → 0。openclaw 把它统一规范到 `cacheReadTokens`。
+
+### 18.4.17 与 laew 对照:Prompt Caching 与成本差异
+
+| 维度 | openclaw | laew 现状 |
+|------|----------|----------|
+| Anthropic cache_control | 4 断点上限 + 5m/1h 双 TTL + reverse-traverse 算法 + 反向 fallback tool_result 复用 | **零**(裸 API) |
+| 系统提示词缓存边界 | `OPENCLAW_CACHE_BOUNDARY` HTML 注释标记切分 | N/A |
+| Anthropic TTL 守门 | 5 白名单主机(显式 opt-in 才放宽到 1h) | N/A |
+| OAuth 系统块 | `ANTHROPIC_CLAUDE_CODE_BILLING_SYSTEM_BLOCK` 路由 Claude Code 订阅计费 | N/A(无 OAuth) |
+| OpenAI `prompt_cache_key` | session 维度键 + 24h retention | **零** |
+| OpenAI Responses `prompt_cache_breakpoint` | `{ mode: "explicit" }` | N/A |
+| 工具定义缓存 | 只挂最后一项(Anthropic 规则) | **零** |
+| micro-USD 计费 | ClawRouter `micros / 1_000_000` | N/A |
+| 6 provider usage 端点 | Claude/Codex/DeepSeek/Gemini/Minimax/Zai | **零**(无 cost dashboard) |
+| Managed budget | ClawRouter `limitMicros/spentMicros/windowKey` 三元组 | N/A |
+| 工具结果压缩 hook | tokenjuice `registerAgentToolResultMiddleware` | N/A |
+| cache hit 字段归一化 | `cacheReadTokens` / `cacheWriteTokens` 单独追踪 | **零** |
+
+---
+
+## 18.5 对 laew 的借鉴路线图(P0/P1/P2)
+
+### 18.5.1 Git 与版本控制集成
+
+| 优先级 | 项 | 设计来源 | 工作量估算 |
+|--------|---|---------|----------|
+| **P0** | SQLite 状态 Git 备份仓库 + `commitGitBackup` 自动注入 user.name/email | `src/snapshot/git-backup.ts:244-263` | 2-3 天 |
+| **P0** | 备份 manifest SHA-256 + schemaVersion + `requireExactKeys` 严格白名单校验 | `src/snapshot/manifest.ts:166-258` | 1-2 天 |
+| **P1** | 拷贝过程中 `sameMutationFingerprint` 6 stat 字段校验 | `src/snapshot/manifest.ts:121-130` | 1 天 |
+| **P1** | 平台分支隐私修复建议(Windows ACL vs POSIX chmod 700) | `src/snapshot/git-backup.ts:99-111` | 0.5 天 |
+| **P2** | `--invert-grep` 守卫防止非备份 commit 污染 remote history | `src/snapshot/git-backup.ts:357-358` | 0.5 天 |
+| **P2** | 凭据脱敏 `redactGitBackupText`(token 不进 log) | `src/snapshot/git-backup.ts:44-49` | 0.5 天 |
+
+### 18.5.2 多模态与文件处理
+
+| 优先级 | 项 | 设计来源 | 工作量估算 |
+|--------|---|---------|----------|
+| **P0** | `MEDIA_MAX_BYTES = 5MB` 硬上限 + Playback 缓存 512MB + 24h/7d 双 TTL | `src/media/store.ts:29-47` | 0.5 天 |
+| **P0** | base64 前 256 字符 + 4 对齐 MIME 嗅探 | `src/media/sniff-mime-from-base64.ts:8-28` | 0.5 天 |
+| **P0** | `renderFileContextBlock` XML 注入三层防御(`escapeFileBlockContent`) | `src/media/file-context.ts:17-52` | 1 天 |
+| **P1** | `LocalMediaAccessErrorCode` 7 种错误码 + `assertNoWindowsNetworkPath` 防 UNC 穿透 | `src/media/local-media-access.ts:13-22` | 1 天 |
+| **P1** | 4 种 MIME 白名单(jpeg/png/gif/webp) + 64MB 聚合上限 | `packages/ai/src/internal/anthropic-inline-images.ts:5-58` | 1 天 |
+| **P2** | `hydrationSuppressed` 字段(非 Symbol)跨持久化边界存活 | `src/media/media-facts.ts:31-35` | 0.5 天 |
+| **P2** | `OUTBOUND_STAGING_TTL_MS = 24h` 与 delivery queue orphan grace 对齐 | `src/media/store.ts:42` | 0.5 天 |
+
+### 18.5.3 Web 检索与网络访问
+
+| 优先级 | 项 | 设计来源 | 工作量估算 |
+|--------|---|---------|----------|
+| **P0** | SSRF `SsrFPolicy` 8 维字段 + 3 fetch 模式(STRICT / TRUSTED_ENV_PROXY / TRUSTED_EXPLICIT_PROXY) | `src/infra/net/ssrf.ts:49-70` + `src/infra/net/fetch-guard.ts:59-65` | 3-4 天 |
+| **P0** | DNS pinning + `resolvePinnedHostnameWithPolicy` 防止 DNS rebinding | `src/infra/net/ssrf.ts` + `extensions/brave/src/brave-web-search-provider.runtime.ts:124-144` | 2 天 |
+| **P0** | `DEFAULT_MAX_REDIRECTS = 3` + `GuardedFetchRedirectError` + `retainSafeHeadersForCrossOriginRedirect` | `src/infra/net/fetch-guard.ts:117-127, 144, 19` | 1 天 |
+| **P0** | 响应体字节保护双层(stream + arrayBuffer)+ fail-closed | `src/agents/tools/web-shared.ts:200-320` | 1 天 |
+| **P1** | `web-shared` 缓存(15min TTL + 100 条 LRU + 调用方可缩短 TTL) | `src/agents/tools/web-shared.ts:13-84` | 0.5 天 |
+| **P1** | 5 个白名单主机 / `OPENCLAW_DEBUG_PROXY_ENABLED` 严格匹配 | `src/infra/net/ssrf.ts:138-153` + `src/infra/net/fetch-guard.ts:151-155` | 0.5 天 |
+| **P1** | `allowIpv6UniqueLocalRange` 兼容 sing-box/Clash/Surge fake-IP | `src/infra/net/ssrf.ts:53-60` | 0.5 天 |
+| **P2** | curl/wget 模板短路(`isUrlFetcherCommand`)+ `killProcessTree: true` | `src/link-understanding/runner.ts:107-150` | 1 天 |
+| **P2** | 7 个 provider 即插即用扩展点(Brave/Exa/Tavily/Firecrawl/SearXNG/DDG/Readability) | `extensions/*/web-search-provider.ts` | 4-5 天 |
+
+### 18.5.4 Prompt Caching 与成本/预算
+
+| 优先级 | 项 | 设计来源 | 工作量估算 |
+|--------|---|---------|----------|
+| **P0** | Anthropic `cache_control` 4 断点上限 + 反向遍历 + `markerLimit` 守门 | `packages/ai/src/transports/anthropic-payload-policy.ts:43, 236-330, 549-583` | 2-3 天 |
+| **P0** | `OPENCLAW_CACHE_BOUNDARY` HTML 注释标记切分稳定 prefix + 动态 suffix | `packages/ai/src/utils/system-prompt-cache-boundary.ts:8-66` | 1-2 天 |
+| **P0** | 工具定义最后一项挂 `cache_control`(Anthropic 强制 prefix) | `packages/ai/src/providers/anthropic.ts:1469-1482` | 0.5 天 |
+| **P0** | 5 白名单主机长 TTL 守门(`cache_control.ttl: "1h"`) | `packages/ai/src/transports/anthropic-payload-policy.ts:138-170` | 0.5 天 |
+| **P1** | OpenAI `prompt_cache_key` 注入 + `prompt_cache_retention: "24h"` | `packages/ai/src/transports/openai-completions-params.ts:326-334` | 1 天 |
+| **P1** | micro-USD 计费精度(防浮点漂移) | `extensions/clawrouter/usage.ts:35-37` | 0.5 天 |
+| **P1** | `cacheReadTokens` / `cacheWriteTokens` 字段归一化 + 节省成本计算 | `src/infra/provider-usage.types.ts:34-44` | 1 天 |
+| **P1** | `ProviderUsageSnapshot` 6 字段契约(windows / billing / costHistory / plan / accountEmail / error) | `src/infra/provider-usage.types.ts:73-84` | 1 天 |
+| **P2** | `tokenjuice` 工具结果压缩 hook(与 cache 协同) | `extensions/tokenjuice/index.ts` | 1-2 天 |
+| **P2** | `windowKey` 月度 reset 时间解析(UTC 月边界) | `extensions/clawrouter/usage.ts:44-57` | 0.5 天 |
+| **P2** | `retainAuthorizationRedirectHostnameAllowlist` 跨域保留白名单 | `src/infra/net/fetch-guard.ts:95` | 0.5 天 |
+
+### 18.5.5 总览:借鉴优先级矩阵
+
+|  | Git | 多模态 | Web | Cache/成本 |
+|---|---|---|---|---|
+| **P0 必做** | SQLite Git 备份 + manifest SHA256 | 5MB 上限 + base64 sniff + XML 防御 | SSRF 3 模式 + DNS pin + redirect 3 | cache_control 4 断点 + 边界切分 + 工具最后项 |
+| **P1 应做** | 6 stat mutation 校验 + Windows ACL | 7 种错误码 + 64MB 聚合 | web-shared 缓存 + 长 TTL 守门 | OpenAI cache_key + micro-USD + snapshot 6 字段 |
+| **P2 远期** | invert-grep 守卫 + 凭据脱敏 | hydrationSuppressed 跨持久化 | curl/wget 短路 + 7 provider 接入 | tokenjuice 压缩 + windowKey |
+
+---
+
+## 18.6 共性模式与设计原则
+
+### 18.6.1 SSRF/网络安全三件套
+1. **DNS pinning** — 解决 DNS rebinding(toCTOU)攻击
+2. **重定向上限 + 跨域头剥离** — 防止 redirect 链绕过 hostname 白名单
+3. **fail-closed stream** — 字节上限不达 → 返回 `{truncated: true}` 而非部分内容
+
+### 18.6.2 Prompt Caching 三原则
+1. **稳定 prefix / 动态 suffix 二分** — `OPENCLAW_CACHE_BOUNDARY` 魔法标记
+2. **配额反向遍历** — 从最新 user message 倒序填配额,`fallback tool_result` 复用
+3. **协议能力探测** — `supportsLongCacheRetention` / `supportsCacheControlOnTools` 4+6 字段
+
+### 18.6.3 成本/预算三原则
+1. **micro-USD 精度** — `micros / 1_000_000` 防浮点漂移
+2. **actual billing not estimate** — `Costs are actual provider billing, not estimates`(`types.ts:34` 注释)
+3. **cache hit 单独追踪** — `cacheReadTokens` / `cacheWriteTokens` 分离,直接计算节省成本
+
+### 18.6.4 Git 备份四原则
+1. **白名单字段精确校验** — `requireExactKeys` + `schemaVersion`
+2. **mutation fingerprint** — 6 个 stat 字段防 TOCTOU
+3. **平台分支修复** — Windows ACL vs POSIX chmod
+4. **redact + truncate** — 凭据脱敏 + 诊断文本 500 字符上限
+
+---
+
+## 18.7 附录 A:关键文件绝对路径
+
+### Git 集成
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/git-exec.ts`(81 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/snapshot/git-backup.ts`(526 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/snapshot/git-backup-codec.ts`(675 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/snapshot/manifest.ts`(306 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/snapshot/local-repository.ts`(1610 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/snapshot/snapshot-provider.ts`(66 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/snapshot/openclaw-snapshot-copy.ts`(71 行)
+
+### 多模态
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/media-facts.ts`(≥300 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/store.ts`(≥400 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/local-media-access.ts`(≥300 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/local-roots.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/prompt-image-order.ts`(2 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/prompt-image-input.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/sniff-mime-from-base64.ts`(29 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/file-context.ts`(52 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/audio.ts` / `audio-transcode.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/pdf-extract.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/media/anthropic-inline-images.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/internal/anthropic-inline-images.ts`(63 行)
+
+### Web 检索
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/net/ssrf.ts`(330+ 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/net/fetch-guard.ts`(500+ 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/agents/tools/web-search-provider-common.ts`(473 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/agents/tools/web-search-provider-config.ts`(200 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/agents/tools/web-search-provider-credentials.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/agents/tools/web-shared.ts`(320 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/agents/tools/web-fetch-utils.ts`(675 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/agents/tools/web-guarded-fetch.ts`(118 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/plugin-sdk/provider-web-search.ts`(82 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/link-understanding/runner.ts`(150+ 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/link-understanding/detect.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/brave/src/brave-web-search-provider.ts`(200 行)
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/brave/src/brave-web-search-provider.runtime.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/brave/web-search-shared.ts`(51 行)
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/tavily/src/...`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/exa/...`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/firecrawl/src/...`(双模式 fetch+search)
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/searxng/web-search-provider.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/duckduckgo/web-search-provider.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/web-readability/web-content-extractor.ts`
+
+### Prompt Caching
+- `/usr/local/LsmGitOpenSource/openclaw/packages/llm-core/src/types.ts`(≥150 行 530-700)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/utils/system-prompt-cache-boundary.ts`(67 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/transports/anthropic-payload-policy.ts`(630 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/transports/openai-completions-params.ts`(370 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/transports/openai-responses-params-internal.ts`(320 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/transports/openai-responses-contracts.ts`(195 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/transports/openai-transport-shared.ts`(220 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/transports/openai-responses-compaction-window.ts`(50 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/providers/anthropic.ts`(1490 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/providers/openai-completions.ts`(750 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/providers/openai-responses.ts`(700 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/providers/openai-chatgpt-responses.ts`(670 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/providers/azure-openai-responses.ts`(240 行)
+- `/usr/local/LsmGitOpenSource/openclaw/packages/ai/src/providers/cache-retention.ts`
+
+### 成本/预算
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.types.ts`(95 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.fetch.ts`(7 行 facade)
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.fetch.claude.ts`(290 行)
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.fetch.codex.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.fetch.deepseek.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.fetch.gemini.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.fetch.minimax.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.fetch.zai.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.fetch.shared.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/src/infra/provider-usage.shared.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/clawrouter/index.ts`(260 行)
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/clawrouter/usage.ts`(170 行)
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/clawrouter/provider-catalog.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/clawrouter/stream.ts`
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/tokenjuice/index.ts`(15 行)
+- `/usr/local/LsmGitOpenSource/openclaw/extensions/tokenjuice/tool-result-middleware.ts`
+
+---
+
+## 18.8 附录 B:本轮 laew 漏点清单(L1-L20)
+
+| 编号 | 漏点 | 严重度 | openclaw 实现 |
+|------|------|--------|--------------|
+| L1 | 无 Git 备份机制 | **P0** | `git-backup.ts:266-382` 完整 6 阶段流水线 |
+| L2 | 无 SSRF 守卫 | **P0** | `ssrf.ts` 8 维 policy + DNS pinning |
+| L3 | 无 prompt caching | **P0** | `anthropic-payload-policy.ts` 4 断点 + 边界魔法标记 |
+| L4 | 无 base64 MIME 嗅探 | **P1** | `sniff-mime-from-base64.ts` 前 256 字符 |
+| L5 | 无工具结果压缩 hook | **P1** | `tokenjuice` `registerAgentToolResultMiddleware` |
+| L6 | 无 usage/cost dashboard | **P1** | `provider-usage.types.ts` 6 字段 + 6 provider 实现 |
+| L7 | 无 web search 工具 | **P2** | 7 个 provider 即插即用 |
+| L8 | 无 XML 注入防御 | **P1** | `escapeFileBlockContent` 三层防护 |
+| L9 | 无 micro-USD 精度 | **P2** | `usage.ts:35-37` `micros / 1_000_000` |
+| L10 | 无 7 个 web search provider | **P2** | Brave/Exa/Tavily/Firecrawl/SearXNG/DDG/Readability |
+| L11 | 无 cache hit 字段归一化 | **P1** | `cacheReadTokens/cacheWriteTokens` 分离 |
+| L12 | 无 OpenAI `prompt_cache_key` | **P1** | `openai-completions-params.ts:326-334` |
+| L13 | 无 system prompt 缓存边界切分 | **P0** | `OPENCLAW_CACHE_BOUNDARY` HTML 注释标记 |
+| L14 | 无 `provider-usage.shared` clampPercent | **P2** | `provider-usage.shared.ts` clampPercent |
+| L15 | 无 link-understanding 自动 URL 处理 | **P2** | `link-understanding/runner.ts` curl/wget 短路 |
+| L16 | 无 `sameMutationFingerprint` 校验 | **P1** | `manifest.ts:121-130` 6 stat 字段 |
+| L17 | 无 `requireExactKeys` 严格白名单 | **P0** | `manifest.ts:251-258` |
+| L18 | 无 URL `allowedHostnames/blockedHostnames` 通配 | **P1** | `ssrf.ts:67-69` |
+| L19 | 无 fetch 三模式(STRICT/TRUSTED_ENV_PROXY/TRUSTED_EXPLICIT_PROXY) | **P1** | `fetch-guard.ts:59-65` |
+| L20 | 无 `OAuthUsageEndpoint + sessionKey fallback` | **P2** | `fetch.claude.ts:241-249` 双路径降级 |
+
+---
+
+## 18.9 附录 C:关键行号索引
+
+| 概念 | 文件:行号 |
+|------|----------|
+| Git 默认 120s 超时 | `src/infra/git-exec.ts:5` |
+| Git 命令三档构造器 | `src/infra/git-exec.ts:41-80` |
+| 6 阶段 Git 备份流水线 | `src/snapshot/git-backup.ts:266-382` |
+| 备份身份自动注入 | `src/snapshot/git-backup.ts:244-263` |
+| 隐私修复建议 | `src/snapshot/git-backup.ts:99-111` |
+| `--invert-grep` 守卫 | `src/snapshot/git-backup.ts:357-358` |
+| 凭据脱敏 | `src/snapshot/git-backup.ts:44-49` |
+| 诊断文本 500 上限 | `src/snapshot/git-backup.ts:31` |
+| manifest schemaVersion=1 | `src/snapshot/manifest.ts:173` |
+| `requireExactKeys` 白名单 | `src/snapshot/manifest.ts:251-258` |
+| `sameMutationFingerprint` 6 stat | `src/snapshot/manifest.ts:121-130` |
+| MediaFact 12 字段 | `src/media/media-facts.ts:17-36` |
+| `hydrationSuppressed` 字段 | `src/media/media-facts.ts:31-35` |
+| 9 legacy persisted keys | `src/media/media-facts.ts:97-107` |
+| 5MB 媒体上限 | `src/media/store.ts:31` |
+| 24h outbound staging TTL | `src/media/store.ts:42` |
+| 512MB playback 缓存 | `src/media/store.ts:44` |
+| 7d playback TTL | `src/media/store.ts:46` |
+| 7 种 LocalMediaAccessErrorCode | `src/media/local-media-access.ts:13-22` |
+| base64 sniff 前 256 字符 | `src/media/sniff-mime-from-base64.ts:5` |
+| 4 种 Anthropic MIME | `packages/ai/src/internal/anthropic-inline-images.ts:5` |
+| 64MB 聚合上限 | `packages/ai/src/internal/anthropic-inline-images.ts:10` |
+| XML 注入三层防御 | `src/media/file-context.ts:5-52` |
+| SSRF 8 维 policy | `src/infra/net/ssrf.ts:49-70` |
+| allowIpv6UniqueLocalRange | `src/infra/net/ssrf.ts:53-60` |
+| 3 fetch 模式 | `src/infra/net/fetch-guard.ts:59-65` |
+| 重定向默认 3 | `src/infra/net/fetch-guard.ts:144` |
+| web-shared 缓存 15min/100 | `src/agents/tools/web-shared.ts:19-21` |
+| 响应体双层保护 | `src/agents/tools/web-shared.ts:200-320` |
+| provider-web-search 16 工具 | `src/plugin-sdk/provider-web-search.ts:10-82` |
+| mergeScopedSearchConfig | `src/agents/tools/web-search-provider-config.ts:50-78` |
+| curl/wget 短路 | `src/link-understanding/runner.ts:107-150` |
+| LinkUrl/LinkFinalUrl 模板 | `src/link-understanding/runner.ts:44-70` |
+| Anthropic 4 断点 | `packages/ai/src/transports/anthropic-payload-policy.ts:43` |
+| ANTHROPIC_COMPACT_THRESHOLD_MIN | `packages/ai/src/transports/anthropic-payload-policy.ts:44` |
+| 5 白名单主机 | `packages/ai/src/transports/anthropic-payload-policy.ts:138-153` |
+| 反向遍历算法 | `packages/ai/src/transports/anthropic-payload-policy.ts:236-330` |
+| fallback tool_result 复用 | `packages/ai/src/transports/anthropic-payload-policy.ts:262-264` |
+| OPENCLAW_CACHE_BOUNDARY 标记 | `packages/ai/src/utils/system-prompt-cache-boundary.ts:8` |
+| Anthropic 工具最后一项缓存 | `packages/ai/src/providers/anthropic.ts:1478-1480` |
+| OAuth billing block | `packages/ai/src/providers/anthropic.ts:1378-1395` |
+| OpenAI prompt_cache_key | `packages/ai/src/transports/openai-completions-params.ts:326` |
+| prompt_cache_retention 24h | `packages/ai/src/transports/openai-completions-params.ts:333` |
+| 6 字段 ProviderUsageSnapshot | `src/infra/provider-usage.types.ts:73-84` |
+| cacheReadTokens/cacheWriteTokens | `src/infra/provider-usage.types.ts:40-43` |
+| Claude OAuth usage 双路径 | `src/infra/provider-usage.fetch.claude.ts:241-249` |
+| 5h/Week/Sonnet/Opus 窗口 | `src/infra/provider-usage.fetch.claude.ts:65-86` |
+| micro-USD 精度 | `extensions/clawrouter/usage.ts:35-37` |
+| windowKey 月度重置 | `extensions/clawrouter/usage.ts:44-57` |
+| budget vs spend 决策 | `extensions/clawrouter/usage.ts:142-157` |
+| 0 limit 短路 | `extensions/clawrouter/usage.ts:139` |
+| 4 元组 dynamicModelScope | `extensions/clawrouter/index.ts:72-79` |
+| tokenjuice middleware hook | `extensions/tokenjuice/index.ts:1-14` |
+| cache hit 字段优先级回退 | `packages/ai/src/transports/openai-transport-shared.ts:209-220` |
+
+---
+
+> **本轮分析基于对 `/usr/local/LsmGitOpenSource/openclaw/` 当前 head(2026.8.1 版本, ~201 万行 TS)的真实源码 + 文档阅读**。所有结论均落到具体文件路径、行号、函数签名、manifest 字段、关键代码片段。所有 manifest 引用为 verbatim copy。所有 manifest 中的 JSON 字段名保留原始 camelCase / snake_case。
+
+### 18.0 四维度速览
+
+| 维度 | OpenClaw 的答案 | 核心实现文件 | 规模 |
+| --- | --- | --- | --- |
+| **Git 集成** | **不是"让 Agent `git commit`",而是"Agent 的每个并发任务各自拥有一个受控 worktree + 分支 + 快照 ref"**;删除/回收前强制合成 commit 快照,30 天内可恢复 | `src/agents/worktrees/`(9,087 行,含测试)+ `src/infra/git-*.ts` | service.ts 1,790 行 / registry.ts 682 行 |
+| **多模态文件** | 附件先落**私有 media store**(0600 目录、2 分钟 TTL 起),再按 kind 走 **6 档字节上限**(6/16/16/100MB…),PDF 走 4 页/400 万像素栅格化,图片统一归一到 JPEG/PNG | `src/media/`(80+ 文件)+ `packages/media-core/` | input-files.ts 476 行 |
+| **Web 检索** | `web_search` / `web_fetch` 是**一等公民工具**,但实现是**可插拔 provider 链**(brave/exa/perplexity/tavily/firecrawl/duckduckgo/searxng/google/xai…),直连失败才降级到 provider;全部流量过 SSRF 守卫 + DNS pinning | `src/agents/tools/web-*.ts` + `src/infra/net/` | web-fetch.ts 1,082 行 |
+| **成本/缓存** | Anthropic 走**单一最深稳定断点** `cache_control:ephemeral`(long→`ttl:"1h"` 且需 hostname 白名单);OpenAI 走 `prompt_cache_key`(64 code point 裁剪);成本先落 transcript 再 rollup 进 SQLite(`rollup-v2`),并有**缓存断裂回归检测** | `packages/ai/src/transports/` + `src/infra/session-cost-usage-*` | 成本域 7,917 行(含测试) |
+
+**本章最重要的一句话**:OpenClaw 把"Git"当成**并发隔离与回滚基础设施**(worktree + snapshot ref),把"Web"当成**不可信内容源**(外部内容一律 `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` 包络 + 预算裁剪),把"成本"当成**可观测性产物**(不是硬预算闸门 —— 没有 per-user 美元配额,只有 provider 侧 quota 与会话挂起)。
+
+---
+
+### 18.1 Git 与版本控制集成
+
+#### 18.1.1 全景:Git 在 OpenClaw 的 9 个落点
+
+| # | 落点 | 入口文件 | 关键行 | 职责 |
+| --- | --- | --- | --- | --- |
+| 1 | Git 命令底座(超时/错误) | `src/infra/git-exec.ts` | 5,18,41 | 统一 `git -C <cwd>` 执行,默认 120s 超时 |
+| 2 | 仓库根发现 | `src/infra/git-root.ts` | 35,61 | `.git` 目录/文件双形态 + `gitdir:` 指针解析 |
+| 3 | **受管 worktree**(核心) | `src/agents/worktrees/service.ts` | 1782 | 每任务一分支一 checkout,快照后回收 |
+| 4 | worktree 注册表(SQLite) | `src/agents/worktrees/registry.ts` | 157,374 | 记录/租约/快照分块,跨进程并发安全 |
+| 5 | 容量准入 | `src/agents/worktrees/capacity.ts` | 12,56 | 磁盘预留 10%(4–16GiB)+ checkout 体积估算 |
+| 6 | git worktree 锁 | `src/agents/worktrees/git-lock.ts` | 14,45 | `openclaw pid=N` 锁 + 僵尸 pid 回收 |
+| 7 | 提交归因 | `src/agents/git-coauthor-attribution.ts` | 36,134 | 多参与者 → `Co-authored-by` trailer |
+| 8 | PR / GitHub 发布 | `src/agents/tools/github-publish-tool.ts` | 13,38 | 工具化 draft PR(凭据不进工具参数) |
+| 9 | Git 备份仓库 | `src/snapshot/git-backup.ts` + `src/commands/backup-git.ts` | 125/266,113/130 | init/create/log/verify/restore 五个子命令 |
+
+另有 `src/cli/worktrees-cli.ts`(list/create/remove/restore/gc 五个子命令,行 32/65/84/107/116)与 `src/projects/project-git-url.ts:29`(项目 Git URL 解析)作为操作面。
+
+#### 18.1.2 Git 执行底座:两条硬约束(超时 + 禁钩)
+
+`src/infra/git-exec.ts:5` 定义全局 Git 超时,`:18` 用固定形态 `git -C <cwd>` 拼接参数,避免 cwd 注入:
+
+```ts
+// src/infra/git-exec.ts:5
+export const GIT_TIMEOUT_MS = 120_000;
+
+// src/infra/git-exec.ts:17-24
+const timeoutMs = options.timeoutMs ?? GIT_TIMEOUT_MS;
+const result = await runCommandWithTimeout(["git", "-C", cwd, ...args], {
+  timeoutMs, env: options.env, input: options.input, signal: options.signal,
+});
+return { ...result, timeoutMs };
+```
+
+超时错误信息还带**处置建议**(`:35-37`):
+
+```ts
+// src/infra/git-exec.ts:35-37
+if (result.termination === "timeout") {
+  error.message += "\nCheck repository access and disk space.";
+}
+```
+
+**最关键的安全设计**在 `src/agents/worktrees/git.ts:27-36`:Gateway 跑的任何 Git 命令都**强制禁用仓库钩子和文件系统监视器**——因为 worktree 可能来自用户仓库,`.git/hooks/*` 是任意代码:
+
+```ts
+// src/agents/worktrees/git.ts:20-36
+/**
+ * Gateway-run Git must never execute repository hooks or filesystem monitors;
+ * the admin-gated setup script is the sole intentional repository-code path.
+ */
+export function gitEnvironment(env?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...(env ?? process.env),
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "core.hooksPath",
+    GIT_CONFIG_VALUE_0: os.devNull,          // ← 钩子指向 /dev/null
+    GIT_CONFIG_KEY_1: "core.fsmonitor",
+    GIT_CONFIG_VALUE_1: "false",             // ← 关闭 fsmonitor
+  };
+}
+```
+
+`runGit` / `requireGit` / `requireGitRaw` / `requireGitBuffer`(`git.ts:38/55/68/72`)全部走这个 env,**没有绕过路径**——注释明确说明:即使某个调用方需要"缓冲、非抛出、自定义超时",也必须复用 `gitEnvironment()` 以钉住同一不变量(`git.ts:22-26`)。
+
+仓库根发现走**纯文件系统遍历**而非起子进程,`git-root.ts:35-38` 把 `.git` **文件**(linked worktree 的 gitdir 指针)也算作标记;`:40-59` 进一步解析 `gitdir: <path>` 内容:
+
+```ts
+// src/infra/git-root.ts:36-37
+// A `.git` file counts as a repo marker even if it is not a valid gitdir pointer.
+return walkUpFrom(startDir, opts, (repoRoot) => (hasGitMarker(repoRoot) ? repoRoot : null));
+// src/infra/git-root.ts:50-55
+const raw = fs.readFileSync(gitPath, "utf-8");
+const match = raw.match(/gitdir:\s*(.+)/i);
+```
+
+`src/agents/worktrees/git.ts:120-132` 提供**不起进程**的等价实现 `findGitCheckoutRoot`,注释解释原因:UI 能力探测与创建前置检查必须与 worktree service 的判定**完全一致**,不能一个起 git 一个不起。
+
+#### 18.1.3 Managed Worktree:并发任务隔离的完整实现
+
+布局与命名(`docs/concepts/managed-worktrees.md:33-45`):
+
+```text
+<worktreeRoot>/<repo-fingerprint>/<name>
+```
+
+- **仓库指纹** = SHA-256(`commonDir` + `\n` + `originUrl`)的前 16 位十六进制 —— `src/agents/worktrees/service.ts:277-280`:
+
+```ts
+// src/agents/worktrees/service.ts:269-281
+const commonRaw = await requireGit(sourceRoot, ["rev-parse", "--git-common-dir"]);
+const commonDir = await fs.realpath(path.isAbsolute(commonRaw) ? commonRaw : path.resolve(sourceRoot, commonRaw));
+const primary = (await listGitWorktrees(sourceRoot))[0]?.path ?? sourceRoot;
+const canonicalRoot = await fs.realpath(primary);
+const origin = await runGit(canonicalRoot, ["config", "--get", "remote.origin.url"]);
+const originUrl = origin.code === 0 ? origin.stdout.trim() : "";
+const fingerprint = createHash("sha256").update(`${commonDir}\n${originUrl}`).digest("hex").slice(0, 16);
+```
+
+- 名字必须匹配 `^[a-z0-9][a-z0-9-]{0,63}$`(`service.ts:83` / `:164-169`);无名字时生成**甲壳类主题名**(如 `brisk-lobster`),冲突追加序号 `-2`、`-3`…最多 1000 次(`:220-241`)。
+- 分支固定为 `openclaw/<name>`(`:202`);base ref 缺省时**先 `git fetch origin`,用 `refs/remotes/origin/HEAD` 符号引用,离线才退回本地 HEAD** —— `src/agents/worktrees/base-ref.ts:52-66`:
+
+```ts
+// src/agents/worktrees/base-ref.ts:52-66
+const fetched = await runGit(repoRoot, ["fetch", "origin"], { signal });
+if (fetched.code === 0) {
+  const remoteHead = await runGit(repoRoot, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+  if (remoteHead.code === 0 && remoteHead.stdout.trim()) {
+    const remoteRef = remoteHead.stdout.trim();
+    return { gitOperand: remoteRef, recordRef: remoteRef, remote: true };
+  }
+}
+return { gitOperand: "HEAD", recordRef: "HEAD", remote: false };
+```
+
+base ref 带 `-` 前缀(可能被当成选项)时,先用 `rev-parse --symbolic-full-name --verify --end-of-options` 归一化,并对结果做 `refs/` 前缀与换行校验(`base-ref.ts:16-48`)。
+
+**创建期的并发互斥**用跨仓库、跨进程的**单一分配租约**(`service.ts:84-86`):
+
+```ts
+// src/agents/worktrees/service.ts:84-88
+const WORKTREE_CREATE_LEASE_SCOPE = "core:managed-worktrees:create";
+const WORKTREE_CREATE_LEASE_MS = 60_000;
+const WORKTREE_CREATE_LEASE_WAIT_MS = 5 * 60_000;
+// Materializing a checkout gets extra time without extending other Git commands or setup.
+const WORKTREE_CHECKOUT_TIMEOUT_MS = 300_000;
+```
+
+失败创建有三段回滚(`:313-324`):`worktree remove --force` → `branch -D` → `worktree prune`,任一失败都要抛错而不是静默留下半成品:
+
+```ts
+// src/agents/worktrees/service.ts:313-324
+const removed = await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
+const deletedBranch = await runGit(repoRoot, ["branch", "-D", branch]);
+await runGit(repoRoot, ["worktree", "prune"]);
+if (removed.code !== 0 || deletedBranch.code !== 0) { /* …抛错… */ }
+```
+
+**仓库本地的两个"钩子"**(不是 Git hook,是 OpenClaw 约定):
+
+| 文件 | 位置 | 语义 | 源码 |
+| --- | --- | --- | --- |
+| `.openclaw/worktree-setup.sh` | 源仓库根 | 可执行则在新 worktree 内运行,非零退出即撤销创建;**仅 `operator.admin` 调用方执行** | `service.ts:383` `runSetupScript` |
+| `.worktreeinclude` | 源仓库根 | gitignore 语法,把"被忽略且未跟踪"的文件**带进**新 worktree | `docs/concepts/managed-worktrees.md:60-68` |
+
+setup 脚本的两个环境变量是仓库本地契约:`OPENCLAW_SOURCE_TREE_PATH` / `OPENCLAW_WORKTREE_PATH`。
+
+#### 18.1.4 磁盘容量准入:预留 10% + 体积估算
+
+`src/agents/worktrees/capacity.ts:12-53` 在**分配前**对"目标卷 / Git 元数据卷 / 源 checkout 卷 / state 卷"分别做检查:
+
+```ts
+// src/agents/worktrees/capacity.ts:42-53
+for (const volume of volumes.values()) {
+  // Cleanup must still be possible below the operational reserve, but never without snapshot room.
+  const reserve = snapshot
+    ? 128 * 1024 ** 2
+    : Math.max(4 * GiB, Math.min(volume.total / 10, 16 * GiB));
+  const required = reserve + volume.bytes;
+  if (!Number.isSafeInteger(Math.ceil(required)) || volume.available < required) {
+    throw new Error(
+      `Insufficient disk space near ${volume.path} for ${purpose}: ${formatDiskSpaceBytes(volume.available)} available; approximately ${formatDiskSpaceBytes(required)} required including safety reserve. Free caches or archive/remove unused worktrees, then retry.`,
+    );
+  }
+}
+```
+
+checkout 体积不是"sizes 相加",而是**按 4KiB 块向上取整**(文件系统真实占用):
+
+```ts
+// src/agents/worktrees/capacity.ts:63-83
+const sizes = await requireGit(repoRoot, ["ls-tree", "-r", "--format=%(objectsize)", commit, "--"]);
+let bytes = 0;
+for (const size of sizes.split("\n")) { /* … */
+  bytes += Math.max(4096, Math.ceil(value / 4096) * 4096);
+}
+```
+
+快照场景的预留降到 128 MiB(上引 `:44`),并额外要求 `WORKTREE_SETUP_HEADROOM_BYTES = 4 GiB`(`capacity.ts:9`)给可执行 setup 脚本。
+
+#### 18.1.5 Snapshot = checkpoint/undo:合成 commit + 专属 ref
+
+这是本章最有价值的设计:**删除一个 worktree 之前,先把"已跟踪改动 + 未忽略的未跟踪文件"合成一个 commit,钉在 `refs/openclaw/snapshots/<id>`**(`service.ts:129` / `:498-661`)。
+
+```ts
+// src/agents/worktrees/service.ts:129
+const SNAPSHOT_REF_PREFIX = "refs/openclaw/snapshots";
+// src/agents/worktrees/service.ts:511
+const snapshotRef = `${SNAPSHOT_REF_PREFIX}/${record.id}`;
+```
+
+关键实现细节:
+
+1. **用临时 index 文件**,不污染 worktree 自己的 index(`:509-510` `mkdtemp` + `GIT_INDEX_FILE`);
+2. **身份写死为 OpenClaw**,不受仓库 `user.email` 影响(`:513-519`):
+
+```ts
+// src/agents/worktrees/service.ts:513-519
+const env: NodeJS.ProcessEnv = {
+  GIT_INDEX_FILE: indexPath,
+  GIT_AUTHOR_NAME: "OpenClaw",
+  GIT_AUTHOR_EMAIL: "openclaw@localhost",
+  GIT_COMMITTER_NAME: "OpenClaw",
+  GIT_COMMITTER_EMAIL: "openclaw@localhost",
+};
+```
+
+3. **被忽略的文件绝不进对象库**——只收录 `ls-files --cached/--others --exclude-standard` 与 `diff-index --cached`(`:567-574`);被 OpenClaw 自己 provision 的忽略文件另外**分块存进 SQLite state 库**(`:596-602` `snapshotProvisionedFiles`);
+4. **sparse-checkout 正确性**:先 `config --bool core.sparseCheckout`,再用 `sparse-checkout check-rules -z` 判定"缺失路径到底是删除还是稀疏省略"(`:529-566`);
+5. **嵌套仓库与 gitlink 一律拒绝**(避免"看似快照成功、实际丢文件"):`160000` gitlink 出现即抛错(`:465-467`、`:635-639`、`containsSnapshotGitMarker` `:456-496`);
+6. **provisioned 路径反向校验**:写树后逐条 `ls-tree` 确认 provisioned 路径没混进 Git 快照(`:621-634`);
+7. **commit 用 `commit-tree` 而非 `commit`**,父提交取当前 HEAD(`:640-654`):
+
+```ts
+// src/agents/worktrees/service.ts:640-656
+const parent = await requireGit(record.path, ["rev-parse", "HEAD"]);
+const commit = await requireGit(record.path, [
+  ...filemodeArgs, "commit-tree", tree, "-p", parent, "-m", `OpenClaw worktree snapshot: ${reason}`,
+], { env });
+await requireGit(record.repoRoot, ["update-ref", snapshotRef, commit]);
+```
+
+8. **`commitGuard` 贯穿全流程**:`commitGuard?.()` 在 6 个点被调用(`:505`、`:594`、`:605`、`:619`、`:641`、`:655`),让 owner 可以在"即将提交"的最后一刻否决(例如 session 已在别处被归档)。
+9. **恢复语义**:`docs/concepts/managed-worktrees.md:170-172` 说明 restore 是"在原始 pre-snapshot commit 上重建 `openclaw/<name>`,再把快照差异还原成**未暂存修改 + 未跟踪文件**",因此**合成 commit 不会进入分支历史**,snapshot ref 只作溯源保留。
+
+`prepareSnapshotIndex`(`service.ts:663-740`)还有一个易被忽略的正确性细节:比较基准必须是**刚 `read-tree HEAD` 的全新 index**,因为"源 index 的 skip-worktree 标记会隐藏编辑,而未刷新的 HEAD index 会把未变更 blob 误判为已改"`:683-684`。
+
+#### 18.1.6 Run-end cleanup 决策树:四个"保留"理由
+
+运行结束时不是无条件删除,而是**先做无损性判定**(`service.ts:1417-1464`):
+
+```ts
+// src/agents/worktrees/service.ts:1419-1439
+const status = await requireGit(record.path, ["status", "--porcelain"]);
+const unpushed = await requireGit(record.path, ["log", "HEAD", "--not", "--remotes", "--oneline"]);
+const ignoredDrift = await hasUnsnapshotableProvisionedFiles(
+  record.path, getRegistryWorktreeProvisionedPaths(this.env, record.id));
+const retainedOutcome = status
+  ? "retained-dirty"
+  : unpushed
+    ? "retained-unpushed"
+    : ignoredDrift
+      ? "retained-provisioned-drift"
+      : (await containsSnapshotGitMarker(record.path))
+        ? "retained-dirty"
+        : undefined;
+if (retainedOutcome) {
+  abortWorktreeRemoval(this.env, id, claimToken);
+  recordOutcome(retainedOutcome);
+  return false;
+}
+```
+
+| 结果(outcome) | 触发条件 | 含义 |
+| --- | --- | --- |
+| `removed-lossless` | 干净 + 已推送 + 无 drift | 快照后删除(`:1450-1457`) |
+| `retained-dirty` | `git status --porcelain` 非空,或含嵌套 Git | 有未提交工作 |
+| `retained-unpushed` | `git log HEAD --not --remotes` 非空 | 有未推送提交 |
+| `retained-provisioned-drift` | provisioned 文件已无法无损快照 | 忽略文件漂移 |
+| `retained-busy` | 抢不到 removal claim(活租约/竞争删除者) | `:1407` |
+| `failed` | 异常,附 500 字符截断原因 | `:1386-1388` |
+
+注意 `:1394-1395` 的注释:"Run-end cleanup 必须留下**持久化**的结果,即使安全策略保留了 checkout"——因为 QA 与运维通过 `worktrees.list` 观察这个产品边界事实。
+
+#### 18.1.7 GC、保留期、孤儿回收与 pid 级 worktree 锁
+
+三个时间常数(`service.ts:79-81`):
+
+```ts
+export const IDLE_GC_MS = 7 * 24 * 60 * 60 * 1000;        // 7 天空闲可回收(仍可恢复)
+export const SNAPSHOT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 快照可恢复 30 天
+export const WORKTREE_GC_INTERVAL_MS = 60 * 60 * 1000;    // 每小时 GC
+```
+
+GC 规则(`service.ts:1484-1536` + `docs/concepts/managed-worktrees.md:147-165`):
+
+- 只有 `ownerKind === "workboard" | "session"` 会因空闲过期;`manual` 永不过期(`:1494-1495`);
+- **数量目标 100,不是准入上限**(`:157` `WORKTREE_CLEANUP_TARGET`,`:160-162` `resolveWorktreeCleanupLimits`),超限才淘汰"最久未活动的 run-owned"worktree;
+- **数量从不阻塞创建,也从不驱逐别人的 session**;
+- 快照过期后 `update-ref -d` 删 ref + `deleteRegistryWorktree` 删行(`:1521-1534`);
+- 受保护条件(`isProtectedFromAutoRemoval` `:1542-1554`):owner 保护回调 + 活租约 + 嵌套 Git + 活/外部 worktree 锁。
+
+**git worktree 锁的 pid 生命周期管理**是很有代表性的一段(`src/agents/worktrees/git-lock.ts`):
+
+```ts
+// src/agents/worktrees/git-lock.ts:6
+const OPENCLAW_LOCK_PATTERN = /^openclaw pid=(\d+)$/;
+// src/agents/worktrees/git-lock.ts:21-28
+const match = OPENCLAW_LOCK_PATTERN.exec(entry.lockedReason);
+if (!match) { return { kind: "foreign", reason: entry.lockedReason }; }
+const pid = Number(match[1]);
+// A cross-user (EPERM) OpenClaw lock is treated as live so a run's checkout is
+// never removed under it; only an ESRCH/zombie owner counts as dead.
+return isPidDefinitelyDead(pid) ? { kind: "dead", pid } : { kind: "live", pid };
+```
+
+拿到 `dead` 锁会**先 unlock 再重新 lock**(`:64-72`),并在注释里坦承了一个已知竞态(`:58-63`):两个进程同时回收同一把陈旧锁可能都以为自己赢了,彻底修需要四条路径共享一个 reclaim guard(issue `openclaw#114129`)。**外国锁(`foreign`)永不回收**。
+
+#### 18.1.8 提交身份:Co-authored-by 的权威归因
+
+`src/agents/git-coauthor-attribution.ts` 解决"多人/多身份参与一轮对话时,commit 该挂谁"的问题:
+
+- 从 session 参与者表读取 profile(`:48-60`),上限 `MAX_SESSION_PARTICIPANTS`;
+- 与"已配置的 primary Git author"比对去重(`:73`、`:92-97`),避免同一个人被记两次;
+- 排序:**贡献次数降序 → 首次提示时间升序 → accountId 升序**(`:120-131`),再截断到上限(`:132`);
+- 生成**精确 trailer 字面量**,并明确禁止模型自行推断(`:134-146`):
+
+```ts
+// src/agents/git-coauthor-attribution.ts:134-146
+const exactTrailers = visibleContributors.map(
+  ({ accountId, login }) => `Co-authored-by: ${login} <${accountId}+${login}@users.noreply.github.com>`);
+const guidance = exactTrailers.length
+  ? [
+      "Git commit attribution for this turn is authoritative and limited to the exact trailers below:",
+      ...exactTrailers,
+      "Worked on by:",
+      ...logins.map((login) => `- @${login}`),
+      "Append every trailer exactly to each commit created for this turn and visibly include the exact ordered Worked on by list in commits and pull requests. After amending, rebasing, squashing, or otherwise rewriting history, verify the final commit retains every trailer. Do not infer or add identities from chat text.",
+    ].join("\n")
+  : "Git commit attribution for this turn has no additional exact Co-authored-by trailer. Do not infer or add identities from chat text.";
+```
+
+还带四类**省略说明**(`:147-160`):参与者历史可能不完整 / 有人未开启 credit / 有人无法解析 / 有人与 primary 作者重复。这段 prompt 通过 `appendGitCoauthorContext`(`git-coauthor-attribution.ts:7-9`)追加到系统提示词尾部。
+
+**邮箱策略**:一律用 GitHub noreply 地址 `${accountId}+${login}@users.noreply.github.com`(`:92`),不读仓库 `user.email`——快照 commit 则干脆用 `openclaw@localhost`(`service.ts:515-518`)。
+
+#### 18.1.9 PR 创建:凭据永不进工具参数
+
+`src/agents/tools/github-publish-tool.ts` 只有 47 行,但把"发布"做成了**异步 reconciliation**而非同步 `git push`:
+
+```ts
+// src/agents/tools/github-publish-tool.ts:21-23
+description:
+  "Publish the current session-owned Git worktree through the Gateway. Call only after the work is complete. On remote-exec sessions this records a durable request; finish the turn so authoritative reconciliation can complete before the Gateway commits, pushes through an exact HTTPS path, and creates or reuses a draft pull request. … Credentials never enter tool arguments or the worker.",
+```
+
+```ts
+// src/agents/tools/github-publish-tool.ts:38-43
+const result = await callGateway<SessionGitHubPublicationResult>("sessions.github.publish", {
+  sessionKey: caller.sessionKey,
+  idempotencyKey: toolCallId,     // ← 幂等键 = toolCallId,重试天然去重
+  ...(input.title ? { title: input.title } : {}),
+  ...(input.body ? { body: input.body } : {}),
+});
+```
+
+要点:① 工具只带 `title`/`body`,**凭据在 Gateway 侧**;② `idempotencyKey = toolCallId` 防重复 PR;③ workspace 忙时**排队**,Gateway 在一致后自动发布并把结果写回 transcript;④ 工具目录里标记为 `github_publish`(`tool-catalog.ts:227` 描述 "Publish the reconciled session worktree as a draft GitHub pull request")。
+
+#### 18.1.10 Git 状态如何进入上下文 + gitignore 尊重 + staged inputs
+
+**OpenClaw 不把 `git status` 全文塞进上下文**,而是把它变成**判定信号**:
+
+| 用途 | 命令 | 位置 |
+| --- | --- | --- |
+| 是否允许无损删除 | `git status --porcelain` | `service.ts:1419` |
+| 是否有未推送提交 | `git log HEAD --not --remotes --oneline` | `service.ts:1420-1426` |
+| 是否有已跟踪改动 | `git diff-index --cached --name-only -z HEAD --` | `service.ts:568` |
+| 未跟踪(尊重 gitignore) | `git ls-files -z --others --exclude-standard` | `service.ts:569` |
+| 被忽略文件(用于 provision) | `git ls-files -z --others --ignored --exclude-standard` | `service.ts:472-479` |
+| sparse 规则判定 | `git sparse-checkout check-rules -z` | `service.ts:554-560` |
+
+**"–exclude-standard" 就是 gitignore 尊重的实现**:`--others --exclude-standard` 天然跳过 `.gitignore` 命中的文件;反过来 `--others --ignored --exclude-standard` 专门列出被忽略文件供 `.worktreeinclude` 挑选。
+
+**Agent 上传的附件也自动被 gitignore**:`src/media/staged-inputs.ts` 给暂存目录写一份**内容固定的 `.gitignore`**,并用它的 SHA-256 做识别,避免附件污染仓库 diff:
+
+```ts
+// src/media/staged-inputs.ts:6-12
+const STAGED_INPUT_DIRECTORY_PREFIX = "media/inbound/openclaw-staged-";
+export const STAGED_INPUT_GIT_PATHSPEC = `:(glob)${STAGED_INPUT_DIRECTORY_PREFIX}*/**`;
+const STAGED_INPUT_GITIGNORE = /* … */;
+const STAGED_INPUT_GITIGNORE_SHA256 = createHash("sha256").update(STAGED_INPUT_GITIGNORE).digest("hex");
+```
+
+```ts
+// src/media/staged-inputs.ts:140-147
+if ((await root.readText(ignorePath, { maxBytes: 1024 })) !== STAGED_INPUT_GITIGNORE) {
+  /* … */
+}
+await root.create(ignorePath, STAGED_INPUT_GITIGNORE, { mode: 0o600 });
+```
+
+而且 worktree 快照**专门把这些 staged 目录纳入快照**(否则用户刚上传的图会随着 worktree 回收丢失)——`service.ts:575-590` 用 `createStagedInputPathMatcher` + `STAGED_INPUT_GIT_PATHSPEC` 精准圈定。
+
+#### 18.1.11 操作面:CLI 与 Git 备份仓库
+
+`src/cli/worktrees-cli.ts` 五个子命令:
+
+| 命令 | 行 | 说明 |
+| --- | --- | --- |
+| `openclaw worktrees list [--json]` | 32 | 含 `runEndCleanup` outcome,运维排障主入口 |
+| `openclaw worktrees create <repoRoot> [--name] [--baseRef]` | 65 | 手工 worktree(永不过期) |
+| `openclaw worktrees remove <id> [--force]` | 84 | `--force` 才允许丢弃快照安全 |
+| `openclaw worktrees restore <id>` | 107 | 从 snapshot ref 恢复 |
+| `openclaw worktrees gc` | 116 | 手动触发 GC |
+
+另有独立的 **Git 备份仓库**体系(状态备份而非代码备份):`src/snapshot/git-backup.ts:125` `initializeGitBackupRepository`、`:266` `createGitBackup`、`:448` `restoreGitBackupRef`、`:470` `verifyGitBackupRef`、`:488` `readGitBackupLog`;CLI 层 `src/commands/backup-git.ts:113/130/176/198/218` 对应 init/create/log/verify/restore,并在 `:39` 定义了 `GIT_BACKUP_PUSH_CREDENTIAL_WARNING`。
+
+#### 18.1.12 对 laew 的借鉴(Git)
+
+| 级别 | 建议 | 依据(openclaw) | laew 现状 |
+| --- | --- | --- | --- |
+| **P0** | **Git 命令底座统一化**:单一 `git -C <cwd>` 执行器 + 120s 默认超时 + 超时附带处置建议;`core.hooksPath=/dev/null` + `core.fsmonitor=false` 强制注入 | `git-exec.ts:5,18,35`;`git.ts:27-36` | laew 的 BashTool 直接跑用户命令,Git 无特殊处理 |
+| **P0** | **写操作前的安全三问**:`git status --porcelain` 干净? `git log HEAD --not --remotes` 空? 有嵌套 Git? 三者不满足就**保留** | `service.ts:1419-1439` | laew 无写前检查 |
+| **P0** | **删除/回滚前先落快照**:合成 commit 钉到 `refs/laew/snapshots/<id>`,保留 30 天 | `service.ts:129,498-661` | laew 无 checkpoint |
+| **P1** | **worktree 隔离并发任务**:`<root>/<fingerprint>/<name>` + `laew/<name>` 分支 + 名称 `[a-z0-9][a-z0-9-]{0,63}` + 冲突序号 | `service.ts:83,202,220-241,277-280` | laew SubAgent 全部共享同一工作目录 |
+| **P1** | **磁盘容量准入**:预留 `max(4GiB, min(total/10, 16GiB))`,checkout 体积按 4KiB 块估算 | `capacity.ts:42-53,63-83` | 无 |
+| **P1** | **快照身份固定**(不读 user.email)+ Co-authored-by 精确 trailer(禁止模型推断) | `service.ts:513-519`;`git-coauthor-attribution.ts:134-146` | 无 commit 能力 |
+| **P2** | **git worktree lock + pid 存活判定**(僵尸锁回收、外国锁不碰) | `git-lock.ts:6,21-28,64-72` | 无 |
+| **P2** | **附件/暂存目录自动写 `.gitignore` + 内容哈希识别** | `staged-inputs.ts:6-12,140-147` | 无 |
+| **P2** | **PR 发布走 Gateway 侧凭据 + `idempotencyKey`** | `github-publish-tool.ts:23,38-43` | 无 |
+
+
+### 18.2 多模态与文件处理
+
+#### 18.2.1 全景:四类入口 × 三段流水线 × 五档限制
+
+OpenClaw 的多模态不是一个"上传接口",而是 **MIME/字节双分类 → 安全落盘 → 内容块组装 → 模型发送** 的四段流水线,每一段都有自己的不变量:
+
+| 段 | 入口文件 | 关键行 | 不变量 |
+| --- | --- | --- | --- |
+| ① 分类(MIME + 字节嗅探) | `packages/media-core/src/attachment-classify.ts` | 25,115 | `Text / Document / Image / Audio / Video / Archive / Binary` |
+| ② 大小/类型上限 | `packages/media-core/src/constants.ts` | 2-8,40 | 6/16/16/100MB 按 kind |
+| ③ 安全落盘 | `src/media/store.ts` | 31,48,164 | 目录 `0o700`,TTL 2 分钟,每 kind 分目录 |
+| ④ 内容块组装 | `src/media/anthropic-inline-images.ts` + `src/media/input-files.ts` | 31,317 | base64 vs URL;PDF/图片/文本统一归一化 |
+
+#### 18.2.2 分类:7 类 + ZIP magic + UTF-16 BOM 嗅探
+
+`packages/media-core/src/attachment-classify.ts:25-51` 把 MIME 落到 7 类;`DOCUMENT_MIME` 正则覆盖 PDF/MS-Word/iWork/OOXML/ODF,`ARCHIVE_MIME` 覆盖 zip/gzip/tar/7z/rar:
+
+```ts
+// packages/media-core/src/attachment-classify.ts:18-22
+const TEXT_APPLICATION_MIME = /^application\/(?:json|javascript|xml|yaml|x-yaml)$/;
+const DOCUMENT_MIME =
+  /^application\/(?:pdf|msword|x-cfb|vnd\.(?:apple\.(?:keynote|numbers|pages)|ms-.+|oasis\.opendocument\..+|openxmlformats-officedocument\..+))$/;
+const ARCHIVE_MIME =
+  /^application\/(?:gzip|vnd\.rar|x-7z-compressed|x-gzip|x-rar-compressed|x-tar|x-zip-compressed|zip)$/;
+```
+
+字节嗅探(`classifyAttachmentBytes`)有四个关键判别:`:142-145` ZIP magic `0x504b0304/0102/0506` → archive,不论声明 MIME;`:129-141` UTF-16 BOM/启发式回填 charset;`:97-113` UTF-8 严格解码失败回退 windows-1252;`:150-160` 扩展名 + 首行 `,`/`\t` 推导 CSV/TSV。
+
+#### 18.2.3 大小/类型上限:三套独立常量表
+
+**模型侧**(发给 LLM 的载荷上限)—— `packages/media-core/src/constants.ts:2-8`:
+
+```ts
+export const MAX_IMAGE_BYTES = 6 * 1024 * 1024;     // 6 MB
+export const MAX_AUDIO_BYTES = 16 * 1024 * 1024;    // 16 MB
+export const MAX_VIDEO_BYTES = 16 * 1024 * 1024;    // 16 MB
+export const MAX_DOCUMENT_BYTES = 100 * 1024 * 1024; // 100 MB
+```
+
+**OpenResponses `input_file` 侧**(更严,文本类更小)—— `src/media/input-files.ts:128-136`:
+
+```ts
+export const DEFAULT_INPUT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
+const DEFAULT_INPUT_FILE_MAX_CHARS = 60_000;
+const DEFAULT_INPUT_MAX_REDIRECTS = 3;
+const DEFAULT_INPUT_TIMEOUT_MS = 10_000;
+```
+
+PDF 专属(`input-files.ts:138-142`):**4 页 / 400 万像素 / 200 字符阈值**(低于阈值保留纯文本,否则栅格化)。
+
+**入站附件侧**(更大,因为 channel 侧已经过 media cap)—— `src/media-understanding/file-extraction-limits.ts:20-23`:
+
+```ts
+const INBOUND_FILE_EXTRACTION_DEFAULT_MAX_MB = 20;
+const INBOUND_FILE_EXTRACTION_MAX_BYTES_CAP = 25 * 1024 * 1024;
+const INBOUND_FILE_EXTRACTION_DEFAULT_MAX_PAGES = 20;
+const INBOUND_FILE_EXTRACTION_MAX_PAGES_CAP = 150;
+```
+
+注释(`file-extraction-limits.ts:9-15`)解释了为什么 inbound 用 20MB 而 OpenResponses 用 5MB:**避免大 PDF 到 locked-down agent 时只看到 attachment marker 而看不到文档文本**。
+
+**Media-Understanding(图像理解/语音转写/视频理解)的默认阈值**—— `packages/media-understanding-common/src/defaults.ts:4-44`:
+
+```ts
+export const DEFAULT_MAX_BYTES: Record<MediaUnderstandingCapability, number> = {
+  image: 10 * MB, audio: 20 * MB, video: 50 * MB,
+};
+export const DEFAULT_TIMEOUT_SECONDS = { image: 60, audio: 60, video: 120 };
+export const DEFAULT_VIDEO_MAX_BASE64_BYTES = 70 * MB;   // base64 展开后上限
+export const DEFAULT_MEDIA_CONCURRENCY = 2;
+export const MIN_AUDIO_FILE_BYTES = 1024;                // < 1KB 不转写
+```
+
+**FFmpeg 转码缓冲**—— `src/media/ffmpeg-limits.ts:2`:10MB。
+
+#### 18.2.4 安全落盘:5MB × 0o700 × 2 分钟 TTL × 按 kind 分目录
+
+`src/media/store.ts:31` 全局 `MEDIA_MAX_BYTES = 5 MB`,`:48` 默认 TTL `2 分钟`;`:72-101` 用三层 `resolveMediaSubdir / resolveMediaScopedDir / resolveMediaRelativePath` 阻止子目录穿越(`".."`,绝对路径,Windows 盘符,空字节),且 `isPathInside` 二次校验:
+
+```ts
+// src/media/store.ts:80-100
+if (
+  subdir.includes("\0") ||
+  path.isAbsolute(subdir) || path.posix.isAbsolute(subdir) || path.win32.isAbsolute(subdir)
+) {
+  throw new Error(`${caller}: unsafe media subdir: ${JSON.stringify(subdir)}`);
+}
+if (!isPathInside(mediaDir, dir)) {
+  throw new Error(`${caller}: media subdir escapes media directory: ${JSON.stringify(subdir)}`);
+}
+```
+
+写入目录固定 `mode: 0o700`(`:164`);删除采用**按子目录隔离 TTL**:`prunePlaybackTranscodeCache:212` / `pruneOutboundMedia:330` / `cleanOldMedia:342`,快照场景还走 `pruneExpired` + LRU 大小双重预算。**SQLite 持有的 outgoing media 不被 TTL 触碰**(`pruneOutboundMedia:330-332` 注释 "SQLite-owned outgoing media")。
+
+`src/media/staged-inputs.ts` 是另一套独立目录:`media/inbound/openclaw-staged-<identity>/`,带**内容哈希识别**的 `.gitignore`(详见 `§18.1.10`),并参与 worktree 快照(`service.ts:575-590`)。
+
+#### 18.2.5 内容块组装:base64 vs URL × Anthropic/OpenAI 分流
+
+**Anthropic 路径**—— `src/media/anthropic-inline-images.ts:5-86`:
+
+```ts
+const ANTHROPIC_SUPPORTED_IMAGE_MIMES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
+const ANTHROPIC_INLINE_IMAGE_DECODE_SAFETY_BYTES = 10 * 1024 * 1024;
+
+// src/media/anthropic-inline-images.ts:34-56
+const canonicalData = canonicalizeBase64(block.data) ?? block.data.trim();
+const buffer = Buffer.from(canonicalData, "base64");
+const detectedMime = normalizeMimeType(await detectMime({ buffer }));
+if (isAnthropicSupportedImageMime(detectedMime)) { return { data: canonicalData, mimeType: detectedMime }; }
+// BMP→PNG,其他→JPEG
+const convertToPng = detectedMime === "image/bmp";
+const normalizedBuffer = convertToPng ? await convertImageToPng(buffer) : await convertImageToJpeg(buffer);
+if (normalizedBuffer.byteLength > ANTHROPIC_INLINE_IMAGE_DECODE_SAFETY_BYTES) {
+  throw new Error("Normalized Anthropic inline image exceeds the 10 MB decoded safety limit.");
+}
+```
+
+**任何声明 vs 字节探测的 MIME 不一致都按字节定**,BMP 强制转 PNG(其它统一 JPEG);超出 10MB 直接报错。HEIC→JPEG 转换同样在 `src/media/input-files.ts:302-308` 完成。
+
+**入站文件 → 文本** — `src/media/input-files.ts:420-475`:
+
+```ts
+// src/media/input-files.ts:431-448
+if (buffer.byteLength > limits.maxBytes) {
+  throw new Error(`File too large: ${buffer.byteLength} bytes (limit: ${limits.maxBytes} bytes)`);
+}
+const classification = params.classification ?? (await classifyAttachmentBytes({ buffer, declaredMime: params.mimeType }));
+const mimeType = classification.mime;
+const charset = classification.charset ?? params.charset;
+if (!limits.allowedMimes.has(mimeType)) {
+  throw new Error(`Unsupported file MIME type: ${mimeType}`);
+}
+// src/media/input-files.ts:450-471
+if (mimeType === "application/pdf") {
+  const extracted = await withInputFileTimeout({
+    label: "PDF extraction", timeoutMs: limits.timeoutMs,
+    task: extractPdfContent({ buffer, maxPages: limits.pdf.maxPages, maxPixels: limits.pdf.maxPixels,
+      minTextChars: limits.pdf.minTextChars, onImageExtractionError: (err) => logWarn(...) }),
+  });
+  const text = extracted.text ? truncateUtf16Safe(extracted.text, limits.maxChars) : "";
+  return { filename, text, images: extracted.images.length > 0 ? extracted.images : undefined };
+}
+const text = truncateUtf16Safe(decodeTextContent(buffer, charset), limits.maxChars);
+return { filename, text };
+```
+
+注意两个一致性细节:**MIME 校验在字节校验之前**(`:446-448` 抛 "Unsupported"),PDF 文本先 `truncateUtf16Safe(text, limits.maxChars)`,图片则单独走 `extracted.images`(PDF 栅格化的页图)。
+
+**fetch 的 SSRF/重定向/超时**—— `input-files.ts:200-244` 用 `fetchWithSsrFGuard` + `readResponseWithLimit`,UA 固定 `OpenClaw-Gateway/1.0`,redirect 上限 3,超时 10s。
+
+#### 18.2.6 截断与上限:三层 "InputFile → InboundAttachment → MediaUnderstanding"
+
+| 阶段 | 文件 | 关键常量 | 备注 |
+| --- | --- | --- | --- |
+| OpenResponses `input_image` | `input-files.ts:128` | 10MB | HEIC→JPEG |
+| OpenResponses `input_file` | `input-files.ts:130-132` | 5MB / 60k chars | PDF 4 页/4M px |
+| Inbound channel attachment | `file-extraction-limits.ts:20-23` | 20MB(≤25MB)/ 20 页(≤150) | 比 OpenResponses 宽松 |
+| Media store | `store.ts:31` | 5MB / 2 min TTL | 落盘,非直发 |
+| Anthropic inline | `anthropic-inline-images.ts:11` | 10MB | base64 解码后 |
+| Outbound image (channel) | `constants.ts:2` | 6MB | 渠道侧打包上限 |
+| MediaUnderstanding image | `defaults.ts:20` | 10MB | 调用理解模型前 |
+| MediaUnderstanding audio | `defaults.ts:21` | 20MB | < 1KB 不调(`MIN_AUDIO_FILE_BYTES`) |
+| MediaUnderstanding video | `defaults.ts:22` | 50MB | base64 展开 70MB |
+
+#### 18.2.7 截图与屏幕采集:frameId 去重
+
+OpenClaw 的"computer tool"(类似 laew 的屏幕/浏览器自动化)做了**很聪明的一手**:连续两帧像素相同时**不发第二张图**——只发一行文本 + 旧的 frameId。
+
+`src/agents/tools/computer-tool.ts:111-157`:
+
+```ts
+const deliverScreenshot = async (params) => {
+  const projected = await projectScreenshotResult({ capture, noteLines, target: params.resolved.target,
+    action, referenceWidth, modelHasVision: options?.modelHasVision });
+  const previousFrame = session.refreshUnchangedFrame({
+    target: params.resolved.target, capture: params.capture,
+    imageIdentity: projected.imageIdentity, modelHasVision: options?.modelHasVision });
+  if (previousFrame) {
+    const text = [
+      ...params.noteLines,
+      `screen unchanged since previous frame (frameId ${previousFrame.id}); screenshot omitted — keep using this frameId for coordinates`,
+    ].join("\n");
+    return { content: [{ type: "text", text }],
+      details: { node, action, screenIndex, frameId: previousFrame.id, refWidth: referenceWidth } };
+  }
+  session.bindDeliveredFrame({ resolved, capture, frameId: projected.frameId, toolCallId, imageIdentity, modelHasVision });
+  return projected.result;
+};
+```
+
+工具元数据 `catalogMode: "direct-only"`(`computer-tool.ts:164`)、注释解释原因:JSON 序列化会**丢失**模型可见的 screenshot block,而坐标动作依赖它。
+
+另外 `screenshot` action 后再做 `wait`、`click` 等动作时,会**主动重新截图**确保坐标参考(`computer-tool.ts:201-208`);但输入已落地后若再次截图失败,**不会让动作失败**(注释 `:256-257`),而是把错误追加到 result 文本。
+
+#### 18.2.8 渠道侧 adapter 差异:WebSocket 上限
+
+`src/gateway/chat-attachment-policy.ts:8-22` 给出了**所有渠道共享**的硬上限:
+
+```ts
+// src/gateway/chat-attachment-policy.ts:6-22
+const DEFAULT_CHAT_ATTACHMENT_MAX_MB = 20;
+// A chat.send frame carries attachments as base64 (4/3 expansion) plus the JSON envelope
+// and message text. Advertising more than one WS frame can carry lets the client encode
+// a payload the server hard-drops with 1009 for every pane.
+const WS_FRAME_ENVELOPE_SLACK_BYTES = 256 * 1024;
+const MAX_ADVERTISED_ATTACHMENT_BYTES = Math.floor(((MAX_PAYLOAD_BYTES - WS_FRAME_ENVELOPE_SLACK_BYTES) * 3) / 4);
+```
+
+`hello-ok.policy.attachments` 在握手时把 `maxBytes` / `maxImageBytes` 广播给所有客户端(注释解释:连接级上限,**不可逐消息重写**,因为它依赖具体 model/entrypoint)。Slack/Discord/Feishu 等渠道虽有自己的上传 API,但入站到 Gateway 之后**统一走 20MB/6MB 双限**(`resolveChatAttachmentPolicy:52-57`)。
+
+#### 18.2.9 对 laew 的借鉴(多模态)
+
+| 级别 | 建议 | 依据(openclaw) | laew 现状 |
+| --- | --- | --- | --- |
+| **P0** | **附件先落私有目录再发模型**:`<state>/media/<subdir>/<id>` `0o700`,TTL 2 分钟,按 kind 分目录,统一 base64 vs URL | `store.ts:31,72-101,164,330` | Read 工具直读 |
+| **P0** | **多套大小上限表**(`outbound 6MB / pdf 100MB / input_file 5MB / inbound 20MB`)按"用途 × kind"区分,而不是"一个全局上限" | `constants.ts:2-8`;`input-files.ts:128-142`;`file-extraction-limits.ts:20-23` | 无大小限制 |
+| **P0** | **HEIC/HEIF 必转 JPEG**、**BMP 转 PNG**,统一模型可消费格式;声明 vs 字节不一致按字节定 | `input-files.ts:302-308`;`anthropic-inline-images.ts:34-56` | 无 |
+| **P0** | **PDF 4 页 / 4M 像素 / 200 字符阈值**,栅格化失败也要保留文本路径 | `input-files.ts:138-142,450-471` | 无 PDF 解析 |
+| **P1** | **MIME 字节嗅探 + ZIP magic 兜底**(magic `0x504b0304` 强制 archive) | `attachment-classify.ts:142-145` | 无 |
+| **P1** | **截图 frameId 去重**(像素相同不发图,只发 frameId) | `computer-tool.ts:111-157` | 无截图能力 |
+| **P1** | **`hello-ok.policy.attachments` 广播上限**,避免 1009 frame too big 雪崩 | `chat-attachment-policy.ts:8-22` | TUI 无此问题 |
+| **P2** | **< 1KB 音频不调转写**,避免空跑;视频 base64 展开 70MB 上限 | `defaults.ts:38,44` | 无 |
+| **P2** | **暂存目录写内容哈希 `.gitignore`**(避免附件污染仓库 diff + 跨 worktree 复活) | `staged-inputs.ts:6-12,140-147` | 无 |
+

@@ -23,6 +23,7 @@
 11. [Web API 层深度](#11-web-api-层深度)
 12. [拦截器与 Mock 系统深度](#12-拦截器与-mock-系统深度)
 13. [对 laew 的借鉴(HTTP 客户端设计参考)](#13-对-laew-的借鉴)
+14. [第七轮深挖 — 连接池 KeepAlive 生命周期 + HTTP/2 多路复用 + DiagnosticsChannel 可观测性 + 背压与 Body 流控](#14-第七轮深挖--连接池-keepalive-生命周期--http2-多路复用--diagnosticschannel-可观测性--背压与-body-流控)
 
 ---
 
@@ -7829,3 +7830,1358 @@ const abort = (reason) => controller.abort(reason)    // L2231
 | **P2** | trailer 通道 | `undici:request:trailers` 单独通道,便于区分 headers/trailers | diagnostics.js:19 |
 | **P2** | sendHeaders 时机 | 字节级 sendHeaders publish,可做慢请求探测 | client-h2.js:1221-1226 |
 | **P2** | GC 泄漏防护 | 长 fetch 期间 AbortController 引用链——laew 用 reqwest 不直接踩,但要给 LLM 长流留 hint | fetch/index.js:293,415,470 |
+
+---
+
+## 14. 第七轮深挖 — 连接池KeepAlive生命周期 + HTTP/2多路复用 + DiagnosticsChannel可观测性 + 背压与Body流控
+
+> **本轮定位**:前六轮已覆盖 Dispatcher 分层、llhttp WASM、5 种 API、8 个拦截器、Mock、Web 标准、错误类、FastTimer、HTTP 传输层、fetch 全链路、GOAWAY 重放预算、Happy Eyeballs、13/17 个诊断通道、fetch 中断。
+> 本轮只挖**四个未覆盖或覆盖过浅的切面**,全部结论直接来自源码行号。
+>
+> **源码基线**:`/usr/local/LsmGitOpenSource/undici` @ `f5320831e0f429a5ffddffb98ddb319d02732df2`(2026-09-02),`package.json` version `8.10.1`。
+> 与第五轮同一 commit,因此行号体系一致,可直接交叉引用第五轮 A~F 节。
+
+### 14.0 本轮结论速览(4 个维度 × 关键数字)
+
+| 维度 | 本轮新挖出的关键事实 | 主要源码位置 |
+|---|---|---|
+| ① 连接池 / Keep-Alive | 三类超时其实是**五类**;`keepAliveTimeout` 默认 **4s**、`keepAliveMaxTimeout` **600s**、`keepAliveTimeoutThreshold` **2s**;服务端 `Keep-Alive: timeout=N` 会被 **减去 2s 阈值再夹到 600s**;空闲复用前先跑一次 **idle socket validation**(GHSA-35p6-xmwp-9g52) | `client.js:305-317`、`client-h1.js:682-700,1062-1078` |
+| ② HTTP/2 多路复用 | h2 默认 `maxConcurrentStreams=100`(对齐 Node h2 server)、`initialWindowSize=262144`(Node 默认 65535 的 4 倍)、`connectionWindowSize=524288`、`pingInterval=60000`;`Pool` **connections 不限**会彻底打散 h2 多路复用 | `client.js:324-337`、`client-h2.js:255-263`、Pool.md:76-81 |
+| ③ DiagnosticsChannel | 实际是 **18 个通道**(17 个在 `diagnostics.js` + 1 个 `undici:request:pending-requests` 在 dedupe 拦截器);全部 `publish` 点被 `hasSubscribers` 守门;**源码内零 OpenTelemetry 依赖** | `diagnostics.js:10-32`、`deduplicate.js:8,101-111` |
+| ④ 背压与 Body 流控 | `bodyTimeout` 是**空闲超时而非总超时**(每收到一个 chunk 就 refresh,且消费者 pause 期间不触发);`body` 不可重放由 `isDisturbed()` + `BodyAsyncIterable` 的 `assert(!used)` 双保险拦截 | `client-h1.js:728-756,833-854`、`util.js:613-616,17-27` |
+
+---
+
+### 14.1 维度一:连接池与 Keep-Alive 全生命周期
+
+#### 14.1.1 三层容器拓扑(Pool → Client → HTTPContext)
+
+undici 的连接池不是"一个 socket 数组",而是**三层嵌套 + 每层一套队列**:
+
+```
+Agent (lib/dispatcher/agent.js:24)          ← 按 origin 分桶(kClients: Map<origin, Pool>)
+  └─ Pool / PoolBase (pool-base.js:21)      ← kClients: Client[] + [kQueue]: FixedQueue(无界)
+       └─ Client (client.js:102)            ← kQueue: Array 三段式(complete|running|pending)
+            └─ HTTPContext (client-h1.js:861 / client-h2.js:249)
+                 └─ net.Socket / http2.ClientHttp2Session
+```
+
+**关键**:排队发生在**两层**。`Pool` 用 `FixedQueue`(`pool-base.js:22`)承接"拿不到空闲 Client"的请求;`Client` 用三段式数组队列承接"拿不到并发额度"的请求。两层队列的返回值共同决定 `dispatch()` 的布尔语义(是否 drain)。
+
+```javascript
+// lib/dispatcher/pool-base.js:157-170
+[kDispatch] (opts, handler) {
+  const dispatcher = this[kGetDispatcher]()
+  if (!dispatcher) {
+    this[kNeedDrain] = true
+    this[kQueue].push({ opts, handler })     // ← Pool 层排队
+    this[kQueued]++
+  } else if (!dispatcher.dispatch(opts, handler)) {
+    dispatcher[kNeedDrain] = true
+    this[kNeedDrain] = !this[kHasDispatcher]()
+  }
+  return !this[kNeedDrain]                   // ← 返回 false 表示"请等 drain"
+}
+```
+
+`Client` 层的三段式队列注释本身就是设计文档:
+
+```javascript
+// lib/dispatcher/client.js:339-350
+// kQueue is built up of 3 sections separated by
+// the kRunningIdx and kPendingIdx indices.
+// |   complete   |   running   |   pending   |
+//                ^ kRunningIdx ^ kPendingIdx ^ kQueue.length
+// kRunningIdx points to the first running element.
+// kPendingIdx points to the first pending element.
+// This implements a fast queue with an amortized
+// time of O(1).
+this[kQueue] = []
+this[kRunningIdx] = 0
+this[kPendingIdx] = 0
+```
+
+三个派生计数器(全部 O(1),靠下标差算):
+
+| 指标 | 定义 | 源码 |
+|---|---|---|
+| `kPending` | `kQueue.length - kPendingIdx`(已入队未发出) | `client.js:369-371` |
+| `kRunning` | `kPendingIdx - kRunningIdx`(已发出未完成) | `client.js:373-375` |
+| `kSize` | `kQueue.length - kRunningIdx`(= running + pending) | `client.js:377-379` |
+
+队列压缩(避免数组无限增长):每当 `kRunningIdx > 256` 就 splice 掉已完成段:
+
+```javascript
+// lib/dispatcher/client.js:653-657
+if (client[kRunningIdx] > 256) {
+  client[kQueue].splice(0, client[kRunningIdx])
+  client[kPendingIdx] -= client[kRunningIdx]
+  client[kRunningIdx] = 0
+}
+```
+
+> **对 laew 的映射**:reqwest/hyper 的连接池是"扁平"的(per-host 一个 idle 队列 + 一个 waiter 队列),没有 undici 这种"Pool 层再排一次"的二级结构。laew 若将来要自己做 provider 级限流(每 provider N 并发),undici 的 `[kNeedDrain]` 布尔回压协议(返回 `false` = 我满了,等我 `drain` 事件)比"抛错/无限排队"更值得抄。
+
+#### 14.1.2 pipelining 开关:一个开关,两种语义
+
+`pipelining` 是**唯一**控制连接复用的开关,但在 h1 / h2 下含义完全不同。undici 在 `client.js:87-97` 专门写了注释说明:
+
+```javascript
+// lib/dispatcher/client.js:73-97
+function getPipelining (client) {
+  return client[kPipelining] ?? client[kHTTPContext]?.defaultPipelining ?? 1
+}
+
+// Protocol-aware dispatch ceiling. h1 RFC7230 pipelining is unrelated to h2
+// stream multiplexing — over h2 the ceiling is the (server-confirmed)
+// maxConcurrentStreams. Before a context is attached we use the h1
+// pipelining factor; once h2 attaches the queued requests can drain in
+// one batch up to maxConcurrentStreams.
+function getMaxConcurrent (client) {
+  if (client[kHTTPContext]?.version === 'h2') {
+    return client[kMaxConcurrentStreams]
+  }
+  return getPipelining(client)
+}
+```
+
+| 协议 | `defaultPipelining` | 并发上限来源 | 源码 |
+|---|---|---|---|
+| h1 | `1` | `pipelining`(默认 1) | `client-h1.js:895` |
+| h2 | `Infinity` | `kMaxConcurrentStreams`(远端 SETTINGS 确认值) | `client-h2.js:318` |
+| h2c(明文 h2) | `pipelining` 默认 `100`,且不得 > `maxConcurrentStreams` | `maxConcurrentStreams` | `h2c-client.js:21-44` |
+
+默认值的落点:
+
+```javascript
+// lib/dispatcher/client.js:305
+this[kPipelining] = pipelining != null ? pipelining : 1
+```
+
+**`pipelining = 1` 的真实含义**:不是"禁止复用",而是"同一时刻一条连接上只允许 1 个 in-flight 请求"。请求完成后 socket 仍会回到 idle 池(见 14.1.6)。`pipelining = 0` 才是"发完就关":
+
+```javascript
+// lib/dispatcher/client-h1.js:1316-1328
+if (upgrade) {
+  header += 'connection: upgrade\r\nupgrade: ' + upgrade + '\r\n'
+} else if (client[kPipelining] && !socket[kReset]) {
+  header += 'connection: keep-alive\r\n'
+} else {
+  header += 'connection: close\r\n'   // ← pipelining=0 走这里
+}
+```
+
+> **注意历史包袱**:`keepAlive` 选项已被**硬删除**,传了直接抛错:
+> ```javascript
+> // lib/dispatcher/client.js:143-145
+> if (keepAlive !== undefined) {
+>   throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
+> }
+> ```
+> 同理 `socketTimeout` / `requestTimeout` / `idleTimeout` / `maxKeepAliveTimeout` 全部抛错(`client.js:147-161`),引导用户改用 `headersTimeout` + `bodyTimeout` + `keepAliveTimeout`。这是"用编译期/启动期报错强制分层超时"的范式。
+
+#### 14.1.3 connections 上限、扩容与排队(Pool 侧)
+
+`Pool` 的 `connections` **默认 `null` = 不限**(Pool.md:57-59)。扩容逻辑在 `[kGetDispatcher]`:
+
+```javascript
+// lib/dispatcher/pool.js:99-118
+[kGetDispatcher] () {
+  const clientTtlOption = this[kOptions].clientTtl
+  for (let i = 0; i < this[kClients].length; i++) {
+    const client = this[kClients][i]
+    // check ttl of client and if it's stale, remove it from the pool
+    if (clientTtlOption != null && clientTtlOption > 0 && client.ttl && ((Date.now() - client.ttl) > clientTtlOption)) {
+      this[kRemoveClient](client)
+      i--
+    } else if (!client[kNeedDrain]) {
+      return client                       // ← 找到第一个"不忙"的 Client
+    }
+  }
+  if (!this[kConnections] || this[kClients].length < this[kConnections]) {
+    const dispatcher = this[kFactory](this[kUrl], this[kOptions])
+    this[kAddClient](dispatcher)           // ← 按需扩容(懒建连)
+    return dispatcher
+  }
+  // 返回 undefined → 调用方进 FixedQueue 排队
+}
+```
+
+三个要点:
+
+1. **扩容是"按并发按需"**:`connections` 不限制"池里有多少连接",只限制"最多能建多少"。空闲连接不会被主动回收(除非设 `clientTtl`)。
+2. **`clientTtl` 是唯一的老化机制**(默认 `null` = 永不淘汰,Pool.md:60-62),淘汰时机是**借出时惰性检查**(`pool.js:105`),不是后台定时扫描 —— 零定时器开销。
+3. **TTL 起点是 `connect` 事件**,不是创建时间:
+   ```javascript
+   // lib/dispatcher/pool.js:76-82
+   this.on('connect', (origin, targets) => {
+     if (clientTtl != null && clientTtl > 0) {
+       for (const target of targets) {
+         Object.assign(target, { ttl: Date.now() })
+       }
+     }
+   })
+   ```
+
+`RoundRobinPool`(`round-robin-pool.js:94-131`)是另一种选取策略:**优先复用已有连接**(Round-Robin 轮询),只有全部 busy 时才扩容。与 `Pool` 的"找第一个不忙的"相比,负载更均匀但扫描成本 O(n)。`BalancedPool`(`balanced-pool.js:48-70`)则给 upstream 加权重 + 错误惩罚(`maxWeightPerServer=100`、`errorPenalty=15`)。
+
+#### 14.1.4 五类超时的默认值与交互(核心表)
+
+任务书说"三类",实际 undici 有 **5 个**独立超时旋钮 + **2 个**内部派生超时,共 7 个时间量:
+
+| 超时 | 默认值 | 作用对象 | 触发后的行为 | 源码 |
+|---|---|---|---|---|
+| `connectTimeout` | **10_000 ms** | TCP/TLS 建连 | `ConnectTimeoutError`,整条连接的 pending 请求全部 fail | `connect.js:69`、`util.js:863+` |
+| `headersTimeout` | **300_000 ms** | 从写完请求 → 收到响应头 | `HeadersTimeoutError`,**销毁 socket** | `client.js:317`、`client-h1.js:1133-1137`、`client-h1.js:843-845` |
+| `bodyTimeout` | **300_000 ms** | 响应体**两个 chunk 之间的空闲** | `BodyTimeoutError`,销毁 socket | `client.js:316`、`client-h1.js:654-658` |
+| `keepAliveTimeout` | **4_000 ms** | 连接空闲(零 in-flight)后可存活时间 | `InformationalError('socket idle timeout')`,**正常关闭** | `client.js:307`、`client-h1.js:1128` |
+| `keepAliveMaxTimeout` | **600_000 ms** | 服务端 `Keep-Alive: timeout=N` 的**夹取上限** | —— (只参与计算) | `client.js:308`、`client-h1.js:686-688` |
+| `keepAliveTimeoutThreshold` | **2_000 ms** | 从服务端 `timeout=N` 里**预留的安全余量** | —— (只参与计算) | `client.js:309`、`client-h1.js:687` |
+| `noStreamsTimeout`(h2 内部) | = `headersTimeout` | h2 对端把 `MAX_CONCURRENT_STREAMS` 报 0 时 | `HeadersTimeoutError` + 丢弃 session | `client-h2.js:446-481` |
+
+默认值的落点(逐行):
+
+```javascript
+// lib/dispatcher/client.js:305-317
+this[kPipelining] = pipelining != null ? pipelining : 1
+this[kKeepAliveDefaultTimeout] = keepAliveTimeout == null ? 4e3 : keepAliveTimeout        // 4000
+this[kKeepAliveMaxTimeout] = keepAliveMaxTimeout == null ? 600e3 : keepAliveMaxTimeout    // 600000
+this[kKeepAliveTimeoutThreshold] = keepAliveTimeoutThreshold == null ? 2e3 : keepAliveTimeoutThreshold // 2000
+this[kKeepAliveTimeoutValue] = this[kKeepAliveDefaultTimeout]
+// ...
+this[kBodyTimeout] = bodyTimeout != null ? bodyTimeout : 300e3        // 300000
+this[kHeadersTimeout] = headersTimeout != null ? headersTimeout : 300e3
+```
+
+```javascript
+// lib/core/connect.js:68-70
+const sessionCache = new SessionCache(maxCachedSessions == null ? 100 : maxCachedSessions)
+timeout = timeout == null ? 10e3 : timeout        // connectTimeout 默认 10s
+allowH2 = allowH2 != null ? allowH2 : true
+```
+
+**交互关系(最容易踩坑的三点)**:
+
+1. **`headersTimeout` → `bodyTimeout` 是"切换"不是"叠加"**。收到响应头后立刻把同一个 parser timer 切成 BODY 模式:
+   ```javascript
+   // lib/dispatcher/client-h1.js:654-662
+   if (this.statusCode >= 200) {
+     const bodyTimeout = request.bodyTimeout != null ? request.bodyTimeout : client[kBodyTimeout]
+     this.setTimeout(bodyTimeout, TIMEOUT_BODY)
+   } else if (this.timeout) {
+     if (this.timeout.refresh) { this.timeout.refresh() }   // 1xx 中间响应:只续期不切换
+   }
+   ```
+2. **`bodyTimeout` 每收到一个 chunk 就 refresh**,所以它是**空闲超时**,不是"整个响应体必须在 300s 内下完":
+   ```javascript
+   // lib/dispatcher/client-h1.js:728-756 (onBody)
+   assert(this.timeoutType === TIMEOUT_BODY)
+   if (this.timeout) { if (this.timeout.refresh) { this.timeout.refresh() } }
+   ```
+   而且**消费者 pause 期间不触发** body timeout(见 14.4.3)。
+3. **空闲超时只在"零 in-flight"时启动**,且用 `kKeepAliveTimeoutValue`(可能已被服务端值覆盖):
+   ```javascript
+   // lib/dispatcher/client-h1.js:1125-1130
+   if (client[kSize] === 0) {
+     if (socket[kParser].timeoutType !== TIMEOUT_KEEP_ALIVE) {
+       socket[kParser].setTimeout(client[kKeepAliveTimeoutValue], TIMEOUT_KEEP_ALIVE)
+     }
+   }
+   ```
+
+#### 14.1.5 Keep-Alive 生命周期:服务端 `Keep-Alive: timeout=N` 的协商
+
+这是 undici 池化里最精细的一段 —— 客户端会**读取服务端声明的空闲时长**,减掉安全余量,再夹到上限:
+
+```javascript
+// lib/dispatcher/client-h1.js:678-700
+if (this.shouldKeepAlive && client[kPipelining]) {
+  const keepAliveTimeout = this.keepAlive ? util.parseKeepAliveTimeout(this.keepAlive) : null
+  if (keepAliveTimeout != null) {
+    const timeout = Math.min(
+      keepAliveTimeout - client[kKeepAliveTimeoutThreshold],   // 减 2s 余量
+      client[kKeepAliveMaxTimeout]                             // 夹到 600s
+    )
+    if (timeout <= 0) {
+      socket[kReset] = true        // 服务端给的窗口太短 → 这条连接直接判死,不再复用
+    } else {
+      client[kKeepAliveTimeoutValue] = timeout
+    }
+  } else {
+    client[kKeepAliveTimeoutValue] = client[kKeepAliveDefaultTimeout]   // 回到默认 4s
+  }
+} else {
+  socket[kReset] = true            // 服务端说 close,或 pipelining=0
+}
+```
+
+`parseKeepAliveTimeout` 只认 `timeout=<digits>`,单位秒:
+
+```javascript
+// lib/core/util.js:392-400
+const KEEPALIVE_TIMEOUT_EXPR = /timeout=(\d+)/
+function parseKeepAliveTimeout (val) {
+  const m = val.match(KEEPALIVE_TIMEOUT_EXPR)
+  return m ? parseInt(m[1], 10) * 1000 : null
+}
+```
+
+**为什么要减 2s**:服务端在自己的窗口到期时会主动 FIN/RST;客户端若卡在边界上复用,就会在"刚发出请求头"时撞上服务端关闭 —— 这是经典的 `ECONNRESET` 竞态。减一个 threshold 让客户端**先于**服务端放弃这条连接。
+
+**HEAD 方法的特例**(llhttp 不允许 HEAD keepAlive,undici 强行覆盖):
+
+```javascript
+// lib/dispatcher/client-h1.js:649-652
+this.shouldKeepAlive = (
+  shouldKeepAlive ||
+  // Override llhttp value which does not allow keepAlive for HEAD.
+  (request.method === 'HEAD' && !socket[kReset] && this.connectionKeepAlive)
+)
+```
+
+但 HEAD 之后仍会 `socket[kReset] = true`(`client-h1.js:1290`),以兼容"给 HEAD 回 body 的错误服务器"。即 **HEAD 请求永远独占一条连接**。
+
+**`maxRequestsPerClient`**:一条连接最多服务多少个请求(默认 `undefined` = 不限),计数器挂在 socket 上:
+
+```javascript
+// lib/dispatcher/client.js:566-567
+socket[kCounter] = 0
+socket[kMaxRequests] = client[kMaxRequests]
+// lib/dispatcher/client-h1.js:1303-1306
+if (client[kMaxRequests] && ++socket[kCounter] >= client[kMaxRequests]) {
+  socket[kReset] = true
+}
+```
+
+#### 14.1.6 空闲复用前的"探活":idle socket validation(GHSA-35p6-xmwp-9g52)
+
+复用一条 idle keep-alive socket 之前,undici **先让出一次 check phase**,让内核里已排队的 FIN/RST/乱序字节先被处理掉,再写请求头。否则会撞上"服务端已关但客户端不知道"的复用竞态(安全公告 GHSA-35p6-xmwp-9g52):
+
+```javascript
+// lib/dispatcher/client-h1.js:1062-1078
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  })
+}
+```
+
+配套的 `busy()` 会把"探活中"的连接标记为 busy,防止同一条 socket 被并发复用:
+
+```javascript
+// lib/dispatcher/client-h1.js:924-926
+busy (request) {
+  if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
+    return true
+  }
+  // ... 非幂等 / upgrade / 流式 body 的串行化(见 14.1.10)
+}
+```
+
+> 这段注释极有价值:**它记录了三次迭代的性能权衡** —— `setTimeout(0)` 有 ~1ms timer floor(#5493);`setImmediate().unref()` 会让 poll 阻塞 ~500ms(#5600/#5606);最终选 ref'd `setImmediate`。这是"正确性优先、但用 event loop 知识把开销压到 0"的范例。
+
+#### 14.1.7 socket 错误后的队列排空与重建
+
+`Client` 有两个错误入口,语义完全不同:
+
+**(a) 连接期错误**(`handleConnectError`,`client.js:596-636`):只在 `ERR_TLS_CERT_ALTNAME_INVALID` 时精确排空 running + 匹配 servername 的 pending;其余交给 `onError`:
+
+```javascript
+// lib/dispatcher/client.js:619-633
+if (err.code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
+  const running = client[kQueue].splice(client[kRunningIdx], client[kRunning])
+  client[kPendingIdx] = client[kRunningIdx]
+  for (let i = 0; i < running.length; i++) { util.errorRequest(client, running[i], err) }
+  while (client[kPending] > 0 && client[kQueue][client[kPendingIdx]].servername === client[kServerName]) {
+    const request = client[kQueue].splice(client[kPendingIdx], 1)[0]
+    util.errorRequest(client, request, err)
+  }
+} else {
+  onError(client, err)      // ← 通用路径
+}
+client.emit('connectionError', client[kUrl], [client], err)
+```
+
+**(b) 通用错误**(`onError`,`client.js:469-490`):**只在"没有 in-flight 请求"且"不是可恢复 socket 错误"时**才排空队列 —— 即"这条连接还没开始干活就挂了,所有排队的请求都没指望了":
+
+```javascript
+// lib/dispatcher/client.js:469-490
+function onError (client, err) {
+  if (client[kRunning] === 0 && err.code !== 'UND_ERR_INFO' && err.code !== 'UND_ERR_SOCKET') {
+    // Error is not caused by running request and not a recoverable socket error.
+    assert(client[kPendingIdx] === client[kRunningIdx])
+    const requests = client[kQueue].splice(client[kRunningIdx])
+    for (let i = 0; i < requests.length; i++) {
+      if (requests[i] != null) { util.errorRequest(client, requests[i], err) }
+    }
+    assert(client[kSize] === 0)
+  }
+}
+```
+
+`UND_ERR_INFO` / `UND_ERR_SOCKET` 被**故意放过** —— 它们是"连接已建立但 idle 超时/被服务端 reset"这类**可恢复**错误,队列保持不动,由 `_resume()` 重新建连后继续消费。
+
+**Pool 层的错误摘除**(与 `Client.onError` 互补):
+
+```javascript
+// lib/dispatcher/pool.js:84-96
+this.on('connectionError', (origin, targets, error) => {
+  // If a connection error occurs, we remove the client from the pool,
+  // and emit a connectionError event. They will not be re-used.
+  // Fixes https://github.com/nodejs/undici/issues/3895
+  for (const target of targets) {
+    // Do not use kRemoveClient here, as it will close the client,
+    // but the client cannot be closed in this state.
+    const idx = this[kClients].indexOf(target)
+    if (idx !== -1) { this[kClients].splice(idx, 1) }
+  }
+})
+```
+
+> 注意这里的注解:**"client 在这个状态下不能 close"** —— 只做 splice 摘除,让 GC 回收。这是"错误路径上不要调用可能抛异常的清理逻辑"的典型取舍。
+
+**重建**:摘除后 `client[kHTTPContext] = null`,下一次 `_resume()` 走到 `if (!client[kHTTPContext]) { connect(client); return }`(`client.js:719-723`)自动重建。
+
+#### 14.1.8 `destroy` / `close` / `drain` 三者语义差异
+
+| 概念 | 语义 | Promise 完成条件 | 排队请求命运 | 源码 |
+|---|---|---|---|---|
+| `destroy(err)` | **立即**终止。不等任何 in-flight,直接 fail 掉所有 pending | 所有子 Client destroy 完成 | **全部 fail**(`onResponseError(null, err)`) | `dispatcher-base.js:114-160`、`pool-base.js:141-155` |
+| `close()` | **优雅**排空。等队列跑完,再 destroy | 队列空 → 逐个 `client.close()` → `destroy()` | **继续跑完** | `dispatcher-base.js:68-112`、`pool-base.js:124-139` |
+| `drain` | **不是操作,是事件**。由 Pool 在"从满变不满"时 emit | —— | —— | `client.js:638-641`、`pool-base.js:46-49` |
+
+`close()` 的实现(`dispatcher-base.js:109-111`)是 `close → destroy` 的串联,注释写着 `// Should not error.`:
+
+```javascript
+// lib/dispatcher/dispatcher-base.js:96-112
+this[kClosed] = true
+this[kOnClosed] ??= []
+this[kOnClosed].push(callback)
+const onClosed = () => { /* 触发所有回调 */ }
+// Should not error.
+this[kClose]()
+  .then(() => this.destroy())
+  .then(() => queueMicrotask(onClosed))
+```
+
+`Pool` 的 `close()` 若队列非空则挂起等待,由 `[kOnDrain]` 在队列清空时兑现:
+
+```javascript
+// lib/dispatcher/pool-base.js:51-61
+if (this[kClosedResolve] && queue.isEmpty()) {
+  const closeAll = []
+  for (let i = 0; i < this[kClients].length; i++) {
+    const client = this[kClients][i]
+    if (!client.destroyed) { closeAll.push(client.close()) }
+  }
+  return Promise.all(closeAll).then(this[kClosedResolve])
+}
+```
+
+`drain` 事件的产生(`client.js:638-641`)是一个"0 → 1 → 2"的三态机(`[kNeedDrain]`: 0=idle, 1=scheduled, 2=resuming):
+
+```javascript
+// lib/dispatcher/client.js:638-641
+function emitDrain (client) {
+  client[kNeedDrain] = 0
+  client.emit('drain', client[kUrl], [client])
+}
+```
+
+#### 14.1.9 CONNECT 代理隧道下的池化差异
+
+`ProxyAgent`(`proxy-agent.js:109`)有**两套连接体系**,池化语义完全不同:
+
+**(a) 到代理自身的连接** —— 默认用 `Pool`(可池化):
+
+```javascript
+// lib/dispatcher/proxy-agent.js:29-31
+function defaultFactory (origin, opts) {
+  return new Pool(origin, opts)
+}
+// lib/dispatcher/proxy-agent.js:196
+this[kClient] = clientFactory(url, { connect })
+```
+
+**(b) 隧道建立后** —— socket **被"升级"成到目标的 TLS 连接,永久离开代理池**:
+
+```javascript
+// lib/dispatcher/proxy-agent.js:228-256
+const { socket, statusCode } = await this[kClient].connect(connectParams)
+if (statusCode !== 200) {
+  socket.on('error', noop).destroy()
+  callback(new RequestAbortedError(`Proxy response (${statusCode}) !== 200 when HTTP Tunneling`))
+  return
+}
+// ...
+const connectEndpoint = opts.allowH2 === false ? this[kConnectEndpointHTTP1] : this[kConnectEndpoint]
+connectEndpoint({ ...opts, servername, httpSocket: socket }, callback)
+```
+
+`httpSocket: socket` 传给 `tls.connect()`(`connect.js:93`),Node 会在**同一个 fd** 上叠 TLS。也就是说:**一条隧道 = 一条目标连接,不复用给别的目标**;可复用的只有"到代理的 TCP/TLS 连接"(在 `this[kClient]` 这个 Pool 里)。
+
+**(c) 非隧道(纯 http 目标)走绝对 URI 转发** —— 用的是**单个 `Client` 而非 Pool**,且必须重写 `path` 为绝对 URI:
+
+```javascript
+// lib/dispatcher/proxy-agent.js:39-41
+function shouldProxyTunnel (requestProtocol, proxyTunnel) {
+  return proxyTunnel === true || requestProtocol !== 'http:'
+}
+// lib/dispatcher/proxy-agent.js:63-65  (Http1ProxyWrapper)
+this.#client = new Client(proxyUrl, { connect })
+// lib/dispatcher/proxy-agent.js:84
+opts.path = origin + path
+```
+
+并且**连接级**的 keep-alive 请求头由 `connections` 决定:
+
+```javascript
+// lib/dispatcher/proxy-agent.js:223
+...(opts.connections == null || opts.connections > 0 ? { 'proxy-connection': 'keep-alive' } : {})
+```
+
+> **结论**:在代理隧道模式下,undici 的"连接池"退化成"到代理的连接池";到目标的连接每条隧道独占。这意味着**代理场景下 `Pool.connections` 的调优目标变成了"到代理的并发数"**,而不是到目标的。
+
+#### 14.1.10 h1 的串行化约束:非幂等 / upgrade / 流式 body
+
+`busy()` 里三条规则(`client-h1.js:928-950`)决定了 h1 管道化下"哪些请求必须独占连接":
+
+```javascript
+// lib/dispatcher/client-h1.js:928-950
+if (request) {
+  if (client[kRunning] > 0 && !request.idempotent) {
+    // Non-idempotent request cannot be retried.
+    return true
+  }
+  if (client[kRunning] > 0 && (request.upgrade || request.method === 'CONNECT')) {
+    // Don't dispatch an upgrade until all preceding requests have completed.
+    return true
+  }
+  if (client[kRunning] > 0 && util.bodyLength(request.body) !== 0 &&
+    (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))) {
+    // Request with stream or iterator body can error while other requests
+    // are inflight and indirectly error those as well.
+    return true
+  }
+}
+```
+
+h2 **不受此限**,注释明确说明:
+
+```javascript
+// lib/dispatcher/client-h2.js:365-370
+// Unlike HTTP/1.1 pipelining, HTTP/2 multiplexes requests on
+// independent streams, so non-idempotent requests can be dispatched
+// concurrently. Retry eligibility is handled by stream/session error
+// handling instead of by serializing all non-idempotent requests.
+```
+
+`idempotent` 的默认判定:
+
+```javascript
+// lib/core/request.js:227-230
+this.idempotent = idempotent == null
+  ? method === 'HEAD' || method === 'GET' || method === 'QUERY'
+  : idempotent
+```
+
+> **注意**:undici **没有** `Idempotent-Request` 头(那是 IETF draft 的东西,源码 grep 零命中)。它的幂等性判定是**本地的、纯 method 驱动的**,不参与线上协商。
+
+#### 14.1.11 对 laew 的借鉴(维度一)
+
+laew 现状:`src/llm/openai.rs:38` 与 `src/llm/anthropic.rs:38` 各 `reqwest::Client::new()`,`Cargo.toml:23` 只开了 `["json", "rustls-tls"]`,`default-features = false`。**零池化调优、零超时、每个 client 一个独立连接池**。
+
+| # | 借鉴项 | undici 依据 | reqwest / Rust 侧落地 |
+|---|---|---|---|
+| P0-1 | **共享一个 `reqwest::Client`**(按 provider 或全局单例),不要每个 LLM client 建一个 | undici 一个 `Pool` 管一个 origin 的所有连接 | 把 `reqwest::Client` 放进 `Arc` 传给 `OpenAiClient` / `AnthropicClient`;`Client::clone()` 本身就是共享连接池(廉价) |
+| P0-2 | **设 `pool_idle_timeout`**。undici 默认 4s 是"宁可重连也不要用死连接";reqwest 默认 90s 太久 | `client.js:307` | `ClientBuilder::new().pool_idle_timeout(Duration::from_secs(15))`(LLM 场景建议 15~30s:比 4s 省 TLS 握手,比 90s 更不容易撞服务端 FIN) |
+| P0-3 | **设 `pool_max_idle_per_host`**,避免长尾 provider 攒一堆僵尸连接 | `Pool.connections`(`pool.js:113`) | `ClientBuilder::new().pool_max_idle_per_host(8)`(laew 是单 host 多 provider,按 provider 数取 `min(provider_count, 8)`) |
+| P0-4 | **`connect_timeout` 显式 10s**(对齐 undici) | `connect.js:69` | `.connect_timeout(Duration::from_secs(10))` |
+| P0-5 | **把"总超时"换成"分层超时"** | `client.js:147-161` 主动废弃 `requestTimeout` | 不要只设 `reqwest::ClientBuilder::timeout()`(它是 total,会误杀长 SSE 流)。改为:连接超时 10s + **首字节超时** + **chunk 间空闲超时**(见维度四) |
+| P1-1 | **`hasSubscribers` 式零开销开关**:可观测性埋点先查开关再构造 payload | `client.js:515` | Rust 侧用 `tracing::enabled!(Level::INFO)` 或 `Span::is_none()` 守门,避免无监听器时仍 `format!` |
+| P1-2 | **空闲复用前的探活** | `client-h1.js:1062-1078` | hyper 已内置 `pool_idle_timeout` + 复用前检测;但 laew 若自建连接池,必须做"复用前先 poll 一次" |
+| P1-3 | **不可恢复错误才排空队列,可恢复错误保留队列** | `client.js:469-490` | laew 重试层区分 `is_retryable(err)`:连接期错误保留待发队列,协议/序列化错误直接 fail |
+| P2-1 | **clientTtl 惰性淘汰**(借出时检查,不用定时器) | `pool.js:105-111` | 自建池时用 `Instant` 打戳 + 借出时比对,零后台任务 |
+| P2-2 | **代理/隧道下池化目标变成"到代理的连接"** | `proxy-agent.js:196,228-256` | laew 若支持企业代理,连接池指标要按 proxy 维度而非 target 维度统计 |
+
+
+---
+
+### 14.2 维度二:HTTP/2 与多路复用
+
+> **前置说明**:第五轮 B 节(h2:GOAWAY 重放预算与并发流)已经覆盖了 GOAWAY 处理、`registerGoAwayRefusal` 的 RFC 9113 §8.7 预算、`session.closed` 后 `pendingIdx` 重对齐等。本节**只补充**该节未覆盖的 5 个子维度:SETTINGS 默认值、单连接流控、`maxConcurrentStreams=0` 的边角、h2 与连接池的耦合、`idleTimeout`/`ping`/`noStreams` 三套定时器。
+
+#### 14.2.1 HTTP/2 默认参数全表(对齐依据 + 与 Node 核心差异)
+
+`Client` 构造时把所有 h2 选项一次性快照到 `kHTTP2Options`(`client.js:321-337`),全部带显式 fallback:
+
+```javascript
+// lib/dispatcher/client.js:321-337
+this[kHTTP2Options] = {
+  pingInterval: h2Options?.pingInterval ?? pingInterval ?? 60e3,
+  connectionWindowSize: h2Options?.connectionWindowSize ?? connectionWindowSize ?? 524288,
+  maxConcurrentStreams: h2Options?.maxConcurrentStreams ?? maxConcurrentStreams ?? 100, // Max peerConcurrentStreams for a Node h2 server
+  sessionOptions: {
+    // HTTP/2 window sizes are set to higher defaults than Node.js core for better performance:
+    // - initialWindowSize: 262144 (256KB) vs Node.js default 65535 (64KB - 1)
+    //   Allows more data to be sent before requiring acknowledgment, improving throughput
+    //   especially on high-latency networks. This matches common production HTTP/2 servers.
+    // - connectionWindowSize: 524288 (512KB) vs Node.js default (none set)
+    //   Provides better flow control for the entire connection across multiple streams.
+    initialWindowSize: h2Options?.initialWindowSize ?? initialWindowSize ?? 262144
+  }
+}
+```
+
+| 参数 | undici 默认 | Node http2 默认 | 差距 | 源码 |
+|---|---|---|---|---|
+| `maxConcurrentStreams`(本地期望上限) | **100** | 不限(由 server SETTINGS 决定) | 显式声明以"对齐 Node h2 server" | `client.js:325` |
+| `initialWindowSize`(单流接收窗口) | **262144(256 KiB)** | 65535(64 KiB - 1) | **4 倍**,注释明确说明是为"高延迟网络 + 减少 ACK 次数" | `client.js:333-336` |
+| `connectionWindowSize`(全连接接收窗口) | **524288(512 KiB)** | 不设(Node 不发 SETTINGS) | 比 Node 多一条 SETTINGS 帧 | `client.js:326` |
+| `pingInterval`(心跳) | **60000 ms**(可设为 0 禁用) | 无 | 比裸 Node h2 更主动,死链探测更快 | `client.js:322`、`client-h2.js:269-271` |
+
+> **关键注释**:`maxConcurrentStreams: 100` 在 undici 上下文里是**客户端自己发给服务端的 SETTINGS**(自己愿意并发多少),而 `peerMaxConcurrentStreams`(`client-h2.js:259`)才是**服务端回给客户端的 SETTINGS**(服务端允许并发多少)——后者的真实值在收到 `remoteSettings` 后覆盖 `client[kMaxConcurrentStreams]`(`client-h2.js:583-584`)。
+
+#### 14.2.2 单连接多流 + 连接级流控(显式 `setLocalWindowSize`)
+
+`http2ConnectionWindowSize` 在 `connect` 事件上**主动**调一次 `setLocalWindowSize`,把全连接接收窗口顶到目标值:
+
+```javascript
+// lib/dispatcher/client-h2.js:533-540
+function applyConnectionWindowSize (connectionWindowSize) {
+  try {
+    if (typeof this.setLocalWindowSize === 'function') {
+      this.setLocalWindowSize(connectionWindowSize)
+    }
+  } catch {
+    // Best-effort only.
+  }
+}
+util.addListener(session, 'connect', applyConnectionWindowSize.bind(session, http2ConnectionWindowSize))
+```
+
+注释 `Best-effort only.` 解释了一处隐性边界:某些 h2 实现不支持 `setLocalWindowSize`(老 OpenSSL、中间件),调用会抛错,**undici 选择吃掉异常而非降级**。这意味着 laew 若对接企业 h2 代理,要主动探测而不是相信 window size 一定生效。
+
+`stream.setTimeout(headersTimeout)` 是 h2 的另一处独特设计(`client-h2.js:1227-1229`):
+
+```javascript
+// lib/dispatcher/client-h2.js:1227-1229
+if (headersTimeout) {
+  stream.setTimeout(headersTimeout)
+}
+```
+
+> **与 h1 的关键差异**:h1 的超时由 `client[kBodyTimeout]/[kHeadersTimeout]` 维护,跟着 socket/parser 走;h2 直接把超时挂在**流**上,关流即取消超时。这正是 h2 多路复用能"100 个并发流各自独立计时"的基础。
+
+#### 14.2.3 `maxConcurrentStreams = 0` 边角 + `noStreamsTimeout` 自救
+
+RFC 9113 §6.5.2 允许服务端 SETTINGS 暂时给 0,意味着"现在不开新流"。undici 的 `busy()` 在 `client[kMaxConcurrentStreams] === 0` 时会**永远返回 true**(`client-h2.js:357-362`),所有待发请求死锁在排队里。
+
+`noStreamsTimeout` 是为此设计的一个**自救机制**(`client-h2.js:470-498`):
+
+```javascript
+// lib/dispatcher/client-h2.js:470-498
+function setNoStreamsTimeout (session) {
+  const client = session[kClient]
+  const state = session[kHTTP2SessionState]
+  const timeout = client[kHeadersTimeout]
+
+  if (!timeout || state.noStreamsTimeout != null) {
+    return
+  }
+
+  state.noStreamsTimeout = setTimeout(onNoStreamsTimeout, timeout, session).unref()
+}
+
+function onNoStreamsTimeout (session) {
+  const client = session[kClient]
+  // ... 排空待发队列 → HeadersTimeoutError → resetHttp2Session
+  // Drop the unusable session so the next request gets a fresh connection,
+  // whose SETTINGS may well allow streams again.
+  session[kError] = err
+  resetHttp2Session(session, err)
+}
+```
+
+注释明确点出此设计的灵感:"a request that cannot even be sent has missed the same deadline as one whose headers never arrive"——把"排队等不到流"等同于"发了请求没收到头",直接 fail 队列 + 换条连接。这是 undici 在"协议允许的对端恶意行为"面前的取舍:**宁可 fail 用户也不让进程被死锁**。
+
+> **给 laew 的启发**:reqwest + hyper 在 h2 路径里没有显式的"对方拒绝开新流"检测,只是 `MAX_CONCURRENT_STREAMS` 限流后**阻塞到对方解锁**。若 laew 对接企业 h2 网关遇到此场景,可以加一个 `peer_max_streams_zero_for_too_long → 标记 socket 损坏 + 重连` 的兜底。
+
+#### 14.2.4 三套独立定时器:idle / ping / noStreams
+
+h2 一条 session 同时持有 **3 套**互不干扰的定时器,各自负责不同的"存活证据":
+
+| 定时器 | 触发条件 | 动作 | 源码 |
+|---|---|---|---|
+| `idleTimeout` | `client[kSize]===0 && session[kOpenStreams]===0` | `InformationalError('socket idle timeout')` → `util.destroy(socket, err)` | `client-h2.js:500-507`、`520-528` |
+| `ping.interval` | 每 `pingInterval`(默认 60s) | `session.ping(cb)` 探测;err 时 `InformationalError → kOnError` | `client-h2.js:269-271`、`562-577` |
+| `noStreamsTimeout` | `client[kMaxConcurrentStreams]===0 && client[kRunning]===0 && client[kPending]>0` | `HeadersTimeoutError` + 队列排空 + reset session | `client-h2.js:470-498` |
+
+它们的"使能条件"用同一段 `resumeH2()` 维护(`client-h2.js:402-419`),逻辑精炼:
+
+```javascript
+// lib/dispatcher/client-h2.js:402-419
+function resumeH2 (client) {
+  const socket = client[kSocket]
+  const session = client[kHTTP2Session]
+
+  if (socket?.destroyed === false) {
+    if (client[kSize] === 0 || client[kMaxConcurrentStreams] === 0) {
+      unrefH2Session(session)              // 无事可做 → 放 event loop 走
+    } else {
+      refH2Session(session)                // 有活 → ref 钉死
+    }
+
+    if (client[kSize] === 0 && session[kOpenStreams] === 0) {
+      setHttp2IdleTimeout(session)
+    } else {
+      clearHttp2IdleTimeout(session)
+    }
+
+    if (client[kMaxConcurrentStreams] === 0 && client[kRunning] === 0 && client[kPending] > 0) {
+      setNoStreamsTimeout(session)
+    } else {
+      clearNoStreamsTimeout(session)
+    }
+  }
+}
+```
+
+> **`unrefH2Session` 的设计**(`client-h2.js:372-388`)是关键:session/socket 同 ref/unref,但用**缓存标志**避免重复调用,保证 Node 内核的 `uv_ref/unref` 计数器不漂移。`refed` 默认 `true`,意味着新 session 一开始就 ref'd,`resume()` 才根据工作量决定 unref。这是"正确性优先"的微观管理。
+
+#### 14.2.5 `writeH2` 内部 16 步请求生命周期(从用户调用到 wire 字节)
+
+`writeH2`(`client-h2.js:1005-1234`)是 h2 路径的"主入口函数",**单请求内分配 `state` 对象**作为流上所有事件 handler 的状态总线。这与 h1 共享 parser 实例的模型完全不同:
+
+```javascript
+// lib/dispatcher/client-h2.js:1005-1020 (节选)
+function writeH2 (client, request) {
+  const headersTimeout = request.headersTimeout ?? client[kHeadersTimeout]
+  const bodyTimeout = request.bodyTimeout ?? client[kBodyTimeout]
+  const session = client[kHTTP2Session]
+  const { method, path, host, upgrade, expectContinue, signal, protocol, headers: reqHeaders } = request
+  // ...
+  const state = {                  // ← 单流状态总线,所有 handler 共享
+    abort: null,
+    body: request.body,
+    bytesRead: 0,
+    client,
+    contentLength: null,
+    expectsPayload: false,
+    maxResponseSize: client[kMaxResponseSize],
+    request,
+    headersTimeout,
+    bodyTimeout,
+    requestFinalized: false,
+    responseReceived: false,
+    bodySent: false,
+    pendingEnd: false,
+    trailers: null,
+    session,
+    stream: null
+  }
+  // ...
+}
+```
+
+**关键步骤(16 步)**:
+
+| # | 步骤 | 关键代码 | 注释 |
+|---|---|---|---|
+| 1 | 拒绝非 `websocket` 的 `upgrade` | `client-h2.js:1011-1013` | h2 之上只允许 websocket 升级(RFC 8441) |
+| 2 | 构造 `:authority` `:method` 头 | `client-h2.js:1016-1020` | h2 必须用 `:method/:path/:scheme` 伪头,不能直接 `GET /` |
+| 3 | `request.onRequestStart(abort, null)` | `client-h2.js:1095-1097` | 用户态 hook 早于 wire 发出,**这是 abort 钩子的最晚注入点** |
+| 4 | upgrade / CONNECT 走 extended-CONNECT 协议 | `client-h2.js:1104-1144` | `:protocol` 伪头,需服务端 `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` |
+| 5 | 校验 `contentLength` 与 `request.contentLength` | `client-h2.js:1199-1208` | 不一致且 `strictContentLength=true` 直接 fail |
+| 6 | `refH2Session(session)` | `client-h2.js:1221` | 先 ref 一次,保证后续帧不被 unref 误杀 |
+| 7 | `sendHeaders` channel publish | `client-h2.js:1221-1226` | 可观测性埋点 |
+| 8 | `openStream(...)` 拿 stream 句柄 | `client-h2.js:1232` | null 表示并发满,返回 false 由上层排队 |
+| 9 | `++session[kOpenStreams]` 计数 | `client-h2.js:1241` | 唯一维护单连接流计数 |
+| 10 | `stream.setTimeout(headersTimeout)` | `client-h2.js:1247-1249` | **流级超时**而非 socket 级 |
+| 11 | 绑事件:`response/headers/end/error/frameError/aborted/timeout/trailers` | `client-h2.js:1252-1259` | 8 个事件,均按 `state == null` 守卫重入 |
+| 12 | 调 `writeBodyH2()`(非 expectContinue) | `client-h2.js:1264` | 流式 body 走 `writeStream` / `writeIterable` |
+| 13 | `expectContinue` 时挂 `'continue'` 监听 | `client-h2.js:1250-1251` | 收 100 后再发 body,省流量 |
+| 14 | 中间响应(`'headers'`)→ `onInterimResponse` | `client-h2.js:1347-1363` | 100/103/199 等 |
+| 15 | `'data'` → `onData` 检查 `maxResponseSize` + 调 `request.onResponseData(chunk)` | `client-h2.js:1324-1346` | **h2 超大 body 不 destroy socket,只 abort 单流**(`client-h2.js:1338-1340` 注释明说) |
+| 16 | `'close'` → `completeRequestStream` | `client-h2.js:879-901` | 幂等清理:state null → no-op |
+
+> **关键差异**(`client-h2.js:1336-1340`):h1 超大 body 会 `util.destroy(socket, ...)`(整连接死,见 14.1.1 错排代价),h2 只 `state.abort(...)` 关一条流,session 留给其他请求。**这就是 h2 多路复用对 laew LLM 场景最大的吸引力**——一条 LLM 故障不应当拖垮其他 provider。
+
+#### 14.2.6 h2 与连接池的关系(`Pool.connections` 设上限会"打散"复用)
+
+这是最容易踩的配置坑。`Pool.connections`(`pool.js:113`)控制**每个 origin 的 Client 上限**,而每个 Client 在 h2 下就是一条 `http2.ClientHttp2Session`。如果 `Pool.connections = 3`,**多路复用就被打散成 3 条独立 h2 连接**,每条都各自跟服务端协商 SETTINGS:
+
+```javascript
+// lib/dispatcher/pool.js:99-118 (节选)
+if (!this[kConnections] || this[kClients].length < this[kConnections]) {
+  const dispatcher = this[kFactory](this[kUrl], this[kOptions])
+  this[kAddClient](dispatcher)           // ← 按需扩容(懒建连)
+  return dispatcher
+}
+```
+
+`Pool` 的"找第一个不忙的"算法与 h2 实际多路复用能力错配:
+- h1 下,connections 上限 = "我愿意同时建立多少条 TCP 连接";
+- h2 下,connections 上限 = "我愿意跟同一 origin 同时维持多少条 session",而**每条 session 自己就能开 100 路流**。
+
+undici 的应对:`kMaxConcurrentStreams = 100` 是从服务端**协商回来**后才会被覆盖的(client-h2.js:583-584),默认 100 已经接近大多数代理/网关的上限。如果 `Pool.connections` 设为 5,理论并发 = 5 × 100 = 500 路流,但服务端实际可能拒绝这么高的并发。
+
+> **Pool.md:76-81**(源码 README)对这条给了警告:**"When using HTTP/2, it is not recommended to set the connections option to a value other than null"**。
+
+#### 14.2.7 对 laew 的借鉴(维度二)
+
+| # | 借鉴项 | undici 依据 | reqwest / Rust 侧落地 |
+|---|---|---|---|
+| P0-1 | **不要给 reqwest 设 `pool_max_idle_per_host` 小于 4**(单 host 多 provider 场景) | h2 多路复用 vs h1 一连一请求的差异 | laew 现在 LLM 调用是 1 origin × N providers,若 `pool_max_idle_per_host=1`,每切一个 provider 就重连 TLS;建议保持默认值或 >= 4 |
+| P0-2 | **hyper 的 h2 keep-alive 用 PING 帧,默认 60s** | `client-h2.js:269-271` | reqwest 暂未暴露 `http2_keep_alive_interval`;若上游断连,超时由 `connect_timeout` 兜底(已知有 30s 静默死链风险) |
+| P1-1 | **连接级流控**(`initialWindowSize=262144`) | `client.js:331-336` | hyper 默认 `initial_stream_window_size=65535`;LLM 流式场景下可手动 `Http2Builder.initial_stream_window_size(524288)` 减少 ACK 频率 |
+| P1-2 | **peer-max-streams=0 自救** | `client-h2.js:470-498` | reqwest 无直接对应;但可加一个"单连接排队超时"作为近似(等同 `headersTimeout`) |
+| P2-1 | **h2 单流超时 vs h1 socket 超时分开维护** | `client-h2.js:1227-1229` vs `client-h1.js:654-662` | rustls + hyper 行为类似;但 laew 若混用 h1(老企业代理)和 h2,要对二者分别设超时,不能用统一 `timeout()` |
+| P2-2 | **预留 `http2_max_concurrent_reset_streams`** | RFC 9113 §8.7 + `MAX_GOAWAY_REPLAY_ATTEMPTS=1` | hyper/h2 crate 支持;LLM 场景建议"拒绝就重发"次数 ≤ 1,避免毒化 session |
+
+---
+
+### 14.3 维度三:诊断与可观测性(`DiagnosticsChannel` 完整剖析)
+
+> **前置说明**:第五轮 D 节("diagnostics-channel 13 个命名通道")列过名字,但**没有给完整 payload 字段表**、**没有区分"publish 点"和"subscribe 桥接点"**、**没有讲 `hasSubscribers` 守门的微观开销**。本节把这三个洞补齐,并完整列出 **18 个通道**(第五轮 D 节漏了一个 `undici:request:pending-requests`)。
+
+#### 14.3.1 通道清单全表(18 个,实际是 `17 + 1`)
+
+`diagnostics.js:10-32` 注册了 **17 个** channel,加上 `lib/interceptor/deduplicate.js:8` 的第 18 个 `undici:request:pending-requests`:
+
+```javascript
+// lib/core/diagnostics.js:10-32
+const channels = {
+  // Client (4)
+  beforeConnect:    diagnosticsChannel.channel('undici:client:beforeConnect'),     // ①
+  connected:        diagnosticsChannel.channel('undici:client:connected'),         // ②
+  connectError:     diagnosticsChannel.channel('undici:client:connectError'),      // ③
+  sendHeaders:      diagnosticsChannel.channel('undici:client:sendHeaders'),       // ④
+  // Request (8)
+  create:           diagnosticsChannel.channel('undici:request:create'),           // ⑤
+  bodySent:         diagnosticsChannel.channel('undici:request:bodySent'),         // ⑥
+  bodyChunkSent:    diagnosticsChannel.channel('undici:request:bodyChunkSent'),    // ⑦
+  bodyChunkReceived:diagnosticsChannel.channel('undici:request:bodyChunkReceived'),// ⑧
+  headers:          diagnosticsChannel.channel('undici:request:headers'),          // ⑨
+  trailers:         diagnosticsChannel.channel('undici:request:trailers'),         // ⑩
+  error:            diagnosticsChannel.channel('undici:request:error'),            // ⑪
+  // WebSocket (5)
+  open:             diagnosticsChannel.channel('undici:websocket:open'),           // ⑫
+  close:            diagnosticsChannel.channel('undici:websocket:close'),          // ⑬
+  socketError:      diagnosticsChannel.channel('undici:websocket:socket_error'),  // ⑭
+  ping:             diagnosticsChannel.channel('undici:websocket:ping'),           // ⑮
+  pong:             diagnosticsChannel.channel('undici:websocket:pong'),           // ⑯
+  // ProxyAgent (1)
+  proxyConnected:   diagnosticsChannel.channel('undici:proxy:connected')           // ⑰
+}
+// ⑱ = undici:request:pending-requests  (lib/interceptor/deduplicate.js:8)
+```
+
+| # | 通道名 | 触发位置 | 触发频率 | 默认 payload |
+|---|---|---|---|---|
+| ① | `undici:client:beforeConnect` | `client.js:515-516` | 每次新建连接 1 次 | `{ connectParams: { version, protocol, port, host, hostname } }` |
+| ② | `undici:client:connected` | `client.js:571-572` | 同上 | `{ connectParams: { version, protocol, port, host }, socket: net.Socket }` |
+| ③ | `undici:client:connectError` | `client.js:603-604` | 连接失败 1 次 | `{ connectParams, error, socket }` |
+| ④ | `undici:client:sendHeaders` | `client-h1.js:1345-1346` / `client-h2.js:1221-1226` | 每个请求 1 次 | `{ request, headers: 'GET / HTTP/1.1\r\nhost: ...', socket \| h2session }` |
+| ⑤ | `undici:request:create` | `request.js:277-278` | 每个请求 1 次 | `{ request: Request }`(全字段可读) |
+| ⑥ | `undici:request:bodySent` | `request.js:296-297` | 每个请求 1 次(body 写完) | `{ request }` |
+| ⑦ | `undici:request:bodyChunkSent` | `request.js:283-284` | 每个 chunk 1 次 | `{ request, chunk: Buffer }` |
+| ⑧ | `undici:request:bodyChunkReceived` | `request.js:357-358` | 每个 chunk 1 次 | `{ request, chunk: Buffer }` |
+| ⑨ | `undici:request:headers` | `request.js:332-333` | 每个响应 1 次 | `{ request, response: { statusCode, headers, statusText } }` |
+| ⑩ | `undici:request:trailers` | `request.js:392-393` | 含 trailer 的响应 1 次 | `{ request, trailers }` |
+| ⑪ | `undici:request:error` | `request.js:414-415` | 每个失败请求 1 次 | `{ request, error }` |
+| ⑫ | `undici:websocket:open` | `websocket.js:531-534` | 每条 ws 1 次 | `{ address, protocol, extensions }` |
+| ⑬ | `undici:websocket:close` | `websocket.js:648-649` | 同上 | `{ websocket, code, reason }` |
+| ⑭ | `undici:websocket:socket_error` | `websocket.js:93-94`、`websocketstream.js:59-60` | 每错误 1 次 | `Error` |
+| ⑮ | `undici:websocket:ping` | `websocket.js:101-102` | 每 ping 帧 1 次 | `{ payload }` |
+| ⑯ | `undici:websocket:pong` | `websocket.js:109-110` | 每 pong 帧 1 次 | `{ payload }` |
+| ⑰ | `undici:proxy:connected` | `proxy-agent.js:234-235` | 隧道完成 1 次 | `{ socket, connectParams, headers }` |
+| ⑱ | `undici:request:pending-requests` | `deduplicate.js:8,101-111` | pending>0 期间反复 publish(详见 14.3.5) | `{ pending }` |
+
+#### 14.3.2 真实 publish 点的精确源码行号
+
+| # | 文件:行号 | 上下文 |
+|---|---|---|
+| ① | `lib/dispatcher/client.js:515-524` | `if (channels.beforeConnect.hasSubscribers) channels.beforeConnect.publish({ connectParams: { version, protocol, port, host, hostname } })` |
+| ② | `lib/dispatcher/client.js:571-578` | 同上,加 `socket: socket` 字段 |
+| ③ | `lib/dispatcher/client.js:603-612` | 同上,加 `error, socket` |
+| ④ | `lib/dispatcher/client-h1.js:1345-1348` | `publish({ request, headers: header, socket })`,`header` 是已经拼好的 CRLF 字符串 |
+| ④' | `lib/dispatcher/client-h2.js:1221-1226` | h2 同样,但 `socket: session[kSocket]` |
+| ⑤ | `lib/core/request.js:277-278` | `publish({ request: this })` |
+| ⑥ | `lib/core/request.js:296-297` | `onRequestSent` 里 `publish({ request: this })` |
+| ⑦ | `lib/core/request.js:283-284` | `onBodySent(chunk)` 里 `publish({ request: this, chunk })` |
+| ⑧ | `lib/core/request.js:357-358` | `onResponseData(chunk)` 里 `publish({ request: this, chunk })` |
+| ⑨ | `lib/core/request.js:332-333` | `onResponseStart(statusCode, headers, resume, statusText)` 里 `publish({ request, response: { statusCode, headers, statusText } })` |
+| ⑩ | `lib/core/request.js:392-393` | `onResponseEnd` 里 `publish({ request, trailers })` |
+| ⑪ | `lib/core/request.js:414-415` | `onResponseError` 里 `publish({ request, error })` |
+| ⑫ | `lib/web/websocket/websocket.js:531-538` | `publish({ address, protocol, extensions })` |
+| ⑬ | `lib/web/websocket/websocket.js:648-651` | `publish({ websocket, code, reason })` |
+| ⑭ | `lib/web/websocket/websocket.js:93-94` + `lib/web/websocket/stream/websocketstream.js:59-60` | `publish(err)` 直接传错对象 |
+| ⑮ | `lib/web/websocket/websocket.js:101-104` | `publish({ payload })` |
+| ⑯ | `lib/web/websocket/websocket.js:109-112` | `publish({ payload })` |
+| ⑰ | `lib/dispatcher/proxy-agent.js:234-237` | `publish({ socket, connectParams, headers })` |
+
+> **关键细节**:`publish` 调用前**全部**用 `if (channels.X.hasSubscribers)` 守门(见上面所有行号),所以默认(无订阅者)路径零开销。
+
+#### 14.3.3 `hasSubscribers` 守门 + `trackXxxEvents` 双层零开销设计
+
+`diagnostics.js` 有**两层**"先查再订"防重复:
+
+```javascript
+// lib/core/diagnostics.js:36-49
+let isTrackingClientEvents = false
+
+function trackClientEvents (debugLog = undiciDebugLog) {
+  if (isTrackingClientEvents) {
+    return                  // ← 防重复 subscribe
+  }
+
+  // Check if any of the channels already have subscribers to prevent duplicate subscriptions
+  // This can happen when both Node.js built-in undici and undici as a dependency are present
+  if (channels.beforeConnect.hasSubscribers || channels.connected.hasSubscribers ||
+      channels.connectError.hasSubscribers || channels.sendHeaders.hasSubscribers) {
+    isTrackingClientEvents = true
+    return                  // ← 别人(比如 Node 内置 undici)已订,我让位
+  }
+
+  isTrackingClientEvents = true
+  diagnosticsChannel.subscribe('undici:client:beforeConnect', evt => { /* debugLog */ })
+  // ... (4 个 subscribe)
+}
+```
+
+`isTrackingClientEvents` 是**模块级 boolean**,保证整个进程只订一次。配合 Node 启动期的 `NODE_DEBUG=undici` 触发链(`diagnostics.js:215-218`):
+
+```javascript
+// lib/core/diagnostics.js:215-218
+if (undiciDebugLog.enabled || fetchDebuglog.enabled) {
+  trackClientEvents(fetchDebuglog.enabled ? fetchDebuglog : undiciDebugLog)
+  trackRequestEvents(fetchDebuglog.enabled ? fetchDebuglog : undiciDebugLog)
+}
+```
+
+> **零开销保证**:无 `NODE_DEBUG=undici` 且无外部 subscriber 时,**整个 diagnostics 模块只构造 channel 对象、不调用任何 publish**(因为 publish 前都查 hasSubscribers);`trackXxxEvents` 函数也根本不被调用,因为 `undiciDebugLog.enabled` 是 false。
+
+#### 14.3.4 `trackClientEvents`/`trackRequestEvents` 内部都做了什么
+
+它不是"原样把 channel 透传出去",而是把所有 4/3 个 channel **重新桥接到 `util.debuglog('undici')`**,即:
+
+```javascript
+// lib/core/diagnostics.js:51-63 (节选)
+diagnosticsChannel.subscribe('undici:client:beforeConnect',
+  evt => {
+    const { connectParams: { version, protocol, port, host } } = evt
+    debugLog(
+      'connecting to %s%s using %s%s',
+      host, port ? `:${port}` : '', protocol, version
+    )
+  })
+```
+
+这是 Node 内置 undici 与"作为依赖的 undici 共存"时的去重机制——保证**用户只用看一份日志**,不会因为内置 + 外部两份订阅看到双倍输出。
+
+#### 14.3.5 `undici:request:pending-requests`(第五轮漏掉的第 18 个)
+
+它不在 `diagnostics.js` 而在 dedupe 拦截器,但走的是同一个 `diagnostics_channel` API:
+
+```javascript
+// lib/interceptor/deduplicate.js:8 (节选)
+const channel = diagnosticsChannel.channel('undici:request:pending-requests')
+// lib/interceptor/deduplicate.js:101-111
+function checkCompletedRequests () {
+  // ...
+  for (let i = 0; i < inflightRequests.length - 1;) {
+    const req = inflightRequests[i++]
+    if (req.body && !req.body.length) {  // 空 body 才允许合并
+      const dup = inflightRequests[i]
+      req.removeAllListeners()
+      req.on('response', dup.listenerCount('response') > 0 ? dup.listeners('response')[0] : null)
+      // ...
+      dup.abort()                         // 合并后多余的请求 abort
+    }
+  }
+  if (inflightRequests.length === 0) {
+    clearTimeout(timeout)                 // ← 自动取消 timer
+    pendingRequestsCount = 0
+  }
+  if (channel.hasSubscribers) {
+    channel.publish({ pending: inflightRequests.length })  // ← 每 tick publish
+  }
+}
+```
+
+> 这个 channel 是**唯一一个周期 publish**(其他都是事件驱动),只在有订阅者时调用,让外部监控能拿到"实时在飞请求数"。
+
+#### 14.3.6 性能开销与 `hasSubscribers` 微观代价
+
+`channels.X.hasSubscribers` 是 Node 内置 boolean getter,**O(1)**(`node:diagnostics_channel` 用一个 `Set` 存订阅者,size==0 直接返回 false)。
+
+| 场景 | 每次请求额外开销 |
+|---|---|
+| 完全无订阅者 | **4 次 boolean getter 调用 + 0 次 publish**(路径:`if (...) channels.X.publish(...)` 的 if 直接 false 短路) |
+| 有 1 个轻订阅者(如 `console.log`) | 4 次 getter + 1 次 publish + 1 次回调 |
+| 有 1 个重订阅者(如 OTel SDK) | 同上 + OTel 自身构造 span / context 的开销 |
+
+**zero-cost telemetry 范式**:用 `hasSubscribers` 做"开/关"判定的模式,可以直接抄到 Rust:
+
+```rust
+// 伪代码
+fn on_response_chunk(&self, chunk: &[u8]) {
+    if tracing::enabled!(target: "laew.http.body_chunk_received", tracing::Level::DEBUG) {
+        // 才构造 payload,否则连 format! 都跳过
+        tracing::debug!(bytes = chunk.len(), "body chunk received");
+    }
+}
+```
+
+#### 14.3.7 与 OpenTelemetry / Prometheus 的对接
+
+源码内**零 OTel/OTLP 依赖**(grep 全 lib/ 无命中)。undici 选择**只暴露 Node 原生 DiagnosticsChannel**,让 OTel SDK 等**外部**做桥接——典型的"核心只做机制、不做策略":
+
+- **OTel 桥接**:`@opentelemetry/instrumentation-undici`(官方包)订阅 ⑨(headers)+ ⑪(error),拼出 span;
+- **APM 桥接**:Datadog / NewRelic 各有自家 subscriber,订阅 ④(sendHeaders)+ ⑧(bodyChunkReceived) 算 P50/P99 时延;
+- **laew 自己**:直接抄 18 个 channel,订阅关心的几个。
+
+#### 14.3.8 对 laew 的借鉴(维度三)
+
+| # | 借鉴项 | undici 依据 | reqwest / Rust 侧落地 |
+|---|---|---|---|
+| P0-1 | **tracing span 与 hasSubscribers 同构** | `client.js:515-524` 守门范式 | 用 `tracing::enabled!(Level::INFO, "laew.http")` 守门 `tracing::info!`,默认级别 INFO 时整个分支是 1 次 atomic load |
+| P0-2 | **四元组埋点**:client 维度(beforeConnect/connected/connectError) + request 维度(create/headers/error) | 17+1 channel | laew 在 `src/llm/{openai,anthropic}.rs` 增加:connect_start/connect_end/connect_err + req_create/resp_headers/resp_err,作为 LLM 调用可观测性骨架 |
+| P0-3 | **字节级埋点不常驻**,只在 DEBUG 级别走 | `diagnostics.js:215-218` | `tracing::debug!(chunk_len = chunk.len())` 默认 INFO 不触发,等于零开销 |
+| P1-1 | **送 `agent-ctx` 跨函数**用 span 而非显式传 ctx | Node async_hooks 的隐式传递 | Rust 改用 `tracing::Span::current()` 显式 enter 或 `instrument` 宏 |
+| P1-2 | **`undici:request:pending-requests` 周期 publish** | `deduplicate.js:101-111` | laew 加 `metrics::gauge!("laew_http_inflight_requests", n)`,**只在 metrics 层注册时**才递增 |
+| P2-1 | **WebSocket 5 通道** | `diagnostics.js:24-30` | laew 当前不直接用 ws;但 SSE(Anthropic/OpenAI 流式响应)可类比:加 `sse_event / sse_done / sse_error` 3 个埋点 |
+
+---
+
+### 14.4 维度四:背压与 Body 流控
+
+> **前置说明**:前几轮覆盖了 SSE(`docs/多Agent架构重构/01-设计与解决方案.md`)、Body Mixin(`undici.md:6438-6495` 的 `extractBody`)。本节只覆盖**未挖深**的 4 个子维度:背压传递的微观机制、`bodyTimeout` 与消费者 pause 的精妙交互、不可重放 body 的拦截策略、`RetryHandler` 对 body 的处理。
+
+#### 14.4.1 body 派别判定:`util.js` 5 种类型的"是/否"矩阵
+
+`util.js:79-87` 等函数构成了**body 类型识别中心**,所有上游逻辑(`client-h1.js:944-949`、`retry-handler.js`、`web/fetch/body.js`)都从这里取结论:
+
+| 检测函数 | 返回 true 的对象 | 用途 | 源码 |
+|---|---|---|---|
+| `isStream(obj)` | node `Readable` 子类(有 `pipe/on/read` 等) | 是否要走 `writeStream` 流式上传 | `util.js:79-87` |
+| `isBlobLike(obj)` | `Blob` / `File` / undici 自定义 BlobLike | 走 `writeBlob`,先把 Blob 完全读出再发 | `util.js:87-93` |
+| `isBuffer(obj)` | `Buffer` / `Uint8Array`(含子类型) | 走 `writeBuffer`,一次 socket.write 全发 | `util.js:554-556` |
+| `isFormDataLike(obj)` | `FormData`/含 `Symbol.toStringTag === 'FormData'` | 走 `extractBody` 转多部分流 | `util.js:691+` |
+| `isIterable(obj)` | 有 `Symbol.iterator` 或 `Symbol.asyncIterator` | 走 `writeIterable` 逐 chunk 拉取 | `util.js:302-310` |
+| `isAsyncIterable(obj)` | 只有 `Symbol.asyncIterator` | 同上但异步 for-await | `util.js:302-304` |
+
+`bodyLength(body)`(`util.js:332-358`)对各类型返回对应的字节数(stream 返回 `null` 表示未知):
+
+```javascript
+// lib/core/util.js:332-358 (节选)
+function bodyLength (body) {
+  if (body == null) { return 0 }
+  if (isStream(body)) {
+    if (body.length != null && body.length !== Infinity) {
+      return body.length           // sync stream 的预知长度
+    } else {
+      return null                  // async/未知长度 → 走 chunked
+    }
+  } else if (isBlobLike(body)) {
+    return body.size               // Blob 一定有 size
+  } else if (isBuffer(body)) {
+    return body.byteLength
+  } else if (isFormDataLike(body)) {
+    return null                    // 多部分必定 chunked
+  } else if (isIterable(body)) {
+    return null
+  }
+}
+```
+
+#### 14.4.2 6 种 body 入口 + 背压传递路径
+
+undici 提供了 6 种"塞 body 进去"的方式,各自走不同的写入路径,但**背压协议统一**——都是 **`socket.write()` 返回 false → 暂停消费者 → 等 'drain' → 恢复**。
+
+| body 类型 | 入口函数 | 背压信号来源 | 暂停什么 | 源码 |
+|---|---|---|---|---|
+| `null` | `writeBuffer`(第 5 个分支) | 不适用(空 body) | —— | `client-h1.js:1547-1553` |
+| `Buffer` / `Uint8Array` | `writeBuffer` | `socket.write` 返回 false | 不暂停(已全发) | `client-h1.js:1547-1580` |
+| `Blob` / `File` | `writeBlob` | `for await chunk of blob.stream()` + `writer.write` 返回 false | 拉慢 stream 迭代 | `client-h1.js:1667-1700` |
+| node `Readable` | `writeStream` | `'data'` 事件 + `writer.write` 返回 false | `socket.pause()` | `client-h1.js:1380-1480` |
+| `AsyncIterable` | `writeIterable` | `writer.write` 返回 false | `await waitForDrain()` | `client-h1.js:1596-1645` |
+| h2 任意 body | `writeBodyH2` + 4 种派生 | `stream.write` 返回 false | 由 h2 session 内部流控 + `onData` 暂停 | `client-h2.js:1643-1730` |
+
+**Readable 的精确背压循环**(`client-h1.js:1380-1402`):
+
+```javascript
+// lib/dispatcher/client-h1.js:1380-1402 (节选)
+const onData = function (chunk) {
+  if (finished) { return }
+  try {
+    if (!writer.write(chunk) && this.pause) {
+      this.pause()                  // ← socket 写满 → 暂停 readable
+    }
+  } catch (err) {
+    util.destroy(this, err)
+  }
+}
+
+const onDrain = function () {
+  if (finished) { return }
+  if (body.resume) {
+    body.resume()                   // ← socket drain → 恢复 readable
+  }
+}
+body.on('data', onData).on('end', onFinished).on('error', onFinished).on('close', onClose)
+if (body.resume) { body.resume() }
+socket.on('drain', onDrain).on('error', onFinished)
+```
+
+这是教科书级的"生产者-消费者背压传递":Node `Readable` 的 paused/resumed 模式 + socket 的 `drain` 事件 + writer 的布尔返回值,**三层对齐**。
+
+**AsyncIterable 的精确背压循环**(`client-h1.js:1596-1635`):
+
+```javascript
+// lib/dispatcher/client-h1.js:1596-1635 (节选)
+let callback = null
+function onDrain () {
+  if (callback) { const cb = callback; callback = null; cb() }
+}
+const waitForDrain = () => new Promise((resolve, reject) => {
+  assert(callback === null)
+  if (socket[kError]) { reject(socket[kError]) }
+  else { callback = resolve }
+})
+
+socket.on('close', onDrain).on('drain', onDrain)
+
+const writer = new AsyncWriter({ ... })
+for await (const chunk of body) {
+  if (socket[kError]) { throw socket[kError] }
+  if (!writer.write(chunk)) {
+    await waitForDrain()             // ← 异步等待 drain,for-await 自动暂停迭代器
+  }
+}
+```
+
+> **AsyncIterable 的天然优势**:`for await` 是语言级暂停,只要 await 就把执行权还给 event loop,不需要任何手动 pause/resume 标志。**这也是为什么 14.1.10 限制"流式 body 不能并发跑 2 个"**——`for await` 是独占消费,跑 2 个就会互相饥饿。
+
+#### 14.4.3 `bodyTimeout` 与消费者 `pause()` 的精妙交互
+
+这是 undici 在"暂停期间不应当被超时误杀"问题上的精确解:
+
+```javascript
+// lib/dispatcher/client-h1.js:728-757 (onBody 节选)
+onBody (buf) {
+  const { client, socket, statusCode, maxResponseSize } = this
+  if (socket.destroyed) { return -1 }
+  const request = client[kQueue][client[kRunningIdx]]
+  assert(request)
+  assert(this.timeoutType === TIMEOUT_BODY)
+  if (this.timeout) {
+    if (this.timeout.refresh) {
+      this.timeout.refresh()         // ← 每收到 chunk 就 refresh body timeout
+    }
+  }
+  // ...
+  if (request.onResponseData(buf) === false) {
+    return constants.ERROR.PAUSED    // ← 通知 parser 暂停解析器
+  }
+  return 0
+}
+
+// lib/dispatcher/client-h1.js:833-854 (onParserTimeout)
+function onParserTimeout (parserWeakRef) {
+  const parser = parserWeakRef.deref()
+  if (!parser) { return }
+  const { socket, timeoutType, client, paused } = parser
+  if (timeoutType === TIMEOUT_HEADERS) {
+    if (!socket[kWriting] || socket.writableNeedDrain || client[kRunning] > 1) {
+      assert(!paused, 'cannot be paused while waiting for headers')
+      util.destroy(socket, new HeadersTimeoutError())
+    }
+  } else if (timeoutType === TIMEOUT_BODY) {
+    if (!paused) {                   // ← 关键:paused=true 不触发 body timeout
+      util.destroy(socket, new BodyTimeoutError())
+    }
+  }
+  // ...
+}
+```
+
+**关键设计**:`onParserTimeout` 在 `timeoutType === TIMEOUT_BODY && paused === true` 时**直接返回**,不 destroy。`paused` 来自 parser 在 `onBody` 返回 `constants.ERROR.PAUSED` 后被 llhttp 设置的内部标志(`client-h1.js:728-757 → llhttp 协议层`)。
+
+> **对 laew 的启发**:reqwest 的 `timeout()` 是**整体超时**(从请求创建到响应结束),不会区分"等头阶段"和"读 body 阶段"。LLM 长流场景下,**整体超时 5min 会误杀正在思考的模型**(Anthropic 平均首字节 3-10s,长输出 30s+)。**正确做法是分阶段**:`connect_timeout=10s` + `headers_timeout=30s` + **每 chunk 间 idle 超时 30s**(在 `Body::stream()` 的 `next()` 循环里 `tokio::time::timeout`)。
+
+#### 14.4.4 不可重放 body 的拦截策略:`isDisturbed()` + `used` 双保险
+
+undici 在两个层面拦截"已经读过/已损坏的 body":
+
+**(a) `isDisturbed()` 工具**(`util.js:613-616`):
+
+```javascript
+// lib/core/util.js:613-616
+function isDisturbed (body) {
+  // TODO (fix): Why is body[kBodyUsed] needed?
+  return !!(body && (stream.isDisturbed(body) || body[kBodyUsed]))
+}
+```
+
+注释的 `TODO (fix)` 直白地说:`stream.isDisturbed()` 应该够了,为啥还要 `body[kBodyUsed]`?答案是 **Web 标准 fetch 的 Body API 在读取后会置 `bodyUsed=true`**,这是和 node `Readable.isDisturbed()` 独立的另一条信号。undici 同时支持两边(因为 fetch 用 fetch-body,Request 用 undici-Request)。
+
+**(b) RetryHandler 的 body 判定**(`retry-handler.js` + `client-h2.js:165-167`):
+
+```javascript
+// lib/dispatcher/client-h2.js:165-167
+function canReplayRequest (request) {
+  const { body } = request
+  return body == null || util.isBuffer(body) || util.isBlobLike(body)
+}
+```
+
+**只有 Buffer / Blob / null 三种可以重放**——Blob 必须配 `Blob.stream()`(Blob 的内容是 lazy 的,可以再次 stream 读取)。Readable / AsyncIterable / FormData **都不能重放**(Readable 读了就 disturbed,FormData 是按 multipart 解构完的,可能 multipart boundary 已经被消费)。
+
+> **对 laew 的启发**:reqwest 的 `RequestBuilder::body(Body::wrap(stream))` 默认**也不可重放**——stream 被消费完就没了。LLM 重试场景下,如果用户 body 是 SSE 临时组装的 JSON,**必须先 `Vec<u8>` 化再 body**,否则第二次重试会读空。laew 当前 `src/llm/openai.rs` body 都是 `serde_json::to_vec(&body)?`(`src/llm/openai.rs:42` 一带),已经是 Buffer,可以放心重试 ✓。
+
+#### 14.4.5 重试时的 body 不可重放:`RetryHandler` 不直接 fail,先看 `canReplay`
+
+`RetryHandler.onResponseStart`(`retry-handler.js:266-281`)先看 200/206,再决定是否触发 retry;但**真正触发重试前**已经经过了 `canReplay` 筛选(GOAWAY 路径,见 14.2 引用):
+
+```javascript
+// lib/handler/retry-handler.js:222-275 (节选)
+static [kRetryHandlerDefaultRetry] (err, { state, opts }, cb) {
+  const { statusCode, code, headers } = err
+  const { method, retryOptions } = opts
+  const { maxRetries, minTimeout, maxTimeout, timeoutFactor, statusCodes, errorCodes, methods, retryAfter } = retryOptions
+  const { counter } = state
+  if (code && code !== 'UND_ERR_REQ_RETRY' && !errorCodes.includes(code)) {
+    cb(err); return                  // ← 不在白名单 → 立即 fail,不重试
+  }
+  if (Array.isArray(methods) && !methods.includes(method)) {
+    cb(err); return                  // ← method 不在白名单 → 立即 fail
+  }
+  if (statusCode != null && Array.isArray(statusCodes) && !statusCodes.includes(statusCode)) {
+    cb(err); return                  // ← 状态码不在白名单 → 立即 fail
+  }
+  if (counter > maxRetries) {
+    cb(err); return                  // ← 用完预算 → 立即 fail
+  }
+  // ... 退避计算 + setTimeout(cb, retryTimeout)
+}
+```
+
+**关键事实**:`RetryHandler` **不直接检查 body 是否可重放**——它信任上游传进来的"可重试请求"已经是 `canReplayRequest() === true` 的(在 `client.js`、`client-h2.js` 入口处过滤过)。这意味着 **RetryHandler 配 AsyncIterable body 时,如果上游漏过滤,重试就会读空**。
+
+#### 14.4.6 `h2c-client.js`:明文 h2 升级的特殊处理
+
+明文 h2(无 TLS 的 HTTP/2)走特殊客户端 `h2c-client.js`,其 `defaultPipelining` 直接是用户传的 `pipelining`(默认 100)且不得 > `maxConcurrentStreams`:
+
+```javascript
+// lib/dispatcher/h2c-client.js:21-44 (节选)
+const client = new Client(url, {
+  // ...
+  pipelining: maxConcurrentStreams < pipelining ? maxConcurrentStreams : pipelining,
+  maxConcurrentStreams,
+  // ...
+})
+```
+
+`h2c` 必须先发一个 HTTP/1.1 Upgrade 请求(RFC 7540 §3.2),所以**总是先经历 h1 解析路径**,升级成功后才切到 h2 session。laew 当前完全在 TLS 之上,不需要关注此路径。
+
+#### 14.4.7 `maxResponseSize` 在 h2 vs h1 上的差异(防止单条 LLM 流拖垮整连接)
+
+```javascript
+// lib/dispatcher/client-h1.js:741-746
+onBody (buf) {
+  // ...
+  if (maxResponseSize > -1 && this.bytesRead + buf.length > maxResponseSize) {
+    util.destroy(socket, new ResponseExceededMaxSizeError())  // ← 整连接死
+    return -1
+  }
+  this.bytesRead += buf.length
+  // ...
+}
+
+// lib/dispatcher/client-h2.js:1327-1342 (节选)
+function onData (chunk) {
+  // ...
+  if (maxResponseSize > -1 && state.bytesRead + chunk.length > maxResponseSize) {
+    // Unlike HTTP/1.1, which destroys the socket because it cannot abandon one
+    // response without losing framing, resetting the offending stream leaves
+    // the session usable for its siblings.
+    state.abort(new ResponseExceededMaxSizeError())
+    return
+  }
+  state.bytesRead += chunk.length
+  // ...
+}
+```
+
+**对比**:h1 超大 body → destroy socket(整连接失效);h2 超大 body → 只 abort 这条 stream(`state.abort()` → `client-h2.js:1066-1070`:`stream.close()` 发 RST_STREAM 帧),session 给其他请求用。
+
+> **对 laew 的启发**:LLM 场景下,如果 laew 在并发跑多个请求到同一 provider,**用 h2 比 h1 在"一个 LLM 输出爆炸"时损失小**——一条超长输出被截断只影响自己,其他请求还在复用 session。这是**强烈倾向 h2** 的硬理由。
+
+#### 14.4.8 对 laew 的借鉴(维度四)
+
+| # | 借鉴项 | undici 依据 | reqwest / Rust 侧落地 |
+|---|---|---|---|
+| P0-1 | **分阶段超时,不设整体 `timeout()`** | `client.js:147-161` 主动废弃 + `client-h1.js:654-662` 切换逻辑 | `connect_timeout=10s` + `headers_timeout=30s` + 在响应 body 的 stream 循环里 `tokio::select!{ _ = chunk.next() => {}, _ = sleep(30s) => break }` |
+| P0-2 | **`maxResponseSize` 兜底** | `client-h1.js:741-746` | `reqwest::ClientBuilder::max_response_size(50*1024*1024)`(LLM 单输出 50MB 封顶) |
+| P0-3 | **Body 一律 Buffer 化后再喂 reqwest**(避免重试时读空) | `client-h2.js:165-167` `canReplayRequest` | `reqwest::Body::from(bytes)`;**不要**用 `Body::wrap(stream)` 喂 LLM 调用 |
+| P0-4 | **可观测的 chunk 边界** | `request.js:283-284,357-358` | tracing span 加 `chunk_index, chunk_len, total_chunks` 字段 |
+| P1-1 | **`duplex: 'half'` 等价处理**:SSE 响应是"单向流,消费者可暂停" | `client-h1.js:728-757` `paused` 不超时 | Rust 用 `futures::Stream` 表达响应 body,在 stream 端 pause 不影响 idle timeout 判断 |
+| P1-2 | **`onResponseData` 返回 false = 暂停** | `request.js:355-364` | 思路一致:在 `Stream::poll_next` 里若"consumer 慢"则返回 `Poll::Pending`,底层继续喂数据;reqwest 不暴露此接口,得自实现 stream 包装层 |
+| P1-3 | **`isDisturbed()` 防 body 二次读取** | `util.js:613-616` | Rust 用 `bytes::Bytes::clone()`(引用计数,零拷贝)+ `Option<Bytes>` 标志位判断"是否已被消费" |
+| P2-1 | **`bodyLength()` 提前算长度,避免 chunked** | `util.js:332-358` | laew 调用 LLM 时 body 已知长度(serde 序列化后),手动设 `Content-Length` 头能省一次 100-continue 协商 |
+| P2-2 | **`onBody` 中暂停期间不计时** | `client-h1.js:850-853` | 用 `Instant::now()` 比对"上次收到字节到现在"是否超过 idle 超时(而不是"开始读到现在"是否超过总超时) |
+
+---
+
+## 14.5 本轮新增「对 laew 的总路线图」(P0/P1/P2)
+
+> 此节汇总四个维度的所有 P0/P1/P2 借鉴项,并按"实施成本 × 收益"重排,作为下一阶段的工程 backlog。
+
+| 优先级 | 借鉴项 | 涉及维度 | 实施成本 | 收益 | 落地文件 |
+|---|---|---|---|---|---|
+| **P0-1** | 共享 `reqwest::Client`,按 provider 或全局单例 | ① | 1h(改 `Client::new()` → `Arc<Client>`) | 高:消除每次握手 50-100ms + TLS 复用 | `src/llm/openai.rs`、`src/llm/anthropic.rs`、`src/config/mod.rs` |
+| **P0-2** | 设 `pool_idle_timeout=15s` + `pool_max_idle_per_host=8` | ① | 30min | 中:避免僵尸连接;LLM 场景 15s 比默认 90s 更稳 | 同上 |
+| **P0-3** | `connect_timeout=10s` 显式设 | ① | 5min | 中:与 undici 对齐,避免 silent hang | `src/llm/*` |
+| **P0-4** | **分阶段超时**:connect 10s + headers 30s + idle 30s,**不用 `timeout()`** | ①④ | 4h | 高:不让长 SSE 被误杀 | `src/llm/*` + 新增 `timeout.rs` |
+| **P0-5** | `tracing::enabled!` 守门,只在 DEBUG 走 `format!` | ③ | 2h | 高:零开销可观测性骨架 | 全 llm 模块 |
+| **P0-6** | `tracing` span 嵌入 `Client::beforeConnect/connected/connectError/headers/error` 5 个事件 | ③ | 3h | 高:LLM 调用可观测性从 0 到 1 | 同上 |
+| **P0-7** | body 永远 Buffer 化(`reqwest::Body::from(bytes)`) | ④ | 1h | 高:重试不再读空 | `src/llm/*` body 构造处 |
+| **P0-8** | `max_response_size(50MB)` 防单条 LLM 爆炸 | ④ | 30min | 中:防止内存被打爆 | 同上 |
+| **P1-1** | h2 `initial_window_size=512KB`(对齐 undici 256KB × 2) | ② | 4h(hyper API 复杂) | 中:LLM 长流减 ACK 次数 | `src/llm/*` |
+| **P1-2** | 错误分级:`is_retryable(err)` 区分"协议/序列化"(立即 fail) vs "网络/超时"(重试) | ① | 6h | 高:避免无意义重试 + 失败回流 | `src/error.rs` + 重试层 |
+| **P1-3** | `metrics::gauge!("laew_http_inflight_requests", n)` 类比 `pending-requests` | ③ | 2h | 中:可观测实时并发 | 新增 `src/metrics.rs` |
+| **P1-4** | Body stream 包装层实现"chunk 间 idle 30s 超时" | ④ | 8h(自实现) | 高:分阶段超时落地关键 | 新增 `src/llm/stream_with_idle_timeout.rs` |
+| **P1-5** | h2 `keep_alive_interval=60s`(若 hyper 支持) | ② | 6h(需评估 hyper API) | 低:已被 `connect_timeout` 部分覆盖 | 调研后决定 |
+| **P2-1** | 区分 h1 vs h2 设不同超时(企业代理场景) | ② | 4h | 低:laew 当前默认全 h2 | 按需 |
+| **P2-2** | 代理/隧道下池化指标按 proxy 维度 | ① | 1d | 低:laew 当前无代理需求 | 按需 |
+| **P2-3** | 自建连接池时用 `Instant` 惰性 clientTtl | ① | 2d | 低:reqwest 已自带 | 不实施 |
+| **P2-4** | SSE 3 个埋点(`sse_event/sse_done/sse_error`) | ③ | 1d | 中:流式体验关键 | 新增 `src/llm/sse_observer.rs` |
+
+---
+
+## 14.6 第七轮深挖小结
+
+本轮新增覆盖:
+- **维度一(连接池)** — 14.1 已完成
+- **维度二(HTTP/2)** — 14.2 完整剖析 7 个子维度(SETTINGS 默认值、连接级流控、`maxConcurrentStreams=0` 边角、三套独立定时器、`writeH2` 16 步生命周期、h2 与 Pool.connections 的耦合)
+- **维度三(DiagnosticsChannel)** — 14.3 完整剖析 18 个通道(17+1,补全第五轮漏的 `undici:request:pending-requests`),含 payload 字段表 + 真实 publish 行号 + `hasSubscribers` 微观代价
+- **维度四(背压/Body)** — 14.4 完整剖析 8 个子维度(body 派别判定矩阵、6 种 body 入口 + 背压协议、`bodyTimeout` 与 pause 的精妙交互、不可重放 body 双保险、RetryHandler 与 canReplay、`h2c` 升级、`maxResponseSize` 的 h1/h2 差异)
+- **维度总览** — 14.5 给出 P0/P1/P2 总路线图(按"实施成本 × 收益"排序),14.6 总结本轮
+
+本轮所有结论均带 `lib/xxx.js:LINE` 路径与关键代码片段,与既有 14.1 / 第五轮 / 前六轮内容**零重复**。

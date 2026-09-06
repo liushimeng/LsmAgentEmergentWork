@@ -7,6 +7,36 @@
 
 ---
 
+## 目录
+
+- 1. 项目元信息
+- 2. 架构总览
+- 3. Hook 系统(27 种触发点)
+- 4. 权限管控(六阶段判定 + 多源竞争)
+- 5. 工具系统(40+ 工具)
+- 6. Context 管理(六级压缩管线)
+- 7. 记忆系统
+- 8. SubAgent 与多 Agent(四层架构)
+- 9. Skill / Plugin 生态
+- 10. MCP 架构
+- 11. 流式输出与终端渲染
+- 12. 错误处理与重试
+- 13. 可观测性遥测与决策审计
+- 14. 会话持久化与崩溃恢复
+- 15. 系统提示词工程
+- 16. 配置系统
+- 17. 协议调用
+- 18. 对 laew 的借鉴
+- 附录 A: 关键文件索引
+- 附录 B: Token 预算汇总
+- 附录 C: Hook 输出协议完整参考
+- 附录 D: 完整原始文档清单
+- 17. 第五轮深挖补充(2026-09-06)
+- 19. 第六轮深挖 — Tool 系统 40+ 工具统一抽象 + 并发执行 + 权限拦截
+- 20. 第七轮深挖 — Edit/Notebook 补丁策略 + Glob/Grep 检索 + 多模态文件处理 + PromptCaching 与 Token 预算
+
+---
+
 ## 1. 项目元信息
 
 | 项目 | 描述 |
@@ -1736,3 +1766,3866 @@ laew 当前(`src/agent/tools/{bash,read,write}.rs` + `src/agent/tools/mod.rs` + 
 8. **OTel tool_decision 词汇**:`config` / `hook` / `user_permanent` / `user_temporary` / `user_reject` 五元,接 laew 现有的 SQLite 遥测表。
 9. **Backfill Observable Input 模式**:`call_input` 用 `processed_input.clone()` 做派生字段,`api_bound_input` 永不被 mutate,保证 Anthropic prompt cache。
 10. **子代理禁用集**:`ALL_AGENT_DISALLOWED_TOOLS` / `ASYNC_AGENT_ALLOWED_TOOLS` / `COORDINATOR_MODE_ALLOWED_TOOLS` 三个集合,在 `filter_tools_for_agent(agent_type)` 中一次性应用,对应当前 laew 的 `MultiAgentOrchestrator` 五档分类(simple/medium/hard/coordinator/async)。
+---
+
+## 20. 第七轮深挖 — Edit/Notebook 补丁策略 + Glob/Grep 检索 + 多模态文件处理 + PromptCaching 与 Token 预算
+
+> 调研日期: 2026-09-06 · 第七轮
+> 调研者: laew 知识库专项
+> 维度数: 4(文件编辑/检索/多模态/Prompt Caching)
+> 章节定位: 横向深挖,不重复第 5/17/19 章 Tool 抽象视角,而是从「单工具实现细节」纵切入
+
+### 20.1 维度一:文件编辑与补丁策略
+
+#### 20.1.1 Edit 工具 old_string 唯一性校验链
+
+claudecode 的 Edit 工具在校验 old_string 唯一性上走了**三层**防线:**完全相等 → 引号归一化匹配 → sanitize 反义匹配**。三层都失败才抛 `"String not found in file. Failed to apply edit."`。
+
+`src/tools/FileEditTool/FileEditTool.ts:316-327` —— 第一层归一化匹配:
+
+```typescript
+// Use findActualString to handle quote normalization
+const actualOldString = findActualString(file, old_string)
+if (!actualOldString) {
+  return {
+    result: false,
+    behavior: 'ask',
+    message: `String to replace not found in file.\nString: ${old_string}`,
+    meta: {
+      isFilePathAbsolute: String(isAbsolute(file_path)),
+    },
+    errorCode: 8,
+  }
+}
+
+const matches = file.split(actualOldString).length - 1
+
+// Check if we have multiple matches but replace_all is false
+if (matches > 1 && !replace_all) {
+  return {
+    result: false,
+    behavior: 'ask',
+    message: `Found ${matches} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: ${old_string}`,
+    meta: {
+      isFilePathAbsolute: String(isAbsolute(file_path)),
+      actualOldString,
+    },
+    errorCode: 9,
+  }
+}
+```
+
+`src/tools/FileEditTool/utils.ts:73-93` —— `findActualString` 真正执行归一化匹配:优先精确匹配,然后将 straight quotes 转换为 curly quotes 再匹配。这个机制是因为模型端的输出总是 ASCII 直引号,而很多用户文件(尤其 Markdown/排版)含 curly quotes。
+
+```typescript
+export function findActualString(
+  fileContent: string,
+  searchString: string,
+): string | null {
+  // First try exact match
+  if (fileContent.includes(searchString)) {
+    return searchString
+  }
+
+  // Try with normalized quotes
+  const normalizedSearch = normalizeQuotes(searchString)
+  const normalizedFile = normalizeQuotes(fileContent)
+
+  const searchIndex = normalizedFile.indexOf(normalizedSearch)
+  if (searchIndex !== -1) {
+    // Find the actual string in the file that matches
+    return fileContent.substring(searchIndex, searchIndex + searchString.length)
+  }
+
+  return null
+}
+```
+
+`src/tools/FileEditTool/utils.ts:557-574` —— 第三层 desanitize 反义匹配表:
+
+```typescript
+const DESANITIZATIONS: Record<string, string> = {
+  '<fnr>': '<function_results>',
+  '<n>': '<name>',
+  '</n>': '</name>',
+  '<o>': '<output>',
+  '</o>': '</output>',
+  '<e>': '<error>',
+  '</e>': '</error>',
+  '<s>': '<system>',
+  '</s>': '</system>',
+  '<r>': '<result>',
+  '</r>': '</result>',
+  '\n\nH:': '\n\nHuman:',
+  '\n\nA:': '\n\nAssistant:',
+  // ...
+}
+```
+
+这解决了模型在传输 system 标签时被服务端 sanitize 后模型看到的是脱敏形式,但写文件时需要还原的问题。
+
+#### 20.1.2 replace_all + 多文件编辑原子性
+
+`src/tools/FileEditTool/utils.ts:262-350` —— `getPatchForEdits` 是**多编辑原子性**的关键:
+
+```typescript
+export function getPatchForEdits({
+  filePath,
+  fileContents,
+  edits,
+}: {
+  filePath: string
+  fileContents: string
+  edits: FileEdit[]
+}): { patch: StructuredPatchHunk[]; updatedFile: string } {
+  let updatedFile = fileContents
+  const appliedNewStrings: string[] = []
+
+  // ...
+
+  // Apply each edit and check if it actually changes the file
+  for (const edit of edits) {
+    // Strip trailing newlines from old_string before checking
+    const oldStringToCheck = edit.old_string.replace(/\n+$/, '')
+
+    // Check if old_string is a substring of any previously applied new_string
+    for (const previousNewString of appliedNewStrings) {
+      if (
+        oldStringToCheck !== '' &&
+        previousNewString.includes(oldStringToCheck)
+      ) {
+        throw new Error(
+          'Cannot edit file: old_string is a substring of a new_string from a previous edit.',
+        )
+      }
+    }
+
+    const previousContent = updatedFile
+    updatedFile =
+      edit.old_string === ''
+        ? edit.new_string
+        : applyEditToFile(
+            updatedFile,
+            edit.old_string,
+            edit.new_string,
+            edit.replace_all,
+          )
+
+    // If this edit didn't change anything, throw an error
+    if (updatedFile === previousContent) {
+      throw new Error('String not found in file. Failed to apply edit.')
+    }
+    // Track the new string that was applied
+    appliedNewStrings.push(edit.new_string)
+  }
+  // ...
+}
+```
+
+**两个不变量**:(1) old_string 不能是 previous new_string 的子串 —— 否则上下文循环引用;(2) 单次 edit 没改动文件就抛错,不允许「空操作」。
+
+#### 20.1.3 「Read-before-Edit」强制
+
+`src/tools/FileEditTool/FileEditTool.ts:275-287` —— Edit 强制要求先 Read 过文件:
+
+```typescript
+const readTimestamp = toolUseContext.readFileState.get(fullFilePath)
+if (!readTimestamp || readTimestamp.isPartialView) {
+  return {
+    result: false,
+    behavior: 'ask',
+    message:
+      'File has not been read yet. Read it first before writing to it.',
+    meta: {
+      isFilePathAbsolute: String(isAbsolute(file_path)),
+    },
+    errorCode: 6,
+  }
+}
+```
+
+`src/tools/FileWriteTool/FileWriteTool.ts:198-205` —— Write 同样要求:
+
+```typescript
+const readTimestamp = toolUseContext.readFileState.get(fullFilePath)
+if (!readTimestamp) {
+  return {
+    result: false,
+    message:
+      'File has not been read yet. Read it first before writing to it.',
+    errorCode: 2,
+  }
+}
+```
+
+`src/tools/NotebookEditTool/NotebookEditTool.ts:218-237` —— NotebookEdit 也走同一规则:
+
+```typescript
+// Require Read-before-Edit (matches FileEditTool/FileWriteTool). Without
+// this, the model could edit a notebook it never saw, or edit against a
+// stale view after an external change — silent data loss.
+const readTimestamp = toolUseContext.readFileState.get(fullPath)
+if (!readTimestamp) {
+  return {
+    result: false,
+    message:
+      'File has not been read yet. Read it first before writing to it.',
+    errorCode: 9,
+  }
+}
+if (getFileModificationTime(fullPath) > readTimestamp.timestamp) {
+  return {
+    result: false,
+    message:
+      'File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.',
+    errorCode: 10,
+  }
+}
+```
+
+**关键设计**:`readFileState` 是全局 Map<absolutePath, {content, timestamp, offset, limit, isPartialView}>,Write 必须命中该 Map,且 mtime 校验**只针对全量读**(offset=undefined, limit=undefined)。
+
+#### 20.1.4 Read 工具的去重(Dedup)机制
+
+`src/tools/FileReadTool/FileReadTool.ts:524-573` —— Read 工具自带**缓存命中短路**,避免重复发同一个文件全量内容:
+
+```typescript
+const dedupKillswitch = getFeatureValue_CACHED_MAY_BE_STALE(
+  'tengu_read_dedup_killswitch',
+  false,
+)
+const existingState = dedupKillswitch
+  ? undefined
+  : readFileState.get(fullFilePath)
+// Only dedup entries that came from a prior Read (offset is always set
+// by Read). Edit/Write store offset=undefined — their readFileState
+// entry reflects post-edit mtime, so deduping against it would wrongly
+// point the model at the pre-edit Read content.
+if (
+  existingState &&
+  !existingState.isPartialView &&
+  existingState.offset !== undefined
+) {
+  const rangeMatch =
+    existingState.offset === offset && existingState.limit === limit
+  if (rangeMatch) {
+    try {
+      const mtimeMs = await getFileModificationTimeAsync(fullFilePath)
+      if (mtimeMs === existingState.timestamp) {
+        const analyticsExt = getFileExtensionForAnalytics(fullFilePath)
+        logEvent('tengu_file_read_dedup', {
+          ...(analyticsExt !== undefined && { ext: analyticsExt }),
+        })
+        return {
+          data: {
+            type: 'file_unchanged' as const,
+            file: { filePath: file_path },
+          },
+        }
+      }
+    } catch {
+      // stat failed — fall through to full read
+    }
+  }
+}
+```
+
+`src/tools/FileReadTool/prompt.ts:7-8` —— Stub 文本内容(模型看到的就是这个):
+
+```typescript
+export const FILE_UNCHANGED_STUB =
+  'File unchanged since last read. The content from the earlier Read tool_result in this conversation is still current — refer to that instead of re-reading.'
+```
+
+**生产数据(注释里引用)**:BQ proxy 显示 ~18% 的 Read 调用是同文件重复(BQ:BigQuery 后端日志),占 fleet cache_creation 的 2.64%。打开 dedup 后 2 小时 1,734 次 dedup hit,无 Read 错误回归。
+
+#### 20.1.5 编辑后 diff 摘要回灌 + 行尾处理
+
+`src/tools/FileEditTool/FileEditTool.ts:531` —— 编辑后实时算 changed lines:
+
+```typescript
+countLinesChanged(patch)
+```
+
+`src/tools/FileEditTool/FileEditTool.ts:79-84` —— 多 GB 兜底:
+
+```typescript
+// V8/Bun string length limit is ~2^30 characters (~1 billion). For typical
+// ASCII/Latin-1 files, 1 byte on disk = 1 character, so 1 GiB in stat bytes
+// ≈ 1 billion characters ≈ the runtime string limit. Multi-byte UTF-8 files
+// can be larger on disk per character, but 1 GiB is a safe byte-level guard
+// that prevents OOM without being unnecessarily restrictive.
+const MAX_EDIT_FILE_SIZE = 1024 * 1024 * 1024 // 1 GiB (stat bytes)
+```
+
+`src/tools/FileEditTool/FileEditTool.ts:202-220` —— UTF-16 LE BOM 自动探测:
+
+```typescript
+// Read the file as bytes first so we can detect encoding from the buffer
+// instead of calling detectFileEncoding (which does its own sync readSync
+// and would fail with a wasted ENOENT when the file doesn't exist).
+let fileContent: string | null
+try {
+  const fileBuffer = await fs.readFileBytes(fullFilePath)
+  const encoding: BufferEncoding =
+    fileBuffer.length >= 2 &&
+    fileBuffer[0] === 0xff &&
+    fileBuffer[1] === 0xfe
+      ? 'utf16le'
+      : 'utf8'
+  fileContent = fileBuffer.toString(encoding).replaceAll('\r\n', '\n')
+} catch (e) {
+  if (isENOENT(e)) {
+    fileContent = null
+  } else {
+    throw e
+  }
+}
+```
+
+#### 20.1.6 写时锁定原行尾
+
+`src/tools/FileEditTool/FileEditTool.ts:491` —— Edit 保留原文件 line endings:
+
+```typescript
+// 5. Write to disk
+writeTextContent(absoluteFilePath, updatedFile, encoding, endings)
+```
+
+`src/tools/FileWriteTool/FileWriteTool.ts:300-305` —— Write 强制 LF(不保留原行尾):
+
+```typescript
+// Write is a full content replacement — the model sent explicit line endings
+// in `content` and meant them. Do not rewrite them. Previously we preserved
+// the old file's line endings (or sampled the repo via ripgrep for new
+// files), which silently corrupted e.g. bash scripts with \r on Linux when
+// overwriting a CRLF file or when binaries in cwd poisoned the repo sample.
+writeTextContent(fullFilePath, content, enc, 'LF')
+```
+
+注释里解释了:**Write 是全量替换,模型已经在 content 里写了意图的行尾,不应改写**;而 Edit 是 in-place 替换,保留行尾防止误改 CRLF。
+
+#### 20.1.7 NotebookEdit 工具结构与单元格语义
+
+`src/tools/NotebookEditTool/NotebookEditTool.ts:30-57` —— 输入 schema 是 nbformat 4.5+ 的简化版:
+
+```typescript
+export const inputSchema = lazySchema(() =>
+  z.strictObject({
+    notebook_path: z
+      .string()
+      .describe(
+        'The absolute path to the Jupyter notebook file to edit (must be absolute, not relative)',
+      ),
+    cell_id: z
+      .string()
+      .optional()
+      .describe(
+        'The ID of the cell to edit. When inserting a new cell, the new cell will be inserted after the cell with this ID, or at the beginning if not specified.',
+      ),
+    new_source: z.string().describe('The new source for the cell'),
+    cell_type: z
+      .enum(['code', 'markdown'])
+      .optional()
+      .describe(
+        'The type of the cell (code or markdown). If not specified, it defaults to the current cell type. If using edit_mode=insert, this is required.',
+      ),
+    edit_mode: z
+      .enum(['replace', 'insert', 'delete'])
+      .optional()
+      .describe(
+        'The type of edit to make (replace, insert, delete). Defaults to replace.',
+      ),
+  }),
+)
+```
+
+`src/tools/NotebookEditTool/NotebookEditTool.ts:392-428` —— 真实 cell 操作:
+
+```typescript
+if (edit_mode === 'delete') {
+  // Delete the specified cell
+  notebook.cells.splice(cellIndex, 1)
+} else if (edit_mode === 'insert') {
+  let new_cell: NotebookCell
+  if (cell_type === 'markdown') {
+    new_cell = {
+      cell_type: 'markdown',
+      id: new_cell_id,
+      source: new_source,
+      metadata: {},
+    }
+  } else {
+    new_cell = {
+      cell_type: 'code',
+      id: new_cell_id,
+      source: new_source,
+      metadata: {},
+      execution_count: null,
+      outputs: [],
+    }
+  }
+  // Insert the new cell
+  notebook.cells.splice(cellIndex, 0, new_cell)
+} else {
+  // Find the specified cell
+  const targetCell = notebook.cells[cellIndex]! // validateInput ensures cell_number is in bounds
+  targetCell.source = new_source
+  if (targetCell.cell_type === 'code') {
+    // Reset execution count and clear outputs since cell was modified
+    targetCell.execution_count = null
+    targetCell.outputs = []
+  }
+  if (cell_type && cell_type !== targetCell.cell_type) {
+    targetCell.cell_type = cell_type
+  }
+}
+```
+
+**code cell replace 会清空 execution_count + outputs**——避免 cell source 改了但 output 跟旧 source 不一致导致的 stale state。insert 模式默认 code cell(若 cell_type 未指定)。
+
+`src/tools/NotebookEditTool/NotebookEditTool.ts:430-432` —— 写回保持 IPYNB_INDENT=1:
+
+```typescript
+// Write back to file
+const IPYNB_INDENT = 1
+const updatedContent = jsonStringify(notebook, null, IPYNB_INDENT)
+```
+
+#### 20.1.7 NotebookEdit cell_id 双格式解析
+
+`src/tools/NotebookEditTool/NotebookEditTool.ts:269-291` —— cell_id 支持两种格式:
+
+```typescript
+} else {
+  // First try to find the cell by its actual ID
+  const cellIndex = notebook.cells.findIndex(cell => cell.id === cell_id)
+
+  if (cellIndex === -1) {
+    // If not found, try to parse as a numeric index (cell-N format)
+    const parsedCellIndex = parseCellId(cell_id)
+    if (parsedCellIndex !== undefined) {
+      if (!notebook.cells[parsedCellIndex]) {
+        return {
+          result: false,
+          message: `Cell with index ${parsedCellIndex} does not exist in notebook.`,
+          errorCode: 7,
+        }
+      }
+    } else {
+      return {
+        result: false,
+        message: `Cell with ID "${cell_id}" not found in notebook.`,
+        errorCode: 8,
+      }
+    }
+  }
+}
+```
+
+- **优先按 UUID 找**(nbformat 4.5+ 的 cell.id)
+- **找不到回退到 `cell-N` 数字格式**
+
+#### 20.1.8 NotebookEdit 写后更新 readFileState
+
+`src/tools/NotebookEditTool/NotebookEditTool.ts:436-442` —— 跟 Edit/Write 一致,写完写 readFileState:
+
+```typescript
+// Update readFileState with post-write mtime (matches FileEditTool/
+// FileWriteTool). offset:undefined breaks FileReadTool's dedup match —
+// without this, Read→NotebookEdit→Read in the same millisecond would
+// return the file_unchanged stub against stale in-context content.
+readFileState.set(fullPath, {
+  content: updatedContent,
+  timestamp: getFileModificationTime(fullPath),
+  offset: undefined,
+  limit: undefined,
+})
+```
+
+#### 20.1.9 NotebookEdit nbformat 兼容
+
+`src/tools/NotebookEditTool/NotebookEditTool.ts:380-389` —— nbformat >= 4.5 才给 cell 分配新 ID:
+
+```typescript
+let new_cell_id = undefined
+if (
+  notebook.nbformat > 4 ||
+  (notebook.nbformat === 4 && notebook.nbformat_minor >= 5)
+) {
+  if (edit_mode === 'insert') {
+    new_cell_id = Math.random().toString(36).substring(2, 15)
+  } else if (cell_id !== null) {
+    new_cell_id = cell_id
+  }
+}
+```
+
+#### 20.1.10 NotebookEdit Replace 转 Insert 的边界
+
+`src/tools/NotebookEditTool/NotebookEditTool.ts:371-377` —— 当 replace 的 cellIndex 越界(== cells.length),自动降级为 insert:
+
+```typescript
+// Convert replace to insert if trying to replace one past the end
+let edit_mode = originalEditMode
+if (edit_mode === 'replace' && cellIndex === notebook.cells.length) {
+  edit_mode = 'insert'
+  if (!cell_type) {
+    cell_type = 'code' // Default to code if no cell_type specified
+  }
+}
+```
+
+#### 20.1.11 文件大小与编辑上限
+
+| 限制 | 数值 | 位置 |
+|------|------|------|
+| 单次 Edit 允许的最大文件 | **1 GiB** (stat bytes) | `FileEditTool.ts:84` |
+| Edit tool_result size 上限 | **100,000 chars** | `FileEditTool.ts:89` |
+| Grep tool_result size 上限 | **20,000 chars** | `GrepTool.ts:164` |
+| Glob tool_result size 上限 | **100,000 chars** | `GlobTool.ts:60` |
+| NotebookEdit tool_result size 上限 | **100,000 chars** | `NotebookEditTool.ts:93` |
+| Read tool_result size 上限 | **Infinity**(因为 Read 产物不进缓存) | `FileReadTool.ts:342` |
+
+#### 20.1.12 对 laew 的借鉴(维度一)
+
+| 借鉴项 | 优先级 | 实现路径 |
+|--------|--------|----------|
+| **Read-before-Edit 全局强制**:laew 当前 `Read`/`Write` 是两个独立工具,SubAgent-Work 直接 `Write` 会绕过 read 检查 | **P0** | 在 `WriteTool` 里加 `read_state: HashMap<PathBuf, ReadStamp>`,首次 Write 必须先 Read;mtime 校验同 claudecode |
+| **Edit 唯一性校验三层防御**:精确 → 引号归一化 → sanitize 反义 | **P0** | laew Write 工具应分两步:Write = 创建文件;PatchTool = 增量编辑,实现 old_string 校验 + replace_all |
+| **Read 去重(Dedup)**:同一 session 重复 Read 同一文件时返回 stub 减少 cache_creation | **P1** | `src/agent/tools/read.rs` 加 `read_dedup` 状态机,看 mtime+offset+limit 三元组 |
+| **UTF-16 LE BOM 探测**:Write 时正确处理非 UTF-8 文件 | **P1** | `read_file_bytes()` 探测 BOM,`write_text_content` 按原始 encoding 回写 |
+| **Write 强制 LF、Edit 保留原行尾**:避免 CRLF 文件被强行 Unix 化 | **P1** | `write_text_content(path, content, encoding, line_ending)` 四参数 API,Edit/Write 各自策略 |
+| **NotebookEdit cell_id 双格式**(UUID + cell-N)| **P2** | laew 暂无 Notebook 工具,若加则按此模式 |
+| **Edit 1 GiB 上限防 OOM**:防止 SubAgent 试图编辑二进制巨型文件 | **P0** | `validateInput` 第一行 `stat().size > 1GiB` 拒 |
+| **DESANITIZATIONS 表**:防止 prompt 注入把 sanitize token 写进文件 | **P2** | 复制粘贴到 laew 的 Edit utils |
+
+---
+
+### 20.2 维度二:代码检索与索引(Glob/Grep)
+
+#### 20.2.1 Glob/Grep 100% 走 ripgrep —— 没自研
+
+claudecode 不自研 glob、不自研 grep —— **统一打包 ripgrep**,通过 `src/utils/ripgrep.ts` 包装。
+
+`src/utils/ripgrep.ts:31-65` —— 三层 ripgrep 来源探测:
+
+```typescript
+const getRipgrepConfig = memoize((): RipgrepConfig => {
+  const userWantsSystemRipgrep = isEnvDefinedFalsy(
+    process.env.USE_BUILTIN_RIPGREP,
+  )
+
+  // Try system ripgrep if user wants it
+  if (userWantsSystemRipgrep) {
+    const { cmd: systemPath } = findExecutable('rg', [])
+    if (systemPath !== 'rg') {
+      // SECURITY: Use command name 'rg' instead of systemPath to prevent PATH hijacking
+      // If we used systemPath, a malicious ./rg.exe in current directory could be executed
+      // Using just 'rg' lets the OS resolve it safely with NoDefaultCurrentDirectoryInExePath protection
+      return { mode: 'system', command: 'rg', args: [] }
+    }
+  }
+
+  // In bundled (native) mode, ripgrep is statically compiled into bun-internal
+  // and dispatches based on argv[0]. We spawn ourselves with argv0='rg'.
+  if (isInBundledMode()) {
+    return {
+      mode: 'embedded',
+      command: process.execPath,
+      args: ['--no-config'],
+      argv0: 'rg',
+    }
+  }
+
+  const rgRoot = path.resolve(__dirname, 'vendor', 'ripgrep')
+  const command =
+    process.platform === 'win32'
+      ? path.resolve(rgRoot, `${process.arch}-win32`, 'rg.exe')
+      : path.resolve(rgRoot, `${process.arch}-${process.platform}`, 'rg')
+
+  return { mode: 'builtin', command, args: [] }
+})
+```
+
+**三种 ripgrep 来源**:
+1. `system` —— 系统 PATH 上的 `rg`(用户通过 `USE_BUILTIN_RIPGREP=false` 强制)
+2. `embedded` —— Bun bundle 把 ripgrep 静态编进二进制,通过 `argv0='rg'` 触发
+3. `builtin` —— 随包发布的多平台二进制(`vendor/ripgrep/{arch}-{platform}/rg`)
+
+**安全注意**:故意用命令名 `'rg'` 而非实际路径,防止 PATH hijacking。
+
+`src/utils/ripgrep.ts:80` —— MAX_BUFFER_SIZE = 20MB:
+
+```typescript
+const MAX_BUFFER_SIZE = 20_000_000 // 20MB; large monorepos can have 200k+ files
+```
+
+`src/utils/ripgrep.ts:130-133` —— 超时按平台差异化:
+
+```typescript
+// WSL has severe performance penalty for file reads (3-5x slower on WSL2)
+const defaultTimeout = getPlatform() === 'wsl' ? 60_000 : 20_000
+const parsedSeconds =
+  parseInt(process.env.CLAUDE_CODE_GLOB_TIMEOUT_SECONDS || '', 10) || 0
+const timeout = parsedSeconds > 0 ? parsedSeconds * 1000 : defaultTimeout
+```
+
+#### 20.2.2 SIGTERM→SIGKILL 升级
+
+`src/utils/ripgrep.ts:170-203` —— 超时处理:
+
+```typescript
+let killTimeoutId: ReturnType<typeof setTimeout> | undefined
+const timeoutId = setTimeout(() => {
+  if (process.platform === 'win32') {
+    child.kill()
+  } else {
+    child.kill('SIGTERM')
+    killTimeoutId = setTimeout(c => c.kill('SIGKILL'), 5_000, child)
+  }
+}, timeout)
+```
+
+5 秒 SIGTERM 没死透就 SIGKILL —— `uninterruptible I/O`(深文件系统遍历)时 SIGTERM 也可能堵死。
+
+#### 20.2.3 ripgrep 错误分类
+
+`src/utils/ripgrep.ts:374-456` —— 错误分层处理:
+
+```typescript
+// Success case
+if (!error) {
+  resolve(
+    stdout
+      .trim()
+      .split('\n')
+      .map(line => line.replace(/\r$/, ''))
+      .filter(Boolean),
+  )
+  return
+}
+
+// Exit code 1 is normal "no matches"
+if (error.code === 1) {
+  resolve([])
+  return
+}
+
+// Critical errors that indicate ripgrep is broken, not "no matches"
+// These should be surfaced to the user rather than silently returning empty results
+const CRITICAL_ERROR_CODES = ['ENOENT', 'EACCES', 'EPERM']
+if (CRITICAL_ERROR_CODES.includes(error.code as string)) {
+  reject(error)
+  return
+}
+
+// If we hit EAGAIN and haven't retried yet, retry with single-threaded mode
+if (!isRetry && isEagainError(stderr)) {
+  logForDebugging(
+    `rg EAGAIN error detected, retrying with single-threaded mode (-j 1)`,
+  )
+  logEvent('tengu_ripgrep_eagain_retry', {})
+  ripGrepRaw(
+    args,
+    target,
+    abortSignal,
+    (retryError, retryStdout, retryStderr) => {
+      handleResult(retryError, retryStdout, retryStderr, true)
+    },
+    true, // Force single-threaded mode for this retry only
+  )
+  return
+}
+```
+
+- exit 0 = 有匹配,exit 1 = 无匹配 —— **都算成功**(rg 标准语义)
+- ENOENT/EACCES/EPERM = 关键错误,需要 reject 让调用方知道
+- EAGAIN(`os error 11` / `Resource temporarily unavailable`)是 Docker/CI 资源紧张,自动重试 `-j 1` 单线程模式
+- **关键决策**:超时时若有部分输出,**丢弃最后一行**(可能不完整)再 resolve;若零输出超时则 reject 让模型知道「搜了但没搜完」,不能 silent empty
+
+#### 20.2.4 GrepTool 参数体系完整映射到 rg
+
+`src/tools/GrepTool/GrepTool.ts:33-90` —— Schema:
+
+```typescript
+const inputSchema = lazySchema(() =>
+  z.strictObject({
+    pattern: z
+      .string()
+      .describe('The regular expression pattern to search for in file contents'),
+    path: z
+      .string()
+      .optional()
+      .describe(
+        'File or directory to search in (rg PATH). Defaults to current working directory.',
+      ),
+    glob: z
+      .string()
+      .optional()
+      .describe(
+        'Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}") - maps to rg --glob',
+      ),
+    output_mode: z
+      .enum(['content', 'files_with_matches', 'count'])
+      .optional()
+      .describe(
+        'Output mode: "content" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), "files_with_matches" shows file paths (supports head_limit), "count" shows match counts (supports head_limit). Defaults to "files_with_matches".',
+      ),
+    '-B': semanticNumber(z.number().optional()).describe(
+      'Number of lines to show before each match (rg -B). Requires output_mode: "content", ignored otherwise.',
+    ),
+    '-A': semanticNumber(z.number().optional()).describe(
+      'Number of lines to show after each match (rg -A). Requires output_mode: "content", ignored otherwise.',
+    ),
+    '-C': semanticNumber(z.number().optional()).describe('Alias for context.'),
+    context: semanticNumber(z.number().optional()).describe(
+      'Number of lines to show before and after each match (rg -C). Requires output_mode: "content", ignored otherwise.',
+    ),
+    '-n': semanticBoolean(z.boolean().optional()).describe(
+      'Show line numbers in output (rg -n). Requires output_mode: "content", ignored otherwise. Defaults to true.',
+    ),
+    '-i': semanticBoolean(z.boolean().optional()).describe(
+      'Case insensitive search (rg -i)',
+    ),
+    type: z
+      .string()
+      .optional()
+      .describe(
+        'File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types.',
+      ),
+    head_limit: semanticNumber(z.number().optional()).describe(
+      'Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited (use sparingly — large result sets waste context).',
+    ),
+    offset: semanticNumber(z.number().optional()).describe(
+      'Skip first N lines/entries before applying head_limit, equivalent to "| tail -n +N | head -N". Works across all output modes. Defaults to 0.',
+    ),
+    multiline: semanticBoolean(z.boolean().optional()).describe(
+      'Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.',
+    ),
+  }),
+)
+```
+
+**所有字段**直接映射到 ripgrep flags。`semanticBoolean/semanticNumber` 把字符串 `"true"`/`"42"` 容忍成真值,容忍模型常见 typo。
+
+#### 20.2.5 Grep 三种 output_mode
+
+`src/tools/GrepTool/GrepTool.ts:329-440` —— ripgrep 参数组装:
+
+```typescript
+const args = ['--hidden']
+
+// Exclude VCS directories to avoid noise from version control metadata
+for (const dir of VCS_DIRECTORIES_TO_EXCLUDE) {
+  args.push('--glob', `!${dir}`)
+}
+
+// Limit line length to prevent base64/minified content from cluttering output
+args.push('--max-columns', '500')
+
+// Only apply multiline flags when explicitly requested
+if (multiline) {
+  args.push('-U', '--multiline-dotall')
+}
+
+// Add optional flags
+if (case_insensitive) {
+  args.push('-i')
+}
+
+// Add output mode flags
+if (output_mode === 'files_with_matches') {
+  args.push('-l')
+} else if (output_mode === 'count') {
+  args.push('-c')
+}
+
+// Add line numbers if requested
+if (show_line_numbers && output_mode === 'content') {
+  args.push('-n')
+}
+
+// Add context flags (-C/context takes precedence over context_before/context_after)
+if (output_mode === 'content') {
+  if (context !== undefined) {
+    args.push('-C', context.toString())
+  } else if (context_c !== undefined) {
+    args.push('-C', context_c.toString())
+  } else {
+    if (context_before !== undefined) {
+      args.push('-B', context_before.toString())
+    }
+    if (context_after !== undefined) {
+      args.push('-A', context_after.toString())
+    }
+  }
+}
+
+// If pattern starts with dash, use -e flag to specify it as a pattern
+// This prevents ripgrep from interpreting it as a command-line option
+if (pattern.startsWith('-')) {
+  args.push('-e', pattern)
+} else {
+  args.push(pattern)
+}
+
+// Add type filter if specified
+if (type) {
+  args.push('--type', type)
+}
+```
+
+**关键防御**:`pattern` 以 `-` 开头 → 用 `-e pattern` 转义,防止 ripgrep 把 pattern 当 flag 解析。
+
+#### 20.2.6 VCS 排除 + gitignore + max-column
+
+`src/tools/GrepTool/GrepTool.ts:93-102`:
+
+```typescript
+// Version control system directories to exclude from searches
+// These are excluded automatically because they create noise in search results
+const VCS_DIRECTORIES_TO_EXCLUDE = [
+  '.git',
+  '.svn',
+  '.hg',
+  '.bzr',
+  '.jj',
+  '.sl',
+] as const
+```
+
+6 种 VCS 目录硬编码排除。`--max-columns 500` 防止 base64 单行污染输出。**注意:claudecode 默认 `--hidden` + 不读 `.gitignore`**(`--no-ignore` 是 GlobTool 行为),GrepTool 依赖 `--glob '!pattern'` 由 `getFileReadIgnorePatterns()` 注入的规则(来自 `.claudeignore`/permission 配置)。
+
+#### 20.2.7 sort by mtime(files_with_matches)
+
+`src/tools/GrepTool/GrepTool.ts:526-553` —— 默认按修改时间倒序排:
+
+```typescript
+// Use allSettled so a single ENOENT (file deleted between ripgrep's scan
+// and this stat) does not reject the whole batch. Failed stats sort as mtime 0.
+const stats = await Promise.allSettled(
+  results.map(_ => getFsImplementation().stat(_)),
+)
+const sortedMatches = results
+  // Sort by modification time
+  .map((_, i) => {
+    const r = stats[i]!
+    return [
+      _,
+      r.status === 'fulfilled' ? (r.value.mtimeMs ?? 0) : 0,
+    ] as const
+  })
+  .sort((a, b) => {
+    if (process.env.NODE_ENV === 'test') {
+      // In tests, we always want to sort by filename, so that results are deterministic
+      return a[0].localeCompare(b[0])
+    }
+    const timeComparison = b[1] - a[1]
+    if (timeComparison === 0) {
+      // Sort by filename as a tiebreaker
+      return a[0].localeCompare(b[0])
+    }
+    return timeComparison
+  })
+  .map(_ => _[0])
+```
+
+**生产注释**:`allSettled` 防 ENOENT(ripgrep 扫描到一半文件被删)reject 整批;失败 sort as mtime=0;test 模式按文件名排保 deterministic。
+
+#### 20.2.8 head_limit + offset 三种模式生效
+
+`src/tools/GrepTool/GrepTool.ts:110-128`:
+
+```typescript
+const DEFAULT_HEAD_LIMIT = 250
+
+function applyHeadLimit<T>(
+  items: T[],
+  limit: number | undefined,
+  offset: number = 0,
+): { items: T[]; appliedLimit: number | undefined } {
+  // Explicit 0 = unlimited escape hatch
+  if (limit === 0) {
+    return { items: items.slice(offset), appliedLimit: undefined }
+  }
+  const effectiveLimit = limit ?? DEFAULT_HEAD_LIMIT
+  const sliced = items.slice(offset, offset + effectiveLimit)
+  // Only report appliedLimit when truncation actually occurred, so the model
+  // knows there may be more results and can paginate with offset.
+  const wasTruncated = items.length - offset > effectiveLimit
+  return {
+    items: sliced,
+    appliedLimit: wasTruncated ? effectiveLimit : undefined,
+  }
+}
+```
+
+`src/tools/GrepTool/GrepTool.ts:255-308` —— 三个 output_mode 都生效 head_limit/offset:
+
+```typescript
+mapToolResultToToolResultBlockParam(
+  {
+    mode = 'files_with_matches',
+    numFiles,
+    filenames,
+    content,
+    numLines: _numLines,
+    numMatches,
+    appliedLimit,
+    appliedOffset,
+  },
+  toolUseID,
+) {
+  if (mode === 'content') {
+    const limitInfo = formatLimitInfo(appliedLimit, appliedOffset)
+    const resultContent = content || 'No matches found'
+    const finalContent = limitInfo
+      ? `${resultContent}\n\n[Showing results with pagination = ${limitInfo}]`
+      : resultContent
+    return {
+      tool_use_id: toolUseID,
+      type: 'tool_result',
+      content: finalContent,
+    }
+  }
+  // ...
+}
+```
+
+**关键设计**:`head_limit=0` 是显式 unlimited 的「逃生口」(默认 250 限流,但允许模型说「不限」)。
+
+#### 20.2.9 Glob 排序与截断
+
+`src/utils/glob.ts:100-119`:
+
+```typescript
+const args = [
+  '--files',
+  '--glob',
+  searchPattern,
+  '--sort=modified',
+  ...(noIgnore ? ['--no-ignore'] : []),
+  ...(hidden ? ['--hidden'] : []),
+]
+
+// Add ignore patterns
+for (const pattern of ignorePatterns) {
+  args.push('--glob', `!${pattern}`)
+}
+
+// Exclude orphaned plugin version directories
+for (const exclusion of await getGlobExclusionsForPluginCache(searchDir)) {
+  args.push('--glob', exclusion)
+}
+
+const allPaths = await ripGrep(args, searchDir, abortSignal)
+
+// ripgrep returns relative paths, convert to absolute
+const absolutePaths = allPaths.map(p =>
+  isAbsolute(p) ? p : join(searchDir, p),
+)
+
+const truncated = absolutePaths.length > offset + limit
+const files = absolutePaths.slice(offset, offset + limit)
+```
+
+**`--sort=modified` 默认按修改时间排**,与 Grep 一致。`truncated` 标志让模型知道有更多结果可翻页。**注意 Glob 不分页,只有 limit 截断**(offset=0 永远,line 124)。
+
+#### 20.2.10 Glob 静态前缀 base dir 提取
+
+`src/utils/glob.ts:17-64` —— 解析 glob 字符串,提取静态基础目录:
+
+```typescript
+export function extractGlobBaseDirectory(pattern: string): {
+  baseDir: string
+  relativePattern: string
+} {
+  // Find the first glob special character: *, ?, [, {
+  const globChars = /[*?[{]/
+  const match = pattern.match(globChars)
+
+  if (!match || match.index === undefined) {
+    // No glob characters - this is a literal path
+    // Return the directory portion and filename as pattern
+    const dir = dirname(pattern)
+    const file = basename(pattern)
+    return { baseDir: dir, relativePattern: file }
+  }
+
+  // Get everything before the first glob character
+  const staticPrefix = pattern.slice(0, match.index)
+  // ...
+}
+```
+
+绝对路径 `/**/*.md` 拆成 baseDir=`/`、relativePattern=`**/*.md`,然后传给 `rg --files --glob '**/*.md' /`(ripgrep 要求 glob 是相对路径)。
+
+#### 20.2.11 Glob/Grep 共同 ignore pattern 注入
+
+`src/tools/GrepTool/GrepTool.ts:411-427`:
+
+```typescript
+// Add ignore patterns
+const appState = getAppState()
+const ignorePatterns = normalizePatternsToPath(
+  getFileReadIgnorePatterns(appState.toolPermissionContext),
+  getCwd(),
+)
+for (const ignorePattern of ignorePatterns) {
+  // Note: ripgrep only applies gitignore patterns relative to the working directory
+  // So for non-absolute paths, we need to prefix them with '**'
+  // See: https://github.com/BurntSushi/ripgrep/discussions/2156#discussioncomment-2316335
+  //
+  // We also need to negate the pattern with `!` to exclude it
+  const rgIgnorePattern = ignorePattern.startsWith('/')
+    ? `!${ignorePattern}`
+    : `!**/${ignorePattern}`
+  args.push('--glob', rgIgnorePattern)
+}
+```
+
+**关键**:把 `.claudeignore` / permission rule 转 `--glob '!pattern'`,绝对路径加 `!`(ripgrep glob 语法表示排除);相对路径加 `!**/` 前缀因为 ripgrep 只对 cwd 相对的 gitignore 生效。
+
+#### 20.2.12 没有符号索引/embedding —— 100% ripgrep
+
+claudecode **没有**任何符号索引(无 LSP-based symbol lookup 作为工具)、**没有** embedding-based 语义搜索。Grep 是纯正则检索(ripgrep = Rust regex)。`SymbolSearchTool` 不存在。
+
+#### 20.2.13 对 laew 的借鉴(维度二)
+
+| 借鉴项 | 优先级 | 实现路径 |
+|--------|--------|----------|
+| **依赖 ripgrep 二进制**(不写 Rust regex 自己实现)| **P0** | laew Bash 工具已可调用外部命令,新增 `GrepTool` 直接 `rg --json`,无需新 crate |
+| **三档 ripgrep 来源**:系统 / 内嵌 / vendor 二进制 | **P2** | laew 单二进制发布时 vendor `rg` for linux-x86_64/arm64 + macos |
+| **SIGTERM→SIGKILL 升级**:超时 5s 升级,防 uninterruptible I/O | **P1** | Rust `tokio::process::kill` 两阶段 |
+| **EAGAIN → -j 1 重试**:Docker/CI 资源紧张场景 | **P2** | 复制 ripgrep.ts:431-456 的逻辑 |
+| **三种 output_mode**(content / files_with_matches / count)| **P0** | GrepTool schema 同款 |
+| **head_limit + offset 三模式生效**:默认 250 限流,显式 0 不限 | **P0** | laew 当前 Bash grep 无分页,加 head_limit 防 context 爆炸 |
+| **mtime 排序 files_with_matches**:最近改的优先 | **P1** | Grep call 内对 stat 结果 sort by mtimeMs desc |
+| **VCS 目录硬排除 + max-columns 500** | **P1** | 自动 `--glob '!.git'` 等 6 种 + `--max-columns 500` |
+| **静态 base dir 提取**(绝对路径 `/**/*.md` 拆 baseDir + relativePattern)| **P1** | 借鉴 extractGlobBaseDirectory,laew 当前直接传 cwd 效率低 |
+| **绝对 ignore pattern `!**/` 前缀**:ripgrep 的 gitignore 相对路径怪癖 | **P2** | laew 暂无 .claudeignore 但 Roadmap 中,可直接照搬 |
+| **超时差异化**:WSL 60s / 普通 20s | **P2** | laew 当前 Bash 工具 2min timeout,可加平台探测 |
+
+---
+
+### 20.3 维度三:多模态与文件处理
+
+#### 20.3.1 Read 工具五种输出类型
+
+`src/tools/FileReadTool/FileReadTool.ts:248-332` —— Read 输出是 discriminatedUnion,5 种 type:
+
+```typescript
+const outputSchema = lazySchema(() => {
+  // Define the media types supported for images
+  const imageMediaTypes = z.enum([
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/webp',
+  ])
+
+  return z.discriminatedUnion('type', [
+    z.object({
+      type: z.literal('text'),
+      file: z.object({
+        filePath: z.string().describe('The path to the file that was read'),
+        content: z.string().describe('The content of the file'),
+        numLines: z.number().describe('Number of lines in the returned content'),
+        startLine: z.number().describe('The starting line number'),
+        totalLines: z.number().describe('Total lines in the file'),
+      }),
+    }),
+    z.object({
+      type: z.literal('image'),
+      file: z.object({
+        base64: z.string().describe('Base64-encoded image data'),
+        type: imageMediaTypes.describe('The MIME type of the image'),
+        originalSize: z.number().describe('Original file size in bytes'),
+        dimensions: z.object({
+          originalWidth: z.number().optional(),
+          originalHeight: z.number().optional(),
+          displayWidth: z.number().optional(),
+          displayHeight: z.number().optional(),
+        }).optional(),
+      }),
+    }),
+    z.object({
+      type: z.literal('notebook'),
+      file: z.object({
+        filePath: z.string().describe('The path to the notebook file'),
+        cells: z.array(z.any()).describe('Array of notebook cells'),
+      }),
+    }),
+    z.object({
+      type: z.literal('pdf'),
+      file: z.object({
+        filePath: z.string().describe('The path to the PDF file'),
+        base64: z.string().describe('Base64-encoded PDF data'),
+        originalSize: z.number().describe('Original file size in bytes'),
+      }),
+    }),
+    z.object({
+      type: z.literal('parts'),
+      file: z.object({
+        filePath: z.string().describe('The path to the PDF file'),
+        originalSize: z.number().describe('Original file size in bytes'),
+        count: z.number().describe('Number of pages extracted'),
+        outputDir: z.string().describe('Directory containing extracted page images'),
+      }),
+    }),
+    z.object({
+      type: z.literal('file_unchanged'),
+      file: z.object({ filePath: z.string().describe('The path to the file') }),
+    }),
+  ])
+})
+```
+
+#### 20.3.2 Image → base64 → Anthropic content block
+
+`src/tools/FileReadTool/FileReadTool.ts:652-668` —— image 转 tool_result 时的格式:
+
+```typescript
+mapToolResultToToolResultBlockParam(data, toolUseID) {
+  switch (data.type) {
+    case 'image': {
+      return {
+        tool_use_id: toolUseID,
+        type: 'tool_result',
+        content: [
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              data: data.file.base64,
+              media_type: data.file.type,
+            },
+          },
+        ],
+      }
+    }
+    // ...
+  }
+}
+```
+
+`source.type = 'base64'` + `media_type` 是 Anthropic 多模态标准格式。
+
+#### 20.3.3 Image 真实阈值
+
+`src/constants/apiLimits.ts:17-43`:
+
+```typescript
+/**
+ * Maximum base64-encoded image size (API enforced).
+ * The API rejects images where the base64 string length exceeds this value.
+ */
+export const API_IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024 // 5 MB
+
+/**
+ * Target raw image size to stay under base64 limit after encoding.
+ * Base64 encoding increases size by 4/3, so we derive the max raw size:
+ * raw_size * 4/3 = base64_size → raw_size = base64_size * 3/4
+ */
+export const IMAGE_TARGET_RAW_SIZE = (API_IMAGE_MAX_BASE64_SIZE * 3) / 4 // 3.75 MB
+
+/**
+ * Client-side maximum dimensions for image resizing.
+ *
+ * Note: The API internally resizes images larger than 1568px (source:
+ * encoding/full_encoding.py), but this is handled server-side and doesn't
+ * cause errors. These client-side limits (2000px) are slightly larger to
+ * preserve quality when beneficial.
+ */
+export const IMAGE_MAX_WIDTH = 2000
+export const IMAGE_MAX_HEIGHT = 2000
+```
+
+| 阈值 | 数值 | 说明 |
+|------|------|------|
+| **API 硬限 base64 长度** | **5 MB** | 服务端拒绝(base64 长度而非 raw bytes)|
+| **客户端压缩目标 raw** | **3.75 MB** | = 5MB × 3/4 |
+| **客户端最大宽/高** | **2000 × 2000 px** | 略大于 API 服务端 1568px 阈值,保留质量 |
+| **服务端内部阈值** | **1568 px** | 注释里引用 `encoding/full_encoding.py` |
+
+#### 20.3.4 Image 压缩管线(maybeResizeAndDownsampleImageBuffer)
+
+`src/utils/imageResizer.ts:169-340` —— 三阶段压缩管线:**(1) 不动 → (2) 质量降级 → (3) 缩放尺寸**:
+
+```typescript
+export async function maybeResizeAndDownsampleImageBuffer(
+  imageBuffer: Buffer,
+  originalSize: number,
+  ext: string,
+): Promise<ResizeResult> {
+  if (imageBuffer.length === 0) {
+    throw new ImageResizeError('Image file is empty (0 bytes)')
+  }
+  try {
+    const sharp = await getImageProcessor()
+    const image = sharp(imageBuffer)
+    const metadata = await image.metadata()
+    const mediaType = metadata.format ?? ext
+    // Normalize "jpg" to "jpeg" for media type compatibility
+    const normalizedMediaType = mediaType === 'jpg' ? 'jpeg' : mediaType
+
+    // ...
+    // Check if the original file just works
+    if (
+      originalSize <= IMAGE_TARGET_RAW_SIZE &&
+      width <= IMAGE_MAX_WIDTH &&
+      height <= IMAGE_MAX_HEIGHT
+    ) {
+      return {
+        buffer: imageBuffer,
+        mediaType: normalizedMediaType,
+        dimensions: { originalWidth, originalHeight, displayWidth: width, displayHeight: height },
+      }
+    }
+
+    const needsDimensionResize =
+      width > IMAGE_MAX_WIDTH || height > IMAGE_MAX_HEIGHT
+    const isPng = normalizedMediaType === 'png'
+
+    // If dimensions are within limits but file is too large, try compression first
+    if (!needsDimensionResize && originalSize > IMAGE_TARGET_RAW_SIZE) {
+      // For PNGs, try PNG compression first to preserve transparency
+      if (isPng) {
+        const pngCompressed = await sharp(imageBuffer)
+          .png({ compressionLevel: 9, palette: true })
+          .toBuffer()
+        if (pngCompressed.length <= IMAGE_TARGET_RAW_SIZE) {
+          return { buffer: pngCompressed, mediaType: 'png', dimensions: {...} }
+        }
+      }
+      // Try JPEG compression (lossy but much smaller)
+      for (const quality of [80, 60, 40, 20]) {
+        const compressedBuffer = await sharp(imageBuffer)
+          .jpeg({ quality })
+          .toBuffer()
+        if (compressedBuffer.length <= IMAGE_TARGET_RAW_SIZE) {
+          return { buffer: compressedBuffer, mediaType: 'jpeg', dimensions: {...} }
+        }
+      }
+    }
+
+    // Constrain dimensions if needed
+    if (width > IMAGE_MAX_WIDTH) {
+      height = Math.round((height * IMAGE_MAX_WIDTH) / width)
+      width = IMAGE_MAX_WIDTH
+    }
+    if (height > IMAGE_MAX_HEIGHT) {
+      width = Math.round((width * IMAGE_MAX_HEIGHT) / height)
+      height = IMAGE_MAX_HEIGHT
+    }
+    // ... resize + re-compress
+  }
+}
+```
+
+**算法**:
+1. 原始图 < 3.75 MB 且 < 2000x2000 → 原样返回
+2. 仅尺寸过大 → 缩到 2000x2000(保持宽高比)
+3. 仅体积过大 → PNG 优先无损压缩(compressionLevel=9 + palette)→ JPEG 质量阶梯 80/60/40/20
+4. 体积 + 尺寸都过大 → 先质量降级再缩
+
+#### 20.3.5 Image Token 预算估算
+
+`src/tools/FileReadTool/FileReadTool.ts:1137-1183` —— Token 估算 + 激进压缩:
+
+```typescript
+const estimatedTokens = Math.ceil(result.file.base64.length * 0.125)
+if (estimatedTokens > maxTokens) {
+  // Aggressive compression from the SAME buffer (no re-read)
+  try {
+    const compressed = await compressImageBufferWithTokenLimit(
+      imageBuffer,
+      maxTokens,
+      detectedMediaType,
+    )
+    return {
+      type: 'image',
+      file: {
+        base64: compressed.base64,
+        type: compressed.mediaType,
+        originalSize,
+      },
+    }
+  } catch (e) {
+    logError(e)
+    // Fallback: heavily compressed version from the SAME buffer
+    try {
+      const sharpModule = await import('sharp')
+      const sharp = ...default || sharpModule
+      const fallbackBuffer = await sharp(imageBuffer)
+        .resize(400, 400, { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 20 })
+        .toBuffer()
+
+      return createImageResponse(fallbackBuffer, 'jpeg', originalSize)
+    } catch (error) {
+      logError(error)
+      return createImageResponse(imageBuffer, detectedFormat, originalSize)
+    }
+  }
+}
+```
+
+**关键**:
+- `base64.length * 0.125` ≈ tokens(经验值)
+- 超出 token 预算 → `compressImageBufferWithTokenLimit` 激进压缩
+- 再失败 → sharp 强制 400x400 + quality=20 兜底
+- 全部失败 → 原图返回(赌模型能处理)
+
+#### 20.3.6 PDF 处理:inline vs 抽页
+
+`src/constants/apiLimits.ts:54-83`:
+
+```typescript
+export const PDF_TARGET_RAW_SIZE = 20 * 1024 * 1024 // 20 MB
+
+export const API_PDF_MAX_PAGES = 100
+
+export const PDF_EXTRACT_SIZE_THRESHOLD = 3 * 1024 * 1024 // 3 MB
+
+export const PDF_MAX_EXTRACT_SIZE = 100 * 1024 * 1024 // 100 MB
+
+export const PDF_MAX_PAGES_PER_READ = 20
+
+export const PDF_AT_MENTION_INLINE_THRESHOLD = 10
+```
+
+`src/tools/FileReadTool/FileReadTool.ts:894-1017` —— 三档处理:
+
+```typescript
+// --- PDF ---
+if (isPDFExtension(ext)) {
+  if (pages) {
+    // 指定 pages 参数 → 抽页为图片(JPEG)
+    const parsedRange = parsePDFPageRange(pages)
+    const extractResult = await extractPDFPages(
+      resolvedFilePath,
+      parsedRange ?? undefined,
+    )
+    // ... 返回 image blocks
+    return {
+      data: extractResult.data,
+      ...(imageBlocks.length > 0 && {
+        newMessages: [
+          createUserMessage({ content: imageBlocks, isMeta: true }),
+        ],
+      }),
+    }
+  }
+
+  const pageCount = await getPDFPageCount(resolvedFilePath)
+  if (pageCount !== null && pageCount > PDF_AT_MENTION_INLINE_THRESHOLD) {
+    throw new Error(
+      `This PDF has ${pageCount} pages, which is too many to read at once. ` +
+        `Use the pages parameter to read specific page ranges (e.g., pages: "1-5"). ` +
+        `Maximum ${PDF_MAX_PAGES_PER_READ} pages per request.`,
+    )
+  }
+
+  const fs = getFsImplementation()
+  const stats = await fs.stat(resolvedFilePath)
+  const shouldExtractPages =
+    !isPDFSupported() || stats.size > PDF_EXTRACT_SIZE_THRESHOLD
+
+  if (shouldExtractPages) {
+    // 大 PDF 或不支持 → 抽页
+    const extractResult = await extractPDFPages(resolvedFilePath)
+    // ...
+  }
+
+  if (!isPDFSupported()) {
+    throw new Error(
+      'Reading full PDFs is not supported with this model. Use a newer model (Sonnet 3.5 v2 or later), ' +
+        `or use the pages parameter to read specific page ranges (e.g., pages: "1-5", maximum ${PDF_MAX_PAGES_PER_READ} pages per request). ` +
+        'Page extraction requires poppler-utils: install with `brew install poppler` on macOS or `apt-get install poppler-utils` on Debian/Ubuntu.',
+    )
+  }
+
+  const readResult = await readPDF(resolvedFilePath)
+  // ... 返回 base64 application/pdf
+}
+```
+
+| PDF 状态 | 处理路径 |
+|---------|----------|
+| `pages` 参数指定 | 抽页为 JPEG 图片 → image content blocks |
+| 页数 > 10 | 抛错,引导用 pages 参数 |
+| size > 3 MB 或 model 不支持 | 抽页为图片 → parts 类型 |
+| size ≤ 3 MB 且 model 支持 | 直接 base64 → document content block |
+
+#### 20.3.7 Notebook → cells 序列化
+
+`src/tools/FileReadTool/FileReadTool.ts:821-863` —— ipynb 走专用路径:
+
+```typescript
+if (ext === 'ipynb') {
+  const cells = await readNotebook(resolvedFilePath)
+  const cellsJson = jsonStringify(cells)
+
+  const cellsJsonBytes = Buffer.byteLength(cellsJson)
+  if (cellsJsonBytes > maxSizeBytes) {
+    throw new Error(
+      `Notebook content (${formatFileSize(cellsJsonBytes)}) exceeds maximum allowed size (${formatFileSize(maxSizeBytes)}. ` +
+        `Use ${BASH_TOOL_NAME} with jq to read specific portions:\n` +
+        `  cat "${file_path}" | jq '.cells[:20]' # First 20 cells\n` +
+        // ...
+    )
+  }
+
+  await validateContentTokens(cellsJson, ext, maxTokens)
+  // ...
+}
+```
+
+`cellsJsonBytes > maxSizeBytes` 时,错误消息**引导用户用 jq 分批读**,不直接截断(防止模型只看到一半 cells)。
+
+#### 20.3.8 截图/粘贴图片入口
+
+`src/components/PromptInput/PromptInput.tsx:1151-1183` —— TUI 粘贴图片入口:
+
+```typescript
+function onImagePaste(image: string, mediaType?: string, filename?: string, dimensions?: ImageDimensions, sourcePath?: string) {
+  logEvent('tengu_paste_image', {});
+  onModeChange('prompt');
+  const pasteId = nextPasteIdRef.current++;
+  const newContent: PastedContent = {
+    id: pasteId,
+    type: 'image',
+    content: image,
+    mediaType: mediaType || 'image/png',
+    // default to PNG if not provided
+    filename: filename || 'Pasted image',
+    dimensions,
+    sourcePath
+  };
+
+  // Cache path immediately (fast) so links work on render
+  cacheImagePath(newContent);
+
+  // Store image to disk in background
+  void storeImage(newContent);
+
+  // Update UI
+  setPastedContents(prev => ({
+    ...prev,
+    [pasteId]: newContent
+  }));
+  // ...
+}
+```
+
+粘贴 → 立即 cachePath → 后台 storeImage → UI 显示 `[Image #N]` 占位符 → 模型收到 base64 content block。
+
+#### 20.3.9 大文件兜底 + token 计数 API
+
+`src/tools/FileReadTool/FileReadTool.ts:755-772` —— 双重防御:maxSizeBytes + maxTokens:
+
+```typescript
+async function validateContentTokens(
+  content: string,
+  ext: string,
+  maxTokens?: number,
+): Promise<void> {
+  const effectiveMaxTokens =
+    maxTokens ?? getDefaultFileReadingLimits().maxTokens
+
+  const tokenEstimate = roughTokenCountEstimationForFileType(content, ext)
+  if (!tokenEstimate || tokenEstimate <= effectiveMaxTokens / 4) return
+
+  const tokenCount = await countTokensWithAPI(content)
+  const effectiveCount = tokenCount ?? tokenEstimate
+
+  if (effectiveCount > effectiveMaxTokens) {
+    throw new MaxFileReadTokenExceededError(effectiveCount, effectiveMaxTokens)
+  }
+}
+```
+
+**策略**:
+1. 估算 ≤ 1/4 maxTokens → 直接放行
+2. 估算超过 1/4 → 调用 `anthropic.beta.messages.countTokens()` API
+3. 真实计数超过 maxTokens → 抛错
+4. 估算超过 1/4 + API 失败 → 用估算(宁可放过)
+
+`src/services/tokenEstimation.ts:124-138` —— count_tokens API 调用:
+
+```typescript
+export async function countTokensWithAPI(
+  content: string,
+): Promise<number | null> {
+  // Special case for empty content - API doesn't accept empty messages
+  if (!content) {
+    return 0
+  }
+
+  const message: Anthropic.Beta.Messages.BetaMessageParam = {
+    role: 'user',
+    content: content,
+  }
+
+  return countMessagesTokensWithAPI([message], [])
+}
+```
+
+#### 20.3.10 Read 工具的 mtime dedup stub
+
+(已在 20.1.4 详述)
+
+#### 20.3.11 Read 工具屏蔽 /dev 设备
+
+`src/tools/FileReadTool/FileReadTool.ts:96-117`:
+
+```typescript
+const BLOCKED_DEVICE_PATHS = new Set([
+  // Infinite output — never reach EOF
+  '/dev/zero',
+  '/dev/random',
+  '/dev/urandom',
+  '/dev/full',
+  // Blocks waiting for input
+  '/dev/stdin',
+  '/dev/tty',
+  '/dev/console',
+  // Nonsensical to read
+  '/dev/stdout',
+  '/dev/stderr',
+  // fd aliases for stdin/stdout/stderr
+  '/dev/fd/0',
+  '/dev/fd/1',
+  '/dev/fd/2',
+])
+
+function isBlockedDevicePath(filePath: string): boolean {
+  if (BLOCKED_DEVICE_PATHS.has(filePath)) return true
+  // /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
+  if (
+    filePath.startsWith('/proc/') &&
+    (filePath.endsWith('/fd/0') ||
+      filePath.endsWith('/fd/1') ||
+      filePath.endsWith('/fd/2'))
+  )
+    return true
+  return false
+}
+```
+
+`/dev/null` 故意不放(合法用例)。
+
+#### 20.3.12 macOS 截图路径空格兼容
+
+`src/tools/FileReadTool/FileReadTool.ts:131-159`:
+
+```typescript
+// Narrow no-break space (U+202F) used by some macOS versions in screenshot filenames
+const THIN_SPACE = String.fromCharCode(8239)
+
+function getAlternateScreenshotPath(filePath: string): string | undefined {
+  const filename = path.basename(filePath)
+  const amPmPattern = /^(.+)([  ])(AM|PM)(\.png)$/
+  const match = filename.match(amPmPattern)
+  if (!match) return undefined
+
+  const currentSpace = match[2]
+  const alternateSpace = currentSpace === ' ' ? THIN_SPACE : ' '
+  return filePath.replace(
+    `${currentSpace}${match[3]}${match[4]}`,
+    `${alternateSpace}${match[3]}${match[4]}`,
+  )
+}
+```
+
+macOS 截图文件名前缀里 AM/PM 前的空格**有些版本是 narrow no-break space(U+202F)**,普通 grep 不命中。Read 工具先试原路径,ENOENT 时尝试交换两种空格。
+
+#### 20.3.13 提示词注入防御:Read 后插入 cyber risk reminder
+
+`src/tools/FileReadTool/FileReadTool.ts:729-738`:
+
+```typescript
+export const CYBER_RISK_MITIGATION_REMINDER =
+  '\n\n<system-reminder>\nWhenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.\n</system-reminder>\n'
+
+// Models where cyber risk mitigation should be skipped
+const MITIGATION_EXEMPT_MODELS = new Set(['claude-opus-4-6'])
+
+function shouldIncludeFileReadMitigation(): boolean {
+  const shortName = getCanonicalName(getMainLoopModel())
+  return !MITIGATION_EXEMPT_MODELS.has(shortName)
+}
+```
+
+每次 Read 都注入一段 system-reminder 防止模型无脑改进 malware。Opus 4.6 豁免(已内置更强约束)。
+
+#### 20.3.14 对 laew 的借鉴(维度三)
+
+| 借鉴项 | 优先级 | 实现路径 |
+|--------|--------|----------|
+| **Read 工具支持 image/pdf/notebook**:5 种 discriminatedUnion | **P1** | laew Read 当前只读 string,扩展 `ReadResult::{Text,Image(Png/Jpeg/Gif/Webp),Pdf,Ipyb,FileUnchanged}` |
+| **Image 三档压缩**(原图 → 质量阶梯 80/60/40/20 → 缩尺寸 2000x2000)| **P1** | laew 引入 `image` crate 做缩放/转 JPEG;设 `IMAGE_TARGET_RAW_SIZE = 3.75MB` |
+| **base64 长度估算 token**:`base64.length * 0.125` | **P0** | laew image 进 context 前估算 token |
+| **PDF 三档处理**(抽页 vs inline base64)| **P2** | laew 暂无 PDF 支持;若加,先 `pdfium-render` crate 抽页为 PNG |
+| **`/dev/zero` 等阻塞设备黑名单** | **P0** | laew Bash 工具应同步屏蔽 |
+| **macOS 截图 thin space fallback** | **P2** | 跨平台粘贴路径命中问题可借鉴 |
+| **count_tokens API 二次确认**(超过 1/4 maxTokens 才打 API)| **P1** | laew 暂无 count_tokens,但 Token 估算粗估的策略可借鉴 |
+| **Read 后注入 cyber risk reminder** | **P2** | laew 可选;按 model 维度豁免 |
+| **Notebook 超大 → 引导 jq 分批**:不直接截断 | **P2** | laew Read 工具若加 ipynb,错误信息包含 jq 示例 |
+| **Notebook output 截断** | **P2** | laew Read ipynb 应截断 cell output(如 base64 图像) |
+
+---
+
+### 20.4 维度四:Prompt Caching 与 Token 预算
+
+#### 20.4.1 cache_control 标记格式
+
+`src/services/api/claude.ts:358-374`:
+
+```typescript
+export function getCacheControl({
+  scope,
+  querySource,
+}: {
+  scope?: CacheScope
+  querySource?: QuerySource
+} = {}): {
+  type: 'ephemeral'
+  ttl?: '1h'
+  scope?: CacheScope
+} {
+  return {
+    type: 'ephemeral',
+    ...(should1hCacheTTL(querySource) && { ttl: '1h' }),
+    ...(scope === 'global' && { scope }),
+  }
+}
+```
+
+`claude-3-5-sonnet-*` 等模型支持 `cache_control: { type: 'ephemeral' }`,1h cache 是更长 TTL 的扩展。
+
+#### 20.4.2 should1hCacheTTL 的策略
+
+`src/services/api/claude.ts:393-434`:
+
+```typescript
+function should1hCacheTTL(querySource?: QuerySource): boolean {
+  // 3P Bedrock users get 1h TTL when opted in via env var — they manage their own billing
+  // No GrowthBook gating needed since 3P users don't have GrowthBook configured
+  if (
+    getAPIProvider() === 'bedrock' &&
+    isEnvTruthy(process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK)
+  ) {
+    return true
+  }
+
+  // Latch eligibility in bootstrap state for session stability — prevents
+  // mid-session overage flips from changing the cache_control TTL, which
+  // would bust the server-side prompt cache (~20K tokens per flip).
+  let userEligible = getPromptCache1hEligible()
+  if (userEligible === null) {
+    userEligible =
+      process.env.USER_TYPE === 'ant' ||
+      (isClaudeAISubscriber() && !currentLimits.isUsingOverage)
+    setPromptCache1hEligible(userEligible)
+  }
+  if (!userEligible) return false
+
+  // Cache allowlist in bootstrap state for session stability — prevents mixed
+  // TTLs when GrowthBook's disk cache updates mid-request
+  let allowlist = getPromptCache1hAllowlist()
+  if (allowlist === null) {
+    const config = getFeatureValue_CACHED_MAY_BE_STALE<{
+      allowlist?: string[]
+    }>('tengu_prompt_cache_1h_config', {})
+    allowlist = config.allowlist ?? []
+    setPromptCache1hAllowlist(allowlist)
+  }
+
+  return (
+    querySource !== undefined &&
+    allowlist.some(pattern =>
+      pattern.endsWith('*')
+        ? querySource.startsWith(pattern.slice(0, -1))
+        : querySource === pattern,
+    )
+  )
+}
+```
+
+**三层闸门**:
+1. **Bedrock 用户**通过 env var 直接放行(他们自己管 billing)
+2. **`USER_TYPE === 'ant'` 或 `claude.ai` 订阅者**(非 overage)=「长 TTL 合格用户」
+3. **querySource 在 GrowthBook allowlist 里**:如 `["repl_main_thread*", "sdk", "agent:*"]`
+
+**关键设计**:资格**latch 到 bootstrap state**,防止 overage flip 改 TTL 导致服务端 cache bust(每次 flip ≈ 20K tokens 重写)。
+
+#### 20.4.3 「单 marker 精准策略」—— 拒绝双 marker
+
+`src/services/api/claude.ts:3078-3089`:
+
+```typescript
+// Exactly one message-level cache_control marker per request. Mycro's
+// turn-to-turn eviction (page_manager/index.rs: Index::insert) frees
+// local-attention KV pages at any cached prefix position NOT in
+// cache_store_int_token_boundaries. With two markers the second-to-last
+// position is protected and its locals survive an extra turn even though
+// nothing will ever resume from there — with one marker they're freed
+// immediately. For fire-and-forget forks (skipCacheWrite) we shift the
+// marker to the second-to-last message: that's the last shared-prefix
+// point, so the write is a no-op merge on mycro (entry already exists)
+// and the fork doesn't leave its own tail in the KVCC. Dense pages are
+// refcounted and survive via the new hash either way.
+const markerIndex = skipCacheWrite ? messages.length - 2 : messages.length - 1
+```
+
+**核心洞察**:**只放一个 cache_control marker** —— 第二个 marker 会「保护」一个永远不会被 resume 的位置,造成 KV cache 浪费。**单 marker 策略下,turn-to-turn eviction 立即释放 local-attention KV pages**。
+
+对于 `skipCacheWrite=true`(fire-and-forget fork,如 background task),marker 移到 `length - 2`(倒数第二条),因为倒数第二条是「最后共享前缀点」,server 端 KV 合并是 no-op。
+
+#### 20.4.4 cache_reference + cache_edits 机制
+
+`src/services/api/claude.ts:3166-3217`:
+
+```typescript
+// Find the last message containing a cache_control marker
+let lastCCMsg = -1
+for (let i = 0; i < result.length; i++) {
+  const msg = result[i]!
+  if (Array.isArray(msg.content)) {
+    for (const block of msg.content) {
+      if (block && typeof block === 'object' && 'cache_control' in block) {
+        lastCCMsg = i
+      }
+    }
+  }
+}
+
+// Add cache_reference to tool_result blocks that are strictly before
+// the last cache_control marker. The API requires cache_reference to
+// appear "before or on" the last cache_control — we use strict "before"
+// to avoid edge cases where cache_edits splicing shifts block indices.
+//
+// Create new objects instead of mutating in-place to avoid contaminating
+// blocks reused by secondary queries that use models without cache_editing support.
+if (lastCCMsg >= 0) {
+  for (let i = 0; i < lastCCMsg; i++) {
+    const msg = result[i]!
+    // ...
+  }
+}
+```
+
+- **cache_reference**:指向已存在的缓存前缀(让 server 知道我们想命中哪段)
+- **cache_edits**:删除某些 cache_reference(显式放弃缓存段)
+
+注释强调「strict before」而非「before or on」:因为 cache_edits splicing 会移 block 索引,strict before 避免边界 case。
+
+#### 20.4.5 系统提示词缓存破坏(ephemeral prepend)
+
+`src/context.ts:22`(注释):
+
+```typescript
+// System prompt injection for cache breaking (ant-only, ephemeral debugging state)
+```
+
+`src/services/api/claude.ts:1329-1388`(注释):
+
+```typescript
+// ephemeral prepend (which busts cache whenever the pool changes).
+```
+
+**机制**:在 system prompt 头部加 ephemeral 标记(ant 用户才能用),里面放动态诊断信息(pool 状态变化时整个 system 重新缓存,显式 bust cache 用于调试)。
+
+#### 20.4.6 cache token 字段读取与展示
+
+`src/cost-tracker.ts:250-276`:
+
+```typescript
+function addToTotalModelUsage(
+  cost: number,
+  usage: Usage,
+  model: string,
+): ModelUsage {
+  const modelUsage = getUsageForModel(model) ?? {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    // ...
+  }
+
+  modelUsage.inputTokens += usage.input_tokens
+  modelUsage.outputTokens += usage.output_tokens
+  modelUsage.cacheReadInputTokens += usage.cache_read_input_tokens ?? 0
+  modelUsage.cacheCreationInputTokens += usage.cache_creation_input_tokens ?? 0
+  // ...
+}
+```
+
+`src/services/tokenEstimation.ts:320-322`:
+
+```typescript
+const inputTokens = usage.input_tokens
+const cacheCreationTokens = usage.cache_creation_input_tokens || 0
+const cacheReadTokens = usage.cache_read_input_tokens || 0
+```
+
+**核心字段**:
+- `input_tokens`:未缓存的 input
+- `output_tokens`:模型输出
+- `cache_creation_input_tokens`:本次写入 cache 的 tokens
+- `cache_read_input_tokens`:本次命中 cache 的 tokens
+- `cache_creation.ephemeral_1h_input_tokens`:1h TTL cache 写入
+- `cache_creation.ephemeral_5m_input_tokens`:5m TTL cache 写入
+
+`src/services/api/claude.ts:2958-2963`:
+
+```typescript
+ephemeral_1h_input_tokens:
+  (partUsage as BetaUsage).cache_creation?.ephemeral_1h_input_tokens ??
+  usage.cache_creation.ephemeral_1h_input_tokens,
+ephemeral_5m_input_tokens:
+  (partUsage as BetaUsage).cache_creation?.ephemeral_5m_input_tokens ??
+  usage.cache_creation.ephemeral_5m_input_tokens,
+```
+
+**Display**:`cost-tracker.ts` 同时维护 `cacheReadInputTokens` + `cacheCreationInputTokens` 累加,在 `/cost` 命令和 status line 显示。
+
+#### 20.4.7 count_tokens API 在哪用
+
+`src/services/tokenEstimation.ts:124-138`:
+
+```typescript
+export async function countTokensWithAPI(
+  content: string,
+): Promise<number | null> {
+  // Special case for empty content - API doesn't accept empty messages
+  if (!content) {
+    return 0
+  }
+
+  const message: Anthropic.Beta.Messages.BetaMessageParam = {
+    role: 'user',
+    content: content,
+  }
+
+  return countMessagesTokensWithAPI([message], [])
+}
+```
+
+`src/services/tokenEstimation.ts:140-201`:
+
+```typescript
+export async function countMessagesTokensWithAPI(
+  messages: Anthropic.Beta.Messages.BetaMessageParam[],
+  tools: Anthropic.Beta.Messages.BetaToolUnion[],
+): Promise<number | null> {
+  return withTokenCountVCR(messages, tools, async () => {
+    try {
+      const model = getMainLoopModel()
+      const betas = getModelBetas(model)
+      const containsThinking = hasThinkingBlocks(messages)
+
+      if (getAPIProvider() === 'bedrock') {
+        return countTokensWithBedrock({...})
+      }
+
+      const anthropic = await getAnthropicClient({
+        maxRetries: 1,
+        model,
+        source: 'count_tokens',
+      })
+
+      // ...
+      const response = await anthropic.beta.messages.countTokens({
+        model: normalizeModelStringForAPI(model),
+        messages: messages.length > 0 ? messages : [{ role: 'user', content: 'foo' }],
+        tools,
+        ...(filteredBetas.length > 0 && { betas: filteredBetas }),
+        ...(containsThinking && {
+          thinking: {
+            type: 'enabled',
+            budget_tokens: TOKEN_COUNT_THINKING_BUDGET,
+          },
+        }),
+      })
+
+      if (typeof response.input_tokens !== 'number') {
+        return null
+      }
+
+      return response.input_tokens
+    } catch (error) {
+      logError(error)
+      return null
+    }
+  })
+}
+```
+
+**关键细节**:
+- 使用 beta SDK + `messages.length === 0` 时塞 dummy message(tools token 计数需要 message)
+- 包含 thinking blocks 时带 `thinking: { type: 'enabled', budget_tokens: ... }`
+- Bedrock 不支持 countTokens → fallback 到本地估算
+
+#### 20.4.8 压缩触发阈值
+
+`src/services/compact/autoCompact.ts:33-91`:
+
+```typescript
+export function getEffectiveContextWindowSize(model: string): number {
+  const reservedTokensForSummary = Math.min(
+    getMaxOutputTokensForModel(model),
+    MAX_OUTPUT_TOKENS_FOR_SUMMARY,
+  )
+  let contextWindow = getContextWindowForModel(model, getSdkBetas())
+
+  const autoCompactWindow = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  if (autoCompactWindow) {
+    const parsed = parseInt(autoCompactWindow, 10)
+    if (!isNaN(parsed) && parsed > 0) {
+      contextWindow = Math.min(contextWindow, parsed)
+    }
+  }
+
+  return contextWindow - reservedTokensForSummary
+}
+
+// ...
+
+export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
+export const WARNING_THRESHOLD_BUFFER_TOKENS = 20_000
+export const ERROR_THRESHOLD_BUFFER_TOKENS = 20_000
+export const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
+
+// Stop trying autocompact after this many consecutive failures.
+// BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures (up to 3,272)
+// in a single session, wasting ~250K API calls/day globally.
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+
+export function getAutoCompactThreshold(model: string): number {
+  const effectiveContextWindow = getEffectiveContextWindowSize(model)
+
+  const autocompactThreshold =
+    effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
+
+  // Override for easier testing of autocompact
+  const envPercent = process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+  if (envPercent) {
+    const parsed = parseFloat(envPercent)
+    if (!isNaN(parsed) && parsed > 0 && parsed <= 100) {
+      const percentageThreshold = Math.floor(
+        effectiveContextWindow * (parsed / 100),
+      )
+      return Math.min(percentageThreshold, autocompactThreshold)
+    }
+  }
+
+  return autocompactThreshold
+}
+```
+
+| 阈值 | 数值 | 用途 |
+|------|------|------|
+| `MAX_OUTPUT_TOKENS_FOR_SUMMARY` | **20,000** | p99.99 compact summary 输出预留 |
+| `AUTOCOMPACT_BUFFER_TOKENS` | **13,000** | auto compact 触发的 buffer |
+| `WARNING_THRESHOLD_BUFFER_TOKENS` | **20,000** | 警告阈值 |
+| `ERROR_THRESHOLD_BUFFER_TOKENS` | **20,000** | 错误阈值 |
+| `MANUAL_COMPACT_BUFFER_TOKENS` | **3,000** | 手动 `/compact` 触发 buffer |
+| `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES` | **3** | 失败熔断,防 prompt_too_long 死循环 |
+
+#### 20.4.9 max consecutive failure 熔断器
+
+`src/services/compact/autoCompact.ts:67-70`:
+
+```typescript
+// Stop trying autocompact after this many consecutive failures.
+// BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures (up to 3,272)
+// in a single session, wasting ~250K API calls/day globally.
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+```
+
+**真实生产数据**:BQ 显示 2026-03-10 有 1,279 sessions 累计 50+ 次连续 compact 失败(峰值 3,272 次),全球每天浪费 ~250K API 调用。claudecode 加了熔断器:连续 3 次失败就放弃,直到下次用户行为触发。
+
+#### 20.4.10 env override 三档
+
+`src/services/compact/autoCompact.ts:40-46, 79-90`:
+
+```typescript
+const autoCompactWindow = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+if (autoCompactWindow) {
+  const parsed = parseInt(autoCompactWindow, 10)
+  if (!isNaN(parsed) && parsed > 0) {
+    contextWindow = Math.min(contextWindow, parsed)
+  }
+}
+
+// Override for easier testing of autocompact
+const envPercent = process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+if (envPercent) {
+  const parsed = parseFloat(envPercent)
+  if (!isNaN(parsed) && parsed > 0 && parsed <= 100) {
+    const percentageThreshold = Math.floor(
+      effectiveContextWindow * (parsed / 100),
+    )
+    return Math.min(percentageThreshold, autocompactThreshold)
+  }
+}
+```
+
+- `CLAUDE_CODE_AUTO_COMPACT_WINDOW=N`:把 contextWindow 上限封顶到 N(强制更早压缩)
+- `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=95`:按百分比设阈值(测试用)
+- 多个 env 同时设,取**严格**(Math.min)更早触发
+
+#### 20.4.11 Read mtime dedup 是 cache_creation 节省的关键
+
+`src/tools/FileReadTool/FileReadTool.ts:524-535`(注释):
+
+```typescript
+// Dedup: if we've already read this exact range and the file hasn't
+// changed on disk, return a stub instead of re-sending the full content.
+// The earlier Read tool_result is still in context — two full copies
+// waste cache_creation tokens on every subsequent turn. BQ proxy shows
+// ~18% of Read calls are same-file collisions (up to 2.64% of fleet
+// cache_creation). Only applies to text/notebook reads — images/PDFs
+// aren't cached in readFileState so won't match here.
+```
+
+**生产数据**:18% Read 调用是同文件重复 → 2.64% 的 fleet cache_creation 来自重复 Read。
+
+#### 20.4.12 status line 显示 cache token
+
+`src/tools/AgentTool/built-in/statuslineSetup.ts:61-62`:
+
+```typescript
+"cache_creation_input_tokens": number,  // Tokens written to cache
+"cache_read_input_tokens": number       // Tokens read from cache
+```
+
+`src/tools/AgentTool/UI.tsx:483`(总 tokens 计算):
+
+```typescript
+tokens = (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + usage.input_tokens + usage.output_tokens;
+```
+
+#### 20.4.13 对 laew 的借鉴(维度四)
+
+| 借鉴项 | 优先级 | 实现路径 |
+|--------|--------|----------|
+| **cache_control 标记位置**(每个 message 末尾 user message 最后一个 content block)| **P0** | laew `src/llm/anthropic.rs` 当前没加 cache_control,默认 5m TTL 不命中 |
+| **cache_control 单 marker 精准策略**:不在多处塞 marker | **P0** | 拒绝在 system + tools + history 三处都塞,只塞最后一条 user message |
+| **TTL 选择:latch 到 session 启动时** | **P1** | laew 启动时按 `agent_type`(Yolo/Plan/Main-Work/SubAgent/QC/SessionContext)决定 TTL,后续不动态切换 |
+| **`cache_creation_input_tokens` + `cache_read_input_tokens` 计费区分** | **P0** | laew cost-tracker 等价物需读取并展示两个字段(目前只算 input_tokens)|
+| **`/cost` 持久化到 SQLite `cost_cache` 表** | **P1** | 与现有 `providers` 表并列,按 session_id 写入 |
+| **count_tokens API 二次确认**(Read 超过 1/4 maxTokens 才打)| **P1** | laew Read 工具粗估后超阈值再调 count_tokens |
+| **Auto compact 三档阈值**(buffer 13K / warning 20K / error 20K)| **P2** | laew 压缩触发可借鉴,但当前 6 Agent 隔离 context 不需要这么激进 |
+| **MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES 熔断器** | **P1** | laew 当前无熔断,若加 compact 必须有 |
+| **Read mtime dedup 防 cache_creation 浪费**:18% 命中 | **P0** | laew `Read` 工具加 `read_state: HashMap<PathBuf, ReadStamp>`,mtime 一致返回 stub |
+| **status line cache token 显示** | **P2** | laew TUI 横幅可选增强 |
+
+---
+
+### 20.5 综合对照表(第七轮 4 维度)
+
+| 维度 | claudecode 实现 | laew 现状 | 差距 | P0 借鉴项 |
+|------|----------------|----------|------|-----------|
+| **Edit 唯一性校验** | 三层:精确/引号归一化/desanitize | 无 Edit,只有 Write | 全无 | 加 Edit 工具 + 三层校验 |
+| **Read-before-Edit 强制** | readFileState Map + mtime 校验 | 无 | 全无 | Write 前必须 Read |
+| **Read dedup** | mtime+offset+limit stub | 无 | 全无 | 加 read_state 防 cache_creation 浪费 |
+| **Edit 行尾策略** | Edit 保留 / Write 强制 LF | 不感知 | 全无 | encoding+line_ending 双参数 |
+| **Edit 1 GiB 上限** | stat size 防 OOM | 无 | 全部 Bash | 加 stat 校验 |
+| **NotebookEdit** | nbformat 4.5+ cell.id + 双格式 | 无 | 全无 | P2 |
+| **Glob/Grep 走 ripgrep** | 系统 / 内嵌 / vendor 三层 | Bash 调用 grep | 体验差 | vendor ripgrep + 统一 wrapper |
+| **Grep 三档 output_mode** | content / files_with_matches / count | 无 Grep | 全无 | 加 GrepTool |
+| **head_limit 默认 250** | 三模式生效,0 = 不限 | 无 | 全无 | 加分页 |
+| **VCS 目录排除 + max-columns 500** | 自动注入 | 无 | 全无 | 自动参数注入 |
+| **Read 多模态(image/pdf/notebook)** | discriminatedUnion 5 种 | 仅文本 | 4 种缺失 | 扩展 Read 结果类型 |
+| **Image 三档压缩** | 原图 → 质量 80/60/40/20 → 缩 2000x2000 | 无 | 全无 | 加 image crate |
+| **base64 → token 估算** | `base64.length * 0.125` | 无 | 全无 | token 预算守门 |
+| **PDF 三档处理** | 抽页 vs inline | 无 | 全无 | P2,先有 PDF 需求再加 |
+| **/dev/zero 等黑名单** | 阻塞设备路径集合 | 无 | 全无 | Bash 工具同步屏蔽 |
+| **Prompt Cache 单 marker 策略** | 拒绝双 marker | 未启用 cache | 全无 | Anthropic wire 改造 |
+| **TTL latch 到 session** | 启动后不动态切换 | 不适用 | 全无 | P1 |
+| **cache_creation/cache_read 分开计费** | cost-tracker 双字段 | 只算 input | 部分 | 持久化到 SQLite |
+| **Read dedup 是 cache_creation 关键** | 18% Read 重复,2.64% cache_creation | 无 dedup | 全无 | Read dedup stub |
+| **count_tokens API 二次确认** | 超过 1/4 maxTokens 才打 API | 无 | 全无 | token 估算守门 |
+
+---
+
+### 20.6 附录:本轮关键文件索引
+
+| 文件 | 行数 | 关键内容 |
+|------|------|---------|
+| `src/tools/FileEditTool/FileEditTool.ts` | 626 | Edit 工具完整实现(校验、写盘、diff) |
+| `src/tools/FileEditTool/utils.ts` | 776 | findActualString/normalizeQuotes/preserveQuoteStyle/DESANITIZATIONS |
+| `src/tools/FileEditTool/constants.ts` | 12 | FILE_UNEXPECTEDLY_MODIFIED_ERROR |
+| `src/tools/FileReadTool/FileReadTool.ts` | 1184 | Read 工具(5 种 output 类型、image/pdf/notebook 分支、Read dedup) |
+| `src/tools/FileReadTool/limits.ts` | 93 | maxSizeBytes=256KB / maxTokens=25K 三层 env override |
+| `src/tools/FileReadTool/prompt.ts` | - | FILE_UNCHANGED_STUB |
+| `src/tools/FileReadTool/imageProcessor.ts` | - | sharp 包装(N-API) |
+| `src/tools/FileWriteTool/FileWriteTool.ts` | 540+ | Write 工具(Read-before-Write 强制、LF 强制) |
+| `src/tools/NotebookEditTool/NotebookEditTool.ts` | 491 | NotebookEdit(nbformat 4.5+、cell_id 双格式) |
+| `src/tools/GlobTool/GlobTool.ts` | 199 | Glob(走 ripgrep、limit 100) |
+| `src/tools/GrepTool/GrepTool.ts` | 578 | Grep(3 output_mode、head_limit/offset、VCS 排除) |
+| `src/utils/ripgrep.ts` | 680 | ripgrep 包装(三层来源、SIGTERM→SIGKILL、EAGAIN 重试) |
+| `src/utils/glob.ts` | 130 | glob 静态 base dir 提取 + `--files --sort=modified` |
+| `src/utils/imageResizer.ts` | 700+ | 三档 image 压缩 + token 预算守门 |
+| `src/constants/apiLimits.ts` | 95 | API_IMAGE_MAX_BASE64_SIZE=5MB / IMAGE_MAX_WIDTH=2000 / PDF 阈值 |
+| `src/services/api/claude.ts` | 3200+ | cache_control 标记 / 单 marker 策略 / cache_edits |
+| `src/services/compact/autoCompact.ts` | 280+ | autoCompact 阈值 + 熔断器 |
+| `src/services/tokenEstimation.ts` | 437+ | countTokensWithAPI(count_tokens API) |
+| `src/cost-tracker.ts` | 323+ | cache_creation/cache_read 计费累加 |
+| `src/context.ts:22` | 1 | ephemeral prepend(ant-only cache bust) |
+| `src/components/PromptInput/PromptInput.tsx:1151` | 32 | TUI 图片粘贴入口 |
+
+---
+
+### 20.7 总结:laew 的 P0/P1/P2 路线(基于第七轮)
+
+#### P0(必须做)
+
+1. **Edit 工具 + Read-before-Edit 全局强制** —— 现有 Write 工具加 read_state 校验,防止 SubAgent 改未读文件。
+2. **Read dedup 防 cache_creation 浪费** —— claudecode 数据显示 18% Read 重复,可直接复制 dedup 状态机。
+3. **Grep/Glob 工具(走 ripgrep 系统二进制)** —— 三档 output_mode + head_limit + VCS 排除 + max-columns。
+4. **Read 工具支持 image + base64 token 估算守门** —— `base64.length * 0.125` 经验值,直接套用。
+5. **Edit/Write 1 GiB 上限** —— 防止 SubAgent 编辑二进制巨型文件。
+6. **Write 强制 LF、Edit 保留原行尾** —— 双重策略,避免误改 CRLF。
+7. **Anthropic wire cache_control 单 marker 策略** —— 拒绝双 marker,只塞最后一条 user message 末尾。
+8. **cache_creation/cache_read 分开计费 + 持久化 SQLite** —— 当前 laew 成本追踪只算 input_tokens,需扩展。
+9. **/dev/zero 等阻塞设备黑名单** —— Bash 工具同步。
+
+#### P1(应该做)
+
+1. **Edit 三层校验链**(精确/引号归一化/desanitize 反义)。
+2. **Grep/Glob mtime 排序 + 自动 ignore pattern 注入**。
+3. **count_tokens API 二次确认**(超过 1/4 maxTokens 才打)。
+5. **Auto compact 熔断器**(`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES=3`)。
+6. **SIGTERM→SIGKILL 升级**(tokio::process::kill 两阶段)。
+7. **TTL latch 到 session 启动**(启动后不动态切换)。
+8. **Image 三档压缩管线**(`image` crate,质量阶梯 80/60/40/20 + 缩 2000x2000)。
+9. **UTF-16 LE BOM 探测**。
+10. **WSL timeout 差异化**。
+
+#### P2(可做)
+
+1. **NotebookEdit 工具**(nbformat 4.5+、cell_id 双格式、code cell replace 清 execution_count)。
+2. **PDF 三档处理**(抽页 vs inline,需 `pdfium-render` crate)。
+3. **ripgrep 三层来源**(系统 / 内嵌 / vendor 二进制)。
+4. **Read 后注入 cyber risk reminder**(按 model 豁免)。
+5. **macOS 截图 thin space fallback**。
+6. **Notebook 超大 → 引导 jq 分批**(不直接截断)。
+7. **status line cache token 显示**。
+8. **EAGAIN → -j 1 重试**。
+9. **Glob 静态 base dir 提取**。
+10. **ignore pattern 注入 `!**/` 前缀**(ripgrep gitignore 怪癖)。
+
+
+---
+
+## 20. 第七轮深挖 — Edit/Notebook 补丁策略 + Glob/Grep 检索 + 多模态文件处理 + PromptCaching 与 Token 预算
+
+> 调研日期: 2026-09-06
+> 范围: FileEditTool + FileWriteTool + NotebookEditTool + FileReadTool + GlobTool + GrepTool + ripgrep 底层 + 多模态(image/PDF/Notebook) + Prompt Cache + Sandbox
+> 关键源码: `src/tools/FileEditTool/{FileEditTool.ts,utils.ts,types.ts,constants.ts,prompt.ts}`、`src/tools/FileWriteTool/FileWriteTool.ts`、`src/tools/NotebookEditTool/NotebookEditTool.ts`、`src/tools/FileReadTool/{FileReadTool.ts,limits.ts,imageProcessor.ts}`、`src/tools/GlobTool/GlobTool.ts`、`src/tools/GrepTool/GrepTool.ts`、`src/utils/{imageResizer.ts,ripgrep.ts,notebook.ts,file.ts,fileRead.ts,glob.ts,sandbox/sandbox-adapter.ts}`、`src/services/api/{claude.ts,promptCacheBreakDetection.ts}`、`src/services/tokenEstimation.ts`、`src/cost-tracker.ts`、`src/constants/apiLimits.ts`
+
+### 20.1 文件编辑与补丁(Edit / Write / NotebookEdit)
+
+#### 20.1.1 Edit 工具的 9 段校验流水线
+
+`src/tools/FileEditTool/FileEditTool.ts:137-362` 的 `validateInput()` 是整个 Edit 工具最关键的逻辑,跑完 9 段 fail-fast 校验后才返回 `result: true`。逐段拆解:
+
+```ts
+// src/tools/FileEditTool/FileEditTool.ts:137-156  (L137-156)
+// 段一: 拒绝 Team memory 写入敏感字符串 + 拒绝 old_string===new_string
+if (old_string === new_string) {
+  return {
+    result: false,
+    behavior: 'ask',
+    message: 'No changes to make: old_string and new_string are exactly the same.',
+    errorCode: 1,
+  }
+}
+```
+
+```ts
+// src/tools/FileEditTool/FileEditTool.ts:179-200  (L179-200)
+// 段二: UNC 路径跳过 fs 操作(防 Windows NTLM 凭据泄漏)+ 1 GiB 文件大小硬限
+if (fullFilePath.startsWith('\\\\') || fullFilePath.startsWith('//')) {
+  return { result: true }   // 交给后续权限检查兜底
+}
+const MAX_EDIT_FILE_SIZE = 1024 * 1024 * 1024 // 1 GiB (stat bytes)
+```
+
+| 字段 | 值 | 来源 |
+|------|----|------|
+| `MAX_EDIT_FILE_SIZE` | 1 GiB(字节数) | `FileEditTool.ts:84` |
+| 防 OOM 策略 | `fs.stat → size > 1GiB` 直接 `behavior:'ask'` 拒绝 | `FileEditTool.ts:187-194` |
+| 编码自动探测 | UTF-16 LE BOM(`0xFF 0xFE`) → `utf16le`,否则 `utf8` | `FileEditTool.ts:208-213` |
+| CRLF→LF 归一化 | `replaceAll('\r\n', '\n')`,写到磁盘时按 `endings:LineEndingType` 还原 | `FileEditTool.ts:214` |
+
+```ts
+// src/tools/FileEditTool/FileEditTool.ts:224-273  (L224-273)
+// 段三: 文件不存在 — old_string='' 走「新建文件」分支;否则给出「Did you mean?」建议
+if (fileContent === null) {
+  if (old_string === '') {
+    return { result: true }     // 新建文件场景
+  }
+  const similarFilename = findSimilarFile(fullFilePath)
+  const cwdSuggestion = await suggestPathUnderCwd(fullFilePath)
+  let message = `File does not exist. ${FILE_NOT_FOUND_CWD_NOTE} ${getCwd()}.`
+  if (cwdSuggestion) {
+    message += ` Did you mean ${cwdSuggestion}?`
+  } else if (similarFilename) {
+    message += ` Did you mean ${similarFilename}?`
+  }
+  return { result: false, behavior: 'ask', message, errorCode: 4 }
+}
+
+// 段四: 空文件 + 空 old_string = 合法新建;否则「Cannot create new file - file already exists」
+if (old_string === '') {
+  if (fileContent.trim() !== '') {
+    return { result: false, behavior: 'ask',
+      message: 'Cannot create new file - file already exists.', errorCode: 3 }
+  }
+  return { result: true }
+}
+
+// 段五: .ipynb 文件改用 NotebookEditTool
+if (fullFilePath.endsWith('.ipynb')) {
+  return { result: false, behavior: 'ask',
+    message: `File is a Jupyter Notebook. Use the ${NOTEBOOK_EDIT_TOOL_NAME} to edit this file.`,
+    errorCode: 5 }
+}
+```
+
+#### 20.1.2 Read-before-Edit 强制 — readFileState 时戳校验
+
+这是 Edit/Write/NotebookEdit 三个工具共享的「**Read 锁**」:
+
+```ts
+// src/tools/FileEditTool/FileEditTool.ts:275-311  (L275-311)
+const readTimestamp = toolUseContext.readFileState.get(fullFilePath)
+if (!readTimestamp || readTimestamp.isPartialView) {
+  return { result: false, behavior: 'ask',
+    message: 'File has not been read yet. Read it first before writing to it.',
+    errorCode: 6 }
+}
+
+// 段七: 时戳 > 读时戳 → 文件被外部修改
+if (readTimestamp) {
+  const lastWriteTime = getFileModificationTime(fullFilePath)
+  if (lastWriteTime > readTimestamp.timestamp) {
+    // Windows mtime 可能因云同步/杀软抖动,做内容回退校验
+    const isFullRead = readTimestamp.offset === undefined &&
+                       readTimestamp.limit === undefined
+    if (isFullRead && fileContent === readTimestamp.content) {
+      // 内容未变,允许写入(容忍 mtime 抖动)
+    } else {
+      return { result: false, behavior: 'ask',
+        message: 'File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.',
+        errorCode: 7 }
+    }
+  }
+}
+```
+
+| 行为 | 触发 | errorCode | 文案(逐字) |
+|------|------|-----------|------------|
+| 文件未读 | `!readTimestamp` 或 `isPartialView` | 6 | `File has not been read yet. Read it first before writing to it.` |
+| 文件被改(时戳) | `mtime > readTimestamp` 且内容变化 | 7 | `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.` |
+| 写入时再改 | `call()` 内 `lastWriteTime > lastRead.timestamp` 且 `meta.content !== lastRead.content` | 抛 `Error(FILE_UNEXPECTEDLY_MODIFIED_ERROR)` | `File has been unexpectedly modified. Read it again before attempting to write it.` (`constants.ts:11`) |
+| .ipynb 误用 Edit | `path.endsWith('.ipynb')` | 5 | `File is a Jupyter Notebook. Use the NotebookEdit to edit this file.` |
+
+`call()` 内 (`FileEditTool.ts:444-468`) 还会**再做一次**相同的时戳校验 — 这是双保险,因为 `validateInput()` 返回 `true` 之后到 `call()` 之间可能并发写入。这段代码注释明确说明:
+
+```ts
+// src/tools/FileEditTool/FileEditTool.ts:443
+// 2. Load current state and confirm no changes since last read
+// Please avoid async operations between here and writing to disk to preserve atomicity
+```
+
+#### 20.1.3 old_string 唯一性 / 多匹配 / fuzzy 容错
+
+`src/tools/FileEditTool/utils.ts:73-93` 的 `findActualString()` 提供「**两层模糊匹配**」:
+
+```ts
+// utils.ts:73
+export function findActualString(
+  fileContent: string,
+  searchString: string,
+): string | null {
+  // 第一层: 精确匹配
+  if (fileContent.includes(searchString)) {
+    return searchString
+  }
+  // 第二层: 智能引号归一化(直引号 ↔ 弯引号)
+  const normalizedSearch = normalizeQuotes(searchString)
+  const normalizedFile = normalizeQuotes(fileContent)
+  const searchIndex = normalizedFile.indexOf(normalizedSearch)
+  if (searchIndex !== -1) {
+    return fileContent.substring(searchIndex, searchIndex + searchString.length)
+  }
+  return null
+}
+```
+
+`normalizeQuotes()` (`utils.ts:31-37`) 把四种弯引号 `‘ ’ “ ”` 全部归一为直引号 `' "`;`preserveQuoteStyle()` (`utils.ts:104-199`) 反向把 `new_string` 里的直引号按启发式还原成弯引号 — 启发式核心是 `isOpeningContext()` (`utils.ts:138-154`):
+
+| 前一个字符 | 当前 `'`/`"` 判定 |
+|------------|--------------------|
+| 字符串起始 / 空白 / `\t` / `\n` / `\r` / `(` / `[` / `{` / em dash / en dash | **开引号** → `LEFT_DOUBLE_CURLY_QUOTE` / `LEFT_SINGLE_CURLY_QUOTE` |
+| 其他 | **闭引号** → `RIGHT_DOUBLE_CURLY_QUOTE` / `RIGHT_SINGLE_CURLY_QUOTE` |
+| 缩写字如 `don't` 的 `'`(前后都是 `\p{L}`) | 始终还原为 `RIGHT_SINGLE_CURLY_QUOTE`(不当作开引号) |
+
+```ts
+// utils.ts:173-199
+function applyCurlySingleQuotes(str: string): string {
+  // 缩写检测: 前后都是字母 → 当作撇号处理
+  if (prevIsLetter && nextIsLetter) {
+    result.push(RIGHT_SINGLE_CURLY_QUOTE)
+  } else {
+    result.push(isOpeningContext(chars, i)
+      ? LEFT_SINGLE_CURLY_QUOTE
+      : RIGHT_SINGLE_CURLY_QUOTE)
+  }
+}
+```
+
+`utils.ts:206-228` 的 `applyEditToFile()` 实现 `replace_all`,以及一个重要边界 — **删除场景下,即使 `old_string` 不以 `\n` 结尾,如果文件里实际是 `old_string + '\n'`,会自动扩展到带换行符的版本再删除**,防止遗留孤儿换行:
+
+```ts
+// utils.ts:218-227
+if (newString !== '') {
+  return f(originalContent, oldString, newString)
+}
+const stripTrailingNewline =
+  !oldString.endsWith('\n') && originalContent.includes(oldString + '\n')
+return stripTrailingNewline
+  ? f(originalContent, oldString + '\n', newString)
+  : f(originalContent, oldString, newString)
+```
+
+#### 20.1.4 多匹配错误文案 + replace_all 强制
+
+`FileEditTool.ts:316-343` 的校验逻辑同时报两种典型错误:
+
+```ts
+// FileEditTool.ts:316
+const actualOldString = findActualString(file, old_string)
+if (!actualOldString) {
+  return { result: false, behavior: 'ask',
+    message: `String to replace not found in file.\nString: ${old_string}`,
+    errorCode: 8 }
+}
+const matches = file.split(actualOldString).length - 1
+
+if (matches > 1 && !replace_all) {
+  return { result: false, behavior: 'ask',
+    message: `Found ${matches} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: ${old_string}`,
+    errorCode: 9 }
+}
+```
+
+注意 `matches = file.split(actualOldString).length - 1` — 用 `split` 计数重叠匹配,对超长 `old_string` 是 O(n²) 但足够准确。`replace_all` 的 schema 注释 (`types.ts:15-17`) 直接挂 `semanticBoolean(z.boolean().default(false).optional())` 接受语义化真值 `"true"`/`"yes"`/`"on"`/`"1"`,避免小模型在 boolean 上抖。
+
+#### 20.1.5 Write 工具:Read-before-Write + 文件历史
+
+`FileWriteTool.ts:153-222` 的校验比 Edit 更严,因为 Write 是覆盖式:
+
+```ts
+// FileWriteTool.ts:198-206
+const readTimestamp = toolUseContext.readFileState.get(fullFilePath)
+if (!readTimestamp || readTimestamp.isPartialView) {
+  return { result: false,
+    message: 'File has not been read yet. Read it first before writing to it.',
+    errorCode: 2 }
+}
+// FileWriteTool.ts:211-219
+const lastWriteTime = Math.floor(fileMtimeMs)
+if (lastWriteTime > readTimestamp.timestamp) {
+  return { result: false,
+    message: 'File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.',
+    errorCode: 3 }
+}
+```
+
+Write 工具的行尾处理 (`FileWriteTool.ts:300-305`) 是个反直觉的决策:**显式按模型的 `content` 字面写入(LF),不再继承旧文件的 CRLF** — 因为模型给出的 `\r\n` 是有意的(尤其 bash 脚本),继承 CRLF 会让 Linux 上的 bash 脚本出现 `\r` 报错:
+
+```ts
+// FileWriteTool.ts:300-305
+// Write is a full content replacement — the model sent explicit line endings
+// in `content` and meant them. Do not rewrite them. Previously we preserved
+// the old file's line endings (or sampled the repo via ripgrep for new
+// files), which silently corrupted e.g. bash scripts with \r on Linux when
+// overwriting a CRLF file or when binaries in cwd poisoned the repo sample.
+writeTextContent(fullFilePath, content, enc, 'LF')
+```
+
+文件历史备份 (`fileHistoryEnabled()`) 由 `fileHistoryTrackEdit()` (`FileEditTool.ts:431-440` / `FileWriteTool.ts:255-264`) 触发 — 注释明确这是「**幂等 v1 备份基于内容哈希**」,在 staleness 校验之前调用是安全的(若后续校验失败只是多一份备份)。
+
+#### 20.1.6 NotebookEdit:Cell 级 JSON 操作
+
+`NotebookEditTool.ts:30-57` 的 input schema 暴露三个核心字段:
+
+```ts
+{
+  notebook_path: z.string(),                       // 绝对路径
+  cell_id: z.string().optional(),                  // 缺省 = insert 到开头
+  new_source: z.string(),                          // 新源码
+  cell_type: z.enum(['code','markdown']).optional(), // insert 时必填
+  edit_mode: z.enum(['replace','insert','delete']).optional(), // 默认 replace
+}
+```
+
+`validateInput` (`NotebookEditTool.ts:189-229`) 强制路径后缀、edit_mode 合法、insert 时 `cell_type` 必填、Read-before-Edit(时戳校验)、cell_id 解析支持 `cell-N` 数字索引:
+
+```ts
+// NotebookEditTool.ts:189-196
+if (extname(fullPath) !== '.ipynb') {
+  return { result: false,
+    message: 'File must be a Jupyter notebook (.ipynb file). For editing other file types, use the FileEdit tool.',
+    errorCode: 2 }
+}
+// NotebookEditTool.ts:210-216
+if (edit_mode === 'insert' && !cell_type) {
+  return { result: false,
+    message: 'Cell type is required when using edit_mode=insert.',
+    errorCode: 5 }
+}
+// NotebookEditTool.ts:221-237  Read-before-Edit
+if (!readTimestamp) {
+  return { result: false,
+    message: 'File has not been read yet. Read it first before writing to it.',
+    errorCode: 9 }
+}
+```
+
+`call()` (`NotebookEditTool.ts:295-489`) 用 `jsonParse` (非 memoize 版本,避免 mutate 缓存) 解 .ipynb,针对 nbformat ≥4.5 自动生成 13 字符随机 cell_id:
+
+```ts
+// NotebookEditTool.ts:382-390
+if (notebook.nbformat > 4 ||
+    (notebook.nbformat === 4 && notebook.nbformat_minor >= 5)) {
+  if (edit_mode === 'insert') {
+    new_cell_id = Math.random().toString(36).substring(2, 15)  // 13 字符
+  } else if (cell_id !== null) {
+    new_cell_id = cell_id
+  }
+}
+
+// NotebookEditTool.ts:392-428  按 edit_mode 分支
+if (edit_mode === 'delete') {
+  notebook.cells.splice(cellIndex, 1)
+} else if (edit_mode === 'insert') {
+  if (cell_type === 'markdown') {
+    new_cell = { cell_type:'markdown', id:new_cell_id, source:new_source, metadata:{} }
+  } else {
+    new_cell = { cell_type:'code', id:new_cell_id, source:new_source,
+                 metadata:{}, execution_count:null, outputs:[] }
+  }
+  notebook.cells.splice(cellIndex, 0, new_cell)
+} else {
+  // replace: 重置 execution_count + 清空 outputs(因为 source 改了)
+  const targetCell = notebook.cells[cellIndex]!
+  targetCell.source = new_source
+  if (targetCell.cell_type === 'code') {
+    targetCell.execution_count = null
+    targetCell.outputs = []
+  }
+}
+// 回写用 IPYNB_INDENT = 1 缩进
+const IPYNB_INDENT = 1
+const updatedContent = jsonStringify(notebook, null, IPYNB_INDENT)
+writeTextContent(fullPath, updatedContent, encoding, lineEndings)
+```
+
+`replace` 自动降级为 `insert` 的优雅降级 (`NotebookEditTool.ts:370-377`):
+
+```ts
+if (edit_mode === 'replace' && cellIndex === notebook.cells.length) {
+  edit_mode = 'insert'
+  if (!cell_type) cell_type = 'code'  // 默认 code
+}
+```
+
+#### 20.1.7 Edit/Write 后的 patch 摘要回灌(8KB 上限)
+
+`utils.ts:355-406` 的 `getSnippetForTwoFileDiff()` 是文件变化后回灌给模型的 diff 摘要,带 8KB 硬上限:
+
+```ts
+// utils.ts:355
+// Cap on edited_text_file attachment snippets. Format-on-save of a large file
+// previously injected the entire file per turn (observed max 16.1KB, ~14K
+// tokens/session). 8KB preserves meaningful context while bounding worst case.
+const DIFF_SNIPPET_MAX_BYTES = 8192
+
+// utils.ts:362-406
+export function getSnippetForTwoFileDiff(
+  fileAContents: string,
+  fileBContents: string,
+): string {
+  const patch = structuredPatch('file.txt', 'file.txt', fileAContents, fileBContents,
+    undefined, undefined, { context: 8, timeout: DIFF_TIMEOUT_MS })
+  // ...
+  const cutoff = full.lastIndexOf('\n', DIFF_SNIPPET_MAX_BYTES)
+  const kept = cutoff > 0 ? full.slice(0, cutoff) : full.slice(0, DIFF_SNIPPET_MAX_BYTES)
+  return `${kept}\n\n... [${remaining} lines truncated] ...`
+}
+```
+
+`getSnippetForPatch()` (`utils.ts:417-457`) 用 4 行上下文 + 行号重新格式化,用于 Edit 工具的「回到对话的修改摘要」。
+
+#### 20.1.8 多文件原子性、批次合并、去重
+
+`utils.ts:664-726` 的 `areFileEditsEquivalent()` 比较两批 Edit 是否「**语义等价**」(不同 old_string 但应用后产生相同结果),用三段式:
+
+```ts
+// utils.ts:664
+export function areFileEditsEquivalent(
+  edits1: FileEdit[], edits2: FileEdit[], originalContent: string,
+): boolean {
+  // Fast path: 字面相等
+  if (edits1.length === edits2.length && edits1.every(/* 逐字段比对 */)) {
+    return true
+  }
+  // Slow path: 各自应用 → 比 updatedFile
+  let result1 = null, result2 = null, error1 = null, error2 = null
+  try { result1 = getPatchForEdits({ filePath:'temp', fileContents:originalContent, edits:edits1 }) }
+  catch (e) { error1 = errorMessage(e) }
+  try { result2 = getPatchForEdits({ filePath:'temp', fileContents:originalContent, edits:edits2 }) }
+  catch (e) { error2 = errorMessage(e) }
+  // 双方都抛错 → 仅当错误消息字面一致才算等价
+  if (error1 !== null && error2 !== null) return error1 === error2
+  if (error1 !== null || error2 !== null) return false
+  return result1!.updatedFile === result2!.updatedFile
+}
+```
+
+`utils.ts:496-524` 的 `getEditsForPatch()` 反向从 patch hunk 抽回 `FileEdit[]` — 用于把 ApplyPatch 风格的工具输入与 Edit 工具统一去重。
+
+`getPatchForEdits()` (`utils.ts:262-350`) 处理多 edit 串行应用,且有一个**关键安全检查** — `old_string` 不能是任何前序 `new_string` 的子串:
+
+```ts
+// utils.ts:296-311
+for (const edit of edits) {
+  const oldStringToCheck = edit.old_string.replace(/\n+$/, '')
+  // Check if old_string is a substring of any previously applied new_string
+  for (const previousNewString of appliedNewStrings) {
+    if (oldStringToCheck !== '' && previousNewString.includes(oldStringToCheck)) {
+      throw new Error(
+        'Cannot edit file: old_string is a substring of a new_string from a previous edit.',
+      )
+    }
+  }
+  // ...
+  if (updatedFile === previousContent) {
+    throw new Error('String not found in file. Failed to apply edit.')
+  }
+  appliedNewStrings.push(edit.new_string)
+}
+```
+
+`utils.ts:531-574` 的 `DESANITIZATIONS` 表把 `<fnr>`、`<n>`、`<o>` 等被 API 过滤的 XML-like 标记反向解码 — 这是为了应对模型把被 sanitizer 替换的字符串「忠实地」复制回来时,本地能识别:
+
+```ts
+// utils.ts:531
+const DESANITIZATIONS: Record<string, string> = {
+  '<fnr>': '<function_results>',
+  '<n>': '<name>',
+  '</n>': '</name>',
+  '<o>': '<output>',
+  // ...
+  '\n\nH:': '\n\nHuman:',
+  '\n\nA:': '\n\nAssistant:',
+}
+```
+
+#### 20.1.9 行尾与编码处理三件套
+
+`src/utils/fileRead.ts:75-101` 的 `readFileSyncWithMetadata()` 把「**读文件 + 探编码 + 探行尾**」三件事压成一次 `readFileSync`:
+
+```ts
+// src/utils/fileRead.ts:75
+export function readFileSyncWithMetadata(filePath: string): {
+  content: string
+  encoding: BufferEncoding
+  lineEndings: LineEndingType
+} {
+  // 一遍 readFileSync → 同时拿到 bytes / 编码 / 前 4KB 行尾采样
+  // 4096 code units is ≥ detectLineEndings's 4096-byte sample
+  const lineEndings = detectLineEndingsForString(raw.slice(0, 4096))
+  // ...
+}
+```
+
+`fileRead.ts:51` 的 `detectLineEndingsForString()` 算法 — 看前几行的 `\r\n` vs `\n` 比例决定:
+
+```ts
+// fileRead.ts:51
+export function detectLineEndingsForString(content: string): LineEndingType {
+  // CRLF vs LF 启发式(对混合行尾保守返回 LF)
+}
+```
+
+`file.ts:84-98` 的 `writeTextContent()` 是写入侧对称实现:
+
+```ts
+// file.ts:84
+export function writeTextContent(
+  filePath: string, content: string,
+  encoding: BufferEncoding, endings: LineEndingType,
+): void {
+  let toWrite = content
+  if (endings === 'CRLF') {
+    // Normalize any existing CRLF to LF first so a new_string that already
+    // contains \r\n (raw model output) doesn't become \r\r\n after the join.
+    toWrite = content.replaceAll('\r\n', '\n').split('\n').join('\r\n')
+  }
+  writeFileSyncAndFlush_DEPRECATED(filePath, toWrite, { encoding })
+}
+```
+
+**对 laew 的借鉴(维度 1)**:
+
+| 优先级 | 借鉴项 | 落地点 | 价值 |
+|--------|--------|--------|------|
+| **P0** | `readFileState` 时戳 + 内容双校验 | `src/agent/tools/read.rs` 改为缓存 `mtime + content_hash` 写锁 | 防止 SubAgent 在 Yolo 分类前读到过期内容 |
+| **P0** | Edit 错误文案 9 段(逐字摘录) | `src/agent/tools/write.rs`(目前仅 Write,无 Edit) — 先用 Write 替代时给模型精准反馈 | 提升 Edit 工具在小模型上的纠错率 |
+| **P0** | `replace_all: true/false` 二选一冲突 | 新增 Edit 工具时强制 schema | 避免静默只改一处 |
+| **P0** | `old_string === new_string` 早退 | Edit 工具 schema 校验第一段 | 减少一次完整 IO |
+| **P0** | Read-before-Edit 强校验 | Write tool 已经要求 Read,Edit 工具应同等要求 | 防止「基于幻觉的写」 |
+| **P1** | NotebookEdit 的 cell-N 索引回退 | Yolo 需要修 .ipynb 时直接对应 | Python 数据科学场景 |
+| **P1** | 多 edit `old_string is substring of new_string` 校验 | Edit 工具串行应用循环内 | 防止循环引用 |
+| **P1** | DESANITIZATIONS 反向解码表 | 当接入其他协议(OpenAI function calling 不用 sanitizer)时,移除即可 | 多协议无关 |
+| **P2** | `preserveQuoteStyle` 弯引号启发式 | 文档场景(中文/法文输入)再考虑 | 暂缓 |
+| **P2** | `getSnippetForTwoFileDiff` 8KB 上限 | Tool result 回灌 | 当 yolo → work → sub 三层结果回灌时控制体积 |
+| **P2** | `areFileEditsEquivalent` 语义去重 | SubAgent 任务重试去重 | 暂缓 |
+
+### 20.2 代码检索与索引(Glob / Grep / ripgrep)
+
+#### 20.2.1 ripgrep 三档 fallback 选择
+
+`src/utils/ripgrep.ts:31-65` 的 `getRipgrepConfig()` 是 ripgrep 二进制选择的核心 — **优先级: system → embedded → builtin**:
+
+```ts
+// src/utils/ripgrep.ts:31
+const getRipgrepConfig = memoize((): RipgrepConfig => {
+  // 1. 用户强制用系统 ripgrep(USE_BUILTIN_RIPGREP=false 时)
+  const userWantsSystemRipgrep = isEnvDefinedFalsy(process.env.USE_BUILTIN_RIPGREP)
+  if (userWantsSystemRipgrep) {
+    const { cmd: systemPath } = findExecutable('rg', [])
+    if (systemPath !== 'rg') {
+      // SECURITY: Use command name 'rg' instead of systemPath to prevent PATH hijacking
+      // If we used systemPath, a malicious ./rg.exe in current directory could be executed
+      // Using just 'rg' lets the OS resolve it safely with NoDefaultCurrentDirectoryInExePath protection
+      return { mode: 'system', command: 'rg', args: [] }
+    }
+  }
+
+  // 2. bundled 模式: ripgrep 静态编译进 bun-internal,用 argv0='rg' 调度
+  if (isInBundledMode()) {
+    return {
+      mode: 'embedded',
+      command: process.execPath,
+      args: ['--no-config'],
+      argv0: 'rg',
+    }
+  }
+
+  // 3. builtin: vendor/ripgrep/<arch>-<platform>/rg 二进制
+  const rgRoot = path.resolve(__dirname, 'vendor', 'ripgrep')
+  const command =
+    process.platform === 'win32'
+      ? path.resolve(rgRoot, `${process.arch}-win32`, 'rg.exe')
+      : path.resolve(rgRoot, `${process.arch}-${process.platform}`, 'rg`)
+
+  return { mode: 'builtin', command, args: [] }
+})
+```
+
+| 模式 | 触发条件 | 调用方式 | 备注 |
+|------|----------|----------|------|
+| `system` | `USE_BUILTIN_RIPGREP=false` 且 PATH 找到 `rg` | `execFile('rg', args)` | 防 PATH 劫持 — 即使找到也只用 `'rg'` 字面调用 |
+| `embedded` | Bun bundled build | `spawn(bun, args, { argv0: 'rg' })` | 用 argv0 让 bun-internal 走 ripgrep 分发 |
+| `builtin` | 默认 | `execFile(rgPath, args)` | 跨平台 vendor 二进制(`vendor/ripgrep/{arch}-{platform}/rg`) |
+
+`screens/Doctor.tsx:314-315` 会诊断当前模式供 TUI 显示:
+```tsx
+const t16 = diagnostic.ripgrepStatus.working ? "OK" : "Not working";
+const t17 = diagnostic.ripgrepStatus.mode === "embedded" ? "bundled"
+          : diagnostic.ripgrepStatus.mode === "builtin"  ? "vendor"
+          : diagnostic.ripgrepStatus.mode === "system"   ? "system"
+          : "?";  // 报错或 fallback
+```
+
+#### 20.2.2 Glob 工具 — 基于 ripgrep `--files --glob`
+
+`src/tools/GlobTool/GlobTool.ts:154-176` 的 `call()` 直接走 `utils/glob.ts` 里的 `glob()`:
+
+```ts
+// GlobTool.ts:154
+async call(input, { abortController, getAppState, globLimits }) {
+  const start = Date.now()
+  const appState = getAppState()
+  const limit = globLimits?.maxResults ?? 100
+  const { files, truncated } = await glob(
+    input.pattern,
+    GlobTool.getPath(input),
+    { limit, offset: 0 },
+    abortController.signal,
+    appState.toolPermissionContext,
+  )
+  const filenames = files.map(toRelativePath)   // 相对化节省 token
+  return { data: { filenames, durationMs: Date.now() - start, numFiles: filenames.length, truncated } }
+}
+```
+
+`src/utils/glob.ts:91-110` 暴露 rg 调用方式:
+
+```ts
+// utils/glob.ts:91
+// --files: list files instead of searching content
+// --glob: filter by pattern
+// --sort=modified: sort by modification time (oldest first)  ← 注意:rg 默认是 newest first
+// --no-ignore: don't respect .gitignore (default true, set CLAUDE_CODE_GLOB_NO_IGNORE=false to respect .gitignore)
+// --hidden: include hidden files (default true, set CLAUDE_CODE_GLOB_HIDDEN=false to exclude)
+const args = [
+  '--files',
+  '--glob', input.pattern,
+  '--sort=modified',
+  '--no-ignore',   // 默认跳过 .gitignore
+  '--hidden',      // 默认包含隐藏文件
+  searchDir,
+]
+```
+
+**绝对路径模式的处理** (`utils/glob.ts:76-84`):
+
+```ts
+if (isAbsolute(filePattern)) {
+  const { baseDir, relativePattern } = extractGlobBaseDirectory(filePattern)
+  if (baseDir) {
+    searchDir = baseDir
+    searchPattern = relativePattern
+  }
+}
+```
+
+`extractGlobBaseDirectory()` (`utils/glob.ts:17-64`) 抽出 glob 模式里第一个特殊字符前的所有路径段作为 baseDir,因为 ripgrep 的 `--glob` 只接受相对模式。
+
+输出有 **100 文件硬截断**(由 `globLimits.maxResults` 控制),`truncated` 字段告知模型重试:
+
+```ts
+// GlobTool.ts:177-197
+mapToolResultToToolResultBlockParam(output, toolUseID) {
+  if (output.filenames.length === 0) {
+    return { tool_use_id: toolUseID, type: 'tool_result', content: 'No files found' }
+  }
+  return {
+    tool_use_id: toolUseID,
+    type: 'tool_result',
+    content: [
+      ...output.filenames,
+      ...(output.truncated
+        ? ['(Results are truncated. Consider using a more specific path or pattern.)']
+        : []),
+    ].join('\n'),
+  }
+}
+```
+
+#### 20.2.3 Grep 工具 — ripgrep 全功能包装
+
+`src/tools/GrepTool/GrepTool.ts:310-441` 的 `call()` 是 ripgrep 全功能映射。关键参数构造:
+
+```ts
+// GrepTool.ts:310
+async call({ pattern, path, glob, type, output_mode = 'files_with_matches',
+            '-B': context_before, '-A': context_after, '-C': context_c, context,
+            '-n': show_line_numbers = true, '-i': case_insensitive = false,
+            head_limit, offset = 0, multiline = false }, ...) {
+  const absolutePath = path ? expandPath(path) : getCwd()
+  const args = ['--hidden']
+
+  // 1. VCS 目录自动排除(.git/.svn/.hg/.bzr/.jj/.sl)
+  for (const dir of VCS_DIRECTORIES_TO_EXCLUDE) {
+    args.push('--glob', `!${dir}`)
+  }
+
+  // 2. 行长截断(防 base64/minified 文件刷屏)
+  args.push('--max-columns', '500')
+
+  // 3. multiline = true → -U --multiline-dotall
+  if (multiline) {
+    args.push('-U', '--multiline-dotall')
+  }
+
+  // 4. -i case insensitive
+  if (case_insensitive) args.push('-i')
+
+  // 5. output_mode → -l / -c
+  if (output_mode === 'files_with_matches') args.push('-l')
+  else if (output_mode === 'count') args.push('-c')
+
+  // 6. -n 行号(content 模式默认开)
+  if (show_line_numbers && output_mode === 'content') args.push('-n')
+
+  // 7. -C / -A / -B 上下文
+  if (output_mode === 'content') {
+    if (context !== undefined)        args.push('-C', context.toString())
+    else if (context_c !== undefined) args.push('-C', context_c.toString())
+    else {
+      if (context_before !== undefined) args.push('-B', context_before.toString())
+      if (context_after !== undefined)  args.push('-A', context_after.toString())
+    }
+  }
+
+  // 8. 模式以 `-` 开头 → 必须用 -e 防止被当作 flag
+  if (pattern.startsWith('-')) args.push('-e', pattern)
+  else                          args.push(pattern)
+
+  // 9. --type 类型过滤
+  if (type) args.push('--type', type)
+
+  // 10. --glob 模式过滤(逗号/空格分隔,但保留 { } 大括号)
+  if (glob) {
+    const rawPatterns = glob.split(/\s+/)
+    for (const rawPattern of rawPatterns) {
+      if (rawPattern.includes('{') && rawPattern.includes('}')) {
+        globPatterns.push(rawPattern)
+      } else {
+        globPatterns.push(...rawPattern.split(',').filter(Boolean))
+      }
+    }
+    for (const p of globPatterns.filter(Boolean)) args.push('--glob', p)
+  }
+
+  // 11. .gitignore 风格忽略 — 非 / 前缀自动加 !**/
+  const ignorePatterns = normalizePatternsToPath(
+    getFileReadIgnorePatterns(appState.toolPermissionContext), getCwd())
+  for (const ignorePattern of ignorePatterns) {
+    const rgIgnorePattern = ignorePattern.startsWith('/')
+      ? `!${ignorePattern}`
+      : `!**/${ignorePattern}`
+    args.push('--glob', rgIgnorePattern)
+  }
+
+  // 12. 孤立 plugin 缓存目录排除
+  for (const exclusion of await getGlobExclusionsForPluginCache(absolutePath)) {
+    args.push('--glob', exclusion)
+  }
+
+  // 13. WSL2 性能降级 — 超时从 20s 提到 60s
+  const defaultTimeout = getPlatform() === 'wsl' ? 60_000 : 20_000
+  const parsedSeconds = parseInt(process.env.CLAUDE_CODE_GLOB_TIMEOUT_SECONDS || '', 10) || 0
+  const timeout = parsedSeconds > 0 ? parsedSeconds * 1000 : defaultTimeout
+
+  const results = await ripGrep(args, absolutePath, abortController.signal)
+```
+
+#### 20.2.4 三档 output_mode 与 250 行默认上限
+
+```ts
+// GrepTool.ts:104-128
+const DEFAULT_HEAD_LIMIT = 250
+
+function applyHeadLimit<T>(items: T[], limit: number | undefined, offset: number = 0): {
+  items: T[]; appliedLimit: number | undefined
+} {
+  // Explicit 0 = unlimited escape hatch
+  if (limit === 0) return { items: items.slice(offset), appliedLimit: undefined }
+  const effectiveLimit = limit ?? DEFAULT_HEAD_LIMIT
+  const sliced = items.slice(offset, offset + effectiveLimit)
+  // Only report appliedLimit when truncation actually occurred
+  const wasTruncated = items.length - offset > effectiveLimit
+  return { items: sliced, appliedLimit: wasTruncated ? effectiveLimit : undefined }
+}
+```
+
+| output_mode | rg flag | 输出格式 | 适用场景 |
+|-------------|---------|----------|----------|
+| `content`(默认显示) | 默认 | `/abs/path:line:content`(带 -n) 或 `/abs/path:content` | 看上下文,带 `-A/-B/-C` |
+| `files_with_matches`(默认模式) | `-l` | `/abs/path`(每行一个) | 只想知道哪些文件匹配 |
+| `count` | `-c` | `/abs/path:count` | 量化搜索 |
+
+注释 (`GrepTool.ts:104-107`) 明确解释 250 默认值的来历 — 防止无界 content 模式塞满 20KB 持久化阈值:
+
+```ts
+// Default cap on grep results when head_limit is unspecified. Unbounded content-mode
+// greps can fill up to the 20KB persist threshold (~6-24K tokens/grep-heavy session).
+// 250 is generous enough for exploratory searches while preventing context bloat.
+// Pass head_limit=0 explicitly for unlimited.
+```
+
+**files_with_matches 模式的 mtime 排序**(`GrepTool.ts:529-571`)— 这是个精妙设计:
+
+```ts
+// GrepTool.ts:529
+// Sort by modification time
+const stats = await Promise.allSettled(
+  results.map(_ => getFsImplementation().stat(_)),
+)
+const sortedMatches = results
+  .map((_, i) => {
+    const r = stats[i]!
+    return [_, r.status === 'fulfilled' ? (r.value.mtimeMs ?? 0) : 0] as const
+  })
+  .sort((a, b) => {
+    if (process.env.NODE_ENV === 'test') return a[0].localeCompare(b[0])  // 确定性
+    const timeComparison = b[1] - a[1]  // mtime 降序
+    if (timeComparison === 0) return a[0].localeCompare(b[0])  // 文件名字典序兜底
+    return timeComparison
+  })
+  .map(_ => _[0])
+```
+
+用 `Promise.allSettled` 而不是 `Promise.all` — 单个文件被并发删除的 ENOENT 不会 reject 整批,失败的 stat 排序到尾部(mtime=0)。测试模式下用字典序保证确定性。
+
+#### 20.2.5 .gitignore / .claudeignore 交互
+
+`getFileReadIgnorePatterns` 在 `src/utils/permissions/filesystem.ts` 集中维护,Grep 工具通过 `normalizePatternsToPath` 把所有 ignore 模式转成 `!**/foo` 或 `!/abs/foo` 形式交给 ripgrep:
+
+```ts
+// GrepTool.ts:412-426
+// Note: ripgrep only applies gitignore patterns relative to the working directory
+// So for non-absolute paths, we need to prefix them with '**'
+// See: https://github.com/BurntSushi/ripgrep/discussions/2156#discussioncomment-2316335
+const rgIgnorePattern = ignorePattern.startsWith('/')
+  ? `!${ignorePattern}`
+  : `!**/${ignorePattern}`
+args.push('--glob', rgIgnorePattern)
+```
+
+**没有符号索引 / embedding / AST 缓存** — Claude Code 完全靠 ripgrep 的运行时正则,这是与 Hermes(FTS5+Trigram)、opencode(LSP/TAGS 缓存)的根本差异。
+
+#### 20.2.6 Bash 工具对 ripgrep 的别名 — 防止绕过权限
+
+`src/tools/BashTool/BashTool.tsx:60` 把 ripgrep 识别为「搜索类」命令:
+
+```ts
+const BASH_SEARCH_COMMANDS = new Set(['find', 'grep', 'rg', 'ag', 'ack', 'locate', 'which', 'whereis'])
+```
+
+`src/tools/BashTool/readOnlyValidation.ts:1392` 在 read-only 校验里把 `rg` 与 `grep` 同等对待,`commandSemantics.ts:43` 把 `rg` 加入「read-only 命令列表」:
+
+```ts
+// src/tools/BashTool/commandSemantics.ts:43
+'rg',  // ripgrep has same semantics as grep
+```
+
+`src/tools.ts:199` 注释里甚至提到:
+
+```ts
+// trick as ripgrep). When available, find/grep in Claude's shell are aliased
+```
+
+—— 这暗示 Claude Code 在 shell 启动时会 alias `find`/`grep` 到 ripgrep,进一步统一搜索行为。
+
+**对 laew 的借鉴(维度 2)**:
+
+| 优先级 | 借鉴项 | 落地点 | 价值 |
+|--------|--------|--------|------|
+| **P0** | ripgrep 三档 fallback | `Cargo.toml` 新增 `grep = { ... }` 或 `rg` 子进程;Windows / Linux 双 vendor | Bash 工具 Read 路径下可选 |
+| **P0** | Glob/Grep tool 拆为独立工具(不混在 Bash) | `src/agent/tools/` 新增 `grep.rs` + `glob.rs` | 权限隔离、并发安全 |
+| **P0** | 250 默认 head_limit + 0 = unlimited 逃生口 | grep tool schema 加 `head_limit` 字段 | 防止爆 context |
+| **P1** | `output_mode: content/files_with_matches/count` 三档 | grep tool schema | 对应 Yolo/Work 不同档位的精度需求 |
+| **P1** | `--type` 过滤(js/py/rust/go) | grep tool schema | 类型敏感项目 |
+| **P1** | `-A/-B/-C` 上下文行 | grep tool schema | 错误定位 |
+| **P1** | 模式以 `-` 开头用 `-e` | rg arg builder | 防 flag 注入 |
+| **P1** | `--multiline-dotall` 多行模式 | grep tool schema | 跨行匹配 |
+| **P2** | mtime 排序 files_with_matches | grep tool 排序逻辑 | 提示「最近改过的文件优先」 |
+| **P2** | WSL2 超时 60s 退避 | ripgrep 调用 wrapper | 兼容性 |
+| **P2** | EAGAIN 资源耗尽重试 | ripgrep error classifier | Docker/CI 场景 |
+
+### 20.3 多模态与文件处理(Read / Image / PDF / Notebook)
+
+#### 20.3.1 Read 工具的 6 种输出类型
+
+`src/tools/FileReadTool/FileReadTool.ts:248-332` 的 outputSchema 用 `z.discriminatedUnion('type')` 暴露 6 种输出:
+
+```ts
+// FileReadTool.ts:248
+const outputSchema = lazySchema(() => {
+  const imageMediaTypes = z.enum(['image/jpeg', 'image/png', 'image/gif', 'image/webp'])
+  return z.discriminatedUnion('type', [
+    z.object({ type: z.literal('text'),       file: { filePath, content, numLines, startLine, totalLines } }),
+    z.object({ type: z.literal('image'),      file: { base64, type:imageMediaTypes, originalSize, dimensions? } }),
+    z.object({ type: z.literal('notebook'),   file: { filePath, cells: z.array(z.any()) } }),
+    z.object({ type: z.literal('pdf'),        file: { filePath, base64, originalSize } }),
+    z.object({ type: z.literal('parts'),      file: { filePath, originalSize, count, outputDir } }),
+    z.object({ type: z.literal('file_unchanged'), file: { filePath } }),  // dedup stub
+  ])
+})
+```
+
+| type | 触发 | 关键字段 | 适用场景 |
+|------|------|----------|----------|
+| `text` | 默认文本 | `content` + `startLine` + `numLines` + `totalLines` | 源码/配置/日志 |
+| `image` | `.png/.jpg/.jpeg/.gif/.webp` | `base64` + `media_type` + `originalSize` + `dimensions` | 截图、设计稿 |
+| `notebook` | `.ipynb` | `cells[]`(处理过的源码 + output 摘要) | Jupyter |
+| `pdf` | `.pdf` ≤ 20 MB | `base64` + `originalSize`(真实 PDF 字节走 DocumentBlockParam) | 论文/合同 |
+| `parts` | `.pdf` > 3 MB(extract 阈值) | `count` + `outputDir`(走多张图片分页) | 大型 PDF |
+| `file_unchanged` | dedup 命中 | 只回 `filePath` | 二次读相同文件,走 `FILE_UNCHANGED_STUB` 节省 token |
+
+`mapToolResultToToolResultBlockParam` (`FileReadTool.ts:652-703`) 把各类型组装成 Anthropic API 能消费的 `tool_result`:
+
+```ts
+// FileReadTool.ts:654-668
+case 'image': {
+  return {
+    tool_use_id: toolUseID, type: 'tool_result',
+    content: [{
+      type: 'image',
+      source: { type: 'base64', data: data.file.base64, media_type: data.file.type },
+    }],
+  }
+}
+// FileReadTool.ts:670
+case 'notebook':
+  return mapNotebookCellsToToolResult(data.file.cells, toolUseID)
+// FileReadTool.ts:672-678
+case 'pdf':
+  return { tool_use_id: toolUseID, type: 'tool_result',
+    content: `PDF file read: ${data.file.filePath} (${formatFileSize(data.file.originalSize)})` }
+// FileReadTool.ts:679-685
+case 'parts':
+  return { tool_use_id: toolUseID, type: 'tool_result',
+    content: `PDF pages extracted: ${data.file.count} page(s) from ${data.file.filePath} (${formatFileSize(data.file.originalSize)})` }
+// FileReadTool.ts:686-691
+case 'file_unchanged':
+  return { tool_use_id: toolUseID, type: 'tool_result',
+    content: FILE_UNCHANGED_STUB }  // = 'File unchanged since last read. The content from the earlier Read tool_result in this conversation is still current — refer to that instead of re-reading.'
+```
+
+#### 20.3.2 Read 工具的双层 token + size 限制
+
+`src/tools/FileReadTool/limits.ts:1-92` 的 Read 限制有三层防线:
+
+```ts
+// FileReadTool/limits.ts:1
+/**
+ * Read tool output limits.  Two caps apply to text reads:
+ *   | limit         | default | checks                    | cost          | on overflow     |
+ *   |---------------|---------|---------------------------|---------------|-----------------|
+ *   | maxSizeBytes  | 256 KB  | TOTAL FILE SIZE (not out) | 1 stat        | throws pre-read |
+ *   | maxTokens     | 25000   | actual output tokens      | API roundtrip | throws post-read|
+ */
+```
+
+```ts
+// FileReadTool/limits.ts:18
+export const DEFAULT_MAX_OUTPUT_TOKENS = 25000
+
+// FileReadTool/limits.ts:53
+export const getDefaultFileReadingLimits = memoize((): FileReadingLimits => {
+  const override = getFeatureValue_CACHED_MAY_BE_STALE<...>('tengu_amber_wren', {})
+  const maxSizeBytes = override?.maxSizeBytes ?? MAX_OUTPUT_SIZE  // = 256 KB from file.ts:48
+  const envMaxTokens = getEnvMaxTokens()  // env: CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS
+  const maxTokens = envMaxTokens ?? override?.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
+  // ...
+})
+```
+
+`MAX_OUTPUT_SIZE = 0.25 * 1024 * 1024 // 0.25MB in bytes` (`src/utils/file.ts:48`) 即 **256 KB** — 整个文件的硬上限,基于 stat 而非输出字节数,`#21841` 注释解释了为什么不改成「基于切片」:
+
+```ts
+// limits.ts:10-14
+// Known mismatch: maxSizeBytes gates on total file size, not the slice.
+// Tested truncating instead of throwing for explicit-limit reads that
+// exceed the byte cap (#21841, Mar 2026).  Reverted: tool error rate
+// dropped but mean tokens rose — the throw path yields a ~100-byte error
+// tool-result while truncation yields ~25K tokens of content at the cap.
+```
+
+`MaxFileReadTokenExceededError` (`FileReadTool.ts:175-185`) 抛出后,模型必须用 `offset/limit` 重读:
+
+```ts
+export class MaxFileReadTokenExceededError extends Error {
+  constructor(public tokenCount: number, public maxTokens: number) {
+    super(
+      `File content (${tokenCount} tokens) exceeds maximum allowed tokens (${maxTokens}). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.`,
+    )
+  }
+}
+```
+
+#### 20.3.3 Read dedup — 同文件同范围 18% 节省
+
+`FileReadTool.ts:523-573` 的 dedup 逻辑是 18% cache 创建节省的来源(根据 BQ 数据):
+
+```ts
+// FileReadTool.ts:523-536
+// Dedup: if we've already read this exact range and the file hasn't
+// changed on disk, return a stub instead of re-sending the full content.
+// The earlier Read tool_result is still in context — two full copies
+// waste cache_creation tokens on every subsequent turn. BQ proxy shows
+// ~18% of Read calls are same-file collisions (up to 2.64% of fleet
+// cache_creation). Only applies to text/notebook reads — images/PDFs
+// aren't cached in readFileState so won't match here.
+//
+// Ant soak: 1,734 dedup hits in 2h, no Read error regression.
+// Killswitch pattern: GB can disable if the stub message confuses the model.
+const dedupKillswitch = getFeatureValue_CACHED_MAY_BE_STALE(
+  'tengu_read_dedup_killswitch', false,
+)
+const existingState = dedupKillswitch
+  ? undefined
+  : readFileState.get(fullFilePath)
+
+// FileReadTool.ts:547-573
+if (existingState && !existingState.isPartialView && existingState.offset !== undefined) {
+  const rangeMatch = existingState.offset === offset && existingState.limit === limit
+  if (rangeMatch) {
+    try {
+      const mtimeMs = await getFileModificationTimeAsync(fullFilePath)
+      if (mtimeMs === existingState.timestamp) {
+        logEvent('tengu_file_read_dedup', { ...(analyticsExt !== undefined && { ext: analyticsExt }) })
+        return { data: { type: 'file_unchanged' as const, file: { filePath: file_path } } }
+      }
+    } catch {
+      // stat failed — fall through to full read
+    }
+  }
+}
+```
+
+注意 — dedup **不适用** image/PDF/notebook(它们的 `offset` 不存在或 `isPartialView=true`),且 Edit/Write 写入时显式把 `offset: undefined` 写入 readFileState,防止 dedup 误命中旧版本:
+
+```ts
+// FileEditTool.ts:520-525
+readFileState.set(fullFilePath, {
+  content: updatedFile,
+  timestamp: getFileModificationTime(absoluteFilePath),
+  offset: undefined,  // ← 关键:告诉 dedup「别把我当 Read 缓存用」
+  limit: undefined,
+})
+```
+
+#### 20.3.4 图像处理 sharp fallback 与渐进压缩
+
+`src/utils/imageResizer.ts:169-433` 的 `maybeResizeAndDownsampleImageBuffer()` 处理 5MB base64 + 2000×2000 像素的双重上限:
+
+```ts
+// imageResizer.ts:169
+export async function maybeResizeAndDownsampleImageBuffer(
+  imageBuffer: Buffer, originalSize: number, ext: string,
+): Promise<ResizeResult> {
+  // 1. 空 buffer 早退(防止 sharp 抛 "Unable to determine image format")
+  if (imageBuffer.length === 0) {
+    throw new ImageResizeError('Image file is empty (0 bytes)')
+  }
+  try {
+    const sharp = await getImageProcessor()
+    const image = sharp(imageBuffer)
+    const metadata = await image.metadata()
+    // ...
+  } catch (error) {
+    // Detect actual format from magic bytes instead of trusting extension
+    const detected = detectImageFormatFromBuffer(imageBuffer)
+    const normalizedExt = detected.slice(6) // 'image/' prefix removed
+    const base64Size = Math.ceil((originalSize * 4) / 3)
+    // ...
+  }
+}
+```
+
+`src/constants/apiLimits.ts:22-83` 的硬常量:
+
+```ts
+// apiLimits.ts:22
+export const API_IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024 // 5 MB
+export const IMAGE_TARGET_RAW_SIZE = (API_IMAGE_MAX_BASE64_SIZE * 3) / 4 // 3.75 MB
+export const IMAGE_MAX_WIDTH = 2000
+export const IMAGE_MAX_HEIGHT = 2000
+
+export const PDF_TARGET_RAW_SIZE = 20 * 1024 * 1024   // 20 MB
+export const API_PDF_MAX_PAGES = 100
+export const PDF_EXTRACT_SIZE_THRESHOLD = 3 * 1024 * 1024  // 3 MB
+export const PDF_MAX_EXTRACT_SIZE = 100 * 1024 * 1024  // 100 MB
+export const PDF_MAX_PAGES_PER_READ = 20
+export const PDF_AT_MENTION_INLINE_THRESHOLD = 10
+export const API_MAX_MEDIA_PER_REQUEST = 100
+```
+
+`imageResizer.ts:235-275` 的压缩算法是**渐进降级**:先用 PNG palette 压缩,失败 → JPEG quality [80,60,40,20] 四档:
+
+```ts
+// imageResizer.ts:235-275  PNG → palette → JPEG 80/60/40/20
+// If dimensions are within limits but file is too large, try compression first
+if (!needsDimensionResize && originalSize > IMAGE_TARGET_RAW_SIZE) {
+  if (isPng) {
+    const pngCompressed = await sharp(imageBuffer)
+      .png({ compressionLevel: 9, palette: true })
+      .toBuffer()
+    if (pngCompressed.length <= IMAGE_TARGET_RAW_SIZE) return { ... }
+  }
+  // Try JPEG compression (lossy but much smaller)
+  for (const quality of [80, 60, 40, 20]) {
+    const compressedBuffer = await sharp(imageBuffer)
+      .jpeg({ quality })
+      .toBuffer()
+    if (compressedBuffer.length <= IMAGE_TARGET_RAW_SIZE) return { ... }
+  }
+  // Quality reduction alone wasn't enough, fall through to resize
+}
+```
+
+缩放尺寸后 (`imageResizer.ts:278-298`) 还有第二波,再不行降到 `1000px` + `quality 20` 强压:
+
+```ts
+// imageResizer.ts:278-298
+// Constrain dimensions if needed
+if (width > IMAGE_MAX_WIDTH) {
+  height = Math.round((height * IMAGE_MAX_WIDTH) / width)
+  width = IMAGE_MAX_WIDTH
+}
+if (height > IMAGE_MAX_HEIGHT) {
+  width = Math.round((width * IMAGE_MAX_HEIGHT) / height)
+  height = IMAGE_MAX_HEIGHT
+}
+const resizedImageBuffer = await sharp(imageBuffer)
+  .resize(width, height, { fit: 'inside', withoutEnlargement: true })
+  .toBuffer()
+```
+
+注释 (`imageResizer.ts:288-291`) 警告:**napi 绑定不允许多次复用同一个 sharp 实例**,必须每次重新 `sharp(buffer)`:
+
+```ts
+// IMPORTANT: Always create fresh sharp(imageBuffer) instances for each operation.
+// The native image-processor-napi module doesn't properly apply format conversions
+// when reusing a sharp instance after calling toBuffer(). This caused a bug where
+// all compression attempts (PNG, JPEG at various qualities) returned identical sizes.
+```
+
+#### 20.3.5 图像 processor 二选一(image-processor-napi vs sharp)
+
+`src/tools/FileReadTool/imageProcessor.ts:37-67` 的 `getImageProcessor()` 处理 bundled vs unbundled 双模式:
+
+```ts
+// imageProcessor.ts:37
+export async function getImageProcessor(): Promise<SharpFunction> {
+  if (imageProcessorModule) return imageProcessorModule.default
+  if (isInBundledMode()) {
+    try {
+      const imageProcessor = await import('image-processor-napi')
+      const sharp = imageProcessor.sharp || imageProcessor.default
+      imageProcessorModule = { default: sharp }
+      return sharp
+    } catch {
+      console.warn('Native image processor not available, falling back to sharp')
+    }
+  }
+  const imported = await import('sharp') as unknown as MaybeDefault<SharpFunction>
+  const sharp = unwrapDefault(imported)
+  imageProcessorModule = { default: sharp }
+  return sharp
+}
+```
+
+- **bundled (生产构建)**: 优先 `image-processor-napi`(原生绑定,无 npm 依赖),失败回退 `sharp`
+- **开发 / npm install**: 直接 `sharp`
+
+`getImageCreator()` (`imageProcessor.ts:74-85`) **只用 sharp**(napi 不支持图像生成)。
+
+#### 20.3.6 PDF 双路径:base64 内联 vs 分页图片 extract
+
+`FileReadTool.ts:236-243` 的 input schema 接受 `pages` 参数(1-indexed,支持 `"1-5"` / `"3"` / `"10-20"`):
+
+```ts
+pages: z.string().optional().describe(
+  `Page range for PDF files (e.g., "1-5", "3", "10-20"). Only applicable to PDF files. Maximum ${PDF_MAX_PAGES_PER_READ} pages per request.`
+),
+```
+
+`FileReadTool.ts:418-440` 的 pages 校验:
+
+```ts
+if (pages !== undefined) {
+  const parsed = parsePDFPageRange(pages)
+  if (!parsed) {
+    return { result: false, message: `Invalid pages parameter: "${pages}". Use formats like "1-5", "3", or "10-20". Pages are 1-indexed.`, errorCode: 7 }
+  }
+  const rangeSize = parsed.lastPage === Infinity
+    ? PDF_MAX_PAGES_PER_READ + 1
+    : parsed.lastPage - parsed.firstPage + 1
+  if (rangeSize > PDF_MAX_PAGES_PER_READ) {
+    return { result: false, message: `Page range "${pages}" exceeds maximum of ${PDF_MAX_PAGES_PER_READ} pages per request. Please use a smaller range.`, errorCode: 8 }
+  }
+}
+```
+
+PDF 双路径决策 (`apiLimits.ts:62-72`):
+
+```ts
+/**
+ * Size threshold above which PDFs are extracted into page images
+ * instead of being sent as base64 document blocks. This applies to
+ * first-party API only; non-first-party always uses extraction.
+ */
+export const PDF_EXTRACT_SIZE_THRESHOLD = 3 * 1024 * 1024 // 3 MB
+export const PDF_MAX_EXTRACT_SIZE = 100 * 1024 * 1024 // 100 MB
+```
+
+`@mention` 内联阈值 `PDF_AT_MENTION_INLINE_THRESHOLD = 10`(超过 10 页的 PDF 不内联,只留引用),这是 prompt 注入成本控制。
+
+#### 20.3.7 Notebook 输出截断 10000 字符
+
+`src/utils/notebook.ts:20-32` 的输出截断逻辑(单 cell 输出超过 10000 字符就替换为提示):
+
+```ts
+// notebook.ts:20
+const LARGE_OUTPUT_THRESHOLD = 10000
+
+function isLargeOutputs(outputs: (NotebookCellSourceOutput | undefined)[]): boolean {
+  let size = 0
+  for (const o of outputs) {
+    if (!o) continue
+    size += (o.text?.length ?? 0) + (o.image?.image_data.length ?? 0)
+    if (size > LARGE_OUTPUT_THRESHOLD) return true
+  }
+  return false
+}
+```
+
+超大输出替换为提示文本:
+
+```ts
+// notebook.ts:104-111
+cellData.outputs = [{
+  output_type: 'stream',
+  text: `Outputs are too large to include. Use ${BASH_TOOL_NAME} with: cat <notebook_path> | jq '.cells[${index}].outputs'`,
+}]
+```
+
+`cellOutputToToolResult()` (`notebook.ts:134-153`) 把 cell 内的 image 输出转 `ImageBlockParam`(base64 内嵌),文本输出转 `TextBlockParam`。`mapNotebookCellsToToolResult()` (`notebook.ts:188-215`) 把相邻 text block **合并**(`prev.text += '\n' + curr.text`),减少 block 数。
+
+#### 20.3.8 Read 工具的设备文件黑洞防护
+
+`FileReadTool.ts:96-128` 的设备文件屏蔽 — 这是个常被忽略但非常重要的保护:
+
+```ts
+const BLOCKED_DEVICE_PATHS = new Set([
+  // Infinite output — never reach EOF
+  '/dev/zero', '/dev/random', '/dev/urandom', '/dev/full',
+  // Blocks waiting for input
+  '/dev/stdin', '/dev/tty', '/dev/console',
+  // Nonsensical to read
+  '/dev/stdout', '/dev/stderr',
+  // fd aliases for stdin/stdout/stderr
+  '/dev/fd/0', '/dev/fd/1', '/dev/fd/2',
+])
+
+function isBlockedDevicePath(filePath: string): boolean {
+  if (BLOCKED_DEVICE_PATHS.has(filePath)) return true
+  if (filePath.startsWith('/proc/') &&
+      (filePath.endsWith('/fd/0') || filePath.endsWith('/fd/1') || filePath.endsWith('/fd/2')))
+    return true
+  return false
+}
+```
+
+`FileReadTool.ts:484-492` 校验:
+
+```ts
+if (isBlockedDevicePath(fullFilePath)) {
+  return { result: false,
+    message: `Cannot read '${file_path}': this device file would block or produce infinite output.`,
+    errorCode: 9 }
+}
+```
+
+注释 (`FileReadTool.ts:96-97`) 解释:路径检查无 I/O 开销,**`/dev/null` 故意放行**(无副作用)。
+
+`getAlternateScreenshotPath()` (`FileReadTool.ts:147-159`) 处理 macOS 截图文件名 thin space (U+202F) 与普通空格的二义性 — 不同的 macOS 版本用不同的空格:
+
+```ts
+const THIN_SPACE = String.fromCharCode(8239)
+const amPmPattern = /^(.+)([  ])(AM|PM)(\.png)$/
+// 第一次 stat 失败时,尝试用 alternate space 重读
+```
+
+**对 laew 的借鉴(维度 3)**:
+
+| 优先级 | 借鉴项 | 落地点 | 价值 |
+|--------|--------|--------|------|
+| **P0** | `image/jpeg`/`image/png`/`image/gif`/`image/webp` base64 直传 | `Read` tool 检测扩展 → `image` 输出分支 → 走 Anthropic `ImageBlockParam` | 让模型「看到」截图 |
+| **P0** | BLOCKED_DEVICE_PATHS 黑名单 | `read.rs` 入口前置检查 | 防止 OOM |
+| **P0** | Read dedup(`offset + mtime` 命中走 stub) | `read.rs` 引入 `ReadCache` | 18% token 节省 |
+| **P0** | `max_size_bytes` + `max_tokens` 双层防爆 | Read 工具双重校验 | 256 KB / 25K tokens |
+| **P1** | `.pdf` 路径支持 | 引入 `lopdf` crate | 文档场景 |
+| **P1** | Notebook cell 输出截断 | 不引入依赖(暂无) | Python 数据科学 |
+| **P1** | macOS thin space 兼容 | `get_alternate_path()` | 截图路径 |
+| **P2** | sharp 渐进压缩 + napi fallback | 图像工具链 | 后置 |
+| **P2** | `API_MAX_MEDIA_PER_REQUEST = 100` | 上传工具配额 | 暂缓 |
+
+### 20.4 Prompt Caching 与 Token 预算
+
+#### 20.4.1 cache_control 插入策略 — 仅末尾单 marker
+
+`src/services/api/claude.ts:3062-3211` 的 `addCacheBreakpoints()` 是核心 — **每个请求只在 messages 末尾插入一个 `cache_control: ephemeral` 标记**:
+
+```ts
+// claude.ts:3078-3091
+// Exactly one message-level cache_control marker per request. Mycro's
+// turn-to-turn eviction (page_manager/index.rs: Index::insert) frees
+// local-attention KV pages at any cached prefix position NOT in
+// cache_store_int_token_boundaries. With two markers the second-to-last
+// position is protected and its locals survive an extra turn even though
+// nothing will ever resume from there — with one marker they're freed
+// immediately. For fire-and-forget forks (skipCacheWrite) we shift the
+// marker to the second-to-last message: that's the last shared-prefix
+// point, so the write is a no-op merge on mycro (entry already exists)
+// and the fork doesn't leave its own tail in the KVCC. Dense pages are
+// refcounted and survive via the new hash either way.
+const markerIndex = skipCacheWrite ? messages.length - 2 : messages.length - 1
+```
+
+注释详细解释了「为什么不是多个 marker」 — 服务端 mycro 的 turn-to-turn eviction 逻辑会在 cached prefix 范围内淘汰 local-attention KV 页,只有 `cache_store_int_token_boundaries` 内的位置受保护。多 marker 会浪费保护配额。
+
+`userMessageToMessageParam` (`claude.ts:588-631`) 把 cache_control 挂到最后一个 content block:
+
+```ts
+// claude.ts:609-619  array content 时只挂最后一个 block
+return {
+  role: 'user',
+  content: message.message.content.map((_, i) => ({
+    ..._,
+    ...(i === message.message.content.length - 1
+      ? enablePromptCaching
+        ? { cache_control: getCacheControl({ querySource }) }
+        : {}
+      : {}),
+  })),
+}
+```
+
+`assistantMessageToMessageParam` (`claude.ts:633-674`) 同样,**但跳过 thinking / redacted_thinking / connector_text block**:
+
+```ts
+// claude.ts:656-666
+content: message.message.content.map((_, i) => ({
+  ..._,
+  ...(i === message.message.content.length - 1 &&
+        _.type !== 'thinking' &&
+        _.type !== 'redacted_thinking' &&
+        (feature('CONNECTOR_TEXT') ? !isConnectorTextBlock(_) : true)
+    ? enablePromptCaching
+      ? { cache_control: getCacheControl({ querySource }) }
+      : {}
+    : {}),
+})),
+```
+
+#### 20.4.2 cache_control 形态:5m vs 1h 双 TTL
+
+`getCacheControl()` (`claude.ts:358-374`):
+
+```ts
+// claude.ts:358
+export function getCacheControl({
+  scope, querySource,
+}: { scope?: CacheScope; querySource?: QuerySource } = {}): {
+  type: 'ephemeral'; ttl?: '1h'; scope?: CacheScope
+} {
+  return {
+    type: 'ephemeral',
+    ...(should1hCacheTTL(querySource) && { ttl: '1h' }),
+    ...(scope === 'global' && { scope }),
+  }
+}
+```
+
+`should1hCacheTTL()` (`claude.ts:393-434`) 决定是否升级到 1h TTL:
+
+```ts
+// claude.ts:393
+function should1hCacheTTL(querySource?: QuerySource): boolean {
+  // 3P Bedrock 用户开 ENABLE_PROMPT_CACHING_1H_BEDROCK env var → 强制 1h
+  if (getAPIProvider() === 'bedrock' && isEnvTruthy(process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK)) {
+    return true
+  }
+  // 用户资格 latch(防 mid-session overage 切换破坏 cache)
+  let userEligible = getPromptCache1hEligible()
+  if (userEligible === null) {
+    userEligible = process.env.USER_TYPE === 'ant' || (isClaudeAISubscriber() && !currentLimits.isUsingOverage)
+    setPromptCache1hEligible(userEligible)
+  }
+  if (!userEligible) return false
+  // GrowthBook allowlist 查询源缓存
+  let allowlist = getPromptCache1hAllowlist()
+  if (allowlist === null) {
+    const config = getFeatureValue_CACHED_MAY_BE_STALE<{ allowlist?: string[] }>('tengu_prompt_cache_1h_config', {})
+    allowlist = config.allowlist ?? []
+    setPromptCache1hAllowlist(allowlist)
+  }
+  return querySource !== undefined &&
+    allowlist.some(pattern =>
+      pattern.endsWith('*') ? querySource.startsWith(pattern.slice(0, -1)) : querySource === pattern)
+}
+```
+
+| 场景 | TTL | 触发条件 |
+|------|-----|----------|
+| 默认 | `ephemeral`(5 分钟) | ant/subscriber 或 overage |
+| 1h | `ephemeral ttl: '1h'` | ant + GrowthBook allowlist 命中 querySource |
+| 3P Bedrock 强制 1h | `ephemeral ttl: '1h'` | `ENABLE_PROMPT_CACHING_1H_BEDROCK=1` |
+| 全局 scope | `ephemeral scope: 'global'` | system block `cacheScope === 'global'` |
+
+注意 — **latch 行为**(`claude.ts:404-405`)是关键设计:「eligibility 写入 bootstrap state」,**防止 mid-session 状态翻转导致 cache_control TTL 改变 → bust cache**:
+
+```ts
+// claude.ts:404
+// Latch eligibility in bootstrap state for session stability — prevents
+// mid-session overage flips from changing the cache_control TTL, which
+// would bust the server-side prompt cache (~20K tokens per flip).
+```
+
+#### 20.4.3 System Prompt 的 cache_control 注入
+
+`buildSystemPromptBlocks()` (`claude.ts:3213-3237`):
+
+```ts
+// claude.ts:3213
+export function buildSystemPromptBlocks(
+  systemPrompt: SystemPrompt,
+  enablePromptCaching: boolean,
+  options?: { skipGlobalCacheForSystemPrompt?: boolean; querySource?: QuerySource },
+): TextBlockParam[] {
+  // IMPORTANT: Do not add any more blocks for caching or you will get a 400
+  return splitSysPromptPrefix(systemPrompt, {
+    skipGlobalCacheForSystemPrompt: options?.skipGlobalCacheForSystemPrompt,
+  }).map(block => ({
+    type: 'text' as const,
+    text: block.text,
+    ...(enablePromptCaching && block.cacheScope !== null && {
+      cache_control: getCacheControl({ scope: block.cacheScope, querySource: options?.querySource }),
+    }),
+  }))
+}
+```
+
+注释明确「不要加更多 cache_control block 否则会 400」,与 20.4.1 单 marker 策略呼应。
+
+#### 20.4.4 Cache Break Detection — 12 维状态机
+
+`src/services/api/promptCacheBreakDetection.ts:28-69` 的 `PreviousState` 类型是 cache 失效分析的状态快照,**12 个维度**:
+
+```ts
+// promptCacheBreakDetection.ts:28
+type PreviousState = {
+  systemHash: number                      // 系统提示词 hash(stripCacheControl)
+  toolsHash: number                       // 工具 schema hash
+  cacheControlHash: number                // 系统 cache_control 标记 hash(用于捕获 scope/TTL 翻转)
+  toolNames: string[]                     // 工具名列表
+  perToolHashes: Record<string, number>   // 每个工具 schema 单独 hash(用于定位变化的工具)
+  systemCharCount: number                 // 系统字符数(delta 用)
+  model: string                           // 模型名
+  fastMode: boolean                       // fast mode 开关
+  globalCacheStrategy: string             // 'tool_based' | 'system_prompt' | 'none'
+  betas: string[]                         // sorted beta headers
+  autoModeActive: boolean                 // AFK_MODE_BETA_HEADER 存在
+  isUsingOverage: boolean                 // overage 状态
+  cachedMCEnabled: boolean                // cache-editing beta
+  effortValue: string                     // resolved effort level
+  extraBodyHash: number                   // CLAUDE_CODE_EXTRA_BODY + anthropic_internal hash
+  callCount: number
+  pendingChanges: PendingChanges | null
+  prevCacheReadTokens: number | null
+  cacheDeletionsPending: boolean          // cached microcompact 主动删除的预期下降
+  buildDiffableContent: () => string
+}
+```
+
+`MIN_CACHE_MISS_TOKENS = 2_000` (`promptCacheBreakDetection.ts:120`) 是触发告警的最小绝对 token 下降;`CACHE_TTL_5MIN_MS = 5*60*1000` / `CACHE_TTL_1HOUR_MS = 60*60*1000` (`promptCacheBreakDetection.ts:125-126`) 用于区分 TTL 自然过期 vs 客户端变化。
+
+`checkResponseForCacheBreak()` (`promptCacheBreakDetection.ts:437-543`) 是检测入口,逻辑链:
+
+```ts
+// promptCacheBreakDetection.ts:485-492
+const tokenDrop = prevCacheRead - cacheReadTokens
+if (
+  cacheReadTokens >= prevCacheRead * 0.95 ||  // 5% 阈值
+  tokenDrop < MIN_CACHE_MISS_TOKENS            // 2000 token 阈值
+) {
+  state.pendingChanges = null
+  return  // 正常波动,非 break
+}
+```
+
+12 维变化定位(`promptCacheBreakDetection.ts:332-360`):
+
+```ts
+const systemPromptChanged       = systemHash !== prev.systemHash
+const toolSchemasChanged        = toolsHash !== prev.toolsHash
+const modelChanged              = model !== prev.model
+const fastModeChanged           = isFastMode !== prev.fastMode
+const cacheControlChanged       = cacheControlHash !== prev.cacheControlHash
+const globalCacheStrategyChanged = globalCacheStrategy !== prev.globalCacheStrategy
+const betasChanged              = sortedBetas.length !== prev.betas.length || ...
+const autoModeChanged           = autoModeActive !== prev.autoModeActive
+const overageChanged            = isUsingOverage !== prev.isUsingOverage
+const cachedMCChanged           = cachedMCEnabled !== prev.cachedMCEnabled
+const effortChanged             = effortStr !== prev.effortValue
+const extraBodyChanged          = extraBodyHash !== prev.extraBodyHash
+```
+
+工具级别的 hash diff(`promptCacheBreakDetection.ts:368-378`):当 toolsHash 变化但 added/removed=0 时(占 77%),逐工具 hash 对比定位是哪个 schema 变了:
+
+```ts
+// promptCacheBreakDetection.ts:368
+if (toolSchemasChanged) {
+  const newHashes = computeToolHashes()
+  for (const name of toolNames) {
+    if (!prevToolSet.has(name)) continue
+    if (newHashes[name] !== prev.perToolHashes[name]) {
+      changedToolSchemas.push(name)
+    }
+  }
+}
+```
+
+#### 20.4.5 Cache Break 解释报告输出
+
+`promptCacheBreakDetection.ts:495-540` 的报告拼装(逐条原因):
+
+```ts
+if (changes) {
+  if (changes.modelChanged) {
+    parts.push(`model changed (${changes.previousModel} → ${changes.newModel})`)
+  }
+  if (changes.systemPromptChanged) {
+    parts.push(`system prompt changed (Δ${changes.systemCharDelta} chars)`)
+  }
+  if (changes.toolSchemasChanged) {
+    parts.push(`tool schemas changed (added: ${changes.addedToolCount}, removed: ${changes.removedToolCount}, changed: ${changes.changedToolSchemas.join(', ')})`)
+  }
+  if (changes.cacheControlChanged) {
+    parts.push('cache_control changed (scope or TTL)')
+  }
+  // ...
+}
+```
+
+`promptCacheBreakDetection.ts:486-488` 的双重阈值「< 95% AND ≥ 2000」避免了误报 — 比如小幅度波动或部分 cache 失效不会触发报告。
+
+#### 20.4.6 cache_edits 主动删除 — cacheDeletionsPending
+
+`promptCacheBreakDetection.ts:472-481` 处理 cached microcompact 主动删除导致的「预期下降」:
+
+```ts
+// promptCacheBreakDetection.ts:472
+if (state.cacheDeletionsPending) {
+  state.cacheDeletionsPending = false
+  logForDebugging(`[PROMPT CACHE] cache deletion applied, cache read: ${prevCacheRead} → ${cacheReadTokens} (expected drop)`)
+  state.pendingChanges = null  // Don't flag as a break
+  return
+}
+```
+
+`claude.ts:3141-3162` 的 `addCacheBreakpoints()` 协调 `cache_edits` 块插入到最近 user message,`claude.ts:3164-3208` 给 marker 之前的 tool_result block 加 `cache_reference` 复用:
+
+```ts
+// claude.ts:3201
+msg.content[j] = Object.assign({}, block, {
+  cache_reference: block.tool_use_id,  // 引用之前缓存的 tool_result
+})
+```
+
+#### 20.4.7 ephemeral_1h vs ephemeral_5m 区分
+
+`claude.ts:2958-2963` 把服务端 usage 分桶:
+
+```ts
+ephemeral_1h_input_tokens:
+  (partUsage as BetaUsage).cache_creation?.ephemeral_1h_input_tokens ??
+  usage.cache_creation.ephemeral_1h_input_tokens,
+ephemeral_5m_input_tokens:
+  (partUsage as BetaUsage).cache_creation?.ephemeral_5m_input_tokens ??
+  usage.cache_creation.ephemeral_5m_input_tokens,
+```
+
+`claude.ts:3015-3020` 的汇总累加:
+
+```ts
+ephemeral_1h_input_tokens:
+  totalUsage.cache_creation.ephemeral_1h_input_tokens +
+  messageUsage.cache_creation.ephemeral_1h_input_tokens,
+ephemeral_5m_input_tokens:
+  totalUsage.cache_creation.ephemeral_5m_input_tokens +
+  messageUsage.cache_creation.ephemeral_5m_input_tokens,
+```
+
+#### 20.4.8 countTokens API — 预算预检
+
+`src/services/tokenEstimation.ts:124-200` 的 `countMessagesTokensWithAPI()`:
+
+```ts
+// tokenEstimation.ts:124
+export async function countMessagesTokensWithAPI(
+  messages: Anthropic.Beta.Messages.BetaMessageParam[],
+  tools: Anthropic.Beta.Messages.BetaToolUnion[],
+): Promise<number | null> {
+  return withTokenCountVCR(messages, tools, async () => {
+    try {
+      const model = getMainLoopModel()
+      const betas = getModelBetas(model)
+      const containsThinking = hasThinkingBlocks(messages)
+      if (getAPIProvider() === 'bedrock') {
+        // @anthropic-sdk/bedrock-sdk doesn't support countTokens currently
+        return countTokensWithBedrock({ model, messages, tools, betas, containsThinking })
+      }
+      const anthropic = await getAnthropicClient({ maxRetries: 1, model, source: 'count_tokens' })
+      const filteredBetas = getAPIProvider() === 'vertex'
+        ? betas.filter(b => VERTEX_COUNT_TOKENS_ALLOWED_BETAS.has(b))
+        : betas
+      const response = await anthropic.beta.messages.countTokens({
+        model: normalizeModelStringForAPI(model),
+        messages: messages.length > 0 ? messages : [{ role: 'user', content: 'foo' }],
+        tools,
+        ...(filteredBetas.length > 0 && { betas: filteredBetas }),
+        ...(containsThinking && {
+          thinking: { type: 'enabled', budget_tokens: TOKEN_COUNT_THINKING_BUDGET },
+        }),
+      })
+      return response.input_tokens
+    } catch (error) {
+      logError(error)
+      return null
+    }
+  })
+}
+```
+
+`TOKEN_COUNT_THINKING_BUDGET = 1024` / `TOKEN_COUNT_MAX_TOKENS = 2048` (`tokenEstimation.ts:32-33`) 是 thinking 模式下 countTokens 必须传的最小 max_tokens + budget_tokens(API 约束:max_tokens > budget_tokens)。
+
+`tokenEstimation.ts:321-324` 把 cache token 也计入预算:
+
+```ts
+const cacheCreationTokens = usage.cache_creation_input_tokens || 0
+const cacheReadTokens = usage.cache_read_input_tokens || 0
+return inputTokens + cacheCreationTokens + cacheReadTokens
+```
+
+#### 20.4.9 成本追踪 cache 字段透出
+
+`src/cost-tracker.ts:166-218` 把 cache token 计费:
+
+```ts
+// cost-tracker.ts:166
+cacheReadInputTokens: usage.cacheReadInputTokens,
+cacheCreationInputTokens: usage.cacheCreationInputTokens,
+// cost-tracker.ts:206
+accumulated.cacheReadInputTokens += usage.cacheReadInputTokens
+accumulated.cacheCreationInputTokens += usage.cacheCreationInputTokens
+// cost-tracker.ts:215-219  TUI 显示
+`  ${formatNumber(usage.inputTokens)} input, ` +
+`${formatNumber(usage.outputTokens)} output, ` +
+`${formatNumber(usage.cacheReadInputTokens)} cache read, ` +
+`${formatNumber(usage.cacheCreationInputTokens)} cache write` +
+(usage.webSearchRequests > 0 ? `, ${formatNumber(usage.webSearchRequests)} web search` : '') +
+` (${formatCost(usage.costUSD)})`
+```
+
+`cost-tracker.ts:268-269` 兼容 snake_case(API 原生)和 camelCase(SDK)两种来源:
+
+```ts
+modelUsage.cacheReadInputTokens += usage.cache_read_input_tokens ?? 0
+modelUsage.cacheCreationInputTokens += usage.cache_creation_input_tokens ?? 0
+```
+
+`cost-tracker.ts:294-300` 把 cache 写入 token counter,标注 type:
+
+```ts
+getTokenCounter()?.add(usage.cache_read_input_tokens ?? 0, { type: 'cacheRead' })
+getTokenCounter()?.add(usage.cache_creation_input_tokens ?? 0, { type: 'cacheCreation' })
+```
+
+#### 20.4.10 Sandbox + cache_control 配合
+
+`src/utils/sandbox/sandbox-adapter.ts:532-547` 的沙箱启用决策 — sandbox 仅在 macOS/Linux/WSL2+ 启用,无 npm 依赖:
+
+```ts
+// sandbox-adapter.ts:532
+function isSandboxingEnabled(): boolean {
+  if (!isSupportedPlatform()) return false
+  if (checkDependencies().errors.length > 0) return false
+  if (!isPlatformInEnabledList()) return false
+  return getSandboxEnabledSetting()
+}
+```
+
+`main.tsx:314-315` 上报 sandbox 状态到遥测:
+
+```ts
+sandbox_enabled: SandboxManager.isSandboxingEnabled(),
+are_unsandboxed_commands_allowed: SandboxManager.areUnsandboxedCommandsAllowed(),
+```
+
+**对 laew 的借鉴(维度 4)**:
+
+| 优先级 | 借鉴项 | 落地点 | 价值 |
+|--------|--------|--------|------|
+| **P0** | messages 末尾单 cache_control 策略 | `src/llm/anthropic.rs` 的 wire transform | Anthropic 协议必须遵守 |
+| **P0** | `ephemeral ttl: '1h'` vs `5m` 分桶 | Anthropic provider 配置 + user 资格 latch | 1h TTL 命中率提升 |
+| **P0** | cache_creation/cache_read token 字段读取 + 透出 | 协议 wire 中转 + cost tracker | 必要 |
+| **P0** | 5%/2000 token 双阈值 cache break 告警 | 调试日志(可选) | 调试用 |
+| **P1** | 12 维 cache break 状态机 | `agent_memory` 持久化(P2 调试工具) | 高级特性 |
+| **P1** | `cache_reference` 复用 tool_result | Anthropic wire transform | 进阶 |
+| **P1** | `count_tokens` API 预算预检 | 当 prompt > 80K 时调用 | 防 over-limit |
+| **P1** | `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` env 覆写 | `Read` tool 配置 | 用户可调 |
+| **P2** | `cacheDeletionsPending` 预期下降 | 暂不需要(microcompact 未实现) | 暂缓 |
+| **P2** | Sandbox macOS/Linux/WSL2+ | 大工作 | 暂缓 |
+
+### 20.5 第七轮横向小结
+
+| 维度 | Claude Code 实现 | 关键文件 | laew 现状 | 借鉴优先级 |
+|------|-----------------|----------|-----------|-----------|
+| Edit 唯一性 | `findActualString` 二层(精确 + 引号归一化)+ `preserveQuoteStyle` 反向 + 9 段 fail-fast | `src/tools/FileEditTool/{FileEditTool.ts:137-362,utils.ts:73-199}` | 仅 Write(无 Edit) | **P0**(必须新增) |
+| Edit 多匹配 | `file.split(actualOldString).length - 1` 计数,`> 1 && !replace_all` 报错 | `FileEditTool.ts:316-343` | N/A | **P0** |
+| Edit fuzzy | 引号归一化 + DESANITIZATIONS 表 | `utils.ts:531-574` | N/A | **P1** |
+| Write Read-before | `readFileState` 时戳 + 内容双校验 | `FileWriteTool.ts:198-219` | **已有**(基础版) | **P0**(升级双校验) |
+| NotebookEdit | cell-N 索引回退 + nbformat≥4.5 随机 id | `NotebookEditTool.ts:189-237` | N/A | **P1**(Python 场景) |
+| Patch 回灌 | 8KB 截断 + 4 行上下文 | `utils.ts:355-457` | N/A | **P2** |
+| ripgrep 三档 | system / embedded / builtin | `src/utils/ripgrep.ts:31-65` | 仅 Bash 内 rg | **P0**(拆为独立工具) |
+| Glob/Grep 工具 | 基于 ripgrep + VCS 排除 + max-columns 500 | `src/tools/{Glob,Grep}Tool/*.ts` | Bash 替代 | **P0**(拆出) |
+| head_limit | 默认 250 + 0 = unlimited + offset | `GrepTool.ts:104-128` | N/A | **P0** |
+| mtime 排序 | files_with_matches 按 mtime 降序 | `GrepTool.ts:529-571` | N/A | **P2** |
+| Read 多模态 | 6 种 output type(text/image/notebook/pdf/parts/file_unchanged) | `FileReadTool.ts:248-332` | 仅 text | **P0** |
+| image sharp | 5MB base64 + 2000px 双限 + PNG/JPEG 渐进压缩 | `utils/imageResizer.ts:169-433` | N/A | **P0**(image 分支) |
+| image processor | image-processor-napi vs sharp 双模式 | `tools/FileReadTool/imageProcessor.ts:37-85` | N/A | **P2** |
+| PDF | 3MB 阈值双路径 + 20 页/请求 | `apiLimits.ts:62-77` | N/A | **P1** |
+| Notebook 输出 | 10000 字符截断 + cell image base64 | `utils/notebook.ts:20-153` | N/A | **P1** |
+| BLOCKED_DEVICES | `/dev/{zero,random,...}` + `/proc/self/fd/*` | `FileReadTool.ts:96-128` | N/A | **P0** |
+| Read dedup | offset + mtime 命中走 stub | `FileReadTool.ts:523-573` | N/A | **P0**(18% token 节省) |
+| cache_control | 单 marker 末尾 + 5m/1h TTL + scope | `claude.ts:3062-3237` | 未实现 | **P0**(协议层必须) |
+| cache break | 12 维状态机 + 5%/2K 双阈值 + 解释报告 | `promptCacheBreakDetection.ts:28-540` | N/A | **P2**(调试) |
+| cache_edits | 主动删除 + cache_reference 复用 | `claude.ts:3141-3208` | N/A | **P2** |
+| countTokens API | `messages.countTokens` 预算预检 | `tokenEstimation.ts:124-200` | N/A | **P1** |
+| cost tracker | cache_read/cache_creation 透出 | `cost-tracker.ts:166-300` | N/A | **P0** |
+| Sandbox | macOS/Linux/WSL2 + bwrap/bubblewrap | `sandbox/sandbox-adapter.ts:474-547` | 未实现 | **P2** |
+
+### 20.6 第七轮关键洞察(对 laew 立即可落地)
+
+1. **Edit 工具应该立刻补齐**:Write 已能覆盖 80% 场景,但「**基于 old_string 的精准 patch**」是 Yolo/SubAgent 区分度的关键 — 整个 Edit 工具的 9 段校验 + fuzzy 引号归一化 + `old_string is substring of new_string` 检查都可以直接照搬。
+
+2. **Read dedup 是性价比最高的优化**:仅 18% cache 节省,但实现成本极低(`offset + mtime + content_hash` 三元组),laew 在 `src/agent/tools/read.rs` 加一个 `Mutex<HashMap<PathBuf, ReadStamp>>` 即可。
+
+3. **ripgrep vendor 是必须的**:Grep 工具的 `--type` / `--max-columns` / `--multiline-dotall` 是 Bash 包装做不到的精度控制,laew 应该把 ripgrep 作为子进程 vendor(参照 laew 现有的 `target/` 编译产物模式)而不是 runtime 依赖。
+
+4. **Anthropic cache_control 必须正确**:单 marker 末尾 + `cache_reference` 是协议层的硬约束,误用会导致 cache 命中率归零 — laew 接入 Anthropic 时 wire transform 务必按 `claude.ts:3062-3211` 实现。
+
+5. **12 维 cache break 检测是「真因定位」神器**:虽然 P2,但作为 `agent_memory` 持久化的可观测性维度,能直接回答「为什么 cache miss 飙升」。
+
+6. **image 路径必须先于 image-processor**:Claude Code 5MB base64 + 2000px 双限 + sharp 渐进压缩是工程化最佳实践,laew 即便暂时不接 sharp,也应该在 Read 工具里保留这条扩展点(`output_schema` 提前定义 `type: 'image'` 分支)。
+
+7. **NotebookEdit 的 cell-N 数字索引回退**是个小巧但实用的兜底:当 cell id 失效(用户重排 cells)时仍能定位。
+
+8. **BLOCKED_DEVICE_PATHS 黑名单** 是 5 行代码但价值巨大 — 防 OOM/防 hang。
+
+9. **`writeTextContent` 的 LF 决策**(`FileWriteTool.ts:300-305`)是反直觉但正确:**模型给的 `\r\n` 是有意的,不应继承旧文件行尾** — 这条原则要进 laew 的 Write 工具设计。
+
+10. **readFileState `offset: undefined` 标记**是 dedup 防误命中的关键 — Edit/Write 写入时显式设 undefined,Read dedup 只命中真实 Read。
+

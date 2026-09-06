@@ -25,6 +25,8 @@
 14. [错误处理与容错](#14-错误处理与容错)
 15. [对 laew 的借鉴](#15-对-laew-的借鉴)
 
+16. [第七轮深挖 — 文件编辑补丁与排他锁 + Git与checkpoint回滚 + Bash进程管理 + 代码检索索引](#14-第七轮深挖--文件编辑补丁与排他锁--git与checkpoint回滚--bash进程管理--代码检索索引)
+
 ---
 
 ## 1. 项目元信息
@@ -1252,6 +1254,920 @@ export async function withFileMutationQueue<T>(env: ExecutionEnv, path: string, 
 3. **Tool result 截断硬编码**: 2000 字符限制,对于需要精确上下文的场景可能导致信息丢失
 4. **Token 估算粗糙**: `字符数 / 4`,对中文/日文等多字节语言不准确
 5. **OAuth 身份伪装有风险**: 伪装为 Claude Code CLI 可能违反 Anthropic 服务条款
+
+---
+
+## 14. 第七轮深挖 — 文件编辑补丁与排他锁 + Git与checkpoint回滚 + Bash进程管理 + 代码检索索引(2026-09-06)
+
+> 分析对象:`/usr/local/LsmGitOpenSource/pi/packages`(TypeScript, Bun)
+> 本轮聚焦前六轮完全未覆盖的四个"工具层执行语义"维度:文件编辑与补丁策略、Git 与版本控制集成、命令执行与进程管理、代码检索与索引。
+> 全部结论均带 `packages/xxx/src/yyy.ts:LINE` 源码坐标,已逐一核对。
+
+### 14.0 本轮结论速览
+
+| # | 维度 | pi 的答案(一句话) | 关键源码 |
+|---|------|---------------------|----------|
+| 1 | 文件编辑与补丁 | 单一 `edit` 工具 + 多编辑 `edits[]` + 模糊匹配回退 + 行块保真回写 + per-realpath 排他锁;**无备份无 undo,非原子写** | `core/tools/edit.ts` / `edit-diff.ts` / `file-mutation-queue.ts` |
+| 2 | Git 与版本控制 | **核心零 Git 集成**。Git 只出现在三处:TUI footer 分支探测(worktree/reftable 兼容)、worktree 上下文文件去重、扩展示例(git-checkpoint 用 `git stash` 把会话树 fork 和代码回滚联动) | `core/footer-data-provider.ts` / `core/resource-loader.ts` / `examples/extensions/git-checkpoint.ts` |
+| 3 | Bash 进程管理 | `spawn(shell, ["-c", cmd], {detached:true})` + 进程组 SIGKILL + 100ms 空闲宽限等待 + 100ms 节流流式输出 + 有界滚动缓冲 + 超限自动落临时文件;**无 PTY、无后台任务、无 stdin 交互、无危险命令黑名单(全部留给扩展 hook)** | `core/tools/bash.ts` / `utils/shell.ts` / `utils/child-process.ts` / `core/tools/output-accumulator.ts` |
+| 4 | 代码检索与索引 | 完全外包给外部二进制:**spawn ripgrep(`--json`)+ spawn fd(`--glob`)**,缺失时从 GitHub Release 自动下载到 `~/.pi/agent/bin`;**无 LSP、无符号索引、无 embedding/向量索引** | `core/tools/grep.ts` / `find.ts` / `utils/tools-manager.ts` |
+
+四个维度共同的"pi 哲学"再确认:**核心只做最小可信执行语义(锁/截断/取消),一切策略性能力(权限、Git、后台任务)都以扩展 hook 的形式外置**——这与第六轮发现的"单写者模型"一脉相承。
+
+---
+
+### 14.1 文件编辑与补丁策略
+
+#### 14.1.1 工具面:`edit` 是唯一的编辑工具(没有 StrReplace/Patch/MultiEdit/Notebook)
+
+pi 的内置工具集是 `read | bash | powershell | edit | write | grep | find | ls` 共 8 个(`packages/coding-agent/src/core/tools/index.ts:91-100`),**没有** MultiEdit / StrReplaceEditor / NotebookEdit / Patch / ApplyPatch 之类的变体。多编辑能力被合并进 `edit` 的 `edits[]` 数组:
+
+```ts
+// packages/coding-agent/src/core/tools/edit.ts:34-54
+const replaceEditSchema = Type.Object({
+    oldText: Type.String({
+        description:
+            "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.",
+    }),
+    newText: Type.String({ description: "Replacement text for this targeted edit." }),
+});
+
+const editSchema = Type.Object({
+    path: Type.String({ description: "Path to the file to edit (relative or absolute)" }),
+    edits: Type.Array(replaceEditSchema, {
+        description:
+            "One or more targeted replacements. Each edit is matched against the original file, not incrementally...",
+    }),
+});
+```
+
+三条强约束被同时写进 schema 描述与系统提示词(`edit.ts:56-64` 的 `promptGuidelines`):
+
+1. `edits[].oldText` 必须**在原文件中唯一**;
+2. 多条编辑**互不重叠、互不嵌套**——"If two changes touch the same block or nearby lines, merge them into one edit instead"(不是像 MultiEdit 那样顺序应用);
+3. "Keep edits[].oldText as small as possible while still being unique"——禁止用大片未变区域填充。
+
+**没有 `replace_all` 参数**。要全局替换,模型必须显式枚举每一处唯一上下文,或者退回 bash 的 `sed`。这是 pi 有意为之:唯一性校验 + 无 replace_all,把歧义在工具层强制暴露,而不是静默全替换。
+
+#### 14.1.2 参数兼容层 `prepareEditArguments`:对模型坏输出的三重容错
+
+每个工具可以声明 `prepareArguments`(类型见 `packages/agent/src/types.ts:386-389`,定义为 "Optional compatibility shim for raw tool-call arguments **before schema validation**")。`edit` 用它消化三类真实模型错误:
+
+```ts
+// packages/coding-agent/src/core/tools/edit.ts:116-147
+function prepareEditArguments(input: unknown): EditToolInput {
+    ...
+    // Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array.
+    // Others send a single edit object instead of a one-element edits array.
+    if (typeof args.edits === "string") {
+        try {
+            const parsed = JSON.parse(args.edits);
+            if (Array.isArray(parsed)) args.edits = parsed;
+            else if (isSingleEditInput(parsed)) args.edits = [parsed];
+        } catch {}
+    } else if (isSingleEditInput(args.edits)) {
+        args.edits = [args.edits];
+    }
+    // legacy 平铺 oldText/newText → 追加为 edits[0]
+    const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : [];
+    edits.push({ oldText: legacy.oldText, newText: legacy.newText });
+    ...
+}
+```
+
+| 模型坏输出 | 修复动作 |
+|---|---|
+| `edits` 传成 JSON 字符串 | `JSON.parse` 后归一为数组 |
+| `edits` 传成单个对象 | 包成 `[obj]` |
+| 平铺 `oldText`/`newText`(旧 API 习惯) | 追加进 `edits[]` 并删除平铺字段 |
+
+配套测试 `packages/coding-agent/test/edit-tool-legacy-input.test.ts` 专门覆盖这一层。
+
+#### 14.1.3 匹配算法:精确优先 → 模糊归一化回退
+
+核心在 `edit-diff.ts` 的 `fuzzyFindText`(`packages/coding-agent/src/core/tools/edit-diff.ts:207-245`):
+
+```ts
+export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResult {
+    // Try exact match first
+    const exactIndex = content.indexOf(oldText);
+    if (exactIndex !== -1) {
+        return { found: true, index: exactIndex, matchLength: oldText.length,
+                 usedFuzzyMatch: false, contentForReplacement: content };
+    }
+    // Try fuzzy match - work entirely in normalized space
+    const fuzzyContent = normalizeForFuzzyMatch(content);
+    const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+    const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
+    ...
+}
+```
+
+模糊归一化 `normalizeForFuzzyMatch`(`edit-diff.ts:34-55`)是一组**渐进式不可逆变换**:
+
+| 变换 | 目标字符 | 场景 |
+|---|---|---|
+| `NFKC` Unicode 归一 | 全/半角、组合字符 | 模型输出全角标点 |
+| 每行 `trimEnd()` | 行尾空白 | 模型复制的代码缩进尾空格失真 |
+| 智能单引号 → `'` | `‘ ’ ‚ ‛` | 模型把撇号写成排版引号 |
+| 智能双引号 → `"` | `“ ” „ ‟` | 同上 |
+| 各类连字符/破折号 → `-` | `‐-―, −` | 注释里的 em-dash |
+| 特殊空格 → 普通空格 | ` ,  - ,  ,  , 　` | NBSP / 全角空格 |
+
+关键设计:**模糊命中时返回的 `contentForReplacement` 是归一化后的文本而非原文**——替换在"归一化空间"完成,再由下一步把未触碰的行块从原文拷回,保证未编辑区域字节级不变。
+
+#### 14.1.4 行块保真回写:`applyReplacementsPreservingUnchangedLines`
+
+这是 pi 编辑器最精巧的一段(`packages/coding-agent/src/core/tools/edit-diff.ts:122-173`),注释原文道破动机:
+
+```ts
+/**
+ * Apply replacements matched against `baseContent` to `originalContent` while
+ * preserving unchanged line blocks from the original.
+ * ...
+ * The actual replacement ranges drive preservation so
+ * duplicate normalized lines cannot be aligned to the wrong occurrence.
+ */
+export function applyReplacementsPreservingUnchangedLines(
+    originalContent: string, baseContent: string, replacements: TextReplacement[],
+): string {
+```
+
+流程:
+
+1. `getLineSpans` 给归一化基线每行记 `[start, end)` 偏移(`edit-diff.ts:75-82`);
+2. 每个替换区间被"拓宽到它实际触碰的行"(`getReplacementLineRange`, `edit-diff.ts:84-109`);
+3. 相邻/重叠的行组合并成 group(`edit-diff.ts:143-154`);
+4. 遍历 group:group 之间的原文行**逐字节拷贝**,group 内部才用归一化替换结果(`edit-diff.ts:156-170`)。
+
+为什么必须有这一步:若直接把归一化空间的替换结果整体写回,文件里所有行都会被 `trimEnd`/NFKC"洗一遍"——一次小编辑产生数千行无关 diff。**只在触碰行上应用归一化,未触碰行保留原始字节**。
+
+多编辑的替换应用按 `matchIndex` 降序倒序 splice(`applyReplacements`, `edit-diff.ts:111-120`),保证前面的替换不会使后面的偏移失效。
+
+#### 14.1.5 唯一性 / 重叠 / 空文本 / 无变化:四类错误文案
+
+`applyEditsToNormalizedContent`(`edit-diff.ts:300-362`)是编辑主入口,校验顺序与错误文案都值得直接照抄:
+
+| 校验 | 行号 | 错误文案(单编辑 / 多编辑) |
+|---|---|---|
+| `oldText` 为空 | `edit-diff.ts:310-313`, `getEmptyOldTextError:275-280` | `oldText must not be empty in {path}.` / `edits[{i}].oldText must not be empty in {path}.` |
+| 找不到 | `edit-diff.ts:324-326`, `getNotFoundError:253-262` | `Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.` |
+| 多处命中 | `edit-diff.ts:328-331`, `getDuplicateError:264-273` | `Found {n} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique.` |
+| 编辑间重叠 | `edit-diff.ts:341-350` | `edits[{a}] and edits[{b}] overlap in {path}. Merge them into one edit or target disjoint regions.` |
+| 替换后内容不变 | `edit-diff.ts:357-359`, `getNoChangeError:282-289` | `No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.` |
+
+唯一性计数 `countOccurrences`(`edit-diff.ts:247-251`)同样在**归一化空间**做:`fuzzyContent.split(fuzzyOldText).length - 1`——精确空间只有 1 处、归一化空间有 3 处时,照样报 duplicate(且计数是 3),提示模型加上下文。
+
+#### 14.1.6 BOM 与换行符的往返保持
+
+`edit.ts:363-372` 的编辑主路径:
+
+```ts
+// Strip BOM before matching. The model will not include an invisible BOM in oldText.
+const { bom, text: content } = splitBom(rawContent);
+const originalEnding = detectLineEnding(content);
+const normalizedContent = normalizeToLF(content);
+const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+await ops.writeFile(absolutePath, finalContent);
+```
+
+- **BOM**:剥离后匹配,写回时拼回头部——模型永远看不到 BOM;
+- **换行**:`detectLineEnding`(`edit-diff.ts:11-17`)取文件中**首个出现的换行形态**(CRLF 出现在 LF 之前则判 CRLF),全文件 LF 化后编辑,最后 `restoreLineEndings`(`edit-diff.ts:23-25`)整文件还原为原形态。代价是混合换行文件会被统一,收益是 `oldText` 不需要关心 `\r`。
+
+#### 14.1.7 写入方式:非原子、无备份、无 undo(明确的反模式)
+
+`defaultEditOperations` 与 `defaultWriteOperations` 都是裸的 `fs.promises.writeFile(path, content, "utf-8")`:
+
+```ts
+// packages/coding-agent/src/core/tools/edit.ts:105-109
+const defaultEditOperations: EditOperations = {
+    readFile: (path) => fsReadFile(path),
+    writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+    access: (path) => fsAccess(path, constants.R_OK | constants.W_OK),
+};
+```
+
+- **没有 write-temp-then-rename**(会话持久化层的 `publishFileAtomically` 并未复用到工作区文件);
+- **没有 `.orig` / trashcan / 任何备份文件**(全仓库 grep `backup|\.orig|trash` 无工作区命中);
+- **没有编辑级 undo 栈**(唯一的 "undo" 是输入框的 `tui.editor.undo` 键位,`core/keybindings.ts:76`)。
+
+回滚完全依赖两条外部路径:会话树 fork(对话级)和 git(代码级,见 14.2)。
+
+#### 14.1.8 per-file 排他锁:`withFileMutationQueue` 的真实现(coding-agent 版)
+
+第六轮 13.8 记录的是 `packages/agent` SDK 版本;`packages/coding-agent` 内的真实实现多了一层 **realpath 规范化 + 注册串行队列**(`packages/coding-agent/src/core/tools/file-mutation-queue.ts:32-61`):
+
+```ts
+export async function withFileMutationQueue<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+    const registration = registrationQueue.then(async () => {
+        const key = await getMutationQueueKey(filePath);           // realpath
+        const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
+        let releaseNext!: () => void;
+        const nextQueue = new Promise<void>((resolveQueue) => { releaseNext = resolveQueue; });
+        const chainedQueue = currentQueue.then(() => nextQueue);
+        fileMutationQueues.set(key, chainedQueue);
+        return { key, currentQueue, chainedQueue, releaseNext };
+    });
+    registrationQueue = registration.then(() => undefined, () => undefined);
+    const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+    await currentQueue;
+    try {
+        return await fn();
+    } finally {
+        releaseNext();
+        if (fileMutationQueues.get(key) === chainedQueue) fileMutationQueues.delete(key);
+    }
+}
+```
+
+三个细节:
+
+1. **key 是 `realpath(filePath)`**(`file-mutation-queue.ts:16-26`),文件不存在(ENOENT/ENOTDIR)时退回 `resolve(filePath)`——新建文件第一次写和第二次写(此时已存在、realpath 生效)能命中同一把锁的前提是路径本身已规范化;symlink 指向同一物理文件的两个不同路径也会被收敛到同一把锁。
+2. **`registrationQueue` 串行化"注册动作"本身**,防止两个并发注册读到同一个 `currentQueue` 造成锁分裂竞态。
+3. **`finally` 里的条件删除**:`fileMutationQueues.get(key) === chainedQueue` 才删——只有"队尾是自己"时才清 Map,中途加入者会接管 entry,不会误删后继队列。
+
+不同文件的写入仍然并行(`withFileMutationQueue` 只按 key 串行)。
+
+#### 14.1.9 锁与取消的交互:为什么不用 `signal.addEventListener("abort", reject)`
+
+`edit.ts:336-345` 与 `write.ts:210-217` 有一段完全相同的注释,这是工具层最容易被写错的地方:
+
+```ts
+return withFileMutationQueue(absolutePath, async () => {
+    // Do not reject from an abort event listener here: that would release the
+    // mutation queue while an in-flight filesystem operation may still finish.
+    // Checking signal.aborted after each await observes the same aborts while
+    // keeping the queue locked until the current operation has settled.
+    const throwIfAborted = (): void => {
+        if (signal?.aborted) throw new Error("Operation aborted");
+    };
+
+    throwIfAborted();
+    ...
+```
+
+即:**在每个 `await` 之后轮询 `signal.aborted`,而不是注册 abort 监听直接 reject**。原因:`finally { releaseNext() }` 在 reject 时立即触发,会释放排他锁,但此时上一个 `writeFile` 可能仍在内核中飞行,下一个写者立刻进入 → 交错写。轮询方案保证锁持有到"当前操作 settle"为止。副作用是 abort 后最多多做一次无谓的文件写入再抛错(半写状态由下一次编辑的"找不到原文"自然兜住)。
+
+`edit.execute` 中一共 6 个检查点:`edit.ts:345 / 351 / 356 / 361 / 368 / 372`(access 前、readFile 前、归一化后、writeFile 后)。
+
+#### 14.1.10 回灌给模型的"编辑结果":只有一行文字,diff 不进上下文
+
+工具返回结构分两栏(`packages/agent/src/types.ts:360-366`):
+
+```ts
+export interface AgentToolResult<T> {
+    /** Text or image content returned to the model. */
+    content: (TextContent | ImageContent)[];
+    /** Arbitrary structured details for logs or UI rendering. */
+    details: T;
+```
+
+`edit` 的实际返回(`edit.ts:376-384`):
+
+```ts
+return {
+    content: [{ type: "text", text: `Successfully replaced ${edits.length} block(s) in ${path}.` }],
+    details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+};
+```
+
+**模型只看到 `Successfully replaced N block(s) in <path>.`**,不回灌 diff、不回灌 patch、不回灌改动行号。理由很直接:模型自己刚写下 oldText/newText,再回显 diff 是纯 token 浪费;`details.diff/patch` 仅供 TUI 渲染(`edit.ts:414-455` 的 `renderResult`)与 HTML 导出。
+
+对比:`read` 工具在截断时**会**在 `content` 里追加可操作提示(`read.ts:308-317` 的 `[Showing lines X-Y of Z. Use offset=N to continue.]`)——"模型需要知道的信息"与"人需要看的信息"在 pi 里被明确分栏,这是值得照抄的边界。
+
+#### 14.1.11 TUI 预览:同一份算法在渲染期"空跑一遍"
+
+`renderCall` 在参数流式生成完毕(`context.argsComplete`)且尚未执行时,后台并发调用 `computeEditsDiff`(`edit.ts:401-410`;实现在 `edit-diff.ts:514-543`)——复用 `applyEditsToNormalizedContent`,只是不写盘。预览结果按 `JSON.stringify({path, edits})` 作 `argsKey` 缓存,参数一变即失效重算(`edit.ts:394-399`)。这意味着编辑算法必须是**幂等纯计算 + 可独立于写盘调用**,pi 把"匹配/生成 diff"与"写文件"彻底分离成两个函数正是为此。
+
+#### 14.1.12 编辑与会话持久化的顺序:没有跨文件事务
+
+工具写工作区文件(`fsWriteFile`)与 SessionManager 追加 JSONL entry(`appendFileSync`,`session-manager.ts` 的 `_appendEntry`)之间**没有任何先后协议、没有 WAL、没有两阶段**:
+
+- 顺序是"工具执行完成 → tool_result entry 落盘"。若工具写文件成功但进程在 entry 落盘前崩溃 → 文件已改但会话日志缺 tool_result(重启后 14 种损坏检测里的"孤儿 assistant toolCall"会命中,见第 5 章);
+- 反之若先落日志再改文件,崩溃时会出现"日志说改了、文件没改"。pi 选择了前者(先改文件,后记日志),因为文件系统的写入语义比 JSONL append 更强,而且 edit 工具的"找不到 oldText 即失败"天然可重入。
+
+唯一的崩溃一致性保护都在**会话持久化层**(JSONL 撕裂尾部修复 + WriterLease fence,第 10 章/13.3),工作区文件层面是零保护。
+
+#### 14.1.13 对 laew 的借鉴(维度一)
+
+laew 现状:只有 `Bash/Read/Write` 三个工具,没有 `edit`——模型改文件只能整文件重写或靠 `sed`,token 成本高且易错。
+
+| 优先级 | 借鉴项 | pi 来源 | laew 落地(Rust) |
+|---|---|---|---|
+| **P0** | 新增 `Edit` 工具 + `edits[]` 多编辑语义 | `edit.ts:34-64` | `src/agent/tools/edit.rs`,`schema = {path, edits: [{oldText, newText}]}`;`Work Agent` 与 `SubAgent` 均注册 |
+| **P0** | 唯一性 + 重叠 + 空文本 + 无变化 四类中文错误文案 | `edit-diff.ts:253-289` | 直接翻译成中文文案表,错误里带 `edits[{i}]` 索引 |
+| **P0** | `prepareArguments` 参数兼容层 | `edit.ts:116-147`, `agent/src/types.ts:386-389` | 在工具 trait 增加 `prepare_args(&mut serde_json::Value)` 钩子,统一消化字符串化 edits / 平铺 oldText |
+| **P1** | 模糊匹配 + 行块保真回写 | `edit-diff.ts:34-55, 132-173` | Rust 用 `unicode-normalization` crate 做 NFKC;按行分组、组间拷贝原文字节 |
+| **P1** | BOM 剥离 + 换行形态探测还原 | `edit.ts:363-372` | `content.strip_prefix('\u{feff}')` + 首个换行探测 |
+| **P1** | per-realpath 排他锁 + 轮询式 abort | `file-mutation-queue.ts:32-61`, `edit.ts:336-345` | `HashMap<PathBuf, Arc<Mutex<()>>>` + tokio `Mutex`;每个 await 后查 `CancellationToken` |
+| **P1** | content/details 分栏,diff 不进上下文 | `agent/src/types.ts:360-366`, `edit.ts:376-384` | `ToolOutput { model_text: String, ui_details: Value }`,laew 的 SQLite `agent_memory` 存 details,diff 只进 UI |
+| **P2** | 编辑预览纯函数化 | `edit-diff.ts:514-543` | 把 `apply_edits` 与 `write_file` 拆成两个独立 fn,便于测试与 TUI 预览 |
+| **P2** | write-temp-then-rename 原子写 | (pi 反例:没有) | `tempfile::NamedTempFile::persist()` —— pi 缺失的,laew 应补上 |
+
+---
+
+### 14.2 Git 与版本控制集成
+
+#### 14.2.1 总体结论:核心零 Git,只有三处"被动感知" + 一批官方示例扩展
+
+全仓库 grep `git status|git diff|checkpoint|worktree|stash` 后,核心代码(`packages/*/src`)里真正涉及 Git 的只有三处:footer 分支探测、worktree 上下文去重、Git URL 解析(扩展安装用)。**没有**自动 commit、自动 branch、内置 diff 工具、仓库指纹、gitignore 引擎(laew 现状相同)、或并发任务 worktree 隔离。
+
+这个"留白"是设计选择:pi 的扩展 API 提供 `pi.exec(cmd, args)`(`packages/coding-agent/src/core/extensions/types.ts:1397`,实现在 `core/exec.ts:37-107`)与 `tool_call`/`session_before_fork` 等事件,Git 策略全部由用户级扩展实现。
+
+#### 14.2.2 footer 分支探测:不调 `git` 子进程的零开销方案
+
+`packages/coding-agent/src/core/footer-data-provider.ts:16-48` 的 `findGitPaths`:
+
+```ts
+export function findGitPaths(cwd: string): GitPaths | null {
+    let dir = cwd;
+    while (true) {
+        const gitPath = join(dir, ".git");
+        if (existsSync(gitPath)) {
+            const stat = statSync(gitPath);
+            if (stat.isFile()) {                       // worktree: .git 是文件
+                const content = readFileSync(gitPath, "utf8").trim();
+                if (content.startsWith("gitdir: ")) {
+                    const gitDir = resolve(dir, content.slice(8).trim());
+                    const headPath = join(gitDir, "HEAD");
+                    if (!existsSync(headPath)) return null;
+                    const commonDirPath = join(gitDir, "commondir");
+                    const commonGitDir = existsSync(commonDirPath)
+                        ? resolve(gitDir, readFileSync(commonDirPath, "utf8").trim()) : gitDir;
+                    return { repoDir: dir, commonGitDir, headPath };
+                }
+            } else if (stat.isDirectory()) {           // 普通仓库
+                ...
+```
+
+要点:
+
+- **向上遍历到根**找 `.git`,兼容 `.git` 为目录(普通仓库)与为文件(`git worktree add` 产生的链接 worktree);
+- worktree 场景解析 `gitdir:` 指针 + `commondir` 回到主仓库共享目录;
+- 分支名**优先直接读 HEAD 文件**(`footer-data-provider.ts:239-251`):`ref: refs/heads/<branch>` 即分支,裸 SHA 即 `"detached"`;只有 HEAD 里出现 `.invalid`(reftable 后端的过渡态)才降级 spawn `git symbolic-ref --quiet --short HEAD`(`:51-59` 同步版 / `:62-81` 异步版),且带 `--no-optional-locks` 避免污染 `index`。
+- **文件监听而非轮询**(`:307-381`):监听 HEAD 所在**目录**而非 HEAD 本身(git 用"写临时文件 + rename"原子替换 HEAD,inode 会变,`fs.watch` 文件会失效);WSL 下 `/mnt/c` 这类 Windows 挂载路径 inotify 不可靠,自动降级 `watchFile` 1s 轮询(`:83-93` 的 `shouldPollGitHead`);**reftable 仓库切分支不写 HEAD**,额外 watch `<commonGitDir>/reftable` 与 `tables.list`(`:342-380`)。变更经 500ms 防抖(`WATCH_DEBOUNCE_MS`,`:101`)后异步刷新。
+
+#### 14.2.3 worktree 感知的项目上下文去重
+
+`packages/coding-agent/src/core/resource-loader.ts:90-116` 的 `findShadowedContextFile`:嵌套 linked worktree 自己的 `AGENTS.md` 与主仓库的 `AGENTS.md` 占据同一"逻辑仓库作用域",若都加载会**应用两遍**。函数通过 `commondir` 反推主仓库根,判定"当前 worktree 是主仓库的子目录"且"主仓库根确有 `.git` 目录"(排除 `proj/.bare` 布局与 submodule)后,把被 shadow 的主仓库上下文文件路径返回给加载器跳过。返回值统一 `canonicalizePath`,因为 `git worktree add` 写入的 `gitdir:` 是 realpath 形式而 cwd 可能仍是 symlink(macOS `/tmp` → `/private/tmp`)。
+
+#### 14.2.4 `utils/git.ts`:唯一的"Git 逻辑"是 URL 解析与安全校验
+
+`packages/coding-agent/src/utils/git.ts` 226 行全部服务于**扩展包安装**(`pi install git:github.com/user/repo@ref`),与 Agent 编辑行为无关。值得抄的是它的注入防护(`git.ts:84-124`):
+
+```ts
+function hasUnsafeGitInstallPart(value: string, allowSlash: boolean): boolean {
+    const decoded = decodeForValidation(value);        // 先 URL 解码再查,防 %2e%2e%2f 绕过
+    if (decoded === null) return true;
+    const candidates = [value, decoded];               // 原文和解码后都查
+    for (const candidate of candidates) {
+        if (candidate.includes("\0") || candidate.includes("\\") || candidate.startsWith("/")) return true;
+        if (!allowSlash && candidate.includes("/")) return true;
+        if (candidate.split("/").includes("..")) return true;
+    }
+    return false;
+}
+```
+
+同时支持 scp 风格 `git@host:path@ref`、`https://host/path@ref`、短格式 `host/path@ref` 三种 ref 切分(`splitRef`, `git.ts:21-74`)。
+
+#### 14.2.5 checkpoint 与 undo/rewind:会话树 fork × `git stash` 的联动
+
+pi 的"回滚"分两层,**核心只实现第一层**:
+
+**第一层(核心):对话回滚 = session tree 分支**
+
+| API | 行号 | 语义 |
+|---|---|---|
+| `getBranch(fromId?)` | `core/session-manager.ts:1261-1270` | 从 entry 沿 `parentId` 走到根,逆序返回当前分支 |
+| `branch(branchFromId)` | `session-manager.ts:1361-1366` | 仅移动 `leafId` 指针,append-only,不删任何 entry |
+| `resetLeaf()` | `session-manager.ts:1368-1374` | leaf 置 null,下一条 entry 成为新根(重编辑首条 user 消息) |
+| `branchWithSummary(branchFromId, summary, ...)` | `session-manager.ts:1378-1406` | 分支同时追加 `branch_summary` entry,保留被放弃路径的摘要(见 7.5) |
+| `createBranchedSession(leafId)` | `session-manager.ts:1414-1460` | 导出"根→leaf"单条路径为新 JSONL 文件;**label entry 被过滤后需要重新链接 parentId,否则产生孤儿子树**(`:1427-1435`) |
+| `SessionManager.forkFrom(sourcePath, targetCwd)` | `session-manager.ts:1581-1633` | 跨项目 fork:新 header 写 `parentSession: 源文件路径`,逐条复制非 header entry |
+
+`/fork` 命令在 `modes/interactive/interactive-mode.ts:3046 / 5135 / 5147 / 5177` 触发,经 `core/agent-session-runtime.ts:150-165` 的 `emitBeforeFork` 先发 `session_before_fork` 事件——**这正是代码回滚的挂载点**。
+
+**第二层(扩展):代码回滚 = `git stash` 快照**
+
+官方示例 `packages/coding-agent/examples/extensions/git-checkpoint.ts`(53 行,完整逻辑):
+
+```ts
+export default function (pi: ExtensionAPI) {
+    const checkpoints = new Map<string, string>();      // entryId → git stash ref
+    let currentEntryId: string | undefined;
+
+    pi.on("tool_result", async (_event, ctx) => {
+        const leaf = ctx.sessionManager.getLeafEntry();
+        if (leaf) currentEntryId = leaf.id;
+    });
+
+    pi.on("turn_start", async () => {
+        // Create a git stash entry before LLM makes changes
+        const { stdout } = await pi.exec("git", ["stash", "create"]);
+        const ref = stdout.trim();
+        if (ref && currentEntryId) checkpoints.set(currentEntryId, ref);
+    });
+
+    pi.on("session_before_fork", async (event, ctx) => {
+        const ref = checkpoints.get(event.entryId);
+        if (!ref) return;
+        if (!ctx.hasUI) return;                        // 非交互模式不自动恢复
+        const choice = await ctx.ui.select("Restore code state?", [
+            "Yes, restore code to that point", "No, keep current code"]);
+        if (choice?.startsWith("Yes")) {
+            await pi.exec("git", ["stash", "apply", ref]);
+            ctx.ui.notify("Code restored to checkpoint", "info");
+        }
+    });
+
+    pi.on("agent_settled", async () => checkpoints.clear());
+}
+```
+
+设计要点:`git stash create` 只创建悬挂 commit **不动工作区/index**(不同于 `git stash push`),零副作用;map 的 key 是**对话树 entry id**,所以 checkpoint 与 fork 点一一对应;恢复用 `stash apply`(非 `pop`,保留 ref 可多次回跳);`agent_settled` 清空避免跨 run 泄漏;非交互模式(`!ctx.hasUI`)默认不恢复——**所有破坏性动作必须有人确认**。
+
+#### 14.2.6 其余三个 Git 示例扩展:同一 API 面的三种策略
+
+| 扩展 | 挂载事件 | 行为 |
+|---|---|---|
+| `auto-commit-on-exit.ts` | `session_shutdown` | `git status --porcelain` 非空时,取**最后一条 assistant 消息首行**拼 `[pi] {前50字符}...` 作 commit message,`git add -A && git commit -m`(`examples/extensions/auto-commit-on-exit.ts:14-52`) |
+| `dirty-repo-guard.ts` | `session_before_switch` / `session_before_fork` 等 | 有未提交改动时弹 `ctx.ui.select` 二次确认;**非交互模式默认 cancel**(fail-closed,`examples/extensions/dirty-repo-guard.ts:24-46`) |
+| `git-merge-and-resolve.ts` | 自定义命令 | 冲突解决流:`git diff --name-only --diff-filter=U` 找冲突文件 → 逐个 ours/theirs(配套测试 `test/git-merge-and-resolve-extension.test.ts:95-199`) |
+
+#### 14.2.7 pi 没有的(与 claude-code 对照)
+
+| 能力 | pi | 说明 |
+|---|---|---|
+| 自动 commit / branch | ✗(仅示例扩展) | 无核心实现 |
+| 内置 git diff / status 工具 | ✗ | 模型走 bash + 提示词约定 |
+| 文件快照式 checkpoint(非 git) | ✗ | 无任何文件级快照存储 |
+| 仓库指纹 / project hash | ✗ | session 目录按 `encoded-cwd` 分桶,与 git 无关 |
+| gitignore 引擎 | ✗(外包) | grep/fnd 依赖 rg/fd 自带的 gitignore 支持(见 14.4) |
+| 并发任务 worktree 隔离 | ✗ | worktree 仅被"识别"(footer/上下文去重),不被"创建" |
+| git status/diff 进上下文 | ✗ | 无自动注入;示例 `inline-bash.ts:9` 演示用 `!{git status --short}` 模板在输入侧内联 |
+
+#### 14.2.8 对 laew 的借鉴(维度二)
+
+laew 现状:完全没有 Git 感知,MultiAgentOrchestrator 的 6 角色也不知道仓库状态。
+
+| 优先级 | 借鉴项 | pi 来源 | laew 落地(Rust) |
+|---|---|---|---|
+| **P0** | footer/横幅级 Git 分支探测(直读 HEAD,零子进程) | `footer-data-provider.ts:16-48, 239-251` | 用 `git2`/`gix` crate 或裸读 `.git/HEAD`;TUI 横幅增加 `分支: main` |
+| **P0** | Quality-Check 前自动 `git stash create` checkpoint | `git-checkpoint.ts:20-27` | QC Agent 启动前记录 ref,存 SQLite `checkpoints(entry_id, stash_ref, created_at)` |
+| **P0** | 失败回流时可选 `git stash apply` 恢复 | `git-checkpoint.ts:29-47` | Yolo 的"失败回流与用户建议"路径:回滚到 SubAgent 执行前 ref(需用户确认) |
+| **P1** | `session_before_fork` 式前置事件 | `agent-session-runtime.ts:150-165` | laew Session 增加 `before_rollback` 钩子,把"对话回滚"与"代码回滚"解耦但联动 |
+| **P1** | worktree/`.git` 文件形态识别 | `footer-data-provider.ts:20-39`, `resource-loader.ts:100-116` | 项目上下文五级链发现时识别 worktree,避免主仓库/子 worktree 上下文重复注入 |
+| **P1** | dirty repo 守卫(非交互 fail-closed) | `dirty-repo-guard.ts:24-46` | `-p` 单轮模式下检测到未提交改动且任务含写操作时拒绝执行 |
+| **P2** | `--no-optional-locks` + `symbolic-ref` 降级路径 | `footer-data-provider.ts:51-81` | 所有 git 只读探测统一带 `--no-optional-locks` |
+| **P2** | reftable / WSL 挂载 / HEAD inode 变化三个兼容坑 | `footer-data-provider.ts:307-381` | Rust 用 `notify` crate watch 目录而非文件;WSL 检测 `/mnt/<x>` |
+
+---
+
+### 14.3 命令执行与进程管理(Bash 工具)
+
+#### 14.3.1 Schema 与超时语义
+
+```ts
+// packages/coding-agent/src/core/tools/bash.ts:42-45
+const bashSchema = Type.Object({
+    command: Type.String({ description: "Shell command to execute" }),
+    timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+});
+```
+
+超时校验(`bash.ts:29-40`):非有限数 / `<=0` → `"Invalid timeout: must be a finite number of seconds"`;超过 `2_147_483_647ms`(Node setTimeout 上限)→ `"Invalid timeout: maximum is 2147483.647 seconds"`。**默认无超时**——长任务不被强制打断,取消只能靠用户 Esc 的 AbortSignal。
+
+工具描述把截断规则写给模型(`bash.ts:350`):"Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file."
+
+#### 14.3.2 spawn:三种 shell、两种命令传输通道、detached 进程组
+
+`createLocalShellOperations`(`bash.ts:84-150`)是 bash/powershell 共用的执行后端:
+
+```ts
+// bash.ts:98-110
+const commandFromStdin = shellConfig.commandTransport === "stdin";
+const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
+    cwd,
+    detached: process.platform !== "win32",
+    env: env ?? getShellEnv(),
+    stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+    windowsHide: true,
+});
+if (commandFromStdin) {
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(command);
+}
+if (child.pid) trackDetachedChildPid(child.pid);
+```
+
+| 决策 | 理由 |
+|---|---|
+| `detached: true`(非 Windows) | 子进程自成进程组,之后 `process.kill(-pid, SIGKILL)` 可**杀整棵树**,不会留下孤儿 |
+| `commandTransport: "stdin"`(shell `["-s"]`) | 旧版 WSL bash(`System32\bash.exe`)的 `-c` 会把命令暴露在 `ps` 输出里且长度受限,改走 stdin(`utils/shell.ts:15-22`) |
+| `stdio[0] = "ignore"` | **工具层无 stdin 交互**;模型想传输入只能用 heredoc / 管道 |
+| `trackDetachedChildPid` | detached 进程不受父进程退出联动,须显式登记,进程收到 SIGHUP/SIGTERM 时统一 `killTrackedDetachedChildren()`(`utils/shell.ts:196-211`) |
+| `windowsHide: true` | Windows 下不弹控制台窗 |
+
+shell 解析链(`utils/shell.ts:67-120`):用户 settings `shellPath` → Windows 下 Git Bash 已知位置(`ProgramFiles\Git\bin\bash.exe` 等)→ PATH 上的 `bash.exe`(`where` + `existsSync` 双重验证,`where` 可能返回不存在的路径)→ Unix `/bin/bash` → PATH `bash`(`which`)→ 兜底 `sh -c`。找不到时报错信息直接给出 3 条解决途径与已搜索路径列表(`shell.ts:100-106`)。
+
+`resolveSpawnContext`(`bash.ts:170-196`)给出**环境变量注入与净化**的完整顺序:
+
+```ts
+const env = { ...getShellEnv() };
+delete env.PI_SESSION_ID;  delete env.PI_SESSION_FILE;
+delete env.PI_PROVIDER;    delete env.PI_MODEL;
+delete env.PI_REASONING_LEVEL;
+if (exposeSessionEnvironment && ctx) {
+    env.PI_SESSION_ID = ctx.sessionManager.getSessionId();
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (sessionFile) env.PI_SESSION_FILE = sessionFile;
+    if (model) { env.PI_PROVIDER = model.provider; env.PI_MODEL = model.id; }
+    if (ctx.thinkingLevel) env.PI_REASONING_LEVEL = ctx.thinkingLevel;
+}
+```
+
+**先删后加**:继承自父进程的旧值一律清掉,再按 `exposeSessionEnvironment`(默认 true)注入当前会话的 `PI_*` 五元组,保证 fork/切换 session 后子进程看到的一定是最新值。`getShellEnv`(`shell.ts:138-150`)同时把 pi 自身 bin 目录前置到 `PATH`。`spawnHook`(`BashSpawnHook`, `bash.ts:168`)允许扩展在执行前改写 `{command, cwd, env}` 三元组。
+
+#### 14.3.3 取消与超时:统一走 `killProcessTree`
+
+```ts
+// bash.ts:111-124
+let timedOut = false;
+const onAbort = () => { if (child.pid) killProcessTree(child.pid); };
+...
+if (timeoutMs !== undefined) {
+    timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        if (child.pid) killProcessTree(child.pid);
+    }, timeoutMs);
+}
+```
+
+`killProcessTree`(`utils/shell.ts:216-247`)跨平台两分支:
+
+- **Windows**:直接 spawn `System32\taskkill.exe /F /T /PID`(用绝对路径而非 PATH,防 PATH 劫持;spawn 失败的异步 `error` 事件被显式消费,避免 unhandled rejection 崩溃 Node);
+- **Unix**:`process.kill(-pid, "SIGKILL")` 杀进程组;失败(如已被 reaper 收走)降级 `process.kill(pid, "SIGKILL")`;再失败静默忽略。
+
+错误区分:abort → `throw new Error("aborted")`(工具层转成 `Command aborted` 状态行,`bash.ts:467-469`);超时 → `throw new Error("timeout:" + timeout)`(转成 `Command timed out after {n} seconds`,`bash.ts:470-473`)。两种失败都**先 `finishOutput()` 保留已产生的输出**再抛,输出不丢。
+
+#### 14.3.4 `waitForChildProcess`:防"exit 后输出被截断"的 100ms 空闲宽限
+
+`packages/coding-agent/src/utils/child-process.ts:38-137` 是对 `child.on("close")` 不可靠的修正,注释直指一个真实 bug(earendil-works/pi#5303):
+
+> A short-lived child can `exit` while a detached descendant keeps its stdout/stderr pipe open. We must not resolve and destroy the streams on a fixed deadline measured from `exit`, or output still being written past that deadline is silently lost.
+
+机制:`EXIT_STDIO_GRACE_MS = 100`(`:16`);`exit` 触发后武装空闲定时器,**每收到一个新 data chunk 就重新武装**(`onData → armIdleTimer`,`:93-97`);stdout/stderr 双双 `end` 则立即 finalize;`close` 事件到达也 finalize。也就是"活跃的后代持续写 → 我们持续读;安静的后台守护进程占着句柄 → 100ms 后强制释放"。配套测试 `test/bash-close-hang-windows.test.ts`。
+
+扩展用的 `execCommand`(`core/exec.ts:37-107`)是另一条独立路径:`shell: false` 直跑 argv(不经 shell 解释,天然免注入)、SIGTERM → 5s → SIGKILL 两段式、同样复用 `waitForChildProcess`。
+
+#### 14.3.5 流式输出:100ms 节流 + OutputAccumulator 有界滚动缓冲
+
+工具执行侧的节流(`bash.ts:211-212` 常量, `:376-410` 实现):
+
+```ts
+const BASH_UPDATE_THROTTLE_MS = 100;
+...
+const scheduleOutputUpdate = () => {
+    if (!onUpdate) return;
+    updateDirty = true;
+    const delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
+    if (delay <= 0) { clearUpdateTimer(); emitOutputUpdate(); return; }
+    updateTimer ??= setTimeout(() => { updateTimer = undefined; emitOutputUpdate(); }, delay);
+};
+```
+
+`OutputAccumulator`(`packages/coding-agent/src/core/tools/output-accumulator.ts:35-222`)是内存安全的核心,**增量统计 + 滚动尾部 + 惰性临时文件**三件套:
+
+```ts
+constructor(options: OutputAccumulatorOptions = {}) {
+    this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;        // 2000
+    this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;        // 50KB
+    this.maxRollingBytes = Math.max(this.maxBytes * 2, 1);        // 100KB 尾部窗口
+}
+```
+
+- **流式 UTF-8 解码**:`TextDecoder().decode(chunk, { stream: true })`(`:70`),多字节字符跨 chunk 不会碎;
+- **滚动尾部**:`tailText` 超过 `2 × maxRollingBytes`(约 200KB)才裁剪(`:157-159`);裁剪时**按 UTF-8 续字节边界推进**(`buf[start] & 0xc0) === 0x80`,`:186-189`),并记录 `tailStartsAtLineBoundary`——若尾部起点在行中间,`getSnapshotText()` 会丢弃到下一个换行(`:196-203`),保证快照永远从整行开始;
+- **行/字节计数增量维护**:`appendDecodedText`(`:148-177`)一次遍历同时更新 `completedLines`、`currentLineBytes`、`hasOpenLine`、`totalDecodedBytes`,O(n) 无重复扫描;
+- **惰性临时文件**:`shouldUseTempFile()`(`:205-209`)在 `totalRawBytes > maxBytes || totalDecodedBytes > maxBytes || totalLines > maxLines` 时才 `ensureTempFile()`,并把此前缓存的 `rawChunks` 先写进去再清空(`:211-221`);文件名 `{prefix}-{randomBytes(8).hex}.log` 于 `tmpdir()`,prefix 默认 `pi-bash`(`bash.ts:532`);
+- **snapshot 双重截断**:`truncateTail(滚动尾部)` 的内容 + 全局的 `totalLines/totalDecodedBytes` 判定(`:91-119`),`persistIfTruncated` 时确保临时文件存在。
+
+即:**GB 级输出下内存占用恒定 ~200KB,同时完整输出始终可从临时文件取回**。
+
+#### 14.3.6 截断策略:头部/尾部双向 + 三个边界 case
+
+`packages/coding-agent/src/core/tools/truncate.ts:11-13` 定义行业默认:`DEFAULT_MAX_LINES = 2000`、`DEFAULT_MAX_BYTES = 50 * 1024`、`GREP_MAX_LINE_LENGTH = 500`。
+
+| 函数 | 行号 | 方向 | 用途 | 边界处理 |
+|---|---|---|---|---|
+| `truncateHead` | `:78-160` | 保头部 | read/ls/grep/find 结果 | **永不返回半行**;首行单独超字节上限 → 返回空 + `firstLineExceedsLimit: true`(由调用方转成 bash 提示) |
+| `truncateTail` | `:168-241` | 保尾部 | bash 输出(错误一般在末尾) | 倒序累计;**唯一允许半行的地方**——若最后一行本身超 50KB,取该行末尾 `maxBytes` 字节并置 `lastLinePartial: true` |
+| `truncateStringToBytesFromEnd` | `:247-262` | — | 上面那个半行 case | 从尾部回退 maxBytes,再跳过 UTF-8 续字节到字符边界 |
+| `truncateLine` | `:268-276` | 单行 | grep 命中行 | 超 500 字符截断 + `... [truncated]` 后缀 |
+
+bash 结果回填文案(`bash.ts:432-450`)分三态并给出**精确行号区间与临时文件路径**:
+
+```ts
+if (truncation.lastLinePartial) {
+    text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
+} else if (truncation.truncatedBy === "lines") {
+    text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+} else {
+    text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+}
+```
+
+#### 14.3.7 退出码与非零输出的呈现
+
+`bash.ts:479-481`:
+
+```ts
+if (exitCode !== 0 && exitCode !== null) {
+    throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
+}
+```
+
+非零退出码被建模为 **tool error**(`isError: true`),但**先带上全部输出再追加状态行**(`appendStatus`,`:452`)——模型既看到 stdout/stderr 又看到退出码。被信号杀死(`exitCode === null`)不算错误。输出为空时文本为 `"(no output)"`(`:432`)。
+
+#### 14.3.8 工作目录与会话 cwd 的关系
+
+工具的 cwd 取 `ctx?.cwd || cwd`(`bash.ts:366`),即**扩展上下文里的会话 cwd 优先**,退回到工具构造时的 cwd。`core/session-cwd.ts:9-62` 处理恢复会话时"存档的 cwd 已不存在"的场景:抛 `MissingSessionCwdError`(带 sessionFile 与 fallbackCwd 两个信息),或由上层用 `formatMissingSessionCwdPrompt`(`:47-51`)弹"继续用当前 cwd"的确认。`createLocalShellOperations` 在 spawn 前还显式 `fsAccess(cwd, F_OK)`,目录不存在直接报 `Working directory does not exist: {cwd}`(`bash.ts:92-96`)。
+
+#### 14.3.9 没有的东西(明确列出)
+
+| 能力 | pi 状态 | 替代方案 |
+|---|---|---|
+| PTY / 伪终端 | ✗ | 无;需要交互的程序(如 `vim`)无法运行,plan-mode 甚至把编辑器列入黑名单 |
+| stdin 交互(向运行中进程写输入) | ✗ 工具层 | 模型用 heredoc / `echo \| cmd`;扩展可走 `pi.exec` |
+| 后台任务与任务 ID(如 `run_in_background`) | ✗ | 长任务靠 `detached` + 用户自己 nohup;无任务句柄/查询接口 |
+| 内置危险命令黑名单 | ✗ 核心无 | 完全交给 `tool_call` hook,见 14.3.10 |
+| 输出预览字节上限之外的全量回读 | ✗ | 只给临时文件路径,模型需自己 `read`/`sed -n` 取 |
+
+#### 14.3.10 危险命令拦截:核心只提供"可阻断的 hook",策略在示例扩展里
+
+`tool_call` 事件契约(`packages/coding-agent/src/core/extensions/types.ts:936-951`):
+
+> Fired before a tool executes. Can block.
+> `event.input` is mutable. Mutate it in place to patch tool arguments before execution. Later `tool_call` handlers see earlier mutations. **No re-validation is performed after mutation.**
+
+返回 `{block: true, reason}` 即拦截(类型见 `packages/agent/src/types.ts:60-70` 的 `BeforeToolCallResult {block, reason, terminate}`);`terminate: true` 提示"本批工具结束后停止整轮"(仅当**同批全部** finalized 结果都置 terminate 才生效,防止单个工具独断终止)。
+
+官方 plan-mode 扩展是最完整的白/黑名单参考(`packages/coding-agent/examples/extensions/plan-mode/`):
+
+```ts
+// index.ts:164-176
+pi.on("tool_call", async (event) => {
+    if (!planModeEnabled || event.toolName !== "bash") return;
+    const command = event.input.command as string;
+    if (!isSafeCommand(command)) {
+        return {
+            block: true,
+            reason: `Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\nCommand: ${command}`,
+        };
+    }
+});
+```
+
+判定函数 `isSafeCommand`(`plan-mode/utils.ts:97-101`)= **非破坏 且 在白名单**:
+
+```ts
+export function isSafeCommand(command: string): boolean {
+    const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
+    const isSafe = SAFE_PATTERNS.some((p) => p.test(command));
+    return !isDestructive && isSafe;
+}
+```
+
+- **黑名单**(`utils.ts:7-42`,36 条):`dd / shred`、任何 `>` / `>>` 重定向、`npm|yarn|pnpm install/uninstall/update`、`pip install`、`apt(-get)`、`brew`、**`git add|commit|push|pull|merge|rebase|reset|checkout|branch -d|stash|cherry-pick|revert|tag|init|clone`**、`sudo / su`、`kill / pkill / killall`、`reboot / shutdown`、`systemctl start|stop|restart|enable|disable`、`vim|nano|emacs|code|subl`(交互式编辑器会挂死无 PTY 的执行器);
+- **白名单**(`utils.ts:44-95`,约 50 条):`cat/head/tail/less/more/grep/find/ls/pwd/echo/printf/wc/sort/uniq/diff/file/stat/du/df/tree/which/whereis/type/env/printenv/uname/whoami/id/date/cal/uptime/ps/top/htop/free`、**`git status|log|diff|show|branch|remote|config --get` 与 `git ls-*`(只读 git)**、`npm list|ls|view|info|search|outdated|audit`、`curl <url>`、`wget -O -`(仅 stdout)、`jq`、`sed -n`(仅打印)、`awk`、`rg/fd/bat/eza`。
+
+注意黑名单是**子串级正则**(如 `/\bsu\b/i` 会误伤 `sudo` 之外的 `sum`?——不会,`\b` 边界;但会拦下 `git commit` 出现在注释字符串里的极端 case),白名单是**行首锚定**(`^\s*cat\b`)——所以 `cat file; rm -rf /` 因不匹配任何行首白名单而整体被拦。这是"默认拒绝"的正确姿势。
+
+plan-mode 同时通过 `before_agent_start` 注入 `[PLAN MODE ACTIVE]` 系统消息并把 edit/write 从活动工具里移除(`plan-mode/index.ts:212-241`),`context` hook 在退出 plan 模式后过滤掉这些过时消息(`:177-191`)——**提示词层与工具层双重设防**。
+
+#### 14.3.11 工具并发:sequential/parallel 的判定链
+
+`packages/agent/src/agent-loop.ts:413-423`:
+
+```ts
+const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
+const hasSequentialToolCall = toolCalls.some(
+    (tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
+);
+if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+    return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+}
+return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+```
+
+**批内一票否决**:只要本批任一工具声明 `executionMode: "sequential"`(`agent/src/types.ts:404-409`),整批退化为串行。无全局并发度上限、无信号量——并发上限就是"模型单条消息里的 tool call 数量"。文件写安全完全由 14.1.8 的 per-file 锁兜底(所以 pi 的 8 个内置工具**都没声明** sequential,默认全并行)。
+
+#### 14.3.12 对 laew 的借鉴(维度三)
+
+laew 现状:`src/agent/tools/bash.rs` 一次性收集输出、无超时参数、无进程组杀、无截断、无流式。
+
+| 优先级 | 借鉴项 | pi 来源 | laew 落地(Rust) |
+|---|---|---|---|
+| **P0** | 进程组 + 整树杀 | `bash.ts:101`, `shell.ts:216-247` | `tokio::process::Command::process_group(0)`(Unix)/ `windows_job_object`;超时与 Ctrl-C 都 `kill(-pgid, SIGKILL)` |
+| **P0** | 50KB / 2000 行双向截断 + 精确区间文案 | `truncate.ts:11-13, 168-241`, `bash.ts:432-450` | 独立 `truncate.rs` 模块,read 用 head、bash 用 tail;文案带 `[Showing lines X-Y of Z]` |
+| **P0** | 超限自动落临时文件 | `output-accumulator.ts:205-221` | `tempfile` crate;路径回填进结果尾部 |
+| **P0** | 非零退出码 = isError + 附带全部输出 | `bash.ts:479-481` | `ToolResult { is_error: true, text: 输出 + "\n\nCommand exited with code N" }` |
+| **P1** | timeout 参数 + Node 上限校验 | `bash.ts:26-40, 42-45` | schema 增加 `timeout: Option<u64>`(秒),上限校验同款 |
+| **P1** | 100ms 节流 onUpdate 流式 | `bash.ts:211-212, 397-410` | TUI 已有 Frame 机制,加 `tokio::time::throttle` |
+| **P1** | 滚动尾部有界缓冲 + UTF-8 边界裁剪 | `output-accumulator.ts:148-203` | `Vec<u8>` 环形缓冲,`str::from_utf8` 失败时推进到下一字符边界 |
+| **P1** | exit 后 100ms 空闲宽限收尾 | `child-process.ts:38-137` | `wait_with_output` 之外监听 stdout EOF + 空闲定时器重武装 |
+| **P1** | PI_* 式会话元数据环境变量(先删后加) | `bash.ts:170-196` | 注入 `LAEW_SESSION_ID / LAEW_AGENT / LAEW_PROVIDER / LAEW_MODEL` |
+| **P1** | 危险命令黑名单 + 白名单(默认拒绝) | `plan-mode/utils.ts:7-101` | `src/agent/permission.rs`:36 条黑名单 + 50 条行首白名单正则,Plan Agent 阶段强制启用 |
+| **P2** | `tool_call` 可阻断 hook + `terminate` 批级语义 | `extensions/types.ts:936-951`, `agent/src/types.ts:60-70` | laew 增加 `BeforeToolCall { Block(reason), Terminate }`;Quality-Check 可挂此钩子 |
+| **P2** | 跨平台 shell 发现链 | `shell.ts:67-136` | Unix 直接 `/bin/bash` 兜底 `sh`;错误信息列出已搜索路径 |
+| **P2** | stdout 净化(控制字符/孤代理/format chars) | `shell.ts:160-190` | Rust 侧 `String::from_utf8_lossy` + 过滤 C0 控制字符(保留 `\t\n\r`) |
+
+---
+
+### 14.4 代码检索与索引
+
+#### 14.4.1 四个只读检索工具 + 一条"只读工具集"预设
+
+`packages/coding-agent/src/core/tools/index.ts:163-170` 提供 `createReadOnlyToolDefinitions`(read/grep/find/ls)——与 `createCodingToolDefinitions`(read/bash/edit/write, `:155-161`)相对。这个二分让"只读 Agent"(如 pi 的 Yolo 类角色)可以整套装配。
+
+#### 14.4.2 外部二进制依赖:`rg` + `fd` + 缺失自动下载
+
+`grep` 工具第一步就是 `await ensureTool("rg")`(`packages/coding-agent/src/core/tools/grep.ts:177`),`find` 用 `ensureTool("fd")`(`find.ts:225`)。`packages/coding-agent/src/utils/tools-manager.ts:335-374` 的 `ensureTool` 链:
+
+1. `getToolPath`(`:85-104`):先查 pi 自己的 bin 目录(`~/.pi/agent/bin/rg`),再查系统 PATH(`fd` 还会尝试 Debian 的 `fdfind` 别名,`:34`);
+2. `PI_OFFLINE=1` → 跳过下载,返回 undefined(工具调用报 "ripgrep (rg) is not available and could not be downloaded",`grep.ts:178-180`);
+3. Android/Termux → 提示 `pkg install ripgrep`(Linux glibc 二进制在 Bionic 上跑不了,`:352-358`);
+4. 否则 GitHub API 取 latest release → 按 platform/arch 拼 asset 名(`TOOLS` 配置表,`:29-71`)→ 下载(`fetchWithRetry`,网络 10s / 下载 120s 超时)→ 解压(**唯一临时目录**,`extract_tmp_{name}_{pid}_{ts}_{rand}`,防 fd/rg 并发安装竞态,`:273-278`)→ `rename` 到 bin 目录 → Unix `chmod 0755`。
+
+解压器自带降级链:tar.gz 用 `tar xzf`;zip 在 Windows 先试 `System32\tar.exe`(bsdtar 支持 zip,**优先于 Git Bash 的 GNU tar**),失败再试 PowerShell `Expand-Archive`;Unix 先 `unzip` 后 `tar xf`(`:185-239`)。
+
+#### 14.4.3 grep:spawn ripgrep `--json`,结果后处理
+
+`grep.ts:220-226`:
+
+```ts
+const args: string[] = ["--json", "--line-number", "--color=never", "--hidden"];
+if (ignoreCase) args.push("--ignore-case");
+if (literal) args.push("--fixed-strings");
+if (glob) args.push("--glob", glob);
+args.push("--", pattern, searchPath);
+
+const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+const rl = createInterface({ input: child.stdout });
+```
+
+关键实现决策:
+
+| 点 | 实现 | 行号 |
+|---|---|---|
+| **流式消费 + 提前终止** | `rl.on("line")` 逐行解析 JSON event,`type === "match"` 计数达到 `limit`(默认 100)即 `child.kill()`(标记 `killedDueToLimit`,避免把 SIGKILL 当错误) | `:277-297`, `:240-245` |
+| **上下文行不靠 rg** | `context > 0` 时 pi **自己重读文件**拼块(`fileCache` 每文件缓存行数组),匹配行用 `:`、上下文行用 `-`(对齐 grep 惯例);`GrepOperations.readFile` 可被远程后端替换,所以必须流完再格式化 | `:205-218`, `:255-273`, `:321-336` |
+| **ignore 规则** | 完全交给 rg(`--hidden` 包含隐藏文件但 rg 仍尊重 `.gitignore`);promptSnippet 明写 "Search file contents for patterns (respects .gitignore)" | `:39`, `:220` |
+| **单行截断** | 命中行超 500 字符截断加 `... [truncated]`,提示 `Use read tool to see full lines` | `:266-268`, `truncate.ts:268-276` |
+| **字节上限** | `truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER })` —— 行数已被 match limit 封顶,只剩字节维度 | `:340` |
+| **可操作截断通知** | `[100 matches limit reached. Use limit=200 for more, or refine pattern. 50.0KB limit reached. Some lines truncated to 500 chars. Use read tool to see full lines]` | `:345-361` |
+| **abort** | `signal.addEventListener("abort")` → kill 子进程 + reject `"Operation aborted"`;`settle` 单次保护防双 resolve | `:167-173`, `:246-249` |
+| **退出码语义** | `code !== 0 && code !== 1` 才算错(rg 用 1 表示"无匹配",2+ 才是真错误);无匹配返回 `"No matches found"` 而非空 | `:309-319` |
+| **路径相对化** | 目录搜索时结果转相对路径并统一 `/` 分隔符 | `:195-203` |
+
+#### 14.4.4 find:spawn fd + 三个 gitignore/git 边界修复
+
+`find.ts:235-267`:
+
+```ts
+const args: string[] = ["--glob", "--color=never", "--hidden"];
+// fd normally ignores .gitignore outside git repos, so keep --no-require-git there.
+// Inside repos, use fd's default git-aware behavior so parent .gitignore rules stop
+// at nested repo boundaries: https://github.com/earendil-works/pi/issues/5960
+let insideGitRepo = false;
+for (let current = searchPath; ; ) {
+    if (await pathExists(path.join(current, ".git"))) { insideGitRepo = true; break; }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+}
+if (!insideGitRepo) args.push("--no-require-git");
+args.push("--max-results", String(effectiveLimit));
+
+// fd --glob matches against the basename unless --full-path is set
+let effectivePattern = pattern;
+if (pattern.includes("/")) {
+    args.push("--full-path");
+    if (!pattern.startsWith("/") && !pattern.startsWith("**/") && pattern !== "**") {
+        effectivePattern = `**/${pattern}`;
+    }
+    if (process.platform === "win32") effectivePattern = effectivePattern.replaceAll("/", String.raw`[/\\]`);
+}
+args.push("--", effectivePattern, searchPath);
+```
+
+三个从真实 issue 长出来的兼容逻辑:
+
+1. **`.gitignore` 边界**:非 git 仓库里 fd 默认不应用 gitignore,需 `--no-require-git`;仓库内则用 fd 默认行为,使父仓库的 ignore 规则在嵌套仓库处截断;
+2. **含 `/` 的 pattern 语义切换**:`--glob` 默认匹配 basename,`src/**/*.spec.ts` 这类带路径的 pattern 必须切 `--full-path`,并自动补 `**/` 前缀;
+3. **Windows 分隔符**:`--full-path` 模式下 fd 用原生分隔符,`/` 需展开成 `[/\]`。
+
+结果侧:每行剥 `\r` + trim、`relativizeFindResultPath` 相对化并保留尾部 `/`(目录标识,`find.ts:17-27`)、`limit`(默认 1000)达到即 `resultLimitReached`、同样的 `[1000 results limit reached. Use limit=2000 for more, or refine pattern]` 通知(`:334-346`)。自定义后端可整体替换 `FindOperations.glob`(`:169-222`,ignore 列表固定 `**/node_modules/**` + `**/.git/**`)。
+
+#### 14.4.5 ls:纯 readdir,无并行 stat
+
+`ls.ts` 不 spawn 任何进程:`ops.readdir` → 大小写不敏感 `localeCompare` 排序(`:154-155`)→ 逐条 `stat` 判目录加 `/` 后缀(`:166-176`)→ 500 条上限 → `truncateHead(maxLines: MAX_SAFE_INTEGER)` 只留字节维度(`:187`)。**stat 是顺序 await 的**,大目录(上万条目)会成为热点——pi 用 500 条上限把这个成本封顶了,超过即停,不再 stat 剩余项。
+
+#### 14.4.6 统一的"三层限额 + 可操作通知"模式
+
+四个检索工具共享同一结果组装模板,这是可直接模板化的设计:
+
+| 工具 | 条目上限 | 字节上限 | 单行截断 | 通知文案模板 |
+|---|---|---|---|---|
+| grep | 100 matches | 50KB | 500 字符 | `{n} matches limit reached. Use limit={2n} for more, or refine pattern` |
+| find | 1000 results | 50KB | — | `{n} results limit reached. Use limit={2n} for more, or refine pattern` |
+| ls | 500 entries | 50KB | — | `{n} entries limit reached. Use limit={2n} for more` |
+| read | 2000 行(或用户 limit) | 50KB | 首行超限→bash 提示 | `[Showing lines X-Y of Z. Use offset=N to continue.]`(`read.ts:308-317`) |
+
+共同点:**上限值写进工具 description 让模型预知**(`grep.ts:136`、`find.ts:131`、`ls.ts:108`、`bash.ts:350`);**超限通知必须给出下一步动作**(加倍 limit / 换 offset / 换 read / refine pattern),而不是干巴巴说 "truncated"。`read` 甚至在首行超 50KB 时给出精确的 bash 替代命令(`read.ts:298-301`):
+
+```ts
+outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
+```
+
+#### 14.4.7 没有的东西
+
+| 能力 | pi 状态 | 说明 |
+|---|---|---|
+| 符号定义跳转 / LSP | ✗ | 全仓库无 lsp/ctags 引用;符号级检索只能 grep 函数名 |
+| embedding / 向量索引 | ✗ | grep `embedding|vector` 仅命中图像模型名 |
+| 全文索引(FTS/lucene) | ✗ | 工作区文件无任何持久化索引;每次工具调用都是冷查询 |
+| 结果按相关性排序 | ✗ | rg/fd 自然序(路径序),无 score |
+| 跨工具缓存 | ✗(仅 grep 上下文行的 per-call `fileCache`, `grep.ts:205`) | 调用结束即丢弃 |
+
+即 pi 的立场:**检索 = 外部专业二进制 + 每次冷查询**,宁可慢也不维护索引状态——与"单写者、无后台任务"的整体哲学一致。
+
+#### 14.4.8 对 laew 的借鉴(维度四)
+
+laew 现状:无 grep/glob/ls 工具,模型检索全靠 BashTool 里 `grep`/`find` 命令(输出无截断、无 gitignore 感知、大仓库会爆上下文)。
+
+| 优先级 | 借鉴项 | pi 来源 | laew 落地(Rust) |
+|---|---|---|---|
+| **P0** | Grep 工具(shell out 到 `rg`) | `grep.ts:220-297` | **不必 spawn**:直接内嵌 `grep-searcher` + `ignore` crate(同一作者 BurntSushi 的 ripgrep 组件库),天然获得 gitignore + 并行 walker |
+| **P0** | Glob/Find 工具 | `find.ts:235-267` | `ignore` crate 的 `WalkBuilder` + `globset`;注意 pi 的"含 `/` 需 full-path 语义"经验 |
+| **P0** | 三层限额 + 可操作中文通知 | `grep.ts:345-361`, `read.ts:308-317` | 文案模板: `[已显示第 X-Y 行(共 Z 行)。使用 offset=N 继续]` / `[已达 100 条上限。可设 limit=200 或收窄 pattern]` |
+| **P0** | 上限值写进工具 description | `grep.ts:136`, `bash.ts:350` | laew 各工具 description 同步写明截断规则,减少模型试错 |
+| **P1** | Ls 工具 + 目录 `/` 后缀 + 大小写不敏感排序 | `ls.ts:154-176` | `std::fs::read_dir`;并行 stat 用 `rayon` 修复 pi 的顺序 stat 短板 |
+| **P1** | 只读工具集预设 | `index.ts:163-170` | laew 的 Yolo Agent(仅 Read)扩为 `read_only_registry()`: Read+Grep+Glob+Ls;Quality-Check Agent 同样适用 |
+| **P1** | Read 的 offset/limit + 续读提示 | `read.ts:277-321` | `ReadTool` 增加 offset/limit 参数与 `[还有 N 行。使用 offset=N 继续]` |
+| **P2** | 依赖二进制自动下载 | `tools-manager.ts:242-317` | laew 若坚持 spawn rg,可参照 GitHub Release 资产名拼接表 + 唯一临时目录防竞态 |
+| **P2** | 单行 500 字符截断 | `truncate.ts:13`, `grep.ts:266-268` | grep 命中行统一截断,提示用 Read 看全行 |
+| **P2** | 符号索引(可选) | (pi 无) | 若做,建议 tree-sitter tags 而非 LSP,避免 pi/laew 都没有的常驻进程负担 |
+
+---
+
+### 14.5 第七轮横向总结
+
+#### 14.5.1 四维度 × pi 设计模式提取
+
+| 模式 | 出现位置 | 一句话 |
+|---|---|---|
+| **纯计算与副作用分离** | `applyEditsToNormalizedContent` / `writeFile`;`computeEditsDiff` / 真编辑 | 匹配、diff、patch 全是纯函数,写盘是唯一副作用——测试与 TUI 预览免费获得 |
+| **归一化空间工作,原文空间回写** | `normalizeForFuzzyMatch` + `applyReplacementsPreservingUnchangedLines` | 容错匹配的代价被限制在"被触碰的行"内 |
+| **锁持有跨越 abort** | `edit.ts:337-343`, `write.ts:211-217` | 轮询 `signal.aborted` 而非监听 reject,锁永不提前释放 |
+| **content / details 双栏** | `agent/src/types.ts:360-366` | 模型上下文与人机界面共用一个工具结果对象但互不污染 |
+| **有界内存 + 惰性落盘** | `OutputAccumulator` | 滚动尾部窗口 + 超限才开临时文件,GB 输出恒定内存 |
+| **策略外置,机制内置** | 权限/Git/后台任务全部走扩展 hook | 核心只保证锁、截断、取消三个机制的正确性 |
+| **截断必须可操作** | 所有工具的通知文案 | 每条 truncation 通知都附下一步指令(limit 加倍 / offset 续读 / 换工具) |
+| **专业事交专业二进制** | rg / fd / tar / taskkill | 检索与压缩解压全部外包,缺失时自动补齐 |
+
+#### 14.5.2 与 laew 现状的差距矩阵(本轮四维度)
+
+| 能力 | pi | laew 现状 | 差距等级 |
+|---|---|---|---|
+| Edit 工具(多编辑+唯一性+模糊) | ✅ 完整 | ❌ 无 | **大** |
+| 文件写排他锁 | ✅ per-realpath | ❌(SQLite 隐式) | 大 |
+| 文件写原子性 | ⚠️ 无(裸 writeFile) | ❌ | 中(两边都缺) |
+| 编辑 undo / 备份 | ⚠️ 靠 git 扩展 | ❌ | 中 |
+| Git 分支探测 | ✅ 零子进程 | ❌ | 小 |
+| checkpoint / 回滚 | ⚠️ 扩展示例(git stash) | ❌ | 中 |
+| Bash 超时 | ✅ 参数化 | ❌ | 中 |
+| Bash 进程树杀 | ✅ | ❌ | **大**(孤儿进程风险) |
+| Bash 输出截断 + 临时文件 | ✅ 50KB/2000 行 | ❌ | **大**(上下文爆炸风险) |
+| Bash 流式输出 | ✅ 100ms 节流 | ❌ | 中 |
+| 危险命令拦截 | ⚠️ hook + 示例正则 | ❌ | 中 |
+| Grep/Glob/Ls 工具 | ✅ rg/fd | ❌(靠 bash) | **大** |
+| gitignore 感知 | ✅(rg/fd 自带) | ❌ | 中 |
+| 符号/向量索引 | ❌ | ❌ | 0(持平,均无) |
+
+#### 14.5.3 本轮 P0 清单汇总(laew 落地顺序建议)
+
+1. **`src/agent/tools/edit.rs`** —— edits[] 多编辑 + 四类错误文案 + prepare_args 兼容层(维度一 P0 ×3);
+2. **`src/agent/tools/truncate.rs`** —— 50KB/2000 行双向截断 + 中文可操作通知(三处工具复用);
+3. **BashTool 改造** —— timeout 参数 + 进程组整树杀 + 尾部截断 + 临时文件 + 非零退出码 isError;
+4. **`src/agent/tools/grep.rs` + `glob.rs`** —— 内嵌 `grep-searcher`/`ignore` crate,三层限额;
+5. **per-realpath 写锁** —— `HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>`,覆盖 Edit/Write;
+6. **Git 分支探测** —— TUI 横幅 + Yolo 分类前的仓库状态感知(直读 `.git/HEAD`);
+7. **危险命令黑名单** —— 36 条黑名单 + 50 条行首白名单(照抄 plan-mode 正则表),Plan Agent/QC Agent 强制启用。
+
+> 以上 7 项均为"无新依赖或仅新增 2 个 crate(`ignore`/`grep-searcher`)"即可完成的增量改造,与既有 `Tool` trait / `AgentProfile` / SQLite 持久化模型完全兼容。
 
 ---
 
