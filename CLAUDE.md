@@ -147,93 +147,58 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
-- `docs/Agent源码调研/` — **15 个外部项目源码**的系统调研与深度分析,**共 101 份文档/~138k 行**,含 3 层文档(源码调研 → 深度分析 → 核心机制深度分析) + 4 轮深挖(三档基础→二轮深挖→三轮边缘模块补齐→第四轮核心模块+新横向专题) + 27 个横向专题,覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/**流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议** 等 27+ 维度:
-  - **CLI / 通用 Agent**:
-    - `atomcode-*.md` — Rust, L0/L1/L2 分层 + cargo feature gating, ~150k 行
-    - `claudecode-*.md` — TypeScript/Bun, 四级压缩管线 + 27 种 Hook, ~218k 行
-    - `deepseek-harness-*.md` — TypeScript, Cordis Everything-is-a-Plugin, ~80+ 包
-    - `openclaw-*.md` — TypeScript, Gateway + Harness + 双向 MCP, ~201 万行
-    - `opencode-*.md` — TypeScript/Bun, Effect + Schema 全栈 DI, ~18k 行
-    - `pi-*.md` — TypeScript, lane 并发 + 一等公民 Skill, ~12 包
-    - `hermes-agent-*.md` — **Python, 859 MB, 6 前端共享 AIAgent 核心 + 30+ provider + Skill 一等公民 + CompressionCommitFence**
-  - **新增 7 个高价值 Agent 仓库(2026-09 第二轮深度调研)**:
-    - `agent-core-*.md` — **Python, openJiuwen Core SDK**, ReAct 循环 + ContextEngine + 多类型记忆(语义/情景/画像/变量/摘要) + PermissionEngine 三级防护 + TeamAgent 双 Spawn + Pregel 图执行 + Rails 铁轨 + OTLP Trajectory + RL 训练
-    - `TencentDB-Agent-Memory-*.md` — **TypeScript+Python, 团队记忆系统**, L0-L3 管线(Chat→Atom→Scenario→Persona) + MemoryPipelineManager + SkillCore 6写4读 + InjectionPipeline 8注入点 + MemoryProxy + 多租户隔离 + RRF 混合检索
-    - `jiuwenswarm-*.md` — **Python, 多 Agent 协作平台**, Leader-Teammate 模式 + A2A/ACP/E2A/A2UI 协议矩阵 + SkillDevPipeline 12 阶段 + SwarmFlow DAG + AgentWarmPool + Symphony 记忆 + JiuwenBox 沙箱
-    - `semantica-*.md` — **Python, 图原生 AI 基础设施**, Context Graph + 决策因果链 + Rete 网络 + Datalog 半朴素不动点 + SPARQL + W3C PROV-O 溯源 + BiTemporalFact 双时序模型 + 冲突检测 7 种策略
-    - `agent-studio-*.md` — **Python, 一站式 Agent 开发平台**, 多微服务架构 + Pregel 图算法 cba 分支消减 + DSL 双向转换 + 5 种 MCP 传输 + BubbleWrap 沙箱 + Seccomp BPF + 多 Trial 评估
-    - `Switchyard-*.md` — **Rust, NVIDIA LLM 网关**, 协议 IR (LlmRequest/LlmResponse) + ContentBlock::Unknown 无损保留 + TranslationEngine + 7 种路由算法(Noop/Passthrough/Random/LlmClassifier/StageRouter/Composite/AdvisorGate) + FallThrough 级联 + PyO3 绑定
-    - `cc-switch-*.md` — **Tauri 2 + Rust + React, AI 工具配置管理桌面应用**, 8 款工具适配(Claude/Codex/Gemini/OpenCode/Hermes 等) + 本地代理 + 熔断器(三态 Closed/Open/HalfOpen) + thinking_rectifier 整流 + MCP 多工具 SSOT + 17 schema 版本迁移 + WebDAV/S3 云同步
-  - **HTTP 客户端基础设施(2026-09 第二轮)**:
-    - `undici-*.md` — **JavaScript, Node.js 官方 HTTP 客户端(非 Agent,纯 HTTP 库)**, Dispatcher 体系 + HTTP/1.1 pipeline + HTTP/2 多路复用 + llhttp WASM 解析器 + 5 种 API 风格 + 8 个可组合拦截器 + Mock 录制回放 + fetch/WebSocket/EventSource/Cache Web 标准实现 + 26 种错误类层次 + FastTimer + TernarySearchTree + Snapshot 快照系统, ~38.7k 行
-  - `*-核心机制深度分析.md` — 第二轮深入钻取,15 个项目(含 undici):核心代码路径/函数名/代码片段/对 laew 借鉴
-  - **横向专题分析(15+9 个,第三轮新增 9 个全新维度专题)**:
-    - `专题-12Agent全面对比深度分析.md` — **13 项目 18 维度横向对比总表 + 4 大新维度专题 + 18 跨项目模式 + 12 反模式 + P0/P1/P2/P3 借鉴路线图**
-    - `专题-Context上下文管理深度分析.md` — Context 压缩管线横向对比(4级/3级/2级/可插拔/投影)
-    - `专题-MCP架构深度分析.md` — MCP 传输层/工具注册/资源/认证/双向支持横向对比
-    - `专题-Skill系统深度分析.md` — Skill 文件格式/注册/加载/触发/内置数量横向对比
-    - `专题-SubAgent与多Agent架构深度分析.md` — 多 Agent 编排模式/上下文传递/并发/通信横向对比
-    - `专题-任务拆解与分类深度分析.md` — 任务分类/拆解粒度/失败回流横向对比
-    - `专题-质检机制深度分析.md` — 质检形式/触发/检查项/自动修复/失败回流横向对比
-    - `专题-多轮对话与循环架构深度分析.md` — agentic loop 驱动/终止/续轮/流式耦合横向对比
-    - `专题-工具调用深度分析.md` — 工具定义/Schema/消息流/并发/权限拦截横向对比
-    - `专题-记忆系统与管理深度分析.md` — 记忆分层/持久化/检索注入/压缩横向对比(老版本,被新版本替换)
-    - `专题-记忆系统与上下文注入深度分析.md` — **新版整合,5 仓库深度对比,含 L0-L3 管线 + RRF + 9 注入点 + W3C PROV-O + P0-P5 路线图**
-    - `专题-Workflow设计深度分析.md` — workflow 定义/编排拓扑/执行引擎横向对比
-    - `专题-Yolo目标意图识别与目标规划深度分析.md` — 目标识别/意图/生命周期/规划生成横向对比
-    - `专题-Agent协作与调度深度分析.md` — 主/Sub 委派/并发调度/通信/失败回流横向对比(老版本,被新版本整合)
-    - `专题-多Agent协作与权限管控深度分析.md` — **新版整合,5 仓库深度对比,含 TeamAgent/Leader-Teammate/BubbleWrap/Seccomp/HITL/Fork 上下文/P0-P2 路线图**
-    - `专题-沙箱设计深度分析.md` — **进程/文件/网络/能力/资源隔离 + 失败回流 + laew 现状(零沙箱)+ 8 个跨项目模式 + P0/P1/P2 路线图**
-    - `专题-权限管控深度分析.md` — **三态策略/Bash 黑名单/路径白名单/敏感信息保护/用户确认/持久化/SubAgent 降级/Hook/审计/YOLO + laew 现状(零校验)+ 8 个跨项目模式 + P0/P1/P2 路线图**
-    - `专题-LLM网关与协议翻译深度分析.md` — **Switchyard/agent-studio/cc-switch 协议 IR + 翻译 + 路由算法 + LRU 缓存 + 熔断器 + Rust/Python 实现对比**
-    - `专题-横向对比深度分析合集.md` — 横向专题索引(15 专题),含横向对比表+设计模式+laew 综合建议
+- `docs/Agent源码调研/` — **15 个外部项目源码**的系统调研与深度分析,**共 45 份文档/~27k 行**（15 份综合文档 + 30 份横向专题）。原始 101 份多轮文档（~138k 行）已于 2026-09-06 合并为单一综合文档，删除跨轮次重复内容。覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议等 27+ 维度。
 
-  **第二轮深挖（8 份，2026-09-05 完成，本轮新增 ~8,200 行 Markdown）**:
-    - `专题-第二轮深挖合集.md` — **本轮 8 份深挖合集索引 + 三大共性模式 + 6 周 P0 路线图**
-    - `atomcode-第二轮深度分析.md` — **Rust 三层 workspace + cargo feature gating 物理边界 + kernel 内部 trait + AgentCommand/AgentEvent 双向消息协议 + MCP 7 子模块 + Skill + CodeIntel 七件套**
-    - `claudecode-第二轮深度分析.md` — **27 种 Hook 触发点 + 5 种执行器 + 4 级压缩管线 + 9 段固定摘要结构 + 6 阶段权限判定 + TodoWrite/Worktree**
-    - `openclaw-第二轮深度分析.md` — **Gateway / Harness / Adapter 三层契约 + Capability Cross Type + 双向 MCP + 11-capability harness + Lane 调度器 + Workshop 自演化**
-    - `opencode-第二轮深度分析.md` — **Effect 4 全栈 DI + LayerNode 拓扑 + 78 Service Tag + packages/llm 4 轴组合 + 15 种 LLMEvent + 34 包 workspace**
-    - `deepseek-harness-第二轮深度分析.md` — **Cordis 三原语 + Service + Fiber epoch 算法 + apps/cli 50 行入口 + 4 层 patch 叠加 + WriteBehind 200ms 批 + ScopedLayers**
-    - `pi-第二轮深度分析.md` — **Operation Lane 三态 + reduceLaneState 事件溯源 + 14 种损坏检测 + Skill 文本注入 + 20+ compat 开关 + 11 种 thinkingFormat + 树状 Session + JSONL 撕裂尾部修复**
-    - `hermes-agent-第二轮深度分析.md` — **6 前端共享 AIAgent + ProviderProfile 38 provider 声明式 + CompressionCommitFence 四重防护 + agentskills.io 标准 + FTS5 + Trigram**
-    - `cc-switch-核心机制深度分析.md` — **Tauri 2 桌面壳 + 本地 LLM 代理 + 熔断器三态 Closed/Open/HalfOpen + thinking_rectifier 7 模式 + 8 工具配置适配 + MCP 多工具 SSOT + 17 schema 迁移 + SQL authorizer 防御 + WebDAV/S3 云同步**
+  **15 份 Agent 综合文档**（每份合并了源码调研/深度分析/核心机制/第二轮/第三轮/第四轮共 3-8 轮内容，去重压缩 50-90%）：
+  | 文件 | 语言/技术 | 核心亮点 | 行数 |
+  |------|----------|---------|------|
+  | `atomcode.md` | Rust | L0/L1/L2 分层 + cargo feature gating + kernel 内部 trait + MCP 7 子模块 + CodeIntel 七件套 + daemon + tuix TUI | ~2,047 行 |
+  | `claudecode.md` | TypeScript/Bun | 四级压缩管线 + 27 种 Hook + 5 种执行器 + 40+ 工具 + Ink Fork + Bridge 远程控制 | ~1,006 行 |
+  | `deepseek-harness.md` | TypeScript | Cordis Everything-is-a-Plugin + Fiber epoch + 30+ 核心模块 + Typert 协议 + ACP/A2A/E2A/A2UI | ~1,116 行 |
+  | `openclaw.md` | TypeScript | Gateway/Harness/Adapter 三层契约 + 162 extensions + 双向 MCP + Lane 调度器 + Workshop 自演化 | ~888 行 |
+  | `opencode.md` | TypeScript/Bun | Effect + Schema 全栈 DI + LayerNode 拓扑 + 34 包 + enterprise Durable Object + R2 | ~936 行 |
+  | `pi.md` | TypeScript | lane 并发 + 一等公民 Skill + 二进制帧协议(CBOR) + WriterLease fence + 14 种损坏检测 | ~1,319 行 |
+  | `hermes-agent.md` | Python | 859 MB + 6 前端共享 AIAgent + 38 provider + CompressionCommitFence + FTS5 + Trigram | ~1,632 行 |
+  | `undici.md` | JavaScript | Node.js 官方 HTTP 客户端(非 Agent) + Dispatcher + HTTP/2 + llhttp WASM + 8 拦截器 + Mock 录制回放 | ~7,639 行 |
+  | `cc-switch.md` | Tauri 2+Rust+React | 8 款工具适配 + 熔断器三态 + thinking_rectifier + MCP SSOT + 17 schema 迁移 + WebDAV/S3 | ~1,293 行 |
+  | `agent-core.md` | Python | openJiuwen Core SDK + ReAct + ContextEngine + 多类型记忆 + PermissionEngine + Pregel + Rails + OTLP | ~1,630 行 |
+  | `agent-studio.md` | Python | 一站式 Agent 平台 + Pregel cba 消减 + DSL 双向转换 + 5 种 MCP 传输 + BubbleWrap + Seccomp | ~1,005 行 |
+  | `jiuwenswarm.md` | Python | 多 Agent 协作 + Leader-Teammate + A2A/ACP/E2A/A2UI + SkillDevPipeline 12 阶段 + SwarmFlow DAG + JiuwenBox | ~1,395 行 |
+  | `semantica.md` | Python | 图原生 AI 基础设施 + Context Graph + Rete + Datalog + SPARQL + W3C PROV-O + BiTemporalFact | ~1,716 行 |
+  | `Switchyard.md` | Rust | NVIDIA LLM 网关 + 协议 IR + ContentBlock::Unknown + TranslationEngine + 7 种路由算法 + PyO3 | ~1,807 行 |
+  | `TencentDB-Agent-Memory.md` | TypeScript+Python | 团队记忆系统 + L0-L3 管线 + SkillCore 6写4读 + InjectionPipeline 8注入点 + RRF 混合检索 | ~1,569 行 |
 
-  **第三轮深挖（15 份，2026-09-05 完成，本轮新增 ~15,361 行 Markdown，知识库从 62k→106k 行）**:
-    - `专题-第三轮深挖合集.md` — **本轮 15 份深挖合集索引 + 5 大共性模式 + P0/P1/P2 借鉴路线图**
-    - **9 个全新维度专题**（既有 15 专题未覆盖的新维度）:
-      - `专题-第三轮-流式输出与终端渲染管线深度分析.md` — **SSE chunk 解析 / partial JSON 容错 / cell-diff 引擎 / marked 增量 lex / 16ms 帧率节流 / Ctrl-C 中断传播**
-      - `专题-第三轮-错误处理重试与容错降级深度分析.md` — **atomcode 10+ 独立熔断计数器 / claudecode 持久模式 heartbeat / deepseek-harness durable 重试记录 / opencode retryable getter+Effect 组合子 / Switchyard eligible_routing_fallback**
-      - `专题-第三轮-可观测性遥测与决策审计深度分析.md` — **atomcode 5 级 opt-out + track/track_durable 双通道 / opencode GROUPING SETS 多维聚合 / pi telemetry schema 类型推导 / 三仓隐私 backstop 脱敏**
-      - `专题-第三轮-会话持久化与崩溃恢复深度分析.md` — **pi 双后端(JSONL+SQLite) + WriterLease fence / claudecode parentUuid 树 / atomcode Snapshot+JSONL+Lease / JSONL 撕裂尾部修复**
-      - `专题-第三轮-测试体系与Eval基建深度分析.md` — **pi vitest-evals + createJudge / atomcode eval.py 零依赖最小范本 / deepseek-harness 录制回放 + snapshot / openclaw 12+ pre-commit 质量门**
-      - `专题-第三轮-成本控制与Token统计深度分析.md` — **opencode 微美分整数计价+Redis批量写入 / claudecode 6 tier 写死价格表 / pi cache miss 浪费量化 / openclaw 分层定价+cacheWrite1h**
-      - `专题-第三轮-系统提示词工程真实对比深度分析.md` — **opencode 14 个模型家族变体 txt / atomcode 9 种失败行为建模 / claudecode DYNAMIC_BOUNDARY 缓存分界 / 6 仓 prompt 真实摘录**
-      - `专题-第三轮-配置系统与多环境管理深度分析.md` — **opencode 8 层发现链 / claudecode 5 源+安全隔离 / atomcode 5 级 ApplyPolicy / openclaw 运行时 secret 内存隔离 / laew DB-as-config 评估+混合方案**
-      - `专题-第三轮-插件生态与扩展分发深度分析.md` — **Cordis Fiber 六态+epoch / claudecode 策略 fail-closed+同形字防护 / pi ExtensionAPI 30+事件 / Rust 子进程 IPC 路径评估**
-    - **6 主仓第三轮边缘模块补齐**:
-      - `atomcode-第三轮边缘模块深度分析.md` — **webui rust-embed+Live Hub / extensions cargo feature gating / evals eval.py 28 case / docker 多阶段构建**
-      - `opencode-第三轮周边包深度分析.md` — **codemode 受限 JS 解释器 / desktop Sidecar 架构 / Slack SDK 内嵌 / sdk-next 零网络内嵌 / enterprise Durable Object+R2 / 34 包全覆盖矩阵**
-      - `deepseek-harness-第三轮-apps前端与native深度分析.md` — **apps/cli+web+storybook 多前端 / native landlock-run Landlock 安全启动器 / patches 清单**
-      - `openclaw-第三轮-custodian与deploy深度分析.md` — **custodian-skills 5 阶段运维 Playbook+SecretRef / Dockerfile 7 阶段多构建 / active-memory 双 Lane / memory-core Dreaming 三阶段 / 153 extensions 生态**
-      - `claudecode-第三轮-剩余模块深度分析.md` — **Ink Fork 13306 行+细胞级屏幕缓冲 / Speculation 投机执行(Copy-to-Overlay) / Bridge 远程控制 12613 行 / 命令系统六源并行+DCE / Forked Agent Cache 共享**
-      - `pi-第三轮-server与session后端深度分析.md` — **Server 二进制帧协议+5 阶段生命周期 / SQLite WriterLease fence / TypeBox 编译期双向约束 / Evals baseline/candidate 配对统计 / Telemetry 回调式 span API**
-
-  **第四轮深挖（11 份，2026-09-06 完成，本轮新增 ~13,244 行 Markdown，知识库从 114k→138k 行）**:
-    - **6 主仓第四轮核心模块深挖**:
-      - `openclaw-第四轮-Gateway架构与extensions生态深度分析.md` — **Gateway/Adapter/Harness 三层契约 + 162 extensions 分类全景（9 大类） + packages 核心模块群（agent-core/ai/llm-core/net-policy/memory-host-sdk/tool-call-repair/workboard） + ACP/A2A 协议**
-      - `deepseek-harness-第四轮-Cordis核心与模块群深度分析.md` — **Cordis 三原语 + Fiber epoch 算法 + Registry/Reflect/Events + 30+ 核心模块（workflow/subagent/plan/goal/sandbox/schedule/skill/shell/lsp/jobs/compaction/guard/interaction）**
-      - `claudecode-第四轮-Hooks权限与工具架构深度分析.md` — **27 种 Hook 触发点 + 5 种执行器 + permission 六阶段判定 + server/bridge/voice/native-ts + tools 工具架构（40+ 工具） + skills/plugins**
-      - `opencode-第四轮-EffectDI全栈与多端架构深度分析.md` — **Effect 全栈 DI（LayerNode 拓扑/两 Tag 体系/132 Node） + 34 包完整矩阵 + enterprise Durable Object + R2 + web/desktop/slack/sdk 多端**
-      - `atomcode-第四轮-daemon与coding核心深度分析.md` — **daemon 守护进程（14 步启动序列） + capabilities L1 分层权限 + auth OAuth + coding/codingplan 核心 + kernel 内部 trait + tuix TUI**
-      - `pi-第四轮-codingAgent与evals深度分析.md` — **coding-agent（AgentSession/8 大工具） + evals（createJudge/baseline-candidate 配对统计） + protocol 二进制帧 + telemetry schema-typed + session-backends**
-    - **3 份补充文档（跨 session 研究沉淀）**:
-      - `deepseek-harness-补充-中断传播背压与Typert协议深度分析.md` — **中断/Abort 传播（AbortSignal 通用货币 + 两级取消 + 阶段机） + 背压/缓冲（OutputCollector tail-keep+spill / BoundedTextBuffer / BlockAssembler） + Typert 协议（代码生成+运行时注册+ndJSON over stdio）**
-      - `deepseek-harness-补充-流式ACP与决策溯源深度分析.md` — **流式翻译（StreamChunk/translate/assembler/WriteBehind 200ms） + ACP 完整实现（session/codec/updates/content/mcp） + SessionEventMap 溯源 + OTLP telemetry**
-      - `pi-补充-流式二进制帧协议与决策溯源深度分析.md` — **二进制帧协议（CBOR + 4 字节 length-prefixed + FrameDecoder） + WriterLease fence（单调 fence/TTL/heartbeat） + schema-typed telemetry + 双后端 sessions（JSONL+SQLite）**
-    - **2 个新横向专题**:
-      - `专题-第四轮-Anthropic与OpenAI协议调用真实实现对比.md` — **7 仓库 × 8 维度协议调用真实实现对比（请求构造/认证头/SSE 解析/错误映射/Tool wire 格式/Thinking/Usage 统计/端点补全） + laew 基线差距分析**
-      - `专题-第四轮-流式协议翻译与Agent通信决策溯源深度分析.md` — **流式协议翻译（SSE↔内部事件） + Agent 间通信协议矩阵（A2A/ACP/E2A/A2UI） + 决策溯源/因果链（6 仓库横向对比）**
+  **30 份横向专题**（位于 `专题/` 子目录）：
+  - `专题-12Agent全面对比深度分析.md` — 13 项目 18 维度横向对比总表 + 4 大新维度专题 + P0-P3 路线图
+  - `专题-Context上下文管理深度分析.md` — Context 压缩管线横向对比(4级/3级/2级/可插拔/投影)
+  - `专题-MCP架构深度分析.md` — MCP 传输层/工具注册/资源/认证/双向支持横向对比
+  - `专题-Skill系统深度分析.md` — Skill 文件格式/注册/加载/触发/内置数量横向对比
+  - `专题-SubAgent与多Agent架构深度分析.md` — 多 Agent 编排模式/上下文传递/并发/通信横向对比
+  - `专题-任务拆解与分类深度分析.md` — 任务分类/拆解粒度/失败回流横向对比
+  - `专题-质检机制深度分析.md` — 质检形式/触发/检查项/自动修复/失败回流横向对比
+  - `专题-多轮对话与循环架构深度分析.md` — agentic loop 驱动/终止/续轮/流式耦合横向对比
+  - `专题-工具调用深度分析.md` — 工具定义/Schema/消息流/并发/权限拦截横向对比
+  - `专题-记忆系统与上下文注入深度分析.md` — 5 仓库深度对比,含 L0-L3 管线 + RRF + 9 注入点 + W3C PROV-O + P0-P5 路线图
+  - `专题-Workflow设计深度分析.md` — workflow 定义/编排拓扑/执行引擎横向对比
+  - `专题-Yolo目标意图识别与目标规划深度分析.md` — 目标识别/意图/生命周期/规划生成横向对比
+  - `专题-多Agent协作与权限管控深度分析.md` — 5 仓库深度对比,含 TeamAgent/Leader-Teammate/BubbleWrap/Seccomp/HITL/Fork 上下文/P0-P2 路线图
+  - `专题-沙箱设计深度分析.md` — 进程/文件/网络/能力/资源隔离 + laew 现状(零沙箱) + P0-P2 路线图
+  - `专题-权限管控深度分析.md` — 三态策略/Bash 黑名单/路径白名单 + laew 现状(零校验) + P0-P2 路线图
+  - `专题-LLM网关与协议翻译深度分析.md` — Switchyard/agent-studio/cc-switch 协议 IR + 翻译 + 路由算法 + 熔断器
+  - `专题-横向对比深度分析合集.md` — 横向专题索引(15 专题)
+  - `专题-第二轮深挖合集.md` — 8 份深挖合集索引 + 三大共性模式 + 6 周 P0 路线图
+  - `专题-第三轮深挖合集.md` — 15 份深挖合集索引 + 5 大共性模式 + P0-P2 路线图
+  - `专题-第三轮-流式输出与终端渲染管线深度分析.md` — SSE chunk/partial JSON/cell-diff/16ms 帧率节流
+  - `专题-第三轮-错误处理重试与容错降级深度分析.md` — 10+ 熔断计数器/durable 重试/eligible_routing_fallback
+  - `专题-第三轮-可观测性遥测与决策审计深度分析.md` — 5 级 opt-out/GROUPING SETS/隐私脱敏
+  - `专题-第三轮-会话持久化与崩溃恢复深度分析.md` — 双后端/WriterLease/parentUuid 树/JSONL 撕裂修复
+  - `专题-第三轮-测试体系与Eval基建深度分析.md` — vitest-evals/eval.py/录制回放
+  - `专题-第三轮-成本控制与Token统计深度分析.md` — 微美分计价/6 tier 价格表/cache miss 量化
+  - `专题-第三轮-系统提示词工程真实对比深度分析.md` — 14 个模型家族变体/9 种失败行为建模
+  - `专题-第三轮-配置系统与多环境管理深度分析.md` — 8 层发现链/5 源+安全隔离/5 级 ApplyPolicy
+  - `专题-第三轮-插件生态与扩展分发深度分析.md` — Cordis Fiber 六态/fail-closed/ExtensionAPI 30+事件
+  - `专题-第四轮-Anthropic与OpenAI协议调用真实实现对比.md` — 7 仓库 × 8 维度协议调用真实实现对比
+  - `专题-第四轮-流式协议翻译与Agent通信决策溯源深度分析.md` — SSE↔内部事件 + A2A/ACP/E2A/A2UI + 决策溯源
 
 - `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 10 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
 
