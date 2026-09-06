@@ -147,7 +147,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
-- `docs/Agent源码调研/` — **15 个外部项目源码**的系统调研与深度分析,**共 89 份文档/114k 行**,含 3 层文档(源码调研 → 深度分析 → 核心机制深度分析) + 3 轮深挖(三档基础→二轮深挖→三轮边缘模块补齐) + 25 个横向专题,覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/**流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端** 等 25+ 维度:
+- `docs/Agent源码调研/` — **15 个外部项目源码**的系统调研与深度分析,**共 101 份文档/~138k 行**,含 3 层文档(源码调研 → 深度分析 → 核心机制深度分析) + 4 轮深挖(三档基础→二轮深挖→三轮边缘模块补齐→第四轮核心模块+新横向专题) + 27 个横向专题,覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/**流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议** 等 27+ 维度:
   - **CLI / 通用 Agent**:
     - `atomcode-*.md` — Rust, L0/L1/L2 分层 + cargo feature gating, ~150k 行
     - `claudecode-*.md` — TypeScript/Bun, 四级压缩管线 + 27 种 Hook, ~218k 行
@@ -218,6 +218,22 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
       - `openclaw-第三轮-custodian与deploy深度分析.md` — **custodian-skills 5 阶段运维 Playbook+SecretRef / Dockerfile 7 阶段多构建 / active-memory 双 Lane / memory-core Dreaming 三阶段 / 153 extensions 生态**
       - `claudecode-第三轮-剩余模块深度分析.md` — **Ink Fork 13306 行+细胞级屏幕缓冲 / Speculation 投机执行(Copy-to-Overlay) / Bridge 远程控制 12613 行 / 命令系统六源并行+DCE / Forked Agent Cache 共享**
       - `pi-第三轮-server与session后端深度分析.md` — **Server 二进制帧协议+5 阶段生命周期 / SQLite WriterLease fence / TypeBox 编译期双向约束 / Evals baseline/candidate 配对统计 / Telemetry 回调式 span API**
+
+  **第四轮深挖（11 份，2026-09-06 完成，本轮新增 ~13,244 行 Markdown，知识库从 114k→138k 行）**:
+    - **6 主仓第四轮核心模块深挖**:
+      - `openclaw-第四轮-Gateway架构与extensions生态深度分析.md` — **Gateway/Adapter/Harness 三层契约 + 162 extensions 分类全景（9 大类） + packages 核心模块群（agent-core/ai/llm-core/net-policy/memory-host-sdk/tool-call-repair/workboard） + ACP/A2A 协议**
+      - `deepseek-harness-第四轮-Cordis核心与模块群深度分析.md` — **Cordis 三原语 + Fiber epoch 算法 + Registry/Reflect/Events + 30+ 核心模块（workflow/subagent/plan/goal/sandbox/schedule/skill/shell/lsp/jobs/compaction/guard/interaction）**
+      - `claudecode-第四轮-Hooks权限与工具架构深度分析.md` — **27 种 Hook 触发点 + 5 种执行器 + permission 六阶段判定 + server/bridge/voice/native-ts + tools 工具架构（40+ 工具） + skills/plugins**
+      - `opencode-第四轮-EffectDI全栈与多端架构深度分析.md` — **Effect 全栈 DI（LayerNode 拓扑/两 Tag 体系/132 Node） + 34 包完整矩阵 + enterprise Durable Object + R2 + web/desktop/slack/sdk 多端**
+      - `atomcode-第四轮-daemon与coding核心深度分析.md` — **daemon 守护进程（14 步启动序列） + capabilities L1 分层权限 + auth OAuth + coding/codingplan 核心 + kernel 内部 trait + tuix TUI**
+      - `pi-第四轮-codingAgent与evals深度分析.md` — **coding-agent（AgentSession/8 大工具） + evals（createJudge/baseline-candidate 配对统计） + protocol 二进制帧 + telemetry schema-typed + session-backends**
+    - **3 份补充文档（跨 session 研究沉淀）**:
+      - `deepseek-harness-补充-中断传播背压与Typert协议深度分析.md` — **中断/Abort 传播（AbortSignal 通用货币 + 两级取消 + 阶段机） + 背压/缓冲（OutputCollector tail-keep+spill / BoundedTextBuffer / BlockAssembler） + Typert 协议（代码生成+运行时注册+ndJSON over stdio）**
+      - `deepseek-harness-补充-流式ACP与决策溯源深度分析.md` — **流式翻译（StreamChunk/translate/assembler/WriteBehind 200ms） + ACP 完整实现（session/codec/updates/content/mcp） + SessionEventMap 溯源 + OTLP telemetry**
+      - `pi-补充-流式二进制帧协议与决策溯源深度分析.md` — **二进制帧协议（CBOR + 4 字节 length-prefixed + FrameDecoder） + WriterLease fence（单调 fence/TTL/heartbeat） + schema-typed telemetry + 双后端 sessions（JSONL+SQLite）**
+    - **2 个新横向专题**:
+      - `专题-第四轮-Anthropic与OpenAI协议调用真实实现对比.md` — **7 仓库 × 8 维度协议调用真实实现对比（请求构造/认证头/SSE 解析/错误映射/Tool wire 格式/Thinking/Usage 统计/端点补全） + laew 基线差距分析**
+      - `专题-第四轮-流式协议翻译与Agent通信决策溯源深度分析.md` — **流式协议翻译（SSE↔内部事件） + Agent 间通信协议矩阵（A2A/ACP/E2A/A2UI） + 决策溯源/因果链（6 仓库横向对比）**
 
 - `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 10 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
 
