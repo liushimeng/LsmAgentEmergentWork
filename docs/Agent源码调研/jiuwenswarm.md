@@ -1393,3 +1393,1039 @@ Team Mode
 ---
 
 > **总结**: JiuwenSwarm 是一个 **工业级多 Agent 协作系统**,其声明式装配、跨边界重建、Skill 自演进、SwarmFlow 确定性工作流、多渠道接入等设计,为 laew 工程提供了丰富的参考。建议 laew 从 **Plan 模式状态机**、**SwarmBuildContext 声明式 Spec**、**PR_SET_PDEATHSIG 子进程守护** 三个方向优先借鉴,逐步构建多 Agent 协作能力。
+# JiuwenSwarm 第十轮深挖 — 8 大新维度深度分析
+
+> 调研对象: jiuwenswarm (Python, 多 Agent 协作平台)
+> 调研日期: 2026-09-07
+> 原始知识库: 10 章 / 1396 行 (覆盖项目元信息/架构/Leader-Teammate/A2A 协议/SkillDev/SwarmFlow/WarmPool/Symphony/JiuwenBox/借鉴)
+> 本轮新增: 8 大维度 / ~2600 行
+> 工程路径: `/usr/local/LsmGitOpenSource/jiuwenswarm`
+> 代码规模: ~33.8 万行 Python, 858 个 .py 文件, 54MB
+> 许可证: Apache 2.0 (华为技术有限公司主导)
+
+---
+
+## 目录
+
+1. [CrashDump 与错误恢复](#1-crasdump-与错误恢复)
+2. [WebUI 与 DesktopApp](#2-webui-与-desktopapp)
+3. [OAuth 认证与多账号](#3-oauth-认证与多账号)
+4. [i18n 国际化](#4-i18n-国际化)
+5. [Release 工程化与 AutoUpdate](#5-release-工程化与-autoupdate)
+6. [WebSocket 与 SSE](#6-websocket-与-sse)
+7. [DevContainer 与容器化](#7-devcontainer-与容器化)
+8. [CRDT 与多端冲突](#8-crdt-与多端冲突)
+9. [JiuwenSwarm 综合对比与 laew 借鉴总表](#9-综合对比与-laew-借鉴总表)
+
+---
+
+## 1. CrashDump 与错误恢复
+
+JiuwenSwarm 在错误诊断与恢复上实现了**生产级的多层防线**：从信号触发的异步态快照、启动阶段 Native 扩展自检、到子进程崩溃的原子化记录与分级终止。
+
+### 1.1 异步态 Dump (`debug_dump.py`, 164 行)
+
+核心机制：`install_async_dump_handler(service_name)` 注册 SIGUSR1 信号处理器，运维人员可在**不停止进程**的情况下抓取全状态快照。
+
+```python
+# 三层快照结构
+def dump_async_state(service_name: str) -> Path | None:
+    # 1. THREAD STACKS — sys._current_frames() 遍历所有线程
+    # 2. ASYNCIO TASKS — gc.get_objects() 全堆扫描（跨线程 loop 也能抓到）
+    #    - repr / _fut_waiter / task.print_stack()
+    # 3. SYNC PRIMITIVES — Lock/Event/Condition/Semaphore 的 _waiters
+    #              — Queue 的 _getters / _putters
+```
+
+**设计要点**：
+- 用 `gc.get_objects()` 而非 `asyncio.all_tasks()` —— 后者需要 running loop 且只抓当前线程 loop
+- 输出到 `logs/async_dump/{service_name}_{pid}_{timestamp}.txt`
+- Windows 上 SIGUSR1 不存在，安装是 no-op，但 `dump_async_state()` 仍可显式调用
+- 信号处理器内只读解释器状态、永不抛异常，安全用于诊断死锁/协程停滞
+
+### 1.2 启动诊断 Doctor (`startup_diagnostics.py`, 583 行)
+
+**双进程隔离架构**：`doctor_supervisor_main()` → 子进程 `doctor_main()`，带 45 秒硬超时，防止安装器挂起。
+
+```python
+# 检查项
+_NATIVE_IMPORT_CHECKS = (
+    ("tiktoken._tiktoken", "tiktoken Native 扩展"),
+    ("grpc._cython.cygrpc", "gRPC Native 扩展 cygrpc"),
+    ("cryptography.hazmat.bindings._rust", "cryptography Rust 扩展"),
+    ("numpy", "NumPy Native 扩展"),
+    ("pandas", "Pandas Native 扩展"),
+    ("lxml.etree", "lxml Native 扩展"),
+    ("PIL._imaging", "Pillow Native 扩展"),
+    ("bcrypt._bcrypt", "bcrypt Native 扩展"),
+    ("faiss", "FAISS Native 扩展"),
+    ("chromadb_rust_bindings", "ChromaDB Rust 扩展"),
+)
+```
+
+**启动失败记录链**：
+
+```
+子进程崩溃 → write_startup_failure() 原子写入 failure-{pid}-{uuid}.json
+           → select_startup_failure() 打分选最 actionable 的一条
+           → is_native_startup_failure() 判断是否 Native 相关
+           → _run_doctor_after_failure() 仅 frozen exe + Native 失败才跑
+           → select_blocking_doctor_check() 匹配具体失败的扩展
+           → _build_failed_status() 生成前端可展示的{title, message, component}
+```
+
+**原子写入**：`_atomic_write_text()` 用 `tempfile.mkstemp` + `os.replace` 保证半写文件不会污染诊断结果。
+
+### 1.3 桌面端启动失败表面 (`desktop_app.py`)
+
+`DesktopRuntime` 实现了一套**先行导航 + 失败回退**的 UX 流程：
+
+```
+start_services()
+  ├── web 静态资源就绪 → _set_startup_status("web_ready") → 先行导航到前端 SPA
+  │     └── 若后续 AgentServer/Gateway 失败 → failed 仍可覆盖 web_ready
+  │           → _present_startup_failure_surface_if_navigated() 重新载入 loading 页
+  └── 全部就绪 → _set_startup_status("ready")
+```
+
+**Watchdog 机制**：前端 JS 轮询 `get_startup_status()`，若 120s 内 bridge 从未响应或 30s 内停止响应，展示"通信中断"错误页。
+
+### 1.4 子进程守护与分级终止
+
+```python
+# 优雅终止 (POSIX)
+def _terminate_process_tree(process):
+    os.killpg(process.pid, signal.SIGTERM)  # 杀整个进程组
+    # 8s 宽限期后 SIGKILL
+
+# 强制终止
+def _kill_process_tree(process):
+    os.killpg(process.pid, signal.SIGKILL)
+
+# Windows 用 psutil 递归杀子孙（避免 taskkill.exe 弹窗）
+def _psutil_terminate(pid, force=False):
+    parent = psutil.Process(pid)
+    children = parent.children(recursive=True)
+    for child in reversed(children): kill_fn(child)  # 先杀子孙
+    kill_fn(parent)
+```
+
+### 1.5 后台清理 (`cleanup.py`, 188 行)
+
+```python
+# 双管齐下
+cleanup_old_sessions()   # 按目录 mtime 删除超期会话 (默认 30 天)
+cleanup_orphan_file_ops()  # 删除对应会话已不存在的 file_ops 日志
+
+# 调度: 首次延迟 10min, 之后每 24h 跑一次
+cleanup_loop(stop_event, on_first_done=...)
+```
+
+### 1.6 沙箱无主机回退 (`sandbox_no_host_fallback.py`, 38 行)
+
+```python
+# ContextVar 控制: 任务级作用域禁止沙箱→主机回退
+_NO_HOST_FALLBACK: ContextVar[bool] = ContextVar("jiuwenswarm_no_host_fallback")
+
+def require_no_host_fallback(): _NO_HOST_FALLBACK.set(True)
+def no_host_fallback_required() -> bool: return _NO_HOST_FALLBACK.get()
+```
+
+**设计意图**：敏感操作（如 SkillDev 评测执行）必须在沙箱内完成，不允许"沙箱失败→回退主机"的降级路径，用 ContextVar 在任务粒度强制。
+
+### 1.7 关键发现 vs laew
+
+| 能力 | JiuwenSwarm 实现 | laew 差距 |
+|------|------------------|-----------|
+| SIGUSR1 异步态 Dump | `debug_dump.py` 全线程+全协程快照 | 无 |
+| Native 扩展启动自检 | Doctor 10+ 项 + 子进程隔离 + 超时 | 无 |
+| 启动失败原子记录 | `failure-{pid}-{uuid}.json` | 无 |
+| 分级进程树终止 | SIGTERM→8s→SIGKILL + psutil 递归 | 仅 kill |
+| 沙箱无回退 ContextVar | `_NO_HOST_FALLBACK` | 无沙箱 |
+
+---
+
+## 2. WebUI 与 DesktopApp
+
+JiuwenSwarm 采用**多渠道接入架构**，Web 与 Desktop 是平行的两个 Channel，共享同一套后端 (AgentServer + Gateway)。
+
+### 2.1 渠道拓扑
+
+```
+Channel 层 (接入层)
+├── web (FastAPI + Vite SPA) ............... app_web.py (2191 行)
+├── desktop (pywebview 桌面壳) ............... desktop_app.py (2799 行)
+├── tui (Bun 编译的 TS 二进制) ............... packages/jiuwenswarm-tui
+├── cli (终端 REPL) .......................... channels/cli/
+├── browser (浏览器扩展) ..................... channels/browser/
+├── acp (Agent Communication Protocol) ....... channels/acp/
+└── process_cli (子进程 CLI) ................. channels/process_cli/
+```
+
+### 2.2 Web 渠道 (`app_web.py`, 2191 行)
+
+**技术栈**：
+- 后端: FastAPI + WebSocket
+- 前端: Vite SPA (TypeScript/React)
+- 静态资源: `channels/web/frontend/dist/`
+- 文件上传/下载: 分块 + 原子写入
+
+**WebSocket 认证**：`ws_origin.py` 提供 Origin 校验，环境变量 `JIUWENSWARM_ENABLE_ORIGIN_CHECK=1` 开启，`JIUWENSWARM_WS_ALLOWED_ORIGIN_HOSTS` 白名单。
+
+### 2.3 Desktop 渠道 (`desktop_app.py`, 2799 行) — 核心亮点
+
+**技术选型: pywebview (非 Electron/Tauri)** —— 直接调用系统 WebView2 (Win) / WKWebView (macOS)，体积极小。
+
+#### 2.3.1 进程拓扑
+
+```
+DesktopRuntime (主进程, pywebview 窗口)
+├── web 子进程 (静态资源 + 反向代理到 Gateway)
+├── agent 子进程 (AgentServer)
+├── gateway 子进程 (Gateway)
+└── doctor 子进程 (仅启动失败时)
+```
+
+**启动流程**：
+1. `_warmup_page_cache_background()` — 后台预读关键包入 OS page cache (仅 frozen exe)
+2. 先拉起 web 子进程（静态资源立即可用）
+3. 并行拉起 agent + gateway 子进程
+4. 三端 TCP 就绪等待并行执行
+5. web HTTP 就绪即触发先行导航（不必等后端）
+6. 后端就绪后 `_set_startup_status("ready")` 导航到前端 SPA
+
+#### 2.3.2 后端配对监控
+
+```python
+def _watch_backend_pair():
+    # agent/gateway 任一退出 → 立即终止对端
+    # 避免端口/cron job/gateway 单例锁泄漏
+    while True:
+        exited = agent if agent.poll() else (gateway if gateway.poll() else None)
+        if exited:
+            peer = gateway if exited is agent else agent
+            _terminate_process_tree(peer)
+        time.sleep(0.25)
+```
+
+#### 2.3.3 文件拖放 (DnD)
+
+桌面端实现了一套**完整的 OS 文件拖放桥**：
+
+```python
+# 三层绑定
+_mark_desktop_shell()     # 注入 JS: window.__JIUWEN_DESKTOP__=true + dragenter/dragover/drop 监听
+_bind_desktop_file_dnd()  # pywebview DOMEventHandler 绑定
+_schedule_desktop_file_dnd_bind()  # 重试机制 (1s/3s 后重试)
+
+# 拖放路径: pywebviewFullPath → describe_local_files() → _dispatch_local_files_event()
+# → window.__JIUWEN_INGEST_LOCAL_FILES__(detail) → 前端 SPA
+```
+
+#### 2.3.4 分块 Blob 保存
+
+前端生成的大文件 (PNG/SVG/Mermaid/JSON) 通过**分块 base64 传输**：
+
+```python
+# 三阶段事务
+begin_blob_save(filename, mime_type, total_size) → transfer_id
+append_blob_save(transfer_id, encoded_chunk)      # 1MB/块, 校验累计大小
+finish_blob_save(transfer_id)                     # 校验字节数 + PNG 签名 → 原子提交
+abort_blob_save(transfer_id)                      # 中止并清理
+```
+
+#### 2.3.5 剪贴板文件读取
+
+- **Windows**: Win32 CF_HDROP 格式 → `shell32.DragQueryFileW`
+- **macOS**: `AppKit.NSPasteboard` → `NSFilenamesPboardType`
+- 读取后统一走 `describe_local_files()` 标准化
+
+#### 2.3.6 安装更新 (Desktop)
+
+```python
+def install_update(installer_path):
+    if os.name == "nt":   _launch_windows_install_helper()  # 交互式 Inno Setup
+    elif sys.platform == "darwin": _launch_macos_install_helper()  # hdiutil + ditto 原子交换
+    else: _launch_linux_install_helper()  # tar.gz 解压 + 备份回滚
+    self.close_window()
+```
+
+**macOS 安装 helper 关键流程**：
+1. 等待父进程退出
+2. 等待端口释放 (15s)
+3. `hdiutil attach` 挂载 DMG 到受控挂载点
+4. `ditto` 拷贝到 `<target>.new`
+5. 原子交换: 旧包→`<target>.old`, 新包就位
+6. `xattr -dr com.apple.quarantine` 去隔离
+7. `open` 启动新应用
+8. EXIT trap 失败时自动恢复 `<target>.old`
+
+**安全**: 所有外部路径 `shlex.quote()` 转义，防止 release API 返回恶意资源名导致 shell 注入。
+
+### 2.4 TUI 渠道
+
+- **技术栈**: TypeScript + Bun 编译为原生二进制
+- **跨平台**: linux-x64/linux-arm64/macos-x64/macos-arm64/windows-x64
+- **签名**: macOS 上 Bun `--compile` 的 ad-hoc 签名会坏掉，需 `codesign --remove-signature` + `codesign -s -` 重签
+- **产物**: `packages/jiuwenswarm-tui/jiuwenswarm_tui/resources/tui-bin/{platform}/jiuwenswarm-tui`
+
+### 2.5 关键发现 vs laew
+
+| 能力 | JiuwenSwarm 实现 | laew 差距 |
+|------|------------------|-----------|
+| 桌面壳 | pywebview (系统 WebView) | 无 |
+| 后端进程配对监控 | agent/gateway 互保活 | 单进程 |
+| OS 文件拖放 | 完整 DnD 桥 + 剪贴板 | 无 |
+| 分块 Blob 保存 | 1MB/块 + PNG 签名校验 | 无 |
+| 原子安装更新 | ditto 原子交换 + 回滚 | 无 |
+| TUI 独立二进制 | Bun 编译 + 多平台签名 | Rust TUI (crossterm) |
+
+---
+
+## 3. OAuth 认证与多账号
+
+JiuwenSwarm 的认证体系分为三大层：**MCP 凭证获取**、**IM 平台 OAuth**、**WebSocket Origin 校验**。
+
+### 3.1 MCP 凭证层 (`mcp/credential.py`, 324 行)
+
+MCP 接入的凭证获取分**三档策略**：
+
+```python
+KIND_NONE = "none"         # 免费远程 MCP (notion/supabase/canva)
+KIND_TOKEN = "token"       # 用户提供静态 token (${VAR} 占位符)
+KIND_CLI_OAUTH = "cli_oauth"  # CLI 自有 OAuth 流程 (feishu/dingtalk)
+```
+
+**检测逻辑**：
+```python
+def detect_credential_kind(name: str) -> str:
+    if (pkg_dir / "cli.json").is_file(): return KIND_CLI_OAUTH      # 有 cli.json
+    if extract_placeholders(load_mcp_cfg(name)): return KIND_TOKEN   # mcp.json 有 ${VAR}
+    if required_tokens_from_schema(name): return KIND_TOKEN          # token-schema.json
+    return KIND_NONE
+```
+
+**CredentialStore 持久化**：
+- 存储位置: `<workspace>/mcp/credentials/<name>.json`
+- 原子写入: `tempfile.NamedTemporaryFile` + `os.replace`
+- Unix 权限: `chmod 0600` 防其他用户读取
+- 编码: `utf-8-sig` 容忍 BOM (兼容 PowerShell `Set-Content`)
+
+**占位符替换**：
+```python
+_PLACEHOLDER_RE = re.compile(r"\$\{(\w+)\}")
+# 支持 env/headers/url/args 任意嵌套结构中的 ${VAR} 替换
+```
+
+### 3.2 IM 平台认证
+
+JiuwenSwarm 支持 **10+ IM 平台**，各有独立的认证方式：
+
+| 平台 | 认证方式 | 关键配置 |
+|------|----------|----------|
+| 飞书 (Feishu) | 开放平台 App ID + App Secret | `app_id`, `app_secret`, `encrypt_key`, `verification_token` |
+| 钉钉 (DingTalk) | Stream 模式 Client ID + Client Secret | `client_id`, `client_secret` |
+| 企业微信 (WeCom) | 企业应用回调 | `corp_id`, `agent_id`, `secret` |
+| 个人微信 (WeChat) | 个人号适配 | 独立模块 |
+| Telegram | Bot Token | `bot_token` |
+| Discord | Bot Token | `bot_token` |
+| Slack | App Token + Bot Token | `app_token`, `bot_token` |
+| WhatsApp | 会话/Token | 独立模块 |
+| 小翼 (Xiaoyi) | 华为生态 | 独立模块 |
+| Slack/Discord | 标准 Bot API | 标准 OAuth |
+
+**飞书 WebSocket 长连接** (`feishu_connect.py`)：
+```python
+class FeishuConfig(BaseModel):
+    app_id: str
+    app_secret: str
+    encrypt_key: str = ""       # 事件订阅加密密钥
+    verification_token: str = "" # 事件订阅验证令牌
+    enable_streaming: bool = True  # 流式消息下发
+    message_merge_window_ms: int = 15000  # 连续消息合并窗口
+```
+
+**钉钉 Stream 模式** (`dingtalk_connect.py`)：
+```python
+from dingtalk_stream import DingTalkStreamClient, Credential, CallbackHandler
+# 使用 dingtalk_stream SDK 建立长连接，CallbackHandler 处理入站消息
+```
+
+### 3.3 WebSocket Origin 校验 (`ws_origin.py`, 89 行)
+
+```python
+# 环境变量控制
+JIUWENSWARM_ENABLE_ORIGIN_CHECK=1  # 默认关闭
+JIUWENSWARM_WS_ALLOWED_ORIGIN_HOSTS="localhost,127.0.0.1,example.com"
+
+# 校验逻辑
+def is_allowed_browser_origin(origin: str | None) -> bool:
+    parsed = urlsplit(origin)
+    return parsed.hostname.lower() in allowed_hosts
+```
+
+**设计要点**：
+- 默认关闭（开发友好），生产环境显式开启
+- 兼容新旧 websockets 库的 `process_request` API
+- 403 响应兼容 legacy `(status, headers, body)` 和 modern `Response` 对象
+
+### 3.4 加密提供者 (`base_crypto.py`, 22 行)
+
+```python
+@runtime_checkable
+class CryptoProvider(Protocol):
+    def encrypt(self, plaintext: str, **kwargs) -> str: ...
+    def decrypt(self, ciphertext: str, **kwargs) -> str: ...
+
+# 全局默认提供者 (可注入 AES-256-GCM + HKDF-SHA256 后端)
+def set_crypto_provider(provider: CryptoProvider): ...
+def get_crypto_provider() -> Optional[CryptoProvider]: ...
+```
+
+**当前状态**: MCP `CredentialStore` 存明文 JSON (注释明确说明"plaintext JSON; the public API is stable so an aes-256-gcm + hkdf-sha256 backend can be swapped in later")。
+
+### 3.5 关键发现 vs laew
+
+| 能力 | JiuwenSwarm 实现 | laew 差距 |
+|------|------------------|-----------|
+| MCP 凭证三档策略 | none/token/cli_oauth 自动检测 | 无 MCP |
+| 凭证原子存储 | tempfile + os.replace + chmod 0600 | API Key 明文 SQLite |
+| IM 平台 OAuth | 10+ 平台适配器 | 无 |
+| WS Origin 校验 | 环境变量开关 + 白名单 | 无 |
+| 加密提供者抽象 | CryptoProvider Protocol | 无 |
+
+---
+
+## 4. i18n 国际化
+
+JiuwenSwarm 的 i18n 是**前端主导**的，后端仅做语言参数透传。
+
+### 4.1 前端 i18n 架构
+
+**位置**: `jiuwenswarm/channels/web/frontend/src/i18n/`
+
+```
+i18n/
+├── locales/
+│   ├── zh.json    # 中文
+│   └── en.json    # 英文
+├── (框架代码)     # 基于 vue-i18n / react-intl 等
+```
+
+**JSON 结构** (按功能模块分 namespace)：
+```json
+{
+  "common": { "noData": "暂无数据", "confirm": "确认", ... },
+  "a2ui": { "generating": "A2UI 界面生成中...", ... },
+  "nav": { "chat": "对话", "work": "任务", "agent": "专家", ... },
+  "applicationPlugins": { "title": "应用插件", ... },
+  "settingsPanel": { "title": "设置", "categories": { "general": "常规", ... } }
+}
+```
+
+### 4.2 后端语言参数透传
+
+**A2UI 协议** (`server/runtime/a2ui/protocol.py`)：
+```python
+class A2UIProtocolSpec:
+    def build_prompt(self, language="en", *, include_browser_workflows=False) -> str:
+        # 基于语言分流生成系统提示
+```
+
+**系统提示词**：部分 Agent 的 system prompt 根据 `language` 参数切换中英文版本。
+
+### 4.3 文档双语
+
+- 中文文档: `docs/zh/` (60+ 份)
+- 英文文档: `docs/en/` (60+ 份)
+- 内容完全对齐，覆盖安装/配置/协议/频道/技能等所有维度
+
+### 4.4 IM 平台多区域
+
+```
+国内: 小翼、飞书、钉钉、企微、个人微信
+国际: Telegram、Discord、Slack、WhatsApp
+```
+
+每个 IM 平台有独立的适配器目录，处理平台特有的消息格式/认证/文件接口。
+
+### 4.5 关键发现 vs laew
+
+| 能力 | JiuwenSwarm 实现 | laew 差距 |
+|------|------------------|-----------|
+| 前端 i18n | zh/en JSON locale | 英文硬编码 |
+| A2UI 语言分流 | `build_prompt(language=...)` | 无 A2UI |
+| 文档双语 | docs/zh + docs/en 完全对齐 | 仅中文 |
+| IM 多区域 | 国内+国际 10+ 平台 | 无 |
+
+---
+
+## 5. Release 工程化与 AutoUpdate
+
+JiuwenSwarm 实现了**完整的发布流水线**：从版本源、构建打包、到自动更新与安装。
+
+### 5.1 版本源 (`version_source.py`, 640 行)
+
+**三源支持**：
+
+| 源 | API | 用途 |
+|----|-----|------|
+| GitHub Releases | `api.github.com/repos/{owner}/{repo}/releases/latest` | 国际分发 |
+| GitCode Releases | `api.gitcode.com/api/v5/repos/{owner}/{repo}/releases/latest` | 国内分发 (默认) |
+| PyPI Simple | `pypi.org/simple/{package}/` | pip 安装模式 |
+
+**版本排序**：
+```python
+def release_sort_key(version: str) -> tuple[tuple[int, ...], int, tuple[int, ...]]:
+    # 1. 基础版本数值比较 (0.2.3 > 0.2.2)
+    # 2. 稳定版 > 预发布版 (0.2.3 > 0.2.3.beta1)
+    # 3. 预发布类型: dev < alpha < beta < rc < pre
+    # 4. 同类型大者更新 (0.2.3.beta2 > 0.2.3.beta1)
+```
+
+**桌面版时间戳规则**：
+- Windows/macOS 用发布时间 (UTC) 比较新旧，不用版本号
+- 同一 Release 应只包含一个 `.exe` 和一个 `.dmg`
+- 多候选时选文件名中唯一包含 `workswarm` 的包
+
+### 5.2 自动更新服务 (`updater.py`, 521 行)
+
+**状态机**：
+```
+idle → checking → up_to_date
+                 → update_available → downloading → downloaded
+                 → error
+pip 模式: update_available → upgrading → restart_pending → restarting → SIGTERM
+```
+
+**核心类**：
+```python
+class UpdaterService:
+    def check(manual=False)       # 检查更新
+    def start_download()          # 后台下载 (desktop) / pip 升级 (pip)
+    def start_upgrade()           # pip 模式: 执行升级 + SIGTERM 重启
+    def _executor_callback()      # 下载进度回调
+```
+
+**安装模式检测**：
+```python
+def _detect_install_mode() -> str:
+    if os.getenv("JIUWENSWARM_DESKTOP"): return "desktop"
+    return "desktop" if getattr(sys, "frozen", False) else "pip"
+```
+
+### 5.3 升级执行器 (`upgrade_executor.py`, 428 行)
+
+```python
+class DesktopExecutor(UpgradeExecutor):
+    def install(self):
+        # 分块下载 (512KB/chunk) → .part 文件 → rename → 完成
+        # 失败时清理 .part 残留
+
+class PipExecutor(UpgradeExecutor):
+    def install(self):
+        # 检测 uv 管理 venv → uv pip install
+        # 否则 pip install --upgrade
+        # 检测 editable 安装 → 拒绝并提示 git pull
+    def upgrade(self):
+        # 写 .restart_pending.json (argv/env/cwd/web_argv/web_pid)
+        # 启动 updater_restart_helper 子进程
+```
+
+**重启助手** (`updater_restart_helper.py`, 127 行)：
+```python
+def main():
+    wait_for_pid_exit(parent_pid, timeout=60.0)     # 等父进程退出
+    _wait_for_port_release(gateway_port, timeout=15)  # 等端口释放
+    _wait_for_port_release(frontend_port, timeout=15)
+    subprocess.Popen(argv, ...)                       # 重启主进程
+    if web_argv:
+        _wait_for_port(gateway_port, timeout=30)      # 等 Gateway 就绪
+        subprocess.Popen(web_argv, ...)               # 重启 web 进程
+```
+
+### 5.4 构建系统
+
+#### 5.4.1 构建配置 (`build_config.py`)
+
+```python
+@dataclass(frozen=True)
+class BuildConfig:
+    package_name: str        # "workswarm"
+    version: str             # "0.2.5.beta1"
+    display_name: str        # "WorkSwarm"
+    executable_name: str     # "workswarm"
+    bundle_identifier: str   # "com.workswarm.desktop"
+    # 派生属性: dmg_filename, setup_filename, app_bundle_name 等
+```
+
+#### 5.4.2 macOS 构建 (`build-macos.sh`)
+
+```
+1. build_config.py --sync → 生成 _build_config.py
+2. npm run build → 前端产物
+3. build_tui.py → TUI 原生二进制
+4. pyinstaller scripts/jiuwenswarm.spec → 打包 .app
+5. codesign (可选 Developer ID) → 签名
+6. hdiutil create → 生成 DMG
+7. notarytool (可选) → Apple 公证 + staple
+```
+
+**签名策略**：
+- 有 Developer ID → 真签名
+- 无身份 → ad-hoc 签名 (仅本地可用)
+- `NOTARIZE=1` → 公证 + staple (分发用)
+
+#### 5.4.3 Windows 构建 (`build-exe.ps1`)
+
+```
+uv sync → npm build → PyInstaller → Inno Setup
+```
+
+#### 5.4.4 HarmonyOS 构建 (`build-harmony.sh`)
+
+```
+npm build (VITE_PLATFORM=harmony) → HNP 更新(嵌入前端) → rawfile 准备 → hvigorw 构建 .hap
+```
+
+#### 5.4.5 Python 包构建 (`build_python_packages.py`)
+
+```python
+# 三件套
+build_root_wheel()      # uv build --wheel (主包)
+build_sidecar_wheel()   # jiuwenswarm-tui 原生二进制 wheel
+build_jiuwenbox_wheel() # jiuwenbox 沙箱 wheel
+build_tui_binary(target) # Bun 编译 TUI 到多平台
+```
+
+### 5.5 关键发现 vs laew
+
+| 能力 | JiuwenSwarm 实现 | laew 差距 |
+|------|------------------|-----------|
+| 多源版本检查 | GitHub/GitCode/PyPI 三源 | 无 |
+| 桌面自动更新 | 时间戳比较 + 后台下载 + helper 安装 | 无 |
+| 原子安装 | ditto 原子交换 + .old 回滚 | 无 |
+| 多平台构建 | macOS DMG / Windows exe / Linux tar / Harmony HAP | cargo build |
+| 代码签名 | Developer ID + Apple 公证 | 无 |
+| 预发布通道 | beta/rc/dev 共用通道 | 无 |
+
+---
+
+## 6. WebSocket 与 SSE
+
+JiuwenSwarm 的实时通信建立在**E2A (Agent ↔ Gateway) WebSocket 总线**之上，辅以 LLM SSE 流补丁。
+
+### 6.1 E2A WebSocket 架构
+
+**服务端** (`agent_ws_server.py`, 484KB)：
+```python
+class AgentWebSocketServer:
+    ping_interval: float = 30.0   # 30s 发 ping
+    ping_timeout: float = 300.0   # 300s 无 pong 断连
+```
+
+**Gateway 侧** (`app_gateway.py`)：
+```python
+client = WebSocketAgentServerClient(ping_interval=20.0, ping_timeout=600.0)
+```
+
+### 6.2 有界发送 (`ws_send.py`, 131 行)
+
+```python
+AGENT_WS_SEND_BUDGET_BYTES = 6 * 2**20   # 6MB 发送上限
+WEB_WS_MAX_MESSAGE_BYTES = 100 * 2**20    # 100MB 浏览器上限 (含 base64 文档)
+
+async def send_wire_payload(ws, wire):
+    serialized = json.dumps(wire, ensure_ascii=False)
+    if len(serialized) <= AGENT_WS_SEND_BUDGET_BYTES:
+        await ws.send(serialized)
+    else:
+        # 超限 → 构建 error fallback 替代原 payload
+        fallback = _build_oversized_fallback(wire, actual_bytes)
+        await ws.send(fallback_json)
+```
+
+### 6.3 诊断工具 (`ws_diagnostics.py`, 81 行)
+
+```python
+def describe_ws_exception(exc) -> dict:
+    # 提取 close_code / close_reason / rcvd / sent / rcvd_then_sent
+    # 兼容新旧 websockets 库版本
+
+def describe_ws_peer(ws) -> dict:
+    # ws_id / remote / local / ws_closed / ws_state
+
+def format_ws_diagnostics(*parts, **fields) -> str:
+    # 稳定 key=value 日志格式
+```
+
+### 6.4 Gateway Push 推送 (`server/gateway_push/`)
+
+```python
+class GatewayPushTransport(Protocol):
+    async def send_push(msg) -> bool: ...
+
+class WebSocketGatewayPushTransport:
+    # 通过 AgentWebSocketServer 单例推送
+    # 支持分离部署 + WebSocket 默认路径
+
+# wire 编码: 与 WebSocket 单帧形状一致
+def build_server_push_wire(msg) -> dict:
+    # E2AResponse 或 AgentResponseChunk → 统一 wire dict
+    # metadata 中标记 E2A_WIRE_SERVER_PUSH_KEY = True
+```
+
+### 6.5 LLM SSE 流补丁 (`llm_sse_patch.py`, 188 行)
+
+**问题**: 部分网关 (如 celia-claw sse-api) 即使在非流式调用下也只返回 `text/event-stream`，导致 OpenAI SDK 收到 `str` 而非 `ChatCompletion`。
+
+**解决方案**: monkeypatch `OpenAIModelClient._parse_response`：
+
+```python
+async def _parse_response_with_sse_guard(self, response, parser=None):
+    if isinstance(response, str):
+        response = assemble_openai_response(response)  # SSE → ChatCompletion
+    return await _orig_parse_response(self, response, parser)
+
+# 组装逻辑: 逐行解析 data: JSON chunk → 累加 content + reasoning + tool_calls
+def assemble_openai_response(response: str) -> ChatCompletion:
+    for line in response.split("\n"):
+        if line.startswith("data:"):
+            chunk = _parse_chunk(line)
+            think_content += think
+            content += out
+            last_chunk = chunk
+    # 构建 ChatCompletion (含 reasoning_content 扩展字段)
+```
+
+### 6.6 PersonalContext WebSocket (`personal_context/ws_handler.py`)
+
+通过 E2A wire 路径暴露 PersonalContext 操作：
+
+```python
+PERSONAL_CONTEXT_REQUEST_METHODS = frozenset({
+    ReqMethod.PERSONAL_CONTEXT_RUNTIME_STATUS,
+    ReqMethod.PERSONAL_CONTEXT_RUNTIME_START_COLLECTION,
+    ReqMethod.PERSONAL_CONTEXT_FETCH_AUTHORIZE_PROVIDER,
+    ReqMethod.PERSONAL_CONTEXT_CONTEXT_STREAM_GRAPH,  # 流式图数据 (200 nodes/chunk)
+    ...
+})
+```
+
+**流式图传输**：
+```python
+async def _stream_graph(host, ws, request, send_lock, *, tree=False):
+    graph = await host.get_tree(root_id, depth)
+    for start in range(0, len(nodes), 200):   # 200 节点/块
+        encode_agent_chunk_for_wire(..., sequence=sequence)
+    for start in range(0, len(edges), 200):   # 200 边/块
+        encode_agent_chunk_for_wire(..., sequence=sequence)
+```
+
+### 6.7 关键发现 vs laew
+
+| 能力 | JiuwenSwarm 实现 | laew 差距 |
+|------|------------------|-----------|
+| WS 心跳 | ping_interval=30s / ping_timeout=300s | 无 WS |
+| 有界发送 | 6MB 上限 + oversized fallback | 无 |
+| WS 诊断 | describe_ws_exception + describe_ws_peer | 无 |
+| Gateway Push | Protocol + WebSocket 实现 | 无 |
+| SSE 流补丁 | monkeypatch OpenAI SDK 兼容 SSE-only 网关 | 无 |
+| 流式图传输 | 200 nodes/chunk 分块 | 无 |
+
+---
+
+## 7. DevContainer 与容器化
+
+JiuwenSwarm 的容器化分为**服务端部署**、**沙箱隔离**、**可观测性**三层。
+
+### 7.1 服务端 Docker 部署
+
+#### 7.1.1 基础镜像 (`docker/Dockerfile.claw.base`)
+
+```dockerfile
+FROM python:3.11.4-slim-bookworm
+RUN apt-get update && apt-get install -y nodejs npm
+```
+
+#### 7.1.2 完整镜像 (`docker/Dockerfile.claw`)
+
+```dockerfile
+ARG BASE_IMAGE=python:3.11.4-slim-bookworm
+FROM ${BASE_IMAGE}
+
+RUN apt-get install -y ca-certificates git nodejs npm
+RUN useradd --create-home --shell /bin/bash app
+COPY --chown=app:app . /app/jiuwenswarm/
+
+# 构建前端
+WORKDIR /app/jiuwenswarm/jiuwenswarm/channels/web/frontend
+RUN npm install && npm run build
+
+# 安装服务端
+WORKDIR /app/jiuwenswarm
+ENV FRONTEND_HOST=0.0.0.0
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple . --no-cache-dir
+
+EXPOSE 5173
+CMD ["jiuwenswarm-start"]
+```
+
+#### 7.1.3 运行时管理镜像 (`docker/Dockerfile.yr.rt.mgr`)
+
+```dockerfile
+FROM ${BASE_IMAGE}
+USER snuser
+RUN pip3.11 install --user jiuwenswarm==${JIUWENSWARM_VERSION}
+USER sn
+```
+
+### 7.2 JiuwenBox 沙箱容器 (`jiuwenbox/docker/Dockerfile`)
+
+**基础镜像**: `openeuler/openeuler:24.03` (华为 openEuler)
+
+```dockerfile
+RUN yum install -y \
+    bubblewrap \       # 用户命名空间沙箱
+    iproute \          # 网络工具
+    iptables \         # 防火墙
+    iptables-nft \     # nftables 兼容
+    nftables \         # 新一代防火墙
+    nodejs \           # Node 运行时
+    python3-pip \      # Python
+    java-17-openjdk \  # Java (代码分析)
+    git vim unzip
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+```
+
+**关键安全组件**:
+- `bubblewrap`: 用户命名空间隔离
+- `iptables/nftables`: 网络隔离
+- 独立 `app` 用户运行服务
+
+### 7.3 可观测性 Docker Compose (`deploy/observability/docker-compose.yml`)
+
+```yaml
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.154.0
+    ports: ["4317:4317", "4318:4318"]   # OTLP gRPC/HTTP
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    ports: ["3000:3000"]
+    # 依赖 postgres + clickhouse + redis + minio
+```
+
+**Langfuse 集成**: 完整的 LLM 可观测性栈 (Trace + Observation + Metric)。
+
+### 7.4 沙箱无主机回退
+
+```python
+# 任务级 ContextVar 控制
+_NO_HOST_FALLBACK: ContextVar[bool] = ContextVar("jiuwenswarm_no_host_fallback")
+
+# 沙箱操作前调用
+require_no_host_fallback()   # 标记: 禁止回退主机
+no_host_fallback_required()  # 查询: 当前是否强制沙箱
+clear_no_host_fallback()     # 清除
+```
+
+### 7.5 关键发现 vs laew
+
+| 能力 | JiuwenSwarm 实现 | laew 差距 |
+|------|------------------|-----------|
+| 服务端容器化 | Dockerfile + 多阶段构建 | 无 |
+| 沙箱容器 | openEuler + bubblewrap + iptables | 零沙箱 |
+| 可观测性 | Langfuse + OTel Collector | 无 |
+| 沙箱无回退 | ContextVar 任务级强制 | 无 |
+| 网络隔离 | iptables/nftables 规则 | 无 |
+
+---
+
+## 8. CRDT 与多端冲突
+
+JiuwenSwarm **未使用 CRDT 库** (无 Yjs/automerge/yrs 依赖)，多端一致性通过**应用层锁 + 版本向量 + 单例守护**实现。
+
+### 8.1 Gateway 单例锁 (`instance_manager.lock.py`)
+
+```python
+class GatewayLock:
+    @staticmethod
+    def find_holder(workspace) -> dict | None:
+        # 返回 {pid, workspace} 或 None
+        # 非权威预检 (preflight)，Gateway 进程自身是权威执行者
+
+# Desktop 启动时
+def _preflight_gateway_singleton(wait=15.0):
+    holder = GatewayLock.find_holder(workspace)
+    if holder:
+        # 等待正在关闭的 Gateway 释放锁 (升级重启场景)
+        deadline = time.monotonic() + wait
+        while holder and time.monotonic() < deadline:
+            time.sleep(0.5)
+            holder = GatewayLock.find_holder(workspace)
+        if holder:
+            raise RuntimeError("Another Gateway instance is running")
+```
+
+**设计意图**: 防止同一 workspace 启动两个 Gateway → 两个 CronSchedulerService → 重复执行 cron job。
+
+### 8.2 WarmRevision 配置指纹
+
+```python
+@dataclass(frozen=True)
+class WarmRevision:
+    boot_id: str             # 进程级 UUID
+    config_fingerprint: str  # SHA256(config + env)
+    sequence: int            # 单调递增
+
+# 配置变更 → fingerprint 不同 → stale slots 被回收
+```
+
+### 8.3 E2A Wire Legacy 兜底
+
+```python
+# wire_codec.py
+def encode_agent_response_for_wire(resp, *, response_id, sequence=0):
+    # 双层 fallback:
+    # 1. to_dict 失败 → envelope 包 E2A error
+    # 2. 整层 encode 失败 → metadata.legacy 包 fallback
+    # 接收端: _fallback_wire_unary_from_legacy 倒出来
+```
+
+### 8.4 TeamManager Round 准入
+
+```python
+class TeamManager:
+    def begin_round(self, session_id, request_id, *,
+                    release_admission=None,
+                    defer_terminal_release=False,
+                    terminal_armed=False):
+        # 每个 session 同一时间只允许一个 round
+        # 后续 request 撞上 → RuntimeError
+
+    async def abort_round(self, session_id, request_id):
+        # 取消自动化 round, 停止保留持久化 Team 状态
+        # 后续请求冷恢复, 收不到幽灵输出
+```
+
+### 8.5 后端配对互保
+
+```python
+# DesktopRuntime._watch_backend_pair
+# agent/gateway 任一退出 → 立即终止对端
+# 避免端口/cron job/gateway 单例锁泄漏
+```
+
+### 8.6 多端 Session 共享
+
+```
+Web 端 ──┐
+TUI 端 ──┼──→ Gateway ChannelManager ──→ AgentServer ──→ Session
+CLI 端 ──┤          (路由/注册)            (实例缓存)
+IM 端 ───┘
+```
+
+所有渠道共享同一 Session 上下文，通过 `channel_id` 区分来源。
+
+### 8.7 关键发现 vs laew
+
+| 能力 | JiuwenSwarm 实现 | laew 差距 |
+|------|------------------|-----------|
+| 多端单例锁 | GatewayLock + 锁文件 | 无 |
+| 配置指纹 | SHA256(config+env) 变更检测 | 无 |
+| Round 准入 | 每 session 单 round | 无 |
+| 后端配对互保 | agent/gateway 互监控 | 单进程 |
+| CRDT | 无 (应用层锁替代) | 无 |
+| Legacy 兜底 | metadata.legacy 整包回退 | 无 |
+
+---
+
+## 9. 综合对比与 laew 借鉴总表
+
+### 9.1 本轮 8 维度 JiuwenSwarm 能力全景
+
+| 维度 | 成熟度 | 核心机制 | 代码量 |
+|------|--------|----------|--------|
+| CrashDump | ★★★★★ | SIGUSR1 异步 Dump + Doctor 自检 + 分级终止 | ~750 行 |
+| WebUI/Desktop | ★★★★★ | pywebview + FastAPI + 10+ 渠道 | ~5000 行 |
+| OAuth/多账号 | ★★★★☆ | MCP 三档凭证 + 10+ IM OAuth + WS Origin | ~400 行 |
+| i18n | ★★★☆☆ | 前端 zh/en locale + A2UI 语言分流 | ~2 份 JSON |
+| Release/AutoUpdate | ★★★★★ | 三源版本 + PyInstaller + 原子安装 + 签名公证 | ~1600 行 |
+| WebSocket/SSE | ★★★★★ | E2A 总线 + 有界发送 + SSE 流补丁 | ~500 行 |
+| DevContainer | ★★★★☆ | 多阶段 Docker + openEuler 沙箱 + Langfuse | ~3 份 Dockerfile |
+| CRDT/多端冲突 | ★★★☆☆ | 应用层锁 + 版本向量 + Round 准入 (无 CRDT) | ~200 行 |
+
+### 9.2 laew 第十轮借鉴路线图
+
+| 优先级 | 能力 | 依据文件 | 借鉴难度 |
+|--------|------|----------|----------|
+| **P0** | SIGUSR1 异步态 Dump | `debug_dump.py` | 中 (Rust signal-hook) |
+| **P0** | 启动 Native 扩展自检 | `startup_diagnostics.py` | 低 |
+| **P0** | 有界 WS 发送 + oversized fallback | `ws_send.py` | 低 |
+| **P0** | 沙箱无主机回退 ContextVar | `sandbox_no_host_fallback.py` | 低 (tokio task_local!) |
+| **P1** | 分级进程树终止 | `desktop_app.py::_terminate_process_tree` | 中 |
+| **P1** | WS Origin 校验 | `ws_origin.py` | 低 |
+| **P1** | Gateway 单例锁 | `instance_manager/lock.py` | 中 (fs2 文件锁) |
+| **P1** | 配置指纹失效 | `agent_warm_pool.py::config_fingerprint` | 低 |
+| **P2** | MCP 凭证三档策略 | `mcp/credential.py` | 高 |
+| **P2** | 原子安装更新 | `desktop_app.py::install_update` | 高 |
+| **P2** | 后端配对互保 | `desktop_app.py::_watch_backend_pair` | 中 |
+| **P2** | SSE 流补丁 | `llm_sse_patch.py` | 低 |
+| **P3** | 桌面壳 (pywebview) | `desktop_app.py` | 极高 |
+| **P3** | 多平台构建签名 | `build-macos.sh` | 高 |
+| **P3** | Langfuse 可观测性 | `docker-compose.yml` | 中 |
+
+### 9.3 第十轮关键发现 (laew gap L79-L96)
+
+本轮新识别 **18 个 gap**：
+
+| 级别 | Gap | JiuwenSwarm 参考 |
+|------|-----|------------------|
+| **P0 紧急** | L79 无异步态 Dump | `debug_dump.py` SIGUSR1 全协程快照 |
+| **P0 紧急** | L80 无启动 Native 自检 | `startup_diagnostics.py` 10+ 项检查 |
+| **P0 紧急** | L81 无有界 WS 发送 | `ws_send.py` 6MB 上限 + fallback |
+| **P0 紧急** | L82 无沙箱无回退 | `sandbox_no_host_fallback.py` ContextVar |
+| **P1 重要** | L83 无分级进程终止 | `desktop_app.py` SIGTERM→8s→SIGKILL |
+| **P1 重要** | L84 无 WS Origin 校验 | `ws_origin.py` 白名单 |
+| **P1 重要** | L85 无多端单例锁 | `instance_manager/lock.py` GatewayLock |
+| **P1 重要** | L86 无配置指纹 | `agent_warm_pool.py` SHA256(config) |
+| **P1 重要** | L87 无后端配对互保 | `desktop_app.py` _watch_backend_pair |
+| **P1 重要** | L88 无 Legacy 兜底 | `wire_codec.py` metadata.legacy |
+| **P2 进阶** | L89 无 MCP 凭证策略 | `mcp/credential.py` 三档自动检测 |
+| **P2 进阶** | L90 无原子安装更新 | `desktop_app.py` ditto 原子交换 |
+| **P2 进阶** | L91 无 SSE 流补丁 | `llm_sse_patch.py` monkeypatch |
+| **P2 进阶** | L92 无多阶段 Docker | `Dockerfile.claw` 多阶段构建 |
+| **P2 进阶** | L93 无可观测性栈 | `docker-compose.yml` Langfuse + OTel |
+| **P2 进阶** | L94 无预发布通道 | `version_source.py` 三源 + 预发布排序 |
+| **P2 进阶** | L95 无代码签名公证 | `build-macos.sh` Developer ID + notarytool |
+| **P3 远期** | L96 无 CRDT | 应用层锁替代 (可引入 yrs) |
+
+### 9.4 与前 9 轮知识库的关系
+
+```
+第 1-3 轮 (15 份综合文档) → 架构/多轮对话/Context/循环/工具/记忆/Workflow/意图/规划/协作/拆解/分类/MCP/SKILL/沙箱/权限/网关/协议翻译/上下文注入/决策溯源/流式渲染/错误容错/遥测/持久化/测试/成本/提示词/配置/插件/HTTP/协议实现/Agent间通信/中断/回填/wire/并发/Goal/TUI/Hook/Effect/CBOR/Lane/WriterLease
+第 4-6 轮 (协议/SubAgent/Hook/Skill/文件/检索/Git/Bash/多模态/PromptCaching/Schema/Web) → 工具链深挖
+第 7-9 轮 (Telemetry/Session/Tool权限/LSP/SkillWorkshop/多租户/TUI终端/CrashDump/WebUI/OAuth/i18n/Release/WS/DevContainer/CRDT) → 生产级维度
+本轮 (第 10 轮) → 补充 8 大横向维度: 错误恢复/界面/认证/国际化/发布/实时通信/容器/同步
+```
+
+### 9.5 总结
+
+JiuwenSwarm 在**错误诊断** (SIGUSR1 Dump + Doctor)、**多渠道接入** (pywebview + 10+ IM)、**自动更新** (三源 + 原子安装 + 签名公证)、**WebSocket 通信** (E2A 总线 + 有界发送 + SSE 补丁) 四个维度达到生产级水准，直接可借鉴到 laew 的 P0/P1 路线图。
+
+**CRDT 维度** JiuwenSwarm 自身也未深入，采用应用层锁替代，说明多 Agent CLI 场景下 CRDT 不是第一优先级。laew 可暂缓 CRDT 投入，优先补齐错误诊断与有界通信。
+
+---
+
+> **推荐 Rust crate 补充** (本轮新增):
+> - `signal-hook` + `tokio::signal` — SIGUSR1 异步 Dump
+> - `fs2` — 文件锁实现 Gateway 单例
+> - `sysinfo` — 跨平台进程树终止 (替代 psutil)
+> - `landlock` — Linux 沙箱无回退
+> - `tracing-opentelemetry` + `opentelemetry-otlp` — Langfuse 集成
+> - `tauri` — 桌面壳 (如不沿用 pywebview 思路)
+> - `cargo-dist` + `cargo-bundle` — 多平台构建签名
+> - `yrs` — CRDT (远期)

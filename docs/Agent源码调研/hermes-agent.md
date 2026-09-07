@@ -1630,3 +1630,541 @@ laew 应**选择性借鉴**：**P0-1 Callback 矩阵 + P0-2 Interrupt 双方法 
 **报告完成日期**：2026-09-06
 **总行数**：~1850 行（去重后）
 **覆盖维度**：项目元信息 / 6 前端共享 / Provider 抽象 / CompressionCommitFence / Skill / 记忆系统 / 多轮对话 / 流式渲染 / 错误容错 / 配置系统 / 遥测 / 借鉴要点 12 条
+# Hermes Agent 第十轮深挖 — 8 大新维度
+
+> 调研对象: hermes-agent (Python, 859 MB, 6 前端共享 AIAgent 核心 + 38 provider)
+> 调研日期: 2026-09-07
+> 前 9 轮覆盖: 项目元信息 / 6 前端架构 / ProviderProfile / CompressionCommitFence / Skill / 记忆 FTS5 / 多轮对话 / 流式渲染 / 错误处理 / 配置 / 遥测
+> 本轮 8 个全新维度: **CrashDump 与错误恢复 / WebUI 与 DesktopApp / OAuth 认证与多账号 / i18n 国际化 / Release 工程化与 AutoUpdate / WebSocket 与 SSE / DevContainer 与容器化 / CRDT 与多端冲突**
+
+---
+
+## 1. CrashDump 与错误恢复
+
+### 1.1 启动存活看门狗 (`hermes_startup_watchdog.py`, 519 行)
+
+守护进程线程,在进程入口武装、事件循环确认存活后 disarm,防止启动期死锁(OOF-298)。
+
+```python
+# hermes_startup_watchdog.py:44-79 — 关键常量
+DEFAULT_STARTUP_WATCHDOG_TIMEOUT_S = 300.0   # 默认 5 分钟
+_MIN_TIMEOUT_S = 30.0
+_CPU_PROGRESS_MIN_S = 1.0                    # 窗口内 CPU 增量阈值
+_MAX_CPU_EXTENSIONS = 3                      # CPU 回退最多 3 次
+_MAX_LEASE_S = 900.0                         # 单次 phase lease 上限 15 min
+_FIRE_EXIT_BOUND_S = 10.0                    # 取证路径硬上限
+SERVICE_RESTART_EXIT_CODE = 75               # 供 s6/systemd 重启
+```
+
+**三级进度信号**(按权威顺序):
+1. **Phase lease** (`report_startup_progress`) — 启动路径自身持有,可证明 I/O 密集阶段(如 state.db 损坏修复)仍活着
+2. **Process-wide CPU** — 回退信号,最多 `_MAX_CPU_EXTENSIONS` 次
+3. **Fire** — `faulthandler.dump_traceback(all_threads=True)` + JSON dump record + `os._exit(75)`
+
+**取证 dump 格式** (`_write_dump_record`):
+```json
+{"ts":"2026-09-07T...", "tag":"startup_watchdog.fired", "pid":1234,
+ "timeout_s":300, "elapsed_s":301.2, "extensions":0,
+ "lease_count":0, "last_lease_phase":null, "exit_code":75}
+```
+落盘到 `<HERMES_HOME>/logs/gateway-startup-watchdog.log`,同时通过 `faulthandler.dump_traceback(file=fh)` 把全线程栈写入同一文件。
+
+**退出护送** (`_exit_escort`): 独立守护线程,若取证路径自身卡住(日志锁被主线程持有 / 磁盘满),10s 后直接 `os._exit`,保证重启不被阻塞。
+
+### 1.2 关闭取证 (`gateway/shutdown_forensics.py`, 269 行)
+
+SIGTERM/SIGINT 同步处理,10ms 内完成快照:
+
+```python
+# gateway/shutdown_forensics.py:80-119
+def snapshot_shutdown_context(received_signal=None) -> Dict[str, Any]:
+    # 信号名/编号 + own/parent /proc 摘要 + systemd 父级推断
+    # + TracerPid(调试器检测) + 1-min loadavg + takeover/planned-stop marker
+```
+
+**异步诊断** (`spawn_async_diagnostic`): fire-and-forget `ps auxf` / `pstree` / `dmesg` 走独立 subprocess(`start_new_session=True` 脱离 cgroup 避免被 `KillMode=control-group` 一起杀掉),5s 自超时。
+
+**systemd 时序对齐** (`check_systemd_timing_alignment`): 启动时校验 `TimeoutStopSec` ≥ drain 预算,防止 systemd 在 drain 期间 SIGKILL cgroup。
+
+### 1.3 重启循环断路器 (`gateway/restart_loop_guard.py`, 148 行)
+
+持久化到 `<HERMES_HOME>/gateway/restart_loop.json`,链式 inter-boot gap 检测:
+
+```python
+DEFAULT_MAX_RESTARTS = 3       # 3 次重启即触发
+DEFAULT_WINDOW_SECONDS = 60
+DEFAULT_MAX_GAP_SECONDS = 300  # 间隔 >5min 视为新链
+_MAX_STORED_BOOTS = 50
+```
+
+**链式算法** (`_chain_ending_at`): 倒序遍历 boot 时间戳,间隔 ≤ `max_gap` 则链连续;间隔 > gap 链断裂。触发后 **跳过 auto-resume**,打破 SIGTERM-respawn 循环(#30719, #81642)。任何 I/O 故障 fail open。
+
+### 1.4 状态修复与 WAL 策略
+
+#### 1.4.1 错误分类 (`hermes_state_errors.py`, 219 行)
+
+```python
+PERSISTENCE_ERROR_CAUSES = ("locked","compression","compression_closed",
+                             "turn_lease","corrupt","replaced","disk","unknown")
+
+class StateDbCorruptError(sqlite3.DatabaseError): ...      # 结构损坏,隔离 handle
+class StateDbReplacedError(RuntimeError): ...               # 文件被 cp/mv 替换
+class DeletedWalGenerationError(StateDbReplacedError): ...  # WAL inode 已删
+class SessionTurnLeaseLostError(RuntimeError): ...          # fencing 失效
+```
+
+`classify_persistence_error(exc_or_str) -> str`: 先按类型匹配(lease 拒绝不含 "locked"/"busy"),再按短语匹配,**corruption 必须在 disk 之前**("disk image is malformed" 含 "disk")。
+
+#### 1.4.2 修复策略 (`hermes_state_repair.py`, 1082 行)
+
+**跨进程修复锁** (`_cross_process_repair_lock`): `flock` + pid+start_time 记录,持有者死锁自动打破;VACUUM 可能数分钟故获取有界。
+
+**持久化尝试账本** (`_MAX_PERSISTENT_REPAIR_ATTEMPTS = 3`):
+- 指纹 = `size + sha256(head64KiB + tail64KiB)[:32]`,屏蔽 volatile header 范围(24-28 commit counter, 92-95 version-valid-for)
+- 同指纹失败 3 次后拒绝进一步手术,提示 `hermes sessions recover --source <db> --output recovered-state.db`
+- 修复/替换改变指纹 → 计数重置
+
+**取证备份去重** (`_backup_db_file`):
+- 字节级 identity = 整个 main file + 所有 sidecar 的 sha256(用于去重)
+- 与 `_db_fingerprint`(仅 head+tail 采样,用于 ledger key)严格区分
+- 上限 `_MAX_MALFORMED_BACKUPS = 3`,最老的自动清理
+- 磁盘预算: `max(256MiB, 2% volume)` headroom,否则 **HARD STOP**
+
+#### 1.4.3 WAL 模式策略 (`hermes_state_wal.py`, 491 行)
+
+**WAL-reset bug 检测** (`is_sqlite_wal_reset_vulnerable`): SQLite 3.7.0–3.51.2 存在 WAL-reset 损坏 bug,脆弱构建永不启用 WAL。
+
+**回退消歧** (`_enable_wal`): "disk i/o error" 在 ZFS/APFS-CoW 是确定性不兼容,但也可能是瞬时 EIO → 重试 2 次后再判定,防止混合 journal 模式损坏。
+
+**macOS 屏障**: `checkpoint_fullfsync=1` + `synchronous=FULL`,防 launchd 关机时 page cache 丢失导致 malformed image(#30636)。
+
+### 1.5 Electron 主进程取证 (`apps/desktop/electron/crash-forensics.ts`, 52 行)
+
+```typescript
+export function installCrashForensics({ flush, log, target = process }): void {
+  target.on('uncaughtException', record('Uncaught exception'))
+  target.on('unhandledRejection', record('Unhandled rejection'))
+}
+```
+同步写 `desktop.log` + 同步 flush(致命错误后无机会异步 flush)。
+
+### 1.6 桌面修复循环守卫 (`apps/desktop/electron/bootstrap-repair-guard.ts`, 122 行)
+
+纯决策 helper,区分 "venv 真坏" vs "运行时健康但 GIL 暂时卡住":
+
+```typescript
+export function decideBootstrapRepair(input: RepairDecisionInput): RepairDecision {
+  // attempt ≤ maxSoftAttempts(默认 3) → soft restart(保留 venv)
+  // attempt > maxSoftAttempts → hard reinstall
+}
+```
+
+### 1.7 Session DB 可恢复缓存 (`gateway/session_db_recovery.py`, 146 行)
+
+`RecoverableHandleCache`: 单 flight 打开 + 指数退避(1s→60s) + generation 防过时 handle 复活 + 健康状态发布到 `gateway/status`。
+
+### 1.8 会话停滞通知 (`gateway/session_stall.py`, 75 行)
+
+单一进度源 `AIAgent.get_activity_summary()`,notify-once 策略,idle ≥ `timeout_seconds` + 有 pending inbound 才发 "⚠️ Agent session appears stalled"。
+
+---
+
+## 2. WebUI 与 DesktopApp
+
+### 2.1 Electron 桌面 (`apps/desktop/electron/main.ts`, 18,360 行)
+
+**窗口拓扑**: 主聊天窗 + 多 session 子窗 + HUD 浮窗 + Quick Entry 全局热键小窗 + Pet 覆盖层 + 浏览器 popout。
+
+**主窗创建** (`createWindow`, L14555):
+```typescript
+mainWindow = new BrowserWindow({
+  ...computeWindowOptions(savedWindowState, screen.getAllDisplays()),
+  titleBarStyle: 'hidden',
+  titleBarOverlay: getTitleBarOverlayOptions(),
+  show: false,  // 防 vibrancy 闪白
+  webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+})
+```
+
+**translucency 支持**: preload 同步 `sendSync('hermes:translucency:support')`,沙箱 preload 不能 import `node:os`,由主进程代查。
+
+**Windows 沙箱回退**: GPU FATAL crash loop 时写 sticky `markerAfterSuccessfulBoot({fallbackActive, reason, appVersion})`,下次启动探测。
+
+### 2.2 Preload 桥 (`apps/desktop/electron/preload.ts`, 541 行)
+
+`contextBridge.exposeInMainWorld('hermesDesktop', {...})` 暴露:
+
+| 命名空间 | 能力 |
+|---------|------|
+| `hud` | 浮窗 open/close/move/ignore-mouse/frost/session/game-overlay |
+| `petOverlay` | 宠物覆盖层 bounds/focusable/state push/control |
+| `quickEntry` | 全局热键小窗 settings/submit/pushState |
+| `connections` | v2 多连接 registry list/save/remove/setPrimary/updateAll |
+| `cloud` | Hermes Cloud status/login/logout/discover/agentSignIn |
+| `mcpOauth` | MCP OAuth loopback listen/wait/cancel |
+| `terminal` | PTY attach/start/write/onData/onExit |
+| `git` | worktree/branch/diff/review(完整 CR list/stage/commit/push/PR) |
+| `fs` | readDir/reveal/trash/rename/readFileDataUrl |
+| `updates` | check/apply/branch/setBranch/onProgress |
+| `findInPage` | Cmd/Cmd+F delegate |
+| `zoom` | get/set/onChanged/factor(同步) |
+
+### 2.3 共享 JSON-RPC 网关客户端 (`apps/shared/src/json-rpc-gateway.ts`, 755 行)
+
+**GatewayEventName** (24 种):
+```typescript
+type GatewayEventName = 'gateway.ready' | 'session.info' | 'message.delta' |
+  'message.interim' | 'message.complete' | 'thinking.delta' | 'reasoning.delta' |
+  'reasoning.available' | 'status.update' | 'tool.start' | 'tool.progress' |
+  'tool.complete' | 'tool.generating' | 'todo.updated' | 'clarify.request' |
+  'approval.request' | 'sudo.request' | 'secret.request' | 'background.complete' |
+  'error' | 'skin.changed' | ...
+```
+
+**JsonRpcGatewayClient** 核心机制:
+- **心跳**: interval 15s, deadline 45s
+- **请求超时**: 默认 120s,支持 per-call override + AbortSignal
+- **重连回放**: `lastSeenSeq` per session + `replayEpoch`(进程重启后 seq 重置检测)
+- **replayHold**: 回放期间 live 帧暂存,防重复派发
+- **连接超时**: 15s 内未 open → fail to 'error' 供调用方重试
+
+### 2.4 Web Dashboard (`web/`)
+
+React SPA,`web/src/lib/gatewayClient.ts` 继承 `JsonRpcGatewayClient`,ticket 认证(非 legacy token)。
+
+**事件重连** (`web/src/lib/events-reconnect.ts`, 85 行):
+```typescript
+EVENTS_RECONNECT_BASE_MS = 1_000
+EVENTS_RECONNECT_MAX_MS = 30_000
+EVENTS_MAX_RECONNECT_ATTEMPTS = 15
+EVENTS_CONNECT_TIMEOUT_MS = 15_000
+// 4401/4403 = auth rejection → 终止,提示 reload
+// 1000 = normal close → 不重试
+```
+
+### 2.5 TUI (`ui-tui/`)
+
+Ink/React 终端渲染,`ui-tui/packages/hermes-ink/src/ink/ink.tsx`(2850 行)是 fork 的 Ink 运行时。
+
+### 2.6 引导安装器 (`apps/bootstrap-installer/`)
+
+Tauri 2 应用,`src-tauri/src/update.rs` 编排:
+1. 等旧桌面进程退出(20s,500ms poll)
+2. `hermes update --yes --gateway`
+3. `hermes desktop --build-only`
+4. 启动新桌面
+
+**UpdateMarkerGuard** (RAII): 拥有 `.hermes-update-in-progress` 标记,`Drop` 在任何退出路径(含 panic)删除标记。标记 payload `{pid}\n{started_at_unix}`,20min 陈旧上限。
+
+---
+
+## 3. OAuth 认证与多账号
+
+### 3.1 RFC 8252 原生 PKCE 流 (`apps/desktop/electron/native-oauth.ts`, 256 行)
+
+网关代理模式: 上游 IDP(Nous Portal) 签发 per-gateway `client_id`,只接受网关 origin 的 `redirect_uri`,所以桌面不能直连 Portal。网关暴露 `/auth/native/{authorize,token,refresh}`。
+
+```typescript
+export function generatePkcePair(): NativePkcePair {
+  const verifier = b64url(randomBytes(32))   // 43 chars, RFC 7636 §4
+  const challenge = b64url(sha256(verifier))
+  return { verifier, challenge, method: 'S256' }
+}
+
+export function resolveLoginStrategy(status, opts): 'native' | 'embedded' {
+  // forceEmbedded → embedded
+  // 无 non-password provider → embedded
+  // status.auth_flows 含 'native_pkce' → native
+  // 否则 → embedded(兼容旧网关)
+}
+```
+
+**回调解析** (`parseLoopbackCallback`): 严格 state 校验(CSRF),不匹配直接抛。
+
+### 3.2 登录驱动 (`apps/desktop/electron/native-oauth-login.ts`)
+
+依赖注入(`openExternal` / `postJson` / `createServer` / `now` / `timeoutMs`)可单元测试。
+
+安全姿态:
+- loopback 绑定 127.0.0.1 临时端口,收到回调或超时立即关闭
+- state 校验后才 redeem code
+- PKCE verifier 在 token POST 前不出进程
+- 浏览器只看到 "You can close this window" HTML,不见 token
+
+### 3.3 加密存储 (`apps/desktop/electron/native-token-store.ts`, 166 行)
+
+`safeStorage.encrypt` → userData store file(mode 0600)。
+
+**URL 脱敏** (`redactGatewayUrl`): 剥 userinfo 防 credential 泄漏到日志。
+
+**双解析路径**: 网关响应 snake_case 用 `parseTokenResponse`;存储 blob camelCase 用 `parseStoredTokenSet`。混用导致每次重启 "signed out"(#73271)。
+
+### 3.4 多账号/多连接
+
+preload `connections` namespace 暴露 v2 registry: `list/save/remove/setPrimary/setLaunchMode/test/updateManaged/updateAll/onChanged`。
+
+`cloud` namespace: Hermes Cloud 门户登录 → 发现 agent → 静默 per-agent 登录(cloud-auto-discovery Phase 3)。
+
+---
+
+## 4. i18n 国际化
+
+### 4.1 CLI 静态消息目录 (`locales/`, 16 语言 YAML)
+
+`locales/en.yaml`(474 行) 为 source of truth。仅覆盖 CLI approval prompt 与少量 gateway slash-command 回复,**不翻译** agent 输出 / 日志 / 错误 traceback / 工具输出。
+
+**键结构**:  dotted path,`{placeholder}` token,新增键必须同一 commit 加到 en/zh/ja/de/es/fr/tr/uk(`tests/agent/test_i18n.py` 断言 catalog parity)。
+
+16 语言: en / zh / zh-hant / es / fr / de / ja / ko / pt / ru / uk / it / ga / af / tr / hu / ar。
+
+### 4.2 Web Dashboard i18n (`web/src/i18n/`, 21 个 locale 文件)
+
+**类型安全** (`web/src/i18n/types.ts`, 876 行):
+```typescript
+export type Locale = "en" | "zh" | "zh-hant" | "ja" | "de" | "es" | "fr" |
+  "tr" | "uk" | "af" | "ko" | "it" | "ga" | "pt" | "ru" | "hu" | "ar";
+export interface Translations { common: {...}; app: {...}; status: {...};
+  sessions: {...}; analytics: {...}; models: {...}; logs: {...}; cron: {...};
+  pluginsPage: {...}; profiles: {...}; skills: {...}; config: {...}; env: {...};
+  oauth: {...}; language: {...}; theme: {...}; achievements: {...}; kanban: {...} }
+```
+
+**部分翻译合并** (`define-locale.ts`): 新 locale 只覆写有翻译的键,缺失键回退英文,未知键仍 type-error。
+
+**RTL 支持**: `RTL_LOCALES = new Set(["ar"])` → Tailwind logical utilities 翻转。
+
+**语言切换器** (`LanguageSwitcher.tsx`): 显示 endonym(本族语名),**不用国旗**(语言≠国家)。窄屏 bottom sheet portaled to body。
+
+### 4.3 文档站点翻译 (`website/i18n/`)
+
+Docusaurus,`zh-Hans` 分支含 313 个翻译 `.md` 文件。
+
+### 4.4 前后端同步
+
+`hermes_constants.py` 的 `INDICATOR_STYLES` / `DEFAULT_INDICATOR_STYLE` 与 `ui-tui/src/app/interfaces.ts` 保持同步,是 TUI busy-indicator 的"前后端单一事实源"。
+
+---
+
+## 5. Release 工程化与 AutoUpdate
+
+### 5.1 CalVer + Semver 发布 (`scripts/release.py`, 2648 行)
+
+```bash
+python scripts/release.py --bump minor --publish --date 2026.3.15
+```
+
+**双版本体系**:
+- **CalVer tag**: `v2026.9.7` / `v2026.9.7.2`(同日多次 release 自动加后缀)
+- **Semver**: `__init__.py` + `pyproject.toml` + `apps/desktop/package.json` 同步
+
+**Changelog 生成**: conventional commit 分类 + PR 号提取 + co-author 解析 + contributor 目录合并(`contributors/emails/` 每邮箱一文件,无 merge conflict)。
+
+**发布流程**: bump version files → git commit → tag → `gh release create` → 上传产物。
+
+### 5.2 应用内更新 (Electron)
+
+**更新门控** (`update-gate.ts`): 双信号 — 磁盘 marker + 进程内 `updateInFlight` flag。单 marker 不够(#73822): `applyUpdates` 早杀 backend 后 marker 写入前,renderer 1s 内重连会 spawn 新 backend 进入更新临界区。
+
+**更新标记** (`update-marker.ts`): `HERMES_HOME/.hermes-update-in-progress` 两行 `{pid}\n{started_at_unix}`,20min 陈旧上限,自愈。
+
+**远程检测** (`update-remote.ts`): 官方 repo SSH remote 在被动检查时替换为 HTTPS `ls-remote`,防 FIDO2/passkey SSH key 触发硬件触摸提示。
+
+**更新器进程** (`updater-process.ts`): Windows 用 repo 内 `scripts/desktop-update/windows.ps1`(frozen-binary 逃逸舱口,updater 自身 bug 无需等新 binary),POSIX 用 `posix.sh`。
+
+### 5.3 Rust/Tauri 更新编排 (`apps/bootstrap-installer/src-tauri/src/update.rs`)
+
+`UpdateMarkerGuard` RAII + `UPDATE_RUNNING` AtomicBool 防 re-entrancy(React strict-mode 双调用 / 窗口 reload)。
+
+**阶段 manifest**: handoff → update → rebuild(+ macOS install stage),前端看起来像短 bootstrap。
+
+---
+
+## 6. WebSocket 与 SSE
+
+### 6.1 TUI 网关 WS 传输 (`tui_gateway/ws.py`, 380 行)
+
+复用 `tui_gateway.server.dispatch`,与 stdio Ink 同一套 handler。
+
+**Token 合并** (`WSTransport`):
+```python
+_STREAMING_EVENT_TYPES = {"message.delta", "reasoning.delta", "thinking.delta"}
+_TOKEN_COALESCE_S = 0.033  # ~30 fps
+```
+流式 token 缓冲 + 定时器批量 flush,非流式帧(工具/审批/状态/完成)立即 flush 并清空缓冲,保序。
+
+**写安全**: `write()` 从 worker 线程调度到 loop,`write_async()` 从 loop 线程 await。`_safe_send_many` 在 `_send_lock` 下发送不可分割 batch。
+
+**UTF-8 净化** (`_sanitize_ws_text`): 替换 lone surrogate,单帧无效不关闭连接(#97288)。
+
+**Scale-to-zero 心跳**: 每 15s touch marker,`gateway/scale_to_zero.py` 读取 mtime 判断是否有 dashboard/desktop/TUI 客户端附着。
+
+### 6.2 事件回放 (`tui_gateway/event_replay.py`, 101 行)
+
+每 session 单调 `seq` + 512 事件 ring buffer + 64 session FIFO 淘汰。
+
+**Epoch 检测**: `_REPLAY_EPOCH = uuid.uuid4().hex`,进程重启后 seq 从 1 重置,客户端通过 `gateway.ready` / `session.events.since` 的 epoch 变化检测重启并重置高水位。
+
+**truncated 标记**: `is_truncated` 告知客户端 ring 已绕回,需 refetch history 而非信任回放。
+
+### 6.3 浏览器 JSON-RPC 客户端 (`apps/shared/src/json-rpc-gateway.ts`)
+
+- 心跳 15s / deadline 45s
+- 请求超时 120s,per-call override + AbortSignal
+- 重连回放 `fetchReplay()` + `replayHold` 防重复派发
+- 连接超时 15s
+
+### 6.4 事件重连 (`web/src/lib/events-reconnect.ts`)
+
+指数退避 1s→30s,15 次上限。4401/4403 auth 拒绝 → 终止提示 reload;1000 normal → 不重试;其他(网关重启/网络掉线/1006/proxy timeout)→ 重试。
+
+---
+
+## 7. DevContainer 与容器化
+
+### 7.1 Dockerfile (466 行,多阶段构建)
+
+**SQLite 定制编译** (`sqlite_build` stage): Debian 13 自带 3.46.1 仍有 WAL-reset bug → 编译 3.53.4 pinned + sha256 校验 + FTS5 trigram 自测试。
+
+**s6-overlay 3.2.3.0**: PID 1 = `s6-svscan`,reap zombie + 监督 main-hermes / dashboard / per-profile gateways。多阶段校验和 + curl retry 防 GitHub CDN 抖动。
+
+**Node 26 源**: bookworm-slim 镜像链接 glibc 2.36,兼容 Debian 13 runtime。
+
+**Photon iMessage sidecar**: 独立 `node_modules`,baked 防运行时 EROFS。
+
+**Python 依赖**: `uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix`。
+
+**镜像溯源**: `HERMES_GIT_SHA` build-arg → `/opt/hermes/.hermes_build_sha` + `/etc/hermes/image-provenance.json`(schema 1, deployment_kind "image")。
+
+**权限**: `--chmod=a+rX,go-w` 非 root hermes 用户(UID 10000)读+遍历,无写;`HERMES_UID` 运行时覆盖。
+
+**Lazy install 重定向**: `HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages`,sealed venv 保证 + 可选后端 SDK 仍可安装。
+
+**docker exec 特权 drop shim**: `/opt/hermes/bin/hermes` 检测 root → `s6-setuidgid hermes` 重执行 venv binary。
+
+### 7.2 docker-compose.yml
+
+`gateway` + `dashboard` 两服务,`network_mode: host`,`~/.hermes:/opt/data`。Dashboard 默认 127.0.0.1,远程访问走 SSH tunnel 或反向代理。
+
+### 7.3 s6 服务定义
+
+`docker/s6-rc.d/main-hermes/run`: 当前是 `exec sleep infinity`(s6-rc 需要至少一个 user service)。
+
+`docker/s6-rc.d/dashboard/run`: `HERMES_DASHBOARD` truthy 才启动,否则 exit 0 + finish 125 = permanent failure slot down。非 loopback bind 强制 auth gate(不再接受 `HERMES_DASHBOARD_INSECURE`)。
+
+### 7.4 cont-init.d
+
+- `01-hermes-setup` → `stage2-hook.sh`(UID/GID remap, volume chown, config seeding, skills sync)
+- `015-supervise-perms`
+- `02-reconcile-profiles` — 容器重启后从 `$HERMES_HOME/profiles/<name>/` 重建 per-profile gateway s6 slots
+
+### 7.5 入口调度
+
+`entrypoint-dispatch.sh`: 真 PID 1 路径 exec `/init`(s6 监督树);平台自有 PID-1 init 时 fallback 到 `stage2-hook.sh` + `main-wrapper.sh`(#38349)。
+
+---
+
+## 8. CRDT 与多端冲突
+
+### 8.1 Skill Sync — 类 Git 内容寻址同步 (`tools/skills_sync_client.py`, 568 行 + `skills_sync_client_wire.py`, 343 行)
+
+**不是传统 CRDT(Yjs/automerge)**,而是 git 风格的对象模型 + CAS ref 更新。
+
+**Wire 模型** (`skills_sync_client_wire.py`):
+```python
+WIRE_VERSION = "1"
+KIND_BLOB, KIND_TREE, KIND_COMMIT = "blob", "tree", "commit"
+MODE_FILE, MODE_EXEC, MODE_DIR = "file", "exec", "dir"
+
+def wire_address(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+def canonical_json_bytes(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ...).encode()
+```
+
+**对象类型**: blob(文件内容) / tree(目录) / commit(tree + parents + author + ts + message)。
+
+**Commit 结构**:
+```python
+{"type":"commit", "tree": tree_hash, "parents": [base, other],
+ "author": {"owner": owner, "device": device},
+ "ts": "2026-09-07T...", "message": "...", "artifact_type": "skill"}
+```
+
+**CAS ref** (`cas_ref`): `POST refs/:name` 带 `from` / `to`,409 → `SyncConflict(actual)` 触发三向合并。
+
+**三向合并** (`merge_skill`):
+```python
+def merge_skill(base, ours, theirs) -> str:
+    if ours == theirs: return "either" if ours else "none"
+    if theirs == base: return "ours"
+    if ours == base: return "theirs"
+    return "overlap"  # 双方都改,需人工
+```
+
+**Sync manifest**: 根级 blob `sync-manifest` 记录 `{name: enabled}`,plane manifest 权威,本地 `.usage.json` 的 `sync` flag 仅是可编辑 intent(pull 时 reconciliation 来源)。
+
+**Org scope**: 独立 `org/` 路由,personal routes hard-scoped to token owner,防 org 查询返回个人数据。
+
+**Eligibility gate**: 非 bundled / 非 hub-installed / 非 external / 非 `_org/` 下;Nous admin JWT claim `tool_gateway_admin` 硬门槛。
+
+### 8.2 会话事件排序与回放
+
+`tui_gateway/event_replay.py` 的 per-session `seq` + ring buffer 是**单写者多读者**场景下的有序广播,客户端重连后 `events_since(last_seen)` 精确回放。
+
+**不是 CRDT**: 事件流是线性的、服务端权威的,客户端不合并并发写,只补漏。
+
+### 8.3 状态库并发控制
+
+`hermes_state.py` 的 `turn_lease` + `CompressionSessionBusyError` + `SessionTurnLeaseLostError` 是**乐观并发控制**(lease-based fencing),不是 CRDT 的 converge 语义 — 后写者 fail fast 而非合并。
+
+### 8.4 laew 差距总结
+
+| 维度 | hermes 现状 | laew 差距 |
+|------|------------|----------|
+| CrashDump | faulthandler + JSON record + 退出护送 + 重启断路器 | 无 panic hook,无重启循环检测 |
+| WebUI | 6 前端共享 AIAgent + 18k 行 Electron + 完整 preload 桥 | 仅 Rust TUI |
+| OAuth | RFC 8252 PKCE + safeStorage + 多连接 registry | 仅 API Key |
+| i18n | 16 语言 YAML + 21 语言 Web + 类型安全 + RTL | 中文硬编码 |
+| Release | CalVer + semver + 应用内更新 + s6 容器 | 手动 cargo build |
+| WebSocket | JSON-RPC + token 合并 + 事件回放 + 心跳 | 无 |
+| DevContainer | 多阶段 Dockerfile + s6-overlay + 镜像溯源 | 无 |
+| 多端同步 | 类 Git 内容寻址 + CAS + 三向合并 | 无 |
+
+---
+
+## 本轮关键发现(laew gap L79-L94)
+
+**L79 无启动看门狗**: hermes 的 `hermes_startup_watchdog.py` 防启动期死锁,laew 无对应 → 启动卡死需人工发现。
+
+**L80 无重启循环断路器**: hermes 的 `restart_loop_guard.py` 链式 inter-boot gap 检测,laew 无 → 崩溃-重启-崩溃无限循环。
+
+**L81 无关闭取证**: hermes 的 `shutdown_forensics.py` 10ms 快照 + 异步 `ps`/`dmesg`,laew 无 → 外部 SIGTERM 原因不明。
+
+**L82 无 Electron/桌面壳**: hermes 18,360 行 Electron main + 541 行 preload + HUD/Pet/Quick Entry,laew 仅 TUI。
+
+**L83 无 RFC 8252 OAuth**: hermes 完整 PKCE + safeStorage + 多连接,laew 仅 API Key 明文。
+
+**L84 无 i18n 框架**: hermes 16 语言 CLI + 21 语言 Web + 类型安全 + RTL,laew 中文硬编码。
+
+**L85 无 CalVer 发布工程**: hermes `scripts/release.py` 2648 行 + 应用内更新 + Rust/Tauri 编排,laew 手动 cargo build。
+
+**L86 无 WS 事件回放**: hermes per-session seq + 512 ring + epoch 检测 + 客户端 replayHold,laew 无 WS。
+
+**L87 无容器化**: hermes 多阶段 Dockerfile + s6-overlay + 镜像溯源 + UID remap + lazy install 重定向,laew 无。
+
+**L88 无多端同步**: hermes 类 Git 内容寻址 + CAS + 三向合并 + sync manifest,laew 无。
+
+**L89 WAL-reset bug 防御**: hermes 检测脆弱 SQLite + 自动回退 DELETE + macOS F_FULLFSYNC,laew 无。
+
+**L90 修复循环有界**: hermes `_MAX_PERSISTENT_REPAIR_ATTEMPTS=3` + 指纹账本 + 备份去重,laew 无状态修复。
+
+**L91 Token 合并流式**: hermes WS 流式 token 30fps 批量 flush,laew 无流式。
+
+**L92 镜像溯源**: hermes `image-provenance.json` + baked git SHA,laew 无。
+
+**L93 Org scope 隔离**: hermes personal / org 路由 hard-scoped,laew 无多租户。
+
+**L94 部分翻译回退**: hermes `defineLocale` 缺失键回退英文,laew 无。
+
+**推荐 Rust crate**: `human-panic`(L79) / `backoff`(L80) / `tauri`(L82) / `oauth2`+`keyring`(L83) / `rust-i18n`(L84) / `cargo-dist`(L85) / `tokio-tungstenite`(L86) / `landlock`+`seccomp`(L87) / `yrs`(L88)。

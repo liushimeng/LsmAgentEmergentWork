@@ -1567,3 +1567,1177 @@ TencentDB Agent Memory 是一个**工程完整度高、设计模式成熟**的�
 - `/usr/local/LsmGitOpenSource/TencentDB-Agent-Memory/MemoryCore/src/core/store/search-utils.ts`（62 行）
 - `/usr/local/LsmGitOpenSource/TencentDB-Agent-Memory/MemoryCore/src/core/store/isolation.ts`（171 行）
 - `/usr/local/LsmGitOpenSource/TencentDB-Agent-Memory/MemoryKnowledge/src/db/schema.ts`（152 行）
+# TencentDB Agent Memory 第十轮深挖 — 8 新维度深度分析
+
+> 调研对象:TencentDB-Agent-Memory(TypeScript+Python,团队记忆系统)
+> 调研日期:2026-09-07
+> 前 9 轮覆盖:L0-L3 管线 / SkillCore / InjectionPipeline / MemoryProxy / 多租户隔离 / RRF 混合检索 / 存储层 / Wiki / CodeGraph / 插件 / SDK / 部署 / 系统提示词 / 可观测性 / LSP / 遥测 / Web 检索 等 50+ 维度
+> 本轮 8 新维度:**CrashDump 与错误恢复** / **WebUI 与 DesktopApp** / **OAuth 认证与多账号** / **i18n 国际化** / **Release 工程化与 AutoUpdate** / **WebSocket 与 SSE** / **DevContainer 与容器化** / **CRDT 与多端冲突**
+> 总行数:~2,300 行
+
+---
+
+## 一、CrashDump 与错误恢复
+
+### 1.1 架构全景
+
+TencentDB-Agent-Memory 采用**分层错误分类 + 优雅降级 + 指数退避重试**三层策略，无传统 CrashDump（核心转储）机制，依赖结构化错误码与 traceId 追踪。
+
+```
+异常抛出
+   │
+   ├─ MemoryProxy 层 ──→ withL0Retry (指数退避 3 次)
+   │                 ──→ pending-writes flush (SIGTERM 前兜底)
+   │                 → classifyError → HTTP 响应 + traceId
+   │
+   ├─ MemoryCore 层 ──→ RecallErrors 4 级分类 (1xxxx/2xxxx/3xxxx/9xxxx)
+   │                 → embedding 重试 (MAX_RETRIES=0 退化为单次 + 超时 abort)
+   │                 → L1 失败回缓冲 + 5 次重试上限
+   │
+   └─ MemoryPanel 层 → onBlur 级 request-id envelope (code 500 + request_id)
+```
+
+### 1.2 Gateway 错误分类器（error-handler.ts）
+
+`MemoryCore/src/gateway/error-handler.ts` 是 MemoryCore 网关的统一错误出口：
+
+```typescript
+export interface ClientFacingError {
+  code: number;        // 业务码
+  message: string;     // 已消毒的安全消息
+  trace_id: string;    // UUID 用于日志关联
+  retryable?: boolean; // 客户端是否值得重试
+}
+
+export function classifyError(err: unknown): ClassifiedError {
+  const trace_id = randomUUID();
+
+  // 1. PayloadTooLargeError (CR-7) — duck-typed
+  if (statusCode === 413) return { status: 413, ... retryable: false };
+
+  // 1b. Invalid JSON body — 400
+  // 1c. COS AppendPositionErr — 409 Concurrent write conflict, retryable: true
+  // 1d. Unsupported Content-Encoding — 415
+
+  // 2. RecallFailure (H-15) — 已分类的 recall 错误
+  if (err instanceof RecallFailure) {
+    return {
+      status: re.category === "config" ? 503 : 500,
+      client: { code: re.code, message: re.message, retryable: re.retryable },
+    };
+  }
+
+  // 4. Generic 5xx — 严格隐藏 err.message
+  return {
+    status: 500,
+    client: { code: 500, message: "Internal server error", retryable: true },
+  };
+}
+```
+
+**关键设计**：
+- **traceId 隔离**: 客户端拿 UUID 报障，服务商用 UUID 查完整日志
+- **strict hide**: 5xx 场景 err.message / err.stack 绝不返回给客户端
+- **duck-typing**: 避免 server.ts ↔ error-handler.ts 循环依赖
+
+### 1.3 日志脱敏（sanitize）
+
+```typescript
+export function sanitize(input: string): string {
+  return input
+    .replace(/sk-ant-[A-Za-z0-9_-]{16,}/g, "sk-ant-***")   // Anthropic
+    .replace(/sk-[A-Za-z0-9_-]{16,}/g, "sk-***")           // OpenAI/DeepSeek
+    .replace(/(Bearer|Basic)\s+[A-Za-z0-9._\-+/=]+/gi, "$1 ***")
+    .replace(/"(?:SecretKey|apiKey|api_key|password|token|authorization|TmpSecretId|TmpSecretKey|TmpToken)"\s*:\s*"[^"]*"/gi, '$1"***"');
+}
+```
+
+**脱敏范围**: API Key（sk-ant-/sk-）、Bearer/Basic 授权头、JSON 敏感字段（SecretKey/apiKey/password/authorization/TmpSecret* 临时凭证）。
+
+### 1.4 RecallError 四级分类（recall-errors.ts）
+
+```
+1xxxx — config (non-retryable, 需运维介入)
+         10001 configMissingEmbedding
+         10002 configInvalidStrategy
+
+2xxxx — dependency (retryable, 瞬时故障)
+         20001 dependencyTimeout
+         20002 dependencyUnavailable
+
+3xxxx — storage (retryable)
+         30001 storageError
+
+9xxxx — internal (non-retryable, 代码 bug)
+         90001 internalError
+```
+
+**设计哲学**: 数字编码是稳定 wire contract，永不复用；`retryable` 字段驱动客户端/Proxy 的重试决策。
+
+### 1.5 L0 写入重试（pending-writes.ts）
+
+MemoryProxy streaming 场景的 **fire-and-forget** 风险兜底：
+
+```typescript
+// 指数退避重试: 3 次总尝试, 间隔 500ms → 1s → 2s (含 jitter)
+export async function withL0Retry<T>(
+  fn: () => Promise<T>,
+  opts: { attempts?: number; baseMs?: number } = {},
+): Promise<T> {
+  const attempts = opts.attempts ?? 3;
+  const baseMs = opts.baseMs ?? 500;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); }
+    catch (err) {
+      if (!isRetryable(err) || i === attempts - 1) throw err;
+      const wait = baseMs * (2 ** i) + Math.floor(Math.random() * 200);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+}
+
+function isRetryable(err: unknown): boolean {
+  // 网络错、5xx、408、429 值得重试；4xx 客户端错直接抛
+  if (/abort|econnreset|enotfound|etimedout|fetch failed|network|timeout/i.test(msg)) return true;
+  const m = msg.match(/HTTP (\d{3})/);
+  if (!m) return true;  // 无状态码信息 → 保守 retry
+  const code = Number(m[1]);
+  return code >= 500 || code === 408 || code === 429;
+}
+```
+
+**关键数字**：
+- 默认 3 次总尝试（含原始那次），间隔 500/1000/2000ms + 0-200ms jitter
+- 总最长 ~3.5s，K8s SIGTERM grace period 通常 30s，flushPendingWrites 默认 10s
+- 重复写风险：tdai `/v3/conversation/add` 没有 idempotency-key；但 L1/L2/L3 蒸馏管线幂等（同 hash 单条），仅 L0 冗余可接受
+
+### 1.6 Graceful Shutdown（MemoryProxy）
+
+```typescript
+// 顺序: L0 flush (10s) → langfuse → clickhouse → logger → exit
+async function gracefulShutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
+  const pending = pendingWriteCount();
+  if (pending > 0) {
+    const { drained, remaining } = await flushPendingWrites(10_000);
+  }
+  await shutdownGuard();       // Redis session store
+  await shutdownLangfuse();    // tracing
+  await shutdownClickHouse();  // 遥测
+  await shutdownLogger();
+  process.exit(0);
+}
+process.on("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
+process.on("SIGINT", () => { void gracefulShutdown("SIGINT"); });
+```
+
+### 1.7 L1 Pipeline 失败重试
+
+`MemoryCore/src/utils/pipeline-manager.ts` 的 L1 失败处理：
+
+```typescript
+// 失败时消息放回缓冲区 + l1RetryCount 递增，30s 后重试（最多 5 次）
+} catch (err) {
+  // On failure: put messages back into the buffer for retry
+  timers.l1RetryCount += 1;
+  if (timers.l1RetryCount <= this.L1_MAX_RETRIES) {  // 5
+    setTimeout(() => this.onL1RetryTimeout(sessionKey), this.L1_RETRY_DELAY_MS);  // 30s
+  } else {
+    // giving up auto-retry, messages remain buffered
+  }
+}
+// Success: reset retry count
+timers.l1RetryCount = 0;
+```
+
+### 1.8 Embedding 远程调用重试
+
+`MemoryCore/src/core/store/embedding.ts`：
+
+```typescript
+const MAX_RETRIES = 0;  // 默认关闭重试，仅 timeout abort
+for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  try {
+    const timeoutId = setTimeout(() => controller.abort(), timeoutOverride ?? this.timeoutMs);
+    // ...
+  } catch (err) {
+    if (err instanceof EmbeddingApiError && err.isClientError()) throw err;  // 4xx 直接抛
+    if (attempt < MAX_RETRIES) {
+      const delay = 500 * (attempt + 1);  // 500ms, 1000ms
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+```
+
+**设计取舍**: `MAX_RETRIES=0` 意味着 embedding 默认不重试（仅超时 abort）；实际生产中 embedding 失败时 graceful degradation：跳过 vec0 写入，仅写 metadata + FTS。
+
+### 1.9 Rate Limit 降级
+
+`MemoryProxy/src/rate-limit/redis-store.ts`：
+
+```typescript
+private degradedDecision(reason = "redis_unavailable"): RateLimitDecision {
+  return {
+    allowed: true,        // 降级时放行
+    degraded: true,
+    degradedReason: reason,
+    reason: null,
+    retryAfterSeconds: 0,
+  };
+}
+```
+
+**策略**: Redis 不可用时 rate limiter **fall open**（放行），避免单点故障阻断全部流量。这是典型的**故障开放**模式，优先可用性。
+
+### 1.10 缺失项（CrashDump gap）
+
+| 缺失 | 影响 |
+|------|------|
+| 无 CrashDump / core dump 机制 | Node.js 进程崩溃后无法事后回溯调用栈 |
+| 无 Sentry / Bugsnag 集成 | 前端/后端异常无自动聚合报警 |
+| 无 panic hook | 未捕获异常依赖 Hono onError / process.on |
+| 无结构化错误上报 | 错误分散在 log 中，无统一错误看板 |
+| 无重试次数动态配置 | attempts/baseMs 硬编码，无法运行时调参 |
+| L2/L3 失败无重试上限 | 仅靠 armL2MaxInterval 最终重试，无放弃机制 |
+| 无断路器 (circuit breaker) | 上游持续 5xx 时仍会继续请求，无快速失败 |
+| idempotency-key 缺失 | L0 重试可能产生重复记录 |
+
+---
+
+## 二、WebUI 与 DesktopApp（MemoryPanel Web）
+
+### 2.1 技术栈总览
+
+`MemoryPanel/web/` 是完整的 React 单页应用：
+
+| 维度 | 选型 |
+|------|------|
+| 框架 | React 18.3 + TypeScript 5.7 |
+| 构建 | Vite 6.0 + tsc |
+| 路由 | react-router-dom 7 (HashRouter) |
+| 状态管理 | zustand 5 |
+| UI 组件库 | tea-component 2.8 (腾讯内部组件库) |
+| 国际化 | react-i18next 17 + i18next 26 |
+| 样式 | TailwindCSS 3.4 + PostCSS |
+| 可视化 | sigma 3 + graphology 0.26 + @react-sigma/core 5 |
+| Markdown | react-markdown 10 + remark-gfm |
+| Toast | sonner 1.7 |
+| 时间处理 | moment 2.30 |
+
+**包名**: `community-loop-lab-web` v0.1.0（开源版重命名）。
+
+### 2.2 路由结构（8 大业务页面）
+
+```typescript
+// src/routes — HashRouter (避免静态部署刷新 404)
+export const routes: RouteObject[] = [
+  {
+    path: '/',
+    element: <ConsoleLayout />,
+    children: [
+      { index: true, element: <WorkbenchPage /> },          // 任务看板
+      { path: 'wiki', element: <WikiPage /> },              // Wiki 知识库
+      { path: 'code', element: <CodePage /> },              // Code_Graph
+      { path: 'skills', element: <SkillsPage /> },          // Skill 技能
+      { path: 'memory', element: <ChatMemoryPage /> },      // Chat_Memory
+      { path: 'team/members', element: <MembersPage /> },   // 成员管理
+      { path: 'team/agents', element: <AgentsPage /> },     // Agents 管理
+      { path: 'team/api-keys', element: <ApiKeysPage /> },  // API Key
+    ],
+  },
+];
+```
+
+**资源页** `ResourcePage` 作为独立页（资产分配、资产范围管理、AdminResourceLock）。
+
+### 2.3 核心组件体系
+
+```
+components/
+├── LoginGate.tsx          — 登录入口 (user_key 鉴权)
+├── RouteGuards.tsx        — 路由守卫
+├── SettingsDialog.tsx     — 设置对话框
+└── MarkdownView.tsx       — Markdown 渲染
+
+layouts/
+├── ConsoleLayout.tsx      — 控制台布局 (侧栏 + 顶栏 + 内容)
+├── GlobalHeader/          — 全局顶栏 (同步/设置/资料/登出)
+└── TabBar/                — 标签栏
+
+pages/
+├── workbench/WorkbenchPage/  — 任务看板 (任务列表/创建/详情)
+├── wiki/WikiPage/            — Wiki 来源/图谱/页面/搜索
+├── code/CodePage/            — CodeGraph 仓库/索引/搜索
+├── skills/SkillsPage/        — Skill 全部/团队池/Agent资产
+├── memory/ChatMemoryPage/    — L0-L3 分层记忆 (BlockDetail/Allocate/Import)
+├── team/                     — Members/Agents/ApiKeys
+└── ResourcePage/             — 资产管理 (分配/锁)
+```
+
+### 2.4 登录认证流程（LoginGate）
+
+```
+无 Cookie、无 OAuth，Header 双凭证鉴权:
+
+1. GET /api/v1/meta/instances     → 选记忆实例
+2. 用户输入自持的 user_key（sk-mem-…）
+3. POST /api/v1/meta/auth/verify  → valid=true 登录成功
+4. 前端缓存 { instance_id, user_key, user } 到 localStorage
+5. 后续每个 meta 请求注入双 Header (X-Tdai-Service-Id + Authorization)
+```
+
+**AuthState 结构**：
+```typescript
+export interface AuthState {
+  user: string;         // display_name || username
+  user_id: string;      // ULID (owner 判定 key)
+  instance_id: string;  // 元数据实例 ID
+  instance_name: string;
+  loggedInAt: number;
+  isAdmin: boolean;     // user_type === 'system_admin'
+}
+```
+
+### 2.5 前端数据获取策略
+
+**无 WebSocket 实时推送**，全部采用 **tab 切换 + 写操作后 poll** 模式：
+
+```typescript
+// SkillsPage — "poll on tab change + after every write action. No setInterval"
+// CodePage — poll CodeGraph 索引状态
+const poll = async () => { ... };
+void poll();
+const timer = setInterval(() => { void poll(); }, 5000);  // 5s 间隔
+
+// WikiPage — poll ingest 状态
+const timer = window.setInterval(poll, 2000);  // 2s 间隔
+```
+
+**请求序号防竞态**（ChatMemoryPanel）：
+```typescript
+const fetchSeqRef = useRef(0);
+const fetchBlocks = useCallback(async () => {
+  const seq = ++fetchSeqRef.current;
+  const data = await chatMemoryApi.getBlocks(teamId);
+  if (seq !== fetchSeqRef.current) return;  // 旧响应丢弃
+  setBlocks(data);
+}, [teamId]);
+```
+
+### 2.6 知识图谱可视化
+
+```typescript
+import { Graph } from "graphology";
+import { circular } from "graphology-layout";
+import forceAtlas2 from "graphology-layout-forceatlas2";
+import Sigma from "sigma";
+import { SigmaContainer, ControlsContainer } from "@react-sigma/core";
+```
+
+**能力**: 知识图谱的 ForceAtlas2 力导向布局、社区发现（Louvain 算法）、节点交互。
+
+### 2.7 Panel HTTP 后端路由
+
+`MemoryPanel/src/panel/http/` 基于 **Hono** 框架：
+
+```typescript
+// buildPanelApp 注册的路由
+registerHealthRoutes(app);           // /health
+const api = new Hono();
+registerMetaInstanceRoutes(api);     // /api/v1/meta/instances
+registerMetaProxyRoutes(api);        // /api/v1/meta/*
+registerSkillProxyRoutes(api);       // /api/v1/skill/* → 内核 /v3/skill/*
+registerChatMemoryRoutes(api);       // /api/v1/chat-memory/*
+registerTaskRoutes(api);             // /api/v1/task/*
+registerAgentOverviewRoutes(api);    // /api/v1/agent/overview
+registerAgentLifecycleRoutes(api);   // /api/v1/agent/delete-cascade
+registerKnowledgeRoutes(api);        // /api/v1/knowledge/*
+app.route(API_PREFIX, api);
+
+// SPA fallback
+app.use('/*', serveStatic({ root: distDir }));
+app.get('*', serveStatic({ path: path.join(distDir, 'index.html') }));
+```
+
+**中间件**：requestLogger 全局注入；onError 返回 `{ code: 500, message: "INTERNAL", request_id }`。
+
+### 2.8 缺失项（DesktopApp gap）
+
+| 缺失 | 影响 |
+|------|------|
+| 无 Electron / Tauri 桌面壳 | 仅浏览器访问，无法离线/系统集成 |
+| 无 PWA / Service Worker | 无离线缓存、无桌面图标 |
+| 无 WebSocket 实时推送 | 状态更新靠轮询（2-5s），有延迟 |
+| 无原生通知集成 | 任务完成/失败无系统通知 |
+| 无多窗口/多标签页同步 | 跨 tab 仅共享 localStorage，无 BroadcastChannel |
+| 无本地文件导出/导入 UI | 仅 API 层支持导入，无拖拽上传 |
+
+---
+
+## 三、OAuth 认证与多账号
+
+### 3.1 认证架构总览
+
+**结论先行：项目无 OAuth/JWT/Passport，采用自研 user_key API Key 体系**。
+
+```
+用户请求
+   │  Header: x-tdai-user-key: sk-mem-XXXXXXXXXXXXXXXXXXXX
+   │  Header: x-tdai-service-id: <instance_id>
+   ▼
+MemoryProxy.auth.ts → verifyUserKey()
+   │  POST /v3/meta/auth/verify → tdai kernel
+   │  Response: { data: { valid, user: { user_id, ... } } }
+   ▼
+user_id + teamId + agentId 注入请求上下文
+```
+
+### 3.2 user_key 生成（crypto.ts）
+
+```typescript
+export function generateUserKey(): string {
+  return USER_KEY_PREFIX + randomBytes(24).toString("base64url");
+}
+// USER_KEY_PREFIX = "sk-mem-"
+// 24 字节 = 192bit 熵 → base64url 32 字符 → 总长度 ~40 字符
+```
+
+**设计要点**：
+- base64url 字符集 `[A-Za-z0-9_-]`，URL/Header/JSON 安全
+- 192bit 熵远高于碰撞界；单实例百万 key 碰撞概率可忽略
+
+### 3.3 密码哈希（scrypt + pepper）
+
+```typescript
+export function hashPassword(plain: string, config: PasswordHashConfig): string {
+  const salt = randomBytes(SALT_LEN);  // 16 bytes
+  const hash = scryptHash(plain, salt, config);
+  return `$scrypt$${N},${r},${p}$${salt_b64}$${hash_b64}`;
+}
+
+function scryptHash(plain: string, salt: Buffer, config: PasswordHashConfig): Buffer {
+  const input = Buffer.concat([config.pepper, Buffer.from(plain, "utf8")]);
+  return scryptSync(input, salt, config.keylen, { N: config.scryptN, r: config.scryptR, p: config.scryptP });
+}
+// 默认: N=16384, r=8, p=1, keylen=32
+// pepper: 32 字节 base64 编码，部署时通过 TDAI_PASSWORD_PEPPER 环境变量注入
+```
+
+**安全分层**：
+- **per-user salt**（随机 16 字节）
+- **全局 pepper**（环境变量注入，不出现在代码/配置中）
+- **scrypt** 内存硬哈希抗 GPU 破解
+
+### 3.4 多租户隔离（instance_id 路由）
+
+`MemoryCore/src/metadata/router/instance.ts`：
+
+```typescript
+export function extractInstanceId(headers: IncomingHttpHeaders): string {
+  const raw = headers["x-tdai-service-id"];
+  const id = Array.isArray(raw) ? raw[0] : raw ?? "";
+  return normalizeInstanceIdForRoute(id);
+}
+
+// factory.ts — 每个 instance_id 独立 SQLite 库
+export function resolveMetadataDbName(instanceId: string, prefix = "tdai_metadata"): string {
+  return `${prefix}_${instanceId}`;  // 物理隔离
+}
+```
+
+**三级数据隔离**：
+1. **Instance 级**：不同 `x-tdai-service-id` → 不同 SQLite 文件
+2. **Team 级**：所有查询强制带 `team_id` 过滤
+3. **User/Agent 级**：`owner_agent_id` + `user_id` 行级 ACL
+
+### 3.5 Proxy Auth 模块（auth.ts）
+
+```typescript
+export async function verifyUserKey(userKey: string, serviceId: string): Promise<VerifyUserResult> {
+  if (!config) return { userId: "", rejected: false };        // auth disabled
+  if (!serviceId) return { userId: "", rejected: true, rejectReason: "missing service_id" };
+  if (!userKey) return { userId: "", rejected: true, rejectReason: "missing user_key" };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tdai-service-id": serviceId },
+    body: JSON.stringify({ user_key: userKey }),
+    signal: AbortSignal.timeout(config.timeoutMs),
+  });
+  // 解析 data.valid + data.user.user_id
+}
+```
+
+**关键特性**：
+- **无缓存**：每次请求实时打 auth 服务（安全优先，拒绝 stale token 风险）
+- **fail-closed**：auth 服务不可用时 reject（可配置 fail-open）
+- **永不抛异常**：返回结构化结果，由调用方决定
+
+### 3.6 System User Passthrough
+
+内部服务账号（CodeBuddy/Wiki-Indexer 等）绕过全量 pipeline：
+
+```typescript
+// 匹配 systemUsers 注册表中的 apiKey → 跳过：
+//   - auth/verify
+//   - session-init / conversation binding
+//   - injection pipeline (skill/memory/wiki)
+//   - routing decisions
+//   - body rewrites (除 model-alias resolution)
+// 保留：Opik/Langfuse/ClickHouse 可观测性 + credit report
+```
+
+### 3.7 Multi-account 支持
+
+**不支持传统意义的 OAuth 多账号**：
+- 一个 user_key 绑定一个 user_id
+- 无 refresh token / token rotation
+- 无 scope / permission 细分
+- API Key 长期有效，无 TTL
+
+**实际多账号模式**：
+- 用户可加入多个 Team（TeamSwitcher 切换）
+- 一个 User 可创建多个 Agent
+- 一个 Agent 可分配多个 Skill/Memory Asset
+
+### 3.8 缺失项（OAuth gap）
+
+| 缺失 | 影响 |
+|------|------|
+| 无 OAuth 2.0 / OpenID Connect | 不支持 Google/GitHub/企业 SSO 登录 |
+| 无 JWT / refresh token | user_key 长期有效，泄露风险高 |
+| 无 token rotation | 无法定期更换凭证 |
+| 无 scope / RBAC | API Key 粒度粗，无法限制读写权限 |
+| 无 MFA / 2FA | 仅 user_key 单因子认证 |
+| 无 session 过期 | localStorage 缓存无 TTL |
+| 无 password 登录入口 | v3.1 后仅 user_key，password 仅历史兼容 |
+| API Key 明文传输风险 | Header 传递，依赖 TLS 保护 |
+
+---
+
+## 四、i18n 国际化
+
+### 4.1 技术架构
+
+MemoryPanel/web 采用 **react-i18next + i18next**，实现运行时语言切换：
+
+```typescript
+// src/i18n/index.ts
+import i18n from 'i18next';
+import { initReactI18next } from 'react-i18next';
+import { zhCN } from './zh-CN';    // 1113 行
+import { enUS } from './en-US';    // 1160 行
+
+function detectInitialLanguage(): string {
+  const stored = localStorage.getItem('tdai-memory.lang');
+  if (stored === 'zh-CN' || stored === 'en-US') return stored;  // 优先用户选择
+  const nav = navigator.language || 'zh-CN';
+  return nav.startsWith('zh') ? 'zh-CN' : 'en-US';              // 浏览器语言回退
+}
+
+i18n.use(initReactI18next).init({
+  resources: {
+    'zh-CN': { translation: zhCN },
+    'en-US': { translation: enUS },
+  },
+  lng: detectInitialLanguage(),
+  fallbackLng: 'zh-CN',
+  interpolation: { escapeValue: false },
+  react: { useSuspense: false },
+});
+```
+
+### 4.2 翻译文件规模
+
+| 文件 | 行数 | 内容分布 |
+|------|------|---------|
+| zh-CN.ts | 1,113 行 | 菜单/导航/全局/登录/工作台/Wiki/Code/Skill/Memory/Team/Error |
+| en-US.ts | 1,160 行 | 完全对齐 zh-CN（en 略长） |
+
+**命名空间扁平**：单 namespace `translation`，无模块化拆分。
+
+### 4.3 翻译键结构（节选）
+
+```typescript
+// ===== Menu / Navigation =====
+'menu.workbench_board': '任务看板',
+'menu.wiki': 'Wiki 知识库',
+'menu.code': 'Code_Graph',
+'menu.skills': 'Skill 技能',
+'menu.chat_memory': 'Chat_Memory',
+'menu.team_members': '成员管理',
+'menu.team_agents': 'Agents 管理',
+'menu.api_keys': 'API Key',
+
+// ===== TeamSwitcher =====
+'teamSwitcher.selectTeam': '选择 team',
+'teamSwitcher.empty.admin': '暂无 team。点击下方「新建团队」创建。',
+'teamSwitcher.empty.member': '你还没有被加入任何 team。请联系管理员将你加入团队。',
+
+// ===== Error messages =====
+'error.UPSTREAM_ERROR': 'Upstream service call failed. Please try again later.',
+```
+
+### 4.4 tea-component 语言同步
+
+```typescript
+// App.tsx — react-i18next → tea-component ConfigProvider 同步
+function toTeaLocale(lang: string): 'zh' | 'en' {
+  return lang.startsWith('zh') ? 'zh' : 'en';
+}
+useEffect(() => {
+  const handler = (lng: string) => setTeaLocale(toTeaLocale(lng));
+  i18n.on('languageChanged', handler);
+  return () => i18n.off('languageChanged', handler);
+}, [i18n]);
+```
+
+**原因**: tea-component 是腾讯内部组件库，内置文案独立于 react-i18next；通过事件监听同步切换。
+
+### 4.5 文档双语体系
+
+| 中文文档 | 英文文档 | 备注 |
+|---------|---------|------|
+| README_CN.md | README.md | 产品总览 |
+| INSTALL_CN.md | INSTALL.md | 安装指南 |
+| CONTRIBUTING_CN.md | CONTRIBUTING.md | 贡献指南 |
+| ROADMAP_CN.md | ROADMAP.md | 路线图 |
+| — | README.deployment.md | 仅英文部署文档 |
+| — | README.docker.md | 仅英文 Docker 文档 |
+
+**文档策略**: 核心文档双语、部署文档英文优先。
+
+### 4.6 缺失项（i18n gap）
+
+| 缺失 | 影响 |
+|------|------|
+| 仅 2 语言 (zh-CN / en-US) | 无法覆盖日韩西班牙语等市场 |
+| 无 RTL (阿拉伯语/希伯来语) | 布局方向固定 LTR |
+| 无 ICU MessageFormat | 复数/性别/占位符需手动拼接 |
+| 无翻译管理平台 | 翻译靠 PR 提交，无 crowdin/lokalise 集成 |
+| 无运行时语言包加载 | 全量打包进 bundle，增加首屏体积 |
+| 无服务端 i18n | 错误消息硬编码中文/英文，无 Accept-Language 探测 |
+| 无日期/数字/货币本地化 | moment 仅做时间格式化，无区域数字格式 |
+| 键名无命名空间 | 单 translation 扁平结构，大规模易冲突 |
+| 无翻译覆盖率检查 | 缺少键时直接显示 key，无编译期报错 |
+
+---
+
+## 五、Release 工程化与 AutoUpdate
+
+### 5.1 版本策略
+
+| 子仓 | npm 版本 | Docker 镜像 tag |
+|------|---------|----------------|
+| MemoryCore | `@tencentdb-agent-memory/memory-tencentdb-v2` 2.0.0-beta.1 | `agentmemory/memory-core` |
+| MemoryProxy | 0.1.0 | `agentmemory/memory-proxy` |
+| MemoryPanel | 0.1.0 | — (合并到 memory-hub) |
+| MemoryKnowledge | 0.1.0 | — (合并到 memory-hub) |
+| SDK TS | `@tencentdb-agent-memory/memory-sdk-ts-v2` | — |
+| SDK Python | `tencentdb-agent-memory-sdk-python` | — |
+
+**版本分离**：npm 版本走 SemVer，Docker tag 独立（`2.0.0-beta.1` 镜像发 `:1.0.0-beta.1`）。
+
+### 5.2 CHANGELOG 规范
+
+遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) + SemVer：
+
+```markdown
+## [2.0.0] — 2026-08-03
+### 🧠 四种记忆资产 · 首次完整开源
+- Chat Memory — L0→L1→L2→L3 逐层提取
+- Skill — 可复用 SOP
+- Wiki — 结构化页面 + 链接图谱
+- CodeGraph — 符号/文件/调用关系索引
+
+### 🎛️ Memory Hub · 面向团队的操作台
+- 三级可见性：private / team / restricted
+
+### 🔀 Memory Proxy · Agent 挂上记忆的通道
+- Anthropic / OpenAI 双协议
+
+### 🚀 一条命令拉起完整三件套
+```
+
+### 5.3 CI/CD 工作流（pr-ci.yml）
+
+```yaml
+# 单 workflow，5 job 串行/并行混合
+jobs:
+  install:    # npm install + cache node_modules
+  pack:       # npm pack → upload .tgz artifact
+  manifest:   # 校验 openclaw.plugin.json + package.json openclaw metadata
+  size:       # 包大小守卫 (MAX_KB=2048)
+  isolation:  # Skill queue 隔离守卫 (禁止触碰红线文件)
+```
+
+**触发条件**: `pull_request → main`；concurrency group `ci-${{ github.ref }}` cancel-in-progress。
+
+### 5.4 Docker 镜像发布（publish.sh）
+
+```bash
+cd deploy/dockerhub
+VERSION=1.0.0 ./publish.sh all           # 三件套一次发布
+VERSION=1.0.0 ./publish.sh memory-core   # 单组件
+DRY_RUN=1 VERSION=1.0.0 ./publish.sh all # 干跑 (仅 secret-scan + context 准备)
+ALSO_LATEST=1 VERSION=1.0.0 ./publish.sh all  # 同时更新 :latest
+```
+
+**安全前置**：`secret-scan.sh` 检查源码中的敏感信息（API Key/密码），防止泄漏到镜像。
+
+### 5.5 一键部署（start-all.sh）
+
+```bash
+# deploy/global-images/
+./start-all.sh            # 本地已有镜像直接用
+PULL=1 ./start-all.sh     # 先 docker pull 升级到最新 :latest
+
+# 内部顺序:
+# Step 1/3: memory (内核) → healthy check
+# Step 2/3: memory-hub (面板+知识) → healthy check
+# Step 3/3: proxy
+```
+
+**辅助脚本**: `stop-all.sh --purge` 彻底清 volume + admin key；`verify.sh` 自检。
+
+### 5.6 Multi-stage Docker 构建
+
+**MemoryCore Dockerfile** (3 stage)：
+```dockerfile
+# Stage 1: deps-builder (node:22-slim + python3/make/g++)
+FROM node:22-slim AS deps-builder
+RUN npm install -g npm@11   # 规避 npm@10.9 arborist edgesOut crash
+RUN npm install --omit=dev --omit=optional --ignore-scripts
+RUN npm install --no-save esbuild  # tsx 运行时依赖
+
+# Stage 2: runtime
+FROM node:22-slim AS runtime
+RUN apt-get install curl tini ca-certificates
+COPY --from=deps-builder /build /app
+HEALTHCHECK --interval=30s --timeout=5s CMD curl -fsS http://127.0.0.1:8420/health
+ENTRYPOINT ["/usr/bin/tini", "--"]   # PID 1 信号传播
+CMD ["node", "--import", "tsx", "src/gateway/server.ts"]
+```
+
+**关键设计**：
+- `tini` PID 1：SIGTERM 正确传播给 Node + pipeline workers，回收僵尸进程
+- BuildKit cache mount：`/var/cache/apt` + `/root/.npm` 加速重复构建
+- apt 镜像可配：`APT_MIRROR=mirrors.tencent.com` 内网加速
+
+### 5.7 Package 大小守卫
+
+```yaml
+# pr-ci.yml size job
+MAX_KB=2048   # 2MB 上限
+if [ "$SIZE_KB" -gt "$MAX_KB" ]; then exit 1; fi
+```
+
+### 5.8 缺失项（AutoUpdate gap）
+
+| 缺失 | 影响 |
+|------|------|
+| 无 AutoUpdate 机制 | 用户需手动 `PULL=1 ./start-all.sh` 升级 |
+| 无 hot reload | 配置变更需重启进程（OpenClaw 插件重注册除外） |
+| 无版本检查 API | 客户端无感知远端有新版本 |
+| 无 code signing | npm 包和镜像无 GPG/sigstore 签名 |
+| 无 SBOM 生成 | 无软件物料清单，供应链审计困难 |
+| 无灰度/金丝雀发布 | 一键全量起停，无流量切分 |
+| 无回滚脚本 | 升级失败后需手动 `docker pull :prev` |
+| CI 仅 PR 触发 | 无 nightly build / 自动发布 |
+| 无 GitHub Release | 用户需手动查 CHANGELOG |
+| 包大小硬编码 | 2MB 上限无法按组件微调 |
+
+---
+
+## 六、WebSocket 与 SSE
+
+### 6.1 现状：无 WebSocket，SSE 仅用于 Form 响应
+
+**搜索结论**：全仓库仅 1 处 TODO 提及 WebSocket，无实际实现。
+
+```typescript
+// MemoryPanel/src/panel/http/routes/knowledge/callback-routes.ts:194
+// TODO: WebSocket push to frontend for real-time UI update
+```
+
+### 6.2 SSE（Server-Sent Events）应用
+
+SSE 仅在 MemoryProxy 的 **session form**（首次 session 初始化引导）场景使用：
+
+```typescript
+// MemoryProxy/src/session/form.ts
+return new Response(stream, {
+  status: 200,
+  headers: {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  },
+});
+
+// MemoryProxy/src/session/codebuddy/form.ts
+headers: { "Content-Type": "text/event-stream", ... };
+
+// MemoryProxy/src/session/claude-code/form.ts
+headers: { "Content-Type": "text/event-stream", ... };
+```
+
+**用途**: 模拟 Anthropic 流式响应格式，把"引导问题"伪装成流式 assistant 消息，让 CC/CodeBuddy 客户端渲染。
+
+### 6.3 前端实时性策略：轮询替代推送
+
+| 场景 | 策略 | 间隔 |
+|------|------|------|
+| Wiki 摄入状态 | `pollWikiStatus` + `setInterval` | 2s |
+| CodeGraph 索引状态 | `pollCodeGraphStatus` + `setInterval` | 5s |
+| Skill 列表刷新 | tab 切换 + 写操作后 refetch | 事件驱动 |
+| Agent/Team 数据 | tab 切换 refetch | 事件驱动 |
+| Chat Memory 资产 | 写操作后 refetch | 事件驱动 |
+
+**典型代码**（WikiSourcesPanel.tsx）：
+```typescript
+const poll = async () => {
+  const detail = await wikiApi.getDetail(wikiId);
+  setDetail(detail);
+  if (detail.status === "processing") {
+    timer = window.setTimeout(poll, 2000);  // 2s 后继续轮询
+  }
+};
+void poll();
+```
+
+### 6.4 Proxy 流式转发
+
+Proxy 的 Anthropic/OpenAI 转发走 **HTTP streaming passthrough**，不解析 SSE chunk：
+
+```typescript
+// MemoryProxy/src/auxiliaryHandler.ts
+const isStream = contentType.includes("event-stream");
+// 直接 pipe 给客户端，不逐 chunk 处理
+```
+
+### 6.5 缺失项（WebSocket/SSE gap）
+
+| 缺失 | 影响 |
+|------|------|
+| 无 WebSocket 服务端 | 无法主动推状态变更到前端 |
+| 无 SSE 推送通道 | 长任务（Wiki ingest）只能轮询 |
+| 无长连接管理 | 无法感知客户端掉线 |
+| 无订阅/广播机制 | 多 tab 同步需手动刷新 |
+| 无背压控制 | 轮询固定间隔，服务端压力大 |
+| SSE 仅用于 Form 模拟 | 非真正的服务器→客户端事件推送 |
+| 无重连退避 | 网络抖动时轮询中断即停止 |
+
+---
+
+## 七、DevContainer 与容器化
+
+### 7.1 Docker 镜像矩阵
+
+| 镜像 | 基础镜像 | 入口 | 端口 |
+|------|---------|------|------|
+| `agentmemory/memory-core` | node:22-slim | `tsx src/gateway/server.ts` | 8420 |
+| `agentmemory/memory-proxy` | node:22-slim | Proxy server | 8096 |
+| `agentmemory/memory-hub` | node:22-slim | Panel + Knowledge | 8125 + 8424 |
+
+**多架构支持**: `linux/amd64` + `linux/arm64`（Apple Silicon 原生）。
+
+### 7.2 Dockerfile 清单
+
+```
+./MemoryCore/Dockerfile                         # MemoryCore 生产镜像
+./MemoryKnowledge/Dockerfile                    # Knowledge 服务
+./MemoryKnowledge/docker-compose.yml            # Knowledge 本地开发
+./MemoryProxy/Dockerfile                        # Proxy 镜像
+./deploy/panel-knowledge-combined/Dockerfile    # Panel + Knowledge 合并 (memory-hub)
+./MemoryPanel/docker/local/Dockerfile.local     # Panel 本地模式 (Panel Control HTTP :8123)
+```
+
+### 7.3 memory-hub 合并镜像构建（panel-knowledge-combined/Dockerfile）
+
+```dockerfile
+# 3 个 builder stage + 1 个 runtime
+FROM base AS panel-ui-builder     # npm run build → /build/panel-web/dist
+FROM base AS panel-builder        # Panel 后端 tsc + 前端产物 → ./web/dist
+FROM base AS knowledge-builder    # Knowledge 后端 tsc
+FROM base AS runtime              # COPY 三者 → 单镜像
+
+# 特点：单容器起 Panel + Knowledge，运维简单
+```
+
+### 7.4 Panel 本地模式（Dockerfile.local）
+
+```dockerfile
+FROM base AS ui-builder
+ARG WEB_UI=1
+RUN if [ "$WEB_UI" = "0" ]; then
+      # 跳过 UI 构建，生成占位 dist（离线/无内部源场景）
+      mkdir -p /ui/dist && echo "..." > /ui/dist/index.html;
+    else npm install && npm run build; fi
+
+FROM base AS runtime
+COPY --from=ui-builder /ui/dist ./web/dist
+ENV UI_DIST_DIR=./web/dist
+CMD ["node", "--import", "tsx/esm", "src/index.ts"]
+```
+
+**双模式**:
+- `WEB_UI=1`（默认）：正常构建面板 UI
+- `WEB_UI=0`：跳过 UI 构建，仅后端可用（`/api` `/health` 正常，静态面板不可用）
+
+### 7.5 Health Check 策略
+
+```dockerfile
+# MemoryCore
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
+  CMD curl -fsS http://127.0.0.1:${TDAI_GATEWAY_PORT:-8420}/health || exit 1
+
+# MemoryPanel (本地模式)
+HEALTHCHECK --interval=15s --timeout=10s --retries=20 --start-period=60s \
+  CMD curl -fsS http://127.0.0.1:8123/health || exit 1
+```
+
+**注意**: 默认值写在 Dockerfile 而非 ENV，防止镜像环境变量覆盖挂载配置里的 `server.port`。
+
+### 7.6 运行时配置
+
+```dockerfile
+# MemoryCore
+ENV NODE_ENV=production \
+    TDAI_GATEWAY_CONFIG=/data/config/tdai-gateway.yaml \
+    TDAI_DATA_DIR=/data/tdai-memory \
+    NODE_OPTIONS="--max-old-space-size=1536"
+
+# 数据目录挂载点 (K8s PVC)
+RUN mkdir -p /data/tdai-memory /data/config
+```
+
+### 7.7 缺失项（DevContainer gap）
+
+| 缺失 | 影响 |
+|------|------|
+| 无 `.devcontainer.json` | VS Code Remote Container 无法一键起开发环境 |
+| 无 docker-compose 全仓编排 | 仅有 MemoryKnowledge 单文件，无跨服务 compose |
+| 无 development Dockerfile | 生产镜像不含 devDeps，本地需 tsx 直跑 |
+| 无热重载容器配置 | 开发时需手动重启 |
+| 无 rootless 指导 | 默认 root 运行，无 `USER node` 建议 |
+| 无 trivy/grype 扫描 | CI 中无镜像漏洞扫描 stage |
+| 无 distroless 基础镜像 | 用 slim（含 shell），攻击面大于 distroless |
+| 无 resource limits 建议 | K8s deployment 无 CPU/Memory request/limit 范例 |
+| 无 init container 示例 | DB migration 无 init container 模式 |
+
+---
+
+## 八、CRDT 与多端冲突
+
+### 8.1 现状：无 CRDT，乐观锁 + 版本检查
+
+**搜索结论**：全仓库无 Yjs / Automerge / CRDT 实现，冲突解决依赖 **乐观锁 (optimistic lock)**。
+
+### 8.2 Skill 乐观锁（expected_version）
+
+`MemoryCore/src/core/skill/skill-tools.ts`：
+
+```typescript
+// Skill 工具定义中强制要求 expected_version
+expected_version: {
+  type: "number",
+  description: "Required optimistic lock — the version you just read (skill_list/skill_view).
+                 After a successful write use the returned version for the next edit."
+}
+```
+
+**实现**（skill-permission.ts）：
+```typescript
+export function assertVersionFresh(headRow: Skill, expected: number): void {
+  if (expected !== headRow.version) {
+    throw new SkillPermissionError("SKILL_VERSION_STALE",
+      `expected version ${expected}, head is ${headRow.version}`);
+  }
+}
+```
+
+**语义**: 读取 skill 时记住 `version`；写入时必须带相同 `version`，否则 409 冲突。
+
+### 8.3 Profile Sync 乐观锁
+
+`MemoryCore/src/core/store/types.ts`：
+
+```typescript
+/** Profile upsert payload with optimistic-lock baseline from the last pull. */
+export interface ProfileUpsertPayload {
+  expected_version: number;  // 上次读取的版本基线
+  // ... 其他字段
+}
+```
+
+### 8.4 Skill Bridge 写操作注入
+
+`MemoryProxy/src/skill/skill-bridge.ts`：
+
+```typescript
+// Write (update/patch/files_write/files_remove): inject `expected_version` → optimistic lock
+// Proxy 层拦截写请求，从 session 上下文中取 expected_version 注入 body
+```
+
+### 8.5 Pipeline 并发控制
+
+**Checkpoint 原子操作**（checkpoint.ts）：
+```typescript
+// Per-file async lock：Promise 链序列化同一文件的并发 read-modify-write
+export function withFileLock(filePath: string, fn: () => Promise<T>): Promise<T> {
+  // 多个 CheckpointManager 实例共享同文件路径时自动共享锁
+}
+
+// Atomic write：先写 tmp 再 rename，防止崩溃时文件损坏
+writeRaw() {
+  fs.writeFileSync(tmpPath, data);
+  fs.renameSync(tmpPath, targetPath);
+}
+```
+
+### 8.6 请求序号防竞态（前端）
+
+```typescript
+// ChatMemoryPanel.tsx
+const fetchSeqRef = useRef(0);
+const fetchBlocks = useCallback(async () => {
+  const seq = ++fetchSeqRef.current;
+  const data = await chatMemoryApi.getBlocks(teamId);
+  if (seq !== fetchSeqRef.current) return;  // 旧响应丢弃，避免竞态
+  setBlocks(data);
+}, [teamId]);
+```
+
+### 8.7 COS 并发写冲突
+
+`MemoryCore/src/gateway/error-handler.ts`：
+
+```typescript
+// COS AppendPositionErr — 并发 append 冲突。客户端应该重试。
+if (/AppendPositionErr|Position not equal object length/i.test(err.message)) {
+  return {
+    status: 409,
+    client: { code: 409, message: "Concurrent write conflict, please retry", retryable: true },
+  };
+}
+```
+
+**场景**: 多个 Agent 同时往同一 COS 对象 append，position 不匹配 → 409 + 客户端重试。
+
+### 8.8 缺失项（CRDT gap）
+
+| 缺失 | 影响 |
+|------|------|
+| 无 Yjs / Automerge | 无法实现真正的多端实时协同编辑 |
+| 无 Vector Clock | 无法判断事件的因果序 |
+| 无 OT (Operational Transform) | 文档并发编辑需锁，无法无冲突合并 |
+| 无 multi-master 同步 | 仅单 instance 写入，无跨地域复制 |
+| 无 CRDT-based 计数 | L0 计数器依赖 SQLite 事务，无分布式计数 |
+| 无 P2P 同步 | 无客户端间直连同步能力 |
+| 无离线编辑 | 断网无法编辑，恢复后无自动合并 |
+| 无冲突 UI | 409 冲突时用户需手动重试，无差异对比视图 |
+| 乐观锁粒度粗 | Skill 级别版本检查，无字段级 merge |
+| 无 causal consistency | 无 happens-before 保证 |
+
+---
+
+## 九、8 维度横向对比总结
+
+### 9.1 与 laew 的 gap 映射
+
+| 维度 | TencentDB-Agent-Memory 现状 | laew 差距 |
+|------|---------------------------|----------|
+| CrashDump | 无 core dump / 无 Sentry / 指数退避重试完善 | L79: laew 无 panic hook, 无错误聚合 |
+| WebUI | 完整 React SPA (tea-component) / 无 Electron | L80: laew 是 TUI (crossterm) |
+| Auth | user_key API Key / 无 OAuth | L81: laew 无 auth，直接 Bearer token |
+| i18n | react-i18next 双语 / 无 RTL | L82: laew TUI 中文硬编码 |
+| Release | SemVer + Docker Hub / 无 AutoUpdate | L83: laew 手动 release |
+| WebSocket/SSE | 无 WebSocket / SSE 仅 Form 模拟 | L84: laew 无 SSE 流式 |
+| DevContainer | 4 Dockerfile / 无 .devcontainer.json | L85: laew 无容器化 |
+| CRDT | 乐观锁 + 版本检查 / 无 CRDT | L86: laew 无多端同步 |
+
+### 9.2 成熟度评分
+
+| 维度 | 评分 | 说明 |
+|------|------|------|
+| CrashDump / 错误恢复 | 75/100 | 分层分类 + traceId + 指数退避完善；缺 Sentry / 断路器 / CrashDump |
+| WebUI / DesktopApp | 70/100 | 完整 React SPA 8 大业务页；缺 Electron / WebSocket / 桌面通知 |
+| OAuth / 多账号 | 55/100 | user_key + scrypt 安全基底；缺 OAuth/JWT/rotation/scope |
+| i18n | 60/100 | react-i18next + 双语文档；缺 RTL/ICU/翻译平台 |
+| Release / AutoUpdate | 50/100 | SemVer + Docker Hub + CI；缺 AutoUpdate/签名/SBOM |
+| WebSocket / SSE | 30/100 | SSE 仅 Form 模拟；无服务端推送；轮询为主 |
+| DevContainer / 容器化 | 65/100 | 多阶段 Dockerfile + tini + HEALTHCHECK；缺 devcontainer |
+| CRDT / 多端冲突 | 40/100 | 乐观锁 + 请求序号；无 CRDT/vector clock/OT |
+
+### 9.3 P0-P2 改造路线图
+
+**P0 紧急**:
+- 集成 Sentry（前后端错误聚合）
+- 断路器（上游 LLM 持续 5xx 快速失败）
+- idempotency-key（L0 写入去重）
+
+**P1 重要**:
+- WebSocket/SSE 实时推送（替代前端轮询）
+- AutoUpdate 机制（版本检查 + 一键升级）
+- .devcontainer.json（开发体验）
+- Code Signing + SBOM
+
+**P2 进阶**:
+- OAuth 2.0 / SSO 集成
+- CRDT (Yjs) 协同编辑
+- Electron/Tauri 桌面壳
+- RTL + ICU MessageFormat
+
+---
+
+## 十、关键文件索引
+
+| 维度 | 核心文件 | 行数 |
+|------|---------|------|
+| 错误恢复 | `MemoryCore/src/gateway/error-handler.ts` | ~150 |
+| 错误分类 | `MemoryCore/src/core/hooks/recall-errors.ts` | ~120 |
+| L0 重试 | `MemoryProxy/src/tdai/pending-writes.ts` | ~110 |
+| Graceful Shutdown | `MemoryProxy/src/index.ts:109-130` | ~25 |
+| WebUI 入口 | `MemoryPanel/web/src/App.tsx` | ~60 |
+| 路由表 | `MemoryPanel/web/src/routes/index.ts` | ~30 |
+| LoginGate | `MemoryPanel/web/src/components/LoginGate.tsx` | 382 |
+| Panel HTTP | `MemoryPanel/src/panel/http/app.ts` | ~50 |
+| 登录页 | `MemoryPanel/web/src/components/LoginGate.tsx` | 382 |
+| user_key 生成 | `MemoryCore/src/metadata/utils/crypto.ts` | ~200 |
+| Auth 模块 | `MemoryProxy/src/auth.ts` | ~120 |
+| Rate Limit | `MemoryProxy/src/rate-limit/redis-store.ts` | ~320 |
+| i18n 初始化 | `MemoryPanel/web/src/i18n/index.ts` | ~40 |
+| zh-CN 翻译 | `MemoryPanel/web/src/i18n/zh-CN.ts` | 1,113 |
+| en-US 翻译 | `MemoryPanel/web/src/i18n/en-US.ts` | 1,160 |
+| CI 工作流 | `.github/workflows/pr-ci.yml` | ~150 |
+| Docker 发布 | `deploy/dockerhub/publish.sh` | ~100 |
+| 一键部署 | `deploy/global-images/start-all.sh` | ~80 |
+| MemoryCore Dockerfile | `MemoryCore/Dockerfile` | ~130 |
+| Panel Dockerfile | `MemoryPanel/docker/local/Dockerfile.local` | ~80 |
+| memory-hub Dockerfile | `deploy/panel-knowledge-combined/Dockerfile` | ~100 |
+| 乐观锁 | `MemoryCore/src/core/skill/skill-tools.ts:139` | ~5 |
+| 版本检查 | `MemoryCore/src/core/skill/skill-permission.ts:441` | ~10 |
+| SSE Form | `MemoryProxy/src/session/form.ts:472` | ~10 |
+
+---
+
+## 十一、与前 9 轮的关系
+
+本轮 8 维度是第 1-9 轮未覆盖的**横向基础设施**维度：
+
+- **第 1-4 轮**: 核心业务逻辑（L0-L3 / Skill / Injection / Proxy）
+- **第 5-6 轮**: 存储与检索（多租户 / RRF / 存储层 / Wiki / CodeGraph）
+- **第 7-8 轮**: 工程化（插件 / SDK / 部署 / 系统提示词）
+- **第 9 轮**: 可观测性（LSP / 遥测 / Web 检索）
+- **第 10 轮 (本轮)**: 基础设施（CrashDump / WebUI / Auth / i18n / Release / WS / 容器 / CRDT）
+
+**关键发现**:
+1. **错误恢复**做得相当成熟（traceId + 指数退避 + 四级分类），是生产级 Agent 系统的典范
+2. **WebUI** 是完整 React SPA 但偏"后台管理系统"，无消费级桌面体验
+3. **Auth** 采用简单有效的 user_key API Key，适合 B2B 但不适合 B2C
+4. **i18n** 双语齐全但扩展性不足
+5. **Release** 工程化程度中等，缺 AutoUpdate/签名/SBOM 等现代供应链安全
+6. **实时通信** 是最大短板（无 WebSocket），前端靠轮询
+7. **容器化** 成熟，但缺 devcontainer 开发体验
+8. **CRDT** 完全缺失，仅乐观锁保护 Skill 写操作

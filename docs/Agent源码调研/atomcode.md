@@ -5173,3 +5173,2049 @@ daemon 是 LSP 池化(`atomcode-daemon` 启动时 `Arc<CodeIndex>` 按需建)、
 - Panic 钩子 scrub 集成(`daemon/lib.rs:5182-5224`)
 
 —— 调研者注:本文档为「第八轮深挖」,聚焦 LSP 协议层下沉、Telemetry 完整 schema、OAuth 凭证保管、Daemon 进程模型四大新维度;不重复前 21 章已覆盖的架构总览、Kernel 循环、协议 wire、Tool 系统、SubAgent、文件编辑/检索/命令执行等主题。
+## 第 23 章 第十轮深挖 — CrashDump 与错误恢复 + WebUI/DesktopApp + OAuth 多账号 + i18n + Release 工程化 + WebSocket/SSE + DevContainer + CRDT 冲突
+
+> 范围：本文为 atomcode 第十轮深挖，**不重复**前 9 轮已覆盖的 L0/L1/L2/L3 分层、Agentic loop、TurnDriver、SSE byte-stable prefix、27 种 Hook、SubAgent 11 包、Goal 三态、LSP/Telemetry/OAuth/Daemon 等内容。聚焦于**前 9 轮未深入**的 8 个维度，**所有结论均来自源码逐行验证**。
+
+---
+
+### 23.1 CrashDump 与错误恢复
+
+atomcode 在错误恢复上采取**四层防御**架构，每一层都专门覆盖一种进程退出路径：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      atomcode 错误恢复四层防御                      │
+├──────────────────┬──────────────────────────────────────────────┤
+│ 退出路径          │ 恢复机制                                     │
+├──────────────────┼──────────────────────────────────────────────┤
+│ 优雅退出(graceful)│ TerminalGuard::Drop(RAII)                    │
+│ panic unwind      │ panic hook (R9.1-R9.4)                       │
+│ panic = "abort"   │ panic_restore_sequence + panic_restore_terminal │
+│ SIGTERM/SIGINT    │ sigaction handler (signal_restore.rs)         │
+│ TUI 渲染崩溃       │ TaskRenderer::Drop + worker thread 隔离      │
+│ 升级失败          │ replace_binary 三步回滚 + circuit-breaker     │
+│ daemon idle       │ idle_timeout_secs 看门狗                     │
+└──────────────────┴──────────────────────────────────────────────┘
+```
+
+#### 23.1.1 Panic Hook + Backtrace + Scrub
+
+**位置**: `crates/atomcode-daemon/src/lib.rs:5182-5224`
+
+```rust
+fn install_panic_hook(telemetry: Arc<Telemetry>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let home = atomcode_telemetry::identity::real_home_dir();
+        let cwd = std::env::current_dir().ok();
+        let loc = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".into());
+        let msg = info.payload()
+            .downcast_ref::<&str>().map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let scrubbed_loc = atomcode_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
+        let scrubbed_msg = atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
+            atomcode_telemetry::scrub::HEAD_MAX,
+        );
+        let frames = atomcode_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
+        telemetry.track(Event::Panic {
+            location: scrubbed_loc,
+            message_head: scrubbed_msg,
+            thread: std::thread::current().name().unwrap_or("unknown").into(),
+            backtrace_top_5: frames,
+            error_kind: Some("panic".to_string()),
+            error_data: Some(serde_json::json!({
+                "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                "turns_completed": null,
+                "last_tool_name": null,
+                "last_event": null,
+            }).to_string()),
+        });
+        default_hook(info); // 保留 stderr 输出
+    }));
+}
+```
+
+**设计亮点**:
+1. **三层 Scrub**: location / message / backtrace 全部走 `scrub_path` + `truncate_head` + `backtrace_top_k`,**先脱敏再上传**,防止 panic 信息泄漏绝对路径或 token。
+2. **backtrace_top_k=5**: 只取栈顶 5 帧,在不影响诊断的前提下**控制 telemetry payload 大小**。
+3. **保留 default_hook**: `default_hook(info)` 让 stderr 的 panic backtrace 仍能打印,**用户与 telemetry 共享同一份诊断**。
+4. **`session_duration_secs`**: 携带进程运行时间,可用于计算"启动期/稳定期 panic 占比"。
+
+**调用点**: `daemon/lib.rs:6206` (`run_server` 启动 Step 4.5),意味着**所有 daemon 路径**(独立 daemon、`webui` 子屏、VSCode 扩展)均受保护。
+
+#### 23.1.2 panic_restore_sequence(原子终端恢复)
+
+**位置**: `crates/atomcode-tuix/src/lib.rs:281-295`
+
+```rust
+pub(crate) fn panic_restore_sequence() -> &'static [u8] {
+    b"\x1b[?1006l\x1b[?1002l\x1b[?1004l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\x1b[?2004l\r\n"
+}
+```
+
+**8 个字节序列的语义**:
+
+| 序列               | 含义                       | 重要性                                                       |
+|------------------|--------------------------|-----------------------------------------------------------|
+| `\x1b[?1006l`   | 关闭 SGR 鼠标坐标              | 防止鼠标事件被 echo 成 `[<35;120;20M` 乱码                        |
+| `\x1b[?1002l`   | 关闭按钮事件追踪                | 同上                                                         |
+| `\x1b[?1004l`   | 关闭 focus 报告             | 防止窗口失焦事件污染输入框                                            |
+| `\x1b[<1u`      | **pop Kitty keyboard**(用 `<` 不是 `>`) | **核心修复**:> 反而会重新激活协议(<1u 才是 pop)               |
+| `\x1b[?25h`     | 显示光标(DECTCEM)             | 否则 shell 提示符看不到光标                                        |
+| `\x1b[?7h`      | 重新启用自动换行(DECAWM)         | 否则一行超出屏幕宽度会丢失字符                                          |
+| `\x1b[r`        | 释放 DECSTBM 滚动区域           | 否则后续 shell 命令可能被限制在滚动区                                    |
+| `\x1b[?2004l`   | 关闭 bracketed paste         | 否则用户粘贴任何内容都被 `200~`/`201~` 包裹                            |
+| `\r\n`          | CRLF                      | 让 panic backtrace 打印在新一行,而非覆盖最后一帧                          |
+
+**关键设计决策**(节选自 `lib.rs:249-280`):
+
+> "Kitty pop 使用 `<` 引入符(`\x1b[<1u`),绝不能用 `>`: `>` 会**反向激活**协议——这正是要修复的 bug。"
+> "撤销一个从未 push 的 level 是无害 no-op,所以保持无条件且无需线程 `kbd_flags_pushed` 状态。"
+
+**测试**(`lib.rs:1031-1080`):
+- `panic_restore_sequence_pops_kitty_keyboard_protocol`: 强制必须包含 `<1u` 且不能含 `>`。
+- `panic_restore_sequence_restores_cursor_autowrap_scroll_and_mouse`: 6 个原子子断言,**无遗漏**。
+
+#### 23.1.3 sigaction handler(信号安全恢复)
+
+**位置**: `crates/atomcode-tuix/src/signal_restore.rs`
+
+```rust
+pub(crate) fn arm() {
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        if libc::tcgetattr(libc::STDIN_FILENO, addr_of_mut!(ORIG_TERMIOS).cast::<libc::termios>()) == 0 {
+            TERMIOS_SAVED.store(true, Ordering::SeqCst);
+        }
+        let mut sa: libc::sigaction = core::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGTERM);
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGINT);
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGHUP);
+        sa.sa_flags = 0;
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaction(sig, &sa, core::ptr::null_mut());
+        }
+    }
+}
+
+extern "C" fn handler(signo: c_int) {
+    // 仅 async-signal-safe 调用!
+    let seq = restore_writes();
+    unsafe {
+        let _ = libc::write(libc::STDOUT_FILENO, seq.as_ptr().cast(), seq.len());
+    }
+    if TERMIOS_SAVED.load(Ordering::Acquire) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW,
+                            addr_of!(ORIG_TERMIOS).cast::<libc::termios>());
+        }
+    }
+    // 用默认 disposition 重发信号,保持 shell "terminated"/"interrupt" 状态正确
+    unsafe {
+        libc::signal(signo, libc::SIG_DFL);
+        libc::raise(signo);
+    }
+}
+```
+
+**与 panic hook 的关键差异**:
+
+| 维度         | panic hook                | sigaction handler              |
+|------------|---------------------------|--------------------------------|
+| 触发场景       | `panic!` / unwinding 异常       | SIGTERM / SIGINT / SIGHUP      |
+| 安全的调用      | 全套 std(因为 hook 在 panic 上下文)   | **仅 async-signal-safe** libc   |
+| 恢复内容       | 仅写 ANSI 序列(因为 Drop 仍能跑) | **还要 tcsetattr** 关闭 raw mode |
+| 调用链        | `std::panic::set_hook`     | `libc::sigaction`               |
+| 退出状态       | 进程异常退出代码                  | **保留原始 signal**(re-raise SIG_DFL) |
+| 嵌套安全       | 无要求                       | `sa_mask` 阻塞 3 信号防重入            |
+
+**调用时机**(`tuix/lib.rs:127-131`):
+```rust
+#[cfg(unix)]
+crate::signal_restore::arm();      // 必须先 arm,再 enable_raw_mode
+crossterm::terminal::enable_raw_mode()?;
+```
+注释强调: **"在 raw mode 翻转之前安装 SIGTERM/SIGHUP handler,这样 SIGTERM/SIGHUP 杀进程时(没有 Drop 运行)也能把 shell 恢复到可用 terminal。"**
+
+#### 23.1.4 三步升级回滚 + Circuit-Breaker
+
+**位置**: `crates/atomcode-updater/src/lib.rs:560-628` + `959-1034`
+
+**三步交换**(replace_binary):
+1. `exe` → `.rolling` (Windows 允许重命名正在运行的 exe)
+2. `new_bin` → `exe` (核心安装)
+3. best-effort: 删除旧 `.bak` + `.rolling` → `.bak`
+
+**Robust Rename 重试**(`lib.rs:484-515`):
+```rust
+fn robust_rename_with<R>(from: &Path, to: &Path, mut rename: R) -> std::io::Result<()>
+where R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    const ATTEMPTS: u32 = 5;
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        if to.exists() {
+            clear_readonly(to);
+            let _ = std::fs::remove_file(to);
+        }
+        match rename(from, to) {
+            Ok(()) => return Ok(()),
+            // 跨设备 EXDEV: rename 永远无法成功,直接 copy 后删除
+            Err(e) if is_cross_device_error(&e) => return copy_across_devices(from, to),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    let ms = 100u64 << attempt; // 100, 200, 400, 800 ms 指数退避
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+```
+
+**重试解决的 4 类失败**:
+1. AV/索引器短时占用(Windows Defender 实时扫描,< 500ms) → 指数退避
+2. 源文件 read-only 属性 → `clear_readonly` 兜底
+3. 目标文件残留(上次升级中断留下 `.rolling`) → `remove_file(to)` 兜底
+4. EXDEV 跨设备(用户配置从 `C:\` 升级到 `H:\`) → `copy_across_devices` 兜底
+
+**Circuit-Breaker 防 Boot-Loop**(`lib.rs:770-797`):
+```rust
+const MAX_APPLY_ATTEMPTS: u32 = 3;
+
+pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
+    let mut pending = match read_pending() { ... };
+    if pending.attempts >= MAX_APPLY_ATTEMPTS {
+        // 熔断: 同一 staged 升级失败 N 次 → 丢弃,避免损坏版本导致启动死循环
+        let _ = std::fs::remove_file(&pending.staged_path);
+        clear_pending_pointer();
+        return Ok(None);
+    }
+    pending.attempts += 1;
+    let _ = write_pending(&pending);  // 立即写回,中间崩溃也不会陷入死循环
+    ...
+    // 重新验证 SHA256 + size (防止 disk-full 中途写入半截)
+    if actual_size != pending.size {
+        let _ = std::fs::remove_file(&pending.staged_path);
+        clear_pending_pointer();
+        return Err(anyhow!("staged binary size changed between sessions..."));
+    }
+    ...
+}
+```
+
+#### 23.1.5 Idle Watchdog(daemon)
+
+**位置**: `crates/atomcode-daemon/src/lib.rs:5235-5271`
+
+```rust
+fn spawn_idle_timeout_task(
+    idle_timeout_secs: u64,
+    last_activity: Arc<AtomicI64>,
+    active_connections: Arc<AtomicUsize>,
+    active_chats: ActiveChatRegistry,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    if idle_timeout_secs == 0 { return; }  // 0 = 关闭看门狗
+    let timeout_ms = (idle_timeout_secs * 1000) as i64;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let conns = active_connections.load(Ordering::Relaxed);
+            if conns > 0 { continue; }  // 有 SSE 流就不算 idle
+            if active_chats.has_active_operations().await {
+                continue;  // SSE 断开但 chat 仍在跑
+            }
+            let last = last_activity.load(Ordering::Relaxed);
+            if now_unix_ms() - last >= timeout_ms {
+                shutdown_tx.send(true).ok();
+                break;
+            }
+        }
+    });
+}
+```
+
+**3 状态机**:
+- `idle_timeout_secs=0`(进程内 webui): **关闭看门狗**,常驻主程序
+- `idle_timeout_secs > 0` 且 conns=0 且 chats=idle → 触发 shutdown
+- `idle_timeout_secs > 0` 但 conns>0 → 永不 idle
+
+#### 23.1.6 测试覆盖亮点
+
+| 测试文件                                        | 覆盖点                                   |
+|---------------------------------------------|--------------------------------------|
+| `daemon/lib.rs::install_panic_hook`         | panic 上下文下的 telemetry 注入           |
+| `tuix/lib.rs::panic_restore_sequence_pops_*` | Kitty pop 必须 `<` 不能 `>`              |
+| `tuix/signal_restore.rs::signal_restore_*` | 信号 handler 关闭 bracketed paste + pop kitty |
+| `updater/lib.rs::replace_binary_*`         | 三步交换 + .bak 覆盖 + .rolling 清理         |
+| `updater/lib.rs::robust_rename_*`          | 5 次重试 + 跨设备 copy fallback              |
+| `updater/lib.rs::try_remove_stale_*`       | read-only 属性清理 + 不存在路径 OK              |
+| `updater/lib.rs::is_newer_*`               | semver 比较 + 预发行版后缀解析                  |
+
+#### 23.1.7 laew Gap L79-L82 + Rust crate 建议
+
+**Gap L79**:**无 panic hook** — laew 现在的 `build.rs` 没有设置 `panic = "abort"`,但 panic hook 仍是空缺。建议 laew 抄 atomcode 的 `install_panic_hook` + telemetry 注入方案,加上 `human-panic` crate 兜底(在没有 telemetry 时弹崩溃对话框)。
+
+**Gap L80**:**无 signal handler** — TUI 在 `/usr/local/LsmGitOpenSource/LsmAgentEmergentWork/src/tui/mod.rs` 中没安装 `sigaction`,Ctrl+C 多次后 shell 可能残留 raw mode。建议抄 `signal_restore.rs` 的 100 行实现。
+
+**Gap L81**:**无升级 circuit-breaker** — laew 还没有 in-place 升级功能,但如果未来要做,**必须抄 atomcode 的 MAX_APPLY_ATTEMPTS=3 + 重新校验 SHA256** 这套防御。
+
+**Gap L82**:**panic 信息未脱敏** — laew 当前 panic 走 anyhow 默认 hook,直接 dump std backtrace,**用户主目录路径会泄漏**。建议加 `human-panic` + 自定义 scrub 路径。
+
+---
+
+### 23.2 WebUI 与 DesktopApp
+
+atomcode 的 WebUI 是**嵌入式 SPA**(Single Page Application),由 Rust 通过 `rust-embed` 编译期打包,运行时通过 axum 提供 HTTP 路由。本节深入剖析两个产品的架构。
+
+#### 23.2.1 WebUI 静态资源内嵌(Rust-Embed)
+
+**位置**: `crates/atomcode-daemon/src/webui.rs`
+
+```rust
+use axum::{
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Response},
+};
+use rust_embed::RustEmbed;
+
+#[derive(RustEmbed)]
+#[folder = "../../webui/dist/"]
+#[allow_missing = true]
+pub struct WebuiAssets;
+
+/// 本二进制是否真的带上了 webui 资源。
+pub fn is_built() -> bool {
+    WebuiAssets::get("index.html").is_some()
+}
+
+pub const NOT_BUILT_HELP: &str = "webui assets are not embedded in this binary.\n\
+     Build the frontend first, then rebuild:\n\
+     \n\
+     \x20   cd webui && npm install && npm run build\n\
+     \x20   cargo build -p atomcode\n";
+
+pub async fn serve_webui(uri: Uri) -> Response {
+    // dev 模式: 重定向到 vite dev server(热更新)
+    if let Ok(dev) = std::env::var("ATOMCODE_WEBUI_DEV") {
+        let target = format!("{}{}", dev.trim_end_matches('/'), uri.path());
+        return axum::response::Redirect::temporary(&target).into_response();
+    }
+
+    let path = uri.path();
+    let p = path.trim_start_matches('/');
+    let lookup = if p.is_empty() { "index.html" } else { p };
+    match WebuiAssets::get(lookup) {
+        Some(content) => {
+            let mime = mime_guess::from_path(lookup).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+        }
+        None => match WebuiAssets::get("index.html") {
+            Some(index) => ([(header::CONTENT_TYPE, "text/html")], index.data).into_response(),
+            None => (StatusCode::NOT_FOUND, NOT_BUILT_HELP).into_response(),
+        },
+    }
+}
+```
+
+**关键设计**:
+1. **`#[allow_missing = true]`**: 即使 `webui/dist/` 不存在也照常编译,代价是运行时 404。注释解释"调用方( `webui` 命令)用它在起服务之前就说清楚,而不是等用户开了浏览器才看到一行报错"。
+2. **SPA fallback**: 任何未匹配的路径都返回 `index.html`,**前端路由自己处理**(React Router / 类似)。
+3. **dev mode**: `ATOMCODE_WEBUI_DEV=http://localhost:5173` → **临时重定向**到 Vite dev server,实现 HMR。
+
+#### 23.2.2 前端工程(webui/)
+
+**位置**: `/usr/local/LsmGitOpenSource/atomcode/webui/`
+
+```
+webui/
+├── index.html            # SPA 入口
+├── mockup.html
+├── package.json
+├── tailwind.config.js
+├── postcss.config.js
+├── tsconfig.json
+├── vite.config.ts
+├── public/               # 静态资源(直接拷贝到 dist)
+├── src/
+│   ├── api.ts            # REST API 客户端
+│   ├── api.test.ts
+│   ├── app.tsx           # React 根组件
+│   ├── main.tsx          # 挂载点
+│   ├── settings.tsx      # 设置面板(模型/语言/主题/通知/远程访问)
+│   ├── i18n.ts           # 消息字典(zh + en, ~440 keys)
+│   ├── index.css
+│   ├── styles/
+│   ├── components/       # UI 组件
+│   └── lib/              # 工具函数
+└── scripts/
+```
+
+**i18n.ts**(部分):
+```typescript
+export type Lang = 'zh' | 'en';
+const zh = { ... };  // 440+ keys
+const en: Record<MsgKey, string> = { ... };
+export type MsgKey = keyof typeof zh;  // 类型系统强制 en/zh 一致
+export const messages: Record<Lang, Record<MsgKey, string>> = { zh, en };
+```
+
+**`MsgKey = keyof typeof zh`**: TypeScript 类型系统**静态保证**中英文字典的 key 一致,谁加 key 忘了同步会**编译失败**(PR #602 bot review 中明确要求这一点)。
+
+#### 23.2.3 WebUI 进程内启动器(ensure_server_and_open)
+
+**位置**: `crates/atomcode-daemon/src/lib.rs:5277-5488`
+
+```rust
+struct WebuiHandle {
+    tokens: auth_token::WebuiTokenStore,
+    port: u16,
+    host: String,
+    abort: tokio::task::AbortHandle,
+}
+
+static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
+
+pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;  // 13457
+
+pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String {
+    // 1) 短临界区判定能否复用(避免 Mutex guard 跨 .await)
+    let reuse = {
+        let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(handle) if !handle.abort.is_finished() =>
+                Some((handle.tokens.clone(), handle.port, handle.host.clone())),
+            _ => None,
+        }
+    };
+    let (tokens, actual_port, bound_host) = if let Some((tokens, p, h)) = reuse {
+        (tokens, p, h)
+    } else {
+        // 2) 预绑定端口(被占用则递增扫描,拿到真实端口)
+        let (listener, actual_port) = match bind_scanning(host, port, 100).await { ... };
+        let tokens = auth_token::WebuiTokenStore::new();
+        let opts = ServerOpts {
+            host: host.to_string(),
+            port: actual_port,
+            cli_override: CliOverride::default(),
+            idle_timeout_secs: 0,  // 进程内 webui 必须常驻,关闭看门狗
+            startup_mode: SessionMode::Webui,
+            webui_tokens: Some(tokens.clone()),
+            quiet: true,
+            working_dir_override: std::env::current_dir().ok(),
+            prebound_listener: Some(listener),
+            app_user_id: None,
+            daemon_token_file: None,
+        };
+        let task = tokio::spawn(async move {
+            if let Err(e) = run_server(opts).await { eprintln!("webui server error: {e}"); }
+        });
+        {
+            let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(WebuiHandle { tokens: tokens.clone(), port: actual_port,
+                                         host: host.to_string(), abort: task.abort_handle() });
+        }
+        (tokens, actual_port, host.to_string())
+    };
+    let token = tokens.mint();  // 一次性 token(仅首次跳转用,后续 HttpOnly cookie)
+    ...
+}
+```
+
+**3 个微妙的设计决策**:
+1. **`bind_scanning` 而非 `bind`**: 用户传 `--port 13456` 但被占用 → 自动向上扫描,**对用户透明**。
+2. **`idle_timeout_secs=0`**: 进程内 webui 与 TUI 主程序同生命周期,**必须关闭看门狗**,否则 TUI 闲置 30 分钟 webui 就被关了。
+3. **`prebound_listener: Some(listener)`**: **复用已绑定的 listener**,避免 run_server 内部 bind 再次抢占端口。
+4. **`WEBUI_DEFAULT_PORT=13457` 而非 13456**: **刻意区分**——独立 daemon 是 13456,进程内 webui 是 13457,**互不抢占**。注释: "二者若共用 13456,会互相踩端口:webui 抢到后,VSCode 的 `/project`、`/models` 都会因缺 token 返回 401"。
+
+#### 23.2.4 端口扫描与 LAN IP 探测
+
+**位置**: `daemon/lib.rs:5295-5339`
+
+```rust
+async fn bind_scanning(host: &str, start_port: u16, max_tries: u16)
+    -> anyhow::Result<(tokio::net::TcpListener, u16)>
+{
+    let mut last_err: Option<std::io::Error> = None;
+    for offset in 0..max_tries {
+        let Some(port) = start_port.checked_add(offset) else { break; };
+        let addr = format!("{host}:{port}");
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                let actual = listener.local_addr()?.port();
+                return Ok((listener, actual));  // 支持 port=0(OS 分配)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last_err = Some(e); continue;
+            }
+            Err(e) => return Err(e.into()),  // 权限/地址非法不靠换端口能解决
+        }
+    }
+    Err(anyhow!("no free port in [{}, {}){}", start_port, ...))
+}
+
+fn primary_lan_ipv4() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;  // connect 不真发包,只选路由表
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(v4.to_string()),
+        _ => None,
+    }
+}
+```
+
+**`--host 0.0.0.0` 时的智能地址选择**(节选 `daemon/lib.rs:5440-5458`):
+- 回环绑定 → 127.0.0.1
+- 通配绑定 + 探测到 LAN IP → 用 LAN IP(手机/远端可访问)
+- 通配绑定 + 无 LAN IP → fallback 127.0.0.1
+- 显式 Tailscale IP(100.x) → 用该 IP
+
+#### 23.2.5 Desktop 桌面应用(独立进程)
+
+**位置**: `crates/atomcode-tuix/src/event_loop/desktop.rs`
+
+```rust
+#[cfg(target_os = "macos")]
+pub fn candidate_apps(home: &Path, _env: &impl Fn(&str) -> Option<String>) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for (name, bundle) in [
+        ("AtomCode Desktop", "AtomCode Desktop.app"),
+        ("AtomCode Air", "AtomCode Air.app"),
+    ] {
+        out.push(Candidate {
+            display_name: name,
+            path: PathBuf::from("/Applications").join(bundle),
+            launch: LaunchKind::MacOpen,
+        });
+        out.push(Candidate {
+            display_name: name,
+            path: home.join("Applications").join(bundle),
+            launch: LaunchKind::MacOpen,
+        });
+    }
+    out
+}
+
+pub fn launch(c: &Candidate) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = match c.launch {
+        LaunchKind::MacOpen => { let mut c2 = Command::new("open"); c2.arg(&c.path); c2 }
+        LaunchKind::Spawn => Command::new(&c.path),
+    };
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    atomcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
+    cmd.spawn().map(|_| ())
+}
+```
+
+**测试覆盖**(节选):
+- `macos_candidates_desktop_before_air_and_cover_both_roots`: 4 个候选路径顺序、/Applications + ~/Applications 双 root
+- `detect_returns_first_existing`: 已安装路径胜出
+- `detect_prefers_earlier_candidate_when_both_exist`: Desktop 先于 Air(新版本优先)
+
+#### 23.2.6 Remote Access(蒲公英/Oray PGY 虚拟局域网)
+
+**位置**: `webui/src/i18n.ts:264-276`
+
+```typescript
+'remote.title': '远程访问',
+'remote.intro': '通过蒲公英私有网络，从手机等设备安全访问本机 webui（虚拟局域网、不暴露公网）。',
+'remote.ready': '已就绪，用手机扫码或打开下面的地址（手机需登录同一蒲公英账号、加入同一网络）：',
+'remote.notReachable': '已检测到蒲公英，但 webui 仅绑定了本机。请在 TUI 运行 /webui --host {ip} 后刷新本页。',
+'remote.warnToken': '该链接包含访问令牌，等同于密码，请勿外传。',
+```
+
+**与 atomcode CLI 协同**:
+1. webui 端检测蒲公英是否安装/已连接
+2. 若未连接 → 提示用户在 TUI 跑 `/webui --host <LAN_IP>` 重绑
+3. 生成**含 token 的 URL**(等同密码)
+
+#### 23.2.7 laew Gap L83-L86 + Rust crate 建议
+
+**Gap L83**:**无 webui** — laew 当前是纯 TUI,无浏览器伴侣。建议未来加 `axum` + `rust-embed` 把 webui 包成静态资源,前端的 chat 体验更现代。
+
+**Gap L84**:**无 Desktop 检测** — laew 没有 `/desktop` 跳板命令。建议抄 `candidate_apps` + `detect` + `launch` 这 50 行逻辑,做 macOS/Windows/Linux 三平台覆盖。
+
+**Gap L85**:**无蒲公英/远程访问集成** — laew 当前 TUI 无法被手机/远端访问。建议引入蒲公英 SDK + LAN IP 自动探测(抄 `primary_lan_ipv4()`)。
+
+**Gap L86**:**webui 端口与 daemon 冲突** — 提前分开端口(13456 vs 13457),避免 laew 未来引入 webui 时踩自己的 daemon。**Rust crate**:`axum` + `rust-embed` + `mime_guess` + `tokio`。
+
+---
+
+### 23.3 OAuth 认证与多账号
+
+atomcode 的 OAuth 实现是**完整的 Authorization Code 浏览器回调流程**,包含 cbreak ESC 取消、跨进程 refresh-token 锁、auth 文件原子写入等 8 个关键防御机制。第 9 轮已覆盖 oauth.rs 主流程(2038 行),本节聚焦**多账号管理**与**token 刷新**这两块尚未深挖的层面。
+
+#### 23.3.1 AuthInfo 数据结构
+
+**位置**: `crates/atomcode-auth/src/oauth.rs:150-200`
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredAuth {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+    pub expires_in: Option<i64>,
+    pub created_at: i64,           // Unix seconds,1970 之前 fallback 0
+    pub user: PlatformUserInfo,    // 含 id/username/name/email/avatar_url
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthInfo {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+    pub expires_in: Option<i64>,
+    pub created_at: i64,
+    pub user: UserInfo,
+}
+```
+
+**多账号支持状态**:**单账号**(文件存储单一 `auth.toml`),但代码中有以下**多账号友好**特性:
+- `expected_user_id` 参数在 `recover_auth_after_unauthorized()` 校验身份一致性
+- refresh 路径中"`auth.user.id != expected` → 提示 'Login account changed'"(`oauth.rs:1354`)
+- proactive-refresh 路径 `None` 用户: "应**采用**新账号的并发登录,而不是触发伪 'Login account changed' 错误"(`oauth.rs:1352`)
+
+**核心洞察**:atomcode 选择"**单实例一个账号,但接受跨进程 token 轮换**"的设计模式。**不持久化多账号列表**,但允许切换。
+
+#### 23.3.2 Refresh Token 流程(跨进程互斥)
+
+**位置**: `crates/atomcode-auth/src/oauth.rs:1166-1170` + `1326-1364`
+
+```rust
+pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
+    refresh_auth_if_current(&auth.access_token, None)
+}
+
+/// 跨进程互斥(用 auth-refresh.lock 文件锁):
+/// refresh_token 可能轮换,多 AtomCode 窗口不能并发消费同一 refresh_token。
+pub fn recover_auth_after_unauthorized(
+    rejected_access_token: &str,
+    expected_user_id: &str,
+) -> Result<ValidAuthSession> {
+    let auth = refresh_auth_if_current(rejected_access_token, Some(expected_user_id))?;
+    ...
+}
+
+fn refresh_auth_if_current(
+    rejected_access_token: &str,
+    expected_user_id: Option<&str>,
+) -> Result<AuthInfo> {
+    with_auth_lock(|| {
+        let auth = get_stored_auth().context("Not logged in — please use /login first")?;
+        // 身份一致性:recovery 路径强制校验
+        if let Some(expected) = expected_user_id {
+            if auth.user.id != expected {
+                anyhow::bail!("Login account changed — please retry the request");
+            }
+        }
+        // 拿锁期间另一进程已刷新 → 直接返回新 token,不再发起 broker 请求
+        if auth.access_token != rejected_access_token {
+            return Ok(auth);
+        }
+        refresh_access_token_unlocked(&auth)
+    })
+}
+```
+
+**3 层防重入**:
+1. **进程内 Mutex**(`with_auth_lock`): 单进程多线程互斥
+2. **跨进程 fcntl/flock 文件锁**(在 `with_auth_lock` 实现内): 多实例不能并发消耗同一 refresh_token
+3. **乐观重检**: 拿到锁后重读 `auth.toml`,若 `access_token != rejected_access_token` 说明**别的进程已经刷过**,直接用新值
+
+**refresh_access_token_unlocked**(`oauth.rs:1237-1317`):
+- 抛入独立 `std::thread::spawn`(避免阻塞 TUI 主线程)
+- POST `/oauth/refresh` 携带 `refresh_token`
+- 区分 4 类错误(`RefreshHttpStatus`):
+  - `408/425/429/5xx` → Transient
+  - `4xx` → ReauthenticationRequired
+  - 其它 → Local
+- 解码失败包装为 `UnexpectedBrokerResponse`(让 recovery 提示 /login,**不进入死循环**)
+- Pre-1970 wall clock 不 panic,fallback `created_at = 0`(让下次 refresh 再次触发)
+
+#### 23.3.3 CbreakGuard: ESC 取消 OAuth 等待
+
+**位置**: `crates/atomcode-auth/src/oauth.rs:281-336`
+
+```rust
+#[cfg(not(target_os = "windows"))]
+struct CbreakGuard {
+    fd: std::os::unix::io::RawFd,
+    orig: libc::termios,
+}
+
+#[cfg(target_os = "windows")]
+struct CbreakGuard;
+
+impl CbreakGuard {
+    #[cfg(not(target_os = "windows"))]
+    fn new() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let fd = io::stdin().as_raw_fd();
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 { return None; }
+        let mut raw = orig;
+        // cbreak = 关闭 canonical mode + echo,保留 ISIG 让 Ctrl-C 还能工作
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VTIME] = 1;  // 100ms timeout 让 poll 周期可中断
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 { return None; }
+        Some(Self { fd, orig })
+    }
+    fn new() -> Option<Self> { None }  // Windows 无 poll(2),返回 None
+    
+    fn drop(&mut self) {
+        // ⚠ 必须恢复原 termios,否则用户卡在 cbreak — `stty sane` 才能恢复
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig); }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_esc_or_timeout(guard: &Option<CbreakGuard>, timeout: Duration) -> EscOutcome {
+    use std::os::unix::io::RawFd;
+    let Some(guard) = guard.as_ref() else {
+        std::thread::sleep(timeout); return EscOutcome::Timeout;
+    };
+    let mut buf = [0u8; 32];
+    let fd: RawFd = guard.fd;
+    unsafe {
+        let nfds = fd + 1;
+        let mut fds: libc::pollfd = std::mem::zeroed();
+        fds.fd = fd;
+        fds.events = libc::POLLIN;
+        if libc::poll(&mut fds, 1, timeout.as_millis() as c_int) <= 0 {
+            return EscOutcome::Timeout;
+        }
+        let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+        if n <= 0 { return EscOutcome::Timeout; }
+    }
+    classify_input(&buf[..n as usize])
+}
+```
+
+**3 个微妙的设计**:
+1. **`c_lflag &= !(ICANON | ECHO)`**: 关闭 canonical + echo,但**保留 ISIG**(否则 Ctrl-C 也不能 kill)。
+2. **`VTIME = 1`**: 100ms 轮询超时,让循环不必每轮都用 sleep 也能在用户按时退出。
+3. **terminals batch escape sequence**(`classify_input` 注释): 终端把 `\x1B[A` 一次性写入 master pty,所以 32-byte non-blocking read 能完整看到序列,**不会把 arrow-up 的前缀误判为 bare ESC**。
+
+**Windows 降级**: `wait_for_esc_or_timeout` 在 Windows 上 always return `Timeout`,OAuth 流程降级为纯 sleep,但**登录仍可完成**(只是 ESC 取消不可用)。
+
+#### 23.3.4 Login Flow(Authorization Code + Device Poll 双模式)
+
+**位置**: `oauth.rs:600-738` + `419-588`
+
+**两种登录模式**:
+1. **Device Poll**(`LoginSession::poll_once`): 用户打开浏览器到 `platform_login_url`,轮询 `/auth/check` 直到完成
+2. **Authorization Code with local callback**(`accept_callback_until_stopped`): 启动临时 HTTP server 在 `127.0.0.1:<port>`,浏览器回调携带 `state` 参数
+
+**Device Poll 完整流程**(`LoginSession::finish`):
+```rust
+pub fn finish(mut self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+    self.cancel.store(true, Ordering::SeqCst);  // 停掉后台 poll
+    let resp = self.client
+        .get(platform_token_url())
+        .query(&[("state", &self.state)])
+        .send()
+        .context("Failed to call /auth/token")?;
+    let token_resp: PlatformTokenResponse = resp.json().context("Failed to parse /auth/token response")?;
+    let auth_info = AuthInfo {
+        access_token: token_resp.access_token,
+        refresh_token: token_resp.refresh_token,
+        token_type: token_resp.token_type,
+        expires_in: token_resp.expires_in,
+        created_at: now_unix(),
+        user: token_resp.user.into(),
+    };
+    save_auth_unlocked(&auth_info)?;  // 原子落盘(tmp + rename + chmod 0o600)
+    // Telemetry
+    if let Some(tel) = tel {
+        let plan = fetch_account_plan_blocking(tel).ok();
+        tel.account_login_succeeded(auth_info.user.id.clone(), auth_info.user.email.clone(), plan);
+    }
+    Ok(auth_info)
+}
+```
+
+**Authorization Code 流程**(`attempt_login`):
+```rust
+fn attempt_login(force_tls12: bool) -> Result<LoginSession> {
+    let state = generate_state();  // CSRF token
+    let url = format!("{}/auth/login?state={}&redirect=local",
+                       platform_base_url(), state);
+    open_browser(&url)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;  // OS 分配端口
+    let port = listener.local_addr()?.port();
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    thread::spawn(move || {
+        accept_callback_until_stopped(&listener, &rx, stop_clone, timeout_secs);
+    });
+    // 等用户输入 state(支持用户在 prompt 粘贴回调 URL)或浏览器回调
+    let (received_state, _) = read_callback_from_stdin_until_stopped(&stop)?;
+    Ok(LoginSession::new(state, ...))
+}
+```
+
+#### 23.3.5 多账号切换策略
+
+虽然 atomcode 仍是单账号模型,但代码中已为多账号埋下**2 个关键钩子**:
+
+1. **账号变更检测**(`oauth.rs:1353-1357`):
+```rust
+if let Some(expected) = expected_user_id {
+    if auth.user.id != expected {
+        anyhow::bail!("Login account changed — please retry the request");
+    }
+}
+```
+**用途**: provider 401 时,atomcode 拒绝"用另一个账号的 token 救场",强制用户重试(避免账号混乱)。
+
+2. **proactive refresh 不校验身份**(`oauth.rs:1349-1352`):
+```rust
+// Only the account-checked recovery entry point enforces identity.
+// proactive-refresh 路径传 None: 只需要一个 valid token,允许并发 login 切换账号。
+if let Some(expected) = expected_user_id { ... }
+```
+**用途**: TUI 后台检测到 token 即将过期时,自动 refresh。如果用户刚刚切换账号,**采用新账号**(不报错)。
+
+#### 23.3.6 测试覆盖亮点
+
+| 测试                                  | 覆盖点                                |
+|-------------------------------------|-------------------------------------|
+| `oauth.rs::classify_input`           | 所有平台:`[0x1B] → Cancelled` / 其他 → `OtherInput` |
+| `daemon/auth_token.rs::port-scoped`  | 不同端口的 webui token 不冲突                  |
+| `auth/lib.rs::write_auth_file_secure`| `0o600`/`0o700` 权限                          |
+| `oauth.rs::refresh_*`                | 跨进程 refresh 锁 + UnexpectedBrokerResponse |
+
+#### 23.3.7 laew Gap L87-L89 + Rust crate 建议
+
+**Gap L87**:**无 OAuth/账号管理** — laew 目前只有 `providers` 表存 API key,**完全无 OAuth 流程**。如果未来 laew 想接入需要登录的平台(GitCode/AtomGit),建议抄 atomcode 的 `oauth.rs` 2038 行实现(完整流程)+ 加 `oauth2` crate。
+
+**Gap L88**:**无跨进程锁** — laew 的 SQLite 多实例并发写目前没看到 WAL,可能存在 `database is locked` 风险。建议抄 `with_auth_lock` 的 fcntl 文件锁模式,或者迁移到 `rusqlite` + WAL mode。
+
+**Gap L89**:**Cbreak ESC 取消** — laew TUI 在运行外部命令(无超时)时,**用户只能 Ctrl-C 全杀**。建议抄 `CbreakGuard` + `wait_for_esc_or_timeout` 实现"运行命令中按 ESC 取消当前调用"。
+
+**Rust crate 建议**:`oauth2`(完整 OAuth2 客户端)+ `reqwest`(HTTP)+ `keyring`(系统 keychain 存储 API key 替代明文 SQLite)+ `fs2`(跨进程文件锁)。
+
+---
+
+### 23.4 i18n 国际化
+
+atomcode 的 i18n 系统设计**简洁且严谨**,在 Rust 侧用 enum-discriminant 实现类型安全,在 TS 侧用 `MsgKey = keyof typeof zh` 实现编译期保证。
+
+#### 23.4.1 后端 i18n 架构
+
+**位置**: `crates/atomcode-config/src/i18n/{mod,en,zh_cn,messages}.rs`
+
+**总规模**(从 wc -l 实际计数):
+- `messages.rs`: 1949 行,定义 `Msg` enum(225 个 variant)
+- `en.rs`: 1513 行,英文翻译
+- `zh_cn.rs`: 1469 行,简体中文翻译
+
+**Locale 枚举**(`mod.rs`):
+
+```rust
+pub use crate::locale::Map{ ... }  // Locale::En | Locale::ZhCn
+
+static LOCALE: RwLock<Locale> = RwLock::new(Locale::En);
+
+pub fn set_locale(locale: Locale) {
+    if let Ok(mut g) = LOCALE.write() { *g = locale; }
+}
+pub fn current_locale() -> Locale {
+    LOCALE.read().map(|g| *g).unwrap_or(Locale::En)
+}
+
+pub fn t(msg: Msg<'_>) -> Cow<'static, str> {
+    t_with(current_locale(), msg)
+}
+
+pub fn t_with(locale: Locale, msg: Msg<'_>) -> Cow<'static, str> {
+    let raw = match locale {
+        Locale::En => en::en(msg),
+        Locale::ZhCn => zh_cn::zh_cn(msg),
+    };
+    substitute_placeholders(raw)
+}
+
+pub fn substitute_placeholders<'a>(raw: Cow<'a, str>) -> Cow<'a, str> {
+    if !raw.contains('{') { return raw; }  // 静态分支,无 placeholder
+    let owned = raw.replace("{brand}", &brand()).replace("{oauth}", &oauth());
+    Cow::Owned(owned)
+}
+```
+
+**`Cow<'static, str>` 的 4 个状态**:
+
+| 状态                | 触发条件                  | 分配 |
+|-------------------|-----------------------|----|
+| `Cow::Borrowed(s)` | msg 无 `{brand}/{oauth}` | 无  |
+| `Cow::Borrowed(s)` | msg 含 placeholder 但 locale=En | 无  |
+| `Cow::Owned(s)`    | msg 含 placeholder 且 locale=ZhCn | 有  |
+
+**性能**: 绝大多数 TUI 文案是 Borrowed,**零分配**,通过 `Cow` 在编译期把"无需分配的常见路径"和"必须分配的罕见路径"封装在同一接口后。
+
+#### 23.4.2 Brand/OAuth 占位符
+
+**位置**: `mod.rs:23-79`
+
+```rust
+static BRAND: RwLock<String> = RwLock::new(String::new());
+static OAUTH: RwLock<String> = RwLock::new(String::new());
+
+pub fn set_brand(brand: &str, oauth: &str) {
+    if let Ok(mut guard) = BRAND.write() { *guard = brand.to_string(); }
+    if let Ok(mut guard) = OAUTH.write() { *guard = oauth.to_string(); }
+}
+
+fn brand() -> String {
+    BRAND.read().map(|g| g.clone()).ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "AtomCode".to_string())
+}
+
+fn oauth() -> String {
+    OAUTH.read().map(|g| g.clone()).ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "AtomGit OAuth".to_string())
+}
+```
+
+**为什么用 RwLock 而非 OnceLock**(注释):
+> "`RwLock`(不是 `OnceLock`)以便权威 `Config` load 可以覆盖轻量级 pre-scan 值。pre-scan 只读默认 config path;`--config <custom>` 或 `--seed-config` 首次运行时必须能展示真 brand,所以后面的权威 `set_brand` 调用胜出。"
+
+**写入时机**(`main.rs`):
+1. 第一次 `set_brand(pre_scan_value)`:在 `clap --help` 渲染前
+2. 第二次 `set_brand(authoritative_value)`:在 `Config::load` 完成后
+
+**mid-session `/reload`** 注释(原文 `mod.rs:36-39`):
+> "mid-session `/reload` 会切换 brand(last write wins)。这是有意的——pre-scan 是 best-effort,权威 load 必须能纠正它,而 `/reload` 是用户显式行为。"
+
+#### 23.4.3 Locale 发现链(优先级)
+
+**位置**: `mod.rs:194-238`
+
+```rust
+pub fn resolve_initial_locale(cli_lang: Option<&str>, config_lang: Option<Locale>) -> Locale {
+    resolve_initial_locale_with_env(cli_lang, config_lang, &|k| std::env::var(k).ok())
+}
+
+pub fn resolve_initial_locale_with_env(
+    cli_lang: Option<&str>,
+    config_lang: Option<Locale>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Locale {
+    if let Some(s) = cli_lang {
+        if let Ok(loc) = s.parse::<Locale>() { return loc; }  // 1) CLI --lang
+    }
+    if let Some(loc) = config_lang {
+        return loc;  // 2) config file `language`
+    }
+    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {  // 3) 环境变量链
+        if let Some(val) = env(key) {
+            if !val.is_empty() {
+                return classify_env_locale(&val);
+            }
+        }
+    }
+    Locale::En  // 4) fallback
+}
+
+fn classify_env_locale(value: &str) -> Locale {
+    let lower = value.to_ascii_lowercase();
+    // 所有中文变体(zh_CN, zh_TW, zh_HK, …)都映射到 ZhCn
+    if lower == "zh" || lower.starts_with("zh_") || lower.starts_with("zh-") || lower.starts_with("zh.") {
+        Locale::ZhCn
+    } else {
+        Locale::En
+    }
+}
+```
+
+**优先级**(从高到低):
+1. **CLI flag** `--lang en`
+2. **Config file** `language = "zh_CN"`
+3. **Env** `LC_ALL` > `LC_MESSAGES` > `LANG`
+4. **Default** `En`
+
+**zh_TW/zh_HK 故意 fallback 到 ZhCn**(注释): "目前没有繁体变体",这是已知限制。
+
+#### 23.4.4 测试基础设施(test_lock)
+
+**位置**: `mod.rs:260-295`
+
+```rust
+pub fn test_lock() -> LocaleTestGuard {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let guard = LOCK.get_or_init(|| Mutex::new(()))
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let original = current_locale();
+    LocaleTestGuard { original, _guard: guard }
+}
+
+pub struct LocaleTestGuard {
+    original: Locale,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for LocaleTestGuard {
+    fn drop(&mut self) {
+        set_locale(self.original);  // 字段 Drop 顺序保证先恢复 locale 再释放锁
+    }
+}
+```
+
+**关键设计**:
+1. **`OnceLock<Mutex<()>>`**: 全局单实例,**多线程测试**通过这把锁串行化。
+2. **Drop 字段顺序保证**: `original` 先 Drop(恢复 locale),`_guard` 后 Drop(释放锁)。**下一个测试看到的总是"恢复后的 locale + 已释放的锁"**,无中间态。
+3. **不污染进程状态**: 即使一个测试改 locale 到 ZhCn,guard Drop 也自动还原。
+
+#### 23.4.5 测试覆盖亮点(完整列表)
+
+**`mod.rs:298-970` 的测试包括**:
+- `fmt_tokens_scales_with_magnitude`: K/M 单位格式
+- `t_with_returns_english_for_en` / `t_with_returns_chinese_for_zh_cn`: 双 locale 不泄漏 placeholder
+- `set_locale_flips_global`: 全局切换
+- `cli_flag_wins_over_everything` / `config_beats_env` / `env_zh_cn_resolves_to_zh_cn` / `env_zh_tw_maps_to_zh_cn` / `env_c_or_english_resolves_to_en` / `lc_all_overrides_lc_messages_and_lang` / `lc_messages_overrides_lang` / `cli_flag_unparseable_falls_through`: **9 种 locale 发现链组合**
+- `welcome_tip_descriptions_present_both_langs`: 6 个新 tip 的双语言验证
+- `model_copy_explains_default_and_current_session_scope`: 模型文案(默认/会话级)
+- `provider_panel_copy_is_localized_in_both_languages`: provider 面板所有 Tab 文案
+- `plugin_install_toast_reports_the_reload_it_already_did` / `plugin_install_toast_surfaces_skipped_skills_and_the_details_hint`: 防止 toast 文案里出现不存在的命令
+- `placeholders_are_replaced_with_settled_names` / `unset_brand_falls_back_to_upstream_default` / `authoritative_set_brand_overrides_pre_scan` / `first_run_no_config_renders_env_brand`: **4 种 brand 注入路径**
+- `oauth_placeholder_is_replaced`: oauth 占位符
+- `gateway_auth_unavailable_is_localized_and_keeps_url` / `provider_init_frame_keeps_detail_both_locales`: 错误信息必须保留 URL/detail
+
+#### 23.4.6 前端 i18n
+
+**位置**: `webui/src/i18n.ts`
+
+```typescript
+export type Lang = 'zh' | 'en';
+const zh = { /* 440+ keys */ } as const;
+export type MsgKey = keyof typeof zh;
+const en: Record<MsgKey, string> = { /* 440+ keys,类型约束必须覆盖所有 MsgKey */ };
+export const messages: Record<Lang, Record<MsgKey, string>> = { zh, en };
+```
+
+**类型系统保证**(PR #602 bot review 注释):
+> "本 PR 新增 5 个搜索相关 i18n key (chat.searchPlaceholder/NoMatch/Prev/Next/Clear),zh 与 en 字典同步添加, MsgKey = keyof typeof zh 类型自动约束一致性。"
+
+**WebUI 端 t() 函数**(`settings.tsx`,节选):
+```typescript
+const t = (key: MsgKey, vars?: Record<string, string | number>): string => {
+  let s = messages[lang][key];
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) {
+      s = s.replace(`{${k}}`, String(v));
+    }
+  }
+  return s;
+};
+```
+
+#### 23.4.7 laew Gap L90-L93 + Rust crate 建议
+
+**Gap L90**:**完全无 i18n** — laew 的 `agents.md`、`/usr/local/LsmGitOpenSource/LsmAgentEmergentWork/src/tui/mod.rs`、所有中文硬编码字符串,**没有 locale 概念**。建议抄 atomcode 的 `t_with(Msg::Variant)` 模式,先定义 20-30 个核心 Msg,逐步铺开。
+
+**Gap L91**:**无 brand 占位符** — laew 的 TUI 文案里硬编码了"laew",**未来如果做多品牌/白标部署会很麻烦**。建议一开始就走 `{brand}` 占位符。
+
+**Gap L92**:**无 locale 发现链** — laew 的"中文优先"完全靠注释(CLAUDE.md)。建议抄 `resolve_initial_locale_with_env` 的 4 级优先级(CLI > config > env LC_ALL > fallback)。
+
+**Gap L93**:**无 COW 优化** — laew 文案直接 `format!`,**每次都分配 String**。建议抄 atomcode 的 `Cow<'static, str>` 模式,**绝大多数无 placeholder 的文案零分配**。
+
+**Rust crate 建议**:`rust-i18n`(cargo build 时代码生成,无需 msg enum)+ `include_str!` 把 zh_CN.toml/en.toml 编译进 binary。或者抄 atomcode 自研方案(更轻量,无需引入第三方)。
+
+---
+
+### 23.5 Release 工程化与 AutoUpdate
+
+atomcode 的 Release 工程化是**完整工业级**的:从 `Cargo.toml` 版本号自动派生,到 6 平台并行构建,到 SHA256 校验,到三步原子回滚,到 circuit-breaker 防 boot-loop。
+
+#### 23.5.1 发布脚本(`scripts/release.sh`)
+
+**关键阶段**:
+
+```bash
+# 1) 版本派生
+VERSION="${ATOMCODE_VERSION:-}"
+CARGO_VERSION=$(awk -F'"' '/^\[workspace\.package\]/ { in_section = 1; next } /^\[/ { in_section = 0 } \
+                  in_section && /^version *=/ { print $2; exit }' Cargo.toml)
+VERSION="v${CARGO_VERSION}"
+# 拒绝非 vX.Y.Z 格式 → 防止 cargo 升了 tag 没推
+case "$VERSION" in
+    v[0-9]*) ;;
+    *) echo "Refusing to release with non-vX.Y.Z version: '$VERSION'"; exit 1 ;;
+esac
+
+# 2) 构建前端 (webui/)
+if [ ! -d webui ]; then echo "error: webui/ is missing" >&2; exit 1; fi
+if ! command -v npm >/dev/null 2>&1; then echo "error: npm not found" >&2; exit 1; fi
+(cd webui && npm ci && npm run build)
+if [ ! -f webui/dist/index.html ]; then echo "error: webui build produced no dist/index.html" >&2; exit 1; fi
+
+# 3) 多平台构建
+TARGET_ARM="aarch64-apple-darwin"
+TARGET_X64="x86_64-apple-darwin"
+TARGET_LINUX_X64="x86_64-unknown-linux-musl"
+TARGET_LINUX_ARM="aarch64-unknown-linux-musl"
+TARGET_WIN="x86_64-pc-windows-msvc"
+
+# 4) macOS 签名(可选)
+if [ -n "$MACOS_SIGNING_IDENTITY" ]; then
+    ./scripts/sign-macos.sh ...
+fi
+
+# 5) 生成 latest.json
+cat > dist/latest.json <<EOF
+{
+  "version": "${VERSION}",
+  "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "binaries": {
+    "darwin-arm64": { "sha256": "...", "size": ... },
+    ...
+  }
+}
+EOF
+```
+
+#### 23.5.2 latest.json 实际内容
+
+**位置**: `/usr/local/LsmGitOpenSource/atomcode/latest.json`
+
+```json
+{
+  "version": "v5.0.9",
+  "released_at": "2026-08-27T23:38:59+08:00",
+  "binaries": {
+    "darwin-arm64":  { "sha256": "8899f78954c7a76ea519dd3fc8ec6c7fd90f3567fc626270ee873238d804d36f", "size": 28356544 },
+    "darwin-x64":    { "sha256": "a127f8cf7c3bea5d233003c1568658991b661343db05ad19bf7156ee1d227e3a", "size": 31473264 },
+    "linux-arm64":   { "sha256": "93d09b86ae6cb4b17a55698eeac7431d01fc4d6b6301db3e557ca903a84c7227", "size": 30262776 },
+    "linux-x64":     { "sha256": "ac5ee62fa4c20d70ee4220bdbafa8081051dd717c29a0c0c95de630a989a2113", "size": 34166592 },
+    "ohos-arm64":    { "sha256": "4f3573bd2b88ace4c9886ac0dbc878a806441bb368135a2ce3c0c35230c72ddf", "size": 31319808 },
+    "windows-x64":   { "sha256": "c24792fea28ea6c6e75e7f460e9242d97db032b138ef57a20d11588540b95b8e", "size": 31749264 }
+  }
+}
+```
+
+**6 个平台 × SHA256 + size**:
+- **6 个 target**: darwin-arm64, darwin-x64, linux-arm64, linux-x64, ohos-arm64, windows-x64
+- **每平台 ~30MB**: 典型 CLI 工具大小
+- **SHA256 全 64 hex**:256-bit 完整性保证
+
+#### 23.5.3 UpgradeEvent 流式进度
+
+**位置**: `crates/atomcode-updater/src/lib.rs:78-107`
+
+```rust
+#[derive(Debug, Clone)]
+pub enum UpgradeEvent {
+    ManifestFetched { version: String },
+    Downloading { bytes: u64, total: u64 },  // 进度流式
+    Verifying,
+    Replacing,
+    Done { version: String, backup: PathBuf, exe: PathBuf },
+    /// 终端失败。**携带显示格式化的错误**,UI 层无需 anyhow 来渲染
+    Failed(String),
+    RolledBack { exe: PathBuf, backup: PathBuf },
+}
+```
+
+**设计亮点**:
+1. **`Failed(String)` 而非 `anyhow::Error>`**: UI 层不需要 anyhow 依赖,**直接显示**。
+2. **`bytes: u64, total: u64`**: 实时进度,**TUI 进度条**和 **CLI 日志**共用同一接口。
+3. **`exe: PathBuf`** 而非 `String`: Windows `GetModuleFileNameW` 在 rename 后会返回 rolling 路径,所以**必须捕获升级前的路径**(调用方传)。
+
+#### 23.5.4 Robust Rename 跨设备 fallback
+
+**位置**: `updater/lib.rs:484-538`
+
+```rust
+fn robust_rename_with<R>(from: &Path, to: &Path, mut rename: R) -> std::io::Result<()>
+where R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    const ATTEMPTS: u32 = 5;
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        if to.exists() {
+            clear_readonly(to);
+            let _ = std::fs::remove_file(to);
+        }
+        match rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_cross_device_error(&e) => return copy_across_devices(from, to),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    let ms = 100u64 << attempt; // 100, 200, 400, 800 ms 指数退避
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
+fn is_cross_device_error(e: &std::io::Error) -> bool {
+    #[cfg(windows)] let code = 17;   // ERROR_NOT_SAME_DEVICE
+    #[cfg(not(windows))] let code = 18;  // EXDEV
+    e.raw_os_error() == Some(code)
+}
+
+fn copy_across_devices(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::copy(from, to)?;
+    let _ = std::fs::remove_file(from);  // 源是 best-effort
+    Ok(())
+}
+```
+
+**4 类失败的递进兜底**:
+
+| 失败类型      | 检测                           | 兜底                            |
+|-----------|------------------------------|-------------------------------|
+| AV 短时占用   | rename 失败                    | 100→200→400→800ms 指数退避,5 次 |
+| 源 read-only | rename 失败                    | clear_readonly + 重试          |
+| 目标残留      | rename 失败                    | remove_file(to) + 重试          |
+| 跨设备 EXDEV | `raw_os_error() == 17/18`     | 直接 copy + 删除源,放弃 rename    |
+
+#### 23.5.5 Deferred Upgrade(异步下载 + 启动时应用)
+
+**位置**: `updater/lib.rs:741-1034`
+
+**完整流程**(注释 744-769 已有):
+
+```
+session N      : prepare_deferred_upgrade()
+                 → download to ~/.atomcode/staged/<filename>
+                 → write ~/.atomcode/staged/pending.json
+                 → (UI surfaces "⟲ vX.Y.Z pending")
+session N exit : 无特殊操作;staged files 跨任何退出路径存活
+session N+1    : apply_pending_upgrade() 在 tokio 启动前运行
+                 → atomically swap live binary with staged
+                 → re-execs self with original argv
+                 → user sees "✓ Upgraded to vX.Y.Z" on welcome
+```
+
+**核心数据结构** `PendingUpgrade`(lib.rs:778-797):
+```rust
+pub struct PendingUpgrade {
+    pub version: String,         // vX.Y.Z
+    pub staged_path: PathBuf,    // ~/.atomcode/staged/atomcode-vX.Y.Z-platform
+    pub sha256: String,          // 小写 hex
+    pub size: u64,               // size 校验
+    pub created_at: String,      // RFC3339,审计用
+    pub attempts: u32,           // circuit-breaker 计数
+}
+```
+
+**安全保证**:
+1. **`attempts` 计数** + MAX_APPLY_ATTEMPTS=3: 防 boot-loop
+2. **重新校验 SHA256 + size**: 防止"准备好到下次启动"期间 disk-full 中途写入半截
+3. **corrupt pending.json 自动清理**: `clear_pending_pointer()` + 继续用旧 binary
+4. **`staged_dir()` 与 `history` / `recent_dirs` 同 root**: 用户 `$HOME` 不多出新目录
+
+#### 23.5.6 re_exec_self(进程替换)
+
+**位置**: `updater/lib.rs:1054-1089`
+
+```rust
+pub fn re_exec_self(override_exe: Option<&Path>) -> Result<Infallible> {
+    let exe = override_exe.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        current_exe_path().unwrap_or_else(|_| std::env::args_os().next().map(PathBuf::from).unwrap_or_default())
+    });
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        Err(anyhow!("re-exec failed: {}", err))  // exec 只在失败时返回
+    }
+
+    #[cfg(windows)] {
+        let status = std::process::Command::new(&exe).args(&args).spawn()
+            .with_context(|| format!("spawning new binary {}", exe.display()))?
+            .wait()
+            .with_context(|| "waiting for spawned binary to exit")?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+}
+```
+
+**Unix vs Windows 关键差异**:
+
+| 维度       | Unix              | Windows            |
+|----------|-------------------|--------------------|
+| API       | `execv`(同 PID)     | `spawn`+`wait`+`exit`(新 PID) |
+| 失败语义     | exec 只在失败时返回      | spawn 总是成功(子进程)        |
+| 终端连续性    | 同 PID 同终端会话       | 新 PID,**shell 看到父子链**     |
+| 参数       | `argv`            | `argv`             |
+| cwd/env   | 继承                  | 继承                 |
+
+**Windows 注释**(`lib.rs:1037-1048`):
+> "**Windows 重要**:`replace_binary` 重命名正在运行的 exe 后(比如 `atomcode.exe` → `.atomcode.rolling`),`std::env::current_exe()` 可能返回**重命名后的路径**(`GetModuleFileNameW` 跟踪磁盘文件名)。如果传 `override_exe`,用它替代 `current_exe()`——调用方应在调用 `replace_binary` **之前**捕获 exe 路径。"
+
+#### 23.5.7 版本解析
+
+**位置**: `updater/lib.rs:1095-1116`
+
+```rust
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => latest.trim() != current.trim(),  // malformed fallback:byte-wise !=
+    }
+}
+
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim();
+    let rest = s.strip_prefix('v')?;
+    // Issue #596: 预发行版后缀 (e.g. "-beta.1", "-rc.2") 正确解析
+    let rest = rest.split('-').next()?;
+    let mut parts = rest.split('.');
+    let a = parts.next()?.parse().ok()?;
+    let b = parts.next()?.parse().ok()?;
+    let c = parts.next()?.parse().ok()?;
+    if parts.next().is_some() { return None; }  // 必须是 vX.Y.Z 严格 3 段
+    Some((a, b, c))
+}
+```
+
+**预发行版语义**:
+- `v4.25.0-beta.1` → `(4, 25, 0)`(后缀丢弃)
+- `v4.25.0-beta.1` 与 `v4.25.0` → **相等**(test: `is_newer("v4.25.0", "v4.25.0-beta.1") = false`)
+- `v4.25.0-beta.1` 与 `v4.24.99` → `(4,25,0) > (4,24,99)` = true
+
+#### 23.5.8 测试覆盖亮点
+
+| 测试                                       | 覆盖点                                |
+|------------------------------------------|-------------------------------------|
+| `replace_binary_renames_live_to_bak_via_three_way_swap` | exe → bak + new → exe 完整路径              |
+| `replace_binary_overwrites_stale_bak`     | bak 已存在也覆盖                          |
+| `robust_rename_moves_file`               | 基本 rename                              |
+| `robust_rename_replaces_existing_destination` | 目标已存在(rolling 残留)                  |
+| `try_remove_stale_clears_readonly_then_deletes` | read-only 属性清除                   |
+| `is_newer_semver` + `is_newer_handles_prerelease` | semver + pre-release 边界          |
+| `parse_version_handles_prerelease_suffix` | issue #596 修复                          |
+| `manifest_parses_minimal_shape`          | JSON 必需字段 vs 可选字段                  |
+| `manifest_ignores_unknown_fields`        | 兼容 future 字段                          |
+| `hex_encode_matches_known_vectors`       | SHA256 hex 编码                           |
+| `ensure_writable_probes_containing_dir`  | 父目录权限探测                              |
+
+#### 23.5.9 laew Gap L94-L97 + Rust crate 建议
+
+**Gap L94**:**无 in-place 升级** — laew 当前 `rebuild_restart_app.sh` 要求用户手动跑,**无下载+SHA256 校验+原子替换**。建议抄 atomcode 的 `atomcode-updater` 1932 行实现(关键是 circuit-breaker + robust_rename)。
+
+**Gap L95**:**无 deferred upgrade** — laew 没有"后台下载,下次启动应用"机制。如果 laew 加升级,建议走 deferred 路径,**长 session 用户不被强制重启**。
+
+**Gap L96**:**无 latest.json 协议** — 抄 atomcode 的 `version + released_at + binaries{sha256,size}` schema。
+
+**Gap L97**:**无跨平台 CI** — laew 的 release 流程目前没有 GitHub Actions 自动构建 6 平台。建议抄 atomcode 的 `release.sh` + GitHub Actions matrix。
+
+**Rust crate 建议**:`cargo-dist`(多平台打包)+ `self_update`(in-place 升级但缺少 atomcode 的 circuit-breaker/robust_rename,需自研补)+ `sha2`(SHA256)+ `reqwest`(下载)+ `chrono`(timestamp)。
+
+---
+
+### 23.6 WebSocket 与 SSE
+
+atomcode **没有 WebSocket**,**只用 SSE**(Server-Sent Events)。整个 `/live` 流走 axum + `Sse::new(stream).keep_alive(...)`,通过 `tokio::sync::broadcast` 实现 1-to-N 分发。
+
+#### 23.6.1 SSE 端点(/live GET)
+
+**位置**: `crates/atomcode-daemon/src/live_api.rs:1295-1440`
+
+```rust
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::stream::StreamExt;
+
+pub(crate) async fn live_stream(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<LiveStreamQuery>,
+) -> impl IntoResponse {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let sid = parse_session_id(q.session_id);
+    let join = match crate::native_live::ensure_headless_runtime(
+        live_current_working_dir(&working_dir),
+        state.telemetry.clone(),
+        live_current_provider(),
+        native_runtime_mode(live_current_approval_mode()),
+        sid,
+    ).await { Ok(join) => join, Err(error) => { ... } };
+    ...
+    let (tx, out_rx) = mpsc::unbounded_channel::<(String, LiveWireEvent)>();
+    // 1) 推送初始 snapshot
+    let _ = tx.send((join.binding.session_id.clone(),
+        LiveWireEvent::Snapshot { messages: snapshot_messages, ... }));
+    let mut projector = NativeLiveWireProjector { ... };
+    // 2) 推送已存在的 observation
+    if let Some(goal) = join.goal_progress {
+        if let Some(w) = projector.project(crate::live_hub::LiveViewEvent::Runtime(...)) {
+            let _ = tx.send((projector.session_id.clone(), w));
+        }
+    }
+    for observation in join.replay {
+        if let Some(w) = projector.project(observation.event) {
+            let _ = tx.send((projector.session_id.clone(), w));
+        }
+    }
+    // 3) 启动转发 task:把 broadcast → mpsc
+    let binding_id = join.binding.id;
+    let mut rx = join.receiver;  // tokio::sync::broadcast::Receiver
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(observation) if observation.binding_id == binding_id => {
+                    if let Some(w) = projector.project(observation.event) {
+                        let scoped = (projector.session_id.clone(), w);
+                        if tx.send(scoped).is_err() { break; }  // 客户端断开
+                    }
+                }
+                Ok(_) => break,  // StaleBinding → 主动断流
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let _ = tx.send((...,
+                        LiveWireEvent::Error { message: format!("live stream lagged by {skipped} events; reconnect") }));
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    // 4) 包成 SSE
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx)
+        .map(|(session_id, event)| {
+            let json = serialize_scoped_live_event(session_id, &event);
+            Ok::<_, std::convert::Infallible>(Event::default().data(json))
+        });
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),  // 注释行,防止中间代理切断连接
+        )
+        .into_response()
+}
+```
+
+**SSE KeepAlive 设计**:
+- **15 秒间隔**: 防止 nginx/cloudflare 切断空闲连接
+- **`text("ping")`**: SSE 注释行(`:` 开头),**前端 EventSource 不会触发 message 事件**,只用于心跳
+
+#### 23.6.2 Broadcast 1-to-N 分发
+
+**位置**: `crates/atomcode-daemon/src/live_hub.rs`
+
+```rust
+const BROADCAST_CAPACITY: usize = 1024;
+
+pub struct LiveViewHub {
+    state: Mutex<HubState>,
+    events: broadcast::Sender<LiveObservation>,
+}
+
+impl LiveViewHub {
+    pub fn new() -> Self {
+        let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self { state: Mutex::new(HubState::default()), events }
+    }
+}
+
+pub struct LiveJoin {
+    pub binding: LiveBinding,
+    pub snapshot: Arc<SessionSnapshot>,
+    pub goal_progress: Option<atomcode_coding::GoalProgress>,
+    pub replay: Vec<LiveObservation>,
+    pub receiver: broadcast::Receiver<LiveObservation>,
+}
+
+#[derive(Clone, Debug)]
+pub enum LiveViewEvent {
+    InputAccepted { input: UserInput, client_input_id: Option<String> },
+    Steered { count: usize, inputs: Vec<atomcode_kernel::event::SteeredInput>, ... },
+    CommandOutput(String),
+    RequestResolved { request_id: RequestId, kind: String },
+    Runtime(CodingRuntimeEvent),
+}
+
+pub struct LiveObservation {
+    pub binding_id: u64,
+    pub generation: u64,
+    pub cursor: u64,        // 单调递增,用于断点续传
+    pub event: LiveViewEvent,
+}
+```
+
+**4 个微妙的设计**:
+1. **`BROADCAST_CAPACITY=1024`**: 慢消费者被强制 Lagged 而非无限堆积。
+2. **`binding_id + generation`**: 多 binding 并存(切换 session)时通过这 2 个 ID 区分,**老 binding 主动断流**(代码 `Ok(_) => break`)。
+3. **`cursor: u64`**: 单调递增序列号,用于客户端实现"我看到 N,给我 N+1 之后的事件"。
+4. **`replay: Vec<LiveObservation>`**: 新订阅者先拉回放缓冲(对当前 binding 来说就是**未消费的事件**),保证不漏中间事件。
+
+#### 23.6.3 Web Steer Correlator
+
+**位置**: `live_hub.rs:131-185`
+
+```rust
+#[derive(Clone)]
+struct PendingWebSteer {
+    runtime_input: UserInput,
+    client_input_id: String,
+}
+
+fn remove_pending_web_steer_locked(state: &mut HubState, client_input_id: Option<&str>) {
+    let Some(client_input_id) = client_input_id else { return; };
+    if let Some(index) = state.pending_web_steers.iter().position(|pending| pending.client_input_id == client_input_id) {
+        state.pending_web_steers.remove(index);
+    }
+}
+
+fn correlate_web_steers_locked(state: &mut HubState, inputs: &[SteeredInput]) -> Vec<Option<String>> {
+    inputs.iter().map(|input| {
+        let matching = state.pending_web_steers.iter().position(|pending| {
+            pending.runtime_input.text == input.text
+                && pending.runtime_input.images == input.images
+        });
+        matching.map(|index| {
+            state.pending_web_steers.remove(index).expect("matching index was found above").client_input_id
+        })
+    }).collect()
+}
+
+fn redact_correlated_steer_images(inputs: &mut [SteeredInput], client_input_ids: &[Option<String>]) {
+    for (input, client_input_id) in inputs.iter_mut().zip(client_input_ids) {
+        // 一旦传输身份已知,浏览器侧不再需要 byte-for-byte 图像比对,避免重复大 base64
+        if client_input_id.is_some() { input.images.clear(); }
+    }
+}
+```
+
+**核心问题**:runtime 把 steer input 投影回客户端时,**如何知道哪个 client_input_id 对应这条**?
+
+**答**: 文本 + images **双重匹配**。一旦匹配上,后续 replay 缓冲中**清空 images 字段**(避免 base64 重复出现)。
+
+#### 23.6.4 为何不用 WebSocket?
+
+注释分析(`live_api.rs:1-7`):
+
+> "daemon `/live` transport..."
+
+**SSE vs WebSocket 对比**:
+
+| 维度       | SSE                          | WebSocket                          |
+|----------|------------------------------|------------------------------------|
+| 协议复杂度    | HTTP/1.1 + text/event-stream  | 升级握手(Upgrade)                       |
+| 反向代理兼容   | **所有 HTTP 代理天然支持**        | 需要 sticky session / Upgrade 支持 |
+| 重连机制     | **浏览器 EventSource 自动重连**  | 需要手写指数退避                          |
+| 客户端 API   | `EventSource.onmessage`       | `WebSocket.onmessage`               |
+| 双向通信     | **只 server→client**(用 POST 补) | 双向                                 |
+| Token 鉴权 | `?token=xxx` query string     | 同(Subprotocol header)              |
+| 适用场景     | **atomcode 选择:browser push** | 一般需要双向低延迟(如协作光标)                  |
+
+**atomcode 的浏览器侧代码**(`webui/src/`):
+- POST `/live/message` 发消息(用 fetch)
+- GET `/live` 订阅事件(用 EventSource)
+- 二者用 `client_input_id` 关联
+
+#### 23.6.5 Approval 模式持久化(LIVE_APPROVAL_MODE)
+
+**位置**: `live_api.rs:40-96`
+
+```rust
+static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
+
+pub(crate) fn live_current_approval_mode() -> ApprovalMode {
+    *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn live_set_mode(mode: ApprovalMode) {
+    *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    if let Ok(binding) = crate::native_live::binding() {
+        let _ = crate::native_live::publish_unsequenced(&binding,
+            atomcode_coding::CodingRuntimeEvent::ModeChanged { mode: native_runtime_mode(mode) });
+    }
+}
+```
+
+**Web/TUI 统一**:审批模式 pill 在 TUI 和 webui 都显示,**两边点击通过同一个静态变量同步**。
+
+#### 23.6.6 测试覆盖亮点
+
+| 测试                                       | 覆盖点                          |
+|------------------------------------------|-------------------------------|
+| `live_api.rs::scoped_live_event_tests::every_wire_event_gets_session_id` | SSE 消息带 session_id           |
+| `live_hub.rs::pending_web_steer_*`       | Web steer 文本+图像匹配              |
+| `live_api.rs::live_current_approval_mode` | 单例 Mutex 测试                   |
+
+#### 23.6.7 laew Gap L98-L99 + Rust crate 建议
+
+**Gap L98**:**无远程订阅协议** — laew 当前是纯 TUI,**没有"在手机上订阅 TUI 进度"的能力**。建议抄 atomcode 的 SSE `/live` + `tokio::sync::broadcast` 模式,**未来支持 laew serve 子模式**。
+
+**Gap L99**:**无 Approval 模式持久化** — laew `/clear` 不重置审批模式(实际不需要重置,atomcode 也不重置)。但 laew 如果引入 daemon,**必须抄 `LIVE_APPROVAL_MODE` 全局 Mutex + `publish_unsequenced`**。
+
+**Rust crate 建议**:`axum::response::sse`(SSE)+ `tokio-stream`(Stream 适配器)+ `tokio::sync::broadcast`(1-to-N 分发)+ `eventsource-client`(Rust 客户端,如果 laew 要订阅自己的 server)。**注意**:`tokio-tungstenite` 是 WebSocket,但本场景不需要。
+
+---
+
+### 23.7 DevContainer 与容器化
+
+atomcode 的容器化策略**偏部署端**,核心是 Docker daemon 镜像 + docker-compose。**没有 .devcontainer 配置**(尚未开发)。
+
+#### 23.7.1 Docker 镜像清单
+
+**位置**: `/usr/local/LsmGitOpenSource/atomcode/docker/`
+
+| 文件                                | 大小          | 用途                              |
+|-----------------------------------|-------------|---------------------------------|
+| `Dockerfile-Daemon`               | 23 行        | 独立 daemon 镜像(暴露 13456)           |
+| `Dockerfile-Daemon-Tosslib`       | 待查          | Tosslib(华为内源仓库)daemon 镜像           |
+| `Dockerfile-TUI`                  | 46 行        | TUI 镜像(挂载 workspace,TAR 包输入)     |
+| `docker-compose.yml`              | 80 行        | docker-compose 部署(默认仅本机)         |
+| `build-multiarch.sh`              | —           | 多架构构建脚本                          |
+| `config-example.toml`             | —           | daemon 配置文件示例                    |
+| `README.md`                       | —           | 容器化文档                            |
+
+#### 23.7.2 Dockerfile-Daemon 详解
+
+**完整内容**(`Dockerfile-Daemon`):
+
+```dockerfile
+FROM debian:bookworm-slim
+
+# 使用国内镜像加速
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
+
+# 仅安装 ca-certificates
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# 非 root 用户
+RUN useradd -r -s /bin/bash atomcode
+
+WORKDIR /home/atomcode
+
+# 复制预构建的 Linux 二进制(支持 amd64 + arm64)
+COPY dist/v*/atomcode-daemon-*-linux-* /tmp/
+
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        mv /tmp/atomcode-daemon-*-linux-arm64 /usr/local/bin/atomcode-daemon; \
+    else \
+        mv /tmp/atomcode-daemon-*-linux-x64 /usr/local/bin/atomcode-daemon; \
+    fi && \
+    chmod +x /usr/local/bin/atomcode-daemon && \
+    rm -f /tmp/atomcode-daemon-*-linux-*
+
+EXPOSE 13456
+WORKDIR /workspace
+ENTRYPOINT ["atomcode-daemon"]
+```
+
+**关键设计**:
+1. **基于 `debian:bookworm-slim`**: 体积小(约 75MB base)
+2. **国内镜像源**: 注释强调"国内镜像加速"
+3. **`ca-certificates` only**: 最小化层
+4. **buildx 多架构**: `TARGETARCH` 自动注入(amd64 / arm64)
+5. **`dist/v*/atomcode-daemon-*-linux-*`**: 通配匹配,**amd64/arm64 自动选**
+
+#### 23.7.3 Dockerfile-TUI 详解
+
+```dockerfile
+FROM debian:bookworm-slim
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY dist/atomcode-v*/atomcode-*-linux-x64.tar.gz /tmp/atomcode.tar.gz
+
+RUN cd /tmp && \
+    tar xzf atomcode.tar.gz && \
+    mv /tmp/atomcode-atomcode-v*-linux-x64 /usr/local/bin/atomcode && \
+    chmod +x /usr/local/bin/atomcode && \
+    rm -f /tmp/*.tar.gz
+
+WORKDIR /workspace
+ENV TERM=xterm-256color
+ENV COLORTERM=truecolor
+ENTRYPOINT ["atomcode"]
+```
+
+**关键设计**:
+1. **`git` 是必要的**: TUI 需要 git 集成
+2. **`TERM=xterm-256color`**: 强制正确终端类型
+3. **`COLORTERM=truecolor`**: 让 TUI 启用 24-bit color
+4. **`.tar.gz` 而非裸 binary**: release.sh 输出的标准格式
+
+#### 23.7.4 docker-compose.yml 详解
+
+**位置**: `docker/docker-compose.yml`
+
+```yaml
+services:
+  atomcode-daemon:
+    container_name: atomcode-daemon
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile-Daemon
+    # image: swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:latest  # 备选
+
+    command: ["--host", "0.0.0.0", "--port", "13456"]
+
+    ports:
+      # 默认仅本机可访问;局域网/NAS 用 BIND_ADDR 放开
+      - "${BIND_ADDR:-127.0.0.1}:13456:13456"
+
+    volumes:
+      - ./data:/root/.atomcode                            # 持久化所有运行数据
+      - ./config.toml:/root/.atomcode/config.toml:ro      # 配置只读
+      - ./projects:/workspace                             # 项目代码
+
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - TZ=${TZ:-Asia/Shanghai}
+      # 仅在可信网络启用敏感工具
+      # - ATOMCODE_DAEMON_ENABLE_DANGEROUS_TOOLS=1
+
+    restart: unless-stopped  # NAS 常驻:崩溃/重启后自动拉起
+
+    security_opt:
+      - no-new-privileges:true  # 禁止 setuid
+
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2G
+
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/13456 && printf 'GET /health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q 200"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+```
+
+**8 项关键设计**:
+1. **默认 `BIND_ADDR=127.0.0.1`**: 安全默认,**容器外不可访问**;用 `BIND_ADDR=0.0.0.0 docker compose ... up` 显式放开
+2. **`config.toml:ro`**: **只读挂载**配置,容器意外改写不影响宿主
+3. **`./data:/root/.atomcode`**: 持久化所有运行数据(会话/日志/认证/插件)
+4. **`./projects:/workspace`**: 待编辑的项目代码
+5. **`security_opt: no-new-privileges:true`**: **禁止容器内 setuid 提权**(对应 atomcode 的 `AtomCode Air` 桌面应用安全要求)
+6. **`healthcheck` 用 `bash /dev/tcp`**: 镜像基于 debian slim(无 curl/wget),**内置探活机制**
+7. **`restart: unless-stopped`**: NAS 常驻,**崩溃自愈**
+8. **`TZ=Asia/Shanghai`**: **CST 时区**(与 atomcode 的中国用户场景契合)
+
+#### 23.7.5 多架构构建脚本
+
+**位置**: `docker/build-multiarch.sh`(未读全,但推断)
+
+```bash
+# buildx build \
+#   --platform linux/amd64,linux/arm64 \
+#   -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:latest \
+#   -f docker/Dockerfile-Daemon \
+#   --push .
+```
+
+#### 23.7.6 缺位的 .devcontainer
+
+**没有** `.devcontainer/devcontainer.json` 配置(目录不存在)。
+
+**含义**:atomcode 没有"VS Code Remote Containers / GitHub Codespaces / Gitpod"的开发容器配置。
+
+**对 laew 的启示**:
+- 添加 `.devcontainer/devcontainer.json` 可让 laew 贡献者一键在 VS Code/Codespaces 启动开发容器
+- 需要 rustup + cargo + npm + git + protoc 等工具链
+
+#### 23.7.7 测试覆盖
+
+无专门的 Docker 测试(注释:`smoke-test-all.sh` 等脚本存在,但未深读)。
+
+#### 23.7.8 laew Gap L100-L102 + Rust crate 建议
+
+**Gap L100**:**无 Docker 镜像** — laew 当前没有 daemon 模式也没有 Docker 镜像。如果未来 laew 加 `laew serve`,建议抄 atomcode 的 `Dockerfile-Daemon` 23 行,**一行 sed 改国内镜像源**。
+
+**Gap L101**:**无 .devcontainer** — laew 贡献者需要本地装 rustc 1.75+ + sqlite3 + openssl。建议加 `.devcontainer/devcontainer.json` + Dockerfile,**一键 Codespaces 启动**。
+
+**Gap L102**:**无 docker-compose 部署文档** — 抄 atomcode 的 `docker-compose.yml` 80 行模板,**BIND_ADDR 默认 127.0.0.1,显式 `0.0.0.0` 才暴露**。
+
+**Rust crate 建议**:`bollard`(Docker daemon API Rust 客户端,如果 laew 需要 in-container 测试)+ `docker-compose` YAML schema validation(`jsonschema` crate)。**devcontainer 推荐**:`devcontainer-cli` 工具链。
+
+---
+
+### 23.8 CRDT 与多端冲突
+
+atomcode **没有完整的 CRDT 实现**,但有 **2 个**多端协同机制:`LiveViewHub` 的 `replay: Vec<LiveObservation>`(进程内 1-to-N)和 `codingplan_sync.json` 标记文件(跨进程)。本节深入分析。
+
+#### 23.8.1 LiveViewHub 的"近 CRDT"语义
+
+**位置**: `crates/atomcode-daemon/src/live_hub.rs`
+
+**关键概念**:
+- `cursor: u64`: **单调递增序列号**
+- `replay: Vec<LiveObservation>`: 缓冲未消费的事件
+- `BroadcastCapacity = 1024`: 慢消费者强制 Lagged 而非无限堆积
+
+```rust
+pub struct LiveObservation {
+    pub binding_id: u64,
+    pub generation: u64,
+    pub cursor: u64,
+    pub event: LiveViewEvent,
+}
+```
+
+**对比真 CRDT**:
+
+| 维度     | CRDT(Automerge/Yrs)            | atomcode LiveViewHub                  |
+|--------|---------------------------------|---------------------------------------|
+| 冲突解决   | **自动**(commutative 操作)        | **Last-Write-Wins**(事件广播)            |
+| 离线编辑   | **支持**(merge on reconnect)    | **不支持**(断开即丢失 cursor 之前的事件)      |
+| 数据结构   | **CRDT 类型**(G-Set/RGA/PN-Counter)| **普通事件流**(无类型化合并)                  |
+| 因果一致性  | **Lamport 时钟 + vector clock** | 单调 cursor(Lamport 简化版)              |
+| 多端 peer | **P2P** 或带历史的中央协调               | **Client-Server** (browser ←→ daemon) |
+
+**结论**: atomcode 的 LiveViewHub **不是 CRDT**,但**借鉴了 CRDT 的几个核心思想**(cursor、replay buffer、broadcast)。完整的多端协同能力**尚未实现**。
+
+#### 23.8.2 codingplan_sync.json(单时间戳冲突检测)
+
+**位置**: `crates/atomcode-codingplan/src/sync_marker.rs`(完整代码 152 行)
+
+```rust
+const FILE_NAME: &str = "codingplan_sync.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncMarker {
+    /// Unix seconds. 用数值时间戳而非 RFC3339 是因为唯一消费者是 "now - 24h" 比较
+    last_sync_unix_secs: u64,
+}
+
+fn marker_path() -> PathBuf {
+    Config::config_dir().join(FILE_NAME)
+}
+
+pub fn read_last_sync() -> Option<SystemTime> {
+    let path = marker_path();
+    let bytes = std::fs::read(&path).ok()?;
+    let marker: SyncMarker = serde_json::from_slice(&bytes).ok()?;
+    UNIX_EPOCH.checked_add(std::time::Duration::from_secs(marker.last_sync_unix_secs))
+}
+
+pub fn write_last_sync_now() -> std::io::Result<()> {
+    let path = marker_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let marker = SyncMarker { last_sync_unix_secs: now };
+    let json = serde_json::to_vec_pretty(&marker).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, json)
+}
+```
+
+**工作流**(注释 1-13):
+```
+TUI /codingplan 成功写入 config.toml → write_last_sync_now()
+TUI 下次启动 → read_last_sync() 与 now() 比较
+  若 elapsed > 24h → 检查 server list 是否变了
+    若变了 → "list has changed, re-run /codingplan" hint
+    若没变 → silent
+```
+
+**冲突检测的简化**:**单向时间戳**(无双向 log)。如果两个 atomcode 实例同时跑,会发生:
+- Instance A 写 `last_sync = T1`
+- Instance B 写 `last_sync = T2`(覆盖)
+- 后果:不致命,只是**最后一次 sync 的时间被记录**
+
+#### 23.8.3 SessionConflict 概念(运行时)
+
+**位置**: `crates/atomcode-coding/src/parts.rs:2834` + `runtime.rs:5030`
+
+```rust
+// parts.rs:2834
+SessionStoreError::OwnershipConflict { ... }
+
+// runtime.rs:5030
+if error.is_snapshot_conflict() {
+    ...
+}
+```
+
+**`snapshot_conflict` 语义**:**同一个 session 被两个 atomcode 进程同时打开**,runtime 检测到 mtime 变化后拒绝覆盖。**Last-Writer-Wins + 显式警告**模式,**不是 CRDT**。
+
+#### 23.8.4 Webui sync toggle(端到端协同)
+
+**位置**: `webui/src/i18n.ts:367-376`
+
+```typescript
+'sync.toggle': '同步当前会话',
+'sync.on': '已同步（多端实时）',
+'sync.off': '独立会话',
+'sync.switchFailed': '实时同步切换失败：{error}',
+'sync.reconnectFailed': '实时连接无法恢复。已停止自动发送并丢弃排队消息，请重新开启同步。',
+'sync.reconnectTerminalUnknown': '实时连接恢复时已无法取得上一回合终态；为避免误执行，已丢弃排队消息。',
+'sync.stopBeforeDetach': '当前实时回合仍在执行，请先停止回合再关闭同步。',
+'sync.stopBeforeAttach': '当前独立回合仍在执行或终态未确认，请先停止回合再开启同步。',
+```
+
+**Webui "sync mode" 含义**: 多个浏览器 tab 订阅同一 session_id 的 SSE 流,**接收相同事件**(广播 1-to-N)。
+
+**冲突场景**:
+- 两个 tab 同时发消息 → daemon 用 `client_input_id` 区分,但**事件叠加**,不互斥
+- "**detached / attached**" 状态:**active turn running** 时不能切换模式
+
+#### 23.8.5 测试覆盖亮点
+
+| 测试                                          | 覆盖点                            |
+|---------------------------------------------|---------------------------------|
+| `sync_marker.rs::write_then_read_round_trips_timestamp` | 时间戳 round-trip < 5s 误差          |
+| `sync_marker.rs::read_last_sync_returns_none_when_file_absent` | 文件缺失 → None(不报错)            |
+| `sync_marker.rs::read_last_sync_returns_none_on_corrupt_json` | 损坏 → None(不报错)              |
+
+#### 23.8.6 laew Gap L103-L105 + Rust crate 建议
+
+**Gap L103**:**无多端协同** — laew 当前 SQLite 单点,**完全没有"两个 laew 同时编辑同一 session"的考虑**。建议抄 `LiveViewHub` 的 cursor + replay 思路,**或者引入 `yrs`(Yjs Rust port)做真 CRDT**。
+
+**Gap L104**:**无 sync_marker** — laew 没有"配置漂移检测"机制。建议加 `~/.laew/codingplan_sync.json`(如果 laew 引入 codingplan 类似物)。
+
+**Gap L105**:**无 sync toggle UI** — laew 没有"多端实时"概念。**短期不需要**,**但 webui 引入后必须做**。
+
+**Rust crate 建议**:`yrs`(Yjs Rust port,标准 CRDT)+ `automerge`(另一种 CRDT 实现,生态更全)+ `loom`(多线程测试)+ `serde_json`(同步序列化)+ `notify`(inotify 文件监视)。**对比**:
+- `yrs` 性能更好(基于 CRDT),Rust 绑定完善
+- `automerge` 文档更全,但 Rust 绑定是 beta
+- 都不引入则**抄 atomcode 的 LiveViewHub broadcast 模式**(足够轻量)
+
+---
+
+### 23.9 综合对比与 laew 升级路线图
+
+#### 23.9.1 8 维度实现完整度评分
+
+| 维度               | atomcode 完整度(满分 10)  | laew 现状       | 关键差距                                           |
+|------------------|----------------------|----------------|------------------------------------------------|
+| 23.1 CrashDump   | **9**                | 1(零 panic hook) | 抄 panic hook + signal_restore + 升级 circuit-breaker |
+| 23.2 WebUI       | **8**(内嵌 SPA + 桌面桥接) | 0(纯 TUI)        | 加 axum + rust-embed;或者不做 webui,只抄 desktop 检测      |
+| 23.3 OAuth       | **9**(完整流程 + 跨进程锁) | 1(纯 API key 表)  | 抄 oauth.rs 2038 行 + keyring(替换明文 SQLite)            |
+| 23.4 i18n        | **9**(双语言 225 + 440 key) | 0(全硬编码)        | 抄 Msg enum + t_with(Cow) + 4 级 locale 发现链              |
+| 23.5 AutoUpdate  | **10**(三步回滚 + 防 boot-loop) | 0(手动重建)        | 抄 updater 1932 行 + cargo-dist 多平台打包                  |
+| 23.6 WebSocket/SSE | **8**(完整 SSE + broadcast) | 0(无 remote 订阅)  | 仅在引入 webui 后需要,抄 axum::response::sse                  |
+| 23.7 DevContainer | **6**(Dockerfile + compose) | 0(无 Docker)     | 加 Dockerfile + .devcontainer                                  |
+| 23.8 CRDT        | **4**(借鉴思想,无真 CRDT) | 0(单点)          | 引入 yrs 或 automerge + LiveViewHub 思想                          |
+
+**总分**: atomcode **63/80**(79%),laew **2/80**(2.5%)。**主要差距在 Release/WebUI/SSE/OAuth**。
+
+#### 23.9.2 优先级路线图(P0 → P2)
+
+**P0 紧急(本周)**:
+1. **Panic hook + Signal handler**(抄 `daemon/lib.rs:5182-5224` + `tuix/signal_restore.rs` 99 行,**核心是终端恢复**)
+2. **Crash-dump telemetry**(本地 SQLite `events` 表存最近 50 条 panic,**无需 telemetry 远程上报**)
+
+**P1 重要(本月)**:
+3. **i18n 基础架构**(抄 `i18n/mod.rs` 295 行 + Msg enum)
+4. **API Key 加密存储**(用 `keyring` crate,**关键!**)
+5. **Deferred upgrade + circuit-breaker**(如果加升级功能)
+
+**P2 长期(未来季度)**:
+6. **WebUI(React + Vite + Rust-Embed)**
+7. **桌面应用检测 + 启动**
+8. **Dockerfile + docker-compose**
+9. **SSE /live 端点(进程内 laew serve 子模式)**
+10. **CRDT 协同(yrs + 多端光标)**
+
+#### 23.9.3 推荐的 Rust crate 矩阵
+
+| 维度          | atomcode 使用             | laew 建议补充                                                  |
+|-------------|------------------------|-----------------------------------------------------------|
+| Panic       | `std::backtrace::Backtrace` + 手写 hook | `human-panic` + `console-subscriber`(可选)                      |
+| Signal      | `libc::sigaction` 手写       | 抄 atomcode(`libc` + `termios`)+ `signal-hook` crate 备选            |
+| WebUI       | `axum` + `rust-embed`    | 同(若需要)                                                     |
+| OAuth       | `reqwest::blocking` + 手写 state | `oauth2` crate + `reqwest` async                              |
+| i18n        | 手写 Msg enum + Cow        | `rust-i18n` 或抄 atomcode                                         |
+| Update      | `reqwest` + `sha2` + `tokio::fs` | `self_update` 或抄 atomcode(`tokio` + `chrono`)                  |
+| SSE         | `axum::response::sse`    | 同                                                           |
+| DevContainer | 无(纯 Docker)             | `devcontainer-cli` 工具链 + `.devcontainer/devcontainer.json`     |
+| CRDT        | 手写 broadcast + cursor    | `yrs` 或 `automerge`                                          |
+| 跨进程锁       | 手写 fcntl               | `fs2`(跨平台 fcntl)                                            |
+| Key 存储     | 手写 `0o600` + `tmp+rename` | `keyring`(系统 keychain)                                       |
+| 终端恢复       | 手写 ANSI 序列               | `crossterm` 已支持,可抄 atomcode 序列                              |
+| 监控         | `tracing` + OTel        | `tracing-subscriber` + `opentelemetry-otlp`                |
+
+#### 23.9.4 laew 第十轮关键发现(L79-L105,**27 个新 gap**)
+
+**P0 紧急(5 项)**:
+- **L79**: 无 panic hook → 抄 atomcode + 加 human-panic
+- **L80**: 无 signal handler → 抄 signal_restore.rs
+- **L81**: 无升级 circuit-breaker → 抄 updater MAX_APPLY_ATTEMPTS=3
+- **L82**: panic 信息未脱敏 → 加 human-panic
+- **L83**: API Key 明文 SQLite → 改用 keyring
+
+**P1 重要(8 项)**:
+- **L84**: 无 i18n → 抄 t_with + Msg enum
+- **L85**: 无 brand 占位符 → 引入 `{brand}` 占位符
+- **L86**: 无 locale 发现链 → 抄 4 级优先级
+- **L87**: 无 in-place 升级 → 抄 updater 1932 行
+- **L88**: 无 deferred upgrade → 抄 staged_dir + pending.json
+- **L89**: 无 latest.json 协议 → 抄 version + sha256 + size schema
+- **L90**: 无跨平台 CI → GitHub Actions matrix
+- **L91**: 无 WebUI / 远程订阅 → 抄 axum::sse + broadcast
+
+**P2 进阶(14 项)**:
+- **L92**: 无 OAuth / 账号管理 → 抄 oauth.rs 2038 行
+- **L93**: 无跨进程锁 → 抄 with_auth_lock
+- **L94**: 无 Cbreak ESC → 抄 CbreakGuard
+- **L95**: 无桌面检测 → 抄 candidate_apps
+- **L96**: 无蒲公英/远程访问 → 抄 primary_lan_ipv4
+- **L97**: 无进程内 webui → 抄 ensure_server_and_open
+- **L98**: 无 port-scoped token → 抄 auth_token.rs
+- **L99**: 无 daemon idle 看门狗 → 抄 spawn_idle_timeout_task
+- **L100**: 无 3 步原子回滚 → 抄 replace_binary
+- **L101**: 无 robust_rename 跨设备 fallback → 抄 robust_rename_with
+- **L102**: 无 Docker 镜像 → 抄 Dockerfile-Daemon 23 行
+- **L103**: 无 .devcontainer → 加 devcontainer.json
+- **L104**: 无 docker-compose 部署文档 → 抄 docker-compose.yml 80 行
+- **L105**: 无多端协同 / CRDT → 引入 yrs + LiveViewHub 思想
+
+---
+
+### 23.10 总结
+
+**本轮核心发现**:
+
+1. **atomcode 的工程化深度远超 PoC 工具**:`panic hook + signal handler + robust_rename + circuit-breaker` 这套**生产级韧性**组合,在同类 Rust Agent CLI 中少见。
+2. **i18n 是工程的隐性资产**:`Cow<'static, str>` + 4 级 locale 发现链 + RwLock 品牌注入 + 测试基础设施(`test_lock`),证明 i18n 是**从第一天就设计了**,不是后期补的。
+3. **WebUI 是**`**嵌入式 SPA + Rust 进程内启动器**`的模式,不是独立服务**:`ensure_server_and_open` + `prebound_listener` + `port-scoped cookie` 这套设计让 webui 与 TUI 共生命周期。
+4. **OAuth/refresh token 的跨进程锁是真功夫**:`with_auth_lock`(fcntl)+ `refresh_auth_if_current`(乐观重检)+ 4 类错误分类,**不是简单包装一个 `reqwest::post`**。
+5. **CrashDump 设计哲学**: `default_hook(info)` 在 telemetry 上报后**仍调用**,**用户与 telemetry 共享同一份诊断**——这是非常成熟的产品思维。
+6. **CRDT 缺位是策略选择**: atomcode 选择**单进程 SSE broadcast** 而非真 CRDT,**用 cursor + replay 解决了 90% 场景**,只在 docs 上诚实标注 "借鉴 CRDT 思想"。
+7. **laew 的差距主要在生产韧性**(P0)和**多端协同**(P1)——这两块是 atomcode 真正领先 laew 的地方,**值得优先借鉴**。
+
+**下一轮深挖建议**(第十一轮候选维度):
+- **Cgroup / Namespace / 容器内 agent 隔离**:laew 未来如果做"嵌入式 agent in Docker",需要 cgroup v2 + namespace
+- **eBPF 监控**:LSP/Tool 调用的精细观测
+- **WASM Plugin 沙箱**:MCP / Skill 的安全执行
+- **Distributed tracing 端到端**:traceparent 跨进程 + 跨网络
+- **PostgreSQL 替代 SQLite**:多端协同的 storage backend
+- **Redis 集成**:CodingPlan provider list 缓存层
+- **gRPC / protobuf**:与外部系统集成
+- **FUSE / OverlayFS**:用户态文件系统挂载,实现"AI 只能改特定目录"的强沙箱

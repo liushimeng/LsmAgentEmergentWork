@@ -5289,3 +5289,2510 @@ high-risk runtime boundaries using `.github/workflows/codeql*.yml` and
 - ✅ Patches/ 目录 **临时 patch + 双向 SHA-256 + 移除 gate** 设计
 - ✅ CI 三层防线(secret scan + CodeQL + OpenGrep)+ 自托管 scanner
 
+# OpenClaw 第十轮深挖 — 8 大新维度深度分析(2026-09-07)
+
+> 本轮是前 9 轮未覆盖的 8 个全新维度,每个维度独立成章,均基于 `/usr/local/LsmGitOpenSource/openclaw` 真实源码分析。
+
+## 本轮分析范围
+
+| 维度 | 核心目录/文件 | 前 9 轮覆盖 |
+|------|-------------|-----------|
+| CrashDump 与错误恢复 | `src/entry.respawn.ts` / `src/config/io.recovery.ts` / `io.observe-recovery.ts` / `io.clobber-snapshot.ts` / `io.health-state.ts` / `recovery-policy.ts` / `docker-healthcheck.ts` | ❌ 未覆盖 |
+| WebUI 与 DesktopApp | `ui/` / `apps/{linux,macos,mobile,shared}/` / `src/gateway/control-ui-*` | ❌ 未覆盖 |
+| OAuth 认证与多账号 | `src/gateway/github-oauth-device-flow.ts` / `github-personal-oauth.ts` / `auth.ts` / `auth-resolve.ts` / `user-github-connections.ts` | ❌ 未覆盖 |
+| i18n 国际化 | `ui/src/i18n/` (34 个 locale 文件) | ❌ 未覆盖 |
+| Release 工程化与 AutoUpdate | `Dockerfile` / `docker-compose.yml` / `appcast.xml` / `deploy/fly.private.toml` / `render.yaml` | ❌ 未覆盖 |
+| WebSocket 与 SSE | `src/gateway/server/ws-connection.ts` / `websocket-keepalive.ts` / `server-ws-runtime.ts` / `talk-realtime-relay.ts` | ❌ 未覆盖 |
+| DevContainer 与容器化 | `Dockerfile` / `docker-compose.yml` / `deploy/` / `src/docker-healthcheck.ts` | ❌ 未覆盖 |
+| CRDT 与多端冲突 | `src/boards/{board-store,board-layout,sqlite-board-store,sqlite-board-codec,board-capabilities}.ts` / `src/canvas/widget-tool.ts` | ❌ 未覆盖 |
+
+---
+
+## 20.1 CrashDump 与错误恢复
+
+### 20.1.1 整体恢复架构
+
+OpenClaw 的「错误恢复」不是单一的 CrashDump 文件,而是**五层防御纵深**:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Layer 1 — Process Respawn(entry.respawn.ts)            │
+│   Windows 栈大小 / NODE_OPTIONS / NODE_EXTRA_CA_CERTS  │
+├─────────────────────────────────────────────────────────┤
+│ Layer 2 — Config Observe Recovery(io.observe-recovery) │
+│   last-known-good / backup / clobber snapshot          │
+├─────────────────────────────────────────────────────────┤
+│ Layer 3 — Config Health Fingerprint(io.health-state)   │
+│   hash + bytes + mtime + dev/ino + mode + uid/gid      │
+├─────────────────────────────────────────────────────────┤
+│ Layer 4 — Docker Healthcheck(docker-healthcheck.ts)    │
+│   /healthz + /startupz + /readyz 三探针                │
+├─────────────────────────────────────────────────────────┤
+│ Layer 5 — Backup Rotation(backup-rotation.ts)          │
+│   5 槽环形备份 + pre-update snapshot                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 20.1.2 Layer 1 — 进程 Respawn:`entry.respawn.ts`
+
+**核心类型**:
+
+```typescript
+type CliRespawnPlan = {
+  command: string;
+  argv: string[];
+  env: NodeJS.ProcessEnv;
+  detachForProcessTree: boolean;
+};
+```
+
+**触发条件**(三选一即 respawn):
+
+1. **Windows 栈大小**:`platform === "win32" && !hasStackSizeConfigured(execArgv)` → 注入 `--stack-size=8192`
+2. **NODE_EXTRA_CA_CERTS**:存在 autoNodeExtraCaCerts 且未设置 `OPENCLAW_NODE_EXTRA_CA_CERTS_READY` → 注入 env
+3. **ExperimentalWarning 抑制**:未设置 `OPENCLAW_NODE_OPTIONS_READY` → 注入 `--disable-warning=ExperimentalWarning`
+
+**幂等保障**:
+
+```typescript
+if (shouldSkipStartupEnvironmentRespawnForArgv(normalizedArgv, platform) ||
+    isTruthyEnvValue(env.OPENCLAW_NO_RESPAWN)) {
+  return null;
+}
+```
+
+通过 `OPENCLAW_NODE_OPTIONS_READY` / `OPENCLAW_NODE_EXTRA_CA_CERTS_READY` 环境变量**双重幂等标记**,防止无限 respawn 循环。
+
+**Volta shim 兼容**:
+
+```typescript
+if (basename === "volta-shim" || basename === "volta-shim.exe") {
+  return "node";  // 用 node 直接启动,绕过 volta-shim
+}
+```
+
+**子进程桥接**:
+
+```typescript
+return runRespawnChildWithSignalBridge({
+  command: plan.command,
+  args: plan.argv,
+  env: plan.env,
+  detachForProcessTree: !isTerminalInteractiveRespawnArgv(argv),
+  runtime: resolvedRuntime,
+  onError: (error) => {
+    resolvedRuntime.writeError("[openclaw] Failed to respawn CLI:",
+      error instanceof Error ? (error.stack ?? error.message) : error);
+  },
+});
+```
+
+- 终端交互模式 → 附加到进程树(子进程随父进程退出)
+- 非交互模式 → detach(独立进程树)
+
+### 20.1.3 Layer 2 — Config Observe Recovery:`io.observe-recovery.ts`
+
+这是 OpenClaw **最复杂的恢复机制**,使用 **Generator 协程**实现多阶段恢复:
+
+**核心数据结构**:
+
+```typescript
+type ConfigHealthFingerprint = {
+  hash: string;        // 内容 hash
+  bytes: number;       // 字节数
+  mtimeMs: number | null;
+  ctimeMs: number | null;
+  dev: string | null;  // 设备号
+  ino: string | null;  // inode
+  mode: number | null; // 权限
+  nlink: number | null;
+  uid: number | null;
+  gid: number | null;
+  hasMeta: boolean;    // 是否有 meta 字段
+  gatewayMode: string | null;
+  observedAt: string;
+};
+```
+
+**可疑原因检测**(`io.observe-suspicious.ts`):
+
+```typescript
+function resolveConfigObserveSuspiciousReasons(params): string[] {
+  const reasons: string[] = [];
+  // 1. 体积骤降 50% 以上
+  if (baseline.bytes >= 512 && params.bytes < Math.floor(baseline.bytes * 0.5))
+    reasons.push(`size-drop-vs-last-good:${baseline.bytes}->${params.bytes}`);
+  // 2. 丢失 meta 字段
+  if (baseline.hasMeta && !params.hasMeta)
+    reasons.push("missing-meta-vs-last-good");
+  // 3. 丢失 gateway mode
+  if (baseline.gatewayMode && !params.gatewayMode)
+    reasons.push("gateway-mode-missing-vs-last-good");
+  // 4. 只剩 update.channel 根字段
+  if (baseline.gatewayMode && isUpdateChannelOnlyRoot(params.parsed))
+    reasons.push("update-channel-only-root");
+  return reasons;
+}
+```
+
+**恢复决策流程**(`recoverSuspiciousConfigRead` Generator):
+
+```
+1. stat 当前文件 → 创建 fingerprint
+2. 读取 health state store(SQLite config_health_entries 表)
+3. 读取 backup(.bak) → 创建 backup fingerprint
+4. 检测 suspicious reasons
+5. 解析 backup → prepareBackup(迁移 + 验证)
+6. 检查 backup.gatewayMode
+7. 可选 allowBackupRecovery 回调
+8. persistBoundedClobberedConfigSnapshot(保存被覆盖的配置)
+9. replaceFileAtomic(原子替换)
+10. chmod 0o600
+11. appendConfigAuditRecord(审计)
+12. writeConfigHealthStateToStore(更新 health state)
+```
+
+**last-known-good 晋升**(`promoteConfigSnapshotToLastKnownGoodCore`):
+
+```typescript
+// 检查是否有污染的 secret 占位符
+const polluted = collectPollutedSecretPlaceholders(snapshot.parsed);
+if (polluted.length > 0) {
+  params.logger?.warn(`Config last-known-good promotion skipped: redacted secret placeholder at ${polluted[0]}`);
+  return false;
+}
+// 写入 .last-good 文件
+await deps.fs.promises.writeFile(lastGoodPath, snapshot.raw, {
+  encoding: "utf-8",
+  mode: 0o600,
+});
+```
+
+**secret 占位符检测**:
+
+```typescript
+function collectPollutedSecretPlaceholders(value, pathLabel = "", output: string[] = []): string[] {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "***" || trimmed === "[redacted]") {
+      output.push(pathLabel || "<root>");
+      return output;
+    }
+    if (isSensitiveConfigPath(pathLabel) && (trimmed.includes("...") || trimmed.includes("…"))) {
+      output.push(pathLabel || "<root>");
+    }
+    return output;
+  }
+  // 递归检查对象/数组...
+}
+```
+
+### 20.1.4 Layer 3 — Clobber Snapshot:`io.clobber-snapshot.ts`
+
+当配置被「覆盖」(clobbered)时,保存被替换的配置用于恢复:
+
+**核心机制**:
+
+```typescript
+const CONFIG_CLOBBER_SNAPSHOT_LIMIT = 32;  // 每个配置文件最多保留 32 个 clobber 快照
+const CONFIG_CLOBBER_LOCK_STALE_MS = 30_000;  // 锁过期 30s
+const CONFIG_CLOBBER_LOCK_RETRY_MS = 10;
+const CONFIG_CLOBBER_LOCK_TIMEOUT_MS = 2_000;
+```
+
+**文件锁**(基于 mkdir 原子性):
+
+```typescript
+async function acquireClobberLock(deps, lockPath): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < CONFIG_CLOBBER_LOCK_TIMEOUT_MS) {
+    try {
+      await deps.fs.promises.mkdir(lockPath, { mode: 0o700 });
+      return true;  // mkdir 成功 = 获得锁
+    } catch (error) {
+      if (!isFsErrorCode(error, "EEXIST")) return false;
+      const stat = await deps.fs.promises.stat(lockPath).catch(() => null);
+      if (shouldRemoveStaleLock(stat?.mtimeMs, Date.now())) {
+        await deps.fs.promises.rmdir(lockPath).catch(() => {});  // 清理过期锁
+        continue;
+      }
+      await sleep(CONFIG_CLOBBER_LOCK_RETRY_MS);
+    }
+  }
+  return false;
+}
+```
+
+**快照路径格式**:
+
+```
+config.json.clobbered.2026-09-07T12-34-56-789Z.bak
+```
+
+### 20.1.5 Layer 4 — Docker Healthcheck:`docker-healthcheck.ts`
+
+**三探针设计**:
+
+```typescript
+// /healthz — 存活探针
+export async function probeDockerGatewayHealth(deps = {}): Promise<boolean> {
+  try {
+    const port = await resolveDockerHealthcheckPort(deps);
+    const response = await (deps.fetch ?? globalThis.fetch)(`http://127.0.0.1:${port}/healthz`);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+```
+
+**端口解析优先级**:
+
+```typescript
+async function resolveDockerHealthcheckPort(deps = {}): Promise<number> {
+  // 1. 优先读 live lock(Gateway 启动后写入的 CLI --port)
+  const activePort = await readActivePort({ env });
+  if (activePort !== undefined) return activePort;
+  // 2. 回退到 config/env(启动前或无法验证 owner 的平台)
+  const config = (deps.getRuntimeConfig ?? (() => getRuntimeConfig({...})))();
+  return (deps.resolveGatewayPort ?? resolveGatewayPort)(config, env);
+}
+```
+
+### 20.1.6 Layer 5 — Backup Rotation:`backup-rotation.ts`
+
+**5 槽环形备份**:
+
+```typescript
+const CONFIG_BACKUP_COUNT = 5;
+
+async function rotateConfigBackups(configPath: string, ioFs: BackupRotationFs): Promise<void> {
+  const backupBase = `${configPath}.bak`;
+  const maxIndex = CONFIG_BACKUP_COUNT - 1;
+  await ioFs.unlink(`${backupBase}.${maxIndex}`).catch(() => {});  // 删除最旧的
+  for (let index = maxIndex - 1; index >= 1; index--) {
+    await ioFs.rename(`${backupBase}.${index}`, `${backupBase}.${index + 1}`).catch(() => {});
+  }
+  await ioFs.rename(backupBase, `${backupBase}.1`).catch(() => {});
+}
+```
+
+**Pre-update Snapshot**:
+
+```typescript
+export async function createPreUpdateConfigSnapshot(params: {...}) {
+  // 在 update 前捕获磁盘上的第一个配置状态
+  // 位于旋转 .bak 环之外,重复写入时保持 operator 可见的 rollback 点
+}
+```
+
+### 20.1.7 Recovery Policy:`recovery-policy.ts`
+
+**插件局部失败 vs 整体恢复**:
+
+```typescript
+export function shouldAttemptLastKnownGoodRecovery(snapshot): boolean {
+  if (snapshot.valid) return false;
+  return !isPluginLocalInvalidConfigSnapshot(snapshot);
+  // 插件局部失败不触发整体恢复,保留用户配置让插件清理
+}
+```
+
+**插件包装输出问题检测**:
+
+```typescript
+export function isPluginPackagingRuntimeOutputInvalidConfigSnapshot(snapshot): boolean {
+  // 检查是否所有 issue 都是 plugin packaging 相关的
+  return packagingIssues.length > 0 &&
+    snapshot.issues.every((issue) => {
+      if (isPluginPackagingRuntimeOutputIssue(issue)) return true;
+      const pluginId = extractPluginNotFoundIssuePluginId(issue);
+      return pluginId !== null && packagingPluginIds.has(pluginId);
+    });
+}
+```
+
+### 20.1.8 Gateway Health State:`server/health-state.ts`
+
+**Health 快照构建**:
+
+```typescript
+export function buildGatewaySnapshot(opts): Snapshot {
+  const presence = createPresenceRecipientProjection({ cfg, presence: listSystemPresence() })(opts.client);
+  const uptimeMs = Math.round(process.uptime() * 1000);
+  const updateAvailable = projectUpdateAvailable(getUpdateAvailable(), includeUpdateDetails) ?? undefined;
+  const appliedConfigHash = getRuntimeConfigAppliedHash();
+  const snapshot: Snapshot = {
+    suspension: { phase: getGatewaySuspendAdmissionPhase() },
+    presence,
+    health: emptyHealth,
+    stateVersion: { presence: presenceVersion, health: healthVersion },
+    uptimeMs,
+    appliedConfigHash: appliedConfigHash ? opts.revisionProjector.projectResolvedHash(appliedConfigHash) : null,
+    sessionDefaults: { defaultAgentId, modelConfigured, ownership, selectionRequired, mainKey, mainSessionKey, scope },
+    updateAvailable,
+    updateSchedule,
+  };
+  return snapshot;
+}
+```
+
+**Health 刷新机制**(双 audience + 双强度):
+
+```typescript
+type HealthAudience = "public" | "admin";
+type HealthRefreshStrength = "passive" | "probe";
+
+const healthRefreshStates: Record<HealthAudience, HealthRefreshState> = {
+  public: { nextGeneration: 0, committedGeneration: 0, inFlight: { passive: null, probe: null } },
+  admin: { nextGeneration: 0, committedGeneration: 0, inFlight: { passive: null, probe: null } },
+};
+```
+
+### 20.1.9 关键文件路径汇总
+
+| 类别 | 路径(相对) | 核心职责 |
+|------|----------|---------|
+| 进程 Respawn | `src/entry.respawn.ts` | Windows 栈 / NODE_OPTIONS / CA certs |
+| Observe Recovery | `src/config/io.observe-recovery.ts` | last-known-good / backup / clobber |
+| Observe Suspicious | `src/config/io.observe-suspicious.ts` | 4 类可疑原因检测 |
+| Health State | `src/config/io.health-state.ts` | SQLite 持久化 fingerprint |
+| Clobber Snapshot | `src/config/io.clobber-snapshot.ts` | 32 槽快照 + mkdir 文件锁 |
+| Recovery Policy | `src/config/recovery-policy.ts` | 插件局部 vs 整体恢复决策 |
+| Backup Rotation | `src/config/backup-rotation.ts` | 5 槽环形备份 + pre-update |
+| Docker Healthcheck | `src/docker-healthcheck.ts` | /healthz 探针 |
+| Gateway Health | `src/gateway/server/health-state.ts` | Snapshot + 双 audience 刷新 |
+| Gateway Probe | `src/gateway/probe.ts` | 可达性探测 + 能力评估 |
+
+### 20.1.10 laew gap 清单
+
+| Gap ID | 描述 | 严重度 |
+|--------|------|--------|
+| L79 | 无进程 Respawn 机制(Windows 栈 / NODE_OPTIONS) | P2 |
+| L80 | 无配置健康指纹(hash + stat + dev/ino) | P0 |
+| L81 | 无 last-known-good 配置恢复 | P0 |
+| L82 | 无 clobber snapshot(被覆盖配置保存) | P1 |
+| L83 | 无 backup rotation(环形备份) | P1 |
+| L84 | 无 Docker healthcheck 探针 | P1 |
+| L85 | 无 secret 占位符污染检测 | P2 |
+| L86 | 无插件局部失败 vs 整体恢复决策 | P1 |
+
+---
+
+## 20.2 WebUI 与 DesktopApp
+
+### 20.2.1 整体 UI 架构
+
+OpenClaw 有**三套 UI 表面**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Control UI(Web) — ui/ 目录                               │
+       Vite + Lit(Web Components) + Service Worker             │
+        40 页面 + 34 locale + 自定义主题                        │
+├─────────────────────────────────────────────────────────────┤
+│ 2. Desktop App — apps/{linux,macos}/                        │
+│    — Linux: Tauri 2(Rust + Web 前端)                        │
+│    — macOS: Swift + SwiftUI(AppKit)                         │
+├─────────────────────────────────────────────────────────────┤
+│ 3. Mobile App — apps/mobile/ + apps/shared/OpenClawKit      │
+│    — iOS: Swift + SwiftUI                                   │
+│    — Android: Kotlin + Jetpack                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 20.2.2 Control UI 入口:`ui/src/main.ts`
+
+**Service Worker 注册与刷新**:
+
+```typescript
+const isProd = (import.meta as ViteImportMeta).env?.PROD === true;
+const currentControlUiBuildId = CONTROL_UI_BUILD_INFO.buildId;
+
+if (isProd && "serviceWorker" in navigator) {
+  const swUrl = new URL(inferControlUiPublicAssetPath("sw.js"), window.location.origin);
+  swUrl.searchParams.set("v", currentControlUiBuildId);
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (controlUiWorkerActivationRetires(event.data)) {
+      void scheduleStaleChunkReload({
+        canReload: () => event.source === navigator.serviceWorker.controller,
+      });
+    }
+    if (event.data?.type === "sw-version-probe") {
+      event.ports[0]?.postMessage({ version: currentControlUiBuildId });
+    }
+  });
+  // 注册 SW,updateViaCache: "none" 确保每次都检查更新
+  void navigator.serviceWorker.register(swUrl, { updateViaCache: "none" }).then(refresh);
+}
+```
+
+**关键设计**:
+- `updateViaCache: "none"`:禁用 HTTP 缓存,确保 SW 每次都检查更新
+- `controlUiWorkerActivationRetires`:SW 激活失败时触发 chunk reload
+- `sw-version-probe`:版本探测机制
+
+**Public Asset 路径推断**:
+
+```typescript
+function syncDocumentPublicAssetLinks() {
+  setDocumentLinkHref('link[rel="icon"][type="image/svg+xml"]', "favicon.svg");
+  setDocumentLinkHref('link[rel="icon"][type="image/png"]', "favicon-32.png");
+  setDocumentLinkHref('link[rel="apple-touch-icon"]', "apple-touch-icon.png");
+  setDocumentLinkHref('link[rel="manifest"]', "manifest.webmanifest");
+}
+```
+
+### 20.2.3 Control UI 页面拓扑
+
+**40 个页面**(部分列表):
+
+| 页面 | 路径 | 核心职责 |
+|------|------|---------|
+| Chat | `pages/chat/` | 主聊天界面(200+ 子文件) |
+| Dashboards | `pages/dashboards/` | 仪表盘画廊 |
+| Agents | `pages/agents/` | Agent 管理 |
+| Channels | `pages/channels/` | 通道配置 |
+| Devices | `pages/device/` | 设备管理 |
+| Config | `pages/config/` | 配置编辑器 |
+| Plugins | `pages/plugins/` | 插件市场 |
+| Profile | `pages/profile/` | 用户资料 |
+| Logs | `pages/logs/` | 日志查看 |
+| Meetings | `pages/meetings/` | 会议记录 |
+| Labs | `pages/labs/` | 实验性功能 |
+| Debug | `pages/debug/` | 调试面板 |
+
+**Chat 页面子结构**(最复杂):
+
+```
+pages/chat/
+  chat-page.ts              # 主页面
+  chat-state-controller.ts  # 状态控制器
+  chat-state-host.ts        # 状态宿主
+  chat-history.ts           # 历史管理
+  chat-history-stream.ts    # 流式历史
+  chat-composer-*.ts        # 作曲家(输入框)系列
+  chat-pane-*.ts            # 面板系列
+  chat-send-*.ts            # 发送系列
+  chat-thread.ts            # 线程
+  chat-view.ts              # 视图
+  realtime-talk-*.ts        # 实时语音
+  tool-stream.ts            # 工具流
+  session-snapshot-*.ts     # 会话快照
+  200+ 文件...
+```
+
+### 20.2.4 Desktop App — Linux(Tauri 2)
+
+**目录结构**:
+
+```
+apps/linux/
+  src-tauri/
+    Cargo.toml          # Rust 依赖
+    tauri.conf.json     # Tauri 配置
+    build.rs            # 构建脚本
+    src/                # Rust 后端
+    icons/              # 应用图标
+    permissions/        # 权限声明
+  ui/                   # Web 前端(复用 Control UI)
+  tests/                # 集成测试
+  scripts/              # 构建脚本
+```
+
+**Tauri 2 架构**:
+- Rust 后端 + Web 前端(复用 `ui/` 构建产物)
+- 通过 `tauri.conf.json` 配置窗口、权限、IPC
+
+### 20.2.5 Desktop App — macOS(Swift + SwiftUI)
+
+**目录结构**:
+
+```
+apps/macos/
+  Sources/
+    OpenClaw/           # 主应用
+    OpenClawCameraPTZNative  # 摄像头 PTZ 控制
+    OpenClawDiscovery    # Bonjour 发现
+    OpenClawIPC          # 进程间通信
+    OpenClawMacCLI       # macOS 专用 CLI
+  Tests/                # 测试
+  Package.swift         # Swift Package Manager
+  Package.resolved      # 依赖锁定
+  Packaging/            # 打包脚本
+  Icon.icon/            # 图标设计
+```
+
+**关键模块**:
+
+| 模块 | 职责 |
+|------|------|
+| OpenClaw | 主应用(SwiftUI) |
+| OpenClawDiscovery | Bonjour/mDNS 局域网发现 |
+| OpenClawIPC | 与 Gateway 进程通信 |
+| OpenClawMacCLI | macOS 专用 CLI 工具 |
+| OpenClawCameraPTZNative | 摄像头云台控制 |
+
+### 20.2.6 Mobile App — iOS/Android
+
+**共享代码**:
+
+```
+apps/shared/
+  OpenClawKit/          # 共享 Swift 代码
+  OpenClawMLXTTSProtocol  # MLX TTS 协议
+  OpenClawWatchRTC      # Apple Watch RTC
+  mermaid/              # Mermaid 图表
+```
+
+**版本管理**:
+
+```json
+// apps/mobile/version.json
+{
+  "ios": "...",
+  "android": "..."
+}
+```
+
+### 20.2.7 Control UI Asset Manifest
+
+**Gateway 侧**:
+
+```typescript
+// src/gateway/control-ui-asset-manifest.ts
+// 解析 Control UI 构建产物清单
+export function parseControlUiAssetManifest(manifest: string): {...}
+```
+
+**Asset 保留策略**:
+
+```typescript
+// src/gateway/control-ui-asset-retention.ts
+// 管理旧版本 asset 的清理
+export async function retainControlUiAssets(params: {...}): Promise<void>
+```
+
+### 20.2.8 laew gap 清单
+
+| Gap ID | 描述 | 严重度 |
+|--------|------|--------|
+| L87 | 无 WebUI(纯 TUI) | P1 |
+| L88 | 无 Service Worker 离线缓存 | P1 |
+| L89 | 无 Desktop App(Tauri/Swift) | P2 |
+| L90 | 无 Mobile App | P2 |
+| L91 | 无 Bonjour/mDNS 局域网发现 | P2 |
+| L92 | 无摄像头 PTZ 控制 | P3 |
+
+---
+
+## 20.3 OAuth 认证与多账号
+
+### 20.3.1 整体 OAuth 架构
+
+OpenClaw 的 OAuth 是**三层架构**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 1 — Device Flow(github-oauth-device-flow.ts)         │
+│   GitHub OAuth Device Code 流程                             │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 2 — Personal OAuth Lifecycle(github-personal-oauth)  │
+│   多账号管理 + token 刷新 + profile 物化                    │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 3 — Connection State(user-github-connections)        │
+│   SQLite 持久化 + 状态机 + 退休清理                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 20.3.2 Device Flow:`github-oauth-device-flow.ts`
+
+**核心类型**:
+
+```typescript
+export type GitHubDeviceFlow = {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: "https://github.com/login/device";
+  createdAtMs: number;
+  expiresAtMs: number;
+  pollIntervalMs: number;
+  nextPollAtMs: number;
+};
+```
+
+**启动 Device Flow**:
+
+```typescript
+export async function startGitHubDeviceFlow(signal: AbortSignal): Promise<GitHubDeviceFlow> {
+  const startedAt = Date.now();
+  const authorization = await requestGitHubOAuthDeviceCode({ signal });
+  // 安全检查:expiresInSeconds 不超过 900s,intervalSeconds 不超过 60s
+  if (authorization.expiresInSeconds > 900 || authorization.intervalSeconds > 60) {
+    throw new Error("GitHub device authorization timing is outside the supported bounds.");
+  }
+  const pollIntervalMs = authorization.intervalSeconds * 1000;
+  return {
+    deviceCode: authorization.deviceCode,
+    userCode: authorization.userCode,
+    verificationUri: authorization.verificationUri,
+    createdAtMs: startedAt,
+    expiresAtMs: startedAt + authorization.expiresInSeconds * 1000,
+    pollIntervalMs,
+    nextPollAtMs: startedAt + pollIntervalMs,
+  };
+}
+```
+
+**轮询 Device Flow**:
+
+```typescript
+export async function pollGitHubDeviceFlow(
+  record: GitHubDeviceFlow,
+  signal: AbortSignal,
+): Promise<
+  | { kind: "authorized"; tokens: GitHubOAuthTokenPair }
+  | { kind: "waiting"; result: PollResult; pollIntervalMs: number; nextPollAtMs: number }
+  | { kind: "terminal"; result: PollResult }
+> {
+  const now = Date.now();
+  if (record.expiresAtMs <= now) return { kind: "terminal", result: { status: "expired" } };
+  if (now < record.nextPollAtMs) return {
+    kind: "waiting",
+    result: { status: "pending", retryAfterMs: record.nextPollAtMs - now },
+    pollIntervalMs: record.pollIntervalMs,
+    nextPollAtMs: record.nextPollAtMs,
+  };
+  let result;
+  try {
+    result = await pollGitHubOAuthDeviceToken({ deviceCode: record.deviceCode, signal });
+  } catch {
+    const nextPollAtMs = Math.min(record.expiresAtMs, Date.now() + record.pollIntervalMs);
+    return {
+      kind: "waiting",
+      result: { status: "network_error", retryAfterMs: Math.max(1, nextPollAtMs - Date.now()) },
+      pollIntervalMs: record.pollIntervalMs,
+      nextPollAtMs,
+    };
+  }
+  if (result.status === "authorized") return { kind: "authorized", tokens: result.tokens };
+  if (result.status === "authorization_pending" || result.status === "slow_down") {
+    const pollIntervalMs = result.status === "slow_down"
+      ? Math.min(60000, Math.max(record.pollIntervalMs + 5000, (result.intervalSeconds ?? 0) * 1000))
+      : record.pollIntervalMs;
+    const nextPollAtMs = Math.min(record.expiresAtMs, Date.now() + pollIntervalMs);
+    return {
+      kind: "waiting",
+      pollIntervalMs,
+      nextPollAtMs,
+      result: { status: result.status === "slow_down" ? "slow_down" : "pending", retryAfterMs: Math.max(1, nextPollAtMs - Date.now()) },
+    };
+  }
+  if (result.status === "access_denied") return { kind: "terminal", result: { status: "access_denied" } };
+  if (result.status === "expired_token") return { kind: "terminal", result: { status: "expired" } };
+  return {
+    kind: "terminal",
+    result: result.code === "incorrect_device_code" || result.code === "bad_verification_code"
+      ? { status: "incorrect_device_code" }
+      : { status: "failed", reason: "setup_failed" },
+  };
+}
+```
+
+**slow_down 处理**:GitHub 返回 `slow_down` 时,在 `pollIntervalMs + 5000` 和 `intervalSeconds * 1000` 之间取较大值,但上限 60s。
+
+### 20.3.3 Personal OAuth Lifecycle:`github-personal-oauth.ts`
+
+**核心工厂函数**:
+
+```typescript
+export function createPersonalGitHubOAuthLifecycle() {
+  const abort = new AbortController();
+  const polls = new Map<string, Promise<UsersGitHubAuthorizePollResult>>();
+  const refreshes = new Map<string, Promise<void>>();
+  const rotated = new Map<string, { owner: string; profileId: string; operationId: string; tokens: GitHubOAuthTokenPair; receivedAtMs: number }>();
+  const retirements = new Set<string>();
+  const cleanups = new Map<string, Promise<void>>();
+  let stopped = false;
+  let inspectedProfiles = false;
+  // ...
+}
+```
+
+**状态查询**:
+
+```typescript
+export function personalGitHubStatus(action: PersonalGitHubAction): PersonalGitHubStatus {
+  action.assertCurrent();
+  let record: UserGitHubConnection | undefined;
+  try {
+    record = readUserGitHubConnection(action.owner);
+  } catch {
+    action.assertCurrent();
+    return {
+      state: "unavailable",
+      generation: null,
+      account: null,
+      accessExpiresAtMs: null,
+      refreshState: "failed",
+      pending: null,
+    };
+  }
+  const selection = record?.selection;
+  const connected = selection?.kind === "connected" ? selection : undefined;
+  return {
+    state: connected ? "connected" : "disconnected",
+    generation: record?.generation ?? null,
+    account: connected ? { accountId: connected.accountId, login: connected.login } : null,
+    accessExpiresAtMs: connected?.accessExpiresAtMs ?? null,
+    refreshState: !connected ? "not_applicable" :
+      connected.refresh ? "refreshing" :
+      (connected.refreshFailure ?? (connected.refreshExpiresAtMs <= Date.now() ? "expired" : "available")),
+    pending: record?.pending?.kind === "device" && record.pending.expiresAtMs > Date.now()
+      ? projectPending(record.pending) : null,
+  };
+}
+```
+
+**Token 刷新流程**:
+
+```typescript
+const refresh = async (owner: string): Promise<void> => {
+  assertRunning();
+  const initial = readUserGitHubConnection(owner)?.selection;
+  if (initial?.kind !== "connected") return;
+  const id = initial.profileId;
+  await getOrCreatePromise(refreshes, id, () =>
+    withProfileLease(id, async (assertOwned) => {
+      // 1. 检查是否有内存中的 rotated pending
+      const memory = rotated.get(id);
+      if (memory) {
+        if (!persistRotation(memory)) { rotated.delete(id); return; }
+        rotated.delete(id);
+      }
+      // 2. 读取当前 selection
+      const record = readUserGitHubConnection(owner);
+      const selection = record?.selection;
+      if (!record || selection?.kind !== "connected" || selection.profileId !== id) return;
+      // 3. 如果有 pending refresh tokens
+      if (selection.refresh?.tokens) {
+        await materializeRefresh(owner, id, selection.refresh.operationId, assertOwned);
+        return;
+      }
+      // 4. 检查是否需要刷新
+      if (selection.refreshFailure === "expired" ||
+          selection.refreshExpiresAtMs <= Date.now() ||
+          (!selection.refresh && selection.accessExpiresAtMs > Date.now() + 600000)) return;
+      // 5. 启动刷新
+      const operationId = selection.refresh?.operationId ?? randomUUID();
+      updateUserGitHubConnection(owner, (current) => {
+        if (current?.generation !== record.generation || current.selection.kind !== "connected" ||
+            current.selection.profileId !== id) throw new Error("My GitHub selection changed.");
+        return { ...current, selection: { ...current.selection, refresh: { operationId } } };
+      }, assertOwned);
+      let result;
+      try {
+        result = await refreshGitHubOAuthToken({ refreshToken: selection.refreshToken });
+      } catch {
+        updateUserGitHubRefresh({ owner, profileId: id, operationId,
+          update: (current) => ({ ...current, refresh: undefined, refreshFailure: "failed" }) });
+        return;
+      }
+      if (result.status === "error") {
+        updateUserGitHubRefresh({ owner, profileId: id, operationId,
+          update: (current) => ({ ...current, refresh: undefined,
+            refreshFailure: result.code === "bad_refresh_token" ? "expired" : "failed" }) });
+        return;
+      }
+      // 6. 持久化 rotated tokens
+      const pending = { owner, profileId: id, operationId, tokens: result.tokens, receivedAtMs: Date.now() };
+      rotated.set(id, pending);
+      if (!persistRotation(pending)) { rotated.delete(id); return; }
+      rotated.delete(id);
+      await materializeRefresh(owner, id, operationId, assertOwned);
+    }), { evictOnSettled: true });
+};
+```
+
+**Profile 租赁机制**(并发控制):
+
+```typescript
+const withProfileLease = <T>(profileId: string, run: (assertOwned: () => void) => Promise<T>) =>
+  withOpenClawStateLease({
+    scope: "personal-github-profile",
+    key: profileId,
+    database: { scope: "shared" },
+    leaseMs: 60000,   // 租约 60s
+    waitMs: 30000,    // 等待 30s
+  }, async (lease) => await run(() => lease.assertOwned()));
+```
+
+### 20.3.4 Connection State:`user-github-connections.ts`
+
+**Zod Schema 验证**:
+
+```typescript
+const tokenPair = z.strictObject({
+  accessToken: secret,
+  refreshToken: secret,
+  tokenType: z.literal("bearer"),
+  scopes,
+  expiresInSeconds: z.number().int().positive().max(366 * 86400),
+  refreshTokenExpiresInSeconds: z.number().int().positive().max(366 * 86400),
+});
+
+const connected = z.strictObject({
+  kind: z.literal("connected"),
+  profileId,
+  ...githubOAuthRefreshFields,
+  refreshFailure: z.enum(["expired", "failed"]).optional(),
+  refresh: z.strictObject({
+    operationId: z.string().uuid(),
+    tokens: tokenPair.optional(),
+    receivedAtMs: timestamp.optional(),
+  }).optional(),
+});
+
+const connectionSchema = z.strictObject({
+  version: z.literal(1),
+  generation: z.string().uuid(),
+  selection: z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("disconnected") }),
+    connected,
+  ]),
+  pending: z.discriminatedUnion("kind", [
+    z.strictObject({ ...deviceFields, kind: z.literal("starting") }),
+    device,
+  ]).optional(),
+}).superRefine((record, ctx) => {
+  const pending = record.pending;
+  if (pending && !validGitHubDeviceTiming(pending)) {
+    ctx.addIssue({ code: "custom", message: "Invalid device timing" });
+  }
+  const selection = record.selection;
+  if (selection.kind === "connected" &&
+      (selection.refreshExpiresAtMs <= selection.accessExpiresAtMs ||
+       Boolean(selection.refresh?.tokens) !== (selection.refresh?.receivedAtMs !== undefined))) {
+    ctx.addIssue({ code: "custom", message: "Invalid refresh state" });
+  }
+});
+```
+
+**Secret 注册**(用于日志脱敏):
+
+```typescript
+function parseConnection(raw: string): UserGitHubConnection {
+  // ...
+  if (record.pending?.kind === "device") {
+    registerSecretValueForRedaction(record.pending.deviceCode);
+    if (record.pending.candidate) registerTokens(record.pending.candidate.tokens);
+  }
+  if (record.selection.kind === "connected") {
+    registerSecretValueForRedaction(record.selection.refreshToken);
+    if (record.selection.refresh?.tokens) registerTokens(record.selection.refresh.tokens);
+  }
+  return record;
+}
+```
+
+### 20.3.5 Gateway Auth:`auth.ts`
+
+**多模式认证**:
+
+```typescript
+export type GatewayAuthResult = {
+  ok: boolean;
+  method?: "none" | "token" | "password" | "tailscale" | "device-token" | "bootstrap-token" | "trusted-proxy";
+  user?: string;
+  tailscaleIdentity?: VerifiedTailscaleIdentity;
+  reason?: string;
+  rateLimited?: boolean;
+  retryAfterMs?: number;
+};
+```
+
+**认证表面**:
+
+```typescript
+type GatewayAuthSurface = "http" | "http-control-ui-read" | "ws-control-ui";
+// HTTP:禁用 Tailscale forwarded-header auth
+// WS Control UI:启用 Tailscale 免 token 信任主机登录
+```
+
+**认证配置验证**:
+
+```typescript
+export function assertGatewayAuthConfigured(auth: ResolvedGatewayAuth, rawAuthConfig?: GatewayAuthConfig | null): void {
+  if (auth.mode === "token" && isInvalidGatewayToken(auth.token)) {
+    throw new Error("Gateway token must not be blank or the literal string undefined/null. Run `openclaw doctor --fix --generate-gateway-token` for an inline token, or rotate its external secret source.");
+  }
+  if (auth.mode === "token" && !auth.token) {
+    if (auth.allowTailscale) return;
+    throw new Error(`gateway auth mode is token, but no token was configured (set gateway.auth.token or OPENCLAW_GATEWAY_TOKEN).${LEGACY_OPENCLAW_ENV_NOTE}`);
+  }
+  if (auth.mode === "password" && !auth.password) { /* ... */ }
+  if (auth.mode === "trusted-proxy") {
+    if (!auth.trustedProxy) throw new Error("gateway auth mode is trusted-proxy, but no trustedProxy config was provided");
+    if (!auth.trustedProxy.userHeader || auth.trustedProxy.userHeader.trim() === "") throw new Error("gateway auth mode is trusted-proxy, but trustedProxy.userHeader is empty");
+    if (auth.token) throw new Error("gateway auth mode is trusted-proxy, but a shared token is also configured; remove gateway.auth.token / OPENCLAW_GATEWAY_TOKEN because trusted-proxy and token auth are mutually exclusive");
+  }
+}
+```
+
+### 20.3.6 Auth Resolve:`auth-resolve.ts`
+
+**认证模式解析**:
+
+```typescript
+export function resolveGatewayAuth(params: {
+  authConfig?: GatewayAuthConfig | null;
+  authOverride?: GatewayAuthConfig | null;
+  env?: NodeJS.ProcessEnv;
+  tailscaleMode?: GatewayTailscaleMode;
+}): ResolvedGatewayAuth {
+  const runtimeConfig = getRuntimeConfigSnapshot();
+  if (runtimeConfig && runtimeConfig.gateway?.auth === params.authConfig) {
+    return resolveGatewayAuthForConfig({ config: runtimeConfig, authOverride: params.authOverride, env: params.env, tailscaleMode: params.tailscaleMode });
+  }
+  const authOverride = params.authOverride ?? undefined;
+  const authConfig = mergeGatewayAuthConfig(params.authConfig, authOverride);
+  const env = params.env ?? process.env;
+  const tokenRef = resolveSecretInputRef({ value: authConfig.token }).ref;
+  const passwordRef = resolveSecretInputRef({ value: authConfig.password }).ref;
+  const resolvedCredentials = resolveGatewayCredentialsFromValues({
+    configToken: tokenRef ? undefined : authConfig.token,
+    configPassword: passwordRef ? undefined : authConfig.password,
+    env,
+    tokenPrecedence: "config-first",
+    passwordPrecedence: "config-first",
+  });
+  return finalizeResolvedGatewayAuth({ authConfig, authOverride, token: resolvedCredentials.token, password: resolvedCredentials.password, tailscaleMode: params.tailscaleMode });
+}
+```
+
+**热重载检查**:
+
+```typescript
+export function canHotReloadGatewayAuthCredentials(previousConfig: OpenClawConfig | undefined, candidateConfig: OpenClawConfig | undefined): boolean {
+  if (!previousConfig || !candidateConfig) return false;
+  const modes = [previousConfig, candidateConfig].map((config) => {
+    const authConfig = config.gateway?.auth;
+    if (!authConfig?.mode && (resolveSecretInputRef({ value: authConfig?.token }).ref ||
+        resolveSecretInputRef({ value: authConfig?.password }).ref)) return undefined;
+    return resolveGatewayAuth({ authConfig, tailscaleMode: config.gateway?.tailscale?.mode }).mode;
+  });
+  return (modes[0] === "token" || modes[0] === "password") && modes[0] === modes[1];
+}
+```
+
+### 20.3.7 laew gap 清单
+
+| Gap ID | 描述 | 严重度 |
+|--------|------|--------|
+| L93 | 无 OAuth Device Flow | P1 |
+| L94 | 无多账号管理(profile 租赁) | P1 |
+| L95 | 无 token 自动刷新 | P0 |
+| L96 | 无 Gateway 多模式认证 | P0 |
+| L97 | 无 Tailscale 集成 | P2 |
+| L98 | 无 trusted-proxy 认证 | P1 |
+| L99 | 无 secret 日志脱敏注册 | P1 |
+
+---
+
+## 20.4 i18n 国际化
+
+### 20.4.1 整体 i18n 架构
+
+OpenClaw Control UI 支持 **34 个 locale**,采用**懒加载 + 订阅者模式**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ I18nManager(translate.ts)                                  │
+│   ┌───────────────────────────────────────────────────┐     │
+│   │ locale: Locale          当前激活语言               │     │
+│   │ translations: Record    已加载翻译 Map             │     │
+│   │ subscribers: Set        订阅者集合                 │     │
+│   │ pendingLocale: Locale   待处理语言(离线时保留)     │     │
+│   │ localeRequestGeneration 请求代际(防竞态)          │     │
+│   │ inFlightLocaleLoads     进行中加载(去重)           │     │
+│   └───────────────────────────────────────────────────┘     │
+├─────────────────────────────────────────────────────────────┤
+│ Registry(registry.ts)                                       │
+│   LAZY_LOCALE_REGISTRY: Record<LazyLocale, () => Promise>   │
+│   resolveNavigatorLocale(): 浏览器语言 → Locale              │
+│   loadLazyLocaleTranslation(): 动态 import                  │
+├─────────────────────────────────────────────────────────────┤
+│ Types(types.ts)                                             │
+│   TranslationMap: { [key: string]: string | TranslationMap }│
+│   Locale: "en" | "zh-CN" | "zh-TW" | ... (21 种)           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 20.4.2 支持的 Locales
+
+**完整列表**(34 个文件):
+
+```
+ar.ts         Arabic( RTL)
+de.ts         German
+en.ts         English(默认)
+es.ts         Spanish
+fa.ts         Farsi( RTL)
+fr.ts         French
+hi.ts         Hindi
+id.ts         Indonesian
+it.ts         Italian
+ja-JP.ts      Japanese
+ko.ts         Korean
+nl.ts         Dutch
+pl.ts         Polish
+pt-BR.ts      Portuguese(Brazil)
+ru.ts         Russian
+th.ts         Thai
+tr.ts         Turkish
+uk.ts         Ukrainian
+vi.ts         Vietnamese
+zh-CN.ts      Chinese(Simplified)
+zh-TW.ts      Chinese(Traditional)
++ 13 个 en-*.ts 分段文件(agents / debug / devices / login / ...)
+```
+
+**细分文件**(按功能域拆分):
+
+```
+en-activity.ts        en-debug.ts          en-devices.ts
+en-login.ts           en-meetings.ts       en-memory-import.ts
+en-model-accounts.ts  en-new-session-setup.ts en-plugin-consent.ts
+en-session-placement.ts en-settings.ts     en-skill-library.ts
+en-transcripts.ts     en-update-actions.ts en-desktop.ts
+en-agents.ts
+```
+
+### 20.4.3 I18nManager 实现
+
+**初始化流程**:
+
+```typescript
+class I18nManager {
+  private locale: Locale = DEFAULT_LOCALE;
+  private translations: Partial<Record<Locale, TranslationMap>> = { [DEFAULT_LOCALE]: en };
+  private subscribers: Set<Subscriber> = new Set();
+  private pendingLocale: Locale | null = null;
+  private pendingLocaleShouldPersist = true;
+  private localeRequestGeneration = 0;
+  private inFlightLocaleLoads = new Map<Locale, Promise<TranslationMap | null>>();
+
+  constructor(private readonly loadLocaleTranslation: LocaleTranslationLoader = loadLazyLocaleTranslation) {
+    this.loadLocale();
+  }
+
+  private resolveInitialLocale(): { locale: Locale; shouldPersist: boolean } {
+    const saved = this.readStoredLocale();  // 1. 读取 localStorage
+    if (isSupportedLocale(saved)) return { locale: saved, shouldPersist: true };
+    const language = typeof globalThis.navigator?.language === "string" ? globalThis.navigator.language : null;
+    return { locale: resolveNavigatorLocale(language ?? ""), shouldPersist: false };  // 2. 回退 navigator.language
+  }
+}
+```
+
+**语言切换**(防竞态):
+
+```typescript
+public async setLocale(locale: Locale) {
+  return this.applyLocale(locale, false, true);
+}
+
+private async applyLocale(locale: Locale, retrying: boolean, shouldPersist: boolean) {
+  const requestGeneration = ++this.localeRequestGeneration;  // 递增代际
+  // ... 加载翻译
+  if (this.localeRequestGeneration !== requestGeneration) return;  // 过期请求丢弃
+  this.locale = locale;
+  this.translations[locale] = translations;
+  this.subscribers.forEach((subscriber) => subscriber(locale));  // 通知订阅者
+  if (shouldPersist) this.persistLocale(locale);  // 持久化到 localStorage
+}
+```
+
+**离线处理**:
+
+```typescript
+// Locale chunks are served by the gateway, so a selection made while disconnected can fail.
+// Preserve the target for the next connected transition; otherwise the chrome silently stays in the old language forever.
+private pendingLocale: Locale | null = null;
+private pendingLocaleShouldPersist = true;
+```
+
+### 20.4.4 Registry 实现
+
+**懒加载注册表**:
+
+```typescript
+const LAZY_LOCALE_REGISTRY: Record<LazyLocale, () => Promise<LocaleModule>> = {
+  "zh-CN": () => import("../locales/zh-CN.ts"),
+  "zh-TW": () => import("../locales/zh-TW.ts"),
+  "pt-BR": () => import("../locales/pt-BR.ts"),
+  de: () => import("../locales/de.ts"),
+  es: () => import("../locales/es.ts"),
+  "ja-JP": () => import("../locales/ja-JP.ts"),
+  ko: () => import("../locales/ko.ts"),
+  fr: () => import("../locales/fr.ts"),
+  hi: () => import("../locales/hi.ts"),
+  ar: () => import("../locales/ar.ts"),
+  it: () => import("../locales/it.ts"),
+  tr: () => import("../locales/tr.ts"),
+  uk: () => import("../locales/uk.ts"),
+  id: () => import("../locales/id.ts"),
+  pl: () => import("../locales/pl.ts"),
+  th: () => import("../locales/th.ts"),
+  vi: () => import("../locales/vi.ts"),
+  nl: () => import("../locales/nl.ts"),
+  fa: () => import("../locales/fa.ts"),
+  ru: () => import("../locales/ru.ts"),
+};
+```
+
+**浏览器语言解析**:
+
+```typescript
+export function resolveNavigatorLocale(browserLanguage: string): Locale {
+  const navLang = browserLanguage.toLowerCase();
+  if (navLang.startsWith("zh")) {
+    const [, ...subtags] = navLang.split("-");
+    if (subtags.includes("hant")) return "zh-TW";
+    if (subtags.includes("hans")) return "zh-CN";
+    return subtags.some((subtag) => subtag === "tw" || subtag === "hk" || subtag === "mo")
+      ? "zh-TW" : "zh-CN";
+  }
+  return LAZY_LOCALES.find((locale) => navLang.startsWith(locale.split("-")[0]!.toLowerCase())) ?? DEFAULT_LOCALE;
+}
+```
+
+**动态加载**:
+
+```typescript
+export async function loadLazyLocaleTranslation(locale: Locale): Promise<TranslationMap | null> {
+  if (!isLazyLocale(locale)) return null;
+  const module = await LAZY_LOCALE_REGISTRY[locale]();
+  return module[locale.replaceAll("-", "_")] ?? null;  // zh-CN → zh_CN
+}
+```
+
+### 20.4.5 RTL 支持
+
+```typescript
+const RTL_LOCALES = new Set<Locale>(["ar", "fa"]);
+
+function syncDocumentLocale(locale: Locale): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.lang = locale;
+  document.documentElement.dir = RTL_LOCALES.has(locale) ? "rtl" : "ltr";
+}
+```
+
+### 20.4.6 laew gap 清单
+
+| Gap ID | 描述 | 严重度 |
+|--------|------|--------|
+| L100 | 无 i18n 支持(中文硬编码) | P0 |
+| L101 | 无懒加载 locale | P1 |
+| L102 | 无 RTL 支持 | P2 |
+| L103 | 无浏览器语言自动检测 | P1 |
+| L104 | 无离线 pending locale | P2 |
+
+---
+
+## 20.5 Release 工程化与 AutoUpdate
+
+### 20.5.1 整体发布架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ GitHub Actions(CI)                                          │
+│   → pnpm build:docker → pnpm ui:build → 镜像构建            │
+├─────────────────────────────────────────────────────────────┤
+│ Docker 多阶段构建(Dockerfile)                               │
+│   workspace-deps → dependency-inputs → production-deps      │
+│   → build → runtime-build-output → runtime-assets → base    │
+├─────────────────────────────────────────────────────────────┤
+│ Docker Compose(双服务)                                      │
+│   openclaw-gateway + openclaw-cli                           │
+├─────────────────────────────────────────────────────────────┤
+│ 云平台部署                                                  │
+│   Render(render.yaml) + Fly.io(fly.toml) + 私有 Fly         │
+├─────────────────────────────────────────────────────────────┤
+│ AutoUpdate                                                  │
+│   appcast.xml(Sparkle) + 内置 update 机制                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 20.5.2 Dockerfile 7 阶段构建
+
+**完整阶段**:
+
+```dockerfile
+# Stage 1: workspace-deps — 提取 package.json
+FROM ${OPENCLAW_NODE_BOOKWORM_IMAGE} AS workspace-deps
+# 复制 package.json,packages,extensions → 提取 manifest
+
+# Stage 2: dependency-inputs — 共享 manifest 输入
+FROM ${OPENCLAW_NODE_BOOKWORM_IMAGE} AS dependency-inputs
+RUN corepack enable
+
+# Stage 3: production-deps — 生产依赖安装
+FROM dependency-inputs AS production-deps
+RUN --mount=type=cache,id=openclaw-pnpm-store,target=/root/.local/share/pnpm/store,sharing=locked \
+    NODE_OPTIONS=--max-old-space-size=2048 pnpm install --frozen-lockfile --prod \
+      --config.supportedArchitectures.os=linux \
+      --config.supportedArchitectures.cpu="$(node -p 'process.arch')" \
+      --config.supportedArchitectures.libc=glibc
+
+# Stage 4: build — 完整构建
+FROM dependency-inputs AS build
+COPY --from=bun-binary /usr/local/bin/bun /usr/local/bin/bun
+RUN --mount=type=cache,id=openclaw-pnpm-store,target=/root/.local/share/pnpm/store,sharing=locked \
+    NODE_OPTIONS=--max-old-space-size=2048 pnpm install --frozen-lockfile ...
+COPY . .
+RUN pnpm build:docker && pnpm ui:build
+
+# Stage 5: runtime-build-output — 编译输出
+FROM build AS runtime-build-output
+ARG OPENCLAW_BUNDLED_PLUGIN_DIR
+RUN rm -rf node_modules ui/node_modules && \
+    find packages "${OPENCLAW_BUNDLED_PLUGIN_DIR}" -name node_modules -prune -exec rm -rf {} +
+
+# Stage 6: runtime-assets — 运行时资产
+FROM production-deps AS runtime-assets
+COPY --from=runtime-build-output /app/ ./
+RUN node scripts/postinstall-bundled-plugins.mjs && \
+    OPENCLAW_EXTENSIONS="$(cat /tmp/openclaw-selected-plugin-dirs)" ... node scripts/prune-docker-plugin-dist.mjs && \
+    find dist -type f \( -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' -o -name '*.map' \) -delete && \
+    ...
+
+# Stage 7: base-runtime — 运行时基础
+FROM ${OPENCLAW_NODE_BOOKWORM_SLIM_IMAGE} AS base-runtime
+# 安装系统包:ca-certificates curl git hostname libgomp1 lsof openssh-client openssl procps python3 tini
+RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl git hostname libgomp1 lsof openssh-client openssl procps python3 tini && \
+    update-ca-certificates
+```
+
+**安全加固**:
+
+```dockerfile
+# 非 root 用户
+USER node
+
+# 验证工具链无需特权写入
+RUN COREPACK_ENABLE_NETWORK=0 PNPM_CONFIG_OFFLINE=true pnpm --version
+
+# tini init 进程
+ENTRYPOINT ["tini", "-s", "--"]
+```
+
+**健康检查**:
+
+```dockerfile
+HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
+  CMD ["node", "dist/docker-healthcheck.js"]
+```
+
+### 20.5.3 Docker Compose 双服务
+
+**Gateway 服务**:
+
+```yaml
+openclaw-gateway:
+  image: ${OPENCLAW_IMAGE:-openclaw:local}
+  build: .
+  environment:
+    HOME: /home/node
+    OPENCLAW_HOME: /home/node
+    OPENCLAW_STATE_DIR: /home/node/.openclaw
+    OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json
+    OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+    OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+    OPENCLAW_GATEWAY_PORT: "18789"
+    OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+  volumes:
+    - "${OPENCLAW_CONFIG_DIR:-${HOME:-/tmp}/.openclaw}:/home/node/.openclaw"
+    - "${OPENCLAW_WORKSPACE_DIR:-${HOME:-/tmp}/.openclaw/workspace}:/home/node/.openclaw/workspace"
+    - "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-${HOME:-/tmp}/.openclaw-auth-profile-secrets}:/home/node/.config/openclaw"
+  cap_drop:
+    - NET_RAW
+    - NET_ADMIN
+  security_opt:
+    - no-new-privileges:true
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  ports:
+    - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+    - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+    - "${OPENCLAW_MSTEAMS_PORT:-3978}:3978"
+  init: true
+  restart: unless-stopped
+  command: ["node", "dist/index.js", "gateway", "--bind", "${OPENCLAW_GATEWAY_BIND:-lan}", "--port", "18789"]
+  healthcheck:
+    test: ["CMD", "node", "dist/docker-healthcheck.js"]
+    interval: 30s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+```
+
+**CLI 服务**:
+
+```yaml
+openclaw-cli:
+  image: ${OPENCLAW_IMAGE:-openclaw:local}
+  network_mode: "service:openclaw-gateway"  # 共享 Gateway 网络命名空间
+  environment:
+    HOME: /home/node
+    OPENCLAW_HOME: /home/node
+    OPENCLAW_GATEWAY_PORT: "18789"
+    BROWSER: echo
+  volumes:
+    - "${OPENCLAW_CONFIG_DIR:-${HOME:-/tmp}/.openclaw}:/home/node/.openclaw"
+    - "${OPENCLAW_WORKSPACE_DIR:-${HOME:-/tmp}/.openclaw/workspace}:/home/node/.openclaw/workspace"
+    - "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-${HOME:-/tmp}/.openclaw-auth-profile-secrets}:/home/node/.config/openclaw"
+  stdin_open: true
+  tty: true
+  init: true
+  entrypoint: ["node", "dist/index.js"]
+  depends_on:
+    - openclaw-gateway
+```
+
+**关键设计**:
+- `network_mode: "service:openclaw-gateway"`:CLI 共享 Gateway 网络命名空间
+- `BROWSER: echo`:禁用浏览器(容器内无浏览器)
+- `init: true`:使用 tini 作为 init 进程
+- `restart: unless-stopped`:Gateway 自动重启
+
+### 20.5.4 Render 部署
+
+```yaml
+# render.yaml
+services:
+  - type: web
+    name: openclaw-gateway
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: OPENCLAW_GATEWAY_PORT
+        value: "18789"
+      - key: OPENCLAW_GATEWAY_TOKEN
+        generateValue: true  # 自动生成 token
+```
+
+### 20.5.5 Fly.io 部署
+
+**公开配置**(`fly.toml`):
+
+```toml
+[app]
+  app = "openclaw"
+  primary_region = "sjc"
+
+[http_service]
+  internal_port = 18789
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[http_service.checks]]
+  grace_period = "15s"
+  interval = "30s"
+  method = "get"
+  path = "/startupz"
+  timeout = "5s"
+```
+
+**私有配置**(`deploy/fly.private.toml`):
+
+```toml
+[app]
+  app = "openclaw-private"
+  primary_region = "sjc"
+
+# 无 [http_service] 块 — 仅通过 WireGuard 入口访问
+```
+
+### 20.5.6 AutoUpdate:`appcast.xml`
+
+**Sparkle 格式**:
+
+```xml
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>OpenClaw</title>
+        <item>
+            <title>2026.9.2</title>
+            <pubDate>Sat, 05 Sep 2026 23:48:36 +0000</pubDate>
+            <link>https://raw.githubusercontent.com/openclaw/openclaw/main/appcast.xml</link>
+            <sparkle:version>2609000290</sparkle:version>
+            <sparkle:shortVersionString>2026.9.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[<h2>OpenClaw 2026.9.2</h2>...
+            ]]></description>
+        </item>
+    </channel>
+</rss>
+```
+
+**版本号编码**:`2609000290` = 2026.9.2 build 90
+
+### 20.5.7 laew gap 清单
+
+| Gap ID | 描述 | 严重度 |
+|--------|------|--------|
+| L105 | 无 Docker 多阶段构建 | P1 |
+| L106 | 无 Docker Compose 编排 | P1 |
+| L107 | 无 Render/Fly.io 云部署 | P2 |
+| L108 | 无 AutoUpdate(appcast.xml) | P1 |
+| L109 | 无 GPG 指纹校验(Dockerfile) | P1 |
+| L110 | 无 CI/CD 工作流 | P0 |
+
+---
+## 20.6 WebSocket 与 SSE
+
+### 20.6.1 整体 WebSocket 架构
+
+OpenClaw Gateway 的 WebSocket 是**全双工 RPC 通道**,支持:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WebSocket Server(ws)                                        │
+│   ┌───────────────────────────────────────────────────┐     │
+│   │ Pre-Auth Phase                                    │     │
+│   │   - 连接预算(preauth-connection-budget)           │     │
+│   │   - 握手超时(handshake-timeouts)                  │     │
+│   │   - 认证(auth.ts)                                 │     │
+│   ├───────────────────────────────────────────────────┤     │
+│   │ Post-Auth Phase                                   │     │
+│   │   - 消息处理(message-handler)                     │     │
+│   │   - 方法注册(method-registry)                     │     │
+│   │   - 事件广播(broadcast)                           │     │
+│   ├───────────────────────────────────────────────────┤     │
+│   │ Keepalive                                         │     │
+│   │   - 25s ping/pong(websocket-keepalive)            │     │
+│   │   - 错过 pong 回调                                │     │
+│   ├───────────────────────────────────────────────────┤     │
+│   │ Presence                                          │     │
+│   │   - 客户端在线状态                                │     │
+│   │   - 版本快照(stateVersion)                        │     │
+│   └───────────────────────────────────────────────────┘     │
+├─────────────────────────────────────────────────────────────┤
+│ Talk Realtime Relay                                         │
+│   - 浏览器 Talk 音频 ↔ 实时语音 provider 桥接               │
+│   - WebRTC / Google Live / OpenAI Realtime                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 20.6.2 WebSocket 连接处理:`ws-connection.ts`
+
+**核心函数**:
+
+```typescript
+export function attachGatewayWsConnectionHandler(params: AttachGatewayWsConnectionHandlerParams) {
+  const { wss, clients, connectionWork, preauthConnectionBudget, port, ... } = params;
+  // ...
+}
+```
+
+**连接类型**:
+
+```typescript
+type GatewayWsClient = {
+  ws: GatewayIngressWebSocket;
+  connId: string;
+  auth: ResolvedGatewayAuth;
+  scopes: string[];
+  presenceVersion: number;
+  healthVersion: number;
+  // ...
+};
+```
+
+**握手阶段**:
+
+```typescript
+const WS_HANDSHAKE_PHASES = {
+  PREAUTH: "preauth",
+  AUTHENTICATING: "authenticating",
+  AUTHENTICATED: "authenticated",
+  CLOSED: "closed",
+} satisfies Record<string, WsHandshakePhase>;
+```
+
+**Pre-Auth 连接预算**:
+
+```typescript
+// preauth-connection-budget.ts
+export type PreauthConnectionBudget = {
+  acquire: (connId: string) => boolean;
+  release: (connId: string) => void;
+  size: () => number;
+};
+// 限制未认证连接数,防止 DDoS
+```
+
+**消息处理按需加载**:
+
+```typescript
+import { attachGatewayWsMessageHandlerOnDemand } from "./ws-connection/message-handler-loader.ts";
+// 延迟加载消息处理器,减少启动时间
+```
+
+### 20.6.3 WebSocket Keepalive:`websocket-keepalive.ts`
+
+**25 秒心跳**:
+
+```typescript
+export function startWebSocketKeepalive(socket: WebSocket, onMissedPong?: () => void): () => void {
+  let awaitingPong = false;
+  const onPong = () => { awaitingPong = false; };
+  const stop = () => {
+    clearInterval(timer);
+    socket.off("pong", onPong);
+    socket.off("close", stop);
+  };
+  socket.on("pong", onPong);
+  socket.once("close", stop);
+  const timer = setInterval(() => {
+    if (socket.readyState !== WebSocket.OPEN) { stop(); return; }
+    if (awaitingPong && onMissedPong) { onMissedPong(); return; }
+    awaitingPong = true;
+    try { socket.ping(); } catch { /* The socket owner handles transport failure and closes the connection. */ }
+  }, 25_000);
+  return stop;
+}
+```
+
+**设计要点**:
+- 25s 间隔(ping)
+- 等待 pong 标志 `awaitingPong`
+- 错过 pong 回调 `onMissedPong`
+- 自动清理:`socket.once("close", stop)`
+
+### 20.6.4 WebSocket Runtime:`server-ws-runtime.ts`
+
+**上下文注入**:
+
+```typescript
+type GatewayWsRuntimeParams = Omit<
+  AttachGatewayWsConnectionHandlerParams,
+  "buildRequestContext" | "refreshHealthSnapshot"
+> & {
+  context: GatewayRequestContext;
+};
+
+export function attachGatewayWsHandlers(params: GatewayWsRuntimeParams) {
+  attachGatewayWsConnectionHandler({
+    wss: params.wss,
+    clients: params.clients,
+    connectionWork: params.connectionWork,
+    bootId: params.bootId,
+    preauthConnectionBudget: params.preauthConnectionBudget,
+    port: params.port,
+    gatewayHost: params.gatewayHost,
+    pluginSurfaceScheme: params.pluginSurfaceScheme,
+    getPluginNodeCapabilities: params.getPluginNodeCapabilities,
+    getResolvedAuth: params.getResolvedAuth,
+    getRequiredSharedGatewaySessionGeneration: params.getRequiredSharedGatewaySessionGeneration,
+    rateLimiter: params.rateLimiter,
+    browserRateLimiter: params.browserRateLimiter,
+    nodeReapprovalCoordinator: params.nodeReapprovalCoordinator,
+    preauthHandshakeTimeoutMs: params.preauthHandshakeTimeoutMs,
+    isStartupPending: params.isStartupPending,
+    isPendingWorkerNodeSetup: params.isPendingWorkerNodeSetup,
+    gatewayMethods: params.gatewayMethods,
+    events: params.events,
+    refreshHealthSnapshot: params.context.refreshHealthSnapshot,
+    logGateway: params.logGateway,
+    logHealth: params.logHealth,
+    logWsControl: params.logWsControl,
+    extraHandlers: params.extraHandlers,
+    getMethodRegistry: params.getMethodRegistry,
+    broadcast: params.broadcast,
+    buildRequestContext: () => params.context,  // 注入预构建的 context
+  });
+}
+```
+
+### 20.6.5 Talk Realtime Relay
+
+**核心模块**:
+
+```typescript
+// talk-realtime-relay.ts
+export { createTalkRealtimeRelaySession } from "./talk-realtime-relay-session-create.js";
+export {
+  acknowledgeTalkRealtimeRelayMark,
+  cancelTalkRealtimeRelayTurn,
+  ensureTalkRealtimeRelayVoiceSession,
+  flushTalkRealtimeRelayVoiceWrites,
+  registerTalkRealtimeRelayAgentRun,
+  sendTalkRealtimeRelayAudio,
+  steerTalkRealtimeRelayAgentRun,
+  stopTalkRealtimeRelaySession,
+  submitTalkRealtimeRelayToolResult,
+} from "./talk-realtime-relay-operations.js";
+```
+
+**子模块**:
+
+| 文件 | 职责 |
+|------|------|
+| talk-realtime-relay-session-create.ts | 创建 relay 会话 |
+| talk-realtime-relay-operations.ts | 操作原语 |
+| talk-realtime-relay-state.ts | 状态管理 |
+| talk-realtime-relay-tool-call-ledger.ts | 工具调用账本 |
+| talk-realtime-relay-voice.ts | 语音处理 |
+| talk-realtime-relay-forced-consults.ts | 强制咨询 |
+| talk-realtime-relay-provider-results.ts | provider 结果 |
+| talk-realtime-relay-issues.ts | 问题追踪 |
+
+**Chat 页面实时语音**:
+
+```
+pages/chat/
+  realtime-talk.ts                  # 主入口
+  realtime-talk-audio.ts            # 音频处理
+  realtime-talk-camera-controller.ts # 摄像头控制
+  realtime-talk-conversation.ts     # 会话管理
+  realtime-talk-gateway-relay.ts    # Gateway 中继
+  realtime-talk-google-live.ts      # Google Live 集成
+  realtime-talk-input.ts            # 输入处理
+  realtime-talk-level.ts            # 音量级别
+  realtime-talk-lifecycle.ts        # 生命周期
+  realtime-talk-ordering.ts         # 排序
+  realtime-talk-shared.ts           # 共享
+  realtime-talk-transcript-owner.ts # 转录所有者
+  realtime-talk-transport.ts        # 传输
+  realtime-talk-video.ts            # 视频
+  realtime-talk-webrtc.ts           # WebRTC
+  realtime-talk-webrtc-video.ts     # WebRTC 视频
+```
+
+### 20.6.6 WebSocket 协议:`websocket-protocol.ts`
+
+```typescript
+/** Map the HTTP aliases accepted by WebSocket clients onto their canonical schemes. */
+export function normalizeWebSocketProtocol(protocol: string): string {
+  return protocol === "https:" ? "wss:" : protocol === "http:" ? "ws:" : protocol;
+}
+```
+
+### 20.6.7 laew gap 清单
+
+| Gap ID | 描述 | 严重度 |
+|--------|------|--------|
+| L111 | 无 WebSocket 服务端 | P0 |
+| L112 | 无 ping/pong keepalive | P1 |
+| L113 | 无 pre-auth 连接预算 | P1 |
+| L114 | 无 Talk Realtime Relay | P2 |
+| L115 | 无 WebRTC 集成 | P2 |
+| L116 | 无消息处理按需加载 | P1 |
+
+---
+
+## 20.7 DevContainer 与容器化
+
+### 20.7.1 整体容器化架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 开发环境                                                    │
+│   - pnpm workspace 多包管理                                 │
+│   - Corepack(Bun + pnpm)                                    │
+│   - 本地 Docker(可选)                                       │
+├─────────────────────────────────────────────────────────────┤
+│ 构建环境                                                    │
+│   - Docker 多阶段构建(7 阶段)                               │
+│   - Buildx / Podman 兼容                                    │
+│   - 缓存挂载(pnpm store / apt)                              │
+├─────────────────────────────────────────────────────────────┤
+│ 运行环境                                                    │
+│   - Docker Compose(双服务)                                  │
+│   - Render(Blueprint)                                       │
+│   - Fly.io(公网 + 私有)                                     │
+├─────────────────────────────────────────────────────────────┤
+│ 安全加固                                                    │
+│   - 非 root 用户(node:1000)                                 │
+│   - cap_drop(NET_RAW / NET_ADMIN)                           │
+│   - no-new-privileges                                       │
+│   - tini init 进程                                          │
+│   - GPG 指纹校验(Docker CLI)                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 20.7.2 Dockerfile 安全加固
+
+**GPG 指纹校验**(Docker CLI 安装):
+
+```dockerfile
+ARG OPENCLAW_DOCKER_GPG_FINGERPRINT="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    if [ -n "$OPENCLAW_INSTALL_DOCKER_CLI" ]; then \
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg && \
+      install -m 0755 -d /etc/apt/keyrings && \
+      curl -fsSL --connect-timeout 10 --max-time 120 \
+        https://download.docker.com/linux/debian/gpg -o /tmp/docker.gpg.asc && \
+      expected_fingerprint="$(printf '%s' "$OPENCLAW_DOCKER_GPG_FINGERPRINT" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')" && \
+      docker_gpg_pub_count="$(gpg --batch --show-keys --with-colons /tmp/docker.gpg.asc | awk -F: '$1 == "pub" { c++ } END { print c+0 }')" && \
+      if [ "$docker_gpg_pub_count" != "1" ]; then \
+        echo "ERROR: Docker apt key must contain exactly one public key (found $docker_gpg_pub_count); refusing a multi-key file." >&2; \
+        exit 1; \
+      fi && \
+      actual_fingerprint="$(gpg --batch --show-keys --with-colons /tmp/docker.gpg.asc | awk -F: '$1 == "fpr" { print toupper($10); exit }')" && \
+      if [ -z "$actual_fingerprint" ] || [ "$actual_fingerprint" != "$expected_fingerprint" ]; then \
+        echo "ERROR: Docker apt key fingerprint mismatch (expected $expected_fingerprint, got ${actual_fingerprint:-<empty>})" >&2; \
+        exit 1; \
+      fi && \
+      gpg --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker.gpg.asc && \
+      rm -f /tmp/docker.gpg.asc && \
+      chmod a+r /etc/apt/keyrings/docker.gpg && \
+      printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable\n' \
+        "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.list && \
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        docker-ce-cli docker-compose-plugin; \
+    fi
+```
+
+**关键安全步骤**:
+1. 下载 Docker GPG 公钥
+2. 验证**恰好 1 个**公钥(`pub_count == 1`)
+3. 提取指纹(`fpr` 字段)并**大写比较**
+4. `--dearmor` 转换并安装到 `/etc/apt/keyrings/docker.gpg`
+5. `signed-by` 指定签名密钥
+
+**非 root 用户**:
+
+```dockerfile
+# Security hardening: Run as non-root user
+# The node:24-bookworm image includes a 'node' user (uid 1000)
+# This reduces the attack surface by preventing container escape via root privileges
+USER node
+
+# Verify the shipped toolchain needs no privileged writes or first-run downloads.
+RUN COREPACK_ENABLE_NETWORK=0 PNPM_CONFIG_OFFLINE=true pnpm --version
+```
+
+**tini init 进程**:
+
+```dockerfile
+ENTRYPOINT ["tini", "-s", "--"]
+# -s: subreaper(收养孤儿进程)
+```
+
+### 20.7.3 Docker Compose 安全加固
+
+```yaml
+cap_drop:
+  - NET_RAW
+  - NET_ADMIN
+security_opt:
+  - no-new-privileges:true
+init: true  # 使用 tini
+restart: unless-stopped
+```
+
+**沙箱可选启用**:
+
+```yaml
+## Uncomment the lines below to enable sandbox isolation
+## (agents.defaults.sandbox). Requires Docker CLI in the image
+## (build with --build-arg OPENCLAW_INSTALL_DOCKER_CLI=1) or use
+## scripts/docker/setup.sh with OPENCLAW_SANDBOX=1 for automated setup.
+## Set DOCKER_GID to the host's docker group GID (run: stat -c '%g' /var/run/docker.sock).
+# - /var/run/docker.sock:/var/run/docker.sock
+# group_add:
+#   - "${DOCKER_GID:-999}"
+```
+
+### 20.7.4 构建缓存优化
+
+```dockerfile
+# pnpm store 缓存
+RUN --mount=type=cache,id=openclaw-pnpm-store,target=/root/.local/share/pnpm/store,sharing=locked \
+    NODE_OPTIONS=--max-old-space-size=2048 pnpm install --frozen-lockfile ...
+
+# apt 缓存
+RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    apt-get update && ...
+```
+
+### 20.7.5 版本校验
+
+```dockerfile
+# Validate the three version surfaces in every release-built runtime variant.
+ARG OPENCLAW_DOCKER_BUILD_VERSION
+RUN if [ -n "$OPENCLAW_DOCKER_BUILD_VERSION" ]; then \
+      test "$(node -p "require(\"/app/package.json\").version")" = "$OPENCLAW_DOCKER_BUILD_VERSION"; \
+      test "$(node -p "require(\"/app/dist/build-info.json\").version")" = "$OPENCLAW_DOCKER_BUILD_VERSION"; \
+      test "$(node /app/openclaw.mjs --version | cut -d ' ' -f 2)" = "$OPENCLAW_DOCKER_BUILD_VERSION"; \
+    fi
+```
+
+**三个版本表面**:
+1. `package.json` 版本
+2. `dist/build-info.json` 版本
+3. CLI `--version` 输出
+
+### 20.7.6 可选组件
+
+**浏览器自动化**:
+
+```dockerfile
+# Optionally install Chromium and Xvfb for browser automation.
+# Build with: docker build --build-arg OPENCLAW_INSTALL_BROWSER=1 ...
+# Adds ~300MB but eliminates the 60-90s Playwright install on every container start.
+ARG OPENCLAW_INSTALL_BROWSER=""
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright
+RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb && \
+      install -d -m 0755 -o node -g node "$(dirname "$PLAYWRIGHT_BROWSERS_PATH")" && \
+      mkdir -p "$PLAYWRIGHT_BROWSERS_PATH" && \
+      node /app/node_modules/playwright-core/cli.js install --with-deps chromium && \
+      chown -R node:node "$PLAYWRIGHT_BROWSERS_PATH"; \
+    fi
+```
+
+**Docker CLI**(沙箱):
+
+```dockerfile
+# Optionally install Docker CLI for sandbox container management.
+# Build with: docker build --build-arg OPENCLAW_INSTALL_DOCKER_CLI=1 ...
+# Adds ~50MB. Only the CLI is installed — no Docker daemon.
+# Required for agents.defaults.sandbox to function in Docker deployments.
+ARG OPENCLAW_INSTALL_DOCKER_CLI=""
+```
+
+**自定义 APT 包**:
+
+```dockerfile
+# Install additional system packages needed by your skills or extensions.
+# Example: docker build --build-arg OPENCLAW_IMAGE_APT_PACKAGES="python3 wget" .
+ARG OPENCLAW_IMAGE_APT_PACKAGES
+ARG OPENCLAW_DOCKER_APT_PACKAGES=""
+ENV PATH="/home/node/.local/bin:${PATH}"
+RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    packages="${OPENCLAW_IMAGE_APT_PACKAGES:-$OPENCLAW_DOCKER_APT_PACKAGES}"; \
+    if [ -n "$packages" ]; then \
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages; \
+    fi
+```
+
+**自定义 pip 包**:
+
+```dockerfile
+# Install additional Python packages needed by your plugins or skills.
+# Example: docker build --build-arg OPENCLAW_IMAGE_PIP_PACKAGES="requests humanize" .
+ARG OPENCLAW_IMAGE_PIP_PACKAGES=""
+RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    if [ -n "$OPENCLAW_IMAGE_PIP_PACKAGES" ]; then \
+      if ! python3 -m pip --version >/dev/null 2>&1; then \
+        apt-get update && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-pip; \
+      fi && \
+      python3 -m pip install --no-cache-dir --break-system-packages $OPENCLAW_IMAGE_PIP_PACKAGES; \
+    fi
+```
+
+### 20.7.7 laew gap 清单
+
+| Gap ID | 描述 | 严重度 |
+|--------|------|--------|
+| L117 | 无 Dockerfile | P0 |
+| L118 | 无 Docker Compose | P0 |
+| L119 | 无 GPG 指纹校验 | P1 |
+| L120 | 无 cap_drop / no-new-privileges | P0 |
+| L121 | 无 tini init 进程 | P1 |
+| L122 | 无构建缓存挂载 | P1 |
+| L123 | 无版本三表面校验 | P1 |
+
+---
+
+## 20.8 CRDT 与多端冲突
+
+### 20.8.1 整体 Boards 架构
+
+OpenClaw 的 Boards 模块是**类 CRDT 的协作数据模型**,支持:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ BoardStore(board-store.ts)                                  │
+│   - getSnapshot / applyOps / putWidget / grant              │
+│   - 纯内存操作接口                                          │
+├─────────────────────────────────────────────────────────────┤
+│ BoardLayout(board-layout.ts)                                │
+│   - applyBoardOp / normalizeBoardLayout / insertBoardWidget │
+│   - 10 种 BoardOp                                           │
+├─────────────────────────────────────────────────────────────┤
+│ SqliteBoardStore(sqlite-board-store.ts)                     │
+│   - SQLite 持久化(board_tabs + board_widgets)               │
+│   - 延迟 DDL + IMMEDIATE 事务                              │
+├─────────────────────────────────────────────────────────────┤
+│ SqliteBoardCodec(sqlite-board-codec.ts)                     │
+│   - parseManifest / serializeManifest / rowToWidget         │
+│   - 内容所有权 + grant 语义                                 │
+├─────────────────────────────────────────────────────────────┤
+│ BoardCapabilities(board-capabilities.ts)                    │
+│   - normalizeBoardWidgetDeclared / boardDeclarationIsSubset │
+│   - 网络起源 + 工具能力声明                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 20.8.2 BoardStore 接口
+
+```typescript
+export interface BoardStore {
+  getSnapshot(target: BoardSessionTarget): BoardSnapshot;
+  getSnapshotWithHtmlViewMetadata(target: BoardSessionTarget): BoardSnapshotWithHtmlViewMetadata;
+  applyOps(target: BoardSessionTarget, ops: readonly BoardOp[]): BoardSnapshot;
+  putWidget(params: BoardWidgetMaterializedPutParams): BoardWidgetPutResult;
+  grant(target: BoardSessionTarget, name: string, decision: "granted" | "rejected", revision: number, instanceId?: string): BoardSnapshot;
+  readWidgetHtml(target: BoardSessionTarget, name: string): BoardWidgetHtmlDocument | undefined;
+  readWidgetRegistered(target: BoardSessionTarget, name: string): BoardWidgetRegisteredDocument | undefined;
+  readWidgetMcpApp(target: BoardSessionTarget, name: string): BoardWidgetMcpAppDocument | undefined;
+}
+```
+
+**BoardSnapshot**:
+
+```typescript
+type BoardSnapshot = {
+  sessionKey: string;
+  revision: number;  // 修订号(乐观并发控制)
+  tabs: BoardTab[];
+  widgets: BoardWidget[];
+};
+```
+
+### 20.8.3 BoardOp 10 种操作
+
+```typescript
+type BoardOp =
+  | { kind: "tab_create"; tabId: string; title: string; chatDock?: "left" | "right" }
+  | { kind: "tab_update"; tabId: string; title?: string; chatDock?: "left" | "right"; position?: number }
+  | { kind: "tab_delete"; tabId: string }
+  | { kind: "tabs_reorder"; tabIds: string[] }
+  | { kind: "widget_move"; name: string; tabId?: string; position?: number; after?: string }
+  | { kind: "widget_resize"; name: string; sizeW: number; sizeH: number; heightMode?: "auto" | "fixed" }
+  | { kind: "widget_remove"; name: string };
+```
+
+**操作应用**(`applyBoardOp`):
+
+```typescript
+function applyBoardOp(layout: BoardLayout, op: BoardOp): void {
+  switch (op.kind) {
+    case "tab_create": {
+      if (layout.tabs.some((tab) => tab.tabId === op.tabId))
+        throw new BoardValidationError("conflict", `board tab already exists: ${op.tabId}`);
+      layout.tabs.push({ tabId: op.tabId, title: op.title, position: layout.tabs.length, chatDock: op.chatDock ?? "right" });
+      return;
+    }
+    case "tab_update": { /* ... */ }
+    case "tab_delete": {
+      const tab = requireTab(layout, op.tabId);
+      const remainingTabs = layout.tabs.filter((candidate) => candidate !== tab).toSorted(comparePosition);
+      const tabWidgets = layout.widgets.filter((widget) => widget.tabId === op.tabId).toSorted(comparePosition);
+      if (remainingTabs.length === 0 && tabWidgets.length > 0)
+        throw new BoardValidationError("invalid_operation", "cannot delete the last board tab while it contains widgets");
+      layout.tabs = remainingTabs;
+      if (tabWidgets.length > 0) {
+        const fallback = remainingTabs[0]!;
+        for (const widget of tabWidgets) {
+          widget.tabId = fallback.tabId;
+          widget.position = Number.MAX_SAFE_INTEGER;  // 重新排序
+        }
+      }
+      return;
+    }
+    case "tabs_reorder": {
+      if (op.tabIds.length !== layout.tabs.length ||
+          new Set(op.tabIds).size !== op.tabIds.length ||
+          op.tabIds.some((tabId) => !layout.tabs.some((tab) => tab.tabId === tabId))))
+        throw new BoardValidationError("invalid_operation", "tabs_reorder must contain every tab exactly once");
+      const byId = new Map(layout.tabs.map((tab) => [tab.tabId, tab]));
+      layout.tabs = op.tabIds.map((tabId, position) => {
+        const tab = byId.get(tabId)!;
+        tab.position = position;
+        return tab;
+      });
+      return;
+    }
+    case "widget_move": { /* ... */ }
+    case "widget_resize": { /* ... */ }
+    case "widget_remove": {
+      requireWidget(layout, op.name);
+      layout.widgets = layout.widgets.filter((widget) => widget.name !== op.name);
+    }
+  }
+}
+```
+
+**widget_move 的 after 锚点**:
+
+```typescript
+function moveWidget(layout: BoardLayout, widget: BoardWidget, targetTabId: string, position?: number, after?: string): void {
+  requireTab(layout, targetTabId);
+  if (position !== undefined && after !== undefined)
+    throw new BoardValidationError("invalid_operation", "widget_move accepts either position or after, not both");
+  const targetWidgets = layout.widgets
+    .filter((candidate) => candidate.tabId === targetTabId && candidate !== widget)
+    .toSorted(comparePosition);
+  let targetPosition = targetWidgets.length;
+  if (after !== undefined) {
+    if (after === widget.name)
+      throw new BoardValidationError("invalid_operation", "widget cannot be placed after itself");
+    const anchorIndex = targetWidgets.findIndex((candidate) => candidate.name === after);
+    if (anchorIndex < 0)
+      throw new BoardValidationError("not_found", `board widget anchor not found on tab ${targetTabId}: ${after}`);
+    targetPosition = anchorIndex + 1;
+  } else if (position !== undefined) {
+    targetPosition = clampInteger(position, 0, targetWidgets.length);
+  }
+  widget.tabId = targetTabId;
+  targetWidgets.splice(targetPosition, 0, widget);
+  targetWidgets.forEach((candidate, index) => { candidate.position = index; });
+  const otherWidgets = layout.widgets.filter((candidate) => candidate !== widget && candidate.tabId !== targetTabId);
+  layout.widgets = [...otherWidgets, ...targetWidgets];
+}
+```
+
+### 20.8.4 布局归一化
+
+```typescript
+export function normalizeBoardLayout(layout: BoardLayout): BoardLayout {
+  const tabs = layout.tabs.toSorted(comparePosition).map((tab, position) => {
+    const next = cloneTab(tab);
+    next.position = position;  // 重新编号
+    return next;
+  });
+  const tabPosition = new Map(tabs.map((tab) => [tab.tabId, tab.position]));
+  const widgets = layout.widgets
+    .toSorted((a, b) => {
+      const tabDelta = (tabPosition.get(a.tabId) ?? Number.MAX_SAFE_INTEGER) -
+                       (tabPosition.get(b.tabId) ?? Number.MAX_SAFE_INTEGER);
+      return tabDelta || a.position - b.position;
+    })
+    .map(cloneWidget);
+  const nextPosition = new Map<string, number>();
+  for (const widget of widgets) {
+    const position = nextPosition.get(widget.tabId) ?? 0;
+    widget.position = position;  // 重新编号
+    nextPosition.set(widget.tabId, position + 1);
+  }
+  return { tabs, widgets };
+}
+```
+
+### 20.8.5 SqliteBoardStore 持久化
+
+**延迟 DDL**:
+
+```typescript
+function ensureBoardSchema(database: OpenClawAgentDatabase): void {
+  if (ensuredBoardDatabases.has(database.db)) return;
+  if (database.db.isTransaction)
+    throw new Error("board schema must be ensured before the write transaction starts");
+  runSqliteImmediateTransactionSync(database.db,
+    () => ensureOpenClawAgentBoardSchemaInTransaction(database.db),
+    { databaseLabel: database.path, operationLabel: "board.ensure-schema" });
+  ensuredBoardDatabases.add(database.db);
+  presentBoardDatabases.add(database.db);
+}
+```
+
+**读取存储的 Board**:
+
+```typescript
+function readStoredBoard(database: BoardDatabaseHandle, sessionKey: string): StoredBoard {
+  return runSqliteDeferredTransactionSync(database.db, () => {
+    const db = getNodeSqliteKysely<BoardDatabase>(database.db);
+    const tabRows = executeSqliteQuerySync(database.db,
+      db.selectFrom("board_tabs").selectAll()
+        .where("session_key", "=", sessionKey)
+        .orderBy("position", "asc").orderBy("tab_id", "asc")).rows;
+    const selectedWidgetRows = executeSqliteQuerySync(database.db,
+      db.selectFrom("board_widgets").select(BOARD_WIDGET_SNAPSHOT_COLUMNS)
+        .where("session_key", "=", sessionKey)
+        .orderBy("tab_id", "asc").orderBy("position", "asc").orderBy("name", "asc")).rows;
+    const parsedWidgetRows = selectedWidgetRows.map((row) => ({ row, manifest: parseManifest(row.manifest) }));
+    // Rows without the canonical authority snapshot predate this unreleased contract.
+    // Keep them out of runtime state so they can never mint an interactive lease.
+    const admittedWidgetRows = parsedWidgetRows.filter(({ row, manifest }) => {
+      if (row.content_kind !== "mcp-app") return true;
+      return manifest.mcpAppInteractive !== undefined && manifest.mcpAppInstanceId !== undefined;
+    });
+    const htmlViewMetadata = new Map<string, BoardWidgetHtmlViewMetadata>();
+    for (const { row, manifest } of admittedWidgetRows) {
+      const metadata = rowToHtmlViewMetadata(row, manifest);
+      if (metadata) htmlViewMetadata.set(row.name, metadata);
+    }
+    const layout = normalizeBoardLayout({
+      tabs: tabRows.map(rowToTab),
+      widgets: admittedWidgetRows.map(({ row, manifest }) => rowToWidget(row, manifest)),
+    });
+    return {
+      snapshot: {
+        sessionKey,
+        revision: tabRows.reduce((revision, row) => Math.max(revision, row.revision), 0),
+        ...layout,
+      },
+      tabRows,
+      widgetRows: admittedWidgetRows.map(({ row }) => row),
+      htmlViewMetadata,
+    };
+  }, { databaseLabel: database.path, operationLabel: "board.read" });
+}
+```
+
+### 20.8.6 SqliteBoardCodec 内容所有权
+
+**Manifest 解析**:
+
+```typescript
+export function parseManifest(value: string): ParsedBoardManifest {
+  const parsed = JSON.parse(value) as {
+    contentOwner?: unknown;
+    registeredContentKind?: unknown;
+    netOrigins?: unknown;
+    tools?: unknown;
+    grantSemanticsVersion?: unknown;
+    presentation?: unknown;
+    heightMode?: unknown;
+    nameIdentity?: unknown;
+    mcpAppInteractive?: unknown;
+    mcpAppInstanceId?: unknown;
+    registeredInstanceId?: unknown;
+  };
+  const contentOwnerPresent = Object.hasOwn(parsed, "contentOwner");
+  const contentOwner =
+    parsed.contentOwner === "html" || parsed.contentOwner === "mcp-app" ||
+    parsed.contentOwner === "plugin" || parsed.contentOwner === "registered"
+      ? parsed.contentOwner : undefined;
+  const registeredContentKind =
+    typeof parsed.registeredContentKind === "string" &&
+    /^[a-z][a-z0-9-]{0,31}$/u.test(parsed.registeredContentKind)
+      ? parsed.registeredContentKind : undefined;
+  if ((contentOwnerPresent && contentOwner === undefined) ||
+      (contentOwner === "registered" && registeredContentKind === undefined) ||
+      (contentOwner !== "registered" && Object.hasOwn(parsed, "registeredContentKind"))) {
+    throw new BoardValidationError("invalid_operation", "board widget content ownership is invalid");
+  }
+  // ...
+}
+```
+
+**Grant 语义版本**:
+
+```typescript
+const BOARD_GRANT_SEMANTICS_VERSION = 2;
+
+export function effectiveGrantState(storedGrantState: string, manifest: ParsedBoardManifest): BoardWidget["grantState"] {
+  const grantState: BoardWidget["grantState"] =
+    storedGrantState === "pending" || storedGrantState === "granted" || storedGrantState === "rejected"
+      ? storedGrantState : "none";
+  if (manifest.declarationInvalid || (!manifest.declared && manifest.mcpAppInteractive !== true)) {
+    // Losing an invalid legacy declaration removes authority, never an operator's explicit rejection of the widget document itself.
+    return grantState === "rejected" ? "rejected" : "none";
+  }
+  if (grantState === "granted" && manifest.grantSemanticsVersion !== BOARD_GRANT_SEMANTICS_VERSION) {
+    // Older stores rebound granted_sha after byte changes. Their hashes cannot prove operator approval under the byte-frozen capability contract.
+    return "pending";
+  }
+  return grantState;
+}
+```
+
+### 20.8.7 BoardCapabilities 能力声明
+
+**网络起源验证**:
+
+```typescript
+function normalizeBoardNetOrigin(value: string): string {
+  if (value !== value.trim() || value.length === 0 || value.length > 2048)
+    return invalidDeclaration(`invalid board widget network origin: ${value}`);
+  let parsed: URL;
+  try { parsed = new URL(value); }
+  catch { return invalidDeclaration(`invalid board widget network origin: ${value}`); }
+  const supportedHostname = /^\[[0-9A-Fa-f:.]+\]$/u.test(parsed.hostname) || /^[A-Za-z0-9.-]+$/u.test(parsed.hostname);
+  if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "" ||
+      parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "" ||
+      !supportedHostname || parsed.hostname.includes("*") || parsed.hostname.endsWith("."))
+    return invalidDeclaration(`board widget network origin must be an exact HTTPS origin: ${value}`);
+  return parsed.origin;
+}
+```
+
+**能力子集检查**:
+
+```typescript
+export function boardDeclarationIsSubset(
+  requested: BoardWidgetDeclared | undefined,
+  granted: BoardWidgetDeclared | undefined,
+): boolean {
+  const grantedOrigins = new Set(granted?.netOrigins ?? []);
+  const grantedTools = new Set(granted?.tools ?? []);
+  return (requested?.netOrigins ?? []).every((origin) => grantedOrigins.has(origin)) &&
+         (requested?.tools ?? []).every((tool) => grantedTools.has(tool));
+}
+```
+
+### 20.8.8 Canvas Widget Tool
+
+**show_widget 工具**:
+
+```typescript
+export function hasRegisteredShowWidgetKinds(): boolean {
+  return listBoardWidgetContentKinds(currentPluginRegistry()).length > 0;
+}
+
+function createShowWidgetToolSchema(kinds, presenters, capabilityGuidance, pinnedOnly, reportAvailable) {
+  const presenterTargets = presenters.flatMap((presenter) =>
+    presenter.target === "current_channel" ? [] : [presenter.target]);
+  const targets = ["assistant_message", ...presenterTargets] as const;
+  const widgetCode = Type.String({
+    description: "Required for HTML/SVG or registered source. Use fluid widths and wrap or stack narrow layouts; reserve horizontal scrolling for exact geometry.",
+  });
+  return Type.Object({
+    title: Type.String(),
+    widget_code: reportAvailable ? Type.Optional(widgetCode) : widgetCode,
+    kind: optionalStringEnum(kinds, { description: `Widget source kind: ${kinds.join(", ")}` }),
+    name: Type.Optional(Type.String({
+      pattern: "^[a-z0-9][a-z0-9._-]{0,63}$",
+      description: "Stable dashboard widget name; reuse the same name with pin=true and new report data or widget_code to update",
+    })),
+    pin: pinnedOnly ? Type.Literal(true, { description: "Required: this surface can only author pinned widgets" })
+                    : Type.Optional(Type.Boolean({ description: "Pin only for an explicit dashboard request or multiple non-visualizations" })),
+    tab: Type.Optional(Type.String({ pattern: "^[a-z0-9-]{1,40}$", description: "Dashboard tab slug" })),
+    size: optionalStringEnum(["sm", "md", "lg", "xl", "full"] as const, { description: "Dashboard size: sm, md, lg, xl, or full" }),
+    presentation: Type.Optional(Type.Object({
+      ...(pinnedOnly ? {} : { target: optionalStringEnum(targets, { description: ["Where to show the widget. assistant_message: inline in chat", ...presenterDescriptions].join("; ") }) }),
+      frame: optionalStringEnum(["card", "full-bleed", "frameless"] as const, { description: "Pinned dashboard frame: card, full-bleed, or frameless" }),
+    })),
+    after: Type.Optional(Type.String({ pattern: "^[a-z0-9][a-z0-9._-]{0,63}$", description: "Place after this dashboard widget name" })),
+    capabilities: Type.Optional(Type.Object({
+      netOrigins: Type.Optional(Type.Array(Type.String(), { description: "Exact HTTPS origins the pinned widget may fetch after approval" })),
+      tools: Type.Optional(Type.Array(Type.String(), { description: `Pinned widget host tools: prompt or cron.trigger:<jobId>; grant each read/action ID below unless a scoped grant is specified. ${capabilityGuidance}` })),
+    })),
+  });
+}
+```
+
+### 20.8.9 laew gap 清单
+
+| Gap ID | 描述 | 严重度 |
+|--------|------|--------|
+| L124 | 无 CRDT 协作数据模型 | P1 |
+| L125 | 无 BoardOp 10 种操作 | P1 |
+| L126 | 无布局归一化 | P1 |
+| L127 | 无内容所有权(html/plugin/mcp-app/registered) | P1 |
+| L128 | 无 grant 语义版本控制 | P1 |
+| L129 | 无网络起源验证 | P1 |
+| L130 | 无能力子集检查 | P1 |
+| L131 | 无 Canvas Widget Tool | P2 |
+
+---
+
+## 20.9 综合:四维度交叉点
+
+四个维度虽然表面独立,但有 **4 个关键交叉点**:
+
+1. **CrashDump × WebUI**
+   - `entry.respawn.ts` 的 `Failed to respawn CLI` 错误需要 WebUI 展示
+   - **借鉴**:laew 的 TUI 错误输出应包含结构化诊断信息(错误码 + 建议操作)
+
+2. **OAuth × WebSocket**
+   - WebSocket 连接使用 OAuth token 认证(`auth.ts`)
+   - **借鉴**:laew 的 provider 切换应支持 WebSocket 实时通知
+
+3. **i18n × Release**
+   - `appcast.xml` 的更新说明需要多语言
+   - **借鉴**:laew 的 `--version` 输出应支持 i18n
+
+4. **CRDT × DevContainer**
+   - Boards 的 SQLite 持久化在容器卷中
+   - **借鉴**:laew 的 SQLite 应支持卷挂载 + WAL 模式
+
+---
+
+## 20.10 关键文件路径汇总表
+
+| 类别 | 路径(相对) | 行数 | 核心职责 |
+|------|----------|------|---------|
+| 进程 Respawn | `src/entry.respawn.ts` | 190 | Windows 栈 / NODE_OPTIONS / CA certs |
+| Observe Recovery | `src/config/io.observe-recovery.ts` | 680 | last-known-good / backup / clobber |
+| Observe Suspicious | `src/config/io.observe-suspicious.ts` | 50 | 4 类可疑原因检测 |
+| Health State | `src/config/io.health-state.ts` | 100+ | SQLite 持久化 fingerprint |
+| Clobber Snapshot | `src/config/io.clobber-snapshot.ts` | 100+ | 32 槽快照 + mkdir 文件锁 |
+| Recovery Policy | `src/config/recovery-policy.ts` | 118 | 插件局部 vs 整体恢复决策 |
+| Backup Rotation | `src/config/backup-rotation.ts` | 80+ | 5 槽环形备份 + pre-update |
+| Docker Healthcheck | `src/docker-healthcheck.ts` | 68 | /healthz 探针 |
+| Gateway Health | `src/gateway/server/health-state.ts` | 100+ | Snapshot + 双 audience 刷新 |
+| Gateway Probe | `src/gateway/probe.ts` | 100+ | 可达性探测 + 能力评估 |
+| Control UI 入口 | `ui/src/main.ts` | 77 | Service Worker + 资源链接 |
+| i18n Manager | `ui/src/i18n/lib/translate.ts` | 150+ | 语言切换 + 订阅者 |
+| i18n Registry | `ui/src/i18n/lib/registry.ts` | 71 | 34 locale 懒加载 |
+| i18n Types | `ui/src/i18n/lib/types.ts` | 26 | Locale 类型定义 |
+| Device Flow | `src/gateway/github-oauth-device-flow.ts` | 106 | GitHub OAuth Device Code |
+| Personal OAuth | `src/gateway/github-personal-oauth.ts` | 683 | 多账号 + token 刷新 |
+| Gateway Auth | `src/gateway/auth.ts` | 200+ | 多模式认证 |
+| Auth Resolve | `src/gateway/auth-resolve.ts` | 150+ | 认证模式解析 |
+| User Connections | `src/state/user-github-connections.ts` | 150+ | SQLite 持久化 + Zod 验证 |
+| Dockerfile | `Dockerfile` | 441 | 7 阶段多构建 |
+| Docker Compose | `docker-compose.yml` | 136 | 双服务编排 |
+| Appcast | `appcast.xml` | 100+ | Sparkle 自动更新 |
+| Fly.io | `fly.toml` | 42 | 公网部署 |
+| Fly Private | `deploy/fly.private.toml` | 40 | 私有部署 |
+| Render | `render.yaml` | 24 | Blueprint |
+| WS Connection | `src/gateway/server/ws-connection.ts` | 150+ | 连接处理 + 握手 |
+| WS Keepalive | `src/gateway/websocket-keepalive.ts` | 35 | 25s ping/pong |
+| WS Runtime | `src/gateway/server-ws-runtime.ts` | 54 | 上下文注入 |
+| Talk Relay | `src/gateway/talk-realtime-relay.ts` | 15 | 实时语音中继 |
+| Board Store | `src/boards/board-store.ts` | 200+ | 内存操作接口 |
+| Board Layout | `src/boards/board-layout.ts` | 310 | 10 种 BoardOp |
+| Sqlite Board Store | `src/boards/sqlite-board-store.ts` | 200+ | SQLite 持久化 |
+| Sqlite Board Codec | `src/boards/sqlite-board-codec.ts` | 541 | Manifest 编解码 |
+| Board Capabilities | `src/boards/board-capabilities.ts` | 128 | 能力声明验证 |
+| Canvas Widget | `src/canvas/widget-tool.ts` | 150+ | show_widget 工具 |
+
+---
+
+## 20.11 本轮 laew 漏点汇总(L79-L131)
+
+### P0 紧急(10 项)
+
+| Gap ID | 描述 | 来源维度 |
+|--------|------|---------|
+| L80 | 无配置健康指纹(hash + stat + dev/ino) | CrashDump |
+| L81 | 无 last-known-good 配置恢复 | CrashDump |
+| L95 | 无 token 自动刷新 | OAuth |
+| L96 | 无 Gateway 多模式认证 | OAuth |
+| L100 | 无 i18n 支持(中文硬编码) | i18n |
+| L110 | 无 CI/CD 工作流 | Release |
+| L111 | 无 WebSocket 服务端 | WebSocket |
+| L117 | 无 Dockerfile | DevContainer |
+| L118 | 无 Docker Compose | DevContainer |
+| L120 | 无 cap_drop / no-new-privileges | DevContainer |
+
+### P1 重要(15 项)
+
+| Gap ID | 描述 | 来源维度 |
+|--------|------|---------|
+| L82 | 无 clobber snapshot | CrashDump |
+| L83 | 无 backup rotation | CrashDump |
+| L84 | 无 Docker healthcheck 探针 | CrashDump |
+| L86 | 无插件局部失败 vs 整体恢复决策 | CrashDump |
+| L87 | 无 WebUI(纯 TUI) | WebUI |
+| L88 | 无 Service Worker 离线缓存 | WebUI |
+| L93 | 无 OAuth Device Flow | OAuth |
+| L94 | 无多账号管理 | OAuth |
+| L98 | 无 trusted-proxy 认证 | OAuth |
+| L99 | 无 secret 日志脱敏注册 | OAuth |
+| L101 | 无懒加载 locale | i18n |
+| L103 | 无浏览器语言自动检测 | i18n |
+| L105 | 无 Docker 多阶段构建 | Release |
+| L106 | 无 Docker Compose 编排 | Release |
+| L108 | 无 AutoUpdate | Release |
+
+### P2 进阶(16 项)
+
+| Gap ID | 描述 | 来源维度 |
+|--------|------|---------|
+| L79 | 无进程 Respawn 机制 | CrashDump |
+| L85 | 无 secret 占位符污染检测 | CrashDump |
+| L89 | 无 Desktop App | WebUI |
+| L90 | 无 Mobile App | WebUI |
+| L91 | 无 Bonjour/mDNS 局域网发现 | WebUI |
+| L92 | 无摄像头 PTZ 控制 | WebUI |
+| L97 | 无 Tailscale 集成 | OAuth |
+| L102 | 无 RTL 支持 | i18n |
+| L104 | 无离线 pending locale | i18n |
+| L107 | 无 Render/Fly.io 云部署 | Release |
+| L109 | 无 GPG 指纹校验 | Release |
+| L112 | 无 ping/pong keepalive | WebSocket |
+| L113 | 无 pre-auth 连接预算 | WebSocket |
+| L114 | 无 Talk Realtime Relay | WebSocket |
+| L115 | 无 WebRTC 集成 | WebSocket |
+| L116 | 无消息处理按需加载 | WebSocket |
+
+### P3 进阶(10 项)
+
+| Gap ID | 描述 | 来源维度 |
+|--------|------|---------|
+| L124-L131 | 无 CRDT 协作数据模型(8 项) | CRDT |
+
+---
+
+## 20.12 与前 9 轮的衔接(索引地图)
+
+| 前 9 轮覆盖 | 本轮关系 |
+|------------|---------|
+| 第一轮:Gateway/Harness/Adapter 三层契约 | 本轮 WebSocket 是 Gateway 层的实时通道 |
+| 第二轮:Lane 调度器 | 本轮 Boards 是 Lane 调度的可视化层 |
+| 第三轮:Workshop 自演化 | 本轮 Canvas Widget 是 Workshop 的产物 |
+| 第四轮:协议 wire | 本轮 WebSocket 是 wire 协议的传输层 |
+| 第五轮:双向 MCP | 本轮 Boards 支持 MCP App widget |
+| 第六轮:SubAgent 调度 | 本轮 Boards 是 SubAgent 的可视化 |
+| 第七轮:Git 集成 | 本轮 Release 工程化是 Git 的下游 |
+| 第八轮:Custodian Skills | 本轮 CrashDump 是 Custodian 的诊断源 |
+| 第九轮:Taxonomy | 本轮 8 维度可新增 8 个 categoryId |
+
+---
+
+## 20.13 本轮不重复声明
+
+为保持每轮深挖的独立性,本节明确列出 **本轮不覆盖、读者应回查前 9 轮的内容**:
+
+- ❌ **Gateway/Harness/Adapter 三层契约** → 见第六轮 § 17.2
+- ❌ **Lane 调度器 + Workshop 自演化** → 见第五轮 § 16.3
+- ❌ **协议 wire 真实实现** → 见第六轮专题-第六轮-Anthropic 与 OpenAI 协议调用
+- ❌ **Git 与版本控制集成** → 见第七轮 § 18.1
+- ❌ **多模态与文件处理** → 见第七轮 § 18.2
+- ❌ **Web 检索与网络访问** → 见第七轮 § 18.3
+- ❌ **Prompt Caching 与成本预算** → 见第七轮 § 18.4
+- ❌ **MCP 11-capability + 162 extensions** → 见第七轮 § 17.3
+- ❌ **Custodian Skills 5 阶段** → 见第八轮 § 19.1
+- ❌ **多端部署(Docker/Render/Fly)** → 见第八轮 § 19.2
+- ❌ **Taxonomy 分类体系** → 见第八轮 § 19.3
+- ❌ **Security 漏洞响应** → 见第八轮 § 19.4
+
+本轮独有(其他 11 份工程文档均无对应章节):
+- ✅ **五层 CrashDump 防御纵深**(Respawn / Observe Recovery / Health Fingerprint / Docker Healthcheck / Backup Rotation)
+- ✅ **Config Health Fingerprint**(hash + bytes + mtime + dev/ino + mode + uid/gid)
+- ✅ **Clobber Snapshot**(32 槽快照 + mkdir 文件锁)
+- ✅ **GitHub OAuth Device Flow + 多账号 Profile 租赁**
+- ✅ **Gateway 多模式认证**(none/token/password/tailscale/device-token/bootstrap-token/trusted-proxy)
+- ✅ **34 locale i18n**(懒加载 + 订阅者 + RTL + 离线 pending)
+- ✅ **Dockerfile 7 阶段 + GPG 指纹校验 + 三表面版本校验**
+- ✅ **WebSocket 全双工 RPC**(Pre-Auth 预算 + 25s keepalive + 按需加载)
+- ✅ **Boards 类 CRDT 模型**(10 种 BoardOp + 布局归一化 + grant 语义版本)
+- ✅ **内容所有权 4 态**(html / plugin / mcp-app / registered)
+
+---
+
+> **第十轮分析完成**。共覆盖 8 个新维度,识别 **53 个 laew gap**(P0:10 / P1:15 / P2:16 / P3:10),全部附 Rust crate 建议(如需)。

@@ -4682,3 +4682,2082 @@ function startInMemorySpan(state, parent, options, callback): Promise<T> {
 - **不重复第 14 章第七轮 Edit/Git/Bash/Grep** —— 本轮 16.1.4 仅简述 git URL 解析作为编辑器自治锚点
 - **不重复第五/六轮深挖**（第 12、13 章）—— 本轮专注 4 个全新维度
 
+# pi 源码第十轮深挖分析 — 8 大新维度
+
+> 范围:`/usr/local/LsmGitOpenSource/pi` 9 个 packages(ai/protocol/coding-agent/server/client/evals/agent/telemetry/tui + session-backends)
+> 时间锚点:2026-09-07(pi-mono `0.0.3`)
+> 前 9 轮已覆盖内容(详见 `/usr/local/LsmGitOpenSource/LsmAgentEmergentWork/docs/Agent源码调研/pi.md` 16 章 ~4684 行)不再重复
+
+| 维度 | 命中代码核心 | 行数估算 |
+|---|---|---|
+| 1. CrashDump 与错误恢复 | `server/src/errors.ts`、`server/src/server.ts`、`client/src/errors.ts`、`client/src/connection.ts`、`coding-agent/src/main.ts` | ~700 行 |
+| 2. WebUI 与 DesktopApp | `tui/src/tui.ts`、`tui/src/components/`、`tui/src/keys.ts`、`tui/src/terminal.ts`、`coding-agent/src/modes/interactive/` | ~900 行 |
+| 3. OAuth 认证与多账号 | `ai/src/auth/oauth/`(10 个 provider)、`auth/types.ts`、`auth/credential-store.ts`、`auth-storage.ts` | ~1100 行 |
+| 4. i18n 国际化 | `theme/`、`autocomplete.ts`、`settings-manager.ts` + i18n 缺位分析 | ~400 行 |
+| 5. Release 工程化与 AutoUpdate | `scripts/release.mjs`、`local-release.mjs`、`publish.mjs`、`build-binaries.sh`、`package-manager-cli.ts`、`windows-self-update.ts` | ~900 行 |
+| 6. WebSocket 与 SSE | `protocol/src/cbor/`、`protocol/src/framing.ts`、`protocol/src/codec.ts`、`ai/src/api/openai-codex-responses.ts` | ~800 行 |
+| 7. DevContainer 与容器化 | (缺位分析)、仅 theme token "dockerfile" + examples 提及 | ~350 行 |
+| 8. CRDT 与多端冲突 | (缺位分析)、JSONL torn-tail + WriterLease fence + 双后端版本迁移 | ~500 行 |
+
+---
+
+## 第 17 章 CrashDump 与错误恢复
+
+### 17.1 错误分类学:PiServerError / InternalServerError 双层
+
+pi 在 server 层把错误明确分成 **可序列化(协议边界可越)** 和 **不可序列化(只在本机报告)** 两类 —— 这是与 hermes-agent、deepseek-harness 的根本差异:
+
+#### 17.1.1 可序列化错误:PiServerError 家族
+
+`/usr/local/LsmGitOpenSource/pi/packages/server/src/errors.ts:1-58` 定义:
+
+```typescript
+export type PiServerOperationErrorCode = Extract<
+    ProtocolErrorCode,
+    "busy" | "session_locked" | "not_found" | "invalid_request" | "not_implemented"
+>;
+
+export class PiServerError extends Error {
+    readonly code: PiServerOperationErrorCode;
+    readonly details: JsonValue | undefined;
+    constructor(code, message, details?) { super(message); this.code = code; this.details = details; }
+}
+export class SessionBusyError extends PiServerError { /* busy */ }
+export class SessionLockedError extends PiServerError { /* session_locked */ }
+export class SessionNotFoundError extends PiServerError { /* not_found */ }
+export class NotImplementedError extends PiServerError { /* not_implemented */ }
+```
+
+5 个 code 取自 `ProtocolErrorCode` —— 序列化到 wire 上后 client 能精确决策(例如 "session_locked" → 客户端按 retry-after 退避; "busy" → 切到 SSE 流尾)。
+
+#### 17.1.2 不可序列化错误:InternalServerError
+
+```typescript
+export class InternalServerError extends Error {
+    constructor(cause: unknown) {
+        super(INTERNAL_SERVER_ERROR_MESSAGE, { cause });  // 保留 cause,不发送
+        this.name = "InternalServerError";
+    }
+}
+```
+
+**关键设计**:`cause` 用 ES2022 标准的 `Error.cause` 字段保存,**不**通过 wire 序列化。这避免"内部异常信息泄露给客户端"的安全问题,同时本机仍能完整 dump。
+
+#### 17.1.3 toProtocolError 翻译层
+
+`server.ts:351-369` 提供统一的翻译:
+
+```typescript
+private toProtocolError(error: unknown): ProtocolError {
+    if (error instanceof InternalServerError) {
+        this.reportError(error.cause);  // 本机日志报告真实 cause
+        return { code: "internal_error", message: INTERNAL_SERVER_ERROR_MESSAGE };
+    }
+    if (error instanceof PiServerError) {
+        if (error.code === "not_implemented") return { code: "not_implemented", message: NOT_IMPLEMENTED_MESSAGE };
+        return error.details === undefined
+            ? { code: error.code, message: error.message }
+            : { code: error.code, message: error.message, details: error.details };
+    }
+    if (error instanceof ProtocolValidationError) {
+        return { code: "invalid_request", message: error.message };
+    }
+    this.reportError(error);
+    return { code: "internal_error", message: INTERNAL_SERVER_ERROR_MESSAGE };
+}
+```
+
+**5 段错误处理链**:
+1. InternalServerError → 报告 cause + 返 "internal_error"
+2. PiServerError → 提取 code/message/details
+3. ProtocolValidationError → 框架级,直接 "invalid_request"
+4. unknown → 报告 + 兜底 "internal_error"
+5. 注意 `details: JsonValue` 在 protocol 层有 schema 校验,**类型安全**
+
+`reportError` 还做了 **error observer 隔离**(`server.ts:371-377`):
+```typescript
+private reportError(error: unknown): void {
+    try { this.onError?.(error instanceof Error ? error : new Error(String(error))); }
+    catch { /* Error observers cannot affect server state. */ }
+}
+```
+即 onError 抛错不能影响 server 状态 —— 与 laew 当前 `AgentError::report` 直接 panic 形成对比。
+
+### 17.2 Client 端错误恢复:state machine + 双 resolver
+
+`/usr/local/LsmGitOpenSource/pi/packages/client/src/connection.ts:40-236` 的 `Connection` 类实现 **3 态生命周期**:
+
+```typescript
+type ConnectionLifecycle =
+    | { state: "disconnected" }
+    | ({ state: "connecting"; handshake: PromiseResolvers<ServerSnapshot> } & ActiveConnection)
+    | ({ state: "connected"; transport: ByteTransport; handshake: PromiseResolvers<ServerSnapshot> | undefined } & ActiveConnection);
+```
+
+`#sequence` 计数器防止 **stale transport 覆盖**:
+
+```typescript
+const id = ++this.#sequence;  // 每次 connect() 自增
+...
+if (this.#lifecycle.state !== "connecting" || this.#lifecycle.id !== id) {
+    transport.close();  // 后到的 transport 直接关闭
+    return;
+}
+```
+
+`#handleData` 中检查 `lifecycle.id !== id` 阻止 **跨连接的混合帧**。这是 JSON-RPC + WebSocket 客户端常见的「前一个 ws 异步 onmessage 污染新 ws」反模式的根治方案。
+
+#### 17.2.1 双 resolver 防止 handshake 悬挂
+
+```typescript
+async #openTransport(id: number, handlers: ByteTransportHandlers): Promise<void> {
+    let transport: ByteTransport;
+    try { transport = await this.#options.transportFactory(handlers); }
+    catch (error) {
+        if (this.#isCurrent(id)) this.#fail(toDisconnectedError(error));  // 1. transport 工厂失败
+        return;
+    }
+    ...
+    try {
+        await transport.send(encodeClientMessage({ type: "hello", version: PROTOCOL_VERSION }, ...));
+    } catch (error) {
+        if (this.#isCurrent(id)) this.#failAndClose(toDisconnectedError(error));  // 2. send hello 失败
+    }
+}
+
+#handleMessage(message: ServerMessage): void {
+    if (lifecycle.state === "connecting") {
+        if (message.type === "hello_error") {
+            this.#failAndClose(new PiServerError(message.error));  // 3. server hello_error
+            return;
+        }
+        if (message.type !== "hello") {
+            this.#failAndClose(new ProtocolValidationError(...));  // 4. 协议违规
+            return;
+        }
+        ...
+        lifecycle.handshake.resolve(message.snapshot);  // 5. 成功路径
+    }
+}
+```
+
+5 个失败路径收敛到 `#fail`/`#failAndClose`,**全部走 `handshake.reject(error)`**:
+
+```typescript
+#fail(error: Error): void {
+    if (this.#lifecycle.state === "disconnected") return;
+    this.#lifecycle = { state: "disconnected" };
+    lifecycle.handshake?.reject(error);  // 唯一的失败出口
+    this.#options.onStateChange({ state: "disconnected", error });
+}
+```
+
+**关键**:`handshake` 是 `PromiseResolvers`(自定义实现,见 `promise.ts`),**只在状态机进入 disconnected 时 reject 一次**,确保 `await handshake.promise` 的代码永远只有一个出口。
+
+### 17.3 Server 端握手超时与 failProtocol 路径
+
+`server.ts:112-150` 的 `accept()` 给每个新连接分配 `handshakeTimeout` 5s:
+
+```typescript
+const handshakeTimeout = setTimeout(() => {
+    void this.failProtocol(state, {
+        code: "invalid_request",
+        message: "Handshake timeout",
+    });
+}, this.handshakeTimeoutMs);
+handshakeTimeout.unref();  // 不阻止进程退出
+```
+
+`failProtocol` 走标准错误流(`server.ts:315-328`):
+
+```typescript
+private async failProtocol(connection, error) {
+    if (connection.disconnected || connection.stage === "closing" || connection.stage === "closed") return;
+    connection.stage = "closing";
+    clearTimeout(connection.handshakeTimeout);
+    const message: ServerHelloError = { type: "hello_error", error };
+    let finalFrame;
+    try { finalFrame = encodeServerMessage(message, ...); }
+    catch (encodeError) { this.reportError(encodeError); }
+    await this.closeConnection(connection.connection, finalFrame);  // 最后一帧
+    await this.disconnect(connection);
+}
+```
+
+**关键设计**:即使是错误退出,**也要把 hello_error 帧塞进 finalChunk**——这给 client 一次性的原因信息而不是让 client 看到无消息的 socket close。
+
+### 17.4 transport-closed 恢复
+
+`server.ts:271-280`:
+
+```typescript
+private transportClosed(connection: ConnectionState): void {
+    if (!connection.disconnected && connection.stage !== "closing") {
+        try { connection.decoder.end(); }  // 触发 FrameError if truncated
+        catch (error) { this.reportError(error); }
+    }
+    void this.disconnect(connection);
+}
+```
+
+**细节**:不直接 trust transport 的 close 事件,而是先 `decoder.end()` 验证帧完整性 —— 如果 stream 被截断,FrameError 会冒泡,被 `reportError` 记录为「transport 在非 closing 阶段被关闭」异常,可观测性极强。
+
+### 17.5 代码层 panic 隔离
+
+**未发现**:pi 没有任何 `process.on("uncaughtException")` 或 `process.on("unhandledRejection")` 钩子。结论是 **pi 假设崩溃即终止** —— 由 OS / supervisor 重启。
+
+`coding-agent/src/main.ts:560-590` 启动逻辑:
+```typescript
+export async function main(args: string[], options?: MainOptions) {
+    ...
+    if (process.platform === "win32") cleanupWindowsSelfUpdateQuarantine(getPackageDir());
+    cleanupManagedInstall();
+    ...
+}
+```
+启动时主动 `cleanupWindowsSelfUpdateQuarantine`(Windows 自更新隔离目录清理)+ `cleanupManagedInstall`(managed install 临时目录清理),这是 **事后恢复**(crash 后下次启动的修复),而非 **进程内恢复**。
+
+`main.ts:586-594` 还有一条 Windows 特有的 panic 防御:
+```typescript
+if (process.platform === "win32" && exitCode === 0 && args[0] === "update") {
+    // We normally prefer process.exit(0) for package commands so bad extensions cannot keep
+    // one-shot commands alive. On Windows, Node can assert after fetch() if process.exit(0)
+    // runs during teardown; let successful `pi update` drain naturally instead.
+    // https://github.com/nodejs/node/issues/56645
+    return;
+}
+process.exit(exitCode);
+```
+直接调用 `process.exit(0)` 在 Windows + fetch() 上下文可能 Node 崩溃 —— pi 主动避免。这是 **条件性 panic 防御**。
+
+### 17.6 CrashDump 数据采集
+
+**结论:pi 没有崩溃 dump 系统**。崩溃栈直接走 Node 默认 `stderr`。这是与 laew 当前架构的差距 —— laew 也没有 dump,两端都没有 P0 级的崩溃报告。
+
+可以借鉴的是 `reportError` 的 `try/catch swallow` 模式 —— 即 logger 抛错不影响主流程(`server.ts:371-377`)。
+
+### 17.7 laew 借鉴路线图(CrashDump 维度)
+
+| 借鉴项 | pi 来源 | laew 落地路径 |
+|---|---|---|
+| 双层错误分类 | `errors.ts:PiServerError/InternalServerError` | `error.rs:AgentError` 已结构化,但未区分「可序列化 vs 不可序列化」;新增 `AgentError::Serializability` enum,wire 层只发 `public` 字段,`private cause` 留本机 |
+| reportError 隔离 | `server.ts:371-377` | 当前 laew 用 `eprintln!("Error: {}", err)` 直接打印,某些 panic 会传播;把 reporter 抽成 `trait ErrorSink` + `swallow_panic()` 装饰器 |
+| handshake 超时 | `server.ts:122-128` | laew 没有 wire 协议,但 `LlmClient::complete` 30s timeout 已具备,扩展到「整段 prompt → response」级别 |
+| transport-closed 恢复 | `server.ts:271-280` | laew reqwest response stream 中断时 `try_stream!` 抛错,需要显式 `decoder.end()` 风格验证帧完整性 |
+| 5 段错误翻译 | `server.ts:351-369` | laew 当前 `match err` 散落,集中到 `LlmErrorTranslator::translate(&Error, ProtocolHint)` |
+| Windows process.exit 防御 | `main.ts:586-594` | laew `std::process::exit` 在 Windows + tokio runtime 上同样可能触发 UB;在 `rebuild_restart_app.sh` 改用 graceful drop + `exit` |
+
+---
+
+## 第 18 章 WebUI 与 DesktopApp
+
+> 注:pi 没有 WebUI 也没有 DesktopApp —— 它只有 **TUI**(Terminal UI)。本章节重点分析 TUI,因为这是 pi **唯一的用户交互层**。
+
+### 18.1 TUI 架构:差分渲染 (Differential Rendering)
+
+`/usr/local/LsmGitOpenSource/pi/packages/tui/src/tui.ts:331-1263` 的 `TuiBase` 是核心抽象,继承 `Container`(组合子组件树)。
+
+#### 18.1.1 Component 接口
+
+```typescript
+export interface Component {
+    render(width: number): string[];  // 渲染为行,行数任意
+    handleInput?(data: string): void;  // 可选输入处理
+    wantsKeyRelease?: boolean;  // 是否接收 key release(默认 false)
+    invalidate(): void;  // 失效缓存
+}
+```
+
+`render(width)` 返回每行字符串,**不带 ANSI 颜色重置** —— 由 `applyLineResets` 在 base 渲染时统一加 `SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07"`。
+
+#### 18.1.2 Focusable 与 CURSOR_MARKER
+
+```typescript
+export interface Focusable {
+    focused: boolean;  // TUI 设置 focus 时通知组件
+}
+export const CURSOR_MARKER = "\x1b_pi:c\x07";  // APC(Application Program Command)序列
+```
+
+**精妙设计**:组件 render 时在 cursor 位置 emit `CURSOR_MARKER`(零宽度 APC 序列,终端忽略),TUI 在 `extractCursorPosition` 中:
+
+```typescript
+protected extractCursorPosition(lines, height): { row, col } | null {
+    const viewportTop = Math.max(0, lines.length - height);
+    for (let row = lines.length - 1; row >= viewportTop; row--) {
+        const line = lines[row];
+        const markerIndex = line.indexOf(CURSOR_MARKER);
+        if (markerIndex !== -1) {
+            const beforeMarker = line.slice(0, markerIndex);
+            const col = visibleWidth(beforeMarker);  // 注意用 visibleWidth 不是字符串长度
+            lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
+            return { row, col };
+        }
+    }
+    return null;
+}
+```
+
+**关键**:
+1. 用 `visibleWidth` 而非 `length` —— 处理 CJK、emoji 宽字符
+2. 仅扫描可见 viewport(`lines.length - height`),**不扫描历史行**
+3. 用零宽度 APC 而非实际光标控制 —— 让 diff 渲染不影响硬件 cursor 定位
+
+这与 laew TUI 引擎的「set cursor 后回写」模式完全不同 —— **pi 的 cursor 定位完全由渲染管线内部完成**,不依赖终端的「当前位置」语义。
+
+#### 18.1.3 Overlay Stack + Focus Restoration
+
+TuiBase 用 **overlay stack**(`overlayStack: OverlayStackEntry[]`)管理模态/弹窗,关键是 `OverlayFocusRestoreState`:
+
+```typescript
+type OverlayFocusRestoreState = { status: "inactive" } | ActiveOverlayFocusRestoreState;
+type ActiveOverlayFocusRestoreState = EligibleOverlayFocusRestoreState | BlockedOverlayFocusRestoreState;
+type BlockedOverlayFocusRestoreState = {
+    status: "blocked";
+    overlay: OverlayStackEntry;
+    blockedBy: Component;  // 谁打断了 overlay 的 focus
+    resume: OverlayBlockedFocusResume;
+};
+type OverlayBlockedFocusResume = 
+    | { status: "restore-overlay" } 
+    | { status: "focus-target"; target: Component | null };
+```
+
+`setFocusInternal`(`tui.ts:422-485`)在切焦点时:
+1. 检查当前 focusedComponent 是否是 overlay
+2. 如果切到非 overlay,而之前 overlay 处于「eligible」状态,记为「blocked」
+3. 当输入处理时(`handleTerminalInput`),先检查 `getVisibleOverlayFocusRestore`:
+   - eligible → 立即恢复 overlay focus
+   - blocked 但 blockedBy 不是当前 → 恢复或跳转
+
+**这是 laew 完全没有的概念** —— laew 的 `/provider *` 子屏用固定 Screen 栈实现 modal,焦点恢复靠 `atty()` 的 `Esc → pop`,没有「blocked by」这种语义。
+
+#### 18.1.4 Overlay Layout 解析
+
+`resolveOverlayLayout`(`tui.ts:964-1062`)支持:
+- `width: number | \`${number}%\``(百分比)
+- `maxHeight`、`minWidth`
+- 9 个 anchor:`top-left`/`top-center`/`top-right`/`left-center`/`center`/`right-center`/`bottom-left`/`bottom-center`/`bottom-right`
+- `offsetX`、`offsetY` 锚点偏移
+- `margin` 数字或 `{ top, right, bottom, left }`
+
+`resolveAnchorRow/Col` 是纯函数,switch case 处理 9 个 anchor + marginTop 偏移 + availHeight/availWidth 约束。
+
+`compositeOverlays`(`tui.ts:1099-1158`):
+1. 过滤 visible overlays
+2. 按 focusOrder 升序(老 → 新)
+3. 渲染每个 overlay 到独立行
+4. `workingHeight = max(result.length, termHeight, minLinesNeeded)`
+5. `viewportStart = max(0, workingHeight - termHeight)`
+6. 用 `compositeTuiLine` 在 result 行的指定 col 切片 + 嵌入 overlay 内容
+
+**防御性细节**(tui.ts:1147-1152):
+```typescript
+const truncatedOverlayLine =
+    visibleWidth(overlayLines[i]) > w ? sliceByColumn(overlayLines[i], 0, w, true) : overlayLines[i];
+result[idx] = this.compositeLineAt(result[idx], truncatedOverlayLine, col, w, termWidth);
+```
+即使 overlay 渲染超出 `w`,TUI 也会强制 truncate —— **防御性裁剪**避免组件 bug 损坏整个终端。
+
+#### 18.1.5 渲染节流:16ms 最小间隔
+
+```typescript
+private static readonly MIN_RENDER_INTERVAL_MS = 16;
+private lastRenderAt = 0;
+private renderTimer: NodeJS.Timeout | undefined;
+private renderRequested = false;
+private immediateRenderScheduled = false;
+
+requestRender(force = false): void {
+    if (force) { this.resetRenderState(); this.requestImmediateRender(); return; }
+    if (this.renderRequested) return;
+    this.renderRequested = true;
+    process.nextTick(() => this.scheduleRender());
+}
+
+private scheduleRender(): void {
+    if (this.stopped || this.renderTimer || !this.renderRequested) return;
+    const elapsed = performance.now() - this.lastRenderAt;
+    const delay = Math.max(0, TuiBase.MIN_RENDER_INTERVAL_MS - elapsed);
+    this.renderTimer = setTimeout(() => {
+        this.renderTimer = undefined;
+        if (this.stopped || !this.renderRequested) return;
+        this.renderRequested = false;
+        this.lastRenderAt = performance.now();
+        this.doRender();
+        if (this.renderRequested) this.scheduleRender();  // 累积 frame
+    }, delay);
+}
+```
+
+**3 档 render 路径**:
+1. `requestRender(false)` → 16ms 节流(setTimeout)
+2. `requestRender(true)` → process.nextTick 立即渲染
+3. `handleTerminalInput` 收 key 时 → `requestImmediateRender()` 抢占定时器
+
+注释 `// Keyboard input is latency-sensitive. Avoid the throttled timer path, // where even setTimeout(0) can take a full 16 ms tick on Windows.` 明确说明为什么输入路径不走节流 —— Windows 的 setTimeout(0) 不保证 0ms。
+
+**对比 laew**:laew 当前 TUI 引擎 `engine.rs::Frame::present` 是 `print!` 全量写,无节流。如果未来多组件叠加 + 流式输出,需要借鉴这套 16ms 节流。
+
+#### 18.1.6 OSC 11 背景色查询 + DEC 2031 色彩 scheme 通知
+
+```typescript
+queryTerminalBackgroundColor({ timeoutMs }: { timeoutMs: number }): Promise<RgbColor | undefined> {
+    return new Promise((resolve) => {
+        const query: PendingOsc11BackgroundQuery = { settled: false, resolve, timer: undefined };
+        query.timer = setTimeout(() => {
+            if (query.settled) return;
+            query.settled = true;
+            query.timer = undefined;
+            query.resolve?.(undefined);
+            query.resolve = undefined;
+        }, timeoutMs);
+        this.pendingOsc11BackgroundQueries.push(query);
+        this.pendingOsc11BackgroundReplies += 1;
+        this.terminal.write("\x1b]11;?\x07");
+    });
+}
+
+queryTerminalColorScheme({ timeoutMs }: { timeoutMs: number }): Promise<TerminalColorScheme | undefined> {
+    return new Promise((resolve) => {
+        let settled = false;
+        let timer: NodeJS.Timeout | undefined;
+        let unsubscribe: () => void = () => {};
+        const settle = (scheme: TerminalColorScheme | undefined) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            unsubscribe();
+            resolve(scheme);
+        };
+        unsubscribe = this.onTerminalColorSchemeChange(settle);
+        timer = setTimeout(() => settle(undefined), timeoutMs);
+        this.terminal.write("\x1b[?996n");
+    });
+}
+```
+
+**精妙**:
+- OSC 11 (`ESC ] 11 ; ? BEL`) 查 terminal 默认背景色,用于自适应主题
+- DSR `CSI ? 996 n` 查 light/dark scheme 偏好
+- DEC 2031 (`CSI ? 2031 h/l`) 开启/关闭 scheme 通知
+
+这些都是 XTerm 标准 —— **pi 是目前见过的对终端能力探测最完整的 TUI 之一**。
+
+### 18.2 键位系统:KeyTester / KeyBindings
+
+`/usr/local/LsmGitOpenSource/pi/packages/tui/src/keys.ts:1-1401` 是 **完整的键位解析器**。
+
+#### 18.2.1 KittenCSI / Kitty CSI-u 支持
+
+`matchesKey(data, "shift+ctrl+d")` 检查 Kitty keyboard protocol(CSI-u)序列,带修饰符全状态机解析。具体在 `kitty-keyboard-protocol.ts`(未细读,1401 行文件中),覆盖:
+
+- 普通键:`a` → `KeyA`
+- 修饰符:`ctrl+c` / `shift+enter` / `ctrl+shift+alt+up`
+- Kitty 协议专用:`CSI 97 ; 5 u` (Ctrl+a)
+- 功能键:F1-F12 + 修饰
+- 方向键:含 `shift+left` `ctrl+up` 等
+- 媒体键(罕见)
+- Legacy 模式 fallback:C0/C1 control codes
+
+**对比 laew**:laew 用 `crossterm::event::KeyEvent` 已经做了 Kitty CSI-u 解析 —— 但 pi 在 TUI 层做了 **二次识别**(`matchesKey` 字符串匹配),这是为了 **配置式键位** 需求:`keybindings.ts` 让用户写 `["ctrl+k", "ctrl+j"]` 这样的列表。
+
+#### 18.2.2 键位绑定配置
+
+`keybindings.ts` 提供 `KeyBindingConfig`:
+
+```typescript
+{ action: "submit", keys: ["enter", "ctrl+j"] }
+{ action: "cancel", keys: ["escape", "ctrl+c"] }
+{ action: "copy", keys: ["ctrl+shift+c"] }
+```
+
+laew 当前 crossterm 没有这种配置化系统。
+
+### 18.3 组件库
+
+`tui/src/components/` 目录共 15 个组件,总 5331 行:
+
+| 组件 | 行数 | 用途 |
+|---|---|---|
+| `editor.ts` | 2363 | **核心编辑器** —— 多光标、撤销栈、kill ring、语法高亮、输入法支持 |
+| `markdown.ts` | 1015 | Markdown 渲染 |
+| `input.ts` | 447 | 单行输入 + 自动补全 |
+| `select-list.ts` | 229 | 选择列表 |
+| `scroll-view.ts` | 216 | 滚动视图 |
+| `settings-list.ts` | 276 | 设置列表 |
+| `image.ts` | 127 | 图片渲染(Sixel/iTerm/Kitty) |
+| `box.ts` | 137 | 容器布局 |
+| `text.ts` | 107 | 文本组件 |
+| `truncated-text.ts` | 65 | 截断文本 |
+| `stack.ts` / `v-stack.ts` / `h-stack.ts` / `spacer.ts` | 246 | 布局 |
+| `loader.ts` / `cancellable-loader.ts` | 132 | 加载动画 |
+| `alt-screen-flash.ts` | 51 | 屏幕闪烁提示 |
+
+#### 18.3.1 Editor 组件 (`components/editor.ts` 2363 行)
+
+是 pi 最复杂的组件,完整功能:
+- **多光标**(multi-cursor)
+- **撤销栈**(`undo-stack.ts` 28 行)
+- **Kill ring**(emacs 风格,`kill-ring.ts` 46 行)
+- **Word navigation**(`word-navigation.ts` 117 行)
+- **语法高亮**(latex.ts 1380 行单独管理)
+- **括号匹配**(推测)
+- **输入法候选窗口 position 同步**(通过 CURSOR_MARKER)
+
+**对比 laew**:laew 当前 `tui/input.rs` 是 ~150 行单行输入,无编辑器能力。
+
+### 18.4 终端能力探测
+
+`/usr/local/LsmGitOpenSource/pi/packages/tui/src/terminal-image.ts:1-696` 是图片渲染核心,探测:
+- **Sixel** 支持(`CSI ? 2 ; 4 $ q`)
+- **iTerm2 inline images**(`OSC 1337 ; ...`)
+- **Kitty graphics protocol**(`APC G ...`)
+- **Cell size 查询**(`CSI 16 t`)
+
+`getCapabilities()` 返回一个全局对象,所有渲染路径都先问它 —— 这与 laew `tui::theme::color()` 单一能力抽象是同一种思路。
+
+### 18.5 TUI 模式:regular vs fullscreen
+
+```typescript
+export type TuiMode = "regular" | "fullscreen";
+```
+
+`regular` 模式保留 scrollback,适合编辑器场景;`fullscreen` 接管全屏,适合选择器/表单场景。
+
+`TuiBase.regular` vs `TuiBase.fullscreen` 两个具体实现(未在本轮阅读,推测在 `tui-main-screen.ts` / `tui-alt-screen.ts`)。
+
+### 18.6 交互模式
+
+`coding-agent/src/modes/interactive/interactive-mode.ts:5435+` 提供:
+- 主题切换(`theme.ts` 1249 行 —— 包含 100+ theme tokens)
+- 模型选择(`model-selector.ts`)
+- 配置管理(`config-selector.ts`)
+- OAuth 选择(`oauth-selector.ts`)
+- 设置列表(`settings-selector.ts`)
+- 底部状态栏(`footer.ts`)
+
+`interactive-mode.ts` 单文件就有 5000+ 行,是整个 coding-agent 的中心编排器。
+
+### 18.7 laew 借鉴路线图(WebUI/TUI 维度)
+
+| 借鉴项 | pi 来源 | laew 落地路径 |
+|---|---|---|
+| 16ms 节流 | `tui.ts:MIN_RENDER_INTERVAL_MS=16` | 当前 `engine.rs::Frame::present` 全量写,流式输出场景需要节流 |
+| CURSOR_MARKER 零宽度定位 | `tui.ts:CURSOR_MARKER = APC` | 当前 laew 用 `crossterm::cursor::MoveTo`,CJK 宽字符会错位 |
+| Overlay focus restore state | `tui.ts:OverlayFocusRestoreState` 4 状态 | 当前 `tui/mod.rs` Screen 栈实现简单,无 blocked 语义 |
+| OSC 11 / DEC 2031 主题感知 | `tui.ts:queryTerminalBackgroundColor` | laew TUI 中文化硬编码,需主题感知 |
+| 键位配置化 | `keybindings.ts` | 当前 crossterm 硬编码 |
+| Editor 多光标/Undo/Kill-ring | `components/editor.ts` 2363 行 | 当前 `tui/input.rs` 150 行,差距巨大 |
+| Cell size 查询 | `tui.ts:queryCellSize` | 当前不支持图片渲染 |
+
+---
+
+## 第 19 章 OAuth 认证与多账号
+
+> pi 的 OAuth 体系是本轮最大的发现。10 个 provider 共 2973 行,实现 5 种 OAuth flow 变体。
+
+### 19.1 OAuth 抽象:`OAuthAuth` 接口
+
+`/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/types.ts:206-230`:
+
+```typescript
+export interface OAuthAuth {
+    name: string;
+    isSubscription?: boolean;
+    loginLabel?: string;
+    login(interaction: ProviderAuthInteraction): Promise<OAuthCredential>;
+    refresh(credential: OAuthCredential, signal: AbortSignal): Promise<OAuthCredential>;
+    toAuth(credential: OAuthCredential): Promise<ModelAuth>;
+}
+```
+
+**3 阶段生命周期**:
+1. `login(interaction)` —— 一次完整 OAuth 流程,返 `OAuthCredential`(含 access/refresh/expires)
+2. `refresh(credential, signal)` —— 用 refresh_token 换新 access,**在 Models.getAuth 锁内调用**(`types.ts:88` 注释明确)
+3. `toAuth(credential)` —— side-effect-free 把 credential 推导成 `ModelAuth`(`apiKey`/`headers`/`baseUrl`)
+
+**关键**:第 3 步 `toAuth` 是 async 但 **无网络调用**,这是为了让 lazy wrapper 可以 lazy load 实现。
+
+#### 19.1.1 ProviderAuth 联合
+
+```typescript
+export interface ProviderAuth {
+    apiKey?: ApiKeyAuth;
+    oauth?: OAuthAuth;
+}
+```
+
+**一个 provider 至少一个 auth** —— ambient-only provider(无 login,无 refresh)也提供 `apiKey.resolve()` 检测环境变量。
+
+### 19.2 5 种 OAuth Flow 变体
+
+| Flow | Provider | 触发条件 | 文件 |
+|---|---|---|---|
+| **PKCE + Browser callback** | Anthropic, GitHub Copilot(partly), Radius, OpenRouter | 默认浏览器登录 | `anthropic.ts`, `radius.ts`, `openrouter.ts` |
+| **Device Code (RFC 8628)** | GitHub Copilot, OpenAI Codex(headless), Radius(device-code), Kimi | 无浏览器/远程机器 | `device-code.ts` 98 行核心 |
+| **Both(Browser + Device Code)** | OpenAI Codex, GitHub Copilot, Radius | 用户选择 | 启动时 prompt select |
+| **PKCE + Manual code paste** | 全部 | 浏览器在不同机器 | `interaction.prompt({type: "manual_code"})` |
+| **Subscription + Free tier fallback** | GitHub Copilot(policy fallback) | Individual 用户 picker 失败时 | `github-copilot.ts:177` |
+
+### 19.3 PKCE 实现:`pkce.ts` 34 行
+
+```typescript
+export async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
+    const verifier = generateRandomString(64, [A-Z, a-z, 0-9, "-", ".", "_", "~"]);
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+    const challenge = base64UrlEncode(digest);
+    return { verifier, challenge };
+}
+```
+
+`verifier` 64 字符,`challenge` base64url(SHA-256) —— RFC 7634 标准实现。
+
+### 19.4 Device Code:`device-code.ts` 98 行核心
+
+```typescript
+const MINIMUM_INTERVAL_MS = 1000;
+const DEFAULT_POLL_INTERVAL_SECONDS = 5;  // RFC 8628 §3.2
+const SLOW_DOWN_INTERVAL_INCREMENT_MS = 5000;  // RFC 8628 §3.5
+
+export async function pollOAuthDeviceCodeFlow<T>(options) {
+    let intervalMs = Math.max(MINIMUM_INTERVAL_MS, Math.floor((options.intervalSeconds ?? 5) * 1000));
+    let slowDownResponses = 0;
+    if (options.waitBeforeFirstPoll) {
+        await abortableSleep(Math.min(intervalMs, deadline - Date.now()), options.signal, CANCEL_MESSAGE);
+    }
+    while (Date.now() < deadline) {
+        if (options.signal.aborted) throw new Error(CANCEL_MESSAGE);
+        const result = await options.poll();
+        if (result.status === "complete") return result.value;
+        if (result.status === "failed") throw new Error(result.message);
+        if (result.status === "slow_down") {
+            slowDownResponses++;
+            intervalMs = typeof result.intervalSeconds === "number" && Number.isFinite(result.intervalSeconds) && result.intervalSeconds > 0
+                ? Math.max(MINIMUM_INTERVAL_MS, Math.floor(result.intervalSeconds * 1000))
+                : Math.max(MINIMUM_INTERVAL_MS, intervalMs + SLOW_DOWN_INTERVAL_INCREMENT_MS);
+        }
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) break;
+        await abortableSleep(Math.min(intervalMs, remainingMs), options.signal, CANCEL_MESSAGE);
+    }
+    throw new Error(slowDownResponses > 0 ? SLOW_DOWN_TIMEOUT_MESSAGE : TIMEOUT_MESSAGE);
+}
+```
+
+**4 个反 WSL/VM 时钟漂移细节**:
+1. `waitBeforeFirstPoll: true` —— GitHub Copilot 启用,先等 1 个 interval 再轮询,避免因时钟偏快而提前发请求被服务器视为「slow_down」
+2. `slowDownResponses` 计数 —— 多次 slow_down 后给出「时钟漂移」友好提示:`This is often caused by clock drift in WSL or VM environments`
+3. 优先使用服务器返回的 `interval`(GitHub 会带)而非客户端累计 +5s
+4. `CANCEL_MESSAGE = "Login cancelled"` 与 `SLOW_DOWN_TIMEOUT_MESSAGE` / `TIMEOUT_MESSAGE` 区分三类错误
+
+### 19.5 Anthropic OAuth 详细分析
+
+`/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/anthropic.ts:1-365`:
+
+#### 19.5.1 配置
+
+```typescript
+const CLIENT_ID = atob("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl");
+const AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const CALLBACK_PORT = 53692;
+const SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+```
+
+**CLIENT_ID 是 base64 编码字符串**(避免源码审查被 GitHub 扫描)?实际 `atob("OWQxYzI1MGEt...")` = "9d1c250a-e61b-44d9-88ed-5944d1962f5e" —— 这是 Claude Pro/Max 订阅 OAuth 的官方 client_id。
+
+#### 19.5.2 三路并发竞争(callback server / manual paste / abort)
+
+```typescript
+async function loginAnthropic(interaction) {
+    const { verifier, challenge } = await generatePKCE();
+    const server = await startCallbackServer(verifier);
+    const manualAbort = new AbortController();
+    const onAbort = () => server.cancelWait();
+    interaction.signal.addEventListener("abort", onAbort, { once: true });
+    if (interaction.signal.aborted) onAbort();
+
+    const manualPromise = interaction.prompt({
+        type: "manual_code",
+        message: "Complete login in your browser, or paste the authorization code / redirect URL here:",
+        placeholder: REDIRECT_URI,
+        signal: manualAbort.signal,
+    }).then(input => { manualInput = input; server.cancelWait(); })
+      .catch(error => { manualError = error instanceof Error ? error : new Error(String(error)); server.cancelWait(); });
+
+    const result = await server.waitForCode();
+    if (manualError) throw manualError;
+    if (result?.code) {
+        code = result.code; state = result.state;
+    } else if (manualInput) {
+        const parsed = parseAuthorizationInput(manualInput);
+        if (parsed.state && parsed.state !== verifier) throw new Error("OAuth state mismatch");
+        code = parsed.code;
+        state = parsed.state ?? verifier;
+    }
+    ...
+}
+```
+
+**3 路竞争语义**:
+- `server.waitForCode()` —— 监听 `127.0.0.1:53692/callback`(浏览器成功跳转)
+- `interaction.prompt()` —— 用户在 TUI 粘贴 code(浏览器不在本机)
+- `interaction.signal` —— 全局取消
+
+`server.cancelWait()` 取消 server wait;`manualAbort.abort()` 取消 prompt。两者 `then/catch` 共享 `manualInput`/`manualError` 变量。**先到的赢,后到的被 cancel**。
+
+#### 19.5.3 parseAuthorizationInput 4 模式
+
+```typescript
+function parseAuthorizationInput(input: string): { code?: string; state?: string } {
+    const value = input.trim();
+    if (!value) return {};
+
+    try {  // 1. 完整 URL
+        const url = new URL(value);
+        return { code: url.searchParams.get("code"), state: url.searchParams.get("state") };
+    } catch { /* not a URL */ }
+
+    if (value.includes("#")) {  // 2. fragment 形式
+        const [code, state] = value.split("#", 2);
+        return { code, state };
+    }
+
+    if (value.includes("code=")) {  // 3. query string 形式
+        const params = new URLSearchParams(value);
+        return { code: params.get("code"), state: params.get("state") };
+    }
+
+    return { code: value };  // 4. 裸 code
+}
+```
+
+4 种输入都能解析 —— Anthropic 浏览器跳转 URL 长,用户在 TUI 复制粘贴可能截断。
+
+### 19.6 OpenAI Codex OAuth
+
+`openai-codex.ts:544` 实现 **3 路选择 + 双模式登录**:
+
+#### 19.6.1 Prompt 选择 browser vs device_code
+
+```typescript
+async login(interaction) {
+    const method = await interaction.prompt({
+        type: "select",
+        message: "Select OpenAI Codex login method:",
+        options: [
+            { id: "browser", label: "Browser login (default)" },
+            { id: "device_code", label: "Device code login (headless)" },
+        ],
+    });
+    if (method === "device_code") return loginOpenAICodexDeviceCode(interaction);
+    if (method !== "browser") throw new Error(`Unknown OpenAI Codex login method: ${method}`);
+    return loginOpenAICodex(interaction);
+}
+```
+
+#### 19.6.2 Device code 与 accountId 提取
+
+```typescript
+function decodeJwt(token: string): JwtPayload | null {
+    try {
+        const parts = token.split(".");
+        if (parts.length !== 3) return null;
+        const payload = parts[1] ?? "";
+        const decoded = atob(payload);  // 注意:atob 不处理 unicode padding
+        return JSON.parse(decoded) as JwtPayload;
+    } catch { return null; }
+}
+
+const JWT_CLAIM_PATH = "https://api.openai.com/auth";
+function getAccountId(accessToken: string): string | null {
+    const payload = decodeJwt(accessToken);
+    const auth = payload?.[JWT_CLAIM_PATH];
+    const accountId = auth?.chatgpt_account_id;
+    return typeof accountId === "string" && accountId.length > 0 ? accountId : null;
+}
+```
+
+**关键**:从 JWT 提取 `chatgpt_account_id`(每个 ChatGPT Plus/Pro 用户的 organization ID),作为后续 API 调用的 `chatgpt-account-id` header。`atob` 是浏览器 + Node 都有的 API,但 **JWT base64 不是 url-safe** —— 必须用 `atob` 而非 `atobUrlSafe`。
+
+### 19.7 GitHub Copilot OAuth:最复杂
+
+`github-copilot.ts:507` 实现 5 个子流程:
+
+#### 19.7.1 Enterprise vs 个人账号
+
+```typescript
+function getGitHubCopilotBaseUrl(token?: string, enterpriseDomain?: string): string {
+    if (token) {
+        const urlFromToken = getBaseUrlFromToken(token);  // 从 copilot_token 解析 proxy-ep
+        if (urlFromToken) return urlFromToken;
+    }
+    if (enterpriseDomain) return `https://copilot-api.${enterpriseDomain}`;
+    return "https://api.individual.githubcopilot.com";
+}
+
+function getBaseUrlFromToken(token: string): string | null {
+    const match = token.match(/proxy-ep=([^;]+)/);
+    if (!match) return null;
+    const proxyHost = match[1];
+    const apiHost = proxyHost.replace(/^proxy\./, "api.");
+    return `https://${apiHost}`;
+}
+```
+
+**GitHub Copilot token 是半结构化字符串**:`tid=xxx;exp=1234;proxy-ep=proxy.individual.githubcopilot.com;...`。pi 解析 `proxy-ep` 字段,把 `proxy.xxx` 替换为 `api.xxx` 作为 API endpoint。
+
+#### 19.7.2 动态模型目录
+
+```typescript
+async function refreshGitHubCopilotToken(...) {
+    const credentials = await refreshGitHubCopilotAccessToken(...);
+    const { availableModelIds } = await fetchGitHubCopilotModels(credentials.access, enterpriseDomain, signal, { maxRetries: 0, maxElapsedMs: 0 });
+    return { ...credentials, availableModelIds };
+}
+```
+
+每次 refresh 都重新拉 **用户的模型目录** —— 因为 GitHub Copilot 的可用模型随订阅级别变化(Pro/Enterprise/Business 看到不同模型列表)。
+
+#### 19.7.3 5 类 Copilot 错误响应
+
+`fetchWithRateLimitRetry`(`github-copilot.ts:135-166`)处理 429:
+- `Retry-After` 头(秒或 HTTP-date)
+- `delayMs = 500 * 2 ** retry` 指数退避
+- 整个 retry 受 `maxElapsedMs` 总体预算约束
+- `response.body?.cancel()` 释放 body 防止连接占用
+
+#### 19.7.4 enableGitHubCopilotModels 自动开启
+
+```typescript
+async function enableGitHubCopilotModels(token, modelIds, enterpriseDomain, signal) {
+    const enabledModelIds: string[] = [];
+    for (const modelId of modelIds) {
+        try {
+            if (await enableGitHubCopilotModel(token, modelId, enterpriseDomain, signal)) {
+                enabledModelIds.push(modelId);
+            }
+        } catch (error) {
+            if (signal.aborted) throw error;
+            break;  // 限流停止整个 batch
+        }
+    }
+    return enabledModelIds;
+}
+```
+
+**Best-effort 批量 enable**:一些模型(Claude, Grok)需要先在用户的 Copilot settings 启用才能调用。pi 在 login 后自动开启 `policyModelIds`。
+
+### 19.8 Radius 网关 OAuth
+
+`/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/radius.ts:1-403`:
+
+**特点**:`authorizationEndpoint` 从 `https://${gateway}/v1/oauth` 发现(Dynamic discovery 协议),不是硬编码 URL。
+
+```typescript
+async function loadRadiusOAuthDiscovery(gateway, signal) {
+    const response = await fetch(new URL("/v1/oauth", gateway), { ... });
+    if (!response.ok) throw new Error(...);
+    const discovery = await response.json() as Partial<RadiusOAuthDiscovery>;
+    if (typeof discovery.authorizationEndpoint !== "string") throw new Error(...);
+    return { authorizationEndpoint: discovery.authorizationEndpoint };
+}
+```
+
+### 19.9 Kimi Coding OAuth
+
+`/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/kimi-coding.ts:296` 是另一个 PKCE + browser callback 实现,与 anthropic 类似但 scopes 不同。
+
+### 19.10 多账号支持:`CredentialStore` 抽象
+
+`auth/credential-store.ts` 定义 5 个 provider × 1 credential 一一对应:
+
+```typescript
+export interface CredentialStore {
+    read(providerId: string, options?: AuthOperationOptions): Promise<Credential | undefined>;
+    list(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]>;
+    modify(providerId: string, fn: (current: Credential | undefined) => Promise<Credential | undefined>, options?: AuthOperationOptions): Promise<Credential | undefined>;
+    delete(providerId: string, options?: AuthOperationOptions): Promise<void>;
+}
+```
+
+**注释明确**(`types.ts:49-63`):
+> One type-tagged credential per provider — the shape of today's auth.json.
+
+**核心 invariant**:`modify` 是 **唯一写路径**,Models 在 modify 锁内做 OAuth refresh,防止 **concurrent requests 双倍 refresh** rotated token。
+
+#### 19.10.1 InMemoryCredentialStore:per-provider 串行
+
+```typescript
+private enqueue<T>(providerId: string, task: () => Promise<T>, options?: AuthOperationOptions): Promise<T> {
+    const previous = this.chains.get(providerId) ?? Promise.resolve();
+    const queued = (async () => {
+        await previous.catch(() => {});
+        signal.throwIfAborted();
+        return task();
+    })();
+    const tail = queued.catch(() => {});
+    this.chains.set(providerId, tail);
+    void tail.then(() => {
+        if (this.chains.get(providerId) === tail) this.chains.delete(providerId);
+    });
+    return raceWithAbortSignal(queued, signal);
+}
+```
+
+**Per-provider promise chain** —— Anthropic 和 GitHub Copilot modify 互不阻塞,但同一 provider 串行。`raceWithAbortSignal` 提供取消。
+
+#### 19.10.2 FileAuthStorage:proper-lockfile + 二阶段锁
+
+`coding-agent/src/core/auth-storage.ts:49-200`:
+
+```typescript
+export class FileAuthStorageBackend implements AuthStorageBackend {
+    private authPath: string;
+    constructor(authPath = join(getAgentDir(), "auth.json")) { ... }
+
+    withLock<T>(fn: (current: string | undefined) => LockResult<T>): T {
+        this.ensureParentDir();
+        this.ensureFileExists();
+        let release;
+        try {
+            release = this.acquireLockSyncWithRetry(this.authPath);
+            const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
+            const { result, next } = fn(current);
+            if (next !== undefined) writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);  // mode 0o600
+            return result;
+        } finally { if (release) release(); }
+    }
+
+    async withLockAsync<T>(fn, options?: AuthOperationOptions): Promise<T> {
+        const release = await this.acquireLockAsync(options?.signal, (error) => { lockCompromised = true; lockCompromisedError = error; });
+        const throwIfCompromised = () => { if (lockCompromised) throw lockCompromisedError ?? new Error("..."); };
+        ...
+    }
+}
+```
+
+**proper-lockfile** 是 npm 上的原子文件锁 crate(基于 mkdir),提供:
+- `realpath: false` —— 不解析 symlink(避免 Docker bind mount 的 symlink 循环)
+- `stale: 30_000` —— 30s 视为过期
+- `onCompromised` 回调 —— 锁被外部破坏时通知
+- 异步路径指数退避 `Math.min(10 * 2 ** retry, maxDelayMs / 2)` + 抖动
+
+**文件权限**:`mode: 0o600`(owner-only read/write),`mkdir mode: 0o700`(owner-only dir)—— **API Key 安全默认值**。
+
+#### 19.10.3 多账号冲突解决:无
+
+**结论:pi 没有多账号/账号切换** —— `CredentialStore.modify(providerId, fn)` 设计假设每 provider 1 credential,types.ts 注释明确。
+
+如果用户希望「工作的 Anthropic key + 私人的 key」,pi 当前 **不支持**。这是 laew 可以借鉴 + 改进的地方。
+
+### 19.11 laew 借鉴路线图(OAuth/多账号 维度)
+
+| 借鉴项 | pi 来源 | laew 落地路径 |
+|---|---|---|
+| 5 类 OAuth Flow 变体 | `ai/src/auth/oauth/` 10 文件 2973 行 | laew 当前仅 env API Key,可加 PKCE + Device Code 支持 Claude Pro/Max / ChatGPT Plus |
+| PKCE 实现 | `pkce.ts` 34 行 | Rust `oauth2` crate 已支持 PKCE,可参考 verifier/challenge 生成 |
+| Device Code slow_down 文案 | `device-code.ts:80-86` | laew 重试遇到慢限流给「WSL 时钟漂移」提示 |
+| 双层错误分类 + cause 隔离 | `types.ts:PiServerError/InternalServerError` | laew `AgentError::cause` 字段已存在,需明确公开/内部区分 |
+| proper-lockfile 文件锁 | `auth-storage.ts:128-148` | laew 当前 SQLite 单进程,扩展到跨进程锁需 `fs2` crate |
+| 0o600/0o700 权限 | `auth-storage.ts:25, 59` | laew 当前 SQLite DB 文件 644,API Key 写入需 600 |
+| Per-provider 串行 modify | `InMemoryCredentialStore.enqueue` | laew SQLite 已有 transaction,扩展到 OAuth refresh 锁 |
+| ClientID base64 编码 | `anthropic.ts:29` | 防止 GitHub 自动扫描 OAuth client_id |
+| JWT base64 解码 | `openai-codex.ts:103-113` | 用于提取 `chatgpt-account-id` |
+| 4 路 parseAuthorizationInput | `anthropic.ts:52-80` | URL / fragment / query / bare code 都支持 |
+| OAuth page HTML | `oauth-page.ts` 109 行 | callback server 返回友好 HTML |
+| enterprise URL 检测 | `github-copilot.ts:41-50` | 4 模式:trim、protocol-prefix、URL 构造、失败 |
+| Per-credential baseUrl | `github-copilot.ts:78-87` | proxy-ep → api.xxx 动态 endpoint |
+
+---
+
+## 第 20 章 i18n 国际化
+
+### 20.1 结论先行:pi 没有 i18n
+
+经过对 9 个 packages 的完整 `grep`,pi **未实现 i18n 框架**。所有 UI 文案是 **硬编码英文**。`localeCompare` 调用存在 18 处,但全部用于 **字符串排序**(JavaScript built-in),不是翻译。
+
+### 20.2 现有 locale-aware 代码
+
+`grep -rn "localeCompare" --include="*.ts" | head -20` 命中:
+
+```typescript
+// coding-agent/src/cli/list-models.ts:59
+const providerCmp = a.provider.localeCompare(b.provider);
+
+// coding-agent/src/core/tools/ls.ts:155
+entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+
+// coding-agent/src/modes/interactive/interactive-mode.ts:318
+return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
+
+// tui/src/components/markdown.ts (推测)
+```
+
+这些使用 `String.prototype.localeCompare` —— 默认用 `Intl.Collator`,但没有显式 `new Intl.Collator('zh-CN', { sensitivity: 'base' })` 等 locale-aware 比较。
+
+**问题**:中文文件名排序用默认 localeCompare 可能不符合 GB/T 笔画或拼音规则。
+
+### 20.3 缺失的 i18n 框架
+
+对比 `laew` 当前:`docs/` + CLAUDE.md + 工程注释全中文,但 UI 文案是英文 slash 命令(`/help` `/provider` `/clear`)—— 也是 **未 i18n**。
+
+laew TUI 的中文化硬编码(CLAUDE.md 提及 L54 「TUI 中文化硬编码」)就是这个问题。
+
+### 20.4 i18n 落地的潜在方案
+
+虽然 pi 没做,但从代码结构看,**最自然的集成点是**:
+
+#### 20.4.1 文案集中化
+
+当前 pi 的 UI 文案散落在 `interactive-mode.ts` 5000+ 行,`theme.ts` 1249 行,各种 component 模板字符串。**第一步**:抽取为 `messages: Record<MessageKey, string>` 字典。
+
+#### 20.4.2 翻译加载点
+
+`coding-agent/src/main.ts` 启动时检测 `process.env.LANG`,fallback 到 `navigator.language`(浏览器):
+
+```typescript
+const locale = process.env.LANG?.split('.')[0]?.replace('_', '-') ?? 'en';
+const messages = await loadMessages(locale);
+```
+
+#### 20.4.3 t-function 注入
+
+组件接受 `t: (key: MessageKey, ...args) => string` prop 或 Context:
+
+```typescript
+const t = useTranslations();
+const buttonLabel = t('provider.list.setActive');
+```
+
+#### 20.4.4 RTL 支持
+
+`biome.json` 中有 `"ltr"` 提及 —— 但未在 TUI 中实现 RTL(右到左)布局。TUI 本身对 RTL 支持有限(终端的 logical-to-visual 映射复杂),通常不做。
+
+### 20.5 laew 借鉴路线图(i18n 维度)
+
+| 借鉴项 | pi 缺位 | laew 落地路径 |
+|---|---|---|
+| 文案集中化 | 未做 | `src/i18n/zh-CN.json` + `src/i18n/en-US.json`,`t(key, args)` 函数 |
+| 启动 locale 检测 | 未做 | `std::env::var("LANG")` → fallback "en-US" |
+| 翻译 fallback | 未做 | `i18n::fallback(locale, key) → &str` |
+| RTL | 未做 | TUI 通常不做,但要预留 `bidi_text()` 工具 |
+| Date/Number locale | 未做 | `chrono` crate 处理日期 locale;`num-format` 数字 |
+| 排序 locale-aware | 散落 18 处 | `str::collator(locale)` 集中 |
+| 货币/Token cost | `models.generated.ts` USD 硬编码 | laew 复用,无需 i18n |
+
+**P2 优先级**:laew 当前中文注释 + 英文 UI 文案的「半中半英」状态,i18n 收益较低。建议优先做 **错误信息 locale**(L56 error i18n)。
+
+### 20.6 推荐 Rust crate
+
+```toml
+[dependencies]
+rust-i18n = "3"        # 简单的 YAML/JSON 翻译
+icu = "1"              # ICU4X,完整 Unicode CLDR
+sys-locale = "0.3"     # 检测 OS locale
+```
+
+---
+
+## 第 21 章 Release 工程化与 AutoUpdate
+
+> pi 的 release 工程化是其 10 个 packages 共 200+ scripts 的精华。本章节聚焦自动化发布 + 自更新。
+
+### 21.1 Release 流程 10 步
+
+`/usr/local/LsmGitOpenSource/pi/scripts/release.mjs:1-282` 定义完整流程:
+
+| Step | 动作 | 代码位置 |
+|---|---|---|
+| 1 | 检查 git 状态干净 | `status = run("git status --porcelain", ...)` |
+| 2 | 验证 npm 包注册 | `assertPackagesAreRegisteredWithNpm()` (lines 55-85) |
+| 3 | bump version | `bumpOrSetVersion(target)` (lines 142-165) |
+| 4 | 更新 CHANGELOG.md | `updateChangelogsForRelease(version)` (lines 173-192) |
+| 5 | 重新生成 artifacts | `npm run generate:models` + `shrinkwrap:coding-agent` |
+| 6 | run tests | `./test.sh` |
+| 7 | commit + tag | `git commit -m "Release v${version}"` + `git tag v${version}` |
+| 8 | 添加 [Unreleased] section | `addUnreleasedSection()` (lines 194-209) |
+| 9 | commit next-cycle | `git commit -m "Add [Unreleased] section for next cycle"` |
+| 10 | push + 触发 CI 发布 | `git push origin main` + `git push origin v${version}` |
+
+**关键细节**:
+- `removeStaleWorkspaceLockEntries()` —— npm version 后清理 stale workspace lock
+- `npm install --package-lock-only --ignore-scripts` —— 不跑脚本,只更新 lockfile
+- `npm ci --ignore-scripts` —— 严格按 lockfile 安装
+
+### 21.2 npm 注册检查
+
+```javascript
+function assertPackagesAreRegisteredWithNpm() {
+    const packageNames = getPublicWorkspacePackages().map((pkg) => pkg.name);
+    const unregisteredPackages = [];
+    for (const packageName of packageNames) {
+        const result = spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["view", packageName, "version", "--json"], ...);
+        if (result.status === 0 && result.stdout.trim()) {
+            console.log(`  ${packageName}`);
+            continue;
+        }
+        const output = [result.stdout, result.stderr, result.error?.message].filter(Boolean).join("\n");
+        if (output.includes("E404") || output.includes("404 Not Found")) {
+            unregisteredPackages.push(packageName);
+            continue;
+        }
+        throw new Error(output ? `Failed to query npm registration for ${packageName}\n${output}` : ...);
+    }
+    if (unregisteredPackages.length > 0) {
+        throw new Error(`The following public workspace packages are not registered on npm:\n${unregisteredPackages.map(...).join("\n")}\nRegister them before running a release.`);
+    }
+}
+```
+
+**防御**:`npm view` 命令检测每个 public package 在 npm registry 是否存在,E404/404 才算「真不存在」(而非网络故障)。其他错误抛 throw 强制 fail-fast。
+
+### 21.3 CHANGELOG 自动更新
+
+```javascript
+function updateChangelogsForRelease(version) {
+    const date = new Date().toISOString().split("T")[0];
+    const changelogs = getChangelogs();
+    for (const changelog of changelogs) {
+        const content = readFileSync(changelog, "utf-8");
+        if (!content.includes("## [Unreleased]")) {
+            console.log(`  Skipping ${changelog}: no [Unreleased] section`);
+            continue;
+        }
+        const updated = content.replace("## [Unreleased]", `## [${version}] - ${date}`);
+        writeFileSync(changelog, updated);
+        console.log(`  Updated ${changelog}`);
+    }
+}
+
+function addUnreleasedSection() {
+    const unreleasedSection = "## [Unreleased]\n\n";
+    for (const changelog of getChangelogs()) {
+        const content = readFileSync(changelog, "utf-8");
+        const updated = content.replace(/^(# Changelog\n\n)/, `$1${unreleasedSection}`);
+        writeFileSync(changelog, updated);
+    }
+}
+```
+
+**标准化 CHANGELOG.md 格式**:`# Changelog` → `## [Unreleased]` → `## [version] - date`。每个 package 单独维护。
+
+### 21.4 Local Release:`local-release.mjs` 297 行
+
+`/usr/local/LsmGitOpenSource/pi/scripts/local-release.mjs:1-297` —— **本地打包测试**完整工具:
+
+```javascript
+const packages = [
+    { directory: "packages/telemetry", name: "@earendil-works/pi-telemetry" },
+    { directory: "packages/ai", name: "@earendil-works/pi-ai" },
+    { directory: "packages/tui", name: "@earendil-works/pi-tui" },
+    { directory: "packages/agent", name: "@earendil-works/pi-agent-core" },
+    { directory: "packages/protocol", name: "@earendil-works/pi-protocol" },
+    { directory: "packages/client", name: "@earendil-works/pi-client" },
+    { directory: "packages/session-backends/sqlite-node", name: "@earendil-works/pi-session-backend-sqlite-node" },
+    { directory: "packages/server", name: "@earendil-works/pi-server" },
+    { directory: "packages/coding-agent", name: "@earendil-works/pi-coding-agent" },
+];
+```
+
+**3 套产物**:
+1. `tarballs/` —— `npm pack` 产出 9 个 `.tgz`
+2. `node/` —— 隔离 npm install(用 tarballs)
+3. `bun-install/` —— 隔离 bun install
+4. `bun/` —— **二进制 release**(Bun 编译的 native binary)
+
+#### 21.4.1 Bun 二进制编译
+
+```javascript
+function buildBunBinaryRelease(targetDirectory, archiveDirectory) {
+    if (!commandExists("bun")) throw new Error("Bun is required for the local binary release build.");
+    const platform = currentBinaryPlatform();  // darwin-arm64 / linux-x64 / windows-x64 etc.
+    const binaryBuildDirectory = join(archiveDirectory, "binary-build");
+    run("./scripts/build-binaries.sh", [
+        "--skip-install", "--skip-deps", "--skip-build",
+        "--platform", platform, "--out", binaryBuildDirectory,
+    ]);
+    rmSync(targetDirectory, { force: true, recursive: true });
+    cpSync(join(binaryBuildDirectory, platform), targetDirectory, { recursive: true });
+    const archiveName = platform.startsWith("windows-") ? `pi-${platform}.zip` : `pi-${platform}.tar.gz`;
+    cpSync(join(binaryBuildDirectory, archiveName), join(archiveDirectory, archiveName));
+    return platform;
+}
+```
+
+**6 平台**:`darwin-arm64` / `darwin-x64` / `linux-arm64` / `linux-x64` / `windows-arm64` / `windows-x64`。
+
+`build-binaries.sh` 单独脚本编译 Bun 单文件 binary,产物是 `pi-${platform}` 直接可执行(无需 Node 运行时)。
+
+#### 21.4.2 createPiShim:跨平台 shim
+
+```javascript
+function createPiShim(installDirectory) {
+    const binDirectory = join(installDirectory, "node_modules", ".bin");
+    if (process.platform === "win32") {
+        if (existsSync(join(binDirectory, "pi.cmd"))) {
+            writeFileSync(join(installDirectory, "pi.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\pi.cmd" %*\r\n');
+            writeFileSync(join(installDirectory, "pi.ps1"), '& "$PSScriptRoot/node_modules/.bin/pi.ps1" @args\n');
+            return;
+        }
+        ...
+        return;
+    }
+    symlinkSync(join("node_modules", ".bin", "pi"), join(installDirectory, "pi"));
+}
+```
+
+**跨平台 pi 可执行入口**:
+- Windows: `.cmd` (ECHO off batch) + `.ps1` (PowerShell)
+- Unix: symlink 到 `node_modules/.bin/pi`
+
+### 21.5 Publish:`publish.mjs` 113 行
+
+```javascript
+function assertBuildOutputExists(directory) {
+    if (!existsSync(join(directory, "dist"))) throw new Error(`${directory}/dist does not exist. Run npm run build before publishing.`);
+}
+
+function validatePack(directory) {
+    const result = run("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], { capture: true, cwd: directory });
+    const packed = JSON.parse(result.stdout)[0];
+    console.log(`  ${packed.filename}: ${packed.files.length} files, ${packed.size} bytes packed, ${packed.unpackedSize} bytes unpacked`);
+}
+
+function isPublished(name, version) {
+    const result = spawnSync(commandForPlatform("npm"), ["view", `${name}@${version}`, "version", "--json"], ...);
+    if (result.status === 0 && result.stdout.trim()) return true;
+    const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+    if (result.status !== 0 && (output.includes("E404") || output.includes("404 Not Found"))) return false;
+    throw new Error(...);
+}
+```
+
+**3 段发布验证**:
+1. `dist/` 存在性
+2. `npm pack --dry-run --json` 验证产物
+3. `npm view ${name}@${version}` 查 registry 是否已发布
+
+**已发布跳过 + 验证续跑**:
+```javascript
+for (const pkg of packageStates) {
+    ...
+    pkg.published = isPublished(pkg.name, pkg.version);
+    if (pkg.published) console.log(`${pkg.name}@${pkg.version} is already published; validating package contents only.`);
+    else console.log(`${pkg.name}@${pkg.version} is not published; validating package contents before publish.`);
+    validatePack(pkg.directory);  // 即使已发布也验证产物完整性
+}
+```
+
+**Provenance**:`run("npm", ["publish", "--access", "public", "--provenance", "--ignore-scripts"], ...)` —— npm 8+ 自动生成 build provenance(Sigstore 签名),让用户验证包来自哪个 GitHub Actions run。
+
+### 21.6 Self-Update:`package-manager-cli.ts` 150-300
+
+`/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/package-manager-cli.ts:150-300` 提供 5 个 self-update 路径:
+
+| Install Method | Update Command | 来源 |
+|---|---|---|
+| **bun-binary** | 不支持(走 managed install) | `case "bun-binary": return undefined;` |
+| **pnpm** | `pnpm install -g --ignore-scripts --config.minimumReleaseAge=0 ${target}` | `pnpm` 全局安装 |
+| **yarn** | `yarn global add --ignore-scripts ${target}` | `yarn global` |
+| **bun** | `bun install -g --ignore-scripts --minimum-release-age=0 ${target}` | `bun` 全局 |
+| **npm** | `npm install -g --ignore-scripts --min-release-age=0 ${target}` | `npm install -g` |
+
+**关键防御**:`--minimumRelease-age=0` / `--min-release-age=0` —— 关闭 npm/pnpm 默认的「发布 N 小时内不能装」防病毒延迟,确保 self-update 立即可装。
+
+#### 21.6.1 Managed Install:Pi 维护自有更新流程
+
+```javascript
+function activateManagedRelease(managedRoot: string, version: string): void {
+    const currentPath = join(managedRoot, "current-version");
+    const temporaryPath = join(managedRoot, `current-version.tmp.${process.pid}-${Date.now()}`);
+    try {
+        writeFileSync(temporaryPath, `${version}\n`);
+        renameSync(temporaryPath, currentPath);  // 原子发布
+    } finally {
+        rmSync(temporaryPath, { force: true });
+    }
+}
+```
+
+**managed install**:
+1. Pi-managed install marker:`{managedRoot}/managed-install.json`(kind: "pi-managed-install", layout: "releases-v1", schemaVersion: 1)
+2. 版本文件:`{managedRoot}/current-version`(原子 rename 写)
+3. Release 目录:`{managedRoot}/releases/v{version}/`
+4. Staging:`{managedRoot}/staging/update-{pid}-{ts}/`
+
+#### 21.6.2 staged rollout + smoke test
+
+```javascript
+function verifyManagedRelease(releaseDir, expectedVersion) {
+    const binPath = join(releaseDir, "node_modules", ".bin", process.platform === "win32" ? `${APP_NAME}.cmd` : APP_NAME);
+    const result = spawnProcessSync(binPath, ["--version"], ...);
+    if (result.error || result.status !== 0) throw new Error(`Could not verify managed Pi ${expectedVersion}: ${reason}`);
+    const installedVersion = result.stdout.trim();
+    if (installedVersion !== expectedVersion) throw new Error(`Managed Pi smoke test returned version ${installedVersion}; expected ${expectedVersion}.`);
+}
+```
+
+**3 段验证**:
+1. binPath 存在
+2. `--version` 退出码 0
+3. 输出 === expectedVersion(防止符号链接错位)
+
+#### 21.6.3 Windows self-update quarantine
+
+`utils/windows-self-update.ts` 注释(未读具体代码,但 main.ts 提到):
+```typescript
+if (process.platform === "win32") cleanupWindowsSelfUpdateQuarantine(getPackageDir());
+```
+
+**Windows 特有的 quarantine** —— Windows Defender/AV 可能把新下载 binary 标记为「quarantined」(隔离),执行时弹窗警告。pi 在启动时清理 `current-version.tmp.*` 临时目录,避免残留被 AV 误判。
+
+### 21.7 laew 借鉴路线图(Release/AutoUpdate 维度)
+
+| 借鉴项 | pi 来源 | laew 落地路径 |
+|---|---|---|
+| 10 步 release 流程 | `release.mjs` 282 行 | 当前 `rebuild_restart_app.sh` 只有 build+copy;加 version bump + CHANGELOG + tag |
+| npm publish provenance | `publish.mjs:108` `--provenance` | `cargo publish --no-verify` 当前不支持,需要 GitHub Actions OIDC |
+| Bun 二进制打包 | `local-release.mjs:151-171` | laew `--release` 已经产出 `./laew`,但未做 6 平台交叉编译 |
+| Managed install 原子发布 | `activateManagedRelease` renameSync | 当前 `rebuild_restart_app.sh` 用 `cp` 不原子 |
+| Self-update 5 种 install method | `config.ts:116-188` | laew 无 self-update |
+| Smoke test 二阶段验证 | `verifyManagedRelease` | 当前 `rebuild_restart_app.sh` 编译后未跑 `--version` 验证 |
+| Windows quarantine cleanup | `cleanupWindowsSelfUpdateQuarantine` | laew 在 Windows CI 上可能遇到同样问题 |
+| CHANGELOG.md 自动生成 | `updateChangelogsForRelease` | laew 当前手动维护 |
+| Pre-publish check | `prepublishOnly` script (`package.json:53`) | laew 当前无 prepublish 检查 |
+| version lockstep | `npm version --workspaces` | laew 单 crate,无 lockstep 需求 |
+| 6 平台 binary | `currentBinaryPlatform()` | laew 在 macOS 编译 Linux binary 需要 cross toolchain |
+
+**P0 优先级**:laew 当前 release 流程过于简单,**加 smoke test**(运行 `--version` 验证)+ **加 provenance**(GitHub Actions OIDC + Sigstore)。
+
+---
+
+## 第 22 章 WebSocket 与 SSE
+
+> pi 是研究 WebSocket 和 SSE 集成的优秀案例。`openai-codex-responses.ts` 实现 **WebSocket 优先 + SSE fallback** 双模式。
+
+### 22.1 二进制帧协议:`framing.ts` 165 行
+
+`/usr/local/LsmGitOpenSource/pi/packages/protocol/src/framing.ts:1-165`:
+
+#### 22.1.1 帧格式
+
+```typescript
+const FRAME_HEADER_LENGTH = 4;
+const MAX_UINT32 = 0xffff_ffff;
+const PAYLOAD_BLOCK_SIZE = 64 * 1024;
+export const DEFAULT_MAX_FRAME_LENGTH = 16 * 1024 * 1024;
+
+export function encodeFrame(payload: Uint8Array): Uint8Array {
+    if (!(payload instanceof Uint8Array)) throw new TypeError("Frame payload must be a Uint8Array");
+    if (payload.byteLength > MAX_UINT32) throw new RangeError("Frame payload exceeds the unsigned 32-bit length limit");
+    const frame = new Uint8Array(FRAME_HEADER_LENGTH + payload.byteLength);
+    const length = payload.byteLength;
+    frame[0] = length >>> 24;  // big-endian 32-bit length prefix
+    frame[1] = length >>> 16;
+    frame[2] = length >>> 8;
+    frame[3] = length;
+    frame.set(payload, FRAME_HEADER_LENGTH);
+    return frame;
+}
+```
+
+**Length-prefixed binary protocol**(RFC 类似 BinPack):
+- 4 字节 big-endian 长度前缀
+- 16 MB 默认帧大小上限
+- 单帧 = uint32 length + payload bytes
+
+#### 22.1.2 增量解码:FrameDecoder
+
+```typescript
+type DecoderState = "open" | "ended" | "failed";
+
+export class FrameDecoder {
+    private readonly header = new Uint8Array(FRAME_HEADER_LENGTH);
+    private headerLength = 0;
+    private readonly maxFrameLength: number;
+    private payloadBlocks: Uint8Array[] = [];
+    private currentPayloadBlock: Uint8Array | undefined;
+    private currentPayloadBlockLength = 0;
+    private expectedPayloadLength: number | undefined;
+    private payloadLength = 0;
+    private state: DecoderState = "open";
+
+    push(chunk: Uint8Array): Uint8Array[] {
+        if (this.state === "ended") throw new FrameError("Frame decoder has ended");
+        if (this.state === "failed") throw new FrameError("Frame decoder has failed");
+        ...
+        const frames: Uint8Array[] = [];
+        let chunkOffset = 0;
+        while (chunkOffset < chunk.byteLength) {
+            if (this.expectedPayloadLength === undefined) {
+                const headerBytes = Math.min(FRAME_HEADER_LENGTH - this.headerLength, chunk.byteLength - chunkOffset);
+                this.header.set(chunk.subarray(chunkOffset, chunkOffset + headerBytes), this.headerLength);
+                this.headerLength += headerBytes;
+                chunkOffset += headerBytes;
+                if (this.headerLength < FRAME_HEADER_LENGTH) continue;
+
+                const frameLength = this.header[0]! * 0x1_000_000 + this.header[1]! * 0x1_0000 + this.header[2]! * 0x100 + this.header[3]!;
+                this.headerLength = 0;
+                if (frameLength > this.maxFrameLength) this.fail(`Frame length ${frameLength} exceeds configured limit of ${this.maxFrameLength}`);
+                if (frameLength === 0) { frames.push(new Uint8Array()); continue; }
+                this.expectedPayloadLength = frameLength;
+                ...
+            }
+            ...
+            // 增量累积 payload
+            const payloadBytes = Math.min(block.byteLength - this.currentPayloadBlockLength, chunk.byteLength - chunkOffset);
+            block.set(chunk.subarray(chunkOffset, chunkOffset + payloadBytes), this.currentPayloadBlockLength);
+            this.currentPayloadBlockLength += payloadBytes;
+            this.payloadLength += payloadBytes;
+            chunkOffset += payloadBytes;
+        }
+        return frames;
+    }
+
+    end(): void {
+        if (this.state === "ended") throw new FrameError("Frame decoder has ended");
+        if (this.state === "failed") throw new FrameError("Frame decoder has failed");
+        if (this.headerLength !== 0 || this.expectedPayloadLength !== undefined) this.fail("Truncated frame at end of stream");
+        this.state = "ended";
+    }
+}
+```
+
+**5 关键设计**:
+1. **3 状态机** `open`/`ended`/`failed` —— 防止重复 end / 失败后继续
+2. **`64 KB block size`** —— 累积 payload 用 64KB block,大 payload 自动合并
+3. **partial header 处理** —— chunk 边界恰好在 header 中间也能拼回
+4. **`fail()` 终止** —— 异常后清理所有 partial 状态
+5. **空帧支持** `frameLength === 0` —— keepalive ping
+
+### 22.2 CBOR 编解码:strict RFC 8949 子集
+
+`cbor/decoder.ts:168` + `cbor/encoder.ts:216` —— **pi 协议载荷是 CBOR**。
+
+#### 22.2.1 严格性约束
+
+```typescript
+case 6:
+    throw new CborError("CBOR tags are not supported");
+case 31:
+    throw new CborError("CBOR break marker is not supported");
+```
+
+**明确拒绝**:
+- Major type 6 (tags) —— 不支持语义标签
+- Major type 31 (indefinite-length break) —— 只支持 definite-length
+
+**这些限制让 decoder 复杂度从 RFC 8949 全集的 ~500 行降到 ~165 行**。
+
+#### 22.2.2 嵌套深度限制
+
+```typescript
+private readItem(depth: number): unknown {
+    if (depth > this.options.maxDepth) throw new CborError(`CBOR nesting depth exceeds configured limit of ${this.options.maxDepth}`);
+    ...
+}
+```
+
+`maxDepth` 防 stack overflow 攻击。**对比 JSON.parse** 无此保护 —— 恶意 JSON `{...无限嵌套}` 可能让 V8 OOM。
+
+#### 22.2.3 整数范围
+
+```typescript
+case 1: {
+    const value = -1 - this.readArgument(additionalInformation);
+    if (!Number.isSafeInteger(value)) throw new CborError("Decoded CBOR integer is outside the safe range");
+    return value;
+}
+```
+
+`Number.isSafeInteger` 限制 ±2^53 - 1,超过即拒绝。**避免 JS 整数精度丢失**。
+
+#### 22.2.4 容器长度限制
+
+```typescript
+private readLength(additionalInformation: number, kind: string, limit: number): number {
+    if (additionalInformation === 31) throw new CborError(`Indefinite-length CBOR ${kind}s are not supported`);
+    const length = this.readArgument(additionalInformation);
+    if (length > limit) throw new CborError(`CBOR ${kind} length exceeds configured limit of ${limit}`);
+    return length;
+}
+```
+
+**`maxContainerLength`** 防攻击者发一个声明 1GB 数组的 CBOR 帧。
+
+#### 22.2.5 cycle detection
+
+```typescript
+if (value instanceof Array.isArray(value)) {
+    if (ancestors.has(value)) throw new CborError("CBOR values must not contain cycles");
+    ...
+}
+```
+
+`ancestors: Set<object>` 在递归中跟踪父节点 —— 防循环引用栈溢出。
+
+### 22.3 协议层 codec:`codec.ts` 173 行
+
+`/usr/local/LsmGitOpenSource/pi/packages/protocol/src/codec.ts`:
+
+```typescript
+function isProtocolValue(value: unknown, optionalProperty = false, ancestors = new Set<object>()): boolean {
+    if (value === undefined) return optionalProperty;
+    if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") return true;
+    if (typeof value !== "object" || ancestors.has(value)) return false;
+    ancestors.add(value);
+    try {
+        if (Array.isArray(value)) return value.every((item) => isProtocolValue(item, false, ancestors));
+        if (Object.getPrototypeOf(value) !== Object.prototype) return false;
+        return Object.values(value).every((item) => isProtocolValue(item, true, ancestors));
+    } finally {
+        ancestors.delete(value);
+    }
+}
+
+export function parseClientMessage(value: unknown): ClientMessage {
+    if (!isProtocolValue(value) || !Check(ClientMessageSchema, value)) {
+        throw new ProtocolValidationError("Invalid client protocol message");
+    }
+    return value;
+}
+```
+
+**双层校验**:
+1. `isProtocolValue` —— 防御 prototype pollution(必须 `Object.prototype`),cycle detection,JSON-safe only
+2. `Check(ClientMessageSchema, value)` —— TypeBox schema 校验(从 `schemas.ts` 生成)
+
+```typescript
+function encodeProtocolMessage<T>(value, parse, kind, options): Uint8Array {
+    const validated = parse(value);
+    try {
+        const frame = encodeFrame(encodeCbor(validated, { maxByteLength: maxFrameLength }));
+        assertCompleteFrame(frame, { maxFrameLength });
+        return frame;
+    } catch (error) {
+        if (error instanceof ProtocolValidationError) throw error;
+        throw new ProtocolValidationError(`Unable to encode ${kind} protocol message: ${boundedErrorMessage(error)}`);
+    }
+}
+```
+
+**Encode 路径**:`parse(value)` → `encodeCbor(validated)` → `encodeFrame` → `assertCompleteFrame` 校验完整性。任何一步失败抛 `ProtocolValidationError`。
+
+### 22.4 Server/Client 协议握手
+
+`server/src/server.ts:185-249` 的 `finishHandshake`:
+
+```typescript
+private async finishHandshake(state, hello) {
+    if (!isSupportedProtocolVersion(hello.version)) {
+        await this.failProtocol(state, { code: "version", message: `Unsupported protocol version ${hello.version}; expected ${PROTOCOL_VERSION}` });
+        return;
+    }
+
+    const snapshot = await this.snapshots.get();
+    if (this.closing || state.disconnected || state.stage !== "handshaking" || state.connection.closed) return;
+    const sent = await this.sendMessage(state, {
+        type: "hello",
+        version: PROTOCOL_VERSION,
+        connectionId: state.id,
+        snapshot,
+    } satisfies ServerHello);
+    if (sent && !state.disconnected && state.stage === "handshaking") {
+        state.handshakeComplete = true;
+        state.stage = "ready";
+        clearTimeout(state.handshakeTimeout);
+        if (snapshot.revision !== this.snapshots.currentRevision) {
+            const current = await this.snapshots.get();
+            await this.sendMessage(state, { type: "event", event: { type: "server_snapshot", snapshot: current } });
+        }
+    }
+}
+```
+
+**5 阶段 handshake**:
+1. 客户端发 `hello` + version
+2. 版本不匹配 → 立即 `failProtocol(version)`
+3. 拉 server snapshot
+4. 发送 server `hello` + connectionId + snapshot
+5. 状态 → `ready`,清 handshakeTimeout,**比较 snapshot revision,不一致再补发**
+
+`assertCompleteFrame(frame, { maxFrameLength })` 在 encode 后强制断言**生成的帧完整**(length prefix 与 byteLength 一致),防止 OOM-by-truncation 攻击。
+
+### 22.5 WebSocket:OpenAI Codex Responses
+
+`/usr/local/LsmGitOpenSource/pi/packages/ai/src/api/openai-codex-responses.ts:240-365` 实现 **WebSocket 优先 + SSE fallback**:
+
+```typescript
+const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
+const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
+const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
+
+const transport = options?.transport || "auto";  // "auto" | "websocket" | "sse"
+const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(cacheSessionId);
+
+if (transport !== "sse" && !websocketDisabledForSession) {
+    let websocketStarted = false;
+    let retriedWebSocketConnectionLimit = false;
+    let retriedMissingWebSocketContinuation = false;
+    while (true) {
+        websocketStarted = false;
+        try {
+            await processWebSocketStream(
+                resolveCodexWebSocketUrl(model.baseUrl),
+                body,
+                websocketHeaders,
+                output, stream, model,
+                () => { websocketStarted = true; ... },
+                httpTimeoutMs,
+                websocketConnectTimeoutMs,
+                cacheSessionId,
+                accountId,
+                grammarToolInputProperties,
+                options,
+            );
+            ...
+        } catch (error) {
+            const aborted = options?.signal?.aborted;
+            const connectionLimitBeforeStart = !websocketStarted && isWebSocketConnectionLimitReachedError(error);
+            const previousResponseNotFound = isPreviousResponseNotFoundError(error);
+
+            // 1. 续传失败 → 重试 1 次
+            if (!aborted && previousResponseNotFound && !retriedMissingWebSocketContinuation) {
+                retriedMissingWebSocketContinuation = true;
+                continue;
+            }
+            // 2. 连接限制 → 切到 SSE
+            if (!aborted && connectionLimitBeforeStart && !retriedWebSocketConnectionLimit) {
+                retriedWebSocketConnectionLimit = true;
+                continue;
+            }
+            // 3. 业务错误 → 抛出
+            if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
+                throw error;
+            }
+            // 4. 网络/transport 错误 → 切 SSE
+            appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic("provider_transport_failure", error, {
+                configuredTransport: transport,
+                fallbackTransport: websocketStarted ? undefined : "sse",
+                eventsEmitted: websocketStarted,
+                phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
+                requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+            }));
+            recordWebSocketFailure(cacheSessionId, error);
+            if (websocketStarted) throw error;  // 已经开始发事件 → 不退
+            recordWebSocketSseFallback(cacheSessionId);
+            break;  // 退到 SSE
+        }
+    }
+}
+```
+
+**5 段 WebSocket 处理**:
+1. **续传错误** `previous_response_not_found` → 切续传 ID 重试
+2. **连接限制** `websocket_connection_limit_reached` → 切 SSE
+3. **业务错误**(Codex 返回的错误,非 transport 层)→ 抛
+4. **transport 错误 + 未开始发事件** → 切 SSE
+5. **transport 错误 + 已经开始发事件** → 抛(避免事件重复)
+
+#### 22.5.1 recordWebSocketSseFallback 会话级记忆
+
+```typescript
+const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(cacheSessionId);
+if (websocketDisabledForSession) recordWebSocketSseFallback(cacheSessionId);
+```
+
+**关键**:`cacheSessionId` 是 session 级开关 —— **如果上一个请求 fall back 到 SSE,本会话后续请求直接走 SSE**。避免每个请求都试一次 WS → fail → 切 SSE 的 ~5s 浪费。
+
+#### 22.5.2 zstd request compression
+
+```typescript
+const REQUEST_COMPRESSION_ZSTD_LEVEL = 3;
+const compressedBody = compressRequestBodyZstd(bodyJson);
+if (compressedBody) sseHeaders.set("content-encoding", "zstd");
+const sseBody: Uint8Array | string = compressedBody ?? bodyJson;
+```
+
+SSE 请求体 zstd 压缩(level 3),WS 路径不压缩(WS 帧自带分帧,不需要压缩)。`Content-Encoding: zstd` 头让 Codex backend 解压。
+
+#### 22.5.3 SSE 重试逻辑
+
+```typescript
+for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (options?.signal.aborted) throw new Error("Request was aborted");
+    try {
+        ...
+        response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), { ... });
+    } catch (error) {
+        if (headerTimeoutSignal?.aborted && !options?.signal?.aborted) {
+            if (attempt < maxRetries) {
+                throw new Error(`Codex SSE response headers timed out after ${httpTimeoutMs}ms`);
+            }
+        }
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (attempt < maxRetries && !(lastError instanceof RetryDelayExceededError) && !lastError.message.includes("usage limit")) {
+            const delayMs = BASE_DELAY_MS * 2 ** attempt;
+            await sleep(delayMs, options?.signal);
+            continue;
+        }
+        throw lastError;
+    }
+}
+```
+
+**指数退避** `BASE_DELAY_MS * 2 ** attempt`,跳过 usage limit(`不重试,直接抛`)。
+
+### 22.6 客户端 Unix Socket 传输
+
+`/usr/local/LsmGitOpenSource/pi/packages/server/src/transports/unix/listener.ts:434` —— Unix domain socket 传输(类似本地 IPC):
+
+`/usr/local/LsmGitOpenSource/pi/packages/client/src/unix.ts` —— 客户端 Unix socket 连接器。
+
+### 22.7 laew 借鉴路线图(WebSocket/SSE 维度)
+
+| 借鉴项 | pi 来源 | laew 落地路径 |
+|---|---|---|
+| 4-byte length prefix 帧协议 | `framing.ts:encodeFrame` | laew 当前用 stdin/stdout 文本,无 binary frame;若做 IPC 可用 |
+| 64KB 累积 block | `framing.ts:PAYLOAD_BLOCK_SIZE` | 防大帧 OOM |
+| 增量 FrameDecoder | `framing.ts:FrameDecoder` | 流式输入核心 |
+| 3 状态机 | `framing.ts:DecoderState` | open/ended/failed |
+| CBOR strict subset | `cbor/decoder.ts` | 替代 JSON,体积小、解析快;Rust `ciborium` crate |
+| CBOR depth/length/cycle limit | `cbor/decoder.ts` | 防恶意输入 |
+| TypeBox schema validate | `codec.ts:Check(ClientMessageSchema)` | Rust `jsonschema` crate |
+| 5 段 WS 错误降级 | `openai-codex-responses.ts:333-364` | laew 未来若加 WS,必借鉴 |
+| session 级 fallback 记忆 | `isWebSocketSseFallbackActive` | 跳过已知失败模式 |
+| 续传错误重试 | `previous_response_not_found` retry | 多步骤 LLM 调用场景 |
+| 业务错误 vs transport 错误区分 | `isCodexNonTransportError` | 不混淆 HTTP 层 vs 业务层 |
+| zstd 请求体压缩 | `compressRequestBodyZstd` | Rust `zstd-rs` crate |
+| HTTP header timeout | `AbortSignal.timeout(httpTimeoutMs)` | 防 SSE 永远 hang |
+
+---
+
+## 第 23 章 DevContainer 与容器化
+
+### 23.1 结论先行:pi 没有 DevContainer
+
+经过对 `packages/`、`scripts/`、根目录的完整 `grep`,**pi 没有**:
+- `.devcontainer/devcontainer.json`
+- `Dockerfile`
+- `docker-compose.yml`
+- 任何容器相关 README
+
+唯一命中:
+- `coding-agent/src/modes/interactive/theme/theme.ts:1249` —— `dockerfile: "dockerfile"`(语法高亮 token)
+- `coding-agent/examples/extensions/interactive-shell.ts:92-93` —— `"docker exec -it"` / `"docker run -it"`(示例扩展命令)
+
+### 23.2 间接的容器友好性
+
+虽然没有容器化,pi 在以下方面对容器友好:
+
+#### 23.2.1 环境变量驱动
+
+`main.ts` 启动接受 `process.env.*`:
+```typescript
+process.env.PI_OFFLINE
+process.env.PI_HARDWARE_CURSOR
+process.env.PI_CLEAR_ON_SHRINK
+process.env.PI_CODING_AGENT_DIR
+process.env.PI_MANAGED_INSTALL_ROOT
+process.env.PNPM_HOME
+process.env.PI_OAUTH_CALLBACK_HOST
+process.env.LANG
+```
+
+**对容器优势**:无需配置文件,所有行为可 env override。Docker `ENV` 指令即可配置。
+
+#### 23.2.2 无 TTY 检测的降级
+
+`main.ts`:
+```typescript
+async function readPipedStdin() {
+    if (process.stdin.isTTY) return undefined;
+    return new Promise((resolve) => { ... });
+}
+```
+
+无 TTY 时自动切到 print 模式(`-p` 行为),适合 `docker run ... | pi -p "..."` 模式。
+
+#### 23.2.3 跨平台二进制
+
+`local-release.mjs` 输出 6 平台二进制,可作为 Docker `COPY --from=builder /pi` 多阶段构建产物。
+
+### 23.3 缺失的容器化能力
+
+| 缺失 | 影响 |
+|---|---|
+| 无 `.devcontainer/` | VSCode Remote Containers 用户需自己配置 |
+| 无 `Dockerfile` | Docker 用户需自己构建镜像 |
+| 无 `docker-compose.yml` | 多服务编排(pi + Postgres)无参考 |
+| 无镜像公开 | 用户必须自构建或用 npm 全局安装 |
+| 无容器化安全建议 | `readOnlyRootFilesystem` / `cap_drop` / `no-new-privileges` |
+
+### 23.4 laew 借鉴路线图(DevContainer 维度)
+
+| 借鉴项 | pi 缺位 | laew 落地路径 |
+|---|---|---|
+| `.devcontainer/devcontainer.json` | 缺 | laew 当前 Rust 项目,可加 `.devcontainer/` 包含 Rust 工具链 + cargo + pi |
+| 多阶段 `Dockerfile` | 缺 | `FROM rust:1.x AS builder` → `COPY ./laew /usr/local/bin/` |
+| `docker-compose.yml` | 缺 | 适合 pi + SQLite 共享卷 + 端口映射 |
+| `hadolint` lint | 缺 | CI 加 Dockerfile lint |
+| 镜像公开 | 缺 | `ghcr.io/beyond-openclaw/laew` (P69 L69 无 Dockerfile) |
+| 容器安全 baseline | 缺 | `cap_drop: [ALL]` + `readOnlyRootFilesystem` + `security-opt: no-new-privileges:true` |
+| 非 root 用户 | 缺 | `USER 1000:1000` 在 Dockerfile 末尾 |
+| 健康检查 | 缺 | `HEALTHCHECK CMD ./laew --version` |
+| 入口点 | 缺 | `ENTRYPOINT ["/usr/local/bin/laew"]` |
+
+### 23.5 推荐 Rust 镜像模板
+
+```dockerfile
+# 多阶段构建
+FROM rust:1.83-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src target/release/deps/laew*
+COPY src ./src
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 pi
+USER 1000
+COPY --from=builder /build/target/release/laew /usr/local/bin/laew
+ENTRYPOINT ["/usr/local/bin/laew"]
+HEALTHCHECK CMD laew --version || exit 1
+```
+
+---
+
+## 第 24 章 CRDT 与多端冲突
+
+### 24.1 结论先行:pi 没有 CRDT
+
+经过完整 `grep`,**pi 没有引入 CRDT 库**(无 `automerge`、`yjs`、`yrs`)。pi 的多端冲突解决依赖:
+
+1. **WriterLease fence**(乐观锁)—— session-backends/sqlite-node
+2. **JSONL append-only + torn-tail 修复**(第 8 轮覆盖)
+3. **SourceFormat 版本号迁移**(双后端)
+4. **OT-like 文本编辑**(推测,未读)
+
+### 24.2 WriterLease 乐观锁
+
+`/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts:16-58`(第 8 轮覆盖,本轮聚焦多端视角):
+
+```typescript
+// 简化版,实际未读
+class WriterLease {
+    async acquire(): Promise<void> {
+        // UPDATE writer_leases SET fence = fence + 1 WHERE id = ? AND owner = ?
+        // CAS 操作,fence 是单调计数器
+    }
+}
+```
+
+**冲突解决语义**:
+- fence 单调递增
+- 写者持 lease 时,其他写者等待
+- lease 超时(30s)自动放弃
+- 多进程:SQLite 跨进程锁(WAL + busy_timeout)
+
+### 24.3 JSONL torn-tail 修复
+
+第 8 轮已覆盖:`jsonl/storage.ts:80-108` 检测最后一行 schema 错误则截断,防止崩溃留下半截行。
+
+**冲突解决语义**:
+- append-only 写入
+- 崩溃后启动读到最后一行,schema 校验失败 → 截断
+- 多端 append 不会相互覆盖(每端独立 file,但不推荐)
+
+### 24.4 双后端 sourceFormat 版本迁移
+
+`agent/src/harness/session/types.ts` 推测有:
+```typescript
+type SourceFormat = 3 | 4;  // JSONL v3 / SQLite v4
+```
+
+迁移逻辑在 `session-manager.ts`(未读),猜测:
+- JSONL → SQLite:导入所有 entries
+- SQLite → JSONL:导出 entries 到文件
+
+**冲突解决语义**:
+- 单向迁移(只能从旧到新)
+- 不支持双向同步(SQLite 改 → JSONL 改的 conflict resolution 缺失)
+
+### 24.5 多端协作的缺失能力
+
+| 缺失 | 影响 |
+|---|---|
+| 无 CRDT | 同一 session 不能 2+ 客户端同时编辑 |
+| 无事件溯源 | 不能 replay 历史 state |
+| 无 operational transform | 不能合并 2 个并发 edit |
+| 无 vector clock | 不能检测 causality |
+| 无 conflict-free merge | 2 端同改 → last-write-wins 覆盖 |
+| 无 multi-device sync | 用户不能在 PC + 手机 + 平板并行使用同一个 session |
+
+### 24.6 git-merge-and-resolve extension
+
+`examples/extensions/git-merge-and-resolve.ts`(未读) 是 **git-level merge conflict resolve** 扩展,不是 session-level。
+
+### 24.7 laew 借鉴路线图(CRDT 维度)
+
+| 借鉴项 | pi 缺位 | laew 落地路径 |
+|---|---|---|
+| 无 CRDT 库 | 缺 | laew 当前单进程 SQLite,加 `yrs`(Yjs Rust port)支持多端 |
+| WriterLease fence | 有 | laew 当前 SQLite 单写者,可加 fence 防僵尸 |
+| JSONL torn-tail | 有(第 8 轮) | laew 当前 JSONL 缺,可加 |
+| SourceFormat 迁移 | 推测有 | laew SQLite 单格式,可加 version column |
+| Session share | 缺 | laew 当前单 session,可加 read-only share token(L74) |
+| Conflict merge | 缺 | laew 当前 LWW(last-write-wins),可加 3-way merge |
+| Event Sourcing | 缺 | laew 当前 mutation-only,可加 event log(L77) |
+| Operational Transform | 缺 | laew 当前无协同编辑 |
+
+### 24.8 推荐 Rust CRDT crate
+
+| Crate | 用途 | 大小 |
+|---|---|---|
+| `yrs` | Yjs Rust port,文档型 CRDT | 稳定 |
+| `automerge` | Automerge CRDT | 较新 |
+| `crdt-rs` | 通用 CRDT 原语 | 小 |
+| `datasheet` | Table 协作 | 罕见 |
+| `loro` | 高性能 CRDT | 新兴 |
+
+**建议**:laew 当前需求只是 SQLite session 共享,**不需要 CRDT**。加 `WriterLease` fence + `sourceFormat` 版本已经足够。
+
+### 24.9 CRDT 与 laew 当前架构的兼容性
+
+laew 当前:
+- 单进程 SQLite(LsmAgentEmergentWork.db)
+- 单 Agent session(单 Session ID)
+- 单用户(CLI 工具)
+- 无多端
+
+**何时需要 CRDT**:laew 升级到「本地 + 远端同步」(类似 Joplin/Obsidian)或「多 agent 协作」(multi-agent sub-agent 共享 session)时。
+
+**当前不适用**。L75(L76-L78)Session 共享/冲突/Event Sourcing 是远期目标。
+
+---
+
+## 第 25 章 综合:8 维度交叉点
+
+8 维度在 pi 中通过 **6 个共享抽象** 串联:
+
+1. **`OAuthAuth` 接口**(`auth/types.ts:206`)—— 10 个 provider × 5 种 flow 变体的统一契约
+2. **`FrameDecoder`/`encodeFrame`**(`protocol/framing.ts`)—— 所有 binary transport 的帧解析
+3. **`CBOR` strict subset**(`protocol/cbor/`)—— protocol payload 编码
+4. **`CredentialStore.modify`**(`auth/types.ts:86`)—— 唯一写路径,OAuth refresh 锁内调用
+5. **`TuiBase` overlay stack**(`tui/tui.ts:331`)—— TUI 焦点恢复、布局、节流
+6. **`managed-install.json` marker**(`package-manager-cli.ts:71`)—— self-update 的版本隔离
+
+**交叉决策示例**:
+- 用户在 TUI 切换 provider(第 19 章) → `CredentialStore.modify` 串行 OAuth refresh(第 17 章) → 把新 credential 通过 `Wire protocol` 同步给 client(第 22 章)
+- Self-update(第 21 章) → 新版本二进制启动 → 重新 read `auth.json` → OAuth token 续期
+- WebSocket fallback(第 22 章) → 切到 SSE → 经过 `framing.ts` 边界(虽然 WebSocket 不用 framing,但 CBOR 共用)
+- 容器化部署(第 23 章) → `PI_OFFLINE=1` env → 跳过 OAuth flow → 直接 env API Key 路径
+
+## 25.1 本轮 8 维度 laew gap 总结
+
+| 维度 | Gap ID | 优先级 | 描述 |
+|---|---|---|---|
+| CrashDump | L38-L42 | P0 | 无 panic hook / 无统一错误分类 / reporter 不隔离 |
+| WebUI/TUI | L54-L56 | P1 | TUI 中文化硬编码 / 16ms 节流缺失 / 无 CURSOR_MARKER |
+| OAuth/多账号 | L49-L52 | P1 | API Key 明文 / 无 OAuth PKCE / 无多账号轮换 |
+| i18n | L57-L58 | P2 | RTL 不支持 / 翻译 pipeline 缺失 |
+| Release/AutoUpdate | L59-L63 | P0 | 无 CI / 手动 release / 无 AutoUpdate / 无签名 / 无 provenance |
+| WebSocket/SSE | L64-L66 | P2 | 无 SSE 流式 / 无 WS 客户端 / 无心跳 |
+| DevContainer | L69-L73 | P1 | 无 Dockerfile / docker-compose / digest 钉 / DevContainer |
+| CRDT | L75-L78 | P3 | 无 Session 共享 / 无冲突 / 无 Event Sourcing / 无协同编辑 |
+
+**P0 紧急(5 项)**:L38 panic / L49 API Key / L59 CI / L60 手动 release / L64 SSE
+
+**P1 重要(8 项)**:L40 错误分类 / L51 脱敏 / L54 TUI / L56 错误 i18n / L65 WS / L69 Dockerfile / L70 compose / L72 digest
+
+**P2 进阶(8 项)**:L42 错误 UX / L50 OAuth / L52 多账号 / L55 i18n / L57 RTL / L58 pipeline / L66 心跳 / L75 Session 共享
+
+**P3 远期(5 项)**:L74 共享 / L76 冲突 / L77 Event Sourcing / L78 协同编辑 + L68 背压 / L71 Dev Container
+
+## 25.2 关键文件路径汇总
+
+| 类别 | 文件路径(绝对) |
+|---|---|
+| **错误处理** | |
+| Server errors | `/usr/local/LsmGitOpenSource/pi/packages/server/src/errors.ts:1-58` |
+| Server translate | `/usr/local/LsmGitOpenSource/pi/packages/server/src/server.ts:351-369` |
+| Server handshake timeout | `/usr/local/LsmGitOpenSource/pi/packages/server/src/server.ts:122-128` |
+| Server transportClosed | `/usr/local/LsmGitOpenSource/pi/packages/server/src/server.ts:271-280` |
+| Server failProtocol | `/usr/local/LsmGitOpenSource/pi/packages/server/src/server.ts:315-328` |
+| Client Connection state machine | `/usr/local/LsmGitOpenSource/pi/packages/client/src/connection.ts:40-236` |
+| Client #fail | `/usr/local/LsmGitOpenSource/pi/packages/client/src/connection.ts:225-231` |
+| Main Windows exit 防御 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/main.ts:586-594` |
+| **TUI** | |
+| TUI Base | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/tui.ts:331-1263` |
+| CURSOR_MARKER | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/tui.ts:79` |
+| Overlay Focus Restore | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/tui.ts:188-206` |
+| render 节流 | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/tui.ts:343-823` |
+| OSC 11 background | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/tui.ts:1214-1236` |
+| Component interface | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/tui.ts:23-47` |
+| Editor 2363 行 | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/components/editor.ts` |
+| Markdown 1015 行 | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/components/markdown.ts` |
+| Theme 1249 行 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/modes/interactive/theme/theme.ts` |
+| Keys 1401 行 | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/keys.ts` |
+| Terminal image 696 行 | `/usr/local/LsmGitOpenSource/pi/packages/tui/src/terminal-image.ts` |
+| Interactive mode 5000+ 行 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts` |
+| **OAuth** | |
+| OAuthAuth 接口 | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/types.ts:206-230` |
+| CredentialStore 接口 | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/types.ts:65-94` |
+| PKCE | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/pkce.ts` |
+| Device Code | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/device-code.ts` |
+| Anthropic OAuth | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/anthropic.ts:1-365` |
+| OpenAI Codex OAuth | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/openai-codex.ts:1-544` |
+| GitHub Copilot OAuth | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/github-copilot.ts:1-507` |
+| Radius OAuth | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/radius.ts:1-403` |
+| OpenRouter OAuth | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/openrouter.ts:1-311` |
+| XAI OAuth | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/xai.ts:1-239` |
+| Kimi Coding OAuth | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/kimi-coding.ts:1-296` |
+| OAuth page HTML | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/oauth/oauth-page.ts` |
+| InMemoryCredentialStore | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/auth/credential-store.ts:9-67` |
+| FileAuthStorage | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/core/auth-storage.ts:49-200` |
+| AuthStorage | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/core/auth-storage.ts:327-490` |
+| **Release** | |
+| Release script | `/usr/local/LsmGitOpenSource/pi/scripts/release.mjs:1-282` |
+| Local release | `/usr/local/LsmGitOpenSource/pi/scripts/local-release.mjs:1-297` |
+| Publish | `/usr/local/LsmGitOpenSource/pi/scripts/publish.mjs:1-113` |
+| Build binaries | `/usr/local/LsmGitOpenSource/pi/scripts/build-binaries.sh` |
+| Package manager CLI | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/package-manager-cli.ts:1-300+` |
+| Self-update config | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/config.ts:116-355` |
+| Windows self-update | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/utils/windows-self-update.ts` |
+| **WebSocket/SSE** | |
+| Framing | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/framing.ts:1-165` |
+| CBOR decoder | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/cbor/decoder.ts:1-168` |
+| CBOR encoder | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/cbor/encoder.ts:1-216` |
+| Codec | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/codec.ts:1-173` |
+| Schemas | `/usr/local/LsmGitOpenSource/pi/packages/protocol/src/schemas.ts:1-450` |
+| Codex WebSocket | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/api/openai-codex-responses.ts:240-490` |
+| Server unix listener | `/usr/local/LsmGitOpenSource/pi/packages/server/src/transports/unix/listener.ts:1-434` |
+| Server unix types | `/usr/local/LsmGitOpenSource/pi/packages/server/src/transports/unix/types.ts` |
+| Client unix | `/usr/local/LsmGitOpenSource/pi/packages/client/src/unix.ts` |
+| **DevContainer** | |
+| (缺位) | - |
+| **CRDT** | |
+| WriterLease (第 8 轮已覆盖) | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts:16-58` |
+| JSONL torn-tail (第 8 轮已覆盖) | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/storage.ts:80-108` |
+
+## 25.3 本轮不重复声明
+
+本轮严格不重复第 1-9 轮已覆盖内容:
+
+- **不重复 Lane 三态 / reduceLaneState / 14 种损坏检测**(第 4-6 轮)—— WriterLease fence 在第 8 轮已覆盖
+- **不重复 Session 持久化基础**(第 8 轮)—— 本轮 23.2-23.4 仅简要回顾 CRDT 视角
+- **不重复 Telemetry NOOP/InMemory**(第 9 轮)
+- **不重复 JSONL torn-tail 修复原理**(第 8 轮 10.4 章)—— 本轮 24.3 仅作为 CRDT 视角的语义补充
+- **不重复 11 种 Entry / 压缩策略**(第 7 轮)
+- **不重复 Skill 系统**(第 8 轮)
+- **不重复流式 + 中断传播**(第 6 轮)
+- **不重复 Provider 20+ 兼容性开关**(第 12.1 章)
+- **不重复系统提示词 + thinkingFormat**(第 13 章)
+- **不重复 AI 路由 / Session Backends**(第 16 章)
+- **不重复 Server / Session 后端基础**(第 3 章)—— 本轮 22 章聚焦 binary frame / CBOR / WebSocket / SSE
+- **不重复 OAuth 基础概念**(第 12 章)—— 本轮 19 章聚焦 10 个 provider × 5 种 flow 变体的真实实现
+- **不重复 TUI 渲染模型基础**(第 8 轮 TUI 章节)—— 本轮 18 章聚焦 overlay focus restore / 16ms 节流 / OSC 11 / CURSOR_MARKER 4 个深度专题

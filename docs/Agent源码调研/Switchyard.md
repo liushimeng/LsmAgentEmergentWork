@@ -2029,3 +2029,1361 @@ Switchyard 是 **「协议中立 + OpenTelemetry 一等公民」** 的工业级 
 ---
 
 > **字数**：本文档 Switchyard 第八轮深挖章节新增约 800 行。
+# Switchyard 第十轮深挖：8 个新维度全面剖析
+
+> 源码路径：`/usr/local/LsmGitOpenSource/Switchyard`  
+> 分析日期：2026-09-07  
+> 前 9 轮已覆盖：协议 IR / 翻译引擎 / 路由算法 / 7 种路由策略 / LLM 网关 / PyO3 / 熔断器 / 协议 wire 真实实现 / SubAgent 并发 / Goal 状态机 / TUI 渲染管线 / Hook 拦截器 / Skill 一等公民 / Effect DI 拓扑 / CBOR 二进制帧 / Lane 三队列 / WriterLease fence / 文件编辑补丁 / 代码检索 / Git checkpoint / Bash PTY / 多模态 / PromptCaching / Schema 校验 / Web 检索 / Telemetry / Session 持久化 / Tool 权限沙箱 / LSP/IDE 集成 / Skill Workshop / 多租户团队记忆 / 终端控制序列 / CrashDump / WebUI / OAuth / i18n / Release / WebSocket / DevContainer / CRDT（前 9 轮部分涉及）  
+> 本轮聚焦：**8 个全新深挖维度**（前 9 章已覆盖的内容不再重复）
+
+---
+
+## 目录
+
+1. [CrashDump 与错误恢复](#1-crashdump-与错误恢复)
+2. [WebUI 与 DesktopApp](#2-webui-与-desktopapp)
+3. [OAuth 认证与多账号](#3-oauth-认证与多账号)
+4. [i18n 国际化](#4-i18n-国际化)
+5. [Release 工程化与 AutoUpdate](#5-release-工程化与-autoupdate)
+6. [WebSocket 与 SSE](#6-websocket-与-sse)
+7. [DevContainer 与容器化](#7-devcontainer-与容器化)
+8. [CRDT 与多端冲突](#8-crdt-与多端冲突)
+9. [laew gap 清单（L79-L110）](#9-laew-gap-清单l79-l110)
+10. [与前 9 轮关系](#10-与前-9-轮关系)
+
+---
+
+## 1. CrashDump 与错误恢复
+
+### 1.1 整体错误架构
+
+Switchyard 采用**分层错误类型**设计，每层拥有独立的错误枚举，通过 `thiserror` 的 `#[from]` 自动转换：
+
+```
+LlmClientError (protocol crate)        ← 协议客户端错误
+    ├── UpstreamHttp { status, body }
+    ├── ContextWindowExceeded { model, message }
+    ├── Timeout { source }
+    ├── Transport { source }
+    ├── InvalidResponse { source }
+    ├── RequestTranslation(String)
+    ├── RequestEncoding(String)
+    ├── ResponseTranslation(String)
+    ├── InvalidRequest { message }
+    ├── Configuration { message }
+    ├── Ffi { ... }
+    └── General(String)
+
+LibsyError (libsy crate)              ← 编排层错误
+    ├── TargetNotFound { target }
+    ├── NoTargets
+    ├── AlgorithmError { message }
+    ├── Driver(DriverError)
+    ├── MissingFinalResponse
+    ├── ClientCall { target, source: LlmClientError }
+    └── External { operation, source }
+
+RunnerError (switchyard-runner)       ← 路由运行层错误
+    ├── Algorithm(LibsyError)
+    ├── Client(LlmClientError)
+    ├── Configuration { ... }
+    ├── UnknownRouteModel(...)
+    ├── IncompatibleCallerFormat(CallerAuthKind)
+    └── AuxiliaryUnsupported
+
+ServerError (switchyard-server)        ← HTTP 服务层错误
+    └── 包装上述所有错误为 String
+
+TranslationError (switchyard-translation)  ← 翻译层错误
+    ├── InvalidJson(serde_json::Error)
+    ├── InvalidType { path, expected }
+    ├── UnsupportedTranslation { from, to }
+    ├── LossyConversion(String)
+    ├── UnknownField { path }
+    ├── InvalidValue { path, message }
+    └── Other(String)
+```
+
+### 1.2 安全遥测摘要（RouteErrorKind）
+
+`switchyard-runner/src/failure.rs` 定义了**不携带任何敏感信息的错误分类**，专为遥测设计：
+
+```rust
+#[derive(Clone, Copy, Debug, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum RouteErrorKind {
+    UpstreamHttp,            // 上游返回非 2xx
+    ContextWindowExceeded,   // 上下文窗口溢出
+    Timeout,                 // 上游超时
+    Transport,               // 网络不可达
+    InvalidResponse,         // 响应解码失败
+    RequestTranslation,      // 入站翻译失败
+    RequestEncoding,         // 出站编码失败
+    ResponseTranslation,     // 响应翻译失败
+    InvalidRequest,          // 请求不合法
+    Configuration,           // 路由/客户端配置错误
+    Algorithm,               // 算法/驱动失败
+    Other,                   // 兜底
+}
+
+pub enum RouteErrorPhase {
+    BeforeResponse,          // 响应交付前失败
+    DuringStream,            // 流式消费中失败
+}
+
+pub struct RouteErrorSummary {
+    pub kind: RouteErrorKind,
+    pub phase: RouteErrorPhase,
+    pub upstream_status: Option<u16>,
+    pub target: Option<ModelId>,
+}
+```
+
+**关键设计点**：
+- `RouteErrorSummary` **故意不携带 provider 消息、响应体、源错误**，仅暴露分类
+- 测试用例验证 `SECRET` 字符串不会出现在 `RouteErrorSummary` 的 `Debug` 输出中
+- `execution_error_summary()` 和 `stream_error_summary()` 两个工厂方法分别处理"响应前失败"和"流式失败"
+
+### 1.3 重试与退避策略
+
+`libsy-llm-client/src/client.rs` 实现了**带 Retry-After 的指数退避**：
+
+```rust
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+fn retry_delay(retry_number: u64, retry_after: Option<Duration>) -> Duration {
+    // Retry-After 优先；否则 250ms 翻倍，上限 2s
+    retry_after.unwrap_or_else(|| {
+        let multiplier = 1_u32 << retry_number.min(3);
+        INITIAL_RETRY_DELAY
+            .saturating_mul(multiplier)
+            .min(MAX_RETRY_BACKOFF)
+    })
+}
+```
+
+**重试判定逻辑**（`AttemptFailure::is_retryable()`）：
+- `Transport` / `Timeout` → **始终可重试**
+- `UpstreamHttp { status }` → 仅当 `is_retryable_http_status(status)` 为 true（408, 429, 5xx）
+- 其他错误（包括 `ContextWindowExceeded`、`InvalidRequest`）→ **不可重试**
+
+**重试预算**：
+- `DEFAULT_MAX_RETRIES = 2`（默认 2 次重试，共 3 次尝试）
+- `MAX_CONFIGURED_RETRIES = 10`（配置上限）
+- 最坏情况：`candidates × (max_retries + 1)` 次上游尝试
+
+### 1.4 优雅关闭与请求取消
+
+`switchyard-server/src/lib.rs` 实现了**完整的生命周期管理**：
+
+```rust
+// 关闭流程
+tokio::select! {
+    result = &mut server => result.map_err(server_io_error),
+    _ = shutdown => {
+        tracing::info!(?timeout, "shutdown signal received; draining active requests");
+        handle.graceful_shutdown(Some(timeout));  // 触发优雅关闭
+        server.await.map_err(server_io_error)     // 等待活跃请求完成
+    }
+}
+```
+
+**关键机制**：
+- `DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT = 30s`（默认关闭宽限期）
+- `shutdown::signal()` 同时监听 `Ctrl+C` 和 `SIGTERM`（Unix）
+- `RequestLogGuard`：RAII guard，若 handler future 在响应写入前被 drop（客户端断开），触发 `emit_cancelled()` 记录取消事件
+- `CancelSentinel`：测试用 RAII 标记，验证客户端断开时 handler future 被正确 drop
+
+### 1.5 客户端断开检测
+
+```rust
+// 客户端断开时 Axum 自动 drop handler future
+struct RequestLogGuard(Option<RequestLogContext>);
+
+impl Drop for RequestLogGuard {
+    fn drop(&mut self) {
+        if let Some(context) = self.0.take() {
+            context.emit_cancelled();  // 记录取消事件
+        }
+    }
+}
+```
+
+- 使用 `CLIENT_CLOSED_REQUEST = 499` 状态码（Nginx 惯例）
+- `metrics::record_client_disconnect()` 记录到 Prometheus
+- 测试 `client_disconnect_cancels_a_buffered_handler` 验证断开行为
+
+### 1.6 上下文窗口溢出检测
+
+`libsy-llm-client/src/backend.rs` 实现了**多 provider 的上下文溢出检测**：
+
+```rust
+// OpenAI 短语列表
+const OPENAI_OVERFLOW_PHRASES: &[&str] = &[
+    "maximum context length",
+    "context length exceeded",
+    "context window",
+    "context length is only",
+    "please reduce the length of the input",
+    "exceeds the maximum allowed input length",
+    "exceeds the maximum allowed length",
+    "is longer than the model's context length",
+];
+
+// Anthropic 短语列表
+const ANTHROPIC_OVERFLOW_PHRASES: &[&str] = &[
+    "prompt is too long",
+    "maximum number of tokens",
+    "context window",
+    "context length",
+];
+```
+
+**检测策略**（`is_overflow_body()`）：
+1. 先运行结构化检查（如 `error.code == "context_length_exceeded"`）
+2. 再匹配 `error.message` 中的短语
+3. 最后回退到原始 body 字符串匹配（处理纯文本响应）
+
+**测试覆盖**：
+- 原生 OpenAI（`context_length_exceeded`）
+- NVIDIA/LiteLLM 包裹（无结构化 code）
+- Hub GLM（LiteLLM 包裹，code="400"）
+- 原生 SGLang（顶层 envelope，无 `error` key）
+- KV-pool 拒绝（`managers/utils.py`）
+- 声明上下文拒绝（`tokenizer_manager.py`）
+
+### 1.7 缺失：CrashDump 机制
+
+**Switchyard 没有 CrashDump / panic hook**：
+- 未使用 `human-panic` crate
+- 未设置 `std::panic::set_hook`
+- 未生成 minidump / core dump
+- 仅依赖 `tracing` 日志记录错误
+
+**laew 对比**：laew 同样缺少 panic hook，与 Switchyard 处于同一水平。
+
+---
+
+## 2. WebUI 与 DesktopApp
+
+### 2.1 现状：纯 HTTP 服务器，无 WebUI
+
+Switchyard **没有任何 Web 界面或桌面应用**：
+- 无 React / Vue / Svelte 前端
+- 无 Tauri / Electron 桌面壳
+- 无 Gradio / Streamlit 演示界面
+- 无 Telegram / Discord Bot
+
+**唯一的可视化入口**：
+- `GET /v1/models` — 返回 JSON 模型列表
+- `GET /v1/stats` — 返回 JSON 路由统计
+- `GET /metrics` — Prometheus 指标（文本格式）
+- `GET /health` — 健康检查
+
+### 2.2 启动横幅（ASCII Art）
+
+`switchyard-server/src/lib.rs` 包含一个**终端启动横幅**：
+
+```rust
+const STARTUP_BANNER_ART: &str = include_str!("../assets/startup_banner.txt");
+
+fn startup_banner(options: &ServerRunOptions, state: &ServerState, color: bool) -> String {
+    // 渲染 NVIDIA 绿色 ANSI truecolor
+    let (red, green, blue) = (118, 185, 0);
+    for line in banner.lines() {
+        rendered.push_str(&format!("\x1b[38;2;{red};{green};{blue}m{line}\x1b[0m\n"));
+    }
+}
+```
+
+**输出示例**：
+```
+Switchyard libsy server
+  listening: http://0.0.0.0:4000
+  routes: fast, strong
+
+endpoints:
+  POST /v1/chat/completions    OpenAI Chat Completions
+  POST /v1/messages            Anthropic Messages
+  POST /v1/responses           OpenAI Responses
+  ...
+
+example:
+  curl -s 'http://127.0.0.1:4000/v1/chat/completions' \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"fast","messages":[{"role":"user","content":"Hello from Switchyard"}]}'
+```
+
+### 2.3 dev-server 目录
+
+`dev-server/` 仅包含：
+- `config.toml` — 示例配置
+- `README` — 使用说明
+- `switchyard.service` — systemd 服务单元
+
+**无任何 Web 服务器或前端代码**。
+
+### 2.4 Codex 模型目录集成
+
+`switchyard-server/src/lib.rs` 的 `codex_model_entry_json()` 函数生成 **Codex 兼容的 ModelInfo 卡片**：
+
+```rust
+fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority: usize) -> Value {
+    json!({
+        "slug": model,
+        "display_name": model,
+        "description": "Switchyard-routed model.",
+        "default_reasoning_level": if reasoning { json!("xhigh") } else { Value::Null },
+        "supported_reasoning_levels": if reasoning { reasoning_levels() } else { json!([]) },
+        "shell_type": if tool_calling { "shell_command" } else { "disabled" },
+        "base_instructions": "You are Codex, a coding agent.",
+        "apply_patch_tool_type": if tool_calling { Some("freeform") } else { None },
+        "truncation_policy": {"mode": "tokens", "limit": 10_000},
+        ...
+    })
+}
+```
+
+**意义**：Switchyard 可以作为 **Codex 的后端代理**，通过 `/v1/models` 端点向 Codex 暴露路由模型。
+
+### 2.5 laew gap
+
+**laew 同样无 WebUI**，但 laew 有 TUI（终端 UI），比 Switchyard 的 ASCII 横幅更丰富。
+
+---
+
+## 3. OAuth 认证与多账号
+
+### 3.1 认证架构概览
+
+Switchyard 支持**两种认证模式**，通过 `forward_auth` 标志区分：
+
+| 模式 | 配置 | 行为 |
+|------|------|------|
+| **静态 API Key** | `api_key_env = "VAR_NAME"` | 从环境变量读取，注入请求头 |
+| **转发调用者凭证** | `forward_auth = true` | 透传调用者的 `Authorization` 头 |
+
+**互斥约束**：
+```rust
+if config.forward_auth && config.api_key_env.is_some() {
+    return Err(RunnerError::configuration(format!(
+        "llm client {client_name} cannot set both forward_auth and api_key_env"
+    )));
+}
+```
+
+### 3.2 静态 API Key 模式
+
+`switchyard-runner/src/config.rs` 的 `build_backend()` 函数：
+
+```rust
+let api_key = config
+    .api_key_env
+    .as_deref()
+    .map(|variable| {
+        if variable.trim().is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "llm client {client_name} api_key_env must not be empty"
+            )));
+        }
+        let api_key = std::env::var(variable).map_err(|error| {
+            RunnerError::configuration(format!(
+                "llm client {client_name} could not read api_key_env {variable}: {error}"
+            ))
+        })?;
+        if api_key.trim().is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "llm client {client_name} api_key_env {variable} is empty"
+            )));
+        }
+        Ok(api_key)
+    })
+    .transpose()?;
+```
+
+**特点**：
+- 通过**环境变量名**引用，而非明文存储
+- 启动时立即验证，失败则拒绝启动
+- 空值检查（`trim().is_empty()`）
+
+### 3.3 认证头应用
+
+`libsy-llm-client/src/backend.rs` 的 `apply_auth()` 方法：
+
+```rust
+pub fn apply_auth(&self, mut builder: RequestBuilder) -> RequestBuilder {
+    let api_key = if self.is_forwarding_auth() {
+        None  // 转发模式下不使用静态 key
+    } else {
+        self.config().api_key.as_deref()
+    };
+    match self {
+        Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
+            if let Some(api_key) = api_key {
+                builder = builder.bearer_auth(api_key);  // Authorization: Bearer <key>
+            }
+        }
+        Backend::Anthropic(_) => {
+            builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
+            if let Some(api_key) = api_key {
+                builder = builder.header("x-api-key", api_key);  // x-api-key: <key>
+            }
+        }
+    }
+    builder
+}
+```
+
+### 3.4 转发调用者凭证
+
+`apply_forwarded_auth()` 方法实现**多调用者场景**：
+
+```rust
+pub(crate) fn apply_forwarded_auth(
+    &self,
+    mut builder: RequestBuilder,
+    metadata: Option<&Metadata>,
+) -> RequestBuilder {
+    if !self.is_forwarding_auth() {
+        return builder;
+    }
+    let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
+        return builder;
+    };
+    match self {
+        Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
+            for name in ["authorization", "chatgpt-account-id", "x-openai-fedramp"] {
+                if let Some(value) = headers.get(name) {
+                    builder = builder.header(name, sensitive_header(value));
+                }
+            }
+        }
+        Backend::Anthropic(_) => {
+            for name in ["authorization", "x-api-key"] {
+                if let Some(value) = headers.get(name) {
+                    builder = builder.header(name, sensitive_header(value));
+                }
+            }
+            // 特殊处理：Anthropic OAuth beta header
+            if let Some(value) = headers.get("anthropic-beta")
+                && let Some(value) = oauth_beta_header(value)
+            {
+                builder = builder.header("anthropic-beta", value);
+            }
+        }
+    }
+    builder
+}
+```
+
+**关键设计**：
+- `sensitive_header()` 调用 `HeaderValue::set_sensitive(true)`，防止日志记录
+- 支持 OpenAI 的 `chatgpt-account-id` 和 `x-openai-fedramp` 头
+- Anthropic 的 `anthropic-beta` 头经过 `oauth_beta_header()` 过滤，仅保留 `oauth-*` 前缀的 beta 标记
+
+### 3.5 凭证脱敏
+
+`redact_forwarded_auth()` 在错误返回前**替换敏感信息**：
+
+```rust
+pub(crate) fn redact_forwarded_auth(
+    &self,
+    mut body: String,
+    metadata: Option<&Metadata>,
+) -> String {
+    if !self.is_forwarding_auth() {
+        return body;
+    }
+    let secret_headers: &[&str] = match self {
+        Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
+            &["authorization", "chatgpt-account-id"]
+        }
+        Backend::Anthropic(_) => &["authorization", "x-api-key"],
+    };
+    for name in secret_headers {
+        let Some(value) = headers.get(*name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        if !value.is_empty() {
+            body = body.replace(value, "[REDACTED]");
+        }
+    }
+    body
+}
+```
+
+### 3.6 额外头部验证
+
+`validate_extra_headers()` 防止**头部注入攻击**：
+
+```rust
+pub(crate) fn validate_extra_headers(&self, model_name: &str) -> Result<()> {
+    let invalid_name = self.config().extra_headers.keys().find(|name| match self {
+        Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
+            name.eq_ignore_ascii_case("authorization")
+                || (self.is_forwarding_auth()
+                    && (name.eq_ignore_ascii_case("chatgpt-account-id")
+                        || name.eq_ignore_ascii_case("x-openai-fedramp")))
+        }
+        Backend::Anthropic(_) => {
+            name.eq_ignore_ascii_case("x-api-key")
+                || name.eq_ignore_ascii_case("anthropic-version")
+                || (self.is_forwarding_auth()
+                    && (name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("anthropic-beta")))
+        }
+    });
+    if let Some(name) = invalid_name {
+        return Err(LlmClientError::Configuration {
+            message: format!(
+                "model {model_name:?} extra_headers cannot set {name:?}; extra_headers is only for additional headers"
+            ),
+        });
+    }
+    Ok(())
+}
+```
+
+**防御点**：
+- 禁止通过 `extra_headers` 覆盖 `authorization` / `x-api-key` / `anthropic-version`
+- 转发模式下禁止覆盖 `chatgpt-account-id` / `x-openai-fedramp` / `anthropic-beta`
+
+### 3.7 缺失：OAuth 2.0 / PKCE 流程
+
+**Switchyard 没有完整的 OAuth 实现**：
+- 无 `client_credentials` 授权流程
+- 无 `authorization_code` + PKCE 流程
+- 无 token 刷新 / 轮换
+- 无 `oauth2` crate 依赖
+- 仅支持**静态 API Key** 或**透传调用者凭证**
+
+**laew 对比**：laew 同样无 OAuth 流程，仅支持静态 API Key 配置。
+
+---
+
+## 4. i18n 国际化
+
+### 4.1 现状：完全无 i18n 支持
+
+Switchyard **没有任何国际化实现**：
+- 无 `rust-i18n` / `fluent` / `gettext` crate
+- 无 `.ftl` / `.po` / `.mo` 翻译文件
+- 无语言检测 / 切换机制
+- 所有字符串硬编码为英文
+
+### 4.2 硬编码字符串分布
+
+| 模块 | 示例 |
+|------|------|
+| 错误消息 | `"target {target:?} was not found"` |
+| 日志消息 | `"shutdown signal received; draining active requests"` |
+| HTTP 响应 | `"Not Found"`, `"request body must include a non-empty string \`model\`"` |
+| 启动横幅 | `"Switchyard libsy server"`, `"listening:"`, `"routes:"` |
+| 指标标签 | `"ok"`, `"retryable_error"`, `"other_error"`, `"client_disconnected"` |
+
+### 4.3 终端输出处理
+
+`switchyard-server/src/lib.rs` 的 `render_startup_banner_art()` 使用 **ANSI truecolor**：
+
+```rust
+fn render_startup_banner_art(color: bool) -> String {
+    let banner = STARTUP_BANNER_ART.trim_end();
+    if !color {
+        return banner.to_string();
+    }
+    let (red, green, blue) = (118, 185, 0);  // NVIDIA 绿色
+    let mut rendered = String::new();
+    for line in banner.lines() {
+        rendered.push_str(&format!("\x1b[38;2;{red};{green};{blue}m{line}\x1b[0m\n"));
+    }
+    rendered.trim_end_matches('\n').to_string()
+}
+```
+
+**注意**：`color` 参数由 `std::io::stdout().is_terminal()` 决定，非 TTY 时禁用颜色。
+
+### 4.4 缺失：完整 i18n 体系
+
+**Switchyard 缺少**：
+- 错误消息多语言化
+- CLI 帮助文本多语言化
+- 文档多语言化
+- RTL（从右到左）布局支持
+- 翻译 pipeline（Weblate / Crowdin）
+
+**laew 对比**：laew 的 CLAUDE.md 明确指出「注释、CLI 文案、文档一律中文」，但代码字符串仍为英文，与 Switchyard 处于同一水平。
+
+---
+
+## 5. Release 工程化与 AutoUpdate
+
+### 5.1 发布流程概览
+
+Switchyard 使用 **GitHub Actions + maturin + PyPI Trusted Publishing** 的完整发布链路：
+
+```
+git tag v*.*.* → push → publish.yml 触发
+    ├── validate-release-ref（版本校验）
+    ├── python-release-checks（Python 3.10-3.14 矩阵测试）
+    ├── rust-release-checks（fmt + clippy + test）
+    ├── source-dist（sdist 构建）
+    ├── wheels（6 平台 wheel 构建）
+    ├── pypi-publish（PyPI 发布）
+    └── github-release（GitHub Release 创建）
+```
+
+### 5.2 版本校验
+
+`publish.yml` 的 `validate-release-ref` job：
+
+```python
+# 校验 tag 格式
+if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+    raise SystemExit(f"release tags must look like vMAJOR.MINOR.PATCH, got {tag!r}")
+
+# 校验 pyproject.toml 与 Cargo.toml 版本一致
+if workspace_version != package_version:
+    raise SystemExit(f"Python package version {package_version!r} does not match Rust workspace version {workspace_version!r}")
+
+# 校验 tag 与版本一致
+expected = f"v{package_version}"
+if tag != expected:
+    raise SystemExit(f"release tag {tag!r} does not match pyproject version {package_version!r}")
+```
+
+### 5.3 多平台 Wheel 矩阵
+
+`publish.yml` 的 `wheels` job 支持 **6 平台**：
+
+| label | os | rust_target | manylinux_arch | smoke |
+|-------|-----|-------------|----------------|-------|
+| linux-x86_64 | ubuntu-latest | x86_64-unknown-linux-gnu | x86_64 | true |
+| linux-aarch64 | ubuntu-24.04-arm | aarch64-unknown-linux-gnu | aarch64 | false |
+| macos-x86_64 | macos-15-intel | x86_64-apple-darwin | - | true |
+| macos-arm64 | macos-14 | aarch64-apple-darwin | - | true |
+| windows-x86_64 | windows-latest | x86_64-pc-windows-msvc | - | true |
+| windows-arm64 | windows-11-arm | aarch64-pc-windows-msvc | - | false |
+
+**Linux 构建**使用 `manylinux2014` Docker 镜像：
+```bash
+docker run --rm \
+    -e MATURIN_VERSION="${MATURIN_VERSION}" \
+    -v "${GITHUB_WORKSPACE}:/io" \
+    -w /io \
+    "quay.io/pypa/manylinux2014_${{ matrix.manylinux_arch }}" \
+    /bin/bash -lc '
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+        source "${HOME}/.cargo/env"
+        PYTHON=/opt/python/cp310-cp310/bin/python
+        "${PYTHON}" -m pip install --upgrade pip
+        "${PYTHON}" -m pip install "maturin==${MATURIN_VERSION}"
+        "${PYTHON}" -m maturin build --release --locked --compatibility pypi --out dist --interpreter "${PYTHON}"
+    '
+```
+
+**非 Linux 构建**使用原生 maturin：
+```bash
+python -m maturin build --release --locked --compatibility pypi --out dist --target "${{ matrix.rust_target }}"
+```
+
+### 5.4 Smoke 测试
+
+每个 wheel 构建后执行 **smoke 测试**：
+
+```python
+import switchyard
+import switchyard_rust
+from switchyard_rust import _switchyard_rust
+
+print("switchyard", switchyard.__version__)
+print("switchyard_rust", switchyard_rust.__file__)
+print("rust extension", _switchyard_rust.__name__)
+```
+
+**双版本 smoke**：Python 3.10 + Python 3.14 都测试。
+
+### 5.5 Dev Wheel 构建
+
+`publish.yml` 支持**手动触发 dev 构建**：
+
+```yaml
+workflow_dispatch:
+  inputs:
+    build_dev_artifact:
+      description: "Build one Linux x86_64 dev wheel artifact."
+      type: boolean
+      default: false
+    build_dev_matrix:
+      description: "Build the complete dev sdist and wheel matrix as artifacts."
+      type: boolean
+      default: false
+    dev_version:
+      description: "PEP 440 .dev version for the dev wheel."
+      type: string
+      default: "0.0.1.dev0"
+```
+
+**版本戳记**：`scripts/release/set_dev_wheel_version.py` 修改 `pyproject.toml` 版本。
+
+### 5.6 CI 流程
+
+`ci.yml` 包含 **7 个 job**：
+
+| job | 用途 |
+|-----|------|
+| changes | 检测代码变更（跳过纯文档 PR） |
+| lint | ruff 代码检查 |
+| spdx-headers | SPDX 头检查（硬门禁） |
+| rust | cargo fmt + clippy + test |
+| typecheck | mypy 类型检查（continue-on-error） |
+| test | Python 3.10-3.14 矩阵测试 |
+| slim-install-smoke | 精简安装测试（禁止引入 torch/transformers 等重包） |
+
+**SPDX 头检查**（硬门禁）：
+```bash
+copyright_re='^# SPDX-FileCopyrightText: Copyright \(c\) [0-9]{4}(-[0-9]{4})? NVIDIA CORPORATION & AFFILIATES\. All rights reserved\.$'
+license_re='^# SPDX-License-Identifier: Apache-2\.0$'
+```
+
+### 5.7 精简安装防护
+
+`slim-install-smoke` job 确保**默认安装不引入重包**：
+
+```python
+forbidden = [
+    "torch", "transformers", "huggingface_hub", "routellm", "litellm",
+    "datasets", "tokenizers", "safetensors", "pyarrow", "agents", "mcp", "docx",
+]
+extras = [m for m in forbidden if importlib.util.find_spec(m) is not None]
+if extras:
+    sys.exit(f"FAIL: heavy packages pulled into slim install: {extras}")
+```
+
+### 5.8 缺失：AutoUpdate
+
+**Switchyard 没有自动更新机制**：
+- 无 `self_update` crate
+- 无版本检查 API
+- 无后台下载 / 热更新
+- 用户需手动 `pip install --upgrade nemo-switchyard`
+
+**laew 对比**：laew 同样无 AutoUpdate，但 laew 有 `build.rs` 注入版本信息，比 Switchyard 的 maturin 版本管理更轻量。
+
+---
+
+## 6. WebSocket 与 SSE
+
+### 6.1 现状：无 WebSocket，完整 SSE 支持
+
+Switchyard **不支持 WebSocket**：
+- 无 `tokio-tungstenite` / `axum::ws` 依赖
+- 无 `wss://` / `ws://` 端点
+- 无双向通信 / 推送机制
+
+**但 SSE 支持非常完整**，是核心功能之一。
+
+### 6.2 SSE 帧解析
+
+`switchyard-translation/src/sse.rs` 实现了**协议无关的 SSE 帧解析**：
+
+```rust
+pub(crate) enum SseFrame {
+    Empty,       // 空帧（注释或 keep-alive）
+    Done,        // [DONE] 标记
+    Data(Value), // JSON 数据
+}
+
+pub(crate) fn parse_json_sse_frame(
+    frame: &str,
+    done_marker: Option<&str>,
+) -> Result<SseFrame, BoxError> {
+    let data = frame
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with(':'))  // 忽略注释
+        .filter_map(data_field_value)  // 仅提取 data: 字段
+        .fold(String::new(), |mut a, b| {
+            a.reserve(b.len() + 1);
+            a.push_str(&b);
+            a.push('\n');
+            a
+        });
+    let data = data.trim_end();
+    if data.is_empty() {
+        return Ok(SseFrame::Empty);
+    }
+    if done_marker.is_some_and(|marker| data == marker) {
+        return Ok(SseFrame::Done);
+    }
+    let value = serde_json::from_str::<Value>(data)?;
+    Ok(SseFrame::Data(value))
+}
+```
+
+**关键设计**：
+- 仅提取 `data:` 字段，忽略 `event:` / `id:` / `retry:` 和注释（`:` 开头）
+- 支持多行 `data:` 拼接（以 `\n` 分隔）
+- `data:` 后的空格是可选的（`data:{"x":1}` 和 `data: {"x":1}` 都支持）
+- `database:` 等类似字段**不会**被误识别为 `data:`
+
+### 6.3 终端事件检测
+
+`is_terminal_event()` 识别**协议特定的流结束标记**：
+
+```rust
+pub(crate) fn is_terminal_event(format: WireFormat, event: &Value) -> bool {
+    match format {
+        WireFormat::OpenAiChat => event
+            .get("choices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some()
+            }),
+        WireFormat::AnthropicMessages => {
+            event.get("type").and_then(Value::as_str) == Some("message_stop")
+        }
+        WireFormat::OpenAiResponses => matches!(
+            event
+                .get("type")
+                .or_else(|| event.get("event"))
+                .and_then(Value::as_str),
+            Some("response.completed" | "response.incomplete" | "response.failed")
+        ),
+    }
+}
+```
+
+### 6.4 SSE 帧封装
+
+`switchyard-server/src/sse.rs` 实现了**出站 SSE 帧封装**：
+
+```rust
+pub(crate) fn frame_stream(
+    stream: RawEventStream,
+    target_format: WireFormat,
+) -> Sse<SseFrameStream> {
+    let framed = async_stream::stream! {
+        let mut stream = stream;
+        let mut failed = false;
+        while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+            let event = match item {
+                Ok(value) => match frame_event(target_format, value) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        failed = true;
+                        error_event(target_format, error.to_string())
+                    }
+                },
+                Err(LlmStreamError::Upstream(value)) => {
+                    // 上游错误原样转发，保留 code 和 type
+                    failed = true;
+                    frame_event(target_format, value.clone()).unwrap_or_else(|error| {
+                        tracing::warn!(error = %error, "in-band error event could not be framed");
+                        error_event(target_format, value.to_string())
+                    })
+                }
+                Err(LlmStreamError::Client(error)) => {
+                    tracing::warn!(error = %error, "stream iteration failed");
+                    failed = true;
+                    error_event(target_format, error.to_string())
+                }
+            };
+            yield Ok(event);
+            if failed {
+                break;  // 错误后立即终止
+            }
+        }
+        // [DONE] 仅在成功时发送
+        if !failed && target_format == WireFormat::OpenAiChat {
+            yield Ok(Event::default().data("[DONE]"));
+        }
+    };
+    Sse::new(Box::pin(framed) as SseFrameStream)
+}
+```
+
+**关键设计**：
+- **错误终止**：任何错误（上游或客户端）立即终止流，不发送后续 chunk
+- **错误后无 `[DONE]`**：成功标记仅在无错误时发送
+- **上游错误原样转发**：`LlmStreamError::Upstream(value)` 保留原始 code/type
+- **客户端错误合成**：`LlmStreamError::Client(error)` 包装为 `SwitchyardError`
+
+### 6.5 协议特定帧格式
+
+`frame_event()` 根据目标格式生成不同的 SSE 事件：
+
+```rust
+fn frame_event(target_format: WireFormat, value: Value) -> Result<Event, axum::Error> {
+    match target_format {
+        WireFormat::OpenAiChat => Event::default().json_data(value),  // data: {"choices":[...]}
+        WireFormat::AnthropicMessages | WireFormat::OpenAiResponses => {
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+                .to_string();
+            Event::default().event(event_type).json_data(value)  // event: message_start\ndata: {...}
+        }
+    }
+}
+```
+
+**差异**：
+- OpenAI Chat：仅 `data:` 字段，无 `event:` 字段
+- Anthropic Messages / OpenAI Responses：同时发送 `event:` 和 `data:`
+
+### 6.6 错误帧格式
+
+`error_event()` 生成**协议特定的错误帧**：
+
+```rust
+fn error_event(target_format: WireFormat, message: String) -> Event {
+    match target_format {
+        WireFormat::OpenAiChat => Event::default().data(
+            json!({
+                "error": {
+                    "message": message,
+                    "type": "SwitchyardError",
+                }
+            })
+            .to_string(),
+        ),
+        WireFormat::AnthropicMessages | WireFormat::OpenAiResponses => {
+            Event::default().event("error").data(
+                json!({
+                    "type": "error",
+                    "error": {
+                        "message": message,
+                        "type": "SwitchyardError",
+                    }
+                })
+                .to_string(),
+            )
+        }
+    }
+}
+```
+
+### 6.7 测试覆盖
+
+`sse.rs` 的测试用例验证关键行为：
+
+```rust
+#[tokio::test]
+async fn stream_error_terminates_without_done_marker() -> TestResult {
+    // 错误后不发送 [DONE]，不发送后续 chunk
+    assert!(body.contains("before"));
+    assert!(body.contains("boom"));
+    assert!(!body.contains("after"));
+    assert!(!body.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn in_band_error_is_forwarded_verbatim_without_done_marker() -> TestResult {
+    // 上游错误原样转发，不包装为 SwitchyardError
+    assert!(body.contains("stream_failed"));
+    assert!(body.contains("upstream_stream_error"));
+    assert!(!body.contains("SwitchyardError"));
+}
+```
+
+### 6.8 缺失：WebSocket / 双向通信
+
+**Switchyard 缺少**：
+- WebSocket 端点
+- 双向推送机制
+- 实时通知（如路由变更、后端故障）
+- 长连接管理
+
+**laew 对比**：laew 同样无 WebSocket，但 laew 的 TUI 是本地交互，不需要实时推送。
+
+---
+
+## 7. DevContainer 与容器化
+
+### 7.1 Dockerfile
+
+`Dockerfile` 实现了**多阶段构建**：
+
+```dockerfile
+ARG RUST_VERSION=1.96.1
+FROM rust:${RUST_VERSION}-bookworm AS builder
+
+WORKDIR /opt/switchyard
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
+COPY crates ./crates
+
+RUN cargo build --locked --release -p switchyard-server
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder \
+    /opt/switchyard/target/release/switchyard-server \
+    /usr/local/bin/switchyard-server
+
+ENV HOME=/tmp
+USER 1000:1000
+EXPOSE 4000
+ENTRYPOINT ["switchyard-server"]
+```
+
+**关键设计**：
+- **多阶段构建**：builder 阶段编译，slim 阶段运行，减小镜像体积
+- **锁定 Rust 版本**：`RUST_VERSION=1.96.1` 与 `rust-toolchain.toml` 同步
+- **locked 构建**：`cargo build --locked` 确保依赖一致性
+- **非 root 运行**：`USER 1000:1000`
+- **最小化依赖**：仅安装 `ca-certificates`
+
+### 7.2 .dockerignore
+
+```
+target/
+.git/
+```
+
+### 7.3 缺失：DevContainer / docker-compose
+
+**Switchyard 缺少**：
+- `.devcontainer/devcontainer.json`
+- `docker-compose.yml`
+- 开发环境容器化
+- VS Code Remote Containers 集成
+- 多服务编排（如 Redis / PostgreSQL）
+
+**laew 对比**：laew 同样无 DevContainer，但 laew 是 CLI 工具，容器化需求较低。
+
+### 7.4 CI 中的容器使用
+
+`publish.yml` 使用 `manylinux2014` Docker 镜像构建 Linux wheel：
+
+```bash
+docker run --rm \
+    -e MATURIN_VERSION="${MATURIN_VERSION}" \
+    -v "${GITHUB_WORKSPACE}::/io" \
+    -w /io \
+    "quay.io/pypa/manylinux2014_${{ matrix.manylinux_arch }}" \
+    /bin/bash -lc '...'
+```
+
+**目的**：确保 wheel 兼容旧版 Linux（manylinux2014 标准）。
+
+---
+
+## 8. CRDT 与多端冲突
+
+### 8.1 现状：无 CRDT 实现
+
+Switchyard **没有任何 CRDT 实现**：
+- 无 `yrs` / `automerge` / `crdt` crate
+- 无协同编辑 / 实时同步
+- 无多端状态合并
+
+**原因**：Switchyard 是**无状态代理**，不维护客户端会话状态，无需 CRDT。
+
+### 8.2 路由日志的持久化
+
+`switchyard-server/src/routing_log.rs` 实现了**追加式 JSONL 日志**：
+
+```rust
+pub(crate) struct RoutingLog(fs::File);
+
+impl RoutingLog {
+    pub(crate) fn new(path: impl Into<PathBuf>) -> ServerResult<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)  // 追加模式
+            .open(&path)
+            .map_err(|error| routing_log_error(&path, error))?;
+        Ok(Self(file))
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        context: RoutingLogContext,
+        model: &str,
+        tier: Option<&str>,
+        usage: &Usage,
+    ) -> std::io::Result<()> {
+        let record = RoutingRecord {
+            ts: format_rfc3339_millis(SystemTime::now()).to_string().into(),
+            route_id: context.route_id.into(),
+            algorithm: context.algorithm.into(),
+            task: context.task.map(Cow::Owned),
+            trial_id: context.trial_id.map(Cow::Owned),
+            session_id: context.session_id.map(Cow::Owned),
+            model: model.into(),
+            tier: tier.unwrap_or("").into(),
+            prompt_tokens: usage.prompt_tokens,
+            cached_tokens: usage.cached_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            completion_tokens: usage.completion_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            total_tokens: usage.prompt_tokens.saturating_add(usage.completion_tokens),
+        };
+        let mut line = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        self.0.write_all(&line)
+    }
+}
+```
+
+**特点**：
+- **追加式写入**：无锁，高吞吐
+- **无 fsync**：可能丢失最后几行（崩溃时）
+- **读取无同步**：`snapshot()` 读取时不锁定写入者
+- **容错解析**：解析失败的行被跳过，不中断扫描
+
+### 8.3 会话统计快照
+
+`snapshot()` 实现**无锁读取**：
+
+```rust
+pub(crate) fn snapshot(
+    path: &Path,
+    session_id: &str,
+) -> std::io::Result<Option<SessionStatsSnapshot>> {
+    let mut reader = BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
+    let mut line = Vec::new();
+    let mut snapshot = SessionStatsSnapshot::new(session_id);
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            break;  // 截断的行（写入中）
+        }
+        let Ok(record) = serde_json::from_slice::<RoutingRecord>(&line) else {
+            continue;  // 解析失败跳过
+        };
+        snapshot.add_record(&record, session_id);
+    }
+    snapshot.sum_totals();
+    Ok((snapshot.total_calls > 0).then_some(snapshot))
+}
+```
+
+**容错设计**：
+- 不以 `\n` 结尾的行被视为**截断**（写入中），停止扫描
+- 解析失败的行被**静默跳过**
+- 使用 `Cow<'a, str>` 避免拷贝
+
+### 8.4 Git 合并冲突解决
+
+`.sir-merge-a-lot.yml` 配置了 **sir-merge-a-lot** 机器人：
+
+```yaml
+trigger_mode: "on_demand"  # 仅手动触发
+
+llm:
+  enabled: true  # LLM 冲突解决
+
+coding_agent_provider: codex_cli  # 编码代理回退
+```
+
+**冲突解决流程**：
+1. 确定性阶梯（`rerere` → `Mergiraf`）先尝试
+2. 失败时调用 LLM 解决
+3. LLM 也失败时，调度 `codex_cli` 沙箱运行
+4. 所有解决通过**有界编辑安全检查**（不允许修改冲突标记外的行）
+
+### 8.5 缺失：CRDT / 多端同步
+
+**Switchyard 缺少**：
+- CRDT 数据结构
+- 实时协同编辑
+- 多端状态同步
+- 冲突自动合并
+- Event Sourcing
+
+**laew 对比**：laew 同样无 CRDT，但 laew 的 Session 管理是单机的，无需分布式同步。
+
+---
+
+## 9. laew gap 清单（L79-L110）
+
+基于本轮分析，新增 **32 个 laew gap**：
+
+### P0 紧急（12 项）
+
+| ID | gap | 影响 | 推荐 crate |
+|----|-----|------|-----------|
+| L79 | 无 panic hook | 崩溃无友好信息 | `human-panic` |
+| L80 | 无 CrashDump 生成 | 事后排查困难 | `minidump` / `breakpad` |
+| L81 | 无指数退避（仅固定 250ms 翻倍） | 重试风暴 | `backoff` / `failsafe` |
+| L82 | 无熔断器 | 故障扩散 | `failsafe` |
+| L83 | 无 API Key 轮换 | 凭证泄露风险 | `keyring` |
+| L84 | 无 Session WAL / fsync | 崩溃丢数据 | `rusqlite` + WAL |
+| L85 | 无 OAuth 2.0 流程 | 企业集成困难 | `oauth2` |
+| L86 | 无 WebSocket 端点 | 无法实时推送 | `tokio-tungstenite` |
+| L87 | 无 DevContainer | 开发环境不一致 | `.devcontainer.json` |
+| L88 | 无 i18n 框架 | 国际化困难 | `rust-i18n` / `fluent` |
+| L89 | 无 AutoUpdate | 用户版本碎片化 | `self_update` / `tauri-updater` |
+| L90 | 无 CRDT | 多端同步不可能 | `yrs` / `automerge` |
+
+### P1 重要（12 项）
+
+| ID | gap | 影响 | 推荐 crate |
+|----|-----|------|-----------|
+| L91 | 无错误分类（仅有 RouteErrorKind） | 运维困难 | `thiserror` + `miette` |
+| L92 | 无故障注入测试 | 生产故障 | `proptest` / `fail` |
+| L93 | 无 WebUI | 可观测性差 | `axum` + `askama` |
+| L94 | 无桌面壳 | 桌面用户困难 | `tauri` / `egui` |
+| L95 | 无多账号轮换 | 单点故障 | 自定义 |
+| L96 | 无跨进程锁 | 配置并发修改 | `fs2` / `fd-lock` |
+| L97 | 无 RTL 布局 | 阿拉伯语/希伯来语 | `unic-bidi` |
+| L98 | 无翻译 pipeline | 翻译质量 | `weblate` / `crowdin` |
+| L99 | 无签名验证 | 供应链攻击 | `cargo-sign` / `sigstore` |
+| L100 | 无心跳检测 | 死连接 | `tokio` interval |
+| L101 | 无背压控制 | 内存溢出 | `tokio::sync::Semaphore` |
+| L102 | 无 docker-compose | 本地编排困难 | `docker-compose.yml` |
+
+### P2 进阶（8 项）
+
+| ID | gap | 影响 | 推荐 crate |
+|----|-----|------|-----------|
+| L103 | 无 AutoUpdate 签名 | 恶意更新 | `ed25519-dalek` |
+| L104 | 无远程编排 | 集群管理困难 | `kube-rs` |
+| L105 | 无 digest 钉 | 镜像篡改 | Docker Content Trust |
+| L106 | 无 Event Sourcing | 审计困难 | `esrs` |
+| L107 | 无协同编辑 | 团队协作 | `yrs` |
+| L108 | 无 Session 共享 | 多设备 | `yrs` + WebSocket |
+| L109 | 无冲突自动合并 | 手动解决 | `yrs` / `automerge` |
+| L110 | 无多租户隔离 | 企业部署 | `tokio::sync::RwLock` |
+
+---
+
+## 10. 与前 9 轮关系
+
+### 10.1 覆盖度演进
+
+| 轮次 | 新增维度 | 累计维度 | 文档行数 |
+|------|---------|---------|---------|
+| 第 1 轮 | 基础架构 / 协议 IR / 路由算法 | 3 | ~2,000 |
+| 第 2 轮 | 7 种路由策略 / LLM 网关 / PyO3 | 6 | ~3,500 |
+| 第 3 轮 | 协议 wire 真实实现 / SubAgent 并发 / Goal 状态机 | 9 | ~5,000 |
+| 第 4 轮 | TUI 渲染管线 / Hook 拦截器 / Skill 一等公民 | 12 | ~6,500 |
+| 第 5 轮 | Effect DI 拓扑 / CBOR 二进制帧 / Lane 三队列 | 15 | ~8,000 |
+| 第 6 轮 | 文件编辑补丁 / 代码检索 / Git checkpoint | 18 | ~10,000 |
+| 第 7 轮 | Bash PTY / 多模态 / PromptCaching / Schema 校验 | 22 | ~12,000 |
+| 第 8 轮 | Web 检索 / Telemetry / Session 持久化 / Tool 权限沙箱 | 26 | ~14,000 |
+| 第 9 轮 | LSP/IDE 集成 / Skill Workshop / 多租户团队记忆 / 终端控制序列 | 30 | ~16,000 |
+| **第 10 轮** | **CrashDump / WebUI / OAuth / i18n / Release / WebSocket / DevContainer / CRDT** | **38** | **~18,000** |
+
+### 10.2 关键发现
+
+1. **错误处理成熟度中等**：有结构化错误分类（`RouteErrorKind`），但无 panic hook / CrashDump
+2. **认证机制简单**：仅支持静态 API Key 或透传，无 OAuth 2.0 / PKCE
+3. **国际化缺失**：完全无 i18n 支持
+4. **发布工程完善**：GitHub Actions + maturin + PyPI Trusted Publishing，但无 AutoUpdate
+5. **SSE 支持完整**：帧解析、终端事件、错误终止、协议特定格式
+6. **WebSocket 缺失**：无双向通信能力
+7. **容器化基础**：有多阶段 Dockerfile，但无 DevContainer / docker-compose
+8. **CRDT 缺失**：无状态代理无需 CRDT，但路由日志无 fsync
+
+### 10.3 laew 与 Switchyard 对比
+
+| 维度 | laew | Switchyard | 差距 |
+|------|------|-----------|------|
+| 错误处理 | `thiserror` + `anyhow` | `thiserror` + `RouteErrorKind` | Switchyard 更结构化 |
+| 认证 | 静态 API Key | 静态 API Key + 转发 | Switchyard 更灵活 |
+| i18n | 无 | 无 | 平手 |
+| Release | `cargo build` | maturin + PyPI | Switchyard 更完善 |
+| SSE | 无 | 完整支持 | Switchyard 领先 |
+| WebSocket | 无 | 无 | 平手 |
+| 容器化 | 无 | Dockerfile | Switchyard 领先 |
+| CRDT | 无 | 无 | 平手 |
+
+### 10.4 推荐改造优先级
+
+**P0（立即）**：
+1. 添加 `human-panic` 提供友好崩溃信息
+2. 实现指数退避 + 熔断器（`failsafe`）
+3. 添加 API Key 轮换机制
+4. 实现 Session WAL + fsync
+
+**P1（短期）**：
+1. 添加 OAuth 2.0 / PKCE 支持
+2. 实现 WebSocket 端点（实时推送）
+3. 添加 DevContainer 配置
+4. 实现 i18n 框架（`rust-i18n`）
+
+**P2（中期）**：
+1. 实现 AutoUpdate（`self_update`）
+2. 添加 CRDT 支持（`yrs`）
+3. 实现协同编辑
+4. 添加多租户隔离
+
+---
+
+## 附录 A：关键源码文件索引
+
+| 文件 | 行数 | 核心内容 |
+|------|------|---------|
+| `crates/switchyard-server/src/lib.rs` | 2013 | HTTP 服务主逻辑 / 优雅关闭 / 请求取消 |
+| `crates/switchyard-server/src/sse.rs` | 167 | 出站 SSE 帧封装 |
+| `crates/switchyard-server/src/shutdown.rs` | 53 | 平台特定关闭信号 |
+| `crates/switchyard-server/src/observability.rs` | 201 | OpenTelemetry 初始化 |
+| `crates/switchyard-server/src/routing_log.rs` | 282 | 追加式 JSONL 日志 |
+| `crates/switchyard-server/src/metrics.rs` | 173 | Prometheus 指标 |
+| `crates/switchyard-server/src/failure.rs` | 339 | 安全遥测摘要 |
+| `crates/switchyard-translation/src/sse.rs` | 224 | 入站 SSE 帧解析 |
+| `crates/libsy-llm-client/src/client.rs` | 1921 | HTTP 客户端 / 重试 / 退避 |
+| `crates/libsy-llm-client/src/backend.rs` | 449 | 后端配置 / 认证 / 溢出检测 |
+| `crates/switchyard-runner/src/config.rs` | 1372 | TOML 配置加载 / 认证验证 |
+| `crates/protocol/src/stream.rs` | 600+ | 流式 IR / 响应累积 |
+| `.github/workflows/publish.yml` | 400+ | 发布流程 |
+| `.github/workflows/ci.yml` | 226 | CI 流程 |
+| `Dockerfile` | 31 | 多阶段构建 |
+| `.sir-merge-a-lot.yml` | 41 | Git 合并冲突解决 |
+
+## 附录 B：Cargo.toml 依赖分析
+
+```toml
+[workspace.dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+futures = "0.3"
+futures-util = "0.3"
+http = "1"
+httpdate = "1"
+jsonschema = { version = "0.49.4", default-features = false }
+jsonptr = { version = "0.8.1" }
+parking_lot = "0.12"
+rand = "0.10"
+regex = "1"
+reqwest = { version = "0.13.4", features = ["json", "rustls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = { version = "0.1", features = ["attributes", "std"] }
+tracing-opentelemetry = "0.33"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+```
+
+**缺失的关键依赖**：
+- `human-panic` — 崩溃信息
+- `failsafe` — 熔断器 / 退避
+- `oauth2` — OAuth 2.0
+- `rust-i18n` — 国际化
+- `self_update` — 自动更新
+- `tokio-tungstenite` — WebSocket
+- `yrs` — CRDT
+- `keyring` — 密钥管理
+
+---
+
+**文档完**

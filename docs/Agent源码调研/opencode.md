@@ -5141,3 +5141,2445 @@ app.message(async ({ message, say }) => {
 7. **`compatibilityDate` 严肃工程**（20.1.1）—— Cloudflare 部署冻结日期
 
 **总章节行数**：本章节约 **1100+ 行**，覆盖 enterprise 4 文件 + cli 2 文件 + web 2 文件 + desktop 1 文件 + http-recorder 8 文件 + slack 1 文件 + 1 个 cross-cutting 段。
+# opencode 第十轮深挖：8 大新维度
+
+> **生成时间**：2026-09-07
+> **分析对象**：`/usr/local/LsmGitOpenSource/opencode`（TypeScript/Bun + Effect 全栈 DI 架构）
+> **对应知识库**：`/usr/local/LsmGitOpenSource/LsmAgentEmergentWork/docs/Agent源码调研/opencode.md`（~5,143 行，前 9 轮累计）
+> **本轮定位**：在前 9 轮已覆盖「Effect/LayerNode/Session/Provider/MCP/Edit/Grep/Bash/CRDT/Skill/Workshop/Telemetry/Session持久化/LSP/IDE/Tool权限沙箱/Hook/Plugin/Skill/多租户/团队记忆/TUI渲染/Enterprise Durable Object/多端UI/HTTP Recorder/Slack」基础上，**仅**对 8 个全新维度做深度源码剖析，每个维度 ≥300 行。
+
+---
+
+## 目录
+
+1. [CrashDump 与错误恢复](#1-crashdump-与错误恢复)
+2. [WebUI 与 DesktopApp](#2-webui-与-desktopapp)
+3. [OAuth 认证与多账号](#3-oauth-认证与多账号)
+4. [i18n 国际化](#4-i18n-国际化)
+5. [Release 工程化与 AutoUpdate](#5-release-工程化与-autoupdate)
+6. [WebSocket 与 SSE](#6-websocket-与-sse)
+7. [DevContainer 与容器化](#7-devcontainer-与容器化)
+8. [CRDT 与多端冲突](#8-crdt-与多端冲突)
+
+附录：[laew gap 清单 L38-L78](#附录laew-gap-清单-l38-l78)
+
+---
+
+## 1. CrashDump 与错误恢复
+
+opencode 的崩溃恢复体系横跨 **CLI sidecar + Electron main + Renderer** 三层，核心设计哲学是「**任何可恢复的异常都走 IPC 回主进程 + 日志落盘 + crashpad**」，**任何不可恢复的异常都强制重启 sidecar**。
+
+### 1.1 三层崩溃捕获
+
+#### 1.1.1 Electron Crashpad（OS 级别）
+
+`packages/desktop/src/main/logging.ts:36-42` 启动 Crashpad 落盘到 `userData/Crashpad/`：
+
+```typescript
+export function initCrashReporter() {
+  const dir = join(app.getPath("userData"), "Crashpad")
+  mkdirSync(dir, { recursive: true })
+  app.setPath("crashDumps", dir)
+  crashReporter.start({ uploadToServer: false, compress: true })
+  write("crash", "crash reporter started", { path: dir })
+}
+```
+
+**关键点**：
+
+- `uploadToServer: false` —— Crashpad dump 只落盘不上传，**隐私默认本地保留**（与 claudecode 的"用户 opt-in 才上传"一致）
+- `compress: true` —— Electron 默认 compress=true，会把 dmp 压缩成 `.dmp.zip`（节省磁盘）
+- **路径隔离**：`app.setPath("crashDumps", dir)` 把 dumps 重定向到 `userData/Crashpad` 而非 Electron 默认的 `~/.config/Electron/Crashpad`，**避免污染全局目录**
+
+`logging.ts:194-210` 控制台 broken-pipe 兜底：
+
+```typescript
+function initConsoleTransport() {
+  if (app.isPackaged) {
+    log.transports.console.level = false  // 生产环境关闭 console
+    return
+  }
+  const write = log.transports.console.writeFn.bind(log.transports.console)
+  log.transports.console.writeFn = (options) => {
+    try {
+      write(options)
+    } catch (err) {
+      if (!isBrokenPipe(err)) throw err
+      log.transports.console.level = false  // 一旦 EPIPE 就永久关闭 console
+    }
+  }
+}
+```
+
+**laew 借鉴**：Rust 当前没有任何 panic hook —— L38 gap。`human-panic` crate 是事实标准（claudecode 用的也是 human-panic），但 opencode 选择 Electron Crashpad 是因为其**直接捕获 native crash**（Rust panic 时传不下来的 C++ 栈、GPU driver crash 等）。
+
+#### 1.1.2 Renderer 渲染进程崩溃（Chromium 级别）
+
+`packages/desktop/src/main/index.ts:234-240` 监听 `render-process-gone`：
+
+```typescript
+app.on("child-process-gone", (_event, details) => {
+  writeLog("utility", "child process gone", { details }, "error")
+})
+app.on("render-process-gone", (_event, webContents, details) => {
+  writeLog("window", "app render process gone", { url: safeWebContentsURL(webContents), details }, "error")
+})
+```
+
+`packages/desktop/src/main/unresponsive.ts:8-69` 是 opencode **独创的 renderer unresponsive 采样器**：
+
+```typescript
+const sampleInterval = 1000  // 每 1s 采样一次
+const samplePeriod = 15000   // 持续 15s
+
+export function createUnresponsiveSampler(win: BrowserWindow, name: string) {
+  let sampleTimer: ReturnType<typeof setTimeout> | undefined
+  let stopTimer: ReturnType<typeof setTimeout> | undefined
+  let sampling = false
+  const samples = new Map<string, number>()  // stack → count
+
+  const collect = async () => {
+    if (!active()) return
+    const stack = await win.webContents.mainFrame
+      .collectJavaScriptCallStack()  // Electron 28+ 提供
+      .catch((error) => {
+        writeLog("window", "failed to collect unresponsive sample", { window: name, error }, "error")
+        return undefined
+      })
+    if (!active()) return
+    if (stack) samples.set(stack, (samples.get(stack) ?? 0) + 1)
+    schedule()
+  }
+
+  const stopAndFlush = () => {
+    const wasSampling = sampling
+    sampling = false
+    clearTimers()
+    if (samples.size === 0) return wasSampling
+    const entries = [...samples.entries()].sort((a, b) => b[1] - a[1])  // 按频次排序
+    const total = entries.reduce((sum, entry) => sum + entry[1], 0)
+    const message = [
+      "renderer unresponsive samples",
+      `Window: ${name}`,
+      `URL: ${safeWindowURL(win)}`,
+      ...entries.map((entry) => `<${entry[1]}> ${entry[0]}`),
+      `Total Samples: ${total}`,
+    ].join("\n")
+    writeLog("window", message, undefined, "error")
+    samples.clear()
+    return wasSampling
+  }
+
+  const start = () => {
+    if (sampling || win.isDestroyed() || win.webContents.isDestroyed() || win.webContents.isDevToolsOpened()) return
+    sampling = true
+    samples.clear()
+    schedule()
+    stopTimer = setTimeout(stopAndFlush, samplePeriod)
+  }
+  win.on("closed", stopAndFlush)
+  return { start, stopAndFlush }
+}
+```
+
+**核心机制**：
+
+1. **Window 切换**到后台时窗口主线程被节流，会触发 Chromium 判定为 unresponsive
+2. **采样栈**：用 `webContents.mainFrame.collectJavaScriptCallStack()` 抓当前 JS 调用栈（Electron 28+ 提供，Electron 41 是当前 latest）
+3. **频次排序**：15s 窗口内对每个 distinct stack 计数，最后按频次排序输出 Top-N
+4. **格式**：`<{count}> {stack}` —— 用尖括号包裹计数，stack 单行展示，方便 grep
+
+`packages/desktop/src/main/windows.ts:33` 还有 `jsCallStacksDocumentPolicy = "include-js-call-stacks-in-crash-reports"`，这是 Chromium 的 `Document-Policy` header，配合 crashpad 时**把 JS 调用栈写入 native crash dump**。
+
+`index.ts:194-196` 在所有平台开启此 feature：
+
+```typescript
+app.commandLine.appendSwitch("enable-features", features ? `${jsCallStackFeature},${features}` : jsCallStackFeature)
+```
+
+#### 1.1.3 Sidecar (opencode server) 崩溃
+
+`packages/desktop/src/main/index.ts:88-93, 234-240`：
+
+```typescript
+async function killSidecar() {
+  if (!server) return
+  const current = server
+  server = null
+  await current.stop()
+}
+
+app.on("child-process-gone", (_event, details) => {
+  writeLog("utility", "child process gone", { details }, "error")
+})
+```
+
+`packages/desktop/src/main/server.ts:73-85` 监听 utility process 退出：
+
+```typescript
+const onProcessGone = (_event: unknown, details: Details) => {
+  if (details.type !== "Utility" || details.name !== SIDECAR_SERVICE_NAME) return
+  options.onStderr?.(`utility process gone reason=${details.reason} exitCode=${details.exitCode}`)
+}
+app.on("child-process-gone", onProcessGone)
+child.once("exit", (code) => {
+  exited = true
+  app.off("child-process-gone", onProcessGone)
+  options.onExit?.(code)
+  exit.resolve(code)
+})
+```
+
+**Sidecar 重启策略**：从 `index.ts:407-409` 看，sidecar 在 `loadingTask` fiber 中启动，**没有自动重启逻辑**（一旦 sidecar 死，主进程也视为异常）。**这是有意的设计**：sidecar 死了 = opencode 死了，用户重启整个 app 即可。
+
+`packages/desktop/src/main/sidecar.ts:67-70` 是 sidecar 自己崩溃时的兜底：
+
+```typescript
+async function start(command: StartCommand) {
+  try {
+    // ...
+    listener = await Server.listen({...})
+    parentPort.postMessage({ type: "ready" })
+  } catch (error) {
+    parentPort.postMessage({ type: "error", error: serializeError(error) })
+    setImmediate(() => process.exit(1))  // 失败立即退出
+  }
+}
+```
+
+### 1.2 日志系统（带自动清理）
+
+`packages/desktop/src/main/logging.ts:9-14` 定义日志常量：
+
+```typescript
+const MAX_LOG_AGE_DAYS = 7        // 7 天自动清理
+const TAIL_LINES = 1000           // tail 默认读最近 1000 行
+const EXPORT_WINDOW = 24 * 60 * 60 * 1000  // 导出窗口 24h
+const MAX_EXPORT_FILE_SIZE = 50 * 1024 * 1024  // 单文件 50MB 上限
+const NET_LOG_SIZE = 20 * 1024 * 1024         // 网络日志 20MB 上限
+```
+
+`logging.ts:101-131` 启动时清理 7 天前的旧日志：
+
+```typescript
+function initRunDirectory() {
+  root = join(app.getPath("userData"), "logs")
+  run = join(root, stamp())  // 每次启动一个独立子目录
+  mkdirSync(run, { recursive: true })
+}
+
+function cleanup() {
+  const dir = root || dirname(log.transports.file.getFile().path)
+  const cutoff = Date.now() - MAX_LOG_AGE_DAYS * 24 * 60 * 60 * 1000
+  for (const entry of readdirSync(dir)) {
+    const file = join(dir, entry)
+    try {
+      const info = statSync(file)
+      if (info.mtimeMs < cutoff) rmSync(file, { recursive: true, force: true })
+    } catch {
+      continue
+    }
+  }
+}
+```
+
+**「每次启动一个独立 run 目录」** 是 opencode 日志系统的核心设计：`logs/{ISO timestamp}/{scope}.log`，**避免单文件被锁、避免写入竞争、避免 huge file**。
+
+`logging.ts:51-73` 用户主动导出 debug：
+
+```typescript
+export async function exportDebugLogs() {
+  const restartNetLog = netLog.currentlyLogging
+  if (restartNetLog) {
+    await netLog.stopLogging().catch((error) => write("network", "failed to stop net log", { error }))
+  }
+  const output = join(app.getPath("downloads"), `opencode-debug-${stamp()}.zip`)
+  try {
+    write("main", "exporting debug logs", { output })
+    await writeZip(output, [
+      { name: "manifest.json", data: Buffer.from(JSON.stringify(manifest(), null, 2)) },
+      ...collect(root, "desktop"),
+      ...serverLogRoots().flatMap((dir, i) => collect(dir, `server-${i + 1}`)),
+      ...collect(app.getPath("crashDumps"), "crashpad"),
+    ])
+    shell.showItemInFolder(output)  // 弹 Finder/Explorer
+    return output
+  } finally {
+    if (restartNetLog) {
+      await startNetLog().catch((error) => write("network", "failed to restart net log", { error }))
+    }
+  }
+}
+```
+
+**导出的 zip 结构**：
+
+```
+opencode-debug-{timestamp}.zip
+├── manifest.json                          # version/packaged/uptime/userData
+├── desktop/main.log                       # 主进程日志
+├── desktop/renderer.log                   # renderer 日志
+├── desktop/server.log                      # sidecar stdout/stderr
+├── desktop/network.netlog                 # Chromium 网络抓包
+├── desktop/crashpad/                      # crash dumps
+│   ├── xxx.dmp.zip
+│   └── yyy.dmp.zip
+├── server-1/log/                          # server log root 1
+└── server-2/log/                          # server log root 2
+```
+
+`logging.ts:152-155` 同时扫描 `XDG_DATA_HOME/opencode/log` + `userData/opencode/log` 两个根（因为 sidecar 可能继承不同的 `XDG_STATE_HOME`）。
+
+### 1.3 Net Log (Chromium 网络抓包)
+
+`logging.ts:44-49`：
+
+```typescript
+export async function startNetLog() {
+  if (netLog.currentlyLogging) return
+  netLogPath = join(run, "network.netlog")
+  await netLog.startLogging(netLogPath, { captureMode: "default", maxFileSize: NET_LOG_SIZE })
+  write("network", "net log started", { path: netLogPath })
+}
+```
+
+`captureMode: "default"` 是 Chromium 的**精确抓包模式**（捕获所有 HTTP/HTTPS 请求与响应头+body），与 `defaultSensitive` 不同（后者会脱敏 cookies）。**`.netlog` 文件可被 Chrome DevTools `chrome://net-export/` 直接打开可视化分析**。
+
+### 1.4 重启与恢复
+
+`packages/desktop/src/main/index.ts:171-177`：
+
+```typescript
+const relaunch = () => {
+  setAppQuitting()
+  void stopSidecars().finally(() => {
+    app.relaunch()
+    app.quit()
+  })
+}
+```
+
+**关键设计**：
+
+1. `setAppQuitting()` —— 通知 window registry **持久化 window IDs**（否则 app.quit 会丢状态）
+2. `stopSidecars().finally(...)` —— **保证 sidecar 干净退出**（避免 zombie 进程占用 port）
+3. `app.relaunch()` —— spawn 新实例
+4. `app.quit()` —— 旧实例退出
+
+`index.ts:246-251` 还监听 Unix signal：
+
+```typescript
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    setAppQuitting()
+    void stopSidecars().finally(() => app.quit())
+  })
+}
+```
+
+### 1.5 IPC `fatal renderer error` 回填
+
+`packages/desktop/src/main/index.ts:309` 在 IPC 暴露：
+
+```typescript
+recordFatalRendererError: (error) => writeLog("renderer", "fatal renderer error", { ...error }, "error"),
+```
+
+`packages/desktop/src/renderer/index.tsx` 在 renderer 里 hook 后调用（unhandled exception → IPC → main 落盘）。
+
+### 1.6 Sidecar 健康检查
+
+`packages/desktop/src/main/server.ts:144-163` 启动后 health check 循环：
+
+```typescript
+const wait = (async () => {
+  const url = `http://${hostname}:${port}`
+  let healthy = false
+  const gone = exit.promise.then((code) => {
+    if (healthy) return
+    throw new Error(`Sidecar exited before health check passed with code ${code}`)
+  })
+  const ready = async () => {
+    while (true) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      if (await checkHealth(url, password)) {
+        healthy = true
+        return
+      }
+    }
+  }
+  await Promise.race([ready(), gone])
+})()
+```
+
+**关键**：100ms 间隔轮询 `/api/health` + `/global/health`（双 endpoint 容错），sidecar 死了直接抛错终止等待。
+
+### 1.7 laew gap L38-L42（CrashDump 相关）
+
+| Gap | 描述 | 借鉴方案 |
+|-----|------|----------|
+| **L38** | laew 无 panic hook | 用 `human-panic` crate（claudecode/opencode 都用 Electron Crashpad 但 Rust 等价是 `human-panic`），dump 到 `~/.local/share/laew/crashdumps/` |
+| **L39** | 无指数退避 | 学习 opencode `setImmediate(() => process.exit(1))` —— 失败立即退出，不重试；relaunch 由 main 进程统一控制 |
+| **L40** | 无熔断器 | 借鉴 opencode 的 sidecar health check 100ms 轮询 + dual endpoint (`/api/health` + `/global/health`)；Rust 用 `tokio::time::interval` |
+| **L41** | 无错误分类 | opencode 的 `Effect.catchTag("Session.NotFoundError", ...)` 三段式：错误定义 (`class NotFoundError extends Schema.TaggedErrorClass`) + 错误传递 + 错误映射到 HTTP status，是 Rust `thiserror` + 模式匹配的范式 |
+| **L42** | 错误 UX 差 | laew 当前是 `tracing::error!` 一行；opencode 有 `desktop.recovery.loadFailed.detail: "Window: {{window}}\nURL: {{url}}\nError: {{code}} {{description}}"` 的本地化模板 |
+
+---
+
+## 2. WebUI 与 DesktopApp
+
+opencode 的多端 UI 体系是 **TUI / Web / Desktop / App** 四端共享 **Solid.js 组件库 + 多语言系统 + 上层 router**。本节聚焦 `desktop` / `web` / `app` / `ui` / `tui` 五个 package。
+
+### 2.1 Package 拓扑
+
+```
+packages/
+├── ui/              # 共享 Solid.js 组件库（@opencode-ai/ui）
+├── app/             # 桌面/CLI 共享业务逻辑（@opencode-ai/app）
+├── desktop/         # Electron 主进程壳（@opencode-ai/desktop）
+├── web/             # Astro Starlight 文档站（@opencode-ai/web）
+├── enterprise/      # SolidStart SSR share 页面（@opencode-ai/enterprise）
+├── tui/             # 终端 UI（@opencode-ai/tui）
+├── session-ui/      # Session 共享组件（@opencode-ai/session-ui）
+└── sdk/             # HTTP 客户端 SDK
+```
+
+**依赖关系**：
+- `ui` ← `app` ← `desktop`（renderer）
+- `ui` ← `session-ui` ← `enterprise`
+- `tui` 直接 Solid.js，独立
+
+### 2.2 Desktop 主进程生命周期（Effect.gen 全栈）
+
+`packages/desktop/src/main/index.ts:115-422` 是 `Effect.gen` 全栈编排器：
+
+```typescript
+const main = Effect.gen(function* () {
+  contextMenu({ showSaveImageAs: true, showLookUpSelection: false, showSearchWithGoogle: false })
+  try {
+    process.chdir(homedir())  // macOS apps run in `/` which can cause issues with ripgrep
+  } catch {}
+  process.env.OPENCODE_DISABLE_EMBEDDED_WEB_UI = "true"
+  
+  const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
+  // ... onboarding test root setup ...
+  app.setName(app.isPackaged ? APP_NAMES[CHANNEL] : "OpenCode Dev")
+  app.setAppUserModelId(appId)
+  app.setPath("userData", onboardingTestRoot ? join(onboardingTestRoot, "desktop") : join(app.getPath("appData"), appId))
+  if (onboardingTestRoot) app.setPath("sessionData", join(onboardingTestRoot, "session"))
+  initializeOldLayoutEligibility(app.getPath("userData"))
+  logger = initLogging()
+  initCrashReporter()
+  
+  // WSL 服务器控制器
+  const wslServers = createWslServersController(app.getVersion(), async (distro) => {...}, {...})
+  const stopSidecars = async () => {
+    await killSidecar()
+    wslServers.stopAll()
+  }
+  const relaunch = () => {
+    setAppQuitting()
+    void stopSidecars().finally(() => { app.relaunch(); app.quit() })
+  }
+  
+  // ... CACert / MDNS / Proxy ...
+  
+  if (!app.requestSingleInstanceLock()) {
+    app.quit()
+    return
+  }
+  
+  yield* Effect.promise(() => app.whenReady())  // 等 Electron ready
+  
+  if (!TEST_ONBOARDING) migrate()
+  yield* Effect.promise(() => cleanupStoreFiles(...)).pipe(Effect.tap, Effect.catch)
+  app.setAsDefaultProtocolClient("opencode")
+  registerRendererProtocol()
+  setDockIcon()
+  const updater = setupAutoUpdater(stopSidecars)
+  registerIpcHandlers({...})
+  void updater.start()
+  const updateTimer = setInterval(() => void updater.check(), 10 * 60 * 1000)
+  updateTimer.unref()
+  
+  // ... startNetLog + loadingTask (sidecar fork) ...
+  
+  const windows = restoreMainWindows()
+  if (windows.length) createMenu(menuDeps)
+})
+Effect.runFork(main)
+```
+
+**核心要点**：
+
+1. **`requestSingleInstanceLock`** —— 单实例锁，第二次启动走 `second-instance` 事件（deep link 路由）
+2. **`process.chdir(homedir())`** —— macOS Electron app 启动时 cwd=`/`，**ripgrep 等工具对此敏感**，先切到 home
+3. **`setAsDefaultProtocolClient("opencode")`** —— 注册 `opencode://` deep link
+4. **`setInterval(check, 10*60*1000).unref()`** —— 每 10 分钟检查更新，**`unref` 让它不阻塞进程退出**
+
+### 2.3 Renderer：Solid.js + MemoryRouter + Window Registry
+
+`packages/desktop/src/renderer/index.tsx` 是 Solid.js 应用入口：
+
+```typescript
+function DesktopMemoryRouter(props: BaseRouterProps & { windowID: string }) {
+  const history = createMemoryHistory()
+  const initialUrl = getLastActiveUrl(props.windowID)
+  if (initialUrl !== "/") history.set({ value: initialUrl, replace: true, scroll: false })
+  onCleanup(history.listen((value) => setLastActiveUrl(props.windowID, value)))
+  return <MemoryRouter {...props} history={history} />
+}
+```
+
+**每个 window 有独立的 memoryHistory** + **持久化最近一次访问的 URL 到 localStorage**，实现「上次访问页面恢复」。
+
+`createPlatform` 创建 `Platform` 对象注入 Provider：
+
+```typescript
+const createPlatform = (windowState: DesktopWindowState): Platform => {
+  const attachmentPaths = new WeakMap<File, string>()
+  const os = (() => {
+    const ua = navigator.userAgent
+    if (ua.includes("Mac")) return "macos"
+    if (ua.includes("Windows")) return "windows"
+    if (ua.includes("Linux")) return "linux"
+    return undefined
+  })()
+  // ...
+}
+```
+
+`@opencode-ai/app/context/platform.tsx` 定义 `Platform` interface，desktop / web 各自 `createPlatform`，**业务组件不感知平台**。
+
+### 2.4 Sentry 集成（仅 prod）
+
+`packages/desktop/src/renderer/index.tsx:40-61`：
+
+```typescript
+if (import.meta.env.VITE_SENTRY_DSN) {
+  Sentry.init({
+    dsn: import.meta.env.VITE_SENTRY_DSN,
+    environment: import.meta.env.VITE_SENTRY_ENVIRONMENT ?? import.meta.env.MODE,
+    release: import.meta.env.VITE_SENTRY_RELEASE ?? `desktop@${pkg.version}`,
+    initialScope: { tags: { platform: "desktop" } },
+    integrations: (integrations) => {
+      return integrations.filter(
+        (i) =>
+          i.name !== "Breadcrumbs" &&  // 关 Breadcrumbs 减少噪音
+          !(import.meta.env.OPENCODE_CHANNEL === "prod" &&
+            (i.name === "GlobalHandlers" || i.name === "BrowserApiErrors")),  // prod 关 auto handler，自己 hook
+    )
+  })
+}
+```
+
+**关键设计**：
+
+1. **`VITE_SENTRY_DSN` 才初始化** —— CI/test 默认关 Sentry
+2. **`!prod` 保留 GlobalHandlers/BrowserApiErrors** —— dev/beta 自动捕获（更方便调试）
+3. **prod 关掉自动 handler** —— 自己手动上报，避免 Sentry 自动上报太多无关事件
+
+### 2.5 Web 端（Astro Starlight）
+
+`packages/web/astro.config.mjs:1-100`：
+
+```javascript
+export default defineConfig({
+  site: config.url,
+  base: "/docs",
+  output: "server",
+  adapter: cloudflare({ imageService: "passthrough" }),
+  // ...
+  integrations: [
+    configSchema(),
+    solidJs(),
+    starlight({
+      title: "OpenCode",
+      defaultLocale: "root",
+      locales: {
+        root: { label: "English", lang: "en", dir: "ltr" },
+        ar: { label: "العربية", lang: "ar", dir: "rtl" },
+        bs: { label: "Bosanski", lang: "bs-BA", dir: "ltr" },
+        // ... 20 locales
+      },
+    }),
+  ],
+})
+```
+
+**`/docs` 路径 + Cloudflare adapter + 20 locales + RTL 支持**。
+
+`packages/web/src/middleware.ts` 是 i18n 中间件：
+
+```typescript
+function docsAlias(pathname: string) {
+  const hit = /^\/docs\/([^/]+)(\/.*)?$/.exec(pathname)
+  if (!hit) return null
+  const value = hit[1] ?? ""
+  const tail = hit[2] ?? ""
+  const locale = exactLocale(value)
+  if (!locale) return null
+  const next = locale === "root" ? `/docs${tail}` : `/docs/${locale}${tail}`
+  if (next === pathname) return null
+  return { path: next, locale }
+}
+
+export const onRequest = defineMiddleware((ctx, next) => {
+  const alias = docsAlias(ctx.url.pathname)
+  if (alias) return redirect(ctx.url, alias.path, alias.locale)
+
+  if (ctx.url.pathname !== "/docs" && ctx.url.pathname !== "/docs/") return next()
+
+  const locale =
+    localeFromCookie(ctx.request.headers.get("cookie")) ??
+    localeFromAcceptLanguage(ctx.request.headers.get("accept-language"))
+  if (!locale || locale === "root") return next()
+
+  return redirect(ctx.url, `/docs/${locale}/`)
+})
+```
+
+**核心**：访问 `/docs` 时按 cookie → Accept-Language 优先级自动重定向到对应 locale 路径。**`oc_locale` cookie 1 年有效期**。
+
+### 2.6 Enterprise (SolidStart SSR Share 页面)
+
+`packages/enterprise/src/app.tsx`：
+
+```typescript
+function detectLocaleFromHeader(header: string | null | undefined) {
+  if (!header) return
+  for (const item of header.split(",")) {
+    const value = item.trim().split(";")[0]?.toLowerCase()
+    if (!value) continue
+    if (value.startsWith("zh")) return "zh" as const
+    if (value.startsWith("en")) return "en" as const
+  }
+}
+
+function detectLocale() {
+  const event = getRequestEvent()
+  const header = event?.request.headers.get("accept-language")
+  const headerLocale = detectLocaleFromHeader(header)
+  if (headerLocale) return headerLocale
+  if (typeof document === "object") {
+    const value = document.documentElement.lang?.toLowerCase() ?? ""
+    if (value.startsWith("zh")) return "zh" as const
+    if (value.startsWith("en")) return "en" as const
+  }
+  if (typeof navigator === "object") {
+    for (const language of navigator.languages ?? []) {
+      if (language.toLowerCase().startsWith("zh")) return "zh" as const
+    }
+  }
+  return "en" as const
+}
+
+function UiI18nBridge(props: ParentProps) {
+  const locale = createMemo(() => detectLocale())
+  const t = (key, params) => {
+    const value = locale() === "zh" ? zh[key] ?? uiEn[key] : uiEn[key]
+    const text = value ?? String(key)
+    return resolveTemplate(text, params)
+  }
+  // ...
+  return <I18nProvider value={{ locale, t, plural }}>{props.children}</I18nProvider>
+}
+```
+
+**Enterprise 只支持 zh/en**（与 web 文档站的 20 locales 不同，**业务组件用 Shared UI 库，UI 库自带完整 i18n**）。
+
+`packages/enterprise/src/routes/share/[shareID].tsx:58-120` 是 share 页面数据组装：
+
+```typescript
+const getData = query(async (shareID) => {
+  "use server"
+  const share = await Share.get(shareID)
+  if (!share) throw new SessionDataMissingError({ sessionID: shareID })
+  const data = await Share.data(shareID)
+  const result = {
+    sessionID: share.sessionID,
+    shareID,
+    session: [],
+    session_diff: { [share.sessionID]: [] },
+    session_status: { [share.sessionID]: { type: "idle" } },
+    message: {},
+    part: {},
+    model: {},
+  }
+  for (const item of data) {
+    switch (item.type) {
+      case "session": result.session.push(item.data); break
+      case "session_diff": result.session_diff[share.sessionID] = item.data; break
+      case "message": result.message[item.data.sessionID] ??= []; result.message[item.data.sessionID].push(item.data); break
+      case "part": result.part[item.data.messageID] ??= []; result.part[item.data.messageID].push(item.data); break
+      case "model": result.model[share.sessionID] = item.data; break
+    }
+  }
+  // ...
+})
+```
+
+**`"use server"` 标记让 SolidStart 把这个函数编到 server bundle**，调用时通过 RPC 跳到 server 端。**Cloudflare Workers 上运行**（compatibilityDate: 2024-09-19 + nodeCompat: true）。
+
+### 2.7 Window State（window-state.ts）
+
+`packages/desktop/src/main/windows.ts:35-45` 用 `electron-window-state`：
+
+```typescript
+import windowState from "electron-window-state"
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: rendererProtocol,
+    privileges: {
+      secure: true,
+      standard: true,
+      supportFetchAPI: true,
+      stream: true,
+    },
+  },
+])
+
+const titlebarHeight = 40
+const maxZoomLevel = 10
+const minZoomLevel = 0.2
+```
+
+**`oc://renderer` 自定义协议**（取代 `file://`），**`supportFetchAPI` + `stream` 让 renderer 可以 fetch 本地资源（SSR 流式渲染 / 字体 / 图片）**。
+
+### 2.8 Menu 系统
+
+`packages/desktop/src/main/index.ts:275-282`：
+
+```typescript
+const menuDeps = {
+  trigger: (id: string) => {
+    const win = getLastFocusedWindow()
+    if (win) sendMenuCommand(win, id)
+  },
+  checkForUpdates: () => void showUpdaterDialog(updater, true),
+  relaunch,
+}
+```
+
+**菜单命令通过 IPC 推送给当前 focused window**，menu 不直接操作业务。
+
+### 2.9 WSL 子进程（WSL 服务器控制器）
+
+`packages/desktop/src/main/wsl/servers.ts:62-99` 是 WSL sidecar 管理：
+
+```typescript
+export function createWslServersController(
+  appVersion: string,
+  spawnSidecar: SpawnSidecar,
+  options?: WslServersControllerOptions,
+) {
+  let state: WslServersState = initialState()
+  const listeners = new Set<(event: WslServersEvent) => void>()
+  const sidecars = new Map<string, RunningSidecar>()
+  const startAttempts = new Map<string, number>()
+  let jobAbort: AbortController | undefined
+  const logger = options?.logger
+  // ...
+
+  const emit = () => {
+    for (const listener of listeners) listener({ type: "state", state })
+  }
+
+  const setState = (next: Partial<WslServersState>) => {
+    state = { ...state, ...next }
+    emit()
+  }
+  // ...
+}
+```
+
+**WSL = 每个 WSL distro 一个 sidecar 进程**，由 `wsl:<distro>` 作为 ID。Job 系统通过 `AbortController` 共享，支持「取消当前 job 后启动新 job」。
+
+### 2.10 TUI Package（独立渲染）
+
+`packages/tui/src/index.tsx` 是 TUI 入口，与 desktop 的 Solid.js web 渲染**完全独立**（不共享组件）。**TUI 是 Effect.gen + Solid.js（@opentui/solid-js）**，**底层用 ANSI 转义码**。
+
+### 2.11 laew gap L44-L48（多端 UI）
+
+| Gap | 描述 | 借鉴方案 |
+|-----|------|----------|
+| **L44** | 无 web 远控 | laew 当前是 TUI 单进程；opencode 的 TUI 实际是「TUI 客户端 + HTTP server」，可独立 web 控制 |
+| **L45** | 无 desktop 壳 | laew 纯 TUI；opencode 的 electron-builder + sidecar 嵌入是参考架构 |
+| **L46** | 无 WASM | opencode 的 enterprise 是 SolidStart SSR + Cloudflare Worker；laew 上 wasm 可做 wasm-pack |
+| **L47** | 无多端 Session | opencode 的 `WindowRegistry` + `DesktopMemoryRouter` 是范式 |
+| **L48** | 测试栈薄 | opencode 每个 package 都带 `*.test.ts`；laew e2e 集中在 `testReport/` |
+
+---
+
+## 3. OAuth 认证与多账号
+
+opencode 的认证体系核心在 `packages/opencode/src/auth/index.ts`，**基于 Effect DI + Schema + 文件持久化**，**支持 OAuth/Api/WellKnown 三种类型**。
+
+### 3.1 Auth 数据模型
+
+`packages/opencode/src/auth/index.ts:14-41`：
+
+```typescript
+export const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key"
+
+export class Oauth extends Schema.Class<Oauth>("OAuth")({
+  type: Schema.Literal("oauth"),
+  refresh: Schema.String,
+  access: Schema.String,
+  expires: NonNegativeInt,
+  accountId: Schema.optional(Schema.String),
+  enterpriseUrl: Schema.optional(Schema.String),
+}) {}
+
+export class Api extends Schema.Class<Api>("ApiAuth")({
+  type: Schema.Literal("api"),
+  key: Schema.String,
+  metadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+}) {}
+
+export class WellKnown extends Schema.Class<WellKnown>("WellKnownAuth")({
+  type: Schema.Literal("wellknown"),
+  key: Schema.String,
+  token: Schema.String,
+}) {}
+
+export const Info = Schema.Union([Oauth, Api, WellKnown]).annotate({ discriminator: "type", identifier: "Auth" })
+export type Info = Schema.Schema.Type<typeof Info>
+
+export class AuthError extends Schema.TaggedErrorClass<AuthError>()("AuthError", {
+  message: Schema.String,
+  cause: Schema.optional(Schema.Defect()),
+}) {}
+```
+
+**三种认证类型**：
+
+1. **OAuth**：access/refresh/expires 三元组 + accountId（多账号区分）+ enterpriseUrl（Anthropic enterprise）
+2. **API Key** + 可选 metadata（provider-specific 配置）
+3. **WellKnown**：自动发现（如 GitHub App 通过 `.well-known` 获取 token）
+
+`OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key"` —— 当 provider 是 OAuth 但还没真实 token 时，**用 dummy key 触发 OAuth 流程**（不是真的 key，是标记）。
+
+### 3.2 持久化层
+
+`packages/opencode/src/auth/index.ts:52-93`：
+
+```typescript
+const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const fsys = yield* FSUtil.Service
+    const decode = Schema.decodeUnknownOption(Info)
+
+    const all = Effect.fn("Auth.all")(function* () {
+      if (process.env.OPENCODE_AUTH_CONTENT) {
+        try {
+          return JSON.parse(process.env.OPENCODE_AUTH_CONTENT)
+        } catch (err) {}
+      }
+      const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
+      return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+    })
+
+    const get = Effect.fn("Auth.get")(function* (providerID: string) {
+      return (yield* all())[providerID]
+    })
+
+    const set = Effect.fn("Auth.set")(function* (key: string, info: Info) {
+      const norm = key.replace(/\/+$/, "")  // 去尾部 /
+      const data = yield* all()
+      if (norm !== key) delete data[key]
+      delete data[norm + "/"]
+      yield* fsys
+        .writeJson(file, { ...data, [norm]: info }, 0o600)  // 0o600 仅 owner 可读写
+        .pipe(Effect.mapError(fail("Failed to write auth data")))
+    })
+
+    const remove = Effect.fn("Auth.remove")(function* (key: string) {
+      const norm = key.replace(/\/+$/, "")
+      const data = yield* all()
+      delete data[key]
+      delete data[norm]
+      yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
+    })
+
+    return Service.of({ get, all, set, remove })
+  }),
+)
+
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node] })
+```
+
+**关键设计**：
+
+1. **`OPENCODE_AUTH_CONTENT` 环境变量注入** —— CI/test 场景用 env 注入 fake auth，避免污染磁盘
+2. **Schema 解码 + `Record.filterMap`** —— 用 Effect 的 `Result.fromOption` 过滤无效项，**损坏的 auth 不会 crash**
+3. **尾部 `/` 归一化** —— 防止 `providerID = "anthropic"` 和 `"anthropic/"` 存两份
+4. **`0o600` 文件权限** —— 仅 owner 可读写（防止多用户系统泄露）
+5. **`FSUtil.node` LayerNode 注入** —— 与 FSUtil 共享底层实现
+
+### 3.3 多账号场景
+
+`Auth` 数据结构是 `Record<string, Info>` —— **key 是 providerID**，**value 是 Auth.Info**。
+
+```typescript
+type AuthMap = Record<string, Auth.Info>
+```
+
+**多账号支持**：
+
+- `accountId: Schema.optional(Schema.String)` 在 `Oauth` schema 中
+- provider 可以有多条记录（同一 provider 不同 accountId 视为不同账号）
+
+### 3.4 OAuth 刷新流程
+
+刷新逻辑不在 `auth/index.ts`，由调用方（如 `Provider`）驱动：
+
+```typescript
+// 伪代码（基于 opencode 实际架构）
+const refresh = Effect.fn("Auth.refresh")(function* (providerID: string) {
+  const info = yield* auth.get(providerID)
+  if (info?.type !== "oauth") return
+  if (info.expires > Date.now()) return  // 未过期
+  const newInfo = yield* oauthClient.refresh(info.refresh)
+  yield* auth.set(providerID, { ...info, access: newInfo.access, expires: newInfo.expires })
+})
+```
+
+**Anthropic OAuth enterprise URL**：Anthropic 提供 enterprise 自定义 OAuth endpoint，`enterpriseUrl` 字段用于支持 enterprise 部署。
+
+### 3.5 Desktop Multi-Account via `desktop-menu`
+
+`packages/desktop/src/main/desktop-menu-actions.ts` 中可能有「Account → Switch Account」菜单项，**通过 IPC 推给 renderer**，renderer 弹 Modal 选 accountId。
+
+### 3.6 laew gap L49-L52（OAuth 相关）
+
+| Gap | 描述 | 借鉴方案 |
+|-----|------|----------|
+| **L49** | API Key 明文存 SQLite | opencode 0o600 + OAuth refresh；laew 缺 OAuth refresh 实现，需加 token rotation |
+| **L50** | 无 OAuth 流程 | opencode 的 `OAUTH_DUMMY_KEY` + `accountId` schema 字段是 Rust 实现参考 |
+| **L51** | 脱敏范围不足 | laew 现在只对 Provider Form Tab 5 脱敏；opencode `mask_key` 在 `theme.rs` 全局脱敏 |
+| **L52** | 无多账号轮换 | laew 单 active provider；opencode `Record<string, Info>` 支持多账号，**轮换策略（如 rate limit 切换）是 laew 需要新增的能力** |
+
+---
+
+## 4. i18n 国际化
+
+opencode 的 i18n 体系是**三层**：**Astro 文档站（20 locales）/ Web UI（业务组件，完整 i18n）/ Desktop Native（30+ locales，仅原生菜单 + 对话框）**。本节聚焦后两层。
+
+### 4.1 三层 i18n 拓扑
+
+```
+Layer 1: Astro Starlight 文档站        # /docs/{ar|bs|da|de|es|fr|it|ja|ko|nb|pl|pt-br|ru|th|tr|zh-CN|zh-TW}
+Layer 2: App UI 业务组件 (Solid.js)    # 60+ locales, RTL 支持, plural categories
+Layer 3: Desktop Native (Electron)     # 60+ locales, 仅原生菜单/对话框/updater/WSL 错误
+```
+
+**Layer 1**：通过 `astro.config.mjs` 的 `locales` 配置 + `middleware.ts` 重定向。
+
+**Layer 2 + 3**：通过 `packages/app/src/i18n/desktop-native.ts` + `packages/app/src/context/language.tsx` 协同。
+
+### 4.2 Desktop Native Bundle（核心抽象）
+
+`packages/app/src/i18n/desktop-native.ts:1-65` 定义 60+ locales：
+
+```typescript
+export const DESKTOP_NATIVE_LOCALES = [
+  "en", "zh", "zht", "ko", "de", "es", "fr", "da", "ja", "pl",
+  "ru", "uk", "bs", "ar", "no", "br", "th", "tr", "hi", "nl",
+  "id", "vi", "it", "ur", "pa", "az", "fi", "sv", "am", "bg",
+  "bn", "ca", "cs", "dv", "dz", "el", "et", "fa", "fo", "hr",
+  "hu", "hy", "is", "ka", "km", "lo", "lt", "lv", "mk", "mn",
+  "ms", "my", "ne", "ro", "si", "sk", "sl", "sq", "sr", "tg",
+  "tk", "uz",
+] as const
+
+export type DesktopNativeLocale = (typeof DESKTOP_NATIVE_LOCALES)[number]
+```
+
+`desktop-native.ts:198-210` 是 locale 检测算法：
+
+```typescript
+export function detectDesktopNativeLocale(languages: readonly string[]): DesktopNativeLocale {
+  for (const language of languages) {
+    const source = locale(language)
+    if (!source) continue
+    if (["no", "nb", "nn"].includes(source.language)) return "no"
+    const match = DESKTOP_NATIVE_LOCALES.find((candidate) => {
+      const target = locale(DESKTOP_NATIVE_LOCALE_TAGS[candidate])
+      return target?.language === source.language && target.script === source.script
+    })
+    if (match) return match
+  }
+  return "en"
+}
+```
+
+**关键算法**：
+
+1. 用 `Intl.Locale.maximize()` 把 `zh-TW` 标准化为 `{language: "zh", script: "Hans"}`
+2. **`["no", "nb", "nn"].includes(source.language)`** —— Norwegian 三方言（bokmål/nynorsk）合并为 `"no"`
+3. **language + script 双重匹配** —— 区分 `zh-Hans`（简体）vs `zh-Hant`（繁體），**这正是 `zht` 单独存在的原因**
+
+`desktop-native.ts:212-214` plural categories：
+
+```typescript
+export function desktopNativePluralCategories(locale: DesktopNativeLocale) {
+  return new Intl.PluralRules(DESKTOP_NATIVE_LOCALE_TAGS[locale]).resolvedOptions().pluralCategories
+}
+```
+
+### 4.3 Native Bundle 序列化（IPC 传递）
+
+`desktop-native.ts:329-358`：
+
+```typescript
+export const DESKTOP_NATIVE_MAX_PAYLOAD_BYTES = 64 * 1024  // 64KB 上限
+
+export function parseDesktopNativeBundle(value: unknown): DesktopNativeBundle | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  try {
+    if (new TextEncoder().encode(JSON.stringify(value)).byteLength > DESKTOP_NATIVE_MAX_PAYLOAD_BYTES) return undefined
+  } catch {
+    return undefined
+  }
+  const bundle = value as { locale?: unknown; messages?: unknown }
+  if (!DESKTOP_NATIVE_LOCALES.some((locale) => locale === bundle.locale)) return undefined
+  if (!bundle.messages || typeof bundle.messages !== "object" || Array.isArray(bundle.messages)) return undefined
+  const messages = bundle.messages as Record<string, unknown>
+  const keys = Object.keys(messages)
+  if (keys.length !== DESKTOP_NATIVE_KEYS.length) return undefined
+  if (!DESKTOP_NATIVE_KEYS.every((key) => typeof messages[key] === "string")) return undefined
+  if (!keys.every((key) => key in DESKTOP_NATIVE_ENGLISH)) return undefined
+  return bundle as DesktopNativeBundle
+}
+```
+
+**关键校验**：
+
+1. **64KB 上限** —— IPC 消息 size 限制
+2. **必须所有 key 都存在**（`!DESKTOP_NATIVE_KEYS.every`） —— 防止 IPC 半截消息
+3. **所有 message 必须是 string** —— 类型校验
+
+`packages/desktop/src/main/native-translations.ts:11-19`：
+
+```typescript
+export function setNativeTranslations(next: DesktopNativeBundle) {
+  if (
+    next.locale === bundle.locale &&
+    DESKTOP_NATIVE_KEYS.every((key) => next.messages[key] === bundle.messages[key])
+  ) {
+    return false  // 没变化就跳过
+  }
+  bundle = next
+  return true
+}
+```
+
+### 4.4 Renderer → Main IPC 传递
+
+`packages/desktop/src/main/index.ts:310-312`：
+
+```typescript
+setNativeTranslations: (bundle) => {
+  if (setNativeTranslations(bundle)) createMenu(menuDeps)
+},
+```
+
+**renderer 检测到语言变化时，重新生成 bundle 推到 main，main 重建原生菜单**。
+
+### 4.5 App UI 业务组件 i18n
+
+`packages/app/src/context/language.tsx:52-114` 是加载器：
+
+```typescript
+const loaders: Record<Exclude<Locale, "en">, () => Promise<Dictionary>> = {
+  zh: () => merge(import("@/i18n/zh"), import("@opencode-ai/ui/i18n/zh")),
+  zht: () => merge(import("@/i18n/zht"), import("@opencode-ai/ui/i18n/zht")),
+  ko: () => merge(import("@/i18n/ko"), import("@opencode-ai/ui/i18n/ko")),
+  de: () => merge(import("@/i18n/de"), import("@opencode-ai/ui/i18n/de")),
+  // ... 60+ loaders
+}
+```
+
+**动态 import + 缓存**：
+
+```typescript
+function loadDict(locale: Locale) {
+  const hit = dicts.get(locale)
+  if (hit) return Promise.resolve(hit)
+  if (locale === "en") return Promise.resolve(base)
+  const load = loaders[locale]
+  return load().then((next: Dictionary) => {
+    dicts.set(locale, next)
+    return next
+  })
+}
+```
+
+`merge(appDict, uiDict)` —— 把 app 域 + UI 共享库 域字典合并：
+
+```typescript
+const merge = (app: Promise<Source>, ui: Promise<Source>) =>
+  Promise.all([app, ui]).then(([a, b]) => ({ ...base, ...i18n.flatten({ ...a.dict, ...b.dict }) }) as Dictionary)
+```
+
+**`@solid-primitives/i18n` 的 `i18n.flatten`** —— 把 `{session.list.title: "..."}` 嵌套结构拍平为 `session.list.title: "..."` 用于快速查找。
+
+### 4.6 RTL 支持
+
+`language.tsx:23-27`：
+
+```typescript
+const RTL_LOCALES: ReadonlySet<Locale> = new Set(["ar", "ur", "pa", "fa", "dv"])
+
+function localeDirection(locale: Locale): Direction {
+  return RTL_LOCALES.has(locale) ? "rtl" : "ltr"
+}
+```
+
+**5 个 RTL locale**：Arabic/Urdu/Punjabi/Persian/Divehi。
+
+`language.tsx:181-187`：
+
+```typescript
+const direction = createMemo(() => layout.direction ?? localeDirection(locale()))
+const layoutLocale = createMemo(() => {
+  if (!layout.direction) return intl()
+  // Kobalte derives menu direction from locale rather than accepting a direction override.
+  return layout.direction === "rtl" ? "ar" : "en"
+})
+```
+
+**关键技巧**：Kobalte menu 组件不接受 direction override，**只能用 locale 推断**，所以 RTL 时把 layout locale 强制设为 `ar`（Kobalte 看到 `ar` 就用 RTL 渲染）。
+
+`language.tsx:207-213` 应用到 DOM：
+
+```typescript
+createEffect(() => {
+  if (typeof document !== "object") return
+  const value = locale()
+  document.documentElement.lang = intl()
+  document.documentElement.dir = direction()
+  document.cookie = cookie(value)
+})
+```
+
+**`<html lang="..." dir="...">` 配合 cookie**，让 CSS `dir="rtl"` selector 工作。
+
+### 4.7 Plural Support
+
+`language.tsx:197-203`：
+
+```typescript
+const plural = (key: PluralKey, count: number, params?: Record<string, string | number | boolean>) => {
+  const category = pluralCategory(intl(), count)
+  const current = (dict.loading ? base : (dict() ?? base)) as Record<string, string>
+  const candidate = `${key}.${category}`   // e.g. "session.followupDock.summary.one"
+  const fallback = `${key}.other`
+  return i18n.resolveTemplate(current[candidate] ?? current[fallback] ?? fallback, { ...params, count })
+}
+```
+
+**`Intl.PluralRules` 提供 `zero`/`one`/`two`/`few`/`many`/`other` 6 个 CLDR categories**。
+
+`packages/ui/src/context/i18n.ts` 提供 `pluralCategory` 和 `pluralKey`：
+
+```typescript
+export function pluralCategory(locale: Locale, count: number) {
+  const pr = new Intl.PluralRules(locale).select(count)
+  return pr  // "zero" | "one" | "two" | "few" | "many" | "other"
+}
+```
+
+### 4.8 语言切换持久化
+
+`language.tsx:171-176`：
+
+```typescript
+const [store, setStore, _, ready] = persisted(
+  Persist.global("language", ["language.v1"]),
+  createStore({
+    locale: initial,
+  }),
+)
+```
+
+**`Persist.global("language", ["language.v1"])`** —— **版本化持久化**，未来 schema 变化时通过 `["v1"]` migration。
+
+### 4.9 关键 Bundle 边界（IPC 推送）
+
+`language.tsx:215-222`：
+
+```typescript
+createEffect(() => {
+  if (!props.onNativeTranslations || dict.loading) return
+  const current = dict()
+  if (!current) return
+  props.onNativeTranslations(
+    createDesktopNativeBundle(locale(), (key) => current[key] ?? DESKTOP_NATIVE_ENGLISH[key]),
+  )
+})
+```
+
+**`?? DESKTOP_NATIVE_ENGLISH[key]`** —— 兜底英文，**保证 IPC bundle 永远所有 key 都有值**。
+
+### 4.10 laew gap L54-L58（i18n 相关）
+
+| Gap | 描述 | 借鉴方案 |
+|-----|------|----------|
+| **L54** | TUI 中文化硬编码 | opencode 用 `@solid-primitives/i18n` + 60+ locale；laew 引入 `rust_i18n` crate + JSON/YAML |
+| **L55** | 文档无双语 | opencode 文档站 20 locales；laew 文档加 `docs/{en,zh}/` |
+| **L56** | 错误无 i18n | opencode `desktop.recovery.loadFailed.detail` 是本地化模板；laew `AgentError` 应加 `i18n_key` 字段 |
+| **L57** | 无 RTL | opencode 5 RTL locale + `<html dir>` + Kobalte；laew TUI 无此需求但 web 化需要 |
+| **L58** | 无翻译 pipeline | opencode 用 `@solid-primitives/i18n.flatten` 自动嵌套拍平；laew 当前无 i18n |
+
+---
+
+## 5. Release 工程化与 AutoUpdate
+
+opencode 的 Release 工程化体系涵盖 **electron-builder + updater state machine + AutoUpdater + CrashReporter + 多 channel（dev/beta/prod）**。
+
+### 5.1 Channel 系统（3 channel）
+
+`packages/desktop/src/main/index.ts:53-62`：
+
+```typescript
+const APP_NAMES: Record<string, string> = {
+  dev: "OpenCode Dev",
+  beta: "OpenCode Beta",
+  prod: "OpenCode",
+}
+const APP_IDS: Record<string, string> = {
+  dev: "ai.opencode.desktop.dev",
+  beta: "ai.opencode.desktop.beta",
+  prod: "ai.opencode.desktop",
+}
+```
+
+**3 channel 隔离**：dev/beta/prod 用不同 `appId`，**window 状态、userData、注册表项、deep link 全隔离**。
+
+`electron-builder.config.ts` 配置 channel-specific 产物名：
+
+```typescript
+// 简化示意
+{
+  appId: "ai.opencode.desktop",  // prod
+  productName: "OpenCode",
+  // beta: appId + ".beta" → "ai.opencode.desktop.beta"
+  // dev:   appId + ".dev"   → "ai.opencode.desktop.dev"
+}
+```
+
+### 5.2 AutoUpdater 状态机
+
+`packages/desktop/src/main/updater-controller.ts:19-95` 是 8 态状态机：
+
+```typescript
+export type UpdaterState =
+  | { status: "disabled" }
+  | { status: "idle" }
+  | { status: "checking" }
+  | { status: "downloading"; version: string; percent?: number }
+  | { status: "ready"; version: string }
+  | { status: "up-to-date" }
+  | { status: "installing"; version: string }
+  | { status: "error"; message: string }
+```
+
+**8 态转换图**：
+
+```
+                    disabled
+                       ↑
+                       │ (when UPDATER_ENABLED=false)
+                       │
+idle ──check()──> checking ──available──> downloading ──done──> ready ──install()──> installing ──> ready
+ │                  │                                                  │
+ │                  └──error──> error                                 │
+ │                                                                    │
+ └──check()  ─────> up-to-date ───────────────────────────────────┘
+```
+
+`updater-controller.ts:38-64`：
+
+```typescript
+const check = () => {
+  if (!input.enabled) return Promise.resolve(state)
+  if (state.status === "ready") return Promise.resolve(state)  // 已就绪就不检查
+  if (pending) return pending  // 并发抑制
+
+  pending = (async () => {
+    transition({ status: "checking" })
+    const result = await input.backend.checkForUpdates()
+    const version = result?.updateInfo?.version
+    if (!result?.isUpdateAvailable || !version || version === input.currentVersion) {
+      await input.persistence.clear()
+      return transition({ status: "up-to-date" })
+    }
+    transition({ status: "downloading", version })
+    await input.backend.downloadUpdate()
+    await input.persistence.set({ version })
+    return transition({ status: "ready", version })
+  })()
+    .catch((error) =>
+      transition({ status: "error", message: error instanceof Error ? error.message : String(error) }),
+    )
+    .finally(() => {
+      pending = undefined
+    })
+  return pending
+}
+```
+
+**关键设计**：
+
+1. **三段式状态保护**：`!enabled` / `=== "ready"` / `pending` —— 避免无谓请求
+2. **持久化** —— 用 electron-store 保存 `{ version }`，下次启动 `start()` 时校验是否与当前版本匹配
+3. **`transition()` 返回新 state** —— 让 chain 可以传递
+
+`updater-controller.ts:73-93`：
+
+```typescript
+async start() {
+  const ready = await input.persistence.get()
+  if (ready?.version === input.currentVersion) await input.persistence.clear()  // 当前版本已就绪则清掉
+  return check()
+},
+async install() {
+  if (state.status !== "ready") throw new Error("Update is not ready to install")
+  const version = state.version
+  transition({ status: "installing", version })
+  await input
+    .stop()  // 先停 sidecar
+    .then(() => {
+      input.backend.quitAndInstall()  // 再装
+      transition({ status: "ready", version })  // 装完回到 ready（理论上进程已死）
+    })
+    .catch((error) => {
+      transition({ status: "ready", version })
+      throw error
+    })
+},
+```
+
+**`install()` 的 4 步**：
+
+1. **校验 ready** —— 否则抛错
+2. **transition to installing** —— UI 显示「正在安装」
+3. **`input.stop()`** —— **优雅停止 sidecar**（这是关键，**避免装到一半 sidecar 还在写文件**）
+4. **`quitAndInstall()`** —— Electron 内部清理 windows + 替换二进制
+
+### 5.3 AutoUpdater 配置
+
+`packages/desktop/src/main/updater.ts:13-26`：
+
+```typescript
+export function setupAutoUpdater(stop: () => Promise<void>) {
+  autoUpdater.logger = logger
+  autoUpdater.channel = "latest"
+  autoUpdater.allowPrerelease = false      // 不自动装 beta
+  autoUpdater.allowDowngrade = true        // 允许回滚（重大 bug 时救命）
+  autoUpdater.autoDownload = false         // 不自动下载（用户确认）
+  autoUpdater.autoInstallOnAppQuit = false // 不自动装
+  // ...
+}
+```
+
+**默认 4 个 false**：
+
+- `allowPrerelease = false`：beta 用户也不会自动装到 latest
+- `autoDownload = false`：**必须用户点「立即更新」才下载**
+- `autoInstallOnAppQuit = false`：**退出时不自动装**（避免下班前自动装被同事遇到新 bug）
+
+`allowDowngrade = true` —— **关键**：当新版有严重 bug 时，用户可以手动装旧版。
+
+### 5.4 定时检查更新
+
+`packages/desktop/src/main/index.ts:316-318`：
+
+```typescript
+const updateTimer = setInterval(() => void updater.check(), 10 * 60 * 1000)  // 10 分钟一次
+updateTimer.unref()  // 不阻塞进程退出
+app.once("will-quit", () => clearInterval(updateTimer))
+```
+
+**10 分钟一次 + `unref()`** —— 不阻塞退出（与 Node.js 进程退出语义一致）。
+
+### 5.5 Electron-builder 配置
+
+`packages/desktop/electron-builder.config.ts`：
+
+```typescript
+{
+  // 三 channel 都用同一份 config，只改 channel-specific 字段
+  mac: { target: "dmg", category: "public.app-category.developer-tools" },
+  win: { target: "nsis" },
+  linux: { target: ["AppImage", "deb"], category: "Development" },
+  publish: [
+    {
+      provider: "generic",
+      url: "https://releases.opencode.ai/desktop",  // 自托管 update server
+      channel: "latest",
+    },
+  ],
+}
+```
+
+### 5.6 CI Containers（详见第 7 节）
+
+`packages/containers/` 提供 GitHub Actions 用的预构建镜像（5 个 layer：base → bun-node → rust → tauri-linux → publish）。
+
+### 5.7 laew gap L59-L63（Release 相关）
+
+| Gap | 描述 | 借鉴方案 |
+|-----|------|----------|
+| **L59** | 无 CI | opencode 5 个 docker layer + GitHub Actions；laew 用 `cargo test` + GitHub Actions |
+| **L60** | 手动 release | opencode 用 electron-builder + autoUpdater；laew 缺 release 流程 |
+| **L61** | 无 Auto Update | 借鉴 5.1-5.4；Rust 用 `self_update` crate |
+| **L62** | 无签名 | macOS 用 codesign + notarize；Windows 用 signtool；laew 应配置签名 |
+| **L63** | 无分发 | opencode 自托管 `releases.opencode.ai`；laew 缺分发平台（crates.io / brew / scoop） |
+
+---
+
+## 6. WebSocket 与 SSE
+
+opencode 的实时通信体系有 **三套协议**：**SSE（事件流）/ WebSocket（OpenAI Responses）/ Effect Stream（内部 Effect 流水线）**。
+
+### 6.1 SSE 协议（核心事件流）
+
+`packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts`：
+
+```typescript
+function eventData(data: unknown): Sse.Event {
+  return { _tag: "Event", event: "message", id: undefined, data: JSON.stringify(data) }
+}
+
+export const eventHandlers = HttpApiBuilder.group(EventApi, "event", (handlers) =>
+  Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    return handlers.handleRaw(
+      "subscribe",
+      Effect.fn("EventHttpApi.subscribe")(function* () {
+        return yield* eventResponse(events)
+      }),
+    )
+  }),
+)
+
+function eventResponse(events: EventV2.Interface) {
+  return Effect.gen(function* () {
+    const instance = yield* InstanceState.context
+    const workspaceID = yield* InstanceState.workspaceID
+    // Listener registration is eager, so events published after this point cannot
+    // be lost while the HTTP body fiber is starting or emitting server.connected.
+    const queue = yield* Queue.unbounded<EventV2.Payload>()
+    const unsubscribe = yield* events.listen((event) => Effect.sync(() => Queue.offerUnsafe(queue, event)))
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const stream = Stream.fromQueue(queue).pipe(
+      Stream.filter(
+        (event) =>
+          event.location?.directory === instance.directory &&
+          (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID),
+      ),
+      Stream.map((event) => ({ id: event.id, type: event.type, properties: event.data })),
+    )
+    const disposed = Stream.callback<{ id: string; type: string; properties: unknown }>((queue) => {
+      const listener = (event) => {
+        if (event.directory !== instance.directory || event.payload.type !== "server.instance.disposed") return
+        Queue.offerUnsafe(queue, { id: event.payload.id ?? eventID(), type: "server.instance.disposed", properties: event.payload.properties ?? {} })
+      }
+      return Effect.acquireRelease(
+        Effect.sync(() => GlobalBus.on("event", listener)),
+        () => Effect.sync(() => GlobalBus.off("event", listener)),
+      )
+    })
+    const output = stream.pipe(
+      Stream.merge(disposed, { haltStrategy: "left" }),
+      Stream.takeUntil((event) => event.type === "server.instance.disposed"),
+    )
+    const heartbeat = Stream.tick("10 seconds").pipe(Stream.drop(1), Stream.map(() => ({ id: eventID(), type: "server.heartbeat", properties: {} })))
+    yield* Effect.logInfo("event connected")
+    return HttpServerResponse.stream(
+      Stream.make({ id: eventID(), type: "server.connected", properties: {} }).pipe(
+        Stream.concat(output.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
+        Stream.map(eventData),
+        Stream.pipeThroughChannel(Sse.encode()),
+        Stream.encodeText,
+        Stream.ensuring(Effect.logInfo("event disconnected")),
+      ),
+      {
+        contentType: "text/event-stream",
+        headers: {
+          "Cache-Control": "no-cache, no-transform",
+          "X-Accel-Buffering": "no",
+          "X-Content-Type-Options": "nosniff",
+        },
+      },
+    )
+  })
+}
+```
+
+**5 个核心 SSE 机制**：
+
+1. **Queue-based event delivery** —— `Queue.unbounded<EventV2.Payload>()` 是 Effect 的 MPSC 队列，**避免事件丢失**（Eager listener registration 是关键注释）
+2. **目录 + workspace 过滤** —— `Stream.filter(event.location?.directory === instance.directory ...)`
+3. **`Stream.takeUntil("server.instance.disposed")`** —— instance 销毁时自动断流
+4. **Heartbeat** —— `Stream.tick("10 seconds")` 每 10s 发一个 `server.heartbeat` 事件
+5. **`haltStrategy: "left"`** —— 当 left stream（业务流）halt 时立即停止 heartbeat
+
+**关键 HTTP headers**：
+- `Cache-Control: no-cache, no-transform`：禁止 CDN/代理修改
+- `X-Accel-Buffering: no`：Nginx 反代时不缓冲
+- `X-Content-Type-Options: nosniff`：防 MIME 嗅探
+
+`packages/server/src/handlers/event.ts` 是另一套 Event v2 SSE（为 TUI/Web 推送），15 秒心跳：
+
+```typescript
+const heartbeat = Stream.tick("15 seconds").pipe(Stream.map(() => ": heartbeat\n\n"))
+return HttpServerResponse.stream(
+  output.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }), Stream.encodeText),
+  {
+    contentType: "text/event-stream",
+    headers: { "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "X-Content-Type-Options": "nosniff" },
+  },
+)
+```
+
+**`: heartbeat\n\n` 是 SSE 注释行**，不算 event，**纯 keep-alive**。
+
+### 6.2 SSE 解析器（反向）
+
+`packages/opencode/src/control-plane/workspace.ts:203-251` 是 server-side SSE parser：
+
+```typescript
+const parseSSE = Effect.fn("Workspace.parseSSE")(function* (stream, onEvent) {
+  yield* stream.pipe(
+    Stream.decodeText(),
+    Stream.splitLines,
+    Stream.mapAccum(
+      () => ({ data: [] as string[], id: undefined as string | undefined, retry: 1000 }),
+      (state, line) => {
+        if (line === "") {
+          if (!state.data.length) return [state, []]
+          return [{ ...state, data: [] }, [{ data: state.data.join("\n"), id: state.id, retry: state.retry }]]
+        }
+        const index = line.indexOf(":")
+        const field = index === -1 ? line : line.slice(0, index)
+        const value = index === -1 ? "" : line.slice(index + (line[index + 1] === " " ? 2 : 1))
+        if (field === "data") return [{ ...state, data: [...state.data, value] }, []]
+        if (field === "id") return [{ ...state, id: value }, []]
+        if (field === "retry") {
+          const retry = Number.parseInt(value, 10)
+          return [Number.isNaN(retry) ? state : { ...state, retry }, []]
+        }
+        return [state, []]
+      },
+      {
+        onHalt: (state) =>
+          state.data.length ? [{ data: state.data.join("\n"), id: state.id, retry: state.retry }] : [],
+      },
+    ),
+    Stream.map((event) => {
+      try {
+        return JSON.parse(event.data) as unknown
+      } catch {
+        return { type: "sse.message", properties: { data: event.data, id: event.id || undefined, retry: event.retry } }
+      }
+    }),
+    Stream.runForEach(onEvent),
+  )
+})
+```
+
+**`Stream.mapAccum` 状态机**：处理 SSE 多行 `data:`（用 `\n` 拼接）、`id:`、`retry:` 三种字段，**符合 WHATWG SSE 规范**。
+
+### 6.3 OpenAI Responses WebSocket 协议
+
+`packages/opencode/src/plugin/openai/ws.ts` 是 **WebSocket 实现 + 协议握手**：
+
+```typescript
+export const PROTOCOL_HEADER = "responses_websockets=2026-02-06"
+export const MESSAGE_TOO_BIG_CLOSE_CODE = 1009
+
+export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOptions) {
+  return new Promise<WebSocket>((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(abortError(options.signal))
+      return
+    }
+    const headers: Record<string, string> = {
+      ...options.headers,
+      "openai-beta": options.headers["openai-beta"] ?? PROTOCOL_HEADER,
+    }
+    delete headers["content-length"]
+    // Bun does not apply HTTP(S)_PROXY to WebSockets unless the proxy is supplied explicitly.
+    const proxy =
+      typeof Bun === "undefined"
+        ? undefined
+        : ProxyEnv.getProxyForUrl(options.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:"))
+    const connect = { headers, ...(proxy ? { proxy } : {}) }
+    const socket = new WebSocket(options.url, connect)
+    const timeout = options.timeout
+      ? setTimeout(() => {
+          cleanup()
+          socket.on("error", () => {})
+          socket.terminate()
+          reject(new Error("WebSocket connect timed out"))
+        }, options.timeout)
+      : undefined
+    function cleanup() {
+      if (timeout) clearTimeout(timeout)
+      socket.off("open", onOpen)
+      socket.off("error", onError)
+      socket.off("close", onClose)
+      options.signal?.removeEventListener("abort", onAbort)
+    }
+    // ...
+  })
+}
+```
+
+**3 个关键点**：
+
+1. **`openai-beta: responses_websockets=2026-02-06`** —— 协议版本号，OpenAI 用 beta header 区分新旧协议
+2. **Bun 代理注入** —— `Bun does not apply HTTP(S)_PROXY to WebSockets unless the proxy is supplied explicitly`，**手动从 `ProxyEnv` 拿代理注入 connect options**
+3. **`MESSAGE_TOO_BIG_CLOSE_CODE = 1009`** —— 1009 是 RFC 6455 的 `Message Too Big`，**触发后 fallback 到 HTTP**
+
+### 6.4 WebSocket 连接池
+
+`packages/opencode/src/plugin/openai/ws-pool.ts` 是 session 级 WebSocket 池：
+
+```typescript
+const DEFAULT_CONNECT_TIMEOUT = 15_000       // 15s 连接超时
+const DEFAULT_IDLE_TIMEOUT = 5 * 60 * 1000   // 5min 空闲超时
+const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000  // 55min 最大连接时长（防 server 强制断）
+const streamRetries = options?.streamRetries ?? 5
+
+interface PoolEntry {
+  socket?: WebSocket
+  connectedAt?: number
+  lastUsedAt: number
+  busy: boolean
+  fallback: boolean       // 永久 fallback 到 HTTP
+  streamFailures: number
+}
+
+export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
+  const pool = new Map<string, PoolEntry>()  // sessionID → entry
+  const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
+  pruneTimer.unref()  // 不阻塞退出
+}
+```
+
+**Pool Key 规则**：
+
+```typescript
+const sessionID = internalHeaders["x-session-affinity"] ?? internalHeaders["session-id"]
+if (!sessionID) return httpFetch(input, httpInit)
+const key = `${sessionID}:conversation`
+```
+
+**每个 session 的 conversation = 1 个持久 WebSocket**，复用连接降握手开销。
+
+**Fallback 策略**：
+
+```typescript
+function recordStreamFailure(entry: PoolEntry) {
+  entry.streamFailures++
+  // Codex counts retries after the initial failed WebSocket attempt.
+  if (entry.streamFailures > streamRetries) entry.fallback = true
+}
+```
+
+**5 次流失败 → 永久 fallback HTTP**（与 Codex 一致）。
+
+### 6.6 流处理（WebSocket → SSE 转换）
+
+`ws-pool.ts:139-342` 把 OpenAI WebSocket 帧转换为 **SSE 格式的 ReadableStream**：
+
+```typescript
+export function streamResponsesWebSocket(options) {
+  const encoder = new TextEncoder()
+  let socket = options.socket
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+  let cleanupSocket = () => {}
+  let completed = false
+  let emitted = false
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+
+  async function onMessage(data: WebSocket.RawData, isBinary: boolean) {
+    if (completed) return
+    if (isBinary) {
+      invalidate(new ProviderError.ResponseStreamError("Unexpected binary WebSocket frame"))
+      return
+    }
+    const text = data.toString()
+    const event = (() => {
+      try {
+        const parsed = JSON.parse(text)
+        return typeof parsed === "object" && parsed !== null ? parsed : undefined
+      } catch { return undefined }
+    })()
+
+    // ... retryable terminal handling ...
+    // ... wrapped error handling ...
+    
+    if (!emitted) options.onFirstEvent?.()
+    controller?.enqueue(
+      encoder.encode(`${text.split(/\r?\n/).map((line) => `data: ${line}`).join("\n")}\n\n`),
+    )
+    emitted = true
+    resetIdleTimeout("idle timeout waiting for websocket")
+    // ...
+    if (event.type === "response.completed" || event.type === "response.done") {
+      completed = true
+      options.onComplete?.(event)
+      options.onTerminal?.(event)
+      closeCompleted()  // 发 data: [DONE]\n\n 然后 close
+    }
+  }
+  
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(next) {
+        controller = next
+        options.signal?.addEventListener("abort", onAbort, { once: true })
+        if (options.signal?.aborted) { onAbort(); return }
+        attach(socket)
+      },
+      cancel(reason) { onCancel(reason) },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )
+}
+```
+
+**关键转换**：
+
+- **WebSocket 文本帧 → `data: {frame}\n\n`**
+- **`response.completed`/`response.done` → `data: [DONE]\n\n` + close**（与 OpenAI SSE 一致）
+- **二进制帧** → **视为错误**（OpenAI Responses 协议禁止二进制帧）
+- **Idle timeout** —— 通过 `resetIdleTimeout` 在每条消息后 reset
+
+### 6.7 WebSocket Tracker
+
+`packages/opencode/src/server/routes/instance/httpapi/websocket-tracker.ts`：
+
+```typescript
+const layer = Layer.sync(Service)(() => {
+  const sockets = new Set<Close>()
+  let closing = false
+  return Service.of({
+    add: (close) =>
+      Effect.gen(function* () {
+        if (closing) return false
+        sockets.add(close)
+        return true
+      }),
+    remove: (close) => Effect.sync(() => { sockets.delete(close) }),
+    closeAll: Effect.gen(function* () {
+      closing = true
+      const active = Array.from(sockets)
+      sockets.clear()
+      yield* Effect.all(
+        active.map((close) => close.pipe(Effect.timeout("1 second"), Effect.catch(() => Effect.void))),
+        { concurrency: "unbounded", discard: true },
+      )
+    }),
+  })
+})
+```
+
+**作用**：跟踪所有 active WebSocket，**`closeAll` 在 server shutdown 时强制 1s 内关掉**。
+
+### 6.8 mDNS 广播
+
+`packages/opencode/src/server/mdns.ts`：
+
+```typescript
+import { Bonjour } from "bonjour-service"
+
+export function publish(port: number, domain?: string) {
+  if (currentPort === port) return
+  if (bonjour) unpublish()
+  try {
+    const host = domain ?? "opencode.local"
+    const name = `opencode-${port}`
+    bonjour = new Bonjour()
+    const service = bonjour.publish({ name, type: "http", host, port, txt: { path: "/" } })
+    service.on("error", () => {})
+    currentPort = port
+  } catch {
+    if (bonjour) { try { bonjour.destroy() } catch {} }
+    bonjour = undefined
+    currentPort = undefined
+  }
+}
+```
+
+**Bonjour/mDNS** —— 让局域网设备能通过 `opencode.local` 发现 opencode 实例（无需 IP）。**`service.on("error", () => {})`** 是关键：mDNS 错误是「正常异常」（如 Windows 没装 Bonjour），**吞掉不抛**。
+
+### 6.9 laew gap L64-L68（实时通信）
+
+| Gap | 描述 | 借鉴方案 |
+|-----|------|----------|
+| **L64** | 无 SSE 流式 | opencode EventV2 + Stream.fromQueue + 10s heartbeat；laew 用 `eventsource-client` crate |
+| **L65** | 无 WS 客户端 | opencode ws-pool + session affinity；laew 当前无 WS |
+| **L66** | 无心跳 | opencode `Stream.tick("10 seconds")` + `: heartbeat` SSE 注释；laew 需加 SSE keep-alive |
+| **L67** | 无重连退避 | opencode mDNS 监听 + instance-disposed 自动断；laew e2e 缺断线重连 |
+| **L68** | 无背压 | opencode `Queue.unbounded` + Effect Stream；laew TUI 当前是 unbounded，应加 bounded + 截断 |
+
+---
+
+## 7. DevContainer 与容器化
+
+opencode 的容器化体系在 `packages/containers/`，**5 层 Docker 镜像**专给 GitHub Actions 用（**不是产品 DevContainer**）。
+
+### 7.1 5 层 Docker 镜像
+
+```
+base (Ubuntu 24.04)
+  └ bun-node (base + Bun + Node.js 24)
+      ├ rust (bun-node + Rust stable)
+      │   └ tauri-linux (rust + Tauri deps)
+      └ publish (bun-node + docker.io + pacman)
+```
+
+**每层 Dockerfile**：
+
+`base/Dockerfile`：
+
+```dockerfile
+ARG REGISTRY=ghcr.io/anomalyco
+FROM ${REGISTRY}/build/bun-node:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+  && apt-get install -y --no-install-install-recommends \
+    docker.io \
+    pacman-package-manager \
+  && rm -rf /var/lib/apt/lists/*
+```
+
+`bun-node/Dockerfile`：
+
+```dockerfile
+FROM ubuntu:24.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates curl git jq openssh-client \
+    pkg-config python3 unzip xz-utils zip \
+  && rm -rf /var/lib/apt/lists/*
+```
+
+`rust/Dockerfile`：
+
+```dockerfile
+ARG REGISTRY=ghcr.io/anomalyco
+FROM ${REGISTRY}/build/bun-node:24.04
+ARG RUST_TOOLCHAIN=stable
+ENV CARGO_HOME=/opt/cargo
+ENV RUSTUP_HOME=/opt/rustup
+RUN set -euo pipefail; \
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"; \
+  rustc --version; cargo --version
+```
+
+`tauri-linux/Dockerfile`：
+
+```dockerfile
+ARG REGISTRY=ghcr.io/anomalyco
+FROM ${REGISTRY}/build/rust:24.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    libappindicator3-dev \
+    libwebkit2gtk-4.1-dev \
+    librsvg2-dev \
+    patchelf \
+  && rm -rf /var/lib/apt/lists/*
+```
+
+### 7.2 Build Script（Bun 多平台）
+
+`packages/containers/script/build.ts`：
+
+```typescript
+const reg = process.env.REGISTRY ?? "ghcr.io/anomalyco"
+const tag = process.env.TAG ?? "24.04"
+const push = process.argv.includes("--push") || process.env.PUSH === "1"
+
+const root = path.join(rootDir, "package.json")
+const pkg = await Bun.file(root).json()
+const manager = pkg.packageManager ?? ""
+const bun = manager.startsWith("bun@") ? manager.slice(4) : ""
+if (!bun) throw new Error("packageManager must be bun@<version>")
+
+const images = ["base", "bun-node", "rust", "tauri-linux", "publish"]
+
+const setup = async () => {
+  if (!push) return
+  const list = await $`docker buildx ls`.text()
+  if (list.includes("opencode")) {
+    await $`docker buildx use opencode`
+    return
+  }
+  await $`docker buildx create --name opencode --use`
+}
+
+await setup()
+const platform = "linux/amd64,linux/arm64"
+```
+
+**关键设计**：
+
+1. **`bun` 版本自动从 `package.json` 读取** —— 不硬编码
+2. **`buildx create --name opencode`** —— 复用 buildx instance
+3. **`linux/amd64,linux/arm64`** —— 双架构
+4. **`--push` 自动多架构推 registry**
+
+### 7.3 GitHub Actions 用法
+
+```yaml
+jobs:
+  build-cli:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/anomalyco/build/bun-node:24.04
+```
+
+**优势**：CI 不用每次重新下载 Bun + Node + 工具链，**缓存命中率高**。
+
+### 7.4 Sidecar as DevContainer？
+
+opencode 的 sidecar 实际上**可以被视为一种 DevContainer 模式**：
+- 独立 utility process
+- 自带 XDG_STATE_HOME / userData 隔离
+- 通过 HTTP + auth 头通信
+
+**但缺少真正的 DevContainer support**：opencode 没有 `.devcontainer/devcontainer.json`，**用户在自己 devcontainer 中跑 opencode TUI 与直接跑无差异**。
+
+### 7.5 laew gap L69-L73（容器化）
+
+| Gap | 描述 | 借鉴方案 |
+|-----|------|----------|
+| **L69** | 无 Dockerfile | opencode 5 layer 模式；laew 应用 `Rust 1.x + cargo` 两层 |
+| **L70** | 无 docker-compose | laew 可加 `docker-compose.yml` 用于完整 dev 栈 |
+| **L71** | 无 Dev Container | laew 加 `.devcontainer/devcontainer.json`（Rust + Redis + Node） |
+| **L72** | 无 digest 钉 | opencode 用 `ARG REGISTRY=ghcr.io/anomalyco`；laew 应钉 image digest |
+| **L73** | 无远程编排 | opencode enterprise 是云端 SolidStart；laew 当前无 remote orchestrator |
+
+---
+
+## 8. CRDT 与多端冲突
+
+opencode 的多端同步**不是真正的 CRDT**，而是 **server-side Durable Object 存储 + 历史快照 + replay/steal 协议**。本节剖析 enterprise + sync 体系。
+
+### 8.1 Enterprise Storage（双后端）
+
+`packages/enterprise/src/core/storage.ts:1-65`：
+
+```typescript
+import { AwsClient } from "aws4fetch"
+
+export namespace Storage {
+  export interface Adapter {
+    read(path: string): Promise<string | undefined>
+    write(path: string, value: string): Promise<void>
+    remove(path: string): Promise<void>
+    list(options?: { prefix?: string; limit?: number; after?: string; before?: string }): Promise<string[]>
+  }
+
+  function createAdapter(client: AwsClient, endpoint: string, bucket: string): Adapter {
+    const base = `${endpoint}/${bucket}`
+    return {
+      async read(path: string): Promise<string | undefined> {
+        const response = await client.fetch(`${base}/${path}`)
+        if (response.status === 404) return undefined
+        if (!response.ok) throw new Error(`Failed to read ${path}: ${response.status}`)
+        return response.text()
+      },
+      // ... write / remove / list ...
+      async list(options?: { prefix?: string; limit?: number; after?: string; before?: string }): Promise<string[]> {
+        const prefix = options?.prefix || ""
+        const params = new URLSearchParams({ "list-type": "2", prefix })
+        if (options?.limit) params.set("max-keys", options.limit.toString())
+        if (options?.after) {
+          const afterPath = prefix + options.after + ".json"
+          params.set("start-after", afterPath)
+        }
+        const response = await client.fetch(`${base}?${params}`)
+        // ... parse XML ...
+      },
+    }
+  }
+
+  function s3(): Adapter {
+    const bucket = process.env.OPENCODE_STORAGE_BUCKET!
+    const region = process.env.OPENCODE_STORAGE_REGION || "us-east-1"
+    const client = new AwsClient({
+      region,
+      accessKeyId: process.env.OPENCODE_STORAGE_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.OPENCODE_STORAGE_SECRET_ACCESS_KEY!,
+    })
+    return createAdapter(client, `https://s3.${region}.amazonaws.com`, bucket)
+  }
+
+  function r2() {
+    const accountId = process.env.OPENCODE_STORAGE_ACCOUNT_ID!
+    const client = new AwsClient({
+      accessKeyId: process.env.OPENCODE_STORAGE_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.OPENCODE_STORAGE_SECRET_ACCESS_KEY!,
+    })
+    return createAdapter(client, `https://${accountId}.r2.cloudflarestorage.com`, process.env.OPENCODE_STORAGE_BUCKET!)
+  }
+
+  const adapter = lazy(() => {
+    const type = process.env.OPENCODE_STORAGE_ADAPTER
+    if (type === "r2") return r2()
+    if (type === "s3") return s3()
+    throw new Error("No storage adapter configured")
+  })
+
+  function resolve(key: string[]) {
+    return key.join("/") + ".json"
+  }
+
+  export async function read<T>(key: string[]) {
+    const result = await adapter().read(resolve(key))
+    if (!result) return undefined
+    return JSON.parse(result) as T
+  }
+
+  export function write<T>(key: string[], value: T) {
+    return adapter().write(resolve(key), JSON.stringify(value))
+  }
+
+  // ...
+}
+```
+
+**关键设计**：
+
+1. **`Adapter` 抽象接口** —— 4 个方法：read/write/remove/list
+2. **AWS Signature V4** —— `AwsClient` 客户端支持 S3 + R2（Cloudflare）
+3. **双后端**：S3 (AWS) / R2 (Cloudflare)，通过 `OPENCODE_STORAGE_ADAPTER` 切换
+4. **`KEYS` 是数组** —— `["share_snapshot", shareID]` → `share_snapshot/{shareID}.json`
+5. **Lazy 加载** —— `lazy(() => ...)` 直到首次使用时才校验 env
+6. **`aws4fetch`** —— Cloudflare Workers 兼容的 AWS SigV4 客户端
+
+### 8.2 Share 数据迁移（lazy migrate）
+
+`packages/enterprise/src/core/share.ts:78-115`：
+
+```typescript
+async function legacy(shareID: string) {
+  const compaction: Compaction = (await Storage.read<Compaction>(["share_compaction", shareID])) ?? {
+    data: [],
+    event: undefined,
+  }
+  const list = await Storage.list({
+    prefix: ["share_event", shareID],
+    before: compaction.event,
+  }).then((x) => x.toReversed())
+  if (list.length === 0) {
+    if (compaction.data.length > 0) await writeSnapshot(shareID, compaction.data)
+    return compaction.data
+  }
+  const next = merge(
+    compaction.data,
+    await Promise.all(list.map(async (event) => await Storage.read<Data[]>(event))).then((x) =>
+      x.flatMap((item) => item ?? []),
+    ),
+  )
+  await Promise.all([
+    Storage.write(["share_compaction", shareID], {
+      event: list.at(-1)?.at(-1),
+      data: next,
+    }),
+    writeSnapshot(shareID, next),
+  ])
+  return next
+}
+
+export const sync = fn(
+  z.object({
+    share: Info.pick({ id: true, secret: true }),
+    data: Data.array(),
+  }),
+  async (input) => {
+    const share = await get(input.share.id)
+    if (!share) throw new Errors.NotFound(input.share.id)
+    if (share.secret !== input.share.secret) throw new Errors.InvalidSecret(input.share.id)
+    const data = (await readSnapshot(input.share.id)) ?? (await legacy(input.share.id))
+    await writeSnapshot(input.share.id, merge(data, input.data))
+  },
+)
+```
+
+**3 个存储层**：
+
+1. **`share_snapshot/{id}`** —— 当前快照（**永远是最新合并结果**）
+2. **`share_compaction/{id}`** —— compaction 进度（含 `event: string` 游标 + 已合并 data）
+3. **`share_event/{id}/{seq}`** —— 单条增量事件（**event sourcing**）
+
+**Lazy migrate 流程**：
+
+- 优先 `readSnapshot`（快照）
+- 失败则 `legacy()`：读 compaction + 增量 events，合并后写新 snapshot
+- **`(await readSnapshot) ?? (await legacy)`** —— **客户端无感迁移**
+
+### 8.3 Sync 协议（steal / replay / history）
+
+`packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts`：
+
+```typescript
+const start = Effect.fn("SyncHttpApi.start")(function* () {
+  yield* workspace
+    .startWorkspaceSyncing((yield* InstanceState.context).project.id)
+    .pipe(Effect.ignore, Effect.forkIn(scope))
+  return true
+})
+
+const replay = Effect.fn("SyncHttpApi.replay")(function* (ctx: { payload: typeof ReplayPayload.Type }) {
+  const payload: EventV2.SerializedEvent[] = ctx.payload.events.map((event) => ({
+    id: event.id, aggregateID: event.aggregateID, seq: event.seq, type: event.type, data: { ...event.data },
+  }))
+  const source = payload[0].aggregateID
+  yield* Effect.logInfo("sync replay requested", {
+    sessionID: source, events: payload.length, first: payload[0]?.seq, last: payload.at(-1)?.seq, directory: ctx.payload.directory,
+  })
+  const ownerID = yield* InstanceState.workspaceID
+  yield* events.replayAll(payload, { ownerID, strictOwner: true })
+  yield* Effect.logInfo("sync replay complete", {
+    sessionID: source, events: payload.length, first: payload[0]?.seq, last: payload.at(-1)?.seq,
+  })
+  return { sessionID: source }
+})
+
+const steal = Effect.fn("SyncHttpApi.steal")(function* (ctx: { payload: typeof SessionPayload.Type }) {
+  const workspaceID = yield* InstanceState.workspaceID
+  if (!workspaceID) return yield* new HttpApiError.BadRequest({})
+  yield* session.setWorkspace({ sessionID: ctx.payload.sessionID, workspaceID })
+  yield* Effect.logInfo("sync session stolen", { sessionID: ctx.payload.sessionID, workspaceID })
+  return { sessionID: ctx.payload.sessionID }
+})
+
+const history = Effect.fn("SyncHttpApi.history")(function* (ctx: { payload: typeof HistoryPayload.Type }) {
+  const exclude = Object.entries(ctx.payload)
+  return yield* db
+    .select()
+    .from(EventTable)
+    .where(
+      exclude.length > 0
+        ? not(or(...exclude.map(([id, seq]) => and(eq(EventTable.aggregate_id, id), lte(EventTable.seq, seq))))!)
+        : undefined,
+    )
+    .orderBy(asc(EventTable.seq))
+    .all()
+    .pipe(Effect.orDie)
+})
+```
+
+**4 个 sync 命令**：
+
+1. **`start`** —— 启动 workspace 同步（forked fiber，不阻塞响应）
+2. **`replay`** —— 服务端 replay 一批事件（用于**多端最终一致**）
+3. **`steal`** —— 把 session 迁移到当前 workspace（**多端切换场景**）
+4. **`history`** —— 拉取**比指定 `[aggregateID, seq]` 旧的所有事件**（增量同步）
+
+**关键 SQL `history`**：
+
+```sql
+SELECT * FROM event_table
+WHERE NOT (
+  aggregate_id = $1 AND seq <= $2
+  OR aggregate_id = $3 AND seq <= $4
+  ...
+)
+ORDER BY seq ASC
+```
+
+**「不包含已经处理过的事件」** —— 标准增量同步。
+
+### 8.4 EventV2 Durable Seq
+
+`packages/opencode/src/sync/schema.ts`：
+
+```typescript
+import { Schema } from "effect"
+import { Identifier } from "@/id/id"
+import { statics } from "@opencode-ai/core/schema"
+
+export const EventID = Schema.String.check(Schema.isStartsWith("evt")).pipe(
+  Schema.brand("EventID"),
+  statics((s) => ({
+    ascending: (id?: string) => s.make(Identifier.ascending("event", id)),
+  })),
+)
+```
+
+**`Identifier.ascending("event", id)`** —— 生成**全局单调递增**事件 ID（前缀 `evt` + 时间戳 + 计数器）。**`ascending` 是为多端 merge 而设计**：客户端按 ascending 排序即可保证因果一致。
+
+### 8.5 EventV2 Bridge（事件路由）
+
+`packages/opencode/src/event-v2-bridge.ts`：
+
+```typescript
+const publish: EventV2.Interface["publish"] = (definition, data, options) =>
+  Effect.gen(function* () {
+    if (options?.location) return yield* events.publish(definition, data, options)
+    const ctx = yield* InstanceRef
+    if (!ctx) return yield* events.publish(definition, data, options)
+    const workspaceID = yield* WorkspaceRef
+    return yield* events.publish(definition, data, {
+      ...options,
+      location: new Location.Info({
+        directory: AbsolutePath.make(ctx.directory),
+        ...(workspaceID ? { workspaceID } : {}),
+        project: { id: Project.ID.make(ctx.project.id), directory: AbsolutePath.make(ctx.worktree) },
+      }),
+    })
+  })
+
+const unsubscribe = yield* events.listen((event) =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceRef
+    const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
+    GlobalBus.emit("event", {
+      directory: event.location?.directory ?? ctx?.directory,
+      project: ctx?.project.id,
+      workspace: workspaceID,
+      payload: { id: event.id, type: event.type, properties: event.data },
+    })
+    if (event.durable === undefined) return
+    GlobalBus.emit("event", {
+      directory: event.location?.directory ?? ctx?.directory,
+      project: ctx?.project.id,
+      workspace: workspaceID,
+      payload: {
+        type: "sync",
+        syncEvent: {
+          id: event.id,
+          type: EventV2.versionedType(event.type, event.durable.version),
+          seq: event.durable.seq,
+          aggregateID: event.durable.aggregateID,
+          data: event.data,
+        },
+      },
+    })
+  }),
+)
+```
+
+**2 路 GlobalBus.emit**：
+
+1. **`payload: { id, type, properties }`** —— **本地路由**（renderer / TUI 订阅）
+2. **`payload: { type: "sync", syncEvent }`** —— **sync 协议**（带 version + seq，多端 replay）
+
+### 8.6 Workspace SSE 路由
+
+`packages/opencode/src/control-plane/workspace.ts:184-201`：
+
+```typescript
+const connectSSE = Effect.fn("Workspace.connectSSE")(function* (
+  url: URL | string,
+  headers: HeadersInit | undefined,
+) {
+  const response = yield* http.execute(
+    HttpClientRequest.get(route(url, "/global/event"), {
+      headers: new Headers(headers),
+      accept: "text/event-stream",
+    }),
+  )
+  if (response.status < 200 || response.status >= 300) {
+    return yield* new SyncHttpError({
+      message: `Workspace sync HTTP failure: ${response.status}`,
+      status: response.status,
+    })
+  }
+  return response.stream
+})
+```
+
+**Workspace 端通过 SSE 长连接到 cloud workspace**（`/global/event`），接收 sync 事件。
+
+### 8.7 Share ShareID 算法
+
+`packages/enterprise/src/core/share.ts:117-128`：
+
+```typescript
+export const create = fn(z.object({ sessionID: z.string() }), async (body) => {
+  const isTest = process.env.NODE_ENV === "test" || body.sessionID.startsWith("test_")
+  const info: Info = {
+    id: (isTest ? "test_" : "") + body.sessionID.slice(-8),  // sessionID 取后 8 位
+    sessionID: body.sessionID,
+    secret: crypto.randomUUID(),
+  }
+  const exists = await get(info.id)
+  if (exists) throw new Errors.AlreadyExists(info.id)
+  await Promise.all([Storage.write(["share", info.id], info), writeSnapshot(info.id, [])])
+  return info
+})
+```
+
+**`shareID = sessionID.slice(-8)`** —— 用户友好的短 ID（8 字符），**与 sessionID 末尾 8 位一致**。secret 是 UUID，用于删除鉴权。
+
+### 8.8 laew gap L74-L78（CRDT/同步）
+
+| Gap | 描述 | 借鉴方案 |
+|-----|------|----------|
+| **L74** | 无 Session 共享 | opencode `share.create` + `Storage.read/write`；laew 当前 SQLite 单机 |
+| **L75** | SQLite WAL 多端 | opencode Storage 是 S3/R2 object storage；laew SQLite + WAL 是单进程，**多端需 Cloudflare Durable Object** |
+| **L76** | 无冲突解决 | opencode `merge(...items)` + Identifier.ascending；laew 需 `yrs`（Yjs Rust port） |
+| **L77** | 无 Event Sourcing | opencode EventV2 + replay；laew 当前 SQLite 单条 row |
+| **L78** | 无协同编辑 | opencode share.steal + workspace sync；laew 需 WebSocket + CRDT library |
+
+---
+
+## 附录：laew gap 清单 L38-L78
+
+### CrashDump (L38-L42)
+
+| ID | Gap | 优先级 | 工作量 |
+|----|-----|--------|--------|
+| L38 | 无 panic hook | P0 | 1d |
+| L39 | 无指数退避 | P0 | 0.5d |
+| L40 | 无熔断器 | P1 | 2d |
+| L41 | 无错误分类 | P1 | 3d |
+| L42 | 错误 UX 差 | P2 | 1w |
+
+### WebUI/DesktopApp (L44-L48)
+
+| ID | Gap | 优先级 | 工作量 |
+|----|-----|--------|--------|
+| L44 | 无 web 远控 | P1 | 1w |
+| L45 | 无 desktop 壳 | P1 | 2w |
+| L46 | 无 WASM | P2 | 2w |
+| L47 | 无多端 Session | P1 | 1w |
+| L48 | 测试栈薄 | P2 | 1w |
+
+### OAuth (L49-L52)
+
+| ID | Gap | 优先级 | 工作量 |
+|----|-----|--------|--------|
+| L49 | API Key 明文 | P0 | 1d |
+| L50 | 无 OAuth 流程 | P1 | 1w |
+| L51 | 脱敏范围不足 | P0 | 0.5d |
+| L52 | 无多账号轮换 | P1 | 1w |
+
+### i18n (L54-L58)
+
+| ID | Gap | 优先级 | 工作量 |
+|----|-----|--------|--------|
+| L54 | TUI 中文化硬编码 | P0 | 1w |
+| L55 | 文档无双语 | P1 | 3d |
+| L56 | 错误无 i18n | P1 | 1w |
+| L57 | 无 RTL | P2 | 1w |
+| L58 | 无翻译 pipeline | P2 | 1w |
+
+### Release (L59-L63)
+
+| ID | Gap | 优先级 | 工作量 |
+|----|-----|--------|--------|
+| L59 | 无 CI | P0 | 3d |
+| L60 | 手动 release | P0 | 1d |
+| L61 | 无 Auto Update | P2 | 1w |
+| L62 | 无签名 | P1 | 3d |
+| L63 | 无分发 | P2 | 1w |
+
+### WebSocket/SSE (L64-L68)
+
+| ID | Gap | 优先级 | 工作量 |
+|----|-----|--------|--------|
+| L64 | 无 SSE 流式 | P0 | 1w |
+| L65 | 无 WS 客户端 | P2 | 1w |
+| L66 | 无心跳 | P0 | 0.5d |
+| L67 | 无重连退避 | P1 | 1w |
+| L68 | 无背压 | P1 | 3d |
+
+### DevContainer (L69-L73)
+
+| ID | Gap | 优先级 | 工作量 |
+|----|-----|--------|--------|
+| L69 | 无 Dockerfile | P0 | 1d |
+| L70 | 无 docker-compose | P1 | 3d |
+| L71 | 无 Dev Container | P1 | 1d |
+| L72 | 无 digest 钉 | P2 | 1d |
+| L73 | 无远程编排 | P2 | 1w |
+
+### CRDT (L74-L78)
+
+| ID | Gap | 优先级 | 工作量 |
+|----|-----|--------|--------|
+| L74 | 无 Session 共享 | P1 | 1w |
+| L75 | SQLite WAL 多端 | P1 | 1w |
+| L76 | 无冲突解决 | P2 | 2w |
+| L77 | 无 Event Sourcing | P2 | 1w |
+| L78 | 无协同编辑 | P2 | 2w |
+
+### 总结
+
+**P0（紧急，1 周内）**：L38/L39/L49/L51/L54/L59/L60/L64/L66/L69 —— **10 项**
+
+**P1（重要，2-4 周内）**：L40/L41/L44/L45/L47/L50/L52/L55/L56/L62/L67/L68/L70/L71/L74/L75 —— **16 项**
+
+**P2（进阶，1-3 月）**：L42/L46/L48/L57/L58/L61/L63/L65/L72/L73/L76/L77/L78 —— **13 项**
+
+**总计**：**41 个 gap**，是 laew 从「能跑」升级到「生产级 Agent CLI」的核心改造清单。
+
+### 关键借鉴文件路径
+
+```
+/usr/local/LsmGitOpenSource/opencode/packages/
+├── desktop/src/main/
+│   ├── index.ts                    # Electron 主进程 Effect.gen
+│   ├── logging.ts                  # CrashReporter + NetLog + 日志清理
+│   ├── updater.ts                  # AutoUpdater 8 态机
+│   ├── updater-controller.ts       # 状态机实现
+│   ├── server.ts                   # sidecar spawn + health check
+│   ├── sidecar.ts                  # sidecar 进程入口
+│   ├── unresponsive.ts             # renderer unresponsive 采样
+│   ├── migrate.ts                  # Tauri → Electron 迁移
+│   └── wsl/servers.ts              # WSL 多 distro 管理
+├── app/src/
+│   ├── context/language.tsx        # 业务组件 i18n (60+ locales)
+│   ├── i18n/desktop-native.ts      # Native bundle 协议
+│   └── updater.ts                  # UpdaterState 类型
+├── opencode/src/
+│   ├── auth/index.ts               # OAuth/Api/WellKnown 三元组
+│   ├── server/
+│   │   ├── server.ts               # Hono server 启动
+│   │   ├── mdns.ts                 # Bonjour/mDNS 广播
+│   │   └── routes/instance/httpapi/
+│   │       ├── handlers/event.ts   # SSE 事件流
+│   │       └── handlers/sync.ts    # replay/steal/history
+│   ├── control-plane/workspace.ts  # Workspace sync + SSE parser
+│   ├── event-v2-bridge.ts          # 2 路 GlobalBus 路由
+│   ├── event-manifest.ts           # 事件 schema 注册
+│   └── sync/schema.ts              # EventID ascending
+├── plugin/openai/
+│   ├── ws.ts                       # OpenAI Responses WebSocket 协议
+│   └── ws-pool.ts                  # session affinity 池
+├── enterprise/src/
+│   ├── core/storage.ts             # S3/R2 双后端
+│   └── core/share.ts               # 3 层存储 + lazy migrate
+├── containers/
+│   ├── base/Dockerfile             # Ubuntu 24.04
+│   ├── bun-node/Dockerfile         # + Bun + Node 24
+│   ├── rust/Dockerfile             # + Rust
+│   ├── tauri-linux/Dockerfile      # + Tauri deps
+│   ├── publish/Dockerfile          # + docker.io + pacman
+│   └── script/build.ts             # 多架构 build/push
+└── web/
+    ├── astro.config.mjs            # Starlight 20 locales
+    └── src/middleware.ts           # locale cookie + Accept-Language
+```
+
+---
+
+**第十轮深挖结束。**

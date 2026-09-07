@@ -301,3 +301,15 @@ SCREEN=$(tmux capture-pane -p -t laew_e2e)
 - 新 Agent 类型：实现 `AgentProfile`（独立名称/系统提示词/工具集），在 `YoloRunner` 或相应编排器中接入。
 - 测试报告输出到 `testReport/`（命名 `e2e-<时间戳>.txt` / `验证报告-<日期>.md`）；临时计划放 `tmpPlan/`（已 gitignore）。
 - `laew`、`*.db`、`tmpPlan/`、`target/` 均不入库（见 .gitignore）。
+
+## 知识库索引（docs/Agent源码调研/）
+
+调研了 **15 个外部 Agent 工程**（atomcode、claudecode、deepseek-harness、openclaw、opencode、pi、undici、agent-core、agent-studio、cc-switch、hermes-agent、jiuwenswarm、semantica、Switchyard、TencentDB-Agent-Memory），共 **~82,000 行** 深度分析（15 份综合文档 + 32 份横向专题）。
+
+**当前最新：第十轮深挖**（2026-09-07，~26,940 行 / ~1 MB）—— 15 主文档全部追加，覆盖 8 大新维度：
+- CrashDump 与错误恢复 / WebUI 与 DesktopApp / OAuth 认证与多账号 / i18n 国际化
+- Release 工程化与 AutoUpdate / WebSocket 与 SSE / DevContainer 与容器化 / CRDT 与多端冲突
+
+**累计 142 个 laew gap**（L1-L142），按 P0/P1/P2 优先级排序，每条附 Rust crate 建议。
+
+详细索引见 `docs/Agent源码调研/专题/专题-第十轮深挖合集.md`。

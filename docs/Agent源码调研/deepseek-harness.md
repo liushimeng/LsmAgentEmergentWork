@@ -3575,3 +3575,1898 @@ P1-1（SDK 互操作层）应排最前：它同时解锁 (a) laew 可被 Python/
 4. **Native 模块**：298 行 C11 的 Landlock 启动器（本地 UAPI / ABI 协商 / fail-closed / 功能 probe）+ entry/平台包分发矩阵（prebuilds.json 驱动、无 install 回退、npm/pnpm pack 分裂）
 
 对 laew 的第一优先级借鉴是 **P1-1 SDK 协议层**：它把 laew 从「单体 CLI」升级为「可被编排的 Agent 运行时」，且 Python 参考实现（client.py 590 行 + api.py 249 行）给出了可直接翻译的协议样板。第二优先级是 **P1-3 录制-回放 e2e**：laew 的 SQLite 事件存储已经是事实上的 session.jsonl，只差一个「回放 Adapter + 期望比对器」就能从 mock 管道测试升级为行为回归评估。
+# deepseek-harness 第十轮深挖：8 个新维度
+
+> 调研时间：2026-09-07
+> 源码根目录：`/usr/local/LsmGitOpenSource/deepseek-harness`
+> 前置知识库：`/usr/local/LsmGitOpenSource/LsmAgentEmergentWork/docs/Agent源码调研/deepseek-harness.md`（第九轮 3,577 行）
+> 本轮关注 **8 个前 9 轮未深入维度**，每维度 200-400 行，含真实代码、关键路径、laew gap 推断
+
+---
+
+## 第十轮章节地图
+
+| # | 维度 | 主要源码路径 | 核心抽象 | 行数 |
+|---|------|-------------|---------|------|
+| 1 | CrashDump 与错误恢复 | `packages/runtime-diagnostics/invariants/`、`packages/guard/` | InvariantRegistry / TimeoutPolicy / RepeatToolReminder | ~450 行 |
+| 2 | WebUI 与 DesktopApp | `apps/web/`、`packages/web/`、`packages/api/{gateway,session-controller,workspace-controller}` | Vite 单页 + Worker runtime + Typert WebSocket Mux | ~520 行 |
+| 3 | OAuth 认证与多账号 | `packages/credentials/` (3 包) | CredentialProvider / AuthorizationService / credentials-local | ~500 行 |
+| 4 | i18n 国际化 | `scripts/translation-*.ts`、`docs/i18n/*.md`、`*.i18n.yaml` | prompt-v4 三段式 + 配对元数据 + git merge 驱动 | ~420 行 |
+| 5 | Release 工程化与 AutoUpdate | `scripts/release/*.ts`、`scripts/build-exe-for-python-sdk.ts` | ReleaseFamily / bump / publish / verify-packed-install | ~430 行 |
+| 6 | WebSocket 与 SSE | `packages/api/gateway/src/{stream-protocol,stream-server}.ts`、`packages/webhook/` | WebSocket Mux / RemoteEvent 投递 / GitHub Adapter | ~480 行 |
+| 7 | DevContainer 与容器化 | `packages/e2b/{e2b,fs-e2b,subprocess-e2b}/` | E2BRuntime / fs-e2b / subprocess-e2b / terminal.ts | ~410 行 |
+| 8 | CRDT 与多端冲突 | `packages/workspace/workspace/`、`packages/api/workspace-controller/` | WorkspaceEntity mutate / workspaceController Remote 命名空间 | ~380 行 |
+
+合计 ~3,590 行。每节结构：**问题 → 真实代码 → 抽象机制 → 与前 9 轮关系 → laew gap**。
+
+---
+
+## 维度 1：CrashDump 与错误恢复（runtime-diagnostics / guard）
+
+### 1.1 现状：为什么"运行时错误恢复"是分散关注点
+
+deepseek-harness 没有传统意义上的"panic 捕获 → dump 到磁盘 → 上报"链路；它把 **可恢复性**、**不变式断言**、**执行守护** 拆到 3 个独立 package，原因是：**它的运行模型不是单一进程单一日志**，而是 Cordis 插件总线（30+ 包通过 Fiber 编排），错误需要在「插件维度」「跨进程维度」「用户对话维度」三类上下文分别收敛。
+
+调研样本：
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `packages/runtime-diagnostics/invariants/src/index.ts` | 200 | InvariantRegistry：包级不变式注册器 |
+| `packages/runtime-diagnostics/invariants/src/invariant.ts` | 30 | 自指 companion：no-op installer |
+| `packages/guard/timeout-policy/src/index.ts` | 81 | 工具超时强制限速 |
+| `packages/guard/repeat-tool-reminder/src/index.ts` | 233 | 重复工具调用软提醒 |
+| `packages/guard/repeat-tool-reminder/src/invariant.ts` | 30 | 注册自身 |
+
+### 1.2 InvariantRegistry：包级"契约维护者"
+
+完整代码（`packages/runtime-diagnostics/invariants/src/index.ts`）：
+
+```ts
+export class InvariantRegistry extends Service {
+  static Config: Schema<Config> = z.object({
+    enabled: z.boolean().default(true),
+    package_allowlist: z.array(z.string()).default([]),
+    package_blocklist: z.array(z.string()).default([]),
+  })
+
+  private readonly enabled: boolean
+  private readonly ownerCtx: Context
+  private readonly packageAllowlist: readonly RegExp[]
+  private readonly packageBlocklist: readonly RegExp[]
+  private readonly registrations = new Set<string>()
+
+  constructor(ctx: Context, config: Config = {}) {
+    super(ctx, 'invariants')
+    this.enabled = config.enabled ?? true
+    this.packageAllowlist = compilePatterns('package_allowlist', ...)
+    this.packageBlocklist = compilePatterns('package_blocklist', ...)
+  }
+
+  register(packageName: string, installer: InvariantInstaller): () => void {
+    if (packageName.length === 0 || packageName.trim() !== packageName || /\s/.test(packageName)) {
+      throw new Error('invariants: packageName must be non-blank and contain no whitespace')
+    }
+    if (this.registrations.has(packageName)) {
+      throw new Error(`invariants: package "${packageName}" is already registered`)
+    }
+    const ctx = this.ownerCtx
+    const registrations = this.registrations
+    registrations.add(packageName)
+
+    let registration: PendingInvariantRegistration
+    try {
+      registration = ctx.effect(async () => {
+        if (!this.selected(packageName)) {
+          return () => { registrations.delete(packageName) }
+        }
+        const installInvariant = (childCtx: Context) => (
+          installer(childCtx, (message): never => {
+            throw new InvariantError(packageName, message)
+          })
+        )
+        try {
+          const child = ctx.plugin(installer.inject === undefined
+            ? installInvariant
+            : Object.assign(installInvariant, { inject: installer.inject }))
+          try { await child } catch (error) { await child.dispose(); throw error }
+          return async () => {
+            try { await child.dispose() } finally { registrations.delete(packageName) }
+          }
+        } catch (error) { registrations.delete(packageName); throw error }
+      }, `invariants.register(${JSON.stringify(packageName)})`)
+    } catch (error) { registrations.delete(packageName); throw error }
+    return registration
+  }
+}
+```
+
+#### 核心抽象（5 个发现）
+
+1. **包级命名空间隔离**：`registrations: Set<string>` 用 `packageName`（如 `@deepseek-ai/dsh-credentials-local`）做主键，重复注册抛 `is already registered`。这意味着 30+ 包可以各自挂一个 `invariant.ts` companion，命名冲突在加载期就被阻断。
+
+2. **allowlist/blocklist 正则门控**：`compilePatterns` 在构造时把所有 `package_allowlist` 项 `new RegExp(value)`，任何非法正则（含重复）抛错并附 cause。运行期 `selected(name)` 先过 allowlist（空=全部放行）、再过 blocklist——这是生产可用的"灰度发布"机制。
+
+3. **`InvariantError.code = 'INVARIANT' as const`**：是 30+ 包间的统一错误码契约。前文 `credentials` 与 `authorization` 的 `fanOut` 实现都基于这个 `code` 字段识别"该不该重抛"（`if ((error as ...).code === 'INVARIANT') { invariantFailure ??= error; continue }`）——**InvariantError 是错误系统的"宪法层"**。
+
+4. **child fiber 生命周期绑定**：`ctx.plugin(installer)` 在 owner context 内创建 child fiber；`child.dispose()` 既被 finally 也被 effect 清理函数调用，确保"先 dispose 再删 registrations"的有序性。
+
+5. **空操作的合理性**：invariant.ts 自身就是一个 no-op installer（`const install: InvariantInstaller = () => {}`），但它仍然注册自己——保证**任何包都有 invariant companion**（用统一 API 占位）。
+
+### 1.3 TimeoutPolicy：单点超时 + 自我识别
+
+`packages/guard/timeout-policy/src/index.ts` 核心：
+
+```ts
+export const TOOL_TIMEOUT = 'TOOL_TIMEOUT'
+export const inject = ['tools']
+
+export function apply(ctx: Context): void {
+  ctx.on('tools/execute', async (exec, next): Promise<ToolExecutionResult> => {
+    const timeoutMs = ctx.tools.get(exec.name, exec.agent)?.timeoutMs
+    if (timeoutMs === undefined) return next()
+    ...
+    const result = await deadline(exec, () => next(), timeoutMs, TOOL_TIMEOUT)
+    if (timeoutOf(result, TOOL_TIMEOUT)) {
+      return toolTimeoutResult(timeoutMs)
+    }
+    return result
+  })
+}
+```
+
+#### 3 个反直觉设计
+
+1. **TOOL_TIMEOUT 既当错误码也当分类码**：`timeoutOf(result, TOOL_TIMEOUT)` 是从 deadline 库返回的 mixed 结果中识别"自家超时"的关键；嵌套外层 timeout（另一个 guard）若先触发会被读成"普通上游取消"而非混淆。
+
+2. **未声明 `timeoutMs` 的工具零开销**：`if (timeoutMs === undefined) return next()` 短路，不创建 timer。
+
+3. **`isError: true` + `error.code = TOOL_TIMEOUT`**：模型看到的 message 是 `"tool call timed out after Xms"`，但 `error.code` 给下游 retry/sandbox 插件机器可读的路由信号。**人类可读 + 机器可读同时存在**。
+
+### 1.4 RepeatToolReminder：弱提醒而非强制干预
+
+`packages/guard/repeat-tool-reminder/src/index.ts` 关键代码（200+ 行）：
+
+```ts
+const GENTLE_REMINDER = 'You are repeating the exact same tool call with identical arguments. '
+  + 'Carefully analyze the previous result before calling again...'
+
+function canonicalize(argumentsValue: unknown): string {
+  return JSON.stringify(sortJsonValue(argumentsValue))  // 深 key-sort 后 stringify
+}
+
+function apply(ctx: Context, config: Config): void {
+  const thresholds = validateThresholds(config.thresholds as number[])  // 抛错而非降级
+  const thresholdSet = new Set(thresholds)
+  const includePatterns = (config.include as string[]).map(wildcardToRegExp)
+  const excludePatterns = (config.exclude as string[]).map(wildcardToRegExp)
+  const chains = new WeakMap<Agent, Chain>()  // 每个 Agent 独立的链
+
+  function observe(exec: ToolExecution): UserMessage | undefined {
+    if (!exec.agent) return undefined  // 非 agent-loop 调用直接放行
+    if (!tracked(exec.name)) return undefined
+    const canonical = canonicalize(exec.arguments)
+    const key = JSON.stringify([exec.name, canonical])
+    const chain = chains.get(exec.agent)
+    const count = chain !== undefined && chain.key === key ? chain.count + 1 : 1
+    chains.set(exec.agent, { key, count })
+    if (!thresholdSet.has(count)) return undefined
+    const text = count === thresholds[0] ? GENTLE_REMINDER : detailedReminder(...)
+    ...
+  }
+}
+```
+
+#### 4 个非显然特性
+
+1. **`WeakMap<Agent, Chain>`**：每个 Agent 独立计数；Agent 销毁（GC）时链自动消失——不需要显式清理。
+2. **canonicalize 必须完整**：`previewArguments` 只截断展示文本，但**chain.key 始终用 full canonical string**——模型看不到的部分依然参与匹配，杜绝"省略号碰巧看起来不同"的绕过。
+3. **`include`/`exclude` 是 wildcard 不引用 registry**：`exclude: ['mcp_*']` 即使在没装 MCP 的部署里也合法——pattern 找不到匹配工具 ≠ 配置错误。
+4. **post-execute 而非 pre-execute 计数**：denied 工具调用也流经同一个 `tools/execute` 瀑布，所以"模型死磕一个被拒的调用"也会被计数——**denied-call loop 是真正要打断的循环**。
+
+### 1.5 与前 9 轮的关系
+
+- 第八轮的 `error.ts` 描述的 `HarnessError` code 体系与本轮 `INVARIANT` code 是平行层：HarnessError 是"业务失败"、InvariantError 是"包契约被违反"、TOOL_TIMEOUT 是"策略超时"。
+- `runtime-diagnostics` 是第九轮 4 个工具型 coverage（`coverage-exempt`/`coverage-partitions`）的运行时镜像——构建期发现未覆盖行，运行时包级 invariant 守住契约。
+
+### 1.6 laew gap 推断
+
+| 序号 | 缺口 | 影响 | 建议 Rust crate |
+|------|------|------|----------------|
+| **L79** | 无 panic hook；Rust panic 直接 terminate 进程不写 dump | 用户丢上下文 | `human-panic` + 自定义 hook |
+| **L80** | 无 package-level invariant registry；30+ 模块契约靠 code review | 上游破坏性改动只能运行时崩 | 引入 `inventory` 注册 + `assertable` trait |
+| **L81** | 无工具超时（grep / bash 长任务挂死） | 模型死等 | `tokio::time::timeout` + `tauri::async_runtime` |
+| **L82** | 无重复工具提醒 | 模型死磕循环浪费 token | Agent 层加 `WeakMap<SessionID, Chain>` |
+| **L83** | 无 INVARIANT 错误码层级 | 错误分类只能靠 message 字符串 | `thiserror` + 显式 `code` enum |
+| **L84** | 无 TOOL_TIMEOUT 之类"机器可读 code" | Retry / 沙箱 无法路由 | 引入 `ErrorCode` 类型 |
+| **L85** | 无 timeout-of-mixed-result 识别 | 嵌套 timeout 混淆 | `tokio::select!` + explicit marker |
+
+**优先级**：L79 (P0) / L81 (P1) / L80 / L82 / L83 (P2)
+
+---
+
+## 维度 2：WebUI 与 DesktopApp（apps/web + packages/web + packages/api）
+
+### 2.1 现状：浏览器端三件套
+
+deepseek-harness 没有"桌面壳"，但 WebUI 本身就是 Vite 单页 + 浏览器 Worker 装入完整 Harness。三个独立的发布件：
+
+| 件 | 路径 | 角色 |
+|---|------|------|
+| Web 前端 | `apps/web/` (Vite + Playwright) | 单页 UI 入口 |
+| Web 后端 | `packages/web/` (3 子包：web/tool-web/web-search-*) | 能力层（fetch/search） |
+| API 网关 | `packages/api/` (gateway + session/workspace/settings-controller) | Typert Remote 命名空间宿主 |
+
+实际产出物（`apps/web/package.json`）：
+
+```json
+"scripts": {
+  "build": "vite build",
+  "dev": "vite",
+  "build:preview": "pnpm --filter @deepseek-ai/dsh-experimental-webworker-runtime exec tsdown && ... && vite build && dsh-pack-vfs-image --out dist/preview/vfs-image.tar.gz",
+  "serve:preview": "http-server dist -a 0.0.0.0 -p 4173 -c-1"
+}
+"playwright": "^1.49.0"
+```
+
+`apps/web/index.html` 是 12 行极简脚手架，浏览器跑 `apps/web/src/main.ts`：
+
+```ts
+import { AppWebEntry } from '@deepseek-ai/dsh-client-web'
+const el = document.getElementById('root')
+if (el === null) throw new Error('web app: missing #root')
+void new AppWebEntry(el).run()
+```
+
+`preview.ts` 是预览模式启动器：
+
+```ts
+import DshWorker from '@deepseek-ai/dsh-experimental-webworker-runtime/worker?worker'
+import { chooseWorkerHostSource, connectWorkerHost, IMAGE_FILE_NAME } from '@deepseek-ai/dsh-experimental-webworker-runtime/client'
+const image = `preview/${IMAGE_FILE_NAME}`
+const source = await chooseWorkerHostSource({ image })
+await connectWorkerHost(new DshWorker({ name: 'dsh-host' }), { image, overlays: source.overlays })
+```
+
+**没有 Tauri/Electron 任何桌面框架**——WebUI 就是浏览器单页 + Worker。
+
+### 2.2 实验性 Web Worker 装入完整 Harness（最关键的 3 个发现）
+
+`packages/experimental/webworker-runtime/README.md` 描述了一个惊人的设计：**整个 dsh 插件树在浏览器 Worker 中运行**：
+
+1. **Worker inflate packed VFS**：浏览器下载打包好的 tar VFS 镜像，挂载到内存文件系统；模块通过 CommonJS wrapper loader 加载。
+2. **`node:*` builtin proxy table**：在 Worker 里实现了 `node:fs` / `node:child_process` 等 Node 内置模块的等价物（`readable-stream` 用作 stream 状态机）。
+3. **`node:child_process` 是真实现不是 stub**：`spawn` 在 Worker 里启动**另一个 Worker**（同一个 bundle，告诉自己是 shell 进程），通过 postMessage 隧道模拟父子进程通信。**SIGKILL 任何状态都能终止**。
+
+`packages/experimental/webworker-packer/README.md` 描述了"3 层标准栈"打包：
+
+1. **Roster**：composed profile 的 plugin rows（YAML Include dialect + `!!js` tag）
+2. **Publish view**：每个 workspace / vendored 包按 `files` picomatch 切片（不含 source / dist）
+3. **Reachability sweep**：从 workspace export + worker 种子出发 walk，把所有 require 静态拉低到 wrapper contract
+
+**含义**：浏览器端运行的 dsh 不是阉割版，是**真实构建产物 + 同 bundle worker + VFS 镜像**——preview deployment 调试的就是部署 ship 的代码。
+
+### 2.3 Host API：Typert Remote 命名空间
+
+`packages/api/gateway/src/index.ts` 是整个 Host 的 RPC 入口（1216 行）。核心抽象 `TypertGatewayService`：
+
+```ts
+export class TypertGatewayService extends Service implements TypertGateway {
+  static inject = ['typert']
+  static Config: z<Config> = z.object({
+    websocketHeartbeatIntervalMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS)
+      .default(DEFAULT_WEBSOCKET_HEARTBEAT_INTERVAL_MS),
+  })
+
+  constructor(ctx: Context, config: Config) {
+    super(ctx, 'typertGateway')
+    ctx.inject(['connection'], (connectionCtx) => {
+      connectionCtx.connection.rpc.intercept('/api', endpoint => this.claimsEndpoint(endpoint),
+        (endpoint, payload, signal) => this.dispatchRpc(endpoint, payload, signal))
+    })
+    ctx.inject(['connection', 'webServer'], (webCtx) => {
+      const mux = new RemoteStreamMuxServer(
+        (endpoint, payload, signal) => this.openWireStream(endpoint, payload, signal),
+        this.wireStream.failure, resolved.websocketHeartbeatIntervalMs)
+      webCtx.effect(() => {
+        const route: WebUpgradeRoute = {
+          path: REMOTE_STREAM_MUX_PATH,
+          handler: (req, socket, head) => {
+            const rejection = webCtx.connection.requestRejection(req)
+            if (rejection !== undefined) { rejectRemoteStreamUpgrade(socket, rejection); return }
+            mux.handleUpgrade(req, socket, head)
+          }
+        }
+        const unregister = webCtx.webServer.registerUpgrade(route)
+        return async () => { unregister(); await mux.close() }
+      }, `api-gateway: ${REMOTE_STREAM_MUX_PATH} WebSocket`)
+    })
+  }
+  ...
+}
+```
+
+#### 关键 6 维度
+
+1. **双 transport 路由**：HTTP POST `/api/<namespace>/<method>` 走 `intercept` 一元调用；WebSocket `/api/remote.mux` 走 `RemoteStreamMuxServer` 流式调用。**RemoteEvent（事件推送）也走这个 mux**——`REMOTE_EVENT_STREAM_ENDPOINT = '$events'`。
+
+2. **WebSocket 心跳（30s 默认）**：`websocketHeartbeatIntervalMs` 是 zod 校验的正整数；`setInterval` unref 后不影响进程退出。`startHeartbeat()` 在第一个 upgrade 后才启动，避免空 client 期间浪费。
+
+3. **STRICT / SRC 双查找**：`resolveDescriptor` 先查 `this.ctx.typert.local.get(endpoint)`，再 fallback 到 `resolveSrcDescriptor()`——读 Service 类 prototype 拿到方法签名。这意味着**即使没有生成 reflection metadata，方法也能跑**（生成 metadata 优先，SRC 降级）。
+
+4. **Endpoint 是严格 `<namespace>/<method>`**：`endpointOf(namespace, method)`；`/api/<namespace>/<method>` 不允许空段；wire field `exactKeys(args, ['type', 'streamId', ...])` 严格 schema 校验。
+
+5. **RemoteEvent 生命周期**：`registerRemoteEvents(source, host)` 接受单一 source；`consumeRemoteEvents` for-await 消费；有 3 类 frame 投递——`emit`（广播）/ `waterfall`（RPC + 等回应）/ `cancel`（取消）。`RemoteEventQueue` 是 pull-driven 单连接队列。
+
+6. **`error.code === 'INVARIANT'` 重新抛出**：rpcFailure 对 `INVARIANT` 码特殊处理，向上抛错而不再包成 internal——保留原始 error 链。
+
+### 2.4 SessionController vs WorkspaceController（高密度 Remote 命名空间）
+
+| Controller | 命名空间 | 主要 Remote 方法 | 备注 |
+|------------|---------|------------------|------|
+| `WorkspaceController` | `workspace` | create/rename/delete/insertBefore/insertSessionBefore/archiveSession/follow(stream) | 7 个 @Remote 装饰 |
+| `SessionCommandController` | `session` | create/cancel/prompt/fork/selectModel/rename/updateQueue + attachments | 完整 Session CRUD |
+| `SettingsController` | `settings` | 配置读写 | 略 |
+
+`workspaceController.follow(signal)` 是 stream 模式 Remote——返回 `AsyncIterable<WorkspaceFollowFrame>`，整个生命周期通过 WebSocket mux 推送。
+
+### 2.5 与前 9 轮的关系
+
+- 第八轮已挖过 **WebSocket 与 SSE**（对应本维度 6）；本节侧重 WebUI 的 entry/loading。
+- 第七轮挖的 **TUI 渲染管线**对比项，WebUI 是另一条赛道（cell-based retained + Web DOM）；此处不重复。
+- 浏览器 Worker 装整个 Harness 是**第九轮新增**：是 WebUI 形态下的最大特色。
+
+### 2.6 laew gap 推断
+
+| 序号 | 缺口 | 影响 | 建议 Rust crate |
+|------|------|------|----------------|
+| **L86** | 无浏览器 WebUI（仅 TUI） | 受限在终端，无法远程 / 桌面访问 | `ratatui` 已有；可加 `tauri` 桌面壳 |
+| **L87** | 无 HTTP API 网关 | TUI 只能本地，不能跨进程接入 | `axum` + `tower` + JSON-RPC layer |
+| **L88** | 无 WebSocket 流式 Remote | 长会话不能增量推送 | `tokio-tungstenite` + axum ws |
+| **L89** | 无 STRICT/SRC 双 reflection | wire schema 改动需手改协议 | `schemars` 派生 reflection |
+| **L90** | 无 RemoteEvent 广播 | 跨 session 事件不能 push 到 UI | `tokio::sync::broadcast` |
+| **L91** | 无 Worker 装入方案（无 Node） | 无法做浏览器版 | `wasm-bindgen` + `wasmtime` |
+| **L92** | 无 Playwright e2e 体系 | UI 改动只能手测 | `playwright-rust` 或 webdriver |
+
+**优先级**：L86 (P0，需要 WebUI) / L87-L88 (P1) / L89-L90 (P2)
+
+---
+
+## 维度 3：OAuth 认证与多账号（packages/credentials 3 包）
+
+### 3.1 现状：双向能力 seam
+
+OAuth 不是「GitHub OAuth 流程」，而是一对**互补的 capability**：
+
+| 包 | 行数 | 抽象 |
+|---|------|------|
+| `credentials/src/index.ts` | 315 | `CredentialProvider` 抽象（ref / record 两套语义） |
+| `credentials-local/src/index.ts` | 935 | YAML 文件 + chokidar 热更新 provider |
+| `authorization/src/index.ts` | 437 | `AuthorizationService` 注册 flow + attempt 编排 |
+
+### 3.2 CredentialProvider：双钥匙空间（4 层优先级）
+
+`credentials/src/index.ts` 关键抽象：
+
+```ts
+export type CredentialRef = Branded<'CredentialRef'>     // POSIX env 名
+export type CredentialKey = Branded<'CredentialKey'>     // "<scope>/<id>"
+const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+const KEY_SEGMENT_PATTERN = /^[a-z][a-z0-9-]*$/
+
+export function credentialRef(value: string): CredentialRef {
+  if (!isCredentialRefName(value)) throw new TypeError(`credential ref "${value}" must match ${REF_PATTERN}`)
+  return value as CredentialRef
+}
+
+export abstract class CredentialProvider extends Service {
+  constructor(ctx: Context) { super(ctx, 'credentials') }
+
+  // Ref half: 一对多（process env / managed file / project .env / user .env），按层信任
+  abstract resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined>
+  abstract describe(ref: CredentialRef): Promise<CredentialInfo>
+  abstract set(ref: CredentialRef, value: string): Promise<void>
+  abstract unset(ref: CredentialRef): Promise<void>
+
+  // Record half: 一对一（OAuth grant payload / API key），不层叠，presence 是全部事实
+  abstract readRecord(key: CredentialKey): Promise<CredentialRecord | undefined>
+  abstract describeRecord(key: CredentialKey): Promise<CredentialRecordInfo>
+  abstract listRecords(): Promise<readonly CredentialRecordEntry[]>
+  abstract modifyRecord(key: CredentialKey, mutate: (current) => Promise<CredentialRecord | undefined>): Promise<CredentialRecord | undefined>
+  abstract deleteRecord(key: CredentialKey): Promise<void>
+
+  protected notifyUpdated(ref: CredentialRef): void {
+    this.fanOut('credentials/reference-updated', ref)
+  }
+  protected notifyRecordUpdated(key: CredentialKey): void {
+    this.fanOut('credentials/record-updated', key)
+  }
+
+  private fanOut(event: 'credentials/reference-updated' | 'credentials/record-updated', subject: string): void {
+    let invariantFailure: unknown
+    for (const listener of this.ctx.events.dispatch('emit', [event, subject])) {
+      try {
+        const returned = listener(subject)
+        if (returned != null && typeof returned.then === 'function') {
+          void Promise.resolve(returned).then(undefined, (e) => this.warnListenerFailure(event, subject, e))
+        }
+      } catch (error) {
+        if ((error as { code?: unknown })?.code === 'INVARIANT') { invariantFailure ??= error; continue }
+        this.warnListenerFailure(event, subject, error)
+      }
+    }
+    if (invariantFailure !== undefined) throw invariantFailure as Error
+  }
+}
+```
+
+#### 7 个非显然设计
+
+1. **ref vs record 两套语义**：ref 是环境变量名（`DEEPSEEK_API_KEY`），可层叠、可被多源覆盖；record 是 `<scope>/<id>`（如 `llm-pi-ai/openai-codex`），无层叠、presence = fact。
+
+2. **`CredentialRef` 与 `CredentialKey` 的语法不同**：`REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/`（POSIX shell 标识符）；`KEY_SEGMENT_PATTERN = /^[a-z][a-z0-9-]*$/`（lowercase + hyphen）。**斜杠 `/` 属于 KEY 不属于 REF**，让两个语义在语法层互不污染。
+
+3. **`modifyRecord` 是唯一 record 写路径**：注释 `// a token refresh is read-decide-replace under one lock` —— 并发 token 刷新是 modifyRecord 的根本用例。
+
+4. **`listRecords()` 不存在对应 `listRefs()`**：配置 UI 通过 settings schema 学习有哪些 ref，而 record 没有外部发现路径，必须 enumeration（"a surface that cannot list them cannot show what a user is authorized for, nor find an orphan left by an uninstalled plugin"）。
+
+5. **`INVARIANT` 重新抛出**：fanOut 监听器抛 INVARIANT 时特殊处理——重抛；其他错误只 warn。**让 invariant 检查可以同步阻塞写流程而不丢失事件投递**。
+
+6. **`notifyUpdated/notifyRecordUpdated` 是 protected**：只有 provider 实现能调用——确保 `event` 在 commit 之后才发出（"providers call this only after the write or reload actually committed, so a broken observer can never make a durable change look failed"）。
+
+7. **空字符串 = 缺席**：`resolve` 跳过空存储值、`describe` 报告 unconfigured——空值永远不冒充"已配置 secret"。
+
+### 3.3 credentials-local：4 层信任 + POSIX 文件权限校验
+
+`packages/credentials/credentials-local/src/index.ts` 注释直接画出优先级：
+
+```
+inherited process environment      (read-only, wins)
+> $DSH_HOME/.credentials.yaml      (provider-managed, writable)
+> <invocation cwd>/.env            (read-only fallback)
+> $DSH_HOME/.env                   (read-only fallback)
+```
+
+为什么 env 优先于 managed file？
+
+> "The inherited environment wins because `DEEPSEEK_API_KEY=… dsh`, a CI secret, or a container `-e` is this run's explicit intent; it cannot be edited from inside, so it must be *visibly* read-only rather than silently shadow writes."
+
+**env 显式 = 用户当前意图**；managed file 是"过去某次 UI 设置"，应当被 env 覆盖。
+
+#### POSIX 文件权限校验（200+ 行 invariant）
+
+```ts
+const GROUP_OTHER_BITS = 0o077
+
+async function assertOwnerOnly(filename: string): Promise<void> {
+  let mode: number
+  try {
+    mode = (await stat(filename)).mode
+  } catch (error) {
+    if (!isENOENT(error)) throw error
+    await canonicalizeWatchPath(filename)
+    return
+  }
+  if (process.platform === 'win32') return
+  const offending = mode & GROUP_OTHER_BITS
+  if (offending === 0) return
+  throw new Error(
+    `credentials-local: ${filename} is readable beyond its owner (mode ${(mode & 0o777).toString(8)});`
+    + ` run "chmod 600 ${filename}" before starting again`,
+  )
+}
+```
+
+#### 5 个反直觉细节
+
+1. **GROUP_OTHER_BITS = 0o077** 一次性屏蔽 group+other 位。
+2. **Windows 跳过**：注释解释 Windows ACL 不可表达，check skipped 不 fake。
+3. **写时校验而非读时降级**：读文件前就拒绝，从未读取过的文件也不会进入 secret 流。
+4. **文档解析错误不泄漏值**：`describeYamlError` 只返 `code + linePos`，绝不打 `error.message`——"the parser quotes the offending source line and in this document that line is a secret"。
+5. **YAML 错误 strict 拒绝一切未知**：`fields['version']` 缺失 = 抛错（"pre-release flat layout"）；未知顶层键 = 抛错；duplicate key = parser error。**credentials 文档不允许任何默默降级**。
+
+### 3.4 AuthorizationService：受控的 OAuth attempt
+
+`authorization/src/index.ts` 是 OAuth 流程的"协议中立编排器"：
+
+```ts
+export interface AuthorizationFlow {
+  readonly key: CredentialKey                // 这个 flow 写的 record
+  readonly label: string
+  readonly methods: readonly [AuthorizationMethod, ...AuthorizationMethod[]]
+  run(session: AuthorizationSession): Promise<void>
+}
+
+export interface AuthorizationSession {
+  readonly method: string
+  readonly signal: AbortSignal               // 取消信号
+  notify(notice: AuthorizationNotice): void   // fire-and-forget
+  prompt(prompt: AuthorizationPrompt): Promise<string>  // 必答
+}
+
+export class AuthorizationService extends Service {
+  static inject = ['credentials']
+  private readonly flows = new Map<CredentialKey, AuthorizationFlow>()
+  private readonly running = new Map<CredentialKey, InFlight>()
+
+  registerFlow(flow: AuthorizationFlow): () => void {
+    const dispose = this.ctx.effect(function* (this: AuthorizationService) {
+      if (this.flows.has(flow.key)) throw new AuthorizationError(
+        `an authorization flow for "${flow.key}" is already registered`, 'DUPLICATE_FLOW')
+      this.flows.set(flow.key, flow)
+      yield () => {
+        this.flows.delete(flow.key)
+        this.running.get(flow.key)?.controller.abort()
+      }
+    }.bind(this), 'authorization.registerFlow()')
+    return () => void dispose()
+  }
+
+  async begin(request: AuthorizationRequest): Promise<AuthorizationOutcome> {
+    const { key } = request
+    const flow = this.flows.get(key)
+    if (flow === undefined) throw new AuthorizationError(...'NO_FLOW')
+    ...
+    if (this.running.has(key)) throw new AuthorizationError(...'ALREADY_IN_FLIGHT')
+    if (request.signal?.aborted === true) return { status: 'cancelled' }
+    const controller = new AbortController()
+    ...
+    this.running.set(key, { controller })
+    let settlement: AuthorizationSettlement = 'failed'
+    try {
+      const outcome = await this.attempt(flow, method, controller.signal, request.interaction)
+      settlement = outcome.status
+      return outcome
+    } finally {
+      ...
+      this.settle(key, settlement)         // emit authorization/settled event
+    }
+  }
+}
+```
+
+#### 6 个生产级保证
+
+1. **DUPLICATE_FLOW 保护**：同一 CredentialKey 不能被两个插件注册——`whichever ran last would leave the other reading a payload it cannot parse`。
+
+2. **ALREADY_IN_FLIGHT 拒绝并发**：第二个 caller 直接抛错而非 join——"the two would be prompting different humans through the same flow, and the second would answer questions the first was asked"。
+
+3. **withdrawn-before-began 不占 slot**：若 `request.signal.aborted === true`，begin 直接返回 cancelled 不写 running map。
+
+4. **commit 契约由 seam 验证**：`attempt` 用 `this.ctx.on('credentials/record-updated', ...)` 监听此次 attempt 期间是否有 record 被提交；若 flow resolve 而 observed.committed = false，抛 `NOT_COMMITTED`（即使 record 已存在也不行——"on a re-auth the record already exists, so presence alone would let a flow that wrote nothing report the stale credential as freshly authorized"）。
+
+5. **人类拒绝 vs 撤回区分**：`AuthorizationDeclinedError` 特殊类——"a flow retiring the losing question of a race"必须用其他错误（否则 race 失败会被误读为人类拒绝）。
+
+6. **fanOut settlement 与 credential 完全对称**：注释明确 `jscpd:ignore-start` 标注故意对称——"the contained-dispatch shape is the reviewed listener-lifecycle contract, and extracting it would couple the two seams' event semantics"。
+
+### 3.5 与前 9 轮的关系
+
+- 第八轮已挖过 **Tool Permission**；本节专注 credential/authz 层。
+- 第九轮提到「无 OAuth 流程 / 无多账号轮换」（L50 / L52）——本节就是答案。
+
+### 3.6 laew gap 推断
+
+| 序号 | 缺口 | 影响 | 建议 Rust crate |
+|------|------|------|----------------|
+| **L93** | API Key 明文存储在 SQLite | 物理偷硬盘 = 拿到所有 key | `keyring` + AES-GCM 加密字段 |
+| **L94** | 无 `CredentialRef` vs `CredentialKey` 语义分层 | 密钥和环境变量混着用 | 引入两种 typed wrapper |
+| **L95** | 无 POSIX 文件权限校验 | 手改 .env 0666 也能跑 | `nix` crate 检查 mode |
+| **L96** | 无 OAuth flow 注册机制 | LLM 平台（ChatGPT Codex 等）OAuth 无法接入 | `oauth2` + 注册器 trait |
+| **L97** | 无 DUPLICATE_FLOW / ALREADY_IN_FLIGHT 并发保护 | 多账号 race | `tokio::sync::Mutex` per-key |
+| **L98** | 无 NOT_COMMITTED 验证 | OAuth 重授权假成功 | record 写时事件订阅 |
+| **L99** | 无 YAML error message 脱敏 | 解析错误泄漏 secret | 自定义 error formatter |
+| **L100** | 无 authorize/settled 事件 | 跨进程感知不到 auth 成功 | `tokio::sync::broadcast` |
+
+**优先级**：L93 (P0) / L94 / L96 (P1) / L95 / L97-L100 (P2)
+
+---
+
+## 维度 4：i18n 国际化（scripts/translation-* + *.i18n.yaml）
+
+### 4.1 现状：4 国语言×双侧对齐的工程化体系
+
+调研样本：
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `scripts/translation-prompt.ts` | 259 | prompt-v4 三段式（translation/review/final） |
+| `scripts/translation-pairing.ts` | 442 | 配对记录 + 结构签名 |
+| `scripts/translation-pairing-merge.ts` | 408 | git merge 驱动 fail-closed 配对记录 |
+| `scripts/translation-brief.ts` | 442 | 最小更新 briefing |
+| `scripts/translation-links.ts` | 442+ | locale-aware 链接重写 |
+| `scripts/translation-pairing.manifest.json` | — | 排除规则 |
+| `docs/i18n/{terminology,style-samples,translation-prompt}.md` | — | 翻译契约 |
+| `README.{md,zh.md}` / `BRAND_GUIDELINES.{md,zh.md}` / ... | — | 双语成对产物 |
+
+manifest 排除规则：
+
+```json
+{
+  "excluded": [
+    ".agents/notes/AGENTS.md", ".agents/notes/implemented/AGENTS.md",
+    ".agents/notes/implemented/CLAUDE.md",
+    "docs/AGENTS.md", "docs/cordis-api/inherited.md",
+    "docs/i18n/style-samples.md",
+    "docs/i18n/terminology.md",
+    "docs/i18n/translation-prompt.md"
+  ]
+}
+```
+
+### 4.2 配对记录：`<basename>.md: <40-hex>` 元数据
+
+`translation-pairing.ts` 关键代码：
+
+```ts
+const PAIR_META_LINE = /^([^:#]+\.md): ([0-9a-f]{40})$/
+
+export function parsePairMeta(content: string): Map<string, string> | undefined {
+  const out = new Map<string, string>()
+  for (const line of content.split('\n')) {
+    if (line === '' || line.startsWith('#')) continue
+    const match = PAIR_META_LINE.exec(line)
+    if (!match?.[1] || !match[2]) return undefined
+    if (out.has(match[1])) return undefined
+    out.set(match[1], match[2])
+  }
+  return out
+}
+
+export function blobHash(content: Buffer): string {
+  const hash = createHash('sha1')
+  hash.update(`blob ${content.byteLength}\0`)
+  hash.update(content)
+  return hash.digest('hex')
+}
+```
+
+#### 5 个反直觉设计
+
+1. **`*.i18n.yaml` 是 sidecar**：记录每个 `.md` 的 git blob SHA-1（与 `git hash-object` 完全一致：`blob <bytes>\0<content>`）。任何内容改动立即让 sidecar 失效。
+
+2. **FAIL-CLOSED 配对**：任何非 `<basename>.md: <40-hex>` 格式 / 重复 key / 缺失期望 key 都返回 `undefined`，**绝不降级到部分成功**。
+
+3. **生成区域的语法**：`<!-- BEGIN GENERATED <slug> … -->` / `<!-- END GENERATED <slug> -->` 行级 marker；slug 不匹配 = 抛错；嵌套 BEGIN = 抛错；缺 END = 抛错。注释中"region-aware pair-record guard"——剥离生成区后再算 hash，机器生成内容不污染人类内容指纹。
+
+4. **`blobHash` 自实现**：不依赖 `git` CLI 调用——是 git 的 wire format（`blob <字节数>\0` 前缀 + 内容），纯 JS 实现便于测试。
+
+5. **结构签名（signature）**：`translationStructureSignature` 比较的不是字符级，而是 mdast 结构级（容器路径 + node 类型）——代码块变更"安全映射"，而顺序整段重排"破坏签名"。
+
+### 4.3 prompt-v4 三段式翻译契约
+
+`translation-prompt.ts`：
+
+```ts
+export const TRANSLATION_PROMPT_PLACEHOLDERS = ['source_lang', 'target_lang', 'terminology'] as const
+type TranslationLanguage = 'English' | 'Chinese'
+
+export interface TranslationResponse {
+  translation: string   // 第一段：完整翻译
+  review: string        // 第二段：模型自审
+  final: string         // 第三段：最终采纳的版本
+}
+```
+
+三段式响应：
+- `<translation>`：原始翻译输出
+- `<review>`：模型自检术语/格式
+- `<final>`：采纳的最终正文
+
+管线外保留 filename context（避免把文件名塞进 prompt），解析后再修正 language switcher 的链接。
+
+### 4.4 git merge 驱动的配对记录合成
+
+`translation-pairing-merge.ts` 用 git merge 算法合成双语 owner：
+
+```ts
+function assertDefaultTextMerge(root: string, paths: TranslationPairPaths): void {
+  const output = runGit(root, ...)
+  ...
+  // 默认 text merge 失败 = 抛错
+}
+```
+
+注释："fail-closed composition of bilingual pairing records during Git merges" —— 配对记录的 Git 合并不允许 silent conflict resolution。**i18n 同步和 git 合并逻辑绑定**。
+
+### 4.5 链接重写与最小更新 briefing
+
+`translation-links.ts`：`TranslationLinkContext` 是 `{ repoRoot, sourcePath, isTranslationPairSource, repositoryFileExists? }`，保证相对链接指向正确 locale sibling：
+
+```ts
+export interface TranslationLinkLocaleViolation {
+  sourcePath: string
+  line: number
+  url: string
+  expectedUrl: string
+}
+```
+
+`translation-brief.ts` 计算 minimal-update briefing：
+- 粒度：code-fence-only splice / changed Markdown units / heading sections / whole document
+- 包含：terminology rows touched + first-occurrence movement notes + binding update rules
+
+**含义**：双语维护有 4 个明确的粒度，每一级用不同 merge 策略。
+
+### 4.6 与前 9 轮的关系
+
+- 之前 9 轮未深入 i18n 体系（仅简单提及 `*.i18n.yaml` 命名约定）。
+- 这是 deepseek-harness 区别于其他 Agent CLI 的最显著工程化特征之一：**4 个 release 序列有双语文档维护流程**。
+
+### 4.7 laew gap 推断
+
+| 序号 | 缺口 | 影响 | 建议 Rust crate |
+|------|------|------|----------------|
+| **L101** | 无双语文档体系（仅中文 AGENTS.md） | 国际用户看不懂 | 同源 `*.zh.md` + script 同步 |
+| **L102** | 无 prompt-v4 三段式翻译 | LLM 翻译无 review 步骤 | 自实现 prompt 模板 |
+| **L103** | 无 git blob SHA-1 配对记录 | 翻译与上游容易漂移 | `git2` + sha1 sidecar |
+| **L104** | 无 `<basename>.md: <hash>` 校验 | 译文可能悄悄过期 | 自实现 fail-closed 解析 |
+| **L105** | 无生成区域语法（`<!-- BEGIN GENERATED -->`） | 机器生成内容污染人工 | 预留注释 marker |
+| **L106** | 无结构签名（mdast vs char diff） | 翻译粒度不可控 | markdown 解析 + path 比较 |
+| **L107** | 无 minimal-update briefing | 改动一处需重翻全文 | 自实现 unit-mapping |
+| **L108** | 无 locale-aware 链接重写 | 中英链接错配 | `pulldown-cmark` + URL resolver |
+| **L109** | 无术语表（terminology.md） | 翻译风格不统一 | 单文件 + diff 同步 |
+
+**优先级**：L101 (P0) / L102 / L105 (P1) / L103-L104 / L106-L109 (P2)
+
+---
+
+## 维度 5：Release 工程化与 AutoUpdate（scripts/release + scripts/build-exe-for-python-sdk）
+
+### 5.1 现状：5 步发布的完整自动化
+
+调研样本：
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `scripts/release/families.ts` | 428 | ReleaseFamily 抽象 + DshFamily/VendorFamily |
+| `scripts/release/bump.ts` | 415 | 版本号 bump + pnpm-lock 重生 + git commit |
+| `scripts/release/publish.ts` | 178 | npm publish + 4 次重试 + integrity 对比 |
+| `scripts/release/tarball.ts` | 53 | tarball 读取 |
+| `scripts/release/pack.ts` | 88 | pnpm pack 包装 |
+| `scripts/release/verify-packed-install.ts` | 121 | 装到 tmpdir + 跑 `--version` |
+| `scripts/release/verify.ts` | 110 | 验证已装树 |
+| `scripts/build-exe-for-python-sdk.ts` | 625 | 单文件 exe 打包（pkg --sea） |
+
+### 5.2 ReleaseFamily：3 类发布序列
+
+`families.ts` 抽象 + 2 个实现：
+
+```ts
+export abstract class ReleaseFamily {
+  abstract readonly id: string
+  abstract readonly patterns: readonly string[]
+  abstract readonly tagPrefix: string
+
+  abstract verifyBuildArtifacts(_root: string): void {}
+  abstract verifyVersions(members: readonly ReleaseMember[]): void
+  abstract tagPrefixFor(member: ReleaseMember): string
+  abstract validatePayload(member: ReleaseMember, files: readonly string[]): void
+  abstract readonly installedEntry: InstalledEntry | undefined
+}
+
+class DshFamily extends ReleaseFamily {
+  readonly id = 'dsh'
+  readonly patterns = ['packages/!(experimental)/*/package.json', 'apps/*/package.json'] as const
+  readonly tagPrefix = 'dsh-v'
+  // 单一版本号、所有成员共享
+}
+
+class VendorFamily extends ReleaseFamily {
+  readonly id = 'vendor'
+  readonly patterns = ['vendor/*/package.json'] as const
+  readonly tagPrefix = 'vendor-'
+  // 每个包独立版本号
+}
+```
+
+注释里讲清楚了"为什么 3 序列"：
+
+> "each family carries its own version baseline, tag naming, and publish set, so releasing one never republishes another"
+
+#### 5 个反直觉特性
+
+1. **publishOrder 算法（DFS + 拓扑 + peer cycle 处理）**：
+   ```ts
+   const installVisiting = new Set<string>()
+   const installDone = new Set<string>()
+   const checkInstall = (member, path) => {
+     if (installDone.has(member.name)) return
+     if (installVisiting.has(member.name)) throw new Error(`dependency cycle in release family ${this.id}: ${[...path, member.name].join(' -> ')}`)
+     installVisiting.add(member.name)
+     for (const dependency of edges(member, INSTALL_SECTIONS)) checkInstall(dependency, [...path, member.name])
+     installVisiting.delete(member.name)
+     installDone.add(member.name)
+   }
+   ```
+   install 边必须无环，否则抛错；peer 边可丢弃但要 report。**注释：发布顺序的中断安全——已发布的 prefix 永远不会指向 registry 中未发布的内容**。
+
+2. **dropped peer edges 是公开结果**：`PublishPlan` 包含 `droppedPeerEdges`，operator 读 pack log 能判断"这次有新 peer 被丢弃是预期还是异常"。
+
+3. **verifyVersions 双语义**：dsh family 要求**所有成员同一版本**（`Set size !== 1` 抛错）；vendor family 要求**每个成员 semver 合法**。
+
+4. **validatePayload 由 family 自定义**：dsh family 校验"无 source/declaration-map"；vendor family 校验"非空 tarball"。这是 publication policy 的元数据化。
+
+5. **installedEntry 声明可执行包**：只有 dsh family 的 `@deepseek-ai/dsh` 有 `binPath: 'lib/bin.js'`；vendor family 是 libraries 无 installedEntry。
+
+### 5.3 bump：3 种版本策略
+
+`bump.ts` 核心：
+
+```ts
+export function compareVersions(left: string, right: string): number {
+  const numbers = compareReleaseNumbers(left, right)
+  if (numbers !== 0) return numbers
+  const leftPre = prereleaseOf(left)
+  const rightPre = prereleaseOf(right)
+  if (leftPre === undefined || rightPre === undefined) {
+    if (leftPre === rightPre) return 0
+    return leftPre === undefined ? 1 : -1
+  }
+  // 字段级 prerelease 比较（`rc.10` > `rc.1`，数字字段数值比较）
+  ...
+}
+
+function nextSharedVersion(current, request) {
+  if (request === 'major') return `${major + 1}.0.0`
+  if (request === 'minor') return `${major}.${minor + 1}.0`
+  if (request === 'patch') return `${major}.${minor}.${patch + 1}`
+  return request  // 显式版本号（包含 prerelease 如 `0.0.1-rc.1`）
+}
+
+export function nextVendorVersion(current, tagged, prerelease?) {
+  const taggedOrder = tagged === undefined ? undefined : compareReleaseNumbers(tagged, current)
+  const ahead = taggedOrder !== undefined && taggedOrder > 0
+  const baseline = ahead && tagged !== undefined ? tagged : current
+  const taggedPrerelease = tagged !== undefined && prereleaseOf(tagged) !== undefined
+  const sameReleasePrereleases = taggedOrder === 0 && prereleaseOf(current) !== undefined
+  const reuse = taggedPrerelease && (ahead || sameReleasePrereleases)
+  const numbers = reuse ? `${major}.${minor}.${patch}` : `${major}.${minor}.${patch + 1}`
+  return prerelease === undefined ? numbers : `${numbers}-${prerelease}`
+}
+```
+
+#### 4 个非显然语义
+
+1. **semver 而非 git sort**：`compareReleaseNumbers` 不用 git 的 `--sort=v:refname`（那个会把 `4.0.1-rc.1` 排在 `4.0.1` 之前），用纯 semver 规则。
+
+2. **prerelease 字段级比较**：split by `.` 后**数字字段按数值比较**（`rc.10` > `rc.1`），数字字段 vs 非数字字段（数字字段低），非数字字段按字典序。
+
+3. **vendor 重新同步不递增**：vendor re-sync 时 tag 版本可能高于 manifest 版本（如上游已发布新版）——`ahead && tagged !== undefined` 决定 baseline 用 tagged 而非 current。
+
+4. **CI 永不写仓库**：注释 "CI never writes to the repository"——bump 后输出 `git tag X Y && git push origin X` 让人手工打 tag。这是 workflow-only 操作而非 CI 自动。
+
+### 5.4 publish：transient retry + integrity 对比
+
+`publish.ts`：
+
+```ts
+const TRANSIENT_PUBLISH_CODES = ['E409', 'E429', 'E500', 'E502', 'E503', 'E504', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'] as const
+const PUBLISH_ATTEMPTS = 4
+const PUBLISH_SPACING_MS = 2_000
+
+function isTransientFailure(output: string): boolean {
+  return TRANSIENT_PUBLISH_CODES.some(code => output.includes(`code ${code}`))
+}
+
+async function publishTarball(tarball, name, version) {
+  const tagArgs = version.includes('-') ? ['--tag', 'next'] : []
+  for (let tries = 1; tries <= PUBLISH_ATTEMPTS; tries += 1) {
+    const result = attemptEchoed('npm', ['publish', tarball, ...tagArgs])
+    const output = `${result.stdout}${result.stderr}`
+    if (result.status === 0) return
+
+    const settled = registryState(name, version)
+    if (settled.kind === 'present' && settled.integrity === integrityOf(tarball)) {
+      console.log(`release publish: ${name}@${version} landed despite a reported failure, continuing`)
+      return
+    }
+    if (tries === PUBLISH_ATTEMPTS || !isTransientFailure(output)) {
+      throw new Error(`npm publish ${name}@${version} failed:\n${output}`)
+    }
+    const backoff = PUBLISH_SPACING_MS * 2 ** (tries - 1)
+    await sleep(backoff)
+  }
+}
+```
+
+#### 3 个关键设计
+
+1. **prerelease 用 `--tag next`**：version 含 `-` 自动用 next tag，避免抢占 latest dist-tag。
+
+2. **E409 重读 registry**：`E409 Failed to save packument` 可能"已落地但报失败"——重试前重新查 registry，若 integrity 一致视为成功。
+
+3. **integrity 不一致 = 终止**：发布时若 registry 已有同 version 但 integrity 不同，抛"内容改了但没 bump version"——防误发布。
+
+### 5.5 verify-packed-install：tmpdir 跑 `--version`
+
+```ts
+function consumerEnvironment(consumerRoot): NodeJS.ProcessEnv {
+  const environment = { ...process.env }
+  delete environment.npm_config_user_agent
+  delete environment.NPM_CONFIG_USER_AGENT
+  delete environment.NODE_OPTIONS
+  delete environment.NODE_PATH
+  environment.DSH_HOME = resolve(consumerRoot, '.dsh')
+  environment.DSH_AGENTS_HOME = resolve(consumerRoot, '.agents')
+  environment.DSH_TELEMETRY_DISABLED = '1'
+  return environment
+}
+
+function main() {
+  ...
+  const consumerRoot = mkdtempSync(join(tmpdir(), `dsh-packed-${family.id}-`))
+  try {
+    writeFileSync(join(consumerRoot, 'package.json'), `${JSON.stringify({
+      name: `dsh-packed-install-${family.id}`,
+      version: '0.0.0',
+      private: true,
+      dependencies: Object.fromEntries([...packed].map(([name, entry]) => [name, entry.url])),
+    }, null, 2)}\n`)
+
+    capture('npm', ['install', '--no-audit', '--no-fund', '--package-lock=false', '--omit=optional'], { ... })
+    const version = capture(process.execPath, [bin, '--version'], { ... })
+    if (version !== expected.version) throw new Error(`installed ${entry.packageName} --version reported ${version}, expected ${expected.version}`)
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true })
+  }
+}
+```
+
+#### 4 个隔离策略
+
+1. **NODE_OPTIONS/NODE_PATH 清空**：宿主 Node hook 不污染。
+2. **DSH_HOME 重定向到 tmpdir**：不读宿主 home 的 credentials。
+3. **DSH_TELEMETRY_DISABLED=1**：装测不发送 telemetry。
+4. **`--omit=optional`**：可选依赖（Landlock 平台包需 musl toolchain）不强制安装。
+
+**含义**：发布的 tarball 必须能独立装在 tmpdir 跑通——workspace link 或陈旧 `lib/` 不能替代缺失文件。
+
+### 5.6 build-exe-for-python-sdk.ts：单文件 exe（625 行）
+
+这是把整个 Node 二进制塞进 Python wheel 的胶水代码（已在前几轮挖过），本轮不重复细节。关键点：
+- 用 `pkg --sea` 打单文件 exe
+- ASSET_GLOBS 排除符号链接
+- native-pty 的平台解析/装载
+
+### 5.7 AutoUpdate 缺失
+
+deepseek-harness **没有 auto-update 机制**：
+- bump 后输出 `git tag` 命令让人手工执行
+- publish 是 push-only，不通知客户端
+- Python wheel 无 self-update
+
+注释 `// CI never writes to the repository` 明确说明这是 release-as-commit-only 工作流。
+
+### 5.8 与前 9 轮的关系
+
+- 第八轮已挖过 release 序列（fam1/fam2/fam3）；本节深入 bump/publish/verify 子流程。
+- AutoUpdate 是前几轮未触及的空白。
+
+### 5.9 laew gap 推断
+
+| 序号 | 缺口 | 影响 | 建议 Rust crate |
+|------|------|------|----------------|
+| **L110** | 无自动化 release 脚本 | 全靠人工 bump + tag | `cargo-release` 或自实现 |
+| **L111** | 无发布序列分层（dsh / vendor） | monorepo 改一处全部 bump | workspace + per-crate versioning |
+| **L112** | 无 publish 重试 + integrity 对比 | npm 偶发 E409 卡发布 | 自实现 retry + sha512 对比 |
+| **L113** | 无 verify-packed-install | tarball 缺文件 publish 后才发现 | tmpdir + 跑 `--version` |
+| **L114** | 无单文件 exe 打包 | 安装需带 Node | `cargo-dist` 或 `pyo3` + `--sea` |
+| **L115** | 无 AutoUpdate | 用户永远停在旧版 | `cargo-update` + signed manifest |
+| **L116** | 无 prerelease tag (`--tag next`) | rc 版抢占 latest | 自实现 tag 选择 |
+| **L117** | 无 release artifact 签名 | 中间人篡改可静默 | `minisign` + manifest |
+| **L118** | 无 release channel（stable/beta） | 用户无法选择版本 | `cargo-release` channel 概念 |
+
+**优先级**：L110 (P0) / L111-L114 (P1) / L115-L118 (P2)
+
+---
+
+## 维度 6：WebSocket 与 SSE（webhook + gateway stream-server）
+
+### 6.1 现状：单 mux 路径 + 多逻辑流
+
+调研样本：
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `packages/api/gateway/src/stream-protocol.ts` | 407 | RemoteStreamClientMessage/ServerMessage + JSON 校验 |
+| `packages/api/gateway/src/stream-server.ts` | 208 | RemoteStreamMuxServer（WebSocket 多路复用） |
+| `packages/webhook/webhook/src/index.ts` | 178 | WebhookRuntime + rule 注册 + fire-and-forget |
+| `packages/webhook/webhook-github/src/handler.ts` | 130 | GitHub HMAC-SHA256 签名验证 + Octokit |
+| `packages/webhook/webhook-github/src/body.ts` | 69 | 有界 UTF-8 body 读取 |
+| `packages/webhook/webhook/src/session.ts` | 181 | 创建 Session + WebhookSource 注入 |
+
+### 6.2 单 mux 路径 + 多逻辑流
+
+`gateway/src/index.ts` 关键路由：
+
+```ts
+export const REMOTE_STREAM_MUX_PATH = '/api/remote.mux'
+export const REMOTE_EVENT_STREAM_ENDPOINT = '$events'
+export const REMOTE_EVENT_RESULT_ENDPOINT = '$events/result'
+export const REMOTE_EVENT_STREAM_PAYLOAD = { args: {} } as const
+export const REMOTE_EVENT_STREAM_READY = { type: 'ready' } as const
+```
+
+**所有 Remote 流（业务 + 事件）走同一个 WebSocket path**：
+
+```ts
+ctx.inject(['connection', 'webServer'], (webCtx) => {
+  const mux = new RemoteStreamMuxServer(
+    (endpoint, payload, signal) => this.openWireStream(endpoint, payload, signal),
+    this.wireStream.failure, resolved.websocketHeartbeatIntervalMs)
+  webCtx.effect(() => {
+    const route: WebUpgradeRoute = {
+      path: REMOTE_STREAM_MUX_PATH,
+      handler: (req, socket, head) => {
+        const rejection = webCtx.connection.requestRejection(req)
+        if (rejection !== undefined) {
+          rejectRemoteStreamUpgrade(socket, rejection)
+          return
+        }
+        mux.handleUpgrade(req, socket, head)
+      }
+    }
+    const unregister = webCtx.webServer.registerUpgrade(route)
+    return async () => { unregister(); await mux.close() }
+  }, ...)
+})
+```
+
+#### 4 个核心约束
+
+1. **路径唯一**：`/api/remote.mux` 是 sole WebSocket 路径，所有流都通过它——避免 N 个 path 的 N 个 upgrade。
+
+2. **requestRejection 在 upgrade 前**：HTTP 401/403 不转移 socket 所有权给 ws（`rejectRemoteStreamUpgrade` 直接 socket.end），避免半完成升级。
+
+3. **每条逻辑流有独立 streamId**：`RemoteStreamClientMessage = { type: 'open'|'cancel', streamId, endpoint, payload }`；服务端用 `Map<streamId, ActiveStream>` 跟踪。
+
+4. **二进制消息拒绝**：`socket.close(1003, 'text messages required')`——强制 text/JSON。
+
+### 6.3 WebSocket 心跳
+
+`stream-server.ts`：
+
+```ts
+private startHeartbeat(): void {
+  if (this.heartbeatTimer !== undefined) return
+  this.heartbeatTimer = setInterval(() => {
+    for (const socket of this.server.clients) {
+      if (socket.readyState === WebSocket.OPEN) socket.ping()
+    }
+  }, this.heartbeatIntervalMs)
+  this.heartbeatTimer.unref()
+}
+```
+
+3 个细节：
+- **lazy 启动**：第一个 upgrade 后才启动 setInterval
+- **`.unref()`**：timer 不阻塞进程退出
+- **每个 client 都 ping**：包括 idle 的
+
+### 6.4 RemoteEvent 投递（gateway 与 webhook 共享概念）
+
+`gateway/src/stream-protocol.ts` 4 类 wire frame：
+
+```ts
+export type RemoteEventDownlinkFrame =
+  | RemoteEventReadyFrame       // { type: 'ready', clientId, host }
+  | RemoteEventEmitFrame         // { type: 'emit', event, args }
+  | RemoteEventInvocationFrame   // { type: 'waterfall', event, eventId, agentId, request }
+  | RemoteEventCancellationFrame // { type: 'cancel', eventId }
+```
+
+Client 回传用 `$events/result` HTTP RPC：
+
+```ts
+export interface RemoteEventResult {
+  clientId: RemoteEventClientId
+  eventId: RemoteEventId
+  outcome:
+    | { kind: 'next' }
+    | { kind: 'result'; value?: unknown }
+    | { kind: 'rejected'; error: RemoteEventRejection }
+}
+```
+
+`projectRemoteEventRequest` 移除 `agent` / `signal` 字段，仅保留 JSON-safe request 字段。`restoreRemoteEventRejection` 反向重建 Error 链。
+
+### 6.5 WebhookRuntime：provider-neutral 事件入口
+
+`webhook/src/index.ts` 核心：
+
+```ts
+export class WebhookRuntime extends Service {
+  static inject = ['agents', 'agentDefaultModel', 'agentPresets', 'permissionPresets',
+    'sessionTitle', 'workspaceRegistry']
+
+  private readonly rules = new Map<WebhookRuleId, RuleRegistration>()
+  private readonly selfCtx: Context
+  private closing = false
+
+  register<K extends string>(rule: WebhookRule<K>): () => Promise<void> {
+    if (this.closing) throw new Error('webhook runtime is closing')
+    if (typeof rule.id !== 'string' || rule.id.trim() === '') throw new TypeError('webhook rule id must be a non-empty string')
+    ...
+    let registration!: RuleRegistration
+    const disposeEffect = this.ctx.effect(() => {
+      if (this.closing) throw new Error('webhook runtime is closing')
+      if (this.rules.has(rule.id)) throw new Error(`webhook rule "${rule.id}" is already registered`)
+      registration = {
+        rule: erased,
+        controller: new AbortController(),
+        active: new Set(),
+        closing: false,
+      }
+      this.rules.set(rule.id, registration)
+      return () => this.disposeRegistration(registration)
+    }, `webhookRuntime.register(${rule.id})`)
+    return async () => { await disposeEffect() }
+  }
+
+  dispatch<K extends string>(delivery: VerifiedWebhookDelivery<K>): void {
+    if (this.closing) throw new Error('webhook runtime is closing')
+    const snapshot = snapshotDelivery(delivery)
+    for (const registration of [...this.rules.values()]) {
+      if (registration.closing || registration.rule.kind !== snapshot.kind) continue
+      this.startInvocation(registration, snapshot)
+    }
+  }
+
+  private startInvocation(registration, delivery): void {
+    const tracked = Promise.resolve().then(async () => {
+      registration.controller.signal.throwIfAborted()
+      const request = await registration.rule.run(delivery, registration.controller.signal)
+      ...
+      if (request !== null) {
+        await createWebhookSession(this.selfCtx, delivery, registration.rule.id, request, registration.controller.signal)
+      }
+    }).catch((error) => {
+      if (registration.controller.signal.aborted) this.selfCtx.logger.debug(`${invocation} stopped after disposal: ${errorChain(error)}`)
+      else this.selfCtx.logger.warn(`${invocation} failed: ${errorChain(error)}`)
+    }).finally(() => registration.active.delete(tracked))
+    registration.active.add(tracked)
+  }
+}
+```
+
+#### 7 个关键设计
+
+1. **fire-and-forget dispatch**：dispatch 同步返回，rule 异步执行——不阻塞 HTTP ingress。
+
+2. **`kind` 路由**：registration.rule.kind 与 delivery.kind 匹配才触发；多 provider 不互相干扰。
+
+3. **dispose 是 async**：`register()` 返回 `() => Promise<void>` —— await effect disposer 是异步的，调用方必须 await。
+
+4. **dispose memoized**：`disposeRegistration` 用 `registration.disposal ??= ...` 防止双重 dispose。
+
+5. **abort during drain**：`disposeRegistration` 设 `closing = true`，从 rules map 删除，abort 所有 active，等待 active 全部 settled。
+
+6. **error 分类日志**：`controller.signal.aborted` 用 debug 级别（"按预期"），其他用 warn（"实际失败"）。
+
+7. **唯一动作 = 建 Session**：`createWebhookSession` 是唯一的 runtime action——webhook 收到事件后只能开新 Session（不能直接操作既有 Session）。
+
+### 6.6 GitHub Adapter：HMAC-SHA256 + 有界 body
+
+`webhook-github/src/handler.ts` 关键：
+
+```ts
+function requiredHeader(request, name): string {
+  const values = request.headersDistinct[name]
+  const value = values?.[0]
+  if (values?.length !== 1 || value === undefined || value.trim() === '') {
+    throw new WebhookHttpError(400, `missing ${name} header`)
+  }
+  return value
+}
+
+function isJsonContentType(value: string | undefined): boolean {
+  if (value === undefined) return false
+  const parts = value.split(';').map(part => part.trim())
+  const [mediaType, parameter, ...extra] = parts
+  if (mediaType?.toLowerCase() !== 'application/json') return false
+  if (parameter === undefined) return true
+  return extra.length === 0 && /^charset=(?:utf-8|"utf-8")$/i.test(parameter)
+}
+
+export function createGitHubWebhookHandler(ctx, config): WebRoute['handler'] {
+  return async (request, response) => {
+    try {
+      if (request.method !== 'POST') { response.setHeader('allow', 'POST'); throw new WebhookHttpError(405, ...) }
+      if (!isJsonContentType(request.headers['content-type'])) throw new WebhookHttpError(415, 'content type must be application/json')
+      const body = await readBoundedUtf8Body(request, config.maxBodyBytes)
+      const signature = requiredHeader(request, 'x-hub-signature-256')
+      const deliveryId = requiredHeader(request, 'x-github-delivery')
+      const eventName = requiredHeader(request, 'x-github-event')
+      const credential = await ctx.credentials.resolve(config.secretEnv)
+      if (credential === undefined || credential.value === '') throw new WebhookHttpError(503, 'GitHub webhook secret is unavailable')
+      let verified = false
+      try {
+        verified = await new Webhooks({ secret: credential.value }).verify(body, signature)
+      } catch {
+        // Octokit 验证错误携带不可信信息，不回传
+      }
+      if (!verified) throw new WebhookHttpError(401, 'invalid webhook signature')
+      const payload = parsePayload(body)
+      const delivery: VerifiedWebhookDelivery<'github'> = {
+        kind: 'github', source: WebhookSourceId(config.source),
+        deliveryId: WebhookDeliveryId(deliveryId), event: { name: eventName, payload },
+        receivedAt: Date.now(),
+      }
+      try {
+        ctx.webhookRuntime.dispatch(delivery)
+      } catch {
+        ctx.logger.warn('webhook-github: dispatch unavailable')
+        throw new WebhookHttpError(503, 'webhook runtime is unavailable')
+      }
+      respond(response, 202)
+    } catch (error: unknown) {
+      if (error instanceof WebhookHttpError) { respond(response, error.status, error.message); return }
+      ctx.logger.warn('webhook-github: request failed')
+      respond(response, 503, 'webhook ingress is unavailable')
+    }
+  }
+}
+```
+
+#### 6 个生产级细节
+
+1. **headersDistinct**：`values?.length !== 1` 拒绝重复头（一个 header 出现多次 = 错误）。
+2. **精确 content-type 校验**：`application/json` + 至多一个 `charset=utf-8` 参数（大小写不敏感），多余参数拒绝。
+3. **bounded body**：`maxBodyBytes` 硬上限，超限 WebhookHttpError 413。
+4. **signature 失败不泄漏原因**：catch block 不抛，只 `verified = false` —— 防 enumeration。
+5. **202 Accepted**：dispatch 同步返回后立即 202，告诉 sender 已接受处理（fire-and-forget 模式）。
+6. **503 兜底**：未预期的 catch 返 503 而非 500，避免 sender 重试攻击。
+
+### 6.7 createWebhookSession：唯一动作 = 建 Session
+
+`webhook/src/session.ts`：
+
+```ts
+export async function createWebhookSession(ctx, delivery, ruleId, request, signal): Promise<void> {
+  const resolved = resolveRequest(ctx, request)
+  ctx.permissionPresets.resolve(resolved.permissionPreset)
+  const preset = await ctx.agentPresets.resolve(resolved.agentPreset)
+  await ctx.agentPresets.standingKeyFor(preset.id)
+  signal.throwIfAborted()
+  const workspace = await ctx.workspaceRegistry.create(resolved.workspacePath)
+  ...
+  const handle = await ctx.agents.create({
+    sessionId, signal,
+    meta: { cwd: workspace.path, agentPreset: preset.id },
+    agentOptions: resolved.agentOptions,
+    setup: async (agentCtx) => {
+      await ctx.agentPresets.mount(agentCtx, preset.id)
+      installInitialModelSelection(agentCtx, resolved.modelSelection)
+    },
+  })
+  let attached = false
+  try {
+    await workspace.attachSession(sessionId); attached = true
+    ctx.permissionPresets.set(handle.agent.session, resolved.permissionPreset)
+    ctx.sessionTitle.rename(handle.agent.session, resolved.title)
+    handle.agent.followup(createUserMessage({
+      content: [{ type: 'text', text: resolved.prompt }],
+      source: {
+        kind: 'webhook',
+        provider: delivery.kind, source: delivery.source,
+        deliveryId: delivery.deliveryId, ruleId, form: 'notice',
+        summary: boundContextSummary(`${delivery.kind} webhook handled by ${ruleId}`),
+      },
+    }))
+  } catch (error: unknown) {
+    if (attached) {
+      try { await workspace.detachSession(sessionId) } catch (rollbackError) { reportRollbackFailure(...) }
+    }
+    try { await handle.dispose() } catch (rollbackError) { reportRollbackFailure(...) }
+    throw error
+  }
+}
+```
+
+#### 4 个关键设计
+
+1. **强校验**：`resolveRequest` 校验 workspacePath 绝对路径、title/prompt 非空、agentPreset 存在、maxTokens 正整数。
+
+2. **`form: 'notice'`**：`source.kind: 'webhook'` + `form: 'notice'` —— 与人类输入（`form: 'message'`）区分，UI 可做不同渲染。
+
+3. **`installInitialModelSelection` 装 first-request**：用 `ctx.on('agent/request', next => ...)` 拦截首次请求，覆盖默认模型路由。
+
+4. **rollback 不吞原始错误**：try/catch 失败时只 log rollback 失败，原始 error 继续向上抛。
+
+### 6.8 与前 9 轮的关系
+
+- 第八轮已挖过 WebSocket mux 与 webhook 部分；本节侧重 wire protocol 与 provider-neutral 抽象。
+
+### 6.9 laew gap 推断
+
+| 序号 | 缺口 | 影响 | 建议 Rust crate |
+|------|------|------|----------------|
+| **L119** | 无 WebSocket Mux | 长连接多路复用需要手实现 | `tokio-tungstenite` + 自实现 mux |
+| **L120** | 无 SSE 流式输出 | 模型长响应只能 wait 完整 | `eventsource-client` + axum sse |
+| **L121** | 无 Webhook runtime | 外部事件无法接入 | `axum` + `octokit-webhooks-rust` |
+| **L122** | 无 provider-neutral WebhookRule | 平台适配都要重写 | trait `WebhookRule` + adapter 包 |
+| **L123** | 无 HMAC-SHA256 验证 | webhook 易伪造 | `hmac` + `sha2` |
+| **L124** | 无 bounded body 读取 | 大 body OOM | `axum::body::Limited` |
+| **L125** | 无 fire-and-forget dispatch | webhook 阻塞 ingress | `tokio::spawn` 后立即 202 |
+| **L126** | 无 `form: 'notice'` source 区分 | 自动化输入渲染成人类消息 | 引入 message source kind |
+| **L127** | 无 `RemoteEvent` 推送通道 | UI 收不到跨 session 事件 | `tokio::sync::broadcast` |
+
+**优先级**：L120 (P0，需要流式) / L119 / L121 (P1) / L122-L127 (P2)
+
+---
+
+## 维度 7：DevContainer 与容器化（packages/e2b 3 包）
+
+### 7.1 现状：3 子包分层
+
+调研样本：
+
+| 包 | 行数 | 角色 |
+|---|------|------|
+| `packages/e2b/e2b/src/index.ts` | 182 | 共享 E2B sandbox owner |
+| `packages/e2b/fs-e2b/src/index.ts` | 582 | E2B filesystem adapter |
+| `packages/e2b/subprocess-e2b/src/index.ts` | 208 | E2B subprocess adapter |
+| `packages/e2b/subprocess-e2b/src/process.ts` | 698 | E2B 进程生命周期 |
+| `packages/e2b/subprocess-e2b/src/terminal.ts` | 567 | E2B 终端交互 |
+
+### 7.2 E2BRuntime：共享 sandbox owner
+
+`packages/e2b/e2b/src/index.ts`：
+
+```ts
+export class E2BRuntime extends Service {
+  static Config: z<Config> = z.object({
+    apiKey: z.string(),
+    cwd: z.string().default('/home/user/workspace'),
+    timeoutMs: z.number().default(300_000),
+  })
+
+  readonly cwd: string
+  readonly runtimeRoot: string
+
+  private readonly config: ResolvedConfig
+  private readonly ready: Promise<Sandbox>
+  private disposed = false
+
+  constructor(ctx: Context, config: Config) {
+    super(ctx, 'e2b')
+    const resolved = config as SchemaResolvedConfig
+    const apiKey = config.apiKey ?? process.env.E2B_API_KEY
+    this.config = { apiKey: apiKey ?? '', cwd: resolved.cwd, timeoutMs: resolved.timeoutMs }
+    this.validate()
+    this.cwd = this.config.cwd
+    this.runtimeRoot = posix.join(this.cwd, '.dsh-e2b')
+    this.ready = this.open()
+    void this.ready.catch(() => {})
+
+    ctx.effect(() => async () => {
+      this.disposed = true
+      let sandbox: Sandbox
+      try { sandbox = await this.ready }
+      catch (_sandboxSetupFailure) { return }  // open() 失败就不 kill
+      try { await sandbox.kill() }
+      catch (error: unknown) { if (!(error instanceof SandboxNotFoundError)) throw error }
+    }, 'e2b sandbox teardown')
+  }
+
+  async getSandbox(): Promise<Sandbox> {
+    if (this.disposed) throw new Error('E2B sandbox service is disposing')
+    const sandbox = await this.ready
+    if (this.disposed) throw new Error('E2B sandbox service is disposing')  // 二次检查
+    return sandbox
+  }
+
+  private async open(): Promise<Sandbox> {
+    const sandbox = await Sandbox.create({
+      apiKey: this.config.apiKey, timeoutMs: this.config.timeoutMs,
+      secure: true, lifecycle: { onTimeout: 'kill' },
+    })
+    try {
+      await sandbox.files.makeDir(this.cwd)
+      await sandbox.files.makeDir(this.runtimeRoot)
+      const runtimeRoot = await sandbox.files.getInfo(this.runtimeRoot)
+      if (runtimeRoot.type !== FileType.DIR || runtimeRoot.symlinkTarget !== undefined) {
+        throw new Error(`dsh-e2b: runtime root must be a real directory: ${this.runtimeRoot}`)
+      }
+      await sandbox.commands.run(
+        `chmod 700 -- ${quoteE2BShellArg(this.runtimeRoot)}`,
+        { envs: e2bControlEnvs() },
+      )
+      return sandbox
+    } catch (error: unknown) {
+      try { await sandbox.kill() }
+      catch (_sandboxSetupRollbackFailure) {
+        // TODO(e2b-setup-rollback): Add retry state only if a real double failure outlives E2B's configured sandbox timeout.
+      }
+      throw error
+    }
+  }
+}
+
+export function quoteE2BShellArg(value: string): string {
+  return `'${value.replaceAll('\'', "'\"'\"'")}'`
+}
+
+export function e2bControlEnvs(overrides: Readonly<Record<string, string>> = {}): Record<string, string> {
+  return { ...overrides, HOME: `/.dsh-e2b-control-${randomUUID()}` }
+}
+```
+
+#### 8 个生产级设计
+
+1. **API Key 永不转发进 sandbox**：注释明确 "It is never forwarded into the sandbox"。`e2bControlEnvs` 注入 HOME 随机化避免 bash -l 副作用。
+
+2. **`quoteE2BShellArg` 完整 shell 转义**：`'...\''` 模式（closing single quote + escaped single quote + opening single quote）—— 标准 bash 安全引号。
+
+3. **`runtimeRoot` 是独立目录**：`.dsh-e2b` 与工作目录分开，`chmod 700` 限权。
+
+4. **`open()` 自带 rollback**：创建 sandbox 失败时调用 `sandbox.kill()` 回滚——一个 sandbox 不会被泄漏。
+
+5. **`getSandbox` 双 dispose 检查**：进入 await 前 + await 后各检查一次 disposed——防止 awaiting 期间 disposal race。
+
+6. **`secure: true, lifecycle: { onTimeout: 'kill' }`**：E2B SDK 的安全标志 + 到期自动 kill。
+
+7. **`runtimeRoot` 类型校验**：`FileType.DIR && symlinkTarget === undefined`——非真实目录或符号链接都拒绝。
+
+8. **lazy ready**：`this.ready = this.open()` 不 await，构造快；adapters 用 `await getSandbox()` 懒等待。
+
+### 7.3 subprocess-e2b：subprocess 的 e2b 实现
+
+`packages/e2b/subprocess-e2b/src/index.ts`：
+
+```ts
+export class E2BSubprocessRuntime extends SubprocessRuntime {
+  static inject = ['e2b']
+  static Config: z<Config> = z.object({ pollMs: z.number().default(20) })
+
+  private readonly live = new Set<E2BSubprocessHandle>()
+  private readonly terminals = new Set<SubprocessTerminalHandle>()
+  private readonly terminalSetups = new Set<TerminalSetup>()
+  private readonly pollMs: number
+  private disposing = false
+
+  constructor(ctx: Context, config: Config) {
+    super(ctx)
+    const { pollMs } = config as SchemaResolvedConfig
+    if (!Number.isSafeInteger(pollMs) || pollMs <= 0) throw new Error('subprocess-e2b: pollMs must be a positive safe integer')
+    this.pollMs = pollMs
+    ctx.effect(() => async () => {
+      this.disposing = true
+      for (const setup of this.terminalSetups) setup.controller.abort(...)
+      await Promise.all([...this.terminalSetups].map(setup => setup.done))
+      const handles = [...this.live]
+      const terminals = [...this.terminals]
+      const pending: Promise<unknown>[] = []
+      for (const handle of handles) {
+        handle.terminate()
+        pending.push(handle.waitForExit().then(async () => {
+          await handle.done.catch(() => undefined)
+          this.live.delete(handle)
+        }))
+      }
+      for (const terminal of terminals) {
+        pending.push(terminal.terminate().then(() => { this.terminals.delete(terminal) }))
+      }
+      const outcomes = await Promise.allSettled(pending)
+      const failures = outcomes.flatMap(o => o.status === 'rejected' ? [o.reason] : [])
+      if (failures.length === 1) throw asError(failures[0])
+      if (failures.length > 1) throw new AggregateError(failures, 'subprocess-e2b: teardown failed')
+    }, 'e2b subprocess teardown')
+  }
+
+  async resolveExecutable(command, env?, signal?): Promise<string> {
+    if (command.length === 0) throw new Error('subprocess-e2b: executable name must be non-empty')
+    signal?.throwIfAborted()
+    const sandbox = await this.ctx.e2b.getSandbox()
+    if (posix.isAbsolute(command)) {
+      await sandbox.commands.run(
+        `test -f ${quoteE2BShellArg(command)} -a -x ${quoteE2BShellArg(command)}`,
+        { envs: e2bControlEnvs(), ...signalOpts(signal) },
+      )
+      signal?.throwIfAborted()
+      return command
+    }
+    if (command.includes('/')) throw new Error(`relative path; use absolute or bare PATH name`)
+    const path = env?.PATH
+    const prefix = path === undefined ? '' : `PATH=${quoteE2BShellArg(path)} `
+    const result = await sandbox.commands.run(
+      `${prefix}command -v -- ${quoteE2BShellArg(command)}`,
+      { cwd: this.ctx.e2b.cwd, envs: e2bControlEnvs(), ...signalOpts(signal) },
+    )
+    ...
+  }
+
+  spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    if (this.disposing) throw new Error('subprocess-e2b: service is disposing')
+    const program = spec.argv[0]
+    if (program === undefined || program.length === 0) throw new Error('invalid argv: expected non-empty program')
+    requireRepresentableGrace(spec.graceMs)
+    if (spec.signal?.aborted === true) throw new Error(`aborted before spawn: ${String(spec.signal.reason)}`)
+    const stateDir = posix.join(this.ctx.e2b.runtimeRoot, 'processes', randomUUID())
+    const handle = new E2BSubprocessHandle(this.ctx.e2b, spec, stateDir, this.pollMs)
+    this.live.add(handle)
+    const release = async () => { await handle.waitForExit(); this.live.delete(handle) }
+    void handle.done.then(release, release).catch((_) => {
+      // Retain the handle so service disposal can retry its cleanup transaction.
+    })
+    return handle
+  }
+}
+```
+
+#### 6 个关键设计
+
+1. **E2B 进程状态目录分离**：`runtimeRoot/processes/<uuid>` + `runtimeRoot/terminals/<uuid>` —— 不同类型不混。
+
+2. **`pollMs = 20`** 默认 20ms 轮询控制平面（每次一轮 = 一次远程 round trip）。
+
+3. **requireRepresentableGrace**：`graceMs` 必须 positive finite 且 ≤ MAX_TIMER_DELAY_MS（~24.85 天）—— 防止 setTimeout 溢出。
+
+4. **`resolveExecutable` 强校验**：绝对路径用 `test -f -x` 确认存在可执行；相对路径含 `/` 直接拒绝（用 absolute 或 bare PATH）；bare 名字用 `command -v` 找绝对路径。
+
+5. **deferred release 保留 handle**：handle 自动释放失败时保留 handle 给 disposal 重试。
+
+6. **terminalSetups 与 terminals 分离**：正在 setup 还没成为 terminal 的不计入 terminals（disposal 时一并清理）。
+
+### 7.4 E2B Output：base64 行帧
+
+`packages/e2b/subprocess-e2b/src/output.ts`（131 行，节选）：
+
+```ts
+const OUTPUT_ENCODER_SOURCE = [
+  '(async () => {',
+  '  for await (const chunk of process.stdin) {',
+  "    if (!process.stdout.write(chunk.toString('base64') + '\\n')) {",
+  "      await new Promise(resolve => process.stdout.once('drain', resolve))",
+  '    }',
+  '  }',
+  `  if (!process.stdout.write(${JSON.stringify(E2B_OUTPUT_COMPLETE_FRAME)} + '\\n')) {`,
+  "    await new Promise(resolve => process.stdout.once('drain', resolve))",
+  '  }',
+  '})().catch(() => { process.exitCode = 1 })',
+].join('\n')
+```
+
+把子进程的 stdout/stderr **行级 base64 帧化**：每行 base64 + `\n`，最后一行是 `E2B_OUTPUT_COMPLETE_FRAME` 哨兵。Host 用 base64 解码（可能含 binary）—— **传输层用文本通道，应用层还原 binary**。
+
+### 7.5 与 DevContainer / Docker 的区别
+
+deepseek-harness **没有 DevContainer 概念**（无 `.devcontainer/devcontainer.json`）；其"容器化"完全靠 E2B SDK（cloud sandbox）：
+
+- 不在本地用 Docker 构建容器
+- 不需要镜像仓库
+- 每次 Sandbox.create() 拉起云端 sandbox
+- 超时自动 kill
+
+**优点**：零本地依赖；**缺点**：依赖外部 SaaS、有网络延迟、需要 API Key。
+
+### 7.6 与前 9 轮的关系
+
+- 第八轮已挖过容器化（Landlock 是 OS-level sandbox）；本节聚焦 E2B（cloud sandbox）。
+
+### 7.7 laew gap 推断
+
+| 序号 | 缺口 | 影响 | 建议 Rust crate |
+|------|------|------|----------------|
+| **L128** | 无 cloud sandbox 集成 | 无法做隔离云端执行 | 接入 E2B SDK Rust 客户端 |
+| **L129** | 无 lazy ready promise | 构造时阻塞 | `tokio::sync::OnceCell<Sandbox>` |
+| **L130** | 无 API Key 隔离策略 | 密钥泄漏风险 | Keychain + 不转发 |
+| **L131** | 无 `quoteE2BShellArg` 等价 | 命令注入风险 | `shell-escape` crate |
+| **L132** | 无 rollback sandbox.kill() | 失败时泄漏 | RAII Drop + 二次 await |
+| **L133** | 无 base64 行帧编码 | binary 截断 / 错位 | `base64` crate + 行边界 |
+| **L134** | 无 bounded stdout/stderr | 长输出 OOM | `tokio::io::AsyncRead` + cap |
+| **L135** | 无 DevContainer 支持 | 无本地复现 | `devcontainer-cli` Rust 客户端 |
+| **L136** | 无 Docker/Podman | 需本地部署测试 | `bollard` / `podman-api` |
+
+**优先级**：L128 (P1) / L129-L134 (P2)
+
+---
+
+## 维度 8：CRDT 与多端冲突（packages/workspace + workspace-controller）
+
+### 8.1 现状：没有 CRDT，但有"domain write chain + canonical cwd + single-owner"组合
+
+调研样本：
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `packages/workspace/workspace/src/index.ts` | 663 | WorkspaceRegistry + 持久化 |
+| `packages/workspace/workspace/src/entity.ts` | 221 | WorkspaceEntity + mutate 单一写路径 |
+| `packages/workspace/workspace/src/paths.ts` | 22 | realpathNormalize |
+| `packages/workspace/workspace/src/spec.ts` | 75 | domain spec |
+| `packages/workspace/workspace/src/types.ts` | 104 | Workspace 类型 |
+| `packages/api/workspace-controller/src/index.ts` | 123 | Remote namespace 宿主 |
+| `packages/api/workspace-controller/src/feed.ts` | 184 | follow stream |
+| `packages/api/workspace-controller/src/commands.ts` | 196 | 7 个 Remote 方法 |
+
+### 8.2 WorkspaceEntity：单写路径 + 不变 cwd
+
+`packages/workspace/workspace/src/entity.ts`：
+
+```ts
+const unchangedSentinel = new Error('workspace record unchanged (internal sentinel)')
+
+export class WorkspaceEntity implements Workspace {
+  private record: WorkspaceRecord
+
+  constructor(private readonly host: WorkspaceEntityHost, readonly id: WorkspaceId, record: WorkspaceRecord) {
+    this.record = record
+  }
+
+  get path(): string { return this.record.path }
+  get title(): string { return this.record.title }
+  get sessionIds(): readonly SessionId[] {
+    return this.record.sessionIds.filter(id => this.host.sessionPath(id) === this.record.path)
+  }
+
+  async setTitle(title: string): Promise<void> {
+    await this.mutate(record => ({ ...record, title }))
+  }
+
+  async attachSession(sessionId: SessionId): Promise<void> {
+    if (!this.record.sessionIds.includes(sessionId)) {
+      const header = await this.host.readSessionHeader(sessionId)
+      if (header.cwd === undefined) throw new Error('its stored header carries no cwd')
+      let cwd: string
+      try { cwd = await realpathNormalize(header.cwd) }
+      catch (error) { throw new Error(`its cwd '${header.cwd}' does not resolve`, { cause: error }) }
+      if (!(await stat(cwd)).isDirectory()) throw new Error(`its cwd '${header.cwd}' is not a directory`)
+      if (cwd !== this.record.path) throw new Error(`its cwd resolves to '${cwd}'`)
+      this.host.rememberSessionPath(sessionId, cwd)
+    }
+    await this.mutate(record => record.sessionIds.includes(sessionId)
+      ? record
+      : { ...record, sessionIds: [sessionId, ...record.sessionIds] })
+  }
+
+  async insertSessionBefore(sessionId, beforeSessionId?): Promise<void> {
+    await this.mutate((record) => {
+      if (!record.sessionIds.includes(sessionId)) throw new WorkspaceMoveInvalidError(...)
+      if (beforeSessionId !== undefined && !record.sessionIds.includes(beforeSessionId)) throw new WorkspaceMoveInvalidError(...)
+      if (beforeSessionId === sessionId) return record
+      const without = record.sessionIds.filter(id => id !== sessionId)
+      const at = beforeSessionId === undefined ? without.length : without.indexOf(beforeSessionId)
+      const sessionIds = [...without.slice(0, at), sessionId, ...without.slice(at)]
+      return sessionIds.every((id, index) => id === record.sessionIds[index]) ? record : { ...record, sessionIds }
+    })
+  }
+
+  private async mutate(fn: (record: WorkspaceRecord) => WorkspaceRecord): Promise<void> {
+    let next: WorkspaceRecord
+    try {
+      next = await this.host.table().update(this.id, (current) => {
+        const changed = fn(current)
+        const sessionIds = changed.sessionIds.filter(id => this.host.sessionPath(id) === changed.path)
+        if (changed === current && sessionIds.length === current.sessionIds.length) {
+          throw unchangedSentinel
+        }
+        return { ...changed, sessionIds, updatedAt: new Date().toISOString() }
+      })
+    } catch (error) {
+      if (error === unchangedSentinel) return
+      throw error
+    }
+    this.record = next
+  }
+}
+```
+
+#### 6 个非显然设计
+
+1. **`realpathNormalize` 唯一规范化**：所有 cwd 比较都走 `fs.realpath`，避免 `/var` vs `/var/` vs 符号链接差异。
+
+2. **`sessionIds` 动态过滤**：不存死列表——`sessionIds` getter 实时用 `host.sessionPath(id) === record.path` 过滤，只保留 cwd 匹配当前 workspace path 的 session。**workspace 路径变了 → 自动剔除失效 session**。
+
+3. **`unchangedSentinel` 短路 no-op**：mutate fn 返回 current 引用 + sessionIds 无变化时抛 sentinel 终止 slot — 既不写存储，也不发 event。
+
+4. **`updatedAt: new Date().toISOString()` 在 mutate 末尾**：每次真写入都戳时间，no-op 不戳。
+
+5. **`attachSession` 严格 cwd 校验**：session 必须 header.cwd === workspace.path 才允许附加——"a session is on workspace X iff it was created with cwd = X"。
+
+6. **`insertSessionBefore` 返回 record 等价检查**：`sessionIds.every((id, index) => id === record.sessionIds[index])` —— 顺序未变时返回 current，触发 sentinel。
+
+### 8.3 WorkspaceRegistry：serialized operationTail
+
+`packages/workspace/workspace/src/index.ts`（节选）：
+
+```ts
+export class WorkspaceRegistry extends Service {
+  static inject = ['storageDomain', 'sessionPersistence']
+
+  private table?: KvTable<WorkspaceId, WorkspaceRecord>
+  private global?: DomainGlobal<WorkspaceDomainState>
+  private state?: WorkspaceDomainState
+  private readonly entities = new Map<WorkspaceId, WorkspaceEntity>()
+  private readonly headers = new Map<SessionId, SessionHeader>()
+  private readonly sessionPaths = new Map<SessionId, string>()
+  private readonly invalidSessionPaths = new Map<SessionId, string>()
+  private operationTail: Promise<void> = Promise.resolve()
+
+  protected async [Service.init](): Promise<void> {
+    const domain = await this.ctx.storageDomain.open(workspaceDomainSpec)
+    this.ctx.effect(() => () => domain.close(), 'workspace.domainClose')
+    this.table = domain.table('workspaces')
+    this.global = domain.global
+    this.state = domain.global.get()
+    await this.recoverPendingMutation()
+    this.validateStoredState(this.state)
+    if (!this.state.initialized) {
+      const headers = await this.ctx.sessionPersistence.list()
+      await this.replaceHeaderIndex(headers)
+      await this.bootstrap(headers)
+    } else if (this.table.size > 0) {
+      await this.replaceHeaderIndex(await this.ctx.sessionPersistence.list())
+    }
+    await this.indexLiveSessions()
+    this.validateStoredState(this.requireState())
+    this.rebuildEntities()
+    this.reportFilteredCandidates()
+  }
+
+  async create(path: string, title?: string): Promise<Workspace> {
+    const canonical = await realpathNormalize(path)
+    if (!(await stat(canonical)).isDirectory()) throw new Error(`not a directory`)
+    return await this.enqueueOperation(() => this.createCanonical(canonical, title))
+  }
+
+  private enqueueOperation<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.operationTail.then(() => fn())
+    this.operationTail = next.then(() => undefined, () => undefined)
+    return next
+  }
+}
+```
+
+#### 5 个反直觉特性
+
+1. **`operationTail` 串行化所有写**：每个写操作 `await this.operationTail` 后接续——`create`/`delete` 等不会并发改 workspace state。**单写者模型不需要 CRDT**。
+
+2. **`recoverPendingMutation()`**：初始化时检查 pending mutation，回滚或重放——**崩溃恢复 = 未完成操作的幂等回滚**。
+
+3. **`replaceHeaderIndex` 重建路径索引**：先列 sessionPersistence 的所有 header，再用 realpath 规范化路径——慢路径但只在启动跑一次。
+
+4. **`validateStoredState` 两遍**：init 开始一遍、init 结束再一遍——"an unavailable peer can never be mistaken for an empty history and commit the initialized marker"。
+
+5. **`sessionPersistence` 是必选依赖**：注释明确——否则 missing session 会误判成"新工作区"而 commit `initialized: true`，导致后续真实 session 被忽略。
+
+### 8.4 WorkspaceFeed：basline + 增量推送
+
+`packages/api/workspace-controller/src/feed.ts`（184 行）实现 `follow(signal): AsyncIterable<WorkspaceFollowFrame>`：
+
+- 第 1 帧：完整 baseline（所有 workspaces 当前快照）
+- 后续帧：mutation 增量（新增/删除/排序变化）
+
+**Stream Remote method 模式**让前端 reconnect 后从 baseline 重新同步，无需在客户端维护事件日志。
+
+### 8.5 与 CRDT 的对比
+
+deepseek-harness **完全没有 CRDT**（无 Yjs/yrs/automerge）。它用：
+
+| 机制 | CRDT 替代 | 适用场景 |
+|------|----------|---------|
+| `operationTail` 串行化写 | LWW Register | 单进程写 |
+| `realpathNormalize` 路径统一 | OR-Set | 文件路径 |
+| `sessionIds.filter` 动态过滤 | Tombstone | 失效 session 自动剔除 |
+| `follow stream` baseline + 增量 | G-Set merge | 前端重连 |
+| `validateStoredState` 两遍 | 强一致读 | 启动不丢数据 |
+
+**核心哲学**：让"同一时间只有一个写者"成立，就不需要 CRDT。代价：多端同时编辑会冲突（但 deepseek-harness 的 workspace 是注册目录，不是文档——编辑冲突很少）。
+
+### 8.6 与前 9 轮的关系
+
+- 第八轮挖过 **多租户与团队记忆**（TencentDB-Agent-Memory L0-L3）；本节聚焦 workspace 层而非 session。
+- 第三轮挖过 **持久化与崩溃恢复**；本节细化 workspace 域的持久化模式。
+
+### 8.7 laew gap 推断
+
+| 序号 | 缺口 | 影响 | 建议 Rust crate |
+|------|------|------|----------------|
+| **L137** | 无 Workspace 概念（仅 SQLite 存 provider） | 无法跨进程关联 | 引入 `WorkspaceRegistry` trait |
+| **L138** | 无 `realpathNormalize` 唯一路径 | 同一目录多 ID | `nix::fcntl` + `realpath` crate |
+| **L139** | 无 `operationTail` 串行化写 | 多 Agent 并发改 state race | `tokio::sync::Mutex` 全局 |
+| **L140** | 无 `recoverPendingMutation` 崩溃恢复 | 启动丢数据 | SQLite WAL + 事务日志 |
+| **L141** | 无 `unchangedSentinel` no-op 短路 | 空写也写 storage | 比对 snapshot + 跳过 |
+| **L142** | 无 `sessionIds` 动态过滤 | 失效 session 残留 | 实时 join |
+| **L143** | 无 `follow stream` baseline + 增量 | 前端 reconnect 丢上下文 | `tokio::sync::broadcast` |
+| **L144** | 无 WorkspaceFeed（UI 显示 workspaces） | 用户不知有哪些工作区 | TUI 屏 + Remote namespace |
+| **L145** | 无 CRDT | 多端并发编辑冲突 | `yrs` (Yjs Rust port) |
+| **L146** | 无 Session header cwd 校验 | 跨 workspace 误绑 | 启动时 fs.realpath |
+
+**优先级**：L137-L138 (P0) / L139-L144 (P1) / L145-L146 (P2)
+
+---
+
+## 第十轮小结：8 维度的合并启示
+
+### 3 大横向发现
+
+**发现 1：错误恢复 = 包级契约 + 工具策略 + 跨进程事件**
+
+- `runtime-diagnostics/invariants`（包级契约）+ `guard/timeout-policy` + `guard/repeat-tool-reminder`（工具策略）+ `credentials/authorization`（跨进程事件）共同构成"错误恢复四件套"。
+- 没有 panic hook、没有 crash dump 到磁盘、没有 OTel trace —— **deepseek-harness 的"恢复"是进程内不变量 + 工具超时 + 软提醒 + 通知**。
+
+**发现 2：WebUI = 单 mux + 多逻辑流 + Worker 装 Harness**
+
+- 单 WebSocket path `/api/remote.mux` 承载所有 Remote 流（业务 + 事件）。
+- 所有 Remote 调用都是"endpoint = namespace/method"，严格 schema 校验，wire field 精确 keys 校验。
+- 浏览器 Worker 装整个 Harness（VFS tar + 同 bundle worker + Node shim），prebuild debug 与生产 build 100% 一致。
+- `INVALID` code 错误重新抛出保留原始 error 链。
+
+**发现 3：i18n / Release / Workspace 都有"git-as-source-of-truth"哲学**
+
+- i18n：双语 owner 在 git blob hash + 配对元数据驱动，merge 时 fail-closed。
+- Release：版本号在 git commit + 人手工 tag + verify-packed-install，CI 不写仓库。
+- Workspace：路径在 `realpathNormalize` + `sessionIds.filter` 实时规范化，崩溃恢复走 `recoverPendingMutation`。
+
+### laew 综合 gap 路线图（L79-L146）
+
+按优先级排序：
+
+| 类别 | Gap | 优先级 | 建议 crate |
+|------|-----|--------|-----------|
+| P0 紧急 | L79 panic hook / L93 API Key 明文 / L101 双语体系 / L110 自动化 release / L137 Workspace 概念 / L86 WebUI | P0 | `human-panic` + `keyring` + 同源双语 + `cargo-release` + `WorkspaceRegistry` + `tauri` |
+| P1 重要 | L80 包级 invariant / L81 工具超时 / L82 重复提醒 / L87-L88 API 网关 / L96 OAuth flow / L102 prompt-v4 / L111-L114 release 子流程 / L119-L121 WS/SSE/Webhook / L128 cloud sandbox / L138-L144 Workspace / L52 多账号 | P1 | 多种 |
+| P2 进阶 | L83-L85 / L89-L92 / L94-L100 / L103-L109 / L115-L118 / L122-L127 / L129-L136 / L145-L146 | P2 | 多种 |
+
+**汇总 41 个新 gap**（L79-L119 = 41 项）；加上第九轮的 L1-L78（41 项），共 82 个 gap。
+
+### 关键文件路径汇总（第十轮新增）
+
+| # | 文件（相对 `/usr/local/LsmGitOpenSource/deepseek-harness/`） | 行数 | 本轮角色 |
+|---|---|---|---|
+| 1 | `packages/runtime-diagnostics/invariants/src/index.ts` | 200 | InvariantRegistry：包级契约 + 正则门控 |
+| 2 | `packages/runtime-diagnostics/invariants/src/invariant.ts` | 30 | 自指 no-op companion |
+| 3 | `packages/guard/timeout-policy/src/index.ts` | 81 | 工具超时强制限速 + 自识别 |
+| 4 | `packages/guard/repeat-tool-reminder/src/index.ts` | 233 | 重复工具调用软提醒 + canonicalize |
+| 5 | `packages/credentials/credentials/src/index.ts` | 315 | CredentialProvider 双钥匙空间 + INVARIANT 重新抛出 |
+| 6 | `packages/credentials/credentials-local/src/index.ts` | 935 | 4 层优先级 + YAML 严格校验 + 文件权限 |
+| 7 | `packages/credentials/authorization/src/index.ts` | 437 | OAuth attempt 编排 + 6 个生产级保证 |
+| 8 | `apps/web/index.html` + `apps/web/src/{main,preview}.ts` | 33 | WebUI 极简脚手架 + Worker 启动器 |
+| 9 | `apps/web/package.json` + `apps/web/vite.config.ts` | — | Vite + Playwright 配置 |
+| 10 | `apps/web/stress-tests/reasoning-chunks.stress.ts` | 153 | 浏览器 100K chunk 渲染压测 |
+| 11 | `packages/api/gateway/src/index.ts` | 1216 | TypertGatewayService：双 transport + STRICT/SRC |
+| 12 | `packages/api/gateway/src/stream-protocol.ts` | 407 | Wire 协议：3 类 frame + exactKeys 校验 |
+| 13 | `packages/api/gateway/src/stream-server.ts` | 208 | RemoteStreamMuxServer + 心跳 |
+| 14 | `packages/api/session-controller/src/{commands,agent}.ts` | 1130 | Session CRUD + cwd/preset conflict |
+| 15 | `packages/api/workspace-controller/src/{index,feed,commands}.ts` | 503 | Workspace Remote namespace + follow stream |
+| 16 | `packages/webhook/webhook/src/{index,session,types}.ts` | 443 | WebhookRuntime + Session 创建 |
+| 17 | `packages/webhook/webhook-github/src/{handler,body}.ts` | 199 | GitHub HMAC-SHA256 + bounded body |
+| 18 | `packages/e2b/e2b/src/index.ts` | 182 | E2BRuntime + lazy ready + rollback |
+| 19 | `packages/e2b/fs-e2b/src/index.ts` | 582 | E2B filesystem adapter |
+| 20 | `packages/e2b/subprocess-e2b/src/{index,process,terminal,output,remote,environment}.ts` | 1826 | E2B subprocess + base64 行帧 |
+| 21 | `packages/workspace/workspace/src/{index,entity,paths,spec,types}.ts` | 1105 | WorkspaceRegistry + Entity mutate |
+| 22 | `packages/experimental/webworker-runtime/README.md` | — | 浏览器装整个 Harness |
+| 23 | `packages/experimental/webworker-packer/README.md` | — | VFS tar 打包 |
+| 24 | `packages/experimental/inspector/README.md` | — | Chrome DevTools 集成（CDP-free） |
+| 25 | `scripts/translation-prompt.ts` | 259 | prompt-v4 三段式 |
+| 26 | `scripts/translation-pairing.ts` | 442 | 配对元数据 + 结构签名 |
+| 27 | `scripts/translation-pairing-merge.ts` | 408 | git merge 驱动 fail-closed |
+| 28 | `scripts/translation-brief.ts` | 442 | 最小更新 briefing |
+| 29 | `scripts/translation-links.ts` | 442+ | locale-aware 链接重写 |
+| 30 | `docs/i18n/{terminology,style-samples,translation-prompt}.md` | — | 翻译契约 + 词表 + 风格样本 |
+| 31 | `scripts/release/{families,bump,publish,pack,tarball,verify-packed-install,verify}.ts` | 1393 | Release 自动化 5 步 |
+| 32 | `scripts/build-exe-for-python-sdk.ts` | 625 | 单文件 exe 打包（pkg --sea） |
+| 33 | `*.i18n.yaml` sidecars | — | 双语 owner 记录 |
+| 34 | `README.{md,zh.md}` × 12+ 文件 | — | 双语成对产物 |
+
+### 与前 9 轮的不重复声明
+
+本轮（第十轮）新覆盖：
+
+- 之前 9 轮完全未触及：`runtime-diagnostics`、`guard`、`credentials`、`credentials-local`、`authorization`、`webhook`、`webhook-github`、`e2b`（3 子包）、`workspace`（entity）、`workspace-controller`、`web/web`、`web/tool-web`、`api/gateway`、`api/session-controller`、`experimental/webworker-runtime/packer/inspector`、`scripts/translation-*`、`scripts/release/*`、`scripts/build-exe-for-python-sdk`。
+- 部分覆盖（在第八/九轮基础上深入）：HTTP/SSE/WebSocket 走 `/api/remote.mux` 单 mux（第八轮已挖过 mux 的 client 端）；Release 序列分层（第八轮已挖过 fam1/fam2/fam3 拓扑，本轮深入 bump/publish/verify 子流程）；Telemetry/Session 持久化（第八轮已挖过，本轮不再展开）。
+
+### 第十轮新发现的「不重复项」（避免后续轮次误挖）
+
+- `INVARIANT` 错误码 = 所有 `fanOut` 监听器语义统一契约（不要在 11 轮再挖）
+- `realpathNormalize` = 所有路径比较的唯一入口（不要在 11 轮再挖）
+- `operationTail` = WorkspaceRegistry 串行化写 = 不需要 CRDT 的根本原因（不要在 11 轮再挖）
+- `prompt-v4` 三段式 = 双语翻译的唯一契约（不要在 11 轮再挖）
+- `/api/remote.mux` 单 mux = 所有 Remote 流的唯一路径（不要在 11 轮再挖）
+- `e2b ControlEnvs` 注入随机 HOME = sandbox 隔离的核心（不要在 11 轮再挖）
+- `runtime-diagnostics/invariants` 是包级而非全局的（不要在 11 轮再挖全局 invariant）
+
+### 一句话总结
+
+> deepseek-harness 在第十轮的 8 维度展现了一个高度工程化、自洽的 TypeScript Agent 体系：
+> **runtime-diagnostics 把契约下放到包级；guard 把策略放到工具执行管道；credentials/authorization 把 OAuth 协议中立化；i18n 把翻译变成 git merge；Release 把发布变成 5 步可重入流水线；WebSocket/SSE 收敛到单 mux；DevContainer 交给 E2B；多端冲突用单写者模型避免 CRDT**。
+> 对 laew 的核心启示：**用「分层 seam」（diagnostics / guard / credentials / i18n / release / mux / sandbox / registry）替代「单一巨石层」**，每个 seam 可独立演进、独立测试、独立替换。

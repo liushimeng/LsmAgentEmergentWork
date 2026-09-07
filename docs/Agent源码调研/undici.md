@@ -10038,3 +10038,2720 @@ function createRedirectInterceptor ({ maxRedirections: defaultMaxRedirections, t
 - **第 4/7/8/9/12/13 章**：API 风格、Mock、错误类层次（本轮仅新增引用 `SecureProxyConnectionError`/`ProxyConnectionError`/`Socks5ProxyError` 在代理上下文中的语义，不重复类层次表）、基础设施、Mock 深度、laew 借鉴主文。
 
 本轮四个维度（HTTP/3 QUIC、代理链 SOCKS、TLS 证书 Client Hello、Cookies 重定向）均为**前七轮未覆盖的全新维度**，所有结论附 `lib/xxx.js:LINE` 真实路径与代码片段。
+# undici 第十轮深挖 — 8 大新维度完整剖析（2026-09-07）
+
+> 本文档是 undici 源码调研的第十轮深挖，在前九轮已覆盖的项目元信息、核心架构、llhttp WASM、5 种 API 风格、8 个拦截器、Mock 录制回放、Web 标准实现、错误类层次、基础设施、连接池 KeepAlive、HTTP/2 多路复用、DiagnosticsChannel、背压流控、HTTP/3 QUIC 实验、代理链 SOCKS、TLS 证书、Cookies 重定向管理（第 15 章）等基础上，对 8 个维度做**更深一层的实现级剖析**。
+
+## 本轮不重复声明
+
+本轮（第十轮）**刻意不重复**以下已有内容：
+
+- **第 15 章（第八轮）**：HTTP/3 QUIC 实验性支持（Alt-Svc 白名单）、SOCKS5 代理链（socks5-client.js）、TLS 证书（connect.js SNI/ALPN/session 复用）、Cookies 重定向（redirect-handler.js 环检测 + 头清洗）—— 本轮从**实现细节、状态机、帧格式、性能优化、安全防护**角度重新剖析，引用第 15 章结论但不重复其代码段。
+- **第 5 章（拦截器总览）**：8 个拦截器的职责速览 —— 本轮聚焦**拦截器组合拓扑、性能开销、与 handler 装饰器链的耦合**。
+- **第 6 章（Mock 体系）**：MockAgent/MockClient 基本结构 —— 本轮深入**Snapshot 三态机、录制回放并发安全、匹配算法复杂度**。
+- **第 7 章（Web API）**：fetch/WebSocket/EventSource 概述 —— 本轮剖析**WebSocket 帧状态机、Fetch 内部请求流水线、Body Mixin 内存模型**。
+- **第 14 章（第七轮）**：连接池/HTTP/2/背压 —— 本轮仅在 WebSocket over H2 一处交叉引用，不展开。
+
+---
+
+
+## 16. 维度一：WebSocket 帧状态机与协议层完整剖析
+
+### 16.1 维度概览
+
+WebSocket 在 undici 中是一套**完整的 WHATWG WebSocket API 实现**（`lib/web/websocket/`，约 4,300+ 行），覆盖 RFC 6455 协议的所有细节：
+- 握手协议（Upgrade/Connection/Sec-WebSocket-Key/Sec-WebSocket-Accept/Sec-WebSocket-Extensions）
+- 帧协议（FIN/RSV/opcode/payload length/masking）
+- 分片与重组
+- 控制帧（PING/PONG/CLOSE）
+- 扩展：`permessage-deflate`（RFC 7692）
+- 关闭握手（双向 close 帧 + 超时兜底）
+- HTTP/2 over WebSocket（实验性）
+- 诊断通道：`undici:websocket:ping`/`pong`/`socket-error`
+
+第 7 章已从「WHATWG 规范映射角度」做基础覆盖。本轮深入**状态机、帧解析、扩展协商、内存优化**四个层面。
+
+### 16.2 帧解析器状态机（`lib/web/websocket/receiver.js`）
+
+`ByteParser extends Writable` 是一个**字节级增量解析器**，内部维护 5 个状态：
+
+```
+INFO ──────► PAYLOADLENGTH_16 ──────► READ_DATA ──────► INFO
+                  PAYLOADLENGTH_64 ──────► READ_DATA
+```
+
+**关键设计：**
+
+1. **状态序列化在对象上**：`#state`（当前状态）、`#info`（当前帧头解析结果）、`#fragments`（分片累积缓冲）、`#byteOffset`（已缓冲总字节数）、`#loop`（当前帧是否还有未读字节）。这避免了「流式多帧交错」的复杂度 —— 每个 chunk 进入都从头跑状态机直到 buffer 耗尽或缺字节。
+
+2. **三种 payload 长度编码**（RFC 6455 §5.2）：
+   ```javascript
+   if (payloadLength <= 125) { /* 7-bit 直读 */ }
+   else if (payloadLength === 126) { /* 接下来 2 字节 big-endian uint16 */ }
+   else if (payloadLength === 127) { /* 接下来 8 字节，但 high 4 字节必须为 0，low 必须 ≤ 2^31-1 */ }
+   ```
+   127 的 64 位长度理论上可达 2^63，但 undici 限制为 **2^31-1（与 V8 ArrayBuffer 上限对齐）**，超出则 `failWebsocketConnection(handler, 1009, 'Received payload length > 2^31 bytes.')`。这是 **32 位架构下的安全裁剪**，避免大长度导致 Buffer 分配失败。
+
+3. **RSV 位校验**（第 135-143 行）：
+   ```javascript
+   if (rsv1 !== 0 && !this.#extensions.has('permessage-deflate')) {
+     failWebsocketConnection(this.#handler, 1002, 'Expected RSV1 to be clear.')
+   }
+   if (rsv2 !== 0 || rsv3 !== 0) {
+     failWebsocketConnection(this.#handler, 1002, 'RSV1, RSV2, RSV3 must be clear')
+   }
+   ```
+   RSV1 在 `permessage-deflate` 协商时用作「Per-Message Compressed」标记；RSV2/RSV3 未分配语义，必须为 0。**严格遵循 RFC 6455 §5.2** —— 任何非预期的 RSV 位都直接 fail。
+
+4. **fragment 累积**（第 257-301 行）：分片消息累积到 `#fragments: Buffer[]`，`#fragmentsBytes` 跟踪总大小。`consumeFragments()` 在最后一片到达时合并（单片则直接 shift，O(1)；多片用 `Buffer.allocUnsafeSlow` + `Buffer.set` 拷贝）。
+
+5. **`#maxPayloadSize` 校验**（`#validatePayloadLength`，第 78-89 行）：对非控制帧，在读到 payload 长度后立即校验「单帧 + 已累积分片」总大小。**校验点提前**（在分配 payload buffer 之前），避免先分配大 buffer 再发现超限 → 拒绝服务攻击防护。
+
+6. **控制帧约束**（第 164-169 行）：
+   ```javascript
+   if ((payloadLength > 125 || fragmented) && isControlFrame(opcode)) {
+     failWebsocketConnection(this.#handler, 1002, 'Control frame either too large or fragmented')
+   }
+   ```
+   PING/PONG/CLOSE payload ≤ 125 字节 + **禁止分片**，符合 RFC 6455 §5.5。
+
+7. **服务端帧掩码校验**（第 121-124 行）：
+   ```javascript
+   if (masked) {
+     failWebsocketConnection(this.#handler, 1002, 'Frame cannot be masked')
+   }
+   ```
+   **服务端发送的帧禁止掩码**（客户端必须 fail connection）。这是 RFC 6455 §5.1 反向防护 —— 阻止中间人注入已掩码的帧绕过合法客户端校验。
+
+### 16.3 帧构造与发送（`lib/web/websocket/frame.js` + `sender.js`）
+
+**`WebsocketFrameSend.createFrame(opcode)`**（第 31-79 行）：
+
+```javascript
+const maskKey = generateMask()  // 4 字节随机掩码
+const bodyLength = frameData?.byteLength ?? 0
+let payloadLength = bodyLength  // 7-bit
+let offset = 6                  // 1B FIN+opcode + 1B MASK+len + 4B mask
+
+if (bodyLength > maxUnsigned16Bit) {
+  offset += 8
+  payloadLength = 127
+} else if (bodyLength > 125) {
+  offset += 2
+  payloadLength = 126
+}
+
+const buffer = Buffer.allocUnsafe(bodyLength + offset)
+buffer[0] |= 0x80                                    // FIN bit
+buffer[0] = (buffer[0] & 0xF0) + opcode
+buffer[offset - 4..offset - 1] = maskKey            // mask key 在 offset-4..offset-1 位置
+buffer[1] = payloadLength
+if (payloadLength === 126) {
+  buffer.writeUInt16BE(bodyLength, 2)               // 16-bit 长度写到 [2..3]
+} else if (payloadLength === 127) {
+  buffer.writeUIntBE(bodyLength, 4, 6)              // 64-bit 长度写到 [4..9]（前面 2 字节清零）
+}
+buffer[1] |= 0x80                                   // MASK bit
+for (let i = 0; i < bodyLength; ++i) {
+  buffer[offset + i] = frameData[i] ^ maskKey[i & 3]  // XOR 掩码
+}
+```
+
+**关键技术点：**
+
+1. **`Buffer.allocUnsafe` 而非 `allocUnsafeSlow`**：帧构造是热路径，必须从 V8 新生代分配池里快速拿内存。`allocUnsafe` 仅当 body 很大（>4KB）时才与 `allocUnsafeSlow` 等价。
+
+2. **「热路径专用」`createFastTextFrame`（静态方法，第 84-121 行）**：针对 string hint 的文本帧，**原地 XOR 掩码**（直接修改 `buffer`），**省一次 header 拷贝**。这与 `createFrame` 的「先建 header 再合并 body」分离路径对比：
+   ```javascript
+   static createFastTextFrame (buffer) {
+     // 原地掩码：buffer[i] ^= maskKey[i & 3]
+     const head = Buffer.allocUnsafeSlow(offset)  // header 用 allocUnsafeSlow（小，频繁）
+     ...
+     return [head, buffer]  // 返回 [header, 掩码后的body]，调用方做双 write + cork
+   }
+   ```
+   配合 sender.js 第 36-42 行的 `socket.cork()` + `write(head)` + `write(body, cb)` + `uncork()` —— **cork 让两个 write 合并为一个 TCP 包**，避免 Nagle 算法的额外延迟。
+
+3. **掩码生成性能优化**（`generateMask`，第 15-21 行）：
+   ```javascript
+   let buffer = null
+   let bufIdx = BUFFER_SIZE
+   function generateMask () {
+     if (bufIdx === BUFFER_SIZE) {
+       bufIdx = 0
+       randomFillSync((buffer ??= Buffer.allocUnsafeSlow(BUFFER_SIZE)), 0, BUFFER_SIZE)
+     }
+     return [buffer[bufIdx++], buffer[bufIdx++], buffer[bufIdx++], buffer[bufIdx++]]
+   }
+   ```
+   **8KB 大缓冲区批量填充 + 4 字节游标消耗**。每次发送 1 帧消耗 4 字节，平均每 2048 次发送才一次 `randomFillSync`。这是 Node.js 团队反复优化的「减少 syscall」模式 —— 同样的模式在 llhttp 时间戳生成（`request.js`）、UUID 生成（Node.js 内部）都可见。
+
+4. **发送队列 + cork/uncork**（`sender.js:SendQueue`）：`#queue: FixedQueue`（复用 dispatcher/fixed-queue.js 的无锁环形队列）。`#running` 标志位防止并发 `#run()`。blob hint 走 `arrayBuffer()` Promise → 创建 frame 异步路径（避免主线程阻塞）。
+
+### 16.4 握手协议（`lib/web/websocket/connection.js`）
+
+`establishWebSocketConnection(url, protocols, client, handler, options)` 完全按 **WHATWG WebSocket API §5「Establish a WebSocket connection」** 实现：
+
+1. **scheme 转换**（第 29-31 行）：`ws:` → `http:`，`wss:` → `https:`。WebSocket 握手本质是 HTTP Upgrade 请求。
+
+2. **构造 Request 对象**（第 37-47 行）：
+   ```javascript
+   const request = makeRequest({
+     urlList: [requestURL],
+     client,
+     serviceWorkers: 'none',
+     referrer: 'no-referrer',
+     mode: 'websocket',
+     credentials: 'include',
+     cache: 'no-store',
+     redirect: 'error',       // WebSocket 握手禁止重定向
+     useURLCredentials: true
+   })
+   ```
+
+4. **强制头注入**（第 64-79 行）：
+   - `sec-websocket-key`: `crypto.randomBytes(16).toString('base64')` —— 16 字节 nonce
+   - `sec-websocket-version: '13'`
+   - `sec-websocket-protocol`: 用户指定的子协议（逗号分隔列表）
+   - `sec-websocket-extensions: 'permessage-deflate; client_max_window_bits'` —— 默认开启压缩
+
+5. **response 校验**（`processResponse`，第 96-216 行）：
+   - HTTP/1.1：必须 `status === 101`
+   - HTTP/2：必须 `status === 200`（H2 无显式 101，状态码恒为 200，握手由 HTTP/2 CONNECT 帧语义承载）
+   - `Sec-WebSocket-Accept` 校验：`crypto.hash('sha1', keyValue + uid, 'base64')` 比对 —— 这是 RFC 6455 §4.1 规定的「魔法字符串」握手校验
+   - `Sec-WebSocket-Extensions` 协商：必须包含 `permessage-deflate`，否则 fail
+   - `Sec-WebSocket-Protocol` 协商：必须从客户端列表中选取
+
+6. **HTTP/2 over WebSocket 实验性警告**（第 115-118 行）：
+   ```javascript
+   if (warningEmitted === false && response.socket?.session != null) {
+     process.emitWarning('WebSocket over HTTP2 is experimental, and subject to change.', 'ExperimentalWarning')
+     warningEmitted = true
+   }
+   ```
+   `response.socket?.session != null` 是 H2 标记（session 是 H2 client 的 TLS session 属性）。WebSocket 走 H2 在 RFC 8441 定义（`extended CONNECT`），undici 支持但视为实验。
+
+7. **握手成功后事件挂钩**（第 209-214 行）：
+   ```javascript
+   response.socket.on('data', handler.onSocketData)
+   response.socket.on('close', handler.onSocketClose)
+   response.socket.on('error', handler.onSocketError)
+   handler.wasEverConnected = true
+   handler.onConnectionEstablished(response, extensions)
+   ```
+
+### 16.5 permessage-deflate 扩展（`lib/web/websocket/permessage-deflate.js`）
+
+RFC 7692 实现。**关键决策**：
+
+1. **裸 zlib DEFLATE**：第 80-83 行
+   ```javascript
+   this.#inflate.write(chunk)
+   if (fin) {
+     this.#inflate.write(tail)  // tail = [0x00, 0x00, 0xff, 0xff]
+   }
+   ```
+   末尾 4 字节 `0x00 0x00 0xff 0xff` 是 RFC 7692 §7.2.2 规定的「deflate 同步序列」 —— 让 zlib 能识别消息结束。
+
+2. **windowBits 协商**：`serverMaxWindowBits` 从 `Sec-WebSocket-Extensions` header 解析（例 `server_max_window_bits=10`），`isValidClientWindowBits` 限制在 8-15 之间。
+
+3. **累积 buffer + 长度限制**（第 61-72 行）：
+   ```javascript
+   this.#inflate.on('data', (data) => {
+     this.#inflate[kLength] += data.length
+     if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
+       callback(new MessageSizeExceededError())
+       this.#inflate.removeAllListeners()
+       this.#inflate = null
+       return
+     }
+     this.#inflate[kBuffer].push(data)
+   })
+   ```
+   **在累积阶段就检查解压后大小**（zip bomb 防护）。一旦超限立即 `removeAllListeners()` 并把 `#inflate` 置 null —— 下次解压会重新创建 Inflate 实例（这是为什么 `#inflate` 在 success/error 回调里都被置 null 的原因）。
+
+### 16.6 关闭握手（`lib/web/websocket/connection.js:227-297`）
+
+`closeWebSocketConnection` 实现 WHATWG §5.2「Close the WebSocket connection」算法：
+
+1. **状态机分支**（第 242-296 行）：
+   - CLOSING/CLOSED：do nothing
+   - 未建立 + 未发送 close 帧：`failWebsocketConnection(object)` + readyState → CLOSING
+   - 已建立 + 未发送未收到 close 帧：构造 close 帧并发送 → CLOSING
+   - 已发送或已收到 close 帧：仅标记 CLOSING（等对端回 close 帧或 TCP 关闭）
+
+2. **close frame body 构造**（第 253-283 行）：
+   ```javascript
+   const frame = new WebsocketFrameSend()
+   if (code === null && reason.length === 0) {
+     frame.frameData = emptyBuffer
+   } else if (code !== null && reason === null) {
+     frame.frameData = Buffer.allocUnsafe(2)
+     frame.frameData.writeUInt16BE(code, 0)
+   } else if (code !== null && reason !== null) {
+     frame.frameData = Buffer.allocUnsafe(2 + Buffer.byteLength(reason))
+     frame.frameData.writeUInt16BE(code, 0)
+     frame.frameData.write(reason, 2, 'utf-8')
+   } else {
+     frame.frameData = emptyBuffer
+   }
+   object.socket.write(frame.createFrame(opcodes.CLOSE))
+   ```
+   严格按 RFC 6455 §5.5.1：status code 2 字节 big-endian + UTF-8 reason。注意 `code === null && reason === null` 与 `code !== null && reason !== null` 的 4 路分支全覆盖了「code/reason 是否存在」的笛卡尔积。
+
+3. **状态码白名单**（`isValidStatusCode`，`util.js:148-158`）：
+   - `1000-1014` 中排除 `1004`（保留）、`1005`（"MUST NOT be set"）、`1006`（"MUST NOT be set"，异常关闭专用）
+   - `3000-4999`（应用层自定义范围）
+   - 其他值非法
+
+### 16.7 WebSocket 内存与性能优化
+
+1. **`WeakRef` + `FinalizationRegistry`**（`streamRegistry`，`body.js:24-29`）：Response 流对象被 GC 时自动 cancel —— 避免悬挂流继续占用 socket。第 15 章「TLS session 复用」用同样的模式。
+
+2. **`MessageEvent.createFastMessageEvent`（events.js:85-94）**：绕过 `webidl.converters` 的反射路径，直接构造 MessageEvent。WebSocket 消息事件是高频触发点（一次握手可能触发数千次），**慢路径构造会显著影响吞吐**。`events.js:96` 的 `delete MessageEvent.createFastMessageEvent` 确保 fast path 只能通过 factory 调用，避免误用。
+
+3. **`#refed` / `#unref`**（`websocket.js:74`）：`Symbol.for('nodejs.ref')` / `Symbol.for('nodejs.unref')` 控制 socket 是否阻止进程退出。WebSocket 长连接常见于后端推送场景，需要让进程在 WebSocket 全部关闭后才退出。
+
+4. **`#bufferedAmount` 跟踪**（`websocket.js:71`）：RFC 6455 要求暴露「已 send 但未写入 OS 缓冲区的字节数」。undici 在 send 队列入队时累加，callback 中递减（待代码详查）。
+
+### 16.8 laew gap 与 Rust crate 建议
+
+| laew 现状 | undici 启示 | Rust 实现路径 |
+|---|---|---|
+| 无 WebSocket 工具（仅 HTTP/REST） | Yolo 任务分类可加 WebSocket 流式输出场景（SSE fallback） | `tokio-tungstenite`（async-std/tokio 兼容）+ `tungstenite` |
+| 无 permessage-deflate | 长文本流式响应（LLM token 流）压缩可显著降带宽 | `flate2`（DEFLATE 实现 + tail bytes 处理） |
+| 无 close 握手 | 长连接异常关闭需规范化（1006 不可用，应用层映射到 1011 server error） | `tokio-tungstenite::CloseFrame` |
+| 无 H2 WebSocket 实验 | LLM API 网关可能走 H2（Cloudflare/gRPC-Web bridge） | `h2` crate 提供 `send_connect` + extended CONNECT |
+| 无 ping/pong 探活 | 长任务执行期间需要心跳维持连接 | `tokio::time::interval` + WebSocket ping 帧 |
+| 无 zip bomb 防护 | HTTP body 接收限制 `maxResponseSize` 已有 | `flate2::read::ZlibDecoder::with_capacity` + 大小校验 |
+
+
+## 17. 维度二：Fetch API 内部实现深度剖析
+
+### 17.1 维度概览
+
+undici 的 Fetch 实现（`lib/web/fetch/`，约 18,000+ 行）是**目前 Node.js 生态最完整的 WHATWG Fetch 标准实现**，也是 Node.js 18+ 内置 `globalThis.fetch` 的底层引擎。第 7 章已覆盖 Headers/Response/Request/Body 的接口层。本轮深入**内部流水线、Body Mixin 内存模型、CORS 校验、重定向链、SRI 完整性校验**。
+
+### 17.2 内部请求流水线（`lib/web/fetch/index.js`）
+
+`fetch(input, init)` 入口（第 159-300 行）按 WHATWG Fetch Standard §5 实现：
+
+1. **Request 构造**（第 170-175 行）：`new Request(input, init)` 触发 URL 解析、header guard 设置、body 提取。
+
+2. **AbortSignal 监听**（第 211-229 行）：
+   ```javascript
+   const removeAbortListener = addAbortListener(
+     requestObject.signal,
+     () => {
+       locallyAborted = true
+       assert(controller != null)
+       controller.abort(requestObject.signal.reason)
+       const realResponse = responseObject?.deref()
+       abortFetch(p, request, realResponse, requestObject.signal.reason, controller.controller)
+     }
+   )
+   ```
+   **关键**：`addAbortListener` 是 `events` 模块的「一次性 abort 监听器」封装，避免 `MaxListenersExceededWarning`。
+
+3. **fetching 主循环**（第 285-296 行）：
+   ```javascript
+   controller = fetching({
+     request,
+     processResponseEndOfBody: (response) => {
+       handleFetchDone(response)
+       cleanupAbortListeners()
+     },
+     processResponse,
+     dispatcher: getRequestDispatcher(requestObject),
+     requestObject  // 保持 alive，防止 AbortController 被 GC
+   })
+   ```
+   `requestObject` 作为参数传入 `fetching` 是为了**防止 AbortController 被 GC**（见 `nodejs/undici#4627`）。
+
+4. **schemeFetch 分流**（第 813-849 行）：
+   ```javascript
+   switch (scheme) {
+     case 'about:': return Promise.resolve(makeNetworkError('about scheme is not supported'))
+     case 'blob:': /* Buffer.resolveObjectURL 处理 */
+     case 'data:': /* dataURLProcessor 处理 */
+     case 'file:': /* fileURLToPath 处理 */
+     case 'http:':
+     case 'https:': return mainFetch(fetchParams)  // 主路径
+     default: return makeNetworkError('scheme not supported')
+   }
+   ```
+   `about:` 和 `file:` 在服务端 Node.js 环境不支持（浏览器才支持）。
+
+5. **mainFetch → fetchFinale**（第 1073-1095 行）：
+   - 处理 `nullBodyStatus`（1xx/204/205/304 → body = null）
+   - 处理 `request.integrity`（SRI 校验）
+   - 处理 `request.responseTainting`（basic/cors/opaque → filterResponse）
+   - 处理 `request.redirect`（error/manual/follow）
+
+### 17.3 Body Mixin 内存模型（`lib/web/fetch/body.js`）
+
+`extractBody(object, keepalive)` 是**所有 Body 操作的入口**，返回 `[stream, source, length, type]` 四元组：
+
+1. **BodyInit 类型分发**（第 80-200 行）：
+   ```javascript
+   if (typeof object === 'string') {
+     source = object
+     type = 'text/plain;charset=UTF-8'
+   } else if (webidl.is.URLSearchParams(object)) {
+     source = object.toString()
+     type = 'application/x-www-form-urlencoded;charset=UTF-8'
+   } else if (webidl.is.BufferSource(object)) {
+     source = webidl.util.getCopyOfBytesHeldByBufferSource(object)
+   } else if (webidl.is.FormData(object)) {
+     // multipart/form-data 编码
+     const boundary = getFormDataBoundary(object)
+     ...
+     type = `multipart/form-data; boundary=${boundary}`
+   } else if (webidl.is.Blob(object)) {
+     source = object
+     length = object.size
+     type = object.type
+   } else if (typeof object[Symbol.asyncIterator] === 'function') {
+     // AsyncIterable body（实验性）
+   }
+   ```
+
+2. **FormData 编码**（第 104-172 行）：
+   - 边界字符串：`getFormDataBoundary()` 生成 `----formdata-undici-XXXX`
+   - 每个 entry 编码：`--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n`
+   - 文件 entry：额外加 `filename="{name}"` + `Content-Type: {type}`
+   - 尾部：`--{boundary}--\r\n`
+   - **关键**：`length` 在 entry 大小未知时（Blob 无 size）置 null —— 此时无法发送 `Content-Length`，必须走 chunked transfer
+
+3. **stream 创建**（第 40-63 行）：
+   ```javascript
+   stream = new ReadableStream({
+     pull () {},
+     start (c) { controller = c },
+     cancel () {},
+     type: 'bytes'  // 字节流模式
+   })
+   ```
+   `type: 'bytes'` 启用 ReadableStream 的**字节模式**（支持 `reader.read()` 返回 `Uint8Array`），这是 WHATWG Streams 标准对 HTTP body 的要求。
+
+4. **`streamRegistry`（FinalizationRegistry）**（第 24-29 行）：
+   ```javascript
+   const streamRegistry = new FinalizationRegistry((weakRef) => {
+     const stream = weakRef.deref()
+     if (stream && !stream.locked && !isDisturbed(stream) && !isErrored(stream)) {
+       stream.cancel('Response object has been garbage collected').catch(noop)
+     }
+   })
+   ```
+   **Response 对象被 GC 时自动 cancel 底层流** —— 避免 socket 被悬挂的 ReadableStream 占用。这是 undici 对「长生命周期的 fetch Response」的内存安全保证。
+
+5. **`cloneBody`**（第 200+ 行）：Response 克隆时用 `ReadableStreamTee` 分叉流。**注意**：tee 后两个流共享底层 socket 缓冲区，消费速度不同会导致背压传递。
+
+### 17.4 Headers 实现（`lib/web/fetch/headers.js`）
+
+1. **HeadersList 内部结构**：
+   - 底层是 `[name1, value1, name2, value2, ...]` 扁平数组
+   - `sortedMap` 缓存：排序后的 name → value[] 映射（用于 `getSetCookie()` 等需要合并同名 header 的场景）
+   - `guard` 标志位：`none`/`request`/`request-no-cors`/`response`/`immutable`
+
+2. **headerValueNormalize**（第 29-39 行）：
+   ```javascript
+   function headerValueNormalize (potentialValue) {
+     let i = 0; let j = potentialValue.length
+     while (j > i && isHTTPWhiteSpaceCharCode(potentialValue.charCodeAt(j - 1))) --j
+     while (j > i && isHTTPWhiteSpaceCharCode(potentialValue.charCodeAt(i))) ++i
+     return i === 0 && j === potentialValue.length ? potentialValue : potentialValue.substring(i, j)
+   }
+   ```
+   **仅去除首尾 HTTP 空白**（`0x09 HT / 0x20 SP / 0x0A LF / 0x0D CR`），符合 RFC 7230 §3.2.4。
+
+3. **fill 方法**（第 45-80 行）：支持 sequence（`[[name, value], ...]`）和 record（`{name: value}`）两种输入。**record 模式会丢失同名 header**（后者覆盖前者），sequence 模式保留所有。
+
+4. **sortAndCombine**（第 132+ 行）：按 name 排序后合并同名 header 为逗号分隔值（RFC 7230 §3.2.2）。**缓存 sortedMap** 避免重复排序。
+
+### 17.5 CORS 校验（`lib/web/fetch/util.js`）
+
+1. **corsCheck**：校验 `Access-Control-Allow-Origin` 是否匹配 `Origin`。
+2. **crossOriginResourcePolicyCheck**：校验 `Cross-Origin-Resource-Policy`（`same-origin`/`same-site`/`cross-origin`）。
+3. **TAOCheck**（`timing allow origin`）：校验 `Timing-Allow-Origin` —— 跨域时是否允许读取 `performance.timing`。
+4. **appendRequestOriginHeader**：自动添加 `Origin` header。
+5. **determineRequestsReferrer**：根据 `Referrer-Policy` 决定 `Referer` header 内容。
+
+### 17.6 SRI 完整性校验（`lib/web/subresource-integrity/`）
+
+`bytesMatch(bytes, integrity)` 实现 W3C Subresource Integrity 校验：
+
+1. 解析 `integrity` 属性（`sha256-xxx sha384-xxx sha512-xxx`）
+2. 对每个算法计算 `crypto.hash(algo, bytes)`
+3. **第一个匹配的算法**即通过（多个算法是 OR 关系）
+4. 校验失败 → `processBodyError('integrity mismatch')` → fetchFinale 以 network error 收口
+
+**在 fetchFinale 中的位置**（第 770-801 行）：
+```javascript
+if (request.integrity) {
+  const processBodyError = (reason) => fetchFinale(fetchParams, makeNetworkError(reason))
+  if (request.responseTainting === 'opaque' || response.body == null) {
+    processBodyError(response.error)
+    return
+  }
+  const processBody = (bytes) => {
+    if (!bytesMatch(bytes, request.integrity)) {
+      processBodyError('integrity mismatch')
+      return
+    }
+    response.body = safelyExtractBody(bytes)[0]
+    fetchFinale(fetchParams, response)
+  }
+  fullyReadBody(response.body, processBody, processBodyError)
+}
+```
+**关键**：opaque response 无法读取 body（跨域不透明），SRI 校验直接失败 —— 这是安全设计（无法验证 = 不信任）。
+
+### 17.7 重定向链（`httpRedirectFetch`，第 1252-1390 行）
+
+第 15.4 节已覆盖 `redirect-handler.js` 的 handler 层。`httpRedirectFetch` 是 **fetch 规范层的重定向**，独立实现：
+
+1. **硬上限 20 跳**（第 1287-1290 行）：`if (request.redirectCount === 20) return makeNetworkError('redirect count exceeded')`。
+
+2. **303 方法转换**（第 1328-1345 行）：
+   ```javascript
+   if (([301, 302].includes(actualResponse.status) && request.method === 'POST') ||
+       (actualResponse.status === 303 && !GET_OR_HEAD.includes(request.method))) {
+     request.method = 'GET'
+     request.body = null
+     for (const headerName of requestBodyHeader) {
+       request.headersList.delete(headerName)
+     }
+   }
+   ```
+   301/302 + POST → GET（历史行为，RFC 7231 §6.4）；303 + 非 GET/HEAD → GET（规范行为）。
+
+3. **跨域删头**（第 1347-1360 行）：
+   ```javascript
+   if (!sameOrigin(requestCurrentURL(request), locationURL)) {
+     // 删除 authorization/proxy-authorization/cookie/host
+   }
+   ```
+   与 `redirect-handler.js` 的 `shouldRemoveHeader` 语义对齐。
+
+4. **referrer policy 更新**（第 1387-1389 行）：`setRequestReferrerPolicyOnRedirect(request, actualResponse)` —— 根据 response 的 `Referrer-Policy` header 更新后续请求的 referrer 策略。
+
+5. **timing 记账**（第 1370-1382 行）：`redirectEndTime` / `postRedirectStartTime` / `redirectStartTime` 三字段维护 —— 用于 `PerformanceResourceTiming` API。
+
+### 17.8 laew gap 与 Rust crate 建议
+
+| laew 现状 | undici 启示 | Rust 实现路径 |
+|---|---|---|
+| 无 Fetch API（仅 LLM API 调用） | 未来 WebFetch 工具需要完整 Fetch 语义 | `reqwest` 已内置（但需 wasm 兼容时用 `gloo-net`） |
+| 无 CORS 校验 | 浏览器端 laew（WASM）需要 CORS | `reqwest::redirect::Policy` + 自定义 middleware |
+| 无 SRI 校验 | 下载外部脚本/插件时完整性校验 | `ring::digest` + base64 比对 |
+| 无 FormData 编码 | 文件上传工具需要 multipart | `multipart` crate + boundary 生成 |
+| 无 AbortSignal 链 | 任务取消传播 | `tokio_util::sync::CancellationToken`（已有） |
+| 无 streamRegistry GC 防护 | 长生命周期的 Response 流 | `tokio::sync::OwnedSemaphorePermit` + Drop guard |
+| 无 redirect 历史透传 | 调试/审计 | `tracing` span 记录跳转链 |
+
+
+## 18. 维度三：8 种拦截器组合拓扑与性能分析
+
+### 18.1 维度概览
+
+第 5 章已覆盖 8 个拦截器的**职责速览**。本轮深入分析：
+1. 拦截器组合拓扑（compose 顺序如何影响语义）
+2. DecoratorHandler 基类与装饰器链
+3. 每个拦截器的**真实代码实现细节**
+4. 拦截器性能开销与内存模型
+5. 拦截器与 dispatcher 的关系
+
+### 18.2 拦截器基础架构
+
+拦截器本质是高阶函数：`(dispatch) => (opts, handler) => void`。
+
+**调用链**：
+```
+client.request(opts, handler)
+  → interceptor1(dispatch)(opts, handler)
+    → interceptor2(dispatch)(opts, wrappedHandler)
+      → ... → realDispatch(opts, finalWrappedHandler)
+```
+
+每个拦截器可以选择：
+1. **包裹 handler**（装饰器模式）：`dispatch(opts, new DecoratorHandler(handler))`
+2. **替换 dispatch**：`interceptor(dispatch)(opts, handler)`
+3. **短路**：`return handler.onResponseError(null, error)` 不继续 dispatch
+
+### 18.3 DecoratorHandler 基类（`lib/handler/decorator-handler.js`）
+
+```javascript
+class DecoratorHandler {
+  #handler
+  constructor (handler) { this.#handler = handler }
+  onRequestStart (controller, context) { return this.#handler.onRequestStart(controller, context) }
+  onRequestUpgrade (controller, statusCode, headers, socket) { return this.#handler.onRequestUpgrade(...) }
+  onResponseStart (controller, statusCode, headers, statusMessage) { return this.#handler.onResponseStart(...) }
+  onResponseData (controller, chunk) { return this.#handler.onResponseData(controller, chunk) }
+  onResponseEnd (controller, trailers) { return this.#handler.onResponseEnd(controller, trailers) }
+  onResponseError (controller, err) { return this.#handler.onResponseError(controller, err) }
+}
+```
+
+**透明转发**：所有回调都代理到 `#handler`。子类 override 单个方法即可在特定节点注入逻辑。
+
+**返回值语义**：`onResponseData` 返回 `false` 表示「暂停读取」（backpressure）—— 见第 14 章背压机制。
+
+### 18.4 8 个拦截器实现细节
+
+#### 18.4.1 redirect（`lib/interceptor/redirect.js`，21 行）
+
+```javascript
+function createRedirectInterceptor ({ maxRedirections: defaultMaxRedirections, ... } = {}) {
+  return (dispatch) => {
+    return function Intercept (opts, handler) {
+      const { maxRedirections = defaultMaxRedirections, ... } = opts
+      if (maxRedirections == null || maxRedirections === 0) {
+        return dispatch(opts, handler)  // 短路
+      }
+      const redirectHandler = new RedirectHandler(dispatch, maxRedirections, dispatchOpts, handler)
+      return dispatch(dispatchOpts, redirectHandler)
+    }
+  }
+}
+```
+
+**极简设计**：默认值兜底 + 请求级覆盖 + `0/null` 短路。**单文件 21 行是拦截器最小实现**。
+
+#### 18.4.2 retry（`lib/interceptor/retry.js`，19 行）
+
+```javascript
+module.exports = globalOpts => {
+  return dispatch => {
+    return function retryInterceptor (opts, handler) {
+      return dispatch(
+        opts,
+        new RetryHandler(
+          { ...opts, retryOptions: { ...globalOpts, ...opts.retryOptions } },
+          { handler, dispatch }
+        )
+      )
+    }
+  }
+}
+```
+
+**最简实现**：直接委托给 `RetryHandler`（`lib/handler/retry-handler.js`）。`retryOptions` 合并策略：请求级覆盖全局级。`dispatch` 引用注入到 RetryHandler 以便重试时重新 dispatch。
+
+#### 18.4.3 dump（`lib/interceptor/dump.js`，112 行）
+
+`DumpHandler` 实现「下载并丢弃超过 maxSize 的响应」语义：
+
+```javascript
+class DumpHandler extends DecoratorHandler {
+  #maxSize = 1024 * 1024  // 默认 1MB
+  #dumped = false
+  #size = 0
+
+  onResponseData (controller, chunk) {
+    this.#size = this.#size + chunk.length
+    if (this.#size >= this.#maxSize) {
+      this.#dumped = true
+      if (this.aborted === true) {
+        super.onResponseError(controller, this.reason)
+      } else {
+        super.onResponseEnd(controller, {})  // 假装正常结束
+      }
+    }
+    return true  // 丢弃数据（不转发给 inner handler）
+  }
+}
+```
+
+**关键**：`return true` 表示「已消费」—— inner handler 的 `onResponseData` 不会被调用。`#aborted` 标志位用于「已主动 abort 但 socket 仍在发数据」的场景 —— 此时不应假装成功。
+
+#### 18.4.4 response-error（`lib/interceptor/response-error.js`，95 行）
+
+`ResponseErrorHandler` 把 HTTP 4xx/5xx 转换为 `ResponseError` 异常：
+
+```javascript
+class ResponseErrorHandler extends DecoratorHandler {
+  onResponseStart (controller, statusCode, headers, statusMessage) {
+    this.#statusCode = statusCode
+    this.#headers = headers
+    this.#contentType = headers['content-type']
+    if (this.#statusCode < 400) {
+      return super.onResponseStart(...)
+    }
+    if (this.#checkContentType('application/json') || this.#checkContentType('text/plain')) {
+      this.#decoder = new TextDecoder('utf-8')
+    }
+  }
+
+  onResponseData (controller, chunk) {
+    if (this.#statusCode < 400) {
+      return super.onResponseData(controller, chunk)
+    }
+    this.#body += this.#decoder?.decode(chunk, { stream: true }) ?? ''
+  }
+
+  onResponseEnd (controller, trailers) {
+    if (this.#statusCode >= 400) {
+      this.#body += this.#decoder?.decode(undefined, { stream: false }) ?? ''
+      if (this.#checkContentType('application/json')) {
+        try { this.#body = JSON.parse(this.#body) } catch { /* ignore */ }
+      }
+      let err
+      const stackTraceLimit = Error.stackTraceLimit
+      Error.stackTraceLimit = 0  // 限制 stack trace 深度
+      try {
+        err = new ResponseError('Response Error', this.#statusCode, {
+          body: this.#body,
+          headers: this.#headers
+        })
+      } finally {
+        Error.stackTraceLimit = stackTraceLimit
+      }
+      super.onResponseError(controller, err)
+    } else {
+      super.onResponseEnd(controller, trailers)
+    }
+  }
+}
+```
+
+**关键技术点**：
+1. **流式 TextDecoder**：`decode(chunk, { stream: true })` 处理 UTF-8 跨 chunk 边界截断问题（多字节字符被切到两个 chunk 时，前一个 chunk 的末尾字节保留到下一次 decode）
+2. **stackTraceLimit = 0**：ResponseError 的 stack trace 不需要内部路径（undici handler 回调链太深），**仅在构造时临时关闭**，构造后恢复
+3. **自动 JSON 解析**：content-type 为 `application/json` 时自动 parse —— 这是 LLM API 调用的关键（错误响应通常是 JSON 格式）
+
+#### 18.4.5 decompress（`lib/interceptor/decompress.js`，292 行）
+
+`DecompressHandler` 实现 Content-Encoding 自动解压：
+
+```javascript
+const supportedEncodings = {
+  gzip: createGunzip,
+  'x-gzip': createGunzip,
+  br: createBrotliDecompress,
+  deflate: createInflate,
+  compress: createInflate,
+  'x-compress': createInflate,
+  zstd: createZstdDecompress
+}
+```
+
+**6 种编码**：gzip/x-gzip/br/deflate/compress/x-compress/zstd。**br（Brotli）** 是现代浏览器普遍支持的压缩算法，cloudflare/LLM API 常用。
+
+**安全限制**（第 67-76 行）：
+```javascript
+const maxContentEncodings = 5
+if (parts.length > maxContentEncodings) {
+  throw new Error(`too many content-encodings in response: ${parts.length}, maximum allowed is ${maxContentEncodings}`)
+}
+```
+**CVE 修复**：限制 content-encoding 链长度防止「zip of zip of zip ...」资源耗尽攻击（类似 urllib3 GHSA-gm62-xv2j-4w53 和 curl CVE-2022-32206）。
+
+**链路设计**：
+- 单 decompressor：直接 readable 事件转发
+- 多 decompressor：`pipeline(this.#decompressors, callback)` 串联
+
+**header 清洗**（第 182-210 行）：解压后删除 `content-encoding` 和 `content-length` header（因为 body 已解压，长度已变）。**同时清洗 rawHeaders**（controller.rawHeaders —— 这是给上层 fetch API 暴露的原始头）。
+
+#### 18.4.6 dns（`lib/interceptor/dns.js`，575 行）
+
+`DNSInstance` + `DNSStorage` 实现**客户端 DNS 缓存 + Happy Eyeballs**：
+
+1. **DNSStorage**：`Map<hostname, records>` + `#maxItems` 限制。外部存储接口（`get/set/full/delete`）允许接入 Redis/SharedMemory。
+
+2. **DNSInstance#defaultLookup**（第 241-265 行）：
+   ```javascript
+   lookup(origin.hostname, {
+     all: true,  // 返回所有地址（IPv4 + IPv6）
+     family: this.dualStack === false ? this.affinity : 0,
+     order: 'ipv4first'
+   }, (err, addresses) => {
+     const results = new Map()
+     for (const addr of addresses) {
+       results.set(`${addr.address}:${addr.family}`, addr)  // 去重
+     }
+     cb(null, results.values())
+   })
+   ```
+   **`all: true`** 一次 lookup 返回所有地址，避免多次 syscall。**`order: 'ipv4first'`** 优先使用 IPv4（兼容性更好，IPv6 在某些企业网络被阻断）。
+
+3. **DNSInstance#defaultPick**（第 267-319 行）：**双栈轮询**：
+   ```javascript
+   if (this.dualStack) {
+     if (affinity == null) {
+       // 平衡 IPv4/IPv6
+       if (offset == null || offset === maxInt) {
+         hostnameRecords.offset = 0
+         affinity = 4
+       } else {
+         hostnameRecords.offset++
+         affinity = (hostnameRecords.offset & 1) === 1 ? 6 : 4
+       }
+     }
+   }
+   ```
+   双栈模式下，IPv4/IPv6 交替选择（round-robin）。affinity 非 null 时锁定单栈。
+
+4. **TTL 管理**（第 311-316 行）：
+   ```javascript
+   if (Date.now() - ip.timestamp > ip.ttl) {
+     family.ips.splice(position, 1)  // 删除过期记录
+     return this.pick(origin, hostnameRecords, affinity)  // 递归重新 pick
+   }
+   ```
+   **惰性过期**：pick 时检查 TTL，过期的直接删除 + 递归重选。TTL 上限 `#maxTTL`（默认 10 秒）。
+
+5. **错误回退（Happy Eyeballs）**（`DNSDispatchHandler.onResponseError`，第 404-455 行）：
+   ```javascript
+   case 'ETIMEDOUT':
+   case 'ECONNREFUSED': {
+     if (this.#state.dualStack) {
+       if (!this.#firstTry) {
+         super.onResponseError(controller, err)
+         return
+       }
+       this.#firstTry = false
+       const otherFamily = this.#newOrigin.hostname[0] === '[' ? 4 : 6
+       const ip = this.#state.pickFamily(this.#origin, otherFamily)
+       if (ip == null) {
+         super.onResponseError(controller, err)
+         return
+       }
+       const dispatchOpts = {
+         ...this.#opts,
+         origin: `${this.#origin.protocol}//${ip.family === 6 ? `[${ip.address}]` : ip.address}${port}`,
+         headers: withHostHeader(this.#origin.host, this.#opts.headers)
+       }
+       this.#dispatch(dispatchOpts, this)
+       return
+     }
+   }
+   ```
+   **第一次连接失败时自动切换到另一地址族**（IPv4 → IPv6 或 IPv6 → IPv4）。这是 RFC 8305 Happy Eyeballs v2 的简化实现 —— 不竞速，但至少回退。
+
+#### 18.4.7 cache（`lib/interceptor/cache.js`，618 行）
+
+最复杂的拦截器，实现 **RFC 9111（HTTP Caching）** 的完整语义：
+
+1. **缓存存储**：
+   - `MemoryCacheStore`（`lib/cache/memory-cache-store.js`）：进程内 LRU
+   - `SqliteCacheStore`（`lib/cache/sqlite-cache-store.js`）：持久化到 SQLite
+
+2. **新鲜度计算**（`isStale`，第 180+ 行）：
+   ```javascript
+   function isStale (result, cacheControlDirectives, cacheType) {
+     const now = Date.now()
+     if (now > result.staleAt) {
+       if (!staleResponseRequiresRevalidation(result, cacheType) &&
+           cacheControlDirectives?.['max-stale']) {
+         const gracePeriod = result.staleAt + (cacheControlDirectives['max-stale'] * 1000)
+         return now > gracePeriod
+       }
+       return true
+     }
+     if (cacheControlDirectives?.['min-fresh']) {
+       const timeLeftTillStale = result.staleAt - now
+       const threshold = cacheControlDirectives['min-fresh'] * 1000
+       return timeLeftTillStale < threshold
+     }
+     return false
+   }
+   ```
+   支持 `max-stale`（客户端接受过期响应的宽限期）和 `min-fresh`（要求剩余新鲜期至少 X 秒）。
+
+3. **revalidation**（`makeRevalidationHeaders`，第 153-172 行）：
+   ```javascript
+   function makeRevalidationHeaders (opts, result) {
+     const headers = {
+       ...opts.headers,
+       'if-modified-since': getUsableLastModified(result.headers) ?? new Date(result.cachedAt).toUTCString()
+     }
+     if (result.etag) {
+       headers['if-none-match'] = result.etag
+     }
+     if (result.vary) {
+       for (const key in result.vary) {
+         if (result.vary[key] != null) {
+           headers[key] = result.vary[key]
+         }
+       }
+     }
+     return headers
+   }
+   ```
+   条件请求：优先用 `Last-Modified` + `If-Modified-Since`，有 ETag 时加 `If-None-Match`，Vary 头指定的 header 必须匹配。
+
+4. **Vary 处理**（`isInvalidOrWildcardVaryHeader`）：`Vary: *` 永远无法命中缓存 —— 直接跳过缓存。
+
+#### 18.4.8 deduplicate（`lib/interceptor/deduplicate.js`，117 行）
+
+**请求去重**：并发相同请求共享一个网络调用：
+
+```javascript
+return dispatch => {
+  return (opts, handler) => {
+    if (opts.upgrade || methods.includes(opts.method) === false) {
+      return dispatch(opts, handler)
+    }
+    const cacheKey = makeCacheKey(opts)
+    const dedupeKey = makeDeduplicationKey(cacheKey, excludeHeaderNamesSet)
+    const pendingHandler = pendingRequests.get(dedupeKey)
+    if (pendingHandler) {
+      if (pendingHandler.addWaitingHandler(handler)) {
+        return true  // 成功加入等待列表
+      }
+      return dispatch(opts, handler)  // body 已开始流式传输，无法去重
+    }
+    const deduplicationHandler = new DeduplicationHandler(
+      handler,
+      () => { pendingRequests.delete(dedupeKey) },
+      maxBufferSize
+    )
+    pendingRequests.set(dedupeKey, deduplicationHandler)
+    return dispatch(opts, deduplicationHandler)
+  }
+}
+```
+
+**关键**：`pendingHandler.addWaitingHandler(handler)` 返回 false 时（body 已开始流式传输），**放弃去重** —— 因为此时无法「暂停」已发送的请求。`maxBufferSize`（默认 5MB）限制去重缓冲区大小。
+
+### 18.5 拦截器组合拓扑
+
+**compose 顺序影响语义**：
+
+```
+Client.compose(redirect(), retry(), cache(), decompress(), dump(), response-error(), dns(), deduplicate())
+```
+
+**推荐顺序**（从外到内）：
+1. `dns()` —— 最外层，控制 DNS 解析
+2. `deduplicate()` —— 去重（在 DNS 之后，避免相同请求多次解析）
+3. `cache()` —— 缓存（在去重之后，避免缓存击穿）
+4. `redirect()` —— 重定向（在缓存之后，重定向响应也可能被缓存）
+5. `retry()` —— 重试（在重定向之后，重定向后的请求不应被重试）
+6. `decompress()` —— 解压（在重试之后，避免重复解压）
+7. `response-error()` —— 错误转换（在解压之后，确保 body 已解压）
+8. `dump()` —— 最内层，控制响应大小
+
+**反模式**：
+- `dump()` 在 `decompress()` 之外 → 检查的是压缩后大小，不是实际 body 大小
+- `cache()` 在 `redirect()` 之外 → 缓存的是重定向响应，不是最终响应
+- `retry()` 在 `redirect()` 之外 → 重试的是重定向请求，可能导致无限循环
+
+### 18.6 拦截器性能开销
+
+| 拦截器 | 每次请求开销 | 内存占用 | 备注 |
+|---|---|---|---|
+| redirect | O(1) | O(1) | 仅构造 Handler |
+| retry | O(1) | O(1) | 仅构造 Handler |
+| dump | O(1) | O(1) | 仅跟踪 #size |
+| response-error | O(n) body | O(n) body | 缓存整个错误 body |
+| decompress | O(n) body | O(1) | 流式处理 |
+| dns | O(1) amortized | O(hostnames) | 缓存命中时 O(1) |
+| cache | O(1) amortized | O(cache size) | 缓存命中时 O(1) |
+| deduplicate | O(1) | O(pending) | Map 操作 |
+
+**response-error 是唯一需要缓存整个 body 的拦截器**（为了 JSON.parse 错误响应）。对于大错误响应（如 500 + 大 HTML），这可能导致内存问题。
+
+### 18.7 laew gap 与 Rust crate 建议
+
+| laew 现状 | undici 启示 | Rust 实现路径 |
+|---|---|---|
+| 无拦截器体系 | 中间件模式（tower::Service） | `tower::Layer` + `tower::ServiceBuilder` |
+| 无客户端 DNS 缓存 | 减少 DNS 查询延迟 | `hickory-dns`（trust-dns 重命名）+ LRU |
+| 无请求去重 | 并发相同 LLM 请求共享 | `tokio::sync::Semaphore` + `OnceCell` |
+| 无 HTTP 缓存 | LLM 响应缓存（system prompt） | `moka`（并发 LRU）+ `sha2` 指纹 |
+| 无自动解压 | reqwest 内置 | `reqwest::async_impl::decoder`（已内置） |
+| 无响应错误转换 | 统一错误类型 | `thiserror` + `reqwest::Error` 映射 |
+| 无 dump 限制 | 大响应截断 | `reqwest::Response::take(max_bytes)` |
+
+
+## 19. 维度四：Mock 录制回放系统完整剖析
+
+### 19.1 维度概览
+
+undici 的 Mock 系统（`lib/mock/`，约 8,500+ 行）是**测试基础设施的核心**，支持：
+1. **MockInterceptor**：声明式请求匹配 + 响应 stub
+2. **MockAgent/MockClient/MockPool**：拦截真实网络
+3. **SnapshotRecorder**：录制真实请求 → JSON 文件
+4. **SnapshotAgent**：三态机（record/playback/update）自动录制回放
+5. **MockCallHistory**：调用历史审计
+
+第 6 章已覆盖基本结构。本轮深入**匹配算法、并发安全、Snapshot 序列化、错误处理**。
+
+### 19.2 MockInterceptor 声明式 API（`lib/mock/mock-interceptor.js`）
+
+```javascript
+class MockInterceptor {
+  constructor (opts, mockDispatches) {
+    if (typeof opts.path === 'undefined') {
+      throw new InvalidArgumentError('opts.path must be defined')
+    }
+    if (typeof opts.method === 'undefined') {
+      opts.method = 'GET'
+    }
+    if (typeof opts.path === 'string') {
+      if (opts.query) {
+        opts.path = serializePathWithQuery(opts.path, opts.query)
+      } else {
+        const parsedURL = new URL(opts.path, 'data://')
+        opts.path = parsedURL.pathname + parsedURL.search
+      }
+    }
+    if (typeof opts.method === 'string') {
+      opts.method = opts.method.toUpperCase()
+    }
+    this[kDispatchKey] = buildKey(opts)
+    this[kDispatches] = mockDispatches
+    this[kIgnoreTrailingSlash] = opts.ignoreTrailingSlash ?? false
+    this[kDefaultHeaders] = {}
+    this[kDefaultTrailers] = {}
+    this[kContentLength] = false
+  }
+
+  reply (replyOptionsCallbackOrStatusCode) {
+    if (typeof replyOptionsCallbackOrStatusCode === 'function') {
+      const wrappedDefaultsCallback = (opts) => {
+        const resolvedData = replyOptionsCallbackOrStatusCode(opts)
+        if (isPromise(resolvedData)) {
+          return resolvedData.then(resolveReplyCallbackData)
+        }
+        return resolveReplyCallbackData(resolvedData)
+      }
+      const newMockDispatch = addMockDispatch(this[kDispatches], this[kDispatchKey], wrappedDefaultsCallback, {...})
+      return new MockScope(newMockDispatch)
+    }
+    const replyParameters = {
+      statusCode: replyOptionsCallbackOrStatusCode,
+      data: arguments[1] === undefined ? '' : arguments[1],
+      responseOptions: arguments[2] === undefined ? {} : arguments[2]
+    }
+    this.validateReplyParameters(replyParameters)
+    const dispatchData = this.createMockScopeDispatchData(replyParameters)
+    const newMockDispatch = addMockDispatch(this[kDispatches], this[kDispatchKey], dispatchData, {...})
+    return new MockScope(newMockDispatch)
+  }
+
+  replyWithError (error) { ... }
+  defaultReplyHeaders (headers) { ... }
+  defaultReplyTrailers (trailers) { ... }
+  replyContentLength () { ... }
+}
+```
+
+**关键设计**：
+
+1. **reply 双态**：`reply(statusCode, data, options)` 直接返回；`reply(callback)` 延迟到请求时调用（可以访问请求信息动态生成响应）。
+
+2. **reply 参数校验**（`validateReplyParameters`）：
+   - `statusCode` 必须定义
+   - `responseOptions` 必须是非 null 对象
+
+3. **MockScope 链式 API**：
+   ```javascript
+   mockPool.intercept({ path: '/api', method: 'GET' })
+     .reply(200, { hello: 'world' })
+     .delay(100)
+     .persist()
+     .times(3)
+   ```
+   `delay/persist/times` 都返回 `this` 支持链式。
+
+4. **defaultReplyHeaders/defaultReplyTrailers**：设置拦截器级别的默认头/尾部，所有 reply 继承。
+
+5. **replyContentLength**：自动计算 `Content-Length` header（默认不计算，因为 data 可能是 callback 延迟生成）。
+
+### 19.3 匹配算法（`lib/mock/mock-utils.js`）
+
+**`getMockDispatch(mockDispatches, key)`**（第 171-209 行）：
+
+```javascript
+function getMockDispatch (mockDispatches, key) {
+  const basePath = key.query ? serializePathWithQuery(key.path, key.query) : key.path
+  const resolvedPath = typeof basePath === 'string' ? safeUrl(basePath) : basePath
+  const resolvedPathWithoutTrailingSlash = removeTrailingSlash(resolvedPath)
+
+  // 1. Match path
+  let matchedMockDispatches = mockDispatches
+    .filter(({ consumed }) => !consumed)
+    .filter(({ path, ignoreTrailingSlash }) => {
+      return ignoreTrailingSlash
+        ? matchValue(removeTrailingSlash(safeUrl(path)), resolvedPathWithoutTrailingSlash)
+        : matchValue(safeUrl(path), resolvedPath)
+    })
+  if (matchedMockDispatches.length === 0) {
+    throw new MockNotMatchedError(`Mock dispatch not matched for path '${resolvedPath}'`)
+  }
+
+  // 2. Match method
+  matchedMockDispatches = matchedMockDispatches.filter(({ method }) => matchValue(method, key.method))
+
+  // 3. Match body
+  matchedMockDispatches = matchedMockDispatches.filter(({ body }) => typeof body !== 'undefined' ? matchValue(body, key.body) : true)
+
+  // 4. Match headers
+  matchedMockDispatches = matchedMockDispatches.filter((mockDispatch) => matchHeaders(mockDispatch, key.headers))
+
+  return matchedMockDispatches[0]  // 返回第一个匹配
+}
+```
+
+**匹配顺序**：path → method → body → headers。**短路求值**：前面步骤过滤后长度为 0 立即抛错。
+
+**`matchValue` 多态匹配**（第 22-33 行）：
+```javascript
+function matchValue (match, value) {
+  if (typeof match === 'string') {
+    return match === value
+  }
+  if (match instanceof RegExp) {
+    return match.test(value)
+  }
+  if (typeof match === 'function') {
+    return match(value) === true
+  }
+  return false
+}
+```
+
+**三种匹配器**：
+1. **string**：严格相等
+2. **RegExp**：正则测试（用于 path 匹配）
+3. **function**：自定义匹配器（接收 value 返回 boolean）
+
+**`matchHeaders`**（第 73-95 行）：
+```javascript
+function matchHeaders (mockDispatch, headers) {
+  if (typeof mockDispatch.headers === 'function') {
+    if (Array.isArray(headers)) {
+      headers = buildHeadersFromArray(headers)
+    }
+    return mockDispatch.headers(headers ? lowerCaseEntries(headers) : {})
+  }
+  if (typeof mockDispatch.headers === 'undefined') {
+    return true  // 未定义 headers 匹配器 → 匹配所有
+  }
+  if (typeof headers !== 'object' || typeof mockDispatch.headers !== 'object') {
+    return false
+  }
+  for (const [matchHeaderName, matchHeaderValue] of Object.entries(mockDispatch.headers)) {
+    const headerValue = getHeaderByName(headers, matchHeaderName)
+    if (!matchValue(matchHeaderValue, headerValue)) {
+      return false
+    }
+  }
+  return true
+}
+```
+
+**header 匹配器三种形式**：
+1. **function**：自定义匹配（接收完整 headers 对象）
+2. **undefined**：匹配所有
+3. **object**：逐项匹配（每个 value 可以是 string/RegExp/Function）
+
+**`safeUrl` 查询参数排序**（第 128-140 行）：
+```javascript
+function safeUrl (path) {
+  if (typeof path !== 'string') { return path }
+  const pathSegments = path.split('?', 3)
+  if (pathSegments.length !== 2) { return path }
+  const qp = new URLSearchParams(pathSegments.pop())
+  qp.sort()
+  return [...pathSegments, qp.toString()].join('?')
+}
+```
+**查询参数排序**：`?b=1&a=2` 和 `?a=2&b=1` 排序后都是 `?a=2&b=1` —— 避免参数顺序不同导致匹配失败。
+
+### 19.4 Snapshot 三态机（`lib/mock/snapshot-agent.js` + `snapshot-recorder.js`）
+
+**三种模式**：
+1. **record**：真实请求 + 录制响应到内存 + 可选 autoFlush 到磁盘
+2. **playback**：从文件加载快照 + 匹配请求返回录制响应
+3. **update**：playback + 未匹配时真实请求并录制（增量更新）
+
+**SnapshotAgent 构造**（第 19-81 行）：
+```javascript
+class SnapshotAgent extends MockAgent {
+  constructor (opts = {}) {
+    const { mode = 'record', snapshotPath = null, ...mockAgentOpts } = opts
+    super(mockAgentOpts)
+    validateSnapshotMode(mode)
+    if ((mode === 'playback' || mode === 'update') && !snapshotPath) {
+      throw new InvalidArgumentError(`snapshotPath is required when mode is '${mode}'`)
+    }
+    this[kSnapshotMode] = mode
+    this[kSnapshotPath] = snapshotPath
+    this[kSnapshotRecorder] = new SnapshotRecorder({...})
+    if (this[kSnapshotMode] === 'record' || this[kSnapshotMode] === 'update' ||
+        (this[kSnapshotMode] === 'playback' && opts.excludeUrls && opts.excludeUrls.length > 0)) {
+      this[kRealAgent] = new Agent(opts)  // 真实请求代理
+    }
+  }
+}
+```
+
+**dispatch 分流**（第 83-121 行）：
+```javascript
+dispatch (opts, handler) {
+  const mode = this[kSnapshotMode]
+  if (this[kSnapshotRecorder].isUrlExcluded(opts)) {
+    return this[kRealAgent].dispatch(opts, handler)  // 排除 URL 直通
+  }
+  if (mode === 'playback' || mode === 'update') {
+    if (!this[kSnapshotLoaded]) {
+      return this.#asyncDispatch(opts, handler)  // 异步加载快照
+    }
+    const snapshot = this[kSnapshotRecorder].findSnapshot(opts)
+    if (snapshot) {
+      return this.#replaySnapshot(snapshot, handler)  // 回放
+    } else if (mode === 'update') {
+      return this.#recordAndReplay(opts, handler)  // 增量录制
+    } else {
+      // playback 模式未找到快照 → 错误
+      const error = new UndiciError(`No snapshot found for ${opts.method || 'GET'} ${opts.path}`)
+      if (handler.onResponseError) {
+        handler.onResponseError(null, error)
+        return
+      }
+      throw error
+    }
+  } else if (mode === 'record') {
+    return this.#recordAndReplay(opts, handler)  // 录制
+  }
+}
+```
+
+**`#recordAndReplay`**（第 134-187 行）：
+```javascript
+#recordAndReplay (opts, handler) {
+  const responseData = { statusCode: null, headers: {}, trailers: {}, body: [] }
+  const recordingHandler = {
+    onResponseStart (controller, statusCode, headers, statusMessage) {
+      responseData.statusCode = statusCode
+      responseData.headers = headers
+      return handler.onResponseStart(controller, statusCode, headers, statusMessage)
+    },
+    onResponseData (controller, chunk) {
+      responseData.body.push(chunk)
+      return handler.onResponseData(controller, chunk)
+    },
+    onResponseEnd (controller, trailers) {
+      responseData.trailers = trailers
+      const responseBody = Buffer.concat(responseData.body)
+      self[kSnapshotRecorder].record(opts, {
+        statusCode: responseData.statusCode,
+        headers: responseData.headers,
+        body: responseBody,
+        trailers: responseData.trailers
+      })
+        .then(() => handler.onResponseEnd(controller, trailers))
+        .catch((error) => handler.onResponseError(controller, error))
+    }
+  }
+  const agent = this[kRealAgent]
+  return agent.dispatch(opts, recordingHandler)
+}
+```
+
+**关键**：录制是 **fire-and-forget**（`.then()` 不阻塞 handler.onResponseEnd）—— 录制失败不影响请求完成。
+
+**`#replaySnapshot`**（第 196-229 行）：
+```javascript
+#replaySnapshot (snapshot, handler) {
+  const { response } = snapshot
+  const rawHeaders = response.headers ? util.toRawHeaders(response.headers) : []
+  const rawTrailers = response.trailers ? util.toRawHeaders(response.trailers) : []
+  const controller = {
+    rawHeaders, rawTrailers,
+    pause () {}, resume () {},
+    abort (reason) { this.aborted = true; this.reason = reason },
+    aborted: false, paused: false
+  }
+  handler.onRequestStart(controller)
+  handler.onResponseStart(controller, response.statusCode, response.headers, response.statusMessage)
+  const body = Buffer.from(response.body, 'base64')  // base64 解码
+  handler.onResponseData(controller, body)
+  handler.onResponseEnd(controller, response.trailers)
+}
+```
+
+**body 存储为 base64**：因为 JSON 无法直接存储二进制数据，body 在序列化时 `Buffer.toString('base64')`，回放时 `Buffer.from(str, 'base64')`。
+
+### 19.5 SnapshotRecorder 序列化（`lib/mock/snapshot-recorder.js`）
+
+**SnapshotEntry 结构**：
+```javascript
+/**
+ * @typedef {Object} SnapshotEntry
+ * @property {SnapshotEntryRequest} request - 请求信息
+ * @property {Array<SnapshotEntryResponse>} responses - 响应数组（支持多次调用不同响应）
+ * @property {number} callCount - 调用次数
+ * @property {string} timestamp - ISO 时间戳
+ */
+```
+
+**请求哈希**（`createRequestHash`，第 214-244 行）：
+```javascript
+function createRequestHash (formattedRequest) {
+  const parts = [formattedRequest.method, formattedRequest.url]
+  if (formattedRequest.headers && typeof formattedRequest.headers === 'object') {
+    const headerKeys = Object.keys(formattedRequest.headers).sort()
+    for (const key of headerKeys) {
+      const values = Array.isArray(formattedRequest.headers[key])
+        ? formattedRequest.headers[key]
+        : [formattedRequest.headers[key]]
+      parts.push(key)
+      for (const value of values.sort()) {
+        parts.push(String(value))
+      }
+    }
+  }
+  parts.push(formattedRequest.body)
+  const content = parts.join('|')
+  return hashId(content)  // SHA-256 → base64url
+}
+```
+
+**确定性哈希**：header 排序 + value 排序 → 相同请求不同 header 顺序产生相同哈希。`hashId` 使用 `crypto.hash('sha256', content)` + base64url 编码。
+
+**匹配选项**（`SnapshotRecorderMatchOptions`）：
+- `matchHeaders`：仅匹配指定 headers（白名单）
+- `ignoreHeaders`：匹配时忽略的 headers
+- `excludeHeaders`：存储时排除的 headers（安全：排除 `authorization`/`cookie`）
+- `matchBody`：是否匹配 body
+- `normalizeBody`：body 归一化函数（如 strip 时间戳）
+- `matchQuery`：是否匹配 query
+- `normalizeQuery`：query 归一化函数
+- `caseSensitive`：header 匹配大小写敏感
+
+**autoFlush**（第 246+ 行）：定时器定期 `saveSnapshots()` 到磁盘。`flushInterval` 默认 30 秒。`#flushTimeout` 在 `close()` 时清理。
+
+### 19.6 MockCallHistory 调用历史（`lib/mock/mock-call-history.js`）
+
+```javascript
+class MockCallHistory {
+  #logs = []
+  #enabled = false
+
+  addLog (opts) {
+    this.#logs.push({
+      method: opts.method,
+      path: opts.path,
+      origin: opts.origin,
+      headers: opts.headers,
+      body: opts.body,
+      timestamp: new Date().toISOString()
+    })
+  }
+
+  clear () { this.#logs = [] }
+  getLogs () { return this.#logs }
+}
+```
+
+**用途**：测试断言（验证请求是否被调用、调用次数、调用参数）。`enableCallHistory()` 后所有请求（包括未被 mock 拦截的）都被记录。
+
+### 19.7 Mock 并发安全
+
+1. **dispatch 是同步的**：`MockAgent.dispatch` 同步调用 `this[kAgent].dispatch`，无竞态。
+2. **match 是只读的**：`getMockDispatch` 只读取 `mockDispatches` 数组，不修改。
+3. **consumed 标记**：`addMockDispatch` 时 `consumed: false`，匹配后 `consumed: true`（如果 `persist: false`）。**非持久拦截器匹配后标记为 consumed**，下次不再匹配。
+4. **times 计数器**：`timesInvoked` 跟踪调用次数，达到 `times` 后 `consumed = true`。
+
+### 19.8 laew gap 与 Rust crate 建议
+
+| laew 现状 | undici 启示 | Rust 实现路径 |
+|---|---|---|
+| 无 Mock 测试基础设施 | E2E 测试需要 mock LLM API | `mockito`（HTTP mock server）+ `wiremock` |
+| 无 Snapshot 录制回放 | 录制真实 LLM 响应用于回归测试 | `insta`（snapshot testing）+ `serde_json` |
+| 无请求匹配器 | 灵活匹配 LLM 请求（header/body/query） | `mockito::Matcher`（已内置多种匹配器） |
+| 无调用历史审计 | 验证 LLM 调用次数/参数 | `mockito::Mock::assert()` |
+| 无 autoFlush | 测试数据持久化 | `tokio::time::interval` + `serde_json::to_writer` |
+| 无三态机 | record/playback/update | `enum SnapshotMode { Record, Playback, Update }` |
+
+
+## 20. 维度五：HTTP/3 QUIC 传输层深度分析
+
+### 20.1 维度概览
+
+第 15.1 节已覆盖「Alt-Svc 白名单 + HTTP/3 实验性」的现状。本轮深入分析：
+
+1. **undici 对 HTTP/3 的真实态度**：仅做 Alt-Svc 解析 + 协议升级提示，**无 QUIC 实现**
+2. **Alt-Svc 头解析实现**（`lib/core/constants.js` + `lib/dispatcher/agent.js`）
+3. **与 Node.js 内置 QUIC（`node:quic`，实验性）的集成可能性**
+4. **HTTP/3 帧格式与 QUIC 流映射**（理论分析 + laew 实现建议）
+
+### 20.2 Alt-Svc 解析实现
+
+**白名单**（`lib/core/constants.js`）：
+```javascript
+// Alt-Svc 支持的协议白名单
+const ALTSVC_SUPPORTED = ['h2', 'h3', 'h3-29', 'h3-Q50', 'h3-29-Q50']
+```
+
+**Alt-Svc 头解析**（`lib/dispatcher/agent.js`）：
+```javascript
+function parseAltSvc (altSvcHeader) {
+  // Alt-Svc: h3=":443"; ma=2592000; v="29"
+  const entries = altSvcHeader.split(',')
+  for (const entry of entries) {
+    const [protocol, ...params] = entry.trim().split(';')
+    const [proto, host] = protocol.split('=')
+    if (ALTSVC_SUPPORTED.includes(proto)) {
+      // 解析 ma (max-age) 和 persist
+      let ma = 0
+      let persist = false
+      for (const param of params) {
+        const [key, value] = param.trim().split('=')
+        if (key === 'ma') ma = parseInt(value, 10)
+        if (key === 'persist') persist = true
+      }
+      return { protocol: proto, host: host.replace(/"/g, ''), ma, persist }
+    }
+  }
+  return null
+}
+```
+
+**语义**：Alt-Svc 告诉客户端「同一资源可通过不同协议/主机访问」。undici 解析后缓存到 Agent 的 `altSvcCache`（`Map<origin, altSvcEntry>`）。
+
+### 20.3 协议升级策略
+
+**undici 当前的 HTTP/3 策略**：
+
+1. **不主动连接 HTTP/3**：即使 Alt-Svc 声明 h3 可用，undici 也不创建 QUIC 连接。
+2. **Alt-Svc 透传**：`agent.js` 在收到 Alt-Svc 头时记录，但下次请求仍走 h1/h2。
+3. **Alt-Used 头**：如果决定使用 Alt-Svc 指定的 origin，发送 `Alt-Used: host:port` 头告诉服务器。
+4. **回退兜底**：HTTP/3 连接失败必须回退到 h2/h1（QUIC 在 UDP 上，某些企业网络阻断 UDP 443）。
+
+### 20.4 QUIC 传输层理论（laew 实现参考）
+
+**QUIC 核心特性**：
+
+1. **基于 UDP**：避免 TCP 队头阻塞（Head-of-Line Blocking）。
+2. **内置 TLS 1.3**：QUIC = UDP + TLS 1.3 + 多路复用，0-RTT 连接建立。
+3. **连接迁移**：Connection ID 标识连接，IP/端口变化时不断连（移动端场景关键）。
+4. **流多路复用**：每个 stream 独立，一个 stream 丢包不影响其他 stream。
+5. **前向纠错**（FEC）：可选，减少重传。
+
+**QUIC 帧格式**（RFC 9000）：
+```
++----------------------------------+
+|   Type (1)   |   Length (1-8)    |
++----------------------------------+
+|   Stream ID (1-8)                |
++----------------------------------+
+|   Offset (0-8)                   |
++----------------------------------+
+|   Data Length (2)                |
++----------------------------------+
+|   Data (0+)                      |
++----------------------------------+
+```
+
+**HTTP/3 帧格式**（RFC 9114）：
+```
++----------------------------------+
+|   Length (varint)                |
++----------------------------------+
+|   Type (varint)                  |
++----------------------------------+
+|   Payload (0+)                   |
++----------------------------------+
+```
+
+**HTTP/3 关键帧**：
+- `HEADERS`（0x01）：QPACK 编码的 header
+- `DATA`（0x00）：body 数据
+- `SETTINGS`（0x04）：连接级配置
+- `GOAWAY`（0x07）：优雅关闭
+- `MAX_PUSH_ID`（0x0D）：server push 限制
+- `CANCEL_PUSH`（0x03）：取消 push
+
+**QPACK**（RFC 9204）：HTTP/3 的 header 压缩（HPACK 的 QUIC 适配版）。
+- **静态表**：99 个预定义 header 字段（与 HPACK 共享）
+- **动态表**：连接级，QUIC 流顺序保证避免 HPACK 的「乱序更新」问题
+- **Encoder/Decoder 流**：专用 unidirectional stream 传输动态表更新
+
+### 20.5 Node.js 内置 QUIC（`node:quic`，实验性）
+
+**Node.js 20+ 实验性 QUIC 支持**：
+
+```javascript
+const { QuicSocket, QuicStream } = require('node:quic')
+
+const socket = new QuicSocket({ client: { key, cert, ca } })
+await socket.connect({ address: 'example.com', port: 443 })
+
+const stream = socket.openStream({ halfOpen: false })
+stream.write('hello')
+stream.on('data', (chunk) => { /* ... */ })
+```
+
+**状态**：Node.js 22 仍标记为 `experimental`，API 不稳定。undici 未集成 `node:quic`。
+
+### 20.6 laew HTTP/3 实现路径
+
+**Rust 生态的 QUIC 实现**：
+
+| crate | 成熟度 | 特性 | 适用场景 |
+|---|---|---|---|
+| `quinn` | 高（Quinn 0.11+） | 纯 Rust，基于 `rustls` | 首选，API 友好 |
+| `s2n-quic` | 高（AWS 出品） | C10K+ 优化，AWS 集成 | 云原生 |
+| `nequ` | 中 | 轻量，底层控制 | 学习/定制 |
+| `lsquic` | 中（C 库绑定） | Cloudflare 维护，Brotli 集成 | 需要 Cloudflare 兼容 |
+
+**laew HTTP/3 落地建议**：
+
+```rust
+// 使用 quinn 实现 HTTP/3 客户端
+use quinn::{Endpoint, ClientConfig};
+use rustls::{RootCertStore, Certificate, PrivateKey};
+
+pub struct H3Client {
+    endpoint: Endpoint,
+    connection: Connection,
+}
+
+impl H3Client {
+    pub async fn connect(host: &str, port: u16) -> Result<Self> {
+        let mut roots = RootCertStore::empty();
+        roots.add_parsable_certificates(&native_certs());
+        
+        let mut client_config = ClientConfig::with_root_certificates(roots);
+        let transport_config = Arc::get_mut(&mut client_config.transport).unwrap();
+        transport_config.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+        
+        let endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+        let connection = endpoint.connect(format!("{}:{}", host, port).parse()?, host)?.await?;
+        
+        Ok(Self { endpoint, connection })
+    }
+    
+    pub async fn send_request(&self, req: Request<Bytes>) -> Result<Response<Bytes>> {
+        let (mut send_stream, recv_stream) = self.connection.open_bi().await?;
+        // HTTP/3 frame encoding
+        // ...
+    }
+}
+```
+
+### 20.7 HTTP/3 vs HTTP/2 对比（laew 决策参考）
+
+| 维度 | HTTP/2 | HTTP/3 | laew 影响 |
+|---|---|---|---|
+| 传输层 | TCP + TLS | QUIC (UDP) + TLS 1.3 | QUIC 更抗丢包 |
+| 队头阻塞 | TCP 层有 | 无（stream 独立） | LLM 长响应更流畅 |
+| 连接迁移 | 无 | Connection ID | 移动端 laew 关键 |
+| 0-RTT | 无 | 有 | 首次连接更快 |
+| 部署成熟度 | 高 | 中（部分企业阻断 UDP） | 当前 h2 更稳妥 |
+| LLM API 支持 | 普遍 | 仅 Cloudflare/部分 | 看 provider |
+
+**结论**：laew 当前优先支持 h2（reqwest 内置），HTTP/3 等 provider 支持后再评估。Alt-Svc 解析可提前实现（为未来升级做准备）。
+
+
+## 21. 维度六：代理链 SOCKS 完整实现剖析
+
+### 21.1 维度概览
+
+第 15.2 节已覆盖 ProxyAgent/SOCKS5 代理链的基本架构。本轮深入分析：
+
+1. **SOCKS5 RFC 1928/1929 状态机完整实现**（`socks5-client.js` 422 行）
+2. **SOCKS5 地址编码**（`socks5-utils.js` 212 行）
+3. **SOCKS5 代理编排**（`socks5-proxy-agent.js` 282 行）
+4. **CONNECT 隧道 + TLS 双层握手**
+5. **laew 代理实现路径**
+
+### 21.2 SOCKS5 客户端状态机（`lib/core/socks5-client.js`）
+
+**RFC 1928 握手协议**：
+
+```
+Client                          Proxy
+  |                                |
+  |--- GREETING (ver, nmethods) -->|
+  |<-- METHOD SELECT (ver, method)-|
+  |                                |
+  |--- REQUEST (ver, cmd, atyp) -->|
+  |<-- REPLY (ver, rep, atyp) -----|
+  |                                |
+  |=== TCP RELAY ==================|
+```
+
+**`Socks5Client` 类实现**：
+
+```javascript
+class Socks5Client {
+  #server
+  #options
+  #socket
+  #state = 'greeting'  // greeting → method → request → reply → connected
+
+  constructor (server, options) {
+    this.#server = server
+    this.#options = options
+  }
+
+  // 1. 发送 GREETING
+  #sendGreeting () {
+    // ver=5, nmethods=2, methods=[0x00 (NO AUTH), 0x02 (USERNAME/PASSWORD)]
+    const greeting = Buffer.allocUnsafe(3)
+    greeting[0] = 0x05  // SOCKS5
+    greeting[1] = 0x02  // nmethods
+    greeting[2] = 0x00  // NO AUTHENTICATION REQUIRED
+    greeting[3] = 0x02  // USERNAME/PASSWORD (RFC 1929)
+    this.#socket.write(greeting)
+  }
+
+  // 2. 接收 METHOD SELECT
+  #handleMethodSelect (data) {
+    if (data[0] !== 0x05) {
+      throw new SOCKS5AuthenticationError('Invalid SOCKS version')
+    }
+    if (data[1] === 0xFF) {
+      throw new SOCKS5AuthenticationError('No acceptable methods')
+    }
+    this.#state = 'request'
+    this.#sendRequest()
+  }
+
+  // 3. 发送 CONNECT REQUEST
+  #sendRequest () {
+    const request = Buffer.allocUnsafe(262)  // max: 4 + 1 + 255 + 2
+    request[0] = 0x05  // SOCKS5
+    request[1] = 0x01  // CONNECT (0x02=BIND, 0x03=UDP ASSOCIATE)
+    request[2] = 0x00  // RSV
+
+    // 地址编码
+    const addr = this.#options.dstAddr
+    if (net.isIP(addr) === 4) {
+      request[3] = 0x01  // IPv4
+      request.writeUInt32BE(ipv4ToInt(addr), 4)
+      request[8] = 0x00  // placeholder
+      // ... 实际 IPv4 编码
+    } else if (net.isIP(addr) === 6) {
+      request[3] = 0x04  // IPv6
+      // ... 16 字节 IPv6 编码
+    } else {
+      request[3] = 0x03  // DOMAIN
+      const domain = Buffer.from(addr)
+      request[4] = domain.length
+      domain.copy(request, 5)
+      const offset = 5 + domain.length
+      request.writeUInt16BE(this.#options.dstPort, offset)
+    }
+
+    this.#socket.write(request.slice(0, request.indexOf(0, 4)))
+  }
+
+  // 4. 接收 REPLY
+  #handleReply (data) {
+    if (data[0] !== 0x05) {
+      throw new SOCKS5ProxyError('Invalid version in reply')
+    }
+    switch (data[1]) {
+      case 0x00: // SUCCEEDED
+        this.#state = 'connected'
+        this.#socket.emit('connect')
+        break
+      case 0x01: // GENERAL FAILURE
+        throw new SOCKS5ProxyError('General SOCKS server failure')
+      case 0x02: // CONNECTION NOT ALLOWED
+        throw new SOCKS5ProxyError('Connection not allowed')
+      case 0x03: // NETWORK UNREACHABLE
+        throw new SOCKS5ProxyError('Network unreachable')
+      case 0x04: // HOST UNREACHABLE
+        throw new SOCKS5ProxyError('Host unreachable')
+      case 0x05: // CONNECTION REFUSED
+        throw new SOCKS5ProxyError('Connection refused')
+      case 0x06: // TTL EXPIRED
+        throw new SOCKS5ProxyError('TTL expired')
+      case 0x07: // COMMAND NOT SUPPORTED
+        throw new SOCKS5ProxyError('Command not supported')
+      case 0x08: // ADDRESS TYPE NOT SUPPORTED
+        throw new SOCKS5ProxyError('Address type not supported')
+    }
+  }
+}
+```
+
+**关键技术点**：
+
+1. **状态机设计**：`greeting → method → request → reply → connected`。每个状态对应不同的 data handler。
+
+2. **SOCKS5 认证协商**（RFC 1929）：
+   - `0x00`：NO AUTHENTICATION REQUIRED（最常见）
+   - `0x02`：USERNAME/PASSWORD（企业代理）
+   - `0xFF`：NO ACCEPTABLE METHODS（拒绝）
+
+3. **CONNECT 命令**（`0x01`）：建立 TCP 连接。BIND（`0x02`）和 UDP ASSOCIATE（`0x03`）undici 不实现。
+
+4. **地址类型**（`atyp`）：
+   - `0x01`：IPv4（4 字节）
+   - `0x03`：DOMAIN（1 字节长度 + 域名）
+   - `0x04`：IPv6（16 字节）
+
+### 21.3 SOCKS5 地址编码（`lib/core/socks5-utils.js`）
+
+```javascript
+/**
+ * 编码 SOCKS5 地址
+ * @param {string} address - IPv4/IPv6/域名
+ * @param {number} port - 端口
+ * @returns {Buffer}
+ */
+function encodeSocks5Address (address, port) {
+  const buffer = Buffer.allocUnsafe(262)  // max 大小
+  let offset = 0
+
+  const family = net.isIP(address)
+  if (family === 4) {
+    buffer[0] = 0x01  // IPv4
+    // IPv4 转 4 字节 big-endian
+    const parts = address.split('.')
+    buffer[1] = parseInt(parts[0], 10)
+    buffer[2] = parseInt(parts[1], 10)
+    buffer[3] = parseInt(parts[2], 10)
+    buffer[4] = parseInt(parts[3], 10)
+    offset = 5
+  } else if (family === 6) {
+    buffer[0] = 0x04  // IPv6
+    // IPv6 转 16 字节
+    const ipv6 = Buffer.from(address.split(':').flatMap((part) => {
+      const value = parseInt(part || '0', 16)
+      return [(value >> 8) & 0xFF, value & 0xFF]
+    }))
+    ipv6.copy(buffer, 1)
+    offset = 17
+  } else {
+    buffer[0] = 0x03  // DOMAIN
+    const domain = Buffer.from(address, 'ascii')
+    buffer[1] = domain.length
+    domain.copy(buffer, 2)
+    offset = 2 + domain.length
+  }
+
+  buffer.writeUInt16BE(port, offset)
+  return buffer.slice(0, offset + 2)
+}
+
+/**
+ * 解码 SOCKS5 回复地址
+ * @param {Buffer} buffer
+ * @param {number} offset
+ * @returns {{ address: string, port: number, offset: number }}
+ */
+function decodeSocks5Address (buffer, offset) {
+  const atyp = buffer[offset]
+  let address, newOffset
+
+  if (atyp === 0x01) {  // IPv4
+    address = `${buffer[offset + 1]}.${buffer[offset + 2]}.${buffer[offset + 3]}.${buffer[offset + 4]}`
+    newOffset = offset + 5
+  } else if (atyp === 0x04) {  // IPv6
+    const parts = []
+    for (let i = 0; i < 16; i += 2) {
+      parts.push(((buffer[offset + 1 + i] << 8) | buffer[offset + 2 + i]).toString(16))
+    }
+    address = parts.join(':')
+    newOffset = offset + 17
+  } else if (atyp === 0x03) {  // DOMAIN
+    const length = buffer[offset + 1]
+    address = buffer.slice(offset + 2, offset + 2 + length).toString('ascii')
+    newOffset = offset + 2 + length
+  }
+
+  const port = buffer.readUInt16BE(newOffset)
+  return { address, port, offset: newOffset + 2 }
+}
+```
+
+**关键**：
+- IPv4 → 4 字节（每个 octet 一个字节）
+- IPv6 → 16 字节（每个 16-bit 段 big-endian）
+- DOMAIN → 1 字节长度 + ASCII 编码
+
+### 21.4 SOCKS5 代理编排（`lib/dispatcher/socks5-proxy-agent.js`）
+
+```javascript
+class Socks5ProxyAgent extends Dispatcher {
+  #proxy
+  #options
+
+  constructor (options = {}) {
+    super()
+    this.#proxy = {
+      host: options.host || '127.0.0.1',
+      port: options.port || 1080,
+      type: 5
+    }
+    this.#options = options
+  }
+
+  dispatch (opts, handler) {
+    // 1. 创建 SOCKS5 客户端
+    const socks5Client = new Socks5Client(this.#proxy, {
+      auth: this.#options.auth,
+      dstAddr: opts.origin.hostname,
+      dstPort: parseInt(opts.origin.port, 10)
+    })
+
+    // 2. 连接到 SOCKS5 代理
+    const socket = net.connect(this.#proxy.port, this.#proxy.host)
+
+    // 3. 建立 SOCKS5 连接
+    socks5Client.connect(socket).then(() => {
+      // 4. 隧道建立成功，返回 socket 给 handler
+      handler.onConnect({
+        socket,
+        // ...
+      })
+    }).catch((err) => {
+      handler.onResponseError(null, err)
+    })
+  }
+}
+```
+
+**关键**：
+1. SOCKS5 代理**不解析 HTTP**，只是 TCP 隧道
+2. 代理不看到请求内容（加密的 HTTPS 流量）
+3. 支持链式代理（SOCKS5 → SOCKS5 → HTTP CONNECT）
+
+### 21.5 CONNECT 隧道 + TLS 双层握手
+
+**HTTPS over SOCKS5**：
+
+```
+Client                          Proxy                    Target
+  |                                |                        |
+  |--- SOCKS5 CONNECT target:443 ->|                        |
+  |<-- SOCKS5 SUCCESS -------------|                        |
+  |                                |--- TCP CONNECT ------->|
+  |                                |<-- TCP ESTABLISHED ----|
+  |=== TLS 1.3 HANDSHAKE ================================|  (加密)
+  |--- ClientHello --------------->|--- ClientHello ------->|
+  |<-- ServerHello ... -----------|<-- ServerHello ... ----|
+  |=== HTTP/2 (h2) ======================================|  (加密)
+```
+
+**关键**：
+1. SOCKS5 代理只看到「连接到 target:443」，**看不到 TLS 内容**
+2. TLS 握手在 SOCKS5 隧道内进行，SNI 加密（ECH）时连 target 域名都看不到
+3. 双层握手延迟 = SOCKS5 握手（1 RTT）+ TLS 握手（1-2 RTT）
+
+### 21.6 laew 代理实现路径
+
+**reqwest 代理支持**：
+
+```rust
+use reqwest::Proxy;
+
+let client = Client::builder()
+    .proxy(Proxy::https("socks5://127.0.0.1:1080")?)
+    .proxy(Proxy::http("http://proxy.example.com:8080")?)
+    .build()?;
+```
+
+**reqwest 支持的代理类型**：
+- `http://`：HTTP CONNECT 隧道
+- `https://`：HTTP CONNECT + TLS 双层
+- `socks5://`：SOCKS5（需要 `reqwest` 开启 `socks` feature）
+- `socks5h://`：SOCKS5 + 远程 DNS（防止本地 DNS 泄漏）
+
+**laew 代理配置建议**：
+
+```rust
+pub struct ProxyConfig {
+    pub http_proxy: Option<String>,    // http://proxy:8080
+    pub https_proxy: Option<String>,   // https://proxy:8080
+    pub socks5_proxy: Option<String>,  // socks5://127.0.0.1:1080
+    pub no_proxy: Vec<String>,        // 绕过代理的域名
+}
+
+impl ProxyConfig {
+    pub fn apply_to_client(&self, builder: ClientBuilder) -> ClientBuilder {
+        let mut builder = builder;
+        if let Some(http) = &self.http_proxy {
+            builder = builder.proxy(Proxy::http(http)?);
+        }
+        if let Some(socks5) = &self.socks5_proxy {
+            builder = builder.proxy(Proxy::all(socks5)?);
+        }
+        builder
+    }
+}
+```
+
+### 21.7 laew gap 与 Rust crate 建议
+
+| laew 现状 | undici 启示 | Rust 实现路径 |
+|---|---|---|
+| 无 SOCKS5 代理 | reqwest 内置 socks feature | `reqwest = { features = ["socks"] }` |
+| 无代理链 | 多跳代理支持 | `Proxy::custom()` 自定义代理链 |
+| 无 NO_PROXY 匹配 | 环境变量支持 | `env_proxy` crate |
+| 无代理认证 | SOCKS5 auth | `reqwest` 支持 `user:pass@proxy` |
+| 无远程 DNS | socks5h 防止 DNS 泄漏 | `reqwest` socks5h 自动支持 |
+
+
+## 22. 维度七：TLS 证书验证与自定义 CA 完整剖析
+
+### 22.1 维度概览
+
+第 15.3 节已覆盖 connect.js 的 SNI/ALPN/session 复用。本轮深入分析：
+
+1. **TLS 证书验证链**（Node.js `tls.connect` 内部机制）
+2. **自定义 CA 配置**（`ca`/`cert`/`key` 选项透传）
+3. **证书指纹钉扎**（fingerprint pinning，官方示例）
+4. **`rejectUnauthorized` 与安全边界**
+5. **TLS Session 复用的 WeakSessionCache 实现**
+6. **laew TLS 配置路径**
+
+### 22.2 TLS 连接建立（`lib/core/connect.js`）
+
+```javascript
+function buildConnector ({ allowH2, preferH2, useH2c, maxCachedSessions, socketPath, timeout, session: customSession, ...opts }) {
+  const options = { path: socketPath, ...opts }
+  const sessionCache = new SessionCache(maxCachedSessions == null ? 100 : maxCachedSessions)
+  timeout = timeout == null ? 10e3 : timeout
+  allowH2 = allowH2 != null ? allowH2 : true
+
+  return function connect ({ hostname, host, protocol, port, servername, localAddress, httpSocket }, callback) {
+    let socket
+    if (protocol === 'https:') {
+      if (!tls) { tls = require('node:tls') }
+      servername = servername || options.servername || util.getServerName(host) || null
+      const sessionKey = servername || hostname
+      assert(sessionKey)
+      const session = customSession || sessionCache.get(sessionKey) || null
+      port = port || 443
+
+      socket = tls.connect({
+        highWaterMark: 16384,  // TLS in node can't have bigger HWM anyway
+        ...options,            // 透传 ca/cert/key/rejectUnauthorized/... 所有 TLS 选项
+        servername,
+        session,
+        localAddress,
+        ALPNProtocols: allowH2
+          ? (preferH2 ? ['h2', 'http/1.1'] : ['http/1.1', 'h2'])
+          : ['http/1.1'],
+        socket: httpSocket,    // CONNECT 隧道升级复用
+        port,
+        host: hostname
+      })
+
+      socket.on('session', function (session) {
+        sessionCache.set(sessionKey, session)
+      })
+    }
+    // ...
+  }
+}
+```
+
+**关键技术点**：
+
+1. **`...options` 透传**：`buildConnector` 的 opts 剩余部分全部透传给 `tls.connect`。这意味着用户可以传：
+   - `ca`：自定义 CA 证书（`Buffer[]` / `string[]`）
+   - `cert`：客户端证书（mTLS）
+   - `key`：客户端私钥
+   - `rejectUnauthorized`：是否拒绝未授权证书（默认 true）
+   - `checkServerIdentity`：自定义服务器身份校验函数
+   - `ciphers`：加密套件白名单
+   - `secureProtocol`：TLS 版本强制（如 `'TLSv1_3_method'`）
+   - `minVersion`/`maxVersion`：TLS 版本范围
+
+2. **ALPN 协议顺序**：
+   - `preferH2 = true`：`['h2', 'http/1.1']`（优先 h2）
+   - `preferH2 = false`（默认）：`['http/1.1', 'h2']`（优先 h1）
+   - `allowH2 = false`：`['http/1.1']`（仅 h1）
+   
+   ALPN 顺序决定服务器选择。**默认 preferH2 = false** 是因为 h2 在某些场景（如大 body 上传）性能不如 h1。
+
+3. **`highWaterMark: 16384`**：TLS socket 的 HWM 固定 16KB（注释：`TLS in node can't have bigger HWM anyway`）—— 超过此值会导致背压失效。
+
+### 22.3 WeakSessionCache 实现（TLS Session 复用）
+
+```javascript
+const SessionCache = class WeakSessionCache {
+  constructor (maxCachedSessions) {
+    this._maxCachedSessions = maxCachedSessions
+    this._sessionCache = new Map()
+    this._sessionRegistry = new FinalizationRegistry((key) => {
+      if (this._sessionCache.size < this._maxCachedSessions) { return }
+      const ref = this._sessionCache.get(key)
+      if (ref !== undefined && ref.deref() === undefined) {
+        this._sessionCache.delete(key)
+      }
+    })
+  }
+
+  get (sessionKey) {
+    const ref = this._sessionCache.get(sessionKey)
+    return ref ? ref.deref() : null
+  }
+
+  set (sessionKey, session) {
+    if (this._maxCachedSessions === 0) { return }
+    if (this._sessionCache.has(sessionKey)) {
+      this._sessionCache.delete(sessionKey)
+    } else if (this._sessionCache.size >= this._maxCachedSessions) {
+      // 优先删除已被 GC 的死条目
+      for (const [key, ref] of this._sessionCache) {
+        if (ref.deref() === undefined) {
+          this._sessionCache.delete(key)
+          return
+        }
+      }
+      // 全部存活时 LRU 淘汰最老条目
+      const oldest = this._sessionCache.keys().next()
+      if (!oldest.done) {
+        this._sessionCache.delete(oldest.value)
+      }
+    }
+    this._sessionCache.set(sessionKey, new WeakRef(session))
+    this._sessionRegistry.register(session, sessionKey)
+  }
+}
+```
+
+**三重淘汰机制**：
+1. **容量上限**（默认 100 条 session）
+2. **FinalizationRegistry 清理**：session 被 GC 时触发回调清理 Map 条目
+3. **惰性清理**：set 时若满，先扫描死条目，再 LRU 淘汰
+
+**为什么用 WeakRef**：TLS Session 对象由 Node.js 底层管理生命周期，JS 层不应强制持有（否则内存泄漏）。WeakRef 允许 GC 回收未使用的 session，同时支持复用活跃 session。
+
+**复用效果**：TLS 1.2 session 复用可省 1 RTT；TLS 1.3 PSK（pre-shared key）复用可省 1 RTT 且 0-RTT 数据。对 LLM API 调用（高延迟网络）意义显著。
+
+### 22.4 证书指纹钉扎（官方示例）
+
+`docs/examples/ca-fingerprint/index.js`：
+
+```javascript
+const { Client, request } = require('undici')
+
+const client = new Client('https://api.example.com', {
+  connect: {
+    // 证书指纹钉扎：只信任指纹匹配的证书
+    checkServerIdentity (hostname, certificate) {
+      // certificate.fingerprint256 是证书的 SHA-256 指纹
+      if (certificate.fingerprint256 !== EXPECTED_FINGERPRINT) {
+        return new Error(`Certificate fingerprint mismatch`)
+      }
+      return undefined  // 验证通过
+    }
+  }
+})
+```
+
+**指纹钉扎 vs CA 钉扎**：
+- **CA 钉扎**（`ca` 选项）：信任自定义 CA 签发的所有证书
+- **指纹钉扎**（`checkServerIdentity`）：只信任特定指纹的证书（即使 CA 被攻破也安全）
+
+**适用场景**：私有化 LLM 网关（固定证书）、内部 API（自签证书）。
+
+### 22.5 CONNECT 隧道 + TLS 双层握手（第 15 章交叉引用）
+
+第 15.2 节已覆盖 CONNECT 隧道。本轮补充 **TLS 双层握手细节**：
+
+```
+Client                      Proxy                    Target
+  |                           |                         |
+  |--- CONNECT target:443 -->|                          |
+  |<-- 200 OK ---------------|                          |
+  |                           |--- TCP CONNECT -------->|
+  |<-- TCP ESTABLISHED ------|<-- TCP ESTABLISHED ------|
+  |=== TLS HANDSHAKE (with target) =========|            |
+  |--- ClientHello (SNI=target) ------------------------>|
+  |<-- ServerHello, Certificate, ... --------------------|
+  |--- Finished ---------------------------------------->|
+  |<-- Finished -----------------------------------------|
+  |=== HTTP/2 or HTTP/1.1 over TLS ======================|
+```
+
+**两次握手、两套证书校验**：
+1. **Proxy 层**（HTTP CONNECT）：如果 proxy 是 `https://`，先与 proxy 做 TLS 握手（SNI=proxy 域名）
+2. **Target 层**：CONNECT 隧道建立后，在隧道上再做 TLS 握手（SNI=target 域名）
+
+**关键实现**（`connect.js:93`）：
+```javascript
+socket: httpSocket,  // upgrade socket connection
+```
+`httpSocket` 是 CONNECT 隧道返回的 socket。`tls.connect` 的 `socket` 选项允许在已有 socket 上做 TLS 升级（而不是新建 TCP 连接）。
+
+### 22.6 laew TLS 配置路径
+
+**reqwest TLS 配置**：
+
+```rust
+use reqwest::{Client, Certificate, Identity};
+use std::fs;
+
+// 自定义 CA
+let ca_cert = fs::read("custom-ca.pem")?;
+let ca = Certificate::from_pem(&ca_cert)?;
+
+// mTLS 客户端证书
+let client_cert = fs::read("client.pem")?;
+let client_key = fs::read("client.key")?;
+let identity = Identity::from_pem(&format!("{}{}", 
+    String::from_utf8_lossy(&client_cert),
+    String::from_utf8_lossy(&client_key)
+))?;
+
+let client = Client::builder()
+    .add_root_certificate(ca)          // 自定义 CA
+    .identity(identity)                // 客户端证书（mTLS）
+    .danger_accept_invalid_certs(false)  // 默认拒绝无效证书
+    .build()?;
+```
+
+**证书指纹钉扎（Rust）**：
+
+```rust
+use rustls::{ServerCertVerifier, ServerCertVerified, RootCertStore, Certificate};
+use sha2::{Sha256, Digest};
+
+struct FingerprintVerifier {
+    expected_fingerprint: Vec<u8>,
+}
+
+impl ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &Certificate,
+        _intermediates: &[Certificate],
+        _server_name: &ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: SystemTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let mut hasher = Sha256::new();
+        hasher.update(&end_entity.0);
+        let fingerprint = hasher.finalize();
+        if fingerprint.as_slice() == self.expected_fingerprint.as_slice() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+}
+```
+
+### 22.7 laew gap 与 Rust crate 建议
+
+| laew 现状 | undici 启示 | Rust 实现路径 |
+|---|---|---|
+| 无自定义 CA 支持 | 企业私有 CA 场景必需 | `reqwest::Certificate::from_pem` |
+| 无 mTLS 客户端证书 | 内部 API 双向认证 | `reqwest::Identity::from_pem` |
+| 无证书指纹钉扎 | 高安全部署 | `rustls::ServerCertVerifier` 自定义 |
+| 无 TLS session 复用显示控制 | reqwest 自动做 | 无需干预（rustls 内置 PSK） |
+| 无 TLS 版本控制 | 兼容老旧网关 | `rustls::Connection::set_tls_version` |
+| 无 ALPN 顺序控制 | h1/h2 强制切换 | `reqwest::ClientBuilder::http1_only()` |
+
+---
+
+## 23. 维度八：Cookies 重定向链与 Set-Cookie 解析完整剖析
+
+### 23.1 维度概览
+
+第 15.4 节已覆盖 redirect-handler.js 的环检测和头清洗。本轮深入分析：
+
+1. **Set-Cookie 解析状态机**（`lib/web/cookies/parse.js`）
+2. **Cookie 属性校验**（`lib/web/cookies/util.js`）
+3. **`__Secure-`/`__Host-` 前缀规则**（RFC 6265bis）
+4. **Cookie 与重定向的交互**（跨源删头细节）
+5. **laew Cookie 处理路径**
+
+### 23.2 Set-Cookie 解析状态机（`lib/web/cookies/parse.js`）
+
+RFC 6265bis §5.4 完整实现：
+
+```javascript
+function parseSetCookie (header) {
+  // 1. CTL 字符检查（%x00-08 / %x0A-1F / %x7F）
+  if (isCTLExcludingHtab(header)) {
+    return null  // 包含控制字符 → 整个 header 忽略
+  }
+
+  let nameValuePair = ''
+  let unparsedAttributes = ''
+  let name = ''
+  let value = ''
+
+  // 2. 按 ';' 分割 name-value-pair 和 attributes
+  if (header.includes(';')) {
+    const position = { position: 0 }
+    nameValuePair = collectASequenceOfCodePointsFast(';', header, position)
+    unparsedAttributes = header.slice(position.position)
+  } else {
+    nameValuePair = header
+  }
+
+  // 3. 按 '=' 分割 name 和 value
+  if (!nameValuePair.includes('=')) {
+    value = nameValuePair  // 无 '=' → name 为空，value 为整串
+  } else {
+    const position = { position: 0 }
+    name = collectASequenceOfCodePointsFast('=', nameValuePair, position)
+    value = nameValuePair.slice(position.position + 1)
+  }
+
+  // 4. 去除首尾空白
+  name = name.trim()
+  value = value.trim()
+
+  // 5. 尺寸限制（RFC 6265bis §5.4 第 5 步）
+  if (name.length + value.length > maxNameValuePairSize) {  // 4096
+    return null
+  }
+
+  // 6. 解析属性
+  return {
+    name, value,
+    ...parseUnparsedAttributes(unparsedAttributes)
+  }
+}
+```
+
+**关键设计**：
+
+1. **CTL 字符前置检查**：含 `0x00-0x08`/`0x0A-0x1F`/`0x7F` 时**整个 header 忽略**（防御注入攻击）。注意 `0x09 (HTAB)` 是允许的（注释：`CTL characters excluding HTAB`）。
+
+2. **`maxNameValuePairSize = 4096`**：name+value 总长上限。超长直接返回 null。
+
+3. **`maxAttributeValueSize = 1024`**：单个属性值（如 Path）上限。
+
+### 23.3 Cookie 属性解析（`parseUnparsedAttributes`）
+
+```javascript
+function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) {
+  if (unparsedAttributes.length === 0) { return cookieAttributeList }
+
+  // 丢弃第一个 ';' 字符
+  assert(unparsedAttributes[0] === ';')
+  unparsedAttributes = unparsedAttributes.slice(1)
+
+  let cookieAv = ''
+
+  if (unparsedAttributes.includes(';')) {
+    cookieAv = collectASequenceOfCodePointsFast(';', unparsedAttributes, { position: 0 })
+    unparsedAttributes = unparsedAttributes.slice(cookieAv.length)
+  } else {
+    cookieAv = unparsedAttributes
+    unparsedAttributes = ''
+  }
+
+  let attributeName = ''
+  let attributeValue = ''
+
+  if (cookieAv.includes('=')) {
+    const position = { position: 0 }
+    attributeName = collectASequenceOfCodePointsFast('=', cookieAv, position)
+    attributeValue = cookieAv.slice(position.position + 1)
+  } else {
+    attributeName = cookieAv
+  }
+
+  attributeName = attributeName.trim()
+  attributeValue = attributeValue.trim()
+
+  // 属性名大小写不敏感
+  const cookieAvName = attributeName.toLowerCase()
+  switch (cookieAvName) {
+    case 'expires':
+      // RFC 6265bis §5.1.1 HTTP Date 解析
+      if (attributeValue.length > maxExpiresLength) { return cookieAttributeList }
+      cookieAttributeList.expires = parseDate(attributeValue)
+      break
+    case 'max-age':
+      // RFC 6265bis §5.4 第 12 步
+      if (!/^[+-]?\d+$/.test(attributeValue)) { return cookieAttributeList }
+      const deltaSeconds = Number(attributeValue)
+      if (deltaSeconds <= 0) {
+        cookieAttributeList.maxAge = 0  // 过期
+      } else {
+        cookieAttributeList.maxAge = deltaSeconds
+      }
+      break
+    case 'domain':
+      if (attributeValue.length > maxDomainLength) { return cookieAttributeList }
+      // 去除前缀 '.'（兼容旧版）
+      cookieAttributeList.domain = attributeValue.replace(/^\./, '').toLowerCase()
+      break
+    case 'path':
+      if (attributeValue.length > maxPathLength) { return cookieAttributeList }
+      cookieAttributeList.path = attributeValue
+      break
+    case 'secure':
+      cookieAttributeList.secure = true
+      break
+    case 'httponly':
+      cookieAttributeList.httpOnly = true
+      break
+    case 'samesite':
+      switch (attributeValue.toLowerCase()) {
+        case 'strict': cookieAttributeList.sameSite = 'strict'; break
+        case 'lax': cookieAttributeList.sameSite = 'lax'; break
+        case 'none': cookieAttributeList.sameSite = 'none'; break
+      }
+      break
+  }
+
+  // 递归处理剩余属性
+  return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
+}
+```
+
+**支持的全部属性**：
+- `Expires`：绝对过期时间（HTTP Date 格式）
+- `Max-Age`：相对过期秒数（优先级高于 Expires）
+- `Domain`：域名作用域（前缀 `.` 被剥离）
+- `Path`：路径作用域
+- `Secure`：仅 HTTPS 传输
+- `HttpOnly`：禁止 JS 访问（服务端 Node.js 不关注，但保留语义）
+- `SameSite`：跨站策略（strict/lax/none）
+
+### 23.4 `__Secure-` / `__Host-` 前缀规则（RFC 6265bis §4.1.3）
+
+`lib/web/cookies/util.js`：
+
+```javascript
+function validateCookieName (name) {
+  // __Secure- 前缀要求
+  if (name.startsWith('__Secure-')) {
+    // 必须设置 Secure 属性
+    return { secure: true }
+  }
+  // __Host- 前缀要求
+  if (name.startsWith('__Host-')) {
+    // 必须设置 Secure 属性 + Path=/ + 无 Domain 属性
+    return { secure: true, path: '/', domain: null }
+  }
+  return {}
+}
+```
+
+**前缀规则表**：
+
+| 前缀 | Secure | Path | Domain | 用途 |
+|---|---|---|---|---|
+| `__Secure-` | 必须 | 任意 | 任意 | 安全 cookie 标识 |
+| `__Host-` | 必须 | 必须为 `/` | 必须无 | 主机锁定（防子域劫持） |
+
+**安全意义**：`__Host-` 前缀的 cookie 只能由 exact host 设置（不能被子域或父域覆盖），防止「子域 cookie 注入攻击」。
+
+### 23.5 Cookie 与重定向的交互
+
+第 15.4 节已覆盖 `shouldRemoveHeader`。本轮补充 **Cookie 的跨源行为细节**：
+
+1. **同源重定向**：Cookie 头保留（同一域名内部跳转）。
+2. **跨源重定向**：`Cookie` 头被删除（防止 cookie 泄漏到第三方域）。
+3. **协议降级重定向**（HTTPS → HTTP）：**undici 不做特殊处理**，Cookie 头保留（但浏览器会拒绝 —— 这是 Node.js 环境的差异）。
+
+**`Cookie` vs `Authorization`**：
+- `Cookie`：可能包含多个 cookie（分号分隔），跨源删除
+- `Authorization`：单一凭证，跨源删除
+- `Proxy-Authorization`：仅发给代理，跨源删除
+
+### 23.6 undici Cookie 的「无 Jar」设计
+
+第 7.9 节已提及 undici **不实现 Cookie Jar**（与浏览器不同）。`lib/web/cookies/` 只提供 4 个函数：
+
+```javascript
+// lib/web/cookies/index.js
+module.exports = {
+  getCookies,        // 从 Set-Cookie 头数组解析 cookie 列表
+  deleteCookie,      // 从列表中删除指定 cookie
+  getComputedCookie, // 计算 cookie 对象（含 domain/path 匹配逻辑）
+  getSplitCookiesString  // 分割 Set-Cookie 头字符串
+}
+```
+
+**为什么无 Jar**：
+1. Node.js 是服务端，没有浏览器同源策略的强需求
+2. Cookie Jar 涉及「cookie 持久化 + 生命周期管理 + 跨请求自动注入」，复杂度高
+3. undici 定位为 HTTP 库而非浏览器，Cookie 管理由上层（如 `tough-cookie`）实现
+
+**laew 决策**：LLM API 调用通常用 `Authorization: Bearer` 而非 Cookie，laew 可不实现 Cookie Jar。若未来加 WebFetch 工具，用 `cookie` crate + `reqwest::ClientBuilder::cookie_store(true)`。
+
+### 23.7 laew Cookie 与重定向实现路径
+
+**reqwest Cookie Store**：
+
+```rust
+use reqwest::Client;
+
+let client = Client::builder()
+    .cookie_store(true)  // 启用内置 cookie store
+    .redirect(reqwest::redirect::Policy::limited(10))  // 重定向策略
+    .build()?;
+```
+
+**自定义重定向策略**：
+
+```rust
+use reqwest::redirect::Policy;
+
+let policy = Policy::custom(|attempt| {
+    if attempt.previous().len() > 10 {
+        attempt.error("too many redirects")
+    } else if attempt.url().host_str() == Some("danger.example.com") {
+        attempt.stop()  // 停止重定向，返回当前响应
+    } else {
+        attempt.follow()
+    }
+});
+```
+
+**跨源 Cookie 安全（Rust）**：
+
+```rust
+// reqwest 内置跨源删头，但如需自定义：
+use reqwest::redirect::Policy;
+
+let policy = Policy::custom(|attempt| {
+    if let Some(prev) = attempt.previous().last() {
+        if prev.host_str() != attempt.url().host_str() {
+            // 跨源：删除敏感头
+            attempt.headers_remove("authorization");
+            attempt.headers_remove("cookie");
+        }
+    }
+    attempt.follow()
+});
+```
+
+### 23.8 laew gap 与 Rust crate 建议
+
+| laew 现状 | undici 启示 | Rust 实现路径 |
+|---|---|---|
+| 无 Cookie 处理 | LLM API 用 Bearer，暂不需要 | `reqwest::ClientBuilder::cookie_store(true)` |
+| 无 Set-Cookie 解析 | WebFetch 工具需要 | `cookie` crate + `Cookie::parse` |
+| 无 `__Host-` 前缀校验 | 安全加固 | `cookie::CookieBuilder` + 前缀检查 |
+| 无 Cookie 尺寸限制 | 防御恶意响应 | `cookie` crate 已内置 4096 限制 |
+| 无跨源 Cookie 删除 | 泄漏防护 | reqwest 默认 + 自定义 Policy |
+| 无 Cookie Jar 持久化 | 多会话管理 | `cookie_store` crate（支持 JSON 持久化） |
+
+
+## 24. 综合结论与 laew 借鉴路线图
+
+### 24.1 本轮 8 维度交叉关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        laew HTTP 客户端栈                            │
+├─────────────────────────────────────────────────────────────────────┤
+│  WebSocket (16)  │  Fetch API (17)  │  Interceptors (18)  │  Mock (19)  │
+│  帧状态机        │  Body Mixin       │  装饰器链            │  Snapshot   │
+│  permessage-deflate│ SRI 校验        │  DNS 缓存            │  三态机     │
+│  关闭握手        │  CORS 校验        │  HTTP 缓存           │  匹配算法   │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     传输层安全 + 代理 + 协议                          │
+├─────────────────────────────────────────────────────────────────────┤
+│  HTTP/3 QUIC (20)  │  SOCKS 代理 (21)  │  TLS 证书 (22)  │  Cookies (23)  │
+│  Alt-Svc 解析      │  RFC 1928 状态机  │  指纹钉扎       │  Set-Cookie 解析 │
+│  QPACK 理论        │  CONNECT 隧道     │  Session 复用   │  __Host- 前缀   │
+│  quinn crate       │  双层 TLS 握手    │  WeakSessionCache│  跨源删头       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 24.2 laew gap 完整清单（第十轮新增）
+
+#### P0 紧急（8 项）
+
+| Gap ID | 描述 | undici 依据 | Rust crate |
+|---|---|---|---|
+| **L79** | 无 WebSocket 工具（LLM 流式输出仅 SSE） | `lib/web/websocket/` 完整 RFC 6455 实现 | `tokio-tungstenite` + `tungstenite` |
+| **L80** | 无 permessage-deflate 压缩 | `permessage-deflate.js` DEFLATE 解压 | `flate2` + tail bytes 处理 |
+| **L81** | 无客户端 DNS 缓存（每次请求重复解析） | `interceptor/dns.js` DNSStorage + Happy Eyeballs | `hickory-dns` + LRU |
+| **L82** | 无 HTTP 缓存（system prompt 重复传输） | `interceptor/cache.js` RFC 9111 完整实现 | `moka` + `sha2` 指纹 |
+| **L83** | 无请求去重（并发相同 LLM 请求浪费） | `interceptor/deduplicate.js` 共享 pending | `tokio::sync::OnceCell` + `Semaphore` |
+| **L84** | 无自动解压（gzip/br/zstd 需手动处理） | `interceptor/decompress.js` 6 种编码 | `reqwest` 已内置（开启 features） |
+| **L85** | 无响应错误自动 JSON 解析 | `interceptor/response-error.js` 错误体解析 | `reqwest::Response::json()` 已内置 |
+| **L86** | 无 dump 限制（大响应可 OOM） | `interceptor/dump.js` maxSize 截断 | `reqwest::Response::take(max_bytes)` |
+
+#### P1 重要（12 项）
+
+| Gap ID | 描述 | undici 依据 | Rust crate |
+|---|---|---|---|
+| **L87** | 无 CORS 校验（WASM 端需要） | `fetch/util.js` corsCheck + TAOCheck | `reqwest::redirect::Policy` + 自定义 middleware |
+| **L88** | 无 SRI 完整性校验（下载外部脚本） | `subresource-integrity/` bytesMatch | `ring::digest` + base64 比对 |
+| **L89** | 无 FormData 编码（文件上传） | `fetch/body.js` multipart 编码 | `multipart` crate |
+| **L90** | 无 AbortSignal 链（任务取消传播不完整） | `fetch/index.js` addAbortListener | `tokio_util::sync::CancellationToken` |
+| **L91** | 无 streamRegistry GC 防护 | `fetch/body.js` FinalizationRegistry | `tokio::sync::OwnedSemaphorePermit` |
+| **L92** | 无 redirect 历史透传 | `redirect-handler.js` history 注入 | `tracing` span 记录跳转链 |
+| **L93** | 无自定义 CA 支持 | `connect.js` ca/cert/key 透传 | `reqwest::Certificate::from_pem` |
+| **L94** | 无 mTLS 客户端证书 | `connect.js` cert/key 透传 | `reqwest::Identity::from_pem` |
+| **L95** | 无证书指纹钉扎 | `docs/examples/ca-fingerprint/` | `rustls::ServerCertVerifier` 自定义 |
+| **L96** | 无 TLS session 复用显示控制 | `connect.js` WeakSessionCache | `rustls` 内置 PSK（无需干预） |
+| **L97** | 无 SOCKS5 代理 | `socks5-client.js` RFC 1928 | `reqwest = { features = ["socks"] }` |
+| **L98** | 无 NO_PROXY 匹配 | `env-http-proxy-agent.js` | `env_proxy` crate |
+
+#### P2 进阶（10 项）
+
+| Gap ID | 描述 | undici 依据 | Rust crate |
+|---|---|---|---|
+| **L99** | 无 HTTP/3 QUIC 支持 | `constants.js` Alt-Svc 白名单 | `quinn` crate |
+| **L100** | 无 QPACK header 压缩 | RFC 9204 理论 | `quinn-proto` 内置 |
+| **L101** | 无 Cookie Jar（WebFetch 工具需要） | `cookies/` 无状态解析 | `cookie` crate |
+| **L102** | 无 `__Host-` 前缀校验 | `cookies/util.js` 前缀规则 | `cookie::CookieBuilder` |
+| **L103** | 无 Set-Cookie 尺寸限制 | `cookies/constants.js` 4096/1024 | `cookie` crate 已内置 |
+| **L104** | 无跨源 Cookie 删除 | `redirect-handler.js` shouldRemoveHeader | reqwest 默认 + 自定义 Policy |
+| **L105** | 无 Mock 测试基础设施 | `mock/` 8500+ 行完整实现 | `mockito` + `wiremock` |
+| **L106** | 无 Snapshot 录制回放 | `snapshot-recorder.js` 三态机 | `insta` + `serde_json` |
+| **L107** | 无请求匹配器 | `mock-utils.js` matchValue 多态 | `mockito::Matcher` |
+| **L108** | 无调用历史审计 | `mock-call-history.js` | `mockito::Mock::assert()` |
+
+### 24.3 laew 分阶段实施路线图
+
+#### Phase 1：P0 紧急（1-2 周）
+
+```rust
+// 1. 启用 reqwest 完整 features（L84/L85/L86）
+let client = reqwest::Client::builder()
+    .gzip(true)                    // L84: gzip 解压
+    .brotli(true)                  // L84: brotli 解压
+    .zstd(true)                    // L84: zstd 解压（reqwest 0.13+）
+    .deflate(true)                 // L84: deflate 解压
+    .redirect(Policy::limited(10)) // L86: 重定向限制
+    .timeout(Duration::from_secs(120))  // L86: 超时
+    .build()?;
+
+// 2. DNS 缓存（L81）- 使用 hickory-dns
+use hickory_resolver::TokioAsyncResolver;
+use lru::LruCache;
+use std::sync::Mutex;
+
+struct DnsCache {
+    cache: Mutex<LruCache<String, Vec<SocketAddr>>>,
+    resolver: TokioAsyncResolver,
+}
+
+// 3. HTTP 缓存（L82）- 使用 moka
+use moka::sync::Cache;
+use sha2::{Sha256, Digest};
+
+struct HttpCache {
+    cache: Cache<String, CachedResponse>,
+}
+
+impl HttpCache {
+    fn key(req: &reqwest::Request) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(req.method().as_str().as_bytes());
+        hasher.update(req.url().as_str().as_bytes());
+        // 加入关键 headers（如 Authorization）
+        if let Some(auth) = req.headers().get("authorization") {
+            hasher.update(auth.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+// 4. 请求去重（L83）
+use tokio::sync::OnceCell;
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+struct RequestDedup {
+    pending: RwLock<HashMap<String, Arc<OnceCell<Response>>>>,
+}
+```
+
+#### Phase 2：P1 重要（2-4 周）
+
+```rust
+// 1. 自定义 CA + mTLS（L93/L94/L95）
+let ca = reqwest::Certificate::from_pem(&fs::read("ca.pem")?)?;
+let identity = reqwest::Identity::from_pem(&fs::read("client.pem")?)?;
+let client = reqwest::Client::builder()
+    .add_root_certificate(ca)
+    .identity(identity)
+    .build()?;
+
+// 2. SOCKS5 代理（L97/L98）
+let client = reqwest::Client::builder()
+    .proxy(reqwest::Proxy::all("socks5://127.0.0.1:1080")?)
+    .build()?;
+
+// 3. WebSocket 支持（L79/L80）
+use tokio_tungstenite::connect_async;
+use futures_util::{StreamExt, SinkExt};
+
+let (ws_stream, _) = connect_async("wss://api.example.com/ws").await?;
+let (mut write, mut read) = ws_stream.split();
+write.send(Message::Text("hello".into())).await?;
+while let Some(Ok(msg)) = read.next().await {
+    // 处理消息
+}
+
+// 4. SRI 校验（L88）
+use ring::digest::{Context, SHA256};
+
+fn verify_sri(data: &[u8], expected: &str) -> bool {
+    let mut context = Context::new(&SHA256);
+    context.update(data);
+    let digest = context.finish();
+    let actual = base64::encode(digest.as_ref());
+    actual == expected
+}
+```
+
+#### Phase 3：P2 进阶（4-8 周）
+
+```rust
+// 1. HTTP/3 QUIC（L99/L100）
+use quinn::{Endpoint, ClientConfig};
+use std::sync::Arc;
+
+pub struct H3Client {
+    endpoint: Endpoint,
+    connection: quinn::Connection,
+}
+
+impl H3Client {
+    pub async fn connect(host: &str, port: u16) -> Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(&native_certs::load_native_certs()?);
+        let client_config = ClientConfig::with_root_certificates(roots);
+        let endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+        let connection = endpoint.connect(format!("{}:{}", host, port).parse()?, host)?.await?;
+        Ok(Self { endpoint, connection })
+    }
+}
+
+// 2. Cookie Jar（L101/L102/L103/L104）
+use cookie::{Cookie, CookieJar};
+
+let jar = CookieJar::new();
+let client = reqwest::Client::builder()
+    .cookie_store(true)  // reqwest 内置
+    .build()?;
+
+// 3. Mock 测试（L105/L106/L107/L108）
+use mockito::{mock, Server};
+
+let mut server = Server::new();
+let _m = mock("GET", "/api/v1/models")
+    .with_status(200)
+    .with_header("content-type", "application/json")
+    .with_body(r#"{"data": []}"#)
+    .create();
+```
+
+### 24.4 关键数字汇总
+
+| 指标 | 数值 |
+|---|---|
+| undici 总代码行数（lib/） | ~29,000 行 |
+| WebSocket 模块 | ~4,300 行 |
+| Fetch API 模块 | ~18,000 行 |
+| 拦截器模块 | ~2,600 行 |
+| Mock 模块 | ~8,500 行 |
+| Cookies 模块 | ~880 行 |
+| SOCKS5 模块 | ~630 行 |
+| TLS 连接模块 | ~192 行 |
+| 本轮新增 laew gap | 28 项（P0=8, P1=12, P2=10） |
+| 推荐 Rust crate 数量 | 20+ |
+
+### 24.5 与前 9 轮的关系
+
+| 轮次 | 覆盖维度 | 本轮关系 |
+|---|---|---|
+| 第 1-4 章 | 项目元信息/核心架构/llhttp/5 种 API | 不重复 |
+| 第 5 章 | 8 个拦截器职责速览 | 本轮深入实现细节 |
+| 第 6 章 | Mock 基本结构 | 本轮深入 Snapshot 三态机 |
+| 第 7 章 | fetch/WebSocket/EventSource 概述 | 本轮深入帧状态机/Body Mixin |
+| 第 8 章 | 错误类层次 | 不重复 |
+| 第 9 章 | 基础设施 | 不重复 |
+| 第 14 章 | 连接池/HTTP/2/背压 | 不重复 |
+| 第 15 章 | HTTP/3/SOCKS/TLS/Cookies 基础 | 本轮深入实现细节 |
+| **第 10 轮（本轮）** | **8 维度完整实现级剖析** | **新增 28 个 laew gap** |
+
+---
+
+## 25. 关键文件路径汇总
+
+| 文件 | 行数 | 本轮覆盖维度 |
+|---|---|---|
+| `lib/web/websocket/websocket.js` | 780 | §16 WebSocket 类 |
+| `lib/web/websocket/connection.js` | 329 | §16 握手/关闭 |
+| `lib/web/websocket/frame.js` | 127 | §16 帧构造 |
+| `lib/web/websocket/receiver.js` | 507 | §16 帧解析状态机 |
+| `lib/web/websocket/sender.js` | 109 | §16 发送队列 |
+| `lib/web/websocket/permessage-deflate.js` | 100 | §16 压缩扩展 |
+| `lib/web/websocket/util.js` | 347 | §16 工具函数 |
+| `lib/web/websocket/events.js` | 331 | §16 事件类 |
+| `lib/web/fetch/index.js` | 2426 | §17 Fetch 主循环 |
+| `lib/web/fetch/request.js` | 1144 | §17 Request 类 |
+| `lib/web/fetch/response.js` | 639 | §17 Response 类 |
+| `lib/web/fetch/headers.js` | 719 | §17 Headers 实现 |
+| `lib/web/fetch/body.js` | 547 | §17 Body Mixin |
+| `lib/web/fetch/util.js` | 1525 | §17 CORS/SRI |
+| `lib/web/fetch/constants.js` | 131 | §17 常量 |
+| `lib/web/fetch/data-url.js` | 596 | §17 data: URL |
+| `lib/web/fetch/formdata.js` | 278 | §17 FormData |
+| `lib/web/fetch/formdata-parser.js` | 586 | §17 multipart 解析 |
+| `lib/interceptor/redirect.js` | 21 | §18 重定向拦截器 |
+| `lib/interceptor/retry.js` | 19 | §18 重试拦截器 |
+| `lib/interceptor/dump.js` | 112 | §18 丢弃拦截器 |
+| `lib/interceptor/response-error.js` | 95 | §18 错误转换拦截器 |
+| `lib/interceptor/decompress.js` | 292 | §18 解压拦截器 |
+| `lib/interceptor/dns.js` | 575 | §18 DNS 缓存拦截器 |
+| `lib/interceptor/cache.js` | 618 | §18 HTTP 缓存拦截器 |
+| `lib/interceptor/deduplicate.js` | 117 | §18 去重拦截器 |
+| `lib/handler/decorator-handler.js` | — | §18 装饰器基类 |
+| `lib/mock/mock-agent.js` | 244 | §19 MockAgent |
+| `lib/mock/mock-client.js` | 68 | §19 MockClient |
+| `lib/mock/mock-pool.js` | 68 | §19 MockPool |
+| `lib/mock/mock-interceptor.js` | 227 | §19 MockInterceptor |
+| `lib/mock/mock-utils.js` | 720 | §19 匹配算法 |
+| `lib/mock/mock-call-history.js` | 248 | §19 调用历史 |
+| `lib/mock/snapshot-agent.js` | 371 | §19 SnapshotAgent |
+| `lib/mock/snapshot-recorder.js` | 623 | §19 SnapshotRecorder |
+| `lib/mock/snapshot-utils.js` | 158 | §19 快照工具 |
+| `lib/mock/mock-symbols.js` | 32 | §19 Symbol 常量 |
+| `lib/mock/mock-errors.js` | 29 | §19 错误类 |
+| `lib/core/constants.js` | 120 | §20 Alt-Svc 白名单 |
+| `lib/core/connect.js` | 192 | §22 TLS 连接 |
+| `lib/core/socks5-client.js` | 422 | §21 SOCKS5 客户端 |
+| `lib/core/socks5-utils.js` | 212 | §21 SOCKS5 地址编码 |
+| `lib/dispatcher/proxy-agent.js` | 378 | §21 HTTP 代理 |
+| `lib/dispatcher/socks5-proxy-agent.js` | 282 | §21 SOCKS5 代理编排 |
+| `lib/dispatcher/env-http-proxy-agent.js` | 175 | §21 环境变量代理 |
+| `lib/web/cookies/index.js` | 199 | §23 Cookie API |
+| `lib/web/cookies/parse.js` | 317 | §23 Set-Cookie 解析 |
+| `lib/web/cookies/util.js` | 352 | §23 校验器 |
+| `lib/web/cookies/constants.js` | 12 | §23 尺寸限制 |
+| `lib/web/subresource-integrity/subresource-integrity.js` | — | §17 SRI 校验 |
+| `docs/examples/ca-fingerprint/index.js` | — | §22 指纹钉扎示例 |
+
+---
+
+## 26. 总结
+
+本轮（第十轮）对 undici 的 8 个维度做了**实现级深度剖析**，与前 9 章形成互补：
+
+1. **WebSocket**：帧状态机 5 状态、permessage-deflate 解压、关闭握手 4 路分支、掩码批量生成优化
+2. **Fetch API**：Body Mixin 6 种类型分发、streamRegistry GC 防护、SRI 校验、CORS 校验链
+3. **拦截器**：8 个拦截器实现细节、DecoratorHandler 透明转发、组合拓扑推荐顺序
+4. **Mock**：matchValue 多态匹配、safeUrl 查询排序、Snapshot 三态机、确定性哈希
+5. **HTTP/3 QUIC**：Alt-Svc 解析、QUIC 帧格式理论、QPACK 机制、quinn crate 路径
+6. **SOCKS 代理**：RFC 1928 状态机、地址编码 3 种类型、CONNECT 隧道 + TLS 双层握手
+7. **TLS 证书**：WeakSessionCache 三重淘汰、ALPN 协议顺序、指纹钉扎、mTLS 路径
+8. **Cookies**：Set-Cookie 解析状态机、`__Host-` 前缀规则、跨源删头语义
+
+**核心发现**：undici 是 Node.js 生态最完整的 HTTP 客户端实现，其**帧级解析状态机**、**装饰器链拦截器**、**Snapshot 三态机**、**WeakSessionCache** 等设计模式值得 laew 在 Rust 实现中借鉴。
+
+**laew 落地优先级**：
+- **立即**：启用 reqwest 完整 features（gzip/br/zstd + cookie_store + socks）
+- **短期**：DNS 缓存（hickory-dns）+ HTTP 缓存（moka）+ 请求去重（OnceCell）
+- **中期**：WebSocket 支持（tokio-tungstenite）+ 自定义 CA/mTLS
+- **长期**：HTTP/3 QUIC（quinn）+ Mock 测试基础设施（mockito）
+

@@ -1763,3 +1763,1350 @@ agent-core (openjiuwen) 是 **「企业级抽象层级极高」** 的代表，�
 ---
 
 > **字数**：本文档 agent-core 第八轮深挖章节新增约 700 行。
+# Agent Core 第十轮深挖 — 8 大新维度深度分析
+
+> 调研对象：agent-core（Python，openJiuwen Core SDK v0.1.17）
+> 调研日期：2026-09-07
+> 前 9 轮已覆盖：ReAct 循环 / ContextEngine / 记忆系统 / PermissionEngine / TeamAgent / Pregel / Rails / OTLP / RL 训练 / Telemetry / Session 持久化 / Tool 权限沙箱 / LSP / Hook / Skill / 多租户 / TUI 渲染 / CrashDump / WebUI / OAuth / i18n / Release / WebSocket / DevContainer / CRDT（前 9 轮部分涉及）
+> 本轮 **全新深挖** 8 维度：**CrashDump 与错误恢复 / WebUI 与 DesktopApp / OAuth 认证与多账号 / i18n 国际化 / Release 工程化与 AutoUpdate / WebSocket 与 SSE / DevContainer 与容器化 / CRDT 与多端冲突**
+
+---
+
+## 目录
+
+1. [CrashDump 与错误恢复](#一crashdump-与错误恢复)
+2. [WebUI 与 DesktopApp](#二webui-与-desktopapp)
+3. [OAuth 认证与多账号](#三oauth-认证与多账号)
+4. [i18n 国际化](#四i18n-国际化)
+5. [Release 工程化与 AutoUpdate](#五release-工程化与-autoupdate)
+6. [WebSocket 与 SSE](#六websocket-与-sse)
+7. [DevContainer 与容器化](#七devcontainer-与容器化)
+8. [CRDT 与多端冲突](#八crdt-与多端冲突)
+9. [laew gap 清单与借鉴建议](#九laew-gap-清单与借鉴建议)
+
+---
+
+## 一、CrashDump 与错误恢复
+
+### 1.1 核心代码路径
+
+| 模块 | 路径 | 行数 | 职责 |
+|------|------|------|------|
+| Checkpoint Manager | `openjiuwen/agent_evolving/checkpointing/manager.py` | 183 行 | 进化训练检查点管理 |
+| Checkpoint State | `openjiuwen/agent_evolving/checkpointing/state.py` | 26 行 | 检查点数据结构 |
+| Store Records | `openjiuwen/agent_evolving/checkpointing/store_records.py` | 467 行 | 原子写入 + 回滚恢复 |
+| Store File | `openjiuwen/agent_evolving/checkpointing/store_file.py` | ~150 行 | 文件持久化层 |
+| Reliability Handler | `openjiuwen/agent_teams/reliability/handler.py` | 113 行 | 异常检测与修复 |
+| External Runtime Handler | `openjiuwen/agent_teams/reliability/external_handler.py` | 74 行 | 三方运行时重试处理 |
+
+### 1.2 进化训练检查点（CheckpointManager）
+
+**核心设计**：`DefaultCheckpointManager` 实现了训练进度的快照保存与恢复，支持「改进时保存」和「每 N 轮保存」双策略。
+
+```python
+# checkpointing/manager.py L31-128
+class DefaultCheckpointManager:
+    def __init__(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        checkpoint_version: str = "v1",
+        save_every_n_epochs: int = 1,
+        save_on_improve: bool = True,
+    ):
+        self._run_id = run_id or str(uuid.uuid4())
+        self._ckpt_version = checkpoint_version
+        self._save_every_n_epochs = max(int(save_every_n_epochs), 1)
+        self._save_on_improve = bool(save_on_improve)
+        self._pending: Dict[str, List[PendingChange]] = {}
+
+    def should_save(self, *, epoch: int, improved: bool) -> bool:
+        if self._save_on_improve and improved:
+            return True
+        return (epoch % self._save_every_n_epochs) == 0
+
+    def build_checkpoint(self, *, agent, progress, updater_state=None) -> EvolveCheckpoint:
+        operators_state = self._snapshot_operators_state(agent)
+        step = {"epoch": int(getattr(progress, "current_epoch", 0)),
+                "batch": int(getattr(progress, "current_batch_iter", 0))}
+        best = {"best_score": float(getattr(progress, "best_score", 0.0))}
+        return EvolveCheckpoint(
+            version=self._ckpt_version, run_id=self._run_id,
+            step=step, best=best, seed=...,
+            operators_state=operators_state,
+            updater_state=updater_state or {}, searcher_state={},
+            last_metrics={"current_epoch_score": ...})
+
+    def restore(self, *, agent, checkpoint) -> Dict[str, Any]:
+        self._restore_operators_state(agent, checkpoint.operators_state)
+        return {"start_epoch": ..., "best_score": ..., "run_id": checkpoint.run_id}
+```
+
+**检查点数据结构**：
+
+```python
+# checkpointing/state.py L11-26
+@dataclass
+class EvolveCheckpoint:
+    version: str
+    run_id: str
+    step: Dict[str, int]           # {epoch, batch}
+    best: Dict[str, Any]           # {best_score}
+    seed: Optional[int]
+    operators_state: Dict[str, Dict[str, Any]]  # 各进化算子状态
+    updater_state: Dict[str, Any]
+    searcher_state: Dict[str, Any]
+    last_metrics: Dict[str, Any]
+```
+
+### 1.3 原子写入与回滚恢复（StoreRecordsHelper）
+
+**核心机制**：`append_record_transactional` 实现了事务型记录写入——失败时自动回滚所有相关文件。
+
+```python
+# checkpointing/store_records.py L138-185
+async def append_record_transactional(self, name, record, *, skill_dir=None, subject_kind=None):
+    target_dir = skill_dir or self._store.resolve_skill_dir(name, create=True, subject_kind=subject_kind)
+    evo_path = target_dir / _EVOLUTION_FILENAME
+    had_log = evo_path.exists()
+    old_log_content = evo_path.read_text(encoding="utf-8") if had_log else None
+    projection_backups = self._snapshot_projection_files(target_dir)  # 快照所有文件
+
+    try:
+        prepared_record = copy.deepcopy(record)
+        if prepared_record.change.target == EvolutionTarget.SCRIPT:
+            await self.persist_script(target_dir, prepared_record)
+        evo_log = await self.load_full_evolution_log(name, subject_kind=subject_kind)
+        self._append_or_merge_record(evo_log, prepared_log)
+        await self.save_evolution_log(name, evo_log, skill_dir=target_dir)
+        await self._store.render_evolution_markdown(name, subject_kind=subject_kind)
+    except Exception:
+        # 失败时回滚所有文件
+        await self._restore_projection_files(target_dir, projection_backups)
+        await self._restore_text_file(evo_path, old_log_content if had_log else None)
+        raise
+```
+
+**原子文件写入**（temp + rename 模式）：
+
+```python
+# checkpointing/store_records.py L124-136
+async def _write_file_text_atomic(self, path, content):
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        await self._store.write_file_text(tmp_path, content)
+        tmp_path.replace(path)  # 原子替换
+    except Exception as exc:
+        with suppress(OSError):
+            tmp_path.unlink()
+        raise_error(...)
+```
+
+### 1.4 可靠性处理（ReliabilityHandler）
+
+**异常检测与修复策略**：
+
+```python
+# reliability/handler.py L30-113
+class ReliabilityHandler(BaseCoordinationHandler):
+    EVENT_METHOD_MAP = {
+        TeamEvent.ANOMALY_DETECTED: "on_anomaly_detected",
+        TeamEvent.MESSAGE: "on_message",
+        TeamEvent.BROADCAST: "on_message",
+    }
+
+    async def on_anomaly_detected(self, event):
+        # 接收跨进程异常流，按策略路由
+        await self._route(Severity(payload.severity), self._format(payload))
+
+    async def _route(self, severity, summary):
+        actions = self._policy.actions_for(severity)
+        if RemediationAction.ESCALATE_USER in actions:
+            await self._round.deliver_input(t("reliability.escalate_user", ...))
+        elif RemediationAction.REPORT_LEADER in actions:
+            await self._round.deliver_input(t("reliability.report_leader", ...))
+```
+
+**三方运行时重试处理**：
+
+```python
+# reliability/external_handler.py L32-74
+class ExternalRuntimeHandler(BaseCoordinationHandler):
+    async def on_external_retry(self, event):
+        # Claude/Codex SDK 仍在自动重试时，向 leader 投递非持久化进度提示
+        await self._round.deliver_input(
+            t("reliability.external_runtime_retrying",
+              member_name=..., agent_kind=..., category=..., summary=...))
+```
+
+### 1.5 设计亮点
+
+| 特性 | 实现 | 说明 |
+|------|------|------|
+| **双策略保存** | `save_on_improve` + `save_every_n_epochs` | 改进时立即保存 + 定期保存 |
+| **事务写入** | `append_record_transactional` | 失败自动回滚所有相关文件 |
+| **原子替换** | temp + `os.replace` | 防止写入中途崩溃导致文件损坏 |
+| **文件快照** | `_snapshot_projection_files` | 写入前备份所有文件，支持完整回滚 |
+| **Pending 队列** | `_pending: Dict[str, List[PendingChange]]` | 在线进化的暂存变更管理 |
+| **异常分级** | `Severity` + `RemediationPolicy` | REPORT_LEADER → ESCALATE_USER 两级升级 |
+| **三方运行时解耦** | `ExternalRuntimeHandler` | 独立处理 Claude/Codex SDK 重试/失败信号 |
+
+---
+
+## 二、WebUI 与 DesktopApp
+
+### 2.1 现状分析
+
+**agent-core 本身不提供 WebUI 或 DesktopApp 实现**。它是一个纯后端 Python SDK，UI 层由上层应用（如 jiuwenclaw/jiuwenswarm）提供。但源码中存在与 UI 通信的关键接口：
+
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| Stream Emitter | `core/session/stream/emitter.py` | 流式输出发射器 |
+| Stream Writer | `core/session/stream/writer.py` | 类型化流写入器 |
+| Stream Manager | `core/session/stream/manager.py` | 多模式流管理 |
+| WebSocket 客户端 | `agent_evolving/agent_rl/online/backends/rollouter/docker_runtime.py` | SFT 容器通过 WebSocket 与 jiuwenclaw 通信 |
+
+### 2.2 流式输出架构（供 WebUI 消费）
+
+```python
+# core/session/stream/emitter.py L133-160
+class StreamEmitter:
+    END_FRAME = "all streaming outputs finish"
+
+    def __init__(self):
+        self._stream_queue = AsyncStreamQueue()
+        self._closed = False
+
+    async def emit(self, stream_data):
+        if self._closed:
+            raise RuntimeError("Can not emit data after the stream emitter is closed.")
+        await self._stream_queue.send(stream_data)
+
+    async def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if not self._stream_queue.is_closed:
+            await self._stream_queue.send(self.END_FRAME)
+```
+
+**三模式流写入器**：
+
+```python
+# core/session/stream/base.py L24-50
+class BaseStreamMode(StreamMode):
+    OUTPUT = ("output", "Standard stream data defined by the framework")
+    TRACE = ("trace", "Trace stream data produced by the graph")
+    CUSTOM = ("custom", "Custom stream data defined by the runnable")
+
+class OutputSchema(BaseModel):
+    type: str
+    index: int
+    payload: Any
+
+class TraceSchema(BaseModel):
+    type: str
+    payload: Any
+```
+
+**流管理器**：
+
+```python
+# core/session/stream/manager.py L18-111
+class StreamWriterManager:
+    def __init__(self, stream_emitter, modes=None):
+        self._default_modes = modes or [BaseStreamMode.OUTPUT, BaseStreamMode.TRACE, BaseStreamMode.CUSTOM]
+        self._writers: Dict[StreamMode, StreamWriter] = {}
+        self._add_default_writers()
+
+    async def stream_output(self, first_frame_timeout=-1, timeout=-1, need_close=True):
+        # 首帧超时 + 帧间隔超时双控制
+        while True:
+            data = await self._stream_emitter.stream_queue.receive(timeout=...)
+            if data == StreamEmitter.END_FRAME:
+                break
+            yield data
+```
+
+### 2.3 WebSocket 通信（SFT 容器 → jiuwenclaw）
+
+```python
+# agent_evolving/agent_rl/online/backends/rollouter/docker_runtime.py L510-566
+# SFT 任务容器通过 WebSocket 与 jiuwenclaw WebUI 通信
+async def main():
+    ws = await connect_with_retry()
+    async with ws:
+        req_id = "chat-" + uuid.uuid4().hex[:12]
+        frame = {
+            "type": "req", "id": req_id, "method": "chat.send",
+            "is_stream": True,
+            "params": {
+                "session_id": session_id, "content": prompt,
+                "mode": os.environ.get("SFT_TASK_MODE", "agent.fast"),
+                "cwd": cwd, "trusted_dirs": [cwd],
+                "session_done": True, "close_session": True,
+            },
+        }
+        await ws.send(json.dumps(frame, ensure_ascii=False))
+        while time.time() < deadline:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+            if event == "chat.processing_status":
+                if payload.get("is_processing") is False:
+                    return
+```
+
+### 2.4 设计亮点
+
+| 特性 | 实现 | 说明 |
+|------|------|------|
+| **三模式流** | OUTPUT / TRACE / CUSTOM | 标准输出、追踪、自定义流分离 |
+| **首帧超时** | `first_frame_timeout` | 防止首帧卡死 |
+| **帧间隔超时** | `timeout` | 检测流式输出中断 |
+| **END_FRAME 哨兵** | `StreamEmitter.END_FRAME` | 优雅关闭信号 |
+| **WebSocket 重连** | `connect_with_retry` | 120s  deadline 内自动重连 |
+| **Schema 校验** | Pydantic `OutputSchema/TraceSchema` | 流数据强类型校验 |
+
+### 2.5 laew gap
+
+- **laew 无 WebUI**：纯 TUI 应用，无 Web 界面
+- **laew 无流式 Schema**：`llm/anthropic.rs` 和 `llm/openai.rs` 的流式输出无统一 Schema
+- **laew 无 WebSocket**：无实时双向通信能力
+
+---
+
+## 三、OAuth 认证与多账号
+
+### 3.1 核心代码路径
+
+| 模块 | 路径 | 行数 | 职责 |
+|------|------|------|------|
+| Auth Manager | `extensions/external_provider/openai_auth/openai_account_auth.py` | 841 行 | OAuth 认证全流程 |
+| Account Login | `extensions/external_provider/openai_auth/openai_account_login.py` | 189 行 | CLI 登录脚本 |
+| Account Models | `extensions/external_provider/openai_auth/openai_account_models.py` | 301 行 | 模型列表发现与缓存 |
+| Model Client | `core/foundation/llm/model_clients/openai_account_model_client.py` | ~350 行 | OAuth 模型客户端 |
+
+### 3.2 OAuth Device Code 完整流程
+
+```python
+# openai_account_auth.py L376-400
+def login_openai_account_oauth(*, on_device_code, timeout_seconds, max_wait_seconds, ...):
+    device_code = request_openai_account_device_code(timeout_seconds=timeout_seconds)
+    if on_device_code:
+        on_device_code(device_code)  # 回调显示 user_code + verification_uri
+    authorization = poll_openai_account_device_authorization(
+        device_code, timeout_seconds=timeout_seconds, max_wait_seconds=max_wait_seconds, ...)
+    return exchange_openai_account_device_authorization(authorization, ...)
+```
+
+**Device Code 请求**：
+
+```python
+# openai_account_auth.py L403-472
+def request_openai_account_device_code(*, timeout_seconds, max_attempts, sleep):
+    for attempt in range(1, attempts + 1):
+        response = client.post(
+            OPENAI_ACCOUNT_DEVICE_USER_CODE_URL,
+            json={"client_id": OPENAI_ACCOUNT_OAUTH_CLIENT_ID},
+            headers={"Content-Type": "application/json"})
+        if response.status_code != 429:
+            break
+        if attempt < attempts:
+            retry_after = _parse_retry_after_seconds(...)
+            delay = retry_after if retry_after is not None else 2 ** attempt
+            sleep(max(1, min(int(delay), 60)))
+    return OpenAIAccountDeviceCode(user_code=..., device_auth_id=..., interval=..., expires_in=...)
+```
+
+**Token 轮询**：
+
+```python
+# openai_account_auth.py L507-542
+def poll_openai_account_device_authorization(device_code, *, timeout_seconds, max_wait_seconds, ...):
+    start = monotonic()
+    while monotonic() - start < max_wait_seconds:
+        sleep(device_code.interval)
+        try:
+            authorization = poll_openai_account_device_authorization_once(device_code, ...)
+        except OpenAIAccountAuthError as exc:
+            if exc.code != _OPENAI_ACCOUNT_DEVICE_POLL_NETWORK_ERROR_CODE:
+                raise
+            continue
+        if authorization is None:
+            continue
+        return authorization
+    raise OpenAIAccountAuthError("OpenAI account device login timed out.", ...)
+```
+
+### 3.3 Token 存储与刷新
+
+**Token 数据结构**：
+
+```python
+# openai_account_auth.py L34-111
+@dataclass(frozen=True, slots=True)
+class OpenAIAccountTokens:
+    access_token: str
+    refresh_token: str
+    id_token: Optional[str] = None
+    expires_at: Optional[float] = None
+    token_type: Optional[str] = None
+    scope: Optional[str] = None
+    last_refresh: Optional[float] = None
+
+    def is_expiring(self, *, now, skew_seconds=120) -> bool:
+        expires_at = self.expires_at if self.expires_at is not None else _jwt_exp(self.access_token)
+        if expires_at is None:
+            return False
+        return expires_at <= now + skew_seconds
+```
+
+**Token 刷新**：
+
+```python
+# openai_account_auth.py L592-665
+def refresh_openai_account_oauth(access_token, refresh_token, *, timeout_seconds, now):
+    del access_token  # 不使用旧 access_token
+    response = client.post(
+        OPENAI_ACCOUNT_OAUTH_TOKEN_URL,
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token,
+              "client_id": OPENAI_ACCOUNT_OAUTH_CLIENT_ID})
+    # 解析 + 校验 + 保留旧 refresh_token（如果响应中无新值）
+    refreshed_payload["refresh_token"] = next_refresh if next_refresh else refresh_token
+    return OpenAIAccountTokens.from_mapping(refreshed_payload, now=refreshed_at)
+```
+
+**文件锁保护**：
+
+```python
+# openai_account_auth.py L326-360
+def _file_lock(self) -> FileLock:
+    self.auth_path.parent.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(self.auth_path) + ".lock")
+
+def _save_store_unlocked(self, store):
+    self.auth_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = self.auth_path.with_name(f"{self.auth_path.name}.tmp")
+    tmp_path.write_text(json.dumps(store, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp_path, 0o600)  # 仅 owner 可读写
+    os.replace(tmp_path, self.auth_path)
+    os.chmod(self.auth_path, 0o600)
+```
+
+### 3.4 多账号模型发现
+
+```python
+# openai_account_models.py L55-196
+class OpenAIAccountModelCatalog:
+    def list_model_ids(self, *, auth_manager=None, access_token=None, force_refresh=False):
+        token = access_token or auth_manager.resolve_access_token(force_refresh=force_refresh)
+        if token:
+            try:
+                payload, model_ids = self.fetch_models(access_token=token)
+                self.write_cache(payload=payload, model_ids=model_ids)
+                return model_ids
+            except OpenAIAccountModelListError:
+                pass
+        cached = self.read_cache_model_ids()  # 缓存兜底
+        if cached:
+            return cached
+        return _add_forward_compat_models(DEFAULT_OPENAI_ACCOUNT_MODELS)  # 内置兜底
+
+    def fetch_models(self, *, access_token):
+        response = client.get(self._models_url(),
+                              headers={"Authorization": f"Bearer {access_token}", ...})
+        model_ids = parse_openai_account_model_ids(payload)
+        return payload, model_ids
+```
+
+**前向兼容模型**：
+
+```python
+# openai_account_models.py L33-38
+_FORWARD_COMPAT_TEMPLATE_MODELS = [
+    ("gpt-5.5", ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5-codex")),
+    ("gpt-5.4-mini", ("gpt-5.3-codex", "gpt-5-codex")),
+    ("gpt-5.4", ("gpt-5.3-codex", "gpt-5-codex")),
+    ("gpt-5.3-codex-spark", ("gpt-5.3-codex",)),
+]
+```
+
+### 3.5 错误处理体系
+
+```python
+# openai_account_auth.py L139-157
+class OpenAIAccountAuthError(Exception):
+    def __init__(self, message, *, code, relogin_required=False, status_code=None):
+        self.message = message
+        self.code = code                    # 结构化错误码
+        self.relogin_required = relogin_required  # 是否需要重新登录
+        self.status_code = status_code      # HTTP 状态码
+```
+
+**错误码分类**：
+- `openai_account_auth_missing` — 无凭证
+- `openai_account_device_code_request_failed` — device code 请求失败
+- `openai_account_device_code_timeout` — 轮询超时
+- `openai_account_auth_refresh_failed` — 刷新失败
+- `openai_account_auth_rate_limited` — 429 限流
+- `openai_account_auth_invalid_store` — 存储文件损坏
+
+### 3.6 设计亮点
+
+| 特性 | 实现 | 说明 |
+|------|------|------|
+| **Device Code 流程** | OAuth 2.0 Device Authorization Grant | 无浏览器环境登录 |
+| **Token 自动刷新** | `is_expiring` + `refresh_tokens` | 提前 120s 刷新 |
+| **文件锁** | `FileLock` | 防并发写入冲突 |
+| **原子写入** | temp + `os.replace` | 防写入中途崩溃 |
+| **权限控制** | `os.chmod(0o600)` | 仅 owner 可读写 |
+| **三级 fallback** | 实时 → 缓存 → 内置 | 模型列表发现 |
+| **前向兼容** | `_FORWARD_COMPAT_TEMPLATE_MODELS` | 新模型自动合成 |
+| **结构化错误** | `code + relogin_required` | 调用方可决策是否重新登录 |
+
+### 3.7 laew gap
+
+- **laew 无 OAuth**：API Key 明文存储在 SQLite
+- **laew 无多账号**：单 provider 模式
+- **laew 无 Token 刷新**：无自动凭证刷新能力
+
+---
+
+## 四、i18n 国际化
+
+### 4.1 核心代码路径
+
+| 模块 | 路径 | 行数 | 职责 |
+|------|------|------|------|
+| i18n 核心 | `openjiuwen/agent_teams/i18n.py` | 812 行 | 进程全局中英翻译 |
+| 时间格式 | `openjiuwen/agent_teams/timefmt.py` | ~100 行 | 相对时间格式化 |
+| 入站渲染 | `openjiuwen/agent_teams/inbound_render.py` | ~200 行 | XML 入站消息渲染 |
+| 团队上下文 | `openjiuwen/agent_teams/team_context.py` | ~400 行 | 团队状态多语言渲染 |
+
+### 4.2 进程全局 i18n 设计
+
+```python
+# i18n.py L27-812
+Language = Literal["cn", "en"]
+_DEFAULT_LANGUAGE: Language = "cn"
+_current_language: Language = _DEFAULT_LANGUAGE
+
+STRINGS: dict[str, dict[str, str]] = {
+    "cn": {
+        "time.just_now": "刚刚",
+        "time.seconds_ago": "{value} 秒前",
+        "dispatcher.member_online": "[成员事件] 成员 {target_id} 已上线",
+        "reliability.steer_self_correct": "⚙️[可靠性] 检测到 {kind}：{summary}。请停止重复无效操作...",
+        "swarmflow.budget_exhausted.workflow_guidance": "该上限为本次工作流的单次额度...",
+        # ... 100+ 键
+    },
+    "en": {
+        "time.just_now": "just now",
+        "time.seconds_ago": "{value}s ago",
+        "dispatcher.member_online": "[Member Event] Member {target_id} is online",
+        "reliability.steer_self_correct": "[reliability] Detected {kind}: {summary}. Stop repeating...",
+        # ... 100+ 键
+    }
+}
+
+def set_language(lang: Language) -> None:
+    global _current_language
+    _current_language = lang
+
+def t(key: str, **kwargs) -> str:
+    table = STRINGS[_current_language]
+    raw = table[key]
+    return raw.format_map(kwargs) if kwargs else raw
+```
+
+### 4.3 字符串分类覆盖
+
+| 分类 | 键前缀 | 数量 | 示例 |
+|------|--------|------|------|
+| 时间格式 | `time.*` | 6 | `time.just_now`, `time.seconds_ago` |
+| 蓝图 | `blueprint.*` | 2 | `blueprint.default_desc` |
+| 团队工具 | `team.*` | 4 | `team.shutdown_request_content` |
+| Checkpoint | `checkpoint.*` | 4 | `checkpoint.fork_not_found` |
+| 可靠性 | `reliability.*` | 12 | `reliability.steer_self_correct` |
+| 调度器 | `dispatcher.*` | 30+ | `dispatcher.member_online`, `dispatcher.stale_claim_self` |
+| 调度器 | `scheduler.*` | 8 | `scheduler.leader_task_done` |
+| HITT | `hitt.*` | 6 | `hitt.human_agent_display_name` |
+| 工作流 | `workflow.*` | 4 | `workflow.started` |
+| Swarmflow | `swarmflow.*` | 8 | `swarmflow.budget_exhausted` |
+| 异步工具 | `async_tool.*` | 4 | `async_tool.launched` |
+
+### 4.4 特殊场景处理
+
+**User 发送者特殊提示**：
+
+```python
+# i18n.py L792-808
+def reply_hint_for(sender: str) -> str:
+    if sender == USER_PSEUDO_MEMBER_NAME:
+        return t("dispatcher.reply_hint_user")  # 强制回复用户
+    return t("dispatcher.reply_hint", sender=sender)  # 通用提示
+```
+
+**HITT 人类成员静默约束**：
+
+```python
+# i18n.py L280-286
+"hitt.silence_note": (
+    "**这是给控制者看的通知，不是要你执行的指令**，运行时已把它原样转给控制者。\n"
+    "**严格禁止任何自主行为**：禁止主动回复发送方 / 指派方..."
+),
+```
+
+### 4.5 设计亮点
+
+| 特性 | 实现 | 说明 |
+|------|------|------|
+| **进程全局** | `_current_language` 模块变量 | 简单高效 |
+| **类型安全** | `Language = Literal["cn", "en"]` | 编译期检查 |
+| **参数注入** | `str.format_map(kwargs)` | 支持动态内容 |
+| **Key 缺失保护** | `raise KeyError` | 快速失败 |
+| **不覆盖已有双语模块** | 注释明确排除 `prompts/sections.py` | 避免重复 |
+| **User 特殊处理** | `reply_hint_for` | 防止用户消息被忽略 |
+
+### 4.6 laew gap
+
+- **laew 无 i18n**：TUI 文案硬编码中文
+- **laew 无多语言切换**：无运行时语言切换能力
+- **laew 无参数化字符串**：无 `t()` 函数
+
+---
+
+## 五、Release 工程化与 AutoUpdate
+
+### 5.1 核心代码路径
+
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| pyproject.toml | `pyproject.toml` | 标准 pyproject 构建配置 |
+| `__init__.py` | `openjiuwen/__init__.py` | 版本号动态解析 |
+| Makefile | `Makefile` | 构建/测试/lint 任务 |
+| uv 配置 | `pyproject.toml` `[tool.uv]` | 包管理器镜像源 |
+
+### 5.2 版本管理
+
+```python
+# openjiuwen/__init__.py L1-23
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("openjiuwen")  # 从 Wheel 元数据读取
+except PackageNotFoundError:
+    import tomllib
+    from pathlib import Path
+    __version__ = "unknown"
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    if pyproject.exists():
+        project_metadata = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project", {})
+        package_name = project_metadata.get("name")
+        version_parsed = project_metadata.get("version")
+        if package_name == "openjiuwen" and version_parsed:
+            __version__ = version_parsed  # 源码安装时从 pyproject.toml 读取
+```
+
+**pyproject.toml 版本**：
+
+```toml
+[project]
+name = "openjiuwen"
+version = "0.1.17"
+requires-python = ">=3.11,<3.14"
+```
+
+### 5.3 构建系统
+
+```toml
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+```
+
+**uv 镜像源配置**：
+
+```toml
+[[tool.uv.index]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
+```
+
+### 5.4 可选依赖组
+
+```toml
+[project.optional-dependencies]
+all-a2a = ["a2a-sdk[http-server]==1.0.0"]
+pulsar = ["pulsar-client>=3.5.0"]
+redis = ["redis>=7.1.0"]
+sqlite = ["aiosqlite>=0.22.1"]
+postgres = ["asyncpg>=0.30.0"]
+sandbox = ["agent-sandbox>=0.0.26"]
+claude = ["claude-agent-sdk>=0.2.115"]
+codex = ["openai-codex>=0.144.4"]
+observability = ["opentelemetry-api>=1.25.0", ...]
+online-rl = ["openjiuwen[redis]", "fastapi>=0.100", ...]
+```
+
+### 5.5 CLI 入口点
+
+```toml
+[project.scripts]
+openjiuwen = "openjiuwen.harness.cli.cli:cli"
+team-member = "openjiuwen.agent_teams.skill.cli:run"
+openjiuwen-team-mcp = "openjiuwen.agent_teams.mcp.server:main"
+openjiuwen-rl-service = "openjiuwen.agent_evolving.agent_rl.online.service:main"
+```
+
+### 5.6 Makefile 任务
+
+```makefile
+# Makefile 核心目标
+help       - 显示帮助
+install    - 安装依赖（uv/pip 自动检测）
+test       - pytest 测试
+format     - ruff 格式检查
+lint       - ruff lint 检查
+pylint     - pylint 深度检查
+spelling   - codespell 拼写检查
+fix-format - ruff 自动修复格式
+fix-lint   - ruff 自动修复 lint
+type-check - mypy 类型检查
+check      - 全量检查（format + spelling + lint + pylint）
+fix        - 全量自动修复
+flame      - pyinstrument 火焰图
+speedscope - speedscope 性能分析
+```
+
+### 5.7 测试配置
+
+```toml
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = ["-v", "--html=report/index.html", "--self-contained-html"]
+markers = [
+    "level0: smoke / happy-path coverage; PR gate must stay green",
+    "level1: feature branches, error paths, and lifecycle edges",
+]
+```
+
+### 5.8 设计亮点
+
+| 特性 | 实现 | 说明 |
+|------|------|------|
+| **双版本源** | Wheel 元数据 + pyproject.toml fallback | 开发/生产环境兼容 |
+| **可选依赖组** | `[project.optional-dependencies]` | 按需安装 |
+| **镜像源** | aliyun PyPI | 国内加速 |
+| **多入口点** | 4 个 CLI 命令 | 不同场景独立入口 |
+| **测试分级** | level0/level1 markers | PR 门禁 + 深度测试 |
+| **跨平台 Makefile** | Windows/Unix 双兼容 | 开发者友好 |
+
+### 5.9 laew gap
+
+- **laew 无 AutoUpdate**：无自动更新机制
+- **laew 无版本 fallback**：`build.rs` 注入固定版本
+- **laew 无可选依赖**：所有功能编译进单一二进制
+
+---
+
+## 六、WebSocket 与 SSE
+
+### 6.1 核心代码路径
+
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| Stream Emitter | `core/session/stream/emitter.py` | 流式数据发射器 |
+| Stream Queue | `core/session/stream/emitter.py` `AsyncStreamQueue` | 异步流队列 |
+| Stream Writer | `core/session/stream/writer.py` | 类型化写入器 |
+| Stream Manager | `core/session/stream/manager.py` | 多模式流管理 |
+| WebSocket 客户端 | `agent_evolving/agent_rl/online/backends/rollouter/docker_runtime.py` | SFT 容器 WS 通信 |
+
+### 6.2 异步流队列
+
+```python
+# core/session/stream/emitter.py L11-130
+class AsyncStreamQueue:
+    DEFAULT_SEND_ATTEMPT_TIMEOUT = 0.2
+    DEFAULT_MAX_SEND_RETRIES = 5
+    DEFAULT_RECEIVE_TIMEOUT = -1
+    DEFAULT_CLOSE_TIMEOUT = 5.0
+
+    def __init__(self, maxsize: int = 0):
+        self._stream_queue = asyncio.Queue(maxsize=maxsize)
+        self._closed = False
+        self._sent_count = 0
+        self._received_count = 0
+
+    async def send(self, data, attempt_timeout=0.2, max_retries=5):
+        if self._closed:
+            raise RuntimeError("StreamQueue is already closed")
+        for attempt in range(max_retries):
+            try:
+                await asyncio.wait_for(self._stream_queue.put(data), attempt_timeout)
+                self._sent_count += 1
+                return
+            except asyncio.TimeoutError:
+                continue
+        # 超过重试次数后记录错误
+
+    async def receive(self, timeout=-1):
+        stream_item = await asyncio.wait_for(
+            self._stream_queue.get(), timeout if timeout and timeout > 0 else None)
+        self._received_count += 1
+        return stream_item
+
+    async def close(self, timeout=5.0):
+        self._closed = True
+        try:
+            await asyncio.wait_for(self._stream_queue.join(), timeout)
+        except asyncio.TimeoutError:
+            self._force_clear()  # 超时后强制清空
+```
+
+### 6.3 流式输出消费
+
+```python
+# core/session/stream/manager.py L40-76
+class StreamWriterManager:
+    async def stream_output(self, first_frame_timeout=-1, timeout=-1, need_close=True):
+        is_first_frame = True
+        yielded_count = 0
+        while True:
+            if is_first_frame:
+                data = await self._stream_emitter.stream_queue.receive(timeout=first_frame_timeout)
+                is_first_frame = False
+            else:
+                data = await self._stream_emitter.stream_queue.receive(timeout=timeout)
+            if data is not None:
+                if data == StreamEmitter.END_FRAME:
+                    if need_close:
+                        await self._stream_emitter.stream_queue.close(timeout=timeout)
+                    break
+                else:
+                    yielded_count += 1
+                    yield data
+```
+
+### 6.4 WebSocket 客户端（SFT 容器）
+
+```python
+# agent_evolving/agent_rl/online/backends/rollouter/docker_runtime.py L510-566
+async def connect_with_retry():
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            return await websockets.connect(url, max_size=16 * 2**20, close_timeout=2)
+        except Exception:
+            await asyncio.sleep(1)
+    raise RuntimeError(f"failed to connect jiuwenclaw websocket {url}")
+
+async def main():
+    ws = await connect_with_retry()
+    async with ws:
+        frame = {"type": "req", "id": req_id, "method": "chat.send",
+                 "is_stream": True, "params": {...}}
+        await ws.send(json.dumps(frame))
+        while time.time() < deadline:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+            if event == "chat.processing_status":
+                if payload.get("is_processing") is False:
+                    return
+```
+
+### 6.5 设计亮点
+
+| 特性 | 实现 | 说明 |
+|------|------|------|
+| **重试发送** | `max_retries=5` | 防止临时背压丢数据 |
+| **首帧超时** | `first_frame_timeout` | 检测 LLM 调用卡死 |
+| **帧间隔超时** | `timeout` | 检测流式输出中断 |
+| **强制清空** | `_force_clear` | 关闭时防止队列泄漏 |
+| **END_FRAME 哨兵** | 特殊字符串 | 优雅关闭信号 |
+| **WebSocket 重连** | 120s deadline | SFT 容器启动等待 |
+
+### 6.6 laew gap
+
+- **laew 无 WebSocket**：无实时双向通信
+- **laew 无 SSE**：无 Server-Sent Events 推送
+- **laew 无帧超时**：流式输出无首帧/帧间隔超时检测
+
+---
+
+## 七、DevContainer 与容器化
+
+### 7.1 核心代码路径
+
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| Docker Environment | `agent_evolving/evaluator/evaluator_pipeline/docker_env.py` | 评测 Docker 环境管理 |
+| Docker Runtime | `agent_evolving/agent_rl/online/backends/rollouter/docker_runtime.py` | SFT 训练容器编排 |
+| Observability Compose | `deploy/observability/docker-compose.yml` | Langfuse 可观测性栈 |
+| Sandbox | `extensions/sys_operation/sandbox/` | 沙箱提供者 |
+
+### 7.2 DockerEnvironment 评测环境
+
+```python
+# agent_evolving/evaluator/evaluator_pipeline/docker_env.py L16-270
+class DockerEnvironment:
+    def __init__(self, image_tag, container_name=None, cpus=1, memory_mb=2048, timeout=900):
+        self.image_tag = image_tag
+        self._cpus = cpus
+        self._memory_mb = memory_mb
+        self._timeout = timeout
+        self._container_id = None
+
+    def build(self, dockerfile_path, build_context, build_timeout=600, no_cache=False, build_args=None):
+        cmd = [self._docker_path(), "build"]
+        if no_cache:
+            cmd.append("--no-cache")
+        if build_args:
+            for key, value in build_args.items():
+                cmd.extend(["--build-arg", f"{key}={value}"])
+        cmd.extend(["-t", self.image_tag, "-f", str(dockerfile_path), str(build_context)])
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=build_timeout)
+        if result.returncode != 0:
+            raise RuntimeError(f"docker build failed (rc={result.returncode}): {result.stderr[:2000]}")
+
+    async def start(self):
+        locale_name = self._get_utf8_locale_name()
+        cmd = [self._docker_path(), "run", "-d",
+               "-e", f"LANG={locale_name}", "-e", f"LC_ALL={locale_name}",
+               "--memory", f"{self._memory_mb}m", "--cpus", str(self._cpus),
+               self.image_tag, "tail", "-f", "/dev/null"]
+        result = await self._run_command(cmd, timeout=60)
+        self._container_id = result.stdout.strip()
+
+    async def exec(self, command, *, timeout=300, workdir=None, env=None):
+        cmd = [self._docker_path(), "exec"]
+        if workdir:
+            cmd.extend(["-w", workdir])
+        if env:
+            for k, v in env.items():
+                cmd.extend(["-e", f"{k}={v}"])
+        cmd.append(self._container_id)
+        cmd.extend(["bash", "-c", command])
+        return await self._run_command(cmd, timeout=timeout)
+```
+
+**UTF-8 Locale 自动检测**：
+
+```python
+# docker_env.py L33-71
+@staticmethod
+def _get_utf8_locale_name() -> str:
+    preferred_locales = ["C.utf8", "C.UTF-8", "en_US.utf8", "en_US.UTF-8"]
+    locale_cmd = DockerEnvironment._locale_path()
+    result = subprocess.run([locale_cmd, "-a"], capture_output=True, encoding="utf-8")
+    available_locales = result.stdout.split()
+    for locale in preferred_locales:
+        if locale in available_locales:
+            return locale
+    return "en_US.utf8"  # fallback
+```
+
+### 7.3 SFT 训练容器编排
+
+```python
+# agent_evolving/agent_rl/online/backends/rollouter/docker_runtime.py L97-130
+def build_jiuwenclaw_docker_command(request):
+    docker_mounts, pythonpath, command_prefix = docker_runtime_mounts()
+    env = build_jiuwenclaw_docker_env(request, ...)
+    return [
+        "docker", "run", "--rm", *docker_mounts,
+        *_docker_env_args(env),
+        request.image, "bash", "-lc", wrapped_command,
+    ]
+
+def build_jiuwenclaw_docker_env(request, *, dataset_case_json, pythonpath, data_dir):
+    env = {
+        "SFT_TASK_PROMPT": request.task_prompt,
+        "API_BASE": f"{request.supervisor_url}/v1",
+        "API_KEY": request.supervisor_token,
+        "TRAJECTORY_GATEWAY_URL": request.gateway_url,
+        "USE_RL_ONLINE_RAIL": "1",
+        "TRAIN_BACKEND": "SFT",
+        "PYTHONPATH": pythonpath,
+        "JIUWENSWARM_DATA_DIR": data_dir,
+        "SFT_TASK_MODE": os.getenv("SFT_TASK_MODE", "agent.fast"),
+        "SFT_TASK_MAX_ITERATIONS": os.getenv("SFT_TASK_MAX_ITERATIONS", ""),
+        "SFT_TASK_CHAT_TIMEOUT": os.getenv("SFT_TASK_CHAT_TIMEOUT", "600"),
+    }
+    env.update(_context_env_from_host())  # 继承宿主机上下文压缩配置
+    return env
+```
+
+**并发控制**：
+
+```python
+# docker_runtime.py L302-322
+async def run_docker_command_specs(specs, *, concurrency):
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+    async def _run_one(spec):
+        async with semaphore:
+            return await run_docker_command_spec(spec)
+    return list(await asyncio.gather(*(_run_one(spec) for spec in specs)))
+```
+
+### 7.4 可观测性 Docker Compose
+
+```yaml
+# deploy/observability/docker-compose.yml
+services:
+  otel-collector:    # OpenTelemetry Collector（4317/4318 端口）
+  langfuse-web:      # Langfuse Web UI（3000 端口）
+  langfuse-worker:   # Langfuse 后台 worker
+  postgres:          # PostgreSQL 17
+  clickhouse:        # ClickHouse 分析数据库
+  redis:             # Redis 7
+  minio:             # MinIO 对象存储
+```
+
+### 7.5 设计亮点
+
+| 特性 | 实现 | 说明 |
+|------|------|------|
+| **资源限制** | `--memory` + `--cpus` | 防止容器资源耗尽 |
+| **UTF-8 自动检测** | `_get_utf8_locale_name` | 避免容器内编码问题 |
+| **并发控制** | `asyncio.Semaphore` | 限制并行容器数 |
+| **挂载共享** | conda + 代码目录 | 容器复用宿主机环境 |
+| **环境变量注入** | 30+ 个 SFT 环境变量 | 灵活配置训练任务 |
+| **超时控制** | `timeout` 参数 | 防止容器无限运行 |
+| **优雅清理** | `trap cleanup EXIT` | 容器退出时 kill 子进程 |
+
+### 7.6 laew gap
+
+- **laew 无容器化**：无 Docker/DevContainer 配置
+- **laew 无资源限制**：Bash 工具无 CPU/内存限制
+- **laew 无沙箱**：无隔离执行环境
+
+---
+
+## 八、CRDT 与多端冲突
+
+### 8.1 现状分析
+
+**agent-core 无显式 CRDT 实现**。但源码中存在多处**冲突避免与状态同步**机制，可作为 CRDT 的替代方案：
+
+| 模块 | 路径 | 机制 |
+|------|------|------|
+| 原子写入 | `checkpointing/store_records.py` | temp + rename |
+| 文件锁 | `extensions/external_provider/openai_auth/openai_account_auth.py` | `FileLock` |
+| 分布式锁 | `core/memory/long_term_memory.py` | `DistributedLock` |
+| 记录合并 | `checkpointing/store_records.py` | `merge_records` |
+| 团队状态追踪 | `agent_teams/team_context.py` | `TeamContextTracker` |
+| 进化记录合并 | `checkpointing/store_records.py` | `_append_or_merge_record` |
+
+### 8.2 原子写入与事务
+
+```python
+# checkpointing/store_records.py L138-185
+async def append_record_transactional(self, name, record, ...):
+    projection_backups = self._snapshot_projection_files(target_dir)  # 快照
+    try:
+        prepared_record = copy.deepcopy(record)
+        evo_log = await self.load_full_evolution_log(name)
+        self._append_or_merge_record(evo_log, prepared_record)
+        await self.save_evolution_log(name, evo_log)
+    except Exception:
+        await self._restore_projection_files(target_dir, projection_backups)  # 回滚
+        await self._restore_text_file(evo_path, old_log_content)
+        raise
+```
+
+### 8.3 记录合并
+
+```python
+# checkpointing/store_records.py L187-203
+@staticmethod
+def _append_or_merge_record(evo_log, record):
+    merge_target = record.change.merge_target
+    if not merge_target:
+        evo_log.entries.append(record)
+        return
+    for idx, existing in enumerate(evo_log.entries):
+        if existing.id == merge_target:
+            evo_log.entries[idx] = record  # 替换已有记录
+            return
+    evo_log.entries.append(record)
+```
+
+### 8.4 团队状态追踪（TeamContextTracker）
+
+```python
+# agent_teams/team_context.py L93-156
+class TeamContextTracker:
+    """Render the team state one member has not been told about yet."""
+    TEAM_CONTEXT_STATE_KEY = "team_prompt_context"
+    _IDENTITY_EMITTED = "identity_emitted"
+    _TEAM_INFO_MTIME = "team_info_mtime"
+    _ROSTER_MTIME = "roster_mtime"
+    _ROSTER = "roster"
+    _MEMBER_PROMPT_MTIME = "member_prompt_mtime"
+
+    async def pending_text(self, session):
+        baseline = self._read_baseline(session)
+        updated = dict(baseline)
+        blocks = []
+        identity_body = await self._identity_body(baseline, updated)
+        info_body = await self._team_info_body(baseline, updated)
+        if identity_body or info_body:
+            blocks.append(render_team_context_with_identity(...))
+        roster_body = await self._roster_body(baseline, updated)
+        if roster_body:
+            blocks.append(roster_body)
+        if not blocks:
+            self._write_baseline(session, updated)
+            return None
+        self._uncommitted = updated
+        return "\n".join(blocks)
+
+    async def commit(self, session):
+        if self._uncommitted is not None:
+            self._write_baseline(session, self._uncommitted)
+            self._uncommitted = None
+```
+
+**设计要点**：
+- **Baseline 持久化**：每个成员的状态基线存储在 `AgentSession` 中
+- **增量更新**：仅发送变化的部分
+- **先提交后发送**：`commit` 在 `pending_text` 之后调用，防止消息丢失
+- **mtime 驱动**：通过修改时间戳判断是否需要更新
+
+### 8.5 分布式锁
+
+```python
+# core/memory/long_term_memory.py L527
+lock = DistributedLock(self.kv_store, f"user/{user_id}")
+async with lock:
+    # 写入原始消息
+    for msg in messages:
+        await self.message_manager.add(add_req)
+    # 生成记忆
+    all_memory = await self.generator.gen_all_memory(...)
+    # 写入各类型存储
+    write_result = await self.write_manager.add_memories(...)
+```
+
+### 8.6 设计亮点
+
+| 特性 | 实现 | 说明 |
+|------|------|------|
+| **原子写入** | temp + `os.replace` | 防写入中途崩溃 |
+| **文件锁** | `FileLock` | 防并发写入冲突 |
+| **分布式锁** | `DistributedLock` | 防多用户并发写入 |
+| **记录合并** | `_append_or_merge_record` | 同 ID 记录替换 |
+| **事务回滚** | `_snapshot_projection_files` | 失败时恢复所有文件 |
+| **增量同步** | `TeamContextTracker` | 仅发送变化部分 |
+| **先提交后发送** | `commit` 在 `pending_text` 后 | 防消息丢失 |
+
+### 8.7 laew gap
+
+- **laew 无 CRDT**：无冲突自由数据类型
+- **laew 无多端同步**：无多设备状态同步
+- **laew 无分布式锁**：SQLite 单文件无并发控制
+- **laew 无增量更新**：TUI 全量重绘
+
+---
+
+## 九、laew gap 清单与借鉴建议
+
+### 9.1 P0 紧急（必须实现）
+
+| Gap | agent-core 实现 | laew 现状 | 建议 Rust crate |
+|-----|-----------------|-----------|-----------------|
+| **L79 无 panic hook** | `checkpointing/manager.py` 事务回滚 | 无 | `human-panic` |
+| **L80 无 OAuth** | `openai_account_auth.py` 完整流程 | API Key 明文 | `oauth2` + `keyring` |
+| **L81 无 Token 刷新** | `refresh_openai_account_oauth` | 无 | `oauth2` |
+| **L82 无原子写入** | temp + `os.replace` | SQLite 直接写 | `tempfile` + `fsync` |
+| **L83 无文件锁** | `FileLock` | 无 | `fs2` + `filelock` |
+
+### 9.2 P1 重要（应该实现）
+
+| Gap | agent-core 实现 | laew 现状 | 建议 Rust crate |
+|-----|-----------------|-----------|-----------------|
+| **L84 无 i18n** | `i18n.py` 进程全局 dict | 硬编码中文 | `rust-i18n` + `fluent` |
+| **L85 无 WebSocket** | `docker_runtime.py` WS 客户端 | 无 | `tokio-tungstenite` |
+| **L86 无 SSE** | `StreamEmitter` 流式输出 | 无 | `eventsource-client` |
+| **L87 无容器化** | `DockerEnvironment` 完整管理 | 无 | `docker-api` |
+| **L88 无事务写入** | `append_record_transactional` | 无 | `tempfile` + `atomicwrites` |
+| **L89 无增量同步** | `TeamContextTracker` baseline | TUI 全量重绘 | `ratatui` diff |
+
+### 9.3 P2 进阶（可选实现）
+
+| Gap | agent-core 实现 | laew 现状 | 建议 Rust crate |
+|-----|-----------------|-----------|-----------------|
+| **L90 无 CRDT** | `merge_records` 记录合并 | 无 | `yrs` / `automerge` |
+| **L91 无多账号** | `OpenAIAccountModelCatalog` | 单 provider | `keyring` |
+| **L92 无模型发现** | `fetch_models` + 缓存 | 手动配置 | `reqwest` |
+| **L93 无前向兼容** | `_FORWARD_COMPAT_TEMPLATE_MODELS` | 无 | `semver` |
+| **L94 无沙箱** | `DockerEnvironment` 隔离执行 | 无 | `landlock` + `seccompiler` |
+| **L95 无资源限制** | `--memory` + `--cpus` | 无 | `cgroups-rs` |
+
+### 9.4 实现路线图
+
+```
+Phase 1 (P0 基础, 1 个月)
+  ├─ 1. panic hook + 错误恢复（human-panic）
+  ├─ 2. 原子写入 + 文件锁（tempfile + fs2）
+  ├─ 3. OAuth 认证流程（oauth2 + keyring）
+  └─ 4. Token 自动刷新
+
+Phase 2 (P1 增强, 2 个月)
+  ├─ 5. i18n 运行时切换（rust-i18n）
+  ├─ 6. WebSocket 实时通信（tokio-tungstenite）
+  ├─ 7. SSE 流式推送（eventsource-client）
+  └─ 8. 事务写入 + 回滚
+
+Phase 3 (P2 高级, 3 个月)
+  ├─ 9. CRDT 多端同步（yrs）
+  ├─ 10. 多账号轮换（keyring）
+  ├─ 11. 容器化沙箱（landlock）
+  └─ 12. 资源限制（cgroups-rs）
+```
+
+### 9.5 核心 Rust 实现参考
+
+#### OAuth 认证
+
+```rust
+pub struct OAuthManager {
+    client_id: String,
+    auth_url: String,
+    token_url: String,
+    auth_store_path: PathBuf,
+}
+
+impl OAuthManager {
+    pub async fn login_with_device_code(&self) -> Result<Tokens> {
+        let device_code = self.request_device_code().await?;
+        println!("Open this URL: {}", device_code.verification_uri);
+        println!("Enter code: {}", device_code.user_code);
+        let authorization = self.poll_device_authorization(&device_code).await?;
+        self.exchange_device_authorization(authorization).await
+    }
+
+    pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<Tokens> {
+        // POST grant_type=refresh_token
+    }
+
+    pub fn resolve_access_token(&self, force_refresh: bool) -> Result<String> {
+        let tokens = self.load_tokens()?;
+        if !force_refresh && !tokens.is_expiring() {
+            return Ok(tokens.access_token);
+        }
+        let refreshed = self.refresh_tokens(&tokens.refresh_token)?;
+        self.save_tokens(&refreshed)?;
+        Ok(refreshed.access_token)
+    }
+}
+```
+
+#### 原子写入
+
+```rust
+pub async fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
+    let tmp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+    tokio::fs::write(&tmp_path, content).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+```
+
+#### i18n
+
+```rust
+pub struct I18n {
+    language: Language,
+    strings: HashMap<String, HashMap<String, String>>,
+}
+
+impl I18n {
+    pub fn t(&self, key: &str, kwargs: &[(&str, &str)]) -> String {
+        let table = self.strings.get(&self.language.to_string()).unwrap();
+        let template = table.get(key).unwrap();
+        // 简单替换 {key} → value
+        let mut result = template.to_string();
+        for (k, v) in kwargs {
+            result = result.replace(&format!("{{{}}}", k), v);
+        }
+        result
+    }
+}
+```
+
+#### 增量同步
+
+```rust
+pub struct TeamContextTracker {
+    baseline: HashMap<String, serde_json::Value>,
+}
+
+impl TeamContextTracker {
+    pub fn pending_text(&mut self, current: &TeamState) -> Option<String> {
+        let mut blocks = Vec::new();
+        // 仅比较变化的部分
+        if current.roster_mtime != self.baseline["roster_mtime"] {
+            blocks.push(self.render_roster_delta(current));
+        }
+        if blocks.is_empty() {
+            None
+        } else {
+            Some(blocks.join("\n"))
+        }
+    }
+
+    pub fn commit(&mut self, current: &TeamState) {
+        self.baseline = serde_json::to_value(current).unwrap();
+    }
+}
+```
+
+---
+
+## 总结
+
+agent-core 在第十轮深挖的 8 大维度上展现出以下特征：
+
+1. **CrashDump 与错误恢复** — 事务写入 + 文件快照 + 回滚恢复 + 异常分级处理，工业级鲁棒性
+2. **WebUI 与 DesktopApp** — 纯后端 SDK，但提供三模式流（OUTPUT/TRACE/CUSTOM）+ WebSocket 通信接口
+3. **OAuth 认证与多账号** — 完整 Device Code 流程 + Token 自动刷新 + 三级 fallback 模型发现
+4. **i18n 国际化** — 进程全局 dict + `t()` 函数 + 100+ 键覆盖，简洁高效
+5. **Release 工程化** — 标准 pyproject + 可选依赖组 + 跨平台 Makefile + 测试分级
+6. **WebSocket 与 SSE** — 异步流队列 + 首帧/帧间隔超时 + WebSocket 重连
+7. **DevContainer 与容器化** — DockerEnvironment 完整管理 + SFT 容器编排 + 可观测性 Compose
+8. **CRDT 与多端冲突** — 无显式 CRDT，但通过原子写入 + 文件锁 + 分布式锁 + 增量同步实现冲突避免
+
+对 laew 而言，P0 的 5 项借鉴（panic hook / 原子写入 / OAuth / Token 刷新 / 文件锁）能在 1 个月内显著提升系统安全性与鲁棒性，是最具 ROI 的改造方向。
+
+---
+
+**分析完成日期**：2026-09-07
+**分析人**：Claude Code Agent
+**源码版本**：openJiuwen Core 0.1.17（HEAD 截至分析时）
+**已读取关键文件**：
+- `openjiuwen/agent_evolving/checkpointing/manager.py` (183 行)
+- `openjiuwen/agent_evolving/checkpointing/state.py` (26 行)
+- `openjiuwen/agent_evolving/checkpointing/store_records.py` (467 行)
+- `openjiuwen/agent_teams/reliability/handler.py` (113 行)
+- `openjiuwen/agent_teams/reliability/external_handler.py` (74 行)
+- `openjiuwen/core/session/stream/emitter.py` (160 行)
+- `openjiuwen/core/session/stream/manager.py` (111 行)
+- `openjiuwen/core/session/stream/writer.py` (82 行)
+- `openjiuwen/core/session/stream/base.py` (50 行)
+- `openjiuwen/extensions/external_provider/openai_auth/openai_account_auth.py` (841 行)
+- `openjiuwen/extensions/external_provider/openai_auth/openai_account_login.py` (189 行)
+- `openjiuwen/extensions/external_provider/openai_auth/openai_account_models.py` (301 行)
+- `openjiuwen/agent_teams/i18n.py` (812 行)
+- `openjiuwen/agent_teams/team_context.py` (400+ 行)
+- `openjiuwen/agent_evolving/evaluator/evaluator_pipeline/docker_env.py` (270 行)
+- `openjiuwen/agent_evolving/agent_rl/online/backends/rollouter/docker_runtime.py` (573 行)
+- `openjiuwen/__init__.py` (23 行)
+- `pyproject.toml` (314 行)
+- `Makefile` (221 行)
+- `deploy/observability/docker-compose.yml` (176 行)
+
+---
+
+> **字数**：本文档第十轮深挖新增约 10,000 字 / ~450 行代码片段。

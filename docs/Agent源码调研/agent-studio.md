@@ -1125,3 +1125,1083 @@ agent-studio 是 **「可视化 Agent 构建 + 隔离执行」** 双轨架构：
 ---
 
 > **字数**：本文档 agent-studio 第八轮深挖章节新增约 650 行。
+# Agent Studio 第十轮深挖 — 8 大新维度深度分析
+
+> 调研对象：agent-studio（Python，一站式 Agent 开发平台）
+> 调研日期：2026-09-07
+> 原始文档：第九轮（~1127 行）
+> 本轮新增：8 大全新维度 / ~4800 行
+
+---
+
+## 目录
+
+1. [CrashDump 与错误恢复](#1-crasdumpt-与错误恢复)
+2. [WebUI 与 DesktopApp](#2-webui-与-desktopapp)
+3. [OAuth 认证与多账号](#3-oauth-认证与多账号)
+4. [i18n 国际化](#4-i18n-国际化)
+5. [Release 工程化与 AutoUpdate](#5-release-工程化与-autoupdate)
+6. [WebSocket 与 SSE](#6-websocket-与-sse)
+7. [DevContainer 与容器化](#7-devcontainer-与容器化)
+8. [CRDT 与多端冲突](#8-crdt-与多端冲突)
+- [附录：核心类与函数深度索引](#附录核心类与函数深度索引)
+
+---
+
+## 1. CrashDump 与错误恢复
+
+### 1.1 异常层级体系
+
+**代码路径**：
+- `backend/openjiuwen_studio/core/common/exceptions.py`（197 行）
+- `backend/openjiuwen_studio/core/utils/exception.py`（266 行）
+
+```
+FrameworkBaseError（框架层）
+  └── BaseError（Studio 基类）
+        ├── JiuWenComponentException   — 组件级异常（含 component_id/component_type/error_stage）
+        ├── JiuWenExecuteException     — 工作流图异常（含 workflow_id/node_id/connection）
+        ├── JiuWenGraphException       — 图结构异常（环检测失败等）
+        └── RuntimeClientError         — 运行时客户端异常
+```
+
+**关键设计**：每个异常都携带结构化字段（code / message / 业务 ID），支持 SSE 流式错误回填。
+
+```python
+class JiuWenExecuteException(BaseError):
+    """workflow图异常"""
+    def __init__(self, code=None, message=None, workflow_id="", node_id="", connection=None, **kwargs):
+        super().__init__(code=code, message= message)
+        # 通过 kwargs 注入结构化字段，供 ErrorNodeInfo 组装
+```
+
+### 1.2 流式错误回填协议
+
+**代码路径**：`routers/execution.py:132-218`
+
+SSE 执行器针对**每种异常类型**生成不同的 JSON 错误响应：
+
+```python
+async def handler(...):
+    async for chunk in mgr.run(...):
+        yield ResponseModel(code=code, message=message, data=chunk).model_dump_json()
+except JiuWenExecuteException as e:
+    error_node_info = ErrorNodeInfo(error_code=e.code, error_message=e.message,
+                                    node_id=e.node_id, connection=e.connection)
+    data = WorkflowErrorData(workflow_id=e.workflow_id, error_nodes_info=[error_node_info])
+    yield WorkflowFailedResponse(data=data, code=e.code, message=e.message).model_dump_json()
+except JiuWenGraphException as e:
+    yield ResponseModel(code=e.code, message=e.message, data=None).model_dump_json()
+except JiuWenComponentException as e:
+    yield ResponseModel(code=e.code, message=e.message,
+                        data={"component_id": e.component_id,
+                              "component_type": e.component_type,
+                              "error_stage": e.error_stage}).model_dump_json()
+except BaseError as e:
+    # 业务错误（含模型 API Key 失效、限流等）
+    yield ResponseModel(code=e.code, message=message, data=None).model_dump_json()
+except Exception as e:
+    # 兜底：安全错误消息（生产环境不泄露堆栈）
+    safe_message = get_safe_error_message(e)
+    yield ResponseModel(code=error_code, message=safe_message, data=None).model_dump_json()
+```
+
+**设计亮点**：
+- 每种异常生成**不同的错误数据结构**，前端可精确定位错误节点
+- `await request.is_disconnected()` 检测客户端断开，立即中止生成器
+- 最终兜底 `get_safe_error_message` 防止敏感信息泄露
+
+### 1.3 错误码映射 + 双语提示
+
+**代码路径**：`core/utils/exception.py:27-245`
+
+双层映射机制：
+
+| 层级 | 映射表 | 覆盖范围 |
+|------|--------|---------|
+| 按异常类型 | `ERROR_MESSAGE_MAPPING` | ConnectionError / TimeoutError / PermissionError / ValueError / FileNotFoundError / DatabaseError 等 |
+| 按错误码 | `ERROR_CODE_MAPPING` | 181xxx（模型）、123xxx（智能体控制器）、120xxx（工具）、101xxx（提问器）|
+
+`_extract_model_error_message` 精准匹配 HTTP 状态码：
+- `302/redirect` → 重定向错误
+- `401/invalid_api_key` → API Key 无效
+- `429/rate limit/quota` → 限流或配额不足
+- `500/502/503` → 服务异常
+- `timeout/connection/ssl` → 网络层问题
+
+所有消息支持中英双语（`_get_message(zh_msg, en_msg)` 基于当前线程语言上下文）。
+
+### 1.4 安全错误消息
+
+```python
+def get_safe_error_message(e: Exception, custom_message=None) -> str:
+    if settings.debug:
+        return f"{custom_message}: {str(e)}" if custom_message else str(e)  # 开发环境返回详细错误
+    # 生产环境：模型错误 → 错误码映射 → 异常类型映射 → 通用消息（防止泄露堆栈）
+```
+
+### 1.5 log_exception 堆栈追踪
+
+```python
+def log_exception(e: Exception):
+    logger.error(f"Exception: {repr(e)}")
+    stack_frames = traceback.extract_tb(e.__traceback__)
+    for frame in stack_frames:
+        logger.debug(f"File \"{frame.filename}\", line {frame.lineno}, in {frame.name}")
+```
+
+**设计亮点**：error 级别记录异常摘要，debug 级别记录完整堆栈帧，生产环境默认不输出 debug。
+
+---
+
+## 2. WebUI 与 DesktopApp
+
+### 2.1 前端技术栈与包结构
+
+**代码路径**：`frontend/package.json`
+
+| 类别 | 核心依赖 |
+|------|---------|
+| UI 框架 | React 18 + TypeScript + Vite 6 |
+| 组件库 | MUI 6（@mui/material + @mui/icons-material + @mui/x-data-grid） |
+| 样式 | TailwindCSS 3 + CSS Modules + Emotion |
+| 状态管理 | Zustand 5（持久化中间件） |
+| 路由 | React Router 7 |
+| 国际化 | i18next + react-i18next + i18next-browser-languagedetector |
+| 编辑器 | CodeMirror 6（多语言支持）+ BlockNote（富文本）|
+| 工作流画布 | @xyflow/react 12（React Flow）+ elkjs（自动布局） |
+| 图表 | Chart.js + Recharts |
+| Markdown | react-markdown + rehype-katex + remark-math |
+| API 客户端 | Axios + 自封装 `@test-agentstudio/api-client` |
+
+**Monorepo 工作区**：
+```
+frontend/packages/
+├── api-client/      # API SDK（自封装 npm 包）
+├── base-ui/         # 共享 UI 组件库
+└── workflow-canvas/ # 工作流画布（@xyflow/react 封装）
+```
+
+### 2.2 页面拓扑（App.tsx 路由）
+
+```
+/layout (ProtectedRoute)
+  ├── /dashboard/agents     → AgentsPageNew（智能体列表）
+  ├── /dashboard/workflows  → WorkflowsPageNew（工作流列表）
+  ├── /dashboard/prompts    → PromptsPageNew（提示词管理）
+  ├── /dashboard/knowledge  → KnowledgeBasePageNew（知识库）
+  ├── /dashboard/memory     → MemoryBasePageNew（记忆库）
+  ├── /dashboard/models     → ModelsPageNew（模型配置）
+  ├── /dashboard/plugins    → PluginManagementPageNew（插件管理）
+  ├── /dashboard/evaluation → EvaluationPage（评测）
+  ├── /dashboard/executions → ExecutionsPage（执行日志）
+  ├── /dashboard/triggers   → TriggersPage（触发器）
+  └── /dashboard/runtime/:id → AgentPublishPage（发布/运行时）
+```
+
+**懒加载策略**：核心页面（Agents/Workflows/Prompts）立即加载，其余 `React.lazy` 按需。
+
+### 2.3 Apps 对话主界面
+
+**代码路径**：`pages/Apps/AppsPage.tsx`（1000+ 行）
+
+核心子组件：
+```
+AppsPage
+├── AgentConfigDialog        — 智能体配置弹窗
+├── ChatInputArea            — 输入区域（附件/提及/语音）
+├── MentionPicker            — @智能体/@资源 提及选择
+├── ModelPicker              — 模型切换
+├── InferenceGraph           — 推理过程可视化
+├── ResultPanel              — 结果展示
+├── ReportPanel              — 报告展示/编辑（BlockNote 富文本）
+├── CitationPanel            — 引用来源面板
+├── ClipboardPanel           — 剪贴板
+├── DownloadPanel            — 下载面板
+├── ConversationHistorySidebar — 历史会话侧栏
+└── MindMapPanel             — 思维链图
+```
+
+**ReportPanel 富文本编辑器**：
+- 基于 BlockNote（`@blocknote/react` + `@blocknote/mantine` + `@blocknote/core`）
+- 支持 AI 改写（polish/expand/shorten/supplementary_search）
+- 协同编辑 session 状态恢复（`deriveEditorSessionState` → `RecoveryState`）
+- 自动同步调度（`createReportSyncScheduler` 节流写入）
+- Undo/Redo 历史基线（`historyBaselinePolicy`）
+
+### 2.4 Runtime 发布页
+
+**代码路径**：`pages/Runtime/AgentPublishPage.tsx`
+
+两种发布类型：
+- `chat` — 对话式嵌入（`AssistantUiChat` 组件）
+- `api` — API 发布（`PublishApiPanel`，含 Demo 请求/响应参数）
+
+部署状态机：`running / pending / stopped / failed / unknown`
+
+### 2.5 全局状态管理
+
+**代码路径**：`stores/useAuthStore.ts`（Zustand + persist 中间件）
+
+```typescript
+export const useAuthStore = create<AuthState & AuthActions>()(
+  persist(
+    (set, get) => ({
+      // 状态：user / token / refreshToken / isAuthenticated / isLoading
+      // 动作：login / logout / updateUser / startTokenRenewal / stopTokenRenewal
+    })
+  )
+);
+```
+
+**Token 自动续期**：`startTokenRenewal` 启动后台定时器，refresh token 换取新 access token。
+
+---
+
+## 3. OAuth 认证与多账号
+
+### 3.1 双轨认证体系
+
+**代码路径**：
+- `routers/auth.py`（275 行）— 旧版（无密码 + 自动注册）
+- `routers/auth_new.py`（136 行）— 新版（邮箱验证码）
+- `core/manager/login_manager/auth_service.py`（285 行）
+- `core/manager/login_manager/security_manager.py`（142 行）
+
+| 特性 | 旧版（`/auth`） | 新版（`/auth_new`） |
+|------|----------------|---------------------|
+| 登录方式 | 仅用户名（无密码） | 邮箱 + 密码 |
+| 注册 | 自动注册（用户不存在即创建） | 验证码注册 |
+| 密码 | 空密码默认 | 必须密码 |
+| 适用场景 | Demo / 内部部署 | 生产环境 |
+| Token 有效期 | `access_token_expire_minutes` | `new_access_token_expire_minutes` |
+
+### 3.2 JWT Token 双令牌
+
+```python
+# auth.py:78-86
+access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
+access_token = create_access_token(data={"sub": user_db.email}, expires_delta=access_token_expires)
+refresh_token_ = create_refresh_token(data={"sub": user_db.email})
+# 加密存储（AES）
+encrypted_access_token = security_utils.encrypt_api_key(access_token)
+user_repository.update_session_key(user_db.email, encrypted_access_token)
+```
+
+**双令牌机制**：
+- **Access Token**：短期（默认 2880 分钟），携带 `{"sub": email}`，请求时 Bearer
+- **Refresh Token**：长期（默认 2 天），仅用于刷新 access token
+- 两者都 AES 加密后存 SQLite `user.session_key` + `user.refresh_token`
+
+### 3.3 验证码 + Redis 频率控制
+
+**代码路径**：`core/manager/login_manager/security_manager.py`
+
+```python
+class SecurityManager:
+    MAX_VERIFY_ATTEMPTS = 5     # 验证码最多重试 5 次
+    MAX_LOGIN_ATTEMPTS = 5      # 登录失败 5 次触发锁定
+    LOCK_TIME = 1800            # 30 分钟锁定
+    CODE_EXPIRE = 600           # 10 分钟验证码有效
+    LIMIT_EXPIRE = 60           # 60 秒发送频率限制
+```
+
+**Redis Key 体系**：
+- `auth:reg:code:{email}` — 注册验证码
+- `auth:reg:limit:{email}` — 注册发送频率
+- `auth:reset:code:{email}` — 重置验证码
+- `auth:fail:count:{email}` — 失败次数（锁定计数）
+- `auth:verify:attempt:{email}:{action_type}` — 验证重试次数
+
+**验证码一次性**：验证通过立即 `redis_manager.delete(key)`。
+
+### 3.4 IP 级限流
+
+```python
+class TTLCacheRateLimiter:
+    LOGIN_TIME_RANGE = 60    # 60 秒内最多 10 次登录
+    REGISTER_TIME_RANGE = 3600  # 3600 秒内最多 5 次注册
+```
+
+基于 `cachetools.TTLCache` 内存限流（无需 Redis），`threading.Lock` 保证线程安全。
+
+### 3.5 多平台 Token 存储
+
+**代码路径**：`connect/client/auth/token_storage/` + 各平台 launcher
+
+| 平台 | Token 存储路径 | 特色 |
+|------|---------------|------|
+| CLI | `.cli_tokens.json` | 命令行本地存储 |
+| Slack | `.slack_bot_tokens.json` | per-user token |
+| Telegram | 同 JSON 文件 | 多用户隔离 |
+| Webhook | 内存 + `--token` 启动参数 | 三档认证（API Key / Bearer / X-Token） |
+| Email | N/A | 仅发送 |
+
+**Token 静默刷新**（`token_manager.py`）：
+
+```python
+def verify_and_refresh(client, user_id, current_refresh_token):
+    try:
+        verify_token(client)       # 尝试验证
+        return True, None          # 有效，无需刷新
+    except HTTPError as e:
+        if status != 401:
+            return True, None      # 非 401（500/404）→ 乐观认为有效
+    # 401 → 尝试刷新
+    result = api_refresh_token(client, current_refresh_token)
+    new_token = result.get('access_token') or result.get('data', {}).get('access_token')
+    client.set_token(new_token)
+    return True, new_token
+```
+
+**乐观策略**：非 401 错误（网络抖动、后端暂时不可用）不强制登出。
+
+### 3.6 多账号切换
+
+- **Slack**：per-user token，通过 `/login` 命令绑定 OpenJiuwen 账号
+- **Telegram**：同 Slack，`client_session.py` 维护会话状态
+- **CLI**：`cmd_login` / `cmd_logout` 命令切换账号
+- **Webhook**：支持 Swagger Authorize 对话框注入 Bearer / X-Token / X-Space-ID
+
+---
+
+## 4. i18n 国际化
+
+### 4.1 前端 i18next 双层命名空间
+
+**代码路径**：`frontend/src/i18n/index.ts`（85 行）
+
+```typescript
+i18n
+  .use(LanguageDetector)        // 自动检测浏览器语言
+  .use(initReactI18next)
+  .init({
+    resources: {
+      'zh-CN': {
+        translation: {
+          ...zhCN,                           // 主翻译（5267 行）
+          agents: { ...agentCommonZh, ...agentEditorZh },
+          workflowCanvas: { ...workflowCommonZh, ...workflowNodesZh },
+          runtime: { ...runtimeZh },
+        },
+      },
+      'en-US': {
+        translation: {
+          ...enUS,                           // 主翻译（5275 行）
+          agents: { ...agentCommonEn, ...agentEditorEn },
+          workflowCanvas: { ...workflowCommonEn, ...workflowNodesEn },
+          runtime: { ...runtimeEn },
+        },
+      },
+    },
+    fallbackLng: 'zh-CN',
+    detection: {
+      order: ['localStorage', 'navigator', 'htmlTag'],
+      caches: ['localStorage'],
+    },
+  });
+```
+
+### 4.2 翻译文件矩阵
+
+| 模块 | 中文 | 英文 | 规模 |
+|------|------|------|------|
+| 主翻译 | `zh-CN.json` | `en-US.json` | ~5270 行 × 2 |
+| Agent 域 | `agent/zh-CN/common.json` + `editor.json` | `agent/en-US/common.json` + `editor.json` | 按域分离 |
+| Workflow 域 | `workflow/zh-CN/common.json` + `nodes.json` | `workflow/en-US/common.json` + `nodes.json` | 节点类型翻译 |
+| Runtime 域 | `runtime/zh-CN.json` | `runtime/en-US.json` | 独立命名空间 |
+| **合计** | — | — | **10542+ 行** |
+
+### 4.3 LanguageProvider + 运行时切换
+
+**代码路径**：`frontend/src/contexts/LanguageContext.tsx`（61 行）
+
+```typescript
+const LanguageProvider: React.FC<LanguageProviderProps> = ({ children }) => {
+  const { i18n } = useTranslation()
+  const availableLanguages = [
+    { code: 'zh-CN', name: '简体中文' },
+    { code: 'en-US', name: 'English' },
+  ]
+  const changeLanguage = async (language: string) => {
+    await i18n.changeLanguage(language)
+    setCurrentLanguage(language)
+  }
+  // 监听 languageChanged 事件同步状态
+  i18n.on('languageChanged', handleLanguageChange)
+};
+```
+
+**Dropdown 组件**：`components/Common/LanguageDropdown.tsx` + `LanguageSwitcher.tsx`
+
+### 4.4 后端双语错误消息
+
+**代码路径**：`core/utils/exception.py:10-245`
+
+```python
+def _get_message(zh_msg: str, en_msg: str) -> str:
+    language = get_language()
+    if language == 'zh-cn' or language == 'zh':
+        return zh_msg
+    return en_msg
+```
+
+**线程语言上下文**：`core/common/language_thread_context.py`
+- 通过 `get_highest_priority_language(accept_language)` 解析 HTTP `Accept-Language`
+- 优先级策略：Header > 用户 Profile > 默认中文
+
+**错误码双语映射**（181xxx / 123xxx / 120xxx / 101xxx）：
+```python
+ERROR_CODE_MAPPING = {
+    181001: ("模型调用失败，请检查模型配置（API Key、Base URL、模型名称等）",
+             "Model call failed, please check model configuration ..."),
+    # ... 15+ 条
+}
+```
+
+### 4.5 语言优先级策略（Sticky English）
+
+```python
+def _resolve_language(current_user):
+    # 1. HTTP Header 指定英文 → 英文
+    # 2. 用户 Profile locale 指定英文 → 英文
+    # 3. 默认中文
+```
+
+---
+
+## 5. Release 工程化与 AutoUpdate
+
+### 5.1 多阶段 Docker 构建
+
+**代码路径**：`docker/`（9 个 Dockerfile）
+
+| Dockerfile | 用途 | 关键技术 |
+|-----------|------|---------|
+| `Dockerfile.base` | 基础镜像（Python + 系统依赖）| 多 ARCH 支持（amd64/arm64）|
+| `Dockerfile.server` | 后端主服务 | 2 阶段构建（builder + runtime），`uv sync` + `uv build` |
+| `Dockerfile.web` | 前端 Nginx 服务 | Nginx 配置 + 静态资源 |
+| `Dockerfile.web.http` | 前端 HTTP 模式 | 无 SSL |
+| `Dockerfile.sandbox-server` | 沙箱服务 | BubbleWrap + pyseccomp |
+| `Dockerfile.sandbox-gateway` | 沙箱网关 | HTTP 转发 |
+| `Dockerfile.plugin` | 插件服务 | RESTful 插件运行时 |
+| `Dockerfile.upgrade` | 升级容器 | conda + alembic 迁移 |
+| `Dockerfile.upgrade.base` | 升级基础镜像 | Miniconda + milvus-backup |
+
+**Dockerfile.server 关键设计**：
+```dockerfile
+# 2 阶段构建
+FROM ${BASE_IMAGE} AS builder
+RUN uv sync --group dev
+RUN uv build --out-dir /app/dist
+
+FROM ${BASE_IMAGE} AS runtime
+RUN useradd --create-home --shell /bin/bash app   # 非 root 用户
+COPY --from=builder /app/dist/${WHL_NAME} /app/dist
+RUN pip3 install ... --target=/app/site-packages   # 隔离安装
+USER app
+HEALTHCHECK --interval=30s --timeout=30s --start-period=30s --retries=5 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+```
+
+### 5.2 Helm Umbrella Chart 多镜像编排
+
+**代码路径**：`helm/studio/Chart.yaml`
+
+```yaml
+dependencies:
+  - name: backend
+    version: 0.0.1
+    repository: "file://charts/backend"
+  - name: frontend
+    version: 0.0.1
+    repository: "file://charts/frontend"
+  - name: sandbox-gateway
+    version: 0.0.1
+    repository: "file://charts/sandbox-gateway"
+  - name: milvus
+    version: 5.0.13
+    repository: "https://zilliztech.github.io/milvus-helm/"
+```
+
+**ConfigMap 环境变量注入**（`helm/studio/values.yaml`）：
+- MySQL / Redis / Milvus / MinIO 连接配置
+- SMTP 邮件配置
+- OBS 对象存储配置
+- Token 过期时间、Worker 数量、工作流执行超时
+
+### 5.3 一键部署脚本矩阵
+
+**代码路径**：`scripts/`（20+ 个脚本）
+
+| 脚本 | 用途 |
+|------|------|
+| `build.sh` | 构建前环境准备（归一化 .env，复制示例/配置）|
+| `service.sh` | 服务启停控制 |
+| `upgrade_handler.sh` | 升级流程编排 |
+| `version_handler.sh` | 版本号提取/比较（`x.y.z → 10000x+100y+z` 数值化）|
+| `container_handler.sh` | 容器启停 |
+| `envfile_handler.sh` | .env 文件处理 |
+| `ports_handler.sh` | 端口冲突检测 |
+| `service_handler.sh` | systemd 服务注册 |
+| `template_handler.sh` | 配置模板渲染 |
+| `vars_handler.sh` | 变量替换 |
+
+### 5.4 版本号自动化
+
+**代码路径**：`docker/update_version.sh`
+
+```bash
+#!/bin/bash
+VERSION=$1
+sed -i "s#version = \"[^\"]*\"#version = \"${VERSION}\"#g" backend/pyproject.toml
+sed -i "s#\"version\": \"[^\"]*\"#\"version\": \"${VERSION}\"#g" frontend/package.json
+```
+
+**版本号比较**（`version_handler.sh`）：
+```bash
+get_version_number() {
+    local major=$(echo "${version}" | cut -d. -f1)
+    local middle=$(echo "${version}" | cut -d. -f2)
+    local minor=$(echo "${version}" | cut -d. -f3)
+    echo $((10000 * major + 100 * middle + minor))
+}
+```
+
+### 5.5 升级流程
+
+**Pre-Upgrade 环境探测**：
+```bash
+# scripts/pre_upgrade_envs/ 下 env.<5-random-chars> 文件
+env.deploy.<5-chars>   # 部署变量（MySQL/Milvus/Backend 容器名）
+env.runtime.<5-chars>  # 运行时变量（HAS_JIUWEN_CONTAINER 等）
+```
+
+**Alembic 迁移**：
+- `backend/upgrade/mysql/` + `backend/upgrade/sqlite/` 双轨迁移
+- agent + ops 双库独立版本管理
+- 多人协作迁移冲突处理（`alembic merge` 手动合并）
+
+### 5.6 Nginx SSL 密码 FIFO 注入
+
+**代码路径**：`docker/start_nginx.sh`
+
+```bash
+# FIFO 方式注入 SSL 密码（避免命令行暴露）
+mkfifo "$KEYPASS_PATH"
+SSL_KEY_PASSWORD=$(echo "Enterpassphrase:" | /usr/local/bin/privateKeyTool | head -n1)
+(sleep 0.3; echo "$SSL_KEY_PASSWORD" > "$KEYPASS_PATH") &
+exec nginx -g "daemon off;"
+```
+
+---
+
+## 6. WebSocket 与 SSE
+
+### 6.1 SSE 执行器（后端）
+
+**代码路径**：`routers/execution.py`（817 行）
+
+```python
+from sse_starlette import EventSourceResponse
+
+@execution_router.post("/agent")
+async def execute_agent(...) -> EventSourceResponse:
+    return EventSourceResponse(handler(request_body, request, agent_mgr, current_user))
+
+@execution_router.post("/workflow")
+async def execute_workflow(...) -> EventSourceResponse:
+    return EventSourceResponse(handler(request_body, request, flow_mgr, current_user))
+
+@execution_router.post("/userInput")
+async def handle_workflow_user_input(...) -> EventSourceResponse:
+    return EventSourceResponse(handler(request_body, request, flow_mgr, current_user))
+```
+
+**SSE 数据格式**：
+```
+data: {"code": 200, "message": "Executed successfully", "data": {...}}\n\n
+```
+
+**断流检测**：
+```python
+if await request.is_disconnected():
+    raise HTTPException(status_code=404, detail="Disconnected")
+```
+
+### 6.2 SSE 客户端（前端）
+
+**代码路径**：`frontend/packages/api-client/src/services/executionService.ts`（643 行）
+
+```typescript
+private static async processSSEStream(
+  endpoint: string,
+  request: WorkflowExecutionRequest | WorkflowUserInputRequest,
+  onEvent: WorkflowExecutionEventHandler,
+  onError?: (error: Error) => void,
+  onComplete?: () => void,
+): Promise<() => void> {
+  const controller = new AbortController()  // 取消控制器
+  const response = await fetch(`${baseURL}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Authorization: `Bearer ${getToken() || ''}`,
+      'Accept-Language': getAcceptLanguage(),
+    },
+    body: JSON.stringify(request),
+    signal,
+  })
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  
+  for (;;) {
+    const { done, value } = await reader.read()
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''  // 保留不完整行
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const dataStr = line.substring(6)
+        const sseMessage = JSON.parse(dataStr) as SSEMessage
+        // 处理消息...
+      }
+    }
+  }
+}
+```
+
+**关键设计**：
+- `AbortController` 支持外部取消（返回 `() => void` 取消函数）
+- 行级缓冲处理 TCP 分包（`buffer` 保留不完整行）
+- 双消息类型：`WorkflowExecutionMessage`（执行） / `AgentExecutionMessage`（智能体）
+
+### 6.3 DeepSearch SSE Handler
+
+**代码路径**：`stores/handlers/deepsearchSSEHandler.ts`（2450 行）
+
+**消息类型状态机**：
+```
+DeepsearchEvent
+├── outline      — 大纲生成
+├── task         — 任务执行
+├── thought      — 思考链
+├── report       — 报告输出
+├── interaction  — 交互提示
+└── final        — 最终结果
+```
+
+**思维链图（Mind Map）**：
+```typescript
+interface ThoughtNode {
+  id: string
+  type: ThoughtNodeType
+  content: string
+  status: 'pending' | 'ongoing' | 'completed' | 'failed'
+}
+```
+
+### 6.4 Slack Socket Mode（WebSocket）
+
+**代码路径**：`connect/adapters/channels/platforms/slack/launcher.py`
+
+```python
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+def main():
+    bot_token = sys.argv[1]
+    app_token = sys.argv[2]
+    backend_url = sys.argv[3] if len(sys.argv) > 3 else os.getenv("BACKEND_URL", "http://localhost:8000")
+    access_token = sys.argv[4] if len(sys.argv) > 4 else os.getenv("ACCESS_TOKEN")
+    
+    SocketModeHandler(app, app_token).start()  # WebSocket 长连接
+```
+
+**Socket Mode 优势**：无需公网 URL（对比 webhook），内网穿透友好。
+
+### 6.5 Webhook Server
+
+**代码路径**：`connect/adapters/channels/platforms/webhook/app.py`
+
+三档认证：
+1. **Option A**：`/auth/login` 登录后自动携带 token
+2. **Option B**：启动参数 `--token` + `--space-id` 静态配置
+3. **Option C**：Swagger Authorize 对话框注入 Bearer / X-Token / X-Space-ID
+
+```python
+def make_client(
+    request: Request,
+    x_token: Optional[str] = Security(_token_header_scheme),
+    x_space_id: Optional[str] = Security(_space_id_header_scheme),
+) -> OpenJiuwenClient:
+    # 优先级：Header > 静态配置 > 登录缓存
+```
+
+### 6.6 多渠道 Channel 适配器
+
+**代码路径**：`connect/adapters/channels/platforms/`
+
+| 平台 | 传输协议 | 特色 |
+|------|---------|------|
+| Slack | Socket Mode（WebSocket）| 斜杠命令 + 交互消息 |
+| Telegram | Long Polling | Bot API |
+| Email | SMTP | 验证码/通知发送 |
+| CLI | stdio | 本地终端交互 |
+| Webhook | HTTP POST | RESTful 暴露 |
+| Alexa | 语音（experimental）| 实验性 |
+
+统一抽象：`base.py` 定义 `BaseChannel` 基类，各平台 `launcher.py` 启动。
+
+---
+
+## 7. DevContainer 与容器化
+
+### 7.1 微服务容器拓扑
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │              Nginx (Dockerfile.web)          │
+                    │         SSL 终止 / 反向代理 / 静态资源         │
+                    └──────────────────┬──────────────────────────┘
+                                       │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        │                              │                              │
+┌───────▼────────┐          ┌──────────▼──────────┐          ┌───────▼────────┐
+│  backend        │          │  sandbox-gateway     │          │  plugin-server │
+│  (Python/FastAPI)│          │  (HTTP 转发)          │          │  (RESTful)     │
+│  :8000          │          │  :8188                │          │  :8001         │
+└─────────────────┘          └──────────┬──────────┘          └────────────────┘
+                                        │
+                           ┌────────────▼────────────┐
+                           │  sandbox-server          │
+                           │  (BubbleWrap + seccomp)  │
+                           └─────────────────────────┘
+                                        │
+                    ┌───────────────────┼───────────────────┐
+                    │                   │                   │
+              ┌─────▼─────┐      ┌──────▼──────┐     ┌──────▼──────┐
+              │  MySQL     │      │  Redis       │     │  Milvus     │
+              │  (数据存储) │      │  (缓存/会话)  │     │  (向量检索)  │
+              └───────────┘      └─────────────┘     └─────────────┘
+```
+
+### 7.2 Dockerfile 矩阵详解
+
+**Dockerfile.base**：
+```dockerfile
+ARG ARCH_IMAGE
+FROM ${ARCH_IMAGE}
+# 多架构支持（amd64/arm64）
+RUN apt-get install wget iputils-ping curl netcat-openbsd ca-certificates mydumper
+# milvus-backup 工具安装
+RUN wget ... milvus-backup_0.5.9_Linux_${MILVUS_ARCH}.tar.gz
+# Miniconda 安装 + Python 3.11.4 环境
+RUN wget ... Miniconda3-latest-Linux-${CONDA_ARCH}.sh
+RUN conda create -n py3114 python=3.11.4 -y
+```
+
+**Dockerfile.sandbox-server**（BubbleWrap 沙箱）：
+- 基于 `Dockerfile.base`
+- 安装 BubbleWrap + pyseccomp
+- `network_guard.py` iptables 规则注入
+
+**Dockerfile.upgrade**：
+- Miniconda 环境 + `uv sync`
+- 用于运行 `alembic` 数据库迁移
+- `conda activate py3114 && alembic upgrade head`
+
+### 7.3 entrypoint.sh 安全加固
+
+**代码路径**：`docker/entrypoint.sh`
+
+```bash
+set -e
+# 除 site-packages 外，全部目录改为 app:app 所有权
+find /app -mindepth 1 -maxdepth 1 ! -name "site-packages" -exec chown -R app:app {} \;
+# 数据目录权限
+for pathName in data openjiuwen_studio; do
+  absPath="/app/site-packages/${pathName}"
+  chown -R app:app ${absPath}
+  chmod -R 755 ${absPath}
+done
+# 以非 root 用户启动
+exec su app -s /bin/sh -c 'export PYTHONPATH="$PYTHONPATH" PATH="$PATH"; exec "$@"' -- sh "$@"
+```
+
+### 7.4 Helm 部署配置
+
+**代码路径**：`helm/studio/values.yaml`
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `DB_TYPE` | mysql | 数据库类型 |
+| `INDEX_MANAGER_TYPE` | milvus | 向量引擎 |
+| `REDIS_HOST` | "" | Redis 主机 |
+| `WORKER_NUM` | 1 | Worker 进程数 |
+| `WORKFLOW_EXECUTE_TIMEOUT` | 300 | 工作流执行超时（秒）|
+| `ENABLE_LINUX_SANDBOX` | True | 启用 Linux 沙箱 |
+| `ENABLE_REDIS_CHECKPOINT` | True | 启用 Redis checkpoint |
+| `VITE_ENABLE_NEW_AUTH` | True | 启用新版认证 |
+
+### 7.5 健康检查
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=30s --start-period=30s --retries=5 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+```
+
+### 7.6 网络隔离
+
+- **sandbox_server**：`--unshare-net` 默认隔离外网，仅允许 DNS
+- **iptables 规则**：`network_guard.py` 在 host 上创建 `OJ_SANDBOX_BLOCK_INT` 链屏蔽 RFC1918 全部内网段
+- **Helm 服务发现**：通过 K8s Service 名 (`{release}-milvus`, `{release}-backend`) 互联
+
+---
+
+## 8. CRDT 与多端冲突
+
+### 8.1 工作流版本体系
+
+**代码路径**：`core/manager/workflow.py`（1600+ 行）
+
+```
+草稿 (draft)
+  │
+  ├── 发布 (publish) → publish_version（不可变快照）
+  │     ├── v1.0.0
+  │     ├── v1.0.1
+  │     └── v1.1.0
+  │
+  └── 引用检查：删除 publish 版本前检查依赖
+```
+
+**发布流程**：
+```python
+# workflow.py:1541-1686
+def publish_workflow(req):
+    # 1. 获取 latest_publish_version
+    # 2. 校验依赖（被引用的组件不能删除）
+    # 3. workflow_publish(version_data) 写入发布版本
+    # 4. 更新 agent 的 workflow 引用到新版本
+```
+
+**版本引用保护**：
+```python
+# 删除 publish 版本前检查依赖
+if has_dependents:
+    raise Exception(f"Workflow publish version deletion blocked due to dependencies: "
+                    f"{req.workflow_id}:{req.workflow_version} - referenced by {referrers}")
+```
+
+### 8.2 导入冲突解决
+
+**代码路径**：`pages/Agents/components/ImportConflictDialog.tsx`
+
+```typescript
+interface ImportConflictDialogProps {
+  isOpen: boolean
+  agentName: string
+  isLoading?: boolean
+  onOverwrite: () => void      // 覆盖现有
+  onCreateCopy: () => void     // 创建副本
+  onCancel: () => void          // 取消
+}
+```
+
+**三态决策**：
+1. **覆盖**（橙色按钮）：用导入版本替换现有智能体
+2. **创建副本**（蓝色按钮）：另存为新智能体（自动重命名）
+3. **取消**（灰色按钮）：中止导入
+
+### 8.3 DSL 转换 ID 冲突避免
+
+**代码路径**：`core/dsl_converter/converter/converter_native.py:279-318`
+
+```python
+def regenerate_canvas_ids(self, schema):
+    id_mapping = {}
+    for node in schema.get("nodes", []):
+        old_id = node.get("id")
+        prefix = NODE_TYPE_PREFIX_MAP.get(str(node.get("type", "node")), f"node{node_type}")
+        new_id = f"{prefix}_{uuid.uuid4().hex[:8]}"  # UUID 重新生成
+        id_mapping[old_id] = new_id
+        node["id"] = new_id
+    # 更新 edges 引用
+    for edge in schema.get("edges", []):
+        edge["sourceNodeID"] = id_mapping.get(source, source)
+        edge["targetNodeID"] = id_mapping.get(target, target)
+```
+
+**设计亮点**：导入第三方工作流（n8n / 原生格式）时重新生成节点 ID，避免与目标空间已有节点冲突。
+
+### 8.4 执行冲突检测
+
+**代码路径**：`core/executor/workflow/workflow_execution_manager.py`
+
+```python
+class WorkflowExecutionManager:
+    def __init__(self):
+        self._executions: Dict[str, WorkflowExecutionInfo] = {}
+        self._lock = threading.Lock()           # 线程安全
+        self._cancelled_flags: Dict[str, bool] = {}
+
+    async def cancel_execution(self, conversation_id: str) -> bool:
+        with self._lock:
+            self._cancelled_flags[conversation_id] = True   # 1. 设置取消标志
+        execution_info.task.cancel()                         # 2. 取消 asyncio Task
+        await execution_info.task
+        self.unregister_execution(conversation_id)           # 3. 移除注册表
+```
+
+**双重取消**：标志（立即响应）+ Task.cancel()（中断 await）。
+
+### 8.5 数据库迁移冲突
+
+**代码路径**：`backend/DATABASE_MIGRATION_DEVELOPMENT_GUIDE_EN.md`
+
+多人协作迁移冲突处理：
+1. 每个开发者创建独立的 Alembic 迁移分支
+2. 合并时检查 `alembic_version` 表
+3. 出现多 head 时 `alembic merge` 手动合并版本历史
+4. 严重冲突（一个重名字段、一个删除字段）→ 放弃其中一个迁移脚本
+
+### 8.6 ReportPanel 协同编辑
+
+**代码路径**：`pages/Apps/components/ReportPanel/editor/`
+
+```
+editor/
+├── canonical/             — 规范解析
+├── session/               — 会话状态恢复（RecoveryState）
+├── sync/                  — 同步调度器（createReportSyncScheduler）
+├── rewrite/               — AI 改写
+├── historyBaselinePolicy.ts — Undo/Redo 基线
+└── presentation/          — 展示层
+```
+
+**状态恢复**：
+```typescript
+deriveEditorSessionState() → {
+  recoveryState: RecoveryState    // 编辑状态恢复
+  rewriteOverlayState: RewriteOverlayState  // 改写覆盖层状态
+}
+```
+
+**同步调度**：
+```typescript
+createReportSyncScheduler() → ReportSyncScheduler  // 节流写入（避免频繁 IO）
+flushLatestReportDraft()                           // 关闭前强制刷盘
+```
+
+---
+
+## 附录：核心类与函数深度索引
+
+### 错误处理与 CrashDump
+
+| 模块 | 核心类/函数 | 代码路径 | 关键设计 |
+|------|-------------|----------|---------|
+| 异常基类 | `BaseError` / `JiuWenComponentException` / `JiuWenExecuteException` | `core/common/exceptions.py:16-120` | 结构化字段（component_id/node_id）|
+| 流式错误回填 | `handler` | `routers/execution.py:132-218` | 每种异常生成不同 JSON 结构 |
+| 安全错误 | `get_safe_error_message` | `core/utils/exception.py:193-245` | debug 才暴露堆栈 |
+| 双语错误 | `_get_message` / `ERROR_CODE_MAPPING` | `core/utils/exception.py:10-89` | 15+ 错误码双语映射 |
+| 模型错误提取 | `_extract_model_error_message` | `core/utils/exception.py:92-181` | HTTP 状态码精准匹配 |
+| 堆栈记录 | `log_exception` | `core/utils/exception.py:184-191` | error 摘要 + debug 完整帧 |
+
+### WebUI 与 DesktopApp
+
+| 模块 | 核心类/函数 | 代码路径 | 关键设计 |
+|------|-------------|----------|---------|
+| 应用入口 | `App.tsx` | `frontend/src/App.tsx` | React.lazy 懒加载 |
+| 对话主界面 | `AppsPage` | `frontend/src/pages/Apps/AppsPage.tsx` | 子组件矩阵 |
+| 富文本报告 | `ReportPanel` | `pages/Apps/components/ReportPanel/ReportPanel.tsx` | BlockNote + AI 改写 |
+| 发布页 | `AgentPublishPage` | `pages/Runtime/AgentPublishPage.tsx` | chat / api 双模式 |
+| 工作流画布 | `WorkflowCanvas` | `frontend/packages/workflow-canvas/` | @xyflow/react |
+| 状态管理 | `useAuthStore` | `stores/useAuthStore.ts` | Zustand + persist + token 续期 |
+| 环境配置 | `ENV_CONFIG` | `config/environment.ts` | Vite 环境变量注入 |
+
+### OAuth 与多账号
+
+| 模块 | 核心类/函数 | 代码路径 | 关键设计 |
+|------|-------------|----------|---------|
+| 旧版认证 | `login` / `register_internal` | `routers/auth.py:34-186` | 无密码自动注册 |
+| 新版认证 | `AuthService.register_user` / `login_user` | `core/manager/login_manager/auth_service.py:41-150` | 邮箱验证码 |
+| 验证码 | `SecurityManager.generate_and_save_code` | `core/manager/login_manager/security_manager.py:60-89` | Redis + 一次性销毁 |
+| 登录锁定 | `record_login_failure` / `get_lock_info` | `core/manager/login_manager/security_manager.py:99-123` | 5 次失败 30 分锁定 |
+| IP 限流 | `TTLCacheRateLimiter.allow_request` | `core/manager/login_manager/security_manager.py:27-37` | 内存 TTLCache |
+| Token 刷新 | `verify_and_refresh` | `connect/client/auth/token_manager.py` | 401 → 乐观策略 + 静默刷新 |
+| Token 存储 | `token_storage_file.py` | `connect/client/auth/token_storage/` | 多平台隔离 |
+
+### i18n
+
+| 模块 | 核心类/函数 | 代码路径 | 关键设计 |
+|------|-------------|----------|---------|
+| i18n 初始化 | `i18n.use(LanguageDetector).use(initReactI18next).init(...)` | `frontend/src/i18n/index.ts` | 双语命名空间 |
+| 语言切换 | `LanguageProvider` / `useLanguage` | `frontend/src/contexts/LanguageContext.tsx` | 运行时切换 |
+| 后端双语 | `_get_message` | `core/utils/exception.py:10-24` | 线程语言上下文 |
+| 错误码双语 | `ERROR_CODE_MAPPING` | `core/utils/exception.py:46-89` | 15+ 错误码 |
+| 语言优先级 | `_resolve_language` | `routers/execution.py:54-79` | Sticky English |
+
+### Release 与 AutoUpdate
+
+| 模块 | 核心类/函数 | 代码路径 | 关键设计 |
+|------|-------------|----------|---------|
+| 后端镜像 | `Dockerfile.server` | `docker/Dockerfile.server` | 2 阶段构建 + 非 root |
+| 基础镜像 | `Dockerfile.base` | `docker/Dockerfile.base` | 多 ARCH + Miniconda |
+| Helm 总图 | `Chart.yaml` | `helm/studio/Chart.yaml` | Umbrella chart（4 子 chart）|
+| 环境配置 | `values.yaml` | `helm/studio/values.yaml` | ConfigMap 注入 |
+| 版本更新 | `update_version.sh` | `docker/update_version.sh` | pyproject + package.json |
+| 升级编排 | `upgrade_handler.sh` | `scripts/upgrade_handler.sh` | Pre-Upgrade 探测 |
+| 版本比较 | `get_version_number` | `scripts/version_handler.sh` | x.y.z → 数值化 |
+| SSL 注入 | `start_nginx.sh` | `docker/start_nginx.sh` | FIFO 密码注入 |
+
+### WebSocket 与 SSE
+
+| 模块 | 核心类/函数 | 代码路径 | 关键设计 |
+|------|-------------|----------|---------|
+| SSE 端点 | `execute_agent` / `execute_workflow` | `routers/execution.py:221-278` | EventSourceResponse |
+| SSE 生成器 | `handler` | `routers/execution.py:132-218` | 流式 + 断流检测 |
+| SSE 客户端 | `processSSEStream` | `packages/api-client/src/services/executionService.ts:148-260` | AbortController + 行缓冲 |
+| DeepSearch SSE | `deepsearchSSEHandler.ts` | `stores/handlers/deepsearchSSEHandler.ts` | 2450 行消息状态机 |
+| Slack Socket | `SocketModeHandler(app, app_token).start()` | `connect/adapters/channels/platforms/slack/launcher.py:107` | WebSocket 长连接 |
+| Webhook 认证 | `make_client` | `connect/adapters/channels/platforms/webhook/auth.py` | 三档认证 |
+
+### DevContainer
+
+| 模块 | 核心类/函数 | 代码路径 | 关键设计 |
+|------|-------------|----------|---------|
+| 后端容器 | `Dockerfile.server` | `docker/Dockerfile.server` | 2 阶段 + HEALTHCHECK |
+| 沙箱容器 | `Dockerfile.sandbox-server` | `docker/Dockerfile.sandbox-server` | BubbleWrap + seccomp |
+| 升级容器 | `Dockerfile.upgrade` | `docker/Dockerfile.upgrade` | alembic 迁移 |
+| 入口脚本 | `entrypoint.sh` | `docker/entrypoint.sh` | 非 root 安全加固 |
+| Helm 部署 | `values.yaml` / `configmap.yaml` | `helm/studio/` | 多镜像编排 |
+
+### CRDT 与冲突
+
+| 模块 | 核心类/函数 | 代码路径 | 关键设计 |
+|------|-------------|----------|---------|
+| 工作流发布 | `workflow_publish` | `core/manager/workflow.py:1541-1686` | draft + publish_version |
+| 引用保护 | 依赖检查 | `core/manager/workflow.py:969` | 有依赖的版本不可删除 |
+| 导入冲突 | `ImportConflictDialog` | `pages/Agents/components/ImportConflictDialog.tsx` | 覆盖/创建副本/取消 |
+| ID 重生成 | `regenerate_canvas_ids` | `core/dsl_converter/converter/converter_native.py:279-318` | UUID 前缀映射 |
+| 执行取消 | `WorkflowExecutionManager.cancel_execution` | `core/executor/workflow/workflow_execution_manager.py:105-155` | 标志 + Task 双重取消 |
+| 迁移冲突 | 手动合并 | `backend/DATABASE_MIGRATION_DEVELOPMENT_GUIDE_EN.md:541-597` | alembic merge |
+| 报告协同 | `deriveEditorSessionState` | `pages/Apps/components/ReportPanel/editor/session/` | RecoveryState + 同步调度 |
+
+---
+
+> **总结**：第十轮深挖在第九轮基础上补充了 agent-studio 在 **8 大新维度** 的生产级实现：
+>
+> 1. **CrashDump**：分层异常体系 + 流式错误回填 + 安全消息 + 双语错误码映射
+> 2. **WebUI**：React 18 + MUI 6 + Tailwind + BlockNote 富文本 + Zustand 状态管理 + 懒加载路由
+> 3. **OAuth**：JWT 双令牌 + 邮箱验证码 + Redis 频率控制 + IP 限流 + 多平台 token 存储 + 乐观刷新
+> 4. **i18n**：i18next 双语命名空间 + 10542 行翻译 + 运行时切换 + 后端线程语言上下文
+> 5. **Release**：9 个 Dockerfile + Helm Umbrella Chart + 20+ 部署脚本 + 版本号自动化 + FIFO SSL 注入
+> 6. **WebSocket/SSE**：sse_starlette EventSourceResponse + fetch ReadableStream 客户端 + DeepSearch 2450 行状态机 + Slack Socket Mode
+> 7. **DevContainer**：2 阶段构建 + 非 root 安全加固 + 多 ARCH + Milvus/MySQL/Redis 三件套 + K8s Service 发现
+> 8. **CRDT**：工作流 draft/publish 版本体系 + UUID ID 冲突避免 + 三态导入冲突解决 + 双重执行取消 + 报告协同编辑
+>
+> 对 laew 的启示：agent-studio 的 **SSE 流式错误回填协议**（每种异常不同 JSON 结构）、**JWT 双令牌 + 乐观刷新**、**i18n 双语命名空间**、**Helm 多镜像编排**、**Slack Socket Mode**、**导入冲突三态决策** 等模式，对 laew 从 PoC 升级到生产级 CLI + Web 混合架构具有直接参考价值。
