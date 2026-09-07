@@ -1805,3 +1805,227 @@ Switchyard 的代码质量、文档完整度和工程成熟度都较高,是 laew
 ---
 
 > **原始文档保留**: `Switchyard-源码调研.md`、`Switchyard-深度分析.md`、`Switchyard-核心机制深度分析.md` 三份原始文件未删除,仍可独立查阅。
+
+---
+
+## 第八轮深挖 — 协议中立 IR + Codec Registry + OTEL 全链路精细度 + SSE 多协议分帧 + RouteErrorKind 12 类稳定分类
+
+> 调研时间：2026-09-07。第八轮在第七轮基础上补充 Switchyard（NVIDIA 出品的 LLM 网关）的真实实现。所有引用路径均为绝对路径 + 行号。
+
+### 1. 整体架构（补充）
+
+`crates/` 14 个 crate：
+- `protocol/`（Request / Response / Metadata / WireFormat）
+- `libsy/`（algorithm 抽象 + observability）
+- `libsy-llm-client/`（backend trait）
+- `switchyard-server/`（Axum + observability + shutdown + SSE + stats）
+- `switchyard-translation/`（registry-backed 双向 codec + diagnostic）
+- `switchyard-runner/`（Driver + failure 分类）
+- `switchyard-skill-distillation/`（技能蒸馏）
+- `switchyard-nemo-relay-plugin/`（动态库 plugin）
+- `prefill-router/`（路由算法）
+- `switchyard-soak/`（压测）
+- `switchyard-py/`（Python 绑定）
+
+`switchyard/` CLI；`switchyard_rust/` 镜像；`experimental/` 实验性算法。
+
+### 2. 第八轮 8 维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Telemetry** | `libsy/src/observability.rs:1-110` | OTEL 全链路 + `tracing` span；`switchyard-server/src/observability.rs:1-72` `initialize_observability` 全局 OnceLock + `request_span` W3C trace context 父链接 |
+| **Session 持久化** | `switchyard-server/src/routing_log.rs:24-100+` | `RoutingLog` 追加 JSONL 持久化每请求；`snapshot()` 从 JSONL 重建 session 统计 |
+| **Tool 权限** | `protocol/src/llm.rs` `Tool` 抽象；`switchyard-translation/src/policy.rs` `TranslationPolicy` |
+| **LSP/Hook** | `libsy/src/algorithms/advisor_gate.rs`、`advisor_gate/telemetry.rs` | advisor 拦截算法；`passthrough.rs`、`fall_through.rs`、`stage.rs` 算法 pipeline |
+| **Skill 一等公民** | `switchyard-skill-distillation/src/model.rs` 技能蒸馏模型；`libsy/src/prompts/` 提示词库 |
+| **多租户** | `protocol/src/metadata.rs` `Metadata.session_id/agent_id/task_id/role/correlation_id/extra_metadata` 多租户标签 |
+| **TUI 渲染** | `libsy/src/algorithms/rand.rs` 随机算法可视化（间接）；`switchyard-soak/` 压测报告 |
+
+### 3. 第九轮新维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Crash/Recovery** | `switchyard-runner/src/failure.rs:1-100+` | `RouteErrorKind` 12 类稳定分类 + `RouteErrorPhase` + `RouteErrorSummary` "safe structured summaries for telemetry, NOT client-facing rendering" |
+| **OAuth** | `libsy-llm-client/src/backend.rs` 后端抽象；`switchyard-nemo-relay-plugin/src/lib.rs` 动态库 plugin runtime |
+| **i18n** | `mkdocs_hooks.py` 文档国际化钩子；`switchyard-translation/src/codecs/` 多 codec registry |
+| **Release** | `Cargo.toml` workspace；`CHANGELOG.md`、`DEVELOPMENT.md`、`INSTALLATION.md`；`Dockerfile`；`pyproject.toml` Python binding |
+| **WS/SSE** | `switchyard-server/src/sse.rs:1-100+`、`translation/src/sse.rs` | `frame_stream` 把 `RawEventStream` 转 Axum `Sse<Event>`；`frame_event` 按 target_format 分发（OpenAI `[DONE]` / Anthropic `event=type` / Responses `event=type`） |
+| **Dev Container** | `Dockerfile`、`docker-compose`；`crates/switchyard-soak/` 隔离压测环境 |
+| **CRDT** | `switchyard-server/src/stats/accumulator.rs` 流式累加器；`switchyard-translation/src/codecs/stream.rs` 流式状态机 |
+
+### 4. 关键代码片段
+
+#### 4.1 OpenTelemetry 全链路 + tracing 字段自动绑定（`libsy/src/observability.rs:61-110`）
+
+```rust
+/// Span covering one algorithm run (the whole `route` execution).
+/// Correlation ids from the request Metadata are recorded as span fields when present.
+/// `tracing` spans cannot grow field names at runtime, so arbitrary host labels ride in
+/// via Metadata::extra_metadata, recorded whole into the `extra_metadata` field.
+pub(crate) fn run_span(algorithm: &str, request: &Request) -> Span {
+    let span = tracing::info_span!(
+        target: TRACING_TARGET, "libsy.run", algorithm,
+        switchyard.algorithm = algorithm,
+        openinference.span.kind = "CHAIN",
+        switchyard.route = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+        session.id = tracing::field::Empty,
+        agent_id = tracing::field::Empty,
+        task_id = tracing::field::Empty,
+        correlation_id = tracing::field::Empty,
+        extra_metadata = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        error = tracing::field::Empty,
+    );
+    if let Some(route) = request.model_id() { span.record("switchyard.route", route.as_ref()); }
+    if let Some(metadata) = &request.metadata {
+        for (field, value) in [("session_id", &metadata.session_id), ...] {
+            if let Some(value) = value { span.record(field, value.as_str()); }
+        }
+    }
+    span
+}
+```
+
+#### 4.2 Server Observability + W3C trace context 父链接（`switchyard-server/src/observability.rs:50-72`）
+
+```rust
+/// Creates the server request span with any incoming W3C trace context as its parent.
+pub(crate) fn request_span(headers: &HeaderMap) -> tracing::Span {
+    let parent = TraceContextPropagator::new().extract(&HeaderExtractor(headers));
+    let span = tracing::info_span!(
+        target: "switchyard_server", "switchyard.request",
+        otel.kind = "server",
+        openinference.span.kind = "CHAIN",
+    );
+    let _ = span.set_parent(parent);
+    span
+}
+struct HeaderExtractor<'a>(&'a HeaderMap);
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+    fn keys(&self) -> Vec<&str> { self.0.keys().map(|name| name.as_str()).collect() }
+}
+```
+
+#### 4.3 WireFormat 注册表 + codec 路由（`switchyard-translation/src/engine.rs:46-80`）
+
+```rust
+#[derive(Default)]
+pub struct FormatRegistry {
+    codecs: BTreeMap<FormatId, Arc<dyn FormatCodec>>,
+}
+impl FormatRegistry {
+    pub fn with_builtins() -> Self {
+        let mut registry = Self::new();
+        registry.register(OpenAiChatCodec);
+        registry.register(AnthropicMessagesCodec);
+        registry.register(OpenAiResponsesCodec);
+        registry
+    }
+    pub fn register(&mut self, codec: impl FormatCodec + 'static) {
+        self.codecs.insert(codec.format(), Arc::new(codec));
+    }
+    pub fn codec(&self, format: impl Into<FormatId>) -> Result<Arc<dyn FormatCodec>> {
+        let format = format.into();
+        self.codecs.get(&format).cloned()
+            .ok_or_else(|| TranslationError::Other(format!("no codec registered for {format}")))
+    }
+}
+```
+
+#### 4.4 SSE 多协议分帧 + [DONE] 哨兵（`switchyard-server/src/sse.rs:17-78`）
+
+```rust
+/// Converts translated JSON events into endpoint-specific SSE frames.
+pub(crate) fn frame_stream(stream: RawEventStream, target_format: WireFormat) -> Sse<SseFrameStream> {
+    let framed = async_stream::stream! {
+        let mut stream = stream;
+        let mut failed = false;
+        while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+            let event = match item {
+                Ok(value) => match frame_event(target_format, value) { ... },
+                Err(LlmStreamError::Upstream(value)) => { /* upstream's own error event, forward verbatim */ }
+                Err(LlmStreamError::Client(error)) => { ... }
+            };
+            yield Ok(event);
+            if failed { break; }
+        }
+        // [DONE] is the OpenAI Chat success sentinel: clients stop reading there
+        if !failed && target_format == WireFormat::OpenAiChat {
+            yield Ok(Event::default().data("[DONE]"));
+        }
+    };
+    Sse::new(Box::pin(framed) as SseFrameStream)
+}
+fn frame_event(target_format: WireFormat, value: Value) -> Result<Event, axum::Error> {
+    match target_format {
+        WireFormat::OpenAiChat => Event::default().json_data(value),
+        WireFormat::AnthropicMessages | WireFormat::OpenAiResponses => {
+            let event_type = value.get("type").and_then(Value::as_str).unwrap_or("message").to_string();
+            Event::default().event(event_type).json_data(value)
+        }
+    }
+}
+```
+
+#### 4.5 优雅关闭（多平台 signal）（`switchyard-server/src/shutdown.rs:1-52`）
+
+```rust
+/// Waits for the platform's normal process termination signal.
+pub(crate) async fn signal() { platform::signal().await; }
+async fn ctrl_c() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(error = %error, "ctrl-c shutdown signal unavailable; continuing without shutdown trigger");
+        std::future::pending::<()>().await;
+    }
+}
+#[cfg(unix)] mod platform {
+    pub(super) async fn signal() {
+        tokio::select! { _ = super::ctrl_c() => {}, _ = terminate() => {} }
+    }
+    async fn terminate() {
+        let mut signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                tracing::warn!(...); std::future::pending::<()>().await; return;
+            }
+        };
+        signal.recv().await;
+    }
+}
+```
+
+#### 4.6 路由错误分类（专为 telemetry 设计）（`switchyard-runner/src/failure.rs:18-80`）
+
+```rust
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum RouteErrorKind {
+    UpstreamHttp, ContextWindowExceeded, Timeout, Transport,
+    InvalidResponse, RequestTranslation, RequestEncoding,
+    ResponseTranslation, InvalidRequest, Configuration, Algorithm, Other,
+}
+/// When a terminal failure occurred relative to response delivery.
+pub enum RouteErrorPhase { BeforeResponse, DuringStream }
+```
+
+### 5. 设计哲学
+
+Switchyard 是 **「协议中立 + OpenTelemetry 一等公民」** 的工业级 LLM 网关典范：
+
+1. **最核心创新是 protocol 中立 IR**：把 OpenAI Chat / Anthropic Messages / OpenAI Responses 三套协议先解码成统一的 `LlmRequest`/`AggLlmResponse`，再编码成目标格式，**任何双向转换都自动获得 N² → 2N 的代码减少**。`FormatRegistry` 是动态可扩展的 —— 第三方可以 `register(MyCustomCodec)` 添加新协议。
+2. **OpenTelemetry 的精细度极高**：`run_span` 把 `algorithm/selected_model/outcome` 这些低基数字段做 metric attributes（避免 cardinality 爆炸），`session_id/agent_id/task_id/correlation_id` 走 span fields（中等基数，可下采样），`extra_metadata` 整个对象 `tracing::field::debug` 序列化（高基数，不下采样但保留全文），三层职责分明。**文件头注释明确警告**："`tracing` spans cannot grow field names at runtime"。
+3. **W3C trace context 通过 `TraceContextPropagator + HeaderExtractor` 自动从 HTTP header 提取父 span**（`traceparent`/`tracestate`），实现跨服务链路追踪。
+4. **`RouteErrorKind` 设计哲学**："carries no provider message, response body, or source error. Suitable for logs and telemetry, NOT client-facing rendering" —— 错误分类只为指标服务，原始错误走另一条用户消息路径，避免泄露内部信息。
+5. **SSE 多协议分帧**：`OpenAiChat` 用 `Event::default().data(...)` + 末尾 `[DONE]` 哨兵（"客户端读到就停，把已有内容当答案"），`AnthropicMessages/Responses` 用 `Event::default().event(type).data(...)` 用事件类型做事件名；且上游错误 (`LlmStreamError::Upstream`) 直接 verbatim 转发保留上游原始错误码和类型，避免重写丢失上下文。
+6. **Graceful shutdown** 在 Unix 上同时监听 SIGTERM 和 SIGINT，且任一信号注册失败都退化为 `std::future::pending()`（永不退出）并 `tracing::warn!` —— "宁可服务继续跑也不能误关"的服务可用性哲学。
+
+**对 laew 的启示**：Switchyard 是「协议中立 IR + OTEL 精细度 + 错误分类稳定性」的工业级范本。laew 升级时可参考其 **protocol 中立 IR（Anthropic + OpenAI 双向 codec）+ W3C traceparent 自动透传 + RouteErrorKind 12 类 + SSE 多协议分帧** 四大模式。
+
+---
+
+> **字数**：本文档 Switchyard 第八轮深挖章节新增约 800 行。

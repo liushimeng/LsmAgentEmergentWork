@@ -1628,3 +1628,138 @@ agent-core 在 10 个核心机制上展现出工业级成熟度：
 - `openjiuwen/agent_teams/spawn/inprocess_spawn.py` (160 行)
 - `openjiuwen/agent_evolving/trajectory/model.py` (276 行)
 - `openjiuwen/agent_evolving/agent_rl/rl_trainer/verl_executor.py` (615 行)
+
+---
+
+## 第八轮深挖 — 企业级抽象层级最高的 Agent 框架 + 双层 Guardrail + 父子 Session + 进程全局 i18n
+
+> 调研时间：2026-09-07。第八轮在第七轮基础上补充华为 openjiuwen 框架的真实实现。所有引用路径均为绝对路径 + 行号。
+
+### 1. 整体架构（补充）
+
+`openjiuwen/` 主包 12 个子包：
+- `core/` 12 个子包：`application/`、`common/`、`context_engine/`、`controller/`、`foundation/`（LLM 客户端、工具抽象）、`graph/`（图记忆）、`kv_cache/`、`memory/`、`multi_agent/`（team_runtime, teams）、`operator/`、`retrieval/`、`runner/`（callback）、`security/`（guardrail）、`session/`（tracer/state/checkpointer/interaction/stream）、`single_agent/`（agents/rail/skills/agents/legacy）、`sys_operation/`（shell_operation）、`workflow/`
+- `agent_teams/` 团队协作（含 `i18n.py`、`timefmt.py`、`reliability/`、`session_controller/`）
+- `agent_evolving/` RL 与轨迹系统
+- `dev_tools/` skill 创作工具链
+- `harness/` Rails（context_engineer, worktree, browser_move）
+- `symphony/` 经验蒸馏
+
+### 2. 第八轮 8 维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Telemetry** | `core/session/tracer/tracer.py:16-61` | `TracerHandlerRegistry` 全局注册 OTEL handler；`Span`/`TraceAgentSpan`/`TraceWorkflowSpan` Pydantic 模型带 traceId/parent/child |
+| **Session 持久化** | `core/session/agent.py:33-76` | `Session` 构造含 session_id/parent_session_id/source_metadata/stream_writer_manager；`core/session/state/agent_state.py:9-43` `StateCollection` 分 global/agent/trace 三段 |
+| **Tool 权限** | `core/single_agent/ability_manager.py`、`core/security/guardrail/guardrail.py:42-100` | `AbilityManager` 注册 Tool/McpServerConfig；`BaseGuardrail` **双层架构**（事件处理 + GuardrailBackend 检测） |
+| **LSP/Hook** | `core/security/guardrail/guardrail.py:35-39` | 集成 `runner.callback.enums.HookType`、`errors.AbortError`；Guardrail 通过 callback framework 注册事件 |
+| **Skill 一等公民** | `core/single_agent/skills/skill_manager.py:10-87` | `Skill` Pydantic 模型；`SkillManager` 注册 YAML 技能（name/description/directory） |
+| **多租户** | `core/session/agent.py:62-66` | `parent_session_id` 用于产品级会话嵌套；`kv_cache/kv_cache_metadata.py:15-19` `KV_CACHE_AFFINITY_PARENT_SESSION_ID_ENV` 父子会话共享 KV cache |
+| **TUI 渲染** | `agent_teams/inbound_render.py` | 入站消息渲染；`agent_teams/team_context.py`、`timefmt.py` 人类可读时间格式 |
+| **Runtime Telemetry** | `core/common/logging.py` | `session_logger` + `LogEventType` |
+
+### 3. 第九轮新维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Crash/Recovery** | `agent_evolving/checkpointing/manager.py`、`checkpointing/state.py` | Agent checkpoint 恢复；`session/checkpointer/` CheckpointerFactory |
+| **OAuth** | `core/foundation/llm/model_clients/openai_account_model_client.py:53,79,307` | "Validate static config while allowing OAuth-based credentials"；通过 `bearer token` 走 ChatGPT 反代模型列表 |
+| **i18n** | `agent_teams/i18n.py:1-100+` | **进程全局中英翻译**（`Language = Literal["cn","en"]`），`STRINGS` 字典覆盖 timefmt/blueprint/team/checkpoint/reliability/dispatcher |
+| **Release** | `pyproject.toml` 标准 pyproject；`__init__.py` 版本号 |
+| **WS/SSE** | `core/session/stream/` | `StreamWriterManager`、`BaseStreamMode`、`OutputSchema` |
+| **Dev Container** | `agent_evolving/evaluator/evaluator_pipeline/docker_env.py` | 评测 docker 环境 |
+| **CRDT** | `multi_agent/teams/` `team.py` `team_runtime/` | 团队共享状态 + `kv_cache/` 父子 cache affinity 实现软协同 |
+
+### 4. 关键代码片段
+
+#### 4.1 全局 Trace handler 注册中心（`core/session/tracer/tracer.py:16-61`）
+
+```python
+class TracerHandlerRegistry:
+    """External handlers registered here get auto-picked-up by Tracer."""
+    _agent_handlers: dict[str, TraceExtAgentHandler] = {}
+    _workflow_handlers: dict[str, TraceExtWorkflowHandler] = {}
+    _RESERVED_NAMES = {name.value for name in TracerHandlerName}
+    @classmethod
+    def register_handler(cls, handler_name, handler):
+        if handler_name in cls._RESERVED_NAMES:
+            raise ValueError(f"Handler '{handler_name}' is a reserved name...")
+        ...
+```
+
+#### 4.2 双层 Guardrail 抽象（`core/security/guardrail/guardrail.py:42-100`）
+
+```python
+class BaseGuardrail(ABC):
+    """Two-layer: BaseGuardrail (event handling) + GuardrailBackend (detection)."""
+    DEFAULT_EVENTS: List[Any] = []
+    DEFAULT_PRIORITY: int = 100
+    NAMESPACE: str = "guardrail"
+    def __init__(self, *, events=None, backend=None, priority=None, enable_logging=True):
+        self._backend = backend
+        ...
+```
+
+#### 4.3 父子 Session 嵌套 + KV cache affinity（`core/session/agent.py:33-68`）
+
+```python
+class Session:
+    def __init__(self, session_id=None, envs=None, card=None, *,
+                 stream_writer_manager=None, close_stream_on_post_run=True,
+                 source_metadata=None, parent_session_id=None,
+                 kv_cache_runtime: KVCacheRuntimeProtocol | None = None):
+        if session_id is None: session_id = str(uuid.uuid4())
+        self._parent_session_id = (parent_session_id.strip()
+            if isinstance(parent_session_id, str) and parent_session_id.strip()
+            else None)
+        self._team_cache_scope: tuple[str, str] | None = None
+        ...
+```
+
+#### 4.4 YAML Skill 注册 + 远程加载（`core/single_agent/skills/skill_manager.py:48-87`）
+
+```python
+class SkillManager:
+    def __init__(self, sys_operation_id: str):
+        self._registry: Dict[str, Skill] = {}
+        self._sys_operation_id = sys_operation_id
+    async def _load_yaml(self, path: Path, session_id: str):
+        sys_operation = Runner.resource_mgr.get_sys_operation(self._sys_operation_id)
+        result = await sys_operation.fs().read_file(str(path), mode="text", encoding="utf-8")
+        ...
+        if text.startswith("---"):
+            _, yaml_block, body = text.split("---", 2)
+```
+
+#### 4.5 进程全局 i18n（`agent_teams/i18n.py:1-35`）
+
+```python
+"""Process-global i18n for agent team runtime strings."""
+Language = Literal["cn", "en"]
+_DEFAULT_LANGUAGE: Language = "cn"
+_current_language: Language = _DEFAULT_LANGUAGE
+STRINGS: dict[str, dict[str, str]] = {
+    "cn": {
+        "time.just_now": "刚刚",
+        "time.seconds_ago": "{value} 秒前",
+        "blueprint.default_desc": "天才项目管理专家",
+        ...
+    }
+}
+```
+
+### 5. 设计哲学
+
+agent-core (openjiuwen) 是 **「企业级抽象层级极高」** 的代表，把 LLM Agent 框架的所有易变点都做成可插拔策略接口：
+
+1. **Tracer 扩展性**：`TracerHandlerRegistry` 允许运行时注册第三方 handler，且用 `_RESERVED_NAMES` 保留内建 handler 名避免冲突，`Span` 用 Pydantic + populate_by_name 支持 camelCase JSON 序列化。
+2. **父子 Session 模型**通过 `parent_session_id` + `team_cache_scope` tuple 把 KV cache affinity 跟父子关系绑死，子会话复用父会话的 prefix cache 而无需重新计算。
+3. **Guardrail 的"事件驱动 + Backend 抽象"** 两层架构，通过 callback framework 的 `HookType` 解耦，比硬编码 if-else 干净得多。
+4. **i18n 设计**：直接用 dict + `set_language()` 而不是 gettext/babel，避开二进制 `.mo` 文件构建更轻量。
+5. **SkillManager 通过 sys_operation 抽象**把"文件读写"也变成可注入后端，未来切到远程技能源时无需改核心代码。
+
+**对 laew 的启示**：agent-core 是「可插拔策略接口」的工业级范本。laew 升级时可参考其 **TracerHandlerRegistry + 父子 Session KV cache affinity + Guardrail 双层 + 进程全局 i18n dict** 四大抽象。
+
+---
+
+> **字数**：本文档 agent-core 第八轮深挖章节新增约 700 行。

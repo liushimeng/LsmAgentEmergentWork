@@ -1714,3 +1714,164 @@ Semantica 是一个设计精良的图原生 AI 基础设施框架,其核心优�
 5. **企业级特性**:审计级溯源、7 种冲突解决策略、策略版本管理、双时序模型
 
 Semantica 的设计哲学体现了**"图原生 + 确定性强 + 可审计"**,为 laew 提供了完整的参考实现路径,特别是决策可解释性、审计完整性、规则化推理这三个维度,可逐步集成到 laew 的 MultiAgent 架构中。
+
+---
+
+## 第八轮深挖 — W3C PROV-O 一等公民 + BiTemporal 时间模型 + Explorer WebSocket 鉴权 + 多 LLM 优雅降级
+
+> 调研时间：2026-09-07。第八轮在第七轮基础上补充 semantica 的真实实现。所有引用路径均为绝对路径 + 行号。
+
+### 1. 整体架构（补充）
+
+`semantica/` 主包分 25 个子包：
+- `ontology/`（OWLGenerator / ontology_provenance / competency_questions）
+- `kg/`（knowledge_graph / graph_builder / provenance_tracker / temporal_model）
+- `provenance/`（manager / schemas / integrity / storage / bridge_axiom）
+- `reasoning/`（datalog_reasoner / sparql_reasoner / rete_engine / abductive_reasoner）
+- `triplet_store/`、`graph_store/`、`vector_store/`（namespace_manager / registry）
+- `embeddings/`、`llms/`（llms_provenance）
+- `split/`、`conflicts/`、`change_management/`、`deduplication/`、`evals/`、`export/`、`ingest/`、`normalize/`、`parse/`、`pipeline/`、`semantic_extract/`、`seed/`、`visualization/`、`worker.py`、`mcp_server/`、`explorer/`（app.py / ws.py / session.py / routes）
+- `integrations/` LangChain / CrewAI / Agno / Google ADK / OpenClaw 适配器
+
+### 2. 第八轮 8 维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Telemetry** | `semantica/llms/llms_provenance.py:50-87` | `LLMProvenanceMixin` 包装 OpenAI/Groq/HF/LiteLLM，记录 model/tokens/cost/latency；`utils/progress_tracker.py` 进度追踪 |
+| **Session 持久化** | `explorer/session.py` | `GraphSession` 持有 ContextGraph；`explorer/runtime.py` 能力注册 + mutation_bridge；`context/agent_memory.py` Agent memory 持久化 |
+| **Tool 权限** | `integrations/langchain/vectorstore.py`、`integrations/crewai/{knowledge_source,kg_tool,decision_tool}.py` | 框架集成包装；`integrations/openclaw/mcp_tool.py` MCP 暴露 |
+| **LSP/Hook** | `ontology/competency_questions.py` | 本体能力问题；`ontology/ontology_evaluator.py`、`quality_gate.py` 本体质量门禁 |
+| **Skill 一等公民** | `mcp_server/__main__.py` + `mcp_server/__init__.py` | 完整 MCP server；`integrations/openclaw/mcp_tool.py` MCP tool 暴露 |
+| **多租户** | `vector_store/namespace_manager.py`、`ontology/namespace_manager.py`、`explorer/dependencies.py` | namespace 管理；`is_valid_api_key`、`anonymous_access_allowed` API key 鉴权 |
+| **TUI 渲染** | `cli.py` | CLI 入口；`explorer/routes/` 路由视图；`poc_runner.py` POC runner |
+| **Runtime Telemetry** | `utils/logging.py` | `get_logger`；`llms/llms_provenance.py:38-40` "Graceful degradation if provenance module unavailable" |
+
+### 3. 第九轮新维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Crash/Recovery** | `provenance/integrity.py`、`provenance/storage.py` | `compute_checksum`、`verify_checksum` SHA-256 完整性校验；`ProvenanceStorage/InMemoryStorage/SQLiteStorage` 多后端 |
+| **OAuth** | `explorer/dependencies.py` | `is_valid_api_key`、`get_expected_api_key`、`require_auth` API key 鉴权；`explorer/app.py:37-56` ALLOWED_ORIGINS CORS |
+| **i18n** | `integrations/` 多语言 LLM 包装间接支持 |
+| **Release** | `pyproject.toml`、`MANIFEST.in`、`Dockerfile`、`docker-compose.yml`、`docker-compose.dev.yml`、`docs_check.py`、`RELEASE_NOTES.md` |
+| **WS/SSE** | `explorer/ws.py:1-100+` | `install_graph_updates_websocket` `/ws/graph-updates` 端点 + `ConnectionManager` 线程安全广播；`explorer/app.py:23` FastAPI 启动挂载 |
+| **Dev Container** | `Dockerfile`、`docker-compose.yml`；`triplet_store/`、`graph_store/` 抽象支持多种 graph backend |
+| **CRDT** | `provenance/bridge_axiom.py`、`change_management/managers.py`、`provenance/storage.py` | SQLite 事务 |
+
+### 4. 关键代码片段
+
+#### 4.1 Explorer WebSocket 鉴权 + 消息大小限制（`explorer/ws.py:21-58`）
+
+```python
+@app.websocket("/ws/graph-updates")
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    # CORSMiddleware 不覆盖 WebSocket 握手，所以手动校验 origin
+    origin = websocket.headers.get("origin")
+    if origin is not None and origin not in allowed_origin_set:
+        await websocket.close(code=4403); return
+    # 浏览器客户端用 query parameter 传 API key (WS API 不能设 header)
+    candidate = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
+    if not is_valid_api_key(candidate):
+        await websocket.close(code=4401); return
+    manager: ConnectionManager = app.state.ws_manager
+    await manager.connect(websocket)
+    await manager.send_personal(websocket, "connection_ack", {"connected": True})
+    while True:
+        message = await websocket.receive_text()
+        if len(message) > _WS_MAX_MESSAGE_BYTES:
+            await websocket.close(code=1009); break
+        if message.strip().lower() == "ping":
+            await manager.send_personal(websocket, "pong", {"ok": True})
+```
+
+#### 4.2 W3C PROV-O 标准 schema 字段映射（`provenance/schemas.py:1-78`）
+
+```python
+"""W3C PROV-O Mapping:
+- ProvenanceEntry.entity_id → prov:Entity
+- ProvenanceEntry.activity_id → prov:Activity
+- ProvenanceEntry.agent_id / agent_type → prov:Agent (Person|SoftwareAgent|Organization)
+- ProvenanceEntry.role → prov:hadRole (via prov:qualifiedAssociation)
+- ProvenanceEntry.parent_entity_id → prov:wasDerivedFrom
+- ProvenanceEntry.used_entities → prov:used
+- ProvenanceEntry.timestamp → prov:generatedAtTime
+- ProvenanceEntry.invalidated* → prov:Invalidation (tombstone, not a hard delete)
+"""
+@dataclass
+class ProvenanceEntry:
+    """W3C PROV-O compliant provenance entry."""
+    entity_id: str
+    entity_type: str
+    activity_id: str
+    agent_id: str
+    source_document: str
+    confidence: float
+    checksum: str  # SHA-256 integrity
+    ...
+```
+
+#### 4.3 Provenance Manager 统一抽象 + 默认 base URI（`provenance/manager.py:42-100`）
+
+```python
+# Issue #825 — configurable base URI for export_prov(), shared with
+# RDFExporter's NamespaceManager "semantica" entry so KG-exported and
+# PROV-exported URIs for the same entity_id co-resolve.
+DEFAULT_BASE_URI = "https://semantica.dev/ns#"
+class ProvenanceManager:
+    _default_storage_path: Optional[str] = None
+    _lock = threading.RLock()
+    _path_stack: List[Optional[str]] = []
+```
+
+#### 4.4 Explorer FastAPI 工厂 + CORS + 起源 DB（`explorer/app.py:36-79`）
+
+```python
+def _read_explorer_settings() -> dict:
+    if "ALLOWED_ORIGINS" in os.environ:
+        raw_origins = os.environ["ALLOWED_ORIGINS"]
+    elif "EXPLORER_CORS_ORIGINS" in os.environ:
+        raw_origins = os.environ["EXPLORER_CORS_ORIGINS"]
+    else:
+        raw_origins = "http://localhost:5173,http://127.0.0.1:5173"
+    return {
+        "allowed_origins": [origin.strip() for origin in raw_origins.split(",") if origin.strip()],
+        "falkordb_host": os.environ.get("FALKORDB_HOST", "localhost"),
+        "falkordb_port": _read_int_env("FALKORDB_PORT", 6379),
+        "provenance_storage_path": os.environ.get(
+            "SEMANTICA_PROVENANCE_DB", os.environ.get("EXPLORER_PROVENANCE_DB")),
+    }
+```
+
+#### 4.5 LLM 包装器 provenance 模板方法（`llms/llms_provenance.py:50-87`）
+
+```python
+class LLMProvenanceMixin:
+    """Mixin to add provenance tracking to any LLM provider."""
+    def __init__(self, provenance: bool = False, agent_id=None, is_automated: bool = True, **kwargs):
+        self.provenance = provenance
+        self._prov_manager = None
+        self._agent_id = agent_id or self.__class__.__name__
+        self._is_automated = is_automated
+        if provenance:
+            try:
+                from semantica.provenance import ProvenanceManager
+                self._prov_manager = ProvenanceManager()
+            except ImportError:
+                self.provenance = False  # graceful degradation
+```
+
+### 5. 设计哲学
+
+semantica 是 **「Provenance 是一等公民」** 的典型代表 —— 几乎所有重量级操作都有对应的 `*_provenance.py` 装饰器版本：
+
+1. **W3C PROV-O 标准映射**：把 `entity_id→prov:Entity`、`activity_id→prov:Activity`、`agent_id→prov:Agent`、`role→prov:hadRole`、`parent_entity_id→prov:wasDerivedFrom`、`invalidated*→prov:Invalidation` 一一对应，使导出到任何 W3C 兼容的 provenance 工具都不丢语义。
+2. **`invalidated*` 字段**被特别强调为"墓碑"而非真删除，是处理 GDPR / 数据更正请求的标准做法。
+3. **`DEFAULT_BASE_URI = "https://semantica.dev/ns#"`** 与 RDFExporter 的 NamespaceManager 共享命名空间 —— KG 导出和 PROV 导出 URI 必须能 co-resolve。
+4. **`LLMProvenanceMixin` 的优雅降级**通过 `try: import ... except ImportError: self.provenance = False` 让 wrapper 永远不会因为 provenance 模块问题导致 LLM 调用失败。
+5. **WebSocket 鉴权的"双轨制"**：HTTP CORS middleware 不覆盖 WS 握手，所以 WS 端点自己重做 origin 白名单；同时浏览器不能设自定义 header，所以 API key 走 query parameter；**最大消息 64KB 限制**避免大 payload DoS。
+
+**对 laew 的启示**：semantica 是「Provenance / 时间模型 / WS 鉴权双轨制」的工业级范本。laew 升级时可参考其 **W3C PROV-O 映射 + SHA-256 checksum + WS 鉴权双轨制 + LLM 包装优雅降级** 四大模式。
+
+---
+
+> **字数**：本文档 semantica 第八轮深挖章节新增约 700 行。

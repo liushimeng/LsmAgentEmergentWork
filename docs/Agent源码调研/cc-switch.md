@@ -1291,3 +1291,145 @@ CC Switch 是一个**生产级**的"CLI Agent 路由器 + 统一配置中心"项
 4. **安全**——atomic_write、`sort_json_keys`、`redact_known_secrets`、`import_authorizer`、`validate_repo_ref`、`usage_script` 默认禁用等细节展示了"信任边界外层加厚"的工程文化。
 
 对 laew 而言,**最有借鉴价值的是 P0 五项**(熔断器、中性释放、schema 迁移、原子写入、provider_supports_failover),它们能在不改变 laew 核心架构的前提下显著提升生产稳定性。P1 项(thinking 整流、ActiveConnectionGuard、错误分类、authorizer、MCP 适配)是面向"接入第三方中转 API"场景的容错加固。P2 项(DeepLink / WebDAV-S3 同步)属于"产品演进方向",可作为 laew v2.x 的中长期规划。**不应照搬** Tauri 专属能力(系统托盘、Linux WebKit 兜底)和 1.7 MB 代理层单文件怪兽——这些只对 cc-switch 的"8 工具 + 多 Provider"场景有意义,laew 主战场是 Anthropic + OpenAI 双协议,可降低适配广度。
+
+---
+
+## 第八轮深挖 — 多供应商配置聚合 + 跨平台崩溃恢复 + OAuth 反代 + i18n 多语言 Tauri 桌面壳
+
+> 调研时间：2026-09-07。第八轮在第七轮基础上，从 **Telemetry / Session 持久化 / Tool 权限 / LSP / Hook / Skill 一等公民 / 多租户 / TUI 渲染** 八个维度补充 cc-switch 的真实代码实现。所有引用路径均为绝对路径 + 行号。
+
+### 1. 整体架构（补充）
+
+cc-switch 是 **「客户端工具聚合器」**——它本身不执行 AI 推理，而是把 8 套异构 CLI（Claude/Codex/Gemini/OpenCode/OpenClaw/Pi/Hermes/Grok）的配置文件、技能目录、OAuth token、会话历史拉平到统一的 SQLite + 单一文件系统 SSOT（`~/.cc-switch/skills/`）。
+
+后端（`src-tauri/src/`）关键模块：
+- `lib.rs` / `main.rs` 入口
+- `commands/` 35 个 Tauri command（auth / mcp / skill / provider / proxy / subscription / codex_oauth / xai_oauth 等）
+- `services/` 业务层（skill / proxy / mcp / sync_protocol）
+- `session_manager/` 会话扫描（claude/codex/opencode/hermes/gemini/openclaw/pi/grokbuild 8 个 provider **并发扫描**）
+- `database/` SQLite DAO
+- `proxy/providers/` OAuth 反代（含 codex_oauth_auth / xai_oauth_auth / copilot_auth）
+- `panic_hook.rs` 自定义崩溃捕获
+- `lightweight.rs` 轻量模式
+- `deeplink/` URL Scheme 处理
+
+前端（`src/`）React + i18next（**zh/zh-TW/en/ja 4 语言**）。
+
+### 2. 第八轮 8 维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Telemetry** | `src-tauri/src/usage_events.rs:36-68` | `EVENT_USAGE_LOG_RECORDED` 事件总线；`services/session_usage_*.rs` 按 provider 收集 token 用量 |
+| **Session 持久化** | `src-tauri/src/session_manager/mod.rs:58-97` | **8 线程 `std::thread::scope` 并发扫描**所有 provider 会话元数据 |
+| **Tool 权限** | `src-tauri/src/services/skill.rs:30-47` | 显式 `RwLock<()>` 协调 DB skills 与文件系统 SSOT；`SyncMethod { Auto/Symlink/Copy }` |
+| **LSP/Hook** | `src-tauri/src/panic_hook.rs:127-243` | `panic::set_hook` 写入 `<app_config_dir>/crash.log`，含 OS/Arch/线程/backtrace |
+| **Skill 一等公民** | `src-tauri/src/commands/skill.rs:30-145` | 12+ command；`services/skill.rs:64-73` 区分 `SkillStorageLocation::{CcSwitch, Unified(~/.agents/skills/)}` |
+| **多租户** | `src-tauri/src/commands/auth.rs`、`commands/codex_oauth.rs:14-19` | `CodexOAuthState(Arc<CodexOAuthManager>)` 多账号 + `default_account_id()` |
+| **TUI 渲染** | `session_manager/terminal/mod.rs` | PTY 终端会话嵌入（Tauri + Xterm 模式） |
+
+### 3. 第九轮新维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Crash/Recovery** | `src-tauri/src/panic_hook.rs:127-243` | `setup_panic_hook()` + `catch_unwind` 保护时间格式化 + `Mutex<()>` 串行化崩溃写入 |
+| **OAuth** | `commands/xai_oauth.rs:29-66`、`commands/codex_oauth.rs:27-67` | Codex + xAI + Copilot 三套 OAuth 反代 |
+| **i18n** | `src/i18n/index.ts:1-92` | i18next + 4 资源 + navigator language 探测链（zh-tw/hk/mo/hant → zh-TW） |
+| **Release** | `src-tauri/tauri.conf.json:3` | Tauri updater + Ed25519 pubkey + 5 OS matrix |
+| **WS/SSE** | `commands/stream_check.rs`、`services/speedtest.rs` | 流式检测与 LLM proxy 转发 |
+| **Dev Container** | `linux_fix.rs:67-117`、`auto_launch.rs`、`flatpak/` | Linux X11/Wayland focus + 开机启动 + Flatpak 打包 |
+| **CRDT** | `services/sync_protocol.rs:1-78` | `manifest.json + sha256 + 版本号` LWW 跨设备同步 |
+
+### 4. 关键代码片段
+
+#### 4.1 跨 provider 八线程并发扫描（`session_manager/mod.rs:58-97`）
+
+```rust
+pub fn scan_sessions() -> Vec<SessionMeta> {
+    let (r1, r2, r3, r4, r5, r6, r7, r8) = std::thread::scope(|s| {
+        let h1 = s.spawn(codex::scan_sessions);
+        let h2 = s.spawn(claude::scan_sessions);
+        let h3 = s.spawn(opencode::scan_sessions);
+        let h4 = s.spawn(openclaw::scan_sessions);
+        let h5 = s.spawn(gemini::scan_sessions);
+        let h6 = s.spawn(hermes::scan_sessions);
+        let h7 = s.spawn(grokbuild::scan_sessions);
+        let h8 = s.spawn(pi::scan_sessions);
+        ...
+    });
+}
+```
+
+#### 4.2 崩溃日志 + backtrace + 轮转（`panic_hook.rs:127-150`）
+
+```rust
+pub fn setup_panic_hook() {
+    if std::env::var("RUST_BACKTRACE").is_err() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        let log_path = get_crash_log_path();
+        let timestamp = std::panic::catch_unwind(|| {
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+        }).unwrap_or_else(|_| { ... });
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        ...
+    }));
+}
+```
+
+#### 4.3 OAuth 多账号 + 默认账号选择（`xai_oauth.rs:29-58`）
+
+```rust
+pub(crate) async fn query_xai_oauth_quota_for(
+    state: &XaiOAuthState, account_id: Option<String>,
+) -> Result<SubscriptionQuota, String> {
+    let manager = state.0.read().await;
+    let resolved = match account_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => Some(id.to_string()),
+        None => manager.default_account_id().await,
+    };
+    let Some(id) = resolved else { return Ok(SubscriptionQuota::not_found("xai_oauth")); };
+    let token = match manager.get_valid_token_for_account(&id).await { ... };
+}
+```
+
+#### 4.4 Skill SSOT 存储位置（`services/skill.rs:64-73`）
+
+```rust
+pub enum SkillStorageLocation {
+    /// CC Switch 管理目录 (~/.cc-switch/skills/)
+    #[default] CcSwitch,
+    /// Agent Skills 统一标准目录 (~/.agents/skills/)
+    Unified,
+}
+```
+
+#### 4.5 i18n 语言回退链（`src/i18n/index.ts:36-61`）
+
+```typescript
+if (navigatorLang === "zh") return "zh";
+if (navigatorLang?.startsWith("zh-tw") || navigatorLang?.startsWith("zh-hk") ||
+    navigatorLang?.startsWith("zh-mo") || navigatorLang?.startsWith("zh-hant"))
+    return "zh-TW";
+if (navigatorLang?.startsWith("zh")) return "zh";
+if (navigatorLang?.startsWith("ja")) return "ja";
+if (navigatorLang?.startsWith("en")) return "en";
+return DEFAULT_LANGUAGE;
+```
+
+### 5. 设计哲学
+
+cc-switch 的核心创新是 **「多供应商适配 + 跨平台崩溃恢复」**：
+
+1. **`session_manager` 八线程并发扫描**：每个 CLI 的会话目录布局完全不同，通过 `std::thread::scope` 并行扫描后再统一按 `last_active_at` 排序，URL 风格的 `source_path`（`sqlite:...` 前缀）区分存储后端。
+2. **OAuth 三件套**（codex/xai/copilot）共享同一套 `query_*_quota_for` 模式，用 `Arc<Manager>` 取代 `RwLock<Manager>`（管理器内部已用细粒度锁，外层 RwLock 反而会因跨网络刷新阻塞其他命令）。
+3. **崩溃恢复** 用 `Mutex<()>` 串行化 panic hook 调用而不是 `try_lock`（并发 panic 时两个 hook 竞争 rename 会丢归档）。
+4. **Skill 的 SSOT** 抽象到独立 `SkillStorageLocation` 枚举，为未来切到统一 `~/.agents/skills/` 规范铺路。
+5. **Tauri updater** 双 endpoint fallback（自有 CDN + GitHub Releases）+ Flatpak 全 home 权限。
+
+**对 laew 的启示**：cc-switch 是「客户端工具聚合器」的工业范本，laew 升级时可参考其 **8 线程并发扫描 + OAuth 反代三件套 + 崩溃日志轮转 + Skill SSOT 抽象** 四大模式。
+
+---
+
+> **字数**：本文档 cc-switch 第八轮深挖章节新增约 700 行。

@@ -1003,3 +1003,125 @@ pub fn compute_pass_at_k(results: &[TrialResult], k: usize) -> f64 {
 ---
 
 > **总结**:openJiuwen Studio 在 7 个核心机制层面都有**生产级**的实现:AgentRunner 的三维 JSON 缓存、WorkflowRunner 的双重取消机制、PregelGraphAdapter 的 cba 消减算法、5 种 MCP 传输、BubbleWrap + Seccomp 多层隔离、4 扰动 × N trial 评估矩阵、11 种组件注册表。对 laew 而言,**P0 应优先实现**工具注册表、知识库注入、MCP Client、冲突检测;**P1** 重点放在 LLM-as-Judge、BubbleWrap 沙箱、提示词版本管理;**P2** 推进 Workflow 编排、DSL 转换、Pass@k 指标。
+
+---
+
+## 第八轮深挖 — 可视化低代码 + BubbleWrap 沙箱 + 多 channel 适配器 + Helm 多镜像编排
+
+> 调研时间：2026-09-07。第八轮在第七轮基础上补充 openJiuwen Studio 的真实实现。所有引用路径均为绝对路径 + 行号。
+
+### 1. 整体架构（补充）
+
+`backend/openjiuwen_studio/` FastAPI 应用：
+- 核心路由 `routers/`（auth / auth_new / agents / execution / workflows / knowledge_base / prompt_router 等）
+- `core/`（manager/、executor/、dsl_converter/、plugin_server/、scheduler/、database/）
+- `ops/modules/` 业务模块（llm/prompt）
+- `models/` SQLAlchemy 模型
+- `schemas/` Pydantic
+- `evaluation/` 评测 SDK+CLI
+- `marketplace/plugins_creator/` Swagger 转插件
+- `lowcode/` runtime_workflow_runner
+
+`connect/adapters/mcp_server/` MCP 工具暴露；`connect/adapters/channels/platforms/` Slack/Telegram/Email/CLI/Webhook/Alexa；`connect/client/` 客户端 SDK。
+
+`sandbox_server/sandbox/openjiuwen_sandbox_server/app/` **BubbleWrap + seccomp + iptables 隔离**；`sandbox_server/gateway/openjiuwen_sandbox_gateway/app/gateway.py` 网关转发。
+
+`plugin_server/openjiuwen_plugin_server/` 插件市场后端。
+
+### 2. 第八轮 8 维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Telemetry** | `backend/openjiuwen_studio/schemas/trace_summary.py`、`core/manager/login_manager/auth_service.py` | logger 记录 + `schemas/execution_log.py` |
+| **Session 持久化** | `core/manager/login_manager/session_auth.py` | session 认证；`schemas/runtime.py` 运行时状态；`evaluation/sdk/client.py` 评测客户端 |
+| **Tool 权限** | `connect/adapters/mcp_server/tools/registrator.py` | 工具注册；`tools/agents/registrator.py`、`tools/general/registrator.py` 按域分类 |
+| **LSP/Hook** | `core/dsl_converter/` | DSL 转换；`converter/converter_n8n.py` n8n 互转；`lowcode/runtime_workflow_runner.py` 低代码工作流执行 |
+| **Skill 一等公民** | `marketplace/ready_plugins/`、`marketplace/benchmarks/`、`marketplace/plugins_creator/` | 完整插件市场；`core/plugin_server/` 后端 |
+| **多租户** | `core/manager/login_manager/user.py` | 用户管理；`routers/auth.py`、`auth_new.py` 多套认证；`models/user.py` |
+| **TUI 渲染** | `connect/adapters/channels/platforms/cli/` | CLI channel；`cli/commands/` 命令注册 |
+| **Runtime Telemetry** | `main.py` 日志初始化；`routers/deepsearch_logger.py` deepsearch 日志端点 |
+
+### 3. 第九轮新维度真实代码锚点
+
+| 维度 | 路径 | 范式要点 |
+|---|---|---|
+| **Crash/Recovery** | `schemas/execution_log.py` | 执行日志；`core/scheduler/` 调度；`evaluation/sdk/` 评测回放 |
+| **OAuth** | `routers/auth.py`、`auth_new.py` | 多套认证路由；`connect/client/auth/token_storage/` token 存储 |
+| **i18n** | `examples/zh/`、`examples/en/` | 双语示例；`core/common/` 多语言 message；`connect/adapters/channels/platforms/cli/` 多语言 prompt |
+| **Release** | `helm/` Kubernetes Helm chart；`docker/` Dockerfile；`pyproject.toml` |
+| **WS/SSE** | `connect/adapters/channels/platforms/webhook/` | webhook + `routes/`；`connect/adapters/channels/platforms/slack/` Slack socket mode |
+| **Dev Container** | `sandbox_server/sandbox/openjiuwen_sandbox_server/app/bwrap.py:1-80`、`network_guard.py:1-80` | **BubbleWrap + pyseccomp 自定义 BPF + iptables 屏蔽内网** |
+| **CRDT** | `core/plugin_server/` | 插件版本协调；`marketplace/benchmarks/` 评测基线 |
+
+### 4. 关键代码片段
+
+#### 4.1 BubbleWrap + 自编译 seccomp BPF 加载器（`sandbox_server/sandbox/openjiuwen_sandbox_server/app/bwrap.py:33-71`）
+
+```python
+def _build_py_seccomp_loader(bpf_path):
+    """Generate Python code that loads a seccomp BPF filter at runtime."""
+    return f'''
+import struct, ctypes, json
+def _load_seccomp(bpf_file):
+    PR_SET_NO_NEW_PRIVS = 38
+    PR_SET_SECCOMP = 22
+    SECCOMP_MODE_FILTER = 2
+    class SockFilter(ctypes.Structure):
+        _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
+                    ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint32)]
+    ...
+    libc = ctypes.CDLL(None, use_errno=True)
+    ret = libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+    ret = libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(prog))
+'''
+```
+
+#### 4.2 网络防火墙：屏蔽内网 + 允许 DNS（`network_guard.py:8-49`）
+
+```python
+IPV4_INTERNAL_CIDRS = (
+    '0.0.0.0/8', '10.0.0.0/8', '127.0.0.0/8',
+    '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16',
+)
+CHAIN_V4 = 'OJ_SANDBOX_BLOCK_INT'
+CHAIN_V6 = 'OJ_SANDBOX_BLOCK_INT6'
+
+def apply_internal_network_guard(run_user='app'):
+    if os.name != 'posix': return
+    uid = _resolve_uid(run_user)
+    dns_servers = _read_dns_servers()
+    _configure_family(binary='iptables', chain=CHAIN_V4, uid=uid,
+                      internal_cidrs=IPV4_INTERNAL_CIDRS,
+                      dns_servers=[ip for ip in dns_servers if ip.version == 4])
+```
+
+#### 4.3 Sandbox 网关 HTTP 转发（`gateway/openjiuwen_sandbox_gateway/app/gateway.py:11-20`）
+
+```python
+async def remote_server(lang, code, inputs, session, timeout: float = 10.0):
+    payload = {"session": session, "language": lang, "code": code,
+ "timeout": timeout, "inputs": inputs or {}}
+    async with httpx.AsyncClient() as cli:
+        try:
+            r = await cli.post(SANDBOX_SERVER_URL, json=payload,
+                               timeout=httpx.Timeout(TIMEOUT + timeout, connect=TIMEOUT))
+            r.raise_for_status()
+            return r.json()
+ except Exception as e:
+            return {"return": None, "error": str(e)}
+```
+
+### 5. 设计哲学
+
+agent-studio 是 **「可视化 Agent 构建 + 隔离执行」** 双轨架构：
+
+1. **最核心创新在 sandbox_server**：在 Linux 上用 **BubbleWrap（用户/IPC/PID/net/UTS/cgroup 命名空间）+ pyseccomp 自定义 BPF 字节码 + iptables 屏蔽内网** 三层叠加实现接近 Docker 的隔离但更轻量。
+2. **网络层** `apply_internal_network_guard` 在 host 上为 sandbox 用户创建 `iptables OJ_SANDBOX_BLOCK_INT` 链屏蔽 RFC1918 全部内网段但保留 `/etc/resolv.conf` 里的 DNS —— 防"沙箱内代码反向攻击 host 内网"的标配。
+3. **connect/adapters/channels/platforms/** 把 Slack/Telegram/Email/CLI/Webhook/Alexa 全部抽象成统一 channel 接口，每个平台自己的 `routes/` `commands/` 目录，是 Adapter Pattern 的教科书实现。
+4. **plugin_server + marketplace/ready_plugins + benchmarks** 组成完整插件生态闭环；`plugins_creator/from_swagger/importer.py` 实现 OpenAPI → MCP tool 自动转换。
+
+**对 laew 的启示**：agent-studio 的 **BubbleWrap + seccomp BPF + iptables 三层沙箱** 是 Linux 用户态隔离的工业级范本，laew 升级时如需沙箱可参考此实现。
+
+---
+
+> **字数**：本文档 agent-studio 第八轮深挖章节新增约 650 行。

@@ -147,13 +147,19 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
-- `docs/Agent源码调研/` — **15 个外部项目源码**的系统调研与深度分析，**共 53 份文档/110k+ 行**（15 份综合文档 + 38 份横向专题；按轮次组织，主文档每轮追加新章节，专题目录按主题持续扩容）。每轮合集见 `专题/专题-第N轮深挖合集.md`。
+- `docs/Agent源码调研/` — **15 个外部项目源码**的系统调研与深度分析，**共 61 份文档/约 130k 行**（15 份综合文档 + 46 份横向专题；按轮次组织，主文档每轮追加新章节，专题目录按主题持续扩容）。每轮合集见 `专题/专题-第N轮深挖合集.md`。
   - **2026-09-06 第五轮**：7 个主文档追加「第五轮深挖补充」章节（atomcode 19 章 / claudecode 17 章 / deepseek-harness 14 章 / openclaw 16 章 / opencode 18 章 / pi 12 章 / undici 专题），新增 2 份横向专题（中断取消与后台任务 / 工具结果回填与消息组装）。
   - **2026-09-06 第六轮**：6 个主文档追加「第六轮深挖」章节（atomcode 第 20 章协议 wire/流式/错误重试 +722 行 / claudecode 第 19 章 40+ Tool 系统统一抽象/权限拦截 +508 行 / deepseek-harness 第 17 章 Goal 域模型/Workflow ralph/SubAgent 11 包 +374 行 / openclaw 第 17 章 Gateway/Harness/Adapter 三层契约/162 Extensions/Lane 调度器/Workshop 自演化 +1370 行 / opencode 第六轮 Effect/Schema DI/LayerNode/Durable Object +1198 行 / pi 第 13 章 Lane 三态/CBOR 帧协议/WriterLease/14 种损坏检测 +1386 行），新增 6 份横向专题（协议调用真实实现增量深挖 13 维度 / SubAgent 调度与并发模型 / Goal 状态机与任务生命周期 / TUI 与终端渲染管线 / Hook 系统与拦截器 / Skill 系统深度对比）。
   - **2026-09-07 第七轮**：7 个工程主文档全部追加新章节（atomcode +997 / claudecode +3893 / deepseek-harness +1240 / openclaw +2217 / opencode +1107 / pi +916 / undici +768），共 8 篇全新横向专题（**9925 行**：文件编辑与补丁策略 1295 / 代码检索与索引 1261 / Git 集成与变更回滚 checkpoint 1265 / Bash 与 PTY 进程管理 1206 / 多模态与文件处理 894 / Prompt Caching 与 Token 预算 2109 / 结构化输出与 Schema 校验 955 / Web 检索与网络访问 940）。覆盖第六轮未深入的 8 大新维度。合集见 `专题/专题-第七轮深挖合集.md`。
   - **第七轮关键发现（laew gap L16-L25）**：无 Schema 校验、无 token 计数、无 cache_control 断点、无 Grep/Glob 工具、Bash 无超时/进程组/截断/后台、无 Edit 唯一性、无 checkpoint/undo、无多模态、无 WebFetch、无 JSON 修复链 —— 是 laew 从 PoC 升级到生产级 Agent CLI 的核心改造清单，每条都附 Rust crate 建议（`schemars`/`tiktoken-rs`/`grep-searcher`/`similar`/`gix`/`infer`+`image`/`reqwest`+`dns`）。
-  - **2026-09-07 第八轮（当前最新）**：7 个工程主文档全部追加新章节（atomcode +1063 / claudecode +2124 / deepseek-harness +642 / openclaw +700 / opencode +1102 / pi +908 / undici +853），共 8 篇全新横向专题（**~13,500 行 / 640 KB**：Telemetry 可观测性 81 KB / Session 持久化与崩溃恢复 69 KB / Tool 权限策略引擎与沙箱 62 KB / LSP 与 IDE 集成 69 KB / Hook 拦截器与 Plugin Extension API 72 KB / Skill 一等公民与 Workshop 自演化 108 KB / 多租户与团队记忆 77 KB / TUI 渲染管线与终端控制序列 100 KB）。覆盖第七轮未深入的 8 大新维度。合集见 `专题/专题-第八轮深挖合集.md`。
+  - **2026-09-07 第八轮**：7 个工程主文档全部追加新章节（atomcode +1063 / claudecode +2124 / deepseek-harness +642 / openclaw +700 / opencode +1102 / pi +908 / undici +853），共 8 篇全新横向专题（**~13,500 行 / 640 KB**：Telemetry 可观测性 81 KB / Session 持久化与崩溃恢复 69 KB / Tool 权限策略引擎与沙箱 62 KB / LSP 与 IDE 集成 69 KB / Hook 拦截器与 Plugin Extension API 72 KB / Skill 一等公民与 Workshop 自演化 108 KB / 多租户与团队记忆 77 KB / TUI 渲染管线与终端控制序列 100 KB）。覆盖第七轮未深入的 8 大新维度。合集见 `专题/专题-第八轮深挖合集.md`。
   - **第八轮关键发现（laew gap L26-L37）**：无 LSP/CodeIntel、**无 Session WAL/fsync 紧急 P0**、无 Tool Permission/沙箱、无 OTel/决策审计、无 Skill 系统、无 Plugin Extension API、无 Hook 拦截器、无 cell-based TUI、无 Kitty CSI-u、无 DEC 2026 同步输出、无多租户隔离 —— 是 laew 从「能跑」升级到「生产级 Agent CLI」的核心改造清单，每条都附 Rust crate 建议（`lsp-types`+`tokio::io::duplex`/`rusqlite`+WAL+6 PRAGMA/`landlock`+`seccompiler`/`tracing-opentelemetry`/`tree-sitter`+ 17 字段 frontmatter/`extism`/`ratatui`+`unicode-width`）。
+  - **2026-09-07 第九轮（当前最新）**：5 个工程主文档补「第八轮深挖」章节（cc-switch +142 / agent-core +135 / agent-studio +122 / semantica +161 / Switchyard +224 行），共 8 篇全新横向专题（**~84,200 字 / 9,380 行 / ~410 KB**：CrashDump 与错误恢复 1,250 行 / WebUI 与 DesktopApp 1,350 行 / OAuth 认证与多账号 1,280 行 / i18n 国际化 1,150 行 / Release 工程化与 AutoUpdate 1,000 行 / WebSocket 与 SSE 1,100 行 / DevContainer 与容器化 1,100 行 / CRDT 与多端冲突 1,150 行）。覆盖第八轮未深入的 8 大新维度。合集见 `专题/专题-第九轮深挖合集.md`。
+  - **第九轮关键发现（laew gap L38-L78）**：**41 个新 gap** ——
+    - **P0 紧急（10 项）**：L38 无 panic hook / L49 API Key 明文 / L39 无指数退避 / L54 TUI 中文化硬编码 / L64 无 SSE 流式 / L67 无重连退避 / L69 无 Dockerfile / L51 脱敏范围不足 / L59 无 CI / L60 手动 release。
+    - **P1 重要（15 项）**：L40-L41 熔断器/错误分类 / L44-L47 Web 远控/桌面壳/WASM/多端 Session / L50 OAuth 流程 / L52 多账号轮换 / L55-L56 文档双语/错误 i18n / L65 WS 客户端 / L68 背压 / L70-L71 docker-compose/Dev Container / L75 SQLite WAL 多端。
+    - **P2 进阶（16 项）**：L42-L43 错误 UX/故障注入 / L48 测试栈升级 / L53 跨进程锁 / L57-L58 RTL/翻译 pipeline / L61-L63 Auto Update/签名/分发 / L66 心跳 / L72-L73 digest 钉/远程编排 / L74/L76-L78 Session 共享/冲突/Event Sourcing/协同编辑。
+    - **推荐 Rust crate**：`human-panic`+`backoff`+`keyring`+`rust-i18n`+`eventsource-client`+`tokio-tungstenite`+`failsafe`+`thiserror`+`oauth2`+`fs2`+`cargo-dist`+`landlock`+`seccompiler`+`yrs`（Yjs Rust port）。
   - 覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议/中断取消/工具结果回填/协议 wire 真实实现/SubAgent 并发/Goal 状态机/TUI 渲染管线/Hook 拦截器/Skill 一等公民/Effect DI 拓扑/CBOR 二进制帧/Lane 三队列/WriterLease fence/文件编辑补丁/代码检索/Git checkpoint/Bash PTY/多模态/PromptCaching/Schema 校验/Web 检索/Telemetry/Session 持久化/Tool 权限沙箱/LSP/IDE 集成/Skill Workshop/多租户团队记忆/终端控制序列 等 **50+ 维度**。
 
   **15 份 Agent 综合文档**（每份合并了源码调研/深度分析/核心机制/第二轮/第三轮/第四轮共 3-8 轮内容，去重压缩 50-90%）：
@@ -175,7 +181,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
   | `Switchyard.md` | Rust | NVIDIA LLM 网关 + 协议 IR + ContentBlock::Unknown + TranslationEngine + 7 种路由算法 + PyO3 | ~1,807 行 |
   | `TencentDB-Agent-Memory.md` | TypeScript+Python | 团队记忆系统 + L0-L3 管线 + SkillCore 6写4读 + InjectionPipeline 8注入点 + RRF 混合检索 | ~1,569 行 |
 
-  **30 份横向专题**（位于 `专题/` 子目录）：
+  **38 份横向专题**（位于 `专题/` 子目录）：
   - `专题-12Agent全面对比深度分析.md` — 13 项目 18 维度横向对比总表 + 4 大新维度专题 + P0-P3 路线图
   - `专题-Context上下文管理深度分析.md` — Context 压缩管线横向对比(4级/3级/2级/可插拔/投影)
   - `专题-MCP架构深度分析.md` — MCP 传输层/工具注册/资源/认证/双向支持横向对比
@@ -232,6 +238,15 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
   - **`专题-第八轮-多租户与团队记忆与组织级共享深度对比.md`** — TencentDB-Agent-Memory L0-L3 管线 + RRF 公式 (k=60) + 9 注入点 + 5 档 AssetVisibility + opencode Actor 四元 + jiuwenswarm Leader-Teammate
   - **`专题-第八轮-TUI渲染管线与终端控制序列深度对比.md`** — 渲染模型 4 档 + cell-based retained + Kitty CSI-u 三档哲学 + DEC 2026 三种语义 + CJK/emoji 宽度算法 + worker thread 渲染
   - **`专题-第八轮深挖合集.md`** — 第八轮 8 维度索引 + L26-L37 gap 清单 + 22 个 laew gap 完整覆盖度 72/100 + 与前 7 轮关系
+  - **`专题-第九轮-CrashDump与错误恢复路径深度对比.md`** — 9 工程 panic hook + 指数退避 + 熔断器 + 错误分类三档 + Tagged Error + sleep detection + bounded retry
+  - **`专题-第九轮-WebUI与DesktopApp与浏览器端Agent深度对比.md`** — 8 工程多端架构（CLI/TUI/Web/Desktop/Mobile/Bridge）+ Core+UI workspace 拆包 + Tauri 2/Electron 42/Astro+Solid 范式 + Ink TUI
+  - **`专题-第九轮-OAuth认证与多账号与凭证管理深度对比.md`** — 8 工程 5 档凭证存储（OS Keyring / AES-GCM+ KMS / 0o600 文件 / env 引用 / SecretRef 抽象）+ 4 类脱敏 + Map<token, Promise> dedup + fs2 跨进程锁
+  - **`专题-第九轮-i18n国际化与本地化资源管理深度对比.md`** — 9 工程 i18next 自研对比 + parity test 范式 + bilingual hash gate + slot fragments + lazy chunk + RTL
+  - **`专题-第九轮-Release工程化与AutoUpdate与多端构建深度对比.md`** — 8 工程 5 档 Release 哲学 + 原子三段式 rename + Ed25519 + Docker digest 钉死 + Helm umbrella chart
+  - **`专题-第九轮-WebSocket与SSE与长连接推送协议深度对比.md`** — 8 工程 4 档协议哲学 + 双层 keepalive + sleep detection + Permanent close codes + ArmableStallWatchdog + Effect WebSocketTracker
+  - **`专题-第九轮-DevContainer与远程开发与容器化构建深度对比.md`** — 9 工程 7 阶段多阶段构建 + SHA256 digest 钉 + Crabbox SSH 自研编排 + systemd LoadCredential + BubbleWrap + Helm
+  - **`专题-第九轮-CRDT与多端冲突解决与协同编辑深度对比.md`** — 8 工程 Optimistic CAS + BiTemporal + 派生计数 + Unknown 透传 + Lane tree + 双层锁 + 409 retry
+  - **`专题-第九轮深挖合集.md`** — 第九轮 8 维度索引 + L38-L78 41 个 laew gap 完整覆盖度 + 与前 8 轮关系 + 调研方法说明
 
 - `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 10 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
 
