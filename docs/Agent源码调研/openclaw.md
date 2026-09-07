@@ -4589,3 +4589,703 @@ const MAX_ADVERTISED_ATTACHMENT_BYTES = Math.floor(((MAX_PAYLOAD_BYTES - WS_FRAM
 | **P2** | **< 1KB 音频不调转写**,避免空跑;视频 base64 展开 70MB 上限 | `defaults.ts:38,44` | 无 |
 | **P2** | **暂存目录写内容哈希 `.gitignore`**(避免附件污染仓库 diff + 跨 worktree 复活) | `staged-inputs.ts:6-12,140-147` | 无 |
 
+---
+
+## 19. 第八轮深挖 — Custodian Skills 运维 Playbook + 多端部署 + Taxonomy 分类体系 + Security 漏洞响应(2026-09-07)
+
+> 本轮聚焦 **「工程的运维生命周期」**:从 Agent 在用户手里写 prompt,到 *作者自己* 如何维护 Agent —— 怎么给新接入点写剧本、怎么打包到 Docker / Render / Fly.io、怎么把整套工程的子系统做标签画像、怎么安全地接收漏洞报告并落地回归。
+> 这是对第七轮「Agent 内置能力」的镜像切面 —— **看 openclaw 团队自己怎么吃自己狗粮**。
+
+### 19.1 Custodian Skills — 运维 Playbook 五阶段剧本
+
+#### 19.1.1 仓库内的 4 个 Custodian Skill
+
+openclaw 把 *运维操作本身* 也建模成 **Skill(技能)**,放在仓库顶层 `custodian-skills/` 目录,只有 4 个:
+
+```text
+/usr/local/LsmGitOpenSource/openclaw/custodian-skills/
+├── add-model-provider/SKILL.md        # 4211 字节,5 阶段
+├── cloud-image-bake/SKILL.md          # 3906 字节,5 阶段
+├── configure-channel/SKILL.md         # 3793 字节,5 阶段
+└── diagnose-gateway/SKILL.md          # 2683 字节,4 阶段(无 Mutate)
+```
+
+每个 `SKILL.md` 都以 YAML frontmatter 开头(name + description),让 Skill 发现器 / TUI 列出。这是 **「Custodian(管理员/守夜人)」** 的 Skill —— 与 `skills/` 下用户级 Skill 的区别是:**它指导人类(或 LLM)如何「维护」openclaw 本身**,而不是用 openclaw 完成任务。
+
+#### 19.1.2 五阶段统一骨架
+
+4 个 Skill 都遵循同一个 5 阶段剧本骨架(Gather / Mutate / Repair / Prove / Report),其中 `diagnose-gateway` 把 Mutate 替换成"Nothing"(只读),变成 4 阶段。骨架以 `add-model-provider/SKILL.md` 为范本:
+
+```markdown
+# add-model-provider/SKILL.md(摘录)
+---
+name: add-model-provider
+description: Add and live-prove a model provider with non-interactive config
+  one-liners, without exposing credentials.
+---
+
+## Gather        # 只读侦察 + 预先打开 schema 检查
+## Mutate        # 通过 openclaw config 写入,严禁手改磁盘
+## Repair        # doctor --lint 报告修复,需 operator 显式 approve --fix
+## Prove         # 跑一条最小可观测探针(单轮对话/拉起 lease)
+## Report        # 结构化输出:哪些 key 改了,SecretRef owner 是什么,延迟多少
+```
+
+每个阶段都有 **强约束规则**(在文档正文之前用粗体强调):
+
+> **Never print or persist secret values; credentials enter config only as SecretRefs (env or file source). Never hand-edit config files on disk — every mutation goes through `openclaw config` so it is validated and audited. Every run ends with the observable Prove result or an exact explanation of why it could not be proven.**
+
+这是 **「副作用三约束」**:① 不打印密文 → ② 不直接编辑磁盘 → ③ Prove 必须可观测失败可解释。
+
+#### 19.1.3 Mutate 阶段的 SecretRef 三件套
+
+`add-model-provider/SKILL.md:29-34` 给出 `openclaw config set` 的 *完整参数形式*:
+
+```text
+openclaw config set secrets.providers.<name>_key_file \
+    --provider-source file \
+    --provider-path /path/to/<name>.key \
+    --provider-mode singleValue \
+    --dry-run                              # 先 dry-run,再真写
+
+openclaw config set models.providers.<id>.apiKey \
+    --ref-provider <name>_key_file \
+    --ref-source file \
+    --ref-id value                         # ref-* 三件套指向 SecretRef
+```
+
+三个 `--ref-*` 参数在 laew 当前 `LsmAgentEmergentWork.db providers` 表里 **完全没有** —— laew 直接把 api_key 明文落表。这是个 **P0 借鉴项**(详见 19.5)。
+
+`configure-channel/SKILL.md:48-50` 用同样模式演示批量 patch:
+
+```text
+openclaw config patch --stdin <<'JSON'
+{ channels: { telegram: { enabled: true, groupPolicy: "allowlist" } } }
+JSON
+```
+
+一次调用修改多个字段,而不是多次 `config set`。
+
+#### 19.1.4 Prove 阶段:可观测探针协议
+
+每个 Skill 的 Prove 都是 **「一条最小命令 + 期望可断言字符串」**,例如:
+
+- `add-model-provider`: `openclaw agent --agent <id> --model openai/gpt-5.4 -m "Reply with exactly: PROVIDER-PROOF-OK"`(add-model-provider/SKILL.md:57)
+- `cloud-image-bake`: 对比 `crabbox warmup --timing-json` 前后数字(cloud-image-bake/SKILL.md:60)
+- `configure-channel`: `openclaw message send --channel telegram --target <chatId> --message "OpenClaw channel test — please ignore"`(configure-channel/SKILL.md:67)
+- `diagnose-gateway`: 重复 `gateway status --deep`(只读探针)
+
+**关键设计:每个 Prove 都先 `--dry-run` 再真跑**(configure-channel/SKILL.md:66),**真跑后必须打印可观测结果**(交付字符串 / 延迟 / 探活码),否则判定「无法证明」并报告 blocker。
+
+#### 19.1.5 Repair 阶段的 `--lint` / `--fix` 分级
+
+4 个 Skill 都在 Repair 阶段调用 `openclaw doctor --lint`(只读,exit 1 仅表示有 findings),**而不是** `doctor --fix --non-interactive`(会改磁盘)。这是因为 `--fix` 需要 operator 显式授权:
+
+```text
+# 错误路径(不应自动执行)
+openclaw doctor --fix --non-interactive
+
+# 正确路径(在 Mutate 之外单独 approve)
+$ ... 得到 operator approve ...
+openclaw doctor --fix --non-interactive
+$ ... re-read profile, re-probe ...
+```
+
+**注意 4 个 Skill 都在 Repair 段用同一句话警告**:`doctor --lint can exit 1 for findings: read the report and continue the remaining checks. Ordinary doctor and doctor --non-interactive can write config/state; do not use them for diagnosis before approval.` —— 这是把 *「Read-Only 默认」+ 显式授权才 Mutate* 写进运维剧本的范本。
+
+#### 19.1.6 diagnose-gateway:唯一只读剧本的特殊性
+
+`diagnose-gateway/SKILL.md` 是 *唯一* 没有 Mutate 阶段的剧本 —— 它的 Mutate 段直接写:
+
+```markdown
+## Mutate
+Nothing. Do not change config, migrate state, or alter services. Diagnostic
+commands may still produce incidental logs or cache bookkeeping.
+```
+
+并要求 *翻译 findings → 下一步应该跳到哪个 Skill*(add-model-provider / configure-channel / cloud-image-bake),**形成 Skill 之间的「路由调用图」**。
+
+#### 19.1.7 Custodian Skill 与普通 Skill 的本质区别
+
+| 维度 | `skills/` 普通 Skill | `custodian-skills/` 运维 Skill |
+| --- | --- | --- |
+| 消费者 | Agent(LLM) | 人类(或 LLM)维护者 |
+| 触发 | 用户在对话中调 `/skill <name>` | 开发者手动 `cat SKILL.md` 或被 LLM 读到 |
+| 阶段骨架 | 自定义 | 强制 Gather/Mutate/Repair/Prove/Report |
+| SecretRef | 可选 | 必选(env / file 单值) |
+| Mutate 方式 | 调工具 | **必须** `openclaw config set --ref-*` |
+| 失败反馈 | 工具错误 | 必须报告 blocker + 下一步命令 |
+
+**这是把 SRE runbook 写成了 SKILL.md —— 不是 Markdown 散文,是机器可执行的剧本**。laew 目前只有 `skills/`(工作 Skill),没有 `custodian-skills/`(维护 Skill),是个 *范式级缺失*(详见 19.5 P0)。
+
+### 19.2 多端部署 — Docker / Render / Fly.io
+
+#### 19.2.1 Dockerfile:7 阶段多阶段构建
+
+`/usr/local/LsmGitOpenSource/openclaw/Dockerfile`(442 行)是最完整的工程级示例。7 个 FROM 阶段:
+
+```text
+1. workspace-deps        (node:24-bookworm)            # 只抽 package.json,缓存友好
+2. dependency-inputs      (node:24-bookworm)            # pnpm 依赖 manifest 准备
+3. production-deps        (dependency-inputs)           # pnpm install --prod
+4. build                  (oven/bun:1.4.0)              # 引入 bun binary + pnpm install + 编译
+5. runtime-build-output   (build)                       # rm dev deps,保留 dist
+6. runtime-assets         (production-deps)             # 把编译产物合并到生产 deps 上
+7. base-runtime           (node:24-bookworm-slim)       # 真正运行的最小基础镜像
+```
+
+最终运行阶段(Dockerfile:217-441)用 **bookworm-slim** + 手动 `apt-get install ca-certificates curl git hostname libgomp1 lsof openssh-client openssl procps python3 tini`,并 `USER node` 降权。
+
+#### 19.2.2 关键构建参数(SHA256 锁版本)
+
+```dockerfile
+# Dockerfile:16-21 — 基础镜像全部用 SHA256 digest 钉死
+ARG OPENCLAW_NODE_BOOKWORM_IMAGE="docker.io/library/node:24-bookworm@sha256:934240a162082..."
+ARG OPENCLAW_NODE_BOOKWORM_SLIM_IMAGE="docker.io/library/node:24-bookworm-slim@sha256:3638d9a6..."
+ARG OPENCLAW_BUN_IMAGE="docker.io/oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a9720..."
+```
+
+Dependabot 自动刷新这些 digest(Dockerfile:23-28 注释)。这是 *reproducible build* 的工业实践 —— laew 当前 `./rebuild_restart_app.sh` 每次 `cargo build` 都可能拉到不同依赖版本。
+
+#### 19.2.3 Docker APT GPG 指纹校验(Dockerfile:362-394)
+
+```dockerfile
+ARG OPENCLAW_DOCKER_GPG_FINGERPRINT="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+# ... 校验:
+expected_fingerprint="$(printf '%s' "$OPENCLAW_DOCKER_GPG_FINGERPRINT" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+docker_gpg_pub_count="$(gpg --batch --show-keys --with-colons /tmp/docker.gpg.asc | awk -F: '$1 == "pub" { c++ } END { print c+0 }')"
+if [ "$docker_gpg_pub_count" != "1" ]; then
+    echo "ERROR: Docker apt key must contain exactly one public key (found $docker_gpg_pub_count)" >&2
+    exit 1
+fi
+actual_fingerprint="$(gpg --batch --show-keys --with-colons /tmp/docker.gpg.asc | awk -F: '$1 == "fpr" { print toupper($10); exit }')"
+if [ -z "$actual_fingerprint" ] || [ "$actual_fingerprint" != "$expected_fingerprint" ]; then
+    echo "ERROR: Docker apt key fingerprint mismatch" >&2
+    exit 1
+fi
+```
+
+**三层防线**:① 强制只能有 1 个 primary key(防多 key 注入) → ② 比对 fingerprint(防 key 替换) → ③ 用变量注入,方便 rotate。laew 当前 `./rebuild_restart_app.sh` 用 `cargo` 拉 crates,没有这种镜像签名验证。
+
+#### 19.2.4 docker-compose.yml:双服务分层
+
+`/usr/local/LsmGitOpenSource/openclaw/docker-compose.yml`(136 行)定义两个服务:
+
+```yaml
+services:
+  openclaw-gateway:                # 主服务,绑端口 18789/18790/3978
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    cap_drop: [NET_RAW, NET_ADMIN]   # 关键:剥权
+    security_opt: [no-new-privileges:true]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    healthcheck:
+      test: ["CMD", "node", "dist/docker-healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  openclaw-cli:                    # 调试用,共享 gateway 网络栈
+    network_mode: "service:openclaw-gateway"
+    cap_drop: [NET_RAW, NET_ADMIN]
+    security_opt: [no-new-privileges:true]
+    stdin_open: true
+    tty: true
+```
+
+**核心安全姿态**:cap_drop + no-new-privileges + 非 root 镜像用户(node:24-bookworm 内置 uid 1000)。注释还提到 `#77436 issue` 的 macOS 路径泄漏 → 通过在 compose 文件里显式覆盖 `OPENCLAW_STATE_DIR` / `OPENCLAW_CONFIG_PATH` 避免 macOS host 路径污染容器内运行时解析。
+
+#### 19.2.5 Render Blueprint:5 行基础设施
+
+`/usr/local/LsmGitOpenSource/openclaw/render.yaml`(24 行):
+
+```yaml
+services:
+  - type: web
+    name: openclaw
+    runtime: docker
+    plan: starter
+    dockerCommand: node openclaw.mjs gateway --allow-unconfigured
+    healthCheckPath: /startupz
+    envVars:
+      - key: OPENCLAW_GATEWAY_PORT
+        value: "8080"
+      - key: OPENCLAW_GATEWAY_TOKEN
+        generateValue: true       # 自动生成,不写明文
+    disk:
+      name: openclaw-data
+      mountPath: /data
+      sizeGB: 1
+```
+
+**亮点**:① `generateValue: true` 让 Render 平台自动注入 Token(等同 `secrets` manager);② `healthCheckPath: /startupz` 是 Gateway 自身暴露的 startup probe(SECURITY.md:435 注释)。
+
+#### 19.2.6 Fly.io 双配置:公开 + 私有
+
+仓库根有两个 `fly.toml`:
+
+| 文件 | 行数 | 用途 |
+| --- | --- | --- |
+| `fly.toml` | 42 | 标准部署,带 `http_service` 块,公开入口 |
+| `deploy/fly.private.toml` | 40 | **无 `[http_service]` 块**,仅 WireGuard / fly proxy 访问 |
+
+`fly.toml:20-26`:
+
+```toml
+[http_service]
+internal_port = 3000
+force_https = true
+auto_stop_machines = false
+auto_start_machines = true
+min_machines_running = 1
+processes = ["app"]
+
+[[http_service.checks]]
+grace_period = "2m"
+interval = "15s"
+method = "GET"
+timeout = "5s"
+path = "/startupz"
+```
+
+`deploy/fly.private.toml:27-31`(注释):
+
+```text
+# NOTE: No [http_service] block = no public ingress allocated.
+# The gateway will only be accessible via:
+#   - fly proxy 3000:3000 -a <app-name>
+#   - fly wireguard (then access via internal IPv6)
+#   - fly ssh console
+```
+
+**这是「同一份代码,两份部署 manifest,公开/私有物隔离」** 的范本 —— Fly.io 平台通过 *缺省配置* 表达安全姿态(私有模式)。
+
+#### 19.2.7 7 阶段 build 阶段的副作用:Native Addon 校验
+
+Dockerfile:98、118 各有一行 `RUN sh scripts/docker/verify-native-addons.sh` —— 在 *生产依赖* 和 *构建阶段* 之后都跑一次 native addon 完整性校验,防止 OverlayFS 在跨架构场景下出现坏文件。
+
+#### 19.2.8 多端形态对比表
+
+| 部署目标 | 配置入口 | 公开访问 | 鉴权 | 健康检查 | 镜像源 |
+| --- | --- | --- | --- | --- | --- |
+| Docker 本地 | `docker run` / `docker-compose.yml` | 由 `--network` 决定 | 需 `--bind lan` + token | `HEALTHCHECK CMD node dist/docker-healthcheck.js` | 本地 build |
+| Render | `render.yaml` Blueprint | 公共 URL | `OPENCLAW_GATEWAY_TOKEN generateValue` | `/startupz` | Docker image |
+| Fly.io 公开 | `fly.toml` | `force_https` 公共入口 | 平台 proxy | `/startupz` (15s 间隔) | Docker image |
+| Fly.io 私有 | `deploy/fly.private.toml` | **无 http_service** | 仅 WireGuard / fly proxy | (无 http checks) | Docker image |
+
+### 19.3 Taxonomy — 工程的子系统标签画像
+
+#### 19.3.1 taxonomy.yaml 的本质:打分画像元模型
+
+`/usr/local/LsmGitOpenSource/openclaw/taxonomy.yaml`(11578 行)是个 **「工程成熟度打分画像」元模型**,不是简单分类。文件头(taxonomy.yaml:1-7):
+
+```yaml
+version: 1
+process_version: 3
+title: Maturity scorecard
+summary: Draft maturity scorecard model for OpenClaw subsystems, features, apps,
+  and platforms.
+snapshot:
+  date: "2026-05-26"
+  source_ref: origin/main@41eef4a7965
+```
+
+注意 `snapshot.source_ref` —— 这是把当前 main 分支的某次 commit 钉成 *基准快照*,所有 profile 的 coverage 都基于此 commit 评分。
+
+#### 19.3.2 profiles:四种部署形态 × 不同 coverage
+
+profiles 字段(19.3.1 节节选)定义了 4 种典型部署形态的「该跑哪条 coverage 路径」:
+
+```yaml
+profiles:
+  - id: smoke-ci
+    description: Deterministic PR and merge proof with mock model providers
+      and the Crabline-backed channel driver
+    evidenceMode: slim
+    channelDriver: crabline
+    coverageIds:
+      - agent-runtime.runtime-override-switching
+      - agent-runtime.subagent-turns-delivery
+      ...
+      - telegram.built-in-commands        # 仅 13 项
+
+  - id: personal-agent
+    coverageIds:
+      - agent-runtime.failure-recovery
+      - agent-runtime.progress-visibility-no-fake-progress
+      ...
+      - session-memory.personal-memory-recall  # 10 项
+
+  - id: observability
+    coverageIds:
+      - observability.otlp-http-traces-otel
+      - observability.prometheus
+      - observability.prometheus-api-auth    # 3 项,极窄
+
+  - id: release
+    channelDriver: live                     # 注意:不再 mock!
+    categoryIds:                            # 用大类 ID 而非具体 coverage
+      - gateway.approvals-and-remote-execution
+      - gateway.http-apis
+      - cli.cli-setup
+      - plugins.bundled-plugins
+      - agent-runtime.agent-turn-execution
+      ...                                    # 100+ 大类,几乎覆盖整个工程
+```
+
+**关键设计模式**:
+- **profile × channelDriver**:smoke-ci 用 `crabline` mock 通道,release 用 `live` 真通道
+- **evidenceMode**:smoke-ci 是 `slim`(只跑必要 evidence),release 隐式是 full
+- **coverageIds vs categoryIds**:细粒度(coverage)vs 大类(category)的二选一
+
+#### 19.3.3 categoryId 命名空间:9 大类 × 多层
+
+从 release profile 看 categoryId 命名空间(摘录):
+
+| 一级域 | 二级域示例 | 三级覆盖 |
+| --- | --- | --- |
+| `gateway.` | `gateway.http-apis` / `gateway.websocket-connection` / `gateway.health-diagnostics-and-repair` / `gateway.protocol-compatibility` / `gateway.roles-and-permissions` / `gateway.security-controls` | 14 个子主题 |
+| `cli.` | `cli.cli-setup` / `cli.doctor` / `cli.updates-and-upgrades` / `cli.gateway-service-management` | 7 个子主题 |
+| `plugins.` | `plugins.authoring-and-packaging-plugins` / `plugins.bundled-plugins` / `plugins.installing-and-running-plugins` | 8 个子主题 |
+| `agent-runtime.` | `agent-runtime.tool-calls-and-response-handling` / `agent-runtime.streaming-and-progress` / `agent-runtime.hosted-provider-execution` | 8 个子主题 |
+| `session-memory.` | `session-memory.token-management` / `session-memory.context-engine` / `session-memory.transcript-persistence` | 10 个子主题 |
+| `channels.` | `channels.outbound-delivery-and-reply-pipeline` / `channels.status-health-and-operator-controls` | 7 个子主题 |
+| `security.` | `security.approval-policy-and-tool-safeguards` / `security.credential-and-secret-hygiene` / `security.device-and-node-pairing` | 6 个子主题 |
+| `automation.` | `automation.cron-jobs` / `automation.heartbeat` / `automation.background-tasks-and-flows` | 6 个子主题 |
+| `observability.` | `observability.health-and-repair` / `observability.telemetry-export` | 5 个子主题 |
+
+**外加 14 个跨端命名空间**:`control-ui.`、`macos-host.`、`macos-app.`、`linux-host.`、`wsl.`、`windows.`、`small-linux.`、`containers.`、`discord.`、`telegram.`、`whatsapp.`、`slack.`、`imessage-bluebubbles.`、`openai.`、`anthropic.`。
+
+**总计 ≥ 100 个 categoryId**,每个 ID 形如 `<domain>.<feature>` —— 这是 *声明式地把整个工程切成可打分的原子单元*。**laew 没有任何对等机制**。
+
+#### 19.3.4 标签发现的语义作用
+
+categoryId 的实际作用是 **「让所有 PR/CI/测试运行/合规审计用同一套标签」**。从顶层文件结构看:
+
+- 每个 PR 可以自报影响的 categoryId → CI 只跑相关 category 的测试 → **精准 PR 反馈**
+- release profile 用 `categoryIds` 而不是 `coverageIds` → 等价于「跑全量测试」 → **稳定发布证明**
+- `observability` profile 三个 ID 全部在 `observability.` 下 → **按主题做合规/可观测性专项审计**
+
+laew 当前测试是「cargo test 全跑」,**没有按 category 做精准反馈**。如果 laew 引入 `taxonomy.yaml`,可以做到 PR 改动 `agent/tools/write.rs` → 只跑 `agent-tools-write` 相关 case。
+
+#### 19.3.5 snapshot.source_ref 的作用
+
+```yaml
+snapshot:
+  date: "2026-05-26"
+  source_ref: origin/main@41eef4a7965
+```
+
+**`source_ref` 让所有 profile 的 coverage 基准绑定到某次 commit** —— 后续 main 演进时,旧 profile 不需要重写,只需生成新 snapshot。这与 SemVer 的 lockfile 哲学相同:**配置层和实现层解耦**。
+
+laew 完全没有这个概念 —— claude.md / AGENTS.md 是「在 main 上漂移的散文」,没有 snapshot 锁定。
+
+### 19.4 Security — 漏洞响应 + OpenGrep 规则链
+
+#### 19.4.1 SECURITY.md 的「明确边界」哲学
+
+`/usr/local/LsmGitOpenSource/openclaw/SECURITY.md`(389 行)是 *业界最完整的安全策略文档之一*。开篇就拒绝把 OpenClaw 描述为多租户安全边界:
+
+> OpenClaw is local-first agent infrastructure for trusted operators; it is not designed as a shared multi-tenant boundary between adversarial users on one gateway.
+
+**核心政策:详尽的「拒绝清单」**(SECURITY.md:48-60、86-120、160-184 共三处):
+
+- prompt injection 单独不构成 bug —— 必须配 auth/approval/sandbox/allowlist 边界绕过
+- scanner-only、dependency-only、stale-path 报告一律 invalid
+- 多用户共享 gateway 期望 *per-user* 隔离 — 不在 scope
+- 信任模型:Authenticated Gateway = Trusted Operator(session key 仅是路由标签)
+- workspace `MEMORY.md` 是 trusted local operator state
+
+**这是「政策化拒绝噪声」的范本** —— 工业级 PR triage 时 70% 的报告都属此类,OpenClaw 直接写进 SECURITY.md 减少 maintainer 工作量。
+
+#### 19.4.2 报告要求:8 项必填(SECURITY.md:73-86)
+
+```text
+For fastest triage, include all of the following:
+1. Exact vulnerable path (file, function, line range) on a current revision
+2. Tested version details (version and/or commit SHA)
+3. Reproducible PoC against latest main or latest released version
+4. If claim targets released version: evidence from shipped tag (not only main)
+5. For dependency CVE: evidence shipped dep version is actually affected + PoC
+6. Demonstrated impact tied to documented trust boundaries
+7. For exposed-secret reports: proof credential is OpenClaw-owned
+8. Explicit statement that report does NOT rely on adversarial operators sharing
+   one gateway host/config
+```
+
+**这是 *研究报告的 8 条「缺一即关 invalid」清单*** —— 极少见诸公开 SECURITY.md。
+
+#### 19.4.3 Trusted Plugins:plugin 是 TCB 的一部分
+
+SECURITY.md:153-157:
+
+```text
+- Installing or enabling a plugin grants it the same trust level as local code
+  running on that gateway host.
+- Plugin behavior such as reading env/files or running host commands is
+  expected inside this trust boundary.
+- Security reports must show a boundary bypass (for example unauthenticated
+  plugin load, allowlist/policy bypass, or sandbox/path-safety bypass), not
+  only malicious behavior from a trusted-installed plugin.
+```
+
+**plugin 加载即 TCB(Trusted Computing Base)成员** —— 这与 laew 的 `extensions/` 设计哲学相同(extension 是 process 内加载),但 laew 没有公开声明这一点。
+
+#### 19.4.4 OpenGrep:148 条规则的精确规则链
+
+`/usr/local/LsmGitOpenSource/openclaw/security/opengrep/precise.yml`(4893 行,**148 条规则**)是 *advisor-driven 的精确规则库*:
+
+```yaml
+# precise.yml:1-10
+# OpenGrep super-config: precise
+#
+# Auto-generated by security/opengrep/compile-rules.mjs.
+# DO NOT EDIT BY HAND. Re-run the compile script after editing source rules.
+#
+# Source rules dir: security/opengrep/rules/openclaw-policy
+# Generated at    : 2026-04-30T09:09:41.198Z
+# Rule count      : 148
+rules:
+  - id: ghsa-25gx-x37c-7pph.openclaw-novnc-x11vnc-missing-auth
+    ...
+  - id: ghsa-25pw-4h6w-qwvm.openclaw.imessage-group-allowlist-merged-with-pairing-store
+  - id: ghsa-2prf-9cw7-fq62.whatsapp-reaction-requires-allowfrom-guard
+  ...
+```
+
+**关键设计:规则 ID 都带 GHSA 前缀**(`ghsa-<id>.<rule-id>`),把 Semgrep 规则和 GitHub Security Advisory **一一对应**。`security/README.md:127-136`:
+
+```text
+## Tracing a finding back to its source
+Every compiled rule's `id` is `<source-id>.<original-id>`. For GHSA-backed rules,
+`<source-id>` is the lower-case GHSA ID. For other source-backed rules, use a
+stable source identifier without dots such as a CVE, OSV ID, internal advisory
+ID, or other review identifier. Rule `metadata` must include `advisory-url`,
+`detector-bucket`, and `source-rule-id`, plus either `ghsa` or `advisory-id`.
+```
+
+**这是个「**advisor → rule → regression firewall**」的闭环**:
+1. 收到 GHSA / CVE
+2. 写 Semgrep 规则描述这个 GHSA 的漏洞形态
+3. 编译进 precise.yml,规则 ID 命名 = GHSA ID
+4. CI(`.github/workflows/opengrep-precise.yml`)对 PR 做 changed-path 扫描
+5. Full workflow(`opengrep-precise-full.yml`)做全量扫描(手动触发)
+6. 上传 SARIF 到 GitHub Code Scanning
+7. 任意 finding 直接 fail PR
+
+#### 19.4.5 规则编译 + 元数据强制检查
+
+```bash
+# security/README.md:34-41
+node security/opengrep/compile-rules.mjs --rules-dir <folder-with-source-rule-yaml>
+# 之后:
+pnpm check:opengrep-rule-metadata
+```
+
+`check-rule-metadata.mjs` 强制要求每条规则的 `metadata` 包含 `advisory-url`、`detector-bucket`、`source-rule-id`、`ghsa` 或 `advisory-id` —— 防止「孤儿规则」(无法追溯来源)。
+
+#### 19.4.6 规则质量契约(security/README.md:43-45)
+
+```text
+## Rule quality contract
+precise rules must catch the vulnerable behavior they were written for,
+should be silent on corresponding fixed behavior when a fix exists, and
+should keep current findings limited to verified regressions or variants.
+```
+
+三约束:
+1. **能抓漏洞形态**(test vulnerable)
+2. **修复后静默**(test fixed)
+3. **当前 finding 必须是真实回归或变种**(不能有 noise)
+
+—— 这是 *工业级* 静态分析规则运营要求,laew 当前 `cargo clippy` / `cargo test` 没做到这点。
+
+#### 19.4.7 Patch 链:patches/ 目录的临时依赖 patch
+
+`/usr/local/LsmGitOpenSource/openclaw/patches/`(4 个 patch)展示了 *「上游未修时本地保命」* 的设计:
+
+```text
+patches/
+├── @awesome.me__webawesome@3.12.0.patch
+├── matrix-js-sdk@42.2.0.patch
+├── @novnc__novnc@1.7.0.patch
+├── vitest@5.0.0.patch
+└── README.md
+```
+
+每个 patch 配 *「何时移除」* 文档(patches/README.md:9-12):
+
+```text
+Remove the noVNC patch, its registration, and its exact-version guard exception
+when an upstream version passes the Desktop panel and document browser suites
+(`test/vitest/vitest.ui-e2e.config.ts`) and the live view-only selection/type
+stress check.
+```
+
+`vitest@5.0.0.patch` 7 个目标文件的 SHA-256 全列在 README 里(patches/README.md:23-29) —— 防 patch 静默 drift。Stable 5.0.0 包在 2026-09-03 发布,`@vitest/browser@5.0.0` 12:24:37.187 UTC 发布 → cooldown exclusion 在 2026-09-10 12:24:37.187 UTC 前必续(patches/README.md:80-84)。
+
+**这是「临时 patch + 移除 gate + 双向 SHA-256」的设计模式** —— laew 的 `Cargo.toml` 用 crates.io 官方版本,**没有这种「自管 patch + 上游解锁条件」机制**。
+
+#### 19.4.8 CI 三层防线
+
+| 防线 | 文件 | 触发 | 输出 |
+| --- | --- | --- | --- |
+| Secret 扫描 | `scripts/detect-private-keys.mts` | 每个 PR + pre-commit | PR fail |
+| CodeQL | `.github/workflows/codeql*.yml` | main + PR | GitHub Code Scanning |
+| OpenGrep precise(changed-path) | `.github/workflows/opengrep-precise.yml` | PR | SARIF → Code Scanning |
+| OpenGrep precise(full) | `.github/workflows/opengrep-precise-full.yml` | 手动 dispatch | SARIF |
+
+```text
+# SECURITY.md:362-377
+### Secret Detection
+OpenClaw runs the in-repo `scripts/detect-private-keys.mts` scanner in CI (the
+same private-key marker set as the pre-commit-hooks `detect-private-key` hook,
+with no hook-repo fetches, package installs, or third-party hook execution in
+the scan's path) over every tracked regular file except colocated `*.test.ts`
+fixtures and the iOS Fastfile; pull requests run the base branch's copy of
+the scanner and fail if the base branch lacks it.
+
+### Static Analysis
+CI runs CodeQL across core TypeScript, GitHub Actions, Android, macOS, and
+high-risk runtime boundaries using `.github/workflows/codeql*.yml` and
+`.github/codeql/*.yml`.
+```
+
+**关键设计**:secret scanner 不拉第三方 hook repo,**自托管在仓库内**,CI 用 base branch 的拷贝(防止 scanner 自身被 PR 改坏)。
+
+#### 19.4.9 三层防线对 laew 的差距
+
+| 层 | openclaw | laew |
+| --- | --- | --- |
+| Secret 扫描 | `scripts/detect-private-keys.mts` + pre-commit | 无 |
+| CodeQL | `.github/workflows/codeql*.yml` | 无 |
+| OpenGrep / Semgrep | 148 条规则 + 编译链 + metadata check | 无 |
+| 临时依赖 patch | 4 个 patches + 双向 SHA-256 + 移除 gate | 无 |
+| 漏洞响应 | SECURITY.md 8 项必填 + 详尽 out-of-scope | 无 SECURITY.md |
+| 报告工作流 | GHSA private advisory + `X-GitHub-Api-Version: 2022-11-28` 头 | 无 |
+
+### 19.5 对 laew 的借鉴路线图(P0/P1/P2)
+
+#### P0(立刻借鉴)
+
+1. **Custodian Skills 范式**(custodian-skills/ 目录)
+   - **建议**:在 `laew/custodian-skills/` 建 4 份 SKILL.md:`add-model-provider`、`repair-tui`、`switch-provider`、`diagnose-session`
+   - **统一 5 阶段骨架**:Gather → Mutate(必须 `openclaw config set --ref-*` 三件套) → Repair(`doctor --lint` 先行,`--fix` 需显式 approve) → Prove(可断言字符串 + 延迟) → Report(结构化字段)
+   - **对应行**:laew 当前 `./laew provider add` 没有任何剧本;用户拿到 `db: not configured` 错误只能读 CLAUDE.md 散文
+
+2. **SecretRef 三件套写表**(add-model-provider/SKILL.md:29-34)
+   - **建议**:改造 `src/config/mod.rs::Db` 里的 `providers` 表,新增 `secret_ref_kind` / `secret_ref_path` / `secret_ref_id` 三列;`api_key` 列只存 `mode=singleValue|multiValue` 的引用,**禁止存明文**(`cargo deny` 规则做静态扫描)
+   - **现状差距**:laew 当前把 `sk-...` 明文落 `LsmAgentEmergentWork.db` providers 表,无任何解密层
+
+3. **OpenGrep / Semgrep 集成**(security/opengrep/precise.yml)
+   - **建议**:在 `scripts/semgrep/` 建 `precise.yml`,先写 5 条 P0 规则:
+     - `laew.api-key-into-sqlite`:`api_key.*INSERT.*INTO.*providers`
+     - `laew.bash-without-timeout`:`std::process::Command::new.*\.output\(\)`(Bash 工具无 timeout)
+     - `laew.read-outside-workspace`:`fs::read_to_string.*cwd.*path`
+     - `laew.write-no-parent-check`:`fs::write.*\.parent\(\)\.unwrap\(\)`
+     - `laew.tool-result-into-prompt`:`format!.*tool_result.*untrusted`
+   - **配套**:`scripts/check-rule-metadata.mjs`(或 Rust 移植版)强制 `metadata.ghsa` 字段
+
+4. **SECURITY.md 公开声明**(security/README.md 范本)
+   - **建议**:在仓库根建 `SECURITY.md`,明确:
+     - 报告渠道(GitHub private advisory)
+     - 「拒绝清单」(prompt-injection-only、scanner-only、stale-path 等)
+     - 8 项必填(文件:函数:行 / commit SHA / PoC / 影响边界 ...)
+     - 信任模型声明(laew 当前是「单用户本地 CLI」,与 openclaw 相同)
+
+#### P1(季度级)
+
+5. **多端部署 manifest**(deploy/fly.private.toml)
+   - **建议**:写 `Dockerfile.laew`(cargo-chef 缓存 + 多阶段 + SHA 锁基础镜像),`docker-compose.yml`,`fly.toml` + `deploy/fly.private.toml`
+   - **镜像安全姿态**:`USER` 非 root、`cap_drop: [NET_RAW, NET_ADMIN]`、`security_opt: [no-new-privileges:true]`
+
+6. **Taxonomy 元模型**(taxonomy.yaml)
+   - **建议**:在 `docs/taxonomy.yaml` 建 30 个 categoryId:`agent-tools-bash` / `agent-tools-read` / `agent-tools-write` / `session-memory` / `llm-anthropic` / `llm-openai` / `tui-repl` / `tui-provider-form` ...
+   - **作用**:PR 改动 `src/agent/tools/write.rs` → CI 只跑 `agent-tools-write` 相关 case → 精准 PR 反馈
+
+7. **三层 CI 防线**(SECURITY.md:362-377)
+   - **建议**:GitHub Actions 加 `secret-scan.yml`(基于 `gitleaks` 或 `detect-secrets`)、`semgrep.yml`、`codeql.yml`
+   - **注意**:scanner 自托管,**不要拉第三方 hook repo**,用 base branch 拷贝防 scanner 自身被改
+
+#### P2(可选)
+
+8. **临时依赖 patch + 双向 SHA-256**(patches/README.md:23-29)
+   - **建议**:在 laew 用 `[patch.crates-io]` 段对某个 crate 打本地 patch,README.md 记录 patch 前后的 sha256 + 移除 gate
+   - **当前场景**:laew 没遇到需要打 patch 的 crate,这是 *预备机制*
+
+9. **OpenClaw `categoryId` 命名空间**(taxonomy.yaml:53-200)
+   - **建议**:laew taxonomy 至少 6 个一级域:`agent-tools` / `session-memory` / `llm-protocol` / `tui` / `cli` / `cli-provider`;每个域 5-10 个二级域
+   - **配合 profile 字段**:定义 `smoke-ci` / `personal-tui` / `release`,各 profile 自带 coverageIds
+
+10. **Docker GPG fingerprint 校验**(Dockerfile:362-394)
+    - **建议**:laew Dockerfile 如果未来引入 apt 装 `libsqlite3-dev` 之类,加上 `expected_fingerprint` 比对(curl → gpg --show-keys --with-colons → awk 取 fpr → tr 大写 → 比对)
+
+### 19.6 综合:四维度交叉点
+
+四个维度虽然表面独立,但有 **4 个关键交叉点**:
+
+1. **Custodian Skill × Security**
+   - `diagnose-gateway/SKILL.md` 是「只读剧本」,**与 SECURITY.md 的「拒绝清单」互补** —— 剧本是「能做什么」,拒绝清单是「不能做什么」
+   - **借鉴**:laew 写 `repair-tui/SKILL.md` 时,应在开头明确「不允许 Mutate 哪些字段」(如 `~/.config/openclaw/openclaw.json` 的 `gateway.bind`)
+
+2. **多端部署 × Security**
+   - `Dockerfile` 的 cap_drop / non-root / GPG 校验,*和* `docker-compose.yml` 的 `no-new-privileges`,*和* `render.yaml` 的 `generateValue: true`,构成 **「构建 → 编排 → 平台」三层安全姿态** —— 缺一层都会被绕过
+   - **借鉴**:laew 如果做 Docker 镜像,**必须三层都做**,不能只做 `USER node` 而漏 `cap_drop`
+
+3. **Taxonomy × CI**
+   - `taxonomy.yaml` 的 `categoryIds` 让 CI 精准跑子集,与 `precise.yml` 的 148 条规则共同构成 **「功能覆盖 × 漏洞形态」二维 PR 反馈**
+   - **借鉴**:laew 引入 `taxonomy.yaml` + Semgrep,**理论上可实现**「改 `agent/tools/write.rs` → CI 只跑该子集 + 只跑该子集相关漏洞规则」
+
+4. **Custodian Skill × 多端部署**
+   - `cloud-image-bake/SKILL.md` 直接指导 *如何* 烧 Cloud Worker 镜像 —— **Skill 内容直接对应 Dockerfile 的 `OPENCLAW_INSTALL_DOCKER_CLI` / `OPENCLAW_INSTALL_BROWSER` 开关**
+   - **借鉴**:laew 的 `repair-tui/SKILL.md` 可以直接复用 `tools/fs/workspaceOnly` 等 CLI 标志做 Mutate
+
+### 19.7 关键文件路径汇总表
+
+| 类别 | 路径(绝对) | 行数 | 核心职责 |
+| --- | --- | --- | --- |
+| Custodian Skill — 模型 | `/usr/local/LsmGitOpenSource/openclaw/custodian-skills/add-model-provider/SKILL.md` | 73 | 5 阶段骨架范本 + SecretRef 三件套 + PROVIDER-PROOF-OK 探针 |
+| Custodian Skill — 通道 | `/usr/local/LsmGitOpenSource/openclaw/custodian-skills/configure-channel/SKILL.md` | 76 | 通道 + 允许列表 + dry-run 投递 + 报告 blocker |
+| Custodian Skill — 镜像烧制 | `/usr/local/LsmGitOpenSource/openclaw/custodian-skills/cloud-image-bake/SKILL.md` | 71 | Crabbox lease + checkpoint + warmup 对比 + 旧镜像保留 |
+| Custodian Skill — 诊断 | `/usr/local/LsmGitOpenSource/openclaw/custodian-skills/diagnose-gateway/SKILL.md` | 58 | 4 阶段(无 Mutate)+ Skill 路由图 |
+| Docker 镜像 | `/usr/local/LsmGitOpenSource/openclaw/Dockerfile` | 441 | 7 阶段多阶段 + SHA-256 锁镜像 + GPG 指纹校验 + non-root |
+| Docker Compose | `/usr/local/LsmGitOpenSource/openclaw/docker-compose.yml` | 136 | gateway + cli 双服务 + cap_drop + no-new-privileges |
+| Render Blueprint | `/usr/local/LsmGitOpenSource/openclaw/render.yaml` | 24 | 5 行基础设施 + generateValue token + /startupz |
+| Fly.io 公开 | `/usr/local/LsmGitOpenSource/openclaw/fly.toml` | 42 | force_https + /startupz 15s |
+| Fly.io 私有 | `/usr/local/LsmGitOpenSource/openclaw/deploy/fly.private.toml` | 40 | 无 `[http_service]` 块 + WireGuard 入口 |
+| Taxonomy 元模型 | `/usr/local/LsmGitOpenSource/openclaw/taxonomy.yaml` | 11578 | 4 profiles × 100+ categoryIds × snapshot.source_ref |
+| Security 政策 | `/usr/local/LsmGitOpenSource/openclaw/SECURITY.md` | 389 | 信任模型 + 拒绝清单 + 8 项必填 + Plugin TCB 声明 |
+| Security 工具 | `/usr/local/LsmGitOpenSource/openclaw/security/README.md` | 137 | OpenGrep 规则链 + 元数据强制 + 规则质量契约 |
+| OpenGrep 规则 | `/usr/local/LsmGitOpenSource/openclaw/security/opengrep/precise.yml` | 4893 | 148 条规则,全部带 GHSA 前缀 |
+| OpenGrep 编译 | `/usr/local/LsmGitOpenSource/openclaw/security/opengrep/compile-rules.mjs` | (未量) | source rule → precise.yml 编译 |
+| OpenGrep 元数据校验 | `/usr/local/LsmGitOpenSource/openclaw/security/opengrep/check-rule-metadata.mjs` | (未量) | 强制 advisory-url / detector-bucket / ghsa |
+| Patch README | `/usr/local/LsmGitOpenSource/openclaw/patches/README.md` | 84 | 临时 patch + 双向 SHA-256 + 移除 gate |
+| Patch 列表 | `/usr/local/LsmGitOpenSource/openclaw/patches/{novnc,matrix-js-sdk,vitest,webawesome}.patch` | (未量) | 4 个上游未修时本地保命 |
+| CI 三层 | `/usr/local/LsmGitOpenSource/openclaw/.github/workflows/{codeql,opengrep-precise,opengrep-precise-full}.yml` | (未量) | secret + SAST + rule firewall |
+| Secret 扫描 | `/usr/local/LsmGitOpenSource/openclaw/scripts/detect-private-keys.mts` | (未量) | 自托管,无第三方 hook repo |
+| OpenGrep 包装 | `/usr/local/LsmGitOpenSource/openclaw/scripts/run-opengrep.sh` | (未量) | 统一 .semgrepignore + 路径 |
+
+### 19.8 本轮不重复声明
+
+为保持每轮深挖的独立性,本节明确列出 **本轮不覆盖、读者应回查前 7 轮的内容**:
+
+- ❌ **Agent 内置能力**(工具调用、Skill 文件格式、SubAgent 调度)→ 见第六轮专题-第六轮-SubAgent 调度
+- ❌ **Gateway / Harness / Adapter 三层契约** → 见第七轮 `17.第六轮深挖` § 17.2
+- ❌ **Lane 调度器 + Workshop 自演化** → 见第五轮 `16.第五轮深挖` § 16.3
+- ❌ **协议 wire 真实实现**(Anthropic/OpenAI 流式 / SSE)→ 见第六轮专题-第六轮-Anthropic 与 OpenAI 协议调用
+- ❌ **Git 与版本控制集成** → 见第七轮 § 18.1
+- ❌ **多模态与文件处理** → 见第七轮 § 18.2
+- ❌ **Web 检索与网络访问** → 见第七轮 § 18.3
+- ❌ **Prompt Caching 与成本预算** → 见第七轮 § 18.4
+- ❌ **MCP 11-capability + 162 extensions** → 见第七轮 § 17.3
+- ❌ **TUI 子屏自动化测试** → 见本工程 `docs/TUI自动化测试/`,与 openclaw 无关
+
+本轮独有(其他 11 份工程文档均无对应章节):
+- ✅ Custodian Skills **5 阶段剧本**(Gather/Mutate/Repair/Prove/Report)的「副作用三约束」
+- ✅ Dockerfile **7 阶段 + SHA-256 锁基础镜像 + GPG 指纹校验**
+- ✅ docker-compose / Render / Fly.io / Fly-private **四形态对比表**
+- ✅ Taxonomy.yaml 的 **profile × categoryId × snapshot.source_ref** 元模型
+- ✅ SECURITY.md **8 项必填 + 详尽拒绝清单 + Plugin TCB 声明**
+- ✅ OpenGrep 148 条规则 **GHSA 前缀化** + advisor → rule → regression firewall 闭环
+- ✅ Patches/ 目录 **临时 patch + 双向 SHA-256 + 移除 gate** 设计
+- ✅ CI 三层防线(secret scan + CodeQL + OpenGrep)+ 自托管 scanner
+

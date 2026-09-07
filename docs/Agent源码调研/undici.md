@@ -9185,3 +9185,856 @@ function onData (chunk) {
 - **维度总览** — 14.5 给出 P0/P1/P2 总路线图(按"实施成本 × 收益"排序),14.6 总结本轮
 
 本轮所有结论均带 `lib/xxx.js:LINE` 路径与关键代码片段,与既有 14.1 / 第五轮 / 前六轮内容**零重复**。
+
+---
+
+## 15. 第八轮深挖 — HTTP/3 QUIC实验 + 代理链SOCKS + TLS证书 + Cookies重定向管理（2026-09-07）
+
+> 本轮聚焦四个全新维度：①HTTP/3 与 QUIC 实验性支持、②代理链与 SOCKS 支持、③TLS / 证书 / Client Hello 分发、④Cookies 与重定向链管理。四个维度全部位于「传输安全与连接路由」这一层 —— 不同于第七轮的「连接池性能与流控」，本轮关注的是**请求如何找到正确的路、如何安全地走到目的地、以及跨跳转时状态如何传递**。
+>
+> 阅读提示：维度一（HTTP/3）在 undici 中是一个**「有预留、无实现」**的真实状态，本章如实记录这一结论并给出证据链，这本身就是对 laew 极有价值的架构情报（不要在客户端层过早投入 QUIC）。维度二三四均有完整生产级实现，是本轮的干货主体。
+
+### 15.1 HTTP/3 与 QUIC 实验性支持
+
+#### 15.1.1 核心结论：undici 尚无 QUIC/HTTP3 实现
+
+对整个仓库做穷举式检索（`lib/` + `docs/` + `test/`），结果如下：
+
+```bash
+# 检索 QUIC 相关
+$ grep -rn "QUIC\|quic" lib/ docs/
+（无命中 —— 唯一命中是 fixed-queue.js:55 的 "quicker checks" 注释，语义无关）
+
+# 检索 HTTP/3 相关
+$ grep -rn "http3\|HTTP/3\|h3\b" lib/ docs/
+（无命中）
+
+# 检索 Alt-Svc 相关
+$ grep -rn "alt-svc\|Alt-Svc\|altSvc" lib/ docs/
+lib/core/constants.js:21:  'Alt-Svc',
+lib/core/constants.js:22:  'Alt-Used',
+```
+
+也就是说，undici 对 HTTP/3 的全部「支持」仅剩两个痕迹：
+
+1. `lib/core/constants.js:21-22` 把 `Alt-Svc` / `Alt-Used` 列入 `wellknownHeaderNames` 白名单；
+2. `lib/core/request.js:453-457` 在写请求头时对白名单头名做小写规范化快速路径：
+
+```javascript
+// lib/core/request.js:453-457
+let headerName = headerNameLowerCasedRecord[key]
+if (headerName === undefined) {
+  if (headerNameLowerCasedRecord[headerName] === undefined && !isValidHTTPToken(headerName)) {
+    // 慢路径：逐字符校验
+```
+
+这两处代码意味着 undici **能透明转发** Alt-Svc / Alt-Used 头（不会被头名校验拒绝），但**从不解析**它们 —— 没有替代服务缓存、没有 `h3-XX` 协议协商、没有 UDP socket 创建逻辑。Alt-Svc 对 undici 而言只是一对「可透传的普通头」。
+
+#### 15.1.2 为什么 undici 不做 QUIC：架构层面的三个硬约束
+
+**(1) Connector 抽象是「流式 socket」强绑定的。**
+
+undici 的整个 Dispatcher/Client 栈建立在 `buildConnector` 返回的 `connect(opts, callback)` 之上，callback 收到的必须是一个 Node `net.Socket`（双工字节流）：
+
+```javascript
+// lib/core/connect.js:71（connector 契约）
+return function connect ({ hostname, host, protocol, port, servername, localAddress, httpSocket }, callback) {
+  ...
+  socket
+    .setNoDelay(true)
+    .once(protocol === 'https:' ? 'secureConnect' : 'connect', function () {
+      ...
+      cb(null, this)   // ← 必须是 socket（stream.Duplex）
+    })
+```
+
+而 QUIC 的传输原语是 **UDP datagram + 独立的 stream 生命周期管理**（一个 QUIC connection 内多路复用的 stream 由 QUIC 层而非内核管理）。要把 QUIC 塞进 `net.Socket` 形状，需要在 QUIC 实现之上再写一层「把每个 HTTP/3 请求的 bidi-stream 包成 Duplex」的适配层 —— 这正是 `client-h2.js` 对 `http2` 模块做的事情，成本极高。
+
+**(2) Node 核心没有 QUIC。**
+
+undici 的 HTTP/2 支持直接依赖 `node:http2`（`lib/dispatcher/client-h2.js` 头部 require），零自带协议栈。而 Node 官方的 QUIC 提案（`node:quic`）多年停留在实验阶段未落地。undici 作为「跟随 Node 核心能力」的库，没有自研 QUIC 栈的动力 —— 这与 laew 依赖 reqwest/hyper 而不自研协议栈是同构的决策。
+
+**(3) Alt-Svc 的收益场景（浏览器)与服务端场景不符。**
+
+Alt-Svc 的核心收益是「浏览器首次走 h1/h2 后，后续连接直接走 h3 省一次握手」。服务端到服务端（undici 的主场景）通常长连接复用，TLS session resumption 已把握手成本降到很低，QUIC 的边际收益进一步缩小。
+
+#### 15.1.3 undici 已为 HTTP/3 预留的扩展点
+
+尽管没有实现，undici 的架构为「换传输协议」留了三个明确的插槽，值得 laew 对照检查自己的抽象是否同样干净：
+
+**插槽 A：`connect` 选项完全可替换。**
+
+`buildConnector` 只是默认值，任何 Dispatcher 都接受 `connect` 覆盖：
+
+```javascript
+// lib/dispatcher/proxy-agent.js:147-150（同时构造 4 个 connector）
+const connect = buildConnector({ timeout: connectTimeout, ...opts.proxyTls })
+const connectHTTP1 = buildConnector({ timeout: connectTimeout, ...opts.proxyTls, allowH2: false })
+this[kConnectEndpoint] = buildConnector({ timeout: connectTimeout, ...opts.requestTls })
+this[kConnectEndpointHTTP1] = buildConnector({ timeout: connectTimeout, ...opts.requestTls, allowH2: false })
+```
+
+一个「QUIC connector」只需要实现同样的 `(opts, callback) => socket` 契约就能接入 Client —— 前提是解决 (1) 的 Duplex 适配。
+
+**插槽 B：协议协商通过 socket 属性注入。**
+
+h2c（HTTP/2 cleartext）的实现展示了 undici 如何「绕过 ALPN 直接指定协议」：
+
+```javascript
+// lib/core/connect.js:129-131
+socket = net.connect(connectOptions)
+if (useH2c === true) {
+  socket.alpnProtocol = 'h2'   // ← 直接在 socket 上伪造 ALPN 结果
+}
+```
+
+`client.js` 在连接建立后读取 `socket.alpnProtocol` 决定走 h1 还是 h2。HTTP/3 理论上可以走同样的钩子（`alpnProtocol = 'h3'`），但 socket 本身不是 UDP 的，所以这条路在 QUIC 上走不通 —— 又回到 (1)。
+
+**插槽 C：诊断通道按前缀注册，无需改动核心。**
+
+`lib/core/diagnostics.js:31` 的 `undici:proxy:connected` 展示了新增通道的模式（`diagnosticsChannel.channel('前缀:域:事件')`）。若未来加 HTTP/3，观测层可以零成本扩展为 `undici:quic:*`。
+
+#### 15.1.4 对 laew 的直接启示（维度一）
+
+| # | 启示 | 说明 |
+|---|---|---|
+| 15.1-P0 | **不要在 laew 里自研或提前引入 HTTP/3** | undici（Node 官方团队、体量远大于 laew）都选择等 Node 核心落地。LLM API 提供商（Anthropic/OpenAI）目前主推 h2，h3 无收益。reqwest 的 http3 是 feature-flag 实验，默认关闭 —— 保持默认。 |
+| 15.1-P1 | **把「协议选择」收敛到 connector 层单一插槽** | laew 若用 reqwest，协议由 hyper 决定，laew 无法干预；但要确保 laew 的重试/超时逻辑**不假设 h1 语义**（例如不要依赖「一个连接同一时刻只有一个 in-flight 请求」）。 |
+| 15.1-P2 | **头白名单机制可参考** | undici 的 `wellknownHeaderNames` + null-prototype Record 做 O(1) 头名规范化，laew 在 serde 序列化头时如有性能需求可类比。 |
+
+---
+
+### 15.2 代理链与 SOCKS 支持
+
+undici 的代理体系由 5 个文件构成（约 1470 行），覆盖「HTTP 正向代理 / HTTPS CONNECT 隧道 / SOCKS5 隧道 / 环境变量路由」四种形态。
+
+#### 15.2.1 ProxyAgent 总体拓扑（lib/dispatcher/proxy-agent.js，378 行）
+
+```
+用户 dispatch(opts)
+  │
+  ├─ buildHeaders + throwIfProxyAuthIsSent(安全检查)
+  │
+  └─ this[kAgent].dispatch(opts, handler)        ← 内嵌一个 Agent（复用连接池路由）
+        │
+        ├─ factory(origin, options) 被调用时按 origin 协议分流:
+        │
+        ├─ proxy 协议是 socks5:/socks: ──────────► Socks5ProxyAgent（见 15.2.3）
+        │
+        ├─ 目标是 http: 且未强制 tunnel ─────────► Http1ProxyWrapper（正向代理模式）
+        │
+        └─ 其余(https 目标 / 强制 tunnel) ───────► agentFactory(origin) → Client/Pool
+                │
+                └─ connect 时走 this[kAgent] 的自定义 connect:
+                      发 CONNECT host:port 给代理 ─► 200 则拿到裸隧道 socket
+                          │
+                          ├─ http 目标:直接用
+                          └─ https 目标:在这条隧道 socket 上再做一次 tls.connect(httpSocket)
+```
+
+`shouldProxyTunnel`（第 40-42 行）是分流的核心判断：
+
+```javascript
+// lib/dispatcher/proxy-agent.js:40-42
+function shouldProxyTunnel (requestProtocol, proxyTunnel) {
+  return proxyTunnel === true || requestProtocol !== 'http:'
+}
+```
+
+即：**https 请求永远走 CONNECT 隧道**（否则无法保证端到端 TLS）；**http 请求默认走正向代理**（改写 path 为绝对 URL），除非 `proxyTunnel: true` 强制升级为隧道。
+
+#### 15.2.2 CONNECT 隧道的 12 步生命周期（proxy-agent.js:202-273）
+
+```javascript
+// lib/dispatcher/proxy-agent.js:202-273（节选）
+connect: async (opts, callback) => {
+  if (!this[kClient]) {   // SOCKS5 不该走到这里
+    callback(new InvalidArgumentError('Cannot establish tunnel connection without a proxy client'))
+    return
+  }
+
+  let requestedPath = opts.host
+  if (!opts.port) {
+    requestedPath += `:${defaultProtocolPort(opts.protocol)}`   // ① 补默认端口
+  }
+  try {
+    const connectParams = {
+      origin,                                  // ② 代理地址（连接目标）
+      port,
+      path: requestedPath,                     // ③ CONNECT 的目标 authority
+      signal: opts.signal,
+      headers: {
+        ...this[kProxyHeaders],
+        host: opts.host,                       // ④ host 头 = 真实目标（不是代理）
+        ...(opts.connections == null || opts.connections > 0
+              ? { 'proxy-connection': 'keep-alive' } : {})   // ⑤ 隧道本身保活
+      },
+      servername: this[kProxyTls]?.servername || proxyHostname // ⑥ SNI 钉住代理
+    }
+    const { socket, statusCode } = await this[kClient].connect(connectParams)  // ⑦ 发 CONNECT
+    if (statusCode !== 200) {                  // ⑧ 非 200 → 隧道失败
+      socket.on('error', noop).destroy()
+      callback(new RequestAbortedError(`Proxy response (${statusCode}) !== 200 when HTTP Tunneling`))
+      return
+    }
+    if (channels.proxyConnected.hasSubscribers) {  // ⑨ 诊断事件
+      channels.proxyConnected.publish({ socket, connectParams })
+    }
+    if (opts.protocol !== 'https:') {          // ⑩ http 目标：隧道 socket 即最终 socket
+      callback(null, socket)
+      return
+    }
+    let servername                             // ⑪ https 目标：决定请求层 SNI
+    if (this[kRequestTls]) {
+      servername = this[kRequestTls].servername
+    } else {
+      servername = opts.servername
+    }
+    const connectEndpoint = opts.allowH2 === false
+      ? this[kConnectEndpointHTTP1]
+      : this[kConnectEndpoint]
+    connectEndpoint({ ...opts, servername, httpSocket: socket }, callback)  // ⑫ 隧道上叠 TLS
+  } catch (err) {
+    if (err.code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
+      callback(new SecureProxyConnectionError(err))     // ⑬ 代理证书不匹配
+    } else if (err.code === 'UND_ERR_SOCKET') {
+      callback(new ProxyConnectionError(err))           // ⑭ 隧道中途断开
+    } else {
+      callback(err)
+    }
+  }
+}
+```
+
+**设计要点拆解**：
+
+- **双层 TLS 分离（`requestTls` vs `proxyTls`）**：`proxyTls` 管与代理之间的 TLS（CA、证书、SNI），`requestTls` 管与真实目标之间的 TLS。两者完全独立配置，对应第 147-150 行构造的 4 个 connector。这是**代理场景下最容易被忽视的正确性问题** —— laew 未来若加代理支持必须同样拆开。
+- **SNI 钉住（第 92-98 / 225 行）**：`Http1ProxyWrapper` 中 `opts.servername = this.#proxyServername`，注释明确说明：不钉住的话底层 Client 会从改写后的 Host 头（指向真实目标）推导 SNI，导致**与代理本身的 TLS 握手用错主机名**。
+- **`ERR_TLS_CERT_ALTNAME_INVALID` 的包装动机（第 172-177 行）**：把错误包成 `SecureProxyConnectionError`，避免 `client.js` 的 connect 错误处理把它当作可恢复错误重试（会死循环）。
+- **`UND_ERR_SOCKET` 的包装动机（第 260-267 行）**：注释直接引用 issue #3897 —— 隧道建立中途 socket 断开意味着 CONNECT 没完成，没有恢复余地；但 `client.js` 把 `UND_ERR_SOCKET` 视为已建连接上的可恢复错误并保持请求排队，导致 `connect()` 永远重试。包成 `ProxyConnectionError` 强制失败。**这是「错误分类决定重试语义」的经典案例**。
+
+#### 15.2.3 Socks5ProxyAgent（lib/dispatcher/socks5-proxy-agent.js，282 行）
+
+**实验性声明**（第 34-41 行）：进程级只发一次 `ExperimentalWarning`：
+
+```javascript
+// lib/dispatcher/socks5-proxy-agent.js:34-41
+let experimentalWarningEmitted = false
+class Socks5ProxyAgent extends DispatcherBase {
+  constructor (proxyUrl, options = {}) {
+    super(options)
+    if (!experimentalWarningEmitted) {
+      process.emitWarning(
+        'SOCKS5 proxy support is experimental and subject to change',
+        'ExperimentalWarning'
+      )
+      experimentalWarningEmitted = true
+    }
+```
+
+**与 ProxyAgent 的组合关系**（proxy-agent.js:157-167）：`ProxyAgent` 检测到 `socks5:` / `socks:` 协议时，factory 直接内嵌一个 `Socks5ProxyAgent`，且自身不再持有 `kClient`（第 193-197 行 `this[kClient] = null`）。所以用户 API 层面只有 `ProxyAgent` 一个入口：
+
+```javascript
+// lib/dispatcher/proxy-agent.js:157-167
+if (this[kProxy].protocol === 'socks5:' || this[kProxy].protocol === 'socks:') {
+  return new Socks5ProxyAgent(this[kProxy].uri, {
+    headers: this[kProxyHeaders],
+    connect,
+    factory: agentFactory,
+    username: opts.username || username,
+    password: opts.password || password,
+    proxyTls: opts.proxyTls,
+    requestTls: opts.requestTls
+  })
+}
+```
+
+**per-origin Pool 缓存**（socks5-proxy-agent.js:186-245）：每个 origin 一个独立 Pool，connect 函数先建 SOCKS5 隧道再按需升级 TLS：
+
+```javascript
+// lib/dispatcher/socks5-proxy-agent.js:186-229（节选）
+let pool = this[kPools].get(originKey)
+if (!pool || pool.destroyed || pool.closed) {
+  pool = new Pool(origin, {
+    pipelining: opts.pipelining,
+    connections: opts.connections,
+    connect: async (connectOpts, callback) => {
+      try {
+        const url = new URL(origin)
+        const targetHost = url.hostname
+        const targetPort = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80)
+        // 建立 SOCKS5 隧道
+        const socket = await this.createSocks5Connection(targetHost, targetPort)
+        // 需要时叠加 TLS
+        let finalSocket = socket
+        if (url.protocol === 'https:') {
+          if (!tls) { tls = require('node:tls') }
+          finalSocket = tls.connect({
+            ...this[kRequestTls],
+            socket,
+            servername: this[kRequestTls]?.servername || targetHost
+          })
+          const tlsReady = Promise.withResolvers()
+          finalSocket.once('secureConnect', tlsReady.resolve)
+          finalSocket.once('error', tlsReady.reject)
+          await tlsReady.promise
+        }
+        callback(null, finalSocket)
+```
+
+**空闲池自回收**（第 232-244 行）：监听 `disconnect` / `connectionError`，当池无连接且不 busy 时从 Map 删除并 close —— 防止 origin 数量无限增长导致内存泄漏。
+
+**createSocks5Connection 的 5 阶段流程**（第 78-175 行）：
+
+| 阶段 | 行号 | 动作 |
+|---|---|---|
+| 1. 连接代理 | 85-100 | `this[kConnector]({hostname: proxyHost, ...})` 拿到 TCP/TLS socket |
+| 2. SOCKS5 握手 | 112 | `socks5Client.handshake()` 发 method 协商 |
+| 3. 等待认证 | 115-143 | 5s 超时；NO_AUTH 已认证则跳过等待 |
+| 4. CONNECT 命令 | 146 | `socks5Client.connect(targetHost, targetPort)` |
+| 5. 等待隧道 | 149-172 | 5s 超时，`connected` 事件后返回裸 socket |
+
+注意这里两处硬编码 `5000ms` 超时，且没有暴露配置项 —— 实验性功能的典型粗糙面。
+
+#### 15.2.4 Socks5Client 状态机（lib/core/socks5-client.js，422 行）
+
+RFC 1928 的六状态协议机：
+
+```javascript
+// lib/core/socks5-client.js:51-60
+const STATES = {
+  INITIAL: 'initial',
+  HANDSHAKING: 'handshaking',    // method 协商中
+  AUTHENTICATING: 'authenticating', // RFC 1929 用户名密码子协商中
+  AUTHENTICATED: 'authenticated',
+  CONNECTING: 'connecting',      // CONNECT 命令已发，等 reply
+  CONNECTED: 'connected',
+  ERROR: 'error',
+  CLOSED: 'closed'
+}
+```
+
+**method 协商**（第 155-177 行）：
+
+```javascript
+// lib/core/socks5-client.js:169-177
+const request = Buffer.alloc(2 + this.authMethods.length)
+request[0] = SOCKS_VERSION          // 0x05
+request[1] = this.authMethods.length
+this.authMethods.forEach((method, i) => {
+  request[2 + i] = method
+})
+this.socket.write(request)
+```
+
+authMethods 的构造（第 83-87 行）：有用户名密码时 `[USERNAME_PASSWORD, NO_AUTH]`，否则 `[NO_AUTH]` —— **优先声明用户名密码认证**（把 NO_AUTH 放后面），服务器按顺序挑选第一个它支持的。
+
+**RFC 1929 认证**（第 214-244 行）：
+
+```javascript
+// Username/Password authentication request (RFC 1929)
+// +----+------+----------+------+----------+
+// |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+// +----+------+----------+------+----------+
+// | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+const request = Buffer.alloc(3 + usernameBuffer.length + passwordBuffer.length)
+request[0] = 0x01 // Sub-negotiation version
+```
+
+注意子协商版本是 `0x01` 而非 SOCKS 版本 `0x05` —— 一个容易写错的细节。
+
+**CONNECT 请求**（第 294-313 行）：
+
+```javascript
+// +----+-----+-------+------+----------+----------+
+// |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+// +----+-----+-------+------+----------+----------+
+const request = Buffer.alloc(4 + addressBuffer.length + 2)
+request[0] = SOCKS_VERSION
+request[1] = command        // 0x01 CONNECT
+request[2] = 0x00           // Reserved
+request[3] = addressType    // 0x01 IPv4 / 0x03 Domain / 0x04 IPv6
+```
+
+**reply 解析的变长处理**（第 318-386 行）：reply 的长度取决于 BND.ADDR 的地址类型 —— IPv4 固定 4 字节、Domain 有 1 字节长度前缀、IPv6 是 16 字节。解析器在缓冲区不足时直接 `return` 等下一批数据（半包处理）：
+
+```javascript
+// lib/core/socks5-client.js:332-347
+let responseLength = 4 // VER + REP + RSV + ATYP
+if (addressType === ADDRESS_TYPES.IPV4) {
+  responseLength += 4 + 2 // IPv4 + port
+} else if (addressType === ADDRESS_TYPES.DOMAIN) {
+  if (this.buffer.length < 5) {
+    return // Need domain length byte
+  }
+  responseLength += 1 + this.buffer[4] + 2 // length byte + domain + port
+} else if (addressType === ADDRESS_TYPES.IPV6) {
+  responseLength += 16 + 2 // IPv6 + port
+}
+if (this.buffer.length < responseLength) {
+  return // Not enough data for full response
+}
+```
+
+**错误码分类学**（第 38-48 行 + 350-352 行）：undici 为每个 reply code 生成独立的 error code（`UND_ERR_SOCKS5_REPLY_1` ~ `UND_ERR_SOCKS5_REPLY_8`），并配人类可读消息（第 391-412 行 `getReplyErrorMessage`）。这允许上层按 code 精确分流重试策略（网络不可达 vs 规则拒绝）。
+
+#### 15.2.5 socks5-utils 地址编码（lib/core/socks5-utils.js，212 行）
+
+`parseAddress`（第 12-40 行）三分支：IPv4 → `Buffer.from(octets)`；IPv6 → `parseIPv6` 16 字节；Domain → 1 字节长度前缀 + UTF-8。SOCKS5 的 domain 传递是关键安全特性 —— **域名由代理解析**，避免客户端 DNS 泄漏（真实 IP 不暴露给目标站）。
+
+`parseIPv6`（第 47-90 行）处理两个难点：
+
+```javascript
+// lib/core/socks5-utils.js:51-62  嵌入 IPv4 尾部（::ffff:1.2.3.4 形式）
+if (address.includes('.')) {
+  const lastColonIndex = address.lastIndexOf(':')
+  const ipv4Part = address.slice(lastColonIndex + 1)
+  if (net.isIPv4(ipv4Part)) {
+    const octets = ipv4Part.split('.').map(Number)
+    const high = ((octets[0] << 8) | octets[1]).toString(16)
+    const low = ((octets[2] << 8) | octets[3]).toString(16)
+    normalizedAddress = `${address.slice(0, lastColonIndex)}:${high}:${low}`
+  }
+}
+// lib/core/socks5-utils.js:65-81  :: 压缩展开
+const doubleColonIndex = normalizedAddress.indexOf('::')
+if (doubleColonIndex !== -1) {
+  const before = normalizedAddress.slice(0, doubleColonIndex)
+  const after = normalizedAddress.slice(doubleColonIndex + 2)
+  ...
+```
+
+#### 15.2.6 EnvHttpProxyAgent 环境变量路由（lib/dispatcher/env-http-proxy-agent.js，175 行）
+
+**三级代理链**（第 22-38 行构造）：
+
+```javascript
+this[kNoProxyAgent] = new Agent(agentOpts)
+
+const HTTP_PROXY = httpProxy ?? process.env.http_proxy ?? process.env.HTTP_PROXY
+if (HTTP_PROXY) {
+  this[kHttpProxyAgent] = new ProxyAgent({ ...agentOpts, uri: HTTP_PROXY })
+} else {
+  this[kHttpProxyAgent] = this[kNoProxyAgent]     // ← 复用同一实例
+}
+
+const HTTPS_PROXY = httpsProxy ?? process.env.https_proxy ?? process.env.HTTPS_PROXY
+if (HTTPS_PROXY) {
+  this[kHttpsProxyAgent] = new ProxyAgent({ ...agentOpts, uri: HTTPS_PROXY })
+} else {
+  this[kHttpsProxyAgent] = this[kHttpProxyAgent]  // ← 链式回退
+}
+```
+
+注意共享实例：没设 HTTP_PROXY 时 http/http(s) 请求共享 noProxyAgent；没设 HTTPS_PROXY 时 https 请求回退用 http 代理。close/destroy（第 49-63 行）都检查 `kClosed`/`kDestroyed` 防止对共享实例重复 close。
+
+**NO_PROXY 匹配规则**（第 101-115 行）：
+
+```javascript
+for (let i = 0; i < this.#noProxyEntries.length; i++) {
+  const entry = this.#noProxyEntries[i]
+  if (entry.port && entry.port !== port) {
+    continue // Skip if ports don't match.
+  }
+  // Don't proxy if the hostname is equal with the no_proxy host.
+  if (hostname === entry.hostname) {
+    return false
+  }
+  // Don't proxy if the hostname is the subdomain of the no_proxy host.
+  // Reference - https://github.com/denoland/deno/blob/.../ext/fetch/proxy.rs#L485
+  if (hostname.slice(-(entry.hostname.length + 1)) === `.${entry.hostname}`) {
+    return false
+  }
+}
+```
+
+即 `no_proxy=example.com` 同时豁免 `example.com` 与 `*.example.com`（后缀匹配 + 点号分隔，避免 `notexample.com` 误豁免）—— 与 Deno 实现对齐。
+
+**no_proxy 条目解析的 IPv6 处理**（第 131-150 行）：
+
+```javascript
+// An IPv6 entry with a port must be bracketed: [::1]:443.
+// A bare IPv6 address like ::1 contains colons that must not
+// be confused with a host:port separator, so we handle it separately.
+let hostname, port
+const ipv6WithPort = entry.match(/^\[(.+)\]:(\d+)$/)
+if (ipv6WithPort) {
+  hostname = ipv6WithPort[1]
+  port = Number.parseInt(ipv6WithPort[2], 10)
+} else {
+  const unbracketed = entry.replace(/^\[(.+)\]$/, '$1')
+  // A bare IPv6 address contains multiple colons; a hostname:port entry
+  // has exactly one colon followed by digits. Only attempt host:port
+  // splitting when that is unambiguously the case.
+  const colonCount = (unbracketed.match(/:/g) || []).length
+  const parsed = colonCount === 1 && unbracketed.match(/^(.+):(\d+)$/)
+  hostname = parsed ? parsed[1] : unbracketed
+  port = parsed ? Number.parseInt(parsed[2], 10) : 0
+}
+```
+
+**环境变量变更检测**（第 163-168 行）：每次 dispatch 都比较当前 `process.env.no_proxy` 与解析时快照，变了就重新解析 —— 支持运行时热更新。
+
+#### 15.2.7 安全细节：Proxy-Authorization 头注入防护（proxy-agent.js:358-376）
+
+```javascript
+function throwIfProxyAuthIsSent (headers) {
+  for (const key in headers) {
+    if (isProxyAuthorizationHeader(key)) {
+      throwProxyAuthError()
+    }
+  }
+}
+function isProxyAuthorizationHeader (key) {
+  return key.length === proxyAuthorization.length && key.toLowerCase() === proxyAuthorization
+}
+```
+
+用户请求头里若自带 `proxy-authorization`，直接抛错 —— 防止凭证被错误地发给真实目标服务器（undici 历史上确实因此出过 CVE）。注释还说明这检查应在下个大版本移除（性能原因），说明社区对安全/性能权衡有明确的迭代计划。
+
+---
+
+### 15.3 TLS / 证书 / Client Hello 分发
+
+#### 15.3.1 buildConnector 全景（lib/core/connect.js，192 行）
+
+undici 的 TLS 全部收敛在这一个 192 行的文件。签名与选项：
+
+```javascript
+// lib/core/connect.js:62
+function buildConnector ({ allowH2, preferH2, useH2c, maxCachedSessions, socketPath, timeout, session: customSession, ...opts })
+```
+
+- `...opts`：直接透传给 `tls.connect()` / `net.connect()` —— 即 `ca` / `cert` / `key` / `ciphers` / `minVersion` / `rejectUnauthorized` 等标准 Node TLS 选项全部可用。
+- `allowH2`（默认 `true`）：ALPN 列表是否含 `h2`。
+- `preferH2`：`h2` 排在 `http/1.1` 前还是后。
+- `maxCachedSessions`（默认 100）：TLS session resumption 缓存条数。
+- `socketPath`：Unix domain socket。
+- `session`（customSession）：外部注入的 TLS session（如跨 Agent 复用）。
+
+#### 15.3.2 SNI 推导链与 sessionKey（connect.js:71-96）
+
+```javascript
+// lib/core/connect.js:77-82
+servername = servername || options.servername || util.getServerName(host) || null
+const sessionKey = servername || hostname
+assert(sessionKey)
+const session = customSession || sessionCache.get(sessionKey) || null
+```
+
+三层回退：**请求级 servername → connector 级 servername → 从 host 字符串推导**。`util.getServerName(host)` 会剥掉方括号（IPv6）。sessionKey 优先用 SNI（逻辑主机），退化用 hostname —— 保证「同一逻辑主机」的 session 才会复用。
+
+`tls.connect` 调用（第 86-96 行）：
+
+```javascript
+socket = tls.connect({
+  highWaterMark: 16384, // TLS in node can't have bigger HWM anyway...
+  ...options,
+  servername,
+  session,
+  localAddress,
+  ALPNProtocols: allowH2
+    ? (preferH2 ? ['h2', 'http/1.1'] : ['http/1.1', 'h2'])
+    : ['http/1.1'],
+  socket: httpSocket, // upgrade socket connection
+  port,
+  host: hostname
+})
+```
+
+**Client Hello 分发**：undici **不做任何 Client Hello 指纹定制**（无 GREASE、无 cipher 顺序调整、无 JA3 混淆，grep 全仓库无命中）。ALPN 列表顺序就是唯一的 Hello 层可编程面。与 curl-impersonate / TLS-client 这类「指纹伪装」库完全不同路线 —— undici 是「诚实客户端」。
+
+#### 15.3.3 TLS Session Resumption：WeakSessionCache（connect.js:15-60）
+
+undici 用 `WeakRef` + `FinalizationRegistry` 实现「不阻止 TLS session 被 GC，但 GC 时自动清缓存键」：
+
+```javascript
+// lib/core/connect.js:15-29
+const SessionCache = class WeakSessionCache {
+  constructor (maxCachedSessions) {
+    this._maxCachedSessions = maxCachedSessions
+    this._sessionCache = new Map()
+    this._sessionRegistry = new FinalizationRegistry((key) => {
+      if (this._sessionCache.size < this._maxCachedSessions) {
+        return
+      }
+      const ref = this._sessionCache.get(key)
+      if (ref !== undefined && ref.deref() === undefined) {
+        this._sessionCache.delete(key)
+      }
+    })
+  }
+```
+
+**淘汰策略**（第 41-55 行）：
+1. 先删旧键再插入（LRU 触碰语义：`Map` 有序，先 delete 后 set 移到末尾）；
+2. 满了先扫一遍找已被 GC 的 WeakRef 清掉；
+3. 还满则淘汰最旧（`keys().next()`）。
+
+session 的写入时机（第 98-102 行）：
+
+```javascript
+socket
+  .on('session', function (session) {
+    sessionCache.set(sessionKey, session)
+  })
+```
+
+这是 Node TLS 的 `session` 事件 —— 新 session 协商完成后触发，undici 缓存之供下次 resumption（省一次完整握手 + 往返）。
+
+#### 15.3.4 httpSocket：在既有 socket 上叠 TLS（connect.js:93 / 104）
+
+`httpSocket` 参数允许把一个已建立的明文 socket 直接升级为 TLS —— 这是 CONNECT 隧道和 SOCKS5 隧道复用同一机制的关键：
+
+- 第 93 行：`socket: httpSocket` 传给 `tls.connect`；
+- 第 104 行：明文分支断言 `assert(!httpSocket, 'httpSocket can only be sent on TLS update')` —— 明文连接不允许带 httpSocket，防止误用。
+
+#### 15.3.5 连接超时与错误规范化（connect.js:134-190）
+
+- TCP keepAlive（第 135-138 行）：默认开启，60s 初始延迟，可配 `keepAliveInitialDelay`。
+- `util.setupConnectTimeout(new WeakRef(socket), ...)`（第 140 行）：WeakRef 防止定时器持有 socket 引用导致泄漏。
+- `maybeNormalizeConnectError`（第 172-190 行）：`autoSelectFamily` 的 `AggregateError` 里任一子错误是 ETIMEDOUT 就转 `ConnectTimeoutError`，原始错误挂 `.cause` —— 保证「不管哪个定时器先赢，用户看到的错误类型一致」。这是**错误规范化（error normalization）**的样板。
+
+#### 15.3.6 证书钉扎（cert pinning）：官方姿势 = 自定义 connector + checkServerIdentity
+
+undici 核心不带 pinning，但 `docs/examples/ca-fingerprint/index.js` 给出完整模式（`test/node-test/ca-fingerprint.js` 是对应测试）：自定义 `connect` 选项，在 `tls.connect` 的 `checkServerIdentity` 回调里比对 `fingerprint256`：
+
+```javascript
+// docs/examples/ca-fingerprint/index.js（节选，行号以示例文件为准）
+// 仅当 issuer 证书指纹等于预期值时放行
+} else if (getIssuerCertificate(socket).fingerprint256 !== caFingerprint) {
+```
+
+这验证了 undici 的一个重要架构性质：**`connect` 选项是完整的 TLS 定制插槽**（不只是换传输，还能注入证书校验逻辑）。laew 用 reqwest 时对应插槽是 `danger_accept_invalid_certs` + 自定义 `CertificateVerifier`（rustls），能力对等。
+
+---
+
+### 15.4 Cookies 与重定向链管理
+
+#### 15.4.1 核心结论：undici 只有「Cookie 工具函数」，没有 CookieJar
+
+`docs/docs/api/Cookies.md:18` 明确声明：
+
+> These functions do not manage a cookie jar or perform any network activity; they
+
+即 undici 的定位是「给需要自建 jar 的用户提供符合规范的解析/序列化原语」，而不是浏览器式自动 cookie 管理。`lib/web/cookies/` 四个文件（880 行）全部是无状态的纯函数。
+
+#### 15.4.2 API 面（lib/web/cookies/index.js）
+
+| 函数 | 行号 | 语义 |
+|---|---|---|
+| `getCookies(headers)` | 28-49 | 解析请求 `Cookie` 头 → `Record<name, value>` |
+| `deleteCookie(headers, name, attrs)` | 57-74 | 通过 `Set-Cookie: name=; Expires=Thu, 01 Jan 1970` 使其过期（对齐 Deno std） |
+| `getSetCookies(headers)` | 80-92 | 解析响应 `Set-Cookie` 数组 → `Cookie[]` 对象 |
+| `parseCookie(str)` | 98-102 | 单条 `Set-Cookie` 字符串 → `Cookie` |
+| `setCookie(headers, cookie)` | 109-121 | `Cookie` 对象 → 序列化并 append 到 `Set-Cookie` |
+
+全部走 `webidl.brandCheckMultiple([Headers, globalThis.Headers])` 品牌校验 + `webidl.dictionaryConverter` 严格类型转换（第 123-191 行定义了 `Cookie` 字典的 9 个字段转换器）。
+
+#### 15.4.3 parseSetCookie：RFC6265bis §5.4 逐步实现（lib/web/cookies/parse.js）
+
+**大小限制**（constants.js:4-7，来自 WICG cookie-store 规范）：
+
+```javascript
+// https://wicg.github.io/cookie-store/#cookie-maximum-attribute-value-size
+const maxAttributeValueSize = 1024
+// https://wicg.github.io/cookie-store/#cookie-maximum-name-value-pair-size
+const maxNameValuePairSize = 4096
+```
+
+主流程（第 14-86 行）严格按算法步骤编号注释：CTL 字符（除 HTAB）→ 整条丢弃；name/value 以第一个 `=` 分割（`value.join('=')` 保证后续 `=` 归值）；name+value 超 4096 → 丢弃。
+
+属性解析 `parseUnparsedAttributes`（第 94-312 行）是**递归实现**的循环算法 —— 每处理一个属性就递归处理剩余部分，非法属性（如 max-age 首字符非数字）直接跳过继续。覆盖 7 个属性：
+
+| 属性 | 行号 | 规范依据 |
+|---|---|---|
+| `Expires` | 174-183 | §5.4.1，`new Date()` 解析失败则忽略 |
+| `Max-Age` | 184-223 | §5.4.2，正负号 + 纯数字校验 |
+| `Domain` | 224-243 | §5.4.3，去前导点 + 小写化 |
+| `Path` | 244-264 | §5.4.4，非 `/` 开头默认 `/` |
+| `Secure` | 265-271 | §5.4.5 |
+| `HttpOnly` | 272-279 | §5.4.6 |
+| `SameSite` | 280-303 | §5.4.7，仅接受 None/Strict/Lax |
+| 未知属性 | 304-308 | 收进 `unparsed[]` 保真 |
+
+#### 15.4.4 stringify 与 Cookie 前缀强制（lib/web/cookies/util.js:273-343）
+
+序列化侧实施 **cookie 前缀安全语义**：
+
+```javascript
+// lib/web/cookies/util.js:285-293
+// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-cookie-prefixes-00#section-3.1
+if (cookie.name.startsWith('__Secure-')) {
+  cookie.secure = true
+}
+if (cookie.name.startsWith('__Host-')) {
+  cookie.secure = true
+  cookie.domain = null
+  cookie.path = '/'
+}
+```
+
+`__Secure-` 前缀强制 `Secure` 属性；`__Host-` 前缀更进一步强制 Secure + 无 Domain（不发给子域）+ Path=/。util.js 还包含完整的语法校验器族：`validateCookieName`（第 31-59 行，token 语法排除 CTL/分隔符）、`validateCookieValue`（第 69-96 行，cookie-octet + DQUOTE 包裹）、`validateCookiePath`、`validateCookieDomain`（第 149-193 行，RFC 1034/1123/1035 preferred name syntax 含 label ≤63 / 总长 ≤255 / 首尾禁连字符）、`toIMFDate`（第 248-254 行，IMF-fixdate 手工拼装避免 toUTCString 与规范差异）。
+
+#### 15.4.5 RedirectHandler：非 fetch 层的通用重定向引擎（lib/handler/redirect-handler.js，229 行）
+
+**可重定向状态码**（第 6 行）：`[300, 301, 302, 303, 307, 308]`。
+
+**方法重写规则**（第 75-90 行）：
+
+```javascript
+// In case of HTTP 301 or 302 with POST, change the method to GET
+// QUERY is safe (RFC 10008) and should not change method like GET.
+if ((statusCode === 301 || statusCode === 302) && this.opts.method === 'POST') {
+  this.opts.method = 'GET'
+  if (util.isStream(this.opts.body)) {
+    util.destroy(this.opts.body.on('error', noop))
+  }
+  this.opts.body = null
+  removeContentHeaders = true
+}
+// In case of HTTP 303, always replace method to be either HEAD or GET
+if (statusCode === 303 && this.opts.method !== 'HEAD') {
+  this.opts.method = 'GET'
+  ...
+```
+
+注意 QUERY 方法豁免（RFC 10008 新方法，语义安全）—— undici 紧跟规范演进的细节。
+
+**重定向循环检测**（第 104-112 行）—— 本轮的核心安全发现之一：
+
+```javascript
+// Check for redirect loops by seeing if we've already visited this URL in our history
+const redirectUrlString = `${origin}${path}`
+for (const historyUrl of this.history) {
+  if (historyUrl.toString() === redirectUrlString) {
+    throw new InvalidArgumentError(`Redirect loop detected. Cannot redirect to ${origin}. This typically happens when using a Client or Pool with cross-origin redirects. Use an Agent for cross-origin redirects.`)
+  }
+}
+```
+
+这是**精确 URL 级**的环检测（origin+path 全等）。注意它检测的是「曾经访问过」而非「连续两次相同」—— 更强的语义，能捕获 A→B→A 型环路。`maxRedirections` 本身也会限制总次数（第 73 行 `this.history.length >= this.maxRedirections` 置 null location 停止），双层保险。
+
+**头清洗策略**（第 168-184 行）：
+
+```javascript
+function shouldRemoveHeader (header, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin) {
+  const name = util.headerNameToString(header)
+  if (name === 'host') {
+    return true
+  }
+  if (stripHeaders?.has(name) || (unknownOrigin && stripHeadersOnCrossOrigin?.has(name))) {
+    return true
+  }
+  if (removeContent && name.startsWith('content-')) {
+    return true
+  }
+  if (unknownOrigin) {
+    return name === 'authorization' || name === 'cookie' || name === 'proxy-authorization'
+  }
+  return false
+}
+```
+
+四层规则：`host` 永远删；用户 strip 列表命中删；POST→GET/303 时 `content-*` 删；**跨源时 `authorization`/`cookie`/`proxy-authorization` 三张凭证头必删**。这最后一条是防「凭证被引到第三方域」的关键防线，laew 若实现 WebFetch 类工具必须复刻。
+
+**3xx body 一律忽略**（第 123-145 行）：`onResponseData` 里 `if (this.location)` 直接吞掉 chunk，`onResponseEnd` 时重新 dispatch。注释详细引用 RFC 7231 §6.4 论证为何 body 可安全忽略。
+
+**history 透传**（第 68-70 行）：`onRequestStart` 把 `this.history` 附到 context 上，上层（RetryAgent、用户 handler）能看到完整跳转链。
+
+#### 15.4.6 fetch 层的 httpRedirectFetch（lib/web/fetch/index.js:1251-1390）
+
+fetch 规范版重定向，与 RedirectHandler 语义对齐但实现独立：
+
+- **硬上限 20 跳**（第 1287-1290 行）：`if (request.redirectCount === 20) return makeNetworkError('redirect count exceeded')`。
+- **跨源删头**（第 1350-1360 行）：删 `authorization`、`proxy-authorization`、`cookie`、`host`，注释说明 Cookie/Host 是 forbidden request-headers 但 undici 不实现禁用逻辑，所以在重定向处显式删。
+- **referrer policy 更新**（第 1387-1389 行）：`setRequestReferrerPolicyOnRedirect(request, actualResponse)`。
+- **timing 记账**（第 1370-1382 行）：`redirectEndTime` / `postRedirectStartTime` / `redirectStartTime` 三字段维护。
+
+#### 15.4.7 重定向拦截器装配（lib/interceptor/redirect.js，21 行）
+
+```javascript
+function createRedirectInterceptor ({ maxRedirections: defaultMaxRedirections, throwOnMaxRedirect: defaultThrowOnMaxRedirect, stripHeadersOnRedirect: defaultStripHeadersOnRedirect, stripHeadersOnCrossOriginRedirect: defaultStripHeadersOnCrossOriginRedirect } = {}) {
+  return (dispatch) => {
+    return function Intercept (opts, handler) {
+      const { maxRedirections = defaultMaxRedirections, ... } = opts
+      if (maxRedirections == null || maxRedirections === 0) {
+        return dispatch(opts, handler)
+      }
+      const redirectHandler = new RedirectHandler(dispatch, maxRedirections, dispatchOpts, handler)
+      return dispatch(dispatchOpts, redirectHandler)
+    }
+  }
+}
+```
+
+默认值兜底 + 请求级覆盖 + `0/null` 短路直通 —— 拦截器「可选增强而非强制包裹」的标准姿势。
+
+---
+
+### 15.5 对 laew 的借鉴路线图
+
+| 优先级 | 借鉴项 | undici 依据 | laew 落地方式 |
+|---|---|---|---|
+| **P0-1** | **LLM API 调用走系统代理（尊重 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`）** | `env-http-proxy-agent.js:22-41` 三级链式回退 | reqwest 默认支持系统代理，但要在 `Client::builder()` 确认 `.no_proxy()` 未被误关；企业内网部署 laew 时必需 |
+| **P0-2** | **跨源重定向时删除凭证头**（authorization/cookie/proxy-authorization） | `redirect-handler.js:180-182` | laew 未来加 WebFetch/WebSearch 工具时，重定向后必须重洗 headers；LLM API 调用同样适用 |
+| **P0-3** | **请求重试前判定 body 可重放性**（已消费的流不可重发） | `client-h2.js` `canReplayRequest` + `util.isDisturbed()` | laew 重试逻辑：确保 body 是 `Bytes`（Clone 廉价），永远不要对流式 body 重试 |
+| **P0-4** | **错误分类决定重试语义**（协议错误立即失败，网络错误可重试） | `proxy-agent.js:257-267`（`UND_ERR_SOCKET` → `ProxyConnectionError` 防死循环重试） | laew 的 `AgentError` 应区分 `Retryable`/`Fatal`；解析错误(协议层)重试无意义 |
+| **P1-1** | **TLS session 复用**（省握手往返） | `connect.js:15-60` `WeakSessionCache`（WeakRef+FinalizationRegistry） | reqwest/hyper 自动做 session resumption，laew 无需干预；但要保持 Client 单例（第七轮已列） |
+| **P1-2** | **自定义 CA 支持**（企业私有 CA 场景） | `buildConnector` 透传 `ca`/`cert`/`key` | laew 配置增加 `extra_ca_certs` 字段，`ClientBuilder::add_root_certificate()`；对应 reqwest 的 `rustls` 配置 |
+| **P1-3** | **重定向历史透传给上层**（诊断/审计） | `redirect-handler.js:68-70` `history` 注入 context | laew LLM 调用若遇重定向（如 API 网关 302），把跳转链记入 tracing span |
+| **P1-4** | **NO_PROXY 通配符与子域后缀匹配** | `env-http-proxy-agent.js:101-115` | 若 laew 自实现代理路由，按 `hostname === entry || hostname.endsWith('.' + entry)` 匹配 |
+| **P2-1** | **SOCKS5 代理支持** | `socks5-proxy-agent.js` + `socks5-client.js`（RFC 1928/1929 全实现） | reqwest 开 `socks` feature 即支持 socks5:// URL；laew 按 provider 配置透传即可 |
+| **P2-2** | **证书指纹钉扎（fingerprint pinning）** | `docs/examples/ca-fingerprint/index.js` | laew 用 rustls 自定义 `ServerCertVerifier` 比对 SHA-256；高安全部署（私有化 LLM 网关）可选 |
+| **P2-3** | **Cookie 工具函数库**（若 laew 加 Web 访问工具） | `lib/web/cookies/` 880 行纯函数 + 严格 RFC 6265bis | Rust 生态用 `cookie` crate；或仅做最小 header 注入，不建 jar |
+| **P2-4** | **协议版本可配置**（h1/h2/h2c 强制切换） | `connect.js:70-92` `allowH2`/`preferH2`/`useH2c` | reqwest `.http1_only()` / `http2_prior_knowledge()` 已覆盖；laew 可在 provider 配置暴露 |
+| **P2-5** | **HTTP/3 保持观望** | 仓库内零实现，仅 Alt-Svc 头白名单 | laew 不投入；等 reqwest http3 稳定 + Anthropic/OpenAI 端点支持后再评估 |
+
+---
+
+### 15.6 综合：四维度交叉点
+
+四个维度并非孤立，它们在三个真实场景里交汇：
+
+**(1) 隧道 + TLS 双层握手**（15.2 × 15.3）：CONNECT 隧道建立后，`connectEndpoint({ ...opts, httpSocket: socket })` 在隧道上再做 TLS。此时 SNI 用 `requestTls.servername`（真实目标），而隧道本身的 SNI 已在 CONNECT 请求阶段用 `proxyTls.servername || proxyHostname` 定死。两次握手、两套证书校验、两个 sessionKey —— laew 实现时最容易在这里把两层 TLS 的 CA/SNI 配置混用。
+
+**(2) 代理 + 重定向的凭证边界**（15.2 × 15.4）：`proxy-authorization` 只发给代理（构造器注入，请求头出现即抛错）；`authorization`/`cookie` 只发给同源目标（跨源重定向即删）。两类凭证的传播域完全不同，undici 用两套独立的清洗机制守住了边界。
+
+**(3) 连接复用 × 协议协商的降级链**（15.1 × 15.3）：ALPN 协商失败时 undici 不阻塞 —— h2 不可用就回落 h1（`client.js` 按 `socket.alpnProtocol` 分流），这与「HTTP/3 可用时升级、不可用时回落 h2/h1」的 Alt-Svc 语义在思想上同构：**协议升级必须是渐进增强，任何一层失败都有低一级的兜底**。
+
+---
+
+### 15.7 关键文件路径汇总
+
+| 文件 | 行数 | 本轮覆盖维度 |
+|---|---|---|
+| `lib/core/connect.js` | 192 | ③ TLS/SNI/ALPN/session 复用/httpSocket |
+| `lib/core/socks5-client.js` | 422 | ② SOCKS5 RFC 1928 状态机 |
+| `lib/core/socks5-utils.js` | 212 | ② SOCKS5 地址编码（IPv6/Domain） |
+| `lib/dispatcher/proxy-agent.js` | 378 | ② ProxyAgent / CONNECT 隧道 / 407 / 凭证防护 |
+| `lib/dispatcher/socks5-proxy-agent.js` | 282 | ② SOCKS5 代理编排 / per-origin Pool |
+| `lib/dispatcher/env-http-proxy-agent.js` | 175 | ② 环境变量路由 / NO_PROXY 匹配 |
+| `lib/handler/redirect-handler.js` | 229 | ④ 重定向引擎 / 环检测 / 头清洗 |
+| `lib/interceptor/redirect.js` | 21 | ④ 重定向拦截器装配 |
+| `lib/web/cookies/index.js` | 199 | ④ Cookie API 面（无 jar） |
+| `lib/web/cookies/parse.js` | 317 | ④ RFC6265bis §5.4 解析 |
+| `lib/web/cookies/util.js` | 352 | ④ 校验器族 + `__Secure-`/`__Host-` 前缀 |
+| `lib/web/cookies/constants.js` | 12 | ④ 尺寸限制（4096/1024） |
+| `lib/core/constants.js` | 120 | ① Alt-Svc/Alt-Used 白名单（唯一痕迹） |
+| `lib/web/fetch/index.js:1251-1390` | — | ④ fetch 层 httpRedirectFetch |
+| `docs/examples/ca-fingerprint/index.js` | — | ③ 证书指纹钉扎官方示例 |
+| `test/node-test/ca-fingerprint.js` | — | ③ 钉扎测试 |
+
+---
+
+### 15.8 本轮不重复声明
+
+本轮（第八轮）**未重复**以下已有内容：
+
+- **第七轮（第 14 章）**：连接池 KeepAlive 生命周期、HTTP/2 多路复用与 SETTINGS/流控、DiagnosticsChannel 18 通道清单、背压与 Body 流控、`maxResponseSize`、`bodyTimeout` 与 pause 交互 —— 本轮仅引用 `undici:proxy:connected` 一处作为代理链证据，未展开通道清单。
+- **第 5 章（拦截器总览）**：8 个拦截器的职责速览 —— 本轮只对 `redirect.js` 做「装配模式」角度的新剖析（默认值兜底 + 请求级覆盖 + 短路直通），不重复拦截器清单。
+- **第 10 章（HTTP 传输层深度）**：h1/h2 请求生命周期、超时体系 —— 本轮的 CONNECT 隧道是代理层新增内容，与第 10 章的常规请求流不重叠。
+- **第 11 章（Web API 层）**：fetch 的 request/response/Headers 结构 —— 本轮只剖析 `httpRedirectFetch` 的重定向步骤（第 1251-1390 行），未涉及 Headers 实现。
+- **第 4/7/8/9/12/13 章**：API 风格、Mock、错误类层次（本轮仅新增引用 `SecureProxyConnectionError`/`ProxyConnectionError`/`Socks5ProxyError` 在代理上下文中的语义，不重复类层次表）、基础设施、Mock 深度、laew 借鉴主文。
+
+本轮四个维度（HTTP/3 QUIC、代理链 SOCKS、TLS 证书 Client Hello、Cookies 重定向）均为**前七轮未覆盖的全新维度**，所有结论附 `lib/xxx.js:LINE` 真实路径与代码片段。

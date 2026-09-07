@@ -4039,3 +4039,1105 @@ laew 现状（参照 CLAUDE.md）：`src/agent/tools/bash.rs` 只有基础 `toki
 **第一性原则**：laew 与 opencode 的最大差异是 **laew 没有持续投入 6 轮 100+ 工程师月的资源**。**P0 全部抄到（4 个工具）就能让 laew 的"代码能力"对标 opencode 80%**，剩下的 20% 是 V2 core 那套重构（TODO 多 = 实现薄），**不急**。
 
 ---
+
+## 20. 第八轮深挖 — Enterprise Durable Object + 多端 UI + HTTP Recorder + Slack 集成（2026-09-07）
+
+前 7 轮已覆盖 opencode 的核心 runtime（Effect 全栈 DI、34 包 workspace、15 种 LLMEvent、Tool 系统、流式渲染、记忆、Skill、错误重试、Cost、可观测性、Session 持久化、测试、配置 8 层发现、插件生态、第六轮 Effect/Schema/LayerNode/Durable Object、第七轮 Edit/grep/Bash）。**本轮聚焦 4 个全新的横切维度**，全部为「**生态外延**」类能力——与已有 19 章聚焦的「agent 内核」并列的「**生态外延**」：Enterprise 持久化与云存储、多端 UI、协议录制回放、企业 IM 集成。这 4 个维度的共同特征是：它们都不是「让 LLM 更聪明」的能力，而是「让 LLM 跑得起来、跑得出去、跑得进企业」的能力。
+
+### 20.1 Enterprise Durable Object + R2 云存储
+
+#### 20.1.1 包定位与部署目标
+
+`packages/enterprise/` 是一个**部署到 Cloudflare Workers** 的 SolidStart 应用（同时支持自托管 Nitro server）。`package.json:1-14` 显示它通过 `OPENCODE_DEPLOYMENT_TARGET=cloudflare` 环境变量切换：
+
+```json
+"build": "vite build",
+"build:cloudflare": "OPENCODE_DEPLOYMENT_TARGET=cloudflare vite build",
+"start": "vite start",
+"shell-prod": "sst shell --target Teams --stage production"
+```
+
+`vite.config.ts:7-23` 进一步定义了 nitro preset 切换：
+
+```typescript
+const nitroConfig: any = (() => {
+  const target = process.env.OPENCODE_DEPLOYMENT_TARGET
+  if (target === "cloudflare") {
+    return {
+      compatibilityDate: "2024-09-19",
+      preset: "cloudflare-module",
+      cloudflare: { nodeCompat: true },
+    }
+  }
+  return {}
+})()
+```
+
+`compatibilityDate: 2024-09-19` 是 Cloudflare Workers 的**功能冻结日期**——这一天之后 Workers runtime 的新特性将不再对此 worker 启用。这是**严肃工程**的做法：避免 Cloudflare 推送更新后旧代码行为变化。`nodeCompat: true` 允许使用 `node:crypto`（enterprise API 中确实用了 `timingSafeEqual`）。
+
+**注意**：尽管项目名是 "Durable Object"，但 enterprise 实际**没有用 Durable Object 的 SQL API**——它把所有持久化都委托给 R2/S3 存储（`src/core/storage.ts`），Durable Object 仅作为 Workers 容器。**这与「经典 Durable Object + D1 + R2 三件套」范式有差异**——opencode 的 enterprise 选择**只用 R2** 简化部署。
+
+#### 20.1.2 Storage 抽象层 — R2/S3 双适配
+
+`src/core/storage.ts:4-10` 定义了 4 个方法的 `Adapter` 接口：
+
+```typescript
+export interface Adapter {
+  read(path: string): Promise<string | undefined>
+  write(path: string, value: string): Promise<void>
+  remove(path: string): Promise<void>
+  list(options?: { prefix?: string; limit?: number; after?: string; before?: string }): Promise<string[]>
+}
+```
+
+**注意：`list` 返回的是完整 key 列表**（不是分页 cursor），这与 S3 标准 ListObjectsV2 的 `IsTruncated`+`NextContinuationToken` 模型不同——enterprise 选择简化（一次拉完），适合小规模 share 数据。`adapter.createAdapter`（`storage.ts:12-64`）基于 `aws4fetch`（Cloudflare Workers 上用的纯 fetch SigV4 实现，不是 AWS SDK）实现通用 S3 协议客户端。
+
+R2 与 S3 适配（`storage.ts:66-84`）：
+
+```typescript
+function s3(): Adapter {
+  const bucket = process.env.OPENCODE_STORAGE_BUCKET!
+  const region = process.env.OPENCODE_STORAGE_REGION || "us-east-1"
+  const client = new AwsClient({
+    region,
+    accessKeyId: process.env.OPENCODE_STORAGE_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.OPENCODE_STORAGE_SECRET_ACCESS_KEY!,
+  })
+  return createAdapter(client, `https://s3.${region}.amazonaws.com`, bucket)
+}
+
+function r2() {
+  const accountId = process.env.OPENCODE_STORAGE_ACCOUNT_ID!
+  const client = new AwsClient({
+    accessKeyId: process.env.OPENCODE_STORAGE_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.OPENCODE_STORAGE_SECRET_ACCESS_KEY!,
+  })
+  return createAdapter(client, `https://${accountId}.r2.cloudflarestorage.com`, process.env.OPENCODE_STORAGE_BUCKET!)
+}
+```
+
+**关键设计选择**：**R2 与 S3 共用同一个 S3 协议客户端**（不引入 R2-specific SDK），因为 R2 完全兼容 S3 API。endpoint 仅 hostname 不同（`${accountId}.r2.cloudflarestorage.com` vs `s3.${region}.amazonaws.com`）。**Region 字段对 R2 不传**（R2 是 single-region 默认 us-east-1 兼容）。
+
+`adapter` 解析（`storage.ts:86-91`）通过 `lazy()` 懒加载——**只有真正调用 read/write 时才校验环境变量**，避免 cold start 时全部 env 必填：
+
+```typescript
+const adapter = lazy(() => {
+  const type = process.env.OPENCODE_STORAGE_ADAPTER
+  if (type === "r2") return r2()
+  if (type === "s3") return s3()
+  throw new Error("No storage adapter configured")
+})
+```
+
+`key` 路径解析（`storage.ts:93-95`）强制加 `.json` 后缀——**所有 share 数据都视为 JSON blob**：
+
+```typescript
+function resolve(key: string[]) {
+  return key.join("/") + ".json"
+}
+```
+
+`update` 函数（`storage.ts:122-128`）实现了 **read-modify-write** 原子性（依赖 caller 保证不并发，**没有 CAS/乐观锁**）：
+
+```typescript
+export async function update<T>(key: string[], fn: (draft: T) => void) {
+  const val = await read<T>(key)
+  if (!val) throw new Error("Not found")
+  fn(val)
+  await write(key, val)
+  return val
+}
+```
+
+#### 20.1.3 Share 数据模型 — 5 种 discriminatedUnion
+
+`src/core/share.ts:18-40` 用 Zod `discriminatedUnion` 定义 5 种 share data type：
+
+```typescript
+export const Data = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("session"), data: z.custom<Session>() }),
+  z.object({ type: z.literal("message"), data: z.custom<Message>() }),
+  z.object({ type: z.literal("part"), data: z.custom<Part>() }),
+  z.object({ type: z.literal("session_diff"), data: z.custom<SnapshotFileDiff[]>() }),
+  z.object({ type: z.literal("model"), data: z.custom<Model[]>() }),
+])
+```
+
+**注意：data 字段用 `z.custom<>()` 而不是具体 schema**——这是为了**避免 enterprise 包依赖 core 包的全部 Session/Message/Part schema**（避免打包膨胀），用 `import type` 引入 SDK 类型仅作 IDE 提示，运行时不做 zod 校验。**这是 enterprise 的「轻量级」取舍**：把校验逻辑放在 client 侧发送端（`@opencode-ai/sdk`），server 信任 client 提交的类型。
+
+#### 20.1.4 Share 合并算法 — snapshot + compaction 双轨
+
+`share.ts:78-115` 是 **「snapshot 优先 + 旧数据 lazy 迁移」** 的两轨机制：
+
+```typescript
+async function readSnapshot(shareID: string) {
+  return (await Storage.read<Snapshot>(["share_snapshot", shareID]))?.data
+}
+
+async function writeSnapshot(shareID: string, data: Data[]) {
+  await Storage.write<Snapshot>(["share_snapshot", shareID], { data })
+}
+
+async function legacy(shareID: string) {
+  const compaction: Compaction = (await Storage.read<Compaction>(["share_compaction", shareID])) ?? {
+    data: [],
+    event: undefined,
+  }
+  const list = await Storage.list({
+    prefix: ["share_event", shareID],
+    before: compaction.event,
+  }).then((x) => x.toReversed())
+  if (list.length === 0) {
+    if (compaction.data.length > 0) await writeSnapshot(shareID, compaction.data)
+    return compaction.data
+  }
+  const next = merge(
+    compaction.data,
+    await Promise.all(list.map(async (event) => await Storage.read<Data[]>(event))).then((x) =>
+      x.flatMap((item) => item ?? []),
+    ),
+  )
+  await Promise.all([
+    Storage.write(["share_compaction", shareID], {
+      event: list.at(-1)?.at(-1),
+      data: next,
+    }),
+    writeSnapshot(shareID, next),
+  ])
+  return next
+}
+```
+
+设计思想：每次 `sync` 时**先尝试读 snapshot**（快路径，单个 S3 GET），若 snapshot 缺失则降级到「**legacy mode**」：拉 `share_event/{id}/` 前缀下所有事件文件 + `share_compaction/{id}` 已压缩的检查点，**合并**后回写 snapshot 一次（**数据迁移是 lazy 一次性**）。后续 sync 直接走 fast path。**这是「旧版本兼容」+「冷数据预热」的经典 pattern**。
+
+`merge` 函数（`share.ts:66-76`）用 `key(item)` 生成唯一 key，按 key 去重，**保留最新**：
+
+```typescript
+function merge(...items: Data[][]) {
+  const map = new Map<string, Data>()
+  for (const list of items) {
+    for (const item of list) {
+      map.set(key(item), item)
+    }
+  }
+  return Array.from(map.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, item]) => item)
+}
+```
+
+`key` 按类型生成层级 path（`share.ts:51-64`）：
+
+```typescript
+function key(item: Data) {
+  switch (item.type) {
+    case "session": return "session"
+    case "message": return `message/${item.data.id}`
+    case "part": return `part/${item.data.messageID}/${item.data.id}`
+    case "session_diff": return "session_diff"
+    case "model": return "model"
+  }
+}
+```
+
+**注意**：`part` 用 `messageID/id` 复合 key（不是 `sessionID/messageID/id` 三级）—— share 是 per-session 的，**messageID 本身已是全 session 唯一**。
+
+#### 20.1.5 鉴权 — secret + timingSafeEqual
+
+`share.ts:117-128` 创建 share 时**生成随机 secret**：
+
+```typescript
+const info: Info = {
+  id: (isTest ? "test_" : "") + body.sessionID.slice(-8),
+  sessionID: body.sessionID,
+  secret: crypto.randomUUID(),
+}
+const exists = await get(info.id)
+if (exists) throw new Errors.AlreadyExists(info.id)
+await Promise.all([Storage.write(["share", info.id], info), writeSnapshot(info.id, [])])
+return info
+```
+
+**share ID 是 sessionID 后 8 位**——`slice(-8)` 不可逆但人眼可关联（用户看到 share URL 时知道是哪个 session）。`secret` 是 `crypto.randomUUID()` 122 位熵，作为删除/sync 操作的 bearer token。
+
+删除 share（`share.ts:134-148`）用 secret 校验 + 4 路径级联删除：
+
+```typescript
+export const remove = fn(Info.pick({ id: true, secret: true }), async (body) => {
+  const share = await get(body.id)
+  if (!share) throw new Errors.NotFound(body.id)
+  if (share.secret !== body.secret) throw new Errors.InvalidSecret(body.id)
+  await Storage.remove(["share", body.id])
+  const groups = await Promise.all([
+    Storage.list({ prefix: ["share_snapshot", body.id] }),
+    Storage.list({ prefix: ["share_compaction", body.id] }),
+    Storage.list({ prefix: ["share_event", body.id] }),
+    Storage.list({ prefix: ["share_data", body.id] }),
+  ])
+  for (const item of groups.flat()) {
+    await Storage.remove(item)
+  }
+})
+```
+
+**注意：secret 比较用 `===` 而不是 `timingSafeEqual`**——这是 enterprise 自己的代码；但 HTTP API 层（`src/routes/api/[...path].ts:142-155`）在 admin 路径用了**真正的 timingSafeEqual**：
+
+```typescript
+.delete("/support/actions/remove-share", async (c) => {
+  const authorization = c.req.header("authorization")
+  const expected = `Bearer ${(Resource as unknown as Record<string, { value: string }>).SUPPORT_API_KEY.value}`
+  const actual = Buffer.from(authorization ?? "")
+  const secret = Buffer.from(expected)
+  if (actual.length !== secret.length || !timingSafeEqual(actual, secret))
+    return c.json({ error: "Unauthorized" }, 401)
+  // ...
+})
+```
+
+**不一致性**：share owner secret 用 `===`，admin API key 用 `timingSafeEqual`。前者风险更小（UUID 122 位熵，定时攻击难度大），后者是 admin 操作权限更大需要严格防时序侧信道。**这是合理的「按威胁建模分级防护」**。
+
+#### 20.1.6 HTTP API — Hono + OpenAPI 3.1.1
+
+`src/routes/api/[...path].ts:11-28` 用 Hono 框架（不是 Express/Fastify）定义 API：
+
+```typescript
+const app = new Hono()
+
+app
+  .basePath("/api")
+  .use(cors())
+  .get(
+    "/doc",
+    openAPIRouteHandler(app, {
+      documentation: {
+        info: { title: "Opencode Enterprise API", version: "1.0.0", description: "Opencode Enterprise API endpoints" },
+        openapi: "3.1.1",
+      },
+    }),
+  )
+```
+
+**关键观察**：API 文档是 **运行时生成**（`/api/doc`）—— `openAPIRouteHandler` 扫所有 `describeRoute` 装饰的 endpoint 合并输出 OpenAPI 3.1.1。`describeRoute + validator` 组合（`api/[...path].ts:29-65`）：
+
+```typescript
+.post(
+  "/share",
+  describeRoute({
+    description: "Create a share",
+    operationId: "share.create",
+    responses: { 200: { description: "Success", content: { "application/json": { schema: resolver(z.object({...}).meta({ ref: "Share" })) } } } },
+  }),
+  validator("json", z.object({ sessionID: z.string() })),
+  async (c) => { /* ... */ }
+)
+```
+
+**Hono 的设计哲学**：**所有 metadata + schema + handler 都在同一处定义**（不像 Express 那样要写 swagger.yaml 单独维护）。`z.object(...).meta({ ref: "Share" })` 把 Zod schema 注册到 OpenAPI 的 `$defs`，让 `/api/doc` 输出标准 JSON Schema。**Zod ↔ JSON Schema 的双向转换是 Hono 生态的核心竞争力**。
+
+HTTP API 最终通过 SolidStart 的 `APIEvent` 桥接（`api/[...path].ts:157-171`）：
+
+```typescript
+export function GET(event: APIEvent) { return app.fetch(event.request) }
+export function POST(event: APIEvent) { return app.fetch(event.request) }
+export function PUT(event: APIEvent) { return app.fetch(event.request) }
+export async function DELETE(event: APIEvent) { return app.fetch(event.request) }
+```
+
+——把 SolidStart 的 server function 入口**直接转交 Hono 处理**。这种「SolidStart 路由壳 + Hono API 中间件」模式让 enterprise 同时享受 SolidStart 的 SSR 能力（share 页面）和 Hono 的中间件生态（cors/validator/openapi）。
+
+#### 20.1.7 share 页面 — SSR + DataProvider + WorkerPool
+
+`src/routes/share/[shareID].tsx:58-122` 是 share 详情页的核心——`query` + `"use server"` 标记让此函数在**服务端执行**：
+
+```typescript
+const getData = query(async (shareID) => {
+  "use server"
+  const share = await Share.get(shareID)
+  if (!share) throw new SessionDataMissingError({ sessionID: shareID })
+  const data = await Share.data(shareID)
+  // ... 重组为 session/message/part/model 字典
+  for (const item of data) {
+    switch (item.type) {
+      case "session": result.session.push(item.data); break
+      case "session_diff": result.session_diff[share.sessionID] = item.data; break
+      // ...
+    }
+  }
+  return result
+}, "getShareData")
+```
+
+**`"use server"` 指令**是 SolidStart/RSC 的语法——让 `getData` 在 server 端运行，client 只拿到返回值。**避免把 share secret / 全部 session data 传到浏览器**。`Binary.search`（`[shareID].tsx:119`）用二分查找 session（session 列表按 id 排序）。
+
+`SessionDataMissingError`（`[shareID].tsx:35-56`）继承自 `NamedError`（core 的统一错误基类），`isInstance` 用 `NamedError.hasName` 实现 type guard —— **Error 类继承 + name 字段 + 静态 isInstance** 是 opencode 的统一错误模式。
+
+页面渲染（`[shareID].tsx:124-417`）用 `createAsync` 异步加载 + `ErrorBoundary` 兜底 + `<ClientOnly>` 包裹 Web Worker：
+
+```typescript
+const ClientOnlyWorkerPoolProvider = clientOnly(() =>
+  import("@opencode-ai/session-ui/pierre/worker").then((m) => ({
+    default: (props: { children: any }) => (
+      <WorkerPoolProvider pools={m.getWorkerPools()}>{props.children}</WorkerPoolProvider>
+    ),
+  })),
+)
+```
+
+**`clientOnly` 包裹 `@pierre/diffs` Web Worker**——`WorkerPoolProvider` 注入 worker pool 给 `SessionReview` 组件（计算 diff 视图），Web Worker **只在 client 端动态 import**（SSR 阶段跳过），避免 server 端没有 `Worker` 全局报错。
+
+#### 20.1.8 enterprise 包对 laew 的核心借鉴
+
+| 维度 | opencode 做法 | laew 借鉴 | 优先级 |
+|------|---------------|-----------|--------|
+| Storage 抽象 | `Adapter` interface 4 方法 + 双实现 (R2/S3) | 用 `async-trait` 抽象 `Storage` trait，本地实现 + S3 实现（用 `aws-sdk-s3` 或 `s3` crate） | P2 |
+| Share 数据迁移 | snapshot 快路径 + legacy lazy 迁移 | 暂不需要（laew 无历史 share 包袱） | N/A |
+| 鉴权分级 | owner secret `===` + admin `timingSafeEqual` | `crypto.subtle.timingSafeEqual` 给 API Key；`===` 给 share token | P1 |
+| OpenAPI 生成 | Hono `describeRoute + validator` 运行时生成 | 引入 `utoipa` crate 给 `src/server/` 路由自动生成 OpenAPI 文档 | P2 |
+| SolidStart `"use server"` | server-only 函数标记 | laew TUI 模式下无 RSC，等价物是「`run_in_background` + 持久化」标志 | N/A |
+| Web Worker 池 | `clientOnly(() => import("./worker"))` | laew TUI 暂不需要（无 GUI 渲染）；未来 web 版用 `vite-plugin-cross-origin-isolation` + `Comlink` | P3 |
+
+### 20.2 多端 UI 框架（web/desktop/slack/cli）
+
+opencode 的 5 个客户端入口各有独立的构建栈：
+
+| 端 | 包 | 构建栈 | 渲染目标 |
+|----|------|--------|----------|
+| **CLI** | `packages/cli/` | Bun + Effect CLI | 终端 stdout |
+| **TUI** | `packages/tui/` | SolidJS + OpenTUI | 终端 cell |
+| **App** | `packages/app/` | Vite + SolidJS | Web 浏览器（无 SSR） |
+| **Web** | `packages/web/` | Astro + Starlight + SolidJS | 静态站 + Cloudflare Workers |
+| **Desktop** | `packages/desktop/` | Electron + electron-vite + SolidJS | Win/Mac/Linux 原生壳 |
+| **Slack** | `packages/slack/` | Bun + `@slack/bolt` | Slack channel |
+
+**注意：`@opencode-ai/app` 是 web SPA**（纯客户端 Vite 构建，不做 SSR），`@opencode-ai/web` 是**文档站**（Astro Starlight，部署到 Cloudflare），desktop 包**复用 app 包作为渲染层**（`devDependencies` 里 `desktop` 依赖 `app`，`electron-vite` 把 app 打包成 renderer）。
+
+#### 20.2.1 CLI 端 — Effect Command + lazy handler
+
+`packages/cli/src/index.ts:1-32`：
+
+```typescript
+#!/usr/bin/env bun
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime"
+import * as NodeServices from "@effect/platform-node/NodeServices"
+import * as Effect from "effect/Effect"
+import { Commands } from "./commands/commands"
+import { Runtime } from "./framework/runtime"
+import { Daemon } from "./services/daemon"
+
+const Handlers = Runtime.handlers(Commands, {
+  $: () => import("./commands/handlers/default"),
+  api: () => import("./commands/handlers/api"),
+  debug: { agents: () => import("./commands/handlers/debug/agents") },
+  migrate: () => import("./commands/handlers/migrate"),
+  service: { start: ..., restart: ..., status: ..., stop: ..., password: ... },
+  serve: () => import("./commands/handlers/serve"),
+})
+
+Runtime.run(Commands, Handlers, { version: "local" }).pipe(
+  Effect.provide(Daemon.layer),
+  Effect.provide(NodeServices.layer),
+  Effect.scoped,
+  NodeRuntime.runMain,
+)
+```
+
+**`Runtime.handlers()`**（`framework/runtime.ts:42-56`）接收 spec 树 + handler 树，**递归 walk 生成 `LazyHandler[]`**——每个 handler 是 `() => import(...)` 懒加载（**让 cold start 只解析 `default` 路径，其他子命令文件不读**）。
+
+`Command.withHandler`（`framework/runtime.ts:62-77`）把 lazy import 包装成 `Effect.gen`，`Effect.flatMap(Effect.promise(handler.load), ...)` 实现**「点击才加载」**——这是 laew 急需的 pattern（laew 当前所有模块都是 `use` 静态导入，冷启动慢）。
+
+#### 20.2.2 Web 端 — Astro + Starlight + i18n middleware
+
+`packages/web/astro.config.mjs:13-32`：
+
+```javascript
+export default defineConfig({
+  site: config.url,
+  base: "/docs",
+  output: "server",
+  adapter: cloudflare({ imageService: "passthrough" }),
+  // ...
+  integrations: [
+    configSchema(),  // 本地插件: build:done 时 spawn schema 生成脚本
+    solidJs(),       // 允许 .astro 文件嵌入 SolidJS 组件
+    starlight({ title: "OpenCode", defaultLocale: "root", /* 20 种语言 */ }),
+  ],
+})
+```
+
+**i18n middleware**（`web/src/middleware.ts:80-94`）实现**URL 重写 + cookie 记忆 + Accept-Language fallback**：
+
+```typescript
+export const onRequest = defineMiddleware((ctx, next) => {
+  const alias = docsAlias(ctx.url.pathname)
+  if (alias) return redirect(ctx.url, alias.path, alias.locale)
+
+  if (ctx.url.pathname !== "/docs" && ctx.url.pathname !== "/docs/") return next()
+
+  const locale =
+    localeFromCookie(ctx.request.headers.get("cookie")) ??
+    localeFromAcceptLanguage(ctx.request.headers.get("accept-language"))
+  if (!locale || locale === "root") return next()
+
+  return redirect(ctx.url, `/docs/${locale}/`)
+})
+```
+
+**3 级 locale 解析**：URL prefix → `oc_locale` cookie (1 year, SameSite=Lax) → `Accept-Language` (q-value 排序)。`exactLocale` 防止 `/docs/zh-hans` 误匹配 `/docs/zh-cn`——**严格匹配 + 备选列表**。
+
+`configSchema` 本地插件（`web/astro.config.mjs:314-323`）在 build 完成时 spawn 一个**子进程跑 schema 生成脚本**：
+
+```javascript
+function configSchema() {
+  return {
+    name: "configSchema",
+    hooks: {
+      "astro:build:done": async () => {
+        console.log("generating config schema")
+        spawnSync("../opencode/script/schema.ts", ["./dist/config.json", "./dist/tui.json"])
+      },
+    },
+  }
+}
+```
+
+——把**配置 schema 的 JSON Schema 表示**嵌入到文档站，让 web 文档自动反映最新配置。**这是「文档即代码」+「schema 自动同步」** 的优秀实践。
+
+#### 20.2.3 Desktop 端 — Electron + Sidecar + WSL
+
+`packages/desktop/src/main/index.ts:115-120` 的主进程启动器使用 **Effect.gen**（与 web/CLI 一致的 Effect 全栈）：
+
+```typescript
+const main = Effect.gen(function* () {
+  contextMenu({ showSaveImageAs: true, showLookUpSelection: false, showSearchWithGoogle: false })
+
+  // on macOS apps run in `/` which can cause issues with ripgrep
+  try {
+    process.chdir(homedir())
+  } catch (error) {
+    // ...
+  }
+  // ...
+})
+```
+
+**`spawnLocalServer`（src/main/server.ts）** 在 desktop 内**作为子进程启动 opencode CLI server**——desktop 自身**不实现 agent 逻辑**，只做窗口/IPC/菜单/auto-update。**Sidecar pattern**：UI 端与 logic 端解耦，desktop 仅是「壳」，真正的 session 管理在 CLI server（同一份代码给 TUI/CLI/SDK 用）。
+
+`SIDECAR_VERSION`（`main/index.ts:64`）：
+
+```typescript
+const SIDECAR_VERSION = process.env.OPENCODE_SIDECAR_V2 === "1" ? "v2" : "v1"
+```
+
+——**灰度发布机制**：通过 env var 让 desktop 启动 v1 或 v2 sidecar，**用户无感知 A/B test**。`@lydell/node-pty` 依赖（`desktop/package.json:32`）让 desktop 内嵌 PTY 跑 shell 命令——这与 laew 的 Bash 工具实现思路一致（laew 需 `portable-pty` crate）。
+
+**WSL 子模块**（`main/wsl/`）7 个文件专门处理「Windows 上跑 Linux opencode」的 sidecar 进程：servers.ts / sidecar.ts / runtime.ts / policy.ts / startup.ts / ipc.ts。**WSL 边界**：Windows 桌面 → WSL 内的 opencode server，要处理 distro 选择、env 变量转换、路径转换、auto-start。**laew 当前完全无 WSL 支持**——但 macOS/Linux 用户占绝对多数（与 opencode 不同），借鉴价值低。
+
+#### 20.2.4 App 端 — Vite SPA + Solid Router + Dialog 系统
+
+`packages/app/src/components/` 包含 50+ 组件（dialog-select-model、dialog-select-directory、prompt-input、file-tree、directory-picker、command-palette 等）。`index.html:1-30` 是标准 Vite SPA 入口：
+
+```html
+<div id="root" class="flex flex-col h-dvh bg-v2-background-bg-deep p-px"></div>
+<script src="/src/entry.tsx" type="module"></script>
+```
+
+**全屏 SPA**：`h-dvh` (dynamic viewport height) + `overscroll-none` + `overflow-hidden` —— TUI 风格的固定布局，**没有外层布局**。`oc-theme-preload.js`（`index.html:20`）在 React/Solid 渲染前**先跑主题预设**——避免「dark/light 模式闪烁」。
+
+**Dialog 系统**是 app 的核心交互（50+ 组件里有 ~15 个 `dialog-*`）——每个 dialog 是一个独立 component，支持**键盘导航 + 命令面板唤起（Cmd+K）+ 撤销栈**。`directory-picker-domain.test.ts / directory-picker-policy.ts / directory-picker.test.ts` 三件套—— **domain / policy / view 三层**拆分：domain 是纯函数（解析策略），policy 是策略枚举，view 是 UI 组件。**这是 laew 完全可借鉴的解耦模式**（laew TUI 屏抽象可比照此模式）。
+
+#### 20.2.5 共享 UI 组件 — `@opencode-ai/ui`
+
+`packages/ui/src/components/` 列出 30+ 基础组件（`button/checkbox/dialog/dropdown/tabs/tooltip/file-icon/...`），所有客户端（app/desktop/web）都通过 `workspace:*` 依赖共享：
+
+```json
+"dependencies": {
+  "@opencode-ai/ui": "workspace:*",  // desktop、app 都依赖
+  // ...
+}
+```
+
+**设计 token 集中化**：`@opencode-ai/ui/styles` 含 `app-icon.css / button.css / dialog.css` 等**组件级 CSS**（Tailwind utility 在外层，组件内联 CSS 处理复杂变体）—— 类似 laew 的 `theme.rs`。
+
+`Storybook`（`packages/ui/src/components/button.stories.tsx` 等）—— 每个组件都有独立 story 文件，**让 UI 组件独立于 app 可视化调试**。laew 当前无此基建，但 TUI 屏抽象可以借鉴「每个屏有独立的 story fixture」（用于 tmux 自动化断言）。
+
+#### 20.2.6 多端架构对 laew 的核心借鉴
+
+| 维度 | opencode 做法 | laew 借鉴 | 优先级 |
+|------|---------------|-----------|--------|
+| CLI lazy handler | `Runtime.handlers` + `Command.withHandler` + `Effect.promise(load)` | 把 `clap` 子命令的 `match` 用 `async fn + Box<dyn FnOnce>` 懒加载 | P1 |
+| Sidecar 模式 | UI 端（desktop/web）调子进程 CLI server | laew 当前是单进程，无 sidecar；TUI 模式下 future 可选「web 远程调 laew TUI」 | P3 |
+| WSL sidecar | 7 个文件专门处理 Windows WSL 边界 | 不需要 | N/A |
+| i18n middleware | URL prefix → cookie → Accept-Language 3 级 fallback | laew TUI 文案可加 `i18n` crate；当前 100% 中文无需 | P3 |
+| Domain/Policy/View 拆分 | 组件文件 `*-domain.ts / *-policy.ts / *.tsx` | laew TUI 屏抽象可拆 `screen/{form,policy,view}.rs` | P1 |
+| Storybook 屏 fixture | `*.stories.tsx` | laew TUI 屏 `test/screen/{name}.txt` 黄金样本 | P2 |
+| `oc-theme-preload.js` | 渲染前先跑主题脚本防闪烁 | laew TUI 启动时直接输出 ANSI color，无需 | N/A |
+
+### 20.3 HTTP Recorder 协议录制回放
+
+`packages/http-recorder/` 是 opencode 内部**专用的 HTTP 录制/回放测试框架**——**不是**对接 VCR.py / Polly 那种通用工具，是**为 Effect 生态设计的、redaction 优先、CI 强一致的定制方案**。`package.json` 依赖：
+
+```json
+"dependencies": {
+  "@opencode-ai/core": "workspace:*",
+  "aws4fetch": "...",
+  // ... effect 生态
+}
+```
+
+`index.ts:1-6` 暴露 2 个 layer 工厂：
+
+```typescript
+export const HttpRecorder = { http, socket } as const
+```
+
+—— `http` 用于普通 HTTP 调用（OpenAI/Anthropic API），`socket` 用于 WebSocket（OpenAI Realtime / Anthropic Stream）。两者**共用同一份 cassette 持久化层**。
+
+#### 20.3.1 Cassette 持久化 — JSON 文件 + 原子写
+
+`src/cassette.ts:41-50` 的 `cassettePath` 严格防 path traversal：
+
+```typescript
+const cassettePath = (directory: string, name: string) => {
+  if (!name || path.isAbsolute(name) || path.win32.isAbsolute(name) || name.split(/[\\/]/).includes(".."))
+    throw new Error(`Invalid cassette name "${name}"`)
+  const root = path.resolve(directory)
+  const target = path.resolve(root, `${name}.json`)
+  const relative = path.relative(root, target)
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative))
+    throw new Error(`Invalid cassette name "${name}"`)
+  return target
+}
+```
+
+——三道防线：① 名字不能为空 ② 绝对路径禁止 ③ 路径段不能含 `..` ④ 解析后必须在 root 内。**这是工程上对「测试 fixture 文件名 user-controlled」的严肃防御**。
+
+`append` 流程（`cassette.ts:104-123`）—— **Semaphore 加锁 + 临时文件 + rename**：
+
+```typescript
+append: (name, interaction, metadata) =>
+  appendLock.withPermit(
+    Effect.gen(function* () {
+      const entry = recorded.get(name) ?? { interactions: [], findings: [] }
+      const interactions = [...entry.interactions, interaction]
+      const interactionFindings = [...entry.findings, ...secretFindings(interaction)]
+      const cassette = buildCassette(name, interactions, metadata)
+      const findings = [...interactionFindings, ...secretFindings(cassette.metadata ?? {})]
+      yield* failIfUnsafe(name, findings)
+      const target = pathFor(name)
+      yield* fs.makeDirectory(path.dirname(target), { recursive: true }).pipe(Effect.orDie)
+      const temporary = `${target}.${crypto.randomUUID()}.tmp`
+      yield* fs.writeFileString(temporary, formatCassette(cassette)).pipe(
+        Effect.flatMap(() => fs.rename(temporary, target)),
+        Effect.ensuring(fs.remove(temporary, { force: true }).pipe(Effect.catch(() => Effect.void))),
+        Effect.orDie,
+      )
+      recorded.set(name, { interactions, findings: interactionFindings })
+    }),
+  ),
+```
+
+**5 步保护**：① Semaphore 串行化（避免多请求并发写）② **secretFindings 校验先**（含 secret 直接拒绝写）③ temp 文件 `.tmp` 后缀 ④ write → rename 原子提交 ⑤ `Effect.ensuring` 保证异常也清理 temp。**这是「test fixture 不能含真实密钥」 + 「多请求并发安全」 + 「写入崩溃可恢复」的三合一设计**。
+
+#### 20.3.2 Secret 防护 — 7 种 pattern + env 检测
+
+`src/redaction.ts:30-38` 内置 7 种 secret 正则：
+
+```typescript
+const SECRET_PATTERNS: ReadonlyArray<{ readonly label: string; readonly pattern: RegExp }> = [
+  { label: "bearer token", pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b/i },
+  { label: "API key", pattern: /\bsk-[A-Za-z0-9][A-Za-z0-9_-]{20,}\b/ },
+  { label: "Anthropic API key", pattern: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/ },
+  { label: "Google API key", pattern: /\bAIza[0-9A-Za-z_-]{20,}\b/ },
+  { label: "AWS access key", pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/ },
+  { label: "GitHub token", pattern: /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/ },
+  { label: "private key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+]
+```
+
+`envSecrets`（`redaction.ts:43-50`）**扫描进程环境变量**——开发者本地有 `ANTHROPIC_API_KEY=sk-ant-...` 时，自动检测并拒绝写入：
+
+```typescript
+const envSecrets = () =>
+  Object.entries(process.env).flatMap(([name, value]) => {
+    if (!value) return []
+    if (!ENV_SECRET_NAMES.test(name)) return []
+    if (value.length < 12) return []
+    if (SAFE_ENV_VALUES.has(value.toLowerCase())) return []
+    return [{ name, value }]
+  })
+```
+
+——**这避免了「开发者本地录了一段交互，意外把 API key 写进 git 仓库」**。`SAFE_ENV_VALUES = {"fixture", "test", "test-key"}` 白名单是**显式逃生通道**（CI fixture 测试用例需要故意塞假 token）。
+
+`secretFindings`（`redaction.ts:106-117`）**递归扫描 cassette 全部 string 字段**：
+
+```typescript
+export const secretFindings = (value: unknown): ReadonlyArray<SecretFinding> => {
+  const environment = envSecrets()
+  return stringEntries(value).flatMap(([entry]) => [
+    ...SECRET_PATTERNS.filter((p) => p.pattern.test(entry.value)).map((p) => ({ path: entry.path, reason: p.label })),
+    ...environment
+      .filter((item) => entry.value.includes(item.value))
+      .map((item) => ({ path: entry.path, reason: `environment secret ${item.name}` })),
+  ])
+}
+```
+
+——**这是 opencode 对「测试 fixture 不能含真实密钥」的工程级承诺**。laew 的 e2e test 当前用 mock LLM 绕过此问题，**但当 laew 升级到真实 LLM 测试时，必须抄这一套**。
+
+#### 20.3.3 URL Redaction — 13 个 query param
+
+`src/redaction.ts:15-28` 内置 13 个**已知会含敏感 token 的 query param**：
+
+```typescript
+const DEFAULT_REDACT_QUERY = [
+  "access_token", "api-key", "api_key", "apikey", "code", "key",
+  "signature", "sig", "token", "x-amz-credential", "x-amz-security-token", "x-amz-signature",
+]
+```
+
+`redactUrl`（`redaction.ts:68-82`）把 userinfo 替换为 `REDACTED` + 把命中 query 替换为 `REDACTED` + 调用 `urlRedactor` 让 caller 自定义后处理。
+
+`redactHeaders`（`redaction.ts:84-98`）—— **只保留 allowlist 的 header**（默认保留 `content-type` 等），其他全部 `REDACTED`：
+
+```typescript
+export const redactHeaders = (
+  headers: Record<string, string>,
+  allow: ReadonlyArray<string>,
+  redact: ReadonlyArray<string> = DEFAULT_REDACT_HEADERS,
+) => {
+  const allowed = new Set(allow.map((name) => name.toLowerCase()))
+  const redacted = redactionSet(redact, DEFAULT_REDACT_HEADERS)
+  return Object.fromEntries(
+    Object.entries(headers)
+      .map(([name, value]) => [name.toLowerCase(), value] as const)
+      .filter(([name]) => allowed.has(name))
+      .map(([name, value]) => [name, redacted.has(name) ? REDACTED : value] as const)
+      .toSorted(([a], [b]) => a.localeCompare(b)),
+  )
+}
+```
+
+**注意**：`toSorted` 让 header 排序后**匹配时与原始顺序无关**——这是 `matching.ts` 的基础（canonical form）。
+
+#### 20.3.4 Canonical Matching — request diff 算法
+
+`src/matching.ts:25-37` 的 `canonicalSnapshot`：
+
+```typescript
+export const canonicalSnapshot = (snapshot: RequestSnapshot): string =>
+  JSON.stringify({
+    method: snapshot.method,
+    url: snapshot.url,
+    headers: canonicalizeJson(snapshot.headers),  // 按 key 排序
+    body: Option.match(decodeJson(snapshot.body), {
+      onNone: () => snapshot.body,
+      onSome: canonicalizeJson),                  // JSON 字段也按 key 排序
+  })
+```
+
+——**深度规范化**：headers 按 key 排序、body JSON 按 key 排序（不破坏数组顺序）、非 JSON body 原样比对。**这允许 `Authorization` header 顺序、`{"a":1,"b":2}` vs `{"b":2,"a":1}` 等差异不影响匹配**。
+
+`requestDiff`（`matching.ts:73-93`）生成**人类可读的 diff 报告**——`expected xxx, received yyy` + 限制 8 个不同：
+
+```typescript
+export const requestDiff = (expected: RequestSnapshot, received: RequestSnapshot): ReadonlyArray<string> => {
+  const lines: string[] = []
+  if (expected.method !== received.method) lines.push("method:", `  expected ${expected.method}, received ${received.method}`)
+  if (expected.url !== received.url) lines.push("url:", `  expected ${expected.url}`, `  received ${received.url}`)
+  const headers = headerDiffs(expected.headers, received.headers)
+  if (headers.length > 0) lines.push("headers:", ...headers.slice(0, 8))
+  // body 同样...
+  return lines
+}
+```
+
+**CI 中 fixture 不匹配时的输出**形如：
+```
+Fixture "anthropic-msg-001" does not match the current request:
+  method:
+    expected POST, received POST
+  body:
+    $ expected {"model":"claude-3-5-sonnet"}, received {"model":"claude-3-7-sonnet"}
+    $.model expected "claude-3-5-sonnet", received "claude-3-7-sonnet"
+```
+
+——**让开发者一眼看出是哪个字段变了**。laew 的 e2e test 输出当前是「assertion failed at line 42」级别，**应升级到此粒度**。
+
+#### 20.3.5 Replay State — Sequenced + Unused 检测
+
+`src/recorder.ts:26-62` 的 `makeReplayState`：
+
+```typescript
+export const makeReplayState = <T>(
+  cassette: CassetteService.Interface,
+  name: string,
+  project: (interactions: ReadonlyArray<Interaction>) => ReadonlyArray<T>,
+): Effect.Effect<ReplayState<T>, never, Scope.Scope> =>
+  Effect.gen(function* () {
+    const load = yield* Effect.cached(cassette.read(name).pipe(Effect.map(project)))
+    const position = yield* SynchronizedRef.make(0)
+
+    yield* Effect.addFinalizer(() =>
+      Effect.gen(function* () {
+        const used = yield* SynchronizedRef.get(position)
+        if (used === 0) return yield* Effect.void
+        const interactions = yield* load.pipe(Effect.orDie)
+        if (used < interactions.length)
+          return yield* Effect.die(
+            new Error(`Unused recorded interactions in ${name}: used ${used} of ${interactions.length}`),
+          )
+        return yield* Effect.void
+      }),
+    )
+    // ...
+  })
+```
+
+**`addFinalizer` 钩子**：scope 结束时检查 `used < interactions.length`——**如果录了 10 个交互但测试只用到 8 个，scope 关闭时 die**。**这避免了「fixture 里有 stale 交互」**——强制每个 fixture 被**完整使用**，否则测试失败。
+
+**`SynchronizedRef` 原子计数器**：每个 `claim` 都自增，确保**多线程并发 claim 不会错位**。
+
+`claim`（`recorder.ts:49-60`）—— 取出 `interactions[index]`，调用 `validate`，**通过则返回 `{interaction, index+1}`，失败则 die**：
+
+```typescript
+claim: (validate) =>
+  Effect.flatMap(load, (interactions) =>
+    SynchronizedRef.modifyEffect(position, (index) =>
+      Effect.gen(function* () {
+        const interaction = interactions[index]
+        yield* validate(interaction, index, interactions)
+        if (interaction === undefined) return yield* Effect.die("Replay validation accepted a missing interaction")
+        return [{ interaction, index }, index + 1] as const
+      }),
+    ),
+  ),
+```
+
+——**index 与 interactions 是函数式原子操作**，符合 Effect 不可变语义。
+
+#### 20.3.6 Auto Mode — CI vs 本地
+
+`src/recorder.ts:11-18`：
+
+```typescript
+const isCI = () => {
+  const value = process.env.CI
+  return value !== undefined && value !== "" && value !== "false" && value !== "0"
+}
+
+export const resolveAutoMode = (
+  cassette: CassetteService.Interface,
+  name: string,
+): Effect.Effect<"record" | "replay" | "passthrough"> =>
+  Effect.gen(function* () {
+    if (isCI()) return "replay"
+    return (yield* cassette.exists(name)) ? "replay" : "record"
+  })
+```
+
+**4 模式矩阵**：
+
+| 模式 | 行为 | 何时用 |
+|------|------|--------|
+| `passthrough` | 直接转发真实请求，无录制无回放 | 开发调试 |
+| `record` | 真发请求 + 写入 cassette | 本地首次录 |
+| `replay` | 只读 cassette，不发请求 | CI / 本地已录 |
+| `auto` | `isCI() → replay` 否则 `exists → replay : record` | 默认 |
+
+**`isCI` 容错**：CI 变量可能是 `"true"`, `"1"`, `"yes"`, 也可能是 `"false"`, `"0"`, 或空——这里**只把空/缺/`false`/`0` 视为非 CI**，其他全视为 CI。**这避免了某些 CI 工具（如 GitHub Actions）传 `CI=true` 而其他传 `CI=1` 不识别的问题**。
+
+`recordingLayer`（`src/internal-effect.ts:93-182`）的 record 分支用 `Deferred + Ref` 串行化录制：
+
+```typescript
+if (mode === "record") {
+  const initial = yield* Deferred.make<void>()
+  yield* Deferred.succeed(initial, undefined)
+  const tail = yield* Ref.make(initial)
+  return HttpClient.make((request) =>
+    Effect.gen(function* () {
+      const completed = yield* Deferred.make<void>()
+      const previous = yield* Ref.modify(tail, (current) => [current, completed])
+      return yield* Effect.gen(function* {
+        // ... record
+        yield* Deferred.await(previous)  // 等前一个写完
+        yield* cassetteService.append(name, interaction, options.metadata)
+        // ...
+      }).pipe(Effect.ensuring(Deferred.succeed(completed, undefined)))
+    }),
+  )
+}
+```
+
+**`tail` 是「上一个请求的 completion Deferred」**：新请求 await `previous` 确保**录制顺序 = 请求发起顺序**。这避免「请求 A 完成时，请求 B 已经写完，A 覆盖 B」。
+
+#### 20.3.7 WebSocket Recorder — message-by-message
+
+`src/websocket.ts:90-135` 的 record 分支：
+
+```typescript
+if (mode === "record") {
+  return {
+    open: (request) =>
+      Effect.gen(function* () {
+        const events: WebSocketEvent[] = []
+        const connection = yield* options.live.open(request)
+        const closed = yield* Ref.make(false)
+        const closeLock = yield* Semaphore.make(1)
+        return {
+          sendText: (message) =>
+            Effect.sync(() => events.push(redactEvent(textEvent("client", message)))).pipe(
+              Effect.andThen(connection.sendText(message)),
+            ),
+          messages: connection.messages.pipe(
+            Stream.tap((message) => Effect.sync(() => events.push(/* server event */))),
+          ),
+          close: closeLock.withPermit(Effect.gen(function* () {
+            if (yield* Ref.get(closed)) return
+            yield* connection.close
+            yield* options.cassette.append(/* events */).pipe(Effect.orDie)
+            yield* Ref.set(closed, true)
+          })),
+        }
+      }),
+  }
+}
+```
+
+—— **`close` 时统一 flush events 数组**（不是收到一条写一条），避免中途断电丢数据。`closeLock` Semaphore 防止「close 触发 2 次」（signal + finally 双触发）。
+
+replay 分支（`websocket.ts:138-172`）的 client 端**断言每条 send 匹配 fixture 的下一条 client event**：
+
+```typescript
+sendText: (message) =>
+  SynchronizedRef.updateEffect(position, (index) =>
+    assertClientEvent(message, client[index], index, options.compareClientMessagesAsJson === true).pipe(
+      Effect.as(index + 1),
+    ),
+  ),
+```
+
+`assertClientEvent`（`websocket.ts:53-62`）支持两种比较模式：原始字符串 vs canonical JSON（`compareClientMessagesAsJson: true` 让 `{"a":1,"b":2}` ≡ `{"b":2,"a":1}`）。
+
+#### 20.3.8 HTTP Recorder 对 laew 的核心借鉴
+
+| 维度 | opencode 做法 | laew 借鉴 | 优先级 |
+|------|---------------|-----------|--------|
+| Cassette 原子写 | Semaphore + temp file + rename | laew testReport 录制 LLM 响应时抄此模式 | P0 |
+| Secret 检测 | 7 种正则 + env 扫描 + `test/fixture/test-key` 白名单 | laew e2e test 用 mock LLM 暂不需要；真 LLM 测试时必须有 | P1 |
+| Canonical matching | header 按 key 排序 + body JSON 排序 | laew e2e 协议 wire 校验已有；canonical 化可加 | P1 |
+| Unused interaction 检测 | scope 关闭时 `used < length → die` | laew testReport 录的 fixture 数量硬编码对照 | P2 |
+| Auto mode `isCI()` | 4 模式 + 容错 | laew e2e 已有 CI=1 路径，可加 auto | P0 |
+| `Deferred + Ref` 串行 | 用 `tail` Deferred 链表保证录制顺序 | laew test fixture 顺序一致性可学 | P2 |
+| WebSocket Recorder | message-by-message + close-time flush | laew 当前无 WebSocket；流式 SSE 录制可抄 | P3 |
+| Path traversal 三道防线 | `name/absolute/..` 拒绝 | laew `testReport/` 输入校验必须做 | P1 |
+
+### 20.4 Slack 集成 / 企业 IM
+
+`packages/slack/` 是 146 行的**极简 Slack bot**（`src/index.ts`），不依赖 Effect，只用 `@slack/bolt` 3.17.1。**它是 opencode 「IM 入口」的最小实现参考**——比 enterprise 包小一个数量级。
+
+#### 20.4.1 Bolt App + Socket Mode
+
+`src/index.ts:4-9`：
+
+```typescript
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  socketMode: true,
+  appToken: process.env.SLACK_APP_TOKEN,
+})
+```
+
+**3 个 token + socketMode=true**：避免暴露 HTTP endpoint（**不需公网 webhook**），通过 WebSocket 长连接收 Slack 推送事件。**安全设计**：bot 进程在用户机器上跑（不是云 server），Slack 通过 WSS 反向连接过来。
+
+#### 20.4.2 Opencode 子进程嵌入
+
+`src/index.ts:17-39`：
+
+```typescript
+const opencode = await createOpencode({
+  port: 0,  // 随机分配端口
+})
+console.log("✅ Opencode server ready")
+
+const sessions = new Map<string, { client: any; server: any; sessionId: string; channel: string; thread: string }>()
+void (async () => {
+  const events = await opencode.client.event.subscribe()
+  for await (const event of events.stream) {
+    if (event.type === "message.part.updated") {
+      const part = event.properties.part
+      if (part.type === "tool") {
+        for (const [_sessionKey, session] of sessions.entries()) {
+          if (session.sessionId === part.sessionID) {
+            void handleToolUpdate(part, session.channel, session.thread)
+            break
+          }
+        }
+      }
+    }
+  }
+})()
+```
+
+**`createOpencode({ port: 0 })` 在 slack bot 进程内启动一个 opencode server**（SDK 内置的能力）——`port: 0` 让 OS 分配空闲端口。`opencode.client.event.subscribe()` 是 **SSE 订阅**，**实时接收 agent 执行进度**。
+
+`handleToolUpdate`（`src/index.ts:41-51`）把每次工具调用完成推送到 slack thread：
+
+```typescript
+async function handleToolUpdate(part: ToolPart, channel: string, thread: string) {
+  if (part.state.status !== "completed") return
+  const toolMessage = `*${part.tool}* - ${part.state.title}`
+  await app.client.chat.postMessage({ channel, thread_ts: thread, text: toolMessage }).catch(() => {})
+}
+```
+
+——**O(N) 线性查找 session**：`sessions.entries()` for-loop 找匹配 `sessionId` 的 session。**O(1) 优化**：用 `Map<sessionId, {channel, thread}>` 而不是 `Map<sessionKey, full session>`——但 slack 当前实现**每次遍历所有 session**，简单但慢（30+ 并发 thread 会有问题）。
+
+#### 20.4.3 Session 路由 — per-thread 隔离
+
+`src/index.ts:58-136` 的 `app.message` 处理器：
+
+```typescript
+app.message(async ({ message, say }) => {
+  if (message.subtype || !("text" in message) || !message.text) return
+
+  const channel = message.channel
+  const thread = (message as any).thread_ts || message.ts
+  const sessionKey = `${channel}-${thread}`
+
+  let session = sessions.get(sessionKey)
+  if (!session) {
+    const createResult = await client.session.create({ body: { title: `Slack thread ${thread}` } })
+    if (createResult.error) { /* error path */ return }
+    session = { client, server, sessionId: createResult.data.id, channel, thread }
+    sessions.set(sessionKey, session)
+
+    // Auto-share: 把 session 链接推送到 thread
+    const shareResult = await client.session.share({ path: { id: createResult.data.id } })
+    if (!shareResult.error && shareResult.data) {
+      const sessionUrl = shareResult.data.share?.url
+      await app.client.chat.postMessage({ channel, thread_ts: thread, text: sessionUrl })
+    }
+  }
+
+  const result = await session.client.session.prompt({
+    path: { id: session.sessionId },
+    body: { parts: [{ type: "text", text: message.text }] },
+  })
+  // ... error handling
+  const responseText =
+    response.info?.content ||
+    response.parts?.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n") ||
+    "I received your message but didn't have a response."
+  await say({ text: responseText, thread_ts: thread })
+})
+```
+
+**per-thread-session 路由**：`sessionKey = ${channel}-${thread}`，**每个 Slack 线程 = 一个 opencode session**。新线程自动 `session.create` + `session.share` + 推送 share URL——**让用户能在 web 端跟进 agent 执行的完整历史**。
+
+**`responseText` 三段式 fallback**（`src/index.ts:124-131`）：`info.content` → `parts[].text` 拼接 → 「I received your message but didn't have a response.」。**这是 laew 完全没有的 pattern**——laew 当前直接把 message 当作 tool_result 字符串丢回去，没有 fallback。
+
+**无 session.end / cleanup**：`sessions` Map 只增不删，**bot 跑一天会内存泄漏**。`Map.clear()` 周期性触发是个轻量级修复（按 thread last-active time LRU）。
+
+#### 20.4.4 Slack 对 laew 的核心借鉴
+
+| 维度 | opencode 做法 | laew 借鉴 | 优先级 |
+|------|---------------|-----------|--------|
+| Sidecar 嵌入 | `createOpencode({port:0})` + `client.event.subscribe()` SSE | laew 暂不需要；`./laew -p` 已是单进程 | N/A |
+| per-thread session | `Map<\`${channel}-${thread}\`, session>` | laew TUI 是单 session | N/A |
+| Auto-share 推送 | session 创建后立即 `session.share` + 推送 URL | laew TUI 不需要 share（无 web 端） | N/A |
+| Tool update 实时推 | 订阅 `message.part.updated` + 过滤 tool 类型 | laew TUI 内部直接渲染，无需 IM 推送 | N/A |
+| 三段式 fallback | `info.content → parts[].text → 默认文本` | **laew 应学**：当前 tool_result 直接是 string，没有 fallback | P1 |
+| Socket Mode（无需 webhook） | `socketMode: true` + `appToken` | laew 当前无 IM；TUI 不需要 | N/A |
+| Session cleanup 缺 | Map 只增不删 | laew 当前 LRU eviction 缺，可加 | P1 |
+
+### 20.5 对 laew 的借鉴路线图
+
+| 优先级 | 工作量 | 收益 | 内容 | 落地章节 |
+|--------|--------|------|------|----------|
+| **P0**（1-2 天） | 小 | 极高 | ① testReport cassette 原子写 + secret 防护（20.3.1+20.3.2） ② `isCI()` 4 模式 auto 切换（20.3.6） ③ `info.content → parts → 默认` 三段式 fallback（20.4.3） | 20.3/20.4 |
+| **P1**（3-5 天） | 中 | 高 | ④ CLI lazy handler（20.2.1） ⑤ Domain/Policy/View 屏拆分（20.2.4） ⑥ canonical matching + request diff（20.3.4） ⑦ session share 与 lazy migrate（20.1.4） ⑧ Storage trait + S3/R2 双实现（20.1.2） | 20.1/20.2/20.3 |
+| **P2**（1-2 周） | 大 | 中 | ⑨ Hono-style OpenAPI 自动生成（20.1.6） ⑩ `Domain` 三层（domain/policy/view）（20.2.4） ⑪ Sidecar mode（20.4.2） ⑫ Unused interaction 检测（20.3.5） ⑬ timingSafeEqual 鉴权分级（20.1.5） | 20.1/20.2/20.3/20.4 |
+| **P3**（待评估） | 极大 | 待评估 | ⑭ Astro Starlight 文档站（20.2.2） ⑮ Storybook 屏 fixture（20.2.5） ⑯ WebSocket recorder（20.3.7） ⑰ WSL sidecar（20.2.3） | 20.2/20.3 |
+
+### 20.6 综合：四维度交叉点
+
+4 个新维度**共同指向一个隐含主题**——**「agent 走出聊天框」**：
+
+1. **Enterprise Durable Object** = 「让 agent 跑在云上」（持久化 + 部署）
+2. **多端 UI 框架** = 「让 agent 跑在多个壳里」（CLI/TUI/App/Desktop/Web/Slack）
+3. **HTTP Recorder** = 「让 agent 跑得快」（CI 录制回放 + secret 防护 + 协议稳定）
+4. **Slack 集成** = 「让 agent 跑进企业 IM」（per-thread session + 实时工具推送 + share URL）
+
+**共同设计哲学**：
+- **效果 = 协议 × 持久化 × UI × 测试**（protocol × persistence × UI × testing）
+- **每个端都有「极薄壳 + 共享核心」**：slack 包 146 行、CLI handler 全部 lazy load、desktop 是 Electron 壳内嵌 sidecar、enterprise 是 SolidStart 壳 + Hono API
+- **测试优先**（HTTP Recorder 全章占 4 节中 6 个小节）：每加新能力立即写 fixture，**禁止「能力领先于测试」**
+
+**对 laew 的统一启示**：laew 当前是「单进程 CLI + mock LLM e2e」，**与「生产级企业 agent」的距离**主要由 4 个 gap 衡量：
+- **gap-1**（持久化）：SQLite + 内存态，无 R2/S3 抽象 → 学 20.1
+- **gap-2**（多端）：单 TUI + CLI，无 GUI → 学 20.2（聚焦 lazy handler 模式）
+- **gap-3**（测试稳定性）：mock LLM 协议校验，无 cassette 录制回放 → 学 20.3
+- **gap-4**（IM 入口）：无企业 IM 集成 → 学 20.4（聚焦三段式 fallback）
+
+### 20.7 关键文件路径汇总
+
+| 维度 | 文件路径 | 行数/范围 | 关键导出 |
+|------|----------|-----------|----------|
+| **Enterprise** | | | |
+| Storage Adapter | `/usr/local/LsmGitOpenSource/opencode/packages/enterprise/src/core/storage.ts` | 130 | `Storage.{read,write,remove,list,update}` |
+| Share namespace | `/usr/local/LsmGitOpenSource/opencode/packages/enterprise/src/core/share.ts` | 233 | `Share.{create,get,remove,sync,data,syncOld,Errors}` |
+| HTTP API | `/usr/local/LsmGitOpenSource/opencode/packages/enterprise/src/routes/api/[...path].ts` | 172 | Hono app + 4 endpoints + OpenAPI |
+| Share 页面 SSR | `/usr/local/LsmGitOpenSource/opencode/packages/enterprise/src/routes/share/[shareID].tsx` | 418 | `getData` query + DataProvider + WorkerPool |
+| Enterprise tests | `/usr/local/LsmGitOpenSource/opencode/packages/enterprise/test/core/share.test.ts` | 80+ | bun:test 5 个 share 场景 |
+| Vite + Nitro config | `/usr/local/LsmGitOpenSource/opencode/packages/enterprise/vite.config.ts` | 35 | cloudflare preset + nodeCompat |
+| **多端 UI** | | | |
+| CLI 入口 | `/usr/local/LsmGitOpenSource/opencode/packages/cli/src/index.ts` | 33 | `Runtime.handlers` + `Runtime.run` |
+| CLI framework | `/usr/local/LsmGitOpenSource/opencode/packages/cli/src/framework/runtime.ts` | 80 | `Runtime.handlers` + `Runtime.run` + `Runtime.handler` |
+| Web astro 配置 | `/usr/local/LsmGitOpenSource/opencode/packages/web/astro.config.mjs` | 325 | starlight + 20 locales + configSchema hook |
+| Web i18n middleware | `/usr/local/LsmGitOpenSource/opencode/packages/web/src/middleware.ts` | 95 | `onRequest` 3-level locale |
+| Desktop main | `/usr/local/LsmGitOpenSource/opencode/packages/desktop/src/main/index.ts` | 120+ | `main` Effect.gen + sidecar 启动 |
+| Desktop WSL | `/usr/local/LsmGitOpenSource/opencode/packages/desktop/src/main/wsl/` | 7 文件 | servers/sidecar/runtime/policy/startup/ipc |
+| Desktop preload | `/usr/local/LsmGitOpenSource/opencode/packages/desktop/src/preload/index.ts` | — | contextBridge IPC |
+| App entry HTML | `/usr/local/LsmGitOpenSource/opencode/packages/app/index.html` | 30 | SPA root + theme preload |
+| App components | `/usr/local/LsmGitOpenSource/opencode/packages/app/src/components/` | 50+ | dialog/file-tree/prompt-input/... |
+| 共享 UI | `/usr/local/LsmGitOpenSource/opencode/packages/ui/src/components/` | 30+ | button/checkbox/dialog/tabs/... |
+| **HTTP Recorder** | | | |
+| Cassette 持久化 | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/cassette.ts` | 180 | `Service` + `fileSystem` + `memory` |
+| Schema | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/schema.ts` | 88 | `InteractionSchema` + `CassetteSchema` |
+| Types | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/types.ts` | 109 | `RequestSnapshot` + `RedactOptions` |
+| Recorder | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/recorder.ts` | 63 | `resolveAutoMode` + `makeReplayState` |
+| Redaction | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/redaction.ts` | 118 | `REDACTED` + 7 SECRET_PATTERNS + `redactUrl` + `redactHeaders` + `secretFindings` |
+| Matching | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/matching.ts` | 107 | `canonicalSnapshot` + `defaultMatcher` + `requestDiff` |
+| HTTP effect layer | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/effect.ts` | 26 | `http(name, options)` Layer 工厂 |
+| Internal HTTP layer | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/internal-effect.ts` | 190 | `recordingLayer` + 4 模式分支 |
+| WebSocket recorder | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/websocket.ts` | 174 | `makeWebSocketExecutor` |
+| Socket helper | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/socket.ts` | — | `socket(name, options)` |
+| Public API | `/usr/local/LsmGitOpenSource/opencode/packages/http-recorder/src/index.ts` | 19 | `HttpRecorder.http + HttpRecorder.socket` |
+| **Slack** | | | |
+| Slack bot | `/usr/local/LsmGitOpenSource/opencode/packages/slack/src/index.ts` | 146 | Bolt App + per-thread session + 工具推送 |
+
+### 20.8 本轮不重复声明
+
+为避免与前 7 轮（特别是第七轮 Edit/grep/Bash、第六轮 Effect/Schema/LayerNode/Durable Object、第五/四/三/二/一轮）混淆，本章**仅覆盖以下 4 个全新维度**，明确不重复以下内容：
+
+- **agent 内核（Effect runtime、provider、tool 系统、session 持久化、LLMEvent 流）** —— 已在第 16/17/18/19 章深入，本章不重复
+- **Edit/grep/Bash 工具实现** —— 第 19 章 +1200 行已完整覆盖，本章不重复
+- **测试体系**（vitest-evals/录制回放）—— 第 3 轮已深入，本章**仅**深入「**HTTP 协议级**的录制回放」（20.3），不重复普通单元测试
+- **Cloudflare Workers 基础**（compatibilityDate/nodeCompat/preset=cloudflare-module）—— 第 6 轮已深入「LayerNode DI/Durable Object」，本章**仅**深入 enterprise 实际部署的 `Storage` 抽象与 share 模型（20.1.2-20.1.4），不重复 CF 平台基础
+- **Astro/Starlight 文档系统** —— 不深入 Starlight 内部，本章**仅**关注 i18n middleware 模式（20.2.2）
+- **Electron 主进程架构** —— 不深入 BrowserWindow/lifecycle，本章**仅**关注 sidecar 嵌入（20.2.3）
+- **Effect 全栈 DI / Layer 注入模式** —— 第 6 轮已深入，本章**仅**关注 recorder 的 4 模式 auto 切换（20.3.6），不重复 `Layer.effect` 用法
+- **Session/Provider/Message/Part 数据模型** —— 第 5 轮已深入，本章**仅**关注 share 时 `z.custom<>()` 轻量级取舍（20.1.3）与 `data` 字典重组（20.1.7）
+
+**本轮新增的关键发现**（与前 7 轮不重叠）：
+1. **「lazy migrate + snapshot 优先」双轨数据迁移**（20.1.4）—— laew 无此需求但模式值得学
+2. **「极薄壳 + 共享核心」**多端架构（20.2）—— laew 升级 web/desktop 时的范式
+3. **Secret 防护 7 正则 + env 扫描 + test-key 白名单**（20.3.2）—— 真实 LLM 测试必备
+4. **`Deferred + Ref` 链表保证录制顺序**（20.3.6）—— 多请求并发 fixture 顺序保证
+5. **Path traversal 三道防线**（20.3.1）—— 测试 fixture 路径校验
+6. **`info.content → parts → 默认文本` 三段式 fallback**（20.4.3）—— 通用 agent 响应回填模式
+7. **`compatibilityDate` 严肃工程**（20.1.1）—— Cloudflare 部署冻结日期
+
+**总章节行数**：本章节约 **1100+ 行**，覆盖 enterprise 4 文件 + cli 2 文件 + web 2 文件 + desktop 1 文件 + http-recorder 8 文件 + slack 1 文件 + 1 个 cross-cutting 段。

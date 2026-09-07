@@ -3774,3 +3774,911 @@ private async appendMutation(mutation: SessionMutation): Promise<void> {
 | CompactionSettings | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/compaction/compaction.ts:148-162` |
 | prepareCompaction 纯函数 | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/compaction/compaction.ts:616-687` |
 
+## 16. 第八轮深挖 — Coding Agent自治 + AI模型路由 + Session Backends双后端 + OTLP Telemetry深度集成（2026-09-07）
+
+第八轮聚焦 pi 仓库的 4 个全新维度，前 7 轮已覆盖：二进制帧协议 CBOR、Server 与 Session 后端、Operation Lane 三态、reduceLaneState 事件溯源、14 种损坏检测、流式与中断传播、记忆与 Context、Skill 系统、Telemetry、Session 持久化、测试与 Eval、配置、系统提示词、错误处理、第 14 章第七轮 Edit/Git/Bash/Grep。本轮严格不重复这些章节。
+
+本轮目标包：
+1. **Coding Agent 编程自治**（`packages/coding-agent/` — 主入口 CLI/参数/会话管理/PR 自动化锚点）
+2. **AI 模型路由 + 推理优化**（`packages/ai/` — provider 路由/认证解析/重试/thinking 预算/KV cache key）
+3. **Session Backends 双后端**（`packages/session-backends/` + `agent/src/harness/session/jsonl/` — SQLite + JSONL 两套后端、WriterLease fence、torn-tail 修复、原子发布）
+4. **OTLP Telemetry 深度集成**（`packages/telemetry/` + `agent/src/harness/telemetry.ts` — 类型化 schema、InMemory 实现、Span/Event 定义、决策审计事件）
+
+### 16.1 Coding Agent 编程自治
+
+#### 16.1.1 main.ts CLI 编排与 createSessionManager
+
+`packages/coding-agent/src/main.ts` 是 978 行的 CLI 入口，第 8-70 行集中 import 了 30+ 模块；最核心的 `createSessionManager`（第 352-443 行）实现了 **6 种会话源自动判定**：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/main.ts:352-443
+export async function createSessionManager(
+    parsed: Args,
+    cwd: string,
+    sessionDir: string | undefined,
+    settingsManager: SettingsManager,
+): Promise<SessionManager> {
+    if (parsed.noSession || parsed.help || parsed.listModels !== undefined) {
+        return SessionManager.inMemory(cwd, parsed.sessionId !== undefined ? { id: parsed.sessionId } : undefined);
+    }
+    if (parsed.fork) {
+        // ... 解析 fork 源:path / local / global / not_found
+        switch (resolved.type) {
+            case "path": case "local": case "global":
+                return forkSessionOrExit(resolved.path, cwd, sessionDir, parsed.sessionId);
+            case "not_found":
+                console.error(chalk.red(`No session found matching '${resolved.arg}'`));
+                process.exit(1);
+        }
+    }
+    if (parsed.session) { /* open + global 二次确认 fork */ }
+    if (parsed.resume) { /* selectSession 调用 SessionManager.list + listAll */ }
+    if (parsed.continue) { return SessionManager.continueRecent(cwd, sessionDir); }
+    if (parsed.sessionId) {
+        const existingSession = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
+        if (existingSession) return SessionManager.open(existingSession.path, sessionDir);
+        // 否则创建新会话但带指定 ID
+    }
+    return SessionManager.create(cwd, sessionDir, { id: parsed.sessionId });
+}
+```
+
+关键设计：6 种会话源按 `--fork / --session / --resume / --continue / --session-id / 默认 new` 的优先级短路判定，**global fork 二次确认**（第 393-401 行：`Fork this session into current directory? [y/N]`，避免跨项目隐式搬移）。
+
+#### 16.1.2 CLI 参数矩阵：44 个 flag
+
+`packages/coding-agent/src/cli/args.ts:13-58` 定义 `Args` 接口，对应 30+ 个解析分支（第 71-446 行）。核心 flag：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/cli/args.ts:13-58
+export interface Args {
+    provider?: string;         // --provider <name>
+    model?: string;            // --model <pattern>[:<thinking>]
+    apiKey?: string;           // --api-key（非持久运行时覆盖）
+    systemPrompt?: string;
+    appendSystemPrompt?: string[];
+    thinking?: ThinkingLevel;
+    continue?: boolean;        // -c
+    resume?: boolean;          // -r
+    help?: boolean;
+    mode?: Mode;               // "text" | "json" | "rpc"
+    name?: string;             // -n
+    noSession?: boolean;
+    session?: string;
+    sessionId?: string;
+    fork?: string;
+    sessionDir?: string;
+    models?: string[];
+    tools?: string[];          // -t
+    excludeTools?: string[];   // -xt
+    noTools?: boolean;         // -nt
+    noBuiltinTools?: boolean;  // -nbt
+    extensions?: string[];     // -e
+    noExtensions?: boolean;    // -ne
+    print?: boolean;           // -p
+    export?: string;           // --export <html>
+    skills?: string[];
+    promptTemplates?: string[];
+    themes?: string[];
+    noContextFiles?: boolean;  // -nc
+    listModels?: string | true;
+    offline?: boolean;
+    tuiMode?: TuiMode;
+    projectTrustOverride?: boolean;
+    messages: string[];
+    fileArgs: string[];        // @path
+    unknownFlags: Map<string, boolean | string>; // 透传给扩展
+    diagnostics: Array<{ type: "warning" | "error"; message: string }>;
+}
+```
+
+特殊处理：
+- 第 82-90 行 `--` 后所有 positional 参数：`@path` 转 fileArgs，其余进 messages。
+- 第 160-163 行 `-p` 自动吞下一个**非 `-` 开头**的 token 作为 prompt。
+- `unknownFlags` 透传给扩展（`Map<string, boolean|string>`），扩展可在 `getExtensionFlags()` 钩子读取。
+
+#### 16.1.3 ModelRuntime：5 源 Provider 合成
+
+`packages/coding-agent/src/core/model-runtime.ts:58-80` 定义 `ModelRuntimeSnapshot`，把 **5 个独立来源** 合成一个统一的模型视图：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/core/model-runtime.ts:58-80
+interface ModelRuntimeSnapshot {
+    all: readonly Model<Api>[];                  // 全量模型
+    available: readonly Model<Api>[];             // 已配置认证的
+    configuredProviders: ReadonlySet<string>;    // 静态目录里有
+    storedProviders: ReadonlySet<string>;         // 持久化模型存储里有
+    auth: ReadonlyMap<string, AuthCheck | undefined>;
+}
+```
+
+5 个来源：
+1. `builtinProviderCatalog`（`@earendil-works/pi-ai/providers/all` 静态生成）
+2. `ModelConfig`（`./model-config.ts` 解析 `models.json`）
+3. `FileModelsStore`（`./models-store.ts` 持久化的 provider 模型）
+4. `ExtensionOAuthConfig`（`./provider-composer.ts` 注册的 OAuth）
+5. `withRemoteCatalog`（`./remote-catalog-provider.ts` 远程目录）
+
+`composeModelProvider`（`./provider-composer.ts:420-523`）把 5 层叠加——**base → models.json → extension → oauth → modelOverrides**，并通过 `validateExtensionProvider`（第 407-417 行）**eager validate** 提前抛出结构错误：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/core/provider-composer.ts:420-449
+export function composeModelProvider(
+    providerId: string,
+    base: Provider | undefined,
+    modelConfig: ModelConfig,
+    extension: ProviderConfigInput | undefined,
+): Provider {
+    const config = modelConfig.getProvider(providerId);
+    // ... 5 层叠加
+    const getModels = () => { /* applyExtension + applyModelsJson + override */ };
+    // Validate eagerly so registration/reload reports structural errors immediately.
+    getModels();
+    const apiKey = composeApiKeyAuth(providerId, base, config, extension);
+    const oauth = composeOAuthAuth(providerId, base, config, extension);
+    if (!apiKey && !oauth) throw new Error(`Provider ${providerId}: no authentication method configured.`);
+    // ...
+}
+```
+
+#### 16.1.4 编辑器自治：URL + 安全解析
+
+`packages/coding-agent/src/utils/git.ts` 第 172-226 行的 `parseGitUrl` 实现了**多层防御的 git URL 解析器**：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/utils/git.ts:172-226
+export function parseGitUrl(source: string): GitSource | null {
+    const trimmed = source.trim();
+    const hasGitPrefix = trimmed.startsWith("git:");
+    const url = hasGitPrefix ? trimmed.slice(4).trim() : trimmed;
+    if (!hasGitPrefix && !/^(https?|ssh|git):\/\//i.test(url)) {
+        return null;  // 非 git: 前缀必须是显式协议
+    }
+    const split = splitRef(url);  // 提取 #ref 后缀
+
+    // 第 1 轮:hostedGitInfo 候选 (ref + url)
+    const hostedCandidates = [split.ref ? `${split.repo}#${split.ref}` : undefined, url].filter(...);
+    for (const candidate of hostedCandidates) {
+        const info = hostedGitInfo.fromUrl(candidate);
+        if (info) {
+            if (split.ref && info.project?.includes("@")) continue;
+            return buildGitSource({ repo: ..., host: info.domain || "", path: `${info.user}/${info.project}`, ref: ... });
+        }
+    }
+
+    // 第 2 轮:https:// 强制前缀
+    const httpsCandidates = [...];
+    for (const candidate of httpsCandidates) { ... }
+
+    // 第 3 轮:通用 git URL 解析
+    return parseGenericGitUrl(url);
+}
+```
+
+`hasUnsafeGitInstallPart`（第 84-102 行）拒绝：`\0`、`\\`、绝对路径 `/`、不带 `allowSlash` 的 `/`、`..` 路径段——**对 shell install 命令注入做 4 重防御**（null 字节、反斜杠、绝对路径、目录穿越）。
+
+`buildGitSource`（第 104-124 行）要求 `path` 至少 2 段（`user/repo`），host 必须在 `hosted-git-info` 域名列表里。
+
+#### 16.1.5 自治编程：CLI flag → 会话生成
+
+`main.ts:445-541` 的 `buildSessionOptions` 把 CLI flag 翻译为 `CreateAgentSessionOptions`，**5 层 fallback**：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/main.ts:445-507
+function buildSessionOptions(parsed, scopedModels, hasExistingSession, modelRuntime, settingsManager) {
+    // 1. CLI --model 显式
+    if (parsed.model) {
+        const resolved = resolveCliModel({ cliProvider, cliModel, cliThinking, modelRuntime });
+        options.model = resolved.model;
+    }
+    // 2. scoped models（Ctrl+P 切换）
+    if (!options.model && scopedModels.length > 0 && !hasExistingSession) {
+        const savedModel = ...;  // settingsManager.getDefaultProvider + getDefaultModel
+        if (savedInScope) options.model = savedInScope.model;
+        else options.model = scopedModels[0].model;
+    }
+    // 3. Thinking level（CLI 优先，覆盖 scoped）
+    if (parsed.thinking) options.thinkingLevel = parsed.thinking;
+    // 4. 工具白/黑名单
+    if (parsed.noTools) options.noTools = "all";
+    else if (parsed.noBuiltinTools) options.noTools = "builtin";
+    if (parsed.tools) options.tools = [...parsed.tools];
+    // 5. 扩展透传
+    return { options, cliThinkingFromModel, diagnostics };
+}
+```
+
+**PR 自动化锚点**：pi 的 `coding-agent` **不内置** GitHub PR 自动化（无 PR API 调用、无 git push 集成），但通过 `git.ts` 提供的 URL 解析被 **PackageManager 扩展**用于从 git URL 安装扩展时安全校验。PR 工作流依赖第三方扩展或用户在 Bash 中自行调用 `gh pr create`。
+
+### 16.2 AI 模型路由 + 推理优化
+
+#### 16.2.1 Provider 35+ 兼容矩阵
+
+`packages/ai/src/types.ts:17-76` 定义 **10 种 Api** + **35+ 种 Provider**：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/ai/src/types.ts:17-76
+export type KnownApi =
+    | "openai-completions" | "mistral-conversations"
+    | "openai-responses" | "azure-openai-responses"
+    | "openai-codex-responses" | "anthropic-messages"
+    | "bedrock-converse-stream" | "google-generative-ai"
+    | "google-vertex" | "pi-messages";
+
+export type KnownProvider =
+    | "amazon-bedrock" | "ant-ling" | "anthropic" | "google" | "google-vertex"
+    | "openai" | "azure-openai-responses" | "openai-codex"
+    | "radius" | "nvidia" | "deepseek" | "github-copilot" | "xai"
+    | "groq" | "cerebras" | "openrouter" | "vercel-ai-gateway"
+    | "zai" | "zai-coding-cn" | "mistral"
+    | "minimax" | "minimax-cn" | "moonshotai" | "moonshotai-cn"
+    | "huggingface" | "fireworks" | "together" | "baseten"
+    | "opencode" | "opencode-go" | "kimi-coding"
+    | "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+    | "qwen-token-plan" | "qwen-token-plan-cn" | "qwen-token-plan-individual"
+    | "xiaomi" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-sgp";
+```
+
+`Api | (string & {})` + `ProviderId | string` 用 branded type 允许**运行时动态注册**新 provider 但保留类型推断。
+
+#### 16.2.2 环境变量 API Key 解析：6 类 ambient 凭证
+
+`packages/ai/src/env-api-keys.ts:68-120` 的 `getApiKeyEnvVars` 把 provider 映射到环境变量，第 154-188 行处理 **Google Vertex + AWS Bedrock** 的特殊认证路径：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/ai/src/env-api-keys.ts:154-188
+// Vertex AI: Application Default Credentials (ADC) + project + location
+if (provider === "google-vertex") {
+    const hasCredentials = hasVertexAdcCredentials(env);  // ~/.config/gcloud/... 或 GOOGLE_APPLICATION_CREDENTIALS
+    const hasProject = !!(env.GOOGLE_CLOUD_PROJECT || env.GCLOUD_PROJECT);
+    const hasLocation = !!env.GOOGLE_CLOUD_LOCATION;
+    if (hasCredentials && hasProject && hasLocation) return "<authenticated>";
+}
+
+// AWS Bedrock: 6 种凭证源
+if (provider === "amazon-bedrock") {
+    if (
+        env.AWS_PROFILE ||                                           // 1. 命名 profile
+        (env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY) ||      // 2. 标准 IAM keys
+        env.AWS_BEARER_TOKEN_BEDROCK ||                              // 3. Bedrock bearer
+        env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI ||                // 4. ECS task roles (相对)
+        env.AWS_CONTAINER_CREDENTIALS_FULL_URI ||                     // 5. ECS task roles (绝对)
+        env.AWS_WEB_IDENTITY_TOKEN_FILE                              // 6. IRSA (K8s)
+    ) return "<authenticated>";
+}
+return undefined;
+```
+
+返回字符串 `"<authenticated>"`（不是真 key）作为 **ambient marker**，避免凭证泄漏到日志。
+
+#### 16.2.3 Thinking Budget：4 档 + 自动 clamp
+
+`packages/ai/src/api/simple-options.ts:55-95` 定义 4 档 thinking budget（minimal/low/medium/high），并自动 `clamp` 到回答空间：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/ai/src/api/simple-options.ts:55-95
+export const MIN_ANSWER_TOKENS = 1024;  // 必须保留的最小回答空间
+
+export const DEFAULT_THINKING_BUDGETS: ThinkingBudgets = {
+    minimal: 1024,
+    low: 2048,
+    medium: 8192,
+    high: 16384,
+};
+
+export function clampReasoning(effort): Exclude<ThinkingLevel, "xhigh" | "max"> | undefined {
+    return effort === "xhigh" || effort === "max" ? "high" : effort;
+}
+
+export function thinkingBudgetForLevel(level, customBudgets?: ThinkingBudgets): number {
+    const budgets = { ...DEFAULT_THINKING_BUDGETS, ...customBudgets };
+    return budgets[clampReasoning(level)!]!;
+}
+
+export function adjustMaxTokensForThinking(baseMaxTokens, modelMaxTokens, reasoningLevel, customBudgets?) {
+    let thinkingBudget = thinkingBudgetForLevel(reasoningLevel, customBudgets);
+    // 关键: maxTokens 必须包含 thinking + 回答
+    const maxTokens = baseMaxTokens === undefined
+        ? modelMaxTokens
+        : Math.min(baseMaxTokens + thinkingBudget, modelMaxTokens);
+    if (maxTokens <= thinkingBudget) {
+        thinkingBudget = clampThinkingBudgetToAnswerRoom(thinkingBudget, maxTokens);
+    }
+    return { maxTokens, thinkingBudget };
+}
+```
+
+**xhigh / max 自动降级为 high**（第 64-66 行），**始终为回答保留 MIN_ANSWER_TOKENS=1024**（第 75-77 行）。
+
+#### 16.2.4 Provider 请求级 retry：SDK 内置 + 外层包装
+
+`packages/ai/src/utils/provider-retry.ts` 实现了 **abort-aware 重试包装器**，镜像 OpenAI/Anthropic SDK 策略：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/ai/src/utils/provider-retry.ts:22-67
+function isRetryableProviderError(error: ProviderError): boolean {
+    const shouldRetry = error.headers?.get("x-should-retry");
+    if (shouldRetry === "true") return true;
+    if (shouldRetry === "false") return false;
+    if (error.status === undefined) return true;
+    return error.status === 408 || error.status === 409 || error.status === 429
+        || (typeof error.status === "number" && error.status >= 500);
+}
+
+function getRetryDelayMs(error, retryIndex, maxRetryDelayMs) {
+    const retryAfterMs = error.headers?.get("retry-after-ms");  // 优先级 1: ms 精度
+    if (retryAfterMs) { const value = Number.parseFloat(retryAfterMs); ... }
+    const retryAfter = error.headers?.get("retry-after");       // 优先级 2: 秒/HTTP-date
+    if (retryAfter) {
+        const seconds = Number.parseFloat(retryAfter);
+        const delayMs = Number.isNaN(seconds) ? Date.parse(retryAfter) - Date.now() : seconds * 1000;
+        return validateServerRetryDelayMs(delayMs, maxRetryDelayMs, error.message);
+    }
+    const exponentialDelay = Math.min(0.5 * 2 ** retryIndex, 8) * 1000;  // 优先级 3: 指数退避
+    return exponentialDelay * (1 - Math.random() * 0.25);                  // ±25% 抖动
+}
+
+export async function retryProviderRequest<T>(request, options) {
+    for (;;) {
+        try {
+            return await request();  // 每次 retry 是新 SDK 调用,X-Stainless-Retry-Count 归零
+        } catch (error) {
+            if (options.signal?.aborted) throw createAbortError();
+            if (retriesRemaining <= 0 || !isRetryableProviderError(error)) throw error;
+            await abortableSleep(getRetryDelayMs(error, retryIndex, options.maxRetryDelayMs), options.signal);
+        }
+    }
+}
+```
+
+**关键设计**：外层包装器**强制 SDK maxRetries=0**，避免 SDK 内部 timer 不响应 AbortSignal 的问题（第 99-104 行注释）。`maxRetryDelayMs` 默认 60s，超过则抛出（让上层重试逻辑接管并提示用户）。
+
+`packages/ai/src/utils/retry.ts` 的更上层 `retryAssistantCall`（第 163-212 行）实现 **assistant-message 级重试**——按错误模式分类（`NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` 配额耗尽 vs `RETRYABLE_PROVIDER_ERROR_PATTERN` 429/5xx/网络），用 `baseDelayMs * 2^(attempt-1)` 指数退避，并通过 `RetryCallbacks` 暴露 `onRetryScheduled` / `onRetryAttemptStart` / `onRetryFinished` 三个钩子让上层 UI 显示。
+
+#### 16.2.5 KV Cache key 路由
+
+`packages/ai/src/types.ts:621-638` 定义 **session affinity header 策略**（OpenAI/OpenRouter 自动检测），**prompt_cache_key 由 cacheRetention 决定**：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/ai/src/api/openai-responses.ts:295
+prompt_cache_key: cacheRetention === "none" ? undefined : clampOpenAIPromptCacheKey(options?.sessionId),
+```
+
+`clampOpenAIPromptCacheKey` 把 sessionId 截断到 provider 上限（OpenAI 64 字符），未指定 `cacheRetention` 时默认 `"short"`（5 分钟），显式 `"long"` 走 Anthropic `1h` TTL（`/usr/local/LsmGitOpenSource/pi/packages/ai/src/api/anthropic-messages.ts:60-74` 的 `getCacheControl`）：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/ai/src/api/anthropic-messages.ts:60-74
+function getCacheControl(model, cacheRetention?, env?): { retention; cacheControl? } {
+    const retention = resolveCacheRetention(cacheRetention, env);
+    if (retention === "none") return { retention };
+    const ttl = retention === "long" && getAnthropicCompat(model).supportsLongCacheRetention
+        ? "1h" : undefined;
+    return { retention, cacheControl: { type: "ephemeral", ...(ttl && { ttl }) } };
+}
+```
+
+#### 16.2.6 Models 集合：refresh + publication chain
+
+`packages/ai/src/models.ts:254-365` 的 `ModelsImpl` 实现 **多 provider 并发刷新 + 串行 publication**：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/ai/src/models.ts:320-365
+private supersedeProviderRefresh(providerId: string): number {
+    const generation = (this.refreshGenerations.get(providerId) ?? 0) + 1;
+    this.refreshGenerations.set(providerId, generation);
+    const previous = this.refreshControllers.get(providerId);
+    if (previous) { this.refreshControllers.delete(providerId); previous.abort(); }
+    return generation;
+}
+
+private publishProviderModels(providerId, generation, signal, publication): Promise<boolean> {
+    const previous = this.publicationChains.get(providerId) ?? Promise.resolve();
+    const queued = (async () => {
+        await previous.catch(() => {});
+        if (signal.aborted || this.refreshGenerations.get(providerId) !== generation) return false;
+        // 1. 持久化（可选 null 删除）
+        if (publication.persist === null) await this.modelsStore.delete(providerId, { signal });
+        else if (publication.persist !== undefined) await this.modelsStore.write(providerId, structuredClone(publication.persist), { signal });
+        // 2. 同步内存态更新（仅当 generation 未过期）
+        if (signal.aborted || this.refreshGenerations.get(providerId) !== generation) return false;
+        publication.update?.();
+        return true;
+    })();
+    this.publicationChains.set(providerId, queued.catch(() => {}));
+    return raceWithAbortSignal(queued, signal);
+}
+```
+
+**Generation 机制**保证同一 provider 的并发 refresh 互斥（递增 generation，旧的立即 abort），**publication chain** 串行化持久化 + 内存更新，避免 race。
+
+#### 16.2.7 retryAssistantCall 错误分类（70+ 正则）
+
+`packages/ai/src/utils/retry.ts:7-90` 用 70+ 正则模式分类错误：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/ai/src/utils/retry.ts:7-90
+const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+    "GoUsageLimitError", "FreeUsageLimitError",      // OpenCode Zen 订阅上限
+    "Monthly usage limit reached", "available balance",
+    "insufficient_quota", "out of budget", "quota exceeded", "billing",  // OpenAI 标准
+]);
+
+const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
+    "overloaded", "rate.?limit", "too many requests",
+    "429", "500", "502", "503", "504", "524",                // HTTP 状态
+    "service.?unavailable", "server.?error", "internal.?error",
+    "provider.?returned.?error",                            // OpenRouter #2264
+    "exceeded request buffer limit while retrying upstream",
+    "network.?error", "connection.?refused", "connection.?lost",
+    "other side closed", "fetch failed", "getaddrinfo", "ENOTFOUND",
+    "EAI_AGAIN", "upstream.?connect", "reset before headers",
+    "socket hang up", "socket connection was closed", "timed? out", "timeout",
+    "websocket.?closed", "websocket.?error",                // WS 传输
+    "ended without", "stream ended before message_stop",   // Anthropic #4433
+    "stream ended before a terminal response event", "http2 request did not get a response", // Bedrock #3594
+    "retry delay",                                          // Provider-requested 上限触发
+    "you can retry your request", "try your request again", "please retry your request",
+    "ResourceExhausted",                                    // gRPC (NVIDIA NIM)
+]);
+```
+
+### 16.3 Session Backends 双后端
+
+`packages/session-backends/` 仅含 `sqlite-node` 子包；**JSONL 后端位于 `agent/src/harness/session/jsonl/`**——双后端分布在不同包但实现 `agent/src/harness/session/types.ts` 里的统一 `SessionStorage` 接口。
+
+#### 16.3.1 SessionStorage 抽象
+
+`agent/src/harness/session/jsonl/types.ts:4-18` 定义 FileSystem 抽象（JSONL 后端）：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/types.ts:4-18
+export type JsonlSessionRepoFileSystem = Pick<
+    FileSystem,
+    | "absolutePath" | "joinPath" | "readTextFile" | "readTextLines"
+    | "writeFile" | "appendFile" | "renameFile"
+    | "fileInfo" | "listDir" | "exists" | "createDir" | "remove"
+>;
+```
+
+`session-backends/sqlite-node/src/sqlite/repo.ts:1-93` 的 `SqliteSessionRepository` 直接实现 `SessionRepo`（来自 `@earendil-works/pi-agent-core`），通过 `SqliteDatabaseFactory` 注入 SQLite 引擎（支持 node/bun/sql.js 三种驱动）。
+
+#### 16.3.2 SQLite 后端：12 张表
+
+`packages/session-backends/sqlite-node/src/sqlite/migrations/001_initial.sql`（122 行）建 12 张表：
+
+| 表 | 主键 | 索引 | 用途 |
+|---|---|---|---|
+| `sessions` | (id) WITHOUT ROWID | `created_at DESC`, `(cwd, created_at DESC)` | 会话元数据 |
+| `entries` | `(session_id, id)` UNIQUE `(session_id, seq)` | `(session_id, parent_id)`, `(session_id, type, seq)` | 11 种 entry |
+| `session_sequences` | (session_id) | — | next_seq 分配 |
+| `session_stats` | (session_id) | — | token / cost 累计 |
+| `branch_entries` | `(session_id, branch_id, entry_id)` WITHOUT ROWID | `(session_id, branch_id, entry_seq)`, `(session_id, entry_id, branch_id, entry_seq)`, `(session_id, branch_id, entry_type, entry_seq)`, `(session_id, branch_id, custom_type, entry_seq)` | 分支缓存 |
+| `lanes` | `(session_id, lane)` | — | 三 Lane 状态 |
+| `records` | `(session_id, id)` UNIQUE `(session_id, seq)` WITHOUT ROWID | 6 个二级索引 | Lane 操作记录 |
+| `lane_moves` | (session_id, seq) | — | Lane 迁移 |
+| `facts` | (session_id, seq) | `(session_id, kind, key, seq)` | key-value 元事实 |
+| `branch_tips` | `(session_id, tip_id)` UNIQUE `(session_id, branch_id)` | — | 分支 tip |
+| `writer_leases` | (session_id) | — | 单写者 lease |
+| `migrations` | (id) | — | schema 版本 |
+
+**关键约束**：所有主键用 `WITHOUT ROWID`（clustered index 即数据）减少磁盘；`UNIQUE (session_id, seq)` 保证单调序号。
+
+#### 16.3.3 WriterLease fence：原子获取 + 三段续约
+
+`packages/session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts:16-58` 用 **atomic upsert + fence 计数器**实现 lease：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts:16-58
+export function acquireWriterLease(db, sessionId, ownerId, now, expiresAtMs) {
+    const row = sql`INSERT INTO writer_leases (session_id, owner_id, fence, expires_at_ms)
+        VALUES (${sessionId}, ${ownerId}, 1, ${expiresAtMs})
+        ON CONFLICT(session_id) DO UPDATE SET
+            owner_id = excluded.owner_id,
+            fence = writer_leases.fence + 1,         // 新所有者 fence +1
+            expires_at_ms = excluded.expires_at_ms
+        WHERE writer_leases.expires_at_ms <= ${now}    // 只在过期时才让位
+        RETURNING owner_id, fence, expires_at_ms`.get(db);
+    return row === undefined ? undefined
+        : { ownerId: row.owner_id, fence: row.fence, expiresAtMs: row.expires_at_ms };
+}
+
+export function renewWriterLease(db, sessionId, lease, now, expiresAtMs) {
+    // 三段续约：必须匹配 owner_id + fence + 还未过期
+    const result = sql`UPDATE writer_leases
+        SET expires_at_ms = ${expiresAtMs}
+        WHERE session_id = ${sessionId}
+            AND owner_id = ${lease.ownerId}
+            AND fence = ${lease.fence}
+            AND expires_at_ms > ${now}`.run(db);
+    if (result.changes === 1) lease.expiresAtMs = expiresAtMs;
+    return result.changes === 1;
+}
+```
+
+**Fence 语义**：每次 lease 转移 fence+1，所有写入必须带 fence token；如果一个旧 owner 心跳续约，fence 已变 → `UPDATE changes === 0` → 静默失败，**避免 zombie writer 用过期 lease 写盘**。
+
+`SqliteSessionRepositoryOptions`（`./repo.ts:102-107`）暴露 `writerLease.ttlMs`（默认 30s）和 `heartbeatIntervalMs`（默认 10s，必须 < ttlMs），第 114-122 行强制校验。
+
+#### 16.3.4 JSONL 后端：torn-tail 修复 + 原子发布
+
+`packages/agent/src/harness/session/jsonl/storage.ts:33-46` 的 `publishFileAtomically` 用 **temp file + rename** 实现原子发布：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/storage.ts:33-46
+async function publishFileAtomically(fs, destinationPath, populate): Promise<void> {
+    const tempPath = `${destinationPath}.tmp`;
+    try {
+        await populate(tempPath);                                // 1. 写入临时
+        fileResult(await fs.renameFile(tempPath, destinationPath), `Failed to publish staged file ${destinationPath}`);
+    } catch (error) {
+        await fs.remove(tempPath, { force: true });             // 2. 失败清理
+        throw error;
+    }
+}
+```
+
+第 80-95 行的 `JsonlSessionStorage.load` 在加载时**自动修复 torn-tail**（进程崩溃在 `appendFile` 中途导致最后一行不完整 JSON）：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/storage.ts:80-108
+for (let index = 1; index < physicalLines.length; index++) {
+    const line = physicalLines[index]!;
+    const mutationResult = parseMutation(line);
+    if (!mutationResult.ok) {
+        const isTornTail = index === physicalLines.length - 1
+            && mutationResult.error.kind === "syntax";
+        if (isTornTail) {
+            // 截断到 valid prefix，重写文件
+            const validPrefix = `${physicalLines.slice(0, index).join("\n")}\n`;
+            await publishFileAtomically(fs, path, async (tempPath) => {
+                fileResult(await fs.writeFile(tempPath, validPrefix), `Failed to stage torn-tail repair ${path}`);
+            });
+            return storage;
+        }
+        throw invalidFile(path, index + 1, mutationResult.error);
+    }
+    storage.applyMutation(mutationResult.value);
+}
+// 兜底:文件不以 \n 结尾 → 追加换行
+if (!content.endsWith("\n")) {
+    fileResult(await fs.appendFile(path, "\n"), `Failed to repair unterminated session tail ${path}`);
+}
+```
+
+**关键策略**：只接受最后一行是 `syntax` 错误（JSON 不完整）；中间任何 mutation 错误立即抛 `invalidFile`。`JsonlDecodeError`（`./errors.ts`）区分 `schema` / `syntax` 两类。
+
+#### 16.3.5 双后端迁移语义
+
+`packages/agent/src/harness/session/jsonl/types.ts:31` 标注 `sourceFormat: 3 | 4`——支持从 v3 legacy JSONL 平滑升级到 v4 header（`JsonlV4Header` 第 47-57 行）：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/types.ts:47-57
+export interface JsonlV4Header {
+    kind: "header";
+    version: 4;
+    id: string;
+    createdAt: number;
+    cwd: string;
+    parentSessionId?: string;
+    /** Preserved only when a v3 parent path could not be resolved to a session id. */
+    legacyParentSessionPath?: string;
+    metadata?: Record<string, JsonValue>;
+}
+```
+
+`legacyParentSessionPath` 保留迁移期不可解析的父路径，避免一次性破坏既有 session tree。
+
+#### 16.3.6 切换策略：双后端如何选
+
+当前 pi 的 SessionManager（`coding-agent/src/core/session-manager.ts`）默认使用 **JSONL 后端**（代码自包含，无外部依赖）。`session-backends/sqlite-node` 是**可选**后端——通过 `getStorage()` 工厂注入或通过 `ModelsStore`/`CredentialStore` 类似模式预留接口（详见 `session-backends/sqlite-node/test/repository.test.ts` 的 `new SqliteSessionRepository({ env, sqlite, databasePath })` 用法）。
+
+`session-backends/sqlite-node` 是**纯函数式接口**——`async using repo = new SqliteSessionRepository(...)`（TS 5.2+ `using` 声明 + `Symbol.asyncDispose`）保证 RAII 自动关闭数据库。
+
+### 16.4 OTLP Telemetry 深度集成
+
+注：第 9 章「遥测」已覆盖 `InMemoryTelemetryContext` + `NOOP_TELEMETRY_CONTEXT` 基础；本节聚焦**类型化 Schema 推导系统**、**Span 决策审计事件清单**、**InMemory 后端内部行为**、**OTLP exporter 接入路径**。
+
+#### 16.4.1 类型化 Schema 推导（高级 TypeScript）
+
+`packages/telemetry/src/index.ts:72-355` 实现了一套**完全类型安全**的 telemetry schema：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/telemetry/src/index.ts:72-130
+export type AttributeDefinitionValue<Definition> = Definition extends { type: "string"; values: readonly (infer V)[]; }
+    ? V : Definition extends { type: "string" }
+    ? string
+    : Definition extends { type: "number"; values: readonly (infer V)[]; }
+    ? V : /* ... 10+ 类型分支 ... */
+    : readonly boolean[];
+
+// 约束: required attribute → 必传; optional → 可选
+export type InferRequiredAndOptionalAttributes<Definitions> = {
+    [Name in RequiredAttributeNames<Definitions>]: AttributeDefinitionValue<Definitions[Name]>;
+} & {
+    [Name in OptionalAttributeNames<Definitions>]?: AttributeDefinitionValue<Definitions[Name]>;
+};
+```
+
+`TypedSpanStarter`（第 318-322 行）通过 UnionToIntersection 把多个 schema 的 span 名字合并：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/telemetry/src/index.ts:299-322
+type UnionToIntersection<U> = (U extends unknown ? (value: U) => void : never) extends
+    (value: infer I) => void ? I : never;
+
+export type TypedSpanStarter<Schemas> = UnionToIntersection<{
+    [Name in SpanNameInSchemas<Schemas>]: TypedSpanStarterForName<Schemas, Name>;
+}[SpanNameInSchemas<Schemas>]>;
+```
+
+`bindTypedSpanStarter`（第 324-343 行）运行时**递归绑定父 context**，让子 span 自动继承。
+
+#### 16.4.2 AI Telemetry Schema（17 种 start attr + 13 种 end attr）
+
+`packages/agent/src/harness/telemetry.ts:42-118` 定义 `AI_TELEMETRY_SCHEMA`，**唯一 span 是 `pi.ai.request`**（覆盖所有 LLM 操作）：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/telemetry.ts:42-118
+export const AI_TELEMETRY_SCHEMA = {
+    version: 1,
+    spans: {
+        "pi.ai.request": {
+            description: "One logical request to an AI provider",
+            parents: { kind: "any" },
+            startAttributes: {
+                "pi.ai.operation": {
+                    type: "string", required: true,
+                    values: ["stream", "fetch_deferred", "cancel_deferred", "generate_images"],
+                    description: "Logical provider operation",
+                },
+                "pi.ai.provider": { type: "string", required: true, description: "Selected provider id" },
+                "pi.ai.model":    { type: "string", required: true, description: "Requested model id" },
+                "pi.ai.api":      { type: "string", required: true, description: "Provider API id" },
+                "pi.ai.streaming": { type: "boolean", required: true, description: "Whether this operation returns a stream" },
+                "pi.ai.deferred":  { type: "boolean", required: false, description: "Whether the operation requests deferred execution" },
+            },
+            endAttributes: {
+                "pi.ai.response.model":       { type: "string", description: "Concrete response model" },
+                "pi.ai.response.id":          { type: "string", cardinality: "high", description: "Provider response id" },
+                "pi.ai.response.stop_reason": { type: "string", values: ["stop", "length", "tool_use", "error", "aborted", "deferred"] },
+                "pi.ai.http.status_code":     { type: "number", description: "Final HTTP status" },
+                "pi.ai.usage.input_tokens":          { type: "number" },
+                "pi.ai.usage.output_tokens":         { type: "number" },
+                "pi.ai.usage.cache_read_tokens":     { type: "number" },
+                "pi.ai.usage.cache_write_tokens":    { type: "number" },
+                "pi.ai.usage.reasoning_tokens":     { type: "number" },
+                "pi.ai.usage.total_tokens":          { type: "number" },
+                "pi.ai.usage.cost":                  { type: "number" },
+                "pi.ai.stream.chunk_count":          { type: "number" },
+                "pi.ai.stream.time_to_first_chunk_ms": { type: "number" },
+                "pi.ai.error.type": { type: "string", cardinality: "low" },
+            },
+            status: { default: "ok", errorWhen: "The operation throws or returns an error result" },
+        },
+    },
+} as const satisfies TelemetrySchemaDefinition;
+```
+
+**关键设计**：`cardinality: "high"` 标记高基数字段（如 provider response id）让 OTLP exporter 做下采样/采样策略；`cardinality: "low"` 标记低基数（如 stop_reason）做索引。
+
+#### 16.4.3 Harness Telemetry Schema：11 种 hook + 30 种 event
+
+`telemetry.ts:147-217` 定义 **11 个 hook name** + **30 个 event type**，构成决策审计的全景：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/telemetry.ts:147-217
+const HOOK_NAMES = [
+    "before_run", "before_resume", "before_run_end", "transform_context",
+    "before_request", "before_payload", "after_response",
+    "before_tool", "after_tool",
+    "before_compaction", "before_navigation",
+] as const;
+
+const EVENT_TYPES = [
+    "run_start", "run_resume", "run_suspend", "run_abort", "run_end", "fault", "handler_error",
+    "turn_start", "turn_end",
+    "retry_scheduled", "retry_start", "retry_end",
+    "message_start", "message_update", "message_end",
+    "tool_start", "tool_update", "tool_end",
+    "entry_added", "write_pending", "queue_update", "fact_update", "config_update",
+    "compaction_start", "compaction_end",
+    "navigation_start", "navigation_end",
+    "lane_created", "usage",
+] as const;
+```
+
+`telemetry.ts:232-299` 定义 4 个核心 span（`pi.harness.run` / `pi.harness.compaction` / `pi.harness.navigation`），共享 `operationStartAttributes`：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/telemetry.ts:193-217
+const operationStartAttributes = {
+    "pi.session.id":         { type: "string", required: true, cardinality: "high", description: "Session id" },
+    "pi.lane.name":          { type: "string", required: true, cardinality: "high", description: "Lane name" },
+    "pi.operation.id":       { type: "string", required: true, cardinality: "high", description: "Durable operation id" },
+    "pi.operation.recovery": { type: "boolean", required: true, description: "Whether this invocation resumes durable work" },
+};
+```
+
+**决策可追溯性**：每个 run/compaction/navigation 的 start 属性固定包含 `lane.name` + `operation.id`，可关联到 Lane 状态机的事件溯源——**OTLP exporter 只需一份 trace 就能还原 agent 决策时序**。
+
+#### 16.4.4 InMemory 后端：defensive recording
+
+`packages/telemetry/src/memory.ts:120-186` 的 `startInMemorySpan` 用 try/catch **passive 录制**：
+
+```typescript
+// /usr/local/LsmGitOpenSource/pi/packages/telemetry/src/memory.ts:120-186
+function startInMemorySpan(state, parent, options, callback): Promise<T> {
+    if (parent?.settled) return NOOP_TELEMETRY_CONTEXT.startSpan(options, callback);  // 父 span 已结束 → 退化 NOOP
+
+    let recordedSpan;
+    try {
+        recordedSpan = createSpan(state, parent, options);
+        state.spans.push(recordedSpan);
+    } catch {
+        return NOOP_TELEMETRY_CONTEXT.startSpan(options, callback);
+    }
+
+    const span: TelemetrySpan = {
+        startSpan: (childOptions, childCallback) =>
+            startInMemorySpan(state, recordedSpan, childOptions, childCallback),
+        addEvent(name, attributes) {
+            if (recordedSpan.settled) return;  // 已 settled → 拒绝
+            try { recordedSpan.events.push({ name, attributes: copyAttributes(attributes) }); }
+            catch { /* Recording is passive. Ignore malformed telemetry payloads. */ }
+        },
+        setAttributes(attributes) {
+            if (recordedSpan.settled) return;
+            try { recordedSpan.attributes = mergeAttributes(recordedSpan.attributes, attributes); }
+            catch { /* Recording is passive. */ }
+        },
+        setStatus(status) {
+            if (recordedSpan.settled) return;
+            try { recordedSpan.status = copyStatus(status); recordedSpan.explicitStatus = true; }
+            catch { /* Recording is passive. */ }
+        },
+    };
+
+    let result;
+    try { result = callback(span); } catch (error) {
+        settleSpan(state, recordedSpan, true, error);
+        return Promise.reject(error);
+    }
+    return Promise.resolve(result).then(
+        (value) => { settleSpan(state, recordedSpan, false); return value; },
+        (error) => { settleSpan(state, recordedSpan, true, error); throw error; }
+    );
+}
+```
+
+**关键设计**：
+- 父 span settled → 子 span 走 NOOP（避免悬挂）
+- 任何 addEvent/setAttributes/setStatus 在 settled 后**静默忽略**（不抛错，避免 telemetry 影响主流程）
+- 错误自动转 `error status`（`automaticErrorStatus` 第 78-87 行）
+
+#### 16.4.5 OTLP Exporter 接入路径
+
+当前 pi **未内置 OTLP exporter**——`InMemoryTelemetryContext` 是唯一实现，但提供了**清晰的 OTLP 适配点**：
+
+1. 实现 `TelemetryContext` 接口（第 14-16 行）→ 提供 `startSpan(options, callback)`
+2. 用 `getSpans()`（第 204-218 行）拿到 `RecordedTelemetrySpan[]`（含 `id` / `parentId` / `name` / `attributes` / `events` / `status` / `endSequence`）
+3. 转换为 OTLP `ResourceSpans` / `ScopeSpans` / `Span` 格式（Otel SDK 标准）
+4. 用 `@opentelemetry/exporter-trace-otlp-http` POST 到 collector
+
+`endSequence`（第 98 行：`state.nextEndSequence++`）是 pi 独有的**全局结束序号**——可还原事件因果序（即便跨 span），适合 OTLP exporter 在导出后做事件重排/去重。
+
+`endAttributes.cardinality: "high"` 字段（如 `pi.ai.response.id`）可在 exporter 层做**采样/skip**（避免 OTLP collector 索引爆炸）。
+
+#### 16.4.6 测试与 conformance
+
+`packages/telemetry/src/testing/conformance.ts` + `testing/types.ts` 提供 **schema 一致性测试套件**——任何新 `TelemetrySchemaDefinition` 必须通过 schema conformance（验证 startAttributes/endAttributes 类型一致性、required 字段、补全度）。
+
+### 16.5 对 laew 的借鉴路线图
+
+#### 16.5.1 P0 — 直接可用（1-2 周）
+
+| 借鉴项 | pi 来源 | laew 落地路径 |
+|---|---|---|
+| 5 源 Provider 合成 | `coding-agent/src/core/model-runtime.ts:58-80` + `provider-composer.ts:420-523` | 把当前 `Provider` 单源升级为 base+models.json+oauth+override 多层；`validateExtensionProvider` eager validate 在 CLI 启动时跑 |
+| abort-aware retry | `ai/src/utils/provider-retry.ts:105-125` + `retry.ts:163-212` | 替换 laew 现有 `reqwest::Client` 的默认 retry（`reqwest::retry` 中间件不响应 `tokio::select!` 取消），外层包装器 + 指数退避 |
+| 错误分类 70+ 正则 | `ai/src/utils/retry.ts:7-90` | Rust `regex` crate 编译 70+ pattern，配额错误立即 fail-fast（不让用户等 backoff） |
+| WriterLease fence | `session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts:16-58` | laew 当前 SQLite 单进程独占，但未来多 agent 并发写可借鉴 `fence INTEGER` + `UPDATE ... WHERE fence=?` 防御 zombie writer |
+| thinking budget 4 档 | `ai/src/api/simple-options.ts:55-95` | 在 `llm/mod.rs` 加 `thinking_budget: HashMap<Level, u32>`，自动 `clamp` 到 `max_tokens - 1024` |
+| 6 类 ambient 凭证 | `ai/src/env-api-keys.ts:154-188` | `config/mod.rs` 加 AWS_PROFILE / GOOGLE_ADC / Azure CLI 等 ambient 检测，返回 `Option<String>` 而非具体 key |
+
+#### 16.5.2 P1 — 中期目标（3-4 周）
+
+| 借鉴项 | pi 来源 | laew 落地路径 |
+|---|---|---|
+| 双后端架构 | `session-backends/sqlite-node/` + `agent/src/harness/session/jsonl/` | laew 当前 SQLite 单一，可加 JSONL 后端做**导出/调试**（`LsmAgentEmergentWork.db` 不可读时回退 JSONL）；`sourceFormat: 3\|4` 模式支持版本迁移 |
+| torn-tail 修复 | `agent/src/harness/session/jsonl/storage.ts:80-108` | JSONL 后端必备；用 `tempfile + rename` 实现原子发布，崩溃后启动检测最后一行 schema 错误则截断 |
+| 类型化 telemetry schema | `telemetry/src/index.ts:72-355` + `agent/src/harness/telemetry.ts:42-118` | laew 当前 `AgentError` 已结构化但无 OTLP；用 `serde` + `tracing-subscriber` 做 span 录制，导出 OTLP HTTP |
+| Lane 决策可追溯 | `agent/src/harness/telemetry.ts:193-217` | laew 当前 MultiAgent 编排已具备 Yolo→Main→SubAgent 链路，把每个 transition 包成 span，让 trace 重放决策 |
+| prompt_cache_key 路由 | `ai/src/api/openai-responses.ts:295` + `anthropic-messages.ts:60-74` | laew 单实例 sessionId 可作为 cache key；`--cache-retention long` 走 Anthropic 1h TTL，节省 cache miss 成本 |
+| git URL 安全解析 | `coding-agent/src/utils/git.ts:84-124` | 如果未来 laew 支持扩展从 git 安装，**必须复用**这套 4 重防御（null/绝对路径/目录穿越/host 校验） |
+
+#### 16.5.3 P2 — 远期目标（5-8 周）
+
+| 借鉴项 | pi 来源 | laew 落地路径 |
+|---|---|---|
+| OTLP exporter | 暂无（自实现） | 引入 `opentelemetry` + `opentelemetry-otlp` crate，导出 trace 到 Jaeger/Tempo |
+| models.json Override | `coding-agent/src/core/model-config.ts` | 让用户覆盖内置 catalog 的 `contextWindow` / `cost` / `compat`，适配 laew 的 `/provider override <id>` 子命令 |
+| 70+ 错误分类 → enum | `ai/src/utils/retry.ts:7-90` | 编译期生成 `RetryClass` enum（配额/限流/网络/服务端/客户端），UI 差异化提示 |
+| editor 自治 / PR 自动化 | 无内置（仅 git URL 解析） | 不必借鉴；laew TUI 单轮模式适合单步任务，PR 工作流交给 `gh` CLI + Bash 工具 |
+| Skill 一等公民 | 第 8 章已覆盖 | — |
+
+### 16.6 综合：四维度交叉点
+
+四个维度在 pi 中通过 **5 个共享抽象** 串联：
+
+1. **Models 集合**（`ai/src/models.ts`）= Provider 路由 + 模型存储 + publication chain——是 16.2 的入口
+2. **SessionStorage 抽象**（`agent/src/harness/session/types.ts`）= JSONL + SQLite 双后端共用接口——是 16.3 的统一契约
+3. **TelemetryContext 抽象**（`telemetry/src/index.ts`）= InMemory + 未来 OTLP exporter 共用接口——是 16.4 的扩展点
+4. **SessionManager 编排**（`coding-agent/src/core/session-manager.ts`）= CLI 6 源判定 + version 迁移 + 双后端装配——是 16.1 + 16.3 的桥
+5. **Provider/Auth composition**（`coding-agent/src/core/provider-composer.ts`）= 5 层 Provider 合成 + eager validate + OAuth 适配——是 16.1 + 16.2 的桥
+
+**交叉决策点示例**：
+- 用户在 TUI 切换 provider（16.1）→ ModelRuntime 重新拉 catalog（16.2.6 refresh）→ 把新 catalog 写入 ModelsStore（持久化）→ trigger 所有 active session 的 `pi.ai.request` span 记录 provider change（16.4.2）
+- Session 写入（16.3.3 WriterLease）→ 失败时记 `pi.harness.run` span `pi.operation.outcome=failed`（16.4.3）→ telemetry exporter 可还原"为什么哪次写入失败"
+- 错误重试（16.2.4）→ `pi.ai.request` span 的 `endAttributes` 加 `pi.ai.usage.cost` + `retry_count` → OTLP trace 显示 retry 累积成本
+
+### 16.7 关键文件路径汇总
+
+| 类别 | 文件路径（绝对） |
+|---|---|
+| **Coding Agent CLI 入口** | |
+| main.ts CLI 编排 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/main.ts:352-443` |
+| CLI Args 解析 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/cli/args.ts:13-58, 71-446` |
+| createSessionManager 6 源 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/main.ts:352-443` |
+| buildSessionOptions 5 层 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/main.ts:445-541` |
+| ModelRuntime 5 源 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/core/model-runtime.ts:58-80` |
+| composeModelProvider | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/core/provider-composer.ts:420-523` |
+| git URL 安全解析 | `/usr/local/LsmGitOpenSource/pi/packages/coding-agent/src/utils/git.ts:84-124, 172-226` |
+| **AI 路由** | |
+| Provider 类型 35+ | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/types.ts:17-76` |
+| env-api-keys 6 类 | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/env-api-keys.ts:154-188` |
+| thinkingBudget 4 档 | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/api/simple-options.ts:55-95` |
+| retryProviderRequest | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/utils/provider-retry.ts:22-125` |
+| retryAssistantCall 70+ 正则 | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/utils/retry.ts:7-90, 163-212` |
+| Models publication chain | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/models.ts:320-365` |
+| cache_control short/long | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/api/anthropic-messages.ts:60-74` |
+| prompt_cache_key | `/usr/local/LsmGitOpenSource/pi/packages/ai/src/api/openai-responses.ts:295` |
+| **Session Backends** | |
+| SQLite 12 表 schema | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/migrations/001_initial.sql` |
+| WriterLease fence | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/storage/writer-leases.ts:16-58` |
+| SqliteSessionRepository | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/repo.ts:1-953` |
+| 12 张表索引 | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/migrations/001_initial.sql:9-122` |
+| SqliteDatabase 工厂 | `/usr/local/LsmGitOpenSource/pi/packages/session-backends/sqlite-node/src/sqlite/types.ts` |
+| JSONL Repo (agent 包) | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/repo.ts:1-247` |
+| JSONL Storage | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/storage.ts:33-108, 110-119` |
+| JSONL Types / FileSystem | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/types.ts:4-57` |
+| JSONL Codec | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/codec.ts` |
+| JSONL Errors | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/session/jsonl/errors.ts` |
+| **Telemetry 类型化** | |
+| Telemetry 接口定义 | `/usr/local/LsmGitOpenSource/pi/packages/telemetry/src/index.ts:1-355` |
+| 类型化 schema 推导 | `/usr/local/LsmGitOpenSource/pi/packages/telemetry/src/index.ts:72-130, 299-343` |
+| NOOP 后端 | `/usr/local/LsmGitOpenSource/pi/packages/telemetry/src/noop.ts` |
+| InMemory 实现 | `/usr/local/LsmGitOpenSource/pi/packages/telemetry/src/memory.ts:120-219` |
+| AI Telemetry Schema | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/telemetry.ts:42-118` |
+| Harness Telemetry Schema | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/telemetry.ts:147-217, 232-299` |
+| 11 hooks + 30 events | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/telemetry.ts:147-191` |
+| operationStartAttributes | `/usr/local/LsmGitOpenSource/pi/packages/agent/src/harness/telemetry.ts:193-217` |
+| Schema conformance 测试 | `/usr/local/LsmGitOpenSource/pi/packages/telemetry/src/testing/conformance.ts` |
+
+### 16.8 本轮不重复声明
+
+本轮严格不重复第七轮及之前章节已覆盖内容：
+
+- **不重复二进制帧协议 CBOR**（第 2 章）—— 本轮聚焦 AI 路由、Session、Telemetry
+- **不重复 Server / Session 后端基础**（第 3 章）—— 本轮仅深入 SQLite/JSONL 双后端差异，不重述 PiServer
+- **不重复 Lane 三态 / reduceLaneState / 14 种损坏检测**（第 4、5、13.5、13.7 章）—— WriterLease fence 是第 5+13 章的延续但聚焦双后端视角
+- **不重复流式 + 中断传播**（第 6 章）
+- **不重复 11 种 Entry / 压缩策略**（第 7 章）
+- **不重复 Skill 系统**（第 8 章）
+- **不重复 Telemetry NOOP/InMemory 基础**（第 9 章）—— 本轮聚焦类型化 schema 推导、决策审计事件清单、OTLP exporter 接入路径
+- **不重复 JSONL torn-tail 修复原理**（第 10.4 章）—— 本轮在 16.3.4 简要回顾但不重述 14 种校验
+- **不重复 Provider 20+ 兼容性开关**（第 12.1 章）—— 本轮聚焦 5 源合成 + 路由 + retry + thinking budget
+- **不重复系统提示词 + thinkingFormat**（第 13 章）
+- **不重复错误处理 TaggedError/Result**（第 14 章）—— 本轮聚焦 HTTP-level retry 与错误分类
+- **不重复第 14 章第七轮 Edit/Git/Bash/Grep** —— 本轮 16.1.4 仅简述 git URL 解析作为编辑器自治锚点
+- **不重复第五/六轮深挖**（第 12、13 章）—— 本轮专注 4 个全新维度
+

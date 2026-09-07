@@ -4110,3 +4110,1066 @@ atomcode **不自研 tokenizer**(太贵),**不用 tiktoken**(绑 OpenAI),采用*
 - ㉓ **SUMMARY_TOOL_OUTPUT_MAX_CHARS = 2000 + TAIL_CHARS = 500**(head/tail 保留)
 
 —— 调研者注:本文档为「第七轮深挖」,聚焦文件编辑、代码检索、命令执行、Token/Cache 四大生产级深度;不重复前 20 章已覆盖的 kernel 循环、协议适配 wire、CodeIntel 七件套主体、claudecode Tool 系统演进、协议 byte-stable + SSE decoder + 重试三层叠加等主题。
+
+## 22. 第八轮深挖 — LSP/CodeIntel完整实现 + Telemetry可观测性 + OAuth与凭证保管 + Daemon进程模型（2026-09-07）
+
+> 本章是 atomcode 第八轮深挖,聚焦四个前七轮未系统覆盖的维度:**LSP 客户端 + 跨 server 池化(tree-sitter fallback 链路)**、**OpenTelemetry-style 事件可观测性 + 隐私脱敏**、**OAuth2 device-poll 流程 + 凭证原子落盘**、**daemon 进程模型 + idle watchdog + signal 三路 graceful-shutdown**。所有路径均为 atomcode `crates/` 实际代码,行号锚点为 2026-09-07 HEAD。
+>
+> 与前七轮的关系:LSP 协议层第七轮提过 `lsp_tool.rs` 单一入口与 fallback 链(第 21 章 ⑪),本轮下沉到 `lsp/client.rs` 1170 行的 JSON-RPC 实现 + 池化 + 进程模型;Telemetry、OAuth、Daemon 三个维度前 21 章未单独成节,本轮首次系统拆解。
+
+### 22.1 LSP/CodeIntel 完整实现
+
+#### 22.1.1 模块拓扑
+
+`crates/atomcode-capabilities/src/codeintel/` 共 14 个文件,总 ~4800 行,**严格按 L0/L1 分层**(对照第 2 章架构):
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `mod.rs` | 80 | 模块入口 + 工具名注册(`codeintel_tool_names()`) |
+| `symbols.rs` | 294 | **L0 符号层**(单文件,无状态,纯 tree-sitter parse) |
+| `lang.rs` | — | 语言枚举 + tree-sitter grammar 注入点 |
+| `list_symbols.rs` / `read_symbol.rs` | — | L0 工具,基于 `symbols::extract_symbols` |
+| `find_references.rs` | 200+ | **L1 文本层**(whole-word + gitignore walker) |
+| `graph.rs` | — | L1 跨文件图模型(`SymbolNode` / `Edge` / `BFS`) |
+| `index.rs` | — | L1 索引器(`CodeIndex` 持有 `Arc<CodeGraph>`,按 mtime 重建) |
+| `trace_callers.rs` / `trace_callees.rs` / `trace_chain.rs` / `blast_radius.rs` / `file_deps.rs` | — | L1 工具,全部走 `CodeIndex` |
+| `diagnostics.rs` | — | 早期 diagnostics 工具(被 `lsp_tool` 替代,保留向后兼容 API) |
+| `lsp/jsonrpc.rs` | 92 | LSP 帧编解码(Content-Length header) |
+| `lsp/types.rs` | 124 | `Location` / `Diagnostic` / `DiagnosticSeverity` |
+| `lsp/registry.rs` | 141 | 8 种语言的 server 预设(扩展名 → command/args/root_markers) |
+| `lsp/manager.rs` | 460 | **Server 池化 + lazy spawn + sticky unavailable** |
+| `lsp/client.rs` | **1170** | **JSON-RPC stdio 客户端 + 双向 async 消息循环** |
+| `lsp_tool.rs` | 460 | 模型侧工具(definition/references/hover/diagnostics) |
+
+**关键约束**(`mod.rs:13-17`):L0 符号层是**无状态的**,不持有共享索引;L1 图层持有 `Arc<CodeIndex>`。LSP 工具被隔离在 `#[cfg(feature = "lsp")]` 后,避免静默暴露进程生成能力。
+
+#### 22.1.2 L0 符号层:tree-sitter 提取
+
+`symbols.rs:31-85` 的 `extract_symbols` 是单文件、一次性 parse:
+
+```rust
+pub fn extract_symbols(source: &str, lang: Lang) -> Option<Vec<Symbol>> {
+    let grammar = lang.grammar();
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
+    let query = Query::new(&grammar, lang.symbols_query()).ok()?;
+    let def_idx = query.capture_index_for_name("definition")?;
+    let name_idx = query.capture_index_for_name("name")?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    // 关键:seen HashSet<(start_byte, end_byte)> 去重
+    // —— 同一 query 可能多 pattern 命中同一节点
+    ...
+}
+```
+
+注释明示了**设计选择**(`symbols.rs:1-4`):"parse fresh per call (single-file parsing is cheap, and a neutral tool holds no shared index; the cross-file graph layer comes later)"。这是 L0/L1 分层的物理体现:L0 零状态所以可并发调用、零锁;L1 才有 `Arc<CodeIndex>`。
+
+#### 22.1.3 L1 索引层:`CodeIndex` + `CodeGraph` 重建
+
+`graph.rs:69-80` 定义的 `CodeGraph` 数据结构:
+
+```rust
+pub struct CodeGraph {
+    pub nodes: HashMap<SymbolId, SymbolNode>,
+    pub edges_out: HashMap<SymbolId, Vec<Edge>>,  // from → callees
+    pub edges_in: HashMap<SymbolId, Vec<Edge>>,   // to → callers  ← 注意反向 to 存源
+    pub file_symbols: HashMap<PathBuf, Vec<SymbolId>>,
+    pub file_mtimes: HashMap<PathBuf, u64>,
+    #[serde(skip)]  // 名称索引需 deserialize 后 rebuild_name_index
+    pub name_index: HashMap<String, HashSet<SymbolId>>,
+}
+```
+
+`graph.rs:4-7` 是反向边约定的 load-bearing 注释(防止后续维护者"修正"):
+
+> EDGE CONVENTION: `edges_out[from]` holds `Edge{to: callee}` (forward); `edges_in[to]` holds `Edge{to: from}` — i.e. in the reverse map the `to` field stores the SOURCE (caller). Do not "fix" this.
+
+按 mtime 重建(`index.rs::build_graph`)而非增量 patch,**注释明示**为什么不做增量:"we rebuild on mtime change" —— 与第七轮 ⑪ "lsp_tool 单一入口 + fallback 链" 配合:graph 不可用时,`find_references` 用 whole-word 文本扫描兜底(`find_references.rs:1-4` "Non-destructive ⇒ always `Safe`. Production shells out to ripgrep; the neutral port does a word-boundary scan with the `ignore` walker (no rg dependency)")。
+
+#### 22.1.4 LSP 客户端 (`lsp/client.rs` 1170 行)
+
+**(1) Transport 抽象 — 决定性测试的基石**
+
+`client.rs:1-8` 注释是教科书级的设计陈述:
+
+> Transport-agnosticism is what makes the protocol DETERMINISTICALLY testable: a test pairs `connect` with `tokio::io::duplex` + a mock-server coroutine — no real language server needed (see the tests below).
+
+整个 client 的内部状态都用 `Box<dyn AsyncRead/Write>` 注入。`spawn`(`client.rs:284-306`)是唯一绑定到 child process 的薄壳。
+
+**(2) JSON-RPC stdio 帧**(`client.rs:33-42`)
+
+```rust
+async fn write_value(writer: &SharedWrite, value: Value) -> Result<(), String> {
+    let body = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    let framed = jsonrpc::encode(&body);
+    let mut writer = writer.lock().await;
+    writer.write_all(&framed).await...?;
+    writer.flush().await...
+}
+```
+
+`SharedWrite = Arc<AsyncMutex<BoxWrite>>` —— 关键设计:写端必须串行,否则两条 notify 帧可能交叉。读端则交给**后台 reader task**。
+
+**(3) 后台 reader 任务**(`client.rs:181-230`)
+
+```rust
+let reader_handle = tokio::spawn(async move {
+    let mut r = BufReader::new(reader);
+    loop {
+        let body = match jsonrpc::read_message(&mut r).await { Ok(b) => b, Err(_) => break };
+        let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
+        // 1) response: by id dispatch to oneshot
+        if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+            if msg.get("method").is_none() { ... pending.remove(&id).send(res) ... continue }
+        }
+        // 2) server-to-client request: handle_server_request(...)
+        if msg.get("id").is_some() && msg.get("method").is_some() { ... continue }
+        // 3) publishDiagnostics: 缓存到 DiagMap
+        if msg["method"] == "textDocument/publishDiagnostics" { ... }
+    }
+    // 关键:流关闭时立即唤醒所有 pending 等待者,而不是等 timeout
+    reader_closed.store(true, Ordering::Release);
+    let waiters = std::mem::take(&mut *rp.lock().unwrap());
+    for (_, waiter) in waiters { waiter.send(Err(...)) }
+});
+```
+
+`client.rs:222-225` 的注释揭示一个真实 bug:"a server can exit between process spawn and the first request (for example, a rustup shim whose component is not installed)" —— 不立即唤醒会一直等到 30s timeout。
+
+**(4) Initialize 握手**(`client.rs:248-279`)
+
+握手能力声明明确写出**哪些是需要的**:`textDocument.publishDiagnostics.relatedInformation`、`synchronization.didOpen+didChange`、`definition/references/hover.diagnostic.dynamicRegistration` 全部 true;`workspace.applyEdit: false` —— L1 集成**只读**。
+
+然后**关键的两段**:
+1. `*client.position_encoding.lock().unwrap() = PositionEncoding::from_initialize(&initialize);` —— 从服务器 `capabilities.positionEncoding` 推断 utf-8/16/32,后续 `wire_position()`(`client.rs:494-526`)按此做位置换算(中文 1 unit,emoji 2 unit,**测试断言**:`client.rs:824-826`)。
+2. `if initialize.pointer("/capabilities/diagnosticProvider").is_some_and(...)` 推断 pull diagnostics 支持;同时 `handle_server_request` 中对 `client/registerCapability` 监听 `textDocument/diagnostic` 也置位(`client.rs:66-79`)—— 两条路径覆盖静态声明 + 动态注册。
+
+**(5) 服务端→客户端请求处理**(`client.rs:44-119`)
+
+七种已知 method 全部 silently 答复:
+
+| 客户端 method | 回复 |
+|--------------|------|
+| `workspace/configuration` | `Value::Array(vec![Value::Null; count])` |
+| `workspace/workspaceFolders` | 单元素 array,uri 为 `root_uri` |
+| `client/registerCapability(textDocument/diagnostic)` | `Value::Null` + 置位 `supports_pull_diagnostics` |
+| `client/unregisterCapability(...)` | 同上,清位 |
+| `window/workDoneProgress/create` / `window/showMessageRequest` | `Value::Null` |
+| `workspace/applyEdit` | `{ "applied": false, "failureReason": "AtomCode LSP integration is read-only" }` ← 关键安全声明 |
+| `window/showDocument` | `{ "success": false }` |
+| 其他 | 返回 JSON-RPC error code -32601(method not implemented) |
+
+`workspace/applyEdit` 的拒绝回复(第 97-99 行)是 L1 工具**强制只读**的协议层落地 —— 任何 LSP server 想 push 一个 workspace edit 都被静默拒绝。
+
+**(6) 请求生命周期**(`client.rs:325-375`)
+
+```rust
+async fn send_request_inner(method, params, cancel) -> Result<Value, String> {
+    let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+    let (tx, rx) = oneshot::channel();
+    { let mut pending = self.pending.lock().unwrap();
+      if self.closed.load(Ordering::Acquire) { return Err("stream closed") }
+      pending.insert(id, tx); }
+    // 写失败要回滚 pending(避免内存泄漏)
+    if let Err(error) = self.write_msg(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})).await {
+        self.pending.lock().unwrap().remove(&id);
+        return Err(error);
+    }
+    let response = async {
+        match tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), rx).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => Err(format!("LSP {method} error: {error}")),
+            Ok(Err(_)) => Err(format!("LSP {method}: response channel closed")),
+            Err(_) => Err(format!("LSP {method}: timed out")),
+        }
+    };
+    let result = if let Some(cancel) = cancel {
+        tokio::select! {
+            result = response => result,
+            _ = cancel.cancelled() => {
+                self.pending.lock().unwrap().remove(&id);
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    self.send_notification("$/cancelRequest", json!({"id": id})),
+                ).await;
+                return Err(format!("LSP {method}: cancelled"));
+            }
+        }
+    } else { response.await };
+    if result.is_err() { self.pending.lock().unwrap().remove(&id); }
+    result
+}
+```
+
+注意三重清理路径:写失败、cancel、超时/错误 —— 都从 `pending` 移除,避免 oneshot channel 累积。
+
+**(7) 文档同步 + 版本号**(`client.rs:383-418`)
+
+```rust
+pub async fn sync_document(&self, path, content, language_id) -> Result<(), String> {
+    let _sync_guard = self.sync_lock.lock().await;  // 串行化 didOpen/didChange
+    let uri = path_to_uri(path)?;
+    self.diagnostics.lock().unwrap().remove(path);  // 关键:每次 sync 前清缓存
+    let previous_version = self.opened.lock().unwrap().get(path).copied();
+    let version = previous_version.unwrap_or(0).checked_add(1)...
+    if previous_version.is_none() { /* didOpen */ } else { /* didChange full-text */ }
+    self.opened.lock().unwrap().insert(path.to_path_buf(), version);
+}
+```
+
+`client.rs:391-394` 的诊断清空逻辑配注释("Never return diagnostics published for an older document version. Servers that omit the optional publishDiagnostics.version field are common")—— 处理了**几乎所有 LSP server 都不填 version 字段**的现状。
+
+**(8) 优雅关闭**(`client.rs:572-585`)
+
+```rust
+pub async fn shutdown(&self) {
+    let _ = tokio::time::timeout(Duration::from_secs(5), self.send_request("shutdown", Value::Null)).await;
+    let _ = self.send_notification("exit", Value::Null).await;
+    if let Some(mut child) = self.child.lock().unwrap().take() { let _ = child.start_kill(); }
+    if let Some(h) = self.reader_handle.lock().unwrap().take() { h.abort(); }
+}
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        if let Ok(mut h) = self.reader_handle.lock() {
+            if let Some(handle) = h.take() { handle.abort(); }
+        }
+    }
+}
+```
+
+`Drop` 是 early-return 路径的**最后防线**(`client.rs:590-592` 注释:"so a client dropped on an early-return path can't leak the task")。配合 `kill_on_drop(true)`(`client.rs:294`)、`DiagMap` 用 `Mutex<HashMap>`(非 async)—— 三层防御保证子进程不泄漏。
+
+#### 22.1.5 LSP 池化 (`lsp/manager.rs` 460 行)
+
+**(1) ClientKey + 共享 client**
+
+```rust
+struct ClientKey {
+    root: PathBuf,
+    command: String,
+    args: Vec<String>,
+}
+clients: Mutex<HashMap<ClientKey, Arc<LspClient>>>,
+startup_locks: Mutex<HashMap<ClientKey, Arc<Mutex<()>>>>,
+unavailable: Mutex<HashMap<ClientKey, String>>,
+```
+
+注释(`manager.rs:28-32`):"Extensions that map to the same server share a process, while different workspaces remain isolated." —— 跨文件不同目录共用一个 rust-analyzer 进程,**只有 workspace root 不同才隔离**。
+
+**(2) Server root 检测**(`manager.rs:73-99`)
+
+`server_root` 沿 `root_markers`(如 `Cargo.toml`)向上 walk,找到最近的 marker 所在目录,作为 `LspClient::spawn` 的 cwd。这解决 monorepo 场景:`packages/app/Cargo.toml` 会让 `packages/app` 成为 rust-analyzer 的 root,而不是 workspace 根。
+
+**(3) Startup 串行化 + 取消**(`manager.rs:132-185`)
+
+```rust
+let startup_lock = {
+    let mut locks = self.startup_locks.lock().await;
+    locks.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+};
+let _startup_guard = tokio::select! {
+    guard = startup_lock.lock() => guard,
+    _ = cancel.cancelled() => return Err("language server startup cancelled".into()),
+};
+```
+
+**关键设计**:每个 `ClientKey` 独立 startup lock —— "a slow Java server must not block an already-running Rust server lookup"。
+
+**Sticky unavailable**(`manager.rs:35-37` 注释):"Startup failures are sticky for this manager generation. Repeating a model tool call must not create a spawn/timeout loop"。同一个 model turn 反复失败不会反复 spawn,而是缓存错误直接返回 —— **防止 spawn 风暴**。
+
+**(4) Graceful degradation**(`manager.rs:149-156`)
+
+```rust
+if which::which(&config.command).is_err() {
+    let error = format!("language server '{}' is not installed or not on PATH", config.command);
+    self.unavailable.lock().await.insert(key, error.clone());
+    return Err(error);
+}
+```
+
+binary 缺失直接 degrade,不是 fail —— L1 工具 `lsp_tool.rs:254-258` 把这个错误**格式化为可读 message**:
+
+```rust
+fn unavailable(error: String) -> ToolResult {
+    ok(format!(
+        "LSP unavailable: {error}. Fall back to read_symbol, find_references, grep, or read_file; \
+         do not retry this LSP call in the current runtime."
+    ))
+}
+```
+
+注意 `ok()` 不是 `err()` —— 工具返回成功但内容是降级提示,**模型收到的是 actionable guidance**("do not retry in the current runtime")。这是 21 章 ⑪ "fallback 链" 的协议层落地。
+
+#### 22.1.6 LSP 工具 (`lsp_tool.rs` 460 行)
+
+**(1) 参数校验在副作用前**(`lsp_tool.rs:79-134`)
+
+```rust
+// 1. 解析参数 → 失败立即 err
+// 2. 校验 semantic position(line/character 必须 one-based 正整数)
+// 3. 校验 severity 枚举("error"|"warning"|"all")
+// 4. 解析 file_path → 必须在 workspace 内
+// 5. 读文件 → 4MB 上限
+// 6. 校验 cancel
+// 7. 真正调用 LSP
+```
+
+注释(`lsp_tool.rs:82-85`):"Tool schemas are guidance rather than a trust boundary: direct callers and imperfect model output can still pass values outside the advertised enum." —— **绝不信任模型 schema 输入**,用 Rust 类型再做一次边界检查。
+
+**(2) Path 沙箱**(`lsp_tool.rs:118-123`)
+
+```rust
+if !path.starts_with(&root) {
+    return err(format!("lsp: file must be inside the workspace: {}", path.display()));
+}
+```
+
+`path_outside_workspace_is_rejected_before_reading` 测试(`lsp_tool.rs:378-394`)验证了这一点:workspace 外的 `outside.path()` 在 read 前就被拒。
+
+**(3) Diagnostics 的 settle delay**(`lsp_tool.rs:172-186`)
+
+```rust
+tokio::select! {
+    _ = tokio::time::sleep(Duration::from_millis(self.manager.settle_delay_ms())) => {}
+    _ = ctx.cancel.cancelled() => return ok("LSP diagnostics query cancelled."),
+}
+if let Err(error) = self.manager.refresh_pull_diagnostics(...).await { ... }
+```
+
+`SETTLE_DELAY_MS = 350`(`manager.rs:17`)—— 服务器发布 diagnostics 是异步的,`sync_document` 后必须等 ~350ms 让 server 消化。这是 LSP 协议**没有 ack 机制**的工程妥协。
+
+**(4) 取消语义**(`lsp_tool.rs:430-435`)
+
+`cancelled_diagnostics_sync_is_not_reported_as_unavailable` 测试明确:**取消不应该被报告为 "unavailable"**,因为它不是错误状态:
+
+```rust
+fn diagnostics_sync_failure(error: String, cancel: &CancellationToken) -> ToolResult {
+    if cancel.is_cancelled() {
+        ok("LSP diagnostics query cancelled.")
+    } else {
+        unavailable(error)
+    }
+}
+```
+
+#### 22.1.7 LSP Server 注册表 (`lsp/registry.rs`)
+
+`LspServerRegistry::with_defaults()`(`registry.rs:26-61`)开箱 8 种语言:
+
+| 扩展 | command | root_markers |
+|------|---------|--------------|
+| `rs` | `rust-analyzer` | `Cargo.toml` |
+| `ts` / `tsx` / `js` | `typescript-language-server --stdio` | `tsconfig.json`, `package.json` |
+| `py` | `pylsp` | `pyproject.toml`, `setup.py` |
+| `go` | `gopls serve` | `go.mod` |
+| `java` | `jdtls` | `pom.xml`, `build.gradle` |
+
+`extension_to_language_id()` 把扩展名映射到 LSP `languageId`(`registry.rs:86-104`)—— `tsx` → `typescriptreact`,`jsx` → `javascriptreact`,未知扩展回退到自身字符串(server 可识别自定义 ID)。
+
+#### 22.1.8 错误回放:`server_exit_wakes_pending_requests_without_waiting_for_timeout`
+
+`client.rs:898-...` 测试覆盖了一个真实场景:mock server 立即 EOF,验证 pending oneshot 立即被唤醒(不是等 30s timeout)。这个测试是 22.1.4 第(3)段 `reader_closed.store(true)` 行为的 contract。
+
+### 22.2 Telemetry / 可观测性
+
+#### 22.2.1 模块拓扑
+
+`crates/atomcode-telemetry/src/` 共 10 文件 / 2763 行:
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `lib.rs` | 26 | 公开 `init` / `Event` / `Telemetry` |
+| `event.rs` | 868 | **事件 schema**(`Envelope` + 7 类 error enum + 6 类 Event + 序列化) |
+| `runtime.rs` | **1090** | **`Telemetry` 句柄 + task-local `CurrentContext` + 计数器 + panic 集成** |
+| `config.rs` | 205 | `ResolvedConfig` + `TelemetryState::{Enabled, Disabled(reason)}` 5 级决策 |
+| `scrub.rs` | 207 | **隐私脱敏**(`redact_secrets` / `scrub_path` / `truncate_head` / `backtrace_top_k`) |
+| `identity.rs` | 101 | 持久 `device_id` |
+| `repo_origin.rs` | 102 | 仓库源识别(Gitcode/Atomgit/Github/Gitlab/Other/None) |
+| `pending_invite.rs` | 128 | 安装期邀请码 |
+| `notice.rs` | 36 | 启动横幅上的 telemetry 状态提示 |
+| `queue/mod.rs` + `queue/roll.rs` | — | **磁盘 NDJSON 段队列**(500 events/512KB roll) |
+| `sender/http.rs` + `sender/mod.rs` | — | **gzip POST + Retry-After 解析** |
+
+#### 22.2.2 Envelope + 6 类 Event(`event.rs:30-200`)
+
+```rust
+pub struct Envelope {
+    pub device_id: Uuid,
+    pub launch_id: Uuid,
+    pub account_id: Option<String>,  // OAuth 登录后由 set_account_id 注入
+    pub session_id: Uuid,
+    pub turn_id: Option<Uuid>,
+    pub ts: i64,
+    pub schema_version: uuid,        // 写在 sender 的 x-atomcode-schema header
+    pub app_version: String,
+    pub os: String, pub arch: String, pub locale: String,
+    pub provider: Option<String>,
+    pub provider_host: Option<String>,  // ← 注意只 host,不 path(防 token 泄露)
+    pub model: Option<String>,
+    pub repo_origin: Option<RepoOrigin>,
+    pub mode: Option<SessionMode>,      // Headless/Tui/Ide/Vscode/Jetbrains/Webui/AtomcodeAir/Channel
+    pub surface: Option<String>,       // 区分 "code_review" 子 Agent 与主 agent loop
+}
+```
+
+7 个 error kind enum(`event.rs:86-151`):`LlmErrorKind`(8 类)/`ToolErrorKind`(13 类,含 `LoopDetected` / `SkillNotFound` / `BlockedByHook`)/`McpErrorKind`(6 类)/`CodingplanErrorKind`(6 类,含 `AuthExpired`)/`UseCommandErrorKind`(4 类)。
+
+`Event` 变体(`event.rs:171-200`):`OpenAtomcode` / `LlmChat` / `ToolCall` / `UseCommand` / `McpConnect` / `LoginSuccess` / `TakeCodingplan` / `Panic` / `TelemetryDisabled`。所有 `#[serde(tag = "event_id", rename_all = "snake_case")]` 序列化。
+
+#### 22.2.3 `CurrentContext` task-local + scope_blocking 双模
+
+`runtime.rs:23-99`:
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub struct CurrentContext {
+    pub turn_id: Option<Uuid>,
+    pub provider: Option<String>,
+    pub provider_host: Option<String>,
+    pub model: Option<String>,
+    pub repo_origin: Option<RepoOrigin>,
+    pub mode: Option<SessionMode>,
+    pub session_id: Option<Uuid>,
+    pub surface: Option<String>,
+}
+tokio::task_local! { static CTX: CurrentContext; }
+
+impl CurrentContext {
+    pub async fn scope<F, Fut, R>(ctx: CurrentContext, fut: F) -> R
+    where F: FnOnce() -> Fut, Fut: std::future::Future<Output = R>
+    { CTX.scope(ctx, fut()).await }
+
+    /// 同步版 — 专为 OAuth / CodingPlan 的 reqwest::blocking 设计
+    /// (它会内部 stand up 一个 tokio runtime,drop 在 async worker thread 会 panic)
+    pub fn scope_blocking<F, R>(ctx: CurrentContext, f: F) -> R
+    where F: FnOnce() -> R
+    { CTX.sync_scope(ctx, f) }
+}
+```
+
+注释(`runtime.rs:79-87`)详细解释为什么需要 `scope_blocking`:`reqwest::blocking` 在 async worker thread 上 drop inner runtime 会 panic("Cannot drop a runtime in a context where blocking is not allowed"),所以必须用 `tokio::task::spawn_blocking` 隔离,又因为 `task_local!` 不跨 `spawn_blocking` 线程,所以**双重 scope 重建**。
+
+#### 22.2.4 计数器(`runtime.rs:101-146`)
+
+```rust
+pub struct Counters {
+    pub events_tracked: AtomicU64,       // try_send 成功
+    pub events_dropped_mpsc: AtomicU64,  // channel 满
+    pub events_dropped_disk: AtomicU64,  // 磁盘 FIFO eviction 超 cap
+    pub segments_posted: AtomicU64,
+    pub bytes_sent: AtomicU64,           // gzipped body bytes
+    pub last_post_unix_ms: AtomicI64,    // 0 = never
+}
+```
+
+`Counters::snapshot()` 把 `last_post_unix_ms` 转换为本地时区 RFC3339 字符串。`health.json` 写盘供外部探活(`runtime.rs:253` `cfg.atomcode_dir.join("telemetry/health.json")`)。
+
+#### 22.2.5 队列决策(纯逻辑,可单测)
+
+`queue/roll.rs:1-13`:
+
+```rust
+pub const MAX_EVENTS_PER_SEGMENT: u32 = 500;
+pub const MAX_BYTES_PER_SEGMENT: u64 = 512 * 1024;
+pub const MAX_SEGMENT_FILES: usize = 50;
+pub const MAX_TOTAL_BYTES: u64 = 5 * 1024 * 1024;
+pub fn should_roll(events_in_segment, bytes_in_segment) -> bool {
+    events_in_segment >= MAX_EVENTS_PER_SEGMENT || bytes_in_segment >= MAX_BYTES_PER_SEGMENT
+}
+pub fn over_cap(segment_count, total_bytes) -> bool {
+    segment_count > MAX_SEGMENT_FILES || total_bytes > MAX_TOTAL_BYTES
+}
+```
+
+5 MB / 50 文件的硬上限 —— 超过会触发 FIFO eviction (`runtime.rs:297-303` 的 `events_dropped_disk` 计数)。
+
+#### 22.2.6 队列 IO:`.partial` + `.partial.owner` 双文件锁
+
+`queue/mod.rs:11-23`:
+
+```rust
+const READY_EXT: &str = "ndjson";
+const PARTIAL_EXT: &str = "partial";
+const INVALID_EXT: &str = "invalid";
+// 锁感知的 .partial 的后缀
+const MARKER_SUFFIX: &str = ".owner";
+const SENDING_MARKER: &str = ".sending-";
+const PARTIAL_QUIET_AFTER: chrono::Duration = chrono::Duration::days(1);  // 跨版本恢复保守期
+const CLAIM_STALE_AFTER: chrono::Duration = chrono::Duration::minutes(1);
+const RAW_RETENTION: chrono::Duration = chrono::Duration::days(90);  // 原始 segment 保留
+```
+
+`Segment::new`(`queue/mod.rs:42-71`)使用 `fs2::FileExt::lock_exclusive()` 拿 OS 文件锁,再加一个 `.partial.owner` 哨兵文件(用 `create_new(true)` 写,失败回滚)。两个机制应对:**OS 锁对 NFS/SMB 不可靠**,但哨兵文件是 lock-aware 版本的标记 —— **跨版本可读性**(老版本 atomcode 不锁,新版本靠哨兵文件过滤)。
+
+#### 22.2.7 HTTP Sender(`sender/http.rs`)
+
+```rust
+pub async fn send_segment(&self, path: &Path, dropped: u64) -> Result<(), SendError> {
+    let body = std::fs::read(path)?;
+    let gz = gzip(&body)?;  // Compression::fast()
+    let resp = self.client.post(&self.endpoint)
+        .header("content-type", "application/x-ndjson")
+        .header("content-encoding", "gzip")
+        .header("x-atomcode-dropped", dropped.to_string())
+        .header("x-atomcode-schema", crate::SCHEMA_VERSION.to_string())
+        .body(gz).send().await?;
+    map_status(resp.status(), resp.headers())
+}
+```
+
+`map_status`(`sender/http.rs:79-96`)对每个 HTTP 状态映射到 typed error:
+- 200/202 → Ok
+- 400 → BadRequest(致命,丢弃整个 segment)
+- 401/403 → Unauthorized(致命)
+- 413 → PayloadTooLarge
+- 429 → RateLimited(Option<Duration>,从 `Retry-After` header 解析)
+- 5xx → Server(code)
+- 其他 → Other
+
+这是**协议-语义双层错误模型** —— HTTP 状态决定错误类型,`Retry-After` 决定下次重试退避。
+
+#### 22.2.8 Scrub 隐私脱敏(`scrub.rs` 全 207 行)
+
+**这是 22.2 最重要的一节。** `redact_secrets`(`scrub.rs:23-44`)是**双 pass regex**:
+
+**Pass 1 — key/value 凭证**:
+
+```rust
+r#"(?i)(\b(?:authorization|x-api-key|api[-_]?key|access[-_]?token|private[-_]?token|auth[-_]?token|password|passwd|secret)\b\s*[:=]\s*"?(?:bearer\s+|token\s+)?)([^"'\s,;)]{6,})"#
+```
+
+匹配 `Authorization: token ghp_…` / `api_key=…` / `password: …` 等键值对,group 1 保留 `key + separator + 可选 bearer/token scheme word`,group 2 替换为 `<REDACTED>`。
+
+**Pass 2 — 已知 token 形态**:
+
+```rust
+\b(?:gh[opsru]_[A-Za-z0-9]{20,}              // GitHub PAT
+   |github_pat_[A-Za-z0-9_]{20,}              // GitHub fine-grained PAT
+   |glpat-[A-Za-z0-9\-_]{16,}                 // GitLab
+   |xox[baprs]-[A-Za-z0-9\-]{10,}             // Slack
+   |sk-[A-Za-z0-9\-_]{16,}                    // OpenAI
+   |AKIA[0-9A-Z]{16}                          // AWS access key
+   |ASIA[0-9A-Z]{16}                          // AWS STS
+   |AIza[0-9A-Za-z\-_]{35}                    // Google API key
+   |eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,})  // JWT
+```
+
+注释(`scrub.rs:36-37`):"Each branch starts at a word boundary so we don't clip an internal substring of an ordinary hyphenated word (e.g. `sk-` inside `task-mgmt`)." —— 防止误杀普通变量名。
+
+**`scrub_path` + `backtrace_top_k`**(`scrub.rs:46-85`):用 `<HOME>` / `<CWD>` 替换绝对路径(隐私),同时 `backtrace_top_k` 截取 backtrace 顶部 k 帧并**只保留文件名**(`rsplit_once('/').1`)。
+
+**测试覆盖**:`scrub.rs:127-188` 的 4 组测试覆盖了
+- `bash(command=curl -H "Authorization: token ghp_…")` 必须脱敏
+- `powershell "$token = 'ghp_…'"` 必须脱敏
+- 各种 token 形态必须脱敏
+- 普通工具参数 `read_file(path=/Users/x/task-management-system/src/main.rs)` **不能误杀**
+
+#### 22.2.9 Panic 钩子集成(`daemon/lib.rs:5182-5224`)
+
+```rust
+fn install_panic_hook(telemetry: Arc<Telemetry>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let home = atomcode_telemetry::identity::real_home_dir();
+        let cwd = std::env::current_dir().ok();
+        let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_else(|| "unknown".into());
+        let msg = info.payload().downcast_ref::<&str>()...;
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let scrubbed_loc = scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
+        let scrubbed_msg = scrub::truncate_head(&scrub::scrub_path(&msg, ...), scrub::HEAD_MAX);
+        let frames = scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
+        telemetry.track(Event::Panic { location: scrubbed_loc, message_head: scrubbed_msg, thread, backtrace_top_5: frames, error_kind: Some("panic".into()), error_data: Some(json!({...}).to_string()) });
+        default_hook(info);  // ← 关键:保留 stderr 输出
+    }));
+}
+```
+
+三件事一起做:**脱敏 panic message** + **保留 stderr** + **上报 telemetry**。
+
+### 22.3 OAuth 与凭证保管
+
+#### 22.3.1 模块拓扑
+
+`crates/atomcode-auth/src/` 仅 3 文件 / 2425 行:
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `lib.rs` | 210 | **凭证原子落盘**(`write_auth_file_secure`:tmp + rename + chmod 600) |
+| `oauth.rs` | **2038** | **OAuth2 完整流程**(login / poll / finish / refresh) + CbreakGuard(ESC 取消) + pending invite 集成 |
+| `gateway_crypto.rs` | 177 | 未知,本轮未读 |
+
+#### 22.3.2 OAuth 数据模型(`oauth.rs:150-178`)
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthInfo {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+    pub expires_in: Option<i64>,
+    #[serde(default)] pub created_at: i64,  // Unix seconds
+    pub user: UserInfo,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub id: String, pub username: String, pub name: Option<String>,
+    pub email: Option<String>, pub avatar_url: Option<String>,
+}
+/// Minimal auth-needed view (refresh + profile never leave the owner)
+pub struct ValidAuthSession { pub access_token: String, pub user_id: String }
+```
+
+`ValidAuthSession` 故意**只暴露 access_token + user_id**,防止其他子系统误用 refresh_token。
+
+#### 22.3.3 OAuth 端点(全部从 `ATOMCODE_PLATFORM_SERVER` 解析)
+
+`oauth.rs:33-57`:
+
+```rust
+fn platform_base_url() -> &'static str {
+    static BASE: OnceLock<String> = OnceLock::new();
+    BASE.get_or_init(|| sanitize_base_url(atomcode_config::endpoints::platform_server()))
+}
+pub fn platform_login_url() -> String { format!("{}/auth/login", platform_base_url()) }
+pub fn platform_check_url() -> String { format!("{}/auth/check", platform_base_url()) }
+pub fn platform_token_url() -> String { format!("{}/auth/token", platform_base_url()) }
+pub fn platform_exchange_url() -> String { format!("{}/oauth/exchange", platform_base_url()) }
+pub fn platform_refresh_url() -> String { format!("{}/oauth/refresh", platform_base_url()) }
+```
+
+`OnceLock` 保证**进程内所有 URL 派生函数**在一次登录/会话流程里都解析到**同一个服务器**,即使中途 env 改变。这是"配置漂移"的防御。
+
+#### 22.3.4 同步 HTTP 客户端构造 + TLS 1.2 降级(`oauth.rs:67-141`)
+
+```rust
+fn apply_blocking_proxy_policy(builder, force_tls12) -> reqwest::blocking::ClientBuilder {
+    atomcode_config::proxy::ensure_runtime_initialized();
+    let builder = if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref() == Some("no_proxy") {
+        builder.no_proxy()  // 显式 opt-out,否则走 env-based 检测
+    } else { builder };
+    if force_tls12 {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)  // 解决 acs.atomgit.com RST TLS 1.3
+    } else { builder }
+}
+fn blocking_client_with_tls12(force_tls12: bool) -> Result<reqwest::blocking::Client> {
+    apply_blocking_proxy_policy(reqwest::blocking::Client::builder(), force_tls12)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))          // 硬超时
+        .user_agent(crate::ATOMCODE_USER_AGENT)   // "atomcode/<version>"(gateway 拒大写)
+        .build()
+        .context("failed to build OAuth HTTP client")
+}
+```
+
+注释(`oauth.rs:124-141`)解释硬超时的必要性:`/status` 同步调用在 main TUI 线程,**无 cap 慢 OAuth 服务器会 hang UI**。同时 `Client::new()` 会在 TLS/resolver init 失败时 panic,这里改用 `Result` 传播错误。
+
+#### 22.3.5 ESC 取消 + CbreakGuard(`oauth.rs:215-369`)
+
+这是一个**教科书级 TUI/CLI termios 集成**:
+
+**问题**:`poll_once().join()` 在 main TUI 线程上同步等待 HTTP,Linux/WSL 用户按 ESC 想取消时,UI 线程被 join 阻塞,无法读 keypress。
+
+**解决**:`spawn_poller`(detached background thread,OOS 第 6 段,line 486-517)把 HTTP 拉出主线程,主线程跑**一个 poll(2) + read 循环**(`wait_for_esc_or_timeout`):
+
+```rust
+fn wait_for_esc_or_timeout(guard: &Option<CbreakGuard>, timeout: Duration) -> EscOutcome {
+    let Some(g) = guard.as_ref() else { thread::sleep(timeout); return EscOutcome::Timeout };
+    let mut pfd = libc::pollfd { fd: g.fd, events: libc::POLLIN, revents: 0 };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc <= 0 { return EscOutcome::Timeout; }
+    let mut buf = [0u8; 32];
+    let n = unsafe { libc::read(g.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n <= 0 { return EscOutcome::Timeout; }
+    classify_input(&buf[..n as usize])  // [0x1B] → Cancelled; 其他 → OtherInput
+}
+```
+
+**CbreakGuard 是 RAII termios 切换**(`oauth.rs:281-328`):
+- ctor 切到 cbreak 模式(`c_lflag &= !(ICANON | ECHO)`,`VMIN=0` `VTIME=0`)
+- Drop 自动 `tcsetattr` 恢复原 termios
+- 任何 drop path(panic / 正常返回)都恢复
+- Windows 无 poll(2) → stub struct,永远返回 `None`,降级到 `thread::sleep`
+
+注释(`oauth.rs:226-234`)强调这与 `read_callback_from_stdin_until_stopped` 的 Windows gate 是同样模式。
+
+#### 22.3.6 完整 Login 流程
+
+`start_login` → `LoginSession` → `poll_once` / `spawn_poller` → `finish`:
+
+**finish 关键逻辑**(`oauth.rs:522-593`):
+
+```rust
+pub fn finish(mut self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+    let client = self.client.take();
+    let state = self.state.clone();
+    let tel = tel.cloned();
+    std::thread::spawn(move || {
+        // 1. POST /auth/token?state=...
+        // 2. 构造 AuthInfo,created_at = now_or_0
+        // 3. (注释明示:clock pre-1970 → created_at=0 → 下游判立即过期 → 强制 refresh,不 panic)
+        // 4. tel.set_account_id(Some(auth_info.user.id.to_string()))  ← 在 login_success 之前注入
+        // 5. 同步 track_durable_sync(Event::LoginSuccess { invite_code, install_uuid })
+        //    失败 fallback 到 async track
+    }).join().map_err(|_| anyhow::anyhow!("finish thread panicked"))?
+}
+```
+
+**关键顺序**:`set_account_id` **必须**在 `track(login_success)` 之前 —— 因为 account_id 写入**进程级状态**,而 login_success 事件本身要携带 account_id。`runtime.rs:21-23` 注释解释为什么 account_id 在 handle 而不在 CurrentContext:"login state outlives any single scope and must apply to all events emitted after sign-in, including `login_success` itself"。
+
+#### 22.3.7 凭证原子落盘(`auth/lib.rs:25-92`)
+
+`write_auth_file_secure` 三步:
+1. **确保父目录权限 0o700**(`ensure_private_dir`)
+2. **写 tmp 文件**(`.<name>.<pid>.<nanos>.tmp`)+ `fsync`
+3. **`rename` 原子替换** + `set_permissions(0o600)`
+
+注释(`lib.rs:5-10`)专门解释 `#[cfg]` 隔离:
+
+> `Write::write_all` and `PathBuf` only appear inside `#[cfg(unix)]` blocks below (the atomic-rename + chmod-600 path uses them; the Windows fallback at line 49 just calls `std::fs::write`). Gate the imports so a Windows build doesn't fire unused_imports.
+
+**Windows fallback**(`lib.rs:62-83`)用 `tempfile::NamedTempFile::new_in(parent)` + `temp.persist(path)` —— 因为 Windows 没有 POSIX rename-over-existing 语义,`persist` 在内部用 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` 实现近似原子。
+
+**测试**(`lib.rs:149-194`):
+- `write_auth_file_secure_sets_private_permissions`:验证新建 dir 0700、文件 0600
+- `write_auth_file_secure_tightens_existing_file_permissions`:先创建 0644 文件,**写完后必须收紧到 0600**(防止遗留弱权限)
+- Windows 版本的 atomic 替换测试
+
+#### 22.3.8 多账号(atomcode 现状)
+
+`oauth.rs` **只支持单账号**: `AuthInfo` 是 single struct, `get_stored_auth()`(从 `lib.rs:1-20` 看不到)隐含单文件读取。**atomcode 在第八轮调研时点**没有多账号存储抽象 —— 这是相对 laew(`providers` 表支持多条 + `is_active` 唯一)的一个明显缺口。但 daemon 端的 `login_sessions: LoginSessionsStore`(`daemon/lib.rs:619-620`)是**登录会话**层多开:**同时**可以有多个 OAuth 流程进行中(浏览器登录可能多 tab),但只持久化一个最终结果。
+
+> 这是 atomcode 的**单用户单账号**设计选择(IDE 辅助工具的常规约束),与 laew 的「多接入点轮换」语义不同。借鉴时要分清楚:OAuth **登录态** vs API **接入点**。
+
+### 22.4 Daemon 进程模型
+
+#### 22.4.1 双形态:`atomcode-daemon` 独立二进制 + 进程内 webui
+
+`atomcode-daemon/src/main.rs:1-14`:
+
+```rust
+// Windows GUI 子系统,不弹控制台窗口
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+use atomcode_daemon::{run_server, ServerOpts};
+use atomcode_telemetry::{CliOverride, SessionMode};
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;  // 30 分钟
+
+#[tokio::main]
+async fn main() {
+    atomcode_config::distribution::bootstrap_home();
+    // Windows console re-attach
+    #[cfg(target_os = "windows")] { unsafe { AttachConsole(ATTACH_PARENT_PROCESS); } }
+    // legacy session 迁移
+    if let Err(error) = atomcode_capabilities::session::SessionManager::migrate_from_legacy() { ... }
+    // 解析 CLI args
+    let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
+    // mint 或 env 注入 token
+    let token_store = atomcode_daemon::auth_token::WebuiTokenStore::new();
+    let daemon_token = atomcode_daemon::resolve_daemon_token(env::var("ATOMCODE_DAEMON_TOKEN").ok(), &token_store);
+    run_server(ServerOpts { host, port, cli_override, idle_timeout_secs, startup_mode, ... }).await
+}
+```
+
+`atomcode-daemon/src/lib.rs:5-8` 的注释揭示**进程内复用**意图:
+
+> The server logic is exposed as a library function [`run_server`] so that both the standalone `atomcode-daemon` binary and (in the future) the main `atomcode` program can run the API server in-process.
+
+`ServerOpts` 字段(`lib.rs:6095-6129`)完整表达所有可调维度:**host/port/cli_override/idle_timeout_secs/startup_mode/webui_tokens/working_dir_override/quiet/prebound_listener/app_user_id/daemon_token_file**。其中:
+- `prebound_listener: Option<TcpListener>` —— 进程内启动器**先 bind 端口**(拿到真实端口、支持动态端口),`run_server` 跳过内部 bind
+- `quiet: bool` —— 进程内启动时为 true(不污染 ratatui),独立二进制为 false
+- `daemon_token_file: Option<String>` —— `Some` 时写 `~/.atomcode/daemon-<port>.json`(0600),退出时删
+
+#### 22.4.2 端口 + 主机解析
+
+`daemon_token_file.rs:9-12` 定义 token 文件路径:
+
+```rust
+pub fn token_file_path(port: u16) -> PathBuf {
+    Config::config_dir().join(format!("daemon-{port}.json"))
+}
+```
+
+`write` 路径(`daemon_token_file.rs:14-43`)在 Unix 上**先 truncate 再 open(0o600),再 fchmod 校正**(注释 "no world-readable 0644 window between write and chmod"):
+
+```rust
+let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+f.write_all(body.as_bytes())?;
+```
+
+Windows fallback 直接 `std::fs::write` —— 平台权限语义不同。
+
+#### 22.4.3 三路 graceful-shutdown(`lib.rs:5144-5178`)
+
+```rust
+async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.ok(); };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) { s.recv().await; }
+    };
+    #[cfg(not(unix))] let terminate = std::future::pending::<()>();
+    let http_shutdown = async {
+        while !*shutdown_rx.borrow_and_update() {
+            if shutdown_rx.changed().await.is_err() { break; }  // sender dropped = 视为 shutdown
+        }
+    };
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Received Ctrl-C, starting graceful shutdown"),
+        _ = terminate => tracing::info!("Received SIGTERM, starting graceful shutdown"),
+        _ = http_shutdown => tracing::info!("Received /shutdown request, starting graceful shutdown"),
+    }
+}
+```
+
+**三路**:
+1. `tokio::signal::ctrl_c()` —— 跨平台,捕获 Ctrl-C
+2. Unix `SignalKind::terminate()` —— 显式 SIGTERM
+3. `watch::Receiver<bool>` —— `POST /shutdown` 触发
+
+`axum::serve(...).with_graceful_shutdown(...)` 在三路中任一触发后开始 drain in-flight 连接。
+
+#### 22.4.4 Idle watchdog(`lib.rs:5235-5272`)
+
+```rust
+fn spawn_idle_timeout_task(
+    idle_timeout_secs: u64,
+    last_activity: Arc<AtomicI64>,
+    active_connections: Arc<AtomicUsize>,
+    active_chats: ActiveChatRegistry,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    if idle_timeout_secs == 0 { return; }  // 0 = 禁用
+    let timeout_ms = (idle_timeout_secs * 1000) as i64;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await;  // 消耗 immediate first tick
+        loop {
+            interval.tick().await;
+            let conns = active_connections.load(Ordering::Relaxed);
+            if conns > 0 { continue; }  // 有 SSE streaming → 不算 idle
+            if active_chats.has_active_operations().await { continue; }  // chat 还在跑
+            let last = last_activity.load(Ordering::Relaxed);
+            let elapsed = now_unix_ms() - last;
+            if elapsed > timeout_ms {
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+        }
+    });
+}
+```
+
+**双重防误杀**:
+1. `active_connections > 0` 时 skip(可能 SSE 客户端暂时断开但 chat 还在跑)
+2. `active_chats.has_active_operations()` 时 skip(第 5255-5257 行注释:"The SSE consumer disconnected, but its chat still runs")
+
+`last_activity` 在 `activity_tracker_middleware`(`lib.rs:1238`)每次非 health 请求时 `store(now_unix_ms(), Relaxed)`。
+
+#### 22.4.5 AppState 全景(`lib.rs:609-657`)
+
+```rust
+pub struct AppState {
+    pub project: ProjectStateStore,                       // 当前 working dir
+    pub active_chats: ActiveChatRegistry,                 // 正在跑的 /chat 操作
+    pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,      // 全局 MCP
+    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,  // per-project 缓存
+    pub(crate) login_sessions: LoginSessionsStore,         // OAuth 流程
+    pub(crate) login_start_lock: Arc<Mutex<()>>,
+    pub(crate) daemon_instance_id: Arc<str>,
+    pub telemetry: Arc<Telemetry>,
+    pub repo_origin: RepoOrigin,
+    pub shutdown_tx: watch::Sender<bool>,                 // /shutdown 触发
+    pub last_activity: Arc<AtomicI64>,                     // idle watchdog
+    pub active_connections: Arc<AtomicUsize>,             // SSE 计数
+    pub webui_tokens: auth_token::WebuiTokenStore,
+    pub enforce_token: bool,                              // webui 模式强制鉴权
+    pub app_user_id: String,                              // /app 模式 X-Atom-User-Id 校验
+    pub pending_permissions: permission_bridge::PermissionResponders,  // 权限弹框
+    pub pending_user_inputs: permission_bridge::UserInputResponders,
+    pub bind_host: String, pub bind_port: u16,
+    pub webui_cookie_name: String,                        // ← port-scoped!
+}
+```
+
+`webui_cookie_name: String` 是 port-scoped 命名(`webui_cookie_name(1111) = "atomcode_webui_1111"`),**关键 bug 修复**(`auth_token.rs:33-44` 注释:"Cookies on `localhost` ignore the PORT (RFC 6265 — port is not part of a cookie's identity), so the bare `atomcode_webui` name was SHARED across every localhost port. A second `/webui` instance's `/?token=` handoff therefore overwrote the first page's cookie in the shared jar")。实例 N 不会读到实例 M 的 cookie,反之亦然。
+
+#### 22.4.6 单 chat 操作原子管控(`lib.rs:411-596`)
+
+`ActiveChatRegistry` 是双 map 设计:
+- `operations: HashMap<operation_id, ActiveChatOperation>`
+- `aliases: HashMap<alias, operation_id>`
+
+`admit()` 在 `RwLock::write` 内**同时**检查 session_id/request_id 别名都不冲突、同时**注册所有别名指向同一 operation_id** —— 避免老问题:"`HashMap<alias, CancellationToken>` overwrote an existing entry when two requests targeted the same session, then let the older task remove the replacement entry during cleanup"。
+
+`complete()` 注释(`lib.rs:545-547`):"Remove only the exact operation that finished. A late cleanup from an older generation can never erase a replacement operation's aliases." —— 防止 stale cleanup 把新 op 的别名误删。
+
+#### 22.4.7 Daemon Token + Auth Middleware
+
+`auth_token::WebuiTokenStore`(`auth_token.rs:46-76`):in-memory `Arc<RwLock<HashSet<String>>>`,提供 `mint()` / `insert()` / `is_valid()`。
+
+`require_webui_token` 中间件(`auth_token.rs:115-143`):
+1. `state.enforce_token == false` → 跳过(独立 daemon / VSCode)
+2. 读 `Authorization: Bearer` header 优先
+3. 退而读 `Cookie: atomcode_webui_<port>`
+4. 用 state 的 `webui_cookie_name`(port-scoped 解析一次)防 sibling 覆盖
+
+`require_app_user_id`(`auth_token.rs:150-178`):仅在 `state.app_user_id` 非空时启用,校验 `X-Atom-User-Id` 头与桌面端登录账号一致(防中继滥用)。
+
+### 22.5 对 laew 的借鉴路线图(P0/P1/P2)
+
+#### 22.5.1 P0(必须,生产阻塞)
+
+| 借鉴项 | 来源 | laew 现状 | 落地路径 |
+|--------|------|-----------|---------|
+| **scrub 双 pass 脱敏** | `atomcode-telemetry/src/scrub.rs` | 无任何脱敏(API key 会进 SQLite `providers.api_key` 但不进 telemetry,目前 telemetry 都不发) | 在 laew 任何"日志/遥测/截屏"前先过一遍 `redact_secrets`。**0 依赖**纯 regex,直接搬 |
+| **凭证原子落盘** | `atomcode-auth/src/lib.rs::write_auth_file_secure` | SQLite `providers` 表写普通 INSERT,无 chmod,无 tmp + rename | 加 `chmod 0o600` 包装 + tmp+rename,只影响 Unix 落盘 |
+| **Panic 钩子** | `daemon/lib.rs:5182-5224` | Rust 默认 panic hook,只有 stderr 输出 | 注册 `set_hook` + track 事件,沿用 `tracing-subscriber` 的 panic layer |
+| **HTTP 客户端硬超时** | `oauth.rs:135-141` | `reqwest::Client` 构造,无显式 timeout(全局 30s 默认) | 全局 `Client::builder().timeout(20s).connect_timeout(5s)`,避免 OAuth 服务器 hang TUI |
+| **CORS / token 鉴权中间件** | `auth_token.rs::require_webui_token` | 暂无需(单进程),但 TUI 子屏已可扩展 | 若引入 `laew serve`(HTTP 模式)直接套用 |
+
+#### 22.5.2 P1(应做,半年内)
+
+| 借鉴项 | 来源 | 落地路径 |
+|--------|------|---------|
+| **LSP 客户端 + Server 池** | `lsp/{client,manager}.rs` 共 1630 行 | 引入 `tower-lsp` 或自写 JSON-RPC,先支持 rust-analyzer(laew 是 Rust 项目,价值最大)。短期替代:**用 `syn`/`tree-sitter-rust` 做无状态 symbol 提取**,对应 22.1.2 L0 层 |
+| **LSP 工具 fallback 链** | `lsp_tool.rs:254-258` 的 `unavailable()` helper | Read tool 找不到 symbol → 提示用 `find_references` 或 `grep`,**不静默 fail**。**0 依赖**立即可做 |
+| **SubAgent 跨 server 池化** | `lsp/manager.rs::ClientKey` | laew SubAgent 委派时,目标工作目录已存在的 SubAgent 应复用,而不是每次 fork。P1 阶段可加 `ClientKey`-like 池 |
+| **LSP/Server sticky unavailable** | `lsp/manager.rs:35-37` | "binary not on PATH" 不反复 spawn。**0 依赖**直接抄 |
+| **Queue cap + FIFO 退化** | `telemetry/queue/roll.rs` | 若 laew 引入调试日志(本地 `.laew.log`),**必须有 cap** 防磁盘爆,沿用 5MB / 50 files |
+| **OAuth device-poll detach** | `oauth.rs::spawn_poller` + `wait_for_esc_or_timeout` | 若 laew 未来接 OAuth(provider OAuth,非 API key),用 `std::thread::spawn` + `mpsc::Receiver` 拉出主线程 |
+
+#### 22.5.3 P2(做不做都行,长期演进)
+
+| 借鉴项 | 来源 | 落地路径 |
+|--------|------|---------|
+| **OpenTelemetry-style 事件 schema** | `event.rs:30-200` 全套 envelope + 6 类 Event + 7 类 ErrorKind | laew 若需要"决策审计 / 模型回放"功能,可参考 envelope 设计。**短期用 SQLite `events` 表 + 简单 JSON** |
+| **`activity_tracker_middleware` + idle watchdog** | `daemon/lib.rs:5235-5272` | 仅 laew `serve` 模式下需要。TUI 模式下不适用 |
+| **port-scoped cookie 命名** | `auth_token.rs:webui_cookie_name(port)` | 仅多 laew 实例并存时有用,单用户场景可忽略 |
+| **TUI cbreak guard 集成** | `oauth.rs:281-328` | 仅 OAuth 流程需要。laew TUI 是 `crossterm` 原始模式(已 cbreak),不需要额外 termios 切换 |
+| **HTTP `Retry-After` 解析** | `sender/http.rs:map_status` | LLM 客户端 429 时尊重 `Retry-After`,目前 laew 是固定指数退避 |
+
+### 22.6 综合:四维度交叉点
+
+四个维度不是孤立的,**有 3 个明显交叉点**:
+
+#### 22.6.1 LSP × 隐私脱敏
+
+LSP `workspace/applyEdit` 拒绝 reply(`client.rs:97-99`)是协议层只读。**同时** LSP server 想 `workspace/configuration` 读 settings(可能含 token)时,atomcode 回 `Value::Null`(`client.rs:54-60`)—— **主动**不暴露 client 配置给 server。laew 若引入 LSP,需要同样地清空 `~/.zshrc` 之类环境变量透传,scrub 模块(`22.2.8`)应作为前置 filter。
+
+#### 22.6.2 Telemetry × OAuth
+
+`telemetry::runtime.rs::set_account_id()`(`runtime.rs:155`)在 `oauth::finish()` 之前调用(`oauth.rs:574`),**保证** `login_success` 事件携带 account_id。这与 `telemetry::queue` 的 NDJSON 段一起形成**完整审计链**:谁(OAuth user)在哪(RepoOrigin)用哪个 provider(model)跑了什么命令(tool_call)—— 可回放、可归因。laew 若加 telemetry,这套**身份 → 行为**的串联是必抄的。
+
+#### 22.6.3 Daemon × LSP × Telemetry
+
+daemon 是 LSP 池化(`atomcode-daemon` 启动时 `Arc<CodeIndex>` 按需建)、Telemetry 句柄(`Arc<Telemetry>` 注入各 handler)、OAuth 流程(`login_sessions: LoginSessionsStore`)的**共同宿主**。**进程内 webui 启动器**通过 `prebound_listener` 复用 daemon,这要求 daemon 库设计**完全 no-stdio**(全用 `tracing` 走 OpenTelemetry layer)。laew 进程内 `laew serve` 子模式若出现,要同样把 stderr/stdout 与 ratatui 屏幕分离。
+
+#### 22.6.4 OAuth 凭证 × Daemon 进程
+
+`auth_token::WebuiTokenStore` 是**进程内** store(`auth_token.rs:49` `Arc<RwLock<HashSet>>`),daemon 退出即失效。**独立 daemon** 通过 `daemon_token_file` 写到 `~/.atomcode/daemon-<port>.json`(0600)让 IDE 持久化读。**双层保护**:进程内 store 防 webui 单实例 token 泄漏到 disk,disk token 文件仅 IDE 集成模式写。laew 的 `providers` 表 API key 走 SQLite,**对应**应加密(目前 `BLOB` 明文?)—— P0 应补。
+
+### 22.7 关键文件路径汇总
+
+> 所有路径相对 `/usr/local/LsmGitOpenSource/atomcode/`
+
+#### LSP / CodeIntel(7 文件 / ~3400 行)
+
+| 路径 | 行数 | 核心 |
+|------|------|------|
+| `crates/atomcode-capabilities/src/codeintel/mod.rs` | 80 | 模块入口 + 工具名注册 |
+| `crates/atomcode-capabilities/src/codeintel/symbols.rs` | 294 | L0 tree-sitter 符号提取 |
+| `crates/atomcode-capabilities/src/codeintel/graph.rs` | — | L1 CodeGraph 数据结构 |
+| `crates/atomcode-capabilities/src/codeintel/index.rs` | — | CodeIndex 懒建 + mtime 重建 |
+| `crates/atomcode-capabilities/src/codeintel/find_references.rs` | 200+ | whole-word 文本 fallback |
+| `crates/atomcode-capabilities/src/codeintel/lsp/jsonrpc.rs` | 92 | Content-Length 帧编解码 |
+| `crates/atomcode-capabilities/src/codeintel/lsp/registry.rs` | 141 | 8 种 server 预设 + languageId 映射 |
+| `crates/atomcode-capabilities/src/codeintel/lsp/manager.rs` | 460 | 池化 + sticky unavailable + graceful degrade |
+| `crates/atomcode-capabilities/src/codeintel/lsp/client.rs` | **1170** | JSON-RPC stdio 客户端 |
+| `crates/atomcode-capabilities/src/codeintel/lsp_tool.rs` | 460 | 模型侧 lsp 工具(4 操作) |
+
+#### Telemetry(10 文件 / 2763 行)
+
+| 路径 | 行数 | 核心 |
+|------|------|------|
+| `crates/atomcode-telemetry/src/lib.rs` | 26 | 公开 API |
+| `crates/atomcode-telemetry/src/event.rs` | 868 | Envelope + Event + 7 ErrorKind enum |
+| `crates/atomcode-telemetry/src/runtime.rs` | **1090** | Telemetry handle + task-local + Counters |
+| `crates/atomcode-telemetry/src/config.rs` | 205 | ResolvedConfig + 5 级 decision |
+| `crates/atomcode-telemetry/src/scrub.rs` | 207 | **双 pass 凭证脱敏** |
+| `crates/atomcode-telemetry/src/identity.rs` | 101 | device_id 持久化 |
+| `crates/atomcode-telemetry/src/repo_origin.rs` | 102 | 6 种 RepoHost |
+| `crates/atomcode-telemetry/src/queue/mod.rs` | — | NDJSON 段 + `.partial.owner` 锁 |
+| `crates/atomcode-telemetry/src/queue/roll.rs` | 39 | 5MB / 50 files cap 决策 |
+| `crates/atomcode-telemetry/src/sender/http.rs` | 97 | gzip POST + Retry-After 解析 |
+
+#### Auth / OAuth(3 文件 / 2425 行)
+
+| 路径 | 行数 | 核心 |
+|------|------|------|
+| `crates/atomcode-auth/src/lib.rs` | 210 | `write_auth_file_secure` 原子落盘 |
+| `crates/atomcode-auth/src/oauth.rs` | **2038** | OAuth2 完整流程 + CbreakGuard |
+| `crates/atomcode-auth/src/gateway_crypto.rs` | 177 | (本轮未读) |
+
+#### Daemon(22 文件 / 27105 行)
+
+| 路径 | 行数 | 核心 |
+|------|------|------|
+| `crates/atomcode-daemon/src/main.rs` | 192 | 独立 daemon binary 入口 + 启动横幅 |
+| `crates/atomcode-daemon/src/lib.rs` | **9072** | `run_server` + `ServerOpts` + AppState + ActiveChatRegistry + shutdown_signal + spawn_idle_timeout_task + install_panic_hook |
+| `crates/atomcode-daemon/src/auth_token.rs` | 304 | `WebuiTokenStore` + 两个 axum middleware |
+| `crates/atomcode-daemon/src/daemon_token_file.rs` | 89 | `~/.atomcode/daemon-<port>.json` 0600 |
+| `crates/atomcode-daemon/src/commands.rs` | 1276 | `POST /command` 13 个斜杠命令 |
+| `crates/atomcode-daemon/src/api_*.rs` | 4 文件 / ~3700 | 各 HTTP endpoint |
+
+#### 测试覆盖亮点
+
+| 文件 | 测试 | 覆盖点 |
+|------|------|--------|
+| `lsp/client.rs:813-...` | `handshake_and_diagnostics_over_duplex` | `tokio::io::duplex` 注入 transport,**0 真实 server** |
+| `lsp/client.rs:848-...` | `semantic_queries_use_wire_positions_and_normalize_locations` | wire_position 的 UTF-16 / UTF-8 转换 |
+| `lsp/client.rs:898-...` | `server_exit_wakes_pending_requests_without_waiting_for_timeout` | 22.1.4 (3) reader_closed 唤醒 |
+| `lsp/manager.rs:332-...` | `ensure_server_degrades_when_uninstalled` | binary 缺失 graceful degrade |
+| `lsp/manager.rs:351-...` | `waiting_for_same_server_startup_is_cancellable` | 22.1.5 (3) 取消语义 |
+| `lsp_tool.rs:362-...` | `unavailable_server_is_a_degradable_success` | 工具层把 Err 格式化为 ok 引导 |
+| `lsp_tool.rs:378-...` | `path_outside_workspace_is_rejected_before_reading` | 22.1.6 (2) 沙箱 |
+| `scrub.rs:127-...` | 4 组测试 | curl auth、powershell、各种 token 形态、不误杀普通参数 |
+| `auth/lib.rs:149-...` | `write_auth_file_secure_sets_private_permissions` | 0o700 / 0o600 |
+| `auth_token.rs:194-...` | `two_instances_on_different_ports_do_not_collide` | port-scoped cookie |
+| `oauth.rs::classify_input` 测试 | 全部平台 | `[0x1B] → Cancelled` / 其他 → `OtherInput` |
+| `daemon_token_file.rs:54-...` | `write_creates_0600_json_and_remove_deletes` | Unix 0600 |
+
+### 22.8 本轮不重复声明
+
+> 本章是第八轮深挖,**不**复述前 21 章已经覆盖的:
+
+1. **第 1-3 章 atomcode 架构总览** —— `crates/` 分层(L0 capabilities / L1 kernel / L2 domain / L3 entry)、分层契约
+2. **第 4-8 章 Kernel 循环** —— Agentic loop、TurnDriver、message 流、tool_calls 协议层
+3. **第 9-11 章 协议 wire** —— Anthropic / OpenAI 适配、SSE decoder、byte-stable prefix、6 类 retry
+4. **第 12-14 章 Tool 系统 + Hook + MCP** —— 27 种 Hook、5 种执行器、Tool Schema
+5. **第 15-16 章 Session + SubAgent + Daemon TUI** —— SessionManager、SubAgent fork、daemon TUI
+6. **第 17-19 章 Auth/Config/Telemetry 一级目录** —— 之前章节**仅提及** telemetry/auth/daemon crate 名,本轮首次**下沉到 4800+ 行实现**
+7. **第 20 章 第六轮 协议 wire + 流式 + 错误重试** —— 不重述 wire 协议本身
+8. **第 21 章 第七轮 文件编辑 + 代码检索 + 命令执行 + Token/Cache** —— 不重述 ⑪ "lsp_tool 单一入口 + fallback 链" 之外的 CodeIntel 主体
+
+**本章新覆盖**(对比前 21 章):
+
+- LSP 客户端 1170 行 JSON-RPC 完整实现(`lsp/client.rs`)
+- LSP 池化 sticky unavailable + per-server startup lock(`lsp/manager.rs`)
+- tree-sitter L0 符号层 + CodeGraph 反向边约定(`symbols.rs` / `graph.rs`)
+- Telemetry 6 类 Event + 7 类 ErrorKind 全套 schema(`event.rs`)
+- 双 pass 凭证脱敏(`scrub.rs`)
+- `CurrentContext` 同步+异步双 scope(`runtime.rs`)
+- NDJSON 段队列 `.partial.owner` 跨版本锁(`queue/mod.rs`)
+- OAuth2 device-poll + CbreakGuard ESC 取消(`oauth.rs`)
+- `write_auth_file_secure` tmp+rename+chmod 0o600(`auth/lib.rs`)
+- daemon `ServerOpts` 11 字段 + `prebound_listener` 进程内复用(`daemon/lib.rs`)
+- 三路 graceful-shutdown + idle watchdog + 单 chat 原子管控(`daemon/lib.rs`)
+- port-scoped cookie 命名 bug 修复(`auth_token.rs`)
+- Panic 钩子 scrub 集成(`daemon/lib.rs:5182-5224`)
+
+—— 调研者注:本文档为「第八轮深挖」,聚焦 LSP 协议层下沉、Telemetry 完整 schema、OAuth 凭证保管、Daemon 进程模型四大新维度;不重复前 21 章已覆盖的架构总览、Kernel 循环、协议 wire、Tool 系统、SubAgent、文件编辑/检索/命令执行等主题。

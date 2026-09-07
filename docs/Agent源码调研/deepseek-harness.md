@@ -2933,3 +2933,645 @@ harness 的 `tool-fs` **不直接调 git**。语义层「与 git 联动」通过
 
 对 laew 最有价值的单点突破是 **P0 的 Schema 白名单 + total 校验**——它把 laew 当前「字符串 + 散落解析」的工具层升级为「声明式 + 错误码化」，与 SQLite 持久化天然兼容（schema hash 进表，drift 自动检测）。**P1 的 TokenMeter replay-aware 是第二突破**——SQLite events 表**已经是**事件日志，复用即可获得崩溃恢复 + 上下文裁剪 + 计费三件套。
 
+
+---
+
+## 19. 第八轮深挖 — 跨语言互操作 + Evals评估 + 多平台适配 + Native模块（2026-09-07）
+
+> 调研对象：`/usr/local/LsmGitOpenSource/deepseek-harness/`（commit 快照，2026-09-07）。
+> 本轮聚焦前七轮未覆盖的 4 个新维度：**Python/Native 跨语言互操作**、**Evals 评估体系**、**多平台消息适配**、**本地 Native 模块**。
+> 所有行号均为真实文件锚点，可直接 `sed -n 'X,Yp'` 验证。
+
+### 19.1 Python/Native 跨语言互操作
+
+deepseek-harness 是一个 TypeScript（Node）为主的 harness，但它同时发布了**官方 Python SDK**。与常见的 PyO3 / napi-rs 内存级 binding 路线完全不同，它选择了 **「进程级协议互操作」** 路线：Python 与 Node 两个运行时各自独立，通过 **stdio 上的 newline-delimited JSON-RPC 2.0** 通信。这是全仓最具工程判断力的决策之一——下文逐层拆解。
+
+#### 19.1.1 互操作总体拓扑：三种载体，一个协议
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Python 进程（宿主）                                              │
+│  deepseek_harness / DeepSeekHarness → HarnessClient              │
+│         │ subprocess.Popen(stdio=PIPE)                           │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ Node 运行时（子进程）— 三种载体（carrier）                    │   │
+│  │  1. exe   : deepseek-harness-sdk-runtime-<plat>-<arch>     │   │
+│  │            (@yao-pkg/pkg --sea 单文件可执行，无需 Node)      │   │
+│  │  2. node  : node runtime/node/node_modules/@deepseek-ai/   │   │
+│  │            dsh/lib/bin.js（仓库源码构建，dev-only）          │   │
+│  │  3. dsh_bin: 用户自带二进制路径（HarnessConfig.dsh_bin）      │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│         │ JSON-RPC over stdio（newline-delimited）                │
+│         ▼                                                        │
+│  packages/sdk/server + protocol：initialize / session/prompt /    │
+│  shutdown / session.event / session.status / subagent.*           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+关键事实：**Python 与 Node 之间没有 FFI、没有共享内存、没有 PyO3/napi-rs**。跨语言边界上流动的只有三种东西：argv、环境变量（`DSH_HOME` / `DEEPSEEK_API_KEY`）、以及 stdio 上的一行一个 JSON 对象。整个互操作层在 Python 侧约 590 行（`client.py`）+ 249 行（`api.py`），在 Node 侧是 `packages/sdk/protocol/src/transport.ts`（行级 JSON-RPC 端点）+ `packages/sdk/server/src/server.ts`。
+
+#### 19.1.2 Python 侧：HarnessClient 的线程模型
+
+文件：`python/sdk/src/deepseek_harness/client.py`
+
+**双线程读泵 + 按 id 分发的响应路由**（client.py:344-368）：
+
+```python
+# client.py:344-346  reader 线程
+def _start_reader_thread(self) -> None:
+    self._reader_thread = threading.Thread(target=self._reader_loop, name="dsh-runtime-reader", daemon=True)
+    self._reader_thread.start()
+
+# client.py:352-364  逐行读 stdout，JSON 反序列化后交 _handle_message
+def _reader_loop(self) -> None:
+    proc = self._proc
+    if proc is None or proc.stdout is None:
+        return
+    try:
+        for line in proc.stdout:
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue   # ← 恶行静默丢弃，绝不中断读泵
+            self._handle_message(message)
+    except BaseException as exc:
+        self._fail_waiters(exc)
+    finally:
+        self._fail_waiters(self._runtime_closed_error("DeepSeek Harness runtime stdout closed"))
+```
+
+`_handle_message`（client.py:377-418）是互操作核心分发表，**三分支路由**：
+
+```python
+# client.py:377-418（节选）
+def _handle_message(self, message: object) -> None:
+    if not isinstance(message, dict):
+        return
+    msg_id = message.get("id")
+    method = message.get("method")
+    if isinstance(msg_id, (str, int)) and isinstance(method, str):
+        # 分支 1：对端 → 我方的请求（如 permission 询问）→ 入 _requests 队列
+        self._requests.put(IncomingRequest(id=msg_id, method=method, ...))
+        return
+    if isinstance(msg_id, (str, int)):
+        # 分支 2：我方请求的响应 → 按 id 弹出 waiter 并 put 结果
+        waiter = self._responses.pop(str(msg_id), None)
+        if isinstance(message.get("error"), dict):
+            waiter.put(JsonRpcError(...))
+        else:
+            waiter.put(message.get("result"))
+        return
+    if isinstance(method, str):
+        # 分支 3：通知 → 按订阅谓词分发到各 subscriber 队列
+        notification = Notification(method=method, ...)
+        ...
+```
+
+**waiter 是 `queue.Queue(maxsize=1)`**（client.py:273），每个在途请求一个，配 UUID v4 作为请求 id（client.py:272 `request_id = str(uuid.uuid4())`）——这与 Node 侧 `transport.ts` 的 `pending = new Map<JsonRpcId, PendingRequest>` 完全镜像，两端语义对称。
+
+#### 19.1.3 跨语言通知订阅：会话树过滤器
+
+互操作不只是请求/响应，还有**服务端主动推送的 notification**。Python SDK 实现了一套完整的订阅模型（client.py:226-238 + 539-577）：
+
+```python
+# client.py:226-238
+def subscribe_notifications(self, notification_filter=None) -> "NotificationSubscription":
+    subscription_id = str(uuid.uuid4())
+    notifications: queue.Queue[Notification | BaseException] = queue.Queue()
+    with self._lock:
+        self._notification_subscribers[subscription_id] = (notifications, notification_filter)
+    return NotificationSubscription(self, subscription_id, notifications)
+
+def subscribe_session_notifications(self, session_id: str) -> "NotificationSubscription":
+    """Subscribe to a session and descendants discovered from subagent lifecycle edges."""
+    return self.subscribe_notifications(self._notification_belongs_to_session_tree(session_id))
+```
+
+最精妙的是 `_notification_belongs_to_session_tree`（client.py:506-536）：**客户端通过监听 `subagent.started` 通知，自行在客户端侧重建父-子会话 DAG**（client.py:492-504 `_record_session_relationship_locked` 只在 `subagent.started` 时记录 `child → parent` 边），然后用 `_session_is_descendant_of` 沿 parent 链向上回溯（带 visited 集合防环，client.py:525-536）。**子代理的生命周期事件由 Python 客户端独立于 Node 服务端推导**——两端对「会话树」的理解通过通知流收敛，无需额外查询 RPC。
+
+#### 19.1.4 关停握手：有界 flush 协议
+
+跨语言进程管理的难点是关停。client.py:94-131 给出了教科书级实现：
+
+```python
+# client.py:94-131（节选）
+def close(self) -> None:
+    proc = self._proc
+    if proc is None:
+        return
+    shutdown_completed = False
+    try:
+        self.request("shutdown", None, response_model=_ShutdownResponse,
+                     timeout_seconds=self.config.shutdown_timeout_seconds)
+        shutdown_completed = True
+    except Exception as exc:
+        self._stderr_lines.append(f"shutdown request failed: {exc}")
+    if proc.stdin:
+        proc.stdin.close()                    # ① 先关 stdin
+    if shutdown_completed:
+        proc.wait(timeout=...)                # ② 握手成功才有限等待
+    if proc.poll() is None:
+        proc.terminate()                      # ③ SIGTERM
+    if proc.poll() is None:
+        proc.wait(timeout=...); proc.kill(); proc.wait()   # ④ SIGKILL
+```
+
+四步递进：**JSON-RPC `shutdown` 请求（给对端持久化机会）→ 关 stdin → 有界 wait → terminate → kill**。且全程把 stderr 环形缓冲（`deque(maxlen=400)`，client.py:60）用于失败诊断拼接（`_runtime_diagnostics`，client.py:437-456）——任何超时/关闭错误都会带上「exit code + stderr 尾部」，跨语言排障不再需要两边的日志对齐。
+
+#### 19.级 19.1.5 错误传播链：跨语言异常三态映射
+
+Python ↔ Node 的错误必须跨进程传播。SDK 定义了清晰的映射（`python/sdk/src/deepseek_harness/errors.py`）：
+
+| Node 侧来源 | Python 异常 | 附加诊断 |
+|---|---|---|
+| JSON-RPC error frame（`{"error":{"code","message","data"}}`） | `JsonRpcError(code, message, data)` | — |
+| stdout 关闭/写入失败 | `TransportClosedError` | 自动拼接 stderr 尾部（client.py:433-435） |
+| 协议不变量破坏（如 `turn/end` 缺 `reason.kind`） | `SdkProtocolError`（api.py:246） | — |
+| 初始化超时 | `TimeoutError` + profile 名（client.py:158-160） | `selected dsh profile '...'` |
+| 运行时缺失 | `FileNotFoundError` + 获取途径提示（`__init__.py:37-43` `_EXE_ACQUISITION_HINT`） | 指向 build 脚本与平台 wheel |
+
+特别值得注意 `initialize` 失败路径（client.py:161-170）：**任何非超时异常都会附带 `_runtime_diagnostics()` 的 stderr 尾部重新抛出**——子进程崩溃时 Python 用户看到的第一条错误就包含 Node 侧的报错栈。
+
+#### 19.1.6 高层 API：DeepSeekHarness 的「运行到 idle」循环
+
+文件：`python/sdk/src/deepseek_harness/api.py`
+
+`DeepSeekHarness`（api.py:49-131）是进程生命周期拥有者：**子进程懒启动**（api.py:103-114 `start()` 内先 `self._client.start()` 再 `initialize`），`run()`（api.py:124-131）委托给 `Session.run()`。`Session.run`（api.py:139-189）是「一次用户回合」的完整封装：
+
+```python
+# api.py:161-189（节选）
+with self.harness.client.subscribe_session_notifications(self.id) as subscription:
+    message_id = self.harness.client.session_prompt(self.id, content_blocks,
+                                                    notification_subscription=subscription)
+    received = False
+    while True:
+        notification = subscription.next()
+        if not received:
+            if not _is_inbox_receipt(notification, self.id, message_id):
+                continue          # ① 丢弃回执确认前的历史通知
+            received = True
+        collect(notification)
+        if (notification.method == "session.status"
+                and notification.payload.get("status") == "idle"):
+            break                 # ② idle 即回合结束信号
+```
+
+两个协议细节：
+1. **inbox 回执门槛**（`_is_inbox_receipt`，api.py:192-202）：SDK 等到 `agent/inbox/spliced` 事件中**包含自己发出的 messageId** 才开始收集事件——防止会话历史中旧回合的通知被误收。
+2. **idle 终止条件**：回合结束不是靠「assistant 消息出现」判断（那无法区分中间回合），而是等服务端显式 `session.status: idle`——这与 ACP 协议的 `session/update` updateSessionIdle 语义对齐。
+
+最终 `final_response(events)`（api.py:211-228）**逆序扫描** `assistant/message` 事件拼接 text block，`finish_reason`（api.py:231-248）逆序找最后一个 `turn/end` 的 `data.reason.kind`——**事件流即结果**，Python 侧不做任何状态机重建。
+
+#### 19.1.7 Node 侧协议端点：行分帧 + StringDecoder
+
+文件：`packages/sdk/protocol/src/transport.ts`
+
+Node 侧是 Python `HarnessClient` 的对端（也是 TS `sdk/client` 的对端）。transport.ts:62-80：
+
+```typescript
+export class JsonRpcLineTransport implements JsonRpcTransportPeer {
+  private buffer = ''
+  private readonly decoder = new StringDecoder('utf8')
+  ...
+  constructor(private readonly input: Readable, private readonly output: Writable) {}
+  start(): void {
+    if (this.started) return
+    this.started = true
+    this.input.on('data', this.onData)
+```
+
+三个工程要点：
+1. **`StringDecoder` 防多字节截断**：UTF-8 中文/emoji 可能被 TCP/pipe chunk 撕裂，`StringDecoder` 保证不完整的多字节序列留到下一 chunk——Python 侧 `subprocess.Popen(text=True, bufsize=1)` 依赖语言运行时解决同一问题。
+2. **分帧规则极简**（transport.ts:1-7 注释）：`id + method` = 请求、`id` alone = 响应、`method` alone = 通知。无 magic header、无长度前缀，一行一个 JSON。
+3. **错误码约定**：缺 handler 返回 `-32601`（Method not found），handler 抛错返回 `-32603`（Internal error）——标准 JSON-RPC 2.0 错误码空间，Python 侧直接透传 `JsonRpcError.code`。
+
+#### 19.1.8 与 PyO3/napi-rs 路线的对比
+
+| 维度 | deepseek-harness（进程级 JSON-RPC） | PyO3（Rust↔Python 内存级） | napi-rs（Rust↔Node 内存级） |
+|---|---|---|---|
+| 边界成本 | 进程启动 + 每消息 JSON 序列化 | 一次 dlopen，函数调用级 | 一次 dlopen，函数调用级 |
+| 类型安全 | 线协议 schema（pydantic `model_validate`，client.py:212） | 编译期（Rust 类型） | 编译期（Rust 类型） |
+| 崩溃隔离 | 子进程崩溃不影响宿主 | 崩溃直接带走 Python | 崩溃直接带走 Node |
+| 版本耦合 | 二进制 + 协议版本同包发布（wheel tag 钉死） | ABI（py03 minor） | N-API 稳定 ABI |
+| GIL/线程 | 天然无 GIL 竞争（子进程） | 需 `allow_threads` | N/A |
+| 调试 | 两进程独立可观测（stderr 环形缓冲） | 混合栈，pdb 难穿透 | 混合栈 |
+
+deepseek-harness 的选择本质是：**当跨语言边界上的交互粒度是「一个 agent 回合」而非「一个函数调用」时，进程级互操作的成本摊薄后可忽略，而崩溃隔离与独立部署的收益巨大**（Python 用户 pip install 后无需装 Node——单文件 exe 直接跑）。这个判断对 laew 直接适用（见 19.5）。
+
+### 19.2 Evals 评估体系
+
+deepseek-harness 没有名为 `evals/` 的目录，但它的评估能力**内嵌在测试基础设施**里，且远比常见「跑一组 prompt 看通过率」的 eval 框架严密。核心思想：**「录制-回放」双轨 + 「世界状态断言」+ 「分层自跳过」**。
+
+#### 19.2.1 测试分层总览（六层）
+
+文件：`docs/testing.md`（Testing policy）
+
+| 层 | 命令 | Key 需求 | 断言对象 |
+|---|---|---|---|
+| Unit | `pnpm run test` | 无 | vitest，包级 spec |
+| Coverage gate | `pnpm run test:coverage` | 无 | **per-file 100%**（packages/*/*/src），未覆盖行=死代码 |
+| Real-API e2e | `pnpm run test:e2e` | `DEEPSEEK_API_KEY` | 真模型行为（按 key 自跳过） |
+| Owner-local expected | `pnpm run test:expected` | 无 | 组装 CLI/进程期望输出（`*.expected.e2e.ts`） |
+| Snapshot（会话回放） | `pnpm run test:snapshot` | 无 | 录制 session.jsonl 回放 + 持久化结果比对 |
+| Web browser snapshot | `pnpm run test:web` | 无 | Chromium + ARIA 证据（Linux PR 必过） |
+
+其中 **Snapshot 层就是 deepseek-harness 的 eval 主体**：一份录制的 `session.jsonl` 同时充当「用户输入」与「模型回放脚本」与「期望持久化输出」三重角色。`snapshots/AGENTS.md` 明确其纪律（以下为该文件原文要点）：
+
+- 每个场景持有一个 primary `session.jsonl` + 连续 child 文件；**只有 owner 能录制/刷新**（snapshots/AGENTS.md:7）
+- **「Committed sessions are normalization fixed points」**（AGENTS.md:9）：易变身份（session id、时间戳）替换为保持关系的类型化 token；system prompt 与 tool schema 替换为 token
+- **变更工作区的场景必须 commit 完整的 `workspace.expected/` 树**，且「Record and refresh do not rewrite this independent oracle」（AGENTS.md:13）——**模型 prose 与 tool-result 文本不能证明外部效果**，工作区最终状态是独立 oracle
+- `pnpm run test:snapshot` **回放不写盘**（AGENTS.md:15）
+
+#### 19.2.2 llm-replay：从 session.jsonl 派生模型脚本
+
+文件：`packages/test-support/llm-replay/src/index.ts`
+
+这是 snapshot 层的引擎——一个 **keyless LLM Adapter**，从录制会话派生逐调用回放脚本（index.ts:1-8 模块注释）：
+
+```typescript
+/**
+ * Keyless snapshot-test LLM replay. It derives one model-call script per
+ * recorded session from `assistant/chunk` events and explicitly marked local
+ * compaction calls, then binds fresh live sessions to parent/child scripts by
+ * first-call order. Throw and hang cases require an explicit override because
+ * a session log cannot reconstruct them alone.
+ */
+```
+
+回放条目三态（index.ts:39-46）：
+
+```typescript
+export type ReplayEntry =
+  | { kind: 'chunks'; chunks: StreamChunk[] }                 // 正常流式回放
+  | { kind: 'throw'; chunks: StreamChunk[]; message: string;  // 先吐 prefix chunk 再抛错
+    code: string; accepted?: boolean }
+  | { kind: 'hang'; readyFile?: string }                       // 挂起等取消（写标记文件）
+```
+
+`hang` 的 `readyFile` 是个精彩设计：**回放适配器在 prefix chunk 消费完后、开始无限等待前，写一个标记文件**——测试脚本用 `waitForFile` 步骤同步「模型已就绪」时点，然后才发 cancel，从而确定性测出「取消正好打断流中」的行为（配合 harness.ts:81-85 `promptAndCancel.waitForFile`）。
+
+回放模型目录（ReplayModelConfig，index.ts:49-81）甚至能声明 `inputModalities`（含 image）与 `imageRequestTokens`——**让无 key 场景也能测图像计费与能力门控**。
+
+#### 19.2.3 session-snapshot harness：真实入口 + 确定性输入脚本
+
+文件：`packages/test-support/session-snapshot/src/harness.ts`
+
+harness 启动**真实的 agent bin 子进程**（经 cordis Loader，防「unit 绿但产物坏」——直接回应 docs/testing.md 引用的 postmortem 0001），用 `input.json` 驱动确定性输入脚本。脚本步骤词汇表（harness.ts:73-94）是评估体系最重要的接口设计：
+
+```typescript
+export type InputStep =
+  | { op: 'initialize' }
+  | { op: 'newSession' }
+  | { op: 'newSessionExpectError'; additionalDirectories?: string[] }
+  | { op: 'prompt'; text: string }
+  | { op: 'promptContent'; content: AcpContentBlock[] }
+  | { op: 'promptAndWaitForAgentMessage'; text: string; waitForText: string }
+  | { op: 'promptExpectError'; text: string }
+  | { op: 'promptAndCancel'; text: string; waitForFile?: {...} }
+  | { op: 'waitForFile'; path: string; timeoutMs?: number }
+  | { op: 'waitForTurnStart'; minimumTurn?: number; ... }
+  | { op: 'waitForTurnEnd'; timeoutMs?: number }
+  | { op: 'waitForSubagentTurnEnd'; child?: number; ... }
+  | { op: 'waitForGoalPhase'; phase: 'active'|'paused'|'blocked'|'complete'; ... }
+  | { op: 'waitForInboxMessage'; text: string; ... }
+  | { op: 'waitForTitleAfterTurnEnd'; timeoutMs?: number }
+  | { op: 'waitForEventAfterTurnEnd'; type: string; ... }
+  | { op: 'cancel'; waitForFile?: {...} }
+```
+
+注意 `waitForGoalPhase`——**Goal 状态机的每个相位（active/paused/blocked/complete）都是可等待的评估锚点**，评估脚本可以直接断言「任务 X 在取消后进入 paused 而非 aborted」。这些 wait 步骤全部有 10s 默认超时（harness.ts:42 `DEFAULT_WAIT_TIMEOUT_MS = 10_000`）。
+
+#### 19.2.4 mock LLM server：故障注入矩阵
+
+文件：`packages/test-support/llm-mock-server/src/cli.ts` + `index.ts`
+
+与 llm-replay（按录制脚本）互补的是 **行为序列 mock server**。CLI 支持编排有序故障序列（cli.ts:37-65 usage 文本）：
+
+```text
+--sequence <a,b,...>       Ordered behaviors; connection_refused is allowed first
+--listen-delay-ms <ms>     Unavailable interval (default 750 with connection_refused)
+--repeat-last              Repeat the final request behavior after exhaustion
+--seed <uint32>            Reproduce random selections
+--random-weights <a=n,...> Relative weights for concrete behaviors
+--chunk-size <count> --chunk-delay-ms <ms>
+--disconnect-delay-ms <ms> --retry-after-ms <ms>
+```
+
+`connection_refused` 只允许出现在序列首位（cli.ts:86-89）——**「服务还没起就拒绝连接」与「连接后断开」是两种不同的重试路径**，分开编排。`--seed` + `--random-weights` 让随机故障选择可复现。
+
+这是对重试/容错逻辑（第六轮已覆盖的 `ResolvedRetryPolicy`）的评估基础设施：不用真 API 就能把「429 带 Retry-After → 指数退避 → 成功」「连接被拒 → 立即失败」「流中断开 → 半响应对齐」等场景全部穷举。
+
+#### 19.2.5 三条评估铁律（docs/testing.md）
+
+testing.md 中有三条直接可移植的评估哲学：
+
+1. **「Verify the world, not the self-report」**（testing.md）：e2e 断言要 **re-run 命令或 re-read 文件**；对 agent 自己输出的关键词探测等于允许 agent 作弊通过。「Assert untouched files are byte-identical.」
+2. **「A no-key test proves plumbing; only a with-key run proves the agent works against a real model」**（testing.md）：mock 证明管道，真 key 证明 agent。最高价值的是 **smoke test：启动一个 shipped profile，发一条 prompt，检查世界**——专治「unit 全绿、产品全坏」。
+3. **「Mock only the expensive or non-deterministic boundary」**（testing.md）：只 mock LLM 适配器/网络/时钟，**下游全部用真实现**。引用例证：`packages/acp/acp/tests/harness.ts` 的 `makeBridgeHarness()` 只用 `MockAdapter` 一个 mock，工具注册表/循环/持久化全部真实。
+
+#### 19.2.6 BENCHMARK.md 与 A/B
+
+根目录 `BENCHMARK.md` 全文仅两句话：指向 `docs/user/guide/python-sdk.md` 的 jsonrpc-agent minimal 变体，要求「Use separate workspaces and session IDs for independent benchmark tasks」。**deepseek-harness 没有独立的模型质量 eval/benchmark 套件**（无 pass@k、无 LLM-judge、无 A/B 框架）——它的「评估」全部是**工程行为回归**（会话回放/持久化比对/协议断言），模型质量评估交给 DeepSeek 模型团队，不在 harness 仓库职责内。这是本轮的诚实结论：**它的 evals 体系 = 测试金字塔的 snapshot/expected 两层，而非 ML 意义上的 eval**。
+
+### 19.3 多平台消息适配（飞书/钉钉/Slack）
+
+**先说结论（本轮最重要的负发现）**：deepseek-harness **没有任何飞书/钉钉/Slack/企业微信/Discord/Telegram 集成**。全仓 grep（含 packages/、apps/、python/、docs/）对 `slack|feishu|lark|wecom|dingtalk|discord|telegram|teams` 的命中仅有两种：experimental agent-team 的内部邮箱语义（`mailbox.ts`）与无关代码。**它对「外部消息平台」的答案是 webhook 通用层**——provider-neutral 到不含任何具体平台 SDK。
+
+#### 19.3.1 webhook 包：平台无关的事件入口
+
+文件：`packages/webhook/webhook/src/`（index.ts / types.ts / session.ts / brand.ts）
+
+设计分三层：
+
+**层 1：类型化投递（types.ts:19-33）**
+
+```typescript
+export interface VerifiedWebhookDelivery<K extends string = string> {
+  readonly kind: K                 // provider 家族，如 'github'
+  readonly source: WebhookSourceId // adapter 实例 id，如 'primary-github'
+  readonly deliveryId: WebhookDeliveryId
+  readonly event: WebhookEventOf<K>   // 声明合并的 provider 事件类型
+  readonly receivedAt: number      // Unix epoch ms
+}
+```
+
+`WebhookEventMap`（types.ts:9）是**空的开放接口**——「Provider adapters add their normalized event type through declaration merging」（types.ts:11）。也就是说具体平台（GitHub / 飞书 / Slack…）由**外部 adapter 包**通过 `declare module` 注入事件类型，核心包不认识任何平台。
+
+**层 2：rule（受信代码）→ SessionRequest（types.ts:54-73）**
+
+```typescript
+export interface WebhookRule<K extends string = string> {
+  readonly id: WebhookRuleId
+  readonly kind: K
+  run(delivery: Readonly<VerifiedWebhookDelivery<K>>, signal: AbortSignal):
+    WebhookSessionRequest | null | Promise<WebhookSessionRequest | null>
+}
+```
+
+Rule 是**受信代码**（不是模型生成），每个投递最多产出一个动作：`WebhookSessionRequest | null`。Request 的字段（types.ts:38-53）全部必填且强校验（session.ts:42-80 `resolveRequest`）：`workspacePath`（必须绝对路径）/ `title` / `prompt` / `agentPreset` / `permissionPreset` / 可选 `model{provider,model,maxTokens}`。
+
+**层 3：fire-and-forget runtime（index.ts:58-80）**
+
+```typescript
+export class WebhookRuntime extends Service {
+  static inject = ['agents', 'agentDefaultModel', 'agentPresets',
+                   'permissionPresets', 'sessionTitle', 'workspaceRegistry']
+  private readonly rules = new Map<WebhookRuleId, RuleRegistration>()
+```
+
+每个 rule 注册自带 `AbortController` 与 `active: Set<Promise<void>>`（index.ts:29-36）；运行时关闭时 `closing = true` 并 `await Promise.all(disposeRegistration)`（index.ts:75-80）。投递先经 `snapshotDelivery` 冻结（`deepFreeze(snapshotJsonValue(delivery))`，index.ts:52-54）——**投递对象跨任意 rule 共享前先做无损 JSON 快照 + 深冻结**，防 rule 间互相污染。
+
+溯源接入 MessageSourceMap（types.ts:75-80）：webhook 创建的消息来源声明为 `{kind:'webhook', provider, source, deliveryId, ruleId, form:'notice'}`——**每个 webhook 会话的四元组来源永久可追溯**（与第四轮决策溯源章节呼应）。
+
+#### 19.3.2 与「聊天机器人适配」路线的对比
+
+deepseek-harness 选择 webhook 通用层而非平台 SDK 集成，理由从架构上清晰可辨：
+
+| 关注点 | 平台 SDK 路线（Slack Bot / 飞书应用） | webhook 通用层（dsh 选择） |
+|---|---|---|
+| 依赖面 | 每平台一个 SDK + token 管理 | 零平台依赖，adapter 在外部 |
+| 类型安全 | 各家事件模型 | `WebhookEventMap` 声明合并，核心保持中性 |
+| 动作语义 | 平台消息协议（回复/卡片/线程） | 唯一动作 = 创建一个 Session（Session 是通用资产） |
+| 鉴权 | 每平台签名验证 | `VerifiedWebhookDelivery` 前置（adapter 负责验证后投递） |
+| 长任务 | 平台超时限制 | fire-and-forget + AbortSignal 生命周期 |
+
+换句话说：**「多平台适配」被分解为「平台 → webhook adapter（外部）+ webhook → Session（内部）」两段**，harness 只拥有后一段。laew 若要做飞书/钉钉机器人，这是更可演化的拆法（见 19.5 P1）。
+
+### 19.4 Native 本地模块
+
+`native/` 目录只有一个工具家族：`landlock-run`——但它是**全仓工程密度最高的 298 行 C 代码**，展示了从「一个 Linux 沙箱需求」到「npm 分发矩阵」的完整工程闭环。
+
+#### 19.4.1 是什么：自限制后 exec 的 Landlock 启动器
+
+文件：`native/landlock-run/packages/entry/src/main.c`（298 行，C11，仅依赖 libc）
+
+功能（main.c:1-36 头注释）：进程**先给自己装 Landlock ruleset，再 exec 目标命令**；ruleset 跨 `execve` 继承，因此命令及其所有后代都被限制，而调用方进程不受限。CLI 契约：
+
+```text
+landlock-run [--ro <path>]... [--rw <path>]... -- <argv>...
+landlock-run --probe
+```
+
+用途（main.c:4-8）：在 `bwrap` 不可用的 Linux 宿主（未装 / 禁用非特权 user namespace / LSM 拒绝 mount）上提供沙箱 rung——Landlock 是独立 syscall 家族，都不需要。
+
+#### 19.4.2 六个关键工程决策（附行号）
+
+**① 本地定义 Landlock UAPI（main.c:50-105）**
+
+```c
+/* The Landlock UAPI, defined locally instead of via <linux/landlock.h>: ...
+ * Layouts and values are verbatim from the kernel header (the
+ * path-beneath struct is packed there, so it must be packed here). */
+struct landlock_path_beneath_attr {
+  uint64_t allowed_access;
+  int32_t parent_fd;
+} __attribute__((packed));
+```
+
+不 include 内核头——**审计面 = 这一个文件 + 内核稳定 syscall 契约**，且构建不依赖工具链头文件年代。syscall 号手动定义（main.c:101-105，444/445/446，2011 后统一表全架构相同）。
+
+**② ABI 协商降级（main.c:184-191 + 230-241）**
+
+```c
+static uint64_t fs_mask_for_abi(long abi) {
+  uint64_t mask = LL_ABI1_MASK;
+  if (abi >= 2) mask |= LL_FS_REFER;
+  if (abi >= 3) mask |= LL_FS_TRUNCATE;
+  if (abi >= 5) mask |= LL_FS_IOCTL_DEV;
+  return mask;
+}
+```
+
+构建期 `MAX_ABI = 5`（main.c:94），运行期先 `landlock_create_ruleset(NULL,0,CREATE_RULESET_VERSION)` 探测内核 ABI，**把规则集缩到内核支持的访问位**。ABI 不足时标记 `*partial`（main.c:237），继续执行但 stderr 报告「partial enforcement」——**「仍被限制（对内核支持的一切）」与「不可用」是两个诚实的等级**。
+
+**③ fail-closed（main.c:231-235 + 全文约定）**
+
+内核不支持 Landlock（ENOSYS）/ 被禁用（EOPNOTSUPP）→ **直接退出 125，绝不 exec 未受限命令**（main.c:233-235 注释「not enforceable — fail CLOSED, never exec unconfined」）。exit 125 是专属启动器失败码（main.c:112），「wrapped command 不太可能用」，调用方还需匹配 `landlock-run: ` 前缀的 fatal 行才能归因启动器失败（cli-contract.md）。
+
+**④ 功能性 probe 而非版本探测（main.c:269-283）**
+
+```c
+/* The functional probe: build and enforce a maximal ruleset in THIS
+ * short-lived process ... `--version` style checks would miss a kernel that
+ * has the syscalls but refuses enforcement; actually restricting is the
+ * only honest signal. */
+```
+
+`--probe` **真装一个 maximal ruleset 到探测进程自身**，成功才打印唯一一行 `landlock: fully/partially enforced`。有 syscall 但拒绝执行的内核骗不过它。
+
+**⑤ 文件 grant 的访问位裁剪（main.c:203-209）**
+
+内核拒绝目录专属访问位落在非目录规则上（EINVAL），所以 `--rw /dev/null` 这类文件 grant 自动裁掉目录位只留 file 兼容位——**argv 语法不变，语义随目标类型自适应**。
+
+**⑥ no_new_privs 前置（main.c:254-256）**
+
+`prctl(PR_SET_NO_NEW_PRIVS)` 先于 `restrict_self`——既是非特权限制的内核强制前提，也顺带中和沙箱内 setuid/setgid 提权。
+
+#### 19.4.3 entry 包：JS 侧契约封装
+
+文件：`native/landlock-run/packages/entry/src/index.ts`（127 行）
+
+TypeScript 只做三件事，**策略留给消费者**（index.ts:9-10「Policy stays with the consumer: this package does not know what a "sandbox mode" is」）：
+
+- `launcherPath()`（index.ts:69-83）：解析平台包路径；不可解析时返回**包边界内一个确定性永不存在的回退路径**——**绝不允许 cwd 相对路径**（index.ts:78-79 注释：「a spawnable relative path here would hand cwd control over which binary confines」）
+- `grantArgs(grants)`（index.ts:94-99）：`--ro/--rw` argv 拼装
+- `probe(launcher, {timeoutMs=2000})`（index.ts:116-127）：spawnSync 跑 `--probe`，退出码非 0 → `'unusable'`；stdout 匹配 `/partially enforced/` → `'partial'`；否则 `'full'`。**缺失二进制与不执法内核故意不可区分**（都是 unusable）——消费者只有一条降级路径。
+
+全模块**零环境变量覆盖**（index.ts:12-14）：「which binary confines a process must never be decidable by the ambient environment」——测试注入走函数参数。
+
+#### 19.4.4 分发矩阵：entry + 平台包 + prebuilds.json
+
+文件：`native/landlock-run/docs/packaging.md` + `packages/linux-x64/prebuilds.json`
+
+- **entry 包**（`@deepseek-ai/node-addon-landlock-run`）：纯 ESM JS，把所有平台包列为 `optionalDependencies`，tarball 内附 C 源码供审计
+- **平台包**（`-linux-x64` / `-linux-arm64`）：`bin/landlock-run` 静态二进制 + `prebuilds.json` + `os`/`cpu` 字段，**零 JS**
+- **无 install 脚本、永不编译回退**（packaging.md「No install fallback」）：编译回退要求消费者处处有 musl 工具链，会把干净的 fail-closed 降级变成环境相关的 maybe；`verify-packed-install.mjs` 强制 tarball 无 install 生命周期脚本
+- **构建 native-only**（`scripts/build.ts:20-28`）：每架构用自己的 `musl-gcc` 静态编译（glibc/musl 通吃），**故意无交叉工具链**——CI 每架构 runner 是 builder of record，审计面 = 被评审的 C 源 + 构建它的 CI job
+- **pack 分裂**（packaging.md「Pack gates」）：平台 tarball 用 `npm pack`，entry 用 `pnpm pack`——因为 pnpm pack 会归一化文件模式**剥掉可执行位**，平台包绝不能被 pnpm 打包
+- 平台矩阵是**签入的元数据**（prebuilds.json + os/cpu），`scripts/github-matrix.mjs` 从它派生 CI/Release 矩阵——加平台 = 加包 + 加 runner 入口，不改 workflow
+
+#### 19.4.5 另一组「native」：Python 单文件 exe
+
+与 native/ 并行的还有 `scripts/build-exe-for-python-sdk.ts`（626 行）——把 Node 侧 dsh 打成单文件可执行作为 Python runtime 载体（19.1.1 的 carrier 1）。关键点：
+
+- **`@yao-pkg/pkg@6.21.0 --sea` 固定版本**（build-exe-for-python-sdk.ts:27 `PKG_SPEC`，SEA 需 Node ≥22，默认 node24）
+- **全树资产 glob**（ASSET_GLOBS，:43-64）：pkg 静态分析看不到 Cordis 的运行时 bare-import，所以 `node_modules/**/*.js|cjs|mjs|json|md|node|so|wasm|yaml…` 全部带上；连 `dsh-web-frontend/dist/**` 与 `dsh-skill-badge/assets/**` 都显式列出（:60-63）
+- **staging 去符号链接**（`materializeStagedLinks`，:357-383）：pnpm 部署产生的 workspace 符号链接**全部实体化拷贝**（cp + dereference），并拒绝任何残留 link——pkg 虚拟文件系统不能装 link
+- **sidecar 三件套**（pack，:423-452）：exe 之外还拷 `ripgrep`（`@vscode/ripgrep-<plat>-<arch>/bin/rg`，让 Node 能在 pkg 虚拟 FS 外 spawn rg）、macOS 加 `node-pty spawn-helper`；Windows 只支持 x64，Linux 要求在目标架构上构建（:519-525）
+- **产物落地双份**：`dist-exe/`（上传副本）+ `python/sdk-runtime/src/deepseek_harness_runtime/runtime/`（wheel 载荷）
+
+而 Python wheel 侧由 `python/sdk-runtime/hatch_build.py` 把关：`RuntimeBuildHook.initialize`（hatch_build.py:60-98）**校验 runtime 目录的文件集合与 platforms.json 声明完全一致**（多一个少一个都 RuntimeError）、确认可执行位、然后设 `tag = py3-none-<platform_tag>`（如 manylinux_2_28_x86_64，hatch_build.py:98）——**把 Node 二进制伪装成 Python 平台 wheel 的平台标签**，pip install 时按平台自动选对二进制。`platforms.json`（4 平台：linux-x64/arm64、macos-arm64、win-x64）与运行期查找（`deepseek_harness_runtime/__init__.py:55-90`，exe + `-rg` sidecar + macOS `-spawn-helper` 三重存在性校验）构成闭环。
+
+### 19.5 对 laew 的借鉴路线图
+
+> laew 现状基线：Rust 单二进制 `laew`、SQLite 配置、6-Agent 编排、Bash/Read/Write 三工具、TUI + `-p`/`-f` 模式、e2e 用 mock LLM（testReport/run_e2e.sh）。
+
+#### P0（低垂果实，1-2 周量级）
+
+| # | 借鉴点 | 来源锚点 | laew 落地建议 |
+|---|---|---|---|
+| P0-1 | **stderr 环形缓冲诊断拼接** | client.py:60（`deque(maxlen=400)`）+ client.py:437-456 | laew 的 SubAgent/QC Agent 调 LLM 失败时，错误信息自动附带「子进程 stderr 尾 N 行」。当前 laew 报错只有 AgentError 单层，排障要重跑。Rust 侧用 `VecDeque<String>` 容量 400，`AgentError` 加 `stderr_tail: Option<String>` |
+| P0-2 | **四步关停握手** | client.py:94-131 | laew 若引入子进程工具（如未来 Python sandbox / sidecar），关停序列固化为：`shutdown` RPC → 关 stdin → 有界 wait → terminate → kill。run_e2e.sh 的 tmux 收尾目前直接 kill-session，可对照补「优雅期」 |
+| P0-3 | **回放断言「世界而非自述」** | docs/testing.md「Verify the world, not the self-report」 | laew e2e 已部分做到（校验文件落盘），但缺「untouched files byte-identical」断言。run_e2e.sh 每个用例前后 `find + sha256sum` 快照对比，把「工具误写旁文件」变成硬失败 |
+| P0-4 | **功能 probe 而非版本探测** | main.c:269-283 | laew 未来任何「宿主能力探测」（如 Landlock/seccomp/pty 可用性）都用**真实最小化动作**探测（fork 一个子进程真装一次规则），不要查 `/proc/version` 或 `syscall_exists` 就下结论 |
+| P0-5 | **fail-closed + 专属退出码 + 前缀行归因** | main.c:112 + cli-contract.md | laew 若做 Bash 沙箱前置启动器：失败退出码选一个命令几乎不会用的（如 125），且 stderr 打 `laew-sandbox: ` 前缀；调用方「码 + 前缀」双条件归因，避免与命令自身退出码混淆 |
+
+#### P1（结构收益，1-2 月量级）
+
+| # | 借鉴点 | 来源锚点 | laew 落地建议 |
+|---|---|---|---|
+| P1-1 | **进程级 JSON-RPC SDK 互操作层** | python/sdk 5 文件 + packages/sdk/protocol/transport.ts | **对 laew 价值最大**。laew 是 Rust，发布 Python/TS SDK 的正确姿势不是 PyO3 全量 binding，而是：laew 增加 `--sdk`（stdio JSON-RPC server）子命令，暴露 `initialize/session/prompt/shutdown` 四方法 + `session.event`/`session.status` 通知。SDK 侧（任意语言）subprocess 启动 + 行分帧即可。Rust 侧协议层与 agent 循环天然解耦（现有 `LlmClient` 模式同构） |
+| P1-2 | **客户端侧会话树订阅** | client.py:492-536 | laew 多 Agent（Main→SubAgent 委派）的通知流按「会话树」过滤：SDK 侧监听 `subagent.started` 维护 child→parent 边，`belongs_to_session_tree(root)` 谓词决定投递。laew 当前 SessionContext/agent_memory 已有 parent 关系，补 wire 通知即可 |
+| P1-3 | **录制-回放双轨 e2e** | llm-replay/index.ts:39-46 + snapshots/AGENTS.md | laew e2e 现在是 mock 固定应答。升级为：真实 API 跑一次 → 落 `session.jsonl`（SQLite events 已有）→ 回放模式把录制 chunk 流作为 mock LLM 返回值 → 断言持久化结果与录制期望逐字节一致。`hang` + `readyFile` 机制可精确测「取消打断流中」 |
+| P1-4 | **故障注入 mock server CLI** | llm-mock-server/cli.ts:37-65 | laew 加 `laew-mock-llm`（或 testReport 内 bin）：`--sequence 429,disconnect,success --retry-after-ms` 编排故障序列，e2e 穷举重试路径。当前 laew 无重试逻辑，此基建先行可倒逼重试设计落地 |
+| P1-5 | **webhook 通用层 + 声明合并事件类型** | packages/webhook/types.ts:19-73 | laew 做飞书/钉钉机器人时**不要**引平台 SDK 进核心。定义 `VerifiedDelivery{kind,source,delivery_id,event,received_at}` + `WebhookRule::run(&Delivery) -> Option<SessionRequest>`；平台 adapter 作为独立 crate `laew-webhook-lark` 等按需组合。SessionRequest 字段强校验（绝对路径 workspace、非空 title/prompt、显式 preset 名） |
+| P1-6 | **单二进制 + sidecar 分发** | build-exe-for-python-sdk.ts:43-64 + hatch_build.py:76-98 | laew 已是单二进制，但若未来需要外部工具（rg 搜索、文件类型探测），学 sidecar 模式：主二进制旁放 `<laew-rg>`，启动时按平台解析 + 存在性校验 + probe；不做「缺失时源码编译」回退 |
+
+#### P2（远期/条件触发）
+
+| # | 借鉴点 | 来源锚点 | laew 落地建议 |
+|---|---|---|---|
+| P2-1 | **Landlock 沙箱启动器**（自限制后 exec） | native/landlock-run/ 整个家族 | laew Bash 工具若要真沙箱：写一个 ~300 行 C 的 `laew-landlock-run`（或 Rust 直接 `landlock` crate），CLI `--ro/--rw/-- -- cmd`，fail-closed 125。分发包用「entry crate + 平台二进制 crate」矩阵。先 probe（`full/partial/unusable` 三态）再决定降级策略 |
+| P2-2 | **per-file 100% 覆盖率门禁** | docs/testing.md（Coverage gate） | laew `cargo test` 升级为 `cargo llvm-cov --fail-under-lines 100`（对核心模块）。哲学：未覆盖行往往是死代码该删，而非缺测试 |
+| P2-3 | **wasm/静态资产全树打包** | ASSET_GLOBS（build-exe-for-python-sdk.ts:43-64） | laew 若内嵌技能文件/前端资源，学「显式 glob 全清单」而非运行时动态发现——构建可审计、体积可解释 |
+| P2-4 | **pack 工具的可执行位陷阱防护** | packaging.md「Pack gates」 | laew 若走 npm/cargo-binstall 分发，CI 加「打包产物 chmod +x 校验」——pnpm pack 剥可执行位这类坑值得一条专门 gate |
+| P2-5 | **Python wheel 平台标签承载非 Python 二进制** | hatch_build.py:57-98 + platforms.json | laew 若发 Python 绑定 wheel：hatch 自定义 hook 校验二进制集合 + 设 `py3-none-<manylinux_tag>`，pip 自动选平台。Rust 侧 maturin 之外的替代路线 |
+
+#### 优先级判据
+
+P1-1（SDK 互操作层）应排最前：它同时解锁 (a) laew 可被 Python/TS 生态编排（多 Agent 测试、CI 集成）、(b) e2e 从「管道测试」升级为「SDK 驱动的行为测试」、(c) 未来 GUI/Web 前端复用同一协议。且实现成本被 19.1 的样板限制在**协议层 ~600 行**（Python 参考实现可直接翻译成 Rust 的 tokio + serde_json 版本）。
+
+### 19.6 综合：四维度交叉点
+
+四个维度表面离散，实际上被三条共同线索缝合：
+
+**线索 1：边界两侧各自完整、边界上流动的只有平凡数据。**
+- Python ↔ Node：边界 = stdio 行 JSON；两侧各有完整的类型系统（pydantic / TS interface）与错误体系
+- JS ↔ Landlock 二进制：边界 = argv + exit code + 一行 stdout；JS 侧不解析沙箱语义
+- webhook ↔ 平台：边界 = 冻结的 JSON 投递；平台语义留在外部 adapter
+- 录制 ↔ 回放：边界 = session.jsonl；评估器不理解模型内容
+每条边都遵守「**聪明在 seam 层，边界只送平凡字节**」——这是第七轮 18.6 结论在本轮四个新维度的再次验证，可以说 是 deepseek-harness 的第一设计公理。
+
+**线索 2：降级路径必须单一且诚实。**
+- Landlock probe 把「缺二进制」与「内核不执法」故意同化为 unusable（index.ts:39 注释「all indistinguishable on purpose because the consumer's answer is the same」）
+- ABI 部分支持诚实上报 partial，不拒绝也不谎称 full（main.c:281 + cli-contract.md）
+- coverage 门禁认为未覆盖行是死代码；e2e 认为关键词自述不可信
+- shell profile 缺 pwsh 时自跳过（testing.md），但 CI 带 pwsh 的 runner 恢复全量
+**单一降级路径 + 显式部分能力报告**贯穿沙箱、测试、分发三处。
+
+**线索 3：审计面主动收缩。**
+- C 启动器本地定义 UAPI、musl 静态链接、无交叉编译——审计面= 1 文件 + CI job
+- wheel 构建钩子校验二进制集合与清单**完全相等**——多一个文件就是错误
+- staging 拒绝任何残留符号链接
+- 平台矩阵由签入元数据派生，CI workflow 零手写
+这种「**让偏差在构建期爆炸而不是运行期**」的取向，与 laew 当前「运行时尽力而为」的风格形成最强对照，也是 P0-3/P0-5、P2-2 的共同动机。
+
+四维度对 laew 的合并启示一句话：**laew 缺的不是某个功能，而是「边界」——agent 循环、TUI、工具、持久化全部焊死在一个进程一个语言里；把这四个 seam（SDK 协议、评估回放、外部事件、原生沙箱）打出来，每个都能独立演化。**
+
+### 19.7 关键文件路径汇总
+
+| # | 文件（相对 `/usr/local/LsmGitOpenSource/deepseek-harness/`） | 行数 | 本轮角色 |
+|---|---|---|---|
+| 1 | `python/sdk/src/deepseek_harness/client.py` | 590 | Python JSON-RPC 客户端：双线程读泵、按 id 路由、通知订阅、会话树过滤、四步关停 |
+| 2 | `python/sdk/src/deepseek_harness/api.py` | 249 | 高层 DeepSeekHarness/Session API：inbox 回执门槛、idle 终止、事件流即结果 |
+| 3 | `python/sdk/src/deepseek_harness/__init__.py` | 19 | SDK 导出面 |
+| 4 | `python/sdk/src/deepseek_harness/errors.py` | — | JsonRpcError / TransportClosedError / SdkProtocolError 跨语言错误三态 |
+| 5 | `python/sdk/src/deepseek_harness/models.py` | — | pydantic wire 模型（InitializeResponse 等） |
+| 6 | `python/sdk/examples/minimal.py` | 48 | 最小用法：DeepSeekHarness 上下文管理器 + run + final_response |
+| 7 | `python/sdk/pyproject.toml` | 40 | 依赖 pydantic≥2.12 + runtime-bin；uv editable 源 |
+| 8 | `python/sdk-runtime/src/deepseek_harness_runtime/__init__.py` | 179 | 双载体解析（exe/node）、平台 tag 映射、sidecar 三重校验、execvpe 转发 |
+| 9 | `python/sdk-runtime/hatch_build.py` | 99 | wheel hook：平台 manifest 校验 + py3-none-<tag> 标签注入 |
+| 10 | `python/sdk-runtime/platforms.json` | 18 | 4 平台矩阵（linux-x64/arm64、macos-arm64、win-x64）→ wheel tag |
+| 11 | `packages/sdk/protocol/src/transport.ts` | ~200 | Node 侧行分帧 JSON-RPC 端点：StringDecoder 防撕裂、-32601/-32603 |
+| 12 | `packages/sdk/protocol/src/types.ts` | — | wire 类型：InitializeParams/Result、SessionPromptParams、4 通知 |
+| 13 | `packages/sdk/server/src/server.ts` | — | JSON-RPC server 插件（对端实现） |
+| 14 | `packages/test-support/llm-replay/src/index.ts` | ~800 | keyless 回放 Adapter：ReplayEntry 三态（chunks/throw/hang+readyFile）、模型目录声明 |
+| 15 | `packages/test-support/llm-mock-server/src/cli.ts` | 100+ | 故障注入 CLI：--sequence/--listen-delay/--seed/--random-weights |
+| 16 | `packages/test-support/session-snapshot/src/harness.ts` | ~500 | 真实入口子进程 + InputStep 18 种确定性步骤（含 waitForGoalPhase） |
+| 17 | `packages/test-support/session-snapshot/src/{launcher,manifest,normalize,suite,workspace,identity}.ts` | — | 快照套件工厂/清单/归一化/工作区 oracle |
+| 18 | `packages/webhook/webhook/src/types.ts` | ~90 | VerifiedWebhookDelivery / WebhookRule / WebhookSessionRequest / 事件声明合并 |
+| 19 | `packages/webhook/webhook/src/index.ts` | ~150 | WebhookRuntime：fire-and-forget、AbortController、deepFreeze 快照 |
+| 20 | `packages/webhook/webhook/src/session.ts` | ~200 | SessionRequest 强校验（绝对路径/非空/正整数）→ Workspace Session 创建 |
+| 21 | `native/landlock-run/packages/entry/src/main.c` | 298 | Landlock 启动器：本地 UAPI、ABI 协商、fail-closed 125、功能 probe |
+| 22 | `native/landlock-run/packages/entry/src/index.ts` | 127 | JS 契约封装：launcherPath/grantArgs/probe 三函数、零环境变量 |
+| 23 | `native/landlock-run/docs/cli-contract.md` | ~40 | CLI 契约：语法/退出码/报告行/限制语义 |
+| 24 | `native/landlock-run/docs/architecture.md` | ~40 | entry+平台包两层家族、fail-closed、native-only 构建 |
+| 25 | `native/landlock-run/docs/packaging.md` | ~45 | 分发矩阵、无 install 回退、npm/pnpm pack 分裂 |
+| 26 | `native/landlock-run/scripts/build.ts` | ~60 | musl-gcc 静态构建、prebuilds.json 矩阵驱动 |
+| 27 | `scripts/build-exe-for-python-sdk.ts` | 626 | pkg --sea 单文件 exe：ASSET_GLOBS、去符号链接、rg/spawn-helper sidecar |
+| 28 | `scripts/build-exe-for-python-sdk-native-pty.ts` | — | node-pty 原生 addon 的平台解析/装载 |
+| 29 | `docs/testing.md` | ~60 | 六层测试策略：世界断言/mock 最小化/with-key 哲学 |
+| 30 | `snapshots/AGENTS.md` | 16 | 录制会话纪律：归一化不动点、workspace.expected 独立 oracle |
+| 31 | `BENCHMARK.md` | 2 | 指向 python-sdk jsonrpc-agent 变体（无独立模型 eval） |
+
+### 19.8 本轮不重复声明
+
+本轮（第八轮）为 deepseek-harness 调研的追加章节，**以下前七轮已覆盖内容本轮不再展开**：
+
+- **第一~四轮**：Cordis 插件体系 / Fiber epoch / Typert 协议 / ACP·A2A 协议矩阵 / 决策溯源 / 30+ 包总览 —— 未重复
+- **第五轮**：中断取消与后台任务、工具结果回填与消息组装 —— 未重复
+- **第六轮（第 17 章）**：Goal 域模型与状态机（含 waitForGoalPhase 的服务端语义）、Workflow ralph、SubAgent 11 包、Hook 系统、Lane 调度 —— 本轮仅在 19.2.3 提及 harness 的 `waitForGoalPhase` 作为**评估锚点**视角（消费端），未重复 Goal 状态机本体
+- **第七轮（第 18 章）**：结构化输出与 Schema 校验 / Prompt Caching 与 TokenMeter / Web 检索 SSRF / 文件编辑与 version CAS —— 未重复。第七轮 18.5.4 的 P0/P1/P2 表与本轮 19.5 表**条目互不重叠**（第七轮聚焦工具层语义，本轮聚焦进程/分发/评估/集成边界）
+- **第六轮协议专题**（`专题-第六轮-Anthropic与OpenAI协议调用真实实现深度对比.md`）覆盖的 L1-L15 漏点 —— 本轮未再列协议层 gap
+
+**本轮新增（前七轮从未出现）的内容**：python/ 目录与 Python SDK/runtime 全部、native/ 目录与 landlock-run 全部、packages/test-support/ 的 llm-replay/llm-mock-server/session-snapshot/agent-loop-testkit、packages/webhook/、packages/sdk/（protocol/client/server）、scripts/build-exe-for-python-sdk*、snapshots/AGENTS.md 纪律、docs/testing.md 六层策略、BENCHMARK.md 的诚实空缺。
+
+**已核实的不存在项**（避免后续轮次误挖）：
+- 无 PyO3 / napi-rs / FFI 内存级 binding（跨语言全部走 stdio JSON-RPC）
+- 无飞书/钉钉/Slack/企业微信/Discord/Telegram 任何平台集成（webhook 层 provider-neutral，事件 Map 为空待外部声明合并）
+- 无独立模型质量 eval（无 pass@k / LLM-judge / A/B 框架）；BENCHMARK.md 仅 2 行指向 SDK 用法
+- native/ 无 Rust 源码（landlock-run 是 C11 + 静态 musl；Rust 仅存在于 laew 自身与生态建议）
+
+### 19.9 本轮小结
+
+第八轮挖出了 deepseek-harness 的「**外延四件套**」—— 它们共同回答「一个 TypeScript harness 如何长出 Python 生态、评估基建、外部事件入口与操作系统级沙箱」：
+
+1. **跨语言互操作**：拒绝 FFI，用 stdio 行 JSON-RPC + 双载体（单文件 exe / 源码 node）+ 平台 wheel 标签，把 Node 二进制装进 pip 生态；客户端侧自建会话树订阅与四步关停握手
+2. **Evals**：评估即测试金字塔的 snapshot 层 —— 录制 session.jsonl 是归一化不动点，回放是 keyless Adapter，工作区终态是独立 oracle，「世界断言」压倒「自述断言」；故障注入靠可复现（--seed）的行为序列 mock
+3. **多平台适配**：以 provider-neutral webhook 层（冻结投递 + 受信 rule + 唯一动作=建 Session）替代任何平台 SDK，平台差异外置到 adapter 包
+4. **Native 模块**：298 行 C11 的 Landlock 启动器（本地 UAPI / ABI 协商 / fail-closed / 功能 probe）+ entry/平台包分发矩阵（prebuilds.json 驱动、无 install 回退、npm/pnpm pack 分裂）
+
+对 laew 的第一优先级借鉴是 **P1-1 SDK 协议层**：它把 laew 从「单体 CLI」升级为「可被编排的 Agent 运行时」，且 Python 参考实现（client.py 590 行 + api.py 249 行）给出了可直接翻译的协议样板。第二优先级是 **P1-3 录制-回放 e2e**：laew 的 SQLite 事件存储已经是事实上的 session.jsonl，只差一个「回放 Adapter + 期望比对器」就能从 mock 管道测试升级为行为回归评估。

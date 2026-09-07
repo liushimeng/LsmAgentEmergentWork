@@ -5629,3 +5629,2127 @@ are_unsandboxed_commands_allowed: SandboxManager.areUnsandboxedCommandsAllowed()
 
 10. **readFileState `offset: undefined` 标记**是 dedup 防误命中的关键 — Edit/Write 写入时显式设 undefined,Read dedup 只命中真实 Read。
 
+
+
+## 21. 第八轮深挖 — Bridge远程控制 + Skill一等公民 + i18n国际化 + Release工程化（2026-09-07）
+
+第八轮聚焦四个**前七轮未覆盖**的新维度，全部给出真实代码路径 + 行号 + 关键片段，并附 laew 的 P0/P1/P2 借鉴路线图。本轮明确**不重复声明**：Edit 工具、NotebookEdit、Glob/Grep、Multimodal、Prompt Caching、Cost Tracker、Sandbox、Hook 系统、MCP、子 Agent 编排、四级压缩管线、27 种 Hook、40+ 工具统一抽象、Ink Fork 渲染、协议 wire 等（详见 21.8）。
+
+### 21.1 Bridge 远程控制 / Remote Control / IDE 集成
+
+Claude Code 的 **Bridge（远程控制）** 是把"本地终端的 Claude 进程"暴露为"可在 claude.ai 网页/IDE 远程驱动"的服务端通道。它由两套并行实现组成：
+
+- **v1（env-based）REPL Bridge** — 经典实现，OAuth 鉴权，WebSocket 反向连接。
+- **v2（env-less）CCR Bridge** — 新一代，JWT 鉴权，SSE 拉模式 + CCRClient 推模式。
+
+#### 21.1.1 模块拓扑与文件总览
+
+```
+src/bridge/                              # 2999+3000+1500+... 行（核心实现）
+├── types.ts                  262   # BridgeConfig/WorkResponse/WorkSecret/BridgeApiClient/SessionHandle 等协议类型
+├── bridgeApi.ts              539   # /v1/environments/* HTTP 客户端 + OAuth 401 retry + BridgeFatalError
+├── bridgeConfig.ts            48   # CLAUDE_BRIDGE_OAUTH_TOKEN / CLAUDE_BRIDGE_BASE_URL ant-only 覆写
+├── bridgeEnabled.ts          203   # feature('BRIDGE_MODE') 闸门 + 3 个 GrowthBook gate + 4 个诊断
+├── bridgeMain.ts            2999   # standalone `claude remote-control` 模式 主循环（多 session 编排）
+├── initReplBridge.ts         569   # REPL 启动期注入（带 bootstrap state 读 OAuth/cwd/sessionId）
+├── replBridge.ts            2406   # initBridgeCore —— 启动→register→poll→ingress→teardown 5 阶段
+├── replBridgeTransport.ts    370   # v1=HybridTransport / v2=SSETransport+CCRClient 适配器
+├── pollConfig.ts             110   # Zod 校验 + GrowthBook 5min refresh 的 7 字段 poll config
+├── pollConfigDefaults.ts      82   # 默认 2s/10min/60s heartbeat/2min keepalive
+├── jwtUtils.ts               256   # decodeJwtPayload + TOKEN_REFRESH_BUFFER_MS=5min + MAX_REFRESH_FAILURES=3
+├── workSecret.ts             127   # session_ingress_token + api_base_url + sources + claude_code_args
+├── sessionRunner.ts          550   # 子进程 spawn + env 注入（CCR v2 = SSE transport + CCRClient）
+├── sessionIdCompat.ts         57   # cse_* ↔ session_* 客户端 retag shim（tengu_bridge_repl_v2_cse_shim_enabled）
+├── trustedDevice.ts          210   # X-Trusted-Device-Token + SecurityTier=ELEVATED + JWT 颁发期校验
+├── bridgePointer.ts          ?    # 崩溃恢复指针（repl vs standalone 区分）
+├── bridgeDebug.ts            ?    # ant-only 故障注入（poll/register/heartbeat 失败模拟）
+├── flushGate.ts              71   # writeMessages 批门控（防止 duplicate UUID 毒化 server）
+├── inboundMessages.ts        80   # 服务端 → 客户端 入口消息分类
+├── inboundAttachments.ts    175   # 上传附件落地（多模态远程附件）
+├── bridgeMessaging.ts       ?    # handleIngressMessage + handleServerControlRequest + BoundedUUIDSet
+├── bridgePermissionCallbacks.ts ? # 权限响应的回调桥
+├── bridgeStatusUtil.ts      ?    # 状态栏工具（duration 格式、idle status 文本）
+├── bridgeUI.ts              ?    # createBridgeLogger —— banner/QR code/状态行
+├── capacityWake.ts          ?    # at-capacity 早醒信号（onSessionDone → 立即 poll）
+├── debugUtils.ts            141   # describeAxiosError + extractHttpStatus + logBridgeSkip
+├── envLessBridgeConfig.ts   165   # v2 路径的 min_version 校验
+├── createSession.ts         384   # POST /v1/sessions + git source/outcome 注入
+├── sessionIdCompat.ts        57   # see above
+└── workSecret.ts            127   # see above
+
+src/remote/                             # 反向视角：claude.ai 端订阅 session
+├── RemoteSessionManager.ts   343   # 订阅 + 发消息 + 权限请求/响应 协调
+├── SessionsWebSocket.ts      404   # WS 客户端 + 重连退避
+├── sdkMessageAdapter.ts      302   # 内部 Message[] ↔ SDKMessage[] 适配
+└── remotePermissionBridge.ts  78   # 权限响应回填
+
+总计：bridge 域约 12,613 行，remote 域约 1,127 行
+```
+
+#### 21.1.2 三种运行模式与核心协议
+
+`src/bridge/types.ts:69-79` 定义 `SpawnMode`：
+
+```ts
+export type SpawnMode = 'single-session' | 'worktree' | 'same-dir'
+/**
+ * - single-session: 单 session，session 结束 bridge 拆
+ * - worktree: 持久 server，每个 session 一个 git worktree 隔离
+ * - same-dir: 持久 server，所有 session 共享 cwd（可能相互踩踏）
+ */
+```
+
+`src/bridge/types.ts:1-50` 是核心常量与类型：
+
+```ts
+/** Default per-session timeout (24 hours). */
+export const DEFAULT_SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000
+
+/** Reusable login guidance appended to bridge auth errors. */
+export const BRIDGE_LOGIN_INSTRUCTION =
+  'Remote Control is only available with claude.ai subscriptions. Please use `/login` to sign in with your claude.ai account.'
+
+export type WorkData = {
+  type: 'session' | 'healthcheck'
+  id: string
+}
+
+export type WorkResponse = {
+  id: string
+  type: 'work'
+  environment_id: string
+  state: string
+  data: WorkData
+  secret: string // base64url-encoded JSON
+  created_at: string
+}
+```
+
+`WorkSecret`（`types.ts:33-51`）是**反向鉴权的核心载荷**，由 server 签名后下发：
+
+```ts
+export type WorkSecret = {
+  version: number
+  session_ingress_token: string   // JWT, 用作 v2 反向连接凭证
+  api_base_url: string             // server API 入口
+  sources: Array<{                  // 1) git 源（自动 clone/repo）
+    type: string
+    git_info?: { type: string; repo: string; ref?: string; token?: string }
+  }>
+  auth: Array<{ type: string; token: string }>  // 2) bearer auth
+  claude_code_args?: Record<string, string> | null  // 3) CLI 参数注入
+  mcp_config?: unknown | null                      // 4) MCP server 注入
+  environment_variables?: Record<string, string> | null
+  /** Server-driven CCR v2 selector. */
+  use_code_sessions?: boolean
+}
+```
+
+`BridgeConfig`（`types.ts:81-115`）包含所有注册期需要的客户端状态：
+
+```ts
+export type BridgeConfig = {
+  dir: string
+  machineName: string
+  branch: string
+  gitRepoUrl: string | null
+  maxSessions: number            // 由 max_sessions 字段透传到 server 决定 picker 灰显
+  spawnMode: SpawnMode
+  verbose: boolean
+  sandbox: boolean
+  /** Client-generated UUID identifying this bridge instance. */
+  bridgeId: string
+  /**
+   * Sent as metadata.worker_type so web clients can filter by origin.
+   * Backend treats as opaque — any string, not just BridgeWorkerType.
+   */
+  workerType: string
+  /** Client-generated UUID for idempotent environment registration. */
+  environmentId: string
+  /**
+   * Backend-issued environment_id to reuse on re-register. When set, the
+   * backend treats registration as a reconnect to the existing environment
+   * instead of creating a new one. Used by `claude remote-control
+   * --session-id` resume. Must be a backend-format ID — client UUIDs are
+   * rejected with 400.
+   */
+  reuseEnvironmentId?: string
+  /** API base URL the bridge is connected to (used for polling). */
+  apiBaseUrl: string
+  /** Session ingress base URL for WebSocket connections (may differ from apiBaseUrl locally). */
+  sessionIngressUrl: string
+  /** Per-session timeout in milliseconds. Sessions exceeding this are killed. */
+  sessionTimeoutMs?: number
+}
+```
+
+#### 21.1.3 Bridge 启动 5 阶段编排（replBridge.ts）
+
+`replBridge.ts:260-296` 的 `initBridgeCore` 是**REPL 启动期的入口**，接收显式参数（由 `initReplBridge` 从 bootstrap state 读 OAuth/cwd/sessionId/git/title 后注入）：
+
+```ts
+export async function initBridgeCore(
+  params: BridgeCoreParams,
+): Promise<BridgeCoreHandle | null> {
+  const {
+    dir, machineName, branch, gitRepoUrl, title,
+    baseUrl, sessionIngressUrl, workerType,
+    getAccessToken, createSession, archiveSession,
+    getCurrentTitle = () => title,
+    toSDKMessages = () => { throw new Error(...) },
+    onAuth401, getPollIntervalConfig = () => DEFAULT_POLL_CONFIG,
+    initialHistoryCap = 200, initialMessages, previouslyFlushedUUIDs,
+    onInboundMessage, onPermissionResponse, onInterrupt,
+    onSetModel, onSetMaxThinkingTokens, onSetPermissionMode,
+    onStateChange, onUserMessage, perpetual, initialSSESequenceNum = 0,
+  } = params
+```
+
+`replBridge.ts:298-348` 启动 5 阶段：
+
+```ts
+const seq = ++initSequence
+
+// bridgePointer import hoisted: perpetual mode reads it before register;
+// non-perpetual writes it after session create; both use clear at teardown.
+const { writeBridgePointer, clearBridgePointer, readBridgePointer } =
+  await import('./bridgePointer.js')
+
+// Perpetual mode: read the crash-recovery pointer and treat it as prior
+// state. The pointer is written unconditionally after session create
+// (crash-recovery for all sessions); perpetual mode just skips the
+// teardown clear so it survives clean exits too. Only reuse 'repl'
+// pointers — a crashed standalone bridge (`claude remote-control`)
+// writes source:'standalone' with a different workerType.
+const rawPrior = perpetual ? await readBridgePointer(dir) : null
+const prior = rawPrior?.source === 'repl' ? rawPrior : null
+
+// 5. Register bridge environment
+const rawApi = createBridgeApiClient({
+  baseUrl, getAccessToken, runnerVersion: MACRO.VERSION,
+  onDebug: logForDebugging, onAuth401, getTrustedDeviceToken,
+})
+// Ant-only: interpose so /bridge-kick can inject poll/register/heartbeat
+// failures. Zero cost in external builds (rawApi passes through unchanged).
+const api =
+  process.env.USER_TYPE === 'ant' ? wrapApiForFaultInjection(rawApi) : rawApi
+
+const bridgeConfig: BridgeConfig = {
+  dir, machineName, branch, gitRepoUrl,
+  maxSessions: 1, spawnMode: 'single-session',
+  verbose: false, sandbox: false,
+  bridgeId: randomUUID(), workerType, environmentId: randomUUID(),
+  reuseEnvironmentId: prior?.environmentId,
+  apiBaseUrl: baseUrl, sessionIngressUrl,
+}
+```
+
+#### 21.1.4 OAuth 401 Refresh 重试
+
+`bridgeApi.ts:99-139` 的 `withOAuthRetry` 是**反向鉴权下，唯一可恢复的失败处理**：
+
+```ts
+async function withOAuthRetry<T>(
+  fn: (accessToken: string) => Promise<{ status: number; data: T }>,
+  context: string,
+): Promise<{ status: number; data: T }> {
+  const accessToken = resolveAuth()
+  const response = await fn(accessToken)
+
+  if (response.status !== 401) {
+    return response
+  }
+
+  if (!deps.onAuth401) {
+    debug(`[bridge:api] ${context}: 401 received, no refresh handler`)
+    return response
+  }
+
+  // Attempt token refresh — matches the pattern in withRetry.ts
+  debug(`[bridge:api] ${context}: 401 received, attempting token refresh`)
+  const refreshed = await deps.onAuth401(accessToken)
+  if (refreshed) {
+    debug(`[bridge:api] ${context}: Token refreshed, retrying request`)
+    const newToken = resolveAuth()
+    const retryResponse = await fn(newToken)
+    if (retryResponse.status !== 401) {
+      return retryResponse
+    }
+    debug(`[bridge:api] ${context}: Retry after refresh also got 401`)
+  } else {
+    debug(`[bridge:api] ${context}: Token refresh failed`)
+  }
+  return response
+}
+```
+
+注释（`bridgeApi.ts:18-26`）点出了**关键设计决策**：
+
+> `onAuth401?: (staleAccessToken: string) => Promise<boolean>` — Called on 401 to attempt OAuth token refresh. Returns true if refreshed, in which case the request is retried once. Injected because `handleOAuth401Error` from `utils/auth.ts` transitively pulls in `config.ts → file.ts → permissions/filesystem.ts → sessionStorage.ts → commands.ts` (~1300 modules). Daemon callers using env-var tokens omit this — their tokens don't refresh, so 401 goes straight to `BridgeFatalError`.
+
+#### 21.1.5 错误状态码 → 业务异常映射
+
+`bridgeApi.ts:454-509` 把 HTTP 状态码翻译成可操作的 `BridgeFatalError`：
+
+```ts
+function handleErrorStatus(
+  status: number, data: unknown, context: string,
+): void {
+  if (status === 200 || status === 204) return
+  const detail = extractErrorDetail(data)
+  const errorType = extractErrorTypeFromData(data)
+  switch (status) {
+    case 401:
+      throw new BridgeFatalError(
+        `${context}: Authentication failed (401)${detail ? `: ${detail}` : ''}. ${BRIDGE_LOGIN_INSTRUCTION}`,
+        401, errorType,
+      )
+    case 403:
+      throw new BridgeFatalError(
+        isExpiredErrorType(errorType)
+          ? 'Remote Control session has expired. Please restart with `claude remote-control` or /remote-control.'
+          : `${context}: Access denied (403)${detail ? `: ${detail}` : ''}. Check your organization permissions.`,
+        403, errorType,
+      )
+    case 404:
+      throw new BridgeFatalError(
+        detail ??
+          `${context}: Not found (404). Remote Control may not be available for this organization.`,
+        404,
+      )
+    case 410:  // environment_expired
+      throw new BridgeFatalError(
+        detail ?? 'Remote Control session has expired. Please restart with `claude remote-control` or /remote-control.',
+        410, errorType ?? 'environment_expired',
+      )
+    case 429:
+      throw new Error(`${context}: Rate limited (429). Polling too frequently.`)
+    default:
+      throw new Error(`${context}: Failed with status ${status}${detail ? `: ${detail}` : ''}`)
+  }
+}
+```
+
+#### 21.1.6 路径遍历防御
+
+`bridgeApi.ts:40-53`：
+
+```ts
+/** Allowlist pattern for server-provided IDs used in URL path segments. */
+const SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/
+
+export function validateBridgeId(id: string, label: string): string {
+  if (!id || !SAFE_ID_PATTERN.test(id)) {
+    throw new Error(`Invalid ${label}: contains unsafe characters`)
+  }
+  return id
+}
+```
+
+这是 **laew 应该照搬的最简 SSRF/path 注入防御**：服务端给的 ID 只允许 `[a-zA-Z0-9_-]`，避免 `../admin` / 注入斜杠 / 注入点号。
+
+#### 21.1.7 v1 vs v2 传输适配
+
+`replBridgeTransport.ts:22-70` 的 `ReplBridgeTransport` 接口**只暴露 replBridge.ts 用到的最小 surface**，把 v1/v2 差异限制在构造点：
+
+```ts
+export type ReplBridgeTransport = {
+  write(message: StdoutMessage): Promise<void>
+  writeBatch(messages: StdoutMessage[]): Promise<void>
+  close(): void
+  isConnectedStatus(): boolean
+  getStateLabel(): string
+  setOnData(callback: (data: string) => void): void
+  setOnClose(callback: (closeCode?: number) => void): void
+  setOnConnect(callback: () => void): void
+  connect(): void
+  /** High-water mark of the underlying read stream's event sequence numbers. */
+  getLastSequenceNum(): number
+  /** Monotonic count of batches dropped via maxConsecutiveFailures. */
+  readonly droppedBatchCount: number
+  /** PUT /worker state (v2 only; v1 is a no-op). */
+  reportState(state: SessionState): void
+  /** PUT /worker external_metadata (v2 only; v1 is a no-op). */
+  reportMetadata(metadata: Record<string, unknown>): void
+  /** POST /worker/events/{id}/delivery (v2 only; v1 is a no-op). */
+  reportDelivery(eventId: string, status: 'processing' | 'processed'): void
+  /** Drain the write queue before close() (v2 only; v1 resolves immediately). */
+  flush(): Promise<void>
+}
+```
+
+`replBridgeTransport.ts:78-103` 的 v1 适配器本质是 no-op wrapper：
+
+```ts
+export function createV1ReplTransport(
+  hybrid: HybridTransport,
+): ReplBridgeTransport {
+  return {
+    write: msg => hybrid.write(msg),
+    writeBatch: msgs => hybrid.writeBatch(msgs),
+    close: () => hybrid.close(),
+    // v1 Session-Ingress WS doesn't use SSE sequence numbers; replay
+    // semantics are different. Always return 0 so the seq-num carryover
+    // logic in replBridge is a no-op for v1.
+    getLastSequenceNum: () => 0,
+    get droppedBatchCount() { return hybrid.droppedBatchCount },
+    reportState: () => {},       // v1 no-op
+    reportMetadata: () => {},    // v1 no-op
+    reportDelivery: () => {},    // v1 no-op
+    flush: () => Promise.resolve(),
+  }
+}
+```
+
+`replBridgeTransport.ts:107-148` 的 v2 适配器注释点出**鉴权差异**：
+
+> Auth: v2 endpoints validate the JWT's `session_id` claim (`register_worker.go:32`) and worker role (`environment_auth.py:856`). OAuth tokens have neither. This is the inverse of the v1 replBridge path, which deliberately uses OAuth. The JWT is refreshed when the poll loop re-dispatches work — the caller invokes `createV2ReplTransport` again with the fresh token.
+
+#### 21.1.8 闸门系统与诊断信息
+
+`bridgeEnabled.ts:28-87` 是 **Bridge 模式 4 个开关**：
+
+```ts
+export function isBridgeEnabled(): boolean {
+  return feature('BRIDGE_MODE')                           // 编译期开关
+    ? isClaudeAISubscriber() &&                          // OAuth 订阅
+        getFeatureValue_CACHED_MAY_BE_STALE('tengu_ccr_bridge', false)  // GrowthBook gate
+    : false
+}
+
+export async function isBridgeEnabledBlocking(): Promise<boolean> {
+  return feature('BRIDGE_MODE')
+    ? isClaudeAISubscriber() &&
+        (await checkGate_CACHED_OR_BLOCKING('tengu_ccr_bridge'))
+    : false
+}
+
+export async function getBridgeDisabledReason(): Promise<string | null> {
+  if (feature('BRIDGE_MODE')) {
+    if (!isClaudeAISubscriber()) {
+      return 'Remote Control requires a claude.ai subscription. Run `claude auth login` to sign in with your claude.ai account.'
+    }
+    if (!hasProfileScope()) {
+      return 'Remote Control requires a full-scope login token. Long-lived tokens (from `claude setup-token` or CLAUDE_CODE_OAUTH_TOKEN) are limited to inference-only for security reasons. Run `claude auth login` to use Remote Control.'
+    }
+    if (!getOauthAccountInfo()?.organizationUuid) {
+      return 'Unable to determine your organization for Remote Control eligibility. Run `claude auth login` to refresh your account information.'
+    }
+    if (!(await checkGate_CACHED_OR_BLOCKING('tengu_ccr_bridge'))) {
+      return 'Remote Control is not yet enabled for your account.'
+    }
+    return null
+  }
+  return 'Remote Control is not available in this build.'
+}
+```
+
+`bridgeEnabled.ts:126-202` 还有 `isEnvLessBridgeEnabled`（v2 gate）/ `isCseShimEnabled`（cse_ shim kill-switch）/ `isCcrMirrorEnabled`（CCR 镜像模式，单向外推）三个独立 gate。
+
+#### 21.1.9 Poll 退避 + Heartbeat 心跳
+
+`pollConfigDefaults.ts:13-30`：
+
+```ts
+const POLL_INTERVAL_MS_NOT_AT_CAPACITY = 2000  // 2s seek-work
+const POLL_INTERVAL_MS_AT_CAPACITY = 600_000   // 10min at-capacity liveness
+```
+
+`pollConfig.ts:25-92` 用 Zod 校验 GrowthBook 下发的 7 字段配置：
+
+```ts
+const pollIntervalConfigSchema = lazySchema(() =>
+  z
+    .object({
+      poll_interval_ms_not_at_capacity: z.number().int().min(100),
+      // 0 = no at-capacity polling. Independent of heartbeat — both can be
+      // enabled (heartbeat runs, periodically breaks out to poll).
+      poll_interval_ms_at_capacity: z
+        .number()
+        .int()
+        .refine(v => v === 0 || v >= 100, zeroOrAtLeast100),
+      // 0 = disabled; positive value = heartbeat at this interval while at
+      // capacity. Runs alongside at-capacity polling, not instead of it.
+      // Named non_exclusive to distinguish from the old heartbeat_interval_ms
+      // (either-or semantics in pre-#22145 clients).
+      non_exclusive_heartbeat_interval_ms: z.number().int().min(0).default(0),
+      // ... 多 session 三档 ...
+      multisession_poll_interval_ms_not_at_capacity: z.number().int().min(100)...
+      multisession_poll_interval_ms_partial_capacity: z.number().int().min(100)...
+      multisession_poll_interval_ms_at_capacity: z.number().int().refine(...)...
+      // .min(1) matches the server's ge=1 constraint (work_v1.py:230).
+      reclaim_older_than_ms: z.number().int().min(1).default(5000),
+      session_keepalive_interval_v2_ms: z.number().int().min(0).default(120_000),
+    })
+    .refine(cfg =>
+      cfg.non_exclusive_heartbeat_interval_ms > 0 ||
+      cfg.poll_interval_ms_at_capacity > 0, {
+      message: 'at-capacity liveness requires non_exclusive_heartbeat_interval_ms > 0 or poll_interval_ms_at_capacity > 0',
+    })
+)
+```
+
+关键设计（`pollConfig.ts:7-23` 注释）：
+
+- `0` 表示"disabled"，不是"立即轮询"（避免 ops 把秒当成毫秒输入 `10` 造成 10ms 紧循环击穿 `VerifyEnvironmentSecretAuth` DB 路径）。
+- 至少一个 at-capacity 活性机制（heartbeat OR poll）必须开启，否则 `.refine()` 拒绝整个 config。
+
+#### 21.1.10 JWT Token 刷新调度
+
+`jwtUtils.ts:51-71`：
+
+```ts
+/** Refresh buffer: request a new token before expiry. */
+const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000
+/** Fallback refresh interval when the new token's expiry is unknown. */
+const FALLBACK_REFRESH_INTERVAL_MS = 30 * 60 * 1000 // 30 minutes
+/** Max consecutive failures before giving up on the refresh chain. */
+const MAX_REFRESH_FAILURES = 3
+/** Retry delay when getAccessToken returns undefined. */
+const REFRESH_RETRY_DELAY_MS = 60_000
+
+export function createTokenRefreshScheduler({...}) {...}
+```
+
+`decodeJwtPayload`（`jwtUtils.ts:21-32`）注释点出：
+
+> Strips the `sk-ant-si-` session-ingress prefix if present. Returns the parsed JSON payload as `unknown`, or `null` if the token is malformed or the payload is not valid JSON.
+
+#### 21.1.11 跨进程 OAuth 死信退避
+
+`initReplBridge.ts:166-198` 是一个**反直觉但正确**的设计：避免一个过期 token 反复被多进程重试：
+
+```ts
+if (!getBridgeTokenOverride()) {
+  // 2a. Cross-process backoff. If N prior processes already saw this exact
+  // dead token (matched by expiresAt), skip silently — no event, no refresh
+  // attempt. The count threshold tolerates transient refresh failures (auth
+  // server 5xx, lockfile errors per auth.ts:1437/1444/1485): each process
+  // independently retries until 3 consecutive failures prove the token dead.
+  // Mirrors useReplBridge's MAX_CONSECUTIVE_INIT_FAILURES for in-process.
+  // The expiresAt key is content-addressed: /login → new token → new expiresAt
+  // → this stops matching without any explicit clear.
+  const cfg = getGlobalConfig()
+  if (
+    cfg.bridgeOauthDeadExpiresAt != null &&
+    (cfg.bridgeOauthDeadFailCount ?? 0) >= 3 &&
+    getClaudeAIOAuthTokens()?.expiresAt === cfg.bridgeOauthDeadExpiresAt
+  ) {
+    logForDebugging(`[bridge:repl] Skipping: cross-process backoff (dead token seen ${cfg.bridgeOauthDeadFailCount} times)`)
+    return null
+  }
+  // 2b. Proactively refresh if expired. Mirrors bridgeMain.ts:2096
+}
+```
+
+#### 21.1.12 客户端崩溃恢复（bridgePointer）
+
+`replBridge.ts:302-316` 注释：
+
+> `bridgePointer` import hoisted: perpetual mode reads it before register; non-perpetual writes it after session create; both use clear at teardown.
+>
+> Perpetual mode: read the crash-recovery pointer and treat it as prior state. The pointer is written unconditionally after session create (crash-recovery for all sessions); perpetual mode just skips the teardown clear so it survives clean exits too. Only reuse `repl` pointers — a crashed standalone bridge (`claude remote-control`) writes `source:'standalone'` with a different `workerType`.
+
+#### 21.1.13 Trusted Device Token
+
+`trustedDevice.ts`（210 行）+ `bridgeApi.ts:27-36` 注释：
+
+> `X-Trusted-Device-Token` on bridge API calls. Bridge sessions have `SecurityTier=ELEVATED` on the server (CCR v2); when the server's enforcement flag is on, `ConnectBridgeWorker` requires a trusted device at JWT-issuance. Optional — when absent or returning undefined, the header is omitted and the server falls through to its flag-off/no-op path. The CLI-side gate is `tengu_sessions_elevated_auth_enforcement`.
+
+#### 21.1.14 多 Session 编排（bridgeMain.ts 核心循环）
+
+`bridgeMain.ts:141-249` 的 `runBridgeLoop` 是**standalone `claude remote-control` 模式**的主循环（多 session 编排）：
+
+```ts
+export async function runBridgeLoop(
+  config: BridgeConfig,
+  environmentId: string, environmentSecret: string,
+  api: BridgeApiClient, spawner: SessionSpawner,
+  logger: BridgeLogger, signal: AbortSignal,
+  backoffConfig: BackoffConfig = DEFAULT_BACKOFF,
+  initialSessionId?: string,
+  getAccessToken?: () => string | undefined | Promise<string | undefined>,
+): Promise<void> {
+  // Local abort controller so that onSessionDone can stop the poll loop.
+  const controller = new AbortController()
+  if (signal.aborted) controller.abort()
+  else signal.addEventListener('abort', () => controller.abort(), { once: true })
+  const loopSignal = controller.signal
+
+  const activeSessions = new Map<string, SessionHandle>()
+  const sessionStartTimes = new Map<string, number>()
+  const sessionWorkIds = new Map<string, string>()
+  // Compat-surface ID (session_*) computed once at spawn and cached so
+  // cleanup and status-update ticks use the same key regardless of whether
+  // the tengu_bridge_repl_v2_cse_shim_enabled gate flips mid-session.
+  const sessionCompatIds = new Map<string, string>()
+  // Session ingress JWTs for heartbeat auth, keyed by sessionId.
+  // Stored separately from handle.accessToken because the token refresh
+  // scheduler overwrites that field with the OAuth token (~3h55m in).
+  const sessionIngressTokens = new Map<string, string>()
+  const sessionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const completedWorkIds = new Set<string>()
+  const sessionWorktrees = new Map<string, {
+    worktreePath: string
+    worktreeBranch?: string
+    gitRoot?: string
+    hookBased?: boolean
+  }>()
+  // Track sessions killed by the timeout watchdog so onSessionDone can
+  // distinguish them from server-initiated or shutdown interrupts.
+  const timedOutSessions = new Set<string>()
+  // Signal to wake the at-capacity sleep early when a session completes,
+  // so the bridge can immediately accept new work.
+  const capacityWake = createCapacityWake(loopSignal)
+```
+
+`bridgeMain.ts:59-79` 默认退避配置：
+
+```ts
+const DEFAULT_BACKOFF: BackoffConfig = {
+  connInitialMs: 2_000,
+  connCapMs: 120_000,      // 2 minutes
+  connGiveUpMs: 600_000,   // 10 minutes
+  generalInitialMs: 500,
+  generalCapMs: 30_000,
+  generalGiveUpMs: 600_000,
+}
+```
+
+#### 21.1.15 OnSessionDone 三态区分
+
+`bridgeMain.ts:186-188` 用 `timedOutSessions: Set<string>` 区分三种 session 结束原因（watchdog 杀 / server 端中断 / 用户 shutdown），让 `onSessionDone` 回调能基于此走不同清理路径。
+
+#### 21.1.16 `claude remote-control` ↔ `/remote-control` 兼容
+
+`replBridge.ts:69-82`：
+
+```ts
+export type ReplBridgeHandle = {
+  bridgeSessionId: string
+  environmentId: string
+  sessionIngressUrl: string
+  writeMessages(messages: Message[]): void
+  writeSdkMessages(messages: SDKMessage[]): void
+  sendControlRequest(request: SDKControlRequest): void
+  sendControlResponse(response: SDKControlResponse): void
+  sendControlCancelRequest(requestId: string): void
+  sendResult(): void
+  teardown(): Promise<void>
+}
+```
+
+7 个方法覆盖了**REPL 桥的所有交互面**。`sendControlRequest`（client → server 的中断/工具决策等控制请求）和 `sendControlResponse`（server → client 的请求的响应）是 SDK 协议的双工设计。
+
+#### 21.1.17 Remote Session 视角（订阅方）
+
+`src/remote/RemoteSessionManager.ts:95-103`：
+
+```ts
+export class RemoteSessionManager {
+  private websocket: SessionsWebSocket | null = null
+  private pendingPermissionRequests: Map<string, SDKControlPermissionRequest> =
+    new Map()
+
+  constructor(
+    private readonly config: RemoteSessionConfig,
+    private readonly callbacks: RemoteSessionCallbacks,
+  ) {}
+```
+
+`RemoteSessionManager` 是**从 claude.ai / IDE 端订阅远端 session** 的反向类（与 bridge 端对应）。`viewerOnly: boolean`（`RemoteSessionManager.ts:60-62`）标记纯查看模式：
+
+> When true, this client is a pure viewer. Ctrl+C/Escape do NOT send interrupt to the remote agent; 60s reconnect timeout is disabled; session title is never updated. Used by `claude assistant`.
+
+#### 21.1.18 Bridge 决策审计
+
+| 决策点 | 关键文件 | 行号 | 设计价值 |
+|--------|----------|------|---------|
+| 模式闸门 | `bridgeEnabled.ts:28-87` | 4 段 | feature flag × OAuth × GB gate × profile scope |
+| 鉴权区分 | `bridgeEnabled.ts:94-99` | 3 段 | OAuth/Console/apiKey/setup-token 各自不同入口 |
+| 错误映射 | `bridgeApi.ts:454-499` | 7 个 status | 401/403/404/410/429 全部 human-readable |
+| ID 白名单 | `bridgeApi.ts:40-53` | 1 段 | 13 字符 SSRF 防御 |
+| OAuth retry | `bridgeApi.ts:99-139` | 41 行 | 单次 refresh + 单次 retry |
+| 路径注入 | `bridgeApi.ts:84-88` | X-Trusted-Device-Token | 服务端 SecurityTier=ELEVATED 凭证 |
+| 5min refresh | `jwtUtils.ts:52` | 1 行 | 5min buffer 防 8h 边界 |
+| 3 失败放弃 | `jwtUtils.ts:57` | 1 行 | 死信退避阈值 |
+| 跨进程计数 | `initReplBridge.ts:166-198` | 32 行 | 防止死 token 反复重试 |
+| v1/v2 适配 | `replBridgeTransport.ts:22-148` | 127 行 | 11 个方法的 v1/v2 差异封装 |
+| Poll Zod 校验 | `pollConfig.ts:25-92` | 68 行 | 0/≥100 双段 + refine 防 ops 单位错 |
+| Heartbeat 命名 | `pollConfigDefaults.ts:60-64` | 注释 | `non_exclusive` 区别旧 `heartbeat_interval_ms` |
+| 多 Session 编排 | `bridgeMain.ts:141-249` | 109 行 | 7 个 Map + 1 个 capacity wake |
+| 3 态结束 | `bridgeMain.ts:186-188` | 3 行 | watchdog / server / shutdown 区分 |
+| 24h 超时 | `types.ts:2` | 1 行 | DEFAULT_SESSION_TIMEOUT_MS |
+| 崩溃恢复 | `replBridge.ts:302-316` | 14 行 | bridgePointer 文件持久化 |
+| Perpetual mode | `replBridge.ts:311-312` | 2 行 | 跳过 teardown clear 永久服务 |
+| 镜像模式 | `bridgeEnabled.ts:197-202` | 6 行 | CLAUDE_CODE_CCR_MIRROR 单向外推 |
+| 故障注入 | `replBridge.ts:327-330` | 4 行 | ant-only `/bridge-kick` 测试钩子 |
+
+### 21.2 Skill 一等公民 / Plugin Marketplace
+
+Claude Code 把 **Skill（提示词片段 + 工具 + hook）** 提到与 Tool 同等地位，作为"可被 Model / User / Plugin 三方调用的"一等公民。本节聚焦：
+
+- **6 源加载机制**（managed / user / project / additional / legacy commands / mcp / plugin）
+- **Bundled skill 编译期注册**
+- **动态发现 + 条件激活**（paths frontmatter）
+- **Plugin Marketplace**（25,000+ 行 ecosystem）
+
+#### 21.2.1 Skill 6 源枚举
+
+`loadSkillsDir.ts:67-74`：
+
+```ts
+export type LoadedFrom =
+  | 'commands_DEPRECATED'  // 旧 /commands/ 目录
+  | 'skills'                // 新 /skills/<name>/SKILL.md
+  | 'plugin'                // 第三方 plugin 提供
+  | 'managed'               // 企业策略
+  | 'bundled'               // 编译期内置
+  | 'mcp'                   // MCP server 暴露
+```
+
+#### 21.2.2 6 源目录路径
+
+`loadSkillsDir.ts:78-94`：
+
+```ts
+export function getSkillsPath(
+  source: SettingSource | 'plugin',
+  dir: 'skills' | 'commands',
+): string {
+  switch (source) {
+    case 'policySettings':  return join(getManagedFilePath(), '.claude', dir)
+    case 'userSettings':    return join(getClaudeConfigHomeDir(), dir)
+    case 'projectSettings': return `.claude/${dir}`
+    case 'plugin':          return 'plugin'
+    default:                return ''
+  }
+}
+```
+
+#### 21.2.3 6 源并发加载 + 去重
+
+`loadSkillsDir.ts:638-804` 的 `getSkillDirCommands` 是**主要入口**，是 `memoize` 包装的：
+
+```ts
+export const getSkillDirCommands = memoize(
+  async (cwd: string): Promise<Command[]> => {
+    const userSkillsDir = join(getClaudeConfigHomeDir(), 'skills')
+    const managedSkillsDir = join(getManagedFilePath(), '.claude', 'skills')
+    const projectSkillsDirs = getProjectDirsUpToHome('skills', cwd)
+
+    logForDebugging(
+      `Loading skills from: managed=${managedSkillsDir}, user=${userSkillsDir}, project=[${projectSkillsDirs.join(', ')}]`,
+    )
+
+    // Load from additional directories (--add-dir)
+    const additionalDirs = getAdditionalDirectoriesForClaudeMd()
+    const skillsLocked = isRestrictedToPluginOnly('skills')
+    const projectSettingsEnabled =
+      isSettingSourceEnabled('projectSettings') && !skillsLocked
+
+    // --bare: skip auto-discovery (managed/user/project dir walks + legacy
+    // commands-dir). Load ONLY explicit --add-dir paths. Bundled skills
+    // register separately. skillsLocked still applies — --bare is not a
+    // policy bypass.
+    if (isBareMode()) {
+      if (additionalDirs.length === 0 || !projectSettingsEnabled) {
+        logForDebugging(`[bare] Skipping skill dir discovery...`)
+        return []
+      }
+      const additionalSkillsNested = await Promise.all(
+        additionalDirs.map(dir =>
+          loadSkillsFromSkillsDir(join(dir, '.claude', 'skills'), 'projectSettings'),
+        ),
+      )
+      // No dedup needed — explicit dirs, user controls uniqueness.
+      return additionalSkillsNested.flat().map(s => s.skill)
+    }
+
+    // Load from /skills/ directories, additional dirs, and legacy /commands/ in parallel
+    const [
+      managedSkills, userSkills, projectSkillsNested,
+      additionalSkillsNested, legacyCommands,
+    ] = await Promise.all([
+      isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_POLICY_SKILLS)
+        ? Promise.resolve([])
+        : loadSkillsFromSkillsDir(managedSkillsDir, 'policySettings'),
+      isSettingSourceEnabled('userSettings') && !skillsLocked
+        ? loadSkillsFromSkillsDir(userSkillsDir, 'userSettings')
+        : Promise.resolve([]),
+      projectSettingsEnabled
+        ? Promise.all(
+            projectSkillsDirs.map(dir => loadSkillsFromSkillsDir(dir, 'projectSettings')),
+          )
+        : Promise.resolve([]),
+      projectSettingsEnabled
+        ? Promise.all(
+            additionalDirs.map(dir => loadSkillsFromSkillsDir(join(dir, '.claude', 'skills'), 'projectSettings')),
+          )
+        : Promise.resolve([]),
+      skillsLocked ? Promise.resolve([]) : loadSkillsFromCommandsDir(cwd),
+    ])
+
+    // Flatten and combine all skills
+    const allSkillsWithPaths = [
+      ...managedSkills, ...userSkills,
+      ...projectSkillsNested.flat(), ...additionalSkillsNested.flat(),
+      ...legacyCommands,
+    ]
+
+    // Deduplicate by resolved path (handles symlinks and duplicate parent directories)
+    // Pre-compute file identities in parallel (realpath calls are independent),
+    // then dedup synchronously (order-dependent first-wins)
+    const fileIds = await Promise.all(
+      allSkillsWithPaths.map(({ skill, filePath }) =>
+        skill.type === 'prompt'
+          ? getFileIdentity(filePath)
+          : Promise.resolve(null),
+      ),
+    )
+
+    const seenFileIds = new Map<string, SettingSource | 'builtin' | 'mcp' | 'plugin' | 'bundled'>()
+    const deduplicatedSkills: Command[] = []
+
+    for (let i = 0; i < allSkillsWithPaths.length; i++) {
+      const entry = allSkillsWithPaths[i]
+      if (entry === undefined || entry.skill.type !== 'prompt') continue
+      const { skill } = entry
+      const fileId = fileIds[i]
+      if (fileId === null || fileId === undefined) {
+        deduplicatedSkills.push(skill)
+        continue
+      }
+      const existingSource = seenFileIds.get(fileId)
+      if (existingSource !== undefined) {
+        logForDebugging(`Skipping duplicate skill '${skill.name}' from ${skill.source} (same file already loaded from ${existingSource})`)
+        continue
+      }
+      seenFileIds.set(fileId, skill.source)
+      deduplicatedSkills.push(skill)
+    }
+```
+
+`getFileIdentity`（`loadSkillsDir.ts:118-124`）用 `realpath` 解析符号链接：
+
+```ts
+async function getFileIdentity(filePath: string): Promise<string | null> {
+  try {
+    return await realpath(filePath)
+  } catch {
+    return null
+  }
+}
+```
+
+注释点出**为什么用 realpath 而非 inode**：
+
+> Uses `realpath` to resolve symlinks, which is filesystem-agnostic and avoids issues with filesystems that report unreliable inode values (e.g., inode 0 on some virtual/container/NFS filesystems, or precision loss on ExFAT).
+> See: https://github.com/anthropics/claude-code/issues/13893
+
+#### 21.2.4 条件 Skill（paths frontmatter）
+
+`loadSkillsDir.ts:771-796`：
+
+```ts
+// Separate conditional skills (with paths frontmatter) from unconditional ones
+const unconditionalSkills: Command[] = []
+const newConditionalSkills: Command[] = []
+for (const skill of deduplicatedSkills) {
+  if (
+    skill.type === 'prompt' &&
+    skill.paths &&
+    skill.paths.length > 0 &&
+    !activatedConditionalSkillNames.has(skill.name)
+  ) {
+    newConditionalSkills.push(skill)
+  } else {
+    unconditionalSkills.push(skill)
+  }
+}
+
+// Store conditional skills for later activation when matching files are touched
+for (const skill of newConditionalSkills) {
+  conditionalSkills.set(skill.name, skill)
+}
+```
+
+`parseSkillPaths`（`loadSkillsDir.ts:159-178`）支持 `paths: ['src/**/*.ts', 'docs/**']` glob，匹配的文件被 touch 时才激活：
+
+```ts
+function parseSkillPaths(frontmatter: FrontmatterData): string[] | undefined {
+  if (!frontmatter.paths) return undefined
+  const patterns = splitPathInFrontmatter(frontmatter.paths)
+    .map(pattern => {
+      // Remove /** suffix - ignore library treats 'path' as matching both
+      // the path itself and everything inside it
+      return pattern.endsWith('/**') ? pattern.slice(0, -3) : pattern
+    })
+    .filter((p: string) => p.length > 0)
+  // If all patterns are ** (match-all), treat as no paths (undefined)
+  if (patterns.length === 0 || patterns.every((p: string) => p === '**')) {
+    return undefined
+  }
+  return patterns
+}
+```
+
+#### 21.2.5 动态 Skill 发现（运行期添加）
+
+`loadSkillsDir.ts:861-915` 的 `discoverSkillDirsForPaths`：
+
+```ts
+export async function discoverSkillDirsForPaths(
+  filePaths: string[], cwd: string,
+): Promise<string[]> {
+  const fs = getFsImplementation()
+  const resolvedCwd = cwd.endsWith(pathSep) ? cwd.slice(0, -1) : cwd
+  const newDirs: string[] = []
+
+  for (const filePath of filePaths) {
+    let currentDir = dirname(filePath)
+    // Walk up to cwd but NOT including cwd itself
+    // CWD-level skills are already loaded at startup, so we only discover nested ones
+    while (currentDir.startsWith(resolvedCwd + pathSep)) {
+      const skillDir = join(currentDir, '.claude', 'skills')
+      // Skip if we've already checked this path (hit or miss) — avoids
+      // repeating the same failed stat on every Read/Write/Edit call when
+      // the directory doesn't exist (the common case).
+      if (!dynamicSkillDirs.has(skillDir)) {
+        dynamicSkillDirs.add(skillDir)
+        try {
+          await fs.stat(skillDir)
+          // Skills dir exists. Before loading, check if the containing dir
+          // is gitignored — blocks e.g. node_modules/pkg/.claude/skills from
+          // loading silently. `git check-ignore` handles nested .gitignore,
+          // .git/info/exclude, and global gitignore. Fails open outside a
+          // git repo (exit 128 → false); the invocation-time trust dialog
+          // is the actual security boundary.
+          if (await isPathGitignored(currentDir, resolvedCwd)) {
+            logForDebugging(`[skills] Skipped gitignored skills dir: ${skillDir}`)
+            continue
+          }
+          newDirs.push(skillDir)
+        } catch {
+          // Directory doesn't exist — already recorded above, continue
+        }
+      }
+      const parent = dirname(currentDir)
+      if (parent === currentDir) break
+      currentDir = parent
+    }
+  }
+  // Sort by path depth (deepest first) so skills closer to the file take precedence
+  return newDirs.sort(
+    (a, b) => b.split(pathSep).length - a.split(pathSep).length,
+  )
+}
+```
+
+`onDynamicSkillsLoaded`（`loadSkillsDir.ts:839-851`）是**回调机制**，其他模块可以订阅而不引入 import cycle：
+
+```ts
+export function onDynamicSkillsLoaded(callback: () => void): () => void {
+  return skillsLoaded.subscribe(() => {
+    try { callback() } catch (error) { logError(error) }
+  })
+}
+```
+
+#### 21.2.6 Skill Frontmatter 17 字段
+
+`loadSkillsDir.ts:185-265` 的 `parseSkillFrontmatterFields`：
+
+```ts
+export function parseSkillFrontmatterFields(frontmatter, markdownContent, resolvedName, descriptionFallbackLabel = 'Skill') {
+  // ...
+  return {
+    displayName, description, hasUserSpecifiedDescription,
+    allowedTools,                        // → allowedTools
+    argumentHint, argumentNames,         // /skill <arg> 提示
+    whenToUse,                           // model 自动调用触发
+    version,                             // 语义版本
+    model,                               // inherit / 指定模型
+    disableModelInvocation,              // 禁止 model 触发（仅 user / mcp）
+    userInvocable,                       // 是否能 /skill 触发
+    hooks,                               // PreToolUse/PostToolUse 等
+    executionContext: 'fork' | undefined,  // 子 Agent 派生
+    agent,                               // 使用哪个 agent
+    effort,                              // 'low' | 'medium' | 'high' | 数字
+    shell,                               // FrontmatterShell 安全设置
+  }
+}
+```
+
+#### 21.2.7 Skill 模板变量替换
+
+`loadSkillsDir.ts:344-369`：
+
+```ts
+async getPromptForCommand(args, toolUseContext) {
+  let finalContent = baseDir
+    ? `Base directory for this skill: ${baseDir}\n\n${markdownContent}`
+    : markdownContent
+  finalContent = substituteArguments(finalContent, args, true, argumentNames)
+
+  // Replace ${CLAUDE_SKILL_DIR} with the skill's own directory so bash
+  // injection (!`...`) can reference bundled scripts. Normalize backslashes
+  // to forward slashes on Windows so shell commands don't treat them as escapes.
+  if (baseDir) {
+    const skillDir =
+      process.platform === 'win32' ? baseDir.replace(/\\/g, '/') : baseDir
+    finalContent = finalContent.replace(/\$\{CLAUDE_SKILL_DIR\}/g, skillDir)
+  }
+
+  // Replace ${CLAUDE_SESSION_ID} with the current session ID
+  finalContent = finalContent.replace(
+    /\$\{CLAUDE_SESSION_ID\}/g, getSessionId(),
+  )
+
+  // Security: MCP skills are remote and untrusted — never execute inline
+  // shell commands (!`…` / ```! … ```) from their markdown body.
+  // ${CLAUDE_SKILL_DIR} is meaningless for MCP skills anyway.
+  if (loadedFrom !== 'mcp') {
+    finalContent = await executeShellCommandsInPrompt(
+      finalContent, {...}, `/${skillName}`, shell,
+    )
+  }
+  return [{ type: 'text', text: finalContent }]
+}
+```
+
+**MCP skills 不执行 `!` shell 注入** 是个**安全硬隔离** — 即使 prompt 被注入，远程 MCP 的 SKILL.md 也不能本地执行 shell。
+
+#### 21.2.8 Bundled Skill 编译期注册
+
+`bundledSkills.ts:14-99` 的 `registerBundledSkill`：
+
+```ts
+export type BundledSkillDefinition = {
+  name: string
+  description: string
+  aliases?: string[]
+  whenToUse?: string
+  argumentHint?: string
+  allowedTools?: string[]
+  model?: string
+  disableModelInvocation?: boolean
+  userInvocable?: boolean
+  isEnabled?: () => boolean
+  hooks?: HooksSettings
+  context?: 'inline' | 'fork'
+  agent?: string
+  /**
+   * Additional reference files to extract to disk on first invocation.
+   * Keys are relative paths (forward slashes, no `..`), values are content.
+   */
+  files?: Record<string, string>
+  getPromptForCommand: (args, ctx) => Promise<ContentBlockParam[]>
+}
+
+const bundledSkills: Command[] = []
+
+export function registerBundledSkill(definition: BundledSkillDefinition): void {
+  const { files } = definition
+  let skillRoot: string | undefined
+  let getPromptForCommand = definition.getPromptForCommand
+
+  if (files && Object.keys(files).length > 0) {
+    skillRoot = getBundledSkillExtractDir(definition.name)
+    // Closure-local memoization: extract once per process.
+    // Memoize the promise (not the result) so concurrent callers await
+    // the same extraction instead of racing into separate writes.
+    let extractionPromise: Promise<string | null> | undefined
+    const inner = definition.getPromptForCommand
+    getPromptForCommand = async (args, ctx) => {
+      extractionPromise ??= extractBundledSkillFiles(definition.name, files)
+      const extractedDir = await extractionPromise
+      const blocks = await inner(args, ctx)
+      if (extractedDir === null) return blocks
+      return prependBaseDir(blocks, extractedDir)
+    }
+  }
+  const command: Command = {
+    type: 'prompt', name: definition.name, description: definition.description,
+    aliases: definition.aliases, hasUserSpecifiedDescription: true,
+    allowedTools: definition.allowedTools ?? [],
+    argumentHint: definition.argumentHint, whenToUse: definition.whenToUse,
+    model: definition.model, disableModelInvocation: definition.disableModelInvocation ?? false,
+    userInvocable: definition.userInvocable ?? true, contentLength: 0,
+    source: 'bundled', loadedFrom: 'bundled',
+    hooks: definition.hooks, skillRoot,
+    context: definition.context, agent: definition.agent,
+    isEnabled: definition.isEnabled,
+    isHidden: !(definition.userInvocable ?? true),
+    progressMessage: 'running', getPromptForCommand,
+  }
+  bundledSkills.push(command)
+}
+```
+
+**安全防御**（`bundledSkills.ts:169-193`）：
+
+```ts
+// The per-process nonce in getBundledSkillsRoot() is the primary defense
+// against pre-created symlinks/dirs. Explicit 0o700/0o600 modes keep the
+// nonce subtree owner-only even on umask=0, so an attacker who learns the
+// nonce via inotify on the predictable parent still can't write into it.
+// O_NOFOLLOW|O_EXCL is belt-and-suspenders (O_NOFOLLOW only protects the
+// final component); we deliberately do NOT unlink+retry on EEXIST — unlink()
+// follows intermediate symlinks too.
+const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0
+const SAFE_WRITE_FLAGS =
+  process.platform === 'win32'
+    ? 'wx'
+    : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | O_NOFOLLOW
+
+async function safeWriteFile(p: string, content: string): Promise<void> {
+  const fh = await open(p, SAFE_WRITE_FLAGS, 0o600)
+  try { await fh.writeFile(content, 'utf8') } finally { await fh.close() }
+}
+
+/** Normalize and validate a skill-relative path; throws on traversal. */
+function resolveSkillFilePath(baseDir: string, relPath: string): string {
+  const normalized = normalize(relPath)
+  if (
+    isAbsolute(normalized) ||
+    normalized.split(pathSep).includes('..') ||
+    normalized.split('/').includes('..')
+  ) {
+    throw new Error(`bundled skill file path escapes skill dir: ${relPath}`)
+  }
+  return join(baseDir, normalized)
+}
+```
+
+`O_NOFOLLOW | O_EXCL` + 显式 `0o700/0o600` + 不 unlink-on-EEXIST 是**三个层次的对称链接/竞态防御**。
+
+#### 21.2.9 17 个 Bundled Skills
+
+```bash
+$ ls src/skills/bundled/
+batch.ts                       # 批量任务编排
+claudeApiContent.ts            # 247KB .md 字符串（懒加载）
+claudeApi.ts                   # Claude API / SDK 助手（按语言检测 + 动态引用注入）
+claudeInChrome.ts              # Chrome 集成
+debug.ts                       # 调试助手
+index.ts                       # 入口
+keybindings.ts                 # 快捷键
+loop.ts                        # 循环任务
+loremIpsum.ts                  # 测试用
+remember.ts                    # 记忆助手
+scheduleRemoteAgents.ts        # 远程 Agent 调度
+simplify.ts                    # 代码简化
+skillify.ts                    # Skill 自动生成
+stuck.ts                       # 卡住诊断
+updateConfig.ts                # 配置更新
+verifyContent.ts               # 内容校验
+verify.ts                      # 通用验证
+```
+
+共 **17 文件、29 处 `registerBundledSkill` 调用**。
+
+#### 21.2.10 claudeApi skill 的语言自动检测
+
+`src/skills/bundled/claudeApi.ts:19-53`：
+
+```ts
+type DetectedLanguage =
+  | 'python' | 'typescript' | 'java' | 'go'
+  | 'ruby' | 'csharp' | 'php' | 'curl'
+
+const LANGUAGE_INDICATORS: Record<DetectedLanguage, string[]> = {
+  python:     ['.py', 'requirements.txt', 'pyproject.toml', 'setup.py', 'Pipfile'],
+  typescript: ['.ts', '.tsx', 'tsconfig.json', 'package.json'],
+  java:       ['.java', 'pom.xml', 'build.gradle'],
+  go:         ['.go', 'go.mod'],
+  ruby:       ['.rb', 'Gemfile'],
+  csharp:     ['.cs', '.csproj'],
+  php:        ['.php', 'composer.json'],
+  curl:       [],
+}
+
+async function detectLanguage(): Promise<DetectedLanguage | null> {
+  const cwd = getCwd()
+  let entries: string[]
+  try { entries = await readdir(cwd) } catch { return null }
+  for (const [lang, indicators] of Object.entries(LANGUAGE_INDICATORS)) {
+    if (indicators.length === 0) continue
+    for (const indicator of indicators) {
+      if (indicator.startsWith('.')) {
+        if (entries.some(e => e.endsWith(indicator))) return lang
+      } else {
+        if (entries.includes(indicator)) return lang
+      }
+    }
+  }
+  return null
+}
+```
+
+`claudeApi.ts:64-79` 的 `processContent` 还会**展开** `{{KEY}}` 模板（绑定到 `claudeApiContent.js` 的 `SKILL_MODEL_VARS`），并去掉 HTML 注释。
+
+#### 21.2.11 Plugin Marketplace 生态
+
+`src/utils/plugins/` 总共 **20,452 行**，42 个文件：
+
+```
+pluginLoader.ts            3302   # 主加载器（dependency resolution + scope 决策）
+schemas.ts                 1681   # Zod schema 完整定义（manifest/marketplace/settings）
+installedPluginsManager.ts 1268   # 已装插件的磁盘管理
+loadPluginCommands.ts       946   # 从插件加载 commands/skills
+validatePlugin.ts           903   # 903 行校验链
+mcpbHandler.ts              968   # .mcpb 桌面扩展协议处理
+mcpPluginIntegration.ts     634   # 插件内 MCP server 集成
+marketplaceManager.ts      2643   # marketplace 配置 + git clone + refresh
+pluginInstallationHelpers.ts 595 # 安装辅助
+loadPluginHooks.ts          287   # 插件 hook 集成
+loadPluginAgents.ts         348   # 插件 agent 集成
+loadPluginOutputStyles.ts   178   # 输出样式
+pluginAutoupdate.ts         284   # 启动期后台自动更新插件
+pluginStartupCheck.ts       341   # 启动期健康检查
+pluginOptionsStorage.ts     400   # 插件 KV 存储
+reconciler.ts               265   # 已装/期望 状态调和
+installedPluginsManager.ts 1268   # 持久化层
+cacheUtils.ts               196   # GCS marketplace 缓存
+dependencyResolver.ts       305   # 插件间依赖解析
+installCounts.ts            292   # 遥测
+marketplaceHelpers.ts       592   # 加载优雅降级 + source 展示
+officialMarketplaceStartupCheck.ts 439 # 官方 marketplace 启动期探测
+fetchTelemetry.ts           135   # 远端拉取遥测
+hintRecommendation.ts       164   # 推荐提示
+gitAvailability.ts           69   # git 是否可用
+lspPluginIntegration.ts     387   # LSP 插件集成
+lspRecommendation.ts        374   # LSP 推荐
+zipCacheAdapters.ts         164   # zip 缓存适配器
+zipCache.ts                 406   # zip 缓存（避免每次解压）
+refresh.ts                  215   # 拉取刷新
+pluginIdentifier.ts         123   # `name@marketplace` ID 解析
+pluginFlagging.ts           208   # 标记可疑/有缺陷插件
+pluginVersioning.ts         157   # 插件版本兼容
+pluginBlocklist.ts          127   # 黑名单（企业策略 + 安全）
+parseMarketplaceInput.ts    162   # marketplace 输入解析
+orphanedPluginFilter.ts     114   # 孤儿插件清理
+pluginDirectories.ts        178   # 插件目录约定
+managedPlugins.ts            27   # 托管插件（企业级）
+addDirPluginSettings.ts      71   # --add-dir 的插件设置合并
+pluginPolicy.ts              20   # 策略决策
+walkPluginMarkdown.ts        69   # 插件 .md 遍历
+schemas.ts                 1681   # Zod schema
+officialMarketplaceGcs.ts   216   # 官方 GCS marketplace
+officialMarketplace.ts       25   # 官方 marketplace 常量
+```
+
+#### 21.2.12 官方 Marketplace
+
+`src/utils/plugins/officialMarketplace.ts:1-26`：
+
+```ts
+/**
+ * Constants for the official Anthropic plugins marketplace.
+ */
+import type { MarketplaceSource } from './schemas.js'
+
+export const OFFICIAL_MARKETPLACE_SOURCE = {
+  source: 'github',
+  repo: 'anthropics/claude-plugins-official',
+} as const satisfies MarketplaceSource
+
+export const OFFICIAL_MARKETPLACE_NAME = 'claude-plugins-official'
+```
+
+#### 21.2.13 Plugin ID 命名
+
+`marketplaceHelpers.ts:59-65`：
+
+```ts
+export function createPluginId(
+  pluginName: string, marketplaceName: string,
+): string {
+  return `${pluginName}@${marketplaceName}`
+}
+```
+
+格式 `{name}@{marketplace}`：第三方是 `claude-plugins-official`，内置是 `@builtin`（`builtinPlugins.ts:23-39`）：
+
+```ts
+export const BUILTIN_MARKETPLACE_NAME = 'builtin'
+
+export function isBuiltinPluginId(pluginId: string): boolean {
+  return pluginId.endsWith(`@${BUILTIN_MARKETPLACE_NAME}`)
+}
+```
+
+#### 21.2.14 Built-in Plugin 注册
+
+`builtinPlugins.ts:1-100`：
+
+```ts
+const BUILTIN_PLUGINS: Map<string, BuiltinPluginDefinition> = new Map()
+
+export function registerBuiltinPlugin(
+  definition: BuiltinPluginDefinition,
+): void {
+  BUILTIN_PLUGINS.set(definition.name, definition)
+}
+
+export function getBuiltinPlugins(): {
+  enabled: LoadedPlugin[]; disabled: LoadedPlugin[]
+} {
+  const settings = getSettings_DEPRECATED()
+  const enabled: LoadedPlugin[] = []
+  const disabled: LoadedPlugin[] = []
+  for (const [name, definition] of BUILTIN_PLUGINS) {
+    if (definition.isAvailable && !definition.isAvailable()) continue
+    const pluginId = `${name}@${BUILTIN_MARKETPLACE_NAME}`
+    const userSetting = settings?.enabledPlugins?.[pluginId]
+    // Enabled state: user preference > plugin default > true
+    const isEnabled =
+      userSetting !== undefined
+        ? userSetting === true
+        : (definition.defaultEnabled ?? true)
+    const plugin: LoadedPlugin = {
+      name, manifest: { name, description: definition.description, version: definition.version },
+      path: BUILTIN_MARKETPLACE_NAME, source: pluginId, repository: pluginId,
+      enabled: isEnabled, isBuiltin: true,
+      hooksConfig: definition.hooks, mcpServers: definition.mcpServers,
+    }
+    if (isEnabled) enabled.push(plugin)
+    else disabled.push(plugin)
+  }
+}
+```
+
+注释（`builtinPlugins.ts:1-14`）点出 **bundled skill vs built-in plugin 的关键差异**：
+
+> Built-in plugins differ from bundled skills (`src/skills/`) in that:
+> - They appear in the `/plugin` UI under a "Built-in" section
+> - Users can enable/disable them (persisted to user settings)
+> - They can provide **multiple components** (skills, hooks, MCP servers)
+
+#### 21.2.15 Plugin Autoupdate（启动期后台）
+
+`pluginAutoupdate.ts:1-79` 的注释点出**关键设计**：
+
+> At startup, this module:
+> 1. First updates marketplaces that have autoUpdate enabled
+> 2. Then checks all installed plugins from those marketplaces and updates them
+>
+> Updates are non-inplace (disk-only), requiring a restart to take effect.
+> Official Anthropic marketplaces have autoUpdate enabled by default,
+> but users can disable it per-marketplace.
+
+```ts
+export function onPluginsAutoUpdated(
+  callback: PluginAutoUpdateCallback,
+): () => void {
+  pluginUpdateCallback = callback
+  // If there are pending updates that happened before registration, deliver them now
+  if (pendingNotification !== null && pendingNotification.length > 0) {
+    callback(pendingNotification)
+    pendingNotification = null
+  }
+  return () => { pluginUpdateCallback = null }
+}
+```
+
+**`pendingNotification` 缓存** 解决了**REPL mount 之前更新已发生的竞态**。
+
+#### 21.2.16 Plugin 安全
+
+`pluginBlocklist.ts`（127 行）+ `pluginPolicy.ts`（20 行）+ `pluginFlagging.ts`（208 行）+ `validatePlugin.ts`（903 行）构成**四层安全网**：
+- 黑名单（企业策略 / 已知恶意）
+- 策略决策（白名单 / 灰名单）
+- 标记（可疑 / 有缺陷）
+- 完整 Zod schema 校验
+
+#### 21.2.17 Plugin 一等公民 vs Bundled Skill 决策表
+
+| 维度 | Bundled Skill | Built-in Plugin | Marketplace Plugin |
+|------|--------------|-----------------|-------------------|
+| 注册时机 | 编译期 | 启动期 | 启动期 + autoupdate |
+| 来源 | `registerBundledSkill` | `registerBuiltinPlugin` | 磁盘 + manifest.json |
+| 文件位置 | 内存 | 内存 | `~/.claude/plugins/{name}@marketplace/` |
+| 启用方式 | 默认全启 | 用户可启停 | 用户可启停 |
+| 包含内容 | 单个 skill prompt | skill + hook + MCP | skill + hook + MCP + agent + output style + LSP |
+| 用户路径 | `/skill-name` | `/plugin name` | `/plugin name` |
+| 可见性 | `/skills` UI | `/plugin` UI "Built-in" 段 | `/plugin` UI "Marketplace" 段 |
+| 升级 | 二进制重发 | 二进制重发 | 启动期 autoupdate |
+
+### 21.3 i18n 国际化
+
+**重要事实**：Claude Code **没有完整的 i18n 系统**。所有 UI 文案、错误消息、命令文案都是**英文硬编码**。它对 i18n 的支持仅限于：
+
+1. **时间戳格式**（POSIX locale env vars → BCP 47）
+2. **Bash 透传 locale env vars**（让子进程的 locale 自行生效）
+3. **Voice STT 语言检测**（speech-to-text 的语言选择）
+4. **Skill 的语言检测**（claudeApi skill 的 `LANGUAGE_INDICATORS`）
+
+本节如实记录这一**反模式**，**作为 laew 的负面参考**。
+
+#### 21.3.1 时间戳 Locale 适配
+
+`src/utils/formatBriefTimestamp.ts:1-77`：
+
+```ts
+/**
+ * Format an ISO timestamp for the brief/chat message label line.
+ *
+ * Display scales with age (like a messaging app):
+ *   - same day:      "1:30 PM" or "13:30" (locale-dependent)
+ *   - within 6 days: "Sunday, 4:15 PM" (locale-dependent)
+ *   - older:         "Sunday, Feb 20, 4:30 PM" (locale-dependent)
+ *
+ * Respects POSIX locale env vars (LC_ALL > LC_TIME > LANG) for time format
+ * (12h/24h), weekday names, month names, and overall structure.
+ * Bun/V8's `toLocaleString(undefined)` ignores these on macOS, so we
+ * convert them to BCP 47 tags ourselves.
+ */
+export function formatBriefTimestamp(isoString: string, now: Date = new Date()): string {
+  const d = new Date(isoString)
+  if (Number.isNaN(d.getTime())) return ''
+  const locale = getLocale()
+  const dayDiff = startOfDay(now) - startOfDay(d)
+  const daysAgo = Math.round(dayDiff / 86_400_000)
+  if (daysAgo === 0) {
+    return d.toLocaleTimeString(locale, { hour: 'numeric', minute: '2-digit' })
+  }
+  if (daysAgo > 0 && daysAgo < 7) {
+    return d.toLocaleString(locale, { weekday: 'long', hour: 'numeric', minute: '2-digit' })
+  }
+  return d.toLocaleString(locale, { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+}
+
+/**
+ * Derive a BCP 47 locale tag from POSIX env vars.
+ * LC_ALL > LC_TIME > LANG, falls back to undefined (system default).
+ * Converts POSIX format (en_GB.UTF-8) to BCP 47 (en-GB).
+ */
+function getLocale(): string | undefined {
+  const raw = process.env.LC_ALL || process.env.LC_TIME || process.env.LANG || ''
+  if (!raw || raw === 'C' || raw === 'POSIX') return undefined
+  const base = raw.split('.')[0]!.split('@')[0]!
+  if (!base) return undefined
+  const tag = base.replaceAll('_', '-')
+  // Validate by trying to construct an Intl locale — invalid tags throw
+  try { new Intl.DateTimeFormat(tag); return tag } catch { return undefined }
+}
+```
+
+**关键设计点**：
+- `LC_ALL > LC_TIME > LANG` 的 POSIX 优先级正确
+- 把 `en_GB.UTF-8` → `en-GB` 的 BCP 47 转换是手工做的（V8 的 `toLocaleString(undefined)` 在 macOS 上不读 POSIX env）
+- 用 `new Intl.DateTimeFormat(tag)` 的构造做 **Zod 风格的 runtime 校验**，无效 locale 静默 fallback 到 `undefined`
+
+#### 21.3.2 Bash 子进程 Locale 透传
+
+`src/tools/BashTool/bashPermissions.ts` 注释中提到 `LANGUAGE` / `LC_ALL` / `LC_MESSAGES` 是允许透传的 env vars。这意味着子进程能正确处理自己的 locale（git / node / python / 各类 CLI 的输出语言）。
+
+#### 21.3.3 Voice STT 语言检测
+
+`src/hooks/useVoice.ts:1144`（1144 行）：
+
+```ts
+const DEFAULT_STT_LANGUAGE = 'en'
+// fall back to DEFAULT_STT_LANGUAGE so recording still works.
+const LANGUAGE_NAME_TO_CODE: Record<string, string> = { /* ... */ }
+```
+
+这是个**孤立的内部映射**，用于把 "English"/"中文" 这种语言名 → ISO 639-1 编码。
+
+#### 21.3.4 没有 i18n 系统的代价
+
+实际后果（**laew 应避免**）：
+- 日文用户看到 "Update installed · Restart to apply" 仍然英文
+- 中文的 `LANG=zh_CN.UTF-8` 不会让错误消息变成 "权限被拒绝"
+- 27 种 Hook 的所有日志都是英文
+- 40+ 工具的 description 都是英文硬编码
+- TUI 横幅是英文
+
+**对 laew 的建议**：i18n 是 laew 的 **P0 差异化** — 既然 laew 在国内场景使用，文案应该直接中文（项目说明文件等已经是中文），错误消息也应该中文。可以用 `rust-i18n` crate + YAML 资源文件，CLI 文案 key 化。
+
+#### 21.3.5 i18n 决策审计
+
+| 决策点 | 文件:行号 | 设计 |
+|--------|----------|------|
+| 时间戳 locale | `formatBriefTimestamp.ts:1-77` | POSIX env → BCP 47，runtime 校验 |
+| Locale 透传 | `BashTool/bashPermissions.ts` | LANGUAGE/LC_ALL/LC_MESSAGES 在白名单 |
+| Voice STT | `hooks/useVoice.ts:1144` 行（DEFAULT_STT_LANGUAGE='en'） | 内部 LANGUAGE_NAME_TO_CODE 映射 |
+| Skill 语言检测 | `skills/bundled/claudeApi.ts:19-53` | 按 cwd 入口文件后缀猜语言 |
+| **缺失** | — | UI 文案 / 错误消息 / 命令 description 无 i18n |
+
+### 21.4 Release 工程化 / 更新器 / Appcast
+
+Claude Code 有**两套并行的更新通道**：
+
+- **JS 包通道**（`autoUpdater.ts` 561 行 + `AutoUpdater.tsx` 197 行）：npm registry + GCS bucket，OAuth/npm 生态
+- **Native 通道**（`NativeAutoUpdater.tsx` 192 行 + `nativeInstaller/`）：本地文件系统 + XDG 目录约定
+
+**没有 Sparkle / appcast.xml**（这是 macOS 原生桌面 app 用的）— 全部走 npm + GCS + 本地 installer。
+
+#### 21.4.1 JS 包更新器
+
+`src/utils/autoUpdater.ts:30-99` 的 **assertMinVersion**：
+
+```ts
+const GCS_BUCKET_URL =
+  'https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases'
+
+class AutoUpdaterError extends ClaudeError {}
+
+export type InstallStatus =
+  | 'success' | 'no_permissions' | 'install_failed' | 'in_progress'
+
+/**
+ * NOTE ON SHA-BASED VERSIONING:
+ * We use SemVer-compliant versioning with build metadata format (X.X.X+SHA) for continuous deployment.
+ * According to SemVer specs, build metadata (the +SHA part) is ignored when comparing versions.
+ *
+ * Versioning approach:
+ * 1. For version requirements/compatibility (assertMinVersion), we use semver comparison that ignores build metadata
+ * 2. For updates ('claude update'), we use exact string comparison to detect any change, including SHA
+ *    - This ensures users always get the latest build, even when only the SHA changes
+ *    - The UI clearly shows both versions including build metadata
+ */
+export async function assertMinVersion(): Promise<void> {
+  if (process.env.NODE_ENV === 'test') return
+  try {
+    const versionConfig = await getDynamicConfig_BLOCKS_ON_INIT<{ minVersion: string }>('tengu_version_config', { minVersion: '0.0.0' })
+    if (versionConfig.minVersion && lt(MACRO.VERSION, versionConfig.minVersion)) {
+      console.error(`
+It looks like your version of Claude Code (${MACRO.VERSION}) needs an update.
+A newer version (${versionConfig.minVersion} or higher) is required to continue.
+To update, please run:
+    claude update
+This will ensure you have access to the latest features and improvements.
+`)
+      gracefulShutdownSync(1)
+    }
+  } catch (error) { logError(error as Error) }
+}
+```
+
+#### 21.4.2 maxVersion Kill Switch
+
+`autoUpdater.ts:101-138` 的 `getMaxVersion`：
+
+```ts
+/**
+ * Returns the maximum allowed version for the current user type.
+ * For ants, returns the `ant` field (dev version format).
+ * For external users, returns the `external` field (clean semver).
+ * This is used as a server-side kill switch to pause auto-updates during incidents.
+ * Returns undefined if no cap is configured.
+ */
+export async function getMaxVersion(): Promise<string | undefined> {
+  const config = await getMaxVersionConfig()
+  if (process.env.USER_TYPE === 'ant') return config.ant || undefined
+  return config.external || undefined
+}
+
+export async function getMaxVersionMessage(): Promise<string | undefined> {
+  const config = await getMaxVersionConfig()
+  if (process.env.USER_TYPE === 'ant') return config.ant_message || undefined
+  return config.external_message || undefined
+}
+```
+
+#### 21.4.3 用户级版本锁定
+
+`autoUpdater.ts:140-159` 的 `shouldSkipVersion`：
+
+```ts
+export function shouldSkipVersion(targetVersion: string): boolean {
+  const settings = getInitialSettings()
+  const minimumVersion = settings?.minimumVersion
+  if (!minimumVersion) return false
+  // Skip if target version is less than minimum
+  const shouldSkip = !gte(targetVersion, minimumVersion)
+  if (shouldSkip) {
+    logForDebugging(`Skipping update to ${targetVersion} - below minimumVersion ${minimumVersion}`)
+  }
+  return shouldSkip
+}
+```
+
+让用户能设置 `minimumVersion` 锁住**最低版本**（避免被 downgrade）。
+
+#### 21.4.4 更新锁（多进程防并发）
+
+`autoUpdater.ts:161-268` 的 `acquireLock / releaseLock`：
+
+```ts
+const LOCK_TIMEOUT_MS = 5 * 60 * 1000 // 5 minute timeout for locks
+
+export function getLockFilePath(): string {
+  return join(getClaudeConfigHomeDir(), '.update.lock')
+}
+
+async function acquireLock(): Promise<boolean> {
+  const fs = getFsImplementation()
+  const lockPath = getLockFilePath()
+
+  // Check for existing lock: 1 stat() on the happy path (fresh lock or ENOENT),
+  // 2 on stale-lock recovery (re-verify staleness immediately before unlink).
+  try {
+    const stats = await fs.stat(lockPath)
+    const age = Date.now() - stats.mtimeMs
+    if (age < LOCK_TIMEOUT_MS) {
+      return false
+    }
+    // Lock is stale, remove it before taking over. Re-verify staleness
+    // immediately before unlinking to close a TOCTOU race: if two processes
+    // both observe the stale lock, A unlinks + writes a fresh lock, then B
+    // would unlink A's fresh lock and both believe they hold it. A fresh
+    // lock has a recent mtime, so re-checking staleness makes B back off.
+    try {
+      const recheck = await fs.stat(lockPath)
+      if (Date.now() - recheck.mtimeMs < LOCK_TIMEOUT_MS) {
+        return false
+      }
+      await fs.unlink(lockPath)
+    } catch (err) {
+      if (!isENOENT(err)) { logError(err as Error); return false }
+    }
+  } catch (err) {
+    if (!isENOENT(err)) { logError(err as Error); return false }
+    // ENOENT: no lock file, proceed to create one
+  }
+
+  // Create lock file atomically with O_EXCL (flag: 'wx'). If another process
+  // wins the race and creates it first, we get EEXIST and back off.
+  // Lazy-mkdir the config dir on ENOENT.
+  try {
+    await writeFile(lockPath, `${process.pid}`, {
+      encoding: 'utf8', flag: 'wx',
+    })
+    return true
+  } catch (err) {
+    const code = getErrnoCode(err)
+    if (code === 'EEXIST') return false
+    if (code === 'ENOENT') {
+      try {
+        // fs.mkdir from getFsImplementation() is always recursive:true and
+        // swallows EEXIST internally, so a dir-creation race cannot reach the
+        // catch below — only writeFile's EEXIST (true lock contention) can.
+        await fs.mkdir(getClaudeConfigHomeDir())
+        await writeFile(lockPath, `${process.pid}`, { encoding: 'utf8', flag: 'wx' })
+        return true
+      } catch (mkdirErr) {
+        if (getErrnoCode(mkdirErr) === 'EEXIST') return false
+        logError(mkdirErr as Error); return false
+      }
+    }
+    logError(err as Error); return false
+  }
+}
+```
+
+**核心设计（注释 184-192）**：
+
+> Lock is stale, remove it before taking over. **Re-verify staleness immediately before unlinking to close a TOCTOU race**: if two processes both observe the stale lock, A unlinks + writes a fresh lock, then B would unlink A's fresh lock and both believe they hold it. A fresh lock has a recent mtime, so re-checking staleness makes B back off.
+
+#### 21.4.5 npm view 与 GCS 双通道
+
+`autoUpdater.ts:319-410` 的 `getLatestVersion` / `getLatestVersionFromGcs` / `getGcsDistTags`：
+
+```ts
+export async function getLatestVersion(channel: ReleaseChannel): Promise<string | null> {
+  const npmTag = channel === 'stable' ? 'stable' : 'latest'
+  // Run from home directory to avoid reading project-level .npmrc
+  // which could be maliciously crafted to redirect to an attacker's registry
+  const result = await execFileNoThrowWithCwd(
+    'npm', ['view', `${MACRO.PACKAGE_URL}@${npmTag}`, 'version', '--prefer-online'],
+    { abortSignal: AbortSignal.timeout(5000), cwd: homedir() },
+  )
+  // ...
+}
+
+/** Get the latest version from GCS bucket for a given release channel. */
+export async function getLatestVersionFromGcs(channel: ReleaseChannel): Promise<string | null> {
+  try {
+    const response = await axios.get(`${GCS_BUCKET_URL}/${channel}`, {
+      timeout: 5000, responseType: 'text',
+    })
+    return response.data.trim()
+  } catch (error) {
+    logForDebugging(`Failed to fetch ${channel} from GCS: ${error}`)
+    return null
+  }
+}
+```
+
+**安全设计**：从 `homedir()` 跑 npm view，避免**恶意项目级 `.npmrc`** 重定向到攻击者 registry。
+
+#### 21.4.6 Native Installer（XDG + 版本隔离）
+
+`src/utils/nativeInstaller/installer.ts:1-132`：
+
+```ts
+/**
+ * Native Installer Implementation
+ *
+ * This module implements the file-based native installer system described in
+ * docs/native-installer.md. It provides:
+ * - Directory structure management with symlinks
+ * - Version installation and activation
+ * - Multi-process safety with locking
+ * - Simple fallback mechanism using modification time
+ * - Support for both JS and native builds
+ */
+
+export const VERSION_RETENTION_COUNT = 2
+// 7 days in milliseconds - used for mtime-based lock stale timeout.
+const LOCK_STALE_MS = 7 * 24 * 60 * 60 * 1000
+
+export function getPlatform(): string {
+  const os = env.platform
+  const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : null
+  if (!arch) throw new Error(`Unsupported architecture: ${process.arch}`)
+  if (os === 'linux' && envDynamic.isMuslEnvironment()) {
+    return `linux-${arch}-musl`
+  }
+  return `${os}-${arch}`
+}
+
+function getBaseDirectories() {
+  const platform = getPlatform()
+  const executableName = getBinaryName(platform)  // 'claude.exe' or 'claude'
+  return {
+    // Data directories (permanent storage)
+    versions: join(getXDGDataHome(), 'claude', 'versions'),
+    // Cache directories (can be deleted)
+    staging: join(getXDGCacheHome(), 'claude', 'staging'),
+    // State directories
+    locks: join(getXDGStateHome(), 'claude', 'locks'),
+    // User bin
+    executable: join(getUserBinDir(), executableName),
+  }
+}
+```
+
+**XDG Base Directory 规范完整**：`$XDG_DATA_HOME / $XDG_CACHE_HOME / $XDG_STATE_HOME / $XDG_BIN_HOME` 分别承担数据/缓存/状态/可执行文件。
+
+#### 21.4.7 安装类型自动检测
+
+`AutoUpdater.tsx:104-131` 的 **4 种安装类型 dispatch**：
+
+```ts
+if (installationType === 'npm-local') {
+  logForDebugging('AutoUpdater: Using local update method')
+  updateMethod = 'local'
+  installStatus = await installOrUpdateClaudePackage(channel)
+} else if (installationType === 'npm-global') {
+  logForDebugging('AutoUpdater: Using global update method')
+  updateMethod = 'global'
+  installStatus = await installGlobalPackage()
+} else if (installationType === 'native') {
+  // This shouldn't happen - native should use NativeAutoUpdater
+  logForDebugging('AutoUpdater: Unexpected native installation in non-native updater')
+  onChangeIsUpdating(false)
+  return
+} else {
+  // Fallback to config-based detection for unknown types
+  logForDebugging(`AutoUpdater: Unknown installation type, falling back to config`)
+  const isMigrated = config.installMethod === 'local'
+  updateMethod = isMigrated ? 'local' : 'global'
+  if (isMigrated) installStatus = await installOrUpdateClaudePackage(channel)
+  else installStatus = await installGlobalPackage()
+}
+```
+
+#### 21.4.8 React UI 渲染
+
+`AutoUpdater.tsx:23-196` 的 `AutoUpdater` 组件（197 行）：
+
+```ts
+export function AutoUpdater({...}): React.ReactNode {
+  const [versions, setVersions] = useState<{ global?: string | null; latest?: string | null }>({})
+  const [hasLocalInstall, setHasLocalInstall] = useState(false)
+  const updateSemver = useUpdateNotification(autoUpdaterResult?.version)
+  useEffect(() => { void localInstallationExists().then(setHasLocalInstall) }, [])
+
+  // Track latest isUpdating value in a ref so the memoized checkForUpdates
+  // callback always sees the current value. Without this, the 30-minute
+  // interval fires with a stale closure where isUpdating is false, allowing
+  // a concurrent installGlobalPackage() to run while one is already in progress.
+  const isUpdatingRef = useRef(isUpdating)
+  isUpdatingRef.current = isUpdating
+
+  const checkForUpdates = React.useCallback(async () => {
+    if (isUpdatingRef.current) return
+    if ("production" === 'test' || "production" === 'development') {
+      logForDebugging('AutoUpdater: Skipping update check in test/dev environment')
+      return
+    }
+    // ... 5min 间隔、检测、退出 dev build ...
+  }, [onAutoUpdaterResult])
+
+  useEffect(() => { void checkForUpdates() }, [checkForUpdates])
+  useInterval(checkForUpdates, 30 * 60 * 1000)  // 每 30 min 复检
+
+  if (!autoUpdaterResult?.version && (!versions.global || !versions.latest)) return null
+  if (!autoUpdaterResult?.version && !isUpdating) return null
+  return <Box flexDirection="row" gap={1}>
+    {verbose && <Text dimColor wrap="truncate">globalVersion: ... &middot; latestVersion: ...</Text>}
+    {isUpdating ? <>
+        <Box><Text color="text" dimColor wrap="truncate">Auto-updating…</Text></Box>
+      </> : autoUpdaterResult?.status === 'success' && showSuccessMessage && updateSemver && (
+        <Text color="success" wrap="truncate">✓ Update installed · Restart to apply</Text>
+      )}
+    {(autoUpdaterResult?.status === 'install_failed' || autoUpdaterResult?.status === 'no_permissions') && (
+      <Text color="error" wrap="truncate">
+        ✗ Auto-update failed &middot; Try <Text bold>claude doctor</Text> or{' '}
+        <Text bold>
+          {hasLocalInstall ? `cd ~/.claude/local && npm update ${MACRO.PACKAGE_URL}` : `npm i -g ${MACRO.PACKAGE_URL}`}
+        </Text>
+      </Text>
+    )}
+  </Box>
+}
+```
+
+#### 21.4.9 NativeAutoUpdater 的 8 类错误分类
+
+`NativeAutoUpdater.tsx:19-42`：
+
+```ts
+function getErrorType(errorMessage: string): string {
+  if (errorMessage.includes('timeout')) return 'timeout'
+  if (errorMessage.includes('Checksum mismatch')) return 'checksum_mismatch'
+  if (errorMessage.includes('ENOENT') || errorMessage.includes('not found')) return 'not_found'
+  if (errorMessage.includes('EACCES') || errorMessage.includes('permission')) return 'permission_denied'
+  if (errorMessage.includes('ENOSPC')) return 'disk_full'
+  if (errorMessage.includes('npm')) return 'npm_error'
+  if (errorMessage.includes('network') || errorMessage.includes('ECONNREFUSED') || errorMessage.includes('ENOTFOUND')) return 'network_error'
+  return 'unknown'
+}
+```
+
+错误分类是**埋点关键** — 让 SRE / oncall 能精准定位故障类型（timout vs permission vs checksum）。
+
+#### 21.4.10 升级期间移除 Native Symlink
+
+`AutoUpdater.tsx:87-90`：
+
+```ts
+// Remove native installer symlink since we're using JS-based updates
+// But only if user hasn't migrated to native installation
+const config = getGlobalConfig()
+if (config.installMethod !== 'native') {
+  await removeInstalledSymlink()
+}
+```
+
+避免 **double-installation**：如果原本是 native 安装但切到 npm install，需要先把 symlink 移除。
+
+#### 21.4.11 5 min 退避 + Lock 死信
+
+`installGlobalPackage`（`autoUpdater.ts:456-533`）：
+
+```ts
+export async function installGlobalPackage(specificVersion?: string | null): Promise<InstallStatus> {
+  if (!(await acquireLock())) {
+    logError(new AutoUpdaterError('Another process is currently installing an update'))
+    logEvent('tengu_auto_updater_lock_contention', {
+      pid: process.pid,
+      currentVersion: MACRO.VERSION as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    })
+    return 'in_progress'
+  }
+  try {
+    await removeClaudeAliasesFromShellConfigs()
+    // Check if we're using npm from Windows path in WSL
+    if (!env.isRunningWithBun() && env.isNpmFromWindowsPath()) {
+      logError(new Error('Windows NPM detected in WSL environment'))
+      logEvent('tengu_auto_updater_windows_npm_in_wsl', { currentVersion: ... })
+      console.error(`
+Error: Windows NPM detected in WSL
+... actionable error ...
+`)
+      return 'install_failed'
+    }
+    // ... npm install -g ...
+  } finally {
+    // Ensure we always release the lock
+    await releaseLock()
+  }
+}
+```
+
+#### 21.4.12 WSL + Windows NPM 检测
+
+`autoUpdater.ts:474-494` 是个**对 WSL 用户的实用提示**：检测到 `/mnt/c/` 下的 Windows NPM 时**主动报错**，因为这种配置下 npm install 会失败。
+
+#### 21.4.13 Release 工程化决策审计
+
+| 决策点 | 关键文件 | 行号 | 设计价值 |
+|--------|----------|------|---------|
+| 编译期版本 | `build.rs` | — | LAEW_BUILD_TIME / LAEW_GIT_HASH 注入 |
+| assertMinVersion | `autoUpdater.ts:70-99` | 30 | 进程级强制升级 |
+| maxVersion | `autoUpdater.ts:101-138` | 38 | 服务端 kill switch |
+| minimumVersion | `autoUpdater.ts:140-159` | 20 | 用户级版本锁定 |
+| Lock + TOCTOU | `autoUpdater.ts:176-249` | 74 | re-verify before unlink |
+| npm cwd=homedir | `autoUpdater.ts:326-330` | 5 | 防恶意 .npmrc 重定向 |
+| GCS fallback | `autoUpdater.ts:384-397` | 14 | native install 不依赖 npm |
+| 安装类型 dispatch | `AutoUpdater.tsx:104-131` | 28 | 4 种 install type 各自走对应路径 |
+| dev build 跳过 | `AutoUpdater.tsx:52-55` | 4 | 防止 dev 环境误升级 |
+| 30min 间隔 | `AutoUpdater.tsx:169` | 1 | useInterval 调 checkForUpdates |
+| isUpdatingRef | `AutoUpdater.tsx:46-47` | 2 | 防止 stale closure 双重升级 |
+| XDG 目录 | `installer.ts:115-132` | 18 | $XDG_DATA/CACHE/STATE/BIN_HOME 完整 |
+| musl 检测 | `installer.ts:103-105` | 3 | linux-arm64-musl 区分 |
+| 7天 stale lock | `installer.ts:78-79` | 2 | mtime-based 兜底 |
+| 8 类错误 | `NativeAutoUpdater.tsx:19-42` | 24 | 故障精准定位 |
+| Native symlink 清理 | `AutoUpdater.tsx:87-90` | 4 | 切通道不重复安装 |
+| WSL 报错 | `autoUpdater.ts:474-494` | 21 | Windows NPM 不可用提示 |
+| Lock 竞争事件 | `autoUpdater.ts:464-468` | 5 | tengu_auto_updater_lock_contention |
+
+### 21.5 对 laew 的借鉴路线图
+
+#### 21.5.1 P0（必须借鉴，1-2 周可落地）
+
+| 借鉴项 | 落地点 | 价值 |
+|--------|--------|------|
+| **Bridge 启动 5 阶段** + 崩溃恢复指针 | `src/bridge/bridgePointer.ts`（laew 还没有） | 远程控制 / IDE 集成的核心 |
+| **OAuth 401 单次 refresh + 单次 retry** | `src/llm/auth.rs`（laew 的 API Key 同样需要 refresh） | 减少 401 误中断 |
+| **路径注入白名单** `SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/` | `src/utils/pathSafety.ts`（新增） | SSRF / 路径遍历 |
+| **Bundled Skill 注册 + O_NOFOLLOW | O_EXCL + 0o700/0o600** | laew 暂用内存注册；持久化时必须照搬 | 文件级安全 |
+| **Lock TOCTOU 防御**（re-verify staleness before unlink） | laew 启动期 .update.lock | 防止多进程双重升级 |
+| **npm cwd=homedir 防恶意 .npmrc** | 如果 laew 后续做 install 流程 | 安全 |
+| **i18n 关键错误消息** 中文 | `rust-i18n` + 中文 YAML | 中文用户体验差异 |
+| **5min refresh buffer + 3 失败放弃** | `src/llm/oauth_refresh.rs` | token 刷新的正确姿势 |
+
+#### 21.5.2 P1（值得借鉴，1-2 月可落地）
+
+| 借鉴项 | 落地点 | 价值 |
+|--------|--------|------|
+| **6 源 Skill 加载**（managed/user/project/additional/legacy/mcp） | `src/agent/skills/loader.rs`（重构） | 复杂部署场景 |
+| **17 字段 frontmatter** + `paths` 条件激活 | `src/agent/skills/parser.rs` | 强表达力 |
+| **`${CLAUDE_SKILL_DIR}` / `${CLAUDE_SESSION_ID}` 模板变量** | Skill 执行期 | Skill 复用 |
+| **MCP skill 不执行 `!` shell 注入** | laew 的 Skill 执行器 | 远程 Skill 安全 |
+| **Plugin ID `{name}@{marketplace}`** | laew 暂无 plugin，但可以预想 | 一等公民 |
+| **Plugin Autoupdate 启动期后台** | laew 暂无 | 一等公民 |
+| **maxVersion 服务端 kill switch** | laew 暂无服务端配置能力 | 高级特性 |
+| **10min at-capacity poll + 60s heartbeat** | laew 暂无远程控制 | 高级特性 |
+| **Native vs JS 双通道** | laew 暂用单通道 | 多平台分发 |
+| **per-session 24h timeout** | laew 的 Session 可加上 | 长 session 安全 |
+| **8 类错误分类埋点** | laew 的 cost-tracker / error 报告 | 故障定位 |
+
+#### 21.5.3 P2（参考借鉴，未来迭代）
+
+| 借鉴项 | 落地点 | 价值 |
+|--------|--------|------|
+| **完整 i18n 系统** | rust-i18n 全量资源 | 多语言 |
+| **OAuth refresh + trusted device token** | laew 暂无多用户/企业 | 企业级 |
+| **Appcast / Sparkle 风格 OTA** | laew 暂无 | 桌面应用 |
+| **Plugin Marketplace 生态** | 太大（42 个文件 / 20K+ 行） | 高级 |
+| **5 phase bridge 完整编排** | laew 暂无 | IDE 集成 |
+| **Native XDG 目录 + 7day stale lock** | laew 暂无 | 桌面平台 |
+| **MCP marketplace 镜像** | 未来 | 高级 |
+
+### 21.6 综合：四维度交叉点
+
+四个新维度实际上**通过 Session/Context 互相耦合**，形成"Agent 远程化"的完整图景：
+
+```
+       +------------------+
+       |  Claude.ai (Web) |
+       +--------+---------+
+                | HTTPS + OAuth
+                v
+       +--------+---------+        WebSocket
+       |  Bridge Server   |<------------------+
+       |  /v1/environments|                   |
+       |  /v1/sessions    |                   |
+       +--------+---------+                   |
+                | pollForWork                 |
+                v                             |
+       +--------+---------+                   |
+       |  Bridge CLI      |                   |
+       |  (local)         |                   |
+       +--------+---------+                   |
+                | spawns                      |
+                v                             |
+       +--------+---------+                   |
+       |  Session Process |   ingress JWT     |
+       |  (claude -p)     |------------------>+
+       |  Skills + Hooks  |
+       |  Tools + Plugins |
+       +------------------+
+                ^
+                | Skills (6 源)
+                | Marketplace (autoupdate)
+                |
+       +--------+---------+
+       |  GCS / npm / GCS |   <-- Release (assertMinVersion / maxVersion)
+       +------------------+
+```
+
+关键交叉点：
+- **Bridge ↔ Session**：`SessionHandle` 包含 `accessToken`（session_ingress_token），由 Bridge 通过 `workSecret` 注入到子进程
+- **Skill ↔ Bridge**：`loadSkillsDir` 缓存 + Bridge 启动期 5 阶段都做 `clearSkillCaches()`
+- **i18n ↔ Bash**：`BashPermissions` 透传 `LANGUAGE/LC_ALL/LC_MESSAGES`，子进程自然处理 locale
+- **Release ↔ Bridge**：`maxVersion` 配置既能卡 Bridge 升级，也能卡 npm install 升级
+- **Plugin ↔ Bridge**：Plugin `marketplace_official` 在启动期 autoupdate，与 Bridge 启动期重叠
+
+### 21.7 关键文件路径汇总
+
+#### 21.7.1 Bridge 远程控制（src/bridge/ + src/remote/）
+
+| 文件 | 行数 | 关键内容 |
+|------|------|---------|
+| `src/bridge/types.ts` | 262 | BridgeConfig/WorkResponse/WorkSecret/BridgeApiClient/SessionHandle |
+| `src/bridge/bridgeApi.ts` | 539 | HTTP 客户端 + OAuth 401 retry + BridgeFatalError + SAFE_ID_PATTERN |
+| `src/bridge/bridgeEnabled.ts` | 203 | feature('BRIDGE_MODE') + 3 GrowthBook gate + 4 诊断消息 |
+| `src/bridge/bridgeMain.ts` | 2999 | standalone `claude remote-control` 主循环（多 session） |
+| `src/bridge/bridgeConfig.ts` | 48 | CLAUDE_BRIDGE_OAUTH_TOKEN / CLAUDE_BRIDGE_BASE_URL ant-only 覆写 |
+| `src/bridge/initReplBridge.ts` | 569 | REPL 启动期注入（bootstrap state 读 OAuth/cwd/sessionId） |
+| `src/bridge/replBridge.ts` | 2406 | initBridgeCore 5 阶段（register→create→poll→ingress→teardown） |
+| `src/bridge/replBridgeTransport.ts` | 370 | v1=HybridTransport / v2=SSETransport+CCRClient 适配器 |
+| `src/bridge/pollConfig.ts` | 110 | Zod 校验 + GrowthBook 5min refresh 的 7 字段 poll config |
+| `src/bridge/pollConfigDefaults.ts` | 82 | 默认 2s/10min/60s heartbeat/2min keepalive |
+| `src/bridge/jwtUtils.ts` | 256 | decodeJwtPayload + 5min refresh buffer + 3 失败放弃 |
+| `src/bridge/workSecret.ts` | 127 | session_ingress_token + api_base_url + sources |
+| `src/bridge/sessionRunner.ts` | 550 | 子进程 spawn + env 注入 |
+| `src/bridge/sessionIdCompat.ts` | 57 | cse_* ↔ session_* shim |
+| `src/bridge/trustedDevice.ts` | 210 | X-Trusted-Device-Token + SecurityTier=ELEVATED |
+| `src/bridge/bridgePointer.ts` | ? | 崩溃恢复指针（repl vs standalone） |
+| `src/bridge/bridgeDebug.ts` | ? | ant-only 故障注入 |
+| `src/bridge/flushGate.ts` | 71 | writeMessages 批门控 |
+| `src/bridge/inboundMessages.ts` | 80 | 服务端 → 客户端 入口消息分类 |
+| `src/bridge/inboundAttachments.ts` | 175 | 上传附件落地 |
+| `src/bridge/bridgeMessaging.ts` | ? | handleIngressMessage + handleServerControlRequest |
+| `src/bridge/bridgeStatusUtil.ts` | ? | 状态栏工具（duration 格式） |
+| `src/bridge/bridgeUI.ts` | ? | createBridgeLogger（banner/QR code/状态行） |
+| `src/bridge/capacityWake.ts` | ? | at-capacity 早醒信号 |
+| `src/bridge/debugUtils.ts` | 141 | describeAxiosError + extractHttpStatus + logBridgeSkip |
+| `src/bridge/envLessBridgeConfig.ts` | 165 | v2 路径的 min_version 校验 |
+| `src/bridge/createSession.ts` | 384 | POST /v1/sessions + git source/outcome 注入 |
+| `src/bridge/bridgePermissionCallbacks.ts` | ? | 权限响应的回调桥 |
+| `src/remote/RemoteSessionManager.ts` | 343 | 订阅 + 发消息 + 权限请求/响应 协调 |
+| `src/remote/SessionsWebSocket.ts` | 404 | WS 客户端 + 重连退避 |
+| `src/remote/sdkMessageAdapter.ts` | 302 | 内部 Message[] ↔ SDKMessage[] 适配 |
+| `src/remote/remotePermissionBridge.ts` | 78 | 权限响应回填 |
+
+#### 21.7.2 Skill 一等公民（src/skills/ + src/plugins/ + src/utils/plugins/）
+
+| 文件 | 行数 | 关键内容 |
+|------|------|---------|
+| `src/skills/loadSkillsDir.ts` | 1086 | 6 源加载 + dedup by realpath + 动态发现 + 条件激活 |
+| `src/skills/bundledSkills.ts` | 220 | 编译期注册 + O_NOFOLLOW | O_EXCL + 0o700/0o600 |
+| `src/skills/mcpSkillBuilders.ts` | 44 | MCP 暴露 skill 的转换 |
+| `src/skills/bundled/index.ts` | — | bundled skill 启动注册（17 文件 / 29 处） |
+| `src/skills/bundled/claudeApi.ts` | — | 语言自动检测 + 247KB 文档懒加载 |
+| `src/skills/bundled/claudeApiContent.ts` | — | 247KB .md 字符串（lazy import） |
+| `src/plugins/builtinPlugins.ts` | — | Built-in plugin 注册 + 用户启停 |
+| `src/plugins/bundled/` | — | 编译期内置插件 |
+| `src/utils/plugins/pluginLoader.ts` | 3302 | 主加载器（dependency + scope 决策） |
+| `src/utils/plugins/schemas.ts` | 1681 | Zod schema（manifest/marketplace/settings） |
+| `src/utils/plugins/installedPluginsManager.ts` | 1268 | 已装插件的磁盘管理 |
+| `src/utils/plugins/loadPluginCommands.ts` | 946 | 从插件加载 commands/skills |
+| `src/utils/plugins/validatePlugin.ts` | 903 | 完整校验链 |
+| `src/utils/plugins/mcpbHandler.ts` | 968 | .mcpb 桌面扩展协议 |
+| `src/utils/plugins/mcpPluginIntegration.ts` | 634 | 插件内 MCP server 集成 |
+| `src/utils/plugins/marketplaceManager.ts` | 2643 | marketplace 配置 + git clone + refresh |
+| `src/utils/plugins/pluginInstallationHelpers.ts` | 595 | 安装辅助 |
+| `src/utils/plugins/loadPluginHooks.ts` | 287 | 插件 hook 集成 |
+| `src/utils/plugins/loadPluginAgents.ts` | 348 | 插件 agent 集成 |
+| `src/utils/plugins/loadPluginOutputStyles.ts` | 178 | 输出样式 |
+| `src/utils/plugins/pluginAutoupdate.ts` | 284 | 启动期后台自动更新 |
+| `src/utils/plugins/pluginStartupCheck.ts` | 341 | 启动期健康检查 |
+| `src/utils/plugins/pluginOptionsStorage.ts` | 400 | 插件 KV 存储 |
+| `src/utils/plugins/reconciler.ts` | 265 | 已装/期望 状态调和 |
+| `src/utils/plugins/marketplaceHelpers.ts` | 592 | 加载优雅降级 + source 展示 |
+| `src/utils/plugins/officialMarketplaceGcs.ts` | 216 | 官方 GCS marketplace |
+| `src/utils/plugins/officialMarketplaceStartupCheck.ts` | 439 | 官方 marketplace 启动期探测 |
+| `src/utils/plugins/cacheUtils.ts` | 196 | GCS marketplace 缓存 |
+| `src/utils/plugins/dependencyResolver.ts` | 305 | 插件间依赖解析 |
+| `src/utils/plugins/installCounts.ts` | 292 | 遥测 |
+| `src/utils/plugins/fetchTelemetry.ts` | 135 | 远端拉取遥测 |
+| `src/utils/plugins/hintRecommendation.ts` | 164 | 推荐提示 |
+| `src/utils/plugins/gitAvailability.ts` | 69 | git 可用性 |
+| `src/utils/plugins/lspPluginIntegration.ts` | 387 | LSP 插件集成 |
+| `src/utils/plugins/lspRecommendation.ts` | 374 | LSP 推荐 |
+| `src/utils/plugins/zipCacheAdapters.ts` | 164 | zip 缓存适配器 |
+| `src/utils/plugins/zipCache.ts` | 406 | zip 缓存 |
+| `src/utils/plugins/refresh.ts` | 215 | 拉取刷新 |
+| `src/utils/plugins/pluginIdentifier.ts` | 123 | `name@marketplace` 解析 |
+| `src/utils/plugins/pluginFlagging.ts` | 208 | 标记可疑/有缺陷 |
+| `src/utils/plugins/pluginVersioning.ts` | 157 | 插件版本兼容 |
+| `src/utils/plugins/pluginBlocklist.ts` | 127 | 黑名单 |
+| `src/utils/plugins/parseMarketplaceInput.ts` | 162 | 输入解析 |
+| `src/utils/plugins/orphanedPluginFilter.ts` | 114 | 孤儿清理 |
+| `src/utils/plugins/pluginDirectories.ts` | 178 | 目录约定 |
+| `src/utils/plugins/managedPlugins.ts` | 27 | 托管插件 |
+| `src/utils/plugins/addDirPluginSettings.ts` | 71 | --add-dir 合并 |
+| `src/utils/plugins/pluginPolicy.ts` | 20 | 策略决策 |
+| `src/utils/plugins/walkPluginMarkdown.ts` | 69 | 插件 .md 遍历 |
+| `src/utils/plugins/officialMarketplace.ts` | 25 | 官方 marketplace 常量 |
+
+#### 21.7.3 i18n 国际化（极简）
+
+| 文件 | 行数 | 关键内容 |
+|------|------|---------|
+| `src/utils/formatBriefTimestamp.ts` | 81 | POSIX env → BCP 47 + runtime 校验 |
+| `src/tools/BashTool/bashPermissions.ts` | — | LANGUAGE/LC_ALL/LC_MESSAGES 透传 |
+| `src/hooks/useVoice.ts` | 1144 | STT DEFAULT_STT_LANGUAGE='en' + LANGUAGE_NAME_TO_CODE |
+| `src/skills/bundled/claudeApi.ts` | — | LANGUAGE_INDICATORS（按 cwd 入口文件后缀） |
+
+#### 21.7.4 Release 工程化（src/utils/autoUpdater.ts + src/utils/nativeInstaller/ + src/components/）
+
+| 文件 | 行数 | 关键内容 |
+|------|------|---------|
+| `src/utils/autoUpdater.ts` | 561 | assertMinVersion + maxVersion + acquireLock + getLatestVersion(GCS/npm) |
+| `src/components/AutoUpdater.tsx` | 197 | JS 通道 React UI + isUpdatingRef + 30min interval |
+| `src/components/NativeAutoUpdater.tsx` | 192 | Native 通道 React UI + 8 类错误分类 |
+| `src/utils/nativeInstaller/installer.ts` | — | XDG 目录 + 平台检测 + 7day stale lock |
+| `src/utils/nativeInstaller/index.ts` | — | 入口 |
+| `src/utils/nativeInstaller/download.ts` | — | 版本下载 + checksum 校验 |
+| `src/utils/nativeInstaller/pidLock.ts` | — | PID-based 进程锁 |
+| `src/utils/nativeInstaller/packageManagers.ts` | — | 包管理器抽象 |
+
+### 21.8 本轮不重复声明
+
+第八轮深挖**不重复**前七轮已写过的内容。明确**不覆盖**：
+
+| 维度 | 已写入章节 | 来源 |
+|------|----------|------|
+| Edit 工具 / NotebookEdit / Glob / Grep / Multimodal / Read 优化 / BLOCKED_DEVICES / Read dedup / image sharp | **20.1 Edit 唯一性 / 20.2 NotebookEdit / 20.3 Glob&Grep / 20.4 Multimodal** | 第七轮 |
+| Prompt Caching（单 marker 末尾 / 5m&1h TTL / cache_control / 12 维 break 检测） | **20.4.4-20.4.6** | 第七轮 |
+| Cost Tracker（cache_read/cache_creation 透出） | **20.4.7** | 第七轮 |
+| Sandbox（macOS/Linux/WSL2+ bwrap） | **20.4.10 + 17-19 章横向专题** | 第七轮 |
+| 4 级压缩管线（microcompact / auto / manual） | **17.x** | 第五轮 |
+| 27 种 Hook | **17.x / 18.x** | 第五-六轮 |
+| 5 种执行器（subagent / foreground / background / localagent / localcommand） | **17.x** | 第五轮 |
+| 40+ 工具统一抽象 | **19.第七轮** | 第七轮 |
+| Ink Fork 渲染 / 16ms 帧率节流 | **17.x / 18.x** | 第五-六轮 |
+| Bridge RPC 协议 wire / SSE chunk / partial JSON | **19.1 + 20.1** | 第六-七轮 |
+| Tool Schema 投影 / 协议中立 ToolResult | **19.2** | 第六轮 |
+| 协议调用真实实现（Anthropic / OpenAI 13 维度） | **19.x** | 第六-七轮 |
+| 错误处理重试 / 熔断器 | **17.x 横向专题** | 第五轮 |
+| 可观测性 / 5 级 opt-out / 决策审计 | **17.x 横向专题** | 第五轮 |
+| 会话持久化 / 崩溃恢复 / JSONL 撕裂修复 | **17.x 横向专题** | 第五轮 |
+| 测试体系 / vitest-evals / 录制回放 | **17.x 横向专题** | 第五轮 |
+| 配置系统 / 8 层发现链 / 5 源 + 安全隔离 | **17.x 横向专题** | 第五轮 |
+| 插件生态 / Cordis Fiber 六态 | **17.x 横向专题** | 第五轮 |
+| SubAgent 调度 / 并发 / 权限继承降级 | **19.2 + 20.4.10** | 第六-七轮 |
+| Goal 状态机 / Workflow ralph | **18.x + 20.4** | 第六-七轮 |
+| Hook 系统 / 拦截器 | **18.x** | 第六轮 |
+| 5 phase Task 分类 / 意图识别 | **17.x + 19.x** | 第五-六轮 |
+| 多 Agent 编排 / TeamAgent | **18.x + 20.x** | 第六-七轮 |
+| LSP 集成 / WebFetch / Bash PTY | **19.x + 20.x** | 第六-七轮 |
+| 文件编辑 / 补丁策略 | **20.x** | 第七轮 |
+| 代码检索 / 索引 | **20.x** | 第七轮 |
+| Git 集成 / checkpoint / undo | **20.x** | 第七轮 |
+| Bash 与 PTY 进程管理 | **20.x** | 第七轮 |
+| 多模态 / 文件处理 | **20.x** | 第七轮 |
+| 结构化输出 / Schema 校验 | **20.x** | 第七轮 |
+| Web 检索 / 网络访问 | **20.x** | 第七轮 |
+
+第八轮聚焦**前七轮未触及的四个新维度**：
+1. **Bridge 远程控制**（12,613 行 bridge + 1,127 行 remote）
+2. **Skill 一等公民 + Plugin Marketplace**（1,350 行 skills + 20,452 行 plugins = 21,802 行）
+3. **i18n 国际化**（**如实记录为反模式**）
+4. **Release 工程化**（autoUpdater 561 行 + 2 updater 组件 + native installer）
+
+三个新维度（B/S/R）都给出了**真实代码路径 + 行号 + 关键代码片段 + 17-19 维决策审计表**，i18n 维度**作为反模式如实记录**（这本身是 laew 的差异化机会）。最后给出 P0/P1/P2 借鉴路线图和关键文件路径汇总表。
