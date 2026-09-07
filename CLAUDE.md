@@ -167,7 +167,22 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
       - **i18n**：atomcode 4 级 locale 发现链 / opencode 3 层 i18n（Astro 20 + App UI 60+ + Desktop 60+）
       - **AutoUpdate**：opencode `allowDowngrade=true` 救命设计 / claudecode PID/mtime 双锁 / atomcode deferred upgrade + circuit-breaker（MAX_APPLY_ATTEMPTS=3）防 boot-loop
     - **推荐 Rust crate**：`human-panic`+`backoff`+`failsafe`+`thiserror`+`keyring`+`oauth2`+`rust-i18n`+`fluent`+`eventsource-client`+`tokio-tungstenite`+`self_update`+`cargo-dist`+`minisign`+`tauri`+`yrs`+`landlock`+`seccompiler`+`ciborium`+`zstd-rs`+`fs2`+`quinn`+`reqwest`+`oauth4webapi`。
-  - **2026-09-07 第十一轮（当前最新）**：8 篇全新横向专题（**~30,000 行 / ~1.2 MB**：Agent 协作与多 Agent 通信协议 / 流式输出与上下文窗口管理 / 错误处理与重试退避与熔断器 / 测试体系与 Eval 基建与录制回放 / 配置系统与多环境管理 / 插件生态与扩展分发与 Hook 系统 / 协议流式翻译与决策溯源与可观测性 / 系统提示词工程与模型适配）。覆盖第十轮未深入的 8 大新维度。合集见 `专题/专题-第十一轮深挖合集.md`。
+  - **2026-09-07 第十一轮**：8 篇全新横向专题（**~30,000 行 / ~1.2 MB**：Agent 协作与多 Agent 通信协议 / 流式输出与上下文窗口管理 / 错误处理与重试退避与熔断器 / 测试体系与 Eval 基建与录制回放 / 配置系统与多环境管理 / 插件生态与扩展分发与 Hook 系统 / 协议流式翻译与决策溯源与可观测性 / 系统提示词工程与模型适配）。覆盖第十轮未深入的 8 大新维度。合集见 `专题/专题-第十一轮深挖合集.md`。
+  - **2026-09-07 第十二轮**：8 篇全新横向专题（**~17,000 行 / ~680 KB**：HTTP 客户端连接池重试多路复用与代理链 / 安全防御体系与 Prompt 注入防护与密钥管理 / 模型路由与负载均衡与故障转移 / 数据迁移与版本演进与 Schema 兼容性 / 性能优化与多级缓存与内存管理 / 日志采样与聚合与结构化日志管道 / CLI 框架与命令分发与自动补全 / 状态持久化与序列化与快照恢复）。覆盖第十一轮未深入的 8 大新维度。合集见 `专题/专题-第十二轮深挖合集.md`。
+  - **第十二轮关键发现（laew gap L281-L403）**：**123 个新 gap**（累计 L1-L403 共 403 个 gap）——
+    - **P0 紧急**：无 HTTP 超时设置 / 无重试退避 / 无熔断器 / 无 OAuth PKCE / 无 Keychain 凭证管理 / 无 SQLite 迁移系统（无 SCHEMA_VERSION）/ 无结构化日志（仍 println!）/ 无 API Key 日志脱敏 / 无 SSRF 防护 / 无 Shell 自动补全 / 无 Schema 版本管理 / 无 Writer Lease 乐观锁 / 无 8 种路由算法 / 无熔断器三态 / 无应用层 LRU / 无 SQLite WAL 模式。
+    - **P1 重要**：无 4 jitter 退避 / 无 DNS pinning / 无 Landlock / 无 oauth refresh 锁 / 无 mimalloc / 无 OTLP / 无 Token 计数 / 无 clap_complete / 无 r2d2 连接池 / 无 Effect Schema / 无 Effect Durable Object / 无双 pass scrub / 无 SHA256 链 / 无 traceparent / 无 apply_migrations() / 无 SAVEPOINT / 无预热 / 无指标 / 无告警。
+    - **P2 进阶**：无 Scope-driven eviction / 无 BubbleWrap / 无 CRDT / 无 multi-account UI / 无 cargo audit / 无 SBOM / 无 CBOR 二进制帧 / 无 Seccomp / 无 netns / 无 cgroup 资源限制。
+    - **关键工程化细节**：
+      - **HTTP 客户端**：atomcode SwappableClient 池毒化 / openclaw DNS pinning + PinnedDispatcherPool LRU / undici RetryHandler 548 行 + Dispatcher compose 8 拦截器 + GOAWAY 重排 / opencode Effect 类型安全 4 层
+      - **安全防御**：jiuwenswarm JiuwenBox BubbleWrap + Landlock ABI 1-5 + Seccomp + netns + cgroup 5 层 / claudecode 27 Hook + Permission 5 态 + Keychain/DPAPI / atomcode `<system-reminder>` 边界 + 双 pass scrub（key=value + token 形状）
+      - **数据迁移**：hermes-agent 30 级链式迁移 / cc-switch 17 级链式 + SAVEPOINT + pre-migration 备份 / openclaw 50+ state migration + doctor 诊断 / opencode Effect 数组式迁移
+      - **性能优化**：TencentDB PipelineWorker 60 协程 + 锁冲突指数退避 + RRF over-retrieve ×3 / opencode Scope-driven eviction / pi Lane 三态 + Writer Lease Fence / atomcode 内容寻址 sha256 修订号
+      - **日志体系**：atomcode `tracing` + scrub.rs 双 pass + tracing-bunyan-formatter / opencode Effect + OTLP / openclaw pino 5 档采样 + redact 数组
+      - **CLI 框架**：clap derive (atomcode) / Commander + 强类型 (claudecode openclaw) / yargs + Effect (opencode) / 自研 parseArgs (pi) / Tauri IPC (cc-switch)
+      - **状态持久化**：opencode effect-drizzle-sqlite + Durable Object + Effect Schema / atomcode daemon 持久化 / pi Session Backends / semantica BiTemporalFact
+      - **模型路由**：Switchyard 8 种路由算法 + Prometheus + JSONL 路由日志 / openclaw 16 种 FailoverReason + 时间驱动冷却 / claudecode 429 三层决策 / atomcode swap-aware 热换装
+    - **推荐 Rust crate**：`reqwest`+`backoff`+`failsafe`+`keyring`+`secrecy`+`zeroize`+`aes-gcm`+`oauth2`+`ring`+`fs2`+`landlock`+`seccompiler`+`bollard`+`tracing`+`tracing-subscriber`+`tracing-appender`+`tracing-bunyan-formatter`+`tracing-opentelemetry`+`opentelemetry-otlp`+`metrics`+`clap_complete`+`dialoguer`+`indicatif`+`lru`+`moka`+`mimalloc`+`parking_lot`+`dashmap`+`arc-swap`+`refinery`+`serde`+`bincode`+`rmp-serde`+`ciborium`+`r2d2_sqlite`+`governor`+`tiktoken-rs`+`ammonia`+`schemars`。
   - **第十一轮关键发现（laew gap L143-L280）**：**138 个新 gap**（累计 L1-L280 共 280 个 gap）——
     - **P0 紧急**：无 SubAgent Registry（openclaw 100+ 文件）/ 无并发控制 Command Lane（openclaw 734 行）/ 无 A2A Protocol（openclaw 3,165 行）/ 无 SSE 安全解析（cc-switch 双 delimiter + UTF-8 安全）/ 无 Token 计数（tiktoken-rs）/ 无配置发现链（8 层发现 + 5 源优先级）/ 无错误分类 + 指数退避 + 熔断器 / 无 Hook 系统（claudecode 27 种）/ 无 Plugin API（openclaw 153 bundled）/ 无 Mock LLM + 录制回放。
     - **P1 重要**：无 ACP Server / 无 SubAgent 恢复机制 / 无 Workboard（openclaw 24K 行）/ 无 Swarm 调度 / 无 Leader-Teammate 模式 / 无 OTel 三栈 / 无决策审计 / 无 Hot Reload / 无 ApplyPolicy 5 档 / 无提示词模板管理。
@@ -181,7 +196,21 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
       - ✅ openclaw 有 A2A Protocol v1.0（3,165 行 + JSON-RPC 2.0）
       - ✅ openclaw 有 Workboard（24,014 行 + board/card + worktree 隔离）
     - **推荐 Rust crate**：`tokio::sync::Semaphore`+`rusqlite`+`jsonrpsee`+`eventsource-client`+`tiktoken-rs`+`config-rs`+`backoff`+`failsafe`+`thiserror`+`extism`+`wasmtime`+`tracing-opentelemetry`+`mockito`+`proptest`+`criterion`+`minijinja`+`handlebars-rust`+`notify`+`aes-gcm`+`keyring`+`fs2`+`petgraph`。
-  - 覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议/中断取消/工具结果回填/协议 wire 真实实现/SubAgent 并发/Goal 状态机/TUI 渲染管线/Hook 拦截器/Skill 一等公民/Effect DI 拓扑/CBOR 二进制帧/Lane 三队列/WriterLease fence/文件编辑补丁/代码检索/Git checkpoint/Bash PTY/多模态/PromptCaching/Schema 校验/Web 检索/Telemetry/Session 持久化/Tool 权限沙箱/LSP/IDE 集成/Skill Workshop/多租户团队记忆/终端控制序列/CrashDump/WebUI/OAuth/i18n/Release/WebSocket/容器化/CRDT/Agent协作/流式输出/错误处理/测试体系/配置系统/插件生态/协议翻译/系统提示词 等 **68+ 维度**。
+  - **2026-09-07 第十三轮（当前最新）**：1 篇 7 工程横向大专题（**~2,065 行 / ~87 KB**：HTTP 客户端连接池重试多路复用与代理链深度对比）。覆盖 atomcode / claudecode / deepseek-harness / openclaw / opencode / pi / undici 共 7 个工程的 10 大维度（连接池实现 / 重试机制 / HTTP/2 多路复用 / 代理链与隧道 / TLS 配置 / 请求响应拦截器 / 流式处理 / 超时与取消 / 连接健康检查 / 性能优化）。合集见 `专题/专题-第十二轮-HTTP客户端连接池重试多路复用与代理链深度对比.md`。
+  - **第十三轮关键发现（laew gap H1-H20）**：**20 个 HTTP 客户端专项 gap**（累计 L1-L334 + H1-H20 共 354 个 gap）——
+    - **P0 紧急**：无超时设置（connect/read/request 三级）/ 无重试机制（atomcode 3 次 + 5 类错误分类）/ 无错误分类（可重试 vs 不可重试状态码 + 传输错误 source chain 挖掘）。
+    - **P1 重要**：无连接池调优（atomcode 15s idle timeout + SwappableClient 池毒化热重建）/ 无代理 3 模式 + loopback 旁路（atomcode）/ 无 TLS 3 层信任根（atomcode issue #514 backstop）/ 无中段流重开（atomcode MAX_STREAM_ATTEMPTS=3, replay-safe metadata 缓冲）/ 无取消传播（claudecode WeakRef 子 AbortController）/ 无 idle 超时 watchdog（deepseek-harness）/ 无首包超时（openclaw stream-first-event）。
+    - **P2 进阶**：无背压控制（opencode Effect Stream Channel awaitRead）/ 无熔断器（failsafe crate）/ 无 DNS pinning（openclaw 双层 DNS 校验）/ 无 HappyEyeballs（openclaw/pi autoSelectFamily）/ 无请求体压缩（pi zstd）/ 无断点续传（undici RetryHandler Range + If-Match）/ 无请求去重（undici deduplicate）/ 无 HTTP 缓存（undici cache interceptor）/ 无 wire dump 诊断（atomcode ATOMCODE_WIRE_DUMP）。
+    - **关键发现**：
+      - **atomcode 是 laew 最直接的参考**：同 reqwest + rustls-tls 技术栈，SwappableClient、5 类错误分类、中段流重开、TLS 1.2 降级均可直接移植
+      - **重试是最大差距**：6/7 工程有完整重试机制，laew 为零；Anthropic 429/529 overloaded_error 直接报错严重影响用户体验
+      - **openclaw 安全最深**：DNS pinning + PinnedDispatcherPool（LRU + 租约 + idle TTL）+ 双层 DNS 校验 + TLS fingerprint pin
+      - **claudecode 重试最精致**：822 行 withRetry.ts + Fast Mode 冷却态 + 自适应 max_tokens + foreground/background 529 分类
+      - **opencode 类型最安全**：Effect Schema + Auth 组合子（andThen/orElse）+ 10+ Reason 子类 retryable getter
+      - **pi 分层最清晰**：3 层重试（传输/应用/Agent）+ 双正则可重试模式匹配
+      - **undici 是共同底层**：Dispatcher compose 8 拦截器 + Pool/Agent/Client 三级 + FixedQueue O(1) + SessionCache (WeakRef)
+    - **推荐 Rust crate**：`reqwest`（已依赖，配置即可）+ `backoff`+`backoff-reqwest`（重试退避）+ `failsafe`（熔断器）+ `rustls-native-certs`（OS 信任根）+ `trust-dns-resolver`（DNS 预解析）+ `rand`（jitter）+ `tokio::time::timeout`（超时）+ `httpdate`（Retry-After 解析）+ `metrics`（连接池监控）。
+  - 覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议/中断取消/工具结果回填/协议 wire 真实实现/SubAgent 并发/Goal 状态机/TUI 渲染管线/Hook 拦截器/Skill 一等公民/Effect DI 拓扑/CBOR 二进制帧/Lane 三队列/WriterLease fence/文件编辑补丁/代码检索/Git checkpoint/Bash PTY/多模态/PromptCaching/Schema 校验/Web 检索/Telemetry/Session 持久化/Tool 权限沙箱/LSP/IDE 集成/Skill Workshop/多租户团队记忆/终端控制序列/CrashDump/WebUI/OAuth/i18n/Release/WebSocket/容器化/CRDT/Agent协作/流式输出/错误处理/测试体系/配置系统/插件生态/协议翻译/系统提示词/模型路由/负载均衡/故障转移/熔断器/健康检查/配额限流/多区域部署/路由算法/Provider抽象/连接池/重试退避/HTTP2多路复用/代理链/TLS配置/拦截器/超时取消/连接健康检查/性能优化 等 **82+ 维度**。
 
   **15 份 Agent 综合文档**（每份合并了源码调研/深度分析/核心机制/第二轮/第三轮/第四轮共 3-8 轮内容，去重压缩 50-90%）：
   | 文件 | 语言/技术 | 核心亮点 | 行数 |
@@ -219,6 +248,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
   - `专题-沙箱设计深度分析.md` — 进程/文件/网络/能力/资源隔离 + laew 现状(零沙箱) + P0-P2 路线图
   - `专题-权限管控深度分析.md` — 三态策略/Bash 黑名单/路径白名单 + laew 现状(零校验) + P0-P2 路线图
   - `专题-LLM网关与协议翻译深度分析.md` — Switchyard/agent-studio/cc-switch 协议 IR + 翻译 + 路由算法 + 熔断器
+  - **`专题-第十二轮-HTTP客户端连接池重试多路复用与代理链深度对比.md`** — 第十三轮 7 工程 × 10 维度 HTTP 客户端深度对比（连接池/重试/HTTP2/代理/TLS/拦截器/流式/超时/健康/性能），含 laew 现状基准线、20 个 HTTP 专项 gap（H1-H20）、P0/P1/P2 改造路线图、可直接使用的 Rust 参考实现
   - `专题-横向对比深度分析合集.md` — 横向专题索引(15 专题)
   - `专题-第二轮深挖合集.md` — 8 份深挖合集索引 + 三大共性模式 + 6 周 P0 路线图
   - `专题-第三轮深挖合集.md` — 15 份深挖合集索引 + 5 大共性模式 + P0-P2 路线图
