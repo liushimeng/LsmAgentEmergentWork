@@ -121,11 +121,38 @@ impl QualityRunner {
         sub_session.id = session_id.to_string();
 
         let (text, usage) = self.agent.run_session(&mut sub_session).await?;
-        let report = parse_quality_report(&text, source).unwrap_or_else(|e| {
-            // 容错:解析失败时默认通过(避免误判)
-            tracing::warn!("Quality 报告解析失败,默认通过: {}", e);
-            QualityReport::pass(source)
-        });
+        // P0:fail-closed —— 解析失败时返回 Verdict::Fail + retryable=true,
+        // 触发 Yolo 回流,而非 fail-open(默认 Pass)绕过质检门。
+        // 设计依据:`docs/Agent源码调研/专题-第八轮-Tool权限策略引擎与沙箱设计深度对比.md`
+        // —— 5 态权限状态机 + fail-closed 默认;以及第十四轮 §1.2 错误恢复专题
+        // —— silent pass 等于绕过熔断。
+        let report = match parse_quality_report(&text, source) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    source = %source.as_str(),
+                    "Quality 报告解析失败,fail-closed:返回 Verdict::Fail 触发回流"
+                );
+                // 落 Agent-Memory 记录原始输出长度,便于未来加入 JSON 修复链
+                // (参考 atomcode repair.rs 8 段修复)
+                let _ = memory::record_entry(
+                    &self.db,
+                    AgentRole::QualityCheck,
+                    session_id,
+                    "parse_failed",
+                    &text,
+                    Some(&format!("解析失败: {e}")),
+                    serde_json::json!({ "raw_output_len": text.len() }),
+                );
+                QualityReport::fail(
+                    source,
+                    vec![format!("Quality 报告解析失败: {e}")],
+                    "请确保 LLM 输出合法 JSON verdict/report 字段;建议重试或补充上下文。",
+                    true,
+                )
+            }
+        };
 
         let _ = memory::record_entry(
             &self.db,
@@ -240,5 +267,60 @@ mod tests {
 ```"#;
         let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
         assert_eq!(r.verdict, Verdict::Pass);
+    }
+
+    // ========== P0 fail-closed 测试 ==========
+    // 验证 JSON 解析失败时返回 Verdict::Fail + retryable=true
+    // (替代历史的 fail-open 默认 Pass)
+
+    #[test]
+    fn parse_quality_report_no_json_fails_closed() {
+        // 完全无 JSON → 应返回 Err(让上游 fail-closed 转为 Fail)
+        let text = "这是一段不含 JSON 的自然语言,无法被解析为质检报告。";
+        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
+        assert!(format!("{err}").contains("JSON"));
+    }
+
+    #[test]
+    fn parse_quality_report_truncated_json_fails_closed() {
+        // JSON 被截断 / 不合法 → 应返回 Err
+        let text = r#"以下是质检报告:
+```json
+{
+  "verdict": "pass",
+  "source": "subagent",
+  "issues": [],
+  // 后面被截断"#;
+        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
+        assert!(format!("{err}").contains("JSON"));
+    }
+
+    #[test]
+    fn parse_quality_report_missing_required_field_fails_closed() {
+        // 缺 verdict 字段 → serde 反序列化失败 → Err
+        let text = r#"```json
+{
+  "source": "subagent",
+  "issues": [],
+  "retryable": false
+}
+```"#;
+        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
+        assert!(format!("{err}").contains("verdict"));
+    }
+
+    #[test]
+    fn quality_report_fail_constructor_sets_retryable() {
+        // 验证 fail-closed 路径所需的构造函数
+        let r = QualityReport::fail(
+            AgentRole::SubAgent,
+            vec!["Quality 报告解析失败: 字段缺失".to_string()],
+            "请确保 LLM 输出合法 JSON verdict/report 字段",
+            true,
+        );
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.retryable);
+        assert!(r.issues.iter().any(|i| i.contains("解析失败")));
+        assert!(r.suggestion.contains("JSON"));
     }
 }

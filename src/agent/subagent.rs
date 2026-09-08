@@ -115,9 +115,37 @@ impl SubAgentRunner {
 /// 简单启发式:从 LLM 输出中探测是否包含失败标记。
 ///
 /// 仅作辅助判定;真正的失败检测由 Quality-Check 完成。
+///
+/// **P0 增强**(2026-09-08):覆盖 LLM 中英双语常见失败措辞、大小写不敏感、
+/// 容忍前缀空白,避免漏判 LLM 真实失败输出导致 silently pass。
+/// 设计依据:`docs/Agent源码调研/专题-第八轮-Tool权限策略引擎与沙箱设计深度对比.md`
+/// —— 5 态权限状态机 + fail-closed 默认值。
 fn looks_like_failure(text: &str) -> bool {
     let t = text.trim();
-    t.starts_with("[失败]") || t.contains("FAILED:") || t.starts_with("ERROR:")
+    if t.is_empty() {
+        return false;
+    }
+    let lower = t.to_lowercase();
+
+    // 1) 英文失败关键词:大小写不敏感、容忍文本任意位置(LLM 自由格式输出)
+    const EN_PATTERNS: &[&str] = &[
+        "[failure]", "[failed]", "[error]", "failed:", "error:", "exception:",
+        "fatal error", "panic:", "crash:", "aborted:", "killed:",
+    ];
+    if EN_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+
+    // 2) 中文失败关键词:覆盖 LLM 中文输出的常见表达
+    const ZH_PATTERNS: &[&str] = &[
+        "[失败]", "执行失败", "未完成", "未能", "无法完成", "无法",
+        "异常退出", "出错了",
+    ];
+    if ZH_PATTERNS.iter().any(|p| t.contains(p)) {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -161,5 +189,55 @@ mod tests {
         assert!(looks_like_failure("ERROR: ..."));
         assert!(!looks_like_failure("已完成"));
         assert!(!looks_like_failure(""));
+    }
+
+    #[test]
+    fn looks_like_failure_case_insensitive_english() {
+        // 大小写不敏感(原本只命中大写 FAILED / ERROR)
+        assert!(looks_like_failure("failed: timeout"));
+        assert!(looks_like_failure("Failed: connection refused"));
+        assert!(looks_like_failure("ERROR: panic"));
+        assert!(looks_like_failure("Exception: NullPointerException"));
+        assert!(looks_like_failure("Fatal Error: out of memory"));
+        assert!(looks_like_failure("panic: thread main"));
+        assert!(looks_like_failure("crash: segmentation fault"));
+        assert!(looks_like_failure("aborted: signal 6"));
+        assert!(looks_like_failure("killed: SIGTERM"));
+    }
+
+    #[test]
+    fn looks_like_failure_chinese_variants() {
+        // 中文常见失败措辞
+        assert!(looks_like_failure("执行失败: 读取文件失败"));
+        assert!(looks_like_failure("未完成: 编译报错"));
+        assert!(looks_like_failure("未能找到目标文件"));
+        assert!(looks_like_failure("无法读取 /etc/passwd"));
+        assert!(looks_like_failure("无法完成该任务"));
+        assert!(looks_like_failure("异常退出 code 1"));
+        assert!(looks_like_failure("出错了: 网络超时"));
+    }
+
+    #[test]
+    fn looks_like_failure_prefix_whitespace_tolerated() {
+        // 容忍前缀空白 / 换行
+        assert!(looks_like_failure("\n\n[失败] 原因: ..."));
+        assert!(looks_like_failure("   FAILED: ..."));
+    }
+
+    #[test]
+    fn looks_like_failure_negative_cases() {
+        // 正向案例不应误判
+        assert!(!looks_like_failure("task successfully completed"));
+        assert!(!looks_like_failure("ok 已完成 30/30 用例"));
+        assert!(!looks_like_failure("success"));
+        assert!(!looks_like_failure("All tests passed"));
+        assert!(!looks_like_failure("正常退出"));
+    }
+
+    #[test]
+    fn looks_like_failure_no_substring_false_positive() {
+        // 反例:不能因 "ok" 之类子串误判
+        assert!(!looks_like_failure("ok"));
+        assert!(!looks_like_failure("完成")); // "完成" 不在关键词列表
     }
 }
