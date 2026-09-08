@@ -176,6 +176,11 @@ impl SystemPrompt {
             .set_protocol_tail(crate::config::Protocol::Anthropic, SESSION_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, SESSION_OPENAI_TAIL)
     }
+
+    /// 构造 Debug Agent 的系统提示词(调试层,trace 评估,无工具)。
+    pub fn debug() -> Self {
+        Self::without_tools(DEBUG_BASE_PROMPT)
+    }
 }
 
 /// Yolo Agent 基础身份与职责说明。
@@ -614,6 +619,38 @@ const SESSION_ANTHROPIC_TAIL: &str = "\
 const SESSION_OPENAI_TAIL: &str = "\
 [OpenAI 补充] 请按 Markdown 格式输出,简洁为主。";
 
+/// Debug Agent 基础身份与职责说明(调试层,trace 评估,无工具)。
+const DEBUG_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Debug,调试层的评估 Agent。
+
+你的唯一职责:阅读 laew 多 Agent 系统一次任务的调试 trace(LLM 调用记录 / Yolo 分类 / Quality-Check 结论 / 任务终态 / 性能与 token 统计),输出一份结构化的调试评估报告,帮助开发者发现问题、优化质量。
+
+你没有任何工具可用,不得执行任何命令或修改任何文件,只做文本评估。
+
+输出要求(严格按以下四章节输出 Markdown,章节标题保持原文):
+
+## 任务评估
+- 目标达成度:任务是否完成、结果是否与目标匹配
+- 档位选择合理性:Yolo 的 simple/medium/hard 分类是否恰当,是否存在过度委派或委派不足
+- 整体结论(一句话)
+
+## 质量报告
+- 各 Agent 输出质量逐一点评(Yolo / Plan / Main-Work / SubAgent-Work / Quality-Check / SessionContext,按 trace 中实际出现的)
+- QC 通过率与失败模式
+- token 使用与耗时是否合理
+
+## 问题报告
+- 列出 trace 中发现的所有问题(错误 / 重试 / 超时 / 空输出 / 异常模式)
+- 每个问题按 P0(紧急)/ P1(重要)/ P2(建议) 分级,并给出证据(引用 trace 中的事件序号)
+
+## 优化建议
+- 给出可落地的改进项,按优先级排序
+- 若 trace 健康无异常,明确说明「本次运行无显著问题」
+
+重要规则:
+- 只基于 trace 中的证据下结论,不要臆测
+- 引用证据时注明事件序号(如「事件 #3」)
+- 全文使用中文,简洁直接"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,14 +703,15 @@ mod tests {
     }
 
     #[test]
-    fn all_six_prompts_render_for_both_protocols() {
-        let builders: [fn() -> SystemPrompt; 6] = [
+    fn all_seven_prompts_render_for_both_protocols() {
+        let builders: [fn() -> SystemPrompt; 7] = [
             SystemPrompt::yolo,
             SystemPrompt::plan,
             SystemPrompt::main_work,
             SystemPrompt::sub_agent_work,
             SystemPrompt::quality_check,
             SystemPrompt::session_context,
+            SystemPrompt::debug,
         ];
         for f in builders {
             let sp = f();
@@ -686,13 +724,14 @@ mod tests {
 
     #[test]
     fn each_prompt_mentions_own_agent_name() {
-        let cases: [(&str, fn() -> SystemPrompt); 6] = [
+        let cases: [(&str, fn() -> SystemPrompt); 7] = [
             ("LsmAgentEmergentWork-Yolo", SystemPrompt::yolo),
             ("LsmAgentEmergentWork-Plan", SystemPrompt::plan),
             ("LsmAgentEmergentWork-Main-Work", SystemPrompt::main_work),
             ("LsmAgentEmergentWork-SubAgent-Work", SystemPrompt::sub_agent_work),
             ("LsmAgentEmergentWork-Quality-Check", SystemPrompt::quality_check),
             ("LsmAgentEmergentWork-SessionContext", SystemPrompt::session_context),
+            ("LsmAgentEmergentWork-Debug", SystemPrompt::debug),
         ];
         for (name, f) in cases {
             let rendered = f().render(Protocol::Anthropic);

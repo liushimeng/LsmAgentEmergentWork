@@ -25,3 +25,6 @@ tmpPlan/
 
 # testReport:保留报告与脚本,仅忽略大体量原始产物
 /testReport/
+
+# DebugReport(laew -debug 调试报告,自动落盘,不入库)
+DebugReport/

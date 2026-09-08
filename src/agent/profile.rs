@@ -14,8 +14,8 @@
 
 use crate::agent::system_prompt::SystemPrompt;
 use crate::agent::tools::{
-    builtin_registry, main_work_registry, plan_registry, quality_registry, session_context_registry,
-    sub_agent_work_registry, yolo_registry, ToolRegistry,
+    builtin_registry, debug_registry, main_work_registry, plan_registry, quality_registry,
+    session_context_registry, sub_agent_work_registry, yolo_registry, ToolRegistry,
 };
 
 // =================== Agent 名称常量 ===================
@@ -32,6 +32,8 @@ pub const SUB_AGENT_WORK_NAME: &str = "LsmAgentEmergentWork-SubAgent-Work";
 pub const QUALITY_CHECK_AGENT_NAME: &str = "LsmAgentEmergentWork-Quality-Check";
 /// SessionContext Agent(会话层)
 pub const SESSION_CONTEXT_AGENT_NAME: &str = "LsmAgentEmergentWork-SessionContext";
+/// Debug Agent(调试层,仅在 `-debug` 调试模式下启用)
+pub const DEBUG_AGENT_NAME: &str = "LsmAgentEmergentWork-Debug";
 
 /// 兼容旧名(指向 SubAgent-Work)。
 pub const WORK_AGENT_NAME: &str = SUB_AGENT_WORK_NAME;
@@ -100,6 +102,15 @@ impl AgentProfile {
             name: SESSION_CONTEXT_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::session_context(),
             tools: session_context_registry(),
+        }
+    }
+
+    /// Debug Agent profile(调试层,任务评估 / 质量报告 / 问题报告,无工具)。
+    pub fn debug_profile() -> Self {
+        Self {
+            name: DEBUG_AGENT_NAME.to_string(),
+            system_prompt: SystemPrompt::debug(),
+            tools: debug_registry(),
         }
     }
 

@@ -158,3 +158,8 @@ pub fn quality_registry() -> ToolRegistry {
 pub fn session_context_registry() -> ToolRegistry {
     ToolRegistry::new()
 }
+
+/// Debug Agent 工具注册表:无工具(只做 trace 评估,不修改系统状态)
+pub fn debug_registry() -> ToolRegistry {
+    ToolRegistry::new()
+}

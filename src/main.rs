@@ -51,6 +51,11 @@ struct Cli {
     #[arg(long, default_value_t = 16, global = true)]
     max_iterations: usize,
 
+    /// 调试模式:采集各 Agent 输入/输出/性能/质量,任务结束后由 Debug Agent 评估,
+    /// 报告写入根目录 DebugReport/(也支持 `-debug` 写法)
+    #[arg(long = "debug", global = true)]
+    debug: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -139,7 +144,7 @@ fn tail(s: &str, n: usize) -> String {
     s.chars().rev().take(n).collect::<String>().chars().rev().collect()
 }
 
-async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
+async fn run_one_shot(prompt: String, max_iterations: usize, debug: bool, mode: &str) -> Result<()> {
     let (paths, db) = open_db()?;
     let active = db
         .get_active()
@@ -150,22 +155,57 @@ async fn run_one_shot(prompt: String, max_iterations: usize) -> Result<()> {
     let user_agent = work_profile.user_agent();
     let llm = client_from_record(&active, &user_agent).map_err(anyhow::Error::from)?;
 
-    eprintln!("[laew] 单轮模式: protocol={} provider={} model={}",
-        active.protocol.as_str(), active.provider_name, active.model_name);
+    eprintln!("[laew] 单轮模式: protocol={} provider={} model={}{}",
+        active.protocol.as_str(), active.provider_name, active.model_name,
+        if debug { " [debug]" } else { "" });
 
-    // 构造 MultiAgentOrchestrator(6 角色)
+    // 构造 MultiAgentOrchestrator(6 角色);debug 模式下包装饰器并注入采集器
     let plans_dir = paths.root_dir.join("plans");
     let db_arc = Arc::new(db);
     let cfg = lsm_agent::agent::orchestrator::OrchestratorConfig {
         subagent_max_iterations: max_iterations,
         ..Default::default()
     };
-    let orchestrator = MultiAgentOrchestrator::with_config(llm, db_arc, plans_dir, cfg);
 
-    // -p 单轮模式每次生成独立 Session
+    // -p 单轮模式每次生成独立 Session(debug 采集器以其 Session ID 命名归属)
     let mut session = Session::new();
-    session.context_mut().push(lsm_agent::llm::ChatMessage::user(prompt));
+    session.context_mut().push(lsm_agent::llm::ChatMessage::user(prompt.clone()));
+
+    let (orchestrator, collector) = if debug {
+        let collector = Arc::new(lsm_agent::agent::debug::DebugCollector::new(session.id()));
+        let decorated: Arc<dyn lsm_agent::llm::LlmClient> =
+            Arc::new(lsm_agent::agent::debug::DebugLlmClient::new(llm.clone(), collector.clone()));
+        let cfg = lsm_agent::agent::orchestrator::OrchestratorConfig {
+            debug: Some(collector.clone()),
+            ..cfg
+        };
+        (
+            MultiAgentOrchestrator::with_config(decorated, db_arc, plans_dir, cfg),
+            Some(collector),
+        )
+    } else {
+        (MultiAgentOrchestrator::with_config(llm.clone(), db_arc, plans_dir, cfg), None)
+    };
+
     let outcome = orchestrator.handle(&mut session).await.map_err(anyhow::Error::from)?;
+
+    // debug 模式:任务结束后生成 Debug 报告(用未装饰的 llm 驱动 Debug Agent,避免自我采集递归)
+    if let Some(collector) = collector {
+        let meta = lsm_agent::agent::debug::ReportMeta {
+            mode: mode.to_string(),
+            task: prompt.clone(),
+            model: format!(
+                "[{}] {}/{} @ {}",
+                active.protocol.as_str(), active.provider_name, active.model_name, active.end_point
+            ),
+        };
+        let report_dir = paths.root_dir.join("DebugReport");
+        match lsm_agent::agent::debug::finalize_report(&collector, llm.clone(), &report_dir, &meta).await {
+            Ok(path) => eprintln!("[laew] Debug 报告已生成: {}", path.display()),
+            Err(e) => eprintln!("[laew] Debug 报告生成失败: {e}"),
+        }
+    }
+
     match outcome {
         OrchestrationOutcome::DirectAnswer { text, usage, .. } => {
             println!("{text}");
@@ -207,7 +247,7 @@ fn print_usage(usage: &lsm_agent::llm::Usage) {
 }
 
 /// 从文件读取提示词并执行单轮任务
-async fn run_from_file(file_path: PathBuf, max_iterations: usize) -> Result<()> {
+async fn run_from_file(file_path: PathBuf, max_iterations: usize, debug: bool) -> Result<()> {
     // 相对路径基于工作目录解析
     let absolute_path = if file_path.is_absolute() {
         file_path
@@ -224,7 +264,7 @@ async fn run_from_file(file_path: PathBuf, max_iterations: usize) -> Result<()> 
     }
 
     eprintln!("[laew] 从文件读取提示词: {} ({} 字符)", absolute_path.display(), content.len());
-    run_one_shot(content, max_iterations).await
+    run_one_shot(content, max_iterations, debug, "-f 文件").await
 }
 
 /// 解析文件路径：绝对路径直接使用，相对路径基于工作目录解析
@@ -304,7 +344,13 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let cli = Cli::parse();
+    let cli = {
+        // 兼容用户习惯写法 `-debug`(单横线),归一化为 `--debug` 再交给 clap
+        let args: Vec<std::ffi::OsString> = std::env::args_os()
+            .map(|a| if a == "-debug" { "--debug".into() } else { a })
+            .collect();
+        Cli::parse_from(args)
+    };
 
     // 优先处理导入/导出命令
     if let Some(path) = cli.inprovider {
@@ -316,11 +362,11 @@ async fn main() -> Result<()> {
             Some(Cmd::Provider(p)) => cmd_provider(p).await,
             None => {
                 if let Some(prompt) = cli.prompt {
-                    run_one_shot(prompt, cli.max_iterations).await
+                    run_one_shot(prompt, cli.max_iterations, cli.debug, "-p 单轮").await
                 } else if let Some(file_path) = cli.file {
-                    run_from_file(file_path, cli.max_iterations).await
+                    run_from_file(file_path, cli.max_iterations, cli.debug).await
                 } else {
-                    lsm_agent::tui::run().await
+                    lsm_agent::tui::run_with_debug(cli.debug).await
                 }
             }
         }

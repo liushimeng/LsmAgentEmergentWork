@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::agent::context::AgentRole;
+use crate::agent::debug::DebugCollector;
 use crate::agent::main_work::{self, MainWorkRunner, WorkFlowPlan, WorkFlowSpec};
 use crate::agent::plan::PlanRunner;
 use crate::agent::project_context;
@@ -34,6 +35,8 @@ pub struct OrchestratorConfig {
     pub history_limit: usize,
     /// SubAgent-Work 单次单元最大迭代
     pub subagent_max_iterations: usize,
+    /// 调试事件采集器(`-debug` 调试模式时注入,默认 None 零开销)
+    pub debug: Option<Arc<DebugCollector>>,
 }
 
 impl Default for OrchestratorConfig {
@@ -42,6 +45,7 @@ impl Default for OrchestratorConfig {
             max_retry_per_level: 3,
             history_limit: DEFAULT_HISTORY_LIMIT,
             subagent_max_iterations: 16,
+            debug: None,
         }
     }
 }
@@ -159,6 +163,7 @@ impl MultiAgentOrchestrator {
 
         // 1) Yolo 入口
         let mut classification = self.run_yolo_classification(session).await?;
+        self.dbg_classify(&classification);
         let mut total_usage = Usage::default();
 
         // 1.1) 记录 Yolo 输入事件
@@ -182,6 +187,7 @@ impl MultiAgentOrchestrator {
                     classification.user_suggestion_if_fail.clone()
                 };
                 self.record_failure_event(session.id(), &classification, &suggestion);
+                self.dbg_task_end(&format!("failed: {suggestion}"), total_usage);
                 return Ok(OrchestrationOutcome::Failed {
                     classification,
                     suggestion,
@@ -220,6 +226,7 @@ impl MultiAgentOrchestrator {
                     total_usage.output_tokens =
                         total_usage.output_tokens.saturating_add(summary.usage.output_tokens);
                     task_result.total_usage = total_usage;
+                    self.dbg_task_end("executed", task_result.total_usage);
                     return Ok(OrchestrationOutcome::Executed { result: task_result });
                 }
                 Err(failure) => {
@@ -233,6 +240,7 @@ impl MultiAgentOrchestrator {
                         {
                             Ok(new_c) => {
                                 classification = new_c;
+                                self.dbg_classify(&classification);
                                 continue;
                             }
                             Err(e) => {
@@ -286,6 +294,7 @@ impl MultiAgentOrchestrator {
                 retryable: true,
                 suggestion: "重试".into(),
             })?;
+        self.dbg_qc(&qc);
 
         if qc.verdict == Verdict::Pass {
             Ok(TaskResult {
@@ -343,6 +352,7 @@ impl MultiAgentOrchestrator {
                 retryable: true,
                 suggestion: "重试".into(),
             })?;
+        self.dbg_qc(&qc_main);
 
         if qc_main.verdict == Verdict::Fail {
             return Err(QualityFailure {
@@ -393,6 +403,7 @@ impl MultiAgentOrchestrator {
                 retryable: true,
                 suggestion: "重试".into(),
             })?;
+        self.dbg_qc(&qc_plan);
         if qc_plan.verdict == Verdict::Fail {
             return Err(QualityFailure {
                 source: AgentRole::Plan,
@@ -423,6 +434,7 @@ impl MultiAgentOrchestrator {
                 retryable: true,
                 suggestion: "重试".into(),
             })?;
+        self.dbg_qc(&qc_main);
         if qc_main.verdict == Verdict::Fail {
             return Err(QualityFailure {
                 source: AgentRole::MainWork,
@@ -487,6 +499,7 @@ impl MultiAgentOrchestrator {
                     retryable: true,
                     suggestion: "重试".into(),
                 })?;
+            self.dbg_qc(&qc);
 
             if qc.verdict == Verdict::Fail {
                 return Err(QualityFailure {
@@ -556,6 +569,26 @@ impl MultiAgentOrchestrator {
             .push(crate::llm::ChatMessage::user(failure_msg));
 
         self.run_yolo_classification(session).await
+    }
+
+    // ========== Debug 采集钩子(未开启时零开销) ==========
+
+    fn dbg_classify(&self, c: &TaskClassification) {
+        if let Some(d) = &self.cfg.debug {
+            d.record_classification(c);
+        }
+    }
+
+    fn dbg_qc(&self, report: &QualityReport) {
+        if let Some(d) = &self.cfg.debug {
+            d.record_quality(report);
+        }
+    }
+
+    fn dbg_task_end(&self, outcome: &str, usage: Usage) {
+        if let Some(d) = &self.cfg.debug {
+            d.record_task_end(outcome, usage);
+        }
     }
 
     fn record_failure_event(

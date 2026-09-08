@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 
+use crate::agent::debug::{finalize_report, DebugCollector, DebugLlmClient, ReportMeta};
 use crate::agent::orchestrator::{MultiAgentOrchestrator, OrchestrationOutcome};
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::llm::{client_from_record, ChatMessage};
@@ -32,17 +33,36 @@ pub struct TuiSession {
     pub db: Arc<Mutex<Db>>,
     pub orchestrator: MultiAgentOrchestrator,
     pub session: Session,
+    /// 调试模式采集器(`-debug` 时 Some;每个用户任务前 reset)
+    pub debug: Option<Arc<DebugCollector>>,
+    /// 未装饰的原始 LLM 客户端(驱动 Debug Agent 评估,避免自我采集递归)
+    pub debug_llm_raw: Option<Arc<dyn crate::llm::LlmClient>>,
 }
 
 impl TuiSession {
     pub fn bootstrap() -> Result<Self> {
+        Self::bootstrap_with_debug(false)
+    }
+
+    /// 启动 TUI 会话;`debug=true` 时开启调试采集(对应 `laew -debug`)。
+    pub fn bootstrap_with_debug(debug: bool) -> Result<Self> {
         let paths = Paths::detect().map_err(anyhow::Error::from)?;
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
         let db = Arc::new(Mutex::new(db));
         let plans_dir = paths.root_dir.join("plans");
-        let orchestrator = build_orchestrator_with_active(&db, plans_dir)?;
         let session = Session::new();
-        Ok(Self { paths, db, orchestrator, session })
+        let collector = debug.then(|| Arc::new(DebugCollector::new(session.id())));
+        let (orchestrator, debug_llm_raw) = build_orchestrator_with_active(&db, plans_dir, collector.clone())?;
+        Ok(Self { paths, db, orchestrator, session, debug: collector, debug_llm_raw })
+    }
+
+    /// 按当前 active provider 重建 orchestrator(debug 模式同时刷新原始 LLM 引用)。
+    fn rebuild_orchestrator(&mut self) -> Result<()> {
+        let plans_dir = self.paths.root_dir.join("plans");
+        let (orch, raw) = build_orchestrator_with_active(&self.db, plans_dir, self.debug.clone())?;
+        self.orchestrator = orch;
+        self.debug_llm_raw = raw;
+        Ok(())
     }
 
     pub fn print_banner(&self) {
@@ -77,8 +97,8 @@ impl TuiSession {
     pub fn switch_provider(&mut self, id: i64) -> Result<()> {
         let record = self.db.lock().expect("db").get(id).map_err(anyhow::Error::from)?;
         self.db.lock().expect("db").set_active(id).map_err(anyhow::Error::from)?;
-        let plans_dir = self.paths.root_dir.join("plans");
-        self.orchestrator = build_orchestrator_with_record(&record, plans_dir, &self.db)?;
+        let _ = record;
+        self.rebuild_orchestrator()?;
         Ok(())
     }
 
@@ -135,8 +155,17 @@ impl TuiSession {
         }
         // 普通提示词:Orchestrator 编排
         self.session.context_mut().push(ChatMessage::user(line));
+        // debug 模式:每个任务开始前重置采集器
+        if let Some(collector) = &self.debug {
+            collector.reset(self.session.id());
+        }
         println!("  [orchestrator 调度中...]");
-        match self.orchestrator.handle(&mut self.session).await {
+        let handle_result = self.orchestrator.handle(&mut self.session).await;
+        // debug 模式:任务结束(无论成败)后生成 Debug 报告
+        if let (Some(collector), Some(raw_llm)) = (&self.debug, &self.debug_llm_raw) {
+            self.emit_debug_report(collector, raw_llm.clone(), line, &handle_result).await;
+        }
+        match handle_result {
             Ok(outcome) => match outcome {
                 OrchestrationOutcome::DirectAnswer { text, usage, .. } => {
                     self.print_assistant_text(&text, &usage);
@@ -161,6 +190,37 @@ impl TuiSession {
             }
         }
         Ok(false)
+    }
+
+    /// debug 模式:任务结束后调用 Debug Agent 评估并落盘报告(失败仅打印,不影响主流程)。
+    async fn emit_debug_report(
+        &self,
+        collector: &Arc<DebugCollector>,
+        raw_llm: Arc<dyn crate::llm::LlmClient>,
+        task: &str,
+        handle_result: &std::result::Result<OrchestrationOutcome, crate::error::AgentError>,
+    ) {
+        // handle 路径异常(orchestrator 内部错误)时补记终态事件,保证报告完整
+        if let Err(e) = handle_result {
+            collector.record_task_end(format!("error: {e}"), crate::llm::Usage::default());
+        }
+        let model = match self.db.lock().expect("db").get_active() {
+            Ok(Some(r)) => format!(
+                "[{}] {}/{} @ {}",
+                r.protocol.as_str(), r.provider_name, r.model_name, r.end_point
+            ),
+            _ => "<未配置>".to_string(),
+        };
+        let meta = ReportMeta {
+            mode: "TUI 多轮".to_string(),
+            task: task.to_string(),
+            model,
+        };
+        let report_dir = self.paths.root_dir.join("DebugReport");
+        match finalize_report(collector, raw_llm, &report_dir, &meta).await {
+            Ok(path) => println!("  [debug] 报告已生成: {}", path.display()),
+            Err(e) => eprintln!("  [debug] 报告生成失败: {e}"),
+        }
     }
 
     fn print_assistant_text(&self, text: &str, usage: &crate::llm::Usage) {
@@ -309,7 +369,7 @@ impl TuiSession {
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
         // 重建 YoloRunner(可能切换了 use)
-        self.orchestrator = build_orchestrator_with_active(&self.db, self.paths.root_dir.join("plans"))?;
+        self.rebuild_orchestrator()?;
         result
     }
 
@@ -330,7 +390,7 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        self.orchestrator = build_orchestrator_with_active(&self.db, self.paths.root_dir.join("plans"))?;
+        self.rebuild_orchestrator()?;
         result
     }
 
@@ -349,7 +409,7 @@ impl TuiSession {
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
-        self.orchestrator = build_orchestrator_with_active(&self.db, self.paths.root_dir.join("plans"))?;
+        self.rebuild_orchestrator()?;
         result
     }
 
@@ -513,39 +573,40 @@ fn print_help() {
     println!("    Esc            关闭列表");
 }
 
-/// 启动 MultiAgentOrchestrator(6 角色);若未配置,使用占位提示信息
+/// 启动 MultiAgentOrchestrator(6 角色);若未配置,使用占位提示信息。
+/// `debug` 为 Some 时:LLM 客户端包 DebugLlmClient 装饰器并注入采集器,
+/// 同时返回未装饰的原始客户端(供 Debug Agent 评估使用)。
 fn build_orchestrator_with_active(
     db: &Arc<Mutex<Db>>,
     plans_dir: PathBuf,
-) -> Result<MultiAgentOrchestrator> {
+    debug: Option<Arc<DebugCollector>>,
+) -> Result<(MultiAgentOrchestrator, Option<Arc<dyn crate::llm::LlmClient>>)> {
     let work_profile = crate::agent::profile::AgentProfile::work_profile();
     let user_agent = work_profile.user_agent();
     // 把 db 从 Mutex 拷一份裸出来(本次只读使用);Db 内部已有自己的 Mutex
     let db_clone = db.lock().expect("db").clone();
     let db_arc = Arc::new(db_clone);
-    match db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
-        Some(r) => {
-            let llm = client_from_record(&r, &user_agent).map_err(anyhow::Error::from)?;
-            Ok(MultiAgentOrchestrator::new(llm, db_arc, plans_dir))
-        }
-        None => {
+    let raw_llm: Arc<dyn crate::llm::LlmClient> =
+        match db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
+            Some(r) => client_from_record(&r, &user_agent).map_err(anyhow::Error::from)?,
             // 未配置时,6 个 Agent 都用 NoopLlm
-            Ok(MultiAgentOrchestrator::new(
-                Arc::new(NoopLlm),
-                db_arc,
-                plans_dir,
+            None => Arc::new(NoopLlm),
+        };
+    match debug {
+        Some(collector) => {
+            let decorated: Arc<dyn crate::llm::LlmClient> =
+                Arc::new(DebugLlmClient::new(raw_llm.clone(), collector.clone()));
+            let cfg = crate::agent::orchestrator::OrchestratorConfig {
+                debug: Some(collector),
+                ..Default::default()
+            };
+            Ok((
+                MultiAgentOrchestrator::with_config(decorated, db_arc, plans_dir, cfg),
+                Some(raw_llm),
             ))
         }
+        None => Ok((MultiAgentOrchestrator::new(raw_llm, db_arc, plans_dir), None)),
     }
-}
-
-fn build_orchestrator_with_record(
-    _r: &ProviderRecord,
-    _plans_dir: PathBuf,
-    _db: &Arc<Mutex<Db>>,
-) -> Result<MultiAgentOrchestrator> {
-    // 简化:复用 build_orchestrator_with_active(切换 provider 时重新构造)
-    build_orchestrator_with_active(_db, _plans_dir)
 }
 
 /// 未配置模型时的占位 LLM(避免 null deref);`complete` 返回错误提示。
@@ -582,8 +643,18 @@ fn atty() -> bool {
 
 /// 启动 TUI 交互式 REPL
 pub async fn run() -> Result<()> {
-    let mut session = TuiSession::bootstrap()?;
+    run_with_debug(false).await
+}
+
+/// 启动 TUI 交互式 REPL;`debug=true` 时开启调试模式(对应 `laew -debug`),
+/// 每个用户任务结束后生成 Debug 报告到根目录 `DebugReport/`。
+pub async fn run_with_debug(debug: bool) -> Result<()> {
+    let mut session = TuiSession::bootstrap_with_debug(debug)?;
     session.print_banner();
+    if session.debug.is_some() {
+        println!("  [debug] 调试模式已开启,报告将写入根目录 DebugReport/");
+        println!();
+    }
 
     if atty() {
         let input_handler = InputHandler::new();
