@@ -133,8 +133,8 @@ pub struct SubFlowInput {
 
 | 维度 | laew 现状 | 改进优先级 |
 |------|----------|-----------|
-| **SubAgent 并行** | 全部串行 | P0（最迫切） |
-| **WorkFlow 并行（同层无依赖）** | 串行 | P0 |
+| **SubAgent 并行** | 全部串行 → ✅ 同层并行已实现(2026-09-08 第 05 轮:`orchestrator.rs::execute_workflows` 层内 `tokio::spawn` + `Semaphore(3)`,跨层仍串行) | P0（最迫切） |
+| **WorkFlow 并行（同层无依赖）** | 串行 → ✅ 已实现(2026-09-08 第 05 轮:`main_work.rs::topo_layers` Kahn 分层,`topo_sort` 复用 flatten) | P0 |
 | **嵌套 SubAgent** | 工具集硬性禁止 | P2 |
 | **后台 SubAgent** | 无（必须同步等） | P1 |
 | **深度限制常量** | 无（靠工具集间接限制） | P1 |

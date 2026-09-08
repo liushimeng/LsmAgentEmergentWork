@@ -10,7 +10,7 @@
 import json
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 STATE = {}  # 按 path 分别计数,避免跨协议干扰
 LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
@@ -22,9 +22,11 @@ LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
 #                  用于端到端验证 src/agent/permissions/* 的 check_bash_command fail-closed 拦截。
 #   BROKEN_QUALITY — 让 quality 角色返回非 JSON 文本,
 #                  用于端到端验证 src/agent/quality.rs 的 JSON 解析失败 fail-closed 回流。
+#   PARALLEL_WFS  — yolo 返回 medium 分类、mainwork 返回 3 个互相独立(无 depends_on)的 WorkFlow,
+#                  用于端到端验证 orchestrator 的「依赖分层 + 同层 SubAgent 并行调度」。
 MODES = set()
 for arg in sys.argv[3:]:
-    if arg in ("--flaky", "--bash-block", "--broken-quality"):
+    if arg in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs"):
         MODES.add(arg)
 
 
@@ -167,6 +169,22 @@ MAIN_WORK_PLAN_JSON = (
     '{"workflows": [{"id": "wf-1", "name": "执行验证",'
     ' "steps": ["运行 echo LAEW_MOCK_OK"],'
     ' "acceptance": ["输出包含 LAEW_MOCK_OK"], "delegate_to": "subagent"}]}'
+)
+# --parallel-wfs 模式:medium 分类 + 3 个互相独立的 WorkFlow(触发同层并行调度)
+YOLO_CLASSIFICATION_MEDIUM_JSON = (
+    '{"task_level": "medium", "goal_summary": "并行调度链路验证",'
+    ' "intent": "verify", "decomposition_plan": ["并行执行三个独立流程"],'
+    ' "direct_answer": null, "user_suggestion_if_fail": ""}'
+)
+MAIN_WORK_PLAN_PARALLEL_JSON = (
+    '{"workflows": ['
+    '{"id": "wf-1", "name": "并行流程一", "steps": ["运行 echo LAEW_MOCK_OK"],'
+    ' "acceptance": ["完成"], "delegate_to": "subagent", "depends_on": []},'
+    '{"id": "wf-2", "name": "并行流程二", "steps": ["运行 echo LAEW_MOCK_OK"],'
+    ' "acceptance": ["完成"], "delegate_to": "subagent", "depends_on": []},'
+    '{"id": "wf-3", "name": "并行流程三", "steps": ["运行 echo LAEW_MOCK_OK"],'
+    ' "acceptance": ["完成"], "delegate_to": "subagent", "depends_on": []}'
+    ']}'
 )
 SESSION_SUMMARY_TEXT = "任务完成:laew 端到端链路验证通过。(SessionContext 自动摘要)"
 COMPACT_SUMMARY_TEXT = (
@@ -437,7 +455,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if key == "oai" or "v1/messages" in self.path:
             if role == "yolo":
-                body_bytes = role_reply(maybe_break_json(YOLO_CLASSIFICATION_JSON))
+                if "--parallel-wfs" in MODES:
+                    body_bytes = role_reply(maybe_break_json(YOLO_CLASSIFICATION_MEDIUM_JSON))
+                else:
+                    body_bytes = role_reply(maybe_break_json(YOLO_CLASSIFICATION_JSON))
             elif role == "quality":
                 if "--broken-quality" in MODES:
                     # 返回非 JSON 文本 → 让 src/agent/quality.rs 走 JSON 解析失败路径
@@ -445,7 +466,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     body_bytes = role_reply(maybe_break_json(QUALITY_REPORT_JSON))
             elif role == "mainwork":
-                body_bytes = role_reply(maybe_break_json(MAIN_WORK_PLAN_JSON))
+                if "--parallel-wfs" in MODES:
+                    body_bytes = role_reply(maybe_break_json(MAIN_WORK_PLAN_PARALLEL_JSON))
+                else:
+                    body_bytes = role_reply(maybe_break_json(MAIN_WORK_PLAN_JSON))
             elif role == "session":
                 body_bytes = role_reply(SESSION_SUMMARY_TEXT)
             elif role == "compact":
@@ -474,4 +498,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8899
     print(f"mock llm server on 127.0.0.1:{port}, log -> {LOG_PATH}", flush=True)
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # ThreadingHTTPServer:--parallel-wfs 模式下同层 3 个 SubAgent 并发请求,
+    # 单线程 HTTPServer 会被 keep-alive 连接占住而串行化甚至死锁;对既有用例是严格超集。
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

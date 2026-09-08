@@ -133,60 +133,81 @@ impl MainWorkRunner {
 
 /// 拓扑排序(返回执行顺序)。
 ///
-/// 简单 Kahn 算法;检测循环依赖。
+/// 基于 `topo_layers` 分层结果扁平化(单一事实源);检测循环依赖与未知依赖。
 pub fn topo_sort(workflows: &[WorkFlowSpec]) -> Result<Vec<WorkFlowSpec>> {
+    Ok(topo_layers(workflows)?.into_iter().flatten().collect())
+}
+
+/// 拓扑分层(Kahn 分层):同层 WorkFlow 互相无依赖,可并行执行;跨层严格串行。
+///
+/// - 第 0 层 = 入度 0 节点;每消费一层,其后继入度 -1,归零者入下一层。
+/// - **确定性**:层内顺序 = 原 `workflows` 数组顺序(不依赖 HashMap 遍历序)。
+/// - 未知依赖 / 环:与 `topo_sort` 一致,报 `AgentError::WorkflowTopology`。
+pub fn topo_layers(workflows: &[WorkFlowSpec]) -> Result<Vec<Vec<WorkFlowSpec>>> {
     let mut by_id: std::collections::HashMap<&str, &WorkFlowSpec> =
         std::collections::HashMap::new();
     for w in workflows {
         by_id.insert(w.id.as_str(), w);
     }
+    // 入度 = 它依赖的 wf 数;先校验所有依赖已知
     let mut in_degree: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
     for w in workflows {
-        *in_degree.entry(w.id.as_str()).or_insert(0) += 0;
         for dep in &w.depends_on {
             if !by_id.contains_key(dep.as_str()) {
                 return Err(AgentError::WorkflowTopology(format!(
                     "wf={} 依赖未知 wf={}",
-                    w.id,
-                    dep
+                    w.id, dep
                 )));
             }
-            *in_degree.entry(dep.as_str()).or_insert(0) += 0;
         }
-    }
-    // 真实 indegree:对于每个 wf,它的 indegree 是「依赖它的 wf 数」,还是「它依赖的 wf 数」?
-    // 这里我们要求 indegree = 0 的先执行;使用「它依赖的 wf 数」
-    let mut in_degree: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
-    for w in workflows {
         in_degree.insert(w.id.as_str(), w.depends_on.len());
     }
-    let mut queue: std::collections::VecDeque<&str> = in_degree
-        .iter()
-        .filter_map(|(k, v)| if *v == 0 { Some(*k) } else { None })
-        .collect();
-    let mut order = Vec::new();
-    while let Some(id) = queue.pop_front() {
-        if let Some(w) = by_id.get(id) {
-            order.push((*w).clone());
+
+    let mut layers: Vec<Vec<WorkFlowSpec>> = Vec::new();
+    let mut placed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut total = 0usize;
+    loop {
+        // 本轮可放置:入度 0 且尚未放置;按原数组顺序扫描保证确定性
+        let layer: Vec<&WorkFlowSpec> = workflows
+            .iter()
+            .filter(|w| {
+                !placed.contains(w.id.as_str())
+                    && in_degree.get(w.id.as_str()).copied().unwrap_or(0) == 0
+            })
+            .collect();
+        if layer.is_empty() {
+            break;
         }
+        for w in &layer {
+            placed.insert(w.id.as_str());
+        }
+        total += layer.len();
+        // 消费本层:递减所有依赖本层节点的后继入度
+        let layer_ids: std::collections::HashSet<&str> =
+            layer.iter().map(|w| w.id.as_str()).collect();
         for w in workflows {
-            if w.depends_on.iter().any(|d| d == id) {
+            if placed.contains(w.id.as_str()) {
+                continue;
+            }
+            let dec = w
+                .depends_on
+                .iter()
+                .filter(|d| layer_ids.contains(d.as_str()))
+                .count();
+            if dec > 0 {
                 let entry = in_degree.entry(w.id.as_str()).or_insert(0);
-                *entry = entry.saturating_sub(1);
-                if *entry == 0 && !queue.contains(&w.id.as_str()) {
-                    queue.push_back(w.id.as_str());
-                }
+                *entry = entry.saturating_sub(dec);
             }
         }
+        layers.push(layer.into_iter().cloned().collect());
     }
-    if order.len() != workflows.len() {
+    if total != workflows.len() {
         return Err(AgentError::WorkflowTopology(
             "检测到循环依赖,无法拓扑排序".into(),
         ));
     }
-    Ok(order)
+    Ok(layers)
 }
 
 /// 解析 Main-Work JSON 输出(支持代码块 / 裸 JSON)。
@@ -380,6 +401,82 @@ mod tests {
     fn topo_sort_unknown_dep() {
         let workflows = vec![wf("wf-1", &["wf-x"])];
         assert!(topo_sort(&workflows).is_err());
+    }
+
+    #[test]
+    fn topo_layers_chain_one_per_layer() {
+        let workflows = vec![
+            wf("wf-1", &[]),
+            wf("wf-2", &["wf-1"]),
+            wf("wf-3", &["wf-2"]),
+        ];
+        let layers = topo_layers(&workflows).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0][0].id, "wf-1");
+        assert_eq!(layers[1][0].id, "wf-2");
+        assert_eq!(layers[2][0].id, "wf-3");
+    }
+
+    #[test]
+    fn topo_layers_independent_all_in_one_layer() {
+        let workflows = vec![wf("wf-1", &[]), wf("wf-2", &[]), wf("wf-3", &[])];
+        let layers = topo_layers(&workflows).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].len(), 3);
+        // 层内顺序 = 原数组顺序(确定性)
+        let ids: Vec<&str> = layers[0].iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, vec!["wf-1", "wf-2", "wf-3"]);
+    }
+
+    #[test]
+    fn topo_layers_diamond() {
+        // wf-1 → {wf-2, wf-3} → wf-4
+        let workflows = vec![
+            wf("wf-1", &[]),
+            wf("wf-2", &["wf-1"]),
+            wf("wf-3", &["wf-1"]),
+            wf("wf-4", &["wf-2", "wf-3"]),
+        ];
+        let layers = topo_layers(&workflows).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0].len(), 1);
+        assert_eq!(layers[1].len(), 2, "wf-2/wf-3 同层可并行");
+        assert_eq!(layers[2][0].id, "wf-4");
+    }
+
+    #[test]
+    fn topo_layers_cycle_error() {
+        let workflows = vec![wf("wf-1", &["wf-2"]), wf("wf-2", &["wf-1"])];
+        assert!(topo_layers(&workflows).is_err());
+    }
+
+    #[test]
+    fn topo_layers_unknown_dep_error() {
+        let workflows = vec![wf("wf-1", &["wf-x"])];
+        assert!(topo_layers(&workflows).is_err());
+    }
+
+    #[test]
+    fn topo_layers_flatten_matches_topo_sort() {
+        // 混合图:flatten(分层) 必须等于 topo_sort 输出(同一事实源)
+        let workflows = vec![
+            wf("wf-1", &[]),
+            wf("wf-2", &[]),
+            wf("wf-3", &["wf-1"]),
+            wf("wf-4", &["wf-2", "wf-3"]),
+        ];
+        let flat: Vec<String> = topo_layers(&workflows)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|w| w.id)
+            .collect();
+        let sorted: Vec<String> = topo_sort(&workflows)
+            .unwrap()
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+        assert_eq!(flat, sorted);
     }
 
     #[test]

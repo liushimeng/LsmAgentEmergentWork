@@ -36,6 +36,8 @@ pub struct OrchestratorConfig {
     pub history_limit: usize,
     /// SubAgent-Work 单次单元最大迭代
     pub subagent_max_iterations: usize,
+    /// 同层无依赖 WorkFlow 的最大并行数(信号量上限,对齐 atomcode Semaphore(3) 惯例)
+    pub max_parallel_workflows: usize,
     /// 调试事件采集器(`-debug` 调试模式时注入,默认 None 零开销)
     pub debug: Option<Arc<DebugCollector>>,
 }
@@ -46,6 +48,7 @@ impl Default for OrchestratorConfig {
             max_retry_per_level: 3,
             history_limit: DEFAULT_HISTORY_LIMIT,
             subagent_max_iterations: 16,
+            max_parallel_workflows: 3,
             debug: None,
         }
     }
@@ -105,8 +108,10 @@ pub struct MultiAgentOrchestrator {
     yolo: YoloRunner,
     plan: PlanRunner,
     main_work: MainWorkRunner,
-    sub_agent: SubAgentRunner,
-    quality: QualityRunner,
+    /// Arc 化:同层 WorkFlow 并行时共享给 tokio::spawn 任务
+    sub_agent: Arc<SubAgentRunner>,
+    /// Arc 化:同上(质检随执行单元并行)
+    quality: Arc<QualityRunner>,
     session_context: SessionContextRunner,
     compact: CompactRunner,
     db: Arc<Db>,
@@ -136,9 +141,11 @@ impl MultiAgentOrchestrator {
         let yolo = YoloRunner::new(llm.clone());
         let plan = PlanRunner::new(llm.clone(), db.clone(), plans_dir);
         let main_work = MainWorkRunner::new(llm.clone(), db.clone());
-        let sub_agent = SubAgentRunner::new(llm.clone(), db.clone())
-            .with_max_iterations(cfg.subagent_max_iterations);
-        let quality = QualityRunner::new(llm.clone(), db.clone());
+        let sub_agent = Arc::new(
+            SubAgentRunner::new(llm.clone(), db.clone())
+                .with_max_iterations(cfg.subagent_max_iterations),
+        );
+        let quality = Arc::new(QualityRunner::new(llm.clone(), db.clone()));
         let session_context = SessionContextRunner::new(llm.clone(), db.clone());
         let compact = CompactRunner::new(llm, db.clone());
         Self {
@@ -480,9 +487,10 @@ impl MultiAgentOrchestrator {
         plan: &WorkFlowPlan,
         session: &Session,
     ) -> std::result::Result<TaskResult, QualityFailure> {
-        let ordered = main_work::topo_sort(&plan.workflows).map_err(|e| QualityFailure {
+        // 依赖分层:同层 WorkFlow 互相无依赖,自动并行;跨层严格串行(自动感知 depends_on)
+        let layers = main_work::topo_layers(&plan.workflows).map_err(|e| QualityFailure {
             source: AgentRole::MainWork,
-            reason: format!("拓扑排序失败: {e}"),
+            reason: format!("拓扑分层失败: {e}"),
             retryable: false,
             suggestion: "Plan 中存在循环或未知依赖".into(),
         })?;
@@ -491,55 +499,124 @@ impl MultiAgentOrchestrator {
         let mut dep_outputs: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut total_usage = Usage::default();
+        let total_layers = layers.len();
 
-        for wf in ordered {
-            let sub_input = build_subflow_input(&wf, &dep_outputs);
-            let sub_outcome = self
-                .sub_agent
-                .run_unit(&sub_input, session.id())
-                .await
-                .map_err(|e| QualityFailure {
-                    source: AgentRole::SubAgent,
-                    reason: format!("SubAgent 执行失败(wf={}): {}", wf.id, e),
-                    retryable: true,
-                    suggestion: "重试".into(),
-                })?;
-            total_usage = add_usage(total_usage, sub_outcome.usage);
-
-            let qc = self
-                .quality
-                .check_subagent(
-                    &c.goal_summary,
-                    &sub_input.expected_output,
-                    &sub_outcome.text,
-                    session.id(),
-                )
-                .await
-                .map_err(|e| QualityFailure {
-                    source: AgentRole::QualityCheck,
-                    reason: format!("Quality 调用失败: {e}"),
-                    retryable: true,
-                    suggestion: "重试".into(),
-                })?;
-            self.dbg_qc(&qc);
-
-            if qc.verdict == Verdict::Fail {
-                return Err(QualityFailure {
-                    source: AgentRole::SubAgent,
-                    reason: format!("wf={}: {}", wf.id, qc.issues.join("; ")),
-                    retryable: qc.retryable,
-                    suggestion: qc.suggestion,
-                });
+        for (layer_idx, layer) in layers.into_iter().enumerate() {
+            if layer.len() > 1 {
+                eprintln!(
+                    "[laew] WorkFlow 并行调度:第 {}/{} 层 {} 个流程并发执行(上限 {})",
+                    layer_idx + 1,
+                    total_layers,
+                    layer.len(),
+                    self.cfg.max_parallel_workflows,
+                );
             }
 
-            dep_outputs.insert(wf.id.clone(), sub_outcome.text.clone());
-            results.push(WorkflowResult {
-                id: wf.id.clone(),
-                name: wf.name.clone(),
-                subflow_outcome: sub_outcome.text,
-                quality_report: qc,
-                usage: sub_outcome.usage,
-            });
+            // 构造本层全部单元的输入(上游产物按层传递)
+            let units: Vec<(WorkFlowSpec, SubFlowInput)> = layer
+                .iter()
+                .map(|wf| (wf.clone(), build_subflow_input(wf, &dep_outputs)))
+                .collect();
+
+            // 执行本层:单个直通(零 spawn 开销),多个 tokio::spawn + Semaphore 有界并发
+            let layer_outcomes = if units.len() == 1 {
+                let (wf, input) = units.into_iter().next().expect("len==1");
+                let outcome = run_wf_unit(
+                    self.sub_agent.clone(),
+                    self.quality.clone(),
+                    self.cfg.debug.clone(),
+                    input,
+                    c.goal_summary.clone(),
+                    session.id().to_string(),
+                    None,
+                )
+                .await;
+                vec![(wf, outcome)]
+            } else {
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(
+                    self.cfg.max_parallel_workflows,
+                ));
+                let mut handles = Vec::with_capacity(units.len());
+                for (wf, input) in units {
+                    let sub_agent = self.sub_agent.clone();
+                    let quality = self.quality.clone();
+                    let debug = self.cfg.debug.clone();
+                    let goal = c.goal_summary.clone();
+                    let sid = session.id().to_string();
+                    let sem = semaphore.clone();
+                    handles.push(tokio::spawn(async move {
+                        let outcome = run_wf_unit(
+                            sub_agent,
+                            quality,
+                            debug,
+                            input,
+                            goal,
+                            sid,
+                            Some(sem),
+                        )
+                        .await;
+                        (wf, outcome)
+                    }));
+                }
+                // 按层内原始顺序 await:保证结果顺序确定;失败不中断在飞的独立任务
+                let mut outcomes = Vec::with_capacity(handles.len());
+                for h in handles {
+                    match h.await {
+                        Ok(pair) => outcomes.push(pair),
+                        Err(e) => {
+                            // JoinError(panic 等):映射为失败回流,不吞掉
+                            outcomes.push((
+                                WorkFlowSpec {
+                                    id: "unknown".into(),
+                                    name: "并行任务".into(),
+                                    steps: vec![],
+                                    branches: vec![],
+                                    loops: vec![],
+                                    depends_on: vec![],
+                                    acceptance: vec![],
+                                    delegate_to: AgentRole::SubAgent,
+                                },
+                                Err(QualityFailure {
+                                    source: AgentRole::SubAgent,
+                                    reason: format!("并行 WorkFlow 任务 join 失败: {e}"),
+                                    retryable: true,
+                                    suggestion: "重试".into(),
+                                }),
+                            ));
+                        }
+                    }
+                }
+                outcomes
+            };
+
+            // 汇总本层:按序取首个失败回流(fail-fast 语义与串行版一致)
+            let mut first_failure: Option<QualityFailure> = None;
+            let mut ok_units = Vec::new();
+            for (wf, outcome) in layer_outcomes {
+                match outcome {
+                    Ok(ok) => ok_units.push((wf, ok)),
+                    Err(f) => {
+                        if first_failure.is_none() {
+                            first_failure = Some(f);
+                        }
+                    }
+                }
+            }
+            if let Some(f) = first_failure {
+                return Err(f);
+            }
+
+            for (wf, ok) in ok_units {
+                total_usage = add_usage(total_usage, ok.usage);
+                dep_outputs.insert(wf.id.clone(), ok.outcome_text.clone());
+                results.push(WorkflowResult {
+                    id: wf.id.clone(),
+                    name: wf.name.clone(),
+                    subflow_outcome: ok.outcome_text,
+                    quality_report: ok.qc,
+                    usage: ok.usage,
+                });
+            }
         }
 
         Ok(TaskResult {
@@ -663,6 +740,77 @@ impl MultiAgentOrchestrator {
     pub fn main_work(&self) -> &MainWorkRunner {
         &self.main_work
     }
+}
+
+/// 单个 WorkFlow 执行单元的成功产物
+struct WfUnitOk {
+    outcome_text: String,
+    usage: Usage,
+    qc: QualityReport,
+}
+
+/// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
+///
+/// 自由函数 + Arc 参数化,串行直通与 tokio::spawn 并行两种调用路径共用同一份逻辑;
+/// `semaphore` 为并行路径的有界并发许可(串行路径传 None)。
+async fn run_wf_unit(
+    sub_agent: Arc<SubAgentRunner>,
+    quality: Arc<QualityRunner>,
+    debug: Option<Arc<DebugCollector>>,
+    input: SubFlowInput,
+    goal: String,
+    session_id: String,
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
+) -> std::result::Result<WfUnitOk, QualityFailure> {
+    // 有界并发:先抢许可(对齐 atomcode Semaphore(3) FIFO 惯例)
+    let _permit = match &semaphore {
+        Some(sem) => Some(sem.acquire().await.map_err(|e| QualityFailure {
+            source: AgentRole::SubAgent,
+            reason: format!("并行调度信号量已关闭: {e}"),
+            retryable: true,
+            suggestion: "重试".into(),
+        })?),
+        None => None,
+    };
+
+    let wf_id = input.id.clone();
+    let outcome = sub_agent
+        .run_unit(&input, &session_id)
+        .await
+        .map_err(|e| QualityFailure {
+            source: AgentRole::SubAgent,
+            reason: format!("SubAgent 执行失败(wf={wf_id}): {e}"),
+            retryable: true,
+            suggestion: "重试".into(),
+        })?;
+
+    let qc = quality
+        .check_subagent(&goal, &input.expected_output, &outcome.text, &session_id)
+        .await
+        .map_err(|e| QualityFailure {
+            source: AgentRole::QualityCheck,
+            reason: format!("Quality 调用失败: {e}"),
+            retryable: true,
+            suggestion: "重试".into(),
+        })?;
+    if let Some(d) = &debug {
+        d.record_quality(&qc);
+    }
+
+    if qc.verdict == Verdict::Fail {
+        return Err(QualityFailure {
+            source: AgentRole::SubAgent,
+            reason: format!("wf={}: {}", wf_id, qc.issues.join("; ")),
+            retryable: qc.retryable,
+            suggestion: qc.suggestion,
+        });
+    }
+
+    Ok(WfUnitOk {
+        outcome_text: outcome.text,
+        usage: outcome.usage,
+        qc,
+    })
 }
 
 fn build_subflow_input(
