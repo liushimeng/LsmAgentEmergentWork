@@ -345,9 +345,15 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = {
-        // 兼容用户习惯写法 `-debug`(单横线),归一化为 `--debug` 再交给 clap
+        // 兼容用户习惯写法 `-debug` / `-inprovider` / `-outprovider`(单横线长参数),
+        // 归一化为 `--xxx` 再交给 clap
         let args: Vec<std::ffi::OsString> = std::env::args_os()
-            .map(|a| if a == "-debug" { "--debug".into() } else { a })
+            .map(|a| match a.to_str() {
+                Some("-debug") => "--debug".into(),
+                Some("-inprovider") => "--inprovider".into(),
+                Some("-outprovider") => "--outprovider".into(),
+                _ => a,
+            })
             .collect();
         Cli::parse_from(args)
     };

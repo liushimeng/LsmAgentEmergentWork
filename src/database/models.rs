@@ -44,6 +44,10 @@ pub struct ProviderRecord {
 // ===== 导入/导出相关结构体 =====
 
 /// 导入用：单条 Provider 配置
+///
+/// `is_active` 可选：仅导出信封格式(`{"providers":[...]}`)的记录携带，
+/// 用于导入后恢复原激活记录；手写配置可省略。
+/// 反序列化时忽略未知字段(如导出格式里的 id / created_at)。
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProviderImport {
     pub protocol: String,
@@ -51,14 +55,23 @@ pub struct ProviderImport {
     pub model_name: String,
     pub end_point: String,
     pub api_key: String,
+    #[serde(default)]
+    pub is_active: Option<bool>,
 }
 
-/// 导入输入：支持单条对象或数组
+/// 导入用：导出信封格式(`--outprovider` 产出的 JSON),支持原样再导入(往返兼容)
+#[derive(Debug, Deserialize)]
+pub struct ImportEnvelope {
+    pub providers: Vec<ProviderImport>,
+}
+
+/// 导入输入：支持单条对象、对象数组或导出信封格式
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ImportInput {
-    Single(ProviderImport),
     Batch(Vec<ProviderImport>),
+    Envelope(ImportEnvelope),
+    Single(ProviderImport),
 }
 
 impl ImportInput {
@@ -67,6 +80,7 @@ impl ImportInput {
         match self {
             ImportInput::Single(one) => vec![one],
             ImportInput::Batch(vec) => vec,
+            ImportInput::Envelope(env) => env.providers,
         }
     }
 }

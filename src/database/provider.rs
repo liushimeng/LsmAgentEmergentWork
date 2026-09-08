@@ -138,21 +138,42 @@ impl Db {
         model_name: &str,
         end_point: &str,
     ) -> Result<bool> {
+        Ok(self
+            .find_id(protocol, provider_name, model_name, end_point)?
+            .is_some())
+    }
+
+    /// 按 UNIQUE 四元组查找记录 id
+    fn find_id(
+        &self,
+        protocol: Protocol,
+        provider_name: &str,
+        model_name: &str,
+        end_point: &str,
+    ) -> Result<Option<i64>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM providers WHERE protocol = ?1 AND provider_name = ?2 AND model_name = ?3 AND end_point = ?4",
-            params![protocol.as_str(), provider_name, model_name, end_point],
-            |r| r.get::<_, i64>(0),
-        )?;
-        Ok(count > 0)
+        let id = conn
+            .query_row(
+                "SELECT id FROM providers WHERE protocol = ?1 AND provider_name = ?2 AND model_name = ?3 AND end_point = ?4",
+                params![protocol.as_str(), provider_name, model_name, end_point],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(id)
     }
 
     // ===== 导入/导出功能 =====
 
     /// 从 JSON 字符串导入 Provider 配置
+    ///
+    /// 支持三种输入: 单条对象 / 对象数组 / `--outprovider` 导出信封(`{"providers":[...]}`)。
+    /// 激活策略: 文件中带 `is_active: true` 的记录(导出信封)导入后恢复为激活;
+    /// 否则若库中当前无任何激活记录, 自动激活本次第一条成功导入的记录, 保证导入即可用。
     pub fn import_from_json(&self, json: &str) -> Result<ImportResult> {
         let input: ImportInput = serde_json::from_str(json)
-            .map_err(|e| ConfigError::Import(format!("JSON 解析失败: {e}")))?;
+            .map_err(|e| ConfigError::Import(format!(
+                "JSON 解析失败: {e}(要求: 单条对象 / 对象数组 / 导出格式 {{\"providers\":[...]}}, 每条须含 protocol/provider_name/model_name/end_point/api_key)"
+            )))?;
 
         let items = input.into_vec();
         if items.is_empty() {
@@ -160,6 +181,10 @@ impl Db {
         }
 
         let mut result = ImportResult::default();
+        // 本次首条成功导入的记录 id(用于空库兜底激活)
+        let mut first_success_id: Option<i64> = None;
+        // 文件中标记 is_active=true 的记录坐标(用于恢复激活态)
+        let mut desired_active: Option<(Protocol, String, String, String)> = None;
 
         for item in items {
             // 验证 protocol
@@ -172,7 +197,7 @@ impl Db {
                 }
             };
 
-            // 验证必尝字段不为空
+            // 验证必填字段不为空
             if item.provider_name.trim().is_empty()
                 || item.model_name.trim().is_empty()
                 || item.end_point.trim().is_empty()
@@ -184,6 +209,15 @@ impl Db {
                 );
                 result.failed += 1;
                 continue;
+            }
+
+            if item.is_active == Some(true) {
+                desired_active = Some((
+                    protocol,
+                    item.provider_name.clone(),
+                    item.model_name.clone(),
+                    item.end_point.clone(),
+                ));
             }
 
             // 检查是否已存在
@@ -209,6 +243,9 @@ impl Db {
                         "✓ 导入成功 id={}: {}/{}/{}",
                         id, item.protocol, item.provider_name, item.model_name
                     );
+                    if first_success_id.is_none() {
+                        first_success_id = Some(id);
+                    }
                     result.success += 1;
                 }
                 Err(e) => {
@@ -218,6 +255,24 @@ impl Db {
                     );
                     result.failed += 1;
                 }
+            }
+        }
+
+        // 激活策略: 优先恢复文件声明的 is_active; 否则空库兜底激活首条导入记录
+        if let Some((protocol, provider_name, model_name, end_point)) = desired_active {
+            match self.find_id(protocol, &provider_name, &model_name, &end_point)? {
+                Some(id) => {
+                    self.set_active(id)?;
+                    println!("★ 已按文件声明激活 id={id}: {provider_name}/{model_name}");
+                }
+                None => {
+                    eprintln!("⚠ 文件声明的激活记录 {provider_name}/{model_name} 未能导入, 跳过激活");
+                }
+            }
+        } else if self.get_active()?.is_none() {
+            if let Some(id) = first_success_id {
+                self.set_active(id)?;
+                println!("★ 库中无激活记录, 已自动激活首条导入记录 id={id}");
             }
         }
 
@@ -395,5 +450,75 @@ mod tests {
 
         assert_eq!(parsed["count"], 0);
         assert!(parsed["providers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_export_envelope_roundtrip() {
+        // 导出 → 再导入到空库: 记录全量恢复, 且激活态被还原
+        let (src, _d1) = fresh_db();
+        let id1 = src.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1").unwrap();
+        src.add(Protocol::OpenAi, "P2", "m2", "https://b", "k2").unwrap();
+        src.set_active(id1).unwrap();
+        let json = src.export_to_json().unwrap();
+
+        let (dst, _d2) = fresh_db();
+        let result = dst.import_from_json(&json).unwrap();
+        assert_eq!(result.success, 2);
+        assert_eq!(result.failed, 0);
+        assert_eq!(dst.list().unwrap().len(), 2);
+        let active = dst.get_active().unwrap().expect("导入后应有激活记录");
+        assert_eq!(active.provider_name, "P1");
+    }
+
+    #[test]
+    fn import_activates_first_when_no_active() {
+        // 空库导入无 is_active 标记的配置: 自动激活首条成功记录
+        let (db, _d) = fresh_db();
+        let json = r#"{
+            "protocol": "anthropic",
+            "provider_name": "P1",
+            "model_name": "m1",
+            "end_point": "https://a",
+            "api_key": "k1"
+        }"#;
+        db.import_from_json(json).unwrap();
+        let active = db.get_active().unwrap().expect("空库导入应自动激活");
+        assert_eq!(active.provider_name, "P1");
+    }
+
+    #[test]
+    fn import_keeps_existing_active_when_unmarked() {
+        // 已有激活记录时, 导入无 is_active 标记的配置不得改变激活态
+        let (db, _d) = fresh_db();
+        let id = db.add(Protocol::Anthropic, "Old", "m0", "https://old", "k0").unwrap();
+        db.set_active(id).unwrap();
+        let json = r#"{
+            "protocol": "openai",
+            "provider_name": "New",
+            "model_name": "m1",
+            "end_point": "https://n",
+            "api_key": "k1"
+        }"#;
+        db.import_from_json(json).unwrap();
+        let active = db.get_active().unwrap().unwrap();
+        assert_eq!(active.provider_name, "Old");
+    }
+
+    #[test]
+    fn import_envelope_restores_active_on_duplicate() {
+        // 信封中标记激活的记录即使因重复被跳过, 也应恢复为激活
+        let (src, _d1) = fresh_db();
+        src.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1").unwrap();
+        let id2 = src.add(Protocol::OpenAi, "P2", "m2", "https://b", "k2").unwrap();
+        src.set_active(id2).unwrap();
+        let json = src.export_to_json().unwrap();
+
+        let (dst, _d2) = fresh_db();
+        dst.add(Protocol::Anthropic, "P1", "m1", "https://a", "k-other").unwrap();
+        dst.add(Protocol::OpenAi, "P2", "m2", "https://b", "k-other").unwrap();
+        let result = dst.import_from_json(&json).unwrap();
+        assert_eq!(result.skipped, 2);
+        let active = dst.get_active().unwrap().expect("应恢复激活态");
+        assert_eq!(active.provider_name, "P2");
     }
 }
