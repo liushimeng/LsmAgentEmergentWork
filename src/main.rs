@@ -39,6 +39,14 @@ struct Cli {
     #[arg(short = 'f', long = "file", value_name = "PATH")]
     file: Option<PathBuf>,
 
+    /// 从 JSON 配置文件批量导入 Provider(支持绝对路径和相对路径)
+    #[arg(long = "inprovider", value_name = "PATH", conflicts_with_all = ["prompt", "file", "outprovider"])]
+    inprovider: Option<PathBuf>,
+
+    /// 导出所有 Provider 到 JSON 配置文件(支持绝对路径和相对路径)
+    #[arg(long = "outprovider", value_name = "PATH", conflicts_with_all = ["prompt", "file", "inprovider"])]
+    outprovider: Option<PathBuf>,
+
     /// 最大 Agent 迭代次数
     #[arg(long, default_value_t = 16, global = true)]
     max_iterations: usize,
@@ -219,6 +227,73 @@ async fn run_from_file(file_path: PathBuf, max_iterations: usize) -> Result<()> 
     run_one_shot(content, max_iterations).await
 }
 
+/// 解析文件路径：绝对路径直接使用，相对路径基于工作目录解析
+fn resolve_path(file_path: PathBuf) -> Result<PathBuf> {
+    if file_path.is_absolute() {
+        Ok(file_path)
+    } else {
+        Ok(std::env::current_dir()?.join(file_path))
+    }
+}
+
+/// 从 JSON 配置文件导入 Provider
+async fn cmd_import_provider(file_path: PathBuf) -> Result<()> {
+    let absolute_path = resolve_path(file_path)?;
+
+    let content = std::fs::read_to_string(&absolute_path)
+        .map_err(|e| anyhow::anyhow!("无法读取文件 '{}': {}", absolute_path.display(), e))?;
+
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        anyhow::bail!("文件 '{}' 内容为空", absolute_path.display());
+    }
+
+    let (_paths, db) = open_db()?;
+
+    println!("[laew] 正在从 '{}' 导入 Provider 配置...", absolute_path.display());
+    let result = db.import_from_json(&content).map_err(anyhow::Error::from)?;
+
+    println!();
+    println!("═══ 导入结果 ═══");
+    println!("  成功: {}", result.success);
+    println!("  跳过(重复): {}", result.skipped);
+    println!("  失败: {}", result.failed);
+    println!("  总计: {}", result.total());
+
+    if result.failed > 0 {
+        anyhow::bail!("部分记录导入失败，请检查上方日志");
+    }
+
+    Ok(())
+}
+
+/// 导出所有 Provider 到 JSON 配置文件
+async fn cmd_export_provider(file_path: PathBuf) -> Result<()> {
+    let absolute_path = resolve_path(file_path)?;
+
+    // 确保父目录存在
+    if let Some(parent) = absolute_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("无法创建目录 '{}': {}", parent.display(), e))?;
+        }
+    }
+
+    let (_paths, db) = open_db()?;
+
+    let json = db.export_to_json().map_err(anyhow::Error::from)?;
+
+    std::fs::write(&absolute_path, &json)
+        .map_err(|e| anyhow::anyhow!("无法写入文件 '{}': {}", absolute_path.display(), e))?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&json)?;
+    let count = parsed["count"].as_u64().unwrap_or(0);
+
+    println!("[laew] 已导出 {} 条 Provider 记录到 '{}'", count, absolute_path.display());
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -231,17 +306,23 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.cmd {
-        Some(Cmd::Provider(p)) => cmd_provider(p).await,
-        None => {
-            if let Some(prompt) = cli.prompt {
-                run_one_shot(prompt, cli.max_iterations).await
-            } else if let Some(file_path) = cli.file {
-                run_from_file(file_path, cli.max_iterations).await
-            } else {
-                lsm_agent::tui::run().await
+    // 优先处理导入/导出命令
+    if let Some(path) = cli.inprovider {
+        cmd_import_provider(path).await
+    } else if let Some(path) = cli.outprovider {
+        cmd_export_provider(path).await
+    } else {
+        match cli.cmd {
+            Some(Cmd::Provider(p)) => cmd_provider(p).await,
+            None => {
+                if let Some(prompt) = cli.prompt {
+                    run_one_shot(prompt, cli.max_iterations).await
+                } else if let Some(file_path) = cli.file {
+                    run_from_file(file_path, cli.max_iterations).await
+                } else {
+                    lsm_agent::tui::run().await
+                }
             }
         }
     }
 }
-
