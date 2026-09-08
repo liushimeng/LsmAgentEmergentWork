@@ -25,8 +25,9 @@
 #     * 旧运行日志超过保留期（缺省 30 天，LOG_RETAIN_DAYS 可覆盖）自动清理
 #   - AutoTestAndSaveReport.md 优先取脚本同目录；不存在则立即报错退出
 #   - Agent 退出后自动 git add + git commit（中文提交信息，逐路径容错；
-#     testReport/ 已被 .gitignore 整目录忽略时通常空暂存、自动跳过提交，
-#     保留该环节以兼容未来策略调整）
+#     提交内容 = testReport/ 测试报告(通常被 .gitignore 整目录忽略而空暂存跳过)
+#     + docs/多轮对话问题知识库/ 的「实测状态 ✅」抽测标记行,后者是本流程
+#     唯一允许入库的 docs/ 变更,详见 AutoTestAndSaveReport.md §3.3）
 #   - 本工程不启用自动修复接力（测试 Agent 业务代码只读，只出报告）
 #
 # 环境变量：
@@ -47,6 +48,7 @@ LOG_DIR="${PROJECT_DIR}/logs"
 SCRIPT_TAG="AutoTestAndSaveReport"
 PROMPT_FILE_NAME="AutoTestAndSaveReport.md"
 REPORT_GLOB="自动化测试报告_*.md"     # 测试报告 glob（testReport/ 下）
+KB_DIR="docs/多轮对话问题知识库"       # 知识库实测标记目录(抽测通过后 Agent 追加 ✅ 行,由本脚本提交入库)
 TS="$(date +%Y%m%d_%H%M%S)"
 
 mkdir -p "${LOG_DIR}"
@@ -384,17 +386,19 @@ BG_PID="$(start_agent_in_background "${LOG_FILE}" "
     bg_log '${SCRIPT_TAG}' '${SELECTED_AGENT} 退出码 : '\${AGENT_EXIT}
     append_run_index script=${SCRIPT_TAG} agent=${SELECTED_AGENT} event=agent_done exit=\"\${AGENT_EXIT}\" log=logs/$(basename "${LOG_FILE}")
 
-    # ------- 2. 尝试用中文 git 自动提交测试报告 -------
-    # testReport/ 被 .gitignore 整目录忽略时 git_add_safe 静默失败、
-    # 暂存区无变更自动跳过提交（保留环节以兼容未来策略调整）。
+    # ------- 2. 尝试用中文 git 自动提交测试报告 + 知识库实测标记 -------
+    # testReport/ 被 .gitignore 整目录忽略时 git_add_safe 静默失败;
+    # docs/多轮对话问题知识库/ 的「实测状态 ✅」标记行(AutoTestAndSaveReport.md §3.3)
+    # 是本流程唯一允许入库的 docs/ 变更;两者都无变更时自动跳过提交。
     bg_log '${SCRIPT_TAG}' '开始 git 自动提交检查...'
     git_add_safe 'testReport/${REPORT_GLOB}'
+    git_add_safe '${KB_DIR}'
 
     if git diff --cached --quiet; then
         bg_log '${SCRIPT_TAG}' '暂存区无变更，跳过提交。'
         append_run_index script=${SCRIPT_TAG} agent=${SELECTED_AGENT} event=commit_skip
     else
-        if git commit -m '测试: laew 自动化测试报告 ${TS} 已完成' -m '自动提交由 ${SCRIPT_TAG}.sh 生成' -m '包含: testReport/${REPORT_GLOB}'; then
+        if git commit -m '测试: laew 自动化测试与知识库抽测标记 ${TS} 已完成' -m '自动提交由 ${SCRIPT_TAG}.sh 生成' -m '包含: testReport/${REPORT_GLOB}(通常被忽略) + ${KB_DIR} 实测标记'; then
             COMMIT_HASH=\"\$(git rev-parse --short HEAD 2>/dev/null)\"
             bg_log '${SCRIPT_TAG}' 'git 提交成功: '\${COMMIT_HASH}
             append_run_index script=${SCRIPT_TAG} agent=${SELECTED_AGENT} event=commit_done commit=\"\${COMMIT_HASH}\"
@@ -413,7 +417,7 @@ echo "[${SCRIPT_TAG}] 已后台启动 Agent [${SELECTED_AGENT}] (PID: ${BG_PID})
 echo "[${SCRIPT_TAG}] 日志 : ${LOG_FILE}"
 echo "[${SCRIPT_TAG}] 运行索引日志 : ${LOG_DIR}/auto_run_index.log"
 echo "[${SCRIPT_TAG}] Agent 退出后会自动尝试 git add + git commit（中文提交信息；"
-echo "[${SCRIPT_TAG}]   testReport/ 被忽略时自动跳过）。"
+echo "[${SCRIPT_TAG}]   内容 = testReport/ 报告(被忽略时跳过) + ${KB_DIR} 实测标记）。"
 echo "[${SCRIPT_TAG}] 调用者可继续执行其他操作，不会被阻塞。"
 echo "[${SCRIPT_TAG}] 提示: AGENT_SMOKE=1 可前台冒烟验证调用链路；"
 echo "[${SCRIPT_TAG}]       AGENT_CLI=<codex|claude|hermes|opencode> 可强制指定 Agent。"
