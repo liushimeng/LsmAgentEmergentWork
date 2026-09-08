@@ -15,6 +15,40 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 STATE = {}  # 按 path 分别计数,避免跨协议干扰
 LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
 
+# 全局 mock 行为开关(可由命令行参数 --flaky / --bash-block / --broken-quality 打开):
+#   FLAKY_JSON    — 把 Yolo/Quality 角色原本返回的合法 JSON 替换为含 smart quote / 全角逗号 / trailing comma 的半坏 JSON,
+#                  用于端到端验证 src/agent/json_repair.rs 的 8 段修复链是否真实生效。
+#   BASH_BLOCK    — 让 subagent 角色的"第一次工具调用"命令从 echo 改为 `rm -rf /`,
+#                  用于端到端验证 src/agent/permissions/* 的 check_bash_command fail-closed 拦截。
+#   BROKEN_QUALITY — 让 quality 角色返回非 JSON 文本,
+#                  用于端到端验证 src/agent/quality.rs 的 JSON 解析失败 fail-closed 回流。
+MODES = set()
+for arg in sys.argv[3:]:
+    if arg in ("--flaky", "--bash-block", "--broken-quality"):
+        MODES.add(arg)
+
+
+def maybe_break_json(text):
+    """按 --flaky 模式把合法 JSON 故意破坏:smart quote 引号 / 全角逗号 / trailing comma。
+    目的:验证 src/agent/json_repair.rs 的修复链真实生效,不只是恰好被解析成功掩盖。"""
+    if "--flaky" not in MODES:
+        return text
+    # 把所有双引号换成 smart quote(必须成对),把逗号换成全角,把最末一个逗号保留为 trailing comma
+    out = ""
+    quote_open = True
+    for ch in text:
+        if ch == '"':
+            out += "“" if quote_open else "”"
+            quote_open = not quote_open
+        elif ch == ",":
+            out += ","
+        else:
+            out += ch
+    # 末尾的 "}" 前保留一个 trailing comma
+    if out.endswith("}"):
+        out = out[:-1] + ",}"
+    return out
+
 
 def openai_tool_call(call_id, name, args):
     return {
@@ -165,6 +199,13 @@ def build_anthropic_stream(call_no):
     """构造 Anthropic 一次完整流的 SSE 字节。"""
     if call_no == 1:
         # 第 1 次:返回工具调用
+        # --bash-block 模式下把命令改成 `rm -rf /`,用于触发 Bash 工具入口
+        # check_bash_command 的 fail-closed 拦截;后续循环收到 tool_result 错误后
+        # 由"第 2 次"返回纯文本收口。
+        if "--bash-block" in MODES:
+            bash_cmd = "rm -rf /"
+        else:
+            bash_cmd = "echo LAEW_ANTHROPIC_OK"
         events = [
             {
                 "type": "message_start",
@@ -194,7 +235,7 @@ def build_anthropic_stream(call_no):
                 "data": {
                     "type": "content_block_delta",
                     "index": 0,
-                    "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"echo LAEW_ANTHROPIC_OK\"}"},
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"" + bash_cmd + "\"}"},
                 },
             },
             {
@@ -262,6 +303,11 @@ def build_openai_stream(call_no):
     """构造 OpenAI 一次完整流的 SSE 字节。"""
     if call_no == 1:
         # 第 1 次:返回工具调用
+        # --bash-block 模式下把命令改成 `rm -rf /`
+        if "--bash-block" in MODES:
+            bash_cmd = "rm -rf /"
+        else:
+            bash_cmd = "echo LAEW_MOCK_OK"
         chunks = [
             {
                 "id": "chatcmpl-mock-1",
@@ -298,7 +344,7 @@ def build_openai_stream(call_no):
                             "tool_calls": [
                                 {
                                     "index": 0,
-                                    "function": {"arguments": "{\"command\": \"echo LAEW_MOCK_OK\"}"},
+                                    "function": {"arguments": "{\"command\": \"" + bash_cmd + "\"}"},
                                 }
                             ]
                         },
@@ -385,11 +431,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if key == "oai" or "v1/messages" in self.path:
             if role == "yolo":
-                body_bytes = role_reply(YOLO_CLASSIFICATION_JSON)
+                body_bytes = role_reply(maybe_break_json(YOLO_CLASSIFICATION_JSON))
             elif role == "quality":
-                body_bytes = role_reply(QUALITY_REPORT_JSON)
+                if "--broken-quality" in MODES:
+                    # 返回非 JSON 文本 → 让 src/agent/quality.rs 走 JSON 解析失败路径
+                    body_bytes = role_reply("not a valid JSON at all, sorry.")
+                else:
+                    body_bytes = role_reply(maybe_break_json(QUALITY_REPORT_JSON))
             elif role == "mainwork":
-                body_bytes = role_reply(MAIN_WORK_PLAN_JSON)
+                body_bytes = role_reply(maybe_break_json(MAIN_WORK_PLAN_JSON))
             elif role == "session":
                 body_bytes = role_reply(SESSION_SUMMARY_TEXT)
             elif role == "plan":

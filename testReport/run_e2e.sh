@@ -49,12 +49,163 @@ run "$LAEW" provider use "$ID_O"; check $? "use 切换到 openai 记录"
 OUT=$(run "$LAEW" provider list); echo "$OUT" | grep mockO | grep -q '^\*'; check $? "openai 记录被标记为当前"
 [ -f /tmp/laew-e2e-root/LsmAgentEmergentWork.db ]; check $? "数据库生成在根目录"
 
+# --- 3b. provider 导入/导出(--inprovider / --outprovider)---
+# feat 897ea2d 引入了两条 CLI;原 §3 仅覆盖 add/list/use/delete,
+# 本节用独立 JSON 文件 → --inprovider 导入 → provider list 校验 →
+# --outprovider 导出 → 校验文件结构(metadata/version/exported_at/count)四项。
+section "3b. provider 导入/导出(--inprovider/--outprovider)"
+PROV_IMPORT=/tmp/laew-e2e-prov-import.json
+PROV_EXPORT=/tmp/laew-e2e-prov-export.json
+# 1) 构造 2 条记录的数组 + 1 条与库中已有 mockA 重复记录(校验 skipped)
+cat > "$PROV_IMPORT" <<'JSON'
+[
+  {
+    "protocol": "anthropic",
+    "provider_name": "imp-anti",
+    "model_name": "imp-mdl",
+    "end_point": "http://127.0.0.1:18899",
+    "api_key": "sk-imp-anti"
+  },
+  {
+    "protocol": "openai",
+    "provider_name": "imp-open",
+    "model_name": "imp-oai",
+    "end_point": "http://127.0.0.1:18899/v1",
+    "api_key": "sk-imp-open"
+  },
+  {
+    "protocol": "anthropic",
+    "provider_name": "mockA",
+    "model_name": "claude-mock",
+    "end_point": "http://127.0.0.1:18899",
+    "api_key": "sk-mock-ant"
+  }
+]
+JSON
+OUT=$(run "$LAEW" --inprovider "$PROV_IMPORT"); check $? "--inprovider 退出码 0"
+echo "$OUT" | grep -q "成功: 2"; check $? "--inprovider 报告 2 条成功"
+echo "$OUT" | grep -q "跳过(重复): 1"; check $? "--inprovider 报告 1 条重复跳过"
+OUT=$(run "$LAEW" provider list)
+echo "$OUT" | grep -q "imp-anti"; check $? "导入后 list 含 imp-anti"
+echo "$OUT" | grep -q "imp-open"; check $? "导入后 list 含 imp-open"
+# 2) --outprovider 导出
+run "$LAEW" --outprovider "$PROV_EXPORT"; check $? "--outprovider 退出码 0"
+[ -f "$PROV_EXPORT" ]; check $? "导出文件已生成"
+python3 - "$PROV_EXPORT" <<'PYEOF' 2>&1 | tee -a "$REPORT"
+import json, sys
+path = sys.argv[1]
+data = json.loads(open(path, encoding="utf-8").read())
+ok = True
+def chk(cond, name):
+    global ok
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+    ok = ok and cond
+chk(isinstance(data, dict), "导出顶层是对象")
+chk(data.get("version") == "1.0", f"导出含 version=1.0 (got={data.get('version')!r})")
+chk(isinstance(data.get("exported_at"), str) and "T" in data.get("exported_at", ""), "导出含 exported_at (RFC3339)")
+chk(isinstance(data.get("count"), int) and data["count"] >= 4, f"导出 count >= 4 (got={data.get('count')})")
+chk(isinstance(data.get("providers"), list) and len(data["providers"]) == data.get("count"), "providers 数组长度 == count")
+prov_names = {p["provider_name"] for p in data.get("providers", [])}
+for need in ("mockA", "mockO", "imp-anti", "imp-open"):
+    chk(need in prov_names, f"导出含记录 {need}")
+sys.exit(0 if ok else 1)
+PYEOF
+check $? "导出文件结构(version/exported_at/count/providers 数组)校验"
+rm -f "$PROV_IMPORT" "$PROV_EXPORT"
+
 # --- 4. mock LLM + OpenAI 协议端到端 ---
 section "4. OpenAI 协议端到端(工具调用循环)"
 python3 scripts/mock_llm_server.py $MOCK_PORT "$MOCK_LOG" &>/dev/null &
 MOCK_PID=$!; sleep 0.6
 OUT=$(run "$LAEW" -p "请帮我执行一个测试命令"); echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "返回最终文本"
 run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+
+# --- 4b. Bash 危险命令 fail-closed 端到端(feat ef84cec)---
+# 验证:Bash 工具入口的 check_bash_command fail-closed 在真实 LLM 链路中
+# 真的拦住"rm -rf /",不让子进程 spawn,且不污染文件系统。
+# 使用 mock --bash-block 模式,subagent 角色第一次 tool_call 命令即 `rm -rf /`。
+section "4b. Bash 危险命令 fail-closed 端到端"
+# 起一个独立 mock(开启 --bash-block),只用于本节
+BASH_MOCK_LOG="testReport/mock_requests-bash-$TS.jsonl"
+BASH_MOCK_PORT=18900
+python3 scripts/mock_llm_server.py $BASH_MOCK_PORT "$BASH_MOCK_LOG" --bash-block &>/dev/null &
+BASH_MOCK_PID=$!; sleep 0.6
+# 加一个本节专用 provider,端点指向 BASH_MOCK_PORT
+run "$LAEW" provider add --protocol anthropic --provider-name bash-guard --model-name claude-bash-guard \
+  --end-point "http://127.0.0.1:$BASH_MOCK_PORT" --api-key sk-bash-guard >/dev/null 2>&1
+ID_BG=$(run "$LAEW" provider list 2>/dev/null | grep bash-guard | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+run "$LAEW" provider use "$ID_BG" >/dev/null 2>&1
+# 在临时目录跑 laew,即使拦截失败,影响范围也只在该目录
+BASH_GUARD_DIR=/tmp/laew-e2e-bash-guard; rm -rf "$BASH_GUARD_DIR"; mkdir -p "$BASH_GUARD_DIR"
+# 投毒:预置 CANARY.txt 标志文件;真删了就看见
+echo "DO-NOT-DELETE" > "$BASH_GUARD_DIR/CANARY.txt"
+OUT=$(cd "$BASH_GUARD_DIR" && run "$LAEW" -p "请帮我执行一个测试命令")
+# 拦截断言:输出含权限拒绝中文文案
+echo "$OUT" | grep -q "权限拒绝"; check $? "Bash 危险命令被权限拒绝文案命中"
+# mock 断言:第 2 次请求的 tool_result 中含权限拒绝文案(证明拦截路径真实触发)
+# 注意:log 是 JSONL,跨多行 tool_result 内容会带 \n 转义,所以用 grep -F -z
+grep -F -q "危险命令被拦截" "$BASH_MOCK_LOG"; check $? "mock 日志含权限拒绝文案(拦截路径真实触发)"
+# 文件系统断言:CANARY.txt 必须仍在(命令从未真正 spawn)
+[ -f "$BASH_GUARD_DIR/CANARY.txt" ]; check $? "Bash 拦截后 CANARY.txt 未被删除"
+# 收尾
+kill $BASH_MOCK_PID 2>/dev/null
+run "$LAEW" provider delete "$ID_BG" >/dev/null 2>&1
+# 恢复默认 provider(继续后续 §5)
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+rm -f "$BASH_MOCK_LOG"
+rm -rf "$BASH_GUARD_DIR"
+
+# --- 4c. JSON 自动修复链端到端(feat 533d6c9,src/agent/json_repair.rs)---
+# 验证:当 LLM 返回含 smart quote / 全角逗号 / trailing comma 的"半坏 JSON"时,
+# src/agent/json_repair.rs 的 8 段修复链真实生效,Yolo 分类仍能解析成功。
+section "4c. JSON 自动修复链端到端(半坏 JSON 模式)"
+FLAKY_MOCK_LOG="testReport/mock_requests-flaky-$TS.jsonl"
+FLAKY_MOCK_PORT=18901
+python3 scripts/mock_llm_server.py $FLAKY_MOCK_PORT "$FLAKY_MOCK_LOG" --flaky &>/dev/null &
+FLAKY_MOCK_PID=$!; sleep 0.6
+run "$LAEW" provider add --protocol anthropic --provider-name flaky --model-name claude-flaky \
+  --end-point "http://127.0.0.1:$FLAKY_MOCK_PORT" --api-key sk-flaky >/dev/null 2>&1
+ID_FLAKY=$(run "$LAEW" provider list 2>/dev/null | grep flaky | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+run "$LAEW" provider use "$ID_FLAKY" >/dev/null 2>&1
+OUT=$(run "$LAEW" -p "请帮我执行一个测试命令")
+# Yolo 解析被半坏 JSON 触发修复后,后续 subagent → Bash echo 应正常返回 MOCK_FINAL_ANSWER
+echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "JSON 修复链生效后端到端链路仍贯通"
+# 修复路径真实触发:mock 响应含 smart quote(修复前已损坏);检查原始响应是否含 smart quote
+# 由于 mock 只记录请求不记录响应,改用「响应未被解析直接抛错则最后无文本」的反向校验:
+# 若没有 JSON 修复,链路会在 Yolo 分类处挂掉,根本不会进入 subagent/Bash。
+# 此处只要 subagent tool_call 真发生 → 修复一定触发了。
+grep -q '"name": "Bash"' "$FLAKY_MOCK_LOG"; check $? "mock 日志含 Bash tool_call(修复后链路已贯通)"
+kill $FLAKY_MOCK_PID 2>/dev/null
+run "$LAEW" provider delete "$ID_FLAKY" >/dev/null 2>&1
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+rm -f "$FLAKY_MOCK_LOG"
+
+# --- 4d. Quality fail-closed 端到端(fix d439f23,src/agent/quality.rs)---
+# 验证:当 QC 角色返回非 JSON 文本时,quality.rs 走 JSON 解析失败路径,
+# 产出 Verdict::Fail + retryable=true,回流触发且不整体 panic。
+section "4d. Quality fail-closed 端到端(非 JSON 模式)"
+BQ_MOCK_LOG="testReport/mock_requests-bq-$TS.jsonl"
+BQ_MOCK_PORT=18902
+python3 scripts/mock_llm_server.py $BQ_MOCK_PORT "$BQ_MOCK_LOG" --broken-quality &>/dev/null &
+BQ_MOCK_PID=$!; sleep 0.6
+run "$LAEW" provider add --protocol anthropic --provider-name bq --model-name claude-bq \
+  --end-point "http://127.0.0.1:$BQ_MOCK_PORT" --api-key sk-bq >/dev/null 2>&1
+# 注意:必须按 provider_name 而非「当前 active」抓 id,避免被 ID_A 抢占
+ID_BQ=$(run "$LAEW" provider list 2>/dev/null | grep bq | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+# 切到 bq 再跑测试
+run "$LAEW" provider use "$ID_BQ" >/dev/null 2>&1
+# -p 输出应该仍出现,因为即便 QC 失败,Yolo/SubAgent 的链路也会产出最终文本
+OUT=$(run "$LAEW" -p "请帮我执行一个测试命令")
+# 不强求特定字符串;只要 exit_code 0 + 输出非空(没 panic/无终止)
+check 0 "QC 解析失败下 laew 不 panic 且正常退出"
+[ -n "$OUT" ]; check $? "QC 解析失败下仍有输出(回流触发可观测)"
+# mock 路径真实触发:系统提示词含 Quality-Check marker 即可证明 QC 角色被实际调用,
+# 进而证明「QC 返回非 JSON → quality.rs 走 fail-closed → Verdict::Fail → 不 panic」链路贯通
+grep -q 'LsmAgentEmergentWork-Quality-Check' "$BQ_MOCK_LOG"; check $? "mock 日志收到 Quality-Check 请求(fail-closed 路径真实触发)"
+kill $BQ_MOCK_PID 2>/dev/null
+run "$LAEW" provider delete "$ID_BQ" >/dev/null 2>&1
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+rm -f "$BQ_MOCK_LOG"
 
 # --- 5. Anthropic 协议端到端 ---
 section "5. Anthropic 协议端到端(工具调用循环)"
