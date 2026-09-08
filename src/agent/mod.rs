@@ -40,6 +40,12 @@ use crate::session::Session;
 
 const DEFAULT_MAX_ITERATIONS: usize = 16;
 
+/// 默认最大截断续接次数(对齐 AtomCode `MAX_TRUNCATION_RESUME = 4` 惯例)。
+///
+/// 当 LLM 输出因 token 上限被截断时(`stop_reason = "max_tokens"` Anthropic /
+/// `"length"` OpenAI),自动注入 nudge 消息让模型从断点继续,最多续接此数值次。
+const DEFAULT_MAX_TRUNCATION_RESUME: usize = 4;
+
 /// 一个可运行的 Agent 实例。
 ///
 /// 持有 [`AgentProfile`](profile::AgentProfile)(名称 / 系统提示词 / 工具集),
@@ -48,6 +54,8 @@ pub struct Agent {
     llm: Arc<dyn LlmClient>,
     profile: AgentProfile,
     max_iterations: usize,
+    /// 最大截断续接次数(输出被 token 上限截断时自动续接的上限)。
+    max_truncation_resume: usize,
 }
 
 impl Agent {
@@ -56,6 +64,7 @@ impl Agent {
             llm,
             profile,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_truncation_resume: DEFAULT_MAX_TRUNCATION_RESUME,
         }
     }
 
@@ -64,9 +73,16 @@ impl Agent {
         self
     }
 
+    /// 设置最大截断续接次数(测试 / 特殊场景用)。
+    pub fn with_max_truncation_resume(mut self, n: usize) -> Self {
+        self.max_truncation_resume = n;
+        self
+    }
+
     pub fn llm(&self) -> Arc<dyn LlmClient> { self.llm.clone() }
     pub fn profile(&self) -> &AgentProfile { &self.profile }
     pub fn max_iterations(&self) -> usize { self.max_iterations }
+    pub fn max_truncation_resume(&self) -> usize { self.max_truncation_resume }
 
     /// 单轮任务:传入用户提示,返回最终文本与本次累计 token 用量。
     pub async fn run_once(&self, user_input: &str) -> Result<(String, Usage)> {
@@ -79,10 +95,16 @@ impl Agent {
     ///
     /// 返回 `(最终回复文本, 本次循环累计 token 用量)`。后者包含所有 LLM 调用的
     /// input/output tokens 之和(由 LlmClient 在 SSE 流中收集)。
+    ///
+    /// **自动截断续接**:当 LLM 输出因 token 上限被截断时(`stop_reason = "max_tokens"`
+    /// / `"length"`),自动注入 nudge 消息让模型从断点继续,最多续接 `max_truncation_resume`
+    /// 次(默认 4 次),避免无限循环。累计所有部分输出后返回完整文本。
     pub async fn run_session(&self, session: &mut Session) -> Result<(String, Usage)> {
         let tool_defs = self.profile.tools.defs();
         let meta: RequestMeta = session.meta();
         let mut total_usage = Usage::default();
+        let mut accumulated_text = String::new();
+        let mut truncation_resumes: usize = 0;
         let final_text;
 
         // 关联报告: 20260908_203854 D-001
@@ -112,13 +134,45 @@ impl Agent {
                 total_usage.cache_creation_input_tokens.saturating_add(completion.usage.cache_creation_input_tokens);
 
             if !completion.has_tool_calls() {
-                info!("agent finished with text answer");
+                // 累计文本(续接场景下可能多次进入此分支)
                 if !completion.text.trim().is_empty() {
+                    if !accumulated_text.is_empty() {
+                        accumulated_text.push('\n');
+                    }
+                    accumulated_text.push_str(&completion.text);
                     session.context_mut().push(ChatMessage::assistant(vec![ContentBlock::text(
                         completion.text.clone(),
                     )]));
                 }
-                final_text = completion.text;
+
+                // 检测截断:输出被 token 上限截断时自动续接
+                if is_truncation_stop_reason(completion.stop_reason.as_deref()) {
+                    if truncation_resumes >= self.max_truncation_resume {
+                        // 达到上限,返回已累计的文本(优雅降级)
+                        warn!(
+                            truncation_resumes = truncation_resumes,
+                            "截断续接达到上限,返回已累计文本"
+                        );
+                        final_text = accumulated_text;
+                        return Ok((final_text, total_usage));
+                    }
+                    // 注入 nudge 并续接
+                    truncation_resumes += 1;
+                    let nudge = format!(
+                        "[输出被截断,请从断点继续。第 {}/{} 次续接]",
+                        truncation_resumes, self.max_truncation_resume
+                    );
+                    info!(
+                        truncation_resumes = truncation_resumes,
+                        "检测到输出截断,自动续接"
+                    );
+                    session.context_mut().push(ChatMessage::user(nudge));
+                    continue;  // 继续循环
+                }
+
+                // 非截断,正常返回
+                info!("agent finished with text answer");
+                final_text = accumulated_text;
                 return Ok((final_text, total_usage));
             }
 
@@ -200,6 +254,14 @@ impl Agent {
     }
 }
 
+/// 判断 `stop_reason` 是否为截断(输出被 token 上限截断)。
+///
+/// - Anthropic:`"max_tokens"` 表示输出达到 `max_tokens` 上限被截断
+/// - OpenAI:`"length"` 表示输出达到 `max_tokens` 上限被截断
+fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
+    matches!(stop_reason, Some("max_tokens") | Some("length"))
+}
+
 /// 将 `serde_json::Value` 序列化为「对象 key 排序后的字符串」,作为失败键的稳定摘要。
 /// 顺序无关,LLM 调换参数顺序不触发「不同目标」误判。
 fn stable_json_string(v: &serde_json::Value) -> String {
@@ -225,6 +287,15 @@ fn stable_json_string(v: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn is_truncation_stop_reason_detects_max_tokens() {
+        assert!(is_truncation_stop_reason(Some("max_tokens")));
+        assert!(is_truncation_stop_reason(Some("length")));
+        assert!(!is_truncation_stop_reason(Some("end_turn")));
+        assert!(!is_truncation_stop_reason(Some("stop")));
+        assert!(!is_truncation_stop_reason(None));
+    }
 
     // 关联报告: 20260908_203854 D-001
     #[test]
