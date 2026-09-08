@@ -200,7 +200,32 @@ async fn run_one_shot(prompt: String, max_iterations: usize, debug: bool, mode: 
         (MultiAgentOrchestrator::with_config(llm.clone(), db_arc, plans_dir, cfg), None)
     };
 
-    let outcome = orchestrator.handle(&mut session).await.map_err(anyhow::Error::from)?;
+    // 取消传播:任务窗口监听 SIGINT,第一次中断取消当前任务(H9);
+    // -p 单轮模式取消后按 128+SIGINT=130 惯例退出
+    let cancel = lsm_agent::agent::cancel::CancelToken::new();
+    let sig_cancel = cancel.clone();
+    let sig_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        eprintln!("[laew] 收到中断信号,正在取消当前任务...");
+        sig_cancel.cancel();
+        let _ = tokio::signal::ctrl_c().await;
+        std::process::exit(130);
+    });
+    let outcome = match orchestrator.handle_cancellable(&mut session, &cancel).await {
+        Ok(o) => o,
+        Err(e) if matches!(e, lsm_agent::error::AgentError::Cancelled) => {
+            sig_task.abort();
+            eprintln!("[laew] 任务已取消(用户中断)");
+            std::process::exit(130);
+        }
+        Err(e) => {
+            sig_task.abort();
+            return Err(anyhow::Error::from(e));
+        }
+    };
+    sig_task.abort();
 
     // debug 模式:任务结束后生成 Debug 报告(用未装饰的 llm 驱动 Debug Agent,避免自我采集递归)
     if let Some(collector) = collector {

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::agent::cancel::CancelToken;
 use crate::agent::context::AgentRole;
 use crate::agent::memory;
 use crate::agent::{Agent, AgentProfile};
@@ -88,15 +89,39 @@ impl SubAgentRunner {
         input: &SubFlowInput,
         session_id: &str,
     ) -> Result<SubFlowOutcome> {
+        self.run_unit_inner(input, session_id, None).await
+    }
+
+    /// [`run_unit`] 的可取消版本(第六轮 SubAgent 调度专题 §11.2 P0):
+    /// 编排器把任务级取消 token 传入,Agent 循环内所有 LLM 调用 / 工具执行
+    /// 即时中断并上抛 `AgentError::Cancelled`;取消路径不落 Agent-Memory。
+    pub async fn run_unit_with_cancel(
+        &self,
+        input: &SubFlowInput,
+        session_id: &str,
+        cancel: &CancelToken,
+    ) -> Result<SubFlowOutcome> {
+        self.run_unit_inner(input, session_id, Some(cancel)).await
+    }
+
+    async fn run_unit_inner(
+        &self,
+        input: &SubFlowInput,
+        session_id: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<SubFlowOutcome> {
         let prompt = input.to_user_prompt();
         let mut sub_session = crate::session::Session::new();
         sub_session.context_mut().push(ChatMessage::user(&prompt));
         // 让 sub_session 共享 session_id 便于追踪
         sub_session.id = session_id.to_string();
 
-        let (text, usage) = self.agent.run_session(&mut sub_session).await?;
+        let (text, usage) = self
+            .agent
+            .run_session_cancellable(&mut sub_session, cancel)
+            .await?;
 
-        // 写入 Agent-Memory
+        // 写入 Agent-Memory(取消路径已在上面提前返回,不会走到这里)
         let _ = memory::record_entry(
             &self.db,
             AgentRole::SubAgent,

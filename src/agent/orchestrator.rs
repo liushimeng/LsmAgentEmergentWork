@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::agent::cancel::CancelToken;
 use crate::agent::compact::CompactRunner;
 use crate::agent::context::AgentRole;
 use crate::agent::debug::DebugCollector;
@@ -23,7 +24,8 @@ use crate::agent::session_context::{
 use crate::agent::subagent::{SubAgentRunner, SubFlowInput};
 use crate::agent::yolo::{TaskClassification, TaskLevel, YoloRunner};
 use crate::config::{Db, EventType};
-use crate::error::Result;
+use crate::error::{AgentError, Result};
+use crate::llm::cancellable::{CancelGate, CancellableLlmClient};
 use crate::llm::Usage;
 use crate::session::Session;
 
@@ -101,6 +103,23 @@ struct QualityFailure {
     reason: String,
     retryable: bool,
     suggestion: String,
+    /// 用户取消触发的「失败」:不可重试、不回流 Yolo,直接短路退出整个任务。
+    cancelled: bool,
+}
+
+impl QualityFailure {
+    /// 从 Agent 错误构造:取消错误标记 `cancelled=true` 且不可重试;
+    /// 其余按可重试处理(与既有站点语义一致)。
+    fn from_agent_error(source: AgentRole, prefix: &str, e: &AgentError) -> Self {
+        let cancelled = matches!(e, AgentError::Cancelled);
+        Self {
+            source,
+            reason: format!("{prefix}: {e}"),
+            retryable: !cancelled,
+            suggestion: if cancelled { "任务已取消".into() } else { "重试".into() },
+            cancelled,
+        }
+    }
 }
 
 /// 多 Agent 编排器
@@ -116,6 +135,9 @@ pub struct MultiAgentOrchestrator {
     compact: CompactRunner,
     db: Arc<Db>,
     cfg: OrchestratorConfig,
+    /// 每任务取消门:8 个角色的 LLM 客户端被 `CancellableLlmClient` 统一包裹,
+    /// `handle_cancellable` 开始时注入 token、结束时(Drop guard)清除。
+    cancel_gate: Arc<CancelGate>,
 }
 
 impl MultiAgentOrchestrator {
@@ -138,6 +160,11 @@ impl MultiAgentOrchestrator {
         plans_dir: PathBuf,
         cfg: OrchestratorConfig,
     ) -> Self {
+        // 取消传播:在最外层包裹可取消装饰器(顺序 cancellable > debug > resilient > raw),
+        // 全部角色的 LLM 调用一处获得中断能力(方案 §3.3)
+        let cancel_gate = CancelGate::new();
+        let llm: Arc<dyn crate::llm::LlmClient> =
+            Arc::new(CancellableLlmClient::new(llm, cancel_gate.clone()));
         let yolo = YoloRunner::new(llm.clone());
         let plan = PlanRunner::new(llm.clone(), db.clone(), plans_dir);
         let main_work = MainWorkRunner::new(llm.clone(), db.clone());
@@ -158,11 +185,38 @@ impl MultiAgentOrchestrator {
             compact,
             db,
             cfg,
+            cancel_gate,
         }
     }
 
-    /// 处理一次用户输入
+    /// 处理一次用户输入(不可取消;既有调用方 / 测试零改动)。
+    ///
+    /// 内部用一个永不触发的全新 token 走 [`handle_cancellable`],语义等价:
+    /// fresh token 的 `cancelled()` 永不 resolve,LLM 装饰器等价直通。
     pub async fn handle(&self, session: &mut Session) -> Result<OrchestrationOutcome> {
+        let never_fires = CancelToken::new();
+        self.handle_cancellable(session, &never_fires).await
+    }
+
+    /// [`handle`] 的可取消版本(H9 取消传播,第 07 轮):
+    /// - LLM 层:token 经 `cancel_gate` 注入装饰器,所有角色调用可即时中断;
+    /// - 编排层:各阶段边界检查,命中即返回 `Err(AgentError::Cancelled)`,
+    ///   **不进 QualityFailure / Yolo 失败回流**(取消不是失败,不能重试);
+    /// - 执行层:token 传入每个 SubAgent 单元(含同层并行 spawn)。
+    pub async fn handle_cancellable(
+        &self,
+        session: &mut Session,
+        cancel: &CancelToken,
+    ) -> Result<OrchestrationOutcome> {
+        let _gate_guard = self.cancel_gate.guard(cancel.clone());
+        self.handle_inner(session, cancel).await
+    }
+
+    async fn handle_inner(
+        &self,
+        session: &mut Session,
+        cancel: &CancelToken,
+    ) -> Result<OrchestrationOutcome> {
         // 0) 项目上下文首次注入(幂等)
         if let Some(work_dir) = project_context::current_work_dir() {
             project_context::inject_once(session, work_dir);
@@ -186,12 +240,14 @@ impl MultiAgentOrchestrator {
                     );
                 }
                 Ok(None) => {}
+                Err(e) if matches!(e, AgentError::Cancelled) => return Err(e),
                 Err(e) => tracing::warn!(error = %e, "Context 自动压缩失败(不中断任务)"),
             }
         }
 
         // 1) Yolo 入口
         let mut classification = self.run_yolo_classification(session).await?;
+        Self::check_cancelled(cancel)?;
         self.dbg_classify(&classification);
         let mut total_usage = Usage::default();
 
@@ -207,6 +263,8 @@ impl MultiAgentOrchestrator {
 
         let mut retry_count = 0;
         loop {
+            // 重试轮入口:取消短路(取消不是失败,不消耗重试预算)
+            Self::check_cancelled(cancel)?;
             retry_count += 1;
             if retry_count > self.cfg.max_retry_per_level {
                 // 超过最大重试,输出失败 / 建议
@@ -224,16 +282,17 @@ impl MultiAgentOrchestrator {
                 });
             }
 
-            // 2) 调度执行
+            // 2) 调度执行(执行层取消:token 贯穿 SubAgent / 并行层)
             let exec_result = match classification.task_level {
-                TaskLevel::Simple => self.run_simple(&classification, session).await,
-                TaskLevel::Medium => self.run_medium(&classification, session).await,
-                TaskLevel::Hard => self.run_hard(&classification, session).await,
+                TaskLevel::Simple => self.run_simple(&classification, session, cancel).await,
+                TaskLevel::Medium => self.run_medium(&classification, session, cancel).await,
+                TaskLevel::Hard => self.run_hard(&classification, session, cancel).await,
             };
 
             match exec_result {
                 Ok(mut task_result) => {
-                    // 3) SessionContext 收口
+                    // 3) SessionContext 收口(收口前再查一次:取消后不再发摘要请求)
+                    Self::check_cancelled(cancel)?;
                     let summary = self
                         .session_context
                         .summarize(
@@ -259,6 +318,11 @@ impl MultiAgentOrchestrator {
                     return Ok(OrchestrationOutcome::Executed { result: task_result });
                 }
                 Err(failure) => {
+                    // 用户取消:短路退出整个任务,不回流不重试(H9 语义)
+                    if failure.cancelled {
+                        self.dbg_task_end("cancelled", total_usage);
+                        return Err(AgentError::Cancelled);
+                    }
                     total_usage = add_usage(total_usage, failure_usage(&failure));
                     // 升级或重试
                     if !failure.retryable {
@@ -286,10 +350,20 @@ impl MultiAgentOrchestrator {
 
     // ========== 简单档 ==========
 
+    /// 取消检查:命中即返回 `Err(Cancelled)`(由调用方短路,不回流)。
+    fn check_cancelled(cancel: &CancelToken) -> Result<()> {
+        if cancel.is_cancelled() {
+            Err(AgentError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     async fn run_simple(
         &self,
         c: &TaskClassification,
         session: &Session,
+        cancel: &CancelToken,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         let input = SubFlowInput {
             id: "wf-1".into(),
@@ -304,25 +378,15 @@ impl MultiAgentOrchestrator {
         };
         let outcome = self
             .sub_agent
-            .run_unit(&input, session.id())
+            .run_unit_with_cancel(&input, session.id(), cancel)
             .await
-            .map_err(|e| QualityFailure {
-                source: AgentRole::SubAgent,
-                reason: format!("SubAgent 执行失败: {e}"),
-                retryable: true,
-                suggestion: "请重试".into(),
-            })?;
+            .map_err(|e| QualityFailure::from_agent_error(AgentRole::SubAgent, "SubAgent 执行失败", &e))?;
 
         let qc = self
             .quality
             .check_subagent(&c.goal_summary, &input.expected_output, &outcome.text, session.id())
             .await
-            .map_err(|e| QualityFailure {
-                source: AgentRole::QualityCheck,
-                reason: format!("Quality 调用失败: {e}"),
-                retryable: true,
-                suggestion: "重试".into(),
-            })?;
+            .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
         self.dbg_qc(&qc);
 
         if qc.verdict == Verdict::Pass {
@@ -346,6 +410,7 @@ impl MultiAgentOrchestrator {
                 reason: qc.issues.join("; "),
                 retryable: qc.retryable,
                 suggestion: qc.suggestion,
+                cancelled: false,
             })
         }
     }
@@ -356,18 +421,14 @@ impl MultiAgentOrchestrator {
         &self,
         c: &TaskClassification,
         session: &Session,
+        cancel: &CancelToken,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Main-Work 拆 WorkFlow
         let plan = self
             .main_work
             .plan_workflows(&c.goal_summary, &c.decomposition_plan, session.id())
             .await
-            .map_err(|e| QualityFailure {
-                source: AgentRole::MainWork,
-                reason: format!("Main-Work 拆解失败: {e}"),
-                retryable: true,
-                suggestion: "重试".into(),
-            })?;
+            .map_err(|e| QualityFailure::from_agent_error(AgentRole::MainWork, "Main-Work 拆解失败", &e))?;
 
         // 2) Quality 校验 Main-Work 输出
         let wf_json = serde_json::to_string(&plan).unwrap_or_default();
@@ -375,12 +436,7 @@ impl MultiAgentOrchestrator {
             .quality
             .check_main(&c.goal_summary, &wf_json, session.id())
             .await
-            .map_err(|e| QualityFailure {
-                source: AgentRole::QualityCheck,
-                reason: format!("Quality 调用失败: {e}"),
-                retryable: true,
-                suggestion: "重试".into(),
-            })?;
+            .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
         self.dbg_qc(&qc_main);
 
         if qc_main.verdict == Verdict::Fail {
@@ -389,11 +445,12 @@ impl MultiAgentOrchestrator {
                 reason: qc_main.issues.join("; "),
                 retryable: qc_main.retryable,
                 suggestion: qc_main.suggestion,
+                cancelled: false,
             });
         }
 
         // 3) 拓扑排序并执行
-        self.execute_workflows(c, &plan, session).await
+        self.execute_workflows(c, &plan, session, cancel).await
     }
 
     // ========== 高等档 ==========
@@ -402,6 +459,7 @@ impl MultiAgentOrchestrator {
         &self,
         c: &TaskClassification,
         session: &Session,
+        cancel: &CancelToken,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Plan 生成
         let plan_output = self
@@ -414,24 +472,14 @@ impl MultiAgentOrchestrator {
                 session.id(),
             )
             .await
-            .map_err(|e| QualityFailure {
-                source: AgentRole::Plan,
-                reason: format!("Plan 生成失败: {e}"),
-                retryable: true,
-                suggestion: "重试".into(),
-            })?;
+            .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;
 
         // 2) Quality 校验 Plan
         let qc_plan = self
             .quality
             .check_plan(&plan_output.markdown, session.id())
             .await
-            .map_err(|e| QualityFailure {
-                source: AgentRole::QualityCheck,
-                reason: format!("Quality 调用失败: {e}"),
-                retryable: true,
-                suggestion: "重试".into(),
-            })?;
+            .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
         self.dbg_qc(&qc_plan);
         if qc_plan.verdict == Verdict::Fail {
             return Err(QualityFailure {
@@ -439,6 +487,7 @@ impl MultiAgentOrchestrator {
                 reason: qc_plan.issues.join("; "),
                 retryable: qc_plan.retryable,
                 suggestion: qc_plan.suggestion,
+                cancelled: false,
             });
         }
 
@@ -446,23 +495,13 @@ impl MultiAgentOrchestrator {
         let plan = self
             .main_work
             .parse_plan(&plan_output.path)
-            .map_err(|e| QualityFailure {
-                source: AgentRole::MainWork,
-                reason: format!("解析 Plan 失败: {e}"),
-                retryable: true,
-                suggestion: "重试".into(),
-            })?;
+            .map_err(|e| QualityFailure::from_agent_error(AgentRole::MainWork, "解析 Plan 失败", &e))?;
 
         let qc_main = self
             .quality
             .check_main(&c.goal_summary, &serde_json::to_string(&plan).unwrap_or_default(), session.id())
             .await
-            .map_err(|e| QualityFailure {
-                source: AgentRole::QualityCheck,
-                reason: format!("Quality 调用失败: {e}"),
-                retryable: true,
-                suggestion: "重试".into(),
-            })?;
+            .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
         self.dbg_qc(&qc_main);
         if qc_main.verdict == Verdict::Fail {
             return Err(QualityFailure {
@@ -470,11 +509,12 @@ impl MultiAgentOrchestrator {
                 reason: qc_main.issues.join("; "),
                 retryable: qc_main.retryable,
                 suggestion: qc_main.suggestion,
+                cancelled: false,
             });
         }
 
         // 4) 执行 WorkFlow
-        let mut task_result = self.execute_workflows(c, &plan, session).await?;
+        let mut task_result = self.execute_workflows(c, &plan, session, cancel).await?;
         task_result.plan_doc = Some(plan_output.path);
         Ok(task_result)
     }
@@ -486,6 +526,7 @@ impl MultiAgentOrchestrator {
         c: &TaskClassification,
         plan: &WorkFlowPlan,
         session: &Session,
+        cancel: &CancelToken,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 依赖分层:同层 WorkFlow 互相无依赖,自动并行;跨层严格串行(自动感知 depends_on)
         let layers = main_work::topo_layers(&plan.workflows).map_err(|e| QualityFailure {
@@ -493,6 +534,7 @@ impl MultiAgentOrchestrator {
             reason: format!("拓扑分层失败: {e}"),
             retryable: false,
             suggestion: "Plan 中存在循环或未知依赖".into(),
+            cancelled: false,
         })?;
 
         let mut results = Vec::new();
@@ -502,6 +544,10 @@ impl MultiAgentOrchestrator {
         let total_layers = layers.len();
 
         for (layer_idx, layer) in layers.into_iter().enumerate() {
+            // 层边界:取消短路(下一层不再启动)
+            if let Err(e) = Self::check_cancelled(cancel) {
+                return Err(QualityFailure::from_agent_error(AgentRole::MainWork, "WorkFlow 层调度", &e));
+            }
             if layer.len() > 1 {
                 eprintln!(
                     "[laew] WorkFlow 并行调度:第 {}/{} 层 {} 个流程并发执行(上限 {})",
@@ -529,6 +575,7 @@ impl MultiAgentOrchestrator {
                     c.goal_summary.clone(),
                     session.id().to_string(),
                     None,
+                    cancel.clone(),
                 )
                 .await;
                 vec![(wf, outcome)]
@@ -544,6 +591,9 @@ impl MultiAgentOrchestrator {
                     let goal = c.goal_summary.clone();
                     let sid = session.id().to_string();
                     let sem = semaphore.clone();
+                    // 取消传播:同层每个并行单元持同一 token 的 clone,
+                    // 父任务取消 → 全部单元即时中断(原子级联,无需逐个通知)
+                    let cancel_tok = cancel.clone();
                     handles.push(tokio::spawn(async move {
                         let outcome = run_wf_unit(
                             sub_agent,
@@ -553,6 +603,7 @@ impl MultiAgentOrchestrator {
                             goal,
                             sid,
                             Some(sem),
+                            cancel_tok,
                         )
                         .await;
                         (wf, outcome)
@@ -581,6 +632,7 @@ impl MultiAgentOrchestrator {
                                     reason: format!("并行 WorkFlow 任务 join 失败: {e}"),
                                     retryable: true,
                                     suggestion: "重试".into(),
+                                    cancelled: false,
                                 }),
                             ));
                         }
@@ -752,7 +804,8 @@ struct WfUnitOk {
 /// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
 ///
 /// 自由函数 + Arc 参数化,串行直通与 tokio::spawn 并行两种调用路径共用同一份逻辑;
-/// `semaphore` 为并行路径的有界并发许可(串行路径传 None)。
+/// `semaphore` 为并行路径的有界并发许可(串行路径传 None);
+/// `cancel` 为任务级取消 token(传播进 SubAgent 的 Agent 循环,LLM/工具即时中断)。
 async fn run_wf_unit(
     sub_agent: Arc<SubAgentRunner>,
     quality: Arc<QualityRunner>,
@@ -761,6 +814,7 @@ async fn run_wf_unit(
     goal: String,
     session_id: String,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    cancel: CancelToken,
 ) -> std::result::Result<WfUnitOk, QualityFailure> {
     // 有界并发:先抢许可(对齐 atomcode Semaphore(3) FIFO 惯例)
     let _permit = match &semaphore {
@@ -769,30 +823,23 @@ async fn run_wf_unit(
             reason: format!("并行调度信号量已关闭: {e}"),
             retryable: true,
             suggestion: "重试".into(),
+            cancelled: false,
         })?),
         None => None,
     };
 
     let wf_id = input.id.clone();
     let outcome = sub_agent
-        .run_unit(&input, &session_id)
+        .run_unit_with_cancel(&input, &session_id, &cancel)
         .await
-        .map_err(|e| QualityFailure {
-            source: AgentRole::SubAgent,
-            reason: format!("SubAgent 执行失败(wf={wf_id}): {e}"),
-            retryable: true,
-            suggestion: "重试".into(),
+        .map_err(|e| {
+            QualityFailure::from_agent_error(AgentRole::SubAgent, &format!("SubAgent 执行失败(wf={wf_id})"), &e)
         })?;
 
     let qc = quality
         .check_subagent(&goal, &input.expected_output, &outcome.text, &session_id)
         .await
-        .map_err(|e| QualityFailure {
-            source: AgentRole::QualityCheck,
-            reason: format!("Quality 调用失败: {e}"),
-            retryable: true,
-            suggestion: "重试".into(),
-        })?;
+        .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
     if let Some(d) = &debug {
         d.record_quality(&qc);
     }
@@ -803,6 +850,7 @@ async fn run_wf_unit(
             reason: format!("wf={}: {}", wf_id, qc.issues.join("; ")),
             retryable: qc.retryable,
             suggestion: qc.suggestion,
+            cancelled: false,
         });
     }
 

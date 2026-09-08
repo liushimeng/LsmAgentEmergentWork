@@ -10,6 +10,7 @@
 //!
 //! 设计见 `docs/多Agent架构重构/01-设计与解决方案.md`。
 
+pub mod cancel;
 pub mod context;
 pub mod compact;
 pub mod debug;
@@ -33,6 +34,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
+use crate::agent::cancel::{backfill_cancelled_tool_results, CancelToken};
 use crate::agent::profile::AgentProfile;
 use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta, Usage};
@@ -91,6 +93,25 @@ impl Agent {
         self.run_session(&mut session).await
     }
 
+    /// [`run_session`] 的可取消版本:传入取消 token,任何阶段命中取消都先补全
+    /// orphan tool_use 再返回 `Err(AgentError::Cancelled)`(对齐 atomcode
+    /// `run_turn` 的 select + backfill 语义,知识库第五轮 §2.1)。
+    ///
+    /// `None` 时行为与 [`run_session`] 完全一致。
+    pub async fn run_session_cancellable(
+        &self,
+        session: &mut Session,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(String, Usage)> {
+        if let Some(token) = cancel {
+            if token.is_cancelled() {
+                backfill_cancelled_tool_results(session.context_mut());
+                return Err(AgentError::Cancelled);
+            }
+        }
+        self.run_session_inner(session, cancel).await
+    }
+
     /// 复用 Session 上下文的对话循环(用于 TUI 多轮对话)。
     ///
     /// 返回 `(最终回复文本, 本次循环累计 token 用量)`。后者包含所有 LLM 调用的
@@ -100,6 +121,15 @@ impl Agent {
     /// / `"length"`),自动注入 nudge 消息让模型从断点继续,最多续接 `max_truncation_resume`
     /// 次(默认 4 次),避免无限循环。累计所有部分输出后返回完整文本。
     pub async fn run_session(&self, session: &mut Session) -> Result<(String, Usage)> {
+        self.run_session_cancellable(session, None).await
+    }
+
+    /// 循环主体(`run_session` / `run_session_cancellable` 共用)。
+    async fn run_session_inner(
+        &self,
+        session: &mut Session,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(String, Usage)> {
         let tool_defs = self.profile.tools.defs();
         let meta: RequestMeta = session.meta();
         let mut total_usage = Usage::default();
@@ -117,13 +147,37 @@ impl Agent {
         let mut consecutive_failures: usize = 0;
 
         for iter in 0..self.max_iterations {
+            // 迭代边界:取消检查(轻量 is_cancelled,热路径零 await 开销)
+            if let Some(token) = cancel {
+                if token.is_cancelled() {
+                    backfill_cancelled_tool_results(session.context_mut());
+                    return Err(AgentError::Cancelled);
+                }
+            }
             info!(iteration = iter, "agent step");
             // 按当前 LLM 协议渲染系统提示词(支持多协议差异化)
             let system = self.profile.system_prompt.render(self.llm.protocol());
-            let completion: Completion = self
-                .llm
-                .complete(&system, session.context(), &tool_defs, &meta)
-                .await?;
+            // None = 取消命中(completion 未返回,本轮无新 tool_use;
+            // 借用约束:select 分支 future 持有 session 不可变借用,backfill 需在 select 外做)
+            let completion: Option<Completion> = match cancel {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    r = self.llm.complete(&system, session.context(), &tool_defs, &meta) => Some(r?),
+                },
+                None => Some(
+                    self.llm
+                        .complete(&system, session.context(), &tool_defs, &meta)
+                        .await?,
+                ),
+            };
+            let completion: Completion = match completion {
+                Some(c) => c,
+                None => {
+                    backfill_cancelled_tool_results(session.context_mut());
+                    return Err(AgentError::Cancelled);
+                }
+            };
 
             // 累计 usage
             total_usage.input_tokens = total_usage.input_tokens.saturating_add(completion.usage.input_tokens);
@@ -198,18 +252,33 @@ impl Agent {
                 let args = call.arguments;
                 info!(tool = %name, "executing tool");
 
-                let (output, is_error) = match self.profile.tools.get(&name) {
-                    Ok(tool) => match tool.execute(args.clone()).await {
-                        Ok(out) => (out, false),
-                        Err(e) => {
-                            warn!(tool = %name, error = %e, "tool failed");
-                            (
-                                format!("[工具执行失败] {}: {}", name, e),
-                                true,
-                            )
+                // 工具执行取消:select 命中后工具 future 被 drop——Bash 工具的
+                // `kill_on_drop` 会随之 SIGKILL 子进程、setsid+killpg 清理整组
+                // (知识库第五轮 §6.1「取消必须级联到进程组」,bash.rs ef84cec 已就位)
+                let executed = match self.profile.tools.get(&name) {
+                    Ok(tool) => match cancel {
+                        Some(token) => {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => None,
+                                r = tool.execute(args.clone()) => Some(r),
+                            }
                         }
+                        None => Some(tool.execute(args.clone()).await),
                     },
-                    Err(e) => (format!("{e}"), true),
+                    Err(e) => Some(Err(e)),
+                };
+                let (output, is_error) = match executed {
+                    Some(Ok(out)) => (out, false),
+                    Some(Err(e)) => {
+                        warn!(tool = %name, error = %e, "tool failed");
+                        (format!("[工具执行失败] {}: {}", name, e), true)
+                    }
+                    // 取消:本条 + 本轮剩余未执行的 tool_use 由 backfill 统一补全
+                    None => {
+                        backfill_cancelled_tool_results(session.context_mut());
+                        return Err(AgentError::Cancelled);
+                    }
                 };
                 if is_error {
                     // 失败键:工具名 + 稳定 JSON(对象按 key 排序后序列化)
@@ -287,6 +356,153 @@ fn stable_json_string(v: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ========== 取消传播(第 07 轮,方案 tmpPlan/2026-09-08_07) ==========
+
+    /// 永远挂起的 LLM(模拟长时间未响应的请求)。
+    struct HangLlm;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for HangLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            std::future::pending().await
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    /// 第 1 次返回 bash 工具调用(长睡眠),之后返回最终文本。
+    struct SlowToolLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for SlowToolLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(Completion {
+                    text: String::new(),
+                    tool_calls: vec![crate::llm::ToolCallReq {
+                        id: "call-slow-1".into(),
+                        // 注意:注册表键为 "Bash"(工具 name() 原样)
+                        name: "Bash".into(),
+                        arguments: json!({"command": "sleep 30"}),
+                    }],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                })
+            } else {
+                Ok(Completion {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                })
+            }
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_during_llm_call_returns_promptly() {
+        let agent = Agent::new(
+            std::sync::Arc::new(HangLlm),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("慢任务"));
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            t2.cancel();
+        });
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            agent.run_session_cancellable(&mut session, Some(&token)).await
+        })
+        .await
+        .expect("取消后应及时返回,而非等 LLM 挂起")
+        .unwrap_err();
+        assert!(matches!(res, AgentError::Cancelled));
+        // 没有工具调用发生,上下文不应被塞入取消回填
+        assert_eq!(session.context().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_during_tool_execution_backfills_orphan() {
+        let agent = Agent::new(
+            std::sync::Arc::new(SlowToolLlm {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("跑个长命令"));
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            // 等 bash sleep 30 已启动后再取消,验证工具执行中断 + 进程清理
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            t2.cancel();
+        });
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            agent.run_session_cancellable(&mut session, Some(&token)).await
+        })
+        .await
+        .expect("工具执行中取消应及时返回,而非等 sleep 30 跑完")
+        .unwrap_err();
+        assert!(matches!(res, AgentError::Cancelled));
+        // 及时性:远小于 sleep 30(允许 mock LLM 与进程启动开销)
+        assert!(start.elapsed() < std::time::Duration::from_secs(4));
+        // 消息一致性:末条应为 is_error 的取消 tool_result(无 orphan tool_use)
+        let last = session.context().last().expect("应有取消回填");
+        assert_eq!(last.role, crate::llm::Role::Tool);
+        match &last.content[0] {
+            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                assert_eq!(tool_use_id, "call-slow-1");
+                assert!(content.contains("cancelled"));
+                assert!(*is_error);
+            }
+            other => panic!("末条应为 ToolResult,实际 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn precancelled_token_short_circuits() {
+        let agent = Agent::new(
+            std::sync::Arc::new(HangLlm),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("已取消的任务"));
+        let token = CancelToken::new();
+        token.cancel();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            agent.run_session_cancellable(&mut session, Some(&token)),
+        )
+        .await
+        .expect("预取消应立即短路")
+        .unwrap_err();
+        assert!(matches!(res, AgentError::Cancelled));
+    }
 
     #[test]
     fn is_truncation_stop_reason_detects_max_tokens() {

@@ -39,6 +39,15 @@ pub enum AgentError {
     #[error("达到最大迭代次数({0})仍未得到最终答案")]
     MaxIterationsExceeded(usize),
 
+    /// 用户中断(Ctrl-C / SIGINT)触发的任务取消。
+    ///
+    /// 语义约定:该错误**不可重试**——编排器遇到它必须短路退出整个任务,
+    /// 不进入 QualityFailure / Yolo 失败回流;所有出口先补全 orphan tool_use
+    /// 再上抛(协议一致性硬约束,anthropic/openai 均拒绝未配对的 tool_use)。
+    /// 设计见 `tmpPlan/2026-09-08_07-取消传播与优雅中断方案.md`。
+    #[error("任务已取消(用户中断)")]
+    Cancelled,
+
     /// 连续相同「工具名 + 目标参数」失败次数超过阈值,主动提前终止以避免
     /// 浪费迭代预算(典型场景:上游 LLM 反复 Read 一个不存在的文件路径)。
     /// 关联报告: 20260908_203854 D-001。

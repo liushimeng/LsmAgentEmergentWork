@@ -17,6 +17,8 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+# CancellationToken(取消传播,对齐 atomcode 原语;见 tmpPlan/2026-09-08_07 方案)
+tokio-util = "0.7"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

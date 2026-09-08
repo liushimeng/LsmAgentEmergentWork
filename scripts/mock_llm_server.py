@@ -24,10 +24,21 @@ LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
 #                  用于端到端验证 src/agent/quality.rs 的 JSON 解析失败 fail-closed 回流。
 #   PARALLEL_WFS  — yolo 返回 medium 分类、mainwork 返回 3 个互相独立(无 depends_on)的 WorkFlow,
 #                  用于端到端验证 orchestrator 的「依赖分层 + 同层 SubAgent 并行调度」。
+#   --delay-ms N  — 每个请求处理前 sleep N 毫秒(模拟慢 LLM),
+#                  用于端到端验证取消传播(SIGINT 优雅中断,不应等延迟跑完)。
 MODES = set()
-for arg in sys.argv[3:]:
-    if arg in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs"):
-        MODES.add(arg)
+DELAY_MS = 0
+_args = sys.argv[3:]
+_i = 0
+while _i < len(_args):
+    _a = _args[_i]
+    if _a == "--delay-ms" and _i + 1 < len(_args):
+        DELAY_MS = int(_args[_i + 1])
+        _i += 2
+        continue
+    if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs"):
+        MODES.add(_a)
+    _i += 1
 
 
 def maybe_break_json(text):
@@ -423,6 +434,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        if DELAY_MS > 0:
+            time.sleep(DELAY_MS / 1000.0)
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         key = "oai" if "chat/completions" in self.path else "anth"

@@ -153,14 +153,34 @@ impl TuiSession {
             // 斜杠命令
             return self.handle_slash(rest).await;
         }
-        // 普通提示词:Orchestrator 编排
+        // 普通提示词:Orchestrator 编排(可取消:Ctrl-C 经 SIGINT 自动感知,零新增命令)
         self.session.context_mut().push(ChatMessage::user(line));
         // debug 模式:每个任务开始前重置采集器
         if let Some(collector) = &self.debug {
             collector.reset(self.session.id());
         }
-        println!("  [orchestrator 调度中...]");
-        let handle_result = self.orchestrator.handle(&mut self.session).await;
+        println!("  [orchestrator 调度中... Ctrl-C 取消]");
+        let cancel = crate::agent::cancel::CancelToken::new();
+        // 任务窗口 SIGINT 监听:第一次中断取消当前任务(claudecode 语义),
+        // 第二次强制退出(exit 130)。输入等待窗口由 InputHandler raw mode
+        // 按键事件处理(既有 Interrupted 行为,不变)。
+        let sig_cancel = cancel.clone();
+        let sig_task = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            println!();
+            println!("  [laew] 收到中断信号,正在取消当前任务(再次 Ctrl-C 强制退出)...");
+            sig_cancel.cancel();
+            let _ = tokio::signal::ctrl_c().await;
+            std::process::exit(130);
+        });
+        let handle_result = self
+            .orchestrator
+            .handle_cancellable(&mut self.session, &cancel)
+            .await;
+        // 任务结束:撤掉 SIGINT 监听,避免游离监听吞掉后续按键窗口外的信号
+        sig_task.abort();
         // debug 模式:任务结束(无论成败)后生成 Debug 报告
         if let (Some(collector), Some(raw_llm)) = (&self.debug, &self.debug_llm_raw) {
             self.emit_debug_report(collector, raw_llm.clone(), line, &handle_result).await;
@@ -185,6 +205,10 @@ impl TuiSession {
                     }
                 }
             },
+            Err(e) if matches!(e, crate::error::AgentError::Cancelled) => {
+                println!();
+                println!("  ✓ 本次任务已取消,可继续输入新指令。");
+            }
             Err(e) => {
                 eprintln!("  [agent error] {e}");
             }

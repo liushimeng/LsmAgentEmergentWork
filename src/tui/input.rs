@@ -26,6 +26,46 @@ mod colors {
     pub const DIM: Color = Color::Grey;               // 辅助文字
 }
 
+/// 返回 `cursor`(字节偏移,须在字符边界)前一个字符的起始字节偏移。
+///
+/// 输入循环的 cursor 恒为字节偏移并保持在字符边界上;退格 / 左移按「字符」
+/// 语义移动,必须先换算到前一个字符的起始边界,否则 `String::remove/insert`
+/// 会触发 `is_char_boundary` panic(修复:TUI 中文输入第 2 个字符必崩)。
+fn prev_char_boundary(s: &str, cursor: usize) -> usize {
+    if cursor == 0 {
+        return 0;
+    }
+    let mut i = cursor - 1;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// 近似显示宽度(列数):CJK / 全角 / 谚文按 2 列,其余按 1 列。
+///
+/// 不引入 `unicode-width` 依赖的轻量近似,仅用于光标列号换算;
+/// 覆盖常用 CJK 区段,边缘字符(组合符等)按 1 列处理,可接受。
+fn display_width(s: &str) -> u16 {
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            if (0x1100..=0x115F).contains(&cp)       // 谚文 Jamo
+                || (0x2E80..=0xA4CF).contains(&cp)    // CJK 部首 ~ 彝文(含 4E00-9FFF 统一汉字)
+                || (0xAC00..=0xD7A3).contains(&cp)    // 谚文音节
+                || (0xF900..=0xFAFF).contains(&cp)    // CJK 兼容表意
+                || (0xFE30..=0xFE4F).contains(&cp)    // CJK 兼容形式
+                || (0xFF00..=0xFF60).contains(&cp)    // 全角 ASCII / 假名
+                || (0xFFE0..=0xFFE6).contains(&cp)
+            {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
 /// 输入处理结果。
 pub enum InputResult {
     /// 用户提交了输入行。
@@ -150,9 +190,10 @@ impl InputHandler {
                             }
                         }
                         KeyCode::Backspace => {
-                            // 退格：删除光标前字符
+                            // 退格：删除光标前字符(cursor 为字节偏移,先回退到前一个
+                            // 字符的起始边界再删,保证多字节 CJK 不触发 is_char_boundary panic)
                             if cursor > 0 {
-                                cursor -= 1;
+                                cursor = prev_char_boundary(&buffer, cursor);
                                 buffer.remove(cursor);
                                 self.redraw_line(&mut stdout, prompt, &buffer, cursor, prompt_width)?;
                                 // 更新补全列表
@@ -164,14 +205,14 @@ impl InputHandler {
                         // 此处显式拦截，避免退格字符落入 Char(c) 分支被当作普通字符插入。
                         KeyCode::Char('\x7f') | KeyCode::Char('\x08') => {
                             if cursor > 0 {
-                                cursor -= 1;
+                                cursor = prev_char_boundary(&buffer, cursor);
                                 buffer.remove(cursor);
                                 self.redraw_line(&mut stdout, prompt, &buffer, cursor, prompt_width)?;
                                 self.update_completion(&mut stdout, &buffer, prompt_width, &mut completion_active, &mut completion_index, &mut completion_items, engine)?;
                             }
                         }
                         KeyCode::Delete => {
-                            // Delete：删除光标处字符
+                            // Delete：删除光标处字符(cursor 在字符边界,remove 按字节偏移删一个字符)
                             if cursor < buffer.len() {
                                 buffer.remove(cursor);
                                 self.redraw_line(&mut stdout, prompt, &buffer, cursor, prompt_width)?;
@@ -179,18 +220,18 @@ impl InputHandler {
                             }
                         }
                         KeyCode::Left => {
-                            // 左箭头：移动光标
+                            // 左箭头：移动光标(按字符,不按字节)
                             if cursor > 0 {
-                                cursor -= 1;
-                                execute!(stdout, MoveToColumn(prompt_width + cursor as u16))?;
+                                cursor = prev_char_boundary(&buffer, cursor);
+                                execute!(stdout, MoveToColumn(prompt_width + display_width(&buffer[..cursor])))?;
                                 stdout.flush()?;
                             }
                         }
                         KeyCode::Right => {
-                            // 右箭头：移动光标
+                            // 右箭头：移动光标(前进一个 UTF-8 字符)
                             if cursor < buffer.len() {
-                                cursor += 1;
-                                execute!(stdout, MoveToColumn(prompt_width + cursor as u16))?;
+                                cursor += buffer[cursor..].chars().next().map_or(0, |c| c.len_utf8());
+                                execute!(stdout, MoveToColumn(prompt_width + display_width(&buffer[..cursor])))?;
                                 stdout.flush()?;
                             }
                         }
@@ -201,13 +242,14 @@ impl InputHandler {
                         }
                         KeyCode::End => {
                             cursor = buffer.len();
-                            execute!(stdout, MoveToColumn(prompt_width + cursor as u16))?;
+                            execute!(stdout, MoveToColumn(prompt_width + display_width(&buffer)))?;
                             stdout.flush()?;
                         }
                         KeyCode::Char(c) => {
-                            // 可打印字符：插入到光标位置
+                            // 可打印字符：插入到光标位置(cursor 为字节偏移,
+                            // 增量按 len_utf8 推进——修复中文输入第 2 字符 panic)
                             buffer.insert(cursor, c);
-                            cursor += 1;
+                            cursor += c.len_utf8();
                             self.redraw_line(&mut stdout, prompt, &buffer, cursor, prompt_width)?;
                             // 更新补全列表
                             self.update_completion(&mut stdout, &buffer, prompt_width, &mut completion_active, &mut completion_index, &mut completion_items, engine)?;
@@ -232,8 +274,8 @@ impl InputHandler {
             Print(prompt),
             Print(buffer),
         )?;
-        // 移动光标到正确位置
-        execute!(stdout, MoveToColumn(prompt_width + cursor as u16))?;
+        // 移动光标到正确位置(cursor 为字节偏移,按显示宽度换算列号)
+        execute!(stdout, MoveToColumn(prompt_width + display_width(&buffer[..cursor])))?;
         stdout.flush()?;
         Ok(())
     }
@@ -252,7 +294,7 @@ impl InputHandler {
             return Ok(());
         }
         // 先移回输入行
-        execute!(stdout, MoveToColumn(prompt_width + buffer.len() as u16))?;
+        execute!(stdout, MoveToColumn(prompt_width + display_width(buffer)))?;
         // 清除输入行以下的内容
         execute!(stdout, Clear(ClearType::FromCursorDown))?;
         stdout.flush()?;
@@ -314,7 +356,7 @@ impl InputHandler {
         items: &[crate::tui::completion::CompletionItem],
     ) -> io::Result<()> {
         // 移到输入行末尾
-        execute!(stdout, MoveToColumn(prompt_width + buffer.len() as u16))?;
+        execute!(stdout, MoveToColumn(prompt_width + display_width(buffer)))?;
         // 清除之前的补全列表
         execute!(stdout, Clear(ClearType::FromCursorDown))?;
         // 换行开始绘制补全列表
@@ -354,7 +396,7 @@ impl InputHandler {
         // 光标移回输入行
         let lines_below = items.len() as u16 + 1; // +1 为提示行
         execute!(stdout, MoveUp(lines_below))?;
-        execute!(stdout, MoveToColumn(prompt_width + buffer.len() as u16))?;
+        execute!(stdout, MoveToColumn(prompt_width + display_width(buffer)))?;
 
         stdout.flush()?;
         Ok(())
@@ -388,7 +430,7 @@ impl InputHandler {
     ) -> io::Result<()> {
         // 清除补全列表
         if completion_active && !items.is_empty() {
-            execute!(stdout, MoveToColumn(prompt_width + buffer.len() as u16))?;
+            execute!(stdout, MoveToColumn(prompt_width + display_width(buffer)))?;
             execute!(stdout, Clear(ClearType::FromCursorDown))?;
         }
         // 清除输入行
@@ -411,5 +453,54 @@ mod tests {
     #[test]
     fn test_input_handler_creation() {
         let _handler = InputHandler::new();
+    }
+
+    // ========== UTF-8 光标修复(第 07 轮,修复中文输入 panic) ==========
+
+    #[test]
+    fn prev_char_boundary_walks_back_multibyte() {
+        let s = "取消";
+        // "取" 3 字节,"消" 3 字节;边界 {0, 3, 6}
+        assert_eq!(prev_char_boundary(s, 6), 3);
+        assert_eq!(prev_char_boundary(s, 3), 0);
+        assert_eq!(prev_char_boundary(s, 0), 0);
+    }
+
+    #[test]
+    fn prev_char_boundary_mixed_ascii_cjk() {
+        let s = "a中b"; // 边界 {0, 1, 4, 5}
+        assert_eq!(prev_char_boundary(s, 4), 1);
+        assert_eq!(prev_char_boundary(s, 5), 4);
+        assert_eq!(prev_char_boundary(s, 1), 0);
+    }
+
+    #[test]
+    fn display_width_cjk_is_two_columns() {
+        assert_eq!(display_width("ab"), 2);
+        assert_eq!(display_width("取消"), 4);
+        assert_eq!(display_width("a取b"), 4);
+        assert_eq!(display_width(""), 0);
+    }
+
+    /// 回归钉子:模拟输入循环的「字节偏移 cursor + insert/remove」核心操作,
+    /// 中文连续插入 + 退格不再触发 is_char_boundary panic。
+    #[test]
+    fn utf8_cursor_insert_and_backspace_never_panics() {
+        let mut buffer = String::new();
+        let mut cursor: usize = 0;
+        for c in "长任务取消测试".chars() {
+            buffer.insert(cursor, c);
+            cursor += c.len_utf8();
+        }
+        assert_eq!(buffer, "长任务取消测试");
+        assert_eq!(cursor, buffer.len());
+        // 连续退格到空
+        while cursor > 0 {
+            cursor = prev_char_boundary(&buffer, cursor);
+            let removed = buffer.remove(cursor);
+            assert!(!removed.is_ascii()); // 全程删的都是 CJK 字符
+        }
+        assert!(buffer.is_empty());
+        assert_eq!(cursor, 0);
     }
 }

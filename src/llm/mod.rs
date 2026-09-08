@@ -14,6 +14,7 @@ use crate::config::{Protocol, ProviderRecord};
 use crate::error::{AgentError, Result};
 
 pub mod anthropic;
+pub mod cancellable;
 pub mod openai;
 pub mod resilient;
 pub mod sse;

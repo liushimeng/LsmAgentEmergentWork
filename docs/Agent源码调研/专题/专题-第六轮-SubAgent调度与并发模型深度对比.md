@@ -127,7 +127,7 @@ pub struct SubFlowInput {
 
 8. **深度限制**：`AgentRole::SubAgent` 的工具集是 `sub_agent_work_registry()`（`profile.rs:79-86`），含 Bash/Read/Write，**没有 Task 工具**——理论上无法递归 spawn，但没有显式的 `MAX_DEPTH` 常量。
 
-9. **取消传播**：`session.rs` 的 Session 没有 AbortSignal 字段，`Agent::run_session`（`mod.rs:78-152`）没有取消检查——`/exit` 直接退出进程，Esc 中断只能 kill 当前 LLM 请求，无法级联到 SubAgent。
+9. **取消传播**：~~Session 没有 AbortSignal 字段~~ ✅ 已实现（2026-09-08 第 07 轮，方案 `tmpPlan/2026-09-08_07-取消传播与优雅中断方案.md`）：`tokio_util CancellationToken` 全链路（每任务根 token + `llm/cancellable.rs` 装饰器包裹全部角色 LLM 调用 + `run_session_cancellable` 三处 select + 并行层 spawn 传 token 级联），SIGINT 双次语义（第一次取消/第二次 exit 130）。与原方案的差异：token 不固化在 `OrchestratorConfig`（一次性原语不可 reset，Session 多任务会互相污染），改为 `CancelGate` 每任务注入。
 
 ### 2.2 laew 当前的并发缺口
 
@@ -139,7 +139,7 @@ pub struct SubFlowInput {
 | **后台 SubAgent** | 无（必须同步等） | P1 |
 | **深度限制常量** | 无（靠工具集间接限制） | P1 |
 | **持久化 resume** | 无（崩溃后从头跑） | P2 |
-| **取消传播到 SubAgent** | 无（仅靠退出进程） | P0 |
+| **取消传播到 SubAgent** | ~~无（仅靠退出进程）~~ ✅ 已实现（第 07 轮，`agent/cancel.rs` + `agent/orchestrator.rs::handle_cancellable` + `agent/subagent.rs::run_unit_with_cancel`） | ~~P0~~ 已完成 |
 | **SubAgent 调度仪表盘** | 无 | P2 |
 | **跨进程 SubAgent 委派** | 无 | P3 |
 
@@ -2364,7 +2364,7 @@ async fn execute_workflows_parallel(
 - **深度限制**：通过 `sub_agent_work_registry` 不含 TaskTool 间接禁止（学 opencode 兜底 deny）
 - **持久化**：可选——把 `level` 信息写到 `session_memory` 表实现崩溃恢复
 
-### 11.2 P0：取消传播（Week 2-3）
+### 11.2 P0：取消传播（Week 2-3）✅ 已实现（2026-09-08 第 07 轮；差异：token 经 `CancelGate` 每任务动态注入而非固化在 `OrchestratorConfig`，LLM 中断用装饰器一处覆盖 8 角色而非逐 runner 改造；下文为原知识库方案存档）
 
 **目标**：Ctrl+C / Esc / `kill_session` 一键级联所有 SubAgent（仿 atomcode CancellationToken 链）
 
