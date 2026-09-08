@@ -80,11 +80,17 @@ impl ProviderForm {
             Tab::text("model_name", "必填", false, model_name.unwrap_or("")),
             Tab::text("end_point", "https://...", false, end_point.unwrap_or("")),
             Tab::text("api_key", "sk-...", true, api_key.unwrap_or("")),
+            Tab::text(
+                "context_max_size",
+                "800000 / 800K / 1M(0=不限)",
+                false,
+                &crate::config::DEFAULT_CONTEXT_MAX_SIZE.to_string(),
+            ),
             Tab::confirm("确认", vec![ConfirmAction::Submit, ConfirmAction::Cancel]),
         ]
     }
 
-    fn validate(&self) -> Result<(Protocol, String, String, String, String), String> {
+    fn validate(&self) -> Result<(Protocol, String, String, String, String, u64), String> {
         let p = self.parse_protocol()?;
         let provider_name = self.form.tabs[1].value.trim().to_string();
         if provider_name.is_empty() {
@@ -102,7 +108,13 @@ impl ProviderForm {
         if api_key.is_empty() {
             return Err("api_key 不能为空".into());
         }
-        Ok((p, provider_name, model_name, end_point, api_key))
+        let ctx_raw = self.form.tabs[5].value.trim().to_string();
+        let context_max_size = if ctx_raw.is_empty() {
+            crate::config::DEFAULT_CONTEXT_MAX_SIZE
+        } else {
+            crate::config::parse_context_size(&ctx_raw)?
+        };
+        Ok((p, provider_name, model_name, end_point, api_key, context_max_size))
     }
 
     fn parse_protocol(&self) -> Result<Protocol, String> {
@@ -116,12 +128,12 @@ impl ProviderForm {
                 self.error = Some(e);
                 Outcome::Continue
             }
-            Ok((p, pn, mn, ep, ak)) => {
+            Ok((p, pn, mn, ep, ak, ctx)) => {
                 let db = self.db.clone();
                 let res = match self.mode {
                     Mode::Add => {
                         let guard = db.lock().expect("db");
-                        guard.add(p, &pn, &mn, &ep, &ak)
+                        guard.add_with_context(p, &pn, &mn, &ep, &ak, Some(ctx))
                     }
                     Mode::Edit(id) => {
                         // Edit 模式暂未通过 TUI 触发;这里走 set_active/use 路径即可
@@ -239,6 +251,7 @@ impl Screen for ProviderForm {
                             2 => "<必填>".to_string(),
                             3 => "<https://...>".to_string(),
                             4 => "<sk-...>".to_string(),
+                            5 => "<800000 / 800K / 1M>".to_string(),
                             _ => String::new(),
                         }
                     } else {

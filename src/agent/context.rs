@@ -32,6 +32,8 @@ pub enum AgentRole {
     QualityCheck,
     /// 会话层:SessionMemory 摘要
     SessionContext,
+    /// 压缩层:Context 超阈值时自动压缩(第 8 角色)
+    Compact,
 }
 
 impl AgentRole {
@@ -43,6 +45,7 @@ impl AgentRole {
             Self::SubAgent => "subagent",
             Self::QualityCheck => "quality",
             Self::SessionContext => "session",
+            Self::Compact => "compact",
         }
     }
 }
@@ -127,6 +130,7 @@ mod tests {
         assert_eq!(AgentRole::SubAgent.as_str(), "subagent");
         assert_eq!(AgentRole::QualityCheck.as_str(), "quality");
         assert_eq!(AgentRole::SessionContext.as_str(), "session");
+        assert_eq!(AgentRole::Compact.as_str(), "compact");
     }
 
     #[test]

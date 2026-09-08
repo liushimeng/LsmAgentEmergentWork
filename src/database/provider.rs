@@ -19,20 +19,34 @@ impl Db {
         end_point: &str,
         api_key: &str,
     ) -> Result<i64> {
+        self.add_with_context(protocol, provider_name, model_name, end_point, api_key, None)
+    }
+
+    /// 新增一条记录(可指定 context_max_size,None = 默认 800K);若库为空则自动激活
+    pub fn add_with_context(
+        &self,
+        protocol: Protocol,
+        provider_name: &str,
+        model_name: &str,
+        end_point: &str,
+        api_key: &str,
+        context_max_size: Option<u64>,
+    ) -> Result<i64> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM providers", [], |r| r.get::<_, i64>(0))?;
         let activate = count == 0;
         conn.execute(
-            "INSERT INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active, context_max_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 protocol.as_str(),
                 provider_name,
                 model_name,
                 end_point,
                 api_key,
-                if activate { 1 } else { 0 }
+                if activate { 1 } else { 0 },
+                context_max_size.unwrap_or(crate::database::models::DEFAULT_CONTEXT_MAX_SIZE) as i64
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -47,17 +61,19 @@ impl Db {
         model_name: &str,
         end_point: &str,
         api_key: &str,
+        context_max_size: Option<u64>,
     ) -> Result<i64> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
-            "INSERT OR IGNORE INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            "INSERT OR IGNORE INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active, context_max_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
             params![
                 protocol.as_str(),
                 provider_name,
                 model_name,
                 end_point,
                 api_key,
+                context_max_size.unwrap_or(crate::database::models::DEFAULT_CONTEXT_MAX_SIZE) as i64
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -67,7 +83,7 @@ impl Db {
     pub fn list(&self) -> Result<Vec<ProviderRecord>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at
+            "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size
              FROM providers ORDER BY id ASC",
         )?;
         let iter = stmt.query_map([], row_to_record)?;
@@ -82,7 +98,7 @@ impl Db {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn
             .query_row(
-                "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at
+                "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size
                  FROM providers WHERE is_active = 1 LIMIT 1",
                 [],
                 row_to_record,
@@ -95,7 +111,7 @@ impl Db {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn
             .query_row(
-                "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at
+                "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size
                  FROM providers WHERE id = ?1",
                 params![id],
                 row_to_record,
@@ -237,6 +253,7 @@ impl Db {
                 &item.model_name,
                 &item.end_point,
                 &item.api_key,
+                item.context_max_size,
             ) {
                 Ok(id) => {
                     println!(
@@ -298,6 +315,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
         _ => unreachable!("unknown protocol in db: {proto_str}"),
     };
     let is_active_int: i64 = row.get(6)?;
+    let ctx: i64 = row.get(8)?;
     Ok(ProviderRecord {
         id: row.get(0)?,
         protocol,
@@ -307,6 +325,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
         api_key: row.get(5)?,
         is_active: is_active_int != 0,
         created_at: row.get(7)?,
+        context_max_size: ctx.max(0) as u64,
     })
 }
 
@@ -437,9 +456,11 @@ mod tests {
         let json = db.export_to_json().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["version"], "1.0");
+        assert_eq!(parsed["version"], "1.1");
         assert_eq!(parsed["count"], 2);
         assert_eq!(parsed["providers"].as_array().unwrap().len(), 2);
+        // 导出携带 context_max_size(默认 800K)
+        assert_eq!(parsed["providers"][0]["context_max_size"], 800_000);
     }
 
     #[test]
@@ -520,5 +541,141 @@ mod tests {
         assert_eq!(result.skipped, 2);
         let active = dst.get_active().unwrap().expect("应恢复激活态");
         assert_eq!(active.provider_name, "P2");
+    }
+
+    // ===== context_max_size =====
+
+    #[test]
+    fn add_defaults_context_max_size_to_800k() {
+        let (db, _d) = fresh_db();
+        db.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1").unwrap();
+        let r = &db.list().unwrap()[0];
+        assert_eq!(r.context_max_size, crate::database::models::DEFAULT_CONTEXT_MAX_SIZE);
+    }
+
+    #[test]
+    fn add_with_context_max_size() {
+        let (db, _d) = fresh_db();
+        db.add_with_context(Protocol::Anthropic, "P1", "m1", "https://a", "k1", Some(256_000))
+            .unwrap();
+        assert_eq!(db.list().unwrap()[0].context_max_size, 256_000);
+    }
+
+    #[test]
+    fn import_without_context_max_size_gets_default() {
+        // 旧版(1.0)导出文件/手写配置无 context_max_size 字段 → 补默认值
+        let (db, _d) = fresh_db();
+        let json = r#"{
+            "protocol": "anthropic",
+            "provider_name": "P1",
+            "model_name": "m1",
+            "end_point": "https://a",
+            "api_key": "k1"
+        }"#;
+        db.import_from_json(json).unwrap();
+        assert_eq!(db.list().unwrap()[0].context_max_size, 800_000);
+    }
+
+    #[test]
+    fn import_export_context_max_size_roundtrip() {
+        // 新版文件带字段 → 往返无损
+        let (src, _d1) = fresh_db();
+        src.add_with_context(Protocol::Anthropic, "P1", "m1", "https://a", "k1", Some(128_000))
+            .unwrap();
+        let json = src.export_to_json().unwrap();
+        assert!(json.contains("\"context_max_size\": 128000"));
+
+        let (dst, _d2) = fresh_db();
+        dst.import_from_json(&json).unwrap();
+        assert_eq!(dst.list().unwrap()[0].context_max_size, 128_000);
+    }
+
+    #[test]
+    fn migration_backfills_context_max_size_on_old_db() {
+        // 模拟旧版数据库(无 context_max_size 列 + 旧 CHECK):打开后自动迁移并回填
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("LsmAgentEmergentWork.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE providers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    protocol TEXT NOT NULL CHECK(protocol IN ('anthropic','openai')),
+                    provider_name TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    end_point TEXT NOT NULL,
+                    api_key TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    UNIQUE(protocol, provider_name, model_name, end_point)
+                );
+                INSERT INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active)
+                VALUES ('anthropic','Old','m0','https://old','k0',1);
+                CREATE TABLE session_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('yolo','plan','main','subagent','quality','session','user')),
+                    event_type TEXT NOT NULL CHECK(event_type IN ('input','output','failure','suggestion','summary')),
+                    content TEXT NOT NULL,
+                    usage_input INTEGER NOT NULL DEFAULT 0,
+                    usage_output INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    UNIQUE(session_id, seq)
+                );
+                INSERT INTO session_memory(session_id, seq, role, event_type, content)
+                VALUES ('s-old', 1, 'yolo', 'summary', '旧数据');
+                CREATE TABLE agent_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    agent_role TEXT NOT NULL CHECK(agent_role IN ('yolo','plan','main','subagent','quality')),
+                    input_summary TEXT NOT NULL,
+                    output_summary TEXT NOT NULL,
+                    error_summary TEXT,
+                    artifacts TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+                );
+                INSERT INTO agent_memory(session_id, agent_role, input_summary, output_summary)
+                VALUES ('s-old','yolo','in','out');",
+            )
+            .unwrap();
+        }
+        let paths = Paths::for_test(dir.path());
+        let db = Db::open(&paths).unwrap();
+        // 存量记录自动补全 800K
+        let r = &db.list().unwrap()[0];
+        assert_eq!(r.provider_name, "Old");
+        assert_eq!(r.context_max_size, 800_000);
+        // CHECK 重建后旧数据保留,且 compact 角色可写
+        let rows = db.list_session_memory("s-old", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        db.insert_session_memory(&crate::config::SessionMemoryEntry {
+            session_id: "s-old".into(),
+            role: crate::agent::context::AgentRole::Compact,
+            event_type: crate::config::EventType::Summary,
+            content: "压缩摘要".into(),
+            usage_input: 0,
+            usage_output: 0,
+        })
+        .unwrap();
+        db.insert_agent_memory(&crate::config::AgentMemoryEntry {
+            session_id: "s-old".into(),
+            agent_role: crate::agent::context::AgentRole::Compact,
+            input_summary: "in".into(),
+            output_summary: "out".into(),
+            error_summary: None,
+            artifacts: "{}".into(),
+        })
+        .unwrap();
+        // SessionContext 角色此前因旧 CHECK 静默失败,迁移后可写
+        db.insert_agent_memory(&crate::config::AgentMemoryEntry {
+            session_id: "s-old".into(),
+            agent_role: crate::agent::context::AgentRole::SessionContext,
+            input_summary: "in".into(),
+            output_summary: "out".into(),
+            error_summary: None,
+            artifacts: "{}".into(),
+        })
+        .unwrap();
     }
 }

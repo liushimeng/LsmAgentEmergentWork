@@ -163,3 +163,8 @@ pub fn session_context_registry() -> ToolRegistry {
 pub fn debug_registry() -> ToolRegistry {
     ToolRegistry::new()
 }
+
+/// Compact Agent 工具注册表:无工具(只做上下文摘要,不修改系统状态)
+pub fn compact_registry() -> ToolRegistry {
+    ToolRegistry::new()
+}

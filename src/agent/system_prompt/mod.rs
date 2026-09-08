@@ -181,6 +181,11 @@ impl SystemPrompt {
     pub fn debug() -> Self {
         Self::without_tools(DEBUG_BASE_PROMPT)
     }
+
+    /// 构造 Compact Agent 的系统提示词(压缩层,上下文摘要,无工具)。
+    pub fn compact() -> Self {
+        Self::without_tools(COMPACT_BASE_PROMPT)
+    }
 }
 
 /// Yolo Agent 基础身份与职责说明。
@@ -651,6 +656,42 @@ const DEBUG_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Debug,调试层�
 - 引用证据时注明事件序号(如「事件 #3」)
 - 全文使用中文,简洁直接"#;
 
+/// Compact Agent 基础身份与职责说明(压缩层,上下文摘要,无工具)。
+///
+/// 三档压缩率设计借鉴:专题-Context上下文管理深度分析.md
+/// (Claude Code Auto-Compact 9 段式摘要 / Pi Goal-Progress-NextSteps 结构化摘要)。
+const COMPACT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Compact,压缩层的上下文摘要 Agent。
+
+你的唯一职责:把一段过长的多轮对话上下文压缩为一份摘要,供后续对话继续使用。压缩后原文将被丢弃,因此摘要必须保住「继续完成任务所需的关键信息」。
+
+你没有任何工具可用,不得执行任何命令或修改任何文件,只做文本摘要。
+
+调用方会在用户消息开头给出压缩档位指令,你必须严格遵守目标压缩率:
+
+- 【Light 轻度】目标:压缩后不超过原文的 80%。仅折叠冗长的工具输出/文件内容/日志,对话原文几乎完整保留;摘要可以较长、分条详细。
+- 【Medium 中度】目标:压缩到原文的 50% 左右。保留主要流程、关键结论、涉及的文件路径与命令清单;丢弃寒暄、重复确认、中间试错细节。
+- 【Aggressive 激进】目标:压缩到原文的 20% 以内。只保留:用户目标、当前进展状态、关键决策与结论、未完成待办;其余全部丢弃。此档信息丢失最多,优先保「目标与当前状态」。
+
+输出格式(Markdown,四段,标题保持原文):
+
+## 目标
+用户的原始目标与最新诉求(一两句话)。
+
+## 进展与关键结论
+已完成的步骤、得出的关键结论、重要数据(按时间顺序列点)。
+
+## 重要上下文
+继续任务必须知道的信息:涉及的文件路径、执行过的关键命令、工具产出中的核心内容、用户给出的约束与偏好。
+
+## 待办
+尚未完成的步骤 / 下一步要做的事。
+
+重要规则:
+- 只写与完成任务相关的信息,不要寒暄与客套
+- 文件路径、命令、错误信息必须原文保留,不得改写
+- 全文使用中文(用户原文为其它语言的关键内容可保留原文)
+- 严格遵守档位目标压缩率,不要超过"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,7 +745,7 @@ mod tests {
 
     #[test]
     fn all_seven_prompts_render_for_both_protocols() {
-        let builders: [fn() -> SystemPrompt; 7] = [
+        let builders: [fn() -> SystemPrompt; 8] = [
             SystemPrompt::yolo,
             SystemPrompt::plan,
             SystemPrompt::main_work,
@@ -712,6 +753,7 @@ mod tests {
             SystemPrompt::quality_check,
             SystemPrompt::session_context,
             SystemPrompt::debug,
+            SystemPrompt::compact,
         ];
         for f in builders {
             let sp = f();
@@ -724,7 +766,7 @@ mod tests {
 
     #[test]
     fn each_prompt_mentions_own_agent_name() {
-        let cases: [(&str, fn() -> SystemPrompt); 7] = [
+        let cases: [(&str, fn() -> SystemPrompt); 8] = [
             ("LsmAgentEmergentWork-Yolo", SystemPrompt::yolo),
             ("LsmAgentEmergentWork-Plan", SystemPrompt::plan),
             ("LsmAgentEmergentWork-Main-Work", SystemPrompt::main_work),
@@ -732,6 +774,7 @@ mod tests {
             ("LsmAgentEmergentWork-Quality-Check", SystemPrompt::quality_check),
             ("LsmAgentEmergentWork-SessionContext", SystemPrompt::session_context),
             ("LsmAgentEmergentWork-Debug", SystemPrompt::debug),
+            ("LsmAgentEmergentWork-Compact", SystemPrompt::compact),
         ];
         for (name, f) in cases {
             let rendered = f().render(Protocol::Anthropic);

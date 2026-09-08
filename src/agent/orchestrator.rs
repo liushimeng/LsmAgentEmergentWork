@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::agent::compact::CompactRunner;
 use crate::agent::context::AgentRole;
 use crate::agent::debug::DebugCollector;
 use crate::agent::main_work::{self, MainWorkRunner, WorkFlowPlan, WorkFlowSpec};
@@ -107,6 +108,7 @@ pub struct MultiAgentOrchestrator {
     sub_agent: SubAgentRunner,
     quality: QualityRunner,
     session_context: SessionContextRunner,
+    compact: CompactRunner,
     db: Arc<Db>,
     cfg: OrchestratorConfig,
 }
@@ -137,7 +139,8 @@ impl MultiAgentOrchestrator {
         let sub_agent = SubAgentRunner::new(llm.clone(), db.clone())
             .with_max_iterations(cfg.subagent_max_iterations);
         let quality = QualityRunner::new(llm.clone(), db.clone());
-        let session_context = SessionContextRunner::new(llm, db.clone());
+        let session_context = SessionContextRunner::new(llm.clone(), db.clone());
+        let compact = CompactRunner::new(llm, db.clone());
         Self {
             yolo,
             plan,
@@ -145,6 +148,7 @@ impl MultiAgentOrchestrator {
             sub_agent,
             quality,
             session_context,
+            compact,
             db,
             cfg,
         }
@@ -160,6 +164,24 @@ impl MultiAgentOrchestrator {
         // 0.1) 历史 Session 摘要注入(幂等)
         let summaries = self.db.latest_summaries(session.id(), self.cfg.history_limit).unwrap_or_default();
         inject_history_with_entries(session, &summaries);
+
+        // 0.2) Context 自动压缩(达到当前 Provider context_max_size 的 80% 阈值时触发)
+        if let Ok(Some(active)) = self.db.get_active() {
+            match self.compact.maybe_compact(session, active.context_max_size).await {
+                Ok(Some(rep)) => {
+                    eprintln!(
+                        "[laew] Context 已自动压缩:档位={} 估算 token {} → {}(覆盖 {} 条历史消息{})",
+                        rep.tier.as_str(),
+                        rep.before_tokens,
+                        rep.after_tokens,
+                        rep.compacted_messages,
+                        if rep.fallback { ",硬截断降级" } else { "" },
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "Context 自动压缩失败(不中断任务)"),
+            }
+        }
 
         // 1) Yolo 入口
         let mut classification = self.run_yolo_classification(session).await?;

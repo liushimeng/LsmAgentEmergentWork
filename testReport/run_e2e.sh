@@ -101,7 +101,7 @@ def chk(cond, name):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
     ok = ok and cond
 chk(isinstance(data, dict), "导出顶层是对象")
-chk(data.get("version") == "1.0", f"导出含 version=1.0 (got={data.get('version')!r})")
+chk(data.get("version") == "1.1", f"导出含 version=1.1 (got={data.get('version')!r})")
 chk(isinstance(data.get("exported_at"), str) and "T" in data.get("exported_at", ""), "导出含 exported_at (RFC3339)")
 chk(isinstance(data.get("count"), int) and data["count"] >= 4, f"导出 count >= 4 (got={data.get('count')})")
 chk(isinstance(data.get("providers"), list) and len(data["providers"]) == data.get("count"), "providers 数组长度 == count")
@@ -112,6 +112,36 @@ sys.exit(0 if ok else 1)
 PYEOF
 check $? "导出文件结构(version/exported_at/count/providers 数组)校验"
 rm -f "$PROV_IMPORT" "$PROV_EXPORT"
+
+# --- 3c. context_max_size 参数(CLI + 导入导出,feat 本轮) ---
+# 设计见 docs/Context设置与自动压缩设计/01-设计与解决方案.md §3
+section "3c. context_max_size 参数(CLI/导入导出)"
+run "$LAEW" provider add --protocol anthropic --provider-name ctxK --model-name m-ctx \
+  --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-ctx --context-max-size 256K
+check $? "add 带 --context-max-size 256K"
+OUT=$(run "$LAEW" provider list)
+echo "$OUT" | grep "ctxK" | grep -q "ctx: 256K"; check $? "list 显示 ctx: 256K(K/M 后缀解析)"
+echo "$OUT" | grep "mockA" | grep -q "ctx: 800K"; check $? "缺省记录自动补默认 800K"
+# 非法值应报错(非 0 退出)
+if run "$LAEW" provider add --protocol anthropic --provider-name bad --model-name m \
+  --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-bad --context-max-size abc >/dev/null 2>&1; then
+  check 1 "非法 context-max-size 被拒绝"
+else
+  check 0 "非法 context-max-size 被拒绝"
+fi
+# 旧版格式(无 context_max_size 字段)导入 → 补默认 800K
+PROV_OLD=/tmp/laew-e2e-prov-old.json
+cat > "$PROV_OLD" <<'JSON'
+{"protocol":"anthropic","provider_name":"oldfmt","model_name":"m-old","end_point":"http://127.0.0.1:18899","api_key":"sk-old"}
+JSON
+run "$LAEW" --inprovider "$PROV_OLD" >/dev/null 2>&1; check $? "旧版格式(无 ctx 字段)导入成功"
+OUT=$(run "$LAEW" provider list)
+echo "$OUT" | grep "oldfmt" | grep -q "ctx: 800K"; check $? "旧版格式导入后自动补默认 800K"
+# 导出携带 context_max_size 字段
+PROV_EXPORT2=/tmp/laew-e2e-prov-export2.json
+run "$LAEW" --outprovider "$PROV_EXPORT2" >/dev/null 2>&1
+grep -q '"context_max_size": 256000' "$PROV_EXPORT2"; check $? "导出文件含 context_max_size 字段(256000)"
+rm -f "$PROV_OLD" "$PROV_EXPORT2"
 
 # --- 4. mock LLM + OpenAI 协议端到端 ---
 section "4. OpenAI 协议端到端(工具调用循环)"
@@ -293,6 +323,25 @@ PYEOF
 check $? "5b 三场景注入行为校验(mock 日志)"
 
 rm -rf "$CTX_BASE"
+
+# --- 5c. Context 自动压缩端到端(Compact Agent,feat 本轮) ---
+# 设计见 docs/Context设置与自动压缩设计/01-设计与解决方案.md §4
+# 手法:切到 context_max_size=100 的 provider(阈值 80 token),管道模式连发 6 轮长消息任务。
+# 第 5 轮起主上下文 = [项目上下文(保护), u1..uN],尾部 4 条保护 → 早期消息进入压缩段
+# (每条约 500 字符,越过 MIN_SEGMENT_TOKENS=100 阈值),Compact Agent 被真实调用。
+section "5c. Context 自动压缩(Compact Agent 触发)"
+run "$LAEW" provider add --protocol anthropic --provider-name compact-test --model-name claude-compact \
+  --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-compact --context-max-size 100 >/dev/null 2>&1
+ID_CP=$(run "$LAEW" provider list 2>/dev/null | grep compact-test | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+run "$LAEW" provider use "$ID_CP" >/dev/null 2>&1
+LONGMSG=$(python3 -c "print('上下文压缩填充内容' * 60)")
+OUT=$( { for i in 1 2 3 4 5 6; do echo "第${i}轮压缩测试任务 $LONGMSG"; done; echo "/exit"; } | run "$LAEW" )
+echo "$OUT" | grep -q "Context 已自动压缩"; check $? "多轮后触发自动压缩(输出含压缩提示)"
+grep -q "LsmAgentEmergentWork-Compact" "$MOCK_LOG"; check $? "mock 日志含 Compact Agent 请求(真实调用)"
+echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "压缩后任务链路仍贯通"
+run "$LAEW" provider delete "$ID_CP" >/dev/null 2>&1
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+
 kill $MOCK_PID 2>/dev/null
 
 # --- 6. 协议请求格式校验(抓包日志) ---
@@ -598,7 +647,7 @@ else
   tsubmit "/provider add"
   texpect "/provider add" "tmux: 进入 ProviderForm(add)"
   # 快速填写:直接到确认 Tab
-  # Tab 0(protocol) → Tab 1(provider_name) → ... → Tab 5(确认)
+  # Tab 0(protocol) → Tab 1(provider_name) → ... → Tab 6(确认;Tab 5 为 context_max_size,用默认值)
   # 填写 provider_name
   tkey Right; sleep 0.2
   tkey Enter; sleep 0.3
@@ -619,7 +668,8 @@ else
   tkey Enter; sleep 0.3
   tsend "sk-test-tmux"; sleep 0.3
   tkey Enter; sleep 0.3
-  # 确认 Tab:默认选中 [确认],直接 Enter
+  # 越过 context_max_size Tab(保留默认 800000),到确认 Tab:默认选中 [确认],直接 Enter
+  tkey Right; sleep 0.2
   tkey Right; sleep 0.2
   tkey Enter; sleep 1.0
   # 验证返回主屏(应有 Toast 或主屏 prompt)

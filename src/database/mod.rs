@@ -19,7 +19,8 @@ pub mod schema;
 
 // 重导出常用类型
 pub use models::{
-    ExportData, ExportRecord, ImportInput, ImportResult, Protocol, ProviderImport, ProviderRecord,
+    format_context_size, parse_context_size, ExportData, ExportRecord, ImportInput, ImportResult,
+    Protocol, ProviderImport, ProviderRecord, DEFAULT_CONTEXT_MAX_SIZE,
 };
 pub use paths::Paths;
 

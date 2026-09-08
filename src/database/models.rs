@@ -39,6 +39,43 @@ pub struct ProviderRecord {
     pub api_key: String,
     pub is_active: bool,
     pub created_at: String,
+    /// 上下文最大 Token 数(默认 800K;0 = 不限制,关闭自动压缩)
+    pub context_max_size: u64,
+}
+
+/// ContextMaxSize 默认值:800K tokens。
+pub const DEFAULT_CONTEXT_MAX_SIZE: u64 = 800_000;
+
+/// 解析 ContextMaxSize 文本:支持纯数字(`800000`)与 K/M 后缀(`800K` / `1M`,大小写不敏感)。
+pub fn parse_context_size(s: &str) -> std::result::Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("context_max_size 不能为空".to_string());
+    }
+    let (digits, mult) = match t.as_bytes().last() {
+        Some(b'k') | Some(b'K') => (&t[..t.len() - 1], 1_000u64),
+        Some(b'm') | Some(b'M') => (&t[..t.len() - 1], 1_000_000u64),
+        _ => (t, 1u64),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("无效的 context_max_size: '{s}'(支持 800000 / 800K / 1M,0 表示不限制)"))?;
+    Ok(n.saturating_mul(mult))
+}
+
+/// 人类可读的大小显示(800000 → "800K")。
+pub fn format_context_size(n: u64) -> String {
+    if n == 0 {
+        return "不限".to_string();
+    }
+    if n % 1_000_000 == 0 {
+        format!("{}M", n / 1_000_000)
+    } else if n % 1_000 == 0 {
+        format!("{}K", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
 // ===== 导入/导出相关结构体 =====
@@ -57,6 +94,9 @@ pub struct ProviderImport {
     pub api_key: String,
     #[serde(default)]
     pub is_active: Option<bool>,
+    /// 可选:旧版(1.0)导出文件/手写配置无此字段,导入时补默认值 800K。
+    #[serde(default)]
+    pub context_max_size: Option<u64>,
 }
 
 /// 导入用：导出信封格式(`--outprovider` 产出的 JSON),支持原样再导入(往返兼容)
@@ -96,6 +136,7 @@ pub struct ExportRecord {
     pub api_key: String,
     pub is_active: bool,
     pub created_at: String,
+    pub context_max_size: u64,
 }
 
 /// 导出用：完整导出数据结构
@@ -121,11 +162,12 @@ impl ExportData {
                 api_key: r.api_key,
                 is_active: r.is_active,
                 created_at: r.created_at,
+                context_max_size: r.context_max_size,
             })
             .collect();
 
         Self {
-            version: "1.0".to_string(),
+            version: "1.1".to_string(),
             exported_at: time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
                 .format(&time::format_description::well_known::Rfc3339)

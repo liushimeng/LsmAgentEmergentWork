@@ -5,8 +5,9 @@
 
 // 重导出 database 模块的公共类型，保持向后兼容
 pub use crate::database::{
-    ConfigError, Db, ExportData, ExportRecord, ImportInput, ImportResult, Paths, Protocol,
-    ProviderImport, ProviderRecord, Result,
+    format_context_size, parse_context_size, ConfigError, Db, ExportData, ExportRecord,
+    ImportInput, ImportResult, Paths, Protocol, ProviderImport, ProviderRecord, Result,
+    DEFAULT_CONTEXT_MAX_SIZE,
 };
 
 pub mod agent_memory;

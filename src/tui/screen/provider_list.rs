@@ -14,7 +14,7 @@ use crate::tui::engine::{Frame, Outcome, Rect, Screen};
 use crate::tui::screen::provider_del::ProviderDelPicker;
 use crate::tui::theme;
 
-const FIELD_LABELS: [&str; 6] = ["id", "protocol", "provider_name", "model_name", "end_point", "api_key"];
+const FIELD_LABELS: [&str; 7] = ["id", "protocol", "provider_name", "model_name", "end_point", "api_key", "context_max_size"];
 
 pub struct ProviderList {
     pub records: Vec<ProviderRecord>,
@@ -52,6 +52,11 @@ impl ProviderList {
             3 => r.model_name.clone(),
             4 => r.end_point.clone(),
             5 => theme::mask_key(&r.api_key),
+            6 => format!(
+                "{} ({})",
+                r.context_max_size,
+                crate::config::format_context_size(r.context_max_size)
+            ),
             _ => String::new(),
         }
     }

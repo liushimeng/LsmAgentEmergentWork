@@ -1166,6 +1166,8 @@ export function estimateTokens(message: AgentMessage): number {
 
 ## 第 9 章 对 laew 的综合建议
 
+> ✅ **laew 已实现(2026-09-08 第 04 轮)**:本地 token 估算(字符/4 +10%)、阈值触发(max×0.8)、尾部保留(最近 4 条)、前缀保护(标记消息)、三档压缩率(Light/Medium/Aggressive)、LLM 失败硬截断降级——实现于 `src/agent/compact.rs`(Compact Agent,第 8 角色),设计见 `docs/Context设置与自动压缩设计/01-设计与解决方案.md`。后续轮次勿重复实现。
+
 ### 9.1 laew 现状分析
 
 laew 当前的 Context 管理状态:

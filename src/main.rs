@@ -81,6 +81,9 @@ enum ProviderCmd {
         end_point: String,
         #[arg(long)]
         api_key: String,
+        /// 上下文最大 Token 数(默认 800K;支持 800000/800K/1M 写法;0 = 不限制,关闭自动压缩)
+        #[arg(long, value_parser = parse_context_size)]
+        context_max_size: Option<u64>,
     },
     /// 列出全部接入记录
     List,
@@ -94,6 +97,10 @@ fn parse_protocol(s: &str) -> std::result::Result<Protocol, String> {
     Protocol::parse(s).map_err(|e| e.to_string())
 }
 
+fn parse_context_size(s: &str) -> std::result::Result<u64, String> {
+    lsm_agent::config::parse_context_size(s)
+}
+
 fn open_db() -> Result<(Paths, Db)> {
     let paths = Paths::detect().map_err(anyhow::Error::from)?;
     let db = Db::open(&paths).map_err(anyhow::Error::from)?;
@@ -103,11 +110,16 @@ fn open_db() -> Result<(Paths, Db)> {
 async fn cmd_provider(p: ProviderCmd) -> Result<()> {
     let (_paths, db) = open_db()?;
     match p {
-        ProviderCmd::Add { protocol, provider_name, model_name, end_point, api_key } => {
+        ProviderCmd::Add { protocol, provider_name, model_name, end_point, api_key, context_max_size } => {
             let id = db
-                .add(protocol, &provider_name, &model_name, &end_point, &api_key)
+                .add_with_context(protocol, &provider_name, &model_name, &end_point, &api_key, context_max_size)
                 .map_err(anyhow::Error::from)?;
-            println!("✓ 已新增接入记录 id={id}");
+            println!(
+                "✓ 已新增接入记录 id={id}(context_max_size={})",
+                lsm_agent::config::format_context_size(
+                    context_max_size.unwrap_or(lsm_agent::config::DEFAULT_CONTEXT_MAX_SIZE)
+                )
+            );
         }
         ProviderCmd::List => {
             let records = db.list().map_err(anyhow::Error::from)?;
@@ -118,13 +130,14 @@ async fn cmd_provider(p: ProviderCmd) -> Result<()> {
             for r in records {
                 let marker = if r.is_active { "*" } else { " " };
                 println!(
-                    "{marker} id={:<3} [{:<9}] {}/{:<24} @ {}  (key 末4位: {})",
+                    "{marker} id={:<3} [{:<9}] {}/{:<24} @ {}  (key 末4位: {}, ctx: {})",
                     r.id,
                     r.protocol.as_str(),
                     r.provider_name,
                     r.model_name,
                     r.end_point,
-                    tail(&r.api_key, 4)
+                    tail(&r.api_key, 4),
+                    lsm_agent::config::format_context_size(r.context_max_size)
                 );
             }
         }

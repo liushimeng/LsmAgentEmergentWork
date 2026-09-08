@@ -11,6 +11,7 @@
 //! 设计见 `docs/多Agent架构重构/01-设计与解决方案.md`。
 
 pub mod context;
+pub mod compact;
 pub mod debug;
 pub mod json_repair;
 pub mod main_work;

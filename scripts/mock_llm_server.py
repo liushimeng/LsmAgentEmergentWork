@@ -169,6 +169,11 @@ MAIN_WORK_PLAN_JSON = (
     ' "acceptance": ["输出包含 LAEW_MOCK_OK"], "delegate_to": "subagent"}]}'
 )
 SESSION_SUMMARY_TEXT = "任务完成:laew 端到端链路验证通过。(SessionContext 自动摘要)"
+COMPACT_SUMMARY_TEXT = (
+    "## 目标\n验证 Context 自动压缩链路。\n\n"
+    "## 进展与关键结论\n历史对话已由 Compact 压缩。\n\n"
+    "## 重要上下文\n无。\n\n## 待办\n继续当前任务。"
+)
 PLAN_MARKDOWN = "# 方案\n\n```json\n" + MAIN_WORK_PLAN_JSON + "\n```\n"
 
 
@@ -188,6 +193,7 @@ def detect_role(body, key):
         ("LsmAgentEmergentWork-Main-Work", "mainwork"),
         ("LsmAgentEmergentWork-SessionContext", "session"),
         ("LsmAgentEmergentWork-Plan", "plan"),
+        ("LsmAgentEmergentWork-Compact", "compact"),
         ("LsmAgentEmergentWork-SubAgent-Work", "subagent"),
     ]:
         if marker in system:
@@ -442,6 +448,8 @@ class Handler(BaseHTTPRequestHandler):
                 body_bytes = role_reply(maybe_break_json(MAIN_WORK_PLAN_JSON))
             elif role == "session":
                 body_bytes = role_reply(SESSION_SUMMARY_TEXT)
+            elif role == "compact":
+                body_bytes = role_reply(COMPACT_SUMMARY_TEXT)
             elif role == "plan":
                 body_bytes = role_reply(PLAN_MARKDOWN)
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本

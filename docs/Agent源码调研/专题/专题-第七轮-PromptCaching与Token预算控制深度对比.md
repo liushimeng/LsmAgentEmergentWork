@@ -1713,6 +1713,8 @@ const fn max_tokens_for_model(model: &str) -> u32 {
 
 #### P0-3：本地 token 估算（3 级 fallback）
 
+> ✅ 已实现最末级兜底(2026-09-08 第 04 轮):`src/agent/compact.rs::estimate_tokens`(字符/4 +10% 保守上浮),供 Compact Agent 触发判定;API 级与 tokenizer 级 fallback 仍未做。
+
 **目标**：`src/agent/budget.rs::TokenCounter` 实现三级链。
 
 **设计**：

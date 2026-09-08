@@ -14,8 +14,9 @@
 
 use crate::agent::system_prompt::SystemPrompt;
 use crate::agent::tools::{
-    builtin_registry, debug_registry, main_work_registry, plan_registry, quality_registry,
-    session_context_registry, sub_agent_work_registry, yolo_registry, ToolRegistry,
+    builtin_registry, compact_registry, debug_registry, main_work_registry, plan_registry,
+    quality_registry, session_context_registry, sub_agent_work_registry, yolo_registry,
+    ToolRegistry,
 };
 
 // =================== Agent 名称常量 ===================
@@ -34,6 +35,8 @@ pub const QUALITY_CHECK_AGENT_NAME: &str = "LsmAgentEmergentWork-Quality-Check";
 pub const SESSION_CONTEXT_AGENT_NAME: &str = "LsmAgentEmergentWork-SessionContext";
 /// Debug Agent(调试层,仅在 `-debug` 调试模式下启用)
 pub const DEBUG_AGENT_NAME: &str = "LsmAgentEmergentWork-Debug";
+/// Compact Agent(压缩层,Context 超阈值时自动压缩)
+pub const COMPACT_AGENT_NAME: &str = "LsmAgentEmergentWork-Compact";
 
 /// 兼容旧名(指向 SubAgent-Work)。
 pub const WORK_AGENT_NAME: &str = SUB_AGENT_WORK_NAME;
@@ -114,6 +117,15 @@ impl AgentProfile {
         }
     }
 
+    /// Compact Agent profile(压缩层,上下文摘要,无工具)。
+    pub fn compact_profile() -> Self {
+        Self {
+            name: COMPACT_AGENT_NAME.to_string(),
+            system_prompt: SystemPrompt::compact(),
+            tools: compact_registry(),
+        }
+    }
+
     /// 兼容旧名(等价于 sub_agent_work_profile)。
     pub fn work_profile() -> Self {
         Self::sub_agent_work_profile()
@@ -181,9 +193,10 @@ mod tests {
             AgentProfile::sub_agent_work_profile().name,
             AgentProfile::quality_check_profile().name,
             AgentProfile::session_context_profile().name,
+            AgentProfile::compact_profile().name,
         ];
         let unique: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(unique.len(), 6, "6 个 profile 必须名字互不相同");
+        assert_eq!(unique.len(), 7, "7 个 profile 必须名字互不相同");
     }
 
     #[test]
@@ -250,6 +263,7 @@ mod tests {
             AgentProfile::sub_agent_work_profile(),
             AgentProfile::quality_check_profile(),
             AgentProfile::session_context_profile(),
+            AgentProfile::compact_profile(),
         ] {
             let rendered = p.system_prompt.render(Protocol::Anthropic);
             assert!(!rendered.is_empty(), "{} 的系统提示词渲染不应为空", p.name);
