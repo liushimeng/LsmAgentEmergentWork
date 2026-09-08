@@ -14,6 +14,7 @@ pub mod context;
 pub mod main_work;
 pub mod memory;
 pub mod orchestrator;
+pub mod permissions;
 pub mod plan;
 pub mod profile;
 pub mod project_context;

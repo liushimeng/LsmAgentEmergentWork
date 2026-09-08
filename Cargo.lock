@@ -744,6 +744,8 @@ dependencies = [
  "clap",
  "crossterm",
  "globset",
+ "libc",
+ "once_cell",
  "regex",
  "reqwest",
  "rusqlite",

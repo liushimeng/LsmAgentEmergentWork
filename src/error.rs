@@ -58,6 +58,9 @@ pub enum AgentError {
         work_dir: String,
         temp_dir: String,
     },
+
+    #[error("[权限拒绝] 工具 {tool}: {reason}\n建议改用更安全的写法(参见工具描述中的「安全提示」)。")]
+    PermissionDenied { tool: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
