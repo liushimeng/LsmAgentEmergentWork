@@ -190,16 +190,13 @@ pub fn topo_sort(workflows: &[WorkFlowSpec]) -> Result<Vec<WorkFlowSpec>> {
 }
 
 /// 解析 Main-Work JSON 输出(支持代码块 / 裸 JSON)。
+/// 直接解析失败时自动走 JSON 修复链(`json_repair`),修复不了仍 WorkflowParse。
 pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
     if let Some(json_str) = extract_json_block(text) {
-        return serde_json::from_str::<WorkFlowPlan>(json_str).map_err(|e| {
-            AgentError::WorkflowParse(format!("JSON 代码块解析失败: {}", e))
-        });
+        return crate::agent::json_repair::try_parse(json_str).map_err(AgentError::WorkflowParse);
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        return serde_json::from_str::<WorkFlowPlan>(json_str).map_err(|e| {
-            AgentError::WorkflowParse(format!("JSON 对象解析失败: {}", e))
-        });
+        return crate::agent::json_repair::try_parse(json_str).map_err(AgentError::WorkflowParse);
     }
     Err(AgentError::WorkflowParse(
         "未找到合法的 WorkFlow JSON".into(),

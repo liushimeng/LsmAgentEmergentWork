@@ -171,15 +171,17 @@ impl QualityRunner {
 }
 
 /// 解析 Quality JSON 输出。
+/// 直接解析失败时自动走 JSON 修复链(`json_repair` Tier-1 语法修复);
+/// 修复不了仍返回 Err(上轮 P0 fail-closed 语义不变,截断 JSON 刻意不补全)。
 pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityReport> {
     if let Some(json_str) = extract_json_block(text) {
-        return serde_json::from_str::<QualityReport>(json_str).map_err(|e| {
-            crate::error::AgentError::Other(format!("Quality JSON 解析失败: {}", e))
+        return crate::agent::json_repair::try_parse::<QualityReport>(json_str).map_err(|diag| {
+            crate::error::AgentError::Other(format!("Quality JSON 解析失败: {diag}"))
         });
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        let mut r: QualityReport = serde_json::from_str(json_str).map_err(|e| {
-            crate::error::AgentError::Other(format!("Quality JSON 解析失败: {}", e))
+        let mut r: QualityReport = crate::agent::json_repair::try_parse(json_str).map_err(|diag| {
+            crate::error::AgentError::Other(format!("Quality JSON 解析失败: {diag}"))
         })?;
         if r.source != source {
             r.source = source;

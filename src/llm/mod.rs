@@ -15,7 +15,27 @@ use crate::error::{AgentError, Result};
 
 pub mod anthropic;
 pub mod openai;
+pub mod resilient;
 pub mod sse;
+
+use resilient::{CONNECT_TIMEOUT, ResilientLlmClient};
+
+/// 统一的 HTTP 客户端构造入口:注入连接超时(防连接挂起导致 TUI 冻结)。
+///
+/// 流式阶段的 idle / 总超时见 [`sse::stream_chunks`]。
+pub fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .expect("reqwest Client 构建失败")
+}
+
+/// 解析 `Retry-After` 头(仅支持 delta-seconds;HTTP-date 形式少见,忽略)。
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let v = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = v.trim().parse().ok()?;
+    Some(secs.saturating_mul(1000))
+}
 
 /// 请求元数据:会话 / 设备标识,由协议层写入 HTTP 头与请求体。
 #[derive(Debug, Clone)]
@@ -175,8 +195,11 @@ pub trait LlmClient: Send + Sync {
 }
 
 /// 根据数据库记录创建对应协议的用户端(注入 User-Agent)。
+///
+/// 自动包一层 [`ResilientLlmClient`]:超时感知 + 自动重试 + 指数退避,
+/// 调用方(main / tui)零改动即获得弹性。
 pub fn client_from_record(record: &ProviderRecord, user_agent: &str) -> Result<Arc<dyn LlmClient>> {
-    match record.protocol {
+    let inner: Arc<dyn LlmClient> = match record.protocol {
         Protocol::Anthropic => {
             let c = anthropic::AnthropicClient::new(
                 &record.end_point,
@@ -184,7 +207,7 @@ pub fn client_from_record(record: &ProviderRecord, user_agent: &str) -> Result<A
                 &record.model_name,
                 user_agent,
             )?;
-            Ok(Arc::new(c))
+            Arc::new(c)
         }
         Protocol::OpenAi => {
             let c = openai::OpenAiClient::new(
@@ -193,9 +216,10 @@ pub fn client_from_record(record: &ProviderRecord, user_agent: &str) -> Result<A
                 &record.model_name,
                 user_agent,
             )?;
-            Ok(Arc::new(c))
+            Arc::new(c)
         }
-    }
+    };
+    Ok(Arc::new(ResilientLlmClient::new(inner)))
 }
 
 /// 规整 end_point:去除尾部 `/`

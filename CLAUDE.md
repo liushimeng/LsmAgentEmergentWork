@@ -290,6 +290,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
   - **`专题-第十三轮-AgentDSL与声明式编程深度对比.md`** — HCL/KDL/Nickel 5 种 DSL + LangGraph + BAML + MiniJinja + pest
   - **`专题-第十三轮-WebAssembly沙箱与WASI深度对比.md`** — wasmtime + Fuel/Epoch + WASI Preview 2 + WIT + Component Model
   - **`专题-第十轮深挖合集.md`** — 第十轮 15 主文档全部追加新章节（~26,940 行 / ~1 MB）+ 8 大新维度全景 + L79-L142 gap 清单 + 142 个 laew gap 累计完整覆盖度
+  - **`专题-laew实现进度对照表.md`** — ⭐ **实现进度中央账本(改代码前必查)**:知识库 gap(H/L 编号)→ 状态(✅/🟡/⏳/⛔)→ 实现位置 → 完成轮次 的对照索引,防止多轮任务重复实现;已实现的 gap 在对应专题原文条目旁有 ✅ 标记(如第十二轮 H1/H2/H3/H10、第七轮 L17)。实现新功能后必须回填此表 + 就地标记
 
 - `docs/Agent架构对比与参考.md` — 7 个项目(6 外部 + laew)的横向对比报告,含 10 维度对比表、15 个跨项目设计模式、laew 借鉴路线图(P0/P1/P2)、反模式警示
 

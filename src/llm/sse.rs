@@ -22,6 +22,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -195,7 +196,8 @@ pub enum DeltaEvent {
     /// 终止信号。
     Stop { stop_reason: Option<String> },
     /// 上游显式错误(目前只有 Anthropic 流)。
-    Error(String),
+    /// `kind` 为上游 error type(如 `overloaded_error`),供重试层分类。
+    Error { kind: String, message: String },
 }
 
 /// 聚合器:把 `DeltaEvent` 累积成 `Completion`。
@@ -212,8 +214,8 @@ pub struct ParseSink {
     stop_reason: Option<String>,
     /// 流是否已收到终止信号。
     finished: bool,
-    /// 流式错误(若设置则 finish() 返回 Err)。
-    errored: Option<String>,
+    /// 流式错误(若设置则 finish() 返回 Err)。(kind, message)
+    errored: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,8 +287,8 @@ impl ParseSink {
                 }
                 self.finished = true;
             }
-            DeltaEvent::Error(msg) => {
-                self.errored = Some(msg);
+            DeltaEvent::Error { kind, message } => {
+                self.errored = Some((kind, message));
             }
         }
         Ok(())
@@ -294,8 +296,8 @@ impl ParseSink {
 
     /// 终结:产生最终的 `Completion`。
     pub fn finish(self) -> Result<Completion> {
-        if let Some(msg) = self.errored {
-            return Err(AgentError::Llm(format!("upstream SSE error: {msg}")));
+        if let Some((kind, message)) = self.errored {
+            return Err(AgentError::LlmStream { kind, message });
         }
         // 若流式未显式终止(例如 [DONE] 之前的最后一个 chunk 之后没新数据),
         // 也把 in_flight 残留的 tool_calls 尝试 parse 出来,避免丢调用。
@@ -316,6 +318,42 @@ impl ParseSink {
             stop_reason: self.stop_reason,
         })
     }
+}
+
+/// 流式读取响应体,带两级超时保护(P0:此前 laew 完全无超时,半开连接会永久卡死):
+/// - `idle`:相邻两个 chunk 之间的最大间隔(超时 → 疑似半开连接,报可重试错误);
+/// - `total`:单次尝试的整体上限(超时 → 无限慢流兜底)。
+///
+/// 每收到一段字节即调用 `on_chunk`;所有超时/传输错误统一映射为
+/// [`AgentError::LlmNetwork`](可重试),由弹性层(`resilient.rs`)决定重试。
+pub async fn stream_chunks(
+    resp: reqwest::Response,
+    idle: Duration,
+    total: Duration,
+    on_chunk: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let mut resp = resp;
+    loop {
+        if start.elapsed() >= total {
+            return Err(AgentError::LlmNetwork(format!(
+                "SSE 总超时(超过 {total:?} 未完成):已放弃本次尝试"
+            )));
+        }
+        match tokio::time::timeout(idle, resp.chunk()).await {
+            Err(_) => {
+                return Err(AgentError::LlmNetwork(format!(
+                    "SSE 空闲超时({idle:?} 无新数据):疑似半开连接"
+                )));
+            }
+            Ok(Err(e)) => {
+                return Err(AgentError::LlmNetwork(format!("SSE 传输中断: {e}")));
+            }
+            Ok(Ok(None)) => break, // EOF
+            Ok(Ok(Some(bytes))) => on_chunk(&bytes)?,
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -441,7 +479,11 @@ mod tests {
     #[test]
     fn sink_error_propagates() {
         let mut sink = ParseSink::new();
-        sink.feed(DeltaEvent::Error("rate limited".into())).unwrap();
+        sink.feed(DeltaEvent::Error {
+            kind: "rate_limit_error".into(),
+            message: "rate limited".into(),
+        })
+        .unwrap();
         let err = sink.finish().unwrap_err();
         assert!(format!("{err}").contains("rate limited"));
     }

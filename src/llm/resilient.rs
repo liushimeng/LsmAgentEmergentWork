@@ -1,0 +1,417 @@
+//! LLM 调用自动弹性层:超时感知 + 自动重试 + 指数退避 + jitter(装饰器)。
+//!
+//! 包住任意 [`LlmClient`],对上仍是 `Arc<dyn LlmClient>`,调用方零改动:
+//! - **可重试错误**(`LlmHttp` 408/425/429/5xx/529、`LlmNetwork`、上游流内
+//!   `overloaded/rate_limit/api/timeout` 错误)→ 自动指数退避重试;
+//! - **429 的 `Retry-After`** 服务端优先(60s 封顶,不做向下抖动);
+//! - **不可重试错误**(401/403/404/413/422 等)→ 立即上抛,不浪费时间。
+//!
+//! 参数对齐知识库结论(专题-第三轮-错误处理重试与容错降级 §附录A 速查表):
+//! 基数 500ms / 倍数 2 / 上限 8s / ±25% jitter / 最多 3 次重试。
+//! jitter 种子用墙钟亚秒纳秒打散(同 atomcode 做法),**不引入 rand crate**。
+//!
+//! 重试安全性:laew 的 `complete()` 聚合完整响应后才返回,工具调用发生在其后,
+//! 因此整请求重放无副作用(仅可能重复计费失败的请求,行业同款行为)。
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+
+use crate::config::Protocol;
+use crate::error::{AgentError, Result};
+use crate::llm::{ChatMessage, Completion, LlmClient, RequestMeta, ToolDef};
+
+/// 最多重试次数(总尝试 = 1 + max_retries)
+pub const DEFAULT_MAX_RETRIES: usize = 3;
+/// 退避基数(毫秒)
+pub const DEFAULT_BASE_DELAY_MS: u64 = 500;
+/// 退避上限(毫秒)
+pub const DEFAULT_MAX_DELAY_MS: u64 = 8_000;
+/// jitter 比例:延迟落在 [d×(1-r), d×(1+r)] 均匀分布
+pub const DEFAULT_JITTER_RATIO: f64 = 0.25;
+/// Retry-After 上限(毫秒),防恶意/异常大值
+pub const DEFAULT_RETRY_AFTER_CAP_MS: u64 = 60_000;
+/// TCP 连接超时(所有协议客户端共用,经 [`crate::llm::build_http_client`])
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// SSE 相邻 chunk 间空闲超时(claudecode SSE idle 90s),防半开连接假活
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// 单次尝试总超时(claudecode 总超时 600s),防无限慢流
+pub const TOTAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 重试策略配置(测试可注入更小延迟)。
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    pub max_retries: usize,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub jitter_ratio: f64,
+    pub retry_after_cap_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_MAX_RETRIES,
+            base_delay_ms: DEFAULT_BASE_DELAY_MS,
+            max_delay_ms: DEFAULT_MAX_DELAY_MS,
+            jitter_ratio: DEFAULT_JITTER_RATIO,
+            retry_after_cap_ms: DEFAULT_RETRY_AFTER_CAP_MS,
+        }
+    }
+}
+
+/// 可重试性判定(纯函数)。
+///
+/// 状态码清单对齐 atomcode:`408 | 425 | 429 | 500 | 502 | 503 | 504 | 529`;
+/// 网络类错误一律可重试;流内错误按上游 error type 白名单。
+pub fn is_retryable(err: &AgentError) -> bool {
+    match err {
+        AgentError::LlmHttp { status, .. } => {
+            matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+        }
+        AgentError::LlmNetwork(_) => true,
+        AgentError::LlmStream { kind, .. } => matches!(
+            kind.as_str(),
+            "overloaded_error" | "rate_limit_error" | "api_error" | "timeout_error"
+        ),
+        _ => false,
+    }
+}
+
+/// 指数退避 + ±jitter 延迟(纯函数,种子外注入以便单测断言区间)。
+///
+/// `capped = min(base × 2^attempt, max)`;延迟均匀落在
+/// `[capped×(1-ratio), capped×(1+ratio)]`。
+pub fn backoff_delay_ms(attempt: usize, cfg: &RetryConfig, seed: u64) -> u64 {
+    let exp = attempt.min(16) as u32;
+    let capped = cfg
+        .base_delay_ms
+        .saturating_mul(1u64 << exp)
+        .min(cfg.max_delay_ms);
+    let window = (capped as f64 * cfg.jitter_ratio * 2.0) as u64;
+    let lo = capped.saturating_sub(window / 2);
+    lo + seed % (window + 1)
+}
+
+/// 墙钟亚秒纳秒打散为种子(同 atomcode jitter 做法,不引 rand crate)。
+pub fn jitter_seed(salt: u64) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x5DEECE66D);
+    let mut x = n ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+    // xorshift64* 一轮打散
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+/// 弹性装饰器:实现 `LlmClient`,内部包装真实客户端并做自动重试。
+pub struct ResilientLlmClient {
+    inner: Arc<dyn LlmClient>,
+    cfg: RetryConfig,
+}
+
+impl ResilientLlmClient {
+    pub fn new(inner: Arc<dyn LlmClient>) -> Self {
+        Self::with_config(inner, RetryConfig::default())
+    }
+
+    pub fn with_config(inner: Arc<dyn LlmClient>, cfg: RetryConfig) -> Self {
+        Self { inner, cfg }
+    }
+
+    /// 单次重试应等待的时长:429/503 的 Retry-After 服务端优先(封顶,不向下抖动),
+    /// 其余走指数退避 + jitter。
+    fn delay_for(&self, err: &AgentError, attempt: usize) -> u64 {
+        if let AgentError::LlmHttp {
+            retry_after_ms: Some(ms),
+            ..
+        } = err
+        {
+            return (*ms).min(self.cfg.retry_after_cap_ms);
+        }
+        backoff_delay_ms(attempt, &self.cfg, jitter_seed(attempt as u64))
+    }
+
+    async fn complete_with_retry(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        meta: &RequestMeta,
+    ) -> Result<Completion> {
+        let mut attempt: usize = 0;
+        loop {
+            match self.inner.complete(system, messages, tools, meta).await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    if attempt >= self.cfg.max_retries || !is_retryable(&e) {
+                        return Err(e);
+                    }
+                    let delay = self.delay_for(&e, attempt);
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_retries = self.cfg.max_retries,
+                        delay_ms = delay,
+                        error = %e,
+                        "LLM 调用失败,自动重试(指数退避)"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for ResilientLlmClient {
+    async fn complete(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        meta: &RequestMeta,
+    ) -> Result<Completion> {
+        self.complete_with_retry(system, messages, tools, meta)
+            .await
+    }
+
+    fn protocol(&self) -> Protocol {
+        self.inner.protocol()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// 脚本化 Mock:按预定顺序弹出响应,并统计调用次数。
+    struct MockClient {
+        responses: Mutex<VecDeque<Result<Completion>>>,
+        calls: Arc<AtomicUsize>,
+        proto: Protocol,
+    }
+
+    impl MockClient {
+        fn new(responses: Vec<Result<Completion>>, proto: Protocol) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    calls: calls.clone(),
+                    proto,
+                },
+                calls,
+            )
+        }
+    }
+
+    fn ok_completion() -> Completion {
+        Completion {
+            text: "ok".into(),
+            ..Default::default()
+        }
+    }
+
+    fn http_err(status: u16, retry_after_ms: Option<u64>) -> AgentError {
+        AgentError::LlmHttp {
+            status,
+            retry_after_ms,
+            message: format!("HTTP {status}"),
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for MockClient {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(ok_completion()))
+        }
+
+        fn protocol(&self) -> Protocol {
+            self.proto
+        }
+    }
+
+    /// 测试专用小延迟配置(总重试耗时 < 100ms)。
+    fn fast_cfg() -> RetryConfig {
+        RetryConfig {
+            max_retries: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 4,
+            jitter_ratio: 0.25,
+            retry_after_cap_ms: 50,
+        }
+    }
+
+    fn test_meta() -> RequestMeta {
+        RequestMeta {
+            session_id: "test-session".into(),
+            device_id: "test-device".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_then_succeeds() {
+        let (mock, calls) = MockClient::new(
+            vec![
+                Err(http_err(500, None)),
+                Err(AgentError::LlmNetwork("连接被重置".into())),
+                Ok(ok_completion()),
+            ],
+            Protocol::Anthropic,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        let out = client.complete("", &[], &[], &test_meta()).await.unwrap();
+        assert_eq!(out.text, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_fails_immediately() {
+        let (mock, calls) = MockClient::new(
+            vec![Err(http_err(401, None))],
+            Protocol::Anthropic,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        let err = client.complete("", &[], &[], &test_meta()).await.unwrap_err();
+        assert!(matches!(err, AgentError::LlmHttp { status: 401, .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "401 不应重试");
+    }
+
+    #[tokio::test]
+    async fn retries_exhausted_returns_last_error() {
+        let (mock, calls) = MockClient::new(
+            vec![
+                Err(http_err(503, None)),
+                Err(http_err(503, None)),
+                Err(http_err(503, None)),
+                Err(http_err(503, None)),
+            ],
+            Protocol::OpenAi,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        let err = client.complete("", &[], &[], &test_meta()).await.unwrap_err();
+        assert!(matches!(err, AgentError::LlmHttp { status: 503, .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "1 次初始 + 3 次重试");
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_respected_with_cap() {
+        let (mock, calls) = MockClient::new(
+            vec![
+                Err(http_err(429, Some(30))),
+                Ok(ok_completion()),
+            ],
+            Protocol::Anthropic,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        let start = std::time::Instant::now();
+        client.complete("", &[], &[], &test_meta()).await.unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(25),
+            "应等待 Retry-After(30ms),实际 {:?}",
+            start.elapsed()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_overloaded_is_retried_but_invalid_request_is_not() {
+        // overloaded_error → 可重试
+        let (mock, calls) = MockClient::new(
+            vec![
+                Err(AgentError::LlmStream {
+                    kind: "overloaded_error".into(),
+                    message: "overloaded".into(),
+                }),
+                Ok(ok_completion()),
+            ],
+            Protocol::Anthropic,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        client.complete("", &[], &[], &test_meta()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // invalid_request_error → 不可重试
+        let (mock2, calls2) = MockClient::new(
+            vec![Err(AgentError::LlmStream {
+                kind: "invalid_request_error".into(),
+                message: "bad".into(),
+            })],
+            Protocol::Anthropic,
+        );
+        let client2 = ResilientLlmClient::with_config(Arc::new(mock2), fast_cfg());
+        let _ = client2.complete("", &[], &[], &test_meta()).await.unwrap_err();
+        assert_eq!(calls2.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn is_retryable_classification_table() {
+        for s in [408u16, 425, 429, 500, 502, 503, 504, 529] {
+            assert!(is_retryable(&http_err(s, None)), "{s} 应可重试");
+        }
+        for s in [400u16, 401, 403, 404, 413, 422, 501] {
+            assert!(!is_retryable(&http_err(s, None)), "{s} 不应重试");
+        }
+        assert!(is_retryable(&AgentError::LlmNetwork("timeout".into())));
+        assert!(!is_retryable(&AgentError::Llm("其它".into())));
+        assert!(!is_retryable(&AgentError::YoloParse("解析".into())));
+    }
+
+    #[test]
+    fn backoff_respects_bounds_and_cap() {
+        let cfg = RetryConfig::default(); // 500/8000/±25%
+        for attempt in 0..6u64 {
+            let expected_cap = (500u64.saturating_mul(1 << attempt)).min(8_000);
+            let lo = (expected_cap as f64 * 0.75) as u64;
+            let hi = (expected_cap as f64 * 1.25) as u64 + 1;
+            for salt in [0u64, 1, 42, 0xDEAD_BEEF, u64::MAX] {
+                let d = backoff_delay_ms(attempt as usize, &cfg, jitter_seed(salt));
+                assert!(
+                    d >= lo && d <= hi,
+                    "attempt={attempt} delay={d} 不在 [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_delay_is_capped() {
+        let client = ResilientLlmClient::with_config(
+            Arc::new(MockClient::new(vec![], Protocol::Anthropic).0),
+            RetryConfig::default(),
+        );
+        let err = http_err(429, Some(600_000));
+        assert_eq!(
+            client.delay_for(&err, 0),
+            60_000,
+            "Retry-After 应被 60s 封顶"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_passthrough() {
+        let (mock, _) = MockClient::new(vec![], Protocol::OpenAi);
+        let client = ResilientLlmClient::new(Arc::new(mock));
+        assert_eq!(client.protocol(), Protocol::OpenAi);
+    }
+}

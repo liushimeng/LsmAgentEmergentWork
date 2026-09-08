@@ -45,6 +45,122 @@ def make_openai_sse(chunks, terminal_usage=None):
     return b"".join(parts)
 
 
+def anthropic_text_sse(text, msg_id="mock-msg-role"):
+    """构造一段纯文本回复的 Anthropic SSE 流(供 Yolo / Quality 等角色返回 JSON 文本)。"""
+    events = [
+        {
+            "type": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "mock-anthropic",
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 30, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                },
+            },
+        },
+        {
+            "type": "content_block_start",
+            "data": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        },
+        {
+            "type": "content_block_delta",
+            "data": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+        },
+        {"type": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+        {
+            "type": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 20},
+            },
+        },
+        {"type": "message_stop", "data": {"type": "message_stop"}},
+    ]
+    return make_anthropic_sse(events)
+
+
+def openai_text_sse(text, chunk_id="chatcmpl-mock-role"):
+    """构造一段纯文本回复的 OpenAI SSE 流。"""
+    chunks = [
+        {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "mock-openai",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+        },
+        {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "mock-openai",
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+        },
+        {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "mock-openai",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    terminal = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "choices": [],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50, "prompt_tokens_details": {"cached_tokens": 0}},
+    }
+    return make_openai_sse(chunks, terminal_usage=terminal)
+
+
+# 各角色的固定 JSON 应答(与 src/agent 内各结构体的 serde 表示严格对应):
+YOLO_CLASSIFICATION_JSON = (
+    '{"task_level": "simple", "goal_summary": "完成 laew 端到端链路验证",'
+    ' "intent": "verify", "decomposition_plan": ["执行验证命令"],'
+    ' "direct_answer": null, "user_suggestion_if_fail": ""}'
+)
+QUALITY_REPORT_JSON = (
+    '{"verdict": "pass", "source": "subagent", "issues": [],'
+    ' "suggestion": "", "retryable": false}'
+)
+MAIN_WORK_PLAN_JSON = (
+    '{"workflows": [{"id": "wf-1", "name": "执行验证",'
+    ' "steps": ["运行 echo LAEW_MOCK_OK"],'
+    ' "acceptance": ["输出包含 LAEW_MOCK_OK"], "delegate_to": "subagent"}]}'
+)
+SESSION_SUMMARY_TEXT = "任务完成:laew 端到端链路验证通过。(SessionContext 自动摘要)"
+PLAN_MARKDOWN = "# 方案\n\n```json\n" + MAIN_WORK_PLAN_JSON + "\n```\n"
+
+
+def detect_role(body, key):
+    """按系统提示词中的 Agent 名识别角色(与 src/agent/system_prompt 各 BASE_PROMPT 对应)。"""
+    if key == "oai":
+        system = ""
+        for m in body.get("messages", []):
+            if m.get("role") == "system":
+                system = m.get("content") or ""
+                break
+    else:
+        system = body.get("system") or ""
+    for marker, role in [
+        ("LsmAgentEmergentWork-Yolo", "yolo"),
+        ("LsmAgentEmergentWork-Quality-Check", "quality"),
+        ("LsmAgentEmergentWork-Main-Work", "mainwork"),
+        ("LsmAgentEmergentWork-SessionContext", "session"),
+        ("LsmAgentEmergentWork-Plan", "plan"),
+        ("LsmAgentEmergentWork-SubAgent-Work", "subagent"),
+    ]:
+        if marker in system:
+            return role
+    return "subagent"  # 兼容旧版:未知系统提示词按执行层序列处理
+
+
 def build_anthropic_stream(call_no):
     """构造 Anthropic 一次完整流的 SSE 字节。"""
     if call_no == 1:
@@ -257,10 +373,33 @@ class Handler(BaseHTTPRequestHandler):
                 ensure_ascii=False,
             ) + "\n")
 
-        if key == "oai":
-            body_bytes = build_openai_stream(n)
-        elif "v1/messages" in self.path:
-            body_bytes = build_anthropic_stream(n)
+        # P0 修复(fail-closed 配套):按角色返回对应结构化应答。
+        # 此前仅按调用序号脚本化,所有非首轮调用都返回纯文本,
+        # Yolo / Quality 的 JSON 解析从未成功过(fail-open 时代被默认通过掩盖)。
+        role = detect_role(body, key)
+        role_no = STATE.get(f"{key}:{role}", 0) + 1
+        STATE[f"{key}:{role}"] = role_no
+
+        def role_reply(text):
+            return openai_text_sse(text) if key == "oai" else anthropic_text_sse(text)
+
+        if key == "oai" or "v1/messages" in self.path:
+            if role == "yolo":
+                body_bytes = role_reply(YOLO_CLASSIFICATION_JSON)
+            elif role == "quality":
+                body_bytes = role_reply(QUALITY_REPORT_JSON)
+            elif role == "mainwork":
+                body_bytes = role_reply(MAIN_WORK_PLAN_JSON)
+            elif role == "session":
+                body_bytes = role_reply(SESSION_SUMMARY_TEXT)
+            elif role == "plan":
+                body_bytes = role_reply(PLAN_MARKDOWN)
+            else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
+                body_bytes = (
+                    build_openai_stream(role_no)
+                    if key == "oai"
+                    else build_anthropic_stream(role_no)
+                )
         else:
             self.send_response(404)
             self.end_headers()

@@ -12,6 +12,24 @@ pub enum AgentError {
     #[error("LLM 调用失败: {0}")]
     Llm(String),
 
+    /// 带 HTTP 状态码的 LLM 错误(结构化,供重试层判定可重试性)。
+    /// `retry_after_ms` 来自 `Retry-After` 头(秒→毫秒),无则 None。
+    #[error("LLM HTTP 错误(status={status}): {message}")]
+    LlmHttp {
+        status: u16,
+        retry_after_ms: Option<u64>,
+        message: String,
+    },
+
+    /// LLM 网络/超时类错误(连接失败、超时、SSE 传输中断、idle watchdog)。
+    #[error("LLM 网络错误: {0}")]
+    LlmNetwork(String),
+
+    /// 上游在流内显式报错(SSE `error` 事件)。`kind` 为上游 error type
+    /// (如 `overloaded_error` / `rate_limit_error`),供重试层分类。
+    #[error("LLM 流式错误({kind}): {message}")]
+    LlmStream { kind: String, message: String },
+
     #[error("工具不存在: {0}")]
     ToolNotFound(String),
 

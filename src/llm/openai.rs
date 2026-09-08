@@ -35,7 +35,7 @@ impl OpenAiClient {
     pub fn new(end_point: &str, api_key: &str, model: &str, user_agent: &str) -> Result<Self> {
         let url = format!("{}/chat/completions", normalize_endpoint(end_point));
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: crate::llm::build_http_client(),
             url,
             api_key: api_key.to_string(),
             model: model.to_string(),
@@ -335,25 +335,34 @@ impl LlmClient for OpenAiClient {
 
         let status = resp.status();
         if !status.is_success() {
+            // 结构化错误:保留状态码与 Retry-After,供弹性层(resilient.rs)分类重试
+            let retry_after_ms = crate::llm::parse_retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(AgentError::Llm(format!("HTTP {status}: {body_text}")));
+            return Err(AgentError::LlmHttp {
+                status: status.as_u16(),
+                retry_after_ms,
+                message: format!("HTTP {status}: {body_text}"),
+            });
         }
 
+        // 流式读取 + 两级超时(idle 90s / 总 600s),超时错误可被弹性层自动重试
         let mut sse = SseStream::new();
         let mut parser = OpenAiParser::new();
         let mut sink = ParseSink::new();
-        let mut resp = resp;
-        loop {
-            match resp.chunk().await {
-                Ok(Some(bytes)) => {
-                    let evs = sse.push(&bytes)?;
-                    for ev in evs {
-                        parser.feed(&ev, &mut sink)?;
-                    }
+        {
+            let mut on_chunk = |bytes: &[u8]| -> Result<()> {
+                for ev in sse.push(bytes)? {
+                    parser.feed(&ev, &mut sink)?;
                 }
-                Ok(None) => break,
-                Err(e) => return Err(AgentError::Llm(format!("SSE 传输中断: {e}"))),
-            }
+                Ok(())
+            };
+            crate::llm::sse::stream_chunks(
+                resp,
+                crate::llm::resilient::STREAM_IDLE_TIMEOUT,
+                crate::llm::resilient::TOTAL_ATTEMPT_TIMEOUT,
+                &mut on_chunk,
+            )
+            .await?;
         }
         if let Some(ev) = sse.finish()? {
             parser.feed(&ev, &mut sink)?;

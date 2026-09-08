@@ -212,16 +212,14 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
 /// 从 Yolo 返回的文本中解析结构化分类结果。
 ///
 /// 优先匹配 ```json ... ``` 代码块;找不到则尝试匹配最大合法 JSON 对象。
+/// 直接解析失败时自动走 JSON 修复链(`json_repair`,Tier-1 语法修复),
+/// 修复不了仍返回 YoloParse(fail-closed 不变)。
 pub fn parse_classification(text: &str) -> Result<TaskClassification> {
     if let Some(json_str) = extract_json_block(text) {
-        return serde_json::from_str::<TaskClassification>(json_str).map_err(|e| {
-            AgentError::YoloParse(format!("JSON 代码块解析失败: {}", e))
-        });
+        return crate::agent::json_repair::try_parse(json_str).map_err(AgentError::YoloParse);
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        return serde_json::from_str::<TaskClassification>(json_str).map_err(|e| {
-            AgentError::YoloParse(format!("JSON 对象解析失败: {}", e))
-        });
+        return crate::agent::json_repair::try_parse(json_str).map_err(AgentError::YoloParse);
     }
     Err(AgentError::YoloParse(
         "未找到合法的 JSON 分类结果".to_string(),

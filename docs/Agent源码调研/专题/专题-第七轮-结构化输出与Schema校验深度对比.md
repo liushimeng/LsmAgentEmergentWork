@@ -605,7 +605,7 @@ fast-path → repair → partial → extractor → 兜底
 - L6: tool_choice 写死 "auto" → Yolo 分类无法强制
 - L11: Schema 投影未做 → 仅适合当前 6 个手写简单 schema
 - **L16 无 jsonschema 校验**：参数错误只能事后工具报错
-- **L17 无 JSON 修复链**：Yolo JSON 解析失败率显著高于 atomcode
+- **L17 无 JSON 修复链**：Yolo JSON 解析失败率显著高于 atomcode ✅ **已实现(2026-09-08,Tier-1)**:`agent/json_repair.rs`(智能引号/全角标点/单引号/裸控制字符/尾逗号/Python 常量,单遍 O(N) + in_string/escape 状态感知 + 512KB 守卫),接入 Yolo / Main-Work / Quality 三处解析点;修复失败仍 fail-closed。不做截断补全(Quality P0 语义保持)。详见 `专题-laew实现进度对照表.md`
 - **L18 无 partial JSON 流式解析**：长 JSON 中途断流后空对象兜底
 - **L19 Yolo 无结构化输出强制**：靠 prompt + 解析，鲁棒性差
 - **L20 无跨 provider 归一化**：未来接入 Gemini / Moonshot 必然触发 400

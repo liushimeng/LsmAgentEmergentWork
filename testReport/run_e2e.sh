@@ -183,15 +183,17 @@ if anth:
     users = [m for m in msgs if m.get("role") == "user"]
     last_user = _texts(users[-1])[0].strip() if users else ""
     chk(last_user == "请帮我执行一个测试命令", "anthropic: 用户提示词原文独立成条(未与上下文混淆)")
-if len(anth) >= 2:
-    b2 = anth[1]["body"]
-    chk(any(c.get("type") == "tool_result" for m in b2["messages"] for c in m["content"]), "anthropic: 第2次请求含 tool_result 块")
+if anth:
+    # 角色化 mock 后请求序号随角色分流变化,改为扫描:执行循环必须把 tool_result 回填到后续请求
+    chk(any(
+        any(c.get("type") == "tool_result" for m in r["body"]["messages"] for c in m.get("content", []) if isinstance(c, dict))
+        for r in anth), "anthropic: 执行循环请求含 tool_result 块")
 if oai:
     b = oai[0]["body"]
     chk(b["messages"][0]["role"] == "system", "openai: system 转为首条 system 消息")
     chk(any(t.get("type") == "function" and "parameters" in t.get("function", {}) for t in b.get("tools", [])), "openai: tools[].function.parameters")
-if len(oai) >= 2:
-    chk(any(m.get("role") == "tool" for m in oai[1]["body"]["messages"]), "openai: 第2次请求含 role=tool 消息")
+if oai:
+    chk(any(m.get("role") == "tool" for r in oai for m in r["body"]["messages"]), "openai: 执行循环请求含 role=tool 消息")
 
 # --- 请求头校验(User-Agent / Authorization / X-Session-Id) ---
 def non_empty(v): return isinstance(v, str) and v.strip() != ""

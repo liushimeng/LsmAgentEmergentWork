@@ -2039,16 +2039,16 @@ pub async fn sleep_cancellable(delay: Duration, token: &tokio_util::sync::Cancel
 
 | 编号 | gap | 等级 | 参考工程 |
 |------|-----|------|---------|
-| H1 | 无超时设置（connect/read/request） | P0 | claudecode 6 级 |
-| H2 | 无重试机制 | P0 | atomcode 3 次 + 5 类分类 |
-| H3 | 无错误分类（可重试 vs 不可重试） | P0 | atomcode 5 类 |
+| H1 | 无超时设置（connect/read/request） | P0 | claudecode 6 级 ✅ **已实现(2026-09-08)**:connect 10s + SSE idle 90s + 单次尝试总 600s,见 `llm/mod.rs::build_http_client` / `llm/sse.rs::stream_chunks` |
+| H2 | 无重试机制 | P0 | atomcode 3 次 + 5 类分类 ✅ **已实现(2026-09-08)**:`llm/resilient.rs::ResilientLlmClient`(基数 500ms/上限 8s/±25% jitter/最多 3 次重试,Retry-After 优先 60s 封顶) |
+| H3 | 无错误分类（可重试 vs 不可重试） | P0 | atomcode 5 类 ✅ **已实现(2026-09-08)**:`AgentError::LlmHttp/LlmNetwork/LlmStream` + `resilient::is_retryable`(408/425/429/500/502/503/504/529 + 网络类白名单) |
 | H4 | 无连接池调优（idle 超时、最大连接） | P1 | atomcode 15s |
 | H5 | 无代理 3 模式 + loopback 旁路 | P1 | atomcode |
 | H6 | 无 TLS 3 层信任根 | P1 | atomcode |
 | H7 | 无中段流重开 | P1 | atomcode MAX_STREAM_ATTEMPTS=3 |
 | H8 | 无背压控制 | P2 | opencode Channel |
 | H9 | 无取消传播（CancellationToken） | P1 | claudecode WeakRef |
-| H10 | 无 idle 超时 watchdog | P1 | deepseek idleWatchdog |
+| H10 | 无 idle 超时 watchdog | P1 | deepseek idleWatchdog ✅ **已实现(2026-09-08)**:`llm/sse.rs::stream_chunks`(tokio timeout 包裹 chunk 间读取,超时报可重试 `LlmNetwork`) |
 | H11 | 无首包超时 | P2 | openclaw stream-first-event |
 | H12 | 无连接健康检查 | P2 | atomcode stale pool 重建 |
 | H13 | 无熔断器 | P2 | failsafe crate |
