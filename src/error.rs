@@ -39,6 +39,16 @@ pub enum AgentError {
     #[error("达到最大迭代次数({0})仍未得到最终答案")]
     MaxIterationsExceeded(usize),
 
+    /// 连续相同「工具名 + 目标参数」失败次数超过阈值,主动提前终止以避免
+    /// 浪费迭代预算(典型场景:上游 LLM 反复 Read 一个不存在的文件路径)。
+    /// 关联报告: 20260908_203854 D-001。
+    #[error("检测到连续 {attempts} 次相同工具 {tool} 调用失败,已提前终止 (last_error: {last_error})")]
+    RepeatedToolFailure {
+        tool: String,
+        attempts: usize,
+        last_error: String,
+    },
+
     #[error("Yolo 分类解析失败: {0}")]
     YoloParse(String),
 

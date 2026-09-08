@@ -11,6 +11,7 @@
 //!
 //! 设计见 `docs/多Agent架构重构/01-设计与解决方案.md` §3。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -20,6 +21,24 @@ use crate::agent::{Agent, AgentProfile};
 use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Usage};
 use crate::session::Session;
+
+/// 全局 Yolo 解析失败计数器(关联报告: 20260908_203854 D-002)。
+///
+/// 用于跨 Session 观察 Yolo 分类降级频率,供 SessionContext 摘要
+/// 在 `summary()` 中合并「Yolo 降级 N 次」一行,便于人工/自动发现
+/// 系统性上游模型问题。
+static YOLO_PARSE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// 读取 Yolo 解析失败累计次数(供 SessionContext 等调用方合并摘要)。
+pub fn yolo_parse_failures() -> usize {
+    YOLO_PARSE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// 重置计数器(主要给测试使用)。
+#[cfg(test)]
+pub fn reset_yolo_parse_failures() {
+    YOLO_PARSE_FAILURES.store(0, Ordering::Relaxed);
+}
 
 /// 任务难度等级(三档)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -144,6 +163,7 @@ impl YoloRunner {
         }
         let (text, usage) = self.yolo_agent.run_session(&mut yolo_session).await?;
         let classification = parse_classification(&text).unwrap_or_else(|e| {
+            YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("Yolo 分类解析失败,降级为 simple: {}", e);
             TaskClassification {
                 task_level: TaskLevel::Simple,
@@ -179,6 +199,7 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
     let classification = match parse_classification(&text) {
         Ok(c) => c,
         Err(e) => {
+            YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("Yolo 分类解析失败,降级为 simple: {}", e);
             TaskClassification {
                 task_level: TaskLevel::Simple,
@@ -445,5 +466,22 @@ mod tests {
 ```"#;
         let result = parse_classification(json).unwrap();
         assert_eq!(result.user_suggestion_if_fail, "请补充更多信息");
+    }
+
+    #[test]
+    fn yolo_parse_failure_counter_starts_at_zero_and_resets() {
+        // 关联报告: 20260908_203854 D-002
+        // 解析失败时计数器 +1,初始 0,reset 后归零。
+        reset_yolo_parse_failures();
+        assert_eq!(yolo_parse_failures(), 0);
+
+        // 模拟一次失败增加(走静态原子,等价于生产代码路径)
+        YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(yolo_parse_failures(), 1);
+        YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(yolo_parse_failures(), 2);
+
+        reset_yolo_parse_failures();
+        assert_eq!(yolo_parse_failures(), 0);
     }
 }

@@ -62,12 +62,15 @@ impl SessionContextRunner {
              用户输入: {user_prompt}\n\
              Plan 文档: {plan}\n\
              WorkFlow: {wf}\n\
-             用量: input={i}, output={o}\n\n\
-             请按系统提示词中的 Markdown 模板输出 200 字以内的简洁摘要。",
+             用量: input={i}, output={o}\n\
+             Yolo 降级(本进程累计): {yolo_fallback} 次\n\n\
+             请按系统提示词中的 Markdown 模板输出 200 字以内的简洁摘要。\
+             若 Yolo 降级累计 > 0,务必在摘要中以「Yolo 降级 N 次」一行显式记录。",
             plan = plan_doc.map(|p| p.display().to_string()).unwrap_or_else(|| "无".into()),
             wf = workflow_line,
             i = total_usage.input_tokens,
             o = total_usage.output_tokens,
+            yolo_fallback = crate::agent::yolo::yolo_parse_failures(),
         );
 
         let mut sub_session = session::Session::new();

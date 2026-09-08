@@ -85,6 +85,15 @@ impl Agent {
         let mut total_usage = Usage::default();
         let final_text;
 
+        // 关联报告: 20260908_203854 D-001
+        // 连续相同「工具名 + 目标参数」失败的短路过流:当上游 LLM 反复引导同一个
+        // 失败调用(典型表现:幻觉一个不存在的文件路径后持续 Read)时,提前终止避免
+        // 耗尽 max_iterations。命中条件:连续 N(默认 3)次失败且失败键(工具名+稳定
+        // JSON)相同;成功调用或换工具/换目标会立即重置计数。
+        const REPEATED_FAILURE_THRESHOLD: usize = 3;
+        let mut last_fail_key: Option<String> = None;
+        let mut consecutive_failures: usize = 0;
+
         for iter in 0..self.max_iterations {
             info!(iteration = iter, "agent step");
             // 按当前 LLM 协议渲染系统提示词(支持多协议差异化)
@@ -128,6 +137,7 @@ impl Agent {
             session.context_mut().push(ChatMessage::assistant(assistant_blocks));
 
             // 逐个执行工具并把结果回填上下文(失败也作为 tool_result,is_error=true)
+            let mut any_success_this_round = false;
             for call in completion.tool_calls {
                 let name = call.name.clone();
                 let id = call.id.clone();
@@ -135,7 +145,7 @@ impl Agent {
                 info!(tool = %name, "executing tool");
 
                 let (output, is_error) = match self.profile.tools.get(&name) {
-                    Ok(tool) => match tool.execute(args).await {
+                    Ok(tool) => match tool.execute(args.clone()).await {
                         Ok(out) => (out, false),
                         Err(e) => {
                             warn!(tool = %name, error = %e, "tool failed");
@@ -147,10 +157,102 @@ impl Agent {
                     },
                     Err(e) => (format!("{e}"), true),
                 };
-                session.context_mut().push(ChatMessage::tool_result(id, output, is_error));
+                if is_error {
+                    // 失败键:工具名 + 稳定 JSON(对象按 key 排序后序列化)
+                    let fail_key = format!(
+                        "{}|{}",
+                        name,
+                        stable_json_string(&args)
+                    );
+                    if last_fail_key.as_deref() == Some(fail_key.as_str()) {
+                        consecutive_failures += 1;
+                    } else {
+                        last_fail_key = Some(fail_key);
+                        consecutive_failures = 1;
+                    }
+                    if consecutive_failures >= REPEATED_FAILURE_THRESHOLD {
+                        warn!(
+                            tool = %name,
+                            consecutive = consecutive_failures,
+                            "检测到连续相同失败调用,提前终止以避免耗尽迭代"
+                        );
+                        return Err(AgentError::RepeatedToolFailure {
+                            tool: name,
+                            attempts: consecutive_failures,
+                            last_error: output,
+                        });
+                    }
+                } else {
+                    any_success_this_round = true;
+                }
+                session
+                    .context_mut()
+                    .push(ChatMessage::tool_result(id, output, is_error));
+            }
+            if any_success_this_round {
+                // 任一成功调用重置失败计数
+                last_fail_key = None;
+                consecutive_failures = 0;
             }
         }
 
         Err(AgentError::MaxIterationsExceeded(self.max_iterations))
+    }
+}
+
+/// 将 `serde_json::Value` 序列化为「对象 key 排序后的字符串」,作为失败键的稳定摘要。
+/// 顺序无关,LLM 调换参数顺序不触发「不同目标」误判。
+fn stable_json_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let parts: Vec<String> = entries
+                .into_iter()
+                .map(|(k, v)| format!("{}:{}", k, stable_json_string(v)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let parts: Vec<String> = arr.iter().map(stable_json_string).collect();
+            format!("[{}]", parts.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // 关联报告: 20260908_203854 D-001
+    #[test]
+    fn stable_json_string_is_key_order_independent() {
+        let a = json!({"path": "/tmp/missing", "limit": 10});
+        let b = json!({"limit": 10, "path": "/tmp/missing"});
+        assert_eq!(stable_json_string(&a), stable_json_string(&b));
+    }
+
+    #[test]
+    fn stable_json_string_nested_objects() {
+        let a = json!({"outer": {"a": 1, "b": [1, 2, 3]}});
+        let b = json!({"outer": {"b": [1, 2, 3], "a": 1}});
+        assert_eq!(stable_json_string(&a), stable_json_string(&b));
+    }
+
+    #[test]
+    fn stable_json_string_different_values_produce_different_keys() {
+        let a = json!({"path": "/tmp/missing_a"});
+        let b = json!({"path": "/tmp/missing_b"});
+        assert_ne!(stable_json_string(&a), stable_json_string(&b));
+    }
+
+    #[test]
+    fn stable_json_string_arrays_preserve_order() {
+        // 数组按设计保持顺序(LLM 调换数组元素顺序确实代表不同输入)
+        let a = json!({"items": [1, 2, 3]});
+        let b = json!({"items": [3, 2, 1]});
+        assert_ne!(stable_json_string(&a), stable_json_string(&b));
     }
 }

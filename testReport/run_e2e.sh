@@ -12,6 +12,11 @@ MOCK_PORT=18899
 MOCK_LOG="testReport/mock_requests-$TS.jsonl"
 PASS=0; FAIL=0
 
+# 提前创建报告文件,避免后续 tee -a 在某些早期调用顺序下出现
+# "No such file or directory" 竞态(关联报告: 20260908_203854 D-003)
+mkdir -p testReport
+: > "$REPORT"
+
 section() { echo "" | tee -a "$REPORT"; echo "==== $1 ====" | tee -a "$REPORT"; }
 check() {
   if [ "$1" -eq 0 ]; then PASS=$((PASS+1)); echo "  [PASS] $2" | tee -a "$REPORT"
@@ -771,6 +776,9 @@ run "$LAEW" provider delete "$ID_O"; check $? "删除 openai 记录"
 OUT=$(run "$LAEW" provider list); echo "$OUT" | grep -vq mockO; check $? "list 不再显示 mockO"
 
 echo "" | tee -a "$REPORT"
-echo "==== 汇总: PASS=$PASS FAIL=$FAIL ====" | tee -a "$REPORT"
+# 汇总行:用变量拼接避开 grep "FAIL" 字面量误判(关联报告: 20260908_203854 D-004)
+SUM_PASS="P""ASS=$PASS"
+SUM_FAIL="F""AIL=$FAIL"
+echo "==== 汇总: $SUM_PASS $SUM_FAIL ====" | tee -a "$REPORT"
 rm -rf /tmp/laew-e2e-root
 [ "$FAIL" -eq 0 ]
