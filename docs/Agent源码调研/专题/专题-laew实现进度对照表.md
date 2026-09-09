@@ -75,5 +75,33 @@
 5. **L16 schemars 工具参数校验**(工具执行前 fail-fast);
 6. ~~Token 计数 + 上下文自动压缩(第七轮 PromptCaching 专题)~~ ✅ 2026-09-08 第 04 轮已完成(`agent/compact.rs`,方案 `docs/Context设置与自动压缩设计/01-设计与解决方案.md`)。
 
+## 四-十五、第 15 轮新增 gap（L836-L1035，200 个）
+
+> 日期:2026-09-09 | 维度:网络协议深度/编译器前端/OS内核交互/分布式共识/ML推理/形式化验证/图数据库/实时流处理
+
+| 编号范围 | 维度 | 数量 | 状态 |
+|---------|------|------|------|
+| L836-L860 | 网络协议深度 | 25 | ⏳ |
+| L861-L885 | 编译器前端 | 25 | ⏳ |
+| L886-L910 | OS内核交互 | 25 | ⏳ |
+| L911-L935 | 分布式共识 | 25 | ⏳ |
+| L936-L960 | ML推理 | 25 | ⏳ |
+| L961-L985 | 形式化验证 | 25 | ⏳ |
+| L986-L1010 | 图数据库与知识图谱 | 25 | ⏳ |
+| L1011-L1035 | 实时流处理 | 25 | ⏳ |
+
+**P0 紧急(优先实现)**:
+- L836 连接池空闲超时配置 → 抄 atomcode `retry.rs:54` POOL_IDLE_TIMEOUT=15s
+- L838 mTLS 支持 → 抄 claude-code `mtls.ts` 全链路
+- L840 指数退避重试 → 抄 claude-code `withRetry.ts`
+- L843 沙箱 → 抄 deepseek-harness C11 Landlock launcher
+- L861 Tree-sitter 语法解析 → 抄 opencode `tool/shell.ts`
+- L862 LSP JSON-RPC 客户端 → 抄 opencode `lsp/client.ts`
+- L886 Landlock/Seccomp 沙箱 → 抄 deepseek-harness `native/landlock-run`
+- L887 进程树优雅终止 → 抄 openclaw `kill-tree.ts`
+- L888 PTY 终端 → 抄 openclaw `terminal-pty.ts`
+- L961 契约框架 → 抄 atomcode `conformance/` 模块
+
 ---
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 01 轮(LLM 熔断器 H13/L188/L771)。*
+
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 15 轮(8 大新维度 L836-L1035 共 200 个 gap)。*

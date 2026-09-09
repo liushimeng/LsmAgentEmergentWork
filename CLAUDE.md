@@ -207,6 +207,32 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
     8. WebAssembly 沙箱与 WASI（1,362 行 / 46 KB）—— wasmtime Cranelift + Fuel/Epoch 双计量 + WASI Preview 2 完整能力 + WIT + Component Model + 5 大 Agent 用例
     覆盖第十二轮未深入的 8 大新维度。合集见 `专题/专题-第十三轮深挖合集.md`。
 
+  - **2026-09-09 第十四轮**：8 篇全新横向专题（**~9,380 行 / ~385 KB**）：
+    1. 数据库优化与存储引擎（1,119 行 / ~45 KB）—— SQLite WAL 配置总表、openclaw 完整 WAL 生命周期、deepseek zstd 压缩+打包编码、opencode Effect DI 迁移
+    2. 多级缓存架构与性能优化（1,091 行 / ~42 KB）—— claudecode 7 种应用缓存+cache break 检测、undici RFC 9111 HTTP 缓存、deepseek Write-Behind 一致性、atomcode prefix-stability
+    3. 分布式部署与服务发现（1,346 行 / ~55 KB）—— Switchyard Axum+优雅关闭+TLS、OpenClaw Gateway 4 档绑定+Tailscale、ClaudeCode WS 重连策略、AtomCode 信号安全终端恢复
+    4. 安全加固与威胁模型（762 行 / ~30 KB）—— STRIDE 总表、claudecode 22 种 bash 检查+tree-sitter、pi 0o600 文件锁、openclaw 14 种脱敏正则、laew 明文 SQLite
+    5. 插件热加载与动态扩展（1,478 行 / ~62 KB）—— atomcode Marketplace git 驱动、deepseek Cordis 热替换+node:vm 沙箱、opencode Glob+semver、claudecode 43 工具动态加载、pi jiti 虚拟模块
+    6. 错误恢复与容错设计模式（1,149 行 / ~47 KB）—— atomcode 429 所有权分离、claudecode 多策略+持久化重试、undici Symbol 错误码+RetryController 背压、Switchyard Escalation 熔断
+    7. 运行时代码分析与自我优化（1,111 行 / ~44 KB）—— claudecode tree-sitter FAIL-CLOSED、opencode Effect Schema 全栈 DI、atomcode tool_args_repair JSON 修复、Switchyard ClassifierContract
+    8. 跨项目综合模式与架构演进（1,324 行 / ~60 KB）—— 6 大模式×8 项目对照、统一消息模型/工具注册分离/异步优先共性、中间件链+生命周期钩子+状态机+权限策略 = 最具性价比 4 项升级
+    合集见 `专题/专题-第十四轮深挖合集.md`。新增 laew gap: L636-L835（200 个）。
+
+  - **2026-09-09 第十五轮（当前最新）**：7 份工程深度分析 + 8 篇横向对比专题（**~7,000+ 行 / ~300 KB**）：
+    1. 网络协议深度（480 行）—— HTTP/2多路复用(undici独占)、WebSocket帧协议(claude-code状态机/openclaw帧协议/pi CBOR帧)、TLS握手与mTLS(atomcode三层版本策略/claude-code mTLS全链路/openclaw指纹pinning)、连接池管理(atomcode 15s空闲超时/claude-code池毒化/undici 4种池+SWRR)、SSE流式解析、DNS钉扎与SSRF防护(deepseek-harness独占)、指数退避重试
+    2. 编译器前端（603 行）—— claude-code 4436行纯TS Bash Lexer(15种Token类型)、deepseek-harness Typert 3142行analyzer+编译器无关TypeGraph模型、opencode LSP JSON-RPC完整客户端(651行)+多Server按需启动、atomcode tree-sitter 17种语言代码图、pi TypeBox Schema验证+CBOR严格子集
+    3. 操作系统内核交互（454 行）—— deepseek-harness自研C11 Landlock launcher(296行)+多平台沙箱链(bwrap/landbelt/Windows ACL)、atomcode信号安全恢复(raw sigaction+async-signal-safe)、openclaw进程树优雅终止+PTY终端+Docker/Podman容器、opencode PTY伪终端封装(ConPTY)+ChildProcess detached进程组
+    4. 分布式共识（501 行）—— 7工程无一实现经典Raft/Paxos/Gossip、pi Delta CRDT(1268行)+proper-lockfile+JSONL事务日志、openclaw/opencode/pi三工程实现事件溯源(形态各异)、openclaw SubAgent注册表+重启恢复+Swarm FIFO调度
+    5. 机器学习推理（489 行）—— 本地推理全零格局(仅atomcode Ollama和openclaw TTS回退)、推理优化三范式(客户端侧精算/Provider侧感知/可用性优化)、pi/opencode 15+ Provider统一Route抽象、pi唯一实现JSON Schema Strict+Grammar约束采样、deepseek-harness KV Cache对齐compaction
+    6. 形式化验证（~450 行）—— 7工程全部无TLA+/Coq/Lean/模型检测、atomcode可执行契约符合性框架(conformance/)最接近形式化验证、claudecode fail-closed安全验证最严密、undici fast-check属性测试唯一P1优先级、opencode Schema驱动Secret检测P0紧急
+    7. 图数据库与知识图谱（321 行）—— 7工程全部无Neo4j/RDF/SPARQL、atomcode CodeGraph(12节点+5边+双向邻接表)+BFS+最短路径唯一完整实现、opencode LSP Call Hierarchy图遍历、claude-code teamMemorySync领先
+    8. 实时流处理（568 行）—— 无工程实现Kafka/Flink集成、opencode流处理最完整(GlobalBus+Event Sourcing+StreamTransport+Tool Call状态机)、atomcode流重建契约独树一帜、undici底层流控最深(HTTP/2流级背压+WebSocket帧状态机+SendQueue双路径)
+    合集见 `专题/专题-第十五轮深挖合集.md`。新增 laew gap: L836-L1035（200 个）。
+    - **P0 紧急（~30 项）**：无连接池空闲超时 / 无mTLS / 无指数退避重试 / 无Landlock沙箱 / 无Tree-sitter / 无LSP客户端 / 无进程树优雅终止 / 无PTY终端 / 无契约框架 / 无图数据库 / 无知识图谱 / 无向量检索 等
+    - **P1 重要（~100 项）**：无TLS指纹Pinning / 无WebSocket帧协议 / 无SSE严格解析 / 无DNS钉扎 / 无fail-closed AST Walker / 无代码图索引 / 无事件溯源 / 无属性测试 等
+    - **P2 进阶（~70 项）**：无HTTP/3 QUIC / 无Raft/Paxos / 无ONNX/TensorRT / 无TLA+/Coq / 无Neo4j / 无Kafka/Flink 等
+    - **推荐 Rust crate**：`reqwest`+`hyper`+`native-tls` / `tree-sitter`+`tree-sitter-bash`+`lsp-types`+`tower-lsp` / `landlock`+`seccompiler`+`cgroups-rs`+`io-uring` / `openraft`+`serde_cbor` / `ollama-rs`+`llama-cpp-2`+`ort` / `proptest`+`quickcheck` / `neo4rs`+`faiss-rs`+`petgraph` / `tokio-stream`+`rdkafka`
+
   - **第十一轮（历史归档）**：8 篇全新横向专题（~30k 行）：Agent 协作与多 Agent 通信协议 / 流式输出与上下文窗口管理 / 错误处理与重试退避与熔断器 / 测试体系与 Eval 基建与录制回放 / 配置系统与多环境管理 / 插件生态与扩展分发与 Hook 系统 / 协议流式翻译与决策溯源与可观测性 / 系统提示词工程与模型适配。合集见 `专题/专题-第十一轮深挖合集.md`。新增 laew gap: L143-L280（138 个）。
   - **第十二轮（历史归档）**：8 篇全新横向专题（~17k 行）：HTTP 客户端连接池重试多路复用与代理链 / 安全防御体系与 Prompt 注入防护与密钥管理 / 模型路由与负载均衡与故障转移 / 数据迁移与版本演进与 Schema 兼容性 / 性能优化与多级缓存与内存管理 / 日志采样与聚合与结构化日志管道 / CLI 框架与命令分发与自动补全 / 状态持久化与序列化与快照恢复。合集见 `专题/专题-第十二轮深挖合集.md`。新增 laew gap: L281-L403（123 个）。
     - **P0 紧急**：无 HTTP 超时设置 / 无重试退避 / 无熔断器 / 无 OAuth PKCE / 无 Keychain 凭证管理 / 无 SQLite 迁移系统（无 SCHEMA_VERSION）/ 无结构化日志（仍 println!）/ 无 API Key 日志脱敏 / 无 SSRF 防护 / 无 Shell 自动补全 / 无 Schema 版本管理 / 无 Writer Lease 乐观锁 / 无 8 种路由算法 / 无熔断器三态 / 无应用层 LRU / 无 SQLite WAL 模式。
@@ -229,7 +255,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
     - **关键修正**：atomcode 已实现 Ollama 集成 1170 行（NDJSON decoder + tool_call id 合成）；jiuwenswarm JiuwenBox 5 层沙箱（Landlock FFI 296 + Seccomp BPF 336 + cgroup 528 + bwrap 503 + daemon 2719）；Switchyard PyO3 + pyo3-asyncio 工业级跨语言桥；openclaw 自研 CDP/Playwright 双栈 6300+ 行。
     - **推荐 Rust crate**：`ollama-rs`+`llama-cpp-2`+`candle-core`+`landlock`+`seccompiler`+`cgroups-rs`+`aya`+`wasmtime`+`wasmtime-wasi`+`extism`+`wit-bindgen`+`schemars`+`minijinja`+`pest`+`tower-lsp`+`statig`+`mockito`+`proptest`+`criterion`+`headless_chrome`+`radix_trie`。
 
-  - 覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议/中断取消/工具结果回填/协议 wire 真实实现/SubAgent 并发/Goal 状态机/TUI 渲染管线/Hook 拦截器/Skill 一等公民/Effect DI 拓扑/CBOR 二进制帧/Lane 三队列/WriterLease fence/文件编辑补丁/代码检索/Git checkpoint/Bash PTY/多模态/PromptCaching/Schema 校验/Web 检索/Telemetry/Session 持久化/Tool 权限沙箱/LSP/IDE 集成/Skill Workshop/多租户团队记忆/终端控制序列/CrashDump/WebUI/OAuth/i18n/Release/WebSocket/容器化/CRDT/Agent协作/流式输出/错误处理/测试体系/配置系统/插件生态/协议翻译/系统提示词/模型路由/负载均衡/故障转移/熔断器/健康检查/配额限流/多区域部署/路由算法/Provider抽象/连接池/重试退避/HTTP2多路复用/代理链/TLS配置/拦截器/超时取消/连接健康检查/性能优化 等 **82+ 维度**。
+  - 覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议/中断取消/工具结果回填/协议 wire 真实实现/SubAgent 并发/Goal 状态机/TUI 渲染管线/Hook 拦截器/Skill 一等公民/Effect DI 拓扑/CBOR 二进制帧/Lane 三队列/WriterLease fence/文件编辑补丁/代码检索/Git checkpoint/Bash PTY/多模态/PromptCaching/Schema 校验/Web 检索/Telemetry/Session 持久化/Tool 权限沙箱/LSP/IDE 集成/Skill Workshop/多租户团队记忆/终端控制序列/CrashDump/WebUI/OAuth/i18n/Release/WebSocket/容器化/CRDT/Agent协作/流式输出/错误处理/测试体系/配置系统/插件生态/协议翻译/系统提示词/模型路由/负载均衡/故障转移/熔断器/健康检查/配额限流/多区域部署/路由算法/Provider抽象/连接池/重试退避/HTTP2多路复用/代理链/TLS配置/拦截器/超时取消/连接健康检查/性能优化 等 **90+ 维度**（第15轮新增：网络协议深度/编译器前端/OS内核交互/分布式共识/ML推理/形式化验证/图数据库/实时流处理）。
 
   **15 份 Agent 综合文档**（每份合并了源码调研/深度分析/核心机制/第二轮/第三轮/第四轮共 3-8 轮内容，去重压缩 50-90%）：
   | 文件 | 语言/技术 | 核心亮点 | 行数 |
