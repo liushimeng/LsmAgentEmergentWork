@@ -114,8 +114,9 @@
 | 编号范围 | 维度 | 数量 | 状态 |
 |---------|------|------|------|
 | L1036-L1040 | 多轮对话恢复（七阶段管线/三级恢复×2/后台记忆） | 5 | ⏳ |
-| L1041-L1043 | SQLite 全栈（WAL/完整性/租约） | 3 | ⏳ |
-| L1044-L1045 | 溢出检测与重试策略 | 2 | ⏳ |
+| L1041-L1042 | SQLite 全栈（WAL/完整性） | 2 | ✅ |
+| L1043 | SQLite 跨进程租约 | 1 | ⛔ 决策不做(单用户单进程 CLI,无多进程形态;WAL+busy_timeout 已覆盖进程内并发) |
+| L1044-L1045 | 溢出检测与重试策略 | 2 | ✅(L1044 第 06 轮;L1045 随 09-08 第 03 轮 resilient.rs,第 07 轮勘误) |
 | L1046-L1047 | LLM 协议栈（Route 五层/Cache Policy） | 2 | ⏳ |
 | L1048 | 反应式 IoC（Cordis Epoch） | 1 | ⏳ |
 | L1049-L1050 | 实时同步与单飞准入 | 2 | ⏳ |
@@ -131,15 +132,15 @@
 - L1037 max_output_tokens 三级恢复 → 抄 claudecode `query.ts:1186`(截断续接已于 2026-09-08 第 06 轮实现,差 max_tokens 静默升级 8k→64k)
 - ~~L1038 prompt-too-long 三级恢复~~ ✅ 2026-09-09 第 06 轮已完成(`src/agent/overflow.rs`,方案 `tmpPlan/2026-09-09_06-上下文溢出自动检测与三级恢复方案.md`)
 - L1039 cached microcompact → 抄 claudecode `microCompact.ts`
-- L1041 SQLite WAL 配置 → 抄 openclaw `infra/sqlite-wal.ts`
-- L1042 SQLite 完整性检测 → 抄 openclaw `infra/sqlite-integrity.ts`
-- L1043 跨进程租约协调 → 抄 openclaw `state/openclaw-state-lease.ts`
+- ~~L1041 SQLite WAL 配置~~ ✅ 2026-09-09 第 07 轮已完成(`src/database/pragmas.rs` apply_pragmas:WAL/busy_timeout 5s/synchronous=NORMAL/cache 8MB/FK/启动 PASSIVE checkpoint;`Db::open`/`Db::clone` 共用工厂,clone 连接 PRAGMA 一致——修复并行 SubAgent 写 agent_memory `database is locked`;WAL 读回验证不支持时降级 rollback journal,方案 `tmpPlan/2026-09-09_07-SQLite并发WAL加固与完整性自愈方案.md`)
+- ~~L1042 SQLite 完整性检测~~ ✅ 2026-09-09 第 07 轮已完成(`try_open_and_check` 三态:quick_check 报损坏/SQLITE_NOTADB(26)/CORRUPT(11) → 隔离 `{db}.corrupt-{时间戳}.bak` + 重建空库 fail-open;瞬态锁冲突不隔离防误报毁数据)
+- ~~L1043 跨进程租约协调~~ ⛔ 2026-09-09 第 07 轮决策不做:laew 是单用户单进程 CLI,无多进程部署形态;WAL+busy_timeout 已覆盖进程内多连接并发,openclaw 式 SharedArrayBuffer 心跳租约对 CLI 属过度设计
 - ~~L1044 上下文溢出检测~~ ✅ 2026-09-09 第 06 轮已完成(与 L1038 同轮,15+ 溢出正则 + NON_OVERFLOW 排除集;pi 的静默溢出检测 usage.input > contextWindow 事前预防未做,留作下一轮候选)
-- L1045 provider 重试策略 → 抄 pi `ai/utils/retry.ts`(H2/H3/H13 重试+分类+熔断已实现,差指数退避 jitter)
+- ~~L1045 provider 重试策略~~ ✅ 实际已于 2026-09-08 第 03 轮随 `llm/resilient.rs` 完成(指数退避基数 500ms/倍数 2/上限 8s/±25% jitter/墙钟纳秒种子;账本原「差 jitter」描述过时,第 07 轮勘误)
 - L1046 Route 五层抽象 → 抄 opencode `llm/src/route/client.ts`
 - L1047 Cache Policy 自动注入 → 抄 opencode `llm/src/cache-policy.ts`
 - L1048 反应式 IoC → 抄 deepseek-harness `vendor/cordis/src/fiber.ts`
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 06 轮(上下文溢出自动检测与三级恢复 L1038+L1044),此前:第 05 轮(SubAgent 执行轨迹)、第 16 轮(130+ 个新 gap,L1-L1165+)。*
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 07 轮(SQLite 并发 WAL 加固与完整性自愈 L1041+L1042,L1043 决策不做,L1045 勘误),此前:第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*

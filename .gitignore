@@ -10,6 +10,8 @@
 *.db-journal
 *.db-wal
 *.db-shm
+# SQLite 损坏自愈的隔离备份(L1042)
+*.corrupt-*.bak
 
 # tmpPlan(临时计划,不入库)
 tmpPlan/

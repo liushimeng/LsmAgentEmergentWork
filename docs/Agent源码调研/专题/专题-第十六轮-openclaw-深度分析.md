@@ -103,9 +103,9 @@ SharedArrayBuffer + Atomics
 
 | 编号 | 维度 | 描述 | 优先级 |
 |------|------|------|--------|
-| L1041 | SQLite | 无 WAL 配置 | P0 |
-| L1042 | SQLite | 无完整性检测与自动修复 | P0 |
-| L1043 | 租约 | 无跨进程 SQLite 租约协调 | P0 |
+| L1041 | SQLite | 无 WAL 配置 | P0 ✅ 已实现(2026-09-09 第 07 轮,`src/database/pragmas.rs`) |
+| L1042 | SQLite | 无完整性检测与自动修复 | P0 ✅ 已实现(2026-09-09 第 07 轮,`src/database/mod.rs::try_open_and_check` + 损坏隔离重建) |
+| L1043 | 租约 | 无跨进程 SQLite 租约协调 | P0 ⛔ 决策不做(单用户单进程 CLI,无多进程形态;WAL+busy_timeout 已覆盖) |
 | L1061 | 内存加密 | 无 AES-256-GCM 内存加密 | P1 |
 | L1062 | SQLite | 无 Post-Commit 事务 | P1 |
 | L1063 | SQLite | 无只读快照 + TOCTOU 保护 | P1 |
