@@ -104,4 +104,39 @@
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 15 轮(8 大新维度 L836-L1035 共 200 个 gap)。*
+## 四-十六、第 16 轮新增 gap（L1036-L1165+，130+ 个）
+
+> 日期:2026-09-09 | 维度:多轮对话恢复/压缩管线/内存加密/SQLite全栈/Hook系统/租约引擎/反应式IoC/LLM协议栈/扩展加载/录制回放
+
+| 编号范围 | 维度 | 数量 | 状态 |
+|---------|------|------|------|
+| L1036-L1040 | 多轮对话恢复（七阶段管线/三级恢复×2/后台记忆） | 5 | ⏳ |
+| L1041-L1043 | SQLite 全栈（WAL/完整性/租约） | 3 | ⏳ |
+| L1044-L1045 | 溢出检测与重试策略 | 2 | ⏳ |
+| L1046-L1047 | LLM 协议栈（Route 五层/Cache Policy） | 2 | ⏳ |
+| L1048 | 反应式 IoC（Cordis Epoch） | 1 | ⏳ |
+| L1049-L1050 | 实时同步与单飞准入 | 2 | ⏳ |
+| L1051-L1065 | 权限/工具/压缩/记忆/MCP/Skill | 15 | ⏳ |
+| L1066-L1082 | 内存加密/SQLite 12模块/Hook 14699行/租约 | 17 | ⏳ |
+| L1083-L1094 | 缓存分析/HTTP/Provider/信任/扩展/OAuth | 12 | ⏳ |
+| L1095-L1110 | 事件/状态机/Worker/脚本/SubAgent | 16 | ⏳ |
+| L1111-L1120 | HTTP 缓存/SSE/multipart/WebSocket/AbortSignal | 10 | ⏳ |
+| L1121-L1130+ | 协议/编译/状态持久化/工具安全 | 15+ | ⏳ |
+
+**P0 紧急(优先实现)**:
+- L1036 七阶段上下文管线 → 抄 claudecode `query.ts`
+- L1037 max_output_tokens 三级恢复 → 抄 claudecode `query.ts:1186`
+- L1038 prompt-too-long 三级恢复 → 抄 claudecode `query.ts:1062`
+- L1039 cached microcompact → 抄 claudecode `microCompact.ts`
+- L1041 SQLite WAL 配置 → 抄 openclaw `infra/sqlite-wal.ts`
+- L1042 SQLite 完整性检测 → 抄 openclaw `infra/sqlite-integrity.ts`
+- L1043 跨进程租约协调 → 抄 openclaw `state/openclaw-state-lease.ts`
+- L1044 上下文溢出检测 → 抄 pi `ai/utils/overflow.ts`
+- L1045 provider 重试策略 → 抄 pi `ai/utils/retry.ts`
+- L1046 Route 五层抽象 → 抄 opencode `llm/src/route/client.ts`
+- L1047 Cache Policy 自动注入 → 抄 opencode `llm/src/cache-policy.ts`
+- L1048 反应式 IoC → 抄 deepseek-harness `vendor/cordis/src/fiber.ts`
+
+---
+
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 16 轮(130+ 个新 gap，累计 L1-L1165+)。*
