@@ -27,38 +27,69 @@ const VERSION_INFO: &str = concat!(
     bin_name = "laew",
     version = VERSION_INFO,
     about = "LsmAgentEmergentWork - LLM Agent CLI",
-    long_about = None,
+    long_about = "LsmAgentEmergentWork (laew) 是由 LLM 驱动的 Rust Agent CLI。\n\
+                  支持 Anthropic / OpenAI 双协议、多 Agent 协作(6 角色 + 三档难度)、\n\
+                  TUI 多轮对话、单轮 -p / -f 文件模式。",
+    after_help = "EXAMPLES:\n  \
+                  # 跑一条单轮任务:\n    \
+                  laew -p \"用一句话解释 Rust 所有权\"\n  \
+                  \n  # 从文件读取提示词:\n    \
+                  laew -f /path/to/prompt.md\n  \
+                  \n  # 新增/列出/切换/删除 Provider:\n    \
+                  laew provider add --protocol anthropic --provider-name anthropic --model-name claude-3-5-sonnet --end-point https://api.anthropic.com --api-key sk-ant-xxx\n    \
+                  laew provider list\n    \
+                  laew provider use 3\n    \
+                  laew provider delete 5\n  \
+                  \n  # 调试模式(任务结束后生成 Debug 报告):\n    \
+                  laew -debug -p \"...\"\n  \
+                  \n文档: docs/工程初始化方案/ 与 docs/TUI界面与CLI渲染引擎/",
     disable_help_subcommand = false
 )]
 struct Cli {
-    /// 单轮任务提示词(不进入 TUI)
+    /// 单轮任务提示词(不进入 TUI);与 -f 互斥
     #[arg(
         short = 'p',
         long = "prompt",
         value_name = "TEXT",
-        conflicts_with = "file"
+        conflicts_with = "file",
+        help_heading = "输入来源"
     )]
     prompt: Option<String>,
 
-    /// 从文件读取提示词(支持绝对路径和相对路径,与 -p 互斥)
-    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    /// 从文件读取提示词(支持绝对/相对路径);与 -p 互斥
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "PATH",
+        help_heading = "输入来源"
+    )]
     file: Option<PathBuf>,
 
-    /// 从 JSON 配置文件批量导入 Provider(支持绝对路径和相对路径)
-    #[arg(long = "inprovider", value_name = "PATH", conflicts_with_all = ["prompt", "file", "outprovider"])]
+    /// 从 JSON 配置文件批量导入 Provider(支持单条/多条数组,也支持 -inprovider 单横线写法)
+    #[arg(
+        long = "inprovider",
+        value_name = "PATH",
+        conflicts_with_all = ["prompt", "file", "outprovider"],
+        help_heading = "输入来源"
+    )]
     inprovider: Option<PathBuf>,
 
-    /// 导出所有 Provider 到 JSON 配置文件(支持绝对路径和相对路径)
-    #[arg(long = "outprovider", value_name = "PATH", conflicts_with_all = ["prompt", "file", "inprovider"])]
+    /// 导出所有 Provider 到 JSON 配置文件(也支持 -outprovider 单横线写法)
+    #[arg(
+        long = "outprovider",
+        value_name = "PATH",
+        conflicts_with_all = ["prompt", "file", "inprovider"],
+        help_heading = "输入来源"
+    )]
     outprovider: Option<PathBuf>,
 
-    /// 最大 Agent 迭代次数
-    #[arg(long, default_value_t = 16, global = true)]
+    /// 最大 Agent 迭代次数(防止工具循环)
+    #[arg(long, default_value_t = 16, global = true, help_heading = "运行调优")]
     max_iterations: usize,
 
     /// 调试模式:采集各 Agent 输入/输出/性能/质量,任务结束后由 Debug Agent 评估,
-    /// 报告写入根目录 DebugReport/(也支持 `-debug` 写法)
-    #[arg(long = "debug", global = true)]
+    /// 报告写入根目录 DebugReport/(也支持 `-debug` 单横线写法)
+    #[arg(long = "debug", global = true, help_heading = "运行调优")]
     debug: bool,
 
     #[command(subcommand)]
@@ -73,24 +104,41 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(after_help = "EXAMPLES:\n  \
+                  # Anthropic 官方接入:\n    \
+                  laew provider add --protocol anthropic --provider-name anthropic \\\n      \
+                    --model-name claude-3-5-sonnet-20241022 \\\n      \
+                    --end-point https://api.anthropic.com --api-key sk-ant-xxx\n  \
+                  \n  # OpenAI 官方接入:\n    \
+                  laew provider add --protocol openai --provider-name openai \\\n      \
+                    --model-name gpt-4o --end-point https://api.openai.com --api-key sk-xxx\n  \
+                  \n  # 自定义上下文上限(200K Token):\n    \
+                  laew provider add --protocol anthropic --provider-name x \\\n      \
+                    --model-name y --end-point https://example.com --api-key sk-z \\\n      \
+                    --context-max-size 200K")]
 enum ProviderCmd {
     /// 新增一条接入记录(若库为空则自动激活)
     Add {
+        /// 协议类型: anthropic 或 openai
         #[arg(long, value_parser = parse_protocol)]
         protocol: Protocol,
+        /// 自定义接入名(如 anthropic / openai / moonshot 等)
         #[arg(long)]
         provider_name: String,
+        /// 模型名(如 claude-3-5-sonnet-20241022 / gpt-4o)
         #[arg(long)]
         model_name: String,
+        /// 端点 URL(Anthropic 不要带 /v1/messages;OpenAI 不要带 /chat/completions;尾部 / 自动裁剪)
         #[arg(long)]
         end_point: String,
+        /// API Key(可含 sk- 前缀;落库已脱敏,仅末尾 4 位可见)
         #[arg(long)]
         api_key: String,
         /// 上下文最大 Token 数(默认 800K;支持 800000/800K/1M 写法;0 = 不限制,关闭自动压缩)
         #[arg(long, value_parser = parse_context_size)]
         context_max_size: Option<u64>,
     },
-    /// 列出全部接入记录
+    /// 列出全部接入记录(标记当前激活项)
     List,
     /// 把指定 id 设为当前使用
     Use { id: i64 },
