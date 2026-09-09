@@ -292,7 +292,8 @@ pub fn is_protected(m: &ChatMessage) -> bool {
 }
 
 /// 把消息列表渲染为纯文本(喂给 Compact Agent)。
-fn render_messages(messages: &[ChatMessage]) -> String {
+/// `pub(crate)`:溢出恢复折叠(`overflow::fold_history`)复用同一渲染语义。
+pub(crate) fn render_messages(messages: &[ChatMessage]) -> String {
     let mut out = String::new();
     for m in messages {
         let role = match m.role {
@@ -322,7 +323,8 @@ fn render_messages(messages: &[ChatMessage]) -> String {
 }
 
 /// 降级:本地硬截断(每条渲染行保留前 200 + 后 100 字符),再按档位目标整体截断。
-fn hard_truncate(rendered: &str, tier: CompactTier) -> String {
+/// `pub(crate)`:溢出恢复折叠(`overflow::fold_history`)复用同一截断语义。
+pub(crate) fn hard_truncate(rendered: &str, tier: CompactTier) -> String {
     let mut out = String::new();
     for line in rendered.lines() {
         let n = line.chars().count();

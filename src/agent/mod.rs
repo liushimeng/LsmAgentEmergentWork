@@ -19,6 +19,7 @@ pub mod json_repair;
 pub mod main_work;
 pub mod memory;
 pub mod orchestrator;
+pub mod overflow;
 pub mod permissions;
 pub mod plan;
 pub mod profile;
@@ -50,6 +51,12 @@ const DEFAULT_MAX_ITERATIONS: usize = 16;
 /// `"length"` OpenAI),自动注入 nudge 消息让模型从断点继续,最多续接此数值次。
 const DEFAULT_MAX_TRUNCATION_RESUME: usize = 4;
 
+/// 默认最大上下文溢出恢复次数(对齐截断续接的有界设计)。
+///
+/// 当 LLM 返回 prompt-too-long 类溢出错误时,自动执行「排水 → 折叠」两级本地
+/// 恢复后重试;全会话累计恢复不超过此值,防止恢复与溢出之间打转。
+const DEFAULT_MAX_OVERFLOW_RECOVERIES: usize = 4;
+
 /// 一个可运行的 Agent 实例。
 ///
 /// 持有 [`AgentProfile`](profile::AgentProfile)(名称 / 系统提示词 / 工具集),
@@ -60,6 +67,8 @@ pub struct Agent {
     max_iterations: usize,
     /// 最大截断续接次数(输出被 token 上限截断时自动续接的上限)。
     max_truncation_resume: usize,
+    /// 最大上下文溢出恢复次数(排水/折叠重试的全会话预算)。
+    max_overflow_recoveries: usize,
 }
 
 impl Agent {
@@ -69,6 +78,7 @@ impl Agent {
             profile,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_truncation_resume: DEFAULT_MAX_TRUNCATION_RESUME,
+            max_overflow_recoveries: DEFAULT_MAX_OVERFLOW_RECOVERIES,
         }
     }
 
@@ -83,10 +93,17 @@ impl Agent {
         self
     }
 
+    /// 设置最大上下文溢出恢复次数(测试 / 特殊场景用)。
+    pub fn with_max_overflow_recoveries(mut self, n: usize) -> Self {
+        self.max_overflow_recoveries = n;
+        self
+    }
+
     pub fn llm(&self) -> Arc<dyn LlmClient> { self.llm.clone() }
     pub fn profile(&self) -> &AgentProfile { &self.profile }
     pub fn max_iterations(&self) -> usize { self.max_iterations }
     pub fn max_truncation_resume(&self) -> usize { self.max_truncation_resume }
+    pub fn max_overflow_recoveries(&self) -> usize { self.max_overflow_recoveries }
 
     /// 单轮任务:传入用户提示,返回最终文本、本次累计 token 用量与执行轨迹。
     pub async fn run_once(
@@ -180,29 +197,12 @@ impl Agent {
                 }
             }
             info!(iteration = iter, "agent step");
-            // 按当前 LLM 协议渲染系统提示词(支持多协议差异化)
-            let system = self.profile.system_prompt.render(self.llm.protocol());
-            // None = 取消命中(completion 未返回,本轮无新 tool_use;
-            // 借用约束:select 分支 future 持有 session 不可变借用,backfill 需在 select 外做)
-            let completion: Option<Completion> = match cancel {
-                Some(token) => tokio::select! {
-                    biased;
-                    _ = token.cancelled() => None,
-                    r = self.llm.complete(&system, session.context(), &tool_defs, &meta) => Some(r?),
-                },
-                None => Some(
-                    self.llm
-                        .complete(&system, session.context(), &tool_defs, &meta)
-                        .await?,
-                ),
-            };
-            let completion: Completion = match completion {
-                Some(c) => c,
-                None => {
-                    backfill_cancelled_tool_results(session.context_mut());
-                    return Err(AgentError::Cancelled);
-                }
-            };
+            // 上下文溢出自动恢复(L1038/L1044,2026-09-09 第 06 轮):
+            // LLM 调用命中 prompt-too-long 类溢出错误时,自动执行
+            // 排水(Level 1)→ 折叠(Level 2)→ 重试;两轮无效则上抛(三级暴露)。
+            let completion: Completion = self
+                .complete_with_overflow_recovery(session, cancel, &tool_defs, &meta, &mut trace)
+                .await?;
 
             // 累计 usage
             total_usage.input_tokens = total_usage.input_tokens.saturating_add(completion.usage.input_tokens);
@@ -407,6 +407,103 @@ impl Agent {
         }
 
         Err(AgentError::MaxIterationsExceeded(self.max_iterations))
+    }
+
+    /// 单次 LLM 调用 + 上下文溢出三级恢复(L1038/L1044,第 06 轮)。
+    ///
+    /// 溢出错误(`prompt is too long` / `context_length_exceeded` 类 400)时:
+    /// - Level 1 排水:截短超长 tool_result 后**立即重试**(本次调用内,不消耗
+    ///   `max_iterations` 预算);
+    /// - Level 2 折叠:排水无效时把非保护段历史合并为压缩摘要后重试;
+    /// - Level 3 暴露:两轮无效 / 全会话恢复预算(`max_overflow_recoveries`)用完
+    ///   → 原错误上抛,进入既有 Yolo 失败回流。
+    ///
+    /// 每次调用最多尝试 1 次排水 + 1 次折叠(跨循环迭代重新武装,新的大工具
+    /// 结果可再次排水);取消语义不变(select 命中即 backfill + `Err(Cancelled)`)。
+    async fn complete_with_overflow_recovery(
+        &self,
+        session: &mut Session,
+        cancel: Option<&CancelToken>,
+        tool_defs: &[crate::llm::ToolDef],
+        meta: &RequestMeta,
+        trace: &mut ExecutionTrace,
+    ) -> Result<Completion> {
+        // 按当前 LLM 协议渲染系统提示词(支持多协议差异化)
+        let system = self.profile.system_prompt.render(self.llm.protocol());
+        // 本次调用内的恢复档位状态(排水 / 折叠各最多尝试一次)
+        let mut drained = false;
+        let mut folded = false;
+        loop {
+            // None = 取消命中(completion 未返回,本轮无新 tool_use;
+            // 借用约束:select 分支 future 持有 session 不可变借用,backfill 需在 select 外做)
+            let outcome: Option<Result<Completion>> = match cancel {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    r = self.llm.complete(&system, session.context(), tool_defs, meta) => Some(r),
+                },
+                None => Some(
+                    self.llm
+                        .complete(&system, session.context(), tool_defs, meta)
+                        .await,
+                ),
+            };
+            let result = match outcome {
+                Some(r) => r,
+                None => {
+                    backfill_cancelled_tool_results(session.context_mut());
+                    return Err(AgentError::Cancelled);
+                }
+            };
+            let completion = match result {
+                Ok(c) => return Ok(c),
+                Err(e) => e,
+            };
+
+            // 非溢出错误 / 恢复预算已用完 → 原样上抛
+            if !overflow::is_context_overflow(&completion)
+                || trace.overflow_recoveries >= self.max_overflow_recoveries
+            {
+                return Err(completion);
+            }
+            // Level 1 排水(尚未尝试过且确有可排水内容)
+            let action = if !drained {
+                drained = true;
+                let n = overflow::drain_tool_results(session.context_mut());
+                (n > 0).then(|| format!("排水:截短 {n} 个超长工具结果"))
+            } else {
+                None
+            };
+            // Level 2 折叠(排水无效 / 已排水过)
+            let action = match action {
+                Some(desc) => Some(desc),
+                None if !folded => {
+                    folded = true;
+                    overflow::fold_history(session)
+                        .map(|n| format!("折叠:合并 {n} 条历史消息为压缩摘要"))
+                }
+                None => None,
+            };
+            match action {
+                Some(desc) => {
+                    trace.overflow_recoveries += 1;
+                    warn!(
+                        recoveries = trace.overflow_recoveries,
+                        action = %desc,
+                        error = %completion,
+                        "上下文溢出,本地恢复后重试"
+                    );
+                    continue; // 恢复后立即重试(同一次调用内的内部重试)
+                }
+                None => {
+                    warn!(
+                        error = %completion,
+                        "上下文溢出且本地恢复手段已穷尽,上抛错误(三级暴露)"
+                    );
+                    return Err(completion);
+                }
+            }
+        }
     }
 
     /// 同步填充 trace 的输出字节数与失败信号后返回 Ok 三元组
@@ -880,5 +977,204 @@ mod tests {
             "混合场景不应触发无文本收敛短路,实际 reason={}",
             trace.early_terminate_reason
         );
+    }
+
+    // ========== 上下文溢出三级恢复(第 06 轮,方案 tmpPlan/2026-09-09_06) ==========
+
+    /// 预置一条超长 tool_result 的会话(模拟上一轮循环产生的大工具输出)。
+    fn session_with_fat_tool_result(fat_chars: usize) -> Session {
+        let mut s = Session::new();
+        s.context_mut().push(ChatMessage::user("跑个大命令"));
+        s.context_mut()
+            .push(ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t-fat".into(),
+                name: "Bash".into(),
+                input: json!({"command": "seq 1 5000"}),
+            }]));
+        s.context_mut().push(ChatMessage::tool_result(
+            "t-fat",
+            "x".repeat(fat_chars),
+            false,
+        ));
+        s
+    }
+
+    fn overflow_err() -> AgentError {
+        AgentError::LlmHttp {
+            status: 400,
+            retry_after_ms: None,
+            message: "HTTP 400: {\"error\":{\"message\":\"This model's maximum context length is 8192 tokens. However, your messages resulted in 54321 tokens\",\"code\":\"context_length_exceeded\"}}".into(),
+        }
+    }
+
+    /// 第 1 次返回溢出 400,之后返回最终文本(验证排水后重试成功)。
+    struct OverflowOnceLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for OverflowOnceLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(overflow_err())
+            } else {
+                Ok(Completion {
+                    text: "溢出恢复后成功".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                })
+            }
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_recovers_via_drain_and_retries() {
+        let agent = Agent::new(
+            std::sync::Arc::new(OverflowOnceLlm {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = session_with_fat_tool_result(20_000);
+        let (text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
+        assert_eq!(text, "溢出恢复后成功");
+        assert_eq!(trace.overflow_recoveries, 1, "应恰好排水恢复 1 次");
+        assert!(
+            trace
+                .failure_signals
+                .iter()
+                .any(|s| s.starts_with("overflow_recovered:")),
+            "恢复应产生弱失败信号,实际 {:?}",
+            trace.failure_signals
+        );
+        assert!(!trace.is_failed(), "恢复成功不算失败");
+        // 排水真实生效:超长 tool_result 已被截短
+        match &session.context()[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert!(content.contains("overflow-drain"));
+                assert!(content.chars().count() < overflow::DRAIN_MIN_CHARS);
+            }
+            other => panic!("应为 ToolResult,实际 {other:?}"),
+        }
+    }
+
+    /// 永远返回溢出 400(验证排水 + 折叠两级穷尽后按三级暴露上抛)。
+    struct AlwaysOverflowLlm;
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for AlwaysOverflowLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            Err(overflow_err())
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_exhausts_recovery_and_exposes_error() {
+        let agent = Agent::new(
+            std::sync::Arc::new(AlwaysOverflowLlm),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        // 会话带可折叠的胖历史(触发 Level 2) + 超长工具结果(触发 Level 1)
+        let mut session = session_with_fat_tool_result(20_000);
+        for i in 0..6 {
+            session
+                .context_mut()
+                .insert(1, ChatMessage::user(format!("历史{i} {}", "话".repeat(400))));
+        }
+        let res = agent.run_session(&mut session).await;
+        let err = res.expect_err("两级恢复穷尽后应上抛原始溢出错误");
+        assert!(
+            matches!(&err, AgentError::LlmHttp { status: 400, .. }),
+            "应原样上抛 LlmHttp 400,实际 {err:?}"
+        );
+        // Level 1 + Level 2 都真实执行过:工具结果被截短 + 折叠标记存在
+        let has_drained = session.context().iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains("overflow-drain")),
+            )
+        });
+        assert!(has_drained, "排水应真实执行");
+        let has_folded = session.context().iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(compact::COMPACT_MARKER_START)))
+        });
+        assert!(has_folded, "折叠应真实执行");
+    }
+
+    #[tokio::test]
+    async fn overflow_budget_zero_disables_recovery() {
+        let agent = Agent::new(
+            std::sync::Arc::new(OverflowOnceLlm {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            AgentProfile::sub_agent_work_profile(),
+        )
+        .with_max_overflow_recoveries(0);
+        let mut session = session_with_fat_tool_result(20_000);
+        let res = agent.run_session(&mut session).await;
+        assert!(res.is_err(), "预算为 0 时不恢复,直接上抛");
+        // 未排水:工具结果保持原长
+        match &session.context()[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content.chars().count(), 20_000);
+            }
+            other => panic!("应为 ToolResult,实际 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_overflow_error_not_recovered() {
+        let agent = Agent::new(
+            std::sync::Arc::new(FailGenericLlm),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = session_with_fat_tool_result(20_000);
+        let res = agent.run_session(&mut session).await;
+        let err = res.expect_err("非溢出错误应原样上抛");
+        assert!(matches!(err, AgentError::Llm(_)));
+        // 上下文未被排水
+        match &session.context()[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content.chars().count(), 20_000, "非溢出错误不应触发排水");
+            }
+            other => panic!("应为 ToolResult,实际 {other:?}"),
+        }
+    }
+
+    /// 普通失败(非溢出),不应触发任何恢复。
+    struct FailGenericLlm;
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for FailGenericLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            Err(AgentError::Llm("mock down".into()))
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
     }
 }

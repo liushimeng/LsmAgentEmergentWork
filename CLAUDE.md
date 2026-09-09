@@ -45,7 +45,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
   - **Quality-Check Agent**（`LsmAgentEmergentWork-Quality-Check`）：质检层，每个执行单元完成后必经 QC；可选 Read 工具辅助。
   - **SessionContext Agent**（`LsmAgentEmergentWork-SessionContext`）：会话层，每次任务完成后汇总并写入 `session_memory` 表；无工具。
   - **Debug Agent**（`LsmAgentEmergentWork-Debug`）：调试层，仅在 `-debug` 调试模式下启用；任务结束后对采集的 trace（各 Agent LLM 调用输入输出 / Yolo 分类 / QC 结论 / 耗时与 token / 错误）做评估，产出「任务评估 / 质量报告 / 问题报告(P0-P2) / 优化建议」四章节；无工具。报告写入**根目录** `DebugReport/debug_report_{YYYYMMDD}_{HHMMSS}_{随机6位}.md`（已 gitignore，不入库）。设计见 `docs/Debug模式与DebugAgent设计/01-设计与解决方案.md`。
-  - **Compact Agent**（`LsmAgentEmergentWork-Compact`）：压缩层（第 8 角色）；Session 主上下文估算 token（字符/4 +10%）达到当前 Provider `context_max_size` 的 80% 时由 Orchestrator 自动触发，按超出幅度自动选三档压缩率（Light ≤80% / Medium ≈50% / Aggressive ≤20%），LLM 摘要失败降级本地硬截断；保护带项目上下文/历史摘要/已压缩标记的消息与最近 4 条消息；无工具。设计见 `docs/Context设置与自动压缩设计/01-设计与解决方案.md`。
+  - **Compact Agent**（`LsmAgentEmergentWork-Compact`）：压缩层（第 8 角色）；Session 主上下文估算 token（字符/4 +10%）达到当前 Provider `context_max_size` 的 80% 时由 Orchestrator 自动触发，按超出幅度自动选三档压缩率（Light ≤80% / Medium ≈50% / Aggressive ≤20%），LLM 摘要失败降级本地硬截断；保护带项目上下文/历史摘要/已压缩标记的消息与最近 4 条消息；无工具。**溢出兜底（reactive）**：估算可能低估（CJK 2-3 倍），真实溢出（Provider 返回 `prompt is too long` / `context_length_exceeded` 类 400）时由 Agent 循环自动三级恢复——排水（截短超长 tool_result）→ 折叠（历史合并为压缩摘要）→ 暴露（原错误上抛），见 `agent/overflow.rs`（一处包裹、8 角色全生效，全会话恢复预算 4 次）。设计见 `docs/Context设置与自动压缩设计/01-设计与解决方案.md`。
   - 由 `MultiAgentOrchestrator` 总编排:用户输入 → 项目上下文注入 → Yolo 分类 → 简单档(SubAgent) / 中档(Main→SubAgent) / 高档(Plan→Main→SubAgent) → Quality-Check → SessionContext 收口。WorkFlow 执行时按 `depends_on` 自动 Kahn 分层(`main_work::topo_layers`),**同层无依赖的 SubAgent 自动并行**(tokio::spawn + Semaphore 上限 3,`OrchestratorConfig::max_parallel_workflows`),跨层严格串行、上游产物按层注入,失败语义与串行一致(fail-fast 回流 Yolo)。
 - **Agent-Context / Agent-Memory**：
   - **Agent-Context**：每个 Agent 独立的实时上下文(消息流 + 状态)，内存态，生命周期 = 当前单元。
@@ -82,6 +82,7 @@ agent/
     write.rs   WriteTool
   yolo.rs      YoloRunner 双 Agent 编排器 + TaskLevel + TaskClassification + JSON 解析
   compact.rs   CompactRunner:token 估算 / 三档选档 / 自动压缩触发 / 硬截断降级 / 保护段识别
+  overflow.rs  上下文溢出检测(15+ provider 正则)+ 三级恢复(排水/折叠/暴露)
   project_context.rs 项目说明文件五级链发现 + README 自动生成 + 每会话首次注入(幂等标记)
 session.rs       Session:本机指纹 device_id + Session ID 生成 + 独立对话上下文 context
 llm/mod.rs       统一消息模型 + LlmClient trait + RequestMeta + build_common_headers

@@ -121,6 +121,18 @@ impl ChatMessage {
             content: vec![ContentBlock::tool_result(tool_use_id, content, is_error)],
         }
     }
+
+    /// 提取消息内全部文本块的合并内容(测试 / 日志 / 展示用;
+    /// tool_use / tool_result 块不参与)。
+    pub fn content_text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// 工具定义(协议无关)

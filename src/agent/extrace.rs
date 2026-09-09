@@ -30,6 +30,9 @@ pub struct ExecutionTrace {
     pub early_terminate_reason: String,
     /// 截断续接次数(>0 表示 LLM 输出被 max_tokens 截断并自动续接过)
     pub truncation_resumes: usize,
+    /// 上下文溢出自动恢复次数(L1038/L1044:排水/折叠后重试成功;
+    /// >0 表示发生过 prompt-too-long 类溢出并本地恢复)
+    pub overflow_recoveries: usize,
     /// 最终输出文本字节数
     pub output_bytes: usize,
     /// 失败模式标签(供 Agent-Memory 索引 / Yolo 失败回流引用)
@@ -55,6 +58,11 @@ impl ExecutionTrace {
         // 2) 截断信号(token 上限触发自动续接 ≥ 1 次)
         if self.truncation_resumes > 0 {
             signals.push(format!("truncated:{}x", self.truncation_resumes));
+        }
+
+        // 2.5) 溢出恢复信号(上下文溢出被排水/折叠本地恢复 ≥ 1 次;恢复成功不算失败)
+        if self.overflow_recoveries > 0 {
+            signals.push(format!("overflow_recovered:{}x", self.overflow_recoveries));
         }
 
         // 3) 工具失败率信号(失败占比 ≥ 50%)
@@ -93,7 +101,7 @@ impl ExecutionTrace {
     pub fn render_prompt(&self) -> String {
         format!(
             "- iterations={} tool_calls={}(ok={},err={}) max_consec={}\n\
-             - early_terminated={} truncation_resumes={}\n\
+             - early_terminated={} truncation_resumes={} overflow_recoveries={}\n\
              - output_bytes={}\n\
              - failure_signals=[{}]",
             self.iterations,
@@ -103,6 +111,7 @@ impl ExecutionTrace {
             self.max_consecutive_failures,
             self.early_terminated,
             self.truncation_resumes,
+            self.overflow_recoveries,
             self.output_bytes,
             self.failure_signals.join(","),
         )
@@ -186,6 +195,20 @@ mod tests {
         t.truncation_resumes = 2;
         t.collect_failure_signals("ok 部分输出");
         assert!(t.failure_signals.iter().any(|s| s.starts_with("truncated:")));
+        assert!(!t.is_failed());
+    }
+
+    #[test]
+    fn overflow_recovery_signal_is_not_strong_failure() {
+        // 溢出被本地恢复(排水/折叠)不算失败,只是弱信号,不进 is_failed
+        let mut t = ExecutionTrace::default();
+        t.overflow_recoveries = 1;
+        t.collect_failure_signals("ok");
+        assert!(
+            t.failure_signals
+                .iter()
+                .any(|s| s.starts_with("overflow_recovered:"))
+        );
         assert!(!t.is_failed());
     }
 

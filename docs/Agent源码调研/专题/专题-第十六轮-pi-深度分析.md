@@ -120,7 +120,7 @@ const patterns = [
 // 静默溢出检测：usage.input > contextWindow
 ```
 
-**laew gap L1044 [P0]**：无上下文溢出检测。
+**laew gap L1044 [P0]**：无上下文溢出检测。✅ **已实现(2026-09-09 第 06 轮)**:`src/agent/overflow.rs::is_context_overflow` 落地 15+ 溢出正则 + NON_OVERFLOW 排除集 + 状态码门槛(400/413),并配套三级恢复(排水→折叠→暴露);pi 的静默溢出检测(usage.input > contextWindow 事前预防)未做,留作下一轮候选。
 
 ---
 
@@ -142,7 +142,7 @@ retryAssistantCall(policy: {
 
 | 编号 | 维度 | 描述 | 优先级 |
 |------|------|------|--------|
-| L1044 | 溢出检测 | 无上下文溢出检测（20+ provider 溢出正则） | P0 |
+| L1044 | 溢出检测 | 无上下文溢出检测（20+ provider 溢出正则） | P0 ✅ **已实现(2026-09-09 第 06 轮)**:`src/agent/overflow.rs` |
 | L1045 | 重试策略 | 无 provider 重试策略（指数退避 + 可重试错误分类） | P0 |
 | L1083 | 缓存分析 | 无 prompt-cache miss 检测 | P1 |
 | L1084 | HTTP | 无自定义 undici 调度器 | P1 |

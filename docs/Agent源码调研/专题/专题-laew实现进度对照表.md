@@ -66,6 +66,7 @@
 | TUI 中文输入 UTF-8 光标修复(既有 P0 缺陷,本轮验证取消功能时发现):cursor 从「字符数」改为「字节偏移 + 字符边界不变量」,`prev_char_boundary` 回退/`display_width` 列号换算,修复中文第 2 字符必 panic(status 101) | TUI 渲染管线专题(第六轮 CJK 宽度算法维度) | `tui/input.rs` + 单元测试 4 项 + e2e §8 用例 14a(中文输入+退格+清空,tmux 真实按键) | 2026-09-08 第 07 轮 |
 | LLM Provider 自动熔断器(H13/L188/L771):重试耗尽后统计连续可重试最终失败,5 次进入 Open 快速失败,30s 后自动 HalfOpen 单探测;成功关闭 / 失败重开;401/400 等请求侧错误与用户取消不计故障;并行 SubAgent 共享同 Provider 熔断状态 | 第十一轮错误处理与熔断专题 §10.2/§14 + 第十二轮 H13 + 第十四轮错误恢复 §4.4/L771 | `llm/resilient.rs` + `error.rs::LlmCircuitOpen`;单元测试覆盖 Open 快速失败 / 半开成功 / 半开失败重开 / 并发单探测 / 探测位取消释放 / 不可重试不熔断 / 成功重置;方案 `tmpPlan/2026-09-09_01-LLM熔断器自动三态防护方案.md` | 2026-09-09 第 01 轮 |
 | SubAgent 执行轨迹(ExecutionTrace)与多维失败检测:Agent 循环内累计工具调用成功/失败/截断/早终止元数据;**早终止路径(RepeatedToolFailure/MaxIterationsExceeded)不再升级为 Error**,而是包装成失败摘要 + early_terminated=true 的 trace,让 QC 仍可判定;失败检测从二值文本启发式升级为多维(early_terminate / high_error_rate / text_failure_phrase 三种强信号);Agent-Memory artifacts 持久化 trace 全字段;QC 收到 ExecutionTrace 摘要辅助判据;Yolo 失败回流时引用 trace.failure_signals | SubAgent 调度专题 §6.1 执行轨迹 + 质检机制专题 + 任务拆解专题 L36 | `src/agent/extrace.rs`(新)+ `src/agent/mod.rs::run_session_inner` 累计 trace + `src/agent/subagent.rs::run_unit_inner` catch 早终止 + `src/agent/quality.rs::check_subagent` 新增 trace 参数 + `src/agent/orchestrator.rs` 三处串联(WorkflowResult 加 subflow_trace 字段 / QualityFailure 加 trace / run_yolo_with_failure 拼信号);单元测试 333 全过 + e2e 94 全过;方案 `tmpPlan/2026-09-09_05-SubAgent执行轨迹与多维失败检测方案.md` | 2026-09-09 第 05 轮 |
+| 上下文溢出自动检测与三级恢复(L1038+L1044):`is_context_overflow` 15+ provider 溢出正则(Anthropic `prompt is too long` / OpenAI `context_length_exceeded` / 网关变体)+ NON_OVERFLOW 排除集(限流/配额/鉴权误报)+ 状态码门槛(仅 400/413);Agent 循环 LLM 调用点一处包裹、8 角色全生效——Level 1 排水(超长 tool_result 原地截短,保头 2000+尾 1000,幂等)→ Level 2 折叠(非保护段历史 hard_truncate 合并为 `<<<LAEW:COMPACTED_CONTEXT>>>` 摘要,配对边界守卫防孤儿 tool_use)→ Level 3 暴露(原错误上抛);每次调用最多 1 排水+1 折叠(跨迭代重武装),全会话预算 4 次防打转;恢复不消耗 max_iterations;ExecutionTrace.overflow_recoveries 弱信号可观测;e2e mock `--overflow-once` wire 级验证 | 第十六轮 claudecode §2.2 prompt-too-long 三级恢复(L1038)+ 第十六轮 pi §8 溢出正则(L1044) | `src/agent/overflow.rs`(新)+ `src/agent/mod.rs::complete_with_overflow_recovery`(新)+ `src/agent/extrace.rs`(overflow_recoveries 字段)+ `src/agent/compact.rs`(render_messages/hard_truncate 开放 pub(crate));`scripts/mock_llm_server.py --overflow-once` + `run_e2e.sh` §4f;单元测试 356 全过 + e2e 97 全过;方案 `tmpPlan/2026-09-09_06-上下文溢出自动检测与三级恢复方案.md` | 2026-09-09 第 06 轮 |
 
 ## 四、下一轮候选(按优先级)
 
@@ -126,18 +127,18 @@
 
 **P0 紧急(优先实现)**:
 - L1036 七阶段上下文管线 → 抄 claudecode `query.ts`
-- L1037 max_output_tokens 三级恢复 → 抄 claudecode `query.ts:1186`
-- L1038 prompt-too-long 三级恢复 → 抄 claudecode `query.ts:1062`
+- L1037 max_output_tokens 三级恢复 → 抄 claudecode `query.ts:1186`(截断续接已于 2026-09-08 第 06 轮实现,差 max_tokens 静默升级 8k→64k)
+- ~~L1038 prompt-too-long 三级恢复~~ ✅ 2026-09-09 第 06 轮已完成(`src/agent/overflow.rs`,方案 `tmpPlan/2026-09-09_06-上下文溢出自动检测与三级恢复方案.md`)
 - L1039 cached microcompact → 抄 claudecode `microCompact.ts`
 - L1041 SQLite WAL 配置 → 抄 openclaw `infra/sqlite-wal.ts`
 - L1042 SQLite 完整性检测 → 抄 openclaw `infra/sqlite-integrity.ts`
 - L1043 跨进程租约协调 → 抄 openclaw `state/openclaw-state-lease.ts`
-- L1044 上下文溢出检测 → 抄 pi `ai/utils/overflow.ts`
-- L1045 provider 重试策略 → 抄 pi `ai/utils/retry.ts`
+- ~~L1044 上下文溢出检测~~ ✅ 2026-09-09 第 06 轮已完成(与 L1038 同轮,15+ 溢出正则 + NON_OVERFLOW 排除集;pi 的静默溢出检测 usage.input > contextWindow 事前预防未做,留作下一轮候选)
+- L1045 provider 重试策略 → 抄 pi `ai/utils/retry.ts`(H2/H3/H13 重试+分类+熔断已实现,差指数退避 jitter)
 - L1046 Route 五层抽象 → 抄 opencode `llm/src/route/client.ts`
 - L1047 Cache Policy 自动注入 → 抄 opencode `llm/src/cache-policy.ts`
 - L1048 反应式 IoC → 抄 deepseek-harness `vendor/cordis/src/fiber.ts`
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 05 轮(SubAgent 执行轨迹 ExecutionTrace 与多维失败检测),同表累计回填含第 16 轮(130+ 个新 gap，L1-L1165+)。*
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 06 轮(上下文溢出自动检测与三级恢复 L1038+L1044),此前:第 05 轮(SubAgent 执行轨迹)、第 16 轮(130+ 个新 gap,L1-L1165+)。*

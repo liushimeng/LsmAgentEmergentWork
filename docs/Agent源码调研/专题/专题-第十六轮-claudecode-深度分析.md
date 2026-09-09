@@ -79,8 +79,8 @@ while (true) {
 | 编号 | 维度 | 描述 | 优先级 |
 |------|------|------|--------|
 | L1036 | 多轮对话 | 无七阶段上下文管线 | P0 |
-| L1037 | 多轮对话 | 无 max_output_tokens 三级恢复 | P0 |
-| L1038 | 多轮对话 | 无 prompt-too-long 三级恢复 | P0 |
+| L1037 | 多轮对话 | 无 max_output_tokens 三级恢复 | P0 🟡 **部分实现**:截断续接已实现(2026-09-08 第 06 轮),差 8k→64k 静默升级 |
+| L1038 | 多轮对话 | 无 prompt-too-long 三级恢复 | P0 ✅ **已实现(2026-09-09 第 06 轮)**:排水→折叠→暴露三级,`src/agent/overflow.rs`,方案 `tmpPlan/2026-09-09_06-上下文溢出自动检测与三级恢复方案.md` |
 | L1039 | 压缩系统 | 无 cached microcompact | P0 |
 | L1040 | 记忆系统 | 无后台记忆提取 agent | P0 |
 | L1051 | 权限 | 无 PermissionContext 工厂 | P1 |

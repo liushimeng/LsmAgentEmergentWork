@@ -24,6 +24,9 @@ LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
 #                  用于端到端验证 src/agent/quality.rs 的 JSON 解析失败 fail-closed 回流。
 #   PARALLEL_WFS  — yolo 返回 medium 分类、mainwork 返回 3 个互相独立(无 depends_on)的 WorkFlow,
 #                  用于端到端验证 orchestrator 的「依赖分层 + 同层 SubAgent 并行调度」。
+#   OVERFLOW_ONCE — subagent 第 1 次工具调用命令改为 `seq 1 5000`(产出约 28.9K 字符的大 tool_result,
+#                  低于 Bash 工具 30K 截断上限)、第 2 次调用返回 HTTP 400 "prompt is too long",
+#                  用于端到端验证 src/agent/overflow.rs 的三级恢复(排水截短 → 重试)。
 #   --delay-ms N  — 每个请求处理前 sleep N 毫秒(模拟慢 LLM),
 #                  用于端到端验证取消传播(SIGINT 优雅中断,不应等延迟跑完)。
 MODES = set()
@@ -36,7 +39,7 @@ while _i < len(_args):
         DELAY_MS = int(_args[_i + 1])
         _i += 2
         continue
-    if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs"):
+    if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs", "--overflow-once"):
         MODES.add(_a)
     _i += 1
 
@@ -239,6 +242,9 @@ def build_anthropic_stream(call_no):
         # 由"第 2 次"返回纯文本收口。
         if "--bash-block" in MODES:
             bash_cmd = "rm -rf /"
+        elif "--overflow-once" in MODES:
+            # 溢出恢复场景:第 1 次工具调用产生大输出,供「排水」恢复有物可排。
+            bash_cmd = "seq 1 5000"
         else:
             bash_cmd = "echo LAEW_ANTHROPIC_OK"
         events = [
@@ -341,6 +347,8 @@ def build_openai_stream(call_no):
         # --bash-block 模式下把命令改成 `rm -rf /`
         if "--bash-block" in MODES:
             bash_cmd = "rm -rf /"
+        elif "--overflow-once" in MODES:
+            bash_cmd = "seq 1 5000"
         else:
             bash_cmd = "echo LAEW_MOCK_OK"
         chunks = [
@@ -462,6 +470,25 @@ class Handler(BaseHTTPRequestHandler):
         role = detect_role(body, key)
         role_no = STATE.get(f"{key}:{role}", 0) + 1
         STATE[f"{key}:{role}"] = role_no
+
+        # --overflow-once 模式:subagent 第 2 次调用返回 HTTP 400 上下文溢出
+        # (Anthropic 真实错误形态),用于端到端验证 src/agent/overflow.rs 的
+        # 三级恢复:排水截短超长 tool_result → 重试 → 最终文本。
+        if "--overflow-once" in MODES and role == "subagent" and role_no == 2:
+            err = {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt is too long: 54321 tokens > 100000 maximum",
+                },
+            }
+            payload = json.dumps(err, ensure_ascii=False).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         def role_reply(text):
             return openai_text_sse(text) if key == "oai" else anthropic_text_sse(text)
