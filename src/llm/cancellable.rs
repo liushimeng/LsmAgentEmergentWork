@@ -160,6 +160,8 @@ mod tests {
         RequestMeta {
             session_id: "test".into(),
             device_id: "d".into(),
+            max_tokens_override: None,
+            user_agent: String::new(),
         }
     }
 

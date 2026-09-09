@@ -534,6 +534,8 @@ mod tests {
         RequestMeta {
             session_id: "test-session".into(),
             device_id: "test-device".into(),
+            max_tokens_override: None,
+            user_agent: String::new(),
         }
     }
 
