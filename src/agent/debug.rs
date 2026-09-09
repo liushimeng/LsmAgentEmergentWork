@@ -524,15 +524,23 @@ pub async fn finalize_report(
     let stats = collector.render_stats();
     let trace = collector.render_trace();
 
-    // Debug Agent 评估;失败不阻塞报告落盘
-    let evaluation = match DebugRunner::new(llm).evaluate(&trace, &stats).await {
-        Ok(text) => text,
-        Err(e) => format!("(Debug Agent 评估失败: {e})"),
+    // Debug Agent 评估;失败不阻塞报告落盘 —— 改为填入「降级骨架」+ 头部横幅提示。
+    // 关联报告: 2026-09-09_07 F-007-2
+    let (evaluation, degraded) = match DebugRunner::new(llm).evaluate(&trace, &stats).await {
+        Ok(text) => (text, false),
+        Err(e) => (render_degraded_evaluation(&anyhow::Error::from(e), collector), true),
+    };
+    let banner = if degraded {
+        "\n> ⚠️ **Debug Agent 评估失败,已降级到基于 trace 的自检骨架** — 下方「任务评估 / 质量报告 / 问题报告 / 优化建议」\
+         章节由 `src/agent/debug.rs::render_degraded_evaluation` 根据 trace 指标自动归类,\
+         **不代表真实 LLM 评估意见**。请检查 Provider 配置 / 网络 / Mock LLM 是否正常。\n"
+    } else {
+        ""
     };
 
     let content = format!(
         "# laew Debug 报告\n\n\
-         - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n\n\
+         - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n{}\n\n\
          ## 一、统计总览\n\n{}\n\n\
          ## 二、Debug Agent 评估\n\n{}\n\n\
          ## 三、原始 Trace 附录\n\n{}\n",
@@ -541,6 +549,7 @@ pub async fn finalize_report(
         meta.mode,
         meta.model,
         truncate_chars(&meta.task, 500),
+        banner,
         stats,
         evaluation,
         trace,
@@ -549,6 +558,86 @@ pub async fn finalize_report(
     let path = report_dir.join(report_file_name());
     std::fs::write(&path, scrub_secrets(&content))?;
     Ok(path)
+}
+
+/// Debug Agent 评估失败时的降级骨架 —— 基于 trace 指标做最朴素的归类,
+/// 仍按 Debug Agent prompt 要求的 4 章节输出 Markdown,只是把 LLM 的语义评估
+/// 替换为「从数字看得见的现象」。这不是为了替代 LLM 评估,而是为了让报告
+/// 在 Debug Agent 不可用时仍有可读的章节结构。
+/// 关联报告: 2026-09-09_07 F-007-2
+fn render_degraded_evaluation(err: &anyhow::Error, collector: &Arc<DebugCollector>) -> String {
+    use DebugEvent as E;
+    let events = collector.events();
+    let llm_calls = events.iter().filter(|e| matches!(e, E::LlmCall { .. })).count();
+    let llm_errors = events.iter().filter(|e| matches!(e, E::LlmCall { error: Some(_), .. })).count();
+    let qc_total = events.iter().filter(|e| matches!(e, E::QualityCheck { .. })).count();
+    let qc_pass = events.iter().filter(|e| matches!(e, E::QualityCheck { verdict: crate::agent::quality::Verdict::Pass, .. })).count();
+    let qc_fail = qc_total.saturating_sub(qc_pass);
+    let total_ms: u128 = events.iter().filter_map(|e| if let E::LlmCall { duration_ms, .. } = e { Some(*duration_ms) } else { None }).sum();
+    let task_ms = collector.elapsed_ms();
+
+    // P0/P1/P2 自检分级(按数字可见信号):
+    //   P0: LLM 错误率 >= 50% / QC 失败 >= 1
+    //   P1: 总耗时 > 5s / 截断续接 >= 1 / overflow 恢复 >= 1
+    //   P2: 仅事件极少量或无 QC(链路未跑完整)
+    // 用 (String, String) 持有自有 buffer,避免 format! 临时值借用问题。
+    let mut issues: Vec<(String, String)> = Vec::new(); // (level, desc)
+    if qc_fail >= 1 {
+        issues.push((
+            "P0".into(),
+            format!("QC 失败 {qc_fail} 次 —— 至少一个 SubAgent 单元未通过质检"),
+        ));
+    }
+    if llm_calls > 0 && llm_errors * 2 >= llm_calls {
+        issues.push((
+            "P0".into(),
+            format!("LLM 错误率 {llm_errors}/{llm_calls} ≥ 50% —— Provider / 网络疑似异常"),
+        ));
+    }
+    if llm_errors > 0 {
+        issues.push((
+            "P1".into(),
+            format!("LLM 错误 {llm_errors} 次(数字同 P0 时合并显示;单独出现归 P1)"),
+        ));
+    }
+    if task_ms > 5000 {
+        issues.push((
+            "P1".into(),
+            format!("任务总耗时 {task_ms} ms 超过 5s —— 可能存在慢请求或上下文压缩未生效"),
+        ));
+    }
+    if llm_calls == 0 {
+        issues.push((
+            "P2".into(),
+            "无任何 LLM 调用 —— 任务在进入 Orchestrator 之前已结束(Provider 未配置 / 解析失败)".into(),
+        ));
+    }
+    if qc_total == 0 && llm_calls > 0 {
+        issues.push((
+            "P2".into(),
+            "链路无 QC 环节 —— SubAgent 输出未经质检直接交付".into(),
+        ));
+    }
+
+    let issues_md = if issues.is_empty() {
+        "- (无)" .to_string()
+    } else {
+        issues.iter().map(|(lvl, desc)| format!("- **{lvl}**: {desc}")).collect::<Vec<_>>().join("\n")
+    };
+
+    // 优化建议按 issues 反推
+    let suggestions = if issues.is_empty() {
+        "- 维持现状,当前 trace 未发现明显异常。\n- 可在 Debug Agent 可用后重跑该任务做语义评估补全。"
+    } else {
+        "- 优先排查标记为 P0 的项(Provider 凭证 / QC 失败原因);\n- P1 项可结合完整 trace 附录判断是否影响功能;\n- 如 Debug Agent 长期不可用,可在 docs/Debug模式与DebugAgent设计/ 增补离线分析脚本。"
+    };
+
+    format!(
+        "## 任务评估\n\n- 评估来源: **⚠️ 降级模式**(Debug Agent 调用失败: `{err}`)\n- 总览: 本次任务共 LLM 调用 {llm_calls} 次(失败 {llm_errors})、QC {qc_total} 次(通过 {qc_pass})、累计 LLM 耗时 {total_ms} ms、任务总耗时 {task_ms} ms。\n\n\
+         ## 质量报告\n\n- LLM 链路: 调用 {llm_calls} 次 / 失败 {llm_errors} 次\n- QC 链路: {qc_pass}/{qc_total} 通过\n- 耗时分布: LLM 累计 {total_ms} ms / 任务总 {task_ms} ms\n\n\
+         ## 问题报告(按 P0/P1/P2 分级)\n\n{issues_md}\n\n\
+         ## 优化建议\n\n{suggestions}\n"
+    )
 }
 
 #[cfg(test)]
@@ -583,6 +672,20 @@ mod tests {
     fn scrub_secrets_keeps_normal_text() {
         let s = "任务管理系统 task-management-system 正常运行";
         assert_eq!(scrub_secrets(s), s);
+    }
+
+    /// F-007-2 降级骨架 —— 直接构造一个空 DebugCollector,验证降级评估渲染包含 4 章节 + P0/P1/P2 自检。
+    #[test]
+    fn render_degraded_evaluation_has_four_sections() {
+        let c = Arc::new(DebugCollector::new("sess-degrade-test"));
+        let err = anyhow::anyhow!("mock LLM 未启动 / 端口不通");
+        let md = render_degraded_evaluation(&err, &c);
+        assert!(md.contains("## 任务评估"), "应包含「任务评估」章节");
+        assert!(md.contains("## 质量报告"), "应包含「质量报告」章节");
+        assert!(md.contains("## 问题报告"), "应包含「问题报告」章节");
+        assert!(md.contains("## 优化建议"), "应包含「优化建议」章节");
+        assert!(md.contains("降级模式"), "应明确标注降级模式");
+        assert!(md.contains("P2"), "空 trace 应触发 P2 自检(无 LLM 调用)");
     }
 
     #[test]

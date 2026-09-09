@@ -374,14 +374,6 @@ async fn cmd_export_provider(file_path: PathBuf) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .with_target(false)
-        .init();
-
     let cli = {
         // 兼容用户习惯写法 `-debug` / `-inprovider` / `-outprovider`(单横线长参数),
         // 归一化为 `--xxx` 再交给 clap
@@ -395,6 +387,21 @@ async fn main() -> Result<()> {
             .collect();
         Cli::parse_from(args)
     };
+
+    // TUI 模式下 INFO 级日志会与对话内容交错打印,造成视觉混乱 + 闪烁。
+    // 单轮 / -debug / provider 子命令场景不受影响,沿用 RUST_LOG 默认行为。
+    // 关联报告: 2026-09-09_07 F-007-1
+    let is_tui = cli.prompt.is_none() && cli.file.is_none()
+        && cli.inprovider.is_none() && cli.outprovider.is_none()
+        && cli.cmd.is_none();
+    let default_level = if is_tui { "warn" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_level.into()),
+        )
+        .with_target(false)
+        .init();
 
     // 优先处理导入/导出命令
     if let Some(path) = cli.inprovider {

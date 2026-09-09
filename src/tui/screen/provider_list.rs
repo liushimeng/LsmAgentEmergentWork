@@ -49,7 +49,10 @@ impl ProviderList {
             1 => r.protocol.as_str().to_string(),
             2 => r.provider_name.clone(),
             3 => r.model_name.clone(),
-            4 => r.end_point.clone(),
+            // end_point 在子屏值列宽有限(默认 96 列 → 值列 ≈ 72 字符),
+            // 超长按智能省略:保留 scheme://host 末段与 path 末两段。
+            // 关联报告: 2026-09-09_07 F-007-3
+            4 => truncate_endpoint(&r.end_point, 72),
             5 => theme::mask_key(&r.api_key),
             6 => format!(
                 "{} ({})",
@@ -59,7 +62,6 @@ impl ProviderList {
             _ => String::new(),
         }
     }
-
     fn switch_active(&mut self) -> Outcome {
         let id = match self.current() {
             Some(r) => r.id,
@@ -71,6 +73,37 @@ impl ProviderList {
             Err(e) => Outcome::Toast(format!("! 切换失败: {e}")),
         }
     }
+}
+
+/// 智能截断 end_point URL,保留 scheme://host + path 末两段(对长 Anthropic/OpenAI 端点友好)。
+/// 字符宽度按 char count 计(中文 / emoji 不会越界,但 CJK 比例过高时仍可能折行)。
+/// 关联报告: 2026-09-09_07 F-007-3
+fn truncate_endpoint(url: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = url.chars().collect();
+    if chars.len() <= max_chars {
+        return url.to_string();
+    }
+    // 按 `/` 切分,保留首段(scheme://host)与末两段(path 子段)
+    let parts: Vec<&str> = url.split('/').collect();
+    if parts.len() <= 4 {
+        // 无 path 或仅有 1 段:简单按 char 截断,加省略号
+        let head: String = chars.iter().take(max_chars.saturating_sub(1)).collect();
+        return format!("{head}…");
+    }
+    let head = parts[0]; // e.g. "https:" 或 "http:"
+    let host = parts.get(2).copied().unwrap_or("");
+    let tail = &parts[parts.len() - 2..];
+    let prefix = format!("{head}//{host}/…/{}", tail.join("/"));
+    if prefix.chars().count() <= max_chars {
+        return prefix;
+    }
+    // host 也太长:再按 char 截断 head
+    let head_budget = max_chars.saturating_sub(tail.join("/").chars().count() + 6);
+    if head_budget == 0 {
+        return format!("…/{}", tail.join("/"));
+    }
+    let head_trunc: String = format!("{head}//{host}").chars().take(head_budget).collect();
+    format!("{head_trunc}…/{}", tail.join("/"))
 }
 
 impl Screen for ProviderList {
@@ -217,6 +250,35 @@ mod tests {
     use super::*;
     use crate::config::Protocol;
     use tempfile::tempdir;
+
+    /// F-007-3 智能截断 end_point —— 不依赖任何状态,直接验证纯函数分支。
+    #[test]
+    fn truncate_endpoint_short_url_unchanged() {
+        assert_eq!(
+            truncate_endpoint("http://127.0.0.1:18905", 72),
+            "http://127.0.0.1:18905"
+        );
+    }
+
+    #[test]
+    fn truncate_endpoint_long_url_with_path() {
+        let long = "https://api.anthropic.com/v1/messages/very/long/path/segment";
+        let out = truncate_endpoint(long, 30);
+        assert!(out.chars().count() <= 30, "应 ≤ max_chars: {out}");
+        assert!(out.contains("…"), "应包含省略号: {out}");
+        assert!(
+            out.ends_with("path/segment") || out.ends_with("path/segmen…"),
+            "应保留 path 末两段: {out}"
+        );
+    }
+
+    #[test]
+    fn truncate_endpoint_no_path() {
+        let long = "https://very-very-long-host-name.example.com:8080";
+        let out = truncate_endpoint(long, 24);
+        assert!(out.chars().count() <= 24, "应 ≤ max_chars: {out}");
+        assert!(out.contains("…"), "应包含省略号: {out}");
+    }
 
     #[test]
     fn list_renders_empty() {

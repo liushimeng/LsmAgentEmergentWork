@@ -34,7 +34,7 @@ pub mod yolo;
 
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::cancel::{backfill_cancelled_tool_results, CancelToken};
 use crate::agent::extrace::ExecutionTrace;
@@ -202,7 +202,7 @@ impl Agent {
                     return Err(AgentError::Cancelled);
                 }
             }
-            info!(iteration = iter, "agent step");
+            debug!(iteration = iter, "agent step");
             // 上下文溢出自动恢复(L1038/L1044,2026-09-09 第 06 轮):
             // LLM 调用命中 prompt-too-long 类溢出错误时,自动执行
             // 排水(Level 1)→ 折叠(Level 2)→ 重试;两轮无效则上抛(三级暴露)。
@@ -261,7 +261,7 @@ impl Agent {
                 }
 
                 // 非截断,正常返回
-                info!("agent finished with text answer");
+                debug!("agent finished with text answer");
                 return Ok(Self::finalize_trace(
                     trace,
                     &accumulated_text,
