@@ -52,8 +52,16 @@ impl TuiSession {
         let plans_dir = paths.root_dir.join("plans");
         let session = Session::new();
         let collector = debug.then(|| Arc::new(DebugCollector::new(session.id())));
-        let (orchestrator, debug_llm_raw) = build_orchestrator_with_active(&db, plans_dir, collector.clone())?;
-        Ok(Self { paths, db, orchestrator, session, debug: collector, debug_llm_raw })
+        let (orchestrator, debug_llm_raw) =
+            build_orchestrator_with_active(&db, plans_dir, collector.clone())?;
+        Ok(Self {
+            paths,
+            db,
+            orchestrator,
+            session,
+            debug: collector,
+            debug_llm_raw,
+        })
     }
 
     /// 按当前 active provider 重建 orchestrator(debug 模式同时刷新原始 LLM 引用)。
@@ -68,11 +76,23 @@ impl TuiSession {
     pub fn print_banner(&self) {
         let active = self.db.lock().expect("db").get_active().ok().flatten();
         println!("╔══════════════════════════════════════════════════════════╗");
-        println!("║  LsmAgentEmergentWork  ·  laew  TUI  ·  v{}           ║", env!("CARGO_PKG_VERSION"));
-        println!("║  编译时间: {}                          ║", env!("LAEW_BUILD_TIME"));
+        println!(
+            "║  LsmAgentEmergentWork  ·  laew  TUI  ·  v{}           ║",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!(
+            "║  编译时间: {}                          ║",
+            env!("LAEW_BUILD_TIME")
+        );
         println!("╠══════════════════════════════════════════════════════════╣");
-        println!("║  根目录 : {:<46} ║", truncate(&self.paths.root_dir.display().to_string(), 46));
-        println!("║  工作目录: {:<45} ║", truncate(&self.paths.work_dir.display().to_string(), 45));
+        println!(
+            "║  根目录 : {:<46} ║",
+            truncate(&self.paths.root_dir.display().to_string(), 46)
+        );
+        println!(
+            "║  工作目录: {:<45} ║",
+            truncate(&self.paths.work_dir.display().to_string(), 45)
+        );
         // 项目说明文件状态(纯探测,不触发生成;发现规则见 docs/Yolo项目上下文注入/)
         let doc_source = crate::agent::project_context::probe(&self.paths.work_dir);
         println!("║  项目说明: {:<45} ║", truncate(doc_source.as_str(), 45));
@@ -95,8 +115,17 @@ impl TuiSession {
 
     /// 切换当前 provider(根据 id),并重新构造 MultiAgentOrchestrator
     pub fn switch_provider(&mut self, id: i64) -> Result<()> {
-        let record = self.db.lock().expect("db").get(id).map_err(anyhow::Error::from)?;
-        self.db.lock().expect("db").set_active(id).map_err(anyhow::Error::from)?;
+        let record = self
+            .db
+            .lock()
+            .expect("db")
+            .get(id)
+            .map_err(anyhow::Error::from)?;
+        self.db
+            .lock()
+            .expect("db")
+            .set_active(id)
+            .map_err(anyhow::Error::from)?;
         let _ = record;
         self.rebuild_orchestrator()?;
         Ok(())
@@ -110,8 +139,8 @@ impl TuiSession {
     pub fn add_provider_interactive(&self) -> Result<i64> {
         println!("  新增接入记录:");
         let protocol = read_line_prompt("    protocol (anthropic/openai): ")?;
-        let protocol = crate::config::Protocol::parse(protocol.trim())
-            .map_err(anyhow::Error::from)?;
+        let protocol =
+            crate::config::Protocol::parse(protocol.trim()).map_err(anyhow::Error::from)?;
         let provider_name = read_line_prompt("    provider_name: ")?;
         let model_name = read_line_prompt("    model_name: ")?;
         let end_point = read_line_prompt("    end_point: ")?;
@@ -133,7 +162,12 @@ impl TuiSession {
     }
 
     pub fn list_providers(&self) -> Result<()> {
-        let records = self.db.lock().expect("db").list().map_err(anyhow::Error::from)?;
+        let records = self
+            .db
+            .lock()
+            .expect("db")
+            .list()
+            .map_err(anyhow::Error::from)?;
         if records.is_empty() {
             println!("  (空)尚未配置任何接入记录。");
             return Ok(());
@@ -183,7 +217,8 @@ impl TuiSession {
         sig_task.abort();
         // debug 模式:任务结束(无论成败)后生成 Debug 报告
         if let (Some(collector), Some(raw_llm)) = (&self.debug, &self.debug_llm_raw) {
-            self.emit_debug_report(collector, raw_llm.clone(), line, &handle_result).await;
+            self.emit_debug_report(collector, raw_llm.clone(), line, &handle_result)
+                .await;
         }
         match handle_result {
             Ok(outcome) => match outcome {
@@ -193,7 +228,9 @@ impl TuiSession {
                 OrchestrationOutcome::Executed { result } => {
                     self.print_task_result(&result);
                 }
-                OrchestrationOutcome::Failed { suggestion, usage, .. } => {
+                OrchestrationOutcome::Failed {
+                    suggestion, usage, ..
+                } => {
                     println!();
                     println!("  [agent failed]");
                     println!("  建议: {suggestion}");
@@ -231,7 +268,10 @@ impl TuiSession {
         let model = match self.db.lock().expect("db").get_active() {
             Ok(Some(r)) => format!(
                 "[{}] {}/{} @ {}",
-                r.protocol.as_str(), r.provider_name, r.model_name, r.end_point
+                r.protocol.as_str(),
+                r.provider_name,
+                r.model_name,
+                r.end_point
             ),
             _ => "<未配置>".to_string(),
         };
@@ -313,14 +353,36 @@ impl TuiSession {
             }
             "clear" | "c" => {
                 self.reset_session();
-                println!("  已清空对话历史并开启新会话, Session ID: {}", self.session.id);
+                // TUI 主屏下真正清屏:滚动区清空(ANSI 100 行上滚) + 重新打印 banner。
+                // 修复前只 print 一行 Session ID,旧对话历史与提示词残留在视觉上不被清除,
+                // 用户体感「清屏没生效」。
+                if atty() {
+                    print!("\x1b[2J\x1b[H");
+                    self.print_banner();
+                } else {
+                    println!(
+                        "  已清空对话历史并开启新会话, Session ID: {}",
+                        self.session.id
+                    );
+                }
             }
             "new" | "n" => {
                 self.reset_session();
-                println!("  已开启新会话, Session ID: {}", self.session.id);
+                if atty() {
+                    print!("\x1b[2J\x1b[H");
+                    self.print_banner();
+                } else {
+                    println!("  已开启新会话, Session ID: {}", self.session.id);
+                }
             }
             "model" => {
-                if let Some(r) = self.db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
+                if let Some(r) = self
+                    .db
+                    .lock()
+                    .expect("db")
+                    .get_active()
+                    .map_err(anyhow::Error::from)?
+                {
                     println!(
                         "  [{}] {} / {}  @ {}",
                         r.protocol.as_str(),
@@ -409,8 +471,11 @@ impl TuiSession {
         let on_done = Box::new(move |id: i64| {
             let _ = db.lock().expect("db").set_active(id);
         });
-        let screen: Box<dyn crate::tui::engine::Screen> =
-            Box::new(ProviderForm::new_add(self.db.clone(), self.paths.clone(), on_done));
+        let screen: Box<dyn crate::tui::engine::Screen> = Box::new(ProviderForm::new_add(
+            self.db.clone(),
+            self.paths.clone(),
+            on_done,
+        ));
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
@@ -428,8 +493,11 @@ impl TuiSession {
             return Ok(());
         }
 
-        let screen: Box<dyn crate::tui::engine::Screen> =
-            Box::new(ProviderDelPicker::new(self.db.clone(), self.paths.clone(), -1));
+        let screen: Box<dyn crate::tui::engine::Screen> = Box::new(ProviderDelPicker::new(
+            self.db.clone(),
+            self.paths.clone(),
+            -1,
+        ));
         enter_alt().map_err(anyhow::Error::from)?;
         let result = Self::run_screen_loop(screen).await;
         leave_alt().map_err(anyhow::Error::from)?;
@@ -489,12 +557,22 @@ impl TuiSession {
 /// 建议相似命令（简单的编辑距离近似）。
 fn suggest_similar_commands(input: &str) -> Vec<String> {
     let all_commands = [
-        "help", "h", "?",
-        "exit", "quit", "q",
-        "clear", "c",
-        "new", "n",
+        "help",
+        "h",
+        "?",
+        "exit",
+        "quit",
+        "q",
+        "clear",
+        "c",
+        "new",
+        "n",
         "model",
-        "provider", "provider list", "provider add", "provider use", "provider del",
+        "provider",
+        "provider list",
+        "provider add",
+        "provider use",
+        "provider del",
     ];
     let input_lower = input.to_lowercase();
     all_commands
@@ -514,8 +592,12 @@ fn suggest_similar_commands(input: &str) -> Vec<String> {
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_len = a.chars().count();
     let b_len = b.chars().count();
-    if a_len == 0 { return b_len; }
-    if b_len == 0 { return a_len; }
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
 
     let mut prev_row: Vec<usize> = (0..=b_len).collect();
     let mut curr_row = vec![0usize; b_len + 1];
@@ -564,7 +646,14 @@ fn print_record(r: &ProviderRecord) {
         r.provider_name,
         r.model_name,
         r.end_point,
-        r.api_key.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>(),
+        r.api_key
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>(),
         r.created_at,
     );
 }
@@ -604,18 +693,27 @@ fn build_orchestrator_with_active(
     db: &Arc<Mutex<Db>>,
     plans_dir: PathBuf,
     debug: Option<Arc<DebugCollector>>,
-) -> Result<(MultiAgentOrchestrator, Option<Arc<dyn crate::llm::LlmClient>>)> {
+) -> Result<(
+    MultiAgentOrchestrator,
+    Option<Arc<dyn crate::llm::LlmClient>>,
+)> {
+    // 构造期 User-Agent 仅作兜底默认值:Agent 循环按当前 profile 逐请求覆盖
+    // (RequestMeta::user_agent,第 08 轮),8 角色在抓包层面各自可辨识
     let work_profile = crate::agent::profile::AgentProfile::work_profile();
     let user_agent = work_profile.user_agent();
     // 把 db 从 Mutex 拷一份裸出来(本次只读使用);Db 内部已有自己的 Mutex
     let db_clone = db.lock().expect("db").clone();
     let db_arc = Arc::new(db_clone);
-    let raw_llm: Arc<dyn crate::llm::LlmClient> =
-        match db.lock().expect("db").get_active().map_err(anyhow::Error::from)? {
-            Some(r) => client_from_record(&r, &user_agent).map_err(anyhow::Error::from)?,
-            // 未配置时,6 个 Agent 都用 NoopLlm
-            None => Arc::new(NoopLlm),
-        };
+    let raw_llm: Arc<dyn crate::llm::LlmClient> = match db
+        .lock()
+        .expect("db")
+        .get_active()
+        .map_err(anyhow::Error::from)?
+    {
+        Some(r) => client_from_record(&r, &user_agent).map_err(anyhow::Error::from)?,
+        // 未配置时,6 个 Agent 都用 NoopLlm
+        None => Arc::new(NoopLlm),
+    };
     match debug {
         Some(collector) => {
             let decorated: Arc<dyn crate::llm::LlmClient> =
@@ -629,7 +727,10 @@ fn build_orchestrator_with_active(
                 Some(raw_llm),
             ))
         }
-        None => Ok((MultiAgentOrchestrator::new(raw_llm, db_arc, plans_dir), None)),
+        None => Ok((
+            MultiAgentOrchestrator::new(raw_llm, db_arc, plans_dir),
+            None,
+        )),
     }
 }
 

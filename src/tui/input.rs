@@ -8,7 +8,8 @@
 //! - 补全浮层向上覆盖绘制在面板上方(底部无空间向下展开);
 //! - 提交时在滚动区底行回显已提交内容,保留输入痕迹;
 //! - 退出路径(Ctrl-D / `/exit` → teardown_pinned)还原滚动区并清空面板,不留残迹。
-use std::io::{self, Write};
+use crate::tui::completion::{CompletionEngine, CompletionItem};
+use crate::tui::theme;
 use crossterm::{
     cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -16,8 +17,7 @@ use crossterm::{
     style::{Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
-use crate::tui::completion::{CompletionEngine, CompletionItem};
-use crate::tui::theme;
+use std::io::{self, Write};
 
 /// 返回 `cursor`(字节偏移,须在字符边界)前一个字符的起始字节偏移。
 ///
@@ -126,7 +126,14 @@ impl Layout {
         } else {
             (rows.saturating_sub(1), rows.saturating_sub(1), None)
         };
-        Self { cols, rows, area_h, panel_top, input_y, hint_y }
+        Self {
+            cols,
+            rows,
+            area_h,
+            panel_top,
+            input_y,
+            hint_y,
+        }
     }
 
     /// 滚动区底行(1-indexed,DECSTBM 参数)。
@@ -239,10 +246,104 @@ impl InputHandler {
                                 return Ok(InputResult::Exit);
                             }
                         }
+                        // —— 以下是 readline 标准行编辑快捷键 ——
+                        // 标准 readline 中 Ctrl-U=kill to beginning of line, Ctrl-K=kill to end of line,
+                        // Ctrl-A=beginning of line, Ctrl-E=end of line, Ctrl-W=kill previous word。
+                        // 在 tmux/普通终端下这些按键由 crossterm 映射为带 CONTROL 修饰的 Char,
+                        // 必须显式拦截,否则会落入下方 Char(c) 兜底分支被当作普通字符插入(实测 u/model 残留 u 即此问题)。
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ctrl-U: 删除到行首(kill to beginning of line)
+                            buffer.truncate(0);
+                            cursor = 0;
+                            overlay_lines = self.update_completion(
+                                &mut stdout,
+                                &layout,
+                                prompt,
+                                &buffer,
+                                cursor,
+                                &mut completion_active,
+                                &mut completion_index,
+                                &mut completion_items,
+                                overlay_lines,
+                                engine,
+                            )?;
+                        }
+                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ctrl-K: 删除到行尾(kill to end of line)
+                            buffer.truncate(cursor);
+                            overlay_lines = self.update_completion(
+                                &mut stdout,
+                                &layout,
+                                prompt,
+                                &buffer,
+                                cursor,
+                                &mut completion_active,
+                                &mut completion_index,
+                                &mut completion_items,
+                                overlay_lines,
+                                engine,
+                            )?;
+                        }
+                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ctrl-A: 光标移到行首(beginning of line)
+                            cursor = 0;
+                            self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
+                        }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ctrl-E: 光标移到行尾(end of line)
+                            cursor = buffer.len();
+                            self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
+                        }
+                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ctrl-W: 删除前一个 word(kill previous word)
+                            // word 定义为连续非空白字符序列,前导空白一并清除。
+                            let mut new_cursor = cursor;
+                            while new_cursor > 0 {
+                                let prev = prev_char_boundary(&buffer, new_cursor);
+                                if buffer[prev..new_cursor]
+                                    .chars()
+                                    .next()
+                                    .map_or(false, char::is_whitespace)
+                                {
+                                    new_cursor = prev;
+                                } else {
+                                    break;
+                                }
+                            }
+                            while new_cursor > 0 {
+                                let prev = prev_char_boundary(&buffer, new_cursor);
+                                if buffer[prev..new_cursor]
+                                    .chars()
+                                    .next()
+                                    .map_or(false, |c| !char::is_whitespace(c))
+                                {
+                                    new_cursor = prev;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if new_cursor != cursor {
+                                buffer.replace_range(new_cursor..cursor, "");
+                                cursor = new_cursor;
+                                overlay_lines = self.update_completion(
+                                    &mut stdout,
+                                    &layout,
+                                    prompt,
+                                    &buffer,
+                                    cursor,
+                                    &mut completion_active,
+                                    &mut completion_index,
+                                    &mut completion_items,
+                                    overlay_lines,
+                                    engine,
+                                )?;
+                            }
+                        }
                         KeyCode::Esc => {
                             // Esc: 关闭补全浮层
                             if completion_active {
-                                overlay_lines = self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
+                                overlay_lines =
+                                    self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
                                 completion_active = false;
                                 completion_items.clear();
                                 self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
@@ -256,7 +357,12 @@ impl InputHandler {
                                 } else {
                                     completion_index - 1
                                 };
-                                overlay_lines = self.draw_overlay(&mut stdout, &layout, completion_index, &completion_items)?;
+                                overlay_lines = self.draw_overlay(
+                                    &mut stdout,
+                                    &layout,
+                                    completion_index,
+                                    &completion_items,
+                                )?;
                                 self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
                             }
                         }
@@ -264,7 +370,12 @@ impl InputHandler {
                             // 下箭头：在补全列表中向下移动
                             if completion_active && !completion_items.is_empty() {
                                 completion_index = (completion_index + 1) % completion_items.len();
-                                overlay_lines = self.draw_overlay(&mut stdout, &layout, completion_index, &completion_items)?;
+                                overlay_lines = self.draw_overlay(
+                                    &mut stdout,
+                                    &layout,
+                                    completion_index,
+                                    &completion_items,
+                                )?;
                                 self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
                             }
                         }
@@ -275,18 +386,31 @@ impl InputHandler {
                                 // 若缓冲区已等于补全目标(忽略尾随空格),直接提交而非接受补全。
                                 // 避免用户已完整输入命令名时 Enter 被吞成"接受补全 + 加尾随空格"。
                                 if buffer.trim() == item.replacement.trim() {
-                                    return self.submit(&mut stdout, &layout, prompt, buffer, overlay_lines);
+                                    return self.submit(
+                                        &mut stdout,
+                                        &layout,
+                                        prompt,
+                                        buffer,
+                                        overlay_lines,
+                                    );
                                 }
                                 // 接受补全并关闭浮层
                                 buffer = item.replacement.clone();
                                 cursor = buffer.len();
                                 completion_active = false;
                                 completion_items.clear();
-                                overlay_lines = self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
+                                overlay_lines =
+                                    self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
                                 self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
                             } else if key.code == KeyCode::Enter {
                                 // 提交输入
-                                return self.submit(&mut stdout, &layout, prompt, buffer, overlay_lines);
+                                return self.submit(
+                                    &mut stdout,
+                                    &layout,
+                                    prompt,
+                                    buffer,
+                                    overlay_lines,
+                                );
                             }
                         }
                         KeyCode::Backspace => {
@@ -296,9 +420,16 @@ impl InputHandler {
                                 cursor = prev_char_boundary(&buffer, cursor);
                                 buffer.remove(cursor);
                                 overlay_lines = self.update_completion(
-                                    &mut stdout, &layout, prompt, &buffer, cursor,
-                                    &mut completion_active, &mut completion_index,
-                                    &mut completion_items, overlay_lines, engine,
+                                    &mut stdout,
+                                    &layout,
+                                    prompt,
+                                    &buffer,
+                                    cursor,
+                                    &mut completion_active,
+                                    &mut completion_index,
+                                    &mut completion_items,
+                                    overlay_lines,
+                                    engine,
                                 )?;
                             }
                         }
@@ -310,9 +441,16 @@ impl InputHandler {
                                 cursor = prev_char_boundary(&buffer, cursor);
                                 buffer.remove(cursor);
                                 overlay_lines = self.update_completion(
-                                    &mut stdout, &layout, prompt, &buffer, cursor,
-                                    &mut completion_active, &mut completion_index,
-                                    &mut completion_items, overlay_lines, engine,
+                                    &mut stdout,
+                                    &layout,
+                                    prompt,
+                                    &buffer,
+                                    cursor,
+                                    &mut completion_active,
+                                    &mut completion_index,
+                                    &mut completion_items,
+                                    overlay_lines,
+                                    engine,
                                 )?;
                             }
                         }
@@ -321,9 +459,16 @@ impl InputHandler {
                             if cursor < buffer.len() {
                                 buffer.remove(cursor);
                                 overlay_lines = self.update_completion(
-                                    &mut stdout, &layout, prompt, &buffer, cursor,
-                                    &mut completion_active, &mut completion_index,
-                                    &mut completion_items, overlay_lines, engine,
+                                    &mut stdout,
+                                    &layout,
+                                    prompt,
+                                    &buffer,
+                                    cursor,
+                                    &mut completion_active,
+                                    &mut completion_index,
+                                    &mut completion_items,
+                                    overlay_lines,
+                                    engine,
                                 )?;
                             }
                         }
@@ -337,7 +482,8 @@ impl InputHandler {
                         KeyCode::Right => {
                             // 右箭头：移动光标(前进一个 UTF-8 字符)
                             if cursor < buffer.len() {
-                                cursor += buffer[cursor..].chars().next().map_or(0, |c| c.len_utf8());
+                                cursor +=
+                                    buffer[cursor..].chars().next().map_or(0, |c| c.len_utf8());
                                 self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
                             }
                         }
@@ -355,9 +501,16 @@ impl InputHandler {
                             buffer.insert(cursor, c);
                             cursor += c.len_utf8();
                             overlay_lines = self.update_completion(
-                                &mut stdout, &layout, prompt, &buffer, cursor,
-                                &mut completion_active, &mut completion_index,
-                                &mut completion_items, overlay_lines, engine,
+                                &mut stdout,
+                                &layout,
+                                prompt,
+                                &buffer,
+                                cursor,
+                                &mut completion_active,
+                                &mut completion_index,
+                                &mut completion_items,
+                                overlay_lines,
+                                engine,
                             )?;
                         }
                         _ => {}
@@ -368,7 +521,12 @@ impl InputHandler {
                     layout = Layout::compute(cols, rows);
                     self.enter_pinned(&mut stdout, &layout)?;
                     overlay_lines = if completion_active && !completion_items.is_empty() {
-                        self.draw_overlay(&mut stdout, &layout, completion_index, &completion_items)?
+                        self.draw_overlay(
+                            &mut stdout,
+                            &layout,
+                            completion_index,
+                            &completion_items,
+                        )?
                     } else {
                         0
                     };
@@ -384,7 +542,11 @@ impl InputHandler {
     /// 设置 DECSTBM 滚动区并绘制固定面板(分隔线 + 快捷键提示行)。
     fn enter_pinned(&self, stdout: &mut impl Write, layout: &Layout) -> io::Result<()> {
         // DECSTBM: 滚动区 = 1..=scroll_bottom(1-indexed),底部 area_h 行排除在外
-        execute!(stdout, ResetColor, Print(format!("\x1b[1;{}r", layout.scroll_bottom())))?;
+        execute!(
+            stdout,
+            ResetColor,
+            Print(format!("\x1b[1;{}r", layout.scroll_bottom()))
+        )?;
         // 分隔线
         if layout.area_h >= 3 {
             execute!(
@@ -499,7 +661,10 @@ impl InputHandler {
                 ResetColor,
                 Clear(ClearType::CurrentLine),
                 SetForegroundColor(theme::DIM),
-                Print(fit_width("  ↑↓ 选择  Enter/Tab 接受  Esc 关闭", layout.cols)),
+                Print(fit_width(
+                    "  ↑↓ 选择  Enter/Tab 接受  Esc 关闭",
+                    layout.cols
+                )),
                 ResetColor,
             )?;
         }
@@ -516,7 +681,12 @@ impl InputHandler {
                 &format!("  {}", item.description),
                 layout.cols.saturating_sub(pw),
             );
-            execute!(stdout, MoveTo(0, y), ResetColor, Clear(ClearType::CurrentLine))?;
+            execute!(
+                stdout,
+                MoveTo(0, y),
+                ResetColor,
+                Clear(ClearType::CurrentLine)
+            )?;
             if i == selected {
                 execute!(
                     stdout,
@@ -544,11 +714,21 @@ impl InputHandler {
     }
 
     /// 清除补全浮层(逐行清空面板上方 lines 行),返回 0(新的占用行数)。
-    fn clear_overlay(&self, stdout: &mut impl Write, layout: &Layout, lines: u16) -> io::Result<u16> {
+    fn clear_overlay(
+        &self,
+        stdout: &mut impl Write,
+        layout: &Layout,
+        lines: u16,
+    ) -> io::Result<u16> {
         if lines > 0 {
             let start = layout.panel_top.saturating_sub(lines);
             for y in start..layout.panel_top {
-                execute!(stdout, MoveTo(0, y), ResetColor, Clear(ClearType::CurrentLine))?;
+                execute!(
+                    stdout,
+                    MoveTo(0, y),
+                    ResetColor,
+                    Clear(ClearType::CurrentLine)
+                )?;
             }
             stdout.flush()?;
         }

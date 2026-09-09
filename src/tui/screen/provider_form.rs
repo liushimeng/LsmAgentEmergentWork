@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::config::{Db, Paths, Protocol, ProviderRecord};
 use crate::tui::engine::{Frame, Outcome, Rect, Screen};
-use crate::tui::form::{ConfirmAction, FormOutcome, TabForm, Tab};
+use crate::tui::form::{ConfirmAction, FormOutcome, Tab, TabForm};
 use crate::tui::theme::{self, attr};
 
 /// ProviderForm 模式。
@@ -74,7 +74,11 @@ impl ProviderForm {
             Protocol::OpenAi => 1,
         };
         vec![
-            Tab::choice("protocol", vec!["anthropic".into(), "openai".into()], proto_idx),
+            Tab::choice(
+                "protocol",
+                vec!["anthropic".into(), "openai".into()],
+                proto_idx,
+            ),
             Tab::text("provider_name", "必填", false, provider_name.unwrap_or("")),
             Tab::text("model_name", "必填", false, model_name.unwrap_or("")),
             Tab::text("end_point", "https://...", false, end_point.unwrap_or("")),
@@ -100,7 +104,9 @@ impl ProviderForm {
             return Err("model_name 不能为空".into());
         }
         let end_point = self.form.tabs[3].value.trim().to_string();
-        if end_point.is_empty() || !(end_point.starts_with("http://") || end_point.starts_with("https://")) {
+        if end_point.is_empty()
+            || !(end_point.starts_with("http://") || end_point.starts_with("https://"))
+        {
             return Err("end_point 必须以 http:// 或 https:// 开头".into());
         }
         let api_key = self.form.tabs[4].value.clone();
@@ -113,7 +119,14 @@ impl ProviderForm {
         } else {
             crate::config::parse_context_size(&ctx_raw)?
         };
-        Ok((p, provider_name, model_name, end_point, api_key, context_max_size))
+        Ok((
+            p,
+            provider_name,
+            model_name,
+            end_point,
+            api_key,
+            context_max_size,
+        ))
     }
 
     fn parse_protocol(&self) -> Result<Protocol, String> {
@@ -179,7 +192,12 @@ impl Screen for ProviderForm {
         // 顶部提示
         let hint = "← → 切换 Tab   Enter 进入编辑   Esc 返回";
         frame.put_str(
-            Rect::new(2, frame.area.height.saturating_sub(2), frame.area.width.saturating_sub(4), 1),
+            Rect::new(
+                2,
+                frame.area.height.saturating_sub(2),
+                frame.area.width.saturating_sub(4),
+                1,
+            ),
             hint,
             theme::DIM,
             attr::NONE,
@@ -196,10 +214,18 @@ impl Screen for ProviderForm {
             let focused = self.form.focus == i;
             let editing = self.form.is_editing(i);
 
-            let label_area = Rect::new(2, y, 16, 1);
-            let value_area = Rect::new(20, y, frame.area.width.saturating_sub(22), 1);
+            // label_area 宽度从 16 调为 24,完整容纳 `context_max_size`(16字符)
+            // + `▸ ` 前缀(2字符,▸ 宽度 2)+ `N. ` 序号与点(3字符)+ 空格 1,
+            // 共 22 字符;24 给一个余量列避免边缘截断。
+            // value_area x 起点同步右移到 26(2+24),保证 label 与 value 间有 2 列间隔。
+            let label_area = Rect::new(2, y, 24, 1);
+            let value_area = Rect::new(26, y, frame.area.width.saturating_sub(28), 1);
             let (label_fg, label_attrs, label_prefix) = if focused {
-                (theme::TAB_FOCUSED_FG, theme::TAB_FOCUSED_ATTRS, theme::TAB_FOCUSED_PREFIX)
+                (
+                    theme::TAB_FOCUSED_FG,
+                    theme::TAB_FOCUSED_ATTRS,
+                    theme::TAB_FOCUSED_PREFIX,
+                )
             } else {
                 (theme::DIM, attr::NONE, "  ")
             };
@@ -233,7 +259,9 @@ impl Screen for ProviderForm {
                         if j == cur && focused {
                             line.push_str(&format!(
                                 "{}{}{}",
-                                theme::SELECTED_BUTTON_L, s, theme::SELECTED_BUTTON_R
+                                theme::SELECTED_BUTTON_L,
+                                s,
+                                theme::SELECTED_BUTTON_R
                             ));
                             line.push_str("  ");
                         } else {
@@ -267,7 +295,12 @@ impl Screen for ProviderForm {
                         (
                             theme::SELECTED_FG,
                             theme::SELECTED_ATTRS,
-                            format!("{}{}{}", theme::SELECTED_BUTTON_L, display, theme::SELECTED_BUTTON_R),
+                            format!(
+                                "{}{}{}",
+                                theme::SELECTED_BUTTON_L,
+                                display,
+                                theme::SELECTED_BUTTON_R
+                            ),
                         )
                     } else if focused {
                         (theme::TAB_FOCUSED_FG, theme::TAB_FOCUSED_ATTRS, display)
@@ -281,7 +314,12 @@ impl Screen for ProviderForm {
 
         // 错误提示
         if let Some(e) = &self.error {
-            let area = Rect::new(2, frame.area.height.saturating_sub(4), frame.area.width.saturating_sub(4), 1);
+            let area = Rect::new(
+                2,
+                frame.area.height.saturating_sub(4),
+                frame.area.width.saturating_sub(4),
+                1,
+            );
             frame.put_str(area, &format!("! {e}"), theme::ERROR, attr::BOLD);
         }
     }
@@ -289,7 +327,9 @@ impl Screen for ProviderForm {
     fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         // Ctrl-C: 强退
         if matches!(key.code, KeyCode::Char('c'))
-            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
         {
             return Outcome::Pop;
         }
@@ -320,11 +360,7 @@ mod tests {
     #[test]
     fn add_form_validates() {
         let (db, paths, _d) = fresh();
-        let mut form = ProviderForm::new_add(
-            db.clone(),
-            paths,
-            Box::new(|_| {}),
-        );
+        let mut form = ProviderForm::new_add(db.clone(), paths, Box::new(|_| {}));
         // 试图在 end_point 为空时提交
         let err = form.validate();
         assert!(err.is_err());
