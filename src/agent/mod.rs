@@ -187,6 +187,12 @@ impl Agent {
         // 单元结束时由 ExecutionTrace::collect_failure_signals 统一打标。
         let mut trace = ExecutionTrace::default();
 
+        // 关联报告: 2026-09-09_06 F-002 — 最近工具调用历史(用于无文本收敛短路时
+        // 输出「叙事化摘要」,而非纯机械的次数统计;最多保留 RECENT_TOOL_HISTORY_LIMIT
+        // 条避免无限增长)。
+        const RECENT_TOOL_HISTORY_LIMIT: usize = 16;
+        let mut recent_tool_history: Vec<(String, String, bool)> = Vec::new(); // (tool, args_digest, is_error)
+
         for iter in 0..self.max_iterations {
             trace.iterations = iter + 1;
             // 迭代边界:取消检查(轻量 is_cancelled,热路径零 await 开销)
@@ -354,6 +360,13 @@ impl Agent {
                     any_success_this_round = true;
                 }
                 trace.tool_calls += 1;
+                // 关联报告: 2026-09-09_06 F-002 — 累计最近工具调用历史
+                let args_digest = crate::agent::extrace::compact_args_digest(&args);
+                recent_tool_history.push((name.clone(), args_digest, is_error));
+                if recent_tool_history.len() > RECENT_TOOL_HISTORY_LIMIT {
+                    let drop_n = recent_tool_history.len() - RECENT_TOOL_HISTORY_LIMIT;
+                    recent_tool_history.drain(0..drop_n);
+                }
                 session
                     .context_mut()
                     .push(ChatMessage::tool_result(id, output, is_error));
@@ -382,21 +395,45 @@ impl Agent {
                 trace.early_terminated = true;
                 trace.early_terminate_reason =
                     format!("no_text_converge rounds={}", consecutive_no_text_rounds);
-                // 注入 nudge 让 LLM 主动收敛,即便不返回最终答复也走 finalize 路径
-                session.context_mut().push(ChatMessage::user(
-                    "[系统提示] 你已连续多轮只调用工具未输出最终答复。\
-                     请基于已收集到的工具结果直接给出结论性答复,不要再发起新的工具调用。"
-                        .to_string(),
-                ));
-                // 合成兜底文本:基于工具执行情况聚合
+                // 关联报告: 2026-09-09_06 F-002 — 把「最近工具调用叙事化摘要」一并
+                // 注入,让 LLM 看到自己刚才做了什么(而非纯次数统计),下次任务能自我纠正。
+                let history_lines: Vec<String> = recent_tool_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (tool, args, err))| {
+                        let status = if *err { "失败" } else { "成功" };
+                        format!("  [{:>2}] {} {} → {}", i + 1, status, tool, args)
+                    })
+                    .collect();
+                let history_block = if history_lines.is_empty() {
+                    "  (无工具调用历史)".to_string()
+                } else {
+                    history_lines.join("\n")
+                };
+                let narrative = format!(
+                    "[无文本收敛已达上限 {} 轮,关联报告 2026-09-09_06 F-002]\n\
+                     你本会话累计执行 {total_tc} 次工具调用(成功 {total_ok},失败 {total_err}),\
+                     最近 {hist_len} 次摘要:\n{history}\n\
+                     请基于以上观察直接给出结论性答复;若任务已无法继续,请明确说明卡点。",
+                    NO_TEXT_CONVERGE_THRESHOLD,
+                    total_tc = trace.tool_calls,
+                    total_ok = trace.tool_calls_ok,
+                    total_err = trace.tool_calls_err,
+                    hist_len = recent_tool_history.len(),
+                    history = history_block,
+                );
+                session.context_mut().push(ChatMessage::user(narrative));
+                // 兜底文本:同步告知用户层
                 let fallback_text = format!(
-                    "[SubAgent 已达无文本收敛上限 {} 轮,基于以下工具执行情况返回]\n\n\
-                     - 共执行 {tc} 次(成功 {ok},失败 {err})\n\
-                     - 详细工具结果请参考 Session 历史 context",
+                    "[SubAgent 已达无文本收敛上限 {} 轮]\n\
+                     - 共执行 {tc} 次工具调用(成功 {ok},失败 {err})\n\
+                     - 最近 {hist_len} 次摘要:\n{history}",
                     NO_TEXT_CONVERGE_THRESHOLD,
                     tc = trace.tool_calls,
                     ok = trace.tool_calls_ok,
                     err = trace.tool_calls_err,
+                    hist_len = recent_tool_history.len(),
+                    history = history_block,
                 );
                 return Ok(Self::finalize_trace(
                     trace,

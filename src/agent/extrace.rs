@@ -145,6 +145,76 @@ fn looks_like_failure_text(text: &str) -> bool {
     false
 }
 
+/// 把工具入参(`serde_json::Value`)压缩成短摘要字符串,用于无文本收敛短路时
+/// 渲染「最近工具调用历史」叙事化摘要(关联报告 2026-09-09_06 F-002)。
+///
+/// 设计要点:
+/// - 仅取 1~3 个核心字段的值,避免长字符串(如 Read 的 `file_path`)撑爆单行;
+/// - 长字符串截短到 60 字符,防止 history 摘要超过上下文预算;
+/// - 空对象 → `"{}"`;非法 JSON → 原样转字符串并截短。
+pub fn compact_args_digest(args: &serde_json::Value) -> String {
+    use serde_json::Value;
+    const MAX_FRAGMENT: usize = 60;
+    fn trunc(s: &str, n: usize) -> String {
+        if s.chars().count() <= n {
+            s.to_string()
+        } else {
+            let head: String = s.chars().take(n).collect();
+            format!("{head}…")
+        }
+    }
+    match args {
+        Value::Object(map) => {
+            // 优先按 schema 的常见字段顺序: file_path → path → command → pattern → content
+            const PREFERRED: &[&str] = &[
+                "file_path", "path", "command", "pattern", "content", "old_string", "url",
+            ];
+            let mut fragments: Vec<String> = Vec::new();
+            'outer: for k in PREFERRED {
+                if let Some(v) = map.get(*k) {
+                    fragments.push(format!("{}={}", k, trunc(&value_to_compact(v), MAX_FRAGMENT)));
+                    if fragments.len() >= 3 {
+                        break 'outer;
+                    }
+                }
+            }
+            // 不足 3 个时再补其它字段
+            if fragments.len() < 3 {
+                for (k, v) in map.iter() {
+                    if PREFERRED.contains(&k.as_str()) {
+                        continue;
+                    }
+                    fragments.push(format!("{}={}", k, trunc(&value_to_compact(v), MAX_FRAGMENT)));
+                    if fragments.len() >= 3 {
+                        break;
+                    }
+                }
+            }
+            if fragments.is_empty() {
+                "{}".to_string()
+            } else {
+                fragments.join(" ")
+            }
+        }
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => trunc(s, MAX_FRAGMENT),
+        Value::Array(arr) => format!("[{} items]", arr.len()),
+    }
+}
+
+fn value_to_compact(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +312,60 @@ mod tests {
         assert!(s.contains("iterations=3"));
         assert!(s.contains("tool_calls=5(ok=4,err=1)"));
         assert!(s.contains("output_bytes=1280"));
+    }
+
+    // ========== compact_args_digest(F-002,2026-09-09_06) ==========
+
+    #[test]
+    fn digest_prefers_known_keys() {
+        // PREFERRED 顺序遇到存在字段就取,凑够 3 个就停
+        let v = serde_json::json!({
+            "file_path": "/tmp/foo.txt",
+            "extra_key": "should_be_dropped"
+        });
+        let s = compact_args_digest(&v);
+        assert!(s.contains("file_path="), "应包含 file_path,实际: {s}");
+        // 只有 1 个 PREFERRED 命中 → 取它,然后尝试补 extra_key 直到 3 个
+        assert!(s.contains("extra_key="), "不足 3 个时应补 extra_key,实际: {s}");
+    }
+
+    #[test]
+    fn digest_stops_at_three_when_preferred_satisfy() {
+        // PREFERRED 字段已有 3 个 → 凑满即停,不再补额外字段
+        let v = serde_json::json!({
+            "file_path": "/tmp/foo.txt",
+            "path": "/tmp/alt.txt",
+            "command": "ls -la",
+            "extra_key": "should_be_dropped"
+        });
+        let s = compact_args_digest(&v);
+        assert!(s.contains("file_path="), "应包含 file_path,实际: {s}");
+        assert!(s.contains("path="), "应包含 path,实际: {s}");
+        assert!(s.contains("command="), "应包含 command,实际: {s}");
+        // 凑满 3 个 → 不再补 extra_key
+        assert!(!s.contains("extra_key="), "凑满 3 个后应停止,实际: {s}");
+    }
+
+    #[test]
+    fn digest_truncates_long_strings() {
+        let long_path = "a".repeat(200);
+        let v = serde_json::json!({"file_path": long_path});
+        let s = compact_args_digest(&v);
+        // 截短到 60 字符 + 省略号
+        assert!(s.chars().count() <= 80, "应截短,实际长度 {} 内容: {s}", s.chars().count());
+        assert!(s.contains('…'), "应含省略号,实际: {s}");
+    }
+
+    #[test]
+    fn digest_handles_empty_object() {
+        let v = serde_json::json!({});
+        assert_eq!(compact_args_digest(&v), "{}");
+    }
+
+    #[test]
+    fn digest_handles_array() {
+        let v = serde_json::json!([1, 2, 3, 4, 5]);
+        let s = compact_args_digest(&v);
+        assert!(s.contains("[5 items]"), "数组应转 [N items],实际: {s}");
     }
 }

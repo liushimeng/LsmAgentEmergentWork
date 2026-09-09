@@ -58,6 +58,8 @@ impl Tool for ReadTool {
             // 关联报告: 2026-09-09_05 E-002 — 当路径不存在时,让错误消息同时显示
             // 「工作目录拼接路径」与「根目录回退路径」(若两者不同),便于 LLM / 用户快速
             // 定位路径解析方向(否则 LLM 可能反复构造根目录变体路径浪费迭代)。
+            // 关联报告: 2026-09-09_06 F-001 — 进一步在错误末尾追加「根目录说明」和
+            // 「源码相对路径」诊断提示,降低 LLM 反复构造变体路径浪费迭代的概率。
             let attempted = resolve_path_with_candidates(path_str);
             let reason_msg = match attempted {
                 ResolveCandidates::Single(p) => {
@@ -65,9 +67,10 @@ impl Tool for ReadTool {
                 }
                 ResolveCandidates::WorkAndRoot { work, root } => {
                     format!(
-                        "stat 失败: {e} (tried [work]: {}, [root]: {})",
+                        "stat 失败: {e} (tried [work]: {}, [root]: {})\n{}",
                         work.display(),
-                        root.display()
+                        root.display(),
+                        format_path_diagnostic(path_str, &work, &root),
                     )
                 }
             };
@@ -234,6 +237,71 @@ fn resolve_path_with_candidates(p: &str) -> ResolveCandidates {
     ResolveCandidates::Single(work_path)
 }
 
+/// 在 Read 工具 stat 失败时为错误消息追加「路径诊断」提示。
+///
+/// 关联报告: 2026-09-09_06 F-001。
+///
+/// 设计意图:典型 B09 测试场景里,LLM 想读 `src/agent/tools/read.rs` 这种「laew
+/// 自身源码相对路径」,但工作目录是 `TestWorkSpace/`(laew 子目录),导致工作目录
+/// 拼接路径 `TestWorkSpace/src/agent/tools/read.rs` 和根目录回退路径
+/// `LsmAgentEmergentWork/src/agent/tools/read.rs` **都不命中**(后者存在但错误
+/// 消息没显式提示「laew 根目录 + src/ 才是正解」)。本函数在错误消息末尾追加
+/// 引导文案,降低 LLM 反复构造变体路径浪费迭代的概率。
+///
+/// 触发条件:
+/// - `path_str` 以 `src/`、`tests/`、`docs/` 开头(典型 laew 源码/测试/文档相对路径),
+///   且工作目录 ≠ laew 根目录(典型「在子目录里跑 laew」场景);
+/// - 拼接后两条路径都不存在。
+///
+/// 不引入新依赖;纯字符串拼接;非命中场景不增加任何输出。
+fn format_path_diagnostic(path_str: &str, _work: &Path, root: &Path) -> String {
+    let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let work_dir_name = work_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let root_dir_name = root
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    // 场景 A:典型「laew 源码相对路径在子目录里跑」 → 提示改用绝对路径
+    let looks_like_source_rel = (path_str.starts_with("src/")
+        || path_str.starts_with("tests/")
+        || path_str.starts_with("docs/"))
+        && !work_dir_name.is_empty()
+        && !root_dir_name.is_empty()
+        && work_dir_name != root_dir_name;
+
+    // 场景 B:工作目录 = 根目录(就在 laew 根目录下跑),但相对路径在工作目录里查不到
+    // → 提示「相对路径不在工作目录」即可
+    let same_dir = !work_dir_name.is_empty()
+        && work_dir_name == root_dir_name;
+
+    if looks_like_source_rel {
+        format!(
+            "提示: 目标路径看起来像 laew 源码相对路径(`{path_str}`),但当前工作目录 \
+             是 `{work_dir_name}/`(laew 的子目录),相对路径在工作目录拼接下不命中。\
+             \n  - 如需读取 laew 自身源码,请改用绝对路径 `{root}/{path_str}`(根目录 + 相对路径),\
+             \n    或先 `cd` 到 laew 根目录再使用相对路径。",
+            path_str = path_str,
+            work_dir_name = work_dir_name,
+            root = root.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+        )
+    } else if same_dir {
+        format!(
+            "提示: 相对路径 `{path_str}` 在工作目录 `{work_dir_name}` 下未找到。\
+             请确认文件实际位置(可用 `ls` 或 `find` 探查),或改用绝对路径。",
+            path_str = path_str,
+            work_dir_name = work_dir_name,
+        )
+    } else {
+        // 非典型场景:不追加诊断,保持现有错误消息紧凑
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +399,85 @@ mod tests {
                     reason.contains("[root]"),
                     "错误消息应标注 [root] 路径,实际: {reason}"
                 );
+            }
+            other => panic!("预期 ToolExecution 错误,实际 {other:?}"),
+        }
+    }
+
+    // ========== F-001 路径诊断(2026-09-09_06,方案 tmpPlan/2026-09-09_06) ==========
+
+    #[test]
+    fn format_path_diagnostic_for_source_rel_in_subdir_hints_absolute() {
+        // 场景:工作目录 = laew 子目录(如 TestWorkSpace),LLM 想读 src/agent/tools/read.rs
+        // 期望诊断提示「请改用绝对路径 根目录/src/...」
+        let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let work_name = work_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        // 模拟一个不存在的 src 子路径
+        let rel = "src/agent/tools/zzz_definitely_missing.rs";
+        let work = work_dir.join(rel);
+        let root = PathBuf::from("/tmp/mock_root").join(rel);
+        let diag = format_path_diagnostic(rel, &work, &root);
+        if work_name != "LsmAgentEmergentWork" && !work_name.is_empty() {
+            // 工作目录是 laew 子目录(典型 TestWorkSpace 场景)
+            assert!(
+                diag.contains("改用绝对路径"),
+                "应提示改用绝对路径,实际: {diag}"
+            );
+            assert!(
+                diag.contains("laew 自身源码"),
+                "应识别为源码相对路径,实际: {diag}"
+            );
+        } else {
+            // 工作目录就是 laew 根目录 → 走 same_dir 分支或空分支
+            // 此分支在 CI 上不一定触发,这里不强制断言
+        }
+    }
+
+    #[test]
+    fn format_path_diagnostic_for_misc_rel_no_diag() {
+        // 场景:既不是 src/tests/docs 开头,也不在工作目录下
+        // 期望:不追加诊断(空字符串),保持错误消息紧凑
+        let rel = "some_random_file.txt";
+        let work = PathBuf::from("/tmp/workdir").join(rel);
+        let root = PathBuf::from("/tmp/rootdir").join(rel);
+        let diag = format_path_diagnostic(rel, &work, &root);
+        // 非典型场景:不应追加诊断
+        assert!(
+            diag.is_empty(),
+            "非典型场景应返回空诊断,实际: {diag}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_error_for_src_subpath_includes_diagnostic_hint() {
+        // 验证 Read 工具在「相对路径是 src/...」且工作目录 ≠ 根目录时,
+        // 错误消息末尾包含「请改用绝对路径」诊断提示
+        let rel = "src/agent/tools/zzz_definitely_missing_e2e.rs";
+        let err = ReadTool
+            .execute(json!({"file_path": rel}))
+            .await
+            .unwrap_err();
+        match err {
+            AgentError::ToolExecution { reason, .. } => {
+                // 双路径一定存在
+                assert!(reason.contains("[work]"), "应含 [work],实际: {reason}");
+                assert!(reason.contains("[root]"), "应含 [root],实际: {reason}");
+                // 当前工作目录若是 laew 子目录(典型 TestWorkSpace),应有诊断
+                let work_dir = std::env::current_dir().unwrap_or_default();
+                let work_name = work_dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if work_name != "LsmAgentEmergentWork" && !work_name.is_empty() {
+                    assert!(
+                        reason.contains("请改用绝对路径"),
+                        "工作目录是 laew 子目录时应追加诊断,实际: {reason}"
+                    );
+                }
             }
             other => panic!("预期 ToolExecution 错误,实际 {other:?}"),
         }

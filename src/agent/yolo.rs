@@ -317,6 +317,10 @@ fn extract_standalone_json(text: &str) -> Option<&str> {
 }
 
 /// 把 TaskClassification 转成 work prompt 文本(用于把分类结果作为下一步 user 消息)。
+///
+/// 关联报告 2026-09-09_06 F-003: 当 `classification.yolo_degraded == true` 时
+/// 在 prompt 末尾追加降级警告 + 建议,让 SubAgent 明确知道"为什么降级"以及
+/// "现在应该怎么办",避免在空 `goal_summary` 上做无意义工具调用。
 pub fn build_work_prompt(classification: &TaskClassification) -> String {
     let mut prompt = String::new();
     prompt.push_str("【任务计划】\n");
@@ -345,6 +349,19 @@ pub fn build_work_prompt(classification: &TaskClassification) -> String {
     prompt.push_str(
         "\n请按照以上计划执行任务。使用可用工具完成目标,完成后用简洁中文回复最终结果。",
     );
+
+    // F-003:Yolo 解析失败降级时显式告知 SubAgent
+    if classification.yolo_degraded {
+        prompt.push_str(
+            "\n\n⚠️ [Yolo 分类解析失败,已降级为 Simple 直答模式]\n\
+             说明: 上层 Yolo Agent 返回的 JSON 分类结果无法解析,已自动 fallback 到 Simple + SubAgent。\n\
+             建议:\n\
+               - 若这是知识问答 / 简单查询,请直接给出最终答案(不要再拆解任务);\n\
+               - 若涉及多步工具调用,请显式提示用户重新表述或补充任务边界(目标 / 验收标准 / 输入数据);\n\
+               - 若需要更复杂的规划,请明确告知用户「需要重新启动并提供更明确的任务描述」。",
+        );
+    }
+
     prompt
 }
 
@@ -461,6 +478,58 @@ mod tests {
         assert_eq!(TaskLevel::Simple.display_name(), "简单");
         assert_eq!(TaskLevel::Medium.display_name(), "中等难度");
         assert_eq!(TaskLevel::Hard.display_name(), "高等难度");
+    }
+
+    // ========== F-003:Yolo 降级警告(2026-09-09_06,方案 tmpPlan/2026-09-09_06) ==========
+
+    #[test]
+    fn build_work_prompt_with_yolo_degraded_adds_warning() {
+        // yolo_degraded=true → prompt 应含「Yolo 分类解析失败」警告 + actionable 建议
+        let c = TaskClassification {
+            task_level: TaskLevel::Simple,
+            purpose: String::new(),
+            goal_summary: "(解析失败,已降级)".into(),
+            intent: "unknown".into(),
+            agent_role: Some(AgentRole::SubAgent),
+            decomposition_plan: vec![],
+            direct_answer: None,
+            user_suggestion_if_fail: String::new(),
+            yolo_degraded: true,
+        };
+        let prompt = build_work_prompt(&c);
+        assert!(
+            prompt.contains("Yolo 分类解析失败"),
+            "降级模式应含警告,实际: {prompt}"
+        );
+        assert!(
+            prompt.contains("已降级为 Simple"),
+            "应说明降级结果,实际: {prompt}"
+        );
+        assert!(
+            prompt.contains("建议"),
+            "应给 actionable 建议,实际: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_work_prompt_normal_no_warning() {
+        // yolo_degraded=false → prompt 不应含警告
+        let c = TaskClassification {
+            task_level: TaskLevel::Medium,
+            purpose: "验证".into(),
+            goal_summary: "正常目标".into(),
+            intent: "code_change".into(),
+            agent_role: Some(AgentRole::MainWork),
+            decomposition_plan: vec!["步骤1".into()],
+            direct_answer: None,
+            user_suggestion_if_fail: String::new(),
+            yolo_degraded: false,
+        };
+        let prompt = build_work_prompt(&c);
+        assert!(
+            !prompt.contains("Yolo 分类解析失败"),
+            "正常模式不应含降级警告,实际: {prompt}"
+        );
     }
 
     #[test]
