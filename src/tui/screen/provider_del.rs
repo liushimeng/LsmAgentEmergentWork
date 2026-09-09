@@ -3,11 +3,10 @@
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crossterm::style::Attribute;
 
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::tui::engine::{Frame, Outcome, Rect, Screen};
-use crate::tui::theme;
+use crate::tui::theme::{self, attr};
 
 /// 选择屏：列出所有记录,高亮 cursor 指向的那条;Enter 进 Confirm。
 pub struct ProviderDelPicker {
@@ -40,12 +39,12 @@ impl Screen for ProviderDelPicker {
             Rect::new(2, 1, frame.area.width.saturating_sub(4), 1),
             header,
             theme::DIM,
-            Attribute::Reset,
+            attr::NONE,
         );
 
         if self.records.is_empty() {
             let area = Rect::new(4, 4, frame.area.width.saturating_sub(8), 1);
-            frame.put_str(area, "(空)没有可删除的接入记录。", theme::FG, Attribute::Reset);
+            frame.put_str(area, "(空)没有可删除的接入记录。", theme::FG, attr::NONE);
             return;
         }
 
@@ -55,9 +54,10 @@ impl Screen for ProviderDelPicker {
             if y + 1 >= frame.area.height.saturating_sub(3) {
                 break;
             }
-            let marker = if i == self.cursor { "►" } else { " " };
+            let focused = i == self.cursor;
+            let marker = if focused { theme::SELECTED_PREFIX } else { "  " };
             let line = format!(
-                "{} id={}  [{}]  {}/{}  @ {}  key={}",
+                "{}id={}  [{}]  {}/{}  @ {}  key={}",
                 marker,
                 r.id,
                 r.protocol.as_str(),
@@ -66,16 +66,16 @@ impl Screen for ProviderDelPicker {
                 r.end_point,
                 theme::mask_key(&r.api_key),
             );
-            let attr = if i == self.cursor {
-                Attribute::Reverse
+            let (fg, attrs) = if focused {
+                (theme::SELECTED_FG, theme::SELECTED_ATTRS)
             } else {
-                Attribute::Reset
+                (theme::FG, attr::NONE)
             };
             frame.put_str(
                 Rect::new(4, y, frame.area.width.saturating_sub(8), 1),
                 &line,
-                theme::FG,
-                attr,
+                fg,
+                attrs,
             );
         }
 
@@ -84,7 +84,7 @@ impl Screen for ProviderDelPicker {
             Rect::new(2, frame.area.height.saturating_sub(2), frame.area.width.saturating_sub(4), 1),
             help,
             theme::DIM,
-            Attribute::Reset,
+            attr::NONE,
         );
     }
 
@@ -154,7 +154,7 @@ impl Screen for ProviderDelConfirm {
             Rect::new(2, 1, frame.area.width.saturating_sub(4), 1),
             header,
             theme::DIM,
-            Attribute::Reset,
+            attr::NONE,
         );
 
         let r = &self.target;
@@ -175,35 +175,46 @@ impl Screen for ProviderDelConfirm {
                 Rect::new(4, y, frame.area.width.saturating_sub(8), 1),
                 line,
                 theme::FG,
-                Attribute::Reset,
+                attr::NONE,
             );
         }
 
-        // 按钮
+        // 按钮 —— 选中态: `▶ [ X ] ◀` + ACCENT + Bold + Reverse
         let button_y = frame.area.height.saturating_sub(4);
         let confirm_label = "[ 确认删除 ]";
         let cancel_label = "[ 取消 ]";
-        let confirm_attr = if self.cursor == 0 {
-            Attribute::Reverse
+
+        let (confirm_fg, confirm_attrs, confirm_text) = if self.cursor == 0 {
+            (
+                theme::SELECTED_FG,
+                theme::SELECTED_ATTRS,
+                format!("{}{}{}", theme::SELECTED_BUTTON_L, confirm_label, theme::SELECTED_BUTTON_R),
+            )
         } else {
-            Attribute::Reset
+            (theme::FG, attr::NONE, format!("  {}  ", confirm_label))
         };
-        let cancel_attr = if self.cursor == 1 {
-            Attribute::Reverse
+
+        let (cancel_fg, cancel_attrs, cancel_text) = if self.cursor == 1 {
+            (
+                theme::SELECTED_FG,
+                theme::SELECTED_ATTRS,
+                format!("{}{}{}", theme::SELECTED_BUTTON_L, cancel_label, theme::SELECTED_BUTTON_R),
+            )
         } else {
-            Attribute::Reset
+            (theme::FG, attr::NONE, format!("  {}  ", cancel_label))
         };
+
         frame.put_str(
-            Rect::new(4, button_y, confirm_label.chars().count() as u16, 1),
-            confirm_label,
-            theme::FG,
-            confirm_attr,
+            Rect::new(4, button_y, confirm_text.chars().count() as u16 + 1, 1),
+            &confirm_text,
+            confirm_fg,
+            confirm_attrs,
         );
         frame.put_str(
-            Rect::new(4 + confirm_label.chars().count() as u16 + 4, button_y, cancel_label.chars().count() as u16, 1),
-            cancel_label,
-            theme::FG,
-            cancel_attr,
+            Rect::new(4 + confirm_text.chars().count() as u16 + 3, button_y, cancel_text.chars().count() as u16 + 1, 1),
+            &cancel_text,
+            cancel_fg,
+            cancel_attrs,
         );
 
         let help = "← → 切换按钮   Enter 触发   Esc 取消";
@@ -211,7 +222,7 @@ impl Screen for ProviderDelConfirm {
             Rect::new(2, frame.area.height.saturating_sub(2), frame.area.width.saturating_sub(4), 1),
             help,
             theme::DIM,
-            Attribute::Reset,
+            attr::NONE,
         );
     }
 

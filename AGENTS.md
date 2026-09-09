@@ -130,6 +130,28 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - 确认 Tab：`[ 确认 ]` / `[ 取消 ]`，左右切换，Enter 触发。
 - **API Key 全程脱敏**：浏览态显示 `****<末4位>`；仅进入 Tab 5 编辑态时显示明文。
 
+### 选中效果视觉规范（2026-09-09 起统一遵循）
+
+**核心原则**：所有可聚焦控件（按钮 / 列表行 / Tab 标签 / Choice 选项 / Text 编辑态 / 补全菜单）
+的"选中态"与"普通态"必须**一眼可辨**。规范组合：**形状 + 边框 + 颜色 + 字重 + 反白**，按控件类型选用子集：
+
+| 控件类型 | 形状 | 边框 | 颜色 | 字重 | 反白 |
+|---------|------|------|------|------|------|
+| **操作按钮** (确认/取消/删除/返回) | — | `▶ [ X ] ◀` | `theme::SELECTED_FG`(Cyan) | Bold | Reverse |
+| **列表行** (Picker 记录项) | `► ` 前缀 | — | `SELECTED_FG` | Bold | Reverse |
+| **Tab 标签** (表单 label) | `▸ ` 前缀 | — | `TAB_FOCUSED_FG`(Cyan) | Bold | — |
+| **Choice 选中项** (anthropic/openai) | — | `[ x ]` | ACCENT | Bold | — |
+| **Text 编辑态** | — | `▶ ... ◀` 包裹 | `SELECTED_FG` | Bold | Reverse |
+| **补全菜单选中项** | `► ` 前缀 | — | `HIGHLIGHT_FG`(White) | Bold | Reverse |
+
+**落地约束**：
+- 选中态常量集中在 `src/tui/theme.rs`（`SELECTED_FG` / `SELECTED_ATTRS` / `TAB_FOCUSED_*` /
+  `SELECTED_PREFIX` / `TAB_FOCUSED_PREFIX` / `SELECTED_BUTTON_L` / `SELECTED_BUTTON_R`），**禁止屏幕内硬编码**。
+- `Cell.attrs: u8` 位掩码（`attr::BOLD | attr::REVERSE | ...`），支持多属性叠加；
+  `engine::present()` 逐 cell 检测样式变化并输出 ANSI 序列。
+- 不使用 `Blink`（兼容性差且干扰阅读）。
+- 新增子屏 / 新控件类型时，必须沿用上述规范；新控件类型先在 `theme.rs` 注册常量再使用。
+
 ### 关键约定
 
 - 新增子屏：实现 `engine::Screen` trait，在 `mod.rs::handle_slash` 中路由。

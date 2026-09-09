@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::tui::theme::{self, BUTTON_FOCUSED};
+use crate::tui::theme;
 
 /// 单个 Tab 的种类。
 #[derive(Debug, Clone)]
@@ -296,12 +296,12 @@ impl TabForm {
         }
     }
 
-    /// 当前按钮是否被聚焦(用于决定是否渲染反白)。
-    pub fn button_attr(&self) -> crossterm::style::Attribute {
+    /// 当前按钮是否被聚焦(用于决定渲染样式)。
+    pub fn button_attrs(&self) -> u8 {
         if self.editing == Some(self.focus) {
-            BUTTON_FOCUSED
+            theme::SELECTED_ATTRS
         } else {
-            crossterm::style::Attribute::Reset
+            theme::attr::NONE
         }
     }
 }

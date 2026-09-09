@@ -364,12 +364,13 @@ impl InputHandler {
 
         for (i, item) in items.iter().enumerate() {
             if i == selected {
-                // 选中项：反白显示
+                // 选中项：► 前缀 + 反白 + 加粗 + 高亮色
                 execute!(
                     stdout,
                     SetForegroundColor(colors::HIGHLIGHT_FG),
+                    SetAttribute(Attribute::Bold),
                     SetAttribute(Attribute::Reverse),
-                    Print(format!(" > {}  ", item.display)),
+                    Print(format!(" ► {}  ", item.display)),
                     SetAttribute(Attribute::Reset),
                     SetForegroundColor(colors::GRAY),
                     Print(format!("  {}\r\n", item.description)),

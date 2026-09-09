@@ -3,12 +3,11 @@
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use crossterm::style::Attribute;
 
 use crate::config::{Db, Paths, Protocol, ProviderRecord};
 use crate::tui::engine::{Frame, Outcome, Rect, Screen};
 use crate::tui::form::{ConfirmAction, FormOutcome, TabForm, Tab};
-use crate::tui::theme;
+use crate::tui::theme::{self, attr};
 
 /// ProviderForm 模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +182,7 @@ impl Screen for ProviderForm {
             Rect::new(2, frame.area.height.saturating_sub(2), frame.area.width.saturating_sub(4), 1),
             hint,
             theme::DIM,
-            Attribute::Reset,
+            attr::NONE,
         );
 
         // Tab 列表
@@ -199,14 +198,13 @@ impl Screen for ProviderForm {
 
             let label_area = Rect::new(2, y, 16, 1);
             let value_area = Rect::new(20, y, frame.area.width.saturating_sub(22), 1);
-            let label_fg = if focused { theme::ACCENT } else { theme::DIM };
-            let label_attr = if focused {
-                Attribute::Bold
+            let (label_fg, label_attrs, label_prefix) = if focused {
+                (theme::TAB_FOCUSED_FG, theme::TAB_FOCUSED_ATTRS, theme::TAB_FOCUSED_PREFIX)
             } else {
-                Attribute::Reset
+                (theme::DIM, attr::NONE, "  ")
             };
-            let label = format!("{}. {}", i + 1, tab.label);
-            frame.put_str(label_area, &label, label_fg, label_attr);
+            let label = format!("{}{}. {}", label_prefix, i + 1, tab.label);
+            frame.put_str(label_area, &label, label_fg, label_attrs);
 
             // 值
             match &tab.kind {
@@ -220,26 +218,34 @@ impl Screen for ProviderForm {
                             line.push_str(&format!("  {}  ", ch));
                         }
                     }
-                    frame.put_str(value_area, &line, theme::FG, Attribute::Reset);
+                    let (fg, attrs) = if focused {
+                        (theme::ACCENT, theme::CHOICE_FOCUSED_ATTRS)
+                    } else {
+                        (theme::FG, attr::NONE)
+                    };
+                    frame.put_str(value_area, &line, fg, attrs);
                 }
                 crate::tui::form::TabKind::Confirm { actions, cursor } => {
                     let cur = *cursor;
                     let mut line = String::new();
                     for (j, a) in actions.iter().enumerate() {
-                        let attr = if j == cur && focused {
-                            Attribute::Reverse
-                        } else {
-                            Attribute::Reset
-                        };
                         let s = a.label();
                         if j == cur && focused {
-                            line.push_str(&format!(">{s}< "));
+                            line.push_str(&format!(
+                                "{}{}{}",
+                                theme::SELECTED_BUTTON_L, s, theme::SELECTED_BUTTON_R
+                            ));
+                            line.push_str("  ");
                         } else {
-                            line.push_str(&format!(" {s}  "));
+                            line.push_str(&format!("  {s}  "));
                         }
-                        let _ = attr;
                     }
-                    frame.put_str(value_area, &line, theme::FG, Attribute::Reset);
+                    let (fg, attrs) = if focused {
+                        (theme::SELECTED_FG, theme::SELECTED_ATTRS)
+                    } else {
+                        (theme::FG, attr::NONE)
+                    };
+                    frame.put_str(value_area, &line, fg, attrs);
                 }
                 crate::tui::form::TabKind::Text { masked, .. } => {
                     let display = if *masked && !editing {
@@ -257,9 +263,18 @@ impl Screen for ProviderForm {
                     } else {
                         tab.value.clone()
                     };
-                    let fg = if focused && editing { theme::ACCENT } else { theme::FG };
-                    let attr = if focused && editing { Attribute::Reverse } else { Attribute::Reset };
-                    frame.put_str(value_area, &display, fg, attr);
+                    let (fg, attrs, wrapped) = if focused && editing {
+                        (
+                            theme::SELECTED_FG,
+                            theme::SELECTED_ATTRS,
+                            format!("{}{}{}", theme::SELECTED_BUTTON_L, display, theme::SELECTED_BUTTON_R),
+                        )
+                    } else if focused {
+                        (theme::TAB_FOCUSED_FG, theme::TAB_FOCUSED_ATTRS, display)
+                    } else {
+                        (theme::FG, attr::NONE, display)
+                    };
+                    frame.put_str(value_area, &wrapped, fg, attrs);
                 }
             }
         }
@@ -267,7 +282,7 @@ impl Screen for ProviderForm {
         // 错误提示
         if let Some(e) = &self.error {
             let area = Rect::new(2, frame.area.height.saturating_sub(4), frame.area.width.saturating_sub(4), 1);
-            frame.put_str(area, &format!("! {e}"), theme::ERROR, Attribute::Bold);
+            frame.put_str(area, &format!("! {e}"), theme::ERROR, attr::BOLD);
         }
     }
 

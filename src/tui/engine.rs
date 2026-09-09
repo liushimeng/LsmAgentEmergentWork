@@ -15,7 +15,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use crate::tui::theme;
+use crate::tui::theme::{self, attr};
 
 /// 屏幕区域(简化版 ratatui Rect)。
 #[derive(Debug, Clone, Copy)]
@@ -43,7 +43,8 @@ pub struct Cell {
     pub ch: char,
     pub fg: Color,
     pub bg: Color,
-    pub attr: Attribute,
+    /// 属性位掩码,见 `theme::attr`。
+    pub attrs: u8,
 }
 
 impl Cell {
@@ -52,7 +53,7 @@ impl Cell {
             ch: ' ',
             fg: theme::FG,
             bg: Color::Reset,
-            attr: Attribute::Reset,
+            attrs: attr::NONE,
         }
     }
 }
@@ -77,14 +78,14 @@ impl Frame {
     }
 
     /// 在指定位置写一个字符(超出区域静默忽略)。
-    pub fn put_char(&mut self, x: u16, y: u16, ch: char, fg: Color, attr: Attribute) {
+    pub fn put_char(&mut self, x: u16, y: u16, ch: char, fg: Color, attrs: u8) {
         if let Some(i) = self.idx(x, y) {
-            self.cells[i] = Cell { ch, fg, bg: Color::Reset, attr };
+            self.cells[i] = Cell { ch, fg, bg: Color::Reset, attrs };
         }
     }
 
     /// 在区域内写入字符串(遇换行换到下一行;不够放就截断)。
-    pub fn put_str(&mut self, area: Rect, s: &str, fg: Color, attr: Attribute) {
+    pub fn put_str(&mut self, area: Rect, s: &str, fg: Color, attrs: u8) {
         let mut x = area.x;
         let mut y = area.y;
         for ch in s.chars() {
@@ -99,17 +100,17 @@ impl Frame {
             if y >= area.y + area.height {
                 break;
             }
-            self.put_char(x, y, ch, fg, attr);
+            self.put_char(x, y, ch, fg, attrs);
             x += 1;
         }
     }
 
     /// 在区域内居中写一行(用于标题 / 单行消息)。
-    pub fn put_str_centered(&mut self, y: u16, s: &str, fg: Color, attr: Attribute) {
+    pub fn put_str_centered(&mut self, y: u16, s: &str, fg: Color, attrs: u8) {
         let w = s.chars().count() as u16;
         let x = self.area.width.saturating_sub(w) / 2;
         let area = Rect::new(x, y, w.min(self.area.width), 1);
-        self.put_str(area, s, fg, attr);
+        self.put_str(area, s, fg, attrs);
     }
 
     /// 用 ASCII 边框绘制一个矩形 + 标题。
@@ -121,42 +122,42 @@ impl Frame {
         }
         // 顶 / 底
         for x in 1..(w - 1) {
-            self.put_char(area.x + x as u16, area.y, '─', theme::ACCENT, Attribute::Reset);
+            self.put_char(area.x + x as u16, area.y, '─', theme::ACCENT, attr::NONE);
             self.put_char(
                 area.x + x as u16,
                 area.y + area.height - 1,
                 '─',
                 theme::ACCENT,
-                Attribute::Reset,
+                attr::NONE,
             );
         }
         // 左 / 右
         for y in 1..(h - 1) {
-            self.put_char(area.x, area.y + y as u16, '│', theme::ACCENT, Attribute::Reset);
+            self.put_char(area.x, area.y + y as u16, '│', theme::ACCENT, attr::NONE);
             self.put_char(
                 area.x + area.width - 1,
                 area.y + y as u16,
                 '│',
                 theme::ACCENT,
-                Attribute::Reset,
+                attr::NONE,
             );
         }
         // 四角
-        self.put_char(area.x, area.y, '╭', theme::ACCENT, Attribute::Reset);
-        self.put_char(area.x + area.width - 1, area.y, '╮', theme::ACCENT, Attribute::Reset);
+        self.put_char(area.x, area.y, '╭', theme::ACCENT, attr::NONE);
+        self.put_char(area.x + area.width - 1, area.y, '╮', theme::ACCENT, attr::NONE);
         self.put_char(
             area.x,
             area.y + area.height - 1,
             '╰',
             theme::ACCENT,
-            Attribute::Reset,
+            attr::NONE,
         );
         self.put_char(
             area.x + area.width - 1,
             area.y + area.height - 1,
             '╯',
             theme::ACCENT,
-            Attribute::Reset,
+            attr::NONE,
         );
 
         if let Some(t) = title {
@@ -165,7 +166,7 @@ impl Frame {
                 Rect::new(area.x + 2, area.y, label.chars().count() as u16, 1),
                 &label,
                 theme::ACCENT,
-                Attribute::Bold,
+                attr::BOLD,
             );
         }
     }
@@ -209,35 +210,85 @@ pub fn leave_alt() -> io::Result<()> {
     Ok(())
 }
 
+/// 把 attrs 位掩码展开为 crossterm Attribute 序列。
+fn attrs_to_list(attrs: u8) -> Vec<Attribute> {
+    let mut v = Vec::new();
+    if attrs & attr::BOLD != 0 {
+        v.push(Attribute::Bold);
+    }
+    if attrs & attr::REVERSE != 0 {
+        v.push(Attribute::Reverse);
+    }
+    if attrs & attr::DIM != 0 {
+        v.push(Attribute::Dim);
+    }
+    if attrs & attr::UNDERLINED != 0 {
+        v.push(Attribute::Underlined);
+    }
+    v
+}
+
 /// 把 Frame 全量绘制到 stdout(子屏用)。
+/// 逐 cell 检查 fg/bg/attrs,与"前一个 cell"比较;样式变化时输出 ANSI 序列,相同样式的连续 cell 合并成一个 Print 批次。
 pub fn present(frame: &Frame) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+    execute!(
+        stdout,
+        MoveTo(0, 0),
+        Clear(ClearType::All),
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+    )?;
 
     let w = frame.area.width as usize;
-    let prev_fg = Color::Reset;
-    let prev_bg = Color::Reset;
-    let prev_attr = Attribute::Reset;
+    let mut cur_fg = Color::Reset;
+    let mut cur_bg = Color::Reset;
+    let mut cur_attrs: u8 = attr::NONE;
 
     for y in 0..frame.area.height {
-        // 移到行首
         execute!(stdout, MoveTo(0, y))?;
-        let mut line = String::with_capacity(w);
+        let mut batch = String::with_capacity(w);
         for x in 0..frame.area.width {
             let cell = &frame.cells[(y as usize) * w + (x as usize)];
-            line.push(cell.ch);
+            if cell.fg != cur_fg || cell.bg != cur_bg || cell.attrs != cur_attrs {
+                // flush 旧批次
+                if !batch.is_empty() {
+                    execute!(stdout, Print(&batch))?;
+                    batch.clear();
+                }
+                // 更新属性(先复位再按需设置)
+                if cell.attrs != cur_attrs {
+                    execute!(stdout, SetAttribute(Attribute::Reset))?;
+                    for a in attrs_to_list(cell.attrs) {
+                        execute!(stdout, SetAttribute(a))?;
+                    }
+                    cur_attrs = cell.attrs;
+                }
+                if cell.bg != cur_bg {
+                    execute!(stdout, SetBackgroundColor(cell.bg))?;
+                    cur_bg = cell.bg;
+                }
+                if cell.fg != cur_fg {
+                    execute!(stdout, SetForegroundColor(cell.fg))?;
+                    cur_fg = cell.fg;
+                }
+            }
+            batch.push(cell.ch);
         }
-        // 重置颜色后输出整行(简化:全行同色,由后续业务控制;子屏用纯 ASCII 边框 + 内容,够用)
+        if !batch.is_empty() {
+            execute!(stdout, Print(&batch))?;
+        }
+        // 每行结束后复位,避免行间样式渗透
         execute!(
             stdout,
             ResetColor,
-            SetForegroundColor(prev_fg),
-            SetBackgroundColor(prev_bg),
-            SetAttribute(prev_attr),
-            Print(&line),
+            SetAttribute(Attribute::Reset),
         )?;
+        cur_fg = Color::Reset;
+        cur_bg = Color::Reset;
+        cur_attrs = attr::NONE;
     }
-    execute!(stdout, ResetColor)?;
+    execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
     stdout.flush()?;
     Ok(())
 }
@@ -260,7 +311,7 @@ mod tests {
     #[test]
     fn frame_put_str_wraps() {
         let mut f = Frame::new(Rect::new(0, 0, 10, 3));
-        f.put_str(Rect::new(0, 0, 10, 1), "hello", theme::FG, Attribute::Reset);
+        f.put_str(Rect::new(0, 0, 10, 1), "hello", theme::FG, attr::NONE);
         let idx = |x, y| (y as usize) * 10 + (x as usize);
         assert_eq!(f.cells[idx(0, 0)].ch, 'h');
         assert_eq!(f.cells[idx(4, 0)].ch, 'o');
@@ -274,5 +325,33 @@ mod tests {
         let idx = |x, y| (y as usize) * 8 + (x as usize);
         assert_eq!(f.cells[idx(0, 0)].ch, '╭');
         assert_eq!(f.cells[idx(7, 3)].ch, '╯');
+    }
+
+    #[test]
+    fn cell_attrs_bitmask() {
+        let mut f = Frame::new(Rect::new(0, 0, 8, 1));
+        // 同时设置 BOLD + REVERSE
+        f.put_str(
+            Rect::new(0, 0, 8, 1),
+            "OK",
+            theme::SELECTED_FG,
+            theme::SELECTED_ATTRS,
+        );
+        let idx = |x, y| (y as usize) * 8 + (x as usize);
+        assert_eq!(f.cells[idx(0, 0)].ch, 'O');
+        assert_eq!(f.cells[idx(0, 0)].fg, theme::SELECTED_FG);
+        assert_eq!(f.cells[idx(0, 0)].attrs & attr::BOLD, attr::BOLD);
+        assert_eq!(f.cells[idx(0, 0)].attrs & attr::REVERSE, attr::REVERSE);
+        // 空白 cell 应该是 attr::NONE
+        assert_eq!(f.cells[idx(7, 0)].attrs, attr::NONE);
+    }
+
+    #[test]
+    fn attrs_to_list_expands_bits() {
+        let list = attrs_to_list(attr::BOLD | attr::REVERSE);
+        assert!(list.contains(&Attribute::Bold));
+        assert!(list.contains(&Attribute::Reverse));
+        let empty = attrs_to_list(attr::NONE);
+        assert!(empty.is_empty());
     }
 }

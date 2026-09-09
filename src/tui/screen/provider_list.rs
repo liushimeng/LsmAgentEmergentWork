@@ -7,12 +7,11 @@
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crossterm::style::Attribute;
 
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::tui::engine::{Frame, Outcome, Rect, Screen};
 use crate::tui::screen::provider_del::ProviderDelPicker;
-use crate::tui::theme;
+use crate::tui::theme::{self, attr};
 
 const FIELD_LABELS: [&str; 7] = ["id", "protocol", "provider_name", "model_name", "end_point", "api_key", "context_max_size"];
 
@@ -98,12 +97,12 @@ impl Screen for ProviderList {
             Rect::new(2, 1, frame.area.width.saturating_sub(4), 1),
             &header,
             theme::DIM,
-            Attribute::Reset,
+            attr::NONE,
         );
 
         if self.records.is_empty() {
             let area = Rect::new(4, 4, frame.area.width.saturating_sub(8), 1);
-            frame.put_str(area, "(空)尚未配置任何接入记录,使用 /provider add 新增。", theme::FG, Attribute::Reset);
+            frame.put_str(area, "(空)尚未配置任何接入记录,使用 /provider add 新增。", theme::FG, attr::NONE);
         } else {
             // 字段 Tab 列表
             let top = 3u16;
@@ -112,27 +111,30 @@ impl Screen for ProviderList {
                 if y + 1 >= frame.area.height.saturating_sub(3) {
                     break;
                 }
-                let focused = self.action_cursor == 99 && false; // 字段不参与按钮焦点
-                let _ = focused;
                 let label_area = Rect::new(2, y, 18, 1);
                 let value_area = Rect::new(22, y, frame.area.width.saturating_sub(24), 1);
-                frame.put_str(label_area, &format!("{}:", label), theme::ACCENT, Attribute::Reset);
-                frame.put_str(value_area, &self.field_value(i), theme::FG, Attribute::Reset);
+                frame.put_str(label_area, &format!("{}:", label), theme::ACCENT, attr::NONE);
+                frame.put_str(value_area, &self.field_value(i), theme::FG, attr::NONE);
             }
 
-            // 操作按钮
+            // 操作按钮 —— 选中态: `▶ [ X ] ◀` + ACCENT + Bold + Reverse
             let action_y = frame.area.height.saturating_sub(4);
             let labels = ["[ 设为当前 s ]", "[ 删除 d ]", "[ 返回 Esc ]"];
             let mut x = 2u16;
             for (i, l) in labels.iter().enumerate() {
-                let attr = if self.action_cursor == i {
-                    Attribute::Reverse
+                let focused = self.action_cursor == i;
+                let (fg, attrs, text) = if focused {
+                    (
+                        theme::SELECTED_FG,
+                        theme::SELECTED_ATTRS,
+                        format!("{}{}{}", theme::SELECTED_BUTTON_L, l, theme::SELECTED_BUTTON_R),
+                    )
                 } else {
-                    Attribute::Reset
+                    (theme::FG, attr::NONE, format!("  {}  ", l))
                 };
-                let area = Rect::new(x, action_y, l.chars().count() as u16 + 2, 1);
-                frame.put_str(area, l, theme::FG, attr);
-                x += l.chars().count() as u16 + 4;
+                let area = Rect::new(x, action_y, text.chars().count() as u16 + 1, 1);
+                frame.put_str(area, &text, fg, attrs);
+                x += text.chars().count() as u16 + 3;
             }
         }
 
@@ -142,7 +144,7 @@ impl Screen for ProviderList {
             Rect::new(2, frame.area.height.saturating_sub(2), frame.area.width.saturating_sub(4), 1),
             help,
             theme::DIM,
-            Attribute::Reset,
+            attr::NONE,
         );
     }
 
