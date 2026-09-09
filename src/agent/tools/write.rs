@@ -70,10 +70,11 @@ impl Tool for WriteTool {
                 reason: "缺少 string 类型参数 content".into(),
             })?;
 
-        // 沙箱拦截
-        check_write_path(&self.sandbox, self.name(), path_str)?;
-
+        // 沙箱拦截:Check-What-You-Write —— 先解析出最终落盘路径,再对该路径做
+        // 白名单检查,保证「检查的就是要写的」(2026-09-09 第 08 轮沙箱细化)。
         let path = resolve_path(path_str);
+        check_write_path(&self.sandbox, self.name(), &path.to_string_lossy())?;
+
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| AgentError::ToolExecution {
@@ -96,63 +97,24 @@ impl Tool for WriteTool {
     }
 }
 
-/// 解析 Write 工具入参路径。
+/// 解析 Write 工具入参路径(简单版,与 Edit 一致)。
 ///
-/// 解析顺序(关联报告: 2026-09-09_04 D-003):
 /// 1. 绝对路径 → 原样返回;
-/// 2. **工作目录**(env::current_dir())拼接;
-/// 3. 若 2 路径的父目录不存在,**根目录**回退(避免在错误位置 mkdir -p 创出意外目录);
-/// 4. 兜底返回 2 路径(让上层按字面行为处理)。
+/// 2. 相对路径 → **工作目录**(env::current_dir())拼接,父目录不存在由 execute 自动创建。
+///
+/// 历史:关联报告 2026-09-09_04 D-003 曾引入「根目录回退」两条分支;沙箱细化
+/// (2026-09-09 第 08 轮)后移除——回退落点在白名单(工作目录/临时目录)外必被拦截,
+/// 只会把本应写进工作目录的相对路径错误改道到根目录再报错。Read 场景的根目录
+/// 回退由 read.rs 自带的路径诊断承担,不受影响。
 fn resolve_path(p: &str) -> PathBuf {
     let path = Path::new(p);
     if path.is_absolute() {
-        // 关联报告: 2026-09-09_04 D-003 —— 若 LLM 把「项目相对路径」误拼成「工作目录绝对路径」,
-        // 而真实文件在根目录,做一次根目录替换重试。
-        let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        if let Ok(rel) = path.strip_prefix(&work) {
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(root) = exe.parent() {
-                    let root_path = root.join(rel);
-                    // 仅当目标已存在(读取场景)或目标父目录已存在(写入场景)时回退
-                    let root_parent_ok = root_path.parent().map(|p| p.exists()).unwrap_or(false);
-                    if (root_path.exists() || root_parent_ok) && !path.exists() {
-                        tracing::debug!(
-                            orig = %path.display(),
-                            tried = %root_path.display(),
-                            "resolve_path 工作目录绝对路径 → 根目录回退"
-                        );
-                        return root_path;
-                    }
-                }
-            }
-        }
-        return path.to_path_buf();
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
-    let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let work_path = work.join(path);
-    if let Some(parent) = work_path.parent() {
-        if parent.exists() {
-            return work_path;
-        }
-    }
-    // 父目录不存在 → 尝试根目录拼接
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(root) = exe.parent() {
-            let root_path = root.join(path);
-            if let Some(parent) = root_path.parent() {
-                if parent.exists() {
-                    tracing::debug!(
-                        rel = %p,
-                        work = %work.display(),
-                        root = %root.display(),
-                        "Write 相对路径回退到根目录解析"
-                    );
-                    return root_path;
-                }
-            }
-        }
-    }
-    work_path
 }
 
 #[cfg(test)]
@@ -213,6 +175,43 @@ mod tests {
             .execute(json!({
                 "file_path": target.to_str().unwrap(),
                 "content": "new"
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::SandboxViolation { .. }));
+    }
+
+    /// 白名单内(工作目录)写入放行,含父目录自动创建(真实 roots 管线)。
+    #[tokio::test]
+    async fn sandbox_allows_write_inside_work_dir() {
+        let dir = TempDir::new().unwrap();
+        let tool = WriteTool::new(SandboxConfig::new(dir.path().to_path_buf()));
+        let target = dir.path().join("sub/dir/f.txt");
+        tool.execute(json!({
+            "file_path": target.to_str().unwrap(),
+            "content": "ok"
+        }))
+        .await
+        .unwrap();
+        assert!(target.exists());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "ok");
+    }
+
+    /// 检查发生在解析之后:带 `..` 穿越的绝对路径按规范化落点判断,
+    /// 折叠后跳出白名单即拦截(不依赖进程 cwd,避免与并行测试竞态)。
+    #[tokio::test]
+    async fn sandbox_check_governs_resolved_path() {
+        let dir = TempDir::new().unwrap();
+        // temp 根指向不存在的目录,避免 tempdir 本身位于 /tmp 造成「穿越后仍在 /tmp」的偶发放行
+        let tool = WriteTool::new(SandboxConfig::for_test(
+            dir.path().to_path_buf(),
+            PathBuf::from("/var/laew-sbx-nonexist"),
+        ));
+        let target = dir.path().join("sub/../../escape.txt"); // 规范化后 = /tmp/escape.txt
+        let err = tool
+            .execute(json!({
+                "file_path": target.to_str().unwrap(),
+                "content": "x"
             }))
             .await
             .unwrap_err();

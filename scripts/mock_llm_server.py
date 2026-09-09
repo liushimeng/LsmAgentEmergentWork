@@ -8,6 +8,7 @@
 请求体落盘到 mock_requests.jsonl 供校验协议格式。
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -27,6 +28,11 @@ LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
 #   OVERFLOW_ONCE — subagent 第 1 次工具调用命令改为 `seq 1 5000`(产出约 28.9K 字符的大 tool_result,
 #                  低于 Bash 工具 30K 截断上限)、第 2 次调用返回 HTTP 400 "prompt is too long",
 #                  用于端到端验证 src/agent/overflow.rs 的三级恢复(排水截短 → 重试)。
+#   WRITE_OUTSIDE — subagent 第 1 次工具调用改为 Write,目标为用户 Home 下的
+#                  laew-sandbox-e2e-canary.txt(白名单外且当前用户可写,若拦截失效会真实落盘),
+#                  用于端到端验证 sandbox_hook 的沙箱拦截。
+#   WRITE_INSIDE  — subagent 第 1 次工具调用改为 Write,目标为相对路径 sandbox-ok.txt
+#                  (落工作目录),用于端到端验证白名单内写入放行(防误伤正例)。
 #   --delay-ms N  — 每个请求处理前 sleep N 毫秒(模拟慢 LLM),
 #                  用于端到端验证取消传播(SIGINT 优雅中断,不应等延迟跑完)。
 MODES = set()
@@ -39,7 +45,8 @@ while _i < len(_args):
         DELAY_MS = int(_args[_i + 1])
         _i += 2
         continue
-    if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs", "--overflow-once"):
+    if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs", "--overflow-once",
+              "--write-outside", "--write-inside"):
         MODES.add(_a)
     _i += 1
 
@@ -233,20 +240,37 @@ def detect_role(body, key):
     return "subagent"  # 兼容旧版:未知系统提示词按执行层序列处理
 
 
+def first_tool_call(default_cmd):
+    """决定 subagent「第 1 次工具调用」的 (工具名, arguments JSON 文本)。
+
+    按 MODES 分流(Write 沙箱两模式供 run_e2e.sh §4g 端到端验证):
+    - 默认:Bash echo(default_cmd 区分协议,保持原行为)
+    - --bash-block:Bash `rm -rf /`(验证 permissions fail-closed)
+    - --overflow-once:Bash `seq 1 5000`(大 tool_result,验证溢出排水)
+    - --write-outside:Write 用户 Home 下 canary 文件(白名单外,验证沙箱拦截)
+    - --write-inside:Write 相对路径 sandbox-ok.txt(落工作目录,验证白名单放行)
+    """
+    if "--bash-block" in MODES:
+        return "Bash", '{"command": "rm -rf /"}'
+    if "--overflow-once" in MODES:
+        return "Bash", '{"command": "seq 1 5000"}'
+    if "--write-outside" in MODES:
+        target = os.path.expanduser("~/laew-sandbox-e2e-canary.txt")
+        return "Write", json.dumps(
+            {"file_path": target, "content": "PWNED"}, ensure_ascii=False
+        )
+    if "--write-inside" in MODES:
+        return "Write", json.dumps(
+            {"file_path": "sandbox-ok.txt", "content": "laew sandbox ok"}, ensure_ascii=False
+        )
+    return "Bash", '{"command": "echo ' + default_cmd + '"}'
+
+
 def build_anthropic_stream(call_no):
     """构造 Anthropic 一次完整流的 SSE 字节。"""
     if call_no == 1:
-        # 第 1 次:返回工具调用
-        # --bash-block 模式下把命令改成 `rm -rf /`,用于触发 Bash 工具入口
-        # check_bash_command 的 fail-closed 拦截;后续循环收到 tool_result 错误后
-        # 由"第 2 次"返回纯文本收口。
-        if "--bash-block" in MODES:
-            bash_cmd = "rm -rf /"
-        elif "--overflow-once" in MODES:
-            # 溢出恢复场景:第 1 次工具调用产生大输出,供「排水」恢复有物可排。
-            bash_cmd = "seq 1 5000"
-        else:
-            bash_cmd = "echo LAEW_ANTHROPIC_OK"
+        # 第 1 次:返回工具调用(按 MODES 分流,含 Write 沙箱两模式)
+        tool_name, tool_args = first_tool_call("LAEW_ANTHROPIC_OK")
         events = [
             {
                 "type": "message_start",
@@ -268,7 +292,7 @@ def build_anthropic_stream(call_no):
                 "data": {
                     "type": "content_block_start",
                     "index": 0,
-                    "content_block": {"type": "tool_use", "id": "toolu_mock_1", "name": "Bash", "input": {}},
+                    "content_block": {"type": "tool_use", "id": "toolu_mock_1", "name": tool_name, "input": {}},
                 },
             },
             {
@@ -276,7 +300,7 @@ def build_anthropic_stream(call_no):
                 "data": {
                     "type": "content_block_delta",
                     "index": 0,
-                    "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"" + bash_cmd + "\"}"},
+                    "delta": {"type": "input_json_delta", "partial_json": tool_args},
                 },
             },
             {
@@ -343,14 +367,8 @@ def build_anthropic_stream(call_no):
 def build_openai_stream(call_no):
     """构造 OpenAI 一次完整流的 SSE 字节。"""
     if call_no == 1:
-        # 第 1 次:返回工具调用
-        # --bash-block 模式下把命令改成 `rm -rf /`
-        if "--bash-block" in MODES:
-            bash_cmd = "rm -rf /"
-        elif "--overflow-once" in MODES:
-            bash_cmd = "seq 1 5000"
-        else:
-            bash_cmd = "echo LAEW_MOCK_OK"
+        # 第 1 次:返回工具调用(按 MODES 分流,含 Write 沙箱两模式)
+        tool_name, tool_args = first_tool_call("LAEW_MOCK_OK")
         chunks = [
             {
                 "id": "chatcmpl-mock-1",
@@ -371,7 +389,7 @@ def build_openai_stream(call_no):
                                     "index": 0,
                                     "id": "call_mock_1",
                                     "type": "function",
-                                    "function": {"name": "Bash", "arguments": ""},
+                                    "function": {"name": tool_name, "arguments": ""},
                                 }
                             ]
                         },
@@ -387,7 +405,7 @@ def build_openai_stream(call_no):
                             "tool_calls": [
                                 {
                                     "index": 0,
-                                    "function": {"arguments": "{\"command\": \"" + bash_cmd + "\"}"},
+                                    "function": {"arguments": tool_args},
                                 }
                             ]
                         },

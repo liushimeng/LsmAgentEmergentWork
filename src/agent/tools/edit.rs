@@ -97,10 +97,10 @@ impl Tool for EditTool {
             });
         }
 
-        // 沙箱拦截
-        check_write_path(&self.sandbox, self.name(), path_str)?;
-
+        // 沙箱拦截:Check-What-You-Write —— 先解析出最终落盘路径,再对该路径做
+        // 白名单检查,保证「检查的就是要写的」(2026-09-09 第 08 轮沙箱细化)。
         let path = resolve_path(path_str);
+        check_write_path(&self.sandbox, self.name(), &path.to_string_lossy())?;
 
         // 必须是已存在的普通文件
         if !path.exists() {
