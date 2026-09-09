@@ -29,6 +29,7 @@ pub mod sandbox_hook;
 pub mod session_context;
 pub mod subagent;
 pub mod system_prompt;
+pub mod tool_schema_validator;
 pub mod tools;
 pub mod yolo;
 
@@ -299,17 +300,33 @@ impl Agent {
                 // 工具执行取消:select 命中后工具 future 被 drop——Bash 工具的
                 // `kill_on_drop` 会随之 SIGKILL 子进程、setsid+killpg 清理整组
                 // (知识库第五轮 §6.1「取消必须级联到进程组」,bash.rs ef84cec 已就位)
+                //
+                // ★ Schema 预校验(L16):工具执行前校验参数类型/必填/越界/多余字段,
+                // 校验失败直接返回结构化错误,避免浪费一次工具执行往返
                 let executed = match self.profile.tools.get(&name) {
-                    Ok(tool) => match cancel {
-                        Some(token) => {
-                            tokio::select! {
-                                biased;
-                                _ = token.cancelled() => None,
-                                r = tool.execute(args.clone()) => Some(r),
+                    Ok(tool) => {
+                        // Schema 预校验(校验失败 → 返回错误,不执行工具)
+                        if let Err(e) =
+                            crate::agent::tool_schema_validator::validate_tool_args(
+                                &name,
+                                &tool.parameters(),
+                                &args,
+                            )
+                        {
+                            Some(Err(e))
+                        } else {
+                            match cancel {
+                                Some(token) => {
+                                    tokio::select! {
+                                        biased;
+                                        _ = token.cancelled() => None,
+                                        r = tool.execute(args.clone()) => Some(r),
+                                    }
+                                }
+                                None => Some(tool.execute(args.clone()).await),
                             }
                         }
-                        None => Some(tool.execute(args.clone()).await),
-                    },
+                    }
                     Err(e) => Some(Err(e)),
                 };
                 let (output, is_error) = match executed {

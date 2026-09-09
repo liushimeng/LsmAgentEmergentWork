@@ -105,6 +105,20 @@ pub enum AgentError {
 
     #[error("[权限拒绝] 工具 {tool}: {reason}\n建议改用更安全的写法(参见工具描述中的「安全提示」)。")]
     PermissionDenied { tool: String, reason: String },
+
+    /// 工具参数 Schema 校验失败。
+    ///
+    /// 在工具执行前对 LLM 输出的 `tool_call.arguments` 做 JSON Schema 预校验,
+    /// 校验失败时返回结构化错误信息,便于 LLM 理解并自我修复。
+    /// 对应知识库 gap L16(第七轮结构化输出专题)。
+    #[error("工具 {tool} 参数校验失败: 字段 '{path}' {reason}\n  期望: {expected}\n  实际: {actual}")]
+    ToolSchemaValidation {
+        tool: String,
+        path: String,
+        reason: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
