@@ -122,15 +122,28 @@ impl DebugCollector {
     }
 
     pub fn session_id(&self) -> String {
-        self.inner.lock().expect("debug collector").session_id.clone()
+        self.inner
+            .lock()
+            .expect("debug collector")
+            .session_id
+            .clone()
     }
 
     pub fn started_at(&self) -> String {
-        self.inner.lock().expect("debug collector").started_at.clone()
+        self.inner
+            .lock()
+            .expect("debug collector")
+            .started_at
+            .clone()
     }
 
     pub fn elapsed_ms(&self) -> u128 {
-        self.inner.lock().expect("debug collector").timer.elapsed().as_millis()
+        self.inner
+            .lock()
+            .expect("debug collector")
+            .timer
+            .elapsed()
+            .as_millis()
     }
 
     fn push(&self, ev: DebugEvent) {
@@ -189,14 +202,23 @@ impl DebugCollector {
         let qc_pass = events
             .iter()
             .filter(|e| {
-                matches!(e, DebugEvent::QualityCheck { verdict: Verdict::Pass, .. })
+                matches!(
+                    e,
+                    DebugEvent::QualityCheck {
+                        verdict: Verdict::Pass,
+                        ..
+                    }
+                )
             })
             .count();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut total_ms = 0u128;
         for e in &events {
-            if let DebugEvent::LlmCall { usage, duration_ms, .. } = e {
+            if let DebugEvent::LlmCall {
+                usage, duration_ms, ..
+            } = e
+            {
                 input_tokens = input_tokens.saturating_add(usage.input_tokens);
                 output_tokens = output_tokens.saturating_add(usage.output_tokens);
                 total_ms = total_ms.saturating_add(*duration_ms);
@@ -248,18 +270,34 @@ impl DebugCollector {
                         out.push_str(&format!("- **错误**: {err}\n"));
                     }
                     out.push_str(&format!("\n输入摘要:\n\n```text\n{input_summary}\n```\n"));
-                    out.push_str(&format!("\n输出摘要:\n\n```text\n{output_summary}\n```\n\n"));
+                    out.push_str(&format!(
+                        "\n输出摘要:\n\n```text\n{output_summary}\n```\n\n"
+                    ));
                 }
-                DebugEvent::Classification { level, goal, intent, purpose } => {
+                DebugEvent::Classification {
+                    level,
+                    goal,
+                    intent,
+                    purpose,
+                } => {
                     out.push_str(&format!(
                         "- 类型: Yolo 分类\n- 档位: **{level}**\n- 目标: {goal}\n- 意图: {intent}\n- 目的: {purpose}\n\n"
                     ));
                 }
-                DebugEvent::QualityCheck { source, verdict, issues, suggestion } => {
+                DebugEvent::QualityCheck {
+                    source,
+                    verdict,
+                    issues,
+                    suggestion,
+                } => {
                     out.push_str(&format!(
                         "- 类型: Quality-Check\n- 被检对象: {}\n- 结论: **{}**\n",
                         source.as_str(),
-                        if *verdict == Verdict::Pass { "pass" } else { "fail" },
+                        if *verdict == Verdict::Pass {
+                            "pass"
+                        } else {
+                            "fail"
+                        },
                     ));
                     if !issues.is_empty() {
                         out.push_str(&format!("- 问题: {}\n", issues.join("; ")));
@@ -269,7 +307,11 @@ impl DebugCollector {
                     }
                     out.push('\n');
                 }
-                DebugEvent::TaskEnd { outcome, total_usage, total_duration_ms } => {
+                DebugEvent::TaskEnd {
+                    outcome,
+                    total_usage,
+                    total_duration_ms,
+                } => {
                     out.push_str(&format!(
                         "- 类型: 任务终态\n- 结果: {outcome}\n- 总耗时: {total_duration_ms} ms\n\
                          - 总 token: input={} output={}\n\n",
@@ -348,7 +390,11 @@ fn truncate_chars(s: &str, max: usize) -> String {
     if chars.len() <= max {
         s.to_string()
     } else {
-        format!("{}…(截断,原 {} 字符)", chars[..max].iter().collect::<String>(), chars.len())
+        format!(
+            "{}…(截断,原 {} 字符)",
+            chars[..max].iter().collect::<String>(),
+            chars.len()
+        )
     }
 }
 
@@ -361,7 +407,11 @@ pub struct DebugLlmClient {
 
 impl DebugLlmClient {
     pub fn new(inner: Arc<dyn LlmClient>, collector: Arc<DebugCollector>) -> Self {
-        Self { inner, collector, seq: Mutex::new(0) }
+        Self {
+            inner,
+            collector,
+            seq: Mutex::new(0),
+        }
     }
 
     fn next_seq(&self) -> usize {
@@ -387,12 +437,7 @@ impl LlmClient for DebugLlmClient {
         let duration_ms = timer.elapsed().as_millis();
 
         let (output_summary, usage, stop_reason, error) = match &result {
-            Ok(c) => (
-                summarize_output(c),
-                c.usage,
-                c.stop_reason.clone(),
-                None,
-            ),
+            Ok(c) => (summarize_output(c), c.usage, c.stop_reason.clone(), None),
             Err(e) => (
                 "(调用失败)".to_string(),
                 Usage::default(),
@@ -438,7 +483,15 @@ impl DebugRunner {
     }
 
     /// 对 trace Markdown 做评估,返回「任务评估 / 质量报告 / 问题报告 / 优化建议」Markdown。
-    pub async fn evaluate(&self, trace_markdown: &str, stats_markdown: &str) -> Result<String> {
+    ///
+    /// `session_id` 为被评估任务的主会话 ID(X-Session-Id 传播,2026-09-09 第 08 轮):
+    /// Debug Agent 的请求在抓包中可关联到所属任务(此前 `run_once` 生成随机新 ID)。
+    pub async fn evaluate(
+        &self,
+        session_id: &str,
+        trace_markdown: &str,
+        stats_markdown: &str,
+    ) -> Result<String> {
         let prompt = format!(
             "以下是 laew 多 Agent 系统一次任务的调试 trace。请完成评估。\n\n\
              【统计总览】\n{stats_markdown}\n\n\
@@ -446,7 +499,12 @@ impl DebugRunner {
              请严格按四章节输出 Markdown:## 任务评估 / ## 质量报告 / ## 问题报告(问题按 P0/P1/P2 分级) / ## 优化建议。",
             truncate_chars(trace_markdown, MAX_TRACE_FOR_EVAL_CHARS),
         );
-        let (text, _usage, _trace) = self.agent.run_once(&prompt).await?;
+        let mut session = crate::session::Session::new();
+        session.id = session_id.to_string();
+        session
+            .context_mut()
+            .push(crate::llm::ChatMessage::user(&prompt));
+        let (text, _usage, _trace) = self.agent.run_session(&mut session).await?;
         Ok(text)
     }
 }
@@ -526,9 +584,16 @@ pub async fn finalize_report(
 
     // Debug Agent 评估;失败不阻塞报告落盘 —— 改为填入「降级骨架」+ 头部横幅提示。
     // 关联报告: 2026-09-09_07 F-007-2
-    let (evaluation, degraded) = match DebugRunner::new(llm).evaluate(&trace, &stats).await {
+    // session_id 取自采集器(第 08 轮):Debug 请求与被评估任务同 X-Session-Id
+    let (evaluation, degraded) = match DebugRunner::new(llm)
+        .evaluate(&collector.session_id(), &trace, &stats)
+        .await
+    {
         Ok(text) => (text, false),
-        Err(e) => (render_degraded_evaluation(&anyhow::Error::from(e), collector), true),
+        Err(e) => (
+            render_degraded_evaluation(&anyhow::Error::from(e), collector),
+            true,
+        ),
     };
     let banner = if degraded {
         "\n> ⚠️ **Debug Agent 评估失败,已降级到基于 trace 的自检骨架** — 下方「任务评估 / 质量报告 / 问题报告 / 优化建议」\
@@ -568,12 +633,41 @@ pub async fn finalize_report(
 fn render_degraded_evaluation(err: &anyhow::Error, collector: &Arc<DebugCollector>) -> String {
     use DebugEvent as E;
     let events = collector.events();
-    let llm_calls = events.iter().filter(|e| matches!(e, E::LlmCall { .. })).count();
-    let llm_errors = events.iter().filter(|e| matches!(e, E::LlmCall { error: Some(_), .. })).count();
-    let qc_total = events.iter().filter(|e| matches!(e, E::QualityCheck { .. })).count();
-    let qc_pass = events.iter().filter(|e| matches!(e, E::QualityCheck { verdict: crate::agent::quality::Verdict::Pass, .. })).count();
+    let llm_calls = events
+        .iter()
+        .filter(|e| matches!(e, E::LlmCall { .. }))
+        .count();
+    let llm_errors = events
+        .iter()
+        .filter(|e| matches!(e, E::LlmCall { error: Some(_), .. }))
+        .count();
+    let qc_total = events
+        .iter()
+        .filter(|e| matches!(e, E::QualityCheck { .. }))
+        .count();
+    let qc_pass = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                E::QualityCheck {
+                    verdict: crate::agent::quality::Verdict::Pass,
+                    ..
+                }
+            )
+        })
+        .count();
     let qc_fail = qc_total.saturating_sub(qc_pass);
-    let total_ms: u128 = events.iter().filter_map(|e| if let E::LlmCall { duration_ms, .. } = e { Some(*duration_ms) } else { None }).sum();
+    let total_ms: u128 = events
+        .iter()
+        .filter_map(|e| {
+            if let E::LlmCall { duration_ms, .. } = e {
+                Some(*duration_ms)
+            } else {
+                None
+            }
+        })
+        .sum();
     let task_ms = collector.elapsed_ms();
 
     // P0/P1/P2 自检分级(按数字可见信号):
@@ -609,7 +703,8 @@ fn render_degraded_evaluation(err: &anyhow::Error, collector: &Arc<DebugCollecto
     if llm_calls == 0 {
         issues.push((
             "P2".into(),
-            "无任何 LLM 调用 —— 任务在进入 Orchestrator 之前已结束(Provider 未配置 / 解析失败)".into(),
+            "无任何 LLM 调用 —— 任务在进入 Orchestrator 之前已结束(Provider 未配置 / 解析失败)"
+                .into(),
         ));
     }
     if qc_total == 0 && llm_calls > 0 {
@@ -620,9 +715,13 @@ fn render_degraded_evaluation(err: &anyhow::Error, collector: &Arc<DebugCollecto
     }
 
     let issues_md = if issues.is_empty() {
-        "- (无)" .to_string()
+        "- (无)".to_string()
     } else {
-        issues.iter().map(|(lvl, desc)| format!("- **{lvl}**: {desc}")).collect::<Vec<_>>().join("\n")
+        issues
+            .iter()
+            .map(|(lvl, desc)| format!("- **{lvl}**: {desc}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     // 优化建议按 issues 反推
@@ -716,8 +815,14 @@ mod tests {
 
     #[test]
     fn detect_agent_name_from_prompt() {
-        let prompt = format!("你是 {},用户对话的第一层入口 Agent。", crate::agent::profile::YOLO_AGENT_NAME);
-        assert_eq!(detect_agent_name(&prompt), crate::agent::profile::YOLO_AGENT_NAME);
+        let prompt = format!(
+            "你是 {},用户对话的第一层入口 Agent。",
+            crate::agent::profile::YOLO_AGENT_NAME
+        );
+        assert_eq!(
+            detect_agent_name(&prompt),
+            crate::agent::profile::YOLO_AGENT_NAME
+        );
         assert_eq!(detect_agent_name("你是某个无名助手"), "unknown");
     }
 

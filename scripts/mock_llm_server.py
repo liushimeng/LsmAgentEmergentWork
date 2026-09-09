@@ -37,12 +37,30 @@ LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
 #                  用于端到端验证取消传播(SIGINT 优雅中断,不应等延迟跑完)。
 MODES = set()
 DELAY_MS = 0
+# Prompt Caching 模拟开关(2026-09-09 第 10 轮 L1047)。
+# --cache-read N    — 每次 Anthropic 响应在 usage 中回填 cache_read_input_tokens=N
+#                     (模拟上游命中缓存;验证 laew 注入的 cache_control 是否被上游接受)。
+# --cache-creation N — 每次响应在 usage 中回填 cache_creation_input_tokens=N
+#                     (模拟上游首次写入缓存;验证 laew 的 cache_control 写入路径)。
+# 注:这两个值仅模拟 mock server 视角的「上游响应」,真实命中需要在 Anthropic 后端
+#     至少发生过一次同 prefix 请求。本 mock 用于 e2e 断言 laew 接收到的 usage 字段
+#     能正确显示 — 不验证真实命中(那是上游行为)。
+CACHE_READ_TOKENS = 0
+CACHE_CREATION_TOKENS = 0
 _args = sys.argv[3:]
 _i = 0
 while _i < len(_args):
     _a = _args[_i]
     if _a == "--delay-ms" and _i + 1 < len(_args):
         DELAY_MS = int(_args[_i + 1])
+        _i += 2
+        continue
+    if _a == "--cache-read" and _i + 1 < len(_args):
+        CACHE_READ_TOKENS = int(_args[_i + 1])
+        _i += 2
+        continue
+    if _a == "--cache-creation" and _i + 1 < len(_args):
+        CACHE_CREATION_TOKENS = int(_args[_i + 1])
         _i += 2
         continue
     if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs", "--overflow-once",
@@ -116,7 +134,7 @@ def anthropic_text_sse(text, msg_id="mock-msg-role"):
                     "content": [],
                     "model": "mock-anthropic",
                     "stop_reason": None,
-                    "usage": {"input_tokens": 30, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                    "usage": {"input_tokens": 30, "output_tokens": 1, "cache_read_input_tokens": CACHE_READ_TOKENS, "cache_creation_input_tokens": CACHE_CREATION_TOKENS},
                 },
             },
         },
@@ -217,15 +235,38 @@ PLAN_MARKDOWN = "# 方案\n\n```json\n" + MAIN_WORK_PLAN_JSON + "\n```\n"
 
 
 def detect_role(body, key):
-    """按系统提示词中的 Agent 名识别角色(与 src/agent/system_prompt 各 BASE_PROMPT 对应)。"""
+    """按系统提示词中的 Agent 名识别角色(与 src/agent/system_prompt 各 BASE_PROMPT 对应)。
+
+    Anthropic 系统提示词形态兼容(2026-09-09 第 10 轮 L1047):
+    - 旧:`system: "..."`
+    - 新:`system: [{ "type": "text", "text": "...", "cache_control": {...} }]`
+    两种形态都识别:对 Anthropic 列表形态做 flatten 合并文本。
+    """
     if key == "oai":
-        system = ""
+        system_parts: list[str] = []
         for m in body.get("messages", []):
             if m.get("role") == "system":
-                system = m.get("content") or ""
+                content = m.get("content")
+                if isinstance(content, str):
+                    system_parts.append(content)
+                elif isinstance(content, list):
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            system_parts.append(p.get("text", ""))
                 break
+        system = "\n".join(system_parts)
     else:
-        system = body.get("system") or ""
+        sys_field = body.get("system")
+        if isinstance(sys_field, str):
+            system = sys_field
+        elif isinstance(sys_field, list):
+            # Anthropic 新形态:多文本块数组,合并所有 text
+            system = "\n".join(
+                p.get("text", "") for p in sys_field
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        else:
+            system = ""
     for marker, role in [
         ("LsmAgentEmergentWork-Yolo", "yolo"),
         ("LsmAgentEmergentWork-Quality-Check", "quality"),
@@ -283,7 +324,7 @@ def build_anthropic_stream(call_no):
                         "content": [],
                         "model": "mock-anthropic",
                         "stop_reason": None,
-                        "usage": {"input_tokens": 13, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                        "usage": {"input_tokens": 13, "output_tokens": 1, "cache_read_input_tokens": CACHE_READ_TOKENS, "cache_creation_input_tokens": CACHE_CREATION_TOKENS},
                     },
                 },
             },
@@ -331,7 +372,7 @@ def build_anthropic_stream(call_no):
                         "content": [],
                         "model": "mock-anthropic",
                         "stop_reason": None,
-                        "usage": {"input_tokens": 50, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                        "usage": {"input_tokens": 50, "output_tokens": 1, "cache_read_input_tokens": CACHE_READ_TOKENS, "cache_creation_input_tokens": CACHE_CREATION_TOKENS},
                     },
                 },
             },

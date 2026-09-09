@@ -121,7 +121,11 @@ impl QualityFailure {
             source,
             reason: format!("{prefix}: {e}"),
             retryable: !cancelled,
-            suggestion: if cancelled { "任务已取消".into() } else { "重试".into() },
+            suggestion: if cancelled {
+                "任务已取消".into()
+            } else {
+                "重试".into()
+            },
             cancelled,
             trace: None,
         }
@@ -147,17 +151,8 @@ pub struct MultiAgentOrchestrator {
 }
 
 impl MultiAgentOrchestrator {
-    pub fn new(
-        llm: Arc<dyn crate::llm::LlmClient>,
-        db: Arc<Db>,
-        plans_dir: PathBuf,
-    ) -> Self {
-        Self::with_config(
-            llm,
-            db,
-            plans_dir,
-            OrchestratorConfig::default(),
-        )
+    pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>, plans_dir: PathBuf) -> Self {
+        Self::with_config(llm, db, plans_dir, OrchestratorConfig::default())
     }
 
     pub fn with_config(
@@ -229,12 +224,19 @@ impl MultiAgentOrchestrator {
         }
 
         // 0.1) 历史 Session 摘要注入(幂等)
-        let summaries = self.db.latest_summaries(session.id(), self.cfg.history_limit).unwrap_or_default();
+        let summaries = self
+            .db
+            .latest_summaries(session.id(), self.cfg.history_limit)
+            .unwrap_or_default();
         inject_history_with_entries(session, &summaries);
 
         // 0.2) Context 自动压缩(达到当前 Provider context_max_size 的 80% 阈值时触发)
         if let Ok(Some(active)) = self.db.get_active() {
-            match self.compact.maybe_compact(session, active.context_max_size).await {
+            match self
+                .compact
+                .maybe_compact(session, active.context_max_size)
+                .await
+            {
                 Ok(Some(rep)) => {
                     eprintln!(
                         "[laew] Context 已自动压缩:档位={} 估算 token {} → {}(覆盖 {} 条历史消息{})",
@@ -258,14 +260,16 @@ impl MultiAgentOrchestrator {
         let mut total_usage = Usage::default();
 
         // 1.1) 记录 Yolo 输入事件
-        let _ = self.db.insert_session_memory(&crate::config::SessionMemoryEntry {
-            session_id: session.id().to_string(),
-            role: AgentRole::Yolo,
-            event_type: EventType::Input,
-            content: format!("goal: {}", classification.goal_summary),
-            usage_input: 0,
-            usage_output: 0,
-        });
+        let _ = self
+            .db
+            .insert_session_memory(&crate::config::SessionMemoryEntry {
+                session_id: session.id().to_string(),
+                role: AgentRole::Yolo,
+                event_type: EventType::Input,
+                content: format!("goal: {}", classification.goal_summary),
+                usage_input: 0,
+                usage_output: 0,
+            });
 
         let mut retry_count = 0;
         loop {
@@ -310,7 +314,13 @@ impl MultiAgentOrchestrator {
                             &task_result
                                 .workflows
                                 .iter()
-                                .map(|w| (w.id.clone(), w.name.clone(), w.quality_report.verdict == Verdict::Pass))
+                                .map(|w| {
+                                    (
+                                        w.id.clone(),
+                                        w.name.clone(),
+                                        w.quality_report.verdict == Verdict::Pass,
+                                    )
+                                })
                                 .collect::<Vec<_>>(),
                             &task_result.total_usage,
                             session.id(),
@@ -318,13 +328,17 @@ impl MultiAgentOrchestrator {
                         )
                         .await?;
                     task_result.summary = summary.text.clone();
-                    total_usage.input_tokens =
-                        total_usage.input_tokens.saturating_add(summary.usage.input_tokens);
-                    total_usage.output_tokens =
-                        total_usage.output_tokens.saturating_add(summary.usage.output_tokens);
+                    total_usage.input_tokens = total_usage
+                        .input_tokens
+                        .saturating_add(summary.usage.input_tokens);
+                    total_usage.output_tokens = total_usage
+                        .output_tokens
+                        .saturating_add(summary.usage.output_tokens);
                     task_result.total_usage = total_usage;
                     self.dbg_task_end("executed", task_result.total_usage);
-                    return Ok(OrchestrationOutcome::Executed { result: task_result });
+                    return Ok(OrchestrationOutcome::Executed {
+                        result: task_result,
+                    });
                 }
                 Err(failure) => {
                     // 用户取消:短路退出整个任务,不回流不重试(H9 语义)
@@ -389,13 +403,23 @@ impl MultiAgentOrchestrator {
             .sub_agent
             .run_unit_with_cancel(&input, session.id(), cancel)
             .await
-            .map_err(|e| QualityFailure::from_agent_error(AgentRole::SubAgent, "SubAgent 执行失败", &e))?;
+            .map_err(|e| {
+                QualityFailure::from_agent_error(AgentRole::SubAgent, "SubAgent 执行失败", &e)
+            })?;
 
         let qc = self
             .quality
-            .check_subagent(&c.goal_summary, &input.expected_output, &outcome.text, &outcome.trace, session.id())
+            .check_subagent(
+                &c.goal_summary,
+                &input.expected_output,
+                &outcome.text,
+                &outcome.trace,
+                session.id(),
+            )
             .await
-            .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
+            .map_err(|e| {
+                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+            })?;
         self.dbg_qc(&qc);
 
         if qc.verdict == Verdict::Pass {
@@ -439,7 +463,9 @@ impl MultiAgentOrchestrator {
             .main_work
             .plan_workflows(&c.goal_summary, &c.decomposition_plan, session.id())
             .await
-            .map_err(|e| QualityFailure::from_agent_error(AgentRole::MainWork, "Main-Work 拆解失败", &e))?;
+            .map_err(|e| {
+                QualityFailure::from_agent_error(AgentRole::MainWork, "Main-Work 拆解失败", &e)
+            })?;
 
         // 2) Quality 校验 Main-Work 输出
         let wf_json = serde_json::to_string(&plan).unwrap_or_default();
@@ -447,7 +473,9 @@ impl MultiAgentOrchestrator {
             .quality
             .check_main(&c.goal_summary, &wf_json, session.id())
             .await
-            .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
+            .map_err(|e| {
+                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+            })?;
         self.dbg_qc(&qc_main);
 
         if qc_main.verdict == Verdict::Fail {
@@ -491,7 +519,9 @@ impl MultiAgentOrchestrator {
             .quality
             .check_plan(&plan_output.markdown, session.id())
             .await
-            .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
+            .map_err(|e| {
+                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+            })?;
         self.dbg_qc(&qc_plan);
         if qc_plan.verdict == Verdict::Fail {
             return Err(QualityFailure {
@@ -505,16 +535,21 @@ impl MultiAgentOrchestrator {
         }
 
         // 3) Main-Work 解析 Plan → WorkFlow
-        let plan = self
-            .main_work
-            .parse_plan(&plan_output.path)
-            .map_err(|e| QualityFailure::from_agent_error(AgentRole::MainWork, "解析 Plan 失败", &e))?;
+        let plan = self.main_work.parse_plan(&plan_output.path).map_err(|e| {
+            QualityFailure::from_agent_error(AgentRole::MainWork, "解析 Plan 失败", &e)
+        })?;
 
         let qc_main = self
             .quality
-            .check_main(&c.goal_summary, &serde_json::to_string(&plan).unwrap_or_default(), session.id())
+            .check_main(
+                &c.goal_summary,
+                &serde_json::to_string(&plan).unwrap_or_default(),
+                session.id(),
+            )
             .await
-            .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
+            .map_err(|e| {
+                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+            })?;
         self.dbg_qc(&qc_main);
         if qc_main.verdict == Verdict::Fail {
             return Err(QualityFailure {
@@ -561,7 +596,11 @@ impl MultiAgentOrchestrator {
         for (layer_idx, layer) in layers.into_iter().enumerate() {
             // 层边界:取消短路(下一层不再启动)
             if let Err(e) = Self::check_cancelled(cancel) {
-                return Err(QualityFailure::from_agent_error(AgentRole::MainWork, "WorkFlow 层调度", &e));
+                return Err(QualityFailure::from_agent_error(
+                    AgentRole::MainWork,
+                    "WorkFlow 层调度",
+                    &e,
+                ));
             }
             if layer.len() > 1 {
                 eprintln!(
@@ -595,9 +634,8 @@ impl MultiAgentOrchestrator {
                 .await;
                 vec![(wf, outcome)]
             } else {
-                let semaphore = Arc::new(tokio::sync::Semaphore::new(
-                    self.cfg.max_parallel_workflows,
-                ));
+                let semaphore =
+                    Arc::new(tokio::sync::Semaphore::new(self.cfg.max_parallel_workflows));
                 let mut handles = Vec::with_capacity(units.len());
                 for (wf, input) in units {
                     let sub_agent = self.sub_agent.clone();
@@ -700,11 +738,10 @@ impl MultiAgentOrchestrator {
 
     // ========== Yolo 分类 + 失败回流 ==========
 
-    async fn run_yolo_classification(
-        &self,
-        session: &Session,
-    ) -> Result<TaskClassification> {
-        let (mut c, _text, usage) = self.yolo.classify(session.context()).await?;
+    async fn run_yolo_classification(&self, session: &Session) -> Result<TaskClassification> {
+        // session_id 传播:Yolo 请求的 X-Session-Id 与任务主会话一致(抓包可关联,
+        // 第 08 轮,方案 tmpPlan/2026-09-09_08)
+        let (mut c, _text, usage) = self.yolo.classify(session.id(), session.context()).await?;
         let _ = usage;
         // 修正:若 agent_role 缺省,按 task_level 推断
         if c.agent_role.is_none() {
@@ -767,29 +804,28 @@ impl MultiAgentOrchestrator {
         }
     }
 
-    fn record_failure_event(
-        &self,
-        session_id: &str,
-        c: &TaskClassification,
-        suggestion: &str,
-    ) {
-        let _ = self.db.insert_session_memory(&crate::config::SessionMemoryEntry {
-            session_id: session_id.to_string(),
-            role: AgentRole::Yolo,
-            event_type: EventType::Failure,
-            content: format!("目标: {}\n达到最大重试次数", c.goal_summary),
-            usage_input: 0,
-            usage_output: 0,
-        });
-        if !suggestion.is_empty() {
-            let _ = self.db.insert_session_memory(&crate::config::SessionMemoryEntry {
+    fn record_failure_event(&self, session_id: &str, c: &TaskClassification, suggestion: &str) {
+        let _ = self
+            .db
+            .insert_session_memory(&crate::config::SessionMemoryEntry {
                 session_id: session_id.to_string(),
-                role: AgentRole::SessionContext,
-                event_type: EventType::Suggestion,
-                content: suggestion.into(),
+                role: AgentRole::Yolo,
+                event_type: EventType::Failure,
+                content: format!("目标: {}\n达到最大重试次数", c.goal_summary),
                 usage_input: 0,
                 usage_output: 0,
             });
+        if !suggestion.is_empty() {
+            let _ = self
+                .db
+                .insert_session_memory(&crate::config::SessionMemoryEntry {
+                    session_id: session_id.to_string(),
+                    role: AgentRole::SessionContext,
+                    event_type: EventType::Suggestion,
+                    content: suggestion.into(),
+                    usage_input: 0,
+                    usage_output: 0,
+                });
         }
     }
 
@@ -861,13 +897,25 @@ async fn run_wf_unit(
         .run_unit_with_cancel(&input, &session_id, &cancel)
         .await
         .map_err(|e| {
-            QualityFailure::from_agent_error(AgentRole::SubAgent, &format!("SubAgent 执行失败(wf={wf_id})"), &e)
+            QualityFailure::from_agent_error(
+                AgentRole::SubAgent,
+                &format!("SubAgent 执行失败(wf={wf_id})"),
+                &e,
+            )
         })?;
 
     let qc = quality
-        .check_subagent(&goal, &input.expected_output, &outcome.text, &outcome.trace, &session_id)
+        .check_subagent(
+            &goal,
+            &input.expected_output,
+            &outcome.text,
+            &outcome.trace,
+            &session_id,
+        )
         .await
-        .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
+        .map_err(|e| {
+            QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+        })?;
     if let Some(d) = &debug {
         d.record_quality(&qc);
     }
@@ -955,9 +1003,9 @@ fn fallback_suggestion(total_usage: &Usage) -> String {
 
 // 解决未使用警告:导入但仅在 cfg(test) 用
 #[allow(unused_imports)]
-use crate::agent::subagent::SubFlowOutcome as _SubFlowOutcome;
-#[allow(unused_imports)]
 use crate::agent::session_context::SessionSummary as _SessionSummary;
+#[allow(unused_imports)]
+use crate::agent::subagent::SubFlowOutcome as _SubFlowOutcome;
 
 #[cfg(test)]
 mod tests {
@@ -992,11 +1040,7 @@ mod tests {
             }
         }
         let plans_dir = dir.path().join("plans");
-        let orch = MultiAgentOrchestrator::new(
-            Arc::new(NoopLlm),
-            db,
-            plans_dir,
-        );
+        let orch = MultiAgentOrchestrator::new(Arc::new(NoopLlm), db, plans_dir);
         (orch, dir)
     }
 

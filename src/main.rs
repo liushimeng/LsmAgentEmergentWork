@@ -32,7 +32,12 @@ const VERSION_INFO: &str = concat!(
 )]
 struct Cli {
     /// 单轮任务提示词(不进入 TUI)
-    #[arg(short = 'p', long = "prompt", value_name = "TEXT", conflicts_with = "file")]
+    #[arg(
+        short = 'p',
+        long = "prompt",
+        value_name = "TEXT",
+        conflicts_with = "file"
+    )]
     prompt: Option<String>,
 
     /// 从文件读取提示词(支持绝对路径和相对路径,与 -p 互斥)
@@ -110,9 +115,23 @@ fn open_db() -> Result<(Paths, Db)> {
 async fn cmd_provider(p: ProviderCmd) -> Result<()> {
     let (_paths, db) = open_db()?;
     match p {
-        ProviderCmd::Add { protocol, provider_name, model_name, end_point, api_key, context_max_size } => {
+        ProviderCmd::Add {
+            protocol,
+            provider_name,
+            model_name,
+            end_point,
+            api_key,
+            context_max_size,
+        } => {
             let id = db
-                .add_with_context(protocol, &provider_name, &model_name, &end_point, &api_key, context_max_size)
+                .add_with_context(
+                    protocol,
+                    &provider_name,
+                    &model_name,
+                    &end_point,
+                    &api_key,
+                    context_max_size,
+                )
                 .map_err(anyhow::Error::from)?;
             println!(
                 "✓ 已新增接入记录 id={id}(context_max_size={})",
@@ -154,23 +173,41 @@ async fn cmd_provider(p: ProviderCmd) -> Result<()> {
 }
 
 fn tail(s: &str, n: usize) -> String {
-    s.chars().rev().take(n).collect::<String>().chars().rev().collect()
+    s.chars()
+        .rev()
+        .take(n)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
 }
 
-async fn run_one_shot(prompt: String, max_iterations: usize, debug: bool, mode: &str) -> Result<()> {
+async fn run_one_shot(
+    prompt: String,
+    max_iterations: usize,
+    debug: bool,
+    mode: &str,
+) -> Result<()> {
     let (paths, db) = open_db()?;
     let active = db
         .get_active()
         .map_err(anyhow::Error::from)?
-        .ok_or_else(|| anyhow::anyhow!("尚未配置当前模型,请先执行 `laew provider add` 添加接入记录。"))?;
-    // 用 SubAgent-Work 的名称构造 User-Agent(作为主标识)
+        .ok_or_else(|| {
+            anyhow::anyhow!("尚未配置当前模型,请先执行 `laew provider add` 添加接入记录。")
+        })?;
+    // 构造期 User-Agent 仅作兜底默认值:正常运行时 Agent 循环按当前 profile
+    // 逐请求覆盖(RequestMeta::user_agent,第 08 轮),8 角色在抓包层面各自可辨识
     let work_profile = AgentProfile::work_profile();
     let user_agent = work_profile.user_agent();
     let llm = client_from_record(&active, &user_agent).map_err(anyhow::Error::from)?;
 
-    eprintln!("[laew] 单轮模式: protocol={} provider={} model={}{}",
-        active.protocol.as_str(), active.provider_name, active.model_name,
-        if debug { " [debug]" } else { "" });
+    eprintln!(
+        "[laew] 单轮模式: protocol={} provider={} model={}{}",
+        active.protocol.as_str(),
+        active.provider_name,
+        active.model_name,
+        if debug { " [debug]" } else { "" }
+    );
 
     // 构造 MultiAgentOrchestrator(6 角色);debug 模式下包装饰器并注入采集器
     let plans_dir = paths.root_dir.join("plans");
@@ -182,12 +219,15 @@ async fn run_one_shot(prompt: String, max_iterations: usize, debug: bool, mode: 
 
     // -p 单轮模式每次生成独立 Session(debug 采集器以其 Session ID 命名归属)
     let mut session = Session::new();
-    session.context_mut().push(lsm_agent::llm::ChatMessage::user(prompt.clone()));
+    session
+        .context_mut()
+        .push(lsm_agent::llm::ChatMessage::user(prompt.clone()));
 
     let (orchestrator, collector) = if debug {
         let collector = Arc::new(lsm_agent::agent::debug::DebugCollector::new(session.id()));
-        let decorated: Arc<dyn lsm_agent::llm::LlmClient> =
-            Arc::new(lsm_agent::agent::debug::DebugLlmClient::new(llm.clone(), collector.clone()));
+        let decorated: Arc<dyn lsm_agent::llm::LlmClient> = Arc::new(
+            lsm_agent::agent::debug::DebugLlmClient::new(llm.clone(), collector.clone()),
+        );
         let cfg = lsm_agent::agent::orchestrator::OrchestratorConfig {
             debug: Some(collector.clone()),
             ..cfg
@@ -197,7 +237,10 @@ async fn run_one_shot(prompt: String, max_iterations: usize, debug: bool, mode: 
             Some(collector),
         )
     } else {
-        (MultiAgentOrchestrator::with_config(llm.clone(), db_arc, plans_dir, cfg), None)
+        (
+            MultiAgentOrchestrator::with_config(llm.clone(), db_arc, plans_dir, cfg),
+            None,
+        )
     };
 
     // 取消传播:任务窗口监听 SIGINT,第一次中断取消当前任务(H9);
@@ -234,11 +277,16 @@ async fn run_one_shot(prompt: String, max_iterations: usize, debug: bool, mode: 
             task: prompt.clone(),
             model: format!(
                 "[{}] {}/{} @ {}",
-                active.protocol.as_str(), active.provider_name, active.model_name, active.end_point
+                active.protocol.as_str(),
+                active.provider_name,
+                active.model_name,
+                active.end_point
             ),
         };
         let report_dir = paths.root_dir.join("DebugReport");
-        match lsm_agent::agent::debug::finalize_report(&collector, llm.clone(), &report_dir, &meta).await {
+        match lsm_agent::agent::debug::finalize_report(&collector, llm.clone(), &report_dir, &meta)
+            .await
+        {
             Ok(path) => eprintln!("[laew] Debug 报告已生成: {}", path.display()),
             Err(e) => eprintln!("[laew] Debug 报告生成失败: {e}"),
         }
@@ -261,7 +309,9 @@ async fn run_one_shot(prompt: String, max_iterations: usize, debug: bool, mode: 
             }
             print_usage(&result.total_usage);
         }
-        OrchestrationOutcome::Failed { suggestion, usage, .. } => {
+        OrchestrationOutcome::Failed {
+            suggestion, usage, ..
+        } => {
             eprintln!("[agent failed] {suggestion}");
             print_usage(&usage);
         }
@@ -272,11 +322,16 @@ async fn run_one_shot(prompt: String, max_iterations: usize, debug: bool, mode: 
 fn print_usage(usage: &lsm_agent::llm::Usage) {
     if usage.input_tokens > 0 || usage.output_tokens > 0 {
         eprintln!(
-            "[laew] 用量: input={}  output={}{}",
+            "[laew] 用量: input={}  output={}{}{}",
             usage.input_tokens,
             usage.output_tokens,
             if usage.cache_read_input_tokens > 0 {
                 format!("  cache_read={}", usage.cache_read_input_tokens)
+            } else {
+                String::new()
+            },
+            if usage.cache_creation_input_tokens > 0 {
+                format!("  cache_creation={}", usage.cache_creation_input_tokens)
             } else {
                 String::new()
             }
@@ -301,7 +356,11 @@ async fn run_from_file(file_path: PathBuf, max_iterations: usize, debug: bool) -
         anyhow::bail!("文件 '{}' 内容为空", absolute_path.display());
     }
 
-    eprintln!("[laew] 从文件读取提示词: {} ({} 字符)", absolute_path.display(), content.len());
+    eprintln!(
+        "[laew] 从文件读取提示词: {} ({} 字符)",
+        absolute_path.display(),
+        content.len()
+    );
     run_one_shot(content, max_iterations, debug, "-f 文件").await
 }
 
@@ -328,7 +387,10 @@ async fn cmd_import_provider(file_path: PathBuf) -> Result<()> {
 
     let (_paths, db) = open_db()?;
 
-    println!("[laew] 正在从 '{}' 导入 Provider 配置...", absolute_path.display());
+    println!(
+        "[laew] 正在从 '{}' 导入 Provider 配置...",
+        absolute_path.display()
+    );
     let result = db.import_from_json(&content).map_err(anyhow::Error::from)?;
 
     println!();
@@ -367,7 +429,11 @@ async fn cmd_export_provider(file_path: PathBuf) -> Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(&json)?;
     let count = parsed["count"].as_u64().unwrap_or(0);
 
-    println!("[laew] 已导出 {} 条 Provider 记录到 '{}'", count, absolute_path.display());
+    println!(
+        "[laew] 已导出 {} 条 Provider 记录到 '{}'",
+        count,
+        absolute_path.display()
+    );
 
     Ok(())
 }
@@ -402,8 +468,10 @@ async fn main() -> Result<()> {
     // TUI 模式下 INFO 级日志会与对话内容交错打印,造成视觉混乱 + 闪烁。
     // 单轮 / -debug / provider 子命令场景不受影响,沿用 RUST_LOG 默认行为。
     // 关联报告: 2026-09-09_07 F-007-1
-    let is_tui = cli.prompt.is_none() && cli.file.is_none()
-        && cli.inprovider.is_none() && cli.outprovider.is_none()
+    let is_tui = cli.prompt.is_none()
+        && cli.file.is_none()
+        && cli.inprovider.is_none()
+        && cli.outprovider.is_none()
         && cli.cmd.is_none();
     let default_level = if is_tui { "warn" } else { "info" };
     tracing_subscriber::fmt()

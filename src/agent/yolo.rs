@@ -157,11 +157,16 @@ impl YoloRunner {
     }
 
     /// 跑一次 Yolo 分类(从已有上下文中分析最后一条用户消息)。
+    ///
+    /// `session_id` 用于 X-Session-Id 传播(2026-09-09 第 08 轮):与其它 6 个
+    /// runner 对齐,让 Yolo 的请求在抓包中可关联到所属任务(此前为随机新 ID)。
     pub async fn classify(
         &self,
+        session_id: &str,
         context: &[ChatMessage],
     ) -> Result<(TaskClassification, String, Usage)> {
         let mut yolo_session = Session::new();
+        yolo_session.id = session_id.to_string();
         for msg in context {
             yolo_session.context_mut().push(msg.clone());
         }
@@ -220,9 +225,7 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
             }
         }
     };
-    if classification.task_level == TaskLevel::Simple
-        && classification.direct_answer.is_some()
-    {
+    if classification.task_level == TaskLevel::Simple && classification.direct_answer.is_some() {
         Ok(YoloOutcome::DirectAnswer {
             text: classification.direct_answer.clone().unwrap_or(text),
             classification,
@@ -346,9 +349,8 @@ pub fn build_work_prompt(classification: &TaskClassification) -> String {
         }
     }
 
-    prompt.push_str(
-        "\n请按照以上计划执行任务。使用可用工具完成目标,完成后用简洁中文回复最终结果。",
-    );
+    prompt
+        .push_str("\n请按照以上计划执行任务。使用可用工具完成目标,完成后用简洁中文回复最终结果。");
 
     // F-003:Yolo 解析失败降级时显式告知 SubAgent
     if classification.yolo_degraded {
@@ -405,11 +407,7 @@ mod tests {
 
     #[test]
     fn parse_three_levels() {
-        for (level, role) in [
-            ("simple", "subagent"),
-            ("medium", "main"),
-            ("hard", "plan"),
-        ] {
+        for (level, role) in [("simple", "subagent"), ("medium", "main"), ("hard", "plan")] {
             let json = format!(
                 r#"```json
 {{
@@ -564,5 +562,58 @@ mod tests {
 
         reset_yolo_parse_failures();
         assert_eq!(yolo_parse_failures(), 0);
+    }
+
+    // ========== X-Session-Id 传播(第 08 轮,方案 tmpPlan/2026-09-09_08) ==========
+
+    /// 捕获 complete() 收到的 session_id,验证 classify 传播任务主会话 ID。
+    struct SessionCaptureLlm {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for SessionCaptureLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            meta: &crate::llm::RequestMeta,
+        ) -> Result<crate::llm::Completion> {
+            self.seen
+                .lock()
+                .expect("session capture")
+                .push(meta.session_id.clone());
+            Ok(crate::llm::Completion {
+                text: r#"```json
+{"task_level": "simple", "goal_summary": "g", "intent": "t", "decomposition_plan": [], "direct_answer": null}
+```"#
+                .into(),
+                tool_calls: vec![],
+                usage: Usage::default(),
+                stop_reason: None,
+            })
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_propagates_parent_session_id() {
+        let cap = std::sync::Arc::new(SessionCaptureLlm {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let runner = YoloRunner::new(cap.clone());
+        let (c, _text, _usage) = runner
+            .classify("20260909-120000-abcd1234-1700000000000-1a2b3c", &[ChatMessage::user("hi")])
+            .await
+            .unwrap();
+        assert_eq!(c.task_level, TaskLevel::Simple);
+        let seen = cap.seen.lock().expect("session capture");
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|s| s == "20260909-120000-abcd1234-1700000000000-1a2b3c"),
+            "Yolo 请求的 X-Session-Id 应为任务主会话 ID,实际: {seen:?}"
+        );
     }
 }

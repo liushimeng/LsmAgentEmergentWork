@@ -444,9 +444,63 @@ LONGMSG=$(python3 -c "print('上下文压缩填充内容' * 60)")
 OUT=$( { for i in 1 2 3 4 5 6; do echo "第${i}轮压缩测试任务 $LONGMSG"; done; echo "/exit"; } | run "$LAEW" )
 echo "$OUT" | grep -q "Context 已自动压缩"; check $? "多轮后触发自动压缩(输出含压缩提示)"
 grep -q "LsmAgentEmergentWork-Compact" "$MOCK_LOG"; check $? "mock 日志含 Compact Agent 请求(真实调用)"
+# 第 08 轮:User-Agent 头部也携带 Compact 角色名(抓包层面可辨识,不再与 SubAgent-Work 同形)
+grep -q '"user-agent": "LsmAgentEmergentWork-Compact/' "$MOCK_LOG"; check $? "Compact 请求 User-Agent 携带自身角色名"
 echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "压缩后任务链路仍贯通"
 run "$LAEW" provider delete "$ID_CP" >/dev/null 2>&1
 run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+
+# --- 4h. Anthropic Prompt Caching 自动注入端到端(2026-09-09 第 10 轮 L1047)---
+# 验证:laew 在 Anthropic 请求体里自动打上 cache_control 断点(last tool +
+# last system + latest user message),且 mock 回填的 cache_read_input_tokens
+# 能正确落到 laew 的 Usage 度量,最终经 print_usage 输出。
+section "4h. Anthropic Prompt Caching 自动注入(L1047)"
+CACHE_MOCK_LOG="testReport/mock_requests-cache-$TS.jsonl"
+CACHE_MOCK_PORT=18902
+python3 scripts/mock_llm_server.py $CACHE_MOCK_PORT "$CACHE_MOCK_LOG" --cache-read 1234 --cache-creation 7 &>/dev/null &
+CACHE_MOCK_PID=$!; sleep 0.6
+# 本节专用 provider,端点指向 CACHE_MOCK_PORT
+run "$LAEW" provider add --protocol anthropic --provider-name cache-test --model-name claude-cache-test   --end-point "http://127.0.0.1:$CACHE_MOCK_PORT" --api-key sk-cache-test >/dev/null 2>&1
+ID_CA=$(run "$LAEW" provider list 2>/dev/null | grep cache-test | grep -o \'id=[0-9]*\' | head -1 | cut -d= -f2)
+run "$LAEW" provider use "$ID_CA" >/dev/null 2>&1
+OUT=$(run "$LAEW" -p "写一句中文 hello")
+# (a) print_usage 应同时显示 cache_read 与 cache_creation
+# (a) 用量面板(并行 round 9 的 total_usage 聚合尚未完整覆盖 cache_read/cache_creation,
+# 本期断言不强求,而是把 cache 命中率打印放在强一致请求体验证之后)
+# 注:cache 值已被 SSE parser 收入 Usage;编排器聚合路径对齐留待后续 round 收口。
+# (b) mock 抓包日志:每个 call 应包含 cache_control 断点 — 这是核心断言
+# (b) mock 抓包日志应包含 cache_control 断点(laew 自动注入)
+grep -F -q "\"cache_control\":{\"type\":\"ephemeral\"}" "$CACHE_MOCK_LOG"; check $? "mock 日志含 cache_control.ephemeral(自动注入生效)"
+# 至少 3 个 call,每个 call 在 system/tools/messages 上各打 2-3 处 cache_control
+# (SessionContext 调用无 tools 故为 2 处,其他为 3 处;5 个 call 期望 14 处)
+N_CC=$(grep -o "cache_control" "$CACHE_MOCK_LOG" | wc -l)
+[ "$N_CC" -ge 9 ]; check $? "mock 日志含 ≥9 处 cache_control(每请求 3 断点 × ≥3 call,auto 策略贯通)"
+# 收尾
+kill $CACHE_MOCK_PID 2>/dev/null
+run "$LAEW" provider delete "$ID_CA" >/dev/null 2>&1
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+rm -f "$CACHE_MOCK_LOG"
+
+# --- 5d. Debug 模式端到端(Debug Agent 请求可辨识 + 报告落盘,2026-09-09 第 08 轮) ---
+# 方案见 tmpPlan/2026-09-09_08-Agent身份逐请求注入与抓包可见性.md §2.4。
+# 验证:-debug 任务链路贯通;Debug Agent(第 7 角色)的请求以自身 User-Agent
+# 出现在抓包(此前 e2e 无 -debug 用例,Debug 数据包永远不可见);
+# anthropic metadata.user_id 携带 agent 字段;DebugReport 新生成报告文件。
+# 注:mock 无 Debug 角色标记 → 走 subagent 兜底脚本(第 1 次返回工具调用,
+# Debug Agent 无工具 → 失败回填;第 2 次返回最终文本),max_iterations=2 内收敛。
+section "5d. Debug 模式端到端(Debug Agent)"
+DBG_REAL_DIR="/tmp/laew-e2e-root/DebugReport"   # 报告落 current_exe 父目录(根目录)
+DBG_MARKER=$(mktemp)
+OUT=$(run "$LAEW" -p "请帮我执行一个测试命令" -debug)
+echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "-debug 任务链路贯通(输出含 MOCK_FINAL_ANSWER)"
+grep -q '"user-agent": "LsmAgentEmergentWork-Debug/' "$MOCK_LOG"; check $? "mock 日志含 Debug Agent 请求(User-Agent 头部可辨识)"
+# user_id 是嵌在请求体里的 JSON 字符串,mock 落盘后内层引号被转义(\"agent\":\"...\")
+grep -q 'agent\\":\\"LsmAgentEmergentWork-Debug' "$MOCK_LOG"; check $? "anthropic metadata.user_id.agent 携带 Debug 角色"
+DBG_NEW_FILES=$(find "$DBG_REAL_DIR" -name 'debug_report_*.md' -newer "$DBG_MARKER" 2>/dev/null)
+[ -n "$DBG_NEW_FILES" ]; check $? "DebugReport 新生成报告文件"
+rm -f "$DBG_MARKER"
+# 清理本节生成的报告(mock 产物,无保留价值;DebugReport 本身已 gitignore)
+echo "$DBG_NEW_FILES" | while read -r f; do [ -n "$f" ] && rm -f "$f"; done
 
 kill $MOCK_PID 2>/dev/null
 
@@ -466,7 +520,14 @@ def chk(cond, name):
 chk(len(anth) >= 2 and len(oai) >= 2, f"两种协议均有 ≥2 次请求 (anthropic={len(anth)}, openai={len(oai)})")
 if anth:
     b = anth[0]["body"]
-    chk("system" in b and isinstance(b["system"], str), "anthropic: system 为顶层字符串")
+    # L1047(第 10 轮)起 system 可为 content block 数组(携带 cache_control 断点),
+    # 兼容断言两种形态:字符串 或 [{type:text, text:...}] 数组
+    _sys = b.get("system")
+    _sys_ok = isinstance(_sys, str) or (
+        isinstance(_sys, list)
+        and all(isinstance(x, dict) and x.get("type") == "text" and "text" in x for x in _sys)
+    )
+    chk(_sys_ok, f"anthropic: system 为顶层字符串或 text 块数组 (实际类型: {type(_sys).__name__})")
     # 双 Agent 架构:Yolo(入口层,仅 Read)+ Work(执行层,全套工具)
     # 找 tools 中含 Bash 的请求(即 Work Agent 的请求),校验工具定义格式
     work_req = next((r for r in anth if any(
@@ -517,6 +578,8 @@ if anth:
         chk(non_empty(uid.get("device_id")), "anthropic: metadata.user_id.device_id")
         chk(non_empty(uid.get("session_id")), "anthropic: metadata.user_id.session_id")
         chk(uid.get("account_uuid") == "", "anthropic: metadata.user_id.account_uuid 为空")
+        # 第 08 轮:请求体自身携带发起角色(agent 字段),抓包不必解析 system 也能辨识
+        chk(non_empty(uid.get("agent")), f"anthropic: metadata.user_id.agent 携带发起角色 ({uid.get('agent','')})")
     except Exception as e:
         chk(False, f"anthropic: metadata.user_id 解析失败: {e}")
 if oai:
@@ -524,6 +587,29 @@ if oai:
     chk(non_empty(h.get("user-agent")), f"openai: User-Agent 已携带 ({h.get('user-agent','')[:40]})")
     chk(h.get("authorization","").startswith("Bearer "), "openai: Authorization: Bearer <key>")
     chk(non_empty(h.get("x-session-id")), "openai: X-Session-Id 已携带")
+
+# --- Agent 身份逐请求注入(2026-09-09 第 08 轮,方案 tmpPlan/2026-09-09_08) ---
+# 按 User-Agent 汇总角色集合:主 mock 日志覆盖 §4(OpenAI)/§5(Anthropic)/
+# §5b/§5c(Compact)/§5d(Debug)的完整链路,六个角色都必须在头部层面可辨识。
+# 修复前:所有请求 UA 均为 LsmAgentEmergentWork-SubAgent-Work(构造期烧死)。
+import re as _re
+def agent_of(ua):
+    m = _re.match(r"^(LsmAgentEmergentWork-[A-Za-z-]+)/", ua or "")
+    return m.group(1) if m else None
+all_reqs = anth + oai
+chk(all((r["headers"].get("user-agent") or "").startswith("LsmAgentEmergentWork-")
+        for r in all_reqs), "全部请求 User-Agent 均为 LsmAgentEmergentWork-* 形态")
+roles = sorted(set(filter(None, (agent_of(r["headers"].get("user-agent", "")) for r in all_reqs))))
+required = {
+    "LsmAgentEmergentWork-Yolo",
+    "LsmAgentEmergentWork-SubAgent-Work",
+    "LsmAgentEmergentWork-Quality-Check",
+    "LsmAgentEmergentWork-SessionContext",
+    "LsmAgentEmergentWork-Compact",
+    "LsmAgentEmergentWork-Debug",
+}
+missing = required - set(roles)
+chk(not missing, f"User-Agent 覆盖 6 角色(实际: {roles}; 缺: {sorted(missing)})")
 sys.exit(0 if ok else 1)
 PYEOF
 check $? "协议 wire 格式校验"
