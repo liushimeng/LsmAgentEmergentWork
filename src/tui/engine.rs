@@ -48,6 +48,11 @@ pub struct Cell {
     pub bg: Color,
     /// 属性位掩码,见 `theme::attr`。
     pub attrs: u8,
+    /// true = 该 cell 是某个 wide char 的"第二半占位",present() 必须跳过
+    /// (详见 tmpPlan/2026-09-09_15-TUI宽字符二次占位与tmux捕获渲染方案.md)。
+    /// 这样 tmux capture-pane 拿到的就是原始 CJK 字符而不是"记 录"带空格,
+    /// `testReport/run_e2e.sh::texpect` 的 `grep -F` 字符串断言可正常命中。
+    pub skip: bool,
 }
 
 impl Cell {
@@ -57,6 +62,7 @@ impl Cell {
             fg: theme::FG,
             bg: Color::Reset,
             attrs: attr::NONE,
+            skip: false,
         }
     }
 }
@@ -81,9 +87,35 @@ impl Frame {
     }
 
     /// 在指定位置写一个字符(超出区域静默忽略)。
+    ///
+    /// 宽字符(CJK / 全角,char_width == 2)处理:
+    /// - cell[x] 写入字符本身
+    /// - cell[x+1] 写入相同字符并标 `skip = true`,present() 跳过该 cell,
+    ///   这样 tmux capture-pane 拿到的是原始 CJK 字符串(无空格),
+    ///   e2e 的 `grep -F "记录:"` 等字符串断言可正常命中
+    /// - 越界保护:x+1 >= area.width 时只写左半,避免越界 panic
     pub fn put_char(&mut self, x: u16, y: u16, ch: char, fg: Color, attrs: u8) {
+        let w = char_width(ch);
         if let Some(i) = self.idx(x, y) {
-            self.cells[i] = Cell { ch, fg, bg: Color::Reset, attrs };
+            self.cells[i] = Cell {
+                ch,
+                fg,
+                bg: Color::Reset,
+                attrs,
+                skip: false,
+            };
+            // 宽字符:标记右半 cell 为 skip(同时写相同 ch 以便回退显示)
+            if w == 2 {
+                if let Some(j) = self.idx(x + 1, y) {
+                    self.cells[j] = Cell {
+                        ch,
+                        fg,
+                        bg: Color::Reset,
+                        attrs,
+                        skip: true,
+                    };
+                }
+            }
         }
     }
 
@@ -280,7 +312,11 @@ pub fn present(frame: &Frame) -> io::Result<()> {
                     cur_fg = cell.fg;
                 }
             }
-            batch.push(cell.ch);
+            // 跳过宽字符续位 cell(write 时已写入 ch 到左半,这里不重复)
+            // 否则会把"记 录"重复成"记  录 ",视觉与 tmux 捕获都错位
+            if !cell.skip {
+                batch.push(cell.ch);
+            }
         }
         if !batch.is_empty() {
             execute!(stdout, Print(&batch))?;
