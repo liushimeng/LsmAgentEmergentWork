@@ -2051,7 +2051,7 @@ pub async fn sleep_cancellable(delay: Duration, token: &tokio_util::sync::Cancel
 | H10 | 无 idle 超时 watchdog | P1 | deepseek idleWatchdog ✅ **已实现(2026-09-08)**:`llm/sse.rs::stream_chunks`(tokio timeout 包裹 chunk 间读取,超时报可重试 `LlmNetwork`) |
 | H11 | 无首包超时 | P2 | openclaw stream-first-event |
 | H12 | 无连接健康检查 | P2 | atomcode stale pool 重建 |
-| H13 | 无熔断器 | P2 | failsafe crate |
+| H13 | 无熔断器 | P2 | failsafe crate ✅ **已实现(2026-09-09)**:`llm/resilient.rs` 自研三态熔断(连续 5 次重试耗尽失败 / Open 30s / HalfOpen 单探测),不引入新 crate |
 | H14 | 无 DNS pinning | P2 | openclaw |
 | H15 | 无 HappyEyeballs | P2 | openclaw/pi |
 | H16 | 无请求体压缩 | P2 | pi zstd |

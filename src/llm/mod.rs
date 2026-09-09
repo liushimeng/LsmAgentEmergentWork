@@ -197,8 +197,8 @@ pub trait LlmClient: Send + Sync {
 
 /// 根据数据库记录创建对应协议的用户端(注入 User-Agent)。
 ///
-/// 自动包一层 [`ResilientLlmClient`]:超时感知 + 自动重试 + 指数退避,
-/// 调用方(main / tui)零改动即获得弹性。
+/// 自动包一层 [`ResilientLlmClient`]:超时感知 + 自动重试 + 指数退避 +
+/// 三态熔断,调用方(main / tui)零改动即获得弹性与故障隔离。
 pub fn client_from_record(record: &ProviderRecord, user_agent: &str) -> Result<Arc<dyn LlmClient>> {
     let inner: Arc<dyn LlmClient> = match record.protocol {
         Protocol::Anthropic => {

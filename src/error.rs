@@ -30,6 +30,13 @@ pub enum AgentError {
     #[error("LLM 流式错误({kind}): {message}")]
     LlmStream { kind: String, message: String },
 
+    /// Provider 熔断器打开:连续可重试失败达到阈值后的快速失败保护。
+    ///
+    /// 该错误本身不可重试,避免熔断器在同一个请求内被重试层放大;
+    /// 冷却期到期后由 `ResilientLlmClient` 自动放入一个 HalfOpen 探测请求。
+    #[error("LLM Provider 熔断器已打开:连续失败 {consecutive_failures} 次,约 {retry_in_ms}ms 后自动半开探测;请稍后重试或切换接入记录")]
+    LlmCircuitOpen { retry_in_ms: u64, consecutive_failures: usize },
+
     #[error("工具不存在: {0}")]
     ToolNotFound(String),
 

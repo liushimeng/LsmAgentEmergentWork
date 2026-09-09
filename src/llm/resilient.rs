@@ -3,6 +3,8 @@
 //! 包住任意 [`LlmClient`],对上仍是 `Arc<dyn LlmClient>`,调用方零改动:
 //! - **可重试错误**(`LlmHttp` 408/425/429/5xx/529、`LlmNetwork`、上游流内
 //!   `overloaded/rate_limit/api/timeout` 错误)→ 自动指数退避重试;
+//! - **熔断器**(Closed/Open/HalfOpen)在重试耗尽后统计连续 Provider 故障,
+//!   Open 快速失败,冷却到期自动只放行 1 个 HalfOpen 探测请求;
 //! - **429 的 `Retry-After`** 服务端优先(60s 封顶,不做向下抖动);
 //! - **不可重试错误**(401/403/404/413/422 等)→ 立即上抛,不浪费时间。
 //!
@@ -13,8 +15,8 @@
 //! 重试安全性:laew 的 `complete()` 聚合完整响应后才返回,工具调用发生在其后,
 //! 因此整请求重放无副作用(仅可能重复计费失败的请求,行业同款行为)。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -32,6 +34,10 @@ pub const DEFAULT_MAX_DELAY_MS: u64 = 8_000;
 pub const DEFAULT_JITTER_RATIO: f64 = 0.25;
 /// Retry-After 上限(毫秒),防恶意/异常大值
 pub const DEFAULT_RETRY_AFTER_CAP_MS: u64 = 60_000;
+/// 连续可重试最终失败达到该次数后熔断(对齐第十一轮熔断器对比表)
+pub const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: usize = 5;
+/// Open → HalfOpen 冷却期
+pub const DEFAULT_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
 /// TCP 连接超时(所有协议客户端共用,经 [`crate::llm::build_http_client`])
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// SSE 相邻 chunk 间空闲超时(claudecode SSE idle 90s),防半开连接假活
@@ -47,6 +53,8 @@ pub struct RetryConfig {
     pub max_delay_ms: u64,
     pub jitter_ratio: f64,
     pub retry_after_cap_ms: u64,
+    pub circuit_failure_threshold: usize,
+    pub circuit_cooldown: Duration,
 }
 
 impl Default for RetryConfig {
@@ -57,6 +65,8 @@ impl Default for RetryConfig {
             max_delay_ms: DEFAULT_MAX_DELAY_MS,
             jitter_ratio: DEFAULT_JITTER_RATIO,
             retry_after_cap_ms: DEFAULT_RETRY_AFTER_CAP_MS,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown: DEFAULT_CIRCUIT_COOLDOWN,
         }
     }
 }
@@ -76,6 +86,60 @@ pub fn is_retryable(err: &AgentError) -> bool {
             "overloaded_error" | "rate_limit_error" | "api_error" | "timeout_error"
         ),
         _ => false,
+    }
+}
+
+/// 三态熔断器的内部状态。`generation` 用于丢弃已过期的并发请求结果:
+/// 例如某个 Closed 请求在途时另一个请求把状态打成 Open,旧请求稍后的
+/// Ok/Err 不能再把状态错误地改回 Closed。
+#[derive(Debug)]
+struct CircuitInner {
+    generation: u64,
+    state: CircuitState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitState {
+    Closed {
+        consecutive_failures: usize,
+    },
+    Open {
+        until: Instant,
+        consecutive_failures: usize,
+    },
+    HalfOpen {
+        probe_in_flight: bool,
+    },
+}
+
+/// 面向测试 / 后续遥测的只读状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitStatus {
+    Closed,
+    Open { retry_in_ms: u64 },
+    HalfOpen { probe_in_flight: bool },
+}
+
+/// 一次调用获得的熔断放行凭证。HalfOpen 持有 RAII 探测位,
+/// 请求被外层取消 / future 被 drop 时也能自动释放,不会永久卡死。
+enum CircuitLease {
+    Closed { generation: u64 },
+    HalfOpen { generation: u64, _guard: ProbeGuard },
+}
+
+struct ProbeGuard {
+    circuit: Arc<Mutex<CircuitInner>>,
+    generation: u64,
+}
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        let mut inner = self.circuit.lock().expect("circuit breaker poisoned");
+        if inner.generation == self.generation {
+            if let CircuitState::HalfOpen { probe_in_flight } = &mut inner.state {
+                *probe_in_flight = false;
+            }
+        }
     }
 }
 
@@ -113,6 +177,7 @@ pub fn jitter_seed(salt: u64) -> u64 {
 pub struct ResilientLlmClient {
     inner: Arc<dyn LlmClient>,
     cfg: RetryConfig,
+    circuit: Arc<Mutex<CircuitInner>>,
 }
 
 impl ResilientLlmClient {
@@ -121,7 +186,173 @@ impl ResilientLlmClient {
     }
 
     pub fn with_config(inner: Arc<dyn LlmClient>, cfg: RetryConfig) -> Self {
-        Self { inner, cfg }
+        Self {
+            inner,
+            cfg,
+            circuit: Arc::new(Mutex::new(CircuitInner {
+                generation: 0,
+                state: CircuitState::Closed {
+                    consecutive_failures: 0,
+                },
+            })),
+        }
+    }
+
+    /// 当前熔断状态快照(测试与后续遥测复用;锁内不 await)。
+    pub fn circuit_status(&self) -> CircuitStatus {
+        let inner = self.circuit.lock().expect("circuit breaker poisoned");
+        self.status_from(&inner)
+    }
+
+    fn status_from(&self, inner: &CircuitInner) -> CircuitStatus {
+        match &inner.state {
+            CircuitState::Closed { .. } => CircuitStatus::Closed,
+            CircuitState::Open { until, .. } => CircuitStatus::Open {
+                retry_in_ms: until
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            },
+            CircuitState::HalfOpen { probe_in_flight } => CircuitStatus::HalfOpen {
+                probe_in_flight: *probe_in_flight,
+            },
+        }
+    }
+
+    /// 获取调用资格。Open 冷却未到期快速失败;到期后转入 HalfOpen 并
+    /// 保证同一时间只有一个探测请求。
+    fn acquire_circuit(&self) -> std::result::Result<CircuitLease, AgentError> {
+        let mut inner = self.circuit.lock().expect("circuit breaker poisoned");
+        match inner.state {
+            CircuitState::Closed { .. } => Ok(CircuitLease::Closed {
+                generation: inner.generation,
+            }),
+            CircuitState::Open {
+                until,
+                consecutive_failures,
+            } => {
+                let now = Instant::now();
+                if until > now {
+                    let retry_in_ms = (until - now).as_millis().min(u64::MAX as u128) as u64;
+                    tracing::warn!(
+                        retry_in_ms,
+                        consecutive_failures,
+                        "LLM Provider 熔断器仍打开,快速失败"
+                    );
+                    return Err(AgentError::LlmCircuitOpen {
+                        retry_in_ms,
+                        consecutive_failures,
+                    });
+                }
+                inner.generation += 1;
+                inner.state = CircuitState::HalfOpen {
+                    probe_in_flight: true,
+                };
+                let generation = inner.generation;
+                drop(inner);
+                tracing::info!("LLM Provider 熔断冷却期到期,自动进入 HalfOpen 单探测");
+                Ok(CircuitLease::HalfOpen {
+                    generation,
+                    _guard: ProbeGuard {
+                        circuit: self.circuit.clone(),
+                        generation,
+                    },
+                })
+            }
+            CircuitState::HalfOpen {
+                probe_in_flight: false,
+            } => {
+                inner.state = CircuitState::HalfOpen {
+                    probe_in_flight: true,
+                };
+                let generation = inner.generation;
+                drop(inner);
+                tracing::debug!("LLM Provider HalfOpen 探测位已释放,允许下一个探测");
+                Ok(CircuitLease::HalfOpen {
+                    generation,
+                    _guard: ProbeGuard {
+                        circuit: self.circuit.clone(),
+                        generation,
+                    },
+                })
+            }
+            CircuitState::HalfOpen {
+                probe_in_flight: true,
+            } => Err(AgentError::LlmCircuitOpen {
+                retry_in_ms: 0,
+                consecutive_failures: self.cfg.circuit_failure_threshold,
+            }),
+        }
+    }
+
+    fn record_success(&self, lease: &CircuitLease) {
+        let generation = lease.generation();
+        let mut inner = self.circuit.lock().expect("circuit breaker poisoned");
+        if inner.generation != generation {
+            return;
+        }
+        match inner.state {
+            CircuitState::Closed { .. } => {
+                inner.state = CircuitState::Closed {
+                    consecutive_failures: 0,
+                };
+            }
+            CircuitState::HalfOpen { .. } => {
+                inner.generation += 1;
+                inner.state = CircuitState::Closed {
+                    consecutive_failures: 0,
+                };
+                tracing::info!("LLM Provider 半开探测成功,熔断器自动关闭");
+            }
+            CircuitState::Open { .. } => {}
+        }
+    }
+
+    fn record_failure(&self, lease: &CircuitLease) {
+        let generation = lease.generation();
+        let mut inner = self.circuit.lock().expect("circuit breaker poisoned");
+        if inner.generation != generation {
+            return;
+        }
+        match inner.state {
+            CircuitState::Closed {
+                consecutive_failures,
+            } => {
+                let failures = consecutive_failures.saturating_add(1);
+                if failures >= self.failure_threshold() {
+                    inner.generation += 1;
+                    inner.state = CircuitState::Open {
+                        until: Instant::now() + self.cfg.circuit_cooldown,
+                        consecutive_failures: failures,
+                    };
+                    tracing::warn!(
+                        consecutive_failures = failures,
+                        cooldown_ms = self.cfg.circuit_cooldown.as_millis(),
+                        "连续可重试失败达到阈值,LLM Provider 熔断器自动打开"
+                    );
+                } else {
+                    inner.state = CircuitState::Closed {
+                        consecutive_failures: failures,
+                    };
+                }
+            }
+            CircuitState::HalfOpen { .. } => {
+                inner.generation += 1;
+                inner.state = CircuitState::Open {
+                    until: Instant::now() + self.cfg.circuit_cooldown,
+                    consecutive_failures: self.failure_threshold(),
+                };
+                tracing::warn!(
+                    cooldown_ms = self.cfg.circuit_cooldown.as_millis(),
+                    "LLM Provider 半开探测失败,熔断器重新打开"
+                );
+            }
+            CircuitState::Open { .. } => {}
+        }
+    }
+
+    fn failure_threshold(&self) -> usize {
+        self.cfg.circuit_failure_threshold.max(1)
     }
 
     /// 单次重试应等待的时长:429/503 的 Retry-After 服务端优先(封顶,不向下抖动),
@@ -144,13 +375,14 @@ impl ResilientLlmClient {
         tools: &[ToolDef],
         meta: &RequestMeta,
     ) -> Result<Completion> {
+        let lease = self.acquire_circuit()?;
         let mut attempt: usize = 0;
-        loop {
+        let result = loop {
             match self.inner.complete(system, messages, tools, meta).await {
-                Ok(c) => return Ok(c),
+                Ok(c) => break Ok(c),
                 Err(e) => {
                     if attempt >= self.cfg.max_retries || !is_retryable(&e) {
-                        return Err(e);
+                        break Err(e);
                     }
                     let delay = self.delay_for(&e, attempt);
                     tracing::warn!(
@@ -164,6 +396,26 @@ impl ResilientLlmClient {
                     attempt += 1;
                 }
             }
+        };
+
+        match &result {
+            Ok(_) => self.record_success(&lease),
+            Err(e) if matches!(e, AgentError::Cancelled) => {
+                // 用户取消不是 Provider 故障;lease drop 仅释放 HalfOpen 探测位。
+            }
+            Err(e) if is_retryable(e) => self.record_failure(&lease),
+            // 401/400/422 等请求侧错误说明服务可达,不应把 Provider 熔断。
+            Err(_) => self.record_success(&lease),
+        }
+        result
+    }
+}
+
+impl CircuitLease {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Closed { generation } => *generation,
+            Self::HalfOpen { generation, .. } => *generation,
         }
     }
 }
@@ -192,6 +444,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::Barrier;
 
     /// 脚本化 Mock:按预定顺序弹出响应,并统计调用次数。
     struct MockClient {
@@ -259,6 +512,21 @@ mod tests {
             max_delay_ms: 4,
             jitter_ratio: 0.25,
             retry_after_cap_ms: 50,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown: DEFAULT_CIRCUIT_COOLDOWN,
+        }
+    }
+
+    /// 熔断器专用配置:不重试、阈值小、冷却期短。
+    fn circuit_cfg(threshold: usize, cooldown_ms: u64) -> RetryConfig {
+        RetryConfig {
+            max_retries: 0,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_ratio: 0.0,
+            retry_after_cap_ms: 1,
+            circuit_failure_threshold: threshold,
+            circuit_cooldown: Duration::from_millis(cooldown_ms),
         }
     }
 
@@ -287,12 +555,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_retryable_fails_immediately() {
-        let (mock, calls) = MockClient::new(
-            vec![Err(http_err(401, None))],
-            Protocol::Anthropic,
-        );
+        let (mock, calls) = MockClient::new(vec![Err(http_err(401, None))], Protocol::Anthropic);
         let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
-        let err = client.complete("", &[], &[], &test_meta()).await.unwrap_err();
+        let err = client
+            .complete("", &[], &[], &test_meta())
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentError::LlmHttp { status: 401, .. }));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "401 不应重试");
     }
@@ -309,18 +577,260 @@ mod tests {
             Protocol::OpenAi,
         );
         let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
-        let err = client.complete("", &[], &[], &test_meta()).await.unwrap_err();
+        let err = client
+            .complete("", &[], &[], &test_meta())
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentError::LlmHttp { status: 503, .. }));
         assert_eq!(calls.load(Ordering::SeqCst), 4, "1 次初始 + 3 次重试");
     }
 
     #[tokio::test]
-    async fn retry_after_is_respected_with_cap() {
+    async fn circuit_opens_after_consecutive_final_failures() {
+        let (mock, calls) = MockClient::new(
+            vec![Err(http_err(503, None)), Err(http_err(503, None))],
+            Protocol::Anthropic,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), circuit_cfg(2, 30));
+
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        match client.circuit_status() {
+            CircuitStatus::Open { retry_in_ms } => assert!(retry_in_ms <= 30),
+            status => panic!("熔断器应处于 Open,实际 {status:?}"),
+        }
+
+        let err = client
+            .complete("", &[], &[], &test_meta())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::LlmCircuitOpen {
+                consecutive_failures: 2,
+                ..
+            }
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Open 后必须快速失败,不再触达底层客户端"
+        );
+    }
+
+    #[tokio::test]
+    async fn half_open_probe_success_closes_circuit() {
+        let (mock, calls) = MockClient::new(
+            vec![Err(http_err(500, None)), Ok(ok_completion())],
+            Protocol::OpenAi,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), circuit_cfg(1, 1));
+
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        assert!(matches!(
+            client.circuit_status(),
+            CircuitStatus::Open { .. }
+        ));
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let out = client.complete("", &[], &[], &test_meta()).await.unwrap();
+        assert_eq!(out.text, "ok");
+        assert_eq!(client.circuit_status(), CircuitStatus::Closed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn half_open_failure_reopens_circuit() {
         let (mock, calls) = MockClient::new(
             vec![
-                Err(http_err(429, Some(30))),
+                Err(http_err(503, None)),
+                Err(AgentError::LlmNetwork("连接仍失败".into())),
+            ],
+            Protocol::Anthropic,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), circuit_cfg(1, 1));
+
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+
+        assert!(matches!(
+            client.circuit_status(),
+            CircuitStatus::Open { .. }
+        ));
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "重新 Open 后应快速失败");
+    }
+
+    #[tokio::test]
+    async fn dropped_half_open_future_releases_probe_slot() {
+        struct HangingProbeMock {
+            failed_first: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LlmClient for HangingProbeMock {
+            async fn complete(
+                &self,
+                _system: &str,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDef],
+                _meta: &RequestMeta,
+            ) -> Result<Completion> {
+                if self.failed_first.swap(1, Ordering::SeqCst) == 0 {
+                    return Err(http_err(503, None));
+                }
+                std::future::pending().await
+            }
+
+            fn protocol(&self) -> Protocol {
+                Protocol::Anthropic
+            }
+        }
+
+        let client = Arc::new(ResilientLlmClient::with_config(
+            Arc::new(HangingProbeMock {
+                failed_first: AtomicUsize::new(0),
+            }),
+            circuit_cfg(1, 1),
+        ));
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let meta = test_meta();
+        let mut probe = Box::pin(client.complete("", &[], &[], &meta));
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            _ = &mut probe => panic!("测试 Mock 不应完成"),
+        }
+        assert_eq!(
+            client.circuit_status(),
+            CircuitStatus::HalfOpen {
+                probe_in_flight: true
+            }
+        );
+        drop(probe);
+
+        assert_eq!(
+            client.circuit_status(),
+            CircuitStatus::HalfOpen {
+                probe_in_flight: false
+            },
+            "外层取消导致 future 被 drop 时,探测位必须释放"
+        );
+    }
+
+    #[tokio::test]
+    async fn half_open_allows_only_one_probe_during_parallel_calls() {
+        struct ProbeMock {
+            failed_first: AtomicUsize,
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl LlmClient for ProbeMock {
+            async fn complete(
+                &self,
+                _system: &str,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDef],
+                _meta: &RequestMeta,
+            ) -> Result<Completion> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.failed_first.swap(1, Ordering::SeqCst) == 0 {
+                    return Err(http_err(503, None));
+                }
+                self.entered.wait().await;
+                self.release.wait().await;
+                Ok(ok_completion())
+            }
+
+            fn protocol(&self) -> Protocol {
+                Protocol::Anthropic
+            }
+        }
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ProbeMock {
+            failed_first: AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+            calls: calls.clone(),
+        };
+        let client = Arc::new(ResilientLlmClient::with_config(
+            Arc::new(mock),
+            circuit_cfg(1, 1),
+        ));
+
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let probe_client = client.clone();
+        let probe =
+            tokio::spawn(async move { probe_client.complete("", &[], &[], &test_meta()).await });
+        entered.wait().await;
+
+        let second = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.complete("", &[], &[], &test_meta()),
+        )
+        .await
+        .expect("第二个请求应立即快速失败")
+        .unwrap_err();
+        assert!(matches!(second, AgentError::LlmCircuitOpen { .. }));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "只有 HalfOpen 探测应触达底层"
+        );
+
+        release.wait().await;
+        probe.await.unwrap().unwrap();
+        assert_eq!(client.circuit_status(), CircuitStatus::Closed);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_does_not_trip_circuit() {
+        let (mock, calls) = MockClient::new(vec![Err(http_err(401, None))], Protocol::Anthropic);
+        let client = ResilientLlmClient::with_config(Arc::new(mock), circuit_cfg(1, 1));
+
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        assert_eq!(client.circuit_status(), CircuitStatus::Closed);
+
+        client.complete("", &[], &[], &test_meta()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn success_resets_consecutive_failure_count() {
+        let (mock, calls) = MockClient::new(
+            vec![
+                Err(http_err(503, None)),
+                Ok(ok_completion()),
+                Err(http_err(503, None)),
                 Ok(ok_completion()),
             ],
+            Protocol::OpenAi,
+        );
+        let client = ResilientLlmClient::with_config(Arc::new(mock), circuit_cfg(2, 1));
+
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        client.complete("", &[], &[], &test_meta()).await.unwrap();
+        assert!(client.complete("", &[], &[], &test_meta()).await.is_err());
+        client.complete("", &[], &[], &test_meta()).await.unwrap();
+
+        assert_eq!(client.circuit_status(), CircuitStatus::Closed);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_respected_with_cap() {
+        let (mock, calls) = MockClient::new(
+            vec![Err(http_err(429, Some(30))), Ok(ok_completion())],
             Protocol::Anthropic,
         );
         let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
@@ -360,7 +870,10 @@ mod tests {
             Protocol::Anthropic,
         );
         let client2 = ResilientLlmClient::with_config(Arc::new(mock2), fast_cfg());
-        let _ = client2.complete("", &[], &[], &test_meta()).await.unwrap_err();
+        let _ = client2
+            .complete("", &[], &[], &test_meta())
+            .await
+            .unwrap_err();
         assert_eq!(calls2.load(Ordering::SeqCst), 1);
     }
 
@@ -375,6 +888,10 @@ mod tests {
         assert!(is_retryable(&AgentError::LlmNetwork("timeout".into())));
         assert!(!is_retryable(&AgentError::Llm("其它".into())));
         assert!(!is_retryable(&AgentError::YoloParse("解析".into())));
+        assert!(!is_retryable(&AgentError::LlmCircuitOpen {
+            retry_in_ms: 1,
+            consecutive_failures: 5,
+        }));
     }
 
     #[test]
