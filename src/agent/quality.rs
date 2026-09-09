@@ -10,7 +10,7 @@ use crate::agent::memory;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::Result;
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, Usage};
 use crate::session;
 
 /// 质检结论。
@@ -76,6 +76,10 @@ impl QualityRunner {
     /// 2026-09-09 第 05 轮:接收 `ExecutionTrace` 作为辅助判据,让 QC 模型
     /// 既能看实际输出文本,也能看到真实执行证据(工具调用次数 / 失败 / 早终止),
     /// 避免「黑盒判定」误判 silently pass。
+    ///
+    /// 2026-09-09 第 14 轮:返回 `(QualityReport, Usage)`,把 Quality 调用的 LLM
+    /// 用量带回给 Orchestrator 累加到 `total_usage`(修复 stdout 用量与 Debug 报告
+    /// 不一致的 Bug)。
     pub async fn check_subagent(
         &self,
         goal: &str,
@@ -83,7 +87,7 @@ impl QualityRunner {
         actual_output: &str,
         trace: &ExecutionTrace,
         session_id: &str,
-    ) -> Result<QualityReport> {
+    ) -> Result<(QualityReport, Usage)> {
         let trace_summary = trace.render_prompt();
         let prompt = format!(
             "【Quality-Check: SubAgent 单元】\n\
@@ -99,25 +103,25 @@ impl QualityRunner {
         self.run_check(prompt, AgentRole::SubAgent, actual_output, session_id).await
     }
 
-    /// 校验 Main-Work WorkFlow 计划。
+    /// 校验 Main-Work WorkFlow 计划(返回带 LLM Usage)。
     pub async fn check_main(
         &self,
         goal: &str,
         workflow_json: &str,
         session_id: &str,
-    ) -> Result<QualityReport> {
+    ) -> Result<(QualityReport, Usage)> {
         let prompt = format!(
             "【Quality-Check: Main-Work 单元】\n目标: {goal}\nWorkFlow JSON: {workflow_json}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。",
         );
         self.run_check(prompt, AgentRole::MainWork, workflow_json, session_id).await
     }
 
-    /// 校验 Plan Markdown。
+    /// 校验 Plan Markdown(返回带 LLM Usage)。
     pub async fn check_plan(
         &self,
         plan_markdown: &str,
         session_id: &str,
-    ) -> Result<QualityReport> {
+    ) -> Result<(QualityReport, Usage)> {
         let prompt = format!(
             "【Quality-Check: Plan 单元】\nPlan Markdown:\n{plan_markdown}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。",
         );
@@ -130,7 +134,7 @@ impl QualityRunner {
         source: AgentRole,
         actual: &str,
         session_id: &str,
-    ) -> Result<QualityReport> {
+    ) -> Result<(QualityReport, Usage)> {
         let mut sub_session = session::Session::new();
         sub_session.context_mut().push(ChatMessage::user(&prompt));
         sub_session.id = session_id.to_string();
@@ -179,9 +183,8 @@ impl QualityRunner {
             serde_json::json!({ "issues": &report.issues, "retryable": report.retryable }),
         );
 
-        let _ = usage;
         let _ = actual;
-        Ok(report)
+        Ok((report, usage))
     }
 }
 

@@ -11,7 +11,7 @@ use crate::agent::memory;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, Usage};
 use crate::session;
 
 /// Plan 生成结果。
@@ -34,7 +34,7 @@ impl PlanRunner {
         Self { agent, db, plans_dir }
     }
 
-    /// 构造并执行 Plan 生成。
+    /// 构造并执行 Plan 生成(2026-09-09 第 14 轮:带回 LLM Usage 用于 Orchestrator 累加)。
     pub async fn generate(
         &self,
         goal: &str,
@@ -42,7 +42,7 @@ impl PlanRunner {
         intent: &str,
         decomposition: &[String],
         session_id: &str,
-    ) -> Result<PlanOutput> {
+    ) -> Result<(PlanOutput, Usage)> {
         // 确保 plans/ 存在
         std::fs::create_dir_all(&self.plans_dir).map_err(|e| {
             AgentError::PlanGen(format!("无法创建 plans/ 目录: {}", e))
@@ -89,7 +89,7 @@ impl PlanRunner {
         );
 
         let _ = usage;
-        Ok(PlanOutput { path, markdown: text })
+        Ok((PlanOutput { path, markdown: text }, usage))
     }
 }
 

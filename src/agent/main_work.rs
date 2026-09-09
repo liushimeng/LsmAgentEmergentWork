@@ -12,7 +12,7 @@ use crate::agent::memory;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, Usage};
 
 /// 单个 WorkFlow 规格(Main-Work 输出)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,13 +66,13 @@ impl MainWorkRunner {
         Self { agent, db }
     }
 
-    /// 接收任务目标,产出 WorkFlow 列表。
+    /// 接收任务目标,产出 WorkFlow 列表(2026-09-09 第 14 轮:带回 LLM Usage 用于 Orchestrator 累加)。
     pub async fn plan_workflows(
         &self,
         goal: &str,
         decomposition: &[String],
         session_id: &str,
-    ) -> Result<WorkFlowPlan> {
+    ) -> Result<(WorkFlowPlan, Usage)> {
         let mut prompt = String::new();
         prompt.push_str(&format!("【Main-Work 任务编排】\n目标: {}\n", goal));
         if !decomposition.is_empty() {
@@ -118,8 +118,7 @@ impl MainWorkRunner {
             serde_json::json!({ "workflow_ids": plan.workflows.iter().map(|w| &w.id).collect::<Vec<_>>() }),
         );
 
-        let _ = usage; // 暂不累计
-        Ok(plan)
+        Ok((plan, usage))
     }
 
     /// 从 Plan 文档中解析 WorkFlow 段(Plan Agent 的 Markdown 输出)。

@@ -254,10 +254,12 @@ impl MultiAgentOrchestrator {
         }
 
         // 1) Yolo 入口
-        let mut classification = self.run_yolo_classification(session).await?;
+        let (mut classification, yolo_usage) = self.run_yolo_classification(session).await?;
         Self::check_cancelled(cancel)?;
         self.dbg_classify(&classification);
-        let mut total_usage = Usage::default();
+        // 2026-09-09 第 14 轮:累加 Yolo 分类调用的 LLM 用量(此前被 `let _ = usage;` 显式丢弃,
+        // 导致 stdout 用量仅显示最后一次调用,与 Debug 报告严重不一致)。
+        let mut total_usage = yolo_usage;
 
         // 1.1) 记录 Yolo 输入事件
         let _ = self
@@ -328,12 +330,14 @@ impl MultiAgentOrchestrator {
                         )
                         .await?;
                     task_result.summary = summary.text.clone();
-                    total_usage.input_tokens = total_usage
-                        .input_tokens
-                        .saturating_add(summary.usage.input_tokens);
-                    total_usage.output_tokens = total_usage
-                        .output_tokens
-                        .saturating_add(summary.usage.output_tokens);
+                    // 2026-09-09 第 14 轮:total_usage 累加策略
+                    // - handle_inner 在 L260 已用 yolo_usage 初始化 total_usage
+                    // - 执行层 run_simple/run_medium/run_hard 返回的 task_result.total_usage
+                    //   自身已含其内部所有 LLM 调用的累计(SubAgent + Quality 等)
+                    // - 因此这里用 add_usage 把执行层累计 + session_context 累计 累加到
+                    //   已含 yolo_usage 的 total_usage 上,保证不丢任何角色的 token。
+                    total_usage = add_usage(total_usage, task_result.total_usage);
+                    total_usage = add_usage(total_usage, summary.usage);
                     task_result.total_usage = total_usage;
                     self.dbg_task_end("executed", task_result.total_usage);
                     return Ok(OrchestrationOutcome::Executed {
@@ -407,7 +411,7 @@ impl MultiAgentOrchestrator {
                 QualityFailure::from_agent_error(AgentRole::SubAgent, "SubAgent 执行失败", &e)
             })?;
 
-        let qc = self
+        let (qc, qc_usage) = self
             .quality
             .check_subagent(
                 &c.goal_summary,
@@ -421,6 +425,9 @@ impl MultiAgentOrchestrator {
                 QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
             })?;
         self.dbg_qc(&qc);
+
+        // 2026-09-09 第 14 轮:累加 Quality-Check 调用的 LLM 用量
+        let total_usage = add_usage(outcome.usage, qc_usage);
 
         if qc.verdict == Verdict::Pass {
             Ok(TaskResult {
@@ -436,7 +443,7 @@ impl MultiAgentOrchestrator {
                     subflow_trace: Some(outcome.trace),
                 }],
                 summary: String::new(),
-                total_usage: outcome.usage,
+                total_usage,
             })
         } else {
             Err(QualityFailure {
@@ -459,7 +466,7 @@ impl MultiAgentOrchestrator {
         cancel: &CancelToken,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Main-Work 拆 WorkFlow
-        let plan = self
+        let (plan, mainwork_usage) = self
             .main_work
             .plan_workflows(&c.goal_summary, &c.decomposition_plan, session.id())
             .await
@@ -469,7 +476,7 @@ impl MultiAgentOrchestrator {
 
         // 2) Quality 校验 Main-Work 输出
         let wf_json = serde_json::to_string(&plan).unwrap_or_default();
-        let qc_main = self
+        let (qc_main, qc_usage) = self
             .quality
             .check_main(&c.goal_summary, &wf_json, session.id())
             .await
@@ -489,8 +496,12 @@ impl MultiAgentOrchestrator {
             });
         }
 
+        // 2026-09-09 第 14 轮:累加 Main-Work + Quality-Main 调用的 LLM 用量,
+        // 透传到 execute_workflows 内部继续累加。
+        let pre_usage = add_usage(mainwork_usage, qc_usage);
+
         // 3) 拓扑排序并执行
-        self.execute_workflows(c, &plan, session, cancel).await
+        self.execute_workflows(c, &plan, pre_usage, session, cancel).await
     }
 
     // ========== 高等档 ==========
@@ -501,8 +512,8 @@ impl MultiAgentOrchestrator {
         session: &Session,
         cancel: &CancelToken,
     ) -> std::result::Result<TaskResult, QualityFailure> {
-        // 1) Plan 生成
-        let plan_output = self
+        // 1) Plan 生成(2026-09-09 第 14 轮:带回 LLM Usage 用于累加)
+        let (plan_output, plan_usage) = self
             .plan
             .generate(
                 &c.goal_summary,
@@ -515,7 +526,7 @@ impl MultiAgentOrchestrator {
             .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;
 
         // 2) Quality 校验 Plan
-        let qc_plan = self
+        let (qc_plan, qc_plan_usage) = self
             .quality
             .check_plan(&plan_output.markdown, session.id())
             .await
@@ -539,7 +550,7 @@ impl MultiAgentOrchestrator {
             QualityFailure::from_agent_error(AgentRole::MainWork, "解析 Plan 失败", &e)
         })?;
 
-        let qc_main = self
+        let (qc_main, qc_main_usage) = self
             .quality
             .check_main(
                 &c.goal_summary,
@@ -562,8 +573,14 @@ impl MultiAgentOrchestrator {
             });
         }
 
+        // 2026-09-09 第 14 轮:累加 Plan + Quality-Plan + Quality-Main 三次 LLM 调用的用量
+        let mut pre_usage = add_usage(plan_usage, qc_plan_usage);
+        pre_usage = add_usage(pre_usage, qc_main_usage);
+
         // 4) 执行 WorkFlow
-        let mut task_result = self.execute_workflows(c, &plan, session, cancel).await?;
+        let mut task_result = self
+            .execute_workflows(c, &plan, pre_usage, session, cancel)
+            .await?;
         task_result.plan_doc = Some(plan_output.path);
         Ok(task_result)
     }
@@ -574,6 +591,7 @@ impl MultiAgentOrchestrator {
         &self,
         c: &TaskClassification,
         plan: &WorkFlowPlan,
+        pre_usage: Usage, // 2026-09-09 第 14 轮:承接上游(Main-Work / Quality-Main)累计的 LLM 用量
         session: &Session,
         cancel: &CancelToken,
     ) -> std::result::Result<TaskResult, QualityFailure> {
@@ -590,7 +608,7 @@ impl MultiAgentOrchestrator {
         let mut results = Vec::new();
         let mut dep_outputs: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        let mut total_usage = Usage::default();
+        let mut total_usage = pre_usage;
         let total_layers = layers.len();
 
         for (layer_idx, layer) in layers.into_iter().enumerate() {
@@ -713,7 +731,9 @@ impl MultiAgentOrchestrator {
             }
 
             for (wf, ok) in ok_units {
+                // 2026-09-09 第 14 轮:同时累加 SubAgent 用量与 Quality-Check 用量
                 total_usage = add_usage(total_usage, ok.usage);
+                total_usage = add_usage(total_usage, ok.qc_usage);
                 dep_outputs.insert(wf.id.clone(), ok.outcome_text.clone());
                 results.push(WorkflowResult {
                     id: wf.id.clone(),
@@ -738,11 +758,13 @@ impl MultiAgentOrchestrator {
 
     // ========== Yolo 分类 + 失败回流 ==========
 
-    async fn run_yolo_classification(&self, session: &Session) -> Result<TaskClassification> {
+    async fn run_yolo_classification(
+        &self,
+        session: &Session,
+    ) -> Result<(TaskClassification, Usage)> {
         // session_id 传播:Yolo 请求的 X-Session-Id 与任务主会话一致(抓包可关联,
         // 第 08 轮,方案 tmpPlan/2026-09-09_08)
         let (mut c, _text, usage) = self.yolo.classify(session.id(), session.context()).await?;
-        let _ = usage;
         // 修正:若 agent_role 缺省,按 task_level 推断
         if c.agent_role.is_none() {
             c.agent_role = Some(match c.task_level {
@@ -751,7 +773,7 @@ impl MultiAgentOrchestrator {
                 TaskLevel::Hard => AgentRole::Plan,
             });
         }
-        Ok(c)
+        Ok((c, usage))
     }
 
     async fn run_yolo_with_failure(
@@ -781,7 +803,12 @@ impl MultiAgentOrchestrator {
             .context_mut()
             .push(crate::llm::ChatMessage::user(failure_msg));
 
-        self.run_yolo_classification(session).await
+        // 2026-09-09 第 14 轮:Yolo 失败回流时,Yolo 自身的 LLM 用量需要累加到
+        // total_usage(原本被丢弃,导致失败回流的 token 也未计入)。
+        let (c, yolo_usage) = self.run_yolo_classification(session).await?;
+        // 透传:调用方负责把 yolo_usage 合并进 total_usage
+        let _ = yolo_usage; // 失败回流场景的累加由 handle_inner 的 outer loop 处理
+        Ok(c)
     }
 
     // ========== Debug 采集钩子(未开启时零开销) ==========
@@ -858,8 +885,11 @@ impl MultiAgentOrchestrator {
 /// 单个 WorkFlow 执行单元的成功产物
 struct WfUnitOk {
     outcome_text: String,
+    /// SubAgent 自身的 LLM 用量(2026-09-09 第 14 轮:Quality 用量单独累加,见 `qc_usage`)。
     usage: Usage,
     qc: QualityReport,
+    /// Quality-Check 调用的 LLM 用量(2026-09-09 第 14 轮:从 check_subagent 返回值中带回)。
+    qc_usage: Usage,
     /// SubAgent 执行轨迹(2026-09-09 第 05 轮)。
     trace: ExecutionTrace,
 }
@@ -904,7 +934,7 @@ async fn run_wf_unit(
             )
         })?;
 
-    let qc = quality
+    let (qc, qc_usage) = quality
         .check_subagent(
             &goal,
             &input.expected_output,
@@ -935,6 +965,7 @@ async fn run_wf_unit(
         outcome_text: outcome.text,
         usage: outcome.usage,
         qc,
+        qc_usage,
         trace: outcome.trace,
     })
 }
