@@ -35,4 +35,4 @@ DebugReport/
 CrashReport/
 
 # TestWorkSpace(自动化测试目录,临时文件不入库;与 tmpPlan/ 类似的「一次性产物」)
-/TestWorkSpace/
+TestWorkSpace/
