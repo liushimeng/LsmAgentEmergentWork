@@ -45,21 +45,37 @@ pub const DEFAULT_AGENT_NAME: &str = SUB_AGENT_WORK_NAME;
 
 // =================== AgentProfile ===================
 
-/// 一个 Agent 身份档案:名称 / 系统提示词 / 工具集。
+/// 一个 Agent 身份档案:名称 / 系统提示词 / 工具集 / 结构化输出通道。
 #[derive(Clone)]
 pub struct AgentProfile {
     pub name: String,
     pub system_prompt: SystemPrompt,
     pub tools: ToolRegistry,
+    /// 结构化输出通道(emit tool,2026-09-09 第 13 轮实现 L6/L19):
+    ///
+    /// `Some(tool_name)` 时,Agent 循环做两件事:
+    /// 1. 把 `tool_name` 注入 `RequestMeta.forced_tool` → 协议层 wire 发出
+    ///    forced `tool_choice`(Anthropic `{"type":"tool"}` / OpenAI
+    ///    `{"type":"function"}` 指名),模型必须以 tool_use 返回结构化结果;
+    /// 2. tool_calls 命中该工具时短路(不执行),input 序列化为 ```json 块
+    ///    作为最终文本 → 下游解析链(`parse_classification` 等)零改动。
+    ///
+    /// 对应工具定义见 `tools/emit.rs`;Provider 不支持 forced 时由
+    /// `llm/resilient.rs` 自动降级为 auto 重试(全程无需用户配置)。
+    pub emit_tool: Option<String>,
 }
 
 impl AgentProfile {
     /// Yolo Agent profile(入口层,任务识别 / 难度分级)。
+    ///
+    /// 结构化输出通道:分类结果必须经 `submit_task_classification` 工具提交
+    /// (forced tool_choice,Provider 不支持时自动降级文本 JSON,见 resilient.rs)。
     pub fn yolo_profile() -> Self {
         Self {
             name: YOLO_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::yolo(),
             tools: yolo_registry(),
+            emit_tool: Some(crate::agent::tools::emit::SUBMIT_TASK_CLASSIFICATION.to_string()),
         }
     }
 
@@ -69,6 +85,7 @@ impl AgentProfile {
             name: PLAN_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::plan(),
             tools: plan_registry(),
+            emit_tool: None,
         }
     }
 
@@ -78,6 +95,7 @@ impl AgentProfile {
             name: MAIN_WORK_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::main_work(),
             tools: main_work_registry(),
+            emit_tool: None,
         }
     }
 
@@ -87,15 +105,19 @@ impl AgentProfile {
             name: SUB_AGENT_WORK_NAME.to_string(),
             system_prompt: SystemPrompt::sub_agent_work(),
             tools: sub_agent_work_registry(),
+            emit_tool: None,
         }
     }
 
     /// Quality-Check Agent profile(质检层)。
+    ///
+    /// 结构化输出通道:质检结论必须经 `submit_quality_report` 工具提交。
     pub fn quality_check_profile() -> Self {
         Self {
             name: QUALITY_CHECK_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::quality_check(),
             tools: quality_registry(),
+            emit_tool: Some(crate::agent::tools::emit::SUBMIT_QUALITY_REPORT.to_string()),
         }
     }
 
@@ -105,6 +127,7 @@ impl AgentProfile {
             name: SESSION_CONTEXT_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::session_context(),
             tools: session_context_registry(),
+            emit_tool: None,
         }
     }
 
@@ -114,6 +137,7 @@ impl AgentProfile {
             name: DEBUG_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::debug(),
             tools: debug_registry(),
+            emit_tool: None,
         }
     }
 
@@ -123,6 +147,7 @@ impl AgentProfile {
             name: COMPACT_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::compact(),
             tools: compact_registry(),
+            emit_tool: None,
         }
     }
 
@@ -142,6 +167,7 @@ impl AgentProfile {
             name: name.into(),
             system_prompt,
             tools: builtin_registry(),
+            emit_tool: None,
         }
     }
 
@@ -155,15 +181,18 @@ impl AgentProfile {
             name: name.into(),
             system_prompt,
             tools,
+            emit_tool: None,
         }
     }
 
     /// 基于当前 profile 构造新 profile,在系统提示词末尾追加环境上下文。
+    /// 结构化输出通道随原 profile 保留(emit_tool 克隆)。
     pub fn with_env_tail(&self, tail: &str) -> Self {
         Self {
             name: self.name.clone(),
             system_prompt: self.system_prompt.append_base(tail),
             tools: self.tools.clone(),
+            emit_tool: self.emit_tool.clone(),
         }
     }
 
@@ -206,6 +235,53 @@ mod tests {
         assert!(names.contains(&"Read".to_string()));
         assert!(!names.iter().any(|n| n == "Bash"));
         assert!(!names.iter().any(|n| n == "Write"));
+    }
+
+    // ========== 结构化输出通道(L6/L19,2026-09-09 第 13 轮) ==========
+
+    #[test]
+    fn emit_tool_only_on_yolo_and_quality() {
+        // Yolo / Quality 声明 emit 通道;其余角色 None
+        assert_eq!(
+            AgentProfile::yolo_profile().emit_tool.as_deref(),
+            Some("submit_task_classification")
+        );
+        assert_eq!(
+            AgentProfile::quality_check_profile().emit_tool.as_deref(),
+            Some("submit_quality_report")
+        );
+        for p in [
+            AgentProfile::plan_profile(),
+            AgentProfile::main_work_profile(),
+            AgentProfile::sub_agent_work_profile(),
+            AgentProfile::session_context_profile(),
+            AgentProfile::debug_profile(),
+            AgentProfile::compact_profile(),
+        ] {
+            assert!(p.emit_tool.is_none(), "{} 不应声明 emit 工具", p.name);
+        }
+    }
+
+    #[test]
+    fn emit_tools_registered_in_registries() {
+        let yolo_names = tool_names(&AgentProfile::yolo_profile());
+        assert!(yolo_names.contains(&"submit_task_classification".to_string()));
+        let q_names = tool_names(&AgentProfile::quality_check_profile());
+        assert!(q_names.contains(&"submit_quality_report".to_string()));
+        // emit 工具不进入其他 registry
+        assert!(!tool_names(&AgentProfile::sub_agent_work_profile())
+            .iter()
+            .any(|n| n.starts_with("submit_")));
+    }
+
+    #[test]
+    fn with_env_tail_keeps_emit_tool() {
+        let p = AgentProfile::yolo_profile().with_env_tail("\n环境尾巴");
+        assert_eq!(
+            p.emit_tool.as_deref(),
+            Some("submit_task_classification"),
+            "with_env_tail 应保留结构化输出通道"
+        );
     }
 
     #[test]

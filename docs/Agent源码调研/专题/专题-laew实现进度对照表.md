@@ -39,9 +39,9 @@
 | L17 | 无 JSON 修复链 | ✅(Tier-1) | `agent/json_repair.rs`(智能引号/全角标点/单引号/裸控制字符/尾逗号/Python 常量,单遍 O(N)+512KB 守卫),接入 `yolo.rs` / `main_work.rs` / `quality.rs` 三处解析点;**刻意不做截断补全**(Quality fail-closed 语义保持,上轮 P0 测试钉死) | 2026-09-08 第 03 轮 |
 | L16 | 无 jsonschema 校验 | ✅(轻量手写) | `agent/tool_schema_validator.rs`(type/required/properties/additionalProperties/enum/minimum/maximum/minLength/maxLength/items 校验子集)+ `error.rs::ToolSchemaValidation`+ `agent/mod.rs` 工具执行前接入 | 2026-09-09 第 08 轮 |
 | L18 | 无 partial JSON 流式解析 | ⏳ | — | — |
-| L19 | Yolo 无结构化输出强制 | ⏳ | — | — |
+| L19 | Yolo 无结构化输出强制 | ✅(emit 工具 + forced tool_choice) | `src/agent/tools/emit.rs`(SubmitTaskClassification / SubmitQualityReport 输出工具)+ `src/agent/profile.rs`(`AgentProfile.emit_tool` 字段)+ `src/llm/mod.rs`(`RequestMeta.forced_tool`)+ `src/llm/anthropic.rs`(`tool_choice: {"type":"tool","name":X,"disable_parallel_tool_use":true}`)+ `src/llm/openai.rs`(`tool_choice: {"type":"function","function":{"name":X}}`,默认仍 auto)+ `src/llm/resilient.rs`(`looks_like_tool_choice_rejection` + 4xx 拒绝自动降级 auto 重试一次)+ `src/agent/mod.rs`(`run_session_inner` emit 短路终止 + `LAEW_FORCED_TOOLS` 开关 + `forced_tools_enabled`)+ `src/agent/extrace.rs`(`structured_emits` 计数)+ `src/agent/system_prompt/mod.rs`(Yolo/Quality 提示词双通道:工具首选 + 文本 JSON 兜底);单元测试 504 全过(新增 ≥14 项)+ e2e §4j(mock `--forced-tool` / `--reject-tool-choice` 双模式,wire 断言 + 降级断言);方案 `tmpPlan/2026-09-09_13-结构化输出强制通道与forced-tool-choice方案.md` | 2026-09-09 第 13 轮 |
 | L20 | 无跨 provider 归一化 | ⏳ | — | — |
-| L6 | tool_choice 写死 auto | ⏳ | — | — |
+| L6 | tool_choice 写死 auto | ✅(forced 指名 + 默认 auto 兼容) | 同 L19(`src/llm/anthropic.rs` + `src/llm/openai.rs` wire 注入,默认 None 时 Anthropic 不发 tool_choice / OpenAI 发 "auto" 维持现状) | 2026-09-09 第 13 轮 |
 
 ## 三、此前轮次已实现项(git 历史可溯)
 
@@ -147,7 +147,7 @@
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 12 轮(Prompt 注入防护 L1208,模块 `src/agent/safety/`),此前:第 08 轮(Write/Edit 沙箱白名单细化:Check-What-You-Write + symlink 防逃逸 + 双形态白名单)、第 07 轮(SQLite 并发 WAL 加固与完整性自愈 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19:emit 工具 + forced tool_choice + Provider 拒绝自适应降级,模块 `src/agent/tools/emit.rs` + wire 双协议 + `src/llm/resilient.rs`),此前:第 12 轮(Prompt 注入防护 L1208,模块 `src/agent/safety/`)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
 
 ---
 
@@ -202,5 +202,57 @@
 
 **相关专题文档**(本轮产出,共 8657 行):
 - `专题/专题-第十八轮-{atomcode|claudecode|deepseek-harness|openclaw|opencode|pi|undici}-深度分析.md`(7 份,7988 行)
+
+---
+
+## 六、第十九轮登记(2026-09-09,用户交互体验层续 + 安全纵深 + 多模态 + A2A + a11y + 离线 + 同步)
+
+**主题**:第十八轮首次切入「用户交互体验层」(D1-D8);本轮继续深挖该层剩余 6 维度(D9-D14),并首次系统化覆盖「安全纵深」「多模态输出」「A2A 协议」「可访问性」「离线模式」「跨设备同步」。
+
+| 维度 | 简称 | 已覆盖轮次 | laew 现状 | 新增 gap 段 |
+|------|------|-----------|---------|------------|
+| D9 | 安全与威胁模型 | 🟡 第 14/17 轮部分 + 第 19 轮系统化 | 🟡 30%(Prompt 注入 L1208 ✅ / 溢出 L1044 ✅ / 熔断 H13 ✅ / 沙箱白名单 ✅) | L1591-L1640 |
+| D10 | 多模态输出(图表/Mermaid/图片) | ❌ 第 19 轮首次系统化 | ❌ 5%(cell-based 纯文本) | L1641-L1700 |
+| D11 | A2A 协议与多 Agent 互操作 | 🟡 第 16 轮部分 + 第 19 轮系统化 | ❌ 0% | L1701-L1760 |
+| D12 | 可访问性 a11y / RTL / 屏幕阅读器 | ❌ 第 19 轮首次 | ❌ 10%(1 套 ANSI) | L1761-L1820 |
+| D13 | 离线模式与本地优先 | ❌ 第 19 轮首次 | ❌ 0% | L1821-L1880 |
+| D14 | 跨设备同步与会话漫游 | ❌ 第 19 轮首次 | ❌ 0% | L1881-L1930 |
+
+**统一编号总表**:
+
+| 区段 | 维度 | 实际 gap 数 |
+|------|------|------------|
+| L1591-L1640 | D9 安全与威胁模型 | 50 |
+| L1641-L1700 | D10 多模态输出 | 60 |
+| L1701-L1760 | D11 A2A 协议 | 60 |
+| L1761-L1820 | D12 可访问性 | 60 |
+| L1821-L1880 | D13 离线模式 | 60 |
+| L1881-L1930 | D14 跨设备同步 | 50 |
+| **合计** | — | **340** |
+
+**优先级分布**:P0=45 / P1=180 / P2=90 / P3=25
+
+**laew P0 路线图**(1-2 周可做):
+1. D9 凭证加密(`src/agent/safety/credentials.rs` 新建 + `aes-gcm` + `secrecy` + `zeroize`)
+2. D9 SSRF 防护(`src/agent/tools/webfetch.rs` 新建 + 私有 IP/CGNAT 阻断 + DNS pinning)
+3. D10 Diff 渲染(`tui/render/diff.rs` 新建 + `similar` + ANSI 着色)
+4. D10 语法高亮(`tui/render/highlight.rs` 新建 + `syntect` + 16 色 SGR)
+5. D12 主题系统 4 主题(`tui/theme.rs` 拆分 + 高对比 + daltonized)
+6. D13 离线检测(`src/llm/offline.rs` 新建 + heartbeat ping + 状态机)
+7. D14 会话导出(`src/agent/session_export.rs` 新建 + JSON/Markdown/HTML)
+
+**20 轮推荐(2026-09-09 之后)**:6 大新方向——
+国际化 i18n 完整实现 / Web UI + Desktop App / OAuth 认证与多账号 / Release 工程化与 AutoUpdate / DevContainer 与容器化 / CRDT 与多端冲突。预计 60-100 个新 gap。
+
+**累计**:L1-L1930+ 共 1930+ 个 gap(前 18 轮 1590 + 第十九轮 340 = 1930),20 轮预计突破 2030。
+
+**相关专题文档**(本轮产出,约 7700 行):
+- `专题/专题-第十九轮-安全与威胁模型深度对比.md`(D9,约 1500 行)
+- `专题/专题-第十九轮-多模态输出深度对比.md`(D10,约 1200 行)
+- `专题/专题-第十九轮-A2A协议与多Agent互操作深度对比.md`(D11,约 1200 行)
+- `专题/专题-第十九轮-可访问性与RTL深度对比.md`(D12,约 1000 行)
+- `专题/专题-第十九轮-离线模式与本地优先深度对比.md`(D13,约 1000 行)
+- `专题/专题-第十九轮-跨设备同步与会话漫游深度对比.md`(D14,约 1000 行)
+- `专题/专题-第十九轮-跨项目缺口分析.md`(综合,约 800 行)
 - `专题/专题-第十八轮-跨项目缺口分析.md`(669 行,含编号冲突修正表)
 - `专题/专题-第十八轮深挖合集.md`(本合集姊妹篇)

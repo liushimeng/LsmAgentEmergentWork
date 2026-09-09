@@ -182,6 +182,13 @@ impl Agent {
         // UA 逐请求注入(2026-09-09 第 08 轮):让抓包层面 8 角色各自可辨识;
         // meta.user_agent 为空时协议层回退到客户端构造期默认 UA(见 RequestMeta::resolve_user_agent)。
         meta.user_agent = self.profile.user_agent();
+        // 结构化输出强制通道(L6/L19,2026-09-09 第 13 轮):profile 声明了 emit 工具时
+        // 注入 forced tool_choice(协议层指名调用),模型必须以 tool_use 返回结构化结果;
+        // `LAEW_FORCED_TOOLS=off` 可全局关闭(仅关 wire 注入,循环短路逻辑保留,
+        // 模型若仍主动调用 emit 工具也会被接住)。
+        if forced_tools_enabled() {
+            meta.forced_tool = self.profile.emit_tool.clone();
+        }
         let mut total_usage = Usage::default();
         let mut accumulated_text = String::new();
         let mut truncation_resumes: usize = 0;
@@ -347,10 +354,40 @@ impl Agent {
 
             // 逐个执行工具并把结果回填上下文(失败也作为 tool_result,is_error=true)
             let mut any_success_this_round = false;
+            // 结构化输出通道命中标记(L6/L19,2026-09-09 第 13 轮):emit 工具的
+            // tool_use 不执行,input 即最终结构化结果;本轮剩余调用只回填不执行
+            // (防孤儿 tool_use,对齐第五轮「工具结果回填」专题)。
+            let mut structured_output: Option<String> = None;
             for call in completion.tool_calls {
                 let name = call.name.clone();
                 let id = call.id.clone();
                 let args = call.arguments;
+
+                // ---- 结构化输出通道短路(先于 schema 预校验与执行) ----
+                if self.profile.emit_tool.as_deref() == Some(name.as_str()) {
+                    let json = serde_json::to_string_pretty(&args)
+                        .unwrap_or_else(|_| args.to_string());
+                    // 回填 tool_result 保持上下文配对(assistant tool_use ↔ tool_result)
+                    session.context_mut().push(ChatMessage::tool_result(
+                        id,
+                        "(结构化输出已接收,循环终止)",
+                        false,
+                    ));
+                    trace.structured_emits += 1;
+                    info!(tool = %name, "结构化输出通道命中,短路终止 Agent 循环");
+                    structured_output = Some(json);
+                    continue;
+                }
+                if structured_output.is_some() {
+                    // emit 已命中:本轮剩余并行调用不再执行,仅回填防孤儿
+                    session.context_mut().push(ChatMessage::tool_result(
+                        id,
+                        "(已忽略:结构化输出已接收,循环终止)",
+                        false,
+                    ));
+                    continue;
+                }
+
                 info!(tool = %name, "executing tool");
 
                 // 工具执行取消:select 命中后工具 future 被 drop——Bash 工具的
@@ -442,6 +479,24 @@ impl Agent {
                 // 任一成功调用重置失败计数
                 last_fail_key = None;
                 consecutive_failures = 0;
+            }
+
+            // 结构化输出通道命中 → 立即终止循环(L6/L19,2026-09-09 第 13 轮)。
+            // emit input 序列化为 ```json 代码块追加到累计文本,下游解析链
+            // (`parse_classification` / `parse_quality_report` 的 extract_json_block)
+            // 直接命中,无需感知本机制的存在。
+            if let Some(json) = structured_output {
+                if !accumulated_text.is_empty() {
+                    accumulated_text.push('\n');
+                }
+                accumulated_text.push_str(&format!("```json\n{json}\n```"));
+                debug!("agent finished with structured tool_use output");
+                return Self::finalize_with_max_tokens(
+                    trace,
+                    &accumulated_text,
+                    total_usage,
+                    max_tokens_state.as_ref(),
+                );
             }
 
             // 关联报告: 2026-09-09_05 E-001 —— 无文本收敛计数
@@ -680,6 +735,23 @@ pub(crate) fn build_runtime_hints(trace: &ExecutionTrace, consecutive_failures: 
 /// - OpenAI:`"length"` 表示输出达到 `max_tokens` 上限被截断
 fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
     matches!(stop_reason, Some("max_tokens") | Some("length"))
+}
+
+/// 结构化输出强制通道总开关(L6/L19,2026-09-09 第 13 轮)。
+///
+/// 环境变量 `LAEW_FORCED_TOOLS=off|0|false|no` 关闭 wire 层 forced tool_choice
+/// 注入(对齐 `LAEW_INJECTION_GUARD` 惯例);默认开启。关闭后 emit 工具仍在
+/// registry,Agent 循环的短路逻辑也保留——模型若仍主动调用 emit 工具同样被接住。
+fn forced_tools_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        forced_tools_enabled_from(std::env::var("LAEW_FORCED_TOOLS").unwrap_or_default())
+    })
+}
+
+/// 开关取值解析(独立出来便于单测,OnceLock 缓存进程级一次)。
+fn forced_tools_enabled_from(raw: String) -> bool {
+    !matches!(raw.trim().to_lowercase().as_str(), "off" | "0" | "false" | "no")
 }
 
 /// 将 `serde_json::Value` 序列化为「对象 key 排序后的字符串」,作为失败键的稳定摘要。
@@ -1487,5 +1559,197 @@ mod tests {
         assert_eq!(text, "hello");
         assert_eq!(t.max_tokens_upscalings, 2);
         assert_eq!(t.max_tokens_history, vec![(8192, 16384), (16384, 32768)]);
+    }
+
+    // ========== 结构化输出通道短路(L6/L19,2026-09-09 第 13 轮) ==========
+
+    /// 返回固定 Completion 的 mock LLM(记录每次收到的 meta.forced_tool)。
+    struct EmitLlm {
+        replies: std::sync::Mutex<Vec<Completion>>,
+        seen_forced: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for EmitLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            meta: &RequestMeta,
+        ) -> Result<Completion> {
+            self.seen_forced
+                .lock()
+                .expect("seen_forced")
+                .push(meta.forced_tool.clone());
+            let mut replies = self.replies.lock().expect("replies");
+            if replies.is_empty() {
+                return Err(AgentError::Other("mock 耗尽".into()));
+            }
+            Ok(replies.remove(0))
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    fn emit_completion(
+        calls: Vec<(&'static str, serde_json::Value)>,
+        text: &str,
+    ) -> Completion {
+        Completion {
+            text: text.to_string(),
+            tool_calls: calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, args))| crate::llm::ToolCallReq {
+                    id: format!("call_{i}"),
+                    name: name.to_string(),
+                    arguments: args,
+                })
+                .collect(),
+            usage: Usage::default(),
+            stop_reason: Some("tool_use".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_tool_short_circuits_loop() {
+        // Yolo profile + 模型返回 submit_task_classification tool_use:
+        // 循环应 1 轮终止,最终文本含 ```json 块,trace.structured_emits = 1,
+        // 且 meta.forced_tool 已注入协议层。
+        let llm = std::sync::Arc::new(EmitLlm {
+            replies: std::sync::Mutex::new(vec![emit_completion(
+                vec![(
+                    "submit_task_classification",
+                    json!({
+                        "task_level": "medium",
+                        "purpose": "验证",
+                        "goal_summary": "结构化输出验证",
+                        "intent": "verify",
+                        "decomposition_plan": ["步骤一"],
+                        "direct_answer": null
+                    }),
+                )],
+                "这是中等难度任务,已提交分类。",
+            )]),
+            seen_forced: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(llm.clone(), AgentProfile::yolo_profile());
+        let (text, _usage, trace) = agent.run_once("测试任务").await.unwrap();
+
+        // 最终文本 = 模型文本 + emit input 的 ```json 块
+        assert!(text.contains("结构化输出验证"), "文本应含 emit input: {text}");
+        assert!(text.contains("```json"), "应输出 json 代码块: {text}");
+        // 下游解析链直接命中
+        let c = crate::agent::yolo::parse_classification(&text).unwrap();
+        assert_eq!(c.task_level, crate::agent::yolo::TaskLevel::Medium);
+        assert!(!c.yolo_degraded, "emit 路径不应降级");
+        // 1 轮终止 + 计数
+        assert_eq!(trace.iterations, 1);
+        assert_eq!(trace.structured_emits, 1);
+        assert_eq!(trace.tool_calls, 0, "emit 通道不计入工具执行计数");
+        // 协议层收到 forced 注入
+        let seen = llm.seen_forced.lock().expect("seen_forced");
+        assert_eq!(
+            seen.first().and_then(|f| f.as_deref()),
+            Some("submit_task_classification"),
+            "meta.forced_tool 应注入 emit 工具名,实际: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_tool_mixed_parallel_calls_ignored() {
+        // emit + Read 并行调用(emit 在前):emit 之后的 Read 不执行,仅回填「已忽略」;
+        // 上下文 tool_use 与 tool_result 一一配对(无孤儿)。
+        // 注:Read 在 emit 之前的场景是正常工作流(先探查后提交),由
+        // emit_tool_short_circuits_loop 与 non_emit_profile_never_forced 覆盖。
+        let llm = std::sync::Arc::new(EmitLlm {
+            replies: std::sync::Mutex::new(vec![emit_completion(
+                vec![
+                    (
+                        "submit_quality_report",
+                        json!({
+                            "verdict": "pass",
+                            "source": "subagent",
+                            "retryable": false
+                        }),
+                    ),
+                    ("Read", json!({"file_path": "/definitely/not/exists.txt"})),
+                ],
+                "",
+            )]),
+            seen_forced: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(llm, AgentProfile::quality_check_profile());
+        let mut session = crate::session::Session::new();
+        session.context_mut().push(ChatMessage::user("质检"));
+        let (text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
+
+        assert_eq!(trace.structured_emits, 1);
+        assert_eq!(trace.tool_calls, 0, "emit 之后的 Read 不应被执行");
+        assert!(text.contains("\"verdict\": \"pass\""));
+
+        // 上下文配对检查:assistant ToolUse × 2 ↔ tool_result × 2
+        let ctx = session.context();
+        let tool_uses: Vec<&ContentBlock> = ctx
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .collect();
+        let tool_results: Vec<&ContentBlock> = ctx
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .collect();
+        assert_eq!(tool_uses.len(), 2, "assistant 应含 2 个 tool_use");
+        assert_eq!(tool_results.len(), 2, "每个 tool_use 都应有 tool_result 回填");
+        // 忽略回填的内容标记
+        let ignored = tool_results
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .any(|c| c.contains("已忽略"));
+        assert!(ignored, "Read 的回填应标记「已忽略」");
+    }
+
+    #[tokio::test]
+    async fn non_emit_profile_never_forced() {
+        // 无 emit_tool 的 profile(SubAgent)不注入 forced,模型普通工具照常执行
+        let llm = std::sync::Arc::new(EmitLlm {
+            replies: std::sync::Mutex::new(vec![
+                emit_completion(vec![("Bash", json!({"command": "echo forced-check"}))], ""),
+                Completion {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                },
+            ]),
+            seen_forced: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(llm.clone(), AgentProfile::sub_agent_work_profile());
+        let (text, _usage, trace) = agent.run_once("echo 测试").await.unwrap();
+        assert_eq!(text.trim(), "done");
+        assert_eq!(trace.tool_calls, 1, "Bash 应正常执行");
+        assert_eq!(trace.structured_emits, 0);
+        let seen = llm.seen_forced.lock().expect("seen_forced");
+        assert!(
+            seen.iter().all(|f| f.is_none()),
+            "无 emit_tool 的 profile 不应注入 forced,实际: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn forced_tools_switch_parsing() {
+        // 环境变量取值解析(off/0/false/no 关闭,其余含空值开启)
+        assert!(!forced_tools_enabled_from("off".into()));
+        assert!(!forced_tools_enabled_from("0".into()));
+        assert!(!forced_tools_enabled_from("FALSE".into()));
+        assert!(!forced_tools_enabled_from(" no ".into()));
+        assert!(forced_tools_enabled_from(String::new()));
+        assert!(forced_tools_enabled_from("on".into()));
     }
 }

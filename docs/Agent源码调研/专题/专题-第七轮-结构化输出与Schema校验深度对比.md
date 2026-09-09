@@ -286,15 +286,21 @@ OR extract_standalone_json(text)  // 顶层 { } 大括号配平抽取
 ```
 **无修复、无 partial JSON、无键值抽取兜底**。
 
-**结构化输出**：Yolo 通过系统提示词要求"输出 JSON" + 模型输出 ```json 代码围栏 + 简单解析；
-**未使用** `tool_choice` 强制（Wire 层 openai.rs:1308 `tool_choice: Some("auto")` 写死）。
+**结构化输出**：✅ 已升级为「结构化输出强制通道」(2026-09-09 第 13 轮,实现 L6+L19):
+Yolo / Quality-Check 注册 emit 工具(`submit_task_classification` / `submit_quality_report`),
+协议层注入 forced `tool_choice`(Anthropic `{"type":"tool","name":X,"disable_parallel_tool_use":true}` /
+OpenAI `{"type":"function","function":{"name":X}}`),模型必须以 tool_use 返回结构化结果;
+Agent 循环命中 emit 工具时短路(input 即最终结果)→ 下游解析链零改动。
+Provider 不支持 forced 时由 `resilient.rs` 自动去掉 forced 降级 auto 重试(全程无需用户配置)。
+默认(None)时维持现状(Anthropic 不发 tool_choice / OpenAI 发 "auto")。
+文本 JSON 仍保留为降级通道(工具调用不可用时回退)。
 
 **漏点 L1-L15**（与第六轮协议对比主题 11 重叠 + 本专题新增）：
-- L1 无 strict 投影；L6 tool_choice 写死 "auto"；L11 Schema 投影未做。
+- L1 无 strict 投影；**L6 tool_choice 写死 "auto"** ✅ 已修复(forced 指名 + 默认 auto 兼容)；L11 Schema 投影未做。
 - **L16 无 jsonschema 校验**：参数缺失/类型错只能事后工具报错，无重试信号。
 - **L17 无 JSON 修复链**：模型输出 ```json{trailing comma}`` 直接失败。
 - **L18 无 partial JSON 流式解析**：长 JSON 中途断流后空对象兜底，丢失全部字段。
-- **L19 Yolo 无结构化输出强制**：靠 prompt + 解析，鲁棒性差。
+- **L19 Yolo 无结构化输出强制** ✅ 已修复(emit 工具 + forced tool_choice,见上)。
 - **L20 无跨 provider 归一化**：Gemini provider 直接透传将触发 400。
 
 ---

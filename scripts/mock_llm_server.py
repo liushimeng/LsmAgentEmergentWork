@@ -35,6 +35,13 @@ LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
 #                  (落工作目录),用于端到端验证白名单内写入放行(防误伤正例)。
 #   --delay-ms N  — 每个请求处理前 sleep N 毫秒(模拟慢 LLM),
 #                  用于端到端验证取消传播(SIGINT 优雅中断,不应等延迟跑完)。
+#   FORCED_TOOL   — yolo / quality 角色改为 tool_use 形式返回结构化结果
+#                  (submit_task_classification / submit_quality_report),
+#                  用于端到端验证第 13 轮「结构化输出强制通道」:
+#                  请求体 wire 断言 tool_choice 指名 + Agent 循环短路 + 下游解析。
+#   REJECT_TC     — 首次收到携带 forced tool_choice(tool/function 指名)的请求时
+#                  返回 HTTP 400 "tool_choice is not supported"(仅拒一次),
+#                  用于端到端验证 resilient.rs 的自适应降级:去掉 forced 重试 → 成功。
 MODES = set()
 DELAY_MS = 0
 # Prompt Caching 模拟开关(2026-09-09 第 10 轮 L1047)。
@@ -64,7 +71,8 @@ while _i < len(_args):
         _i += 2
         continue
     if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs", "--overflow-once",
-              "--write-outside", "--write-inside", "--inject-bash"):
+              "--write-outside", "--write-inside", "--inject-bash", "--forced-tool",
+              "--reject-tool-choice"):
         MODES.add(_a)
     _i += 1
 
@@ -183,6 +191,124 @@ def openai_text_sse(text, chunk_id="chatcmpl-mock-role"):
             "created": int(time.time()),
             "model": "mock-openai",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    terminal = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "choices": [],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50, "prompt_tokens_details": {"cached_tokens": 0}},
+    }
+    return make_openai_sse(chunks, terminal_usage=terminal)
+
+
+def anthropic_tool_use_sse(tool_name, input_json, text="", msg_id="mock-msg-emit"):
+    """构造一段 tool_use 回复的 Anthropic SSE 流(结构化输出强制通道,第 13 轮)。
+
+    input_json: dict(工具 input 对象);text: 可选伴随文本(前置 text 块)。
+    事件序列与真实 Anthropic tool_use 流一致:
+    message_start → [text 块] → content_block_start(tool_use) →
+    input_json_delta(整段 partial_json) → content_block_stop →
+    message_delta(stop_reason="tool_use") → message_stop。
+    """
+    blocks = []
+    idx = 0
+    if text:
+        blocks += [
+            {"type": "content_block_start", "data": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}},
+            {"type": "content_block_delta", "data": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}},
+            {"type": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+        ]
+        idx = 1
+    events = [
+        {
+            "type": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "mock-anthropic",
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 30, "output_tokens": 1, "cache_read_input_tokens": CACHE_READ_TOKENS, "cache_creation_input_tokens": CACHE_CREATION_TOKENS},
+                },
+            },
+        },
+    ] + blocks + [
+        {
+            "type": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "tool_use", "id": f"toolu_{msg_id}", "name": tool_name, "input": {}},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "input_json_delta", "partial_json": json.dumps(input_json, ensure_ascii=False)},
+            },
+        },
+        {"type": "content_block_stop", "data": {"type": "content_block_stop", "index": idx}},
+        {
+            "type": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 20},
+            },
+        },
+        {"type": "message_stop", "data": {"type": "message_stop"}},
+    ]
+    return make_anthropic_sse(events)
+
+
+def openai_tool_use_sse(tool_name, arguments, text="", chunk_id="chatcmpl-mock-emit"):
+    """构造一段 tool_calls 回复的 OpenAI SSE 流(结构化输出强制通道,第 13 轮)。
+
+    arguments: dict(function 参数对象);text: 可选伴随文本。
+    首片携带 id + function.name,参数以 arguments 字符串分片送出,
+    尾片 finish_reason="tool_calls"。
+    """
+    args_str = json.dumps(arguments, ensure_ascii=False)
+    # 分两片送 arguments,模拟真实流式分片(解析器侧 json_buf 拼接)
+    half = max(1, len(args_str) // 2)
+    chunks = [
+        {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "mock-openai",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "tool_calls": [{
+                    "index": 0, "id": f"call_{chunk_id}", "type": "function",
+                    "function": {"name": tool_name, "arguments": args_str[:half]},
+                }]},
+                "finish_reason": None,
+            }],
+        },
+        {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "mock-openai",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": args_str[half:]}}]},
+                "finish_reason": None,
+            }],
+        },
+        {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "mock-openai",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
         },
     ]
     terminal = {
@@ -555,17 +681,57 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        # --reject-tool-choice 模式(第 13 轮结构化输出强制通道):
+        # 首次收到携带 forced tool_choice(Anthropic {"type":"tool"} /
+        # OpenAI {"type":"function"} 指名)的请求时返回 400 拒绝(仅拒一次),
+        # 用于端到端验证 resilient.rs 的自适应降级:去掉 forced 重试 → 成功。
+        tc = body.get("tool_choice")
+        forced_tc = isinstance(tc, dict) and tc.get("type") in ("tool", "function")
+        if "--reject-tool-choice" in MODES and forced_tc and not STATE.get("rejected_tc", False):
+            STATE["rejected_tc"] = True
+            err = {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "tool_choice is not supported by this endpoint",
+                },
+            }
+            payload = json.dumps(err, ensure_ascii=False).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         def role_reply(text):
             return openai_text_sse(text) if key == "oai" else anthropic_text_sse(text)
 
+        def emit_reply(tool_name, payload):
+            """--forced-tool 模式:yolo / quality 以 tool_use 形式返回结构化结果。"""
+            if key == "oai":
+                return openai_tool_use_sse(tool_name, payload)
+            return anthropic_tool_use_sse(tool_name, payload)
+
         if key == "oai" or "v1/messages" in self.path:
             if role == "yolo":
-                if "--parallel-wfs" in MODES:
+                if "--forced-tool" in MODES:
+                    # 结构化输出强制通道:submit_task_classification tool_use
+                    body_bytes = emit_reply(
+                        "submit_task_classification",
+                        json.loads(YOLO_CLASSIFICATION_JSON),
+                    )
+                elif "--parallel-wfs" in MODES:
                     body_bytes = role_reply(maybe_break_json(YOLO_CLASSIFICATION_MEDIUM_JSON))
                 else:
                     body_bytes = role_reply(maybe_break_json(YOLO_CLASSIFICATION_JSON))
             elif role == "quality":
-                if "--broken-quality" in MODES:
+                if "--forced-tool" in MODES:
+                    body_bytes = emit_reply(
+                        "submit_quality_report",
+                        json.loads(QUALITY_REPORT_JSON),
+                    )
+                elif "--broken-quality" in MODES:
                     # 返回非 JSON 文本 → 让 src/agent/quality.rs 走 JSON 解析失败路径
                     body_bytes = role_reply("not a valid JSON at all, sorry.")
                 else:

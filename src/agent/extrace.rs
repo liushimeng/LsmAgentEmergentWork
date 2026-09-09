@@ -41,6 +41,10 @@ pub struct ExecutionTrace {
     /// max_tokens 升级历史 `(old, new)`,供 Debug Report 调试使用。
     /// 当前实现由 Agent 循环在 finalize 阶段从状态机注入。
     pub max_tokens_history: Vec<(u32, u32)>,
+    /// 结构化输出通道命中次数(L6/L19,2026-09-09 第 13 轮):
+    /// 模型经 forced tool_choice 以 tool_use 形式提交结果的次数。
+    /// >0 表示协议级结构化输出链路生效(优于文本 JSON 启发式解析)。
+    pub structured_emits: usize,
     /// 最终输出文本字节数
     pub output_bytes: usize,
     /// 失败模式标签(供 Agent-Memory 索引 / Yolo 失败回流引用)

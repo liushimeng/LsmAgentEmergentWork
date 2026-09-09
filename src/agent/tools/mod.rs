@@ -16,6 +16,7 @@ use crate::llm::ToolDef;
 
 pub mod bash;
 pub mod edit;
+pub mod emit;
 pub mod glob;
 pub mod grep;
 pub mod read;
@@ -115,10 +116,12 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
         .register(Arc::new(grep::GrepTool))
 }
 
-/// Yolo Agent 工具注册表:仅 Read(用于理解上下文,不修改系统状态)
+/// Yolo Agent 工具注册表:Read(理解上下文)+ 结构化输出通道
+/// `submit_task_classification`(2026-09-09 第 13 轮,L6/L19)
 pub fn yolo_registry() -> ToolRegistry {
     ToolRegistry::new()
         .register(Arc::new(read::ReadTool))
+        .register(Arc::new(emit::SubmitTaskClassification))
 }
 
 /// Plan Agent 工具注册表:Read + Write + Edit + Glob + Grep(规划与调研)
@@ -147,11 +150,13 @@ pub fn sub_agent_work_registry() -> ToolRegistry {
 }
 
 /// Quality-Check Agent 工具注册表:Read + Glob + Grep(质检时可检索与读取)
+/// + 结构化输出通道 `submit_quality_report`(2026-09-09 第 13 轮,L6/L19)
 pub fn quality_registry() -> ToolRegistry {
     ToolRegistry::new()
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(glob::GlobTool))
         .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(emit::SubmitQualityReport))
 }
 
 /// SessionContext Agent 工具注册表:无工具(纯文本生成)

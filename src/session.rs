@@ -174,6 +174,7 @@ impl Session {
             device_id: self.device_id.clone(),
             max_tokens_override: None,
             user_agent: String::new(),
+            forced_tool: None,
         }
     }
 }

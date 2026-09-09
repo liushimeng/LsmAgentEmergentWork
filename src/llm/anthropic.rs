@@ -54,6 +54,11 @@ struct AnthropicRequest {
     messages: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
+    /// forced tool_choice(L6/L19,2026-09-09 第 13 轮):
+    /// `{"type":"tool","name":X,"disable_parallel_tool_use":true}`。
+    /// `None` 时不发送该字段(= Anthropic 默认 auto)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
     /// Anthropic 会话/设备标识(metadata.user_id)。
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<Metadata>,
@@ -381,6 +386,11 @@ impl LlmClient for AnthropicClient {
             system: if sys_blocks.is_empty() { None } else { Some(sys_blocks) },
             messages: msg_blocks,
             tools: tool_blocks,
+            // 结构化输出强制通道(L6/L19):forced 指名调用 + 禁并行,
+            // 引导模型先 Read 后单独 submit(分轮),避免混合并行调用被忽略。
+            tool_choice: meta.forced_tool.as_ref().map(|name| {
+                json!({ "type": "tool", "name": name, "disable_parallel_tool_use": true })
+            }),
             metadata: Some(Metadata {
                 user_id: build_user_id(&meta.device_id, &meta.session_id, agent_name),
             }),
@@ -736,11 +746,53 @@ mod tests {
             system: None,
             messages: vec![],
             tools: vec![],
+            tool_choice: None,
             metadata: None,
             stream: true,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("system"));
+    }
+
+    // ========== 结构化输出强制通道 wire(L6/L19,2026-09-09 第 13 轮) ==========
+
+    #[test]
+    fn request_serializes_forced_tool_choice() {
+        let req = AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 1,
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            tool_choice: Some(json!({
+                "type": "tool",
+                "name": "submit_task_classification",
+                "disable_parallel_tool_use": true
+            })),
+            metadata: None,
+            stream: true,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["tool_choice"]["type"], "tool", "forced wire 应为 tool 指名形态");
+        assert_eq!(v["tool_choice"]["name"], "submit_task_classification");
+        assert_eq!(
+            v["tool_choice"]["disable_parallel_tool_use"], true,
+            "forced wire 应禁并行(引导先 Read 后单独 submit 分轮)"
+        );
+        // None 时不发送 tool_choice 字段(= 默认 auto)
+        let req2 = AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 1,
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            metadata: None,
+            stream: true,
+        };
+        let s2 = serde_json::to_string(&req2).unwrap();
+        assert!(!s2.contains("tool_choice"));
     }
 
     #[test]
@@ -751,6 +803,7 @@ mod tests {
             system: None,
             messages: vec![],
             tools: vec![],
+            tool_choice: None,
             metadata: Some(Metadata {
                 user_id: build_user_id("dev1234567890", "sess-1", "LsmAgentEmergentWork-Yolo"),
             }),

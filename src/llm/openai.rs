@@ -50,8 +50,12 @@ struct OpenAiRequest<'a> {
     messages: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
+    /// tool_choice(L6,2026-09-09 第 13 轮):
+    /// - 默认 `json!("auto")`(维持既有行为);
+    /// - forced(结构化输出强制通道)时为
+    ///   `{"type":"function","function":{"name":X}}` 指名调用。
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
+    tool_choice: Option<Value>,
     /// 启用 SSE 流式响应。
     stream: bool,
     /// 让上游在尾部单条 chunk 中输出 usage。
@@ -331,7 +335,11 @@ impl LlmClient for OpenAiClient {
             model: &self.model,
             messages: converted,
             tools: convert_tools(tools),
-            tool_choice: Some("auto"),
+            // 结构化输出强制通道(L6/L19):forced 指名调用;默认维持 auto。
+            tool_choice: Some(match meta.forced_tool.as_deref() {
+                Some(name) => json!({ "type": "function", "function": { "name": name } }),
+                None => json!("auto"),
+            }),
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
@@ -582,7 +590,7 @@ mod tests {
             model: "m",
             messages: vec![json!({"role":"user","content":"hi"})],
             tools: vec![],
-            tool_choice: Some("auto"),
+            tool_choice: Some(json!("auto")),
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
@@ -593,5 +601,27 @@ mod tests {
         assert!(s.contains("\"stream\":true"));
         assert!(s.contains("\"include_usage\":true"));
         assert!(s.contains("\"tool_choice\":\"auto\""));
+    }
+
+    // ========== 结构化输出强制通道 wire(L6/L19,2026-09-09 第 13 轮) ==========
+
+    #[test]
+    fn request_serializes_forced_tool_choice() {
+        let req = OpenAiRequest {
+            model: "m",
+            messages: vec![json!({"role":"user","content":"hi"})],
+            tools: vec![],
+            tool_choice: Some(json!({
+                "type": "function",
+                "function": { "name": "submit_task_classification" }
+            })),
+            stream: true,
+            stream_options: None,
+            max_tokens: None,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["tool_choice"]["type"], "function", "forced wire 应为 function 指名形态");
+        assert_eq!(v["tool_choice"]["function"]["name"], "submit_task_classification");
     }
 }

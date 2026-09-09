@@ -429,13 +429,49 @@ impl LlmClient for ResilientLlmClient {
         tools: &[ToolDef],
         meta: &RequestMeta,
     ) -> Result<Completion> {
-        self.complete_with_retry(system, messages, tools, meta)
-            .await
+        // 结构化输出强制通道的自适应降级(L6/L19,2026-09-09 第 13 轮):
+        // forced tool_choice 被第三方网关/代理拒绝(4xx + tool_choice 相关报错)时,
+        // 自动去掉 forced 降级为默认 auto 再走一次完整重试管线。
+        // forced 拒绝是不可重试 4xx(不污染熔断计数),降级后模型回退文本 JSON,
+        // 由既有三重解析链 + 修复链兜底 —— 全程无需用户配置。
+        match self.complete_with_retry(system, messages, tools, meta).await {
+            Ok(c) => Ok(c),
+            Err(e) if meta.forced_tool.is_some() && looks_like_tool_choice_rejection(&e) => {
+                tracing::warn!(
+                    tool = meta.forced_tool.as_deref().unwrap_or_default(),
+                    error = %e,
+                    "forced tool_choice 被 Provider 拒绝,自动降级为 auto 重试"
+                );
+                let mut degraded = meta.clone();
+                degraded.forced_tool = None;
+                self.complete_with_retry(system, messages, tools, &degraded).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn protocol(&self) -> Protocol {
         self.inner.protocol()
     }
+}
+
+/// 判断错误是否为「Provider 不支持 forced tool_choice」的拒绝形态。
+///
+/// 特征:4xx(400/404/422)且错误文本提及 tool_choice / tool choice /
+/// tool + not support / function calling 不支持(大小写不敏感)。
+/// 命中即触发降级;401 鉴权错、400 溢出等其他 4xx 不命中。
+pub fn looks_like_tool_choice_rejection(err: &AgentError) -> bool {
+    let AgentError::LlmHttp { status, message, .. } = err else {
+        return false;
+    };
+    if !matches!(status, 400 | 404 | 422) {
+        return false;
+    }
+    let lower = message.to_lowercase();
+    lower.contains("tool_choice")
+        || lower.contains("tool choice")
+        || (lower.contains("tool") && lower.contains("not support"))
+        || lower.contains("function calling is not supported")
 }
 
 #[cfg(test)]
@@ -536,6 +572,7 @@ mod tests {
             device_id: "test-device".into(),
             max_tokens_override: None,
             user_agent: String::new(),
+            forced_tool: None,
         }
     }
 
@@ -932,5 +969,155 @@ mod tests {
         let (mock, _) = MockClient::new(vec![], Protocol::OpenAi);
         let client = ResilientLlmClient::new(Arc::new(mock));
         assert_eq!(client.protocol(), Protocol::OpenAi);
+    }
+
+    // ========== forced tool_choice 自适应降级(L6/L19,2026-09-09 第 13 轮) ==========
+
+    /// 记录每次请求 forced_tool 的 mock(脚本式回复)。
+    struct ForcedAwareMock {
+        responses: Mutex<VecDeque<Result<Completion>>>,
+        seen_forced: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl ForcedAwareMock {
+        fn new(responses: Vec<Result<Completion>>) -> (Self, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    seen_forced: seen.clone(),
+                },
+                seen,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ForcedAwareMock {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDef],
+            meta: &RequestMeta,
+        ) -> Result<Completion> {
+            self.seen_forced
+                .lock()
+                .unwrap()
+                .push(meta.forced_tool.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(ok_completion()))
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::Anthropic
+        }
+    }
+
+    fn forced_meta() -> RequestMeta {
+        let mut m = test_meta();
+        m.forced_tool = Some("submit_task_classification".into());
+        m
+    }
+
+    fn tool_choice_rejection() -> AgentError {
+        AgentError::LlmHttp {
+            status: 400,
+            retry_after_ms: None,
+            message: "HTTP 400: {\"error\":{\"message\":\"tool_choice is not supported by this endpoint\"}}".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_tool_choice_rejection_degrades_to_auto() {
+        // 首次 forced 请求被 Provider 拒绝(400 tool_choice) → 自动去掉 forced
+        // 降级重试 → 第二次(forced=None)成功返回。
+        let (mock, seen) = ForcedAwareMock::new(vec![
+            Err(tool_choice_rejection()),
+            Ok(ok_completion()),
+        ]);
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        let c = client
+            .complete("sys", &[], &[], &forced_meta())
+            .await
+            .expect("降级重试后应成功");
+        assert_eq!(c.text, "ok");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "应恰好发生 2 次请求(forced 拒绝 + 降级 auto),实际: {seen:?}"
+        );
+        assert_eq!(seen[0].as_deref(), Some("submit_task_classification"));
+        assert!(seen[1].is_none(), "第二次请求不应携带 forced tool_choice");
+    }
+
+    #[tokio::test]
+    async fn non_rejection_4xx_does_not_degrade() {
+        // 401 鉴权错不含 tool_choice 语义 → 不触发降级,原错误上抛
+        let (mock, seen) = ForcedAwareMock::new(vec![Err(http_err(401, None))]);
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        let err = client
+            .complete("sys", &[], &[], &forced_meta())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::LlmHttp { status: 401, .. }));
+        assert_eq!(seen.lock().unwrap().len(), 1, "401 不应触发降级重试");
+    }
+
+    #[tokio::test]
+    async fn degradation_without_forced_tool_is_noop() {
+        // 无 forced 的普通调用即使收到 tool_choice 形态报错也不重试
+        // (错误来自 Provider 自身配置,与本地 forced 注入无关)。
+        let (mock, seen) = ForcedAwareMock::new(vec![Err(tool_choice_rejection())]);
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        let err = client
+            .complete("sys", &[], &[], &test_meta())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::LlmHttp { status: 400, .. }));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn looks_like_rejection_matching() {
+        // 命中:4xx + tool_choice 语义
+        for (status, msg) in [
+            (400, "Invalid value for 'tool_choice'"),
+            (422, "tool choice not supported"),
+            (400, "this endpoint does not support tool parameter"),
+            (422, "function calling is not supported on this model"),
+        ] {
+            let e = AgentError::LlmHttp {
+                status,
+                retry_after_ms: None,
+                message: msg.into(),
+            };
+            assert!(looks_like_tool_choice_rejection(&e), "应命中: {status} {msg}");
+        }
+        // 不命中:其他状态码 / 无关 4xx / 非网络错误
+        for e in [
+            AgentError::LlmHttp {
+                status: 429,
+                retry_after_ms: None,
+                message: "tool_choice ...".into(),
+            },
+            AgentError::LlmHttp {
+                status: 400,
+                retry_after_ms: None,
+                message: "prompt is too long".into(),
+            },
+            AgentError::LlmHttp {
+                status: 401,
+                retry_after_ms: None,
+                message: "invalid api key".into(),
+            },
+            AgentError::Other("whatever".into()),
+        ] {
+            assert!(!looks_like_tool_choice_rejection(&e), "不应命中: {e}");
+        }
     }
 }

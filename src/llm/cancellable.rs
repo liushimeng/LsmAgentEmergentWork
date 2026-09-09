@@ -162,6 +162,7 @@ mod tests {
             device_id: "d".into(),
             max_tokens_override: None,
             user_agent: String::new(),
+            forced_tool: None,
         }
     }
 

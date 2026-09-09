@@ -470,7 +470,9 @@ OUT=$(run "$LAEW" -p "写一句中文 hello")
 # 注:cache 值已被 SSE parser 收入 Usage;编排器聚合路径对齐留待后续 round 收口。
 # (b) mock 抓包日志:每个 call 应包含 cache_control 断点 — 这是核心断言
 # (b) mock 抓包日志应包含 cache_control 断点(laew 自动注入)
-grep -F -q "\"cache_control\":{\"type\":\"ephemeral\"}" "$CACHE_MOCK_LOG"; check $? "mock 日志含 cache_control.ephemeral(自动注入生效)"
+# 注:mock 日志由 json.dumps(ensure_ascii=False) 落盘,键值分隔符为 ", ": " "
+# (带空格)——断言用带空格形态(第 13 轮勘误:此前无空格形态自 L1208 改日志格式后永不匹配)
+grep -F -q "\"cache_control\": {\"type\": \"ephemeral\"}" "$CACHE_MOCK_LOG"; check $? "mock 日志含 cache_control.ephemeral(自动注入生效)"
 # 至少 3 个 call,每个 call 在 system/tools/messages 上各打 2-3 处 cache_control
 # (SessionContext 调用无 tools 故为 2 处,其他为 3 处;5 个 call 期望 14 处)
 N_CC=$(grep -o "cache_control" "$CACHE_MOCK_LOG" | wc -l)
@@ -510,6 +512,114 @@ kill $INJECT_MOCK_PID 2>/dev/null
 run "$LAEW" provider delete "$ID_INJ" >/dev/null 2>&1
 run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 rm -f "$INJECT_MOCK_LOG"
+
+# --- 4j. 结构化输出强制通道端到端(L6/L19,2026-09-09 第 13 轮) ---
+# 方案见 tmpPlan/2026-09-09_13-结构化输出强制通道与forced-tool-choice方案.md
+# 4j-1: mock --forced-tool — Yolo/Quality 以 tool_use 返回结构化结果;
+#       断言 wire 上 tool_choice 指名(anthropic {"type":"tool"}) + 链路贯通。
+# 4j-2: mock --forced-tool --reject-tool-choice — 首次 forced 请求被 400 拒绝;
+#       断言 resilient.rs 自适应降级(第二次请求无 tool_choice)后链路仍贯通。
+section "4j. 结构化输出强制通道(L6/L19 forced tool_choice)"
+FT_MOCK_LOG="testReport/mock_requests-forced-$TS.jsonl"
+FT_MOCK_PORT=18904
+python3 scripts/mock_llm_server.py $FT_MOCK_PORT "$FT_MOCK_LOG" --forced-tool &>/dev/null &
+FT_MOCK_PID=$!; sleep 0.6
+run "$LAEW" provider add --protocol anthropic --provider-name forced-test --model-name claude-forced-test \
+  --end-point "http://127.0.0.1:$FT_MOCK_PORT" --api-key sk-forced-test >/dev/null 2>&1
+ID_FT=$(run "$LAEW" provider list 2>/dev/null | grep forced-test | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+run "$LAEW" provider use "$ID_FT" >/dev/null 2>&1
+OUT=$(run "$LAEW" -p "执行一次链路验证")
+echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "4j-1 forced tool_use 链路贯通(输出含 MOCK_FINAL_ANSWER)"
+# wire 断言(python 解析 JSONL,不依赖字段顺序/空格):
+#  - Yolo 请求恰好 1 次(emit 命中 1 轮终止,无续轮)
+#  - 其 tool_choice 为 tool 指名 submit_task_classification + 禁并行
+#  - Quality 请求 tool_choice 指名 submit_quality_report
+python3 - "$FT_MOCK_LOG" <<'PYEOF' 2>&1 | tee -a "$REPORT"
+import json, sys
+reqs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+def by_agent(marker):
+    out = []
+    for r in reqs:
+        s = r["body"].get("system")
+        if isinstance(s, list):
+            s = "\n".join(p.get("text", "") for p in s if isinstance(p, dict))
+        elif not isinstance(s, str):
+            s = ""
+        if marker in s:
+            out.append(r)
+    return out
+ok = True
+def chk(cond, name):
+    global ok
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+    ok = ok and cond
+yolo = by_agent("LsmAgentEmergentWork-Yolo")
+quality = by_agent("LsmAgentEmergentWork-Quality-Check")
+chk(len(yolo) == 1, f"Yolo 请求恰好 1 次(emit 命中 1 轮终止,实际 {len(yolo)})")
+if yolo:
+    tc = yolo[0]["body"].get("tool_choice") or {}
+    chk(tc.get("type") == "tool", f"Yolo wire tool_choice.type=tool(实际 {tc.get('type')!r})")
+    chk(tc.get("name") == "submit_task_classification", f"Yolo wire 指名 submit_task_classification(实际 {tc.get('name')!r})")
+    chk(tc.get("disable_parallel_tool_use") is True, "Yolo wire 禁并行(disable_parallel_tool_use=true)")
+    tools = [t.get("name") for t in yolo[0]["body"].get("tools", [])]
+    chk("submit_task_classification" in tools, f"emit 工具在 tools 列表中(实际 {tools})")
+if quality:
+    tc = quality[0]["body"].get("tool_choice") or {}
+    chk(tc.get("name") == "submit_quality_report", f"Quality wire 指名 submit_quality_report(实际 {tc.get('name')!r})")
+else:
+    chk(False, "未见 Quality 请求")
+sys.exit(0 if ok else 1)
+PYEOF
+check $? "4j-1 wire 断言:forced tool_choice 指名 + emit 工具注册 + 1 轮终止"
+# kill + wait 确保 mock 进程退出、端口释放(kill 是异步信号,不等待会在连续
+# 两次跑 e2e 时让下一轮同端口 mock bind 失败,残留旧进程以旧 STATE/旧日志路径服务)
+kill $FT_MOCK_PID 2>/dev/null; wait $FT_MOCK_PID 2>/dev/null; sleep 0.2
+run "$LAEW" provider delete "$ID_FT" >/dev/null 2>&1
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+rm -f "$FT_MOCK_LOG"
+
+# 4j-2: forced 被 Provider 拒绝 → resilient 自动降级 auto 重试 → 链路仍贯通
+FT2_MOCK_LOG="testReport/mock_requests-forced-reject-$TS.jsonl"
+FT2_MOCK_PORT=18905
+python3 scripts/mock_llm_server.py $FT2_MOCK_PORT "$FT2_MOCK_LOG" --forced-tool --reject-tool-choice &>/dev/null &
+FT2_MOCK_PID=$!; sleep 0.6
+run "$LAEW" provider add --protocol anthropic --provider-name forced-reject --model-name claude-forced-reject \
+  --end-point "http://127.0.0.1:$FT2_MOCK_PORT" --api-key sk-forced-reject >/dev/null 2>&1
+ID_FR=$(run "$LAEW" provider list 2>/dev/null | grep forced-reject | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+run "$LAEW" provider use "$ID_FR" >/dev/null 2>&1
+OUT=$(run "$LAEW" -p "执行一次降级验证")
+echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "4j-2 forced 被拒后降级重试,链路仍贯通(MOCK_FINAL_ANSWER)"
+python3 - "$FT2_MOCK_LOG" <<'PYEOF' 2>&1 | tee -a "$REPORT"
+import json, sys
+reqs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+def yolo_reqs():
+    out = []
+    for r in reqs:
+        s = r["body"].get("system")
+        if isinstance(s, list):
+            s = "\n".join(p.get("text", "") for p in s if isinstance(p, dict))
+        elif not isinstance(s, str):
+            s = ""
+        if "LsmAgentEmergentWork-Yolo" in s:
+            out.append(r["body"])
+    return out
+ok = True
+def chk(cond, name):
+    global ok
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+    ok = ok and cond
+ys = yolo_reqs()
+chk(len(ys) == 2, f"Yolo 请求恰好 2 次(forced 拒绝 + 降级 auto 重试,实际 {len(ys)})")
+if len(ys) == 2:
+    chk((ys[0].get("tool_choice") or {}).get("type") == "tool", "第 1 次携带 forced tool_choice(被拒)")
+    chk("tool_choice" not in ys[1], f"第 2 次降级后不携带 tool_choice(实际 {ys[1].get('tool_choice')})")
+sys.exit(0 if ok else 1)
+PYEOF
+check $? "4j-2 wire 断言:第一次 forced 被拒 → 第二次降级无 tool_choice"
+kill $FT2_MOCK_PID 2>/dev/null; wait $FT2_MOCK_PID 2>/dev/null; sleep 0.2
+run "$LAEW" provider delete "$ID_FR" >/dev/null 2>&1
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+rm -f "$FT2_MOCK_LOG"
 
 # --- 5d. Debug 模式端到端(Debug Agent 请求可辨识 + 报告落盘,2026-09-09 第 08 轮) ---
 # 方案见 tmpPlan/2026-09-09_08-Agent身份逐请求注入与抓包可见性.md §2.4。

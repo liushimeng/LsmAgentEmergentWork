@@ -240,7 +240,22 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 1. 先用自然语言简要说明你的判断(1-3 句话),例如:
    「这是一个中等难度任务,需要修改两个文件。已制定以下计划:」
 
-2. 然后用 ```json 代码块输出结构化分类结果,格式严格如下:
+2. 然后提交结构化分类结果(字段与示例如下)。
+   【首选通道】调用 submit_task_classification 工具提交——这是最终结果的唯一出口,
+   工具参数即分类结果本身(input 天然是合法 JSON,不需要你在正文手写 JSON):
+   {
+     "task_level": "medium",
+     "purpose": "一句话概括用户的目的(为什么问这个)",
+     "goal_summary": "一句话概括用户的核心目标",
+     "intent": "意图分类英文标识,如 code_refactor / info_query / file_operation / chat / config / debug",
+     "decomposition_plan": [
+       "步骤 1: ...",
+       "步骤 2: ..."
+     ],
+     "direct_answer": null
+   }
+
+   【降级通道】仅当工具调用不可用时,才用 ```json 代码块在正文输出同样结构:
 
 ```json
 {
@@ -257,7 +272,7 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 ```
 
 重要规则:
-- JSON 必须是合法的(引号、逗号、括号正确)
+- 分类结果只能提交一次:首选 submit_task_classification 工具,不要在正文重复裸写 JSON
 - task_level 只能是 simple / medium / hard 三个值之一
 - purpose / goal_summary / intent 三个字段每次都必须认真填写(三步分析的结果),不允许留空或敷衍
 - simple 且无需工具可直接回答时填 direct_answer(字符串),decomposition_plan 为空数组
@@ -265,15 +280,18 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 - decomposition_plan 是字符串数组,simple 级别可以只有 1 个元素或为空
 - medium / hard 级别必须有详细的分解步骤"#;
 
-/// Yolo Agent 工具说明(仅 Read)。
+/// Yolo Agent 工具说明(Read + 结构化输出通道)。
 fn yolo_tools_hint() -> &'static str {
     "工具调用规范:\n\
-     - 你仅可使用 Read 工具读取文件来帮助理解上下文。\n\
+     - 你可使用 Read 工具读取文件来帮助理解上下文(必要时)。\n\
      - 工具参数需严格遵守给定 JSON Schema。\n\
      - 不要调用 Bash、Write 等会修改系统状态的工具。\n\
-     - 如果不需要读取文件就能判断,请直接输出分类结果。\n\n\
+     - 最终分类结果必须通过 submit_task_classification 工具提交(结构化输出通道,\n\
+       这是最终结果的唯一出口);不要在正文裸写 JSON。\n\n\
      可用工具:\n\
-     - Read(file_path, offset?, limit?): 读取文本文件,带行号。offset/limit 用于分页。"
+     - Read(file_path, offset?, limit?): 读取文本文件,带行号。offset/limit 用于分页。\n\
+     - submit_task_classification(task_level, purpose, goal_summary, intent, ...):\n\
+       提交最终任务分类结果(三步分析与难度分级完成后调用,一次即止)。"
 }
 
 /// Anthropic 协议下 Yolo 的额外提示。
@@ -499,7 +517,20 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 
 ---
 
-输出格式(JSON):
+输出格式(结构化):
+
+【首选通道】调用 submit_quality_report 工具提交质检结论——这是最终结果的唯一出口,
+工具参数即质检报告本身(input 天然是合法 JSON,不需要在正文手写 JSON):
+{
+  "verdict": "pass | fail",
+  "source": "subagent | main | plan",
+  "issues": ["问题 1", "问题 2"],
+  "suggestion": "改进建议",
+  "retryable": true,
+  "evidence": "判定依据(可选)"
+}
+
+【降级通道】仅当工具调用不可用时,才用 ```json 代码块在正文输出同样结构:
 
 ```json
 {
@@ -541,11 +572,14 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 
 fn quality_tools_hint() -> &'static str {
     "工具调用规范:\n\
-     - 默认不使用工具(纯 LLM 判定)\n\
-     - 需要时可使用 Read 工具读取相关文件辅助判断\n\
+     - 最终质检结论必须通过 submit_quality_report 工具提交(结构化输出通道,\n\
+       这是最终结果的唯一出口);不要在正文裸写 JSON。\n\
+     - 需要时可使用 Read 工具读取相关文件辅助判断(判定前)\n\
      - 不要执行修改类命令\n\n\
-     可用工具(可选):\n\
-     - Read(file_path, offset?, limit?): 读取文本文件,带行号"
+     可用工具:\n\
+     - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
+     - submit_quality_report(verdict, source, retryable, issues?, suggestion?, evidence?):\n\
+       提交最终质检报告(判定完成后调用,一次即止)。"
 }
 
 const QUALITY_ANTHROPIC_TAIL: &str = "\

@@ -68,6 +68,17 @@ pub struct RequestMeta {
     /// 抓包层面可辨识(2026-09-09 第 08 轮,方案 tmpPlan/2026-09-09_08);
     /// 为空时协议层回退到客户端构造期的默认 UA。
     pub user_agent: String,
+    /// 结构化输出强制通道(2026-09-09 第 13 轮,实现 L6/L19):
+    ///
+    /// `Some(tool_name)` 时协议层发出 forced `tool_choice`——
+    /// - Anthropic:`{"type":"tool","name":X,"disable_parallel_tool_use":true}`
+    /// - OpenAI:`{"type":"function","function":{"name":X}}`
+    ///
+    /// 模型必须以 tool_use 形式返回结构化结果(input 即合法 JSON 对象)。
+    /// 由 `Agent::run_session_inner` 从 `AgentProfile.emit_tool` 注入;
+    /// Provider 不支持时由 `resilient.rs` 自动去掉 forced 降级重试。
+    /// `None` = 默认行为(Anthropic 不发 tool_choice / OpenAI 发 "auto")。
+    pub forced_tool: Option<String>,
 }
 
 impl RequestMeta {
@@ -78,6 +89,7 @@ impl RequestMeta {
             device_id: device_id.into(),
             max_tokens_override: None,
             user_agent: String::new(),
+            forced_tool: None,
         }
     }
 
@@ -92,6 +104,7 @@ impl RequestMeta {
             device_id: device_id.into(),
             max_tokens_override: Some(max_tokens),
             user_agent: String::new(),
+            forced_tool: None,
         }
     }
 
@@ -351,6 +364,7 @@ mod tests {
             device_id: "45d277355416ee1b2f42758fb292b60b45170a57a5b4dec5cb7fa1a40fdd17ec".into(),
             max_tokens_override: None,
             user_agent: String::new(),
+            forced_tool: None,
         };
         let headers = build_common_headers(
             "sk-xxx",
