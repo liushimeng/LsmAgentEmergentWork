@@ -10,6 +10,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod crash;
 pub mod database;
 pub mod error;
 pub mod llm;

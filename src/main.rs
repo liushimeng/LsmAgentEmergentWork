@@ -374,6 +374,17 @@ async fn cmd_export_provider(file_path: PathBuf) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 崩溃取证必须先于 CLI 解析 / TUI 初始化 / Tokio worker 创建安装。
+    // 报告目录沿用 laew 根目录约定，不依赖数据库配置，用户零配置。
+    {
+        let root_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        lsm_agent::crash::install_panic_hook_from_root(&root_dir);
+    }
+
     let cli = {
         // 兼容用户习惯写法 `-debug` / `-inprovider` / `-outprovider`(单横线长参数),
         // 归一化为 `--xxx` 再交给 clap

@@ -31,5 +31,8 @@ tmpPlan/
 # DebugReport(laew -debug 调试报告,自动落盘,不入库)
 DebugReport/
 
+# CrashReport(全局 panic hook 崩溃取证,自动落盘,不入库)
+CrashReport/
+
 # TestWorkSpace(自动化测试目录,临时文件不入库;与 tmpPlan/ 类似的「一次性产物」)
 /TestWorkSpace/
