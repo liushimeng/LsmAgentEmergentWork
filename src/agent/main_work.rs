@@ -214,10 +214,13 @@ pub fn topo_layers(workflows: &[WorkFlowSpec]) -> Result<Vec<Vec<WorkFlowSpec>>>
 /// 直接解析失败时自动走 JSON 修复链(`json_repair`),修复不了仍 WorkflowParse。
 pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
     if let Some(json_str) = extract_json_block(text) {
-        return crate::agent::json_repair::try_parse(json_str).map_err(AgentError::WorkflowParse);
+        // Main-Work 路径:启用 Tier-2 截断补全(关联报告: 2026-09-09_04 D-001)。
+        return crate::agent::json_repair::try_parse_lenient(json_str)
+            .map_err(AgentError::WorkflowParse);
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        return crate::agent::json_repair::try_parse(json_str).map_err(AgentError::WorkflowParse);
+        return crate::agent::json_repair::try_parse_lenient(json_str)
+            .map_err(AgentError::WorkflowParse);
     }
     Err(AgentError::WorkflowParse(
         "未找到合法的 WorkFlow JSON".into(),

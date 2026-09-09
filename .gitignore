@@ -28,3 +28,6 @@ tmpPlan/
 
 # DebugReport(laew -debug 调试报告,自动落盘,不入库)
 DebugReport/
+
+# TestWorkSpace(自动化测试目录,临时文件不入库;与 tmpPlan/ 类似的「一次性产物」)
+/TestWorkSpace/

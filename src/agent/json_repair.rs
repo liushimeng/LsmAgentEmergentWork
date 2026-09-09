@@ -21,6 +21,10 @@ use serde::de::DeserializeOwned;
 const MAX_REPAIR_BYTES: usize = 512 * 1024;
 
 /// fast-path 直解 → 自动修复 → 再解;均失败返回合并诊断(原始错误 + 修复后错误)。
+///
+/// **不启用截断补全**(fail-closed):Quality-Check 报告被截断可能 verdict 已出
+/// 而 issues 列表未列全,自动补全在语义上有害。
+/// 上轮 P0 fail-closed 测试(`parse_quality_report_truncated_json_fails_closed`)钉死此语义。
 pub fn try_parse<T: DeserializeOwned>(json: &str) -> Result<T, String> {
     match serde_json::from_str::<T>(json) {
         Ok(v) => Ok(v),
@@ -37,6 +41,58 @@ pub fn try_parse<T: DeserializeOwned>(json: &str) -> Result<T, String> {
             }
         }
     }
+}
+
+/// 启用 **Tier-2 截断补全** 的解析入口 —— Yolo / Main-Work JSON 输出
+/// (token 触顶被服务端截断的场景)可被自动补全为合法 JSON;
+/// Quality-Check 报告**必须**使用 `try_parse`(fail-closed 不变,见
+/// `parse_quality_report_truncated_json_fails_closed` 测试)。
+///
+/// 关联报告: 2026-09-09_04-多轮对话测试问题分析 D-001。
+pub fn try_parse_lenient<T: DeserializeOwned>(json: &str) -> Result<T, String> {
+    match serde_json::from_str::<T>(json) {
+        Ok(v) => Ok(v),
+        Err(primary) => {
+            // 1) 先走 Tier-1 修复链(智能引号 / 单引号 / 尾逗号等)
+            let repaired = repair_json(json);
+            match serde_json::from_str::<T>(&repaired) {
+                Ok(v) => {
+                    tracing::info!(primary = %primary, "JSON Tier-1 修复成功");
+                    Ok(v)
+                }
+                Err(secondary) => {
+                    // 2) Tier-1 仍失败,若原错误是截断语义,再走 Tier-2 补全
+                    if !is_truncation_error(&primary) && !is_truncation_error(&secondary) {
+                        return Err(format!(
+                            "JSON 解析失败(原始: {primary}; 自动修复后仍失败: {secondary})"
+                        ));
+                    }
+                    let completed = complete_truncated_json(&repaired);
+                    match serde_json::from_str::<T>(&completed) {
+                        Ok(v) => {
+                            tracing::warn!(
+                                primary = %primary,
+                                "JSON 截断补全成功(Tier-2): LLM 输出被截断,自动补全"
+                            );
+                            Ok(v)
+                        }
+                        Err(tertiary) => Err(format!(
+                            "JSON 解析失败(原始: {primary}; 截断补全后仍失败: {tertiary})"
+                        )),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 判断 serde_json::Error 是否呈现「截断」特征 —— `EOF while parsing ...`
+/// 或 `unexpected end of input`(serde_json 标准截断错误文案)。
+fn is_truncation_error(err: &serde_json::Error) -> bool {
+    let s = err.to_string();
+    s.contains("EOF while parsing")
+        || s.contains("unexpected end of input")
+        || (s.contains("EOF") && s.contains("parsing"))
 }
 
 /// 依次叠加全部 Tier-1 修复规则。
@@ -432,6 +488,91 @@ fn pass_python_consts(input: &str) -> String {
     out
 }
 
+/// Tier-2 截断补全:扫描 JSON 字符串 / 对象 / 数组的开闭配对,在 EOF 时
+/// 自动追加必要的闭合字符(`"`、`}`、`]`),仅在「确实是 EOF 截断」时启用。
+///
+/// 设计约束:
+/// - 仅在字符串/对象/数组开闭配对失衡时追加闭合,**不会插入新内容**;
+/// - 若原串以「合法 JSON 字符(`,` / `}` 等)」结尾,说明不是 EOF,直接原样返回;
+/// - 若发现完全无法配对(例如键值对一半被截掉),补全可能产生语义错误,
+///   调用方应仍按修复失败处理(fail-closed 兜底不变)。
+fn complete_truncated_json(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    // 元素: b'\"' = 在双引号串内; b'{' / b'[' = 在对象/数组内
+    let mut stack: Vec<u8> = Vec::with_capacity(8);
+    let mut escape = false; // 反斜杠转义态,仅在串内有效
+    for c in input.chars() {
+        // 反斜杠转义:把 \\ 自身入栈,下一字符原样透传并清 escape
+        if escape {
+            out.push(c);
+            escape = false;
+            continue;
+        }
+        // 是否在串内(栈顶是 ")
+        let in_string = stack.last().copied() == Some(b'"');
+        match c {
+            '\\' if in_string => {
+                // 串内的反斜杠:下一个字符原样透传
+                out.push(c);
+                escape = true;
+            }
+            '"' => {
+                if in_string {
+                    stack.pop(); // 闭合字符串
+                } else {
+                    stack.push(b'"'); // 进入字符串
+                }
+                out.push(c);
+            }
+            '{' => {
+                if !in_string {
+                    stack.push(b'{');
+                }
+                out.push(c);
+            }
+            '}' => {
+                if !in_string && stack.last().copied() == Some(b'{') {
+                    stack.pop();
+                }
+                out.push(c);
+            }
+            '[' => {
+                if !in_string {
+                    stack.push(b'[');
+                }
+                out.push(c);
+            }
+            ']' => {
+                if !in_string && stack.last().copied() == Some(b'[') {
+                    stack.pop();
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+
+    if stack.is_empty() {
+        return out;
+    }
+
+    // EOF 时按栈逆序补全
+    let mut suffix = String::new();
+    while let Some(top) = stack.pop() {
+        match top {
+            b'"' => suffix.push('"'),
+            b'{' => suffix.push('}'),
+            b'[' => suffix.push(']'),
+            _ => {}
+        }
+    }
+    if !suffix.is_empty() {
+        tracing::debug!(suffix = %suffix, "Tier-2 截断补全:追加闭合字符");
+    }
+    out.push_str(&suffix);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,9 +719,78 @@ mod tests {
     #[test]
     fn try_parse_unrepairable_returns_combined_diagnostic() {
         // 截断的 JSON(缺右括号)刻意不修复 → 返回合并诊断
+        // (fail-closed:Quality 报告不应被自动补全)
         let err = try_parse::<Sample>("{\"name\": \"laew\"").unwrap_err();
         assert!(err.contains("原始"));
         assert!(err.contains("自动修复后仍失败"));
+    }
+
+    // ========== Tier-2 截断补全(D-001)==========
+    // 关联报告: 2026-09-09_04-多轮对话测试问题分析 D-001
+
+    #[test]
+    fn truncated_string_at_eof_gets_closed() {
+        // LLM 输出被 token 触顶截断,停在字符串中部
+        let src = r#"{"task_level": "simple", "goal_summary": "区块链"#;
+        let r = complete_truncated_json(src);
+        assert!(r.ends_with(r#""}"#), "应自动闭合字符串和对象: got {r:?}");
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["goal_summary"], "区块链");
+    }
+
+    #[test]
+    fn truncated_array_gets_closed() {
+        let src = r#"{"tags": ["a", "b"#;
+        let result = complete_truncated_json(src);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let arr = v["tags"].as_array().unwrap();
+        assert_eq!(arr, &vec![serde_json::json!("a"), serde_json::json!("b")]);
+    }
+
+    #[test]
+    fn truncated_nested_object_gets_closed() {
+        let src = r#"{"outer": {"inner": 1"#;
+        let result = complete_truncated_json(src);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["outer"]["inner"], 1);
+    }
+
+    #[test]
+    fn truncated_with_escaped_quote() {
+        // 字符串内含转义引号,补全器不应被转义引号干扰
+        let src = r#"{"a": "say \"hi\" and then"#;
+        let result = complete_truncated_json(src);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["a"], r#"say "hi" and then"#);
+    }
+
+    #[test]
+    fn balanced_json_unchanged_by_completion() {
+        let src = r#"{"name": "x", "tags": ["a"]}"#;
+        assert_eq!(complete_truncated_json(src), src);
+    }
+
+    #[test]
+    fn try_parse_lenient_repairs_truncated() {
+        // Yolo / MainWork 路径:截断 JSON 自动补全
+        let src = r#"{"task_level": "simple", "goal_summary": "什么是区块链"#;
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Partial {
+            task_level: String,
+            goal_summary: String,
+        }
+        let v: Partial = try_parse_lenient(src).expect("截断补全应成功");
+        assert_eq!(v.task_level, "simple");
+        assert_eq!(v.goal_summary, "什么是区块链");
+    }
+
+    #[test]
+    fn try_parse_does_not_repair_truncated_quality_report() {
+        // Quality-Check 报告:刻意 fail-closed,不允许截断补全
+        let src = r#"{"verdict": "pass", "issues"#;
+        let err = try_parse::<serde_json::Value>(src).unwrap_err();
+        assert!(err.contains("原始"), "应保持原 error 信息: got {err}");
+        assert!(!err.contains("截断补全后仍失败"), "Quality 路径不应走 Tier-2: got {err}");
     }
 
     #[test]

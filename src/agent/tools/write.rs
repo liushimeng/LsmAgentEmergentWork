@@ -96,15 +96,63 @@ impl Tool for WriteTool {
     }
 }
 
+/// 解析 Write 工具入参路径。
+///
+/// 解析顺序(关联报告: 2026-09-09_04 D-003):
+/// 1. 绝对路径 → 原样返回;
+/// 2. **工作目录**(env::current_dir())拼接;
+/// 3. 若 2 路径的父目录不存在,**根目录**回退(避免在错误位置 mkdir -p 创出意外目录);
+/// 4. 兜底返回 2 路径(让上层按字面行为处理)。
 fn resolve_path(p: &str) -> PathBuf {
     let path = Path::new(p);
     if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+        // 关联报告: 2026-09-09_04 D-003 —— 若 LLM 把「项目相对路径」误拼成「工作目录绝对路径」,
+        // 而真实文件在根目录,做一次根目录替换重试。
+        let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Ok(rel) = path.strip_prefix(&work) {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(root) = exe.parent() {
+                    let root_path = root.join(rel);
+                    // 仅当目标已存在(读取场景)或目标父目录已存在(写入场景)时回退
+                    let root_parent_ok = root_path.parent().map(|p| p.exists()).unwrap_or(false);
+                    if (root_path.exists() || root_parent_ok) && !path.exists() {
+                        tracing::debug!(
+                            orig = %path.display(),
+                            tried = %root_path.display(),
+                            "resolve_path 工作目录绝对路径 → 根目录回退"
+                        );
+                        return root_path;
+                    }
+                }
+            }
+        }
+        return path.to_path_buf();
     }
+    let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let work_path = work.join(path);
+    if let Some(parent) = work_path.parent() {
+        if parent.exists() {
+            return work_path;
+        }
+    }
+    // 父目录不存在 → 尝试根目录拼接
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.parent() {
+            let root_path = root.join(path);
+            if let Some(parent) = root_path.parent() {
+                if parent.exists() {
+                    tracing::debug!(
+                        rel = %p,
+                        work = %work.display(),
+                        root = %root.display(),
+                        "Write 相对路径回退到根目录解析"
+                    );
+                    return root_path;
+                }
+            }
+        }
+    }
+    work_path
 }
 
 #[cfg(test)]

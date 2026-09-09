@@ -306,6 +306,7 @@ impl MultiAgentOrchestrator {
                                 .collect::<Vec<_>>(),
                             &task_result.total_usage,
                             session.id(),
+                            task_result.classification.yolo_degraded,
                         )
                         .await?;
                     task_result.summary = summary.text.clone();

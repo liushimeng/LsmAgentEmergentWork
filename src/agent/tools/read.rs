@@ -56,7 +56,8 @@ impl Tool for ReadTool {
         let path = resolve_path(path_str);
         let metadata = fs::metadata(&path).map_err(|e| AgentError::ToolExecution {
             tool: self.name().into(),
-            reason: format!("stat 失败: {e}"),
+            // 关联报告: 2026-09-09_04 D-003,把尝试的绝对路径写入错误便于排查路径解析。
+            reason: format!("stat 失败: {e} (tried: {})", path.display()),
         })?;
         if !metadata.is_file() {
             return Err(AgentError::ToolExecution {
@@ -102,15 +103,81 @@ impl Tool for ReadTool {
     }
 }
 
+/// 把工具入参里的相对路径解析为绝对路径。
+///
+/// 解析顺序(关联报告: 2026-09-09_04 D-003):
+/// 1. 已是绝对路径 → 原样返回;
+/// 2. **工作目录**(env::current_dir())拼接;
+/// 3. 若 2 不存在,**根目录**(laew 二进制所在目录,与 CLAUDE.md "根目录" 约定一致)拼接;
+/// 4. 兜底返回 2 路径(让上层 stat 给出明确报错信息,而不是默默返回错路径)。
 fn resolve_path(p: &str) -> PathBuf {
     let path = Path::new(p);
     if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+        tracing::debug!(path = %path.display(), "resolve_path: 绝对路径");
+        // 关联报告: 2026-09-09_04 D-003 —— 若 LLM 把「项目相对路径」误拼成「工作目录绝对路径」,
+        // 而真实文件在根目录,做一次根目录替换重试。
+        let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Ok(rel) = path.strip_prefix(&work) {
+            // 该路径在工作目录下,但 stat 失败;尝试「根目录 + 相对路径」
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(root) = exe.parent() {
+                    let root_path = root.join(rel);
+                    if root_path.exists() && !path.exists() {
+                        tracing::debug!(
+                            orig = %path.display(),
+                            tried = %root_path.display(),
+                            "resolve_path 工作目录绝对路径 → 根目录回退"
+                        );
+                        return root_path;
+                    }
+                }
+            }
+        }
+        return path.to_path_buf();
     }
+    let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let work_path = work.join(path);
+    let work_exists = work_path.exists();
+    tracing::debug!(
+        rel = %p,
+        work = %work.display(),
+        work_path = %work_path.display(),
+        work_exists = %work_exists,
+        "resolve_path 工作目录尝试"
+    );
+    if work_exists {
+        return work_path;
+    }
+    // 根目录回退:从 current_exe() 父目录推导
+    match std::env::current_exe() {
+        Ok(exe) => {
+            tracing::debug!(exe = %exe.display(), "resolve_path current_exe 成功");
+            match exe.parent() {
+                Some(root) => {
+                    let root_path = root.join(path);
+                    let root_exists = root_path.exists();
+                    tracing::debug!(
+                        rel = %p,
+                        root = %root.display(),
+                        root_path = %root_path.display(),
+                        root_exists = %root_exists,
+                        "resolve_path 根目录回退判断"
+                    );
+                    if root_exists {
+                        return root_path;
+                    }
+                }
+                None => {
+                    tracing::debug!(exe = %exe.display(), "resolve_path current_exe 无父目录");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(err = %e, "resolve_path current_exe 失败");
+        }
+    }
+    tracing::debug!(rel = %p, fallback = %work_path.display(), "resolve_path 兜底返回 work_path");
+    work_path
 }
 
 #[cfg(test)]

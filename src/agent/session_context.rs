@@ -35,6 +35,10 @@ impl SessionContextRunner {
     }
 
     /// 收口:汇总本次任务,生成 Markdown 摘要,写入 session_memory。
+    ///
+    /// `yolo_degraded`:本次任务 Yolo 是否走了解析失败降级分支(关联报告: 2026-09-09_04 D-002);
+    /// Orchestrator 传入后,本函数将其拼入 prompt,SessionContext Agent 据此避免把
+    /// "任务完成 + Yolo 降级" 渲染成"目标解析失败(已降级)"的误导性标题。
     pub async fn summarize(
         &self,
         goal: &str,
@@ -43,6 +47,7 @@ impl SessionContextRunner {
         workflow_results: &[(String, String, bool)], // (id, name, ok)
         total_usage: &Usage,
         session_id: &str,
+        yolo_degraded: bool,
     ) -> Result<SessionSummary> {
         let workflow_line = if workflow_results.is_empty() {
             "(无 WorkFlow)".to_string()
@@ -63,13 +68,19 @@ impl SessionContextRunner {
              Plan 文档: {plan}\n\
              WorkFlow: {wf}\n\
              用量: input={i}, output={o}\n\
+             Yolo 本次降级: {yolo_degraded_this}\n\
              Yolo 降级(本进程累计): {yolo_fallback} 次\n\n\
              请按系统提示词中的 Markdown 模板输出 200 字以内的简洁摘要。\
+             若 Yolo 本次降级 = true,** 必须** 按以下规则处理标题与状态行:\n\
+             - 标题不要写成「目标解析失败(已降级)」 —— 这是上游 LLM 输出格式问题,不是任务失败;\n\
+             - 若 WorkFlow 全部成功:标题用原始 goal 摘要,状态行标记为「Yolo 降级 + 执行成功」;\n\
+             - 若 WorkFlow 全部失败:标题用原始 goal 摘要,状态行标记为「Yolo 降级 + 执行失败」并保留失败原因;\n\
              若 Yolo 降级累计 > 0,务必在摘要中以「Yolo 降级 N 次」一行显式记录。",
             plan = plan_doc.map(|p| p.display().to_string()).unwrap_or_else(|| "无".into()),
             wf = workflow_line,
             i = total_usage.input_tokens,
             o = total_usage.output_tokens,
+            yolo_degraded_this = yolo_degraded,
             yolo_fallback = crate::agent::yolo::yolo_parse_failures(),
         );
 

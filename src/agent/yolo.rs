@@ -91,6 +91,10 @@ pub struct TaskClassification {
     /// 失败时给用户的备选建议(默认空)
     #[serde(default)]
     pub user_suggestion_if_fail: String,
+    /// Yolo 本次是否走降级分支(JSON 解析失败 → 强制 simple,关联报告: 2026-09-09_04 D-002)。
+    /// 旧 JSON 缺省 = false,新写入字段由 yolo runner 填充。
+    #[serde(default)]
+    pub yolo_degraded: bool,
 }
 
 impl TaskClassification {
@@ -174,6 +178,7 @@ impl YoloRunner {
                 decomposition_plan: vec![],
                 direct_answer: None,
                 user_suggestion_if_fail: String::new(),
+                yolo_degraded: true, // 关联报告: 2026-09-09_04 D-002
             }
         });
         Ok((classification, text, usage))
@@ -210,6 +215,7 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
                 decomposition_plan: vec![],
                 direct_answer: None,
                 user_suggestion_if_fail: String::new(),
+                yolo_degraded: true, // 关联报告: 2026-09-09_04 D-002
             }
         }
     };
@@ -237,10 +243,14 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
 /// 修复不了仍返回 YoloParse(fail-closed 不变)。
 pub fn parse_classification(text: &str) -> Result<TaskClassification> {
     if let Some(json_str) = extract_json_block(text) {
-        return crate::agent::json_repair::try_parse(json_str).map_err(AgentError::YoloParse);
+        // Yolo 路径:启用 Tier-2 截断补全(LLM 输出被 token 触顶截断的场景),
+        // 仅在 Quality-Check fail-closed 路径禁用。关联报告: 2026-09-09_04 D-001。
+        return crate::agent::json_repair::try_parse_lenient(json_str)
+            .map_err(AgentError::YoloParse);
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        return crate::agent::json_repair::try_parse(json_str).map_err(AgentError::YoloParse);
+        return crate::agent::json_repair::try_parse_lenient(json_str)
+            .map_err(AgentError::YoloParse);
     }
     Err(AgentError::YoloParse(
         "未找到合法的 JSON 分类结果".to_string(),
@@ -433,6 +443,7 @@ mod tests {
             decomposition_plan: vec!["第一步".into(), "第二步".into()],
             direct_answer: None,
             user_suggestion_if_fail: String::new(),
+            yolo_degraded: false, // 关联报告: 2026-09-09_04 D-002(新字段)
         };
         let prompt = build_work_prompt(&c);
         assert!(prompt.contains("验证"));
