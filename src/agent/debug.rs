@@ -700,6 +700,43 @@ fn render_degraded_evaluation(err: &anyhow::Error, collector: &Arc<DebugCollecto
             format!("任务总耗时 {task_ms} ms 超过 5s —— 可能存在慢请求或上下文压缩未生效"),
         ));
     }
+
+    // 恢复与截断属于已自动处理的弱信号:不升级为故障,但必须在降级报告中
+    // 明确呈现,否则 Debug Agent 不可用时用户无法知道链路曾经自愈。
+    let recovery_hints: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            E::LlmCall {
+                input_summary,
+                output_summary,
+                ..
+            } => {
+                let text = format!("{input_summary}\n{output_summary}");
+                let mut signals = Vec::new();
+                if text.contains("truncation_resumes") || text.contains("max_tokens") {
+                    signals.push("检测到截断/续接提示");
+                }
+                if text.contains("overflow_recoveries") || text.contains("prompt-too-long") {
+                    signals.push("检测到上下文溢出恢复提示");
+                }
+                if signals.is_empty() {
+                    None
+                } else {
+                    Some(signals.join("、"))
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    if !recovery_hints.is_empty() {
+        issues.push((
+            "P1".into(),
+            format!(
+                "自动恢复/截断事件: {} —— 属于已处理的可观测弱信号",
+                recovery_hints.join("；")
+            ),
+        ));
+    }
     if llm_calls == 0 {
         issues.push((
             "P2".into(),
@@ -785,6 +822,29 @@ mod tests {
         assert!(md.contains("## 优化建议"), "应包含「优化建议」章节");
         assert!(md.contains("降级模式"), "应明确标注降级模式");
         assert!(md.contains("P2"), "空 trace 应触发 P2 自检(无 LLM 调用)");
+    }
+
+    #[test]
+    fn degraded_evaluation_mentions_recovery_hints() {
+        let c = Arc::new(DebugCollector::new("sess-recovery-test"));
+        c.push(DebugEvent::LlmCall {
+            agent: "SubAgent".into(),
+            seq: 1,
+            started_at: "2026-09-09 00:00:00".into(),
+            duration_ms: 10,
+            input_summary:
+                "<<<LAEW:RUNTIME_HINTS>>> truncation_resumes=1 overflow_recoveries=1".into(),
+            message_count: 1,
+            tool_count: 0,
+            output_summary: "完成".into(),
+            usage: Usage::default(),
+            stop_reason: Some("end_turn".into()),
+            error: None,
+        });
+        let md = render_degraded_evaluation(&anyhow::anyhow!("Debug Agent 不可用"), &c);
+        assert!(md.contains("自动恢复/截断事件"));
+        assert!(md.contains("截断/续接"));
+        assert!(md.contains("上下文溢出恢复"));
     }
 
     #[test]

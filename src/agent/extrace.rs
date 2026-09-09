@@ -47,6 +47,13 @@ pub struct ExecutionTrace {
     pub structured_emits: usize,
     /// 最终输出文本字节数
     pub output_bytes: usize,
+    /// 工具产物摘要(目前采集 Write 成功落盘的 `file_path` + 内容字节数)。
+    ///
+    /// 背景(2026-09-09 第 15 轮 AQ03 实测):SubAgent 把成果写进文件时,
+    /// 收尾文本往往只有几百字节,QC 仅凭 `output_bytes` 会误判"内容与声称不符"。
+    /// 本字段让 QC 看到真实的文件产物体量,避免假阴性 fail。
+    #[serde(default)]
+    pub artifacts: Vec<String>,
     /// 失败模式标签(供 Agent-Memory 索引 / Yolo 失败回流引用)
     pub failure_signals: Vec<String>,
 }
@@ -75,6 +82,15 @@ impl ExecutionTrace {
         // 2.5) 溢出恢复信号(上下文溢出被排水/折叠本地恢复 ≥ 1 次;恢复成功不算失败)
         if self.overflow_recoveries > 0 {
             signals.push(format!("overflow_recovered:{}x", self.overflow_recoveries));
+        }
+
+        // 2.75) 连续失败预警信号:尚未达到早终止时也保留中间态,
+        // 便于 QC/Debug 识别“曾接近短路”而不把它误判为最终失败。
+        if !self.early_terminated && self.max_consecutive_failures >= 2 {
+            signals.push(format!(
+                "consecutive_failures:{}x",
+                self.max_consecutive_failures
+            ));
         }
 
         // 3) 工具失败率信号(失败占比 ≥ 50%)
@@ -109,9 +125,9 @@ impl ExecutionTrace {
         })
     }
 
-    /// 把 trace 渲染成 QC prompt 可用的紧凑 Markdown(≤ 8 行,防止膨胀 prompt)。
+    /// 把 trace 渲染成 QC prompt 可用的紧凑 Markdown(≤ 9 行,防止膨胀 prompt)。
     pub fn render_prompt(&self) -> String {
-        format!(
+        let base = format!(
             "- iterations={} tool_calls={}(ok={},err={}) max_consec={}\n\
              - early_terminated={} truncation_resumes={} overflow_recoveries={}\n\
              - output_bytes={}\n\
@@ -126,7 +142,12 @@ impl ExecutionTrace {
             self.overflow_recoveries,
             self.output_bytes,
             self.failure_signals.join(","),
-        )
+        );
+        if self.artifacts.is_empty() {
+            base
+        } else {
+            format!("{base}\n- artifacts=[{}]", self.artifacts.join("; "))
+        }
     }
 }
 
@@ -332,6 +353,31 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_failure_warning_is_weak_signal() {
+        let mut t = ExecutionTrace::default();
+        t.max_consecutive_failures = 2;
+        t.collect_failure_signals("正常输出");
+        assert!(t
+            .failure_signals
+            .iter()
+            .any(|s| s == "consecutive_failures:2x"));
+        assert!(!t.is_failed());
+    }
+
+    #[test]
+    fn consecutive_failure_warning_is_suppressed_after_termination() {
+        let mut t = ExecutionTrace::default();
+        t.max_consecutive_failures = 3;
+        t.early_terminated = true;
+        t.early_terminate_reason = "重复失败".into();
+        t.collect_failure_signals("正常输出");
+        assert!(!t
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("consecutive_failures:")));
+    }
+
+    #[test]
     fn multiple_signals_can_coexist() {
         let mut t = ExecutionTrace::default();
         t.early_terminated = true;
@@ -429,5 +475,24 @@ mod tests {
         let v = serde_json::json!([1, 2, 3, 4, 5]);
         let s = compact_args_digest(&v);
         assert!(s.contains("[5 items]"), "数组应转 [N items],实际: {s}");
+    }
+
+    #[test]
+    fn render_prompt_includes_artifacts_when_present() {
+        // 2026-09-09 第 15 轮:Write 产物需进入 QC 可见的轨迹渲染。
+        let mut t = ExecutionTrace::default();
+        t.collect_failure_signals("ok");
+        assert!(!t.render_prompt().contains("artifacts="));
+        t.artifacts.push("Write guide.md (4600B)".into());
+        let s = t.render_prompt();
+        assert!(s.contains("artifacts=[Write guide.md (4600B)]"), "实际: {s}");
+    }
+
+    #[test]
+    fn artifacts_serde_default_compatible() {
+        // 旧格式 JSON(无 artifacts 字段)反序列化应成功。
+        let v = serde_json::json!({"iterations":1,"output_bytes":10,"failure_signals":["ok"]});
+        let t: ExecutionTrace = serde_json::from_value(v).unwrap();
+        assert!(t.artifacts.is_empty());
     }
 }
