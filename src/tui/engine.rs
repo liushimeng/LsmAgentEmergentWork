@@ -199,7 +199,10 @@ pub trait Screen: Send {
 /// 进入 alternate screen + 隐藏光标。子屏生命周期内调用。
 pub fn enter_alt() -> io::Result<()> {
     terminal::enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+    // 先重置 DECSTBM 滚动区:主屏固定底部输入组件会设置滚动区,
+    // 若泄漏进 alternate screen,present() 的行尾换行会在滚动区底缘
+    // 触发滚动而非换行,破坏子屏渲染。
+    execute!(io::stdout(), ResetColor, Print("\x1b[r"), EnterAlternateScreen, Hide)?;
     Ok(())
 }
 

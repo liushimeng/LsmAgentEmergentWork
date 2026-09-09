@@ -64,6 +64,34 @@ pub const SELECTED_BUTTON_L: &str = "▶ ";
 /// 操作按钮选中态右括号。
 pub const SELECTED_BUTTON_R: &str = " ◀";
 
+/// 补全菜单选中项前景色(主屏输入组件的斜杠命令补全)。
+pub const HIGHLIGHT_FG: Color = Color::White;
+
+// ============================================================
+// 固定底部输入组件(2026-09-09 起,方案见 tmpPlan/2026-09-09_03)
+// ============================================================
+
+/// 输入行整行背景色(与输出区默认底色一眼可辨)。
+pub const INPUT_BG: Color = Color::DarkGrey;
+
+/// 输入行文字前景色。
+pub const INPUT_FG: Color = Color::White;
+
+/// 输入行提示符(`>> `)前景色。
+pub const INPUT_PROMPT_FG: Color = Color::Cyan;
+
+/// 输入行提示符属性。
+pub const INPUT_PROMPT_ATTRS: u8 = attr::BOLD;
+
+/// 输入区顶部分隔线颜色。
+pub const INPUT_BORDER_FG: Color = Color::DarkGrey;
+
+/// 输入区快捷键提示行颜色。
+pub const INPUT_HINT_FG: Color = Color::DarkGrey;
+
+/// 输入区固定高度(行):分隔线 + 输入行 + 提示行。
+pub const INPUT_AREA_HEIGHT: u16 = 3;
+
 /// 把 API Key 末 4 位脱敏展示;长度不足时退化为 `****`。
 pub fn mask_key(s: &str) -> String {
     let tail: String = if s.chars().count() >= 4 {

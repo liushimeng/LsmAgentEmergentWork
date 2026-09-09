@@ -673,6 +673,10 @@ pub async fn run() -> Result<()> {
 /// 启动 TUI 交互式 REPL;`debug=true` 时开启调试模式(对应 `laew -debug`),
 /// 每个用户任务结束后生成 Debug 报告到根目录 `DebugReport/`。
 pub async fn run_with_debug(debug: bool) -> Result<()> {
+    // TUI 视觉规范(选中态 / 主题色 / 固定底部输入组件的独立配色)依赖颜色输出;
+    // 显式覆盖 NO_COLOR 环境变量导致的 crossterm 全局禁色,保证配色可达。
+    crossterm::style::Colored::set_ansi_color_disabled(false);
+
     let mut session = TuiSession::bootstrap_with_debug(debug)?;
     session.print_banner();
     if session.debug.is_some() {
@@ -701,8 +705,17 @@ pub async fn run_with_debug(debug: bool) -> Result<()> {
                 continue;
             }
 
-            if session.handle_user_input(&line).await? {
-                break;
+            match session.handle_user_input(&line).await {
+                Ok(true) => {
+                    // /exit 退出:拆除固定底部输入组件,还原终端滚动区
+                    input::teardown_pinned();
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    input::teardown_pinned();
+                    return Err(e);
+                }
             }
         }
     } else {
