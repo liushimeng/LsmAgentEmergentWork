@@ -54,7 +54,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **SessionContext 摘要**：每个用户任务完成后 SessionContext 生成 Markdown 摘要写入 `session_memory` 表；Yolo 下次处理时自动注入最近 N 条历史摘要(默认 3),用 `<<<LAEW:SESSION_HISTORY>>>` 标记隔离。
 - **AgentProfile**：Agent 身份档案（名称 / 系统提示词 / 工具集），`work_profile()` / `yolo_profile()` 两个工厂函数。
 - **Session**：进程内会话，拥有独立 Session ID 与对话上下文（context）；TUI 启动或 `/new` `/clear` 时生成新 Session。
-- **请求头**：两协议统一携带 `User-Agent: {AgentName}/{版本} {编译时间}`、`Authorization: Bearer {api_key}`、`X-Session-Id`；Anthropic 请求体 additionally 携带 `metadata.user_id`（含 `device_id/account_uuid/session_id`）。
+- **请求头**：两协议统一携带 `User-Agent: {AgentName}/{版本} {编译时间}`、`Authorization: Bearer {api_key}`、`X-Session-Id`；Anthropic 请求体 additionally 携带 `metadata.user_id`（含 `device_id/account_uuid/session_id/agent`）。**User-Agent 按"发起请求的 Agent 角色"逐请求注入**（`Agent::run_session_inner` 从 profile 写入 `RequestMeta.user_agent`，8 角色各自携带自身名称，抓包层面可辨识；空值回退客户端构造期默认 UA）——见 `tmpPlan/2026-09-09_08` 方案。
 
 ## 架构（src/）
 
@@ -219,7 +219,24 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
     8. 跨项目综合模式与架构演进（1,324 行 / ~60 KB）—— 6 大模式×8 项目对照、统一消息模型/工具注册分离/异步优先共性、中间件链+生命周期钩子+状态机+权限策略 = 最具性价比 4 项升级
     合集见 `专题/专题-第十四轮深挖合集.md`。新增 laew gap: L636-L835（200 个）。
 
-  - **2026-09-09 第十六轮（当前最新）**：8 个工程独立 SubAgent 深度分析 + 跨项目缺口分析（**~12,000+ 行 / ~450 KB**）：
+  - **2026-09-09 第十七轮（当前最新）**：7 个工程独立 SubAgent 深度分析 + 跨项目缺口分析（**~7,000+ 行 / ~300 KB**）：
+    1. 崩溃恢复与取证（claudecode 五层防御/openclaw 5层纵深/deepseek 三层语义检查点/atomcode 看门狗 ~3,000 行）
+    2. 多租户隔离（claudecode 四层隔离/openclaw session-lifecycle/deepseek Cordis Isolate/atomcode Project Bucket ~2,000 行）
+    3. RRF 检索（deepseek FTS5+Cursor/openclaw web-search/pi fuzzyMatch/atomcode RecallTool ~1,500 行）
+    4. LLM 网关路由（openclaw Failover 16种冻结原因码/claudecode 四提供商/opencode 16+Provider/pi ProviderComposer ~2,500 行）
+    5. Pregel 图执行（deepseek Worker线程协议/openclaw session-state-events/pi Lane并发 ~1,500 行）
+    6. Skill 生命周期（openclaw 3000+行全栈/claudecode 六阶段/deepseek 注册中心/opencode 五级发现 ~2,500 行）
+    7. Agent 预热池（openclaw 80+文件/deepseek LRU/pi SessionWorkerManager ~1,500 行）
+    8. Turn 锁（openclaw Command Queue/deepseek Agent Inbox双队列/pi Lane串行化 ~1,500 行）
+    9. HTTP 客户端高级实现（openclaw SSRF+DNS钉扎/claudecode mTLS/deepseek NAT64/atomcode 连接池 ~2,000 行）
+    10. 安全加固（openclaw 14种prompt注入检测/claudecode 22层Bash/deepseek 凭证分离/atomcode Approval ~2,000 行）
+    合集见 `专题/专题-第十七轮深挖合集.md`。新增 laew gap: L1166-L1395+（230+ 个）。
+    - **P0 紧急（20 项）**：无 panic hook / 无 CrashDump / 无 graceful shutdown / 无 RRF 混合检索 / 无向量检索 / 无故障转移 / 无 Pregel 图执行 / 无 Agent 池化 / 无 Lease 机制 / 无 Prompt 注入防护 / 无沙箱隔离 / 无 API Key 加密 / 无 SSRF 防护 / 无连接池 / 无重试策略 / 无 Session 级隔离 / 无 Skill 系统 / 无错误审计 / 无 Watchdog / 无会话恢复
+    - **P1 重要（40 项）**：无 Watchdog/Repair/Restart Loop / 无数据隔离/权限隔离 / 无 FTS5/无 Snippet / 无负载均衡/无模型回退 / 无 Worker 线程协议 / 无 Skill 注册中心 / 无 LRU 缓存 / 无 Agent Inbox / 无 mTLS / 无 22 层 Bash 检测 等
+    - **P2 进阶（30+ 项）**：无 Heap Dump / 无 AsyncLocalStorage / 无 Cordis Isolate / 无 ProviderComposer / 无 PKCE / 无 Telemetry Scrub 等
+    - **推荐 Rust crate**：`human-panic`+`ctrlc` / `async-local-storage` / `rusqlite`+FTS5 / `failsafe` / `timely-dataflow` / `tree-sitter`+frontmatter / `lru` / `tokio::sync::Mutex` / `reqwest`+`hyper` / `landlock`+`seccompiler`
+
+  - **2026-09-09 第十六轮**：8 个工程独立 SubAgent 深度分析 + 跨项目缺口分析（**~12,000+ 行 / ~450 KB**）：
     1. 多轮对话恢复与压缩管线（claudecode 七阶段管线/三级恢复×2/cached MC/后台记忆提取/流式工具执行器 ~2,500 行）
     2. 内存加密与 SQLite 全栈基础设施（openclaw Secret Sentinel AES-256-GCM/12 模块 SQLite/14699 行 Hook/租约+Worker 心跳 ~3,000 行）
     3. 扩展加载与 AI 适配器（pi cache-stats/自定义 undici/jiti 加载/23 种扩展事件/OAuth 双检锁/溢出检测/重试策略 ~2,000 行）
