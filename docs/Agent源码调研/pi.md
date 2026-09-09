@@ -6761,3 +6761,114 @@ laew 当前:
 - **不重复 Server / Session 后端基础**(第 3 章)—— 本轮 22 章聚焦 binary frame / CBOR / WebSocket / SSE
 - **不重复 OAuth 基础概念**(第 12 章)—— 本轮 19 章聚焦 10 个 provider × 5 种 flow 变体的真实实现
 - **不重复 TUI 渲染模型基础**(第 8 轮 TUI 章节)—— 本轮 18 章聚焦 overlay focus restore / 16ms 节流 / OSC 11 / CURSOR_MARKER 4 个深度专题
+
+## 26. 第十八轮深挖 — 用户交互体验层 (2026-09-09)
+
+> **专题文档**：[`专题-第十八轮-pi-深度分析.md`](专题/专题-第十八轮-pi-深度分析.md)（约 690 行）
+> **本轮新增 laew gap**：**L1546-L1575**（30 个区间，本轮主线分配 18 个 + 12 个保留作 D8 重构待办）
+
+### 26.1 八维度速览
+
+| 维度 | 核心实现 | 关键文件 |
+|------|----------|---------|
+| **D1 @提及** | `CombinedAutocompleteProvider` 三层触发器合一（@/`/`/path）+ Skill 命令注入 | `tui/src/autocomplete.ts:326-345`, `interactive-mode.ts:631-728` |
+| **D2 命令/Prompt** | 23 个内建命令 + bash 风格 `${N:-default}` 替换 + 扩展同名 `name:N` 冲突解决 | `core/slash-commands.ts:19-43`, `core/prompt-templates.ts:71-90`, `extensions/runner.ts:664-683` |
+| **D3 对话回退** | `UserMessageSelectorComponent` + `TreeSelectorComponent` 5 档 FilterMode + 分支摘要 + 双层 fork（`/fork` + `/clone`）| `components/tree-selector.ts:1-1427`, `interactive-mode.ts:5144-5340` |
+| **D4 文件监视** | `node:fs` 原生 watcher + Git HEAD 三路冗余（父目录 + `watchFile` 轮询 + reftable） + 主题热重载 100ms debounce | `utils/fs-watch.ts:1-30`, `footer-data-provider.ts:290-380`, `theme.ts:825-870` |
+| **D5 富文本渲染** | `marked` + 自实现 ANSI 渲染 + Table 智能列宽 + word-level Diff inverse + 18 语言 syntax-highlight 渐进加载 + photon-node 图片 resize + Kitty/iTerm2 协议探测 | `tui/components/markdown.ts:1-1015`, `syntax-highlight.ts:1-212`, `terminal-image.ts:78-696` |
+| **D6 输入工程** | 多行 Editor + 大粘贴 marker `[paste #N +123 lines]` + bracketed paste mode `\x1b[200~` / `\x1b[201~` + tmux CSI-u 解码 + Emacs 风格 kill ring + 50+ 键位 + Ctrl+G 外部编辑器 | `tui/components/editor.ts:222-1310`, `kill-ring.ts:1-46`, `keybindings.ts:71-210` |
+| **D7 Onboarding/信任** | `FirstTimeSetupComponent` 两步向导（theme + analytics）+ `TrustSelectorComponent` 5 选项 + cwd 向上冒泡 + `proper-lockfile` 同步锁 + 7 类 trust-requiring 资源 | `components/first-time-setup.ts:1-145`, `core/trust-manager.ts:30-167` |
+| **D8 导出/statusline** | JSONL 单 branch 导出 + `pi.share` trailing entry（systemPrompt + tools）+ Radius → Gist 二级 fallback + `FooterComponent` 7 指标聚合 + cache miss 美元量化 | `core/session-export.ts:1-42`, `session-share.ts:1-206`, `components/footer.ts:1-245`, `core/cache-stats.ts:1-164` |
+
+### 26.2 关键设计巧妙点（按维度精选）
+
+**D1 — 三层触发器合一**：`CombinedAutocompleteProvider.getSuggestions` 按 `@` → `/` → path 优先级触发，每层独立的 `triggerCharacters` 让扩展可插拔。Skill 命令 `/skill:<name>` 在补全阶段显示名称，运行时 `_expandSkillCommand` 读 frontmatter 后注入完整 body，避免「补全看到 100 字符 body」UX 灾难。
+
+**D2 — 扩展同名去重**：`resolveRegisteredCommands()` 检测到多扩展注册同名时自动加 `:occurrence` 后缀；与内建冲突则通过 `getBuiltInCommandConflictDiagnostics` 写 warning 到 `ResourceDiagnostic`，用户可见而非静默覆盖。
+
+**D3 — fork vs clone 双入口分离**：`/fork` 选历史 user 消息 → 新 session 从该 entry 起（变子树）；`/clone` 在当前 leafId 复制 → 新 session（变 sessionId）；两者 UI 形态完全不同但底层共享 `runtimeHost.fork(entryId, options)`。**缺失的能力：edit message**（pi 强制「不可变历史 + 显式分支」避免 cache prefix 失效）。
+
+**D4 — Git HEAD 三路冗余**：watch HEAD 的**父目录**（inode-aware，git 原子写入） + `fs.watchFile` 1s 轮询兜底（不可靠 fs.watch 平台） + reftable 目录监听覆盖 Git 新引用表。5s watcher 重试处理 EMFILE（fd 耗尽）瞬时错误。
+
+**D5 — Table 智能列宽三档退避**：natural fit → 比例缩 → 按权重分配 → 太窄退化原文；保证任意终端宽度下都不会破坏 layout。Word-level Diff `inverse()` 标记具体改了哪个词，避免用户盯着整行找差异。
+
+**D6 — Paste marker 而非粘贴原文**：>10 行粘贴只插入 `[paste #N +123 lines]`，提交时一次性注入原文——避免编辑器被 1000 行淹没、避免 undo stack 膨胀。**Bracketed paste 完整 CSI-u 解码**：tmux popups 把 `\n` 转成 `\x1b[106;5u`（CSI-u Ctrl+J），Editor 主动解码回字面 `\n`。
+
+**D7 — cwd 向上冒泡**：子项目 trust 自动继承父项目，子项目 untrust 不影响父项目——适配 monorepo。`proper-lockfile` 同步锁防多 pi 实例 race condition（同一用户开多个窗口）。
+
+**D8 — Cache miss 量化到美元**：`missedCost = missedTokens × (paidRate - readRate)`，让用户看到「这个 idle gap 让你多付了 $0.012」。**Statusline 7 指标聚合**：输入/输出/cache read/cache write/cache hit 率/费用/上下文%，单行展示不打断用户。
+
+### 26.3 本轮 laew gap 汇总（L1546-L1575，30 个区间）
+
+| 编号 | 维度 | 描述 | P | Rust crate |
+|------|------|------|---|------------|
+| **L1546** | D1 @提及 | 无 `@file` 提及系统 | P1 | `fuzzy-matcher` + `walkdir` + `nucleo-matcher` |
+| **L1547** | D1 @提及 | 无 Skill 命令注入 | P1 | 与 L1546 一起在 `tui/autocomplete.rs` 实现 |
+| **L1548** | D2 命令 | 无 prompt template 系统 | P1 | `serde_yaml` + 自实现 `substitute_args()` |
+| **L1549** | D2 命令 | 斜杠命令为硬编码 if/else，无运行时动态注册 | P1 | `inventory` + `linkme` |
+| **L1550** | D2 命令 | 无命令源 description 标签 | P2 | `SourceTag` enum |
+| **L1551** | D2 命令 | 无内建命令冲突诊断 | P2 | 启动时扫描 + DebugReport |
+| **L1552** | D3 对话回退 | 无会话树 / fork 能力 | P1 | `rusqlite` + `TreeSelectorComponent` ratatui 实现 |
+| **L1553** | D3 对话回退 | 无 `/fork` 从历史消息分叉 | P1 | 与 L1552 一起 |
+| **L1554** | D3 对话回退 | 无 `/clone` 当前 leaf 复制 | P2 | 与 L1552 一起 |
+| **L1555** | D3 对话回退 | 无 5 档 FilterMode | P2 | 与 L1552 一起 |
+| **L1556** | D3 对话回退 | 无分支摘要 | P1 | 与 L1552 + L1039 联动 |
+| **L1557** | D3 对话回退 | 无 entry label 书签 | P2 | SQLite `entry_labels` 表 |
+| **L1558** | D3 对话回退 | 无 entry 复制转剪贴板 | P2 | `arboard` |
+| **L1559** | D4 文件监视 | 无工作区文件监视 + 自动索引失效 | P1 | `notify` v6 + `debounce` 500ms |
+| **L1560** | D4 文件监视 | 无 git HEAD 三路冗余监听 | P2 | `notify` + `tokio::sync::Mutex` |
+| **L1561** | D4 文件监视 | 无主题文件热重载 | P2 | `notify` + 100ms debounce |
+| **L1562** | D4 文件监视 | 无 stale-timer 防护 | P2 | `theme_name` 校验 + clearTimeout |
+| **L1563** | D5 富文本 | 无 Markdown 渲染 | P1 | `pulldown-cmark` + 自实现 ANSI 渲染 |
+| **L1564** | D5 富文本 | 无 Table 智能列宽 | P2 | 与 L1563 一起 |
+| **L1565** | D5 富文本 | 无语法高亮 | P2 | `syntect` 或 `tree-sitter-highlight` |
+| **L1566** | D5 富文本 | 无 word-level Diff 渲染 | P2 | `similar` + inverse |
+| **L1567** | D5 富文本 | 无内联图片渲染 | P2 | `image` crate + base64 + ANSI 转义 |
+| **L1568** | D5 富文本 | 无图片 resize 上限 | P2 | `image::imageops::resize(Lanczos3)` |
+| **L1569** | D5 富文本 | 无工具自定义渲染接口 | P1 | `Tool` trait 加 `render_call`/`render_result` |
+| **L1570** | D6 输入 | 无 kill ring | P2 | 自实现 `KillRing` + emacs 风格键位 |
+| **L1571** | D6 输入 | 无 undo stack | P2 | 自实现 `UndoStack<T>` |
+| **L1572** | D6 输入 | 无 prompt history 持久化 | P2 | `~/.config/laew/history.txt` |
+| **L1573** | D6 输入 | 无大粘贴截断 | P1 | 自实现 `paste_marker.rs` |
+| **L1574** | D6 输入 | 无外部编辑器钩子 | P2 | `std::process::Command` + `tempfile` |
+| **L1575** | D7 信任 | 无 project trust 5 档 UI + cwd 冒泡 | P1 | 自实现 `TrustSelectorComponent` + SQLite `trust` 表 |
+
+**汇总**：
+- **18 个本轮主线 gap**（L1546-L1575 区间内分配）+ **12 个保留作 D8 重构待办**（L1576-L1587，超本轮区间）
+- **P1 重要（12 项）**：L1546/L1547/L1548/L1549/L1552/L1553/L1556/L1559/L1563/L1569/L1573/L1575
+- **P2 进阶（18 项）**：L1550/L1551/L1554/L1555/L1557/L1558/L1560/L1561/L1562/L1564/L1565/L1566/L1567/L1568/L1570/L1571/L1572/L1574
+
+### 26.4 推荐优先实施清单
+
+按「P1 投入产出比」排序：
+
+1. **L1573 大粘贴截断**（~100 行）—— 单文件即可，性价比最高
+2. **L1548 prompt template 系统**（~300 行 + `serde_yaml`）—— 让用户写 `/commit-message` 等自定义命令
+3. **L1546 + L1547 @ 提及 + Skill 命令注入**（~500 行 + `nucleo-matcher`）—— 提升补全体验
+4. **L1559 工作区文件监视**（~200 行 + `notify`）—— 触发 cache 失效、git status 自动更新
+5. **L1575 project trust 5 档 UI**（~400 行 + SQLite）—— 解决第三方项目目录执行扩展的信任问题
+6. **L1552 + L1553 + L1556 会话树 + fork + 分支摘要**（~600 行 + SQLite）—— laew 缺的核心会话能力
+7. **L1563 Markdown 渲染**（~800 行 + `pulldown-cmark`）—— 工具输出可读性大幅提升
+
+### 26.5 关键文件路径汇总
+
+| 维度 | 关键文件路径 |
+|------|------------|
+| D1 @ 提及 | `packages/tui/src/autocomplete.ts:326-345`, `interactive-mode.ts:631-728` |
+| D2 命令 | `packages/coding-agent/src/core/slash-commands.ts:19-43`, `extensions/runner.ts:664-683` |
+| D3 对话回退 | `components/user-message-selector.ts:1-155`, `tree-selector.ts:1-1427`, `interactive-mode.ts:5144-5340` |
+| D4 文件监视 | `utils/fs-watch.ts:1-30`, `footer-data-provider.ts:290-380`, `theme.ts:825-870` |
+| D5 富文本 | `tui/components/markdown.ts:236-1015`, `syntax-highlight.ts:1-212`, `terminal-image.ts:78-696` |
+| D6 输入 | `tui/components/editor.ts:222-1310`, `kill-ring.ts:1-46`, `keybindings.ts:71-210` |
+| D7 信任/Onboarding | `components/first-time-setup.ts:1-145`, `core/trust-manager.ts:30-167` |
+| D8 导出/statusline | `core/session-export.ts:1-42`, `session-share.ts:1-206`, `cache-stats.ts:1-164`, `footer.ts:1-245` |
+
+### 26.6 本轮不重复声明
+
+严格不重复前 17 轮已覆盖内容：
+
+- **不重复 Lane 三态 / reduceLaneState / 14 种损坏检测 / WriterLease fence**（第 6 / 8 轮）
+- **不重复 Session 持久化 JSONL 基础**（第 8 轮）—— 本轮 D8 仅聚焦 export/share trailing entry + cache miss
+- **不重复 Skill 系统 / Cordis Epoch**（第 6 / 16 轮）—— 本轮 D1/D2 仅聚焦 `/skill:<name>` 触发
+- **不重复 TUI 渲染模型基础**（第 8 轮）—— 本轮 D5 仅聚焦 markdown/table/diff/image
+- **不重复 Telemetry / OTLP / OAuth**（第 16 轮）

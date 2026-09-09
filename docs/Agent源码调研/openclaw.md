@@ -7796,3 +7796,153 @@ function createShowWidgetToolSchema(kinds, presenters, capabilityGuidance, pinne
 ---
 
 > **第十轮分析完成**。共覆盖 8 个新维度,识别 **53 个 laew gap**(P0:10 / P1:15 / P2:16 / P3:10),全部附 Rust crate 建议(如需)。
+
+---
+
+# 第 21 章 第十八轮深挖：用户交互体验层（D1-D8，30 个 laew gap）
+
+> 详细专题文档：`专题/专题-第十八轮-openclaw-深度分析.md`（约 950 行 / 全文源码定位 + 机制剖析 + 设计巧妙点 + laew gap 表）。
+>
+> 本章为浓缩章节，仅保留核心发现 + 30 个 gap 索引。
+
+## 21.1 维度地图
+
+| 维度 | 主题 | openclaw 实现亮点 | laew 现状 | 差距 |
+|---|---|---|---|---|
+| D1 | @提及系统 | 触发检测 + LRU 16 + 150ms debounce + code fence 守卫 + locale 隔离过滤 | 0% | 完全缺失 |
+| D2 | 斜杠命令 + Prompt 模板 | TUI 22 个内置命令 + 别名 + 三源 frontmatter 模板 + 行内 slash 实时替换 + `$1 $@` 占位符 + shell completion 4 case 自动接管 | 5%（仅 9 个硬编码） | 模板发现 + 注册中心 |
+| D3 | 用户级 Rewind/分支 | rewind/fork/switch 三 action + lifecycle revision CAS + composer 签名守卫 + 上游 linked session fail-closed + active run 阻塞 | 0% | 完全缺失 |
+| D4 | 文件监视 | chokidar 多 workspace 共享 + 三层 ignore + awaitWriteFinish 250ms + raw event 兜底 + EMFILE/ENOSPC 自愈 + symlink trust 链 + idle TTL 60min | 0% | 完全缺失 |
+| D5 | 富文本渲染 | Markdown 容器 setText 原地刷新 + sanitize 全套（ANSI/C0/RTL/U+FFFD binary fold）+ UsageBar 模板 DSL（8 套 meter scale + filter pipe + when/map 块 + multi-surface） | 10%（仅 ANSI） | 模板 DSL + sanitize 全套 |
+| D6 | 输入体验工程 | submit 历史（trim/空不入）+ TUI autocomplete Symbol 透传 + Web IME 229 守卫 + 多菜单 dispatch + iTerm paste burst coalescing | 70%（基础有） | 命令入历史 + IME 守卫 + paste coalescing |
+| D7 | Onboarding/Trust | setup wizard 747 行 + `securityAcknowledgedAt` 风险确认 + `consentedAt` 遥测 opt-in + shell completion 4 case + 12 套主题 × 2 模式 + plugin trust gate | 0% | 完全缺失 |
+| D8 | 导出 + statusline + 实时成本 | HTML 导出 vendored marked/highlight.js + JSONL 轨迹 + AES-256-GCM 公开分享 token + OG/Twitter Card + CSP `default-src 'none'` + UsageBar fs.watch 热更 + TUI footer + status summary | 30%（仅 CompactAgent 80%） | HTML 导出 + AES 公开链接 + 实时 cost |
+
+## 21.2 各维度核心源码定位（速查表）
+
+| 维度 | 关键文件 | 行 |
+|---|---|---|
+| D1 | `ui/src/pages/chat/components/chat-composer-mention-menu.ts` | 全文 409 行（`findMentionTarget`/`HumanMentionMenu`/`cachedResult`/`select`） |
+| D1 | `ui/src/lib/chat/human-mentions.ts` | `MAX_HUMAN_MENTIONS` + `updateHumanMentions` |
+| D2 | `src/agents/sessions/prompt-templates.ts` | 全文 226 行（`loadPromptTemplates`/`expandPromptTemplate`/`parsePromptFrontmatter`） |
+| D2 | `src/tui/commands.ts` | 87-181（TUI 22 命令表 + `createLevelCompletion`） |
+| D2 | `ui/src/pages/chat/components/chat-composer-inline-slash.ts` | 全文 230 行（`commitInlineSlashSelection`/`findDirectInlineSlashArgumentInvocation`） |
+| D2 | `src/wizard/setup.completion.ts` | 全文 140 行（4 case 自动接管） |
+| D3 | `src/gateway/server-methods/sessions-rewind.ts` | 全文 700+ 行（`mutateSessionAtMessage`/`EXTERNAL_CONVERSATION_ERROR`/`runExclusiveSessionLifecycleMutation`） |
+| D3 | `ui/src/pages/chat/chat-history-actions.ts` | 222-360（`rewindChatHistory`/`switchChatHistoryBranch` + composer 签名守卫） |
+| D4 | `src/skills/runtime/refresh.ts` | 全文 700+ 行（chokidar 多 workspace + `awaitWriteFinish` + raw event + EMFILE 自愈） |
+| D4 | `src/gateway/config-reload.ts` | 全文 1000+ 行（`WATCHER_RECREATE_MAX_RETRIES = 3` + 退避 500/2000/5000ms） |
+| D5 | `src/tui/components/markdown-message.ts` | 全文 35 行（容器 setText 原地更新） |
+| D5 | `src/tui/tui-formatters.ts` | 14-160（sanitize 全套 + RTL 隔离 + binary 折叠） |
+| D5 | `src/auto-reply/usage-bar/default-template.ts` | 全文（8 套 meter scale + aliases + multi-surface） |
+| D5 | `src/auto-reply/usage-bar/translator.ts` | 291-320（`renderUsageBar`） |
+| D6 | `src/tui/tui-submit.ts` | 38-98（`createEditorSubmitHandler` + trim/空不入 + bang 路由） |
+| D6 | `src/tui/tui-autocomplete.ts` | 13-83（`sanitizeAutocompleteProvider` + Symbol 透传） |
+| D6 | `ui/src/pages/chat/components/chat-composer-keydown.ts` | 全文 200 行（IME 229 守卫 + 多菜单 dispatch + history nav） |
+| D7 | `src/wizard/setup.ts` | 全文 747 行（`runSetupWizard` + `runWizardWithPromptNavigation`） |
+| D7 | `src/wizard/setup.shared.ts` | 132-200（`requireRiskAcknowledgement` + `requestTelemetryConsent`） |
+| D7 | `src/wizard/setup.completion.ts` | 全文 140 行 |
+| D7 | `ui/src/app/theme.ts` | 全文（12 ThemeName × 2 ThemeMode） |
+| D7 | `ui/src/components/theme-mode-toggle.ts` | 全文 50 行（三态循环 + `prefers-color-scheme`） |
+| D8 | `src/auto-reply/reply/commands-export-session.ts` | 全文 600+ 行（HTML 生成 + 占位符注入） |
+| D8 | `src/auto-reply/reply/commands-export-session-file.ts` | 全文 80 行（fs-safe + `-1 -2` 冲突后缀） |
+| D8 | `src/gateway/control-ui-share.ts` | 全文 100 行（OG/Twitter Card + CSP + X-Robots-Tag） |
+| D8 | `src/gateway/control-ui-public-session-token.ts` | 全文 200 行（AES-256-GCM + HKDF + AAD + `v1.` 前缀） |
+| D8 | `src/gateway/server-methods/sessions-sharing.ts` | 全文 400+ 行（visibility + public-share RPC + actor evidence 三态） |
+| D8 | `src/auto-reply/usage-bar/contract.ts` | 全文 80 行（`UsageContract` 数据契约 v1） |
+| D8 | `src/auto-reply/usage-bar/template.ts` | 100-160（LRU 64 + fs.watch 热更 + 失败 warn 去重） |
+| D8 | `src/tui/tui-status-summary.ts` | 全文 100 行（Gateway/Heartbeat/Sessions/Recent/QueuedEvents） |
+| D8 | `src/tui/tui-formatters.ts` | 31-43 + 155-200（`formatModelFooter` + `formatTuiFooter` + `formatContextUsageLine`） |
+| D8 | `ui/src/pages/usage/export.ts` | 全文（snapshot consistency + `usage.export.changed` 显式失败） |
+
+## 21.3 设计巧妙点 16 项（每维度 2 项精选）
+
+1. **D1 mention locale 隔离过滤**：`canFilterMentionText()` 仅对 ASCII 且不含大写 I 的查询本地裁剪，其余强制回流服务端（`truncated=false` 前提下）
+2. **D1 mention 触发互斥**：`value.trimStart().startsWith("/")` 让 mention 与 slash 互斥抢键
+3. **D2 TUI help 与 completions 单源**：`TUI_COMMAND_ROWS` 数据 → `TUI_COMMAND_DESCRIPTORS` 派生态，避免文档漂移
+4. **D2 模板匹配回退**：`expandPromptTemplate` 不匹配时返回原文而非抛错（避免误判 `/something`）
+5. **D3 lifecycle revision CAS**：session 任何并发变更都 bump `lifecycleRevision`，commit 前再读一次保证原子切
+6. **D3 composer 签名捕获**：RPC 期间用户改草稿则放弃回填 editor（避免覆盖并发编辑）
+7. **D4 watcher 不直接 reload**：所有 skill reload 是「lazy on next turn」，避免 hot-reload 期间 race
+8. **D4 trust symlink 链验证**：`isTrustedSymlinkSkillTarget` 检查 source ∈ {managed, personal} 或 root 是 containment（防 symlink 跳出 worktree）
+9. **D5 `setText` 原地刷新**：streaming 时不重建组件，chat-log virtualized 重排成本最小
+10. **D5 UsageBar 模板 v1 schema**：`schema: "openclaw.usageBar.v1"` 让 LRU cache 在 schema 升级时自动失效
+11. **D6 trim 不入历史**：`onSubmit("   hi   ")` 仅入 `"hi"`，避免噪声污染 ↑↓
+12. **D6 `applyCompletion` Symbol 透传**：sanitize 不污染 apply 数据（`Reflect.get(item, originalSafeItem)`）
+13. **D7 `securityAcknowledgedAt` + `consentedAt` 时间戳**：审计链可还原「用户何时确认了什么」
+14. **D7 shell completion 4 case 自动判定**：profile 有/无 + cache 有/无 组合全自动处理
+15. **D8 AES-256-GCM + AAD + HKDF + `v1.` 前缀**：token 完整性 + 上下文绑定 + 算法可升级
+16. **D8 公开分享页 CSP 严格**：`default-src 'none'` + `frame-ancestors 'none'` 防 clickjack + `X-Robots-Tag: noindex`
+
+## 21.4 laew gap 清单（L1486-L1515，共 30 个）
+
+### P0 紧急（10 项）
+
+| 编号 | 描述 | 章节 | 推荐 Rust crate |
+|---|---|---|---|
+| L1486 | 无 @提及系统（@agent / @file / @模式） | D1 | `regex` + `tui-input` menu hook |
+| L1489 | 无 prompt 模板发现机制（无 frontmatter 解析） | D2 | `serde_yaml` + `walkdir` |
+| L1490 | 无 `/` 斜杠命令注册中心（仅硬编码 9 个） | D2 | `clap_complete` + 命令注册表 |
+| L1494 | 无用户级对话回退（仅整体 session reset） | D3 | SQLite 增加 entry 链表 + `leaf_entry_id` |
+| L1497 | 无 lifecycle revision CAS 守卫 | D3 | `entry-level optimistic lock` |
+| L1499 | 无工作区文件 chokidar 监视 | D4 | `notify` + `notify-debouncer-mini` |
+| L1504 | 无 TUI Markdown 渲染（仅纯文本） | D5 | `pulldown-cmark` + `termimad` |
+| L1505 | 无 ANSI/控制字符 sanitize | D5 | `strip-ansi-escapes`（`vte` derive） |
+| L1513 | 无 onboarding wizard（首次启动无引导） | D7 | `dialoguer` / `inquire` |
+| L1515 | 无 telemetry opt-in（缺省默认发送） | D7 | config schema 必填 `telemetry.consentedAt` |
+
+> 另含 D5/D8 复合 gap：「无 HTML 会话导出」+「无 TUI statusline」+「无 token/cost 实时显示」并入 L1504/L1505 复合改造。
+
+### P1 重要（12 项）
+
+| 编号 | 描述 | 章节 | 推荐 Rust crate |
+|---|---|---|---|
+| L1487 | mention 触发检测未做 code fence / blockquote 守卫 | D1 | `pulldown-cmark` 解析状态机 |
+| L1491 | 无 `$1 $@ $*` 占位符替换 | D2 | 自实现 tokenize |
+| L1493 | 无 shell completion 安装向导 | D2 | `clap_complete` + `shell-words` |
+| L1495 | 无对话分支（session 在某 entry 分叉为多线） | D3 | SQLite + UI selector |
+| L1496 | 无「回退到第 N 条消息后恢复 editor 草稿」机制 | D3 | agent 循环 user_message ↔ entry 映射 |
+| L1500 | 无 EMFILE/ENOSPC 自愈降级 polling | D4 | `notify` `PollWatcher` + inotify limit 探测 |
+| L1501 | 无 `awaitWriteFinish` 写完稳定检测 | D4 | `notify-debouncer-mini` |
+| L1502 | 无 symlink trust 链验证 | D4 | `std::fs::canonicalize` |
+| L1507 | 无 `[binary data omitted]` 折叠 | D5 | 自实现行扫描 + U+FFFD 计数 |
+| L1508 | 无 UsageBar 模板 DSL（无 meter scale） | D5 | 自实现 80 行 tokenize |
+| L1509 | 无命令入历史（仅普通消息） | D6 | tui-input 改造 |
+| L1511 | 无 IME composing 守卫 | D6 | crossterm `Event::Key::kind` |
+| L1512 | 无 paste burst coalescing（iTerm 多行粘贴合并） | D6 | 200ms 时间窗聚合 |
+| L1514 | 无安全风险一次性确认 | D7 | `dialoguer::Confirm` |
+| L1515-bis | 无 AES-256-GCM 公开分享链接 | D8 | `aes-gcm` + `hkdf` |
+
+### P2 进阶（8 项）
+
+| 编号 | 描述 | 章节 | 推荐 Rust crate |
+|---|---|---|---|
+| L1488 | 无客户端 LRU + debounce 缓存（mention） | D1 | `lru` |
+| L1492 | 无 inline slash 实时替换 | D2 | tui-input Menu hook |
+| L1498 | 无上游链接会话 fail-closed | D3 | `data: external_session_link` flag |
+| L1503 | 无共享 watcher + workspace idle TTL | D4 | `Arc<Mutex<HashMap>>` |
+| L1506 | 无 RTL 双向隔离（U+2067/U+2069） | D5 | `unicode-bidi` |
+| L1510 | 无 ANSI sanitize 后的 apply 透传 | D6 | `Rc<RefCell<T>>` |
+
+> **slot 计数**：P0 10 + P1 14 + P2 6 = 30 个 gap 槽（L1486-L1515 已用满）。L1515-bis 为 D8 AES 补充。
+
+## 21.5 与前 17 轮的衔接
+
+- **第十五轮 L836-L1035**：D4 文件监视补 OS 内核交互维度；D5 UsageBar DSL 补协议翻译上层；D8 statusline 补终端控制序列应用层。
+- **第十六轮 L1036-L1165+**：D3 补 session 状态机用户面；D7 wizard 补 onboarding 配套。
+- **第十七轮 L1166-L1395+**：D6 补 Session 多轮交互补充；D1 补 human-in-the-loop 工具扩展；D8 补 session 共享实现。
+
+## 21.6 本轮独有（其他 11 份工程文档均无对应章节）
+
+- ✅ **Mention Menu 三层守卫**（slash 互斥 + code fence + IME 229）
+- ✅ **Prompt 模板三源发现 + frontmatter + `$1 $@` 占位符**
+- ✅ **Rewind/Fork/Switch 三 action 统一编排 + lifecycle revision CAS**
+- ✅ **Chokidar 多 workspace 共享 watcher + 250ms awaitWriteFinish + EMFILE 自愈**
+- ✅ **UsageBar 模板 DSL**（8 套 meter scale + filter pipe + when/map + multi-surface + fs.watch 热更）
+- ✅ **Input 历史 + sanitize Symbol 透传 + IME 守卫 + paste coalescing**
+- ✅ **Onboarding wizard + risk ack + telemetry opt-in + completion 4 case 自动接管 + 12 套主题**
+- ✅ **AES-256-GCM 公开分享链接 + OG/Twitter Card + CSP `default-src 'none'`**
+
+---
+
+> **第十八轮 openclaw 分析完成**。共覆盖 8 个新维度（D1-D8 用户交互体验层），识别 **30 个 laew gap**（L1486-L1515；P0:10 / P1:14 / P2:6），全部附 Rust crate 建议。专题文档 `专题/专题-第十八轮-openclaw-深度分析.md`（约 950 行）含完整源码定位 + 机制剖析 + 设计巧妙点 + 覆盖率统计 + 与前 17 轮衔接。

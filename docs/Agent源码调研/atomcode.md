@@ -7219,3 +7219,149 @@ if error.is_snapshot_conflict() {
 - **Redis 集成**:CodingPlan provider list 缓存层
 - **gRPC / protobuf**:与外部系统集成
 - **FUSE / OverlayFS**:用户态文件系统挂载,实现"AI 只能改特定目录"的强沙箱
+
+---
+
+## 第 24 章 第十八轮深挖:用户交互体验层(D1-D8)
+
+> 调研日期:2026-09-09 / 工程:atomcode v5.0.9(Rust)/ 本轮主题:在前 17 轮基础设施层深挖后,聚焦「用户每天都会感受到的 UI/UX 工程」——@提及补全、命令模板、对话回退、文件监视、富文本渲染、输入框、首次运行、状态展示。
+>
+> 完整专题(含每章「源码定位表格 + 机制剖析 + 设计巧妙点 + laew gap 表 + 代码片段」)见 `专题/专题-第十八轮-atomcode-深度分析.md`(约 600 行)。
+
+### 24.1 速览:D1-D8 八维度覆盖矩阵
+
+| 维度 | atomcode 状态 | 关键文件 | 行数 | 一句话总结 |
+|---|---|---|---|---|
+| **D1 @提及系统** | 已实现(完整) | `crates/atomcode-capabilities/src/file_index.rs` + `crates/atomcode-tuix/src/event_loop/file_index.rs`(shim) | ~150 + ~5 | 4 条 token 规则 + TUI/webui 共享 walk engine + 流式阶段守卫 |
+| **D2 自定义斜杠命令** | 已实现(598 行) | `crates/atomcode-tuix/src/custom_commands.rs` | 598 | YAML frontmatter + 三态 ArgsRequirement + `${ARGUMENTS}` 递归防御 + 三层优先级 |
+| **D3 对话 Rewind** | 已实现(404 行 modal + RewindCatalog) | `crates/atomcode-tuix/src/modals/rewind.rs` + `crates/atomcode-coding/src/runtime.rs` | 404 + ~250 | Generation Fencing + 两阶段 picker(Target/Scope)+ RewindTransactionGuard 所有权 token |
+| **D4 文件监视** | **未实现(主动放弃)** | 仅 `tokio::sync::watch`(runtime 状态,非文件监视) | — | 全 workspace Cargo.toml 零 `notify`/`inotify` 依赖;采用 lazy refresh 而非 hot watcher |
+| **D5 富文本渲染** | 已实现(逆向工程决策) | `crates/atomcode-tuix/src/highlight/mod.rs` + `render/theme.rs` + `render/diff.rs` + `modals/diff_viewer.rs` | 50 + ~150 + ~50 + 539 | **主动放弃** syntect(selection overlay 复合消失) + **主动放弃** truecolor(light 主题消失) + DiffViewer 三阶段 |
+| **D6 输入体验工程** | 已实现(编辑器级细节) | `crates/atomcode-tuix/src/input/{key_action,reader,history,mod}.rs` | 80 + ~120 + ~80 + ~50 | 15ms paste-burst coalescing + `^H`/`^?` 归一化 + HistoryEntry 三元组(text+images+pastes) |
+| **D7 Onboarding/主题** | 已实现(2336 行 wizard) | `crates/atomcode-tuix/src/modals/onboarding_wizard.rs` + `render/welcome_tips.rs` | 2336 + ~50 | 3+1 步骤状态机 + ASCII box fallback + 15 条 hand-curated 提示池 |
+| **D8 导出/statusline/成本** | 已实现(完整) | `crates/atomcode-tuix/src/event_loop/commands.rs` + `event_loop/usage_monitor.rs` + `modals/usage.rs` | ~250(export)+ ~140(monitor)+ 1338 | `/save` 五态防御(含 RefuseOverwrite)+ `/cost` local + `/usage` remote + 5 级 hint 优先级链 |
+
+### 24.2 关键工程决策(三大逆向 + 一大放弃)
+
+**逆向决策 1:放弃 `syntect` 语法高亮**(`highlight/mod.rs:1-25`)
+- 原因:Mac Terminal.app 默认「Basic」profile 的 selection overlay 是半透明灰色,与 syntect 的 tint color 复合后亮度差异消失——**选中代码块时所有 token 都不可见**
+- 方案:彻底放弃 per-token 着色,改用默认 fg(让 terminal 用 high-contrast counterpart 显示)
+- 与 opencode 同款选择(注释明确交叉引用)
+
+**逆向决策 2:放弃 truecolor RGB**(`render/theme.rs:1-40`)
+- 原因:truecolor 在所有终端上渲染相同像素,与终端主题无关——在 Mac Terminal light 主题上,lavender/mint/gray 都消失在浅色背景里
+- 方案:用 SGR 30-37/90-97(1996 ECMA-48 基础),让每个 terminal 的 theme engine 自动 remap
+- 明确避开 `\x1b[2m`(dim),因 Windows conhost < 1809 不可靠
+
+**逆向决策 3:`/save` 的 RefuseOverwrite 五态防御**(`event_loop/commands.rs:6090-6260`)
+- `SaveOutcome::{Ok, EmptyHistory, IoError, InvalidPath, RefuseOverwrite}`
+- 拒绝覆盖非 `.md` 文件(防御 `/save config.py` typo 覆盖源码)
+- 注释明确列出高危文件名:`config.py` / `.bashrc` / bare `notes`
+
+**主动放弃:D4 文件监视**
+- 全 workspace `Cargo.toml` 零 `notify`/`inotify`/`RecommendedWatcher` 依赖
+- 源码中所有 `watch` 都是 `tokio::sync::watch`(runtime 状态 channel,非文件监视)
+- 设计哲学:**lazy refresh 优于 hot refresh**(避免后台 watcher 的资源成本与事件风暴)
+- 代价:workspace 变化不会自动 invalidate `@`-mention 缓存
+- laew 如需「实时 workspace 感知」应参考 claude-code/opencode,**不要参考 atomcode**
+
+### 24.3 第十八轮 gap 汇总(19 个,落在 L1396-L1414)
+
+| L 编号 | 维度 | 描述 | 优先级 | 推荐 Rust crate |
+|---|---|---|---|---|
+| L1396 | D1 | laew 无 `@`-mention 弹窗 | P1 | `walkdir` + 自研 detector |
+| L1397 | D1 | laew 的 TUI 补全与 webui 后端会双实现 drift | P2 | 共享同一 crate 解析 |
+| L1398 | D2 | laew 无自定义斜杠命令系统 | P1 | `serde_yaml` + `directories` |
+| L1399 | D2 | laew 的 `/help` 是硬编码字符串,无 frontmatter 描述解析 | P1 | 同上 |
+| L1400 | D3 | laew 无 `/rewind` 检查点回退系统 | P1 | `gix` shadow git + `rusqlite` 持久化 catalog |
+| L1401 | D5 | laew 无 DiffViewer(无独立 modal 渲染 git diff) | P1 | 参考 atomcode `git_diff` + `render/diff.rs` |
+| L1402 | D5 | laew 无 CJK box diagram 修复(用户贴 box 时右漂) | P2 | `unicode-width`(已用)+ 自研 detector |
+| L1403 | D6 | laew 输入框无 paste-burst coalescing(大 paste 会卡) | P1 | 参考 atomcode `input/reader.rs` 实现 15ms 阈值 |
+| L1404 | D6 | laew 无 `^H`/`^?` 归一化(SSH 用户 Backspace 不工作) | P1 | `crossterm` KeyCode 处理 |
+| L1405 | D6 | laew 无 HistoryEntry 图片/paste 反向 hydrate | P2 | `serde_json` + 自研 schema |
+| L1406 | D7 | laew 无 onboarding wizard(首次运行直接进 TUI) | P2 | 参考 atomcode 2336 行实现 |
+| L1407 | D7 | laew 无 ASCII box fallback(Windows conhost / LANG=C 会错位) | P2 | `unicode-width` + 终端能力探测 |
+| L1408 | D7 | laew 无「欢迎提示池」hand-curated tip 轮播 | P3 | 简单 const 数组即可 |
+| L1409 | D7 | laew 无主题偏好持久化(默认 ANSI 16 色) | P3 | `directories` + serde_json |
+| L1410 | D8 | laew 无 `/save` 会话导出 markdown | P1 | `chrono` + `serde_json` |
+| L1411 | D8 | laew 无 `/cost` local token accounting | P1 | 累积 session token 即可 |
+| L1412 | D8 | laew 无 token-usage statusline hint(80%/95% 阈值) | P1 | 简单 `Arc<Mutex<Option<UsageInfo>>>` slot |
+| L1413 | D8 | laew 无 5 级 hint 优先级链 | P2 | 自研 `build_status` 函数 |
+| L1414 | D8 | laew 无 `/usage` 远程 quota 拉取 | P2 | reqwest + 30s cooldown |
+
+**gap 区间**:L1396-L1414(共 19 个,落在 L1396-L1425 区间前段;剩余 L1415-L1425 留给后续轮次)。
+
+### 24.4 借鉴路线图(按 ROI 排序)
+
+**P0 紧急**:本轮无(用户交互层差距主要是「用户体验」非「数据丢失」类硬伤)。
+
+**P1 一个月内**(7 项):
+- L1396 @-mention 弹窗(补全 `/` 之外的直接引用文件 UX)
+- L1398 自定义斜杠命令(团队 commit `.atomcode/commands/*.md` 共享 prompt)
+- L1400 `/rewind`(用户级对话回退,错误修复的安全网)
+- L1401 DiffViewer(modal 内 review git diff)
+- L1403 paste-burst coalescing + L1404 `^H` 归一化(基础输入体验)
+- L1410 `/save` + L1411 `/cost` + L1412 token hint(导出与成本可见性)
+
+**P2 三个月内**(7 项):
+- L1397 / L1402 / L1405 / L1406 / L1407 / L1413 / L1414
+
+**P3 长期**(2 项):
+- L1408 / L1409
+
+### 24.5 第十八轮关键洞察(5 条)
+
+1. **D4 主动放弃文件监视**:lazy refresh 优于 hot refresh,代价是「实时感知」缺失。laew 如需 workspace 变化感知应参考 claude-code/opencode,而**非 atomcode**。
+
+2. **D5 三大逆向决策都基于具体事故**:放弃 syntect(Mac Terminal.app selection overlay)、放弃 truecolor(Mac Terminal light 主题)、RefuseOverwrite(`/save config.py` typo)——每一个「主动放弃 feature」决策都用真实生产事故做依据,且注释清晰可重现。
+
+3. **D6 输入体验的「事故驱动细节」**:15ms paste-burst 阈值(防 chunked paste 显示成多行)、`^H`/`^?` 归一化(防 SSH Backspace 变成 `h`)、HistoryEntry 三元组(防 paste 召回丢失 #843)——三个细节每个都对应真实事故,**这种「事故驱动的细节」是工程化深度的标志**。
+
+4. **D8 hint 优先级链**是少见的「多源 hint 融合」设计:把运行时诊断 / 用户成本 / 产品升级三个不同来源的 hint 用单一优先级链排序,让最关键的诊断永远不被无关消息覆盖——可移植到 laew 的 status row。
+
+5. **D3 RewindTransactionGuard 所有权 token**是 saga 模式的 Rust 变体:用类型系统把「commit-or-compensate」二选一固化为 API 边界——这是非常值得借鉴的并发设计,可直接用于 laew 的 Plan/MainWork/SubAgent 三档执行回退。
+
+### 24.6 关键文件路径清单
+
+**D1 @提及系统**:
+- `crates/atomcode-capabilities/src/file_index.rs` — `@`-mention 探测 + walk engine
+- `crates/atomcode-tuix/src/event_loop/file_index.rs` — shim
+- `crates/atomcode-tuix/src/render/mod.rs:486-562` — `MenuKind::AtMention` 菜单
+- `crates/atomcode-tuix/src/event_loop/mod.rs:6616-6660` — 流式阶段守卫
+
+**D2 自定义命令**:
+- `crates/atomcode-tuix/src/custom_commands.rs`(598 行)
+
+**D3 对话 Rewind**:
+- `crates/atomcode-tuix/src/modals/rewind.rs`(404 行)
+- `crates/atomcode-coding/src/runtime.rs:226-260` — RewindCatalog / RewindResult / RewindTransactionGuard
+
+**D5 富文本渲染**:
+- `crates/atomcode-tuix/src/highlight/mod.rs` — 主动放弃 syntect
+- `crates/atomcode-tuix/src/render/theme.rs` — 16 色 SGR palette
+- `crates/atomcode-tuix/src/render/diff.rs` — 纯 diff 解析
+- `crates/atomcode-tuix/src/modals/diff_viewer.rs`(539 行)
+
+**D6 输入体验**:
+- `crates/atomcode-tuix/src/input/key_action.rs` — Action 枚举 + `^H`/`^?` 归一化
+- `crates/atomcode-tuix/src/input/reader.rs` — paste-burst coalescing
+- `crates/atomcode-tuix/src/input/history.rs` — HistoryEntry 三元组
+- `crates/atomcode-tuix/src/input/mod.rs` — InputEvent 主循环派发
+
+**D7 Onboarding/主题**:
+- `crates/atomcode-tuix/src/modals/onboarding_wizard.rs`(2336 行)
+- `crates/atomcode-tuix/src/render/welcome_tips.rs` — Tip POOL
+
+**D8 导出/statusline/成本**:
+- `crates/atomcode-tuix/src/event_loop/commands.rs:6090-6260` — `/save` 五态防御
+- `crates/atomcode-tuix/src/event_loop/usage_monitor.rs` — token hint(80%/95%)
+- `crates/atomcode-tuix/src/modals/usage.rs`(1338 行)
+- `crates/atomcode-tuix/src/event_loop/mod.rs:28274-28374` — 5 级 hint 优先级链
+
+### 24.7 总结
+
+第十八轮深挖表明:**atomcode 在「用户交互体验层」的工程化深度被严重低估**。`@`-mention 的 4 条 token 规则、自定义命令的 placeholder 递归防御、`/rewind` 的 generation fencing、输入框的 paste-burst + `^H` 归一化、`/save` 的 RefuseOverwrite 五态防御、5 级 hint 优先级链——每一个细节都对应真实生产事故,且都被清晰地记录在源码注释中。
+
+**唯一主动缺失的是 D4 文件监视**(atomcode 选 lazy refresh)。laew 的 P1 借鉴清单已就绪(L1396/L1398/L1400/L1401/L1403/L1404/L1410/L1411/L1412 共 9 项),建议立即启动。
+
+**累计 24 轮深挖覆盖度**:从 L1-L1414 共 1414 个 laew gap,本轮新增 19 个(占比 1.3%)——单轮增量看似不多,但用户交互体验层是「**用户每天都能感受到的差距**」,ROI 极高。
