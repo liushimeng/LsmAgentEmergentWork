@@ -2,7 +2,7 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **31 维度 × 10 个 = 310 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **41 维度 × 10 个 = 410 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理等多个角度，**无重复主题**。
 
@@ -51,6 +51,16 @@ docs/自动化测试-提示词文件列表/
   29-云原生与DevOps工程实战.md            ← Dockerfile优化 / compose编排 / K8s部署排障 / CI-CD / GitOps / Terraform / 监控告警 / 日志管道 / 发布策略
   30-逆向工程与二进制安全分析.md          ← ELF结构 / 反汇编阅读 / gdb调试 / 栈溢出与ROP(本地靶场) / Frida插桩 / 反混淆 / 样本防御分析 / 软件加固 / CVE复现方法论
   31-数据工程与ETL管线实战.md             ← ETL管线 / 数仓分层 / CDC增量同步 / 数据质量 / 调度编排 / Parquet列存 / 流式ETL / 元数据血缘 / 数据脱敏 / 日志管道
+  32-移动应用与跨平台开发实战.md          ← React Native / Flutter / SwiftUI / Jetpack Compose / 小程序 / 移动端性能 / 移动端安全 / 热更新
+  33-嵌入式系统与物联网开发.md            ← FreeRTOS / Arduino / ESP32 / 嵌入式C / MQTT / 边缘计算 / 嵌入式Linux / 实时系统 / CAN总线 / 物联网平台
+  34-区块链与智能合约开发.md              ← Solidity / ERC-20 / DeFi / NFT / Web3 / 链上分析 / Layer2 / ZK / DAO / 跨链桥
+  35-音视频处理与流媒体工程.md            ← FFmpeg / H.264 / 音频处理 / HLS / WebRTC / 播放器 / 直播 / ASR / 视频分析 / 性能优化
+  36-自动化办公与脚本工程.md              ← Excel / 邮件 / PDF / 爬虫 / CLI工具 / Shell脚本 / UI自动化 / 数据处理 / 定时任务 / 效率工具
+  37-产品需求分析与原型设计.md            ← 需求访谈 / 用户故事 / 竞品分析 / 信息架构 / 原型设计 / 用户流程 / 指标体系 / 需求评审 / 路线图 / 设计思维
+  38-代码审查与团队协作工程.md            ← Git工作流 / PR写作 / Code Review / 合并冲突 / 提交规范 / 代码风格 / 结对编程 / 技术债务 / 工程文化 / 开源协作
+  39-性能调优与Profiling实战.md           ← 性能指标 / 火焰图 / 内存Profiling / IO Profiling / 数据库优化 / Web性能 / 并发性能 / 分布式追踪 / 调优方法论 / 实战案例
+  40-正则表达式与文本处理工程.md          ← 正则语法 / 零宽断言 / 日志解析 / 文本清洗 / 词法分析 / 语法分析 / grep-sed-awk / 全文搜索 / NLP预处理 / 文本分类
+  41-数学建模与科学计算.md                ← 线性代数 / 优化 / 微分方程 / 贝叶斯 / 蒙特卡洛 / 信号处理 / 数据拟合 / 运筹学 / 数值仿真 / 科学计算工程
 ```
 
 ## 编号规则
@@ -88,6 +98,16 @@ docs/自动化测试-提示词文件列表/
 | AC01–AC10 | 云原生与 DevOps 工程实战 | Dockerfile优化/compose/K8s部署排障/CI-CD/GitOps/Terraform/监控告警/日志管道/发布策略 | medium 为主 |
 | AD01–AD10 | 逆向工程与二进制安全分析 | ELF/反汇编/gdb/栈溢出与ROP(本地靶场)/Frida/反混淆/样本防御分析/软件加固/CVE复现 | medium~hard |
 | AE01–AE10 | 数据工程与 ETL 管线实战 | ETL/数仓分层/CDC/数据质量/调度编排/Parquet/流式ETL/元数据血缘/脱敏/日志管道 | medium 为主 |
+| AF01–AF10 | 移动应用与跨平台开发实战 | React Native/Flutter/SwiftUI/Compose/小程序/移动性能/安全/热更新/网络/Flutter游戏 | medium~hard |
+| AH01–AH10 | 嵌入式系统与物联网开发 | FreeRTOS/Arduino/ESP32/嵌入式C/MQTT/边缘计算/嵌入式Linux/实时系统/CAN/物联网平台 | medium~hard |
+| AI01–AI10 | 区块链与智能合约开发 | Solidity/ERC-20/DeFi/NFT/Web3/链上分析/Layer2/ZK/DAO/跨链桥 | medium~hard |
+| AJ01–AJ10 | 音视频处理与流媒体工程 | FFmpeg/H.264/音频处理/HLS/WebRTC/播放器/直播/ASR/视频分析/性能优化 | medium~hard |
+| AK01–AK10 | 自动化办公与脚本工程 | Excel/邮件/PDF/爬虫/CLI工具/Shell脚本/UI自动化/数据处理/定时任务/效率工具 | simple~medium |
+| AL01–AL10 | 产品需求分析与原型设计 | 需求访谈/用户故事/竞品分析/信息架构/原型设计/用户流程/指标体系/需求评审/路线图/设计思维 | simple~medium |
+| AM01–AM10 | 代码审查与团队协作工程 | Git工作流/PR写作/Code Review/合并冲突/提交规范/代码风格/结对编程/技术债务/工程文化/开源协作 | simple~medium |
+| AN01–AN10 | 性能调优与 Profiling 实战 | 性能指标/火焰图/内存Profiling/IO Profiling/数据库优化/Web性能/并发性能/分布式追踪/调优方法论/实战案例 | medium~hard |
+| AO01–AO10 | 正则表达式与文本处理工程 | 正则语法/零宽断言/日志解析/文本清洗/词法分析/语法分析/grep-sed-awk/全文搜索/NLP预处理/文本分类 | simple~medium |
+| AP01–AP10 | 数学建模与科学计算 | 线性代数/优化/微分方程/贝叶斯/蒙特卡洛/信号处理/数据拟合/运筹学/数值仿真/科学计算工程 | medium~hard |
 
 ## 每条提示词的字段
 
