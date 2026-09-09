@@ -33,6 +33,14 @@ pub struct ExecutionTrace {
     /// 上下文溢出自动恢复次数(L1038/L1044:排水/折叠后重试成功;
     /// >0 表示发生过 prompt-too-long 类溢出并本地恢复)
     pub overflow_recoveries: usize,
+    /// max_tokens 静默升级次数(2026-09-09 第 09 轮,实现 L1037)。
+    ///
+    /// 0 表示本会话 LLM 输出从未被 max_tokens 截断;>0 表示发生过 8K→16K→32K→64K 的
+    /// 翻倍升级。写入 Agent-Memory 供后续 Session 决策参考。
+    pub max_tokens_upscalings: usize,
+    /// max_tokens 升级历史 `(old, new)`,供 Debug Report 调试使用。
+    /// 当前实现由 Agent 循环在 finalize 阶段从状态机注入。
+    pub max_tokens_history: Vec<(u32, u32)>,
     /// 最终输出文本字节数
     pub output_bytes: usize,
     /// 失败模式标签(供 Agent-Memory 索引 / Yolo 失败回流引用)
@@ -129,15 +137,30 @@ fn looks_like_failure_text(text: &str) -> bool {
     }
     let lower = t.to_lowercase();
     const EN_PATTERNS: &[&str] = &[
-        "[failure]", "[failed]", "[error]", "failed:", "error:", "exception:",
-        "fatal error", "panic:", "crash:", "aborted:", "killed:",
+        "[failure]",
+        "[failed]",
+        "[error]",
+        "failed:",
+        "error:",
+        "exception:",
+        "fatal error",
+        "panic:",
+        "crash:",
+        "aborted:",
+        "killed:",
     ];
     if EN_PATTERNS.iter().any(|p| lower.contains(p)) {
         return true;
     }
     const ZH_PATTERNS: &[&str] = &[
-        "[失败]", "执行失败", "未完成", "未能", "无法完成", "无法",
-        "异常退出", "出错了",
+        "[失败]",
+        "执行失败",
+        "未完成",
+        "未能",
+        "无法完成",
+        "无法",
+        "异常退出",
+        "出错了",
     ];
     if ZH_PATTERNS.iter().any(|p| t.contains(p)) {
         return true;
@@ -167,12 +190,22 @@ pub fn compact_args_digest(args: &serde_json::Value) -> String {
         Value::Object(map) => {
             // 优先按 schema 的常见字段顺序: file_path → path → command → pattern → content
             const PREFERRED: &[&str] = &[
-                "file_path", "path", "command", "pattern", "content", "old_string", "url",
+                "file_path",
+                "path",
+                "command",
+                "pattern",
+                "content",
+                "old_string",
+                "url",
             ];
             let mut fragments: Vec<String> = Vec::new();
             'outer: for k in PREFERRED {
                 if let Some(v) = map.get(*k) {
-                    fragments.push(format!("{}={}", k, trunc(&value_to_compact(v), MAX_FRAGMENT)));
+                    fragments.push(format!(
+                        "{}={}",
+                        k,
+                        trunc(&value_to_compact(v), MAX_FRAGMENT)
+                    ));
                     if fragments.len() >= 3 {
                         break 'outer;
                     }
@@ -184,7 +217,11 @@ pub fn compact_args_digest(args: &serde_json::Value) -> String {
                     if PREFERRED.contains(&k.as_str()) {
                         continue;
                     }
-                    fragments.push(format!("{}={}", k, trunc(&value_to_compact(v), MAX_FRAGMENT)));
+                    fragments.push(format!(
+                        "{}={}",
+                        k,
+                        trunc(&value_to_compact(v), MAX_FRAGMENT)
+                    ));
                     if fragments.len() >= 3 {
                         break;
                     }
@@ -233,7 +270,10 @@ mod tests {
         t.early_terminated = true;
         t.early_terminate_reason = "tool=Read attempts=3".into();
         t.collect_failure_signals("ok");
-        assert!(t.failure_signals.iter().any(|s| s.starts_with("early_terminate:")));
+        assert!(t
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("early_terminate:")));
         assert!(t.is_failed());
     }
 
@@ -244,7 +284,10 @@ mod tests {
         t.tool_calls_ok = 1;
         t.tool_calls_err = 3;
         t.collect_failure_signals("ok");
-        assert!(t.failure_signals.iter().any(|s| s.starts_with("high_error_rate:")));
+        assert!(t
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("high_error_rate:")));
         assert!(t.is_failed());
     }
 
@@ -264,7 +307,10 @@ mod tests {
         let mut t = ExecutionTrace::default();
         t.truncation_resumes = 2;
         t.collect_failure_signals("ok 部分输出");
-        assert!(t.failure_signals.iter().any(|s| s.starts_with("truncated:")));
+        assert!(t
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("truncated:")));
         assert!(!t.is_failed());
     }
 
@@ -274,11 +320,10 @@ mod tests {
         let mut t = ExecutionTrace::default();
         t.overflow_recoveries = 1;
         t.collect_failure_signals("ok");
-        assert!(
-            t.failure_signals
-                .iter()
-                .any(|s| s.starts_with("overflow_recovered:"))
-        );
+        assert!(t
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("overflow_recovered:")));
         assert!(!t.is_failed());
     }
 
@@ -291,8 +336,14 @@ mod tests {
         t.tool_calls_err = 2;
         t.collect_failure_signals("执行失败: ...");
         // 三个信号并存:early_terminate / high_error_rate / text_failure_phrase
-        assert!(t.failure_signals.iter().any(|s| s.starts_with("early_terminate:")));
-        assert!(t.failure_signals.iter().any(|s| s.starts_with("high_error_rate:")));
+        assert!(t
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("early_terminate:")));
+        assert!(t
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("high_error_rate:")));
         assert!(t.failure_signals.iter().any(|s| s == "text_failure_phrase"));
         assert!(t.is_failed());
     }
@@ -326,7 +377,10 @@ mod tests {
         let s = compact_args_digest(&v);
         assert!(s.contains("file_path="), "应包含 file_path,实际: {s}");
         // 只有 1 个 PREFERRED 命中 → 取它,然后尝试补 extra_key 直到 3 个
-        assert!(s.contains("extra_key="), "不足 3 个时应补 extra_key,实际: {s}");
+        assert!(
+            s.contains("extra_key="),
+            "不足 3 个时应补 extra_key,实际: {s}"
+        );
     }
 
     #[test]
@@ -352,7 +406,11 @@ mod tests {
         let v = serde_json::json!({"file_path": long_path});
         let s = compact_args_digest(&v);
         // 截短到 60 字符 + 省略号
-        assert!(s.chars().count() <= 80, "应截短,实际长度 {} 内容: {s}", s.chars().count());
+        assert!(
+            s.chars().count() <= 80,
+            "应截短,实际长度 {} 内容: {s}",
+            s.chars().count()
+        );
         assert!(s.contains('…'), "应含省略号,实际: {s}");
     }
 

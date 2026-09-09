@@ -11,12 +11,13 @@
 //! 设计见 `docs/多Agent架构重构/01-设计与解决方案.md`。
 
 pub mod cancel;
-pub mod context;
 pub mod compact;
+pub mod context;
 pub mod debug;
 pub mod extrace;
 pub mod json_repair;
 pub mod main_work;
+pub mod max_tokens_state;
 pub mod memory;
 pub mod orchestrator;
 pub mod overflow;
@@ -39,6 +40,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent::cancel::{backfill_cancelled_tool_results, CancelToken};
 use crate::agent::extrace::ExecutionTrace;
+use crate::agent::max_tokens_state::MaxTokensState;
 use crate::agent::profile::AgentProfile;
 use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta, Usage};
@@ -100,17 +102,24 @@ impl Agent {
         self
     }
 
-    pub fn llm(&self) -> Arc<dyn LlmClient> { self.llm.clone() }
-    pub fn profile(&self) -> &AgentProfile { &self.profile }
-    pub fn max_iterations(&self) -> usize { self.max_iterations }
-    pub fn max_truncation_resume(&self) -> usize { self.max_truncation_resume }
-    pub fn max_overflow_recoveries(&self) -> usize { self.max_overflow_recoveries }
+    pub fn llm(&self) -> Arc<dyn LlmClient> {
+        self.llm.clone()
+    }
+    pub fn profile(&self) -> &AgentProfile {
+        &self.profile
+    }
+    pub fn max_iterations(&self) -> usize {
+        self.max_iterations
+    }
+    pub fn max_truncation_resume(&self) -> usize {
+        self.max_truncation_resume
+    }
+    pub fn max_overflow_recoveries(&self) -> usize {
+        self.max_overflow_recoveries
+    }
 
     /// 单轮任务:传入用户提示,返回最终文本、本次累计 token 用量与执行轨迹。
-    pub async fn run_once(
-        &self,
-        user_input: &str,
-    ) -> Result<(String, Usage, ExecutionTrace)> {
+    pub async fn run_once(&self, user_input: &str) -> Result<(String, Usage, ExecutionTrace)> {
         let mut session = Session::new();
         session.context_mut().push(ChatMessage::user(user_input));
         self.run_session(&mut session).await
@@ -161,7 +170,17 @@ impl Agent {
         cancel: Option<&CancelToken>,
     ) -> Result<(String, Usage, ExecutionTrace)> {
         let tool_defs = self.profile.tools.defs();
-        let meta: RequestMeta = session.meta();
+        // 会话级 max_tokens 升级状态机(2026-09-09 第 09 轮,实现 L1037)。
+        // 起始 8K,被 max_tokens 截断时翻倍,封顶 64K;每会话重置,
+        // 避免「上次会话把 max 撑满,下次新会话也按 64K 起跳」的浪费。
+        let max_tokens_state = Arc::new(MaxTokensState::new());
+        // 每次迭代注入 override 的可变 meta:从 session.meta() 复制后改写。
+        // 注:session.meta() 本身不可变拿 ID,这里手工重建 RequestMeta 以避免改 Session API。
+        let mut meta: RequestMeta = session.meta();
+        meta.max_tokens_override = Some(max_tokens_state.current());
+        // UA 逐请求注入(2026-09-09 第 08 轮):让抓包层面 8 角色各自可辨识;
+        // meta.user_agent 为空时协议层回退到客户端构造期默认 UA(见 RequestMeta::resolve_user_agent)。
+        meta.user_agent = self.profile.user_agent();
         let mut total_usage = Usage::default();
         let mut accumulated_text = String::new();
         let mut truncation_resumes: usize = 0;
@@ -204,20 +223,36 @@ impl Agent {
                 }
             }
             debug!(iteration = iter, "agent step");
+            // runtime hints 拼接(2026-09-09 第 09 轮,联动 L771 失败计数预警):
+            // 仅在对应计数器 > 0 时追加,全 0 时返回空串,不影响 LLM 上下文;
+            // 拼到 system 末尾,不破坏 cache_control 缓存前缀。
+            let base_system = self.profile.system_prompt.render(self.llm.protocol());
+            let runtime_hints = build_runtime_hints(&trace, consecutive_failures);
+            let system = if runtime_hints.is_empty() {
+                base_system
+            } else {
+                format!("{base_system}{runtime_hints}")
+            };
             // 上下文溢出自动恢复(L1038/L1044,2026-09-09 第 06 轮):
             // LLM 调用命中 prompt-too-long 类溢出错误时,自动执行
             // 排水(Level 1)→ 折叠(Level 2)→ 重试;两轮无效则上抛(三级暴露)。
             let completion: Completion = self
-                .complete_with_overflow_recovery(session, cancel, &tool_defs, &meta, &mut trace)
+                .complete_with_overflow_recovery(session, cancel, &system, &tool_defs, &meta, &mut trace)
                 .await?;
 
             // 累计 usage
-            total_usage.input_tokens = total_usage.input_tokens.saturating_add(completion.usage.input_tokens);
-            total_usage.output_tokens = total_usage.output_tokens.saturating_add(completion.usage.output_tokens);
-            total_usage.cache_read_input_tokens =
-                total_usage.cache_read_input_tokens.saturating_add(completion.usage.cache_read_input_tokens);
-            total_usage.cache_creation_input_tokens =
-                total_usage.cache_creation_input_tokens.saturating_add(completion.usage.cache_creation_input_tokens);
+            total_usage.input_tokens = total_usage
+                .input_tokens
+                .saturating_add(completion.usage.input_tokens);
+            total_usage.output_tokens = total_usage
+                .output_tokens
+                .saturating_add(completion.usage.output_tokens);
+            total_usage.cache_read_input_tokens = total_usage
+                .cache_read_input_tokens
+                .saturating_add(completion.usage.cache_read_input_tokens);
+            total_usage.cache_creation_input_tokens = total_usage
+                .cache_creation_input_tokens
+                .saturating_add(completion.usage.cache_creation_input_tokens);
 
             if !completion.has_tool_calls() {
                 // 累计文本(续接场景下可能多次进入此分支)
@@ -226,13 +261,29 @@ impl Agent {
                         accumulated_text.push('\n');
                     }
                     accumulated_text.push_str(&completion.text);
-                    session.context_mut().push(ChatMessage::assistant(vec![ContentBlock::text(
-                        completion.text.clone(),
-                    )]));
+                    session
+                        .context_mut()
+                        .push(ChatMessage::assistant(vec![ContentBlock::text(
+                            completion.text.clone(),
+                        )]));
                 }
 
                 // 检测截断:输出被 token 上限截断时自动续接
                 if is_truncation_stop_reason(completion.stop_reason.as_deref()) {
+                    // max_tokens 静默升级(2026-09-09 第 09 轮,L1037):
+                    // LLM 返回截断时,翻倍下一次请求的 max_tokens 上限(封顶 64K),
+                    // 下一轮 LLM 调用通过 `meta.max_tokens_override` 自动注入。
+                    let old_max = max_tokens_state.current();
+                    let new_max = max_tokens_state.note_truncated();
+                    if new_max != old_max {
+                        info!(
+                            old = old_max,
+                            new = new_max,
+                            "max_tokens 被截断,静默升级(下一轮 LLM 调用注入)"
+                        );
+                    }
+                    meta.max_tokens_override = Some(new_max);
+
                     if truncation_resumes >= self.max_truncation_resume {
                         // 达到上限,返回已累计的文本(优雅降级)
                         warn!(
@@ -240,11 +291,12 @@ impl Agent {
                             "截断续接达到上限,返回已累计文本"
                         );
                         trace.truncation_resumes = truncation_resumes;
-                        return Ok(Self::finalize_trace(
+                        return Self::finalize_with_max_tokens(
                             trace,
                             &accumulated_text,
                             total_usage,
-                        ));
+                            max_tokens_state.as_ref(),
+                        );
                     }
                     // 注入 nudge 并续接
                     truncation_resumes += 1;
@@ -258,16 +310,17 @@ impl Agent {
                         "检测到输出截断,自动续接"
                     );
                     session.context_mut().push(ChatMessage::user(nudge));
-                    continue;  // 继续循环
+                    continue; // 继续循环
                 }
 
                 // 非截断,正常返回
                 debug!("agent finished with text answer");
-                return Ok(Self::finalize_trace(
+                return Self::finalize_with_max_tokens(
                     trace,
                     &accumulated_text,
                     total_usage,
-                ));
+                    max_tokens_state.as_ref(),
+                );
             }
 
             // 记录 assistant 的工具调用请求(同时附带文本,如果有)
@@ -282,7 +335,9 @@ impl Agent {
                     input: call.arguments.clone(),
                 });
             }
-            session.context_mut().push(ChatMessage::assistant(assistant_blocks));
+            session
+                .context_mut()
+                .push(ChatMessage::assistant(assistant_blocks));
 
             // 关联报告: 2026-09-09_05 E-001 —— 快照本轮文本/工具状态供后续短路判断使用
             // (completion.text 与 completion.tool_calls 在下面的循环会被 move)
@@ -306,13 +361,11 @@ impl Agent {
                 let executed = match self.profile.tools.get(&name) {
                     Ok(tool) => {
                         // Schema 预校验(校验失败 → 返回错误,不执行工具)
-                        if let Err(e) =
-                            crate::agent::tool_schema_validator::validate_tool_args(
-                                &name,
-                                &tool.parameters(),
-                                &args,
-                            )
-                        {
+                        if let Err(e) = crate::agent::tool_schema_validator::validate_tool_args(
+                            &name,
+                            &tool.parameters(),
+                            &args,
+                        ) {
                             Some(Err(e))
                         } else {
                             match cancel {
@@ -344,11 +397,7 @@ impl Agent {
                 if is_error {
                     trace.tool_calls_err += 1;
                     // 失败键:工具名 + 稳定 JSON(对象按 key 排序后序列化)
-                    let fail_key = format!(
-                        "{}|{}",
-                        name,
-                        stable_json_string(&args)
-                    );
+                    let fail_key = format!("{}|{}", name, stable_json_string(&args));
                     if last_fail_key.as_deref() == Some(fail_key.as_str()) {
                         consecutive_failures += 1;
                     } else {
@@ -452,11 +501,12 @@ impl Agent {
                     hist_len = recent_tool_history.len(),
                     history = history_block,
                 );
-                return Ok(Self::finalize_trace(
+                return Self::finalize_with_max_tokens(
                     trace,
                     &fallback_text,
                     total_usage,
-                ));
+                    max_tokens_state.as_ref(),
+                );
             }
         }
 
@@ -474,16 +524,18 @@ impl Agent {
     ///
     /// 每次调用最多尝试 1 次排水 + 1 次折叠(跨循环迭代重新武装,新的大工具
     /// 结果可再次排水);取消语义不变(select 命中即 backfill + `Err(Cancelled)`)。
+    ///
+    /// `system` 由调用方在循环外构造(已拼 runtime hints),重试循环内复用,
+    /// 避免 hints 在每次重试重新计算 + 字符串拼接。
     async fn complete_with_overflow_recovery(
         &self,
         session: &mut Session,
         cancel: Option<&CancelToken>,
+        system: &str,
         tool_defs: &[crate::llm::ToolDef],
         meta: &RequestMeta,
         trace: &mut ExecutionTrace,
     ) -> Result<Completion> {
-        // 按当前 LLM 协议渲染系统提示词(支持多协议差异化)
-        let system = self.profile.system_prompt.render(self.llm.protocol());
         // 本次调用内的恢复档位状态(排水 / 折叠各最多尝试一次)
         let mut drained = false;
         let mut folded = false;
@@ -494,11 +546,11 @@ impl Agent {
                 Some(token) => tokio::select! {
                     biased;
                     _ = token.cancelled() => None,
-                    r = self.llm.complete(&system, session.context(), tool_defs, meta) => Some(r),
+                    r = self.llm.complete(system, session.context(), tool_defs, meta) => Some(r),
                 },
                 None => Some(
                     self.llm
-                        .complete(&system, session.context(), tool_defs, meta)
+                        .complete(system, session.context(), tool_defs, meta)
                         .await,
                 ),
             };
@@ -560,17 +612,65 @@ impl Agent {
         }
     }
 
-    /// 同步填充 trace 的输出字节数与失败信号后返回 Ok 三元组
-    /// (在循环正常结束后调用,异常路径由调用方继续包装)。
-    fn finalize_trace(
+    /// 同步填充 trace 的输出字节数 + 失败信号 + max_tokens 升级历史(2026-09-09 第 09 轮)
+    /// 后返回 Ok 三元组(在循环正常结束后调用,异常路径由调用方继续包装)。
+    fn finalize_with_max_tokens(
         mut trace: ExecutionTrace,
         text: &str,
         total_usage: Usage,
-    ) -> (String, Usage, ExecutionTrace) {
+        max_tokens_state: &MaxTokensState,
+    ) -> Result<(String, Usage, ExecutionTrace)> {
         trace.output_bytes = text.len();
+        trace.max_tokens_upscalings = max_tokens_state.upscalings();
+        trace.max_tokens_history = max_tokens_state.history_snapshot();
         trace.collect_failure_signals(text);
-        (text.to_string(), total_usage, trace)
+        Ok((text.to_string(), total_usage, trace))
     }
+}
+
+/// 拼装运行时 hint(2026-09-09 第 09 轮,联动 L771 失败计数早期预警)。
+///
+/// 仅当对应计数器 > 0 时追加对应行,全 0 时返回空串(零开销)。
+/// 拼到 system_prompt 末尾(不破坏 cache_control 缓存前缀;详见
+/// 第七轮 PromptCaching 专题),让 LLM 自我感知「正在被短路保护」并主动收敛。
+///
+/// `<<<LAEW:RUNTIME_HINTS>>>` 标记保证幂等探测 + 与用户提示词严格隔离,
+/// 与现有 `LAEW:PROJECT_CONTEXT` / `LAEW:SESSION_HISTORY` / `LAEW:COMPACTED_CONTEXT`
+/// 标记风格一致。
+pub(crate) fn build_runtime_hints(trace: &ExecutionTrace, consecutive_failures: usize) -> String {
+    let mut hints: Vec<String> = Vec::new();
+    if trace.truncation_resumes > 0 {
+        hints.push(format!(
+            "本会话已续接 {} 次截断输出(因 max_tokens 触发),如非必要请缩短回复或减少一次性工具调用。",
+            trace.truncation_resumes
+        ));
+    }
+    if trace.overflow_recoveries > 0 {
+        hints.push(format!(
+            "上下文已自动恢复 {} 次(排水/折叠历史),请避免一次性读取超大文件或拼装超长 prompt。",
+            trace.overflow_recoveries
+        ));
+    }
+    if trace.max_tokens_upscalings > 0 {
+        hints.push(format!(
+            "max_tokens 已升级 {} 次(当前 {} K),这是为解决截断自动翻倍;请控制单次回复长度。",
+            trace.max_tokens_upscalings,
+            trace.max_tokens_upscalings * 8 // 8K 起,展示近似值即可
+        ));
+    }
+    if consecutive_failures >= 2 {
+        hints.push(format!(
+            "连续 {} 次工具调用失败,请先停下核对目标参数(路径/工具名/必填字段)再继续,避免在错误路径上重复打转。",
+            consecutive_failures
+        ));
+    }
+    if hints.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n<<<LAEW:RUNTIME_HINTS>>>\n{}\n<<<END>>>",
+        hints.join("\n")
+    )
 }
 
 /// 判断 `stop_reason` 是否为截断(输出被 token 上限截断)。
@@ -684,7 +784,9 @@ mod tests {
             t2.cancel();
         });
         let res = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            agent.run_session_cancellable(&mut session, Some(&token)).await
+            agent
+                .run_session_cancellable(&mut session, Some(&token))
+                .await
         })
         .await
         .expect("取消后应及时返回,而非等 LLM 挂起")
@@ -713,7 +815,9 @@ mod tests {
         });
         let start = std::time::Instant::now();
         let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            agent.run_session_cancellable(&mut session, Some(&token)).await
+            agent
+                .run_session_cancellable(&mut session, Some(&token))
+                .await
         })
         .await
         .expect("工具执行中取消应及时返回,而非等 sleep 30 跑完")
@@ -725,7 +829,11 @@ mod tests {
         let last = session.context().last().expect("应有取消回填");
         assert_eq!(last.role, crate::llm::Role::Tool);
         match &last.content[0] {
-            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
                 assert_eq!(tool_use_id, "call-slow-1");
                 assert!(content.contains("cancelled"));
                 assert!(*is_error);
@@ -741,7 +849,9 @@ mod tests {
             AgentProfile::sub_agent_work_profile(),
         );
         let mut session = Session::new();
-        session.context_mut().push(ChatMessage::user("已取消的任务"));
+        session
+            .context_mut()
+            .push(ChatMessage::user("已取消的任务"));
         let token = CancelToken::new();
         token.cancel();
         let res = tokio::time::timeout(
@@ -919,9 +1029,7 @@ mod tests {
             _tools: &[crate::llm::ToolDef],
             _meta: &RequestMeta,
         ) -> Result<Completion> {
-            let n = self
-                .calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Completion {
                 text: String::new(),
                 tool_calls: vec![crate::llm::ToolCallReq {
@@ -1149,9 +1257,10 @@ mod tests {
         // 会话带可折叠的胖历史(触发 Level 2) + 超长工具结果(触发 Level 1)
         let mut session = session_with_fat_tool_result(20_000);
         for i in 0..6 {
-            session
-                .context_mut()
-                .insert(1, ChatMessage::user(format!("历史{i} {}", "话".repeat(400))));
+            session.context_mut().insert(
+                1,
+                ChatMessage::user(format!("历史{i} {}", "话".repeat(400))),
+            );
         }
         let res = agent.run_session(&mut session).await;
         let err = res.expect_err("两级恢复穷尽后应上抛原始溢出错误");
@@ -1230,5 +1339,152 @@ mod tests {
         fn protocol(&self) -> crate::config::Protocol {
             crate::config::Protocol::Anthropic
         }
+    }
+
+    // ========== Agent 身份逐请求注入(第 08 轮,方案 tmpPlan/2026-09-09_08) ==========
+
+    /// 捕获 complete() 收到的 RequestMeta(含 User-Agent),验证 Agent 循环逐请求注入。
+    struct MetaCaptureLlm {
+        seen: std::sync::Mutex<Vec<RequestMeta>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for MetaCaptureLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            meta: &RequestMeta,
+        ) -> Result<Completion> {
+            self.seen.lock().expect("meta capture").push(meta.clone());
+            Ok(Completion {
+                text: "done".into(),
+                tool_calls: vec![],
+                usage: Usage::default(),
+                stop_reason: None,
+            })
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn run_session_injects_profile_user_agent_per_request() {
+        // Yolo profile → 请求 UA 必须是 Yolo 的(而非共享客户端的构造期默认)
+        let cap = std::sync::Arc::new(MetaCaptureLlm {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(cap.clone(), AgentProfile::yolo_profile());
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("分类一下"));
+        agent.run_session(&mut session).await.unwrap();
+        let seen = cap.seen.lock().expect("meta capture");
+        assert!(!seen.is_empty(), "应至少发起一次 LLM 调用");
+        for meta in seen.iter() {
+            assert!(
+                meta.user_agent.starts_with("LsmAgentEmergentWork-Yolo/"),
+                "UA 应逐请求注入为 Yolo,实际: {}",
+                meta.user_agent
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_session_injects_subagent_user_agent() {
+        // SubAgent-Work profile → 同一注入路径下角色名跟随 profile 变化
+        let cap = std::sync::Arc::new(MetaCaptureLlm {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(cap.clone(), AgentProfile::sub_agent_work_profile());
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("跑命令"));
+        agent.run_session(&mut session).await.unwrap();
+        let seen = cap.seen.lock().expect("meta capture");
+        assert!(
+            seen.iter()
+                .all(|m| m.user_agent.starts_with("LsmAgentEmergentWork-SubAgent-Work/")),
+            "UA 应为 SubAgent-Work,实际: {:?}",
+            seen.iter().map(|m| m.user_agent.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    // ========== L1037 + L771 联动(2026-09-09 第 09 轮) ==========
+
+    #[test]
+    fn runtime_hints_empty_when_no_counters_active() {
+        // 所有计数器为 0 时,返回空字符串(零开销,不影响 LLM 上下文)
+        let t = ExecutionTrace::default();
+        let h = build_runtime_hints(&t, 0);
+        assert!(h.is_empty(), "全 0 应返回空串,实际: {h:?}");
+        let h = build_runtime_hints(&t, 1);
+        assert!(h.is_empty(), "consecutive_failures < 2 也不应触发,实际: {h:?}");
+    }
+
+    #[test]
+    fn runtime_hints_truncation_when_resumes_present() {
+        let mut t = ExecutionTrace::default();
+        t.truncation_resumes = 2;
+        let h = build_runtime_hints(&t, 0);
+        assert!(h.contains("已续接 2 次"));
+        assert!(h.contains("LAEW:RUNTIME_HINTS"));
+        assert!(h.contains("END"));
+    }
+
+    #[test]
+    fn runtime_hints_overflow_when_recoveries_present() {
+        let mut t = ExecutionTrace::default();
+        t.overflow_recoveries = 1;
+        let h = build_runtime_hints(&t, 0);
+        assert!(h.contains("自动恢复 1 次"));
+        assert!(h.contains("排水/折叠"));
+    }
+
+    #[test]
+    fn runtime_hints_max_tokens_when_upscalings_present() {
+        let mut t = ExecutionTrace::default();
+        t.max_tokens_upscalings = 2;
+        let h = build_runtime_hints(&t, 0);
+        assert!(h.contains("max_tokens 已升级 2 次"));
+    }
+
+    #[test]
+    fn runtime_hints_consecutive_failures_threshold() {
+        // consecutive_failures >= 2 触发
+        let t = ExecutionTrace::default();
+        assert!(build_runtime_hints(&t, 2).contains("连续 2 次"));
+        assert!(build_runtime_hints(&t, 5).contains("连续 5 次"));
+        // < 2 不触发
+        assert!(build_runtime_hints(&t, 1).is_empty());
+    }
+
+    #[test]
+    fn runtime_hints_multiple_lines_joined() {
+        // 多个信号并存时全部出现
+        let mut t = ExecutionTrace::default();
+        t.truncation_resumes = 1;
+        t.overflow_recoveries = 1;
+        t.max_tokens_upscalings = 1;
+        let h = build_runtime_hints(&t, 3);
+        assert!(h.contains("已续接 1 次"));
+        assert!(h.contains("自动恢复 1 次"));
+        assert!(h.contains("max_tokens 已升级 1 次"));
+        assert!(h.contains("连续 3 次"));
+    }
+
+    #[test]
+    fn finalize_trace_records_max_tokens_state() {
+        // 验证 finalize_with_max_tokens 把 MaxTokensState 写入 trace
+        use crate::agent::max_tokens_state::MaxTokensState;
+        let state = MaxTokensState::new();
+        state.note_truncated(); // 8K → 16K
+        state.note_truncated(); // 16K → 32K
+        let mut t = ExecutionTrace::default();
+        t.iterations = 2;
+        let (text, _u, t) =
+            crate::agent::Agent::finalize_with_max_tokens(t, "hello", Usage::default(), &state).unwrap();
+        assert_eq!(text, "hello");
+        assert_eq!(t.max_tokens_upscalings, 2);
+        assert_eq!(t.max_tokens_history, vec![(8192, 16384), (16384, 32768)]);
     }
 }

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use reqwest::header::{ACCEPT, HeaderValue};
+use reqwest::header::{HeaderValue, ACCEPT};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -57,6 +57,12 @@ struct OpenAiRequest<'a> {
     /// 让上游在尾部单条 chunk 中输出 usage。
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    /// 输出 token 上限(2026-09-09 第 09 轮,实现 L1037)。
+    ///
+    /// 此前完全不传,长代码回复易被 Provider 默认(4K-8K)静默截断。
+    /// Agent 循环按会话级 MaxTokensState 注入 override,起始 8K → 16K → 32K → 64K 上限。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -89,14 +95,16 @@ fn convert_messages(system: &str, messages: &[ChatMessage]) -> Vec<Value> {
                     match b {
                         ContentBlock::Text { text } => text_buf.push_str(text),
                         ContentBlock::ToolUse { id, name, input } => {
-                            let args_str = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
+                            let args_str =
+                                serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
                             tool_calls_arr.push(json!({
                                 "id": id,
                                 "type": "function",
                                 "function": { "name": name, "arguments": args_str }
                             }));
                         }
-                        ContentBlock::ToolResult { .. } => { /* 不应出现在 assistant 消息中 */ }
+                        ContentBlock::ToolResult { .. } => { /* 不应出现在 assistant 消息中 */
+                        }
                     }
                 }
                 if !text_buf.is_empty() {
@@ -114,7 +122,12 @@ fn convert_messages(system: &str, messages: &[ChatMessage]) -> Vec<Value> {
             Role::Tool => {
                 // 一条 tool 消息一个 tool_use_id;若存在多条则拆为多条
                 for b in &m.content {
-                    if let ContentBlock::ToolResult { tool_use_id, content, is_error: _ } = b {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error: _,
+                    } = b
+                    {
                         out.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_use_id,
@@ -214,7 +227,9 @@ impl OpenAiParser {
             let u = &v["usage"];
             sink.feed(DeltaEvent::InputUsage {
                 input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                cache_read: u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) as u32,
+                cache_read: u["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0) as u32,
                 cache_creation: 0,
             })?;
             if let Some(out) = u["completion_tokens"].as_u64() {
@@ -318,11 +333,19 @@ impl LlmClient for OpenAiClient {
             tools: convert_tools(tools),
             tool_choice: Some("auto"),
             stream: true,
-            stream_options: Some(StreamOptions { include_usage: true }),
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            // max_tokens 静默升级(2026-09-09 第 09 轮,L1037):None 时不序列化,
+            // 走 Provider 默认;有 override 时由协议层透传给上游。
+            max_tokens: meta.max_tokens_override,
         };
 
         // 通用头:Content-Type / User-Agent / Authorization / X-Session-Id
-        let mut headers = build_common_headers(&self.api_key, meta, &self.user_agent)?;
+        // Agent 身份逐请求注入(2026-09-09 第 08 轮):meta 注入的 UA 优先,
+        // 空则回退构造期默认 —— 8 角色请求在抓包层面各自可辨识。
+        let user_agent = meta.resolve_user_agent(&self.user_agent);
+        let mut headers = build_common_headers(&self.api_key, meta, user_agent)?;
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
 
         let resp = self
@@ -452,11 +475,16 @@ mod tests {
     fn parser_text_chunks_concat() {
         let mut sink = ParseSink::new();
         let mut p = OpenAiParser::new();
-        let ev1 = ev_with_data(&json!({"choices":[{"delta":{"content":"Hello "},"finish_reason":null}]}).to_string());
+        let ev1 = ev_with_data(
+            &json!({"choices":[{"delta":{"content":"Hello "},"finish_reason":null}]}).to_string(),
+        );
         p.feed(&ev1, &mut sink).unwrap();
-        let ev2 = ev_with_data(&json!({"choices":[{"delta":{"content":"world"},"finish_reason":null}]}).to_string());
+        let ev2 = ev_with_data(
+            &json!({"choices":[{"delta":{"content":"world"},"finish_reason":null}]}).to_string(),
+        );
         p.feed(&ev2, &mut sink).unwrap();
-        let ev3 = ev_with_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string());
+        let ev3 =
+            ev_with_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string());
         p.feed(&ev3, &mut sink).unwrap();
         p.finish_into(&mut sink).unwrap();
         let c = sink.finish().unwrap();
@@ -483,7 +511,9 @@ mod tests {
         );
         p.feed(&ev3, &mut sink).unwrap();
         // 收尾
-        let ev4 = ev_with_data(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}).to_string());
+        let ev4 = ev_with_data(
+            &json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}).to_string(),
+        );
         p.feed(&ev4, &mut sink).unwrap();
         p.finish_into(&mut sink).unwrap();
         let c = sink.finish().unwrap();
@@ -497,9 +527,12 @@ mod tests {
     fn parser_done_sentinel_emits_stop() {
         let mut sink = ParseSink::new();
         let mut p = OpenAiParser::new();
-        let ev1 = ev_with_data(&json!({"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}).to_string());
+        let ev1 = ev_with_data(
+            &json!({"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}).to_string(),
+        );
         p.feed(&ev1, &mut sink).unwrap();
-        let ev2 = ev_with_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string());
+        let ev2 =
+            ev_with_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string());
         p.feed(&ev2, &mut sink).unwrap();
         let ev3 = ev_with_data("[DONE]");
         p.feed(&ev3, &mut sink).unwrap();
@@ -531,9 +564,12 @@ mod tests {
         let bad = ev_with_data("not json at all");
         p.feed(&bad, &mut sink).unwrap();
         // 正常 chunk
-        let ev = ev_with_data(&json!({"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}).to_string());
+        let ev = ev_with_data(
+            &json!({"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}).to_string(),
+        );
         p.feed(&ev, &mut sink).unwrap();
-        let ev_done = ev_with_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string());
+        let ev_done =
+            ev_with_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string());
         p.feed(&ev_done, &mut sink).unwrap();
         p.finish_into(&mut sink).unwrap();
         let c = sink.finish().unwrap();
@@ -548,7 +584,10 @@ mod tests {
             tools: vec![],
             tool_choice: Some("auto"),
             stream: true,
-            stream_options: Some(StreamOptions { include_usage: true }),
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            max_tokens: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"stream\":true"));

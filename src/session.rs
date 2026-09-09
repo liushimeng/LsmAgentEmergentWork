@@ -71,7 +71,9 @@ pub fn generate_session_id(device: &str) -> String {
     let readable = format_readable(secs, subsec_millis);
 
     // Unix 毫秒时间戳(单调)
-    let millis = secs.saturating_mul(1000).saturating_add(u64::from(subsec_millis));
+    let millis = secs
+        .saturating_mul(1000)
+        .saturating_add(u64::from(subsec_millis));
 
     // 随机成分:nanos ^ pid ^ 原子计数器,再哈希取 6 位 hex
     let rand_part = {
@@ -158,10 +160,20 @@ impl Session {
     }
 
     /// 构造协议层所需的请求元数据。
+    ///
+    /// `max_tokens_override` 字段保留为 `None`(协议层默认行为);Agent 循环
+    /// 在 `run_session_inner` 内按会话级 `MaxTokensState` 状态机构造并注入 override,
+    /// 避免污染 Session 的不可变接口(详见 `tmpPlan/2026-09-09_09`)。
+    ///
+    /// `user_agent` 暂留空字符串(第 08 轮新增字段,2026-09-09):Session 不持有
+    /// profile 上下文,具体 UA 由 Agent 循环在 `run_session_inner` 内按 `self.profile`
+    /// 注入(对齐 mod.rs:179 的 `let mut meta = session.meta();` 后续改写)。
     pub fn meta(&self) -> RequestMeta {
         RequestMeta {
             session_id: self.id.clone(),
             device_id: self.device_id.clone(),
+            max_tokens_override: None,
+            user_agent: String::new(),
         }
     }
 }
@@ -180,7 +192,10 @@ mod tests {
     fn device_id_is_64_hex_chars() {
         let d = device_id();
         assert_eq!(d.len(), 64, "device_id 应为 64 位 hex,实际 {d}");
-        assert!(d.chars().all(|c| c.is_ascii_hexdigit()), "device_id 应全为 hex");
+        assert!(
+            d.chars().all(|c| c.is_ascii_hexdigit()),
+            "device_id 应全为 hex"
+        );
     }
 
     #[test]

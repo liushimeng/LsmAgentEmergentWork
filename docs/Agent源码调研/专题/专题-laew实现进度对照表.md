@@ -131,6 +131,7 @@
 **P0 紧急(优先实现)**:
 - L1036 七阶段上下文管线 → 抄 claudecode `query.ts`
 - L1037 max_output_tokens 三级恢复 → 抄 claudecode `query.ts:1186`(截断续接已于 2026-09-08 第 06 轮实现,差 max_tokens 静默升级 8k→64k)
+- ~~L1037 max_tokens 静默升级 8K→64K~~ ✅ 2026-09-09 第 09 轮已完成(`src/agent/max_tokens_state.rs` 会话级 `MaxTokensState` 状态机 8K→16K→32K→64K 封顶;`RequestMeta.max_tokens_override` 协议层注入;`AnthropicClient::complete` 用 `meta.max_tokens_override.unwrap_or(DEFAULT_MAX_TOKENS)`;`OpenAiRequest` 新增 `max_tokens` 字段并在 `complete()` 注入,OpenAI 客户端此前根本不传此字段);`ExecutionTrace.max_tokens_upscalings` + `max_tokens_history` 写入;`run_session_inner` truncation 命中分支调 `note_truncated()` 翻倍;**联动 L771 失败计数预警**:`build_runtime_hints` 在 `<<<LAEW:RUNTIME_HINTS>>>` 标记下拼接 truncation_resumes / overflow_recoveries / max_tokens_upscalings / consecutive_failures ≥ 2 四类提示,仅在对应计数器 > 0 时追加,全 0 时零开销,追加到 system 末尾(不破坏 cache_control 缓存前缀);14 个新单元测试全过;方案 `tmpPlan/2026-09-09_09-max-tokens静默升级与失败计数预警方案.md`
 - ~~L1038 prompt-too-long 三级恢复~~ ✅ 2026-09-09 第 06 轮已完成(`src/agent/overflow.rs`,方案 `tmpPlan/2026-09-09_06-上下文溢出自动检测与三级恢复方案.md`)
 - L1039 cached microcompact → 抄 claudecode `microCompact.ts`
 - ~~L1041 SQLite WAL 配置~~ ✅ 2026-09-09 第 07 轮已完成(`src/database/pragmas.rs` apply_pragmas:WAL/busy_timeout 5s/synchronous=NORMAL/cache 8MB/FK/启动 PASSIVE checkpoint;`Db::open`/`Db::clone` 共用工厂,clone 连接 PRAGMA 一致——修复并行 SubAgent 写 agent_memory `database is locked`;WAL 读回验证不支持时降级 rollback journal,方案 `tmpPlan/2026-09-09_07-SQLite并发WAL加固与完整性自愈方案.md`)

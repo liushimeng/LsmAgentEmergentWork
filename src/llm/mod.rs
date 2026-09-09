@@ -14,12 +14,23 @@ use crate::config::{Protocol, ProviderRecord};
 use crate::error::{AgentError, Result};
 
 pub mod anthropic;
+pub mod cache_policy;
 pub mod cancellable;
 pub mod openai;
 pub mod resilient;
 pub mod sse;
 
-use resilient::{CONNECT_TIMEOUT, ResilientLlmClient};
+pub use cache_policy::{
+    apply_cache_policy, CacheBreakpoints, CacheHint, CachePolicy, CacheTtl, ANTHROPIC_BREAKPOINT_CAP,
+};
+
+/// 默认 Cache Policy: Anthropic 路径自动注入(其他协议客户端忽略)。
+///
+/// 修改此常量即可全局调整策略。laew 当前协议客户端仅 Anthropic
+/// 客户端消费它(第十六轮 L1047)。
+pub const DEFAULT_CACHE_POLICY: CachePolicy = CachePolicy::Auto;
+
+use resilient::{ResilientLlmClient, CONNECT_TIMEOUT};
 
 /// 统一的 HTTP 客户端构造入口:注入连接超时(防连接挂起导致 TUI 冻结)。
 ///
@@ -43,10 +54,66 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 pub struct RequestMeta {
     pub session_id: String,
     pub device_id: String,
+    /// 本次调用的输出 token 上限(由会话级 `MaxTokensState` 状态机计算)。
+    ///
+    /// - Anthropic 协议:作为请求体 `max_tokens` 字段(覆盖默认 8192)。
+    /// - OpenAI 协议:作为请求体 `max_tokens` 字段(此前完全不传,长代码回复易静默截断)。
+    ///
+    /// `None` = 协议层使用自身默认值(Anthropic 8192,OpenAI 不传)。
+    /// 设计见 `tmpPlan/2026-09-09_09-max-tokens静默升级与失败计数预警方案.md`。
+    pub max_tokens_override: Option<u32>,
+    /// 发起本次请求的 Agent 的 User-Agent(如 `LsmAgentEmergentWork-Yolo/0.1.2 <build>`)。
+    ///
+    /// 由 `Agent::run_session_inner` 按当前 profile 逐请求注入,使 8 角色在
+    /// 抓包层面可辨识(2026-09-09 第 08 轮,方案 tmpPlan/2026-09-09_08);
+    /// 为空时协议层回退到客户端构造期的默认 UA。
+    pub user_agent: String,
+}
+
+impl RequestMeta {
+    /// 便捷构造:仅设置会话 / 设备 ID,max_tokens 走协议默认。
+    pub fn new(session_id: impl Into<String>, device_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            device_id: device_id.into(),
+            max_tokens_override: None,
+            user_agent: String::new(),
+        }
+    }
+
+    /// 带 max_tokens override 的构造(供 Agent 循环注入状态机当前值)。
+    pub fn with_max_tokens(
+        session_id: impl Into<String>,
+        device_id: impl Into<String>,
+        max_tokens: u32,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            device_id: device_id.into(),
+            max_tokens_override: Some(max_tokens),
+            user_agent: String::new(),
+        }
+    }
+
+    /// 解析本次请求实际使用的 User-Agent:meta 逐请求注入值优先,空则回退默认。
+    ///
+    /// 协议客户端(anthropic / openai)在 `complete()` 内调用,默认值取构造期
+    /// 烧入的 UA(main / tui 传入的 work_profile UA,兜底用)。
+    pub fn resolve_user_agent<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.user_agent.trim().is_empty() {
+            fallback
+        } else {
+            self.user_agent.as_str()
+        }
+    }
 }
 
 /// 构造两协议通用的请求头:`Content-Type` / `User-Agent` / `Authorization` / `X-Session-Id`。
-pub fn build_common_headers(api_key: &str, meta: &RequestMeta, user_agent: &str) -> Result<HeaderMap> {
+pub fn build_common_headers(
+    api_key: &str,
+    meta: &RequestMeta,
+    user_agent: &str,
+) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
@@ -80,9 +147,19 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
-    ToolResult { tool_use_id: String, content: String, is_error: bool },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 impl ContentBlock {
@@ -90,7 +167,11 @@ impl ContentBlock {
         Self::Text { text: s.into() }
     }
 
-    pub fn tool_result(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         Self::ToolResult {
             tool_use_id: tool_use_id.into(),
             content: content.into(),
@@ -108,14 +189,24 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, content: vec![ContentBlock::text(text)] }
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::text(text)],
+        }
     }
 
     pub fn assistant(blocks: Vec<ContentBlock>) -> Self {
-        Self { role: Role::Assistant, content: blocks }
+        Self {
+            role: Role::Assistant,
+            content: blocks,
+        }
     }
 
-    pub fn tool_result(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         Self {
             role: Role::Tool,
             content: vec![ContentBlock::tool_result(tool_use_id, content, is_error)],
@@ -145,7 +236,11 @@ pub struct ToolDef {
 }
 
 impl ToolDef {
-    pub fn new(name: impl Into<String>, description: impl Into<String>, input_schema: Value) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -207,7 +302,12 @@ pub trait LlmClient: Send + Sync {
     fn protocol(&self) -> Protocol;
 }
 
-/// 根据数据库记录创建对应协议的用户端(注入 User-Agent)。
+/// 根据数据库记录创建对应协议的用户端(注入 User-Agent 兜底值)。
+///
+/// 注意:此处传入的 `user_agent` 仅作为**兜底默认值**——正常运行时
+/// `Agent::run_session_inner` 会按当前 profile 逐请求覆盖
+/// (`RequestMeta::user_agent`),使 8 角色在抓包层面各自可辨识;
+/// 仅绕过 Agent 循环的直接调用(测试等)才会落到该兜底值。
 ///
 /// 自动包一层 [`ResilientLlmClient`]:超时感知 + 自动重试 + 指数退避 +
 /// 三态熔断,调用方(main / tui)零改动即获得弹性与故障隔离。
@@ -249,19 +349,55 @@ mod tests {
         let meta = RequestMeta {
             session_id: "20260902-153012-abcd1234-1700000000000-1a2b3c".into(),
             device_id: "45d277355416ee1b2f42758fb292b60b45170a57a5b4dec5cb7fa1a40fdd17ec".into(),
+            max_tokens_override: None,
+            user_agent: String::new(),
         };
-        let headers = build_common_headers("sk-xxx", &meta, "LsmAgentEmergentWork-Work/0.1.0 2026-09-02 15:30:12 CST").unwrap();
+        let headers = build_common_headers(
+            "sk-xxx",
+            &meta,
+            "LsmAgentEmergentWork-Work/0.1.0 2026-09-02 15:30:12 CST",
+        )
+        .unwrap();
         assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
-        let ua = headers
-            .get("user-agent")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(ua, "LsmAgentEmergentWork-Work/0.1.0 2026-09-02 15:30:12 CST");
+        let ua = headers.get("user-agent").unwrap().to_str().unwrap();
+        assert_eq!(
+            ua,
+            "LsmAgentEmergentWork-Work/0.1.0 2026-09-02 15:30:12 CST"
+        );
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer sk-xxx");
         assert_eq!(
             headers.get("x-session-id").unwrap(),
             "20260902-153012-abcd1234-1700000000000-1a2b3c"
+        );
+    }
+
+    // ========== Agent 身份逐请求注入(第 08 轮,方案 tmpPlan/2026-09-09_08) ==========
+
+    #[test]
+    fn resolve_user_agent_prefers_meta_injection() {
+        // meta 注入优先:8 角色各自的 UA 覆盖构造期默认
+        let mut meta = RequestMeta::new("sess-1", "dev-1");
+        meta.user_agent = "LsmAgentEmergentWork-Yolo/0.1.2 build-x".into();
+        assert_eq!(
+            meta.resolve_user_agent("LsmAgentEmergentWork-SubAgent-Work/0.1.2 build-x"),
+            "LsmAgentEmergentWork-Yolo/0.1.2 build-x"
+        );
+    }
+
+    #[test]
+    fn resolve_user_agent_falls_back_when_empty() {
+        // 空(含纯空白)→ 回退构造期默认:绕过 Agent 循环的直接调用(测试等)不受影响
+        let meta = RequestMeta::new("sess-1", "dev-1");
+        assert_eq!(
+            meta.resolve_user_agent("LsmAgentEmergentWork-SubAgent-Work/0.1.2 build-x"),
+            "LsmAgentEmergentWork-SubAgent-Work/0.1.2 build-x"
+        );
+        let mut blank = RequestMeta::new("sess-1", "dev-1");
+        blank.user_agent = "   ".into();
+        assert_eq!(
+            blank.resolve_user_agent("FALLBACK"),
+            "FALLBACK",
+            "纯空白 UA 应视为空,回退默认"
         );
     }
 }

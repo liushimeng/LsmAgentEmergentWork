@@ -16,8 +16,8 @@ use crate::config::Protocol;
 use crate::error::{AgentError, Result};
 use crate::llm::sse::{DeltaEvent, ParseSink, SseStream};
 use crate::llm::{
-    build_common_headers, normalize_endpoint, ChatMessage, Completion, ContentBlock, LlmClient,
-    RequestMeta, ToolDef,
+    apply_cache_policy, build_common_headers, normalize_endpoint, ChatMessage, Completion,
+    ContentBlock, LlmClient, RequestMeta, ToolDef, DEFAULT_CACHE_POLICY,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -48,8 +48,9 @@ impl AnthropicClient {
 struct AnthropicRequest {
     model: String,
     max_tokens: u32,
+    /// Anthropic 系统提示词,作为文本块数组(允许携带 `cache_control` 断点)。
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Vec<Value>>,
     messages: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
@@ -62,16 +63,20 @@ struct AnthropicRequest {
 
 #[derive(Serialize)]
 struct Metadata {
-    /// JSON 字符串,形如: {"device_id":"...","account_uuid":"","session_id":"..."}
+    /// JSON 字符串,形如: {"device_id":"...","account_uuid":"","session_id":"...","agent":"..."}
     user_id: String,
 }
 
 /// 构造 metadata.user_id 的 JSON 字符串。
-fn build_user_id(device_id: &str, session_id: &str) -> String {
+///
+/// `agent` 为发起请求的 Agent 名称(取 User-Agent 首段,2026-09-09 第 08 轮),
+/// 使请求体自身也可辨识角色;对上游是 opaque 字符串,不影响真实 API。
+fn build_user_id(device_id: &str, session_id: &str, agent_name: &str) -> String {
     json!({
         "device_id": device_id,
         "account_uuid": "",
         "session_id": session_id,
+        "agent": agent_name,
     })
     .to_string()
 }
@@ -96,7 +101,11 @@ fn convert_messages(messages: &[ChatMessage]) -> Vec<Value> {
                     ContentBlock::ToolUse { id, name, input } => {
                         json!({ "type": "tool_use", "id": id, "name": name, "input": input })
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
                         let mut v = json!({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
@@ -125,6 +134,113 @@ fn convert_tools(tools: &[ToolDef]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// 把字符串 system 切分为单个文本块数组(Anthropic 同时支持字符串与数组形态,
+/// 数组形态才能携带 `cache_control` 断点 — L1047)。
+///
+/// 空字符串返回空数组(`AnthropicRequest.system: None` 时整字段被 skip_serializing)。
+/// 非空则返回 `[{ "type": "text", "text": <原文> }]`,`apply_cache_policy`
+/// 在最后一个(也是唯一)文本块上打 cache_control。
+fn convert_system_blocks(system: &str) -> Vec<Value> {
+    if system.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "text", "text": system })]
+    }
+}
+
+#[cfg(test)]
+mod cache_policy_tests {
+    //! 验证 `convert_system_blocks` 与 `apply_cache_policy` 在 Anthropic 协议层的端到端集成。
+
+    use super::*;
+    use crate::llm::{ChatMessage, ToolDef};
+    use serde_json::json;
+
+    #[test]
+    fn convert_system_blocks_empty_returns_empty() {
+        assert!(convert_system_blocks("").is_empty());
+        assert!(convert_system_blocks("   ").is_empty());
+        assert!(convert_system_blocks("\n\t").is_empty());
+    }
+
+    #[test]
+    fn convert_system_blocks_single_text_block() {
+        let blocks = convert_system_blocks("you are a helpful assistant");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "you are a helpful assistant");
+        // 未应用 cache policy 时不带 cache_control
+        assert!(blocks[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn convert_system_blocks_plus_apply_marks_last_block() {
+        let blocks = convert_system_blocks("s");
+        let (out_sys, _, _, bp) = apply_cache_policy(
+            DEFAULT_CACHE_POLICY,
+            blocks,
+            vec![json!({"name":"T","description":"d","input_schema":{}})],
+            vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})],
+        );
+        assert_eq!(out_sys.len(), 1);
+        assert!(out_sys[0].get("cache_control").is_some());
+        assert_eq!(bp.dropped, 0);
+    }
+
+    #[test]
+    fn anthropic_request_system_field_serializes_as_array() {
+        // 直接验证序列化形态
+        #[derive(serde::Serialize)]
+        struct Probe {
+            system: Option<Vec<Value>>,
+        }
+        let probe = Probe {
+            system: Some(vec![json!({
+                "type":"text",
+                "text":"hello",
+                "cache_control": {"type":"ephemeral"}
+            })]),
+        };
+        let s = serde_json::to_string(&probe).unwrap();
+        assert!(s.contains("\"type\":\"text\""));
+        assert!(s.contains("\"cache_control\":{\"type\":\"ephemeral\"}"));
+    }
+
+    #[test]
+    fn end_to_end_request_body_has_cache_control_on_three_breakpoints() {
+        // 模拟一次完整 complete() 路径的请求体构造
+        let system = "you are x";
+        let tools = vec![
+            ToolDef::new("Read", "read file", json!({"type":"object"})),
+            ToolDef::new("Write", "write file", json!({"type":"object"})),
+        ];
+        let messages = vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant(vec![ContentBlock::text("ok")]),
+            ChatMessage::user("second"),
+        ];
+
+        let sys_blocks = convert_system_blocks(system);
+        let tool_blocks = convert_tools(&tools);
+        let msg_blocks = convert_messages(&messages);
+        let (sys_blocks, tool_blocks, msg_blocks, _) = apply_cache_policy(
+            DEFAULT_CACHE_POLICY,
+            sys_blocks,
+            tool_blocks,
+            msg_blocks,
+        );
+
+        // 1) last tool
+        assert!(tool_blocks.last().unwrap().get("cache_control").is_some());
+        // 2) last system
+        assert!(sys_blocks.last().unwrap().get("cache_control").is_some());
+        // 3) latest user message text block
+        let latest_user = msg_blocks.iter().rfind(|m| m["role"] == "user").unwrap();
+        let content = latest_user["content"].as_array().unwrap();
+        assert!(content.last().unwrap().get("cache_control").is_some());
+    }
 }
 
 /// 协议 parser:把 Anthropic SSE 事件喂给 [`ParseSink`]。
@@ -157,7 +273,8 @@ impl AnthropicParser {
                 sink.feed(DeltaEvent::InputUsage {
                     input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
                     cache_read: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
-                    cache_creation: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
+                    cache_creation: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
+                        as u32,
                 })?;
             }
             "content_block_start" => {
@@ -210,16 +327,11 @@ impl AnthropicParser {
             }
             "message_stop" => {
                 // 兜底终止(若 message_delta 没给 stop_reason 也能收尾)
-                sink.feed(DeltaEvent::Stop {
-                    stop_reason: None,
-                })?;
+                sink.feed(DeltaEvent::Stop { stop_reason: None })?;
             }
             "ping" => {}
             "error" => {
-                let kind = v["error"]["type"]
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .to_string();
+                let kind = v["error"]["type"].as_str().unwrap_or("unknown").to_string();
                 let msg = v["error"]["message"]
                     .as_str()
                     .unwrap_or("unknown upstream error")
@@ -243,20 +355,40 @@ impl LlmClient for AnthropicClient {
         tools: &[ToolDef],
         meta: &RequestMeta,
     ) -> Result<Completion> {
+        // Agent 身份逐请求注入(2026-09-09 第 08 轮):meta 注入的 UA 优先,
+        // 空则回退构造期默认 —— 同一客户端上 8 角色请求在抓包层面各自可辨识。
+        let user_agent = meta.resolve_user_agent(&self.user_agent);
+        let agent_name = user_agent.split('/').next().unwrap_or_default();
+        // Prompt Caching(第十六轮 L1047):Anthropic 路径自动注入 cache_control 断点。
+        // OpenAI 协议忽略(走隐式 prefix caching),故无需在此处判断协议。
+        // 三元组顺序:tools → system → messages,与 opencode cache-policy.ts 一致。
+        let sys_blocks = convert_system_blocks(system);
+        let tool_blocks = convert_tools(tools);
+        let msg_blocks = convert_messages(messages);
+        let (sys_blocks, tool_blocks, msg_blocks, _bp) = apply_cache_policy(
+            DEFAULT_CACHE_POLICY,
+            sys_blocks,
+            tool_blocks,
+            msg_blocks,
+        );
+
         let req = AnthropicRequest {
             model: self.model.clone(),
-            max_tokens: DEFAULT_MAX_TOKENS,
-            system: if system.trim().is_empty() { None } else { Some(system.to_string()) },
-            messages: convert_messages(messages),
-            tools: convert_tools(tools),
+            // max_tokens 静默升级(2026-09-09 第 09 轮,实现 L1037):
+            // 会话级 MaxTokensState 在 LLM 输出被截断时翻倍,默认 8K → 16K → 32K → 64K 上限。
+            // 协议层仅负责读取 meta 注入的 override,不参与升级逻辑。
+            max_tokens: meta.max_tokens_override.unwrap_or(DEFAULT_MAX_TOKENS),
+            system: if sys_blocks.is_empty() { None } else { Some(sys_blocks) },
+            messages: msg_blocks,
+            tools: tool_blocks,
             metadata: Some(Metadata {
-                user_id: build_user_id(&meta.device_id, &meta.session_id),
+                user_id: build_user_id(&meta.device_id, &meta.session_id, agent_name),
             }),
             stream: true,
         };
 
         // 通用头:Content-Type / User-Agent / Authorization / X-Session-Id
-        let mut headers = build_common_headers(&self.api_key, meta, &self.user_agent)?;
+        let mut headers = build_common_headers(&self.api_key, meta, user_agent)?;
         // Anthropic 专属头:x-api-key + anthropic-version(保留官方 SDK 风格)
         headers.insert(
             HeaderName::from_static("x-api-key"),
@@ -322,8 +454,8 @@ impl LlmClient for AnthropicClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::Role;
     use crate::llm::sse::SseEvent;
+    use crate::llm::Role;
     use serde_json::json;
 
     #[test]
@@ -431,7 +563,8 @@ mod tests {
         p.feed(&ev, &mut sink).unwrap();
         let ev = SseEvent {
             event: Some("message_delta".into()),
-            data: json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}).to_string(),
+            data: json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}})
+                .to_string(),
             id: None,
             retry: None,
         };
@@ -459,7 +592,8 @@ mod tests {
         let mut sink = ParseSink::new();
         let ev = SseEvent {
             event: Some("message_start".into()),
-            data: json!({"message":{"usage":{"input_tokens":42,"cache_read_input_tokens":7}}}).to_string(),
+            data: json!({"message":{"usage":{"input_tokens":42,"cache_read_input_tokens":7}}})
+                .to_string(),
             id: None,
             retry: None,
         };
@@ -523,7 +657,9 @@ mod tests {
         p.feed(
             &SseEvent {
                 event: Some("content_block_delta".into()),
-                data: json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}).to_string(),
+                data:
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}})
+                        .to_string(),
                 id: None,
                 retry: None,
             },
@@ -562,7 +698,8 @@ mod tests {
         p.feed(
             &SseEvent {
                 event: Some("message_delta".into()),
-                data: json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":123}}).to_string(),
+                data: json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":123}})
+                    .to_string(),
                 id: None,
                 retry: None,
             },
@@ -579,7 +716,8 @@ mod tests {
         p.feed(
             &SseEvent {
                 event: Some("error".into()),
-                data: json!({"error":{"type":"overloaded_error","message":"overloaded"}}).to_string(),
+                data: json!({"error":{"type":"overloaded_error","message":"overloaded"}})
+                    .to_string(),
                 id: None,
                 retry: None,
             },
@@ -614,7 +752,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             metadata: Some(Metadata {
-                user_id: build_user_id("dev1234567890", "sess-1"),
+                user_id: build_user_id("dev1234567890", "sess-1", "LsmAgentEmergentWork-Yolo"),
             }),
             stream: true,
         };
@@ -625,6 +763,8 @@ mod tests {
         assert_eq!(parsed["device_id"], "dev1234567890");
         assert_eq!(parsed["session_id"], "sess-1");
         assert_eq!(parsed["account_uuid"], "");
+        // 第 08 轮:agent 字段使请求体自身可辨识发起角色
+        assert_eq!(parsed["agent"], "LsmAgentEmergentWork-Yolo");
     }
 
     #[test]
