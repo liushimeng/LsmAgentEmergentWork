@@ -2,9 +2,10 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **50 维度 × 10 个 = 500 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **55 维度 × 10 个 = 550 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
-编码 Coding、界面设计、文件整理处理等多个角度，**无重复主题**。
+编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD
+等多个角度，**无重复主题**。
 
 ## 用途
 
@@ -70,6 +71,11 @@ docs/自动化测试-提示词文件列表/
   48-操作系统与内核原理.md                  ← 内核架构/进程线程/调度/CFS/内存管理/IPC/同步原语/文件系统/虚拟化容器/eBPF
   49-编译原理与DSL实战.md                   ← 编译流程/词法分析/语法分析/AST/IR+SSA/代码生成/优化/JIT/DSL设计/Mini-Lisp实战
   50-软件架构模式与设计系统.md              ← 架构全景/DDD/CQRS+ES/整洁架构/事件驱动/插件化/API选型/ADR/可演化/ATAM评估
+  51-LLM提示词注入与AI红队.md                ← 提示词注入/越狱/PII泄露/Agent劫持/RAG投毒/模型供应链/水印溯源/合规
+  52-异步编程范式专题.md                    ← 异步模型演进/Rust tokio/Go goroutine/Node事件循环/Java虚拟线程/Kotlin协程/Reactive/取消传播/反模式
+  53-软件供应链与SBOM工程.md                ← 供应链攻击/SBOM标准/CVE监控/制品签名/SLSA/License合规/私有仓库/可复现构建/应急响应
+  54-技术写作与知识沉淀.md                  ← 金字塔原理/ADR/API文档/Runbook/Engineering Wiki/RFC/技术博客/演讲/注释即文档/工具链
+  55-领域驱动设计DDD专题.md                  ← 通用语言/限界上下文/Context Map/聚合根/值对象/领域服务/领域事件/仓储/事件风暴/团队转型
 ```
 
 ## 编号规则
@@ -126,6 +132,11 @@ docs/自动化测试-提示词文件列表/
 | AW01–AW10 | 操作系统与内核原理 | 内核架构/进程线程/调度/CFS/内存管理/IPC/同步原语/文件系统/虚拟化容器/eBPF | medium~hard |
 | AX01–AX10 | 编译原理与 DSL 实战 | 编译流程/词法分析/语法分析/AST/IR+SSA/代码生成/优化/JIT/DSL设计/Mini-Lisp实战 | medium~hard |
 | AY01–AY10 | 软件架构模式与设计系统 | 架构全景/DDD/CQRS+ES/整洁架构/事件驱动/插件化/API选型/ADR/可演化/ATAM评估 | medium~hard |
+| AZ01–AZ10 | LLM 提示词注入与 AI 红队 | 提示词注入/越狱/PII泄露/Agent劫持/RAG投毒/模型供应链/水印溯源/合规 | medium~hard |
+| BA01–BA10 | 异步编程范式专题 | 异步模型演进/Rust tokio/Go goroutine/Node事件循环/Java虚拟线程/Kotlin协程/Reactive/取消传播/反模式 | medium~hard |
+| BB01–BB10 | 软件供应链与 SBOM 工程 | 供应链攻击/SBOM标准/CVE监控/制品签名/SLSA/License合规/私有仓库/可复现构建/应急响应 | medium~hard |
+| BC01–BC10 | 技术写作与知识沉淀 | 金字塔原理/ADR/API文档/Runbook/Engineering Wiki/RFC/技术博客/演讲/注释即文档/工具链 | simple~medium |
+| BD01–BD10 | 领域驱动设计 DDD 专题 | 通用语言/限界上下文/Context Map/聚合根/值对象/领域服务/领域事件/仓储/事件风暴/团队转型 | medium~hard |
 
 ## 每条提示词的字段
 
@@ -166,7 +177,7 @@ docs/自动化测试-提示词文件列表/
 
 ## 维护约定
 
-- 新增主题时**先检索本库 460 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…）。
+- 新增主题时**先检索本库 510 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/BC/BD/BE…）。
 - 修改 laew 功能后（如新增工具、改档位策略），同步修订受影响条目的「预期档位」。
 - 每组提示词控制在 3~5 轮；后轮必须与前轮有显式承接关系，保证"多轮"语义成立。
 - 实测发现某条实际档位与预期不符时，先记录现象（写入 testReport/ 验证报告），
