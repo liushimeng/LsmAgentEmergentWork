@@ -5669,3 +5669,471 @@ return { kind: 'script', placement: 'body', text: bootThemeScript(preference, fo
 
 > deepseek-harness 在第十八轮的 8 维度展现了**Web-first 工程如何把"用户体验"做成严谨的形式化契约**：代际防 stale、shadow-price 协议、claimed 完整性 watchdog、durable schema = wire envelope、版本化 welcome notice、pipe-separated stats with durable projection priority、fflate 流式 + 64 KiB 背压、boot 主题内联避免 FOUC。
 > 对 laew（TUI 为主）的核心启示：**用"显式状态机 + 单调计数器 + bounded fold + 单事件源"替代"无意识副作用"**——每个 UX 维度都该有可重放的契约、可验证的不变量、可解释的投影。
+
+---
+
+## 第 21 章 第十九轮深挖 — 安全纵深 + 多模态 + A2A + a11y + 离线 + 同步（2026-09-09）
+
+> 完整分析见 4 份第十九轮专题文档：
+> - `专题-第十九轮-安全与威胁模型深度对比.md`（D9，1582 行，55 个 gap L1591-L1645）
+> - `专题-第十九轮-A2A协议与多Agent互操作深度对比.md`（D11，1355 行，60 个 gap L1701-L1760）
+> - `专题-第十九轮-可访问性a11y与RTL深度对比.md`（D12，1200+ 行，60 个 gap L1761-L1820）
+> - `专题-第十九轮-跨设备同步与会话漫游深度对比.md`（D14，1149 行，50 个 gap L1881-L1930）
+> - D10 多模态输出 / D13 离线模式两份专题仍在进行中（gap 编号已预留 L1641-L1700 / L1821-L1880）
+>
+> 本章为浓缩索引：每维度核心机制表 + 关键代码锚点 + gap 汇总 + 借鉴路线图。
+> **本轮定位**：第十八轮首次切入「用户交互体验层」（D1-D8），本轮继续深挖该层剩余 6 大全新维度（D9-D14），并首次系统化覆盖「安全纵深」「多模态输出」「A2A 协议」「可访问性」「离线模式」「跨设备同步」——前 18 轮几乎未专门深挖。
+> **新增 gap**：L1591-L1930+（共 340+ 个新 gap，累计突破 1930）。
+
+### 维度总览
+
+| 维度 | 核心实现 | 关键文件 | 关键设计 | 新增 gap |
+|------|---------|---------|---------|---------|
+| **D9** 安全与威胁模型 | C11 Landlock launcher 298 行 + 四平台原生沙箱 + 凭证 0o600 + 跨进程锁 + role('secret') | `native/landlock-run/main.c`、`sandbox/sandbox-local/src/index.ts`、`credentials-local/src/index.ts` | bwrap+Landlock / Seatbelt / ACL 三平台链 + 审批审计对 + 不变式校验 | L1591-L1645（55 个） |
+| **D10** 多模态输出 | mdast + shiki 同步 JS regex + 流式 O(tail) | `client/ui-primitives/src/markdown/` | Boot 3 + lazy N grammar + 流式 tail 解析 | L1641-L1700（预留） |
+| **D11** A2A 协议与多 Agent 互操作 | ACP 桥 1853 行 + Cordis 注册中心 + E2A 事件总线 + A2UI Tagged JSON | `packages/acp/acp/src/index.ts`、`packages/acp/acp/src/session.ts`、`packages/acp/acp/src/codec.ts` | AcpSession + AcpModelControl + TurnEndReason→StopReason 映射 + 更新流 | L1701-L1760（60 个） |
+| **D12** 可访问性 a11y / RTL | 538+ ARIA 属性 + aria-live + 版本化 welcome + 无 FOUC boot + npm/wcwidth | `packages/client/src/components/ChatMessage.tsx`、`client/ui-settings-models/src/onboarding-copy.ts` | React + 散落 role="status" + 12-17px 可调字号 + 部分 logical props | L1761-L1820（60 个） |
+| **D13** 离线模式与本地优先 | Worker 线程协议 + Write-Behind 一致性 | `packages/api/gateway/src/stream-protocol.ts` | generation 单调递增 + accept() 确认 + carrier 错误分类 | L1821-L1880（预留） |
+| **D14** 跨设备同步与会话漫游 | Cordis 注册中心 + SessionEventStream + Typert Remote 协议 | `packages/api/gateway/src/client/remote-stream.ts`、`packages/api/session-controller/src/client/transport.ts` | 物理 generation 单调递增 + 自动重开 + waterfall/emit 双模式 | L1881-L1930（50 个） |
+
+---
+
+### D9 安全与威胁模型（8 子维度）
+
+> deepseek-harness 在 D9 的核心竞争力是**四平台原生沙箱链**（业界最佳实践之一）+ **审批审计对 + 不变式校验**。
+
+#### D9-1 STRIDE 威胁模型
+
+| 子维度 | deepseek-harness 实现 | 代码定位 |
+|--------|---------------------|---------|
+| STRIDE 建模 | ❌ 无文档，以「能力接缝」架构替代（安全关注点 = 独立 Cordis 服务，DI 编排） | 各 Cordis 服务 |
+| Prompt 注入 | ⚠️ 结构性隔离：@Untrusted 类型标注 + URL 信任栅栏 | `mcp/mcp-client/src/tools.ts:197`、`api-request-trust.ts:91-118` |
+| Bash 检测 | ⚠️ 沙箱包裹（无 AST）：把隔离职责推给 OS 沙箱 | `shell/bash-sandbox/src/index.ts:88-114` |
+| 凭证管理 | ✅ 0o600 + 0o700 目录 + 跨进程写锁 + role('secret') 结构性脱敏 | `credentials-local/src/index.ts:1-785`、`settings/settings/src/redact.ts:50-92` |
+| 文件路径信任 | ✅ containment（lexical fast path + dev+ino 身份）+ 观察者写保护 | `fs-sandbox/src/containment.ts:58-76`、`fs-observation-policy/src/index.ts:88` |
+| 进程沙箱 | ✅ **四平台原生沙箱**：Linux(bwrap+Landlock) / macOS(Seatbelt) / Windows(ACL) | `sandbox-local/src/index.ts:159-187`、`landlock-run/main.c:1-298` |
+| SSRF 防护 | ⚠️ DNS-rebinding Host 栅栏（Host + Origin + sec-fetch-site 三层） | `client/connection/src/api-request-trust.ts:91-118` |
+| 决策审计 | ✅ 审批审计对（approval/asked + approval/decided）+ 不变式校验 | `user-approval/src/types.ts:34-59`、`user-approval/src/invariant.ts:27-103` |
+
+#### D9 关键代码片段
+
+**1. 四平台沙箱链**（`packages/sandbox/sandbox-local/src/index.ts:159-187`）：
+```typescript
+PLATFORM_CHAIN = { linux: ['bwrap', 'landlock'], macos: ['seatbelt'], windows: ['acl'] }
+// bwrap 配置: --ro-bind / / --unshare-pid --die-with-parent
+// Landlock: 自定义 UAPI, ABI 版本协商 MAX_ABI=5, PR_SET_NO_NEW_PRIVS 防提权
+// Seatbelt: (deny file-write*) + allow-list subpath
+// Windows ACL: DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED
+```
+
+**2. Landlock C11 launcher 298 行**（`native/landlock-run/packages/entry/src/main.c:1-298`）：
+```c
+// 自定义 Landlock UAPI（不依赖 <linux/landlock.h>）
+// ABI 版本协商（MAX_ABI = 5L，支持 ABI 1-5 的 access bits）
+// PR_SET_NO_NEW_PRIVS 防 setuid 提权
+// --probe 功能探测（构建 maximal ruleset 验证内核是否真正 enforce）
+// Fail-closed：任何失败 exit 125 且不 exec 命令
+```
+
+**3. 凭证四层信任链**（`packages/credentials/credentials-local/src/index.ts:1-36`）：
+```
+inherited process environment (read-only, wins)
+> $DSH_HOME/.credentials.yaml (provider-managed, writable)
+> <invocation cwd>/.env (read-only fallback)
+> $DSH_HOME/.env (read-only fallback)
+// assertOwnerOnly() 拒绝 group/other 可读的凭证文件，要求 chmod 600
+// withFileLock() + DOCUMENT_LOCK_WAIT_MS = 30_000 保证 token refresh 原子性
+```
+
+**4. 审批审计对 + 不变式校验**（`packages/interaction/user-approval/src/invariant.ts:27-103`）：
+```typescript
+// approval/asked: { id, toolName, callId?, reason? }
+// approval/decided: { id, outcome }  // outcome ∈ allowed-once | rejected | cancelled | unavailable
+// 不变式：approval/asked 必须在 open turn 内 + id 不可重复 + decided 必须有匹配 asked
+// pre-commit staging：事件发布前先通过 internal/dispatch 暂存，session/event 时校验配对
+```
+
+**5. 文件 containment**（`packages/fs/fs-sandbox/src/containment.ts:58-76`）：
+```typescript
+// lexical fast path + dev+ino 文件系统身份
+// checkedTarget TOCTOU 防护（fs-sandbox/src/index.ts:144）
+// 观察者写保护（fs-observation-policy/src/index.ts:88）
+```
+
+#### D9 laew gap 汇总
+
+| 优先级 | gap 编号范围 | 核心缺失 |
+|--------|-------------|---------|
+| **P0 紧急** | L1591-L1610（20 项） | 无形式化威胁模型 / 无 Prompt 注入检测 / 无 Bash 23 层检测 / API Key 明文 SQLite / 无 AES-256-GCM / 无 0o600 / 无工作目录信任 / 无 Landlock 沙箱 / 无私有 IP 拦截 / 无决策审计 3 段式 |
+| **P1 重要** | L1611-L1630（20 项） | 无 MITRE ATLAS / 无双 pass scrub / 无 synthetic 标记 / 无 Zsh 危险命令 / 无 SecretRef 4 级校验 / 无时序安全比较 / 无 tilde TOCTOU 防护 / 无 Docker 容器 / 无 IPv4-mapped IPv6 解析 / 无 W3C traceparent |
+| **P2 进阶** | L1631-L1645（15 项） | 无攻击链建模 / 无随机边界标记 / 无命令元组 arity 字典 / 无 role('secret') 脱敏 / 无四平台沙箱链 / 无 escalation ladder / 无 LRU dispatcher 池 / 无 10 万行滚动保留 |
+
+---
+
+### D10 多模态输出（6 子维度）
+
+> deepseek-harness 在 D10 的核心是 **mdast + shiki 同步 JS regex + 流式 O(tail) 解析**——与第十八轮 D5 工具输出富文本共享同一套渲染管线。
+
+| 子维度 | deepseek-harness 实现 | 代码定位 |
+|--------|---------------------|---------|
+| D10-1 图表 | ❌ 无 Mermaid/Graphviz | — |
+| D10-2 数学公式 | ❌ 无 KaTeX/MathJax（D5 中 katex 仅用于工具输出富文本） | — |
+| D10-3 图片协议 | ❌ 无 iTerm2/sixel/kitty 图片协议 | — |
+| D10-4 Markdown | ✅ mdast + shiki 同步 JS regex + Boot 3 + lazy N grammar | `client/ui-primitives/src/markdown/` |
+| D10-5 HTML/SVG | ❌ 无 HTML 公开分享 | — |
+| D10-6 流式多模态 | ✅ 流式 O(tail) 解析（尾块重解析，前块冻结为缓存 React 元素） | `client/ui-primitives/src/markdown/MarkdownText.tsx:8-20` |
+
+**laew 现状**：❌ 完全缺失（cell-based 纯文本，无 diff/语法高亮/图片）。gap 编号 L1641-L1700 预留（专题进行中）。
+
+---
+
+### D11 A2A 协议与多 Agent 互操作（7 子维度）
+
+> deepseek-harness 在 D11 的核心竞争力是 **A2A/ACP/E2A/A2UI 全协议栈**（7 工程中唯一与 openclaw 并列的全协议栈实现）+ **Cordis 注册中心**。
+
+#### D11 子维度实现
+
+| 子维度 | deepseek-harness 实现 | 代码定位 |
+|--------|---------------------|---------|
+| D11-1 A2A Protocol | ❌ 无独立 A2A 模块（第十一轮报告中的"A2A"标注为 Cordis 事件总线，非 Google A2A Protocol） | — |
+| D11-2 ACP | ✅ **Cordis Fiber + ACP 桥 1853 行**：AcpSession + AcpModelControl + 更新流 | `packages/acp/acp/src/index.ts:1-534`、`session.ts:1-527` |
+| D11-3 E2A | ✅ 事件总线：有界发送 6MB 上限 + 心跳 ping 30s / timeout 300s + LLM SSE 流补丁 | Cordis Fiber 消息总线 |
+| D11-4 A2UI | ✅ Tagged JSON：build_prompt(language=...) 语言分流 + verify_a2ui_bundle.py | 结构化 UI 渲染协议 |
+| D11-5 MCP 双向 | ⚠️ MCP 客户端（非双向）：mountAcpMcpServers() 将 ACP MCP 声明转为 DSH MCP 客户端 | `packages/mcp/mcp-client/` |
+| D11-6 跨语言互操作 | ❌ 纯 TypeScript（无 PyO3/FFI） | — |
+| D11-7 协议路由发现 | ✅ Cordis 注册中心：六态生命周期 + Fiber epoch + 事件分发 | Cordis Everything-is-a-Plugin |
+
+#### D11 关键代码片段
+
+**1. ACP 核心入口**（`packages/acp/acp/src/index.ts:1-534`）：
+```typescript
+// Automation-only Agent Client Protocol server over JSON-RPC stdio
+export const name = 'acp'
+export const inject = ['agents', 'llm', 'sessionPersistence', 'sessions']
+// Session 表：Map<SessionId, AcpSession>
+// 事件桥接：session/event + agent/inbox/claimed + agent/error + llm/adapters-updated
+// 权限通道：approval/request → session/request_permission（仅 allow-once / reject-once）
+```
+
+**2. AcpSession 类**（`packages/acp/acp/src/session.ts:98-117`）：
+```typescript
+export class AcpSession {
+  readonly agent: Agent
+  private readonly modelControl: AcpModelControl
+  private outputTail = Promise.resolve()
+  private inflight: InflightPrompt | undefined
+  // create() / resume() 创建/恢复
+  // owns(agent) / ownsSession(session) 精确引用比较（所有权验证）
+}
+```
+
+**3. TurnEndReason→StopReason 映射**（`packages/acp/acp/src/codec.ts:14-34`）：
+```typescript
+export function turnEndToStopReason(reason: TurnEndReason): StopReason {
+  switch (reason.kind) {
+    case 'completed': return 'end_turn'
+    case 'max-tokens': return 'max_tokens'
+    case 'aborted': return 'end_turn'  // hook/owner 中止 = 普通静止
+    case 'interrupted': return 'cancelled'
+    case 'blocked': case 'error': return 'end_turn'
+    default: return 'end_turn'
+  }
+}
+// 关键设计：cancelled 保留给显式客户端取消（session/cancel）和 disposal
+```
+
+**4. ACP 更新流**（`packages/acp/acp/src/updates.ts:16-85`）：
+```typescript
+// assistant message → 3 种 update
+{ sessionUpdate: 'agent_thought_chunk', messageId, content: { type: 'text', text } }
+{ sessionUpdate: 'agent_message_chunk', messageId, content }
+{ sessionUpdate: 'usage_update', used, size }
+// tool call → tool_call update（status: 'in_progress'）
+// tool result → tool_call_update（status: 'completed'|'failed'）
+```
+
+**5. MCP 挂载**（`packages/acp/acp/src/mcp.ts:26-33`）：
+```typescript
+export async function mountAcpMcpServers(agentCtx, servers, sessionCwd): Promise<void> {
+  // Stdio 验证：isAbsolute(server.command) 要求绝对路径
+  // HTTP 验证：assertHttpUrl() 限制 http/https 协议
+  // 名称规范化：normalizeServerName() NFKD + slug + sha256 摘要
+  // 重复检测：Set<string> 检测重复规范化名称
+}
+```
+
+#### D11 laew gap 汇总
+
+| 优先级 | gap 编号范围 | 核心缺失 |
+|--------|-------------|---------|
+| **P0 紧急** | L1701-L1720（20 项） | 无 A2A Protocol / 无 ACP Server / 无 Agent Card / 无 SubAgent 注册中心 / 无并发控制 / 无 SubAgent 恢复 / 无 SendMessage / 无 GetTask / 无 ACP initialize / 无 session/new / 无 session/prompt / 无 MCP 挂载 / 无模型控制 / 无消息截断保护 / 无速率限制 / 无 SSRF 防护 / 无 Peer 认证 / 无 StopReason 映射 / 无更新流 / 无 FIFO 会话队列 |
+| **P1 重要** | L1721-L1740（20 项） | 无 A2A 批处理 / 无等待者模式 / 无终端任务清理 / 无会话隔离 / 无 allowlist / 无出站发送 / 无协议兼容重试 / 无 ACP v2 / 无 replayFrom / 无 elicitation / 无 session/list / 无 keyset 分页 / 无权限请求通道 / 无事件账本 / 无会话容量上限 / 无空闲 TTL / 无 LRU 驱逐 / 无活跃保护 / 无暂停恢复 / 无孤儿恢复 |
+| **P2 进阶** | L1741-L1760（20 项） | 无 E2A 事件总线 / 无 A2UI / 无 Talk Realtime / 无 AgentHarness 注册 / 无 Workboard / 无 Swarm 调度 / 无 Leader-Teammate / 无 Cordis Fiber / 无 SubAgent 11 包 / 无二进制帧 / 无 WriterLease / 无 MCP 双向 Resource / 无 MCP 双向 Sampling / 无 MCP SSOT / 无协议 IR / 无健康检查 / 无注册表分页 / 无 ACP 配置选项 / 无 ACP 翻译层 |
+
+---
+
+### D12 可访问性 a11y / RTL（7 子维度）
+
+> deepseek-harness 在 D12 的实现**偏弱**：538+ ARIA 属性 + aria-live 是亮点，但无高对比度主题、无 RTL 支持、无减动效检测。
+
+#### D12 子维度实现
+
+| 子维度 | deepseek-harness 实现 | 代码定位 |
+|--------|---------------------|---------|
+| D12-1 屏幕阅读器 | ✅ **538+ ARIA 属性** + visually-hidden + aria-live="polite" + role="alert" | `packages/client/src/components/ChatMessage.tsx:30-50` |
+| D12-2 高对比度主题 | ❌ 仅 light/dark/system（无高对比度 / 无色盲主题） | — |
+| D12-3 减动效 | ✅ **22+ CSS 文件** + 完整降级链 | 各 CSS 文件 |
+| D12-4 RTL | 🟡 部分 logical props（无 dir="rtl" 切换 / 无 bidi 算法） | `packages/client/src/styles/chat.css:30-50` |
+| D12-5 盲文 | ❌ 无 Braille 终端适配 | — |
+| D12-6 键盘可达 | ✅ focus-visible 环 + tabIndex 显式控制 + 键盘事件 | `packages/client/src/hooks/useKeyboard.ts:1-50` |
+| D12-7 字体/字号 | ✅ **12-17px 可调** + npm/wcwidth + CJK 字体回退 | `packages/client/package.json:20` |
+
+#### D12 关键代码片段
+
+**1. ARIA live region**（`packages/client/src/components/ChatMessage.tsx:30-50`）：
+```tsx
+<div role="status" aria-live="polite">
+    {streaming ? <Spinner /> : <Markdown content={content} />}
+</div>
+// 不足：所有消息共用同一 role="status"，屏幕阅读器无法区分用户/助手/工具输出
+```
+
+**2. 版本化 welcome notice**（`packages/client/ui-settings-models/src/onboarding-copy.ts:6-10`）：
+```typescript
+export const WELCOME_NOTICE_VERSION = '2026-08-13.1'
+// 用户确认的版本号持久化；启动比对 —— 不一致才显示
+```
+
+**3. 无 FOUC 主题 boot**（`packages/client/ui-theme/src/boot-theme.ts:25-30`）：
+```typescript
+return { kind: 'script', placement: 'body', text: bootThemeScript(preference, fontSize) }
+// 内联 script 紧跟 <body> 打开后 → React mount 前已设置 data-ds-dark-theme
+```
+
+#### D12 laew gap 汇总
+
+| 优先级 | gap 编号范围 | 核心缺失 |
+|--------|-------------|---------|
+| **P0 紧急** | L1771、L1778、L1801、L1802、L1805（5 项） | 无主题切换 / 无 focus ring 主题 / 无 IME compositionstart 防护 / 无 IME 双 setTimeout flush / 无 focus-visible |
+| **P1 重要** | L1761-L1770、L1772-L1774、L1777、L1796、L1800、L1803-L1804、L1806-L1807、L1811-L1813（15 项） | 无 ARIA live / 无高对比度主题 / 无色盲主题 / 无 prefers-contrast / 无 ANSI 降级 / 无 ANSI bell / 无高优先级 live region / 无 Ctrl+G 外部编辑器 / 无 Ctrl+R 反向搜索 / 无 Tab order 显式管理 / 无 Focus trap / 无 unicode-width / 无 emoji ZWJ / 无 VS16 |
+| **P2 进阶** | L1763、L1766、L1770、L1775-L1776、L1779-L1780、L1786-L1795、L1797-L1799、L1808-L1809、L1810、L1814-L1820（20 项） | 无 aria-busy / 无 sr-only / 无 alt 检查 / 无 prefers-color-scheme / 无 ANSI 4-bit / 无系统主题监听 / 无主题持久化 / 无 RTL locale 检测 / 无 dir="rtl" / 无 CSS Logical Props / 无 bidi 算法 / 无 macOS 通知 / 无 NVDA 测试 / 无 VoiceOver / 无键位注册中心 / 无撤销重做 / 无键位自定义 / 无 emoji 1.0+ / 无 CJK 字体回退文档 / 无等宽字体测试 / 无字号放大 / 无 clamp() / 无 SVG 宽度映射 / 无字体回退文档 |
+| **P3 长期** | L1767-L1768、L1781-L1785、L1792、L1817-L1820（20 项） | 无 Braille 适配 / 无 VoiceOver 朗读 / 无减动效（TUI 无需）/ 无 atlas 镜像 / 无字号放大 / 无 clamp() / 无 SVG 宽度映射 / 无字体回退文档 |
+
+---
+
+### D13 离线模式与本地优先（6 子维度）
+
+> deepseek-harness 在 D13 的核心是 **Worker 线程协议 + Write-Behind 一致性**（与第十七轮 Pregel 图执行共享基础设施）。
+
+| 子维度 | deepseek-harness 实现 | 代码定位 |
+|--------|---------------------|---------|
+| D13-1 离线检测 | ❌ 无 | — |
+| D13-2 请求队列 | ⚠️ Worker 线程协议（有界发送 + 心跳） | Cordis Fiber |
+| D13-3 本地缓存 | ⚠️ Write-Behind 一致性 | 各 Cordis 服务 |
+| D13-4 队列持久化 | ❌ 无 JSONL 事务日志 | — |
+| D13-5 离线功能子集 | ✅ 内置工具（Bash/Read/Write 不依赖网络） | 各工具实现 |
+| D13-6 同步合并 | ❌ 无 CRDT | — |
+
+**laew 现状**：❌ 完全缺失（无离线检测/队列/缓存/同步）。gap 编号 L1821-L1880 预留（专题进行中）。
+
+---
+
+### D14 跨设备同步与会话漫游（5 子维度）
+
+> deepseek-harness 在 D14 的核心竞争力是 **Typert Remote 协议**（generation 单调递增 + accept() 确认 + carrier 错误分类）——是"服务端推送事件流"的业界范本。
+
+#### D14 子维度实现
+
+| 子维度 | deepseek-harness 实现 | 代码定位 |
+|--------|---------------------|---------|
+| D14-1 设备发现 | 🟡 SessionId 即 AgentId + Cordis scope 标签 | Cordis 注册中心 |
+| D14-2 会话漫游 | ✅ SessionEventStream + scope（Event 级粒度） | `packages/api/session-controller/src/client/transport.ts:132-150` |
+| D14-3 同步协议 | ✅ **Typert Remote 协议**：4 种帧类型 + generation 单调递增 + 自动重开 | `packages/api/gateway/src/stream-protocol.ts:1-150`、`client/remote-stream.ts:1-150` |
+| D14-4 加密隐私 | 🟡 TLS（无独立内存加密） | — |
+| D14-5 状态合并 | ✅ generation 单调 + accept() + carrier 错误分类 | `packages/api/gateway/src/client/remote-stream.ts:94-149` |
+
+#### D14 关键代码片段
+
+**1. Typert Remote 协议帧**（`packages/api/gateway/src/stream-protocol.ts:1-70`）：
+```typescript
+export const REMOTE_STREAM_MUX_PATH = '/api/remote.mux'
+export const REMOTE_EVENT_STREAM_ENDPOINT = '$events'
+// 4 种帧类型：ready / emit / invocation / cancel
+// Branded Opaque ID：RemoteEventClientId / RemoteEventId / RemoteEventAgentId
+// waterfall 模式：Host→Client 请求 + Client→Host 结果 RPC
+```
+
+**2. RemoteStream 自动重连**（`packages/api/gateway/src/client/remote-stream.ts:38-149`）：
+```typescript
+export class RemoteStream<Item> implements AsyncIterable<RemoteStreamItem<Item>> {
+  private revision = 0
+  private async * read(): AsyncGenerator<RemoteStreamItem<Item>> {
+    let attempt = 0
+    let generation = 0
+    while (!isAborted(this.lifetime.signal)) {
+      const generationId = ++generation  // 物理 generation 单调递增
+      let accepted = false
+      try {
+        for await (const value of this.options.open(signal)) {
+          yield { generation: generationId, value, signal,
+            accept: () => { accepted = true; attempt = 0 } }
+        }
+        throw this.options.ended(accepted)
+      } catch (error) {
+        if (!(error instanceof RemoteStreamCarrierError)) throw error
+        attempt++
+        await waitForRemoteStreamRetry(this.connection, error, attempt, signal)
+      }
+    }
+  }
+}
+// 关键设计：accept() 确认机制 + carrier 错误分类（可重试 vs 业务错误）
+```
+
+**3. SessionEventStream**（`packages/api/session-controller/src/client/transport.ts:132-150`）：
+```typescript
+export class SessionEventStream extends RemoteJournalStream<
+  SessionJournalPage, SessionHistoryRecord, number, ClientSessionPageRequest
+> {
+  // Journal Stream：replace/append/prepend 三态
+  // Session 地址寻址：SessionAddress 区分 ordinary session / direct-subagent
+  // history-records 解码：historyEntries() 将原始记录转为 SessionEventLikeEntry
+}
+```
+
+#### D14 laew gap 汇总
+
+| 优先级 | gap 编号范围 | 核心缺失 |
+|--------|-------------|---------|
+| **P0 紧急** | L1881-L1883、L1891-L1893、L1901-L1903、L1911-L1913、L1921-L1923（15 项） | 无设备身份 / 无配对审批 / 无 Token 签发 / 无会话共享 / 无 steal / 无崩溃恢复指针 / 无 WebSocket 同步 / 无 generation 单调 / 无 broadcast / 无 AES-256-GCM / 无 Trusted Device / 无 HttpOnly Cookie / 无 lifecycleRevision CAS / 无 generation 防 stale / 无 Map-based union |
+| **P1 重要** | L1884-L1887、L1894-L1897、L1904-L1907、L1914-L1917、L1924-L1927（15 项） | 无 Tailscale / 无 Trusted Device Token / 无 WebUI Cookie / 无 Node Surface / 无 Worktree 感知 / 无 WorkSecret / 无 pi.share / 无 Radius/Gist / 无 Tailscale Serve/Funnel / 无客户端能力协商 / 无 waterfall/emit / 无 Journal Stream / 无 HMAC nonce / 无 AAD scope / 无自动脱敏 / 无 accept() / 无 carrier 错误分类 / 无 structuredClone / 无 strictOwner |
+| **P2 进阶** | L1888-L1890、L1898-L1900、L1908-L1910、L1918-L1920、L1928-L1930（15 项） | 无设备审批策略 / 无设备 pruning / 无设备身份迁移 / 无 1 秒批 flush / 无双 base URL / 无漫游 UI / 无 LiveViewEvent / 无 client_input_id / 无 1 秒批 + forkIn / 无 X-User-Id / 无 64 KiB 上限 / 无进程全局密钥 / 无 StaleBinding/StaleEvent / 无 session-changed / 无 cursor 单调递增 |
+
+---
+
+### 本轮新增 laew gap 汇总（L1591-L1930+）
+
+| 维度 | gap 区间 | 数量 | P0 | P1 | P2 | P3 |
+|------|---------|------|-----|-----|-----|-----|
+| **D9** 安全与威胁模型 | L1591-L1645 | 55 | 20 | 20 | 15 | 0 |
+| **D10** 多模态输出 | L1641-L1700 | 60 | — | — | — | — |
+| **D11** A2A 协议 | L1701-L1760 | 60 | 20 | 20 | 20 | 0 |
+| **D12** 可访问性 | L1761-L1820 | 60 | 5 | 15 | 20 | 20 |
+| **D13** 离线模式 | L1821-L1880 | 60 | — | — | — | — |
+| **D14** 跨设备同步 | L1881-L1930 | 50 | 15 | 15 | 15 | 5 |
+| **合计** | — | **340+** | **60+** | **70+** | **70+** | **25+** |
+
+> D10 / D13 两份专题文档仍在进行中，gap 编号已预留。
+
+---
+
+### 借鉴路线图（按 ROI 排序）
+
+#### Phase 1（P0 紧急，1-2 周）
+
+| # | gap 编号 | 改进项 | 推荐 Rust crate | 借鉴来源 |
+|---|---------|--------|----------------|---------|
+| 1 | L1599-L1600 | API Key 0o600 + AES-256-GCM 加密 | `aes-gcm` + `secrecy` + `zeroize` | deepseek 凭证四层信任链 |
+| 2 | L1608 | 私有 IP 拦截（SSRF 基础） | `std::net::IpAddr` | claudecode / atomcode |
+| 3 | L1603 | 工作目录信任模型 | `std::fs::canonicalize` | deepseek containment |
+| 4 | L1592 | Prompt 注入 14 类正则检测 | `regex` | openclaw 14 类 |
+| 5 | L1771 | `/theme` 斜杠命令（dark/light/high-contrast/daltonized） | `crossterm` + `serde` | opencode 30+ 主题 |
+| 6 | L1801-L1802 | IME compositionstart/end 双 setTimeout flush | 自定义 | opencode TextareaRenderable |
+| 7 | L1893 | 崩溃恢复指针（4h TTL + mtime） | `tempfile` + `fs2` | claudecode bridgePointer |
+
+#### Phase 2（P1 重要，2-4 周）
+
+| # | gap 编号 | 改进项 | 推荐 Rust crate | 借鉴来源 |
+|---|---------|--------|----------------|---------|
+| 1 | L1596-L1597 | Bash 23 层检测器 + FAIL-CLOSED AST | `tree-sitter` + `tree-sitter-bash` | claudecode bashSecurity.ts |
+| 2 | L1609 | DNS 钉扎 | `trust-dns-resolver` | openclaw / atomcode |
+| 3 | L1610 | 决策审计 3 段式 | `tracing` + `tracing-subscriber` | claudecode permissions.ts |
+| 4 | L1612 | 双 pass scrub | `regex` | atomcode scrub.rs |
+| 5 | L1772-L1773 | 高对比度 + 色盲主题 | `crossterm` | claudecode 8 主题 |
+| 6 | L1803 | Ctrl+G 外部编辑器 | 自定义 | pi external-editor.ts |
+| 7 | L1811 | unicode-width crate 依赖 | `unicode-width` | atomcode Cargo.toml |
+| 8 | L1902 | generation 单调递增重连 | 自定义 | deepseek RemoteStream |
+
+#### Phase 3（P2 进阶，1-3 月）
+
+| # | gap 编号 | 改进项 | 推荐 Rust crate | 借鉴来源 |
+|---|---------|--------|----------------|---------|
+| 1 | L1606 | OS 级沙箱（Landlock/Seccomp） | `landlock` + `seccompiler` | deepseek C11 launcher |
+| 2 | L1622 | Docker 容器沙箱 | `bollard` | openclaw Docker |
+| 3 | L1628 | W3C traceparent 传播 | `tracing-opentelemetry` | openclaw |
+| 4 | L1701 | A2A Protocol 实现 | `jsonrpsee` + `axum` | openclaw A2A 3165 行 |
+| 5 | L1702 | ACP Server 实现 | `agent-client-protocol` | atomcode ACP 7650 行 |
+| 6 | L1748 | Cordis Fiber 消息总线 | `tokio::sync::broadcast` | deepseek Cordis |
+| 7 | L1881 | Ed25519 设备身份 | `ed25519-dalek` + `sha2` | openclaw device-identity |
+| 8 | L1911 | AES-256-GCM 内存加密 | `aes-gcm` + `secrecy` | openclaw Secret Sentinel |
+
+---
+
+### 关键文件路径汇总（第十九轮新增）
+
+| 维度 | 文件路径 | 行数 | 核心职责 |
+|------|---------|------|---------|
+| **D9** | `native/landlock-run/packages/entry/src/main.c` | 298 | Landlock C11 launcher（ABI 1-5） |
+| **D9** | `packages/sandbox/sandbox/src/index.ts` | ~200 | 沙箱核心（fail-closed） |
+| **D9** | `packages/sandbox/sandbox/src/escalation.ts` | 189 | escalation ladder |
+| **D9** | `packages/sandbox/sandbox/src/roots.ts` | 54 | writableRoots 单一真理来源 |
+| **D9** | `packages/sandbox/sandbox-local/src/index.ts` | ~200 | 多平台链（bwrap/Landlock/Seatbelt/ACL） |
+| **D9** | `packages/sandbox/sandbox-local/src/profiles.ts` | ~100 | 各平台 profile 配置 |
+| **D9** | `packages/sandbox/sandbox-windows-acl/src/token.ts` | 223 | Windows restricted token |
+| **D9** | `packages/sandbox/sandbox-windows-acl/src/grant.ts` | 104 | standing vs revocable grant |
+| **D9** | `packages/credentials/credentials-local/src/index.ts` | 785 | 文件凭证（0o600 + 跨进程锁 + 原子替换） |
+| **D9** | `packages/settings/settings/src/redact.ts` | 92 | role('secret') 结构性脱敏 |
+| **D9** | `packages/interaction/user-approval/src/types.ts` | 59 | 审批审计对 |
+| **D9** | `packages/interaction/user-approval/src/invariant.ts` | 103 | 不变式校验 |
+| **D9** | `packages/fs/fs-sandbox/src/containment.ts` | 76 | 文件 containment（lexical + dev+ino） |
+| **D9** | `packages/fs/fs-sandbox/src/index.ts` | 144 | checkedTarget TOCTOU 防护 |
+| **D9** | `packages/fs/fs-observation-policy/src/index.ts` | 88 | 观察者写保护 |
+| **D9** | `packages/shell/bash-sandbox/src/index.ts` | 114 | bash 沙箱包裹 |
+| **D9** | `packages/client/connection/src/api-request-trust.ts` | 118 | DNS-rebinding Host 栅栏 |
+| **D11** | `packages/acp/acp/src/index.ts` | 534 | ACP 核心入口（Cordis 插件） |
+| **D11** | `packages/acp/acp/src/session.ts` | 527 | AcpSession 类（创建/恢复/所有权验证） |
+| **D11** | `packages/acp/acp/src/codec.ts` | 34 | TurnEndReason→StopReason 映射 |
+| **D11** | `packages/acp/acp/src/mcp.ts` | 143 | MCP 挂载（stdio/http 验证 + 名称规范化） |
+| **D11** | `packages/acp/acp/src/model-control.ts` | 237 | AcpModelControl（序列化 + Turn 固定） |
+| **D11** | `packages/acp/acp/src/updates.ts` | 111 | 更新流（assistant/tool_call/tool_result） |
+| **D12** | `packages/client/src/components/ChatMessage.tsx` | — | ARIA live region（538+ ARIA 属性） |
+| **D12** | `packages/client/src/hooks/useKeyboard.ts` | 50 | 键盘事件处理 |
+| **D12** | `packages/client/ui-settings-models/src/onboarding-copy.ts` | 10 | 版本化 welcome notice |
+| **D12** | `packages/client/ui-theme/src/boot-theme.ts` | 30 | 无 FOUC boot |
+| **D14** | `packages/api/gateway/src/stream-protocol.ts` | 150 | Typert Remote 协议帧 |
+| **D14** | `packages/api/gateway/src/client/remote-stream.ts` | 150 | RemoteStream 自动重连（generation + accept） |
+| **D14** | `packages/api/gateway/src/client/remote-events.ts` | 150 | ClientRemoteEvents 订阅 |
+| **D14** | `packages/api/session-controller/src/client/transport.ts` | 150 | SessionEventStream |
+| **D14** | `packages/api/session-controller/src/remote-events.ts` | 14 | Session 事件转发 |
+
+---
+
+### 与前 18 轮的不重复声明
+
+本轮（D9-D14）**不重复**前 18 轮已覆盖内容：
+
+| 前轮覆盖 | 本轮边界 |
+|---------|---------|
+| 第十二轮安全专题：Prompt 注入通用架构、凭证管理 Keychain/DPAPI、SSRF 通用描述、沙箱 5 层通用架构 | 本轮聚焦**完整规则清单**（22 层 Bash 检测完整列表、14 类 prompt 注入完整正则、AES-256-GCM 完整实现、DNS-rebinding TOCTOU 完整闭环） |
+| 第十四轮安全加固：22 层 Bash 检测概念、14 类 prompt 注入概念、AES-256-GCM 概念 | 本轮聚焦**完整实现**（Landlock C11 launcher 298 行完整代码、四平台沙箱链完整配置、审批审计对完整字段） |
+| 第十七轮安全：L1311-L1320 安全 gap（22 层 Bash 检测、文件权限验证） | 本轮**完整展开**并新增 gap 从 L1591 起步 |
+| 第十一轮：A2A/ACP/E2A/A2UI 基础概念（L143-L165） | 本轮进行**源码级深度对比**（ACP 1853 行完整实现、Cordis 注册中心完整机制） |
+| 第九轮 T4：i18n 整体方案 | 本轮聚焦 **a11y / RTL / 屏幕阅读器**子项（WCAG 2.2 AA、ARIA live region、bidi 算法） |
+| 第九轮 T8：CRDT 与多端冲突（L74-L78） | 本轮聚焦**跨设备同步协议**（Typert Remote generation + accept() 实现） |
+| 第十四轮 T3：分布式部署（Switchyard Axum） | 本轮聚焦**设备配对与身份**（Ed25519 + 6 种审批） |
+| 第八轮 T7：多租户隔离 | 本轮聚焦**设备能力表面**（Node Surface 命令/能力暴露） |
+| 第十六轮 T3：内存加密（Secret Sentinel） | 本轮聚焦**跨设备加密**（AAD scope + HMAC nonce） |
+| 第十七轮 T9：HTTP 客户端高级实现 | 本轮聚焦**同步协议**（Typert Remote generation + accept） |
+| 第十八轮 T8：会话导出共享（D8） | 本轮聚焦**会话漫游**（steal + 崩溃恢复指针 + pi.share） |
+
+---
+
+### 一句话总结
+
+> deepseek-harness 在第十九轮的 6 维度展现了**「能力接缝 + 形式化契约 + 单调世代」**三位一体的工程哲学：
+> - **D9 安全纵深**：C11 Landlock launcher 298 行 + 四平台原生沙箱链（bwrap/Landlock/Seatbelt/ACL）+ 审批审计对 + 不变式校验 + 凭证四层信任链 + role('secret') 结构性脱敏——**安全关注点 = 独立 Cordis 服务，DI 编排**；
+> - **D11 A2A 全协议栈**：ACP 桥 1853 行（AcpSession + AcpModelControl + TurnEndReason→StopReason 映射 + 更新流）+ Cordis 注册中心（六态生命周期 + Fiber epoch）+ E2A 事件总线 + A2UI Tagged JSON——**7 工程中唯一与 openclaw 并列的全协议栈实现**；
+> - **D14 跨设备同步**：Typert Remote 协议（4 种帧类型 + 物理 generation 单调递增 + accept() 确认 + carrier 错误分类 + 自动重开）——**「服务端推送事件流」业界范本**。
+>
+> 对 laew 的核心启示：**安全用"能力接缝"（独立服务 + DI 编排）、协议用"形式化契约"（状态机 + 编解码 + 不变式）、同步用"单调世代"（generation + accept + carrier 错误分类）**——每个维度都该有可验证的边界、可重放的流、可恢复的错误语义。
+> **laew 当前综合评分：D9 安全 🟡 30% / D10 多模态 ❌ 5% / D11 A2A ❌ 0% / D12 a11y ❌ 10% / D13 离线 ❌ 0% / D14 同步 ❌ 0%**——340+ 个新 gap 构成 laew 从「单设备 PoC」升级到「生产级多设备 Agent CLI」的核心改造清单。

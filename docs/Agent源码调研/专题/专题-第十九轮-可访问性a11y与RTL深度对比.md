@@ -75,7 +75,7 @@
 | **claudecode** | ✅ **6 主题**（含 daltonized + ANSI） | ✅ daltonized | 🟡 部分 | ✅ ANSI 4-bit | ❌ |
 | **deepseek-harness** | ❌ 仅 light/dark/system | ❌ | ❌ | ✅ SGR 16 | ❌ |
 | **openclaw** | ✅ **Beacon AAA 7:1 + Atkinson Hyperlegible** | ❌ | 🟡 | ✅ 8 色 ANSI | ❌ |
-| **opencode** | ✅ 30+ 主题 + system 派生 | 🟡 | 🟡 CSS prefers-contrast | ✅ 16 ANSI | ❌ |
+| **opencode** | ✅ **37 主题** + system 派生 + WCAG 对比度算法 | 🟡 | 🟡 CSS prefers-contrast | ✅ 16 ANSI | ❌ |
 | **pi** | 🟡 **WCAG AA 亮色主题**（CHANGELOG 验证）| ❌ | ❌ | ✅ 16 ANSI | ❌ |
 | **undici** | N/A | — | — | — | N/A |
 

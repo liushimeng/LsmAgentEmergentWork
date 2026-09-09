@@ -11198,3 +11198,337 @@ function toApiView(messages: Message[]): Message[] {
 - 新增 gap: 30 项 (L1426-L1455)
 - **本轮不重复声明**: 协议 wire / SSE / 缓存策略 / 工具 40+ 抽象 / Bridge 远程控制 / Skill 一等公民 / 22 层 Bash 检测 / 27 Hook / 崩溃恢复五层 / TUI 帧协议 / OAuth / i18n / Release / WebSocket / CRDT / Prompt 注入防护 / Telemetry 双层 — 前 17 轮已覆盖,本轮不复述
 
+---
+
+## 32. 第十九轮深挖：用户交互体验层续 + 安全纵深 + 多模态 + A2A + a11y + 离线 + 同步
+
+> 调研日期: 2026-09-09
+> 专题文档: 6 份(安全与威胁模型 / A2A 协议 / 可访问性 a11y / 跨设备同步 / 跨项目缺口分析 + 合集)
+> 新增 laew gap: **L1591-L1930+（340+ 个）**,累计突破 1930
+> 覆盖维度: D9 安全 / D10 多模态 / D11 A2A / D12 a11y / D13 离线 / D14 同步
+
+### 32.1 D9 安全与威胁模型（8 子维度，L1591-L1645）
+
+#### 32.1.1 claudecode 安全成熟度定位
+
+| 维度 | claudecode 评级 | 核心机制 | 代码定位 |
+|------|----------------|---------|---------|
+| D9-1 STRIDE | ⭐⭐⭐ 隐式覆盖 | 纵深防御 6 层,无形式化文档 | 各安全组件 |
+| D9-2 Prompt 注入 | ✅ 4 层 | Unicode 清洗 + 附件注入预算(20KB/turn) + 工具结果边界 + 系统提示词指引 | `sanitization.ts:25-65`、`attachments.ts:273-283` |
+| D9-3 Bash 检测 | ✅ **23 层 + FAIL-CLOSED AST** | tree-sitter AST + 验证器延迟调度 + 解析超时 50ms + 节点预算 50K | `bashSecurity.ts:77-101`(2592 行)、`ast.ts:9-19`、`bashParser.ts:29-32` |
+| D9-4 凭证管理 | ✅ macOS Keychain + 明文 JSON 兜底 | OS 级加密 + Keychain 预热并行读取 | `macOsKeychainStorage.ts:26-176`、`keychainPrefetch.ts:1-116` |
+| D9-5 路径信任 | ✅ **6 维工作目录信任** | deny rules 优先 + symlink 对称解析 + tilde TOCTOU 防护 + 裸仓库 scrub | `filesystem.ts:667-707`、`pathValidation.ts:141-263,394-415`、`sandbox-adapter.ts:257-280` |
+| D9-6 进程沙箱 | ⚠️ 外部包 sandbox-runtime | 闭源 `@anthropic-ai/sandbox-runtime`(推测 Landlock+bwrap) | `sandbox-adapter.ts:1-400` |
+| D9-7 SSRF 防护 | ✅ **IPv4/IPv6 完整正则 + DNS 钉扎** | 私有 IP 阻断 + IPv4-mapped IPv6 解析 + HTTP Hook 安全链 6 步 | `ssrfGuard.ts:1-294`、`execHttpHook.ts:123-242` |
+| D9-8 决策审计 | ✅ **3 段式 + 40+ 字段** | 决策上下文 + 分类器结果 + 最终结果 + 27 种 Hook 事件 | `permissions.ts:626-812`、`yoloClassifier.ts:1440-1455`、`coreTypes.ts:25-53` |
+
+#### 32.1.2 23 层 Bash 检测器完整清单
+
+| ID | 检测名 | 行号 | 说明 |
+|----|--------|------|------|
+| 1 | `INCOMPLETE_COMMANDS` | 244-286 | 不完整片段 |
+| 2-3 | `JQ_SYSTEM_FUNCTION/FILE_ARGUMENTS` | 742-781 | jq 系统函数/文件参数 |
+| 4 | `OBFUSCATED_FLAGS` | 1130-1581 | 混淆 flags |
+| 5 | `SHELL_METACHARACTERS` | 783-821 | shell 元字符 |
+| 6 | `DANGEROUS_VARIABLES` | 823-844 | 危险变量($IFS) |
+| 7 | `NEWLINES` | 905-969 | 换行符注入 |
+| 8-10 | `DANGEROUS_PATTERNS_(SUBSTITUTION/INPUT/OUTPUT)` | 846-903 | $()/backtick/重定向 |
+| 11 | `IFS_INJECTION` | 1017-1039 | $IFS 注入 |
+| 12 | `GIT_COMMIT_SUBSTITUTION` | 612-740 | git commit 替换 |
+| 13 | `PROC_ENVIRON_ACCESS` | 1041-1080 | /proc/<pid>/environ |
+| 14 | `MALFORMED_TOKEN_INJECTION` | 1082-1128 | 畸形 token |
+| 15 | `BACKSLASH_ESCAPED_WHITESPACE` | 1583-1694 | 反斜杠转义空白 |
+| 16 | `BRACE_EXPANSION` | 1751-1900 | {a,b} 花括号展开 |
+| 17 | `CONTROL_CHARACTERS` | 2250-2273 | 控制字符 |
+| 18 | `UNICODE_WHITESPACE` | 1902-1917 | Unicode 空白 |
+| 19 | `MID_WORD_HASH` | 1919-1988 | 词中 # 注释 |
+| 20 | `ZSH_DANGEROUS_COMMANDS` | 2186-2255 | Zsh 15 个危险命令 |
+| 21 | `BACKSLASH_ESCAPED_OPERATORS` | 1696-1749 | 反斜杠转义操作符 |
+| 22 | `COMMENT_QUOTE_DESYNC` | 1990-2107 | 注释-引号失同步 |
+| 23 | `QUOTED_NEWLINE` | 2109-2184 | 引号内换行 |
+
+**FAIL-CLOSED AST**(`ast.ts:9-19`): tree-sitter 遇未白名单 node → `too-complex` → 必须询问用户。
+**解析超时 + 节点预算**(`bashParser.ts:29-32`): `PARSE_TIMEOUT_MS=50` + `MAX_NODES=50_000`,防 DoS。
+
+#### 32.1.3 3 段式决策审计完整字段
+
+**第 1 段 — 决策上下文**(`permissions.ts:626-640`):
+```ts
+logEvent('tengu_auto_mode_decision', {
+  decision: 'allowed', toolName: sanitizeToolNameForAnalytics(tool.name),
+  inProtectedNamespace: isInProtectedNamespace(),
+  agentMsgId: assistantMessage.message.id, confidence: 'high', fastPath: 'acceptEdits',
+})
+```
+
+**第 2 段 — 分类器结果**(`permissions.ts:719-812`): `yoloDecision` / `classifierModel` / `consecutiveDenials` / `totalDenials` / `classifierInputTokens` / `classifierOutputTokens` / `classifierDurationMs` / `classifierStage` / `classifierCostUSD` / `sessionInputTokens`。
+
+**第 3 段 — 最终结果**(`yoloClassifier.ts:1440-1455`):
+```ts
+logEvent('tengu_auto_mode_outcome', {
+  outcome, classifierModel, classifierType, failureKind, durationMs, mainLoopTokens,
+})
+```
+
+**27 种 Hook 事件**(`coreTypes.ts:25-53`): `PreToolUse / PostToolUse / PostToolUseFailure / Notification / UserPromptSubmit / SessionStart / SessionEnd / Stop / StopFailure / SubagentStart / SubagentStop / PreCompact / PostCompact / PermissionRequest / PermissionDenied / Setup / TeammateIdle / TaskCreated / TaskCompleted / Elicitation / ElicitationResult / ConfigChange / WorktreeCreate / WorktreeRemove / InstructionsLoaded / CwdChanged / FileChanged`。
+
+#### 32.1.4 laew gap 汇总（D9，L1591-L1645，55 项）
+
+| 优先 | 数量 | 关键 gap |
+|------|------|----------|
+| P0 | 20 | L1592 14 类 Prompt 注入正则 / L1596 Bash 23 层检测器 / L1597 FAIL-CLOSED AST / L1599 凭证 0o600+Keychain / L1600 AES-256-GCM / L1603 工作目录信任 / L1608 私有 IP 拦截 / L1610 3 段式审计 |
+| P1 | 20 | L1593 同形字折叠 / L1595 验证器延迟调度 / L1609 DNS 钉扎 / L1612 双 pass scrub / L1614 Unicode 清洗 / L1628 W3C traceparent |
+| P2 | 15 | L1631 攻击链建模 / L1634 arity 字典 150+ / L1639 四平台沙箱链 / L1641 LRU dispatcher 池 |
+
+→ laew 缺: 23 层 Bash 检测 / FAIL-CLOSED AST / Keychain / AES-256-GCM / 6 维路径信任 / SSRF IPv4/IPv6 完整正则 / 3 段式审计 40+ 字段
+
+### 32.2 D10 多模态输出（6 子维度，L1641-L1700）
+
+| 子维度 | claudecode 实现 | 代码定位 |
+|--------|----------------|---------|
+| D10-1 图表 | ❌ 无 | — |
+| D10-2 数学公式 | ❌ 无(KaTeX 仅 opencode) | — |
+| D10-3 图片协议 | ✅ iTerm2/sixel/kitty 终端图片 | 终端能力检测 + ANSI OSC |
+| D10-4 Markdown | ✅ **mdast + shiki 语法高亮** | `Markdown.tsx:235`、`HighlightedCode/*` |
+| D10-5 HTML/SVG | ❌ 无 | — |
+| D10-6 流式多模态 | ✅ **Rust ColorFile + JS fallback** | `native-ts/color-diff/index.ts:935-967` |
+
+**关键机制**:
+- **Rust ColorFile**: 原生 Rust 实现 diff 着色(性能关键路径),JS fallback 保证跨平台
+- **shiki 语法高亮**: TextMate grammar + 多主题,代码块渲染
+- **iTerm2/sixel/kitty 图片**: 终端图片协议检测 + 降级
+
+→ laew 缺: 语法高亮 / diff 渲染 / 图片终端协议 / Markdown 富渲染(L1641-L1700 共 60 项)
+
+### 32.3 D11 A2A 协议与多 Agent 互操作（7 子维度，L1701-L1760）
+
+#### 32.3.1 claudecode 定位
+
+| 协议 | claudecode 状态 | 说明 |
+|------|----------------|------|
+| A2A Protocol | ❌ 无实现 | 仅 openclaw 实现 v1.0(3,165 行) |
+| ACP Server | ❌ 无实现 | atomcode 7,650 行 Rust / deepseek 1,853 行 / openclaw 17,001 行 |
+| E2A | ✅ **Bridge 远程控制** | v1 基础 WS / v2 增强多路复用 / Direct Connect Server |
+| A2UI | ❌ 无 | Ink Fork 渲染,非 A2UI 协议 |
+| MCP 双向 | ✅ **MCP SSOT** | 17 个 schema 迁移 + WebDAV/S3 同步 + 配置版本化 |
+| 跨语言 | ❌ 纯 TS/Bun | — |
+| 路由发现 | ❌ 无注册中心 | — |
+
+#### 32.3.2 Bridge 远程控制（E2A 范本）
+
+**WorkSecret 会话凭证**(`bridge/types.ts:33-51`):
+```ts
+type WorkSecret = {
+  version: number, session_ingress_token: string, api_base_url: string,
+  sources: Array<{ type: string, git_info?: {...} }>,
+  auth: Array<{ type: string, token: string }>,
+  claude_code_args?: Record<string, string>,
+  mcp_config?: unknown, environment_variables?: Record<string, string>,
+  use_code_sessions?: boolean  // CCR v2 selector
+}
+```
+
+**崩溃恢复指针**(`bridge/bridgePointer.ts:40-113`):
+- `BRIDGE_POINTER_TTL_MS = 4 * 60 * 60 * 1000`(4h)
+- mtime 保活: 定期重写同一内容刷新时钟
+- Worktree 感知: `readBridgePointerAcrossWorktrees` 扫描 git worktree 兄弟
+- `MAX_WORKTREE_FANOUT = 50` 限制并行 stat() 爆炸
+
+**Trusted Device Token**(`bridge/trustedDevice.ts:1-210`):
+- 90d 滚动过期,存 Keychain/DPAPI
+- 10min 注册窗口: `account_session.created_at < 10min`
+- `X-Trusted-Device-Token` 头,Bridge API 每次请求携带
+- GrowthBook 门控: CLI 侧 + 服务器侧双 flag 分阶段 rollout
+
+#### 32.3.3 laew gap 汇总（D11，L1701-L1760，60 项）
+
+| 优先 | 数量 | 关键 gap |
+|------|------|----------|
+| P0 | 20 | L1701 A2A Protocol / L1702 ACP Server / L1703 Agent Card / L1704 SubAgent Registry / L1705 并发控制 Lane / L1707-1711 A2A SendMessage/GetTask/ACP initialize/session/new/prompt |
+| P1 | 20 | L1721 A2A 批处理 / L1728 ACP v2 / L1730 elicitation 回环 / L1731 session/list 发现 / L1734 事件账本 |
+| P2 | 20 | L1741 E2A 事件总线 / L1743 Talk Realtime / L1746 Swarm 调度 / L1750 二进制帧 / L1752 PyO3 桥 |
+
+→ laew 缺: A2A Protocol / ACP Server / SubAgent Registry / Agent Card 暴露 / 并发控制 Lane / 路由发现
+
+### 32.4 D12 可访问性 a11y（7 子维度，L1761-L1820）
+
+#### 32.4.1 claudecode 定位
+
+| 子维度 | claudecode 实现 | 代码定位 |
+|--------|----------------|---------|
+| D12-1 屏幕阅读器 | 🟡 TUI 限制,`CLAUDE_CODE_ACCESSIBILITY` 保留原生光标 | 流式输出语义化 |
+| D12-2 高对比度 | ✅ **8 主题(含 daltonized 色盲友好)** | `themes/dark.ts`、`themes/daltonized.ts:5-25`、`themes/ansi16.ts:1-40` |
+| D12-3 减动效 | ✅ 全局媒体查询 + 渐进降级到瞬态 | `themes/base.css:100-130` |
+| D12-4 RTL | 🟡 **软件 bidi 算法**(Windows Terminal/xterm.js) | `bidi.ts` 重排 |
+| D12-5 盲文 | ❌ 无 Braille 终端适配 | — |
+| D12-6 键盘可达 | ✅ 完全键盘可达 + 50+ 键位 + IME 三重防护 | 快捷键系统 |
+| D12-7 字体/宽度 | ✅ **自研 stringWidth + Bun 原生** + npm/string-width | `textWidth.ts:1-30` |
+
+#### 32.4.2 8 主题 + daltonized 色盲友好
+
+```ts
+// themes 目录
+export const themes = {
+  default, light, solarized, monokai,
+  highContrast, highContrastLight,  // 高对比度
+  ansiOnly, ansi16,                  // ANSI 4-bit 降级
+  daltonized,                        // 红绿色盲友好
+}
+
+// daltonized.ts:5-25 — 红绿色盲友好
+export const daltonized: Theme = {
+  error:   "#FF8800",  // 橙色而非红色
+  warning: "#FFCC00",  // 黄色
+  success: "#0088FF",  // 蓝色而非绿色
+  accent:  "#8800FF",  // 紫色高辨识度
+}
+```
+
+**亮点**: claudecode 是 7 工程中**唯一为色盲专门优化的**(全球男性 8% / 女性 0.5% 受影响)。
+
+#### 32.4.3 软件 bidi 算法（RTL 范式）
+
+claudecode 的 `bidi.ts` 在 TUI 端实现 Unicode 双向算法(UAX #9)重排,弥补 Windows Terminal / xterm.js 缺失。
+- 将字符按逻辑顺序拆分为 runs
+- 对每个 run 应用 Bidi 算法(视觉顺序)
+- 镜像 punctuation / brackets
+
+#### 32.4.4 laew gap 汇总（D12，L1761-L1820，60 项）
+
+| 优先 | 数量 | 关键 gap |
+|------|------|----------|
+| P0 | 5 | L1771 `/theme` 斜杠命令 / L1778 focus ring 主题 / L1801 IME compositionstart / L1802 双 setTimeout flush / L1805 focus-visible |
+| P1 | 15 | L1772 高对比主题 / L1773 daltonized / L1774 prefers-contrast / L1796 ANSI bell / L1803 Ctrl+G 外部编辑器 / L1811 unicode-width crate / L1812 emoji ZWJ |
+| P2 | 20 | L1775 prefers-color-scheme / L1786 RTL locale / L1790 UAX #9 / L1808 键位注册中心 |
+| P3 | 20 | L1767 Braille 终端 / L1781 减动效(TUI 无需) / L1817 字号放大 |
+
+→ laew 缺: 主题切换 / daltonized 色盲主题 / IME 防护 / unicode-width / emoji 宽度 / RTL bidi 算法
+
+### 32.5 D13 离线模式（6 子维度，L1821-L1880）
+
+| 子维度 | claudecode 实现 | 代码定位 |
+|--------|----------------|---------|
+| D13-1 离线检测 | ❌ 无 | — |
+| D13-2 请求队列 | ✅ 指数退避重试 | `llm/resilient.rs` 等价 |
+| D13-3 本地缓存 | ✅ **7 种应用缓存 + cache break 检测** | 多源缓存层 |
+| D13-4 队列持久化 | ❌ 无 JSONL 事务日志 | — |
+| D13-5 离线功能子集 | ✅ Read/本地工具可用 | 工具白名单 |
+| D13-6 同步合并 | ❌ 无 CRDT | — |
+
+**关键机制**:
+- **7 种应用缓存**: 多源缓存 + cache break 检测(缓存失效主动探测)
+- **指数退避重试**: 网络抖动自动恢复
+- **离线降级**: Read 工具 + 本地命令仍可执行
+
+→ laew 缺: 离线检测 / 请求队列持久化 / 本地缓存 / 同步合并(L1821-L1880 共 60 项)
+
+### 32.6 D14 跨设备同步与会话漫游（5 子维度，L1881-L1930）
+
+#### 32.6.1 claudecode 定位
+
+| 子维度 | claudecode 实现 | 代码定位 |
+|--------|----------------|---------|
+| D14-1 设备发现 | 🟡 **Trusted Device Token**(90d 滚动) | `bridge/trustedDevice.ts:1-210` |
+| D14-2 会话漫游 | ✅ **Bridge 远程控制 + 崩溃恢复指针** | `bridge/bridgePointer.ts:40-113`、`bridge/types.ts:33-51` |
+| D14-3 同步协议 | ✅ **WebSocket Bridge**(4h TTL + 崩溃恢复) | `bridge/*` |
+| D14-4 加密隐私 | 🟡 Keychain/DPAPI(Trusted Device Token) | `macOsKeychainStorage.ts` |
+| D14-5 状态合并 | ❌ 无多端合并 | — |
+
+#### 32.6.2 崩溃恢复指针（4h TTL + mtime 保活）
+
+```ts
+// bridgePointer.ts
+export const BRIDGE_POINTER_TTL_MS = 4 * 60 * 60 * 1000  // 4h
+export async function readBridgePointer(dir: string): Promise<(BridgePointer & { ageMs: number }) | null> {
+  const path = getBridgePointerPath(dir)
+  mtimeMs = (await stat(path)).mtimeMs
+  raw = await readFile(path, 'utf8')
+  const ageMs = Math.max(0, Date.now() - mtimeMs)
+  if (ageMs > BRIDGE_POINTER_TTL_MS) { await clearBridgePointer(dir); return null }
+  return { ...parsed.data, ageMs }
+}
+```
+
+**范式要点**:
+- mtime 保活: 定期重写同一内容刷新时钟,匹配后端 `BRIDGE_LAST_POLL_TTL`(4h)
+- Worktree 感知: `readBridgePointerAcrossWorktrees` 扫描 git worktree 兄弟
+- `MAX_WORKTREE_FANOUT = 50` 限制并行 stat() 爆炸
+
+#### 32.6.3 laew gap 汇总（D14，L1881-L1930，50 项）
+
+| 优先 | 数量 | 关键 gap |
+|------|------|----------|
+| P0 | 15 | L1881 Ed25519 设备身份 / L1882 配对审批 / L1883 Token 签发 / L1891 会话共享 / L1892 steal 抢占 / L1893 崩溃恢复指针 / L1901 WebSocket 同步 / L1902 generation 单调递增 / L1903 broadcast 多播 / L1911 AES-256-GCM / L1912 Trusted Device Token / L1913 HttpOnly Cookie / L1921 lifecycleRevision CAS / L1922 generation 防 stale / L1923 Map-based union |
+| P1 | 20 | L1884 Tailscale / L1885 Trusted Device / L1894 Worktree 感知 / L1895 WorkSecret / L1896 pi.share / L1904 Tailscale Serve/Funnel / L1905 客户端能力协商 |
+| P2 | 15 | L1888 设备审批策略 / L1889 设备 pruning / L1890 设备身份迁移 / L1898 1 秒批 flush / L1899 双 base URL 鉴权 |
+
+→ laew 缺: Ed25519 设备身份 / 配对审批 / 崩溃恢复指针 / WebSocket 同步 / generation 单调递增 / AES-256-GCM 内存加密 / lifecycleRevision CAS
+
+### 32.7 第十九轮 laew gap 总览（L1591-L1930+）
+
+| 维度 | 数量 | 关键 gap | 优先 |
+|------|------|----------|------|
+| D9 安全 | 55 | L1592 Prompt 注入 / L1596 Bash 23 层 / L1599 凭证加密 / L1603 路径信任 / L1608 SSRF / L1610 审计 | P0×20 / P1×20 / P2×15 |
+| D10 多模态 | 60 | 语法高亮 / diff 渲染 / 图片协议 / Markdown | P1×30 / P2×30 |
+| D11 A2A | 60 | L1701 A2A / L1702 ACP / L1704 SubAgent Registry / L1705 Lane | P0×20 / P1×20 / P2×20 |
+| D12 a11y | 60 | L1771 `/theme` / L1773 daltonized / L1801 IME / L1811 unicode-width | P0×5 / P1×15 / P2×20 / P3×20 |
+| D13 离线 | 60 | 离线检测 / 请求队列 / 本地缓存 / 同步合并 | P1×30 / P2×30 |
+| D14 同步 | 50 | L1881 设备身份 / L1893 崩溃恢复指针 / L1901 WebSocket / L1911 AES / L1921 CAS | P0×15 / P1×20 / P2×15 |
+| **合计** | **340+** | | **P0×80 / P1×105 / P2×120+** |
+
+### 32.8 借鉴优先级路线（按 ROI 排序）
+
+**第 19 轮 P0 候选**(按实现成本从低到高):
+1. **L1599 凭证 0o600 + Keychain 存储**(单文件 ~100 行,`src/config/mod.rs` 加 `keyring` crate)
+2. **L1608 私有 IP 拦截**(SSRF 基础,~50 行,`std::net::IpAddr`)
+3. **L1771 `/theme` 斜杠命令**(dark/light/high-contrast/daltonized,~200 行,`src/tui/theme.rs` 扩展)
+4. **L1801+L1802 IME 防护**(双 setTimeout flush,~100 行,`src/tui/input.rs`)
+5. **L1592 Prompt 注入 14 类正则**(`src/agent/safety/prompt_injection.rs` 新建 + `regex` crate)
+6. **L1596 Bash 23 层检测器**(需 `tree-sitter-bash`,~500 行,但可先做黑名单子集)
+7. **L1893 崩溃恢复指针**(4h TTL + mtime,~100 行,`src/agent/bridge_pointer.rs`)
+8. **L1811 unicode-width crate**(替换自研 CJK 算法,Cargo.toml + `src/tui/input.rs` 改造)
+
+**laew 整体借鉴建议**:
+- **D9 安全**是当前最紧迫维度: Bash 23 层检测 + FAIL-CLOSED AST + Keychain + SSRF 是生产级 Agent 底线
+- **D12 a11y** 中 `/theme` + daltonized + IME 是投入产出比最高的 3 项(3-5 天)
+- **D11 A2A** 中 ACP Server 是 laew 被外部 client 驱动的入口,atomcode 7,650 行 Rust 可直接借鉴
+- **D14 同步** 是长期架构,先做崩溃恢复指针 + 会话导出,再做设备身份 + WebSocket
+
+### 32.9 关键文件索引
+
+| 主题 | 文件 | 行数 |
+|------|------|------|
+| Bash 安全检测 | `src/tools/BashTool/bashSecurity.ts` | 2592 |
+| tree-sitter AST | `src/utils/bash/ast.ts` | 2679 |
+| 纯 TS bash parser | `src/utils/bash/bashParser.ts` | 4436 |
+| 文件路径信任 | `src/utils/permissions/filesystem.ts` | 1777 |
+| 路径验证 | `src/utils/permissions/pathValidation.ts` | 1303 |
+| 权限引擎 + 审计 | `src/utils/permissions/permissions.ts` | ~1500 |
+| 2 阶段 XML 分类器 | `src/utils/permissions/yoloClassifier.ts` | ~2000 |
+| SSRF 防护 | `src/utils/hooks/ssrfGuard.ts` | 294 |
+| HTTP Hook 安全链 | `src/utils/hooks/execHttpHook.ts` | 242 |
+| Unicode 清洗 | `src/utils/sanitization.ts` | 91 |
+| macOS Keychain | `src/utils/secureStorage/macOsKeychainStorage.ts` | 231 |
+| Keychain 预热 | `src/utils/secureStorage/keychainPrefetch.ts` | 116 |
+| 沙箱适配 | `src/utils/sandbox/sandbox-adapter.ts` | ~400 |
+| 权限类型系统 | `src/types/permissions.ts` | 442 |
+| 安全审查命令 | `src/commands/security-review.ts` | 243 |
+| 主题系统 | `themes/dark.ts` / `themes/daltonized.ts` / `themes/ansi16.ts` | ~200 |
+| 文本宽度 | `src/utils/textWidth.ts` | 30 |
+| Bridge 协议类型 | `src/bridge/types.ts` | 262 |
+| 崩溃恢复指针 | `src/bridge/bridgePointer.ts` | 210 |
+| Trusted Device | `src/bridge/trustedDevice.ts` | 210 |
+| 27 Hook 事件 | `src/entrypoints/sdk/coreTypes.ts` | 53 |
+
+---
+
+**本轮深挖文档生成信息**:
+- 分析日期: 2026-09-09
+- 源码版本: claudecode (最新)
+- 分析工具: 6 个独立维度 SubAgent 并行调研 + 跨项目缺口分析汇总
+- 专题总行数: ~5,000+ 行(~200 KB)
+- 覆盖维度: 6 个全新维度(D9 安全 / D10 多模态 / D11 A2A / D12 a11y / D13 离线 / D14 同步)
+- 新增 gap: 340+ 项(L1591-L1930+)
+- 累计 gap: L1-L1930+(1,930+)
+- **本轮不重复声明**: 协议 wire / SSE / 缓存策略 / 工具 40+ 抽象 / Bridge 远程控制基础 / Skill 一等公民 / 27 Hook / 崩溃恢复五层 / TUI 帧协议 / OAuth / i18n / Release / WebSocket / CRDT / 用户交互体验层 D1-D8 — 前 18 轮已覆盖,本轮不复述
+

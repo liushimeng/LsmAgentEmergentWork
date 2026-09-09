@@ -7696,4 +7696,514 @@ opencode 在「用户交互体验层」展示了 4 个值得 laew 借鉴的核�
 
 ---
 
+## 22. 第十九轮深挖：安全纵深 + A2A 协议 + 可访问性 a11y + 跨设备同步
+
+> **调研日期**：2026-09-09
+> **调研范围**：7 个参考工程（atomcode / claudecode / deepseek-harness / openclaw / opencode / pi / undici）× 6 大新维度（D9-D14）
+> **本轮定位**：第十八轮首次切入「用户交互体验层」（D1-D8），本轮继续深挖 D9 安全与威胁模型 / D10 多模态输出 / D11 A2A 协议 / D12 可访问性 a11y / D13 离线模式 / D14 跨设备同步
+> **与前 18 轮关系**：前 18 轮已覆盖 D1-D8 用户交互体验层、协议 wire、工具抽象、Skill、Hook、TUI 渲染、OAuth、i18n、Release、WebSocket、CRDT、Telemetry、多租户、RRF、LLM 网关、Pregel、Agent 池、Turn 锁、Bash 检测、Session 持久化、内存加密、SQLite 全栈、反应式 IoC、守护进程基础设施、录制回放等 90+ 维度；**本轮不重述**
+> **新增 laew gap**：L1591-L1930+（共 340+ 个新 gap，累计突破 1930）
+
+### 22.0 第十九轮 6 大维度 × opencode 实现速览
+
+| 维度 | 名称 | opencode 成熟度 | 核心机制 | laew gap 区段 |
+|------|------|----------------|---------|--------------|
+| **D9** | 安全与威胁模型 | ⭐⭐⭐ 应用层防护 | Effect Schema TaggedErrorClass 80+ 处 + tree-sitter 双语法 arity 字典 + 0o600 + OAuth 状态机 + 7 类正则脱敏 | L1591-L1645 |
+| **D10** | 多模态输出 | ⭐⭐⭐⭐ 双栈渲染 | @pierre/diffs + shiki-wasm + KaTeX + Web/TUI 双栈 | L1641-L1700 |
+| **D11** | A2A 协议与多 Agent 互操作 | ⭐ 无显式 A2A | Effect DI + Durable Object + R2 双后端（无 A2A/ACP/E2A/A2UI） | L1701-L1760 |
+| **D12** | 可访问性 a11y / RTL | ⭐⭐⭐⭐ Web AA/AAA | 30+ 主题 + system 派生 + prefers-reduced-motion + 5 locale RTL + Solid ARIA + sr-only | L1761-L1820 |
+| **D13** | 离线模式与本地优先 | ⭐⭐ 重连基础 | WebSocket 重连 + Effect DI + Durable Object | L1821-L1880 |
+| **D14** | 跨设备同步与会话漫游 | ⭐⭐⭐ share-next 范本 | share-next.ts EventV2 + 1 秒批 flush + steal 抢占 + 双 base URL 鉴权 + Map LWW | L1881-L1930 |
+
+---
+
+### 22.1 D9 安全与威胁模型（8 子维度）
+
+#### 22.1.1 opencode 安全实现总览
+
+opencode 在安全维度属于「**轻信任派**」——应用层防护为主（Schema 校验 + tree-sitter AST + 0o600 + OAuth 状态机 + 7 类正则脱敏），**无 OS 级沙箱、无专用 Prompt 注入检测、无 SSRF 防护、无形式化 STRIDE 文档**。
+
+| 子维度 | opencode 机制 | 代码定位 | 成熟度 |
+|--------|--------------|---------|--------|
+| **D9-1 STRIDE** | ❌ 无文档，以「Permission 三态引擎」替代 | `permission/index.ts` | ⭐⭐ 隐式覆盖 |
+| **D9-2 Prompt 注入** | ⚠️ Schema TaggedErrorClass + 提示词工程 | `tool/tool.ts:24-34`、`tool/shell/prompt.ts:78-119` | ⭐⭐ 2 层 |
+| **D9-3 Bash 检测** | ✅ web-tree-sitter 双语法（bash + powershell）+ arity 字典 150+ 命令元组 | `tool/shell.ts:311-336`、`permission/arity.ts:24-161` | ⭐⭐⭐ |
+| **D9-4 凭证管理** | ✅ auth.json + OAuth 状态机 + 0o600 + 7 类正则脱敏 | `auth/index.ts:73-89`、`redaction.ts:5-38` | ⭐⭐⭐ |
+| **D9-5 路径信任** | ✅ 外部目录边界检测 + realpathSync 解析 | `instance-context.ts:18-24`、`fs-util.ts:270-273` | ⭐⭐⭐ |
+| **D9-6 进程沙箱** | ❌ 无 OS 沙箱，仅 Effect Layer 逻辑隔离 | `layer-node.ts:81-112`、`shell.ts:293-310` | ⭐ 逻辑隔离 |
+| **D9-7 SSRF 防护** | ⚠️ 仅协议校验（http/https） | `webfetch.ts:35-37` | ⭐ 最弱 |
+| **D9-8 决策审计** | ⚠️ Permission 事件（无 W3C traceparent） | `permission.ts:61-66`、`otlp.ts:55-77` | ⭐⭐ |
+
+#### 22.1.2 D9-3 Bash 检测：tree-sitter 双语法 + arity 字典
+
+**核心文件**：`packages/opencode/src/tool/shell.ts:311-336`
+
+- 使用 **web-tree-sitter** 加载 bash + powershell 双语法 WASM
+- 解析后的命令树用于提取 `command_name`、`command_argument`、`redirection` 等节点
+
+**命令元组 arity 字典**（`permission/arity.ts:24-161`）：**150+ 条命令前缀 → arity 映射**，用于识别"人类可理解的命令"（如 `git checkout main` → `git checkout`）。
+
+**与 claudecode / atomcode 差异**：
+- claudecode / atomcode 走「**黑名单派**」（22+ 类破坏性命令规则 + FAIL-CLOSED AST）
+- opencode 走「**元组识别派**」（150+ 命令元组 arity 字典，识别"人类可理解的命令"）
+- opencode **无**破坏性命令检测、**无**递归解包、**无**反向 shell 检测
+
+#### 22.1.3 D9-4 凭证管理：auth.json + OAuth 状态机 + 7 类正则脱敏
+
+**核心文件**：`auth/index.ts:73-89`、`redaction.ts:5-38`
+
+- auth.json 落盘 0o600 文件权限
+- OAuth 状态机管理 token 生命周期
+- 7 类正则脱敏（API Key / token / 凭证形状）
+
+**与业界最佳实践差距**：
+- ❌ 无应用层 AES-256-GCM 加密（openclaw Secret Sentinel）
+- ❌ 无 macOS Keychain / DPAPI（claudecode）
+- ❌ 无跨进程写锁（atomcode tempfile + fsync + atomic rename）
+- ❌ 无时序安全比较（`subtle::constant_time_eq`）
+
+#### 22.1.4 D9-7 SSRF：最弱一环
+
+**核心文件**：`webfetch.ts:35-37`
+
+```typescript
+// 仅校验协议
+if (url.protocol !== "http:" && url.protocol !== "https:") {
+  throw new Error("scheme not allowed");
+}
+```
+
+**完全缺失**：私有 IP 拦截、DNS 钉扎、IPv4-mapped IPv6 解析、maxResponseSize 限制、重定向清洗。
+
+#### 22.1.5 D9 laew gap 汇总（opencode 视角）
+
+| 优先级 | 编号 | 描述 |
+|--------|------|------|
+| **P0** | L1599 | API Key 明文存 SQLite，无 0o600 / Keychain |
+| **P0** | L1600 | 无应用层 AES-256-GCM 加密 |
+| **P0** | L1608 | 无私有 IP 拦截（loopback/private/CGNAT） |
+| **P0** | L1592 | 无 Prompt 注入检测（14 类正则） |
+| **P0** | L1596 | 无 Bash 安全检测器（23 层） |
+| **P0** | L1603 | 无工作目录信任模型 |
+| **P0** | L1610 | 无决策审计 3 段式 |
+| **P1** | L1597 | 无 FAIL-CLOSED AST 白名单 |
+| **P1** | L1609 | 无 DNS 钉扎（防 DNS rebinding） |
+| **P1** | L1612 | 无双 pass scrub（key=value + token 形状） |
+| **P1** | L1606 | 无 OS 级沙箱（Landlock/Seccomp/cgroup） |
+| **P2** | L1634 | 无命令元组 arity 字典（150+） |
+| **P2** | L1628 | 无 W3C traceparent 传播 |
+
+---
+
+### 22.2 D10 多模态输出（6 子维度）
+
+> **状态**：D10 专题文档仍在生成中，本节基于已有调研摘要。
+
+#### 22.2.1 opencode 双栈渲染机制
+
+opencode 在 D10 属于「**双栈派**」（Web + TUI 各自最优渲染），成熟度 ⭐⭐⭐⭐。
+
+| 子维度 | Web 端 | TUI 端 | 代码定位 |
+|--------|--------|--------|---------|
+| **Diff 渲染** | `@pierre/diffs`（Web Component + Shiki 双栈） | 自建 `diff-viewer.tsx`（700+ 行） | `tui/component/diff-viewer.tsx` |
+| **语法高亮** | `shiki-wasm`（跨平台）+ `marked-shiki` | `@opentui/core` SyntaxStyle 30+ 颜色字段 | `tui/theme/syntax.ts` |
+| **数学公式** | KaTeX 扩展 | ❌ 不支持 | `web/src/katex.ts` |
+| **图片渲染** | `<img>` 原生 | ❌ 不支持（无 sixel/kitty） | — |
+| **Markdown** | `marked` + `marked-shiki` | 简化 Markdown 渲染 | `tui/component/markdown.tsx` |
+| **懒加载语言** | 首次见某语言才 `loadLanguage` | — | `shiki.ts` |
+
+**关键设计**：
+- **懒加载语言**：首次见某语言才 `loadLanguage`，避免启动全量 bundle 200+ 语言
+- **折叠/分页**：`scrollbox height={min(count, 10, anchor.y)}` 限定最大高度 10 行
+
+#### 22.2.2 D10 laew gap 汇总
+
+| 优先级 | 编号 | 描述 |
+|--------|------|------|
+| **P0** | L1641 | 无 Diff 渲染器（当前 cell-based 纯文本） |
+| **P0** | L1642 | 无语法高亮（`syntect` / `shiki-wasm`） |
+| **P1** | L1643 | 无数学公式渲染（KaTeX） |
+| **P1** | L1644 | 无图片终端协议（sixel / kitty / iTerm2） |
+| **P2** | L1645 | 无懒加载语言 bundle |
+
+---
+
+### 22.3 D11 A2A 协议与多 Agent 互操作（7 子维度）
+
+#### 22.3.1 opencode 现状：无显式 A2A/ACP/E2A/A2UI 实现
+
+**关键发现**：7 个参考工程中，**仅 openclaw 实现了 Google A2A Protocol v1.0**（3,165 行），opencode 在 D11 维度**全部缺失**。
+
+| 子维度 | opencode 状态 | 说明 |
+|--------|--------------|------|
+| **D11-1 A2A** | ❌ 无实现 | 仅 openclaw 实现 v1.0（3165 行） |
+| **D11-2 ACP** | ❌ 无实现 | atomcode 7650 行 Rust / deepseek 1853 行 / openclaw 17001 行 |
+| **D11-3 E2A** | ❌ 无显式 E2A | deepseek 事件总线 / claudecode Bridge |
+| **D11-4 A2UI** | ❌ 无显式 A2UI | deepseek Tagged JSON / atomcode LiveViewHub |
+| **D11-5 MCP 双向** | ⚠️ 基础 MCP 客户端 | 无 Sampling / 资源双向 |
+| **D11-6 跨语言互操作** | — | TypeScript/Bun 单语言 |
+| **D11-7 协议路由发现** | — | Durable Object 持久化（非路由发现） |
+
+#### 22.3.2 D11 laew gap 汇总
+
+| 优先级 | 编号 | 描述 |
+|--------|------|------|
+| **P0** | L1701 | 无 A2A Protocol 实现（SendMessage / GetTask / Task 6 态） |
+| **P0** | L1702 | 无 ACP 实现（stdio v1/v2 + JSON-RPC 2.0） |
+| **P0** | L1703 | 无 Agent Card 发现（`/.well-known/agent-card.json`） |
+| **P0** | L1704 | 无 Task 存储与状态机（FIFO 会话队列 + 等待者模式） |
+| **P1** | L1705 | 无 Peer 认证（SHA-256 + timingSafeEqual） |
+| **P1** | L1706 | 无速率限制（滑动窗口 30 req/min） |
+| **P1** | L1707 | 无 E2A 事件总线 |
+| **P1** | L1708 | 无 A2UI 结构化 UI 渲染 |
+| **P2** | L1709 | 无 MCP Sampling 双向 |
+| **P2** | L1710 | 无跨语言互操作（PyO3 / FFI） |
+
+---
+
+### 22.4 D12 可访问性 a11y / RTL / 屏幕阅读器（7 子维度）
+
+#### 22.4.1 opencode a11y 实现总览
+
+opencode 在 D12 属于「**强 a11y 派**」（与 claudecode / openclaw 并列），Web 端达 WCAG 2.2 AA/AAA 水平，成熟度 ⭐⭐⭐⭐。
+
+| 子维度 | opencode 机制 | 代码定位 | 成熟度 |
+|--------|--------------|---------|--------|
+| **D12-1 屏幕阅读器** | ✅ Solid + aria-label + role + sr-only + Markdown alt | `message-part.tsx:25-80`、`sr-only.css:1-10`、`markdown.tsx:50-70` | ⭐⭐⭐⭐ |
+| **D12-2 高对比度** | ✅ 30+ 主题 + system 派生 + prefers-contrast + daltonized 3 类 | `themes/index.ts:1-60`、`themes/system.ts` | ⭐⭐⭐⭐ |
+| **D12-3 减动效** | ✅ 全局 `@media (prefers-reduced-motion)` + 完整降级链 | `styles/motion.css:1-50` | ⭐⭐⭐⭐ |
+| **D12-4 RTL** | ✅ 5 locale RTL + logical CSS + bidi 控制字符 | `i18n/locales.ts:17-50`、`ChatLayout.tsx:50-80`、`bidi.ts:1-50` | ⭐⭐⭐ |
+| **D12-5 多模态提示** | ✅ 5 档 toast priority（critical/error/warning/info/debug） | `services/toast.ts:30-60` | ⭐⭐⭐ |
+| **D12-6 键盘可达性** | ✅ 焦点环 + Tab order + IME 双 setTimeout + 100+ 快捷键 | `prompt/index.tsx:1391-1395` | ⭐⭐⭐⭐ |
+| **D12-7 字体/字号** | ✅ rem/em + CJK 回退 + npm/string-width | `themes/index.ts` | ⭐⭐⭐ |
+
+#### 22.4.2 D12-1 屏幕阅读器：Solid + ARIA + sr-only
+
+**核心文件**：`packages/ui/src/components/message-part.tsx:25-80`
+
+```tsx
+export function MessagePart(props: Part) {
+  return (
+    <div role="article"
+         aria-labelledby={`part-${props.id}-title`}
+         aria-describedby={`part-${props.id}-body`}>
+      {props.type === "tool" && (
+        <div role="group" aria-label={`Tool: ${props.tool.name}`}>
+          <span id={`part-${props.id}-title`} className="sr-only">
+            {`Tool execution: ${props.tool.name}`}
+          </span>
+          <div id={`part-${props.id}-body`}
+               aria-live="polite"
+               aria-busy={props.status === "running"}>
+            ...
+          </div>
+        </div>
+      )}
+      {props.type === "text" && <Markdown altText={props.altText} />}
+      {props.type === "file" && <FilePart aria-label={props.fileName} />}
+    </div>
+  );
+}
+```
+
+**`sr-only` CSS 类**（`packages/ui/src/styles/sr-only.css:1-10`）：视觉隐藏但屏幕阅读器可读。
+
+**Markdown alt 文本**（`packages/ui/src/components/markdown.tsx:50-70`）：`![Image description](./foo.png)` 解析，缺失时 `console.warn` 警告（仅警告未强制）。
+
+#### 22.4.3 D12-2 高对比度主题：30+ 主题 + daltonized 3 类
+
+**核心文件**：`packages/ui/src/themes/index.ts:1-60`
+
+```typescript
+export const builtInThemes = [
+    "default", "light", "dark",
+    "solarized-dark", "solarized-light",
+    "monokai", "dracula", "nord", "one-dark", "one-light",
+    "github-dark", "github-light",
+    "ayu-dark", "ayu-light", "ayu-mirage",
+    "tokyo-night", "catppuccin-mocha", "catppuccin-latte",
+    "rose-pine", "rose-pine-dawn",
+    "high-contrast", "high-contrast-light",  // AA+
+    "high-contrast-dark", "high-contrast-more", // AAA
+    "ansi", "ansi-light",
+    "daltonized-deuteranopia", // 红绿色盲
+    "daltonized-protanopia",   // 红色盲
+    "daltonized-tritanopia",   // 蓝黄色盲
+    "system", // 自动检测 prefers-color-scheme
+] as const;
+```
+
+**system 主题**（`packages/ui/src/themes/system.ts`）：`window.matchMedia("(prefers-color-scheme: dark)")` 自动跟随操作系统。
+
+#### 22.4.4 D12-3 减动效：`animation-duration: 0.01ms !important`
+
+**核心文件**：`packages/ui/src/styles/motion.css:1-50`
+
+```css
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+```
+
+**设计巧妙点**：把所有动效降到 1 微秒（视觉上看不到），但保留 `animationend` 事件触发（避免破坏组件生命周期）。
+
+#### 22.4.5 D12-4 RTL：5 locale + bidi 控制字符
+
+**核心文件**：`packages/web/src/i18n/locales.ts:17-50`
+
+```typescript
+export const rtlLocales = new Set(["ar", "fa", "he", "ur", "yi"]); // 5 个
+```
+
+**bidi 处理**（`packages/web/src/utils/bidi.ts:1-50`）：LRE/RLE/PDF Unicode 控制字符包裹阿拉伯文片段。
+
+**不足**：bidi 控制字符硬编码，未用 `unicode-bidi: isolate` CSS 替代；**TUI 端 7 工程无一支持 RTL 渲染**。
+
+#### 22.4.6 D12 laew gap 汇总
+
+| 优先级 | 编号 | 描述 |
+|--------|------|------|
+| **P0** | L1761 | 无 ARIA 属性（role / aria-label / aria-live） |
+| **P0** | L1762 | 无 sr-only CSS 类（屏幕阅读器专用） |
+| **P0** | L1763 | 无高对比度主题（high-contrast / AAA） |
+| **P0** | L1764 | 无减动效偏好检测（prefers-reduced-motion） |
+| **P0** | L1765 | 无 daltonized 色盲友好主题 |
+| **P1** | L1766 | 无 RTL 布局（dir="rtl" + bidi 处理） |
+| **P1** | L1767 | 无 5 档 toast priority + aria-live 映射 |
+| **P1** | L1768 | 无系统主题自动派生（prefers-color-scheme） |
+| **P2** | L1769 | 无 CJK 字体回退链 |
+| **P2** | L1770 | 无 emoji 宽度精细算法 |
+
+---
+
+### 22.5 D13 离线模式与本地优先（6 子维度）
+
+> **状态**：D13 专题文档仍在生成中，本节基于已有调研摘要。
+
+#### 22.5.1 opencode 离线机制
+
+opencode 在 D13 属于「**强离线派**」（与 openclaw / pi 并列），但实际实现以 WebSocket 重连为主。
+
+| 子维度 | opencode 机制 | 代码定位 | 成熟度 |
+|--------|--------------|---------|--------|
+| **D13-1 离线检测** | ⚠️ WebSocket 重连 | `websocket.ts` | ⭐⭐ |
+| **D13-2 请求队列** | ⚠️ Effect DI 异步队列 | `queue.ts` | ⭐⭐ |
+| **D13-3 本地缓存** | ⚠️ Durable Object 持久化 | `durable-object.ts` | ⭐⭐⭐ |
+| **D13-4 队列持久化** | ⚠️ SQLite + Effect Schema | `db.ts` | ⭐⭐ |
+| **D13-5 同步合并** | ⚠️ EventV2 重放 | `share-next.ts` | ⭐⭐⭐ |
+| **D13-6 冲突解决** | ⚠️ Map LWW | `share-next.ts:97-110` | ⭐⭐ |
+
+#### 22.5.2 D13 laew gap 汇总
+
+| 优先级 | 编号 | 描述 |
+|--------|------|------|
+| **P0** | L1821 | 无离线检测（heartbeat / 网络状态监听） |
+| **P0** | L1822 | 无请求队列持久化（断网排队 + 恢复重放） |
+| **P0** | L1823 | 无本地缓存（SQLite / 文件缓存） |
+| **P1** | L1824 | 无同步合并策略（LWW / CRDT） |
+| **P1** | L1825 | 无冲突解决机制 |
+| **P2** | L1826 | 无 Durable Object 持久化 |
+
+---
+
+### 22.6 D14 跨设备同步与会话漫游（5 子维度）
+
+#### 22.6.1 opencode share-next 范本
+
+opencode 在 D14 以 `share-next.ts` 的 EventV2 实时同步为**业界范本**之一（与 openclaw Ed25519 设备身份、claudecode Bridge 远程控制并列）。
+
+| 子维度 | opencode 机制 | 代码定位 | 成熟度 |
+|--------|--------------|---------|--------|
+| **D14-1 设备发现** | 🟡 基于账号 token 鉴权（无独立设备身份） | `auth/index.ts` | ⭐⭐ |
+| **D14-2 会话漫游** | 🟢 share-next.ts + steal 抢占 | `share/share-next.ts:1-371` | ⭐⭐⭐⭐ |
+| **D14-3 同步协议** | 🟢 HTTP POST + EventV2 + 1 秒批 flush | `share-next.ts:124-146` | ⭐⭐⭐⭐ |
+| **D14-4 加密与隐私** | 🟡 HTTPS + Bearer Token（无独立加密） | `share-next.ts:206-222` | ⭐⭐ |
+| **D14-5 状态合并** | 🟢 Map-based union（LWW by key） | `share-next.ts:97-110` | ⭐⭐⭐⭐ |
+
+#### 22.6.2 D14-2/3 share-next.ts 核心机制
+
+**架构**：
+```
+Session Event → EventV2 Bridge → ShareNext.sync() → 1s 批 flush → POST /api/shares/{id}/sync
+                                                              ↓
+                                                    双 base URL 鉴权切换
+                                                    (legacyApi / consoleApi)
+```
+
+**1 秒批 flush 机制**（`share-next.ts:124-146`）：
+
+```typescript
+function sync(sessionID: SessionID, data: Data[]) {
+  return Effect.gen(function* () {
+    if (disabled) return
+    const share = yield* getCached(sessionID)
+    if (!share) return
+    const s = yield* InstanceState.get(state)
+    const existing = s.queue.get(sessionID)
+    if (existing) {
+      for (const item of data) { existing.set(key(item), item) }
+      return
+    }
+    const next = new Map(data.map((item) => [key(item), item]))
+    s.queue.set(sessionID, next)
+    yield* flush(sessionID).pipe(Effect.delay(1000), Effect.forkIn(s.scope))
+  })
+}
+```
+
+**范式要点**：
+- **Map-based 去重**：同 key 后写覆盖前写（session/message/part/session_diff/model 五类）
+- **1 秒延迟批处理**：`Effect.delay(1000)` 合并高频事件
+- **forkIn 隔离**：每个 share 独立 Scope，失败不影响其他
+
+**steal 会话抢占**（`handlers/sync.ts:61-70`）：
+- **"steal" 语义**：将一个 workspace 的会话转移到另一个 workspace
+- **strictOwner 校验**：`events.replayAll(payload, { ownerID, strictOwner: true })` 防越权
+- **EventV2 重放**：`replayAll` 将事件流注入目标 workspace
+
+**双 base URL 鉴权**（`share-next.ts:206-222`）：
+- 未登录走 `opncd.ai`（legacyApi）
+- 登录 enterprise console 走 `/api/shares` + Bearer + `x-org-id`（consoleApi）
+
+#### 22.6.3 D14-5 Map-based union（LWW by key）
+
+**核心文件**：`packages/opencode/src/share/share-next.ts:97-110`
+
+```typescript
+function key(item: Data) {
+  switch (item.type) {
+    case "session": return "session"
+    case "message": return `message/${item.data.id}`
+    case "part": return `part/${item.data.messageID}/${item.data.id}`
+    case "session_diff": return "session_diff"
+    case "model": return "model"
+  }
+}
+```
+
+**范式要点**：
+- **稳定 key 函数**：每个 Data 类型有唯一 key 生成规则
+- **Map 覆盖**：同 key 后写覆盖前写（LWW）
+- **structuredClone**：`sync()` 前深拷贝防引用污染
+- **replayAll strictOwner**：防跨 workspace 注入
+
+#### 22.6.4 D14 laew gap 汇总
+
+| 优先级 | 编号 | 描述 |
+|--------|------|------|
+| **P0** | L1891 | 无会话共享（EventV2 实时同步） |
+| **P0** | L1892 | 无会话抢占/转移（steal 机制） |
+| **P0** | L1881 | 无设备身份（Ed25519 密钥对 + 指纹） |
+| **P0** | L1882 | 无设备配对审批流程（6 种方式） |
+| **P1** | L1893 | 无 1 秒批 flush 事件合并 |
+| **P1** | L1894 | 无 forkIn 隔离（每 share 独立 Scope） |
+| **P1** | L1895 | 无 steal 会话抢占机制 |
+| **P1** | L1883 | 无设备 Token 签发/轮换/撤销 |
+| **P1** | L1923 | 无 Map-based union（LWW by key） |
+| **P1** | L1926 | 无 structuredClone 深拷贝隔离 |
+| **P1** | L1927 | 无 strictOwner 防跨 workspace 注入 |
+| **P2** | L1898 | 无 1 秒批 flush 事件合并 |
+| **P2** | L1899 | 无双 base URL 鉴权切换 |
+| **P2** | L1884 | 无 Tailscale 集成 |
+
+---
+
+### 22.7 借鉴路线图（按 ROI 排序）
+
+#### 第 1 步（P0 紧急，1-2 周）
+
+| 编号 | 维度 | 描述 | 预估工时 |
+|------|------|------|---------|
+| L1599 | D9 | 凭证 0o600 + Keychain 存储 | 2 天 |
+| L1600 | D9 | 应用层 AES-256-GCM 加密 | 3 天 |
+| L1608 | D9 | 私有 IP 拦截（SSRF 基础） | 2 天 |
+| L1592 | D9 | Prompt 注入 14 类正则检测 | 3 天 |
+| L1603 | D9 | 工作目录信任模型 | 2 天 |
+| L1641 | D10 | Diff 渲染器（`similar` crate） | 3 天 |
+| L1642 | D10 | 语法高亮（`syntect` crate） | 3 天 |
+| L1763 | D12 | 高对比度主题 4 主题 | 2 天 |
+| L1764 | D12 | 减动效偏好检测 | 1 天 |
+| L1821 | D13 | 离线检测（heartbeat） | 2 天 |
+| L1891 | D14 | 会话导出（JSON / Markdown） | 2 天 |
+
+#### 第 2 步（P1 重要，2-4 周）
+
+| 编号 | 维度 | 描述 |
+|------|------|------|
+| L1596 | D9 | Bash 23 层检测器（tree-sitter-bash） |
+| L1597 | D9 | FAIL-CLOSED AST 白名单 |
+| L1609 | D9 | DNS 钉扎（trust-dns-resolver） |
+| L1610 | D9 | 决策审计 3 段式 |
+| L1612 | D9 | 双 pass scrub |
+| L1643 | D10 | 数学公式渲染（KaTeX） |
+| L1644 | D10 | 图片终端协议（sixel / kitty） |
+| L1761 | D12 | ARIA 属性（role / aria-label / aria-live） |
+| L1762 | D12 | sr-only CSS 类 |
+| L1766 | D12 | RTL 布局（dir="rtl" + bidi） |
+| L1893 | D14 | 1 秒批 flush 事件合并 |
+| L1894 | D14 | forkIn 隔离 |
+
+#### 第 3 步（P2 进阶，1-2 月）
+
+| 编号 | 维度 | 描述 |
+|------|------|------|
+| L1606 | D9 | OS 级沙箱（Landlock/Seccomp/cgroup） |
+| L1622 | D9 | Docker 容器沙箱 |
+| L1628 | D9 | W3C traceparent 传播 |
+| L1629 | D9 | OTel 安全事件导出 |
+| L1701 | D11 | A2A Protocol 实现 |
+| L1702 | D11 | ACP 实现 |
+| L1881 | D14 | Ed25519 设备身份 |
+| L1882 | D14 | 设备配对审批流程 |
+
+---
+
+### 22.8 关键文件路径汇总
+
+| 维度 | 文件路径 | 核心职责 |
+|------|---------|---------|
+| **D9** | `packages/opencode/src/tool/shell.ts:311-336` | web-tree-sitter 双语法 Bash 检测 |
+| **D9** | `packages/opencode/src/permission/arity.ts:24-161` | 150+ 命令元组 arity 字典 |
+| **D9** | `packages/opencode/src/auth/index.ts:73-89` | auth.json + OAuth 状态机 |
+| **D9** | `packages/opencode/src/redaction.ts:5-38` | 7 类正则脱敏 |
+| **D9** | `packages/opencode/src/instance-context.ts:18-24` | 外部目录边界检测 |
+| **D9** | `packages/opencode/src/webfetch.ts:35-37` | SSRF 仅协议校验 |
+| **D10** | `packages/opencode/src/tui/component/diff-viewer.tsx` | Diff 渲染（700+ 行） |
+| **D10** | `packages/opencode/src/tui/theme/syntax.ts` | SyntaxStyle 30+ 颜色字段 |
+| **D12** | `packages/ui/src/components/message-part.tsx:25-80` | Solid + ARIA + sr-only |
+| **D12** | `packages/ui/src/styles/sr-only.css:1-10` | 屏幕阅读器专用 CSS |
+| **D12** | `packages/ui/src/themes/index.ts:1-60` | 30+ 内置主题 + daltonized |
+| **D12** | `packages/ui/src/styles/motion.css:1-50` | prefers-reduced-motion 降级 |
+| **D12** | `packages/web/src/i18n/locales.ts:17-50` | 5 locale RTL |
+| **D12** | `packages/web/src/utils/bidi.ts:1-50` | bidi 控制字符包裹 |
+| **D12** | `packages/ui/src/services/toast.ts:30-60` | 5 档 toast priority |
+| **D14** | `packages/opencode/src/share/share-next.ts:1-371` | EventV2 实时同步 + steal + Map LWW |
+| **D14** | `packages/opencode/src/share/share-next.ts:97-110` | 稳定 key 函数（LWW by key） |
+| **D14** | `packages/opencode/src/share/share-next.ts:124-146` | 1 秒批 flush 机制 |
+| **D14** | `packages/opencode/src/share/share-next.ts:206-222` | 双 base URL 鉴权切换 |
+
+---
+
+### 22.9 本轮不重复声明
+
+本轮**不重复**前 18 轮已覆盖的以下内容：
+- D1-D8 用户交互体验层（@提及 / 自定义命令 / Rewind / 文件监视 / 富文本渲染 / 输入体验 / Onboarding / 会话导出）—— 详见第 21 章
+- 协议 wire / SSE / 工具抽象 / Skill 系统 / Hook / TUI 渲染管线 / OAuth / i18n / Release / WebSocket / CRDT / Telemetry / 多租户 / RRF / LLM 网关 / Pregel / Agent 池 / Turn 锁 / Bash 检测（第十二轮）/ Session 持久化 / 内存加密 / SQLite 全栈 / 反应式 IoC / 守护进程基础设施 / 录制回放
+
+本轮**新增**聚焦：D9 安全纵深（STRIDE / Prompt 注入 / Bash 检测 / 凭证 / 路径信任 / 沙箱 / SSRF / 审计）/ D10 多模态输出 / D11 A2A 协议 / D12 可访问性 a11y / D13 离线模式 / D14 跨设备同步。
+
+详细源码引用、机制剖析、设计巧妙点、完整 gap 表见专题文档：
+- `专题/专题-第十九轮-安全与威胁模型深度对比.md`（1582 行 / 8 维度 / 55 gap）
+- `专题/专题-第十九轮-A2A协议与多Agent互操作深度对比.md`（1355 行 / 7 维度 / 60 gap）
+- `专题/专题-第十九轮-可访问性a11y与RTL深度对比.md`（1200+ 行 / 7 维度 / 60 gap）
+- `专题/专题-第十九轮-跨设备同步与会话漫游深度对比.md`（1149 行 / 5 维度 / 50 gap）
+- `专题/专题-第十九轮-跨项目缺口分析.md`（800+ 行 / 6 维度综合）
+
+---
+
 **第十轮深挖结束。**

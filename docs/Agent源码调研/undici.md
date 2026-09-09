@@ -12881,4 +12881,607 @@ for (let i = codings.length - 1; i >= 0; --i) {  // 逆序压栈
 
 ---
 
+## 第 28 章 第十九轮深挖：安全纵深 + A2A 协议 + 可访问性 + 跨设备同步
+
+> **调研日期**：2026-09-09
+> **调研范围**：7 个参考工程（atomcode / claudecode / deepseek-harness / openclaw / opencode / pi / undici）× 6 大新维度（D9-D14）
+> **本轮定位**：第十八轮首次切入「用户交互体验层」（D1-D8），本轮继续深挖该层剩余 6 维度（D9-D14），并首次系统化覆盖「安全纵深」「A2A 协议」「可访问性」「跨设备同步」
+> **与前 18 轮关系**：前 18 轮聚焦 HTTP 客户端基础设施（N1-N5 富内容获取 / HTTP/2 / WebSocket / SSE / 连接池 / 重试 / 代理 / TLS / DNS / 缓存 / 录制回放）；本轮聚焦 undici 在安全 / 多 Agent 互操作 / a11y / 同步维度的**底座级能力与局限**
+> **新增 laew gap**：L1591-L1930+（共 340+ 个新 gap，累计突破 1930）
+
+### 28.1 D9 — 安全与威胁模型（8 子维度）
+
+Undici 作为 HTTP 客户端在安全维度的定位是**协议层防护**（非 Agent 层），核心机制集中在 HTTP 语义校验、重定向清洗、响应截断。
+
+#### 28.1.1 D9 子维度 × undici 核心机制对照表
+
+| 子维度 | undici 实现 | 代码定位 | 成熟度 |
+|--------|------------|---------|--------|
+| **D9-1 STRIDE** | SECURITY.md 威胁模型（Node.js 对齐） | `SECURITY.md:47-160` | ⭐⭐⭐⭐ 文档化 |
+| **D9-2 Prompt 注入** | N/A（HTTP 客户端，非 Agent） | — | — |
+| **D9-3 Bash 检测** | N/A | — | — |
+| **D9-4 凭证管理** | Cookie/Header 处理（无加密） | `lib/web/cookies/index.js:28-80` | ⚠️ 仅解析 |
+| **D9-5 文件路径信任** | N/A | — | — |
+| **D9-6 进程沙箱** | N/A | — | — |
+| **D9-7 SSRF 防护** | 重定向清洗 + maxResponseSize | `lib/handler/redirect-handler.js:1-229`、`lib/dispatcher/client.js:129-321` | ⚠️ 协议层 |
+| **D9-8 决策审计** | Symbol 错误码 + RetryController | `lib/core/errors.js:387-401`、`lib/handler/retry-handler.js:48-127` | ⚠️ 错误分类 |
+
+#### 28.1.2 undici 安全机制详解
+
+**HTTP Token/Header 校验**（`lib/core/util.js:752-780`）：
+- `isValidHTTPToken()`：严格校验 request header 名（RFC 7230 §3.2.6），≥12 字符走正则快速路径，<12 字符逐字符查表
+- `isValidHeaderValue()`：`headerCharRegex = /[^\t\x20-\x7e\x80-\xff]/` 拒绝非法字符（CRLF 注入防护）
+
+**重定向安全**（`lib/handler/redirect-handler.js`）：
+- `maxRedirections` 上限（默认 10）
+- `stripHeadersOnRedirect`：跨域重定向时剥离敏感 Header
+- `cleanRequestHeaders`（L207）：移除 Content-Type / Content-Length / Authorization
+
+**maxResponseSize 协议层强制**（`lib/dispatcher/client.js:129-321`）：
+- `-1` 哨兵表示无限制
+- H1 destroy socket（`client-h1.js:745-752`）vs H2 RST_STREAM（`client-h2.js:1337-1343`）
+
+**连接限制**（`client.js:87-127`）：
+- `maxRequestsPerClient`：单连接最大请求数
+- `pipelining`：HTTP/1.1 流水线因子
+- `keepAliveTimeout` / `keepAliveMaxTimeout`：连接保活超时
+
+**Subresource Integrity**（`lib/web/subresource-integrity/subresource-integrity.js:307`）：
+- SRI 校验（sha256/384/512）
+
+**DNS 缓存 + lookup 回调**（`lib/interceptor/dns.js:575`）：
+- 支持自定义 lookup（DNS pinning 基础）
+
+#### 28.1.3 D9 laew gap 汇总（undici 相关）
+
+| 编号 | 维度 | 描述 | 优先级 |
+|------|------|------|--------|
+| **L1591** | STRIDE | 无形式化威胁模型文档 | P0 |
+| **L1592** | Prompt 注入 | 无 Prompt 注入检测（14 类正则） | P0 |
+| **L1596** | Bash 检测 | 无 Bash 安全检测器（23 层） | P0 |
+| **L1599** | 凭证管理 | API Key 明文存 SQLite，无 0o600 / Keychain | P0 |
+| **L1600** | 凭证管理 | 无应用层 AES-256-GCM 加密 | P0 |
+| **L1603** | 路径信任 | 无工作目录信任模型 | P0 |
+| **L1606** | 进程沙箱 | 无 OS 级沙箱（Landlock/Seccomp/cgroup） | P0 |
+| **L1608** | SSRF | 无私有 IP 拦截（loopback/private/CGNAT） | P0 |
+| **L1609** | SSRF | 无 DNS 钉扎（防 DNS rebinding） | P0 |
+| **L1610** | 审计 | 无决策审计 3 段式（who/when/why） | P0 |
+| L1593-L1595 | Prompt 注入 | 无同形字折叠 / LLM Token 清洗 / 附件预算 | P1 |
+| L1597-L1598 | Bash 检测 | 无 FAIL-CLOSED AST / 解析超时 | P1 |
+| L1601-L1602 | 凭证管理 | 无跨进程写锁 / 0o600 强制 | P1 |
+| L1604-L1605 | 路径信任 | 无 symlink 解析 / 敏感路径门 | P1 |
+| L1607 | 进程沙箱 | 无 PR_SET_NO_NEW_PRIVS 防提权 | P1 |
+| L1611-L1615 | 审计/注入 | MITRE ATLAS / 双 pass scrub / synthetic 标记 / Unicode 清洗 / 验证器延迟 | P1 |
+| L1616-L1645 | 综合 | Zsh 检测 / SecretRef / 时序安全 / tilde TOCTOU / Docker / IPv6 解析 / W3C traceparent / OTel / HMAC 假名化 / 攻击链 / 随机边界 / arity 字典 / role('secret') / 信任链 / 四平台沙箱 / LRU dispatcher / 证书钉扎 / 10 万行审计 / 3 段式事件 / 属性敏感标记 | P2 |
+
+#### 28.1.4 D9 借鉴路线图
+
+```
+Phase 1（P0 紧急，1-2 周）：
+├── L1599 凭证 0o600 + Keychain 存储（`aes-gcm` + `secrecy` + `zeroize`）
+├── L1600 应用层 AES-256-GCM 加密
+├── L1608 私有 IP 拦截（SSRF 基础，`std::net::IpAddr`）
+├── L1603 工作目录信任模型（`std::fs::canonicalize`）
+└── L1592 Prompt 注入 14 类正则检测（`regex`）
+
+Phase 2（P1 重要，2-4 周）：
+├── L1596 Bash 23 层检测器（`tree-sitter` + `tree-sitter-bash`）
+├── L1597 FAIL-CLOSED AST 白名单
+├── L1609 DNS 钉扎（`trust-dns-resolver`）
+├── L1610 决策审计 3 段式（`tracing` + `tracing-subscriber`）
+├── L1612 双 pass scrub
+└── L1613 synthetic 来源标记
+
+Phase 3（P2 进阶，1-2 月）：
+├── L1606 OS 级沙箱（`landlock` + `seccompiler`）
+├── L1622 Docker 容器沙箱（`bollard`）
+├── L1628 W3C traceparent 传播（`tracing-opentelegram`）
+└── L1639 四平台沙箱链
+```
+
+---
+
+### 28.2 D10 — 多模态输出（6 子维度）
+
+Undici 在 D10 的定位是**内容获取底座**（非渲染引擎），核心能力集中在内容协商、MIME 处理、大响应流式截断。
+
+#### 28.2.1 D10 子维度 × undici 核心机制对照表
+
+| 子维度 | undici 实现 | 代码定位 | 成熟度 |
+|--------|------------|---------|--------|
+| **D10-1 图表** | N/A | — | — |
+| **D10-2 数学公式** | N/A | — | — |
+| **D10-3 图片协议** | N/A（仅获取，无渲染） | — | — |
+| **D10-4 Markdown** | 内容协商 + MIME 提取 | `lib/web/fetch/util.js:1289-1342` | ⚠️ 仅提取 |
+| **D10-5 HTML/SVG** | Accept 头按 destination 注入（TODO） | `lib/web/fetch/index.js:515-534` | ⚠️ 未实现 |
+| **D10-6 流式多模态** | maxResponseSize + dump 模式 | `lib/web/fetch/index.js:2336-2358`、`lib/api/readable.js:265-320` | ⚠️ 字节级 |
+
+#### 28.2.2 undici 内容协商机制
+
+**Accept 头按 destination 注入**（`lib/web/fetch/index.js:515-534`）：
+- 当前 TODO 统一发 `*/*`，未实现 HTML/Image/Style 分支
+
+**MIME 提取与 charset 嗅探**（`lib/web/fetch/util.js:1289-1342`）：
+- `extractMimeType` 多值 Content-Type 解析
+- 后值继承前值 charset
+- 跳过 `*/*` 失败值
+
+**JSON MIME 嗅探**（`lib/web/fetch/data-url.js:556-571`）：
+- `isJSONMimeType` 检测 `+json` 后缀（RFC 8259 §6）
+
+**大响应流式消费**：
+- `maxResponseSize` 协议层强制（`client.js:163-321`）
+- `fetchParams.controller.dump` 模式（`index.js:2336-2358`）：完全丢弃 body chunk 但 socket 继续读到 EOF
+- `BodyReadable.dump`（`readable.js:265-320`）：默认 128KB 上限，双重预检（Content-Length 头 + 累加器 kBytesRead）
+
+#### 28.2.3 D10 laew gap 汇总
+
+| 编号 | 维度 | 描述 | 优先级 |
+|------|------|------|--------|
+| L1641-L1700 | D10 多模态 | 60 个 gap（图表/公式/图片/Markdown/HTML/流式多模态） | P1 |
+
+> **注**：D10 专题文档仍在生成中（第十九轮进行中），完整 gap 清单待补充。laew 当前 cell-based 纯文本，无 diff/语法高亮/图片渲染能力。
+
+#### 28.2.4 D10 借鉴路线图
+
+```
+Phase 1（P1 重要，2-4 周）：
+├── Diff 渲染（`tui/render/diff.rs` 新建 + `similar` + ANSI 着色）
+├── 语法高亮（`tui/render/highlight.rs` 新建 + `syntect` + 16 色 SGR）
+└── Markdown 渲染（`pulldown-cmark` + ANSI 转换）
+
+Phase 2（P2 进阶，1-2 月）：
+├── 图片协议（`image` + `sixel` + `viuer`）
+├── 数学公式（KaTeX → ANSI 近似）
+└── 图表（Mermaid → ASCII 近似）
+```
+
+---
+
+### 28.3 D11 — A2A 协议与多 Agent 互操作（7 子维度）
+
+Undici 在 D11 的定位是**纯 HTTP 客户端底座**（非 Agent），**无任何 A2A/ACP/E2A/A2UI 协议实现**。
+
+#### 28.3.1 D11 子维度 × undici 核心机制对照表
+
+| 子维度 | undici 实现 | 代码定位 | 成熟度 |
+|--------|------------|---------|--------|
+| **D11-1 A2A** | ❌ 无 | — | — |
+| **D11-2 ACP** | ❌ 无 | — | — |
+| **D11-3 E2A** | ❌ 无 | — | — |
+| **D11-4 A2UI** | ❌ 无 | — | — |
+| **D11-5 MCP 双向** | ❌ 无 | — | — |
+| **D11-6 跨语言** | ❌ 无（纯 JS） | — | — |
+| **D11-7 路由发现** | ❌ 无 | — | — |
+
+#### 28.3.2 参考工程 A2A/ACP 实现（laew 借鉴对象）
+
+| 工程 | 协议 | 规模 | 核心文件 |
+|------|------|------|---------|
+| **openclaw** | A2A Protocol v1.0 | 3,165 行 / 13 文件 | `extensions/a2a/src/protocol.ts:173`、`task-store.ts:210`、`http.ts:383`、`gateway.ts:86`、`inbound.ts:137`、`outbound.ts:132` |
+| **atomcode** | ACP stdio 服务器 | 7,650 行 Rust / 14 文件 | `crates/atomcode-cli/src/acp/mod.rs:618`、`v2.rs:1571`、`discovery.rs:346`、`mcp.rs:213` |
+| **deepseek-harness** | ACP 桥 | 1,853 行 / 8 核心 | `packages/acp/acp/src/index.ts:534`、`session.ts:527`、`codec.ts:34`、`updates.ts:111`、`model-control.ts:237` |
+| **openclaw** | ACP + Gateway 桥 | 17,001 行 | `src/acp/server.ts:207`、`translator.ts:207`、`packages/acp-core/src/session.ts:191` |
+
+**A2A Protocol v1.0 核心机制**（openclaw 范本）：
+- JSON-RPC 2.0 接口（`protocol.ts:47-52`）
+- Task 6 态状态机（SUBMITTED / WORKING / COMPLETED / FAILED / CANCELED / REJECTED）
+- Agent Card 发现（`/.well-known/agent-card.json` + `/.well-known/agent.json`）
+- 消息体上限 64KB + UTF-8 安全截断
+- 速率限制 30 req/min + 批处理上限 30 req/batch
+- SSRF 防护出站（`outbound.ts:79-84`）+ Peer 认证（SHA-256 + timingSafeEqual）
+
+**ACP 核心机制**（atomcode 范本）：
+- v1 + v2 draft 双协议代（`mod.rs:196-200`）
+- Session 发现 + keyset 分页（50/page）
+- MCP 挂载（stdio 基线 + HTTP 广告 + SSE 忽略）
+- Elicitation 回环（form/URL）
+- replayFrom 重放持久化对话
+
+#### 28.3.3 D11 laew gap 汇总
+
+| 编号 | 维度 | 描述 | 优先级 |
+|------|------|------|--------|
+| **L1701** | A2A | 无 A2A Protocol 实现 | P0 |
+| **L1702** | ACP | 无 ACP Server 实现 | P0 |
+| **L1703** | Agent Card | 无 Agent Card 暴露 | P0 |
+| **L1704** | SubAgent Registry | 无 SubAgent 注册/生命周期管理 | P0 |
+| **L1705** | 并发控制 | 无并发控制（Lane / Semaphore） | P0 |
+| **L1706** | SubAgent 恢复 | 无 SubAgent 恢复机制 | P0 |
+| **L1707** | A2A SendMessage | 无 A2A SendMessage 处理 | P0 |
+| **L1708** | A2A GetTask | 无 A2A GetTask 查询 | P0 |
+| **L1709** | ACP initialize | 无 ACP initialize 握手 | P0 |
+| **L1710** | ACP session/new | 无 ACP session/new 创建 | P0 |
+| L1711-L1720 | A2A/ACP | session/prompt / MCP 挂载 / 模型控制 / 消息截断 / 速率限制 / SSRF 防护 / Peer 认证 / StopReason 映射 / 更新流 / FIFO 队列 | P0 |
+| L1721-L1740 | A2A/ACP 进阶 | 批处理 / 等待者模式 / 终端清理 / 会话隔离 / allowlist / 出站发送 / 协议重试 / v2 协议 / replayFrom / elicitation / session/list / keyset 分页 / 权限请求 / 事件账本 / 容量上限 / 空闲 TTL / LRU 驱逐 / 活跃保护 / 暂停恢复 / 孤儿恢复 | P1 |
+| L1741-L1760 | E2A/A2UI/跨语言 | 事件总线 / A2UI / Talk Realtime / AgentHarness / Workboard / Swarm / Leader-Teammate / Cordis / SubAgent 11 包 / 二进制帧 / WriterLease / PyO3 / MCP 双向 Resource / MCP 双向 Sampling / MCP SSOT / 协议 IR / 健康检查 / 注册表分页 / 配置选项目录 / 翻译层 | P2 |
+
+#### 28.3.4 D11 借鉴路线图
+
+```
+Phase 1（P0 紧急，2-4 周）：
+├── L1702 ACP Server（`agent/acp/server.rs` 新建 + `agent-client-protocol` crate）
+├── L1703 Agent Card（`agent/acp/agent_card.rs` 新建 + `axum` HTTP 服务）
+├── L1704 SubAgent Registry（`agent/subagent/registry.rs` 新建 + `rusqlite` 持久化）
+├── L1705 并发控制（`tokio::sync::Semaphore` 替代 CommandLane）
+└── L1707 A2A SendMessage（`agent/a2a/protocol.rs` 新建 + `jsonrpsee`）
+
+Phase 2（P1 重要，1-2 月）：
+├── L1701 A2A Protocol 完整实现（参考 openclaw 3,165 行）
+├── L1706 SubAgent 恢复（重启/孤儿/父恢复）
+├── L1709 ACP initialize + session/new + session/prompt
+├── L1712 ACP MCP 挂载（stdio + http）
+└── L1720 A2A FIFO 会话队列
+
+Phase 3（P2 进阶，2-3 月）：
+├── L1741 E2A 事件总线（`tokio::sync::broadcast`）
+├── L1746 Swarm 并行调度
+├── L1750 二进制帧（`ciborium` CBOR）
+├── L1752 PyO3 跨语言桥
+└── L1760 ACP 翻译层
+```
+
+---
+
+### 28.4 D12 — 可访问性 a11y / RTL / 屏幕阅读器（7 子维度）
+
+Undici 在 D12 的定位是**HTTP 客户端**（无 UI 层），**无任何 a11y 实现**。本节主要记录 laew 在 TUI 端的 a11y 差距。
+
+#### 28.4.1 D12 子维度 × laew 现状对照表
+
+| 子维度 | laew 现状 | 代码定位 | 评分 |
+|--------|----------|---------|------|
+| **D12-1 屏幕阅读器** | ❌ 无 ARIA，无 live region | `src/tui/mod.rs` | 0% |
+| **D12-2 高对比度主题** | 🟡 `BOLD\|REVERSE` 选中态（21:1 = AAA） | `src/tui/theme.rs` | 50% |
+| **D12-3 减动效** | ✅ TUI 无动效，自然符合 | — | 100% |
+| **D12-4 RTL** | ❌ 完全无 RTL 支持 | — | 0% |
+| **D12-5 多模态提示** | ❌ 无 ANSI bell，无通知 | — | 0% |
+| **D12-6 键盘可达性** | ✅ 完全键盘可达 + Tab 切换 | `src/tui/form.rs`、`src/tui/input.rs` | 70% |
+| **D12-7 字体/宽度** | 🟡 自研 CJK 宽度（无 emoji/ZWJ） | `src/tui/input.rs:38-58` | 30% |
+
+#### 28.4.2 laew a11y 优势（已实现）
+
+1. **`BOLD|REVERSE` 选中态**：对比度 21:1（AAA）
+2. **完全键盘可达**：所有功能仅靠键盘（TUI 优势）
+3. **纯文本输出**：可被屏幕阅读器（VoiceOver / NVDA）+ Braille 终端（brltty）朗读
+4. **统一视觉规范**：所有子屏遵循统一选中态规范（`src/tui/theme.rs`）
+5. **CJK 输入支持**：`input.rs:418-837` 已测试字符边界 + 退格键陷阱
+
+#### 28.4.3 D12 laew gap 汇总
+
+| 编号 | 维度 | 描述 | 优先级 |
+|------|------|------|--------|
+| **L1771** | D12-2 | 无主题切换机制（`/theme` 斜杠命令） | P0 |
+| **L1778** | D12-2 | 无 focus ring 主题 | P0 |
+| **L1801** | D12-6 | 无 IME compositionstart 防护 | P0 |
+| **L1802** | D12-6 | 无 IME compositionend 双 setTimeout flush | P0 |
+| **L1805** | D12-6 | 无焦点环视觉规范（`focus-visible`） | P0 |
+| L1761-L1770 | D12-1 | Web 端 ARIA / live region / aria-busy / alt 文本 | P1 |
+| L1772-L1774 | D12-2 | 高对比度主题 / 色盲主题 / prefers-contrast 检测 | P1 |
+| L1777 | D12-2 | 字体对比度审计（4.5:1 / 3:1） | P1 |
+| L1796 | D12-5 | 无 ANSI bell 通知 | P1 |
+| L1800 | D12-5 | 无「高优先级 = assertive」live region 映射 | P1 |
+| L1803-L1804 | D12-6 | 无 Ctrl+G 外部编辑器 / Ctrl+R 反向搜索 | P1 |
+| L1806-L1807 | D12-6 | 无 Tab order 显式管理 / Focus trap | P1 |
+| L1811-L1813 | D12-7 | 无 `unicode-width` crate / emoji ZWJ / VS16 变体 | P1 |
+| L1775-L1780 | D12-2 | prefers-color-scheme / ANSI 降级 / 系统监听 / 主题持久化 | P2 |
+| L1781-L1785 | D12-3 | `@media (prefers-reduced-motion)` / MotionController / framer-motion | P2 |
+| L1786-L1795 | D12-4 | RTL locale / dir 切换 / CSS Logical Props / Bidi 算法 | P2 |
+| L1797-L1799 | D12-5 | macOS 系统通知 / NVDA 测试 / VoiceOver API | P2 |
+| L1808-L1810 | D12-6 | 键位注册中心 / 撤销重做 / 键位自定义 UI | P2 |
+| L1814-L1820 | D12-7 | emoji 复杂组合 / CJK 字体回退 / 等宽字体测试 / 字号放大 / clamp() / SVG 宽度 / 字体文档 | P2 |
+
+#### 28.4.4 D12 借鉴路线图
+
+```
+Phase 1（P0 紧急，1-2 周）：
+├── L1771 `/theme` 斜杠命令（dark / light / high-contrast / daltonized）
+├── L1778 focus ring 主题（`SELECTED_ATTRS = BOLD|REVERSE` 标准化）
+├── L1801 + L1802 IME compositionstart/end 双 setTimeout flush
+└── L1805 focus-visible CSS 类
+
+Phase 2（P1 重要，1-2 月）：
+├── L1772/L1773/L1774 高对比度 + 色盲主题 + prefers-contrast
+├── L1777 字体对比度审计
+├── L1796/L1800 ANSI bell + 高优先级 live region
+├── L1803/L1804 Ctrl+G 外部编辑器 + Ctrl+R 反向搜索
+├── L1806/L1807 Tab order 显式管理 + Focus trap
+└── L1811/L1812/L1813 unicode-width crate + emoji 宽度
+
+Phase 3（P2 进阶，2-3 月）：
+├── L1786-L1795 RTL（未来需求，ar/he/fa locale）
+├── L1797-L1799 多模态通知
+├── L1808-L1810 键位注册中心
+└── L1814-L1820 字体细节
+```
+
+---
+
+### 28.5 D13 — 离线模式与本地优先（6 子维度）
+
+Undici 在 D13 的定位是**HTTP 缓存 + 重试底座**（非完整离线方案），核心能力集中在 RFC 9111 HTTP 缓存、RetryHandler 背压、Dispatcher compose。
+
+#### 28.5.1 D13 子维度 × undici 核心机制对照表
+
+| 子维度 | undici 实现 | 代码定位 | 成熟度 |
+|--------|------------|---------|--------|
+| **D13-1 离线检测** | ❌ 无 | — | — |
+| **D13-2 请求队列** | RetryHandler 背压 | `lib/handler/retry-handler.js:48-127` | ⚠️ 重试级 |
+| **D13-3 本地缓存** | HTTP 缓存（RFC 9111） | `lib/cache/memory-cache-store.js:57`、`lib/cache/sqlite-cache-store.js` | ⚠️ 标准缓存 |
+| **D13-4 队列持久化** | ❌ 无 | — | — |
+| **D13-5 离线功能子集** | ❌ 无 | — | — |
+| **D13-6 同步合并** | ❌ 无 | — | — |
+
+#### 28.5.2 undici 离线相关机制
+
+**RetryHandler 背压**（`lib/handler/retry-handler.js:48-127`）：
+- RetryController 背压控制
+- 指数退避 + 最大重试次数
+
+**HTTP 缓存**（`lib/cache/`）：
+- `memory-cache-store.js`：100MB maxSize 限制
+- `sqlite-cache-store.js`：SQLite 持久化缓存
+- RFC 9111 标准缓存语义（ETag / Last-Modified / Cache-Control）
+
+**Dispatcher compose**（`lib/dispatcher/`）：
+- 8 拦截器链（redirect / dns / cache / retry / dump 等）
+- 可组合缓存策略
+
+#### 28.5.3 D13 laew gap 汇总
+
+| 编号 | 维度 | 描述 | 优先级 |
+|------|------|------|--------|
+| L1821-L1880 | D13 离线模式 | 60 个 gap（离线检测/请求队列/本地缓存/队列持久化/离线功能子集/同步合并） | P2 |
+
+> **注**：D13 专题文档仍在生成中（第十九轮进行中），完整 gap 清单待补充。laew 当前无离线检测/队列/缓存/同步能力。
+
+#### 28.5.4 D13 借鉴路线图
+
+```
+Phase 1（P1 重要，2-4 周）：
+├── 离线检测（`src/llm/offline.rs` 新建 + heartbeat ping + 状态机）
+├── 请求队列（`tokio::sync::mpsc` + 指数退避）
+└── 本地缓存（`moka` 异步 LRU + ETag/Last-Modified）
+
+Phase 2（P2 进阶，1-2 月）：
+├── 队列持久化（`rusqlite` + WAL）
+├── 离线功能子集（Read/本地工具优先）
+└── 同步合并（CRDT 冲突合并）
+```
+
+---
+
+### 28.6 D14 — 跨设备同步与会话漫游（5 子维度）
+
+Undici 在 D14 的定位是**纯 HTTP 客户端**（无 Agent 会话层），**无任何跨设备同步能力**。本节主要记录 laew 在会话层的差距。
+
+#### 28.6.1 D14 子维度 × laew 现状对照表
+
+| 子维度 | laew 现状 | 代码定位 | 评分 |
+|--------|----------|---------|------|
+| **D14-1 设备发现与配对** | ❌ 无设备身份（仅元数据 device_id） | `src/session.rs` | 0% |
+| **D14-2 会话漫游** | ❌ 无 | — | 0% |
+| **D14-3 同步协议** | ❌ 无（仅 HTTP 请求-响应） | `src/llm/mod.rs` | 0% |
+| **D14-4 加密与隐私** | ❌ API Key 明文存 SQLite + 明文内存 | `src/config/mod.rs` | 0% |
+| **D14-5 状态合并与冲突** | ❌ 无（单进程压缩） | `src/agent/compact.rs` | 0% |
+
+#### 28.6.2 参考工程跨设备同步实现（laew 借鉴对象）
+
+| 工程 | 核心机制 | 规模 | 核心文件 |
+|------|---------|------|---------|
+| **openclaw** | Ed25519 设备身份 + 6 种配对审批 + Tailscale + AES-256-GCM | ~2,894 行 | `src/infra/device-identity.ts:203`、`device-pairing.ts:806`、`device-pairing-tokens.ts:427`、`tailscale.ts:682` |
+| **opencode** | share-next.ts EventV2 + steal + 双 base URL | ~371 行 | `packages/opencode/src/share/share-next.ts:371` |
+| **claudecode** | Bridge 远程控制 + 崩溃恢复指针（4h TTL） | ~400 行 | `src/bridge/bridgePointer.ts:210`、`trustedDevice.ts:210` |
+| **deepseek-harness** | Typert Remote（generation + accept()） | ~600 行 | `packages/api/gateway/src/stream-protocol.ts:150`、`remote-stream.ts:150` |
+| **atomcode** | LiveViewHub broadcast + OAuth 状态机 | ~500 行 | `crates/atomcode-daemon/src/live_hub.rs:200`、`auth_token.rs:150` |
+| **pi** | pi.share trailing entry + Radius/Gist fallback | ~150 行 | `packages/coding-agent/src/modes/interactive/session-share.ts:150` |
+
+#### 28.6.3 D14 laew gap 汇总
+
+| 编号 | 维度 | 描述 | 优先级 |
+|------|------|------|--------|
+| **L1881** | D14-1 | 无设备身份（Ed25519 密钥对 + 指纹） | P0 |
+| **L1882** | D14-1 | 无设备配对审批流程（6 种方式） | P0 |
+| **L1883** | D14-1 | 无设备 Token 签发/轮换/撤销 | P0 |
+| **L1891** | D14-2 | 无会话共享（EventV2 实时同步） | P0 |
+| **L1892** | D14-2 | 无会话抢占/转移（steal 机制） | P0 |
+| **L1893** | D14-2 | 无崩溃恢复指针（4h TTL + mtime） | P0 |
+| **L1901** | D14-3 | 无 WebSocket 实时同步协议 | P0 |
+| **L1902** | D14-3 | 无 generation 单调递增重连机制 | P0 |
+| **L1903** | D14-3 | 无 broadcast channel 多播 | P0 |
+| **L1911** | D14-4 | 无 AES-256-GCM 内存加密 | P0 |
+| **L1912** | D14-4 | 无 Trusted Device Token（90d 滚动） | P0 |
+| **L1913** | D14-4 | 无 HttpOnly Cookie + 端口隔离 | P0 |
+| **L1921** | D14-5 | 无 lifecycleRevision CAS | P0 |
+| **L1922** | D14-5 | 无 generation 单调递增（防 stale） | P0 |
+| **L1923** | D14-5 | 无 Map-based union（LWW by key） | P0 |
+| L1884-L1890 | D14-1 | Tailscale / Trusted Device / WebUI Cookie / Node Surface / 审批策略 / pruning / 身份迁移 | P1 |
+| L1894-L1900 | D14-2 | Worktree 感知 / WorkSecret / pi.share / Radius/Gist / 1 秒批 flush / 双 base URL / 漫游 UI | P1 |
+| L1904-L1910 | D14-3 | Tailscale Serve/Funnel / 客户端能力协商 / waterfall/emit / Journal Stream / LiveViewEvent / client_input_id / 1 秒批 | P1 |
+| L1914-L1920 | D14-4 | HMAC nonce / AAD scope / 自动脱敏 / env var 覆盖 / X-User-Id 校验 / 64 KiB 上限 / 进程全局密钥 | P1 |
+| L1924-L1930 | D14-5 | accept() 确认 / carrier 错误分类 / structuredClone / strictOwner / StaleBinding / session-changed / cursor 单调 | P2 |
+
+#### 28.6.4 D14 借鉴路线图
+
+```
+Phase 1（P0 紧急，1-2 周）：
+├── L1893 崩溃恢复指针（`src/agent/bridge_pointer.rs` 新建 + 4h TTL + mtime）
+├── L1911 API Key 内存加密（`src/llm/credentials.rs` 新建 + `aes-gcm` + `secrecy` + `zeroize`）
+└── L1891 会话导出（`src/agent/session_export.rs` 新建 + JSONL）
+
+Phase 2（P1 重要，2-4 周）：
+├── L1881 设备身份（`src/agent/device_identity.rs` 新建 + `ed25519-dalek` + `sha2`）
+├── L1882 设备配对（`src/agent/device_pairing.rs` 新建 + silent/owner 两种审批）
+├── L1892 会话共享（`src/agent/share_next.rs` 新建 + 1 秒批 flush + Map-based union）
+├── L1901 WebSocket 同步（`src/agent/sync_protocol.rs` 新建 + `tokio-tungstenite`）
+└── L1902 generation + accept() 机制
+
+Phase 3（P2 进阶，1-3 月）：
+├── L1904 Tailscale 集成（`src/agent/tailscale.rs` 新建 + Serve/Funnel）
+├── L1921 lifecycleRevision CAS（`src/agent/session_merge.rs` 新建）
+├── L1912 Trusted Device Token（90d 滚动）
+└── L1913 HttpOnly Cookie + 端口隔离
+```
+
+---
+
+### 28.7 关键文件路径汇总
+
+#### 28.7.1 undici 安全相关文件索引（D9）
+
+| 文件 | 行数 | 核心职责 |
+|------|------|---------|
+| `SECURITY.md` | 160 | 威胁模型（Node.js 对齐） |
+| `lib/core/util.js` | 1037 | isValidHTTPToken + isValidHeaderValue |
+| `lib/core/request.js` | 539 | Header 校验 + 方法校验 |
+| `lib/dispatcher/client.js` | 741 | maxResponseSize + 连接限制 |
+| `lib/dispatcher/client-h1.js` | 1801 | HTTP/1.1 客户端（maxResponseSize） |
+| `lib/dispatcher/client-h2.js` | 1781 | HTTP/2 客户端（maxResponseSize） |
+| `lib/dispatcher/proxy-agent.js` | 378 | 代理 CONNECT + SecureProxyConnectionError |
+| `lib/interceptor/redirect.js` | 21 | 重定向拦截器 |
+| `lib/handler/redirect-handler.js` | 229 | 重定向安全（maxRedirections + stripHeaders） |
+| `lib/interceptor/dns.js` | 575 | DNS 缓存 + lookup 回调 |
+| `lib/interceptor/retry.js` | ~50 | 重试拦截器 |
+| `lib/handler/retry-handler.js` | ~100 | RetryController 背压 |
+| `lib/web/cookies/index.js` | 80 | Cookie 处理 |
+| `lib/web/subresource-integrity/subresource-integrity.js` | 307 | SRI 校验（sha256/384/512） |
+| `lib/cache/memory-cache-store.js` | 57 | 100MB maxSize 限制 |
+
+#### 28.7.2 参考工程 A2A/ACP 文件索引（D11）
+
+| 工程 | 文件 | 行数 | 核心职责 |
+|------|------|------|---------|
+| openclaw | `extensions/a2a/src/protocol.ts` | 173 | A2A 核心协议 + Task 6 态 + 方法路由 |
+| openclaw | `extensions/a2a/src/task-store.ts` | 210 | Task 存储 + FIFO 队列 + 等待者 |
+| openclaw | `extensions/a2a/src/http.ts` | 383 | HTTP 服务端 + Agent Card + 批处理 |
+| openclaw | `extensions/a2a/src/gateway.ts` | 86 | Gateway 路由注册 |
+| openclaw | `extensions/a2a/src/inbound.ts` | 137 | 入站分发 + 会话隔离 |
+| openclaw | `extensions/a2a/src/outbound.ts` | 132 | 出站发送 + SSRF 防护 |
+| atomcode | `crates/atomcode-cli/src/acp/mod.rs` | 618 | ACP 模块入口 + SharedState |
+| atomcode | `crates/atomcode-cli/src/acp/v2.rs` | 1571 | Draft v2 协议链 |
+| atomcode | `crates/atomcode-cli/src/acp/discovery.rs` | 346 | session/list 发现 + keyset 分页 |
+| atomcode | `crates/atomcode-cli/src/acp/mcp.rs` | 213 | ACP MCP → coding MCP 配置转换 |
+| deepseek | `packages/acp/acp/src/index.ts` | 534 | ACP 插件入口 + 事件桥接 |
+| deepseek | `packages/acp/acp/src/session.ts` | 527 | Session 生命周期 |
+| deepseek | `packages/acp/acp/src/codec.ts` | 34 | TurnEndReason → StopReason 映射 |
+| deepseek | `packages/acp/acp/src/updates.ts` | 111 | Session 更新流 |
+| deepseek | `packages/acp/acp/src/model-control.ts` | 237 | 模型控制 |
+| openclaw | `src/acp/server.ts` | 207 | ACP stdio 服务端 + Gateway 桥 |
+| openclaw | `src/acp/translator.ts` | 207 | ACP ↔ Gateway 协议翻译 |
+| openclaw | `packages/acp-core/src/session.ts` | 191 | Session 存储 + LRU 驱逐 |
+
+#### 28.7.3 参考工程跨设备同步文件索引（D14）
+
+| 工程 | 文件 | 行数 | 核心职责 |
+|------|------|------|---------|
+| openclaw | `src/infra/device-identity.ts` | 203 | Ed25519 设备身份 API |
+| openclaw | `src/infra/device-identity-store.ts` | 200 | SQLite 持久化 |
+| openclaw | `src/infra/device-pairing.types.ts` | 178 | 配对类型定义（6 种审批） |
+| openclaw | `src/infra/device-pairing.ts` | 806 | 配对管理核心 |
+| openclaw | `src/infra/device-pairing-tokens.ts` | 427 | Token 签发/轮换/撤销 |
+| openclaw | `src/infra/device-auth-store.ts` | 365 | 设备授权持久化 |
+| openclaw | `src/secrets/sentinel.ts` | 125 | AES-256-GCM Secret Sentinel |
+| openclaw | `src/infra/tailscale.ts` | 682 | Tailscale CLI 集成 |
+| openclaw | `src/gateway/server-tailscale.ts` | 108 | Gateway Tailscale 暴露 |
+| openclaw | `packages/gateway-protocol/src/client-info.ts` | 140 | 14 种客户端 ID + 13 种 cap |
+| opencode | `packages/opencode/src/share/share-next.ts` | 371 | EventV2 会话共享 |
+| opencode | `packages/opencode/src/event-v2-bridge.ts` | 71 | EventV2 桥接 |
+| claudecode | `src/bridge/types.ts` | 262 | Bridge 协议类型（WorkSecret） |
+| claudecode | `src/bridge/bridgePointer.ts` | 210 | 崩溃恢复指针（4h TTL） |
+| claudecode | `src/bridge/trustedDevice.ts` | 210 | Trusted Device Token 注册/存储 |
+| deepseek | `packages/api/gateway/src/stream-protocol.ts` | 150 | Typert Remote 协议帧 |
+| deepseek | `packages/api/gateway/src/client/remote-stream.ts` | 150 | RemoteStream 自动重连 |
+| atomcode | `crates/atomcode-daemon/src/live_hub.rs` | 200 | LiveViewHub broadcast channel |
+| atomcode | `crates/atomcode-daemon/src/auth_token.rs` | 150 | WebUI Cookie + 端口隔离 |
+| pi | `packages/coding-agent/src/modes/interactive/session-share.ts` | 150 | pi.share trailing entry |
+
+---
+
+### 28.8 第十九轮总结
+
+#### 28.8.1 6 大维度 gap 总表
+
+| 区段 | 维度 | 实际 gap 数 | 状态 |
+|------|------|------------|------|
+| L1591-L1645 | D9 安全与威胁模型 | 55 | ✅ |
+| L1641-L1700 | D10 多模态输出 | 60 | 🔄 |
+| L1701-L1760 | D11 A2A 协议 | 60 | ✅ |
+| L1761-L1820 | D12 可访问性 | 60 | ✅ |
+| L1821-L1880 | D13 离线模式 | 60 | 🔄 |
+| L1881-L1930 | D14 跨设备同步 | 50 | ✅ |
+| **合计** | — | **340+** | 4/6 完成 |
+
+#### 28.8.2 laew 综合评分（6 维度）
+
+| 维度 | laew 现状 | 已覆盖 | 缺失 | 优先级 |
+|------|----------|-------|------|-------|
+| D9 安全 | 🟡 30% | Prompt 注入 L1208 ✅、溢出 L1044 ✅、熔断 H13 ✅ | Landlock/Seccomp/凭证加密/SSRF | P0 |
+| D10 多模态 | ❌ 5% | cell-based 纯文本 | diff/语法高亮/图片/Markdown | P1 |
+| D11 A2A | ❌ 0% | 无 | A2A/ACP/E2A/A2UI/MCP 双向 | P0 |
+| D12 a11y | 🟡 35% | 1 套 ANSI 主题 + 键盘可达 | 高对比/RTL/屏幕阅读器/减动效 | P0 |
+| D13 离线 | ❌ 0% | 无 | 离线检测/队列/缓存/同步 | P2 |
+| D14 同步 | ❌ 0% | 无 | 设备发现/配对/同步/加密 | P0 |
+
+#### 28.8.3 laew P0 紧急路线图（1-2 周）
+
+1. **D9 凭证加密**（`src/agent/safety/credentials.rs` 新建 + `aes-gcm` + `secrecy` + `zeroize`）
+2. **D9 SSRF 防护**（`src/agent/tools/webfetch.rs` 新建 + 私有 IP/CGNAT 阻断 + DNS pinning）
+3. **D9 Prompt 注入检测**（14 类正则 + `regex` crate）
+4. **D11 ACP Server**（`agent/acp/server.rs` 新建 + `agent-client-protocol` crate）
+5. **D11 Agent Card**（`agent/acp/agent_card.rs` 新建 + `axum` HTTP 服务）
+6. **D12 主题系统**（`tui/theme.rs` 拆分 + 高对比 + daltonized）
+7. **D12 IME 防护**（compositionstart/end 双 setTimeout flush）
+8. **D14 会话导出**（`src/agent/session_export.rs` 新建 + JSONL）
+9. **D14 崩溃恢复指针**（`src/agent/bridge_pointer.rs` 新建 + 4h TTL + mtime）
+10. **D14 API Key 内存加密**（`src/llm/credentials.rs` 新建 + `aes-gcm` + `secrecy`）
+
+#### 28.8.4 与前 18 轮的关系
+
+```
+第十九轮（2026-09-09）  ← 本轮 D9-D14 安全/a11y/A2A/同步（L1591-L1930+）
+  ↓
+第十八轮（2026-09-09）  ← 用户交互体验层 D1-D8（L1396-L1590）
+  ↓
+第十七轮（2026-09-09）  ← 崩溃恢复/多租户/RRF/Pregel/Skill/预热池/Turn 锁/HTTP/安全（L1166-L1395+）
+  ↓
+第十六轮（2026-09-09）  ← 多轮对话恢复/压缩管线/内存加密/SQLite/Hook/租约/IoC/LLM协议栈（L1036-L1165+）
+  ↓
+前 15 轮              ← HTTP 客户端基础设施（N1-N5 / HTTP/2 / WebSocket / SSE / 连接池 / 重试 / 代理 / TLS / DNS / 缓存 / 录制回放）
+```
+
+#### 28.8.5 关键 Rust crate 推荐矩阵
+
+| 维度 | 推荐 crate | 用途 |
+|------|-----------|------|
+| D9 凭证加密 | `aes-gcm` + `secrecy` + `zeroize` | API Key 磁盘加密 |
+| D9 SSRF 防护 | `reqwest` + `hyper` + `dns-lookup` | 私有 IP 阻断 + DNS pinning |
+| D9 Bash 检测 | `tree-sitter` + `tree-sitter-bash` | 23 层 Bash 安全检测器 |
+| D9 进程沙箱 | `landlock` + `seccompiler` + `cgroups-rs` | OS 级沙箱 |
+| D10 Diff 渲染 | `similar` + `ansi_term` | 行级 diff + ANSI 着色 |
+| D10 语法高亮 | `syntect` + `pulldown-cmark` | 代码高亮 + Markdown 渲染 |
+| D11 A2A 协议 | `jsonrpsee` + `serde_json` | A2A JSON-RPC 2.0 服务端 |
+| D11 ACP 协议 | `agent-client-protocol` + `tokio::io::AsyncBufRead` | ACP SDK |
+| D11 HTTP 服务 | `axum` | A2A HTTP 服务端 |
+| D12 主题 | `crossterm` + `serde` | 主题持久化 + ANSI 转义 |
+| D12 字体宽度 | `unicode-width` | 准确 CJK/emoji 宽度 |
+| D13 离线检测 | `tokio` + `reqwest` | heartbeat ping + 状态机 |
+| D14 设备身份 | `ed25519-dalek` + `sha2` | Ed25519 密钥对 + 指纹 |
+| D14 同步协议 | `tokio-tungstenite` + `tokio::sync::broadcast` | WebSocket + 多播 |
+| D14 会话导出 | `serde_json` + `chrono` + `handlebars` | JSON/Markdown/HTML 导出 |
+
+---
+
+> **本轮总结一句话**：第十九轮从「HTTP 客户端基础设施」升级到「安全纵深 + A2A 协议 + 可访问性 + 跨设备同步」6 大新维度，新增 340+ 个 laew gap（累计突破 1930）。**laew 当前 a11y 评分 35%（WCAG 30%）、安全 30%、A2A 0%、跨设备同步 0%**，需要 4-6 周 P0 重构，重点是凭证加密 + SSRF 防护 + ACP Server + 主题系统 + IME 防护 + 会话导出。
+
+完整对照表：[`专题/专题-laew实现进度对照表.md`](专题/专题-laew实现进度对照表.md)
+
+专题来源：
+- [`专题-第十九轮-安全与威胁模型深度对比.md`](专题/专题-第十九轮-安全与威胁模型深度对比.md)
+- [`专题-第十九轮-A2A协议与多Agent互操作深度对比.md`](专题/专题-第十九轮-A2A协议与多Agent互操作深度对比.md)
+- [`专题-第十九轮-可访问性a11y与RTL深度对比.md`](专题/专题-第十九轮-可访问性a11y与RTL深度对比.md)
+- [`专题-第十九轮-跨设备同步与会话漫游深度对比.md`](专题/专题-第十九轮-跨设备同步与会话漫游深度对比.md)
+- [`专题-第十九轮-跨项目缺口分析.md`](专题/第十九轮-跨项目缺口分析.md)
+
+---
+
 *本轮深挖 100% 覆盖 undici 富内容获取 HTTP 底座维度，为 laew WebFetch 工具实现提供完整参考。新增 15 个 gap 集中在 N1-N5 主线，无重复前 17 轮维度。*

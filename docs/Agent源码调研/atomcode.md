@@ -7364,4 +7364,618 @@ if error.is_snapshot_conflict() {
 
 **唯一主动缺失的是 D4 文件监视**(atomcode 选 lazy refresh)。laew 的 P1 借鉴清单已就绪(L1396/L1398/L1400/L1401/L1403/L1404/L1410/L1411/L1412 共 9 项),建议立即启动。
 
+---
+
+## 25. 第十九轮深挖 — 安全纵深 + A2A 协议 + 可访问性 + 跨设备同步
+
+> **调研日期**：2026-09-09
+> **本轮定位**：第十八轮首次切入「用户交互体验层」(D1-D8),本轮继续深挖该层剩余 6 维度(D9-D14),并首次系统化覆盖「**安全纵深**」(D9)、「**A2A 协议与多 Agent 互操作**」(D11)、「**可访问性 a11y / RTL / 屏幕阅读器**」(D12)、「**跨设备同步与会话漫游**」(D14);D10 多模态输出 / D13 离线模式仍在进行中,本节标注 🔄 跳过
+> **本轮新增 gap**：L1591-L1930+(共 340+ 个新 gap,累计突破 1930)
+> **与前 18 轮关系**：
+> - 第十二轮安全专题(通用架构) + 第十四轮安全加固(概念) + 第十七轮安全 gap(L1311-L1320) → 本轮**完整规则清单 + 完整实现 + 完整字段**
+> - 第十一轮首次覆盖 A2A/ACP/E2A/A2UI 基础概念(L143-L165) → 本轮**源码级深度对比**
+> - 第九轮 T4 i18n → 本轮 **a11y / RTL / 字体回退** 3 子项深度展开
+> - 第十八轮 D8 会话导出 → 本轮 **跨设备漫游** 自然延伸
+
+---
+
+### 25.1 维度总览(D9-D14 六大维度)
+
+| 维度 | 状态 | 新增 gap | atomcode 核心机制 | laew 现状 |
+|------|------|---------|------------------|----------|
+| **D9 安全与威胁模型** | ✅ 完成 | L1591-L1645(55 个) | 双 pass scrub + 22 类 Bash + DNS-rebinding TOCTOU + PolicyIntervention | 🟡 30%(Prompt 注入 L1208 ✅ / 溢出 L1044 ✅ / 熔断 H13 ✅) |
+| **D10 多模态输出** | 🔄 进行中 | L1641-L1700 | 主动放弃 syntect + 主动放弃 truecolor + DiffViewer 三阶段 | ❌ 5% |
+| **D11 A2A 协议与多 Agent 互操作** | ✅ 完成 | L1701-L1760(60 个) | ACP stdio 7650 行 Rust + MCP 7 子模块 + LiveViewHub | ❌ 0% |
+| **D12 可访问性 a11y / RTL** | ✅ 完成 | L1761-L1820(60 个) | 50+ aria-label + 2336 行 onboarding_wizard + 16 色 SGR | ❌ 35%(WCAG 30%) |
+| **D13 离线模式** | 🔄 进行中 | L1821-L1880 | prefix-stability + 内容寻址 sha256 修订号 | ❌ 0% |
+| **D14 跨设备同步** | ✅ 完成 | L1881-L1930(50 个) | LiveViewHub broadcast::channel + OAuth 状态机 + WebUI Cookie 端口隔离 | ❌ 0% |
+
+---
+
+### 25.2 D9 安全与威胁模型(8 子维度)
+
+#### 25.2.1 atomcode D9 子维度矩阵
+
+| 子维度 | 核心机制 | 代码定位(文件:行号) | 安全成熟度 |
+|--------|---------|-------------------|-----------|
+| **D9-1 STRIDE** | ❌ 无形式化文档,以「fail-closed by implementation」替代 | 各具体门控实现 | ⭐⭐ 隐式 |
+| **D9-2 Prompt 注入** | ✅ synthetic 标记 + 双 pass scrub + 系统提示词契约 | `reminder.rs:18-43`、`scrub.rs:23-44`、`persona.rs` | ⭐⭐⭐ 3 层 |
+| **D9-3 Bash 检测** | ✅ 22 类规则 + tree-sitter AST + 递归解包(17 wrapper) | `bash.rs:1653-2163`(4303 行) | ⭐⭐⭐⭐ |
+| **D9-4 凭证管理** | ✅ 0o600 + fsync + atomic rename + Zeroizing<String> | `auth/lib.rs:25-92`、`askpass/server.rs:1-293` | ⭐⭐⭐⭐ |
+| **D9-5 路径信任** | ✅ 25+ 敏感路径 + 系统保护前缀 + tilde 安全展开 | `sensitive_path.rs:32-55`、`pathutil.rs:24-36` | ⭐⭐⭐⭐ |
+| **D9-6 进程沙箱** | ❌ 无 OS 沙箱,仅进程隔离(setsid + TIOCNOTTY) | `bash.rs:26-106` | ⭐ 逻辑隔离 |
+| **D9-7 SSRF 防护** | ✅ DNS-rebinding TOCTOU 闭环 + resolve_to_addrs 钉扎 | `web_fetch.rs:410-545` | ⭐⭐⭐⭐ |
+| **D9-8 决策审计** | ⚠️ PolicyIntervention 三段式(correlation id + 稳定 code + 恢复动作白名单) | `kernel/src/event.rs:22-65`、`coding/telemetry.rs:436-449` | ⭐⭐⭐ |
+
+#### 25.2.2 atomcode D9 关键实现深度
+
+**双 pass scrub**( `crates/atomcode-telemetry/src/scrub.rs:23-44` ):
+```rust
+// Pass 1: key=value 凭证
+let kv = Regex::new(r#"(?i)(\b(?:authorization|x-api-key|api[-_]?key|...)\b\s*[:=]\s*"?(?:bearer\s+|token\s+)?)([^"'\s,;)]{6,})"#);
+// Pass 2: 已知独立 token 形状(GitHub PAT / GitLab PAT / Slack / OpenAI sk- / AWS AKIA/ASIA / Google AIza / JWT)
+let tokens = Regex::new(r#"\b(?:gh[opsru]_[A-Za-z0-9]{20,}|github_pat_...|glpat-...|xox[baprs]-...|sk-...|AKIA[0-9A-Z]{16}|ASIA...|AIza...|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,})"#);
+```
+
+**22 类 Bash 破坏性命令规则**( `crates/atomcode-capabilities/src/tools/bash.rs:1653-2163` ):
+- 权限提升工具(sudo/doas/pkexec/run0/dzdo/pfexec/systemd-run/runuser/su/machinectl)
+- `find -delete` / `find -exec rm`
+- `xargs`/`parallel` 承载 rm 或 git checkout/restore
+- 子壳递归 `<shell> -c "..."`(bash/sh/zsh/dash/ash/ksh/python/perl/ruby/node)
+- `eval` 递归 / 复合命令 `; && ||` 分段递归
+- 远程脚本管道到 shell(curl/wget/aria2c/lynx/wget2 | sh/bash/zsh)
+- 反向 shell / raw socket `/dev/tcp/` `/dev/udp/`
+- netcat/ncat 监听或 -e/-c exec / socat exec/system/tcp-listen
+- `rm -r` / `dd if=/dev/` / fork bomb `:(){`
+- 关键系统文件覆写(`/etc/passwd` `/etc/shadow` `/etc/hosts` `/etc/sudoers`)
+- ORM/迁移 schema 重置 / Windows PowerShell Invoke-WebRequest + IEX
+- tree-sitter AST 读白名单(仅 14 种结构节点类型)
+
+**DNS-rebinding TOCTOU 闭环**( `crates/atomcode-capabilities/src/tools/web_fetch.rs:410-545` ):
+```rust
+fn validate_scheme(url: &Url) -> Result<(), String> {  // 仅 http/https
+fn is_safe_ip()  // IPv4: loopback/private/link-local/CGNAT/广播/组播/未指定/保留
+                  // IPv6: loopback/unspecified/multicast/unique-local/link-local + 嵌入 IPv4 解包重检
+async fn validate_host(url: &Url) -> Result<Vec<SocketAddr>, String> {  // 解析后重校验
+fn build_client(host: &str, pinned: &[SocketAddr]) -> Result<reqwest::Client, String> {
+    builder.resolve_to_addrs(host, pinned)  // ← DNS 钉扎,关闭 TOCTOU 窗口
+```
+
+**PolicyIntervention 三段式**( `crates/atomcode-kernel/src/event.rs:22-65` ):
+```rust
+pub struct PolicyIntervention {
+    pub id: u64,                    // ← 进程唯一关联 id(防延迟响应误确认)
+    pub code: PolicyInterventionCode, // ← 稳定机器码(CredentialShellBlocked)
+    pub actions: Vec<PolicyRecoveryAction>, // ← 可安全执行的恢复动作白名单
+}
+```
+
+**凭证落盘完整链路**( `crates/atomcode-auth/src/lib.rs:25-92` ):
+```
+tempfile → 0o600 → write → fsync → atomic rename → chmod 0o600
+```
+
+**askpass 安全 sudo/ssh 密码输入**( `crates/atomcode-capabilities/src/askpass/server.rs:1-293` ):
+- Unix socket 认证:`$HOME/.atomcode/run/atomcode-askpass-{pid}.sock`
+- 随机 token:读 `/dev/urandom` 取 16 字节转 32 字符 hex
+- 密码缓存用 `Zeroizing<String>`
+
+#### 25.2.3 D9 与其他工程对比(关键差异)
+
+| 特性 | atomcode | claudecode | deepseek | openclaw | laew |
+|------|---------|-----------|---------|---------|------|
+| **STRIDE 文档** | ❌ | ❌ | ❌ | ✅ MITRE ATLAS 17 威胁 | ❌ |
+| **Prompt 注入** | synthetic + 双 pass | Unicode + 20KB 预算 | 结构隔离 | 14 类 + 同形字 + LLM Token | ❌ |
+| **Bash 检测** | 22 类 + AST | 23 层 + FAIL | 沙箱包裹 | 解释器白名单 | ❌ |
+| **凭证管理** | 0o600 + fsync | Keychain | 0o600 + 锁 + role | AES-256-GCM | ❌ 明文 SQLite |
+| **SSRF** | TOCTOU 闭环 | IPv4/IPv6 完整 | Host 栅栏 | 双阶段 + pinning | ❌ |
+| **OS 沙箱** | ❌ | 外部包 | 四平台原生 | Docker | ❌ |
+
+#### 25.2.4 D9 laew gap 与借鉴路线图
+
+**P0 紧急(5 项)**:
+- L1599 凭证 0o600 + Keychain 存储(`auth/lib.rs:35-59`)
+- L1600 应用层 AES-256-GCM 加密(`aes-gcm` + `secrecy` + `zeroize`)
+- L1608 私有 IP 拦截(`web_fetch.rs:425-493`)
+- L1603 工作目录信任模型(`sensitive_path.rs:32-55`)
+- L1592 Prompt 注入 14 类正则检测
+
+**P1 重要(7 项)**:
+- L1596 Bash 23 层检测器(`bash.rs:1653-2163`)
+- L1597 FAIL-CLOSED AST 白名单
+- L1609 DNS 钉扎(`web_fetch.rs:495-545`)
+- L1610 决策审计 3 段式(`event.rs:22-65`)
+- L1612 双 pass scrub(`scrub.rs:23-44`)
+- L1613 synthetic 来源标记(`reminder.rs:31-33`)
+- L1605 敏感路径门 25+ 标记
+
+**P2 进阶(3 项)**:
+- L1606 OS 级沙箱(Landlock/Seccomp)
+- L1622 Docker 容器沙箱
+- L1628 W3C traceparent 传播
+
+---
+
+### 25.3 D11 A2A 协议与多 Agent 互操作(7 子维度)
+
+#### 25.3.1 atomcode D11 子维度矩阵
+
+| 子维度 | 核心机制 | 代码定位(文件:行号) | 协议代 |
+|--------|---------|-------------------|-------|
+| **D11-1 A2A** | ❌ 无 A2A 实现,仅 ACP | — | — |
+| **D11-2 ACP** | ✅ stdio 服务器 7650 行 Rust,14 文件 | `crates/atomcode-cli/src/acp/` | v1 + v2 draft 双协议代 |
+| **D11-3 E2A** | ❌ 无显式 E2A,ACP 嵌入式场景 | — | — |
+| **D11-4 A2UI** | ✅ LiveViewHub 实时 UI 同步 | `crates/atomcode-daemon/src/live_hub.rs:1-200` | 自研 |
+| **D11-5 MCP 双向** | ✅ 7 子模块(server/client/stdio/sse/streamable-http/tool-registry/resource-manager) | `crates/atomcode-capabilities/src/mcp/` | 三传输 |
+| **D11-6 跨语言** | ❌ 全 Rust 栈,无 FFI | — | — |
+| **D11-7 路由发现** | ✅ SessionManager 合并视图 + keyset 分页 | `crates/atomcode-cli/src/acp/discovery.rs:1-346` | 50/page |
+
+#### 25.3.2 atomcode ACP 核心实现深度
+
+**模块结构**( `crates/atomcode-cli/src/acp/`,14 文件 7650 行):
+
+| 文件 | 行数 | 功能 |
+|------|------|------|
+| `mod.rs` | 618 | 模块入口 + SharedState + serve_over |
+| `v2.rs` | 1,571 | Draft v2 协议链 |
+| `dispatch.rs` | 1,057 | 共享 session 表 + prompt turn 循环 |
+| `options.rs` | 1,038 | Session config option 目录 |
+| `sessions.rs` | 605 | Session 表 + cancel/close/delete |
+| `discovery.rs` | 346 | session/list 发现 + keyset 分页 |
+| `elicitation.ts` | 345 | 用户输入回环(form/URL) |
+| `turn.rs` | 388 | Prompt turn 循环 |
+| `replay.rs` | 247 | 会话重放(replayFrom) |
+| `permission.rs` | 294 | 权限请求 |
+| `mcp.rs` | 213 | 客户端注入 MCP 服务器转换 |
+| `translate.rs` | 264 | 协议翻译 |
+| `engine.rs` | 215 | Kernel-native session agent |
+
+**双协议代**( `mod.rs:196-200` ):
+- v1 稳定链 + v2 draft 链,按 SDK 协议路由器选择
+- 能力广告:`load_session` / `prompt image` / `MCP http` / `session list/delete/resume`
+
+**Session 发现**( `discovery.rs:1-346` ):
+- 合并视图:live ACP sessions + 持久化 native session catalog
+- Keyset 分页:cursor 编码最后 session id,支持 cwd 过滤
+- Fork 折叠:`SessionManager::collapse_fork_lineages()`
+
+**MCP 服务器转换**( `mcp.rs:38-106` ):
+- Stdio 基线(协议要求)+ HTTP 广告 via `mcp_capabilities.http`
+- SSE 忽略(返回 ignored 列表)
+- 信任边界:`source: McpConfigSource::Driver, trust: false`
+
+**端到端测试**( `crates/atomcode-cli/tests/acp_end_to_end.rs:1-2233` ):
+- `initialize_new_prompt_streams_and_stops`
+- `resume_reconnects_to_persisted_session`
+- `error_turn_does_not_poison_next_prompt_on_same_session`
+- `v2_client_negotiates_and_runs_prompt_lifecycle`
+- `session_config_options_mode_and_effort`
+
+#### 25.3.3 LiveViewHub 实时同步(D11-4 A2UI)
+
+**核心文件**:`crates/atomcode-daemon/src/live_hub.rs:1-200`
+
+```rust
+const BROADCAST_CAPACITY: usize = 1024;
+
+pub struct LiveViewHub {
+    state: Mutex<HubState>,
+    events: broadcast::Sender<LiveObservation>,
+}
+
+pub struct LiveBinding {
+    pub id: u64,
+    pub generation: u64,  // ← 每次 runtime 切换 +1,防 stale
+    pub session_id: String,
+    pub working_dir: PathBuf,
+    pub provider: String,
+    pub provider_fingerprint: String,
+}
+
+pub enum LiveViewEvent {
+    InputAccepted { input: UserInput, client_input_id: Option<String> },
+    Steered { count: usize, inputs: Vec<SteeredInput>, client_input_ids: Vec<Option<String>> },
+    CommandOutput(String),
+    RequestResolved { request_id: RequestId, kind: String },
+    Runtime(CodingRuntimeEvent),
+}
+```
+
+**范式要点**:
+- `broadcast::channel(1024)`:tokio 多播通道
+- generation 防 stale:`HubError::StaleBinding { expected, actual }` 拒绝过期 binding
+- cursor 单调递增 + replay buffer(新订阅者补发历史)
+- client_input_id 关联:Web 端输入 → 内核 Steered 响应 → 按 ID 匹配
+
+#### 25.3.4 D11 与其他工程对比(关键差异)
+
+| 特性 | atomcode | openclaw | deepseek | claudecode | laew |
+|------|---------|---------|---------|-----------|------|
+| **A2A Protocol** | ❌ | ✅ v1.0 3165 行 | ❌ | ❌ | ❌ |
+| **ACP** | ✅ 7650 行 Rust | ✅ 17001 行 TS | ✅ 1853 行 TS | ❌ | ❌ |
+| **协议代** | v1 + v2 draft | v1 | v1 | — | — |
+| **MCP 传输** | stdio/sse/http | stdio/sse/http | stdio/http | SSOT | 🟡 子集 |
+| **SubAgent 注册** | SessionManager | Registry 100+ 文件 | Cordis | — | ❌ |
+| **跨语言** | 全 Rust | 纯 TS | Cordis | — | — |
+
+#### 25.3.5 D11 laew gap 与借鉴路线图
+
+**P0 紧急(5 项)**:
+- L1702 ACP Server 实现(`agent-client-protocol` crate,atomcode 同款)
+- L1709 ACP initialize 握手(`mod.rs:107-120`)
+- L1710 ACP session/new 创建
+- L1711 ACP session/prompt 驱动
+- L1712 ACP MCP 挂载(`mcp.rs:38-106`)
+
+**P1 重要(5 项)**:
+- L1728 ACP v2 协议支持(`v2.rs:1571 行`)
+- L1729 ACP replayFrom 重放(`replay.rs:247 行`)
+- L1730 ACP elicitation 回环(`elicitation.rs:345 行`)
+- L1731 ACP session/list 发现(`discovery.rs:346 行`)
+- L1732 ACP keyset 分页(`discovery.rs:125-143`)
+
+**P2 进阶(5 项)**:
+- L1701 A2A Protocol 实现(openclaw 3165 行参考)
+- L1741 E2A 事件总线
+- L1742 A2UI 协议(LiveViewHub 已部分覆盖)
+- L1752 PyO3 跨语言桥
+- L1759 ACP 配置选项目录(`options.rs:1038 行`)
+
+---
+
+### 25.4 D12 可访问性 a11y / RTL / 屏幕阅读器(7 子维度)
+
+#### 25.4.1 atomcode D12 子维度矩阵
+
+| 子维度 | 核心机制 | 代码定位(文件:行号) | a11y 评分 |
+|--------|---------|-------------------|----------|
+| **D12-1 屏幕阅读器** | ✅ 50+ aria-label + role="alert"/"status"/"search" | `webui/src/components/Chat.tsx:3274/3284/3122/3331` | 中等偏高 |
+| **D12-2 高对比度主题** | ❌ 仅 light/dark 无高对比,16 色 SGR | `crates/atomcode-tui/src/theme.rs:1-60` | 低 |
+| **D12-3 减动效** | 🟡 部分样式表 + framer-motion 检测 | `apps/webui/src/hooks/useReducedMotion.ts:1-30` | 部分 |
+| **D12-4 RTL** | 🟡 Web 端 CSS logical props,无 dir 切换 | `webui/src/styles/layout.css:30-60` | 部分 |
+| **D12-5 盲文** | ❌ 无 Braille 适配(市场极小) | — | 0% |
+| **D12-6 键盘可达** | ✅ VS Code 风格焦点环 + Tab order + 50+ 键位 | `webui/src/styles/focus.css:1-30`、`crates/atomcode-tui/src/focus.rs:1-50` | 70% |
+| **D12-7 字体/宽度** | ✅ 4 档字号(0.875/1/1.125/1.25)+ font-family 链 + width.rs 精细算法 | `Cargo.toml:25 unicode-width`、`webui/src/styles/fonts.css:1-40` | 中等 |
+
+#### 25.4.2 atomcode D12 关键实现深度
+
+**WebUI ARIA 50+ 属性**( `webui/src/components/Chat.tsx` ):
+```tsx
+// 发送/停止按钮
+<button aria-label={sending ? t('stop') : t('send')}>...</button>
+// 错误播报
+<div role="alert">{error.message}</div>
+// 状态播报
+<div role="status">{statusText}</div>
+// 搜索区域
+<div role="search"><input aria-label={t('search.placeholder')} /></div>
+// 装饰性 SVG 隐藏
+<svg aria-hidden="true">...</svg>
+// 状态切换
+<button aria-pressed={isPressed} aria-expanded={isExpanded}>...</button>
+```
+
+**关键缺口**:SSE 流是"哑"广播,**没有 `aria-live="polite"` 包装**——`role="status"` 容器需用户焦点在其中才会朗读,实时 token 流不会自动播报。
+
+**TUI 主题**( `crates/atomcode-tui/src/theme.rs:1-60` ):
+```rust
+pub const DEFAULT_THEME: Theme = Theme {
+    fg: Color::White, bg: Color::Black, accent: Color::Cyan,
+    error: Color::Red, success: Color::Green, warning: Color::Yellow,
+    dim: Color::DarkGrey, select_fg: Color::Black, select_bg: Color::White,
+};
+pub const HIGH_CONTRAST_THEME: Theme = Theme { /* BrightCyan/BrightRed/BrightGreen/BrightYellow/BrightWhite */ };
+```
+- 无色盲主题、无 prefers-contrast 检测
+
+**Web 端 CSS Logical Props**( `webui/src/styles/layout.css:30-60` ):
+```css
+.message {
+    margin-inline-start: 12px;
+    padding-inline-end: 8px;
+    border-inline-start: 3px solid var(--accent);
+}
+```
+- 未实现 `dir="rtl"` 切换(仅 UI 准备好,但无 locale 触发)
+
+**framer-motion 减动效检测**( `apps/webui/src/hooks/useReducedMotion.ts:1-30` ):
+```tsx
+import { useReducedMotion as framerUseReducedMotion } from "framer-motion";
+export function useReducedMotion(): boolean { return framerUseReducedMotion() ?? false; }
+```
+
+**TUI Focus Manager**( `crates/atomcode-tui/src/focus.rs:1-50` ):
+```rust
+pub struct FocusManager { focused: Option<ComponentId> }
+impl FocusManager {
+    pub fn focus_next(&mut self) {}  // Tab
+    pub fn focus_prev(&mut self) {}  // Shift+Tab
+    pub fn focus_first(&mut self) {} // Home
+    pub fn focus_last(&mut self) {}  // End
+}
+```
+
+**WebUI 字号 4 档 + font-family 链**( `webui/src/styles/fonts.css:1-40` ):
+```css
+:root {
+    --font-sans: "Inter", "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    --font-mono: "JetBrains Mono", "Cascadia Code", "Consolas", "Microsoft YaHei", monospace;
+    font-size: 16px;
+}
+```
+
+#### 25.4.3 D12 与其他工程对比(关键差异)
+
+| 特性 | atomcode | claudecode | openclaw | opencode | laew |
+|------|---------|-----------|---------|---------|------|
+| **ARIA 命中** | 50+ | 🟡 Ink Fork | 2139 | Solid + aria-label | ❌ |
+| **主题数** | 2 | 8(含 daltonized) | 11 | 30+ | 1 |
+| **高对比主题** | ❌ | ✅ daltonized | ✅ Beacon AAA 7:1 | ✅ 3 高对比 | ❌ |
+| **RTL locale** | 🟡 logical props | 🟡 bidi.ts | ✅ 34 locale | ✅ 5 locale | ❌ |
+| **减动效** | 🟡 framer | ✅ 全局 | ✅ 全局 + Lit | ✅ 全局 | ✅ TUI 无动效 |
+| **键盘可达** | ✅ 50+ | ✅ 50+ | ✅ | ✅ 100+ | ✅ 完全键盘 |
+| **emoji 宽度** | ✅ width.rs | ✅ 自研 stringWidth | ✅ decorative-emoji.ts | ✅ npm/string-width | 🟡 自研 CJK |
+
+#### 25.4.4 D12 laew gap 与借鉴路线图
+
+**P0 紧急(3 项)**:
+- L1771 `/theme` 斜杠命令(dark / light / high-contrast / daltonized)
+- L1778 focus ring 主题(`SELECTED_ATTRS = BOLD | REVERSE` 标准化)
+- L1801 + L1802 IME compositionstart/end 双 setTimeout flush
+
+**P1 重要(7 项)**:
+- L1772 高对比度主题(AAA ≥ 7:1,参考 openclaw Beacon)
+- L1773 色盲友好主题(daltonized,参考 claudecode)
+- L1774 `prefers-contrast: more` 检测
+- L1796 ANSI bell(``)通知
+- L1800 高优先级 = assertive live region 映射
+- L1803 `Ctrl+G` 外部编辑器
+- L1811 `unicode-width` crate 依赖(替代自研 CJK 近似)
+
+**P2 进阶(5 项)**:
+- L1786 RTL locale 检测(ar / he / fa / ur)
+- L1787 `document.documentElement.dir = "rtl"` 切换
+- L1788 CSS Logical Properties(`margin-inline-start`)
+- L1790 UAX #9 Bidi 算法(TUI)
+- L1812 emoji ZWJ 序列宽度算法
+
+---
+
+### 25.5 D14 跨设备同步与会话漫游(5 子维度)
+
+#### 25.5.1 atomcode D14 子维度矩阵
+
+| 子维度 | 核心机制 | 代码定位(文件:行号) | 同步能力 |
+|--------|---------|-------------------|---------|
+| **D14-1 设备发现** | 🟡 WebUI Cookie 端口隔离 + OAuth 状态机 | `crates/atomcode-daemon/src/auth_token.rs:1-150` | 部分 |
+| **D14-2 会话漫游** | ✅ LiveViewHub + /live transport | `crates/atomcode-daemon/src/live_hub.rs:1-200`、`live_api.rs:1-150` | Turn 级 |
+| **D14-3 同步协议** | ✅ HTTP SSE + broadcast::channel(1024) | `crates/atomcode-daemon/src/live_hub.rs:1-200` | 实时 |
+| **D14-4 加密隐私** | 🟡 HttpOnly Cookie + X-Atom-User-Id 双向校验 | `crates/atomcode-daemon/src/auth_token.rs:27-44` | 部分 |
+| **D14-5 状态合并** | ✅ generation 防 stale binding + StaleBinding/StaleEvent 错误 | `crates/atomcode-daemon/src/live_hub.rs:36-44` | 强 |
+
+#### 25.5.2 atomcode D14 关键实现深度
+
+**WebUI Cookie 端口隔离**( `crates/atomcode-daemon/src/auth_token.rs:1-150` ):
+```rust
+pub(crate) const WEBUI_COOKIE: &str = "atomcode_webui";
+pub fn webui_cookie_name(port: u16) -> String {
+    format!("{WEBUI_COOKIE}_{port}")  // ← 解决多实例共享 cookie jar 问题
+}
+pub async fn require_webui_token(...) -> Result<Response, StatusCode> {
+    let header = req.headers().get(AUTHORIZATION).and_then(|h| h.to_str().ok());
+    let cookie = req.headers().get(COOKIE).and_then(|h| h.to_str().ok());
+    let token = token_from_header(header).or_else(|| token_from_cookie(cookie, &state.webui_cookie_name));
+    match token {
+        Some(tok) if state.webui_tokens.is_valid(&tok) => Ok(next.run(req).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+```
+- **HttpOnly 防 XSS**:CWE-598 / CWE-522 防护
+- **双通道**:Authorization Bearer 头优先,Cookie 兜底
+- **X-Atom-User-Id 双向校验**:App 端经中继透传桌面端验证
+
+**LiveViewHub broadcast channel**( `crates/atomcode-daemon/src/live_hub.rs:1-200` ):
+- `broadcast::channel(1024)`:tokio 多播通道,容量 1024
+- generation 防 stale:`LiveBinding { id, generation, session_id, working_dir, provider, provider_fingerprint }`
+- cursor 单调递增 + replay buffer(新订阅者补发历史)
+- LiveViewEvent 5 变体:`InputAccepted` / `Steered` / `CommandOutput` / `RequestResolved` / `Runtime`
+- client_input_id 关联:Web 端输入 → 内核 Steered 响应 → 按 ID 匹配
+- Steered 图像脱敏:`redact_correlated_steer_images` 已知 ID 后清除 base64 图像
+
+**generation 防 stale binding**( `live_hub.rs:36-44` ):
+```rust
+pub struct LiveBinding {
+    pub id: u64,
+    pub generation: u64,  // ← 每次 runtime 切换 +1
+    pub session_id: String,
+    pub working_dir: PathBuf,
+    pub provider: String,
+    pub provider_fingerprint: String,
+}
+// HubError::StaleBinding { expected, actual } 拒绝过期 binding 的操作
+// HubError::StaleEvent(RuntimeGenerationChanged) 拒绝过期 generation 的事件
+```
+
+#### 25.5.3 D14 与其他工程对比(关键差异)
+
+| 特性 | atomcode | openclaw | opencode | claudecode | laew |
+|------|---------|---------|---------|-----------|------|
+| **设备身份** | 🟡 Cookie + OAuth | ✅ Ed25519 + 6 种审批 | 🟡 账号 token | 🟢 Trusted Device | ❌ |
+| **配对审批** | ❌ | ✅ 6 种(owner/silent/cidr/proxy/ssh/bootstrap) | ❌ | ❌ | ❌ |
+| **会话漫游** | ✅ LiveViewHub | ✅ Gateway 多端 | ✅ share-next + steal | ✅ Bridge + 指针 | ❌ |
+| **同步协议** | SSE + broadcast | WS + Tailscale 4 档 | HTTP + EventV2 | WS Bridge | ❌ |
+| **加密隐私** | 🟡 HttpOnly | ✅ AES-256-GCM | 🟡 双 base URL | 🟡 Keychain | ❌ |
+| **状态合并** | ✅ generation 防 stale | ✅ lifecycleRevision CAS | ✅ Map LWW | ❌ | ❌ |
+
+#### 25.5.4 D14 laew gap 与借鉴路线图
+
+**P0 紧急(3 项)**:
+- L1903 broadcast channel 多播(`live_hub.rs:1-200`)
+- L1913 HttpOnly Cookie + 端口隔离(`auth_token.rs:27-44`)
+- L1922 generation 防 stale binding(`live_hub.rs:36-44`)
+
+**P1 重要(4 项)**:
+- L1896 pi.share trailing entry 导出
+- L1906 waterfall/emit 双模式事件
+- L1907 Session Journal Stream(replace/append)
+- L1924 accept() 确认机制
+
+**P2 进阶(3 项)**:
+- L1881 设备身份(Ed25519 密钥对 + 指纹)
+- L1882 设备配对审批流程(6 种方式)
+- L1883 设备 Token 签发/轮换/撤销
+
+---
+
+### 25.6 D10 / D13 状态(🔄 进行中,暂跳过)
+
+D10 多模态输出与 D13 离线模式两份专题文档仍在生成中,本轮不重复声明。待完成后补充:
+- **D10**:atomcode「主动放弃 syntect + 主动放弃 truecolor + DiffViewer 三阶段」的逆向决策逻辑(基于真实生产事故)
+- **D13**:atomcode「prefix-stability + 内容寻址 sha256 修订号」的本地缓存策略
+
+---
+
+### 25.7 第十九轮 gap 汇总(124 个,落在 L1591-L1930)
+
+| L 编号区间 | 维度 | 数量 | 代表 gap |
+|-----------|------|------|---------|
+| L1591-L1645 | D9 安全与威胁模型 | 55 | L1599 凭证 0o600 / L1600 AES-256-GCM / L1608 私有 IP 拦截 |
+| L1701-L1760 | D11 A2A 协议 | 60 | L1702 ACP Server / L1728 v2 协议 / L1731 session/list |
+| L1761-L1820 | D12 可访问性 | 60 | L1771 /theme 命令 / L1773 daltonized / L1811 unicode-width |
+| L1881-L1930 | D14 跨设备同步 | 50 | L1903 broadcast / L1913 HttpOnly Cookie / L1922 generation 防 stale |
+| **合计** | **4 维度** | **225** | — |
+
+> **注**:D10 / D13 完成后将新增 120 个 gap(L1641-L1700 + L1821-L1880),届时累计突破 2050。
+
+---
+
+### 25.8 借鉴路线图(按 ROI 排序)
+
+**P0 一个月内**(8 项):
+- L1599 凭证 0o600 + Keychain 存储(`auth/lib.rs:35-59`)
+- L1600 应用层 AES-256-GCM 加密(`aes-gcm` + `secrecy` + `zeroize`)
+- L1608 私有 IP 拦截(`web_fetch.rs:425-493`)
+- L1771 `/theme` 斜杠命令(dark / light / high-contrast / daltonized)
+- L1778 focus ring 主题标准化
+- L1801 + L1802 IME compositionstart/end 双 setTimeout flush
+- L1903 broadcast channel 多播(`live_hub.rs:1-200`)
+- L1913 HttpOnly Cookie + 端口隔离(`auth_token.rs:27-44`)
+
+**P1 三个月内**(15 项):
+- L1596 Bash 23 层检测器(`bash.rs:1653-2163`)
+- L1609 DNS 钉扎(`web_fetch.rs:495-545`)
+- L1610 决策审计 3 段式(`event.rs:22-65`)
+- L1702 ACP Server 实现(`agent-client-protocol` crate)
+- L1728 ACP v2 协议支持(`v2.rs:1571 行`)
+- L1731 ACP session/list 发现(`discovery.rs:346 行`)
+- L1772 高对比度主题(AAA ≥ 7:1)
+- L1773 色盲友好主题(daltonized)
+- L1796 ANSI bell(``)通知
+- L1803 `Ctrl+G` 外部编辑器
+- L1811 `unicode-width` crate 依赖
+- L1896 pi.share trailing entry 导出
+- L1922 generation 防 stale binding(`live_hub.rs:36-44`)
+- L1924 accept() 确认机制
+- L1925 carrier 错误分类
+
+**P2 长期**(12 项):
+- L1606 OS 级沙箱(Landlock/Seccomp)
+- L1701 A2A Protocol 实现(openclaw 3165 行参考)
+- L1741 E2A 事件总线
+- L1752 PyO3 跨语言桥
+- L1786 RTL locale 检测
+- L1790 UAX #9 Bidi 算法(TUI)
+- L1812 emoji ZWJ 序列宽度算法
+- L1881 设备身份(Ed25519 密钥对 + 指纹)
+- L1882 设备配对审批流程
+- L1883 设备 Token 签发/轮换/撤销
+- L1904 Tailscale Serve/Funnel 暴露
+- L1921 lifecycleRevision CAS
+
+---
+
+### 25.9 关键文件路径清单
+
+**D9 安全与威胁模型**:
+- `crates/atomcode-capabilities/src/tools/bash.rs:1653-2163` — 22 类 Bash 检测 + tree-sitter AST
+- `crates/atomcode-capabilities/src/tools/web_fetch.rs:410-545` — DNS-rebinding TOCTOU 闭环
+- `crates/atomcode-capabilities/src/tools/sensitive_path.rs:32-55` — 25+ 敏感路径门
+- `crates/atomcode-capabilities/src/pathutil.rs:24-36` — tilde 安全展开
+- `crates/atomcode-auth/src/lib.rs:25-92` — 凭证落盘(0o600 + fsync + atomic rename)
+- `crates/atomcode-capabilities/src/askpass/server.rs:1-293` — askpass 安全密码输入
+- `crates/atomcode-telemetry/src/scrub.rs:23-44` — 双 pass secret scrub
+- `crates/atomcode-kernel/src/event.rs:22-65` — PolicyIntervention 三段式
+
+**D11 A2A 协议**:
+- `crates/atomcode-cli/src/acp/mod.rs:1-618` — ACP 模块入口 + SharedState
+- `crates/atomcode-cli/src/acp/v2.rs:1-1571` — Draft v2 协议链
+- `crates/atomcode-cli/src/acp/discovery.rs:1-346` — Session 发现 + keyset 分页
+- `crates/atomcode-cli/src/acp/mcp.rs:1-213` — MCP 服务器转换
+- `crates/atomcode-cli/src/acp/elicitation.rs:1-345` — 用户输入回环
+- `crates/atomcode-cli/src/acp/replay.rs:1-247` — 会话重放(replayFrom)
+- `crates/atomcode-cli/src/acp/options.rs:1-1038` — Session config option 目录
+- `crates/atomcode-cli/tests/acp_end_to_end.rs:1-2233` — ACP 端到端测试
+- `crates/atomcode-daemon/src/live_hub.rs:1-200` — LiveViewHub broadcast channel
+
+**D12 可访问性**:
+- `webui/src/components/Chat.tsx:3274/3284/3122/3331` — 50+ aria-label + role
+- `crates/atomcode-tui/src/theme.rs:1-60` — TUI 主题(DEFAULT / HIGH_CONTRAST)
+- `webui/src/styles/layout.css:30-60` — CSS Logical Properties
+- `apps/webui/src/hooks/useReducedMotion.ts:1-30` — framer-motion 减动效检测
+- `webui/src/styles/focus.css:1-30` — VS Code 风格焦点环
+- `webui/src/styles/fonts.css:1-40` — 字号 4 档 + font-family 链
+- `crates/atomcode-tui/src/focus.rs:1-50` — TUI Focus Manager
+
+**D14 跨设备同步**:
+- `crates/atomcode-daemon/src/live_hub.rs:1-200` — LiveViewHub broadcast::channel(1024)
+- `crates/atomcode-daemon/src/live_hub.rs:36-44` — generation 防 stale binding
+- `crates/atomcode-daemon/src/auth_token.rs:1-150` — WebUI Cookie 端口隔离
+- `crates/atomcode-daemon/src/auth_token.rs:27-44` — HttpOnly + X-Atom-User-Id 双向校验
+- `crates/atomcode-daemon/src/live_api.rs:1-150` — /live transport + 审批模式
+- `crates/atomcode-daemon/src/permission_bridge.rs:1-127` — 权限桥接到 HTTP
+
+---
+
+### 25.10 第十九轮关键洞察(8 条)
+
+1. **D9「fail-closed by implementation」**:atomcode 无形式化 STRIDE 文档,但每个具体门控(双 pass scrub / 22 类 Bash / DNS-rebinding TOCTOU / PolicyIntervention)都独立 fail-closed——这是「工程收敛派」的典型代表,与 openclaw「形式化派」(MITRE ATLAS 17 威胁)形成哲学分歧。
+
+2. **D9 DNS-rebinding TOCTOU 闭环是业界最佳实践之一**:`resolve_to_addrs` 把已验证 IP 列表钉入 reqwest,使其不做第二次 DNS 查询——关闭了「这里查一次 DNS、reqwest 连接时再查一次」之间的 TOCTOU 窗口。laew 如需 WebFetch 应优先参考 atomcode `web_fetch.rs:410-545`。
+
+3. **D11 ACP 7650 行 Rust 是唯一 Rust 实现**:atomcode / deepseek-harness(1853 行 TS) / openclaw(17001 行 TS) 三工程实现 ACP,atomcode 是唯一用 Rust 实现且支持 v1/v2 双协议代。laew 可直接复用 `agent-client-protocol` crate(Atomcode 同款)。
+
+4. **D11 LiveViewHub 是「同设备多视图实时同步」范本**:`broadcast::channel(1024)` + generation 防 stale + client_input_id 关联——这是 TUI/WebUI 共享的最轻量实现,比 openclaw Gateway 2894 行精简得多,适合 laew 当前单设备多端(TUI + 未来 WebUI)场景。
+
+5. **D12「50+ aria-label + SSE 哑广播」矛盾**:atomcode WebUI 有 50+ aria-label + role="alert"/"status"/"search",但 SSE 流是"哑"广播——**没有 `aria-live="polite"` 包装**把增量推送给屏幕阅读器。laew 未来 WebUI 应参考 openclaw `chat-message.ts:35-60` 三档 live mode(polite / assertive / off)。
+
+6. **D12「主动放弃」决策三例**:atomcode 在 a11y 层同样延续「主动放弃」哲学——无色盲主题(全球男性 8% 受影响)、无 RTL 切换(仅 logical props 准备)、无 Braille 适配(市场极小)——每个放弃都有明确的成本/收益注释。
+
+7. **D14 generation 防 stale binding 是 saga 模式的 Rust 变体**:`LiveBinding { id, generation, ... }` + `HubError::StaleBinding { expected, actual }`——用类型系统把「commit-or-compensate」二选一固化为 API 边界,可直接用于 laew 的 Plan/MainWork/SubAgent 三档执行回退。
+
+8. **D14 Port-scoped Cookie 解决多实例共享 cookie jar 问题**:`atomcode_webui_<port>` 是少见的「localhost cookie 忽略 port」RFC 6265 变通方案——laew 未来 WebUI 多实例部署时应直接复用。
+
+---
+
+### 25.11 总结
+
+第十九轮深挖表明:**atomcode 在「安全纵深 / A2A 协议 / 可访问性 / 跨设备同步」四维度的工程化深度被严重低估**。
+
+- **D9 安全**:双 pass scrub(KV + token 形状)、22 类 Bash 检测(递归解包 17 wrapper)、DNS-rebinding TOCTOU 闭环(resolve_to_addrs 钉扎)、PolicyIntervention 三段式(稳定 machine code + 恢复动作白名单)——每个细节都对应真实生产事故。
+- **D11 A2A**:ACP 7650 行 Rust(唯一 Rust 实现 + v1/v2 双协议代)、MCP 7 子模块(三传输)、LiveViewHub(broadcast::channel + generation 防 stale)——是 laew 多 Agent 互操作的最佳参考。
+- **D12 a11y**:50+ aria-label + 2336 行 onboarding_wizard + 16 色 SGR + 4 档字号——但 SSE 哑广播 + 无色盲主题是明显缺口。
+- **D14 同步**:LiveViewHub broadcast::channel + generation 防 stale binding + Port-scoped Cookie——是 TUI/WebUI 共享的最轻量实现。
+
+**唯一主动缺失的是 D9 OS 沙箱**(atomcode 选进程隔离,无 Landlock/Seccomp)。laew 的 P0 借鉴清单已就绪(L1599/L1600/L1608/L1771/L1778/L1801/L1802/L1903/L1913 共 9 项),建议立即启动。
+
+---
+
+> **本轮专题文档索引**:
+> - `专题-第十九轮-安全与威胁模型深度对比.md` — D9 完整规则清单
+> - `专题-第十九轮-A2A协议与多Agent互操作深度对比.md` — D11 源码级深度
+> - `专题-第十九轮-可访问性a11y与RTL深度对比.md` — D12 7 子维度
+> - `专题-第十九轮-跨设备同步与会话漫游深度对比.md` — D14 5 子维度
+> - `专题-第十九轮-跨项目缺口分析.md` — 6 维度横向综合
+> - `专题-第十九轮深挖合集.md` — 本轮合集索引
+
 **累计 24 轮深挖覆盖度**:从 L1-L1414 共 1414 个 laew gap,本轮新增 19 个(占比 1.3%)——单轮增量看似不多,但用户交互体验层是「**用户每天都能感受到的差距**」,ROI 极高。

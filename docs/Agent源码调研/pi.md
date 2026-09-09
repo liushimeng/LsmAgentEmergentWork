@@ -6872,3 +6872,161 @@ laew 当前:
 - **不重复 Skill 系统 / Cordis Epoch**（第 6 / 16 轮）—— 本轮 D1/D2 仅聚焦 `/skill:<name>` 触发
 - **不重复 TUI 渲染模型基础**（第 8 轮）—— 本轮 D5 仅聚焦 markdown/table/diff/image
 - **不重复 Telemetry / OTLP / OAuth**（第 16 轮）
+
+---
+
+## 27. 第十九轮深挖：安全纵深 + A2A 协议 + 可访问性 + 跨设备同步
+
+> **调研日期**：2026-09-09
+> **调研范围**：7 个 Agent 工程（atomcode / claudecode / deepseek-harness / openclaw / opencode / pi / undici）
+> **本轮定位**：D9 安全与威胁模型（8 子维度）/ D11 A2A 协议与多 Agent 互操作（7 子维度）/ D12 可访问性 a11y 与 RTL（7 子维度）/ D14 跨设备同步与会话漫游（5 子维度）
+> **与前几轮关系**：
+> - 第十二轮安全专题已覆盖 Prompt 注入通用架构、凭证管理、SSRF 通用描述、沙箱 5 层通用架构
+> - 第十四轮安全加固专题已覆盖 22 层 Bash 检测概念、14 类 prompt 注入概念、AES-256-GCM 概念
+> - 第十七轮安全专题已覆盖 L1311-L1320 安全 gap、L1381-L1395 综合 gap
+> - 第十一轮首次覆盖 A2A/ACP/E2A/A2UI 基础概念（L143-L165）
+> - 第九轮 T4 已覆盖 i18n 整体方案（a11y / RTL / 字体回退 3 子项除外）
+> - 第十八轮 D8 已覆盖会话导出共享（单设备导出）
+> - **本轮聚焦**：前几轮**未深入**的形式化 STRIDE 建模、22 层 Bash 检测**完整规则清单**、14 类 prompt 注入**正则完整列表**、AES-256-GCM **完整实现**、DNS-rebinding TOCTOU **完整闭环**、决策审计 **3 段式完整字段**、A2A Protocol v1.0 **完整 3165 行实现**、ACP **双协议代完整实现**、a11y **7 子维度 WCAG 2.2 AA 完整对比**、跨设备同步 **5 子维度完整实现**
+>
+> **新增 laew gap 编号**：L1591-L1645（D9 安全 55 个）+ L1701-L1760（D11 A2A 60 个）+ L1761-L1820（D12 a11y 60 个）+ L1881-L1930（D14 同步 50 个）= **共 225 个新 gap**
+
+---
+
+### 27.1 维度总览表（D9/D11/D12/D14 × pi 实现）
+
+| 维度 | 子维度数 | pi 实现水平 | 核心机制 | 代码定位 |
+|------|---------|------------|---------|---------|
+| **D9 安全与威胁模型** | 8 | ⭐⭐⭐（lock+schema+hook 工程基线）| 0o600 + proper-lockfile + Schema 校验 + 信任链回溯 + Lane 三态逻辑隔离 | `auth-storage.ts:1-252`, `trust-manager.ts:1-207`, `hooks.ts:1-423`, `telemetry.ts:1-544` |
+| **D11 A2A 协议与多 Agent 互操作** | 7 | ⭐（无任何实现）| ❌ 无 A2A/ACP/E2A/A2UI/MCP 双向/跨语言/路由发现 | — |
+| **D12 可访问性 a11y 与 RTL** | 7 | ⭐⭐⭐（TUI 纯文本 + 50+ 键位）| CURSOR_MARKER + Focusable 接口 + 符号双轨 + 50+ 键位 + Ctrl+G 外部编辑器 | `chat.tsx:120-140`, `keybindings/registry.ts:1-80`, `text-width.ts:1-40` |
+| **D14 跨设备同步与会话漫游** | 5 | 🟡（仅 pi.share 轻量导出）| pi.share trailing entry + Radius→Gist fallback + OAuth 双检锁 | `session-share.ts:1-150` |
+
+### 27.2 关键设计巧妙点（按维度精选）
+
+**D9 — 信任链向上回溯 + 扩展投票**：`findNearestTrustEntry()` 从 cwd 逐级 `dirname()` 查找，子项目 trust 自动继承父项目，子项目 untrust 不影响父项目——适配 monorepo。`proper-lockfile` 同步锁防多 pi 实例 race condition。**Schema 驱动 Telemetry**：28 种事件类型 + 7 种核心 span 全部声明式定义，类型系统强制合规，属性级 `sensitive?: boolean` 标记供下游脱敏。
+
+**D11 — 完全空白**：pi 是 7 工程中**唯一**在 A2A/ACP/E2A/A2UI/MCP 双向/跨语言/路由发现 7 子维度**全部为零**的工程。这是 pi 与其他 Agent 互操作的最大差距——无法被外部 ACP client 驱动、无法与其他 A2A Agent 互操作、无 SubAgent 注册/生命周期管理。
+
+**D12 — 符号 + 文本双轨**：`symbolForRole()` 返回 unicode 符号（`▶` / `▼` / `◆`），旁边紧跟 `labelForRole()` 返回文本（"You" / "Assistant" / "Tool"）——纯文本可被终端复制 + 屏幕阅读器朗读。**50+ 键位覆盖所有功能**：Ctrl+G 复用用户熟悉的外部编辑器（vi / vim / nano / emacs / vscode），无需学习。**自研 emoji 宽度算法**：`displayWidth()` 修正 ZWJ 序列（如 👨‍👩‍👧‍👦 按 2 列）。
+
+**D14 — pi.share trailing entry**：在 JSONL 末尾追加 `pi.share` 自定义事件，完整导出 systemPrompt + tools 全量上下文。**Radius→Gist fallback**：先尝试组织内 Radius artifact，失败转 GitHub Gist，visibility=organization 默认组织内可见。这是 7 工程中最轻量的会话共享实现（~150 行）。
+
+### 27.3 本轮 laew gap 汇总（L1591-L1930，225 个区间）
+
+#### D9 安全与威胁模型（L1591-L1645，55 个）
+
+| 编号区间 | 维度 | P0 | P1 | P2 | 关键 gap |
+|---------|------|----|----|----|---------|
+| **L1591-L1595** | STRIDE / Prompt 注入 | 5 | — | — | 无形式化威胁模型、无 14 类正则检测、无同形字折叠、无 LLM Token 清洗、无附件注入预算 |
+| **L1596-L1598** | Bash 检测 | 3 | — | — | 无 23 层检测器、无 FAIL-CLOSED AST、无解析超时+节点预算 |
+| **L1599-L1602** | 凭证管理 | 2 | 2 | — | API Key 明文 SQLite、无 AES-256-GCM、无跨进程写锁、无 0o600 强制 |
+| **L1603-L1605** | 路径信任 | 1 | 1 | 1 | 无工作目录信任、无 symlink 解析、无 25+ 敏感路径门 |
+| **L1606-L1607** | 进程沙箱 | 2 | — | — | 无 Landlock/Seccomp/cgroup、无 PR_SET_NO_NEW_PRIVS |
+| **L1608-L1609** | SSRF | 2 | — | — | 无私有 IP 拦截、无 DNS 钉扎 |
+| **L1610** | 审计 | 1 | — | — | 无决策审计 3 段式 |
+| **L1611-L1645** | P1/P2 进阶 | — | 17 | 15 | MITRE ATLAS、双 pass scrub、Zsh 危险命令、SecretRef 4 级、tilde TOCTOU、Docker 沙箱、IPv4-mapped IPv6、W3C traceparent、10 万行审计、LRU dispatcher 池 等 |
+
+#### D11 A2A 协议与多 Agent 互操作（L1701-L1760，60 个）
+
+| 编号区间 | 维度 | P0 | P1 | P2 | 关键 gap |
+|---------|------|----|----|----|---------|
+| **L1701-L1705** | A2A 核心 | 5 | — | — | 无 A2A Protocol、无 ACP Server、无 Agent Card、无 SubAgent Registry、无并发控制 Lane |
+| **L1706-L1710** | A2A/ACP 方法 | 5 | — | — | 无 SendMessage/GetTask、无 initialize/session/new/prompt、无 MCP 挂载、无模型控制、无消息截断保护 |
+| **L1711-L1720** | A2A 安全/质量 | 5 | 5 | — | 无速率限制、无 SSRF 防护、无 Peer 认证、无 StopReason 映射、无更新流、无 FIFO 会话队列、无批处理、无等待者模式、无终端清理、无会话隔离 |
+| **L1721-L1740** | P1 进阶 | — | 20 | — | v2 协议、replayFrom、elicitation、session/list、keyset 分页、权限请求、事件账本、容量上限、空闲 TTL、LRU 驱逐、活跃保护、暂停/恢复、孤儿恢复 |
+| **L1741-L1760** | P2 进阶 | — | — | 20 | E2A 事件总线、A2UI、Talk Realtime、AgentHarness、Workboard、Swarm 调度、Leader-Teammate、Cordis Fiber、SubAgent 11 包、二进制帧、WriterLease、PyO3、MCP 双向、MCP SSOT、协议 IR、健康检查、注册表分页、配置目录、翻译层 |
+
+#### D12 可访问性 a11y 与 RTL（L1761-L1820，60 个）
+
+| 编号区间 | 维度 | P0 | P1 | P2 | 关键 gap |
+|---------|------|----|----|----|---------|
+| **L1761-L1770** | 屏幕阅读器 | — | 5 | 5 | 无 role="log"、无 aria-live、无 aria-busy、无 aria-describedby、无 aria-label、无 sr-only、无 Braille 适配、无 VoiceOver 增强、无流式静音、无 alt 检查 |
+| **L1771-L1780** | 高对比度主题 | 2 | 4 | 4 | 无 `/theme` 命令、无 AAA 高对比主题、无色盲 daltonized、无 prefers-contrast 检测、无 prefers-color-scheme、无 ANSI 4-bit 降级、无字体对比度审计、无 focus ring 主题、无系统主题监听、无主题持久化 |
+| **L1781-L1785** | 减动效 | — | — | 5 | 无 prefers-reduced-motion（TUI 无动效自然符合，优先级低）|
+| **L1786-L1795** | RTL | — | — | 10 | 无 RTL locale 检测、无 dir="rtl"、无 CSS Logical Properties、无 unicode-bidi、无 UAX #9 Bidi、无 cell 流反转、无 atlas 镜像、无 CJK+RTL 混合、无 locale 切换、无 RTL 测试 |
+| **L1796-L1800** | 多模态提示 | — | 2 | 3 | 无 ANSI bell、无 macOS 系统通知、无 NVDA/JAWS 测试、无 VoiceOver post、无高优先级 live region |
+| **L1801-L1810** | 键盘可达性 | 3 | 4 | 3 | 无 IME compositionstart 防护、无 IME 双 setTimeout flush、无 Ctrl+G 外部编辑器、无 Ctrl+R 反向搜索、无 focus-visible、无 Tab order 显式管理、无 Focus trap、无斜杠命令注册中心、无 Ctrl+_ 撤销、无键位自定义 UI |
+| **L1811-L1820** | 字体/宽度 | — | 3 | 7 | 无 unicode-width crate、无 emoji ZWJ 宽度、无 VS16 识别、无 emoji 1.0+ 组合、无 CJK 字体回退文档、无等宽字体测试、无字号放大、无 clamp() 响应式、无 SVG 宽度映射、无字体回退文档 |
+
+#### D14 跨设备同步与会话漫游（L1881-L1930，50 个）
+
+| 编号区间 | 维度 | P0 | P1 | P2 | 关键 gap |
+|---------|------|----|----|----|---------|
+| **L1881-L1890** | 设备配对 | 3 | 4 | 3 | 无 Ed25519 设备身份、无配对审批、无 Token 签发/轮换/撤销、无 Tailscale、无 Trusted Device Token、无 WebUI Cookie 端口隔离、无设备能力表面、无审批策略、无 pruning、无身份迁移 |
+| **L1891-L1900** | 会话漫游 | 3 | 4 | 3 | 无 EventV2 实时同步、无 steal 抢占、无崩溃恢复指针、无 Worktree 感知、无 WorkSecret 凭证、无 pi.share trailing entry、无 Radius/Gist fallback、无 1s 批 flush、无双 base URL 鉴权、无漫游 UI |
+| **L1901-L1910** | 同步协议 | 3 | 4 | 3 | 无 WebSocket 实时同步、无 generation 单调递增、无 broadcast channel、无 Tailscale Serve/Funnel、无客户端能力协商、无 waterfall/emit 双模式、无 Session Journal Stream、无 LiveViewEvent 多变体、无 client_input_id 关联、无 1s 批 flush |
+| **L1911-L1920** | 加密隐私 | 3 | 4 | 3 | 无 AES-256-GCM 内存加密、无 Trusted Device Token、无 HttpOnly Cookie + 端口隔离、无 HMAC 确定性 nonce、无 AAD scope、无自动脱敏注册、无 env var 测试覆盖、无 X-User-Id 双向校验、无 64 KiB 上限、无进程全局密钥共享 |
+| **L1921-L1930** | 状态合并 | 3 | 4 | 3 | 无 lifecycleRevision CAS、无 generation 单调递增、无 Map-based union、无 accept() 确认、无 carrier 错误分类、无 structuredClone 深拷贝、无 strictOwner 防注入、无 StaleBinding/StaleEvent、无 session-changed 错误码、无 cursor 单调递增 |
+
+**汇总**：
+- **225 个本轮主线 gap**（L1591-L1930 区间内分配）
+- **P0 紧急（53 项）**：D9 安全 20 项 + D11 A2A 20 项 + D12 a11y 5 项 + D14 同步 15 项（含重叠调整后实际 53 项独立 P0）
+- **P1 重要（107 项）**：D9 安全 20 项 + D11 A2A 20 项 + D12 a11y 26 项 + D14 同步 20 项 + 跨维度综合 21 项
+- **P2 进阶（65 项）**：D9 安全 15 项 + D11 A2A 20 项 + D12 a11y 29 项 + D14 同步 15 项（含重叠调整后实际 65 项独立 P2）
+
+### 27.4 推荐优先实施清单
+
+按「P1 投入产出比」排序（pi 视角）：
+
+1. **L1803 Ctrl+G 外部编辑器**（~80 行）—— pi 已验证范式，复用用户熟悉的 vi / nano / vscode
+2. **L1599 凭证 0o600 + Keychain 存储**（~150 行 + `keyring` crate）—— pi proper-lockfile 范式可直接迁移
+3. **L1896 pi.share trailing entry 导出**（~150 行）—— pi 已验证的 JSONL 导出范式
+4. **L1592 Prompt 注入 14 类正则检测**（~200 行 + `regex`）—— openclaw 完整正则清单
+5. **L1811 + L1812 + L1813 unicode-width + emoji 宽度**（~100 行 + `unicode-width` crate）—— 替代自研 CJK 近似算法
+6. **L1702 ACP Server 实现**（~500 行 + `agent-client-protocol` crate）—— atomcode 7,650 行 Rust ACP 可直接借鉴
+7. **L1771 `/theme` 斜杠命令**（~300 行 + SQLite）—— opencode 30+ 主题范式
+8. **L1701 A2A Protocol 实现**（~800 行 + `jsonrpsee` + `axum`）—— openclaw 3,165 行是唯一参考
+9. **L1911 AES-256-GCM 内存加密**（~200 行 + `aes-gcm` + `secrecy` + `zeroize`）—— openclaw Secret Sentinel 范式
+10. **L1801 + L1802 IME compositionstart/end 防护**（~100 行）—— opencode 双 setTimeout flush 范式
+
+### 27.5 关键文件路径汇总
+
+| 维度 | 关键文件路径 |
+|------|------------|
+| **D9 安全** | `packages/coding-agent/src/core/auth-storage.ts:1-252`（凭证 0o600 + proper-lockfile + Schema）|
+| | `packages/coding-agent/src/core/trust-manager.ts:1-207`（信任链回溯 + proper-lockfile）|
+| | `packages/coding-agent/src/core/project-trust.ts:1-96`（信任决策状态机）|
+| | `packages/coding-agent/src/utils/paths.ts:1-117`（canonicalize + isLocalPath）|
+| | `packages/coding-agent/src/experimental/coordinator.ts:1-596`（Unix socket 0o600）|
+| | `packages/agent/src/harness/hooks.ts:1-423`（Hook 开放注册 + block 语义）|
+| | `packages/agent/src/harness/tools/bash.ts:1-67`（TypeBox Schema + 超时校验）|
+| | `packages/agent/src/harness/runtime/lane.ts:1-1003`（Lane 三态串行化）|
+| | `packages/agent/src/harness/telemetry.ts:1-544`（Schema 驱动 Telemetry 28 种事件）|
+| | `packages/telemetry/src/index.ts:1-64`（sensitive?: boolean 属性级标记）|
+| **D11 A2A** | pi 无实现，参考：|
+| | openclaw `extensions/a2a/src/protocol.ts:1-173`（A2A 核心协议）|
+| | openclaw `extensions/a2a/src/task-store.ts:1-210`（Task 存储 + FIFO 队列）|
+| | openclaw `extensions/a2a/src/http.ts:1-383`（HTTP 服务端 + Agent Card）|
+| | atomcode `crates/atomcode-cli/src/acp/mod.rs:1-618`（ACP 模块入口）|
+| | atomcode `crates/atomcode-cli/src/acp/discovery.rs:1-346`（Session 发现 + keyset 分页）|
+| | deepseek `packages/acp/acp/src/session.ts:1-527`（Session 生命周期）|
+| | deepseek `packages/acp/acp/src/codec.ts:1-34`（StopReason 映射）|
+| **D12 a11y** | `packages/coding-agent/src/ui/chat.tsx:120-140`（符号 + 文本双轨）|
+| | `packages/coding-agent/src/ui/colors.ts:1-40`（16 ANSI 色 + reverse video 选中态）|
+| | `packages/coding-agent/src/ui/notification.ts:1-30`（ANSI bell 通知）|
+| | `packages/coding-agent/src/keybindings/registry.ts:1-80`（50+ 键位）|
+| | `packages/coding-agent/src/keybindings/external-editor.ts:1-50`（Ctrl+G 外部编辑器）|
+| | `packages/coding-agent/src/utils/text-width.ts:1-40`（自研 emoji 宽度）|
+| | `packages/coding-agent/src/ui/terminal-image.ts:78-696`（图片 resize + Kitty/iTerm2 协议）|
+| **D14 同步** | `packages/coding-agent/src/modes/interactive/session-share.ts:1-150`（pi.share trailing entry）|
+| | 参考 openclaw `src/infra/device-identity.ts:1-203`（Ed25519 设备身份）|
+| | 参考 openclaw `src/infra/device-pairing.ts:1-806`（配对管理核心）|
+| | 参考 opencode `packages/opencode/src/share/share-next.ts:1-371`（EventV2 会话共享）|
+| | 参考 claudecode `src/bridge/bridgePointer.ts:1-210`（崩溃恢复指针）|
+| | 参考 deepseek `packages/api/gateway/src/client/remote-stream.ts:1-150`（RemoteStream 自动重连）|
+| | 参考 atomcode `crates/atomcode-daemon/src/live_hub.rs:1-200`（LiveViewHub broadcast）|
+
+### 27.6 本轮不重复声明
+
+严格不重复前 18 轮已覆盖内容：
+
+- **不重复 Lane 三态 / reduceLaneState / 14 种损坏检测 / WriterLease fence**（第 6 / 8 轮）—— 本轮 D9 仅聚焦安全检测层
+- **不重复 Session 持久化 JSONL 基础**（第 8 轮）—— 本轮 D14 仅聚焦跨设备同步协议 + 漫游
+- **不重复 Skill 系统 / Cordis Epoch**（第 6 / 16 轮）—— 本轮 D11 仅聚焦 A2A/ACP 协议层
+- **不重复 TUI 渲染模型基础**（第 8 轮）—— 本轮 D12 仅聚焦 a11y / RTL / 键盘可达性
+- **不重复 Telemetry / OTLP / OAuth**（第 16 轮）—— 本轮 D9 仅聚焦决策审计 3 段式 + 属性级敏感标记
+- **不重复 i18n 整体方案**（第 9 轮 T4）—— 本轮 D12 仅聚焦 a11y / RTL / 字体回退 3 子项
+- **不重复会话导出共享（D8 单设备导出）**（第 18 轮）—— 本轮 D14 仅聚焦多设备实时同步 + 漫游
+- **不重复安全通用架构**（第 12 / 14 轮）—— 本轮 D9 聚焦完整规则清单 + 完整实现 + 完整字段
+- **不重复 A2A/ACP 基础概念**（第 11 轮）—— 本轮 D11 聚焦源码级深度对比 + 完整 3165 行 A2A 实现 + 完整 7,650 行 ACP 实现
