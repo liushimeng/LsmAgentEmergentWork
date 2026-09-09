@@ -6,6 +6,7 @@
 //! - 主屏仍然走 `input.rs` 的单行渲染;引擎只接管子屏。
 
 use std::io::{self, Write};
+use crate::tui::input::{char_width, display_width};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -16,6 +17,8 @@ use crossterm::{
 };
 
 use crate::tui::theme::{self, attr};
+
+// Re-export for use by other TUI modules (mod.rs::truncate etc.)
 
 /// 屏幕区域(简化版 ratatui Rect)。
 #[derive(Debug, Clone, Copy)]
@@ -94,20 +97,20 @@ impl Frame {
                 x = area.x;
                 continue;
             }
-            if x >= area.x + area.width {
+            if x + char_width(ch) > area.x + area.width {
                 continue;
             }
             if y >= area.y + area.height {
                 break;
             }
             self.put_char(x, y, ch, fg, attrs);
-            x += 1;
+            x += char_width(ch);
         }
     }
 
     /// 在区域内居中写一行(用于标题 / 单行消息)。
     pub fn put_str_centered(&mut self, y: u16, s: &str, fg: Color, attrs: u8) {
-        let w = s.chars().count() as u16;
+        let w = display_width(s);
         let x = self.area.width.saturating_sub(w) / 2;
         let area = Rect::new(x, y, w.min(self.area.width), 1);
         self.put_str(area, s, fg, attrs);
@@ -162,8 +165,9 @@ impl Frame {
 
         if let Some(t) = title {
             let label = format!(" {} ", t);
+            let label_w = display_width(&label);
             self.put_str(
-                Rect::new(area.x + 2, area.y, label.chars().count() as u16, 1),
+                Rect::new(area.x + 2, area.y, label_w, 1),
                 &label,
                 theme::ACCENT,
                 attr::BOLD,

@@ -36,7 +36,7 @@ fn prev_char_boundary(s: &str, cursor: usize) -> usize {
 }
 
 /// 单字符近似显示宽度(列数):CJK / 全角 / 谚文按 2 列,其余按 1 列。
-fn char_width(c: char) -> u16 {
+pub fn char_width(c: char) -> u16 {
     let cp = c as u32;
     if (0x1100..=0x115F).contains(&cp)       // 谚文 Jamo
         || (0x2E80..=0xA4CF).contains(&cp)    // CJK 部首 ~ 彝文(含 4E00-9FFF 统一汉字)
@@ -57,7 +57,7 @@ fn char_width(c: char) -> u16 {
 /// 不引入 `unicode-width` 依赖的轻量近似,仅用于光标列号换算;
 /// 覆盖常用 CJK 区段,边缘字符(组合符等)按 1 列处理,可接受。
 /// 饱和到 u16::MAX,避免超长输入溢出。
-fn display_width(s: &str) -> u16 {
+pub fn display_width(s: &str) -> u16 {
     let w: u32 = s.chars().map(|c| char_width(c) as u32).sum();
     w.min(u16::MAX as u32) as u16
 }

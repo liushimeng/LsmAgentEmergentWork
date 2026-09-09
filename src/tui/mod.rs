@@ -16,6 +16,7 @@ use crate::agent::orchestrator::{MultiAgentOrchestrator, OrchestrationOutcome};
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::llm::{client_from_record, ChatMessage};
 use crate::session::Session;
+use crate::tui::input::display_width;
 
 pub mod completion;
 pub mod engine;
@@ -223,7 +224,7 @@ impl TuiSession {
         match handle_result {
             Ok(outcome) => match outcome {
                 OrchestrationOutcome::DirectAnswer { text, usage, .. } => {
-                    self.print_assistant_text(&text, &usage);
+                    self.print_assistant_text_with_agent("Yolo", &text, &usage);
                 }
                 OrchestrationOutcome::Executed { result } => {
                     self.print_task_result(&result);
@@ -287,10 +288,10 @@ impl TuiSession {
         }
     }
 
-    fn print_assistant_text(&self, text: &str, usage: &crate::llm::Usage) {
+    fn print_assistant_text_with_agent(&self, agent_name: &str, text: &str, usage: &crate::llm::Usage) {
         if !text.is_empty() {
             println!();
-            println!("  [assistant]");
+            println!("  [agent: {agent_name}]");
             for line in text.lines() {
                 println!("  {line}");
             }
@@ -315,6 +316,31 @@ impl TuiSession {
             for line in wf.subflow_outcome.lines() {
                 println!("  {line}");
             }
+            // 显示 Quality-Check 结论
+            let qc_icon = match wf.quality_report.verdict {
+                crate::agent::quality::Verdict::Pass => "✅",
+                crate::agent::quality::Verdict::Fail => "❌",
+            };
+            println!("  [QC] {} {}", qc_icon, match wf.quality_report.verdict {
+                crate::agent::quality::Verdict::Pass => "通过",
+                crate::agent::quality::Verdict::Fail => "未通过",
+            });
+            if !wf.quality_report.issues.is_empty() {
+                for issue in &wf.quality_report.issues {
+                    println!("      问题: {issue}");
+                }
+            }
+            // 显示 SubAgent 执行轨迹摘要
+            if let Some(trace) = &wf.subflow_trace {
+                println!(
+                    "  [trace] iter={} tools={}(ok={},err={}) early_term={}",
+                    trace.iterations,
+                    trace.tool_calls,
+                    trace.tool_calls_ok,
+                    trace.tool_calls_err,
+                    trace.early_terminated
+                );
+            }
         }
         if !result.summary.is_empty() {
             println!();
@@ -328,11 +354,13 @@ impl TuiSession {
 
     fn print_usage(&self, usage: &crate::llm::Usage) {
         if usage.input_tokens > 0 || usage.output_tokens > 0 {
-            let cache = if usage.cache_read_input_tokens > 0 {
-                format!("  cache_read={}", usage.cache_read_input_tokens)
-            } else {
-                String::new()
-            };
+            let mut cache = String::new();
+            if usage.cache_read_input_tokens > 0 {
+                cache.push_str(&format!("  cache_read={}", usage.cache_read_input_tokens));
+            }
+            if usage.cache_creation_input_tokens > 0 {
+                cache.push_str(&format!("  cache_creation={}", usage.cache_creation_input_tokens));
+            }
             println!(
                 "  本次用量: input={}  output={}{}",
                 usage.input_tokens, usage.output_tokens, cache
@@ -616,12 +644,22 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// 截断字符串到指定显示宽度（简化版，按字符数）。
+
 fn truncate(s: &str, max_len: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_len {
+    let w = display_width(s);
+    if w as usize <= max_len {
         s.to_string()
     } else {
-        chars[..max_len - 1].iter().collect::<String>() + "…"
+        // 按显示宽度截断,不在双宽字符中间截断
+        let mut out = String::new();
+        let mut w = 0u16;
+        for c in s.chars() {
+            let cw = crate::tui::input::char_width(c);
+            if w + cw > max_len as u16 { break; }
+            out.push(c);
+            w += cw;
+        }
+        out + "…"
     }
 }
 
@@ -639,21 +677,14 @@ fn read_line_prompt(prompt: &str) -> Result<String> {
 fn print_record(r: &ProviderRecord) {
     let marker = if r.is_active { "*" } else { " " };
     println!(
-        "  {} id={} [{:>9}] {}/{} @ {}  key=****{}  ({})",
+        "  {} id={} [{:>9}] {}/{} @ {}  key={}  ({})",
         marker,
         r.id,
         r.protocol.as_str(),
         r.provider_name,
         r.model_name,
         r.end_point,
-        r.api_key
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>(),
+        crate::tui::theme::mask_key(&r.api_key),
         r.created_at,
     );
 }
