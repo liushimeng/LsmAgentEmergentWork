@@ -118,7 +118,8 @@
 | L1041-L1042 | SQLite 全栈（WAL/完整性） | 2 | ✅ |
 | L1043 | SQLite 跨进程租约 | 1 | ⛔ 决策不做(单用户单进程 CLI,无多进程形态;WAL+busy_timeout 已覆盖进程内并发) |
 | L1044-L1045 | 溢出检测与重试策略 | 2 | ✅(L1044 第 06 轮;L1045 随 09-08 第 03 轮 resilient.rs,第 07 轮勘误) |
-| L1046-L1047 | LLM 协议栈（Route 五层/Cache Policy） | 2 | ⏳ |
+| L1046 | Route 五层抽象 | ⏳ | — | — |
+| L1047 | Cache Policy 自动注入(Anthropic) | ✅ | `src/llm/cache_policy.rs`(CachePolicy/CacheHint/CacheTtl/CacheBreakpoints + apply_cache_policy 三元组 + 4 断点 cap)+ `src/llm/anthropic.rs::complete`(convert_system_blocks + apply 注入 last tool / last system / latest user)+ `src/llm/mod.rs::DEFAULT_CACHE_POLICY` + 8 单元测试 + 5 集成测试 + mock_llm_server `--cache-read/--cache-creation` + e2e §4h | 2026-09-09 第 10 轮 |
 | L1048 | 反应式 IoC（Cordis Epoch） | 1 | ⏳ |
 | L1049-L1050 | 实时同步与单飞准入 | 2 | ⏳ |
 | L1051-L1065 | 权限/工具/压缩/记忆/MCP/Skill | 15 | ⏳ |
@@ -140,7 +141,7 @@
 - ~~L1044 上下文溢出检测~~ ✅ 2026-09-09 第 06 轮已完成(与 L1038 同轮,15+ 溢出正则 + NON_OVERFLOW 排除集;pi 的静默溢出检测 usage.input > contextWindow 事前预防未做,留作下一轮候选)
 - ~~L1045 provider 重试策略~~ ✅ 实际已于 2026-09-08 第 03 轮随 `llm/resilient.rs` 完成(指数退避基数 500ms/倍数 2/上限 8s/±25% jitter/墙钟纳秒种子;账本原「差 jitter」描述过时,第 07 轮勘误)
 - L1046 Route 五层抽象 → 抄 opencode `llm/src/route/client.ts`
-- L1047 Cache Policy 自动注入 → 抄 opencode `llm/src/cache-policy.ts`
+- ~~L1047 Cache Policy 自动注入~~ ✅ 2026-09-09 第 10 轮(`src/llm/cache_policy.rs` + `anthropic.rs` 内化,Anthropic 路径 4 断点 cap 内置,详见 `tmpPlan/2026-09-09_10-L1047-Anthropic-PromptCaching自动注入方案.md`)
 - L1048 反应式 IoC → 抄 deepseek-harness `vendor/cordis/src/fiber.ts`
 
 ---

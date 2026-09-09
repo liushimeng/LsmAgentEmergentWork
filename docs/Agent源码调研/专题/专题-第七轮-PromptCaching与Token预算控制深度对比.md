@@ -107,6 +107,16 @@ if (breakpoints.dropped > 0) {
 
 #### 2.1.2 断点放置算法：`applyCachePolicy`
 
+> **laew 实现进度(2026-09-09 第 10 轮,L1047)**: ✅ 已完整实现 —
+> `src/llm/cache_policy.rs`(CachePolicy/CacheHint/CacheTtl/CacheBreakpoints +
+> `apply_cache_policy` 三元组 + 4 断点 cap 与 opencode `ANTHROPIC_BREAKPOINT_CAP=4` 完全对齐),
+> 在 `src/llm/anthropic.rs::complete()` 内部串联,Anthropic 协议下每个请求自动打 3 处
+> cache_control 断点(last tool / last system / latest user message);`src/llm/mod.rs::DEFAULT_CACHE_POLICY = CachePolicy::Auto`
+> 作为全局开关,OpenAI 路径不消费(走隐式 prefix caching)。方案见
+> `tmpPlan/2026-09-09_10-L1047-Anthropic-PromptCaching自动注入方案.md`,e2e 端到端
+> 抓包验证(mock_llm_server `--cache-read/--cache-creation` + §4h)≥9 处 cache_control 落盘。
+
+
 **核心代码**：`/usr/local/LsmGitOpenSource/opencode/packages/llm/src/cache-policy.ts:1-111`
 
 ```typescript
