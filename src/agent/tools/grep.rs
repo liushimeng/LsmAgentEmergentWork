@@ -239,7 +239,12 @@ impl Tool for GrepTool {
             }
         }
 
-        Ok(result_buf)
+        // L1208:grep 匹配行可能含外部内容里的可疑模式,扫描后返回
+        Ok(crate::agent::safety::scan_and_wrap(
+            &result_buf,
+            crate::agent::safety::InjectionSource::GrepMatch,
+        )
+        .wrapped_text)
     }
 }
 

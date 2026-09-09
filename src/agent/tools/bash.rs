@@ -166,7 +166,12 @@ impl Tool for BashTool {
                     buf.push_str("<stdout>\n(无输出)\n");
                 }
                 buf.push_str(&format!("\n<exit_code>{code}</exit_code>"));
-                Ok(buf)
+                // L1208:bash 输出是「外部内容」,扫描 prompt injection 后返回
+                Ok(crate::agent::safety::scan_and_wrap(
+                    &buf,
+                    crate::agent::safety::InjectionSource::BashStdout,
+                )
+                .wrapped_text)
             }
             Ok(Err(e)) => Err(AgentError::ToolExecution {
                 tool: self.name().into(),

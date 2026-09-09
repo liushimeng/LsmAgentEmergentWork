@@ -161,7 +161,12 @@ impl Tool for GlobTool {
         if truncated {
             buf.push_str(&format!("...[截断,还有 {} 条未显示]\n", total - limit));
         }
-        Ok(buf)
+        // L1208:glob 结果里的文件名也可能携带注入(罕见但安全兜底)
+        Ok(crate::agent::safety::scan_and_wrap(
+            &buf,
+            crate::agent::safety::InjectionSource::GlobMatch,
+        )
+        .wrapped_text)
     }
 }
 

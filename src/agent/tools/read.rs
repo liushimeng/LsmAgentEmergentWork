@@ -119,7 +119,12 @@ impl Tool for ReadTool {
             };
             buf.push_str(&format!("{:>width$}\t{}\n", line_num, display, width = width));
         }
-        Ok(buf)
+        // L1208:文件内容是典型的「外部内容」,扫描 prompt injection 后返回
+        Ok(crate::agent::safety::scan_and_wrap(
+            &buf,
+            crate::agent::safety::InjectionSource::ReadFile,
+        )
+        .wrapped_text)
     }
 }
 
