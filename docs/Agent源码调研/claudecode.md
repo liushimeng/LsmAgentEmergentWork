@@ -10921,3 +10921,280 @@ Week 17-18: 完整 i18n + RTL
 - 覆盖维度: 8 个全新维度
 - 新增 gap: 64 项（L79-L142）
 
+---
+
+# claudecode 第十八轮深挖分析 — 用户交互体验层 8 维度
+
+> **本轮聚焦**: 前 17 轮从未专门深挖的「用户交互体验层」8 维度
+> **专题全文**: [`专题/专题-第十八轮-claudecode-深度分析.md`](./专题/专题-第十八轮-claudecode-深度分析.md)(**1526 行** / ~75 KB)
+> **新增 gap**: L1426-L1455 共 30 个(已分配、未越界),其中 P1 10 / P2 20
+> **分析日期**: 2026-09-09
+
+## 第 31 章 用户交互体验层 8 维度深度分析
+
+### 31.1 D1 @提及系统 — 三正则 + 行号片段 + 目录树 + 实时补全
+
+`src/utils/attachments.ts:2757-2828` 实现三正则形态(@file / @"file with space" / @agent-type / @server:uri),`parseAtMentionedFileLines:2836-2852` 解析 `#L10` / `#L10-20` 行号片段,`processAtMentionedFiles:1894-1964` 把目录展开为 1000 条目内联树。
+
+**`generateFileAttachment:3020+` 五道关卡**:
+1. `isFileReadDenied` 权限拦截
+2. `> 256KB` (`maxSizeBytes`) 拒读
+3. `tryGetPDFReference` 轻量引用
+4. **`already_read_file` mtime 命中跳过重复 IO**(`attachments.ts:3076-3119`)
+5. 真正 `FileReadTool.call` 失败时降级为前 `MAX_LINES_TO_READ` 行
+
+**实时补全** `src/hooks/fileSuggestions.ts:715-739` 走 **Rust nucleo 模糊匹配** + 5s 时间地板 + `.git/index` mtime 触发:
+
+```ts
+const REFRESH_THROTTLE_MS = 5_000
+// .git/index mtime 变化 → 立即刷新(捕获 git add/checkout)
+// 时间地板 5s → 捕获 untracked 新文件
+// pathListSignature: FNV-1a + 每 500 步采样,346k 路径 < 1ms
+```
+
+**IDE 双向** `PromptInput.tsx:1281-1298` 处理 `useIdeAtMentioned` —— VSCode 选区直接转成 `@relative#L10-20` 文本。
+
+→ laew 缺:三正则 / 行号片段 / 目录树 / 实时 Rust 索引 / 5s 节流 / mtime 唤醒(全套)
+
+### 31.2 D2 自定义斜杠命令与 Prompt 模板
+
+claudecode 把"命令"与"skill"统一为同一 `Command` 抽象,7 源合并(managed / user / project / additional / legacy commands / plugin / bundled):
+
+```ts
+// loadSkillsDir.ts:638-713
+const [managedSkills, userSkills, ...projectSkillsNested, additionalSkillsNested, legacyCommands] = await Promise.all([...])
+// dedup by name;managed 优先覆盖 user/project/plugin
+```
+
+**frontmatter 13 字段**(`parseSkillFrontmatterFields:185-265`):`description / allowed-tools / argument-hint / arguments / when_to_use / version / model / effort / disable-model-invocation / user-invocable / hooks / context:fork / agent:<type>`。
+
+**`substituteArguments:94-145` 四种占位符**: `$ARGUMENTS` / `$ARGUMENTS[N]` / `$N` / `$name`,shell-quote 解析参数(避免空格误分割带空格路径)。
+
+**`user-invocable` + `disable-model-invocation` 正交两轴**:决定"用户可触发 / 模型可触发"两维可见性。`context: fork` 让命令作为 sub-agent 跑,父上下文不污染。
+
+→ laew 缺:frontmatter 解析 / 三目录合并 / shell 风格 args / context:fork / agent: 委派
+
+### 31.3 D3 对话 Rewind/分支/时间旅行
+
+**三入口汇聚**:`/rewind` 命令(`/checkpoint` 别名)+ `Esc Esc` 键(`PromptInput.tsx:1254` `useDoublePress`)+ 双击确认。
+
+**`MessageSelector.tsx` 7 选单 + 6 恢复选项**:
+```ts
+type RestoreOption = 'both' | 'conversation' | 'code' | 'summarize' | 'summarize_up_to' | 'nevermind'
+```
+
+**两路恢复**(分别由 `restoreMessageSync` 与 `fileHistoryRewind` 处理):
+- 对话: `rewindConversationTo` 截断消息树 + `textForResubmit` 重灌输入 + 图片 `PastedContent` 还原(`REPL.tsx:3712-3747`)
+- 文件: 复用第七轮 git shadow 快照机制
+
+**`setImmediate` 包装防残留**(`REPL.tsx:3742-3747`):让 "Interrupted" 消息先渲染完,避免遗留。
+
+**`summarize-from-here` 是 rewind × 压缩二合一**:既回退又腾出 context window,**典型场景"前面 200k 没用的探索"一键总结**。
+
+**uuid 24 字符前缀匹配**(`REPL.tsx:3749-3753`):跨 SDK 序列化反序列化后仍能定位原节点。
+
+→ laew 缺:checkpoint 浏览器 UI / 6 恢复选项 / Esc Esc 双击 / summarize 联动
+
+### 31.4 D4 文件监视与工作区感知
+
+claudecode **不通用监听整个工作区**(性能杀手),只在用户配 `FileChanged` 钩子时启动 `chokidar`(`fileChangedWatcher.ts:28-46`):
+
+```ts
+const config = getHooksConfigFromSnapshot()
+hasEnvHooks = (config?.CwdChanged?.length ?? 0) > 0 || (config?.FileChanged?.length ?? 0) > 0
+if (hasEnvHooks) { registerCleanup(async () => dispose()) }
+const paths = resolveWatchPaths(config)
+if (paths.length === 0) return
+startWatching(paths)
+```
+
+**静态 + 动态路径合并**(`fileChangedWatcher.ts:48-65`):钩子命令**自己可输出"要监听更多文件"**(典型:`.envrc` 改了 → 钩子跑 direnv → 输出"再听 `.env.local`")。
+
+**`awaitWriteFinish: 500ms`** 适配编辑器原子写。
+
+**`already-read` mtime 比对**(`attachments.ts:3076-3119`):用户连续 @ 同一文件 → 跳过重复 IO(已读且 mtime 未变)。
+
+**LSP 诊断被动拉取**(`attachments.ts:2883-2935`):每次 user turn 主动从 `LSPDiagnosticsRegistry` 拉,**不走 chokidar**。
+
+→ laew 缺:钩子驱动 chokidar / 动态路径合并 / mtime 比对 / LSP 诊断注入
+
+### 31.5 工具输出富文本内容渲染
+
+**`utils/diff.ts` 纯计算层** + `FileEditToolDiff.tsx` UI 层(Suspense + `use(promise)`):
+
+```ts
+// diff.ts:9-103
+export const CONTEXT_LINES = 3
+context: singleHunk ? 100_000 : CONTEXT_LINES,  // 单 hunk 全展开,多 hunk 折叠
+```
+
+**Rust ColorFile 渲染引擎**(`src/native-ts/color-diff/index.ts:935-967`):`detectLanguage(filePath, firstLine)` 用 shebang 检测 80% 无扩展名配置文件,`wrapText` token 边界折行,`addLineNumber` 自适应行号栏宽度。**直接输出 ANSI 字符串**避免 React 重渲染风暴。
+
+**JS fallback**(`HighlightedCode/Fallback.tsx`):LRU 手动维护 + `hashPair(language, code)` 键,**防止虚拟滚动 remount 重算 + 不持全文**(#24180 RSS fix)。
+
+**Markdown 渲染**(`src/components/Markdown.tsx`)走 marked 自定义 renderer,`MarkdownTable.tsx:1-321` 处理表格列宽 + 折叠。
+
+**图片不直接渲染**:`ClickableImageRef` 用 `[Image #N]` 文本引用 + 点击 IDE 打开,**绕过终端兼容性矩阵**(OSC 1337 / iTerm2 inline / Sixel 都没实现)。
+
+**`CtrlOToExpand`** 子 Agent / 虚拟列表上下文不显示(避免噪音)。
+
+→ laew 缺:Rust ColorFile 加速 / LRU 缓存 / 表格自动列宽 / 折叠提示
+
+### 31.6 输入体验工程
+
+**`!` 直通 bash 模式**(`inputModes.ts:16-21` + `PromptInput.tsx:870-887`):首字符 `!` 触发,**字符本身不入库**(只是触发器);tab 接受 `"! gcloud auth login"` 时**自动剥 `!` + 切模式**。
+
+**大粘贴截断**(`inputPaste.ts:1-58`):
+```ts
+const TRUNCATION_THRESHOLD = 10000
+const PREVIEW_LENGTH = 1000
+// 超过 → 截断为首 500 + 末 500 + [...Truncated text #N +X lines...]
+// 完整内容存到 pastedContents 字典,显示引用块
+```
+
+**命令队列三优先级**(`messageQueueManager.ts:53-100`):
+```ts
+const commandQueue: QueuedCommand[] = []
+// 'now' > 'next' > 'later' 优先级 + 同档 FIFO
+// useSyncExternalStore 暴露给 React + 非 React 代码
+```
+
+**图像粘贴 3 路径**(`usePasteHandler.ts:180-285`):macOS `Cmd+V` 剪贴板图 / 拖入多文件(`/ ?=|C:\\` 切) / 单图像扩展名。
+
+**Vim 模式 1513 行完整状态机**(`src/vim/{motions,operators,textObjects,transitions,types}.ts`):
+- `motions` 82 行(h/j/k/l/w/b/e/0/$/gg/G)
+- `operators` 556 行(d/c/y)
+- `textObjects` 186 行(iw/aw/i"/a"/ip/ap)
+- `transitions` 490 行(模式间转换)
+
+启用时(`PromptInput.tsx:2243`):`isVimModeEnabled() ? <VimTextInput> : <TextInput>`,**自研 Vim 完全替换 Ink TextInput**。
+
+**`! bash` 模式直接走 BashTool,不经 LLM**(节省成本)。
+
+→ laew 缺:大粘贴截断 / 队列 / ! bash / Vim 模式 / 图像粘贴(整 D6 维度都是新增)
+
+### 31.7 Onboarding/目录信任/主题偏好
+
+**Onboarding 6 步状态机**(`Onboarding.tsx:116-160`):
+```ts
+type StepId = 'preflight' | 'theme' | 'oauth' | 'api-key' | 'security' | 'terminal-setup'
+const steps: OnboardingStep[] = []  // 动态组合
+if (oauthEnabled) steps.push({ id: 'preflight', ... })
+steps.push({ id: 'theme', ... })
+if (apiKeyNeedingApproval) steps.push({ id: 'api-key', ... })
+if (oauthEnabled) steps.push({ id: 'oauth', ... })
+steps.push({ id: 'security', ... })
+if (shouldOfferTerminalSetup()) steps.push({ id: 'terminal-setup', ... })
+```
+
+**8 主题**(`theme.ts:91-103`):`dark / light / light-daltonized / dark-daltonized / light-ansi / dark-ansi` + `auto`。**`light-daltonized` 为色盲用户准备**,**`*-ansi` 降级到 16 色**。每主题 60+ 颜色字段完全可编程。
+
+**目录信任 6 维度**(`TrustDialog.tsx:1-275+` + `utils.ts:1-245`):
+- MCP servers / Hooks / Bash 权限 / API key helper / AWS-GCP commands / otelHeadersHelper / 危险环境变量
+
+**仅非 home 目录弹**(`TrustDialog.tsx:174-179`):`isHomeDir_0` 走 `setSessionTrustAccepted(true)`(不入盘);非 home 走 `saveCurrentProjectConfig`。
+
+**5 层设置叠**:`policySettings > userSettings > projectSettings > localSettings > auto`。数组类(hooks / mcpServers)**合并而非覆盖**。
+
+**Terminal setup 探测**(`terminalSetup.tsx`):12 个终端 + 5 个明示支持 + 1 条建议命令。
+
+→ laew 缺:Onboarding 多步 / 8 主题 / 目录信任 6 维度
+
+### 31.8 会话导出 / 状态线 / 实时成本
+
+**`/export` 三模式**(`export.tsx:53-90`):
+1. `/export <filename>` → 直接写
+2. `/export <filename>.txt` → 显式后缀
+3. `/export` → 弹 `ExportDialog`
+
+**默认文件名**:`<timestamp>-<firstPrompt-sanitized>.txt`(50 字符首 prompt 摘要)。
+
+**`/cost`**(`cost.ts:1-24`):**订阅用户隐藏金额**,只显示"订阅/超额"状态;`USER_TYPE=ant` 内部分支可强制展示。
+
+**`/context`**(`context.tsx:18-29`):应用 `toApiView` 投影 + `projectView` collapse,**显示 API 真实看到的而非 UI 缓存**:
+```ts
+function toApiView(messages: Message[]): Message[] {
+  let view = getMessagesAfterCompactBoundary(messages)
+  if (feature('CONTEXT_COLLAPSE')) view = projectView(view)  // 应用 collapse
+  return view
+}
+```
+
+**`/statusline` 委派**(`statusline.tsx:14-22`):不直接写状态线,委派 `statusline-setup` sub-agent。**工具白名单严格**:`[AGENT_TOOL_NAME, 'Read(~/**)', 'Edit(~/.claude/settings.json)']` —— **不能 Write / Bash**。
+
+**状态线运行时**(`StatusLine.tsx:36-105`)组装 **16 字段 JSON 输入**:`session_id / model / workspace / version / output_style / cost / context_window / rate_limits / vim_mode / agent_type` 等。
+
+**5s 硬超时**(`hooks.ts:4579+`):状态线不卡 TUI;**信任门**:`shouldSkipHookDueToTrust()` → 没接受 trust dialog → 状态线脚本不跑,防 RCE。
+
+→ laew 缺:`/export` 三模式 + `/context` toApiView 投影(状态线 / cost 已有等价物)
+
+### 31.9 laew gap 总览(L1426-L1455)
+
+| 维度 | 数量 | 关键 gap | 优先 |
+|------|------|----------|------|
+| D1 @提及 | 5 | L1426/1427/1428/1429/1430 | P1×2 / P2×3 |
+| D2 命令 | 5 | L1431/1432/1433/1434/1435 | P1×4 / P2×1 |
+| D3 Rewind | 4 | L1436/1437/1438/1439 | P1×2 / P2×2 |
+| D4 文件监视 | 3 | L1440/1441/1442 | P2×3 |
+| D5 渲染 | 5 | L1443/1444/1445/1446/1447 | P1×1 / P2×4 |
+| D6 输入 | 5 | L1448/1449/1450/1451/1452 | P1×2 / P2×3 |
+| D7 Onboarding | 3 | L1453/1454/1455 | P2×3 |
+| D8 状态/成本/导出 | (已实现) | — | — |
+| **合计** | **30** | | P1×10 / P2×20 |
+
+### 31.10 借鉴优先级路线
+
+**第 19 轮 P1 候选**(按实现成本从低到高):
+1. **L1448 大粘贴截断**(单文件,~100 行,直接进 `input.rs`)
+2. **L1443 Diff 渲染**(已有 `similar` crate,接 ratatui 即可,~200 行)
+3. **L1431+L1432+L1433+L1434 自定义命令**(组合,~300 行,frontmatter + $ARGUMENTS + 多源合并)
+4. **L1426+L1427 @ 提及 + 实时补全**(~500 行 + nucleo crate)
+5. **L1449 命令队列**(与 laew `message_queue_manager.ts` 等价)
+
+**laew 整体借鉴建议**:
+- 当前 `commands/` 目录是 1 文件对应 1 命令(已知 25+),**下一轮可走"frontmatter + skill 化"**,显著降低新增命令成本
+- laew TUI 已有 `/provider *` 子屏,借鉴 D1 @ 提及 + D6 队列 + D7 onboarding 的输入增强可显著提升体验
+- laew `PromptInput` 缺 paste threshold / image paste / vim mode / queue — **D6 整维度都是新增能力**
+
+### 31.11 关键文件索引
+
+| 主题 | 文件 | 行数 |
+|------|------|------|
+| @ 提及 | `src/utils/attachments.ts:2757-2852` | 95 |
+| 实时补全 | `src/hooks/fileSuggestions.ts` | 811 |
+| 命令 frontmatter | `src/skills/loadSkillsDir.ts:185-265` | 80 |
+| $ARGUMENTS 替换 | `src/utils/argumentSubstitution.ts` | 145 |
+| Rewind UI | `src/components/MessageSelector.tsx` | 830 |
+| Rewind 协调 | `src/screens/REPL.tsx:3712-3747` | 35 |
+| 文件监视 | `src/utils/hooks/fileChangedWatcher.ts` | 191 |
+| Diff 计算 | `src/utils/diff.ts:1-177` | 177 |
+| Diff 渲染 UI | `src/components/FileEditToolDiff.tsx` | 180+ |
+| Rust ColorFile | `src/native-ts/color-diff/index.ts:935-967` | 32 |
+| 代码高亮 fallback | `src/components/HighlightedCode/Fallback.tsx` | 100+ |
+| Markdown | `src/components/Markdown.tsx` | 235 |
+| 表格 | `src/components/MarkdownTable.tsx` | 321 |
+| 折叠提示 | `src/components/CtrlOToExpand.tsx` | 50 |
+| 大粘贴截断 | `src/components/PromptInput/inputPaste.ts` | 90 |
+| ! bash 模式 | `src/components/PromptInput/inputModes.ts` | 33 |
+| 命令队列 | `src/utils/messageQueueManager.ts` | (多) |
+| Vim 模式 | `src/vim/{motions,operators,textObjects,transitions,types}.ts` | 1513 |
+| Onboarding | `src/components/Onboarding.tsx` | 243 |
+| 主题 | `src/utils/theme.ts:91-598+` | 500+ |
+| 信任 dialog | `src/components/TrustDialog/TrustDialog.tsx` | 275+ |
+| /statusline | `src/commands/statusline.tsx` | 23 |
+| 状态线运行时 | `src/components/StatusLine.tsx` | 209+ |
+| /cost | `src/commands/cost/cost.ts` | 24 |
+| /context | `src/commands/context/context.tsx` | 63 |
+| /export | `src/commands/export/export.tsx` | 90 |
+
+---
+
+**本轮深挖文档生成信息**:
+- 分析日期: 2026-09-09
+- 源码版本: claudecode (最新)
+- 分析工具: 8 个独立子领域 grep 定位 + 文件:行号 + 关键代码片段
+- 专题总行数: 1526 行 (~75 KB)
+- 覆盖维度: 8 个全新用户交互体验层维度
+- 新增 gap: 30 项 (L1426-L1455)
+- **本轮不重复声明**: 协议 wire / SSE / 缓存策略 / 工具 40+ 抽象 / Bridge 远程控制 / Skill 一等公民 / 22 层 Bash 检测 / 27 Hook / 崩溃恢复五层 / TUI 帧协议 / OAuth / i18n / Release / WebSocket / CRDT / Prompt 注入防护 / Telemetry 双层 — 前 17 轮已覆盖,本轮不复述
+

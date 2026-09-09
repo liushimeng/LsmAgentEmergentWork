@@ -5470,3 +5470,202 @@ deepseek-harness **完全没有 CRDT**（无 Yjs/yrs/automerge）。它用：
 > deepseek-harness 在第十轮的 8 维度展现了一个高度工程化、自洽的 TypeScript Agent 体系：
 > **runtime-diagnostics 把契约下放到包级；guard 把策略放到工具执行管道；credentials/authorization 把 OAuth 协议中立化；i18n 把翻译变成 git merge；Release 把发布变成 5 步可重入流水线；WebSocket/SSE 收敛到单 mux；DevContainer 交给 E2B；多端冲突用单写者模型避免 CRDT**。
 > 对 laew 的核心启示：**用「分层 seam」（diagnostics / guard / credentials / i18n / release / mux / sandbox / registry）替代「单一巨石层」**，每个 seam 可独立演进、独立测试、独立替换。
+
+## 第 20 章 第十八轮深挖 — 用户交互体验层（2026-09-09）
+
+> 完整分析见 `专题/专题-第十八轮-deepseek-harness-深度分析.md`（约 800 行 / 30 个新 laew gap L1456-L1485）。
+> 本章为浓缩索引，每节 5-15 行 + 关键代码锚点。
+
+### 维度总览
+
+| 维度 | 核心实现 | 关键文件 | 关键设计 |
+|------|---------|---------|---------|
+| **D1** @提及系统 | `InputTriggerSource` 统一契约 + `WorkspaceFileSearch` | `ui-input-trigger/src/types.ts`、`context/file-reference-local/src/search.ts` | 4 级排序 ladder + 懒失效+后台重建 + 代际防 stale |
+| **D2** 自定义斜杠命令 | `CommandDefinition` + `CommandLayer` 双栈注册 | `interaction/commands/src/index.ts` | 配对事件 id + 作用域诊断信息 + recordInput 优化 |
+| **D3** 对话 Rewind/分支 | 语义检查点（3 处 flush）+ `forkAt(seq)` | `session/session-checkpoint-policy/src/index.ts` | 三处 flush 边界 + 嵌套复用 + 失败闭合 |
+| **D4** 文件监视/工作区感知 | 工具结果事件总线驱动 + `invalidate()` | `context/file-reference-local/src/index.ts:60-95` | 懒失效 + 静默后台重建 + 不依赖 chokidar |
+| **D5** 工具输出富文本 | mdast 解析 + shiki 同步 JS regex 高亮 + katex 公式 | `client/ui-primitives/src/markdown/` 全文 | 流式 O(tail) 解析 + boot 3 + lazy N grammar |
+| **D6** 输入体验工程 | `SubmitMachine` 状态机（4 相）+ Lexical keymap | `client/ui-conversation/src/client/input/machine.ts` | IME 三重防护 + claimed watchdog + detached 模式 |
+| **D7** Onboarding/主题 | 版本化 welcome notice + 无 FOUC boot + override layers | `client/ui-settings-models/src/onboarding-copy.ts`、`client/ui-theme/src/boot-theme.ts` | 基础调色板 + alias 覆盖 + durable schema = wire envelope |
+| **D8** 导出/状态/成本 | fflate 流式 ZIP + O(1) surface fold + StatsLine | `session-query/session-log-export/`、`llm/token-meter/src/`、`client/ui-chat/src/client/chat/StatsLine.tsx` | 64 KiB 背压 + shadow-price 协议 + pipe-separated groups |
+
+### 18 轮关键代码片段（精选）
+
+**1. @提及语法边界严格性**（`packages/context/file-reference/src/grammar.ts:30-40`）：
+```ts
+const quoted = /(?:^|\s)(@"([^"]*))$/u.exec(beforeCursor)
+if (quoted?.[1] !== undefined && quoted[2] !== undefined) {
+  return { prefix: quoted[1], query: quoted[2], quoted: true }
+}
+const plain = /(?:^|\s)(@([^\s]*))$/u.exec(beforeCursor)
+// (?:\s|^) 限定只在空白后 → 避免 user@host 邮箱误识别
+```
+
+**2. 工作区索引懒失效+后台重建**（`packages/context/file-reference-local/src/search.ts:75-95`）：
+```ts
+async indexFor(signal) {
+  if (this.settled === undefined) return waitForPromise(this.ensureIndex(), signal)
+  if (this.settled.startedAt < this.invalidations) {
+    void this.ensureIndex().catch(() => { /* 后台静默失败 */ })
+  }
+  return this.settled.entries  // 老索引照常回答
+}
+```
+
+**3. 4 级排序 ladder**（`packages/context/file-reference-local/src/search.ts:283-310`）：
+```ts
+if (name === needle) return 1_000 + directoryBonus     // 完全匹配
+if (name.startsWith(needle)) return 900 + directoryBonus  // 名称前缀
+if (name.includes(needle)) return 700 + directoryBonus   // 名称包含
+if (path.includes(needle)) return 500 + directoryBonus   // 路径包含
+const subsequence = subsequenceScore(path, needle)
+return subsequence === undefined ? undefined : 300 + subsequence + directoryBonus
+```
+
+**4. 命令解析严格性**（`packages/interaction/commands/src/index.ts:90-103`）：
+```ts
+const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/u.exec(line)
+// 强格式：/name 后必须跟空白或行尾 → /abc.def 不识别（避免 URL 冲突）
+```
+
+**5. 语义检查点三处 flush**（`packages/session/session-checkpoint-policy/src/index.ts:60-80`）：
+```ts
+ctx.on('llm/stream', (options, next) => { /* flush → next() */ })
+ctx.on('tools/execute', async (exec, next) => {
+  if (exec.agent === undefined || exec.parent !== undefined) return next()  // 只 top-level
+  await ctx.sessions.flush(exec.agent.session)
+  if (exec.signal.aborted) return abortedBeforeDispatchResult()
+  return next()
+})
+ctx.on('agent/pre-step', async ({ agent }, next) => {
+  await ctx.sessions.flush(agent.session)
+  return next()
+})
+```
+
+**6. 用户级 fork 单方法**（`packages/client/ui-chat/src/client/contract/slots.ts:68`）：
+```ts
+forkAt: (seq: number) => void  // 从第 seq 节点分叉一个新分支
+```
+
+**7. 工具结果事件总线驱动失效**（`packages/context/file-reference-local/src/index.ts:60-95`）：
+```ts
+ctx.on('session/event', (session, event) => {
+  if (event.type !== 'tool/result') return
+  const agent = ctx.agents.get(session.id)
+  if (agent !== undefined) this.searches.get(agent)?.invalidate()
+})
+// 不依赖 chokidar/fs.watch —— 完全事件驱动
+```
+
+**8. 流式 markdown O(tail) 解析**（`packages/client/ui-primitives/src/markdown/MarkdownText.tsx:8-20`）：
+```ts
+/**
+ * While a message streams, all but the trailing two blocks freeze as cached
+ * React elements and only the source tail behind them re-parses per chunk,
+ * so per-chunk work tracks the tail size instead of the whole reply.
+ */
+```
+
+**9. shiki 同步 JS regex engine + boot 3 + lazy N grammar**（`packages/client/ui-primitives/src/markdown/highlight.ts:1-30`）：
+```ts
+// Boot 3: TypeScript + Shell + JSON；其他 17 种懒加载
+// JS regex engine —— 避免 oniguruma WASM
+// 未知语言 → plain text monospace，永不报错
+```
+
+**10. SubmitMachine 状态机 4 相**（`packages/client/ui-conversation/src/client/input/machine.ts:50-150`）：
+```ts
+// phase: 'plain' | 'claimed' | 'adjudicating' | 'submitting'
+// claimed watchdog: draft 破坏 token 前缀 → 自动释放
+// detached 模式: submitting 时编辑器已清空，用户可继续输入
+```
+
+**11. IME 三重防护**（`packages/client/ui-conversation/src/client/input/editor/keymap.ts:1-30`）：
+```ts
+// isComposing + keyCode === 229 + recentlyComposing() (10ms post-composition window)
+// 优先级 CRITICAL —— 在 Lexical 默认 keymap 之前
+// false 落回默认（Shift+Enter 仍能换行）
+```
+
+**12. 版本化 welcome notice**（`packages/client/ui-settings-models/src/onboarding-copy.ts:6-10`）：
+```ts
+export const WELCOME_NOTICE_VERSION = '2026-08-13.1'
+// 用户确认的版本号持久化；启动比对 —— 不一致才显示
+```
+
+**13. 无 FOUC 主题 boot**（`packages/client/ui-theme/src/boot-theme.ts:25-30`）：
+```ts
+return { kind: 'script', placement: 'body', text: bootThemeScript(preference, fontSize) }
+// 内联 script 紧跟 <body> 打开后 → React mount 前已设置 data-ds-dark-theme
+// 不等待 React —— 避免"白屏闪一下"
+```
+
+**14. fflate 流式 ZIP + 64 KiB 背压**（`packages/session-query/session-log-export/src/archive.ts:1-30`）：
+```ts
+// fflate streaming API → host 永不 OOM
+// 64 KiB 响应队列背压 → 慢消费者自适应
+// 子代 lineage + 媒体对象内容寻址 → 共享图片不重复
+```
+
+**15. shadow-price 协议保持 O(1) fold**（`packages/llm/token-meter/src/surface-projection.ts:1-20`）：
+```ts
+// compaction 紧邻声明被替换区间价格 → fold 保留 at most one claim
+// bounded state 关键：投影状态持久化到 cache，不能随 session 增长
+```
+
+**16. StatsLine pipe-separated + durable projection 优先**（`packages/client/ui-chat/src/client/chat/StatsLine.tsx:140-200`）：
+```ts
+// pipe-separated groups — 空组整组消失（"该有的都有，不该有的不出现"）
+// useProjection('tokenUsage') 优先 — paging/compaction 不影响账单
+// fallback 字段名镜像 — 整体切换无感
+// 位置：conversation.composer.dock — 跟随 composer
+```
+
+### 18 轮新增 30 个 laew gap（L1456-L1485）
+
+> 完整 gap 表见专题文档。每维度 P0/P1/P2 分布：
+> - D1（5 个）：P1×3 + P2×2
+> - D2（5 个）：P1×1 + P2×3 + P3×1
+> - D3（5 个）：**P0×1** + P1×1 + P2×3
+> - D4（4 个）：P1×1 + P2×2 + P3×1
+> - D5（5 个）：P1×4 + P2×1
+> - D6（5 个）：P1×3 + P2×2
+> - D7（2 个）：P2×1 + P3×1
+> - D8（0 个 — 7 候选 gap 已超出 L1485 区间，保留入 L1496+ 区间叙述级）
+
+**唯一 P0 紧急**：**L1467**（无语义 checkpoint 失败闭合 — 崩溃后可能重做副作用）。
+
+### Web → TUI 范式翻译清单
+
+| deepseek 范式 | laew 对应 | 状态 |
+|---------------|-----------|------|
+| Lexical Editor | `tui-textarea` / `crossterm` raw | 已具备（input.rs） |
+| React Portal | `engine::Screen` 栈 | 已具备 |
+| slot 注入 | `handle_slash` 路由 | 已具备 |
+| dispatch 事件 | `mpsc::Sender<AgentEvent>` | 已具备 |
+| ObservableSnapshot | `Arc<RwLock<State>>` | 已具备 |
+| 代际防 stale | `AtomicU64` + `tokio::sync::watch` | **待建**（L1459） |
+| 懒失效+后台重建 | `Arc<RwLock<Index>>` + `tokio::spawn` | **待建**（L1472） |
+| shadow-price 协议 | bounded state fold | **待建**（D8 候选，下轮补） |
+| IME 三重防护 | composition state | **待建**（L1480） |
+| pipe-separated stats | `ratatui` + tracing | **待建**（D8 候选，下轮补） |
+
+### 关键设计建议（5 个最有借鉴价值）
+
+1. **代际（generation）防 stale**（D1）：单个递增数 + reducer 静默丢弃——比事件序列号简单。
+2. **懒失效 + 后台重建**（D4）：`invalidate()` 不清空，**下次查询后台刷新区分代际**——把重索引成本完全剥离到用户输入延迟。
+3. **shadow-price 协议**（D8）：compaction 紧邻声明价格让 fold 保持 O(1)——bounded state 关键。
+4. **claimed 完整性 watchdog**（D6）：draft 破坏前缀自动释放 claim——状态机完整性的自然表达。
+5. **durable schema = wire envelope**（D7）：Host 持久化与 Client 校验共用 schema——单一真理源。
+
+### laew 1 周可做的 3 个改进（基于 18 轮 P0/P1）
+
+- **L1467（语义 checkpoint 失败闭合，P0）**：在 `agent/mod.rs` 的 `run_session` 循环里，**tool 执行前**先 `db.flush_async()` 一次，**失败时 return error 不执行**——当前 laew 缺此保护，崩溃后可能重做副作用。
+- **L1480（IME 防护，P1）**：在 `tui/input.rs` 加 `is_composing` 状态机，**composition 中不消费 Enter/Space**——`crossterm` 不直接给 isComposing，需要自己维护 state。
+- **D8 候选（context breakdown，P1）**：在 `tui` 加一个 `ContextMeter` 面板，分三段显示 system/tools/messages——用 `tiktoken-rs` 计算。**让用户看到"为什么 context 满了"**。
+
+### 一句话总结
+
+> deepseek-harness 在第十八轮的 8 维度展现了**Web-first 工程如何把"用户体验"做成严谨的形式化契约**：代际防 stale、shadow-price 协议、claimed 完整性 watchdog、durable schema = wire envelope、版本化 welcome notice、pipe-separated stats with durable projection priority、fflate 流式 + 64 KiB 背压、boot 主题内联避免 FOUC。
+> 对 laew（TUI 为主）的核心启示：**用"显式状态机 + 单调计数器 + bounded fold + 单事件源"替代"无意识副作用"**——每个 UX 维度都该有可重放的契约、可验证的不变量、可解释的投影。

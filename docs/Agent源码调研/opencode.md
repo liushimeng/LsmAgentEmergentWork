@@ -7582,4 +7582,118 @@ export const create = fn(z.object({ sessionID: z.string() }), async (body) => {
 
 ---
 
+# 第二十一章 第十八轮深挖：用户交互体验层（2026-09-09）
+
+> 完整版：专题-第十八轮-opencode-深度分析.md（1033 行 / 8 维度 D1-D8 + gap L1516-L1545）
+
+## 21.1 维度概览
+
+| 维度 | 主题 | opencode 实现 | 关键文件 |
+|---|---|---|---|
+| **D1** | @提及系统 | 完整（file/agent/resource/IDE 桥 + frecency + extmark） | `tui/component/prompt/autocomplete.tsx` 781 行 |
+| **D2** | 自定义斜杠命令 | 完整（4 源合并 + frontmatter 强校验 + $ARGUMENTS） | `opencode/src/command/index.ts` 177 行 |
+| **D3** | Rewind/Fork | 完整（revert 栈 + parentID 重映射 + undo/redo） | `session/revert.ts` 137 行 + `session.fork` 691-732 |
+| **D4** | 文件监视 | 仅被动（workspace 移动检测，无后台 fs.watch） | `dialog-workspace-file-changes.tsx` |
+| **D5** | 富文本渲染 | Web:shiki+marked+KaTeX；TUI:自建 diff viewer | `@pierre/diffs` + `tui/feature-plugins/system/diff-viewer.tsx` |
+| **D6** | 输入体验 | 完整（IME flush + 5 档粘贴 + Tab 目录展开 + stash） | `tui/component/prompt/index.tsx` 1716 行 |
+| **D7** | Onboarding/Theme | 主题完整（30+ 内置 + system 派生 + 8 级配置）；trust 未实现 | `tui/theme/index.ts` 700+ 行 |
+| **D8** | 状态线/成本/分享 | 完整（share-next + EventV2 实时 + cost Decimal + 4 档 footer） | `share/share-next.ts` 371 行 + `footer.width.ts` |
+
+## 21.2 关键发现速览
+
+### D1 @提及系统（autocomplete.tsx）
+
+- **三态 store**：`visible: false | "@" | "/"` 共享一个 Autocomplete 组件（autocomplete.tsx:103）。
+- **三源融合**：files（`sdk.client.v2.fs.find`）+ agents（`!hidden && mode !== "primary"`）+ MCP resources + reference aliases。
+- **fff 服务端权威排序**：TUI 不二次 fuzzy 重排，避免覆盖文件路径得分；frecency 仍以客户端加成形式叠在 `scoreFn` 上。
+- **行级 range**：`@path#Lstart-Lend` 自动拼 `path#N-M` + URL `?start=&end=`（extractLineRange L32-57）。
+- **IDE JSON-RPC 桥**：`editor.ts:74-78` 的 `EditorMentionSchema` 订阅 `at_mentioned` 通知，从 Zed/VS Code 按 `@` 拉文件。
+- **extmark 虚拟文本**：`<textarea>` 看到 `@README.md`，内部仍按 `PromptInfo.parts` 序列化（autocomplete.tsx:194-200）。
+
+### D2 自定义斜杠命令（command/index.ts）
+
+- **4 源合并优先级**：默认（init/review）→ 配置（`.opencode/{command,commands}/*.md`）→ MCP prompts → Skills。
+- **Schema 强校验**：`Info = {template, description, agent, model, variant, subtask}`（`core/v1/config/command.ts`），失败抛 `InvalidError`（不静默降级）。
+- **`hints(template)` 占位符抽取**：`$1/$2/...` 与 `$ARGUMENTS` 单独检测（command/index.ts:36-44）。
+- **MCP Prompt 一等命令**：MCP server 的 prompt 直接暴露为斜杠命令，前端无需额外协议。
+- **Skill 隐式命令**：Skill 文件即命令，模板追加 `Base directory for this skill: ...` 两行保留相对路径语义。
+
+### D3 Rewind/Fork（revert.ts）
+
+- **三段式 revert**：`track()` 备份当前 → `restore()` 还原到更早快照 → `revert(patches)` 倒序 reverse patch（revert.ts:38-89）。
+- **patch part 收集**：回滚一个 message 时，需收集该 message 之后的 patch part（工具修改文件的结果）。
+- **嵌套 revert**：`session.revert?.snapshot` 保留链式还原栈。
+- **fork 重映射**：`idMap = new Map<MessageID, MessageID>()` 重建 assistant parentID 树；compaction `tail_start_id` 也要重映射（session.ts:710-728）。
+- **undo/redo slash**：`messagesBeforeRevert().findLast(role === "user")` 回退到上一条 user message + 还原 prompt（session/index.tsx:611-670）。
+
+### D4 文件监视（被动模式）
+
+- **无后台 fs.watch**：调研证实全代码库无 `fs.watch` / `chokidar` / `fsevents` / `@parcel/watcher` 引用。
+- **替代方案**：`DialogWorkspaceFileChanges.show` 在 session 切换/移动时被动传入 `git status` 列表，渲染 yes/no Dialog。
+- **LSP 诊断未推送 TUI**：`footer.tsx` 只显示 LSP server 数量，不显示具体诊断；这是 D4 最大短板。
+- **Git snapshot 感知**：`Snapshot.Service` 在 revert 时检测外部编辑，但运行中不显示。
+
+### D5 富文本渲染
+
+- **Web/Desktop**：`@pierre/diffs`（Web Component + Shiki 双栈）+ `shiki-wasm`（跨平台）+ `marked-shiki` + KaTeX 数学公式扩展。
+- **TUI**：自建 `diff-viewer.tsx`（700+ 行）+ `PanelGroup/Panel/Separator` 布局原语；`@opentui/core` SyntaxStyle 主题 30+ 颜色字段。
+- **懒加载语言**：首次见某语言才 `loadLanguage`，避免启动全量 bundle 200+ 语言。
+- **折叠/分页**：`scrollbox height={min(count, 10, anchor.y)}` 限定最大高度 10 行。
+
+### D6 输入体验（prompt/index.tsx）
+
+- **编辑器**：`@opentui/core` 的 `TextareaRenderable`（不自研）。
+- **IME 双 setTimeout flush**：`setTimeout(() => setTimeout(() => submit(), 0), 0)` 让 IME 合成事件先 process 一轮（prompt/index.tsx:1391-1395）。
+- **粘贴 5 档**：空粘贴 → `prompt.paste` 命令；本地文件路径 → 读 attachment；URL 不读 attachment；大段文本（≥3 行或 >150 字符）折叠成 `[Pasted ~N lines]`。
+- **frecency 公式**：`frequency / (1 + age / 86400000)`；持久化 JSONL append-only，启动自愈重写。
+- **Prompt stash**：`/stash` / `/stash pop` / `/stash list` 三个 slash 临时保存输入。
+
+### D7 Onboarding/Theme（theme/index.ts）
+
+- **30+ 内置主题**：aura/ayu/catppuccin/dracula/github/gruvbox/tokyonight 等，远超 laew 当前 1 个默认主题。
+- **`system` 自动派生主题**：从 `TerminalColors` 计算 ANSI 16 色 → 灰阶 → diff alpha tint → 完整 theme（开箱即用）。
+- **ThemeJson 4 类值**：Hex / RefName / Variant（dark+light）/ RGBA；`$defs` 跨字段引用 + 循环引用检测。
+- **8 级配置发现链**：`mergeDeep` 字段级合并 + `OPENCODE_DISABLE_PROJECT_CONFIG` 企业兜底。
+- **Home tips 轮播**：30+ 条 tips 运行期随机选一条（tips-view.tsx:99），`<leader>h` 切换显示/隐藏。
+- **目录信任未实现**：opencode 默认信任当前工作目录，不做"陌生仓库警告"；laew 不需要借鉴。
+
+### D8 状态线/成本/分享（share-next.ts + footer.width.ts）
+
+- **三层 share 架构**：`SessionShare.Service`（业务）→ `ShareNext.Service`（网络）→ `SessionShareTable`（SQLite）。
+- **EventV2 自动同步**：每个 `session.updated` / `message.updated` / `part.updated` / `session_diff` 自动推到 ShareNext 队列，1 秒批 flush。
+- **双 base URL + 鉴权切换**：未登录走 `opncd.ai`，登录 enterprise console 走 `/api/shares` + Bearer + `x-org-id`。
+- **cost Decimal 精算**：`decimal.js` 避免浮点 + tier 模型 + cache 分价 + reasoning 同价 + Copilot 特殊公式，共 4 路径（session.ts:355-405）。
+- **AI SDK v6 input 修正**：`safe(inputTokens - cacheReadInputTokens - cacheWriteInputTokens)`（L361-364）—— 这是 2025-2026 跨 SDK 升级期非常现实的补丁。
+- **宽度自适应 statusline**：4 档断点（66/80/120/150），`contextHintLimit` 四档精确控制。
+- **TUI 实时 cost 显示**：`subagent-footer.tsx:33-55` 从 `sync.data.message` 找最后 `AssistantMessage`，累加 tokens 换算 context 百分比 + cost。
+
+## 21.3 laew gap 汇总（L1516-L1545，30 项）
+
+| 优先级 | 数量 | 编号 |
+|---|---|---|
+| **P0 必做** | 7 | L1516 / L1517 / L1521 / L1526 / L1527 / L1539 / L1545 |
+| **P1 重要** | 14 | L1518 / L1519 / L1522 / L1523 / L1528 / L1529 / L1531 / L1532 / L1534 / L1535 / L1536 / L1537 / L1540 / L1543 |
+| **P2 进阶** | 9 | L1520 / L1524 / L1525 / L1530 / L1533 / L1538 / L1541 / L1542 / L1544 |
+
+## 21.4 借鉴路线图
+
+**第 1 步（P0，2-3 周）**：实现 L1516-L1517（@提及 + FilePart 序列化） + L1521（自定义斜杠命令） + L1545（session share 增量同步）。这三项把 opencode 最核心的"用户表达力"复制过来。
+
+**第 2 步（P1，3-4 周）**：实现 L1526-L1527（revert/fork） + L1534-L1537（shiki+markdown+diff viewer） + L1543（多主题系统）。这些是"专业感"的核心。
+
+**第 3 步（P2，长期）**：L1539（IME flush）+ L1540（粘贴 5 档）+ L1528-L1529（timeline + undo/redo）。细节体验打磨。
+
+## 21.5 结语
+
+opencode 在「用户交互体验层」展示了 4 个值得 laew 借鉴的核心模式：
+
+1. **Part 化消息模型**：FilePart/AgentPart/TextPart 是统一的"prompt 附加物"抽象，extmark 虚拟文本桥接可见/不可见。
+2. **EventV2 watcher 自动同步**：share/sync/record 三个外部系统都通过订阅同一组 Event 事件自动接收。
+3. **AI SDK v6 修正补丁**：跨 SDK 升级期需要显式修正 inputTokens 计费口径。
+4. **宽度自适应 statusline**：4 档断点 + responsive contextHintLimit，比固定 footer 体验好得多。
+
+详细源码引用、机制剖析、设计巧妙点、完整 gap 表见专题文档 `专题/专题-第十八轮-opencode-深度分析.md`（1033 行 / 8 维度 / 30 gap）。
+
+---
+
 **第十轮深挖结束。**

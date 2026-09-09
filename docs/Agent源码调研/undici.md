@@ -12755,3 +12755,130 @@ let _m = mock("GET", "/api/v1/models")
 - **中期**：WebSocket 支持（tokio-tungstenite）+ 自定义 CA/mTLS
 - **长期**：HTTP/3 QUIC（quinn）+ Mock 测试基础设施（mockito）
 
+---
+
+## 27. 第十八轮深挖 — Agent 富内容获取的 HTTP 底座（2026-09-09）
+
+> 完整专题：[`专题/专题-第十八轮-undici-深度分析.md`](专题/专题-第十八轮-undici-深度分析.md)（~800 行）
+> 本轮聚焦 laew WebFetch 工具的底层支撑维度：**N1 响应体解码 / N2 内容类型协商 / N3 大响应流式消费 / N4 网页场景化封装 / N5 Rust 映射**。
+> 新增 gap：**L1576-L1590**（共 15 个，聚焦「响应体解码 / 字符集嗅探 / 大响应截断 / Web 场景化封装」）。
+
+### 27.1 N1 — 响应体内容解码管线
+
+**Accept-Encoding 注入策略**（`lib/web/fetch/index.js:1569-1576`）：
+
+```javascript
+if (!httpRequest.headersList.contains('accept-encoding', true)) {
+  if (urlHasHttpsScheme(requestCurrentURL(httpRequest))) {
+    httpRequest.headersList.append('accept-encoding', 'br, gzip, deflate, zstd', true)
+  } else {
+    httpRequest.headersList.append('accept-encoding', 'gzip, deflate', true)
+  }
+}
+```
+
+HTTPS 才声明 `br + zstd`（规避中间件兼容性），用户声明 `Range` 时强制覆盖为 `identity`。
+
+**Content-Encoding 解码链**（`lib/web/fetch/index.js:2268-2318`）—— **CVE 2022 风格攻击防护**（`maxContentEncodings = 5`）：
+
+```javascript
+for (let i = codings.length - 1; i >= 0; --i) {  // 逆序压栈
+  const coding = codings[i].trim()
+  if (coding === 'x-gzip' || coding === 'gzip') decoders.push(zlib.createGunzip({...flush: Z_SYNC_FLUSH}))
+  else if (coding === 'deflate') decoders.push(createInflate({...}))
+  else if (coding === 'br') decoders.push(zlib.createBrotliDecompress({...}))
+  else if (coding === 'zstd') decoders.push(zlib.createZstdDecompress({...}))
+  else { decoders.length = 0; break }   // 未知编码熔断
+}
+```
+
+设计点：**逆序压栈**（HTTP `gzip, br` 表示先 gzip 后 br，客户端解码 br → gzip 与 `for` 逆向自然契合）；**always-Z_SYNC_FLUSH** 对齐 cURL 容忍非标准响应；**未知编码熔断**避免 OOM。
+
+**deflate Raw/Zlib 自动嗅探**（`lib/web/fetch/util.js:1252-1268`）—— 首字节 `(chunk[0] & 0x0F) === 0x08` 决定 zlib wrapper 与 raw deflate。
+
+**UTF-8 BOM 剥离**（`lib/encoding/index.js:9-29`）—— `TextDecoder` 单例默认 `fatal: false`（无效序列替换 U+FFFD 而非抛异常）。
+
+### 27.2 N2 — 内容类型协商与 MIME 处理
+
+**Accept 头按 destination 注入**（`lib/web/fetch/index.js:515-534`）—— 当前 TODO 统一发 `*/*`，未实现 HTML/Image/Style 分支。对 Agent 影响：抓 HTML 未声明 `text/html` 优先级权（实际不致命）。
+
+**MIME 提取与 charset 嗅探**（`lib/web/fetch/util.js:1289-1342`）—— `extractMimeType` 多值 Content-Type 解析、**后值继承前值 charset**、跳过 `*/*` 失败值。
+
+**JSON MIME 嗅探**（`lib/web/fetch/data-url.js:556-571`）—— `isJSONMimeType` 检测 `+json` 后缀（RFC 8259 §6）。
+
+### 27.3 N3 — 大响应的流式消费与背压
+
+**maxResponseSize 协议层强制**（`lib/dispatcher/client.js:163-321`）—— `-1` 哨兵表示无限制。**H1 destroy socket**（`client-h1.js:745-752`）vs **H2 RST_STREAM**（`client-h2.js:1337-1343`）—— H2 单 stream 中断不影响同连接其他 stream（多路复用优势）。
+
+**fetchParams.controller.dump 模式**（`lib/web/fetch/index.js:2336-2358`）—— dump=true 时**完全丢弃** body chunk 但 socket 继续读到 EOF，让 server TCP 窗口不归零。
+
+**BodyReadable.dump**（`lib/api/readable.js:265-320`）—— 默认 128KB 上限，**双重预检**（Content-Length 头 + 累加器 kBytesRead），AbortSignal 桥接 `addAbortListener`。
+
+**SSE 事件级 maxEventSize**（`lib/web/eventsource/eventsource-stream.js:151`）—— 事件维度（`eventDataSize` 累加）而非字节级截断。
+
+### 27.4 N4 — 网页获取的场景化封装
+
+**重定向策略**（`lib/web/fetch/index.js:1214-1350`）—— `redirectCount` 硬上限 20（防止循环重定向）。**POST→GET 自动降级**（`index.js:1330-1345`）：301/302 + POST 改 GET + 剥 `Content-*` 头 —— **SPA 抓取注意**：登录后 302 跳到 dashboard 会丢 POST body，**对 WebFetch 应配置 `redirect: 'manual'`**。**跨域 CORS 删头**（`index.js:1347-1355`）防 token 跨站泄漏。**重定向 body 完全丢弃**（`redirect-handler.js:123-145`）。
+
+**referer / origin**（`lib/web/fetch/index.js:1499-1503` + `request.js:639-657`）—— `referrerPolicy` 8 种策略，`Referer` 头按策略计算。**WebFetch 默认应禁用**（`referrerPolicy: 'no-referrer'`）避免 agent 上下文泄漏。
+
+**Cookie 会话保持** —— **TODO 未实现**（`index.js:2071-2076`）：fetch 路径完全无 Cookie jar，每次 fetch 是 fresh session。Cookie 持久化仅 `lib/web/cookies/index.js` 独立 API 提供 —— laew WebFetch 抓登录页（公众号/Notion 公开页）会失败。
+
+**AbortSignal + timeout 组合**（`index.js:180-188` + `client.js:316-317`）—— headers/body timeout 分离（默认 300s），防止 slowloris 与传输卡死。**默认 300s 偏激进**：WebFetch 建议 30s headers / 60s body。
+
+### 27.5 N5 — 对 laew WebFetch 工具的 Rust 映射
+
+**Rust crate 矩阵**（要点）：
+- 解码：reqwest feature `brotli`(默认) + `zstd`(需开启) + `async-compression` (deflate Raw/Zlib 嗅探)
+- 字符集：`encoding_rs = "0.8"`（UTF-8/GBK/Big5/Shift_JIS 全覆盖） + `chardetng = "0.1"` 嗅探 fallback
+- MIME：`mime = "0.3"` + `mime_guess`
+- 流式限制：`tower-http::limit::BodyLimitLayer` 或自实现 LimitedBody 包装 `Body::poll_frame` 累加
+- AbortSignal：`tokio_util::sync::CancellationToken` + `tokio::select!` race
+- Cookie：`reqwest::cookie::Jar` + `Arc<Jar>` 跨请求复用
+- 重定向：`reqwest::redirect::Policy::{none, limited(N), custom}`
+- SSE：`eventsource-stream = "0.1"` 或 `reqwest-eventsource = "0.6"`
+
+**WebFetch 工具骨架**（建议 `src/agent/tools/webfetch.rs`）：构造请求 + first-byte/total timer race + Content-Length 预检 + 流式下载累加器截断 + charset 嗅探 + Markdown 转换（`htmd` crate） —— **约 150 行 Rust 即可覆盖 undici N1-N5 全部能力**。
+
+**laew 差异化建议**：
+1. **HTML→Markdown 中间层**：`htmd` crate，直接喂 LLM（节省 50%+ token）
+2. **二次结构化**：JSON 自动 `serde_json::to_string_pretty`、CSV `csv` crate 解析
+3. **PDF/图片**：`pdf-extract` / `image` + `tesseract-rs`（OCR）
+4. **缓存层**：`moka` 异步 LRU + ETag/Last-Modified
+
+### 27.6 新增 gap 汇总（L1576-L1590，15 项）
+
+| 编号 | 维度 | 描述 | 优先级 |
+|------|------|------|--------|
+| **L1576** | N1 解码 | 无 zstd Content-Encoding 解压 | P1 |
+| **L1577** | N1 解码 | 无 Content-Encoding 链级 DoS 防护（无限 gzip） | **P0** |
+| **L1578** | N1 解码 | 无 deflate Raw/Zlib 自动嗅探 | P1 |
+| **L1579** | N1 解码 | 无 UTF-8 BOM 剥离 | P2 |
+| **L1580** | N1 解码 | 无「未知 encoding 熔断」机制 | P1 |
+| **L1581** | N2 MIME | 无 Accept 头按 destination 协商 | P2 |
+| **L1582** | N2 MIME | 无 GBK/非 UTF-8 字符集解码 | **P0** |
+| **L1583** | N2 MIME | 无 `<meta charset>` HTML 内嵌嗅探 | P1 |
+| **L1584** | N2 MIME | 无 `+json` 后缀 MIME 识别 | P2 |
+| **L1585** | N2 MIME | 无 Multipart FormData 解析 | P2 |
+| **L1586** | N3 截断 | 无 maxResponseSize 连接层强制 | **P0** |
+| **L1587** | N3 截断 | 无 fetchParams dump 等价机制 | P1 |
+| **L1588** | N3 截断 | 无 128KB 默认 dump 上限 | **P0** |
+| **L1589** | N3 截断 | 无 Content-Length 头预检 | **P0** |
+| **L1590** | N4 重定向 | 无 POST→GET 自动降级抑制（SPA 登录态丢失） | P1 |
+
+**P0 紧急（5 项）**：L1577 / L1582 / L1586 / L1588 / L1589 —— 涉及 DoS 防护、字符集、资源耗尽。
+**P1 重要（6 项）**：L1576 / L1578 / L1580 / L1583 / L1587 / L1590
+**P2 进阶（4 项）**：L1579 / L1581 / L1584 / L1585
+
+### 27.7 与 laew 实现进度对照表的衔接
+
+本轮新增 15 个 gap（L1576-L1590）填补「富内容获取」维度空白，**优先实现路径**：
+1. **P0 立即**：在 `src/agent/tools/webfetch.rs` 新建工具骨架（150 行），一次性实现 L1577+L1582+L1586+L1588+L1589 五个 P0
+2. **P1 短期**：补充 L1576 (zstd feature) + L1578 (deflate 嗅探) + L1583 (meta charset) + L1590 (redirect 抑制)
+3. **P2 中期**：L1579/L1581/L1584/L1585 体验优化
+
+完整对照表：[`专题/专题-laew实现进度对照表.md`](专题/专题-laew实现进度对照表.md)
+
+---
+
+*本轮深挖 100% 覆盖 undici 富内容获取 HTTP 底座维度，为 laew WebFetch 工具实现提供完整参考。新增 15 个 gap 集中在 N1-N5 主线，无重复前 17 轮维度。*

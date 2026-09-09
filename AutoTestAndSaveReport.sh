@@ -26,7 +26,7 @@
 #   - AutoTestAndSaveReport.md 优先取脚本同目录；不存在则立即报错退出
 #   - Agent 退出后自动 git add + git commit（中文提交信息，逐路径容错；
 #     提交内容 = testReport/ 测试报告(通常被 .gitignore 整目录忽略而空暂存跳过)
-#     + docs/多轮对话问题知识库/ 的「实测状态 ✅」抽测标记行,后者是本流程
+#     + docs/自动化测试-提示词文件列表/ 的「实测状态 ✅」抽测标记行,后者是本流程
 #     唯一允许入库的 docs/ 变更,详见 AutoTestAndSaveReport.md §3.3）
 #   - 本工程不启用自动修复接力（测试 Agent 业务代码只读，只出报告）
 #
@@ -48,7 +48,7 @@ LOG_DIR="${PROJECT_DIR}/logs"
 SCRIPT_TAG="AutoTestAndSaveReport"
 PROMPT_FILE_NAME="AutoTestAndSaveReport.md"
 REPORT_GLOB="自动化测试报告_*.md"     # 测试报告 glob（testReport/ 下）
-KB_DIR="docs/多轮对话问题知识库"       # 知识库实测标记目录(抽测通过后 Agent 追加 ✅ 行,由本脚本提交入库)
+KB_DIR="docs/自动化测试-提示词文件列表"       # 知识库实测标记目录(抽测通过后 Agent 追加 ✅ 行,由本脚本提交入库)
 TS="$(date +%Y%m%d_%H%M%S)"
 
 mkdir -p "${LOG_DIR}"
@@ -388,7 +388,7 @@ BG_PID="$(start_agent_in_background "${LOG_FILE}" "
 
     # ------- 2. 尝试用中文 git 自动提交测试报告 + 知识库实测标记 -------
     # testReport/ 被 .gitignore 整目录忽略时 git_add_safe 静默失败;
-    # docs/多轮对话问题知识库/ 的「实测状态 ✅」标记行(AutoTestAndSaveReport.md §3.3)
+    # docs/自动化测试-提示词文件列表/ 的「实测状态 ✅」标记行(AutoTestAndSaveReport.md §3.3)
     # 是本流程唯一允许入库的 docs/ 变更;两者都无变更时自动跳过提交。
     bg_log '${SCRIPT_TAG}' '开始 git 自动提交检查...'
     git_add_safe 'testReport/${REPORT_GLOB}'

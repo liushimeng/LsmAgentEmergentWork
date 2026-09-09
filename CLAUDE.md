@@ -106,24 +106,24 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 
 ### 斜杠命令
 
-| 命令 | 行为 |
-|------|------|
-| `/help` (h, ?) | 显示帮助 |
-| `/exit` (quit, q) | 退出 TUI |
-| `/clear` (c) | 清空对话历史，开启新 Session |
-| `/new` (n) | 同 `/clear`（开启新 Session） |
-| `/model` | 显示当前模型 |
-| `/provider` | 管理接入记录（默认进入 list 屏） |
+| 命令              | 行为                             |
+| ----------------- | -------------------------------- |
+| `/help` (h, ?)    | 显示帮助                         |
+| `/exit` (quit, q) | 退出 TUI                         |
+| `/clear` (c)      | 清空对话历史，开启新 Session     |
+| `/new` (n)        | 同 `/clear`（开启新 Session）    |
+| `/model`          | 显示当前模型                     |
+| `/provider`       | 管理接入记录（默认进入 list 屏） |
 
 ### `/provider` 系列交互
 
-| 输入 | 行为 |
-|------|------|
-| `/provider` | **默认等价 `/provider list`**，进入 ProviderList 屏 |
-| `/provider list` (ls) | ProviderList 屏：5 只读字段 Tab + 操作按钮（设为当前 / 删除 / 返回） |
-| `/provider add` | ProviderForm 屏：5+1 Tab 表单（protocol / provider_name / model_name / end_point / api_key / 确认） |
-| `/provider use <id>` | 后台 set_active + 重建 Agent，回到主屏打印 `✓ 已切换` |
-| `/provider del` | ProviderDelPicker 屏 → ProviderDelConfirm 屏（二次确认） |
+| 输入                  | 行为                                                                                                |
+| --------------------- | --------------------------------------------------------------------------------------------------- |
+| `/provider`           | **默认等价 `/provider list`**，进入 ProviderList 屏                                                 |
+| `/provider list` (ls) | ProviderList 屏：5 只读字段 Tab + 操作按钮（设为当前 / 删除 / 返回）                                |
+| `/provider add`       | ProviderForm 屏：5+1 Tab 表单（protocol / provider_name / model_name / end_point / api_key / 确认） |
+| `/provider use <id>`  | 后台 set_active + 重建 Agent，回到主屏打印 `✓ 已切换`                                               |
+| `/provider del`       | ProviderDelPicker 屏 → ProviderDelConfirm 屏（二次确认）                                            |
 
 ### Tab 表单交互（ProviderForm）
 
@@ -138,14 +138,14 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 **核心原则**：所有可聚焦控件（按钮 / 列表行 / Tab 标签 / Choice 选项 / Text 编辑态 / 补全菜单）
 的"选中态"与"普通态"必须**一眼可辨**。规范组合：**形状 + 边框 + 颜色 + 字重 + 反白**，按控件类型选用子集：
 
-| 控件类型 | 形状 | 边框 | 颜色 | 字重 | 反白 |
-|---------|------|------|------|------|------|
-| **操作按钮** (确认/取消/删除/返回) | — | `▶ [ X ] ◀` | `theme::SELECTED_FG`(Cyan) | Bold | Reverse |
-| **列表行** (Picker 记录项) | `► ` 前缀 | — | `SELECTED_FG` | Bold | Reverse |
-| **Tab 标签** (表单 label) | `▸ ` 前缀 | — | `TAB_FOCUSED_FG`(Cyan) | Bold | — |
-| **Choice 选中项** (anthropic/openai) | — | `[ x ]` | ACCENT | Bold | — |
-| **Text 编辑态** | — | `▶ ... ◀` 包裹 | `SELECTED_FG` | Bold | Reverse |
-| **补全菜单选中项** | `► ` 前缀 | — | `HIGHLIGHT_FG`(White) | Bold | Reverse |
+| 控件类型                             | 形状      | 边框           | 颜色                       | 字重 | 反白    |
+| ------------------------------------ | --------- | -------------- | -------------------------- | ---- | ------- |
+| **操作按钮** (确认/取消/删除/返回)   | —         | `▶ [ X ] ◀`    | `theme::SELECTED_FG`(Cyan) | Bold | Reverse |
+| **列表行** (Picker 记录项)           | `► ` 前缀 | —              | `SELECTED_FG`              | Bold | Reverse |
+| **Tab 标签** (表单 label)            | `▸ ` 前缀 | —              | `TAB_FOCUSED_FG`(Cyan)     | Bold | —       |
+| **Choice 选中项** (anthropic/openai) | —         | `[ x ]`        | ACCENT                     | Bold | —       |
+| **Text 编辑态**                      | —         | `▶ ... ◀` 包裹 | `SELECTED_FG`              | Bold | Reverse |
+| **补全菜单选中项**                   | `► ` 前缀 | —              | `HIGHLIGHT_FG`(White)      | Bold | Reverse |
 
 **落地约束**：
 - 选中态常量集中在 `src/tui/theme.rs`（`SELECTED_FG` / `SELECTED_ATTRS` / `TAB_FOCUSED_*` /
@@ -172,7 +172,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 - `docs/YoloAgent设计/` — 双 Agent 架构 / Yolo 入口层 / 任务四级分类 / 任务拆解 设计（01-设计与解决方案 / 02-系统提示词设计）
 - `docs/Yolo项目上下文注入/` — 项目说明文件五级链发现（CLAUDE.md→AGENTS.md→README.md→自动生成→空）+ 每会话首次注入 + 三步意图识别优化（01-设计与解决方案 / 02-技术实现文档）
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
-- `docs/多轮对话问题知识库/` — 10 维度 × 100 组多轮对话测试脚本(知识问答/编码/代码理解/调试/文件处理/电脑使用/软件使用/界面设计/文档规划/laew 元任务),每条 3~5 轮追问,标注预期档位(simple/medium/hard),用于人工/自动化回归与 Yolo 分类验证
+- `docs/自动化测试-提示词文件列表/` — 10 维度 × 100 组多轮对话测试脚本(知识问答/编码/代码理解/调试/文件处理/电脑使用/软件使用/界面设计/文档规划/laew 元任务),每条 3~5 轮追问,标注预期档位(simple/medium/hard),用于人工/自动化回归与 Yolo 分类验证
 - `docs/Debug模式与DebugAgent设计/` — `-debug` 调试模式与 Debug Agent(第 7 角色):trace 采集 / LLM 装饰器 / DebugReport 报告生成 设计与解决方案
 - `docs/Context设置与自动压缩设计/` — ContextMaxSize 上下文上限(默认 800K,DB 迁移自动补全)+ Compact Agent(第 8 角色)三档自动压缩 设计与解决方案
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
@@ -291,23 +291,23 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
   - 覆盖架构/多轮对话/Context/循环架构/工具调用/记忆系统/Workflow/目标意图识别/目标规划/Agent协作调度/Yolo/质检/任务拆解/分类/MCP/SKILL/沙箱设计/权限管控/LLM网关/协议翻译/上下文注入/决策溯源/流式渲染/错误容错/遥测/持久化/测试Eval/成本控制/提示词工程/配置系统/插件生态/HTTP客户端/协议调用实现/Agent间通信协议/中断取消/工具结果回填/协议 wire 真实实现/SubAgent 并发/Goal 状态机/TUI 渲染管线/Hook 拦截器/Skill 一等公民/Effect DI 拓扑/CBOR 二进制帧/Lane 三队列/WriterLease fence/文件编辑补丁/代码检索/Git checkpoint/Bash PTY/多模态/PromptCaching/Schema 校验/Web 检索/Telemetry/Session 持久化/Tool 权限沙箱/LSP/IDE 集成/Skill Workshop/多租户团队记忆/终端控制序列/CrashDump/WebUI/OAuth/i18n/Release/WebSocket/容器化/CRDT/Agent协作/流式输出/错误处理/测试体系/配置系统/插件生态/协议翻译/系统提示词/模型路由/负载均衡/故障转移/熔断器/健康检查/配额限流/多区域部署/路由算法/Provider抽象/连接池/重试退避/HTTP2多路复用/代理链/TLS配置/拦截器/超时取消/连接健康检查/性能优化 等 **90+ 维度**（第15轮新增：网络协议深度/编译器前端/OS内核交互/分布式共识/ML推理/形式化验证/图数据库/实时流处理；第16轮新增：多轮对话恢复/压缩管线/内存加密/SQLite全栈/Hook系统/租约引擎/反应式IoC/LLM协议栈/扩展加载/录制回放/守护进程基础设施）。
 
   **15 份 Agent 综合文档**（每份合并了源码调研/深度分析/核心机制/第二轮/第三轮/第四轮共 3-8 轮内容，去重压缩 50-90%）：
-  | 文件 | 语言/技术 | 核心亮点 | 行数 |
-  |------|----------|---------|------|
-  | `atomcode.md` | Rust | L0/L1/L2 分层 + cargo feature gating + kernel 内部 trait + MCP 7 子模块 + CodeIntel 七件套 + daemon + tuix TUI + 协议 wire + 流式 + 错误重试 + **第 22 章 LSP/Telemetry/OAuth/Daemon (+1063 行)** | ~5,175 行 |
-  | `claudecode.md` | TypeScript/Bun | 四级压缩管线 + 27 种 Hook + 5 种执行器 + 40+ 工具 + Ink Fork + Bridge 远程控制 + Tool 系统 40+ 工具统一抽象 + 并发执行 + 权限拦截 + **第 21 章 Bridge远程控制/Skill一等公民/i18n/Release工程化 (+2124 行)** | ~7,755 行 |
-  | `deepseek-harness.md` | TypeScript | Cordis Everything-is-a-Plugin + Fiber epoch + 30+ 核心模块 + Typert 协议 + ACP/A2A/E2A/A2UI + Goal 域模型 + Workflow ralph + SubAgent 11 包 + **第 19 章 跨语言互操作/Evals/多平台/Native (+642 行)** | ~3,577 行 |
-  | `openclaw.md` | TypeScript | Gateway/Harness/Adapter 三层契约 + 162 extensions + 双向 MCP + Lane 调度器 + Workshop 自演化 + **第 19 章 Custodian Skills/多端部署/Taxonomy/Security (+700 行)** | ~5,291 行 |
-  | `opencode.md` | TypeScript/Bun | Effect + Schema 全栈 DI + LayerNode 拓扑 + 34 包 + enterprise Durable Object + R2 + Effect 异步运行时 + LayerNode DI + Durable Object + **第 20 章 Enterprise Durable Object/多端 UI/HTTP Recorder/Slack 集成 (+1102 行)** | ~5,143 行 |
-  | `pi.md` | TypeScript | lane 并发 + 一等公民 Skill + 二进制帧协议(CBOR) + WriterLease fence + 14 种损坏检测 + Lane 三态 + 三队列驱动 + per-file 排他锁 + **第 16 章 Coding Agent/AI 路由/Session Backends/OTLP Telemetry (+908 行)** | ~4,684 行 |
-  | `hermes-agent.md` | Python | 859 MB + 6 前端共享 AIAgent + 38 provider + CompressionCommitFence + FTS5 + Trigram | ~1,632 行 |
-  | `undici.md` | JavaScript | Node.js 官方 HTTP 客户端(非 Agent) + Dispatcher + HTTP/2 + llhttp WASM + 8 拦截器 + Mock 录制回放 + **第 15 章 HTTP/3 QUIC/代理链 SOCKS/TLS 证书/Cookies 重定向 (+853 行)** | ~10,040 行 |
-  | `cc-switch.md` | Tauri 2+Rust+React | 8 款工具适配 + 熔断器三态 + thinking_rectifier + MCP SSOT + 17 schema 迁移 + WebDAV/S3 | ~1,293 行 |
-  | `agent-core.md` | Python | openJiuwen Core SDK + ReAct + ContextEngine + 多类型记忆 + PermissionEngine + Pregel + Rails + OTLP | ~1,630 行 |
-  | `agent-studio.md` | Python | 一站式 Agent 平台 + Pregel cba 消减 + DSL 双向转换 + 5 种 MCP 传输 + BubbleWrap + Seccomp | ~1,005 行 |
-  | `jiuwenswarm.md` | Python | 多 Agent 协作 + Leader-Teammate + A2A/ACP/E2A/A2UI + SkillDevPipeline 12 阶段 + SwarmFlow DAG + JiuwenBox | ~1,395 行 |
-  | `semantica.md` | Python | 图原生 AI 基础设施 + Context Graph + Rete + Datalog + SPARQL + W3C PROV-O + BiTemporalFact | ~1,716 行 |
-  | `Switchyard.md` | Rust | NVIDIA LLM 网关 + 协议 IR + ContentBlock::Unknown + TranslationEngine + 7 种路由算法 + PyO3 | ~1,807 行 |
-  | `TencentDB-Agent-Memory.md` | TypeScript+Python | 团队记忆系统 + L0-L3 管线 + SkillCore 6写4读 + InjectionPipeline 8注入点 + RRF 混合检索 | ~1,569 行 |
+  | 文件                        | 语言/技术          | 核心亮点                                                                                                                                                                                                                   | 行数       |
+  | --------------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+  | `atomcode.md`               | Rust               | L0/L1/L2 分层 + cargo feature gating + kernel 内部 trait + MCP 7 子模块 + CodeIntel 七件套 + daemon + tuix TUI + 协议 wire + 流式 + 错误重试 + **第 22 章 LSP/Telemetry/OAuth/Daemon (+1063 行)**                          | ~5,175 行  |
+  | `claudecode.md`             | TypeScript/Bun     | 四级压缩管线 + 27 种 Hook + 5 种执行器 + 40+ 工具 + Ink Fork + Bridge 远程控制 + Tool 系统 40+ 工具统一抽象 + 并发执行 + 权限拦截 + **第 21 章 Bridge远程控制/Skill一等公民/i18n/Release工程化 (+2124 行)**                | ~7,755 行  |
+  | `deepseek-harness.md`       | TypeScript         | Cordis Everything-is-a-Plugin + Fiber epoch + 30+ 核心模块 + Typert 协议 + ACP/A2A/E2A/A2UI + Goal 域模型 + Workflow ralph + SubAgent 11 包 + **第 19 章 跨语言互操作/Evals/多平台/Native (+642 行)**                      | ~3,577 行  |
+  | `openclaw.md`               | TypeScript         | Gateway/Harness/Adapter 三层契约 + 162 extensions + 双向 MCP + Lane 调度器 + Workshop 自演化 + **第 19 章 Custodian Skills/多端部署/Taxonomy/Security (+700 行)**                                                          | ~5,291 行  |
+  | `opencode.md`               | TypeScript/Bun     | Effect + Schema 全栈 DI + LayerNode 拓扑 + 34 包 + enterprise Durable Object + R2 + Effect 异步运行时 + LayerNode DI + Durable Object + **第 20 章 Enterprise Durable Object/多端 UI/HTTP Recorder/Slack 集成 (+1102 行)** | ~5,143 行  |
+  | `pi.md`                     | TypeScript         | lane 并发 + 一等公民 Skill + 二进制帧协议(CBOR) + WriterLease fence + 14 种损坏检测 + Lane 三态 + 三队列驱动 + per-file 排他锁 + **第 16 章 Coding Agent/AI 路由/Session Backends/OTLP Telemetry (+908 行)**               | ~4,684 行  |
+  | `hermes-agent.md`           | Python             | 859 MB + 6 前端共享 AIAgent + 38 provider + CompressionCommitFence + FTS5 + Trigram                                                                                                                                        | ~1,632 行  |
+  | `undici.md`                 | JavaScript         | Node.js 官方 HTTP 客户端(非 Agent) + Dispatcher + HTTP/2 + llhttp WASM + 8 拦截器 + Mock 录制回放 + **第 15 章 HTTP/3 QUIC/代理链 SOCKS/TLS 证书/Cookies 重定向 (+853 行)**                                                | ~10,040 行 |
+  | `cc-switch.md`              | Tauri 2+Rust+React | 8 款工具适配 + 熔断器三态 + thinking_rectifier + MCP SSOT + 17 schema 迁移 + WebDAV/S3                                                                                                                                     | ~1,293 行  |
+  | `agent-core.md`             | Python             | openJiuwen Core SDK + ReAct + ContextEngine + 多类型记忆 + PermissionEngine + Pregel + Rails + OTLP                                                                                                                        | ~1,630 行  |
+  | `agent-studio.md`           | Python             | 一站式 Agent 平台 + Pregel cba 消减 + DSL 双向转换 + 5 种 MCP 传输 + BubbleWrap + Seccomp                                                                                                                                  | ~1,005 行  |
+  | `jiuwenswarm.md`            | Python             | 多 Agent 协作 + Leader-Teammate + A2A/ACP/E2A/A2UI + SkillDevPipeline 12 阶段 + SwarmFlow DAG + JiuwenBox                                                                                                                  | ~1,395 行  |
+  | `semantica.md`              | Python             | 图原生 AI 基础设施 + Context Graph + Rete + Datalog + SPARQL + W3C PROV-O + BiTemporalFact                                                                                                                                 | ~1,716 行  |
+  | `Switchyard.md`             | Rust               | NVIDIA LLM 网关 + 协议 IR + ContentBlock::Unknown + TranslationEngine + 7 种路由算法 + PyO3                                                                                                                                | ~1,807 行  |
+  | `TencentDB-Agent-Memory.md` | TypeScript+Python  | 团队记忆系统 + L0-L3 管线 + SkillCore 6写4读 + InjectionPipeline 8注入点 + RRF 混合检索                                                                                                                                    | ~1,569 行  |
 
   **30 份横向专题**（位于 `专题/` 子目录）：
   - `专题-12Agent全面对比深度分析.md` — 13 项目 18 维度横向对比总表 + 4 大新维度专题 + P0-P3 路线图
@@ -386,10 +386,10 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 
 测试分三层,放在 `testReport/` 下:
 
-| 层 | 入口 | 用途 |
-|----|------|------|
-| 单元测试 | `cargo test` | Rust 函数级覆盖(模块、解析、转换、工具) |
-| 端到端(CLI) | `bash testReport/run_e2e.sh` | mock LLM,跑 `-p` / `provider add|list|use|delete` / 协议 wire 校验 / **项目上下文注入(说明文件五级链,5b 节)** / TUI 管道冒烟 / **TUI 子屏 tmux 自动化** |
+| 层             | 入口                            | 用途                                                                             |
+| -------------- | ------------------------------- | -------------------------------------------------------------------------------- |
+| 单元测试       | `cargo test`                    | Rust 函数级覆盖(模块、解析、转换、工具)                                          |
+| 端到端(CLI)    | `bash testReport/run_e2e.sh`    | mock LLM,跑 `-p` / `provider add                                                 | list | use | delete` / 协议 wire 校验 / **项目上下文注入(说明文件五级链,5b 节)** / TUI 管道冒烟 / **TUI 子屏 tmux 自动化** |
 | TUI 子屏自动化 | `testReport/run_e2e.sh` 第 8 节 | tmux control-mode 真 PTY 渲染,验证 alternate screen + raw mode + Screen::title() |
 
 ### TUI 自动化:**优先使用 tmux control-mode**
