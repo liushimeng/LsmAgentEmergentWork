@@ -240,7 +240,8 @@ impl CompactRunner {
         let mut sub_session = session::Session::new();
         sub_session.context_mut().push(ChatMessage::user(prompt));
         sub_session.id = format!("{session_id}-compact");
-        self.agent.run_session(&mut sub_session).await
+        let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
+        Ok((text, usage))
     }
 
     /// 写入 agent_memory + session_memory(审计追踪)。

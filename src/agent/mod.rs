@@ -14,6 +14,7 @@ pub mod cancel;
 pub mod context;
 pub mod compact;
 pub mod debug;
+pub mod extrace;
 pub mod json_repair;
 pub mod main_work;
 pub mod memory;
@@ -35,6 +36,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::agent::cancel::{backfill_cancelled_tool_results, CancelToken};
+use crate::agent::extrace::ExecutionTrace;
 use crate::agent::profile::AgentProfile;
 use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta, Usage};
@@ -86,8 +88,11 @@ impl Agent {
     pub fn max_iterations(&self) -> usize { self.max_iterations }
     pub fn max_truncation_resume(&self) -> usize { self.max_truncation_resume }
 
-    /// 单轮任务:传入用户提示,返回最终文本与本次累计 token 用量。
-    pub async fn run_once(&self, user_input: &str) -> Result<(String, Usage)> {
+    /// 单轮任务:传入用户提示,返回最终文本、本次累计 token 用量与执行轨迹。
+    pub async fn run_once(
+        &self,
+        user_input: &str,
+    ) -> Result<(String, Usage, ExecutionTrace)> {
         let mut session = Session::new();
         session.context_mut().push(ChatMessage::user(user_input));
         self.run_session(&mut session).await
@@ -102,7 +107,7 @@ impl Agent {
         &self,
         session: &mut Session,
         cancel: Option<&CancelToken>,
-    ) -> Result<(String, Usage)> {
+    ) -> Result<(String, Usage, ExecutionTrace)> {
         if let Some(token) = cancel {
             if token.is_cancelled() {
                 backfill_cancelled_tool_results(session.context_mut());
@@ -114,13 +119,20 @@ impl Agent {
 
     /// 复用 Session 上下文的对话循环(用于 TUI 多轮对话)。
     ///
-    /// 返回 `(最终回复文本, 本次循环累计 token 用量)`。后者包含所有 LLM 调用的
-    /// input/output tokens 之和(由 LlmClient 在 SSE 流中收集)。
+    /// 返回 `(最终回复文本, 本次循环累计 token 用量, 执行轨迹)`。
+    /// 后两者包含所有 LLM 调用的 input/output tokens 之和(由 LlmClient 在 SSE 流中收集),
+    /// 以及本次循环的工具调用明细(成功/失败/截断/早终止),供 QC 与编排器使用。
     ///
     /// **自动截断续接**:当 LLM 输出因 token 上限被截断时(`stop_reason = "max_tokens"`
     /// / `"length"`),自动注入 nudge 消息让模型从断点继续,最多续接 `max_truncation_resume`
     /// 次(默认 4 次),避免无限循环。累计所有部分输出后返回完整文本。
-    pub async fn run_session(&self, session: &mut Session) -> Result<(String, Usage)> {
+    ///
+    /// **执行轨迹(2026-09-09 第 05 轮)**:每次循环迭代同步累计工具调用成功/失败计数、
+    /// 连续失败长度、截断续接次数,单元结束时聚合成 `ExecutionTrace` 返回。
+    pub async fn run_session(
+        &self,
+        session: &mut Session,
+    ) -> Result<(String, Usage, ExecutionTrace)> {
         self.run_session_cancellable(session, None).await
     }
 
@@ -129,13 +141,12 @@ impl Agent {
         &self,
         session: &mut Session,
         cancel: Option<&CancelToken>,
-    ) -> Result<(String, Usage)> {
+    ) -> Result<(String, Usage, ExecutionTrace)> {
         let tool_defs = self.profile.tools.defs();
         let meta: RequestMeta = session.meta();
         let mut total_usage = Usage::default();
         let mut accumulated_text = String::new();
         let mut truncation_resumes: usize = 0;
-        let final_text;
 
         // 关联报告: 20260908_203854 D-001
         // 连续相同「工具名 + 目标参数」失败的短路过流:当上游 LLM 反复引导同一个
@@ -146,7 +157,12 @@ impl Agent {
         let mut last_fail_key: Option<String> = None;
         let mut consecutive_failures: usize = 0;
 
+        // 执行轨迹累计(2026-09-09 第 05 轮):每次循环同步填充 trace 字段,
+        // 单元结束时由 ExecutionTrace::collect_failure_signals 统一打标。
+        let mut trace = ExecutionTrace::default();
+
         for iter in 0..self.max_iterations {
+            trace.iterations = iter + 1;
             // 迭代边界:取消检查(轻量 is_cancelled,热路径零 await 开销)
             if let Some(token) = cancel {
                 if token.is_cancelled() {
@@ -207,11 +223,16 @@ impl Agent {
                             truncation_resumes = truncation_resumes,
                             "截断续接达到上限,返回已累计文本"
                         );
-                        final_text = accumulated_text;
-                        return Ok((final_text, total_usage));
+                        trace.truncation_resumes = truncation_resumes;
+                        return Ok(Self::finalize_trace(
+                            trace,
+                            &accumulated_text,
+                            total_usage,
+                        ));
                     }
                     // 注入 nudge 并续接
                     truncation_resumes += 1;
+                    trace.truncation_resumes = truncation_resumes;
                     let nudge = format!(
                         "[输出被截断,请从断点继续。第 {}/{} 次续接]",
                         truncation_resumes, self.max_truncation_resume
@@ -226,8 +247,11 @@ impl Agent {
 
                 // 非截断,正常返回
                 info!("agent finished with text answer");
-                final_text = accumulated_text;
-                return Ok((final_text, total_usage));
+                return Ok(Self::finalize_trace(
+                    trace,
+                    &accumulated_text,
+                    total_usage,
+                ));
             }
 
             // 记录 assistant 的工具调用请求(同时附带文本,如果有)
@@ -281,6 +305,7 @@ impl Agent {
                     }
                 };
                 if is_error {
+                    trace.tool_calls_err += 1;
                     // 失败键:工具名 + 稳定 JSON(对象按 key 排序后序列化)
                     let fail_key = format!(
                         "{}|{}",
@@ -293,12 +318,17 @@ impl Agent {
                         last_fail_key = Some(fail_key);
                         consecutive_failures = 1;
                     }
+                    trace.max_consecutive_failures =
+                        trace.max_consecutive_failures.max(consecutive_failures);
                     if consecutive_failures >= REPEATED_FAILURE_THRESHOLD {
                         warn!(
                             tool = %name,
                             consecutive = consecutive_failures,
                             "检测到连续相同失败调用,提前终止以避免耗尽迭代"
                         );
+                        trace.early_terminated = true;
+                        trace.early_terminate_reason =
+                            format!("tool={} attempts={}", name, consecutive_failures);
                         return Err(AgentError::RepeatedToolFailure {
                             tool: name,
                             attempts: consecutive_failures,
@@ -306,8 +336,10 @@ impl Agent {
                         });
                     }
                 } else {
+                    trace.tool_calls_ok += 1;
                     any_success_this_round = true;
                 }
+                trace.tool_calls += 1;
                 session
                     .context_mut()
                     .push(ChatMessage::tool_result(id, output, is_error));
@@ -320,6 +352,18 @@ impl Agent {
         }
 
         Err(AgentError::MaxIterationsExceeded(self.max_iterations))
+    }
+
+    /// 同步填充 trace 的输出字节数与失败信号后返回 Ok 三元组
+    /// (在循环正常结束后调用,异常路径由调用方继续包装)。
+    fn finalize_trace(
+        mut trace: ExecutionTrace,
+        text: &str,
+        total_usage: Usage,
+    ) -> (String, Usage, ExecutionTrace) {
+        trace.output_bytes = text.len();
+        trace.collect_failure_signals(text);
+        (text.to_string(), total_usage, trace)
     }
 }
 
@@ -541,5 +585,115 @@ mod tests {
         let a = json!({"items": [1, 2, 3]});
         let b = json!({"items": [3, 2, 1]});
         assert_ne!(stable_json_string(&a), stable_json_string(&b));
+    }
+
+    // ========== ExecutionTrace 累计(2026-09-09 第 05 轮) ==========
+
+    /// 模拟 1 个工具调用成功(第 1 次返回工具,第 2 次返回最终文本)。
+    struct OneOkToolLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for OneOkToolLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(Completion {
+                    text: String::new(),
+                    tool_calls: vec![crate::llm::ToolCallReq {
+                        id: "call-ok".into(),
+                        name: "Bash".into(),
+                        arguments: json!({"command": "echo ok"}),
+                    }],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                })
+            } else {
+                Ok(Completion {
+                    text: "工具成功完成".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                })
+            }
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn run_session_returns_trace_with_tool_ok() {
+        let agent = Agent::new(
+            std::sync::Arc::new(OneOkToolLlm {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("跑命令"));
+        let (text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
+        // 第 1 轮 mock LLM 返回 Bash echo ok → 累计 1 次成功;第 2 轮返回最终文本
+        assert_eq!(trace.tool_calls_ok, 1, "应累计 1 次工具成功");
+        assert_eq!(trace.tool_calls_err, 0);
+        assert_eq!(trace.tool_calls, 1);
+        assert_eq!(text, "工具成功完成");
+        assert!(!trace.is_failed());
+        assert!(trace.failure_signals.iter().any(|s| s == "ok"));
+    }
+
+    /// 模拟连续相同失败 → trace 应累计 early_terminated=true。
+    struct SameFailLlm;
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for SameFailLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            // 始终尝试调用一个 sandbox 违规路径,触发 Write 沙箱失败,
+            // 3 次连续 → 早终止。
+            Ok(Completion {
+                text: String::new(),
+                tool_calls: vec![crate::llm::ToolCallReq {
+                    id: "call-bad".into(),
+                    name: "Bash".into(),
+                    arguments: json!({"command": "rm -rf /"}), // 必触发 dangerous 命令拦截
+                }],
+                usage: Usage::default(),
+                stop_reason: None,
+            })
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_failure_returns_error_and_trace_populated() {
+        let agent = Agent::new(
+            std::sync::Arc::new(SameFailLlm),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("跑命令"));
+        let res = agent.run_session(&mut session).await;
+        // 早终止返回 Err(RepeatedToolFailure),此处不是 trace 路径,而是 Agent 错误
+        assert!(res.is_err(), "RepeatedToolFailure 应上抛 Err");
+        match res.unwrap_err() {
+            AgentError::RepeatedToolFailure { tool, attempts, .. } => {
+                assert_eq!(tool, "Bash");
+                assert!(attempts >= 3);
+            }
+            other => panic!("预期 RepeatedToolFailure,实际 {other:?}"),
+        }
     }
 }

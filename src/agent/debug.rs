@@ -446,7 +446,7 @@ impl DebugRunner {
              请严格按四章节输出 Markdown:## 任务评估 / ## 质量报告 / ## 问题报告(问题按 P0/P1/P2 分级) / ## 优化建议。",
             truncate_chars(trace_markdown, MAX_TRACE_FOR_EVAL_CHARS),
         );
-        let (text, _usage) = self.agent.run_once(&prompt).await?;
+        let (text, _usage, _trace) = self.agent.run_once(&prompt).await?;
         Ok(text)
     }
 }

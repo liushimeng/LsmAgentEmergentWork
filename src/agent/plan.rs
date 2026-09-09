@@ -68,7 +68,7 @@ impl PlanRunner {
         sub_session.context_mut().push(ChatMessage::user(&prompt));
         sub_session.id = session_id.to_string();
 
-        let (text, usage) = self.agent.run_session(&mut sub_session).await?;
+        let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
 
         // 落盘
         let seq = self.db.next_session_seq(session_id)?;

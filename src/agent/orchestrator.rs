@@ -14,6 +14,7 @@ use crate::agent::cancel::CancelToken;
 use crate::agent::compact::CompactRunner;
 use crate::agent::context::AgentRole;
 use crate::agent::debug::DebugCollector;
+use crate::agent::extrace::ExecutionTrace;
 use crate::agent::main_work::{self, MainWorkRunner, WorkFlowPlan, WorkFlowSpec};
 use crate::agent::plan::PlanRunner;
 use crate::agent::project_context;
@@ -64,6 +65,8 @@ pub struct WorkflowResult {
     pub subflow_outcome: String,
     pub quality_report: QualityReport,
     pub usage: Usage,
+    /// SubAgent 执行轨迹(2026-09-09 第 05 轮),失败时为 None。
+    pub subflow_trace: Option<ExecutionTrace>,
 }
 
 /// 任务结果
@@ -105,6 +108,8 @@ struct QualityFailure {
     suggestion: String,
     /// 用户取消触发的「失败」:不可重试、不回流 Yolo,直接短路退出整个任务。
     cancelled: bool,
+    /// 失败时的执行轨迹(2026-09-09 第 05 轮),便于 Yolo 失败回流时引用具体失败模式。
+    trace: Option<Arc<ExecutionTrace>>,
 }
 
 impl QualityFailure {
@@ -118,6 +123,7 @@ impl QualityFailure {
             retryable: !cancelled,
             suggestion: if cancelled { "任务已取消".into() } else { "重试".into() },
             cancelled,
+            trace: None,
         }
     }
 }
@@ -385,7 +391,7 @@ impl MultiAgentOrchestrator {
 
         let qc = self
             .quality
-            .check_subagent(&c.goal_summary, &input.expected_output, &outcome.text, session.id())
+            .check_subagent(&c.goal_summary, &input.expected_output, &outcome.text, &outcome.trace, session.id())
             .await
             .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
         self.dbg_qc(&qc);
@@ -401,6 +407,7 @@ impl MultiAgentOrchestrator {
                     subflow_outcome: outcome.text,
                     quality_report: qc,
                     usage: outcome.usage,
+                    subflow_trace: Some(outcome.trace),
                 }],
                 summary: String::new(),
                 total_usage: outcome.usage,
@@ -412,6 +419,7 @@ impl MultiAgentOrchestrator {
                 retryable: qc.retryable,
                 suggestion: qc.suggestion,
                 cancelled: false,
+                trace: Some(Arc::new(outcome.trace)),
             })
         }
     }
@@ -447,6 +455,7 @@ impl MultiAgentOrchestrator {
                 retryable: qc_main.retryable,
                 suggestion: qc_main.suggestion,
                 cancelled: false,
+                trace: None,
             });
         }
 
@@ -489,6 +498,7 @@ impl MultiAgentOrchestrator {
                 retryable: qc_plan.retryable,
                 suggestion: qc_plan.suggestion,
                 cancelled: false,
+                trace: None,
             });
         }
 
@@ -511,6 +521,7 @@ impl MultiAgentOrchestrator {
                 retryable: qc_main.retryable,
                 suggestion: qc_main.suggestion,
                 cancelled: false,
+                trace: None,
             });
         }
 
@@ -536,6 +547,7 @@ impl MultiAgentOrchestrator {
             retryable: false,
             suggestion: "Plan 中存在循环或未知依赖".into(),
             cancelled: false,
+            trace: None,
         })?;
 
         let mut results = Vec::new();
@@ -634,6 +646,7 @@ impl MultiAgentOrchestrator {
                                     retryable: true,
                                     suggestion: "重试".into(),
                                     cancelled: false,
+                                    trace: None,
                                 }),
                             ));
                         }
@@ -668,6 +681,7 @@ impl MultiAgentOrchestrator {
                     subflow_outcome: ok.outcome_text,
                     quality_report: ok.qc,
                     usage: ok.usage,
+                    subflow_trace: Some(ok.trace),
                 });
             }
         }
@@ -707,13 +721,21 @@ impl MultiAgentOrchestrator {
         failure: &QualityFailure,
         session: &mut Session,
     ) -> Result<TaskClassification> {
-        // 构造失败摘要消息,让 Yolo 重新评估
+        // 构造失败摘要消息,让 Yolo 重新评估。
+        // 2026-09-09 第 05 轮:把 ExecutionTrace 的 failure_signals 也带上,
+        // 让 Yolo 看到具体失败模式而非仅凭自由文本判定。
+        let failure_signals = failure
+            .trace
+            .as_ref()
+            .map(|t| t.failure_signals.join(","))
+            .unwrap_or_default();
         let failure_msg = format!(
-            "[PREVIOUS_FAILURE]\n源: {}\n任务级别: {}\n原目标: {}\n失败原因: {}\n建议: {}\n请重新评估:可重试 → 修订 decomposition_plan 重发;不可重试 → 填 user_suggestion_if_fail 并给出 direct_answer 告知用户。",
+            "[PREVIOUS_FAILURE]\n源: {}\n任务级别: {}\n原目标: {}\n失败原因: {}\n失败信号: {}\n建议: {}\n请重新评估:可重试 → 修订 decomposition_plan 重发;不可重试 → 填 user_suggestion_if_fail 并给出 direct_answer 告知用户。",
             failure.source.as_str(),
             prev.task_level.as_str(),
             prev.goal_summary,
             failure.reason,
+            failure_signals,
             failure.suggestion,
         );
         session
@@ -800,6 +822,8 @@ struct WfUnitOk {
     outcome_text: String,
     usage: Usage,
     qc: QualityReport,
+    /// SubAgent 执行轨迹(2026-09-09 第 05 轮)。
+    trace: ExecutionTrace,
 }
 
 /// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
@@ -825,6 +849,7 @@ async fn run_wf_unit(
             retryable: true,
             suggestion: "重试".into(),
             cancelled: false,
+            trace: None,
         })?),
         None => None,
     };
@@ -838,7 +863,7 @@ async fn run_wf_unit(
         })?;
 
     let qc = quality
-        .check_subagent(&goal, &input.expected_output, &outcome.text, &session_id)
+        .check_subagent(&goal, &input.expected_output, &outcome.text, &outcome.trace, &session_id)
         .await
         .map_err(|e| QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e))?;
     if let Some(d) = &debug {
@@ -852,6 +877,7 @@ async fn run_wf_unit(
             retryable: qc.retryable,
             suggestion: qc.suggestion,
             cancelled: false,
+            trace: Some(Arc::new(outcome.trace)),
         });
     }
 
@@ -859,6 +885,7 @@ async fn run_wf_unit(
         outcome_text: outcome.text,
         usage: outcome.usage,
         qc,
+        trace: outcome.trace,
     })
 }
 

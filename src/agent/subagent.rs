@@ -9,10 +9,11 @@ use serde::Serialize;
 
 use crate::agent::cancel::CancelToken;
 use crate::agent::context::AgentRole;
+use crate::agent::extrace::ExecutionTrace;
 use crate::agent::memory;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
-use crate::error::Result;
+use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Usage};
 
 /// SubFlow 输入(由 Orchestrator 构造)。
@@ -59,8 +60,10 @@ impl SubFlowInput {
 pub struct SubFlowOutcome {
     pub text: String,
     pub usage: Usage,
-    /// 是否判定为失败(根据 LLM 输出推断)
+    /// 是否判定为失败(多维判定:文本失败措辞 / 执行轨迹失败模式)
     pub failed: bool,
+    /// 执行轨迹(QC 辅助判据 + Agent-Memory 持久化 + Yolo 失败回流)
+    pub trace: ExecutionTrace,
 }
 
 /// SubAgent-Work 执行器。
@@ -116,35 +119,86 @@ impl SubAgentRunner {
         // 让 sub_session 共享 session_id 便于追踪
         sub_session.id = session_id.to_string();
 
-        let (text, usage) = self
+        // Agent 循环返回 (text, usage, trace) 三元组。
+        // 早终止路径(RepeatedToolFailure / MaxIterationsExceeded)不再升级为 Error,
+        // 而是包装成一段失败摘要文本 + 已填充 early_terminated 的 trace,
+        // 让 Quality-Check 仍可基于 trace 判定 Fail。
+        let (text, usage, mut trace) = match self
             .agent
             .run_session_cancellable(&mut sub_session, cancel)
-            .await?;
+            .await
+        {
+            Ok((t, u, tr)) => (t, u, tr),
+            Err(AgentError::RepeatedToolFailure { tool, attempts, last_error }) => {
+                let summary = format!(
+                    "[RepeatedToolFailure] 工具 {tool} 连续 {attempts} 次失败;last_error: {last_error}"
+                );
+                let mut tr = ExecutionTrace::default();
+                tr.early_terminated = true;
+                tr.early_terminate_reason = format!("tool={tool} attempts={attempts}");
+                tr.max_consecutive_failures = attempts;
+                tr.collect_failure_signals(&summary);
+                (summary, Usage::default(), tr)
+            }
+            Err(AgentError::MaxIterationsExceeded(n)) => {
+                let summary =
+                    format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
+                let mut tr = ExecutionTrace::default();
+                tr.iterations = n;
+                tr.early_terminated = true;
+                tr.early_terminate_reason = format!("max_iter:{n}");
+                tr.collect_failure_signals(&summary);
+                (summary, Usage::default(), tr)
+            }
+            Err(e) => return Err(e), // Cancelled / Llm 等真正错误依然上抛
+        };
+
+        // 计算多维失败信号 + 综合判定
+        trace.collect_failure_signals(&text);
+        let failed = trace.is_failed();
 
         // 写入 Agent-Memory(取消路径已在上面提前返回,不会走到这里)
+        // 把 trace 关键指标塞进 artifacts,便于下次同类 Agent 加载经验。
+        let error_summary_owned: Option<String> = if failed {
+            if !trace.early_terminate_reason.is_empty() {
+                Some(trace.early_terminate_reason.clone())
+            } else {
+                Some(trace.failure_signals.join(","))
+            }
+        } else {
+            None
+        };
+        let error_summary = error_summary_owned.as_deref();
         let _ = memory::record_entry(
             &self.db,
             AgentRole::SubAgent,
             session_id,
             &input.description,
             &text,
-            None,
-            serde_json::json!({ "subflow_id": &input.id, "expected": &input.expected_output }),
+            error_summary,
+            serde_json::json!({
+                "subflow_id": &input.id,
+                "expected": &input.expected_output,
+                "trace": &trace,
+            }),
         );
 
-        let failed = looks_like_failure(&text);
-        Ok(SubFlowOutcome { text, usage, failed })
+        Ok(SubFlowOutcome { text, usage, failed, trace })
     }
 }
 
 /// 简单启发式:从 LLM 输出中探测是否包含失败标记。
 ///
-/// 仅作辅助判定;真正的失败检测由 Quality-Check 完成。
+/// 仅作辅助判定;真正的失败检测由 Quality-Check + ExecutionTrace 综合。
+///
+/// **2026-09-09 第 05 轮**:本函数仍保留以向后兼容既有测试,但
+/// 实际判定已被 `ExecutionTrace::is_failed()` 取代。
 ///
 /// **P0 增强**(2026-09-08):覆盖 LLM 中英双语常见失败措辞、大小写不敏感、
 /// 容忍前缀空白,避免漏判 LLM 真实失败输出导致 silently pass。
 /// 设计依据:`docs/Agent源码调研/专题-第八轮-Tool权限策略引擎与沙箱设计深度对比.md`
 /// —— 5 态权限状态机 + fail-closed 默认值。
+#[allow(dead_code)] // 单元测试仍覆盖该函数;运行时已被 ExecutionTrace::is_failed 取代
 fn looks_like_failure(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
@@ -176,6 +230,78 @@ fn looks_like_failure(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use async_trait::async_trait;
+    use crate::llm::{ChatMessage, Completion, LlmClient, RequestMeta, Usage};
+
+    /// 始终返回"rm -rf /" Bash 工具调用 → 触发 dangerous 命令拦截
+    /// → 连续 3 次失败 → Agent 抛 RepeatedToolFailure 早终止。
+    /// SubAgentRunner::run_unit 应捕获该错误,返回 Ok(outcome)
+    /// 而非 Err(让 QC 仍可基于 trace 判定 Fail)。
+    struct AlwaysBadBashLlm;
+
+    #[async_trait]
+    impl LlmClient for AlwaysBadBashLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> crate::error::Result<Completion> {
+            Ok(Completion {
+                text: String::new(),
+                tool_calls: vec![crate::llm::ToolCallReq {
+                    id: "call-bad".into(),
+                    name: "Bash".into(),
+                    arguments: serde_json::json!({"command": "rm -rf /"}),
+                }],
+                usage: Usage::default(),
+                stop_reason: None,
+            })
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn run_unit_returns_outcome_on_repeated_tool_failure() {
+        use crate::config::{Db, Paths};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path());
+        let db = std::sync::Arc::new(Db::open(&paths).unwrap());
+
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(AlwaysBadBashLlm);
+        let runner = SubAgentRunner::new(llm, db);
+
+        let input = SubFlowInput {
+            id: "wf-x".into(),
+            description: "尝试运行 rm -rf /".into(),
+            expected_output: "应该被拦截".into(),
+            depends_on_outputs: vec![],
+            sibling_outputs: vec![],
+        };
+
+        let outcome = runner.run_unit(&input, "s-x").await
+            .expect("早终止应被 SubAgent 包装为 Ok(outcome),而非 Err");
+
+        // 关键断言:outcome.trace.early_terminated=true
+        assert!(outcome.trace.early_terminated,
+                "RepeatedToolFailure 早终止应反映在 trace.early_terminated");
+        assert!(!outcome.trace.early_terminate_reason.is_empty());
+        assert!(outcome.trace.max_consecutive_failures >= 3);
+        // outcome.failed=true(因 early_terminate 信号是强信号)
+        assert!(outcome.failed,
+                "outcome.failed 应为 true,触发 QC 判 Fail");
+        // outcome.text 是早期包装的摘要
+        assert!(outcome.text.contains("RepeatedToolFailure"),
+                "outcome.text 应包含早终止摘要,实际: {}", outcome.text);
+        // failure_signals 含 early_terminate
+        assert!(outcome.trace.failure_signals.iter()
+                .any(|s| s.starts_with("early_terminate:")),
+                "failure_signals 应包含 early_terminate 信号");
+    }
 
     #[test]
     fn subflow_input_to_user_prompt_contains_all_fields() {

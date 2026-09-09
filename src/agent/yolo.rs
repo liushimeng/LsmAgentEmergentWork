@@ -165,7 +165,7 @@ impl YoloRunner {
         for msg in context {
             yolo_session.context_mut().push(msg.clone());
         }
-        let (text, usage) = self.yolo_agent.run_session(&mut yolo_session).await?;
+        let (text, usage, _trace) = self.yolo_agent.run_session(&mut yolo_session).await?;
         let classification = parse_classification(&text).unwrap_or_else(|e| {
             YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("Yolo 分类解析失败,降级为 simple: {}", e);
@@ -190,7 +190,8 @@ impl YoloRunner {
         work_agent: &crate::agent::Agent,
         session: &mut Session,
     ) -> Result<(String, Usage)> {
-        work_agent.run_session(session).await
+        let (text, usage, _trace) = work_agent.run_session(session).await?;
+        Ok((text, usage))
     }
 }
 
@@ -200,7 +201,7 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
     for msg in context {
         yolo_session.context_mut().push(msg.clone());
     }
-    let (text, usage) = yolo_agent.run_session(&mut yolo_session).await?;
+    let (text, usage, _trace) = yolo_agent.run_session(&mut yolo_session).await?;
     let classification = match parse_classification(&text) {
         Ok(c) => c,
         Err(e) => {

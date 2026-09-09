@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::context::AgentRole;
+use crate::agent::extrace::ExecutionTrace;
 use crate::agent::memory;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
@@ -71,15 +72,29 @@ impl QualityRunner {
     }
 
     /// 校验 SubAgent-Work 单元输出。
+    ///
+    /// 2026-09-09 第 05 轮:接收 `ExecutionTrace` 作为辅助判据,让 QC 模型
+    /// 既能看实际输出文本,也能看到真实执行证据(工具调用次数 / 失败 / 早终止),
+    /// 避免「黑盒判定」误判 silently pass。
     pub async fn check_subagent(
         &self,
         goal: &str,
         expected_output: &str,
         actual_output: &str,
+        trace: &ExecutionTrace,
         session_id: &str,
     ) -> Result<QualityReport> {
+        let trace_summary = trace.render_prompt();
         let prompt = format!(
-            "【Quality-Check: SubAgent 单元】\n目标: {goal}\n期望输出: {expected_output}\n实际输出: {actual_output}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。",
+            "【Quality-Check: SubAgent 单元】\n\
+             目标: {goal}\n\
+             期望输出: {expected_output}\n\
+             实际输出: {actual_output}\n\
+             \n\
+             【执行轨迹】\n{trace_summary}\n\
+             \n\
+             请基于「实际输出 + 执行轨迹」共同判定,按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
+             判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。",
         );
         self.run_check(prompt, AgentRole::SubAgent, actual_output, session_id).await
     }
@@ -120,7 +135,7 @@ impl QualityRunner {
         sub_session.context_mut().push(ChatMessage::user(&prompt));
         sub_session.id = session_id.to_string();
 
-        let (text, usage) = self.agent.run_session(&mut sub_session).await?;
+        let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
         // P0:fail-closed —— 解析失败时返回 Verdict::Fail + retryable=true,
         // 触发 Yolo 回流,而非 fail-open(默认 Pass)绕过质检门。
         // 设计依据:`docs/Agent源码调研/专题-第八轮-Tool权限策略引擎与沙箱设计深度对比.md`

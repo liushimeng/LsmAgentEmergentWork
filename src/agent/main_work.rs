@@ -90,7 +90,7 @@ impl MainWorkRunner {
         sub_session.context_mut().push(ChatMessage::user(&prompt));
         sub_session.id = session_id.to_string();
 
-        let (text, usage) = self.agent.run_session(&mut sub_session).await?;
+        let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
         let plan = parse_workflow_plan(&text).unwrap_or_else(|e| {
             tracing::warn!("Main-Work 解析失败,使用单 WorkFlow 兜底: {}", e);
             WorkFlowPlan {
