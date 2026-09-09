@@ -274,8 +274,10 @@ impl MultiAgentOrchestrator {
             retry_count += 1;
             if retry_count > self.cfg.max_retry_per_level {
                 // 超过最大重试,输出失败 / 建议
+                // 关联报告: 2026-09-09_05 E-003 —— 当 Yolo 没提供 user_suggestion 时,
+                // 给出 actionable 化的兜底建议(根据 trace 推测失败原因)。
                 let suggestion = if classification.user_suggestion_if_fail.is_empty() {
-                    "任务执行超过最大重试次数,请补充任务信息或调整目标".to_string()
+                    fallback_suggestion(&total_usage)
                 } else {
                     classification.user_suggestion_if_fail.clone()
                 };
@@ -924,6 +926,33 @@ fn failure_usage(_failure: &QualityFailure) -> Usage {
     Usage::default()
 }
 
+/// 当 Yolo 没有给出 user_suggestion 时,根据累计 usage 给出 actionable 兜底建议。
+///
+/// 关联报告: 2026-09-09_05 E-003。当前仅按 output token(代表 LLM 实际产出)
+/// 启发式区分:
+/// - output_token = 0 → LLM 完全没产出,提示「任务描述不够具体」;
+/// - output_token > 0 → LLM 产出了文本但未触发成功判定,提示「可能需要拆分 / 改路径」。
+fn fallback_suggestion(total_usage: &Usage) -> String {
+    if total_usage.output_tokens == 0 {
+        // 完全无产出:任务描述可能不明确,或被早终止
+        "未产出任何答复:请补充任务信息(目标 / 验收标准 / 输入数据)或调整目标粒度,\
+         让 LLM 能给出明确的输出"
+            .to_string()
+    } else if total_usage.output_tokens < 50 {
+        // 产出极少:可能被无文本收敛短路,或 LLM 反复试探
+        "答复信息密度极低:可能因反复工具调用未收敛。请把任务描述得更具体(目标 / 输入 / \
+         期望产出),或确认工具调用所需的资源(文件路径 / 环境)是否可达"
+            .to_string()
+    } else {
+        // 已有较多产出但仍失败:通常是质量判定 / 路径错误类
+        format!(
+            "已迭代 {} 次仍未通过质量判定:请确认任务目标是否合理、工具调用结果是否正确,\
+             或拆分成更小的子任务",
+            total_usage.output_tokens
+        )
+    }
+}
+
 // 解决未使用警告:导入但仅在 cfg(test) 用
 #[allow(unused_imports)]
 use crate::agent::subagent::SubFlowOutcome as _SubFlowOutcome;
@@ -1018,5 +1047,37 @@ mod tests {
         let _ = orch.sub_agent();
         let _ = orch.plan();
         let _ = orch.main_work();
+    }
+
+    // ========== actionable 失败文案(第 05 轮 E-003,方案 tmpPlan/2026-09-09_05) ==========
+
+    #[test]
+    fn fallback_suggestion_distinguishes_output_levels() {
+        // output_token = 0: 任务描述不够具体
+        let zero = fallback_suggestion(&Usage::default());
+        assert!(
+            zero.contains("未产出任何答复"),
+            "output=0 应提示「未产出任何答复」,实际: {zero}"
+        );
+
+        // output_token 极小(< 50): 可能反复工具调用未收敛
+        let tiny = fallback_suggestion(&Usage {
+            output_tokens: 10,
+            ..Usage::default()
+        });
+        assert!(
+            tiny.contains("答复信息密度极低"),
+            "output=10 应提示「答复信息密度极低」,实际: {tiny}"
+        );
+
+        // output_token 较大: 提示拆分 / 调整目标
+        let ample = fallback_suggestion(&Usage {
+            output_tokens: 200,
+            ..Usage::default()
+        });
+        assert!(
+            ample.contains("已迭代") && ample.contains("拆分"),
+            "output=200 应提示拆分,实际: {ample}"
+        );
     }
 }

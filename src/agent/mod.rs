@@ -157,6 +157,15 @@ impl Agent {
         let mut last_fail_key: Option<String> = None;
         let mut consecutive_failures: usize = 0;
 
+        // 关联报告: 2026-09-09_05 E-001 「无文本收敛短路」
+        // 对称短路:当 LLM 在多轮迭代中持续产生 tool_use 但**始终没有输出 final_text**
+        // (典型表现:不停探查/验证/重写同一目标),即使成功调用把失败计数重置了,
+        // 循环也会一直跑到 max_iterations 耗尽。命中条件:连续 N(默认 8)轮「仅 tool_use
+        // 无 final_text」;命中后注入系统级 nudge 让 LLM 收敛,并立即返回已观察到的工具
+        // 结果聚合作为最终答复。阈值 = max_iterations/2 防止误伤收敛慢但最终成功的任务。
+        const NO_TEXT_CONVERGE_THRESHOLD: usize = 8;
+        let mut consecutive_no_text_rounds: usize = 0;
+
         // 执行轨迹累计(2026-09-09 第 05 轮):每次循环同步填充 trace 字段,
         // 单元结束时由 ExecutionTrace::collect_failure_signals 统一打标。
         let mut trace = ExecutionTrace::default();
@@ -268,6 +277,11 @@ impl Agent {
             }
             session.context_mut().push(ChatMessage::assistant(assistant_blocks));
 
+            // 关联报告: 2026-09-09_05 E-001 —— 快照本轮文本/工具状态供后续短路判断使用
+            // (completion.text 与 completion.tool_calls 在下面的循环会被 move)
+            let this_round_text_empty = completion.text.trim().is_empty();
+            let this_round_had_tool_calls = !completion.tool_calls.is_empty();
+
             // 逐个执行工具并把结果回填上下文(失败也作为 tool_result,is_error=true)
             let mut any_success_this_round = false;
             for call in completion.tool_calls {
@@ -348,6 +362,47 @@ impl Agent {
                 // 任一成功调用重置失败计数
                 last_fail_key = None;
                 consecutive_failures = 0;
+            }
+
+            // 关联报告: 2026-09-09_05 E-001 —— 无文本收敛计数
+            // 本轮:有 tool_use 但 completion.text 为空(LLM 只输出工具调用指令没附文本)
+            // → 增加计数;否则(有文本 / 无工具调用)归零
+            // 注:completion.text 与 completion.tool_calls 在前面循环已被消费,
+            // 这里通过本轮迭代开始时记录的 snapshot 判断。
+            if this_round_text_empty && this_round_had_tool_calls {
+                consecutive_no_text_rounds += 1;
+            } else {
+                consecutive_no_text_rounds = 0;
+            }
+            if consecutive_no_text_rounds >= NO_TEXT_CONVERGE_THRESHOLD {
+                warn!(
+                    consecutive_no_text_rounds = consecutive_no_text_rounds,
+                    "检测到连续无文本收敛轮次,注入 nudge 并提前终止以避免耗尽迭代"
+                );
+                trace.early_terminated = true;
+                trace.early_terminate_reason =
+                    format!("no_text_converge rounds={}", consecutive_no_text_rounds);
+                // 注入 nudge 让 LLM 主动收敛,即便不返回最终答复也走 finalize 路径
+                session.context_mut().push(ChatMessage::user(
+                    "[系统提示] 你已连续多轮只调用工具未输出最终答复。\
+                     请基于已收集到的工具结果直接给出结论性答复,不要再发起新的工具调用。"
+                        .to_string(),
+                ));
+                // 合成兜底文本:基于工具执行情况聚合
+                let fallback_text = format!(
+                    "[SubAgent 已达无文本收敛上限 {} 轮,基于以下工具执行情况返回]\n\n\
+                     - 共执行 {tc} 次(成功 {ok},失败 {err})\n\
+                     - 详细工具结果请参考 Session 历史 context",
+                    NO_TEXT_CONVERGE_THRESHOLD,
+                    tc = trace.tool_calls,
+                    ok = trace.tool_calls_ok,
+                    err = trace.tool_calls_err,
+                );
+                return Ok(Self::finalize_trace(
+                    trace,
+                    &fallback_text,
+                    total_usage,
+                ));
             }
         }
 
@@ -695,5 +750,135 @@ mod tests {
             }
             other => panic!("预期 RepeatedToolFailure,实际 {other:?}"),
         }
+    }
+
+    // ========== 无文本收敛短路(第 05 轮 E-001,方案 tmpPlan/2026-09-09_05) ==========
+
+    /// 永远只产生 Bash tool_use、text 为空的 LLM。模拟「死循环不停探查」场景。
+    struct OnlyToolLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for OnlyToolLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Completion {
+                text: String::new(),
+                tool_calls: vec![crate::llm::ToolCallReq {
+                    id: format!("call-{n}"),
+                    name: "Bash".into(),
+                    arguments: json!({"command": "echo only-tool"}),
+                }],
+                usage: Usage::default(),
+                stop_reason: None,
+            })
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    /// 验证: 持续 tool_use 无 text 应在阈值(默认 8)轮内触发「无文本收敛短路」,
+    /// 返回 Ok 而不是 MaxIterationsExceeded。
+    #[tokio::test]
+    async fn no_text_converge_short_circuit_returns_ok() {
+        let agent = Agent::new(
+            std::sync::Arc::new(OnlyToolLlm {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("陷入循环"));
+        let (text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
+        // 应返回 Ok 而非 MaxIterationsExceeded
+        assert!(
+            trace.early_terminated,
+            "无文本收敛短路应标记 early_terminated"
+        );
+        assert!(
+            trace.early_terminate_reason.starts_with("no_text_converge"),
+            "早终止原因应为 no_text_converge,实际 {}",
+            trace.early_terminate_reason
+        );
+        // 兜底文本应包含「无文本收敛上限」字样
+        assert!(
+            text.contains("无文本收敛上限"),
+            "兜底文本应提示无文本收敛,实际: {text}"
+        );
+        // 短路触发时,Bash 工具应至少被调用了阈值次数
+        assert!(
+            trace.tool_calls >= 8,
+            "应至少执行 8 次 Bash 才短路,实际 {}",
+            trace.tool_calls
+        );
+    }
+
+    /// 验证: 工具调用 + 文本混合的正常 LLM 不应触发短路。
+    struct MixedTextToolLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for MixedTextToolLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 3 {
+                Ok(Completion {
+                    text: format!("第 {} 轮说明", n + 1),
+                    tool_calls: vec![crate::llm::ToolCallReq {
+                        id: format!("call-{n}"),
+                        name: "Bash".into(),
+                        arguments: json!({"command": "echo mix"}),
+                    }],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                })
+            } else {
+                Ok(Completion {
+                    text: "已完成".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                })
+            }
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_text_and_tool_does_not_short_circuit() {
+        let agent = Agent::new(
+            std::sync::Arc::new(MixedTextToolLlm {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            AgentProfile::sub_agent_work_profile(),
+        );
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user("混合任务"));
+        let (_text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
+        // 混合文本+工具不应触发无文本收敛短路
+        assert!(
+            !trace.early_terminate_reason.starts_with("no_text_converge"),
+            "混合场景不应触发无文本收敛短路,实际 reason={}",
+            trace.early_terminate_reason
+        );
     }
 }
