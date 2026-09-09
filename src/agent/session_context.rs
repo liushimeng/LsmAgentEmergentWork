@@ -48,6 +48,7 @@ impl SessionContextRunner {
         total_usage: &Usage,
         session_id: &str,
         yolo_degraded: bool,
+        task_level: &crate::agent::yolo::TaskLevel,
     ) -> Result<SessionSummary> {
         let workflow_line = if workflow_results.is_empty() {
             "(无 WorkFlow)".to_string()
@@ -65,17 +66,24 @@ impl SessionContextRunner {
             "【SessionContext 收口】\n\
              目标: {goal}\n\
              用户输入: {user_prompt}\n\
+             当前时间: {now}\n\
+             任务档位: {level}\n\
              Plan 文档: {plan}\n\
              WorkFlow: {wf}\n\
              用量: input={i}, output={o}\n\
              Yolo 本次降级: {yolo_degraded_this}\n\
              Yolo 降级(本进程累计): {yolo_fallback} 次\n\n\
              请按系统提示词中的 Markdown 模板输出 200 字以内的简洁摘要。\
+             摘要中的「时间」与「难度」**必须**原样使用上方给定的当前时间与任务档位,禁止自行推测。\
              若 Yolo 本次降级 = true,** 必须** 按以下规则处理标题与状态行:\n\
              - 标题不要写成「目标解析失败(已降级)」 —— 这是上游 LLM 输出格式问题,不是任务失败;\n\
              - 若 WorkFlow 全部成功:标题用原始 goal 摘要,状态行标记为「Yolo 降级 + 执行成功」;\n\
              - 若 WorkFlow 全部失败:标题用原始 goal 摘要,状态行标记为「Yolo 降级 + 执行失败」并保留失败原因;\n\
              若 Yolo 降级累计 > 0,务必在摘要中以「Yolo 降级 N 次」一行显式记录。",
+            goal = goal,
+            user_prompt = user_prompt,
+            now = session::now_readable(),
+            level = task_level.as_str(),
             plan = plan_doc.map(|p| p.display().to_string()).unwrap_or_else(|| "无".into()),
             wf = workflow_line,
             i = total_usage.input_tokens,

@@ -221,6 +221,9 @@ impl Agent {
         const RECENT_TOOL_HISTORY_LIMIT: usize = 16;
         let mut recent_tool_history: Vec<(String, String, bool)> = Vec::new(); // (tool, args_digest, is_error)
 
+        // trace.artifacts 上限(2026-09-09 第 15 轮):防止极端任务写大量文件时轨迹膨胀。
+        const ARTIFACTS_LIMIT: usize = 8;
+
         for iter in 0..self.max_iterations {
             trace.iterations = iter + 1;
             // 迭代边界:取消检查(轻量 is_cancelled,热路径零 await 开销)
@@ -462,6 +465,13 @@ impl Agent {
                 } else {
                     trace.tool_calls_ok += 1;
                     any_success_this_round = true;
+                    // 产物采集(2026-09-09 第 15 轮):Write 成功落盘时记录 路径+字节数,
+                    // 让 QC 能看到"成果在文件里"而非仅凭收尾文本 output_bytes 误判。
+                    if name == "Write" && trace.artifacts.len() < ARTIFACTS_LIMIT {
+                        let path = args["file_path"].as_str().unwrap_or("?");
+                        let bytes = args["content"].as_str().map(|c| c.len()).unwrap_or(0);
+                        trace.artifacts.push(format!("Write {path} ({bytes}B)"));
+                    }
                 }
                 trace.tool_calls += 1;
                 // 关联报告: 2026-09-09_06 F-002 — 累计最近工具调用历史

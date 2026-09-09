@@ -21,6 +21,7 @@
   4. GraphQL 的 N+1 查询问题怎么解决？DataLoader 的批处理与缓存原理是什么？
 
 ### AQ03 错误码体系：从 HTTP 状态码到业务语义
+- **测试状态**: ✅ 已测试 (AQ03_q1.md, 通过 — 真实网关 laew -debug 完整链路 Yolo→SubAgent→QC,详见 `tmpPlan/2026-09-09_15-DirectAnswer短路与input-token与QC产物可见性修复方案.md`)
 - **预期档位**: medium
 - **考察维度**: 错误建模 + 客户端可操作性
 - **对话脚本**:

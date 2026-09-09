@@ -48,6 +48,7 @@
   4. Emoji 字体优先级：苹果、谷歌、微软、Twitter 的 Emoji 风格差异，怎么在前端控制？
 
 ### AR06 时区与日历：跨时区工程
+- **测试状态**: ✅ 已测试 (AR06_q1.md, 通过 — laew -debug 链路跑通,详见 `tmpPlan/2026-09-09_15-DirectAnswer短路与input-token与QC产物可见性修复方案.md`)
 - **预期档位**: medium
 - **考察维度**: 时区数据 + 日历系统
 - **对话脚本**:

@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn artifacts_serde_default_compatible() {
         // 旧格式 JSON(无 artifacts 字段)反序列化应成功。
-        let v = serde_json::json!({"iterations":1,"output_bytes":10,"failure_signals":["ok"]});
+        let v = serde_json::json!({"iterations":1,"tool_calls":0,"tool_calls_ok":0,"tool_calls_err":0,"max_consecutive_failures":0,"early_terminated":false,"early_terminate_reason":"","truncation_resumes":0,"overflow_recoveries":0,"max_tokens_upscalings":0,"max_tokens_history":[],"structured_emits":0,"output_bytes":10,"failure_signals":["ok"]});
         let t: ExecutionTrace = serde_json::from_value(v).unwrap();
         assert!(t.artifacts.is_empty());
     }

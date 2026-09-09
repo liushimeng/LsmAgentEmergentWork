@@ -274,6 +274,44 @@ impl MultiAgentOrchestrator {
             });
 
         let mut retry_count = 0;
+
+        // 1.2) simple + direct_answer 短路(2026-09-09 第 15 轮 AQ03 实测发现):
+        // Yolo 已给出完整直接答案时,不再空转一轮 SubAgent+QC(实测多花 ~2.5 分钟
+        // 且引入额外失败面)。本分支接通 OrchestrationOutcome::DirectAnswer ——
+        // 该变体与 main.rs/tui 消费端早已存在,但此前无任何构造点(死代码),
+        // 旧兼容 API `yolo::run_yolo` 的 DirectAnswer 语义在此对齐到主编排链路。
+        // 仍跑 SessionContext 收口(workflows 为空),保住 session_memory 连续性。
+        if classification.task_level == TaskLevel::Simple {
+            if let Some(answer) = classification
+                .direct_answer
+                .as_ref()
+                .filter(|a| !a.trim().is_empty())
+                .cloned()
+            {
+                Self::check_cancelled(cancel)?;
+                let summary = self
+                    .session_context
+                    .summarize(
+                        &classification.goal_summary,
+                        "(用户原始输入已记录)",
+                        None,
+                        &[],
+                        &total_usage,
+                        session.id(),
+                        classification.yolo_degraded,
+                        &classification.task_level,
+                    )
+                    .await?;
+                total_usage = add_usage(total_usage, summary.usage);
+                self.dbg_task_end("direct_answer", total_usage);
+                return Ok(OrchestrationOutcome::DirectAnswer {
+                    text: answer,
+                    classification,
+                    usage: total_usage,
+                });
+            }
+        }
+
         loop {
             // 重试轮入口:取消短路(取消不是失败,不消耗重试预算)
             Self::check_cancelled(cancel)?;
@@ -327,6 +365,7 @@ impl MultiAgentOrchestrator {
                             &task_result.total_usage,
                             session.id(),
                             task_result.classification.yolo_degraded,
+                            &task_result.classification.task_level,
                         )
                         .await?;
                     task_result.summary = summary.text.clone();

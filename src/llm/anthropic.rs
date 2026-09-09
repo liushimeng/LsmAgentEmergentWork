@@ -318,7 +318,32 @@ impl AnthropicParser {
                 self.block_kind = None;
             }
             "message_delta" => {
-                if let Some(out) = v["usage"]["output_tokens"].as_u64() {
+                // 兼容网关形态差异:真实 Anthropic 在 message_start 给全量 usage,
+                // 部分兼容网关(如 LongCat)message_start 给空 usage、
+                // 到 message_delta 才带上 input_tokens/cache_* —— 此处补解析,
+                // 缺失字段回填 sink 当前值,避免抹掉 message_start 已给的信息。
+                let usage = &v["usage"];
+                let has_input = usage["input_tokens"].is_u64()
+                    || usage["cache_read_input_tokens"].is_u64()
+                    || usage["cache_creation_input_tokens"].is_u64();
+                if has_input {
+                    let cur = sink.usage();
+                    sink.feed(DeltaEvent::InputUsage {
+                        input_tokens: usage["input_tokens"]
+                            .as_u64()
+                            .map(|v| v as u32)
+                            .unwrap_or(cur.input_tokens),
+                        cache_read: usage["cache_read_input_tokens"]
+                            .as_u64()
+                            .map(|v| v as u32)
+                            .unwrap_or(cur.cache_read_input_tokens),
+                        cache_creation: usage["cache_creation_input_tokens"]
+                            .as_u64()
+                            .map(|v| v as u32)
+                            .unwrap_or(cur.cache_creation_input_tokens),
+                    })?;
+                }
+                if let Some(out) = usage["output_tokens"].as_u64() {
                     // message_delta.usage.output_tokens 是累计值,直接覆盖
                     sink.feed(DeltaEvent::OutputUsage {
                         output_tokens: out as u32,
@@ -717,6 +742,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sink.usage().output_tokens, 123);
+    }
+
+    #[test]
+    fn parser_message_delta_backfills_input_usage() {
+        // 网关形态兼容(2026-09-09 第 15 轮):部分兼容网关(LongCat 等)
+        // message_start 给空 usage,input_tokens 到 message_delta 才出现。
+        let mut sink = ParseSink::new();
+        let mut p = AnthropicParser::new();
+        p.feed(
+            &SseEvent {
+                event: Some("message_start".into()),
+                data: json!({"message":{"usage":{}}}).to_string(),
+                id: None,
+                retry: None,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.usage().input_tokens, 0);
+        p.feed(
+            &SseEvent {
+                event: Some("message_delta".into()),
+                data: json!({"delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":8,"output_tokens":64}})
+                    .to_string(),
+                id: None,
+                retry: None,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.usage().input_tokens, 8);
+        assert_eq!(sink.usage().output_tokens, 64);
+    }
+
+    #[test]
+    fn parser_message_delta_preserves_message_start_cache_fields() {
+        // message_delta 只带 input/output 时,不得抹掉 message_start 已给的 cache 字段。
+        let mut sink = ParseSink::new();
+        let mut p = AnthropicParser::new();
+        p.feed(
+            &SseEvent {
+                event: Some("message_start".into()),
+                data: json!({"message":{"usage":{"input_tokens":42,"cache_read_input_tokens":7}}})
+                    .to_string(),
+                id: None,
+                retry: None,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        p.feed(
+            &SseEvent {
+                event: Some("message_delta".into()),
+                data: json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}})
+                    .to_string(),
+                id: None,
+                retry: None,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.usage().input_tokens, 42);
+        assert_eq!(sink.usage().cache_read_input_tokens, 7);
+        assert_eq!(sink.usage().output_tokens, 20);
     }
 
     #[test]
