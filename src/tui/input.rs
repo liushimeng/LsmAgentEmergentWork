@@ -237,6 +237,65 @@ fn handle_paste_text(text: &str, registry: &mut PasteRegistry) -> PasteInsert {
     }
 }
 
+/// 补全菜单 + Tab/Enter 行为的决策结果(2026-09-10 第 24 轮 Enter 吞键修复)。
+/// - `Submit(text)`  : 调用方应以 text 作为输入行提交(进入 handle_user_input);
+/// - `AcceptOnly(s)` : 调用方仅把 s 写入输入框,不提交(原「接受补全」语义,Tab 路径);
+/// - `None`          : 无操作(补全菜单未开 + Tab,或边界场景)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletionDecision {
+    Submit(String),
+    AcceptOnly(String),
+    None,
+}
+
+/// 决定 Tab/Enter 在补全菜单中的行为。
+///
+/// 规则(2026-09-10 第 24 轮):
+/// - 补全未开:Enter → Submit(buffer);Tab → None。
+/// - 补全已开 + buffer.trim() == replacement.trim():Enter/Tab → Submit(buffer)(已匹配,避免再加尾随空格)。
+/// - 补全已开 + Enter + buffer 是 replacement 的真前缀:Submit(replacement)(一键补全并提交,
+///   解决 `/provider` 等高频命令需要按 2 次 Enter 才能进入子屏的 UX 问题)。
+/// - 补全已开 + Tab:AcceptOnly(replacement)(只补全不提交,符合 Tab 的传统语义)。
+/// - 补全已开 + Enter + buffer 不是任何补全项真前缀:Submit(buffer)(兜底:不让 Enter 被吞)。
+fn completion_enter_tab_decision(
+    key: KeyCode,
+    buffer: &str,
+    completion_active: bool,
+    completion_items: &[CompletionItem],
+    completion_index: usize,
+) -> CompletionDecision {
+    // 补全菜单未开:Enter 直接提交当前 buffer;Tab 无操作
+    if !completion_active || completion_items.is_empty() {
+        return match key {
+            KeyCode::Enter => CompletionDecision::Submit(buffer.to_string()),
+            _ => CompletionDecision::None,
+        };
+    }
+    let item = match completion_items.get(completion_index) {
+        Some(i) => i,
+        None => return CompletionDecision::None,
+    };
+    let trimmed_buf = buffer.trim();
+    let trimmed_rep = item.replacement.trim();
+    // 路径 A:已匹配(忽略尾随空格)→ 直接以 buffer 提交
+    if trimmed_buf == trimmed_rep {
+        return CompletionDecision::Submit(buffer.to_string());
+    }
+    // 路径 B:Enter + buffer 是补全项真前缀 → 用补全项内容直接提交
+    if key == KeyCode::Enter
+        && trimmed_rep.starts_with(trimmed_buf)
+        && trimmed_rep.len() > trimmed_buf.len()
+    {
+        return CompletionDecision::Submit(item.replacement.clone());
+    }
+    // 路径 C:Tab → 接受补全但不提交;Enter 兜底 → 以 buffer 提交,不让 Enter 被吞成空操作
+    match key {
+        KeyCode::Tab => CompletionDecision::AcceptOnly(item.replacement.clone()),
+        KeyCode::Enter => CompletionDecision::Submit(buffer.to_string()),
+        _ => CompletionDecision::None,
+    }
+}
+
 /// 屏幕布局:滚动区 + 底部固定输入面板的行号计算。
 #[derive(Debug, Clone, Copy)]
 struct Layout {
@@ -559,39 +618,54 @@ impl InputHandler {
                             }
                         }
                         KeyCode::Tab | KeyCode::Enter => {
-                            // Tab 或 Enter：接受当前选中项或提交输入
-                            if completion_active && !completion_items.is_empty() {
-                                let item = &completion_items[completion_index];
-                                // 若缓冲区已等于补全目标(忽略尾随空格),直接提交而非接受补全。
-                                // 避免用户已完整输入命令名时 Enter 被吞成"接受补全 + 加尾随空格"。
-                                if buffer.trim() == item.replacement.trim() {
+                            // Tab/Enter 在补全菜单打开时行为分流(2026-09-10 第 24 轮修复):
+                            //  - Tab  永远只「接受补全」,不提交(用户预期);
+                            //  - Enter 若 buffer 是当前选中补全项的「真前缀」,则用补全项的完整内容直接
+                            //    提交(避免 `/provider` 等高频命令需要按 2 次 Enter 才能进入子屏);
+                            //  - Enter 若 buffer 已等于补全项(忽略尾随空格),直接以 buffer 提交
+                            //    (容错:与既有路径 A 一致);
+                            //  - Enter 若 buffer 不是任何补全项的真前缀,则「接受补全 + 提交原 buffer」
+                            //    (兜底:不让 Enter 被吞成空操作)。
+                            match completion_enter_tab_decision(
+                                key.code,
+                                &buffer,
+                                completion_active,
+                                &completion_items,
+                                completion_index,
+                            ) {
+                                CompletionDecision::Submit(text) => {
                                     return self.submit(
                                         &mut stdout,
                                         &layout,
                                         prompt,
-                                        buffer,
+                                        text,
                                         overlay_lines,
                                         &pastes,
                                     );
                                 }
-                                // 接受补全并关闭浮层
-                                buffer = item.replacement.clone();
-                                cursor = buffer.len();
-                                completion_active = false;
-                                completion_items.clear();
-                                overlay_lines =
-                                    self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
-                                self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
-                            } else if key.code == KeyCode::Enter {
-                                // 提交输入
-                                return self.submit(
-                                    &mut stdout,
-                                    &layout,
-                                    prompt,
-                                    buffer,
-                                    overlay_lines,
-                                    &pastes,
-                                );
+                                CompletionDecision::AcceptOnly(replacement) => {
+                                    buffer = replacement;
+                                    cursor = buffer.len();
+                                    completion_active = false;
+                                    completion_items.clear();
+                                    overlay_lines = self.clear_overlay(
+                                        &mut stdout,
+                                        &layout,
+                                        overlay_lines,
+                                    )?;
+                                    self.redraw_line(
+                                        &mut stdout,
+                                        &layout,
+                                        prompt,
+                                        &buffer,
+                                        cursor,
+                                    )?;
+                                }
+                                CompletionDecision::None => {
+                                    // 补全未开 + Tab:无操作(保持静默);
+                                    // 补全未开 + Enter:辅助函数已返回 Submit(text=buffer),
+                                    // 不会到这里,所以下方兜底不会再跑到。
+                                }
                             }
                         }
                         KeyCode::Backspace => {
@@ -774,7 +848,7 @@ impl InputHandler {
                 Clear(ClearType::CurrentLine),
                 SetForegroundColor(theme::INPUT_HINT_FG),
                 Print(fit_width(
-                    "  ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出  /help 帮助",
+                    "  ↑↓ 选择补全  Enter 补全并提交  Tab 仅补全  Esc 关闭补全  Ctrl-D 退出  /help 帮助",
                     layout.cols,
                 )),
                 ResetColor,
@@ -1207,6 +1281,83 @@ mod tests {
         };
         assert!(m1.contains("#1"));
         assert!(m2.contains("#2"));
+    }
+
+    // ========== Tab/Enter + 补全菜单决策(2026-09-10 第 24 轮 Enter 吞键修复) ==========
+
+    fn items(items: Vec<&str>) -> Vec<CompletionItem> {
+        items
+            .into_iter()
+            .map(|r| CompletionItem {
+                display: r.to_string(),
+                replacement: r.to_string(),
+                description: String::new(),
+                usage: String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completion_enter_when_buffer_equals_replacement_submits_buffer() {
+        // 路径 A:buffer 已是完整命令 → 直接以 buffer 提交(避免补全后再加尾随空格)
+        let items = items(vec!["/provider list"]);
+        let d = completion_enter_tab_decision(KeyCode::Enter, "/provider list", true, &items, 0);
+        assert_eq!(d, CompletionDecision::Submit("/provider list".to_string()));
+    }
+
+    #[test]
+    fn completion_enter_on_prefix_submits_replacement() {
+        // 路径 B:`/provider` + Enter → 用 `/provider list` 提交(第 24 轮 Bug 修复)
+        // 避免高频命令需要按 2 次 Enter 才能进入子屏。
+        let items = items(vec!["/provider list", "/provider add"]);
+        let d = completion_enter_tab_decision(KeyCode::Enter, "/provider", true, &items, 0);
+        assert_eq!(d, CompletionDecision::Submit("/provider list".to_string()));
+    }
+
+    #[test]
+    fn completion_enter_on_partial_prefix_submits_replacement() {
+        // `/provider a` 命中 `/provider add` 的真前缀 → 一次 Enter 补全并提交
+        let items = items(vec!["/provider list", "/provider add"]);
+        let d = completion_enter_tab_decision(KeyCode::Enter, "/provider a", true, &items, 1);
+        assert_eq!(d, CompletionDecision::Submit("/provider add".to_string()));
+    }
+
+    #[test]
+    fn completion_tab_on_prefix_accepts_without_submit() {
+        // Tab + buffer 是补全项真前缀 → AcceptOnly(只补全,不提交,符合 Tab 传统语义)
+        let items = items(vec!["/provider list"]);
+        let d = completion_enter_tab_decision(KeyCode::Tab, "/provider", true, &items, 0);
+        assert_eq!(d, CompletionDecision::AcceptOnly("/provider list".to_string()));
+    }
+
+    #[test]
+    fn completion_enter_with_no_completion_submits_buffer() {
+        // 补全未开:Enter 提交 buffer(原行为)
+        let d = completion_enter_tab_decision(KeyCode::Enter, "hello world", false, &[], 0);
+        assert_eq!(d, CompletionDecision::Submit("hello world".to_string()));
+    }
+
+    #[test]
+    fn completion_tab_with_no_completion_is_noop() {
+        // 补全未开:Tab 无操作(避免意外副作用)
+        let d = completion_enter_tab_decision(KeyCode::Tab, "hello", false, &[], 0);
+        assert_eq!(d, CompletionDecision::None);
+    }
+
+    #[test]
+    fn completion_enter_on_non_prefix_buffer_submits_buffer_as_fallback() {
+        // 兜底:补全已开 + Enter + buffer 不是任何补全项真前缀 → 提交 buffer(不让 Enter 被吞)
+        let items = items(vec!["/provider list", "/help"]);
+        let d = completion_enter_tab_decision(KeyCode::Enter, "/xyz custom", true, &items, 0);
+        assert_eq!(d, CompletionDecision::Submit("/xyz custom".to_string()));
+    }
+
+    #[test]
+    fn completion_enter_with_buffer_having_trailing_space_matches_replacement() {
+        // 路径 A 容错:buffer 末尾有空格时,trim 后与 replacement 相等 → 提交 buffer
+        let items = items(vec!["/provider list"]);
+        let d = completion_enter_tab_decision(KeyCode::Enter, "/provider list  ", true, &items, 0);
+        assert_eq!(d, CompletionDecision::Submit("/provider list  ".to_string()));
     }
 
     #[test]
