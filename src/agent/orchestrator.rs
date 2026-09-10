@@ -332,11 +332,17 @@ impl MultiAgentOrchestrator {
         // 该变体与 main.rs/tui 消费端早已存在,但此前无任何构造点(死代码),
         // 旧兼容 API `yolo::run_yolo` 的 DirectAnswer 语义在此对齐到主编排链路。
         // 仍跑 SessionContext 收口(workflows 为空),保住 session_memory 连续性。
+        //
+        // 占位字符串兜底(2026-09-10 第 27 轮 F12 / 实测 BUG-2026-09-10-TUI-NULL):
+        // 部分上游 LLM 在需要委派执行时,会把 `direct_answer` 写成字符串字面量
+        // `"null"`/`"None"`/`"NULL"`(而非 JSON 的 null),导致本分支错误短路,
+        // TUI 直接打印字面量 `null` 让用户以为没输出。此处把 4 类常见占位归一
+        // 为"未填",继续走 loop → run_simple 委派 SubAgent。
         if classification.task_level == TaskLevel::Simple {
             if let Some(answer) = classification
                 .direct_answer
                 .as_ref()
-                .filter(|a| !a.trim().is_empty())
+                .filter(|a| !is_placeholder_direct_answer(a))
                 .cloned()
             {
                 Self::check_cancelled(cancel)?;
@@ -1204,6 +1210,23 @@ fn failure_usage(_failure: &QualityFailure) -> Usage {
     Usage::default()
 }
 
+/// 判断 `direct_answer` 是否为占位字符串(2026-09-10 第 27 轮 F12)。
+///
+/// 上下文:`yolo.rs::TaskClassification.direct_answer` 期望需要委派时填 JSON
+/// `null`(→ `Option::None`),需要直答时填字符串答案。但实测发现部分上游 LLM
+/// 误把字面量 `"null"`/`"None"`/`"NULL"` 当 JSON `null` 写入,反序列化后
+/// 是 `Some("null")`,原 `filter(|a| !a.trim().is_empty())` 不会拒绝它,导致
+/// 走 DirectAnswer 短路、TUI 直接打印"null"用户以为零输出。
+///
+/// 把 4 类常见占位归一为"未填",继续走 loop → run_simple 委派 SubAgent。
+fn is_placeholder_direct_answer(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty()
+        || t.eq_ignore_ascii_case("null")
+        || t.eq_ignore_ascii_case("none")
+        || t.eq_ignore_ascii_case("nil")
+}
+
 /// 当 Yolo 没有给出 user_suggestion 时,根据累计 usage 给出 actionable 兜底建议。
 ///
 /// 关联报告: 2026-09-09_05 E-003。当前仅按 output token(代表 LLM 实际产出)
@@ -1356,5 +1379,36 @@ mod tests {
             ample.contains("output tokens") && ample.contains("拆分"),
             "output=200 应如实描述产出并提示拆分,实际: {ample}"
         );
+    }
+
+    // ========== 占位字符串归一化(2026-09-10 第 27 轮 F12 / BUG-2026-09-10-TUI-NULL) ==========
+
+    #[test]
+    fn placeholder_direct_answer_normalizes() {
+        // 字面量 "null" / "None" / "NULL" / "Nil" / 空字符串 → 视为未填(继续走委派)
+        for s in ["", "  ", "null", "NULL", "Null", "None", "none", "NIL", "nil"] {
+            assert!(
+                is_placeholder_direct_answer(s),
+                "{s:?} 应被识别为占位字符串,实际未识别"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_direct_answer_keeps_real_answers() {
+        // 真正含答案的字符串不应被误判为占位
+        for s in [
+            "答:巴黎",
+            "1+1=2",
+            "答案是42",
+            "nullable", // 含 "null" 子串但不是占位
+            "nonempty answer",
+            "nullabc",
+        ] {
+            assert!(
+                !is_placeholder_direct_answer(s),
+                "{s:?} 不应被识别为占位,实际被误判"
+            );
+        }
     }
 }

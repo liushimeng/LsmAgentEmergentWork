@@ -72,7 +72,7 @@ while _i < len(_args):
         continue
     if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs", "--overflow-once",
               "--write-outside", "--write-inside", "--inject-bash", "--forced-tool",
-              "--reject-tool-choice"):
+              "--reject-tool-choice", "--yolo-direct-null"):
         MODES.add(_a)
     _i += 1
 
@@ -326,6 +326,16 @@ YOLO_CLASSIFICATION_JSON = (
     ' "purpose": "验证 laew 端到端链路是否正常",'
     ' "intent": "verify", "decomposition_plan": ["执行验证命令"],'
     ' "direct_answer": null, "user_suggestion_if_fail": ""}'
+)
+# --yolo-direct-null 模式(2026-09-10 第 27 轮 F12 回归测试 / BUG-2026-09-10-TUI-NULL):
+# 模拟 LLM 在需要委派 SubAgent 时,把 `direct_answer` 写成字符串字面量 "null"
+# (而非 JSON 的 null)。实测会让 orchestrator 错误走 DirectAnswer 短路、
+# TUI 直接打印字面量 "null"。修复后应被识别为占位、正常委派 SubAgent 执行。
+YOLO_CLASSIFICATION_DIRECT_NULL_JSON = (
+    '{"task_level": "simple", "goal_summary": "查看服务器进程列表",'
+    ' "purpose": "让用户能看到当前服务器运行的所有进程",'
+    ' "intent": "info_query", "decomposition_plan": ["运行 ps -ef"],'
+    ' "direct_answer": "null", "user_suggestion_if_fail": ""}'
 )
 QUALITY_REPORT_JSON = (
     '{"verdict": "pass", "source": "subagent", "issues": [],'
@@ -739,7 +749,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if key == "oai" or "v1/messages" in self.path:
             if role == "yolo":
-                if "--forced-tool" in MODES:
+                if "--yolo-direct-null" in MODES:
+                    # 2026-09-10 第 27 轮 F12:模拟 direct_answer 写字符串 "null" 的边界场景
+                    # 优先级最高(高于 --forced-tool),便于验证修复路径
+                    body_bytes = emit_reply(
+                        "submit_task_classification",
+                        json.loads(YOLO_CLASSIFICATION_DIRECT_NULL_JSON),
+                    )
+                elif "--forced-tool" in MODES:
                     # 结构化输出强制通道:submit_task_classification tool_use
                     body_bytes = emit_reply(
                         "submit_task_classification",

@@ -276,9 +276,13 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 - task_level 只能是 simple / medium / hard 三个值之一
 - purpose / goal_summary / intent 三个字段每次都必须认真填写(三步分析的结果),不允许留空或敷衍
 - simple 且无需工具可直接回答时填 direct_answer(字符串),decomposition_plan 为空数组
-- 需要委派执行时 direct_answer 必须为 null
+- 需要委派执行时 direct_answer 必须为 null(JSON 的 null,不是字符串 \"null\"/\"None\")
 - decomposition_plan 是字符串数组,simple 级别可以只有 1 个元素或为空
-- medium / hard 级别必须有详细的分解步骤"#;
+- medium / hard 级别必须有详细的分解步骤
+- ⚠️ direct_answer 严格区分两种语义:
+  · 字符串答案(给出具体内容,例如\"答:巴黎\")→ 走直答短路,无需工具调用
+  · JSON null(不写引号)→ 委派给 SubAgent-Work 执行
+  如果误把字符串 \"null\"(带引号)填入,系统会错误判定为直答并打印字面量 \"null\"。"#;
 
 /// Yolo Agent 工具说明(Read + 结构化输出通道)。
 fn yolo_tools_hint() -> &'static str {
