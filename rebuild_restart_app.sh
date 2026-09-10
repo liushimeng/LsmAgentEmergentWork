@@ -36,6 +36,14 @@ if [[ ! -f "$BIN_PATH" ]]; then
 fi
 
 # 2) 拷贝到工程根目录
+# 覆盖前告警:检测正在运行的 laew 进程(2026-09-10 第 20 轮)。
+# 运行中的二进制被覆盖会导致 ETXTBSY 或「边跑边换二进制」的静默干扰
+# (并行会话共享根目录时尤甚),仅提示不阻塞。
+if pgrep -x laew >/dev/null 2>&1; then
+  echo "[rebuild] ⚠️  检测到正在运行的 laew 进程(pgrep -x laew):" >&2
+  pgrep -ax laew | sed 's/^/[rebuild]   /' >&2
+  echo "[rebuild] ⚠️  即将覆盖 ./laew,运行中的旧实例不受影响,但新启动才用新二进制" >&2
+fi
 cp -f "$BIN_PATH" "$ROOT_DIR/laew"
 chmod +x "$ROOT_DIR/laew"
 echo "[rebuild] 已输出: $ROOT_DIR/laew"

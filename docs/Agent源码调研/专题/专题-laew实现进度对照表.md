@@ -17,7 +17,7 @@
 
 | 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
 |------|-----|------|------|---------|---------|
-| H1 | 无超时设置(connect/read/request) | P0 | ✅ | `llm/mod.rs::build_http_client`(connect 10s)+ `llm/sse.rs::stream_chunks`(idle 90s / 总 600s) | 2026-09-08 第 03 轮 |
+| H1 | 无超时设置(connect/read/request) | P0 | ✅ | `llm/mod.rs::build_http_client`(connect 10s)+ `llm/sse.rs::stream_chunks`(idle 90s / 总 600s)+ `llm/resilient.rs::RESPONSE_HEADERS_TIMEOUT`(响应头 TTFB 120s,补最后一段:send() 等包头此前无超时可无限挂起)+ CLI 等待心跳 `ProgressGuard`(-p/-f 每 20s stderr 提示) | 2026-09-08 第 03 轮 / 2026-09-10 第 20 轮补 TTFB+心跳 |
 | H2 | 无重试机制 | P0 | ✅ | `llm/resilient.rs::ResilientLlmClient`(自动重试,最多 3 次) | 同上 |
 | H3 | 无错误分类(可重试 vs 不可重试) | P0 | ✅ | `error.rs` 新增 `LlmHttp/LlmNetwork/LlmStream` + `resilient::is_retryable`(408/425/429/5xx/529 白名单) | 同上 |
 | H10 | 无 idle 超时 watchdog | P1 | ✅ | `llm/sse.rs::stream_chunks`(tokio timeout 包裹 chunk 间读取) | 同上 |

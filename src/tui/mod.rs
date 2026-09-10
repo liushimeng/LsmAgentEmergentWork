@@ -85,7 +85,7 @@ impl TuiSession {
     }
 
     pub fn print_banner(&self) {
-        let active = self.db.lock().expect("db").get_active().ok().flatten();
+        let active = self.db.lock().expect("db").get_active_or_env().ok().flatten();
         println!("╔══════════════════════════════════════════════════════════╗");
         println!(
             "║  LsmAgentEmergentWork  ·  laew  TUI  ·  v{}           ║",
@@ -329,7 +329,7 @@ impl TuiSession {
         if let Err(e) = handle_result {
             collector.record_task_end(format!("error: {e}"), crate::llm::Usage::default());
         }
-        let model = match self.db.lock().expect("db").get_active() {
+        let model = match self.db.lock().expect("db").get_active_or_env() {
             Ok(Some(r)) => format!(
                 "[{}] {}/{} @ {}",
                 r.protocol.as_str(),
@@ -489,7 +489,7 @@ impl TuiSession {
                     .db
                     .lock()
                     .expect("db")
-                    .get_active()
+                    .get_active_or_env()
                     .map_err(anyhow::Error::from)?
                 {
                     println!(
@@ -592,7 +592,7 @@ impl TuiSession {
 
     /// `/export [path]`(D8):导出当前会话 transcript。
     fn run_export(&mut self, path_arg: &str) {
-        let model = match self.db.lock().expect("db").get_active() {
+        let model = match self.db.lock().expect("db").get_active_or_env() {
             Ok(Some(r)) => format!("[{}] {}/{}", r.protocol.as_str(), r.provider_name, r.model_name),
             _ => "<未配置>".to_string(),
         };
@@ -1082,7 +1082,7 @@ fn build_orchestrator_with_active(
     let raw_llm: Arc<dyn crate::llm::LlmClient> = match db
         .lock()
         .expect("db")
-        .get_active()
+        .get_active_or_env()
         .map_err(anyhow::Error::from)?
     {
         Some(r) => client_from_record(&r, &user_agent).map_err(anyhow::Error::from)?,

@@ -15,6 +15,7 @@
 //! 重试安全性:laew 的 `complete()` 聚合完整响应后才返回,工具调用发生在其后,
 //! 因此整请求重放无副作用(仅可能重复计费失败的请求,行业同款行为)。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,54 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// 单次尝试总超时(claudecode 总超时 600s),防无限慢流
 pub const TOTAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+/// 等待响应头(TTFB)超时:TCP 连上后服务端迟迟不回 HTTP 头(网关挂起/假活)的兜底。
+///
+/// 此前该阶段无任何超时(`connect_timeout` 只管握手,流内两级超时只在拿到
+/// `Response` 之后生效),真实事故:网关不回包头 → laew 无限等待、CLI 零反馈。
+pub const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// CLI 等待心跳开关(TUI 模式保持关,避免写坏 alternate screen;-p/-f 单轮开启)。
+static PROGRESS_FEEDBACK: AtomicBool = AtomicBool::new(false);
+
+/// 开启/关闭 CLI 等待心跳(`-p`/`-f` 路径开启;默认关)。
+pub fn set_progress_feedback(enabled: bool) {
+    PROGRESS_FEEDBACK.store(enabled, Ordering::Relaxed);
+}
+
+/// 等待心跳守卫:存活期间每 20s 向 stderr 输出一行等待进度,
+/// 帮助用户区分「正常生成中」与「已经挂死」;drop 时自动中止后台 ticker。
+pub struct ProgressGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ProgressGuard {
+    pub fn start(label: &str) -> Self {
+        if !PROGRESS_FEEDBACK.load(Ordering::Relaxed) {
+            return Self { handle: None };
+        }
+        let label = label.to_string();
+        let started_at = Instant::now();
+        let handle = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(20));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // interval 首个 tick 立即完成,先消费掉再进入 20s 节奏
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                eprintln!("[laew] {}等待中… {}s", label, started_at.elapsed().as_secs());
+            }
+        });
+        Self { handle: Some(handle) }
+    }
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
 
 /// 重试策略配置(测试可注入更小延迟)。
 #[derive(Debug, Clone, Copy)]
@@ -376,6 +425,8 @@ impl ResilientLlmClient {
         meta: &RequestMeta,
     ) -> Result<Completion> {
         let lease = self.acquire_circuit()?;
+        // CLI 等待心跳:覆盖全部尝试 + 退避睡眠;TUI 模式开关关闭时为空操作
+        let _progress = ProgressGuard::start("LLM 响应");
         let mut attempt: usize = 0;
         let result = loop {
             match self.inner.complete(system, messages, tools, meta).await {

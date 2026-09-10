@@ -231,7 +231,7 @@ impl MultiAgentOrchestrator {
         inject_history_with_entries(session, &summaries);
 
         // 0.2) Context 自动压缩(达到当前 Provider context_max_size 的 80% 阈值时触发)
-        if let Ok(Some(active)) = self.db.get_active() {
+        if let Ok(Some(active)) = self.db.get_active_or_env() {
             match self
                 .compact
                 .maybe_compact(session, active.context_max_size)

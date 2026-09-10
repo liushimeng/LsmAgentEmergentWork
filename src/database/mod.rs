@@ -60,6 +60,10 @@ pub enum ConfigError {
     /// 对应知识库 gap L1608 / L1625(D9-7 SSRF 防护):拦截私网/CGNAT/link-local 请求。
     #[error("URL 不安全: {0}")]
     UrlSafety(String),
+
+    /// 环境变量覆盖非法(如 LAEW_PROVIDER_ID 指向不存在的记录)。
+    #[error("环境变量错误: {0}")]
+    Env(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;

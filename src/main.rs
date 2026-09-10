@@ -237,8 +237,10 @@ async fn run_one_shot(
     mode: &str,
 ) -> Result<()> {
     let (paths, db) = open_db()?;
+    // -p/-f 单轮模式开启 CLI 等待心跳(TUI 模式不开,避免写坏 alternate screen)
+    lsm_agent::llm::resilient::set_progress_feedback(true);
     let active = db
-        .get_active()
+        .get_active_or_env()
         .map_err(anyhow::Error::from)?
         .ok_or_else(|| {
             anyhow::anyhow!("尚未配置当前模型,请先执行 `laew provider add` 添加接入记录。")

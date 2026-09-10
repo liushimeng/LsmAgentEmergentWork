@@ -436,13 +436,23 @@ impl LlmClient for AnthropicClient {
         );
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
 
-        let resp = self
-            .http
-            .post(&self.url)
-            .headers(headers)
-            .json(&req)
-            .send()
-            .await?;
+        // 响应头(TTFB)超时兜底:网关挂起不回包头时转可重试错误,而非无限等待
+        // (此前 connect_timeout 只管握手,流内 idle/总超时只在拿到 Response 后生效)
+        let resp = tokio::time::timeout(
+            crate::llm::resilient::RESPONSE_HEADERS_TIMEOUT,
+            self.http
+                .post(&self.url)
+                .headers(headers)
+                .json(&req)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            AgentError::LlmNetwork(format!(
+                "等待响应头超时(>{:?}):服务端未返回 HTTP 头,疑似网关挂起",
+                crate::llm::resilient::RESPONSE_HEADERS_TIMEOUT
+            ))
+        })??;
 
         let status = resp.status();
         if !status.is_success() {

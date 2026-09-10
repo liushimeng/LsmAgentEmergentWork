@@ -111,6 +111,33 @@ impl Db {
         Ok(row)
     }
 
+    /// 取「本进程生效」的接入记录:`LAEW_PROVIDER_ID` 环境变量优先,否则回落 `is_active=1`。
+    ///
+    /// 动机(2026-09-10 第 20 轮):多个并行 laew 会话共享同一根目录 DB 时,
+    /// `is_active` 是全局单点,互相 `provider use` / 测试会互踩对方的当前模型。
+    /// 环境变量覆盖仅作用于本进程、不写 DB,多会话可各自锁定接入记录:
+    /// `LAEW_PROVIDER_ID=3 ./laew …`。
+    pub fn get_active_or_env(&self) -> Result<Option<ProviderRecord>> {
+        if let Some(raw) = std::env::var_os("LAEW_PROVIDER_ID") {
+            let raw = raw.to_string_lossy().trim().to_string();
+            if !raw.is_empty() {
+                let id: i64 = raw.parse().map_err(|_| {
+                    ConfigError::Env(format!(
+                        "LAEW_PROVIDER_ID=`{raw}` 不是合法的接入记录 id(应为整数,可用 `laew provider list` 查看)"
+                    ))
+                })?;
+                return match self.get(id) {
+                    Ok(r) => Ok(Some(r)),
+                    Err(ConfigError::NotFound(_)) => Err(ConfigError::Env(format!(
+                        "LAEW_PROVIDER_ID={id} 指定的接入记录不存在,可用 `laew provider list` 查看现有 id"
+                    ))),
+                    Err(e) => Err(e),
+                };
+            }
+        }
+        self.get_active()
+    }
+
     pub fn get(&self, id: i64) -> Result<ProviderRecord> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn

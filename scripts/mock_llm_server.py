@@ -354,6 +354,17 @@ MAIN_WORK_PLAN_PARALLEL_JSON = (
     ']}'
 )
 SESSION_SUMMARY_TEXT = "任务完成:laew 端到端链路验证通过。(SessionContext 自动摘要)"
+# debug 角色(2026-09-10 第 20 轮):此前无该标记,Debug Agent 请求落入 subagent
+# 兜底分支,拿到"第 2 次调用"的 MOCK_FINAL_ANSWER 文本被原样填进 Debug 报告
+# 「二、Debug Agent 评估」章节(误导为评估结论)。现返回四章节评估 Markdown。
+DEBUG_EVALUATION_TEXT = (
+    "## 任务评估\n任务链路完整:Yolo 分类 → SubAgent 执行 → QC 质检 → SessionContext 收口"
+    "各环节均正常返回,StopReason 序列符合预期,任务目标达成。\n\n"
+    "## 质量报告\n- 工具调用:参数合法,无失败调用\n- 结构化输出:JSON 可解析,字段齐全\n"
+    "- 用量:与既有基线一致,无异常放大\n\n"
+    "## 问题报告\n- P2: mock 环境为脚本化固定响应,业务正确性不在本报告评估范围内。\n\n"
+    "## 优化建议\n- 建议对真实模型回归本任务,验证业务语义层面的完成质量。"
+)
 COMPACT_SUMMARY_TEXT = (
     "## 目标\n验证 Context 自动压缩链路。\n\n"
     "## 进展与关键结论\n历史对话已由 Compact 压缩。\n\n"
@@ -404,6 +415,9 @@ def detect_role(body, key):
     # SubAgent-Work / Quality-Check 等子角色名字最特异、引用频次最低,优先匹配。
     # Yolo 放到最后兜底(它的 prompt 几乎不会提到其它 Agent,匹配兜底安全)。
     for marker, role in [
+        # Debug 必须最先匹配(第 20 轮):DEBUG_BASE_PROMPT 中会反向提及
+        # LsmAgentEmergentWork-Compact 等其它角色名,放在后面会被截胡。
+        ("LsmAgentEmergentWork-Debug", "debug"),
         ("LsmAgentEmergentWork-SubAgent-Work", "subagent"),
         ("LsmAgentEmergentWork-Quality-Check", "quality"),
         ("LsmAgentEmergentWork-SessionContext", "session"),
@@ -757,6 +771,8 @@ class Handler(BaseHTTPRequestHandler):
                 body_bytes = role_reply(COMPACT_SUMMARY_TEXT)
             elif role == "plan":
                 body_bytes = role_reply(PLAN_MARKDOWN)
+            elif role == "debug":
+                body_bytes = role_reply(DEBUG_EVALUATION_TEXT)
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
                 body_bytes = (
                     build_openai_stream(role_no)
