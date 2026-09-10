@@ -23,6 +23,7 @@ pub mod completion;
 pub mod engine;
 pub mod export;
 pub mod form;
+pub mod render;
 pub mod screen;
 pub mod theme;
 
@@ -96,27 +97,36 @@ impl TuiSession {
         );
         println!("╠══════════════════════════════════════════════════════════╣");
         println!(
-            "║  根目录 : {:<46} ║",
-            truncate(&self.paths.root_dir.display().to_string(), 46)
+            "║  根目录 : {} ║",
+            fit_display(&self.paths.root_dir.display().to_string(), 46)
         );
         println!(
-            "║  工作目录: {:<45} ║",
-            truncate(&self.paths.work_dir.display().to_string(), 45)
+            "║  工作目录: {} ║",
+            fit_display(&self.paths.work_dir.display().to_string(), 45)
         );
         // 项目说明文件状态(纯探测,不触发生成;发现规则见 docs/Yolo项目上下文注入/)
         let doc_source = crate::agent::project_context::probe(&self.paths.work_dir);
-        println!("║  项目说明: {:<45} ║", truncate(doc_source.as_str(), 45));
+        println!("║  项目说明: {} ║", fit_display(doc_source.as_str(), 45));
         match active {
             Some(r) => println!(
-                "║  当前模型: [{}] {}/{} {:<25} ║",
-                r.protocol.as_str(),
-                r.provider_name,
-                r.model_name,
-                truncate(&format!("@ {}", r.end_point), 25)
+                "║  当前模型: {} ║",
+                fit_display(
+                    &format!(
+                        "[{}] {}/{} @ {}",
+                        r.protocol.as_str(),
+                        r.provider_name,
+                        r.model_name,
+                        r.end_point
+                    ),
+                    45,
+                )
             ),
-            None => println!("║  当前模型: <未配置, 使用 /provider add 添加>{:<14} ║", ""),
+            None => println!(
+                "║  当前模型: {} ║",
+                fit_display("<未配置, 使用 /provider add 添加>", 45)
+            ),
         }
-        println!("║  Session: {:<46} ║", truncate(&self.session.id, 46));
+        println!("║  Session: {} ║", fit_display(&self.session.id, 46));
         println!("╚══════════════════════════════════════════════════════════╝");
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
         println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出");
@@ -342,9 +352,7 @@ impl TuiSession {
         if !text.is_empty() {
             println!();
             println!("  [agent: {agent_name}]");
-            for line in text.lines() {
-                println!("  {line}");
-            }
+            self.print_with_optional_highlight(text);
             println!();
         } else {
             println!("  (模型未返回文本)");
@@ -355,6 +363,66 @@ impl TuiSession {
     fn print_task_result(&self, result: &crate::agent::orchestrator::TaskResult) {
         for line in format_task_result(result).lines() {
             println!("{line}");
+        }
+    }
+
+    /// 渲染 diff 输出(供 `/diff` 命令使用)。
+    fn print_diff_hunk(&self, hunk: &crate::tui::render::diff::DiffHunk) {
+        let rendered = crate::tui::render::diff::render_diff_hunk(hunk);
+        for line_spans in rendered {
+            print!("  ");
+            for span in line_spans {
+                let attrs_ansi = attrs_to_ansi(span.attrs);
+                print!(
+                    "\x1b[38;5;{}m{}{}\x1b[0m",
+                    color_to_ansi256(span.fg),
+                    attrs_ansi,
+                    span.text
+                );
+            }
+            println!();
+        }
+    }
+
+    /// 带围栏检测的文本输出:在 ```lang ... ``` 围栏内按语言高亮,围栏外原样输出。
+    fn print_with_optional_highlight(&self, text: &str) {
+        let mut in_fence = false;
+        let mut fence_lang = crate::tui::render::highlight::HlLang::Plain;
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                let tag = trimmed.trim_start_matches('`').trim();
+                if in_fence {
+                    // 结束围栏
+                    println!("  {line}");
+                    in_fence = false;
+                } else {
+                    // 开始围栏
+                    fence_lang = crate::tui::render::highlight::lang_from_fence_tag(tag);
+                    println!("  {line}");
+                    in_fence = true;
+                }
+                continue;
+            }
+
+            if in_fence {
+                // 围栏内按语言高亮
+                let spans = crate::tui::render::highlight::highlight_line(line, fence_lang);
+                print!("  ");
+                for span in spans {
+                    let attrs_ansi = attrs_to_ansi(span.attrs);
+                    print!(
+                        "\x1b[38;5;{}m{}{}\x1b[0m",
+                        color_to_ansi256(span.fg),
+                        attrs_ansi,
+                        span.text
+                    );
+                }
+                println!();
+            } else {
+                println!("  {line}");
+            }
         }
     }
 
@@ -470,6 +538,25 @@ impl TuiSession {
             // D2 自定义命令自观测:列出已加载命令与来源
             "commands" => {
                 self.print_custom_commands();
+            }
+            "diff" => {
+                // /diff <old_file> <new_file>:并排 diff 两个文件(行级+字符级着色)
+                let parts: Vec<&str> = rest_args.split_whitespace().collect();
+                if parts.len() < 2 {
+                    println!("  用法: /diff <旧文件路径> <新文件路径>");
+                    println!("  示例: /diff a.rs b.rs");
+                } else {
+                    let old_path = parts[0];
+                    let new_path = parts[1];
+                    match crate::tui::render::diff::diff_files(old_path, new_path) {
+                        Ok(hunk) => {
+                            self.print_diff_hunk(&hunk);
+                        }
+                        Err(e) => {
+                            println!("  [diff 错误] 无法读取文件: {e}");
+                        }
+                    }
+                }
             }
             "" => {}
             other => {
@@ -827,6 +914,15 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev_row[b_len]
 }
 
+/// 截断到 max 显示宽度后按显示宽度右侧补空格(CJK 安全),保证 banner 行等宽。
+/// 修复 2026-09-10 第 18 轮 P1/P2:「当前模型」行 provider/model 不截断溢出右边框、
+/// `{: <N}` 按字符数填充导致含 CJK 内容(如「自动生成(根目录 Markdown)」)时右边界错位。
+fn fit_display(s: &str, max: usize) -> String {
+    let t = truncate(s, max);
+    let w = crate::tui::input::display_width(&t) as usize;
+    format!("{}{}", t, " ".repeat(max.saturating_sub(w)))
+}
+
 /// 截断字符串到指定显示宽度（简化版，按字符数）。
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -886,6 +982,7 @@ fn print_help() {
     println!("  │  /new (n)          开启新会话(同 /clear)                   │");
     println!("  │  /model            显示当前模型                           │");
     println!("  │  /export [path]    导出当前会话(Markdown, .json 后缀 JSON) │");
+    println!("  │  /diff <old> <new> 并排 diff 两个文件(行级+字符级着色)    │");
     println!("  │  /commands         列出自定义斜杠命令                      │");
     println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
     println!("  │  /provider list    列出所有接入记录                       │");
@@ -906,6 +1003,59 @@ fn print_help() {
     println!("    项目级 .laew/commands/<命令名>.md / 用户级 ~/.laew/commands/<命令名>.md");
     println!("    模板支持 frontmatter(description/argument-hint)与 $ARGUMENTS/$1-$9 占位符");
     println!("    详见 /commands");
+}
+
+/// 把 `theme::attr` 位掩码转换为 ANSI 转义前缀(Bold/Underlined/DIM)。
+fn attrs_to_ansi(attrs: u8) -> String {
+    let mut s = String::new();
+    if attrs & crate::tui::theme::attr::BOLD != 0 {
+        s.push_str("\x1b[1m");
+    }
+    if attrs & crate::tui::theme::attr::DIM != 0 {
+        s.push_str("\x1b[2m");
+    }
+    if attrs & crate::tui::theme::attr::UNDERLINED != 0 {
+        s.push_str("\x1b[4m");
+    }
+    if attrs & crate::tui::theme::attr::REVERSE != 0 {
+        s.push_str("\x1b[7m");
+    }
+    s
+}
+
+/// 把 crossterm Color 转为 ANSI 256 色索引(简化映射)。
+fn color_to_ansi256(color: crossterm::style::Color) -> u8 {
+    use crossterm::style::Color;
+    match color {
+        Color::Reset => 7,        // 白色/默认
+        Color::Black => 0,
+        Color::DarkRed => 1,
+        Color::DarkGreen => 2,
+        Color::DarkYellow => 3,
+        Color::DarkBlue => 4,
+        Color::DarkMagenta => 5,
+        Color::DarkCyan => 6,
+        Color::DarkGrey => 8,
+        Color::Grey => 7,
+        Color::Red => 9,
+        Color::Green => 10,
+        Color::Yellow => 11,
+        Color::Blue => 12,
+        Color::Magenta => 13,
+        Color::Cyan => 14,
+        Color::White => 15,
+        Color::Rgb { r, g, b } => {
+            // 简化 RGB → 256 色(取 6x6x6 立方体索引)
+            let r_idx = if r < 48 { 0 } else { (r - 35) / 40 };
+            let g_idx = if g < 48 { 0 } else { (g - 35) / 40 };
+            let b_idx = if b < 48 { 0 } else { (b - 35) / 40 };
+            let r_idx = r_idx.min(5) as u8;
+            let g_idx = g_idx.min(5) as u8;
+            let b_idx = b_idx.min(5) as u8;
+            16 + 36 * r_idx + 6 * g_idx + b_idx
+        }
+        Color::AnsiValue(v) => v,
+    }
 }
 
 /// 启动 MultiAgentOrchestrator(6 角色);若未配置,使用占位提示信息。

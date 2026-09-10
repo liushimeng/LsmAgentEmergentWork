@@ -539,8 +539,12 @@ async fn main() -> Result<()> {
         match cli.cmd {
             Some(Cmd::Provider(p)) => cmd_provider(p).await,
             None => {
-                if let Some(prompt) = cli.prompt {
-                    run_one_shot(prompt, cli.max_iterations, cli.debug, "-p 单轮").await
+                // 纯函数斜杠命令前置检测(/diff 等不依赖 LLM 的命令在 -p 模式也可直接执行)
+                if let Some(prompt) = &cli.prompt {
+                    if try_run_pure_slash_command(prompt) {
+                        return Ok(());
+                    }
+                    run_one_shot(prompt.clone(), cli.max_iterations, cli.debug, "-p 单轮").await
                 } else if let Some(file_path) = cli.file {
                     run_from_file(file_path, cli.max_iterations, cli.debug).await
                 } else {
@@ -548,5 +552,112 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// 纯函数斜杠命令前置检测与执行。
+///
+/// 部分斜杠命令(如 `/diff`)不依赖 LLM,在 `-p` 单轮模式下也应直接执行,
+/// 无需送入编排器(否则会被当作普通提示词处理)。
+///
+/// 返回 `true` 表示已处理完毕(调用者应直接 return Ok(()));
+/// 返回 `false` 表示非纯函数命令,继续走常规 `-p` 编排流程。
+fn try_run_pure_slash_command(input: &str) -> bool {
+    let trimmed = input.trim();
+    let Some(cmd) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+
+    // 取命令头(第一个空白符前的部分)
+    let head = cmd.split_whitespace().next().unwrap_or("");
+    let rest = cmd[head.len()..].trim();
+
+    match head {
+        "diff" => {
+            // /diff <old_file> <new_file>:并排 diff 两个文件
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() < 2 {
+                println!("  用法: /diff <旧文件路径> <新文件路径>");
+                println!("  示例: /diff a.rs b.rs");
+            } else {
+                let old_path = parts[0];
+                let new_path = parts[1];
+                match lsm_agent::tui::render::diff::diff_files(old_path, new_path) {
+                    Ok(hunk) => {
+                        let rendered = lsm_agent::tui::render::diff::render_diff_hunk(&hunk);
+                        for line_spans in rendered {
+                            print!("  ");
+                            for span in line_spans {
+                                let attrs_ansi = tui_attrs_to_ansi(span.attrs);
+                                print!(
+                                    "\x1b[38;5;{}m{}{}\x1b[0m",
+                                    tui_color_to_ansi256(span.fg),
+                                    attrs_ansi,
+                                    span.text
+                                );
+                            }
+                            println!();
+                        }
+                    }
+                    Err(e) => {
+                        println!("  [diff 错误] 无法读取文件: {e}");
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 把 `theme::attr` 位掩码转换为 ANSI 转义前缀(与 tui/mod.rs 内同名函数保持一致)。
+fn tui_attrs_to_ansi(attrs: u8) -> String {
+    let mut s = String::new();
+    if attrs & lsm_agent::tui::theme::attr::BOLD != 0 {
+        s.push_str("\x1b[1m");
+    }
+    if attrs & lsm_agent::tui::theme::attr::DIM != 0 {
+        s.push_str("\x1b[2m");
+    }
+    if attrs & lsm_agent::tui::theme::attr::UNDERLINED != 0 {
+        s.push_str("\x1b[4m");
+    }
+    if attrs & lsm_agent::tui::theme::attr::REVERSE != 0 {
+        s.push_str("\x1b[7m");
+    }
+    s
+}
+
+/// 把 crossterm Color 转为 ANSI 256 色索引(与 tui/mod.rs 内同名函数保持一致)。
+fn tui_color_to_ansi256(color: crossterm::style::Color) -> u8 {
+    use crossterm::style::Color;
+    match color {
+        Color::Reset => 7,
+        Color::Black => 0,
+        Color::DarkRed => 1,
+        Color::DarkGreen => 2,
+        Color::DarkYellow => 3,
+        Color::DarkBlue => 4,
+        Color::DarkMagenta => 5,
+        Color::DarkCyan => 6,
+        Color::DarkGrey => 8,
+        Color::Grey => 7,
+        Color::Red => 9,
+        Color::Green => 10,
+        Color::Yellow => 11,
+        Color::Blue => 12,
+        Color::Magenta => 13,
+        Color::Cyan => 14,
+        Color::White => 15,
+        Color::Rgb { r, g, b } => {
+            let r_idx = if r < 48 { 0 } else { (r - 35) / 40 };
+            let g_idx = if g < 48 { 0 } else { (g - 35) / 40 };
+            let b_idx = if b < 48 { 0 } else { (b - 35) / 40 };
+            let r_idx = r_idx.min(5) as u8;
+            let g_idx = g_idx.min(5) as u8;
+            let b_idx = b_idx.min(5) as u8;
+            16 + 36 * r_idx + 6 * g_idx + b_idx
+        }
+        Color::AnsiValue(v) => v,
     }
 }

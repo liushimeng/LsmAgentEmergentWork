@@ -36,6 +36,7 @@ walkdir = "2"
 globset = "0.4"
 regex = "1"
 once_cell = "1"
+similar = "2"   # diff 算法(claudecode 同款,纯 Rust,无系统依赖)
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -143,6 +143,8 @@
 - ~~L1045 provider 重试策略~~ ✅ 实际已于 2026-09-08 第 03 轮随 `llm/resilient.rs` 完成(指数退避基数 500ms/倍数 2/上限 8s/±25% jitter/墙钟纳秒种子;账本原「差 jitter」描述过时,第 07 轮勘误)
 - L1046 Route 五层抽象 → 抄 opencode `llm/src/route/client.ts`
 - ~~L1047 Cache Policy 自动注入~~ ✅ 2026-09-09 第 10 轮(`src/llm/cache_policy.rs` + `anthropic.rs` 内化,Anthropic 路径 4 断点 cap 内置,详见 `tmpPlan/2026-09-09_10-L1047-Anthropic-PromptCaching自动注入方案.md`)
+- ~~L1048 反应式 IoC~~ ⛔ 决策不做(deepseek-harness Cordis Epoch 是重度服务端架构,laew 单用户单进程 CLI 无需求)
+- **Diff 渲染 + 语法高亮** ✅ 2026-09-10 第 18 轮(`src/tui/render/{mod,diff,highlight}.rs` + `theme.rs` 追加常量 + `main.rs` /diff 前置处理 + `mod.rs` 围栏高亮集成 + `/diff` 命令,`similar` crate 行级+字符级 diff + 手写 regex 8 类 token 高亮 + `lang_from_fence_tag` 围栏检测 + e2e §4k,7 项全过)
 - L1048 反应式 IoC → 抄 deepseek-harness `vendor/cordis/src/fiber.ts`
 
 ---

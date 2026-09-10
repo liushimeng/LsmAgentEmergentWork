@@ -92,6 +92,64 @@ pub const INPUT_HINT_FG: Color = Color::DarkGrey;
 /// 输入区固定高度(行):分隔线 + 输入行 + 提示行。
 pub const INPUT_AREA_HEIGHT: u16 = 3;
 
+// ============================================================
+// Diff 渲染颜色(D5/L1436-L1445 P0,第十八/十九轮)
+// ============================================================
+
+/// 新增行前景色。
+pub const DIFF_ADDED_FG: Color = Color::Green;
+/// 新增行属性。
+pub const DIFF_ADDED_ATTRS: u8 = attr::BOLD;
+/// 删除行前景色。
+pub const DIFF_REMOVED_FG: Color = Color::Red;
+/// 删除行属性。
+pub const DIFF_REMOVED_ATTRS: u8 = attr::BOLD;
+/// 上下文行前景色。
+pub const DIFF_CONTEXT_FG: Color = Color::DarkGrey;
+/// 行号前景色。
+pub const DIFF_LINE_NO_FG: Color = Color::Cyan;
+/// 行号属性。
+pub const DIFF_LINE_NO_ATTRS: u8 = attr::DIM;
+/// diff 标题(/diff 命令输出路径行)前景色。
+pub const DIFF_HEADER_FG: Color = Color::Yellow;
+/// diff 标题属性。
+pub const DIFF_HEADER_ATTRS: u8 = attr::BOLD;
+/// 新增行内字符级变更背景色。
+pub const DIFF_ADDED_CHAR_BG: Color = Color::DarkGreen;
+/// 删除行内字符级变更背景色。
+pub const DIFF_REMOVED_CHAR_BG: Color = Color::DarkRed;
+
+// ============================================================
+// 语法高亮 token 颜色(D10/L1641-L1700 P0,第十九轮)
+// ============================================================
+
+/// 关键字(if/for/fn/let/def/class/...)前景色。
+pub const HL_KEYWORD_FG: Color = Color::Magenta;
+/// 关键字属性。
+pub const HL_KEYWORD_ATTRS: u8 = attr::BOLD;
+/// 字符串前景色。
+pub const HL_STRING_FG: Color = Color::Green;
+/// 数字前景色。
+pub const HL_NUMBER_FG: Color = Color::Yellow;
+/// 注释前景色。
+pub const HL_COMMENT_FG: Color = Color::DarkGrey;
+/// 注释属性。
+pub const HL_COMMENT_ATTRS: u8 = attr::DIM;
+/// 类型(struct/enum/大写标识符)前景色。
+pub const HL_TYPE_FG: Color = Color::Cyan;
+/// 类型属性。
+pub const HL_TYPE_ATTRS: u8 = attr::BOLD;
+/// 函数调用/定义前景色。
+pub const HL_FUNCTION_FG: Color = Color::Blue;
+/// 函数属性。
+pub const HL_FUNCTION_ATTRS: u8 = attr::BOLD;
+/// 操作符前景色。
+pub const HL_OPERATOR_FG: Color = Color::White;
+/// 标点符号前景色。
+pub const HL_PUNCTUATION_FG: Color = Color::Reset;
+/// 默认文本前景色。
+pub const HL_PLAIN_FG: Color = Color::Reset;
+
 /// 把 API Key 末 4 位脱敏展示;长度不足时退化为 `****`。
 pub fn mask_key(s: &str) -> String {
     let tail: String = if s.chars().count() >= 4 {
