@@ -2,9 +2,11 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **55 维度 × 10 个 = 550 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **67 维度 × 10 个 = 670 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
-编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD
+编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
+手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
+疑难 Bug 攻坚、文件格式解析、编程冷知识、跨平台电脑使用、设计系统
 等多个角度，**无重复主题**。
 
 ## 用途
@@ -76,6 +78,18 @@ docs/自动化测试-提示词文件列表/
   53-软件供应链与SBOM工程.md                ← 供应链攻击/SBOM标准/CVE监控/制品签名/SLSA/License合规/私有仓库/可复现构建/应急响应
   54-技术写作与知识沉淀.md                  ← 金字塔原理/ADR/API文档/Runbook/Engineering Wiki/RFC/技术博客/演讲/注释即文档/工具链
   55-领域驱动设计DDD专题.md                  ← 通用语言/限界上下文/Context Map/聚合根/值对象/领域服务/领域事件/仓储/事件风暴/团队转型
+  56-从零手写Unix命令行工具集.md             ← 手写 cat/ls/wc/grep/find/tree/du/xargs/diff/watch，每条复刻一个经典命令
+  57-经典小游戏复刻与游戏编程实战.md         ← 俄罗斯方块/扫雷/2048/推箱子/五子棋AI/生命游戏/打砖块/MUD/数独/塔防
+  58-从零造轮子经典系统复刻.md               ← 迷你 Redis/Git/Docker/HTTP服务器/JSON解析器/正则引擎/虚拟机/数据库/协程/编辑器
+  59-小众与新兴编程语言巡礼.md               ← Nim/Crystal/Julia/R/Scala3/OCaml+F#/Erlang/Racket/Fortran+COBOL/Odin+V+Gleam
+  60-编辑器插件开发与开发环境定制.md         ← VSCode扩展/LSP接入/Neovim配置/JetBrains插件/自制LSP/dotfiles/Shell定制/字体/DevContainer/键位
+  61-企业业务系统开发实战.md                 ← 进销存/工单/OA审批流/RBAC/报表引擎/多租户SaaS/CRM/考勤排班/低代码表单/对账结算
+  62-桌面小工具软件开发实战.md               ← 截图标注/剪贴板管理/番茄钟/批量重命名GUI/看图/音乐播放器/密码管理器/串口助手/笔记本/监控挂件
+  63-疑难Bug攻坚与故障排查实录.md            ← 段错误/内存泄漏/死锁/数据竞争/生产OOM/CPU打满/fd泄漏/时钟时区/乱码/变更归因
+  64-文件格式解析与序列化编程.md             ← PNG/ZIP/WAV/xlsx/Protobuf/CBOR+MessagePack/SQLite文件格式/CSV方言/YAML+TOML/自定义二进制协议
+  65-编程冷知识与为什么十问.md               ← 浮点/UTF-8/时间/大小端/随机数与UUID/排序稳定性/下标从0/null/删文件/"我机器上能跑"
+  66-跨平台电脑使用与虚拟化实战.md           ← PowerShell/WSL2/macOS/虚拟机/远程桌面/NAS共享/外设排障/分区与数据恢复/系统迁移/双系统引导
+  67-设计系统与组件库工程实战.md             ← Design Token/组件API/暗色主题/图标系统/栅格响应式/排版系统/动效规范/表单规范/图表规范/组件库治理
 ```
 
 ## 编号规则
@@ -137,6 +151,18 @@ docs/自动化测试-提示词文件列表/
 | BB01–BB10 | 软件供应链与 SBOM 工程 | 供应链攻击/SBOM标准/CVE监控/制品签名/SLSA/License合规/私有仓库/可复现构建/应急响应 | medium~hard |
 | BC01–BC10 | 技术写作与知识沉淀 | 金字塔原理/ADR/API文档/Runbook/Engineering Wiki/RFC/技术博客/演讲/注释即文档/工具链 | simple~medium |
 | BD01–BD10 | 领域驱动设计 DDD 专题 | 通用语言/限界上下文/Context Map/聚合根/值对象/领域服务/领域事件/仓储/事件风暴/团队转型 | medium~hard |
+| BE01–BE10 | 从零手写 Unix 命令行工具集 | cat/ls/wc/grep/find/tree/du/xargs/diff/watch 逐个复刻实现 | medium 为主 |
+| BF01–BF10 | 经典小游戏复刻与游戏编程实战 | 俄罗斯方块/扫雷/2048/推箱子/五子棋AI/生命游戏/打砖块/MUD/数独/塔防 | medium~hard |
+| BG01–BG10 | 从零造轮子：经典系统复刻 | 迷你 Redis/Git/Docker/HTTP服务器/JSON解析器/正则引擎/虚拟机/数据库/协程/编辑器 | hard 为主 |
+| BH01–BH10 | 小众与新兴编程语言巡礼 | Nim/Crystal/Julia/R/Scala3/OCaml+F#/Erlang/Racket/Fortran+COBOL/Odin+V+Gleam | medium~hard |
+| BI01–BI10 | 编辑器插件开发与开发环境定制 | VSCode扩展/LSP接入/Neovim/JetBrains插件/自制LSP/dotfiles/Shell定制/字体/DevContainer/键位 | medium 为主 |
+| BJ01–BJ10 | 企业业务系统开发实战 | 进销存/工单/审批流/RBAC/报表引擎/多租户SaaS/CRM/考勤排班/低代码表单/对账结算 | medium~hard |
+| BK01–BK10 | 桌面小工具软件开发实战 | 截图标注/剪贴板/番茄钟/批量重命名/看图/音乐播放器/密码管理器/串口助手/笔记本/监控挂件 | medium~hard |
+| BL01–BL10 | 疑难 Bug 攻坚与故障排查实录 | 段错误/内存泄漏/死锁/数据竞争/生产OOM/CPU打满/fd泄漏/时钟时区/乱码/变更归因 | medium~hard |
+| BM01–BM10 | 文件格式解析与序列化编程 | PNG/ZIP/WAV/xlsx/Protobuf/CBOR/SQLite文件格式/CSV方言/YAML+TOML/自定义二进制协议 | medium~hard |
+| BN01–BN10 | 编程冷知识与「为什么」十问 | 浮点/UTF-8/时间/大小端/随机数与UUID/排序稳定性/下标从0/null/删文件/环境差异 | simple~medium |
+| BO01–BO10 | 跨平台电脑使用与虚拟化实战 | PowerShell/WSL2/macOS/虚拟机/远程桌面/NAS/外设排障/分区与数据恢复/系统迁移/双系统 | simple~medium |
+| BP01–BP10 | 设计系统与组件库工程实战 | Design Token/组件API/暗色主题/图标系统/栅格/排版/动效/表单规范/图表规范/组件库治理 | medium 为主 |
 
 ## 每条提示词的字段
 
@@ -177,7 +203,7 @@ docs/自动化测试-提示词文件列表/
 
 ## 维护约定
 
-- 新增主题时**先检索本库 510 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/BC/BD/BE…）。
+- 新增主题时**先检索本库 670 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…）。
 - 修改 laew 功能后（如新增工具、改档位策略），同步修订受影响条目的「预期档位」。
 - 每组提示词控制在 3~5 轮；后轮必须与前轮有显式承接关系，保证"多轮"语义成立。
 - 实测发现某条实际档位与预期不符时，先记录现象（写入 testReport/ 验证报告），
