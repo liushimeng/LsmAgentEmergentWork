@@ -578,14 +578,21 @@ impl InputHandler {
                             }
                         }
                         KeyCode::Esc => {
-                            // Esc: 关闭补全浮层
+                            // Esc: 关闭补全浮层;非命令输入时清空输入(对齐 bash Esc 语义)
                             if completion_active {
+                                // 补全浮层当前可见:关闭浮层,保留输入
                                 overlay_lines =
                                     self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
                                 completion_active = false;
                                 completion_items.clear();
                                 self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
+                            } else if !buffer.is_empty() && !buffer.trim_start().starts_with('/') {
+                                // 非命令输入(不以 / 开头):清空输入缓冲区
+                                buffer.clear();
+                                cursor = 0;
+                                self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
                             }
+                            // 命令输入(以 / 开头)且补全未激活时:保留输入(用户可能想按 Enter 提交)
                         }
                         KeyCode::Up => {
                             // 上箭头：在补全列表中向上移动
@@ -848,7 +855,7 @@ impl InputHandler {
                 Clear(ClearType::CurrentLine),
                 SetForegroundColor(theme::INPUT_HINT_FG),
                 Print(fit_width(
-                    "  ↑↓ 选择补全  Enter 补全并提交  Tab 仅补全  Esc 关闭补全  Ctrl-D 退出  /help 帮助",
+                    "  ↑↓ 选择补全  Enter 补全并提交  Tab 仅补全  Esc 关闭补全/清行  Ctrl-D 退出  /help 帮助",
                     layout.cols,
                 )),
                 ResetColor,
