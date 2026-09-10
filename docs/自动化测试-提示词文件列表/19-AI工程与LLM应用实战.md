@@ -16,6 +16,7 @@ R 考察"浏览器端与全栈 Web 工程实现"，
 ---
 
 ### S01 用 OpenAI / Anthropic API 开发对话机器人
+- **测试状态**: ✅ 已测试 (S01_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通, 详见 `tmpPlan/2026-09-10_05-A02-E03-L02-S01-C05-自动化测试与hard任务Plan解析Bug修复方案.md`)
 - **预期档位**: medium
 - **考察维度**: LLM API 集成 + 流式响应 + 多轮上下文
 - **对话脚本**:

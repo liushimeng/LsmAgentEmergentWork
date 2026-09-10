@@ -30,6 +30,7 @@
 - **实测状态**: ✅ 通过（2026-09-10，mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通，TUI 主屏中文显示 / `[QC] ✅ 通过` / `[trace] iter=1 tools=0` / `[session_context 摘要]` / `本次用量` 全部正常，详见 `tmpPlan/2026-09-10_05-D08-E02-测试与TUI用量显示Bug修复方案.md`）
 
 ### E03 代码审查（Code Review）
+- **测试状态**: ✅ 已测试 (E03_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通, 详见 `tmpPlan/2026-09-10_05-A02-E03-L02-S01-C05-自动化测试与hard任务Plan解析Bug修复方案.md`)
 - **预期档位**: medium
 - **考察维度**: 代码质量评估 + 改进建议
 - **对话脚本**:

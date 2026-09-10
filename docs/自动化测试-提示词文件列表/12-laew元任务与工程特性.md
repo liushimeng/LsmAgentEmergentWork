@@ -21,6 +21,7 @@ TUI 自动化、调试模式、记忆系统、错误恢复、配置管理、版�
   4. 讨论：e2e 测试的 mock LLM 是怎么工作的？如果要新增一个测试用例，应该改哪里？
 
 ### L02 多 Agent 编排验证
+- **测试状态**: ✅ 已测试 (L02_q1.md, 通过 — mock 链路 Yolo→Plan→Main-Work→SubAgent→QC→SessionContext 完整跑通, 发现并修复 Plan 解析 Bug, 详见 `tmpPlan/2026-09-10_05-A02-E03-L02-S01-C05-自动化测试与hard任务Plan解析Bug修复方案.md`)
 - **预期档位**: hard
 - **考察维度**: 触发完整多 Agent 流程
 - **对话脚本**:

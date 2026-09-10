@@ -264,8 +264,22 @@ fn extract_standalone_json(text: &str) -> Option<&str> {
     end.map(|e| &text[start..e])
 }
 
-/// 从 Plan Markdown 提取 WorkFlow 列表(基于 `## 二、WorkFlow 拆解` 段)。
+/// 从 Plan Markdown 提取 WorkFlow 列表。
+///
+/// 双通道解析:
+/// 1) JSON 代码块兜底(兼容 Plan Agent 直接输出 JSON 的场景)
+/// 2) Markdown 行级解析(基于 `## 二、WorkFlow 拆解` 段的 `### WorkFlow N:` 块)
 pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
+    // 0) 兜底:尝试从 JSON 代码块解析(兼容 Plan Agent 输出 JSON 代码块格式的场景)
+    // 关联修复: 2026-09-10 hard 任务 Plan 解析 Bug — Plan Agent 输出 JSON 代码块,
+    // 但 parse_plan_markdown 只支持 markdown 行级格式,导致解析失败触发无意义重试循环。
+    if let Some(json_str) = extract_json_block(content) {
+        if let Ok(plan) = serde_json::from_str::<WorkFlowPlan>(json_str) {
+            if !plan.workflows.is_empty() {
+                return Ok(plan);
+            }
+        }
+    }
     // 简单行级解析:查找 `### WorkFlow N:` 块,提取 acceptance / 依赖
     let mut workflows = Vec::new();
     let mut in_workflows_section = false;
@@ -530,5 +544,22 @@ mod tests {
         assert_eq!(plan.workflows[0].id, "wf-1");
         assert_eq!(plan.workflows[0].steps.len(), 2);
         assert_eq!(plan.workflows[1].depends_on, vec!["wf-1"]);
+    }
+
+    /// 验证 parse_plan_markdown 支持 JSON 代码块格式(兜底解析)。
+    /// 关联修复: 2026-09-10 hard 任务 Plan 解析 Bug。
+    #[test]
+    fn parse_plan_markdown_supports_json_code_block() {
+        let md = r#"# 方案
+
+```json
+{"workflows": [{"id": "wf-1", "name": "执行验证", "steps": ["运行 echo LAEW_MOCK_OK"], "acceptance": ["输出包含 LAEW_MOCK_OK"], "delegate_to": "subagent"}]}
+```
+"#;
+        let plan = parse_plan_markdown(md).unwrap_or_else(|e| panic!("JSON 代码块解析失败: {e}"));
+        assert_eq!(plan.workflows.len(), 1, "应解析出 1 个 WorkFlow");
+        assert_eq!(plan.workflows[0].id, "wf-1");
+        assert_eq!(plan.workflows[0].name, "执行验证");
+        assert_eq!(plan.workflows[0].steps.len(), 1);
     }
 }
