@@ -35,11 +35,46 @@ use resilient::{ResilientLlmClient, CONNECT_TIMEOUT};
 /// 统一的 HTTP 客户端构造入口:注入连接超时(防连接挂起导致 TUI 冻结)。
 ///
 /// 流式阶段的 idle / 总超时见 [`sse::stream_chunks`]。
-pub fn build_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .expect("reqwest Client 构建失败")
+///
+/// TLS 校验策略(自签名证书适配,2026-09-10,见
+/// `docs/自签名证书TLS适配/01-设计与解决方案.md`):
+/// 命中宽松策略(IP 主机自动 / `LAEW_TLS_INSECURE=1` 全局)时跳过证书校验,
+/// 使 IP + 自签名证书的内网/自建网关 HTTPS API 可直接使用;rustls 纯 Rust
+/// 实现保证 Windows / macOS / CentOS / Ubuntu 行为一致。
+pub fn build_http_client(end_point: &str) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+    if tls_insecure_for(end_point) {
+        // rustls 后端下同时跳过证书链与主机名校验;仅跳过校验,TLS 加密不降级。
+        builder = builder.danger_accept_invalid_certs(true);
+        tracing::warn!(
+            "TLS 证书校验已放宽(LAEW_TLS_INSECURE 或 IP 主机自动策略):{end_point}"
+        );
+    }
+    builder.build().expect("reqwest Client 构建失败")
+}
+
+/// 三级 TLS 校验策略判定:
+///
+/// - `LAEW_TLS_INSECURE=1/true/yes/on` → 全局宽松(所有 endpoint 跳过校验);
+/// - `LAEW_TLS_INSECURE=0/false/no/off` → 全局严格(安全基线);
+/// - 未设置(默认)→ 自动模式:endpoint 主机为 IP 地址(IPv4/IPv6)时放宽,
+///   域名主机仍严格校验(IP 直连的 HTTPS 服务几乎只能是自签名证书)。
+pub fn tls_insecure_for(end_point: &str) -> bool {
+    match std::env::var("LAEW_TLS_INSECURE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => endpoint_host_is_ip(end_point),
+    }
+}
+
+/// 判定 endpoint 主机是否为 IP 字面量(IPv4 / IPv6,含 `[::1]` 写法)。
+fn endpoint_host_is_ip(end_point: &str) -> bool {
+    let Ok(u) = url::Url::parse(end_point) else {
+        return false;
+    };
+    matches!(u.host(), Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)))
 }
 
 /// 解析 `Retry-After` 头(仅支持 delta-seconds;HTTP-date 形式少见,忽略)。
@@ -417,5 +452,46 @@ mod tests {
             "FALLBACK",
             "纯空白 UA 应视为空,回退默认"
         );
+    }
+
+    // ========== 自签名证书 TLS 适配(2026-09-10) ==========
+
+    #[test]
+    fn endpoint_host_is_ip_detects_ip_literals() {
+        assert!(endpoint_host_is_ip("https://8.130.85.252:29003/Anthropic"));
+        assert!(endpoint_host_is_ip("https://127.0.0.1:8443"));
+        assert!(endpoint_host_is_ip("https://[::1]:8443/v1"));
+        assert!(endpoint_host_is_ip("http://192.168.1.10"));
+    }
+
+    #[test]
+    fn endpoint_host_is_ip_rejects_domains_and_bad_urls() {
+        assert!(!endpoint_host_is_ip("https://api.anthropic.com"));
+        assert!(!endpoint_host_is_ip("https://example.com:8443/v1"));
+        assert!(!endpoint_host_is_ip("not-a-url"));
+        assert!(!endpoint_host_is_ip(""));
+    }
+
+    #[test]
+    fn tls_insecure_auto_mode_relaxes_only_ip_hosts() {
+        // 未设置环境变量 → 自动模式:IP 放宽 / 域名严格
+        std::env::remove_var("LAEW_TLS_INSECURE");
+        assert!(tls_insecure_for("https://8.130.85.252:29003"));
+        assert!(!tls_insecure_for("https://api.anthropic.com"));
+    }
+
+    #[test]
+    fn tls_insecure_env_overrides_auto_mode() {
+        // 全局宽松
+        std::env::set_var("LAEW_TLS_INSECURE", "1");
+        assert!(tls_insecure_for("https://api.anthropic.com"));
+        std::env::set_var("LAEW_TLS_INSECURE", "true");
+        assert!(tls_insecure_for("https://api.anthropic.com"));
+        // 全局严格(即使 IP 主机也不放宽)
+        std::env::set_var("LAEW_TLS_INSECURE", "0");
+        assert!(!tls_insecure_for("https://8.130.85.252:29003"));
+        std::env::set_var("LAEW_TLS_INSECURE", "off");
+        assert!(!tls_insecure_for("https://8.130.85.252:29003"));
+        std::env::remove_var("LAEW_TLS_INSECURE");
     }
 }

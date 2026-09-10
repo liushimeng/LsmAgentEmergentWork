@@ -35,7 +35,7 @@ impl OpenAiClient {
     pub fn new(end_point: &str, api_key: &str, model: &str, user_agent: &str) -> Result<Self> {
         let url = format!("{}/chat/completions", normalize_endpoint(end_point));
         Ok(Self {
-            http: crate::llm::build_http_client(),
+            http: crate::llm::build_http_client(end_point),
             url,
             api_key: api_key.to_string(),
             model: model.to_string(),
