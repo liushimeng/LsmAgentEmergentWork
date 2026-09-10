@@ -393,14 +393,22 @@ def detect_role(body, key):
             )
         else:
             system = ""
+    # 特异性优先匹配(2026-09-10 第 17 轮 P0 修复):
+    # SUB_AGENT_BASE_PROMPT / Quality-Check 等子角色 prompt 在职责描述中会反向引用
+    # 其它 Agent 名字(如 SubAgent 提到"由 Yolo 完成"),导致 mock 的 substring 匹配
+    # 被"父角色名字"截胡,所有子角色调用都被错认为 yolo 角色,污染 STATE[`anth:yolo`]
+    # 进而返回错误的响应(SubAgent 第 1 次本应是 tool_use,实际收到 end_turn+文本)。
+    # 修复:按"角色 prompt 中反向引用其它 Agent 的概率从低到高"排序,
+    # SubAgent-Work / Quality-Check 等子角色名字最特异、引用频次最低,优先匹配。
+    # Yolo 放到最后兜底(它的 prompt 几乎不会提到其它 Agent,匹配兜底安全)。
     for marker, role in [
-        ("LsmAgentEmergentWork-Yolo", "yolo"),
-        ("LsmAgentEmergentWork-Quality-Check", "quality"),
-        ("LsmAgentEmergentWork-Main-Work", "mainwork"),
-        ("LsmAgentEmergentWork-SessionContext", "session"),
-        ("LsmAgentEmergentWork-Plan", "plan"),
-        ("LsmAgentEmergentWork-Compact", "compact"),
         ("LsmAgentEmergentWork-SubAgent-Work", "subagent"),
+        ("LsmAgentEmergentWork-Quality-Check", "quality"),
+        ("LsmAgentEmergentWork-SessionContext", "session"),
+        ("LsmAgentEmergentWork-Compact", "compact"),
+        ("LsmAgentEmergentWork-Plan", "plan"),
+        ("LsmAgentEmergentWork-Main-Work", "mainwork"),
+        ("LsmAgentEmergentWork-Yolo", "yolo"),
     ]:
         if marker in system:
             return role

@@ -37,6 +37,7 @@
   4. 给出重构建议，让代码更易读、更易维护。
 
 ### E04 数据结构与算法
+- **测试状态**: ✅ 已测试 (E04_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通,Debug Report SubAgent trace 显示 `iterations=2 tool_calls=1(ok=1,err=0)`,StopReason 序列正确,详见 `tmpPlan/2026-09-10_01-A10-E04-测试与mock角色识别Bug方案.md`)
 - **预期档位**: medium
 - **考察维度**: 算法实现 + 复杂度分析
 - **对话脚本**:
