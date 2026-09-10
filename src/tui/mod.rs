@@ -52,6 +52,9 @@ pub struct TuiSession {
     pub session_usage: crate::llm::Usage,
     /// 对话分支存储(D3,2026-09-10 第二十四轮):rewind/fork/switch/clear 前自动快照
     pub branches: BranchStore,
+    /// 当前任务开始时间戳(2026-09-10 第 27 轮 F05):handle_normal_prompt 入口
+    /// 设置 Some,print_usage 后清回 None;Some 期间 print_usage 追加「(耗时 Ns)」。
+    pub task_started_at: Option<std::time::Instant>,
 }
 
 impl TuiSession {
@@ -79,6 +82,7 @@ impl TuiSession {
             transcript: Vec::new(),
             session_usage: crate::llm::Usage::default(),
             branches: BranchStore::new(),
+            task_started_at: None,
         })
     }
 
@@ -284,12 +288,18 @@ impl TuiSession {
             collector.reset(self.session.id());
         }
         println!("  [orchestrator 调度中... Ctrl-C 取消]");
+        // 任务开始时间戳(2026-09-10 第 27 轮 F05 / tmpPlan/2026-09-10_22):
+        // 用于在「本次用量」行末尾追加总耗时,便于用户感知 LLM 响应速度。
+        self.task_started_at = Some(std::time::Instant::now());
         // 阶段进度打印协程(2026-09-10 第 23 轮,D05/D07 测试轮 + 第 26 轮 F05/C06):
         // - 阶段切换:收到消息挂起 1.5s 再显示;任务快速完成(所有发送端 drop → recv
         //   返回 None)时挂起消息直接丢弃 —— mock 级链路零噪音,真实 LLM 长任务稳定可见。
         // - 阶段内 waiting 心跳(2026-09-10 第 26 轮 F05/C06 测试轮):单阶段执行超过
         //   1s 后每秒重写一行 [waiting] 行,显示 spinner + 已等待秒数;30s 加「响应较慢」
         //   提示,60s 加「Ctrl-C 取消」提示;阶段切换时自动擦除旧行不留痕迹。
+        // - 2026-09-10 第 27 轮 F05 测试轮(F05_p1.md / tmpPlan/2026-09-10_22):
+        //   提交后立刻打印初始 spinner(无 stage 文字,只 ⠋ (0s)),消除前 1.5s 的空窗;
+        //   真实 LLM 慢场景下用户不再感觉「卡了」。
         let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
         let stage_printer = tokio::spawn(async move {
@@ -298,10 +308,16 @@ impl TuiSession {
             let tick = std::time::Duration::from_millis(1000);
             // 队列语义:同批到达的阶段消息(如 Yolo 分类 + SubAgent 启动)整批冲刷,
             // 不互相覆盖;通道关闭(任务结束)早于计时器触发时全部丢弃。
+            // 2026-09-10 第 27 轮 F05:启动后 1.5s hold 仍生效,目的是让快速任务(mmock < 1s 完成)
+            // 阶段消息直接被静默丢弃,屏幕零噪音。真实慢任务场景下,初始 spinner 立刻占位
+            // 1.5s 空窗;阶段消息在 hold 窗口外到达才打印(原 hold 语义不变)。
             let mut queue: std::collections::VecDeque<String> = Default::default();
-            let mut idle = Box::pin(tokio::time::sleep(hold));
+            let mut idle = Box::pin(tokio::time::sleep(tick));
             // 当前阶段的 waiting 心跳状态:None 表示无活动阶段
             let mut current_stage: Option<(String, std::time::Instant)> = None;
+            // 初始 spinner 状态:协程启动后立刻打印 ⠋ (0s) 占位,收到第一条
+            // 阶段消息时清掉 + 进入正常 stage/waiting 心跳。
+            let mut initial_spinner_active: bool = true;
             let mut spinner_idx: usize = 0;
             // Braille Pattern 字符集(Braille spinner,宽 1,绝大多数 Unicode 终端可见)
             const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -324,12 +340,22 @@ impl TuiSession {
                 }
             };
 
+            // 启动时立即打印初始 spinner 占位,占满 1.5s 空窗(2026-09-10 第 27 轮 F05)。
+            // 用 \r 开头 + 不换行,后续 rewrite_waiting_line(\r) 可在同一行原地刷新;
+            // 收尾时用整行清除(\r\x1b[K)即可擦掉,不会留下残影。
+            if stdout_is_tty {
+                let _ = std::io::stdout().write_all(b"\r  [waiting] \xe2\xa0\x8b  (0s)\x1b[K");
+                let _ = std::io::stdout().flush();
+            }
+
             loop {
                 tokio::select! {
                     maybe = stage_rx.recv() => match maybe {
                         Some(line) => {
-                            // 阶段切换:擦除旧 waiting 行 + 打印 stage 行 + 记录新阶段
-                            if current_stage.is_some() {
+                            // 阶段切换:有 current_stage 时清除旧 waiting 行;
+                            // 初始 spinner(独占 line 1)不在这里清除 — 让它继续转动直到
+                            // 队列真正 flush 时与 [stage](line 2)共存,视觉上"加载条+阶段名"双行。
+                            if !initial_spinner_active && current_stage.is_some() {
                                 clear_waiting_line(stdout_is_tty);
                             }
                             if queue.is_empty() {
@@ -338,16 +364,36 @@ impl TuiSession {
                             queue.push_back(line);
                         }
                         None => {
-                            // 任务结束:清除 waiting 行,丢弃未显示的快速阶段
-                            if current_stage.is_some() {
+                            // 任务结束:清除 waiting 行 / 初始 spinner,丢弃未显示的快速阶段
+                            if initial_spinner_active {
+                                if stdout_is_tty {
+                                    let _ = std::io::stdout().write_all(b"\r\x1b[K");
+                                    let _ = std::io::stdout().flush();
+                                }
+                            } else if current_stage.is_some() {
                                 clear_waiting_line(stdout_is_tty);
                             }
                             break;
                         }
                     },
                     _ = &mut idle => {
-                        // 阶段切换 flush + 启动新阶段 waiting 心跳
+                        // 阶段切换 flush:从队列里取出所有到达的阶段消息,println 出 [stage] 行。
+                        // 初始 spinner(若还活着)在这里一并清掉,腾出 line 1 让 [stage] 写;
+                        // 但 \r\x1b[K 后光标仍在 line 1 起点,println 默认换行追加,所以 [stage]
+                        // 会出现在 line 1(从空覆盖到 stage)+ 后续内容,无需光标管理。
+                        let mut should_clear_initial = false;
+                        if initial_spinner_active && !queue.is_empty() {
+                            should_clear_initial = true;
+                        }
                         while let Some(line) = queue.pop_front() {
+                            if should_clear_initial {
+                                if stdout_is_tty {
+                                    let _ = std::io::stdout().write_all(b"\r\x1b[K");
+                                    let _ = std::io::stdout().flush();
+                                }
+                                should_clear_initial = false;
+                                initial_spinner_active = false;
+                            }
                             println!("  [stage] {line}");
                             let _ = std::io::stdout().flush();
                             current_stage = Some((line, std::time::Instant::now()));
@@ -367,6 +413,13 @@ impl TuiSession {
                             let line = format!(
                                 "  [waiting] {stage}  {frame}  ({elapsed}s){slow_warn}"
                             );
+                            rewrite_waiting_line(stdout_is_tty, &line);
+                            idle.as_mut().reset(tokio::time::Instant::now() + tick);
+                        } else if initial_spinner_active {
+                            // 仍在初始占位阶段:每秒更新 spinner 字符(秒数固定 0)
+                            let frame = SPINNER[spinner_idx % SPINNER.len()];
+                            spinner_idx += 1;
+                            let line = format!("  [waiting] {frame}  (0s)");
                             rewrite_waiting_line(stdout_is_tty, &line);
                             idle.as_mut().reset(tokio::time::Instant::now() + tick);
                         } else {
@@ -413,7 +466,9 @@ impl TuiSession {
                 Some((OutcomeKind::DirectAnswer, text.clone(), *usage))
             }
             Ok(OrchestrationOutcome::Executed { result }) => {
-                let text = format_task_result(result, &self.paths);
+                // print_task_result 内部从 self.task_started_at.take() 取值后拼接耗时,
+                // 这里先 format 一份给 transcript 使用,不再重复 take(避免耗时被吃掉)。
+                let text = format_task_result(result, &self.paths, self.task_started_at);
                 self.print_task_result(result);
                 Some((OutcomeKind::Executed, text, result.total_usage))
             }
@@ -524,7 +579,7 @@ impl TuiSession {
         }
     }
 
-    fn print_assistant_text_with_agent(&self, agent_name: &str, text: &str, usage: &crate::llm::Usage) {
+    fn print_assistant_text_with_agent(&mut self, agent_name: &str, text: &str, usage: &crate::llm::Usage) {
         if !text.is_empty() {
             println!();
             println!("  [agent: {agent_name}]");
@@ -534,10 +589,19 @@ impl TuiSession {
             println!("  (模型未返回文本)");
         }
         self.print_usage(usage);
+        // DirectAnswer 路径:print_usage 内部已 take,但作为防御性清空,
+        // 防止某些边界场景(usage 全 0 不进入 println)留下脏值。
+        self.task_started_at = None;
     }
 
-    fn print_task_result(&self, result: &crate::agent::orchestrator::TaskResult) {
-        for line in format_task_result(result, &self.paths).lines() {
+    fn print_task_result(
+        &mut self,
+        result: &crate::agent::orchestrator::TaskResult,
+    ) {
+        // 2026-09-10 第 27 轮 F05:从 self.task_started_at.take() 取任务开始时间,
+        // 拼接到「本次用量」行末尾。take 保证只显示一次,后续命令不带耗时。
+        let started = self.task_started_at.take();
+        for line in format_task_result(result, &self.paths, started).lines() {
             println!("{line}");
         }
     }
@@ -610,7 +674,7 @@ impl TuiSession {
         }
     }
 
-    fn print_usage(&self, usage: &crate::llm::Usage) {
+    fn print_usage(&mut self, usage: &crate::llm::Usage) {
         if usage.input_tokens > 0 || usage.output_tokens > 0 {
             let mut cache = String::new();
             if usage.cache_read_input_tokens > 0 {
@@ -619,10 +683,23 @@ impl TuiSession {
             if usage.cache_creation_input_tokens > 0 {
                 cache.push_str(&format!("  cache_creation={}", usage.cache_creation_input_tokens));
             }
+            // 任务总耗时(2026-09-10 第 27 轮 F05 / tmpPlan/2026-09-10_22):
+            // 从任务提交到 print_usage 调用的 wall-clock 时间,以秒为单位显示,
+            // 便于用户判断 LLM 响应速度;通过 self.task_started_at(任务开始时
+            // 在 handle_normal_prompt 入口捕获)计算。读后立即清空,防止下次 print_usage
+            // (非任务场景,如 /model /provider list 等)误带耗时。
+            let elapsed_str = self
+                .task_started_at
+                .take()
+                .map(|t| format!("  (耗时 {:.2}s)", t.elapsed().as_secs_f64()))
+                .unwrap_or_default();
             println!(
-                "  本次用量: input={}  output={}{}",
-                usage.input_tokens, usage.output_tokens, cache
+                "  本次用量: input={}  output={}{}{}",
+                usage.input_tokens, usage.output_tokens, cache, elapsed_str
             );
+        } else {
+            // 非任务场景(usage 全 0)也清空,防止 /model /provider 等命令误带耗时。
+            self.task_started_at = None;
         }
     }
 
@@ -1212,6 +1289,7 @@ impl TuiSession {
 fn format_task_result(
     result: &crate::agent::orchestrator::TaskResult,
     paths: &Paths,
+    task_started_at: Option<std::time::Instant>,
 ) -> String {
     let mut out = String::new();
     let plan_doc_display = result
@@ -1284,9 +1362,14 @@ fn format_task_result(
         if usage.cache_creation_input_tokens > 0 {
             cache.push_str(&format!("  cache_creation={}", usage.cache_creation_input_tokens));
         }
+        // 任务总耗时(2026-09-10 第 27 轮 F05 / tmpPlan/2026-09-10_22):
+        // 由 print_task_result 调用方从 self.task_started_at.take() 传入,这里直接拼接。
+        let elapsed_suffix = task_started_at
+            .map(|t| format!("  (耗时 {:.2}s)", t.elapsed().as_secs_f64()))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  本次用量: input={}  output={}{}\n",
-            usage.input_tokens, usage.output_tokens, cache
+            "  本次用量: input={}  output={}{}{}\n",
+            usage.input_tokens, usage.output_tokens, cache, elapsed_suffix
         ));
     }
     out

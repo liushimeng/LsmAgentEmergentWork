@@ -79,6 +79,7 @@
 4. ~~**L18 partial JSON 流式解析**(断流时已收部分的语义保全)~~ ✅ 2026-09-10 第二十五轮已完成(`src/agent/partial_json.rs` + `sse.rs` 三级回退,方案 `tmpPlan/2026-09-10_12`);
 5. **L16 schemars 工具参数校验**(工具执行前 fail-fast);
 6. ~~Token 计数 + 上下文自动压缩(第七轮 PromptCaching 专题)~~ ✅ 2026-09-08 第 04 轮已完成(`agent/compact.rs`,方案 `docs/Context设置与自动压缩设计/01-设计与解决方案.md`)。
+7. ~~**TUI 等待体验两项 P2 优化**(第 27 轮 F05 测试轮 / `tmpPlan/2026-09-10_22`)~~ ✅ 2026-09-10 第 27 轮已完成:`TuiSession.task_started_at: Option<Instant>` 字段 + `handle_normal_prompt` 入口设置 + `print_usage`/`format_task_result`/`print_task_result`/`print_assistant_text_with_agent` 统一清空 + 「本次用量」行末尾追加 `(耗时 N.NNs)`;stage_printer 协程启动时立即打印 `\r [waiting] ⠋ (0s)` 占位行,1s 后每秒切换 spinner 字符,直到 hold 1.5s 过期 flush 队列或通道关闭 — 消除提交后 1.5s 空窗;30s/60s 边界触发「响应较慢」/「可 Ctrl-C 取消」提示 35s mock 实测验证;e2e PASS=153 FAIL=3(FAIL 全为预存 cache_policy mock + /export 轮数 pathfmt,与本轮无关);`src/tui/mod.rs` +99/-15。
 
 ## 四-十五、第 15 轮新增 gap（L836-L1035，200 个）
 
