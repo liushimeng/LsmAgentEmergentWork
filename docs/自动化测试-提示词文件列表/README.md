@@ -2,7 +2,7 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **108 维度 × 10 个 = 1080 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **116 维度 × 10 个 = 1160 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
@@ -17,7 +17,9 @@ AR/VR 空间计算、语音交互与对话式 UI、基础设施可观测性与 S
 HTML5 小游戏 Canvas、物理仿真与粒子特效、推荐系统与个性化、地理空间 GIS 地图、
 金融账务量化回测、电商交易营销、压缩编码与数据校验、历法时间与重复规则、
 OJ 在线判题平台、图算法与社交网络分析、**弹性系统与混沌工程实战**、
-**人因工程与软件组织行为学**等多个角度，**无重复主题**。
+**人因工程与软件组织行为学**、**搜索引擎与信息检索工程**、**即时通讯 IM 系统编程**、
+**排版渲染与打印引擎**、**构建系统与编译缓存工程**、**生物信息学与基因数据编程**、
+**音乐编程与音频合成**、**规则引擎与业务决策自动化**、**天文计算与航天编程**等多个角度，**无重复主题**。
 
 ## 用途
 
@@ -141,6 +143,14 @@ docs/自动化测试-提示词文件列表/
   106-图算法应用与社交网络分析.md            ← CSR图存储/PageRank幂迭代/Louvain社区发现/双向BFS社交距离/三种中心性/好友推荐与图嵌入/Feed推拉模式/力导向可视化/知识图谱三元组/Pregel超步计算
   107-弹性系统与混沌工程实战.md              ← 韧性模式六件套/指数退避抖动四式/熔断器三态机/Bulkhead舱壁/Chaos注入矩阵/GameDay红蓝对抗/blameless postmortem五段论/自适应弹性/优雅降级金字塔/DR演练RTO-RPO
   108-人因工程与软件组织行为学.md             ← Conway定律反向利用/Team Topologies四类团队/DORA四指标/SPACE五维度/第二大脑组织记忆飞轮/远程异步writing-first/会议税与决策日志/技术债四象限治理/工程文化与OKR晋升机制
+  109-搜索引擎与信息检索工程.md               ← 倒排索引与压缩/TF-IDF与BM25调参/查询纠错改写/前缀补全Trie/高亮动态摘要/点击日志分析/MAP·NDCG评估/段合并NRT/多字段多语言/SQLite FTS5迷你引擎
+  110-即时通讯IM系统编程实战.md               ← 长连接网关心跳/ACK重传去重/会话内seqid排序/离线消息多端漫游/已读回执未读数/写扩散vs读扩散/历史分页游标/撤回编辑内容审核/Signal协议简化/WebSocket迷你IM
+  111-排版渲染与打印引擎编程.md               ← Knuth-Plass断行/字体度量基线行高/Markdown AST渲染管线/HTML→PDF分页/撤销重做栈/表格列宽跨页/语法高亮引擎/@media print/墨水屏刷新抖动/网格版式自动化
+  112-构建系统与编译缓存工程.md               ← Make依赖图/-MMD头依赖/Ninja并行调度/ccache内容寻址CAS/远程缓存distcc分布式编译/Bazel hermetic沙箱/sysroot交叉编译/deb-rpm打包/构建性能关键路径/inotify watch/手写迷你构建系统
+  113-生物信息学与基因数据编程.md             ← FASTA-FASTQ与Phred质量/Smith-Waterman比对/BLAST种子扩展/de Bruijn图组装/VCF变异检测/NJ系统发育树/PDB结构解析/单细胞RNA-seq管线/Snakemake工作流/基因数据合规
+  114-音乐编程与音频合成实战.md               ← MIDI事件流VLQ/减法合成器ADSR/步进音序器lookahead调度/FFT调音器/onset与BPM估计/和弦进行自动伴奏/五线谱MusicXML渲染/延迟混响失真效果器链/马尔可夫作曲/VST插件宿主
+  115-规则引擎与业务决策自动化.md             ← 规则与代码分离/Rete网络/DMN决策表命中策略/中文规则DSL/保险核保分层/实时风控决策/积分等级状态机/冲突检测优先级/规则版本灰度/手写迷你Rete
+  116-天文计算与航天编程实战.md               ← 赤道地平坐标转换/简化星历/开普勒方程牛顿迭代/日出日落晨昏蒙影/TLE解析SGP4过境预测/星野对齐叠加降噪/凌日光变BLS/NASA开放API/FITS格式WCS/霍曼转移Δv
 ```
 
 ## 编号规则
@@ -255,6 +265,14 @@ docs/自动化测试-提示词文件列表/
 | CX01–CX10 | 图算法应用与社交网络分析 | CSR存储/PageRank/Louvain社区/双向BFS社交距离/中心性/好友推荐图嵌入/Feed推拉/力导向布局/知识图谱/Pregel超步 | medium~hard |
 | CY01–CY10 | 弹性系统与混沌工程实战 | 韧性模式六件套/指数退避抖动四式/熔断器三态机/Bulkhead舱壁/Chaos注入矩阵/GameDay红蓝对抗/blameless postmortem五段论/自适应弹性/优雅降级金字塔/DR演练RTO-RPO | medium~hard |
 | CZ01–CZ10 | 人因工程与软件组织行为学 | Conway定律反向利用/Team Topologies四类团队/DORA四指标/SPACE五维度/第二大脑组织记忆飞轮/远程异步writing-first/会议税与决策日志/技术债四象限治理/工程文化与OKR晋升机制 | simple~hard |
+| DA01–DA10 | 搜索引擎与信息检索工程 | 倒排索引压缩/BM25调参/查询纠错改写/前缀补全Trie/高亮摘要/点击日志/MAP·NDCG评估/段合并/多字段多语言/FTS5迷你引擎 | medium~hard |
+| DB01–DB10 | 即时通讯 IM 系统编程实战 | 长连接心跳/ACK重传去重/seqid排序/离线漫游/已读未读数/写扩散读扩散/历史分页/撤回编辑审核/Signal协议/迷你IM | medium~hard |
+| DC01–DC10 | 排版渲染与打印引擎编程 | Knuth-Plass断行/字体度量/Markdown管线/HTML→PDF/撤销重做栈/表格跨页/语法高亮/打印样式/墨水屏/网格版式 | simple~hard |
+| DD01–DD10 | 构建系统与编译缓存工程 | Make依赖图/Ninja调度/CAS缓存/远程缓存分布式编译/hermetic沙箱/交叉编译/deb-rpm打包/构建剖析/watch脚本/迷你构建系统 | simple~hard |
+| DE01–DE10 | 生物信息学与基因数据编程 | FASTA-FASTQ质量/Smith-Waterman/BLAST种子扩展/de Bruijn组装/VCF变异/NJ建树/PDB结构/单细胞管线/Snakemake/基因合规 | simple~hard |
+| DF01–DF10 | 音乐编程与音频合成实战 | MIDI解析/减法合成/步进音序器/FFT调音器/BPM估计/自动伴奏/五线谱渲染/效果器链/马尔可夫作曲/插件宿主 | medium~hard |
+| DG01–DG10 | 规则引擎与业务决策自动化 | 规则引擎选型/Rete网络/DMN决策表/规则DSL/核保/实时风控/积分等级/冲突检测/版本灰度/迷你Rete | simple~hard |
+| DH01–DH10 | 天文计算与航天编程实战 | 天球坐标转换/简化星历/开普勒方程/日出日落蒙影/TLE与SGP4/星野叠加/凌日BLS/NASA API/FITS格式/霍曼转移 | simple~hard |
 
 ## 每条提示词的字段
 
@@ -295,7 +313,7 @@ docs/自动化测试-提示词文件列表/
 
 ## 维护约定
 
-- 新增主题时**先检索本库 1080 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…，CL 之后用 CM/CN/CO/…，CX 之后用 CY/CZ/DA/…）。
+- 新增主题时**先检索本库 1160 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…，CL 之后用 CM/CN/CO/…，CX 之后用 CY/CZ/DA/…，DH 之后用 DI/DJ/DK/…）。
 - 修改 laew 功能后（如新增工具、改档位策略），同步修订受影响条目的「预期档位」。
 - 每组提示词控制在 3~5 轮；后轮必须与前轮有显式承接关系，保证"多轮"语义成立。
 - 实测发现某条实际档位与预期不符时，先记录现象（写入 testReport/ 验证报告），
