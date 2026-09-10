@@ -31,6 +31,7 @@ TUI 自动化、调试模式、记忆系统、错误恢复、配置管理、版�
   4. 验证 Main-Work → SubAgent → Quality-Check 的完整链路是否执行，各 Agent 的产物是否齐全。
 
 ### L03 上下文压缩触发
+- **测试状态**: ✅ 已测试 (L03_q1, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通; 注意: mock 环境分类为 simple, 预期档位为 hard, 需真实 LLM 回归验证, 详见 `tmpPlan/2026-09-10_21-B08-C06-D10-E02-L03-自动化测试与Yolo分类验证方案.md`)
 - **预期档位**: hard
 - **考察维度**: Compact Agent 自动触发
 - **对话脚本**:

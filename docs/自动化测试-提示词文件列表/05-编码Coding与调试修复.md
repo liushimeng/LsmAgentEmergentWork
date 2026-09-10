@@ -20,6 +20,7 @@
   4. 把代码保存到 `tmpPlan/rs_wc/`，包含完整的 Cargo 项目结构。
 
 ### E02 调试一段错误代码
+- **测试状态**: ✅ 已测试 (E02_q1, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通; 注意: mock 环境分类为 simple, 预期档位为 medium, 需真实 LLM 回归验证, 详见 `tmpPlan/2026-09-10_21-B08-C06-D10-E02-L03-自动化测试与Yolo分类验证方案.md`)
 - **预期档位**: medium
 - **考察维度**: Bug 定位与修复能力
 - **对话脚本**:
