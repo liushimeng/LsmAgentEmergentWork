@@ -38,7 +38,7 @@
 |------|-----|------|---------|---------|
 | L17 | 无 JSON 修复链 | ✅(Tier-1) | `agent/json_repair.rs`(智能引号/全角标点/单引号/裸控制字符/尾逗号/Python 常量,单遍 O(N)+512KB 守卫),接入 `yolo.rs` / `main_work.rs` / `quality.rs` 三处解析点;**刻意不做截断补全**(Quality fail-closed 语义保持,上轮 P0 测试钉死) | 2026-09-08 第 03 轮 |
 | L16 | 无 jsonschema 校验 | ✅(轻量手写) | `agent/tool_schema_validator.rs`(type/required/properties/additionalProperties/enum/minimum/maximum/minLength/maxLength/items 校验子集)+ `error.rs::ToolSchemaValidation`+ `agent/mod.rs` 工具执行前接入 | 2026-09-09 第 08 轮 |
-| L18 | 无 partial JSON 流式解析 | ⏳ | — | — |
+| L18 | 无 partial JSON 流式解析 | ✅(Tier-1.5 结构截断恢复) | `src/agent/partial_json.rs`(单遍 O(N) char 扫描状态机:`in_string`/`escape`/结构栈;trailing string 语义保留未闭合串内容;不完整原子值(截断的 bool/null/数字)丢弃该 pair;512KB 守卫;完全非法 → None);`TRUNCATED_KEY="__truncated__"` 标记让下游感知参数可能不完整;集成到 `src/llm/sse.rs::ParseSink` 的 `ToolCallEnd` + `finish()` in_flight 残留两处,三级回退(完整 JSON → partial JSON → `_raw`);单元测试 20 项 + sse 集成测试 3 项(截断恢复 / 不可恢复回退 / 完整 JSON 不标截断);e2e 无新增失败(基线 3 失败均为 cache_policy/export 预存);方案 `tmpPlan/2026-09-10_12-L18-partial-JSON流式解析与截断工具调用恢复方案.md` | 2026-09-10 第二十五轮 |
 | L19 | Yolo 无结构化输出强制 | ✅(emit 工具 + forced tool_choice) | `src/agent/tools/emit.rs`(SubmitTaskClassification / SubmitQualityReport 输出工具)+ `src/agent/profile.rs`(`AgentProfile.emit_tool` 字段)+ `src/llm/mod.rs`(`RequestMeta.forced_tool`)+ `src/llm/anthropic.rs`(`tool_choice: {"type":"tool","name":X,"disable_parallel_tool_use":true}`)+ `src/llm/openai.rs`(`tool_choice: {"type":"function","function":{"name":X}}`,默认仍 auto)+ `src/llm/resilient.rs`(`looks_like_tool_choice_rejection` + 4xx 拒绝自动降级 auto 重试一次)+ `src/agent/mod.rs`(`run_session_inner` emit 短路终止 + `LAEW_FORCED_TOOLS` 开关 + `forced_tools_enabled`)+ `src/agent/extrace.rs`(`structured_emits` 计数)+ `src/agent/system_prompt/mod.rs`(Yolo/Quality 提示词双通道:工具首选 + 文本 JSON 兜底);单元测试 504 全过(新增 ≥14 项)+ e2e §4j(mock `--forced-tool` / `--reject-tool-choice` 双模式,wire 断言 + 降级断言);方案 `tmpPlan/2026-09-09_13-结构化输出强制通道与forced-tool-choice方案.md` | 2026-09-09 第 13 轮 |
 | L20 | 无跨 provider 归一化 | ⏳ | — | — |
 | L6 | tool_choice 写死 auto | ✅(forced 指名 + 默认 auto 兼容) | 同 L19(`src/llm/anthropic.rs` + `src/llm/openai.rs` wire 注入,默认 None 时 Anthropic 不发 tool_choice / OpenAI 发 "auto" 维持现状) | 2026-09-09 第 13 轮 |
@@ -76,7 +76,7 @@
 1. ~~WorkFlow 同层并行调度(第六轮 SubAgent 并发专题 §2.2 P0)~~ ✅ 2026-09-08 第 05 轮已完成(方案 `tmpPlan/2026-09-08_05-WorkFlow依赖分层与SubAgent自动并行调度方案.md`)。同专题剩余 P0:**取消传播到 SubAgent**(H9 联动)。
 2. ~~截断续接(第六轮多轮对话专题 §2.4 P1-2)~~ ✅ 2026-09-08 第 06 轮已完成(`agent/mod.rs::run_session`,方案 `tmpPlan/2026-09-08_06-自动截断续接与智能续轮方案.md`)。
 3. ~~H9 取消传播~~ ✅ 2026-09-08 第 07 轮已完成(方案 `tmpPlan/2026-09-08_07-取消传播与优雅中断方案.md`)。~~H13 熔断器~~ ✅ 2026-09-09 第 01 轮已完成(方案 `tmpPlan/2026-09-09_01-LLM熔断器自动三态防护方案.md`);
-4. **L18 partial JSON 流式解析**(断流时已收部分的语义保全);
+4. ~~**L18 partial JSON 流式解析**(断流时已收部分的语义保全)~~ ✅ 2026-09-10 第二十五轮已完成(`src/agent/partial_json.rs` + `sse.rs` 三级回退,方案 `tmpPlan/2026-09-10_12`);
 5. **L16 schemars 工具参数校验**(工具执行前 fail-fast);
 6. ~~Token 计数 + 上下文自动压缩(第七轮 PromptCaching 专题)~~ ✅ 2026-09-08 第 04 轮已完成(`agent/compact.rs`,方案 `docs/Context设置与自动压缩设计/01-设计与解决方案.md`)。
 

@@ -270,10 +270,14 @@ impl ParseSink {
             }
             DeltaEvent::ToolCallEnd => {
                 if let Some(call) = self.in_flight.pop_back() {
-                    let arguments: Value = serde_json::from_str(&call.json_buf).unwrap_or_else(|_| {
-                        // 模型偶发返回非严格 JSON,兜底原文
-                        json!({ "_raw": call.json_buf })
-                    });
+                    // 三级回退:完整 JSON → partial JSON(恢复截断字段) → _raw 兜底。
+                    let arguments: Value = serde_json::from_str(&call.json_buf)
+                        .ok()
+                        .or_else(|| {
+                            // 长 tool_call 参数被 max_tokens / 中断截断时,恢复已完成的字段。
+                            crate::agent::partial_json::parse_partial_json_object(&call.json_buf)
+                        })
+                        .unwrap_or_else(|| json!({ "_raw": call.json_buf }));
                     self.tool_calls.push(ToolCallReq {
                         id: call.id,
                         name: call.name,
@@ -303,8 +307,11 @@ impl ParseSink {
         // 也把 in_flight 残留的 tool_calls 尝试 parse 出来,避免丢调用。
         let mut tool_calls = self.tool_calls;
         for call in self.in_flight {
+            // 三级回退:完整 JSON → partial JSON(恢复截断字段) → _raw 兜底。
             let arguments: Value = serde_json::from_str(&call.json_buf)
-                .unwrap_or_else(|_| json!({ "_raw": call.json_buf }));
+                .ok()
+                .or_else(|| crate::agent::partial_json::parse_partial_json_object(&call.json_buf))
+                .unwrap_or_else(|| json!({ "_raw": call.json_buf }));
             tool_calls.push(ToolCallReq {
                 id: call.id,
                 name: call.name,
@@ -494,5 +501,53 @@ mod tests {
         assert_eq!(c.usage.input_tokens, 0);
         assert_eq!(c.usage.output_tokens, 0);
         assert_eq!(c.usage.cache_read_input_tokens, 0);
+    }
+
+    // ========== partial JSON 截断恢复集成测试(L18) ==========
+
+    #[test]
+    fn sink_tool_call_truncated_json_recovers_partial() {
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart { id: "c1".into(), name: "Bash".into() }).unwrap();
+        // 模拟截断:command 完整、timeout 完整、workdir 在字符串中间断流
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":\"git log --oneline -n 50\",".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("\"timeout\":30,\"workdir\":\"/ho".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: Some("max_tokens".into()) }).unwrap();
+        let c = sink.finish().unwrap();
+        assert_eq!(c.tool_calls.len(), 1);
+        let args = &c.tool_calls[0].arguments;
+        let m = args.as_object().unwrap();
+        assert_eq!(m["command"], "git log --oneline -n 50");
+        assert_eq!(m["timeout"], 30);
+        assert_eq!(m["workdir"], "/ho");
+        assert_eq!(m[crate::agent::partial_json::TRUNCATED_KEY], true, "应标记截断");
+    }
+
+    #[test]
+    fn sink_tool_call_unrecoverable_falls_back_to_raw() {
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart { id: "c1".into(), name: "X".into() }).unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("not json at all".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        assert_eq!(c.tool_calls.len(), 1);
+        let m = c.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(m["_raw"], "not json at all");
+    }
+
+    #[test]
+    fn sink_tool_call_complete_json_unchanged() {
+        // 完整 JSON 不应被 partial 路径触碰,也不应标截断
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart { id: "c1".into(), name: "Bash".into() }).unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":\"ls\"}".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: Some("tool_use".into()) }).unwrap();
+        let c = sink.finish().unwrap();
+        let m = c.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(m["command"], "ls");
+        assert!(m.get(crate::agent::partial_json::TRUNCATED_KEY).is_none());
     }
 }

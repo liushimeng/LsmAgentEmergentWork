@@ -21,6 +21,7 @@ pub mod max_tokens_state;
 pub mod memory;
 pub mod orchestrator;
 pub mod overflow;
+pub mod partial_json;
 pub mod permissions;
 pub mod plan;
 pub mod profile;
