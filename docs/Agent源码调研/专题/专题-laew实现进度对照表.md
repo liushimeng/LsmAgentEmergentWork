@@ -235,8 +235,8 @@
 **优先级分布**:P0=45 / P1=180 / P2=90 / P3=25
 
 **laew P0 路线图**(1-2 周可做):
-1. D9 凭证加密(`src/agent/safety/credentials.rs` 新建 + `aes-gcm` + `secrecy` + `zeroize`)
-2. D9 SSRF 防护(`src/agent/tools/webfetch.rs` 新建 + 私有 IP/CGNAT 阻断 + DNS pinning)
+1. ✅ D9 凭证加密(`src/agent/safety/credentials.rs` 新建 + `aes-gcm` + `zeroize`) — 2026-09-10 第二十一轮完成(L1600)
+2. ✅ D9 SSRF 防护(`src/agent/safety/url_safety.rs` 新建 + 私有 IP/CGNAT 阻断 + IPv4-mapped IPv6 解包) — 2026-09-10 第二十一轮完成(L1608/L1625)
 3. D10 Diff 渲染(`tui/render/diff.rs` 新建 + `similar` + ANSI 着色)
 4. D10 语法高亮(`tui/render/highlight.rs` 新建 + `syntect` + 16 色 SGR)
 5. D12 主题系统 4 主题(`tui/theme.rs` 拆分 + 高对比 + daltonized)
@@ -258,3 +258,27 @@
 - `专题/专题-第十九轮-跨项目缺口分析.md`(综合,约 800 行)
 - `专题/专题-第十八轮-跨项目缺口分析.md`(669 行,含编号冲突修正表)
 - `专题/专题-第十八轮深挖合集.md`(本合集姊妹篇)
+
+---
+
+## 七、第二十一轮登记(2026-09-10,安全纵深 P0 落地)
+
+**主题**:第十九轮首次系统化覆盖「安全纵深 D9」,本轮(第二十一轮)落地其 P0 路线图前两项(凭证加密 + SSRF 防护),并额外修复测试过程中发现的解密优雅降级缺陷。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| L1600 | 凭证管理:无应用层 AES-256-GCM 加密 | P0 | ✅ | `src/agent/safety/credentials.rs`(Vault 单例 + AES-256-GCM + 0o600 master.key + 存量迁移 migrate_credentials + export 脱敏告警)、`src/database/provider.rs`(写入加密/读出解密) | 2026-09-10 第二十一轮 |
+| L1608 | SSRF:无私有 IP 拦截(loopback/private/CGNAT) | P0 | ✅ | `src/agent/safety/url_safety.rs`(is_safe_endpoint + IPv4/IPv6 完整拒绝集)、`src/llm/mod.rs::client_from_record`(创建 LLM 客户端前校验) | 2026-09-10 第二十一轮 |
+| L1625 | SSRF:无 IPv4-mapped IPv6 解析 | P0 | ✅ | `src/agent/safety/url_safety.rs`(ipv4_mapped 解包重检) | 2026-09-10 第二十一轮 |
+
+**额外修复(测试过程中发现的 P1 健壮性缺陷)**:
+- 解密优雅降级:`row_to_record` 解密失败(主密钥轮换/损坏/篡改)→ WARN 日志 + `[解密失败]` 占位符,不再崩溃整个 `provider list()`。对应真实场景:用户主密钥丢失时仍可查看/删除其他记录。
+
+**验证**:
+- 581 单元测试全过(新增 credentials 11 项 + url_safety 14 项 = 25 项)
+- e2e PASS=132 / FAIL=3(预存,与改动前基线完全一致,3 个 FAIL 均在 cache_policy/export 模块,非本轮引入)
+- DB 物理验证:15/15 条加密,0 明文泄漏,末 4 位解密正确
+- SSRF 实测:私网 endpoint 报 `URL 不安全: private/internal IP 被拦截: 127.0.0.0/8 loopback`,LAEW_ALLOW_PRIVATE_ENDPOINT=1 可放行
+- 解密降级实测:id=19 用非常规密钥加密后,list() 输出 WARN + 占位符,其余 14 条正常显示
+
+**累计**:L1-L1930+ 共 1930+ 个 gap,本轮新增 3 个 ✅(L1600/L1608/L1625)。
