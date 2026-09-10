@@ -80,6 +80,7 @@
   4. 讨论死锁、竞态条件在这类场景中如何产生，如何避免。
 
 ### E08 性能优化实战
+- **测试状态**: ✅ 已测试 (E08_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通;本轮同时发现并修复 D1 @ 提及 TUI 路径 P0 Bug:Tab 接受 @ 路径补全时,replacement 去掉 @ 前缀导致 dispatch_prompt 看不到 @、附件不展开;同步修复 Tab 路径 replace_range 区间计算错误导致的 @@ 双 @ 残留;详见 `tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md`)
 - **预期档位**: hard
 - **考察维度**: 性能分析 + 优化策略
 - **对话脚本**:
@@ -89,6 +90,7 @@
   4. 介绍 Rust 中常用的性能分析工具（如 perf、flamegraph、criterion）。
 
 ### E09 测试策略设计
+- **测试状态**: ✅ 已测试 (E09_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通;同 E08,D1 修复一并验证;详见 `tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md`)
 - **预期档位**: medium
 - **考察维度**: 测试金字塔 + 测试编写
 - **对话脚本**:
