@@ -2,13 +2,14 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **77 维度 × 10 个 = 770 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **83 维度 × 10 个 = 830 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
 疑难 Bug 攻坚、文件格式解析、编程冷知识、跨平台电脑使用、设计系统、量子计算、机器人 ROS2、
 3D 建模与几何、WebAssembly 边缘、密码学与隐私计算、并行 GPU、函数式编程、编译器后端 LLVM、
-AR/VR 空间计算、语音交互与对话式 UI、基础设施可观测性与 SRE
+AR/VR 空间计算、语音交互与对话式 UI、基础设施可观测性与 SRE、Agent 记忆与上下文工程、
+隐私计算与数据合规工程、边缘计算与离线优先架构、数字孪生与工业 IoT、人机交互与可解释 AI
 等多个角度，**无重复主题**。
 
 ## 用途
@@ -103,6 +104,11 @@ docs/自动化测试-提示词文件列表/
   76-ARVR与空间计算.md                       ← OpenXR生态/SLAM空间定位/渲染ATW-ASW-SSW/多维交互-手柄手势眼动语音/空间锚点持久化/空间音频HRTF/三维UI舒适UX/MR场景理解遮挡/注视点渲染与热节流/WebXR与three.js
   77-语音交互与对话式UI.md                   ← 语音全链路ASR-对话管理-TTS/Whisper-Paraformer流式ASR/VITS-Bert-VITS流式TTS/VAD端点检测/唤醒词Porcupine/对话管理FSM-LLM/语音UX打断修复/SSML情感语音/Voice Agent全双工AEC/多模态Copilot Voice
   78-基础设施可观测性与SRE.md                ← 三大支柱Logs-Metrics-Traces/OpenTelemetry工程化/SLO-SLI错误预算Burn Rate/Incident Management无责复盘/告警疲劳治理/容量规划Little's Law/混沌工程ChaosMesh/Continuous Profiling eBPF/SRE平台工程/Grafana技术栈一站式
+  79-Agent记忆与上下文工程.md               ← 三层记忆STM-LTM-Episodic/Context Engineering七要素/MemGPT虚拟上下文分页/RAG进阶HyDE-ReRank-GraphRAG-Self-RAG/长程一致性/反思机制ReAct-Reflexion-Self-Refine/多Agent共享记忆/记忆压缩/记忆评估LOCOMO
+  80-隐私计算与数据合规工程.md               ← 数据脱敏分级与工程化/差分隐私ε预算/联邦学习横向纵向拆分/GDPR-PIPL-CCPA合规框架对比/同意管理/数据驻留与跨境传输/PETs隐私增强技术选型/数据生命周期治理/Privacy by Design/laew合规升级路径
+  81-边缘计算与离线优先架构.md               ← 离线优先设计哲学/Service Worker生命周期/PWA标准/IndexedDB/CRDT合并算法/Operational Transformation/Edge Runtime架构/边缘AI推理ONNX-TF.js-WebGPU/网络弹性/同步协议ETag-CDC/laew离线优先升级
+  82-数字孪生与工业IoT.md                   ← 数字孪生六维模型/OPC UA工业协议与信息建模/MQTT Sparkplug B/IT-OT融合与协议网关/时序数据库InfluxDB-TimescaleDB/仿真集成Unity-Omniverse/预测性维护异常检测RUL/边缘AI部署蒸馏/工业安全ISA-IEC 62443/laew工业4.0集成
+  83-人机交互与可解释AI.md                   ← 心智模型与AI系统理解/信任校准/可解释AI LIME-SHAP-Attention/决策溯源/算法审计/以人为本AI/人机分工HITL/AI UX模式流式-不确定性-来源-拒绝/协作智能/AI错误恢复3R原则/laew AI UX优化路线
 ```
 
 ## 编号规则
@@ -187,6 +193,11 @@ docs/自动化测试-提示词文件列表/
 | BY01–BY10 | AR/VR 与空间计算 | OpenXR生态/SLAM空间定位/渲染ATW-ASW-SSW/多维交互-手柄手势眼动语音/空间锚点持久化/空间音频HRTF/三维UI舒适UX/MR场景理解遮挡/注视点渲染与热节流/WebXR与three.js | medium~hard |
 | BZ01–BZ10 | 语音交互与对话式 UI | 语音全链路ASR-对话管理-TTS/Whisper-Paraformer流式ASR/VITS-Bert-VITS流式TTS/VAD端点检测/唤醒词Porcupine/对话管理FSM-LLM/语音UX打断修复/SSML情感语音/Voice Agent全双工AEC/多模态Copilot Voice | medium~hard |
 | CA01–CA10 | 基础设施可观测性与 SRE | 三大支柱Logs-Metrics-Traces/OpenTelemetry工程化/SLO-SLI错误预算Burn Rate/Incident Management无责复盘/告警疲劳治理/容量规划Little's Law/混沌工程ChaosMesh/Continuous Profiling eBPF/SRE平台工程/Grafana技术栈一站式 | medium~hard |
+| CA11–CA20 | Agent 记忆与上下文工程 | 三层记忆STM-LTM-Episodic/Context Engineering七要素/MemGPT虚拟上下文分页/RAG进阶HyDE-ReRank-GraphRAG-Self-RAG/长程一致性/反思机制ReAct-Reflexion-Self-Refine/多Agent共享记忆/记忆压缩/记忆评估LOCOMO | medium~hard |
+| CA21–CA30 | 隐私计算与数据合规工程 | 数据脱敏分级与工程化/差分隐私ε预算/联邦学习横向纵向拆分/GDPR-PIPL-CCPA合规框架对比/同意管理/数据驻留与跨境传输/PETs隐私增强技术选型/数据生命周期治理/Privacy by Design/laew合规升级路径 | medium~hard |
+| CA31–CA40 | 边缘计算与离线优先架构 | 离线优先设计哲学/Service Worker生命周期/PWA标准/IndexedDB/CRDT合并算法/Operational Transformation/Edge Runtime架构/边缘AI推理ONNX-TF.js-WebGPU/网络弹性/同步协议ETag-CDC/laew离线优先升级 | medium~hard |
+| CA41–CA50 | 数字孪生与工业 IoT | 数字孪生六维模型/OPC UA工业协议与信息建模/MQTT Sparkplug B/IT-OT融合与协议网关/时序数据库InfluxDB-TimescaleDB/仿真集成Unity-Omniverse/预测性维护异常检测RUL/边缘AI部署蒸馏/工业安全ISA-IEC 62443/laew工业4.0集成 | medium~hard |
+| CA51–CA60 | 人机交互与可解释 AI | 心智模型与AI系统理解/信任校准/可解释AI LIME-SHAP-Attention/决策溯源/算法审计/以人为本AI/人机分工HITL/AI UX模式流式-不确定性-来源-拒绝/协作智能/AI错误恢复3R原则/laew AI UX优化路线 | medium~hard |
 
 ## 每条提示词的字段
 
