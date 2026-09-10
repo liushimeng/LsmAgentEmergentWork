@@ -1087,11 +1087,16 @@ impl TuiSession {
         let screen: Box<dyn crate::tui::engine::Screen> =
             Box::new(ProviderList::new(self.db.clone(), self.paths.clone()));
         enter_alt().map_err(anyhow::Error::from)?;
-        let result = Self::run_screen_loop(screen).await;
+        let toast = Self::run_screen_loop(screen).await?;
         leave_alt().map_err(anyhow::Error::from)?;
+        // Toast 必须在 leave_alt 之后输出,否则会被 alternate screen 切换吞掉
+        // (第三十轮 Bug 修复)
+        if let Some(msg) = toast {
+            println!("  {msg}");
+        }
         // 重建 YoloRunner(可能切换了 use)
         self.rebuild_orchestrator()?;
-        result
+        Ok(())
     }
 
     async fn run_provider_add_screen(&mut self) -> Result<()> {
@@ -1112,10 +1117,14 @@ impl TuiSession {
             on_done,
         ));
         enter_alt().map_err(anyhow::Error::from)?;
-        let result = Self::run_screen_loop(screen).await;
+        let toast = Self::run_screen_loop(screen).await?;
         leave_alt().map_err(anyhow::Error::from)?;
+        // Toast 必须在 leave_alt 之后输出,否则会被 alternate screen 切换吞掉
+        if let Some(msg) = toast {
+            println!("  {msg}");
+        }
         self.rebuild_orchestrator()?;
-        result
+        Ok(())
     }
 
     async fn run_provider_del_screen(&mut self) -> Result<()> {
@@ -1134,16 +1143,27 @@ impl TuiSession {
             -1,
         ));
         enter_alt().map_err(anyhow::Error::from)?;
-        let result = Self::run_screen_loop(screen).await;
+        let toast = Self::run_screen_loop(screen).await?;
         leave_alt().map_err(anyhow::Error::from)?;
+        // Toast 必须在 leave_alt 之后输出,否则会被 alternate screen 切换吞掉
+        if let Some(msg) = toast {
+            println!("  {msg}");
+        }
         self.rebuild_orchestrator()?;
-        result
+        Ok(())
     }
 
     /// 通用子屏循环:渲染 → 读键 → 处理 Outcome。
     /// 屏幕栈:`Vec<Box<dyn Screen>>`,top 是当前屏;`Push` 压栈、`Pop` 出栈。
     /// 当栈清空时退出循环(回到主屏)。
-    async fn run_screen_loop(initial: Box<dyn crate::tui::engine::Screen>) -> Result<()> {
+    ///
+    /// 返回值:`Result<Option<String>>` —— `Some(msg)` 表示子屏触发了
+    /// `Outcome::Toast(msg)`,由调用者在退出 alternate screen 后输出到主屏。
+    /// 第三十轮 Bug 修复:之前在子屏内直接 `println!` 会被 alternate screen
+    /// 切换吞掉,用户看不到任何反馈。
+    async fn run_screen_loop(
+        initial: Box<dyn crate::tui::engine::Screen>,
+    ) -> Result<Option<String>> {
         use crate::tui::engine::{present, read_key, Frame, Outcome, Rect};
 
         let mut stack: Vec<Box<dyn crate::tui::engine::Screen>> = Vec::new();
@@ -1174,18 +1194,17 @@ impl TuiSession {
                     stack.push(new_screen);
                 }
                 Outcome::Toast(msg) => {
-                    // Toast:弹出现有屏栈,在主屏展示消息。
-                    // 适合"操作成功/失败"的反馈,用户能立即看到。
+                    // Toast:弹出现有屏栈,把消息回给调用者,在主屏上下文打印。
+                    // 修复点:不在 alt screen 内 println,避免被 leave_alt 吞掉。
                     while let Some(mut s) = stack.pop() {
                         s.on_exit();
                     }
-                    println!("  {msg}");
-                    break;
+                    return Ok(Some(msg));
                 }
                 Outcome::Quit => std::process::exit(0),
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
