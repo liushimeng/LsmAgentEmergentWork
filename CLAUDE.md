@@ -65,7 +65,9 @@ tui/
   engine.rs    CLI 渲染引擎 —— Screen trait + Frame + 全量重绘 present
   form.rs      通用 Tab 表单状态机(被 ProviderForm 屏复用)
   input.rs     单行输入(主屏用):含行内提示 + 补全(crossterm 原始模式)
-  completion.rs 斜杠命令补全引擎
+  completion.rs 斜杠命令补全引擎(内置 + 自定义命令动态注册)
+  commands.rs   自定义斜杠命令(D2):两级目录发现/frontmatter/占位符渲染
+  export.rs     会话导出(D8):transcript 记录 + Markdown/JSON 落盘
   theme.rs     ANSI 颜色 / mask_key 脱敏 集中管理
   screen/
     provider_list.rs   /provider list —— Tab 化展示 + 操作按钮
@@ -113,7 +115,13 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 | `/clear` (c)      | 清空对话历史，开启新 Session     |
 | `/new` (n)        | 同 `/clear`（开启新 Session）    |
 | `/model`          | 显示当前模型                     |
+| `/export [path]`  | 导出当前会话为 Markdown（`.json` 后缀导出 JSON）；默认落工作目录 `laew-export-{时间戳}.md`，同名冲突自动 `-1` 后缀，显式路径已存在拒绝覆盖 |
+| `/commands`       | 列出已加载的自定义斜杠命令与来源 |
 | `/provider`       | 管理接入记录（默认进入 list 屏） |
+
+### 自定义斜杠命令（D2，2026-09-10）
+
+Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/commands/*.md` + **用户级** `~/.laew/commands/*.md`（同名用户级优先；内置命令不可遮蔽）。frontmatter 支持 `description` / `argument-hint`（缺失时描述取正文首行截 60 字符）；模板占位符 `$ARGUMENTS`（全量参数）与 `$1`-`$9`（位置参数，`$10` 原样保留）；无占位符但带参调用时末尾追加 `ARGUMENTS:` 块。补全列表内置在前、自定义在后，每行输入前自动重扫（命令文件增删即时生效）。实现见 `src/tui/commands.rs`，方案 `tmpPlan/2026-09-10_01-自定义斜杠命令与会话导出方案.md`。会话导出（D8）transcript 记录在 TUI 层（不动主 Session 上下文），实现见 `src/tui/export.rs`。
 
 ### `/provider` 系列交互
 

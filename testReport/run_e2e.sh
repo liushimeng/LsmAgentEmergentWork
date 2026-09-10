@@ -765,6 +765,35 @@ echo "$OUT" | grep -q "Session"; check $? "TUI 横幅显示 Session ID"
 echo "$OUT" | grep -q "provider add"; check $? "/help 输出命令指南"
 echo "$OUT" | grep -q "开启新会话\|已开启新会话"; check $? "/new 命令生效"
 
+# --- 7b. 自定义斜杠命令 + 会话导出(D2/D8,2026-09-10 第 17 轮) ---
+section "7b. 自定义斜杠命令与会话导出"
+rm -rf /tmp/laew-e2e-cmd-work; mkdir -p /tmp/laew-e2e-cmd-work/.laew/commands
+cat > /tmp/laew-e2e-cmd-work/.laew/commands/e2e-hello.md <<'CMDEOF'
+---
+description: e2e 测试命令
+argument-hint: [name]
+---
+请向 $ARGUMENTS 问好,并说明 $1 是第一个参数。
+CMDEOF
+# /commands 列出自定义命令(纯本地,不依赖 mock)
+OUT=$(cd /tmp/laew-e2e-cmd-work && printf '/commands\n/exit\n' | run "$LAEW")
+echo "$OUT" | grep -q "e2e-hello"; check $? "/commands 列出自定义命令"
+echo "$OUT" | grep -q "\.laew/commands"; check $? "/commands 显示来源路径"
+# 自定义命令 dispatch(经 mock 编排) + /export 落盘断言
+OUT=$(cd /tmp/laew-e2e-cmd-work && printf '/e2e-hello laew\n/export\n/exit\n' | run "$LAEW")
+echo "$OUT" | grep -q "custom command.*e2e-hello"; check $? "自定义命令 dispatch 显示来源"
+echo "$OUT" | grep -q "已导出 Markdown"; check $? "/export 导出成功提示"
+EXPORT_FILE=$(echo "$OUT" | grep -oE "/tmp/laew-e2e-cmd-work/laew-export-[0-9-]+\.md" | head -1)
+[ -n "$EXPORT_FILE" ] && [ -f "$EXPORT_FILE" ]; check $? "/export 文件已落盘(${EXPORT_FILE:-未找到})"
+grep -q "请向 laew 问好" "$EXPORT_FILE" 2>/dev/null; check $? "导出含命令展开提示词"
+grep -q "/e2e-hello laew" "$EXPORT_FILE" 2>/dev/null; check $? "导出含原始命令输入"
+grep -q "1 轮对话" "$OUT"; check $? "/export 提示轮数"
+# 显式路径拒绝覆盖(保护用户文件)
+touch /tmp/laew-e2e-cmd-work/exists.md
+OUT=$(cd /tmp/laew-e2e-cmd-work && printf '/export exists.md\n/exit\n' | run "$LAEW")
+echo "$OUT" | grep -q "拒绝覆盖"; check $? "/export 显式路径已存在时拒绝覆盖"
+rm -rf /tmp/laew-e2e-cmd-work
+
 # --- 8. TUI 子屏自动化(tmux control-mode,真 PTY 渲染) ---
 # 详见 docs/TUI自动化测试/01-设计与解决方案.md
 section "8. TUI 子屏自动化(tmux control-mode)"

@@ -18,8 +18,10 @@ use crate::llm::{client_from_record, ChatMessage};
 use crate::session::Session;
 use crate::tui::input::display_width;
 
+pub mod commands;
 pub mod completion;
 pub mod engine;
+pub mod export;
 pub mod form;
 pub mod screen;
 pub mod theme;
@@ -27,6 +29,7 @@ pub mod theme;
 mod input;
 
 use completion::CompletionEngine;
+use export::{OutcomeKind, TranscriptEntry};
 use input::{InputHandler, InputResult};
 
 pub struct TuiSession {
@@ -38,6 +41,10 @@ pub struct TuiSession {
     pub debug: Option<Arc<DebugCollector>>,
     /// 未装饰的原始 LLM 客户端(驱动 Debug Agent 评估,避免自我采集递归)
     pub debug_llm_raw: Option<Arc<dyn crate::llm::LlmClient>>,
+    /// 会话导出 transcript(D8,2026-09-10):TUI 层独立记录,不动主 Session 上下文
+    pub transcript: Vec<TranscriptEntry>,
+    /// 会话累计 token 用量(每轮任务结束后累加,`/export` 元信息使用)
+    pub session_usage: crate::llm::Usage,
 }
 
 impl TuiSession {
@@ -62,6 +69,8 @@ impl TuiSession {
             session,
             debug: collector,
             debug_llm_raw,
+            transcript: Vec::new(),
+            session_usage: crate::llm::Usage::default(),
         })
     }
 
@@ -133,8 +142,11 @@ impl TuiSession {
     }
 
     /// 重置会话:清空上下文并生成新 Session ID。
+    /// transcript 与累计用量随会话一并清零(导出的是「当前会话」)。
     pub fn reset_session(&mut self) {
         self.session = Session::new();
+        self.transcript.clear();
+        self.session_usage = crate::llm::Usage::default();
     }
 
     pub fn add_provider_interactive(&self) -> Result<i64> {
@@ -185,11 +197,21 @@ impl TuiSession {
             return Ok(false);
         }
         if let Some(rest) = line.strip_prefix('/') {
-            // 斜杠命令
-            return self.handle_slash(rest).await;
+            // 斜杠命令(line 原文传给 handle_slash,自定义命令 dispatch 时记录原始输入)
+            return self.handle_slash(rest, line).await;
         }
+        self.dispatch_prompt(line, line).await
+    }
+
+    /// 统一提示词分发(D2/D8,2026-09-10):
+    /// - `raw`:用户原始输入行(自定义命令记 `/cmd args` 原文,transcript/导出使用);
+    /// - `prompt`:实际送入编排的提示词(自定义命令展开后,可能与 raw 不同)。
+    ///
+    /// 普通输入与自定义命令都汇入此处,保证取消/调试/输出/transcript 记录单点收敛。
+    async fn dispatch_prompt(&mut self, raw: &str, prompt: &str) -> Result<bool> {
+        let turn_ts = now_clock();
         // 普通提示词:Orchestrator 编排(可取消:Ctrl-C 经 SIGINT 自动感知,零新增命令)
-        self.session.context_mut().push(ChatMessage::user(line));
+        self.session.context_mut().push(ChatMessage::user(prompt));
         // debug 模式:每个任务开始前重置采集器
         if let Some(collector) = &self.debug {
             collector.reset(self.session.id());
@@ -218,38 +240,66 @@ impl TuiSession {
         sig_task.abort();
         // debug 模式:任务结束(无论成败)后生成 Debug 报告
         if let (Some(collector), Some(raw_llm)) = (&self.debug, &self.debug_llm_raw) {
-            self.emit_debug_report(collector, raw_llm.clone(), line, &handle_result)
+            self.emit_debug_report(collector, raw_llm.clone(), prompt, &handle_result)
                 .await;
         }
-        match handle_result {
-            Ok(outcome) => match outcome {
-                OrchestrationOutcome::DirectAnswer { text, usage, .. } => {
-                    self.print_assistant_text_with_agent("Yolo", &text, &usage);
+        // 终态:屏幕输出 + transcript 记录(outcome, response, 本轮用量)
+        let entry = match &handle_result {
+            Ok(OrchestrationOutcome::DirectAnswer { text, usage, .. }) => {
+                self.print_assistant_text_with_agent("Yolo", text, usage);
+                Some((OutcomeKind::DirectAnswer, text.clone(), *usage))
+            }
+            Ok(OrchestrationOutcome::Executed { result }) => {
+                let text = format_task_result(result);
+                self.print_task_result(result);
+                Some((OutcomeKind::Executed, text, result.total_usage))
+            }
+            Ok(OrchestrationOutcome::Failed {
+                suggestion, usage, ..
+            }) => {
+                println!();
+                println!("  [agent failed]");
+                println!("  建议: {suggestion}");
+                if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                    println!(
+                        "  本次用量: input={}  output={}",
+                        usage.input_tokens, usage.output_tokens
+                    );
                 }
-                OrchestrationOutcome::Executed { result } => {
-                    self.print_task_result(&result);
-                }
-                OrchestrationOutcome::Failed {
-                    suggestion, usage, ..
-                } => {
-                    println!();
-                    println!("  [agent failed]");
-                    println!("  建议: {suggestion}");
-                    if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                        println!(
-                            "  本次用量: input={}  output={}",
-                            usage.input_tokens, usage.output_tokens
-                        );
-                    }
-                }
-            },
+                Some((
+                    OutcomeKind::Failed,
+                    format!("执行失败。\n建议: {suggestion}"),
+                    *usage,
+                ))
+            }
             Err(e) if matches!(e, crate::error::AgentError::Cancelled) => {
                 println!();
                 println!("  ✓ 本次任务已取消,可继续输入新指令。");
+                Some((
+                    OutcomeKind::Cancelled,
+                    "(任务已取消)".to_string(),
+                    crate::llm::Usage::default(),
+                ))
             }
             Err(e) => {
                 eprintln!("  [agent error] {e}");
+                Some((
+                    OutcomeKind::Error,
+                    format!("[agent error] {e}"),
+                    crate::llm::Usage::default(),
+                ))
             }
+        };
+        if let Some((outcome, response, usage)) = entry {
+            self.session_usage = merge_usage(self.session_usage, usage);
+            self.transcript.push(TranscriptEntry {
+                ts: turn_ts,
+                raw_input: raw.to_string(),
+                prompt: prompt.to_string(),
+                response,
+                usage,
+                outcome,
+            });
         }
         Ok(false)
     }
@@ -303,58 +353,9 @@ impl TuiSession {
     }
 
     fn print_task_result(&self, result: &crate::agent::orchestrator::TaskResult) {
-        println!();
-        let plan_doc_display = result
-            .plan_doc
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "无".into());
-        println!(
-            "  [task executed: difficulty={}, plan_doc={}, workflows={}]",
-            result.classification.task_level.display_name(),
-            plan_doc_display,
-            result.workflows.len()
-        );
-        // 打印每个 WorkFlow 的 subflow 输出
-        for wf in &result.workflows {
-            println!("  --- WorkFlow {} ({}) ---", wf.id, wf.name);
-            for line in wf.subflow_outcome.lines() {
-                println!("  {line}");
-            }
-            // 显示 Quality-Check 结论
-            let qc_icon = match wf.quality_report.verdict {
-                crate::agent::quality::Verdict::Pass => "✅",
-                crate::agent::quality::Verdict::Fail => "❌",
-            };
-            println!("  [QC] {} {}", qc_icon, match wf.quality_report.verdict {
-                crate::agent::quality::Verdict::Pass => "通过",
-                crate::agent::quality::Verdict::Fail => "未通过",
-            });
-            if !wf.quality_report.issues.is_empty() {
-                for issue in &wf.quality_report.issues {
-                    println!("    问题: {issue}");
-                }
-            }
-            // 显示 SubAgent 执行轨迹摘要
-            if let Some(trace) = &wf.subflow_trace {
-                println!(
-                    "  [trace] iter={} tools={}(ok={},err={}) early_term={}",
-                    trace.iterations,
-                    trace.tool_calls,
-                    trace.tool_calls_ok,
-                    trace.tool_calls_err,
-                    trace.early_terminated
-                );
-            }
+        for line in format_task_result(result).lines() {
+            println!("{line}");
         }
-        if !result.summary.is_empty() {
-            println!();
-            println!("  [session_context 摘要]");
-            for line in result.summary.lines() {
-                println!("  {line}");
-            }
-        }
-        self.print_usage(&result.total_usage);
     }
 
     fn print_usage(&self, usage: &crate::llm::Usage) {
@@ -373,9 +374,13 @@ impl TuiSession {
         }
     }
 
-    async fn handle_slash(&mut self, cmd: &str) -> Result<bool> {
+    /// 处理斜杠命令。`cmd` 为去掉 `/` 前缀的命令串;`full_line` 为用户原始输入行
+    /// (自定义命令 dispatch 时作为 transcript 的 raw_input,保留 `/cmd args` 原文)。
+    async fn handle_slash(&mut self, cmd: &str, full_line: &str) -> Result<bool> {
         let mut it = cmd.split_whitespace();
         let head = it.next().unwrap_or("");
+        // 头部之后的剩余参数(保留原始空白语义,自定义命令 /export 路径均使用)
+        let rest_args = cmd[head.len()..].trim();
         match head {
             "help" | "h" | "?" => {
                 print_help();
@@ -458,17 +463,102 @@ impl TuiSession {
                     other => println!("  未知 /provider 子命令: {other}"),
                 }
             }
+            // D8 会话导出:默认落工作目录 Markdown,显式路径按后缀定格式
+            "export" => {
+                self.run_export(rest_args);
+            }
+            // D2 自定义命令自观测:列出已加载命令与来源
+            "commands" => {
+                self.print_custom_commands();
+            }
             "" => {}
             other => {
-                println!("  未知斜杠命令: /{other}");
-                let suggestions = suggest_similar_commands(other);
-                if !suggestions.is_empty() {
-                    println!("  您是否想输入: {}", suggestions.join(", "));
+                // 内置未命中 → 查自定义命令(D2);命中则渲染模板并送编排。
+                // 内置命令不可遮蔽:与内置同名时根本走不进此分支。
+                let customs = commands::discover(&self.paths.work_dir);
+                match commands::render_by_name(&customs, other, rest_args) {
+                    Some(rendered) => {
+                        let source = customs
+                            .iter()
+                            .find(|c| c.name == other)
+                            .map(|c| c.source.display().to_string())
+                            .unwrap_or_default();
+                        println!("  [custom command] /{other} ← {source}");
+                        return self.dispatch_prompt(full_line, &rendered).await;
+                    }
+                    None => {
+                        println!("  未知斜杠命令: /{other}");
+                        let suggestions = suggest_similar_commands(other);
+                        if !suggestions.is_empty() {
+                            println!("  您是否想输入: {}", suggestions.join(", "));
+                        }
+                        println!("  输入 /help 查看所有命令, /commands 查看自定义命令。");
+                    }
                 }
-                println!("  输入 /help 查看所有命令。");
             }
         }
         Ok(false)
+    }
+
+    /// `/export [path]`(D8):导出当前会话 transcript。
+    fn run_export(&mut self, path_arg: &str) {
+        let model = match self.db.lock().expect("db").get_active() {
+            Ok(Some(r)) => format!("[{}] {}/{}", r.protocol.as_str(), r.provider_name, r.model_name),
+            _ => "<未配置>".to_string(),
+        };
+        let default_ts = export::now_export_stamp(); // YYYYMMDD-HHMMSS
+        let explicit = if path_arg.trim().is_empty() {
+            None
+        } else {
+            Some(path_arg.trim())
+        };
+        let meta = export::ExportMeta {
+            session_id: self.session.id.clone(),
+            session_created_at: export::humanize_compact(&self.session.created_at),
+            exported_at: export::now_export_human(),
+            model,
+            turns: self.transcript.len(),
+            total_usage: self.session_usage,
+        };
+        match export::resolve_target(&self.paths.work_dir, explicit, "laew-export", &default_ts) {
+            Ok((path, fmt)) => {
+                let fmt_name = if fmt == export::ExportFormat::Json { "JSON" } else { "Markdown" };
+                match export::write_export(&meta, &self.transcript, &path, fmt) {
+                    Ok(()) => println!(
+                        "  ✓ 已导出 {fmt_name}: {} ({} 轮对话)",
+                        path.display(),
+                        meta.turns
+                    ),
+                    Err(e) => eprintln!("  导出失败: {e}"),
+                }
+            }
+            Err(e) => eprintln!("  导出失败: {e}"),
+        }
+    }
+
+    /// `/commands`(D2):列出已加载的自定义命令(名称/描述/来源)。
+    fn print_custom_commands(&self) {
+        let customs = commands::discover(&self.paths.work_dir);
+        if customs.is_empty() {
+            println!("  当前无自定义命令。创建方法(Markdown 模板):");
+            println!(
+                "    项目级: {}/.laew/commands/<命令名>.md",
+                self.paths.work_dir.display()
+            );
+            println!("    用户级: ~/.laew/commands/<命令名>.md");
+            println!("    模板内可用 $ARGUMENTS(全量参数)与 $1-$9(位置参数)");
+            return;
+        }
+        println!("  自定义命令({} 个,用户级优先于项目级):", customs.len());
+        for c in &customs {
+            let hint = if c.argument_hint.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", c.argument_hint)
+            };
+            println!("  /{}{hint}", c.name);
+            println!("    {} — {}", c.description, c.source.display());
+        }
     }
 
     /// 进入 ProviderList 屏(子屏通过 engine 渲染)。
@@ -587,6 +677,93 @@ impl TuiSession {
     }
 }
 
+/// 格式化任务执行结果为多行文本(D8:屏幕打印与导出同源,避免两处漂移)。
+fn format_task_result(result: &crate::agent::orchestrator::TaskResult) -> String {
+    let mut out = String::new();
+    let plan_doc_display = result
+        .plan_doc
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "无".into());
+    out.push_str(&format!(
+        "  [task executed: difficulty={}, plan_doc={}, workflows={}]\n",
+        result.classification.task_level.display_name(),
+        plan_doc_display,
+        result.workflows.len()
+    ));
+    // 每个 WorkFlow 的 subflow 输出
+    for wf in &result.workflows {
+        out.push_str(&format!("  --- WorkFlow {} ({}) ---\n", wf.id, wf.name));
+        for line in wf.subflow_outcome.lines() {
+            out.push_str(&format!("  {line}\n"));
+        }
+        // Quality-Check 结论
+        let (qc_icon, qc_text) = match wf.quality_report.verdict {
+            crate::agent::quality::Verdict::Pass => ("✅", "通过"),
+            crate::agent::quality::Verdict::Fail => ("❌", "未通过"),
+        };
+        out.push_str(&format!("  [QC] {qc_icon} {qc_text}\n"));
+        if !wf.quality_report.issues.is_empty() {
+            for issue in &wf.quality_report.issues {
+                out.push_str(&format!("    问题: {issue}\n"));
+            }
+        }
+        // SubAgent 执行轨迹摘要
+        if let Some(trace) = &wf.subflow_trace {
+            out.push_str(&format!(
+                "  [trace] iter={} tools={}(ok={},err={}) early_term={}\n",
+                trace.iterations,
+                trace.tool_calls,
+                trace.tool_calls_ok,
+                trace.tool_calls_err,
+                trace.early_terminated
+            ));
+        }
+    }
+    if !result.summary.is_empty() {
+        out.push('\n');
+        out.push_str("  [session_context 摘要]\n");
+        for line in result.summary.lines() {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    // 用量行(与 print_usage 同格式)
+    let usage = &result.total_usage;
+    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+        let mut cache = String::new();
+        if usage.cache_read_input_tokens > 0 {
+            cache.push_str(&format!("  cache_read={}", usage.cache_read_input_tokens));
+        }
+        if usage.cache_creation_input_tokens > 0 {
+            cache.push_str(&format!("  cache_creation={}", usage.cache_creation_input_tokens));
+        }
+        out.push_str(&format!(
+            "  本次用量: input={}  output={}{}\n",
+            usage.input_tokens, usage.output_tokens, cache
+        ));
+    }
+    out
+}
+
+/// Usage 逐字段饱和累加(会话累计用途;orchestrator 内部 add_usage 为私有,此处独立实现)。
+fn merge_usage(a: crate::llm::Usage, b: crate::llm::Usage) -> crate::llm::Usage {
+    crate::llm::Usage {
+        input_tokens: a.input_tokens.saturating_add(b.input_tokens),
+        output_tokens: a.output_tokens.saturating_add(b.output_tokens),
+        cache_read_input_tokens: a
+            .cache_read_input_tokens
+            .saturating_add(b.cache_read_input_tokens),
+        cache_creation_input_tokens: a
+            .cache_creation_input_tokens
+            .saturating_add(b.cache_creation_input_tokens),
+    }
+}
+
+/// 当前本地时间 HH:MM:SS(transcript 轮次时间戳;实现在 export.rs)。
+fn now_clock() -> String {
+    export::now_clock()
+}
+
 /// 建议相似命令（简单的编辑距离近似）。
 fn suggest_similar_commands(input: &str) -> Vec<String> {
     let all_commands = [
@@ -601,6 +778,8 @@ fn suggest_similar_commands(input: &str) -> Vec<String> {
         "new",
         "n",
         "model",
+        "export",
+        "commands",
         "provider",
         "provider list",
         "provider add",
@@ -706,6 +885,8 @@ fn print_help() {
     println!("  │  /clear (c)        清空对话历史并开启新会话                 │");
     println!("  │  /new (n)          开启新会话(同 /clear)                   │");
     println!("  │  /model            显示当前模型                           │");
+    println!("  │  /export [path]    导出当前会话(Markdown, .json 后缀 JSON) │");
+    println!("  │  /commands         列出自定义斜杠命令                      │");
     println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
     println!("  │  /provider list    列出所有接入记录                       │");
     println!("  │  /provider add     交互式新增接入记录                     │");
@@ -720,6 +901,11 @@ fn print_help() {
     println!("    ↑ / ↓          上下选择命令");
     println!("    Enter / Tab    接受选中命令");
     println!("    Esc            关闭列表");
+    println!();
+    println!("  自定义命令:");
+    println!("    项目级 .laew/commands/<命令名>.md / 用户级 ~/.laew/commands/<命令名>.md");
+    println!("    模板支持 frontmatter(description/argument-hint)与 $ARGUMENTS/$1-$9 占位符");
+    println!("    详见 /commands");
 }
 
 /// 启动 MultiAgentOrchestrator(6 角色);若未配置,使用占位提示信息。
@@ -823,9 +1009,11 @@ pub async fn run_with_debug(debug: bool) -> Result<()> {
 
     if atty() {
         let input_handler = InputHandler::new();
-        let completion_engine = CompletionEngine::new();
+        let mut completion_engine = CompletionEngine::new();
 
         loop {
+            // 每行输入前重扫自定义命令目录(D2):命令文件增删即时生效,无需重启
+            completion_engine.reload_custom(&session.paths.work_dir);
             let line = match input_handler.read_line(">> ", &completion_engine)? {
                 InputResult::Submitted(l) => l,
                 InputResult::Exit => {
