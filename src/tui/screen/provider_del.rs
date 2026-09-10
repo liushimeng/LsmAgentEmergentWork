@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::tui::engine::{Frame, Outcome, Rect, Screen};
+use crate::tui::input::display_width;
 use crate::tui::theme::{self, attr};
 
 /// 选择屏：列出所有记录,高亮 cursor 指向的那条;Enter 进 Confirm。
@@ -204,14 +205,18 @@ impl Screen for ProviderDelConfirm {
             (theme::FG, attr::NONE, format!("  {}  ", cancel_label))
         };
 
+        // 注意:必须用 display_width() 而非 chars().count() —— CJK 字符占 2 列,
+        // 用 chars().count() 会低估宽度,导致末尾的 `]` 被 put_str 的边界检查截断。
+        let confirm_w = display_width(&confirm_text) + 1;
+        let cancel_w = display_width(&cancel_text) + 1;
         frame.put_str(
-            Rect::new(4, button_y, confirm_text.chars().count() as u16 + 1, 1),
+            Rect::new(4, button_y, confirm_w, 1),
             &confirm_text,
             confirm_fg,
             confirm_attrs,
         );
         frame.put_str(
-            Rect::new(4 + confirm_text.chars().count() as u16 + 3, button_y, cancel_text.chars().count() as u16 + 1, 1),
+            Rect::new(4 + confirm_w + 3, button_y, cancel_w, 1),
             &cancel_text,
             cancel_fg,
             cancel_attrs,
