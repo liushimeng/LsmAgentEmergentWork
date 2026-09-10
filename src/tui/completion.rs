@@ -73,6 +73,14 @@ impl CompletionEngine {
                 "删除接入记录",
                 "/provider del <id>",
             ),
+            // 2026-09-10 第 22 轮:补全列表补回 /diff,使 Tab 补全可见;
+            // 命令实现位于 src/tui/mod.rs::handle_slash,此前未注册到 builtin 导致补全缺失。
+            SlashCommand::builtin(
+                "diff",
+                &[],
+                "并排 diff 两个文件(行级+字符级着色)",
+                "/diff <old> <new>",
+            ),
         ];
         Self { builtin, custom: Vec::new() }
     }

@@ -275,12 +275,10 @@ impl TuiSession {
                 println!();
                 println!("  [agent failed]");
                 println!("  建议: {suggestion}");
-                if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                    println!(
-                        "  本次用量: input={}  output={}",
-                        usage.input_tokens, usage.output_tokens
-                    );
-                }
+                // 2026-09-10 第 22 轮:与 Executed/DirectAnswer 路径对齐,统一调用
+                // print_usage 输出(input/output + cache_read + cache_creation),
+                // 避免 Failed 路径用量维度缺失,导致用户看不到 prompt caching 命中量。
+                self.print_usage(usage);
                 Some((
                     OutcomeKind::Failed,
                     format!("执行失败。\n建议: {suggestion}"),

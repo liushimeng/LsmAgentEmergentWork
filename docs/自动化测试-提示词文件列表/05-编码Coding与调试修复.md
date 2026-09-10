@@ -27,6 +27,7 @@
   2. 修复后代码运行结果不对（逻辑 bug），请用调试思路定位问题。
   3. 给修复后的代码加上注释，说明每个修改点的原因。
   4. 写一个测试用例来验证修复的正确性。
+- **实测状态**: ✅ 通过（2026-09-10，mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通，TUI 主屏中文显示 / `[QC] ✅ 通过` / `[trace] iter=1 tools=0` / `[session_context 摘要]` / `本次用量` 全部正常，详见 `tmpPlan/2026-09-10_05-D08-E02-测试与TUI用量显示Bug修复方案.md`）
 
 ### E03 代码审查（Code Review）
 - **预期档位**: medium
