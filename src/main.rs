@@ -306,19 +306,33 @@ async fn run_one_shot(
         let _ = tokio::signal::ctrl_c().await;
         std::process::exit(130);
     });
-    let outcome = match orchestrator.handle_cancellable(&mut session, &cancel).await {
+    // 阶段进度(stderr 立即打印,stdout 保持只含答案与用量;与等待心跳同流,
+    // 2026-09-10 第 23 轮 D05/D07 测试轮)
+    let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let stage_printer = tokio::spawn(async move {
+        while let Some(line) = stage_rx.recv().await {
+            eprintln!("[stage] {line}");
+        }
+    });
+    let outcome = match orchestrator
+        .handle_cancellable_with_progress(&mut session, &cancel, Some(stage_tx))
+        .await
+    {
         Ok(o) => o,
         Err(e) if matches!(e, lsm_agent::error::AgentError::Cancelled) => {
             sig_task.abort();
+            let _ = stage_printer.await;
             eprintln!("[laew] 任务已取消(用户中断)");
             std::process::exit(130);
         }
         Err(e) => {
             sig_task.abort();
+            let _ = stage_printer.await;
             return Err(anyhow::Error::from(e));
         }
     };
     sig_task.abort();
+    let _ = stage_printer.await;
 
     // debug 模式:任务结束后生成 Debug 报告(用未装饰的 llm 驱动 Debug Agent,避免自我采集递归)
     if let Some(collector) = collector {
@@ -337,7 +351,14 @@ async fn run_one_shot(
         match lsm_agent::agent::debug::finalize_report(&collector, llm.clone(), &report_dir, &meta)
             .await
         {
-            Ok(path) => eprintln!("[laew] Debug 报告已生成: {}", path.display()),
+            Ok(path) => eprintln!(
+                "{}",
+                lsm_agent::tui::pathfmt::fit_line(
+                    "[laew] Debug 报告已生成: ",
+                    &lsm_agent::tui::pathfmt::display_path(&paths, &path),
+                    ""
+                )
+            ),
             Err(e) => eprintln!("[laew] Debug 报告生成失败: {e}"),
         }
     }

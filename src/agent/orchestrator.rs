@@ -30,6 +30,19 @@ use crate::llm::cancellable::{CancelGate, CancellableLlmClient};
 use crate::llm::Usage;
 use crate::session::Session;
 
+/// 任务阶段进度通道(D05/D07 测试轮,2026-09-10 第 23 轮):
+/// 编排器在阶段边界(Yolo 分类 / Plan / Main-Work / SubAgent / QC / 失败回流)
+/// 发送一行人类可读消息,由 TUI(挂起 1.5s 后打印,快速完成不打扰)或
+/// CLI(stderr 立即打印)的消费端展示,解决长任务期间界面零反馈的问题。
+pub type ProgressTx = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// 发送一条阶段消息(未接通道 / 接收端已退出时零开销静默)。
+fn emit_progress(tx: &Option<ProgressTx>, msg: impl Into<String>) {
+    if let Some(tx) = tx {
+        let _ = tx.send(msg.into());
+    }
+}
+
 /// Orchestrator 行为参数
 #[derive(Debug, Clone)]
 pub struct OrchestratorConfig {
@@ -209,14 +222,29 @@ impl MultiAgentOrchestrator {
         session: &mut Session,
         cancel: &CancelToken,
     ) -> Result<OrchestrationOutcome> {
+        self.handle_cancellable_with_progress(session, cancel, None)
+            .await
+    }
+
+    /// [`handle_cancellable`] 的带进度版本(2026-09-10 第 23 轮):
+    /// `progress` 接收端由调用方(TUI 打印协程 / CLI stderr 打印)持有,
+    /// 通道 clone 会贯穿到并行执行的 WorkFlow 单元,任务返回时全部 drop,
+    /// 接收端 `recv()` 返回 None 即为「任务结束」信号。
+    pub async fn handle_cancellable_with_progress(
+        &self,
+        session: &mut Session,
+        cancel: &CancelToken,
+        progress: Option<ProgressTx>,
+    ) -> Result<OrchestrationOutcome> {
         let _gate_guard = self.cancel_gate.guard(cancel.clone());
-        self.handle_inner(session, cancel).await
+        self.handle_inner(session, cancel, &progress).await
     }
 
     async fn handle_inner(
         &self,
         session: &mut Session,
         cancel: &CancelToken,
+        progress: &Option<ProgressTx>,
     ) -> Result<OrchestrationOutcome> {
         // 0) 项目上下文首次注入(幂等)
         if let Some(work_dir) = project_context::current_work_dir() {
@@ -257,6 +285,23 @@ impl MultiAgentOrchestrator {
         let (mut classification, yolo_usage) = self.run_yolo_classification(session).await?;
         Self::check_cancelled(cancel)?;
         self.dbg_classify(&classification);
+        emit_progress(
+            progress,
+            format!(
+                "Yolo 分类:{} → {}{}",
+                classification.task_level.display_name(),
+                match classification.task_level {
+                    TaskLevel::Simple => "SubAgent 直通",
+                    TaskLevel::Medium => "Main-Work 拆解",
+                    TaskLevel::Hard => "Plan 规划",
+                },
+                if classification.yolo_degraded {
+                    "(降级本地解析)"
+                } else {
+                    ""
+                },
+            ),
+        );
         // 2026-09-09 第 14 轮:累加 Yolo 分类调用的 LLM 用量(此前被 `let _ = usage;` 显式丢弃,
         // 导致 stdout 用量仅显示最后一次调用,与 Debug 报告严重不一致)。
         let mut total_usage = yolo_usage;
@@ -289,6 +334,7 @@ impl MultiAgentOrchestrator {
                 .cloned()
             {
                 Self::check_cancelled(cancel)?;
+                emit_progress(progress, "Yolo 直接作答(跳过执行层)");
                 let summary = self
                     .session_context
                     .summarize(
@@ -336,9 +382,18 @@ impl MultiAgentOrchestrator {
 
             // 2) 调度执行(执行层取消:token 贯穿 SubAgent / 并行层)
             let exec_result = match classification.task_level {
-                TaskLevel::Simple => self.run_simple(&classification, session, cancel).await,
-                TaskLevel::Medium => self.run_medium(&classification, session, cancel).await,
-                TaskLevel::Hard => self.run_hard(&classification, session, cancel).await,
+                TaskLevel::Simple => {
+                    self.run_simple(&classification, session, cancel, progress)
+                        .await
+                }
+                TaskLevel::Medium => {
+                    self.run_medium(&classification, session, cancel, progress)
+                        .await
+                }
+                TaskLevel::Hard => {
+                    self.run_hard(&classification, session, cancel, progress)
+                        .await
+                }
             };
 
             match exec_result {
@@ -397,6 +452,7 @@ impl MultiAgentOrchestrator {
                     total_usage = add_usage(total_usage, failure_usage(&failure));
                     // 升级或重试
                     if !failure.retryable {
+                        emit_progress(progress, "失败回流 Yolo 重新评估…");
                         // 升级到上一层(由 Yolo 重新评估)
                         match self
                             .run_yolo_with_failure(&classification, &failure, session)
@@ -413,6 +469,7 @@ impl MultiAgentOrchestrator {
                         }
                     }
                     // retryable=true 留在当前档位继续重跑
+                    emit_progress(progress, format!("第 {retry_count} 轮重试当前档位…"));
                     continue;
                 }
             }
@@ -435,6 +492,7 @@ impl MultiAgentOrchestrator {
         c: &TaskClassification,
         session: &Session,
         cancel: &CancelToken,
+        progress: &Option<ProgressTx>,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         let input = SubFlowInput {
             id: "wf-1".into(),
@@ -447,6 +505,7 @@ impl MultiAgentOrchestrator {
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
         };
+        emit_progress(progress, "wf-1 SubAgent 执行中…");
         let outcome = self
             .sub_agent
             .run_unit_with_cancel(&input, session.id(), cancel)
@@ -469,6 +528,17 @@ impl MultiAgentOrchestrator {
                 QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
             })?;
         self.dbg_qc(&qc);
+        emit_progress(
+            progress,
+            format!(
+                "wf-1 QC:{}",
+                if qc.verdict == Verdict::Pass {
+                    "✅ 通过"
+                } else {
+                    "❌ 未通过"
+                }
+            ),
+        );
 
         // 2026-09-09 第 14 轮:累加 Quality-Check 调用的 LLM 用量
         let total_usage = add_usage(outcome.usage, qc_usage);
@@ -514,8 +584,10 @@ impl MultiAgentOrchestrator {
         c: &TaskClassification,
         session: &Session,
         cancel: &CancelToken,
+        progress: &Option<ProgressTx>,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Main-Work 拆 WorkFlow
+        emit_progress(progress, "Main-Work 拆解中…");
         let (plan, mainwork_usage) = self
             .main_work
             .plan_workflows(&c.goal_summary, &c.decomposition_plan, session.id())
@@ -534,6 +606,10 @@ impl MultiAgentOrchestrator {
                 QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
             })?;
         self.dbg_qc(&qc_main);
+        emit_progress(
+            progress,
+            format!("Main-Work 拆解 {} 个流程单元", plan.workflows.len()),
+        );
 
         if qc_main.verdict == Verdict::Fail {
             return Err(QualityFailure {
@@ -551,7 +627,8 @@ impl MultiAgentOrchestrator {
         let pre_usage = add_usage(mainwork_usage, qc_usage);
 
         // 3) 拓扑排序并执行
-        self.execute_workflows(c, &plan, pre_usage, session, cancel).await
+        self.execute_workflows(c, &plan, pre_usage, session, cancel, progress)
+            .await
     }
 
     // ========== 高等档 ==========
@@ -561,8 +638,10 @@ impl MultiAgentOrchestrator {
         c: &TaskClassification,
         session: &Session,
         cancel: &CancelToken,
+        progress: &Option<ProgressTx>,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Plan 生成(2026-09-09 第 14 轮:带回 LLM Usage 用于累加)
+        emit_progress(progress, "Plan 规划中…");
         let (plan_output, plan_usage) = self
             .plan
             .generate(
@@ -574,6 +653,17 @@ impl MultiAgentOrchestrator {
             )
             .await
             .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;
+        emit_progress(
+            progress,
+            format!(
+                "Plan 已生成:{}",
+                plan_output
+                    .path
+                    .file_name()
+                    .map(|n| n.display().to_string())
+                    .unwrap_or_default()
+            ),
+        );
 
         // 2) Quality 校验 Plan
         let (qc_plan, qc_plan_usage) = self
@@ -612,6 +702,10 @@ impl MultiAgentOrchestrator {
                 QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
             })?;
         self.dbg_qc(&qc_main);
+        emit_progress(
+            progress,
+            format!("Main-Work 解析为 {} 个流程单元", plan.workflows.len()),
+        );
         if qc_main.verdict == Verdict::Fail {
             return Err(QualityFailure {
                 source: AgentRole::MainWork,
@@ -629,7 +723,7 @@ impl MultiAgentOrchestrator {
 
         // 4) 执行 WorkFlow
         let mut task_result = self
-            .execute_workflows(c, &plan, pre_usage, session, cancel)
+            .execute_workflows(c, &plan, pre_usage, session, cancel, progress)
             .await?;
         task_result.plan_doc = Some(plan_output.path);
         Ok(task_result)
@@ -644,6 +738,7 @@ impl MultiAgentOrchestrator {
         pre_usage: Usage, // 2026-09-09 第 14 轮:承接上游(Main-Work / Quality-Main)累计的 LLM 用量
         session: &Session,
         cancel: &CancelToken,
+        progress: &Option<ProgressTx>,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 依赖分层:同层 WorkFlow 互相无依赖,自动并行;跨层严格串行(自动感知 depends_on)
         let layers = main_work::topo_layers(&plan.workflows).map_err(|e| QualityFailure {
@@ -698,6 +793,7 @@ impl MultiAgentOrchestrator {
                     session.id().to_string(),
                     None,
                     cancel.clone(),
+                    progress.clone(),
                 )
                 .await;
                 vec![(wf, outcome)]
@@ -715,6 +811,7 @@ impl MultiAgentOrchestrator {
                     // 取消传播:同层每个并行单元持同一 token 的 clone,
                     // 父任务取消 → 全部单元即时中断(原子级联,无需逐个通知)
                     let cancel_tok = cancel.clone();
+                    let progress_tx = progress.clone();
                     handles.push(tokio::spawn(async move {
                         let outcome = run_wf_unit(
                             sub_agent,
@@ -725,6 +822,7 @@ impl MultiAgentOrchestrator {
                             sid,
                             Some(sem),
                             cancel_tok,
+                            progress_tx,
                         )
                         .await;
                         (wf, outcome)
@@ -948,7 +1046,9 @@ struct WfUnitOk {
 ///
 /// 自由函数 + Arc 参数化,串行直通与 tokio::spawn 并行两种调用路径共用同一份逻辑;
 /// `semaphore` 为并行路径的有界并发许可(串行路径传 None);
-/// `cancel` 为任务级取消 token(传播进 SubAgent 的 Agent 循环,LLM/工具即时中断)。
+/// `cancel` 为任务级取消 token(传播进 SubAgent 的 Agent 循环,LLM/工具即时中断);
+/// `progress` 为阶段进度通道 clone(并行单元各自持有,2026-09-10 第 23 轮)。
+#[allow(clippy::too_many_arguments)]
 async fn run_wf_unit(
     sub_agent: Arc<SubAgentRunner>,
     quality: Arc<QualityRunner>,
@@ -958,6 +1058,7 @@ async fn run_wf_unit(
     session_id: String,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
     cancel: CancelToken,
+    progress: Option<ProgressTx>,
 ) -> std::result::Result<WfUnitOk, QualityFailure> {
     // 有界并发:先抢许可(对齐 atomcode Semaphore(3) FIFO 惯例)
     let _permit = match &semaphore {
@@ -973,6 +1074,7 @@ async fn run_wf_unit(
     };
 
     let wf_id = input.id.clone();
+    emit_progress(&progress, format!("{wf_id} SubAgent 执行中…"));
     let outcome = sub_agent
         .run_unit_with_cancel(&input, &session_id, &cancel)
         .await
@@ -999,6 +1101,17 @@ async fn run_wf_unit(
     if let Some(d) = &debug {
         d.record_quality(&qc);
     }
+    emit_progress(
+        &progress,
+        format!(
+            "{wf_id} QC:{}",
+            if qc.verdict == Verdict::Pass {
+                "✅ 通过"
+            } else {
+                "❌ 未通过"
+            }
+        ),
+    );
 
     if qc.verdict == Verdict::Fail {
         return Err(QualityFailure {

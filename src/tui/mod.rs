@@ -23,6 +23,7 @@ pub mod completion;
 pub mod engine;
 pub mod export;
 pub mod form;
+pub mod pathfmt;
 pub mod render;
 pub mod screen;
 pub mod theme;
@@ -238,6 +239,37 @@ impl TuiSession {
             collector.reset(self.session.id());
         }
         println!("  [orchestrator 调度中... Ctrl-C 取消]");
+        // 阶段进度打印协程(2026-09-10 第 23 轮,D05/D07 测试轮):
+        // 收到消息挂起 1.5s 再显示;任务快速完成(所有发送端 drop → recv 返回
+        // None)时挂起消息直接丢弃 —— mock 级链路零噪音,真实 LLM 长任务
+        // (Yolo/Plan/Main-Work/SubAgent/QC 各阶段数秒到数分钟)稳定可见。
+        let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let stage_printer = tokio::spawn(async move {
+            let hold = std::time::Duration::from_millis(1500);
+            // 队列语义:同批到达的阶段消息(如 Yolo 分类 + SubAgent 启动)整批冲刷,
+            // 不互相覆盖;通道关闭(任务结束)早于计时器触发时全部丢弃。
+            let mut queue: std::collections::VecDeque<String> = Default::default();
+            let mut idle = Box::pin(tokio::time::sleep(hold));
+            loop {
+                tokio::select! {
+                    maybe = stage_rx.recv() => match maybe {
+                        Some(line) => {
+                            if queue.is_empty() {
+                                idle.as_mut().reset(tokio::time::Instant::now() + hold);
+                            }
+                            queue.push_back(line);
+                        }
+                        None => break, // 任务结束:未显示的快速阶段直接丢弃
+                    },
+                    _ = &mut idle => {
+                        while let Some(line) = queue.pop_front() {
+                            println!("  [stage] {line}");
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + hold);
+                    }
+                }
+            }
+        });
         let cancel = crate::agent::cancel::CancelToken::new();
         // 任务窗口 SIGINT 监听:第一次中断取消当前任务(claudecode 语义),
         // 第二次强制退出(exit 130)。输入等待窗口由 InputHandler raw mode
@@ -255,10 +287,13 @@ impl TuiSession {
         });
         let handle_result = self
             .orchestrator
-            .handle_cancellable(&mut self.session, &cancel)
+            .handle_cancellable_with_progress(&mut self.session, &cancel, Some(stage_tx))
             .await;
         // 任务结束:撤掉 SIGINT 监听,避免游离监听吞掉后续按键窗口外的信号
         sig_task.abort();
+        // 阶段打印协程收尾:通道已随任务结束关闭,快速阶段静默丢弃后再输出结果块,
+        // 保证 [stage] 行不会插进最终结果中间
+        let _ = stage_printer.await;
         // debug 模式:任务结束(无论成败)后生成 Debug 报告
         if let (Some(collector), Some(raw_llm)) = (&self.debug, &self.debug_llm_raw) {
             self.emit_debug_report(collector, raw_llm.clone(), prompt, &handle_result)
@@ -271,7 +306,7 @@ impl TuiSession {
                 Some((OutcomeKind::DirectAnswer, text.clone(), *usage))
             }
             Ok(OrchestrationOutcome::Executed { result }) => {
-                let text = format_task_result(result);
+                let text = format_task_result(result, &self.paths);
                 self.print_task_result(result);
                 Some((OutcomeKind::Executed, text, result.total_usage))
             }
@@ -361,7 +396,14 @@ impl TuiSession {
         };
         let report_dir = self.paths.root_dir.join("DebugReport");
         match finalize_report(collector, raw_llm, &report_dir, &meta).await {
-            Ok(path) => println!("  [debug] 报告已生成: {}", path.display()),
+            Ok(path) => println!(
+                "{}",
+                pathfmt::fit_line(
+                    "  [debug] 报告已生成: ",
+                    &pathfmt::display_path(&self.paths, &path),
+                    ""
+                )
+            ),
             Err(e) => eprintln!("  [debug] 报告生成失败: {e}"),
         }
     }
@@ -379,7 +421,7 @@ impl TuiSession {
     }
 
     fn print_task_result(&self, result: &crate::agent::orchestrator::TaskResult) {
-        for line in format_task_result(result).lines() {
+        for line in format_task_result(result, &self.paths).lines() {
             println!("{line}");
         }
     }
@@ -678,9 +720,12 @@ impl TuiSession {
                 let fmt_name = if fmt == export::ExportFormat::Json { "JSON" } else { "Markdown" };
                 match export::write_export(&meta, &self.transcript, &path, fmt) {
                     Ok(()) => println!(
-                        "  ✓ 已导出 {fmt_name}: {} ({} 轮对话)",
-                        path.display(),
-                        meta.turns
+                        "{}",
+                        pathfmt::fit_line(
+                            &format!("  ✓ 已导出 {fmt_name}: "),
+                            &pathfmt::display_path(&self.paths, &path),
+                            &format!(" ({} 轮对话)", meta.turns)
+                        )
                     ),
                     Err(e) => eprintln!("  导出失败: {e}"),
                 }
@@ -839,12 +884,15 @@ impl TuiSession {
 }
 
 /// 格式化任务执行结果为多行文本(D8:屏幕打印与导出同源,避免两处漂移)。
-fn format_task_result(result: &crate::agent::orchestrator::TaskResult) -> String {
+fn format_task_result(
+    result: &crate::agent::orchestrator::TaskResult,
+    paths: &Paths,
+) -> String {
     let mut out = String::new();
     let plan_doc_display = result
         .plan_doc
         .as_ref()
-        .map(|p| p.display().to_string())
+        .map(|p| pathfmt::display_path(paths, p))
         .unwrap_or_else(|| "无".into());
     out.push_str(&format!(
         "  [task executed: difficulty={}, plan_doc={}, workflows={}]\n",
