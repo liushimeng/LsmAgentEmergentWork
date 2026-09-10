@@ -176,6 +176,12 @@ cd LsmAgentEmergentWork
 > 接入点自动补全：Anthropic 自动拼接 `v1/messages`，OpenAI 自动拼接 `chat/completions`。
 > 配置不落配置文件，全部存于 **根目录** 的 SQLite（`LsmAgentEmergentWork.db`）。
 
+> **自签名证书 / 内网网关**：`end_point` 为 HTTPS + IP 地址（自签名证书常见形态）时自动跳过证书校验，
+> 开箱即用；域名自签名服务可设 `LAEW_TLS_INSECURE=1` 全局放行，设 `0` 强制全局严格。
+> 仅跳过证书校验，TLS 加密不降级；rustls 纯 Rust 实现，Windows / macOS / Linux 行为一致。
+> 设计见 `docs/自签名证书TLS适配/01-设计与解决方案.md`。私网/loopback 地址默认被 SSRF 防护拦截，
+> 本地调试可设 `LAEW_ALLOW_PRIVATE_ENDPOINT=1` 放行。
+
 ### 三种使用模式
 
 ```bash
