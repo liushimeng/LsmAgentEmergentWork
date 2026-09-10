@@ -9,6 +9,7 @@
 //! - 提交时在滚动区底行回显已提交内容,保留输入痕迹;
 //! - 退出路径(Ctrl-D / `/exit` → teardown_pinned)还原滚动区并清空面板,不留残迹。
 use crate::tui::completion::{CompletionEngine, CompletionItem};
+use crate::tui::mention::{mention_token_at, FileSuggester};
 use crate::tui::theme;
 use crossterm::{
     cursor::MoveTo,
@@ -248,6 +249,52 @@ enum CompletionDecision {
     None,
 }
 
+/// @ 提及补全状态(D1,2026-09-10 第二十八轮,L1427 简化实现)。
+///
+/// 与斜杠命令补全共用浮层渲染,但语义不同:
+/// - 斜杠:replacement 替换**整个 buffer**;
+/// - @ 提及:replacement 只拼接替换**当前 @token**(`token_start..cursor`),
+///   Tab 接受(目录尾随 `/` 保持浮层继续钻取,文件尾随空格闭合),
+///   Enter 原样提交 buffer(不触发 slash 的真前缀自动提交)。
+///
+/// suggester 懒加载:首次检测到 @token 才构建(首次走 walkdir 快照),
+/// 生命周期 = 单次行编辑;工作目录 = 进程 cwd(与工程「工作目录」定义一致)。
+struct MentionCompletion {
+    suggester: Option<FileSuggester>,
+    token_start: Option<usize>,
+}
+
+impl MentionCompletion {
+    fn new() -> Self {
+        Self {
+            suggester: None,
+            token_start: None,
+        }
+    }
+
+    /// 检测光标前是否处于 @token 内;是则(必要时懒建 suggester)返回候选。
+    fn suggest(&mut self, buffer: &str, cursor: usize) -> Vec<CompletionItem> {
+        match mention_token_at(buffer, cursor) {
+            Some((start, frag)) => {
+                self.token_start = Some(start);
+                let sugg = self.suggester.get_or_insert_with(|| {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    FileSuggester::new(&cwd)
+                });
+                sugg.suggest(&frag)
+            }
+            None => {
+                self.token_start = None;
+                Vec::new()
+            }
+        }
+    }
+
+    fn deactivate(&mut self) {
+        self.token_start = None;
+    }
+}
+
 /// 决定 Tab/Enter 在补全菜单中的行为。
 ///
 /// 规则(2026-09-10 第 24 轮):
@@ -422,6 +469,8 @@ impl InputHandler {
         let mut completion_index: usize = 0;
         let mut completion_items: Vec<CompletionItem> = Vec::new();
         let mut overlay_lines: u16 = 0;
+        // @ 提及补全状态(D1):token 起点 + 懒加载文件建议器
+        let mut mention = MentionCompletion::new();
         // 粘贴登记簿:本次行编辑期间的大粘贴原文(D6,提交时 marker 展开)
         let mut pastes = PasteRegistry::new();
         // 批量合并排空时暂存的非字符事件(crossterm 无 pushback,不能丢)
@@ -464,6 +513,7 @@ impl InputHandler {
                         &mut completion_items,
                         overlay_lines,
                         engine,
+                        &mut mention,
                     )?;
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -504,6 +554,7 @@ impl InputHandler {
                                 &mut completion_items,
                                 overlay_lines,
                                 engine,
+                                &mut mention,
                             )?;
                         }
                         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -520,6 +571,7 @@ impl InputHandler {
                                 &mut completion_items,
                                 overlay_lines,
                                 engine,
+                                &mut mention,
                             )?;
                         }
                         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -574,6 +626,7 @@ impl InputHandler {
                                     &mut completion_items,
                                     overlay_lines,
                                     engine,
+                                    &mut mention,
                                 )?;
                             }
                         }
@@ -625,6 +678,59 @@ impl InputHandler {
                             }
                         }
                         KeyCode::Tab | KeyCode::Enter => {
+                            // @ 提及补全 + Tab(D1):拼接替换当前 token,不动 buffer 其余部分。
+                            // 目录(尾随 /)保持浮层继续钻取;文件(尾随空格)闭合浮层。
+                            // Enter 不做特殊处理,落到下方 slash 决策的兜底分支 = 原样提交。
+                            if key.code == KeyCode::Tab
+                                && completion_active
+                                && mention.token_start.is_some()
+                            {
+                                if let (Some(start), Some(item)) = (
+                                    mention.token_start,
+                                    completion_items.get(completion_index),
+                                ) {
+                                    let drill = item.replacement.ends_with('/');
+                                    let rep = item.replacement.clone();
+                                    // start 指向 `@` 本身。第二十八轮修订:replacement 已含 `@` 前缀,
+                                    // 故替换区间改为 `start..cursor`(整个 @token 含 @ 一起替换),
+                                    // 避免重复 `@`;cursor 落在 replacement 末尾。
+                                    buffer.replace_range(start..cursor, &rep);
+                                    cursor = start + rep.len();
+                                    if drill {
+                                        // 继续钻取:按新 fragment 刷新候选
+                                        overlay_lines = self.update_completion(
+                                            &mut stdout,
+                                            &layout,
+                                            prompt,
+                                            &buffer,
+                                            cursor,
+                                            &mut completion_active,
+                                            &mut completion_index,
+                                            &mut completion_items,
+                                            overlay_lines,
+                                            engine,
+                                            &mut mention,
+                                        )?;
+                                    } else {
+                                        completion_active = false;
+                                        completion_items.clear();
+                                        mention.deactivate();
+                                        overlay_lines = self.clear_overlay(
+                                            &mut stdout,
+                                            &layout,
+                                            overlay_lines,
+                                        )?;
+                                        self.redraw_line(
+                                            &mut stdout,
+                                            &layout,
+                                            prompt,
+                                            &buffer,
+                                            cursor,
+                                        )?;
+                                    }
+                                }
+                                continue;
+                            }
                             // Tab/Enter 在补全菜单打开时行为分流(2026-09-10 第 24 轮修复):
                             //  - Tab  永远只「接受补全」,不提交(用户预期);
                             //  - Enter 若 buffer 是当前选中补全项的「真前缀」,则用补全项的完整内容直接
@@ -692,6 +798,7 @@ impl InputHandler {
                                     &mut completion_items,
                                     overlay_lines,
                                     engine,
+                                    &mut mention,
                                 )?;
                             }
                         }
@@ -713,6 +820,7 @@ impl InputHandler {
                                     &mut completion_items,
                                     overlay_lines,
                                     engine,
+                                    &mut mention,
                                 )?;
                             }
                         }
@@ -731,6 +839,7 @@ impl InputHandler {
                                     &mut completion_items,
                                     overlay_lines,
                                     engine,
+                                    &mut mention,
                                 )?;
                             }
                         }
@@ -800,6 +909,7 @@ impl InputHandler {
                                 &mut completion_items,
                                 overlay_lines,
                                 engine,
+                                &mut mention,
                             )?;
                         }
                         _ => {}
@@ -1045,15 +1155,18 @@ impl InputHandler {
         items: &mut Vec<CompletionItem>,
         overlay_lines: u16,
         engine: &CompletionEngine,
+        mention: &mut MentionCompletion,
     ) -> io::Result<u16> {
         let mut lines = self.clear_overlay(stdout, layout, overlay_lines)?;
 
-        // 仅当输入以 '/' 开头且有后续字符时激活补全
+        // 斜杠命令补全优先(输入以 '/' 开头且有后续字符);
+        // 否则检测 @ 提及 token(D1,文件路径实时补全)
         let trimmed = buffer.trim_start();
         let new_items = if trimmed.starts_with('/') && trimmed.len() >= 2 {
+            mention.deactivate();
             engine.complete(trimmed)
         } else {
-            Vec::new()
+            mention.suggest(buffer, cursor)
         };
 
         if new_items.is_empty() {

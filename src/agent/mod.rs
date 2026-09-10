@@ -10,6 +10,7 @@
 //!
 //! 设计见 `docs/多Agent架构重构/01-设计与解决方案.md`。
 
+pub mod attachments;
 pub mod cancel;
 pub mod compact;
 pub mod context;

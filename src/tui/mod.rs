@@ -24,6 +24,7 @@ pub mod completion;
 pub mod engine;
 pub mod export;
 pub mod form;
+pub mod mention;
 pub mod pathfmt;
 pub mod render;
 pub mod screen;
@@ -259,6 +260,23 @@ impl TuiSession {
     /// 普通输入与自定义命令都汇入此处,保证取消/调试/输出/transcript 记录单点收敛。
     async fn dispatch_prompt(&mut self, raw: &str, prompt: &str) -> Result<bool> {
         let turn_ts = now_clock();
+        // D1 @ 提及展开(2026-09-10 第二十八轮,L1426):@路径/@"带空格"/@路径#L10-20
+        // 命中真实文件时以 <<<LAEW:ATTACHMENTS>>> 附件块追加到送入上下文的消息;
+        // transcript/导出仍记 raw 原文,不受影响。
+        let expanded = crate::agent::attachments::expand_mentions(prompt, &self.paths.work_dir);
+        let prompt_owned;
+        let prompt = if expanded.attached > 0 || !expanded.missed.is_empty() {
+            if expanded.attached > 0 {
+                println!("  [附件] 已附加 {} 个 @ 提及内容", expanded.attached);
+            }
+            for m in &expanded.missed {
+                println!("  [附件] 跳过 {m}");
+            }
+            prompt_owned = expanded.message;
+            prompt_owned.as_str()
+        } else {
+            prompt
+        };
         // 普通提示词:Orchestrator 编排(可取消:Ctrl-C 经 SIGINT 自动感知,零新增命令)
         self.session.context_mut().push(ChatMessage::user(prompt));
         // debug 模式:每个任务开始前重置采集器
@@ -1426,6 +1444,12 @@ fn print_help() {
     println!("  ├──────────────────────────────────────────────────────────┤");
     println!("  │  其他输入           作为提示词进入多轮对话                │");
     println!("  └──────────────────────────────────────────────────────────┘");
+    println!();
+    println!("  @ 文件提及(D1):");
+    println!("    @路径            引用文件内容(如 @src/main.rs)");
+    println!("    @\"带空格路径\"    引用含空格的路径");
+    println!("    @路径#L10-20     只引用指定行区间;@目录 列出目录条目");
+    println!("    输入 @ 后 Tab    实时路径补全(目录可继续钻取)");
     println!();
     println!("  补全快捷键:");
     println!("    输入 / 后显示命令列表");

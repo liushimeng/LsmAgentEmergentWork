@@ -1435,8 +1435,8 @@ export async function executeStatusLineCommand(
 
 | 编号 | 维度 | 描述 | P0/P1/P2 | 推荐 Rust crate |
 |------|------|------|----------|----------------|
-| L1426 | D1 @提及 | 三正则 + 行号片段 + 目录树 + 大文件降级 | P1 | `regex` + `walkdir` + `nucleo-matcher` + `ignore` |
-| L1427 | D1 @提及 | 实时自动补全 (Rust 索引 + 5s 节流 + .git/index mtime 唤醒) | P1 | `nucleo-matcher` + `gix` |
+| L1426 | D1 @提及 | 三正则 + 行号片段 + 目录树 + 大文件降级 | P1 | `regex` + `walkdir` + `nucleo-matcher` + `ignore` | ✅ 已实现(2026-09-10 第二十八轮,`src/agent/attachments.rs`,方案 `tmpPlan/2026-09-10_13`)
+| L1427 | D1 @提及 | 实时自动补全 (Rust 索引 + 5s 节流 + .git/index mtime 唤醒) | P1 | `nucleo-matcher` + `gix` | 🟡 部分实现(2026-09-10 第二十八轮,`src/tui/mention.rs`:walkdir 快照 + 5s 节流 + 前缀匹配;未做 .git/index mtime 唤醒与 nucleo 模糊匹配)
 | L1428 | D1 @提及 | IDE → CLI 双向 @ 注入 (WS 推送) | P2 | `tokio-tungstenite` |
 | L1429 | D1 @提及 | already_read_file 附件优化 (mtime 比对) | P2 | 直接在 `attachments.rs` |
 | L1430 | D1 @提及 | PDF reference 轻量引用 (只取元数据) | P2 | `lopdf` |

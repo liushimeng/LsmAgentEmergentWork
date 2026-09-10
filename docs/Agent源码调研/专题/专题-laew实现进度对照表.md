@@ -159,7 +159,7 @@
 
 | 维度 | 简称 | 已覆盖轮次 | laew 现状 | 新增 gap 段 |
 |------|------|-----------|---------|------------|
-| D1 | @提及系统 | ❌ 第 18 轮首次 | ❌ 0% | L1396-L1397 / L1426-L1427 / L1456+ / L1486+ / L1516-L1517 / L1546+ |
+| D1 | @提及系统 | ❌ 第 18 轮首次 + 第 28 轮落地 | 🟡 70%(✅ 2026-09-10 第二十八轮:`@path`/`@"带空格"`/`@path#L10-20` 提取注入 `src/agent/attachments.rs` + TUI @ 实时路径补全 `src/tui/mention.rs`;未做 IDE 双向注入/already_read mtime 去重/PDF 引用/nucleo 模糊匹配) | L1396-L1397 / L1426-L1427 / L1456+ / L1486+ / L1516-L1517 / L1546+ |
 | D2 | 自定义斜杠命令/Prompt 模板 | ❌ 第 18 轮首次 | 🟡 40%(✅ 2026-09-10:两级目录 `.laew/commands` + frontmatter + `$ARGUMENTS`/`$1-$9` + 补全集成 + `/commands`;未做 allowed-tools/model/`!`shell``/递归命名空间) | L1398-L1399 / L1428-L1434 / L1457+ / L1487-L1490 / L1518-L1521 / L1547+ |
 | D3 | 对话 Rewind/分支/时间旅行 | 🟡 第 18 轮首次(用户级) + 第 24 轮落地 | 🟡 60%(✅ 2026-09-10 第二十四轮:`/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,内存分支存储上限 10;未做:文件侧恢复/Git checkpoint 联动/消息树持久化/in-place 编辑) | L1400 / L1435+ / L1458+ / L1491-L1497 / L1522-L1527 / L1548+ |
 | D4 | 文件监视与工作区感知 | ❌ 第 18 轮首次(运行时) | ❌ 0% | L1415+ (预留) / L1459+ / L1498-L1499 / L1549+ |
@@ -347,3 +347,43 @@ JSONL 落盘,等 Session 持久化)/ in-place 消息编辑(pi 亦无)/ rewind �
 (用户手动,避免意外扣费)。
 
 **累计**:D3 维度 laew 现状 0% → 60%。
+
+---
+
+## 十、第二十八轮登记(2026-09-10,D1 @文件提及系统 + TUI 实时路径补全)
+
+**主题**:第十八轮 D1 维度 P1 落地(laew P0 路线图第 9 项)。laew 此前引用文件只能口述
+路径让 SubAgent 二次 Read(多一轮 LLM 往返);本轮实现 claudecode attachments.ts 的
+核心闭环:提交时提取 @ 提及 → 读取 → 以附件块注入上下文,并在 TUI 输入时提供
+@ 实时路径补全。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| L1426 | claudecode D1:@ 文件提及(三形态 + 行号片段 + 目录树 + 大文件降级) | P1 | ✅ | `src/agent/attachments.rs`(extract_mentions 双正则 + `#L10`/`#L10-20` 解析 + 逆区间归一 + agent/MCP 伪提及排除 + 目录内联 200 条 + 256KB 上限拒读 + 8KB 二进制嗅探 + 去重 + 单轮 8 附件上限 + `<<<LAEW:ATTACHMENTS>>>` 块),注入点 `tui/mod.rs::dispatch_prompt` + `main.rs`(-p/-f) | 2026-09-10 第二十八轮 |
+| L1427 | claudecode D1:@ 时实时自动补全 | P1 | 🟡 | `src/tui/mention.rs`(FileSuggester:walkdir 快照 max_depth 6 / 20000 条上限 / 5s 节流 + 前缀∪文件名匹配 + 15 条上限)+ `src/tui/input.rs`(MentionCompletion 状态 + update_completion @ 分支 + Tab 拼接替换钻取/闭合;Enter 原样提交) | 2026-09-10 第二十八轮 |
+
+**设计要点**:
+- **存在才注入**:不存在/二进制/超 256KB → missed 提示,原文不动 —— 邮箱
+  `user@host`、粘贴文本中的 `@` 天然不误命中(前置必须行首/空白)。
+- **transcript/rewind 记原文**:附件展开只作用于送入 Session 上下文的 user 消息,
+  raw 不动,D3 轮次扫描/导出/预览全部不受影响。
+- **Tab 语义**:replacement 保留 `@` 前缀(目录尾随 `/` 保持浮层继续钻取,文件尾随
+  空格闭合);Enter 不吞键、不做 slash 的真前缀自动提交。
+- **零新 crate**:regex/walkdir 既有依赖。
+
+**验证**:
+- 单元测试 716 全过(attachments 20 项 + mention 24 项,含并行会话补充的
+  @ 前缀回归钉子 2 项)
+- e2e `run_e2e.sh` 新增 §4l 六条 wire 级断言全过(附件块标记/canary 内容/目录内联/
+  不存在跳过提示/负例透传);全量 PASS=153 FAIL=3(3 个为第 21 轮记录的既有基线:
+  cache_policy 2 + export 1)
+- 顺带修复 run_e2e.sh 准备段 `rm -f /tmp/laew-e2e-root` 对目录无效导致残留 DB
+  级联失败(§2/§3)的脚本 bug(→ `rm -rf`)
+- TUI tmux 手测:@ 浮层出现 / Tab 钻取 src/ / 二次 Tab 接受文件 / Enter 提交
+  打印「[附件] 已附加 1 个」
+- 方案:`tmpPlan/2026-09-10_13-D1-文件提及与路径补全方案.md`
+
+**未做(后续候选)**:IDE 双向注入(无 IDE 端,L1428)/ already_read_file mtime 去重
+(L1429)/ PDF 轻量引用(L1430)/ nucleo 模糊匹配与 .git/index mtime 唤醒(L1427 完整版)。
+
+**累计**:D1 维度 laew 现状 0% → 70%。

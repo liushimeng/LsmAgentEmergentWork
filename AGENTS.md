@@ -7,7 +7,7 @@
 由 LLM 驱动的 Rust Agent CLI（二进制名 **`laew`**）。支持 Anthropic（anthropic-messages）与
 OpenAI（openai-completions）双协议，**多 Agent 架构**（6 角色 + 三档难度），
 内置 Bash / Read / Write 三个工具，TUI 多轮对话 + `-p` 单轮模式 + `-f` 文件提示词模式。
-TUI 支持斜杠命令自动补全（Tab 补全 + 行内提示）和文件路径补全。
+TUI 支持斜杠命令自动补全（Tab 补全 + 行内提示）和 @ 文件提及（`@路径` / `@"带空格"` / `@路径#L10-20` 行区间，输入 @ 后 Tab 实时路径补全、目录可钻取；命中文件内容以 `<<<LAEW:ATTACHMENTS>>>` 附件块自动注入上下文，实现见 `src/agent/attachments.rs` + `src/tui/mention.rs`）。
 配置持久化在 **根目录** SQLite（`LsmAgentEmergentWork.db`），不使用配置文件。
 完整架构设计见 `docs/多Agent架构重构/01-设计与解决方案.md`。
 

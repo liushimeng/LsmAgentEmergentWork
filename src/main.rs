@@ -269,6 +269,16 @@ async fn run_one_shot(
 
     // -p 单轮模式每次生成独立 Session(debug 采集器以其 Session ID 命名归属)
     let mut session = Session::new();
+    // D1 @ 提及展开(2026-09-10 第二十八轮,L1426):与 TUI dispatch_prompt 同一语义
+    let expanded =
+        lsm_agent::agent::attachments::expand_mentions(&prompt, &paths.work_dir);
+    if expanded.attached > 0 {
+        eprintln!("[laew] 已附加 {} 个 @ 提及内容", expanded.attached);
+    }
+    for m in &expanded.missed {
+        eprintln!("[laew] 跳过 @ 提及: {m}");
+    }
+    let prompt = expanded.message;
     session
         .context_mut()
         .push(lsm_agent::llm::ChatMessage::user(prompt.clone()));
