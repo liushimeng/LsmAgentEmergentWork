@@ -255,8 +255,11 @@ fn append_text_with_char_spans(spans: &mut Vec<Span>, text: &str, line: &DiffLin
         return;
     }
 
-    // 字符级着色:区间外为行颜色,区间内加背景色
-    let (base_fg, base_attrs, _hl_bg) = match line.tag {
+    // 字符级着色:区间外为行颜色,区间内叠加 hl_bg 背景色(2026-09-10 第二十五轮 F04/B07 测试修复)。
+    // 此前 `_hl_bg` 用 `_` 前缀被丢弃,4 主题的 diff_added_char_bg / diff_removed_char_bg 全部死代码;
+    // 兜底用 Color::White + REVERSE 反白,在不支持反白的终端会完全无视觉反馈。
+    // 修复:真正使用 hl_bg 作为背景色,fg 保持行色以维持语义(added = 绿底,removed = 红底)。
+    let (base_fg, base_attrs, hl_bg) = match line.tag {
         DiffTag::Added => (p.diff_added_fg, p.diff_added_attrs, p.diff_added_char_bg),
         DiffTag::Removed => (p.diff_removed_fg, p.diff_removed_attrs, p.diff_removed_char_bg),
         DiffTag::Context => (p.diff_context_fg, attr::NONE, Color::Reset),
@@ -268,13 +271,18 @@ fn append_text_with_char_spans(spans: &mut Vec<Span>, text: &str, line: &DiffLin
     let mut cursor: usize = 0;
     for (s, e) in byte_spans {
         if cursor < s {
-            spans.push(Span::with_attrs(text[cursor..s].to_string(), base_fg, base_attrs));
+            spans.push(Span::with_bg(text[cursor..s].to_string(), base_fg, Color::Reset, base_attrs));
         }
-        spans.push(Span::with_attrs(text[s..e].to_string(), Color::White, base_attrs | attr::REVERSE));
+        // 字符级变更区间:用 hl_bg 作为背景色,fg 保留行色;无 hl_bg(Context)时 fallback REVERSE
+        if hl_bg == Color::Reset {
+            spans.push(Span::with_attrs(text[s..e].to_string(), Color::White, base_attrs | attr::REVERSE));
+        } else {
+            spans.push(Span::with_bg(text[s..e].to_string(), base_fg, hl_bg, base_attrs));
+        }
         cursor = e;
     }
     if cursor < text.len() {
-        spans.push(Span::with_attrs(text[cursor..].to_string(), base_fg, base_attrs));
+        spans.push(Span::with_bg(text[cursor..].to_string(), base_fg, Color::Reset, base_attrs));
     }
 }
 
@@ -351,6 +359,46 @@ mod tests {
         let removed = hunk.lines.iter().find(|l| l.tag == DiffTag::Removed).unwrap();
         let added = hunk.lines.iter().find(|l| l.tag == DiffTag::Added).unwrap();
         assert!(!removed.char_spans.is_empty() || !added.char_spans.is_empty());
+    }
+
+    #[test]
+    fn render_char_level_applies_palette_bg() {
+        // 第二十五轮 F04/B07 测试:字符级 diff 高亮的 Span 必须携带主题 `hl_bg`,
+        // 让 4 套主题的 diff_added_char_bg / diff_removed_char_bg 真正生效。
+        // 此前 hl_bg 被 `_hl_bg` 丢弃,主题色全部死代码。
+        let old = "fn hello() {}\n";
+        let new = "fn world() {}\n";
+        let hunk = compute_diff(old, new, "old.rs", "new.rs");
+        let rendered = render_diff_hunk(&hunk);
+        let p = theme::palette();
+
+        // 收集所有 Span,验证至少有一个 Span 的 bg 与主题表里的 hl_bg 一致
+        // (added 行应有 diff_added_char_bg;removed 行应有 diff_removed_char_bg)。
+        let mut saw_added_bg = false;
+        let mut saw_removed_bg = false;
+        let mut saw_plain_reset = false;
+        for line_spans in &rendered {
+            for span in line_spans {
+                if span.bg == p.diff_added_char_bg && p.diff_added_char_bg != Color::Reset {
+                    saw_added_bg = true;
+                }
+                if span.bg == p.diff_removed_char_bg && p.diff_removed_char_bg != Color::Reset {
+                    saw_removed_bg = true;
+                }
+                // 行内非字符级高亮 Span 应保持 Reset(不污染整体底色)
+                if span.bg == Color::Reset {
+                    saw_plain_reset = true;
+                }
+            }
+        }
+        assert!(
+            saw_added_bg && saw_removed_bg,
+            "字符级 diff Span 必须应用主题 hl_bg 背景色(此前为死代码)"
+        );
+        assert!(
+            saw_plain_reset,
+            "非字符级区间的 Span 应保持 bg=Reset,避免污染行底色"
+        );
     }
 
     #[test]

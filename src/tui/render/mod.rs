@@ -19,20 +19,29 @@ use crate::tui::theme::{self, attr};
 pub struct Span {
     pub text: String,
     pub fg: Color,
+    /// 背景色;`Color::Reset` 表示不覆盖终端默认底色(2026-09-10 第二十五轮 F04/B07 测试新增)。
+    /// 字符级 diff 高亮使用此字段实现主题色背景块(此前 `_hl_bg` 字段被丢弃,主题色成为死代码)。
+    pub bg: Color,
     pub attrs: u8,
 }
 
 impl Span {
     pub fn new(text: impl Into<String>, fg: Color, attrs: u8) -> Self {
-        Self { text: text.into(), fg, attrs }
+        Self { text: text.into(), fg, bg: Color::Reset, attrs }
     }
 
     pub fn plain(text: impl Into<String>) -> Self {
-        Self { text: text.into(), fg: theme::FG, attrs: attr::NONE }
+        Self { text: text.into(), fg: theme::FG, bg: Color::Reset, attrs: attr::NONE }
     }
 
     pub fn with_attrs(text: impl Into<String>, fg: Color, attrs: u8) -> Self {
         Self::new(text, fg, attrs)
+    }
+
+    /// 带背景色构造(2026-09-10 第二十五轮 F04/B07 测试新增)。
+    /// 用于字符级 diff 高亮:让主题表中的 `diff_added_char_bg` / `diff_removed_char_bg` 真正生效。
+    pub fn with_bg(text: impl Into<String>, fg: Color, bg: Color, attrs: u8) -> Self {
+        Self { text: text.into(), fg, bg, attrs }
     }
 }
 

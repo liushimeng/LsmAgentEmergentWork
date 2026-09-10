@@ -460,9 +460,13 @@ impl TuiSession {
             print!("  ");
             for span in line_spans {
                 let attrs_ansi = attrs_to_ansi(span.attrs);
+                // 2026-09-10 第二十五轮 F04/B07 测试修复:输出 bg ANSI 序列,
+                // 让 `diff_added_char_bg` / `diff_removed_char_bg` 主题色真正生效(此前死代码)。
+                let bg_ansi = bg_color_ansi(span.bg);
                 print!(
-                    "\x1b[38;5;{}m{}{}\x1b[0m",
+                    "\x1b[38;5;{}m{}{}{}\x1b[0m",
                     color_to_ansi256(span.fg),
+                    bg_ansi,
                     attrs_ansi,
                     span.text
                 );
@@ -499,9 +503,13 @@ impl TuiSession {
                 print!("  ");
                 for span in spans {
                     let attrs_ansi = attrs_to_ansi(span.attrs);
+                    // 2026-09-10 第二十五轮 F04/B07 测试修复:同样支持 bg ANSI 输出,
+                    // 为后续语法高亮扩展(关键字底色 / 错误标注底色等)留口子。
+                    let bg_ansi = bg_color_ansi(span.bg);
                     print!(
-                        "\x1b[38;5;{}m{}{}\x1b[0m",
+                        "\x1b[38;5;{}m{}{}{}\x1b[0m",
                         color_to_ansi256(span.fg),
+                        bg_ansi,
                         attrs_ansi,
                         span.text
                     );
@@ -1378,6 +1386,38 @@ fn attrs_to_ansi(attrs: u8) -> String {
     s
 }
 
+/// 把背景色转为 ANSI 背景序列(2026-09-10 第二十五轮 F04/B07 测试新增)。
+/// `Color::Reset` 返回空串(不输出 bg 序列,沿用终端默认底色)。
+/// 非 Reset 时返回 `\x1b[48;5;{idx}m` 形式,256 色背景块。
+fn bg_color_ansi(bg: crossterm::style::Color) -> String {
+    use crossterm::style::Color;
+    match bg {
+        Color::Reset => String::new(),
+        _ => format!("\x1b[48;5;{}m", color_to_ansi256(bg)),
+    }
+}
+
+#[cfg(test)]
+mod bg_color_ansi_tests {
+    use super::*;
+    use crossterm::style::Color;
+
+    #[test]
+    fn reset_returns_empty_string() {
+        // Color::Reset 不输出 bg 序列(避免污染终端默认底色)。
+        assert_eq!(bg_color_ansi(Color::Reset), "");
+    }
+
+    #[test]
+    fn non_reset_emits_bg48_5_idx_m() {
+        // 非 Reset 输出 `\x1b[48;5;{idx}m`,与 fg 输出的 `\x1b[38;5;{idx}m` 对称。
+        let s = bg_color_ansi(Color::DarkGreen);
+        assert!(s.starts_with("\x1b[48;5;"), "got: {s}");
+        assert!(s.ends_with("m"), "got: {s}");
+        // DarkGreen 在 color_to_ansi256 里映射到索引 2。
+        assert_eq!(s, "\x1b[48;5;2m");
+    }
+}
 /// 把 crossterm Color 转为 ANSI 256 色索引(简化映射)。
 fn color_to_ansi256(color: crossterm::style::Color) -> u8 {
     use crossterm::style::Color;

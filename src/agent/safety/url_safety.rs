@@ -112,34 +112,34 @@ fn check_v4_safety(v4: Ipv4Addr) -> Result<()> {
     let o = v4.octets();
     let range = |start: [u8; 4], end: [u8; 4]| o >= start && o <= end;
     if range([0, 0, 0, 0], [0, 255, 255, 255]) {
-        return Err(err("0.0.0.0/8 当前网络/未指派"));
+        return Err(err_with_hint("0.0.0.0/8 当前网络/未指派", "公网 provider 才会命中"));
     }
     if range([10, 0, 0, 0], [10, 255, 255, 255]) {
-        return Err(err("10.0.0.0/8 私网"));
+        return Err(err_with_hint("10.0.0.0/8 私网", "局域网 / 内网网关 / Ollama 局域网访问"));
     }
     if range([100, 64, 0, 0], [100, 127, 255, 255]) {
-        return Err(err("100.64.0.0/10 CGNAT"));
+        return Err(err_with_hint("100.64.0.0/10 CGNAT", "运营商级 NAT 段"));
     }
     if range([127, 0, 0, 0], [127, 255, 255, 255]) {
-        return Err(err("127.0.0.0/8 loopback"));
+        return Err(err_with_hint("127.0.0.0/8 loopback", "本机 loopback;本地 Ollama / LMStudio / mock LLM 服务"));
     }
     if range([169, 254, 0, 0], [169, 254, 255, 255]) {
-        return Err(err("169.254.0.0/16 link-local(云元数据)"));
+        return Err(err_with_hint("169.254.0.0/16 link-local(云元数据)", "云厂商元数据段"));
     }
     if range([172, 16, 0, 0], [172, 31, 255, 255]) {
-        return Err(err("172.16.0.0/12 私网"));
+        return Err(err_with_hint("172.16.0.0/12 私网", "Docker bridge / k8s Pod IP / 局域网"));
     }
     if range([192, 168, 0, 0], [192, 168, 255, 255]) {
-        return Err(err("192.168.0.0/16 私网"));
+        return Err(err_with_hint("192.168.0.0/16 私网", "家庭 / 公司局域网"));
     }
     if range([224, 0, 0, 0], [239, 255, 255, 255]) {
-        return Err(err("224.0.0.0/4 multicast"));
+        return Err(err_with_hint("224.0.0.0/4 multicast", "组播地址"));
     }
     if range([240, 0, 0, 0], [255, 255, 255, 254]) {
-        return Err(err("240.0.0.0/4 reserved"));
+        return Err(err_with_hint("240.0.0.0/4 reserved", "IANA 保留段"));
     }
     if o == [255, 255, 255, 255] {
-        return Err(err("255.255.255.255 broadcast"));
+        return Err(err_with_hint("255.255.255.255 broadcast", "广播地址"));
     }
     Ok(())
 }
@@ -149,22 +149,22 @@ fn check_v4_safety(v4: Ipv4Addr) -> Result<()> {
 /// 拒绝范围:`::` / `::1` / `fc00::/7` / `fe80::/10` / `ff00::` / IPv4-mapped 解包重检。
 fn check_v6_safety(v6: Ipv6Addr) -> Result<()> {
     if v6.is_unspecified() {
-        return Err(err(":: 未指定地址"));
+        return Err(err_with_hint(":: 未指定地址", "公网 provider 不会用"));
     }
     if v6.is_loopback() {
-        return Err(err("::1 loopback"));
+        return Err(err_with_hint("::1 loopback", "本机 loopback;本地 Ollama / LMStudio / mock LLM 服务"));
     }
     if v6.is_multicast() {
-        return Err(err("ff00::/8 multicast"));
+        return Err(err_with_hint("ff00::/8 multicast", "组播地址"));
     }
     let s = v6.segments();
     // unique-local fc00::/7 → 前 7 位 = 0b1111_110x
     if (s[0] & 0xfe00) == 0xfc00 {
-        return Err(err("fc00::/7 unique-local"));
+        return Err(err_with_hint("fc00::/7 unique-local", "IPv6 私网段"));
     }
     // link-local fe80::/10 → 前 10 位 = 0b1111_1110_10
     if (s[0] & 0xffc0) == 0xfe80 {
-        return Err(err("fe80::/10 link-local"));
+        return Err(err_with_hint("fe80::/10 link-local", "IPv6 链路本地段,仅同网段有效"));
     }
     // IPv4-mapped IPv6 (::ffff:a.b.c.d) → 解包后再次判 IPv4 私网
     if let Some(v4) = ipv4_mapped(&v6) {
@@ -187,8 +187,17 @@ fn ipv4_mapped(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
 }
 
 #[inline]
-fn err(reason: &'static str) -> ConfigError {
-    ConfigError::UrlSafety(format!("private/internal IP 被拦截: {reason}"))
+fn err_with_hint(reason: &'static str, hint: &'static str) -> ConfigError {
+    // URL 安全检查被拒时,文案末尾固定追加 escape hatch 提示,
+    // 让本地 Ollama / LMStudio / 局域网 / mock 测试用户立刻知道有解(2026-09-10 第二十五轮 F04/B07 测试发现并修复)。
+    // 同时给出该拦截场景的针对性说明,帮助用户判断是真错配还是合理期望。
+    if hint.is_empty() {
+        ConfigError::UrlSafety(format!("private/internal IP 被拦截: {reason}"))
+    } else {
+        ConfigError::UrlSafety(format!(
+            "private/internal IP 被拦截: {reason}。{hint}。\n  提示:本地调试 / 局域网 / mock 测试 provider 可设 `LAEW_ALLOW_PRIVATE_ENDPOINT=1` 放行(详见 AGENTS.md)"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +317,26 @@ mod tests {
         assert!(is_safe_endpoint("http://10.0.0.1:11434").is_ok());
         assert!(is_safe_endpoint("http://192.168.1.1").is_ok());
         std::env::remove_var("LAEW_ALLOW_PRIVATE_ENDPOINT");
+    }
+
+    #[test]
+    fn endpoint_loopback_error_includes_escape_hatch_hint() {
+        // 第二十五轮 F04/B07 测试:URL 安全检查被拒时,文案必须告知 escape hatch,
+        // 让本地 Ollama / LMStudio / mock LLM 用户立刻知道有解(2026-09-10)。
+        let err = is_safe_endpoint("http://127.0.0.1:11434").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LAEW_ALLOW_PRIVATE_ENDPOINT"),
+            "loopback error should mention escape hatch; got: {msg}"
+        );
+        assert!(
+            msg.contains("127.0.0.0/8"),
+            "loopback error should mention the blocked CIDR; got: {msg}"
+        );
+        assert!(
+            msg.contains("loopback") || msg.contains("loopback"),
+            "loopback error should describe loopback semantics; got: {msg}"
+        );
     }
 
     #[test]
