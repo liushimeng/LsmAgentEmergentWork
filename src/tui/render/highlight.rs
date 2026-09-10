@@ -255,15 +255,17 @@ pub fn highlight_line(line: &str, lang: HlLang) -> Vec<Span> {
 
 /// 给 token 上色。
 fn colorize(text: &str, token: HlToken) -> Span {
+    // 当前主题(D12,2026-09-10 第二十三轮):高亮 token 颜色跟随主题切换
+    let p = theme::palette();
     match token {
-        HlToken::Keyword => Span::with_attrs(text, theme::HL_KEYWORD_FG, theme::HL_KEYWORD_ATTRS),
-        HlToken::String => Span::with_attrs(text, theme::HL_STRING_FG, attr::NONE),
-        HlToken::Number => Span::with_attrs(text, theme::HL_NUMBER_FG, attr::NONE),
-        HlToken::Comment => Span::with_attrs(text, theme::HL_COMMENT_FG, theme::HL_COMMENT_ATTRS),
-        HlToken::Type => Span::with_attrs(text, theme::HL_TYPE_FG, theme::HL_TYPE_ATTRS),
-        HlToken::Function => Span::with_attrs(text, theme::HL_FUNCTION_FG, theme::HL_FUNCTION_ATTRS),
-        HlToken::Operator => Span::with_attrs(text, theme::HL_OPERATOR_FG, attr::NONE),
-        HlToken::Punctuation => Span::with_attrs(text, theme::HL_PUNCTUATION_FG, attr::NONE),
+        HlToken::Keyword => Span::with_attrs(text, p.hl_keyword_fg, p.hl_keyword_attrs),
+        HlToken::String => Span::with_attrs(text, p.hl_string_fg, attr::NONE),
+        HlToken::Number => Span::with_attrs(text, p.hl_number_fg, attr::NONE),
+        HlToken::Comment => Span::with_attrs(text, p.hl_comment_fg, p.hl_comment_attrs),
+        HlToken::Type => Span::with_attrs(text, p.hl_type_fg, p.hl_type_attrs),
+        HlToken::Function => Span::with_attrs(text, p.hl_function_fg, p.hl_function_attrs),
+        HlToken::Operator => Span::with_attrs(text, p.hl_operator_fg, attr::NONE),
+        HlToken::Punctuation => Span::with_attrs(text, p.hl_punctuation_fg, attr::NONE),
         HlToken::Plain => Span::plain(text),
     }
 }

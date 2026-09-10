@@ -57,9 +57,10 @@ pub struct Cell {
 
 impl Cell {
     fn blank() -> Self {
+        // 当前主题 fg(2026-09-10 第二十三轮 D12):保证主题切换时空白 cell 颜色跟随
         Self {
             ch: ' ',
-            fg: theme::FG,
+            fg: theme::palette().fg,
             bg: Color::Reset,
             attrs: attr::NONE,
             skip: false,
@@ -155,43 +156,45 @@ impl Frame {
         if w < 2 || h < 2 {
             return;
         }
+        // 当前活跃主题(D12,2026-09-10 第二十三轮):边框色跟随主题切换
+        let p = theme::palette();
         // 顶 / 底
         for x in 1..(w - 1) {
-            self.put_char(area.x + x as u16, area.y, '─', theme::ACCENT, attr::NONE);
+            self.put_char(area.x + x as u16, area.y, '─', p.accent, attr::NONE);
             self.put_char(
                 area.x + x as u16,
                 area.y + area.height - 1,
                 '─',
-                theme::ACCENT,
+                p.accent,
                 attr::NONE,
             );
         }
         // 左 / 右
         for y in 1..(h - 1) {
-            self.put_char(area.x, area.y + y as u16, '│', theme::ACCENT, attr::NONE);
+            self.put_char(area.x, area.y + y as u16, '│', p.accent, attr::NONE);
             self.put_char(
                 area.x + area.width - 1,
                 area.y + y as u16,
                 '│',
-                theme::ACCENT,
+                p.accent,
                 attr::NONE,
             );
         }
         // 四角
-        self.put_char(area.x, area.y, '╭', theme::ACCENT, attr::NONE);
-        self.put_char(area.x + area.width - 1, area.y, '╮', theme::ACCENT, attr::NONE);
+        self.put_char(area.x, area.y, '╭', p.accent, attr::NONE);
+        self.put_char(area.x + area.width - 1, area.y, '╮', p.accent, attr::NONE);
         self.put_char(
             area.x,
             area.y + area.height - 1,
             '╰',
-            theme::ACCENT,
+            p.accent,
             attr::NONE,
         );
         self.put_char(
             area.x + area.width - 1,
             area.y + area.height - 1,
             '╯',
-            theme::ACCENT,
+            p.accent,
             attr::NONE,
         );
 
@@ -201,7 +204,7 @@ impl Frame {
             self.put_str(
                 Rect::new(area.x + 2, area.y, label_w, 1),
                 &label,
-                theme::ACCENT,
+                p.accent,
                 attr::BOLD,
             );
         }

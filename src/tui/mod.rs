@@ -127,6 +127,12 @@ impl TuiSession {
             ),
         }
         println!("║  Session: {} ║", fit_display(&self.session.id, 46));
+        // D12 主题提示行(2026-09-10 第二十三轮):告知用户当前主题与切换方式
+        let active_theme = crate::tui::theme::active_kind();
+        println!(
+            "║  主  题 : {} ║",
+            fit_display(&format!("{}  (切换 /theme [kind])", active_theme.as_str()), 46)
+        );
         println!("╚══════════════════════════════════════════════════════════╝");
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
         println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出");
@@ -561,6 +567,10 @@ impl TuiSession {
                     }
                 }
             }
+            "theme" | "t" => {
+                // D12 多主题切换命令(2026-09-10 第二十三轮)
+                self.run_theme(rest_args);
+            }
             "" => {}
             other => {
                 // 内置未命中 → 查自定义命令(D2);命中则渲染模板并送编排。
@@ -588,6 +598,50 @@ impl TuiSession {
             }
         }
         Ok(false)
+    }
+
+    /// `/theme [kind]`(D12,2026-09-10 第二十三轮):列出或切换主题。
+    ///
+    /// - 无参数:列出全部主题 + 当前活跃主题 + 实时生效范围说明
+    /// - 有参数:解析 → 切换;返回旧主题供输出「✓ 已从 X 切换到 Y」
+    ///
+    /// 实时生效范围(本轮实现):
+    ///   - 主屏 banner 主题行:下次会话或 `/clear` 重打 banner
+    ///   - 边框 (engine::border_box):下次子屏重绘
+    ///   - diff 标题/行号/前后缀/字符级着色:下次 `/diff` 调用
+    ///   - 语法高亮 token:下次围栏渲染
+    ///   - Cell::blank() 空白底:全屏实时
+    /// 不实时(需重启):子屏硬编码 const(SELECTED_FG / INPUT_BG 等),所以打印友好提示
+    fn run_theme(&self, arg: &str) {
+        let current = crate::tui::theme::active_kind();
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            println!("  当前主题: {}", current.as_str());
+            println!("  可用主题:");
+            for k in crate::tui::theme::all_kinds() {
+                let marker = if *k == current { " * " } else { "   " };
+                println!("    {marker}{:<14} {}", k.as_str(), k.describe());
+            }
+            println!("  切换主题:");
+            println!("    /theme <kind>   例如: /theme dark-contrast");
+            println!("    LAEW_THEME=dark-contrast ./laew   (启动期初始化)");
+            println!("  注:核心 cell 渲染(banner / 边框 / diff / 高亮)实时生效;");
+            println!("      子屏局部配色需重启会话才能完整生效。");
+            return;
+        }
+        match crate::tui::theme::ThemeKind::from_env_str(trimmed) {
+            Some(kind) => {
+                let prev = crate::tui::theme::set_active(kind);
+                println!("  ✓ 已切换主题: {} → {}", prev.as_str(), kind.as_str());
+                println!("    核心 cell 渲染实时生效(下次重绘可见)。");
+                println!("    子屏局部配色需重启会话才能完整生效。");
+            }
+            None => {
+                println!("  未知主题: {trimmed}");
+                println!("  可选: default | dark-contrast | light | daltonized");
+                println!("  输入 /theme 查看主题列表与说明。");
+            }
+        }
     }
 
     /// `/export [path]`(D8):导出当前会话 transcript。
@@ -986,6 +1040,7 @@ fn print_help() {
     println!("  │  /model            显示当前模型                           │");
     println!("  │  /export [path]    导出当前会话(Markdown, .json 后缀 JSON) │");
     println!("  │  /diff <old> <new> 并排 diff 两个文件(行级+字符级着色)    │");
+    println!("  │  /theme [kind]     查看或切换主题(D12 a11y 配色)          │");
     println!("  │  /commands         列出自定义斜杠命令                      │");
     println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
     println!("  │  /provider list    列出所有接入记录                       │");

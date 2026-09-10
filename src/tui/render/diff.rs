@@ -179,16 +179,19 @@ fn compute_char_spans_rev(removed: &str, added: &str) -> Vec<(usize, usize)> {
 pub fn render_diff_hunk(hunk: &DiffHunk) -> RenderLines {
     let mut out: RenderLines = Vec::new();
 
+    // 当前主题(D12,2026-09-10 第二十三轮):diff 颜色跟随主题切换
+    let p = theme::palette();
+
     // 标题行
     out.push(vec![Span::with_attrs(
         format!("--- {}", hunk.old_path),
-        theme::DIFF_HEADER_FG,
-        theme::DIFF_HEADER_ATTRS,
+        p.diff_header_fg,
+        p.diff_header_attrs,
     )]);
     out.push(vec![Span::with_attrs(
         format!("+++ {}", hunk.new_path),
-        theme::DIFF_HEADER_FG,
-        theme::DIFF_HEADER_ATTRS,
+        p.diff_header_fg,
+        p.diff_header_attrs,
     )]);
 
     // 计算行号宽度
@@ -198,14 +201,14 @@ pub fn render_diff_hunk(hunk: &DiffHunk) -> RenderLines {
     let w_new = line_no_width(max_new);
 
     for line in &hunk.lines {
-        out.push(render_diff_line(line, w_old, w_new));
+        out.push(render_diff_line(line, w_old, w_new, &p));
     }
 
     out
 }
 
 /// 渲染单行:行号 + 前缀 + 文本(带字符级着色)。
-fn render_diff_line(line: &DiffLine, w_old: usize, w_new: usize) -> Vec<Span> {
+fn render_diff_line(line: &DiffLine, w_old: usize, w_new: usize, p: &theme::Palette) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
 
     // 左栏行号(旧)
@@ -213,40 +216,40 @@ fn render_diff_line(line: &DiffLine, w_old: usize, w_new: usize) -> Vec<Span> {
         Some(n) => format!("{:>w_old$}", n, w_old = w_old),
         None => " ".repeat(w_old),
     };
-    spans.push(Span::with_attrs(old_str, theme::DIFF_LINE_NO_FG, theme::DIFF_LINE_NO_ATTRS));
+    spans.push(Span::with_attrs(old_str, p.diff_line_no_fg, p.diff_line_no_attrs));
 
     // 分隔
-    spans.push(Span::with_attrs("│", theme::DIFF_LINE_NO_FG, theme::DIFF_LINE_NO_ATTRS));
+    spans.push(Span::with_attrs("│", p.diff_line_no_fg, p.diff_line_no_attrs));
 
     // 右栏行号(新)
     let new_str = match line.line_no_new {
         Some(n) => format!("{:>w_new$}", n, w_new = w_new),
         None => " ".repeat(w_new),
     };
-    spans.push(Span::with_attrs(new_str, theme::DIFF_LINE_NO_FG, theme::DIFF_LINE_NO_ATTRS));
+    spans.push(Span::with_attrs(new_str, p.diff_line_no_fg, p.diff_line_no_attrs));
 
     // 前缀符号(+/-/` `)
     let (prefix, prefix_fg, prefix_attrs) = match line.tag {
-        DiffTag::Added => ("+ ", theme::DIFF_ADDED_FG, theme::DIFF_ADDED_ATTRS),
-        DiffTag::Removed => ("- ", theme::DIFF_REMOVED_FG, theme::DIFF_REMOVED_ATTRS),
-        DiffTag::Context => ("  ", theme::DIFF_CONTEXT_FG, attr::NONE),
+        DiffTag::Added => ("+ ", p.diff_added_fg, p.diff_added_attrs),
+        DiffTag::Removed => ("- ", p.diff_removed_fg, p.diff_removed_attrs),
+        DiffTag::Context => ("  ", p.diff_context_fg, attr::NONE),
     };
     spans.push(Span::with_attrs(prefix, prefix_fg, prefix_attrs));
 
     // 文本(字符级着色)
-    append_text_with_char_spans(&mut spans, &line.text, line);
+    append_text_with_char_spans(&mut spans, &line.text, line, p);
 
     spans
 }
 
 /// 追加文本,按字符级区间着色。
-fn append_text_with_char_spans(spans: &mut Vec<Span>, text: &str, line: &DiffLine) {
+fn append_text_with_char_spans(spans: &mut Vec<Span>, text: &str, line: &DiffLine, p: &theme::Palette) {
     if line.char_spans.is_empty() {
         // 无字符级变更,整行统一着色
         let (fg, attrs) = match line.tag {
-            DiffTag::Added => (theme::DIFF_ADDED_FG, theme::DIFF_ADDED_ATTRS),
-            DiffTag::Removed => (theme::DIFF_REMOVED_FG, theme::DIFF_REMOVED_ATTRS),
-            DiffTag::Context => (theme::DIFF_CONTEXT_FG, attr::NONE),
+            DiffTag::Added => (p.diff_added_fg, p.diff_added_attrs),
+            DiffTag::Removed => (p.diff_removed_fg, p.diff_removed_attrs),
+            DiffTag::Context => (p.diff_context_fg, attr::NONE),
         };
         spans.push(Span::with_attrs(text.to_string(), fg, attrs));
         return;
@@ -254,9 +257,9 @@ fn append_text_with_char_spans(spans: &mut Vec<Span>, text: &str, line: &DiffLin
 
     // 字符级着色:区间外为行颜色,区间内加背景色
     let (base_fg, base_attrs, _hl_bg) = match line.tag {
-        DiffTag::Added => (theme::DIFF_ADDED_FG, theme::DIFF_ADDED_ATTRS, theme::DIFF_ADDED_CHAR_BG),
-        DiffTag::Removed => (theme::DIFF_REMOVED_FG, theme::DIFF_REMOVED_ATTRS, theme::DIFF_REMOVED_CHAR_BG),
-        DiffTag::Context => (theme::DIFF_CONTEXT_FG, attr::NONE, Color::Reset),
+        DiffTag::Added => (p.diff_added_fg, p.diff_added_attrs, p.diff_added_char_bg),
+        DiffTag::Removed => (p.diff_removed_fg, p.diff_removed_attrs, p.diff_removed_char_bg),
+        DiffTag::Context => (p.diff_context_fg, attr::NONE, Color::Reset),
     };
 
     // 将字符索引区间转换为字节偏移

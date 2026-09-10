@@ -81,6 +81,13 @@ impl CompletionEngine {
                 "并排 diff 两个文件(行级+字符级着色)",
                 "/diff <old> <new>",
             ),
+            // 2026-09-10 第二十三轮 D12:主题切换(无参 /theme 列出所有主题与说明)
+            SlashCommand::builtin(
+                "theme",
+                &["t"],
+                "查看或切换主题(D12 a11y 配色,4 套)",
+                "/theme [default|dark-contrast|light|daltonized]",
+            ),
         ];
         Self { builtin, custom: Vec::new() }
     }
