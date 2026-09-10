@@ -44,7 +44,16 @@ if pgrep -x laew >/dev/null 2>&1; then
   pgrep -ax laew | sed 's/^/[rebuild]   /' >&2
   echo "[rebuild] ⚠️  即将覆盖 ./laew,运行中的旧实例不受影响,但新启动才用新二进制" >&2
 fi
+# 2026-09-10: 处理「运行中二进制被占用」(ETXTBSY)。
+# Linux 不允许直接 overwrite 正在执行的 binary,但允许 rename(只改目录项,
+# 不影响运行中的 inode)。策略: 先重命名旧文件 → 复制新文件 → 清理旧文件。
+# 运行中的旧实例继续用旧 inode,新启动的才用新二进制。
+if [[ -f "$ROOT_DIR/laew" ]]; then
+  mv -f "$ROOT_DIR/laew" "$ROOT_DIR/laew.old" 2>/dev/null \
+    || echo "[rebuild] ⚠️  无法重命名旧 laew,尝试直接覆盖" >&2
+fi
 cp -f "$BIN_PATH" "$ROOT_DIR/laew"
 chmod +x "$ROOT_DIR/laew"
+rm -f "$ROOT_DIR/laew.old" 2>/dev/null || true
 echo "[rebuild] 已输出: $ROOT_DIR/laew"
 echo "[rebuild] 完成 ✓"
