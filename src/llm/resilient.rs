@@ -61,9 +61,15 @@ pub fn set_progress_feedback(enabled: bool) {
 
 /// 等待心跳守卫:存活期间每 20s 向 stderr 输出一行等待进度,
 /// 帮助用户区分「正常生成中」与「已经挂死」;drop 时自动中止后台 ticker。
+///
+/// 行尾的 `#N` 为进程内请求序号(2026-09-10 第 28 轮 B09/B10):多请求并发在途时
+/// (如主链路 + Debug 报告生成),固定 label 会让两行心跳完全相同无法区分。
 pub struct ProgressGuard {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
+
+/// 进程内 ProgressGuard 自增序号,用于区分并发在途请求的心跳行。
+static PROGRESS_GUARD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl ProgressGuard {
     pub fn start(label: &str) -> Self {
@@ -72,6 +78,7 @@ impl ProgressGuard {
         }
         let label = label.to_string();
         let started_at = Instant::now();
+        let seq = PROGRESS_GUARD_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         let handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(20));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -79,7 +86,11 @@ impl ProgressGuard {
             tick.tick().await;
             loop {
                 tick.tick().await;
-                eprintln!("[laew] {}等待中… {}s", label, started_at.elapsed().as_secs());
+                eprintln!(
+                    "[laew] {}等待中… {}s (#{seq})",
+                    label,
+                    started_at.elapsed().as_secs()
+                );
             }
         });
         Self { handle: Some(handle) }

@@ -87,7 +87,7 @@ fn build_user_id(device_id: &str, session_id: &str, agent_name: &str) -> String 
 }
 
 fn convert_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
+    let raw: Vec<Value> = messages
         .iter()
         .map(|m| {
             let role = match m.role {
@@ -125,7 +125,34 @@ fn convert_messages(messages: &[ChatMessage]) -> Vec<Value> {
                 .collect();
             json!({ "role": role, "content": content })
         })
-        .collect()
+        .collect();
+    merge_adjacent_same_role(raw)
+}
+
+/// 出站前合并相邻同角色消息(2026-09-10 第 28 轮 B09/B10 修复)。
+///
+/// laew 的上下文构造会产生连续多条 role=user —— 典型序列:
+/// `[user SESSION_HISTORY] [user PROJECT_CONTEXT] [user 提示词]`。
+/// 官方 api.anthropic.com 与宽容网关可接受;但**严格 Anthropic 协议实现会
+/// 400 拒绝连续同角色消息**(LsmAgentGame 工程 CLAUDE.md §14.1 记录的 DouBao
+/// 严格代理同类事故,其修复即出站前合并)。laew 支持任意 endpoint 接入,
+/// 在 wire 层统一合并:相邻同角色消息拼接 content blocks 为一条。
+/// `apply_cache_policy` 在本函数之后运行,cache_control 仍落最后一条 user
+/// 消息的末 text block,语义不受影响。
+fn merge_adjacent_same_role(entries: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(last) = out.last_mut() {
+            if last["role"] == entry["role"] {
+                let mut blocks = last["content"].as_array().cloned().unwrap_or_default();
+                blocks.extend(entry["content"].as_array().cloned().unwrap_or_default());
+                last["content"] = Value::Array(blocks);
+                continue;
+            }
+        }
+        out.push(entry);
+    }
+    out
 }
 
 fn convert_tools(tools: &[ToolDef]) -> Vec<Value> {
@@ -929,5 +956,65 @@ mod tests {
     #[test]
     fn _role_marker() {
         let _ = Role::System;
+    }
+
+    // ===== 第 28 轮 B09/B10:出站前合并相邻同角色消息(wire 兼容严格 Anthropic 网关) =====
+
+    #[test]
+    fn consecutive_user_messages_merged_into_one() {
+        // laew 典型上下文:SESSION_HISTORY + PROJECT_CONTEXT + 用户提示词
+        // 三条连续 user —— 严格网关会 400,必须在 wire 层合并为一条。
+        let msgs = vec![
+            ChatMessage::user("<<<LAEW:SESSION_HISTORY>>> 摘要"),
+            ChatMessage::user("<<<LAEW:PROJECT_CONTEXT>>> 背景"),
+            ChatMessage::user("香农信息熵是什么?"),
+        ];
+        let v = convert_messages(&msgs);
+        assert_eq!(v.len(), 1, "三条连续 user 必须合并为一条: {v:?}");
+        assert_eq!(v[0]["role"], "user");
+        let blocks = v[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["text"], "<<<LAEW:SESSION_HISTORY>>> 摘要");
+        assert_eq!(blocks[2]["text"], "香农信息熵是什么?");
+    }
+
+    #[test]
+    fn user_then_tool_result_merged_as_user_blocks() {
+        // Role::Tool 映射为 user + tool_result 块;紧邻 user 文本时同样合并
+        // (Anthropic 允许同一 user 消息内 text 与 tool_result 块共存)。
+        let msgs = vec![
+            ChatMessage::user("跑个命令"),
+            ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t9".into(),
+                name: "Bash".into(),
+                input: json!({"command": "ls"}),
+            }]),
+            ChatMessage::tool_result("t9", "ok", false),
+            ChatMessage::user("结果很好,继续"),
+        ];
+        let v = convert_messages(&msgs);
+        // 期望:user(文本) → assistant(tool_use) → user(tool_result+text 合并)
+        assert_eq!(v.len(), 3, "got: {v:?}");
+        assert_eq!(v[2]["role"], "user");
+        let blocks = v[2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[1]["type"], "text");
+    }
+
+    #[test]
+    fn alternating_roles_untouched() {
+        // 正常交替序列不受合并影响(逐条保持原样)。
+        let msgs = vec![
+            ChatMessage::user("q1"),
+            ChatMessage::assistant(vec![ContentBlock::text("a1")]),
+            ChatMessage::user("q2"),
+        ];
+        let v = convert_messages(&msgs);
+        assert_eq!(v.len(), 3);
+        assert_eq!(
+            v.iter().map(|m| m["role"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["user", "assistant", "user"]
+        );
     }
 }

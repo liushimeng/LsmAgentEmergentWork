@@ -318,15 +318,25 @@ impl TuiSession {
             // 初始 spinner 状态:协程启动后立刻打印 ⠋ (0s) 占位,收到第一条
             // 阶段消息时清掉 + 进入正常 stage/waiting 心跳。
             let mut initial_spinner_active: bool = true;
+            // 初始 spinner 的计时起点:首个 LLM 请求在途(尚无 stage 消息)期间用它
+            // 计算真实等待秒数,30s/60s 慢提示在「首字节未到」阶段同样生效
+            // (2026-09-10 第 28 轮 B09/B10 修复:此前固定 (0s),慢提示永不触发)。
+            let spinner_started_at = std::time::Instant::now();
             let mut spinner_idx: usize = 0;
             // Braille Pattern 字符集(Braille spinner,宽 1,绝大多数 Unicode 终端可见)
             const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-            // 工具函数:在真 TTY 下擦除「上一行 waiting 行」(光标上移 + 整行清除)
-            // 非 TTY(管道 / e2e)走 println 路径,不输出 ANSI 控制序列。
+            // ANSI 纪律(2026-09-10 第 28 轮 B09/B10 慢链路实测修复):
+            // waiting 行(初始 spinner / 心跳行)永远以 \r 开头「原地重写」—— 光标停在
+            // 该行行中,不换行。因此任何 println! 输出([stage] 行 / 最终结果)之前必须
+            // 先 \r\x1b[K 把该行从列 0 清掉,再从列 0 打印;**绝不**用 \x1b[1A 上移清除
+            // (旧实现会误删 waiting 行上方刚打印的 stage 历史行,并让后续 println 落在
+            // 行中部 —— 实测回滚区丢两行 stage + 新行缩进到第 50/79 列)。
+            // waiting_line_on_screen 精确追踪屏幕上是否有一行待清的原地 waiting 行。
+            let mut waiting_line_on_screen: bool = true; // 初始 spinner 已打印
             let clear_waiting_line = |tty: bool| {
                 if tty {
-                    let _ = std::io::stdout().write_all(b"\x1b[1A\x1b[2K");
+                    let _ = std::io::stdout().write_all(b"\r\x1b[K");
                     let _ = std::io::stdout().flush();
                 }
             };
@@ -352,79 +362,69 @@ impl TuiSession {
                 tokio::select! {
                     maybe = stage_rx.recv() => match maybe {
                         Some(line) => {
-                            // 阶段切换:有 current_stage 时清除旧 waiting 行;
-                            // 初始 spinner(独占 line 1)不在这里清除 — 让它继续转动直到
-                            // 队列真正 flush 时与 [stage](line 2)共存,视觉上"加载条+阶段名"双行。
-                            if !initial_spinner_active && current_stage.is_some() {
-                                clear_waiting_line(stdout_is_tty);
-                            }
+                            // 不在此处清除 waiting 行:清除统一延迟到 idle flush,
+                            // 否则「recv 清行 → 心跳用过期 current_stage 复活旧行 →
+                            // flush println 落在行中部」的竞态会复发行中部错位
+                            // (心跳分支另有 queue.is_empty() 闸门双保险)。
                             if queue.is_empty() {
                                 idle.as_mut().reset(tokio::time::Instant::now() + hold);
                             }
                             queue.push_back(line);
                         }
                         None => {
-                            // 任务结束:清除 waiting 行 / 初始 spinner,丢弃未显示的快速阶段
-                            if initial_spinner_active {
-                                if stdout_is_tty {
-                                    let _ = std::io::stdout().write_all(b"\r\x1b[K");
-                                    let _ = std::io::stdout().flush();
-                                }
-                            } else if current_stage.is_some() {
+                            // 任务结束:清除屏幕上的 waiting 行,丢弃未显示的快速阶段
+                            if waiting_line_on_screen {
                                 clear_waiting_line(stdout_is_tty);
                             }
                             break;
                         }
                     },
                     _ = &mut idle => {
-                        // 阶段切换 flush:从队列里取出所有到达的阶段消息,println 出 [stage] 行。
-                        // 初始 spinner(若还活着)在这里一并清掉,腾出 line 1 让 [stage] 写;
-                        // 但 \r\x1b[K 后光标仍在 line 1 起点,println 默认换行追加,所以 [stage]
-                        // 会出现在 line 1(从空覆盖到 stage)+ 后续内容,无需光标管理。
-                        let mut should_clear_initial = false;
-                        if initial_spinner_active && !queue.is_empty() {
-                            should_clear_initial = true;
-                        }
+                        // 阶段切换 flush:第一批 stage 行打印前先清 waiting 行
+                        // (统一 \r\x1b[K,从列 0 打印,不吞历史行)。
                         while let Some(line) = queue.pop_front() {
-                            if should_clear_initial {
-                                if stdout_is_tty {
-                                    let _ = std::io::stdout().write_all(b"\r\x1b[K");
-                                    let _ = std::io::stdout().flush();
-                                }
-                                should_clear_initial = false;
+                            if waiting_line_on_screen {
+                                clear_waiting_line(stdout_is_tty);
+                                waiting_line_on_screen = false;
                                 initial_spinner_active = false;
                             }
                             println!("  [stage] {line}");
                             let _ = std::io::stdout().flush();
                             current_stage = Some((line, std::time::Instant::now()));
                         }
-                        // 阶段内 waiting 心跳:每 1s 重写一行(覆盖上一帧)
-                        if let Some((stage, started)) = &current_stage {
-                            let elapsed = started.elapsed().as_secs();
-                            let slow_warn = if elapsed >= 60 {
-                                " ⚠ 等待超过 1 分钟,可 Ctrl-C 取消"
-                            } else if elapsed >= 30 {
-                                " ⚠ 响应较慢"
-                            } else {
-                                ""
-                            };
-                            let frame = SPINNER[spinner_idx % SPINNER.len()];
-                            spinner_idx += 1;
-                            let line = format!(
-                                "  [waiting] {stage}  {frame}  ({elapsed}s){slow_warn}"
-                            );
-                            rewrite_waiting_line(stdout_is_tty, &line);
-                            idle.as_mut().reset(tokio::time::Instant::now() + tick);
-                        } else if initial_spinner_active {
-                            // 仍在初始占位阶段:每秒更新 spinner 字符(秒数固定 0)
-                            let frame = SPINNER[spinner_idx % SPINNER.len()];
-                            spinner_idx += 1;
-                            let line = format!("  [waiting] {frame}  (0s)");
-                            rewrite_waiting_line(stdout_is_tty, &line);
-                            idle.as_mut().reset(tokio::time::Instant::now() + tick);
-                        } else {
-                            // 无活动阶段:回到 1.5s 节奏(基本不会进入此分支,防御性)
-                            idle.as_mut().reset(tokio::time::Instant::now() + hold);
+                        // 阶段内 waiting 心跳:每 1s 重写一行(覆盖上一帧)。
+                        // queue 非空(有待冲刷阶段)时绝不重写 —— 防止用旧
+                        // current_stage 把已清掉的行复活,导致下一条 [stage] 错位。
+                        if queue.is_empty() {
+                            let (text, next) =
+                                if let Some((stage, started)) = &current_stage {
+                                    (
+                                        waiting_line_text(
+                                            Some(stage),
+                                            SPINNER[spinner_idx % SPINNER.len()],
+                                            started.elapsed().as_secs(),
+                                        ),
+                                        tick,
+                                    )
+                                } else if initial_spinner_active {
+                                    (
+                                        waiting_line_text(
+                                            None,
+                                            SPINNER[spinner_idx % SPINNER.len()],
+                                            spinner_started_at.elapsed().as_secs(),
+                                        ),
+                                        tick,
+                                    )
+                                } else {
+                                    // 无活动阶段:回到 1.5s 节奏(基本不会进入此分支,防御性)
+                                    (String::new(), hold)
+                                };
+                            if !text.is_empty() {
+                                spinner_idx += 1;
+                                rewrite_waiting_line(stdout_is_tty, &text);
+                                waiting_line_on_screen = true;
+                            }
+                            idle.as_mut().reset(tokio::time::Instant::now() + next);
                         }
                     }
                 }
@@ -1394,6 +1394,26 @@ fn now_clock() -> String {
     export::now_clock()
 }
 
+/// waiting 心跳行文案(纯函数,便于单测;2026-09-10 第 28 轮 B09/B10 抽取):
+/// - `Some(stage)`:阶段内等待,`  [waiting] {stage}  {frame}  ({elapsed}s){slow_warn}`
+/// - `None`:初始 spinner(首阶段消息未到),`  [waiting] {frame}  ({elapsed}s){slow_warn}`
+/// - elapsed ≥ 60s 追加「等待超过 1 分钟」提示;≥ 30s 追加「响应较慢」。
+/// 初始 spinner 同样启用 30s/60s 慢提示 —— 修复前固定 `(0s)`,真实慢 LLM
+/// (首字节 >30s)场景下用户既看不到计时也看不到慢提示。
+fn waiting_line_text(stage: Option<&str>, frame: char, elapsed_secs: u64) -> String {
+    let slow_warn = if elapsed_secs >= 60 {
+        " ⚠ 等待超过 1 分钟,可 Ctrl-C 取消"
+    } else if elapsed_secs >= 30 {
+        " ⚠ 响应较慢"
+    } else {
+        ""
+    };
+    match stage {
+        Some(stage) => format!("  [waiting] {stage}  {frame}  ({elapsed_secs}s){slow_warn}"),
+        None => format!("  [waiting] {frame}  ({elapsed_secs}s){slow_warn}"),
+    }
+}
+
 /// 把字符串按 char 截断(避免 split_at 在 CJK 多字节上切断),
 /// 超长末尾加 `…`。TUI 渲染宽度计算依赖完整 char 边界。
 fn truncate_chars(s: &str, limit: usize) -> String {
@@ -1638,6 +1658,49 @@ mod bg_color_ansi_tests {
         assert!(s.ends_with("m"), "got: {s}");
         // DarkGreen 在 color_to_ansi256 里映射到索引 2。
         assert_eq!(s, "\x1b[48;5;2m");
+    }
+}
+
+#[cfg(test)]
+mod waiting_line_text_tests {
+    use super::*;
+
+    #[test]
+    fn initial_spinner_counts_real_elapsed() {
+        // 第 28 轮 B09/B10 修复:初始 spinner 的秒数来自 spinner_started_at,
+        // 不再固定 (0s) —— 否则首字节 >30s 的真实慢链路下用户以为卡死在 0s。
+        assert_eq!(waiting_line_text(None, '⠋', 0), "  [waiting] ⠋  (0s)");
+        assert_eq!(waiting_line_text(None, '⠹', 5), "  [waiting] ⠹  (5s)");
+    }
+
+    #[test]
+    fn initial_spinner_slow_warn_at_30s() {
+        // 初始阶段(尚无 stage 消息)同样触发 30s「响应较慢」。
+        let s = waiting_line_text(None, '⠸', 31);
+        assert!(s.contains("(31s)"), "got: {s}");
+        assert!(s.contains("响应较慢"), "got: {s}");
+        assert!(!s.contains("1 分钟"), "got: {s}");
+    }
+
+    #[test]
+    fn stage_waiting_line_label_and_elapsed() {
+        let s = waiting_line_text(Some("wf-1 SubAgent 执行中…"), '⠧', 8);
+        assert!(s.starts_with("  [waiting] wf-1 SubAgent 执行中…  ⠧  (8s)"), "got: {s}");
+    }
+
+    #[test]
+    fn stage_waiting_line_over_one_minute_hint() {
+        // 60s 提示优先于 30s 提示,且包含 Ctrl-C 取消指引。
+        let s = waiting_line_text(Some("wf-1 QC"), '⠇', 63);
+        assert!(s.contains("(63s)"), "got: {s}");
+        assert!(s.contains("等待超过 1 分钟"), "got: {s}");
+        assert!(s.contains("Ctrl-C 取消"), "got: {s}");
+    }
+
+    #[test]
+    fn below_30s_has_no_warn_suffix() {
+        let s = waiting_line_text(Some("wf-1"), '⠙', 29);
+        assert!(!s.contains("⚠"), "got: {s}");
     }
 }
 /// 把 crossterm Color 转为 ANSI 256 色索引(简化映射)。
