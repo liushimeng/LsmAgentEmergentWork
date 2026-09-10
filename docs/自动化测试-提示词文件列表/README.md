@@ -2,15 +2,15 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **83 维度 × 10 个 = 830 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **84 维度 × 10 个 = 840 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
 疑难 Bug 攻坚、文件格式解析、编程冷知识、跨平台电脑使用、设计系统、量子计算、机器人 ROS2、
 3D 建模与几何、WebAssembly 边缘、密码学与隐私计算、并行 GPU、函数式编程、编译器后端 LLVM、
 AR/VR 空间计算、语音交互与对话式 UI、基础设施可观测性与 SRE、Agent 记忆与上下文工程、
-隐私计算与数据合规工程、边缘计算与离线优先架构、数字孪生与工业 IoT、人机交互与可解释 AI
-等多个角度，**无重复主题**。
+隐私计算与数据合规工程、边缘计算与离线优先架构、数字孪生与工业 IoT、人机交互与可解释 AI、
+软件工程认知科学与开发者成长等多个角度，**无重复主题**。
 
 ## 用途
 
@@ -109,6 +109,7 @@ docs/自动化测试-提示词文件列表/
   81-边缘计算与离线优先架构.md               ← 离线优先设计哲学/Service Worker生命周期/PWA标准/IndexedDB/CRDT合并算法/Operational Transformation/Edge Runtime架构/边缘AI推理ONNX-TF.js-WebGPU/网络弹性/同步协议ETag-CDC/laew离线优先升级
   82-数字孪生与工业IoT.md                   ← 数字孪生六维模型/OPC UA工业协议与信息建模/MQTT Sparkplug B/IT-OT融合与协议网关/时序数据库InfluxDB-TimescaleDB/仿真集成Unity-Omniverse/预测性维护异常检测RUL/边缘AI部署蒸馏/工业安全ISA-IEC 62443/laew工业4.0集成
   83-人机交互与可解释AI.md                   ← 心智模型与AI系统理解/信任校准/可解释AI LIME-SHAP-Attention/决策溯源/算法审计/以人为本AI/人机分工HITL/AI UX模式流式-不确定性-来源-拒绝/协作智能/AI错误恢复3R原则/laew AI UX优化路线
+  84-软件工程认知科学与开发者成长.md         ← 认知负荷/心流/深度工作/调试心智/技能习得曲线/源码阅读方法论/工程判断力/技术领导力/反脆弱职业/AI时代思考深度/laew 思考伙伴
 ```
 
 ## 编号规则
@@ -198,6 +199,7 @@ docs/自动化测试-提示词文件列表/
 | CA31–CA40 | 边缘计算与离线优先架构 | 离线优先设计哲学/Service Worker生命周期/PWA标准/IndexedDB/CRDT合并算法/Operational Transformation/Edge Runtime架构/边缘AI推理ONNX-TF.js-WebGPU/网络弹性/同步协议ETag-CDC/laew离线优先升级 | medium~hard |
 | CA41–CA50 | 数字孪生与工业 IoT | 数字孪生六维模型/OPC UA工业协议与信息建模/MQTT Sparkplug B/IT-OT融合与协议网关/时序数据库InfluxDB-TimescaleDB/仿真集成Unity-Omniverse/预测性维护异常检测RUL/边缘AI部署蒸馏/工业安全ISA-IEC 62443/laew工业4.0集成 | medium~hard |
 | CA51–CA60 | 人机交互与可解释 AI | 心智模型与AI系统理解/信任校准/可解释AI LIME-SHAP-Attention/决策溯源/算法审计/以人为本AI/人机分工HITL/AI UX模式流式-不确定性-来源-拒绝/协作智能/AI错误恢复3R原则/laew AI UX优化路线 | medium~hard |
+| CB01–CB10 | 软件工程认知科学与开发者成长 | 认知负荷理论/心流/深度工作/调试心智模型/技能习得曲线/源码阅读方法论/工程判断力/技术领导力/反脆弱职业/AI时代思考深度 | medium~hard |
 
 ## 每条提示词的字段
 
