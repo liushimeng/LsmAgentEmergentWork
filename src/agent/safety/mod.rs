@@ -5,12 +5,15 @@
 //! 对齐 openclaw §11.0 14 种正则与 claudecode §11.1「flag it directly to the user」温和告警哲学。
 //!
 //! 后续可扩展:
-//! - SSRF 检测(L1215)
 //! - 密钥扫描(API Key / Token)
 //! - 22 层 Bash 检测对齐 claudecode
 
+pub mod credentials;
 pub mod prompt_injection;
+pub mod url_safety;
 
+pub use credentials::{Vault, CREDENTIAL_PREFIX};
 pub use prompt_injection::{
     scan_and_wrap, InjectionSource, InjectionVerdict, MatchHit, Severity, INJECTION_BOUNDARY,
 };
+pub use url_safety::{check_endpoint_safety, is_safe_endpoint, BLOCKED_HOSTNAMES};

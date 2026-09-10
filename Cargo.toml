@@ -38,6 +38,15 @@ regex = "1"
 once_cell = "1"
 similar = "2"   # diff 算法(claudecode 同款,纯 Rust,无系统依赖)
 
+# D9-4 凭证加密(L1600):AES-256-GCM 应用层加密,落 SQLite 前透明加解密
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"
+zeroize = "1"
+
+# D9-7 SSRF 防护(L1608/L1625):URL 解析 + 私网/CGNAT 拦截
+url = "2.5"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

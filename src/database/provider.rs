@@ -372,12 +372,18 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
     let is_active_int: i64 = row.get(6)?;
     let ctx: i64 = row.get(8)?;
     // D9-4 凭证加密(L1600):读出时透明解密;未加密(旧明文)直接透传。
+    // 解密失败(主密钥轮换/损坏/记录被篡改)→ 优雅降级为占位符 + 告警,
+    // 不崩溃整个列表(用户仍可查看/删除其他记录)。
     let raw_key: String = row.get(5)?;
+    let id: i64 = row.get(0)?;
     let api_key = if crate::agent::safety::Vault::is_encrypted(&raw_key) {
-        crate::agent::safety::Vault::global()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?
-            .decrypt(&raw_key)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?
+        match crate::agent::safety::Vault::global().and_then(|v| v.decrypt(&raw_key)) {
+            Ok(plaintext) => plaintext,
+            Err(e) => {
+                tracing::warn!(provider_id = id, error = %e, "API Key 解密失败,已替换为占位符(可能主密钥轮换或数据被篡改)");
+                format!("[解密失败: {e}]")
+            }
+        }
     } else {
         raw_key
     };

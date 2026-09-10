@@ -48,6 +48,18 @@ pub enum ConfigError {
 
     #[error("导出失败: {0}")]
     Export(String),
+
+    /// 凭证加密 Vault 错误(主密钥加载/生成/加解密失败)。
+    ///
+    /// 对应知识库 gap L1600(D9-4 凭证管理):API Key 应用层 AES-256-GCM 加密。
+    #[error("凭证加密错误: {0}")]
+    Vault(String),
+
+    /// URL 安全校验失败(SSRF 防护)。
+    ///
+    /// 对应知识库 gap L1608 / L1625(D9-7 SSRF 防护):拦截私网/CGNAT/link-local 请求。
+    #[error("URL 不安全: {0}")]
+    UrlSafety(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
@@ -198,20 +210,26 @@ impl Db {
             }
         };
         schema::init_schema(&conn)?;
-        Ok(Self {
+        let db = Self {
             conn: Mutex::new(conn),
             db_path: paths.db_path.clone(),
-        })
+        };
+        // D9-4 凭证加密(L1600):存量明文 API Key 一次性迁移。
+        db.migrate_credentials()?;
+        Ok(db)
     }
 
     /// 隔离后重建:新文件 + PRAGMA + 建表。
     fn open_fresh(db_path: &Path) -> Result<Self> {
         let conn = open_connection(db_path)?;
         schema::init_schema(&conn)?;
-        Ok(Self {
+        let db = Self {
             conn: Mutex::new(conn),
             db_path: db_path.to_path_buf(),
-        })
+        };
+        // D9-4 凭证加密(L1600):存量明文 API Key 一次性迁移。
+        db.migrate_credentials()?;
+        Ok(db)
     }
 
     pub fn db_path(&self) -> &Path {
