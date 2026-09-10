@@ -819,8 +819,10 @@ echo "$OUT" | grep -q "\.laew/commands"; check $? "/commands 显示来源路径"
 OUT=$(cd /tmp/laew-e2e-cmd-work && printf '/e2e-hello laew\n/export\n/exit\n' | run "$LAEW")
 echo "$OUT" | grep -q "custom command.*e2e-hello"; check $? "自定义命令 dispatch 显示来源"
 echo "$OUT" | grep -q "已导出 Markdown"; check $? "/export 导出成功提示"
-EXPORT_FILE=$(echo "$OUT" | grep -oE "/tmp/laew-e2e-cmd-work/laew-export-[0-9-]+\.md" | head -1)
-[ -n "$EXPORT_FILE" ] && [ -f "$EXPORT_FILE" ]; check $? "/export 文件已落盘(${EXPORT_FILE:-未找到})"
+# 第 23 轮(D07)起导出成功行显示相对文件名(长路径收敛),按文件名在工作目录定位
+EXPORT_NAME=$(echo "$OUT" | grep -oE "laew-export-[0-9]+-[0-9]+\.md" | head -1)
+EXPORT_FILE="/tmp/laew-e2e-cmd-work/${EXPORT_NAME:-not-found}"
+[ -n "$EXPORT_NAME" ] && [ -f "$EXPORT_FILE" ]; check $? "/export 文件已落盘(${EXPORT_FILE:-未找到})"
 grep -q "请向 laew 问好" "$EXPORT_FILE" 2>/dev/null; check $? "导出含命令展开提示词"
 grep -q "/e2e-hello laew" "$EXPORT_FILE" 2>/dev/null; check $? "导出含原始命令输入"
 grep -q "1 轮对话" "$OUT"; check $? "/export 提示轮数"
@@ -829,6 +831,29 @@ touch /tmp/laew-e2e-cmd-work/exists.md
 OUT=$(cd /tmp/laew-e2e-cmd-work && printf '/export exists.md\n/exit\n' | run "$LAEW")
 echo "$OUT" | grep -q "拒绝覆盖"; check $? "/export 显式路径已存在时拒绝覆盖"
 rm -rf /tmp/laew-e2e-cmd-work
+
+# --- 7c. D3 对话 Rewind 与分支(2026-09-10 第二十四轮) ---
+# 独立根目录 + 无 provider(NoopLlm 全本地确定性,不依赖 mock;QC fail-closed 回流
+# 属预期噪音,不影响轮次累积断言)。
+section "7c. D3 对话 Rewind 与分支"
+rm -rf /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
+mkdir -p /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
+cp laew /tmp/laew-e2e-rw-root/laew
+OUT=$(cd /tmp/laew-e2e-rw-work && printf '第一轮问题\n第二轮问题\n/rewind\n/rewind 99\n/rewind 2\n/branches\n/switch rewind-1\n/undo\n/fork\n/clear\n/rewind\n/exit\n' | run timeout 90 /tmp/laew-e2e-rw-root/laew)
+echo "$OUT" | grep -q "可回退的对话轮次(共 2 轮"; check $? "/rewind 列出 2 轮"
+echo "$OUT" | grep -q "#1 \[.*第一轮问题"; check $? "/rewind 轮次预览含时间与原文"
+echo "$OUT" | grep -q "无效轮次编号: 99"; check $? "/rewind 越界编号报错"
+echo "$OUT" | grep -q "已回退到第 2 轮之前(移除 1 轮对话"; check $? "/rewind 2 回退成功"
+echo "$OUT" | grep -q "已存为分支 rewind-1"; check $? "/rewind 回退前自动存分支"
+echo "$OUT" | grep -q "rewind-1 \[.* 2 轮 | /rewind 2 回退前"; check $? "/branches 列出分支明细"
+echo "$OUT" | grep -q "已切换到分支 rewind-1"; check $? "/switch 恢复分支(2 轮)"
+echo "$OUT" | grep -q "已自动存为分支 switch-2"; check $? "/switch 切换前自动快照"
+echo "$OUT" | grep -q "已存为分支 rewind-3"; check $? "/undo 撤销末轮"
+echo "$OUT" | grep -q "已从当前对话分叉出新会话"; check $? "/fork 分叉新会话"
+echo "$OUT" | grep -q "已存为分支 fork-4"; check $? "/fork 分叉前自动存分支"
+echo "$OUT" | grep -q "已自动保存分支 clear-5"; check $? "/clear 自动快照找回提示"
+echo "$OUT" | grep -q "当前会话还没有可回退的对话轮次"; check $? "/clear 后无可回退轮次"
+rm -rf /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
 
 # --- 8. TUI 子屏自动化(tmux control-mode,真 PTY 渲染) ---
 # 详见 docs/TUI自动化测试/01-设计与解决方案.md

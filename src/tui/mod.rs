@@ -18,6 +18,7 @@ use crate::llm::{client_from_record, ChatMessage};
 use crate::session::Session;
 use crate::tui::input::display_width;
 
+pub mod branches;
 pub mod commands;
 pub mod completion;
 pub mod engine;
@@ -30,6 +31,7 @@ pub mod theme;
 
 mod input;
 
+use branches::BranchStore;
 use completion::CompletionEngine;
 use export::{OutcomeKind, TranscriptEntry};
 use input::{InputHandler, InputResult};
@@ -47,6 +49,8 @@ pub struct TuiSession {
     pub transcript: Vec<TranscriptEntry>,
     /// 会话累计 token 用量(每轮任务结束后累加,`/export` 元信息使用)
     pub session_usage: crate::llm::Usage,
+    /// 对话分支存储(D3,2026-09-10 第二十四轮):rewind/fork/switch/clear 前自动快照
+    pub branches: BranchStore,
 }
 
 impl TuiSession {
@@ -73,6 +77,7 @@ impl TuiSession {
             debug_llm_raw,
             transcript: Vec::new(),
             session_usage: crate::llm::Usage::default(),
+            branches: BranchStore::new(),
         })
     }
 
@@ -160,10 +165,32 @@ impl TuiSession {
 
     /// 重置会话:清空上下文并生成新 Session ID。
     /// transcript 与累计用量随会话一并清零(导出的是「当前会话」)。
-    pub fn reset_session(&mut self) {
+    ///
+    /// D3(2026-09-10 第二十四轮):清空前若有真实对话轮次,自动快照为
+    /// `clear-k` 分支(误触 /clear 可 `/switch` 找回),返回分支名。
+    pub fn reset_session(&mut self) -> Option<String> {
+        let saved = self.snapshot_current("clear", "清空前");
         self.session = Session::new();
         self.transcript.clear();
         self.session_usage = crate::llm::Usage::default();
+        saved
+    }
+
+    /// 把当前会话状态快照为分支,返回分支名(无真实轮次时返回 None)。
+    fn snapshot_current(&mut self, prefix: &str, note_prefix: &str) -> Option<String> {
+        let turns = crate::agent::session_fork::scan_user_turns(self.session.context());
+        if turns.is_empty() {
+            return None;
+        }
+        let note = format!("{note_prefix}(共 {} 轮)", turns.len());
+        Some(self.branches.snapshot(
+            prefix,
+            &note,
+            &self.session,
+            &self.transcript,
+            self.session_usage,
+            export::now_clock(),
+        ))
     }
 
     pub fn add_provider_interactive(&self) -> Result<i64> {
@@ -518,7 +545,7 @@ impl TuiSession {
                 return Ok(true);
             }
             "clear" | "c" => {
-                self.reset_session();
+                let saved = self.reset_session();
                 // TUI 主屏下真正清屏:滚动区清空(ANSI 100 行上滚) + 重新打印 banner。
                 // 修复前只 print 一行 Session ID,旧对话历史与提示词残留在视觉上不被清除,
                 // 用户体感「清屏没生效」。
@@ -531,14 +558,20 @@ impl TuiSession {
                         self.session.id
                     );
                 }
+                if let Some(name) = saved {
+                    println!("  (已自动保存分支 {name},可用 /switch {name} 找回)");
+                }
             }
             "new" | "n" => {
-                self.reset_session();
+                let saved = self.reset_session();
                 if atty() {
                     print!("\x1b[2J\x1b[H");
                     self.print_banner();
                 } else {
                     println!("  已开启新会话, Session ID: {}", self.session.id);
+                }
+                if let Some(name) = saved {
+                    println!("  (已自动保存分支 {name},可用 /switch {name} 找回)");
                 }
             }
             "model" => {
@@ -622,6 +655,22 @@ impl TuiSession {
                 // D12 多主题切换命令(2026-09-10 第二十三轮)
                 self.run_theme(rest_args);
             }
+            // D3 对话 Rewind / 分支(2026-09-10 第二十四轮)
+            "rewind" => {
+                self.run_rewind(rest_args);
+            }
+            "undo" => {
+                self.run_undo();
+            }
+            "fork" => {
+                self.run_fork();
+            }
+            "branches" | "branch" => {
+                self.run_branches();
+            }
+            "switch" => {
+                self.run_switch(rest_args);
+            }
             "" => {}
             other => {
                 // 内置未命中 → 查自定义命令(D2);命中则渲染模板并送编排。
@@ -692,6 +741,166 @@ impl TuiSession {
                 println!("  可选: default | dark-contrast | light | daltonized");
                 println!("  输入 /theme 查看主题列表与说明。");
             }
+        }
+    }
+
+    /// `/rewind [N]`(D3,2026-09-10 第二十四轮):列出轮次或回退到第 N 轮之前。
+    ///
+    /// - 无参数:列出当前会话全部真实轮次(#编号 + 时间 + 首行预览)
+    /// - `/rewind N`:第 N..末轮全部移除(回退前自动快照存分支),
+    ///   context / transcript / session_usage 三处一致截断
+    fn run_rewind(&mut self, arg: &str) {
+        let turns = crate::agent::session_fork::scan_user_turns(self.session.context());
+        if turns.is_empty() {
+            println!("  当前会话还没有可回退的对话轮次。");
+            return;
+        }
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            println!("  可回退的对话轮次(共 {} 轮,从旧到新):", turns.len());
+            for t in &turns {
+                let ts = self
+                    .transcript
+                    .get(t.order - 1)
+                    .map(|e| e.ts.as_str())
+                    .unwrap_or("-");
+                let preview = first_line_preview(&t.prompt, 48);
+                println!("    #{} [{}] {}", t.order, ts, preview);
+            }
+            println!("  用法: /rewind <编号>  回退到该轮之前(该轮及其后全部移除,原对话自动存为分支)");
+            println!("        /undo           撤销最后一轮(等价 /rewind {})", turns.len());
+            return;
+        }
+        match trimmed.parse::<usize>() {
+            Ok(order) => self.run_rewind_order(order),
+            Err(_) => {
+                println!("  无效轮次编号: {trimmed}(应为 1..={} 的整数)", turns.len());
+                println!("  输入 /rewind 查看全部轮次。");
+            }
+        }
+    }
+
+    /// 执行回退到第 `order` 轮之前(编号已由调用方给出,此处负责校验与三处一致截断)。
+    fn run_rewind_order(&mut self, order: usize) {
+        let turns = crate::agent::session_fork::scan_user_turns(self.session.context());
+        if order == 0 || order > turns.len() {
+            println!(
+                "  无效轮次编号: {order}(当前共 {} 轮,编号 1..={})",
+                turns.len(),
+                turns.len()
+            );
+            println!("  输入 /rewind 查看全部轮次。");
+            return;
+        }
+        let boundary = turns[order - 1].ctx_index;
+        let removed_turns = turns.len() - order + 1;
+        let removed_msgs = self.session.context().len() - boundary;
+        // 破坏性操作前快照(atomcode RewindTransactionGuard 语义:截断与快照同生成败)
+        let name = self
+            .snapshot_current("rewind", &format!("/rewind {order} 回退前"))
+            .expect("调用方已确认存在真实轮次");
+        self.session.context_mut().truncate(boundary);
+        self.transcript.truncate(order - 1);
+        // 累计用量由剩余轮次重算(被移除轮次的 token 不再计入「当前会话」)
+        self.session_usage = self
+            .transcript
+            .iter()
+            .fold(crate::llm::Usage::default(), |acc, e| merge_usage(acc, e.usage));
+        println!(
+            "  ✓ 已回退到第 {order} 轮之前(移除 {removed_turns} 轮对话 / {removed_msgs} 条上下文消息)"
+        );
+        if order == 1 {
+            println!("    已清空全部真实轮次(项目上下文等内部标记保留,不会重复注入)。");
+        } else {
+            println!("    保留第 1..={} 轮,当前上下文 {} 条消息。", order - 1, boundary);
+        }
+        println!("    原对话已存为分支 {name},可用 /switch {name} 找回。");
+    }
+
+    /// `/undo`(D3):撤销最后一轮(最常用路径一键化,等价 `/rewind <末轮>`)。
+    fn run_undo(&mut self) {
+        let n = crate::agent::session_fork::scan_user_turns(self.session.context())
+            .len();
+        if n == 0 {
+            println!("  当前会话还没有可回退的对话轮次。");
+            return;
+        }
+        self.run_rewind_order(n);
+    }
+
+    /// `/fork`(D3,pi `/clone` current leaf 语义):从当前对话分叉出新 Session。
+    ///
+    /// 上下文完整拷贝 + 新 Session ID,后续对话在新会话上进行;
+    /// 原对话自动存分支(两个方向都不会丢)。
+    fn run_fork(&mut self) {
+        let turns = crate::agent::session_fork::scan_user_turns(self.session.context());
+        if turns.is_empty() {
+            println!("  当前会话没有对话轮次,无需分叉(直接输入提示词即可)。");
+            return;
+        }
+        let name = self
+            .snapshot_current("fork", "fork 前原会话")
+            .expect("调用方已确认存在真实轮次");
+        let forked = Session::fork_from(&self.session);
+        let new_id = forked.id.clone();
+        let msg_count = forked.context.len();
+        self.session = forked;
+        println!("  ✓ 已从当前对话分叉出新会话: {new_id}");
+        println!("    上下文 {msg_count} 条消息 / {} 轮完整保留,后续对话在新会话上进行。", turns.len());
+        println!("    原对话已存为分支 {name},可用 /switch {name} 找回。");
+    }
+
+    /// `/branches`(D3):列出已存分支(新→旧)。
+    fn run_branches(&self) {
+        if self.branches.is_empty() {
+            println!("  暂无分支。/rewind <n>、/fork、/switch、/clear 在改动前会自动保存分支。");
+            return;
+        }
+        println!("  已存分支({} 个,新→旧):", self.branches.len());
+        for s in self.branches.list() {
+            let preview = if BranchStore::last_turn_preview(s).is_empty() {
+                "-".to_string()
+            } else {
+                first_line_preview(&BranchStore::last_turn_preview(s), 32)
+            };
+            println!(
+                "    {} [{}] {} 轮 | {} | 末轮: {}",
+                s.name,
+                s.created_at,
+                s.transcript.len(),
+                s.note,
+                preview
+            );
+        }
+        println!("  切换: /switch <分支名>;分支保存在内存中(最多 10 个,超出淘汰最旧),退出 TUI 后失效。");
+    }
+
+    /// `/switch <name>`(D3):切换到指定分支;切换前当前对话自动快照(零丢失)。
+    fn run_switch(&mut self, arg: &str) {
+        let name = arg.trim();
+        if name.is_empty() {
+            println!("  用法: /switch <分支名>(输入 /branches 查看可用分支)");
+            return;
+        }
+        if self.branches.get(name).is_none() {
+            println!("  未找到分支: {name}(输入 /branches 查看可用分支)");
+            return;
+        }
+        let cur = self.snapshot_current("switch", &format!("/switch {name} 切换前"));
+        let (session, transcript, usage) = self
+            .branches
+            .restore(name)
+            .expect("上面已校验分支存在");
+        let restored_id = session.id.clone();
+        let restored_turns = transcript.len();
+        self.session = session;
+        self.transcript = transcript;
+        self.session_usage = usage;
+        println!("  ✓ 已切换到分支 {name}(Session {restored_id}, {restored_turns} 轮对话)");
+        if let Some(cur) = cur {
+            println!("    切换前的对话已自动存为分支 {cur},可再切回。");
+        } else {
+            println!("    切换前会话无真实轮次,未产生快照。");
         }
     }
 
@@ -994,6 +1203,13 @@ fn suggest_similar_commands(input: &str) -> Vec<String> {
         "provider add",
         "provider use",
         "provider del",
+        "diff",
+        "theme",
+        "rewind",
+        "undo",
+        "fork",
+        "branches",
+        "switch",
     ];
     let input_lower = input.to_lowercase();
     all_commands
@@ -1065,6 +1281,17 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+/// 取首行非空内容并压缩空白,截断到 `max` 显示宽度(D3 轮次/分支列表预览用)。
+fn first_line_preview(s: &str, max: usize) -> String {
+    let first = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let collapsed: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate(&collapsed, max)
+}
+
 /// 简单的标准输入读取（用于交互子命令）。
 fn read_line_prompt(prompt: &str) -> Result<String> {
     use std::io::{self, BufRead};
@@ -1103,6 +1330,11 @@ fn print_help() {
     println!("  │  /clear (c)        清空对话历史并开启新会话                 │");
     println!("  │  /new (n)          开启新会话(同 /clear)                   │");
     println!("  │  /model            显示当前模型                           │");
+    println!("  │  /rewind [N]       列出轮次或回退到第 N 轮之前(自动存分支) │");
+    println!("  │  /undo             撤销最后一轮对话                        │");
+    println!("  │  /fork             从当前对话分叉出新会话                  │");
+    println!("  │  /branches         列出已存分支(/rewind /fork /clear 自动存)│");
+    println!("  │  /switch <name>    切换到指定分支                          │");
     println!("  │  /export [path]    导出当前会话(Markdown, .json 后缀 JSON) │");
     println!("  │  /diff <old> <new> 并排 diff 两个文件(行级+字符级着色)    │");
     println!("  │  /theme [kind]     查看或切换主题(D12 a11y 配色)          │");

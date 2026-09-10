@@ -45,9 +45,13 @@ struct Frontmatter {
 }
 
 /// 内置命令名与别名(自定义命令不得遮蔽)。
+///
+/// 2026-09-10 第二十四轮 D3:补 rewind/undo/fork/branches/switch;
+/// 并补登此前遗漏的 diff/theme/t(命令已实现但未入此表,自定义命令可遮蔽,违背一致性)。
 pub const BUILTIN_NAMES: &[&str] = &[
     "help", "h", "?", "exit", "quit", "q", "clear", "c", "new", "n", "model", "provider", "p",
-    "export", "commands",
+    "export", "commands", "diff", "theme", "t", "rewind", "undo", "fork", "branches", "branch",
+    "switch",
 ];
 
 /// 扫描两级命令目录,返回去重后的自定义命令列表(用户级优先)。

@@ -149,7 +149,7 @@
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-10 第二十三轮(D12 多主题系统 + /theme + LAEW_THEME 环境变量,4 主题:default / dark-contrast / light / daltonized;`src/tui/theme.rs` 保留所有现有 const + 新增 ThemeKind/Palette/4 套 Palette 常量表 + palette()/set_active()/active_kind()/from_env()/from_env_str() API;核心 cell 渲染位置 Cell::blank / engine::border_box / render/diff / render/highlight 改用 palette() 实时跟随主题;`src/tui/{completion,mod}.rs` 新增 /theme builtin + banner 主题提示行 + run_theme dispatch + help 行;单元测试新增 8 项全过;e2e LAEW_THEME=daltonized 启动 banner /theme 列出 4 主题 /theme dark-contrast 实时切换 /theme nope 未知报错;方案 `tmpPlan/2026-09-10_03-D12多主题系统与a11y配色方案.md`),此前:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-10 第二十四轮(D3 对话 Rewind/分支:`src/agent/session_fork.rs` 轮次扫描 + `src/tui/branches.rs` 分支存储 + `/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,三处一致不变量 + 零丢失快照语义,方案 `tmpPlan/2026-09-10_07-D3对话Rewind与分支方案.md`),此前:2026-09-10 第二十三轮(D12 多主题系统 + /theme + LAEW_THEME 环境变量,4 主题:default / dark-contrast / light / daltonized;`src/tui/theme.rs` 保留所有现有 const + 新增 ThemeKind/Palette/4 套 Palette 常量表 + palette()/set_active()/active_kind()/from_env()/from_env_str() API;核心 cell 渲染位置 Cell::blank / engine::border_box / render/diff / render/highlight 改用 palette() 实时跟随主题;`src/tui/{completion,mod}.rs` 新增 /theme builtin + banner 主题提示行 + run_theme dispatch + help 行;单元测试新增 8 项全过;e2e LAEW_THEME=daltonized 启动 banner /theme 列出 4 主题 /theme dark-contrast 实时切换 /theme nope 未知报错;方案 `tmpPlan/2026-09-10_03-D12多主题系统与a11y配色方案.md`),此前:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
 
 ---
 
@@ -161,7 +161,7 @@
 |------|------|-----------|---------|------------|
 | D1 | @提及系统 | ❌ 第 18 轮首次 | ❌ 0% | L1396-L1397 / L1426-L1427 / L1456+ / L1486+ / L1516-L1517 / L1546+ |
 | D2 | 自定义斜杠命令/Prompt 模板 | ❌ 第 18 轮首次 | 🟡 40%(✅ 2026-09-10:两级目录 `.laew/commands` + frontmatter + `$ARGUMENTS`/`$1-$9` + 补全集成 + `/commands`;未做 allowed-tools/model/`!`shell``/递归命名空间) | L1398-L1399 / L1428-L1434 / L1457+ / L1487-L1490 / L1518-L1521 / L1547+ |
-| D3 | 对话 Rewind/分支/时间旅行 | ❌ 第 18 轮首次(用户级) | ❌ 0% | L1400 / L1435+ / L1458+ / L1491-L1497 / L1522-L1527 / L1548+ |
+| D3 | 对话 Rewind/分支/时间旅行 | 🟡 第 18 轮首次(用户级) + 第 24 轮落地 | 🟡 60%(✅ 2026-09-10 第二十四轮:`/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,内存分支存储上限 10;未做:文件侧恢复/Git checkpoint 联动/消息树持久化/in-place 编辑) | L1400 / L1435+ / L1458+ / L1491-L1497 / L1522-L1527 / L1548+ |
 | D4 | 文件监视与工作区感知 | ❌ 第 18 轮首次(运行时) | ❌ 0% | L1415+ (预留) / L1459+ / L1498-L1499 / L1549+ |
 | D5 | 工具输出富文本内容渲染 | ❌ 第 18 轮首次(内容层) | ❌ 5%(cell-based 纯文本) | L1401-L1402 / L1436-L1445 / L1460+ / L1500-L1506 / L1528-L1530 / L1550+ |
 | D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 55%(✅ 2026-09-10 第二十二轮:bracketed paste + 大粘贴 marker 登记簿 L1573 + 提交展开/10000 字符截断注入 L1448 + 快速输入批量合并;未做多行编辑器/Vim 模式/kill ring) | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
@@ -309,3 +309,41 @@
 **未做(后续轮次候选)**:多行编辑器 / Vim 模式 / kill ring / Ctrl+G 外部编辑器 / 命令队列(L1449) / `!` bash 直通(L1450)。
 
 **累计**:L1-L1930+ 共 1930+ 个 gap,本轮新增 2 个 ✅(L1573/L1448)+ D6-IME 终端侧落地。
+
+---
+
+## 九、第二十四轮登记(2026-09-10,D3 对话 Rewind / 分支 / 时间旅行)
+
+**主题**:第十八轮 D3 维度 P0 路线图第 8 项落地。laew 此前多轮对话只进不退:误发一条提示词
+无法撤销,想换方向只能 `/clear` 全丢。本轮按**轻量派**(pi 树状分支 / deepseek-harness
+`forkAt(seq)`)实现纯对话侧的用户级恢复,不耦合文件状态(文件侧恢复等第七轮 Git
+checkpoint 底座,见方案 §5)。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| L1400 | atomcode D3:无 rewind(对话侧) | P1 | ✅ | `src/agent/session_fork.rs`(合成消息识别 `<<<LAEW:`/`[PREVIOUS_FAILURE]` + `scan_user_turns` 轮次扫描 + `turn_boundary` 截断边界)+ `src/session.rs::fork_from` | 2026-09-10 第二十四轮 |
+| L1435+ | claudecode D3:/rewind 对话侧恢复 | P0 | ✅ | `src/tui/mod.rs::run_rewind/run_rewind_order/run_undo`:无参列出全部真实轮次(#编号+时间+首行预览),`/rewind N` 回退到第 N 轮之前 | 2026-09-10 第二十四轮 |
+| L1491-L1497 | openclaw D3:rewind/fork/switch 三 action | P0 | ✅ | `src/tui/mod.rs::run_fork/run_switch/run_branches` + `src/tui/branches.rs`(BranchStore 内存分支存储:计数命名/容量 10 淘汰最旧/快照-恢复原子成对) | 2026-09-10 第二十四轮 |
+| L1522-L1527 | opencode D3:session.fork + 树重映射 | P1 | ✅(单链分叉形态) | `/fork` = `Session::fork_from`(新 ID + 上下文完整拷贝);消息树持久化未做(等 Session 持久化轮次) | 2026-09-10 第二十四轮 |
+| L1548+ | pi D3:/fork from history + /clone current leaf | P1 | ✅(clone current leaf 形态) | `/fork` + `/switch <name>`(从分支任意时间点继续) | 2026-09-10 第二十四轮 |
+
+**设计要点**:
+- **三处一致不变量**:回退/恢复同时作用于 `session.context` / `transcript` / `session_usage`
+  (用量由剩余轮次重算),不存在错位;轮次↔transcript 严格 1:1。
+- **零丢失语义**:`/rewind` `/fork` `/switch` `/clear` 四个破坏性操作前自动快照存分支
+  (atomcode RewindTransactionGuard 的「截断与快照同生成败」语义);`/clear` 误触可救回。
+- **头部标记保留**:截断从轮次边界开始,项目上下文/历史摘要标记天然保留,幂等探测
+  不受影响(不会重复注入)。
+- 分支为内存态(退出 TUI 失效),上限 10 个淘汰最旧 —— 快照含完整上下文,必须有界。
+
+**验证**:
+- 单元测试 631 全过(新增 20 项:session_fork 11 + branches 7 + session fork_from 2)
+- e2e §7c 新增 13 条断言(独立根目录 + 无 provider,NoopLlm 全本地确定性,不依赖 mock)
+  独立验证 13/13 全过
+- 方案:`tmpPlan/2026-09-10_07-D3对话Rewind与分支方案.md`
+
+**未做(后续候选)**:文件侧恢复(Git checkpoint 联动)/ 消息树持久化(parentUuid 树 /
+JSONL 落盘,等 Session 持久化)/ in-place 消息编辑(pi 亦无)/ rewind 后自动重发
+(用户手动,避免意外扣费)。
+
+**累计**:D3 维度 laew 现状 0% → 60%。

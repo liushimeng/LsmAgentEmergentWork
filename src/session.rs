@@ -159,6 +159,15 @@ impl Session {
         &mut self.context
     }
 
+    /// 从既有会话分叉出新 Session(D3,2026-09-10 第二十四轮):
+    /// 生成**新 ID** + 完整拷贝对话上下文,device_id/created_at 全新。
+    /// 原 Session 不受影响(pi `/clone` current leaf 语义)。
+    pub fn fork_from(src: &Session) -> Self {
+        let mut forked = Session::new();
+        forked.context = src.context.clone();
+        forked
+    }
+
     /// 构造协议层所需的请求元数据。
     ///
     /// `max_tokens_override` 字段保留为 `None`(协议层默认行为);Agent 循环
@@ -230,5 +239,27 @@ mod tests {
         let m = s.meta();
         assert_eq!(m.session_id, s.id);
         assert_eq!(m.device_id, s.device_id);
+    }
+
+    #[test]
+    fn fork_from_copies_context_with_new_id() {
+        let mut src = Session::new();
+        src.context_mut().push(ChatMessage::user("第一轮"));
+        src.context_mut()
+            .push(ChatMessage::assistant(vec![crate::llm::ContentBlock::text("回答")]));
+
+        let forked = Session::fork_from(&src);
+        assert_ne!(forked.id, src.id, "分叉必须生成新 Session ID");
+        assert_eq!(forked.context.len(), 2, "上下文完整拷贝");
+        assert_eq!(forked.context[0].content_text(), "第一轮");
+        assert_eq!(src.context.len(), 2, "原 Session 不受影响");
+    }
+
+    #[test]
+    fn fork_from_two_forks_have_distinct_ids() {
+        let src = Session::new();
+        let a = Session::fork_from(&src);
+        let b = Session::fork_from(&src);
+        assert_ne!(a.id, b.id);
     }
 }

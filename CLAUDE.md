@@ -68,6 +68,7 @@ tui/
   completion.rs 斜杠命令补全引擎(内置 + 自定义命令动态注册)
   commands.rs   自定义斜杠命令(D2):两级目录发现/frontmatter/占位符渲染
   export.rs     会话导出(D8):transcript 记录 + Markdown/JSON 落盘
+  branches.rs   对话分支存储(D3):rewind/fork/switch/clear 前自动快照(内存态上限 10)
   theme.rs     ANSI 颜色 / mask_key 脱敏 集中管理
   screen/
     provider_list.rs   /provider list —— Tab 化展示 + 操作按钮
@@ -86,6 +87,7 @@ agent/
   compact.rs   CompactRunner:token 估算 / 三档选档 / 自动压缩触发 / 硬截断降级 / 保护段识别
   overflow.rs  上下文溢出检测(15+ provider 正则)+ 三级恢复(排水/折叠/暴露)
   project_context.rs 项目说明文件五级链发现 + README 自动生成 + 每会话首次注入(幂等标记)
+  session_fork.rs 对话 Rewind 轮次扫描(D3):合成消息识别 + 截断边界(供 /rewind /undo /fork /switch)
 session.rs       Session:本机指纹 device_id + Session ID 生成 + 独立对话上下文 context
 llm/mod.rs       统一消息模型 + LlmClient trait + RequestMeta + build_common_headers
 llm/anthropic.rs  Anthropic wire 转换(x-api-key + anthropic-version + metadata.user_id)
@@ -115,6 +117,11 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 | `/clear` (c)      | 清空对话历史，开启新 Session     |
 | `/new` (n)        | 同 `/clear`（开启新 Session）    |
 | `/model`          | 显示当前模型                     |
+| `/rewind [N]`     | 对话回退（D3）：无参列出全部真实轮次（#编号+时间+预览）；`/rewind N` 回退到第 N 轮之前（context/transcript/累计用量三处一致截断，回退前自动快照存分支）；合成消息（`<<<LAEW:>>>` 标记 / `[PREVIOUS_FAILURE]`）不计轮次，实现 `agent/session_fork.rs` |
+| `/undo`           | 撤销最后一轮对话（等价 `/rewind 末轮`） |
+| `/fork`           | 从当前对话分叉出新 Session（上下文完整拷贝 + 新 ID，原对话自动存分支） |
+| `/branches`       | 列出已存分支（`/rewind` `/fork` `/switch` `/clear` 改动前自动快照；内存态上限 10 个，退出 TUI 失效），实现 `tui/branches.rs` |
+| `/switch <name>`  | 切换到指定分支（切换前当前对话自动快照，零丢失） |
 | `/export [path]`  | 导出当前会话为 Markdown（`.json` 后缀导出 JSON）；默认落工作目录 `laew-export-{时间戳}.md`，同名冲突自动 `-1` 后缀，显式路径已存在拒绝覆盖 |
 | `/commands`       | 列出已加载的自定义斜杠命令与来源 |
 | `/provider`       | 管理接入记录（默认进入 list 屏） |

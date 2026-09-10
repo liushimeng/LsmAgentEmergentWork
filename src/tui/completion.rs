@@ -88,6 +88,32 @@ impl CompletionEngine {
                 "查看或切换主题(D12 a11y 配色,4 套)",
                 "/theme [default|dark-contrast|light|daltonized]",
             ),
+            // 2026-09-10 第二十四轮 D3:对话 Rewind / 分支
+            SlashCommand::builtin(
+                "rewind",
+                &[],
+                "列出轮次或回退到第 N 轮之前(原对话自动存分支)",
+                "/rewind [N]",
+            ),
+            SlashCommand::builtin(
+                "undo",
+                &[],
+                "撤销最后一轮对话(等价 /rewind 末轮)",
+                "/undo",
+            ),
+            SlashCommand::builtin("fork", &[], "从当前对话分叉出新会话", "/fork"),
+            SlashCommand::builtin(
+                "branches",
+                &["branch"],
+                "列出已保存的对话分支",
+                "/branches",
+            ),
+            SlashCommand::builtin(
+                "switch",
+                &[],
+                "切换到指定分支(切换前自动快照当前对话)",
+                "/switch <name>",
+            ),
         ];
         Self { builtin, custom: Vec::new() }
     }
