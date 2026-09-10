@@ -36,3 +36,7 @@ CrashReport/
 
 # TestWorkSpace(自动化测试目录,临时文件不入库;与 tmpPlan/ 类似的「一次性产物」)
 TestWorkSpace/
+
+# scripts(本地脚本目录;注意:mock_llm_server.py 为已跟踪文件,忽略规则仅对新增文件生效)
+/scripts/
+
