@@ -345,6 +345,11 @@ impl MultiAgentOrchestrator {
                 Ok(mut task_result) => {
                     // 3) SessionContext 收口(收口前再查一次:取消后不再发摘要请求)
                     Self::check_cancelled(cancel)?;
+                    // 2026-09-10 第 18 轮:摘要的用量口径与终端「本次用量」对齐 ——
+                    // Yolo 分类 + 执行层累计(不含 SessionContext 自身)。
+                    // 此前直接传 task_result.total_usage(仅执行层),漏记 Yolo 分类调用,
+                    // 导致写入 session_memory 的摘要用量系统性偏小。
+                    let usage_for_summary = add_usage(yolo_usage, task_result.total_usage);
                     let summary = self
                         .session_context
                         .summarize(
@@ -362,7 +367,7 @@ impl MultiAgentOrchestrator {
                                     )
                                 })
                                 .collect::<Vec<_>>(),
-                            &task_result.total_usage,
+                            &usage_for_summary,
                             session.id(),
                             task_result.classification.yolo_degraded,
                             &task_result.classification.task_level,

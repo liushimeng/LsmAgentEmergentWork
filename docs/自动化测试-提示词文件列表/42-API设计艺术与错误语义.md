@@ -78,6 +78,7 @@
 ### AQ09 API 文档与开发者体验
 - **预期档位**: medium
 - **考察维度**: DX 设计 + 文档自动化
+- **测试状态**: ✅ 已测试 (AQ09_q1.md, 通过 — 隔离 mock 链路完整跑通,SessionContext 摘要用量口径修复后验证 input=123/81=Yolo+Sub+QC 正确,详见 `tmpPlan/2026-09-10_02-R06-AQ09-测试与Banner对齐及用量口径修复方案.md`)
 - **对话脚本**:
   1. API 文档的核心要素：参考文档、教程、变更日志、SDK、Postman Collection 各自解决什么问题？
   2. OpenAPI 3.1 规范：从 `.yaml` 到 Swagger UI / Redoc 自动渲染的完整 pipeline，CI 怎么集成？

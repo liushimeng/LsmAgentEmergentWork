@@ -61,6 +61,7 @@ E 考察"通用软件开发"，Q 考察"特定编程范式与垂直领域"，
 ### R06 用 Tailwind CSS + Alpine.js 开发 Landing Page
 - **预期档位**: medium
 - **考察维度**: 原子化 CSS + 轻量 JS + 响应式设计
+- **测试状态**: ✅ 已测试 (R06_q1.md, 通过 — 隔离 mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通;本轮修复 TUI Banner 当前模型行溢出/CJK 填充错位、SessionContext 摘要用量缺 Yolo 口径、Debug Report 任务段换行破坏结构,详见 `tmpPlan/2026-09-10_02-R06-AQ09-测试与Banner对齐及用量口径修复方案.md`)
 - **对话脚本**:
   1. 我想用 Tailwind CSS + Alpine.js 开发一个 SaaS 产品的 Landing Page，先设计页面结构（Hero / 功能特性 / 定价 / FAQ / CTA）。
   2. 实现核心功能：用 Tailwind 的工具类完成响应式布局，用 Alpine.js 实现 FAQ 手风琴展开/收起、移动端菜单切换。

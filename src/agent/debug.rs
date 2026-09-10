@@ -603,6 +603,9 @@ pub async fn finalize_report(
         ""
     };
 
+    // 2026-09-10 第 18 轮:任务文本单行化 —— 多行提示词原始换行会破坏报告头部的
+    // Markdown 列表结构(任务里的 `- ` 行混成报告列表项),统一替换为 ⏎ 可见符号。
+    let task_one_line = truncate_chars(&meta.task, 500).replace('\n', " ⏎ ");
     let content = format!(
         "# laew Debug 报告\n\n\
          - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n{}\n\n\
@@ -613,7 +616,7 @@ pub async fn finalize_report(
         collector.session_id(),
         meta.mode,
         meta.model,
-        truncate_chars(&meta.task, 500),
+        task_one_line,
         banner,
         stats,
         evaluation,

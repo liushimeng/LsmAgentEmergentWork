@@ -323,6 +323,7 @@ def openai_tool_use_sse(tool_name, arguments, text="", chunk_id="chatcmpl-mock-e
 # 各角色的固定 JSON 应答(与 src/agent 内各结构体的 serde 表示严格对应):
 YOLO_CLASSIFICATION_JSON = (
     '{"task_level": "simple", "goal_summary": "完成 laew 端到端链路验证",'
+    ' "purpose": "验证 laew 端到端链路是否正常",'
     ' "intent": "verify", "decomposition_plan": ["执行验证命令"],'
     ' "direct_answer": null, "user_suggestion_if_fail": ""}'
 )
@@ -338,6 +339,7 @@ MAIN_WORK_PLAN_JSON = (
 # --parallel-wfs 模式:medium 分类 + 3 个互相独立的 WorkFlow(触发同层并行调度)
 YOLO_CLASSIFICATION_MEDIUM_JSON = (
     '{"task_level": "medium", "goal_summary": "并行调度链路验证",'
+    ' "purpose": "验证同层 WorkFlow 并行调度",'
     ' "intent": "verify", "decomposition_plan": ["并行执行三个独立流程"],'
     ' "direct_answer": null, "user_suggestion_if_fail": ""}'
 )
