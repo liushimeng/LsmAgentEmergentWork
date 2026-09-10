@@ -266,33 +266,95 @@ impl TuiSession {
             collector.reset(self.session.id());
         }
         println!("  [orchestrator 调度中... Ctrl-C 取消]");
-        // 阶段进度打印协程(2026-09-10 第 23 轮,D05/D07 测试轮):
-        // 收到消息挂起 1.5s 再显示;任务快速完成(所有发送端 drop → recv 返回
-        // None)时挂起消息直接丢弃 —— mock 级链路零噪音,真实 LLM 长任务
-        // (Yolo/Plan/Main-Work/SubAgent/QC 各阶段数秒到数分钟)稳定可见。
+        // 阶段进度打印协程(2026-09-10 第 23 轮,D05/D07 测试轮 + 第 26 轮 F05/C06):
+        // - 阶段切换:收到消息挂起 1.5s 再显示;任务快速完成(所有发送端 drop → recv
+        //   返回 None)时挂起消息直接丢弃 —— mock 级链路零噪音,真实 LLM 长任务稳定可见。
+        // - 阶段内 waiting 心跳(2026-09-10 第 26 轮 F05/C06 测试轮):单阶段执行超过
+        //   1s 后每秒重写一行 [waiting] 行,显示 spinner + 已等待秒数;30s 加「响应较慢」
+        //   提示,60s 加「Ctrl-C 取消」提示;阶段切换时自动擦除旧行不留痕迹。
         let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
         let stage_printer = tokio::spawn(async move {
+            use std::io::Write as _;
             let hold = std::time::Duration::from_millis(1500);
+            let tick = std::time::Duration::from_millis(1000);
             // 队列语义:同批到达的阶段消息(如 Yolo 分类 + SubAgent 启动)整批冲刷,
             // 不互相覆盖;通道关闭(任务结束)早于计时器触发时全部丢弃。
             let mut queue: std::collections::VecDeque<String> = Default::default();
             let mut idle = Box::pin(tokio::time::sleep(hold));
+            // 当前阶段的 waiting 心跳状态:None 表示无活动阶段
+            let mut current_stage: Option<(String, std::time::Instant)> = None;
+            let mut spinner_idx: usize = 0;
+            // Braille Pattern 字符集(Braille spinner,宽 1,绝大多数 Unicode 终端可见)
+            const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+            // 工具函数:在真 TTY 下擦除「上一行 waiting 行」(光标上移 + 整行清除)
+            // 非 TTY(管道 / e2e)走 println 路径,不输出 ANSI 控制序列。
+            let clear_waiting_line = |tty: bool| {
+                if tty {
+                    let _ = std::io::stdout().write_all(b"\x1b[1A\x1b[2K");
+                    let _ = std::io::stdout().flush();
+                }
+            };
+            // 工具函数:原地重写当前 waiting 行(\r + 整行覆盖 + flush)
+            let rewrite_waiting_line = |tty: bool, line: &str| {
+                if tty {
+                    let _ = std::io::stdout().write_all(b"\r");
+                    let _ = std::io::stdout().write_all(line.as_bytes());
+                    let _ = std::io::stdout().write_all(b"\x1b[K");
+                    let _ = std::io::stdout().flush();
+                }
+            };
+
             loop {
                 tokio::select! {
                     maybe = stage_rx.recv() => match maybe {
                         Some(line) => {
+                            // 阶段切换:擦除旧 waiting 行 + 打印 stage 行 + 记录新阶段
+                            if current_stage.is_some() {
+                                clear_waiting_line(stdout_is_tty);
+                            }
                             if queue.is_empty() {
                                 idle.as_mut().reset(tokio::time::Instant::now() + hold);
                             }
                             queue.push_back(line);
                         }
-                        None => break, // 任务结束:未显示的快速阶段直接丢弃
+                        None => {
+                            // 任务结束:清除 waiting 行,丢弃未显示的快速阶段
+                            if current_stage.is_some() {
+                                clear_waiting_line(stdout_is_tty);
+                            }
+                            break;
+                        }
                     },
                     _ = &mut idle => {
+                        // 阶段切换 flush + 启动新阶段 waiting 心跳
                         while let Some(line) = queue.pop_front() {
                             println!("  [stage] {line}");
+                            let _ = std::io::stdout().flush();
+                            current_stage = Some((line, std::time::Instant::now()));
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + hold);
+                        // 阶段内 waiting 心跳:每 1s 重写一行(覆盖上一帧)
+                        if let Some((stage, started)) = &current_stage {
+                            let elapsed = started.elapsed().as_secs();
+                            let slow_warn = if elapsed >= 60 {
+                                " ⚠ 等待超过 1 分钟,可 Ctrl-C 取消"
+                            } else if elapsed >= 30 {
+                                " ⚠ 响应较慢"
+                            } else {
+                                ""
+                            };
+                            let frame = SPINNER[spinner_idx % SPINNER.len()];
+                            spinner_idx += 1;
+                            let line = format!(
+                                "  [waiting] {stage}  {frame}  ({elapsed}s){slow_warn}"
+                            );
+                            rewrite_waiting_line(stdout_is_tty, &line);
+                            idle.as_mut().reset(tokio::time::Instant::now() + tick);
+                        } else {
+                            // 无活动阶段:回到 1.5s 节奏(基本不会进入此分支,防御性)
+                            idle.as_mut().reset(tokio::time::Instant::now() + hold);
+                        }
                     }
                 }
             }
@@ -338,20 +400,29 @@ impl TuiSession {
                 Some((OutcomeKind::Executed, text, result.total_usage))
             }
             Ok(OrchestrationOutcome::Failed {
-                suggestion, usage, ..
+                suggestion,
+                reason,
+                usage,
+                ..
             }) => {
                 println!();
                 println!("  [agent failed]");
+                // F4(2026-09-10 第 25 轮):先呈现真实失败原因,再给建议 ——
+                // 此前只显示 suggestion,可能与真实失败无关而误导用户。
+                if !reason.is_empty() {
+                    println!("  原因: {reason}");
+                }
                 println!("  建议: {suggestion}");
                 // 2026-09-10 第 22 轮:与 Executed/DirectAnswer 路径对齐,统一调用
                 // print_usage 输出(input/output + cache_read + cache_creation),
                 // 避免 Failed 路径用量维度缺失,导致用户看不到 prompt caching 命中量。
                 self.print_usage(usage);
-                Some((
-                    OutcomeKind::Failed,
-                    format!("执行失败。\n建议: {suggestion}"),
-                    *usage,
-                ))
+                let mut text = String::from("执行失败。");
+                if !reason.is_empty() {
+                    text.push_str(&format!("\n原因: {reason}"));
+                }
+                text.push_str(&format!("\n建议: {suggestion}"));
+                Some((OutcomeKind::Failed, text, *usage))
             }
             Err(e) if matches!(e, crate::error::AgentError::Cancelled) => {
                 println!();
@@ -1531,6 +1602,41 @@ impl crate::llm::LlmClient for NoopLlm {
 fn atty() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal()
+}
+
+/// TUI 模式的 tracing writer(F5,2026-09-10 第 25 轮):
+/// 把 WARN 级日志改写到 `{根目录}/logs/laew-tui.log`(追加),不再直写 stdout
+/// 与全量重绘交错破坏对话区布局。每次写入独立打开文件(日志量低,开销可忽略);
+/// 目录创建 / 打开失败时退化 `io::sink`(静默丢弃),绝不影响主流程。
+pub fn tui_log_writer() -> impl for<'s> tracing_subscriber::fmt::MakeWriter<'s> {
+    struct TuiLogWriter;
+
+    impl<'s> tracing_subscriber::fmt::MakeWriter<'s> for TuiLogWriter {
+        type Writer = Box<dyn std::io::Write + 's>;
+
+        fn make_writer(&'s self) -> Self::Writer {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(tui_log_path());
+            match file {
+                Ok(f) => Box::new(std::io::LineWriter::new(f)),
+                Err(_) => Box::new(std::io::sink()),
+            }
+        }
+    }
+
+    TuiLogWriter
+}
+
+/// TUI 日志文件路径:`{根目录}/logs/laew-tui.log`(根目录 = 二进制所在目录)。
+fn tui_log_path() -> std::path::PathBuf {
+    let root = crate::database::paths::Paths::detect()
+        .map(|p| p.root_dir)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+    let dir = root.join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("laew-tui.log")
 }
 
 /// 启动 TUI 交互式 REPL

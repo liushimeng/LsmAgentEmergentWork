@@ -211,6 +211,13 @@ impl Agent {
         // 结果聚合作为最终答复。阈值 = max_iterations/2 防止误伤收敛慢但最终成功的任务。
         const NO_TEXT_CONVERGE_THRESHOLD: usize = 8;
         let mut consecutive_no_text_rounds: usize = 0;
+        // F9(2026-09-10 第 25 轮):无文本收敛「宽限轮」。
+        // 此前命中阈值后注入 nudge 却立即 return 兜底文本,nudge 从未到达 LLM
+        // (F-002 的「让 LLM 看到工具历史自纠」意图落空),合法的多步执行单元被硬杀
+        // (D06 实测:SubAgent 8 轮环境探查被终止,核心写入从未发生)。
+        // 现在首次命中:注入 nudge + 重置计数,给 LLM 一轮真实继续机会(工具照常执行);
+        // 第二次命中才按原语义硬终止。上界仍受 max_iterations 约束。
+        let mut no_text_grace_used = false;
 
         // 执行轨迹累计(2026-09-09 第 05 轮):每次循环同步填充 trace 字段,
         // 单元结束时由 ExecutionTrace::collect_failure_signals 统一打标。
@@ -521,13 +528,6 @@ impl Agent {
                 consecutive_no_text_rounds = 0;
             }
             if consecutive_no_text_rounds >= NO_TEXT_CONVERGE_THRESHOLD {
-                warn!(
-                    consecutive_no_text_rounds = consecutive_no_text_rounds,
-                    "检测到连续无文本收敛轮次,注入 nudge 并提前终止以避免耗尽迭代"
-                );
-                trace.early_terminated = true;
-                trace.early_terminate_reason =
-                    format!("no_text_converge rounds={}", consecutive_no_text_rounds);
                 // 关联报告: 2026-09-09_06 F-002 — 把「最近工具调用叙事化摘要」一并
                 // 注入,让 LLM 看到自己刚才做了什么(而非纯次数统计),下次任务能自我纠正。
                 let history_lines: Vec<String> = recent_tool_history
@@ -543,8 +543,39 @@ impl Agent {
                 } else {
                     history_lines.join("\n")
                 };
+                if !no_text_grace_used {
+                    // F9 宽限轮:nudge 真正送达 LLM,工具调用照常执行一轮
+                    no_text_grace_used = true;
+                    warn!(
+                        consecutive_no_text_rounds = consecutive_no_text_rounds,
+                        "检测到连续无文本收敛轮次,注入 nudge 宽限一轮(观察 LLM 自纠)"
+                    );
+                    let narrative = format!(
+                        "[无文本收敛已达上限 {} 轮,关联报告 2026-09-09_06 F-002]\n\
+                         你本会话累计执行 {total_tc} 次工具调用(成功 {total_ok},失败 {total_err}),\
+                         最近 {hist_len} 次摘要:\n{history}\n\
+                         请基于以上观察立即推进任务核心步骤(如写入/修改目标产物)或直接给出结论性答复;\
+                         若任务已无法继续,请明确说明卡点。",
+                        NO_TEXT_CONVERGE_THRESHOLD,
+                        total_tc = trace.tool_calls,
+                        total_ok = trace.tool_calls_ok,
+                        total_err = trace.tool_calls_err,
+                        hist_len = recent_tool_history.len(),
+                        history = history_block,
+                    );
+                    session.context_mut().push(ChatMessage::user(narrative));
+                    consecutive_no_text_rounds = 0;
+                    continue;
+                }
+                warn!(
+                    consecutive_no_text_rounds = consecutive_no_text_rounds,
+                    "宽限轮后仍无文本收敛,提前终止以避免耗尽迭代"
+                );
+                trace.early_terminated = true;
+                trace.early_terminate_reason =
+                    format!("no_text_converge rounds={}", consecutive_no_text_rounds);
                 let narrative = format!(
-                    "[无文本收敛已达上限 {} 轮,关联报告 2026-09-09_06 F-002]\n\
+                    "[无文本收敛已达上限 {} 轮(宽限轮已用),关联报告 2026-09-09_06 F-002]\n\
                      你本会话累计执行 {total_tc} 次工具调用(成功 {total_ok},失败 {total_err}),\
                      最近 {hist_len} 次摘要:\n{history}\n\
                      请基于以上观察直接给出结论性答复;若任务已无法继续,请明确说明卡点。",
@@ -558,7 +589,7 @@ impl Agent {
                 session.context_mut().push(ChatMessage::user(narrative));
                 // 兜底文本:同步告知用户层
                 let fallback_text = format!(
-                    "[SubAgent 已达无文本收敛上限 {} 轮]\n\
+                    "[SubAgent 已达无文本收敛上限 {} 轮(含宽限轮)]\n\
                      - 共执行 {tc} 次工具调用(成功 {ok},失败 {err})\n\
                      - 最近 {hist_len} 次摘要:\n{history}",
                     NO_TEXT_CONVERGE_THRESHOLD,

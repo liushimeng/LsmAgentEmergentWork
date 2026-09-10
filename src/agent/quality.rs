@@ -83,21 +83,28 @@ impl QualityRunner {
     pub async fn check_subagent(
         &self,
         goal: &str,
+        unit_scope: &str,
         expected_output: &str,
         actual_output: &str,
         trace: &ExecutionTrace,
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
         let trace_summary = trace.render_prompt();
+        // F10(2026-09-10 第 25 轮):判定基准是「本单元职责」,整体目标仅作背景。
+        // 此前 prompt 只给整体 goal,QC(真实 LLM)按整体目标判单元产物,SubAgent
+        // 只完成了 wf-1 前置检查也被判「核心任务未完成」→ 无效重试风暴
+        // (Debug 报告 debug_report_20260910_150805 问题报告 P1)。
         let prompt = format!(
             "【Quality-Check: SubAgent 单元】\n\
-             目标: {goal}\n\
-             期望输出: {expected_output}\n\
+             整体目标(仅作背景,不作为本单元判定依据): {goal}\n\
+             本单元职责(判定依据): {unit_scope}\n\
+             本单元期望输出: {expected_output}\n\
              实际输出: {actual_output}\n\
              \n\
              【执行轨迹】\n{trace_summary}\n\
              \n\
-             请基于「实际输出 + 执行轨迹」共同判定,按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
+             请基于「本单元职责 + 期望输出 + 实际输出 + 执行轨迹」判定本单元是否完成,**不要用整体目标苛求本单元**\
+             (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
              判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。",
         );
         self.run_check(prompt, AgentRole::SubAgent, actual_output, session_id).await

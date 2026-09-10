@@ -75,6 +75,14 @@ impl Tool for WriteTool {
         let path = resolve_path(path_str);
         check_write_path(&self.sandbox, self.name(), &path.to_string_lossy())?;
 
+        // F12(2026-09-10 第 25 轮):记录「本次是否新建了父目录」。SubAgent 曾把
+        // 相对路径误写成 `TestWorkSpace/xxx`(工作目录已是 TestWorkSpace),静默
+        // 新建嵌套目录后在后续 mv/find 修复循环中耗尽迭代(D06 实测 P0)。
+        // 把该事实显式回显给 LLM,让路径错误在写入口就被察觉。
+        let parent_created = path
+            .parent()
+            .map(|p| !p.as_os_str().is_empty() && !p.exists())
+            .unwrap_or(false);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| AgentError::ToolExecution {
@@ -90,10 +98,14 @@ impl Tool for WriteTool {
             reason: format!("写入失败: {e}"),
         })?;
 
-        Ok(format!(
-            "[Write] 写入 {bytes} 字节到 {}",
-            path.display()
-        ))
+        let mut result = format!("[Write] 写入 {bytes} 字节到 {}", path.display());
+        if parent_created {
+            result.push_str(
+                "\n[Write] ⚠️ 本次新建了父目录 —— 若你在相对路径里重复了工作目录名(如工作目录已是 \
+                 TestWorkSpace 又写 TestWorkSpace/xxx),文件会落到嵌套目录,请核对路径。",
+            );
+        }
+        Ok(result)
     }
 }
 

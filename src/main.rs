@@ -381,9 +381,18 @@ async fn run_one_shot(
             print_usage(&result.total_usage);
         }
         OrchestrationOutcome::Failed {
-            suggestion, usage, ..
+            suggestion,
+            reason,
+            usage,
+            ..
         } => {
-            eprintln!("[agent failed] {suggestion}");
+            // F4(2026-09-10 第 25 轮):先呈现真实失败原因,再给建议
+            if reason.is_empty() {
+                eprintln!("[agent failed] {suggestion}");
+            } else {
+                eprintln!("[agent failed] 原因: {reason}");
+                eprintln!("[agent failed] 建议: {suggestion}");
+            }
             print_usage(&usage);
         }
     }
@@ -545,13 +554,24 @@ async fn main() -> Result<()> {
         && cli.outprovider.is_none()
         && cli.cmd.is_none();
     let default_level = if is_tui { "warn" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_level.into()),
-        )
-        .with_target(false)
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_level.into());
+    if is_tui {
+        // F5(2026-09-10 第 25 轮):TUI 模式 WARN 级 tracing 原始行直写 stdout,
+        // 与全量重绘交错破坏对话区布局(D06 实测 3 段 6 行 WARN 裸奔在屏上)。
+        // 改写入 {根目录}/logs/laew-tui.log(追加,目录/文件创建失败则静默丢弃,
+        // 不影响主流程);关键降级事件已由 orchestrator 的 [stage] 进度行呈现。
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_writer(lsm_agent::tui::tui_log_writer())
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .init();
+    }
 
     // 优先处理导入/导出命令
     if let Some(path) = cli.inprovider {

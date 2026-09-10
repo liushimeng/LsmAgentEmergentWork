@@ -29,7 +29,9 @@ use crate::llm::{ChatMessage, Completion, LlmClient, RequestMeta, ToolDef, Usage
 /// 单字段摘要最大字符数(防止超大 trace 撑爆报告)。
 const MAX_FIELD_CHARS: usize = 4000;
 /// 喂给 Debug Agent 评估的 trace 最大字符数。
-const MAX_TRACE_FOR_EVAL_CHARS: usize = 12000;
+/// Debug Agent 评估的 trace 窗口上限(字符)。
+/// F7(2026-09-10 第 25 轮):12000 → 36000(配合头尾保留窗口,现代模型上下文充足)。
+const MAX_TRACE_FOR_EVAL_CHARS: usize = 36000;
 
 // =================== 调试事件 ===================
 
@@ -398,6 +400,26 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// 头尾保留窗口截断(F7,2026-09-10 第 25 轮):
+/// Debug 报告评估最需要 trace 的**终态**(最后几次 LLM 调用 / QC 结论 / 收口状态),
+/// 纯头部截断会把它们全丢掉(D06 实测 39261 字符 trace 只留前 12000,Debug Agent
+/// 明确报告「后半段缺失,无法评估终态」)。改为 头 60% + 尾 40%。
+fn head_tail_chars(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let head = max * 6 / 10;
+    let tail = max - head;
+    let dropped = chars.len() - head - tail;
+    format!(
+        "{}\n…(中段截断 {} 字符,保头尾)…\n{}",
+        chars[..head].iter().collect::<String>(),
+        dropped,
+        chars[chars.len() - tail..].iter().collect::<String>(),
+    )
+}
+
 /// LLM 客户端装饰器:打点每次 complete() 并写入 [`DebugCollector`]。
 pub struct DebugLlmClient {
     inner: Arc<dyn LlmClient>,
@@ -497,7 +519,7 @@ impl DebugRunner {
              【统计总览】\n{stats_markdown}\n\n\
              【原始 trace(可能截断)】\n{}\n\n\
              请严格按四章节输出 Markdown:## 任务评估 / ## 质量报告 / ## 问题报告(问题按 P0/P1/P2 分级) / ## 优化建议。",
-            truncate_chars(trace_markdown, MAX_TRACE_FOR_EVAL_CHARS),
+            head_tail_chars(trace_markdown, MAX_TRACE_FOR_EVAL_CHARS),
         );
         let mut session = crate::session::Session::new();
         session.id = session_id.to_string();
@@ -530,12 +552,38 @@ pub struct ReportMeta {
 ///
 /// 用于 Debug 报告 banner 加注"业务正确性不在评估范围"的诚实提示,
 /// 避免阅读者把脚本化文本通过误读为真实任务达成。
-pub fn detect_mock_provider(model: &str) -> bool {
+/// Provider 分类(2026-09-10 第 25 轮 F6):
+/// 此前 `detect_mock_provider` 把「私有端点」与「mock」混为一谈,本地真实网关
+/// (one-api / litellm / Ollama 等跑真实模型)被误标「mock 提供方」,误导报告读者。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// mock 供应商(模型名含 mock 字样):评估为脚本化响应,业务正确性无效
+    Mock,
+    /// 私有端点但非 mock(本地网关 / Ollama):评估是真实模型产出
+    LocalReal,
+    /// 公网真实 Provider
+    Real,
+}
+
+/// 按「当前模型」元信息串分类 Provider(模型名 + 端点)。
+pub fn classify_provider(model: &str) -> ProviderKind {
     let lower = model.to_lowercase();
-    lower.contains("mock")
-        || lower.contains("127.0.0.1")
+    if lower.contains("mock") {
+        return ProviderKind::Mock;
+    }
+    if lower.contains("127.0.0.1")
         || lower.contains("localhost")
         || lower.contains("0.0.0.0")
+        || lower.contains("[::1]")
+    {
+        return ProviderKind::LocalReal;
+    }
+    ProviderKind::Real
+}
+
+/// 兼容旧调用:是否 mock 供应商。
+pub fn detect_mock_provider(model: &str) -> bool {
+    classify_provider(model) == ProviderKind::Mock
 }
 
 /// 生成报告文件名:`debug_report_{YYYYMMDD}_{HHMMSS}_{rand6}.md`。
@@ -614,16 +662,19 @@ pub async fn finalize_report(
     };
 
     // 2026-09-10 第 21 轮:Mock provider 识别 + 评估边界提示。
-    // 当 `meta.model` 含 `mock` 字样或指向 127.0.0.1 私有端点时,
-    // Debug Agent 的"任务目标达成"判断是脚本化文本通过,**不代表真实业务完成**。
-    // 在 banner 后追加一段 P3 提示,让阅读者(测试人员 / CI 维护者)不被误导。
-    let is_mock = detect_mock_provider(&meta.model);
-    let mock_notice = if is_mock {
-        "\n> ℹ️ **当前为 mock 提供方** — 下方 Debug Agent 的「任务评估」/「质量报告」基于脚本化响应,\n\
-         > 仅用于验证 laew 链路完整性(Yolo 分类 / Main-Work 拆解 / SubAgent 调度 / QC / SessionContext 收口),\n\
-         > **业务正确性不在评估范围内**。回归请使用真实 Provider。\n"
-    } else {
-        ""
+    // 2026-09-10 第 25 轮(F6):细分 mock 与「本地真实网关」—— 此前私有端点一律
+    // 误标为 mock 提供方,本地网关(one-api / litellm / Ollama)的真实评估被误导。
+    let mock_notice = match classify_provider(&meta.model) {
+        ProviderKind::Mock => {
+            "\n> ℹ️ **当前为 mock 提供方** — 下方 Debug Agent 的「任务评估」/「质量报告」基于脚本化响应,\n\
+             > 仅用于验证 laew 链路完整性(Yolo 分类 / Main-Work 拆解 / SubAgent 调度 / QC / SessionContext 收口),\n\
+             > **业务正确性不在评估范围内**。回归请使用真实 Provider。\n"
+        }
+        ProviderKind::LocalReal => {
+            "\n> ℹ️ **当前为本地网关(私有端点 + 真实模型)** — 评估基于真实 LLM 产出,\n\
+             > 但端点在本机/内网,生产回归仍建议用公网 Provider 复测。\n"
+        }
+        ProviderKind::Real => "",
     };
 
     let banner = if degraded {
@@ -932,19 +983,59 @@ mod tests {
 
     /// 2026-09-10 第 21 轮:`detect_mock_provider` 单元测试,确保 mock / 私有端点
     /// 正确识别、真实 provider 不会被误标。
+    /// 2026-09-10 第 25 轮(F6):私有端点细分 —— 本地真实网关不再是 mock。
     #[test]
     fn detect_mock_provider_recognizes_mock_and_private_endpoint() {
         // mock 字样
         assert!(detect_mock_provider("[anthropic] mockTest/claude-mock @ http://127.0.0.1:18930"));
         assert!(detect_mock_provider("Mock Provider Test"));
         assert!(detect_mock_provider("MOCK"));
-        // 私有端点
-        assert!(detect_mock_provider("[openai] gpt-4 @ http://localhost:8080"));
-        assert!(detect_mock_provider("[anthropic] provider @ http://0.0.0.0:5000"));
-        assert!(detect_mock_provider("[anthropic] x @ http://127.0.0.1:5000"));
+        // 私有端点:非 mock 模型 → LocalReal(本地网关,真实模型)
+        assert_eq!(
+            classify_provider("[openai] gpt-4 @ http://localhost:8080"),
+            ProviderKind::LocalReal
+        );
+        assert_eq!(
+            classify_provider("[anthropic] provider @ http://0.0.0.0:5000"),
+            ProviderKind::LocalReal
+        );
+        assert_eq!(
+            classify_provider("[anthropic] x @ http://127.0.0.1:5000"),
+            ProviderKind::LocalReal
+        );
+        assert_eq!(
+            classify_provider("[anthropic] gw/llama3 @ http://[::1]:11434"),
+            ProviderKind::LocalReal
+        );
         // 真实 provider 不应被误标
-        assert!(!detect_mock_provider("[anthropic] realProvider/claude-3-5 @ https://api.anthropic.com"));
-        assert!(!detect_mock_provider("[openai] gpt-4 @ https://api.openai.com"));
-        assert!(!detect_mock_provider("[anthropic] claude @ https://example.com"));
+        assert_eq!(
+            classify_provider("[anthropic] realProvider/claude-3-5 @ https://api.anthropic.com"),
+            ProviderKind::Real
+        );
+        assert_eq!(
+            classify_provider("[openai] gpt-4 @ https://api.openai.com"),
+            ProviderKind::Real
+        );
+        assert_eq!(
+            classify_provider("[anthropic] claude @ https://example.com"),
+            ProviderKind::Real
+        );
+        // mock 模型名优先于端点判定
+        assert_eq!(
+            classify_provider("[anthropic] mockTest/claude-mock @ http://127.0.0.1:18930"),
+            ProviderKind::Mock
+        );
+    }
+
+    /// F7(2026-09-10 第 25 轮):头尾保留窗口 —— 终态(尾部)必须可见。
+    #[test]
+    fn head_tail_chars_keeps_tail() {
+        let s: String = "0123456789".repeat(10); // 100 字符
+        let out = head_tail_chars(&s, 20);
+        assert!(out.contains("中段截断"));
+        assert!(out.starts_with('0'), "应保留头部");
+        assert!(out.ends_with('9'), "应保留尾部(终态)");
+        let short = "短文本";
+        assert_eq!(head_tail_chars(short, 100), short);
     }
 }

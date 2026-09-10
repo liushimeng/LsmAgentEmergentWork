@@ -15,19 +15,27 @@ use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Usage};
 
 /// 单个 WorkFlow 规格(Main-Work 输出)
+///
+/// 2026-09-10 第 25 轮(F1):steps/branches/loops/depends_on/acceptance/delegate_to
+/// 全部走宽松反序列化 —— 真实 LLM 高频把 branches 写成字符串数组、acceptance 写成
+/// 单字符串、delegate_to 写成 "SubAgent-Work" 等别名,严格 serde 校验会丢弃整份计划
+/// (D06 实测 3/3 失败,2605 token 高质量编排被整体浪费)。详见
+/// `tmpPlan/2026-09-10_08-D06测试与MainWork解析宽松化及重试反馈修复方案.md`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkFlowSpec {
     pub id: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_strings")]
     pub steps: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_branches")]
     pub branches: Vec<BranchSpec>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_loops")]
     pub loops: Vec<LoopSpec>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_strings")]
     pub depends_on: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_strings")]
     pub acceptance: Vec<String>,
+    #[serde(default = "default_delegate_to", deserialize_with = "lenient_delegate_to")]
     pub delegate_to: AgentRole,
 }
 
@@ -52,6 +60,150 @@ pub struct WorkFlowPlan {
     pub workflows: Vec<WorkFlowSpec>,
     #[serde(default)]
     pub summary: String,
+    /// 解析失败走了兜底单 WorkFlow(F2):`run_medium` 据此跳过 QC-main
+    /// (兜底计划带自证失败的 summary,送 QC 必然 fail+retryable,形成必败重试循环),
+    /// 直接进入执行层,由每 WorkFlow 的 QC 把守真实产物。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degraded: bool,
+}
+
+/// 宽松 `Vec<String>` 反序列化:对象数组(标准)/ 单字符串 → 数组。
+fn lenient_strings<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Many(Vec<String>),
+        One(String),
+    }
+    match Raw::deserialize(deserializer)? {
+        Raw::Many(v) => Ok(v),
+        Raw::One(s) => Ok(vec![s]),
+    }
+}
+
+/// 把 "条件: 动作" 形态的自然语言字符串切成 (condition, then)。
+/// 分隔符取 `：` `:` `→` `->` 中**最早出现**的一个;切不开则整体归 condition。
+fn split_condition_then(text: &str) -> (String, String) {
+    let chars: Vec<char> = text.chars().collect();
+    let candidates = ["：", ":", "→", "->"];
+    let mut best: Option<(usize, usize, usize)> = None; // (char_idx, sep_chars, sep_bytes)
+    for sep in candidates {
+        if let Some(byte_idx) = text.find(sep) {
+            let char_idx = text[..byte_idx].chars().count();
+            if best.map_or(true, |(b, _, _)| char_idx < b) {
+                best = Some((char_idx, sep.chars().count(), sep.len()));
+            }
+        }
+    }
+    match best {
+        Some((idx, sep_chars, _)) => (
+            chars[..idx].iter().collect::<String>().trim().to_string(),
+            chars[idx + sep_chars..]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string(),
+        ),
+        None => (text.trim().to_string(), String::new()),
+    }
+}
+
+/// 宽松 branches 反序列化(F1):对象数组 / 字符串数组 / 单字符串。
+/// 字符串形态 `"若 X 失败: 改用 Y"` → `BranchSpec { condition: "若 X 失败", then: "改用 Y" }`。
+fn lenient_branches<'de, D>(deserializer: D) -> std::result::Result<Vec<BranchSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RawBranch {
+        Object(BranchSpec),
+        Text(String),
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RawList {
+        Many(Vec<RawBranch>),
+        One(RawBranch),
+    }
+    fn convert(r: RawBranch) -> BranchSpec {
+        match r {
+            RawBranch::Object(b) => b,
+            RawBranch::Text(s) => {
+                let (condition, then) = split_condition_then(&s);
+                BranchSpec { condition, then }
+            }
+        }
+    }
+    Ok(match RawList::deserialize(deserializer)? {
+        RawList::Many(v) => v.into_iter().map(convert).collect(),
+        RawList::One(r) => vec![convert(r)],
+    })
+}
+
+/// 宽松 loops 反序列化(F1):对象数组 / 字符串数组 / 单字符串。
+/// 字符串形态 `"对每个文件: 执行 X"` → `LoopSpec { condition: "对每个文件", over: "执行 X" }`。
+fn lenient_loops<'de, D>(deserializer: D) -> std::result::Result<Vec<LoopSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RawLoop {
+        Object(LoopSpec),
+        Text(String),
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RawList {
+        Many(Vec<RawLoop>),
+        One(RawLoop),
+    }
+    fn convert(r: RawLoop) -> LoopSpec {
+        match r {
+            RawLoop::Object(l) => l,
+            RawLoop::Text(s) => {
+                let (condition, over) = split_condition_then(&s);
+                LoopSpec {
+                    condition,
+                    over,
+                    max_iterations: None,
+                }
+            }
+        }
+    }
+    Ok(match RawList::deserialize(deserializer)? {
+        RawList::Many(v) => v.into_iter().map(convert).collect(),
+        RawList::One(r) => vec![convert(r)],
+    })
+}
+
+/// 宽松 delegate_to 反序列化(F1):接受 "SubAgent-Work" / "main-work" 等别名;
+/// 未知变体回退执行层 SubAgent,绝不因该字段丢整份计划。
+fn default_delegate_to() -> AgentRole {
+    AgentRole::SubAgent
+}
+
+fn lenient_delegate_to<'de, D>(deserializer: D) -> std::result::Result<AgentRole, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    let norm = raw.trim().to_lowercase().replace(['-', '_', ' '], "");
+    let role = match norm.as_str() {
+        "subagent" | "subagentwork" | "work" | "执行层" => AgentRole::SubAgent,
+        "main" | "mainwork" | "mainworkagent" => AgentRole::MainWork,
+        "yolo" => AgentRole::Yolo,
+        "plan" => AgentRole::Plan,
+        "quality" | "qualitycheck" | "qc" => AgentRole::QualityCheck,
+        "session" | "sessioncontext" => AgentRole::SessionContext,
+        "compact" => AgentRole::Compact,
+        _ => AgentRole::SubAgent,
+    };
+    Ok(role)
 }
 
 /// Main-Work 执行器。
@@ -67,11 +219,15 @@ impl MainWorkRunner {
     }
 
     /// 接收任务目标,产出 WorkFlow 列表(2026-09-09 第 14 轮:带回 LLM Usage 用于 Orchestrator 累加)。
+    ///
+    /// `retry_hint`(2026-09-10 第 25 轮 F3):上一轮执行/QC 的失败原因,重试轮回灌给
+    /// Main-Work 参考规避,消除「盲重试」;首轮传空串。
     pub async fn plan_workflows(
         &self,
         goal: &str,
         decomposition: &[String],
         session_id: &str,
+        retry_hint: &str,
     ) -> Result<(WorkFlowPlan, Usage)> {
         let mut prompt = String::new();
         prompt.push_str(&format!("【Main-Work 任务编排】\n目标: {}\n", goal));
@@ -81,9 +237,24 @@ impl MainWorkRunner {
                 prompt.push_str(&format!("  {}. {}\n", i + 1, s));
             }
         }
+        if !retry_hint.is_empty() {
+            prompt.push_str(&format!(
+                "\n【重要】上一轮同目标执行失败,失败原因:\n{retry_hint}\n\
+                 请在本轮拆解中针对上述原因调整编排(补充前置检查 / 拆细步骤 / 明确验收命令)。\n"
+            ));
+        }
+        // F8:补全 branches/loops 的 schema 示例并注明可省略 —— 此前提示词只列了
+        // 六个必填字段,LLM 自行发明 branches 字符串形态导致类型失配(F1 的源头)。
         prompt.push_str(
-            "\n请按 JSON 格式输出 workflows 数组。每个 workflow 必须包含 \
-             id/name/steps/depends_on/acceptance/delegate_to 字段。",
+            "\n请严格按以下 JSON 结构输出(可包裹在 ```json 代码块中):\n\
+             {\"workflows\": [{\"id\": \"wf-1\", \"name\": \"流程名\", \"steps\": [\"步骤\"], \
+             \"branches\": [\"条件: 动作\"], \"loops\": [\"条件: 遍历对象\"], \"depends_on\": [], \
+             \"acceptance\": [\"可验证的验收标准\"], \"delegate_to\": \"subagent\"}], \"summary\": \"编排思路\"}\n\
+             约束:\n\
+             - id/name/steps/acceptance/delegate_to 必填;branches/loops/depends_on/summary 可省略。\n\
+             - branches/loops 元素是字符串(形如 \"条件: 动作\")或对象({\"condition\":…,\"then\":…} / {\"condition\":…,\"over\":…})均可。\n\
+             - delegate_to 固定填 \"subagent\"。\n\
+             - acceptance 必须是可执行验证的验收标准(命令 / 可比对的预期输出),不要写「完成目标」这类空话。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -93,6 +264,13 @@ impl MainWorkRunner {
         let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
         let plan = parse_workflow_plan(&text).unwrap_or_else(|e| {
             tracing::warn!("Main-Work 解析失败,使用单 WorkFlow 兜底: {}", e);
+            // F2:兜底 acceptance 继承 Yolo 分解步骤(可验证清单),不再退化「完成目标」;
+            // degraded=true 供 run_medium 跳过 QC-main,消除必败重试循环。
+            let inherited = if decomposition.is_empty() {
+                vec!["完成目标".to_string()]
+            } else {
+                decomposition.to_vec()
+            };
             WorkFlowPlan {
                 workflows: vec![WorkFlowSpec {
                     id: "wf-1".into(),
@@ -101,10 +279,11 @@ impl MainWorkRunner {
                     branches: vec![],
                     loops: vec![],
                     depends_on: vec![],
-                    acceptance: vec!["完成目标".into()],
+                    acceptance: inherited,
                     delegate_to: AgentRole::SubAgent,
                 }],
                 summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
+                degraded: true,
             }
         });
 
@@ -368,6 +547,7 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
     Ok(WorkFlowPlan {
         workflows,
         summary: "从 Plan 文档解析得到".into(),
+        degraded: false,
     })
 }
 
@@ -561,5 +741,92 @@ mod tests {
         assert_eq!(plan.workflows[0].id, "wf-1");
         assert_eq!(plan.workflows[0].name, "执行验证");
         assert_eq!(plan.workflows[0].steps.len(), 1);
+    }
+
+    /// F1(2026-09-10 第 25 轮):真实 LLM(D06 实测 MiniMax-M3 3/3)把 branches
+    /// 写成字符串数组,宽松反序列化必须解析成功而非丢弃整份计划。
+    #[test]
+    fn parse_lenient_branches_string_array() {
+        let json = r#"{"workflows": [{"id": "wf-1", "name": "创建文件", "steps": ["写入 JSON"],
+            "branches": ["若 jq . 解析失败(JSON 语法错误): 修正文件内容后重新自检,最多重试 1 次",
+                          "IF jq 不可用或 jq 命令非零退出 → 改用 python3 等效提取"],
+            "loops": [], "depends_on": [],
+            "acceptance": ["test -f openai_chat_response.json 退出码为 0"],
+            "delegate_to": "subagent"}]}"#;
+        let plan: WorkFlowPlan =
+            serde_json::from_str(json).expect("字符串形态 branches 必须可解析");
+        let branches = &plan.workflows[0].branches;
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].condition, "若 jq . 解析失败(JSON 语法错误)");
+        assert_eq!(branches[0].then, "修正文件内容后重新自检,最多重试 1 次");
+        assert_eq!(branches[1].condition, "IF jq 不可用或 jq 命令非零退出");
+        assert_eq!(branches[1].then, "改用 python3 等效提取");
+    }
+
+    /// F1:branches 为单字符串 / loops 为字符串数组 / acceptance 为单字符串。
+    #[test]
+    fn parse_lenient_scalar_shapes() {
+        let json = r#"{"workflows": [{"id": "wf-1", "name": "n",
+            "branches": "若失败: 重试一次",
+            "loops": ["对每个文件: 执行校验"],
+            "acceptance": "文件存在"}]}"#;
+        let plan: WorkFlowPlan = serde_json::from_str(json).expect("标量形态必须可解析");
+        let wf = &plan.workflows[0];
+        assert_eq!(wf.branches.len(), 1);
+        assert_eq!(wf.branches[0].condition, "若失败");
+        assert_eq!(wf.branches[0].then, "重试一次");
+        assert_eq!(wf.loops.len(), 1);
+        assert_eq!(wf.loops[0].condition, "对每个文件");
+        assert_eq!(wf.loops[0].over, "执行校验");
+        assert_eq!(wf.acceptance, vec!["文件存在"]);
+    }
+
+    /// F1:对象数组(标准形态)与对象/字符串混合数组都兼容。
+    #[test]
+    fn parse_lenient_branches_object_and_mixed() {
+        let json = r#"{"workflows": [{"id": "wf-1", "name": "n",
+            "branches": [{"condition": "a", "then": "b"}, "若 X: 则 Y"]}]}"#;
+        let plan: WorkFlowPlan = serde_json::from_str(json).expect("混合形态必须可解析");
+        let branches = &plan.workflows[0].branches;
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].condition, "a");
+        assert_eq!(branches[0].then, "b");
+        assert_eq!(branches[1].condition, "若 X");
+        assert_eq!(branches[1].then, "则 Y");
+    }
+
+    /// F1:delegate_to 接受别名;未知值与字段缺失回退 SubAgent。
+    #[test]
+    fn parse_lenient_delegate_to() {
+        let mk = |v: &str| {
+            format!(r#"{{"workflows": [{{"id": "wf-1", "name": "n", "delegate_to": {v}}}]}}"#)
+        };
+        for alias in ["\"SubAgent-Work\"", "\"subagent\"", "\"work\"", "\"MAIN-WORK\""] {
+            let plan: WorkFlowPlan = serde_json::from_str(&mk(alias)).unwrap();
+            let expected = if alias.contains("MAIN") {
+                AgentRole::MainWork
+            } else {
+                AgentRole::SubAgent
+            };
+            assert_eq!(plan.workflows[0].delegate_to, expected, "alias={alias}");
+        }
+        // 未知值 → SubAgent 兜底
+        let plan: WorkFlowPlan = serde_json::from_str(&mk("\"someone-else\"")).unwrap();
+        assert_eq!(plan.workflows[0].delegate_to, AgentRole::SubAgent);
+        // 字段缺失 → 默认 SubAgent
+        let plan: WorkFlowPlan =
+            serde_json::from_str(r#"{"workflows": [{"id": "wf-1", "name": "n"}]}"#).unwrap();
+        assert_eq!(plan.workflows[0].delegate_to, AgentRole::SubAgent);
+    }
+
+    /// F2:split_condition_then 的分隔符取最早出现者,切不开归 condition。
+    #[test]
+    fn split_condition_then_earliest_separator() {
+        let (c, t) = super::split_condition_then("若超时: 重试,若仍失败: 上报");
+        assert_eq!(c, "若超时");
+        assert_eq!(t, "重试,若仍失败: 上报");
+        let (c, t) = super::split_condition_then("无分隔符的整句");
+        assert_eq!(c, "无分隔符的整句");
+        assert_eq!(t, "");
     }
 }

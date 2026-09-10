@@ -107,6 +107,9 @@ pub enum OrchestrationOutcome {
     /// 失败(达到最大重试 / Yolo 给出 user_suggestion)
     Failed {
         classification: TaskClassification,
+        /// 最后一轮的真实失败原因(2026-09-10 第 25 轮 F4):此前只有 suggestion,
+        /// 可能与真实失败无关(如 Yolo 预判「jq 未安装」而实际是解析失败),误导用户。
+        reason: String,
         suggestion: String,
         usage: Usage,
     },
@@ -319,6 +322,9 @@ impl MultiAgentOrchestrator {
             });
 
         let mut retry_count = 0;
+        // F3(2026-09-10 第 25 轮):上一轮失败原因,重试轮回灌 Main-Work(消除盲重试);
+        // 档位升级回流 Yolo 后清空。同时作为 Failed 变体的 reason(F4)。
+        let mut retry_hint = String::new();
 
         // 1.2) simple + direct_answer 短路(2026-09-09 第 15 轮 AQ03 实测发现):
         // Yolo 已给出完整直接答案时,不再空转一轮 SubAgent+QC(实测多花 ~2.5 分钟
@@ -375,6 +381,7 @@ impl MultiAgentOrchestrator {
                 self.dbg_task_end(&format!("failed: {suggestion}"), total_usage);
                 return Ok(OrchestrationOutcome::Failed {
                     classification,
+                    reason: retry_hint.clone(),
                     suggestion,
                     usage: total_usage,
                 });
@@ -387,7 +394,7 @@ impl MultiAgentOrchestrator {
                         .await
                 }
                 TaskLevel::Medium => {
-                    self.run_medium(&classification, session, cancel, progress)
+                    self.run_medium(&classification, session, cancel, progress, &retry_hint)
                         .await
                 }
                 TaskLevel::Hard => {
@@ -461,6 +468,8 @@ impl MultiAgentOrchestrator {
                             Ok(new_c) => {
                                 classification = new_c;
                                 self.dbg_classify(&classification);
+                                // 档位升级后旧失败原因不再适用(F3)
+                                retry_hint.clear();
                                 continue;
                             }
                             Err(e) => {
@@ -469,6 +478,8 @@ impl MultiAgentOrchestrator {
                         }
                     }
                     // retryable=true 留在当前档位继续重跑
+                    // F3:记录失败原因,下一轮回灌 Main-Work / 供 Failed 呈现
+                    retry_hint = failure.reason.clone();
                     emit_progress(progress, format!("第 {retry_count} 轮重试当前档位…"));
                     continue;
                 }
@@ -518,6 +529,7 @@ impl MultiAgentOrchestrator {
             .quality
             .check_subagent(
                 &c.goal_summary,
+                &input.description,
                 &input.expected_output,
                 &outcome.text,
                 &outcome.trace,
@@ -585,16 +597,39 @@ impl MultiAgentOrchestrator {
         session: &Session,
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
+        retry_hint: &str,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Main-Work 拆 WorkFlow
         emit_progress(progress, "Main-Work 拆解中…");
         let (plan, mainwork_usage) = self
             .main_work
-            .plan_workflows(&c.goal_summary, &c.decomposition_plan, session.id())
+            .plan_workflows(
+                &c.goal_summary,
+                &c.decomposition_plan,
+                session.id(),
+                retry_hint,
+            )
             .await
             .map_err(|e| {
                 QualityFailure::from_agent_error(AgentRole::MainWork, "Main-Work 拆解失败", &e)
             })?;
+
+        // 1.5) F2(2026-09-10 第 25 轮):兜底计划跳过 QC-main 直接执行。
+        // 兜底 WorkFlowPlan 的 summary 自证「解析失败」,送 QC 必然 fail+retryable,
+        // 形成确定性必败重试循环(D06 实测连烧 3 轮 ~10 分钟零产出)。
+        // 真实产物质量仍由 execute_workflows 内每 WorkFlow 的 QC 把守。
+        if plan.degraded {
+            emit_progress(
+                progress,
+                format!(
+                    "Main-Work 解析失败,已使用单 WorkFlow 兜底(跳过计划 QC,直接执行 {} 个流程)",
+                    plan.workflows.len()
+                ),
+            );
+            return self
+                .execute_workflows(c, &plan, mainwork_usage, session, cancel, progress)
+                .await;
+        }
 
         // 2) Quality 校验 Main-Work 输出
         let wf_json = serde_json::to_string(&plan).unwrap_or_default();
@@ -1089,6 +1124,7 @@ async fn run_wf_unit(
     let (qc, qc_usage) = quality
         .check_subagent(
             &goal,
+            &input.description,
             &input.expected_output,
             &outcome.text,
             &outcome.trace,
@@ -1187,9 +1223,11 @@ fn fallback_suggestion(total_usage: &Usage) -> String {
             .to_string()
     } else {
         // 已有较多产出但仍失败:通常是质量判定 / 路径错误类
+        // F11(2026-09-10 第 25 轮):此前误把 output_tokens 当「迭代次数」展示
+        // ("已迭代 398 次"),数值来自 token 统计,严重误导。改为如实描述。
         format!(
-            "已迭代 {} 次仍未通过质量判定:请确认任务目标是否合理、工具调用结果是否正确,\
-             或拆分成更小的子任务",
+            "任务累计产出 {} output tokens 仍未通过质量判定:请确认任务目标是否合理、\
+             工具调用结果是否正确,或拆分成更小的子任务",
             total_usage.output_tokens
         )
     }
@@ -1309,13 +1347,14 @@ mod tests {
         );
 
         // output_token 较大: 提示拆分 / 调整目标
+        // F11(2026-09-10 第 25 轮):措辞不再把 output_tokens 谎报为「迭代次数」
         let ample = fallback_suggestion(&Usage {
             output_tokens: 200,
             ..Usage::default()
         });
         assert!(
-            ample.contains("已迭代") && ample.contains("拆分"),
-            "output=200 应提示拆分,实际: {ample}"
+            ample.contains("output tokens") && ample.contains("拆分"),
+            "output=200 应如实描述产出并提示拆分,实际: {ample}"
         );
     }
 }

@@ -12,6 +12,11 @@ MOCK_PORT=18899
 MOCK_LOG="testReport/mock_requests-$TS.jsonl"
 PASS=0; FAIL=0
 
+# 2026-09-10 第 25 轮:D9-7 SSRF 守卫(url_safety.rs)落库后,mock 服务的
+# 127.0.0.1 端点在请求期被拦截,全量用例挂在这一行(92 FAIL)。
+# e2e 全程使用本地 mock,统一放行私有端点(与 tmux 用例既有做法一致)。
+export LAEW_ALLOW_PRIVATE_ENDPOINT=1
+
 # 提前创建报告文件,避免后续 tee -a 在某些早期调用顺序下出现
 # "No such file or directory" 竞态(关联报告: 20260908_203854 D-003)
 mkdir -p testReport
@@ -869,7 +874,11 @@ else
 
   # ----- tmux helpers -----
   tnew() {  # 创建后台会话并启动 laew,固定 100x30
-    tmux new-session -d -s "$TSESS" -x 100 -y 30 "$LAEW" 2>>"$TMUX_LOG"
+    # 2026-09-10 第 25 轮:env 显式内联 —— 脚本 shell 的 export 对常驻 tmux server
+    # 的会话环境不生效(server 只继承启动时环境 + update-environment 白名单),
+    # 隔离库中的 127.0.0.1 provider 会在 TUI bootstrap 时被 SSRF 守卫拦截致秒退,
+    # 全部 tmux 用例空捕获(实测 32 FAIL)。
+    tmux new-session -d -s "$TSESS" -x 100 -y 30 "env LAEW_ALLOW_PRIVATE_ENDPOINT=1 $LAEW" 2>>"$TMUX_LOG"
     # 等待 bootstrap(banner 是首屏内容,出现即说明已就绪)
     sleep 0.5
   }
