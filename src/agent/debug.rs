@@ -521,6 +521,23 @@ pub struct ReportMeta {
     pub model: String,
 }
 
+/// 检测 `meta.model` 字符串是否描述了一个 mock / 本地端点 provider。
+///
+/// 触发任一条件即视为 mock:
+/// - `model` 字符串含 `mock`(大小写不敏感)—— 覆盖 `mockCI01` / `mockHard` / `mockA` 等命名约定
+/// - `model` 字符串含 `127.0.0.1` / `localhost` —— 指向本机私有端点(loopback)
+/// - `model` 字符串含 `0.0.0.0` —— 指向所有网卡(典型 mock server 绑定)
+///
+/// 用于 Debug 报告 banner 加注"业务正确性不在评估范围"的诚实提示,
+/// 避免阅读者把脚本化文本通过误读为真实任务达成。
+pub fn detect_mock_provider(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("mock")
+        || lower.contains("127.0.0.1")
+        || lower.contains("localhost")
+        || lower.contains("0.0.0.0")
+}
+
 /// 生成报告文件名:`debug_report_{YYYYMMDD}_{HHMMSS}_{rand6}.md`。
 pub fn report_file_name() -> String {
     let now = crate::session::now_readable(); // YYYYMMDD-HHMMSS
@@ -595,6 +612,20 @@ pub async fn finalize_report(
             true,
         ),
     };
+
+    // 2026-09-10 第 21 轮:Mock provider 识别 + 评估边界提示。
+    // 当 `meta.model` 含 `mock` 字样或指向 127.0.0.1 私有端点时,
+    // Debug Agent 的"任务目标达成"判断是脚本化文本通过,**不代表真实业务完成**。
+    // 在 banner 后追加一段 P3 提示,让阅读者(测试人员 / CI 维护者)不被误导。
+    let is_mock = detect_mock_provider(&meta.model);
+    let mock_notice = if is_mock {
+        "\n> ℹ️ **当前为 mock 提供方** — 下方 Debug Agent 的「任务评估」/「质量报告」基于脚本化响应,\n\
+         > 仅用于验证 laew 链路完整性(Yolo 分类 / Main-Work 拆解 / SubAgent 调度 / QC / SessionContext 收口),\n\
+         > **业务正确性不在评估范围内**。回归请使用真实 Provider。\n"
+    } else {
+        ""
+    };
+
     let banner = if degraded {
         "\n> ⚠️ **Debug Agent 评估失败,已降级到基于 trace 的自检骨架** — 下方「任务评估 / 质量报告 / 问题报告 / 优化建议」\
          章节由 `src/agent/debug.rs::render_degraded_evaluation` 根据 trace 指标自动归类,\
@@ -608,7 +639,7 @@ pub async fn finalize_report(
     let task_one_line = truncate_chars(&meta.task, 500).replace('\n', " ⏎ ");
     let content = format!(
         "# laew Debug 报告\n\n\
-         - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n{}\n\n\
+         - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n{}{}\n\n\
          ## 一、统计总览\n\n{}\n\n\
          ## 二、Debug Agent 评估\n\n{}\n\n\
          ## 三、原始 Trace 附录\n\n{}\n",
@@ -618,6 +649,7 @@ pub async fn finalize_report(
         meta.model,
         task_one_line,
         banner,
+        mock_notice,
         stats,
         evaluation,
         trace,
@@ -896,5 +928,23 @@ mod tests {
         assert!(out.contains("截断"));
         let short = "短文本";
         assert_eq!(truncate_chars(short, 100), short);
+    }
+
+    /// 2026-09-10 第 21 轮:`detect_mock_provider` 单元测试,确保 mock / 私有端点
+    /// 正确识别、真实 provider 不会被误标。
+    #[test]
+    fn detect_mock_provider_recognizes_mock_and_private_endpoint() {
+        // mock 字样
+        assert!(detect_mock_provider("[anthropic] mockTest/claude-mock @ http://127.0.0.1:18930"));
+        assert!(detect_mock_provider("Mock Provider Test"));
+        assert!(detect_mock_provider("MOCK"));
+        // 私有端点
+        assert!(detect_mock_provider("[openai] gpt-4 @ http://localhost:8080"));
+        assert!(detect_mock_provider("[anthropic] provider @ http://0.0.0.0:5000"));
+        assert!(detect_mock_provider("[anthropic] x @ http://127.0.0.1:5000"));
+        // 真实 provider 不应被误标
+        assert!(!detect_mock_provider("[anthropic] realProvider/claude-3-5 @ https://api.anthropic.com"));
+        assert!(!detect_mock_provider("[openai] gpt-4 @ https://api.openai.com"));
+        assert!(!detect_mock_provider("[anthropic] claude @ https://example.com"));
     }
 }

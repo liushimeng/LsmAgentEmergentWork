@@ -208,8 +208,27 @@ pub fn inject_once(session: &mut Session, work_dir: &Path) -> bool {
     let ctx = load(work_dir);
     match build_message(&ctx) {
         Some(msg) => {
+            // 注入元数据日志(让 -p / TUI 模式下注入行为可观测):
+            // - chars: 注入的字符数(CJK 按字符计数,后续 Compact 触发判断会换算 token)
+            // - truncated: 是否触发了 MAX_CONTEXT_CHARS 截断(>50K 字符会被截到 50K)
+            // - path: 实际读取的文件路径(GeneratedReadme 时为 None,显示 <generated>)
+            // - work_dir: 探测的工作目录绝对路径
+            let chars = ctx.content.chars().count();
+            let truncated = chars >= MAX_CONTEXT_CHARS;
+            let path_display = ctx
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<generated>".to_string());
+            info!(
+                source = ctx.source.as_str(),
+                chars = chars,
+                truncated = truncated,
+                path = %path_display,
+                work_dir = %ctx.work_dir.display(),
+                "项目上下文注入完成(首次处理)"
+            );
             session.context_mut().insert(0, msg);
-            info!(source = ctx.source.as_str(), "已注入项目上下文(首次处理)");
             true
         }
         None => false,
