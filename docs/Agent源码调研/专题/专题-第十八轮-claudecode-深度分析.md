@@ -1089,7 +1089,7 @@ const textInputElement = isVimModeEnabled()
 
 | 编号 | gap 描述 | P0/P1/P2 | 推荐 Rust crate |
 |------|---------|----------|----------------|
-| L1448 | **大粘贴截断**(10000 字符阈值 + 首尾预览 + reference block) | P1 | 直接在 `input.rs` 实现 |
+| L1448 | **大粘贴截断**(10000 字符阈值 + 首尾预览 + reference block) ✅ 2026-09-10 第二十二轮已实现 | P1 | `src/tui/input.rs::truncate_for_inject`(10000 阈值 + 首 500+尾 500 + 省略标注) |
 | L1449 | **命令队列**(now/next/later 三优先级 + useSyncExternalStore) | P1 | `tokio::sync::mpsc` + `arc-swap` |
 | L1450 | **! bash 直通模式**(字符触发 + 不入库) | P2 | 直接在 input handler 实现 |
 | L1451 | **图像粘贴(macOS Cmd+V / 拖入 / 单图像)** | P2 | `arboard`(剪贴板) |
@@ -1457,7 +1457,7 @@ export async function executeStatusLineCommand(
 | L1445 | D5 渲染 | Markdown 渲染 (comrak / pulldown-cmark + 自定义扩展) | P2 | `pulldown-cmark` |
 | L1446 | D5 渲染 | 表格自动列宽 + 折叠 | P2 | (与 L1445 一起) |
 | L1447 | D5 渲染 | 大输出折叠提示 ((Ctrl+O to expand)) | P2 | (与 L1445 一起) |
-| L1448 | D6 输入 | 大粘贴截断 (10000 字符阈值 + 首尾预览 + reference block) | P1 | `input.rs` |
+| L1448 | D6 输入 | 大粘贴截断 (10000 字符阈值 + 首尾预览 + reference block) ✅ 2026-09-10 第二十二轮已实现 | P1 | `input.rs` |
 | L1449 | D6 输入 | 命令队列 (now/next/later 三优先级 + useSyncExternalStore) | P1 | `tokio::sync::mpsc` + `arc-swap` |
 | L1450 | D6 输入 | ! bash 直通模式 (字符触发 + 不入库) | P2 | 自实现 |
 | L1451 | D6 输入 | 图像粘贴 (macOS Cmd+V / 拖入 / 单图像) | P2 | `arboard` |

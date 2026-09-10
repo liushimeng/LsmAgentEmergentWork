@@ -1139,6 +1139,21 @@ else
   tkey Escape
   sleep 0.6
 
+  # 14c) D6 大粘贴防护(2026-09-10 第二十二轮,L1573+L1448):
+  #     bracketed paste 序列 \x1b[200~...\x1b[201~ 整体送达 → 大粘贴转 marker。
+  #     纯输入层验证,不依赖 LLM(不提交,Ctrl-U 清空)。
+  # 小粘贴:≤10 行且 ≤1000 字符 → 归一化直插(换行转空格)
+  tsend $'\x1b[200~hello \xe7\xb2\x98\xe8\xb4\xb4\x1b[201~'
+  sleep 0.5
+  texpect "hello 粘贴" "tmux: 小粘贴 bracketed paste 直插(控制字符不残留)"
+  tkey C-u; sleep 0.3
+  # 大粘贴:12 行 > 10 行阈值 → 输入行只显示 [粘贴 #1 +12 行] marker
+  PASTE12=$(printf 'line%02d\n' 1 2 3 4 5 6 7 8 9 10 11 12)
+  tsend "$(printf '\x1b[200~%s\x1b[201~' "$PASTE12")"
+  sleep 0.6
+  texpect "[粘贴 #1 +12 行]" "tmux: 大粘贴转 marker(输入行不被 12 行原文淹没)"
+  tkey C-u; sleep 0.3
+
   # 15) /exit 退出 TUI(tmux 检测到子进程结束自动销毁会话)
   tsubmit "/exit"
   deadline=$((SECONDS + 5))

@@ -149,7 +149,7 @@
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-10 第 17 轮(用户交互体验层 D2+D8:自定义斜杠命令 `.laew/commands` 两级发现 + frontmatter + `$ARGUMENTS`/`$1-$9` 占位符 + 补全集成 + `/commands`;会话导出 `/export` Markdown/JSON + TUI 层 transcript + 用量;模块 `src/tui/{commands,export}.rs` + `completion.rs` 动态注册 + `tui/mod.rs` dispatch_prompt 统一收口,方案 `tmpPlan/2026-09-10_01-自定义斜杠命令与会话导出方案.md`),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8:自定义斜杠命令 `.laew/commands` 两级发现 + frontmatter + `$ARGUMENTS`/`$1-$9` 占位符 + 补全集成 + `/commands`;会话导出 `/export` Markdown/JSON + TUI 层 transcript + 用量;模块 `src/tui/{commands,export}.rs` + `completion.rs` 动态注册 + `tui/mod.rs` dispatch_prompt 统一收口,方案 `tmpPlan/2026-09-10_01-自定义斜杠命令与会话导出方案.md`),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
 
 ---
 
@@ -164,7 +164,7 @@
 | D3 | 对话 Rewind/分支/时间旅行 | ❌ 第 18 轮首次(用户级) | ❌ 0% | L1400 / L1435+ / L1458+ / L1491-L1497 / L1522-L1527 / L1548+ |
 | D4 | 文件监视与工作区感知 | ❌ 第 18 轮首次(运行时) | ❌ 0% | L1415+ (预留) / L1459+ / L1498-L1499 / L1549+ |
 | D5 | 工具输出富文本内容渲染 | ❌ 第 18 轮首次(内容层) | ❌ 5%(cell-based 纯文本) | L1401-L1402 / L1436-L1445 / L1460+ / L1500-L1506 / L1528-L1530 / L1550+ |
-| D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 30% | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
+| D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 55%(✅ 2026-09-10 第二十二轮:bracketed paste + 大粘贴 marker 登记簿 L1573 + 提交展开/10000 字符截断注入 L1448 + 快速输入批量合并;未做多行编辑器/Vim 模式/kill ring) | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
 | D7 | Onboarding/目录信任/主题 | ❌ 第 18 轮首次 | ❌ 10%(1 套 ANSI) | L1406-L1409 / L1451+ / L1462+ / L1507-L1513 / L1540+ / L1552+ |
 | D8 | 会话导出/Statusline/实时成本 | ❌ 第 18 轮首次 | 🟡 25%(✅ 2026-09-10:`/export [path]` Markdown/JSON + TUI 层 transcript + 每轮/累计用量;未做 Statusline/实时成本/脱敏/分享) | L1410-L1414 / L1452-L1455 / L1463+ / L1514-L1515 / L1541-L1545 / **L1564-L1575** |
 | N1-N5 | undici 内容获取底座 | ❌ 第 18 轮首次(WebFetch 底座) | ❌ 0% | **L1576-L1590**(15 个,与 pi D8 冲突后修正) |
@@ -187,8 +187,8 @@
 **优先级分布**:P0=26 / P1=98 / P2=45 / P3=15
 
 **laew P0 路线图**(1-2 周可做):
-1. D6 IME 防护(`tui/input.rs` + `unicode-segmentation`)
-2. D6 大粘贴截断(`tui/input.rs`)
+1. ~~D6 IME 防护(`tui/input.rs` + `unicode-segmentation`)~~ 🟡 2026-09-10 第二十二轮完成终端侧可落地部分(快速连续字符批量合并渲染,`poll(0)` 排空 + pending 事件回存;字符边界 panic 已于第 07 轮修复)
+2. ~~D6 大粘贴截断(`tui/input.rs`)~~ ✅ 2026-09-10 第二十二轮完成(L1573+L1448)
 3. D5 Diff 渲染行级(`tui/render/diff.rs` 新建 + `similar`)
 4. D2 项目级 frontmatter 命令(`tui/completion.rs` + `agent/commands.rs` 新建 + `serde_yaml`)
 5. D7 主题系统 4 主题(`tui/theme.rs` 拆分)
@@ -282,3 +282,30 @@
 - 解密降级实测:id=19 用非常规密钥加密后,list() 输出 WARN + 占位符,其余 14 条正常显示
 
 **累计**:L1-L1930+ 共 1930+ 个 gap,本轮新增 3 个 ✅(L1600/L1608/L1625)。
+
+---
+
+## 八、第二十二轮登记(2026-09-10,D6 输入体验:大粘贴防护 + 快速输入批量合并)
+
+**主题**:第十八轮 D6 输入体验工程 P0 路线图第 1/2 项落地。laew TUI 主屏输入此前无 bracketed paste 支持:粘贴 1000 行 = 数千次逐字重绘 + 粘贴内 `\n` 误触发提交;无大粘贴保护,1MB 粘贴直接进 LLM 上下文。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| L1573 | pi D6:无大粘贴截断(无 `[paste #N]` marker 机制) | P1 | ✅ | `src/tui/input.rs`(bracketed paste `EnableBracketedPaste` + `Event::Paste` 整体接收 + `PasteRegistry` 登记簿:>10 行或 >1000 字符 → `[粘贴 #N +M 行]`/`[粘贴 #N M 字符]` marker,提交时精确匹配展开还原,损坏/未知 marker 原样保留;回显 marker 版、Submitted 展开版) | 2026-09-10 第二十二轮 |
+| L1448 | claudecode D6:大粘贴截断(10000 阈值 + 首尾预览) | P1 | ✅ | `src/tui/input.rs::truncate_for_inject`(单份 >10000 字符提交注入时截断为首 500 + `[...中间省略 N 字符...]` + 尾 500,char 边界安全) | 2026-09-10 第二十二轮 |
+| D6-IME | IME 快速上屏逐字重绘卡顿(终端侧可落地部分) | P1 | ✅ | `src/tui/input.rs` Char 分支批量合并(`event::poll(0)` 排空同类 Char 一次性插入 + 单次重绘 + 非字符事件 pending 回存不丢事件;无 bracketed paste 旧终端的粘贴同时受益) | 2026-09-10 第二十二轮 |
+
+**设计要点**:
+- 登记簿生命周期 = 单次 read_line 调用(局部变量),提交/退出即弃,无跨行一致性负担。
+- 小粘贴(≤10 行且 ≤1000 字符)过滤控制字符后 `\n`/`\t` 归一为空格直插(单行输入语义)。
+- 回显用 marker 版 buffer(`>> 帮我分析 [粘贴 #1 +123 行]`),`Submitted` 返回展开版 —— 1000 行原文不回显刷屏。
+- 不引入新 crate(crossterm 0.27 原生 `Event::Paste`),遵守 TUI 约定;`InputHandler::read_line` 对外签名不变,`tui/mod.rs` 零改动。
+
+**验证**:
+- 单元测试 592 全过(基线 581 + 新增 11 项 paste 测试:过滤/大小判定/marker 格式/计数递增/展开还原/截断注入/损坏 marker/未知编号/char 边界安全)
+- e2e `run_e2e.sh` §8 新增 14c(2 个 tmux 用例:小粘贴直插 / 大粘贴 marker);本轮因并行会话占用 mock 未跑全量,已独立 tmux 手动验证通过
+- 方案:`tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`
+
+**未做(后续轮次候选)**:多行编辑器 / Vim 模式 / kill ring / Ctrl+G 外部编辑器 / 命令队列(L1449) / `!` bash 直通(L1450)。
+
+**累计**:L1-L1930+ 共 1930+ 个 gap,本轮新增 2 个 ✅(L1573/L1448)+ D6-IME 终端侧落地。

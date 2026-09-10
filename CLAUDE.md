@@ -102,7 +102,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 
 ### 屏幕拓扑
 
-- **REPL 主屏**：保留 0.1.2 的 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。
+- **REPL 主屏**：保留 0.1.2 的 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。**D6 大粘贴防护**（2026-09-10）：bracketed paste 整体接收 + 大粘贴（>10 行或 >1000 字符）转 `[粘贴 #N]` marker、提交时展开还原（单份 >10000 字符截断为首尾各 500 + 省略标注）+ 快速输入批量合并（IME/旧终端粘贴逐字重绘优化）。
 - **子屏（Modal）**：`engine.rs` 的 Screen 栈接管 `/provider *` 系列，进入 alternate screen + 原始模式，Esc 退回主屏。
 - **非 TTY 回退**：stdin 不是终端时（管道 / e2e），子屏与主屏都回退到 print 输出，保证 `run_e2e.sh` 兼容。
 

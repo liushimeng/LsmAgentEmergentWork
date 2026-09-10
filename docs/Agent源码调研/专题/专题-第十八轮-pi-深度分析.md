@@ -836,7 +836,7 @@ export const TUI_KEYBINDINGS = {
 | **L1570** | 无 kill ring（删除文本后无法 `Ctrl+Y` 恢复，多次删除无累积） | P2 | 自实现 `KillRing` + emacs 风格 `Ctrl+U/W/A/K` 钩到 `crossterm` |
 | **L1571** | 无 undo stack（编辑器操作不可撤销） | P2 | 自实现 `UndoStack<T>` + `Command` 模式 |
 | **L1572** | 无 prompt history 持久化（进程重启后历史消失） | P2 | `~/.config/laew/history.txt` + 上限 1000 + 去重 |
-| **L1573** | 无大粘贴截断（laew `input.rs` 无 `[paste #N]` marker 机制） | P1 | 自实现 `paste_marker.rs`：>10 行/1000 字符 → marker + paste registry |
+| **L1573** | 无大粘贴截断（laew `input.rs` 无 `[paste #N]` marker 机制）✅ 2026-09-10 第二十二轮已实现 | P1 | ~~自实现 `paste_marker.rs`~~ 实际落地 `src/tui/input.rs` PasteRegistry：bracketed paste + >10 行/1000 字符 → `[粘贴 #N]` marker + 提交展开 |
 | **L1574** | 无外部编辑器钩子（无 `Ctrl+G` → `$VISUAL`） | P2 | `std::process::Command::new($VISUAL)` + `tempfile::NamedTempFile` + 阻塞读回 |
 
 ---
@@ -1308,7 +1308,7 @@ D8 维度（statusline + 实时成本 + cache 命中 + 会话导出 + share）la
 | **L1570** | D6 输入 | 无 kill ring（删除文本后无法 `Ctrl+Y` 恢复，多次删除无累积） | P2 | 自实现 `KillRing` + emacs 风格 `Ctrl+U/W/A/K` 钩到 `crossterm` |
 | **L1571** | D6 输入 | 无 undo stack（编辑器操作不可撤销） | P2 | 自实现 `UndoStack<T>` + `Command` 模式 |
 | **L1572** | D6 输入 | 无 prompt history 持久化（进程重启后历史消失） | P2 | `~/.config/laew/history.txt` + 上限 1000 + 去重 |
-| **L1573** | D6 输入 | 无大粘贴截断（laew `input.rs` 无 `[paste #N]` marker 机制） | P1 | 自实现 `paste_marker.rs`：>10 行/1000 字符 → marker + paste registry |
+| **L1573** | D6 输入 | 无大粘贴截断 ✅ 2026-09-10 第二十二轮已实现(`src/tui/input.rs` PasteRegistry) | P1 | — |
 | **L1574** | D6 输入 | 无外部编辑器钩子（无 `Ctrl+G` → `$VISUAL`） | P2 | `std::process::Command::new($VISUAL)` + `tempfile::NamedTempFile` + 阻塞读回 |
 | **L1575** | D7 信任 | 无 project trust 5 档 UI + cwd 冒泡查询 | P1 | 自实现 `TrustSelectorComponent` + `find_nearest_trust_entry()` + 持久化到 SQLite `trust` 表（schema: `path TEXT PRIMARY KEY, decision INTEGER`） |
 
