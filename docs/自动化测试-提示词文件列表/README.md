@@ -2,11 +2,13 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **67 维度 × 10 个 = 670 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **77 维度 × 10 个 = 770 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
-疑难 Bug 攻坚、文件格式解析、编程冷知识、跨平台电脑使用、设计系统
+疑难 Bug 攻坚、文件格式解析、编程冷知识、跨平台电脑使用、设计系统、量子计算、机器人 ROS2、
+3D 建模与几何、WebAssembly 边缘、密码学与隐私计算、并行 GPU、函数式编程、编译器后端 LLVM、
+AR/VR 空间计算、语音交互与对话式 UI、基础设施可观测性与 SRE
 等多个角度，**无重复主题**。
 
 ## 用途
@@ -90,6 +92,17 @@ docs/自动化测试-提示词文件列表/
   65-编程冷知识与为什么十问.md               ← 浮点/UTF-8/时间/大小端/随机数与UUID/排序稳定性/下标从0/null/删文件/"我机器上能跑"
   66-跨平台电脑使用与虚拟化实战.md           ← PowerShell/WSL2/macOS/虚拟机/远程桌面/NAS共享/外设排障/分区与数据恢复/系统迁移/双系统引导
   67-设计系统与组件库工程实战.md             ← Design Token/组件API/暗色主题/图标系统/栅格响应式/排版系统/动效规范/表单规范/图表规范/组件库治理
+  68-量子计算编程与量子算法.md               ← 量子比特与布洛赫球/量子门与电路/量子纠缠/Shor算法/Grover搜索/Qiskit/变分算法VQE-QAOA/量子纠错表面码/NISQ/量子-经典混合
+  69-机器人与ROS2工程.md                     ← ROS2节点话题服务动作/URDF与tf2/Navigation2/MoveIt2/Gazebo仿真/BT.CPP行为树/Lifecycle多机/ros2_control/Micro-ROS/排障实战
+  70-3D建模与几何处理实战.md                 ← 半边网格/曲面细分/CSG布尔与OpenCASCADE/OpenGL-Vulkan管线/PBR glTF2.0/几何深度学习/参数化生成/多视图几何/3D打印修复/刚体碰撞
+  71-WebAssembly深度与边缘计算.md            ← Wasm字节码与S-表达式/wasmtime JIT-AOT/WASI/Component Model与WIT/Edge Runtime-Workers/Capability安全/性能SIMD多线程/Rust工具链/Wasm vs容器/WASI Preview2
+  72-密码学与隐私计算.md                     ← AES-GCM-ChaCha20/RSA-ECC-Ed25519/哈希与Argon2/TLS1.3/零知识证明zk-SNARK-STARK/同态加密BFV-CKKS/安全多方计算/PKI证书/后量子密码Kyber-Dilithium/Rust crypto生态
+  73-并行与GPU计算.md                        ← GPU SM-Warp架构/CUDA编程模型/内存层次与合并访问/SIMD-AVX512/rayon-crossbeam/wgpu原生GPU/NCCL多卡通信/Roofline模型/并行算法/CUDA profiling
+  74-函数式编程进阶.md                       ← λ演算与Curry-Howard/Haskell类型类-Functor-Applicative-Monad/Monad Transformer/解析器组合子-nom/依赖类型Idris-Agda/线性类型与Rust ownership/GADT/惰性求值/代数效应/FP在Rust实战
+  75-编译器后端与LLVM优化.md                 ← SSA与φ函数/LLVM IR结构/Pass Manager/内联成本模型/循环优化LICM向量化/寄存器分配/指令选择GlobalISel/Target描述/LTO-ThinLTO/MLIR Dialect/JIT-LLJIT
+  76-ARVR与空间计算.md                       ← OpenXR生态/SLAM空间定位/渲染ATW-ASW-SSW/多维交互-手柄手势眼动语音/空间锚点持久化/空间音频HRTF/三维UI舒适UX/MR场景理解遮挡/注视点渲染与热节流/WebXR与three.js
+  77-语音交互与对话式UI.md                   ← 语音全链路ASR-对话管理-TTS/Whisper-Paraformer流式ASR/VITS-Bert-VITS流式TTS/VAD端点检测/唤醒词Porcupine/对话管理FSM-LLM/语音UX打断修复/SSML情感语音/Voice Agent全双工AEC/多模态Copilot Voice
+  78-基础设施可观测性与SRE.md                ← 三大支柱Logs-Metrics-Traces/OpenTelemetry工程化/SLO-SLI错误预算Burn Rate/Incident Management无责复盘/告警疲劳治理/容量规划Little's Law/混沌工程ChaosMesh/Continuous Profiling eBPF/SRE平台工程/Grafana技术栈一站式
 ```
 
 ## 编号规则
@@ -163,6 +176,17 @@ docs/自动化测试-提示词文件列表/
 | BN01–BN10 | 编程冷知识与「为什么」十问 | 浮点/UTF-8/时间/大小端/随机数与UUID/排序稳定性/下标从0/null/删文件/环境差异 | simple~medium |
 | BO01–BO10 | 跨平台电脑使用与虚拟化实战 | PowerShell/WSL2/macOS/虚拟机/远程桌面/NAS/外设排障/分区与数据恢复/系统迁移/双系统 | simple~medium |
 | BP01–BP10 | 设计系统与组件库工程实战 | Design Token/组件API/暗色主题/图标系统/栅格/排版/动效/表单规范/图表规范/组件库治理 | medium 为主 |
+| BQ01–BQ10 | 量子计算编程与量子算法 | 量子比特与布洛赫球/量子门与电路/量子纠缠/Shor算法/Grover搜索/Qiskit/变分算法VQE-QAOA/量子纠错表面码/NISQ/量子-经典混合 | medium~hard |
+| BR01–BR10 | 机器人与 ROS2 工程 | ROS2节点话题服务动作/URDF与tf2/Navigation2/MoveIt2/Gazebo仿真/BT.CPP行为树/Lifecycle多机/ros2_control/Micro-ROS/排障实战 | medium~hard |
+| BS01–BS10 | 3D 建模、CAD 与几何处理实战 | 半边网格/曲面细分/CSG布尔与OpenCASCADE/OpenGL-Vulkan管线/PBR glTF2.0/几何深度学习/参数化生成/多视图几何/3D打印修复/刚体碰撞 | medium~hard |
+| BT01–BT10 | WebAssembly 深度与边缘计算 | Wasm字节码与S-表达式/wasmtime JIT-AOT/WASI/Component Model与WIT/Edge Runtime/Capability安全/性能SIMD多线程/Rust工具链/Wasm vs容器/WASI Preview2 | medium~hard |
+| BU01–BU10 | 密码学与隐私计算 | AES-GCM-ChaCha20/RSA-ECC-Ed25519/哈希与Argon2/TLS1.3/零知识证明/同态加密/安全多方计算/PKI证书/后量子密码Kyber-Dilithium/Rust crypto生态 | medium~hard |
+| BV01–BV10 | 并行与 GPU 计算 | GPU SM-Warp架构/CUDA编程模型/内存层次与合并访问/SIMD-AVX512/rayon-crossbeam/wgpu原生GPU/NCCL多卡通信/Roofline模型/并行算法/CUDA profiling | medium~hard |
+| BW01–BW10 | 函数式编程进阶 | λ演算与Curry-Howard/Haskell类型类-Functor-Applicative-Monad/Monad Transformer/解析器组合子-nom/依赖类型Idris-Agda/线性类型与Rust ownership/GADT/惰性求值/代数效应/FP在Rust实战 | medium~hard |
+| BX01–BX10 | 编译器后端与 LLVM 优化 | SSA与φ函数/LLVM IR结构/Pass Manager/内联成本模型/循环优化LICM向量化/寄存器分配/指令选择GlobalISel/Target描述/LTO-ThinLTO/MLIR Dialect/JIT-LLJIT | medium~hard |
+| BY01–BY10 | AR/VR 与空间计算 | OpenXR生态/SLAM空间定位/渲染ATW-ASW-SSW/多维交互-手柄手势眼动语音/空间锚点持久化/空间音频HRTF/三维UI舒适UX/MR场景理解遮挡/注视点渲染与热节流/WebXR与three.js | medium~hard |
+| BZ01–BZ10 | 语音交互与对话式 UI | 语音全链路ASR-对话管理-TTS/Whisper-Paraformer流式ASR/VITS-Bert-VITS流式TTS/VAD端点检测/唤醒词Porcupine/对话管理FSM-LLM/语音UX打断修复/SSML情感语音/Voice Agent全双工AEC/多模态Copilot Voice | medium~hard |
+| CA01–CA10 | 基础设施可观测性与 SRE | 三大支柱Logs-Metrics-Traces/OpenTelemetry工程化/SLO-SLI错误预算Burn Rate/Incident Management无责复盘/告警疲劳治理/容量规划Little's Law/混沌工程ChaosMesh/Continuous Profiling eBPF/SRE平台工程/Grafana技术栈一站式 | medium~hard |
 
 ## 每条提示词的字段
 
@@ -203,7 +227,7 @@ docs/自动化测试-提示词文件列表/
 
 ## 维护约定
 
-- 新增主题时**先检索本库 670 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…）。
+- 新增主题时**先检索本库 770 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…）。
 - 修改 laew 功能后（如新增工具、改档位策略），同步修订受影响条目的「预期档位」。
 - 每组提示词控制在 3~5 轮；后轮必须与前轮有显式承接关系，保证"多轮"语义成立。
 - 实测发现某条实际档位与预期不符时，先记录现象（写入 testReport/ 验证报告），
