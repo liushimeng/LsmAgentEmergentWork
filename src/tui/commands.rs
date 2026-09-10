@@ -57,6 +57,38 @@ pub fn discover(work_dir: &Path) -> Vec<CustomCommand> {
     discover_with_home(work_dir, &home_commands_dir())
 }
 
+/// 扫描两级命令目录中「存在 .md 文件但文件名非法被跳过」的项(诊断用)。
+/// 2026-09-10 第 23 轮:`/commands` 空列表时列出被跳过文件与原因,
+/// 把静默失败变成可诊断(此前中文命令名被过滤后零线索)。
+pub fn scan_invalid_names(work_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in [work_dir.join(".laew").join("commands"), home_commands_dir()] {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !valid_command_name(stem) {
+                out.push(format!(
+                    "{} — 命令名含非法字符(仅允许字母/数字/中文/下划线/连字符)",
+                    path.display()
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// [`discover`] 的可测核心:显式传入用户级目录(测试不污染进程级 HOME 环境变量)。
 pub fn discover_with_home(work_dir: &Path, user_dir: &Path) -> Vec<CustomCommand> {
     let mut out: Vec<CustomCommand> = Vec::new();
@@ -123,7 +155,10 @@ fn valid_command_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            // Unicode 字母数字(含中日韩)允许 —— 2026-09-10 第 23 轮:此前仅 ASCII,
+            // 中文命令名(如 tmux速查.md)被静默过滤,/commands 与补全均不可见,零线索。
+            // `is_alphanumeric` 天然排除空格/路径分隔符/控制字符,安全性不变。
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
 /// 解析 frontmatter(手写 YAML 子集):首行 `---` 起,到下一个 `---` 止。
@@ -360,8 +395,11 @@ mod tests {
         assert!(valid_command_name("review"));
         assert!(valid_command_name("git-commit"));
         assert!(valid_command_name("cmd_2"));
+        // Unicode(中日韩)命令名合法(第 23 轮放宽,原 ASCII-only 静默过滤中文)
+        assert!(valid_command_name("tmux速查"));
+        assert!(valid_command_name("代码审查"));
         assert!(!valid_command_name(""));
-        assert!(!valid_command_name("带空格"));
+        assert!(!valid_command_name("a b"));
         assert!(!valid_command_name("a/b"));
         assert!(!valid_command_name("a.b"));
     }
@@ -387,6 +425,30 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn scan_invalid_names_reports_only_illegal_md() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let dir = tmp.path().join(".laew").join("commands");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("正常命令.md"), "ok").unwrap();
+        std::fs::write(dir.join("tmux速查.md"), "ok").unwrap(); // 中文合法,不报
+        std::fs::write(dir.join("bad.name.md"), "非法").unwrap(); // 点号非法,报
+        std::fs::write(dir.join("ignored.txt"), "非 md 不报").unwrap();
+        let out = scan_invalid_names(tmp.path());
+        assert_eq!(out.len(), 1, "仅 bad.name.md 被报告: {out:?}");
+        assert!(out[0].contains("bad.name.md"));
+    }
+
+    #[test]
+    fn discover_loads_cjk_command_name() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let dir = tmp.path().join(".laew").join("commands");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("tmux速查.md"), "---\ndescription: 速查\n---\n正文").unwrap();
+        let cmds = discover_with_home(tmp.path(), &tmp.path().join("nonexistent"));
+        assert!(cmds.iter().any(|c| c.name == "tmux速查"), "中文名应被加载: {cmds:?}");
+    }
+
     fn discover_two_level_priority_and_dedup() {
         // 临时目录:项目级 + 用户级同名,用户级应胜出
         let tmp = tempfile::tempdir().expect("tmpdir");

@@ -153,9 +153,17 @@ impl PasteRegistry {
         }
     }
 
-    /// 过滤粘贴文本:剔除控制字符(保留 \n 与 \t,小粘贴归一阶段再处理)。
+    /// 过滤粘贴文本:先做换行归一化(CRLF/CR → LF),再剔除其余控制字符(保留 \n 与 \t)。
+    ///
+    /// 换行归一化的必要性(2026-09-10 第 23 轮实测):tmux 的 bracketed paste 把
+    /// 粘贴内容按按键语义回放,LF 全部转为 CR(LF=0/CR=N,探针 hex 取证);桌面终端
+    /// 则保留 LF/CRLF。若不归一化,CR 会在下方控制字符过滤中被剔除,换行信息全丢 →
+    /// 大粘贴行数判定恒为 1 行、marker 永不触发,小粘贴「换行转空格」归一也失效,
+    /// 内容被拼成一行(D6 防护在 tmux 下完全失效)。
     fn filter(text: &str) -> String {
-        text.chars()
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        normalized
+            .chars()
             .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
             .collect()
     }
@@ -1125,6 +1133,33 @@ mod tests {
         assert_eq!(PasteRegistry::filter("a\x07b\x01c\nd"), "abc\nd");
         assert_eq!(PasteRegistry::filter("\x1b[31m红\x1b[0m"), "[31m红[0m");
         assert_eq!(PasteRegistry::filter("正常文本"), "正常文本");
+    }
+
+    #[test]
+    fn paste_filter_normalizes_cr_and_crlf_to_lf() {
+        // tmux bracketed paste 把 LF 转为 CR 按键语义回放(第 23 轮探针取证 LF=0/CR=N):
+        // CR 必须归一为 LF,否则行数判定恒 1、marker 永不触发,内容拼成一行。
+        assert_eq!(PasteRegistry::filter("a\r\nb\rc"), "a\nb\nc");
+        // 纯 CR 多行 → 大粘贴行数判定依据
+        let tmux_paste: String = (1..=15).map(|i| format!("第{i}行\r")).collect();
+        assert_eq!(PasteRegistry::filter(&tmux_paste).matches('\n').count(), 15);
+    }
+
+    #[test]
+    fn large_paste_with_tmux_cr_newlines_gets_marker() {
+        // 复现本轮 Bug:15 行粘贴以 CR 分隔(tmux 实际形态)必须触发 marker
+        let mut reg = PasteRegistry::new();
+        let tmux_text: String = (1..=15)
+            .map(|i| format!("第{i}行:大粘贴防护测试内容-{i}"))
+            .collect::<Vec<_>>()
+            .join("\r");
+        match handle_paste_text(&tmux_text, &mut reg) {
+            PasteInsert::Marker(m) => assert_eq!(m, "[粘贴 #1 +15 行]"),
+            PasteInsert::Inline(_) => panic!("tmux CR 形态 15 行粘贴应转 marker"),
+        }
+        // 展开注入的原文应含 LF 归一化后的完整行
+        let expanded = reg.expand("[粘贴 #1 +15 行]");
+        assert_eq!(expanded.matches('\n').count(), 14);
     }
 
     #[test]

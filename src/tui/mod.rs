@@ -311,6 +311,15 @@ impl TuiSession {
         };
         if let Some((outcome, response, usage)) = entry {
             self.session_usage = merge_usage(self.session_usage, usage);
+            // 多轮对话记忆(2026-09-10 第 23 轮):最终回答回填主上下文。
+            // 此前只有 user 提示词进 session.context(),assistant 回复从不回填,
+            // 下轮 Yolo 看不到模型自己上轮的回答,「你上面的比方里…」类指代追问
+            // 必然失忆(实测 mock 日志第 2 轮请求全是 user 角色)。回填文本与
+            // transcript/导出同源(含 WorkFlow/QC/trace 渲染),增长由 Compact 压缩兜底。
+            let blocks = vec![crate::llm::ContentBlock::text(response.clone())];
+            self.session
+                .context_mut()
+                .push(crate::llm::ChatMessage::assistant(blocks));
             self.transcript.push(TranscriptEntry {
                 ts: turn_ts,
                 raw_input: raw.to_string(),
@@ -691,6 +700,14 @@ impl TuiSession {
             );
             println!("    用户级: ~/.laew/commands/<命令名>.md");
             println!("    模板内可用 $ARGUMENTS(全量参数)与 $1-$9(位置参数)");
+            // 静默失败可诊断化(第 23 轮):列出「存在 .md 但文件名非法被跳过」的项
+            let ignored = commands::scan_invalid_names(&self.paths.work_dir);
+            if !ignored.is_empty() {
+                println!("  ⚠ 发现未加载的命令文件(文件名不合法):");
+                for line in ignored {
+                    println!("    {line}");
+                }
+            }
             return;
         }
         println!("  自定义命令({} 个,用户级优先于项目级):", customs.len());
