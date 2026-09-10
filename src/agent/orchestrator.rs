@@ -469,13 +469,19 @@ impl MultiAgentOrchestrator {
         let total_usage = add_usage(outcome.usage, qc_usage);
 
         if qc.verdict == Verdict::Pass {
+            // WorkFlow 名称使用 goal_summary 截断(最多 20 字符),便于在 TUI 区分不同任务
+            let wf_name = if c.goal_summary.chars().count() > 20 {
+                format!("{}…", c.goal_summary.chars().take(19).collect::<String>())
+            } else {
+                c.goal_summary.clone()
+            };
             Ok(TaskResult {
                 goal: c.goal_summary.clone(),
                 classification: c.clone(),
                 plan_doc: None,
                 workflows: vec![WorkflowResult {
                     id: "wf-1".into(),
-                    name: "单步执行".into(),
+                    name: wf_name,
                     subflow_outcome: outcome.text,
                     quality_report: qc,
                     usage: outcome.usage,

@@ -304,10 +304,15 @@ impl TuiSession {
 
     fn print_task_result(&self, result: &crate::agent::orchestrator::TaskResult) {
         println!();
+        let plan_doc_display = result
+            .plan_doc
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "无".into());
         println!(
-            "  [task executed: difficulty={}, plan_doc={:?}, workflows={}]",
+            "  [task executed: difficulty={}, plan_doc={}, workflows={}]",
             result.classification.task_level.display_name(),
-            result.plan_doc,
+            plan_doc_display,
             result.workflows.len()
         );
         // 打印每个 WorkFlow 的 subflow 输出
@@ -327,7 +332,7 @@ impl TuiSession {
             });
             if !wf.quality_report.issues.is_empty() {
                 for issue in &wf.quality_report.issues {
-                    println!("      问题: {issue}");
+                    println!("    问题: {issue}");
                 }
             }
             // 显示 SubAgent 执行轨迹摘要
