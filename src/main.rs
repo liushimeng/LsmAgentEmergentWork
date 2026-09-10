@@ -379,10 +379,37 @@ async fn run_one_shot(
             print_usage(&usage);
         }
         OrchestrationOutcome::Executed { result } => {
+            // 2026-09-10 第二十九轮 P06/M05 自动化测试发现:
+            // -p 单轮模式此前只打印 WorkFlow 文本,没有 [trace] 工具调用统计。
+            // 与 TUI 模式 (src/tui/mod.rs:1229) 对齐,把每个 workflow 的 trace 行也补上,
+            // 便于 -p 用户 / 脚本解析时区分 "LLM 直接 end_turn" vs "工具被调用"
+            // vs "工具失败" 三种语义,改善可观测性。
             for wf in &result.workflows {
                 println!("--- WorkFlow {} ({}) ---", wf.id, wf.name);
                 println!("{}", wf.subflow_outcome);
+                if let Some(trace) = &wf.subflow_trace {
+                    println!(
+                        "[trace] iter={} tools={}(ok={},err={}) early_term={}",
+                        trace.iterations,
+                        trace.tool_calls,
+                        trace.tool_calls_ok,
+                        trace.tool_calls_err,
+                        trace.early_terminated
+                    );
+                }
             }
+            // 暴露 Yolo 三步分析(2026-09-10 第二十九轮 P06/M05):
+            // 让用户在 -p 输出里能看到 Yolo 怎么理解任务,
+            // 避免 mock Yolo 返回固定 JSON 时只看 mock 行为看不到 Yolo 决策。
+            let c = &result.classification;
+            let purpose = truncate_for_display(&c.purpose, 60);
+            let goal = truncate_for_display(&c.goal_summary, 60);
+            let intent = &c.intent;
+            let plan_count = c.decomposition_plan.len();
+            println!(
+                "[yolo] purpose={} goal={} intent={} plan_steps={}",
+                purpose, goal, intent, plan_count
+            );
             if !result.summary.is_empty() {
                 println!();
                 println!("[session_context 摘要]");
@@ -426,6 +453,18 @@ fn print_usage(usage: &lsm_agent::llm::Usage) {
                 String::new()
             }
         );
+    }
+}
+
+/// Yolo 三步分析等文本字段在 stdout 里截断显示,防止脚本解析时一行过长。
+/// CJK 字符按 1 个 char 计算(对应 1 列显示宽度);超过 limit 时末尾加 `…`。
+fn truncate_for_display(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(limit.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
 

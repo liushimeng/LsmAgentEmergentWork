@@ -1206,6 +1206,19 @@ fn format_task_result(
         plan_doc_display,
         result.workflows.len()
     ));
+    // 2026-09-10 第二十九轮 P06/M05 自动化测试:
+    // TUI 也补一行 Yolo 三步分析摘要,让用户看到 Yolo 怎么理解任务
+    // (与 main.rs OrchestrationOutcome::Executed 分支对齐)
+    let c = &result.classification;
+    let purpose_short = truncate_chars(&c.purpose, 40);
+    let goal_short = truncate_chars(&c.goal_summary, 40);
+    out.push_str(&format!(
+        "  [yolo] purpose={} goal={} intent={} plan_steps={}\n",
+        purpose_short,
+        goal_short,
+        c.intent,
+        c.decomposition_plan.len()
+    ));
     // 每个 WorkFlow 的 subflow 输出
     for wf in &result.workflows {
         out.push_str(&format!("  --- WorkFlow {} ({}) ---\n", wf.id, wf.name));
@@ -1277,6 +1290,18 @@ fn merge_usage(a: crate::llm::Usage, b: crate::llm::Usage) -> crate::llm::Usage 
 /// 当前本地时间 HH:MM:SS(transcript 轮次时间戳;实现在 export.rs)。
 fn now_clock() -> String {
     export::now_clock()
+}
+
+/// 把字符串按 char 截断(避免 split_at 在 CJK 多字节上切断),
+/// 超长末尾加 `…`。TUI 渲染宽度计算依赖完整 char 边界。
+fn truncate_chars(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(limit.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// 建议相似命令（简单的编辑距离近似）。
