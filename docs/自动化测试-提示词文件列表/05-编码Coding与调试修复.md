@@ -10,6 +10,7 @@
 ---
 
 ### E01 实现一个 CLI 工具
+- **测试状态**: ✅ 已测试 (E01_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通,详见 `tmpPlan/2026-09-10_02-D01-E01-测试与TUI显示验证方案.md`)
 - **预期档位**: medium
 - **考察维度**: 完整工程实现能力
 - **对话脚本**:
