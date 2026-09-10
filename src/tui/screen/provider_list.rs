@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{Db, Paths, ProviderRecord};
 use crate::tui::engine::{Frame, Outcome, Rect, Screen};
+use crate::tui::input::display_width;
 use crate::tui::screen::provider_del::ProviderDelPicker;
 use crate::tui::theme::{self, attr};
 
@@ -165,9 +166,13 @@ impl Screen for ProviderList {
                 } else {
                     (theme::FG, attr::NONE, format!("  {}  ", l))
                 };
-                let area = Rect::new(x, action_y, text.chars().count() as u16 + 1, 1);
+                let w = display_width(&text);
+                // 注意:必须用 display_width() 而非 chars().count() —— CJK 字符占 2 列,
+                // 用 chars().count() 会低估宽度,导致末尾的 `]` / `◀` 被 put_str 的边界检查截断
+                // (provider_del.rs 同源 bug 已修,此处同步修复)。
+                let area = Rect::new(x, action_y, w + 1, 1);
                 frame.put_str(area, &text, fg, attrs);
-                x += text.chars().count() as u16 + 3;
+                x += w + 3;
             }
         }
 

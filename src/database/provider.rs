@@ -36,6 +36,8 @@ impl Db {
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM providers", [], |r| r.get::<_, i64>(0))?;
         let activate = count == 0;
+        // D9-4 凭证加密(L1600):API Key 落 SQLite 前 AES-256-GCM 加密。
+        let encrypted_key = crate::agent::safety::Vault::global()?.encrypt(api_key)?;
         conn.execute(
             "INSERT INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active, context_max_size)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -44,7 +46,7 @@ impl Db {
                 provider_name,
                 model_name,
                 end_point,
-                api_key,
+                encrypted_key,
                 if activate { 1 } else { 0 },
                 context_max_size.unwrap_or(crate::database::models::DEFAULT_CONTEXT_MAX_SIZE) as i64
             ],
@@ -64,6 +66,8 @@ impl Db {
         context_max_size: Option<u64>,
     ) -> Result<i64> {
         let conn = self.conn.lock().expect("db mutex poisoned");
+        // D9-4 凭证加密(L1600):API Key 落 SQLite 前 AES-256-GCM 加密。
+        let encrypted_key = crate::agent::safety::Vault::global()?.encrypt(api_key)?;
         conn.execute(
             "INSERT OR IGNORE INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active, context_max_size)
              VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
@@ -72,7 +76,7 @@ impl Db {
                 provider_name,
                 model_name,
                 end_point,
-                api_key,
+                encrypted_key,
                 context_max_size.unwrap_or(crate::database::models::DEFAULT_CONTEXT_MAX_SIZE) as i64
             ],
         )?;
@@ -176,6 +180,35 @@ impl Db {
             )
             .optional()?;
         Ok(id)
+    }
+
+    /// D9-4 凭证加密(L1600):存量明文 API Key 一次性迁移。
+    ///
+    /// 启动时由 `Db::open` 调用,扫描所有 `api_key` 字段,非 `enc:v1:` 前缀的
+    /// 记录加密后 `UPDATE` 回写。整批事务,任一条失败则回滚并保留原明文(下次启动重试)。
+    ///
+    /// 幂等:已加密记录跳过,可安全重复调用。
+    pub fn migrate_credentials(&self) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare("SELECT id, api_key FROM providers")?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, key)| !crate::agent::safety::Vault::is_encrypted(key))
+            .collect();
+        drop(stmt);
+        let mut migrated = 0usize;
+        for (id, plaintext) in &rows {
+            let encrypted = crate::agent::safety::Vault::global()?.encrypt(plaintext)?;
+            tx.execute("UPDATE providers SET api_key = ?1 WHERE id = ?2", params![encrypted, id])?;
+            migrated += 1;
+        }
+        tx.commit()?;
+        if migrated > 0 {
+            tracing::info!(migrated, "D9-4 凭证加密迁移完成: {} 条明文 API Key 已加密", migrated);
+        }
+        Ok(())
     }
 
     // ===== 导入/导出功能 =====
@@ -296,12 +329,34 @@ impl Db {
         Ok(result)
     }
 
-    /// 导出所有 Provider 为 JSON 字符串
+    /// 导出所有 Provider 为 JSON 字符串。
+    ///
+    /// **安全提示**:默认输出**明文** API Key(用户备份/迁移场景需要)。
+    /// 环境变量 `LAEW_EXPORT_REDACT=1` 开启脱敏(对齐 `mask_key`,输出 `****末4位`)。
+    /// 无论是否脱敏,导出时均打印一次性告警到 stderr,提醒用户妥善保管备份文件。
     pub fn export_to_json(&self) -> Result<String> {
         let records = self.list()?;
-        let export_data = ExportData::from_records(records);
+        let redact = std::env::var("LAEW_EXPORT_REDACT").ok().as_deref() == Some("1");
+        let export_data = if redact {
+            ExportData::from_records(records.into_iter().map(|mut r| {
+                // 对齐 tui::theme::mask_key 脱敏(避免 database→tui 反向依赖):保留末 4 位。
+                r.api_key = if r.api_key.len() > 4 {
+                    format!("****{}", &r.api_key[r.api_key.len()-4..])
+                } else {
+                    "****".to_string()
+                };
+                r
+            }).collect())
+        } else {
+            ExportData::from_records(records)
+        };
         let json = serde_json::to_string_pretty(&export_data)
             .map_err(|e| ConfigError::Export(format!("JSON 序列化失败: {e}")))?;
+        if redact {
+            eprintln!("⚠️  导出已脱敏(api_key 显示为 ****末4位);如需明文备份请去掉 LAEW_EXPORT_REDACT=1 重跑。");
+        } else {
+            eprintln!("⚠️  导出文件包含明文 API Key,请妥善保管备份文件(建议加密存储 + 勿入库)。");
+        }
         Ok(json)
     }
 }
@@ -316,13 +371,23 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
     };
     let is_active_int: i64 = row.get(6)?;
     let ctx: i64 = row.get(8)?;
+    // D9-4 凭证加密(L1600):读出时透明解密;未加密(旧明文)直接透传。
+    let raw_key: String = row.get(5)?;
+    let api_key = if crate::agent::safety::Vault::is_encrypted(&raw_key) {
+        crate::agent::safety::Vault::global()
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?
+            .decrypt(&raw_key)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?
+    } else {
+        raw_key
+    };
     Ok(ProviderRecord {
         id: row.get(0)?,
         protocol,
         provider_name: row.get(2)?,
         model_name: row.get(3)?,
         end_point: row.get(4)?,
-        api_key: row.get(5)?,
+        api_key,
         is_active: is_active_int != 0,
         created_at: row.get(7)?,
         context_max_size: ctx.max(0) as u64,

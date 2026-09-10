@@ -206,6 +206,11 @@ impl TuiSession {
         if line.is_empty() {
             return Ok(false);
         }
+        // 单字符 `?` 等价 `/help`(文档/补全都列出此别名,但因无 `/` 前缀原本走不到 handle_slash,
+        // 导致输入 `?` 被当作普通 prompt 处理,本轮修复接通)。
+        if line == "?" {
+            return self.handle_slash("?", line).await;
+        }
         if let Some(rest) = line.strip_prefix('/') {
             // 斜杠命令(line 原文传给 handle_slash,自定义命令 dispatch 时记录原始输入)
             return self.handle_slash(rest, line).await;
