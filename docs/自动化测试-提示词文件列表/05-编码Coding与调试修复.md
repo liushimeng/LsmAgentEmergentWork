@@ -69,6 +69,7 @@
   4. 为 API 编写集成测试，验证各端点的正确性。
 
 ### E07 并发编程挑战
+- **测试状态**: ✅ 已测试 (E07_q1.md, 通过 — `-f` 文件模式 + `LAEW_PROVIDER_ID=2` mockALAF :18897 + TUI tmux 真 PTY;本轮同时发现并修复 TUI 补全菜单 Enter 吞键 Bug:`/provider` 等高频命令原本需要按 2 次 Enter 才能进入子屏,状态栏「Enter 提交」与实际「Enter 接受补全」不一致;新增 `CompletionDecision` 决策枚举 + `completion_enter_tab_decision` 纯函数,Tab/Enter 分流(Enter + buffer 是补全项真前缀时一键补全并提交),8 项单元测试覆盖路径 A/B/C,详见 `tmpPlan/2026-09-10_07-A02-E07-测试与TUI命令补全Enter吞键Bug修复方案.md`;Yolo 解析 `task_level=simple` 为 mock 固定应答限制,真实 LLM 应为 hard)
 - **预期档位**: hard
 - **考察维度**: 多线程/异步编程能力
 - **对话脚本**:
