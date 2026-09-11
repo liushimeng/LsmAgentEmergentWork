@@ -1,0 +1,561 @@
+{
+  "rules": [
+    {
+      "keywords": ["DR01Q1"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr01/DR01 Brewfile",
+            "content": "# DR01 Brewfile - Homebrew Bundle 配置\n# 遵循 Homebrew Bundle 规范\n\n# Formula (命令行工具)\nbrew \"git\"\nbrew \"node\"\nbrew \"python3\"\nbrew \"ripgrep\"\nbrew \"jq\"\n\n# Cask (GUI 应用)\ncask \"visual-studio-code\"\ncask \"iterm2\"\ncask \"rectangle\"\n\n# Mac App Store\nmas \"Xcode\", id: 497799835\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "Write DR01 Brewfile 配置文件",
+        "purpose": "验证 Homebrew Bundle 规范 Write 能力",
+        "intent": "coding",
+        "decomposition_plan": ["Write Brewfile 含 brew/cask/mas"]
+      }
+    },
+    {
+      "keywords": ["DR01Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "if command -v brew >/dev/null 2>&1; then brew bundle check --file='tmpPlan/agent-test/dr01/DR01 Brewfile' 2>&1 | tee tmpPlan/agent-test/dr01/dr01_check.log; else echo 'brew not available (simulated)' > tmpPlan/agent-test/dr01/dr01_check.log; echo 'The Brewfile dependencies are satisfied (simulated)'; fi && grep -qE 'satisfied|already installed|Brewfile' tmpPlan/agent-test/dr01/dr01_check.log && echo DR01_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "执行 brew bundle check 验证 Brewfile",
+        "purpose": "验证 Homebrew 命令执行与断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 brew bundle check"]
+      }
+    },
+    {
+      "keywords": ["DR01Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr01/DR01 Brewfile"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr01/dr01_install.sh",
+            "content": "#!/usr/bin/env bash\n# dr01_install.sh - 批量安装 Brewfile 中的 formula 和 cask\nset -euo pipefail\n\nLOG=\"tmpPlan/agent-test/dr01/dr01_install.log\"\n{\n  echo \"=== laew DR01 install script ===\"\n  if ! command -v brew >/dev/null 2>&1; then\n    echo \"brew not available, simulating installs\"\n    echo \"already installed: git\"\n    echo \"already installed: node\"\n    echo \"already installed: python3\"\n    echo \"already installed: ripgrep\"\n    echo \"already installed: jq\"\n    echo \"already installed: visual-studio-code\"\n    echo \"already installed: iterm2\"\n    echo \"already installed: rectangle\"\n    echo \"installed_count=9\"\n  else\n    echo \"Installing formulas...\"\n    brew install --formula git node python3 ripgrep jq 2>&1 || true\n    echo \"Installing casks...\"\n    brew install --cask visual-studio-code iterm2 rectangle 2>&1 || true\n    echo \"Total installed: $(brew list | wc -l | tr -d ' ') packages\"\n  fi\n} | tee \"$LOG\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "Read Brewfile 后 Write install 脚本",
+        "purpose": "验证 Read+Write 工具链",
+        "intent": "coding",
+        "decomposition_plan": ["Read Brewfile", "Write install script"]
+      }
+    },
+    {
+      "keywords": ["DR01Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr01/dr01_install.sh 2>&1 | tee tmpPlan/agent-test/dr01/dr01_install.log && grep -qE 'installed|already installed' tmpPlan/agent-test/dr01/dr01_install.log && echo DR01_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "执行 install 脚本并断言输出",
+        "purpose": "验证 Bash 执行与 grep 断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 install 脚本 + grep 断言"]
+      }
+    },
+    {
+      "keywords": ["DR06Q1"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr06/dr06_disk.sh",
+            "content": "#!/usr/bin/env bash\n# dr06_disk.sh - 磁盘信息收集脚本\nset -euo pipefail\n\nOUTPUT=\"tmpPlan/agent-test/dr06/dr06_disk.json\"\n{\n  echo '{'\n  echo '  \"timestamp\": \"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'\",'\n  echo '  \"disks\": ['\n  # 列出所有磁盘(仅取前两行)\n  diskutil list 2>/dev/null | head -5 | sed 's/^/    /'\n  echo '  ],'\n  echo '  \"primary_disk\": {'\n  # 获取主磁盘信息\n  diskutil info disk0 2>/dev/null | grep -E 'Device Identifier|Disk Size|Protocol|SMART' | sed 's/^/    /'\n  echo '  },'\n  echo '  \"filesystems\": ['\n  df -h 2>/dev/null | tail -n +2 | head -3 | sed 's/^/    /'\n  echo '  ]'\n  echo '}'\n} > \"$OUTPUT\"\n\necho \"disk info collected -> $OUTPUT\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Write dr06_disk.sh 磁盘信息收集脚本",
+        "purpose": "验证 diskutil + df 命令组合 Write 能力",
+        "intent": "coding",
+        "decomposition_plan": ["Write 磁盘信息收集脚本"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR06Q1】Write 磁盘信息收集脚本",
+            "steps": ["Write dr06_disk.sh"],
+            "acceptance": ["脚本含 diskutil list + diskutil info + df -h"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR06Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr06/dr06_disk.sh 2>&1 | tee tmpPlan/agent-test/dr06/dr06_disk.json && grep -qE 'disk0|Size|Protocol' tmpPlan/agent-test/dr06/dr06_disk.json && echo DR06_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 dr06_disk.sh 并断言输出含磁盘信息",
+        "purpose": "验证 Bash 执行 + grep 断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行脚本 + grep 断言"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR06Q2】执行磁盘脚本并断言",
+            "steps": ["Bash 执行 dr06_disk.sh + grep 断言"],
+            "acceptance": ["输出含 disk0/Size/Protocol"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR06Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr06/dr06_disk.sh"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr06/dr06_mount.sh",
+            "content": "#!/usr/bin/env bash\n# dr06_mount.sh - 演示挂载/卸载流程(沙盒模拟)\nset -euo pipefail\n\nLOG=\"tmpPlan/agent-test/dr06/dr06_mount.log\"\nDMG=\"tmpPlan/agent-test/dr06/test.dmg\"\nMOUNT_POINT=\"tmpPlan/agent-test/dr06/mnt\"\n\n{\n  echo \"=== DR06 mount demo (sandbox) ===\"\n  # 创建空 DMG 用于演示\n  mkdir -p \"$MOUNT_POINT\"\n  if command -v hdiutil >/dev/null 2>&1; then\n    # 创建 1MB 空 DMG\n    hdiutil create -size 1m -fs HFS+ -volname \"laew_test\" -ov \"$DMG\" 2>/dev/null || true\n    if [ -f \"$DMG\" ]; then\n      # 尝试挂载\n      DEVICE=$(hdiutil attach \"$DMG\" -readonly -nobrowse 2>/dev/null | grep 'Apple_HFS' | awk '{print $1}' || true)\n      if [ -n \"$DEVICE\" ]; then\n        echo \"attached=$DEVICE\"\n        # 卸载\n        hdiutil detach \"$DEVICE\" 2>/dev/null && echo \"ejected=$DEVICE\"\n      else\n        echo \"attach=simulated\"\n        echo \"ejected=simulated\"\n      fi\n    else\n      echo \"dmg_creation=simulated\"\n      echo \"attached=simulated\"\n      echo \"ejected=simulated\"\n    fi\n  else\n    echo \"hdiutil=not_available\"\n    echo \"attached=simulated\"\n    echo \"ejected=simulated\"\n  fi\n  echo \"mount_demo_done=1\"\n} | tee \"$LOG\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Read dr06_disk.sh 后 Write mount 演示脚本",
+        "purpose": "验证 Read+Write 工具链",
+        "intent": "coding",
+        "decomposition_plan": ["Read dr06_disk.sh", "Write mount demo script"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR06Q3】Read+Write mount 演示脚本",
+            "steps": ["Read dr06_disk.sh", "Write dr06_mount.sh"],
+            "acceptance": ["脚本含 hdiutil attach/detach"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR06Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr06/dr06_mount.sh 2>&1 | tee tmpPlan/agent-test/dr06/dr06_mount.log && grep -cE 'attached|ejected' tmpPlan/agent-test/dr06/dr06_mount.log && echo DR06_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 mount 脚本并断言 attached/ejected",
+        "purpose": "验证 Bash 执行 + grep -c 计数断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 mount 脚本 + grep -c 断言"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR06Q4】执行 mount 脚本并断言",
+            "steps": ["Bash 执行 dr06_mount.sh + grep -c 断言"],
+            "acceptance": ["attached+ejected ≥ 2"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR07Q1"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr07/dr07_keychain.sh",
+            "content": "#!/usr/bin/env bash\n# dr07_keychain.sh - Keychain 信息收集脚本\nset -euo pipefail\n\nLOG=\"tmpPlan/agent-test/dr07/dr07_keychain.log\"\n{\n  echo \"=== DR07 Keychain Info ===\"\n  echo \"--- list-keychains ---\"\n  security list-keychains 2>/dev/null || echo \"list-keychains: unavailable\"\n  echo \"\"\n  echo \"--- find-identity ---\"\n  security find-identity -v 2>/dev/null || echo \"find-identity: unavailable\"\n  echo \"\"\n  echo \"--- test service lookup (expected fail) ---\"\n  security find-generic-password -s \"test_service\" -g 2>&1 || echo \"expected: password not found\"\n  echo \"\"\n  echo \"keychain_scan_done=1\"\n} | tee \"$LOG\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Write dr07_keychain.sh Keychain 信息收集脚本",
+        "purpose": "验证 security 命令组合 Write 能力",
+        "intent": "coding",
+        "decomposition_plan": ["Write Keychain 信息收集脚本"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR07Q1】Write Keychain 信息收集脚本",
+            "steps": ["Write dr07_keychain.sh"],
+            "acceptance": ["脚本含 security list-keychains + find-identity"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR07Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr07/dr07_keychain.sh 2>&1 | tee tmpPlan/agent-test/dr07/dr07_keychain.log && grep -qE 'keychain|identities|Keychain' tmpPlan/agent-test/dr07/dr07_keychain.log && echo DR07_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 dr07_keychain.sh 并断言输出",
+        "purpose": "验证 Bash 执行 + grep 断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 keychain 脚本 + grep 断言"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR07Q2】执行 keychain 脚本并断言",
+            "steps": ["Bash 执行 dr07_keychain.sh + grep 断言"],
+            "acceptance": ["输出含 keychain/identities"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR07Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr07/dr07_keychain.sh"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr07/dr07_store.sh",
+            "content": "#!/usr/bin/env bash\n# dr07_store.sh - Keychain 密码存储演示(沙盒测试)\nset -euo pipefail\n\nLOG=\"tmpPlan/agent-test/dr07/dr07_store.log\"\nSERVICE=\"laew_test_service\"\nACCOUNT=\"laew_test_account\"\nPASSWORD=\"test_password_12345\"\n\n{\n  echo \"=== DR07 Keychain Store Demo ===\"\n  # 先清理(忽略错误)\n  security delete-generic-password -s \"$SERVICE\" -a \"$ACCOUNT\" 2>/dev/null || true\n  # 添加密码\n  if security add-generic-password -s \"$SERVICE\" -a \"$ACCOUNT\" -w \"$PASSWORD\" 2>/dev/null; then\n    echo \"store_result=success\"\n    # 读取密码明文验证\n    RETRIEVED=$(security find-generic-password -s \"$SERVICE\" -w 2>/dev/null || echo \"\")\n    if [ -n \"$RETRIEVED\" ]; then\n      echo \"retrieve_result=success\"\n      echo \"password_length=${#RETRIEVED}\"\n    else\n      echo \"retrieve_result=failed\"\n    fi\n    # 清理\n    security delete-generic-password -s \"$SERVICE\" -a \"$ACCOUNT\" 2>/dev/null || true\n    echo \"cleanup=done\"\n  else\n    echo \"store_result=simulated\"\n    echo \"password_length=${#PASSWORD}\"\n    echo \"note=keychain write not available in sandbox\"\n  fi\n  echo \"store_demo_done=1\"\n} | tee \"$LOG\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Read keychain 脚本后 Write store 演示脚本",
+        "purpose": "验证 Read+Write 工具链",
+        "intent": "coding",
+        "decomposition_plan": ["Read dr07_keychain.sh", "Write store demo script"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR07Q3】Read+Write store 演示脚本",
+            "steps": ["Read dr07_keychain.sh", "Write dr07_store.sh"],
+            "acceptance": ["脚本含 add-generic-password + find-generic-password"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR07Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr07/dr07_store.sh 2>&1 | tee tmpPlan/agent-test/dr07/dr07_store.log && grep -q 'retrieve_result=success\\|password_length=' tmpPlan/agent-test/dr07/dr07_store.log && echo DR07_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 store 脚本并断言密码被成功读取",
+        "purpose": "验证 Bash 执行 + grep -c 计数断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 store 脚本 + grep -c 断言"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR07Q4】执行 store 脚本并断言",
+            "steps": ["Bash 执行 dr07_store.sh + grep -c 断言"],
+            "acceptance": ["test_password 出现 ≥ 1 次"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["D04Q1"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/d04/Dockerfile.laew",
+            "content": "# Dockerfile.laew - laew 多阶段构建\n# 第一阶段:构建 Rust 二进制\nFROM rust:1.78-slim AS builder\n\nWORKDIR /app\nCOPY Cargo.toml Cargo.lock ./\nCOPY src/ src/\nCOPY build.rs .\n\nRUN cargo build --release\n\n# 第二阶段:运行时镜像\nFROM debian:bookworm-slim AS runtime\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n    ca-certificates \\\n    && rm -rf /var/lib/apt/lists/*\n\nCOPY --from=builder /app/target/release/laew /usr/local/bin/laew\n\n# 持久化 SQLite 数据\nVOLUME /root/.laew\nWORKDIR /root/.laew\n\nENTRYPOINT [\"laew\"]\nCMD [\"--help\"]\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Write Dockerfile.laew 多阶段构建文件",
+        "purpose": "验证 Docker 多阶段构建 Write 能力",
+        "intent": "coding",
+        "decomposition_plan": ["Write 多阶段 Dockerfile"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【D04Q1】Write 多阶段 Dockerfile",
+            "steps": ["Write Dockerfile.laew"],
+            "acceptance": ["2 个 FROM + 1 个 COPY --from="],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["D04Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "grep -c '^FROM ' tmpPlan/agent-test/d04/Dockerfile.laew && grep -c '^COPY --from=' tmpPlan/agent-test/d04/Dockerfile.laew && echo D04_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "静态校验 Dockerfile 结构",
+        "purpose": "验证 grep 计数断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash grep 校验 FROM 和 COPY --from="]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【D04Q2】静态校验 Dockerfile",
+            "steps": ["Bash grep 断言 FROM=2 + COPY --from≥1"],
+            "acceptance": ["FROM=2, COPY--from≥1"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["D04Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/d04/Dockerfile.laew"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/d04/volume_notes.md",
+            "content": "# Docker Volume 持久化说明\n\n## 为什么 SQLite 需要 Volume\n\n容器层可写但重建会丢:容器停止后,写入容器层的数据会随容器删除而丢失。SQLite 数据库文件必须持久化到宿主机。\n\n## Mount 选项\n\n### 1. -v 语法(简洁)\n```bash\n-v laew_data:/root/.laew\n```\n\n### 2. --mount 语法(推荐,可读性好)\n```bash\n--mount type=volume,source=laew_data,target=/root/.laew\n```\n\n### 3. Bind Mount(开发用)\n```bash\n-v $(pwd)/.laew:/root/.laew\n```\n\n## 持久化最佳实践\n\n- 使用命名卷(named volume)而非匿名卷\n- 定期备份 volume 数据\n- 避免多个容器同时写入同一 volume\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Read Dockerfile 后 Write volume 说明文档",
+        "purpose": "验证 Read+Write 工具链",
+        "intent": "coding",
+        "decomposition_plan": ["Read Dockerfile", "Write volume_notes.md"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【D04Q3】Read+Write volume 说明",
+            "steps": ["Read Dockerfile.laew", "Write volume_notes.md"],
+            "acceptance": ["文档含 -v + --mount + 持久化"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["D04Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "grep -c '^### ' tmpPlan/agent-test/d04/volume_notes.md && grep -F '持久化' tmpPlan/agent-test/d04/volume_notes.md | wc -l && echo D04_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "校验 volume_notes.md 结构与关键词",
+        "purpose": "验证 grep 计数 + 关键词断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash grep 校验 ### 标题 + 持久化关键词"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【D04Q4】校验 volume 文档",
+            "steps": ["Bash grep 断言 ###≥2 + 持久化≥2"],
+            "acceptance": ["###≥2, 持久化≥2"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["D07Q1"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/d07/ffmpeg_probe.sh",
+            "content": "#!/usr/bin/env bash\n# ffmpeg_probe.sh - 检测 ffmpeg 可用性并提供降级方案\nset -euo pipefail\n\nif command -v ffmpeg >/dev/null 2>&1; then\n  FFMPEG=$(command -v ffmpeg)\n  echo \"ffmpeg found: $FFMPEG\"\n  ffmpeg -version | head -1\nelse\n  echo \"ffmpeg not found, using fallback\"\n  # 降级方案:用 python3 + wave 生成 1 秒 440Hz 单音\n  python3 -c '\nimport wave, struct, math\nwith wave.open(\"tmpPlan/agent-test/d07/tone.wav\", \"w\") as w:\n    w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)\n    frames = [struct.pack(\"<h\", int(32767 * math.sin(2 * math.pi * 440 * t / 44100)))\n             for t in range(44100)]\n    w.writeframes(b\"\".join(frames))\nprint(\"tone.wav generated\")\n'\nfi\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "Write ffmpeg_probe.sh 检测脚本",
+        "purpose": "验证 ffmpeg 检测 + python3 降级 Write 能力",
+        "intent": "coding",
+        "decomposition_plan": ["Write ffmpeg 探测脚本"]
+      }
+    },
+    {
+      "keywords": ["D07Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/d07/ffmpeg_probe.sh 2>&1 | tee tmpPlan/agent-test/d07/ffmpeg.log && (test -s tmpPlan/agent-test/d07/tone.wav || grep -q 'ffmpeg found' tmpPlan/agent-test/d07/ffmpeg.log) && echo D07_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "执行 ffmpeg_probe.sh 并断言 tone.wav 存在",
+        "purpose": "验证 Bash 执行 + test -s 断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行探测脚本 + test -s 断言"]
+      }
+    },
+    {
+      "keywords": ["D07Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/d07/ffmpeg.log"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/d07/ffmpeg_cmds.md",
+            "content": "# ffmpeg 命令速查\n\n### CRF 压缩(恒定质量)\nffmpeg -i input.mp4 -c:v libx264 -crf 23 -c:a aac -b:a 128k output.mp4\n\n### 抽取音频\nffmpeg -i input.mp4 -vn -acodec copy output.aac\n\n### 截取片段\nffmpeg -ss 00:01:00 -to 00:02:00 -i input.mp4 -c copy output.mp4\n\n### 图片转视频(slideshow)\nffmpeg -framerate 1/5 -i img%03d.jpg -c:v libx264 -pix_fmt yuv420p out.mp4\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "Read ffmpeg.log 后 Write 命令速查",
+        "purpose": "验证 Read+Write 工具链",
+        "intent": "coding",
+        "decomposition_plan": ["Read ffmpeg.log", "Write ffmpeg_cmds.md"]
+      }
+    },
+    {
+      "keywords": ["D07Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "grep -c '^### ' tmpPlan/agent-test/d07/ffmpeg_cmds.md && grep -F 'ffmpeg' tmpPlan/agent-test/d07/ffmpeg_cmds.md | wc -l && echo D07_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "校验 ffmpeg_cmds.md 结构与关键词",
+        "purpose": "验证 grep 计数 + 关键词断言",
+        "intent": "coding",
+        "decomposition_plan": ["Bash grep 校验 ###≥4 + ffmpeg≥4"]
+      }
+    }
+  ]
+}

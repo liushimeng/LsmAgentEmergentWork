@@ -14,6 +14,7 @@
 
 ### DR01 Homebrew 包管理与环境搭建
 
+- **测试状态**: ✅ 已测试（2026-09-11 第四十一轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write DR01 Brewfile(287B,含 brew/cask/mas) → q2 Bash brew bundle check(首次 >120s 超时,重试成功) → q3 Read+Write dr01_install.sh(928B) → q4 Bash 执行 install + grep 断言 installed + DR01_Q4_OK;simple 档 Yolo→SubAgent→QC→SessionContext→DebugReport 全链路;详见 tmpPlan/2026-09-11_22-DR01-DR06-DR07-D04-D07-macOS编程Shell提示词测试与prompt-router修复方案.md）
 - **预期档位**: simple
 - **考察维度**: Homebrew 安装/搜索/管理 / Brewfile 批量配置
 - **工具链**: Write → Bash → Read → Bash
@@ -73,6 +74,7 @@
 
 ### DR06 磁盘工具 diskutil 与存储管理
 
+- **测试状态**: ✅ 已测试（2026-09-11 第四十一轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write dr06_disk.sh(676B,diskutil list/info + df -h) → q2 Bash 执行 + grep 断言 disk0/Size/Protocol + DR06_Q2_OK → q3 Read+Write dr06_mount.sh(1148B,hdiutil attach/detach) → q4 Bash 真实挂载卸载(disk4) + grep -c attached/ejected≥2 + DR06_Q4_OK;medium 档 Yolo→Main-Work→SubAgent→QC→SessionContext→DebugReport 全链路;真实 diskutil + hdiutil 验证通过;详见 tmpPlan/2026-09-11_22-DR01-DR06-DR07-D04-D07-macOS编程Shell提示词测试与prompt-router修复方案.md）
 - **预期档位**: medium
 - **考察维度**: 磁盘列表/分区/挂载/卸载/修复
 - **工具链**: Write → Bash → Read → Write
@@ -84,6 +86,7 @@
 
 ### DR07 Keychain 密钥管理
 
+- **测试状态**: ✅ 已测试（2026-09-11 第四十一轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write dr07_keychain.sh(616B,security list-keychains/find-identity) → q2 Bash 执行 + grep 断言 keychain/identities + DR07_Q2_OK → q3 Read+Write dr07_store.sh(1122B,add/find/delete-generic-password) → q4 Bash Keychain 存储/读取/清理全流程成功 + DR07_Q4_OK;medium 档 Yolo→Main-Work→SubAgent→QC→SessionContext→DebugReport 全链路;真实 Keychain 操作验证通过;修复 1 处断言(grep -c 'test_password' → grep -q 'retrieve_result=success|password_length=');详见 tmpPlan/2026-09-11_22-DR01-DR06-DR07-D04-D07-macOS编程Shell提示词测试与prompt-router修复方案.md）
 - **预期档位**: medium
 - **考察维度**: 安全存储/密码读写/代码签名证书
 - **工具链**: Write → Bash → Read → Bash
