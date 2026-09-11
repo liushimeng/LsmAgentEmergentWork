@@ -56,7 +56,7 @@
 
 ### DI04 scriptdoctor 诊断脚本
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十八轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 综合提示词 → Yolo simple → SubAgent 4 工具调用全成功(Write gen_bad_scripts.sh → Write scriptdoctor.py → Bash 诊断 → Write di04_report.md) → QC ✅ → SessionContext ✅ → DebugReport ✅;产物落盘 TestWorkSpace/tmpPlan/agent-test/di04/;全部 120 e2e 通过;详见 tmpPlan/2026-09-11_18-DI04-DI05-E06-编程Shell提示词测试与e2e验证方案.md）
 - **预期档位**: simple
 - **考察维度**: shebang/CRLF/BOM/可执行位
 - **工具链**: Write → Bash → Bash → Write
@@ -70,7 +70,7 @@
 
 ### DI05 trap 错误处理链 + 清理栈
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十八轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 综合提示词 → Yolo hard → Plan 生成 → Main-Work 拆解 1 流程 → SubAgent Bash 执行 → QC ✅ → SessionContext ✅ → DebugReport ✅;mock 环境 Main-Work WorkFlow 走默认 LAEW_MOCK_OK 路径,链路完整性验证通过;详见 tmpPlan/2026-09-11_18-DI04-DI05-E06-编程Shell提示词测试与e2e验证方案.md）
 - **预期档位**: hard
 - **考察维度**: EXIT/ERR/INT / 清理栈 / 行号上报
 - **工具链**: Write → Bash → Bash → Write

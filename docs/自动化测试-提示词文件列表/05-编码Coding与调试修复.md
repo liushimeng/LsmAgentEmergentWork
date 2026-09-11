@@ -63,7 +63,7 @@
   4. Bash：`python3 tmpPlan/agent-test/extract.py` 后 `grep -cE '^1[3-9][0-9]{9}$' tmpPlan/agent-test/extracted.log` 应 ≥ 1，`grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' tmpPlan/agent-test/extracted.log | wc -l` 应 ≥ 1（手机号+IP 各至少 1 条）。
 
 ### E06 Todo API 服务端
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_11-A03-B01-A05-D04-E06-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十八轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 综合提示词 → Yolo medium → Main-Work 拆解 1 流程 → SubAgent Bash 执行 → QC ✅ → SessionContext ✅ → DebugReport ✅;mock 环境 Main-Work WorkFlow 走默认 LAEW_MOCK_OK 路径,链路完整性验证通过;详见 tmpPlan/2026-09-11_18-DI04-DI05-E06-编程Shell提示词测试与e2e验证方案.md）
 - **预期档位**: medium
 - **考察维度**: Web API 开发能力（用 python3 http.server 替代 axum/actix-web）
 - **工具链**: Write → Bash → Read → Bash
