@@ -14,7 +14,7 @@
 
 ### DI01 GNU/BSD 工具差异探测
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 macOS arm64 / laew mock 4 轮全过:q1 Write GNU-only 脚本 → q2 Bash 捕获 BSD sed `undefined label` 与非零证据 + EXPECTED_NEGATIVE_OK → q3 portable_env_detect/type/run_demo BSD sed 回归 → q4 六命令差异报告;q1 同时验证新增预期负例 QC 豁免;产物与 4 份 DebugReport 落盘 TestWorkSpace/DI0102FinalRoot_*;详见 tmpPlan/2026-09-11_16-DI01-DI02-Shell测试与QC预期负例及失败用量修复方案.md）
 - **预期档位**: medium
 - **考察维度**: sed/date/readlink 差异 / 可移植替写
 - **工具链**: Write → Bash → Bash → Write
@@ -28,7 +28,7 @@
 
 ### DI02 bash/zsh/fish 方言兼容
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 macOS arm64 / laew mock 4 轮全过:q1 bash=0-based + zsh=1-based + [[ glob → q2 countdown 在 bash/bash --posix 输出 5..1 → q3 bash/sh 语法与排除注释后的 Bashism 检查 → q4 Bash 3.2 兼容报告;产物与 4 份 DebugReport 落盘 TestWorkSpace/DI0102FinalRoot_*;详见 tmpPlan/2026-09-11_16-DI01-DI02-Shell测试与QC预期负例及失败用量修复方案.md）
 - **预期档位**: medium
 - **考察维度**: 数组下标 / word splitting / 模式匹配
 - **工具链**: Write → Bash → Bash → Write

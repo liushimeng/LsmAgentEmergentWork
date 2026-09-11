@@ -105,7 +105,8 @@ impl QualityRunner {
              \n\
              请基于「本单元职责 + 期望输出 + 实际输出 + 执行轨迹」判定本单元是否完成,**不要用整体目标苛求本单元**\
              (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
-             判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase / bash_exit_nonzero 信号,通常应判 Fail 并把对应信号写入 issues。",
+             判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。\n\
+             若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。",
         );
         self.run_check(
             prompt,
@@ -190,7 +191,7 @@ impl QualityRunner {
             }
         };
         let report = match trace {
-            Some(trace) => gate_report_on_trace(report, source, trace),
+            Some(trace) => gate_report_on_trace(report, source, trace, actual),
             None => report,
         };
 
@@ -225,14 +226,22 @@ fn gate_report_on_trace(
     report: QualityReport,
     source: AgentRole,
     trace: &ExecutionTrace,
+    actual_output: &str,
 ) -> QualityReport {
     if report.verdict == Verdict::Fail {
         return report;
     }
 
     let strong_failure = trace.is_failed();
-    let unevidenced_bash_failure =
-        trace.bash_exit_nonzero_count > 0 && report.evidence.trim().is_empty();
+    // 负例测试契约:底层命令非零是“通过条件”,最终断言必须返回零并输出
+    // EXPECTED_NEGATIVE_OK。这样避免 QC 模型忘记填 evidence 时,把已经成功验证
+    // 的预期负例反复重试;同时仍要求最终验收命令成功,防止用文字口头豁免。
+    let expected_negative_confirmed = actual_output.contains("EXPECTED_NEGATIVE_OK")
+        && trace.bash_exit_nonzero_count > 0
+        && trace.last_bash_exit_code == 0;
+    let unevidenced_bash_failure = trace.bash_exit_nonzero_count > 0
+        && report.evidence.trim().is_empty()
+        && !expected_negative_confirmed;
     if !strong_failure && !unevidenced_bash_failure {
         return report;
     }
@@ -433,6 +442,7 @@ mod tests {
             QualityReport::pass(AgentRole::SubAgent),
             AgentRole::SubAgent,
             &trace,
+            "完成",
         );
 
         assert_eq!(gated.verdict, Verdict::Fail);
@@ -449,7 +459,7 @@ mod tests {
 
         let mut report = QualityReport::pass(AgentRole::SubAgent);
         report.evidence = "exit=2 是本负向用例的预期结果".into();
-        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace);
+        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace, "完成");
 
         assert_eq!(gated.verdict, Verdict::Pass);
     }
@@ -463,9 +473,45 @@ mod tests {
 
         let mut report = QualityReport::pass(AgentRole::SubAgent);
         report.evidence = "模型解释这是预期情况".into();
-        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace);
+        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace, "完成");
 
         assert_eq!(gated.verdict, Verdict::Fail);
         assert!(gated.issues[0].contains("强失败信号"));
+    }
+
+    #[test]
+    fn trace_gate_allows_explicit_negative_confirmation_without_qc_evidence() {
+        let mut trace = ExecutionTrace::default();
+        trace.bash_exit_nonzero_count = 1;
+        trace.last_bash_exit_code = 0;
+        trace.collect_failure_signals("EXPECTED_NEGATIVE_OK");
+
+        let output = "工具输出摘录\nEXPECTED_NEGATIVE_OK\n<exit_code>0</exit_code>";
+        let gated = gate_report_on_trace(
+            QualityReport::pass(AgentRole::SubAgent),
+            AgentRole::SubAgent,
+            &trace,
+            output,
+        );
+
+        assert_eq!(gated.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn trace_gate_rejects_negative_marker_without_final_success() {
+        let mut trace = ExecutionTrace::default();
+        trace.bash_exit_nonzero_count = 1;
+        trace.last_bash_exit_code = 1;
+        trace.collect_failure_signals("EXPECTED_NEGATIVE_OK");
+
+        let gated = gate_report_on_trace(
+            QualityReport::pass(AgentRole::SubAgent),
+            AgentRole::SubAgent,
+            &trace,
+            "EXPECTED_NEGATIVE_OK",
+        );
+
+        assert_eq!(gated.verdict, Verdict::Fail);
+        assert!(gated.issues[0].contains("Bash 命令非零退出"));
     }
 }

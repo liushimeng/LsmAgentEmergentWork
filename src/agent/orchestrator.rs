@@ -126,6 +126,11 @@ struct QualityFailure {
     cancelled: bool,
     /// 失败时的执行轨迹(2026-09-09 第 05 轮),便于 Yolo 失败回流时引用具体失败模式。
     trace: Option<Arc<ExecutionTrace>>,
+    /// 本轮已发生的 LLM 用量(2026-09-11 第 16 轮)。
+    ///
+    /// 失败路径原先只累加 Yolo 用量,终端 Failed 用量与 Debug Collector
+    /// 统计严重不一致;SubAgent + QC 用量必须在 QC fail 时随失败一起回传。
+    usage: Usage,
 }
 
 impl QualityFailure {
@@ -144,6 +149,7 @@ impl QualityFailure {
             },
             cancelled,
             trace: None,
+            usage: Usage::default(),
         }
     }
 }
@@ -408,7 +414,7 @@ impl MultiAgentOrchestrator {
             // 2) 调度执行(执行层取消:token 贯穿 SubAgent / 并行层)
             let exec_result = match classification.task_level {
                 TaskLevel::Simple => {
-                    self.run_simple(&classification, session, cancel, progress)
+                    self.run_simple(&classification, session, cancel, progress, &retry_hint)
                         .await
                 }
                 TaskLevel::Medium => {
@@ -531,17 +537,35 @@ impl MultiAgentOrchestrator {
             .filter(|s| !s.trim().is_empty())
     }
 
+    /// 为 simple 档重试回灌上一轮失败原因,避免 SubAgent 每轮看到完全相同输入。
+    fn prompt_with_retry_hint(original_prompt: Option<String>, retry_hint: &str) -> Option<String> {
+        let hint = retry_hint.trim();
+        if hint.is_empty() {
+            return original_prompt;
+        }
+        Some(match original_prompt {
+            Some(prompt) => format!(
+                "{prompt}\n\n【上一轮失败反馈,必须改变策略】\n{hint}\n不要重复完全相同的工具调用。"
+            ),
+            None => {
+                format!("【上一轮失败反馈,必须改变策略】\n{hint}\n不要重复完全相同的工具调用。")
+            }
+        })
+    }
+
     async fn run_simple(
         &self,
         c: &TaskClassification,
         session: &Session,
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
+        retry_hint: &str,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 2026-09-11 第三十三轮:#P-A 修复 — 取 session 最后一条 user 消息作为
         // 原始 prompt 透传给 SubAgent,避免具体任务被 Yolo 抽象摘要漂移
         // (实测 P10「对 p10_inject.txt 做词频统计」被改写为「完成 laew 端到端链路验证」)。
-        let original_prompt = Self::original_user_prompt(session);
+        let original_prompt =
+            Self::prompt_with_retry_hint(Self::original_user_prompt(session), retry_hint);
         let input = SubFlowInput {
             id: "wf-1".into(),
             description: c.goal_summary.clone(),
@@ -623,6 +647,7 @@ impl MultiAgentOrchestrator {
                 suggestion: qc.suggestion,
                 cancelled: false,
                 trace: Some(Arc::new(outcome.trace)),
+                usage: add_usage(outcome.usage, qc_usage),
             })
         }
     }
@@ -696,6 +721,7 @@ impl MultiAgentOrchestrator {
                 suggestion: qc_main.suggestion,
                 cancelled: false,
                 trace: None,
+                usage: add_usage(mainwork_usage, qc_usage),
             });
         }
 
@@ -759,6 +785,7 @@ impl MultiAgentOrchestrator {
                 suggestion: qc_plan.suggestion,
                 cancelled: false,
                 trace: None,
+                usage: add_usage(plan_usage, qc_plan_usage),
             });
         }
 
@@ -791,6 +818,7 @@ impl MultiAgentOrchestrator {
                 suggestion: qc_main.suggestion,
                 cancelled: false,
                 trace: None,
+                usage: add_usage(add_usage(plan_usage, qc_plan_usage), qc_main_usage),
             });
         }
 
@@ -825,6 +853,7 @@ impl MultiAgentOrchestrator {
             suggestion: "Plan 中存在循环或未知依赖".into(),
             cancelled: false,
             trace: None,
+            usage: Usage::default(),
         })?;
 
         let mut results = Vec::new();
@@ -930,6 +959,7 @@ impl MultiAgentOrchestrator {
                                     suggestion: "重试".into(),
                                     cancelled: false,
                                     trace: None,
+                                    usage: Usage::default(),
                                 }),
                             ));
                         }
@@ -1146,6 +1176,7 @@ async fn run_wf_unit(
             suggestion: "重试".into(),
             cancelled: false,
             trace: None,
+            usage: Usage::default(),
         })?),
         None => None,
     };
@@ -1199,6 +1230,7 @@ async fn run_wf_unit(
             suggestion: qc.suggestion,
             cancelled: false,
             trace: Some(Arc::new(outcome.trace)),
+            usage: add_usage(outcome.usage, qc_usage),
         });
     }
 
@@ -1248,8 +1280,9 @@ fn add_usage(mut total: Usage, delta: Usage) -> Usage {
 }
 
 fn failure_usage(_failure: &QualityFailure) -> Usage {
-    // 失败不消耗额外 token(LLM 调用由各 Agent 自身累计);此处返回 0 避免重复累计
-    Usage::default()
+    // QC fail 时由 QualityFailure 携带 SubAgent + QC 用量;Agent 错误路径为默认零。
+    // 外层调用方只累加一次,避免与下一次执行层返回值重复计算。
+    _failure.usage.clone()
 }
 
 /// 判断 `direct_answer` 是否为占位字符串(2026-09-10 第 27 轮 F12)。
