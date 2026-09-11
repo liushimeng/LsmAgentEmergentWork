@@ -1,0 +1,648 @@
+{
+  "rules": [
+    {
+      "keywords": [
+        "D05Q4"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "grep -F 'x-api-key' tmpPlan/agent-test/req.sh | wc -l && grep -F 'anthropic-version' tmpPlan/agent-test/req.sh | wc -l && grep -c '^curl ' tmpPlan/agent-test/req.sh && echo D05_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "校验 req.sh 含 x-api-key/anthropic-version/curl",
+        "purpose": "验证 curl 请求脚本完整性",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash grep 断言 req.sh 关键字"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【D05Q4】校验 req.sh 含 x-api-key/anthropic-version/curl",
+            "steps": [
+              "Bash grep 断言 req.sh 关键字"
+            ],
+            "acceptance": [
+              "x-api-key/anthropic-version/curl 各≥1"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "D05Q3"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/curl.log"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/req.sh",
+            "content": "#!/bin/bash\n# Anthropic API 请求脚本(最小骨架)\n# 包含 x-api-key 头 + anthropic-version + messages body\nAPI_KEY=\"${ANTHROPIC_API_KEY:-sk-placeholder}\"\ncurl -s -X POST http://127.0.0.1:18906/v1/messages \\\n  -H \"x-api-key: $API_KEY\" \\\n  -H \"anthropic-version: 2023-06-01\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\":\"claude-sonnet-4-20250514\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":\"Hi!\"}],\"max_tokens\":100}'\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "Read curl.log 后 Write 带 x-api-key 头的 req.sh",
+        "purpose": "验证 Read+Write 工具链",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Read curl.log",
+          "Write req.sh"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【D05Q3】Read curl.log 后 Write req.sh",
+            "steps": [
+              "Read curl.log",
+              "Write req.sh"
+            ],
+            "acceptance": [
+              "req.sh 含 x-api-key/anthropic-version"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "D05Q2"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/mock_server.sh && awk 'NF==4' tmpPlan/agent-test/curl.log | wc -l && echo D05_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "执行 mock_server.sh 并断言 curl.log 含 1 行 4 浮点数",
+        "purpose": "验证 curl 计时脚本执行",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash 执行 mock_server.sh"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【D05Q2】执行 mock_server.sh 并断言",
+            "steps": [
+              "Bash 执行 mock_server.sh"
+            ],
+            "acceptance": [
+              "curl.log 含 1 行 4 浮点数"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "D05Q1"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/mock_server.sh",
+            "content": "#!/bin/bash\n# mock_server.sh: 起本地 HTTP 服务 + curl 计时\nset -euo pipefail\ncd \"$(dirname \"$0\")\"\npython3 -m http.server 18080 & echo $! > mock.pid\nsleep 1\ncurl -s -w '%{time_namelookup} %{time_connect} %{time_starttransfer} %{time_total}\\n' -o /dev/null http://127.0.0.1:18080/ | tee curl.log\nkill $(cat mock.pid) 2>/dev/null || true\nrm -f mock.pid\necho D05_Q1_DONE\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "Write mock_server.sh 起 HTTP 服务 + curl 计时",
+        "purpose": "验证 Write 工具 + curl 计时脚本",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write mock_server.sh"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【D05Q1】Write mock_server.sh",
+            "steps": [
+              "Write mock_server.sh"
+            ],
+            "acceptance": [
+              "mock_server.sh 落盘"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DR04Q4"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "osascript tmpPlan/agent-test/dr04_screenshot.scpt && test -f tmpPlan/agent-test/screenshot.png && echo DR04_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行截图 AppleScript 并断言截图文件存在",
+        "purpose": "验证 AppleScript 截图闭环",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash osascript 截图脚本"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR04Q4】执行截图 AppleScript",
+            "steps": [
+              "Bash osascript 截图脚本"
+            ],
+            "acceptance": [
+              "screenshot.png 存在"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DR04Q3"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr04_applescript.scpt"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr04_screenshot.scpt",
+            "content": "set _outFile to \"tmpPlan/agent-test/screenshot.png\"\ndo shell script \"screencapture -x \" & quoted form of _outFile & \" 2>/dev/null\"\nreturn _outFile\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Read AppleScript 后 Write 截图脚本",
+        "purpose": "验证 Read+Write 工具链",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Read dr04_applescript.scpt",
+          "Write dr04_screenshot.scpt"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR04Q3】Read AppleScript 后 Write 截图脚本",
+            "steps": [
+              "Read dr04_applescript.scpt",
+              "Write dr04_screenshot.scpt"
+            ],
+            "acceptance": [
+              "dr04_screenshot.scpt 落盘"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DR04Q2"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "osascript tmpPlan/agent-test/dr04_applescript.scpt 2>&1 | tee tmpPlan/agent-test/dr04_windows.json && echo DR04_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 AppleScript 获取窗口信息",
+        "purpose": "验证 AppleScript GUI 自动化",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash osascript 窗口信息脚本"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR04Q2】执行 AppleScript 获取窗口信息",
+            "steps": [
+              "Bash osascript 窗口信息脚本"
+            ],
+            "acceptance": [
+              "dr04_windows.json 含 Finder/System Events"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DR04Q1"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr04_applescript.scpt",
+            "content": "tell application \"System Events\"\n    set _frontApp to name of first application process whose frontmost is true\nend tell\ntell application \"Finder\"\n    set _desktopPath to (get POSIX path of (desktop as alias))\n    set _windowCount to (count of windows)\nend tell\nreturn \"{\\\"frontApp\\\":\\\"\" & _frontApp & \"\\\",\\\"desktopPath\\\":\\\"\" & _desktopPath & \"\\\",\\\"windowCount\\\":\" & _windowCount & \"}\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Write AppleScript 获取前台进程和窗口信息",
+        "purpose": "验证 Write 工具 + AppleScript",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write dr04_applescript.scpt"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR04Q1】Write AppleScript 窗口信息脚本",
+            "steps": [
+              "Write dr04_applescript.scpt"
+            ],
+            "acceptance": [
+              "dr04_applescript.scpt 落盘"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "E09Q4"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "python3 tmpPlan/agent-test/test_calc.py 2>&1 | tee tmpPlan/agent-test/test.log && grep -E 'ok|tests=6' tmpPlan/agent-test/test.log && echo E09_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 test_calc.py 并断言测试通过",
+        "purpose": "验证测试套件执行",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash 执行 test_calc.py"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E09Q4】执行 test_calc.py",
+            "steps": [
+              "Bash 执行 test_calc.py"
+            ],
+            "acceptance": [
+              "test.log 含 ok/tests=6"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "E09Q3"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/calc.py"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/test_calc.py",
+            "content": "#!/usr/bin/env python3\n\"\"\"test_calc.py: calc.py 测试套件(至少 6 个用例)。\"\"\"\nimport sys, os\nsys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\nfrom calc import divide, parse_int_list\n\ndef test_divide_normal():\n    assert divide(10, 2) == 5.0\n\ndef test_divide_negative():\n    assert divide(-6, 3) == -2.0\n\ndef test_divide_by_zero():\n    try:\n        divide(1, 0)\n        assert False, \"should raise ValueError\"\n    except ValueError:\n        pass\n\ndef test_parse_int_list_normal():\n    assert parse_int_list(\"1 2 3\") == [1, 2, 3]\n\ndef test_parse_int_list_empty():\n    assert parse_int_list(\"\") == []\n\ndef test_parse_int_list_with_invalid():\n    assert parse_int_list(\"1 x 3\") == [1, 3]\n\nif __name__ == \"__main__\":\n    tests = [test_divide_normal, test_divide_negative, test_divide_by_zero,\n             test_parse_int_list_normal, test_parse_int_list_empty, test_parse_int_list_with_invalid]\n    failed = 0\n    for t in tests:\n        try:\n            t()\n            print(f\"PASS {t.__name__}\")\n        except Exception as e:\n            print(f\"FAIL {t.__name__}: {e}\")\n            failed += 1\n    print(f\"tests={len(tests)} failures={failed}\")\n    if failed == 0:\n        print(\"ok\")\n    else:\n        print(f\"FAILED {failed} tests\")\n        sys.exit(1)\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Read calc.py 后 Write test_calc.py 测试套件",
+        "purpose": "验证 Read+Write 工具链 + 测试编写",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Read calc.py",
+          "Write test_calc.py"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E09Q3】Read calc.py 后 Write test_calc.py",
+            "steps": [
+              "Read calc.py",
+              "Write test_calc.py"
+            ],
+            "acceptance": [
+              "test_calc.py 含 6 个用例"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "E09Q2"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "python3 tmpPlan/agent-test/calc.py 2>&1 | tee tmpPlan/agent-test/calc.log && grep -F 'bug_x_not_filtered' tmpPlan/agent-test/calc.log && echo E09_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 calc.py 暴露 bug 并断言含 bug_x_not_filtered",
+        "purpose": "验证 bug 暴露",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash 执行 calc.py"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E09Q2】执行 calc.py 暴露 bug",
+            "steps": [
+              "Bash 执行 calc.py"
+            ],
+            "acceptance": [
+              "calc.log 含 bug_x_not_filtered"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "E09Q1"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/calc.py",
+            "content": "#!/usr/bin/env python3\n\"\"\"calc.py: divide + parse_int_list,故意埋 1 个 bug。\"\"\"\ndef divide(a, b):\n    if b == 0:\n        raise ValueError(\"division by zero\")\n    return a / b\n\ndef parse_int_list(s):\n    \"\"\"字符串→int 列表,bug:未过滤非数字。\"\"\"\n    result = []\n    for token in s.split():\n        try:\n            result.append(int(token))\n        except ValueError:\n            # BUG: 未过滤非数字,直接跳过(正确应跳过,但这里打印标记)\n            print(f\"bug_x_not_filtered: token={token!r} skipped\")\n    return result\n\nif __name__ == \"__main__\":\n    print(\"divide(10,2)=\", divide(10, 2))\n    try:\n        divide(1, 0)\n    except ValueError as e:\n        print(\"divide(1,0) caught division-by-zero\", e)\n    print(\"parse_int_list('1 2 3')=\", parse_int_list(\"1 2 3\"))\n    print(\"parse_int_list('1 2 x')=\", parse_int_list(\"1 2 x\"))\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Write calc.py 含 divide + parse_int_list(故意埋 bug)",
+        "purpose": "验证 Write 工具 + 被测函数",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write calc.py"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E09Q1】Write calc.py 被测函数",
+            "steps": [
+              "Write calc.py"
+            ],
+            "acceptance": [
+              "calc.py 落盘"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DI06Q4"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/di06/di06_report.md",
+            "content": "# DI06 getopts 参数解析报告\n\n## vo: 冒号位置语义\n\n- `v` 表示 `-v` 开关不带参数\n- `o:` 表示 `-o` 必须带参数(冒号=需要值)\n- 首冒号 `:` 抑制错误报告,脚本自行处理\n\n## getopts 不支持长选项的原因\n\ngetopts 是 POSIX builtin,仅解析单字符选项。`--output` 等多字符长选项需手写循环处理,或改用 `getopt`(GNU 扩展,非 POSIX)。\n\n## 何时应换 argparse(Python)\n\n- 参数>5个或含复杂嵌套子命令\n- 需要自动生成 --help\n- 需要类型校验/互斥组\n- 跨平台一致性要求高\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Write di06_report.md 解释 getopts 语义",
+        "purpose": "验证 Write 工具 + 报告编写",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write di06_report.md"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DI06Q4】Write di06_report.md",
+            "steps": [
+              "Write di06_report.md"
+            ],
+            "acceptance": [
+              "di06_report.md 落盘"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DI06Q3"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/di06/mytool.sh",
+            "content": "#!/bin/bash\n# mytool.sh: getopts + 手写长选项解析\nset -euo pipefail\nVERBOSE=false\nOUTPUT=\"\"\nPOSITIONAL=()\n\n# 手写长选项解析\nparse_long() {\n    while [[ $# -gt 0 ]]; do\n        case \"$1\" in\n            -v) VERBOSE=true; shift ;;\n            -o) OUTPUT=\"$2\"; shift 2 ;;\n            --output=*) OUTPUT=\"${1#*=}\"; shift ;;\n            --output) OUTPUT=\"$2\"; shift 2 ;;\n            --) shift; POSITIONAL+=(\"$@\"); break ;;\n            -h|--help) usage; return 0 ;;\n            -*) echo \"Unknown option: $1\" >&2; return 2 ;;\n            *) POSITIONAL+=(\"$1\"); shift ;;\n        esac\n    done\n}\n\nusage() {\n    echo \"Usage: mytool.sh [-v] [-o output] [--output=file] [files...]\"\n}\n\nparse_long \"$@\"\necho \"verbose=$VERBOSE output=$OUTPUT positional=${POSITIONAL[*]}\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Write mytool.sh 加长选项解析",
+        "purpose": "验证 Write 工具 + 长选项实现",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write mytool.sh"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DI06Q3】Write mytool.sh 加长选项",
+            "steps": [
+              "Write mytool.sh"
+            ],
+            "acceptance": [
+              "mytool.sh 含 --output 处理"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DI06Q2"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/di06/mytool.sh --help 2>&1 | head -3 && bash tmpPlan/agent-test/di06/mytool.sh -x 2>&1; echo \"exit=$?\" && echo DI06_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "验证 mytool.sh --help 和 -x 退出码=2",
+        "purpose": "验证参数解析行为",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash 验证 mytool.sh"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DI06Q2】验证 mytool.sh --help 和 -x",
+            "steps": [
+              "Bash 验证 mytool.sh"
+            ],
+            "acceptance": [
+              "--help 输出 usage, -x exit=2"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DI06Q1"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/di06/mytool.sh",
+            "content": "#!/bin/bash\n# mytool.sh: getopts 参数解析\nset -euo pipefail\nusage() { echo \"Usage: mytool.sh [-v] [-o output] [files...]\"; }\nVERBOSE=false\nOUTPUT=\"\"\nwhile getopts \"vo:\" opt; do\n    case $opt in\n        v) VERBOSE=true ;;\n        o) OUTPUT=\"$OPTARG\" ;;\n        *) usage; exit 2 ;;\n    esac\ndone\nshift $((OPTIND-1))\necho \"verbose=$VERBOSE output=$OUTPUT positional=$*\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Write mytool.sh 用 getopts 解析 -v/-o",
+        "purpose": "验证 Write 工具 + getopts 实现",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write mytool.sh"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DI06Q1】Write mytool.sh getopts",
+            "steps": [
+              "Write mytool.sh"
+            ],
+            "acceptance": [
+              "mytool.sh 落盘"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -84,7 +84,7 @@
 
 ### DI06 getopts 参数解析
 
-- **测试状态**: ✅ 已测试（2026-09-11 Linux x86_64 / laew mock(anthropic) -debug 全链路通过：Yolo 分类 → Main-Work → SubAgent 多工具 → QC ✅ → DebugReport ✅；详见 tmpPlan/2026-09-11_xx-DI06-DI07-DJ01-Linux测试方案.md)
+- **测试状态**: ✅ 已测试（2026-09-11 第四十轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write mytool.sh(371B,getopts vo:) → q2 Bash 验证 --help 输出 usage + -x exit=2 + DI06_Q2_OK → q3 Write mytool.sh(769B,手写 parse_long 长选项) → q4 Write di06_report.md(563B,解释 vo:/长选项/argparse);medium 档 Yolo→Main-Work→SubAgent→QC→SessionContext→DebugReport 全链路;真实 bash getopts + 长选项解析验证通过;Linux 环境同轮次通过;详见 tmpPlan/2026-09-11_21-D05-DR04-E09-DI06-编程Shell提示词测试与QC修复方案.md）
 - **预期档位**: medium
 - **考察维度**: getopts / 长选项 / 退出码
 - **工具链**: Write → Bash → Bash → Write
@@ -98,7 +98,6 @@
 
 ### DI07 管道子 shell 变量丢失
 
-- **测试状态**: ✅ 已测试（2026-09-11 Linux x86_64 / laew mock(anthropic) -debug 全链路通过：Yolo 分类 → Main-Work → SubAgent 多工具 → QC ✅ → DebugReport ✅；详见 tmpPlan/2026-09-11_xx-DI06-DI07-DJ01-Linux测试方案.md)
 - **预期档位**: hard
 - **考察维度**: 子 shell 边界 / 进程替换 / 流式
 - **工具链**: Write → Bash → Bash → Write

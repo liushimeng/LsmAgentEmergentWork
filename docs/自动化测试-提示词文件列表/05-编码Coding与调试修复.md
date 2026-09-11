@@ -96,7 +96,7 @@
   4. Bash：`time python3 tmpPlan/agent-test/fast.py 2>&1 | tee tmpPlan/agent-test/fast.log`，断言 `fast.log` 含相同 dup_removed 数但 elapsed 值 < slow.log 的 50%（awk 提取两文件耗时做对比，通过则 echo SPEEDUP_OK）。
 
 ### E09 测试策略设计 + 实际编写
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write calc.py(869B,含 divide+parse_int_list+bug) → q2 Bash 执行 + grep bug_x_not_filtered + E09_Q2_OK(QC ✅,修复 ValueError 误检) → q3 Read+Write test_calc.py(1278B,6 用例) → q4 Bash 执行 tests=6 failures=0 + E09_Q4_OK;medium 档 Yolo→Main-Work→SubAgent→QC→SessionContext→DebugReport 全链路;发现并修复 QC text_failure_phrase 误检 ValueError 的 P0 问题;详见 tmpPlan/2026-09-11_21-D05-DR04-E09-DI06-编程Shell提示词测试与QC修复方案.md）
 - **预期档位**: medium
 - **考察维度**: 测试金字塔 + 测试编写 + 覆盖
 - **工具链**: Write → Bash → Read → Write

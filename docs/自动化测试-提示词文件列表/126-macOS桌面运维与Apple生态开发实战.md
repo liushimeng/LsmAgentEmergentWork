@@ -49,6 +49,7 @@
 
 ### DR04 AppleScript GUI 自动化
 
+- **测试状态**: ✅ 已测试（2026-09-11 第四十轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write dr04_applescript.scpt(386B) → q2 Bash osascript 获取前台进程 "Code"+ 桌面路径 + DR04_Q2_OK → q3 Read+Write dr04_screenshot.scpt(147B) → q4 Bash screencapture 截图 6400x3600 PNG(5.3MB) + DR04_Q4_OK;medium 档 Yolo→Main-Work→SubAgent→QC→SessionContext→DebugReport 全链路;真实 AppleScript GUI 自动化验证通过;详见 tmpPlan/2026-09-11_21-D05-DR04-E09-DI06-编程Shell提示词测试与QC修复方案.md）
 - **预期档位**: medium
 - **考察维度**: GUI 脚本 / 应用交互 / 窗口操作
 - **工具链**: Write → Bash → Read → Write
