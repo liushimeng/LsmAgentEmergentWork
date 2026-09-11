@@ -330,6 +330,41 @@ def _final_answer_text(tool_snippet, base="MOCK_FINAL_ANSWER: laew Anthropic 链
     return text
 
 
+def _strip_unsupported_tool_args(tool_name, args):
+    """剥离 router args 里的非 Schema 字段,避免 laew 工具校验 fail-closed。
+
+    laew Bash / Write / Read tool 的 JSON Schema 标记为 `additionalProperties=false`,
+    router 中常见的辅助字段 `note`(测试员写备注)会触发 "未声明字段" 校验失败,
+    进而把整个轮次打成 QC ❌ + 3 轮重试 → 假失败。
+
+    兼容字段白名单(按 laew 工具已知 args 字段):
+      - Bash:    command
+      - Write:   file_path, content
+      - Read:    file_path
+      - 其余工具: 透传(router 不为它们生成 args,沿用 default_call 路径)
+    """
+    if not isinstance(args, dict):
+        return args
+    whitelist = {
+        "Bash": {"command"},
+        "Write": {"file_path", "content"},
+        "Read": {"file_path"},
+    }
+    allowed = whitelist.get(tool_name)
+    if allowed is None:
+        return args
+    extra = set(args.keys()) - allowed
+    if not extra:
+        return args
+    # 输出警告一次,便于 router 作者修正:走 stderr 不影响 SSE 流
+    print(
+        f"[mock] router 工具 {tool_name} 剥离非白名单字段: {sorted(extra)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {k: v for k, v in args.items() if k in allowed}
+
+
 def _route_subagent_tool(call_no, prompt_text, default_call):
     """按 prompt 关键词 + call_no 返回 (tool_name, args_json_str)。
 
@@ -343,7 +378,11 @@ def _route_subagent_tool(call_no, prompt_text, default_call):
                 tools = rule.get("tools", []) or []
                 for t in tools:
                     if int(t.get("call_no", 1)) == int(call_no):
-                        return t["tool"], json.dumps(t.get("args", {}), ensure_ascii=False)
+                        tool_name = t["tool"]
+                        # 第四十二轮:剥离 router args 非 Schema 字段(防止 note 等
+                        # 备注字段触发 laew 工具 fail-closed 假失败)
+                        args = _strip_unsupported_tool_args(tool_name, t.get("args", {}))
+                        return tool_name, json.dumps(args, ensure_ascii=False)
                 # 第三十七轮规则锁定(跨端合并移植):关键词命中规则后工具查找
                 # 锁定在该规则内;缺当前 call_no 直接落 default_call,不再扫后续
                 # 规则 —— 防泛关键词规则截胡,把别的轮次的工具链错误重放

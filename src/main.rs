@@ -210,7 +210,20 @@ async fn cmd_provider(p: ProviderCmd) -> Result<()> {
         }
         ProviderCmd::Use { id } => {
             db.set_active(id).map_err(anyhow::Error::from)?;
-            println!("✓ 已切换当前模型为 id={id}");
+            // 第四十二轮 UX 优化:use 后立即打印当前激活记录全貌,
+            // 让用户在切完 provider 时一眼看清接下来 laew 走的是哪条;
+            // 避免「use 完以为生效,但实际默认还是旧 provider」的认知偏差。
+            if let Ok(Some(active)) = db.get_active() {
+                println!(
+                    "✓ 已切换当前模型为 id={id} → {} / {} @ {} (ctx: {})",
+                    active.provider_name,
+                    active.model_name,
+                    active.end_point,
+                    lsm_agent::config::format_context_size(active.context_max_size)
+                );
+            } else {
+                println!("✓ 已切换当前模型为 id={id}");
+            }
         }
         ProviderCmd::Delete { id } => {
             db.delete(id).map_err(anyhow::Error::from)?;
