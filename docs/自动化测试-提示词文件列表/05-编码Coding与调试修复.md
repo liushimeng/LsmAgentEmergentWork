@@ -30,7 +30,7 @@
   4. Bash：`diff tmpPlan/agent-test/buggy.py tmpPlan/agent-test/fixed.py | grep -c '^[<>]'` 应 ≥ 4（至少 4 行差异），且 `python3 tmpPlan/agent-test/fixed.py 2>&1 | tee /dev/null` 不抛错且输出符合预期（脚本内 assert 通过则 echo FIXED）。
 
 ### E03 代码审查（Code Review）
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_05-A02-E03-L02-S01-C05-自动化测试与hard任务Plan解析Bug修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十五轮 TUI 4 轮全过:q1 Write review_me.py(REVIEW=5) → q2 Bash grep 双断言(REVIEW=5, hardcoded password=2) → q3 Read+Write review.md(50 行, 4 ### 标题, 关键词命中 5 次) → q4 grep 校验 headings=4 + keywords=5;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;TUI session log 见 /tmp/laew_e03_session.log;产物 review_me.py/review.md 落盘 TestWorkSpace/tmpPlan/agent-test/;详见 tmpPlan/2026-09-11_13-E03-E10编程提示词测试与TUI观察方案.md）
 - **预期档位**: medium
 - **考察维度**: 代码质量评估 + 改进建议 + 落盘
 - **工具链**: Write → Bash → Read → Write
@@ -107,7 +107,7 @@
   4. Bash：`python3 tmpPlan/agent-test/test_calc.py 2>&1 | tee tmpPlan/agent-test/test.log`，断言 `test.log` 含 "failures=0" 且 "tests=6" 或 "ok"（grep -E 'ok|tests=6' 命中，失败则 Edit calc.py 修复后重跑）。
 
 ### E10 安全编程 + 命令白名单机制
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十五轮 TUI 4 轮全过:q1 Write insecure.py(VULN=4, os.system/eval=5) → q2 Bash grep 双断言(VULN=4, 危险调用=5) → q3 Read+Write secure.py(subprocess.run+json.loads+os.environ,无 eval) → q4 DB_PASSWORD inline 跑 secure.py:5 BLOCK + 2 ALLOW + blocked_by_whitelist=5 + VULN: =0 + OK validated;q4 同时发现并修复一个真实问题——Bash 工具每条命令独立进程不保留 export,prompt 必须 inline 写 env;medium 档全链路;TUI session log 见 /tmp/laew_e10_session.log;详见 tmpPlan/2026-09-11_13-E03-E10编程提示词测试与TUI观察方案.md）
 - **预期档位**: medium
 - **考察维度**: 安全意识 + 防护措施 + 实际机制
 - **工具链**: Write → Bash → Read → Write
