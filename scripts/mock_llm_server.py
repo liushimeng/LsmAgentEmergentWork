@@ -33,6 +33,10 @@ LOG_PATH = sys.argv[2] if len(sys.argv) > 2 else "mock_requests.jsonl"
 #                  用于端到端验证 sandbox_hook 的沙箱拦截。
 #   WRITE_INSIDE  — subagent 第 1 次工具调用改为 Write,目标为相对路径 sandbox-ok.txt
 #                  (落工作目录),用于端到端验证白名单内写入放行(防误伤正例)。
+#   SYSTEM_OVERVIEW — subagent 第 1 次工具调用改为 Bash,输出 load/memory/swap 概览,
+#                  用于 C07 的「真实工具调用 + 结果解读」定向回归。
+#   WRITE_RETENTION — subagent 第 1 次工具调用改为 Write cleanup_testReport.sh,
+#                  用于 C08 q4 的保留策略脚本落盘与语法检查回归。
 #   --delay-ms N  — 每个请求处理前 sleep N 毫秒(模拟慢 LLM),
 #                  用于端到端验证取消传播(SIGINT 优雅中断,不应等延迟跑完)。
 #   FORCED_TOOL   — yolo / quality 角色改为 tool_use 形式返回结构化结果
@@ -71,7 +75,8 @@ while _i < len(_args):
         _i += 2
         continue
     if _a in ("--flaky", "--bash-block", "--broken-quality", "--parallel-wfs", "--overflow-once",
-              "--write-outside", "--write-inside", "--inject-bash", "--forced-tool",
+              "--write-outside", "--write-inside", "--system-overview",
+              "--write-retention", "--inject-bash", "--forced-tool",
               "--reject-tool-choice", "--yolo-direct-null"):
         MODES.add(_a)
     _i += 1
@@ -450,6 +455,8 @@ def first_tool_call(default_cmd):
     - --overflow-once:Bash `seq 1 5000`(大 tool_result,验证溢出排水)
     - --write-outside:Write 用户 Home 下 canary 文件(白名单外,验证沙箱拦截)
     - --write-inside:Write 相对路径 sandbox-ok.txt(落工作目录,验证白名单放行)
+    - --system-overview:Bash 输出 load/memory/swap 概览(C07 定向回归)
+    - --write-retention:Write cleanup_testReport.sh(C08 q4 定向回归)
     """
     if "--bash-block" in MODES:
         return "Bash", '{"command": "rm -rf /"}'
@@ -463,6 +470,32 @@ def first_tool_call(default_cmd):
     if "--write-inside" in MODES:
         return "Write", json.dumps(
             {"file_path": "sandbox-ok.txt", "content": "laew sandbox ok"}, ensure_ascii=False
+        )
+    if "--system-overview" in MODES:
+        command = (
+            "printf 'load_average: '; cut -d' ' -f1-3 /proc/loadavg; "
+            "printf 'memory_and_swap:\\n'; free -h"
+        )
+        return "Bash", json.dumps({"command": command}, ensure_ascii=False)
+    if "--write-retention" in MODES:
+        script = """#!/bin/sh
+set -eu
+
+dir=${1:-testReport}
+keep=${2:-20}
+
+find "$dir" -maxdepth 1 -type f -print0 |
+  xargs -0 stat -c '%Y\t%n' |
+  sort -nr |
+  tail -n +$((keep + 1)) |
+  cut -f2- |
+  while IFS= read -r file; do
+    rm -- "$file"
+  done
+"""
+        return "Write", json.dumps(
+            {"file_path": "cleanup_testReport.sh", "content": script},
+            ensure_ascii=False,
         )
     # L1208:Prompt 注入防护 e2e —— Bash 命令输出含「curl | bash」,触发 Critical 注入告警
     if "--inject-bash" in MODES:

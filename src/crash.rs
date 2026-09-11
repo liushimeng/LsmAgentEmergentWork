@@ -83,6 +83,20 @@ pub fn install_panic_hook(report_dir: impl Into<PathBuf>) {
     });
 }
 
+/// 恢复 Unix 默认 SIGPIPE 行为。
+///
+/// Rust 运行时启动时会忽略 SIGPIPE，导致 `laew provider list | head` 这类
+/// 下游提前关闭管道的常规 CLI 用法被 `println!` 转成 panic。CLI 工具应沿用
+/// Unix 惯例：对端关闭时进程收到 SIGPIPE 并退出，而不是生成 CrashDump。
+pub fn restore_sigpipe_default() {
+    #[cfg(unix)]
+    unsafe {
+        // `signal` 返回 SIG_ERR 表示安装失败；此时保持 Rust 默认行为即可，
+        // 不能在初始化阶段因信号设置失败中断 CLI。
+        let _ = libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 /// 按 laew 根目录安装全局 panic hook。
 pub fn install_panic_hook_from_root(root_dir: &Path) {
     install_panic_hook(root_dir.join("CrashReport"));

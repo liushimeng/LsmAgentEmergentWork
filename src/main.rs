@@ -569,6 +569,10 @@ async fn cmd_export_provider(file_path: PathBuf) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // SIGPIPE 必须早于任何 stdout 输出与 panic hook：`laew ... | head` 提前关闭
+    // 管道是 Unix CLI 正常行为，不应进入 CrashDump 流程。
+    lsm_agent::crash::restore_sigpipe_default();
+
     // 崩溃取证必须先于 CLI 解析 / TUI 初始化 / Tokio worker 创建安装。
     // 报告目录沿用 laew 根目录约定，不依赖数据库配置，用户零配置。
     {
@@ -619,6 +623,7 @@ async fn main() -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_target(false)
+            .with_writer(std::io::stderr)
             .init();
     }
 

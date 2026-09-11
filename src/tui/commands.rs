@@ -429,7 +429,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn scan_invalid_names_reports_only_illegal_md() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let dir = tmp.path().join(".laew").join("commands");
@@ -453,6 +452,7 @@ mod tests {
         assert!(cmds.iter().any(|c| c.name == "tmux速查"), "中文名应被加载: {cmds:?}");
     }
 
+    #[test]
     fn discover_two_level_priority_and_dedup() {
         // 临时目录:项目级 + 用户级同名,用户级应胜出
         let tmp = tempfile::tempdir().expect("tmpdir");

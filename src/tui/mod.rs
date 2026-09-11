@@ -463,7 +463,12 @@ impl TuiSession {
         let entry = match &handle_result {
             Ok(OrchestrationOutcome::DirectAnswer { text, usage, .. }) => {
                 self.print_assistant_text_with_agent("Yolo", text, usage);
-                Some((OutcomeKind::DirectAnswer, text.clone(), *usage))
+                Some((
+                    OutcomeKind::DirectAnswer,
+                    text.clone(),
+                    text.clone(),
+                    *usage,
+                ))
             }
             Ok(OrchestrationOutcome::Executed { result }) => {
                 // print_task_result 内部从 self.task_started_at.take() 取值后拼接耗时,
@@ -474,9 +479,16 @@ impl TuiSession {
                 // 等 TUI 元数据会污染 LLM 决策、浪费 token、跨轮指代干扰)。
                 // print_task_result 继续用人类版(含 trace 等可观测性信息,屏幕友好)。
                 // transcript/导出也用人类版(用户看到的完整记录)。
-                let text = format_task_result(result, &self.paths, self.task_started_at);
+                let transcript_text =
+                    format_task_result(result, &self.paths, self.task_started_at);
+                let context_text = format_task_result_for_context(result);
                 self.print_task_result(result);
-                Some((OutcomeKind::Executed, text, result.total_usage))
+                Some((
+                    OutcomeKind::Executed,
+                    context_text,
+                    transcript_text,
+                    result.total_usage,
+                ))
             }
             Ok(OrchestrationOutcome::Failed {
                 suggestion,
@@ -501,7 +513,12 @@ impl TuiSession {
                     text.push_str(&format!("\n原因: {reason}"));
                 }
                 text.push_str(&format!("\n建议: {suggestion}"));
-                Some((OutcomeKind::Failed, text, *usage))
+                Some((
+                    OutcomeKind::Failed,
+                    text.clone(),
+                    text,
+                    *usage,
+                ))
             }
             Err(e) if matches!(e, crate::error::AgentError::Cancelled) => {
                 println!();
@@ -509,26 +526,29 @@ impl TuiSession {
                 Some((
                     OutcomeKind::Cancelled,
                     "(任务已取消)".to_string(),
+                    "(任务已取消)".to_string(),
                     crate::llm::Usage::default(),
                 ))
             }
             Err(e) => {
                 eprintln!("  [agent error] {e}");
+                let text = format!("[agent error] {e}");
                 Some((
                     OutcomeKind::Error,
-                    format!("[agent error] {e}"),
+                    text.clone(),
+                    text,
                     crate::llm::Usage::default(),
                 ))
             }
         };
-        if let Some((outcome, response, usage)) = entry {
+        if let Some((outcome, context_response, transcript_response, usage)) = entry {
             self.session_usage = merge_usage(self.session_usage, usage);
             // 多轮对话记忆(2026-09-10 第 23 轮):最终回答回填主上下文。
             // 此前只有 user 提示词进 session.context(),assistant 回复从不回填,
             // 下轮 Yolo 看不到模型自己上轮的回答,「你上面的比方里…」类指代追问
             // 必然失忆(实测 mock 日志第 2 轮请求全是 user 角色)。回填文本与
-            // transcript/导出同源(含 WorkFlow/QC/trace 渲染),增长由 Compact 压缩兜底。
-            let blocks = vec![crate::llm::ContentBlock::text(response.clone())];
+            // transcript/导出分流:上下文只保留回答与 QC 结论,导出保留完整人类版。
+            let blocks = vec![crate::llm::ContentBlock::text(context_response.clone())];
             self.session
                 .context_mut()
                 .push(crate::llm::ChatMessage::assistant(blocks));
@@ -536,7 +556,7 @@ impl TuiSession {
                 ts: turn_ts,
                 raw_input: raw.to_string(),
                 prompt: prompt.to_string(),
-                response,
+                response: transcript_response,
                 usage,
                 outcome,
             });
