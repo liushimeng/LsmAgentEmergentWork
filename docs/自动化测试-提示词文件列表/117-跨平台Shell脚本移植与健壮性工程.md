@@ -84,7 +84,7 @@
 
 ### DI06 getopts 参数解析
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 Linux x86_64 / laew mock(anthropic) -debug 全链路通过：Yolo 分类 → Main-Work → SubAgent 多工具 → QC ✅ → DebugReport ✅；详见 tmpPlan/2026-09-11_xx-DI06-DI07-DJ01-Linux测试方案.md)
 - **预期档位**: medium
 - **考察维度**: getopts / 长选项 / 退出码
 - **工具链**: Write → Bash → Bash → Write
@@ -98,7 +98,7 @@
 
 ### DI07 管道子 shell 变量丢失
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 Linux x86_64 / laew mock(anthropic) -debug 全链路通过：Yolo 分类 → Main-Work → SubAgent 多工具 → QC ✅ → DebugReport ✅；详见 tmpPlan/2026-09-11_xx-DI06-DI07-DJ01-Linux测试方案.md)
 - **预期档位**: hard
 - **考察维度**: 子 shell 边界 / 进程替换 / 流式
 - **工具链**: Write → Bash → Bash → Write
