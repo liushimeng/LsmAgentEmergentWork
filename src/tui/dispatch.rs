@@ -275,10 +275,22 @@ impl TuiSession {
                 suggestion,
                 reason,
                 usage,
-                ..
+                classification,
             }) => {
                 println!();
                 println!("  [agent failed]");
+                // 2026-09-11 第三十八轮 BUG-2:失败路径补 [yolo] 分类摘要(与
+                // Executed 路径对齐)—— 失败前任务按什么难度/目标执行过,用户应可见,
+                // 不应随 Failed 分支的 `..` 解构一起丢失。
+                let c = &classification;
+                println!(
+                    "  [yolo] difficulty={} purpose={} goal={} intent={} plan_steps={}",
+                    c.task_level.display_name(),
+                    crate::tui::format::truncate_chars(&c.purpose, 40),
+                    crate::tui::format::truncate_chars(&c.goal_summary, 40),
+                    c.intent,
+                    c.decomposition_plan.len()
+                );
                 // F4(2026-09-10 第 25 轮):先呈现真实失败原因,再给建议 ——
                 // 此前只显示 suggestion,可能与真实失败无关而误导用户。
                 if !reason.is_empty() {

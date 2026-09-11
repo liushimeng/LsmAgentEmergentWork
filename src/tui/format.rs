@@ -262,7 +262,7 @@ pub(crate) fn waiting_line_text(stage: Option<&str>, frame: char, elapsed_secs: 
 
 /// 把字符串按 char 截断(避免 split_at 在 CJK 多字节上切断),
 /// 超长末尾加 `…`。TUI 渲染宽度计算依赖完整 char 边界。
-fn truncate_chars(s: &str, limit: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, limit: usize) -> String {
     if s.chars().count() <= limit {
         s.to_string()
     } else {

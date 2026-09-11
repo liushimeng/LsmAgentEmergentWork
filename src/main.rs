@@ -430,8 +430,19 @@ async fn run_one_shot(
             suggestion,
             reason,
             usage,
-            ..
+            classification,
         } => {
+            // 2026-09-11 第三十八轮 BUG-2:失败路径补 [yolo] 分类摘要(与 TUI/Executed
+            // 路径对齐),失败任务的难度与目标不随 `..` 解构丢失。
+            eprintln!(
+                "[agent failed] difficulty={} goal={}",
+                classification.task_level.display_name(),
+                classification
+                    .goal_summary
+                    .chars()
+                    .take(40)
+                    .collect::<String>()
+            );
             // F4(2026-09-10 第 25 轮):先呈现真实失败原因,再给建议
             if reason.is_empty() {
                 eprintln!("[agent failed] {suggestion}");

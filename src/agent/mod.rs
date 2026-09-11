@@ -449,16 +449,12 @@ impl Agent {
                 // bash 工具的输出文本都含 `<exit_code>N</exit_code>`,
                 // 即使工具返回 Ok(exit_code=1)也累计 trace 失败信号,
                 // 让 QC 看到工具层真实失败证据(典型场景:python3 抛 RuntimeError)。
-                // LA-4(同轮修复):last_bash_exit_code 必须无条件更新(含 0)。
-                // 此前仅在 code > 0 时写入,后续成功命令永远无法把它复位为 0,
-                // 预期负例契约(复现命令非零 + 最终断言命令 exit=0)在真实链路
-                // 永远无法达成,gate 只能靠 QC evidence 豁免。
+                // 2026-09-11 第三十八轮 BUG-1(LA-4):采集收敛到 record_bash_exit_code ——
+                // 成功(code=0)也必须刷新 last_bash_exit_code,否则「先失败后成功」
+                // 的预期负例单元永远过不了 QC trace 门的 last==0 豁免条件。
+                // 守卫 code >= 0:无标签时(-1)不覆盖历史退出码。
                 if name == "Bash" {
-                    let code = crate::agent::extrace::extract_bash_exit_code(&output);
-                    trace.last_bash_exit_code = code;
-                    if code > 0 {
-                        trace.bash_exit_nonzero_count += 1;
-                    }
+                    trace.record_bash_exit_code(&output);
                 }
                 if is_error {
                     trace.tool_calls_err += 1;

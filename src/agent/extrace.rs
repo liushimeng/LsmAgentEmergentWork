@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// 执行轨迹:SubAgent 单元(或其他 Agent 单元)一次 `run_session` 的可观测元数据。
 ///
 /// 字段按"低成本 / 高信号"原则选取 —— 全部为同步计数 / 标志位,不增加 LLM 调用。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionTrace {
     /// LLM 调用总轮数(iter 计数:实际进入 LLM 调用的次数)
     pub iterations: usize,
@@ -73,6 +73,34 @@ pub struct ExecutionTrace {
 
 fn default_last_bash_exit_code() -> i32 {
     -1
+}
+
+impl Default for ExecutionTrace {
+    /// 手写 Default(第三十八轮):`last_bash_exit_code` 的语义是「-1 = 无 bash
+    /// 执行记录」,须与 serde 旧格式反序列化的 `default_last_bash_exit_code()`
+    /// 一致 —— derive(Default) 会给 0,被误读成「最后一次 bash 成功退出」,
+    /// Write/Read-only 单元的 QC 轨迹会谎报 last_exit=0。
+    fn default() -> Self {
+        Self {
+            iterations: 0,
+            tool_calls: 0,
+            tool_calls_ok: 0,
+            tool_calls_err: 0,
+            max_consecutive_failures: 0,
+            early_terminated: false,
+            early_terminate_reason: String::new(),
+            truncation_resumes: 0,
+            overflow_recoveries: 0,
+            max_tokens_upscalings: 0,
+            max_tokens_history: Vec::new(),
+            structured_emits: 0,
+            output_bytes: 0,
+            artifacts: Vec::new(),
+            failure_signals: Vec::new(),
+            bash_exit_nonzero_count: 0,
+            last_bash_exit_code: default_last_bash_exit_code(),
+        }
+    }
 }
 
 impl ExecutionTrace {
@@ -141,6 +169,28 @@ impl ExecutionTrace {
             signals.push("ok".into());
         }
         self.failure_signals = signals;
+    }
+
+    /// 从 bash 工具输出文本采集退出码并写回 trace(2026-09-11 第三十八轮 BUG-1 修复)。
+    ///
+    /// 语义(与字段文档注释对齐):
+    /// - 输出含 `<exit_code>N</exit_code>`(N 可为 0)→ 刷新 `last_bash_exit_code`;
+    /// - 仅 N > 0 时累计 `bash_exit_nonzero_count`;
+    /// - 无标签(非 bash 输出 / `[工具执行失败]` 占位文本)→ 两个字段都不动。
+    ///
+    /// 修复背景:旧实现(内联在 agent 循环)把两个字段的更新都包在 `code > 0` 里,
+    /// 成功的 bash(code=0)从不刷新 `last_bash_exit_code` ——「先失败后成功」的
+    /// 预期负例单元永远无法满足 QC trace 门豁免条件 `last_bash_exit_code == 0`
+    /// (D02N1 实测:call1 exit=1 → count=1,last=1;call2 exit=0 被跳过,QC 轨迹
+    /// 仍显示 last_exit=1,EXPECTED_NEGATIVE_OK 豁免失效,任务被误判失败)。
+    pub fn record_bash_exit_code(&mut self, output: &str) {
+        let code = extract_bash_exit_code(output);
+        if code >= 0 {
+            self.last_bash_exit_code = code;
+        }
+        if code > 0 {
+            self.bash_exit_nonzero_count += 1;
+        }
     }
 
     /// 综合失败判定:任一强信号即视为失败。
@@ -592,6 +642,37 @@ mod tests {
         let t: ExecutionTrace = serde_json::from_value(v).unwrap();
         assert_eq!(t.bash_exit_nonzero_count, 0);
         assert_eq!(t.last_bash_exit_code, -1);
+    }
+
+    // ========== record_bash_exit_code(第三十八轮 BUG-1 修复) ==========
+
+    #[test]
+    fn record_bash_exit_code_updates_last_on_success() {
+        // 预期负例契约核心场景:先失败(exit=1)后成功(exit=0)。
+        // 旧 bug:成功的 0 不刷新 last → QC trace 门 last==0 永不成立。
+        let mut t = ExecutionTrace::default();
+        t.record_bash_exit_code("<stderr>can't find session\n<exit_code>1</exit_code>");
+        assert_eq!(t.bash_exit_nonzero_count, 1);
+        assert_eq!(t.last_bash_exit_code, 1);
+        t.record_bash_exit_code("<stdout>\nEXPECTED_NEGATIVE_OK rc=1\n<exit_code>0</exit_code>");
+        assert_eq!(
+            t.bash_exit_nonzero_count, 1,
+            "成功的 bash 不应累计失败次数"
+        );
+        assert_eq!(t.last_bash_exit_code, 0, "成功的 bash 必须刷新 last_exit");
+    }
+
+    #[test]
+    fn record_bash_exit_code_ignores_missing_tag() {
+        // 非 bash 输出 / 工具执行失败占位文本:无标签,两个字段都保持不动
+        let mut t = ExecutionTrace::default();
+        t.record_bash_exit_code("[工具执行失败] Bash: 命令超时");
+        assert_eq!(t.bash_exit_nonzero_count, 0);
+        assert_eq!(t.last_bash_exit_code, -1);
+        // 已有记录时,无标签输出也不应覆盖历史退出码
+        t.last_bash_exit_code = 0;
+        t.record_bash_exit_code("plain text without tag");
+        assert_eq!(t.last_bash_exit_code, 0);
     }
 
     // ========== extract_bash_exit_code(LA-2) ==========
