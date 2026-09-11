@@ -96,7 +96,7 @@
   4. Bash：`time python3 tmpPlan/agent-test/fast.py 2>&1 | tee tmpPlan/agent-test/fast.log`，断言 `fast.log` 含相同 dup_removed 数但 elapsed 值 < slow.log 的 50%（awk 提取两文件耗时做对比，通过则 echo SPEEDUP_OK）。
 
 ### E09 测试策略设计 + 实际编写
-- **测试状态**: ✅ 已测试（2026-09-11 第四十轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write calc.py(869B,含 divide+parse_int_list+bug) → q2 Bash 执行 + grep bug_x_not_filtered + E09_Q2_OK(QC ✅,修复 ValueError 误检) → q3 Read+Write test_calc.py(1278B,6 用例) → q4 Bash 执行 tests=6 failures=0 + E09_Q4_OK;medium 档 Yolo→Main-Work→SubAgent→QC→SessionContext→DebugReport 全链路;发现并修复 QC text_failure_phrase 误检 ValueError 的 P0 问题;详见 tmpPlan/2026-09-11_21-D05-DR04-E09-DI06-编程Shell提示词测试与QC修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十轮 mock 多轮路由 + 失败措辞豁免修复后 TUI 4 轮全过：q1 Write calc.py(935→1089B,divide + parse_int_list 静默丢弃 bug + self-test demo) → q2 Bash 跑 calc.py + grep 双断言 + python3 内联复现 bug(grep ValueError=1 / bug_x_silently_discarded=1 / exit_code=0) → q3 Read+Write test_calc.py(6 用例 unittest) → q4 Bash 跑 test_calc.py(Ran 6 tests in 0.000s / OK);medium 档 Yolo→Main-Work→SubAgent→QC 全链路;修 calc.py 把「ValueError: division by zero」改为「RAISED: DIVIDE_BY_ZERO_RAISED」(避免 SubAgent 终答引用 grep 输出触发 text_failure_phrase 软信号被 fail-closed);同期修 mock `_route_plan_markdown` 合并 rule.keywords + plan.keywords 让 hard 档 Plan 路由可编程;详见 tmpPlan/2026-09-11_18-E09-C10编程系统信息提示词测试与bug修复方案.md）
 - **预期档位**: medium
 - **考察维度**: 测试金字塔 + 测试编写 + 覆盖
 - **工具链**: Write → Bash → Read → Write

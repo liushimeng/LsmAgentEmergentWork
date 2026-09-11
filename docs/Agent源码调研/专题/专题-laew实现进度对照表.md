@@ -456,3 +456,25 @@ E07 4 轮(-debug,预期负例契约达成 + processed=100)TUI 全过;cargo test 
 (含新增 4 个 gate 单测);run_e2e.sh PASS=120 FAIL=0。
 
 **方案**:`tmpPlan/2026-09-11_17-D06-E07-jq分组与生产者消费者测试及预期负例契约修复方案.md`
+
+---
+
+# 第四十轮(2026-09-11)E09/C10 编程与系统信息提示词测试新增登记
+
+测试范围:`docs/自动化测试-提示词文件列表/05-编码Coding与调试修复.md` E09 + `03-电脑使用与系统管理.md` C10(2 套提示词 × 4 轮 = 8 轮 TUI 多轮)。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| E09-prompt | 05 编码维度 E09「测试策略设计 + 实际编写」(medium 档)未在隔离环境 TUI 多轮验证 | P2(回归覆盖) | ✅ | `tests/prompt_router_e09_c10.json`(E09×4 规则 + yolo/mainwork 段)+ `TestWorkSpace/E09_q1-4.md`(4 轮多行提示词)+ `tmpPlan/run_e09c10_tui.sh`(18965 端口隔离环境驱动)+ TUI 4 轮全过(产物 calc.py 1089B/test_calc.py 1375B/test.log 含 OK) | 2026-09-11 第四十轮 |
+| C10-prompt | 03 电脑使用维度 C10「系统信息汇总脚本含 JSON 输出」(hard 档)未在隔离环境 TUI 多轮验证 | P2(回归覆盖) | ✅ | `tests/prompt_router_e09_c10.json`(C10×4 规则 + yolo/plan/mainwork 段,plan 段 keywords 含 goal_summary 特征词)+ `TestWorkSpace/C10_q1-4.md`+ `tmpPlan/run_e09c10_tui.sh`+ TUI 4 轮全过(产物 sysinfo.sh/sysinfo.md/sysinfo.json 5 keys 完整) | 2026-09-11 第四十轮 |
+| mock-plan-keywords-merge | mock `_route_plan_markdown` 仅用 `rule.keywords` 命中,但 Plan 输入只含 yolo 合成 goal_summary(无用户 prompt 轮次 token);需合并 plan.keywords 才能命中 | P0(测试基建) | ✅ | `scripts/mock_llm_server.py::_route_plan_markdown`(keywords = rule.keywords ++ plan.keywords;plan 段写 goal_summary 特征词即可生效,不再依赖 user 轮次 token) | 2026-09-11 第四十轮 |
+| mock-evidence-empty | mock QC 报告无 `evidence` 字段,SubAgent 终答引用 grep 输出含 "error:"(来自 `ValueError: division by zero` 子串)触发 text_failure_phrase 软信号 + evidence 真空 → fail-closed | P1(测试基建) | ✅ | `tests/prompt_router_e09_c10.json` E09Q1 calc.py(`raise ValueError("DIVIDE_BY_ZERO_RAISED")` + `print(f"divide(1,0) -> RAISED: {e}")`;避免 "ValueError:" / "error:" 子串触发 text_failure_phrase 软信号);QC 报告 evidence 仍为空,但 text_phrase_only + 无 bash 退出非零双重豁免可保持 pass(LA-3 设计意图) | 2026-09-11 第四十轮 |
+| e09q4-asserts-syntax | E09Q4 unittest 成功时不打印 `failures=0`(unittest 文本输出格式差异),原 grep 永远 0 命中 | P2(测试基建) | ✅ | `tests/prompt_router_e09_c10.json` E09Q4 bash command(asserts 改为 `grep -cE 'Ran [0-9]+ tests'` + `grep -cE '^OK$'` + final run grep tail -1) | 2026-09-11 第四十轮 |
+
+**驱动脚本**:`tmpPlan/run_e09c10_tui.sh`(18965 端口,单次 Bash 调用完成 mock+provider+TUI+4 round+cleanup 全流程,Bash 工具沙盒不杀后台进程的边界 — 参见 [[tmux-test-sandbox-traps]])。
+
+**路由约定补充**:hard 档 plan 段 keywords 必须取 **yolo 覆写段 goal_summary 中的特征词**(如「断言 5 个二级标题」),不能用用户 prompt token(Plan 输入不含);keywords 合并的修复让 plan 段可独立驱动 mock plan markdown 覆写,不再依赖 user 轮次 token 在 Plan 上下文里也存在(此前不存在)。
+
+**C10Q4 链上修复**:sysinfo.sh --json 模式把锚点 `C10Q3_JSON_OK` 走 stderr(`>&2`),stdout 只输出 JSON;C10Q4 bash command 去掉 `2>&1 | tee`(避免 stderr 污染 sysinfo.json),改用纯 stdout `| tee`;最终 `python3 json.load(sysinfo.json)` 成功 + 5 keys 全在。
+
+**验证**:E09 4/4 + C10 4/4 共 8 轮全过,无 TIMEOUT;产物 calc.py/test_calc.py/sysinfo.sh/sysinfo.md/sysinfo.json 全部落盘 TestWorkSpace/tmpPlan/agent-test/;测试报告 `tmpPlan/2026-09-11_18-E09-C10编程系统信息提示词测试与bug修复方案.md`;单元测试未回归。

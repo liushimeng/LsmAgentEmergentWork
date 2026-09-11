@@ -704,6 +704,10 @@ def _route_plan_markdown(corpus):
     """
     if PROMPT_ROUTER:
         for rule in PROMPT_ROUTER.get("rules", []) or []:
+            # 合并 rule.keywords 与 plan.keywords(2026-09-11 第四十轮 E09C10 修复):
+            # Plan 输入是 yolo.goal_summary 合成任务,不携带用户 prompt 的轮次 token;
+            # plan.keywords 才是 goal_summary 的特征词(必须用其命中)。
+            # HEAD 8788481 进一步把 plan.keywords 提到前面避免前序简单档规则抢先打断
             keywords = (
                 (rule.get("plan") or {}).get("keywords")
                 or rule.get("keywords", [])
