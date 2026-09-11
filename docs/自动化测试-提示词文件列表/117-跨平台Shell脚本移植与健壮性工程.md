@@ -98,6 +98,7 @@
 
 ### DI07 管道子 shell 变量丢失
 
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write subshell_trap.sh → q2 Bash 跑脚本 + q3 Write subshell_fix.sh（进程替换 < <(cat ...)）→ q4 Bash 验证修复;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: hard
 - **考察维度**: 子 shell 边界 / 进程替换 / 流式
 - **工具链**: Write → Bash → Bash → Write
@@ -111,7 +112,7 @@
 
 ### DI08 bats 风格 shell 测试（python 替代）
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write slugify.py → q2 Bash 跑 slugify + q3 Write test_slugify.py（5 用例 unittest）→ q4 Bash 跑 unittest 全部通过;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: medium
 - **考察维度**: subprocess 断言 / 命令 mock / shell 行为验证
 - **工具链**: Write → Bash → Bash → Write
@@ -139,7 +140,7 @@
 
 ### DI10 preflight 自检 + 版本横幅
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write preflight.sh（ver_ge 版本拆位比较）→ q2 Bash 跑脚本 + q3 Write 加 --version/--self-check → q4 Bash 验证版本输出与环境矩阵;simple 档 Yolo→SubAgent 直通;⚠️ 发现 ver_ge() 版本号段数不等时 b[i] 越界;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: hard
 - **考察维度**: 环境探测 / 版本拆位比较 / 依赖矩阵
 - **工具链**: Write → Bash → Bash → Write

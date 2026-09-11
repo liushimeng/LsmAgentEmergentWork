@@ -28,7 +28,7 @@
 
 ### DJ02 socket 激活 + path 触发 reload
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write myapp.socket + myapp.service → q2 Bash systemd-analyze verify + q3 Write 补全配置 → q4 Bash 验证;systemd 有预期警告 Unknown key name 'Accept';simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: medium
 - **考察维度**: socket 激活 / Type=notify / path 单元
 - **工具链**: Write → Bash → Bash → Write
@@ -42,7 +42,7 @@
 
 ### DJ03 timer 替代 cron 迁移脚本
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write backup.cron → q2 Bash 读取 + q3 Write backup.timer（OnCalendar + RandomizedDelaySec + Persistent）→ q4 Bash grep 验证 Persistent=true;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: medium
 - **考察维度**: OnCalendar / Persistent / 并发防护
 - **工具链**: Write → Bash → Bash → Write
@@ -56,7 +56,7 @@
 
 ### DJ04 journalctl 查询模拟器
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write fake_journal.py（1000 行模拟日志）→ q2 Bash 跑脚本 + q3 Write journal_query.py（--priority 过滤）→ q4 Bash 验证过滤后行数;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: medium
 - **考察维度**: 过滤语法 / 磁盘预算 / 快照导出
 - **工具链**: Write → Bash → Bash → Write
@@ -70,7 +70,7 @@
 
 ### DJ05 cgroups v2 配额（python 探测）
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write cgroup_probe.py（只读探测 /sys/fs/cgroup/）→ q2 Bash 跑脚本 + q3 Write 补全 PID cgroup 路径 → q4 Bash 验证 cgroup_v2=True + 输出 current_pid_cgroup;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: medium
 - **考察维度**: cgroups v2 只读探测 / CPU/Memory/IO
 - **工具链**: Write → Bash → Bash → Write
@@ -98,7 +98,7 @@
 
 ### DJ07 SSH 密钥轮换脚本（本地模拟）
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write gen_keys.sh（ssh-keygen ed25519 密钥对）→ q2 Bash 跑脚本 + q3 Write rotate_keys.py（三步轮换）→ q4 Bash 验证 ROTATION_OK;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: medium
 - **考察维度**: 密钥生命周期 / 三步顺序 / 备份策略
 - **工具链**: Write → Bash → Bash → Write
@@ -112,7 +112,7 @@
 
 ### DJ08 apt 安全升级窗口脚本
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write upgrade_window.sh（四阶段升级）→ q2 Bash --dry-run + q3 Write fake_apt.py（模拟可升级包）→ q4 Bash 验证输出;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: medium
 - **考察维度**: apt-mark hold / dry-run / 健康检查
 - **工具链**: Write → Bash → Bash → Write
@@ -126,7 +126,7 @@
 
 ### DJ09 幂等运维脚本 + dry-run
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write nonidempotent.sh → q2 Bash 跑 + q3 Write idempotent.sh（先查后做）→ q4 Bash 验证;⚠️ useradd Permission denied 为预期行为（无 root 权限）;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: medium
 - **考察维度**: 先查后做 / 标记收敛 / 自动回滚
 - **工具链**: Write → Bash → Bash → Write
@@ -140,7 +140,7 @@
 
 ### DJ10 自愈脚本：探测→动作阶梯→熔断
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过:q1 Write autoheal.sh（三层探测 + 动作阶梯）→ q2 Bash --check-only + q3 Write 补全熔断逻辑 → q4 Bash 验证动作阶梯（restart → restart → clear cache + restart）;simple 档 Yolo→SubAgent 直通;详见 tmpPlan/2026-09-11_23-DI07-DI08-DI10-DJ02-DJ10-D04-D08-Linux-bash编程提示词mock测试报告.md）
 - **预期档位**: hard
 - **考察维度**: 分层探测 / 熔断上限 / 演练注入
 - **工具链**: Write → Bash → Bash → Write
