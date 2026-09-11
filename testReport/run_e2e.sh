@@ -468,7 +468,7 @@ python3 scripts/mock_llm_server.py $CACHE_MOCK_PORT "$CACHE_MOCK_LOG" --cache-re
 CACHE_MOCK_PID=$!; sleep 0.6
 # 本节专用 provider,端点指向 CACHE_MOCK_PORT
 run "$LAEW" provider add --protocol anthropic --provider-name cache-test --model-name claude-cache-test   --end-point "http://127.0.0.1:$CACHE_MOCK_PORT" --api-key sk-cache-test >/dev/null 2>&1
-ID_CA=$(run "$LAEW" provider list 2>/dev/null | grep cache-test | grep -o \'id=[0-9]*\' | head -1 | cut -d= -f2)
+ID_CA=$(run "$LAEW" provider list 2>/dev/null | grep cache-test | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
 run "$LAEW" provider use "$ID_CA" >/dev/null 2>&1
 OUT=$(run "$LAEW" -p "写一句中文 hello")
 # (a) print_usage 应同时显示 cache_read 与 cache_creation
@@ -755,7 +755,11 @@ if anth:
         t0 = "\n".join(_texts(ctx_msgs[0]))
         chk("工作目录:" in t0 and "CLAUDE.md" in t0, "anthropic: 注入消息含工作目录与说明文件来源")
     users = [m for m in msgs if m.get("role") == "user"]
-    last_user = _texts(users[-1])[0].strip() if users else ""
+    # 2026-09-11 第 34 轮:merge_adjacent_same_role 将 PROJECT_CONTEXT 与用户提示词
+    # 合并为同一条 user 消息的两个 text block(兼容严格 Anthropic 网关的 400 拒绝)。
+    # 用户提示词位于 content 数组末位,检查最后一条 text block 而非首条。
+    last_user_blocks = _texts(users[-1]) if users else []
+    last_user = last_user_blocks[-1].strip() if last_user_blocks else ""
     chk(last_user == "请帮我执行一个测试命令", "anthropic: 用户提示词原文独立成条(未与上下文混淆)")
 if anth:
     # 角色化 mock 后请求序号随角色分流变化,改为扫描:执行循环必须把 tool_result 回填到后续请求
