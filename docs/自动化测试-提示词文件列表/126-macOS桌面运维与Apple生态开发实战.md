@@ -37,6 +37,7 @@
 
 ### DR03 defaults 系统偏好读写
 
+- **测试状态**: ✅ 已测试（2026-09-11 第三十九轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write dr03_defaults.sh(JSON 显式含 Dock/Finder) → q2 Bash + tee dr03_prefs.json + DR03_Q2_OK(QC ✅) → q3 Read+Write dr03_toggle.sh(沙盒模拟写入) → q4 Bash + tee dr03_toggle.log + DR03_Q4_OK(QC ✅);simple 档 Yolo→SubAgent→QC→SessionContext→DebugReport 全链路;产物 dr03_defaults.sh/dr03_prefs.json/dr03_toggle.sh/dr03_toggle.log 落盘 tmpPlan/agent-test/dr03/;详见 tmpPlan/2026-09-11_19-DR03-DR05-macOS-编程测试与Agent验证方案.md）
 - **预期档位**: simple
 - **考察维度**: 偏好域/键值类型/全局与域特定设置
 - **工具链**: Write → Bash → Read → Bash
@@ -59,6 +60,7 @@
 
 ### DR05 plist 文件解析与编辑
 
+- **测试状态**: ✅ 已测试（2026-09-11 第三十九轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write dr05_plist.sh(plutil -extract SystemVersion.plist) → q2 Bash + tee dr05_sysver.json + DR05_Q2_OK(QC ✅) → q3 Read+Write dr05_edit.sh(plutil -replace + -convert binary1 测试副本) → q4 Bash + tee dr05_edit.log + DR05_Q4_OK(QC ✅);medium 档 Yolo→Main-Work→SubAgent→QC→SessionContext→DebugReport 全链路;产物 dr05_plist.sh/dr05_sysver.json/dr05_edit.sh/dr05_edit.log/test_sample.plist/test_sample_binary.plist 落盘 tmpPlan/agent-test/dr05/;详见 tmpPlan/2026-09-11_19-DR03-DR05-macOS-编程测试与Agent验证方案.md）
 - **预期档位**: medium
 - **考察维度**: plist XML/binary 格式 / plutil 转换 / 编程式读写
 - **工具链**: Write → Bash → Read → Bash

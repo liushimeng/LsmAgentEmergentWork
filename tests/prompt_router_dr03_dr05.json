@@ -1,0 +1,262 @@
+{
+  "rules": [
+    {
+      "keywords": ["DR03Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr03/dr03_toggle.sh && grep -qE 'true|false' tmpPlan/agent-test/dr03/dr03_toggle.log && echo DR03_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "执行 dr03_toggle.sh 并断言日志含 true/false",
+        "purpose": "验证 macOS defaults 模拟写入流程",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 toggle 脚本并断言"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR03Q4】Bash 执行 dr03_toggle.sh 并断言",
+            "steps": ["【DR03Q4】Bash 执行 dr03_toggle.sh 并断言"],
+            "acceptance": ["日志含 true|false 且 DR03_Q4_OK"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR03Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr03/dr03_defaults.sh"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr03/dr03_toggle.sh",
+            "content": "#!/usr/bin/env bash\n# dr03_toggle.sh:演示 defaults write 流程(沙盒内仅 echo 模拟,不真正改写系统默认)\nset -euo pipefail\nLOG=\"tmpPlan/agent-test/dr03/dr03_toggle.log\"\n{\n  echo \"toggle_started=1\"\n  echo \"intent=AppleShowAllFiles=YES\"\n  # 不实际执行 defaults write,改为 echo 模拟\n  echo \"whatif_defaults_write_com.apple.finder.AppleShowAllFiles=true\"\n  echo \"whatif_defaults_read_com.apple.finder.AppleShowAllFiles=true\"\n  echo \"toggle_done=1 status=simulated value=true\"\n} | tee \"$LOG\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "Read defaults 脚本后 Write 安全 toggle 模拟脚本",
+        "purpose": "验证 Read+Write 工具链 + 沙盒模拟",
+        "intent": "coding",
+        "decomposition_plan": ["Read dr03_defaults.sh 后 Write toggle 脚本"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR03Q3】Read+Write dr03_toggle.sh",
+            "steps": ["【DR03Q3】Read dr03_defaults.sh 后 Write dr03_toggle.sh"],
+            "acceptance": ["产物落盘且 toggle.sh 可执行"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR03Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr03/dr03_defaults.sh 2>&1 | tee tmpPlan/agent-test/dr03/dr03_prefs.json && grep -qE 'Dock|Finder' tmpPlan/agent-test/dr03/dr03_prefs.json && echo DR03_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "执行 defaults 读取脚本并断言输出含 Dock/Finder",
+        "purpose": "验证 Bash 工具 + macOS 原生命令调用",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 defaults 读取并断言"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR03Q2】Bash 执行 defaults 读取并断言",
+            "steps": ["【DR03Q2】Bash 执行 defaults 读取并断言"],
+            "acceptance": ["产物含 Dock|Finder 且 DR03_Q2_OK"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR03Q1"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr03/dr03_defaults.sh",
+            "content": "#!/usr/bin/env bash\n# dr03_defaults.sh:读取 macOS 系统偏好配置(Dock 深色模式 Finder 路径栏)并以 JSON 汇总\n# 注意:仅 defaults read,不修改任何配置\nset -euo pipefail\nOUT=\"tmpPlan/agent-test/dr03/dr03_prefs.json\"\n{\n  echo \"{\"\n  echo \"  \\\"_meta\\\": \\\"Dock/深色模式/Finder 路径栏 偏好域只读快照\\\",\"\n  echo \"  \\\"dock_source\\\": \\\"com.apple.dock\\\",\"\n  echo \"  \\\"dock_sample\\\": \\\"$(defaults read com.apple.dock 2>/dev/null | tr '\\n' ' ' | head -c 80 || echo 'unavailable')\\\",\"\n  echo \"  \\\"dark_mode_source\\\": \\\"NSGlobalDomain AppleInterfaceStyle\\\",\"\n  echo \"  \\\"dark_mode\\\": \\\"$(defaults read NSGlobalDomain AppleInterfaceStyle 2>/dev/null || echo 'Light')\\\",\"\n  echo \"  \\\"finder_source\\\": \\\"com.apple.finder ShowPathbar\\\",\"\n  echo \"  \\\"finder_show_pathbar\\\": \\\"$(defaults read com.apple.finder ShowPathbar 2>/dev/null || echo '0')\\\",\"\n  echo \"  \\\"captured_at\\\": \\\"$(date +%Y-%m-%dT%H:%M:%S)\\\"\"\n  echo \"}\"\n} | tee \"$OUT\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "创建 defaults 读取脚本(只读 JSON 汇总)",
+        "purpose": "验证 Write 工具 + macOS 原生命令封装",
+        "intent": "coding",
+        "decomposition_plan": ["Write defaults 读取脚本"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR03Q1】Write dr03_defaults.sh",
+            "steps": ["【DR03Q1】Write tmpPlan/agent-test/dr03/dr03_defaults.sh"],
+            "acceptance": ["产物落盘且 Bash 可执行"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR05Q4"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr05/dr05_edit.sh 2>&1 | tee tmpPlan/agent-test/dr05/dr05_edit.log && grep -cE 'ModifiedKey|originalValue|newValue' tmpPlan/agent-test/dr05/dr05_edit.log && echo DR05_Q4_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 plist 编辑脚本并断言含修改痕迹",
+        "purpose": "验证 plutil -replace 与 -convert binary1 链路",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 plist 编辑脚本并断言"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR05Q4】Bash 执行 plist 编辑脚本并断言",
+            "steps": ["【DR05Q4】Bash 执行 plist 编辑脚本并断言"],
+            "acceptance": ["日志含 ModifiedKey|originalValue|newValue 且 DR05_Q4_OK"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR05Q3"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr05/dr05_plist.sh"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr05/dr05_edit.sh",
+            "content": "#!/usr/bin/env bash\n# dr05_edit.sh:用 plutil -replace 修改测试 plist 的键值,-convert binary1 转二进制\n# 注意:使用 tmpPlan/agent-test/dr05/ 下的测试副本,不动系统 plist\nset -euo pipefail\nPLIST_DIR=\"tmpPlan/agent-test/dr05\"\nTEST_PLIST=\"${PLIST_DIR}/test_sample.plist\"\nLOG=\"${PLIST_DIR}/dr05_edit.log\"\n{\n  echo \"edit_started=1 target=${TEST_PLIST}\"\n  if [[ ! -f \"$TEST_PLIST\" ]]; then\n    cat >\"$TEST_PLIST\" <<'EOF'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>ModifiedKey</key><string>originalValue</string>\n</dict>\n</plist>\nEOF\n  fi\n  echo \"originalValue=$(plutil -extract ModifiedKey raw \"$TEST_PLIST\")\"\n  plutil -replace ModifiedKey -string \"newValue\" \"$TEST_PLIST\"\n  echo \"newValue=$(plutil -extract ModifiedKey raw \"$TEST_PLIST\")\"\n  plutil -convert binary1 -o \"${PLIST_DIR}/test_sample_binary.plist\" \"$TEST_PLIST\"\n  echo \"binary_size=$(stat -f%z \"${PLIST_DIR}/test_sample_binary.plist\" 2>/dev/null || echo unknown)\"\n  echo \"edit_done=1 status=ok\"\n} | tee \"$LOG\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "Read plist 解析脚本后 Write 安全 edit 脚本(测试副本)",
+        "purpose": "验证 Read+Write + plutil -replace 链路",
+        "intent": "coding",
+        "decomposition_plan": ["Read dr05_plist.sh 后 Write edit 脚本"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR05Q3】Read+Write dr05_edit.sh",
+            "steps": ["【DR05Q3】Read dr05_plist.sh 后 Write dr05_edit.sh"],
+            "acceptance": ["产物落盘且脚本可执行"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR05Q2"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr05/dr05_plist.sh 2>&1 | tee tmpPlan/agent-test/dr05/dr05_sysver.json && grep -qE 'ProductVersion|ProductBuildVersion' tmpPlan/agent-test/dr05/dr05_sysver.json && echo DR05_Q2_OK"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "执行 plist 解析脚本并断言含 ProductVersion",
+        "purpose": "验证 Bash + plutil -p 链路",
+        "intent": "coding",
+        "decomposition_plan": ["Bash 执行 plist 解析脚本并断言"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR05Q2】Bash 执行 plist 解析并断言",
+            "steps": ["【DR05Q2】Bash 执行 plist 解析脚本并断言"],
+            "acceptance": ["产物含 ProductVersion 且 DR05_Q2_OK"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": ["DR05Q1"],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr05/dr05_plist.sh",
+            "content": "#!/usr/bin/env bash\n# dr05_plist.sh:解析 /System/Library/CoreServices/SystemVersion.plist 输出 JSON\n# 注意:仅读,不修改任何系统 plist\nset -euo pipefail\nSYS_PLIST=\"/System/Library/CoreServices/SystemVersion.plist\"\nOUT=\"tmpPlan/agent-test/dr05/dr05_sysver.json\"\n{\n  echo \"{\"\n  echo \"  \\\"_keys\\\": \\\"ProductVersion, ProductBuildVersion, ProductName\\\",\"\n  echo \"  \\\"ProductVersion\\\": \\\"$(plutil -extract ProductVersion raw \"$SYS_PLIST\" 2>/dev/null || echo unknown)\\\",\"\n  echo \"  \\\"ProductBuildVersion\\\": \\\"$(plutil -extract ProductBuildVersion raw \"$SYS_PLIST\" 2>/dev/null || echo unknown)\\\",\"\n  echo \"  \\\"ProductName\\\": \\\"$(plutil -extract ProductName raw \"$SYS_PLIST\" 2>/dev/null || echo unknown)\\\",\"\n  echo \"  \\\"captured_at\\\": \\\"$(date +%Y-%m-%dT%H:%M:%S)\\\"\"\n  echo \"}\"\n} | tee \"$OUT\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "创建 plist 解析脚本(只读)",
+        "purpose": "验证 Write 工具 + plutil 调用链",
+        "intent": "coding",
+        "decomposition_plan": ["Write plist 解析脚本"]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR05Q1】Write dr05_plist.sh",
+            "steps": ["【DR05Q1】Write tmpPlan/agent-test/dr05/dr05_plist.sh"],
+            "acceptance": ["产物落盘且 Bash 可执行"],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    }
+  ]
+}
