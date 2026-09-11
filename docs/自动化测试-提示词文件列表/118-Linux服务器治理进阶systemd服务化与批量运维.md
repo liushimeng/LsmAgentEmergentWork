@@ -84,7 +84,7 @@
 
 ### DJ06 本地多目录批量巡检（offline fleet）
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第四十一轮 Linux x86_64 / laew mock(anthropic) -debug 4 轮全过：q1 Write gen_local_fleet.sh（5 主机目录,h3 故意不同 Debian/Port 2222/PasswordAuthentication no）→ q2 Bash DJ06_FLEET_GEN_OK hosts=5 + Write fleet_inspect.sh（xargs -P 5 并发采集）→ q3 Bash baseline+sed+再跑+diff 出 h3 sshd_hash 变更 → q4 Write dj06_report.md 2532 字节 4 章节齐全;Yolo hard → Plan 5 步 → Main-Work 1 流程 → SubAgent 5 工具链(Write→Bash→Write→Bash→Write)全成功 → QC ×3 全过 → SessionContext → DebugReport;13 次 LLM 调用全成功无重试,iter=6,任务 289ms;21 文件产物落盘 tmpPlan/agent-test/dj06/(含 5 行 JSONL + drift_report.txt 11 行);关键词 DJ06_OFFLINE_FLEET 三阶段穿透 Yolo/Plan/SubAgent;详见 tmpPlan/2026-09-11_DJ06-Linux离线批量巡检测试与mock多步工具链方案.md）
 - **预期档位**: hard
 - **考察维度**: 并发 ssh 模拟 / 漂移检测 / JSON 行输出
 - **工具链**: Write → Bash → Bash → Write

@@ -478,3 +478,41 @@ E07 4 轮(-debug,预期负例契约达成 + processed=100)TUI 全过;cargo test 
 **C10Q4 链上修复**:sysinfo.sh --json 模式把锚点 `C10Q3_JSON_OK` 走 stderr(`>&2`),stdout 只输出 JSON;C10Q4 bash command 去掉 `2>&1 | tee`(避免 stderr 污染 sysinfo.json),改用纯 stdout `| tee`;最终 `python3 json.load(sysinfo.json)` 成功 + 5 keys 全在。
 
 **验证**:E09 4/4 + C10 4/4 共 8 轮全过,无 TIMEOUT;产物 calc.py/test_calc.py/sysinfo.sh/sysinfo.md/sysinfo.json 全部落盘 TestWorkSpace/tmpPlan/agent-test/;测试报告 `tmpPlan/2026-09-11_18-E09-C10编程系统信息提示词测试与bug修复方案.md`;单元测试未回归。
+
+---
+
+## 十、第四十一轮登记(2026-09-11,DJ06 Linux 离线批量巡检)
+
+**主题**:118-DJ06 本地多目录批量巡检(offline fleet) **hard 档** 4 轮 `laew -debug` 测试一次通过,无 laew 程序 bug。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| dj06-keyword-route | mock 路由器关键词硬档穿透 Plan 段 | P0(测试基建) | ✅ | `tests/prompt_router_dj06.json`(关键词 `DJ06_OFFLINE_FLEET` 同时出现在主 keywords / decomposition_plan 步骤 / workflow name,Plan 段 keywords 冗余写一份防御);`scripts/mock_llm_server.py` 第 697 行 `_route_plan_markdown` 已合并 `plan.keywords`(第四十轮修复,本轮直接受益) | 2026-09-11 第四十一轮 |
+| dj06-bash-merge | q2+q3 多 Bash 合并为单次 call_no 简化路由 | P2(测试基建) | ✅ | `tests/prompt_router_dj06.json` call_no=4 Bash 单次完成 baseline + sed 替换 + 再跑 + diff + grep(用 `&&` 串接 + `2>&1 || true` 兜底) | 2026-09-11 第四十一轮 |
+| dj06-port-collision | mock 端口冲突(E03/E10 占 18945) | P2(测试基建) | ✅ | 本轮用 18981 新端口(避免与并行会话的 mock_llm_server 进程冲突,见 [[tmux-test-sandbox-traps]]) | 2026-09-11 第四十一轮 |
+| dj06-concurrent-jsonl | xargs -P 5 并发采集 5 行 JSONL | P1(测试基建) | ✅ | `tmpPlan/agent-test/dj06/fleet_inspect.sh` `xargs -P 5 -I{} bash -c 'collect "$@"' _ {}`(每主机 6 字段 JSON) | 2026-09-11 第四十一轮 |
+| dj06-drift-detect | sed 替换触发 hash 漂移并 diff 命中 | P1(测试基建) | ✅ | `tmpPlan/agent-test/dj06/drift_report.txt` 11 行,sed 改 h3 `PasswordAuthentication no→yes` 触发 `sshd_hash e3876f902b4c6fd0 → 3209983429f1308c` | 2026-09-11 第四十一轮 |
+
+**全链路验证**(从 mock log 解析):
+- Yolo 1 次(hard 分类) → Plan 1 次(5 步骤 acceptance 齐全) → SubAgent 6 次(5 工具调用 + 1 终答) → Quality-Check 3 次(每工具结果质检) → SessionContext 1 次(摘要) → Debug 1 次(评估) = **合计 13 次 LLM 调用**
+- 5 工具链全成功(Write→Bash→Write→Bash→Write),无失败,无重试,iter=6
+- 21 个产物文件落盘 tmpPlan/agent-test/dj06/(`gen_local_fleet.sh` + `fleet_inspect.sh` + `current.jsonl` 5 行 + `last_snapshot/snapshot_v1.jsonl` 5 行 + `drift_report.txt` 11 行 + `dj06_report.md` 2532 字节 + `hosts/{h1..h5}/` 共 15 文件)
+- Plan 方案 `plans/20260911-163951-b2cb7a82-*.md`(含 5 步骤 acceptance)
+- DebugReport `DebugReport/debug_report_20260911_163951_6c5630.md`(12 项统计齐全,LLM 21ms / QC 3/3 pass / 任务 289ms)
+- 用量 input=443 output=241(mock 端固定)
+
+**路由验证**:关键词 `DJ06_OFFLINE_FLEET` 命中三阶段
+1. Yolo 分类 → `goal_summary` 含关键词 → `task_level=hard` ✅
+2. Plan 输入 → 主 keywords 命中 → 返回覆写 workflow ✅
+3. Main-Work → `workflow.name` 含【DJ06_OFFLINE_FLEET】前缀 → 透传 SubAgent → mock 按 call_no 路由 5 工具链 ✅
+
+**亮点**:
+- **mock 路由器一次到位**:沿用第四十轮 BUG-M3 / 第四十一轮 plan.keywords 合并经验,关键词无需调试即通过 5 步工具链
+- **简化 Bash 命令减少 mock 路由次数**:q2+q3 合并到 call_no=4,总工具调用 5 次(与提示词 q4 严格对齐)
+- **drift 检测对 sed 替换敏感**:PasswordAuthentication 行变更同时触发 sshd_hash 整体变更,两份 hash 在 drift_report 并列显示
+- **并发 JSONL 真实可跑**:xargs -P 5 + bash -c 函数导出,5 主机并发采集 5 行 JSON(实测毫秒级完成)
+
+**未发现 laew 程序 bug**:Yolo 三步意图识别 / Plan 硬档方案生成 / Main-Work 拆解 / SubAgent 5 步工具链 / QC × 3 质检 / SessionContext 摘要 / DebugReport 全部正常。
+
+**方案**:`tmpPlan/2026-09-11_DJ06-Linux离线批量巡检测试与mock多步工具链方案.md`
+**产物落盘**:`tmpPlan/agent-test/dj06/`(21 文件)+ `plans/20260911-163951-*.md` + `DebugReport/debug_report_20260911_163951_6c5630.md` + `testReport/{mock_server_DJ06,laew_dj06_run}.log` + `tests/prompt_router_dj06.json`
