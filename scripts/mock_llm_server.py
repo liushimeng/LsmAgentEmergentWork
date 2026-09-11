@@ -366,9 +366,14 @@ def _strip_unsupported_tool_args(tool_name, args):
 
 
 def _route_subagent_tool(call_no, prompt_text, default_call):
-    """按 prompt 关键词 + call_no 返回 (tool_name, args_json_str)。
+    """按 prompt 关键词 + 实例内相对序号返回 (tool_name, args_json_str)。
 
-    优先级:PROMPT_ROUTER 命中 > 现有 MODES(default_call 来自 first_tool_call)
+    优先级:PROMPT_ROUTER 命中 > 现有 MODES(default_call 来自 first_tool_call)。
+    第四十三轮修复:不再按 call_no 绝对值匹配 —— 全局 call_no 跨 laew -p
+    会话累计(第 N 个会话的首次 SubAgent 调用 call_no 已 >1),导致 router
+    表 call_no:1 规则永不命中。改为按工具在规则内的索引顺序返回
+    (首调用返回 tools[0],第 2 次返回 tools[1],以此类推),
+    与全局 call_no 解耦,适配每轮独立 laew -p 调用场景。
     """
     if PROMPT_ROUTER:
         rules = PROMPT_ROUTER.get("rules", []) or []
@@ -376,17 +381,14 @@ def _route_subagent_tool(call_no, prompt_text, default_call):
             keywords = rule.get("keywords", []) or []
             if any(kw in prompt_text for kw in keywords):
                 tools = rule.get("tools", []) or []
-                for t in tools:
-                    if int(t.get("call_no", 1)) == int(call_no):
-                        tool_name = t["tool"]
-                        # 第四十二轮:剥离 router args 非 Schema 字段(防止 note 等
-                        # 备注字段触发 laew 工具 fail-closed 假失败)
-                        args = _strip_unsupported_tool_args(tool_name, t.get("args", {}))
-                        return tool_name, json.dumps(args, ensure_ascii=False)
-                # 第三十七轮规则锁定(跨端合并移植):关键词命中规则后工具查找
-                # 锁定在该规则内;缺当前 call_no 直接落 default_call,不再扫后续
-                # 规则 —— 防泛关键词规则截胡,把别的轮次的工具链错误重放
-                # (实测 D09Q2 第 2/3 次调用被 D09Q1 规则截胡,重放 a.rs 写入)。
+                # 实例内相对序号:首调用=0,第 2 次=1,以此类推
+                idx = max(0, call_no - 1)
+                if idx < len(tools):
+                    t = tools[idx]
+                    tool_name = t["tool"]
+                    args = _strip_unsupported_tool_args(tool_name, t.get("args", {}))
+                    return tool_name, json.dumps(args, ensure_ascii=False)
+                # 工具已耗尽:锁定在该规则内,不再扫后续规则
                 break
     # 兜底:返回 default_call(Bash echo / 现有 MODES 派生)
     return default_call
