@@ -98,6 +98,7 @@
 
 ### DR08 Xcode 命令行工具与 SDK 管理
 
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 macOS arm64 / laew mock(openai) 4 轮全过:q1 Write dr08_xcode.sh(659B) → q2 Bash 执行 + grep 断言 swift/sdk + DR08_Q2_OK → q3 双 Write(hello.swift + dr08_build.sh) → q4 Bash 编译运行 + grep -c 'Hello from laew' + DR08_Q4_OK;simple 档 Yolo→SubAgent→QC 直通;真实 xcode-select/xcrun/swiftc 验证通过;详见 tmpPlan/2026-09-11_23-DR08-DR09-DR10-macOS运维提示词测试与Agent验证方案.md）
 - **预期档位**: medium
 - **考察维度**: xcode-select/SDK 路径/编译工具链
 - **工具链**: Write → Bash → Read → Write
@@ -109,6 +110,7 @@
 
 ### DR09 系统扩展权限与隐私保护
 
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write dr09_tcc.sh → q2 Bash 执行 + grep TCC/auth + DR09_Q2_OK → q3 Write dr09_perm.sh(csrutil+spctl+ls -laOe) → q4 Bash 执行 + grep -cE 'SIP|Gatekeeper|enabled|disabled'≥2 + DR09_Q4_OK;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;真实 TCC/SIP/Gatekeeper 验证通过;详见 tmpPlan/2026-09-11_23-DR08-DR09-DR10-macOS运维提示词测试与Agent验证方案.md）
 - **预期档位**: medium
 - **考察维度**: TCC 权限/完全磁盘访问/屏幕录制/辅助功能
 - **工具链**: Write → Bash → Read → Bash
@@ -120,6 +122,7 @@
 
 ### DR10 macOS 系统信息综合审计
 
+- **测试状态**: ✅ 已测试（2026-09-11 第四十三轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write dr10_audit.sh(system_profiler 三类) → q2 Bash + grep Model/Version + DR10_Q2_OK → q3 Write dr10_report.py(plistlib 解析 XML) → q4 Bash 执行 + grep -c '^## '≥4 + DR10_Q4_OK;hard 档 Plan→Main-Work→SubAgent→QC→SessionContext→DebugReport 全链路;真实 system_profiler + plistlib 验证通过;详见 tmpPlan/2026-09-11_23-DR08-DR09-DR10-macOS运维提示词测试与Agent验证方案.md）
 - **预期档位**: hard
 - **考察维度**: 系统报告/硬件信息/软件清单/安全状态
 - **工具链**: Write → Bash → Read → Write

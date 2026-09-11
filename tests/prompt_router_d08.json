@@ -1,0 +1,24 @@
+{
+  "rules": [
+    {
+      "keywords": ["D08Q1"],
+      "tools": [{"call_no": 1, "tool": "Write", "args": {"file_path": "tmpPlan/agent-test/d08/sqlite_inspect.py", "content": "#!/usr/bin/env python3\n\"\"\"D08 - sqlite3 模块替代 sqlite3 CLI，列出所有表与 schema。\"\"\"\nimport sqlite3, os, json\nfrom pathlib import Path\n\ndb_path = Path('tmpPlan/agent-test/d08/laew_demo.db')\n\n# 造演示库\ntry:\n    if db_path.exists():\n        db_path.unlink()\n    conn = sqlite3.connect(str(db_path))\n    conn.executescript('''\n        CREATE TABLE providers(\n            id INTEGER PRIMARY KEY,\n            name TEXT NOT NULL,\n            protocol TEXT DEFAULT 'openai',\n            is_active INTEGER DEFAULT 0\n        );\n        INSERT INTO providers VALUES(1, 'demo', 'openai', 1);\n        INSERT INTO providers VALUES(2, 'mock', 'anthropic', 0);\n        CREATE TABLE sessions(\n            id INTEGER PRIMARY KEY,\n            provider_id INTEGER REFERENCES providers(id),\n            created_at TEXT DEFAULT (datetime('now'))\n        );\n        INSERT INTO sessions VALUES(1, 1, '2026-09-11');\n    ''')\n    conn.commit()\n\n    # 只读方式打开\n    ro = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)\n    tables = ro.execute(\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\").fetchall()\n    result = {'tables': {}, 'db_path': str(db_path), 'mode': 'ro'}\n    for (t,) in tables:\n        schema = ro.execute(f\"SELECT sql FROM sqlite_master WHERE name='{t}'\").fetchone()\n        result['tables'][t] = schema[0] if schema else None\n        count = ro.execute(f'SELECT COUNT(*) FROM \"{t}\"').fetchone()[0]\n        result['tables'][t] = {'schema': schema[0] if schema else None, 'row_count': count}\n    ro.close()\n    print(json.dumps(result, indent=2, ensure_ascii=False))\n    db_path.unlink()  # 清理\nexcept Exception as e:\n    print(json.dumps({'error': str(e)}))\n"}}],
+      "yolo": {"task_level": "medium", "goal_summary": "Write sqlite_inspect.py 脚本", "purpose": "验证 sqlite3 模块只读操作", "intent": "coding", "decomposition_plan": ["Write sqlite_inspect.py"]}
+    },
+    {
+      "keywords": ["D08Q2"],
+      "tools": [{"call_no": 1, "tool": "Bash", "args": {"command": "python3 tmpPlan/agent-test/d08/sqlite_inspect.py 2>&1 | tee tmpPlan/agent-test/d08/schema.log && grep -F 'CREATE TABLE providers' tmpPlan/agent-test/d08/schema.log && echo D08_Q2_OK"}}],
+      "yolo": {"task_level": "medium", "goal_summary": "执行 sqlite_inspect.py 断言", "purpose": "验证 schema 输出", "intent": "coding", "decomposition_plan": ["Bash 执行 sqlite_inspect.py"]}
+    },
+    {
+      "keywords": ["D08Q3"],
+      "tools": [{"call_no": 1, "tool": "Write", "args": {"file_path": "tmpPlan/agent-test/d08/wal_backup_notes.md", "content": "# SQLite WAL 模式备份注意事项\n\n## 风险说明\n\nWAL 模式下直接拷贝 .db 文件可能丢失 wal 内容。\n\n## 正确热备份方式\n\n### 方式一：sqlite3 .backup\n\n```bash\nsqlite3 source.db '.backup backup.db'\n```\n\n### 方式二：python3 VACUUM INTO\n\n```python\nimport sqlite3\nconn = sqlite3.connect('source.db')\nconn.execute('VACUUM INTO \"backup.db\"')\nconn.close()\n```\n\n### 方式三：checkpoint 后拷贝\n\n```bash\nsqlite3 source.db 'PRAGMA wal_checkpoint(TRUNCATE);'\ncp source.db backup.db\n```\n\n## 关键要点\n\n- WAL 模式下 .db + .wal + .shm 三文件必须一致\n- 直接 cp 可能得到撕裂状态（torn state）\n- 推荐用 .backup 命令或 VACUUM INTO 保证一致性\n"}}],
+      "yolo": {"task_level": "medium", "goal_summary": "Write wal_backup_notes.md", "purpose": "验证 WAL 备份知识整理", "intent": "coding", "decomposition_plan": ["Write wal_backup_notes.md"]}
+    },
+    {
+      "keywords": ["D08Q4"],
+      "tools": [{"call_no": 1, "tool": "Bash", "args": {"command": "grep -c '^### ' tmpPlan/agent-test/d08/wal_backup_notes.md && grep -F 'WAL\\|VACUUM INTO\\|backup' tmpPlan/agent-test/d08/wal_backup_notes.md | wc -l && echo D08_Q4_OK"}}],
+      "yolo": {"task_level": "medium", "goal_summary": "校验 wal_backup_notes.md", "purpose": "验证 WAL 笔记完整性", "intent": "coding", "decomposition_plan": ["Bash 校验 wal_backup_notes.md"]}
+    }
+  ]
+}
