@@ -1,0 +1,370 @@
+{
+  "rules": [
+    {
+      "keywords": [
+        "E08Q4"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "time python3 tmpPlan/agent-test/fast.py 2>&1 | tee tmpPlan/agent-test/fast.log; DS=$(grep -oE 'dup_removed=[0-9]+' tmpPlan/agent-test/slow.log); DF=$(grep -oE 'dup_removed=[0-9]+' tmpPlan/agent-test/fast.log); SLOW=$(grep -oE 'elapsed=[0-9.]+' tmpPlan/agent-test/slow.log | head -1 | cut -d= -f2); FAST=$(grep -oE 'elapsed=[0-9.]+' tmpPlan/agent-test/fast.log | head -1 | cut -d= -f2); [ \"$DS\" = \"$DF\" ] && echo \"DUP_MATCH $DS\" || echo \"DUP_MISMATCH $DS vs $DF\"; awk -v s=\"$SLOW\" -v f=\"$FAST\" 'BEGIN{if (f < s*0.5) print \"SPEEDUP_OK slow=\" s \" fast=\" f; else print \"SPEEDUP_FAIL slow=\" s \" fast=\" f}'"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "hard",
+        "goal_summary": "运行 fast.py 并与 slow.log 对比去重数与耗时加速比",
+        "purpose": "性能对比验收",
+        "intent": "coding",
+        "decomposition_plan": [
+          "跑 fast.py 落盘 fast.log",
+          "提取两份日志的 dup_removed 与 elapsed,断言数量一致",
+          "awk 断言 fast < slow 的 50% 输出 SPEEDUP_OK"
+        ]
+      },
+      "plan": {
+        "keywords": [
+          "耗时加速比"
+        ],
+        "summary": "E08Q4 性能对比验收方案(prompt-router 覆写)",
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E08Q4】运行 fast.py 落盘 fast.log,提取 dup_removed/elapsed 与 slow.log 对比,awk 断言加速比输出 SPEEDUP_OK",
+            "steps": [
+              "【E08Q4】运行 fast.py 落盘 fast.log,提取 dup_removed/elapsed 与 slow.log 对比,awk 断言加速比输出 SPEEDUP_OK"
+            ],
+            "acceptance": [
+              "fast.log 落盘且 SPEEDUP_OK 输出"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E08Q4】运行 fast.py 落盘 fast.log,提取 dup_removed/elapsed 与 slow.log 对比,awk 断言加速比输出 SPEEDUP_OK",
+            "steps": [
+              "【E08Q4】运行 fast.py 落盘 fast.log,提取 dup_removed/elapsed 与 slow.log 对比,awk 断言加速比输出 SPEEDUP_OK"
+            ],
+            "acceptance": [
+              "fast.log 落盘且 SPEEDUP_OK 输出"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "E08Q3"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/slow.py"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/fast.py",
+            "content": "#!/usr/bin/env python3\n\"\"\"fast.py — O(n) 去重优化版(dict.fromkeys 保序)。数据生成与 slow.py 完全一致。\"\"\"\nimport random\nimport string\nimport time\n\nrandom.seed(42)\npool = [\"\".join(random.choices(string.ascii_lowercase, k=10)) for _ in range(4000)]\nwords = [random.choice(pool) for _ in range(50000)]\n\nstart = time.perf_counter()\nresult = list(dict.fromkeys(words))  # O(n) 且保序\nelapsed = time.perf_counter() - start\n\nprint(f\"dup_removed={len(words) - len(result)}\")\nprint(f\"elapsed={elapsed:.3f}\")\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "hard",
+        "goal_summary": "Read slow.py 后写 O(n) 去重优化版 fast.py",
+        "purpose": "编写优化版脚本",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Read slow.py 复习基线写法",
+          "Write fast.py 用 dict.fromkeys 做 O(n) 去重,数据生成与基线一致"
+        ]
+      },
+      "plan": {
+        "keywords": [
+          "优化版 fast.py"
+        ],
+        "summary": "E08Q3 编写 O(n) 优化版方案(prompt-router 覆写)",
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E08Q3】Read tmpPlan/agent-test/slow.py 后 Write 优化版 tmpPlan/agent-test/fast.py(dict.fromkeys O(n) 去重,数据生成一致)",
+            "steps": [
+              "【E08Q3】Read tmpPlan/agent-test/slow.py 后 Write 优化版 tmpPlan/agent-test/fast.py(dict.fromkeys O(n) 去重,数据生成一致)"
+            ],
+            "acceptance": [
+              "fast.py 落盘且 dup_removed 与 slow 一致"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E08Q3】Read tmpPlan/agent-test/slow.py 后 Write 优化版 tmpPlan/agent-test/fast.py(dict.fromkeys O(n) 去重,数据生成一致)",
+            "steps": [
+              "【E08Q3】Read tmpPlan/agent-test/slow.py 后 Write 优化版 tmpPlan/agent-test/fast.py(dict.fromkeys O(n) 去重,数据生成一致)"
+            ],
+            "acceptance": [
+              "fast.py 落盘且 dup_removed 与 slow 一致"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "E08Q2"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "time python3 tmpPlan/agent-test/slow.py 2>&1 | tee tmpPlan/agent-test/slow.log; echo '--- asserts ---'; echo -n 'dup_removed lines = '; grep -cE 'dup_removed=[0-9]+' tmpPlan/agent-test/slow.log; echo -n 'elapsed lines = '; grep -cE 'elapsed=[0-9.]+' tmpPlan/agent-test/slow.log; grep -oE 'elapsed=[0-9.]+' tmpPlan/agent-test/slow.log | head -1"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "hard",
+        "goal_summary": "运行 slow.py 落盘基线日志并断言 dup_removed/elapsed 两行输出",
+        "purpose": "基线计时",
+        "intent": "coding",
+        "decomposition_plan": [
+          "time python3 slow.py 落盘 slow.log",
+          "grep 断言 dup_removed 与 elapsed 各 1 行并报数"
+        ]
+      },
+      "plan": {
+        "keywords": [
+          "落盘基线日志"
+        ],
+        "summary": "E08Q2 基线计时方案(prompt-router 覆写)",
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E08Q2】time python3 tmpPlan/agent-test/slow.py 落盘 slow.log,grep 断言 dup_removed=[0-9]+ 与 elapsed=[0-9.]+ 均命中",
+            "steps": [
+              "【E08Q2】time python3 tmpPlan/agent-test/slow.py 落盘 slow.log,grep 断言 dup_removed=[0-9]+ 与 elapsed=[0-9.]+ 均命中"
+            ],
+            "acceptance": [
+              "slow.log 落盘且两个 grep 均命中"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E08Q2】time python3 tmpPlan/agent-test/slow.py 落盘 slow.log,grep 断言 dup_removed=[0-9]+ 与 elapsed=[0-9.]+ 均命中",
+            "steps": [
+              "【E08Q2】time python3 tmpPlan/agent-test/slow.py 落盘 slow.log,grep 断言 dup_removed=[0-9]+ 与 elapsed=[0-9.]+ 均命中"
+            ],
+            "acceptance": [
+              "slow.log 落盘且两个 grep 均命中"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "E08Q1",
+        "E08"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/slow.py",
+            "content": "#!/usr/bin/env python3\n\"\"\"slow.py — 故意低效的 O(n²) 列表去重(性能基线)。\"\"\"\nimport random\nimport string\nimport time\n\nrandom.seed(42)\npool = [\"\".join(random.choices(string.ascii_lowercase, k=10)) for _ in range(4000)]\nwords = [random.choice(pool) for _ in range(50000)]\n\nstart = time.perf_counter()\nresult = []\nfor w in words:\n    if w not in result:  # O(n²) 瓶颈:list 线性成员测试\n        result.append(w)\nelapsed = time.perf_counter() - start\n\nprint(f\"dup_removed={len(words) - len(result)}\")\nprint(f\"elapsed={elapsed:.3f}\")\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "hard",
+        "goal_summary": "编写故意低效的 O(n²) 去重脚本 slow.py 作为性能基线",
+        "purpose": "构造性能基线",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write slow.py:50000 抽样 + list in 循环 O(n²) 去重",
+          "末尾打印 dup_removed= 与 elapsed= 两行"
+        ]
+      },
+      "plan": {
+        "keywords": [
+          "去重脚本 slow.py"
+        ],
+        "summary": "E08Q1 构造性能基线方案(prompt-router 覆写)",
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E08Q1】Write tmpPlan/agent-test/slow.py(random.seed(42) 4000 池抽 50000 + list in O(n²) 去重,末尾打印 dup_removed=/elapsed=)",
+            "steps": [
+              "【E08Q1】Write tmpPlan/agent-test/slow.py(random.seed(42) 4000 池抽 50000 + list in O(n²) 去重,末尾打印 dup_removed=/elapsed=)"
+            ],
+            "acceptance": [
+              "slow.py 落盘且格式正确"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【E08Q1】Write tmpPlan/agent-test/slow.py(random.seed(42) 4000 池抽 50000 + list in O(n²) 去重,末尾打印 dup_removed=/elapsed=)",
+            "steps": [
+              "【E08Q1】Write tmpPlan/agent-test/slow.py(random.seed(42) 4000 池抽 50000 + list in O(n²) 去重,末尾打印 dup_removed=/elapsed=)"
+            ],
+            "acceptance": [
+              "slow.py 落盘且格式正确"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "D09Q4"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "echo -n 'table rows = '; grep -c '^| ' tmpPlan/agent-test/rg_cheatsheet.md; echo -n 'rg mentions = '; grep -cF 'rg ' tmpPlan/agent-test/rg_cheatsheet.md"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "【D09Q4】校验 rg 速查表",
+        "purpose": "校验速查表质量",
+        "intent": "tooling",
+        "decomposition_plan": [
+          "grep 双断言表格行 ≥5 与 rg 示例 ≥4"
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "D09Q3"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/unwraps.log"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/rg_cheatsheet.md",
+            "content": "# rg (ripgrep) 高级用法速查\n\n> 检索对象: `tmpPlan/agent-test/proj/`(a.rs/b.rs/c.rs,含 TODO/FIXME/unwrap 演练埋点)\n\n| 选项 | 用途 | 示例 |\n|------|------|------|\n| `-A/-B/-C <N>` | 显示匹配行后/前/前后 N 行上下文,快速看代码语境 | `rg -C 3 'unwrap' proj/` |\n| `-l` | 仅列出命中文件名,不输出内容,适合清点涉及面 | `rg -l 'TODO' proj/` |\n| `--type rust` | 按语言过滤(等价 `*.rs` glob),免手写 --glob | `rg --type rust 'FIXME' .` |\n| `-w` | 单词边界匹配,避免 error/erroring 子串误命中 | `rg -w 'error' src/` |\n\n## 组合用法\n\n- `rg -w --type rust -C 2 'unwrap'` = rust 文件中单词级匹配并带前后 2 行上下文(本次 D09Q2 统计的加强版)。\n- `rg --type rust -l 'TODO|FIXME'` = 只列出带 TODO/FIXME 的 rust 文件。\n- `--type-list` 可查看全部内置语言类型映射。\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "【D09Q3】写 rg 速查表",
+        "purpose": "编写速查表",
+        "intent": "tooling",
+        "decomposition_plan": [
+          "Read unwraps.log 看命中明细",
+          "Write rg_cheatsheet.md:4 行选项表 + 组合用法小节"
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "D09Q2"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "rg -c 'TODO|FIXME' tmpPlan/agent-test/proj/; echo '--- unwrap counts ---'; rg -c 'unwrap' tmpPlan/agent-test/proj/; rg -n 'unwrap' tmpPlan/agent-test/proj/ > tmpPlan/agent-test/unwraps.log; wc -l tmpPlan/agent-test/unwraps.log"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "【D09Q2】rg 统计 proj 检索",
+        "purpose": "rg 统计检索",
+        "intent": "tooling",
+        "decomposition_plan": [
+          "rg -c 'TODO|FIXME' 应 3 行",
+          "rg -c 'unwrap' 应 ≥1 行",
+          "rg -n 'unwrap' 落盘 unwraps.log 并 wc -l"
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "D09Q1",
+        "D09"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/proj/a.rs",
+            "content": "// a.rs — ripgrep 演练沙盒文件 A\npub fn parse_config(path: &str) -> Option<String> {\n    // TODO: 支持 TOML 与 YAML 双格式\n    let raw = std::fs::read_to_string(path).ok()?;\n    Some(raw.trim().to_string())\n}\n\npub fn boot() {\n    let cfg = parse_config(\"app.toml\").unwrap(); // FIXME: 生产路径应优雅降级\n    let _ = cfg;\n}\n"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/proj/b.rs",
+            "content": "// b.rs — ripgrep 演练沙盒文件 B\nfn checksum(data: &[u8]) -> u32 {\n    // TODO: 换 CRC32 替代累加和\n    data.iter().fold(0u32, |acc, b| acc.wrapping_add(*b as u32))\n}\n\npub fn legacy() {\n    let v: Vec<u32> = vec![1, 2, 3];\n    let first = v.first().unwrap();\n    let _ = first;\n    let last = v.last().unwrap();\n    let _ = last;\n    let _ = checksum(&[1, 2, 3]);\n}\n"
+          }
+        },
+        {
+          "call_no": 3,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/proj/c.rs",
+            "content": "// c.rs — ripgrep 演练沙盒文件 C\npub fn retry(times: u32) {\n    // FIXME: 指数退避还没实现,固定 sleep\n    for _ in 0..times {\n        std::thread::sleep(std::time::Duration::from_millis(100));\n    }\n}\n\npub fn label(tag: &str) -> String {\n    // TODO: 加 i18n 翻译层\n    format!(\"[{tag}]\")\n}\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "【D09Q1】建 proj 三沙盒文件",
+        "purpose": "构造检索沙盒",
+        "intent": "tooling",
+        "decomposition_plan": [
+          "Write proj/a.rs(TODO+FIXME+unwrap 各 1)",
+          "Write proj/b.rs(TODO 1 + unwrap 2)",
+          "Write proj/c.rs(TODO+FIXME,无 unwrap)"
+        ]
+      }
+    }
+  ]
+}
