@@ -344,6 +344,11 @@ def _route_subagent_tool(call_no, prompt_text, default_call):
                 for t in tools:
                     if int(t.get("call_no", 1)) == int(call_no):
                         return t["tool"], json.dumps(t.get("args", {}), ensure_ascii=False)
+                # 第三十七轮规则锁定(跨端合并移植):关键词命中规则后工具查找
+                # 锁定在该规则内;缺当前 call_no 直接落 default_call,不再扫后续
+                # 规则 —— 防泛关键词规则截胡,把别的轮次的工具链错误重放
+                # (实测 D09Q2 第 2/3 次调用被 D09Q1 规则截胡,重放 a.rs 写入)。
+                break
     # 兜底:返回 default_call(Bash echo / 现有 MODES 派生)
     return default_call
 

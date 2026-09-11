@@ -150,7 +150,7 @@
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-10 第二十四轮(D3 对话 Rewind/分支:`src/agent/session_fork.rs` 轮次扫描 + `src/tui/branches.rs` 分支存储 + `/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,三处一致不变量 + 零丢失快照语义,方案 `tmpPlan/2026-09-10_07-D3对话Rewind与分支方案.md`),此前:2026-09-10 第二十三轮(D12 多主题系统 + /theme + LAEW_THEME 环境变量,4 主题:default / dark-contrast / light / daltonized;`src/tui/theme.rs` 保留所有现有 const + 新增 ThemeKind/Palette/4 套 Palette 常量表 + palette()/set_active()/active_kind()/from_env()/from_env_str() API;核心 cell 渲染位置 Cell::blank / engine::border_box / render/diff / render/highlight 改用 palette() 实时跟随主题;`src/tui/{completion,mod}.rs` 新增 /theme builtin + banner 主题提示行 + run_theme dispatch + help 行;单元测试新增 8 项全过;e2e LAEW_THEME=daltonized 启动 banner /theme 列出 4 主题 /theme dark-contrast 实时切换 /theme nope 未知报错;方案 `tmpPlan/2026-09-10_03-D12多主题系统与a11y配色方案.md`),此前:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-11 第三十六轮(QC 强失败信号分级 + 预期负例契约链路修复:`src/agent/quality.rs::gate_report_on_trace` LA-3 text_failure_phrase 降为证据可豁免 + `src/agent/mod.rs` LA-4 last_bash_exit_code 无条件更新 + mock OpenAI 分支 call_no≥2 路由/Plan 路由/终答摘录三补;方案 `tmpPlan/2026-09-11_17-D06-E07-jq分组与生产者消费者测试及预期负例契约修复方案.md`),此前:2026-09-11 第三十七轮(D6-CtrlJ 输入拦截:`src/tui/input.rs` 显式拦截 Char('j')+CONTROL(LF 按键)插空格 + Char(c) 兜底对未绑定 CONTROL 修饰不产生字符;mock hard 档 plan 路由段 + SubAgent 规则锁定 BUG-M5;方案 `tmpPlan/2026-09-11_15-E08-D09编程检索提示词测试与TUI输入CtrlJ拦截方案.md`),此前:2026-09-10 第二十四轮(D3 对话 Rewind/分支:`src/agent/session_fork.rs` 轮次扫描 + `src/tui/branches.rs` 分支存储 + `/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,三处一致不变量 + 零丢失快照语义,方案 `tmpPlan/2026-09-10_07-D3对话Rewind与分支方案.md`),此前:2026-09-10 第二十三轮(D12 多主题系统 + /theme + LAEW_THEME 环境变量,4 主题:default / dark-contrast / light / daltonized;`src/tui/theme.rs` 保留所有现有 const + 新增 ThemeKind/Palette/4 套 Palette 常量表 + palette()/set_active()/active_kind()/from_env()/from_env_str() API;核心 cell 渲染位置 Cell::blank / engine::border_box / render/diff / render/highlight 改用 palette() 实时跟随主题;`src/tui/{completion,mod}.rs` 新增 /theme builtin + banner 主题提示行 + run_theme dispatch + help 行;单元测试新增 8 项全过;e2e LAEW_THEME=daltonized 启动 banner /theme 列出 4 主题 /theme dark-contrast 实时切换 /theme nope 未知报错;方案 `tmpPlan/2026-09-10_03-D12多主题系统与a11y配色方案.md`),此前:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
 
 ---
 
@@ -165,7 +165,7 @@
 | D3 | 对话 Rewind/分支/时间旅行 | 🟡 第 18 轮首次(用户级) + 第 24 轮落地 | 🟡 60%(✅ 2026-09-10 第二十四轮:`/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,内存分支存储上限 10;未做:文件侧恢复/Git checkpoint 联动/消息树持久化/in-place 编辑) | L1400 / L1435+ / L1458+ / L1491-L1497 / L1522-L1527 / L1548+ |
 | D4 | 文件监视与工作区感知 | ❌ 第 18 轮首次(运行时) | ❌ 0% | L1415+ (预留) / L1459+ / L1498-L1499 / L1549+ |
 | D5 | 工具输出富文本内容渲染 | ❌ 第 18 轮首次(内容层) | ❌ 5%(cell-based 纯文本) | L1401-L1402 / L1436-L1445 / L1460+ / L1500-L1506 / L1528-L1530 / L1550+ |
-| D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 55%(✅ 2026-09-10 第二十二轮:bracketed paste + 大粘贴 marker 登记簿 L1573 + 提交展开/10000 字符截断注入 L1448 + 快速输入批量合并;未做多行编辑器/Vim 模式/kill ring) | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
+| D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 55%(✅ 2026-09-10 第二十二轮:bracketed paste + 大粘贴 marker 登记簿 L1573 + 提交展开/10000 字符截断注入 L1448 + 快速输入批量合并;未做多行编辑器/Vim 模式/kill ring;✅ 2026-09-11 第三十七轮补 Ctrl+J/LF 按键拦截与 CONTROL 通用防护) | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
 | D7 | Onboarding/目录信任/主题 | ❌ 第 18 轮首次 | ❌ 10%(1 套 ANSI) | L1406-L1409 / L1451+ / L1462+ / L1507-L1513 / L1540+ / L1552+ |
 | D8 | 会话导出/Statusline/实时成本 | ❌ 第 18 轮首次 | 🟡 25%(✅ 2026-09-10:`/export [path]` Markdown/JSON + TUI 层 transcript + 每轮/累计用量;未做 Statusline/实时成本/脱敏/分享) | L1410-L1414 / L1452-L1455 / L1463+ / L1514-L1515 / L1541-L1545 / **L1564-L1575** |
 | N1-N5 | undici 内容获取底座 | ❌ 第 18 轮首次(WebFetch 底座) | ❌ 0% | **L1576-L1590**(15 个,与 pi D8 冲突后修正) |
@@ -388,3 +388,71 @@ JSONL 落盘,等 Session 持久化)/ in-place 消息编辑(pi 亦无)/ rewind �
 (L1429)/ PDF 轻量引用(L1430)/ nucleo 模糊匹配与 .git/index mtime 唤醒(L1427 完整版)。
 
 **累计**:D1 维度 laew 现状 0% → 70%。
+
+## 十二、第三十七轮登记(2026-09-11,D6-CtrlJ 输入拦截 + mock hard 档 plan 路由)
+
+**主题**:E08(hard)/D09(simple)提示词多轮 TUI 测试发现并修复两类问题:
+① TUI 输入 Ctrl+J/LF 按键污染(原始模式 LF(0x0A) 被 crossterm 解析为
+Char('j')+CONTROL,落入 Char(c) 兜底把字母 j 插入输入缓冲——tmux send-keys
+多行输入/无 bracketed paste 旧终端逐键粘贴/用户按 Ctrl+J 均触发,「slow.py:\n用」
+回显成「slow.py:j用」);② mock prompt-router 无法编程 hard 档任务(laew hard 档
+WorkFlow 唯一来源是 Plan Agent markdown,Main-Work 不发 LLM 请求 → mainwork 段
+永不生效)。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| D6-CtrlJ | 终端 LF/Ctrl+J 按键被当普通字符插入(控制字节→Char(letter)+CONTROL 家族残留) | P1 | ✅ | `src/tui/input.rs`(显式拦截 Char('j')+CONTROL → 插空格,与 PasteInsert::Inline 单行归一语义对齐;Char(c) 兜底对未绑定 CONTROL 修饰一律不产生字符,readline 语义,防 Ctrl-T/Ctrl-N 等同类) | 2026-09-11 第三十七轮 |
+| mock-plan-router | mock 无法编程 hard 档 WorkFlow(prompt-router mainwork 段只挂 Main-Work 角色,hard 档不触发) | P1(测试基建) | ✅ | `scripts/mock_llm_server.py::_route_plan_markdown`(规则可选 "plan" 段:独立 keywords 取 yolo goal_summary 特征词 + workflows;role=plan 按语料路由生成 PLAN_MARKDOWN 同构 markdown) | 2026-09-11 第三十七轮 |
+| BUG-M5 | mock SubAgent 路由规则穿透(命中规则缺当前 call_no 时继续扫后续规则,被泛关键词规则截胡重放别的轮次工具链) | P1(测试基建) | ✅ | `scripts/mock_llm_server.py::_route_subagent_tool`(关键词命中即锁定规则,规则内无该 call_no 直接落 default_call) | 2026-09-11 第三十七轮 |
+
+**设计要点**:
+- Ctrl+J 归一为空格而非换行/提交:与既有小粘贴「\n/\t → 空格(单行输入语义)」一致;
+  多行编辑器是 D6 未做项,不在本轮扩大范围。
+- plan 段 keywords 必须取 yolo goal_summary 特征词:Plan 上下文只有 Yolo 摘要,
+  不含用户原始 prompt(与 SubAgent 路由语料不同,不能用轮次 token)。
+- simple 档 TUI 横幅锚点约定:wf 名 = goal_summary 截 20 字符,路由表需把轮次
+  token 前置写进 goal_summary(≤20 字符)。
+- 本机测试环境:rg 真实二进制不在 PATH(仅 Claude Code shell 函数伪装),已把
+  vscode-server 自带 ripgrep 链接到 ~/.local/bin/rg;laew Bash 工具 `bash -lc`
+  行为正确(command not found 报错清晰)。
+
+**验证**:E08 4 轮(SPEEDUP_OK slow=1.228 fast=0.002)+ D09 4 轮(rg 统计 3 行/
+unwraps.log 3 行/table rows=5/rg mentions=7)TUI 全过;cargo test 745 全过;
+8 轮多行提示词回显零 j 污染。
+
+**方案**:`tmpPlan/2026-09-11_15-E08-D09编程检索提示词测试与TUI输入CtrlJ拦截方案.md`
+
+## 十三、第三十六轮登记(2026-09-11,QC 强失败信号分级 + 预期负例契约链路修复)
+
+**主题**:D06(medium)/E07(hard)提示词多轮 TUI 测试(macOS/openai mock,管道多轮 +
+`-debug`)发现并修复三类问题:① QC trace 证据门的 `text_failure_phrase` 强信号被
+终答内嵌的「工具输出摘录」误触发(引用日志 ≠ 模型声称失败),预期负例轮被 3 轮回流
+拒绝;② `last_bash_exit_code` 仅在非零时写入,成功命令永远无法复位 → 699a677 引入的
+预期负例契约(`bash_exit_nonzero>0 && last_exit==0`)在真实 Agent 循环永不可达成
+(单测手工置 0 才通过,端到端从未验证);③ mock OpenAI 分支缺失 call_no≥2 路由分发
+(与 Anthropic 分支不对称,OpenAI 协议多步工具链不可模拟)+ Plan 角色不支持路由覆写
+(hard 档链路完全失控,四轮假通过:产物零落盘但 QC 全 ✅)。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| LA-3 | text_failure_phrase 被终答引用的工具日志(如 `AssertionError:` 小写含 `error:`)误触发为强失败信号,预期负例无法通过 | P1 | ✅ | `src/agent/quality.rs::gate_report_on_trace`(强失败信号分级:early_terminate/high_error_rate 保持无条件强拒绝;text_failure_phrase 降为"证据可豁免"——QC 非空 evidence 或 EXPECTED_NEGATIVE_OK 契约佐一即可放行;纯措辞无佐证仍 fail;新增 4 单测) | 2026-09-11 第三十六轮 |
+| LA-4 | last_bash_exit_code 只记非零,后续成功命令无法复位,预期负例契约(last_exit==0)真实链路永假 | P1 | ✅ | `src/agent/mod.rs`(Bash 工具输出解析退出码后无条件更新,含 0;`bash_exit_nonzero_count` 仍只累计非零;extrace.rs 字段文档同步) | 2026-09-11 第三十六轮 |
+| mock-openai-router | mock OpenAI 分支 call_no≥2 不查 PROMPT_ROUTER,多步工具链(Write→Write/Read→Write)在 openai provider 下不可模拟 | P0(测试基建) | ✅ | `scripts/mock_llm_server.py::build_openai_stream`(补齐与 build_anthropic_stream 同构的 `_route_subagent_tool` 分发;未命中保持纯文本终答,默认行为不变) | 2026-09-11 第三十六轮 |
+| mock-tool-excerpt-oai | `_extract_last_tool_result` 只解析 Anthropic tool_result 块,OpenAI wire(role="tool")终答永不带工具输出摘录 | P2(测试基建) | ✅ | `scripts/mock_llm_server.py::_extract_last_tool_result`(补 role="tool" 分支) | 2026-09-11 第三十六轮 |
+| mock-plan-router-36 | mock Plan 角色恒返回默认方案,hard 档(Yolo→Plan→Main-Work)mainwork 覆写永不生效(与第三十七轮 mock-plan-router 同题独立实现,合并后共存) | P0(测试基建) | ✅ | `scripts/mock_llm_server.py::_route_plan_markdown`(规则可选 "plan" 段与 mainwork 同构;hard 档规则的 goal_summary 需植入轮次关键词——Plan 上下文只有 Yolo 摘要) | 2026-09-11 第三十六轮 |
+
+**设计要点**:
+- QC fail-closed 语义不回退:D01Q4 类负例(bash 非零 + last_exit=1 + 无 evidence)
+  仍 3 轮回流失败收口;LA-3 只放宽文本启发式信号且需佐证。
+- 预期负例契约标准形态:复现命令**重定向落盘**(不用 `\| tee`,管道掩盖非零退出),
+  断言命令 exit 0 并输出 EXPECTED_NEGATIVE_OK。
+- 断言命令防"空转通过":文件存在性前置(`test -f`)+ `set -o pipefail` +
+  序列字符串等值断言(diff 两个同错输出会判等,exit 0 假阳性)。
+- mock 默认行为不变:三处修复均只在 PROMPT_ROUTER 规则显式配置时生效
+  (run_e2e.sh 120 用例全过佐证)。
+
+**验证**:D06 4 轮(jq -c 提取/group_by 3 行/reduce 等价 diff/n 序列 "1,1,3")+
+E07 4 轮(-debug,预期负例契约达成 + processed=100)TUI 全过;cargo test 751 全过
+(含新增 4 个 gate 单测);run_e2e.sh PASS=120 FAIL=0。
+
+**方案**:`tmpPlan/2026-09-11_17-D06-E07-jq分组与生产者消费者测试及预期负例契约修复方案.md`
