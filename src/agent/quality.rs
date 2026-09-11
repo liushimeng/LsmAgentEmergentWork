@@ -105,7 +105,7 @@ impl QualityRunner {
              \n\
              请基于「本单元职责 + 期望输出 + 实际输出 + 执行轨迹」判定本单元是否完成,**不要用整体目标苛求本单元**\
              (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
-             判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。",
+             判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase / bash_exit_nonzero 信号,通常应判 Fail 并把对应信号写入 issues。",
         );
         self.run_check(prompt, AgentRole::SubAgent, actual_output, session_id).await
     }

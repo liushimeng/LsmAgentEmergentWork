@@ -445,6 +445,17 @@ impl Agent {
                         return Err(AgentError::Cancelled);
                     }
                 };
+                // 2026-09-11 第三十六轮 LA-2:无论工具返回成功与否,
+                // bash 工具的输出文本都含 `<exit_code>N</exit_code>`,
+                // 即使工具返回 Ok(exit_code=1)也累计 trace 失败信号,
+                // 让 QC 看到工具层真实失败证据(典型场景:python3 抛 RuntimeError)。
+                if name == "Bash" {
+                    let code = crate::agent::extrace::extract_bash_exit_code(&output);
+                    if code > 0 {
+                        trace.bash_exit_nonzero_count += 1;
+                        trace.last_bash_exit_code = code;
+                    }
+                }
                 if is_error {
                     trace.tool_calls_err += 1;
                     // 失败键:工具名 + 稳定 JSON(对象按 key 排序后序列化)

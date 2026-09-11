@@ -87,7 +87,7 @@
           "call_no": 1,
           "tool": "Bash",
           "args": {
-            "command": "echo 'REVIEW count =' && grep -c 'REVIEW:' tmpPlan/agent-test/review_me.py && echo 'hardcoded password hits =' && grep -cE 'DB_PASSWORD|admin123' tmpPlan/agent-test/review_me.py"
+            "command": "echo 'REVIEW count =' && grep -c 'REVIEW:' tmpPlan/agent-test/review_me.py && echo 'hardcoded password hits =' && grep -cE 'DB_PASSWORD|admin123' tmpPlan/agent-test/review_me.py; true"
           }
         }
       ],
@@ -160,7 +160,7 @@
           "call_no": 1,
           "tool": "Bash",
           "args": {
-            "command": "DB_PASSWORD=test_pass_123 python3 tmpPlan/agent-test/secure.py 2>&1 | tee tmpPlan/agent-test/secure.log; echo '--- summary ---'; echo 'blocked hits =' && grep -cF 'blocked_by_whitelist' tmpPlan/agent-test/secure.log; echo 'VULN leftover =' && grep -cF 'VULN:' tmpPlan/agent-test/secure.log"
+            "command": "DB_PASSWORD=test_pass_123 python3 tmpPlan/agent-test/secure.py 2>&1 | tee tmpPlan/agent-test/secure.log; echo '--- summary ---'; echo 'blocked hits =' && grep -cF 'blocked_by_whitelist' tmpPlan/agent-test/secure.log; echo 'VULN leftover =' && (grep -cF 'VULN:' tmpPlan/agent-test/secure.log || echo 0); true"
           }
         }
       ],

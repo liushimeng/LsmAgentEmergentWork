@@ -56,6 +56,22 @@ pub struct ExecutionTrace {
     pub artifacts: Vec<String>,
     /// 失败模式标签(供 Agent-Memory 索引 / Yolo 失败回流引用)
     pub failure_signals: Vec<String>,
+    /// bash 命令返回非零退出码的累计次数(2026-09-11 第三十六轮 LA-2)。
+    ///
+    /// 仅 bash 工具的输出文本含 `<exit_code>N</exit_code>` 且 N != 0 时累计;
+    /// 0 表示整个单元没有任何 bash 命令失败。
+    /// 弱信号:不进入 `is_failed()`,但写入 trace 供 QC 看到真实执行证据。
+    #[serde(default)]
+    pub bash_exit_nonzero_count: usize,
+    /// 最近一次 bash 命令的退出码(2026-09-11 第三十六轮 LA-2)。
+    ///
+    /// 仅 bash 工具的输出文本含 `<exit_code>N</exit_code>` 时更新;-1 表示无记录。
+    #[serde(default = "default_last_bash_exit_code")]
+    pub last_bash_exit_code: i32,
+}
+
+fn default_last_bash_exit_code() -> i32 {
+    -1
 }
 
 impl ExecutionTrace {
@@ -109,6 +125,16 @@ impl ExecutionTrace {
             signals.push("text_failure_phrase".into());
         }
 
+        // 4.5) bash 退出码非零信号(2026-09-11 第三十六轮 LA-2)
+        // 弱信号:不进入 `is_failed()`,但让 QC 看见工具层真实失败证据
+        // (典型场景:`python3 script.py` 抛 RuntimeError,exit_code=1)。
+        if self.bash_exit_nonzero_count > 0 {
+            signals.push(format!(
+                "bash_exit_nonzero:{}x",
+                self.bash_exit_nonzero_count
+            ));
+        }
+
         // 5) 没有命中任何失败信号时记 "ok" 占位,便于下游聚合
         if signals.is_empty() {
             signals.push("ok".into());
@@ -130,7 +156,7 @@ impl ExecutionTrace {
         let base = format!(
             "- iterations={} tool_calls={}(ok={},err={}) max_consec={}\n\
              - early_terminated={} truncation_resumes={} overflow_recoveries={}\n\
-             - output_bytes={}\n\
+             - output_bytes={} bash_exit_nonzero={} last_exit={}\n\
              - failure_signals=[{}]",
             self.iterations,
             self.tool_calls,
@@ -141,6 +167,8 @@ impl ExecutionTrace {
             self.truncation_resumes,
             self.overflow_recoveries,
             self.output_bytes,
+            self.bash_exit_nonzero_count,
+            self.last_bash_exit_code,
             self.failure_signals.join(","),
         );
         if self.artifacts.is_empty() {
@@ -151,9 +179,26 @@ impl ExecutionTrace {
     }
 }
 
-/// 提取 `subagent::looks_like_failure` 的核心文本判断,
-/// 供 `ExecutionTrace::collect_failure_signals` 复用(避免循环依赖)。
+/// 从 bash 工具输出文本里提取最近一个 `<exit_code>N</exit_code>` 的退出码。
 ///
+/// 找不到或解析失败返回 -1(表示「无 bash 执行」)。由 orchestrator 在每次
+/// bash 工具调用后调用,把退出码写回 trace。
+///
+/// 设计(2026-09-11 第三十六轮 LA-2):BashTool 输出文本末尾固定有
+/// `<exit_code>{code}</exit_code>`(bash.rs:168),扫描最后一段即可。
+pub fn extract_bash_exit_code(output: &str) -> i32 {
+    const TAG: &str = "<exit_code>";
+    const TAG_END: &str = "</exit_code>";
+    if let Some(end_pos) = output.rfind(TAG_END) {
+        let prefix = &output[..end_pos];
+        if let Some(start_pos) = prefix.rfind(TAG) {
+            let body = &prefix[start_pos + TAG.len()..];
+            return body.trim().parse::<i32>().unwrap_or(-1);
+        }
+    }
+    -1
+}
+
 /// 保留 2026-09-08 第 02 轮的中英双语 + 大小写不敏感 + 前缀空白容忍语义。
 fn looks_like_failure_text(text: &str) -> bool {
     let t = text.trim();
@@ -494,5 +539,82 @@ mod tests {
         let v = serde_json::json!({"iterations":1,"tool_calls":0,"tool_calls_ok":0,"tool_calls_err":0,"max_consecutive_failures":0,"early_terminated":false,"early_terminate_reason":"","truncation_resumes":0,"overflow_recoveries":0,"max_tokens_upscalings":0,"max_tokens_history":[],"structured_emits":0,"output_bytes":10,"failure_signals":["ok"]});
         let t: ExecutionTrace = serde_json::from_value(v).unwrap();
         assert!(t.artifacts.is_empty());
+    }
+
+    // ========== LA-2 bash exit_code 追踪(2026-09-11 第三十六轮) ==========
+
+    #[test]
+    fn bash_exit_nonzero_is_weak_signal() {
+        // bash 返回 exit_code=1 时:产出弱信号 bash_exit_nonzero:1x,不进 is_failed
+        let mut t = ExecutionTrace::default();
+        t.bash_exit_nonzero_count = 1;
+        t.last_bash_exit_code = 1;
+        t.collect_failure_signals("ok");
+        assert!(t
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("bash_exit_nonzero:")));
+        assert!(!t.is_failed(), "bash 退出码非零是弱信号,不应阻断 is_failed");
+    }
+
+    #[test]
+    fn bash_exit_nonzero_accumulates() {
+        // 多次 bash 失败累加 + 最近一次退出码更新
+        let mut t = ExecutionTrace::default();
+        t.bash_exit_nonzero_count = 3;
+        t.last_bash_exit_code = 127;
+        t.collect_failure_signals("ok");
+        let sig = t
+            .failure_signals
+            .iter()
+            .find(|s| s.starts_with("bash_exit_nonzero:"))
+            .unwrap();
+        assert_eq!(sig, "bash_exit_nonzero:3x");
+    }
+
+    #[test]
+    fn render_prompt_surfaces_bash_exit() {
+        // QC prompt 必须能看到 bash_exit_nonzero + last_exit,作为真实执行证据
+        let mut t = ExecutionTrace::default();
+        t.bash_exit_nonzero_count = 2;
+        t.last_bash_exit_code = 2;
+        t.collect_failure_signals("ok");
+        let s = t.render_prompt();
+        assert!(s.contains("bash_exit_nonzero=2"), "实际: {s}");
+        assert!(s.contains("last_exit=2"), "实际: {s}");
+    }
+
+    #[test]
+    fn bash_serde_default_compatible() {
+        // 旧格式 JSON(无 bash_exit_nonzero_count 字段)反序列化应成功
+        let v = serde_json::json!({"iterations":1,"tool_calls":0,"tool_calls_ok":0,"tool_calls_err":0,"max_consecutive_failures":0,"early_terminated":false,"early_terminate_reason":"","truncation_resumes":0,"overflow_recoveries":0,"max_tokens_upscalings":0,"max_tokens_history":[],"structured_emits":0,"output_bytes":10,"failure_signals":["ok"]});
+        let t: ExecutionTrace = serde_json::from_value(v).unwrap();
+        assert_eq!(t.bash_exit_nonzero_count, 0);
+        assert_eq!(t.last_bash_exit_code, -1);
+    }
+
+    // ========== extract_bash_exit_code(LA-2) ==========
+
+    #[test]
+    fn extract_bash_exit_code_basic() {
+        // 正常情况:末尾 <exit_code>0</exit_code>
+        let s = "<stdout>\nhello\n\n<exit_code>0</exit_code>";
+        assert_eq!(extract_bash_exit_code(s), 0);
+        let s2 = "<stdout>\nRuntimeError...\n\n<exit_code>1</exit_code>";
+        assert_eq!(extract_bash_exit_code(s2), 1);
+    }
+
+    #[test]
+    fn extract_bash_exit_code_missing() {
+        // 无标记 → -1
+        assert_eq!(extract_bash_exit_code("plain output"), -1);
+        assert_eq!(extract_bash_exit_code(""), -1);
+    }
+
+    #[test]
+    fn extract_bash_exit_code_picks_last() {
+        // 多个 exit_code(异常情况,如脚本打印了 literal 文本)→ 取最后一个
+        let s = "<exit_code>0</exit_code>\n中间出现 <exit_code>2</exit_code> 但这是字面量\n<exit_code>3</exit_code>";
+        assert_eq!(extract_bash_exit_code(s), 3);
     }
 }
