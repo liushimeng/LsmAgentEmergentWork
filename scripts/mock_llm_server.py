@@ -694,16 +694,28 @@ def _route_plan_markdown(corpus):
     工具 —— hard 档在 prompt router 下完全失控(实测 E07 四轮假通过)。
     修复:规则可选 `"plan": {"workflows": [...]}`(与 mainwork 同构)覆写方案;
     未配置时保持默认 PLAN_MARKDOWN,行为不变。
+
+    第四十轮修复(2026-09-11):Plan 阶段 corpus 是 Yolo 合成任务,不含用户原始
+    输入的轮次关键词(如 E08Q1),因此 `rule["keywords"]` 永远不命中 → Plan
+    恒返回默认 → hard 档链路 SubAgent 路由全部失效。修复:Plan 路由优先用
+    `rule["plan"]["keywords"]`(若存在),回退到 `rule["keywords"]`。同时:
+    命中 keywords 但 `rule["plan"]` 不存在(简单档规则如 D09Q*)时,continue
+    扫描后续规则,不再 break —— 避免前序规则抢先打断硬档规则命中。
     """
     if PROMPT_ROUTER:
         for rule in PROMPT_ROUTER.get("rules", []) or []:
-            keywords = rule.get("keywords", []) or []
+            keywords = (
+                (rule.get("plan") or {}).get("keywords")
+                or rule.get("keywords", [])
+                or []
+            )
             if any(kw in corpus for kw in keywords):
                 override = rule.get("plan")
                 if override and override.get("workflows"):
                     payload = json.dumps(override, ensure_ascii=False)
                     return "# 方案\n\n```json\n" + payload + "\n```\n"
-                break
+                # 命中 keywords 但无 plan 字段(简单档规则),继续扫描后续规则
+                continue
     return PLAN_MARKDOWN
 
 
