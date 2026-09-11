@@ -74,13 +74,13 @@
   4. Bash：`python3 tmpPlan/agent-test/test_todo.py 2>&1 | tail -1` 应含 "ok"；`kill $(cat tmpPlan/agent-test/todo.pid) 2>/dev/null` 清理。
 
 ### E07 生产者消费者模型
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_07-A02-E07-测试与TUI命令补全Enter吞键Bug修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十六轮 macOS arm64 / laew mock(openai) -debug 4 轮全过:q1 Write 埋 bug 版(1544B) → q2 预期负例契约达成(bash_exit_nonzero=1 + last_exit=0 + EXPECTED_NEGATIVE_OK,E07_Q2_OK) → q3 Read+Write 修复版(1487B) → q4 processed=100 + E07_Q4_OK;同期修复 laew LA-3(text_failure_phrase 降为证据可豁免)/LA-4(last_bash_exit_code 不含 0 时契约永不可达成)与 mock BUG-M7(Plan 角色不支持路由覆写,hard 档链路失控致四轮假通过);详见 tmpPlan/2026-09-11_17-D06-E07-jq分组与生产者消费者测试及预期负例契约修复方案.md）
 - **预期档位**: hard
 - **考察维度**: 多线程/异步编程能力 + 修复闭环
 - **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. Write 生产者消费者 python3 `tmpPlan/agent-test/producer_consumer.py`：用 `queue.Queue(maxsize=5)` 实现 1 生产者+1 消费者，生产者故意埋 bug（`q.put(item, timeout=0.1)` 不捕获 Full），脚本末尾 `assert not error_flag`。
-  2. Bash：`python3 tmpPlan/agent-test/producer_consumer.py 2>&1 | tee tmpPlan/agent-test/pc.log`，断言 `pc.log` 含 "queue.Full" 或 "producer error"（故意触发 bug，确认捕获）。
+  1. Write 生产者消费者 python3 `tmpPlan/agent-test/producer_consumer.py`：用 `queue.Queue(maxsize=5)` 实现 1 生产者+1 消费者，生产者故意埋 bug（`q.put(item, timeout=0.01)` 在队列满时走错误路径不重试；注意 timeout 必须短于消费者周期，如消费 `time.sleep(0.02)`，否则 put 会等到空位永不触发 Full），脚本末尾 `assert not error_flag`。
+  2. Bash：`python3 tmpPlan/agent-test/producer_consumer.py > tmpPlan/agent-test/pc.log 2>&1`（重定向落盘，**不用 `| tee`**——管道会掩盖非零退出码）；再断言 `grep -Eq 'queue\.Full|producer error' tmpPlan/agent-test/pc.log && echo E07_Q2_OK && echo EXPECTED_NEGATIVE_OK`。预期负例契约：复现命令 exit≠0 是"通过条件"，最终断言命令必须 exit 0 并输出 EXPECTED_NEGATIVE_OK（laew trace 证据门据此放行，无需 QC evidence）。
   3. Read pc.log，再 Write 修复版 `tmpPlan/agent-test/producer_consumer_fix.py`：用 `q.put(item, timeout=1)` + 重试/优雅关闭（`None` sentinel），脚本末 `assert processed == produced`。
   4. Bash：`python3 tmpPlan/agent-test/producer_consumer_fix.py 2>&1 | tee tmpPlan/agent-test/pc_fix.log`，断言 `pc_fix.log` 含 "processed=100" 且不含 "Error"（grep -F 'processed=100' 命中）。
 

@@ -217,7 +217,11 @@ impl QualityRunner {
 /// 用不可伪造的执行轨迹约束 Quality-Check 的“通过”结论。
 ///
 /// LLM QC 是语义判断,但不能覆盖进程级事实:
-/// - 强失败信号(`is_failed()`)出现时,pass 一律降级为 fail;
+/// - 进程级硬失败信号(early_terminate / high_error_rate)出现时,pass 一律降级为 fail;
+/// - 文本级软信号(text_failure_phrase)降为“证据可豁免”(2026-09-11 第三十六轮 LA-3):
+///   终答为提升可观测性引用工具输出摘录时,摘录中的 "AssertionError:"/"error:" 等日志
+///   措辞会误触发该信号 —— 引用日志 ≠ 模型自己声称失败。QC 提供非空 evidence 说明
+///   预期性,或预期负例契约确认(EXPECTED_NEGATIVE_OK)任一即可保持 pass;
 /// - Bash 非零退出是弱信号:若 QC 想把它解释为预期负例,必须提供非空 evidence;
 ///   空 evidence 的 pass 视为无效质检,触发回流/失败收口。
 ///
@@ -232,22 +236,34 @@ fn gate_report_on_trace(
         return report;
     }
 
-    let strong_failure = trace.is_failed();
     // 负例测试契约:底层命令非零是“通过条件”,最终断言必须返回零并输出
     // EXPECTED_NEGATIVE_OK。这样避免 QC 模型忘记填 evidence 时,把已经成功验证
     // 的预期负例反复重试;同时仍要求最终验收命令成功,防止用文字口头豁免。
     let expected_negative_confirmed = actual_output.contains("EXPECTED_NEGATIVE_OK")
         && trace.bash_exit_nonzero_count > 0
         && trace.last_bash_exit_code == 0;
+    // 文本软信号单独判定:仅当不存在进程级硬信号时才允许证据豁免
+    let has_text_failure_phrase = trace.failure_signals.iter().any(|s| s == "text_failure_phrase");
+    let has_hard_failure = trace
+        .failure_signals
+        .iter()
+        .any(|s| s.starts_with("early_terminate:") || s.starts_with("high_error_rate:"));
+    let text_phrase_only = has_text_failure_phrase && !has_hard_failure;
+    let hard_strong_failure = trace.is_failed() && !text_phrase_only;
+    let unevidenced_text_phrase = text_phrase_only
+        && report.evidence.trim().is_empty()
+        && !expected_negative_confirmed;
     let unevidenced_bash_failure = trace.bash_exit_nonzero_count > 0
         && report.evidence.trim().is_empty()
         && !expected_negative_confirmed;
-    if !strong_failure && !unevidenced_bash_failure {
+    if !hard_strong_failure && !unevidenced_text_phrase && !unevidenced_bash_failure {
         return report;
     }
 
-    let issue = if strong_failure {
+    let issue = if hard_strong_failure {
         "执行轨迹包含强失败信号,Quality-Check 的 pass 结论被 trace 证据门拒绝".to_string()
+    } else if unevidenced_text_phrase {
+        "终答包含失败措辞(可能引用了工具日志摘录)且 Quality-Check 未提供非空 evidence 说明预期性".to_string()
     } else {
         "Bash 命令非零退出且 Quality-Check 未提供非空 evidence 说明预期性".to_string()
     };
@@ -513,5 +529,79 @@ mod tests {
 
         assert_eq!(gated.verdict, Verdict::Fail);
         assert!(gated.issues[0].contains("Bash 命令非零退出"));
+    }
+
+    #[test]
+    fn trace_gate_allows_text_phrase_with_expected_negative_contract() {
+        // LA-3:终答摘录引用了 AssertionError 日志(误触发 text_failure_phrase),
+        // 但预期负例契约确认(先非零复现 + 最终断言命令 exit=0 + EXPECTED_NEGATIVE_OK)
+        // 应保持 pass,不应反复回流重试。
+        let mut trace = ExecutionTrace::default();
+        trace.bash_exit_nonzero_count = 1;
+        trace.last_bash_exit_code = 0;
+        trace.collect_failure_signals(
+            "MOCK_FINAL_ANSWER: 验证通过。\n\n[工具输出摘录]\nAssertionError: producer error: 有 queue.Full 未处理",
+        );
+        assert!(trace
+            .failure_signals
+            .iter()
+            .any(|s| s == "text_failure_phrase"));
+
+        let output = "AssertionError 摘录\nEXPECTED_NEGATIVE_OK\n<exit_code>0</exit_code>";
+        let gated = gate_report_on_trace(
+            QualityReport::pass(AgentRole::SubAgent),
+            AgentRole::SubAgent,
+            &trace,
+            output,
+        );
+
+        assert_eq!(gated.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn trace_gate_rejects_text_phrase_without_contract_or_evidence() {
+        // LA-3:纯文本失败措辞(无契约确认、无 QC evidence)仍必须拒绝,
+        // 防止模型口头上声称成功、引用失败日志蒙混过关。
+        let mut trace = ExecutionTrace::default();
+        trace.collect_failure_signals("执行失败: 无法完成队列写入");
+
+        let gated = gate_report_on_trace(
+            QualityReport::pass(AgentRole::SubAgent),
+            AgentRole::SubAgent,
+            &trace,
+            "任务完成",
+        );
+
+        assert_eq!(gated.verdict, Verdict::Fail);
+        assert!(gated.issues[0].contains("失败措辞"));
+    }
+
+    #[test]
+    fn trace_gate_allows_text_phrase_with_qc_evidence() {
+        // LA-3:QC 用非空 evidence 说明"该失败措辞来自预期负例日志摘录"→ 放行
+        let mut trace = ExecutionTrace::default();
+        trace.collect_failure_signals("AssertionError: 预期复现摘录");
+
+        let mut report = QualityReport::pass(AgentRole::SubAgent);
+        report.evidence = "终答中的 AssertionError 是负例脚本预期输出,断言已确认捕获".into();
+        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace, "任务完成");
+
+        assert_eq!(gated.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn trace_gate_hard_failure_still_rejects_with_text_phrase_present() {
+        // LA-3:early_terminate 与 text_failure_phrase 并存时按进程级硬信号无条件拒绝
+        let mut trace = ExecutionTrace::default();
+        trace.early_terminated = true;
+        trace.early_terminate_reason = "max_iter:2".into();
+        trace.collect_failure_signals("[MaxIterationsExceeded] 迭代达到 2 次上限未得到最终答案");
+
+        let mut report = QualityReport::pass(AgentRole::SubAgent);
+        report.evidence = "模型解释这是预期情况".into();
+        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace, "任务完成");
+
+        assert_eq!(gated.verdict, Verdict::Fail);
+        assert!(gated.issues[0].contains("强失败信号"));
     }
 }

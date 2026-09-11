@@ -65,7 +65,8 @@ pub struct ExecutionTrace {
     pub bash_exit_nonzero_count: usize,
     /// 最近一次 bash 命令的退出码(2026-09-11 第三十六轮 LA-2)。
     ///
-    /// 仅 bash 工具的输出文本含 `<exit_code>N</exit_code>` 时更新;-1 表示无记录。
+    /// bash 工具的输出文本含 `<exit_code>N</exit_code>` 时无条件更新(含 0,
+    /// LA-4 修复:成功命令也要能复位,预期负例契约才可达成);-1 表示无记录。
     #[serde(default = "default_last_bash_exit_code")]
     pub last_bash_exit_code: i32,
 }

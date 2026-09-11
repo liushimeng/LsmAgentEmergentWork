@@ -1,0 +1,424 @@
+{
+ "rules": [
+  {
+   "keywords": [
+    "D06Q4"
+   ],
+   "tools": [
+    {
+     "call_no": 1,
+     "tool": "Bash",
+     "args": {
+      "command": "set -o pipefail; test -f tmpPlan/agent-test/data.json && test -f tmpPlan/agent-test/group_reduce.jq && diff <(jq -c 'group_by(.color) | map({color: .[0].color, n: length}) | .[]' tmpPlan/agent-test/data.json) <(jq -c -f tmpPlan/agent-test/group_reduce.jq tmpPlan/agent-test/data.json) && echo '--- reduce n 序列 ---' && [ \"$(jq -c -f tmpPlan/agent-test/group_reduce.jq tmpPlan/agent-test/data.json | jq -r '.n' | sort -n | paste -sd, -)\" = '1,1,3' ] && echo D06_Q4_OK"
+     }
+    }
+   ],
+   "yolo": {
+    "task_level": "medium",
+    "goal_summary": "校验 reduce 版 jq 过滤器输出与 group_by 等价且频次序列为 1,1,3",
+    "purpose": "校验分组等价性",
+    "intent": "coding",
+    "decomposition_plan": [
+     "diff 对比 reduce 与 group_by 输出",
+     "提取 n 值序列断言 1,1,3"
+    ],
+    "direct_answer": null,
+    "user_suggestion_if_fail": ""
+   },
+   "mainwork": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【D06Q4】校验 group_reduce.jq 与 group_by 输出等价并输出频次序列 1,1,3",
+      "steps": [
+       "【D06Q4】校验 group_reduce.jq 与 group_by 输出等价并输出频次序列 1,1,3"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   }
+  },
+  {
+   "keywords": [
+    "D06Q3"
+   ],
+   "tools": [
+    {
+     "call_no": 1,
+     "tool": "Read",
+     "args": {
+      "file_path": "tmpPlan/agent-test/data.json"
+     }
+    },
+    {
+     "call_no": 2,
+     "tool": "Write",
+     "args": {
+      "file_path": "tmpPlan/agent-test/group_reduce.jq",
+      "content": "# 用 reduce 改写 group_by 分组:按 color 聚合计数,输出与 group_by 相同的三行\nreduce .[] as $r ({}; .[$r.color] += 1)\n| to_entries\n| map({color: .key, n: .value})\n| sort_by(.color)\n| .[]\n"
+     }
+    }
+   ],
+   "yolo": {
+    "task_level": "medium",
+    "goal_summary": "Read data.json 后用 reduce 改写分组过滤器 group_reduce.jq",
+    "purpose": "编写 reduce 版过滤器",
+    "intent": "coding",
+    "decomposition_plan": [
+     "Read data.json 确认字段",
+     "Write group_reduce.jq 用 reduce 聚合"
+    ],
+    "direct_answer": null,
+    "user_suggestion_if_fail": ""
+   },
+   "mainwork": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【D06Q3】Read data.json 后 Write reduce 版分组过滤器 group_reduce.jq",
+      "steps": [
+       "【D06Q3】Read data.json 后 Write reduce 版分组过滤器 group_reduce.jq"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   }
+  },
+  {
+   "keywords": [
+    "D06Q2"
+   ],
+   "tools": [
+    {
+     "call_no": 1,
+     "tool": "Bash",
+     "args": {
+      "command": "set -o pipefail; echo '--- Q2a content ---' && jq -r '.choices[0].message.content' tmpPlan/agent-test/openai_resp.json && echo '--- Q2b group_by 3 lines ---' && jq -c 'group_by(.color) | map({color: .[0].color, n: length}) | .[]' tmpPlan/agent-test/data.json && [ \"$(jq -c 'group_by(.color) | map({color: .[0].color, n: length}) | .[]' tmpPlan/agent-test/data.json | wc -l | tr -d ' ')\" -eq 3 ] && echo D06_Q2_OK"
+     }
+    }
+   ],
+   "yolo": {
+    "task_level": "medium",
+    "goal_summary": "用 jq 提取 choices[0].message.content 并按 color 分组统计 3 行",
+    "purpose": "jq 提取与分组校验",
+    "intent": "coding",
+    "decomposition_plan": [
+     "jq -r 提取 content 应为 hello",
+     "jq group_by 分组应输出 3 行 compact JSON"
+    ],
+    "direct_answer": null,
+    "user_suggestion_if_fail": ""
+   },
+   "mainwork": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【D06Q2】用 jq 提取 openai_resp.json 的 content 并对 data.json 按 color 分组统计",
+      "steps": [
+       "【D06Q2】用 jq 提取 openai_resp.json 的 content 并对 data.json 按 color 分组统计"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   }
+  },
+  {
+   "keywords": [
+    "D06Q1"
+   ],
+   "tools": [
+    {
+     "call_no": 1,
+     "tool": "Write",
+     "args": {
+      "file_path": "tmpPlan/agent-test/openai_resp.json",
+      "content": "{\n  \"id\": \"chatcmpl-mock01\",\n  \"object\": \"chat.completion\",\n  \"created\": 1757568000,\n  \"model\": \"gpt-mock\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"hello\"\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 10,\n    \"completion_tokens\": 1,\n    \"total_tokens\": 11\n  }\n}"
+     }
+    },
+    {
+     "call_no": 2,
+     "tool": "Write",
+     "args": {
+      "file_path": "tmpPlan/agent-test/data.json",
+      "content": "[\n  {\n    \"id\": 1,\n    \"color\": \"red\",\n    \"score\": 88\n  },\n  {\n    \"id\": 2,\n    \"color\": \"red\",\n    \"score\": 72\n  },\n  {\n    \"id\": 3,\n    \"color\": \"blue\",\n    \"score\": 95\n  },\n  {\n    \"id\": 4,\n    \"color\": \"green\",\n    \"score\": 61\n  },\n  {\n    \"id\": 5,\n    \"color\": \"red\",\n    \"score\": 79\n  }\n]"
+     }
+    }
+   ],
+   "yolo": {
+    "task_level": "medium",
+    "goal_summary": "编写 mock OpenAI 响应 JSON 与 5 条 color 分组数据",
+    "purpose": "编写测试数据文件",
+    "intent": "coding",
+    "decomposition_plan": [
+     "Write openai_resp.json(content=hello)",
+     "Write data.json(red*3/green/blue)"
+    ],
+    "direct_answer": null,
+    "user_suggestion_if_fail": ""
+   },
+   "mainwork": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【D06Q1】Write openai_resp.json 与 data.json 两个 mock 数据文件",
+      "steps": [
+       "【D06Q1】Write openai_resp.json 与 data.json 两个 mock 数据文件"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   }
+  },
+  {
+   "keywords": [
+    "E07Q4"
+   ],
+   "tools": [
+    {
+     "call_no": 1,
+     "tool": "Bash",
+     "args": {
+      "command": "python3 tmpPlan/agent-test/producer_consumer_fix.py 2>&1 | tee tmpPlan/agent-test/pc_fix.log; echo '--- 断言:processed=100 且无 Error ---'; grep -F 'processed=100' tmpPlan/agent-test/pc_fix.log && ! grep -q 'Error' tmpPlan/agent-test/pc_fix.log && echo E07_Q4_OK"
+     }
+    }
+   ],
+   "yolo": {
+    "task_level": "hard",
+    "goal_summary": "【E07Q4】运行修复版生产者消费者并断言 processed=100 且无 Error",
+    "purpose": "运行修复版断言",
+    "intent": "coding",
+    "decomposition_plan": [
+     "运行 producer_consumer_fix.py 落盘 pc_fix.log",
+     "grep 断言 processed=100 与无 Error"
+    ],
+    "direct_answer": null,
+    "user_suggestion_if_fail": ""
+   },
+   "mainwork": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【E07Q4】运行 producer_consumer_fix.py 并断言 processed=100 无 Error",
+      "steps": [
+       "【E07Q4】运行 producer_consumer_fix.py 并断言 processed=100 无 Error"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   },
+   "plan": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【E07Q4】运行 producer_consumer_fix.py 并断言 processed=100 无 Error",
+      "steps": [
+       "【E07Q4】运行 producer_consumer_fix.py 并断言 processed=100 无 Error"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   }
+  },
+  {
+   "keywords": [
+    "E07Q3"
+   ],
+   "tools": [
+    {
+     "call_no": 1,
+     "tool": "Read",
+     "args": {
+      "file_path": "tmpPlan/agent-test/pc.log"
+     }
+    },
+    {
+     "call_no": 2,
+     "tool": "Write",
+     "args": {
+      "file_path": "tmpPlan/agent-test/producer_consumer_fix.py",
+      "content": "#!/usr/bin/env python3\n\"\"\"E07 生产者消费者模型(修复版)。\n\n修复点(对照 producer_consumer.py 的 3 处 TODO):\n1. put 超时 10ms → 1s,并在 queue.Full 时带退避重试(上限 5 次);\n2. 优雅关闭:生产者结束后放入 None sentinel,消费者收到即退出,不靠 join 猜;\n3. 结尾断言 processed == produced,保证不丢不重。\n\"\"\"\nimport queue\nimport threading\nimport time\n\nq = queue.Queue(maxsize=5)\nproduced = 0\nprocessed = 0\nlock = threading.Lock()\n\n\ndef producer():\n    global produced\n    for i in range(1, 101):\n        for attempt in range(5):  # 修复 1:Full 时重试(带退避)\n            try:\n                q.put(i, timeout=1)\n                break\n            except queue.Full:\n                if attempt == 4:\n                    raise\n                time.sleep(0.05 * (attempt + 1))\n        with lock:\n            produced += 1\n    q.put(None)  # 修复 2:sentinel 优雅关闭\n\n\ndef consumer():\n    global processed\n    while True:\n        item = q.get()\n        if item is None:\n            q.task_done()\n            break\n        time.sleep(0.001)\n        with lock:\n            processed += 1\n        q.task_done()\n\n\nif __name__ == \"__main__\":\n    t_p = threading.Thread(target=producer)\n    t_c = threading.Thread(target=consumer)\n    t_c.start()\n    t_p.start()\n    t_p.join()\n    t_c.join()\n    print(f\"produced={produced} processed={processed}\")\n    assert processed == produced, \"丢消息\"\n    print(\"processed=100 all_ok\")\n"
+     }
+    }
+   ],
+   "yolo": {
+    "task_level": "hard",
+    "goal_summary": "【E07Q3】Read pc.log 后 Write 修复版生产者消费者(sentinel 优雅关闭)",
+    "purpose": "修复并发缺陷",
+    "intent": "coding",
+    "decomposition_plan": [
+     "Read pc.log 分析 queue.Full 根因",
+     "Write producer_consumer_fix.py 修复"
+    ],
+    "direct_answer": null,
+    "user_suggestion_if_fail": ""
+   },
+   "mainwork": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【E07Q3】Read pc.log 定位根因后 Write producer_consumer_fix.py 修复版",
+      "steps": [
+       "【E07Q3】Read pc.log 定位根因后 Write producer_consumer_fix.py 修复版"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   },
+   "plan": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【E07Q3】Read pc.log 定位根因后 Write producer_consumer_fix.py 修复版",
+      "steps": [
+       "【E07Q3】Read pc.log 定位根因后 Write producer_consumer_fix.py 修复版"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   }
+  },
+  {
+   "keywords": [
+    "E07Q2"
+   ],
+   "tools": [
+    {
+     "call_no": 1,
+     "tool": "Bash",
+     "args": {
+      "command": "python3 tmpPlan/agent-test/producer_consumer.py > tmpPlan/agent-test/pc.log 2>&1"
+     }
+    },
+    {
+     "call_no": 2,
+     "tool": "Bash",
+     "args": {
+      "command": "echo '--- 断言:预期捕获 queue.Full ---' && grep -Eq 'queue\\.Full|producer error' tmpPlan/agent-test/pc.log && echo E07_Q2_OK && echo EXPECTED_NEGATIVE_OK"
+     }
+    }
+   ],
+   "yolo": {
+    "task_level": "hard",
+    "goal_summary": "【E07Q2】运行埋 bug 版生产者消费者并确认捕获 queue.Full",
+    "purpose": "运行复现并发缺陷",
+    "intent": "coding",
+    "decomposition_plan": [
+     "运行 producer_consumer.py 复现 queue.Full(exit 非零是预期)",
+     "grep 断言日志捕获负例并输出 EXPECTED_NEGATIVE_OK"
+    ],
+    "direct_answer": null,
+    "user_suggestion_if_fail": ""
+   },
+   "mainwork": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【E07Q2】运行 producer_consumer.py 复现 queue.Full 并落盘 pc.log",
+      "steps": [
+       "【E07Q2】运行 producer_consumer.py 复现 queue.Full 并落盘 pc.log"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   },
+   "plan": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【E07Q2】运行 producer_consumer.py 复现 queue.Full 并落盘 pc.log",
+      "steps": [
+       "【E07Q2】运行 producer_consumer.py 复现 queue.Full 并落盘 pc.log"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   }
+  },
+  {
+   "keywords": [
+    "E07Q1"
+   ],
+   "tools": [
+    {
+     "call_no": 1,
+     "tool": "Write",
+     "args": {
+      "file_path": "tmpPlan/agent-test/producer_consumer.py",
+      "content": "#!/usr/bin/env python3\n\"\"\"E07 生产者消费者模型(故意埋 bug 版)。\n\n1 个生产者 + 1 个消费者,queue.Queue(maxsize=5)。\nTODO 标记处为故意埋的 bug:q.put(timeout=0.1) 在队列满时抛 queue.Full,\n错误路径只是置 error_flag 不重试,导致丢生产记录;脚本末尾 assert 会失败。\n\"\"\"\nimport queue\nimport threading\nimport time\n\nq = queue.Queue(maxsize=5)\nerror_flag = False\nproduced = 0\nprocessed = 0\nlock = threading.Lock()\n\n\ndef producer():\n    global error_flag, produced\n    for i in range(1, 101):\n        try:\n            # TODO: 故意埋 bug — timeout=10ms 短于消费周期 20ms,队列满即抛 queue.Full 且不重试\n            q.put(i, timeout=0.01)\n            with lock:\n                produced += 1\n        except queue.Full:\n            # TODO: 故意埋 bug — 捕获后只置标志不重试,该条数据丢失\n            error_flag = True\n            print(\"producer error: queue.Full at item\", i, flush=True)\n            break\n\n\ndef consumer():\n    global processed\n    while True:\n        item = q.get()\n        time.sleep(0.02)  # 模拟慢消费(20ms/条)\n        with lock:\n            processed += 1\n        q.task_done()\n\n\nif __name__ == \"__main__\":\n    t_p = threading.Thread(target=producer, daemon=True)\n    t_c = threading.Thread(target=consumer, daemon=True)\n    t_c.start()\n    t_p.start()\n    t_p.join(timeout=5)\n    q.join()  # 排空剩余\n    print(f\"produced={produced} processed={processed}\")\n    assert not error_flag, \"producer error: 有 queue.Full 未处理\"\n"
+     }
+    }
+   ],
+   "yolo": {
+    "task_level": "hard",
+    "goal_summary": "【E07Q1】编写故意埋 bug 的生产者消费者模型(put 不捕获 Full)",
+    "purpose": "编写并发模型埋 bug 版",
+    "intent": "coding",
+    "decomposition_plan": [
+     "Write producer_consumer.py(1 生产者+1 消费者,埋 3 处 TODO bug)"
+    ],
+    "direct_answer": null,
+    "user_suggestion_if_fail": ""
+   },
+   "mainwork": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【E07Q1】Write 埋 bug 版 producer_consumer.py 生产者消费者模型",
+      "steps": [
+       "【E07Q1】Write 埋 bug 版 producer_consumer.py 生产者消费者模型"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   },
+   "plan": {
+    "workflows": [
+     {
+      "id": "wf-1",
+      "name": "【E07Q1】Write 埋 bug 版 producer_consumer.py 生产者消费者模型",
+      "steps": [
+       "【E07Q1】Write 埋 bug 版 producer_consumer.py 生产者消费者模型"
+      ],
+      "acceptance": [
+       "产物落盘且断言通过"
+      ],
+      "delegate_to": "subagent"
+     }
+    ]
+   }
+  }
+ ]
+}

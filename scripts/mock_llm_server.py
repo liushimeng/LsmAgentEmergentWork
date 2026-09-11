@@ -240,6 +240,16 @@ def _extract_last_tool_result(body, limit=600):
     """
     msgs = body.get("messages", []) or []
     for m in reversed(msgs):
+        # OpenAI wire 工具结果是 role="tool" 消息(2026-09-11 第三十六轮 BUG-M6:
+        # 此前只解析 Anthropic tool_result 块,OpenAI 协议下终答永不附带工具输出摘录)
+        if m.get("role") == "tool":
+            rc = m.get("content", "")
+            if not isinstance(rc, str):
+                rc = str(rc)
+            rc = rc.strip()
+            if len(rc) > limit:
+                rc = rc[:limit] + "…(截断)"
+            return rc
         if m.get("role") != "user":
             continue
         content = m.get("content", "")
@@ -670,6 +680,28 @@ COMPACT_SUMMARY_TEXT = (
 PLAN_MARKDOWN = "# 方案\n\n```json\n" + MAIN_WORK_PLAN_JSON + "\n```\n"
 
 
+def _route_plan_markdown(corpus):
+    """按 PROMPT_ROUTER 规则覆写 Plan Markdown(2026-09-11 第三十六轮 BUG-M7)。
+
+    hard 档链路 Yolo → Plan → Main-Work 中,Plan 的输入是 Yolo 的 goal_summary
+    合成任务,不含用户原始输入的轮次关键词;若 Plan 恒返回默认 PLAN_MARKDOWN,
+    Main-Work 将按默认方案(执行验证/echo)拆解,SubAgent 路由全部失配回落默认
+    工具 —— hard 档在 prompt router 下完全失控(实测 E07 四轮假通过)。
+    修复:规则可选 `"plan": {"workflows": [...]}`(与 mainwork 同构)覆写方案;
+    未配置时保持默认 PLAN_MARKDOWN,行为不变。
+    """
+    if PROMPT_ROUTER:
+        for rule in PROMPT_ROUTER.get("rules", []) or []:
+            keywords = rule.get("keywords", []) or []
+            if any(kw in corpus for kw in keywords):
+                override = rule.get("plan")
+                if override and override.get("workflows"):
+                    payload = json.dumps(override, ensure_ascii=False)
+                    return "# 方案\n\n```json\n" + payload + "\n```\n"
+                break
+    return PLAN_MARKDOWN
+
+
 def detect_role(body, key):
     """按系统提示词中的 Agent 名识别角色(与 src/agent/system_prompt 各 BASE_PROMPT 对应)。
 
@@ -1013,7 +1045,73 @@ def build_openai_stream(call_no, prompt_text="", tool_snippet=""):
             "usage": {"prompt_tokens": 17, "completion_tokens": 25, "total_tokens": 42, "prompt_tokens_details": {"cached_tokens": 0}},
         }
     else:
-        # 第 2 次:返回纯文本
+        # 第 N 次 (N >= 2):
+        # 若 PROMPT_ROUTER 命中第 N 个工具,返回 tool_use(2026-09-11 第三十六轮
+        # 修复:与 build_anthropic_stream 对齐;此前 OpenAI 分支缺失此路由,
+        # 多步工具链(Write→Write→…)在 OpenAI 协议 mock 下第二步起直接回终答,
+        # 导致 D06Q1 第二个 Write 永不执行、后续轮次连锁失败);
+        # 否则回退纯文本 end_turn,保持原行为。
+        routed = _route_subagent_tool(call_no, prompt_text, None)
+        if routed is not None:
+            tool_name, tool_args = routed
+            chunks = [
+                {
+                    "id": f"chatcmpl-mock-{call_no}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": "mock-openai",
+                    "choices": [
+                        {"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}
+                    ],
+                },
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": f"call_mock_{call_no}",
+                                        "type": "function",
+                                        "function": {"name": tool_name, "arguments": ""},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {"arguments": tool_args},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+                    ]
+                },
+            ]
+            terminal = {
+                "id": f"chatcmpl-mock-{call_no}",
+                "object": "chat.completion.chunk",
+                "choices": [],
+                "usage": {"prompt_tokens": 60, "completion_tokens": 20, "total_tokens": 80, "prompt_tokens_details": {"cached_tokens": 0}},
+            }
+            return make_openai_sse(chunks, terminal_usage=terminal)
+        # 未命中:返回纯文本(原第 2 次行为)
         chunks = [
             {
                 "id": "chatcmpl-mock-2",
@@ -1192,7 +1290,11 @@ class Handler(BaseHTTPRequestHandler):
             elif role == "compact":
                 body_bytes = role_reply(COMPACT_SUMMARY_TEXT)
             elif role == "plan":
-                body_bytes = role_reply(PLAN_MARKDOWN)
+                # 2026-09-11 第三十六轮 BUG-M7:PROMPT_ROUTER 可按 prompt 覆写
+                # Plan Markdown(hard 档链路可控);未命中保持默认。
+                body_bytes = role_reply(
+                    _route_plan_markdown(_extract_current_prompt(body))
+                )
             elif role == "debug":
                 body_bytes = role_reply(debug_evaluation_text(body))
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
