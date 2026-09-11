@@ -10,88 +10,88 @@
 - **预期档位**: medium
 - **考察维度**: 流式 I/O + 文件描述符 + inode watch
 - **对话脚本**:
-  1. 用 Rust 写一个简化版 `cat`：支持 `cat file1 file2 -`（`-` 表示 stdin），按行缓冲输出到 stdout，处理 EPIPE（下游 `head` 提前关闭管道时不能 panic）。
-  2. 在上面基础上加 `head` 与 `tail`：默认各 10 行；`head -n 50` / `tail -n +5`（从第 5 行起输出，含 `-c` 字节模式）；注意 `tail -n +5` 是「从 5 开始」不是「最后 5 行」，很多初学者搞混。
-  3. 实现 `tail -f`：用 `inotify`（Linux）/ `FSEvents`（macOS）监听文件 inode 的 IN_MODIFY 事件，从上次读取位置继续读；处理「被 truncate 后重建」的情况（stat.st_ino 不变但 size 变小，重置偏移）。
-  4. 用同样思路给 laew 加 `/show 路径` 斜杠命令：复用 `head`/`tail` 的逻辑让用户在 TUI 内分页查看长文件，按 `f` 进入 follow 模式（适合看 laew 自己的 DebugReport 实时增长）。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/cat.py`，支持 `python3 cat.py file1 file2 -`（`-` 表示 stdin），按行缓冲输出，实现 `cat file1 file2` 拼接、`-` 时从 `sys.stdin` 读。
+  2. 在上面基础上加 `tmpPlan/agent-test/unix/head.py` 与 `tail.py`：默认各 10 行；`head -n 50` / `tail -n +5`（从第 5 行起输出，注意不是最后 5 行）；`Bash` 用 `seq 1 20 | python3 head.py -n 5` 断言恰好前 5 行 1-5。
+  3. `Bash` 用真命令对照：`diff <(seq 1 20 | python3 head.py -n 5) <(seq 1 20 | head -n 5)` 必须空 diff；`diff <(seq 1 20 | python3 tail.py -n +15) <(seq 1 20 | tail -n +15)` 必须空 diff（15-20 共 6 行）。
+  4. 故意把 `tail.py -n +X` 实现错成 `tail -N`(最后 N 行)，跑 `seq 1 20 | python3 tail.py -n +15` 期望输出 15-20，但实际输出 1-15，diff 非空，定位 bug（`+X` 语义 vs 末尾 N 行）修正后 diff 空。
 
 ### BE02 手写 ls：目录遍历、权限位与多列对齐
 - **预期档位**: medium
 - **考察维度**: getdents64 + termios + 列宽计算
 - **对话脚本**:
-  1. 用 Rust 写 `ls`：调用 `getdents64` syscall（绕过 libc dirent 的名字长度 255 限制），处理 `.` / `..` 过滤、隐藏文件（`-a`）、按 mtime 排序（`-t`）。
-  2. 解析 Unix 权限位：`mode & 0o777` 得到 9 位三元组，转 rwxrwxrwx 字符串（还要识别 SUID/SGID/Sticky 三种特殊位，分别用 `s`/`t` 替换对应位置的 `x`），给一段格式化函数。
-  3. 多列对齐：根据终端宽度（用 `ioctl(TIOCGWINSZ)` 获取 col）与最长文件名计算列数；CJK 字符按 2 列宽（用 `unicode-width` crate）；输出方向 `-x`（按列填）vs 默认（按行填）的差异。
-  4. 给 laew 的 TUI ProviderList 屏做参考：它需要按列对齐显示「协议 / 提供商 / 模型 / 端点 / 密钥末四位」5 列，复用 ls 的列宽算法 + termios 探测就能避免 CJK 截断。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/ls.py`：调用 `os.listdir` 与 `os.stat`，实现 `-a`(含隐藏文件)、`-t`(按 mtime 倒序) 两个选项；输出每行 `name<tab>mtime<tab>size`。
+  2. `Bash` 跑 `python3 ls.py -a -t .` 与 `ls -a -t` 对比：`diff <(python3 ls.py -a -t . | awk -F'\t' '{print $1}' | head) <(ls -a -t | head)` 验证排序结果一致。
+  3. 解析 Unix 权限位：`mode & 0o777` 转 `rwxrwxrwx` 字符串（SUID/SGID/Sticky 用 `s`/`t` 替换对应 `x`），`Bash` 跑 `python3 ls.py -a . | awk -F'\t' 'NR==1{print $4}'` 断言第一个文件权限串是 10 字符（含首字符 `d`/`-`）。
+  4. 故意在权限函数里把 `r` 写成 `R`（大写），跑 `diff` 与真 `ls -l` 对照发现字母不符，修正后 `diff <(python3 ls.py . | awk -F'\t' '{print $4}') <(ls -l | awk '{print $1}')` 断言首 5 行一致。
 
 ### BE03 手写 wc：字节/字符/单词/行的四种计数口径
 - **预期档位**: simple
 - **考察维度**: 字节 vs Unicode 字符 + 状态机
 - **对话脚本**:
-  1. 用 Rust 写 `wc -l`：最简单，按 `\n` 计数（注意：末尾无换行的最后一行算不算？GNU wc 算 1 行，POSIX 严格定义无统一答案，要可配置）。
-  2. 加 `-c`（字节）与 `-m`（字符）：`-c` 直接 `len(file)`；`-m` 需要按 Unicode 码点遍历（不要按 UTF-8 字节），CJK/Emoji 一个 codepoint 算一个字符，处理 broken UTF-8 时降级为字节。
-  3. 加 `-w`（单词）：POSIX 定义「非空白字符组成的最大序列」；要处理 Unicode 空白（用 `unicode-general-category` 判定 White_Space），否则中文标点会被错误切词。
-  4. 实现 `-L`（最长行长）：按字符列宽（不是字节数）统计，CJK 算 2 列、Tab 按下一个 8 的倍数对齐；这个口径在生成 `laew -h` 输出与 TUI 排版时很实用。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/wc.py`：`-l` 行数、`-c` 字节数、`-m` Unicode 字符数、`-w` 单词数；默认输出 `l w c`。
+  2. `Bash` 现场造数据：`printf 'hello 世界\n你好 python3\n' > /tmp/wc_test.txt`，跑 `python3 wc.py /tmp/wc_test.txt` 与 `wc /tmp/wc_test.txt` 对比，`diff <(python3 wc.py /tmp/wc_test.txt) <(wc /tmp/wc_test.txt)` 必须空 diff。
+  3. 故意把 `-m` 实现成字节数(与 `-c` 相同)，跑 `python3 wc.py -m /tmp/wc_test.txt` 与 `wc -m` 对比 diff 非空，定位 bug 后用 `len(text.encode('utf-8'))` vs `len(text)` 区分，修正后 diff 空。
+  4. 加 `-L` 最长行长（按字符列宽，CJK 算 2 列），`Bash` 跑 `python3 wc.py -L /tmp/wc_test.txt` 与手动 `awk '{if(length>max) max=length} END{print max}'` 验证，写入 `wc.md` 列四种口径公式。
 
 ### BE04 手写 grep：正则匹配、上下文行与彩色高亮
 - **预期档位**: medium
 - **考察维度**: NFA/DFA 正则 + ANSI 转义 + 多文件并行
 - **对话脚本**:
-  1. 用 Rust 写 `grep`：先支持 literal（普通字符串）匹配，KMP 或 Boyer-Moore-Horspool 都行；再切换到正则（用 `regex` crate 的 DFA 后端，避免回溯爆栈）。
-  2. 加 `-C 3`（前后 3 行上下文）、`-B 2 -A 5`、`--color=auto`（输出到 tty 才着色，重定向到管道不染色，避免污染日志）；颜色用 ANSI `\x1b[01;31m`（红粗体）+ `\x1b[0m` 重置，匹配部分高亮，行尾单独重置避免泄露到下一行。
-  3. 多文件 `grep -rn pattern dir`：用 `walkdir` 递归 + `rayon` 并行（per-file 任务独立），性能可提升 4-8 倍；处理 SIGPIPE（多个文件时提前退出别浪费 CPU）。
-  4. 给 laew 的 SessionContext Agent 设计一个 `grep_session.sh`：在 `session_memory` 表里全文搜索历史摘要关键词，复用 grep 的高亮与上下文输出逻辑，给 TUI 主屏的「查找历史任务」功能打底。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/grep.py`：先支持字面量匹配（KMP 或 `in` 即可），`Bash` 造含 1000 行的测试文件 `seq 1 1000 > /tmp/g.txt; echo "needle" >> /tmp/g.txt`，跑 `python3 grep.py needle /tmp/g.txt` 断言只输出含 needle 的 1 行。
+  2. 加 `-C N` 前后 N 行上下文、`--color=auto`（只在 tty 输出 ANSI `\x1b[01;31m` 红色 + `\x1b[0m` 重置），`Bash` 跑 `python3 grep.py -C 1 needle /tmp/g.txt` 断言输出 3 行（上+匹配+下）。
+  3. `Bash` 与真 grep 对照：`diff <(grep -n needle /tmp/g.txt) <(python3 grep.py -n needle /tmp/g.txt)` 必须空 diff，否则调整正则转义后重跑。
+  4. 故意在颜色输出里忘了重置（匹配后没有 `\x1b[0m`），把输出 `| cat -A` 会看到颜色码泄露到下一行（`^[` 序列），定位 bug 后加重置再跑 `grep -c '\x1b\[0m'` 验证每次匹配后都有重置码。
 
 ### BE05 手写 find：表达式求值与目录剪枝
 - **预期档位**: hard
 - **考察维度**: 表达式 AST + 剪枝优化 + xattr
 - **对话脚本**:
-  1. 用 Rust 写 `find` 的表达式解析：`find . -name '*.rs' -size +1M -mtime -7 -print` 是布尔表达式，需要先词法分析再递归下降建 AST（`-name` `-size` `-mtime` 是叶子，`-a` 隐式 AND / `-o` OR / `!` NOT 是内部节点）。
-  2. 表达式求值 + 目录剪枝：在 walkdir 遍历时每访问一个 entry 调用 `eval(ast, entry)`；剪枝是关键：`-name 'node_modules'` 命中后整个子树不递归，否则大规模目录树性能崩盘。
-  3. 实现 `-exec`：`find ... -exec cmd {} \;` 要把 `{}` 替换为路径，处理路径含空格的情况（GNU 用 `\;\+` 把多文件合并到一次 exec 调用，减少 fork 次数）；以及 `-prune`（剪枝 + 不打印）与 `-print` 的默认行为差异。
-  4. 给 laew 的 Bash 工具加白名单：`BashTool` 调用前先用 find 风格的表达式扫描用户要执行的命令意图（如 `git status` 在哪个仓库、`cargo test` 哪个 crate），比纯字符串匹配更稳。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/find.py`：解析 `find . -name '*.py' -size +1M -mtime -7 -print`，支持 `-name`/`-size`/`-mtime`/`-print` 叶子与 `-a`(AND)、`-o`(OR)、`!`(NOT) 内部节点。
+  2. `Bash` 造测试树：`mkdir -p /tmp/ft/a/b; echo "x" > /tmp/ft/a/big.py; python3 find.py /tmp/ft -name '*.py' -print` 断言只输出 `.py` 文件。
+  3. `Bash` 与真 find 对照：`diff <(python3 find.py /tmp/ft -name '*.py' -print | sort) <(find /tmp/ft -name '*.py' -print | sort)` 必须空 diff，否则调整通配匹配逻辑后重跑。
+  4. 故意把 `-size +1M` 实现成 `>1K`（把单位 M 误按 K 算），跑 `diff` 与真 `find ... -size +1M` 不一致，定位单位换算 bug（1M=1024*1024）修正后 diff 空；加 `-exec` 占位（打印 `exec path` 即可）。
 
 ### BE06 手写 tree：递归绘制与 Unicode 制表符
 - **预期档位**: medium
 - **考察维度**: 深度优先 + UTF-8 box-drawing + ANSI 文件类型色
 - **对话脚本**:
-  1. 用 Rust 写 `tree`：深度优先遍历目录，输出形如 `├── src/ → agent/ → mod.rs`；绘制符号默认 ASCII（`|--` `+--` `|`），加 `-N` 用 Unicode box-drawing（`├──` `└──` `│  `）。
-  2. 处理最后一层 vs 中间层的视觉差异：父节点用 `├──` 链接中间子项，用 `└──` 链接最后一个子项；递归时给下一层传「父前缀」字符串（`│   ` 或 `    `），错位就乱套。
-  3. 加 `-L 2`（深度限制）、`-I 'target'`（忽略模式）、`-F`（目录加 `/`、可执行加 `*`、symlink 加 `@`）；颜色按文件类型分（蓝=目录、绿=可执行、品红=图片），通过 `LS_COLORS` 环境变量读取。
-  4. 给 laew 的 `-p` 单轮模式加 `--tree` 选项：执行任务前先把工作目录结构打印出来作为上下文，让 LLM 看到项目骨架（比单纯 cd 后 ls 更高效）。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/tree.py`：深度优先遍历目录，输出 `├──` / `└──` / `│   ` 三符号；支持 `-L N` 深度限制。
+  2. `Bash` 造测试树：`mkdir -p /tmp/tt/{src,test}; touch /tmp/tt/src/{a.py,b.py}; python3 tree.py -L 2 /tmp/tt`，断言输出 1 行目录名 + 2 行一级子目录。
+  3. `Bash` 与真 tree 对照：`diff <(python3 tree.py -L 1 /tmp/tt) <(tree -L 1 /tmp/tt | tail -n +2 | head -n -1)` 必须空 diff（去除 tree 首行目录名与末行计数）。
+  4. 故意把 `├──` 与 `└──`（4 长）写错，`diff` 与真 tree 不一致，`Bash` 跑 `grep -cE '├' tree_out.txt` 断言符号计数，修正后 diff 空；加 `-I 'test'` 忽略模式。
 
 ### BE07 手写 du 与 df：磁盘占用统计与硬链接去重
 - **预期档位**: medium
 - **考察维度**: statfs + inode 引用计数 + 并行聚合
 - **对话脚本**:
-  1. 用 Rust 写 `df`：调用 `statfs`/`statvfs` syscall 获取文件系统总块、空闲块、可用块；注意 `f_bavail`（普通用户可用）vs `f_bfree`（root 可见空闲）的差异，5% 预留空间不要算进去。
-  2. 写 `du -sh dir`：递归遍历统计 `st_blocks * 512`（注意是 512 字节为单位，不是 `st_size`！一个空文件也可能占 4KB）；并行版用 rayon，每个目录独立 stat 后聚合，避免单线程 IO 瓶颈。
-  3. 硬链接去重是关键：`du` 默认会把同一 inode 多次出现的目录项都算进去，导致共享子目录被重复计算；GNU du 用 `-l` 关闭去重（默认开启），即用 HashSet 记录见过的 dev+inode。
-  4. 给 laew 加 `/disk` 斜杠命令：在 TUI 状态栏显示根目录与 SQLite 库的占用，配合 Compact Agent 的「按比例触发压缩」决策（占盘 > 80% 时主动压缩 session_memory）。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/du.py`：递归统计 `st_blocks * 512`（注意不是 `st_size`），支持 `-h`（人类可读）、`-s`（仅汇总）。
+  2. `Bash` 造测试树：`mkdir -p /tmp/du1/sub; dd if=/dev/zero of=/tmp/du1/sub/f.bin bs=1024 count=10 2>/dev/null; python3 du.py -s /tmp/du1`，断言输出 `>= 10K`。
+  3. `Bash` 与真 du 对照：`diff <(python3 du.py -s /tmp/du1) <(du -s /tmp/du1)` 允许 ±10% 误差（`awk` 数值比较），否则检查 `st_blocks` 用法。
+  4. 硬链接去重：`ln /tmp/du1/sub/f.bin /tmp/du1/sub/f2.bin` 造硬链接，`python3 du.py -s --no-dedup /tmp/du1` 与 `python3 du.py -s /tmp/du1` 对比，后者应更小（去重生效），`diff` 非空证明去重逻辑工作。
 
 ### BE08 手写 xargs：参数分批与并行执行
 - **预期档位**: medium
 - **考察维度**: ARG_MAX 探测 + 引号转义 + 并行调度
 - **对话脚本**:
-  1. 用 Rust 写 `xargs`：核心是「一行 stdin 算一个参数」还是「按空白切分多个参数」（默认行为），GNU 用 `-d` 改分隔符；遇到引号要正确处理（`'a b'` 算一个参数，含空格的引号字符串）。
-  2. 参数分批：一次性构造 argv 受限于 `ARG_MAX`（Linux 通常 128KB-2MB，用 `sysconf(_SC_ARG_MAX)` 探测），超过就拆成多轮 exec；新版 `-n 1` 强制每参数一次调用。
-  3. 实现 `xargs -P 4 -I {} cmd {}`：用线程池并行 4 个 worker，每个 worker 持有一个子进程；`-I {}` 把 `{}` 替换为参数（每条独立调用，不分批）。
-  4. 用同样的分批模式给 laew 的 MultiAgentOrchestrator 改造：当 hard 任务的 Workflow 列表超过「单轮 LLM 调用上限」（如 50 个）时分批投喂，每批完成后等 Quality-Check 再投喂下一批。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/xargs.py`：默认按空白切分参数、支持 `-I {}` 占位符替换、`-n 1` 每参数一条命令。
+  2. `Bash` 造测试：`printf 'a b c\nd e\n' | python3 xargs.py -n 2 echo` 断意输出 3 行（a b / c d / e），与 `printf 'a b c\nd e\n' | xargs -n 2 echo` diff 空。
+  3. 故意把 `-I {}` 实现成不替换（直接忽略 `{}`），跑 `echo 'foo' | python3 xargs.py -I {} echo prefix-{}` 期望输出 `prefix-foo`，实际输出 `prefix-{}`，diff 非空，修正替换逻辑后 diff 空。
+  4. 加 `-P 2` 并行（`ThreadPoolExecutor(max_workers=2)`），`Bash` 跑 `seq 1 4 | python3 xargs.py -P 2 -I {} sleep 0.1; echo done` 断言 4 任务并行 2 路总耗时 ≈ 0.2s（`time` 验证）。
 
 ### BE09 手写 diff：最长公共子序列与补丁输出
 - **预期档位**: hard
 - **考察维度**: LCS DP + Myers diff + hunk 格式
 - **对话脚本**:
-  1. 用 Rust 写 `diff`：最朴素版用动态规划算最长公共子序列（LCS），时间空间 O(mn) 太占内存；改成 Myers diff（O((m+n)d)，d 是编辑距离），Git 内部用的就是这个算法。
-  2. 输出格式：普通模式（`<` `>` `|`）、unified diff（`--- a/f +++ b/f @@ -1,3 +1,4 @@` + ` ` `-` `+` 三种前缀）；hunk header 的 `-1,3` 表示「原文件第 1 行起 3 行」，合并相邻 hunk 时默认上下文 3 行。
-  3. 大文件优化：用 patience diff（先匹配唯一行锚点，再 Myers）显著减少 hunk 数；Git 默认就是 patience diff；对超大文件再加 suffix array 或 kdiff3 三方合并算法。
-  4. 给 laew 的 SessionContext 摘要做版本对比：每次任务后存一份「上轮摘要 vs 本轮摘要」的 unified diff，方便用户回溯「这次会话改了什么」，复用 Myers diff 实现避免引入额外依赖。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/diff.py`：先实现朴素 LCS（O(mn) DP）输出相同行与差异行，支持 `-u` unified 格式。
+  2. `Bash` 造测试文件：`printf 'A\nB\nC\nD\n' > /tmp/d1.txt; printf 'A\nX\nC\nD\n' > /tmp/d2.txt; python3 diff.py -u /tmp/d1.txt /tmp/d2.txt` 断言 hunk 含 `-B` + `+X`。
+  3. `Bash` 与真 diff 对照：`diff <(python3 diff.py -u /tmp/d1.txt /tmp/d2.txt) <(diff -u /tmp/d1.txt /tmp/d2.txt)` 必须空 diff（hunk 行号与内容一致），否则调整上下文行数后重跑。
+  4. 故意把 `-u` 的上下文行数固定成 0（不输出上下文），`diff` 与真 `diff -u` 不一致，定位 bug 后改成默认 3 行上下文，diff 空；再跑 `seq 1 100` 大文件 100 行测试，断言无超时。
 
 ### BE10 手写 watch 与 top：终端定时刷新与光标控制
 - **预期档位**: medium
 - **考察维度**: termios raw mode + 信号处理 + ANSI 局部重绘
 - **对话脚本**:
-  1. 用 Rust 写 `watch -n 2 cmd`：核心是「隐藏光标 + 保存当前行 + 移到首行 + 清除到末尾 + 执行 cmd + 输出」循环；用 `write(STDOUT, "\x1b[?25l\x1b[H\x1b[J", ...)` 控制终端；恢复时务必 `\x1b[?25h` 显示光标（panic 也要做）。
-  2. 处理信号：`SIGWINCH`（终端尺寸变化）需要重抓 col/row 重新布局；`Ctrl+C`（SIGINT）要恢复光标再退出，否则终端留下乱码；用 `crossterm` 的 raw mode 比直接 termios 安全。
-  3. 写 `top`：从 `/proc/[pid]/stat` 与 `/proc/[pid]/status` 读取 CPU/内存占用，每秒重采样，进程列表按 CPU 倒序；CPU 占用算法要处理「上一个采样点没数据」的情况，用 `/proc/stat` 总时间差分。
-  4. 给 laew 的 TUI 主屏加「实时状态栏」：复用 watch 的光标控制 + ANSI 重绘，显示当前活跃 Agent / Token 用量 / SQLite 写入速率 / 上下文占用百分比，1Hz 刷新，不打断主输入框。
+  1. 用 python3 写 `tmpPlan/agent-test/unix/watch.py`：`watch.py -n 1 cmd` 每秒清屏执行命令输出，用 `print("\x1b[H\x1b[J")` 清屏，`print("\x1b[?25l")` 隐藏光标，退出时 `\x1b[?25h` 显示。
+  2. `Bash` 后台跑 `python3 watch.py -n 1 'date +%T'` 3 秒后 kill，`tmpPlan/agent-test/unix/trace.txt` 记录输出，`grep -c ':' trace.txt` 断言至少 2 个时间戳。
+  3. 故意忘记退出时显示光标，跑 `python3 watch.py -n 100 'echo test'` 后 Ctrl-C，终端光标消失；在脚本末尾加 `finally: print("\x1b[?25h", end='')` 重跑验证光标恢复。
+  4. `Write` `top.py` 用 `os.listdir('/proc')` + 读 `/proc/[pid]/stat` 实现简化版 top，每 2 秒刷新，按 CPU 倒序打印前 5 进程，`Bash` 跑 `python3 top.py` 断言 5 行进程 + 1 行表头；`Write` `watch_top.md` 总结 ANSI 控制序列清单（清屏/定位/显隐光标/颜色）。

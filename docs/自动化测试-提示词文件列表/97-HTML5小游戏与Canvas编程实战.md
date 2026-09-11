@@ -1,130 +1,120 @@
-# 97 HTML5 小游戏与 Canvas 编程实战
+# 自动化测试提示词 — HTML5 小游戏与 Canvas 编程实战（CO01–CO10）
 
+> 使用说明见同目录 `README.md`。每条提示词在同一 Session 内按轮次顺序喂入。
+>
 > 编号段 CO01–CO10 · 聚焦「浏览器里的小游戏」：游戏循环与后台节流 / 离屏分层渲染 / 雪碧图与资源管理 / 输入与虚拟摇杆 / 场景管理 / Web Audio 音效 / 摄像机与视差卷轴 / HUD 与像素完美 / 微信小游戏适配 / 性能与内存排查
->
-> 与现有维度互补说明：
-> - `57-经典小游戏复刻与游戏编程实战`（BF01–BF10）聚焦**终端字符画游戏**（Rust + crossterm）；本文件聚焦**浏览器 Canvas 平台**的游戏工程。
-> - `28-游戏引擎与图形编程进阶`（AB02 固定时间步 / AB09 粒子系统与对象池）聚焦**引擎级通用原理**；本文件聚焦**浏览器平台特有**（rAF 节流 / DOM 与 Canvas 混合 / 小游戏平台差异）。
-> - `32-移动应用与跨平台开发实战`（AF05 小程序工程）聚焦**小程序业务工程化**；本文件 CO09 聚焦**小游戏**（游戏向）的平台适配。
->
-> **本文件独特主题**：requestAnimationFrame 与后台标签节流 / 离屏 Canvas 分层缓存 / 雪碧图帧动画与资源预载 / 虚拟摇杆 / 场景栈与过渡 / AudioContext 解锁与无缝 BGM / 视差卷轴摄像机 / 像素完美缩放 / 微信小游戏开放数据域 / Chrome DevTools 性能排查。
+
+## 维度说明
+本维度考察 Agent 在**浏览器 Canvas 平台**做小游戏工程的实战能力。所有任务固定 4 轮，要求至少 1 轮 Bash 执行并断言、至少 1 轮 Write 落盘产物到 `tmpPlan/agent-test/` 沙盒，工具链限于 Bash/Read/Write + node（**node 跑 JS 模拟 Canvas 行为**）+ python3（**PIL 合成像素图作为最终渲染断言**）。所有路径前缀 `tmpPlan/agent-test/`，输入数据现场生成，**产物只允许在 `tmpPlan/agent-test/` 沙盒内**。衡量重点：把抽象的浏览器游戏工程概念（rAF/分层/雪碧图/摇杆/场景栈/Audio/摄像机/HUD/小游戏/性能）转化为可由 node 脚本或 PIL 像素图验证的工程产物。
 
 ---
 
 ### CO01 游戏循环：rAF、deltaTime 与后台节流
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium
 - **考察维度**: 浏览器游戏循环 + 时间步 + 标签页生命周期
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 用 TypeScript 写浏览器游戏循环：`requestAnimationFrame(loop)` 代替 `setInterval`，每帧计算 `dt = (now - last) / 1000` 并 clamp 到 50ms（防止切回标签时的大跳变）；解释 rAF 与屏幕刷新率同步（120Hz 屏会跑 120fps）带来的影响。
-  2. 固定时间步累加器：逻辑更新用固定 60Hz（`accumulator += dt; while (acc >= STEP) update(STEP)`），渲染用插值 alpha——比纯可变步长好在哪（物理确定性 / 高刷屏一致性）；与 AB02 的通用固定时间步对照，指出浏览器版要额外处理什么。
-  3. 后台标签：浏览器会把后台标签的 rAF 节流到接近 0 或 1fps——监听 `visibilitychange`，切后台时暂停逻辑与计时器（暂停时刻记录），切回时恢复而不是补帧；写「限时关卡」在后台不继续扣时的实现。
-  4. laew 借鉴：对照 TUI 的渲染循环——laew `engine.rs::present()` 全量重绘 vs Canvas 的脏矩形局部重绘，讨论「按需重绘 + 事件驱动唤醒」能否降低 laew 在等待输入时的 CPU 占用。
-
----
+  1. Write 一份 Node 脚本 `tmpPlan/agent-test/game_loop.js`：实现 `requestAnimationFrame` 模拟循环（用 `setImmediate` 推进帧）、每帧 `dt = (now - last) / 1000` clamp 到 50ms、累加器固定 60Hz 逻辑步；同时输出 200 帧的 `dt` 与 `tick` 序列到 `tmpPlan/agent-test/loop_log.json`。
+  2. Bash 跑：`node tmpPlan/agent-test/game_loop.js`，再 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/loop_log.json')); assert max(e['dt'] for e in d)<=0.05, 'dt 未 clamp'; assert sum(1 for e in d if e.get('tick'))>=190, 'tick 不足'; print('PASS frames=',len(d))"` 断言 dt 全 ≤ 50ms 且 tick 数 ≥ 190。
+  3. Read `loop_log.json` 的前 5 帧后 Write 第二个 Node 脚本 `tmpPlan/agent-test/visibility_sim.js`：模拟「切后台 3 秒→切回」，验证回切时 dt 不暴涨（仍然 ≤ 50ms 而不是 3 秒），输出 `tmpPlan/agent-test/visibility_log.json`。
+  4. Bash 复检：`node tmpPlan/agent-test/visibility_sim.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/visibility_log.json')); assert max(e['dt'] for e in d)<=0.05; assert d[-1]['phase']=='resumed'; print('PASS')"`。
 
 ### CO02 离屏 Canvas 与分层渲染
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium
 - **考察维度**: 图层分离 + 离屏缓存 + drawImage 合成
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 分层策略：把画面拆成「静态背景层（砖墙/管道）/ 动态实体层（角色/敌人）/ UI 层」三个 Canvas 叠放，只有动态层每帧重绘；估算 480×270 像素游戏每帧的绘制调用从 ~800 次降到 ~50 次的收益。
-  2. 离屏缓存：用 `document.createElement('canvas')` 建离屏画布，把整张静态地图一次性绘制进去，每帧只 `ctx.drawImage(offscreen, camX, camY)`；写一个 `LayerCache` 类封装「失效标记 + 惰性重绘」。
-  3. 复杂场景裁剪：视口外的瓦片不绘制（计算摄像机覆盖的瓦片行列范围再双层循环），配合 `ctx.setTransform` 做摄像机变换；讨论「整层离屏缓存」与「视口裁剪实时绘制」的内存/算力取舍。
-  4. laew 借鉴：离屏缓存 = 「不变内容的渲染结果复用」——对照 laew TUI 横幅与帮助文本这类静态区，讨论 `Frame` 是否可以引入「静态区缓存 + 脏行检测」来减少每帧字符串构造。
-
----
+  1. Write Node 脚本 `tmpPlan/agent-test/layers.js`：用 `canvas`（如未装则改纯 JS 模拟二维数组 buffer）实现三图层分离（背景层 map[200][200] 静态、实体层 entities[100] 动态、UI 层 ui[10]），记录每帧的 drawcall 数与渲染时间到 `tmpPlan/agent-test/layers_log.json`。
+  2. Bash 跑：`node tmpPlan/agent-test/layers.js` → 输出 100 帧日志，再 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/layers_log.json')); assert all(f['bg_draws']==1 for f in d), '背景层应只画 1 次'; assert all(f['ui_draws']<=10 for f in d); print('PASS avg_draws=',sum(f['total'] for f in d)//len(d))"`。
+  3. Read 日志，Write `LayerCache` 类的测试 `tmpPlan/agent-test/cache_test.js`：验证「失效标记」行为——连续两次同 key 渲染只调一次底层；输出命中/未命中计数到 `tmpPlan/agent-test/cache_log.json`。
+  4. Bash 跑：`node tmpPlan/agent-test/cache_test.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/cache_log.json')); assert d['miss']==1 and d['hit']>=10; print('PASS hit_rate=',d['hit']/(d['hit']+d['miss']))"`。
 
 ### CO03 雪碧图动画与资源预载管理
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium
 - **考察维度**: 帧动画 + 资源清单 + 预载进度
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 雪碧图帧动画：一张 PNG 横排 8 帧走路动画，`drawImage(sheet, frame * 32, 0, 32, 32, x, y, 32, 32)` 按帧时长推进 `frame = floor(t / 120ms) % 8`；写一个 `SpriteAnim` 类支持「循环 / 单次 / 速度倍率」。
-  2. 多向与多状态：精灵表按「行 = 朝向（下/左/右/上）、列 = 帧」组织，动画状态机 idle/run/attack 切换时从对应行播放；讨论逆向播放（后退走）与镜像翻转（`ctx.scale(-1, 1)` 只做左右）两种省资源的做法。
-  3. 资源预载：写 `AssetLoader`——按 JSON 清单 `{ sheet: 'player.png', maps: [...], audio: [...] }` 用 `Promise.all` 并行加载，`img.decode()` 防止首帧卡顿，回调进度条百分比；失败单个资源时的降级（占位色块 + 继续游戏）策略。
-  4. laew 借鉴：资源清单与懒加载对照 laew 工具注册表——`builtin_registry()` 是「启动即全量注册」，讨论按任务档位懒注册工具（simple 任务只挂 Read）能否减少系统提示词体积、降低 token 成本。
-
----
+  1. Write Node 脚本 `tmpPlan/agent-test/sprite_anim.js`：用 PIL 现场生成 8 帧 32×32 雪碧图存 `tmpPlan/agent-test/sheet.png`，脚本读取并按 `frame = floor(t/120ms) % 8` 抽取当前帧写入 `tmpPlan/agent-test/current_frame.png`（先跑 PIL 生成图，再跑 node 读帧生成目标）。
+  2. Bash 跑：`python3 -c "from PIL import Image; im=Image.new('RGBA',(256,32),(255,0,0,255)); [im.paste((i*30%255,i*50%255,128,255),(i*32,0,32,32)) for i in range(8)]; im.save('tmpPlan/agent-test/sheet.png')"` → `node tmpPlan/agent-test/sprite_anim.js` → 输出 `current_frame.png`。
+  3. Read `current_frame.png` 的像素用 PIL 验证：`python3 -c "from PIL import Image; im=Image.open('tmpPlan/agent-test/current_frame.png'); px=im.getpixel((16,16)); print('frame0_color=',px); assert px[0]<10 and px[1]<10, '首帧应为接近红色'"`。
+  4. Write 资源加载器 `tmpPlan/agent-test/asset_loader.js`：JSON 清单 `{sheets:['sheet.png'],maps:['map.json']}` 用 `Promise.all` 并行加载，模拟 `img.decode()` 等待，输出加载进度到 `tmpPlan/agent-test/loader_log.json`；Bash 跑后断言 `progress_100` 必须出现且单资源失败不阻塞。
 
 ### CO04 输入系统：键盘、触屏与虚拟摇杆
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium
 - **考察维度**: 输入抽象 + 多点触控 + 虚拟摇杆实现
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 键盘输入状态表：监听 `keydown/keyup` 维护 `Set<string>`，游戏逻辑每帧读 `input.isDown('ArrowLeft')` 而不是响应事件（避免事件顺序问题）；处理「同时按左右」「松开即停」与 `event.repeat` 过滤，再讨论方向优先级（后按下优先）。
-  2. 触屏多点：`touchstart/touchmove/touchend` 的 `changedTouches` 按 `identifier` 跟踪多个手指——左手摇杆 + 右手跳跃键同时响应；写触点归属判定（按下位置落在哪个控件的命中区）。
-  3. 虚拟摇杆：触摸起点为摇杆中心，拖动向量 clamp 到半径 r，输出归一化方向 `(dx/r, dy/r)` 用于移动；画底盘 + 摇杆头（半透明），松手回弹动画，写这个 `VirtualJoystick` 类的完整实现。
-  4. laew 借鉴：输入抽象层对照 laew 的 `input.rs`——laew 已处理「退格 / 方向键 / 粘贴」等差异输入，讨论浏览器与终端输入处理的共同教训（永远做一层统一抽象，平台差异封闭在最底层）。
-
----
+  1. Write Node 脚本 `tmpPlan/agent-test/input_state.js`：实现键盘 `Set<string>` 状态表、模拟 60 帧序列按键事件（左按下 10 帧→同时按右 5 帧→全松开），每帧输出当前 down 集合到 `tmpPlan/agent-test/input_log.json`。
+  2. Bash 跑：`node tmpPlan/agent-test/input_state.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/input_log.json')); assert d[10]['down']==['ArrowLeft']; assert d[15]['down']==['ArrowLeft','ArrowRight']; assert d[20]['down']==[]; print('PASS frames=',len(d))"`。
+  3. Read 日志后 Write 虚拟摇杆 `tmpPlan/agent-test/joystick.js`：触摸起点 (200,300)、半径 r=50，模拟 6 次拖动（向右 30/向上 40/对角 35,-35/边界 70/松手）输出归一化方向序列到 `tmpPlan/agent-test/joy_log.json`。
+  4. Bash 跑：`node tmpPlan/agent-test/joystick.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/joy_log.json')); import math; assert all(math.hypot(v['dx'],v['dy'])<=1.001 for v in d); assert d[0]['dx']>0.5 and d[0]['dy']<0.1; print('PASS samples=',len(d))"`。
 
 ### CO05 场景管理与过渡动画
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium
 - **考察维度**: 场景栈 FSM + 过渡效果 + 暂停恢复
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 场景栈：`SceneManager` 维护 `scenes: Stack`，`push(menuScene)` / `pop()` / `replace(gameScene)`；每个场景实现 `update(dt)` / `render(ctx)` / `onEnter()` / `onExit()`；解释「栈」相比「扁平状态机」的优势（暂停菜单压栈后底层游戏场景冻结但可透视渲染）。
-  2. 过渡动画：写黑屏淡入淡出过渡器（`Transition` 对象在场景切换期间接管渲染，alpha 0→1 切场景 →1→0），扩展为「圆形擦除」（按半径扩大的圆裁剪 `ctx.clip`）；讨论过渡期间输入是否应被吞掉。
-  3. 暂停与恢复：ESC 打开暂停菜单（压栈），恢复时弹栈；后台标签切走自动进入暂停（联动 CO01 的 visibilitychange）；写「暂停时 BGM 播放速率降为 0.3」的沉浸细节。
-  4. laew 借鉴：对照 laew TUI 的 Screen 栈（`/provider` 子屏压栈、Esc 弹回主屏）——两者完全同构，讨论 laew 子屏是否也需要「过渡帧」（如半透明遮罩渐入）以及终端实现 ANSI 渐变的可行性。
-
----
+  1. Write Node 脚本 `tmpPlan/agent-test/scene_stack.js`：实现 `SceneManager` 栈（menu/game/pause 三场景）、模拟事件序列 push(game)/push(pause)/pop()/replace(gameOver) 共 10 步，每步输出栈快照与当前 update 调用的场景名到 `tmpPlan/agent-test/scene_log.json`。
+  2. Bash 跑：`node tmpPlan/agent-test/scene_stack.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/scene_log.json')); assert [s['current'] for s in d]==['menu','game','pause','game','gameOver',...] or len(d)>=8; assert all(s['frozen_under'] for s in d if s['current']=='pause'); print('PASS stack_depth_max=',max(s['depth'] for s in d))"`。
+  3. Read 日志后 Write 过渡动画 `tmpPlan/agent-test/transition.js`：黑屏淡入淡出（alpha 0→1→0 共 60 帧），用 PIL 把每帧 alpha 渲到灰度 PNG 序列到 `tmpPlan/agent-test/frames/`。
+  4. Bash 跑：`node tmpPlan/agent-test/transition.js` → 对中间帧 `frames/030.png` 用 `python3 -c "from PIL import Image; im=Image.open('tmpPlan/agent-test/frames/030.png'); px=im.getpixel((50,50)); assert 100<px[0]<160, '过渡中段应为中灰'; print('mid_alpha=',px[0])"` 断言。
 
 ### CO06 Web Audio 音效与背景音乐
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium~hard
 - **考察维度**: AudioContext 解锁 + 音效池 + 无缝循环 BGM
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. AudioContext 解锁：浏览器自动播放策略要求「用户手势后」才能出声——首次 `pointerdown/keydown` 时 `ctx.resume()`；写一个 `AudioBus` 单例封装「解锁前静默丢弃请求 / 解锁后正常播放」，并处理 iOS Safari 的特殊行为。
-  2. 音效池与节流：同一音效（跳跃声）高并发播放会爆音——限制同音效同时实例数（最多 4 个，超出丢弃），用 `AudioBufferSourceNode` 一次性播放；实现播放 2D 空间化（距离衰减 + 左右声相 `StereoPannerNode`）。
-  3. 无缝循环 BGM：循环 WAV/OGG 在边界有缝隙——要么素材做成「整小节循环」并预加载完整 `AudioBuffer` 用 `loop = true`，要么用 WebAudio 调度器按小节 lookahead 提前排 `start(when)`；写按小节调度版的循环逻辑（含 BPM 与小节长度换算）。
-  4. laew 借鉴：音频「解锁门槛」对照 laew 的 LLM API 首调延迟——讨论 laew TUI 首屏是否也应做「骨架屏 / 预热请求」掩盖冷启动（如启动即建 TCP 连接池）。
-
----
+  1. Write Node 脚本 `tmpPlan/agent-test/audio_bus.js`：实现 `AudioBus` 单例 + 解锁前静默丢弃、解锁后正常播放（用伪 AudioContext 对象模拟），模拟 50 次 play('jump') 并发请求，输出实际播放实例数与丢弃数到 `tmpPlan/agent-test/audio_log.json`。
+  2. Bash 跑：`node tmpPlan/agent-test/audio_bus.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/audio_log.json')); assert d['played']<=4; assert d['dropped']==46; assert d['unlocked_after']>0; print('PASS played=',d['played'],'dropped=',d['dropped'])"` 断言同时实例数 ≤ 4。
+  3. Read 日志后 Write BGM 调度器 `tmpPlan/agent-test/bgm_loop.js`：120 BPM、4/4 拍，按 16 小节 lookahead 调度 `start(when)`，输出调度时间表到 `tmpPlan/agent-test/bgm_log.json`。
+  4. Bash 跑：`node tmpPlan/agent-test/bgm_loop.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/bgm_log.json')); assert len(d)==64; gaps=[d[i+1]['when']-d[i]['end'] for i in range(len(d)-1)]; assert all(-0.001<g<0.01 for g in gaps), '存在间隙'; print('PASS seamless_bar=',64)"` 断言每小节无缝衔接。
 
 ### CO07 摄像机系统与视差卷轴
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium
 - **考察维度**: 摄像机跟随 + 死区与前视 + 多层视差
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 摄像机跟随：朴素版 `cam.x = player.x - W/2` 写起，再加「死区」（玩家在屏幕中央 ±40px 内摄像机不动）与「平滑跟随」`cam.x += (target - cam.x) * min(1, 6 * dt)`；解释死区对平台跳跃手感的重要性（小位移不晃屏）。
-  2. 前视（Look-ahead）：摄像机朝玩家移动方向偏移（速度 × 0.5s），让玩家看到前方；写偏移量随速度渐变、停止后缓慢回正的实现，讨论参数过大导致「玩家被甩出屏幕边缘」的钳制。
-  3. 多层视差卷轴：远景层（系数 0.2）/ 中景（0.5）/ 玩家层（1.0）/ 前景装饰（1.3），每层独立滚动；用离屏 Canvas 缓存每层（联动 CO02），写 `renderLayer(layer, cam)` 的通用函数与「无限平铺」的取模偏移。
-  4. laew 借鉴：视差的「多速率信息层」对照 laew 上下文的分层（系统提示词不动 / 项目上下文低频变 / 对话历史高频变）——讨论把这种「层 + 变化频率」显式建模进 Compact Agent 的保护段识别是否更精确。
-
----
+  1. Write Node 脚本 `tmpPlan/agent-test/camera.js`：实现摄像机跟随 + 死区（±40px 不动）+ 平滑 `cam += (target - cam) * min(1, 6*dt)`，模拟玩家从 x=0 走到 x=500 共 600 帧，输出 cam 与 target 序列到 `tmpPlan/agent-test/cam_log.json`。
+  2. Bash 跑：`node tmpPlan/agent-test/camera.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/cam_log.json')); dead=[i for i,e in enumerate(d) if abs(e['target']-e['cam'])<40]; assert len(dead)>=200, '死区帧应充足'; assert all(abs(d[i+1]['cam']-d[i]['cam'])<=20 for i in range(len(d)-1)); print('PASS dead_frames=',len(dead))"`。
+  3. Read 日志后 Write 视差卷轴 `tmpPlan/agent-test/parallax.js`：远景 0.2 / 中景 0.5 / 玩家 1.0 / 前景 1.3 四层，每帧输出每层 x 偏移到 `tmpPlan/agent-test/parallax_log.json`。
+  4. Bash 跑：`node tmpPlan/agent-test/parallax.js` 后用 PIL 把四层偏移渲成单张测试图 `tmpPlan/agent-test/parallax.png`（每层不同灰度），再 `python3 -c "from PIL import Image; im=Image.open('tmpPlan/agent-test/parallax.png'); assert im.size[0]==400; assert len(set(im.crop((0,y,400,y+1)).tobytes() for y in range(4)))==4; print('PASS 4 layers rendered')"`。
 
 ### CO08 HUD、UI 与像素完美渲染
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium
 - **考察维度**: Canvas 内 UI vs DOM 层 + 像素画缩放 + 自适应
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. HUD 设计：血条（分段/平滑两种）、分数与连击浮字（上浮 + 淡出）、Boss 血条顶部悬停；比较「Canvas 内绘制 UI」与「DOM overlay（div + CSS 动画）」在开发效率、渲染性能、缩放一致性上的取舍。
-  2. 像素完美：低分辨率美术（480×270）整数倍放大到屏幕（`image-rendering: pixelated` + `ctx.imageSmoothingEnabled = false`），画布尺寸取「窗口能容纳的最大整数倍」居中留黑边；写窗口 resize 的重算逻辑，解释为什么非整数缩放会让像素画糊/错位。
-  3. 文字与图标：Canvas 文字用离屏缓存（分数变化才重绘）避免每帧 `fillText` 抖动；伤害数字对象池（联动浮字），图标统一走雪碧图（联动 CO03）。
-  4. laew 借鉴：像素完美的「整数倍缩放」对照 laew TUI 的等宽对齐——中文全角/半角混排导致表格错位时，讨论用 `unicode-width` 思想在 `Frame` 渲染层做宽度对齐（哪些字符占 2 列）与像素缩放的共同原则：显示单元的物理宽度必须可预测。
-
----
+  1. Write PIL 脚本 `tmpPlan/agent-test/hud_render.py`：画一张 480×270 HUD 测试图（血条 100→60→30 三段、分数 9999、连击 x5 浮字），保存到 `tmpPlan/agent-test/hud.png`。
+  2. Bash 跑：`python3 tmpPlan/agent-test/hud_render.py` 后 `python3 -c "from PIL import Image; im=Image.open('tmpPlan/agent-test/hud.png'); assert im.size==(480,270); red=sum(1 for px in im.crop((10,10,210,30)).getdata() if px[0]>200 and px[1]<50); assert red>1000, '血条应有红色像素'; print('PASS red_px=',red)"`。
+  3. Read HUD 图后 Write 像素完美缩放脚本 `tmpPlan/agent-test/pixel_scale.py`：480×270 源图整数倍 ×2 放大到 960×540（image.NEAREST），再 ×1.5 非整数放大到 720×405（image.BILINEAR），保存到 `tmpPlan/agent-test/scaled_int.png` 与 `tmpPlan/agent-test/scaled_nonint.png`。
+  4. Bash 跑：`python3 tmpPlan/agent-test/pixel_scale.py` 后断言整数倍仍锐利、非整数糊：`python3 -c "from PIL import Image; a=Image.open('tmpPlan/agent-test/scaled_int.png'); b=Image.open('tmpPlan/agent-test/scaled_nonint.png'); assert a.size==(960,540); assert b.size==(720,405); import os; assert a.tobytes()!=b.resize((960,540)).tobytes(); print('PASS int_sharp nonint_blur')"`。
 
 ### CO09 微信小游戏适配与发布
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: medium~hard
 - **考察维度**: 平台差异层 + 包体分包 + 开放数据域 + 审核发布
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 平台适配层：微信小游戏没有 DOM，`document/canvas/Audio` 全部要换成 `wx.createCanvas()` / `wx.createInnerAudioContext()` —— 写一个 `PlatformAdapter` 接口（`createCanvas / loadImage / playAudio / getStorage`），Web 与小游戏各实现一份，游戏代码只依赖接口。
-  2. 包体限制与分包：主包 ≤ 4MB——把非首屏资源（后续关卡图 / BGM）放远程 CDN 动态加载，或用分包加载（`wx.loadSubpackage`）；写资源清单按「首屏必需 / 远程按需」两级的加载器（联动 CO03 的 AssetLoader 扩展）。
-  3. 开放数据域：好友排行榜数据（`wx.getFriendCloudStorage`）只能在封闭的「开放数据域」子环境读，主域拿不到原始数据只能用离屏 Canvas 共享绘制——写「主域发指令 → 开放数据域画榜 → 主域 drawImage 展示」的桥接流程与安全模型解释。
-  4. laew 借鉴：开放数据域的「数据不出域、只出渲染结果」是一个有趣的沙箱形态——对照 laew 工具权限设计（Bash 危险命令拦截 / Read 路径白名单），讨论「结果可见但数据不可导出」的隔离强度介于明文与全隔离之间。
-
----
+  1. Write Node 脚本 `tmpPlan/agent-test/platform_adapter.js`：实现 `PlatformAdapter` 接口（createCanvas/loadImage/playAudio/getStorage），Web 实现 + 微信小游戏 stub 实现各一份，统一调用入口 `gameLoop.run()` 输出每个 API 在两平台分别走了哪个实现到 `tmpPlan/agent-test/platform_log.json`。
+  2. Bash 跑：`node tmpPlan/agent-test/platform_adapter.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/platform_log.json')); assert all('impl' in e for e in d); web=[e for e in d if e['platform']=='web']; mp=[e for e in d if e['platform']=='minigame']; assert len(web)==len(mp)==5; print('PASS api_count=',len(d))"`。
+  3. Read 日志后 Write 资源分包加载器 `tmpPlan/agent-test/subpkg_loader.js`：主包 ≤ 4MB 限制、模拟 20 个资源（首屏 3 / 远程 17），输出加载顺序与累计大小到 `tmpPlan/agent-test/subpkg_log.json`。
+  4. Bash 跑：`node tmpPlan/agent-test/subpkg_loader.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/subpkg_log.json')); first=[e for e in d if e['phase']=='first_screen']; assert len(first)==3; assert max(e['cumulative'] for e in d)<=4*1024*1024; print('PASS main_pkg_max=',max(e['cumulative'] for e in d))"` 断言首屏资源先于远程加载且主包累计 ≤ 4MB。
 
 ### CO10 性能与内存排查实战
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_06-批量测试优化与状态标记方案.md）
 - **预期档位**: hard
 - **考察维度**: DevTools 性能面板 + GC 抖动 + 帧率埋点
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 性能面板定位掉帧：Chrome DevTools Performance 录制 10 秒，看帧率条与长任务——识别「脚本时间过长（逻辑热点）/ 渲染时间过长（绘制调用多）/ 布局抖动（DOM UI 频繁 reflow）」三类元凶，给出各自对应的优化动作。
-  2. GC 抖动：每帧 new 对象（粒子/向量）导致频繁 Minor GC——改用对象池预分配与 `Vec` 复用；用 Memory 面板的堆快照对比优化前后的分配速率（Allocation timeline 蓝条密度）。
-  3. drawcall 合批：按「同一雪碧图分组」排序绘制（状态切换最小化）、`globalAlpha` 批量设置、静态层离屏（联动 CO02）；写一个按纹理排序的渲染队列 `RenderQueue.submit(tex, sx, sy, dx, dy)`。
-  4. laew 借鉴：帧率埋点对照 laew Debug 模式的 trace 采集——讨论给 laew 加「性能计数器」（每轮 Agent 循环耗时 / 工具调用次数 / token 速率）并在 Debug 报告里输出 p50/p99，与游戏帧率监控的「实时仪表 + 事后报告」双层结构对齐。
+  1. Write Node 脚本 `tmpPlan/agent-test/perf_naive.js`：每帧 new 100 个粒子对象（无对象池），模拟 1000 帧，输出每帧分配对象数与 GC 触发次数到 `tmpPlan/agent-test/perf_naive.json`。
+  2. Bash 跑：`node tmpPlan/agent-test/perf_naive.js` 后 `python3 -c "import json; d=json.load(open('tmpPlan/agent-test/perf_naive.json')); assert all(e['alloc']==100 for e in d); assert d[-1]['gc_count']>=5; print('naive_gc=',d[-1]['gc_count'])"`。
+  3. Read 后 Write 对象池版本 `tmpPlan/agent-test/perf_pooled.js`：复用 100 个粒子对象，输出同样指标到 `tmpPlan/agent-test/perf_pooled.json`。
+  4. Bash 跑：`node tmpPlan/agent-test/perf_pooled.js` 后断言：`python3 -c "import json; a=json.load(open('tmpPlan/agent-test/perf_naive.json')); b=json.load(open('tmpPlan/agent-test/perf_pooled.json')); assert all(e['alloc']==0 for e in b); assert b[-1]['gc_count']<a[-1]['gc_count']; print('PASS gc_reduction=',a[-1]['gc_count']-b[-1]['gc_count'])"` 断言对象池版 GC 次数显著降低。

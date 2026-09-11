@@ -12,120 +12,140 @@
 
 ---
 
-### DI01 GNU 与 BSD 命令差异地图
+### DI01 GNU/BSD 工具差异探测
 
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
 - **预期档位**: medium
-- **考察维度**: coreutils 差异 / 可移植替写 / 差异探测
+- **考察维度**: sed/date/readlink 差异 / 可移植替写
+- **工具链**: Write → Bash → Bash → Write
 - **对话脚本**:
-  1. 同一条 `sed -i 's/a/b/' file` 在 Debian 和 macOS 上行为完全不同：GNU 的 `-i` 可不带参数、BSD 的 `-i` 必须跟备份后缀；列出 sed / date / readlink / stat / cp / head 这六个命令在 GNU（Linux）与 BSD（macOS）下的典型差异。
-  2. 针对上面的差异逐条给出可移植写法：`sed` 用临时文件重写、`date` 加载判断 `-v` 还是 `-d`、`readlink -f` 用 `realpath` 或循环 `cd` 替代；解释"探测一次、缓存到变量"的写法为什么要优于到处写 `if [[ $(uname) == Darwin ]]`。
-  3. 基于上面的探测思路，写一个 `portable_env_detect` 函数骨架：探测 OS、包管理器、coreutils 前缀（macOS 上 `gsed`/`gdate` 的 Homebrew 命名），并导出 `SED`、`DATE` 等命令变量供后续使用。
-  4. 动手：把 `ls -1 *.log | head -n 3 | xargs gzip` 改写成同时兼容 GNU/BSD 的版本，并用 Docker 起 alpine（BusyBox！）镜像验证 BusyBox 又是第三种行为，记录差异表。
+  1. Write 在 `tmpPlan/agent-test/di01/` 写 `gen_diff_demo.sh`：故意用 `sed -i 's/a/b/' file`（无备份后缀）与 `date -d "2024-01-01" +%s`（GNU 语法），Bash 跑：`bash gen_diff_demo.sh` 在 GNU/Linux 上成功（断言 echo $? == 0）、`bash gen_diff_demo.sh 2>&1 | grep -i 'illegal option\|invalid'` 在 BSD/macOS 上预期失败（用 docker alpine 跑镜像不行 → 直接用 stderr 预演差异）。
+  2. Write 写 `portable_env_detect()` 函数：探测 OS（`uname -s`）、包管理器（apt/brew/apk）、GNU 工具前缀（`command -v gsed gdate`）；Bash 跑：`bash -c 'source portable.sh; portable_env_detect'` 输出 `SED=/usr/bin/sed`、`DATE=date`、前缀提示。
+  3. Bash 验证探测可移植：`bash -c 'source portable.sh; type portable_env_detect'` 断言输出函数定义；Write 加 `run_demo.sh`：根据探测结果切换 sed 写法，断言 echo "ok"。
+  4. Write 写 `di01_report.md`：列出 sed/date/readlink/stat/cp/head 六命令 GNU vs BSD 差异表，解释"探测一次缓存到变量"优于到处写 uname 判断的原因。
 
 ---
 
-### DI02 bash / zsh / fish 方言差异与兼容策略
+### DI02 bash/zsh/fish 方言兼容
 
-- **预期档位**: medium~hard
-- **考察维度**: shell 方言 / 数组与分词 / 兼容边界
-- **对话脚本**:
-  1. 为什么"在交互终端 zsh 里试得好好的脚本，放进 CI 的 `/bin/sh` 就炸"？从数组下标（bash 从 0、zsh 默认从 1）、字符串分词（zsh 默认不做 word splitting）、`==` 与 `=` 模式匹配三个例子讲清方言差异。
-  2. 针对上面的差异给出工程策略：脚本一律声明 `#!/usr/bin/env bash` 并 `set -euo pipefail`；数组的写法差异如何用显式 `"${arr[@]}"` 规避；fish 根本不是 POSIX 后代，为什么"给 fish 写脚本"通常应转译而不是翻译。
-  3. 基于上面的结论，讨论"公司里同事默认 shell 五花八门"的现实：发布给团队的脚本应该假设什么解释器？`#!/usr/bin/env bash` 在 Nix、Homebrew、WSL 上的解析路径有何不同？
-  4. 动手：写一个 `countdown.sh`，在 bash 3.2（macOS 自带）与 bash 5 上都可用——不用关联数组、不用 `${var,,}` 小写展开，列出你为了兼容 bash 3.2 砍掉了哪些语法。
-
----
-
-### DI03 POSIX sh 可移植子集编程
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
 - **预期档位**: medium
-- **考察维度**: POSIX 子集 / 可移植构造 / 何时值得
+- **考察维度**: 数组下标 / word splitting / 模式匹配
+- **工具链**: Write → Bash → Bash → Write
 - **对话脚本**:
-  1. POSIX sh 是"最小公共分母"：解释 `local` 并非 POSIX 标准、`[[ ]]` 是 bash/ksh 扩展、`echo -n` 行为不可指定；给出每条的 POSIX 替代写法（子函数、`case`/`test`、`printf`）。
-  2. 针对上面的替代写法，讨论可移植性的代价：没有数组怎么办（`set --` 位置参数当数组用）、没有管道失败检测怎么办；用 `set -- a b c; for x do echo "$x"; done` 展示这一惯用法。
-  3. 基于上面的对比，建立决策树：什么场景值得写纯 POSIX sh（Docker ENTRYPOINT、initramfs、OpenBSD rc 脚本），什么场景应果断换语言；解释"Alpine 镜像默认没有 bash"对 Dockerfile 里脚本选择的影响。
-  4. 动手：把一段 30 行的 bash 脚本（含数组、`[[ ]]`、进程替换）降级为 dash 可执行的 POSIX 版本，用 `dash -n` 与 `shellcheck --shell=sh` 验证，并总结降级过程中最痛的三处改动。
+  1. Write 在 `tmpPlan/agent-test/di02/` 写 `dialect_demo.sh`：演示 bash 数组下标 0、`"${arr[@]}"` 引用、`[[ ]]` 模式匹配 `== glob`；Bash 跑：`bash dialect_demo.sh` 输出 0-based 索引；`zsh dialect_demo.sh`（如 zsh 可用）输出 1-based 差异。
+  2. Write 写 `countdown.sh`：从 5 倒计时到 0，不使用关联数组与 `${var,,}`，Bash 跑：`bash countdown.sh` 输出 5/4/3/2/1；再 `bash --version` 验证能在 bash 3.2（macOS 自带）上跑（如当前 bash 较新，`bash --posix countdown.sh` 验证 POSIX 子集兼容性）。
+  3. Bash 用 grep 检测兼容性：`bash -n countdown.sh && echo "syntax ok"` 断言无语法错。
+  4. Write 写 `di02_report.md`：列出为兼容 bash 3.2 砍掉的语法（mapfile/关联数组/小写展开）、`#!/usr/bin/env bash` 在 Nix/Homebrew/WSL 上的解析路径差异。
 
 ---
 
-### DI04 shebang、换行符与编码陷阱
+### DI03 POSIX sh 子集降级
 
-- **预期档位**: simple~medium
-- **考察维度**: shebang 解析 / CRLF / 文件编码
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **预期档位**: medium
+- **考察维度**: POSIX 子集 / `[[ ]]` 替代 / dash
+- **工具链**: Write → Bash → Bash → Write
 - **对话脚本**:
-  1. `#!/bin/bash` 与 `#!/usr/bin/env bash` 差在哪？为什么带空格的安装路径（如 macOS 的 `/Applications/My Tools/bin`）能击毁固定路径 shebang；解释内核对 shebang 行"只拆一个参数"的规则。
-  2. 针对上面的解析规则，进入换行符陷阱：Windows 上编辑的脚本带 CRLF，报错 `\r: command not found`；解释为什么错误信息里的 `\r` 几乎不可见，以及 `.gitattributes` 里 `*.sh text eol=lf` 如何在仓库层面根治。
-  3. 基于上面的两个坑，整理"脚本跨机器跑不起来"的第一时间排查清单：`file` 看编码、`cat -A` 看 CRLF、`which bash` 看解释器、`bash -x` 看执行轨迹；再补充 UTF-8 BOM 在老版本 bash 上的坑。
-  4. 动手：写一个 `scriptdoctor` 函数：输入脚本路径，自动检测 CRLF、BOM、shebang 是否存在、解释器是否安装、文件是否可执行，输出诊断报告并给出修复命令（`dos2unix`、`chmod +x`）。
+  1. Write 在 `tmpPlan/agent-test/di03/` 写 `bash_only.sh`：含数组、`[[ ]]` 模式、进程替换 `<(...)`、local 声明；Bash `bash bash_only.sh` 跑通（断言 echo $? == 0）；`dash bash_only.sh 2>&1 | head -5` 预期报错。
+  2. Write 写 `posix.sh`：改写 `bash_only.sh` 为 dash 可执行版本（用 `set --` 当数组、`case` 替代 `[[ ]]`、管道改文件、子函数替代 local）；Bash `dash posix.sh` 断言 exit 0。
+  3. Bash 用 shellcheck 静态验证：`shellcheck --shell=sh posix.sh && echo "clean"` 断言无警告（若 shellcheck 不可用则 `dash -n posix.sh && echo "syntax ok"`）。
+  4. Write 写 `di03_report.md`：列出降级过程中最痛的三处改动（local/数组/[[ ]]），解释 Alpine 镜像默认没 bash 对 Dockerfile 的影响。
 
 ---
 
-### DI05 trap 错误处理链与清理顺序
+### DI04 scriptdoctor 诊断脚本
 
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **预期档位**: simple
+- **考察维度**: shebang/CRLF/BOM/可执行位
+- **工具链**: Write → Bash → Bash → Write
+- **对话脚本**:
+  1. Write 在 `tmpPlan/agent-test/di04/` 写 `gen_bad_scripts.sh`：生成 3 个故意有问题的脚本 `crlf.sh`（CRLF 换行）、`no_shebang.sh`（无 shebang）、`not_exec.sh`（无可执行位）；Bash 跑脚本、`file crlf.sh` 断言 = "CRLF line terminators"。
+  2. Write 写 `scriptdoctor.py`：检查 shebang 存在、CRLF（`\r` 字节）、UTF-8 BOM、可执行位、解释器是否在 `$PATH`；Bash 跑：`python3 scriptdoctor.py crlf.sh no_shebang.sh not_exec.sh` 输出诊断报告，断言 3 个脚本都至少命中 1 条问题。
+  3. Bash 验证修复：给 `no_shebang.sh` 加 shebang、`chmod +x not_exec.sh`、`dos2unix crlf.sh`；再跑 `python3 scriptdoctor.py *.sh` 断言输出 "all clean"。
+  4. Write 写 `di04_report.md`：整理"脚本跨机器跑不起来"的第一时间排查清单、`file`/`cat -A`/`which bash`/`bash -x` 四个工具的用法。
+
+---
+
+### DI05 trap 错误处理链 + 清理栈
+
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
 - **预期档位**: hard
-- **考察维度**: trap 语义 / 清理链 / ERR 陷阱边界
+- **考察维度**: EXIT/ERR/INT / 清理栈 / 行号上报
+- **工具链**: Write → Bash → Bash → Write
 - **对话脚本**:
-  1. 临时文件用完就删：`trap 'rm -f "$tmp"' EXIT` 的执行时机覆盖正常退出、`set -e` 触发的失败、Ctrl-C 吗？分别解释 EXIT / INT / TERM / ERR 四个信号或伪信号的触发条件与典型用途。
-  2. 针对上面的基础，深入两个经典坑：(a) ERR 陷阱在 `if` 条件、`&&` 链、管道非最后一段里**不触发**；(b) 同一 trap 重复注册会覆盖而非追加——如何在保留前一个清理动作的前提下追加清理（读取 `trap -p` 再拼接）。
-  3. 基于上面的坑，设计一个"分层清理栈"：`push_cleanup 'umount /mnt/iso'`、`push_cleanup 'rm -rf "$tmpdir"'`，退出时后进先出执行；讨论它与 `trap` 单槽覆盖的本质矛盾以及为什么需要这个抽象。
-  4. 动手：实现 `push_cleanup` / `pop_cleanup` / 错误行号上报（`$LINENO` 与 `caller` 内建），写一个使用示例：挂载临时镜像 → 复制文件 → 任一步失败都完整回滚，并构造三个失败注入点验证清理顺序。
+  1. Write 在 `tmpPlan/agent-test/di05/` 写 `cleanup_stack.sh`：实现 `push_cleanup` / `pop_cleanup`（数组存命令 + trap EXIT 倒序执行）+ `$LINENO` 错误行号上报；Bash 跑：`bash cleanup_stack.sh` 输出基本清理栈演示（断言最后一行 = "cleanup: tmpdir removed"）。
+  2. Write 写 `mount_rollback.sh`：用 cleanup_stack 模拟"挂载 → 复制 → 失败回滚"流程；故意在 `cp` 后注入 `false` 让流程失败；Bash 跑：`bash mount_rollback.sh 2>&1` 断言输出 "umount /mnt/iso" 与 "rm -rf tmpdir" 两条清理。
+  3. Bash 验证三个失败注入点：`bash -c "source mount_rollback.sh; mount_step; false_step"` 断言 EXIT 1 且清理栈全跑；`bash -c "source mount_rollback.sh; mount_step; cp_step; false_step"` 同样断言清理执行。
+  4. Write 写 `di05_report.md`：解释 ERR trap 在 if/&&/管道非末段不触发、trap 重复注册覆盖而非追加的坑、分层清理栈与单槽 trap 的本质矛盾。
 
 ---
 
-### DI06 参数解析与 CLI 惯例
+### DI06 getopts 参数解析
 
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
 - **预期档位**: medium
-- **考察维度**: getopts / 长选项 / POSIX CLI 约定
+- **考察维度**: getopts / 长选项 / 退出码
+- **工具链**: Write → Bash → Bash → Write
 - **对话脚本**:
-  1. 命令行脚本的"民间标准"：`-h/--help`、`-v` 与 `--verbose` 撞车时怎么办、`--` 分隔符的作用、参数后接值的三种形态（`-ofile` / `-o file` / `--output=file`）；对照 `ls`、`tar`、`curl` 的真实行为说明 GNU 风格约定。
-  2. 针对上面的约定，用 `getopts` 实现短选项解析：`while getopts "vo:" opt` 循环、`$OPTARG` 取值、`$OPTIND` 之后 `shift $((OPTIND-1))` 收集位置参数；说明 getopts 为什么**不支持长选项**以及 `vo:` 中冒号位置的含义。
-  3. 基于上面的 getopts 版本，手写一个长选项解析器：处理 `--output=x`、`--output x`、未知选项报错并指向 usage、`--` 终止选项扫描；对比两种实现的代码量与健壮性，讨论何时该换 argparse（Python）而不是硬撑。
-  4. 动手：给脚本加规范 usage 与退出码约定（0 成功 / 2 用法错误 / 3 运行时错误），实现 `usage()` 函数自动从注释生成；验证 `mytool --help | head -5` 与 `mytool -q 2>&1; echo $?` 的行为。
+  1. Write 在 `tmpPlan/agent-test/di06/` 写 `mytool.sh`：用 `getopts "vo:"` 解析 `-v`/`-o output`、`shift $((OPTIND-1))` 收集位置参数、`usage()` 输出 `-h` 帮助；Bash 跑：`bash mytool.sh -v -o out.txt file1 file2` 断言 echo $? == 0、参数被正确接收。
+  2. Bash 验证长选项：`bash mytool.sh --help 2>&1 | head -3` 输出 usage；`bash mytool.sh -x 2>&1` 断言退出码 = 2（用法错误）。
+  3. Write 加长选项解析（手写 parse_long 循环处理 `--output=x` / `--output x` / `--` 终止）；Bash 跑：`bash mytool.sh --output=out.txt file1` 断言 output=out.txt。
+  4. Write 写 `di06_report.md`：解释 `vo:` 冒号位置语义、getopts 不支持长选项的原因、何时应换 argparse（Python）而不是硬撑。
 
 ---
 
-### DI07 管道子 shell 变量丢失与进程替换
+### DI07 管道子 shell 变量丢失
 
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
 - **预期档位**: hard
-- **考察维度**: 子 shell 边界 / 进程替换 / 数据传递
+- **考察维度**: 子 shell 边界 / 进程替换 / 流式
+- **工具链**: Write → Bash → Bash → Write
 - **对话脚本**:
-  1. 经典陷阱：`cat list | while read -r line; do count=$((count+1)); done; echo $count` 永远输出 0——解释管道右侧是子 shell、变量修改不回传的原理；画出父子进程与变量副本的关系图。
-  2. 针对上面的原理给出四种修复：进程替换 `while ... done < <(cat list)`、here-string 重定向、把结果写文件再读、用 `last` 命令数组累积（`mapfile -t arr < file`）；说明 `mapfile`/`readarray` 为何是 bash 4+ 的正解。
-  3. 基于上面的进程替换，扩展它在跨平台的另一面：`<(...)` 在 macOS bash 3.2 可用但在 POSIX sh、dash、busybox sh 里不可用；给出"进程替换降级"策略（FIFO 命名管道 + trap 清理，或临时文件）。
-  4. 动手：实现 `csv_stats.sh`：流式读取 CSV 统计行列数与某列汇总，要求不把整个文件读进内存、兼容 bash 3.2；用 `yes | head -c 20m` 生成 2000 万字符测试流式处理时的内存占用（`/usr/bin/time -v` 观察 RSS）。
+  1. Write 在 `tmpPlan/agent-test/di07/` 写 `subshell_trap.sh`：经典陷阱 `cat list | while read -r line; do count=$((count+1)); done; echo $count` 永远输出 0；Bash 跑：`bash subshell_trap.sh` 断言 echo 输出 = 0。
+  2. Write 写 `subshell_fix.sh`：用 `while read ... done < <(cat list)` 进程替换修复；Bash 跑：`bash subshell_fix.sh` 断言 echo 输出 = 5（list 有 5 行）。
+  3. Write 写 `csv_stats.sh`：流式读 CSV 统计行列数与某列汇总、用 `read` 替代 mapfile；Bash 跑：`bash csv_stats.sh < sample.csv` 断言输出"rows=10, sum=..."。
+  4. Write 写 `di07_report.md`：解释子 shell 变量副本原理、四种修复方式、mapfile 是 bash 4+ 正解但需考虑 bash 3.2 兼容。
 
 ---
 
-### DI08 bats 单元测试与 Shell CI
+### DI08 bats 风格 shell 测试（python 替代）
 
-- **预期档位**: medium~hard
-- **考察维度**: bats 框架 / 命令 mock / CI 门禁
-- **对话脚本**:
-  1. Shell 脚本也能写单元测试：bats 的 `@test` 块、`run` 捕获输出、`[ "$status" -eq 0 ]` 断言三件套；为一个 `slugify()` 函数写第一个测试，说明 bats 如何把 stdout/stderr/status 收进 `$output`/`$status`。
-  2. 针对上面的第一个测试，处理"被测函数内部调用了外部命令"的情况：把 `date`、`curl` mock 掉——用测试专用 `bin/` 目录 + `PATH` 前置注入假命令，对比 mock 命令与 mock 函数两种手法的适用边界。
-  3. 基于上面的 mock 手法，补齐负面用例：非法参数应退出码 2、输出用法到 stderr；讨论 bats 的 `setup`/`teardown` 与临时目录（`mktemp -d` + trap 清理）的配合惯例。
-  4. 动手：为 DI07 的 `csv_stats.sh` 写 5 个 bats 用例（空文件 / 表头 / 带引号字段 / CRLF / 大文件抽样），并写一段 GitHub Actions：矩阵跑 `ubuntu + macos` 两个平台的 bats，失败时上传失败用例名。
-
----
-
-### DI09 bash→PowerShell 对译工程
-
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
 - **预期档位**: medium
-- **考察维度**: 文本流 vs 对象流 / 错误流 / 对译方法论
+- **考察维度**: subprocess 断言 / 命令 mock / shell 行为验证
+- **工具链**: Write → Bash → Bash → Write
 - **对话脚本**:
-  1. 两种哲学的根本分叉：bash 管道流的是**文本**、一切靠解析；PowerShell 管道流的是**对象**、属性直接点出来；用"取占用空间前 5 的目录"同一个任务，写出 `du | sort | head` 与 `Get-ChildItem | Sort-Object Length -Desc | Select -First 5` 的对比例子。
-  2. 针对上面的分叉，对译错误处理：bash 的退出码 `$?` 与 `set -e`，对应 PowerShell 的 `$?`、`$LASTEXITCODE`（只在调外部 exe 时更新）与 `$ErrorActionPreference='Stop'`；解释为什么"PS 里 grep 失败脚本继续跑"是最常见对译 bug。
-  3. 基于上面的对照，建立一张对译速查表：grep→`Select-String`、sed→`-replace`、awk→`ForEach-Object`/`Where-Object`、xargs→`ForEach-Object -Parallel`、trap→`try/finally`、`$(...)`→`$()`+子表达式；标注每条中"形似神不似"的坑。
-  4. 动手：把 DI05 的"挂载镜像→复制→失败回滚"脚本完整对译成 PowerShell（`Mount-DiskImage`、`Copy-Item`、`try/catch/finally`），在 Windows 上验证回滚路径，并列出对译过程中你不得不改变设计结构的三处。
+  1. Write 在 `tmpPlan/agent-test/di08/` 写 `slugify.py`：slug 化函数（小写、空格转 -、去标点）；Bash 跑：`python3 slugify.py "Hello World!"` 断言输出 = "hello-world"。
+  2. Write 写 `test_slugify.py`：5 个 unittest 用例（空串、纯字母、含空格、含特殊字符、Unicode），Bash 跑：`python3 -m unittest test_slugify.py -v` 断言 OK。
+  3. Write 写 `test_shell_behavior.py`：用 subprocess 调 `bash csv_stats.sh < sample.csv` 断言 stdout 含 "rows=10"、stderr 为空、exit 0；Bash 跑 `python3 -m unittest test_shell_behavior.py -v` 断言 PASS。
+  4. Write 写 `di08_report.md`：解释 bats 在不可用时用 python unittest + subprocess 是等效替代、命令 mock 通过 PATH 前置注入的技巧、setup/teardown 与 mktemp -d + trap 配合。
 
 ---
 
-### DI10 脚本分发与环境锁定
+### DI09 bash↔PowerShell 对照表
 
-- **预期档位**: hard
-- **考察维度**: 环境探测 / 版本横幅 / 降级矩阵
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **预期档位**: medium
+- **考察维度**: 文本流 vs 对象流 / 对译方法论
+- **工具链**: Write → Bash → Bash → Write
 - **对话脚本**:
-  1. 把脚本发给十台机器，十台环境各不相同：最低 bash 版本、必需命令（jq/curl/openssl）、操作系统、CPU 架构（arm64 服务器上 `uname -m` 差异）——设计一个 `preflight()` 启动自检：缺什么就报什么、给出安装指引，而不是跑到一半神秘失败。
-  2. 针对上面的自检，加版本要求：脚本用了 `mapfile`（bash 4+）与 `readarray`，如何比较版本字符串（把 `4.2.46` 拆位比较而不是字符串比较）；解释 macOS 系统 bash 3.2 的历史包袱与 `brew install bash` 后 shebang 解析路径。
-  3. 基于上面的版本矩阵，讨论分发形态选型：单文件脚本 vs `curl | bash` 安装器 vs 打成 Homebrew formula / deb 包 vs 干脆 Docker 镜像兜底（`docker run --rm mytool`），从依赖可控性、更新成本、离线环境三个维度对比。
-  4. 动手：为脚本加上 `--self-check`（打印环境矩阵：OS/bash 版本/依赖版本/架构）与 `--version`（嵌入发布号与 git hash），写一个发布 checklist：shellcheck 通过 → bats 全绿 → 三平台 smoke → 打 tag，说明为什么 CI 应拒绝跳过 smoke 直接发版。
+  1. Write 在 `tmpPlan/agent-test/di09/` 写 `disk_usage.sh`：取占用空间前 5 的目录（`du -sh */ | sort -rh | head -5`）；Bash 跑：`bash disk_usage.sh | tee baseline.txt` 输出前 5 行。
+  2. Write 写 `disk_usage.ps1`：PowerShell 版本（`Get-ChildItem | ForEach-Object { (Get-Item $_.FullName -Force).Length }` 简化版、`Sort-Object -Desc | Select -First 5`）；Bash 用 `which pwsh` 检查是否可用，如不可用则 Write 写 `disk_usage_pwsh_demo.txt` 伪输出对照格式。
+  3. Bash 跑 `bash disk_usage.sh > bash_out.txt`、`cat bash_out.txt | wc -l` 断言 = 5（取前 5）。
+  4. Write 写 `di09_report.md`：列出 bash↔PowerShell 对照表（grep→Select-String / sed→-replace / awk→ForEach-Object / xargs→ForEach-Object -Parallel / trap→try-finally / $(...)→$()子表达式），标注"形似神不似"的坑。
+
+---
+
+### DI10 preflight 自检 + 版本横幅
+
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **预期档位**: hard
+- **考察维度**: 环境探测 / 版本拆位比较 / 依赖矩阵
+- **工具链**: Write → Bash → Bash → Write
+- **对话脚本**:
+  1. Write 在 `tmpPlan/agent-test/di10/` 写 `preflight.sh`：检测 bash 版本（≥4.0）、必需命令（jq/curl/openssl）、OS、CPU 架构；`ver_ge()` 函数把版本字符串拆位比较（4.2.46 → [4,2,46]）；Bash 跑：`bash preflight.sh` 输出环境矩阵到 stdout，断言 bash≥4.0 行存在。
+  2. Bash 故意在低 bash 测：`bash --version | head -1` 当前 bash 版本 > 4.0 时测试"硬编码低版本"分支：`bash -c 'source preflight.sh; bash_required=5.0; ver_ge "$BASH_VERSION" "$bash_required" || echo "blocked"'` 验证 ver_ge 在不满足时返回非零。
+  3. Write 加 `--self-check`（打印环境矩阵）和 `--version`（嵌入发布号与 git hash）；Bash 跑：`bash preflight.sh --version` 输出含 "v1.0.0"，`bash preflight.sh --self-check` 输出含 "OS=" 行。
+  4. Write 写 `di10_report.md`：对比单文件脚本/curl|bash 安装器/Homebrew formula/deb 包/Docker 镜像五种分发形态、CI 三平台 smoke 测试为何不可跳过。

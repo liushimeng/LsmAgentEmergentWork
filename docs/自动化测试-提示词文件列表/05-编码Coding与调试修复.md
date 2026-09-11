@@ -3,108 +3,116 @@
 > 使用说明见同目录 `README.md`。每条提示词在同一 Session 内按轮次顺序喂入。
 
 ## 维度说明
-
-本维度考察 Agent 在**编码实现、调试修复、代码审查、重构优化**等开发场景中的表现，
-涵盖算法实现、Bug 定位、性能优化、代码审查、安全编程、测试编写等主题。
+本维度考察 Agent 在**编码实现、调试修复、代码审查、重构优化、测试编写**等开发场景的多轮迭代能力。所有任务固定 4 轮，要求至少 1 轮 Bash 执行并断言、至少 1 轮 Write 落盘产物到 `tmpPlan/agent-test/` 沙盒。衡量重点：把算法/正则/API/并发/安全等抽象编码任务转化为最小可运行代码+测试用例+断言，hard 档须含「故意埋缺陷→定位→修复→重跑通过」闭环，且多轮之间通过 Read/Edit 复用前轮产物。本机工具链以 python3/bash/cargo 优先，不依赖外网。
 
 ---
 
-### E01 实现一个 CLI 工具
-- **测试状态**: ✅ 已测试 (E01_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通,详见 `tmpPlan/2026-09-10_02-D01-E01-测试与TUI显示验证方案.md`)
+### E01 实现 wc 命令行工具
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_02-D01-E01-测试与TUI显示验证方案.md）
 - **预期档位**: medium
-- **考察维度**: 完整工程实现能力
+- **考察维度**: 完整工程实现能力 + 测试闭环
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. 请用 Rust 实现一个简单的 `wc` 命令行工具，支持统计文件的行数、单词数、字节数。
-  2. 给工具添加 `--json` 输出格式支持，输出结构化结果。
-  3. 为工具编写单元测试，覆盖正常输入和异常输入。
-  4. 把代码保存到 `tmpPlan/rs_wc/`，包含完整的 Cargo 项目结构。
+  1. Write 一份纯 python3 实现 `tmpPlan/agent-test/wc.py`：支持 `-l`（行数）、`-w`（单词数）、`-c`（字节数）、`--json`（JSON 输出），默认全 3 项；`--help` 打印用法。
+  2. Bash：`echo -e "a b\nc d e" | python3 tmpPlan/agent-test/wc.py` 应输出 lines=2 words=5 bytes=9（grep -F 'lines=2' / 'words=5' / 'bytes=9' 校验），且 `echo "1 2" | python3 tmpPlan/agent-test/wc.py --json | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["lines"]==1'` 应通过。
+  3. Read wc.py，再 Write 测试套件 `tmpPlan/agent-test/test_wc.py`：覆盖正常输入、空文件、仅空格、异常参数、`--json` 结构校验至少 5 个用例。
+  4. Bash：`python3 tmpPlan/agent-test/test_wc.py 2>&1 | tail -1` 应输出 "OK" 或类似 pass 信息（断言失败则 Edit 修复 wc.py 后重跑）。
 
 ### E02 调试一段错误代码
-- **测试状态**: ✅ 已测试 (E02_q1, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通; 注意: mock 环境分类为 simple, 预期档位为 medium, 需真实 LLM 回归验证, 详见 `tmpPlan/2026-09-10_21-B08-C06-D10-E02-L03-自动化测试与Yolo分类验证方案.md`)
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_21-B08-C06-D10-E02-L03-自动化测试与Yolo分类验证方案.md）
 - **预期档位**: medium
-- **考察维度**: Bug 定位与修复能力
+- **考察维度**: Bug 定位与修复能力 + 闭环
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. 这段 Rust 代码编译不过，请找出所有错误并解释原因。
-  2. 修复后代码运行结果不对（逻辑 bug），请用调试思路定位问题。
-  3. 给修复后的代码加上注释，说明每个修改点的原因。
-  4. 写一个测试用例来验证修复的正确性。
-- **实测状态**: ✅ 通过（2026-09-10，mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通，TUI 主屏中文显示 / `[QC] ✅ 通过` / `[trace] iter=1 tools=0` / `[session_context 摘要]` / `本次用量` 全部正常，详见 `tmpPlan/2026-09-10_05-D08-E02-测试与TUI用量显示Bug修复方案.md`）
+  1. Write 一段故意含 3 类错误的 python3 `tmpPlan/agent-test/buggy.py`：① 语法错误（漏冒号）、② 名称错误（变量名拼错）、③ 逻辑 bug（循环范围差一），每类注释 `# TODO: 故意埋`。
+  2. Bash：`python3 tmpPlan/agent-test/buggy.py 2>&1 | tee tmpPlan/agent-test/err.log`，断言 `err.log` 含 "SyntaxError" 或 "NameError"（grep -F 命中）→ 确认捕获到 ①/②。
+  3. Read err.log + buggy.py，Write 修复版 `tmpPlan/agent-test/fixed.py`：修掉 ① ② 后跑 `python3 tmpPlan/agent-test/fixed.py`，观察 ③ 导致的逻辑错误输出。
+  4. Bash：`diff tmpPlan/agent-test/buggy.py tmpPlan/agent-test/fixed.py | grep -c '^[<>]'` 应 ≥ 4（至少 4 行差异），且 `python3 tmpPlan/agent-test/fixed.py 2>&1 | tee /dev/null` 不抛错且输出符合预期（脚本内 assert 通过则 echo FIXED）。
 
 ### E03 代码审查（Code Review）
-- **测试状态**: ✅ 已测试 (E03_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通, 详见 `tmpPlan/2026-09-10_05-A02-E03-L02-S01-C05-自动化测试与hard任务Plan解析Bug修复方案.md`)
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_05-A02-E03-L02-S01-C05-自动化测试与hard任务Plan解析Bug修复方案.md）
 - **预期档位**: medium
-- **考察维度**: 代码质量评估 + 改进建议
+- **考察维度**: 代码质量评估 + 改进建议 + 落盘
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. 这是一段实现用户认证的代码，请做代码审查，找出潜在问题。
-  2. 从安全性角度审查这段代码，指出可能的漏洞（如 SQL 注入、XSS）。
-  3. 从性能角度分析，有没有可以优化的地方？
-  4. 给出重构建议，让代码更易读、更易维护。
+  1. Write 一份含 4 类故意缺陷的 python3 `tmpPlan/agent-test/review_me.py`：① 硬编码密码 ② 未校验输入类型导致 SQL 注入风险 ③ 列表遍历 O(n²) 性能瓶颈 ④ 无异常处理 500 崩溃，每类注释 `# REVIEW: 缺陷类型`。
+  2. Bash：静态扫描 `grep -c 'REVIEW:' tmpPlan/agent-test/review_me.py` 应 = 4，`grep -F 'password=' tmpPlan/agent-test/review_me.py | wc -l` 应 ≥ 1（命中 ①）。
+  3. Read review_me.py，再 Write 审查报告 `tmpPlan/agent-test/review.md`：每缺陷 1 行「编号/严重度/位置/建议」，末尾「优先级排序/预估工时」2 小节。
+  4. Bash `grep -c '^### ' tmpPlan/agent-test/review.md` 应 ≥ 4，`grep -F '密码\|SQL注入\|O(n²)\|异常处理' tmpPlan/agent-test/review.md | wc -l` 应 ≥ 4（每类都讨论）。
 
-### E04 数据结构与算法
-- **测试状态**: ✅ 已测试 (E04_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通,Debug Report SubAgent trace 显示 `iterations=2 tool_calls=1(ok=1,err=0)`,StopReason 序列正确,详见 `tmpPlan/2026-09-10_01-A10-E04-测试与mock角色识别Bug方案.md`)
+### E04 LRU 缓存纯 python3 实现
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_01-A10-E04-测试与mock角色识别Bug方案.md）
 - **预期档位**: medium
-- **考察维度**: 算法实现 + 复杂度分析
+- **考察维度**: 数据结构与算法 + 边界断言
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. 请实现一个 LRU 缓存，支持 get 和 put 操作，要求 O(1) 时间复杂度。
-  2. 解释你的实现思路，分析时间复杂度和空间复杂度。
-  3. 如果要多线程安全，应该怎么改？对比 Mutex 和 RwLock 的选择。
-  4. 写一组测试用例，覆盖边界情况（空缓存、满缓存、并发访问）。
+  1. Write 纯 python3 LRU `tmpPlan/agent-test/lru.py`：用 `collections.OrderedDict` 实现 `class LRUCache`，`get(k)`/`put(k,v)` 均为 O(1)，`get` 未命中返回 -1。
+  2. Bash：`python3 tmpPlan/agent-test/lru.py`（脚本内自带断言：cap=2 时 put(1,1)→put(2,2)→get(1)=1→put(3,3) 触发逐出→get(2)=-1），断言输出含 "assert_ok"（grep -F 命中）。
+  3. Read lru.py，再 Write 多线程安全版 `tmpPlan/agent-test/lru_mt.py`：用 threading.Lock 保护 get/put，脚本内起 2 线程并发读写同一 key，验证计数一致性。
+  4. Bash：`python3 tmpPlan/agent-test/lru_mt.py 2>&1 | tee tmpPlan/agent-test/lru_mt.log`，断言 `lru_mt.log` 含 "race_ok" 或 "final_count=" 且无 "Error"（grep -F 校验）。
 
 ### E05 正则表达式实战
-- **测试状态**: ✅ 已测试 (E05_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext→Debug 完整跑通,详见 `tmpPlan/2026-09-10_03-C04-E05-测试与TUI按钮CJK截断修复方案.md`)
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_03-C04-E05-测试与TUI按钮CJK截断修复方案.md）
 - **预期档位**: simple
-- **考察维度**: 正则编写 + 实际应用场景
+- **考察维度**: 正则编写 + 实测断言
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 写一个正则表达式，匹配中国大陆的手机号码（11 位，1 开头）。
-  2. 写一个正则，从日志中提取所有 IP 地址和对应的时间戳。
-  3. 用你写的正则处理一段示例日志，验证匹配结果。
-  4. 正则表达式在实际项目中有哪些常见陷阱？如何避免？
+  1. Write python3 脚本 `tmpPlan/agent-test/re_demo.py`：定义 4 个正则（中国大陆手机号、IP 地址、时间戳 YYYY-MM-DD HH:MM:SS、邮箱），每个带 3 个断言用例（应匹配/不应匹配），全部通过则 echo "regex_ok"。
+  2. Bash：`python3 tmpPlan/agent-test/re_demo.py 2>&1 | tee tmpPlan/agent-test/re.log`，断言 `re.log` 含 "regex_ok" 且不含 "AssertionError"。
+  3. Read re_demo.py，再 Write 一段带正则的示例日志 `tmpPlan/agent-test/sample_log.txt`（6 行含合法手机号+IP+时间戳混合），并 Write `tmpPlan/agent-test/extract.py`：用 3 个正则一次提取手机号/IP/时间戳落盘 `tmpPlan/agent-test/extracted.log`。
+  4. Bash：`python3 tmpPlan/agent-test/extract.py` 后 `grep -cE '^1[3-9][0-9]{9}$' tmpPlan/agent-test/extracted.log` 应 ≥ 1，`grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' tmpPlan/agent-test/extracted.log | wc -l` 应 ≥ 1（手机号+IP 各至少 1 条）。
 
-### E06 API 接口实现
-- **测试状态**: ✅ 已测试 (E06_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通; 详见 `tmpPlan/2026-09-10_11-A03-B01-A05-D04-E06-自动化测试与TUI验证方案.md`)
+### E06 Todo API 服务端
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_11-A03-B01-A05-D04-E06-自动化测试与TUI验证方案.md）
 - **预期档位**: medium
-- **考察维度**: Web API 开发能力
+- **考察维度**: Web API 开发能力（用 python3 http.server 替代 axum/actix-web）
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 设计一个 RESTful API 用于管理待办事项（Todo），包含 CRUD 操作。
-  2. 用 Rust（axum 或 actix-web）实现这个 API，包含数据模型和路由。
-  3. 添加请求参数验证和错误处理，返回合适的 HTTP 状态码。
-  4. 为 API 编写集成测试，验证各端点的正确性。
+  1. Write 一个 python3 HTTP API `tmpPlan/agent-test/todo_server.py`：用 `http.server.BaseHTTPRequestHandler` 实现 `/todos`（GET 列表/POST 创建）+ `/todos/<id>`（GET/PUT/DELETE），内存态列表 + `next_id` 自增，请求体 JSON 校验返回合适 HTTP 状态码（200/201/400/404）。
+  2. Bash：后台起服务 `python3 tmpPlan/agent-test/todo_server.py & echo $! > tmpPlan/agent-test/todo.pid; sleep 1`，然后 `curl -s -X POST http://127.0.0.1:18090/todos -d '{"title":"buy milk"}' -H 'Content-Type: application/json' | tee tmpPlan/agent-test/post.log` 应含 "201" 或 `"id": 1`（grep -E '201|"id": 1' 命中）。
+  3. Read todo_server.py，再 Write 集成测试 `tmpPlan/agent-test/test_todo.py`：顺序跑 5 个用例（创建→列表→更新→获取→删除），每步断言状态码与 body。
+  4. Bash：`python3 tmpPlan/agent-test/test_todo.py 2>&1 | tail -1` 应含 "ok"；`kill $(cat tmpPlan/agent-test/todo.pid) 2>/dev/null` 清理。
 
-### E07 并发编程挑战
-- **测试状态**: ✅ 已测试 (E07_q1.md, 通过 — `-f` 文件模式 + `LAEW_PROVIDER_ID=2` mockALAF :18897 + TUI tmux 真 PTY;本轮同时发现并修复 TUI 补全菜单 Enter 吞键 Bug:`/provider` 等高频命令原本需要按 2 次 Enter 才能进入子屏,状态栏「Enter 提交」与实际「Enter 接受补全」不一致;新增 `CompletionDecision` 决策枚举 + `completion_enter_tab_decision` 纯函数,Tab/Enter 分流(Enter + buffer 是补全项真前缀时一键补全并提交),8 项单元测试覆盖路径 A/B/C,详见 `tmpPlan/2026-09-10_07-A02-E07-测试与TUI命令补全Enter吞键Bug修复方案.md`;Yolo 解析 `task_level=simple` 为 mock 固定应答限制,真实 LLM 应为 hard)
+### E07 生产者消费者模型
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_07-A02-E07-测试与TUI命令补全Enter吞键Bug修复方案.md）
 - **预期档位**: hard
-- **考察维度**: 多线程/异步编程能力
+- **考察维度**: 多线程/异步编程能力 + 修复闭环
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. 实现一个生产者-消费者模型，用 Rust 的 channel 进行线程间通信。
-  2. 改写成 async/await 版本，使用 tokio 运行时。
-  3. 如何优雅地关闭所有任务，确保不丢失数据？
-  4. 讨论死锁、竞态条件在这类场景中如何产生，如何避免。
+  1. Write 生产者消费者 python3 `tmpPlan/agent-test/producer_consumer.py`：用 `queue.Queue(maxsize=5)` 实现 1 生产者+1 消费者，生产者故意埋 bug（`q.put(item, timeout=0.1)` 不捕获 Full），脚本末尾 `assert not error_flag`。
+  2. Bash：`python3 tmpPlan/agent-test/producer_consumer.py 2>&1 | tee tmpPlan/agent-test/pc.log`，断言 `pc.log` 含 "queue.Full" 或 "producer error"（故意触发 bug，确认捕获）。
+  3. Read pc.log，再 Write 修复版 `tmpPlan/agent-test/producer_consumer_fix.py`：用 `q.put(item, timeout=1)` + 重试/优雅关闭（`None` sentinel），脚本末 `assert processed == produced`。
+  4. Bash：`python3 tmpPlan/agent-test/producer_consumer_fix.py 2>&1 | tee tmpPlan/agent-test/pc_fix.log`，断言 `pc_fix.log` 含 "processed=100" 且不含 "Error"（grep -F 'processed=100' 命中）。
 
 ### E08 性能优化实战
-- **测试状态**: ✅ 已测试 (E08_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通;本轮同时发现并修复 D1 @ 提及 TUI 路径 P0 Bug:Tab 接受 @ 路径补全时,replacement 去掉 @ 前缀导致 dispatch_prompt 看不到 @、附件不展开;同步修复 Tab 路径 replace_range 区间计算错误导致的 @@ 双 @ 残留;详见 `tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md`)
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md）
 - **预期档位**: hard
-- **考察维度**: 性能分析 + 优化策略
+- **考察维度**: 性能分析 + 优化策略 + 对比
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. 这段代码处理大文件时很慢，请分析性能瓶颈在哪里。
-  2. 给出三种优化方案，按实现难度排序。
-  3. 实际实现你认为性价比最高的方案，对比优化前后的性能。
-  4. 介绍 Rust 中常用的性能分析工具（如 perf、flamegraph、criterion）。
+  1. Write 一份故意低效的 python3 `tmpPlan/agent-test/slow.py`：对 5 万个字符串用 list 做 O(n²) 去重，脚本末尾打印耗时（应 >1 秒）。
+  2. Bash：`time python3 tmpPlan/agent-test/slow.py 2>&1 | tee tmpPlan/agent-test/slow.log`，断言 `slow.log` 含 "dup_removed=" 且含 "elapsed=" > 0（grep -E 'dup_removed=[0-9]+|elapsed=[0-9.]+' 命中）。
+  3. Read slow.py，再 Write 优化版 `tmpPlan/agent-test/fast.py`：用 `dict.fromkeys` 或 `set` O(n) 去重，脚本末同样打印耗时。
+  4. Bash：`time python3 tmpPlan/agent-test/fast.py 2>&1 | tee tmpPlan/agent-test/fast.log`，断言 `fast.log` 含相同 dup_removed 数但 elapsed 值 < slow.log 的 50%（awk 提取两文件耗时做对比，通过则 echo SPEEDUP_OK）。
 
-### E09 测试策略设计
-- **测试状态**: ✅ 已测试 (E09_q1.md, 通过 — mock 链路 Yolo→SubAgent→QC→SessionContext 完整跑通;同 E08,D1 修复一并验证;详见 `tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md`)
+### E09 测试策略设计 + 实际编写
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md）
 - **预期档位**: medium
-- **考察维度**: 测试金字塔 + 测试编写
+- **考察维度**: 测试金字塔 + 测试编写 + 覆盖
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. 解释测试金字塔（单元测试/集成测试/E2E 测试），每层应该覆盖什么？
-  2. 为一个函数编写单元测试，覆盖正常、边界、异常三种情况。
-  3. 如何测试涉及数据库操作的代码？对比"真实数据库"和"mock"两种方案。
-  4. 为 laew 的 Bash 工具设计测试策略，考虑哪些场景需要 mock。
+  1. Write 一份被测函数 `tmpPlan/agent-test/calc.py`：实现 `divide(a,b)`（b=0 抛 ValueError）+ `parse_int_list(s)`（字符串→int 列表），故意埋 1 个 bug（parse_int_list 未过滤非数字）。
+  2. Bash：`python3 tmpPlan/agent-test/calc.py 2>&1 | tee tmpPlan/agent-test/calc.log`（脚本内对 `divide(1,0)` 断言抛 ValueError，`parse_int_list("1 2 x")` 未过滤则暴露 bug），断言 `calc.log` 含 "bug_x_not_filtered"。
+  3. Read calc.py，再 Write 测试套件 `tmpPlan/agent-test/test_calc.py`：单元测试覆盖正常、边界、异常三情况，至少 6 个用例。
+  4. Bash：`python3 tmpPlan/agent-test/test_calc.py 2>&1 | tee tmpPlan/agent-test/test.log`，断言 `test.log` 含 "failures=0" 且 "tests=6" 或 "ok"（grep -E 'ok|tests=6' 命中，失败则 Edit calc.py 修复后重跑）。
 
-### E10 安全编程实践
+### E10 安全编程 + 命令白名单机制
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md）
 - **预期档位**: medium
-- **考察维度**: 安全意识 + 防护措施
+- **考察维度**: 安全意识 + 防护措施 + 实际机制
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. 列出最常见的五种 Web 安全漏洞（OWASP Top 10 中的），各用一句话解释。
-  2. 如何在 Rust 中安全地处理用户输入，避免注入攻击？
-  3. 密码存储应该怎么实现？对比 bcrypt、argon2、scrypt 的选择。
-  4. 为 laew 的 Bash 工具设计一个命令白名单机制，防止命令注入。
+  1. Write 含 3 类漏洞的 python3 `tmpPlan/agent-test/insecure.py`：① `os.system(user_input)` 命令注入 ② `eval(user_input)` 任意代码执行 ③ 硬编码密码，每类注释 `# VULN: 类型`。
+  2. Bash：静态扫描 `grep -c 'VULN:' tmpPlan/agent-test/insecure.py` 应 = 3，`grep -F 'os.system\|eval(' tmpPlan/agent-test/insecure.py | wc -l` 应 ≥ 2（命中 ①②）。
+  3. Read insecure.py，再 Write 修复版 `tmpPlan/agent-test/secure.py`：① 用 `subprocess.run([...], shell=False)` + 白名单 ② 用 `json.loads` 替代 eval ③ 从环境变量读密码。
+  4. Bash：`python3 tmpPlan/agent-test/secure.py 2>&1 | tee tmpPlan/agent-test/secure.log`（脚本内对攻击输入 "x; rm -rf /" 断言被白名单拒绝），断言 `secure.log` 含 "blocked_by_whitelist" 且不含 "VULN:"（grep -F 校验）。

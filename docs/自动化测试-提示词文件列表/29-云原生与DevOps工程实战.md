@@ -4,100 +4,106 @@
 
 ## 维度说明
 
-本维度考察 Agent 在**云原生工具链与交付流程**中的实战能力：容器镜像优化、
-compose 编排、Kubernetes 部署与排障、CI/CD 流水线、GitOps、Terraform IaC、
-监控告警、日志管道、发布策略。与 V 维度（分布式架构理论）和 C 维度（单机系统管理）
-互补：本维度聚焦"从代码到生产"的工程化交付实操，
-覆盖"工作日常-Work"中研发效能与运维协作的高频场景。
+本维度从 Agent 能力视角考察**交付工程化**链路：Dockerfile/compose/YAML 生成与静态校验、CI/CD 脚本化流水线、可观测性配置。本机不允许真实 build/pull/run 容器（网络慢且有副作用），一律「写配置文件 → python3 解析/校验断言 → bash 自查脚本」路径；CI/CD 用 make/bash 在本机模拟多阶段。所有产物落在 `tmpPlan/agent-test/`，零外网依赖。
 
 ---
 
-### AC01 Dockerfile 优化：从 1.2GB 到 80MB
+### AC01 Dockerfile 多阶段优化
 - **预期档位**: medium
-- **考察维度**: 镜像分层 + 构建优化
+- **考察维度**: 镜像分层 / 体积量化
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 一份 Python 应用的 Dockerfile 构建出 1.2GB 镜像：分析层缓存失效的原因与体积都花在了哪里。
-  2. 基于分析结果重构为多阶段构建：构建期装编译依赖、运行期只带产物；解释每个阶段的职责边界。
-  3. 继续瘦身：slim 基础镜像、合并 RUN 清理 apt 缓存、.dockerignore 排除；给出每步的体积对照表。
-  4. 安全加固：换 distroless/无 shell 基础镜像、以非 root 用户运行、镜像漏洞扫描工具怎么选？
+  1. 在 `tmpPlan/agent-test/` 用 Write 产出「差」版 `Dockerfile.bad`：单阶段 `FROM python:3.11` + `apt-get install gcc` + `pip install` + `COPY . .` + `CMD`。用 python3 写 `DockerfileInspector` 解析它：按 `RUN` 切层、估算每层命令数与「不可清理 apt 缓存」标记，输出 `bad-layers.txt`。Read 验证标记为 `unsafe_apt_cache` 的层数 ≥ 1。
+  2. 写 `Dockerfile.good` 多阶段版：`FROM python:3.11-slim AS build` 装编译依赖 → `FROM python:3.11-slim` 只 COPY `site-packages`。再跑同一 `DockerfileInspector`，输出 `good-layers.txt`。Read 对比两文件，期望 `good-layers.txt` 层数比 `bad-layers.txt` 少 30% 且无 `unsafe_apt_cache` 标记。
+  3. Bash 自查脚本 `lint_dockerfile.sh`：要求每条 `RUN` 后跟 `rm -rf /var/lib/apt/lists/*` 或 `&&` 合并、`.dockerignore` 存在且含 `.git`/`__pycache__`/`*.pyc`。故意把 good 版里 `rm` 那行删掉，跑 lint 期望退出码 1 且 stderr 含 `apt cache not cleaned`；恢复后通过。
+  4. 写 `dockerfile-security.md` 总结：换 distroless（`gcr.io/distroless/python3`）后体积变化、运行用户改 `USER 1000`、镜像扫描（`trivy`）的接入方式；表格形式不超过 10 行。
 
-### AC02 docker-compose 本地开发全家桶
+### AC02 docker-compose 本地编排
 - **预期档位**: medium
-- **考察维度**: 本地编排 + 依赖就绪
+- **考察维度**: 编排 YAML / 依赖就绪
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 为一个 Web 应用编写 docker-compose.yml：应用 + PostgreSQL + Redis 三服务，用健康检查保证依赖就绪后再启动应用。
-  2. 数据持久化与配置分离：卷挂载数据库、环境变量注入、用 override 文件区分 dev 与 prod。
-  3. 热重载开发体验：源码以卷挂载进容器、应用自动重载；讨论数据库迁移这种"一次性任务"在容器里怎么跑。
-  4. 模拟故障演练：`docker stop` 数据库容器后应用表现如何？加上优雅停止与健康检查重连策略。
+  1. 在 `tmpPlan/agent-test/` 写 `compose.yml`：app + postgres + redis 三服务，app 加 `depends_on: condition: service_healthy`。用 python3 解析器（`yaml.safe_load`）跑 `validate_compose.py`：期望检测到 `postgres.healthcheck.test` 与 `redis.healthcheck.test` 字段均存在；故意删除 redis healthcheck，再跑期望报错 `redis: healthcheck required by app`。Read 验证错误定位精确到服务名。
+  2. 加 `volumes:` + `env_file: .env.app` 配置分离；写 `dev.yml` 与 `prod.yml` 两个 override 文件。验证 `docker-compose -f compose.yml -f dev.yml config`（不实际跑，仅用 yaml merge 模拟 `merge_yaml.py`）期望 dev 启用 `DEBUG=1` 而 prod 不启用。
+  3. Bash 写热重载检查脚本 `check_volume_mount.sh`：要求 app 服务至少 1 个 `./src:/app/src` 类型 bind mount；故意把 bind mount 改成匿名卷，跑脚本期望退出码 1；恢复后通过。
+  4. 模拟故障演练：写 `chaos_test.sh` 不实际停容器，而是解析 compose YAML 检查 `restart: on-failure` 与 `healthcheck` 同时存在；故意把 app 的 restart 改成 `no`，跑脚本期望警告。写 `compose-resilience.md` 总结优雅停止与重连策略。
 
-### AC03 Kubernetes 部署一个 Web 服务
+### AC03 Kubernetes 部署 YAML
 - **预期档位**: medium
-- **考察维度**: K8s 核心对象 + 探针配置
+- **考察维度**: K8s 必填字段 / 探针配置
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 讲清 Pod/Deployment/Service/ConfigMap/Ingress 各自的职责与关系，画出一张访问链路拓扑。
-  2. 为应用写一套 YAML：2 副本 Deployment、ClusterIP Service、ConfigMap 注入配置。
-  3. 配置 liveness 与 readiness 探针：两者应该探测什么路径？把 readiness 误配成 liveness 会发生什么？
-  4. 资源管理：requests/limits 设置不当导致的 CPU throttling 与 OOMKilled；给出容量估算方法。
+  1. 在 `tmpPlan/agent-test/` 写 `deploy.yml`：Deployment(2 副本) + ClusterIP Service + ConfigMap + Ingress。python3 `k8s_validator.py` 检查所有 `metadata.name`、`spec.selector.matchLabels` 与 `template.metadata.labels` 三者一致；故意把 matchLabels 改一个字符，期望报错并指出三处不一致。
+  2. 加 liveness/readiness/startup 三类探针。写 `probe_lint.py` 校验：liveness 路径 ≠ readiness 路径（避免互相影响）、startup `failureThreshold` ≥ liveness `failureThreshold`。故意把 liveness 与 readiness 设为同路径 `/health`，跑 lint 期望报错；恢复后通过。Read 验证错误提示。
+  3. 资源 requests/limits 设置：写 `resource_calc.py` 给定应用 QPS=200、平均 RT=200ms 推导 `requests.cpu` 与 `limits.memory` 公式化数值。故意把 limits.cpu 设成 `100m`（明显过低），跑 `resource_calc.py --check` 期望警告；改合理后通过。
+  4. 写 `k8s-rollout.md`：画 ASCII 拓扑图（Pod→Service→Ingress→Client），列出 4 个常见排障起点（`describe pod` / `logs --previous` / `get events` / `top pod`），不超过 10 行。
 
-### AC04 K8s 故障排查实战
+### AC04 K8s 故障排查剧本
 - **预期档位**: hard
-- **考察维度**: 集群排障方法论
+- **考察维度**: 排障方法论 / 闭环修复
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. Pod 状态 CrashLoopBackOff：给出从 `kubectl describe` / `logs --previous` / events 入手的完整排查清单。
-  2. 服务内部能通、外部访问 502：从 Service/Endpoint/Ingress/NetworkPolicy 逐层定位的思路。
-  3. OOMKilled 与 CPU 限流：怎么从监控数据区分是 limits 配太紧还是代码内存泄漏？
-  4. 写一个"发布后偶发 5xx"的排查剧本：滚动更新、就绪探针误配、旧连接排空三个要素怎么串成一条因果链？
+  1. 在 `tmpPlan/agent-test/` 写 `events.jsonl`（模拟 K8s events 流，含 CrashLoopBackOff/OOMKilled/ProbeFailed/NodeNotReady 几类）。python3 `triage.py` 按关键字归类：期望对每条事件输出「类别 + 排查起点 + kubectl 命令模板」。故意在 events 里混入噪声行（随机 `Normal` 事件），跑 triage 期望噪声行被过滤。
+  2. 写「502 排障剧本」脚本 `playbook_502.sh`：分层检查 Service endpoints、Ingress backend、NetworkPolicy egress。模拟生成 `endpoints.json`（空列表表示 Service 无 endpoint）+ `ingress.yml`（backend serviceName 写错），跑 playbook 期望按层定位到「endpoints 空 → 上游 selector 不匹配」。Read 验证剧本分支齐全。
+ 3. OOM 与 CPU 限流区分：写 `metrics.jsonl`（含 `container_memory_usage_bytes` 与 `container_cpu_cfs_throttled_seconds_total`）。`oom_vs_throttle.py` 根据两条数据相对阈值给出判定；故意造一份「内存稳定但 throttled 时间线性增长」的指标，期望判为 CPU 限流而非 OOM。
+ 4. 「发布后偶发 5xx」剧本：写 `publish_sop.sh` 串接 rolling update → readiness 误配检测（旧 pod 还未 ready 就切流量）→ 旧连接排空（preStop hook sleep）。故意把 readiness 配成 `tcpSocket: {port: 9999}`（端口不存在），跑剧本期望报错步骤 2；修复后通过。写 `5xx-playbook.md` 总结三要素因果链。
 
-### AC05 GitHub Actions：从手工发布到流水线
+### AC05 GitHub Actions 流水线（本地模拟）
 - **预期档位**: medium
-- **考察维度**: CI/CD + 密钥管理
+- **考察维度**: CI YAML / 本地阶段化执行
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 为一个 Rust 项目写 CI：push 时跑 fmt/clippy/test，并用缓存把 cargo 依赖下载加速到秒级。
-  2. 加构建矩阵：三个平台的交叉编译产物；再补失败重试与超时控制。
-  3. 发布自动化：打 tag 触发构建、生成 changelog、上传 Release 附件并附 checksum 校验文件。
-  4. 密钥管理：secrets 的作用域、用 OIDC 替代长期 token 的原理；branch protection 怎么与必过检查联动？
+  1. 在 `tmpPlan/agent-test/` 用 Write 产出 `.github/workflows/ci.yml`：含 fmt/clippy/test 三个 job。python3 `gh_actions_validator.py` 解析：要求每个 `run` 命令非空、`actions/checkout` 是 `step[0]`、有 `cache: cargo`；故意把 checkout 移到第二个 step，期望报错。
+  2. 本地 `Makefile` 模拟 CI 阶段：`fmt` / `clippy` / `test` 三个 target。`make ci` 期望顺序执行且任一失败后续 stage 跳过（`make -k` 关闭验证）。故意让 `clippy` 故意报 warning（写 `#[allow(unused)]` 测试），期望 `clippy` 阶段非 0 退出。
+  3. 构建矩阵：扩展 yml 加 `strategy.matrix.os: [ubuntu-latest, macos-latest, windows-latest]`。`matrix_lint.py` 要求三个 OS 都存在对应 runner 引用；故意删除 macos 期望报错。
+  4. 发布自动化：tag 触发 + 生成 changelog + 上传 release。写 `release_simulate.sh`：本地模拟打 tag 时跑 `git log --oneline` 生成 CHANGELOG.md，跑 `sha256sum` 生成 checksum 文件。故意构造一个 tag 但仓库为空，期望脚本失败并指明原因；写 `release-flow.md` 总结 OIDC 替代 PAT 的原理。
 
-### AC06 GitOps：ArgoCD 声明式发布
+### AC06 GitOps: ArgoCD 声明式发布（静态校验）
 - **预期档位**: medium
-- **考察维度**: 声明式交付 + 环境管理
+- **考察维度**: GitOps 范式 / 配置静态校验
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. GitOps 与传统 CI 驱动部署的核心区别是什么？"集群状态 = 仓库状态"这句口号意味着什么？
-  2. 用 ArgoCD 部署一个应用：Application 资源、自动同步、自愈能力（手工 kubectl 改动被还原）逐项演示。
-  3. 多环境管理：overlays 目录结构、dev 预览分支与 prod 主干分支的差异、发布审批门禁怎么加？
-  4. 回滚演练：发布坏版本后，ArgoCD 内置回滚与 Git revert 两种路径的差异与各自风险。
+  1. 在 `tmpPlan/agent-test/` 写 `applicationset.yml`（ArgoCD ApplicationSet）：含 repoURL/path/targetRevision/kustomize.namespace。`argocd_lint.py` 校验必填字段；故意删除 `targetRevision`，跑期望报错。
+  2. 写 overlays 目录结构：`base/` 含 kustomization + deployment；`overlays/dev/` 与 `overlays/prod/` 各加 `kustomization.yaml` 覆盖 replicas 与 image tag。`kustomize_build.py` 用纯 python 解析 YAML 合并（不实际跑 kustomize CLI），期望 dev replicas=2、prod replicas=5 且 image tag 不同。
+  3. 自愈能力静态校验：写 `drift_check.py`，对比「git 仓库期望状态」与「模拟运行时状态」（一个手工改过的 runtime.yml）期望输出 diff 列表。故意让 runtime 与 git 一致，期望 diff 列表空。
+  4. 回滚剧本：写 `rollback_plan.sh` 对比「revert commit」与「ArgoCD 内置 rollback」两种路径，输出选择建议（带原因）。故意标记一个回滚会触发「数据库迁移不匹配」的危险场景，期望脚本警告。写 `gitops-rollback.md` 总结两种回滚风险。
 
-### AC07 Terraform：基础设施即代码
+### AC07 Terraform IaC 静态校验
 - **预期档位**: hard
-- **考察维度**: IaC + 状态管理
+- **考察维度**: 状态管理 / 模块化
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 讲清 Terraform 的声明式模型：provider/resource/state 三者关系，plan 与 apply 两阶段的意义。
-  2. 写一组配置创建云服务器 + 安全组 + 对象存储；解释 state 文件为什么不能提交进 git、远程 backend 怎么配置。
-  3. 模块化：把网络层抽成可复用 module，设计输入输出变量；讨论"漂移检测"为什么重要。
-  4. 团队协作：state 锁、命名规范、workspace 与目录分环境两种方案的取舍。
+  1. 在 `tmpPlan/agent-test/` 写 `main.tf`：含 provider + 2 个 resource（云服务器 + 安全组）+ `terraform { backend "local" {} }`。`tf_lint.py` 校验：所有 resource 都有 `tags = local.common_tags` 引用；故意把一个 resource 的 tags 写成内联值，期望报错提示「应使用 common_tags 变量」。
+  2. 写 `variables.tf` + `outputs.tf` + `modules/network/` 子模块。`module_check.py` 要求网络模块的 `required_providers` 与根模块一致；故意在子模块换 provider 版本，期望报错。
+  3. 漂移检测静态模拟：写 `state.json`（terraform state 期望值）与 `runtime.json`（实际值模拟），`drift_detect.py` 输出 diff。故意让 runtime 多一台服务器，期望检测出 `resource added without apply`。
+  4. workspace vs 目录分环境：写 `strategy.md` 对比两方案（每个环境单独 workspace 还是单独目录）。Bash 跑 `lint_workspace.sh` 校验 `*.tfvars` 与环境目录一一对应；故意制造一份没有对应 tfvars 的环境，期望报错。写 `tf-iac.md` 总结选型决策（≤ 10 行）。
 
-### AC08 Prometheus + Grafana 监控告警
+### AC08 Prometheus + Grafana 监控配置
 - **预期档位**: medium
-- **考察维度**: 指标体系 + 告警设计
+- **考察维度**: 指标体系 / 告警规则
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 讲清 Pull 模型、exporter、PromQL 基本查询；counter/gauge/histogram/summary 四种指标类型分别适合什么？
-  2. 为一个 HTTP 服务接指标：QPS、P99 延迟、错误率；直方图的桶边界怎么规划才合理？
-  3. 写告警规则：基于错误率与延迟的多窗口燃烧率（burn rate）告警，避免毛刺误报。
-  4. 用 Grafana 出一块"黄金四信号"仪表盘；讨论告警分级与值班收敛——谁应该在什么时候被打扰？
+  1. 在 `tmpPlan/agent-test/` 写 `prometheus.yml`（scrape config）+ `rules/*.yml`（告警规则）。`prom_lint.py` 校验：scrape_interval ∈ [15s, 5m]、alert rule 表达式非空且有 `summary`/`description` 字段。故意把 scrape_interval 设成 `1s`（过密），期望报错。
+  2. 为 HTTP 服务配指标：`http_requests_total{handler,method,status}` counter + `http_request_duration_seconds` histogram。`histogram_lint.py` 要求桶边界单调递增且覆盖 [0.005, 10]；故意让桶边界缺 0.5，期望报错。
+  3. 多窗口燃烧率告警：写规则 `HighErrorRate: http_requests_total{status=~"5.."}/http_requests_total > 0.05 for 5m` + `MultiBurnRate: ... for 1h and ... for 5m`。`burn_rate_check.py` 验证多窗口组合正确；故意改一个窗口表达式，期望测试用例失败。
+  4. 写「黄金四信号」仪表盘 JSON：`dashboard.json` 含 QPS/P99/错误率/饱和度四面板。`dashboard_lint.py` 要求每个 panel 都有 `expr` 与 `legendformat`；故意把一个 panel 的 legendformat 删掉，期望报错。写 `golden-signals.md` 总结告警分级与值班收敛。
 
-### AC09 日志管道：从 print 到可检索
+### AC09 日志管道：结构化 + 保留策略
 - **预期档位**: medium
-- **考察维度**: 日志工程 + 成本治理
+- **考察维度**: 日志工程 / 成本治理
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 应用日志为什么要结构化（JSON）？统一时间/级别/trace_id 字段对检索与关联分析的意义。
-  2. 搭一套 Promtail + Loki + Grafana：采集容器 stdout；标签设计为什么要避开高基数标签？
-  3. 采样与保留策略：DEBUG 日志采样、按团队分级保留周期；日志与指标的成本权衡怎么做？
-  4. 设计一次故障的排障动线：从告警指标跳到日志、再跳到 trace，三者的时间轴怎么对齐？
+  1. 在 `tmpPlan/agent-test/` 用 Write 产出 `app.log.jsonl`（10 行结构化日志：timestamp/level/trace_id/msg）。`jsonl_lint.py` 校验每行合法 JSON、必含 4 字段；故意把一行 msg 字段去掉，期望报错指出具体行号。
+  2. 写 Promtail 配置 `promtail.yml` + Loki 标签规则；`label_cardinality_lint.py` 校验 labels 不含高基数字段（`request_id`/`user_id` 禁用）；故意把 request_id 加进 static_labels，期望报错。
+  3. 采样与保留策略：写 `retention_policy.yml`：DEBUG 采样率 10%、INFO 100%、保留周期 7 天/30 天/90 天分级。`retention_calc.py` 验证日志总量与保留成本的估算公式；故意把 DEBUG 采样设成 100%，跑脚本期望成本估算异常偏高。
+  4. 排障动线：写 `trace_id_correlate.py` 给定 trace_id 在 metrics + logs 两份数据里查找返回联动时间轴。故意构造一份 metrics 有但 logs 无的 trace_id，期望提示「该 span 未采集到日志」。写 `trace-correlate.md` 总结三时间轴对齐方法。
 
-### AC10 发布策略：滚动、蓝绿、金丝雀
-- **预期档位**: medium
-- **考察维度**: 发布工程 + 回滚设计
+### AC10 发布策略：滚动 + 蓝绿 + 金丝雀
+- **预期档位**: simple
+- **考察维度**: 发布工程 / 回滚设计
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 对比滚动、蓝绿、金丝雀三种发布策略的停机时间、回滚速度、资源成本；各举一个最适合的业务场景。
-  2. 金丝雀实操：按流量比例逐步放量，关键指标异常时自动回切的判断条件怎么定？
-  3. 数据库变更与代码发布的解耦：expand-contract（先加列、双写、再删列）模式讲解。
-  4. 为一个"每周两次发布"的小团队设计发布 SOP：检查单、灰度观察窗口、回滚演练频率各定多少？
+  1. 在 `tmpPlan/agent-test/` 写 `strategy_sim.py`：模拟滚动/蓝绿/金丝雀三种发布策略的「部署时间 / 资源成本 / 回滚时长」三维对比。给定 app 实例数=10、版本大小=1GB、新版本启动时间=30s，输出三策略表格。Read 验证三维数据齐全。
+  2. 金丝雀放量脚本 `canary_release.sh`：1%→5%→20%→100% 四阶段，每阶段 sleep 5s 后查「关键指标」模拟数据。故意把模拟指标的 error_rate 配成 0.08（>0.05 阈值），期望脚本在某阶段自动退出并标注「触发回切」；修复后通过。
+  3. expand-contract 数据库变更：写 `db_migration.md` 描述三步（先加列 → 双写 → 再删列），对应 schema v1 → v2 → v3 三文件。`schema_compat.py` 校验旧代码访问新 schema 不报错；故意把 v2 改成删除某列，跑脚本期望「旧代码会找不到列」报错。
+  4. 小团队发布 SOP：写 `publish_sop.md` 含检查单（10 项）、灰度观察窗口（30min）、回滚演练频率（每月 1 次），每项给可勾选复选框 `[ ]`。Read 验证 SOP 文件可读且 10 项齐全。

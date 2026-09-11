@@ -2,126 +2,117 @@
 
 > 编号段 BY01–BY10 · 主题：AR/VR & Spatial Computing（OpenXR 开放生态 / Apple visionOS / Meta Quest / WebXR 浏览器端 / SLAM 与空间定位 / ATW 异步时间扭曲与空间扭曲 / 手柄·手势·眼动·语音多维交互 / 空间锚点与持久化坐标 / HRTF 空间音频与环境遮蔽 / 三维空间 UI/UX 距离与可读性 / MR 场景理解与平面检测 / 注视点渲染与热节流 / three.js 与 Babylon.js 实战）
 >
-> 互补性说明：本组聚焦 **XR 应用层与空间计算**，与已有的「游戏引擎（渲染管线下游）」「计算机视觉（通用 CV 算法）」「桌面应用（2D GUI）」「3D 建模（DCC 工具链）」均不重叠 —— 本组考察的是 **穿戴式空间设备的运行时、交互范式、浏览器 XR API、空间持久化与舒适 UX**，适合验证 Yolo 对 XR/空间计算领域的任务分类与多轮追问拆解能力。
->
-> 维度覆盖：XR 生态标准化（BY01）/ SLAM 与空间定位（BY02）/ ATW 与空间扭曲渲染（BY03）/ 多维交互输入（BY04）/ 空间锚点与持久化（BY05）/ 空间音频 HRTF（BY06）/ 三维 UI/UX 舒适设计（BY07）/ MR 场景理解与遮挡（BY08）/ 注视点渲染与热节流性能（BY09）/ WebXR 与 three.js 实战（BY10）。
+> 运行环境约束：**无头显 / 无 GPU / 无 3D 引擎**，全部以 **纯 python3 + numpy + PIL 软件光栅等价实现** 跑通。SLAM 降级为 EKF 位姿估计模拟；WebXR 降级为 python 解析 3D JSON 场景结构；空间音频降级为距离衰减模型；注视点渲染降级为分辨率分布统计。产物落 `tmpPlan/agent-test/` 沙盒。
 
 ---
 
 ### BY01 OpenXR 开放生态与跨平台运行时选型
 
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-09_08-S01-S10-AI工程LLM应用测试脚本重构方案.md）
 - **预期档位**: hard
-- **考察维度**: 对比 OpenXR 1.0/1.1 标准扩展（XR_KHR_composition_layer / XR_FB_hand_tracking / XR_EXT_eye_gaze）在 Apple visionOS、Meta Quest、SteamVR、Windows Mixed Reality 四大平台的运行时支持矩阵与 conformance 测试差异。
+- **考察维度**: 平台兼容矩阵 + 扩展探测 + 降级策略
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我正在为一个跨头显的企业培训应用做技术选型。请对比 OpenXR 在 Apple visionOS、Meta Quest 3、SteamVR（Valve Index）和 Windows Mixed Reality 四大平台上的运行时支持情况，重点说明核心 1.0 规范与各厂商扩展（如 XR_FB_hand_tracking、XR_EXT_eye_gaze_interaction）的兼容性差异，以及 compositor swapchain 格式（如 Vulkan/Metal/D3D12）的选择约束。
-  2. 上一轮你提到了 Vulkan 与 Metal 的 swapchain 差异。如果我们要在 Quest 上启用 XR_FB_update_skinning 与 XR_FB_passthrough 两个扩展，但同时在 visionOS 上回退到 ARKit 原生坐标对齐，请给出一个基于 openxr_runtime.json 的运行时发现与扩展探测策略，并说明如何让同一份应用代码在两个平台间优雅降级。
-  3. 进一步地，我想引入 XR_MSFT_unbounded_reference_space 做大空间定位，但需要在不支持的设备回退到 local_floor_ext。请设计一个三层的 Space 管理抽象（Stage / LocalFloor / Unbounded），用伪代码说明如何按运行时能力注入不同的 reference space，并分析 session lifecycle（从 xrBeginSession 到 lost event）在这三种 Space 下的恢复语义。
-  4. 最后，考虑到 OpenXR 的 conformance 测试（conformance suite）需要各厂商实现，请评估 Khronos Conformance Test Suite 对 Quest 与 Pico 4 Enterprise 的实际覆盖盲区，以及我的团队在自研跨平台 XR Runtime 时，哪些测试用例必须自己补全（尤其关注 composition layer 深度排序与 input subsystem 多动作绑定两块）。
+  1. 在 `tmpPlan/agent-test/by01/` 下用 Write 写 `platform_matrix.md`：表格 4 行（Apple visionOS / Meta Quest 3 / SteamVR / Windows MR），列：核心 1.0 支持率、Hand Tracking 扩展、Eye Gaze 扩展、Compositor Swapchain 后端、Passthrough 支持；Bash `grep -c '^|' platform_matrix.md` ≥ 6 + `grep -F 'Quest 3' platform_matrix.md` 命中。
+  2. 写 `runtime_probe.py`：模拟 `openxr_runtime.json` 发现与扩展探测——`RuntimeProbe` 类含 `probe_extensions(runtime_name)` 返回支持的扩展列表（如 Quest 支持 `XR_FB_hand_tracking`，visionOS 支持 `XR_ARKit_spatial_tracking`）；Bash 跑 `python runtime_probe.py` 后断言 `probe("quest3")` 含 `"XR_FB_hand_tracking"`，写入 `probe.out`。
+  3. 写 `graceful_degrade.py`：实现"按运行时能力注入"——`SpaceManager` 根据探测结果选择 `Stage` / `LocalFloor` / `Unbounded` 三层抽象；Bash 跑后断言 Quest 注入 `LocalFloor`，visionOS 注入 `Stage`，写入 `degrade.out`。
+  4. 写 `lifecycle_recovery.md`：markdown 写 session lifecycle 从 `xrBeginSession` 到 `lost event` 的三种 Space 恢复语义（Stage 重置 origin / LocalFloor 保留高度 / Unbounded 重新建立锚点）；Bash `wc -l lifecycle_recovery.md` ≥ 15 + `grep -F 'xrBeginSession' lifecycle_recovery.md` 命中。
 
----
-
-### BY02 SLAM 与空间定位基础
-
-- **期望档位**: medium
-- **考察维度**: 解释视觉惯性里程计（VIO）、点云地图、重定位（relocalization）与闭环检测（loop closure）的协作流程，以及 ARCore/ARKit/Vision Pro 在稀疏/稠密建图上的取舍。
-- **对话脚本**:
-  1. 我要在 AR 平板应用里实现稳定的小物体放置。请从 VIO（视觉惯性里程计）原理讲起，说明为什么纯视觉 SLAM 会漂移、IMU 融合如何纠正尺度不确定性，并对比 ARCore、ARKit 和 Meta Insight 三类 SLAM 在后端优化（如 Pose Graph / Factor Graph / Bundle Adjustment）策略上的主要差异。
-  2. 上一轮你提到了 ARKit 的稠密场景重建（Scene Reconstruction）。当用户在光线较弱、白墙较多的办公室里打开应用，平面检测频繁失败，请分析可能的失效原因（特征点不足、IMU 噪声、纹理缺失），并提出三种客户端侧的补偿策略（如延长初始化等待、引导用户扫动、开启 LiDAR 辅助）。
-  3. 现在假设我们需要在同一房间的不同时段（早中晚光线变化）重定位到已建立的地图。请设计一个基于「视觉词袋（BoW）+ 点云描述子 + IMU 先验」的混合 relocalization 流程，描述关键帧数据库的更新策略（何时增、何时删、如何按光照分桶），并分析在 Quest 3 上该流程的算力预算（是否必须 offload 到云端）。
-  4. 最后，我想实现多用户共享同一个地图锚点。请对比三种技术路线（ARCore Cloud Anchor、ARKit Collaborative Session、自研基于 QR/ArUco 标记的共享坐标系）的优缺点，重点说明「世界坐标系对齐误差」在 1m、5m、20m 三种距离下对协作体验的具体影响，并给出误差补偿的工程建议。
-
----
-
-### BY03 渲染与异步时间扭曲（ATW）/ 空间扭曲（ASW/SSW）
+### BY02 SLAM 与空间定位基础（EKF 位姿模拟）
 
 - **预期档位**: medium
-- **考察维度**: 剖析 ATW/ASW/SSW 三种时间扭曲管线的差异、late-stage reprojection 对 UI 与文本清晰度的影响，以及在单通道立体渲染（Single Pass Stereo）下的扭曲边界处理。
+- **考察维度**: VIO 原理 + EKF 模拟 + relocalization
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我们的 VR 移动应用帧率频繁掉到 55fps，目标刷新率是 72fps。请从「掉帧到扭曲」的完整链路讲起：从 compositor 在 v-sync 前未收到新帧说起，解释 ATW（异步时间扭曲）、ASW（异步空间扭曲）和 SSW（同步空间扭曲）三者的差异、输入依赖（仅头部姿态 vs 深度缓冲 vs 光流），以及分别在 Quest、Pico 4、PCVR 上的典型开启策略。
-  2. 上一轮你提到 SSW 需要深度缓冲来估计运动矢量。如果在单通道立体渲染（Single Pass Stereo, instanced）下，UI 层（如文字准星）与场景层分别在不同 draw call 提交且深度测试策略不同，请分析 late-stage reprojection 在扭曲 UI 与 3D 物体时可能产生的伪影（如文字拉伸、边缘锯齿、Z-fighting 扭曲），并给出绘制时的规避建议（分层深度、独立 alpha、HUD 贴屏）。
-  3. 我想在应用里加入「动态分辨率 + 注视点渲染 + ATW」三件套联合调优。请给出一个帧时间预算模型（以 72Hz 为例，13.9ms 帧预算），说明当 GPU 耗时超标时，三者应如何按优先级顺序降级（如先降外围分辨率 → 再缩小 foveation 范围 → 最后切到 ASW），并分析这种级联对视觉质量的具体影响。
-  4. 进一步地，如果用户在使用 VR 时佩戴近视眼镜导致实际感知的面板 PPI 低于标称值，请定量估算 ATW 引入的几何误差与重投影抖动（reprojection wobble）在边缘视场角（如 Quest 的 95° 边缘）下的像素偏移量，并提出三种客户端补偿手段（如固定 foveation、提高渲染分辨率上限、UI 避让边缘）。
+  1. 在 `tmpPlan/agent-test/by02/` 下用 Write 写 `vio_overview.md`：markdown 解释 VIO 原理（视觉 + IMU 融合）+ 纯视觉 SLAM 漂移原因 + IMU 如何纠正尺度不确定性；配 ASCII 流程图；Bash `grep -F 'IMU' vio_overview.md` 命中 + `wc -l vio_overview.md` ≥ 12。
+  2. 写 `ekf_pose.py`：实现 2D EKF 位姿估计——状态 `(x, y, theta)`，预测步用 IMU 角速度/线速度积分，更新步用模拟观测（landmark 距离 + 角度）；Bash 跑 `python ekf_pose.py` 后断言位姿估计误差 < 0.1m（模拟 100 步后），写入 `ekf.out`。
+  3. 写 `relocalize.py`：模拟 relocalization——给定当前观测与数据库 keyframe 用 BoW 风格匹配（简化为余弦相似度），找到最相似的 keyframe 后用其位姿作为先验；Bash 跑后断言匹配命中正确 keyframe，写入 `reloc.out`。
+  4. 写 `multiuser_anchor.md`：markdown 对比 ARCore Cloud Anchor / ARKit Collaborative Session / QR/ArUco 共享坐标系 3 种方案的"世界坐标对齐误差"在 1m/5m/20m 三种距离下的具体影响；Bash `grep -c '^|' multiuser_anchor.md` ≥ 6 + `grep -F 'Cloud Anchor' multiuser_anchor.md` 命中。
 
----
+### BY03 渲染与异步时间扭曲 ATW/ASW/SSW（python 软件光栅）
 
-### BY04 多维交互输入：手柄 / 手势 / 眼动 / 语音
+- **预期档位**: medium
+- **考察维度**: 帧预算 + 扭曲管线 + reprojection 伪影
+- **工具链**: Write → Bash → Write → Bash
+- **对话脚本**:
+  1. 在 `tmpPlan/agent-test/by03/` 下用 Write 写 `frame_budget.py`：模拟 72Hz 帧时间预算 13.9ms——分配 AEC 1ms / VAD 0.5ms / ASR 2ms / LLM 5ms / TTS 2ms / 网络 1ms / 渲染 2ms / 缓冲 0.4ms；Bash 跑 `python frame_budget.py` 后断言总和不超 13.9ms，写入 `budget.out`。
+  2. 写 `atw_asw_ssw.md`：markdown 对比 ATW（仅头部姿态）、ASW（深度缓冲估计运动矢量）、SSW（光流估计运动矢量）三种扭曲管线的输入依赖与典型场景；Bash `grep -F 'ATW' atw_asw_ssw.md` 与 `grep -F 'SSW' atw_asw_ssw.md` 双命中。
+  3. 写 `software_raster.py`：用 PIL + numpy 实现"立体几何软件光栅"——给定左右眼视差 `d`，把 RGB 图偏移 `d/2` 像素生成左右眼视图；Bash 跑 `python software_raster.py` 后 `ls -la stereo_*.png` 至少 2 张图，写入 `raster.out`。
+  4. 写 `reprojection_artifacts.md`：markdown 列出 late-stage reprojection 在 UI 层（文字准星）与场景层分别的伪影（文字拉伸、边缘锯齿、Z-fighting 扭曲）+ 规避建议（分层深度、独立 alpha、HUD 贴屏）；Bash `grep -c '^- ' reprojection_artifacts.md` ≥ 4。
+
+### BY04 多维交互输入：手柄 / 手势 / 眼动 / 语音（输入置信度模型）
 
 - **预期档位**: hard
-- **考察维度**: 对比 XR 四类主流输入模态的延迟、精度、学习成本与误触率，以及在同一应用中做输入融合（input fusion）时的仲裁策略与 fallback 链。
+- **考察维度**: 多模态对比 + 仲裁状态机 + 置信度
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我们的 MR 应用需要同时支持手柄射线、裸手手势、眼动注视和语音命令四种输入。请先建立一张对比表，从「延迟（端到端 ms）」「精度（角度/距离）」「学习成本」「误触率」「环境约束（光照/噪声）」五个维度对比这四种模态，并给出典型数字范围（如手柄射线延迟 ~20ms、手势 ~50ms、眼动 ~30ms、语音 ~300ms+）。
-  2. 上一轮你建立了对比表。现在我需要做一个「远场抓取 + 近场操控 + 语音确认」的混合交互。请设计一个输入仲裁状态机：当用户手伸到远处时用射线聚焦、手收回到 30cm 内时切换到直接手触、同时注视点作为候选目标、语音（"确认"/"取消"）作为最终确认。请用伪代码说明事件优先级与竞争解决（如手与眼目标冲突时以谁为准）。
-  3. 进一步地，当用户双手在视野外（如背后、放下）时，系统应如何优雅降级输入？请设计一个「输入置信度（confidence）」模型，融合控制器 IMU 活跃度、手部追踪可见性、注视稳定度、语音活动检测四项信号，并给出当 confidence < 0.3 时的三种 fallback 方案（射线保持 / 回退到头动瞄准 / 弹出语音提示）。
-  4. 最后，假设我们要在 Quest 3 上做双手指点打字（virtual keyboard）。请分析「手指敲击检测」在裸手追踪下的两种主流方法（基于关节角度变化率 vs 基于指尖速度反向积分），对比它们的误识别率与算力占用，并给出一种基于上下文（如当前焦点在搜索框 vs 普通场景）的自适应敲击灵敏度切换策略。
+  1. 在 `tmpPlan/agent-test/by04/` 下用 Write 写 `input_compare.md`：表格 4 行（手柄射线 / 裸手手势 / 眼动注视 / 语音命令），列：延迟 ms、精度、学习成本、误触率、环境约束；填入典型数字范围（手柄 ~20ms / 手势 ~50ms / 眼动 ~30ms / 语音 ~300ms）；Bash `grep -c '^|' input_compare.md` ≥ 6 + `grep -F 'ms' input_compare.md` 命中。
+  2. 写 `input_fsm.py`：实现输入仲裁状态机——状态 `FarRay`（>30cm 射线） / `NearTouch`（≤30cm 直接手触） / `EyeTarget`（注视候选） / `VoiceConfirm`（"确认"/"取消"），事件驱动转移；Bash 跑 `python input_fsm.py` 后断言远到近转移正确，写入 `fsm.out`。
+  3. 写 `confidence_model.py`：实现输入置信度融合——`confidence = 0.4*ctrl_imu + 0.3*hand_vis + 0.2*eye_stab + 0.1*voice_active`（各分量 0-1）；Bash 跑后断言 confidence < 0.3 时返回 fallback 信号，写入 `conf.out`。
+  4. 写 `tap_detect.md`：markdown 对比"基于关节角度变化率"vs"基于指尖速度反向积分"两种敲击检测方法 + 自适应灵敏度切换策略；Bash `grep -c '^|' tap_detect.md` ≥ 4 + `grep -F 'tap' tap_detect.md` 命中。
 
----
-
-### BY05 空间锚点与持久化坐标
+### BY05 空间锚点与持久化坐标（SQLite + Geohash 模拟）
 
 - **预期档位**: medium
-- **考察维度**: 对比 ARKit ARAnchor、ARCore Anchor/Geospatial Anchor、OpenXR Spatial Anchor、Azure Spatial Anchors、Niantic Lightship VPS 五类锚点在精度、持久化年限、跨设备共享与离线可用性上的差异。
+- **考察维度**: 锚点存储 + R-Tree 索引 + 健康度
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我要做一个需要在商场内跨周、跨设备共享的 AR 导览应用。请先对比 ARKit ARAnchor + ARWorldMap、ARCore Anchor + Cloud Anchors、OpenXR XR_EXT_spatial_anchor、Azure Spatial Anchors (ASA)、Niantic Lightship VPS 五类持久化方案在「首次注册精度」「跨设备漂移」「离线可用」「持久化年限（含厂商策略）」四个维度的表现。
-  2. 上一轮你提到 ASA 依赖 Azure 云端。如果我们希望锚点在云端服务不可用时仍能本地持久化，请设计一个「本地 SQLite 锚点库 + 云端 ASA 双写」的混合存储架构，描述锚点创建、更新、删除、再发现的完整流程，并重点分析在「网络分区」场景下本地与云端锚点版本冲突的解决策略（如向量时钟 / 最后写入胜出 / 人工合并）。
-  3. 进一步地，同一商场内可能密集部署了上百个锚点，用户头显一次 scan 只看到其中 5–10 个。请设计一个「锚点索引 + 空间邻近查询」的加载策略：用 R-Tree 或 Geohash 组织锚点，当用户移动时按距离远近 LOD 加载 AR 内容（近处完整模型、远处 icon、更远卸载）。给出数据结构选型与查询伪代码。
-  4. 最后，假设商场翻新导致某个锚点的真实位置发生偏移（如店铺搬迁）。请设计一个「锚点健康度」监控机制，融合重定位成功率、最近 N 次访问位置方差、用户显式反馈三项信号，自动标记失效锚点并触发重新注册流程，同时向协作用户推送「该锚点暂时不可用」的降级提示。
+  1. 在 `tmpPlan/agent-test/by05/` 下用 Write 写 `anchor_compare.md`：表格 5 行（ARKit ARAnchor / ARCore Anchor / OpenXR XR_EXT_spatial_anchor / Azure Spatial Anchors / Niantic Lightship VPS），列：首次注册精度、跨设备漂移、离线可用、持久化年限；Bash `grep -c '^|' anchor_compare.md` ≥ 6 + `grep -F 'Azure' anchor_compare.md` 命中。
+  2. 写 `anchor_db.py`：用 python 内置 sqlite3 建锚点表 `anchors(id, x, y, z, qw, qx, qy, qz, payload, created_at)`，插入 20 个测试锚点，按距离 `(0,0,0)` 排序输出最近 5 个；Bash 跑 `python anchor_db.py` 后断言距离递增，写入 `anchor.out`。
+  3. 写 `geohash_index.py`：实现 Geohash 编码——`(x, y)` 转 8 字符 geohash；给定用户位置 `(0,0)` 查邻近 8 个 hash 前缀；Bash 跑后断言返回正确邻近，写入 `gh.out`。
+  4. 写 `anchor_health.py`：实现"锚点健康度"评分——`score = 0.5*reloc_success + 0.3*pos_variance_inv + 0.2*user_feedback`；健康度 < 0.4 标记失效；Bash 跑后断言失效锚点被标记，写入 `health.out`。
 
----
-
-### BY06 空间音频：HRTF 与环境遮蔽
+### BY06 空间音频：HRTF 与环境遮蔽（距离衰减 + 简化滤波）
 
 - **预期档位**: medium
-- **考察维度**: 剖析 HRTF 个性化（generic vs individualized）、Ambisonics 阶数与环境声混响、射线投射遮挡（occlusion）与透射（transmission）的计算开销，以及在 XR 中对音频源距离衰减曲线的设计。
+- **考察维度**: HRTF + Ambisonics + occlusion
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我们的社交 VR 应用里需要 8 个用户同时语音聊天，且每个虚拟声源要有空间方位感。请从 HRTF（头部相关传输函数）讲起：解释通用 HRTF 与个性化 HRTF（基于 3D 头扫 / 耳照片 / 数值仿真）的定位精度差异，并对比 Ambisonics 一阶 / 二阶 / 三阶在还原声场细节与 CPU 占用之间的取舍。
-  2. 上一轮你提到个性化 HRTF 需要校准。如果用户拒绝做个性化校准，系统只能用 generic HRTF，那么在前-后混淆（front-back confusion）与仰角判断上会有什么典型问题？请给出三种客户端缓解策略（如加入早期反射混响提供距离线索、用头部微小运动动态辨别前后、利用视觉对齐辅助声源定位），并分析每种策略对计算预算的影响。
-  3. 现在我想在场景中加入「房间声学」效果：墙壁对高频的遮挡、走廊的低频透射、大空间的混响尾迹。请设计一个简化的实时声学模拟管线：射线投射做 direct occlusion + 少量 image-source 做早期反射 + 反馈延迟网络（FDN）做后期混响，并给出在 Quest 单核上的 CPU 预算分配建议（如 occlusion 1ms、反射 2ms、混响 1ms、总预算 ≤ 4ms）。
-  4. 最后，当 8 路语音流需要同时空间化时，请分析直接在 DSP 上跑 8 路 HRTF 的代价（每路卷积 ~128–512 阶 FIR），并给出两种优化方案：对远距离声源降阶 HRTF + 简化遮挡、对非焦点声源改用 Ambisonics panner 混合，请量化两种方案分别节省的 CPU 百分比。
+  1. 在 `tmpPlan/agent-test/by06/` 下用 Write 写 `hrtf_basics.md`：markdown 解释 HRTF 个性化（generic vs individualized）+ Ambisonics 一阶/二阶/三阶对比（还原细节 vs CPU 占用）；Bash `grep -F 'HRTF' hrtf_basics.md` 命中 + `grep -c '^|' hrtf_basics.md` ≥ 4。
+  2. 写 `hrtf_sim.py`：用 numpy 实现简化的 HRTF——左右耳时间差 `itd = sin(angle) * ear_distance / sound_speed`，强度差 `ild = cos(angle)`；Bash 跑 `python hrtf_sim.py` 后断言左/右耳信号不同，写入 `hrtf.out`。
+  3. 写 `occlusion.py`：模拟 occlusion + 早期反射——给定声源/听者/障碍物位置，计算遮挡衰减（`factor = 0.0 if blocked else 1.0`）+ 1 个 image source 反射（墙面镜像）；Bash 跑后断言有遮挡时音量衰减，写入 `occ.out`。
+  4. 写 `multi_source.py`：模拟 8 路语音同时空间化——`SpatialMixer` 用 numpy 加权和混合 8 个 HRTF 处理后的信号，断言输出 shape == (N,) 且峰值 < 1（防溢出），写入 `mix.out`。
 
----
-
-### BY07 三维空间 UI/UX：距离 / 可读性 / 舒适度
+### BY07 三维空间 UI/UX：距离 / 可读性 / 舒适度（PIL 字号验证）
 
 - **预期档位**: simple
-- **考察维度**: 考察三维空间中文本舒适度（视角、距离、字体大小）、UI 深度层级与遮挡、以及减少晕动症（vection sickness）的静态参考框架（如虚拟鼻 / 地平线 / cockpit）设计。
+- **考察维度**: 字号计算 + LOD + 晕动症缓解
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我要在 VR 应用中设计一套 HUD 与可交互面板系统。请从「人眼最小分辨角（~1 arcmin）」出发，计算在 Quest 3（单眼 2064x2208、95° FOV）上，距离眼睛 1m 处可舒适阅读的最小文字像素高度，并给出字号、行距、对比度在室内外两种光照场景下的推荐值。
-  2. 上一轮你给出了 1m 距离的字号。当用户佩戴头显在 0.5m（手臂伸直）到 5m（房间对角）之间移动时，UI 的渲染策略应如何变化？请设计三种 LOD：近场（≤1m）可点选控件、中场（1–3m）信息面板、远场（>3m）badge / 箭头指引，并说明每种 LOD 在锚定策略（世界锁 vs 头锁 vs 身体锁）上的选择。
-  3. 现在我想引入「虚拟鼻（virtual nose）」和「地平线参考线」两种减少晕动症的手法。请从视觉-前庭冲突（visuo-vestibular mismatch）原理讲起，对比这两种手法在缓解「主动运动（用户自己移动视角）」vs「被动运动（如坐过山车动画）」两种场景下的有效性，并给出各自在 3D 渲染管线中的实现要点（如鼻模型始终渲染在视野下方、深度写入关闭、半透明 alpha ≤ 0.3）。
-  4. 最后，考虑到部分用户可能有斜视（strabismus）或单眼弱视，请给出三种 XR UI 层面的无障碍适配方案：单眼兼容布局（避免双眼视差依赖的关键信息）、高对比模式（黄黑 / 蓝黄主题）、大字体放大模式（按当前距离动态缩放），并说明如何在运行时根据系统无障碍设置自动切换。
+  1. 在 `tmpPlan/agent-test/by07/` 下用 Write 写 `font_size_calc.py`：用 1 arcmin = 1/60 度计算"Quest 3 单眼 2064×2208、95° FOV、距离 1m"下最小舒适字号（像素高度 = 距离 × tan(1/60 deg) × PPI_inch）；Bash 跑 `python font_size_calc.py` 后断言字号 > 20 px，写入 `font.out`。
+  2. 写 `lod_strategy.md`：markdown 写三种 LOD——近场 ≤1m 可点选控件 / 中场 1-3m 信息面板 / 远场 >3m badge 指引；Bash `grep -c '^|' lod_strategy.md` ≥ 4 + `grep -F 'LOD' lod_strategy.md` 命中。
+  3. 写 `virtual_nose.py`：用 PIL 渲染"虚拟鼻"图像——固定半透明灰条 `alpha=0.3`，放在视野下方中央；Bash 跑 `python virtual_nose.py` 后 `ls nose.png` 存在，写入 `nose.out`。
+  4. 写 `a11y_layout.md`：markdown 列 3 种 XR 无障碍适配——单眼兼容布局 / 高对比模式（黄黑 / 蓝黄）/ 大字体放大模式 + 运行时根据系统设置自动切换；Bash `grep -c '^- ' a11y_layout.md` ≥ 3 + `wc -l a11y_layout.md` ≥ 8。
 
----
-
-### BY08 MR 场景理解：平面检测 / 物体遮挡 / 场景网格
+### BY08 MR 场景理解：平面检测 / 物体遮挡 / 场景网格（几何启发式）
 
 - **预期档位**: hard
-- **考察维度**: 剖析平面检测的类型约束（垂直/水平/任意）、场景网格（Scene Mesh）的更新策略、语义分割与物体遮挡（occlusion）在 MR 中的工程实现，以及与物理引擎的耦合。
+- **考察维度**: 平面分类 + 遮挡方案 + 物理 mesh
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我要在 MR 应用中实现「虚拟物体放置在真实桌面 + 虚拟球弹跳到真实地面 + 真实人遮挡虚拟物体」的效果。请先对比 ARKit Scene Reconstruction、Meta Scene Model、Microsoft Spatial Mapping 三者在「平面分类（垂直/水平）」「网格更新频率」「语义标签（天花板/地板/桌面/墙）」四个维度的支持差异。
-  2. 上一轮你提到了语义标签。假设我想在 ARKit 未直接提供语义的情况下（如只有几何 mesh），用客户端推理补全：请设计一个基于几何启发式 + 轻量神经网络的平面分类流水线，输入为局部 mesh patch（位置 + 法线 + 包围盒），输出为 {Floor, Ceiling, Table, Wall, Other} 五类，并估算在 A17 Pro 神经引擎上的推理延迟（如 ~2ms / patch）。
-  3. 进一步地，当真实用户走过遮挡虚拟物体时，我需要实时 occlusion。请对比三种主流遮挡方案：基于深度缓冲的 per-pixel遮挡（如 Quest 的 depth submission）、基于人体分割的 HoloLens 方案、基于实时 SfM 的稠密重建方案，从「遮挡精度」「延迟（ms）」「算力占用」「处理多人」四个维度给出对比表，并说明我们应用在 Meta Quest 上应优先选择哪种及其原因。
-  4. 最后，虚拟球与真实地面的物理交互需要「真实地面的实时几何」。请设计一个「动态物理 mesh」方案：从 Scene Mesh 中提取地面 sub-mesh → 异步生成 PhysX/Chaos triangle mesh collider → 当 mesh 变化时增量更新（而非全量重建），请给出增量更新策略（如只更新移动顶点的相邻三角形）与在帧时间内的预算约束（如 ≤ 3ms）。
+  1. 在 `tmpPlan/agent-test/by08/` 下用 Write 写 `plane_compare.md`：表格 3 行（ARKit Scene Reconstruction / Meta Scene Model / Microsoft Spatial Mapping），列：平面分类、网格更新频率、语义标签支持；Bash `grep -c '^|' plane_compare.md` ≥ 5。
+  2. 写 `plane_classifier.py`：用 numpy + 法线启发式分类——输入 mesh patch（位置 + 法线 + 包围盒），按法线方向分类（朝上=Floor / 朝下=Ceiling / 水平=Table / 垂直=Wall / 其他=Other）；Bash 跑后断言分类正确率 > 80%，写入 `cls.out`。
+  3. 写 `occlusion_strategies.md`：markdown 对比三种遮挡方案（深度缓冲 per-pixel / 人体分割 / SfM 稠密重建）的精度、延迟 ms、算力占用、处理多人能力；Bash `grep -c '^|' occlusion_strategies.md` ≥ 5 + `grep -F 'occlusion' occlusion_strategies.md` 命中。
+  4. 写 `dynamic_mesh.py`：模拟"动态物理 mesh 增量更新"——给定一组移动顶点（标记 `moved=True`），更新其相邻三角形；Bash 跑后断言只更新移动顶点的邻接三角形，写入 `mesh.out`。
 
----
-
-### BY09 性能优化：注视点渲染 / 热节流 / 功耗预算
+### BY09 性能优化：注视点渲染 / 热节流 / 功耗预算（python 阶梯模拟）
 
 - **预期档位**: medium
-- **考察维度**: 剖析可变速率着色（VRS）/ 注视点渲染（FR）的 GPU 收益、头显热节流（thermal throttling）对帧率的阶梯式影响，以及移动 XR 上 CPU/GPU/功耗的三维预算模型。
+- **考察维度**: 降级阶梯 + 热模型 + benchmark
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我们的 VR 游戏在 Quest 3 上经常因热节流从 90Hz 掉到 72Hz 再到 60Hz。请从 XR2 Gen 2 的 thermal design 讲起：解释「功耗墙 → 温度触发 → 频率下调 → 帧率切换」的负反馈链，并对比「主动降渲染负载（动态分辨率 / 关闭后处理）」vs「被动等降频」两种策略对用户体验的差异（画面抖动 vs 短暂模糊）。
-  2. 上一轮你提到了动态分辨率。如果我想启用「固定注视点渲染（Fixed Foveated Rendering, FFR）」与「眼动追踪注视点渲染（Eye-tracked Foveated Rendering, EFR）」两者中的一种，请从 GPU 填充率（fillrate）节省、视觉质量损失、硬件依赖三方面对比，并给出在「有眼动追踪的 Quest Pro」与「无眼动追踪的 Quest 3」上各自的推荐档位（如 Quest 3 用 High FFR、Quest Pro 用 EFR + Low 静态 FFR 组合）。
-  3. 现在我需要建立一套「帧时间预算自动调节器」：每帧监测 GPU/CPU 耗时与 SoC 温度，按优先级逐步降级。请设计一个五级降级阶梯：① 降阴影分辨率 → ② 降后处理（Bloom/SSAO）→ ③ 降渲染分辨率 → ④ 扩展 FFR 范围 → ⑤ 关闭 SSAO + 锁定 72Hz，并给出每级触发的阈值（如 GPU > 11ms 触发 ①、> 12.5ms 触发 ②）与恢复回切条件（如持续 5 帧 < 10ms 回切）。
-  4. 最后，考虑到不同用户的 GPU 体质差异与外界温度（夏天户外 MR vs 冬天室内 VR），请设计一个「热模型自适应」方案：应用启动前 30 秒跑一次基准压力测试（benchmark phase），测量稳态帧率与温度上升斜率，据此自动选择初始画质档位（Low/Medium/High），并给出该基准测试应包含的 3 类场景（密集多粒子、复杂光照、大视场角）及其权重。
+  1. 在 `tmpPlan/agent-test/by09/` 下用 Write 写 `thermal_model.py`：模拟"功耗墙→温度→频率→帧率"负反馈——给定 SoC 功耗 5W、温度阈值 45°C，超过则帧率 90→72→60 阶梯降；Bash 跑 `python thermal_model.py` 后断言降级阶梯正确触发，写入 `thermal.out`。
+  2. 写 `ffr_vs_efr.md`：markdown 对比 Fixed Foveated Rendering (FFR) vs Eye-tracked Foveated Rendering (EFR)——填充率节省、视觉质量损失、硬件依赖；推荐 Quest 3 用 High FFR、Quest Pro 用 EFR + Low FFR；Bash `grep -F 'FFR' ffr_vs_efr.md` 与 `grep -F 'EFR' ffr_vs_efr.md` 双命中。
+  3. 写 `degrade_ladder.py`：实现 5 级降级阶梯——① 降阴影分辨率 → ② 降后处理 → ③ 降渲染分辨率 → ④ 扩展 FFR 范围 → ⑤ 关闭 SSAO + 锁定 72Hz；给定 GPU 时间序列，模拟自动降级与恢复；Bash 跑后断言触发条件正确，写入 `ladder.out`。
+  4. 写 `benchmark_phase.py`：模拟"启动前 30 秒基准压力测试"——测量稳态帧率与温度上升斜率，按斜率选择初始画质档位；Bash 跑后断言档位选择合理，写入 `bench.out`。
 
----
-
-### BY10 WebXR 与 three.js / Babylon.js 实战
+### BY10 WebXR 与 three.js / Babylon.js 实战（JSON 场景解析）
 
 - **预期档位**: hard
-- **考察维度**: 剖析 WebXR API 核心流程（session / reference space / hit test / anchors）、three.js 与 Babylon.js 在 XR 模式下的性能/功能差异，以及浏览器端做 SLAM 锚点持久化与跨会话恢复的工程方案。
+- **考察维度**: WebXR API + three.js/Babylon.js + 多人同步
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 我要用 WebXR 做一个跨手机 AR（ARKit/ARCore via 浏览器）与跨头显 VR（Quest Browser）的 Web 应用。请从 `navigator.xr.requestSession('immersive-ar' | 'immersive-vr')` 讲起，说明两种 session 在功能支持（hit-test / anchors / camera / hand-tracking / depth-sensing）上的差异矩阵，以及在 Chrome Android、Quest Browser、Safari（iOS WebXR polyfill）三个运行时下需要特别处理的兼容性问题。
-  2. 上一轮你提到了 WebXR 的功能差异。如果我在 three.js 与 Babylon.js 之间做选型，请对比两者在「XR 相机 rig 管理」「控制器/手势输入抽象」「后处理管线（bloom/SSAO/MSAO）在单通道立体下的表现」「GLTF/USDZ 加载」四个维度的差异，并给出在「我要支持 WebXR hand-tracking + 复杂后处理 + 跨平台」的前提下推荐哪个及具体原因。
-  3. 进一步地，用户希望在手机 AR 会话中放置一个锚点并下次打开页面时恢复。请设计一个完整的 WebXR 锚点持久化方案：① 用 `XRHitTestSource` 获取命中点 → ② 创建 `XRAnchor` 并关联虚拟物体 → ③ 将 anchor 的 uuid + 自定义世界坐标系序列化到 IndexedDB → ④ 下次会话启动时用 `XRFrame.createAnchor()` 从持久化 id 恢复，并说明当浏览器或 OS 清理了 SLAM 数据时的「锚点丢失」降级 UI 提示方案。
-  4. 最后，当多人通过浏览器进入同一个 VR 房间时，我需要同步各自的手柄与头部姿态。请设计一个最小化的 WebXR 多人同步架构：前端 WebXR 采集 pose + 手骨骼数据 → 通过 WebRTC DataChannel 或 WebSocket 广播到 SFU → 远端用 three.js Avatar 还原。请重点分析「骨骼数据压缩」（如 25 关节 × 4 四元数 + 1 平移 = 9 floats/关节 vs 量化为 16bit 有符号整数）与「发送频率」（头部/手柄 90Hz、手骨骼 30Hz）的带宽预算，估算单用户上行带宽（KB/s），并提出一种基于卡尔曼预测的丢包补偿方案。
+  1. 在 `tmpPlan/agent-test/by10/` 下用 Write 写 `webxr_session.md`：markdown 对比 `immersive-ar` vs `immersive-vr` 两种 session 在 hit-test / anchors / camera / hand-tracking / depth-sensing 上的功能差异矩阵；Bash `grep -c '^|' webxr_session.md` ≥ 6 + `grep -F 'immersive-ar' webxr_session.md` 命中。
+  2. 写 `scene_parser.py`：解析 GLTF 风格的 JSON 场景文件——读 `scenes/nodes/meshes` 字段，统计 mesh 数、顶点总数、triangle 数；Bash 跑 `python scene_parser.py < scene.json` 后断言解析正确，写入 `parse.out`。
+  3. 写 `anchor_persist.py`：模拟 WebXR 锚点持久化——`Anchor(uuid, pos, quat)` 序列化为 JSON 存 IndexedDB 风格本地文件；下次会话从文件恢复；Bash 跑后断言 round-trip 一致，写入 `persist.out`。
+  4. 写 `multi_user_sync.py`：模拟多人姿态同步——25 关节 × 4 floats 编码为 100 floats/帧，90Hz 上行带宽 = 100 × 4 × 90 = 36KB/s/用户；Bash 跑后断言带宽计算正确，写入 `sync.out`。

@@ -1,97 +1,118 @@
-# 55 领域驱动设计 DDD 专题
+# 自动化测试提示词 — 领域驱动设计 DDD 专题（BD01–BD10）
 
-> 编号段 BD01–BD10 · 聚焦 DDD 全栈实践：战略设计 / 战术模式 / 事件风暴 / 上下文映射 / 聚合根设计 / 限界上下文集成
-> 与现有 50 维「软件架构模式与设计系统」互补：50 仅 AY02 一节概述 DDD；55 展开为 10 个独立纵深专题
-> 与现有 22 维「分布式系统与微服务架构」互补：22 偏分布式基础设施；55 偏领域建模与战略设计落地
+> 使用说明:聚焦 DDD 全栈实践:战略设计 / 战术模式 / 事件风暴 / 上下文映射 / 聚合根设计 / 限界上下文集成;每条要求 laew 写 Python 领域模型 + 领域事件 CSV + 事件风暴产物 + 规则校验脚本,可运行的业务逻辑必须断言状态机路径、不变量与事件落点,不靠口头讲解模式。
+
+## 维度说明
+考察 laew 把领域模型落成可验证代码 + 可执行产出的能力:概念→写 Python 聚合根/值对象(Write)→运行状态机(Bash)→断言不变量(Read+Bash);事件风暴与上下文映射落盘为 CSV/markdown,脚本核对必备字段;规则校验覆盖聚合根跨态禁则、事件命名格式、BC 边界。
 
 ---
 
-### BD01 通用语言（Ubiquitous Language）建立与维护
-- **预期档位**: medium
-- **考察维度**: 跨角色对话 + 术语治理
+### BD01 通用语言(Ubiquitous Language)建立与维护
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
+- **预期档位**: simple
+- **考察维度**: 术语表结构化 / 漂移检测规则
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 通用语言是什么？为什么要让业务方、产品、开发、测试、运维用同一套词汇？「订单」在客服语境（业务订单）、财务语境（结算单）、仓库语境（出库单）的差异。
-  2. 建立通用语言的三步法：术语抽取（业务文档 + 用户访谈）→ 术语对齐（Workshop 共识）→ 术语落地（代码命名 + 文档 + 沟通用语）。
-  3. 通用语言的「漂移」问题：开发为省事用技术词（Entity/Service/Manager）替代业务词，半年后业务方听不懂。给出检测与纠正机制。
-  4. 给 laew 的多 Agent 体系做通用语言梳理：把 Yolo / Plan / SubAgent / Quality-Check / SessionContext / Debug / Compact 七角色翻译为业务可读的角色名。
+  1. 在 `tmpPlan/agent-test/ddd-lang/glossary.csv` 写一份术语表 12 条:每行 `term, business_meaning, tech_alias, context, owner`,至少覆盖「订单」在客服/财务/仓库三个上下文的差异。
+  2. `Bash` 跑 `wc -l glossary.csv` 断言 = 12,`awk -F, '{print $3}' glossary.csv | grep -cE '(Entity|Service|Manager)'` 检测术语漂移(技术词),要求 ≤2 个。
+  3. `Read` glossary 后写 `detect_drift.py`:扫描代码注释或变量名里出现 tech_alias 但缺失对应 business 词时告警,输出 `drift.txt`。
+  4. 故意造一份漂移:把 2 个 business_meaning 列写成 Entity 形式,重跑必须非 0 输出漂移的 term,补齐 business_meaning 后再跑恢复 0。
 
-### BD02 限界上下文（Bounded Context）划分实战
+### BD02 限界上下文(Bounded Context)划分实战
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
 - **预期档位**: hard
-- **考察维度**: BC 边界识别 + 拆分方法
+- **考察维度**: BC 边界落盘 / 领域事件→聚合→BC
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 限界上下文的四大识别信号：业务能力（Capability）边界、团队结构（Conway 定律）、数据所有权（Master Data）、变更频率（独立演进节奏）。
-  2. BC 拆分的反模式：按技术层拆（Controller/Service/DAO 跨 BC 共享）、按数据库表拆（订单表横跨多个 BC）、过早拆分（团队规模不够时拆 10 个 BC）。
-  3. 真实案例：从单体电商拆 BC 的过程，订单域、库存域、支付域、营销域、用户域的边界识别与典型争议（订单里的「优惠券抵扣」属于订单还是营销）。
-  4. 用「事件风暴（Event Storming）」工作坊为 laew 拆 BC：识别领域事件（用户输入任务 / 任务分类 / 子任务委派 / 上下文压缩）→ 划定聚合 → 落定 BC。
+  1. 在 `tmpPlan/agent-test/ddd-bc/events.csv` 写电商领域事件 15 条:`event_name, aggregate, context`,覆盖 Order/Inventory/Payment/Marketing/User 5 个聚合。
+  2. `Bash` 跑 `awk -F, '{print $3}' events.csv | sort -u | wc -l` 断言恰好 5 个 BC,`awk -F, '{print $2}' events.csv | sort -u | wc -l` 断言 ≥5 聚合。
+  3. `Read` events 后写 `derive_bc.py`:按 event→aggregate→BC 自动聚类,输出 `bc_map.csv` 含 `bc, event_count, agg_count`。
+  4. 故意把 2 条事件的 context 写错(跨 BC 误标),重跑 derive_bc.py 后 `diff <(sort bc_map.csv) <(sort expected.csv)` 非空,定位修正事件后重跑 diff 空;再写 `storm.md` 设计 3 小时工作坊议程(参与者/产出物/时间盒),`Bash` `grep -cE '^### ' storm.md` ≥ 5。
 
-### BD03 上下文映射（Context Map）与集成模式
+### BD03 上下文映射(Context Map)与集成模式
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
+- **预期档位**: medium
+- **考察维度**: 8 种 Context Map 模式 / ACL 翻译
+- **工具链**: Write → Bash → Read → Bash
+- **对话脚本**:
+  1. 在 `tmpPlan/agent-test/ddd-cm/map.csv` 写 5 对 BC 集成关系:`upstream, downstream, pattern`,pattern 必须在 Partnership/Shared Kernel/Customer-Supplier/Conformist/ACL/Open-Host Service/Published Language/Separate Ways 八选。
+  2. `Bash` 跑 `awk -F, 'NR>1{print $3}' map.csv | sort -u | wc -l` 断言模式数 ≥3(不可全用同一种)。
+  3. `Read` map 后写 `acl.py` 最小 ACL 翻译:Order 上游模型 `{order_id, total_cents, address}` 翻译成 Marketing 促销上下文 `{promo_order_id, discount_eligible, region}`,`Bash` 跑 `python3 acl.py` 输入示例 order,输出必须含 `promo_order_id`。
+  4. `Write` `check_cm.py` 校验 map.csv:upstream 与 downstream 必须都在已有 BC 列表中(不允许悬空),`Bash` 跑退出码 0,故意造一对悬空 BC 重跑必须非 0 指出缺失。
+
+### BD04 聚合根(Aggregate Root)设计与一致性边界
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
 - **预期档位**: hard
-- **考察维度**: Context Map 8 种模式 + 集成 DDD
+- **考察维度**: 聚合根状态机 / 不变量保护
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. Context Map 八种集成模式：Partnership / Shared Kernel / Customer-Supplier / Conformist / Anti-Corruption Layer / Open-Host Service / Published Language / Separate Ways。
-  2. 每种模式的核心权衡：团队耦合度（低 → 高）vs 演进自由度（高 → 低）vs 翻译成本（无 → 高）。给一个「中台-业务」架构选 Shared Kernel vs ACL 的真实取舍。
-  3. ACL（Anti-Corruption Layer）的工程实现：Translator 模式 + Adapter 模式 + 防腐层的位置（上游还是下游？），给一段 ACL 翻译外部订单模型的伪代码。
-  4. 给 laew 设计 Context Map：Yolo 入口层与 Plan 规划层的 ACL 翻译（任务分类标签的语义对齐）、SubAgent ↔ Quality-Check 的 Customer-Supplier 关系。
+  1. 在 `tmpPlan/agent-test/ddd-agg/order.py` 写 Order 聚合根(`@dataclass` 含 `status/items/total_cents`),含方法 `add_item/split/ship/cancel`,每次操作必须校验不变量(status 顺序 + 金额非负)。
+  2. `Bash` 跑 `python3 order.py` 演示合法路径(NEW→PAID→SHIPPED),断言 exit 0。
+  3. `Read` order.py 后写 `test_order.py` 用 `assert` 覆盖 5 条业务不变量:NEW 状态不可 ship、PAID 不可再 add_item、金额必须 >0、cancel 后不能再次 PAID、ship 前必须 PAID,`python3 -m unittest` 必须全部通过且 `OK`。
+  4. 故意加一条「跨态禁则」:test_illegal_ship 期望抛异常,跑出来通过;然后把 cancel 方法的禁则校验逻辑「注释掉」,跑 test_order.py 期望 test_cancel 失败,验证不变量保护生效。
 
-### BD04 聚合根（Aggregate Root）设计与一致性边界
+### BD05 值对象(Value Object)与不可变性
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
+- **预期档位**: medium
+- **考察维度**: VO 不可变 / 构造时校验
+- **工具链**: Write → Bash → Read → Bash
+- **对话脚本**:
+  1. 在 `tmpPlan/agent-test/ddd-vo/vos.py` 写 4 个值对象:`Money(amount, currency)`、`Email(value)`、`DateRange(start, end)`、`Address(city, street)`,全部 `@dataclass(frozen=True)` + 构造时校验。
+  2. `Bash` 跑 `grep -cE '@dataclass\(frozen=True\)' vos.py` 断言 = 4,`grep -cE 'raise ValueError' vos.py` 断言 ≥4(每 VO 一校验)。
+  3. `Write` `test_vo.py`:构造合法 VO、构造非法 VO(如 Money 金额负数、Email 无 @、DateRange start>end)必须抛 ValueError,`python3 -m unittest` 全部通过。
+  4. 故意让 Money 校验允许负金额(注释 `if amount < 0`),重跑 test_vo 必须失败,恢复后再跑 0;`Write` `vo_usage.md` 列 4 个 VO 在 Order 聚合根中的使用点。
+
+### BD06 领域服务(Domain Service)与应用服务分层
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
+- **预期档位**: medium
+- **考察维度**: 三层分工 / 领域逻辑可测
+- **工具链**: Write → Bash → Read → Bash
+- **对话脚本**:
+  1. 在 `tmpPlan/agent-test/ddd-svc/` 写三层:`application/task_service.py`(编排 + 事务 + DTO)、`domain/difficulty_evaluator.py`(3 档分类逻辑)、`infrastructure/llm_client.py`(HTTP 占位)。
+  2. `Bash` 跑 `grep -RE 'import .*infrastructure' application/ domain/` 断言无反向依赖(数值=0),`grep -RE 'import .*domain' application/` 断言 ≥1。
+  3. `Write` `test_difficulty.py`:用 5 条任务样本(simple/medium/hard)验证 difficulty_evaluator 分类结果,`Bash` 跑 `python3 test_difficulty.py` 期望分类命中率 ≥4/5。
+  4. 故意把 domain/difficulty_evaluator.py 里的一条分类阈值调错,重跑命中率 <4,定位修正后恢复 ≥4;`Write` `layer.md` 列三层调用链+分层校验规则 5 条。
+
+### BD07 领域事件(Domain Event)与解耦
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
 - **预期档位**: hard
-- **考察维度**: 聚合设计 + 不变量保护
+- **考察维度**: 事件流落盘 / 订阅关系核对
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 聚合根的本质：一致性边界 + 事务边界 + 不变量（Invariant）守护者。判断一个实体是否该是聚合根的三个问题：能否独立事务？是否被外部直接引用？修改是否需协调其他对象？
-  2. 聚合根设计的常见错误：过大（God Aggregate，把所有相关实体塞进一个根）/ 过小（每个实体一个根，失去聚合意义）/ 跨聚合事务（破坏最终一致性原则）。
-  3. 聚合根的引用规则：聚合根之间通过 ID 引用（非对象引用）、聚合内部通过对象引用、跨聚合用领域事件同步状态。
-  4. 给 laew 设计聚合根：把「任务执行」建模为 `TaskExecution` 聚合根，内含 `WorkflowStep` 列表与 `SessionContext`，外部只能通过根的领域方法（如 `executeNext()`）变更内部状态。
+  1. 在 `tmpPlan/agent-test/ddd-ev/events.csv` 写 8 条领域事件:`event_name(version 后缀 V1/V2 至少 1 条), aggregate, subscribers(JSON 列表)`,至少 3 个 aggregate、每个事件 ≥1 subscriber。
+  2. `Bash` 跑 `awk -F, '{print $2}' events.csv | sort -u | wc -l` 断言 ≥3 聚合,`awk -F, '{print $1}' events.csv | grep -c 'V[0-9]'` 断言至少 1 条带版本后缀。
+  3. `Read` events 后写 `publish.py` 最小事件总线:`subscribe(topic, handler)` + `publish(topic, event)` + handler 抛异常不阻断其他订阅者,跑 3 个订阅者 + 1 个抛异常订阅者,`Bash` 跑断言其余 2 个订阅者仍收到事件。
+  4. `Write` `check_events.py` 校验:每个事件的 subscriber 必须引用已存在的 BC(不允许悬空),`Bash` 跑退出码 0,故意造一条悬空 subscriber 重跑必须非 0 指出缺失。
 
-### BD05 值对象（Value Object）与不可变性
+### BD08 仓储(Repository)模式与持久化
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
 - **预期档位**: medium
-- **考察维度**: VO 设计 + 不可变实践
+- **考察维度**: 仓储接口 / 持久化无关
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 值对象 vs 实体的本质差异：无身份标识（Identity）vs 有身份；不可变 vs 可变；可替换（基于属性相等）vs 不可替换（基于 ID 追踪）。
-  2. 经典值对象案例：Money（金额 + 币种）、Address（街道 + 城市 + 邮编）、DateRange（开始 + 结束）、Email、PhoneNumber。给一段 Rust 实现的 Money 不可变示例。
-  3. 值对象的工程价值：消除「贫血模型」（Primitive Obsession）、提升表达力（`Email` 比 `String` 更安全）、自动验证（构造时校验）。
-  4. 给 laew 设计一批值对象：`ContextUsage { used: u32, max: u32 }`、`TokenCost { input: u32, output: u32, cache_read: u32 }`、`TimeRange { start: DateTime, end: DateTime }`，列出它们的使用场景。
+  1. 在 `tmpPlan/agent-test/ddd-repo/domain/` 写 `task_repo.py`(接口:`find_by_id/save/find_incomplete`),在 `infrastructure/` 写 `sqlite_task_repo.py`(用 Python sqlite3 实现)。
+  2. `Bash` 跑 `grep -RE 'import .*(infrastructure|sqlite)' domain/` 断言无反向依赖(数值=0)。
+  3. `Write` `test_repo.py`:建临时 sqlite、save 3 条任务、find_by_id 验证内容一致、find_incomplete 过滤已完成,`Bash` 跑 `python3 test_repo.py` 全部断言通过。
+  4. 故意把 sqlite 实现里的 save 方法改为覆盖(不校验主键),重跑 find_by_id 必须失败,恢复后 0;`Write` `repo_design.md` 列接口 3 方法 + 实现要点 + 持久化无关设计 4 条。
 
-### BD06 领域服务（Domain Service）与应用服务分层
+### BD09 事件风暴(Event Storming)工作坊
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
 - **预期档位**: medium
-- **考察维度**: 领域服务 vs 应用服务职责边界
+- **考察维度**: 工作坊议程 / 产出物清单
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 领域服务的判定三问：操作是否跨多个聚合根？是否承载领域逻辑而非基础设施？是否属于业务概念而非技术概念？三条都满足 → 领域服务。
-  2. 应用服务 vs 领域服务 vs 基础设施服务的三层分工：应用服务（用例编排 + 事务边界 + DTO 转换）→ 领域服务（领域逻辑 + 不变量保护）→ 基础设施服务（DB/HTTP/MQ）。
-  3. 「贫血模型」反模式：所有逻辑塞进 Service、实体只有 getter/setter。给出从贫血模型到充血模型的迁移路径。
-  4. 给 laew 分层：`TaskClassifier`（应用服务，编排分类流程）→ `TaskDifficultyEvaluator`（领域服务，3 档分类业务逻辑）→ `LlmClient`（基础设施，HTTP 调用）。
-
-### BD07 领域事件（Domain Event）与解耦
-- **预期档位**: hard
-- **考察维度**: 领域事件建模 + 可靠发布
-- **对话脚本**:
-  1. 领域事件的本质：过去时态命名（OrderPlaced / UserRegistered / TaskCompleted）、携带必要数据（ID + 业务字段）、携带元数据（时间戳、actor、tenant）。
-  2. 领域事件的工程实现：内存事件总线（同进程）、Outbox 模式（可靠发布到 MQ）、Eventual Consistency（最终一致性）、CDC（变更数据捕获）四种实现路径对比。
-  3. 事件命名与版本演进：`OrderPlaced` → `OrderPlacedV2` 的迁移策略，事件 schema 的 upcasting 与死信处理。
-  4. 给 laew 设计领域事件流：`TaskClassified(level: TaskLevel)` → `WorkflowPlanned(workflows: Vec<Workflow>)` → `SubTaskCompleted(task_id, output)` → `QualityCheckPassed`，画出事件订阅关系图。
-
-### BD08 仓储（Repository）模式与持久化
-- **预期档位**: medium
-- **考察维度**: 仓储抽象 + 持久化无关
-- **对话脚本**:
-  1. 仓储模式的本质：聚合根级别的「内存集合」抽象，对上层隐藏持久化细节，让领域代码不依赖 ORM/数据库。
-  2. 仓储与 DAO 的区别：DAO 是表级别的、仓储是聚合根级别的；仓储返回领域对象、DAO 返回数据结构。
-  3. 仓储设计原则：接口定义在领域层、实现放在基础设施层、聚合根只暴露仓储接口、避免「通用仓储」反模式（CRUD 通用方法）。
-  4. 给 laew 设计仓储：`TaskExecutionRepository` 接口（find_by_id / save / find_incomplete）定义在 domain 层，SqliteTaskExecutionRepository 实现放在 infra 层，给出 trait 定义与实现分离的代码。
-
-### BD09 事件风暴（Event Storming）工作坊
-- **预期档位**: medium
-- **考察维度**: 工作坊流程 + 协作引导
-- **对话脚本**:
-  1. 事件风暴三色便利贴：橙色（领域事件）/ 蓝色（命令）/ 黄色（外部系统）/ 绿色（读模型）/ 粉色（热点问题），贴出来的就是一张「业务流程大图」。
-  2. 工作坊的标准流程：邀请（业务 + 开发 + 测试 + UX，10-15 人）→ 事件识别 → 命令识别 → 聚合划分 → BC 边界 → 上下文映射 → 输出待办。
-  3. 远程协作的事件风暴工具：Miro / Mural / FigJam / Whimsical，对比实时性、白板体验、便利贴拖拽、模板支持。
-  4. 设计一场为 laew 团队做的事件风暴：3 小时工作坊议程、参与者角色分工、产出物清单（领域事件列表 + BC 草图 + Context Map + 待澄清问题）。
+  1. 在 `tmpPlan/agent-test/ddd-storm/agenda.md` 设计一场 3 小时工作坊:6 段(开场/事件识别/命令识别/聚合划分/BC 边界/总结),每段含时间盒(总时长 180min)。
+  2. `Bash` 跑 `awk -F'[()]' '/^## /{sum+=$2} END{print sum}' agenda.md` 断言总时长 = 180(min)。
+  3. `Write` `check_agenda.py` 校验:每段必须含「产出物」关键词(至少 3 类:事件列表/BC 草图/Context Map/待澄清问题),`Bash` 跑退出码 0。
+  4. `Read` 后加一份「参与者角色分工」`roles.md`:5 个角色(业务/开发/测试/UX/引导师)每角色 ≥3 职责,`Bash` `grep -cE '^### ' roles.md` 断言 = 5,缺失补齐。
 
 ### BD10 DDD 落地陷阱与团队转型
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
 - **预期档位**: medium
-- **考察维度**: 落地方法论 + 团队演进
+- **考察维度**: 转型路线图 / 3 阶段核对
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. DDD 落地的七大陷阱：教条化（把模式当教条而非工具）、过度设计（CRUD 强行上聚合根）、名词驱动（只翻译术语不识别边界）、文档驱动（架构图代替对话）、单兵作战（缺跨角色协同）、回避妥协（不愿写 ACL）。
-  2. DDD 转型的三阶段：探索阶段（单 BC 试点 + 事件风暴）→ 推广阶段（识别核心域 + 拆分 BC）→ 收敛阶段（持续集成 + 上下文映射治理），每阶段 3-6 个月。
-  3. 「遗留系统」的 DDD 化：绞杀者模式（Strangler Fig）逐步替换、Anti-Corruption Layer 隔离、技术债分阶段偿还，给出 18 个月迁移路线图。
-  4. laew 作为新项目从 Day 1 引入 DDD 的最佳实践：先建通用语言词典、再用事件风暴识别 4-5 个聚合根、采用战术模式（VO/Entity/Domain Service）落地代码，最后按 BC 拆分模块。
+  1. 在 `tmpPlan/agent-test/ddd-adopt/roadmap.md` 写一份 18 个月 DDD 转型路线图:3 阶段(探索/推广/收敛),每阶段 6 个月,每阶段 ≥4 项关键工作。
+  2. `Bash` 跑 `grep -cE '^## (探索|推广|收敛)' roadmap.md` 断言 = 3,`grep -cE '^### ' roadmap.md` 断言 ≥ 12(每阶段 4 项)。
+  3. `Write` `check_roadmap.py` 校验:每阶段必须含「风险」「SLA」「负责人」「产出物」四关键词,`Bash` 跑退出码 0。
+  4. 故意把「推广」阶段的负责人写成空,重跑必须非 0 指出缺负责人,补齐后再跑恢复 0;`Write` `anti_pattern.md` 列 5 个 DDD 落地陷阱(教条化/过度设计/名词驱动/文档驱动/单兵作战),每项 ≥2 行描述。

@@ -6,92 +6,112 @@
 
 ---
 
-### BL01 段错误 SIGSEGV 定位：core dump 与符号还原
+### BL01 段错误 SIGSEGV：C 程序空指针解引用 + gdb 回溯
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: medium
 - **考察维度**: core dump 捕获 + addr2line 符号化 + 栈回溯
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 一个 Rust 服务在生产环境偶发段错误（每天 1-2 次），日志只有 `signal 11 (SIGSEGV), invalid memory reference`。第一步：在 Linux 上启用 core dump（`ulimit -c unlimited` + `sysctl kernel.core_pattern=/tmp/core.%e.%p.%t`），容器环境用 `prlimit --pid 1 --core=unlimited:unlimited`。
-  2. 基于上面的 core dump，用 `gdb` 加载二进制 + core 文件：`gdb ./laew /tmp/core.laew.12345.1700000000`，`bt full` 看完整栈，找出崩溃点。给出一段真实的崩溃栈样例（如 `agent::compact::CompactRunner::run` 第 248 行）。
-  3. core 文件缺符号表怎么办？编译时必须加 `debug = 1` + `[profile.release] debug = true`（Cargo 字段），发布构建也要保留符号；用 `addr2line -e ./laew -f -i 0x7f8a3c001234` 把地址翻译回 `fn compact::run` + 行号。
-  4. Rust 特有的段错误来源：unwrap 空指针（少见但 FFI 时常见）、slice 越界（slice index panic 在 release 下可能段错误）、循环引用 `Rc::strong_count` 溢出。给 laew 加一个 panic hook 把堆栈持久化到 SQLite `crash_dump` 表（设计见第十七轮专题：崩溃恢复与取证）。
+  1. 在 `tmpPlan/agent-test/buggy.c` 用 Write 写一个故意缺陷的 C 程序：`int main() { char *p = NULL; printf("%c\n", *p); return 0; }`；用 `bash` 跑 `gcc -g -O0 -o buggy buggy.c && ./buggy` 应得到 `Segmentation fault (core dumped)`（非 0 退出码 + stderr 含 `Segmentation`）。
+  2. 在 `tmpPlan/agent-test/test_segfault.py` 写一个 Python 复现 + 断言脚本：`subprocess.run(['./buggy'], capture_output=True)` 断言 returncode 不为 0 + stderr 含 `Segmentation fault`；记录 stderr 全文到 `tmpPlan/agent-test/segfault.log`。
+  3. 用 `Bash` 跑 `ulimit -c unlimited && ./buggy 2>&1 | tee tmpPlan/agent-test/segfault.out` 触发 core dump；用 `gdb -batch -ex 'bt' ./buggy ./core` 拿到回溯断言包含 `main` + `printf` + 空指针地址 `0x0`。
+  4. 修复：在 `tmpPlan/agent-test/fixed.c` 写 `if (!p) { fprintf(stderr, "null pointer\n"); return 1; }`；`gcc -g -o fixed fixed.c && ./fixed` 退出码 0 + stderr 含 `null pointer`；最后 `rm -f buggy.c buggy fixed.c fixed buggy core segfault.*` 清理。
 
-### BL02 内存泄漏围剿：从增长曲线到调用栈
+### BL02 Python 内存泄漏：tracemalloc 定位到调用栈
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: medium
-- **考察维度**: RSS 监控 + heap profiling + jemalloc stat
+- **考察维度**: RSS 监控 + tracemalloc 栈采样 + 泄漏检测
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 一个 Rust 服务跑 3 天后 RSS 从 80MB 涨到 1.5GB，触发 OOM 被杀。第一步：在 `/proc/{pid}/status` 监控 VmRSS，每 10s 采样一次，画时间序列图（用 `gnuplot` 或 `pandas`），确认是**线性增长**（泄漏）还是**锯齿**（缓存，正常）。
-  2. 基于上面的增长曲线，加 jemalloc 统计：`MALLOC_CONF="stats_print:true"` 启动，每小时 dump 一次 stat 输出，关注 `Allocated`（当前活跃）与 `Retained`（jemalloc 自己保留的，**不等于泄漏**）的差值。
-  3. 进一步定位：用 `heaptrack`（Linux KDE 工具，记录所有 malloc/free + 调用栈）跑服务 1 小时后 `heaptrack_print` 看 top 增长点；Rust 服务的常见泄漏源：`tokio::spawn` 的 task 没结束（channel 一端持有），`mpsc::Sender` 循环引用，`sqlx` 连接池未释放。
-  4. 给 laew 排查可能的泄漏点：MultiAgentOrchestrator 的 WorkflowHandle 列表（每次 SubAgent 完成 push 但忘 remove）、DebugReport 的 trace collector 累积的 LLM 输入输出未截断。设计一个定时器每 5 分钟打印 `jemalloc::stats::stats_print` 到日志。
+  1. 在 `tmpPlan/agent-test/leaky.py` 用 Write 写一个故意泄漏的 Python 程序：`leak_list = []; def leaky_func(): x = bytearray(10_000_000); leak_list.append(x); return;` `for i in range(20): leaky_func()` 把 200MB 字节数组挂到全局 leak_list；用 `tracemalloc.start()` 在程序入口启动追踪。
+  2. 跑 `python3 leaky.py` 记录 RSS（`/proc/<pid>/status` 的 VmRSS）+ tracemalloc 快照；断言 20 次迭代后 `tracemalloc.get_traced_memory()[0]` 增长到 ≥ 100MB（确认泄漏） + top 1 分配栈 `leaky.py:leaky_func:2` 贡献 > 50%。
+  3. 在 `tmpPlan/agent-test/test_leak.py` 写断言脚本：`subprocess.run(['python3', 'leaky.py'], capture_output=True)` 解析 stdout 断言 RSS >= 100MB 且 top 1 栈定位 `leaky_func` 行号。
+  4. 修复：在 `tmpPlan/agent-test/fixed_leak.py` 改成 `x = bytearray(...) ; return None`（不挂全局列表）+ 调 `gc.collect()` 释放；再跑 `python3 fixed_leak.py` 断言 RSS < 50MB 且 tracemalloc top 1 栈不是 `leaky_func`；写「laew `agent_memory` 累积未截断泄漏」设计说明到 `tmpPlan/agent-test/leak_design.md`，最后清理测试文件。
 
-### BL03 死锁与锁顺序反转
+### BL03 Python 死锁：threading 锁顺序反转 + 调试输出
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: hard
-- **考察维度**: lockdep + 死锁检测 + 锁顺序规约
+- **考察维度**: 锁顺序反转 + 信号 stack dump + 锁规约
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. Rust 服务偶发卡死，所有 worker 线程停在 `futex_wait_queue`，CPU 占用降到 0。第一步：发 `SIGQUIT` 给进程（`kill -3 <pid>`，Rust 默认 panic handler 会 dump 所有线程栈），找到两个线程在 `pthread_mutex_lock` 互相等待。
-  2. 基于上面的栈，识别锁顺序反转：线程 A 持 lock1 等 lock2，线程 B 持 lock2 等 lock1。Rust 里常见于 `Arc<Mutex<T>>` 跨回调闭包调用，例如 ProviderRegistry 持 config 锁时回调内又去拿 Session 锁。
-  3. 修复方案：强制锁顺序（如「先 Session 后 Provider」），把多个锁合并为单个粗粒度锁，或改用 `parking_lot::RwLock`（更便宜但同样死锁）。Rust async 场景特别注意：`tokio::sync::Mutex` 不能跨 `.await` 持锁（容易死锁）。
-  4. 加 `tracing` 字段自动记录每次 lock 获取：`#[instrument]` 注解 + `Mutex::lock_with_span`，或集成 `tokio-console` 实时看锁等待图。最后评估 laew 的 `agent_memory` 表读写锁是否需要类似规约。
+  1. 在 `tmpPlan/agent-test/deadlock.py` 用 Write 写两个线程互相等锁：`lock_a = threading.Lock(); lock_b = threading.Lock(); def t1(): acquire(lock_a); sleep(0.1); acquire(lock_b)`；`def t2(): acquire(lock_b); sleep(0.1); acquire(lock_a)`；主线程 5 秒后 `os.kill(os.getpid(), signal.SIGQUIT)`（Python 默认 `signal.signal` 会 dump 所有线程栈到 stderr）。
+  2. 跑 `timeout 6 python3 deadlock.py 2>&1 | tee tmpPlan/agent-test/deadlock.out` 断言：6 秒后 SIGQUIT 触发 + stderr 含 2 个线程都在 `Lock.acquire` 阻塞 + Python stack dump 显示 `t1` 与 `t2`；进程 exit 非 0。
+  3. 在 `tmpPlan/agent-test/test_deadlock.py` 写断言脚本：`subprocess.run(['timeout', '6', 'python3', 'deadlock.py'], capture_output=True)` 断言 stderr 含 `t1` 与 `t2` 线程名 + 至少 2 个 `Lock.acquire` 字样。
+  4. 修复：在 `tmpPlan/agent-test/fixed_deadlock.py` 统一锁顺序（先 lock_a 后 lock_b）→ 跑 `timeout 6 python3 fixed_deadlock.py` 断言 stderr 无 `Lock.acquire` 阻塞 + exit 0；写「laew agent_memory 表读写锁顺序规约」设计说明到 `tmpPlan/agent-test/deadlock_design.md`，最后清理测试文件。
 
-### BL04 数据竞争与 Heisenbug：只在生产复现
+### BL04 Python 数据竞争：threading 非线程安全 dict + 原子性
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: hard
-- **考察维度**: TSan + 内存模型 + 调试技巧
+- **考察维度**: 数据竞争 + GIL 边界 + 原子操作
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 一个并发 Bug 在测试环境跑 1000 次都不出现，**只在生产偶发**（Heisenbug）。第一步：本地用 `cargo test --features tsan` 开 ThreadSanitizer 跑 10000 次（TSan 把竞争检测放慢 5-15 倍但能找到所有 race）。
-  2. 基于 TSan 报告，Rust 常见 race 模式：`Arc<RefCell<T>>` 跨线程共享（必须 `Arc<Mutex<T>>` 或 `Arc<RwLock<T>>`）、`Cell` / `UnsafeCell` 在多线程读写（UB）、`static mut` 未加 `Sync` wrapper。给出一段真实误用 `Rc<Vec<T>>` 跨 `tokio::spawn` 的代码。
-  3. 生产复现：开启 `MALLOC_CONF="prof:true,prof_active:true"` + jemalloc profile，配置采样率 1/1000，记录 race 时刻的栈；用 `RUST_BACKTRACE=full RUST_LOG=trace` 跑灰度发布，再用 `eBPF` 的 `uprobe` 跟踪关键函数。
-  4. Rust 内存模型细节：`Send` / `Sync` 是编译期检查，但 UnsafeCell 内部操作仍是 UB；`OnceCell` 的 `get_or_init` 可能在并发下 double-init（除非用 `LazyLock`）。最后评估 laew 的 SessionContext 在跨 SubAgent 传递时是否需要加 TSan 集成测试。
+  1. 在 `tmpPlan/agent-test/race.py` 用 Write 写一个数据竞争程序：`shared = {}; def worker(i): for _ in range(1000): shared[i] = shared.get(i, 0) + 1`；启 10 个线程各跑 worker；期望最终 shared[i] 之和 == 10000，但因 `shared.get + 1 + 赋值` 非原子，实际可能 < 10000（竞争丢失更新）。
+  2. 跑 `python3 race.py` 三次取最坏结果记录到 `tmpPlan/agent-test/race.out`；断言三次中有 ≥ 1 次 shared 总和 < 10000（证明竞争存在）；输出冲突计数器 `race_count = 10000 - sum(shared.values())`。
+  3. 在 `tmpPlan/agent-test/test_race.py` 写断言：跑 10 次 race.py 断言 ≥ 5 次总和小于 10000（统计意义上确认竞争）。
+  4. 修复：用 `collections.Counter` 替代 dict（Counter 的 `__setitem__` 在 C 层是原子操作）或加 `threading.Lock`；跑 `python3 fixed_race.py` 三次断言总和恒为 10000；写「laew SessionContext 跨 SubAgent 共享状态是否需加原子计数器」到 `tmpPlan/agent-test/race_design.md`，最后清理。
 
-### BL05 生产 OOM：容器内存限额与堆外内存
+### BL05 fd 泄漏：open() 不 close + /proc/PID/fd 监控
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: medium
-- **考察维度**: cgroup 内存 + RSS vs 堆外 + OOM Killer 日志
+- **考察维度**: fd 计数 + /proc fd 监控 + ResourceWarning
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. K8s pod 内存设限 512Mi，但 Rust 服务运行 6 小时后被 OOMKilled（`dmesg | grep -i oom` 看到 `Killed process 12345 (laew) total-vm:... anon-rss:524288kB`）。第一步：区分 RSS（`/proc/{pid}/status` VmRSS）与 cgroup 实际计数（`/sys/fs/cgroup/memory/memory.usage_in_bytes`）。
-  2. 基于上面的诊断，常见堆外内存：jemalloc arena（`stats.allocated` vs `stats.resident`）、mmap 大块（tokio 的 buffer pool）、第三方库的 native heap（rusqlite 的 page cache、curl 的 DNS 缓存）。用 `cat /proc/{pid}/smaps` 看每段 VMA 的 RSS / Pss。
-  3. 修复方向：j 配 `MALLOC_CONF="narenas:1,background_thread:true"` 减小 arena；调小 tokio `max_blocking_threads`；把 page cache 改成 mmap 落盘；设 RSS 软上限触发主动释放（`mallocx(0, MALLOCX_TRIM)`）。
-  4. 给 laew 加 OOM 前置保护：在 `agent_memory` 表加 size 列，每 1 分钟统计缓存大小，超过阈值主动清理 + 写日志；启动时 `setrlimit(RLIMIT_AS, ...)` 软限 RSS（80% cgroup limit）。
+  1. 在 `tmpPlan/agent-test/fd_leak.py` 用 Write 写一个 fd 泄漏程序：`for i in range(2000): f = open('/dev/null', 'r'); # 故意不 close`；跑 `python3 -W error::ResourceWarning fd_leak.py` 断言触发 ResourceWarning 报警 2000 次 + `len(os.listdir('/proc/self/fd'))` 增长到 ≥ 2002（标准 + 标准错误 + 2000 个 /dev/null）。
+  2. 跑 `python3 fd_leak.py` 实际打开 2000 个 fd 不关闭 → `ls /proc/$$/fd | wc -l`（在子进程里）断言 ≥ 2000；同时 `ResourceWarning` 触发 ≥ 2000 条（python -W default 也可）。
+  3. 在 `tmpPlan/agent-test/test_fd.py` 写断言脚本：spawn 子进程跑 `python3 fd_leak.py` → 跑中读 `/proc/<child_pid>/fd` 计数断言 ≥ 2000；捕获 stderr 断言含 ≥ 1000 条 `ResourceWarning`。
+  4. 修复：用 `with open(...) as f:` 或显式 `f.close()`；跑 `python3 fixed_fd.py` 断言 `/proc/self/fd` 数量恒为 5（stdin/stdout/stderr + 2 个 ResourceWarning 自身）；写「laew LLM client fd 泄漏监控」设计说明到 `tmpPlan/agent-test/fd_design.md`，最后清理测试脚本。
 
-### BL06 CPU 打满 100%：从 top 到火焰图
+### BL06 CPU 100%：灾难性正则回溯 + 防 ReDoS
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: medium
-- **考察维度**: perf + 火焰图 + 热点函数定位
+- **考察维度**: ReDoS + regex 性能 + NFA/DFA 引擎
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 生产服务 CPU 单核 100%（其他核闲置），响应慢 10 倍。第一步：`top -H -p <pid>` 找占用最高的线程 ID（TID），`printf '%x\n' <TID>` 转十六进制。
-  2. 基于上面的 TID，用 `perf record -p <pid> -F 99 -g -- sleep 30` 采样 30 秒（每秒 99 次，9 指令窗口），生成 `perf.data`；`perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg` 生成火焰图。
-  3. 看火焰图找到热点：常见于 JSON 序列化（`serde_json` 默认非零拷贝）、正则回溯（灾难性回溯 O(2^n)）、锁竞争自旋、LLM streaming chunk 解析的字符串分配。Rust 优化：换 `simd-json` / `sonic-rs` 提速 3-5 倍，正则改用 `regex_automata` 的 non-backtracking DFA。
-  4. 持续监控：`cargo install cargo-flamegraph` 集成到 CI，给 laew 的 e2e 测试加 CPU 采样断言（任何 Agent 循环步骤 CPU > 80% 持续 5s 报警）。最后列出 laew 已知的潜在热点（session_memory 摘要、MultiAgentOrchestrator 拓扑排序）。
+  1. 在 `tmpPlan/agent-test/regex_dos.py` 用 Write 写一个 ReDoS 复现：模式 `^(a+)+$` + 输入 `aaaaX`；`time python3 regex_dos.py` 跑 `re.match('^(a+)+$', 'aaaa' * 5 + 'X')` 测耗时；预期在某些 Python 版本/输入长度下耗时 ≥ 1 秒（CPython 自带 RE 是回溯式）。
+  2. 加防 ReDoS：用 `regex` 库的 `regex.match(pattern, text, timeout=0.5)`（`regex` crate Python 移植支持超时）→ 触发 `regex.TimeoutError`；断言未超时版本耗时长 + 超时版本立即抛 TimeoutError。
+  3. 在 `tmpPlan/agent-test/test_re_dos.py` 写断言：跑 `re.match('^(a+)+$', 'a'*30 + 'X')` 用 `time.perf_counter()` 测耗时 ≥ 0.5s 视为 ReDoS 触发；用 `regex.match(..., timeout=0.2)` 断言抛 TimeoutError。
+  4. 修复：在 `tmpPlan/agent-test/safe_regex.py` 改用 `regex_automata` Python 移植（非回溯 DFA）→ 跑 `python3 safe_regex.py` 测 `^(a+)+$` 在 30 个 `a` + `X` 输入耗时 < 0.05s（常数时间）；写「laew Bash 命令过滤用 NFA/DFA 自研引擎避免第三方 regex ReDoS」设计说明到 `tmpPlan/agent-test/regex_design.md`，最后清理。
 
-### BL07 文件句柄与连接泄漏：fd 耗尽排查
-- **预期档位**: medium
-- **考察维度**: lsof + ulimit + fd 监控
-- **对话脚本**:
-  1. Rust 服务报 `Too many open files`（`/var/log/syslog` 里 `OS error 24`）。第一步：`ulimit -n` 看软硬限制（默认 1024，生产应改 65536）；`cat /proc/{pid}/limits` 看进程实际限制。
-  2. 基于上面的诊断，`ls -l /proc/{pid}/fd | wc -l` 看当前 fd 数（突破 1024 即快爆）；`lsof -p <pid>` 列所有 fd，按类型统计（socket / pipe / file / anon_inode）。常见泄漏：HTTP 连接未 close、SQLite 连接池未归还、tokio TcpStream 没用 `drop`。
-  3. Rust 修复：`reqwest` Client 复用 + 显式 `response.bytes().await?` 后让 response drop；`tokio::net::TcpListener` accept 后没 spawn；`tokio::select!` 缺 `_ = tokio::time::sleep(timeout)` 分支导致 TcpStream 永驻；`tokio::spawn` 的 task 因 channel 阻塞永不结束。
-  4. 给 laew 加 fd 监控：每 5 分钟 `lsof -p $$` 统计 socket 数，超过 5000 写日志 + 触发紧急连接池重建（`hyper::client::Client::rebuild`）。最后排查 laew 的 LLM client 是否在 Anthropic / OpenAI 双协议下都有连接泄漏。
-
-### BL08 时钟、时区与闰秒引发的诡异 Bug
+### BL07 时区 off-by-one：DST 切换日 + Asia/Shanghai
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: hard
-- **考察维度**: monotonic vs wall clock + tz data + leap second
+- **考察维度**: monotonic vs wall clock + DST 切换 + tz data
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 一个分布式日志服务在凌晨 3 点集体错乱 1 小时，原因：俄罗斯时区调整（DST 切换）。第一步：审计所有时间相关代码：`std::time::SystemTime`（wall clock，可跳变）vs `Instant`（monotonic，永不减），二者**绝不能混用做差值**。
-  2. 基于上面的诊断，Rust 时间 API 选择：`chrono::Utc::now()` 用于业务时间戳存 DB、`tokio::time::Instant` 用于超时 / 计时、`time::OffsetDateTime` 替代 chrono（更快更安全）。存储用 UTC，显示按用户时区转换。
-  3. 闰秒问题：2017 年 1 月 1 日的闰秒让部分 Linux 内核把 `clock_gettime(CLOCK_REALTIME)` 倒回 1 秒，导致基于 wall clock 的定时器触发两次。Google 的解决方案是「smear」：闰秒前 24 小时逐步加 1ms。Rust 项目建议：所有计时全用 `tokio::time::Instant` + `Duration`，不要用 `SystemTime` 做差。
-  4. laew 的相关风险：SessionContext 摘要的「最近 3 条」按 `created_at` 排序，如果 DB 时区与系统时区不一致会跨日错位；`-debug` 模式 trace 里时间戳必须 UTC + ISO8601 + 纳秒精度。给 laew 加一个 `chrono::Utc::now()` 替换所有 `Local::now()` 的 audit 报告。
+  1. 在 `tmpPlan/agent-test/tz_bug.py` 用 Write 写一个时区 bug 复现：本地时间 2024-03-10 02:30 America/New_York（美国 DST 开始日，02:00 → 03:00 跳过）；用 `datetime(2024,3,10,2,30)` `astimezone(ZoneInfo('America/New_York'))` 应抛 `NonExistentTimeError`（不存在时间）。
+  2. `astimezone(ZoneInfo('Europe/Moscow'))` 2014-10-26 02:30 可能 `AmbiguousTimeError`（2 点到 3 点重复）；bug 程序捕获异常后错误地 `replace(fold=1)` 直接选后一次重复时间，未告知用户歧义。
+  3. 在 `tmpPlan/agent-test/test_tz.py` 写断言：调用 buggy 函数断言在 NonExistent 时返回某个「默认」（如 03:30）而非报错；记录 buggy 行号 `tz_bug.py:15`；同时正确版本应抛异常。
+  4. 修复：在 `tmpPlan/agent-test/fixed_tz.py` 改用 `datetime(2024,3,10,3,30)`（跳到 DST 后的等同时刻）+ 异常时主动 `logger.warning` 告知用户；跑测试断言 NonExistent 抛 `NonExistentTimeError` + Ambiguous 抛 `AmbiguousTimeError`；写「laew SessionContext `created_at` UTC + ISO8601 + 纳秒精度」设计说明到 `tmpPlan/agent-test/tz_design.md`，最后清理。
 
-### BL09 乱码与编码地狱：从字节到字形
+### BL08 乱码：GBK 文件读取为 UTF-8 + chardetng 嗅探
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: medium
-- **考察维度**: charset detection + encoding 转换 + 字形回退
+- **考察维度**: charset detection + encoding 转换 + BOM
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 一个 CSV 导入工具读 UTF-8 文件显示正常，读 GBK 文件全乱码。第一步：用 `chardetng`（Mozilla 的 Rust 实现）做编码嗅探，看 `Encoding` 字段；区分 BOM（`EF BB BF` UTF-8 / `FF FE` UTF-16LE / `FE FF` UTF-16BE）。
-  2. 基于上面的编码识别，用 `encoding_rs::decode(bytes, encoding)` 转换到 UTF-8，统一存到 SQLite TEXT 字段（强制 NOCASE 之外的列都用 `COLLATE BINARY` + UTF-8）。导出时反之。
-  3. Rust 字符串边界：C++ 风格 `&str` 是字节切片，`s.len()` 返回**字节数**（不是字符数），`s.chars().count()` 才是字符数；`from_utf8` 严格校验，`from_utf8_lossy` 用 `U+FFFD` 替换错字节。中日韩字符占 3 字节，CJK 表意文字遍历时性能陷阱。
-  4. 字形回退问题：emoji `🎉` 4 字节 + ZWJ 序列（`👨‍👩‍👧`）在终端显示宽度可能是 1 也可能是 2，用 `unicode-width` crate 计算列数；CJK 半角 / 全角混排容易错位。给 laew 的 TUI 渲染（crossterm）加一个 `unicode-width` 集成测试，覆盖 100 个 CJK + emoji 边界用例。
+  1. 在 `tmpPlan/agent-test/buggy_encoding.py` 用 Write 写一个乱码 bug 复现：用 `open('sample_gbk.txt', encoding='utf-8').read()` 读 GBK 编码文件 → 抛 `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xd5 in position 0`。
+  2. 用 Python `codecs.open` + `chardet.detect(bytes_data)` 先嗅探（`chardet` crate Python 移植）→ 返回 `{'encoding': 'GB2312', 'confidence': 0.99}` → 用正确编码重读 → 文本正确。
+  3. 在 `tmpPlan/agent-test/test_encoding.py` 写：用 Write 把中文「你好世界」用 GBK 编码写到 `tmpPlan/agent-test/sample_gbk.txt`（`open(path, 'wb').write('你好世界'.encode('gbk'))`）；buggy 版断言抛 UnicodeDecodeError；fixed 版 `chardet.detect(open(path,'rb').read())` 断言返回 GB2312 + 重新读出字符串断言 == `你好世界`。
+  4. 修复：在 `tmpPlan/agent-test/fixed_encoding.py` 写 `detect_and_read(path)` 函数：先嗅探 → 嗅探失败 fallback UTF-8 → 强制 UTF-8 读 + `errors='replace'`；跑测试断言 GBK 文件正确读出 + UTF-8 文件正常；写「laew Read 工具统一编码嗅探」设计说明到 `tmpPlan/agent-test/encoding_design.md`，最后清理 sample_gbk.txt。
 
-### BL10 改一行代码引发的雪崩：变更归因与二分定位
+### BL09 时钟异常：单调时钟 vs wall clock 混用 + Duration 负值
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **预期档位**: medium
+- **考察维度**: monotonic clock + duration 计算 + NTP 跳变
+- **工具链**: Write → Bash → Read → Bash
+- **对话脚本**:
+  1. 在 `tmpPlan/agent-test/clock_bug.py` 用 Write 写一个时钟 bug 复现：用 `datetime.now()` (wall clock) 计算 duration：`start = datetime.now(); time.sleep(1); duration = datetime.now() - start`（应该 OK）；但若 NTP 把时钟向前调 60 秒 → `duration` 出现负值 `timedelta(seconds=-59)`；同样的代码用 `time.monotonic()` 永远单调递增，不会出现负值。
+  2. 模拟 NTP 跳变：测试用 mock 把 `time.time()` 在两次调用之间向后调 5 秒 → buggy 版断言 `duration.total_seconds() < -3`；fixed 版用 `time.monotonic()` 断言 duration ≈ 1 秒。
+  3. 在 `tmpPlan/agent-test/test_clock.py` 写断言脚本：mock `time.time` 模拟跳变 → buggy 版 `buggy_measure()` 返回负值 duration → 抛 `ValueError('negative duration')`；fixed 版 `safe_measure()` 返回正常 duration。
+  4. 修复：在 `tmpPlan/agent-test/fixed_clock.py` 用 `time.monotonic()` + `time.monotonic_ns()`；跑测试断言 fixed 版在模拟跳变下不出现负值；写「laew Session 持续时间统计统一用 monotonic clock」设计说明到 `tmpPlan/agent-test/clock_design.md`，最后清理测试脚本。
+
+### BL10 变更归因：git bisect 风格二分定位 + 回归断言
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
 - **预期档位**: hard
 - **考察维度**: git bisect + 回归测试 + 变更影响分析
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 上线一个看似无害的小改动（某 Agent 工具的 prompt 措辞微调）后，5 个 e2e 用例失败，3 个性能指标劣化。第一步：`git log --oneline -20` 看最近变更，`git diff HEAD~5 HEAD -- src/` 逐行 review。
-  2. 基于上面的 diff，用 `git bisect start; git bisect bad; git bisect good <commit>` 自动二分定位引发回归的提交；每个候选 commit 跑一遍 `bash testReport/run_e2e.sh`，自动化测试结果作为「good / bad」判定。
-  3. 找到可疑 commit 后，深入分析：可能是隐藏的 prompt 副作用（某子句让 LLM 多调一次工具）、未考虑的边界条件（空字符串 / Unicode / 大数）、并发时序变化（某 sleep 时间让 race 概率变化）。给出真实案例：`asyncio.gather` 改成 `asyncio.gather(*, return_exceptions=True)` 后下游处理逻辑没改导致的崩溃。
-  4. 给 laew 加变更归因机制：每个 SubAgent 任务记录「输入 prompt 哈希 + 工具调用序列 + 关键决策点」，出现回归时通过哈希快速定位是否同一种 prompt 模式；CI 阶段强制跑基线对比（base branch vs 当前分支 e2e 差异 < 5%）。最后给出一个 laew 的真实回归排查纪要：Compact Agent 触发阈值从 80% 改到 75% 后某场景下频繁压缩的归因过程。
+  1. 在 `tmpPlan/agent-test/bisect/` 用 Write 写 5 个版本的 `compute.py`：v1 正确实现 `def add(a,b): return a+b`；v2 改成 `def add(a,b): return a-b`（bug1：符号错）；v3 改回 `def add(a,b): return a+b`（修复）；v4 改成 `def add(a,b): return a*b`（bug2：乘号错）；v5 改回 `def add(a,b): return a+b`（修复）。
+  2. 用 `Write` 写 `test_compute.py` 回归测试：`assert compute.add(2,3) == 5`；跑 v1/v3/v5 通过，跑 v2/v4 失败。
+  3. 在 `tmpPlan/agent-test/bisect_run.py` 写二分查找脚本：`versions = [v1,v2,v3,v4,v5]` + 当前状态为「不通过」 + 已知 v1 通过 v5 通过 → 二分 mid 试 → 找到第一个引入 bug 的版本（v2）+ 第一个修复的版本（v3）。
+  4. 跑 `python3 bisect_run.py` 断言：找到 bug 引入版本 == v2（add 改成 a-b）+ 找到修复版本 == v3；写「laew SubAgent 任务记录 prompt 哈希 + 工具调用序列用于回归归因」设计说明到 `tmpPlan/agent-test/bisect_design.md`，最后 `rm -rf bisect/` 清理。

@@ -1,100 +1,118 @@
 # 73 并行与 GPU 计算
 
 > 编号段 BV01–BV10 · 与 21-系统编程/22-分布式/27-算法竞赛/25-桌面应用多线程 互补：本维度聚焦 **GPU/CUDA 数据并行 + GPU 内存模型 + SIMD + Rust GPU 生态（wgpu/rayon）+ 多卡通信（NCCL）+ Roofline 性能分析**，不覆盖通用多线程/分布式共识/竞赛算法/桌面 UI 线程。
-
-## 维度说明
-
-本维度考察 Agent 在 **GPU 架构（SM/Warps/CUDA cores vs RT/Tensor cores）、CUDA C++ 编程模型（kernel launch / 网格-块-线程）、GPU 内存层次（全局/共享/常量/纹理 + 合并访问）、SIMD（SSE/AVX-512/NEON / Rust `std::simd`）、Rust 并行生态（rayon 并行迭代 / crossbeam 无锁结构）、wgpu 与 Rust 原生 GPU 计算、NCCL/MPI 多卡通信与数据/模型并行、Roofline 性能分析模型、典型并行算法（reduce/scan/稀疏矩阵）、CUDA 调试与 profiling（Nsight Compute）** 等"并行与 GPU 计算"垂直领域中的实战表现。
-所有主题都以"动手写并行/GPU 代码或分析性能"为核心，强调数据并行与异构计算工程能力。
+>
+> 本批测试运行环境约束：**无 GPU/CUDA/OpenCL 硬件**，所有并行范式以纯 CPU + numpy/python multiprocessing + asyncio 跑通，CUDA/SIMD 用 numpy 矢量化 + python `concurrent.futures` 等价模拟；Roofline 模型用 numpy 统计 flop/byte 比率近似。产物落 `tmpPlan/agent-test/` 沙盒。
 
 ---
 
-### BV01 GPU 架构总览：SM、Warps 与三类核心
+### BV01 GPU 架构总览：SM、Warps 与三类核心（CPU 模拟）
+
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-09_08-S01-S10-AI工程LLM应用测试脚本重构方案.md）
 - **预期档位**: simple
-- **考察维度**: GPU 微架构 + 异构核心分类
+- **考察维度**: 微架构映射 + SIMT 分支发散 + Roofline 概念
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. 解释 NVIDIA GPU 的 SM（Streaming Multiprocessor）是什么，一个 SM 里包含哪些关键部件（CUDA cores / Tensor cores / RT cores / warp scheduler / register file / shared memory）。
-  2. CUDA cores、Tensor cores、RT cores 各自擅长什么计算？为什么深度学习推理主要吃 Tensor cores，而光线追踪离不开 RT cores？
-  3. 什么是 Warp？为什么 NVIDIA 的 Warp 大小固定为 32？Warp 内线程的 SIMT 执行和分支 divergence 会带来什么性能问题？
-  4. 以 A100/H100 为例，对比两代架构的 SM 数量、Tensor core 代际差异和显存带宽（HBM2e vs HBM3）。
+  1. 在 `tmpPlan/agent-test/bv01/` 下用 Write 写 `sm_sim.py`：把一个 1024 元素的 numpy `np.arange(1024)` 当作"SM 的 32 路 warp × 32 个 warp"展开；脚本打印 SM 内部组成（CUDA core 计数、warp scheduler、register file 容量）作为注释字典 `SM = {"cuda_cores": 64, "warps_max": 32, ...}`，并写 `gpu_arch.md` 用 markdown 表格列出 CUDA/Tensor/RT 三类核心的擅长场景（矩阵乘 / 注意力 / 光线追踪 BVH）；用 Bash 跑 `python sm_sim.py > sm.out && head -20 sm.out` 断言 `grep -F '"cuda_cores": 64' sm.out` 命中。
+  2. 写 `warp_sim.py`：模拟 32 路 SIMT 执行——给一组输入 `[0]*32 + [1]*16 + [2]*16`（前 32 全 0、中间 16 全 1、后 16 全 2），按"warp 内 if 谓词相同走快路径、否则串行化"统计 cycle：均匀分支 8 cycle、分支发散 16 cycle；用 Bash 跑 `python warp_sim.py` 后 `grep -F "uniform=8" warp.out` 与 `grep -F "divergent=16" warp.out` 都必须命中，否则 Read 修谓词分组逻辑。
+  3. 写 `roofline_intensity.py`：随机生成两个 1024×1024 float32 矩阵 `A` `B`，调用 `A @ B` 算 GFLOPs（`2*N**3 / 1e9`）与最小字节传输（`3 * N*N * 4 / 1e9`，读 A 读 B 写 C），打印 `intensity = flops / bytes`；预期 GEMM 的 intensity 在 80-90 FLOPs/Byte 量级；Bash 跑后 `awk '/intensity/ {print $NF}' roof.out` 收集数值，断言 `> 50`。
+  4. 加 a100 vs h100 对比表 `arch_compare.md`：用 markdown 表格列 SM 数（108 / 132）、Tensor core 代际（3 / 4）、HBM 带宽（2.0 / 3.35 TB/s）、FP16 Tensor TFLOPS（312 / 989）；用 Bash `grep -c '^|' arch_compare.md` 行数 ≥ 6 行表格才视为合规；跑 `wc -l arch_compare.md` 验证文件 ≥ 10 行。
 
-### BV02 CUDA C++ 编程模型：Kernel Launch 与网格-块-线程
+### BV02 CUDA C++ 编程模型：Kernel Launch 与网格-块-线程（numpy 等价）
+
 - **预期档位**: medium
-- **考察维度**: kernel 配置 + 线程索引 + 执行配置
+- **考察维度**: 索引映射 + grid/block 划分 + 边界检查
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 写一个最简 CUDA kernel：`__global__ void add(float *a, float *b, float *c, int n)`，实现两个向量的逐元素相加，并给出 host 端调用代码（含 `cudaMalloc` / `cudaMemcpy` / `cudaFree`）。
-  2. 解释 `<<<gridDim, blockDim, sharedMemSize, stream>>>` 四个参数的含义。如果 n=1,000,000，你会怎么选 blockDim 和 gridDim？为什么 blockDim 通常选 128 或 256？
-  3. 在 kernel 里 `threadIdx.x`、`blockIdx.x`、`blockDim.x` 分别代表什么？推导一维全局索引 `i = blockIdx.x * blockDim.x + threadIdx.x` 的由来。
-  4. 加上边界检查 `if (i < n)` 后，当 n 不是 blockDim 整数倍时，最后一个 block 里"多余"的线程会怎样？这种"浪费"在 n 很大时可忽略吗？
+  1. 在 `tmpPlan/agent-test/bv02/` 下用 Write 写 `vec_add.py`：用 numpy 模拟 `__global__ void add(float*, float*, float*, n)`，函数 `vec_add(a, b, n, block=128)` 按 `block` 划分"block"，每个 block 内 `i = block_id * block + thread_id` 算 `c[i] = a[i] + b[i]`；`host` 端用 `a = np.random.randn(N).astype(np.float32)`、`b = np.random.randn(N).astype(np.float32)`、`c = np.zeros_like(a)`，跑 `vec_add(a, b, n=1_000_000)`；Bash 跑 `python vec_add.py` 后 `python -c "import numpy as np; assert np.allclose(c, a+b); print('OK')"` 必须 `OK`。
+  2. 写 `grid_block_choice.md`：markdown 写"为什么 blockDim 选 128 / 256"的两段解释（warp 32 倍数 + register 压力 + occupancy），含 1m 元素的 grid/block 划分表（block=128 → grid=7813 余 16）；Bash 跑 `grep -F 'blockDim=128' grid_block_choice.md` 与 `grep -F 'grid=7813' grid_block_choice.md` 双断言。
+  3. 写 `index_derive.py`：函数 `global_1d(block_idx, thread_idx, block_dim)` 返回 `block_idx * block_dim + thread_idx`，循环 5 组 (block, thread, dim) 输出全局索引；Bash 跑后 `awk '/idx/ {print $NF}' idx.out` 收集数值断言（0,0,128)→0 / (1,0,128)→128 / (5,17,128)→657 与预期一致。
+  4. 写 `boundary_check.py`：用 `n = 1_000_003`（非 128 整数倍），跑 `vec_add` 并断言 `np.allclose(c[:1_000_000], a[:1_000_000]+b[:1_000_000])` 与 `c[1_000_000:] == 0`（多余线程不写入）；Bash 跑 `python boundary_check.py` 后 `grep -F "BOUNDARY_OK" boundary.out` 必须命中，否则 Read 修边界 `if i < n` 分支重跑。
 
-### BV03 GPU 内存层次：全局/共享/常量/纹理与合并访问
+### BV03 GPU 内存层次与合并访问（numpy stride 模拟）
+
 - **预期档位**: hard
-- **考察维度**: 显存层次 + 合并访问 + bank conflict
+- **考察维度**: 内存层次 + 合并访问 + bank conflict 等价
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 画表对比 GPU 四种主要存储器的位置（on-chip/off-chip）、容量范围、延迟（cycles）、生命周期、典型用途：Global / Shared / Constant / Texture。
-  2. 什么是 Coalesced Memory Access（合并访问）？以矩阵按行访问 vs 按列访问为例，解释为什么行访问在 GPU 上快得多，并估算一次非合并访问会浪费多少带宽。
-  3. Shared memory 的 bank 是什么？为什么同一 warp 内多个线程访问同一 bank 的不同地址会触发 bank conflict？给出一个 2x 或 4x bank conflict 的具体例子。
-  4. 用 shared memory 优化一个 16x16 的矩阵分块乘法（tiling）：写出 kernel 伪代码，说明 `__syncthreads()` 的放置位置，并估算相比 naive 版本能提升多少带宽利用率。
+  1. 在 `tmpPlan/agent-test/bv03/` 下用 Write 写 `memory_table.md`：markdown 表格 4 行（Global / Shared / Constant / Texture），列：位置、容量、延迟 cycles、生命周期、典型用途；Bash `grep -c '^|' memory_table.md` ≥ 6（表头+分隔+4 数据行）才合规；`wc -l memory_table.md` ≥ 10 行说明含解释段。
+  2. 写 `coalesced.py`：用 numpy stride 模拟"合并 vs 非合并"——对 1024×1024 float32 矩阵，分别按 `arr[i, :].sum()`（行访问，合并）与 `arr[:, i].sum()`（列访问，非合并）跑 1000 次循环，统计耗时；Bash `python -c` 用 `time.time()` 测两次，断言行访问 < 列访问 × 1.3 倍（不严格倍率只测趋势），写入 `coalesce.out`。
+  3. 写 `bank_conflict.py`：模拟 32 线程访问 shared memory `smem[32]`，全部访问 `smem[thread_id]`（无冲突，1 cycle）与全部访问 `smem[0]`（广播，1 cycle）vs 全部访问 `smem[thread_id % 4]`（4 路 bank conflict，4 cycle）；脚本打印三组 cycle 数；Bash 跑后断言 `grep -F "broadcast=1" bank.out`、`grep -F "conflict=4" bank.out` 都命中。
+  4. 写 `tiling_16x16.py`：实现 16×16 矩阵分块乘法 naive 版（O(N^3) 三层循环）vs tiled 版（用 numpy `A[i:i+16, j:j+16]` 子块视图复用），跑 N=512 比耗时，断言 tiled 比 naive 快（耗时比 < 1.0）写入 `tile.out`；若不满足，请 Read 确认子块切法（避免不必要 copy）后重跑。
 
-### BV04 SIMD 编程：SSE / AVX-512 / NEON 与 Rust std::simd
+### BV04 SIMD 编程：SSE / AVX-512 / NEON 与 Rust std::simd（numpy 矢量化）
+
 - **预期档位**: medium
-- **考察维度**: 向量化指令 + 跨平台 SIMD + 自动向量化
+- **考察维度**: 向量化等价 + 尾部处理 + 自动矢量化失败
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 解释 SIMD 与 SIMT 的区别：SSE/AVX/NEON 是 CPU 侧的"单指令多数据"，而 CUDA 是 GPU 侧的"单指令多线程"。为什么 CPU 上也能做数据并行？
-  2. 用 x86 AVX-512 内联函数（intrinsics）写一个 float 数组逐元素相加的函数：`_mm512_loadu_ps` / `_mm512_add_ps` / `_mm512_storeu_ps`，并处理尾部不足 16 个元素的情况。
-  3. 用 Rust 的 `std::simd`（portable simd）重写同样的功能，说明 `f32x16` 和 `Simd<f32, 16>` 的语义，以及如何用 `simd_chunks` 处理任意长度数组。
-  4. 讨论：编译器"自动向量化"在什么情况下会失败？`#[target_feature(enable = "avx512f")]` 和运行时 `is_x86_feature_detected!("avx512f")` 双路径分发怎么做？
+  1. 在 `tmpPlan/agent-test/bv04/` 下用 Write 写 `simd_explain.md`：markdown 写 SIMD vs SIMT 对比表（SIMD 单指令多数据 / SIMT 单指令多线程 / lane 数 / 典型指令集 / 代表硬件）；Bash `grep -c '^|' simd_explain.md` ≥ 6 + `grep -F 'SIMD' simd_explain.md` 命中。
+  2. 写 `simd_add.py`：实现三个版本的 float 数组逐元素相加——`naive_loop`（python for）、`numpy_vec`（`a + b`）、`numpy_chunked`（按 16 元素切块 `np.add`）；随机生成 65536 元素（16 倍数），三版本跑 100 次取平均耗时；Bash 跑 `python simd_add.py` 后断言 `numpy_vec_avg < naive_loop_avg` 与 `numpy_chunked_avg ≈ numpy_vec_avg`（误差 < 30%），写到 `simd.out`。
+  3. 写 `tail_handler.py`：处理"非 16 倍数"数组（如 65540 元素）——主循环按 16 处理，尾部用 `for i in range(end_aligned, n): c[i] = a[i] + b[i]`；Bash 跑 `python tail_handler.py` 后断言 `np.allclose(c, a+b)` 与 `c.shape == (65540,)`，写入 `tail.out`。
+  4. 写 `autovec_fail.md`：markdown 列出"编译器自动矢量化失败"四类场景（指针别名 / 条件分支 / 跨迭代依赖 / 不对齐内存），每条配 1 个 numpy/python 例子；Bash 跑 `grep -c '^- ' autovec_fail.md` ≥ 4（条目数）才视为合规；`wc -l autovec_fail.md` ≥ 15 行说明有解释段。
 
-### BV05 Rust 并行生态：rayon 与 crossbeam
+### BV05 Rust 并行生态：rayon 与 crossbeam（python 等价）
+
 - **预期档位**: medium
-- **考察维度**: 数据并行 + 工作窃取 + 无锁结构
+- **考察维度**: 工作窃取 + 无锁 CAS + 流水线
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. rayon 的 `par_iter()` 和 `par_iter_mut()` 背后用的是什么调度算法？解释"工作窃取"（work-stealing）为什么比静态均分更适合负载不均的并行任务。
-  2. 用 rayon 并行化一个"大数组求最大值"任务：对比 `par_iter().max()`、`par_iter().fold().reduce()` 和手动 `chunks + scope` 三种写法的性能差异。
-  3. crossbeam 的 `ArrayQueue` 和 `SegQueue` 是无锁（lock-free）的，解释 CAS（Compare-And-Swap）和 ABA 问题，crossbeam 如何用 epoch-based reclamation 避免内存回收的 use-after-free。
-  4. 用 rayon + crossbeam channel 实现一个生产者-消费者流水线：一个线程读文件、多个线程并行处理、一个线程写结果，保证顺序输出。
+  1. 在 `tmpPlan/agent-test/bv05/` 下用 Write 写 `work_stealing.md`：markdown 解释 rayon 的工作窃取 vs 静态均分优劣，配 1 张 ASCII 时序图（4 worker + 不均负载）；Bash `grep -F 'work-stealing' work_stealing.md` 命中 + `grep -c '^|' work_stealing.md` ≥ 4（表格行）。
+  2. 写 `par_max.py`：用 `concurrent.futures.ThreadPoolExecutor` 模拟 rayon `par_iter().max()`——把 1024×1024 float32 数组按 256 元素切块，多线程分别求块内 max，最后 reduce；与 `np.max` 单线程版比耗时，断言多线程不显著慢于单线程（开销 < 5x），写入 `parmax.out`。
+  3. 写 `lock_free.py`：实现 `ArrayQueue`（定长无锁队列）用 `threading.Lock` 模拟 CAS 重试——生产者/消费者各起 1 线程，跑 10000 次 put/get，最终断言队列空且计数为 0；Bash 跑 `python lock_free.py` 后 `grep -F "QUEUE_OK" lockfree.out` 必须命中，否则 Read 修重试逻辑。
+  4. 写 `pipeline.py`：用 `concurrent.futures` + `queue.Queue` 模拟 rayon+crossbeam channel 流水线——1 个 reader 线程从文件读行、N 个 worker 线程并行反转字符串、1 个 writer 收集结果按输入顺序写出；输入生成 1000 行随机字符串，断言输出顺序与输入一致且每行被反转；Bash 跑后 `grep -F "PIPELINE_OK" pipeline.out` 命中。
 
-### BV06 wgpu 与 Rust 原生 GPU 计算
+### BV06 wgpu 与 Rust 原生 GPU 计算（WebGPU 不可用 → 文档 + 等价实现说明）
+
 - **预期档位**: hard
-- **考察维度**: 跨平台 GPU + compute shader + WGSL
+- **考察维度**: WGSL 模拟 + compute shader 等价 + 跨平台取舍
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. wgpu 是什么？它如何做到"一套 Rust 代码跑在 Vulkan / Metal / Direct32 / WebGPU 上"？与直接用 CUDA 写 kernel 相比，wgpu 的优缺点是什么？
-  2. 用 wgpu 写一个 compute shader（WGSL 语言）：实现两个矩阵的逐元素相乘。给出 Rust 端的 device/queue 初始化、shader 编译、bind group 绑定和 dispatch 调用代码。
-  3. WGSL 的 `@group(0) @binding(0) var<storage, read> input: array<f32>` 和 `@group(0) @binding(1) var<storage, read_write> output: array<f32>` 分别代表什么？`@builtin(global_invocation_id)` 对应 CUDA 里的什么？
-  4. 讨论：wgpu 在 Web 端（WebGPU）和原生端的性能差距主要来自哪里？什么场景下你会选 wgpu 而不是 CUDA？
+  1. 在 `tmpPlan/agent-test/bv06/` 下用 Write 写 `wgpu_overview.md`：markdown 解释 wgpu 跨平台机制（Vulkan/Metal/D3D12/WebGPU 后端映射表）+ WGSL 与 CUDA 的 5 条对比（语法 / 内存模型 / 调度粒度 / 调试工具 / 性能上限）；Bash `grep -c '^|' wgpu_overview.md` ≥ 8（2 张表格）+ `grep -F 'WGSL' wgpu_overview.md` 命中。
+  2. 写 `compute_equivalent.py`：用 numpy 模拟 wgpu compute shader 的"逐元素乘法"——函数 `compute_mul(a, b, workgroup=64)` 按 workgroup 划分（等价 `@builtin(global_invocation_id)`），每个 invocation 处理 `i = wg_id * workgroup + local_id`；Bash 跑 `python compute_equivalent.py` 后断言 `np.allclose(c, a*b)` 写入 `compute.out`。
+  3. 写 `wgsl_grammar.md`：WGSL 关键语法备忘（`@group(0) @binding(0) var<storage, read> input: array<f32>` / `@builtin(global_invocation_id)` / `var<uniform>` 等），至少 8 行；Bash `wc -l wgsl_grammar.md` ≥ 8 + `grep -F '@builtin(global_invocation_id)' wgsl_grammar.md` 命中。
+  4. 写 `tradeoff.md`：markdown 列出"什么场景选 wgpu / 什么场景选 CUDA"决策树（5 条分支），如"是否需要 RTX 专属扩展→是→CUDA；否→wgpu"；Bash 跑 `grep -c '^- ' tradeoff.md` ≥ 5（决策条目）+ Read `tradeoff.md` 检查无明显错误。
 
-### BV07 多卡通信：NCCL、MPI 与数据/模型并行
+### BV07 多卡通信：NCCL、MPI 与数据/模型并行（无 NCCL → 通信模式说明 + mini 模拟）
+
 - **预期档位**: hard
-- **考察维度**: 集合通信 + 并行策略 + 通信隐藏
+- **考察维度**: 集合通信 + 数据/模型并行 + 通信隐藏
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. NCCL（NVIDIA Collective Communications Library）支持哪些原语（AllReduce / Broadcast / AllGather / ReduceScatter）？为什么分布式训练几乎离不开 AllReduce？
-  2. 解释数据并行（Data Parallelism）和模型并行（Model Parallelism）的区别。8 卡训练时，数据并行下每张卡都持有完整模型副本，AllReduce 同步的是什么？
-  3. 用 PyTorch 的 `torch.distributed` 写一个最小 DDP 示例：`init_process_group` + `DistributedDataParallel`，并说明 `NCCL_BACKEND` 和 `GLOO_BACKEND` 的适用场景。
-  4. 什么是"通信隐藏"（communication hiding）？解释 gradient accumulation + async AllReduce 如何把计算和通信 overlap，给出时序图。
+  1. 在 `tmpPlan/agent-test/bv07/` 下用 Write 写 `nccl_primitives.md`：表格 4 行（AllReduce / Broadcast / AllGather / ReduceScatter），列：用途、典型场景、通信量；Bash `grep -c '^|' nccl_primitives.md` ≥ 6。
+  2. 写 `allreduce_sim.py`：用 python `multiprocessing` 模拟 4 个 worker 的 AllReduce——每个 worker 持一个 1024 元素 numpy 数组，`mp.Queue` + ring 算法 4 步通信，最终每个 worker 持有完整 sum；断言 4 个 worker 结果一致且等于 4× 原始和；Bash 跑 `python allreduce_sim.py` 后 `grep -F "ALLREDUCE_OK" allreduce.out` 命中。
+  3. 写 `dp_vs_mp.md`：markdown 写数据并行 vs 模型并行对比表（每卡模型副本 / 通信内容 / 适用模型规模 / 显存占用），含 AllReduce 同步"梯度"在 DP 中的角色解释；Bash `grep -c '^|' dp_vs_mp.md` ≥ 6 + `grep -F 'gradient' dp_vs_mp.md` 命中。
+  4. 写 `comm_hide_sim.py`：模拟"梯度累积 + 异步 AllReduce overlap"——10 步前向，每步算本地梯度放入待发送队列；通信线程在后台把 5 步累积的梯度做 AllReduce；Bash 跑后断言最终所有 worker 梯度对齐且总耗时 < 串行（梯度+通信）耗时，写入 `commhide.out`。
 
-### BV08 Roofline 性能分析模型
+### BV08 Roofline 性能分析模型（numpy flop/byte 比率）
+
 - **预期档位**: medium
-- **考察维度**: 计算强度 + 性能上界 + 优化方向
+- **考察维度**: 计算强度 + Roofline 曲线 + 优化方向
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 画一个 Roofline 模型的示意图：横轴是 Arithmetic Intensity（FLOPs/Byte），纵轴是 Attained GFLOPS。解释"内存墙"（memory wall）和"计算墙"（compute roof"分别对应图中的什么。
-  2. 一个矩阵乘法 C = A×B（M×K 乘 K×N）的算术强度大约是多少 FLOPs/Byte？为什么 GEMM 通常能撞上 compute roof，而向量加法只能撞上 memory roof？
-  3. 如果一个 kernel 实测性能落在 Roofline 曲线的"内存段"左侧，你应该优先优化什么（合并访问 / shared memory tiling / 增大 blockDim）？如果在"计算段"右侧呢（Tensor core / 降低精度 FP16/BF16）？
-  4. 用 Nsight Compute 实测一个向量加法的 kernel：你会关注哪些指标（dram__bytes.sum、sm__throughput、smsp__inst_executed）？如何从这些指标判断它是否已经接近理论带宽上限？
+  1. 在 `tmpPlan/agent-test/bv08/` 下用 Write 写 `roofline_plot.py`：模拟 A100 GPU 峰值——内存带宽 2.0 TB/s、FP32 峰值 19.5 TFLOPS；定义函数 `roofline(ai_gflops_per_byte, mem_bw, peak_compute)` 返回 `min(peak_compute, ai * mem_bw)`；生成 ai 从 0.1 到 100 的点用 ASCII 画屋顶线（每行选最高 GFLOPS），写入 `roofline.txt`；Bash 跑 `python roofline_plot.py` 后 `grep -c '#' roofline.txt` ≥ 10 行图表。
+  2. 写 `intensity_calc.py`：用 numpy 实测 4 个 kernel 的 flop/byte——向量加（1 FLOP/byte）、矩阵乘（~85）、dot product（~0.5）、点积转置（~8）；Bash 跑后 `awk '/intensity/ {print $(NF-1), $NF}' intensity.out` 收集 4 个数值，断言 GEMM > dot > vec_add > dot_transposed 与预期顺序一致。
+  3. 写 `optimize_choice.md`：markdown 表 4 行（位置 / 优化手段 / 举例 / 提升倍数）——内存段左侧→合并访问/shared tiling / GEMM 段右侧→Tensor core / FP16 / 算子融合；Bash `grep -c '^|' optimize_choice.md` ≥ 6 + `grep -F 'tensor core' optimize_choice.md` 命中。
+  4. 写 `dram_metrics.md`：markdown 列出 Nsight Compute 关键指标 6 条（`dram__bytes.sum` / `sm__throughput.avg.pct_of_peak_sustained_elapsed` / `smsp__inst_executed` / L1/L2 hit rate / `stall_long_sb` / `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum`），每条 1 行解释；Bash `grep -c '^- ' dram_metrics.md` ≥ 6 + `wc -l dram_metrics.md` ≥ 12。
 
-### BV09 典型并行算法：Reduce、Scan 与稀疏矩阵
+### BV09 典型并行算法：Reduce、Scan 与稀疏矩阵（numpy mini 实现）
+
 - **预期档位**: hard
-- **考察维度**: 并行原语 + 工作效率 + 稀疏存储
+- **考察维度**: 并行 reduce / Blelloch scan / CSR SpMV
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. 并行 reduce（求和）的 naive 实现是每步折半相加，总工作量 O(n)，但步数 O(log n)。解释 Brent's theorem 如何把"工作量 × 步数"映射到 p 处理器上的实际耗时。
-  2. 写一个高效的 CUDA parallel scan（prefix sum）：用 Blelloch 两阶段（upsweep + downsweep）算法，说明为什么需要 `__syncthreads()` 和 shared memory。
-  3. 稀疏矩阵存储格式 CSR / CSC / COO / ELL / HYB 各有什么优劣？什么场景下 CSR 的 SpMV（稀疏矩阵-向量乘）会成为 GPU 上的性能瓶颈？
-  4. 用 Rust 的 `sprs` 库实现一个 CSR 矩阵与稠密向量的乘法，并用 rayon 并行化：对比单线程和 8 线程的加速比，解释为什么稀疏矩阵的并行度受行长度方差影响。
+  1. 在 `tmpPlan/agent-test/bv09/` 下用 Write 写 `parallel_reduce.py`：实现两种 reduce——naive（每步折半 O(log n) 步）、brent（work × depth，p 个 processor 分块本地 reduce + 树形合并）；随机生成 1024 元素数组比耗时；Bash 跑 `python parallel_reduce.py` 后断言 `np.isclose(naive_sum, brent_sum)` 且 `brent_time <= naive_time * 1.5`（p=4 时 brent 不慢多少），写入 `reduce.out`。
+  2. 写 `blelloch_scan.py`：实现 Blelloch 独占 scan——upsweep 建树 + downsweep 下推；输入 16 元素 `[1]*16` 期望输出 `[0, 1, 2, ..., 15]`；Bash 跑后断言 `np.array_equal(out, np.arange(16))` 写入 `scan.out`。
+  3. 写 `csr_spmv.py`：用 numpy 实现 CSR SpMV——输入 CSR 三元组 `(indptr, indices, data)` 与稠密向量 `x`，函数 `csr_spmv(indptr, indices, data, x, n_rows)` 输出 `y[i] = sum(data[k] * x[indices[k]]) for k in indptr[i]:indptr[i+1]`；随机生成 1000 行稀疏矩阵（每行 ~10 非零）与 numpy 稠密版对比，断言 `np.allclose(csr_y, dense_y)` 写入 `spmv.out`。
+  4. 写 `parallel_speedup.py`：CSR 矩阵 1000 行按 100 行/块切 10 块，`concurrent.futures.ThreadPoolExecutor` 10 worker 并行 SpMV，比单线程耗时；Bash 跑后断言 `parallel_time < serial_time`（任意线程开销 < 计算收益时）写入 `speedup.out`。
 
-### BV10 CUDA 调试与 Profiling：Nsight Compute 实战
+### BV10 CUDA 调试与 Profiling：Nsight Compute 实战（无 Nsight → mini profiler）
+
 - **预期档位**: medium
-- **考察维度**: 性能剖析 + 瓶颈定位 + 迭代优化
+- **考察维度**: profile 指标 + 瓶颈定位 + 迭代优化
+- **工具链**: Write → Bash → Write → Bash
 - **对话脚本**:
-  1. Nsight Compute 和 Nsight Systems 的区别是什么？一个看"单个 kernel 的微架构指标"，一个看"全系统时间线"——分别在什么阶段用？
-  2. 你有一个矩阵乘法 kernel，Nsight Compute 报告显示 `sm__throughput.avg.pct_of_peak_sustained_elapsed` 只有 15%，但 `dram__throughput.avg.pct_of_peak_sustained_elapsed` 有 85%。这说明瓶颈在哪里？下一步该优化什么？
-  3. 解释 Nsight Compute 里"Memory Workload Analysis"中 L1TEX / L2 / Device Memory 的命中率含义。如果 L1 命中率低但 L2 命中率高，说明什么？
-  4. 经过 shared memory tiling 优化后，你的 kernel 计算强度从 1 FLOP/Byte 提升到 8 FLOP/Byte，但实测性能只提升了 2 倍。结合 BV08 的 Roofline 模型，分析可能的原因（shared memory bank conflict / occupancy 低 / 同步开销）。
+  1. 在 `tmpPlan/agent-test/bv10/` 下用 Write 写 `mini_profiler.py`：用 `time.perf_counter()` 给 4 个阶段打时间戳（AEC 前处理 / VAD / ASR 模拟 / TTS 模拟）——实际改用 numpy 计算阶段（vec_add / matmul / scan / reduce）；输出 CSV `trace.csv` `phase,start_ns,duration_ns`；Bash 跑 `python mini_profiler.py && head trace.csv` 断言 5 行（表头+4 阶段）。
+  2. 写 `bottleneck_analyze.py`：对某次 profile 输出计算 `sm_throughput = (peak - actual) / peak * 100%` 与 `dram_throughput` 比例，给瓶颈判定规则（`sm 低 dram 高 → 内存墙` / `sm 高 dram 低 → 计算墙` / `都低 → 启动开销`）；Bash 跑 `python bottleneck_analyze.py < trace.csv` 后 `grep -F "BOTTLENECK=" bottleneck.out` 必须命中 `memory_wall` 或 `compute_wall` 之一。
+  3. 写 `l1_l2_hitrate.md`：markdown 解释"L1 命中率低 + L2 高"的含义——L1 是 per-SM 一级 cache，L1 miss 但 L2 hit 表示数据被多个 SM 共享；附示例数字（如 L1 30%、L2 85%）；Bash `grep -F 'L1' l1_l2_hitrate.md` 命中 + `wc -l l1_l2_hitrate.md` ≥ 8。
+  4. 写 `tiling_iterate.py`：实现一个"假设提升计算强度从 1→8 但实测只快 2 倍"的场景——跑 naive GEMM 1024×1024 得耗时 T1；跑 tiled GEMM 得耗时 T2；计算 `expected_speedup = 8 / 1 = 8`、`actual_speedup = T1/T2`、`gap = expected - actual`；写 markdown 报告 `tiling_report.md` 列出 gap 的三个可能原因（bank conflict / occupancy 低 / 同步开销）；Bash 跑后 `grep -F "actual_speedup" tiling_report.md` 命中。

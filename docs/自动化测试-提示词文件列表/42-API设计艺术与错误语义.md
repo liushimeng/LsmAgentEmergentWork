@@ -2,94 +2,112 @@
 
 > 编号段 AQ01–AQ10 · 聚焦 API 协议选型、错误码语义、分页策略、版本演进、Webhook 与限流工程
 
-### AQ01 REST API 资源建模与 URI 设计
+## 维度说明
+
+本维度考察 Agent 在 **API 协议工程化** 上的动手能力：能起 mock 服务、构造请求、解析响应、断言语义层（状态码 / 错误体结构 / 分页游标 / 限流头 / 幂等键），并把"概念对比/选型矩阵"翻译成可执行脚本。
+所有产物落到 `tmpPlan/agent-test/` 沙盒，不引入真网络依赖。
+与同 README 的 E 维度（编码实现）互补：E 考察通用编码能力；AQ 聚焦"协议层"——请求/响应/语义/状态码/链路。
+
+---
+
+### AQ01 REST 资源建模与 URI 设计
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-09_15-DirectAnswer短路与input-token与QC产物可见性修复方案.md）
 - **预期档位**: medium
-- **考察维度**: REST 资源建模 + URI 自描述性
+- **考察维度**: REST 资源建模 + mock 服务端落盘
+- **工具链**: Write → Bash → Bash → Read
 - **对话脚本**:
-  1. 设计一个图书管理系统的 REST API，覆盖图书/作者/借阅三个核心实体，画出资源关系图。
-  2. URI 用名词复数还是单数？嵌套资源（如 `/books/{id}/authors`）什么时候合适？
-  3. HTTP 方法语义：GET/POST/PUT/PATCH/DELETE 各自的幂等性与安全属性，违反时有什么副作用？
-  4. 给出完整 API 文档样例：路径、方法、请求体、响应体、错误码，使用 OpenAPI 3.1 描述。
+  1. 在 `tmpPlan/agent-test/aq01/` 写一个 python `http.server` 实现的 mock 图书管理 API，提供 `/books`、`/authors`、`/books/{id}/authors` 三个端点，GET 返回固定 JSON。
+  2. 用 `curl` 跑一遍三个端点，把响应体分别存到 `books.json`、`author_42.json`、`book_1_authors.json`，断言每个文件都包含 `"id"` 字段。
+  3. 在 `models.md` 里画资源关系图：图书—作者—借阅的 ER，并说明嵌套 URI `/books/{id}/authors` 何时用、何时退化到 query 参数。
+  4. 用 `grep -c '"id"'` 数每个 JSON 的 id 字段出现次数，写一行 shell 验证"嵌套资源数 = 该书作者数"，确认 mock 数据自洽。
 
-### AQ02 RPC vs REST vs GraphQL：协议选型矩阵
+### AQ02 RPC vs REST vs GraphQL：写一遍同一份订单
+- **测试状态**: 🔄 待重测（2026-09-11 脚本重写）
 - **预期档位**: hard
-- **考察维度**: 协议对比 + 选型决策
+- **考察维度**: 协议对比 + 同一业务用三种风格各实现一遍
+- **工具链**: Write → Write → Write → Bash
 - **对话脚本**:
-  1. REST、gRPC、GraphQL 三者在契约表达、性能、缓存友好性、类型安全上各有什么优劣？
-  2. 移动端 App 后端、跨服务内部通信、BFF（Backend For Frontend）三种场景，分别应该选哪种？
-  3. 用 Protobuf 定义一个订单服务的 gRPC 接口：消息体、服务、方法、流式（client/server/bidi），给出 `.proto` 文件。
-  4. GraphQL 的 N+1 查询问题怎么解决？DataLoader 的批处理与缓存原理是什么？
+  1. 在 `tmpPlan/agent-test/aq02/` 写 `rest_order.py`（http.server + JSON）、`grpc_order.proto`（手写 Protobuf 消息体+服务定义）、`graphql_order.py`（http.server 处理 `query { order(id) { id, total, items { sku, qty } } }`），实现同一个"订单查询"接口。
+  2. 用 `protoc --decode_raw` 或纯文本解析，对比 `rest_order.py` 的 JSON、`grpc_order.proto` 的二进制编码、`graphql_order.py` 的响应三者在「同一订单 id=1」下的字段数与可读性，把对比写进 `protocol_diff.md`。
+  3. 写 `bench.py` 用 python `requests` 串行打 100 次本地 mock，统计三个端点的平均响应字节数（`len(resp.content)`）与耗时（`time.perf_counter`），断言 REST 字节数 > GraphQL 字节数 > gRPC 字节数。
+  4. 写 `select.md` 总结：移动端 BFF、跨服务内部通信、第三方开放接口分别该选哪种协议，引用你自己跑出的字节数/耗时数据作论据。
 
-### AQ03 错误码体系：从 HTTP 状态码到业务语义
-- **测试状态**: ✅ 已测试 (AQ03_q1.md, 通过 — 真实网关 laew -debug 完整链路 Yolo→SubAgent→QC,详见 `tmpPlan/2026-09-09_15-DirectAnswer短路与input-token与QC产物可见性修复方案.md`)
+### AQ03 错误码体系：本地构造并断言分类
 - **预期档位**: medium
 - **考察维度**: 错误建模 + 客户端可操作性
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. HTTP 4xx 与 5xx 的语义边界：什么时候客户端应该重试、什么时候不该？列出"应该重试"和"不应该重试"的状态码清单。
-  2. 设计一套业务错误码：包含错误码（数字）、错误信息（人类可读）、错误原因（机器可读）、建议操作四要素，给出 schema。
-  3. 错误信息本地化怎么做？错误码作为稳定契约、文案按 locale 切换，如何避免本地化文本污染日志？
-  4. 异常与错误的边界：Rust 的 `Result`、Go 的 error、Java 的 checked/unchecked exception 在 API 设计上有什么区别？
+  1. 在 `tmpPlan/agent-test/aq03/` 写一个 mock 错误响应生成器 `errors.py`：能根据 `?code=invalid_param|rate_limited|internal|not_found` 返回 4 种结构化错误体（code/message/reason/suggestion 四字段）。
+  2. 用 `curl -o resp.json -w "%{http_code}\n" "http://127.0.0.1:18003/...?code=invalid_param"`，断言 HTTP 状态码=400 且响应 JSON 含 `"reason":"E1001"` 和 `"suggestion"` 字段。
+  3. 写 `retry_decision.py` 实现重试判定：4xx 全部不重试（除 408/429），5xx 全部重试最多 3 次，给定一组 `(code, retry)` 测试用例断言通过。
+  4. 把"哪些码应该重试"的判定表写到 `retry_policy.md`，至少 8 行（含 200/201/400/401/403/404/408/409/429/500/502/503），每一行用 markdown 表格，code 与 retry(Y/N) 列分明。
 
-### AQ04 分页策略：Offset、Cursor 与 Seek
+### AQ04 分页策略：游标的稳定性
 - **预期档位**: medium
-- **考察维度**: 大数据集分页 + 一致性
+- **考察维度**: 大数据集分页 + 增量游标不漂移
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. Offset 分页在数据频繁变动的场景下有什么问题？写一个具体例子说明"跳页"和"重复"现象。
-  2. Cursor 分页（基于时间戳或唯一键）怎么实现？给出请求/响应 schema 与 SQL 查询示例。
-  3. Seek Method（Keyset 分页）和 Cursor 分页有什么本质区别？性能差异在哪？
-  4. 无限滚动（Infinite Scroll）的游标怎么设计才能避免越滚越慢？游标的稳定性怎么保证？
+  1. 在 `tmpPlan/agent-test/aq04/` 写 `seed.py`，向 `tmpPlan/agent-test/aq04/items.db`（用 python 内置 sqlite3）灌 1000 条记录，主键 id 与 created_at 字段。
+  2. 写 `cursor_api.py` 暴露 `/items?cursor=<created_at>&limit=50` 接口，按 created_at 升序翻页，响应里 next_cursor 用最后一条的 created_at。
+  3. 用 `bash` 循环：先请求 cursor=0 取前 50 条，再请求上一步的 next_cursor 取下 50 条直到 1000 条拿完，断言所有返回的 id 集合等于 `{1..1000}`，无重复无丢失。
+  4. 中途在数据库 `INSERT` 一条 created_at 处于第一页中间的记录，重跑翻页脚本，断言游标分页不出现"跳行"（offset 分页会跳，cursor 不会），用 `wc -l` 数两轮结果行数应当一致。
 
-### AQ05 API 版本演进：URL、Header 与兼容性
+### AQ05 API 版本演进：Sunset Header 客户端感知
 - **预期档位**: medium
-- **考察维度**: 版本策略 + 向后兼容
+- **考察维度**: 版本策略 + 弃用通知
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. API 版本管理的三种方式：URI Path（/v1/）、Header（Accept: application/vnd.api+2）、Query 参数各有什么优劣？
-  2. 什么是"破坏性变更"？举出 5 个例子（删除字段、修改类型、修改语义等），每个给出兼容性策略。
-  3. 用 Sunset Header（RFC 8594）实现 API 弃用通知：客户端如何感知、何时停止支持，给出实现代码。
-  4. 同时维护多版本 API 的工程成本怎么评估？Stripe / GitHub / Slack 是怎么处理这个问题的？
+  1. 在 `tmpPlan/agent-test/aq05/` 写 `v1_server.py`，所有响应都带 `Sunset: Sat, 01 Mar 2026 00:00:00 GMT` + `Deprecation: true` + `Link: </v2/orders>; rel="successor-version"` 三个 header。
+  2. 用 `curl -I` 抓 headers 到 `v1_headers.txt`，断言文件包含三行（Sunset/Deprecation/Link），并用 `awk` 解析出 Sunset 日期写到 `deprecation_date.txt`。
+  3. 写 `client.py` 实现客户端感知：请求 v1 时打印 `WARNING: v1 已弃用，请于 <Sunset 日期> 前迁移到 v2`，迁移窗口 ≤30 天时升级为 `ERROR`。
+  4. 用 `unittest`（python 内置）跑 3 个测试：未过期打印 WARNING、临期打印 ERROR、过期拒绝请求，断言三条用例全过。
 
-### AQ06 Webhook 设计：从回调到可靠投递
+### AQ06 Webhook 签名与退避：本地接收验证
 - **预期档位**: hard
-- **考察维度**: 异步通知 + 可靠性保证
+- **考察维度**: HMAC 签名验证 + 指数退避 + 重放防护
+- **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
-  1. Webhook 与轮询的本质区别是什么？实时性、可靠性、复杂度三方面对比。
-  2. Webhook 投递如何保证"至少一次"语义？签名验证（HMAC-SHA256）怎么实现？给出 Node.js 与 Python 示例。
-  3. 接收方处理失败怎么设计退避策略？指数退避 + 抖动 + 最大重试次数的实现代码。
-  4. Webhook 安全：防重放攻击（timestamp + nonce）、防 SSRF（URL 白名单）、防泄露（签名密钥轮换）分别怎么实现？
+  1. 在 `tmpPlan/agent-test/aq06/` 写 `sender.py`：用 `hmac.new(secret, body, sha256).hexdigest()` 算 X-Signature 头，X-Timestamp 用 `time.time()`，随机生成 3 个事件 POST 到本地 receiver。
+  2. 写 `receiver.py`：用 http.server 处理 POST，校验 `abs(now - X-Timestamp) < 300`（防重放）与 HMAC 签名，把每个事件落盘到 `events.jsonl`（每行一个 JSON）。
+  3. 用 bash 重放 sender 一次（同一时间戳+签名），断言 events.jsonl 行数=3（重放被拒），用 `wc -l events.jsonl` 验证。
+  4. 写 `retry.py` 实现指数退避：base=1s, factor=2, jitter=±0.2, max=5 次，对失败投递用 `time.sleep` 实际等待，跑完打印总耗时与每次退避秒数到 `retry_log.txt`。
 
-### AQ07 限流与配额：从令牌桶到分布式
+### AQ07 限流算法：本地实现四种并对比
 - **预期档位**: hard
-- **考察维度**: 限流算法 + 分布式一致性
+- **考察维度**: 限流算法 + 公平性
+- **工具链**: Write → Bash → Bash → Read
 - **对话脚本**:
-  1. 令牌桶、漏桶、固定窗口、滑动窗口四种限流算法的数学原理与适用场景对比，画出时间-请求数示意图。
-  2. 用 Redis + Lua 实现一个分布式限流器：原子性怎么保证？高并发下性能如何？
-  3. 限流的三个维度（QPS、并发数、带宽）怎么组合？多租户场景下每用户独立配额怎么实现？
-  4. 限流后的降级策略：返回 429 + Retry-After、静默丢弃、返回缓存、切换备用服务，画出决策树。
+  1. 在 `tmpPlan/agent-test/aq07/` 写 `token_bucket.py`、`leaky_bucket.py`、`fixed_window.py`、`sliding_window.py` 四个独立模块，每个暴露 `try_acquire(now, key) -> bool`，参数：容量=5、窗口=1s、突发=2。
+  2. 写 `simulate.py`：模拟 100 个请求在 1s 内按泊松到达（`numpy.random.poisson` 可用），依次过四道闸门，每道闸门打印 `allowed=X denied=Y` 到 `result_<algo>.txt`。
+  3. 用 `awk` 汇总四个 result 文件：被拒数应当满足 fixed_window ≥ sliding_window ≈ token_bucket ≥ leaky_bucket（边界突发场景），把对比写进 `compare.md`。
+  4. 修一个 bug：token_bucket 在 capacity=0 时应当 deny，写测试 `assert token_bucket.try_acquire(0, 0, 0) == False`，跑通。
 
-### AQ08 幂等性：从概念到分布式实现
+### AQ08 幂等性：Idempotency-Key 端到端验证
 - **预期档位**: hard
-- **考察维度**: 幂等设计 + 分布式事务
+- **考察维度**: 幂等设计 + 二次提交防重
+- **工具链**: Write → Bash → Bash → Bash
 - **对话脚本**:
-  1. 什么是幂等性？为什么支付、下单、扣库存场景必须幂等？举出 3 个不幂等的反例。
-  2. 用 Idempotency-Key（UUID）实现幂等：客户端、服务端、存储三端各需要做什么？给出完整流程图。
-  3. 分布式系统中幂等性与事务的关系：幂等是事务的子集吗？Saga 模式怎么保证最终幂等？
-  4. 数据库层实现幂等的 4 种方式：唯一索引、乐观锁、悲观锁、状态机，分别给出 SQL 示例与适用场景。
+  1. 在 `tmpPlan/agent-test/aq08/` 写 `order_api.py`：POST /orders 接受 `Idempotency-Key` header，把 key 存到 `tmpPlan/agent-test/aq08/idem.db`（python 内置 sqlite3），已存在则返回上次结果而不创建新订单。
+  2. 用 curl 带同一 key 连续 POST 3 次（订单体故意不同），断言第 2/3 次响应体的 `order_id` 与第 1 次完全相同；用 `sqlite3 idem.db 'select count(*) from orders'` 断言行数=1。
+  3. 不带 key 的请求应当每次都新建订单，POST 2 次不带 key 断言行数=2（=1+1）。
+  4. 写 `expire.py` 模拟 24h 过期：直接 SQL 删旧 key，再 POST 同一 key 断言创建了新订单（行数 +1），整个流程 sql 查询结果用 `tee` 落到 `idempotency_log.txt`。
 
-### AQ09 API 文档与开发者体验
+### AQ09 限流降级：429 + Retry-After 决策树
 - **预期档位**: medium
-- **考察维度**: DX 设计 + 文档自动化
-- **测试状态**: ✅ 已测试 (AQ09_q1.md, 通过 — 隔离 mock 链路完整跑通,SessionContext 摘要用量口径修复后验证 input=123/81=Yolo+Sub+QC 正确,详见 `tmpPlan/2026-09-10_02-R06-AQ09-测试与Banner对齐及用量口径修复方案.md`)
+- **考察维度**: DX + 限流响应头解析
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. API 文档的核心要素：参考文档、教程、变更日志、SDK、Postman Collection 各自解决什么问题？
-  2. OpenAPI 3.1 规范：从 `.yaml` 到 Swagger UI / Redoc 自动渲染的完整 pipeline，CI 怎么集成？
-  3. SDK 自动生成：OpenAPI Generator、Speakeasy、Stainless 的对比，生成代码的可维护性如何？
-  4. API 变更如何通知？写一份"v1 弃用 → v2 迁移指南"的结构范本。
+  1. 在 `tmpPlan/agent-test/aq09/` 写 `rate_limited_api.py`：每窗口只允许 3 次请求，超出返回 429 + `Retry-After: 2` + JSON `{"degrade":"fallback"}`。
+  2. 写 `client.py` 解析 429：用 `int(headers['Retry-After'])` 决定 sleep 秒数，被限流时打印 `提示：触发降级，回退到本地缓存`。
+  3. 跑 `client.py` 连续请求 5 次，把每次的 status、retry-after、提示行落到 `degrade_log.txt`，断言第 4/5 行包含 `429` 与 `降级`。
+  4. 写 `policy.md`：把"静默丢弃 / 返回缓存 / 切换备用服务"三种降级策略整理成一张表（触发条件/优点/缺点/适用场景），每行 4 列。
 
-### AQ10 API 网关：路由、聚合与横切关注点
+### AQ10 协议抓包：本地分析一次完整 HTTP 往返
 - **预期档位**: hard
-- **考察维度**: 网关架构 + 横切能力
+- **考察维度**: 抓包分析 + 协议层观察
+- **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
-  1. API 网关与反向代理的本质区别是什么？网关需要承担哪些横切关注点（认证、限流、熔断、灰度）？
-  2. Kong / Envoy / APISIX / AWS API Gateway 的对比：性能、可扩展性、生态、运维成本。
-  3. 用 Envoy + WASM 扩展实现一个自定义鉴权过滤器：流程图、配置示例、关键代码。
-  4. BFF（Backend For Frontend）模式：移动端、Web、第三方各一个独立 BFF，怎么组织代码与团队？
+  1. 在 `tmpPlan/agent-test/aq10/` 写 `echo_api.py`：返回 `X-Request-Id`、`X-RateLimit-Remaining`、`Content-Type: application/json` 三种典型 header。
+  2. 用 `curl -v` 请求 2 次（一次带 Accept 头，一次不带），把完整 stderr+stdout 抓包到 `trace.log`。
+  3. 用 `grep -E '^(>|<|\*)' trace.log` 提取请求/响应行，断言 `> X-Request-Id` 出现 1 次、`< HTTP/1.0 200` 出现 2 次、`< X-RateLimit-Remaining: 99` 出现至少 1 次。
+  4. 写 `protocol_notes.md`：用上面抓包数据说明 HTTP 方法、header 顺序、keep-alive 行为，至少 6 行并引用 trace.log 的真实行号。
