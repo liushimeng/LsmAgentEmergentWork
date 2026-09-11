@@ -2,7 +2,7 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **134 维度 × 10 个 = 1340 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **144 维度 × 10 个 = 1440 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
@@ -23,7 +23,7 @@ OJ 在线判题平台、图算法与社交网络分析、弹性系统与混沌�
 **跨平台 Shell 脚本移植与健壮性工程**、**Linux 服务器治理进阶 systemd 与批量运维**、
 **游戏品类与系统编程进阶（放置/卡牌/棋类/猜词/数值）**、**模拟器与复古平台编程**、
 **气象与环境数据编程**、**智能家居与家庭自动化编程**、**数字电路与逻辑仿真编程**、
-**逻辑编程与约束求解实战**、**Windows 系统管理与 PowerShell 运维实战**、**macOS 桌面运维与 Apple 生态开发实战**、**容器编排与 Kubernetes 运维实战**、**CI/CD 流水线工程与 GitOps 实战**、**基础设施即代码 IaC 与 Ansible 自动化运维**、**日志分析与监控告警工程实战**、**数据库运维与备份恢复工程实战**、**网络安全审计与合规自动化实战**、**自动化测试框架与测试工程实践**、**办公自动化与文档处理工程实战**等多个角度，**无重复主题**。
+**逻辑编程与约束求解实战**、**Windows 系统管理与 PowerShell 运维实战**、**macOS 桌面运维与 Apple 生态开发实战**、**容器编排与 Kubernetes 运维实战**、**CI/CD 流水线工程与 GitOps 实战**、**基础设施即代码 IaC 与 Ansible 自动化运维**、**日志分析与监控告警工程实战**、**数据库运维与备份恢复工程实战**、**网络安全审计与合规自动化实战**、**自动化测试框架与测试工程实践**、**办公自动化与文档处理工程实战**、**跨平台应急响应与系统取证**、**可复现实验与科学计算**、**插件化命令行应用与命令总线**、**游戏本地化与全球发布**、**桌面自动化与操作回放**、**团队工作流与运营自动化**、**多媒体资产交付与批量转码**、**边缘函数与事件流集成**、**技术知识库与可验证问答**、**多语言运行时与内存模型实验**等多个角度，**无重复主题**。
 
 ## 用途
 
@@ -173,6 +173,16 @@ docs/自动化测试-提示词文件列表/
   132-网络安全审计与合规自动化实战.md           ← Nmap NSE脚本扫描/CIS Benchmark基线/testssl.sh证书审计/iptables规则审计/SSH加固sshd_config/Trivy容器扫描/ModSecurity WAF/Sigma SIEM规则/应急响应自动化
   133-自动化测试框架与测试工程实践.md           ← pytest fixture-parametrize/Mock patch测试/pytest-BDD Gherkin/Pact契约测试/Locust性能测试/Playwright视觉回归/factory_boy数据工厂/testcontainers环境隔离/Allure报告度量/变异测试充分性
   134-办公自动化与文档处理工程实战.md           ← openpyxl报表样式公式/pandas CSV清洗转换/reportlab PDF生成/pdfplumber表格提取/python-docx模板填充/Markdown批量转换/smtplib邮件自动化/imaplib自动分类/文件批量整理/APScheduler工作流编排
+  135-跨平台应急响应与系统取证实战.md           ← 证据哈希链/多源时间线归一/进程端口漂移/launchd-systemd-cron-计划任务/脚本风险扫描/USB外设画像/浏览器下载痕迹/容量与deleted-open风险/事件处置报告/便携工具包自检
+  136-可复现实验与科学计算工程.md               ← 假设协议与seed/原始数据QC/bootstrap置信区间/参数扫描敏感性/不确定度传播/失败实验台账/环境指纹/图表数据包/科学验收断言/一键复现包
+  137-插件化命令行应用与命令总线工程.md         ← 插件manifest契约/argparse子命令/生命周期钩子/分层配置覆盖/JSON-CSV-table格式器/检查点取消/能力权限/API版本协商/错误码语义/CLI行为回归
+  138-游戏本地化与全球发布管线.md               ← 字符串抽取/复数性别ICU/伪本地化截断/字体回退/文化合规筛查/商店关键词/年龄分级问卷/分区域发布清单/补丁说明/LQA缺陷门禁
+  139-桌面自动化与用户操作回放.md               ← 语义Action录制/a11y稳定selector/确定性回放幂等/等待抖动重试/截图隐私遮罩/数据驱动矩阵/macOS-Windows-Linux adapter/权限kill switch/失败自愈诊断/套件趋势
+  140-团队工作流与运营自动化.md                 ← 会议行动项/工单SLA路由/值班公平性/审批事件溯源/费用政策检查/入职开通/KPI汇总异常归因/RACI决策日志/跨班次交接/运营周报
+  141-多媒体资产交付与批量转码.md               ← 资产清单来源链/哈希去重版本链/渠道编码矩阵/并发转码dry-run/业务元数据sidecar/SRT-VTT章节/交付manifest/QC门禁/断点回滚/渠道交接
+  142-边缘函数与事件流集成实战.md               ← 事件信封schema/HMAC防重放幂等/队列背压/退避抖动DLQ/Transactional Outbox/边缘合规路由/冷启动预算/配置密钥发布/Trace延迟归因/混沌故障矩阵
+  143-技术知识库与可验证问答工程.md             ← 语料来源分级/实体关系抽取/引用行级定位/矛盾过期检测/迷你知识图谱/检索计划/证据包答案/保鲜责任人/问答评测评分/维护状态机
+  144-多语言运行时与内存模型实验.md             ← 栈堆逃逸记账/借用检查玩具/mark-sweep分代GC/AoS-SoA缓存/并发可见性/异步调度开销/UTF-8-16字符串/整数溢出语义/结构体ABI布局/运行时选型
 ```
 
 ## 编号规则
@@ -303,6 +313,26 @@ docs/自动化测试-提示词文件列表/
 | DN01–DN10 | 智能家居与家庭自动化编程 | HA实体模型/Zigbee组网/自动化编排/传感器治理/能源统计/本地语音/离线排障/远程安全/持久化备份/仪表盘场景 | simple~hard |
 | DO01–DO10 | 数字电路与逻辑仿真编程 | 卡诺图/组合器件/加法器ALU/触发器亚稳态/FSM电路/Verilog子集/事件驱动仿真/延迟冒险/流水线/门级CPU | medium~hard |
 | DP01–DP10 | 逻辑编程与约束求解实战 | Prolog统一回溯/迷你解释器/Datalog/CSP建模/传播启发式/DPLL-CDCL/Z3优化/排课诊断/配送松弛/选型判断 | medium~hard |
+| DQ01–DQ10 | Windows 系统管理与 PowerShell 运维实战 | cmdlet管道/WMI-CIM/事件日志/注册表ACL/服务进程/组策略/WinRM/计划任务/性能计数器/Windows更新 | medium~hard |
+| DR01–DR10 | macOS 桌面运维与 Apple 生态开发实战 | Homebrew/launchd/defaults/AppleScript/plist/diskutil/系统权限/Xcode CLI/Swift脚本/Keychain | medium~hard |
+| DS01–DS10 | 容器编排与 Kubernetes 运维实战 | Dockerfile多阶段/Compose健康检查/Pod-Deployment-Service-Ingress/ConfigMap-Secret/PVC/滚动回滚/HPA/Helm/RBAC | medium~hard |
+| DT01–DT10 | CI/CD 流水线工程与 GitOps 实战 | GitLab CI/GitHub Actions/Jenkins/构建缓存/制品管理/环境晋升/ArgoCD-Flux/语义版本/质量门禁/密钥注入 | medium~hard |
+| DU01–DU10 | 基础设施即代码 IaC 与 Ansible 自动化运维 | Terraform状态与模块/Ansible Role/动态Inventory/Cloud-Init/Packer/Pulumi/Terratest/Drift合规/多云编排 | medium~hard |
+| DV01–DV10 | 日志分析与监控告警工程实战 | ELK-Loki/PromQL/Grafana/Alertmanager/grok-regex/慢查询/分布式Trace/SLO错误预算/采样降噪/事件关联 | medium~hard |
+| DW01–DW10 | 数据库运维与备份恢复工程实战 | MySQL慢查询/PG VACUUM/Redis持久化/Mongo副本集/全量增量PITR/主从切换/连接池/Schema迁移/归档/CDC | medium~hard |
+| DX01–DX10 | 网络安全审计与合规自动化实战 | 端口扫描/漏洞扫描/CIS基线/TLS审计/防火墙/SSH加固/容器扫描/WAF/SIEM关联/应急自动化 | medium~hard |
+| DY01–DY10 | 自动化测试框架与测试工程实践 | pytest fixture-parametrize/mock patch/BDD/Pact契约/Locust-k6/视觉回归/测试数据工厂/testcontainers/报告度量/变异测试 | medium~hard |
+| DZ01–DZ10 | 办公自动化与文档处理工程实战 | Excel-CSV/清洗转换/PDF生成解析/Word模板/Markdown批量/邮件收发/批量整理/OCR/报告生成/工作流编排 | medium~hard |
+| EA01–EA10 | 跨平台应急响应与系统取证实战 | 证据哈希链/时间线归一/进程端口漂移/跨平台持久化/脚本风险/USB外设/下载痕迹/容量deleted-open/处置报告/工具包自检 | simple~hard |
+| EB01–EB10 | 可复现实验与科学计算工程 | 假设seed/数据QC/bootstrap/参数扫描/不确定度/失败归档/环境指纹/图表数据/科学验收/复现包 | simple~hard |
+| EC01–EC10 | 插件化命令行应用与命令总线工程 | 插件契约/argparse子命令/生命周期钩子/配置覆盖/输出格式器/检查点取消/能力权限/版本协商/错误语义/行为回归 | medium~hard |
+| ED01–ED10 | 游戏本地化与全球发布管线 | 字符串抽取/复数性别/伪本地化/字体回退/文化合规/商店元数据/年龄分级/发布清单/补丁说明/LQA门禁 | simple~hard |
+| EE01–EE10 | 桌面自动化与用户操作回放 | Action schema/a11y selector/回放幂等/等待重试/证据遮罩/数据矩阵/OS adapter/安全策略/失败诊断/套件趋势 | medium~hard |
+| EF01–EF10 | 团队工作流与运营自动化 | 会议行动项/工单路由/值班公平/审批状态机/费用政策/入职清单/KPI汇总/决策RACI/交接Runbook/运营周报 | simple~hard |
+| EG01–EG10 | 多媒体资产交付与批量转码 | 资产清单/哈希去重/编码矩阵/转码调度/元数据sidecar/字幕章节/交付包/QC门禁/断点回滚/交接报告 | medium~hard |
+| EH01–EH10 | 边缘函数与事件流集成实战 | 事件契约/HMAC幂等/背压/重试DLQ/Outbox/边缘路由/冷启动预算/配置密钥/Trace归因/混沌矩阵 | hard |
+| EI01–EI10 | 技术知识库与可验证问答工程 | 来源分级/实体关系/引用定位/矛盾检测/知识图谱/检索计划/证据包/保鲜治理/问答评测/维护工作流 | medium~hard |
+| EJ01–EJ10 | 多语言运行时与内存模型实验 | 栈堆逃逸/借用检查/GC实验/缓存布局/内存可见性/异步调度/字符串编码/整数溢出/结构体ABI/运行时选型 | medium~hard |
 
 ## 每条提示词的字段
 
@@ -343,7 +373,7 @@ docs/自动化测试-提示词文件列表/
 
 ## 维护约定
 
-- 新增主题时**先检索本库 1340 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…，CL 之后用 CM/CN/CO/…，CX 之后用 CY/CZ/DA/…，DH 之后用 DI/DJ/DK/…，DP 之后用 DQ/DR/DS/DT/DU/DV/DW/DX/DY/DZ/…）。
+- 新增主题时**先检索本库 1440 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…，CL 之后用 CM/CN/CO/…，CX 之后用 CY/CZ/DA/…，DH 之后用 DI/DJ/DK/…，DP 之后用 DQ/DR/DS/DT/DU/DV/DW/DX/DY/DZ/EA/EB/EC/ED/EE/EF/EG/EH/EI/EJ/…）。
 - 修改 laew 功能后（如新增工具、改档位策略），同步修订受影响条目的「预期档位」。
 - 每组提示词控制在 3~5 轮；后轮必须与前轮有显式承接关系，保证"多轮"语义成立。
 - 实测发现某条实际档位与预期不符时，先记录现象（写入 testReport/ 验证报告），
