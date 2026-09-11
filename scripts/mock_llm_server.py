@@ -311,6 +311,37 @@ def _route_mainwork_plan(corpus):
     return MAIN_WORK_PLAN_JSON
 
 
+def _route_plan_markdown(corpus):
+    """按 PROMPT_ROUTER 规则覆写 Plan Agent 的方案 markdown(hard 档配套,第三十七轮)。
+
+    laew hard 档编排:Plan Agent 产出的 markdown(内嵌 WorkFlow JSON)是 WorkFlow
+    的唯一来源,Main-Work 仅本地 parse_plan、不再发起 LLM 拆解请求 —— 规则的
+    "mainwork" 段在 hard 档永远不会被触发(E08 实测 SubAgent 收到默认
+    「执行验证 / echo LAEW_MOCK_OK」步骤)。规则可选:
+
+      "plan": {"keywords": ["..."], "workflows": [...], "summary": "..."}
+
+    匹配语料为 Plan 请求的 user 文本(仅含 Yolo 摘要:goal_summary /
+    decomposition_plan,不含用户原始 prompt),keywords 需取 yolo 覆写段中的
+    特征词。workflows 结构与 mainwork 段同构,name 建议带轮次 token(既作
+    SubAgent 路由语料,又作 TUI WorkFlow 横幅断言锚点)。未命中返回默认
+    PLAN_MARKDOWN,行为不变。
+    """
+    if PROMPT_ROUTER:
+        for rule in PROMPT_ROUTER.get("rules", []) or []:
+            plan_ov = rule.get("plan")
+            if not plan_ov:
+                continue
+            kws = plan_ov.get("keywords", []) or []
+            if any(kw in corpus for kw in kws):
+                payload = {
+                    "workflows": plan_ov.get("workflows", []) or [],
+                    "summary": plan_ov.get("summary", "prompt-router 覆写方案"),
+                }
+                return "# 方案\n\n```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```\n"
+    return PLAN_MARKDOWN
+
+
 def _final_answer_text(tool_snippet, base="MOCK_FINAL_ANSWER: laew Anthropic 链路验证通过。"):
     """SubAgent 终答文案(BUG-M4):前缀保持既有形态(e2e 子串断言兼容),
     工具输出非空时追加「工具输出摘录」段。"""
@@ -324,6 +355,11 @@ def _route_subagent_tool(call_no, prompt_text, default_call):
     """按 prompt 关键词 + call_no 返回 (tool_name, args_json_str)。
 
     优先级:PROMPT_ROUTER 命中 > 现有 MODES(default_call 来自 first_tool_call)
+
+    2026-09-11 第三十七轮 BUG-M5 修复:关键词命中规则后,工具查找**锁定在该规则内**;
+    该规则缺当前 call_no 时直接落 default_call,不再继续扫描后续规则 —— 旧逻辑会
+    穿透到带泛关键词(如 "D09")的规则,把别的轮次的工具链错误重放(实测 D09Q2 的
+    第 2/3 次调用被 D09Q1 规则截胡,重放 a.rs/b.rs 写入)。
     """
     if PROMPT_ROUTER:
         rules = PROMPT_ROUTER.get("rules", []) or []
@@ -334,6 +370,7 @@ def _route_subagent_tool(call_no, prompt_text, default_call):
                 for t in tools:
                     if int(t.get("call_no", 1)) == int(call_no):
                         return t["tool"], json.dumps(t.get("args", {}), ensure_ascii=False)
+                break  # 规则已锁定:本规则无此 call_no → 不再扫后续规则
     # 兜底:返回 default_call(Bash echo / 现有 MODES 派生)
     return default_call
 
@@ -1192,7 +1229,9 @@ class Handler(BaseHTTPRequestHandler):
             elif role == "compact":
                 body_bytes = role_reply(COMPACT_SUMMARY_TEXT)
             elif role == "plan":
-                body_bytes = role_reply(PLAN_MARKDOWN)
+                # 2026-09-11 第三十七轮:hard 档 WorkFlow 唯一来源是 Plan markdown,
+                # 按 prompt-router 的 "plan" 段覆写(未配置时保持默认 PLAN_MARKDOWN)。
+                body_bytes = role_reply(_route_plan_markdown(_extract_user_corpus(body)))
             elif role == "debug":
                 body_bytes = role_reply(debug_evaluation_text(body))
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本

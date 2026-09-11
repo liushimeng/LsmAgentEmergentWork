@@ -630,6 +630,30 @@ impl InputHandler {
                                 )?;
                             }
                         }
+                        // 2026-09-11 第三十七轮:Ctrl-J(LF,0x0A)拦截。
+                        // 原始模式下终端发来的换行字节 LF 被 crossterm 解析为
+                        // Char('j')+CONTROL —— tmux send-keys 逐键发送多行文本、
+                        // 不支持 bracketed paste 的旧终端逐键粘贴、用户手按 Ctrl-J
+                        // 都会到达这里;落入下方 Char(c) 兜底会把字母 j 插入输入缓冲,
+                        // 污染多行提示词(实测「slow.py:\n用」回显成「slow.py:j用」)。
+                        // 语义与 PasteInsert::Inline 的单行归一(\n → 空格)对齐。
+                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            buffer.insert(cursor, ' ');
+                            cursor += 1;
+                            overlay_lines = self.update_completion(
+                                &mut stdout,
+                                &layout,
+                                prompt,
+                                &buffer,
+                                cursor,
+                                &mut completion_active,
+                                &mut completion_index,
+                                &mut completion_items,
+                                overlay_lines,
+                                engine,
+                                &mut mention,
+                            )?;
+                        }
                         KeyCode::Esc => {
                             // Esc: 关闭补全浮层;非命令输入时清空输入(对齐 bash Esc 语义)
                             if completion_active {
@@ -867,6 +891,14 @@ impl InputHandler {
                             self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
                         }
                         KeyCode::Char(c) => {
+                            // 通用 CONTROL 防护(2026-09-11 第三十七轮):未被上方
+                            // 显式绑定的 Ctrl 组合键(Ctrl-T/Ctrl-N/…)一律不作为
+                            // 文本插入(readline 语义:未绑定的 Ctrl 组合不产生字符),
+                            // 防止 crossterm 把控制字节解析成 Char(letter)+CONTROL
+                            // 后落入此处插入字母垃圾。Shift/Alt/无修饰不受影响。
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                continue;
+                            }
                             // 可打印字符：插入到光标位置(cursor 为字节偏移,
                             // 增量按 len_utf8 推进——修复中文输入第 2 字符 panic)
                             buffer.insert(cursor, c);

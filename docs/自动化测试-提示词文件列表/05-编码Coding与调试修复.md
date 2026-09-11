@@ -85,7 +85,7 @@
   4. Bash：`python3 tmpPlan/agent-test/producer_consumer_fix.py 2>&1 | tee tmpPlan/agent-test/pc_fix.log`，断言 `pc_fix.log` 含 "processed=100" 且不含 "Error"（grep -F 'processed=100' 命中）。
 
 ### E08 性能优化实战
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_14-E08-E09-自动化测试与D1-TUI附件展开Bug修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十七轮 Linux 隔离环境 TUI 4 轮全过:q1 Write slow.py(O(n²) 基线) → q2 time 基线 slow.log dup_removed=46000/elapsed=1.228 + grep 双断言 → q3 Read+Write fast.py(dict.fromkeys O(n)) → q4 DUP_MATCH + SPEEDUP_OK slow=1.228 fast=0.002;hard 档 Plan→QC→Main-Work 解析→SubAgent→QC 全链路,mock 需 plan 段路由(本轮新增);本轮同步修复 TUI Ctrl+J/LF 按键把字母 j 插入输入缓冲的 Bug;详见 tmpPlan/2026-09-11_15-E08-D09编程检索提示词测试与TUI输入CtrlJ拦截方案.md）
 - **预期档位**: hard
 - **考察维度**: 性能分析 + 优化策略 + 对比
 - **工具链**: Write → Bash → Read → Write

@@ -150,7 +150,7 @@
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-10 第二十四轮(D3 对话 Rewind/分支:`src/agent/session_fork.rs` 轮次扫描 + `src/tui/branches.rs` 分支存储 + `/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,三处一致不变量 + 零丢失快照语义,方案 `tmpPlan/2026-09-10_07-D3对话Rewind与分支方案.md`),此前:2026-09-10 第二十三轮(D12 多主题系统 + /theme + LAEW_THEME 环境变量,4 主题:default / dark-contrast / light / daltonized;`src/tui/theme.rs` 保留所有现有 const + 新增 ThemeKind/Palette/4 套 Palette 常量表 + palette()/set_active()/active_kind()/from_env()/from_env_str() API;核心 cell 渲染位置 Cell::blank / engine::border_box / render/diff / render/highlight 改用 palette() 实时跟随主题;`src/tui/{completion,mod}.rs` 新增 /theme builtin + banner 主题提示行 + run_theme dispatch + help 行;单元测试新增 8 项全过;e2e LAEW_THEME=daltonized 启动 banner /theme 列出 4 主题 /theme dark-contrast 实时切换 /theme nope 未知报错;方案 `tmpPlan/2026-09-10_03-D12多主题系统与a11y配色方案.md`),此前:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-11 第三十七轮(D6-CtrlJ 输入拦截:`src/tui/input.rs` 显式拦截 Char('j')+CONTROL(LF 按键)插空格 + Char(c) 兜底对未绑定 CONTROL 修饰不产生字符;mock hard 档 plan 路由段 + SubAgent 规则锁定 BUG-M5;方案 `tmpPlan/2026-09-11_15-E08-D09编程检索提示词测试与TUI输入CtrlJ拦截方案.md`),此前:2026-09-10 第二十四轮(D3 对话 Rewind/分支:`src/agent/session_fork.rs` 轮次扫描 + `src/tui/branches.rs` 分支存储 + `/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,三处一致不变量 + 零丢失快照语义,方案 `tmpPlan/2026-09-10_07-D3对话Rewind与分支方案.md`),此前:2026-09-10 第二十三轮(D12 多主题系统 + /theme + LAEW_THEME 环境变量,4 主题:default / dark-contrast / light / daltonized;`src/tui/theme.rs` 保留所有现有 const + 新增 ThemeKind/Palette/4 套 Palette 常量表 + palette()/set_active()/active_kind()/from_env()/from_env_str() API;核心 cell 渲染位置 Cell::blank / engine::border_box / render/diff / render/highlight 改用 palette() 实时跟随主题;`src/tui/{completion,mod}.rs` 新增 /theme builtin + banner 主题提示行 + run_theme dispatch + help 行;单元测试新增 8 项全过;e2e LAEW_THEME=daltonized 启动 banner /theme 列出 4 主题 /theme dark-contrast 实时切换 /theme nope 未知报错;方案 `tmpPlan/2026-09-10_03-D12多主题系统与a11y配色方案.md`),此前:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
 
 ---
 
@@ -165,7 +165,7 @@
 | D3 | 对话 Rewind/分支/时间旅行 | 🟡 第 18 轮首次(用户级) + 第 24 轮落地 | 🟡 60%(✅ 2026-09-10 第二十四轮:`/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,内存分支存储上限 10;未做:文件侧恢复/Git checkpoint 联动/消息树持久化/in-place 编辑) | L1400 / L1435+ / L1458+ / L1491-L1497 / L1522-L1527 / L1548+ |
 | D4 | 文件监视与工作区感知 | ❌ 第 18 轮首次(运行时) | ❌ 0% | L1415+ (预留) / L1459+ / L1498-L1499 / L1549+ |
 | D5 | 工具输出富文本内容渲染 | ❌ 第 18 轮首次(内容层) | ❌ 5%(cell-based 纯文本) | L1401-L1402 / L1436-L1445 / L1460+ / L1500-L1506 / L1528-L1530 / L1550+ |
-| D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 55%(✅ 2026-09-10 第二十二轮:bracketed paste + 大粘贴 marker 登记簿 L1573 + 提交展开/10000 字符截断注入 L1448 + 快速输入批量合并;未做多行编辑器/Vim 模式/kill ring) | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
+| D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 55%(✅ 2026-09-10 第二十二轮:bracketed paste + 大粘贴 marker 登记簿 L1573 + 提交展开/10000 字符截断注入 L1448 + 快速输入批量合并;未做多行编辑器/Vim 模式/kill ring;✅ 2026-09-11 第三十七轮补 Ctrl+J/LF 按键拦截与 CONTROL 通用防护) | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
 | D7 | Onboarding/目录信任/主题 | ❌ 第 18 轮首次 | ❌ 10%(1 套 ANSI) | L1406-L1409 / L1451+ / L1462+ / L1507-L1513 / L1540+ / L1552+ |
 | D8 | 会话导出/Statusline/实时成本 | ❌ 第 18 轮首次 | 🟡 25%(✅ 2026-09-10:`/export [path]` Markdown/JSON + TUI 层 transcript + 每轮/累计用量;未做 Statusline/实时成本/脱敏/分享) | L1410-L1414 / L1452-L1455 / L1463+ / L1514-L1515 / L1541-L1545 / **L1564-L1575** |
 | N1-N5 | undici 内容获取底座 | ❌ 第 18 轮首次(WebFetch 底座) | ❌ 0% | **L1576-L1590**(15 个,与 pi D8 冲突后修正) |
@@ -388,3 +388,36 @@ JSONL 落盘,等 Session 持久化)/ in-place 消息编辑(pi 亦无)/ rewind �
 (L1429)/ PDF 轻量引用(L1430)/ nucleo 模糊匹配与 .git/index mtime 唤醒(L1427 完整版)。
 
 **累计**:D1 维度 laew 现状 0% → 70%。
+
+## 十二、第三十七轮登记(2026-09-11,D6-CtrlJ 输入拦截 + mock hard 档 plan 路由)
+
+**主题**:E08(hard)/D09(simple)提示词多轮 TUI 测试发现并修复两类问题:
+① TUI 输入 Ctrl+J/LF 按键污染(原始模式 LF(0x0A) 被 crossterm 解析为
+Char('j')+CONTROL,落入 Char(c) 兜底把字母 j 插入输入缓冲——tmux send-keys
+多行输入/无 bracketed paste 旧终端逐键粘贴/用户按 Ctrl+J 均触发,「slow.py:\n用」
+回显成「slow.py:j用」);② mock prompt-router 无法编程 hard 档任务(laew hard 档
+WorkFlow 唯一来源是 Plan Agent markdown,Main-Work 不发 LLM 请求 → mainwork 段
+永不生效)。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| D6-CtrlJ | 终端 LF/Ctrl+J 按键被当普通字符插入(控制字节→Char(letter)+CONTROL 家族残留) | P1 | ✅ | `src/tui/input.rs`(显式拦截 Char('j')+CONTROL → 插空格,与 PasteInsert::Inline 单行归一语义对齐;Char(c) 兜底对未绑定 CONTROL 修饰一律不产生字符,readline 语义,防 Ctrl-T/Ctrl-N 等同类) | 2026-09-11 第三十七轮 |
+| mock-plan-router | mock 无法编程 hard 档 WorkFlow(prompt-router mainwork 段只挂 Main-Work 角色,hard 档不触发) | P1(测试基建) | ✅ | `scripts/mock_llm_server.py::_route_plan_markdown`(规则可选 "plan" 段:独立 keywords 取 yolo goal_summary 特征词 + workflows;role=plan 按语料路由生成 PLAN_MARKDOWN 同构 markdown) | 2026-09-11 第三十七轮 |
+| BUG-M5 | mock SubAgent 路由规则穿透(命中规则缺当前 call_no 时继续扫后续规则,被泛关键词规则截胡重放别的轮次工具链) | P1(测试基建) | ✅ | `scripts/mock_llm_server.py::_route_subagent_tool`(关键词命中即锁定规则,规则内无该 call_no 直接落 default_call) | 2026-09-11 第三十七轮 |
+
+**设计要点**:
+- Ctrl+J 归一为空格而非换行/提交:与既有小粘贴「\n/\t → 空格(单行输入语义)」一致;
+  多行编辑器是 D6 未做项,不在本轮扩大范围。
+- plan 段 keywords 必须取 yolo goal_summary 特征词:Plan 上下文只有 Yolo 摘要,
+  不含用户原始 prompt(与 SubAgent 路由语料不同,不能用轮次 token)。
+- simple 档 TUI 横幅锚点约定:wf 名 = goal_summary 截 20 字符,路由表需把轮次
+  token 前置写进 goal_summary(≤20 字符)。
+- 本机测试环境:rg 真实二进制不在 PATH(仅 Claude Code shell 函数伪装),已把
+  vscode-server 自带 ripgrep 链接到 ~/.local/bin/rg;laew Bash 工具 `bash -lc`
+  行为正确(command not found 报错清晰)。
+
+**验证**:E08 4 轮(SPEEDUP_OK slow=1.228 fast=0.002)+ D09 4 轮(rg 统计 3 行/
+unwraps.log 3 行/table rows=5/rg mentions=7)TUI 全过;cargo test 745 全过;
+8 轮多行提示词回显零 j 污染。
+
+**方案**:`tmpPlan/2026-09-11_15-E08-D09编程检索提示词测试与TUI输入CtrlJ拦截方案.md`
