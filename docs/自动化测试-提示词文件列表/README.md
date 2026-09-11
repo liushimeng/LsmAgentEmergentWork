@@ -2,7 +2,7 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **124 维度 × 10 个 = 1240 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **134 维度 × 10 个 = 1340 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
@@ -23,7 +23,7 @@ OJ 在线判题平台、图算法与社交网络分析、弹性系统与混沌�
 **跨平台 Shell 脚本移植与健壮性工程**、**Linux 服务器治理进阶 systemd 与批量运维**、
 **游戏品类与系统编程进阶（放置/卡牌/棋类/猜词/数值）**、**模拟器与复古平台编程**、
 **气象与环境数据编程**、**智能家居与家庭自动化编程**、**数字电路与逻辑仿真编程**、
-**逻辑编程与约束求解实战**等多个角度，**无重复主题**。
+**逻辑编程与约束求解实战**、**Windows 系统管理与 PowerShell 运维实战**、**macOS 桌面运维与 Apple 生态开发实战**、**容器编排与 Kubernetes 运维实战**、**CI/CD 流水线工程与 GitOps 实战**、**基础设施即代码 IaC 与 Ansible 自动化运维**、**日志分析与监控告警工程实战**、**数据库运维与备份恢复工程实战**、**网络安全审计与合规自动化实战**、**自动化测试框架与测试工程实践**、**办公自动化与文档处理工程实战**等多个角度，**无重复主题**。
 
 ## 用途
 
@@ -163,6 +163,16 @@ docs/自动化测试-提示词文件列表/
   122-智能家居与家庭自动化编程.md             ← Home Assistant实体模型/Zigbee2MQTT组网/自动化三段式模板/传感器去抖治理/能源统计电费/本地语音链路/Zigbee排障LQI/Tailscale远程安全/recorder持久化/Lovelace场景设计
   123-数字电路与逻辑仿真编程.md               ← 卡诺图化简/MUX译码器七段/超前进位ALU/触发器亚稳态/Mealy-Moore状态机/Verilog阻塞非阻塞/事件驱动仿真器delta周期/惯性延迟冒险/流水线转发气泡/NAND2Tetris门级CPU
   124-逻辑编程与约束求解实战.md               ← Prolog统一回溯/迷你Prolog解释器/Datalog不动点/八皇后地图着色建模/MRV弧一致AC-3/DPLL与CDCL/Z3排班优化/会议排课UNSAT诊断/配送软约束松弛/声明式思维选型
+  125-Windows系统管理与PowerShell运维实战.md   ← PowerShell对象管道/WMI-CIM查询/Windows事件日志/注册表ACL/服务进程管理/WinRM远程/计划任务/性能计数器/Windows更新API
+  126-macOS桌面运维与Apple生态开发实战.md      ← Homebrew Formula-Cask/launchd plist/Defaults偏好读写/AppleScript GUI自动/plist解析编辑/diskutil磁盘管理/Keychain密钥存储/Xcode工具链/TCC隐私权限
+  127-容器编排与Kubernetes运维实战.md          ← Dockerfile多阶段构建/Docker Compose健康检查与依赖/K8s Deployment-Service-Ingress/ConfigMap/Secret/PVC存储/滚动更新回滚/HPA自动扩缩/Helm Chart打包/命名空间RBAC
+  128-CI-CD流水线工程与GitOps实战.md            ← GitLab CI stage依赖/GitLab matrix矩阵/构建缓存优化/制品语义化版本/环境晋升审批门/ArgoCD Application-CRD/Flux Kustomization/SonarQube质量门禁/Vault密钥注入
+  129-基础设施即代码IaC与Ansible自动化运维.md   ← Terraform resource-module-state/Ansible Playbook-Role/Cloud-Init初始化/Packer镜像构建/Pulumi编程式IaC/Checkov合规扫描/Drift漂移检测/多云输出聚合
+  130-日志分析与监控告警工程实战.md             ← Filebeat采集-grok解析/PromQL rate-histogram/Grafana仪表盘JSON/Alertmanager路由抑制/SLO burn-rate/分布式Trace分析/LogQL日志检索/日志降噪采样/事件关联时间线
+  131-数据库运维与备份恢复工程实战.md           ← MySQL慢查询索引优化/PostgreSQL VACUUM统计信息/Redis RDB-AOF集群/MySQL全量增量备份/PITR时间点恢复/GTID主从切换/连接池泄漏检测/在线Schema迁移/CDC跨库同步
+  132-网络安全审计与合规自动化实战.md           ← Nmap NSE脚本扫描/CIS Benchmark基线/testssl.sh证书审计/iptables规则审计/SSH加固sshd_config/Trivy容器扫描/ModSecurity WAF/Sigma SIEM规则/应急响应自动化
+  133-自动化测试框架与测试工程实践.md           ← pytest fixture-parametrize/Mock patch测试/pytest-BDD Gherkin/Pact契约测试/Locust性能测试/Playwright视觉回归/factory_boy数据工厂/testcontainers环境隔离/Allure报告度量/变异测试充分性
+  134-办公自动化与文档处理工程实战.md           ← openpyxl报表样式公式/pandas CSV清洗转换/reportlab PDF生成/pdfplumber表格提取/python-docx模板填充/Markdown批量转换/smtplib邮件自动化/imaplib自动分类/文件批量整理/APScheduler工作流编排
 ```
 
 ## 编号规则
@@ -333,7 +343,7 @@ docs/自动化测试-提示词文件列表/
 
 ## 维护约定
 
-- 新增主题时**先检索本库 1240 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…，CL 之后用 CM/CN/CO/…，CX 之后用 CY/CZ/DA/…，DH 之后用 DI/DJ/DK/…，DP 之后用 DQ/DR/DS/…）。
+- 新增主题时**先检索本库 1340 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…，CL 之后用 CM/CN/CO/…，CX 之后用 CY/CZ/DA/…，DH 之后用 DI/DJ/DK/…，DP 之后用 DQ/DR/DS/DT/DU/DV/DW/DX/DY/DZ/…）。
 - 修改 laew 功能后（如新增工具、改档位策略），同步修订受影响条目的「预期档位」。
 - 每组提示词控制在 3~5 轮；后轮必须与前轮有显式承接关系，保证"多轮"语义成立。
 - 实测发现某条实际档位与预期不符时，先记录现象（写入 testReport/ 验证报告），
