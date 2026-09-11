@@ -79,7 +79,91 @@ while _i < len(_args):
               "--write-retention", "--inject-bash", "--forced-tool",
               "--reject-tool-choice", "--yolo-direct-null"):
         MODES.add(_a)
+        _i += 1
+        continue
+    # 2026-09-11 第三十三轮:prompt router 由下方独立循环解析,
+    # 跳过以免两个循环互相吃掉参数。
+    if _a == "--prompt-router-file":
+        _i += 2
+        continue
     _i += 1
+
+
+# Prompt 路由(2026-09-11 第三十三轮 #P-B 修复):
+# 让 mock LLM 在 SubAgent 调用时感知 prompt 内容,根据 prompt 关键词返回不同的
+# 工具序列(Read/Write/Bash),让「编码类任务」(词频统计、写 TCP 文档、写 Python 脚本)
+# 在 mock 环境下也能端到端跑通,而不是固定返回 `Bash echo LAEW_ANTHROPIC_OK`。
+#
+# --prompt-router-file <path.json>  启用;JSON 格式:
+#   {
+#     "rules": [
+#       {"keywords": ["词频", "wordfreq"], "tools": [
+#         {"call_no": 1, "tool": "Read", "args": {"file_path": "tmpPlan/.../p10_inject.txt"}},
+#         {"call_no": 2, "tool": "Write", "args": {"file_path": "...", "content": "..."}},
+#         {"call_no": 3, "tool": "Bash", "args": {"command": "echo OK"}}
+#       ]}
+#     ]
+#   }
+# 规则匹配优先级:先匹配规则列表中第一个命中的;同一规则内按 call_no 索引。
+PROMPT_ROUTER = None
+_args_router = sys.argv[3:]
+_i = 0
+while _i < len(_args_router):
+    _a = _args_router[_i]
+    if _a == "--prompt-router-file" and _i + 1 < len(_args_router):
+        router_path = _args_router[_i + 1]
+        try:
+            with open(router_path, encoding="utf-8") as _rf:
+                PROMPT_ROUTER = json.load(_rf)
+        except Exception as e:
+            print(f"[mock] prompt router load failed: {e}", file=sys.stderr, flush=True)
+        _i += 2
+        continue
+    _i += 1
+
+
+def _extract_last_user_text(body):
+    """从请求体提取最后一条 user 消息文本(Anthropic + OpenAI 兼容)。"""
+    msgs = body.get("messages", []) or []
+    for m in reversed(msgs):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict):
+                    if p.get("type") == "text" and "text" in p:
+                        parts.append(p["text"])
+                    elif "text" in p:
+                        parts.append(p["text"])
+            return "\n".join(parts)
+    return ""
+
+
+def _route_subagent_tool(call_no, prompt_text, default_call):
+    """按 prompt 关键词 + call_no 返回 (tool_name, args_json_str)。
+
+    优先级:PROMPT_ROUTER 命中 > 现有 MODES(default_call 来自 first_tool_call)
+    """
+    if PROMPT_ROUTER:
+        rules = PROMPT_ROUTER.get("rules", []) or []
+        for rule in rules:
+            keywords = rule.get("keywords", []) or []
+            if any(kw in prompt_text for kw in keywords):
+                tools = rule.get("tools", []) or []
+                for t in tools:
+                    if int(t.get("call_no", 1)) == int(call_no):
+                        return t["tool"], json.dumps(t.get("args", {}), ensure_ascii=False)
+    # 兜底:返回 default_call(Bash echo / 现有 MODES 派生)
+    return default_call
+
+
+def _ensure_default_call(default_cmd):
+    """重新计算默认 first_tool_call(不依赖 prompt_text,保留原 MODES 行为)。"""
+    return first_tool_call_inner(default_cmd)
 
 
 def maybe_break_json(text):
@@ -446,17 +530,12 @@ def detect_role(body, key):
     return "subagent"  # 兼容旧版:未知系统提示词按执行层序列处理
 
 
-def first_tool_call(default_cmd):
-    """决定 subagent「第 1 次工具调用」的 (工具名, arguments JSON 文本)。
+def first_tool_call_inner(default_cmd):
+    """决定 subagent「第 1 次工具调用」的默认 (工具名, arguments JSON 文本)。
 
-    按 MODES 分流(Write 沙箱两模式供 run_e2e.sh §4g 端到端验证):
-    - 默认:Bash echo(default_cmd 区分协议,保持原行为)
-    - --bash-block:Bash `rm -rf /`(验证 permissions fail-closed)
-    - --overflow-once:Bash `seq 1 5000`(大 tool_result,验证溢出排水)
-    - --write-outside:Write 用户 Home 下 canary 文件(白名单外,验证沙箱拦截)
-    - --write-inside:Write 相对路径 sandbox-ok.txt(落工作目录,验证白名单放行)
-    - --system-overview:Bash 输出 load/memory/swap 概览(C07 定向回归)
-    - --write-retention:Write cleanup_testReport.sh(C08 q4 定向回归)
+    仅按 MODES 分流(Write 沙箱两模式供 run_e2e.sh §4g 端到端验证),
+    与 prompt 内容无关 — 由 first_tool_call(call_no, prompt_text, default_cmd)
+    包裹层先尝试 PROMPT_ROUTER 命中,再回退到此函数。
     """
     if "--bash-block" in MODES:
         return "Bash", '{"command": "rm -rf /"}'
@@ -506,11 +585,27 @@ find "$dir" -maxdepth 1 -type f -print0 |
     return "Bash", '{"command": "echo ' + default_cmd + '"}'
 
 
-def build_anthropic_stream(call_no):
-    """构造 Anthropic 一次完整流的 SSE 字节。"""
+def first_tool_call(call_no, prompt_text, default_cmd):
+    """决定 subagent 第 call_no 次工具调用。
+
+    2026-09-11 第三十三轮:支持 call_no > 1(多轮 SubAgent 工具序列),
+    通过 _route_subagent_tool(call_no, prompt_text, default_call) 按
+    PROMPT_ROUTER 命中返回对应工具,否则回退到 first_tool_call_inner。
+    """
+    default_call = first_tool_call_inner(default_cmd)
+    return _route_subagent_tool(call_no, prompt_text, default_call)
+
+
+def build_anthropic_stream(call_no, prompt_text=""):
+    """构造 Anthropic 一次完整流的 SSE 字节。
+
+    2026-09-11 第三十三轮:新增 prompt_text 参数,让 mock 在生成工具调用时
+    能感知 prompt 内容(PROMPT_ROUTER 关键词命中)。call_no > 1 的轮次
+    同样走 prompt 路由(用于 Read → Write → Bash 多轮序列)。
+    """
     if call_no == 1:
-        # 第 1 次:返回工具调用(按 MODES 分流,含 Write 沙箱两模式)
-        tool_name, tool_args = first_tool_call("LAEW_ANTHROPIC_OK")
+        # 第 1 次:返回工具调用(按 MODES 分流 + PROMPT_ROUTER)
+        tool_name, tool_args = first_tool_call(call_no, prompt_text, "LAEW_ANTHROPIC_OK")
         events = [
             {
                 "type": "message_start",
@@ -557,15 +652,22 @@ def build_anthropic_stream(call_no):
             },
             {"type": "message_stop", "data": {"type": "message_stop"}},
         ]
-    else:
-        # 第 2 次:返回纯文本
+        return make_anthropic_sse(events)
+    # 第 N 次 (N >= 2):
+    # 若 PROMPT_ROUTER 命中第 N 个工具,返回 tool_use;
+    # 否则回退纯文本 end_turn,保持原行为。
+    routed = _route_subagent_tool(
+        call_no, prompt_text, None
+    )
+    if routed is not None:
+        tool_name, tool_args = routed
         events = [
             {
                 "type": "message_start",
                 "data": {
                     "type": "message_start",
                     "message": {
-                        "id": "mock-msg-2",
+                        "id": f"mock-msg-{call_no}",
                         "type": "message",
                         "role": "assistant",
                         "content": [],
@@ -577,38 +679,84 @@ def build_anthropic_stream(call_no):
             },
             {
                 "type": "content_block_start",
-                "data": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                "data": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": f"toolu_mock_{call_no}", "name": tool_name, "input": {}},
+                },
             },
             {
                 "type": "content_block_delta",
                 "data": {
                     "type": "content_block_delta",
                     "index": 0,
-                    "delta": {"type": "text_delta", "text": "MOCK_FINAL_ANSWER: laew Anthropic 链路验证通过。"},
+                    "delta": {"type": "input_json_delta", "partial_json": tool_args},
                 },
             },
-            {
-                "type": "content_block_stop",
-                "data": {"type": "content_block_stop", "index": 0},
-            },
+            {"type": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
             {
                 "type": "message_delta",
                 "data": {
                     "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": {"output_tokens": 18},
+                    "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                    "usage": {"output_tokens": 20},
                 },
             },
             {"type": "message_stop", "data": {"type": "message_stop"}},
         ]
+        return make_anthropic_sse(events)
+    # 未命中:返回纯文本(原 call_no == 2 行为)
+    events = [
+        {
+            "type": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": "mock-msg-2",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "mock-anthropic",
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 50, "output_tokens": 1, "cache_read_input_tokens": CACHE_READ_TOKENS, "cache_creation_input_tokens": CACHE_CREATION_TOKENS},
+                },
+            },
+        },
+        {
+            "type": "content_block_start",
+            "data": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        },
+        {
+            "type": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "MOCK_FINAL_ANSWER: laew Anthropic 链路验证通过。"},
+            },
+        },
+        {"type": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+        {
+            "type": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 18},
+            },
+        },
+        {"type": "message_stop", "data": {"type": "message_stop"}},
+    ]
     return make_anthropic_sse(events)
 
 
-def build_openai_stream(call_no):
-    """构造 OpenAI 一次完整流的 SSE 字节。"""
+def build_openai_stream(call_no, prompt_text=""):
+    """构造 OpenAI 一次完整流的 SSE 字节。
+
+    2026-09-11 第三十三轮:接收 prompt_text 用于 PROMPT_ROUTER 命中;
+    call_no > 1 时若路由命中第 N 个工具则返回 tool_use,否则回退纯文本。
+    """
     if call_no == 1:
         # 第 1 次:返回工具调用(按 MODES 分流,含 Write 沙箱两模式)
-        tool_name, tool_args = first_tool_call("LAEW_MOCK_OK")
+        tool_name, tool_args = first_tool_call(call_no, prompt_text, "LAEW_MOCK_OK")
         chunks = [
             {
                 "id": "chatcmpl-mock-1",
@@ -824,10 +972,13 @@ class Handler(BaseHTTPRequestHandler):
             elif role == "debug":
                 body_bytes = role_reply(DEBUG_EVALUATION_TEXT)
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
+                # 2026-09-11 第三十三轮:把 prompt 文本传给 stream 构造,
+                # 让 PROMPT_ROUTER 在每轮都能感知用户原始诉求。
+                _sub_prompt = _extract_last_user_text(body)
                 body_bytes = (
-                    build_openai_stream(role_no)
+                    build_openai_stream(role_no, _sub_prompt)
                     if key == "oai"
-                    else build_anthropic_stream(role_no)
+                    else build_anthropic_stream(role_no, _sub_prompt)
                 )
         else:
             self.send_response(404)

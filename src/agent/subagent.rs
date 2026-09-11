@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::cancel::CancelToken;
 use crate::agent::context::AgentRole;
@@ -17,11 +17,20 @@ use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Usage};
 
 /// SubFlow 输入(由 Orchestrator 构造)。
-#[derive(Debug, Clone, Serialize)]
+///
+/// 2026-09-11 第三十三轮:新增 `original_prompt` 字段,让 SubAgent 在
+/// `description`(Yolo 抽象摘要)之外仍能看到「用户原始 prompt」,
+/// 解决 #P-A(任务漂移,具体任务被改写为「完成 laew 端到端链路验证」之类通用语)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubFlowInput {
     pub id: String,
     pub description: String,
     pub expected_output: String,
+    /// 用户原始 prompt(Orchestrator 透传)。simple 任务必须填;
+    /// medium/hard 由 MainWork/Plan 拆解后填各自的子任务原始输入。
+    /// `None` 或空字符串视为未提供,`to_user_prompt()` 仅展示 description。
+    #[serde(default)]
+    pub original_prompt: Option<String>,
     /// 来自上游 WorkFlow 的产物(JSON 序列化字符串)
     #[serde(default)]
     pub depends_on_outputs: Vec<String>,
@@ -34,7 +43,16 @@ impl SubFlowInput {
     pub fn to_user_prompt(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("【SubFlow id={}】\n", self.id));
-        out.push_str(&format!("任务: {}\n", self.description));
+        // 2026-09-11 第三十三轮:用户原始 prompt 优先于抽象摘要,
+        // 避免 SubAgent 在脱离用户意图的「任务摘要」上空转。
+        if let Some(orig) = self
+            .original_prompt
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            out.push_str(&format!("用户原始输入:\n{}\n\n", orig));
+        }
+        out.push_str(&format!("任务摘要: {}\n", self.description));
         if !self.expected_output.is_empty() {
             out.push_str(&format!("期望输出: {}\n", self.expected_output));
         }
@@ -279,6 +297,7 @@ mod tests {
             id: "wf-x".into(),
             description: "尝试运行 rm -rf /".into(),
             expected_output: "应该被拦截".into(),
+            original_prompt: None,
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
         };
@@ -309,13 +328,22 @@ mod tests {
             id: "wf-1.step-1".into(),
             description: "读取 src/foo.rs".into(),
             expected_output: "返回文件前 50 行内容".into(),
+            original_prompt: Some("请帮我看一下 src/foo.rs 这个文件的前 50 行".into()),
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("wf-1.step-1"));
+        assert!(prompt.contains("请帮我看一下 src/foo.rs 这个文件的前 50 行"));
         assert!(prompt.contains("读取 src/foo.rs"));
         assert!(prompt.contains("返回文件前 50 行内容"));
+        // 原始 prompt 必须排在任务摘要之前,SubAgent 优先看到用户原始诉求
+        let orig_pos = prompt.find("用户原始输入").unwrap();
+        let summary_pos = prompt.find("任务摘要").unwrap();
+        assert!(
+            orig_pos < summary_pos,
+            "original_prompt 必须在 description 之前呈现,避免 SubAgent 漂移到抽象摘要"
+        );
     }
 
     #[test]
@@ -324,6 +352,7 @@ mod tests {
             id: "wf-2".into(),
             description: "修改源文件".into(),
             expected_output: "替换函数 X".into(),
+            original_prompt: None,
             depends_on_outputs: vec!["依赖产物 A".into()],
             sibling_outputs: vec!["前序步骤产物 B".into()],
         };
@@ -331,6 +360,39 @@ mod tests {
         assert!(prompt.contains("上游产物"));
         assert!(prompt.contains("依赖产物 A"));
         assert!(prompt.contains("前序步骤产物 B"));
+        // 未提供原始 prompt 时,不输出「用户原始输入」段
+        assert!(!prompt.contains("用户原始输入"));
+    }
+
+    #[test]
+    fn subflow_input_original_prompt_empty_treated_as_absent() {
+        // 兼容性边界:Some("") 或纯空白字符串应等同 None,不污染 prompt。
+        let input = SubFlowInput {
+            id: "wf-3".into(),
+            description: "测试".into(),
+            expected_output: "".into(),
+            original_prompt: Some("   \n  \t  ".into()),
+            depends_on_outputs: vec![],
+            sibling_outputs: vec![],
+        };
+        let prompt = input.to_user_prompt();
+        assert!(!prompt.contains("用户原始输入"));
+    }
+
+    #[test]
+    fn subflow_input_backward_compatible_default_field() {
+        // 兼容性边界:不指定 original_prompt 时序列化与旧字段完全一致。
+        let input = SubFlowInput {
+            id: "wf-4".into(),
+            description: "测试".into(),
+            expected_output: "".into(),
+            original_prompt: None,
+            depends_on_outputs: vec![],
+            sibling_outputs: vec![],
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        // original_prompt 默认值是 null,确保 SubAgent 输入 JSON 兼容老实现
+        assert!(json.contains("\"original_prompt\":null"));
     }
 
     #[test]

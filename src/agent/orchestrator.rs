@@ -288,13 +288,19 @@ impl MultiAgentOrchestrator {
         let (mut classification, yolo_usage) = self.run_yolo_classification(session).await?;
         Self::check_cancelled(cancel)?;
         self.dbg_classify(&classification);
+        // 2026-09-11 第三十三轮:#P-C 修复 — 此处只能确定档位,无法确定 simple
+        // 是否走 direct_answer 短路(短路判断在 stage 之后)。文案采用「预期路径」:
+        // - simple 期望委派 SubAgent → "SubAgent 委派执行"
+        // - medium/hard 期望委派 MainWork/Plan → 拆解/规划
+        // direct_answer 短路时,在下面的分支再额外输出 "[trace] subagent=skipped
+        // (direct_answer=true)" 行,让用户看到真实执行链路。
         emit_progress(
             progress,
             format!(
                 "Yolo 分类:{} → {}{}",
                 classification.task_level.display_name(),
                 match classification.task_level {
-                    TaskLevel::Simple => "SubAgent 直通",
+                    TaskLevel::Simple => "SubAgent 委派执行",
                     TaskLevel::Medium => "Main-Work 拆解",
                     TaskLevel::Hard => "Plan 规划",
                 },
@@ -347,6 +353,12 @@ impl MultiAgentOrchestrator {
             {
                 Self::check_cancelled(cancel)?;
                 emit_progress(progress, "Yolo 直接作答(跳过执行层)");
+                // 2026-09-11 第三十三轮:#P-C 修复 — 显式输出 trace 行,
+                // 让用户/调试脚本区分「Yolo 直答」与「SubAgent 委派执行」两条路径。
+                emit_progress(
+                    progress,
+                    "[trace] subagent=skipped(direct_answer=true)",
+                );
                 let summary = self
                     .session_context
                     .summarize(
@@ -511,6 +523,16 @@ impl MultiAgentOrchestrator {
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
     ) -> std::result::Result<TaskResult, QualityFailure> {
+        // 2026-09-11 第三十三轮:#P-A 修复 — 取 session 最后一条 user 消息作为
+        // 原始 prompt 透传给 SubAgent,避免具体任务被 Yolo 抽象摘要漂移
+        // (实测 P10「对 p10_inject.txt 做词频统计」被改写为「完成 laew 端到端链路验证」)。
+        let original_prompt = session
+            .context()
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::llm::Role::User))
+            .map(|m| m.content_text())
+            .filter(|s| !s.trim().is_empty());
         let input = SubFlowInput {
             id: "wf-1".into(),
             description: c.goal_summary.clone(),
@@ -519,6 +541,7 @@ impl MultiAgentOrchestrator {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "完成用户请求".into()),
+            original_prompt,
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
         };
@@ -1184,10 +1207,16 @@ fn build_subflow_input(
         .iter()
         .filter_map(|id| dep_outputs.get(id).cloned())
         .collect();
+    // 2026-09-11 第三十三轮:#P-A 修复 — medium/hard 路径同样需要把用户原始
+    // prompt 透传给 SubAgent。由于 MainWork/Plan 拆解时已隐含用户原始需求
+    // (WorkFlow.name + steps 是对原始需求的分解),这里把 wf.name 作为原始
+    // 提示词的近似透传。如需更精确(传整段原始 prompt),可在 MainWorkRunner
+    // 拆分 WorkFlowSpec 时额外携带 original_prompt 字段。
     SubFlowInput {
         id: format!("{}.step", wf.id),
         description: format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n")),
         expected_output: wf.acceptance.join("; "),
+        original_prompt: Some(wf.name.clone()),
         depends_on_outputs: deps,
         sibling_outputs: vec![],
     }
@@ -1315,6 +1344,9 @@ mod tests {
         assert_eq!(input.id, "wf-1.step");
         assert!(input.description.contains("读 a"));
         assert_eq!(input.expected_output, "OK");
+        // 2026-09-11 第三十三轮:#P-A 修复 — medium/hard 路径默认透传 wf.name 作为
+        // original_prompt,SubAgent 不会丢失 WorkFlow 主题。
+        assert_eq!(input.original_prompt.as_deref(), Some("读取"));
     }
 
     #[test]
