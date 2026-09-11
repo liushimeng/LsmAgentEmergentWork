@@ -659,3 +659,91 @@ impl ThemeKind {
         }
     }
 }
+
+// ── ANSI 转换辅助(2026-09-11 自 tui/mod.rs 迁入;ANSI 颜色集中管理的既有职责)──
+
+/// 把 `theme::attr` 位掩码转换为 ANSI 转义前缀(Bold/Underlined/DIM)。
+pub(crate) fn attrs_to_ansi(attrs: u8) -> String {
+    let mut s = String::new();
+    if attrs & crate::tui::theme::attr::BOLD != 0 {
+        s.push_str("\x1b[1m");
+    }
+    if attrs & crate::tui::theme::attr::DIM != 0 {
+        s.push_str("\x1b[2m");
+    }
+    if attrs & crate::tui::theme::attr::UNDERLINED != 0 {
+        s.push_str("\x1b[4m");
+    }
+    if attrs & crate::tui::theme::attr::REVERSE != 0 {
+        s.push_str("\x1b[7m");
+    }
+    s
+}
+
+/// 把背景色转为 ANSI 背景序列(2026-09-10 第二十五轮 F04/B07 测试新增)。
+/// `Color::Reset` 返回空串(不输出 bg 序列,沿用终端默认底色)。
+/// 非 Reset 时返回 `\x1b[48;5;{idx}m` 形式,256 色背景块。
+pub(crate) fn bg_color_ansi(bg: crossterm::style::Color) -> String {
+    use crossterm::style::Color;
+    match bg {
+        Color::Reset => String::new(),
+        _ => format!("\x1b[48;5;{}m", color_to_ansi256(bg)),
+    }
+}
+
+#[cfg(test)]
+mod bg_color_ansi_tests {
+    use super::*;
+    use crossterm::style::Color;
+
+    #[test]
+    fn reset_returns_empty_string() {
+        // Color::Reset 不输出 bg 序列(避免污染终端默认底色)。
+        assert_eq!(bg_color_ansi(Color::Reset), "");
+    }
+
+    #[test]
+    fn non_reset_emits_bg48_5_idx_m() {
+        // 非 Reset 输出 `\x1b[48;5;{idx}m`,与 fg 输出的 `\x1b[38;5;{idx}m` 对称。
+        let s = bg_color_ansi(Color::DarkGreen);
+        assert!(s.starts_with("\x1b[48;5;"), "got: {s}");
+        assert!(s.ends_with("m"), "got: {s}");
+        // DarkGreen 在 color_to_ansi256 里映射到索引 2。
+        assert_eq!(s, "\x1b[48;5;2m");
+    }
+}
+
+/// 把 crossterm Color 转为 ANSI 256 色索引(简化映射)。
+pub(crate) fn color_to_ansi256(color: crossterm::style::Color) -> u8 {
+    use crossterm::style::Color;
+    match color {
+        Color::Reset => 7,        // 白色/默认
+        Color::Black => 0,
+        Color::DarkRed => 1,
+        Color::DarkGreen => 2,
+        Color::DarkYellow => 3,
+        Color::DarkBlue => 4,
+        Color::DarkMagenta => 5,
+        Color::DarkCyan => 6,
+        Color::DarkGrey => 8,
+        Color::Grey => 7,
+        Color::Red => 9,
+        Color::Green => 10,
+        Color::Yellow => 11,
+        Color::Blue => 12,
+        Color::Magenta => 13,
+        Color::Cyan => 14,
+        Color::White => 15,
+        Color::Rgb { r, g, b } => {
+            // 简化 RGB → 256 色(取 6x6x6 立方体索引)
+            let r_idx = if r < 48 { 0 } else { (r - 35) / 40 };
+            let g_idx = if g < 48 { 0 } else { (g - 35) / 40 };
+            let b_idx = if b < 48 { 0 } else { (b - 35) / 40 };
+            let r_idx = r_idx.min(5) as u8;
+            let g_idx = g_idx.min(5) as u8;
+            let b_idx = b_idx.min(5) as u8;
+            16 + 36 * r_idx + 6 * g_idx + b_idx
+        }
+        Color::AnsiValue(v) => v,
+    }
+}

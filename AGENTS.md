@@ -70,14 +70,18 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 ```
 main.rs        clap CLI:默认进 tui; -p 单轮; -f 文件提示词; provider 子命令
 tui/
-  mod.rs       会话编排:REPL 主屏循环 + Screen 栈;暴露 pub async fn run()
+  mod.rs       会话外壳:TuiSession 结构 + 生命周期(bootstrap/banner/provider 增删查/分支快照)+ orchestrator 装配 + run()/run_with_debug() 入口(2026-09-11 按 ≤1800 行规范自单文件拆分,方案 tmpPlan/2026-09-11_代码文件1800行上限模块化拆分方案.md)
+  dispatch.rs  输入分发与任务输出:handle_user_input / dispatch_prompt(@提及展开 + 阶段进度协程 + SIGINT 取消)/ emit_debug_report / print_* 家族
+  slash.rs     斜杠命令路由:handle_slash + run_theme/run_rewind/run_undo/run_fork/run_branches/run_switch/run_export + print_custom_commands
+  provider_screen.rs /provider 子屏桥接:list/add/del 三屏接入 + run_screen_loop(通用 Screen 栈循环,非 TTY 回退 print)
+  format.rs    纯函数格式化:任务结果双版本(人类版 format_task_result / LLM 回填版 for_context)/ merge_usage / waiting_line_text / CJK 截断系 / print_help / print_record
   engine.rs    CLI 渲染引擎 —— Screen trait + Frame + 全量重绘 present
   form.rs      通用 Tab 表单状态机(被 ProviderForm 屏复用)
   input.rs     单行输入(主屏用):含行内提示 + 补全(crossterm 原始模式)
   completion.rs 斜杠命令补全引擎(内置 + 自定义命令动态注册)
   commands.rs   自定义斜杠命令(D2):两级目录发现/frontmatter/占位符渲染
   export.rs     会话导出(D8):transcript 记录 + Markdown/JSON 落盘
-  theme.rs     ANSI 颜色 / mask_key 脱敏 集中管理
+  theme.rs     ANSI 颜色 / mask_key 脱敏 / attrs·bg·color→ANSI 转换 集中管理
   screen/
     provider_list.rs   /provider list —— Tab 化展示 + 操作按钮
     provider_form.rs   /provider add  —— 5+1 Tab 表单
@@ -448,6 +452,7 @@ SCREEN=$(tmux capture-pane -p -t laew_e2e)
 ## 约定
 
 - 注释、CLI 文案、文档一律中文；代码标识符英文。
+- **单源码文件 ≤ 1800 行**（2026-09-11 起）：超过必须按功能/业务/架构维度拆分模块（TUI 层范例：`src/tui/` 的 dispatch / slash / provider_screen / format 分层）；临界文件（≥ 1700 行，如 `src/agent/mod.rs` 1799 行）新增代码优先落到职责子模块，防止越线。
 - 新工具：在 `src/agent/tools/` 建同名模块实现 `Tool` trait，注册进 `builtin_registry()`（Work Agent）或相应 registry，Schema 参考 `docs/其他Agent工具定义/`。
 - 新协议：实现 `LlmClient` trait + `client_from_record()` 增加分支，不改动 agent 层。
 - 新 Agent 类型：实现 `AgentProfile`（独立名称/系统提示词/工具集），在 `YoloRunner` 或相应编排器中接入。
