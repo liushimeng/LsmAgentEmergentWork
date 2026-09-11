@@ -8,18 +8,18 @@
 ---
 
 ### E01 实现 wc 命令行工具
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_02-D01-E01-测试与TUI显示验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十四轮 mock 多轮路由修复后 TUI 4 轮全过:q1 Write wc.py → q2 管道验证 lines=2 words=5 bytes=9 + json_ok → q3 Read+Write test_wc.py(6 用例) → q4 tests=6 failures=0;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;详见 tmpPlan/2026-09-11_12-E01-E02-E04-E05编程提示词测试与mock多轮路由修复方案.md）
 - **预期档位**: medium
 - **考察维度**: 完整工程实现能力 + 测试闭环
 - **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
   1. Write 一份纯 python3 实现 `tmpPlan/agent-test/wc.py`：支持 `-l`（行数）、`-w`（单词数）、`-c`（字节数）、`--json`（JSON 输出），默认全 3 项；`--help` 打印用法。
-  2. Bash：`echo -e "a b\nc d e" | python3 tmpPlan/agent-test/wc.py` 应输出 lines=2 words=5 bytes=9（grep -F 'lines=2' / 'words=5' / 'bytes=9' 校验），且 `echo "1 2" | python3 tmpPlan/agent-test/wc.py --json | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["lines"]==1'` 应通过。
+  2. Bash：`printf 'a b\nc d e' | python3 tmpPlan/agent-test/wc.py` 应输出 lines=2 words=5 bytes=9（grep -F 'lines=2' / 'words=5' / 'bytes=9' 校验；注：`echo -e` 会补尾 `\n` 得 10 字节，故用 printf），且 `echo "1 2" | python3 tmpPlan/agent-test/wc.py --json | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["lines"]==1'` 应通过。
   3. Read wc.py，再 Write 测试套件 `tmpPlan/agent-test/test_wc.py`：覆盖正常输入、空文件、仅空格、异常参数、`--json` 结构校验至少 5 个用例。
   4. Bash：`python3 tmpPlan/agent-test/test_wc.py 2>&1 | tail -1` 应输出 "OK" 或类似 pass 信息（断言失败则 Edit 修复 wc.py 后重跑）。
 
 ### E02 调试一段错误代码
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_21-B08-C06-D10-E02-L03-自动化测试与Yolo分类验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十四轮 mock 多轮路由修复后 TUI 4 轮全过:q1 Write buggy.py(3 类缺陷) → q2 err.log 含 SyntaxError → q3 Read+Write fixed.py → q4 diff 差异 14 行(≥4) + FIXED;终答含工具输出摘录(BUG-M4);详见 tmpPlan/2026-09-11_12-E01-E02-E04-E05编程提示词测试与mock多轮路由修复方案.md）
 - **预期档位**: medium
 - **考察维度**: Bug 定位与修复能力 + 闭环
 - **工具链**: Write → Bash → Read → Write
@@ -41,7 +41,7 @@
   4. Bash `grep -c '^### ' tmpPlan/agent-test/review.md` 应 ≥ 4，`grep -F '密码\|SQL注入\|O(n²)\|异常处理' tmpPlan/agent-test/review.md | wc -l` 应 ≥ 4（每类都讨论）。
 
 ### E04 LRU 缓存纯 python3 实现
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_01-A10-E04-测试与mock角色识别Bug方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十四轮 mock 多轮路由修复后 TUI 4 轮全过:q1 Write lru.py → q2 assert_ok → q3 Read+Write lru_mt.py(2 线程) → q4 race_ok final_count=50 hits=4000;medium 档全链路;-debug 模式另验证 DebugReport 生成;详见 tmpPlan/2026-09-11_12-E01-E02-E04-E05编程提示词测试与mock多轮路由修复方案.md）
 - **预期档位**: medium
 - **考察维度**: 数据结构与算法 + 边界断言
 - **工具链**: Write → Bash → Read → Write
@@ -52,7 +52,7 @@
   4. Bash：`python3 tmpPlan/agent-test/lru_mt.py 2>&1 | tee tmpPlan/agent-test/lru_mt.log`，断言 `lru_mt.log` 含 "race_ok" 或 "final_count=" 且无 "Error"（grep -F 校验）。
 
 ### E05 正则表达式实战
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_03-C04-E05-测试与TUI按钮CJK截断修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 第三十四轮 mock 多轮路由修复后 TUI 4 轮全过:q1 Write re_demo.py(4 正则×3 断言) → q2 regex_ok → q3 双 Write sample_log.txt+extract.py → q4 extracted.log 手机号 3 条/IP 4 条(各≥1);simple 档直通 SubAgent;详见 tmpPlan/2026-09-11_12-E01-E02-E04-E05编程提示词测试与mock多轮路由修复方案.md）
 - **预期档位**: simple
 - **考察维度**: 正则编写 + 实测断言
 - **工具链**: Write → Bash → Read → Bash

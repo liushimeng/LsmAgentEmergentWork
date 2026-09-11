@@ -516,6 +516,21 @@ impl MultiAgentOrchestrator {
         }
     }
 
+    /// 取 session 最后一条 user 消息文本作为「用户原始 prompt」。
+    ///
+    /// 2026-09-11 第三十三轮 #P-A:SubAgent 透传原始 prompt 防抽象摘要漂移;
+    /// 2026-09-11 第三十四轮 LA-1:提取为公共 helper,Main-Work 拆解同样透传
+    /// (run_simple / run_medium 共用,行为一致)。
+    fn original_user_prompt(session: &Session) -> Option<String> {
+        session
+            .context()
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::llm::Role::User))
+            .map(|m| m.content_text())
+            .filter(|s| !s.trim().is_empty())
+    }
+
     async fn run_simple(
         &self,
         c: &TaskClassification,
@@ -526,13 +541,7 @@ impl MultiAgentOrchestrator {
         // 2026-09-11 第三十三轮:#P-A 修复 — 取 session 最后一条 user 消息作为
         // 原始 prompt 透传给 SubAgent,避免具体任务被 Yolo 抽象摘要漂移
         // (实测 P10「对 p10_inject.txt 做词频统计」被改写为「完成 laew 端到端链路验证」)。
-        let original_prompt = session
-            .context()
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, crate::llm::Role::User))
-            .map(|m| m.content_text())
-            .filter(|s| !s.trim().is_empty());
+        let original_prompt = Self::original_user_prompt(session);
         let input = SubFlowInput {
             id: "wf-1".into(),
             description: c.goal_summary.clone(),
@@ -630,6 +639,9 @@ impl MultiAgentOrchestrator {
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Main-Work 拆 WorkFlow
         emit_progress(progress, "Main-Work 拆解中…");
+        // 2026-09-11 第三十四轮 LA-1:Main-Work 拆解同样透传用户原始 prompt,
+        // 与 SubAgent #P-A 修复对齐,防止拆解只基于 Yolo 抽象摘要脱离用户意图。
+        let original_prompt = Self::original_user_prompt(session);
         let (plan, mainwork_usage) = self
             .main_work
             .plan_workflows(
@@ -637,6 +649,7 @@ impl MultiAgentOrchestrator {
                 &c.decomposition_plan,
                 session.id(),
                 retry_hint,
+                original_prompt.as_deref(),
             )
             .await
             .map_err(|e| {

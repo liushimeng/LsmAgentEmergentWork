@@ -89,10 +89,20 @@ while _i < len(_args):
     _i += 1
 
 
-# Prompt 路由(2026-09-11 第三十三轮 #P-B 修复):
+# Prompt 路由(2026-09-11 第三十三轮 #P-B 修复;第三十四轮 BUG-M1/M2/M3 增强):
 # 让 mock LLM 在 SubAgent 调用时感知 prompt 内容,根据 prompt 关键词返回不同的
 # 工具序列(Read/Write/Bash),让「编码类任务」(词频统计、写 TCP 文档、写 Python 脚本)
 # 在 mock 环境下也能端到端跑通,而不是固定返回 `Bash echo LAEW_ANTHROPIC_OK`。
+#
+# 第三十四轮增强:
+# - BUG-M1:匹配语料从「最后一条 user 消息」改为「全量 user 语料 + tool_result
+#   内容」(_extract_user_corpus),SubAgent 第 2+ 次调用也能命中关键词,
+#   多步工具链(Write→Bash→Read→Write)真实可模拟;
+# - BUG-M2:call_no 改为 SubAgent 实例内计数(新实例首调用归零),
+#   多轮会话/多 SubAgent 场景下路由表 call_no 不再错位;
+# - BUG-M3:规则可选 "yolo" 段覆写分类档位(simple/medium/hard)与 goal_summary,
+#   可选 "mainwork" 段覆写 WorkFlow 拆解计划(wf.name 作为 original_prompt
+#   透传给 SubAgent,可携带轮次关键词)。
 #
 # --prompt-router-file <path.json>  启用;JSON 格式:
 #   {
@@ -101,10 +111,17 @@ while _i < len(_args):
 #         {"call_no": 1, "tool": "Read", "args": {"file_path": "tmpPlan/.../p10_inject.txt"}},
 #         {"call_no": 2, "tool": "Write", "args": {"file_path": "...", "content": "..."}},
 #         {"call_no": 3, "tool": "Bash", "args": {"command": "echo OK"}}
-#       ]}
+#       ],
+#        "yolo": {"task_level": "medium", "goal_summary": "...",
+#                  "purpose": "...", "intent": "coding",
+#                  "decomposition_plan": ["..."]},
+#        "mainwork": {"workflows": [{"id": "wf-1", "name": "...(含轮次关键词)",
+#                                    "steps": ["..."], "acceptance": ["..."],
+#                                    "delegate_to": "subagent"}]}}
 #     ]
 #   }
 # 规则匹配优先级:先匹配规则列表中第一个命中的;同一规则内按 call_no 索引。
+# 路由文件编写约定:后轮规则放前(关键词特异性递增),防前轮泛关键词截胡后轮。
 PROMPT_ROUTER = None
 _args_router = sys.argv[3:]
 _i = 0
@@ -141,6 +158,132 @@ def _extract_last_user_text(body):
                         parts.append(p["text"])
             return "\n".join(parts)
     return ""
+
+
+def _extract_user_corpus(body):
+    """收集全部 user 消息文本 + tool_result 内容,作为 PROMPT_ROUTER 匹配语料。
+
+    2026-09-11 第三十四轮 BUG-M1 修复:_extract_last_user_text 只看最后一条
+    user 消息的 text 块;SubAgent 第 2+ 次调用的最后一条 user 消息是
+    tool_result 块(无 `text` 键)→ 提取结果恒为空串 → PROMPT_ROUTER 关键词
+    永不命中 → mock 无法模拟「Write → Bash → Read → Write」多步工具链。
+    改为全量语料:任务 prompt(首条 user 消息)中的关键词在 SubAgent 每一次
+    调用的上下文里稳定存在,路由匹配与调用序号解耦。
+    """
+    msgs = body.get("messages", []) or []
+    parts: list[str] = []
+    for m in msgs:
+        if m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        if isinstance(content, list):
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "text" and "text" in p:
+                    parts.append(p["text"])
+                elif p.get("type") == "tool_result":
+                    rc = p.get("content", "")
+                    if isinstance(rc, str):
+                        parts.append(rc)
+                    elif isinstance(rc, list):
+                        for tb in rc:
+                            if isinstance(tb, dict) and "text" in tb:
+                                parts.append(tb["text"])
+    return "\n".join(parts)
+
+
+def _extract_last_tool_result(body, limit=600):
+    """提取最后一条 tool_result 内容片段(供终答摘录,2026-09-11 第三十四轮 BUG-M4)。
+
+    此前 SubAgent 终答固定为「MOCK_FINAL_ANSWER: laew …验证通过。」,工具输出
+    (如 wc 管道验证的 lines=2 words=5 bytes=9)完全不回显,TUI 用户视角无法
+    判断任务真实结果。终答追加「工具输出摘录」段,Agent 编排链路的可观测性
+    与真实 LLM 行为对齐。截断到 limit 字符,避免超长输出污染上下文。
+    """
+    msgs = body.get("messages", []) or []
+    for m in reversed(msgs):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        blocks = content if isinstance(content, list) else []
+        for p in reversed(blocks):
+            if isinstance(p, dict) and p.get("type") == "tool_result":
+                rc = p.get("content", "")
+                if isinstance(rc, list):
+                    rc = "\n".join(
+                        tb.get("text", "") for tb in rc
+                        if isinstance(tb, dict) and "text" in tb
+                    )
+                if not isinstance(rc, str):
+                    rc = str(rc)
+                rc = rc.strip()
+                if len(rc) > limit:
+                    rc = rc[:limit] + "…(截断)"
+                return rc
+    return ""
+
+
+def _route_yolo_classification(corpus):
+    """按 PROMPT_ROUTER 规则覆写 Yolo 分类(2026-09-11 第三十四轮 BUG-M3)。
+
+    规则可选 `"yolo": {...}` 段,支持 task_level / goal_summary / purpose /
+    intent / decomposition_plan;未配置的规则或未启用 router 时返回默认
+    YOLO_CLASSIFICATION_JSON,行为与现状完全一致。
+    """
+    if PROMPT_ROUTER:
+        for rule in PROMPT_ROUTER.get("rules", []) or []:
+            keywords = rule.get("keywords", []) or []
+            if any(kw in corpus for kw in keywords):
+                override = rule.get("yolo")
+                if override:
+                    merged = {
+                        "task_level": override.get("task_level", "simple"),
+                        "goal_summary": override.get(
+                            "goal_summary", "完成 laew 端到端链路验证"
+                        ),
+                        "purpose": override.get(
+                            "purpose", "验证 laew 端到端链路是否正常"
+                        ),
+                        "intent": override.get("intent", "verify"),
+                        "decomposition_plan": override.get(
+                            "decomposition_plan", ["执行验证命令"]
+                        ),
+                        "direct_answer": None,
+                        "user_suggestion_if_fail": "",
+                    }
+                    return json.dumps(merged, ensure_ascii=False)
+                break  # 命中规则但未配置 yolo 覆写 → 保持默认分类
+    return YOLO_CLASSIFICATION_JSON
+
+
+def _route_mainwork_plan(corpus):
+    """按 PROMPT_ROUTER 规则覆写 Main-Work 拆解计划(BUG-M3 配套)。
+
+    规则可选 `"mainwork": {"workflows": [...]}` 段,与 MAIN_WORK_PLAN_JSON
+    同构;未配置时返回默认,行为不变。
+    """
+    if PROMPT_ROUTER:
+        for rule in PROMPT_ROUTER.get("rules", []) or []:
+            keywords = rule.get("keywords", []) or []
+            if any(kw in corpus for kw in keywords):
+                override = rule.get("mainwork")
+                if override:
+                    return json.dumps(override, ensure_ascii=False)
+                break
+    return MAIN_WORK_PLAN_JSON
+
+
+def _final_answer_text(tool_snippet, base="MOCK_FINAL_ANSWER: laew Anthropic 链路验证通过。"):
+    """SubAgent 终答文案(BUG-M4):前缀保持既有形态(e2e 子串断言兼容),
+    工具输出非空时追加「工具输出摘录」段。"""
+    text = base
+    if tool_snippet:
+        text += f"\n\n[工具输出摘录]\n{tool_snippet}"
+    return text
 
 
 def _route_subagent_tool(call_no, prompt_text, default_call):
@@ -596,12 +739,13 @@ def first_tool_call(call_no, prompt_text, default_cmd):
     return _route_subagent_tool(call_no, prompt_text, default_call)
 
 
-def build_anthropic_stream(call_no, prompt_text=""):
+def build_anthropic_stream(call_no, prompt_text="", tool_snippet=""):
     """构造 Anthropic 一次完整流的 SSE 字节。
 
     2026-09-11 第三十三轮:新增 prompt_text 参数,让 mock 在生成工具调用时
     能感知 prompt 内容(PROMPT_ROUTER 关键词命中)。call_no > 1 的轮次
     同样走 prompt 路由(用于 Read → Write → Bash 多轮序列)。
+    2026-09-11 第三十四轮 BUG-M4:新增 tool_snippet 参数,终答追加工具输出摘录。
     """
     if call_no == 1:
         # 第 1 次:返回工具调用(按 MODES 分流 + PROMPT_ROUTER)
@@ -731,7 +875,7 @@ def build_anthropic_stream(call_no, prompt_text=""):
             "data": {
                 "type": "content_block_delta",
                 "index": 0,
-                "delta": {"type": "text_delta", "text": "MOCK_FINAL_ANSWER: laew Anthropic 链路验证通过。"},
+                "delta": {"type": "text_delta", "text": _final_answer_text(tool_snippet)},
             },
         },
         {"type": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
@@ -748,7 +892,7 @@ def build_anthropic_stream(call_no, prompt_text=""):
     return make_anthropic_sse(events)
 
 
-def build_openai_stream(call_no, prompt_text=""):
+def build_openai_stream(call_no, prompt_text="", tool_snippet=""):
     """构造 OpenAI 一次完整流的 SSE 字节。
 
     2026-09-11 第三十三轮:接收 prompt_text 用于 PROMPT_ROUTER 命中;
@@ -827,7 +971,7 @@ def build_openai_stream(call_no, prompt_text=""):
             },
             {
                 "choices": [
-                    {"index": 0, "delta": {"content": "MOCK_FINAL_ANSWER: laew 端到端链路验证通过。"}, "finish_reason": None}
+                    {"index": 0, "delta": {"content": _final_answer_text(tool_snippet, "MOCK_FINAL_ANSWER: laew 端到端链路验证通过。")}, "finish_reason": None}
                 ]
             },
             {
@@ -876,6 +1020,21 @@ class Handler(BaseHTTPRequestHandler):
         role = detect_role(body, key)
         role_no = STATE.get(f"{key}:{role}", 0) + 1
         STATE[f"{key}:{role}"] = role_no
+        # 2026-09-11 第三十四轮 BUG-M2 修复:SubAgent 实例内计数。
+        # 全局 role_no 跨实例累计,导致 PROMPT_ROUTER 的 call_no 在多轮会话 /
+        # 多 SubAgent 场景下永远错位(第 2 个 SubAgent 实例首调用 role_no 已 >1,
+        # 路由表 call_no:1 的规则永不命中)。实例判定:请求 messages 中不含
+        # assistant 消息 = 新实例首调用,计数归零。--overflow-once 等既有模式
+        # 仍用全局 role_no 判定,行为不变。
+        call_no_for_stream = role_no
+        if role == "subagent":
+            _has_assistant = any(
+                m.get("role") == "assistant" for m in (body.get("messages") or [])
+            )
+            if not _has_assistant:
+                STATE[f"{key}:subagent:inst"] = 0
+            STATE[f"{key}:subagent:inst"] = STATE.get(f"{key}:subagent:inst", 0) + 1
+            call_no_for_stream = STATE[f"{key}:subagent:inst"]
 
         # --overflow-once 模式:subagent 第 2 次调用返回 HTTP 400 上下文溢出
         # (Anthropic 真实错误形态),用于端到端验证 src/agent/overflow.rs 的
@@ -946,7 +1105,12 @@ class Handler(BaseHTTPRequestHandler):
                 elif "--parallel-wfs" in MODES:
                     body_bytes = role_reply(maybe_break_json(YOLO_CLASSIFICATION_MEDIUM_JSON))
                 else:
-                    body_bytes = role_reply(maybe_break_json(YOLO_CLASSIFICATION_JSON))
+                    # 2026-09-11 第三十四轮 BUG-M3:PROMPT_ROUTER 可按 prompt
+                    # 内容覆写分类档位(simple/medium/hard)与 goal_summary,
+                    # 让 medium/hard 链路可按提示词真实触发;未命中保持默认。
+                    body_bytes = role_reply(maybe_break_json(
+                        _route_yolo_classification(_extract_user_corpus(body))
+                    ))
             elif role == "quality":
                 if "--forced-tool" in MODES:
                     body_bytes = emit_reply(
@@ -962,7 +1126,12 @@ class Handler(BaseHTTPRequestHandler):
                 if "--parallel-wfs" in MODES:
                     body_bytes = role_reply(maybe_break_json(MAIN_WORK_PLAN_PARALLEL_JSON))
                 else:
-                    body_bytes = role_reply(maybe_break_json(MAIN_WORK_PLAN_JSON))
+                    # BUG-M3 配套:PROMPT_ROUTER 可按 prompt 内容覆写 WorkFlow
+                    # 拆解计划(wf.name 会作为 original_prompt 透传给 SubAgent,
+                    # 携带轮次关键词让 SubAgent 路由可命中);未命中保持默认。
+                    body_bytes = role_reply(maybe_break_json(
+                        _route_mainwork_plan(_extract_user_corpus(body))
+                    ))
             elif role == "session":
                 body_bytes = role_reply(SESSION_SUMMARY_TEXT)
             elif role == "compact":
@@ -972,13 +1141,16 @@ class Handler(BaseHTTPRequestHandler):
             elif role == "debug":
                 body_bytes = role_reply(DEBUG_EVALUATION_TEXT)
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
-                # 2026-09-11 第三十三轮:把 prompt 文本传给 stream 构造,
-                # 让 PROMPT_ROUTER 在每轮都能感知用户原始诉求。
-                _sub_prompt = _extract_last_user_text(body)
+                # 2026-09-11 第三十四轮 BUG-M1/M2:改用全量 user 语料(任务
+                # prompt + tool_result 内容)做路由匹配,call_no 用实例内计数,
+                # 多步工具链(Write→Bash→Read→Write)与多轮会话真实可模拟。
+                # BUG-M4:终答附带最后工具输出摘录。
+                _sub_prompt = _extract_user_corpus(body)
+                _tool_snippet = _extract_last_tool_result(body)
                 body_bytes = (
-                    build_openai_stream(role_no, _sub_prompt)
+                    build_openai_stream(call_no_for_stream, _sub_prompt, _tool_snippet)
                     if key == "oai"
-                    else build_anthropic_stream(role_no, _sub_prompt)
+                    else build_anthropic_stream(call_no_for_stream, _sub_prompt, _tool_snippet)
                 )
         else:
             self.send_response(404)

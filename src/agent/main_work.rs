@@ -222,15 +222,24 @@ impl MainWorkRunner {
     ///
     /// `retry_hint`(2026-09-10 第 25 轮 F3):上一轮执行/QC 的失败原因,重试轮回灌给
     /// Main-Work 参考规避,消除「盲重试」;首轮传空串。
+    ///
+    /// `original_prompt`(2026-09-11 第三十四轮 LA-1):用户原始 prompt 透传,与
+    /// SubAgent 的 #P-A 修复同源 —— 此前 Main-Work 只看到 Yolo 抽象摘要
+    /// (goal_summary/分解步骤),拆解脱离用户原始意图的风险与 SubAgent 完全一致;
+    /// 现在编排 prompt 头部附「用户原始输入」段。
     pub async fn plan_workflows(
         &self,
         goal: &str,
         decomposition: &[String],
         session_id: &str,
         retry_hint: &str,
+        original_prompt: Option<&str>,
     ) -> Result<(WorkFlowPlan, Usage)> {
         let mut prompt = String::new();
         prompt.push_str(&format!("【Main-Work 任务编排】\n目标: {}\n", goal));
+        if let Some(orig) = original_prompt.filter(|s| !s.trim().is_empty()) {
+            prompt.push_str(&format!("\n用户原始输入:\n{orig}\n"));
+        }
         if !decomposition.is_empty() {
             prompt.push_str("\nYolo 给出的分解步骤(可参考,不一定照搬):\n");
             for (i, s) in decomposition.iter().enumerate() {

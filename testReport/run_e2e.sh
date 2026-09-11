@@ -7,7 +7,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 TS=$(date +%Y%m%d-%H%M%S)
-REPORT="testReport/e2e-$TS.txt"
+# 2026-09-11 第三十四轮修复:REPORT 用绝对路径 —— run() 的 tee -a 在被 cd 到
+# /tmp 子目录的子壳里以相对路径打开会静默失败,导致这些小节的 laew 原始输出
+# 不落报告(例:7b 自定义命令节),事后排查无据可查。
+REPORT="$ROOT_DIR/testReport/e2e-$TS.txt"
 MOCK_PORT=18899
 MOCK_LOG="testReport/mock_requests-$TS.jsonl"
 PASS=0; FAIL=0
@@ -838,6 +841,11 @@ echo "$OUT" | grep -q "开启新会话\|已开启新会话"; check $? "/new 命�
 
 # --- 7b. 自定义斜杠命令 + 会话导出(D2/D8,2026-09-10 第 17 轮) ---
 section "7b. 自定义斜杠命令与会话导出"
+# 2026-09-11 第三十四轮修复:基础 mock 在 §5d 后已被 kill,本节 /e2e-hello
+# dispatch 依赖 mock 编排 —— 此前静默降级为 [agent error],断言只覆盖本地
+# 输出仍在通过,真实编排链路从未被测到。本节独立拉起 mock 复用 18899 端口。
+python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7b-$TS.jsonl" &>/dev/null &
+MOCK7B_PID=$!; sleep 0.6
 rm -rf /tmp/laew-e2e-cmd-work; mkdir -p /tmp/laew-e2e-cmd-work/.laew/commands
 cat > /tmp/laew-e2e-cmd-work/.laew/commands/e2e-hello.md <<'CMDEOF'
 ---
@@ -860,11 +868,15 @@ EXPORT_FILE="/tmp/laew-e2e-cmd-work/${EXPORT_NAME:-not-found}"
 [ -n "$EXPORT_NAME" ] && [ -f "$EXPORT_FILE" ]; check $? "/export 文件已落盘(${EXPORT_FILE:-未找到})"
 grep -q "请向 laew 问好" "$EXPORT_FILE" 2>/dev/null; check $? "导出含命令展开提示词"
 grep -q "/e2e-hello laew" "$EXPORT_FILE" 2>/dev/null; check $? "导出含原始命令输入"
-grep -q "1 轮对话" "$OUT"; check $? "/export 提示轮数"
+# 2026-09-11 第三十四轮修复:原写法 `grep -q "1 轮对话" "$OUT"` 把 laew 的多行
+# 输出整体当作「文件名」传给 grep(ENAMETOOLONG → 恒 FAIL,即遗留 FAIL-4);
+# 与本节其它断言统一为 stdin 管道写法。
+echo "$OUT" | grep -q "1 轮对话"; check $? "/export 提示轮数"
 # 显式路径拒绝覆盖(保护用户文件)
 touch /tmp/laew-e2e-cmd-work/exists.md
 OUT=$(cd /tmp/laew-e2e-cmd-work && printf '/export exists.md\n/exit\n' | run "$LAEW")
 echo "$OUT" | grep -q "拒绝覆盖"; check $? "/export 显式路径已存在时拒绝覆盖"
+kill $MOCK7B_PID 2>/dev/null
 rm -rf /tmp/laew-e2e-cmd-work
 
 # --- 7c. D3 对话 Rewind 与分支(2026-09-10 第二十四轮) ---
