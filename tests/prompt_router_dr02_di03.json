@@ -1,0 +1,334 @@
+{
+  "rules": [
+    {
+      "keywords": [
+        "DR02Q4"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr02_launch.sh"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/dr02_launch.sh >/dev/null && grep -q 'DRY_RUN=1' tmpPlan/agent-test/dr02_status.log && grep -q 'loaded|com.laew.test|simulated' tmpPlan/agent-test/dr02_status.log && echo 'DR02_VERIFIED_OK'"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "安全模拟 launchd plist 加载状态并断言日志",
+        "purpose": "验证 Agent 工具链、文件落盘、Bash 执行与质量收口",
+        "intent": "coding",
+        "decomposition_plan": [
+          "模拟 launchctl 加载与状态验证"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR02Q4】Bash 执行 dr02_launch.sh 并验证 dr02_status.log",
+            "steps": [
+              "【DR02Q4】Bash 执行 dr02_launch.sh 并验证 dr02_status.log"
+            ],
+            "acceptance": [
+              "产物落盘且断言通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DR02Q3"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Read",
+          "args": {
+            "file_path": "tmpPlan/agent-test/com.laew.test.plist"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/dr02_launch.sh",
+            "content": "#!/bin/bash\nset -euo pipefail\nPLIST=\"$PWD/tmpPlan/agent-test/com.laew.test.plist\"\n{\n  echo 'DRY_RUN=1'\n  plutil -lint \"$PLIST\"\n  echo 'loaded|com.laew.test|simulated'\n  echo 'unloaded|com.laew.test|simulated'\n} | tee tmpPlan/agent-test/dr02_status.log\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "读取 plist 后生成安全的 launchd 管理 DryRun 脚本",
+        "purpose": "验证 Agent 工具链、文件落盘、Bash 执行与质量收口",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Read plist 后 Write launchd DryRun 脚本"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR02Q3】Read com.laew.test.plist 后 Write dr02_launch.sh",
+            "steps": [
+              "【DR02Q3】Read com.laew.test.plist 后 Write dr02_launch.sh"
+            ],
+            "acceptance": [
+              "产物落盘且断言通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DR02Q2"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "plutil -lint tmpPlan/agent-test/com.laew.test.plist 2>&1 | tee tmpPlan/agent-test/dr02_plint.log"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "校验 launchd plist 语法并落盘日志",
+        "purpose": "验证 Agent 工具链、文件落盘、Bash 执行与质量收口",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash 执行 plutil -lint 并验证"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR02Q2】Bash 执行 plutil -lint 并 tee dr02_plint.log",
+            "steps": [
+              "【DR02Q2】Bash 执行 plutil -lint 并 tee dr02_plint.log"
+            ],
+            "acceptance": [
+              "产物落盘且断言通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DR02Q1"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/com.laew.test.plist",
+            "content": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>com.laew.test</string>\n  <key>ProgramArguments</key>\n  <array><string>/bin/echo</string><string>hello</string></array>\n  <key>StartInterval</key><integer>3600</integer>\n  <key>RunAtLoad</key><true/>\n  <key>StandardOutPath</key><string>/tmp/com.laew.test.out.log</string>\n  <key>StandardErrorPath</key><string>/tmp/com.laew.test.err.log</string>\n</dict>\n</plist>\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "创建每小时运行 echo 的 launchd plist",
+        "purpose": "验证 Agent 工具链、文件落盘、Bash 执行与质量收口",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write launchd plist"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DR02Q1】Write com.laew.test.plist",
+            "steps": [
+              "【DR02Q1】Write com.laew.test.plist"
+            ],
+            "acceptance": [
+              "产物落盘且断言通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DI03Q4"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "bash tmpPlan/agent-test/di03/bash_only.sh && (command -v dash >/dev/null 2>&1 && dash tmpPlan/agent-test/di03/posix.sh || sh tmpPlan/agent-test/di03/posix.sh) && grep -q '^## ' tmpPlan/agent-test/di03/di03_report.md && echo 'DI03_ALL_OK'"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "回归 Bash 与 POSIX sh 两版脚本并验证报告",
+        "purpose": "验证 Agent 工具链、文件落盘、Bash 执行与质量收口",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Bash/bash 与 dash/sh 双运行 + 报告断言"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DI03Q4】回归 bash_only.sh、posix.sh 和 di03_report.md",
+            "steps": [
+              "【DI03Q4】回归 bash_only.sh、posix.sh 和 di03_report.md"
+            ],
+            "acceptance": [
+              "产物落盘且断言通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DI03Q3"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Bash",
+          "args": {
+            "command": "if command -v shellcheck >/dev/null 2>&1; then shellcheck --shell=sh tmpPlan/agent-test/di03/posix.sh; else dash -n tmpPlan/agent-test/di03/posix.sh; fi && echo 'STATIC_OK'"
+          }
+        },
+        {
+          "call_no": 2,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/di03/di03_report.md",
+            "content": "# DI03 POSIX 降级报告\n\n## local\nPOSIX sh 没有 local，改为避免同名全局变量或使用子 shell。\n\n## arrays\nPOSIX sh 没有数组，用 positional parameters 或固定循环列表替代。\n\n## conditional operators\n[[ ]] 不是 POSIX，test/case 是兼容写法；case 对字符串模式最直观。\n\n## Alpine 影响\nAlpine 默认是 BusyBox ash/dash，Dockerfile 直接执行 bash-only 脚本会失败；应使用 POSIX sh 或显式安装 bash。\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "静态校验 POSIX 脚本并总结降级痛点",
+        "purpose": "验证 Agent 工具链、文件落盘、Bash 执行与质量收口",
+        "intent": "coding",
+        "decomposition_plan": [
+          "静态校验后 Write di03_report.md"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DI03Q3】Bash 静态校验 posix.sh 后 Write di03_report.md",
+            "steps": [
+              "【DI03Q3】Bash 静态校验 posix.sh 后 Write di03_report.md"
+            ],
+            "acceptance": [
+              "产物落盘且断言通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DI03Q2"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/di03/posix.sh",
+            "content": "#!/bin/sh\nset -eu\ncount=0\nfor item in alpha beta gamma; do\n  case \"$item\" in\n    alpha|gamma) count=$((count + 1)) ;;\n  esac\ndone\nresult=$(printf '%s\\n' 3 | while read n; do echo $((n * 2)); done)\necho \"posix_ok count=$count doubled=$result\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "实现 POSIX sh 兼容脚本",
+        "purpose": "验证 Agent 工具链、文件落盘、Bash 执行与质量收口",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write posix.sh"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DI03Q2】Write tmpPlan/agent-test/di03/posix.sh",
+            "steps": [
+              "【DI03Q2】Write tmpPlan/agent-test/di03/posix.sh"
+            ],
+            "acceptance": [
+              "产物落盘且断言通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    },
+    {
+      "keywords": [
+        "DI03Q1"
+      ],
+      "tools": [
+        {
+          "call_no": 1,
+          "tool": "Write",
+          "args": {
+            "file_path": "tmpPlan/agent-test/di03/bash_only.sh",
+            "content": "#!/usr/bin/env bash\nset -euo pipefail\nitems=(alpha beta gamma)\ncount=0\nfor item in \"${items[@]}\"; do\n  [[ \"$item\" == alpha || \"$item\" == gamma ]] && count=$((count + 1))\ndone\nresult=$(printf '%s\\n' 3 | while read n; do echo $((n * 2)); done)\necho \"bash_only_ok count=$count doubled=$result\"\n"
+          }
+        }
+      ],
+      "yolo": {
+        "task_level": "medium",
+        "goal_summary": "创建 Bash 特性对照脚本",
+        "purpose": "验证 Agent 工具链、文件落盘、Bash 执行与质量收口",
+        "intent": "coding",
+        "decomposition_plan": [
+          "Write bash_only.sh"
+        ]
+      },
+      "mainwork": {
+        "workflows": [
+          {
+            "id": "wf-1",
+            "name": "【DI03Q1】Write tmpPlan/agent-test/di03/bash_only.sh",
+            "steps": [
+              "【DI03Q1】Write tmpPlan/agent-test/di03/bash_only.sh"
+            ],
+            "acceptance": [
+              "产物落盘且断言通过"
+            ],
+            "delegate_to": "subagent"
+          }
+        ]
+      }
+    }
+  ]
+}

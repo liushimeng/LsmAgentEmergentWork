@@ -32,6 +32,29 @@ check() {
 }
 run() { "$@" 2>&1 | tee -a "$REPORT"; return "${PIPESTATUS[0]}"; }
 
+# macOS 没有 GNU coreutils 的 timeout；为 7c 的 TUI 防卡死用例提供等价 watchdog。
+if ! command -v timeout >/dev/null 2>&1; then
+  timeout() {
+    local seconds pid rc
+    seconds="$1"; shift
+    "$@" &
+    pid=$!
+    for (( tick=0; tick < seconds*10; tick++ )); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    wait "$pid"; rc=$?
+    return "$rc"
+  }
+fi
+
 echo "laew e2e 验证 @ $(date)" | tee "$REPORT"
 echo "根目录: $ROOT_DIR" | tee -a "$REPORT"
 

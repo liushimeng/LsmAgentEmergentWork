@@ -25,6 +25,7 @@
 
 ### DR02 launchd 服务管理
 
+- **测试状态**: ✅ 已测试（2026-09-11 macOS arm64 / laew mock 4 轮全过:q1 Write plist → q2 plutil -lint OK → q3 Read+Write DryRun 脚本 → q4 状态断言 + DR02_VERIFIED_OK;为避免污染宿主机,launchctl 加载/卸载改为显式 DRY_RUN 模拟;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;详见 tmpPlan/2026-09-11_14-DR02-DI03-macOS-Shell测试与Agent编排优化方案.md）
 - **预期档位**: medium
 - **考察维度**: plist 配置 / launchctl 加载/卸载 / 定时任务
 - **工具链**: Write → Bash → Read → Write

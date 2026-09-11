@@ -123,6 +123,27 @@ while _i < len(_args):
 # 规则匹配优先级:先匹配规则列表中第一个命中的;同一规则内按 call_no 索引。
 # 路由文件编写约定:后轮规则放前(关键词特异性递增),防前轮泛关键词截胡后轮。
 PROMPT_ROUTER = None
+
+
+def _validate_prompt_router(router, source="prompt-router"):
+    """Fail fast on router shapes that are known to poison agent-level tests.
+
+    ``decomposition_plan`` must mirror the Rust Yolo contract exactly: an array
+    of strings. A scalar is still syntactically valid JSON, but laew correctly
+    rejects it and degrades the classification to simple, which makes a router
+    intended for medium/hard regression silently test the fallback path instead.
+    """
+    for index, rule in enumerate((router or {}).get("rules", []) or []):
+        plan = ((rule.get("yolo") or {}).get("decomposition_plan"))
+        if plan is not None and (
+            not isinstance(plan, list)
+            or any(not isinstance(step, str) for step in plan)
+        ):
+            raise ValueError(
+                f"{source}: rules[{index}].yolo.decomposition_plan must be string[]"
+            )
+
+
 _args_router = sys.argv[3:]
 _i = 0
 while _i < len(_args_router):
@@ -132,8 +153,10 @@ while _i < len(_args_router):
         try:
             with open(router_path, encoding="utf-8") as _rf:
                 PROMPT_ROUTER = json.load(_rf)
+                _validate_prompt_router(PROMPT_ROUTER, router_path)
         except Exception as e:
             print(f"[mock] prompt router load failed: {e}", file=sys.stderr, flush=True)
+            PROMPT_ROUTER = None
         _i += 2
         continue
     _i += 1

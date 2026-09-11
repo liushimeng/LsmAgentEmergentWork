@@ -42,7 +42,7 @@
 
 ### DI03 POSIX sh 子集降级
 
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_20-A09-G01-I04-自动化测试与TUI验证方案.md）
+- **测试状态**: ✅ 已测试（2026-09-11 macOS arm64 / laew mock 4 轮全过:q1 Write bash_only.sh → q2 Write posix.sh → q3 Bash 静态校验 + Write 报告 → q4 bash 与 POSIX sh 双回归，输出 count=2 doubled=6 和 DI03_ALL_OK;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;详见 tmpPlan/2026-09-11_14-DR02-DI03-macOS-Shell测试与Agent编排优化方案.md）
 - **预期档位**: medium
 - **考察维度**: POSIX 子集 / `[[ ]]` 替代 / dash
 - **工具链**: Write → Bash → Bash → Write

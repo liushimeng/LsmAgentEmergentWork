@@ -78,14 +78,22 @@ git_hash() { git rev-parse --short=8 HEAD 2>/dev/null || echo unknown; }
 
 # 尝试远端 main 短哈希(网络可达时),失败回退 unknown
 remote_hash() {
-  # 仅在 5 秒超时内尝试,避免无网环境卡住脚本
-  if command -v timeout >/dev/null 2>&1; then
+  fetch_with_timeout() {
+    local pid watcher
     git fetch --no-tags --depth=1 origin main 2>/dev/null &
-    local pid=$!
+    pid=$!
     ( sleep 5; kill -9 "$pid" 2>/dev/null || true ) &
+    watcher=$!
     wait "$pid" 2>/dev/null || true
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+  }
+  # 仅在 5 秒超时内尝试,避免无网环境卡住脚本。
+  # macOS 未内置 GNU timeout;后台 fetch + watchdog 是 BSD/macOS 兼容兜底。
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5 git fetch --no-tags --depth=1 origin main 2>/dev/null || true
   else
-    git fetch --no-tags --depth=1 origin main 2>/dev/null || true
+    fetch_with_timeout
   fi
   git rev-parse --short=8 origin/main 2>/dev/null || echo unknown
 }
