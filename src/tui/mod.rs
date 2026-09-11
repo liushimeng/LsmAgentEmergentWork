@@ -468,6 +468,12 @@ impl TuiSession {
             Ok(OrchestrationOutcome::Executed { result }) => {
                 // print_task_result 内部从 self.task_started_at.take() 取值后拼接耗时,
                 // 这里先 format 一份给 transcript 使用,不再重复 take(避免耗时被吃掉)。
+                // 2026-09-11 第三十轮 BA01/CA31 测试修复:
+                // 多轮 Assistant 回填必须用 context 版(仅 subflow_outcome + QC verdict),
+                // 不能复用人类版(含 [task executed]/[yolo]/[trace]/[session_context]/本次用量
+                // 等 TUI 元数据会污染 LLM 决策、浪费 token、跨轮指代干扰)。
+                // print_task_result 继续用人类版(含 trace 等可观测性信息,屏幕友好)。
+                // transcript/导出也用人类版(用户看到的完整记录)。
                 let text = format_task_result(result, &self.paths, self.task_started_at);
                 self.print_task_result(result);
                 Some((OutcomeKind::Executed, text, result.total_usage))
@@ -1375,6 +1381,69 @@ fn format_task_result(
     out
 }
 
+
+/// 构造 Assistant 回填到 LLM 主上下文的精简文本(2026-09-11 第三十轮 BA01/CA31 测试修复)。
+///
+/// 与 `format_task_result`(人类版,含全部 TUI 元数据)的差异:
+/// - **不含** `[task executed: difficulty=...]` 行:任务级别是 orchestrator 内部状态,
+///   LLM 看到会困惑(它只知道自己的分类结果,看不到 orchestrator 后续加工)。
+/// - **不含** `[yolo] purpose=... goal=... intent=... plan_steps=...` 行:这是上一轮
+///   Yolo 的决策文本,会让下轮 Yolo 受上一轮自己决策的暗示(锚定效应),污染任务分类。
+/// - **不含** `[trace] iter=... tools=... early_term=...` 行:SubAgent 内部执行统计,
+///   LLM 看不到自己的 tool_use_id 与 trace 之间的对应关系,读 trace 反而误导。
+/// - **不含** `[session_context 摘要]` 块:摘要已经在 SESSION_HISTORY 标记里注入,
+///   再回填相当于让 LLM 看到自己已生成的摘要,造成内容重复膨胀。
+/// - **不含** `本次用量: input=... output=... (耗时 ...)` 行:mock 下固定值会让 LLM
+///   误以为"上次只用了 140 token",真实 LLM 下暴露自身用量给模型本身也无必要。
+/// - **不含** `--- WorkFlow wf-1 (xxx) ---` 标题行:WorkFlow id 与 name 是内部标识,
+///   LLM 不关心;只要看到 subflow_outcome 就能理解上轮的产出。
+/// - **不含** 行首的 2 空格缩进(避免在 LLM 视角产生伪缩进视觉)。
+///
+/// **保留**:
+/// - 每个 WorkFlow 的 `wf.subflow_outcome`(这是 LLM 必须看到的"上轮真正回答")
+/// - QC verdict + issues:让下轮 LLM 知道上次是否成功、有什么遗留问题,指导是否需要重做。
+///   QC Pass 给一句话"已通过质检";Fail 给"未通过质检 + 问题清单"。
+///
+/// 实现要点:
+/// - 单 WorkFlow 链路与多 WorkFlow 链路均正常(loop 迭代,各 WorkFlow 拼接)。
+/// - 不含本次耗时(`task_started_at` 字段直接丢弃,context 版不关心)。
+/// - transcript/导出 仍然用 `format_task_result` 人类版(用户能看到的完整记录)。
+fn format_task_result_for_context(
+    result: &crate::agent::orchestrator::TaskResult,
+) -> String {
+    let mut out = String::new();
+    for (idx, wf) in result.workflows.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        // SubAgent 的真正回答(LLM 必须看到的核心信息)
+        if !wf.subflow_outcome.is_empty() {
+            out.push_str(&wf.subflow_outcome);
+            if !wf.subflow_outcome.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        // QC verdict:让下轮 LLM 知道上次是否通过质检,指导是否需要重做。
+        // 单行精简表达,避免占用过多 token。
+        let (verdict_text, issues_text) = match wf.quality_report.verdict {
+            crate::agent::quality::Verdict::Pass => {
+                ("(质检通过)".to_string(), String::new())
+            }
+            crate::agent::quality::Verdict::Fail => {
+                let mut issues_str = String::new();
+                if !wf.quality_report.issues.is_empty() {
+                    issues_str = format!(
+                        ";问题:{}",
+                        wf.quality_report.issues.join("; ")
+                    );
+                }
+                ("(质检未通过)".to_string(), issues_str)
+            }
+        };
+        out.push_str(&format!("{verdict_text}{issues_text}\n"));
+    }
+    out
+}
 /// Usage 逐字段饱和累加(会话累计用途;orchestrator 内部 add_usage 为私有,此处独立实现)。
 fn merge_usage(a: crate::llm::Usage, b: crate::llm::Usage) -> crate::llm::Usage {
     crate::llm::Usage {
@@ -1923,4 +1992,133 @@ pub async fn run_with_debug(debug: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod format_task_result_for_context_tests {
+    use super::*;
+    use crate::agent::orchestrator::{TaskResult, WorkflowResult};
+    use crate::agent::quality::{QualityReport, Verdict};
+    use crate::llm::Usage;
+
+    fn make_workflow(subflow_outcome: &str, qc_pass: bool, issues: Vec<&str>) -> WorkflowResult {
+        WorkflowResult {
+            id: "wf-1".into(),
+            name: "测试单元".into(),
+            subflow_outcome: subflow_outcome.into(),
+            quality_report: QualityReport {
+                verdict: if qc_pass { Verdict::Pass } else { Verdict::Fail },
+                issues: issues.into_iter().map(|s| s.to_string()).collect(),
+                suggestion: String::new(),
+                retryable: false,
+                source: crate::agent::context::AgentRole::SubAgent,
+                evidence: String::new(),
+            },
+            usage: Usage::default(),
+            subflow_trace: None,
+        }
+    }
+
+    fn make_result(workflows: Vec<WorkflowResult>, summary: &str) -> TaskResult {
+        TaskResult {
+            goal: "g".into(),
+            classification: crate::agent::yolo::TaskClassification {
+                task_level: crate::agent::yolo::TaskLevel::Simple,
+                purpose: "p".into(),
+                goal_summary: "g".into(),
+                intent: "info_query".into(),
+                agent_role: None,
+                decomposition_plan: vec![],
+                direct_answer: None,
+                user_suggestion_if_fail: String::new(),
+                yolo_degraded: false,
+            },
+            plan_doc: None,
+            workflows,
+            summary: summary.into(),
+            total_usage: Usage::default(),
+        }
+    }
+
+    #[test]
+    fn context_version_excludes_tui_metadata() {
+        // 第 30 轮 BA01/CA31 修复:context 版不能含任何 TUI 元数据
+        let wf = make_workflow("MOCK_FINAL_ANSWER: hello", true, vec![]);
+        let result = make_result(vec![wf], "任务完成摘要");
+        let ctx = format_task_result_for_context(&result);
+        // 不应含的元数据
+        for forbidden in &[
+            "[task executed",
+            "[yolo]",
+            "[trace]",
+            "[session_context",
+            "本次用量",
+            "--- WorkFlow",
+            "difficulty=",
+            "intent=",
+            "plan_steps=",
+        ] {
+            assert!(
+                !ctx.contains(forbidden),
+                "context 版不应包含 {forbidden:?},实际: {ctx}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_version_includes_subflow_outcome() {
+        // 必须保留 subflow_outcome(LLM 要看的"上轮真正回答")
+        let wf = make_workflow("这是 SubAgent 的真实回答,包含具体内容。", true, vec![]);
+        let result = make_result(vec![wf], "");
+        let ctx = format_task_result_for_context(&result);
+        assert!(ctx.contains("这是 SubAgent 的真实回答,包含具体内容。"));
+    }
+
+    #[test]
+    fn context_version_qc_pass_marker() {
+        // QC Pass 时含「(质检通过)」标记
+        let wf = make_workflow("answer", true, vec![]);
+        let result = make_result(vec![wf], "");
+        let ctx = format_task_result_for_context(&result);
+        assert!(ctx.contains("(质检通过)"));
+        // Fail 时不应出现 Pass
+        assert!(!ctx.contains("(质检未通过)"));
+    }
+
+    #[test]
+    fn context_version_qc_fail_marker_with_issues() {
+        // QC Fail 时含「(质检未通过)」+ issues 清单
+        let wf = make_workflow("bad answer", false, vec!["缺少结论", "数据未引用"]);
+        let result = make_result(vec![wf], "");
+        let ctx = format_task_result_for_context(&result);
+        assert!(ctx.contains("(质检未通过)"));
+        assert!(ctx.contains("缺少结论"));
+        assert!(ctx.contains("数据未引用"));
+        assert!(!ctx.contains("(质检通过)"));
+    }
+
+    #[test]
+    fn context_version_multi_workflow_joins_with_blank_line() {
+        // 多 WorkFlow 链路:每个 WorkFlow 用空行分隔
+        let wf1 = make_workflow("first answer", true, vec![]);
+        let wf2 = make_workflow("second answer", true, vec![]);
+        let result = make_result(vec![wf1, wf2], "");
+        let ctx = format_task_result_for_context(&result);
+        assert!(ctx.contains("first answer"));
+        assert!(ctx.contains("second answer"));
+        // 两个 answer 之间有空行
+        assert!(ctx.contains("first answer"), "first answer 应在结果中");
+        assert!(ctx.contains("second answer"), "second answer 应在结果中");
+        // 两个 WorkFlow 之间用空行分隔(中间夹 QC 标记)
+        assert!(ctx.contains("(质检通过)\n\nsecond answer"), "空行分隔两个 WorkFlow,实际: {ctx}");
+    }
+
+    #[test]
+    fn context_version_empty_subflow_outcome_still_emits_qc_marker() {
+        // subflow_outcome 为空时仍输出 QC 标记(下轮 LLM 仍需看到上次质检结果)
+        let wf = make_workflow("", true, vec![]);
+        let result = make_result(vec![wf], "");
+        let ctx = format_task_result_for_context(&result);
+        assert!(ctx.contains("(质检通过)"));
+    }
 }
