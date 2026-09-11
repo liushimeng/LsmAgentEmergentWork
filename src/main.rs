@@ -270,8 +270,7 @@ async fn run_one_shot(
     // -p 单轮模式每次生成独立 Session(debug 采集器以其 Session ID 命名归属)
     let mut session = Session::new();
     // D1 @ 提及展开(2026-09-10 第二十八轮,L1426):与 TUI dispatch_prompt 同一语义
-    let expanded =
-        lsm_agent::agent::attachments::expand_mentions(&prompt, &paths.work_dir);
+    let expanded = lsm_agent::agent::attachments::expand_mentions(&prompt, &paths.work_dir);
     if expanded.attached > 0 {
         eprintln!("[laew] 已附加 {} 个 @ 提及内容", expanded.attached);
     }
@@ -375,7 +374,7 @@ async fn run_one_shot(
 
     match outcome {
         OrchestrationOutcome::DirectAnswer { text, usage, .. } => {
-            println!("{text}");
+            println!("{}", lsm_agent::tui::sanitize_terminal_controls(&text));
             print_usage(&usage);
         }
         OrchestrationOutcome::Executed { result } => {
@@ -385,8 +384,15 @@ async fn run_one_shot(
             // 便于 -p 用户 / 脚本解析时区分 "LLM 直接 end_turn" vs "工具被调用"
             // vs "工具失败" 三种语义,改善可观测性。
             for wf in &result.workflows {
-                println!("--- WorkFlow {} ({}) ---", wf.id, wf.name);
-                println!("{}", wf.subflow_outcome);
+                println!(
+                    "--- WorkFlow {} ({}) ---",
+                    wf.id,
+                    lsm_agent::tui::sanitize_terminal_controls(&wf.name)
+                );
+                println!(
+                    "{}",
+                    lsm_agent::tui::sanitize_terminal_controls(&wf.subflow_outcome)
+                );
                 if let Some(trace) = &wf.subflow_trace {
                     println!(
                         "[trace] iter={} tools={}(ok={},err={}) early_term={}",
@@ -413,7 +419,10 @@ async fn run_one_shot(
             if !result.summary.is_empty() {
                 println!();
                 println!("[session_context 摘要]");
-                println!("{}", result.summary);
+                println!(
+                    "{}",
+                    lsm_agent::tui::sanitize_terminal_controls(&result.summary)
+                );
             }
             print_usage(&result.total_usage);
         }

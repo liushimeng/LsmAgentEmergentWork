@@ -147,8 +147,15 @@ fi
 # 5) 远端 HEAD 对比(2026-09-10): 如果远端领先,提示用户先 git pull
 REMOTE="$(remote_hash)"
 if [[ "$REMOTE" != "unknown" && "$REMOTE" != "$EXPECT" ]]; then
-  echo "[rebuild] ⚠️  远端 origin/main ($REMOTE) 领先当前 HEAD ($EXPECT)" >&2
-  echo "[rebuild] ⚠️  产物是按本地 HEAD 构建的,可能不是最新代码,建议: git pull" >&2
+  # 本地已提交但尚未 push 时,远端 hash 会落后于 HEAD;此时远端已被 HEAD 包含,
+  # 不能误报「远端领先」。只有 origin/main 不是 HEAD 祖先时才提醒 pull。
+  if git cat-file -e "${REMOTE}^{commit}" >/dev/null 2>&1 \
+     && git merge-base --is-ancestor "$REMOTE" "$EXPECT" >/dev/null 2>&1; then
+    echo "[rebuild] 远端 origin/main ($REMOTE) 已包含在当前 HEAD ($EXPECT),本地提交待推送" >&2
+  else
+    echo "[rebuild] ⚠️  远端 origin/main ($REMOTE) 领先当前 HEAD ($EXPECT)" >&2
+    echo "[rebuild] ⚠️  产物是按本地 HEAD 构建的,可能不是最新代码,建议: git pull" >&2
+  fi
 fi
 
 # 6) 显著展示产物版本与当前提交,便于一眼确认「构建的就是这份代码」

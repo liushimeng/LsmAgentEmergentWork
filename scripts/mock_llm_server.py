@@ -183,6 +183,17 @@ def _extract_last_user_text(body):
     return ""
 
 
+def _extract_current_prompt(body):
+    """提取“本轮用户提示词”，供 Yolo/MainWork 路由使用。
+
+    不能使用 `_extract_user_corpus()`:
+    - TUI 多轮请求会带 SESSION_HISTORY / PROJECT_CONTEXT 与历史 assistant 回填;
+    - 全量语料中的旧轮次关键词会按 rules 顺序抢先命中，导致当前轮分类错位。
+    Yolo/MainWork 请求没有 tool_result 尾块，最后一条 user 消息即当前请求。
+    """
+    return _extract_last_user_text(body)
+
+
 def _extract_user_corpus(body):
     """收集全部 user 消息文本 + tool_result 内容,作为 PROMPT_ROUTER 匹配语料。
 
@@ -630,6 +641,27 @@ DEBUG_EVALUATION_TEXT = (
     "## 问题报告\n- P2: mock 环境为脚本化固定响应,业务正确性不在本报告评估范围内。\n\n"
     "## 优化建议\n- 建议对真实模型回归本任务,验证业务语义层面的完成质量。"
 )
+
+
+def debug_evaluation_text(body):
+    """根据 Debug prompt 中的真实 trace 选择成功/失败评估。
+
+    固定“目标达成”会让 Bash 非零 + QC fail 的报告自相矛盾，误导回归判断。
+    """
+    corpus = _extract_user_corpus(body)
+    qc_failed = "结论: **fail**" in corpus or (
+        "QC 检查次数" in corpus and "QC 通过次数 | 0" in corpus
+    )
+    if not qc_failed:
+        return DEBUG_EVALUATION_TEXT
+    return (
+        "## 任务评估\n任务链路返回了结构化结果,但执行轨迹或 Quality-Check "
+        "存在失败证据,不能判定目标达成。\n\n"
+        "## 质量报告\n- QC:存在 fail 结论,需要优先处理\n"
+        "- 工具轨迹:检查 bash_exit_nonzero / early_terminate / high_error_rate 信号\n\n"
+        "## 问题报告\n- P0: QC 或执行轨迹存在失败证据,业务验收未闭环\n\n"
+        "## 优化建议\n- 修正命令/产物后重跑;若非零退出是预期负例,Quality-Check 必须给出非空 evidence 说明。"
+    )
 COMPACT_SUMMARY_TEXT = (
     "## 目标\n验证 Context 自动压缩链路。\n\n"
     "## 进展与关键结论\n历史对话已由 Compact 压缩。\n\n"
@@ -1132,7 +1164,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 内容覆写分类档位(simple/medium/hard)与 goal_summary,
                     # 让 medium/hard 链路可按提示词真实触发;未命中保持默认。
                     body_bytes = role_reply(maybe_break_json(
-                        _route_yolo_classification(_extract_user_corpus(body))
+                        _route_yolo_classification(_extract_current_prompt(body))
                     ))
             elif role == "quality":
                 if "--forced-tool" in MODES:
@@ -1153,7 +1185,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 拆解计划(wf.name 会作为 original_prompt 透传给 SubAgent,
                     # 携带轮次关键词让 SubAgent 路由可命中);未命中保持默认。
                     body_bytes = role_reply(maybe_break_json(
-                        _route_mainwork_plan(_extract_user_corpus(body))
+                        _route_mainwork_plan(_extract_current_prompt(body))
                     ))
             elif role == "session":
                 body_bytes = role_reply(SESSION_SUMMARY_TEXT)
@@ -1162,7 +1194,7 @@ class Handler(BaseHTTPRequestHandler):
             elif role == "plan":
                 body_bytes = role_reply(PLAN_MARKDOWN)
             elif role == "debug":
-                body_bytes = role_reply(DEBUG_EVALUATION_TEXT)
+                body_bytes = role_reply(debug_evaluation_text(body))
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
                 # 2026-09-11 第三十四轮 BUG-M1/M2:改用全量 user 语料(任务
                 # prompt + tool_result 内容)做路由匹配,call_no 用实例内计数,

@@ -107,7 +107,14 @@ impl QualityRunner {
              (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
              判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase / bash_exit_nonzero 信号,通常应判 Fail 并把对应信号写入 issues。",
         );
-        self.run_check(prompt, AgentRole::SubAgent, actual_output, session_id).await
+        self.run_check(
+            prompt,
+            AgentRole::SubAgent,
+            actual_output,
+            session_id,
+            Some(trace),
+        )
+        .await
     }
 
     /// 校验 Main-Work WorkFlow 计划(返回带 LLM Usage)。
@@ -120,7 +127,8 @@ impl QualityRunner {
         let prompt = format!(
             "【Quality-Check: Main-Work 单元】\n目标: {goal}\nWorkFlow JSON: {workflow_json}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。",
         );
-        self.run_check(prompt, AgentRole::MainWork, workflow_json, session_id).await
+        self.run_check(prompt, AgentRole::MainWork, workflow_json, session_id, None)
+            .await
     }
 
     /// 校验 Plan Markdown(返回带 LLM Usage)。
@@ -132,7 +140,8 @@ impl QualityRunner {
         let prompt = format!(
             "【Quality-Check: Plan 单元】\nPlan Markdown:\n{plan_markdown}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。",
         );
-        self.run_check(prompt, AgentRole::Plan, plan_markdown, session_id).await
+        self.run_check(prompt, AgentRole::Plan, plan_markdown, session_id, None)
+            .await
     }
 
     async fn run_check(
@@ -141,6 +150,7 @@ impl QualityRunner {
         source: AgentRole,
         actual: &str,
         session_id: &str,
+        trace: Option<&ExecutionTrace>,
     ) -> Result<(QualityReport, Usage)> {
         let mut sub_session = session::Session::new();
         sub_session.context_mut().push(ChatMessage::user(&prompt));
@@ -179,6 +189,10 @@ impl QualityRunner {
                 )
             }
         };
+        let report = match trace {
+            Some(trace) => gate_report_on_trace(report, source, trace),
+            None => report,
+        };
 
         let _ = memory::record_entry(
             &self.db,
@@ -186,13 +200,56 @@ impl QualityRunner {
             session_id,
             &format!("check source={}", source.as_str()),
             &format!("verdict={:?}", report.verdict),
-            if report.verdict == Verdict::Fail { Some(&report.suggestion) } else { None },
+            if report.verdict == Verdict::Fail {
+                Some(&report.suggestion)
+            } else {
+                None
+            },
             serde_json::json!({ "issues": &report.issues, "retryable": report.retryable }),
         );
 
         let _ = actual;
         Ok((report, usage))
     }
+}
+
+/// 用不可伪造的执行轨迹约束 Quality-Check 的“通过”结论。
+///
+/// LLM QC 是语义判断,但不能覆盖进程级事实:
+/// - 强失败信号(`is_failed()`)出现时,pass 一律降级为 fail;
+/// - Bash 非零退出是弱信号:若 QC 想把它解释为预期负例,必须提供非空 evidence;
+///   空 evidence 的 pass 视为无效质检,触发回流/失败收口。
+///
+/// 这样保留“命令预期失败”的测试空间,同时杜绝 D01Q4 这类 exit=1 被静默判成功。
+fn gate_report_on_trace(
+    report: QualityReport,
+    source: AgentRole,
+    trace: &ExecutionTrace,
+) -> QualityReport {
+    if report.verdict == Verdict::Fail {
+        return report;
+    }
+
+    let strong_failure = trace.is_failed();
+    let unevidenced_bash_failure =
+        trace.bash_exit_nonzero_count > 0 && report.evidence.trim().is_empty();
+    if !strong_failure && !unevidenced_bash_failure {
+        return report;
+    }
+
+    let issue = if strong_failure {
+        "执行轨迹包含强失败信号,Quality-Check 的 pass 结论被 trace 证据门拒绝".to_string()
+    } else {
+        "Bash 命令非零退出且 Quality-Check 未提供非空 evidence 说明预期性".to_string()
+    };
+    let mut gated = QualityReport::fail(
+        source,
+        vec![issue],
+        "请修正命令或产物后重跑;若非零退出是预期负例,Quality-Check 必须在 evidence 中说明。",
+        true,
+    );
+    gated.evidence = trace.render_prompt();
+    gated
 }
 
 /// 解析 Quality JSON 输出。
@@ -205,9 +262,10 @@ pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityRepo
         });
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        let mut r: QualityReport = crate::agent::json_repair::try_parse(json_str).map_err(|diag| {
-            crate::error::AgentError::Other(format!("Quality JSON 解析失败: {diag}"))
-        })?;
+        let mut r: QualityReport =
+            crate::agent::json_repair::try_parse(json_str).map_err(|diag| {
+                crate::error::AgentError::Other(format!("Quality JSON 解析失败: {diag}"))
+            })?;
         if r.source != source {
             r.source = source;
         }
@@ -229,7 +287,11 @@ fn extract_json_block(text: &str) -> Option<&str> {
     let end_marker = "```";
     let end = text[content_start..].find(end_marker)?;
     let json_text = &text[content_start..content_start + end].trim();
-    if json_text.is_empty() { None } else { Some(json_text) }
+    if json_text.is_empty() {
+        None
+    } else {
+        Some(json_text)
+    }
 }
 
 fn extract_standalone_json(text: &str) -> Option<&str> {
@@ -239,15 +301,29 @@ fn extract_standalone_json(text: &str) -> Option<&str> {
     let mut escape = false;
     let mut end = None;
     for (i, c) in text[start..].char_indices() {
-        if escape { escape = false; continue; }
-        if c == '\\' && in_string { escape = true; continue; }
-        if c == '"' { in_string = !in_string; continue; }
-        if in_string { continue; }
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
         match c {
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
-                if depth == 0 { end = Some(start + i + 1); break; }
+                if depth == 0 {
+                    end = Some(start + i + 1);
+                    break;
+                }
             }
             _ => {}
         }
@@ -268,12 +344,7 @@ mod tests {
 
     #[test]
     fn quality_report_fail_sets_retryable() {
-        let r = QualityReport::fail(
-            AgentRole::SubAgent,
-            vec!["x".into()],
-            "再试一次",
-            true,
-        );
+        let r = QualityReport::fail(AgentRole::SubAgent, vec!["x".into()], "再试一次", true);
         assert_eq!(r.verdict, Verdict::Fail);
         assert!(r.retryable);
         assert_eq!(r.suggestion, "再试一次");
@@ -349,5 +420,52 @@ mod tests {
         assert!(r.retryable);
         assert!(r.issues.iter().any(|i| i.contains("解析失败")));
         assert!(r.suggestion.contains("JSON"));
+    }
+
+    #[test]
+    fn trace_gate_rejects_empty_evidence_for_bash_nonzero() {
+        let mut trace = ExecutionTrace::default();
+        trace.bash_exit_nonzero_count = 1;
+        trace.last_bash_exit_code = 1;
+        trace.collect_failure_signals("完成");
+
+        let gated = gate_report_on_trace(
+            QualityReport::pass(AgentRole::SubAgent),
+            AgentRole::SubAgent,
+            &trace,
+        );
+
+        assert_eq!(gated.verdict, Verdict::Fail);
+        assert!(gated.retryable);
+        assert!(gated.evidence.contains("bash_exit_nonzero=1"));
+    }
+
+    #[test]
+    fn trace_gate_allows_expected_bash_nonzero_with_evidence() {
+        let mut trace = ExecutionTrace::default();
+        trace.bash_exit_nonzero_count = 1;
+        trace.last_bash_exit_code = 2;
+        trace.collect_failure_signals("负向用例按预期返回非零");
+
+        let mut report = QualityReport::pass(AgentRole::SubAgent);
+        report.evidence = "exit=2 是本负向用例的预期结果".into();
+        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace);
+
+        assert_eq!(gated.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn trace_gate_rejects_strong_failure_even_with_evidence() {
+        let mut trace = ExecutionTrace::default();
+        trace.early_terminated = true;
+        trace.early_terminate_reason = "max_iter:2".into();
+        trace.collect_failure_signals("完成");
+
+        let mut report = QualityReport::pass(AgentRole::SubAgent);
+        report.evidence = "模型解释这是预期情况".into();
+        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace);
+
+        assert_eq!(gated.verdict, Verdict::Fail);
+        assert!(gated.issues[0].contains("强失败信号"));
     }
 }

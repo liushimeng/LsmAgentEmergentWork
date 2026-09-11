@@ -46,16 +46,20 @@ pub const BLOCKED_HOSTNAMES: &[&str] = &[
 /// 4. IP 字面量 → 直接判私有性
 /// 5. 域名 → 本轮放行(不做 DNS);后续轮次补钉扎
 pub fn is_safe_endpoint(endpoint: &str) -> Result<()> {
-    if std::env::var("LAEW_ALLOW_PRIVATE_ENDPOINT")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
+    let allow_private = std::env::var("LAEW_ALLOW_PRIVATE_ENDPOINT").ok().as_deref() == Some("1");
+    is_safe_endpoint_with_override(endpoint, allow_private)
+}
+
+/// 在显式指定 override 状态下校验 endpoint。
+///
+/// 单元测试不能用 `std::env::set_var` 模拟 override:Rust 测试默认并发运行,
+/// 进程级环境变量会被其它 safety 用例观察到,造成偶发失败。
+fn is_safe_endpoint_with_override(endpoint: &str, allow_private: bool) -> Result<()> {
+    if allow_private {
         return Ok(());
     }
-    let url = url::Url::parse(endpoint).map_err(|e| {
-        ConfigError::UrlSafety(format!("URL 解析失败: {e}"))
-    })?;
+    let url = url::Url::parse(endpoint)
+        .map_err(|e| ConfigError::UrlSafety(format!("URL 解析失败: {e}")))?;
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -64,9 +68,9 @@ pub fn is_safe_endpoint(endpoint: &str) -> Result<()> {
             )));
         }
     }
-    let host = url.host_str().ok_or_else(|| {
-        ConfigError::UrlSafety("URL 缺少 host".to_string())
-    })?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| ConfigError::UrlSafety("URL 缺少 host".to_string()))?;
     check_hostname_safety(host)?;
     // IP 字面量直接判私有性;域名本轮放行(不做 DNS 解析,避免阻塞)。
     if let Ok(ip) = IpAddr::from_str(host) {
@@ -84,9 +88,7 @@ pub fn check_endpoint_safety(endpoint: &str) -> Result<()> {
 fn check_hostname_safety(host: &str) -> Result<()> {
     let lc = host.to_ascii_lowercase();
     if BLOCKED_HOSTNAMES.contains(&lc.as_str()) {
-        return Err(ConfigError::UrlSafety(format!(
-            "blocked hostname: {host}"
-        )));
+        return Err(ConfigError::UrlSafety(format!("blocked hostname: {host}")));
     }
     if lc.ends_with(".local") || lc.ends_with(".internal") {
         return Err(ConfigError::UrlSafety(format!(
@@ -112,22 +114,37 @@ fn check_v4_safety(v4: Ipv4Addr) -> Result<()> {
     let o = v4.octets();
     let range = |start: [u8; 4], end: [u8; 4]| o >= start && o <= end;
     if range([0, 0, 0, 0], [0, 255, 255, 255]) {
-        return Err(err_with_hint("0.0.0.0/8 当前网络/未指派", "公网 provider 才会命中"));
+        return Err(err_with_hint(
+            "0.0.0.0/8 当前网络/未指派",
+            "公网 provider 才会命中",
+        ));
     }
     if range([10, 0, 0, 0], [10, 255, 255, 255]) {
-        return Err(err_with_hint("10.0.0.0/8 私网", "局域网 / 内网网关 / Ollama 局域网访问"));
+        return Err(err_with_hint(
+            "10.0.0.0/8 私网",
+            "局域网 / 内网网关 / Ollama 局域网访问",
+        ));
     }
     if range([100, 64, 0, 0], [100, 127, 255, 255]) {
         return Err(err_with_hint("100.64.0.0/10 CGNAT", "运营商级 NAT 段"));
     }
     if range([127, 0, 0, 0], [127, 255, 255, 255]) {
-        return Err(err_with_hint("127.0.0.0/8 loopback", "本机 loopback;本地 Ollama / LMStudio / mock LLM 服务"));
+        return Err(err_with_hint(
+            "127.0.0.0/8 loopback",
+            "本机 loopback;本地 Ollama / LMStudio / mock LLM 服务",
+        ));
     }
     if range([169, 254, 0, 0], [169, 254, 255, 255]) {
-        return Err(err_with_hint("169.254.0.0/16 link-local(云元数据)", "云厂商元数据段"));
+        return Err(err_with_hint(
+            "169.254.0.0/16 link-local(云元数据)",
+            "云厂商元数据段",
+        ));
     }
     if range([172, 16, 0, 0], [172, 31, 255, 255]) {
-        return Err(err_with_hint("172.16.0.0/12 私网", "Docker bridge / k8s Pod IP / 局域网"));
+        return Err(err_with_hint(
+            "172.16.0.0/12 私网",
+            "Docker bridge / k8s Pod IP / 局域网",
+        ));
     }
     if range([192, 168, 0, 0], [192, 168, 255, 255]) {
         return Err(err_with_hint("192.168.0.0/16 私网", "家庭 / 公司局域网"));
@@ -152,7 +169,10 @@ fn check_v6_safety(v6: Ipv6Addr) -> Result<()> {
         return Err(err_with_hint(":: 未指定地址", "公网 provider 不会用"));
     }
     if v6.is_loopback() {
-        return Err(err_with_hint("::1 loopback", "本机 loopback;本地 Ollama / LMStudio / mock LLM 服务"));
+        return Err(err_with_hint(
+            "::1 loopback",
+            "本机 loopback;本地 Ollama / LMStudio / mock LLM 服务",
+        ));
     }
     if v6.is_multicast() {
         return Err(err_with_hint("ff00::/8 multicast", "组播地址"));
@@ -164,7 +184,10 @@ fn check_v6_safety(v6: Ipv6Addr) -> Result<()> {
     }
     // link-local fe80::/10 → 前 10 位 = 0b1111_1110_10
     if (s[0] & 0xffc0) == 0xfe80 {
-        return Err(err_with_hint("fe80::/10 link-local", "IPv6 链路本地段,仅同网段有效"));
+        return Err(err_with_hint(
+            "fe80::/10 link-local",
+            "IPv6 链路本地段,仅同网段有效",
+        ));
     }
     // IPv4-mapped IPv6 (::ffff:a.b.c.d) → 解包后再次判 IPv4 私网
     if let Some(v4) = ipv4_mapped(&v6) {
@@ -240,14 +263,7 @@ mod tests {
 
     #[test]
     fn private_ipv6_blocked() {
-        let cases = [
-            "::",
-            "::1",
-            "fc00::1",
-            "fd00::1",
-            "fe80::1",
-            "ff00::1",
-        ];
+        let cases = ["::", "::1", "fc00::1", "fd00::1", "fe80::1", "ff00::1"];
         for c in cases {
             assert!(
                 check_ip_safety(IpAddr::from_str(c).unwrap()).is_err(),
@@ -273,57 +289,64 @@ mod tests {
 
     #[test]
     fn endpoint_localhost_blocked() {
-        assert!(is_safe_endpoint("http://localhost:11434").is_err());
-        assert!(is_safe_endpoint("https://localhost/v1/messages").is_err());
-        assert!(is_safe_endpoint("http://LOCALHOST:8080").is_err());
+        assert!(is_safe_endpoint_with_override("http://localhost:11434", false).is_err());
+        assert!(is_safe_endpoint_with_override("https://localhost/v1/messages", false).is_err());
+        assert!(is_safe_endpoint_with_override("http://LOCALHOST:8080", false).is_err());
     }
 
     #[test]
     fn endpoint_private_ip_blocked() {
-        assert!(is_safe_endpoint("http://10.0.0.1:11434").is_err());
-        assert!(is_safe_endpoint("http://192.168.1.1/v1/messages").is_err());
-        assert!(is_safe_endpoint("http://169.254.169.254/latest/meta-data").is_err());
-        assert!(is_safe_endpoint("http://127.0.0.1:8080").is_err());
-        assert!(is_safe_endpoint("http://100.64.0.1").is_err());
+        assert!(is_safe_endpoint_with_override("http://10.0.0.1:11434", false).is_err());
+        assert!(is_safe_endpoint_with_override("http://192.168.1.1/v1/messages", false).is_err());
+        assert!(
+            is_safe_endpoint_with_override("http://169.254.169.254/latest/meta-data", false)
+                .is_err()
+        );
+        assert!(is_safe_endpoint_with_override("http://127.0.0.1:8080", false).is_err());
+        assert!(is_safe_endpoint_with_override("http://100.64.0.1", false).is_err());
     }
 
     #[test]
     fn endpoint_metadata_hostname_blocked() {
-        assert!(is_safe_endpoint("http://metadata.google.internal/computeMetadata").is_err());
+        assert!(is_safe_endpoint_with_override(
+            "http://metadata.google.internal/computeMetadata",
+            false
+        )
+        .is_err());
     }
 
     #[test]
     fn endpoint_local_suffix_blocked() {
-        assert!(is_safe_endpoint("http://myserver.local:8080").is_err());
-        assert!(is_safe_endpoint("http://db.internal:5432").is_err());
+        assert!(is_safe_endpoint_with_override("http://myserver.local:8080", false).is_err());
+        assert!(is_safe_endpoint_with_override("http://db.internal:5432", false).is_err());
     }
 
     #[test]
     fn endpoint_scheme_blocked() {
-        assert!(is_safe_endpoint("ftp://example.com/key").is_err());
-        assert!(is_safe_endpoint("file:///etc/passwd").is_err());
+        assert!(is_safe_endpoint_with_override("ftp://example.com/key", false).is_err());
+        assert!(is_safe_endpoint_with_override("file:///etc/passwd", false).is_err());
     }
 
     #[test]
     fn endpoint_public_ok() {
-        assert!(is_safe_endpoint("https://api.anthropic.com").is_ok());
-        assert!(is_safe_endpoint("https://api.openai.com/v1").is_ok());
-        assert!(is_safe_endpoint("https://example.com:8443/v1/messages").is_ok());
+        assert!(is_safe_endpoint_with_override("https://api.anthropic.com", false).is_ok());
+        assert!(is_safe_endpoint_with_override("https://api.openai.com/v1", false).is_ok());
+        assert!(
+            is_safe_endpoint_with_override("https://example.com:8443/v1/messages", false).is_ok()
+        );
     }
 
     #[test]
     fn endpoint_allow_private_override() {
-        std::env::set_var("LAEW_ALLOW_PRIVATE_ENDPOINT", "1");
-        assert!(is_safe_endpoint("http://10.0.0.1:11434").is_ok());
-        assert!(is_safe_endpoint("http://192.168.1.1").is_ok());
-        std::env::remove_var("LAEW_ALLOW_PRIVATE_ENDPOINT");
+        assert!(is_safe_endpoint_with_override("http://10.0.0.1:11434", true).is_ok());
+        assert!(is_safe_endpoint_with_override("http://192.168.1.1", true).is_ok());
     }
 
     #[test]
     fn endpoint_loopback_error_includes_escape_hatch_hint() {
         // 第二十五轮 F04/B07 测试:URL 安全检查被拒时,文案必须告知 escape hatch,
         // 让本地 Ollama / LMStudio / mock LLM 用户立刻知道有解(2026-09-10)。
-        let err = is_safe_endpoint("http://127.0.0.1:11434").unwrap_err();
+        let err = is_safe_endpoint_with_override("http://127.0.0.1:11434", false).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("LAEW_ALLOW_PRIVATE_ENDPOINT"),

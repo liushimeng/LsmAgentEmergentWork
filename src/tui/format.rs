@@ -87,7 +87,10 @@ pub(crate) fn format_task_result(
             cache.push_str(&format!("  cache_read={}", usage.cache_read_input_tokens));
         }
         if usage.cache_creation_input_tokens > 0 {
-            cache.push_str(&format!("  cache_creation={}", usage.cache_creation_input_tokens));
+            cache.push_str(&format!(
+                "  cache_creation={}",
+                usage.cache_creation_input_tokens
+            ));
         }
         // 任务总耗时(2026-09-10 第 27 轮 F05 / tmpPlan/2026-09-10_22):
         // 由 print_task_result 调用方从 self.task_started_at.take() 传入,这里直接拼接。
@@ -99,9 +102,67 @@ pub(crate) fn format_task_result(
             usage.input_tokens, usage.output_tokens, cache, elapsed_suffix
         ));
     }
-    out
+    sanitize_terminal_controls(&out)
 }
 
+/// 清理人类可读任务结果中的终端控制序列。
+///
+/// Bash/Vim 等外部工具可能把 CSI 光标移动、OSC 标题、退格等控制字节混入 stdout。
+/// 这些字节如果直接 `println!`,会移动光标、覆盖 TUI 底部输入面板,甚至破坏导出文本。
+/// 该函数只作用于人类版/导出版;`format_task_result_for_context` 不调用它,
+/// 避免改变模型看到的原始工具语义。
+pub(crate) fn sanitize_terminal_controls(input: &str) -> String {
+    let mut chars = input.chars().peekable();
+    let mut out = String::with_capacity(input.len());
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek().copied() {
+                // CSI: ESC [ params... final(0x40..=0x7e)
+                Some('[') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('\u{0040}'..='\u{007e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... BEL,或 ESC ] ... ESC \。终止符一并消费。
+                Some(']') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\u{0007}' {
+                            break;
+                        }
+                        if next == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // 两字符 ESC 序列(如 ESC M)。
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            // 输出已按 LF 组织,CR 只会触发覆盖式回绘,丢弃。
+            '\r' => {}
+            '\n' | '\t' => out.push(c),
+            c if ('\u{0000}'..='\u{001f}').contains(&c) => {
+                let n = c as u32;
+                out.push('^');
+                out.push(char::from_u32(0x40 + n).unwrap_or('?'));
+            }
+            '\u{007f}' => out.push_str("^?"),
+            c if ('\u{0080}'..='\u{009f}').contains(&c) => {
+                out.push_str(&format!("<U+{:04X}>", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// 构造 Assistant 回填到 LLM 主上下文的精简文本(2026-09-11 第三十轮 BA01/CA31 测试修复)。
 ///
@@ -147,16 +208,11 @@ pub(crate) fn format_task_result_for_context(
         // QC verdict:让下轮 LLM 知道上次是否通过质检,指导是否需要重做。
         // 单行精简表达,避免占用过多 token。
         let (verdict_text, issues_text) = match wf.quality_report.verdict {
-            crate::agent::quality::Verdict::Pass => {
-                ("(质检通过)".to_string(), String::new())
-            }
+            crate::agent::quality::Verdict::Pass => ("(质检通过)".to_string(), String::new()),
             crate::agent::quality::Verdict::Fail => {
                 let mut issues_str = String::new();
                 if !wf.quality_report.issues.is_empty() {
-                    issues_str = format!(
-                        ";问题:{}",
-                        wf.quality_report.issues.join("; ")
-                    );
+                    issues_str = format!(";问题:{}", wf.quality_report.issues.join("; "));
                 }
                 ("(质检未通过)".to_string(), issues_str)
             }
@@ -307,7 +363,9 @@ fn truncate(s: &str, max_len: usize) -> String {
         let mut w = 0u16;
         for c in s.chars() {
             let cw = crate::tui::input::char_width(c);
-            if w + cw > max_len as u16 { break; }
+            if w + cw > max_len as u16 {
+                break;
+            }
             out.push(c);
             w += cw;
         }
@@ -424,7 +482,10 @@ mod waiting_line_text_tests {
     #[test]
     fn stage_waiting_line_label_and_elapsed() {
         let s = waiting_line_text(Some("wf-1 SubAgent 执行中…"), '⠧', 8);
-        assert!(s.starts_with("  [waiting] wf-1 SubAgent 执行中…  ⠧  (8s)"), "got: {s}");
+        assert!(
+            s.starts_with("  [waiting] wf-1 SubAgent 执行中…  ⠧  (8s)"),
+            "got: {s}"
+        );
     }
 
     #[test]
@@ -444,6 +505,29 @@ mod waiting_line_text_tests {
 }
 
 #[cfg(test)]
+mod terminal_control_sanitizer_tests {
+    use super::*;
+
+    #[test]
+    fn strips_csi_and_osc_sequences() {
+        let input = "before\u{1b}[24;1Hmiddle\u{1b}]0;title\u{07}after";
+        assert_eq!(sanitize_terminal_controls(input), "beforemiddleafter");
+    }
+
+    #[test]
+    fn preserves_newline_and_tab() {
+        assert_eq!(sanitize_terminal_controls("a\tb\nc"), "a\tb\nc");
+    }
+
+    #[test]
+    fn renders_isolated_control_bytes_without_terminal_side_effects() {
+        let output = sanitize_terminal_controls("a\u{0008}b\u{0000}c\u{007f}");
+        assert_eq!(output, "a^Hb^@c^?");
+        assert!(!output.chars().any(|c| c.is_control()));
+    }
+}
+
+#[cfg(test)]
 mod format_task_result_for_context_tests {
     use super::*;
     use crate::agent::orchestrator::{TaskResult, WorkflowResult};
@@ -456,7 +540,11 @@ mod format_task_result_for_context_tests {
             name: "测试单元".into(),
             subflow_outcome: subflow_outcome.into(),
             quality_report: QualityReport {
-                verdict: if qc_pass { Verdict::Pass } else { Verdict::Fail },
+                verdict: if qc_pass {
+                    Verdict::Pass
+                } else {
+                    Verdict::Fail
+                },
                 issues: issues.into_iter().map(|s| s.to_string()).collect(),
                 suggestion: String::new(),
                 retryable: false,
@@ -559,7 +647,10 @@ mod format_task_result_for_context_tests {
         assert!(ctx.contains("first answer"), "first answer 应在结果中");
         assert!(ctx.contains("second answer"), "second answer 应在结果中");
         // 两个 WorkFlow 之间用空行分隔(中间夹 QC 标记)
-        assert!(ctx.contains("(质检通过)\n\nsecond answer"), "空行分隔两个 WorkFlow,实际: {ctx}");
+        assert!(
+            ctx.contains("(质检通过)\n\nsecond answer"),
+            "空行分隔两个 WorkFlow,实际: {ctx}"
+        );
     }
 
     #[test]

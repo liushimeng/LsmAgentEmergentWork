@@ -69,6 +69,11 @@ pub struct TuiSession {
     pub task_started_at: Option<std::time::Instant>,
 }
 
+/// 清理外部工具/模型输出中的终端控制序列,供 `-p` 与 TUI 共用。
+pub fn sanitize_terminal_controls(input: &str) -> String {
+    format::sanitize_terminal_controls(input)
+}
+
 impl TuiSession {
     pub fn bootstrap() -> Result<Self> {
         Self::bootstrap_with_debug(false)
@@ -108,7 +113,13 @@ impl TuiSession {
     }
 
     pub fn print_banner(&self) {
-        let active = self.db.lock().expect("db").get_active_or_env().ok().flatten();
+        let active = self
+            .db
+            .lock()
+            .expect("db")
+            .get_active_or_env()
+            .ok()
+            .flatten();
         println!("╔══════════════════════════════════════════════════════════╗");
         println!(
             "║  LsmAgentEmergentWork  ·  laew  TUI  ·  v{}           ║",
@@ -154,7 +165,10 @@ impl TuiSession {
         let active_theme = crate::tui::theme::active_kind();
         println!(
             "║  主  题 : {} ║",
-            fit_display(&format!("{}  (切换 /theme [kind])", active_theme.as_str()), 46)
+            fit_display(
+                &format!("{}  (切换 /theme [kind])", active_theme.as_str()),
+                46
+            )
         );
         println!("╚══════════════════════════════════════════════════════════╝");
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
