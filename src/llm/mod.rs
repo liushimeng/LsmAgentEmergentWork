@@ -16,6 +16,7 @@ use crate::error::{AgentError, Result};
 pub mod anthropic;
 pub mod cache_policy;
 pub mod cancellable;
+pub mod offline;
 pub mod openai;
 pub mod resilient;
 pub mod sse;
@@ -30,6 +31,7 @@ pub use cache_policy::{
 /// 客户端消费它(第十六轮 L1047)。
 pub const DEFAULT_CACHE_POLICY: CachePolicy = CachePolicy::Auto;
 
+pub use offline::{Connectivity, ConnectivitySnapshot, ConnectivityTracker, DEGRADED_THRESHOLD, OFFLINE_THRESHOLD};
 use resilient::{ResilientLlmClient, CONNECT_TIMEOUT};
 
 /// 统一的 HTTP 客户端构造入口:注入连接超时(防连接挂起导致 TUI 冻结)。

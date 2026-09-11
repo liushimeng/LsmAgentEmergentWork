@@ -20,6 +20,7 @@ pub mod json_repair;
 pub mod main_work;
 pub mod max_tokens_state;
 pub mod memory;
+pub mod offline_queue;
 pub mod orchestrator;
 pub mod overflow;
 pub mod partial_json;

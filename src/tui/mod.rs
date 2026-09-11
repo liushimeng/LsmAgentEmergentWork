@@ -20,9 +20,10 @@ use std::sync::Mutex;
 use anyhow::Result;
 
 use crate::agent::debug::{DebugCollector, DebugLlmClient};
+use crate::agent::offline_queue::OfflineQueue;
 use crate::agent::orchestrator::MultiAgentOrchestrator;
 use crate::config::{Db, Paths};
-use crate::llm::{client_from_record, ChatMessage};
+use crate::llm::{client_from_record, ChatMessage, Connectivity, ConnectivityTracker};
 use crate::session::Session;
 
 pub mod branches;
@@ -67,6 +68,10 @@ pub struct TuiSession {
     /// 当前任务开始时间戳(2026-09-10 第 27 轮 F05):handle_normal_prompt 入口
     /// 设置 Some,print_usage 后清回 None;Some 期间 print_usage 追加「(耗时 Ns)」。
     pub task_started_at: Option<std::time::Instant>,
+    /// D13 离线模式(2026-09-11):连接状态跟踪器,与 ResilientLlmClient 共享。
+    pub connectivity: std::sync::Arc<ConnectivityTracker>,
+    /// D13 离线模式(2026-09-11):离线请求队列,LLM 不可达时暂存用户输入。
+    pub offline_queue: OfflineQueue,
 }
 
 /// 清理外部工具/模型输出中的终端控制序列,供 `-p` 与 TUI 共用。
@@ -87,8 +92,14 @@ impl TuiSession {
         let plans_dir = paths.root_dir.join("plans");
         let session = Session::new();
         let collector = debug.then(|| Arc::new(DebugCollector::new(session.id())));
-        let (orchestrator, debug_llm_raw) =
-            build_orchestrator_with_active(&db, plans_dir, collector.clone())?;
+        // D13 离线模式:创建连接状态跟踪器(TUI 侧持有,基于任务结果更新)。
+        let connectivity = std::sync::Arc::new(ConnectivityTracker::new());
+        let (orchestrator, debug_llm_raw) = build_orchestrator_with_active_shared(
+            &db,
+            plans_dir,
+            collector.clone(),
+            connectivity.clone(),
+        )?;
         Ok(Self {
             paths,
             db,
@@ -100,13 +111,21 @@ impl TuiSession {
             session_usage: crate::llm::Usage::default(),
             branches: BranchStore::new(),
             task_started_at: None,
+            connectivity,
+            offline_queue: OfflineQueue::new(),
         })
     }
 
     /// 按当前 active provider 重建 orchestrator(debug 模式同时刷新原始 LLM 引用)。
+    /// D13:复用已有 ConnectivityTracker,避免重建后丢失连接状态。
     fn rebuild_orchestrator(&mut self) -> Result<()> {
         let plans_dir = self.paths.root_dir.join("plans");
-        let (orch, raw) = build_orchestrator_with_active(&self.db, plans_dir, self.debug.clone())?;
+        let (orch, raw) = build_orchestrator_with_active_shared(
+            &self.db,
+            plans_dir,
+            self.debug.clone(),
+            self.connectivity.clone(),
+        )?;
         self.orchestrator = orch;
         self.debug_llm_raw = raw;
         Ok(())
@@ -170,10 +189,45 @@ impl TuiSession {
                 46
             )
         );
+        // D13 离线模式(2026-09-11):连接状态行
+        let conn_line = Self::connectivity_status_line(&self.connectivity, &self.offline_queue);
+        println!("║  连  接 : {} ║", fit_display(&conn_line, 45));
         println!("╚══════════════════════════════════════════════════════════╝");
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
         println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出");
         println!();
+    }
+
+    /// D13 离线模式:生成连接状态行文本(供横幅显示)。
+    fn connectivity_status_line(
+        connectivity: &std::sync::Arc<ConnectivityTracker>,
+        queue: &OfflineQueue,
+    ) -> String {
+        let snap = connectivity.snapshot();
+        match snap.state {
+            Connectivity::Online => {
+                if queue.is_empty() {
+                    "Online ✓".to_string()
+                } else {
+                    format!("Online ✓ (队列残留 {} 条)", queue.len())
+                }
+            }
+            Connectivity::Degraded => {
+                let kind = snap
+                    .last_network_error_kind
+                    .as_deref()
+                    .unwrap_or("网络不稳");
+                format!("Degraded ⚠ ({kind}, {} 次)", snap.consecutive_network_errors)
+            }
+            Connectivity::Offline => {
+                let queued = queue.len();
+                if queued > 0 {
+                    format!("Offline ✗ (已排队 {queued} 条)")
+                } else {
+                    "Offline ✗".to_string()
+                }
+            }
+        }
     }
 
     /// 切换当前 provider(根据 id),并重新构造 MultiAgentOrchestrator
@@ -270,10 +324,13 @@ impl TuiSession {
 /// 启动 MultiAgentOrchestrator(6 角色);若未配置,使用占位提示信息。
 /// `debug` 为 Some 时:LLM 客户端包 DebugLlmClient 装饰器并注入采集器,
 /// 同时返回未装饰的原始客户端(供 Debug Agent 评估使用)。
-fn build_orchestrator_with_active(
+/// `connectivity` 为 TUI 侧共享的连接状态跟踪器(D13 离线模式),
+/// 由 dispatch_prompt 基于任务结果更新,无需注入 LLM 层(保持 LLM 层纯粹)。
+fn build_orchestrator_with_active_shared(
     db: &Arc<Mutex<Db>>,
     plans_dir: PathBuf,
     debug: Option<Arc<DebugCollector>>,
+    _connectivity: std::sync::Arc<ConnectivityTracker>,
 ) -> Result<(
     MultiAgentOrchestrator,
     Option<Arc<dyn crate::llm::LlmClient>>,

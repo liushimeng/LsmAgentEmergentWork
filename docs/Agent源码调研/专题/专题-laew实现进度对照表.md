@@ -516,3 +516,31 @@ E07 4 轮(-debug,预期负例契约达成 + processed=100)TUI 全过;cargo test 
 
 **方案**:`tmpPlan/2026-09-11_DJ06-Linux离线批量巡检测试与mock多步工具链方案.md`
 **产物落盘**:`tmpPlan/agent-test/dj06/`(21 文件)+ `plans/20260911-163951-*.md` + `DebugReport/debug_report_20260911_163951_6c5630.md` + `testReport/{mock_server_DJ06,laew_dj06_run}.log` + `tests/prompt_router_dj06.json`
+
+---
+
+# 第二十轮(2026-09-11)D13 离线模式与连接韧性增强登记
+
+**主题**:第十九轮 D13 离线模式 P0 落地(离线检测 + 请求队列 + TUI 状态显示)。laew 此前网络错误时直接走完整重试链(≈30s)后上抛晦涩错误,用户无感知、无队列、无状态可视化。本轮落地三组件:被动离线检测(Online/Degraded/Offline 三态)、有界内存队列(默认 50 条)、TUI 横幅状态行 + dispatch 层自动入队/恢复 flush。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| L1821-L1830 | D13-1 离线检测(被动检测三态状态机) | P1 | ✅ | `src/llm/offline.rs`(ConnectivityTracker:Online/Degraded/Offline + record_network_error/record_success/snapshot + DEGRADED_THRESHOLD=2/OFFLINE_THRESHOLD=5 对齐熔断器)、`src/tui/dispatch.rs::update_connectivity_from_result`(任务结果驱动状态更新:网络错误分类累计 / 成功复位) | 2026-09-11 第二十轮 |
+| L1831-L1840 | D13-2 请求队列(有界内存队列 + 自动 flush) | P1 | ✅ | `src/agent/offline_queue.rs`(OfflineQueue + QueuedRequest + QueueFull + DEFAULT_QUEUE_CAPACITY=50 + LAEW_OFFLINE_QUEUE_CAP 环境变量覆盖)、`src/tui/dispatch.rs`(dispatch_prompt 入口:Offline→入队返回 / Online/Degraded→flush 一条队列头部) | 2026-09-11 第二十轮 |
+| L1871-L1880 | D13-6 TUI 状态显示(横幅 + 斜杠命令) | P1 | ✅ | `src/tui/mod.rs`(TuiSession.connectivity/offline_queue 字段 + print_banner 连接状态行 + connectivity_status_line 辅助)、`src/tui/slash.rs`(`/offline` `/status` 命令 + run_offline_status 方法)、`src/tui/completion.rs`(补全注册) | 2026-09-11 第二十轮 |
+
+**设计要点**:
+- **被动检测**:不发心跳 ping,基于真实 LLM 调用结果推断连接状态(零 API 成本);恢复由用户下一笔输入触发。
+- **三态状态机**:Online → Degraded(≥2 次) → Offline(≥5 次) → Online(成功)。
+- **队列内存态**:退出即弃,有界 50 条(防内存溢出),满则拒绝并提示。
+- **dispatch 层集成**:离线时入队跳过 LLM 调用(避免 30s 重试链浪费);恢复时 flush 队列头部(逐条避免递归顺序错乱)。
+- **LLM 层零改动**:ConnectivityTracker 由 TUI 侧持有,dispatch 层基于任务结果更新,不侵入 `LlmClient` trait / `ResilientLlmClient`。
+
+**验证**:
+- 单元测试 770 全过(新增 17 项:offline.rs 10 项 + offline_queue.rs 7 项,从 753→770)。
+- e2e `run_e2e.sh` PASS=156 FAIL=0(基线一致,无回归)。
+- 方案 `tmpPlan/2026-09-11_19-D13离线模式与连接韧性增强方案.md`。
+
+**未做(后续候选)**:L1841-L1850 本地缓存 / L1851-L1860 队列持久化 / L1861-L1870 同步合并 / 队列优先级。
+
+**累计**:本轮新增 3 ✅(L1821-L1830/L1831-L1840/L1871-L1880),累计实现 gap 持续增长。

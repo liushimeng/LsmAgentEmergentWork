@@ -158,6 +158,10 @@ impl TuiSession {
             "switch" => {
                 self.run_switch(rest_args);
             }
+            // D13 离线模式状态查看(2026-09-11):显示连接状态、最近错误、队列深度。
+            "offline" | "status" => {
+                self.run_offline_status();
+            }
             "" => {}
             other => {
                 // 内置未命中 → 查自定义命令(D2);命中则渲染模板并送编排。
@@ -229,6 +233,38 @@ impl TuiSession {
                 println!("  输入 /theme 查看主题列表与说明。");
             }
         }
+    }
+
+    /// `/offline` 或 `/status`(D13,2026-09-11):显示连接状态与离线队列。
+    fn run_offline_status(&self) {
+        let snap = self.connectivity.snapshot();
+        println!("  连接状态: {}", snap.state.as_str());
+        match snap.state {
+            crate::llm::Connectivity::Online => {
+                if snap.consecutive_network_errors > 0 {
+                    println!("  (近期错误已复位,连续 {} 次)", snap.consecutive_network_errors);
+                }
+            }
+            crate::llm::Connectivity::Degraded | crate::llm::Connectivity::Offline => {
+                println!("  连续网络错误: {} 次", snap.consecutive_network_errors);
+                if let (Some(kind), Some(secs)) =
+                    (&snap.last_network_error_kind, snap.last_network_error_ago_secs)
+                {
+                    println!("  最近错误: {kind} ({secs}s 前)");
+                }
+                println!("  阈值: {} 次 → Degraded, {} 次 → Offline",
+                    crate::llm::DEGRADED_THRESHOLD,
+                    crate::llm::OFFLINE_THRESHOLD);
+            }
+        }
+        let qlen = self.offline_queue.len();
+        if qlen > 0 {
+            println!("  离线队列: {}/{} 条 (恢复后输入任意提示词触发 flush)",
+                qlen, self.offline_queue.capacity());
+        } else {
+            println!("  离线队列: 空 (容量 {})", self.offline_queue.capacity());
+        }
+        println!("  提示:离线时输入自动排队,恢复连接后逐条自动处理。");
     }
 
     /// `/rewind [N]`(D3,2026-09-10 第二十四轮):列出轮次或回退到第 N 轮之前。

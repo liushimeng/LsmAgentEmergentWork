@@ -62,8 +62,31 @@ impl TuiSession {
         } else {
             prompt
         };
+        // D13 离线模式(2026-09-11):
+        // - Offline → 入队跳过 LLM 调用(避免浪费 30s 重试链),等恢复后 flush;
+        // - Online/Degraded 且有积压队列 → 本条用户输入触发 flush 一条队列头部
+        //   (逐条 flush 避免递归 dispatch 导致顺序错乱,用户当前提示词顺延到下一笔)。
+        let queued_req = if !self.connectivity.should_attempt_llm() {
+            // 离线:当前提示词入队
+            return self.enqueue_offline(raw, prompt).await;
+        } else if !self.offline_queue.is_empty() {
+            // 恢复:flush 一条队列头部(如有)
+            self.offline_queue.drain().into_iter().next()
+        } else {
+            None
+        };
+        let (effective_raw, effective_prompt, is_flush) = match &queued_req {
+            Some(req) => {
+                println!(
+                    "  [离线] 恢复连接,flush 队列第 1 条(剩余 {} 条)",
+                    self.offline_queue.len()
+                );
+                (req.raw.as_str(), req.prompt.as_str(), true)
+            }
+            None => (raw, prompt, false),
+        };
         // 普通提示词:Orchestrator 编排(可取消:Ctrl-C 经 SIGINT 自动感知,零新增命令)
-        self.session.context_mut().push(ChatMessage::user(prompt));
+        self.session.context_mut().push(ChatMessage::user(effective_prompt));
         // debug 模式:每个任务开始前重置采集器
         if let Some(collector) = &self.debug {
             collector.reset(self.session.id());
@@ -237,9 +260,11 @@ impl TuiSession {
         let _ = stage_printer.await;
         // debug 模式:任务结束(无论成败)后生成 Debug 报告
         if let (Some(collector), Some(raw_llm)) = (&self.debug, &self.debug_llm_raw) {
-            self.emit_debug_report(collector, raw_llm.clone(), prompt, &handle_result)
+            self.emit_debug_report(collector, raw_llm.clone(), effective_prompt, &handle_result)
                 .await;
         }
+        // D13:任务结束更新连接状态(基于最终结果)。
+        self.update_connectivity_from_result(&handle_result, is_flush);
         // 终态:屏幕输出 + transcript 记录(outcome, response, 本轮用量)
         let entry = match &handle_result {
             Ok(OrchestrationOutcome::DirectAnswer { text, usage, .. }) => {
@@ -347,8 +372,8 @@ impl TuiSession {
                 .push(crate::llm::ChatMessage::assistant(blocks));
             self.transcript.push(TranscriptEntry {
                 ts: turn_ts,
-                raw_input: raw.to_string(),
-                prompt: prompt.to_string(),
+                raw_input: effective_raw.to_string(),
+                prompt: effective_prompt.to_string(),
                 response: transcript_response,
                 usage,
                 outcome,
@@ -521,4 +546,123 @@ impl TuiSession {
             self.task_started_at = None;
         }
     }
+
+    // ========================================================================
+    // D13 离线模式(2026-09-11):离线入队 / 连接状态更新
+    // ========================================================================
+
+    /// 离线时将当前提示词入队,返回 Ok(false) 提示用户。
+    async fn enqueue_offline(&self, raw: &str, prompt: &str) -> Result<bool> {
+        match self
+            .offline_queue
+            .enqueue(prompt.to_string(), raw.to_string())
+        {
+            Ok(()) => {
+                println!(
+                    "  [离线] Provider 不可达,已排队 #{} (恢复后自动处理)",
+                    self.offline_queue.len()
+                );
+                Ok(false)
+            }
+            Err(crate::agent::offline_queue::QueueFull(cap)) => {
+                eprintln!("  [离线] 队列已满({cap}),请稍后再试");
+                Ok(false)
+            }
+        }
+    }
+
+    /// 任务结束后更新连接状态(被动检测核心逻辑)。
+    fn update_connectivity_from_result(
+        &self,
+        result: &std::result::Result<OrchestrationOutcome, crate::error::AgentError>,
+        is_flush: bool,
+    ) {
+        match result {
+            Ok(OrchestrationOutcome::DirectAnswer { .. })
+            | Ok(OrchestrationOutcome::Executed { .. }) => {
+                // 任务成功 → 网络可达,复位连接状态。
+                self.connectivity.record_success();
+            }
+            Ok(OrchestrationOutcome::Failed { reason, .. }) => {
+                // 编排层失败:检查 reason 是否网络类。
+                if looks_like_network_failure(reason) {
+                    self.connectivity.record_network_error(
+                        categorize_failure_reason(reason),
+                    );
+                } else {
+                    // 非网络失败(如 Yolo 解析失败 / 任务逻辑失败)→ 网络可达。
+                    self.connectivity.record_success();
+                }
+            }
+            Err(e) => match e {
+                crate::error::AgentError::LlmNetwork(_) => {
+                    self.connectivity
+                        .record_network_error("llm_network");
+                }
+                crate::error::AgentError::LlmHttp { status, .. } => {
+                    // 5xx 视为 Provider 不可达;4xx(除 429/408)视为服务可达。
+                    if *status == 502 || *status == 503 || *status == 504 || *status == 429
+                    {
+                        self.connectivity
+                            .record_network_error(format!("http_{status}"));
+                    } else {
+                        // 4xx 其他(401/400/422)→ 服务可达,网络正常。
+                        self.connectivity.record_success();
+                    }
+                }
+                crate::error::AgentError::Cancelled => {
+                    // 取消不影响连接状态。
+                }
+                // 其他错误(Yolo 解析失败等)→ 服务可达。
+                _ => {
+                    self.connectivity.record_success();
+                }
+            },
+        }
+        // D13:如果是 flush 队列的任务,记录恢复探测日志。
+        if is_flush {
+            let state = self.connectivity.state();
+            match state {
+                crate::llm::Connectivity::Online => {
+                    // 静默:恢复成功无需提示(横幅会显示 Online)。
+                }
+                crate::llm::Connectivity::Degraded | crate::llm::Connectivity::Offline => {
+                    println!("  [离线] 探测仍失败,保持离线状态");
+                }
+            }
+        }
+    }
+}
+
+/// 判断编排层失败原因是否网络类(用于 D13 连接状态更新)。
+fn looks_like_network_failure(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    lower.contains("network")
+        || lower.contains("connection")
+        || lower.contains("timeout")
+        || lower.contains("refused")
+        || lower.contains("reset")
+        || lower.contains("dns")
+        || lower.contains("unreachable")
+        || lower.contains("llm")
+        || lower.contains("http")
+}
+
+/// 分类失败原因生成简短标签(用于 ConnectivityTracker 展示)。
+fn categorize_failure_reason(reason: &str) -> String {
+    let lower = reason.to_lowercase();
+    if lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("refused") || lower.contains("connection") {
+        "connection_refused"
+    } else if lower.contains("dns") || lower.contains("resolve") {
+        "dns_error"
+    } else if lower.contains("reset") {
+        "connection_reset"
+    } else if lower.contains("http") || lower.contains("503") || lower.contains("502") {
+        "http_error"
+    } else {
+        "network"
+    }
+    .to_string()
 }

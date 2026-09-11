@@ -114,6 +114,13 @@ impl CompletionEngine {
                 "切换到指定分支(切换前自动快照当前对话)",
                 "/switch <name>",
             ),
+            // D13 离线模式(2026-09-11):连接状态查看
+            SlashCommand::builtin(
+                "offline",
+                &["status"],
+                "查看连接状态与离线队列",
+                "/offline",
+            ),
         ];
         Self { builtin, custom: Vec::new() }
     }
