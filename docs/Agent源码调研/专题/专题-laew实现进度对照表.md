@@ -48,6 +48,7 @@
 | 功能 | 对应知识库维度 | 实现位置 | 提交 |
 |------|--------------|---------|------|
 | Bash 危险命令拦截 + 敏感路径(fail-closed) | 权限管控/沙箱(P0) | `agent/permissions/{dangerous,sensitive}.rs` | ef84cec |
+| Bash 敏感路径 word-boundary 细化(2026-09-12 第 47 轮 P1-1 修复):SSH 私钥文件名(`id_rsa` 等)+ 配置文件(`.netrc` `.gitconfig` 等)改用 word-boundary 匹配,避免 openssl `-newkey rsa:2048` 子串误中;证书扩展名(`.pem` `.p12` 等)需文件名型匹配,openssl/curl 写入参数(`-keyout` `-out` 等)白名单放行;新增 16 项单元测试覆盖 `allows_openssl_rsa_keygen` / `blocks_certificates` 等 | 第十七轮 openclaw §11.0 误报 P1 + 第一轮 SSH 私钥子串误中 P1-1 | `src/agent/permissions/sensitive.rs`(word-boundary 函数 + openssl 写入 flag 白名单 + 扩展名型 marker + `is_after_openssl_write_flag`) | 2026-09-12 第 47 轮 |
 | Bash 超时 + 进程组管理(setsid+killpg+kill_on_drop)+ 输出截断 | 第七轮 Bash 专题 | `agent/tools/bash.rs` | ef84cec |
 | SubFlow 失败检测增强 | SubAgent 调度/质检专题 | `agent/subagent.rs` | d439f23 |
 | Quality 解析失败 fail-closed | 质检机制专题(P0) | `agent/quality.rs` | d439f23 |
