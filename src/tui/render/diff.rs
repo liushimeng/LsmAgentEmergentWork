@@ -327,10 +327,85 @@ impl DiffLine {
 }
 
 /// 便捷函数:从两个文件路径读文件并 diff。
+///
+/// 2026-09-12 第 44 轮:Windows + Git Bash 下,用户/脚本传入的 `/tmp/xxx`
+/// 这种 POSIX 路径 Windows 不认识(MSYS shell 会自动转换,但 Rust std::fs
+/// 不会),所以读不到。这里加一层「msys 风格路径 → Windows 路径」的
+/// 兼容转换,使 e2e 脚本和 Git Bash 用户都能直接传 `/tmp/old.rs`。
 pub fn diff_files(old_path: &str, new_path: &str) -> std::io::Result<DiffHunk> {
-    let old_text = std::fs::read_to_string(old_path)?;
-    let new_text = std::fs::read_to_string(new_path)?;
+    let old_resolved = resolve_unix_style_path(old_path);
+    let new_resolved = resolve_unix_style_path(new_path);
+    let old_text = std::fs::read_to_string(&old_resolved).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("读取 {old_path}(尝试 {old_resolved:?}): {e}"),
+        )
+    })?;
+    let new_text = std::fs::read_to_string(&new_resolved).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("读取 {new_path}(尝试 {new_resolved:?}): {e}"),
+        )
+    })?;
     Ok(compute_diff(&old_text, &new_text, old_path, new_path))
+}
+
+/// 把 `/tmp/x`、`/c/Users/...`、`/home/...` 等 POSIX 风格路径在
+/// Windows 下转换为实际可访问的 Windows 路径;其他平台/已可访问
+/// 路径原样返回。
+///
+/// 仅做最常见的 MSYS / Git Bash 兼容(2026-09-12 第 44 轮):
+/// - `/tmp/<x>`     → `%TMP%\<x>`(若原路径不存在 + TMP/TEMP 环境变量可用)
+/// - `/c/<rest>`    → `C:\<rest>`(MSYS2 /Git Bash 常见挂载点)
+/// - `/<x>` (其他) → `\<x>`(允许「根盘符」用法,但通常交给后续 std::fs 判定)
+///
+/// 转换后再次探测存在性,只有原路径不可读而转换后可读时才使用转换结果。
+fn resolve_unix_style_path(p: &str) -> String {
+    use std::path::Path;
+    let orig = Path::new(p);
+    if orig.exists() {
+        return p.to_string();
+    }
+    if !cfg!(windows) {
+        return p.to_string();
+    }
+
+    // /tmp/<x> → %TMP%\<x>
+    if let Some(rest) = p.strip_prefix("/tmp/").or_else(|| p.strip_prefix("/TMP/")) {
+        if let Ok(tmp) = std::env::var("TMP").or_else(|_| std::env::var("TEMP")) {
+            if !tmp.is_empty() {
+                let sep = std::path::MAIN_SEPARATOR;
+                let tmp_trimmed = tmp.trim_end_matches(|c| c == '\\' || c == '/');
+                let candidate = format!(
+                    "{}{}{}",
+                    tmp_trimmed,
+                    sep,
+                    rest.replace('/', &sep.to_string())
+                );
+                if Path::new(&candidate).exists() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    // /c/<rest> → C:\<rest> (MSYS/Cygwin 风格挂载)
+    if p.len() >= 3 && p.as_bytes()[0] == b'/' && p.as_bytes()[2] == b'/' {
+        let drive = p.as_bytes()[1] as char;
+        if drive.is_ascii_alphabetic() {
+            let rest = &p[3..];
+            let sep = std::path::MAIN_SEPARATOR;
+            let candidate = format!(
+                "{}:{}{}",
+                drive.to_ascii_uppercase(),
+                sep,
+                rest.replace('/', &sep.to_string())
+            );
+            if Path::new(&candidate).exists() {
+                return candidate;
+            }
+        }
+    }
+    p.to_string()
 }
 
 #[cfg(test)]

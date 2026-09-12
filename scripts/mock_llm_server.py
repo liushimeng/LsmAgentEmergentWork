@@ -1228,6 +1228,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"path": self.path, "call_no": n, "headers": headers, "body": body},
                 ensure_ascii=False,
             ) + "\n")
+            f.flush()  # 2026-09-12 第 44 轮:立即 flush,避免父进程监控不到写入
 
         # P0 修复(fail-closed 配套):按角色返回对应结构化应答。
         # 此前仅按调用序号脚本化,所有非首轮调用都返回纯文本,

@@ -693,6 +693,13 @@ async fn main() -> Result<()> {
 /// 返回 `true` 表示已处理完毕(调用者应直接 return Ok(()));
 /// 返回 `false` 表示非纯函数命令,继续走常规 `-p` 编排流程。
 fn try_run_pure_slash_command(input: &str) -> bool {
+    // 2026-09-12 第 44 轮:Git Bash on Windows 会在 spawn 时把
+    // `/diff` 这种以 `/` 开头的参数当作 POSIX 路径自动转换为
+    // `D:/Program Files/Git/diff`(MSYS2_ARG_CONV 自动机制),
+    // 此时 strip_prefix('/') 失败 → 命令被误判为非纯函数 → 走 LLM。
+    // 修复:如果参数前几个 token 形如 `<盘符>:/<cmd>`,且 `<cmd>` 是
+    // 我们已知的纯函数命令,把 `<盘符>:/` 切掉回到原意。
+    let input = unwrap_msys_slash_arg(input);
     let trimmed = input.trim();
     let Some(cmd) = trimmed.strip_prefix('/') else {
         return false;
@@ -738,6 +745,72 @@ fn try_run_pure_slash_command(input: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// 反向 MSYS/Git Bash 自动路径转换。
+///
+/// Git Bash spawn 子进程时,如果 argv 元素以 `/<字母>/...` 形式开头,
+/// 会自动转换成本地盘符路径(`/diff` → `D:/Program Files/Git/diff`),
+/// 导致原本的 `laew -p "/diff ..."` 拿到的 prompt 变成
+/// `D:/Program Files/Git/diff ...`,strip_prefix('/') 失败。
+///
+/// 已知 laew 支持的纯函数命令名列表很短,逐个比对;命中时把
+/// `<盘符>:/<中间路径段们>/` 前缀切掉,恢复为 `/cmd ...` 形式,
+/// 继续按 `/` 命令处理。
+///
+/// 仅在 Windows 上做这个纠正,Unix 平台不需要。
+fn unwrap_msys_slash_arg(input: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        let trimmed = input.trim_start();
+        // 形如 `X:/...`(X 为 ASCII 字母)
+        if trimmed.len() >= 4 {
+            let bytes = trimmed.as_bytes();
+            if bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes[2] == b'/' || bytes[2] == b'\\')
+            {
+                // 从 `X:/` 后开始,跳过全部路径段(以 `/` 或 `\` 分隔),
+                // 直到下一个空白符 → 那里是真实命令名。
+                let after_drive = &trimmed[3..];
+                // 分词:跳过 0~N 个路径段;路径段由 `/` 或 `\` 分隔。
+                // 注意:Git Bash 转换 `D:/Program Files/Git/diff` 时,
+                // `D:/` 之后第一段 `Program` 没有前导 `/`(`/` 已被吞掉),
+                // 所以需要先尝试「带前导分隔符」,失败再尝试「无前导」。
+                let mut rest: &str = after_drive;
+                loop {
+                    // 跳过前导空白
+                    let trimmed_rest = rest.trim_start();
+                    if trimmed_rest.is_empty() {
+                        break;
+                    }
+                    // 取本路径段(到下一个分隔符或空白)
+                    let seg_end = trimmed_rest
+                        .find(|c: char| c == '/' || c == '\\' || c.is_whitespace())
+                        .unwrap_or(trimmed_rest.len());
+                    let seg = &trimmed_rest[..seg_end];
+                    // 如果该段是已知 laew 命令名,这就是 cmd 头
+                    if matches!(seg, "diff") {
+                        // 切掉 `X:/.../<cmd>` 之前的所有内容,补回 `/<cmd>`
+                        let after_seg = &trimmed_rest[seg.len()..];
+                        return std::borrow::Cow::Owned(format!(
+                            "/{seg}{}",
+                            after_seg
+                        ));
+                    }
+                    // 否则这一段是路径目录(如 `Program Files/Git`),
+                    // 继续往后看;但要跳过本段及紧随的分隔符或空白
+                    if seg_end < trimmed_rest.len() {
+                        let after_seg = &trimmed_rest[seg_end..];
+                        rest = after_seg.trim_start_matches(|c: char| c == '/' || c == '\\' || c.is_whitespace());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(input)
 }
 
 /// 把 `theme::attr` 位掩码转换为 ANSI 转义前缀(与 tui/mod.rs 内同名函数保持一致)。

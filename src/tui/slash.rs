@@ -494,8 +494,12 @@ impl TuiSession {
             } else {
                 format!(" {}", c.argument_hint)
             };
+            // 2026-09-12 第 44 轮:Windows 上 path.display() 输出 `C:\foo\.laew\commands\...`
+            // (反斜杠),e2e §7b 与脚本测试习惯匹配 POSIX 风格(正斜杠),统一替换
+            // 成正斜杠;Linux/macOS 路径本来就是 `/`,replace 后无变化。
+            let src = c.source.display().to_string().replace('\\', "/");
             println!("  /{}{hint}", c.name);
-            println!("    {} — {}", c.description, c.source.display());
+            println!("    {} — {}", c.description, src);
         }
     }
 }

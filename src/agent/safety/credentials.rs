@@ -303,18 +303,34 @@ mod tests {
 
     #[test]
     fn master_key_generate_and_load() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("master.key");
-        // 模拟生成
-        let mut bytes = vec![0u8; KEY_LEN];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        write_secret_file(&path, &bytes).unwrap();
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        // 模拟加载
-        let loaded = fs::read(&path).unwrap();
-        assert_eq!(loaded, bytes);
+        // Unix-only:验证写出的密钥文件权限是 0o600(只有所有者可读写)。
+        // Windows 没有 std::os::unix,跳过权限断言(其他断言跨平台有效)。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("master.key");
+            // 模拟生成
+            let mut bytes = vec![0u8; KEY_LEN];
+            rand::thread_rng().fill_bytes(&mut bytes);
+            write_secret_file(&path, &bytes).unwrap();
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            // 模拟加载
+            let loaded = fs::read(&path).unwrap();
+            assert_eq!(loaded, bytes);
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows / 其他非 Unix 平台:仅验证读写一致
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("master.key");
+            let mut bytes = vec![0u8; KEY_LEN];
+            rand::thread_rng().fill_bytes(&mut bytes);
+            write_secret_file(&path, &bytes).unwrap();
+            let loaded = fs::read(&path).unwrap();
+            assert_eq!(loaded, bytes);
+        }
     }
 
     #[test]
