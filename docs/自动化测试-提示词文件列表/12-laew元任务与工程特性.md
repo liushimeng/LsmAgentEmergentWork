@@ -9,7 +9,7 @@
 ---
 
 ### L01 laew 自测试：跑通 e2e 并定位失败
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_03-D03-L01-测试与按钮显示Bug修复方案.md）
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
 - **预期档位**: medium
 - **考察维度**: 工程自验证 / 失败定位闭环
 - **工具链**: Read → Bash → Bash → Write
@@ -20,7 +20,7 @@
   4. 把 mock LLM 工作原理总结写到 `tmpPlan/agent-test/l01_mock.md`：解释 mock server 如何按角色分流（参考 e2e 脚本里的 mock 路由）、以及"新增一个测试用例应改哪里"（指出具体函数/节号）。
 
 ### L02 多 Agent 编排验证：触发 hard 全流程
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_05-A02-E03-L02-S01-C05-自动化测试与hard任务Plan解析Bug修复方案.md）
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
 - **预期档位**: hard
 - **考察维度**: 触发完整多 Agent 流程 / 产物齐全
 - **工具链**: Bash → Bash → Bash → Write
@@ -31,7 +31,7 @@
   4. 写 `tmpPlan/agent-test/l02_report.md`：列出"Yolo 分类 / Plan 文档路径 / Main-Work 步骤数 / SubAgent 调用数 / QC 结论"五列事实，给出各 Agent 产物是否齐全的判定（✓/✗），不写空话。
 
 ### L03 上下文压缩触发验证
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_21-B08-C06-D10-E02-L03-自动化测试与Yolo分类验证方案.md）
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
 - **预期档位**: hard
 - **考察维度**: Compact Agent 触发 / 保护带保留
 - **工具链**: Read → Bash → Bash → Write

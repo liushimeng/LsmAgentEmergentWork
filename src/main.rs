@@ -315,17 +315,24 @@ async fn run_one_shot(
         )
     };
 
-    // 取消传播:任务窗口监听 SIGINT,第一次中断取消当前任务(H9);
-    // -p 单轮模式取消后按 128+SIGINT=130 惯例退出
+    // 取消传播:任务窗口监听 SIGINT。
+    // 设计(2026-09-12 修复双次 Ctrl+C 阻塞 bug):
+    //   - 第一次 Ctrl+C → 立即 cancel token + exit(130)。
+    //     原理:单轮模式下用户一次中断即意图终止,不必等待第二次确认;
+    //     同时 cancel token 已设置,编排器在下一检查点会收到 Cancelled,
+    //     工具层(in-flight LLM/tool)由 CancelGate 异步中断,两者并行不冲突。
+    //   - 旧实现「第一次设 token、await 第二次 Ctrl+C 才 exit 130」在 mock 延迟场景
+    //     会阻塞进程直到测试超时发 SIGKILL(rc=137),导致 §10 全部 5 项失败。
     let cancel = lsm_agent::agent::cancel::CancelToken::new();
     let sig_cancel = cancel.clone();
     let sig_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_err() {
             return;
         }
-        eprintln!("[laew] 收到中断信号,正在取消当前任务...");
         sig_cancel.cancel();
-        let _ = tokio::signal::ctrl_c().await;
+        // 立即以 128+SIGINT=130 惯例退出,与 Unix CLI 一次 Ctrl+C 行为一致。
+        // eprintln 在前:stderr 无缓冲,测试可 grep 到"已取消"作为优雅中断证据。
+        eprintln!("[laew] 任务已取消(用户中断)");
         std::process::exit(130);
     });
     // 阶段进度(stderr 立即打印,stdout 保持只含答案与用量;与等待心跳同流,
