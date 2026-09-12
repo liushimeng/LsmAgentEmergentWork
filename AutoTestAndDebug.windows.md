@@ -1,0 +1,231 @@
+# 自动化测试与代码优化一体化任务：laew（LsmAgentEmergentWork）— Windows 版
+
+> 本文件是 `AutoTestAndDebug.bat` 读取的提示词（Linux 版见 `AutoTestAndDebug.md`，由
+> `AutoTestAndDebug.sh` 读取）。你（执行 Agent）是被脚本随机/指定选中的编程 Agent CLI，
+> 任务是**一次会话内完成「同步 → 感知 → 实测 → 方案 → 修复 → 收尾」一体化闭环**：拉取最新
+> 代码、感知近 10 天变更、从知识库随机选条实测 **laew 的 Agent 能力**、把问题汇总成方案落盘
+> `tmpPlan/`、按方案修码验证、git 中文提交推送并清理产物。
+> 工程说明见 `CLAUDE.md` / `AGENTS.md`（可先读「常用命令」「领域概念」两节，**只读不许改**）。
+
+- **工程**: Rust Agent CLI `laew`（多 Agent 架构 + TUI + 双协议 LLM 接入）
+- **工作目录**: `AutoTestAndDebug.bat` 所在目录（即当前目录，命令都在这里执行）
+- **Windows 环境须知**：
+  - 可用 **PowerShell** 或 **Git Bash** 执行命令（Git Bash 提供 `grep` / `sed` / `timeout` /
+    `shuf` 等 GNU 工具，位于 `D:\Program Files\Git\usr\bin`，通常已在 PATH）；
+  - laew 二进制为 **`laew.exe`**（`rebuild_restart_app.bat` 产出，见 §5）；
+  - Python 命令为 `python`（无 `python3`）；临时目录用 `%TEMP%` 而非 `/tmp`。
+- **产物路径**（时间戳 `YYYY-MM-DD` 或 `YYYYMMDD_HHMMSS`）:
+  - 测试与优化方案: `tmpPlan/YYYY-MM-DD_NN-<主题>测试与优化方案.md`（文件名自定义，含日期；本轮核心交付物）
+  - e2e 原始输出: `testReport/e2e-<时间戳>.txt`（run_e2e.sh 自产，不入库）
+  - 调试报告: `DebugReport/debug_report_*.md`（laew -debug 自产，不入库）
+- **不再生成问题报告**: 本流程**不产出** `testReport/自动化测试报告_*.md`；测试发现的问题
+  一律进入 `tmpPlan/` 方案文档（`tmpPlan/`、`testReport/`、`DebugReport/`、`TestWorkSpace/`
+  均被 `.gitignore` 忽略，产物仅留本地，不污染 git 工程）。
+
+---
+
+## 顶层硬约束（不可违反）
+
+1. **绝对禁止修改 `CLAUDE.md`、`AGENTS.md` 这两个规则文件。**
+   - 两个文件是仓库的**项目规则唯一事实来源**，任何自动化流程都不应追加、删除或修改其内容；
+     测试摘要 / 修复记录 / 教训只写到 `tmpPlan/` 方案文档或 `docs/` 业务文档。
+   - 「知识库状态标记」是 docs/ 唯一允许的修改：`docs/自动化测试-提示词文件列表/*.md`
+     条目的 `测试状态` 行（见 §5.3），条目主题/预期档位/对话脚本一律不得改动。
+2. **测的是 laew 的 Agent 能力，不是大模型的能力。**
+   - 判定对象：Yolo 三档分类、工具执行（Bash/Read/Write）、Agent 调度编排
+     （Yolo→Plan/Main→SubAgent→QC→SessionContext）、文件修改与产物落盘、任务完成度；
+   - 模型回答内容本身的「文笔好坏 / 知识对错」**不是**缺陷依据；工具不执行、编排缺失、
+     产物不达标、程序卡住/崩溃/死循环才是。
+3. **git 并行任务隔离**：本工程常态有多个 Agent 会话并行。`git add` 一律**显式路径**，
+   只提交自己本轮修改产生的文件；别人的未提交改动 / 别人的暂存**一律不碰**
+   （发现异常混入自己暂存时 `git restore --staged <别人的文件>`）。禁止 force push。
+4. **数据脱敏**：报告/日志中如出现 API Key / Token / 密码，输出时必须脱敏。
+
+## 执行指令（自动启动）
+
+> 本 prompt 由 `AutoTestAndDebug.bat` 加载，调用方**已授权**你直接执行，无需进一步确认。
+
+- **收到本 prompt 立即进入 §0**；**不要输出「请确认是否启动」等确认性问句**（会浪费一轮对话）。
+- **不要询问用户偏好 / 模型选择 / 是否推送远程**——按本规范默认值执行；真正需要决策的歧义
+  写入 tmpPlan 方案文档「待人工确认」小节，继续往下推进。
+- **每完成一步必须继续推进**，直到全流程结束或触发 §7 的 60 分钟硬上限。
+
+---
+
+## §0 环境准备与 git 拉取（≤ 3 min）
+
+1. **拉取最新代码（默认 main 分支）**：
+   ```bash
+   git pull --ff-only origin main
+   ```
+   - 自己有未提交改动导致拉取受阻时：`git stash push -- <自己的文件>` → pull → `git stash pop`；
+   - ff-only 失败（分叉）时：`git pull --rebase origin main`，**只解决自己文件的冲突**
+     （别人的改动保持原样）；仍解不动则记录到方案文档，基于当前 HEAD 继续。
+2. **环境探测**（写入方案文档「执行环境」节）：
+   - 操作系统：`cmd /c ver` 或 PowerShell `$env:OS` + `[System.Environment]::OSVersion`（选条
+     OS 适配依据；本提示词默认 Windows 10/11 x64）；
+   - Git HEAD：`git rev-parse --short HEAD`；cargo/rustc 版本；执行 Agent 名（claude/codex/opencode）；
+   - Shell 能力探测：`bash --version`（确认 Git Bash 可用，§2/§3 的随机与 timeout 依赖它）。
+3. **读工程说明**：通读 `CLAUDE.md` 的「常用命令」「领域概念」「约定」三节（只读）。
+
+## §1 近 10 天变更感知（≤ 3 min）
+
+1. ```bash
+      git log --since="10 days ago" --oneline --stat | head -80
+      ```
+   （PowerShell 写法：`git log --since="10 days ago" --oneline --stat | Select-Object -First 80`）
+   过滤掉 `docs:` / 调研类提交，梳理最近的**代码变更**（feat/fix/refactor/test）：
+   新增了什么功能、优化了什么、涉及哪些模块。
+2. 把「**定向测试关注清单**」写进方案文档：变更提交 → 模块（`src/tui/*`、`src/agent/*`、
+   `src/llm/*`、`src/config/*` 等）→ 本轮在 §3 实测与 §5 回归中要重点覆盖的点。
+3. 近 10 天无代码变更 → 注明「无代码变更，本轮以知识库抽测 + 基线回归为主」，继续 §2。
+
+## §2 知识库随机选条（≤ 5 min）
+
+知识库源：`docs/自动化测试-提示词文件列表/`（184 个主题文件 × 10 条 = **1840 条多轮对话
+提示词**，字段含「预期档位 / 考察维度 / 工具链 / 对话脚本 / 测试状态」，说明见该目录 README.md）。
+
+1. **OS 适配过滤（Windows 反转规则）**：跳过 **macOS/Linux 专属主题**（如 `126-macOS*`、
+   Linux 系统管理专属条目），**纳入 `125-Windows*` 等本机相关主题**，跨平台主题保留。
+2. **优先 bash/编程相关**：优先文件名/条目主题含 `编程|编码|脚本|Shell|命令行|调试|工具链|
+   系统管理|Unix|算法|数据结构|PowerShell|Windows` 等关键词的条目。
+3. **防重复**：`测试状态` 为 `✅ 已测试` 的条目**本轮跳过**；优先 `🔄 待重测` 与无标记条目：
+   ```bash
+   grep -c '✅ 已测试' docs/自动化测试-提示词文件列表/<文件>.md   # 已测分布
+   grep -n '🔄 待重测' docs/自动化测试-提示词文件列表/<文件>.md   # 优先候选
+   ```
+4. **随机选条数量**：从 **10 条**起步；§3 时间盒余量充足可逐批扩选，**上限 100 条**
+   （宁少而精：每条都要有真实执行与断言，禁止为凑数只测不验）。随机方法示例：
+   ```bash
+   # Git Bash:
+   ls docs/自动化测试-提示词文件列表/*.md | grep -vE 'macOS' | shuf -n 6
+   # PowerShell:
+   Get-ChildItem docs/自动化测试-提示词文件列表/*.md | Where-Object Name -notmatch 'macOS' | Get-Random -Count 6
+   # 在选中的文件里再随机挑「待重测/无标记」条目编号
+   ```
+5. 选中条目清单（编号 + 文件 + 预期档位 + 工具链）写入方案文档「本轮抽测清单」节。
+
+## §3 laew Agent 能力实测（≤ 25 min，核心阶段）
+
+> **测试对象是 laew 程序本身**：模拟用户输入提示词，验证 laew 能否正常完成任务、达到预期。
+> 统一在沙盒工作目录 `TestWorkSpace/` 下执行（根目录/工作目录分离设计见 CLAUDE.md）。
+
+1. **执行方式**（默认 `-f` 单轮 + `-debug` 采集 trace；自动化环境无 TTY）：
+   ```bash
+   mkdir -p TestWorkSpace/tmpPlan
+   # 把条目「对话脚本」第 1 轮提示词写入文件（多轮追问以 TUI 场景为准，自动化取第 1 轮探测）
+   timeout 300 ./laew.exe -debug -f TestWorkSpace/tmpPlan/<编号>_<时间戳>.md
+   ```
+   - `timeout` 用 Git Bash 自带的 GNU timeout（`Git\usr\bin\timeout.exe`）；若不可用，
+     用 PowerShell 作业/进程等待兜底，或在方案文档记录「无法限时」后去掉 timeout；
+   - 工作目录注意：`laew` 的 Bash/Read/Write 相对路径基准是**工作目录**；建议
+     `cd TestWorkSpace && timeout 300 ../laew.exe -debug -f tmpPlan/<编号>.md`，产物自然落沙盒。
+2. **每条四要素判定**（全部写入方案文档「测试矩阵」）：
+   - **Yolo 档位**：输出档位 vs 条目「预期档位」（simple/medium/hard），不符记 P2；
+   - **工具链**：条目「工具链」字段声明的 Write/Bash/Read 序列是否真实执行、参数正确；
+   - **SubAgent 编排**：档位对应编排是否成立（simple→SubAgent 直通；medium→Main-Work→
+     SubAgent；hard→Plan→Main→SubAgent 并行 + QC 全链路）；**优先确认 SubAgent 执行层
+     真实工作**（工具调用与产物由 SubAgent 完成）；
+   - **产物达标**：条目对话脚本中的 grep/test 断言逐条复核（产物在 `TestWorkSpace/` 落盘后
+     由你直接跑断言命令验证，**不要只信 laew 自己说成功**）。
+3. **执行质量观察**（发现即记入问题清单）：
+   - **卡住 / 崩溃 / 死循环 / 超时**（timeout 触发）/ 退出码非 0 / 输出为空；
+   - **任务结果未达预期**：目标没完成、答非所问、产物内容与要求不符；
+   - `-debug` 模式下 `DebugReport/` 报告是否正常生成、四章节（任务评估/质量报告/问题报告/
+     优化建议）是否完整合理；
+   - 日志信息、输出信息中的异常（错误堆栈、乱码、重复刷屏）。
+4. **TUI 界面观察**：**Windows 无 tmux，本项 SKIP**（在测试矩阵中记 SKIP 即可，
+   **SKIP 条目不得标 ✅**）；tmux 自动化用例（run_e2e.sh 第 8 节）同样自动 SKIP，不影响其余节。
+5. **Provider 依赖与降级**：实测依赖根目录 DB 的激活 provider（真实 LLM 网关）。
+   - provider/网络不可用 → 可降级本地 mock（`python scripts/mock_llm_server.py <空闲端口>`，
+     **避开 18899/18990**，用后清理），或该条记「环境问题 SKIP」——**SKIP 条目不得标 ✅**；
+   - 每条执行加 `timeout` 兜底（见上），防 laew 卡死拖垮整轮。
+
+## §4 问题汇总与方案落盘（≤ 5 min）
+
+1. 把 §1~§3 的全部发现汇总为**一份**方案文档：
+   `tmpPlan/YYYY-MM-DD_NN-<主题>测试与优化方案.md`（NN 为当日序号；文件名自定义但含日期）。
+2. **必备章节**：
+   - **执行环境**：§0 探测结果（OS / Git HEAD / Agent 名 / cargo 版本 / Shell 能力）；
+   - **变更感知**：§1 的近 10 天变更梳理 + 定向测试关注清单；
+   - **本轮抽测清单与测试矩阵**：§2 选条清单 + §3 四要素逐条结果（编号/档位/工具链/编排/产物断言/PASS-FAIL-SKIP）;
+   - **问题清单**:每条含 严重级别(P0/P1/P2) / 复现步骤(命令) / 根因分析 / 涉及文件与函数 / 解决方案；
+   - **验证方式**：§5 修复后用什么命令复核（cargo test / e2e 节 / 重跑该条提示词）；
+   - **下轮建议**。
+3. **无问题也要落盘**轻量测试记录（测试矩阵 + 环境信息），防止测试事实丢失；
+   此时可跳过 §5 直入 §6。
+4. 方案文档落盘后**先保存再继续**——它是本轮唯一交付物，后续任何失败都不能丢掉它。
+
+## §5 按方案实现代码功能（≤ 15 min；仅在方案含有效问题时执行）
+
+1. **动手前确认问题仍存在**：`git log --oneline -10 -- <文件>` 看相关文件近期提交、
+   比对当前实现与方案描述，避免对已修复问题重复打补丁。
+2. **修复原则**：从逻辑底层修，不做表面修补；遵循 `CLAUDE.md` 工程约束——
+   - 注释、CLI 文案、文档一律中文；代码标识符英文；**单源码文件 ≤ 1800 行**（临界文件新增代码落职责子模块）；
+   - 新工具进 `src/agent/tools/` 实现 `Tool` trait 并注册；新协议实现 `LlmClient` trait；
+     不引入新 TUI crate；TUI 选中态常量集中在 `src/tui/theme.rs`，屏幕内禁止硬编码；
+   - 数据库在**根目录**；工具相对路径基准是**工作目录**。
+3. **验证链（顺序执行，全绿才算修复完成）**：
+   ```bash
+   cargo test 2>&1 | tail -30
+   ./rebuild_restart_app.bat            # 必须走脚本重编译输出根目录 laew.exe
+   bash testReport/run_e2e.sh 2>&1 | tail -40
+   ```
+   - `rebuild_restart_app.bat` 为 Windows 版编译脚本（`--debug` 可选 debug 构建）；若在
+     Git Bash 内调用，写法 `cmd //c rebuild_restart_app.bat` 或直接执行同名 `.sh`；
+   - e2e 经 Git Bash 执行（`bash testReport/run_e2e.sh`）：mock LLM 监听 **18899 端口**，
+     **tmux 第 8 节在 Windows 自动 SKIP，不影响其余节通过**；
+   - e2e 独占资源：跑前 `netstat -ano | findstr 18899` 查残留，**有则等其退出，
+     不得 kill 他人进程**；
+   - 失败回修直至通过（计入本阶段时间盒）；修不动则方案文档标注「待人工」，不得谎报通过；
+   - 未改 `src/` 只改测试基建时，rebuild 仍须跑通。
+4. **修复后复测**：把 §3 中因该问题 FAIL 的条目重跑 1 次，确认转 PASS。
+5. **知识库「测试状态」回填（防重复，docs/ 唯一允许的修改）**：
+   - 仅当条目四要素全过**且**（若本轮改码）§5.3 验证链全绿，才把该条状态行改为：
+     ```markdown
+     - **测试状态**: ✅ 已测试（YYYY-MM-DD <一句话结果：档位/工具链/断言摘要>；详见 tmpPlan/<方案文件名>）
+     ```
+   - 回填前 `grep` 确认该条目尚无 `✅ 已测试`，避免重复；FAIL/SKIP 条目保持原状；
+     条目主题/预期档位/对话脚本不得改动。
+
+## §6 git 中文提交推送与清理（≤ 4 min）
+
+1. **清理测试中间产物**（保持 git 工程整洁；tmpPlan 方案文档**保留**）：
+   ```bash
+   rm -rf TestWorkSpace/tmpPlan TestWorkSpace/tmp            # 本轮 laew 测试产物
+   # 自建 mock 进程/日志清理；DebugReport/e2e 产物已被 .gitignore 覆盖可留本地
+   ```
+   只删本轮自己生成的文件；`TestWorkSpace/` 下其他会话的文件不动。
+2. **提交（中文信息，只 add 自己的文件）**：
+   ```bash
+   git status --porcelain                       # 逐行核对：只处理自己本轮产生的路径
+   git add -- <自己的文件1> <自己的文件2> ...     # 显式路径：src/**、docs/自动化测试-提示词文件列表/**、docs/** 等
+   git commit -m '测试与优化: <本轮摘要>（知识库抽测 X 条，修复 Y 项）'
+   ```
+   - 涉及架构调整 / 新增功能 → 同步更新对应 `docs/*.md` 业务文档（依然禁改 CLAUDE.md/AGENTS.md）。
+3. **推送**：
+   ```bash
+   git push origin main
+   ```
+   - origin 的 pushurl 已配置 gitee + gitcode 双推送，一次 push 双写；
+   - 冲突/非快进：`git pull --rebase origin main`（只解自己文件的冲突）后重推；
+   - 仍失败（网络/权限）：保留本地提交，方案文档记录「推送待人工」，**禁止 force push**。
+4. 提交推送结果（commit hash / 推送状态）追加到方案文档末尾。
+
+## §7 终止条件与降级
+
+1. **总时长硬上限 60 分钟**：逼近时立即收口，优先级 = 方案文档落盘 > git 提交 > 推送 >
+   知识库回填 > 其余细化；已改代码但 `cargo test` 未全绿时，方案文档明确标注未验证状态再提交。
+2. **自身（Agent CLI）工具调用连续 5 次失败不可恢复** → 落盘方案文档（标注中断位置）后终止。
+3. **laew 卡死/崩溃**：记录现象（超时退出码 / panic 输出）即问题 P0，不强求当轮修复，
+   按方案文档推进；laew 二进制异常可先 `rebuild_restart_app.bat` 重建再复测一次。
+4. **无论正常或异常终止**：tmpPlan 方案文档必须落盘；这是判定本轮成败的唯一依据。
+
+## 注意事项
+
+- **报告自包含**：结论、数据、证据写全——方案文档是唯一交付物，读者不会回放你的会话；
+  引用输出摘录关键行即可。
+- **客观性**：一切结论基于命令真实输出，禁止臆断；`cargo build` 失败不终止整轮，降级静态分析。
+- **资源独占**：18899 端口不可与其它进程共享；他人 mock 进程只等不 kill。
+- **git 只提交自己的变更**：并行会话常态存在，别人的文件/暂存绝不操作。
+- 方案文档确认落盘、git 提交推送完成后，本轮任务即完成，直接结束会话，无需执行任何其它脚本。

@@ -4,6 +4,8 @@
 
 # 构建产物
 /laew
+/laew.exe
+/laew.old.exe
 
 # 运行时数据
 *.db
