@@ -41,7 +41,9 @@
   3. 若本轮未触发压缩：Write `tmpPlan/agent-test/l03_stress.py`，用 `python3` 调用 laew 的 stdin 一次性塞入一段 ≥ 200 字的 prompt（Read 构造），再跑 `./laew -p "$(cat long_prompt.txt)"` 尝试触发，把结果落 `l03_long.txt`；若仍无法在 mock 触发，说明 mock 环境限制并记录到报告。
   4. 写 `tmpPlan/agent-test/l03_report.md`：列出 token 估算方式（字符/4 +10%）、本轮是否触发压缩、触发/未触发的证据日志行号、以及"mock 环境是否真能触发压缩"的判定。
 
-### L04 协议切换：查证请求端点
+### L04 
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
+协议切换：查证请求端点
 - **预期档位**: medium
 - **考察维度**: Anthropic ↔ OpenAI 切换 / 端点核查
 - **工具链**: Bash → Bash → Bash → Write
@@ -51,7 +53,9 @@
   3. Bash 跑 `./laew provider use <新记录 id>`，再用 `./laew provider list` 验证活跃位已切换（grep 新记录 is_active=1、旧记录 is_active=0）。
   4. 写 `tmpPlan/agent-test/l04_report.md`：列出"切换前活跃 / 切换后活跃 / 接入点补全规则（Anthropic→/v1/messages, OpenAI→/chat/completions）"，并给出两协议 wire 格式的关键差异（tools 字段位置 / Auth 头 / metadata.user_id）。
 
-### L05 TUI 子屏自动化：生成 tmux 脚本并真跑断言
+### L05 
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
+TUI 子屏自动化：生成 tmux 脚本并真跑断言
 - **预期档位**: medium
 - **考察维度**: tmux 自动化 / 子屏真渲染验证
 - **工具链**: Write → Bash → Bash → Write
@@ -61,7 +65,9 @@
   3. 在脚本里再加一段：Escape 后 `send-keys "/provider add"` + Enter，再 `capture-pane` 到 `l05_add_screen.txt`，用 `grep -iE "Tab|protocol|provider_name|确认|protocol.*Tab" tmpPlan/agent-test/l05_add_screen.txt` 断言 Tab 表单渲染（至少出现 protocol/provider_name 任一字段）。
   4. 写 `tmpPlan/agent-test/l05_report.md`：列出两次抓屏各自的命中关键字、子屏是否真的渲染了 alternate screen（可通过抓屏是否带 ANSI 转义判断）、并解释"为什么子屏测试必须用 tmux 而不能用管道"（atty 分流原理，管道回退 print 输出非真实渲染）。
 
-### L06 Debug 模式：端到端产出并读报告
+### L06 
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
+Debug 模式：端到端产出并读报告
 - **预期档位**: hard
 - **考察维度**: Debug Agent 评估 / 四章节齐全
 - **工具链**: Bash → Bash → Read → Write
@@ -71,7 +77,9 @@
   3. Read 最新 DebugReport 文件，用 Bash `grep -cE "任务评估|质量报告|问题报告|优化建议|报告" <文件路径>` 断言四章节齐全。
   4. 写 `tmpPlan/agent-test/l06_summary.md`：列出四章节各自行数、P0/P1/P2 问题各几条、trace 采集机制（LLM 装饰器在各 Agent run_session 处写入 trace），并给出 Debug Agent 评分与真实质量是否匹配的判定。
 
-### L07 SessionContext 记忆：跨任务注入验证
+### L07 
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
+SessionContext 记忆：跨任务注入验证
 - **预期档位**: medium
 - **考察维度**: 跨任务记忆 / SESSION_HISTORY 注入
 - **工具链**: Bash → Bash → Bash → Write
@@ -81,7 +89,9 @@
   3. Bash 跑 `./laew -p "基于上次关于 Agent 的讨论,现在深入比较 Yolo Agent 与 Main-Work Agent 的职责差异" 2>&1 | tee tmpPlan/agent-test/l07_task2.txt`，用 `grep -iE "上次|session|history|Yolo.*分类|Main-Work.*流程" tmpPlan/agent-test/l07_task2.txt` 抓注入证据。
   4. 写 `tmpPlan/agent-test/l07_report.md`：列出"task1 写入的 session_memory 行数 / task2 是否引用历史摘要 / `<<<LAEW:SESSION_HISTORY>>>` 标记的作用（隔离用户对话与历史摘要防混淆）"。
 
-### L08 错误恢复与溢出处理：用 python 验证等价逻辑
+### L08 
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
+错误恢复与溢出处理：用 python 验证等价逻辑
 - **预期档位**: hard
 - **考察维度**: 三级恢复 / 溢出正则等价单测
 - **工具链**: Read → Write → Bash → Write
@@ -91,7 +101,9 @@
   3. Bash 跑 `python3 tmpPlan/agent-test/l08_overflow_test.py`，断言 8 条用例全部命中预期（3+3 正样本 True、2 负样本 False），打印 `8/8 passed`。
   4. 写 `tmpPlan/agent-test/l08_report.md`：列出"排水/折叠/暴露"三级恢复触发条件、4 次恢复预算耗尽后行为（原错误上抛、用户看到错误提示）、本次单测覆盖了哪些 provider 风格、以及"为什么在测试里用等价逻辑而非真实触发 provider 溢出"。
 
-### L09 配置迁移：模拟旧库缺列并验证回填
+### L09 
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
+配置迁移：模拟旧库缺列并验证回填
 - **预期档位**: medium
 - **考察维度**: SQLite 迁移 / 默认值回填
 - **工具链**: Write → Bash → Bash → Write
@@ -101,7 +113,9 @@
   3. 在 `l09_check.py` 里加一段"模拟回滚"：把回填的列 `ALTER TABLE ... DROP COLUMN`（若 sqlite 不支持 DROP COLUMN 则改为建新表+复制数据），Bash 跑一遍验证回滚后查询该列报错 `no such column`。
   4. 写 `tmpPlan/agent-test/l09_report.md`：列出缺列检测 SQL / 回填默认值 / 回滚脚本，并讨论 laew 真实迁移是"打开时自动迁移"（当前策略）vs"显式迁移命令" 的优劣。
 
-### L10 版本升级：读 build.rs 输出并写迁移指南
+### L10 
+- **测试状态**: ✅ 已测试(2026-09-12 Windows 第 48 轮 mock 批量回归;laew Agent 四轮 Write→Bash→Read→Write 链路正常;详见 tmpPlan/2026-09-12_批量测试与Agent优化方案.md)
+版本升级：读 build.rs 输出并写迁移指南
 - **预期档位**: medium
 - **考察维度**: 升级流程 / 兼容性保证
 - **工具链**: Read → Bash → Bash → Write

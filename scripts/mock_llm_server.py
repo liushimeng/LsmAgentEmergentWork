@@ -132,6 +132,13 @@ def _validate_prompt_router(router, source="prompt-router"):
     of strings. A scalar is still syntactically valid JSON, but laew correctly
     rejects it and degrades the classification to simple, which makes a router
     intended for medium/hard regression silently test the fallback path instead.
+
+    hard-档规则缺 ``plan`` 段只警告不拒绝(2026-09-12 第 49 轮):hard 链路里 Plan
+    的输入是 Yolo 的 goal_summary 合成任务,不带 plan 覆写时 Plan 恒返回默认
+    PLAN_MARKDOWN(echo LAEW_MOCK_OK),Main-Work 按默认方案拆解 → SubAgent 上下文
+    不含规则关键词 → 路由全失配回落默认工具。该契约此前只散落在
+    _route_plan_markdown 的注释里,router 作者极易踩坑(第 49 轮 S01 首测实测),
+    现在加载即提示。不 raise 是因为个别用例可能故意只测默认方案路径。
     """
     for index, rule in enumerate((router or {}).get("rules", []) or []):
         plan = ((rule.get("yolo") or {}).get("decomposition_plan"))
@@ -142,6 +149,48 @@ def _validate_prompt_router(router, source="prompt-router"):
             raise ValueError(
                 f"{source}: rules[{index}].yolo.decomposition_plan must be string[]"
             )
+        level = ((rule.get("yolo") or {}).get("task_level") or "").strip().lower()
+        has_plan_override = bool((rule.get("plan") or {}).get("workflows"))
+        if level == "hard" and not has_plan_override:
+            print(
+                f"[mock] WARN {source}: rules[{index}] task_level=hard 但缺 "
+                f'"plan": {{"keywords": [...], "workflows": [...]}} 覆写 —— '
+                f"hard 链路 Plan 将恒返回默认方案,SubAgent 路由会失配回落默认工具;"
+                f"若非有意测默认路径,请补 plan 段(参见 _route_plan_markdown/BUG-M7)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _normalize_msys_path(path):
+    """把 Git Bash 风格路径翻译成 Windows Python 可打开的形式(第 47 轮 P1-2 遗留)。
+
+    Git Bash 里 ``--prompt-router-file /tmp/x.json`` 传给 Windows Python 时
+    ``/tmp`` 不存在于任何盘符根,open 必败。转换优先级:
+    1. 原样存在 → 直接用(Windows 原生路径 / MSYS 已安装根);
+    2. ``/tmp/...`` → 用户临时目录(TEMP)下的同名相对路径;
+    3. 其它 POSIX 绝对路径 → 借 ``cygpath -w`` 转换(无 cygpath 则原样返回,由
+       上层报打开失败)。
+    """
+    if os.path.exists(path):
+        return path
+    if path.startswith("/tmp/"):
+        rel = path[len("/tmp/"):]
+        cand = os.path.join(os.environ.get("TEMP", os.environ.get("TMP", ".")), rel)
+        if os.path.exists(cand):
+            return cand
+    if path.startswith("/") and path != "/":
+        import subprocess as _sp
+        try:
+            out = _sp.run(
+                ["cygpath", "-w", path], capture_output=True, text=True, timeout=5
+            )
+            conv = (out.stdout or "").strip()
+            if out.returncode == 0 and conv and os.path.exists(conv):
+                return conv
+        except Exception:
+            pass
+    return path
 
 
 _args_router = sys.argv[3:]
@@ -149,7 +198,7 @@ _i = 0
 while _i < len(_args_router):
     _a = _args_router[_i]
     if _a == "--prompt-router-file" and _i + 1 < len(_args_router):
-        router_path = _args_router[_i + 1]
+        router_path = _normalize_msys_path(_args_router[_i + 1])
         try:
             with open(router_path, encoding="utf-8") as _rf:
                 PROMPT_ROUTER = json.load(_rf)
