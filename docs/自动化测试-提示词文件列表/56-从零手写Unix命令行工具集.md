@@ -7,6 +7,7 @@
 ---
 
 ### BE01 手写 cat / head / tail：从文件流到 -n 与 -f 跟随
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1-q2 Write cat/head/tail → q2 Bash 与真 head/tail 进程替换 diff 空(-n 5/-n +15/-n 3) + cat selftest 拼接断言;q3 notes 四要点;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: medium
 - **考察维度**: 流式 I/O + 文件描述符 + inode watch
 - **对话脚本**:
@@ -16,6 +17,7 @@
   4. 故意把 `tail.py -n +X` 实现错成 `tail -N`(最后 N 行)，跑 `seq 1 20 | python3 tail.py -n +15` 期望输出 15-20，但实际输出 1-15，diff 非空，定位 bug（`+X` 语义 vs 末尾 N 行）修正后 diff 空。
 
 ### BE02 手写 ls：目录遍历、权限位与多列对齐
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1 Write ls.py(-a/-t/四列) → q2 selftest mtime 倒序+隐藏文件+10 字符 rwx 权限串正则 + awk 全表校验;Windows S_IMODE 适配;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: medium
 - **考察维度**: getdents64 + termios + 列宽计算
 - **对话脚本**:
@@ -25,6 +27,7 @@
   4. 故意在权限函数里把 `r` 写成 `R`（大写），跑 `diff` 与真 `ls -l` 对照发现字母不符，修正后 `diff <(python3 ls.py . | awk -F'\t' '{print $4}') <(ls -l | awk '{print $1}')` 断言首 5 行一致。
 
 ### BE03 手写 wc：字节/字符/单词/行的四种计数口径
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1 Write wc.py 五口径 → q2 与真 wc -l/-w/-c/-m/-L 全等(CJK m=20 c=28 L=12)+ 空输入断言;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: simple
 - **考察维度**: 字节 vs Unicode 字符 + 状态机
 - **对话脚本**:
@@ -34,6 +37,7 @@
   4. 加 `-L` 最长行长（按字符列宽，CJK 算 2 列），`Bash` 跑 `python3 wc.py -L /tmp/wc_test.txt` 与手动 `awk '{if(length>max) max=length} END{print max}'` 验证，写入 `wc.md` 列四种口径公式。
 
 ### BE04 手写 grep：正则匹配、上下文行与彩色高亮
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1 Write grep.py(-n/-C/--color) → q2 与真 grep -n diff 空 + -C 1 三行 + 彩色高亮与重置码配对计数;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: medium
 - **考察维度**: NFA/DFA 正则 + ANSI 转义 + 多文件并行
 - **对话脚本**:
@@ -43,6 +47,7 @@
   4. 故意在颜色输出里忘了重置（匹配后没有 `\x1b[0m`），把输出 `| cat -A` 会看到颜色码泄露到下一行（`^[` 序列），定位 bug 后加重置再跑 `grep -c '\x1b\[0m'` 验证每次匹配后都有重置码。
 
 ### BE05 手写 find：表达式求值与目录剪枝
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1 Write find.py(AST 组合 -a/-o/!) → q2 与真 find 5 组 diff 空(-name/-size +1M/-mtime -7/!否定)+ -exec 占位 2 行;hard 档 Plan→Main-Work→SubAgent 全链路;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: hard
 - **考察维度**: 表达式 AST + 剪枝优化 + xattr
 - **对话脚本**:
@@ -52,6 +57,7 @@
   4. 故意把 `-size +1M` 实现成 `>1K`（把单位 M 误按 K 算），跑 `diff` 与真 `find ... -size +1M` 不一致，定位单位换算 bug（1M=1024*1024）修正后 diff 空；加 `-exec` 占位（打印 `exec path` 即可）。
 
 ### BE06 手写 tree：递归绘制与 Unicode 制表符
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1 嵌套目录 Write unix/tree.py → q2 固定树与手写期望 diff 空 + ├/└ 计数 + -L 1/-I test;本机无 tree 命令的自证适配;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: medium
 - **考察维度**: 深度优先 + UTF-8 box-drawing + ANSI 文件类型色
 - **对话脚本**:
@@ -61,6 +67,7 @@
   4. 故意把 `├──` 与 `└──`（4 长）写错，`diff` 与真 tree 不一致，`Bash` 跑 `grep -cE '├' tree_out.txt` 断言符号计数，修正后 diff 空；加 `-I 'test'` 忽略模式。
 
 ### BE07 手写 du 与 df：磁盘占用统计与硬链接去重
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1 Write du.py(st_size 递归) → q2 selftest NTFS 硬链接 inode 去重 10240/不去重 20480 + 真du ±范围对比 + -h 人类可读;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: medium
 - **考察维度**: statfs + inode 引用计数 + 并行聚合
 - **对话脚本**:
@@ -70,6 +77,7 @@
   4. 硬链接去重：`ln /tmp/du1/sub/f.bin /tmp/du1/sub/f2.bin` 造硬链接，`python3 du.py -s --no-dedup /tmp/du1` 与 `python3 du.py -s /tmp/du1` 对比，后者应更小（去重生效），`diff` 非空证明去重逻辑工作。
 
 ### BE08 手写 xargs：参数分批与并行执行
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1 Write xargs.py → q2 与真 xargs -n 2/-I {} diff 空 + -P 2 并行时序 < 串行同机对比;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: medium
 - **考察维度**: ARG_MAX 探测 + 引号转义 + 并行调度
 - **对话脚本**:
@@ -79,6 +87,7 @@
   4. 加 `-P 2` 并行（`ThreadPoolExecutor(max_workers=2)`），`Bash` 跑 `seq 1 4 | python3 xargs.py -P 2 -I {} sleep 0.1; echo done` 断言 4 任务并行 2 路总耗时 ≈ 0.2s（`time` 验证）。
 
 ### BE09 手写 diff：最长公共子序列与补丁输出
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1 Write diff.py(LCS DP) → q2 -u 输出与真 diff -u 归一化 diff 空(单点替换+双远距 hunk 2 个)+ 100 行 <5s;hard 档全链路;详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: hard
 - **考察维度**: LCS DP + Myers diff + hunk 格式
 - **对话脚本**:
@@ -88,6 +97,7 @@
   4. 故意把 `-u` 的上下文行数固定成 0（不输出上下文），`diff` 与真 `diff -u` 不一致，定位 bug 后改成默认 3 行上下文，diff 空；再跑 `seq 1 100` 大文件 100 行测试，断言无超时。
 
 ### BE10 手写 watch 与 top：终端定时刷新与光标控制
+- **测试状态**: ✅ 已测试(2026-09-13 第五十轮 Windows 11 / laew mock 批量回归 PASS:q1-q2 Write watch/top → q2 Bash trace 3 轮时间戳 + ESC[?25l/h 与 ESC[H 计数 + tasklist top5(Windows /proc 适配);详见 tmpPlan/2026-09-13_50-BE-DY-AO三维度批量回归与测试基建加固报告.md)
 - **预期档位**: medium
 - **考察维度**: termios raw mode + 信号处理 + ANSI 局部重绘
 - **对话脚本**:
