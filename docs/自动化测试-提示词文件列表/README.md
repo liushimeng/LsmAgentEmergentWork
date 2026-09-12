@@ -2,7 +2,7 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **194 维度 × 10 个 = 1940 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **209 维度 × 10 个 = 2090 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
@@ -233,6 +233,21 @@ docs/自动化测试-提示词文件列表/
    192-跨平台硬件诊断与设备健康巡检.md           ← 硬件清单/CPU拓扑/内存健康/温度传感器/电池电源/USB画像/显卡驱动/网卡链路/输入设备/健康评分
    193-游戏LiveOps运营配置与活动系统.md           ← 远程配置开关/活动排期互斥/补偿邮件/热修包/AB分流/公告跑马灯/强更灰度/数据日报/礼码风控/客服查询
    194-静态站点生成与个人发布工程.md             ← SSG选型/主题模板/frontmatter校验/构建优化/SEO三件套/RSS集成/评论系统/部署管线/图像性能/多语言站点
+  195-字体工程与文字塑形引擎编程实战.md        ← TrueType/OpenType表结构/HarfBuzz塑形/复杂文本布局CTL/彩色字体COLR-CPAL/字体子集化WOFF2/字距连字/可变字体/SARIF式校验
+  196-二维码与工业标识编码工程.md              ← QR纠错Reed-Solomon/DataMatrix ECC200/PDF417层叠条码/RFID EPC/工业喷码/质量分级/抗污损设计/批量生成
+  197-嵌入式固件与实时操作系统编程实战.md      ← ARM Cortex-M中断向量/裸机启动序列/FreeRTOS任务调度/Zephyr内核/RTOS信号量互斥/RTC时钟/低功耗模式/OTA差分升级
+  198-数据脱敏与隐私保护工程实战.md            ← 静态脱敏/动态脱敏/k匿名l多样性t接近/差分隐私ε预算/脱敏算法选型/审计追踪/GDPR-PIPL合规/数据驻留
+  199-语音合成与TTS引擎工程实战.md             ← 单元选择拼接/参数化HTS/VITS端到端/Flow-TTS/声码器HiFi-GAN/SSML情感控制/流式合成/多语种克隆/质量MOS评估
+  200-3D打印与增材制造编程实战.md              ← STL三角网格/切片分层/G-code生成/路径规划/支撑设计/材料工艺参数/质量检测/远程监控/Cura引擎/批量打印调度
+  201-图像识别与OCR文档智能工程实战.md          ← Tesseract OCR引擎/PaddleOCR多语言/版面分析/表格结构识别/手写体识别/印章检测/票据识别/合同要素抽取/RAG前置
+  202-编译器优化与代码生成工程实战.md           ← SSA静态单赋值/LLVM IR/Pass Manager/指令选择/寄存器分配/窥孔优化/内联成本/JIT编译/自动向量化/PGO优化
+  203-网络流量分析与NetFlow工程实战.md          ← NetFlow v5-v9/IPFIX采样/sFlow/session聚合/异常DDoS检测/带宽画像/数据导出/取证留存/IP信誉
+  204-程序静态分析与代码审计工程实战.md         ← Lexer/Parser-AST/CFG控制流图/数据流DU-chain/污点分析/符号执行Z3/Semgrep规则/CWE Top 25/SARIF/SAST-CI增量
+  205-进程间通信IPC深度实战.md                 ← 管道pipe-FIFO/信号sigaction/共享内存mmap-shm_open/POSIX信号量/Unix socket/D-Bus/fcntl锁/内存映射/跨平台IPC选型
+  206-版本控制协议与Git协议层工程.md            ← Git对象模型/Packfile增量压缩/引用reflog/Smart HTTP v2协议/钩子拦截/子模块gitlink/三方合并ort策略/Myers diff/Git-LFS/选型
+  207-数据血缘与元数据治理工程.md              ← 血缘有向图/OpenLineage事件协议/数据目录爬虫/Great Expectations/Data Contract/数据可观测性/Schema注册中心/MDM主数据/PII识别
+  208-端侧AI推理与设备端LLM工程.md             ← 量化PTQ-QAT/GGUF格式/Apple Silicon MLX/ONNX Runtime/KV cache优化/端侧RAG/模型热更新/端侧基准MMLU/端云协同
+  209-数字取证与电子证据分析工程.md            ← 取证法律框架/磁盘镜像EWF/NTFS MFT-ext4 inode/内存取证Volatility/网络取证PCAP/移动取证UFDR/反取证检测/Plaso时间线/证据哈希链
 ```
 
 ## 编号规则
