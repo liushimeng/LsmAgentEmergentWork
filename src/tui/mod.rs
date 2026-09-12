@@ -496,10 +496,32 @@ pub async fn run_with_debug(debug: bool) -> Result<()> {
         }
     } else {
         // 非 TTY:回退到阻塞式 stdin 行读取(用于管道 / e2e)
+        //
+        // 关联:2026-09-12 第 44 轮新发现 P1-bug:windows bash pipe 偶尔截断中文编码
+        // 边界(典型 head -c N 切到多字节 UTF-8 中段,产生半截 D1B9CB 字节序),
+        // 原 `let line = line?;` 把 `BufRead::lines()` 的 InvalidData 直接上抛到
+        // `run_with_debug` 的 `Result<()>` → anyhow 终止整个 TUI。改成:用
+        // `from_utf8_lossy` 容错解码(半截编码用 U+FFFD 替换),保证 stdin pipe
+        // 真实场景(GBK 输出 / 二进制乱入 / 头部编码截断)都不再炸进程;
+        // 对 e2e §5c 这种故意灌长 GBK 中文触发压缩的用例同样有效。
         use std::io::{self, BufRead};
         let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = line?;
+        let mut handle = stdin.lock();
+        loop {
+            let mut buf: Vec<u8> = Vec::new();
+            match handle.read_until(b'\n', &mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[laew] stdin 读取失败: {e}(已忽略,继续等待下一行)");
+                    continue;
+                }
+            }
+            // 容错 UTF-8 解码:无效字节替换为 U+FFFD,而非上抛错误
+            let line = String::from_utf8_lossy(&buf)
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
             if line.trim().is_empty() {
                 continue;
             }

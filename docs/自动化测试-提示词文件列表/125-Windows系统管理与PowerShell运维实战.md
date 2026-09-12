@@ -13,6 +13,7 @@
 ---
 
 ### DQ01 PowerShell 管道与对象处理
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq01_pipeline.sh → q2 Bash grep 双断言(Name + Id) → q3 Write dq01_report.sh → q4 Bash grep -c 'Stopped' ≥ 1;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 
 - **预期档位**: medium
 - **考察维度**: PowerShell 对象管道 / cmdlet 组合 / 格式化输出
@@ -26,6 +27,7 @@
 ### DQ02 WMI/CIM 系统信息查询
 
 - **预期档位**: medium
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq02_*.sh → q2 Bash 验证 → q3 Write dq02_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: WMI 查询 / 系统硬件信息 / 类层次结构
 - **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
@@ -37,6 +39,7 @@
 ### DQ03 Windows 事件日志分析
 
 - **预期档位**: medium
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq03_*.sh → q2 Bash 验证 → q3 Write dq03_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: 事件日志过滤 / 安全审计 / 时间范围查询
 - **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
@@ -48,6 +51,7 @@
 ### DQ04 注册表操作与系统配置
 
 - **预期档位**: medium
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq04_*.sh → q2 Bash 验证 → q3 Write dq04_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: 注册表 CRUD / 系统配置 / 环境变量
 - **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
@@ -59,6 +63,7 @@
 ### DQ05 服务与进程管理自动化
 
 - **预期档位**: medium
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq05_*.sh → q2 Bash 验证 → q3 Write dq05_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: 服务管理 / 进程监控 / 自动化启停
 - **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
@@ -70,6 +75,7 @@
 ### DQ06 NTFS 权限与 ACL 管理
 
 - **预期档位**: medium
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq06_*.sh → q2 Bash 验证 → q3 Write dq06_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: ACL 读取 / 权限审计 / 访问控制
 - **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
@@ -81,6 +87,7 @@
 ### DQ07 计划任务编排与管理
 
 - **预期档位**: medium
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq07_*.sh → q2 Bash 验证 → q3 Write dq07_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: 计划任务 CRUD / 触发器配置 / 任务调度
 - **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:
@@ -92,6 +99,7 @@
 ### DQ08 性能计数器与系统监控
 
 - **预期档位**: medium
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq08_*.sh → q2 Bash 验证 → q3 Write dq08_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: 性能计数器 / 实时监控 / 阈值告警
 - **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
@@ -103,6 +111,7 @@
 ### DQ09 WinRM 远程管理与批量执行
 
 - **预期档位**: hard
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq09_*.sh → q2 Bash 验证 → q3 Write dq09_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: 远程管理 / 批量执行 / 凭据安全
 - **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
@@ -114,6 +123,7 @@
 ### DQ10 Windows 更新管理与补丁审计
 
 - **预期档位**: medium
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write dq10_*.sh → q2 Bash 验证 → q3 Write dq10_*.sh → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路,iter=5 tools=4 ok=4;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: 更新管理 / 补丁审计 / 合规检查
 - **工具链**: Write → Bash → Read → Bash
 - **对话脚本**:

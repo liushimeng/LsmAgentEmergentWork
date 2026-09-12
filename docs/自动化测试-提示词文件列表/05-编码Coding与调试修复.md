@@ -9,6 +9,7 @@
 
 ### E01 实现 wc 命令行工具
 - **测试状态**: ✅ 已测试（2026-09-11 第三十四轮 mock 多轮路由修复后 TUI 4 轮全过:q1 Write wc.py → q2 管道验证 lines=2 words=5 bytes=9 + json_ok → q3 Read+Write test_wc.py(6 用例) → q4 tests=6 failures=0;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;详见 tmpPlan/2026-09-11_12-E01-E02-E04-E05编程提示词测试与mock多轮路由修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write e01_* → q2 Bash 验证 → q3 Write e01_* → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **预期档位**: medium
 - **考察维度**: 完整工程实现能力 + 测试闭环
 - **工具链**: Write → Bash → Read → Write
@@ -52,6 +53,7 @@
   4. Bash：`python3 tmpPlan/agent-test/lru_mt.py 2>&1 | tee tmpPlan/agent-test/lru_mt.log`，断言 `lru_mt.log` 含 "race_ok" 或 "final_count=" 且无 "Error"（grep -F 校验）。
 
 ### E05 正则表达式实战
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write e05_* → q2 Bash 验证 → q3 Write e05_* → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **测试状态**: ✅ 已测试（2026-09-11 第三十四轮 mock 多轮路由修复后 TUI 4 轮全过:q1 Write re_demo.py(4 正则×3 断言) → q2 regex_ok → q3 双 Write sample_log.txt+extract.py → q4 extracted.log 手机号 3 条/IP 4 条(各≥1);simple 档直通 SubAgent;详见 tmpPlan/2026-09-11_12-E01-E02-E04-E05编程提示词测试与mock多轮路由修复方案.md）
 - **预期档位**: simple
 - **考察维度**: 正则编写 + 实测断言
@@ -87,6 +89,7 @@
 ### E08 性能优化实战
 - **测试状态**: ✅ 已测试（2026-09-11 第四十轮 macOS 隔离环境 mock 复测 4 轮全过:q1 Write slow.py(O(n²) 基线 554B) → q2 time slow.py 落盘 slow.log(dup_removed=46000 elapsed=0.780) + grep 双断言 → q3 Read slow.py+Write fast.py(dict.fromkeys O(n) 522B) → q4 time fast.py 落盘 fast.log(dup_removed=46000 elapsed=0.001) + awk 加速比断言 SPEEDUP_OK(实际 780x);hard 档 Plan→Main-Work→SubAgent 全链路;**本轮新发现并修复 mock router Plan 段失配**(用 plan.keywords 优先 + 命中但无 plan 字段 continue 后续规则)以及 router rule 关键词宽词截胡(去掉 "E08"/"D09" 宽词保留 Qn 特异性),详见 tmpPlan/2026-09-11_20-E08-D09-性能对比与ripgrep演练测试方案.md）
 - **预期档位**: hard
+- **测试状态**: ✅ 已测试（2026-09-12 第 45 轮 Windows 11 / laew mock 4 轮全过:q1 Write e08_* → q2 Bash 验证 → q3 Write e08_* → q4 Bash 验证;medium 档 Yolo→Main-Work→SubAgent→QC 全链路;详见 tmpPlan/2026-09-12_45-Windows-DQ-F批量测试与TUI-stdin-UTF-8修复方案.md）
 - **考察维度**: 性能分析 + 优化策略 + 对比
 - **工具链**: Write → Bash → Read → Write
 - **对话脚本**:
