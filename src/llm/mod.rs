@@ -474,9 +474,18 @@ mod tests {
         assert!(!endpoint_host_is_ip(""));
     }
 
+    /// LAEW_TLS_INSECURE 是进程级环境变量,两个 tls 测试并发 set/remove 会互踩
+    /// (第 50 轮实测:override 测试设 1 的窗口内,auto 测试的域名严格断言必炸)。
+    static TLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_tls_env() -> std::sync::MutexGuard<'static, ()> {
+        TLS_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn tls_insecure_auto_mode_relaxes_only_ip_hosts() {
         // 未设置环境变量 → 自动模式:IP 放宽 / 域名严格
+        let _env = lock_tls_env();
         std::env::remove_var("LAEW_TLS_INSECURE");
         assert!(tls_insecure_for("https://8.130.85.252:29003"));
         assert!(!tls_insecure_for("https://api.anthropic.com"));
@@ -484,6 +493,7 @@ mod tests {
 
     #[test]
     fn tls_insecure_env_overrides_auto_mode() {
+        let _env = lock_tls_env();
         // 全局宽松
         std::env::set_var("LAEW_TLS_INSECURE", "1");
         assert!(tls_insecure_for("https://api.anthropic.com"));

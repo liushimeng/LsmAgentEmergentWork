@@ -379,6 +379,10 @@ mod tests {
         let content = std::fs::read_to_string(reports[0].path()).expect("read CrashDump");
         assert!(content.contains("smoke ****REDACTED"));
         assert!(!content.contains("abcdefghijklmno"));
-        assert!(content.contains("src/crash.rs"));
+        // Windows 适配:panic Location 的 file 在 MSVC 目标上用 `\` 分隔
+        assert!(
+            content.contains("src/crash.rs") || content.contains("src\\crash.rs"),
+            "CrashDump 应含 panic 位置: {content}"
+        );
     }
 }

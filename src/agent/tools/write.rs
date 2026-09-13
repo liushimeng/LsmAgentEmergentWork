@@ -13,19 +13,24 @@ use crate::agent::tools::Tool;
 use crate::error::{AgentError, Result};
 
 pub struct WriteTool {
-    sandbox: SandboxConfig,
+    sandbox: Option<SandboxConfig>,
 }
 
 impl WriteTool {
     pub fn new(sandbox: SandboxConfig) -> Self {
-        Self { sandbox }
+        Self {
+            sandbox: Some(sandbox),
+        }
     }
 
     /// 向后兼容:无沙箱限制(仅测试用)。
     #[cfg(test)]
     pub fn without_sandbox() -> Self {
         Self {
-            sandbox: SandboxConfig::for_test(PathBuf::from("/"), PathBuf::from("/")),
+            // 真旁路:None = 完全跳过 check_write_path。旧实现用 for_test("/","/")
+            // 让根目录放行一切,在 Windows 上依赖「cwd 盘符 == 目标盘符」
+            //(tempdir 在 C: 而仓库在 D: 时必拒),第 50 轮 CwdGuard 修复后现形。
+            sandbox: None,
         }
     }
 }
@@ -73,7 +78,10 @@ impl Tool for WriteTool {
         // 沙箱拦截:Check-What-You-Write —— 先解析出最终落盘路径,再对该路径做
         // 白名单检查,保证「检查的就是要写的」(2026-09-09 第 08 轮沙箱细化)。
         let path = resolve_path(path_str);
-        check_write_path(&self.sandbox, self.name(), &path.to_string_lossy())?;
+        match &self.sandbox {
+            Some(cfg) => check_write_path(cfg, self.name(), &path.to_string_lossy())?,
+            None => {} // without_sandbox:测试/特殊场景真旁路
+        };
 
         // F12(2026-09-10 第 25 轮):记录「本次是否新建了父目录」。SubAgent 曾把
         // 相对路径误写成 `TestWorkSpace/xxx`(工作目录已是 TestWorkSpace),静默

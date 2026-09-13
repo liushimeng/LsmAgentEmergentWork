@@ -38,6 +38,24 @@ fn current_work_dir() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
+/// `LAEW_BASH_UTF8=1/true/yes/on` 时为 bash 子进程注入 UTF-8 语言环境。
+///
+/// 2026-09-13 第 50 轮:Windows 下 python(WindowsApps 3.12)与部分 coreutils
+/// 按区域设置(cp936/GBK)编码输出,laew 侧 `from_utf8_lossy` 后中文变 U+FFFD 乱码;
+/// Agent 生成的脚本被迫逐个 `sys.stdout.reconfigure(encoding="utf-8")`(本轮 9 个
+/// 脚本踩坑)。开关打开后注入 `PYTHONUTF8/PYTHONIOENCODING/LC_ALL/LANG`,
+/// 把编码义务收进工具层。行尾(文本模式 CRLF)不受编码影响,精确 diff 场景仍需
+/// 脚本自行 `reconfigure(newline=...)`。
+fn utf8_env_enabled() -> bool {
+    match std::env::var("LAEW_BASH_UTF8") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// bash 二进制路径(Windows 进程内缓存;首次解析失败后回退 None)。
 ///
 /// 2026-09-12 第 44 轮:Windows 11 默认 PATH 中
@@ -254,6 +272,13 @@ impl Tool for BashTool {
         // -c 单条命令直接执行
         cmd.arg("-c").arg(&command);
         cmd.current_dir(current_work_dir());
+        // 可选 UTF-8 子进程环境(见 utf8_env_enabled 文档)
+        if utf8_env_enabled() {
+            cmd.env("PYTHONUTF8", "1");
+            cmd.env("PYTHONIOENCODING", "utf-8");
+            cmd.env("LC_ALL", "C.UTF-8");
+            cmd.env("LANG", "C.UTF-8");
+        }
         // 不连 stdin:防止意外阻塞等待输入
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
@@ -506,5 +531,25 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("<exit_code>0</exit_code>"));
+    }
+
+    #[tokio::test]
+    async fn utf8_env_switch_injects_and_defaults_off() {
+        // 合并为单测试顺序执行:两个 #[test] 并行跑会因进程级 env 互相竞态
+        std::env::set_var("LAEW_BASH_UTF8", "1");
+        let on = BashTool
+            .execute(json!({"command": "echo \"$LC_ALL/$PYTHONUTF8/$PYTHONIOENCODING\""}))
+            .await
+            .unwrap();
+        assert!(
+            on.contains("C.UTF-8/1/utf-8"),
+            "子进程应注入 UTF-8 环境,实际: {on}"
+        );
+        std::env::remove_var("LAEW_BASH_UTF8");
+        let off = BashTool
+            .execute(json!({"command": "echo \"[$PYTHONUTF8]\""}))
+            .await
+            .unwrap();
+        assert!(off.contains("[]"), "默认不注入,实际: {off}");
     }
 }

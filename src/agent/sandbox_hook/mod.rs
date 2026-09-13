@@ -105,10 +105,26 @@ pub fn check_write_path(cfg: &SandboxConfig, tool_name: &str, target_path: &str)
     // 拦截(path 报「规范化后的真实落点」,便于 LLM 自纠)
     Err(AgentError::SandboxViolation {
         tool: tool_name.into(),
-        path: canonical.display().to_string(),
-        work_dir: cfg.work_dir.display().to_string(),
-        temp_dir: cfg.temp_dir.display().to_string(),
+        path: display_path(&canonical),
+        work_dir: display_path(&cfg.work_dir),
+        temp_dir: display_path(&cfg.temp_dir),
     })
+}
+
+/// 展示用路径:剥掉 Windows canonicalize 产生的 verbatim 前缀(`\\?\` / `\\?\UNC\`)。
+///
+/// 2026-09-13 第 50 轮:错误信息里泄漏 `\\?\D:\...` 前缀既难读,也让跨平台断言
+/// 与 LLM 自纠提示不一致(`error_reports_normalized_path` 在 Windows 失败的根因:
+/// canonicalize 返回 verbatim 形态,`contains("/etc/evil.txt")` 永不命中)。
+fn display_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    }
 }
 
 /// 路径规范化:先词典序折叠 `.`/`..`,再对「最深已存在祖先」做 canonicalize 拼回尾部。
@@ -180,16 +196,41 @@ fn starts_with(path: &Path, prefix: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// Windows 下 drive-less 绝对路径(`/home/...`)按当前 cwd 的盘符解析;
+    /// 任何测试 chdir 都会瞬移其它并发测试的解析基准(第 50 轮实测:
+    /// tempdir 落 C: 盘而仓库在 D: 盘,`/home/user/proj` 被解析成 C:\home\...)。
+    /// 模块内全部测试经此锁串行化;chdir 测试额外用 CwdGuard 保证 panic 也恢复。
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
+        CWD_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
     #[test]
     fn allows_write_under_work_dir() {
+        let _cwd_guard = lock_cwd();
         let cfg = SandboxConfig::for_test(PathBuf::from("/home/user/proj"), PathBuf::from("/tmp"));
-        assert!(check_write_path(&cfg, "Write", "/home/user/proj/src/main.rs").is_ok());
-        assert!(check_write_path(&cfg, "Write", "/home/user/proj").is_ok());
-        assert!(check_write_path(&cfg, "Edit", "/home/user/proj/a/b/c.txt").is_ok());
+        for p in [
+            "/home/user/proj/src/main.rs",
+            "/home/user/proj",
+            "/home/user/proj/a/b/c.txt",
+        ] {
+            if let Err(e) = check_write_path(&cfg, "Write", p) {
+                panic!("工作目录内写入被误拦截({p}): {e}");
+            }
+        }
     }
 
     #[test]
     fn allows_write_under_temp_dir() {
+        let _cwd_guard = lock_cwd();
         let cfg = SandboxConfig::for_test(PathBuf::from("/home/user/proj"), PathBuf::from("/tmp"));
         assert!(check_write_path(&cfg, "Write", "/tmp/laew-output.txt").is_ok());
         assert!(check_write_path(&cfg, "Write", "/tmp/a/b/c").is_ok());
@@ -197,6 +238,7 @@ mod tests {
 
     #[test]
     fn rejects_write_outside_whitelist() {
+        let _cwd_guard = lock_cwd();
         let cfg = SandboxConfig::for_test(PathBuf::from("/home/user/proj"), PathBuf::from("/tmp"));
         let err = check_write_path(&cfg, "Write", "/etc/passwd").unwrap_err();
         assert!(matches!(err, AgentError::SandboxViolation { .. }));
@@ -204,6 +246,7 @@ mod tests {
 
     #[test]
     fn rejects_parent_escape_attempt() {
+        let _cwd_guard = lock_cwd();
         let cfg = SandboxConfig::for_test(PathBuf::from("/home/user/proj"), PathBuf::from("/tmp"));
         // ../../../etc/passwd 基于当前工作目录解析后跳出工作目录
         // 注意:这个测试的语义取决于 cwd;如果 cwd 在 /home/user/proj 下,则跳出会被拦截
@@ -214,6 +257,7 @@ mod tests {
 
     #[test]
     fn rejects_home_dir() {
+        let _cwd_guard = lock_cwd();
         let cfg = SandboxConfig::for_test(PathBuf::from("/home/user/proj"), PathBuf::from("/tmp"));
         let err = check_write_path(&cfg, "Edit", "/home/user/.bashrc").unwrap_err();
         assert!(matches!(err, AgentError::SandboxViolation { .. }));
@@ -221,6 +265,7 @@ mod tests {
 
     #[test]
     fn string_prefix_false_positive() {
+        let _cwd_guard = lock_cwd();
         // /home/user/proj2 不应被视为 /home/user/proj 的子目录
         let cfg = SandboxConfig::for_test(PathBuf::from("/home/user/proj"), PathBuf::from("/tmp"));
         let err = check_write_path(&cfg, "Write", "/home/user/proj2/evil.txt").unwrap_err();
@@ -229,12 +274,16 @@ mod tests {
 
     #[test]
     fn relative_path_resolved_against_cwd() {
+        // 注意:本测试有两层保护,名字必须互异 —— let 遮蔽不会提前 drop 旧绑定,
+        // 同名会导致两个 MutexGuard 共存、同线程重入 lock_cwd() 死锁(第 50 轮实测)。
+        let _lock = lock_cwd();
         // 相对路径应基于 current_dir 解析
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().to_path_buf();
         // 使用 /var/run 作为临时目录(不太可能与 tempdir 重合)
         let cfg = SandboxConfig::for_test(work.clone(), PathBuf::from("/var/run"));
-        // 把当前工作目录切到 work
+        let _cwd_guard = CwdGuard(std::env::current_dir().unwrap());
+        // 把当前工作目录切到 work(守卫保证 panic/结束都恢复,不污染并发测试)
         std::env::set_current_dir(&work).unwrap();
         assert!(check_write_path(&cfg, "Write", "src/main.rs").is_ok());
         // ../other 解析后是 work 的父目录下的 other,不在白名单内
@@ -247,6 +296,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_escape_blocked() {
+        let _cwd_guard = lock_cwd();
         use std::os::unix::fs::symlink;
         let work = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -272,6 +322,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_whitelist_root_still_allowed() {
+        let _cwd_guard = lock_cwd();
         use std::os::unix::fs::symlink;
         let real = tempfile::tempdir().unwrap();
         let alias_parent = tempfile::tempdir().unwrap();
@@ -287,6 +338,7 @@ mod tests {
     /// canonical_prefix:自目标向上找最深已存在祖先,canonicalize 后拼回尾部。
     #[test]
     fn canonical_prefix_resolves_deepest_existing_ancestor() {
+        let _cwd_guard = lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let deep = dir.path().join("a/b");
         std::fs::create_dir_all(&deep).unwrap();
@@ -308,10 +360,15 @@ mod tests {
     /// 拦截错误中 path 字段报告「规范化后的真实落点」(而非原始入参)。
     #[test]
     fn error_reports_normalized_path() {
+        let _cwd_guard = lock_cwd();
         let cfg = SandboxConfig::for_test(PathBuf::from("/home/user/proj"), PathBuf::from("/tmp"));
         let err = check_write_path(&cfg, "Write", "/home/user/proj/../../../../etc/evil.txt")
             .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("/etc/evil.txt"), "错误应包含规范化路径: {msg}");
+        // Windows 适配:canonicalize 落到当前盘符且分隔符为 `\`;统一斜杠后断言,
+        // 同时确认 verbatim 前缀(`\\?\`)已被 display_path 剥除。
+        let norm = msg.replace('\\', "/");
+        assert!(norm.contains("/etc/evil.txt"), "错误应包含规范化路径: {msg}");
+        assert!(!msg.contains(r"\\?\"), "错误不应泄漏 verbatim 前缀: {msg}");
     }
 }
