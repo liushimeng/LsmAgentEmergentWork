@@ -37,6 +37,7 @@ pub mod subagent;
 pub mod system_prompt;
 pub mod tool_schema_validator;
 pub mod tools;
+pub mod workspace;
 pub mod yolo;
 
 use std::sync::Arc;
@@ -249,11 +250,17 @@ impl Agent {
             // 仅在对应计数器 > 0 时追加,全 0 时返回空串,不影响 LLM 上下文;
             // 拼到 system 末尾,不破坏 cache_control 缓存前缀。
             let base_system = self.profile.system_prompt.render(self.llm.protocol());
+            // 工作区运行时快照(2026-09-13 第 01 轮,D4):让**执行层** Agent
+            // (SubAgent-Work / Main-Work / Plan)也拿到工程类型、工具链、git 状态、
+            // 平台与日期 —— 此前只有 Yolo 通过 PROJECT_CONTEXT 消息可见。
+            // 进程级 TTL 缓存(默认 5s),同任务内多次调用复用同一快照,开销可忽略;
+            // 空目录返回空串,不改变既有 system 语义。
+            let workspace_hint = crate::agent::workspace::hint_block();
             let runtime_hints = build_runtime_hints(&trace, consecutive_failures);
-            let system = if runtime_hints.is_empty() {
+            let system = if workspace_hint.is_empty() && runtime_hints.is_empty() {
                 base_system
             } else {
-                format!("{base_system}{runtime_hints}")
+                format!("{base_system}{workspace_hint}{runtime_hints}")
             };
             // 上下文溢出自动恢复(L1038/L1044,2026-09-09 第 06 轮):
             // LLM 调用命中 prompt-too-long 类溢出错误时,自动执行

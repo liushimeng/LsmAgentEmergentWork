@@ -151,7 +151,7 @@
 
 ---
 
-*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-11 第三十六轮(QC 强失败信号分级 + 预期负例契约链路修复:`src/agent/quality.rs::gate_report_on_trace` LA-3 text_failure_phrase 降为证据可豁免 + `src/agent/mod.rs` LA-4 last_bash_exit_code 无条件更新 + mock OpenAI 分支 call_no≥2 路由/Plan 路由/终答摘录三补;方案 `tmpPlan/2026-09-11_17-D06-E07-jq分组与生产者消费者测试及预期负例契约修复方案.md`),此前:2026-09-11 第三十七轮(D6-CtrlJ 输入拦截:`src/tui/input.rs` 显式拦截 Char('j')+CONTROL(LF 按键)插空格 + Char(c) 兜底对未绑定 CONTROL 修饰不产生字符;mock hard 档 plan 路由段 + SubAgent 规则锁定 BUG-M5;方案 `tmpPlan/2026-09-11_15-E08-D09编程检索提示词测试与TUI输入CtrlJ拦截方案.md`),此前:2026-09-10 第二十四轮(D3 对话 Rewind/分支:`src/agent/session_fork.rs` 轮次扫描 + `src/tui/branches.rs` 分支存储 + `/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,三处一致不变量 + 零丢失快照语义,方案 `tmpPlan/2026-09-10_07-D3对话Rewind与分支方案.md`),此前:2026-09-10 第二十三轮(D12 多主题系统 + /theme + LAEW_THEME 环境变量,4 主题:default / dark-contrast / light / daltonized;`src/tui/theme.rs` 保留所有现有 const + 新增 ThemeKind/Palette/4 套 Palette 常量表 + palette()/set_active()/active_kind()/from_env()/from_env_str() API;核心 cell 渲染位置 Cell::blank / engine::border_box / render/diff / render/highlight 改用 palette() 实时跟随主题;`src/tui/{completion,mod}.rs` 新增 /theme builtin + banner 主题提示行 + run_theme dispatch + help 行;单元测试新增 8 项全过;e2e LAEW_THEME=daltonized 启动 banner /theme 列出 4 主题 /theme dark-contrast 实时切换 /theme nope 未知报错;方案 `tmpPlan/2026-09-10_03-D12多主题系统与a11y配色方案.md`),此前:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
+*本表由 2026-09-08 第 03 轮(方案:`tmpPlan/2026-09-08_03-LLM自动弹性层与JSON自动修复链方案.md`)建立;后续每轮实现后回填。最近回填:2026-09-13 第 01 轮(D4 工作区感知:`src/agent/workspace.rs` 懒刷新快照 + 8 角色 system brief + PROJECT_CONTEXT 工作区段 + TUI 横幅/`/workspace`/任务后变更提示;方案 `tmpPlan/2026-09-13_01-工作区感知与运行时环境注入方案.md`),此前:2026-09-11 第三十六轮(QC 强失败信号分级 + 预期负例契约链路修复:`src/agent/quality.rs::gate_report_on_trace` LA-3 text_failure_phrase 降为证据可豁免 + `src/agent/mod.rs` LA-4 last_bash_exit_code 无条件更新 + mock OpenAI 分支 call_no≥2 路由/Plan 路由/终答摘录三补;方案 `tmpPlan/2026-09-11_17-D06-E07-jq分组与生产者消费者测试及预期负例契约修复方案.md`),此前:2026-09-11 第三十七轮(D6-CtrlJ 输入拦截:`src/tui/input.rs` 显式拦截 Char('j')+CONTROL(LF 按键)插空格 + Char(c) 兜底对未绑定 CONTROL 修饰不产生字符;mock hard 档 plan 路由段 + SubAgent 规则锁定 BUG-M5;方案 `tmpPlan/2026-09-11_15-E08-D09编程检索提示词测试与TUI输入CtrlJ拦截方案.md`),此前:2026-09-10 第二十四轮(D3 对话 Rewind/分支:`src/agent/session_fork.rs` 轮次扫描 + `src/tui/branches.rs` 分支存储 + `/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,三处一致不变量 + 零丢失快照语义,方案 `tmpPlan/2026-09-10_07-D3对话Rewind与分支方案.md`),此前:2026-09-10 第二十三轮(D12 多主题系统 + /theme + LAEW_THEME 环境变量,4 主题:default / dark-contrast / light / daltonized;`src/tui/theme.rs` 保留所有现有 const + 新增 ThemeKind/Palette/4 套 Palette 常量表 + palette()/set_active()/active_kind()/from_env()/from_env_str() API;核心 cell 渲染位置 Cell::blank / engine::border_box / render/diff / render/highlight 改用 palette() 实时跟随主题;`src/tui/{completion,mod}.rs` 新增 /theme builtin + banner 主题提示行 + run_theme dispatch + help 行;单元测试新增 8 项全过;e2e LAEW_THEME=daltonized 启动 banner /theme 列出 4 主题 /theme dark-contrast 实时切换 /theme nope 未知报错;方案 `tmpPlan/2026-09-10_03-D12多主题系统与a11y配色方案.md`),此前:2026-09-10 第二十二轮(D6 输入体验:bracketed paste + 大粘贴 marker 登记簿 L1573 + 10000 字符截断注入 L1448 + 快速输入批量合并,模块 `src/tui/input.rs`,方案 `tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`),此前:2026-09-10 第 17 轮(用户交互体验层 D2+D8),此前:2026-09-09 第 13 轮(结构化输出强制通道 L6+L19)、第 12 轮(Prompt 注入防护 L1208)、第 08 轮(Write/Edit 沙箱白名单细化)、第 07 轮(SQLite 并发 WAL 加固 L1041+L1042)、第 06 轮(上下文溢出 L1038+L1044)、第 05 轮(SubAgent 执行轨迹)。*
 
 ---
 
@@ -164,7 +164,7 @@
 | D1 | @提及系统 | ❌ 第 18 轮首次 + 第 28 轮落地 | 🟡 70%(✅ 2026-09-10 第二十八轮:`@path`/`@"带空格"`/`@path#L10-20` 提取注入 `src/agent/attachments.rs` + TUI @ 实时路径补全 `src/tui/mention.rs`;未做 IDE 双向注入/already_read mtime 去重/PDF 引用/nucleo 模糊匹配) | L1396-L1397 / L1426-L1427 / L1456+ / L1486+ / L1516-L1517 / L1546+ |
 | D2 | 自定义斜杠命令/Prompt 模板 | ❌ 第 18 轮首次 | 🟡 40%(✅ 2026-09-10:两级目录 `.laew/commands` + frontmatter + `$ARGUMENTS`/`$1-$9` + 补全集成 + `/commands`;未做 allowed-tools/model/`!`shell``/递归命名空间) | L1398-L1399 / L1428-L1434 / L1457+ / L1487-L1490 / L1518-L1521 / L1547+ |
 | D3 | 对话 Rewind/分支/时间旅行 | 🟡 第 18 轮首次(用户级) + 第 24 轮落地 | 🟡 60%(✅ 2026-09-10 第二十四轮:`/rewind [N]` `/undo` `/fork` `/branches` `/switch` 五命令 + /clear 自动快照,内存分支存储上限 10;未做:文件侧恢复/Git checkpoint 联动/消息树持久化/in-place 编辑) | L1400 / L1435+ / L1458+ / L1491-L1497 / L1522-L1527 / L1548+ |
-| D4 | 文件监视与工作区感知 | ❌ 第 18 轮首次(运行时) | ❌ 0% | L1415+ (预留) / L1459+ / L1498-L1499 / L1549+ |
+| D4 | 文件监视与工作区感知 | ❌ 第 18 轮首次(运行时) | 🟡 75%(✅ 2026-09-13 第 01 轮:`src/agent/workspace.rs` 懒刷新快照(git/工程类型/工具链/顶层结构/最近改动)+ 8 角色 system brief + PROJECT_CONTEXT 工作区段 + TUI 横幅/`/workspace`/任务后变更提示;未做:文件系统监听/快照持久化/mtime 与 @提及去重联动) | L1415+ (预留) / L1459+ / L1498-L1499 / L1549+ |
 | D5 | 工具输出富文本内容渲染 | ❌ 第 18 轮首次(内容层) | ❌ 5%(cell-based 纯文本) | L1401-L1402 / L1436-L1445 / L1460+ / L1500-L1506 / L1528-L1530 / L1550+ |
 | D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 55%(✅ 2026-09-10 第二十二轮:bracketed paste + 大粘贴 marker 登记簿 L1573 + 提交展开/10000 字符截断注入 L1448 + 快速输入批量合并;未做多行编辑器/Vim 模式/kill ring;✅ 2026-09-11 第三十七轮补 Ctrl+J/LF 按键拦截与 CONTROL 通用防护) | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
 | D7 | Onboarding/目录信任/主题 | ❌ 第 18 轮首次 | ❌ 10%(1 套 ANSI) | L1406-L1409 / L1451+ / L1462+ / L1507-L1513 / L1540+ / L1552+ |
@@ -545,3 +545,43 @@ E07 4 轮(-debug,预期负例契约达成 + processed=100)TUI 全过;cargo test 
 **未做(后续候选)**:L1841-L1850 本地缓存 / L1851-L1860 队列持久化 / L1861-L1870 同步合并 / 队列优先级。
 
 **累计**:本轮新增 3 ✅(L1821-L1830/L1831-L1840/L1871-L1880),累计实现 gap 持续增长。
+
+---
+
+## 十一、2026-09-13 第 01 轮登记(D4 文件监视与工作区感知 —— 懒刷新派落地)
+
+**主题**:第十八轮 D4 维度(laew 现状 0%)首次落地。laew 原本只有「说明文件五级链」发现,
+且**注入只到 Yolo 入口层** —— 真正调用 Bash 的 SubAgent-Work 看不到工程类型 / 工具链 /
+git 状态 / 平台 / 日期,只能 `ls` 试探,常猜错构建命令(`npm test` vs `cargo test`)。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| L1498-L1499 | openclaw D4:工作区感知(工程类型/变更/结构) | P1 | ✅ | `src/agent/workspace.rs::snapshot`(git status/log 子进程 + 11 类工程标记表 + 顶层结构 + walkdir 最近改动 6h 窗口 + 16 类忽略目录) | 2026-09-13 第 01 轮 |
+| L1459+ | deepseek-harness D4:事件驱动 invalidate(无 watcher 依赖) | P1 | ✅ | `workspace::invalidate()` 进程级 TTL 缓存(默认 5s,`LAEW_WORKSPACE_TTL_SECS` 可调)+ `tui/dispatch.rs` 任务结束后失效缓存 → 下一轮 brief 反映任务后真实状态 | 2026-09-13 第 01 轮 |
+| L1549+ | pi D4:Git HEAD / 分支感知 | P1 | ✅ | `workspace::collect_git`(`git status --porcelain=v1 -b` + `git log -3 --format=%h %s` + `rev-parse --short HEAD` 兜底;2s 超时 + 读取线程防死锁) | 2026-09-13 第 01 轮 |
+| D4-env | 平台 / 日期 / 架构环境信息缺失(claudecode 系统提示词内置) | P1 | ✅ | `hint_block()`(约 35 token,System 末尾,8 角色每次调用可见)+ `render_section()`(会话级 PROJECT_CONTEXT 段) | 2026-09-13 第 01 轮 |
+| D4-execlayer | 执行层 Agent 无环境可见性(注入只到 Yolo) | P0 | ✅ | `src/agent/mod.rs::run_session_inner` system 组装点追加 `<<<LAEW:WORKSPACE>>>` 块(与 RUNTIME_HINTS 同位置,不改 `build_runtime_hints` 契约) | 2026-09-13 第 01 轮 |
+| D4-tui | 工作区状态不可见 / 任务改动不可感知 | P2 | ✅ | `tui/mod.rs` 横幅「工作区」行 + `/workspace [refresh]`(别名 `/ws`)+ `tui/dispatch.rs::print_workspace_delta` 任务前后 `变更 N → M(+k): 文件` 自动提示 | 2026-09-13 第 01 轮 |
+
+**设计要点**:
+- **懒刷新派**:知识库三派(hot watcher / 事件总线 / lazy refresh)中取懒刷新 + TTL 缓存,
+  **不引入 `notify`**(遵守工程依赖约定);快照显式声明「可能略滞后于磁盘」,精确状态以工具为准。
+- **触发条件放宽但空目录语义不变**:`build_message` 由「有说明文件」放宽为「有说明文件 **或** 工作区非空」
+  —— 无 Markdown 的 git 仓库 / 有工程标记的目录也注入;空目录(`is_trivial`)仍不注入(e2e §5b 场景C 契约保持)。
+- **子进程安全**:std 无 `wait_timeout`,「先 try_wait 再读管道」在 >64KB 输出时死锁 ——
+  用独立线程排空 stdout + 轮询 + 到期 kill;超时路径不 join(句柄 drop 即 detach),防孙进程持管道永久阻塞。
+- **零回归**:`build_runtime_hints` 本体未改(其 8 项单测契约保持),brief 作为独立块拼在其前。
+
+**验证**:
+- 单元测试 **787 全过**(基线 770 + 新增 17 项 workspace 测试)
+- e2e `run_e2e.sh` **PASS=156 FAIL=0**;新增 §5b 场景A/B 工作区段断言 + **场景D**(无 Markdown 的
+  git 仓库仍注入,新契约)+ §6 仓库根 `LAEW:WORKSPACE` 标记与 `cargo` 工具链建议断言
+- 真链路(mock + 真实 git 仓库):system brief 与 PROJECT_CONTEXT 段内容逐项核对正确
+- TUI tmux 真 PTY:横幅行 / `/workspace` / 任务后 `[工作区] 未提交变更 2 → 3(+1): sandbox-ok.txt`
+
+**方案**:`tmpPlan/2026-09-13_01-工作区感知与运行时环境注入方案.md`
+**设计文档**:`docs/工作区感知与运行时环境注入/01-设计与解决方案.md`
+
+**D4 维度现状**:0% → 75%(未做:文件系统监听 / 快照跨 Session 持久化 / mtime 与 @提及去重联动)。
+
+**累计**:本轮新增 6 ✅(L1459+/L1498-L1499/L1549+/D4-env/D4-execlayer/D4-tui)。

@@ -160,6 +160,9 @@ impl TuiSession {
         // 项目说明文件状态(纯探测,不触发生成;发现规则见 docs/Yolo项目上下文注入/)
         let doc_source = crate::agent::project_context::probe(&self.paths.work_dir);
         println!("║  项目说明: {} ║", fit_display(doc_source.as_str(), 45));
+        // 工作区感知(D4,2026-09-13):工程类型 + git 分支/变更,与注入给模型的一致
+        let ws = crate::agent::workspace::snapshot(&self.paths.work_dir);
+        println!("║  工作区 : {} ║", fit_display(&Self::workspace_status_line(&ws), 45));
         match active {
             Some(r) => println!(
                 "║  当前模型: {} ║",
@@ -196,6 +199,28 @@ impl TuiSession {
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
         println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出");
         println!();
+    }
+
+    /// D4 工作区感知:生成工作区状态行文本(供横幅显示)。
+    ///
+    /// 形如 `[Rust] git:main · 3 未提交` / `[Node] 非 git` / `空目录`。
+    fn workspace_status_line(ws: &crate::agent::workspace::WorkspaceSnapshot) -> String {
+        if ws.is_trivial() {
+            return "空目录(不注入环境信息)".to_string();
+        }
+        let mut s = format!("[{}]", ws.project_label());
+        if ws.is_git {
+            let branch = ws.branch.as_deref().unwrap_or("?");
+            let dirty_text = if ws.dirty() == 0 {
+                "干净".to_string()
+            } else {
+                format!("{} 未提交", ws.dirty())
+            };
+            s.push_str(&format!(" git:{branch} · {dirty_text}"));
+        } else {
+            s.push_str(" 非 git");
+        }
+        s
     }
 
     /// D13 离线模式:生成连接状态行文本(供横幅显示)。

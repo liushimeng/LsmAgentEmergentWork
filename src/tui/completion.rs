@@ -121,6 +121,13 @@ impl CompletionEngine {
                 "查看连接状态与离线队列",
                 "/offline",
             ),
+            // D4 工作区感知(2026-09-13):环境快照查看
+            SlashCommand::builtin(
+                "workspace",
+                &["ws"],
+                "查看工作区快照(git / 工程类型 / 最近改动)",
+                "/workspace [refresh]",
+            ),
         ];
         Self { builtin, custom: Vec::new() }
     }

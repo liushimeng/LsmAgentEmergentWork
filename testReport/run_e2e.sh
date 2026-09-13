@@ -383,7 +383,9 @@ OUT=$(run "$LAEW" -p "请帮我执行一个测试命令"); echo "$OUT" | grep -q
 # --- 5b. 项目说明文件发现与首次注入(工作目录五级链) ---
 # 规则: CLAUDE.md > AGENTS.md > README.md > 根目录 Markdown 自动生成 README.md > 空
 # 设计见 docs/Yolo项目上下文注入/02-技术实现文档.md §6
-section "5b. 项目上下文注入(说明文件五级链)"
+# 2026-09-13 第 01 轮(D4 工作区感知):注入消息在说明文件正文后追加「工作区快照」段;
+# 场景D 新增契约 —— 无 Markdown 但是 git 仓库时也注入(空目录=场景C 仍不注入)。
+section "5b. 项目上下文注入(说明文件五级链 + D4 工作区快照)"
 CTX_BASE=/tmp/laew-e2e-ctx; rm -rf "$CTX_BASE"
 
 # 场景A:三级并存 → 只注入 CLAUDE.md 内容
@@ -406,11 +408,20 @@ grep -q "架构总览" "$CTX_B/README.md" 2>/dev/null; check $? "场景B: 生成
 CTX_C="$CTX_BASE/c"; mkdir -p "$CTX_C"
 CC0=$(wc -l < "$MOCK_LOG"); (cd "$CTX_C" && run "$LAEW" -p "场景C测试") >/dev/null 2>&1; CC1=$(wc -l < "$MOCK_LOG")
 
-python3 - "$MOCK_LOG" "$CA0" "$CA1" "$CB0" "$CB1" "$CC0" "$CC1" <<'PYEOF' 2>&1 | tee -a "$REPORT"
+# 场景D(D4 工作区感知,2026-09-13 第 01 轮):无 Markdown 但**是 git 仓库**
+# → 说明文件为空但工作区非空,注入「工作区快照」(新语义,空目录仍不注入=场景C)
+CTX_D="$CTX_BASE/d"; mkdir -p "$CTX_D"
+DT_HAS_GIT=1; command -v git >/dev/null 2>&1 || DT_HAS_GIT=0
+[ "$DT_HAS_GIT" = "1" ] && (cd "$CTX_D" && git init -q >/dev/null 2>&1)
+CD0=$(wc -l < "$MOCK_LOG"); (cd "$CTX_D" && run "$LAEW" -p "场景D测试") >/dev/null 2>&1; CD1=$(wc -l < "$MOCK_LOG")
+
+python3 - "$MOCK_LOG" "$CA0" "$CA1" "$CB0" "$CB1" "$CC0" "$CC1" "$CD0" "$CD1" "$DT_HAS_GIT" <<'PYEOF' 2>&1 | tee -a "$REPORT"
 import json, sys
 path = sys.argv[1]
-args = [int(x) for x in sys.argv[2:8]]
-ranges = {"A": (args[0], args[1]), "B": (args[2], args[3]), "C": (args[4], args[5])}
+args = [int(x) for x in sys.argv[2:10]]
+has_git = sys.argv[10] == "1"
+ranges = {"A": (args[0], args[1]), "B": (args[2], args[3]), "C": (args[4], args[5]),
+          "D": (args[6], args[7])}
 reqs = [json.loads(l) for l in open(path, encoding="utf-8")]
 ok = True
 def chk(cond, name):
@@ -439,6 +450,7 @@ if ra:
     chk("PROJ-A-CLAUDE" in texts, "场景A: 注入 CLAUDE.md 内容")
     chk("PROJ-A-AGENTS" not in texts, "场景A: 未注入 AGENTS.md 内容(优先级正确)")
     chk("PROJ-A-README" not in texts, "场景A: 未注入 README.md 内容(优先级正确)")
+    chk("工作区快照" in texts, "场景A: 注入消息含工作区快照段(D4 工作区感知)")
     users = user_texts(ra[0])
     chk(len(users) == 2 and users[-1].strip() == "场景A测试", "场景A: 用户提示词独立成条且未被改写")
 
@@ -449,6 +461,7 @@ if rb:
     texts = "\n".join(all_texts(rb[0]))
     chk("LAEW:PROJECT_CONTEXT" in texts, "场景B: 首请求含项目上下文标记")
     chk("架构总览" in texts, "场景B: 注入自动生成的 README 内容")
+    chk("工作区快照" in texts, "场景B: 注入消息含工作区快照段(D4)")
 
 # 场景C:无 Markdown,不注入
 rc = anth_in(ranges["C"])
@@ -457,6 +470,19 @@ if rc:
     chk(all("LAEW:PROJECT_CONTEXT" not in t for req in rc for t in all_texts(req)), "场景C: 所有请求均无注入标记")
     users = user_texts(rc[0])
     chk(len(users) == 1 and users[0].strip() == "场景C测试", "场景C: user 消息仅用户提示词一条")
+
+# 场景D:无 Markdown 但为 git 仓库 → 仅注入工作区快照(D4 新语义)
+rd = anth_in(ranges["D"])
+chk(len(rd) >= 1, f"场景D: 有 anthropic 请求 ({len(rd)})")
+if rd and has_git:
+    texts = "\n".join(all_texts(rd[0]))
+    chk("LAEW:PROJECT_CONTEXT" in texts, "场景D: git 仓库(无 Markdown)仍注入工作区快照")
+    chk("工作区快照" in texts, "场景D: 注入内容含工作区快照段")
+    chk("未发现 CLAUDE.md" in texts, "场景D: 说明文件缺失时如实标注")
+    users = user_texts(rd[0])
+    chk(len(users) == 2 and users[-1].strip() == "场景D测试", "场景D: 用户提示词独立成条且未被改写")
+elif not has_git:
+    print("  [SKIP] 场景D: 环境无 git,跳过")
 sys.exit(0 if ok else 1)
 PYEOF
 check $? "5b 三场景注入行为校验(mock 日志)"
@@ -761,6 +787,13 @@ if anth:
         and all(isinstance(x, dict) and x.get("type") == "text" and "text" in x for x in _sys)
     )
     chk(_sys_ok, f"anthropic: system 为顶层字符串或 text 块数组 (实际类型: {type(_sys).__name__})")
+    # D4 工作区感知(2026-09-13 第 01 轮):运行时环境 brief 拼在 system 末尾,
+    # 8 角色全生效(执行层 SubAgent 也能看到工程类型 / 工具链 / git 状态)。
+    _sys_text = _sys if isinstance(_sys, str) else "".join(
+        x.get("text", "") for x in _sys if isinstance(x, dict)
+    ) if isinstance(_sys, list) else ""
+    chk("LAEW:WORKSPACE" in _sys_text, "anthropic: system 含运行时工作区 brief(D4 全角色注入)")
+    chk("cargo" in _sys_text, "anthropic: 工作区 brief 含工程工具链建议(cargo)")
     # 双 Agent 架构:Yolo(入口层,仅 Read)+ Work(执行层,全套工具)
     # 找 tools 中含 Bash 的请求(即 Work Agent 的请求),校验工具定义格式
     work_req = next((r for r in anth if any(
@@ -780,6 +813,9 @@ if anth:
     if len(ctx_msgs) == 1:
         t0 = "\n".join(_texts(ctx_msgs[0]))
         chk("工作目录:" in t0 and "CLAUDE.md" in t0, "anthropic: 注入消息含工作目录与说明文件来源")
+        # D4 工作区感知(2026-09-13 第 01 轮):说明文件正文之后追加工作区快照段
+        chk("工作区快照" in t0, "anthropic: 注入消息含工作区快照段(D4)")
+        chk("Git:" in t0, "anthropic: 工作区快照含 Git 状态行(仓库根为 git 仓库)")
     users = [m for m in msgs if m.get("role") == "user"]
     # 2026-09-11 第 34 轮:merge_adjacent_same_role 将 PROJECT_CONTEXT 与用户提示词
     # 合并为同一条 user 消息的两个 text block(兼容严格 Anthropic 网关的 400 拒绝)。

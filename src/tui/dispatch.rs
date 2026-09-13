@@ -91,6 +91,10 @@ impl TuiSession {
         if let Some(collector) = &self.debug {
             collector.reset(self.session.id());
         }
+        // D4 工作区感知(2026-09-13 第 01 轮):任务执行前取一次轻量变更标记,
+        // 任务结束后再取一次,自动向用户呈现「本次任务让工作区变化了什么」。
+        // 非 git 目录返回 is_git=false,对比直接跳过(零噪音)。
+        let ws_before = crate::agent::workspace::change_marker(&self.paths.work_dir);
         println!("  [orchestrator 调度中... Ctrl-C 取消]");
         // 任务开始时间戳(2026-09-10 第 27 轮 F05 / tmpPlan/2026-09-10_22):
         // 用于在「本次用量」行末尾追加总耗时,便于用户感知 LLM 响应速度。
@@ -361,6 +365,8 @@ impl TuiSession {
         };
         if let Some((outcome, context_response, transcript_response, usage)) = entry {
             self.session_usage = merge_usage(self.session_usage, usage);
+            // D4 工作区感知(2026-09-13 第 01 轮):任务结束后的工作区变更提示。
+            self.print_workspace_delta(&ws_before);
             // 多轮对话记忆(2026-09-10 第 23 轮):最终回答回填主上下文。
             // 此前只有 user 提示词进 session.context(),assistant 回复从不回填,
             // 下轮 Yolo 看不到模型自己上轮的回答,「你上面的比方里…」类指代追问
@@ -631,6 +637,62 @@ impl TuiSession {
                 }
             }
         }
+    }
+
+    /// D4 工作区感知(2026-09-13 第 01 轮):任务执行后的工作区变更提示。
+    ///
+    /// 只在「用户可感知的变化」出现时打印:分支切换 / 未提交变更数变化 /
+    /// 新增变更文件。非 git 目录或无变化时静默 —— 避免每轮任务刷屏。
+    /// 同时失效工作区缓存,让下一轮注入的运行时 brief 反映任务后的真实状态。
+    fn print_workspace_delta(&self, before: &crate::agent::workspace::WorkspaceDelta) {
+        crate::agent::workspace::invalidate();
+        if !before.is_git {
+            return;
+        }
+        let after = crate::agent::workspace::change_marker(&self.paths.work_dir);
+        if !after.is_git {
+            return;
+        }
+        let branch_changed = before.branch != after.branch;
+        let new_files: Vec<&String> = after
+            .files
+            .iter()
+            .filter(|f| !before.files.contains(f))
+            .collect();
+        if !branch_changed && after.dirty == before.dirty && new_files.is_empty() {
+            return;
+        }
+        if branch_changed {
+            println!(
+                "  [工作区] 分支 {} → {}",
+                before.branch.as_deref().unwrap_or("?"),
+                after.branch.as_deref().unwrap_or("?")
+            );
+        }
+        if after.dirty != before.dirty {
+            let delta = after.dirty as isize - before.dirty as isize;
+            let sign = if delta > 0 { "+" } else { "" };
+            print!(
+                "  [工作区] 未提交变更 {} → {}({sign}{delta})",
+                before.dirty, after.dirty
+            );
+        } else {
+            print!("  [工作区] 变更文件集变化(共 {} 个未提交)", after.dirty);
+        }
+        if !new_files.is_empty() {
+            let shown: Vec<&str> = new_files
+                .iter()
+                .take(3)
+                .map(|f| f.as_str())
+                .collect();
+            let more = if new_files.len() > shown.len() {
+                format!(" 等 {} 个", new_files.len())
+            } else {
+                String::new()
+            };
+            print!(": {}{more}", shown.join(", "));
+        }
+        println!();
     }
 }
 

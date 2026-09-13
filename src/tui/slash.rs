@@ -162,6 +162,10 @@ impl TuiSession {
             "offline" | "status" => {
                 self.run_offline_status();
             }
+            // D4 工作区感知(2026-09-13):查看/刷新工作区快照。
+            "workspace" | "ws" => {
+                self.run_workspace(rest_args);
+            }
             "" => {}
             other => {
                 // 内置未命中 → 查自定义命令(D2);命中则渲染模板并送编排。
@@ -265,6 +269,32 @@ impl TuiSession {
             println!("  离线队列: 空 (容量 {})", self.offline_queue.capacity());
         }
         println!("  提示:离线时输入自动排队,恢复连接后逐条自动处理。");
+    }
+
+    /// `/workspace [refresh|ws]`(D4,2026-09-13 第 01 轮):查看工作区快照。
+    ///
+    /// - 无参数 / 默认:命中进程级 TTL 缓存(5s)后展示,零额外开销
+    /// - `refresh`(别名 `rf` / `-f`):强制失效缓存并按磁盘真实状态重采集
+    ///
+    /// 展示内容与注入给 Agent 的 `<<<LAEW:WORKSPACE>>>` / PROJECT_CONTEXT 工作区段一致,
+    /// 便于用户核对「模型看到的运行环境」。
+    fn run_workspace(&self, arg: &str) {
+        let arg = arg.trim().to_ascii_lowercase();
+        let force = matches!(arg.as_str(), "refresh" | "rf" | "-f" | "--force");
+        if force {
+            crate::agent::workspace::invalidate();
+        }
+        let snap = crate::agent::workspace::snapshot(&self.paths.work_dir);
+        println!("  工作区快照(/workspace){}:", if force { " · 已刷新" } else { "" });
+        for line in snap.render_section().lines() {
+            println!("  {line}");
+        }
+        if snap.is_trivial() {
+            println!("  (空目录:既不注入 PROJECT_CONTEXT,也不注入运行时环境 brief)");
+        } else {
+            println!("  注入状态: 会话级已并入 PROJECT_CONTEXT;每次 LLM 调用另附运行时 brief。");
+        }
+        println!("  用法: /workspace refresh  强制重新采集(默认命中 5s 缓存)。");
     }
 
     /// `/rewind [N]`(D3,2026-09-10 第二十四轮):列出轮次或回退到第 N 轮之前。

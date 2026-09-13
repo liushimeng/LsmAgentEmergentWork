@@ -430,6 +430,7 @@ pub(crate) fn print_help() {
     println!("  │  /export [path]    导出当前会话(Markdown, .json 后缀 JSON) │");
     println!("  │  /diff <old> <new> 并排 diff 两个文件(行级+字符级着色)    │");
     println!("  │  /theme [kind]     查看或切换主题(D12 a11y 配色)          │");
+    println!("  │  /workspace [rf]   查看工作区快照(git/工程/最近改动)       │");
     println!("  │  /commands         列出自定义斜杠命令                      │");
     println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
     println!("  │  /provider list    列出所有接入记录                       │");

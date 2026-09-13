@@ -102,6 +102,7 @@ agent/
   overflow.rs  上下文溢出检测(15+ provider 正则)+ 三级恢复(排水/折叠/暴露)
   project_context.rs 项目说明文件五级链发现 + README 自动生成 + 每会话首次注入(幂等标记)
   session_fork.rs 对话 Rewind 轮次扫描(D3):合成消息识别 + 截断边界(供 /rewind /undo /fork /switch)
+  workspace.rs 工作区感知(D4):懒刷新快照(git 分支/变更计数/工程类型与工具链建议/顶层结构/6h 最近改动)+ TTL 缓存 + 8 角色 system brief `<<<LAEW:WORKSPACE>>>` + 会话级「工作区快照」段 + TUI 变更对比
 session.rs       Session:本机指纹 device_id + Session ID 生成 + 独立对话上下文 context
 llm/mod.rs       统一消息模型 + LlmClient trait + RequestMeta + build_common_headers + build_http_client(TLS 三级策略:IP 主机自动放宽自签名证书 / LAEW_TLS_INSECURE 全局开关)
 llm/anthropic.rs  Anthropic wire 转换(x-api-key + anthropic-version + metadata.user_id)
@@ -137,6 +138,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 | `/branches`       | 列出已存分支（`/rewind` `/fork` `/switch` `/clear` 改动前自动快照；内存态上限 10 个，退出 TUI 失效），实现 `tui/branches.rs` |
 | `/switch <name>`  | 切换到指定分支（切换前当前对话自动快照，零丢失） |
 | `/offline` (`status`)| 查看连接状态(Online/Degraded/Offline 三态)与离线队列深度;D13 离线模式 |
+| `/workspace` (`ws`) | 查看工作区快照(D4):git 分支/未提交变更/工程类型与工具链建议/顶层结构/6h 内最近改动;`/workspace refresh` 强制失效 TTL 缓存重采集 |
 | `/export [path]`  | 导出当前会话为 Markdown（`.json` 后缀导出 JSON）；默认落工作目录 `laew-export-{时间戳}.md`，同名冲突自动 `-1` 后缀，显式路径已存在拒绝覆盖 |
 | `/commands`       | 列出已加载的自定义斜杠命令与来源 |
 | `/provider`       | 管理接入记录（默认进入 list 屏） |
@@ -205,6 +207,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/自动化测试-提示词文件列表/` — 10 维度 × 100 组多轮对话测试脚本(知识问答/编码/代码理解/调试/文件处理/电脑使用/软件使用/界面设计/文档规划/laew 元任务),每条 3~5 轮追问,标注预期档位(simple/medium/hard),用于人工/自动化回归与 Yolo 分类验证
 - `docs/Debug模式与DebugAgent设计/` — `-debug` 调试模式与 Debug Agent(第 7 角色):trace 采集 / LLM 装饰器 / DebugReport 报告生成 设计与解决方案
 - `docs/Context设置与自动压缩设计/` — ContextMaxSize 上下文上限(默认 800K,DB 迁移自动补全)+ Compact Agent(第 8 角色)三档自动压缩 设计与解决方案
+- `docs/工作区感知与运行时环境注入/` — D4 工作区感知:懒刷新快照(git 分支/变更计数/工程类型与工具链建议/顶层结构/最近改动)+ 8 角色 system brief + PROJECT_CONTEXT 工作区段 + TUI 横幅·`/workspace`·任务后变更对比
 - `docs/自签名证书TLS适配/` — IP + 自签名证书 HTTPS 网关适配:TLS 三级校验策略(IP 自动放宽 / LAEW_TLS_INSECURE 全局开关)、跨平台一致性(rustls)、真实端点集成验证(tests/tls_self_signed.rs)
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
