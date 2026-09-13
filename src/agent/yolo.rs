@@ -19,7 +19,7 @@ use serde::Deserialize;
 use crate::agent::context::AgentRole;
 use crate::agent::{Agent, AgentProfile};
 use crate::error::{AgentError, Result};
-use crate::llm::{ChatMessage, Usage};
+use crate::llm::{ChatMessage, ContentBlock, Role, Usage};
 use crate::session::Session;
 
 /// 全局 Yolo 解析失败计数器(关联报告: 20260908_203854 D-002)。
@@ -174,17 +174,7 @@ impl YoloRunner {
         let classification = parse_classification(&text).unwrap_or_else(|e| {
             YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("Yolo 分类解析失败,降级为 simple: {}", e);
-            TaskClassification {
-                task_level: TaskLevel::Simple,
-                purpose: String::new(),
-                goal_summary: "(解析失败,已降级)".to_string(),
-                intent: "unknown".to_string(),
-                agent_role: Some(AgentRole::SubAgent),
-                decomposition_plan: vec![],
-                direct_answer: None,
-                user_suggestion_if_fail: String::new(),
-                yolo_degraded: true, // 关联报告: 2026-09-09_04 D-002
-            }
+            degraded_classification(context)
         });
         Ok((classification, text, usage))
     }
@@ -212,17 +202,7 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
         Err(e) => {
             YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("Yolo 分类解析失败,降级为 simple: {}", e);
-            TaskClassification {
-                task_level: TaskLevel::Simple,
-                purpose: String::new(),
-                goal_summary: "(解析失败,已降级)".to_string(),
-                intent: "unknown".to_string(),
-                agent_role: Some(AgentRole::SubAgent),
-                decomposition_plan: vec![],
-                direct_answer: None,
-                user_suggestion_if_fail: String::new(),
-                yolo_degraded: true, // 关联报告: 2026-09-09_04 D-002
-            }
+            degraded_classification(context)
         }
     };
     if classification.task_level == TaskLevel::Simple && classification.direct_answer.is_some() {
@@ -237,6 +217,52 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
             yolo_text: text,
             usage,
         })
+    }
+}
+
+/// 降级时从上下文提取最近一条 user 消息文本,作为 goal_summary 兜底。
+///
+/// 2026-09-13 第 50 轮(真实网关批量测试 c03 实测):降级分类的 goal_summary
+/// 原为固定占位符「(解析失败,已降级)」,SubAgent 拿不到真实任务描述 →
+/// 自行发挥,产物路径翻倍嵌套(`tmpPlan/agent-test/tmpPlan/agent-test/`)。
+/// 改为保留用户原文(折叠空白 + 截断),占位符挪到 purpose 字段;
+/// 上下文没有 user 文本时才回落占位符。
+fn degraded_goal_from_context(context: &[ChatMessage]) -> String {
+    let raw = context
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        "(解析失败,已降级)".to_string()
+    } else {
+        flat.chars().take(300).collect()
+    }
+}
+
+/// 统一的降级分类构造(2026-09-13 第 50 轮):goal_summary 保留用户原始任务。
+fn degraded_classification(context: &[ChatMessage]) -> TaskClassification {
+    TaskClassification {
+        task_level: TaskLevel::Simple,
+        purpose: "(Yolo 解析失败,已降级)".to_string(),
+        goal_summary: degraded_goal_from_context(context),
+        intent: "unknown".to_string(),
+        agent_role: Some(AgentRole::SubAgent),
+        decomposition_plan: vec![],
+        direct_answer: None,
+        user_suggestion_if_fail: String::new(),
+        yolo_degraded: true, // 关联报告: 2026-09-09_04 D-002
     }
 }
 
@@ -384,6 +410,41 @@ pub fn add_usage(mut total: Usage, delta: Usage) -> Usage {
 mod tests {
     use super::*;
     use crate::agent::context::AgentRole;
+
+    #[test]
+    fn degraded_goal_keeps_raw_user_prompt() {
+        // 2026-09-13 第 50 轮(c03 实测):降级分类应保留用户原始任务文本,
+        // 避免 SubAgent 在占位符上自行发挥导致产物路径翻倍嵌套。
+        let context = vec![
+            ChatMessage::assistant(vec![ContentBlock::text("上一轮回复")]),
+            ChatMessage::user("  Write 备份脚本 tmpPlan/agent-test/backup.sh\n并跑一次验证  "),
+        ];
+        let c = degraded_classification(&context);
+        assert!(c.yolo_degraded);
+        assert_eq!(c.task_level, TaskLevel::Simple);
+        assert_eq!(
+            c.goal_summary,
+            "Write 备份脚本 tmpPlan/agent-test/backup.sh 并跑一次验证"
+        );
+        assert!(c.purpose.contains("已降级"));
+    }
+
+    #[test]
+    fn degraded_goal_falls_back_to_placeholder_without_user_text() {
+        let context = vec![ChatMessage::assistant(vec![ContentBlock::text(
+            "只有 assistant 消息",
+        )])];
+        let c = degraded_classification(&context);
+        assert_eq!(c.goal_summary, "(解析失败,已降级)");
+    }
+
+    #[test]
+    fn degraded_goal_truncates_long_prompt() {
+        let long = "长".repeat(1000);
+        let context = vec![ChatMessage::user(long)];
+        let c = degraded_classification(&context);
+        assert_eq!(c.goal_summary.chars().count(), 300);
+    }
 
     #[test]
     fn extract_json_block_basic() {

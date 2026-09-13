@@ -437,6 +437,10 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 - 每个 workflow 必须明确 delegate_to: subagent
 - depends_on 用 wf-{n} 引用,不要循环依赖
 - 验收标准尽量可机器验证(cargo test / file exists / line count 等)
+- 路径保真:用户指定的文件/目录路径必须逐字保留在 steps 与 acceptance 中,
+  不得改写为绝对路径、不得省略目录层级、不得挪到工作区根目录
+  (2026-09-13 第 50 轮:批量测试实测 Main-Work 改写用户相对路径导致
+  SubAgent 忠实执行错误路径,QC 无原始路径对照而误判通过)
 "#;
 
 fn main_work_tools_hint() -> &'static str {
@@ -489,6 +493,10 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
 - 不要尝试规划下一步
 - 不要修改 subflow 之外的范围
 - 失败时如实回报,不要伪造成功
+- 路径保真:用户/上游指定的文件路径必须逐字使用(相对当前工作目录),
+  不得自行更换目录或在工作区根目录另建副本;中间产物也一样落到处方路径,
+  汇报时写明实际落盘路径(2026-09-13 第 50 轮:批量测试实测执行层路径漂移,
+  产物落错位置导致下游轮次与验收双双失配)
 - 完成后简洁回答,不需要 markdown 标题
 "#;
 

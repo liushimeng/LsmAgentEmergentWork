@@ -20,24 +20,42 @@ use serde::de::DeserializeOwned;
 /// 超过该大小的输入不做修复(防性能退化),对齐 atomcode MAX_REPAIR_BYTES。
 const MAX_REPAIR_BYTES: usize = 512 * 1024;
 
-/// fast-path 直解 → 自动修复 → 再解;均失败返回合并诊断(原始错误 + 修复后错误)。
+/// fast-path 直解 → Tier-3 类型纠偏 → Tier-1 自动修复 → 再解;均失败返回合并诊断。
 ///
 /// **不启用截断补全**(fail-closed):Quality-Check 报告被截断可能 verdict 已出
 /// 而 issues 列表未列全,自动补全在语义上有害。
 /// 上轮 P0 fail-closed 测试(`parse_quality_report_truncated_json_fails_closed`)钉死此语义。
+/// Tier-3 类型纠偏**不属于截断补全**:它不发明缺失内容,只把已有内容的形态
+/// (数组/双重编码字符串)整成目标结构期望的形态,与 fail-closed 语义不冲突。
 pub fn try_parse<T: DeserializeOwned>(json: &str) -> Result<T, String> {
     match serde_json::from_str::<T>(json) {
         Ok(v) => Ok(v),
         Err(primary) => {
+            // Tier-3:语法合法但字段类型不匹配(真实 LLM 高频)→ 已知形态纠偏
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+                if let Ok(v) = deserialize_coerced::<T>(&v) {
+                    tracing::info!(primary = %primary, "JSON Tier-3 类型纠偏成功");
+                    return Ok(v);
+                }
+            }
             let repaired = repair_json(json);
             match serde_json::from_str::<T>(&repaired) {
                 Ok(v) => {
                     tracing::info!(primary = %primary, "JSON 自动修复成功");
                     Ok(v)
                 }
-                Err(secondary) => Err(format!(
-                    "JSON 解析失败(原始: {primary}; 自动修复后仍失败: {secondary})"
-                )),
+                Err(secondary) => {
+                    // Tier-1 修复后同样可能只剩类型问题,再给一次纠偏机会
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                        if let Ok(v) = deserialize_coerced::<T>(&v) {
+                            tracing::info!(primary = %primary, "JSON Tier-1+3 修复+纠偏成功");
+                            return Ok(v);
+                        }
+                    }
+                    Err(format!(
+                        "JSON 解析失败(原始: {primary}; 自动修复后仍失败: {secondary})"
+                    ))
+                }
             }
         }
     }
@@ -53,6 +71,13 @@ pub fn try_parse_lenient<T: DeserializeOwned>(json: &str) -> Result<T, String> {
     match serde_json::from_str::<T>(json) {
         Ok(v) => Ok(v),
         Err(primary) => {
+            // 0) Tier-3 类型纠偏(语法合法、形态不符的场景先于语法修复)
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+                if let Ok(v) = deserialize_coerced::<T>(&v) {
+                    tracing::info!(primary = %primary, "JSON Tier-3 类型纠偏成功");
+                    return Ok(v);
+                }
+            }
             // 1) 先走 Tier-1 修复链(智能引号 / 单引号 / 尾逗号等)
             let repaired = repair_json(json);
             match serde_json::from_str::<T>(&repaired) {
@@ -61,8 +86,21 @@ pub fn try_parse_lenient<T: DeserializeOwned>(json: &str) -> Result<T, String> {
                     Ok(v)
                 }
                 Err(secondary) => {
-                    // 2) Tier-1 仍失败,若原错误是截断语义,再走 Tier-2 补全
-                    if !is_truncation_error(&primary) && !is_truncation_error(&secondary) {
+                    // 1b) Tier-1 修复后类型纠偏
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                        if let Ok(v) = deserialize_coerced::<T>(&v) {
+                            tracing::info!(primary = %primary, "JSON Tier-1+3 修复+纠偏成功");
+                            return Ok(v);
+                        }
+                    }
+                    // 2) Tier-1 仍失败:仅当 repaired 仍非合法 JSON(截断/半截
+                    //    输出)才走 Tier-2 补全。2026-09-13 第 50 轮:原门槛
+                    //    「错误文案含截断字样」在「类型错误 + 截断」叠加时会被
+                    //    类型错误文本掩盖(serde 先报 type error),补全被跳过;
+                    //    改为以「repaired 能否解析成 Value」判定 —— 语法合法的
+                    //    类型错误输入在步骤 1b 已给过纠偏机会且不会走到这里,
+                    //    Quality 的 try_parse 入口不受影响(fail-closed 不变)。
+                    if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
                         return Err(format!(
                             "JSON 解析失败(原始: {primary}; 自动修复后仍失败: {secondary})"
                         ));
@@ -76,14 +114,181 @@ pub fn try_parse_lenient<T: DeserializeOwned>(json: &str) -> Result<T, String> {
                             );
                             Ok(v)
                         }
-                        Err(tertiary) => Err(format!(
-                            "JSON 解析失败(原始: {primary}; 截断补全后仍失败: {tertiary})"
-                        )),
+                        Err(tertiary) => {
+                            // 2b) 补全后的文本也可能带类型问题
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&completed) {
+                                if let Ok(v) = deserialize_coerced::<T>(&v) {
+                                    tracing::warn!(
+                                        primary = %primary,
+                                        "JSON Tier-2+3 截断补全+纠偏成功"
+                                    );
+                                    return Ok(v);
+                                }
+                            }
+                            Err(format!(
+                                "JSON 解析失败(原始: {primary}; 截断补全后仍失败: {tertiary})"
+                            ))
+                        }
                     }
                 }
             }
         }
     }
+}
+
+// =================== Tier-3 类型纠偏(2026-09-13 第 50 轮) ===================
+//
+// 真实网关批量测试实测(运行日志 logs/laew-tui.log):
+// - Yolo 分类:`invalid type: sequence, expected a string`(purpose 等字段给成数组)
+// - Quality-Check:`invalid type: string ..., expected a sequence`(issues 被双重
+//   编码成 JSON 字符串)—— 与知识库既有结论一致(专题 e2e-env 教训:mock 应答
+//   天然合法,真实 LLM 才暴露形态漂移)。
+// Tier-1 语法修复与 Tier-2 截断补全都救不了「语法合法但形态不对」的输出,
+// Tier-3 按「已知字段名 → 期望形态」保守词表整型后重反序列化。
+// 安全性:纠偏只跑在 T 直解**失败之后**,且纠偏后再反序列化仍失败就按原错误
+// 上抛 —— 合法输入零开销,非法输入不发明缺失内容(fail-closed 语义不变)。
+
+/// 期望为字符串的已知字段名(值被模型给成数组/数字/布尔时纠偏)。
+const STRING_FIELDS: &[&str] = &[
+    "purpose",
+    "goal_summary",
+    "intent",
+    "task_level",
+    "agent_role",
+    "user_suggestion_if_fail",
+    "verdict",
+    "summary",
+    "suggestion",
+    "evidence",
+    "reason",
+    "mode",
+    "id",
+    "name",
+    "original_prompt",
+    "delegate_to",
+    "direct_answer",
+];
+
+/// 期望为字符串数组的已知字段名。
+const STRING_VEC_FIELDS: &[&str] = &["decomposition_plan", "issues", "steps", "acceptance"];
+
+/// Tier-3:对 Value 树按已知词表做保守形态纠偏(递归对象/数组)。
+pub fn coerce_known_shapes(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                if STRING_FIELDS.contains(&k.as_str()) {
+                    coerce_to_string(val);
+                } else if STRING_VEC_FIELDS.contains(&k.as_str()) {
+                    coerce_to_string_vec(val);
+                } else if k == "workflows" {
+                    // 双重编码:整个 workflows 数组被包成 JSON 字符串
+                    if let serde_json::Value::String(s) = val {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s.trim()) {
+                            if parsed.is_array() {
+                                *val = parsed;
+                            }
+                        }
+                    }
+                    coerce_known_shapes(val);
+                } else {
+                    coerce_known_shapes(val);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for it in items {
+                coerce_known_shapes(it);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 单值 → 字符串纠偏:数组用 `；` 连接(保留全部信息),数字/布尔转写。
+/// Null / Object 保持原样(Null 由 serde Option 处理;Object 无法有意义地字符串化)。
+fn coerce_to_string(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Array(items) => {
+            let joined = items
+                .iter()
+                .map(value_brief_string)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("；");
+            *val = serde_json::Value::String(joined);
+        }
+        serde_json::Value::Number(n) => *val = serde_json::Value::String(n.to_string()),
+        serde_json::Value::Bool(b) => *val = serde_json::Value::String(b.to_string()),
+        _ => {}
+    }
+}
+
+/// 单值 → 字符串数组纠偏:
+/// - 字符串:优先按双重编码解析(JSON 数组文本),失败则包成单元素数组;
+/// - 数组:逐元素字符串化(数字/布尔 → to_string,对象 → 紧凑 JSON);
+/// - 其它标量:包成单元素数组。
+fn coerce_to_string_vec(val: &mut serde_json::Value) {
+    let replacement: Option<serde_json::Value> = match val {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            let parsed = if trimmed.starts_with('[') {
+                serde_json::from_str::<serde_json::Value>(&repair_json(trimmed))
+                    .ok()
+                    .filter(serde_json::Value::is_array)
+            } else {
+                None
+            };
+            Some(match parsed {
+                Some(serde_json::Value::Array(items)) => serde_json::Value::Array(
+                    items
+                        .iter()
+                        .map(|v| serde_json::Value::String(value_brief_string(v)))
+                        .collect(),
+                ),
+                _ => {
+                    if trimmed.is_empty() {
+                        serde_json::Value::Array(vec![])
+                    } else {
+                        serde_json::Value::Array(vec![serde_json::Value::String(s.clone())])
+                    }
+                }
+            })
+        }
+        serde_json::Value::Array(_) => None, // 保留原数组,仅逐元素字符串化
+        serde_json::Value::Null => return,
+        ref other => Some(serde_json::Value::Array(vec![serde_json::Value::String(
+            value_brief_string(other),
+        )])),
+    };
+    if let Some(new_val) = replacement {
+        *val = new_val;
+    }
+    if let serde_json::Value::Array(items) = val {
+        for it in items.iter_mut() {
+            if !matches!(it, serde_json::Value::String(_)) {
+                let s = value_brief_string(it);
+                *it = serde_json::Value::String(s);
+            }
+        }
+    }
+}
+
+/// 元素级简短字符串化:字符串原样,数字/布尔 to_string,其它紧凑 JSON。
+fn value_brief_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// 纠偏后反序列化。失败返回错误文本(由调用方决定是否继续降级)。
+fn deserialize_coerced<T: DeserializeOwned>(v: &serde_json::Value) -> Result<T, String> {
+    let mut coerced = v.clone();
+    coerce_known_shapes(&mut coerced);
+    serde_json::from_value::<T>(coerced).map_err(|e| e.to_string())
 }
 
 /// 判断 serde_json::Error 是否呈现「截断」特征 —— `EOF while parsing ...`
@@ -798,5 +1003,78 @@ mod tests {
         let src = r#"{"name":"x","tags":[],"flag":true,"count":7}"#;
         let parsed: Sample = try_parse(src).unwrap();
         assert_eq!(parsed.count, Some(7));
+    }
+
+    // ========== Tier-3 类型纠偏(2026-09-13 第 50 轮) ==========
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct FakeClassification {
+        task_level: String,
+        purpose: String,
+        decomposition_plan: Vec<String>,
+    }
+
+    #[test]
+    fn tier3_sequence_coerced_to_string_field() {
+        // 真实网关实测形态:purpose 被模型给成字符串数组
+        // (logs/laew-tui.log: invalid type: sequence, expected a string)
+        let src = r#"{"task_level":["simple"],"purpose":["研究X的目的","分两步"],"decomposition_plan":["步骤一"]}"#;
+        let parsed: FakeClassification = try_parse(src).unwrap();
+        assert_eq!(parsed.task_level, "simple");
+        assert_eq!(parsed.purpose, "研究X的目的；分两步");
+        assert_eq!(parsed.decomposition_plan, vec!["步骤一"]);
+    }
+
+    #[test]
+    fn tier3_double_encoded_string_vec_field() {
+        // 真实网关实测形态:issues 被双重编码成 JSON 数组文本
+        // (logs/laew-tui.log: invalid type: string "...", expected a sequence)
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct FakeQuality {
+            issues: Vec<String>,
+        }
+        let src = r#"{"issues": "[\"错误一\", \"错误二\"]"}"#;
+        let parsed: FakeQuality = try_parse(src).unwrap();
+        assert_eq!(parsed.issues, vec!["错误一", "错误二"]);
+    }
+
+    #[test]
+    fn tier3_plain_string_becomes_single_element_vec() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct FakeQuality {
+            issues: Vec<String>,
+        }
+        let src = r#"{"issues": "单条问题"}"#;
+        let parsed: FakeQuality = try_parse(src).unwrap();
+        assert_eq!(parsed.issues, vec!["单条问题"]);
+    }
+
+    #[test]
+    fn tier3_double_encoded_workflows_array_unwrapped() {
+        // Main-Work 拆解形态:整个 workflows 数组被包成 JSON 字符串
+        // (用真实 WorkFlowPlan 结构验证端到端反序列化)
+        let src = r#"{"summary":"s","workflows":"[{\"id\":\"wf-1\",\"name\":\"n\",\"steps\":[\"a\"],\"acceptance\":[\"b\"]}]"}"#;
+        let parsed: crate::agent::main_work::WorkFlowPlan = try_parse(src).unwrap();
+        assert_eq!(parsed.workflows.len(), 1);
+        assert_eq!(parsed.workflows[0].id, "wf-1");
+        assert_eq!(parsed.workflows[0].acceptance, vec!["b"]);
+        assert_eq!(parsed.summary, "s");
+    }
+
+    #[test]
+    fn tier3_does_not_invent_missing_content() {
+        // 纠偏不改变缺失字段语义:缺字段仍解析失败(与 fail-closed 精神一致)
+        let src = r#"{"task_level":["simple"]}"#;
+        let err = try_parse::<FakeClassification>(src).unwrap_err();
+        assert!(err.contains("原始"), "应上抛原诊断: got {err}");
+    }
+
+    #[test]
+    fn tier3_lenient_truncation_still_works_with_coercion() {
+        // Tier-2 截断补全与 Tier-3 可叠加:截断 + 类型错误同时出现
+        let src = r#"{"task_level":["medium"],"purpose":"研究","decomposition_plan":["a","b""#;
+        let parsed: FakeClassification = try_parse_lenient(src).unwrap();
+        assert_eq!(parsed.task_level, "medium");
+        assert_eq!(parsed.decomposition_plan, vec!["a", "b"]);
     }
 }

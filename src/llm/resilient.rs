@@ -238,6 +238,15 @@ pub struct ResilientLlmClient {
     inner: Arc<dyn LlmClient>,
     cfg: RetryConfig,
     circuit: Arc<Mutex<CircuitInner>>,
+    /// 本 Provider 实例已确认拒绝 forced tool_choice(2026-09-13 第 50 轮)。
+    ///
+    /// 真实网关实测:开启 thinking 的 Anthropic 兼容网关对 forced tool_choice
+    /// 恒返回 400(`tool_choice 'specified' is incompatible with thinking
+    /// enabled`),旧逻辑每次结构化调用都先吃一次 400 再降级 auto —— Yolo
+    /// 分类/QC 每调用双倍延迟与 token。拒绝是确定性配置问题,首次命中后
+    /// 记忆化,后续请求直接以 auto 发出(进程生命周期内有效,客户端实例
+    /// 与 Provider 一一对应,天然按 Provider 隔离)。
+    forced_tool_rejected: AtomicBool,
 }
 
 impl ResilientLlmClient {
@@ -255,6 +264,7 @@ impl ResilientLlmClient {
                     consecutive_failures: 0,
                 },
             })),
+            forced_tool_rejected: AtomicBool::new(false),
         }
     }
 
@@ -496,14 +506,22 @@ impl LlmClient for ResilientLlmClient {
         // 自动去掉 forced 降级为默认 auto 再走一次完整重试管线。
         // forced 拒绝是不可重试 4xx(不污染熔断计数),降级后模型回退文本 JSON,
         // 由既有三重解析链 + 修复链兜底 —— 全程无需用户配置。
+        // 2026-09-13 第 50 轮:拒绝记忆化 —— 同一 Provider 首次被拒后,后续
+        // 带 forced 的请求直接以 auto 发出,不再重复「注定 400 的一次往返」。
+        if meta.forced_tool.is_some() && self.forced_tool_rejected.load(Ordering::Relaxed) {
+            let mut degraded = meta.clone();
+            degraded.forced_tool = None;
+            return self.complete_with_retry(system, messages, tools, &degraded).await;
+        }
         match self.complete_with_retry(system, messages, tools, meta).await {
             Ok(c) => Ok(c),
             Err(e) if meta.forced_tool.is_some() && looks_like_tool_choice_rejection(&e) => {
                 tracing::warn!(
                     tool = meta.forced_tool.as_deref().unwrap_or_default(),
                     error = %e,
-                    "forced tool_choice 被 Provider 拒绝,自动降级为 auto 重试"
+                    "forced tool_choice 被 Provider 拒绝,自动降级为 auto 重试(本 Provider 后续请求将跳过 forced)"
                 );
+                self.forced_tool_rejected.store(true, Ordering::Relaxed);
                 let mut degraded = meta.clone();
                 degraded.forced_tool = None;
                 self.complete_with_retry(system, messages, tools, &degraded).await
@@ -1115,6 +1133,35 @@ mod tests {
         );
         assert_eq!(seen[0].as_deref(), Some("submit_task_classification"));
         assert!(seen[1].is_none(), "第二次请求不应携带 forced tool_choice");
+    }
+
+    #[tokio::test]
+    async fn forced_tool_rejection_memoized_for_subsequent_calls() {
+        // 2026-09-13 第 50 轮:首次 forced 被拒(400 thinking/tool_choice 互斥)
+        // 后,记忆化生效 —— 第二次带 forced 的调用直接以 auto 发出,只发生
+        // 1 次请求,不再重复「注定 400」的往返。
+        let (mock, seen) = ForcedAwareMock::new(vec![
+            Err(tool_choice_rejection()),
+            Ok(ok_completion()),
+            Ok(ok_completion()),
+        ]);
+        let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
+        client
+            .complete("sys", &[], &[], &forced_meta())
+            .await
+            .expect("首次调用降级后应成功");
+        client
+            .complete("sys", &[], &[], &forced_meta())
+            .await
+            .expect("第二次调用应直接以 auto 成功");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "第二次调用应跳过 forced 直接 auto(共 1 次请求),实际: {seen:?}"
+        );
+        assert!(seen[2].is_none(), "记忆化后的请求不应携带 forced tool_choice");
     }
 
     #[tokio::test]
