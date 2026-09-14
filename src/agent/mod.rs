@@ -10,6 +10,7 @@
 //!
 //! 设计见 `docs/多Agent架构重构/01-设计与解决方案.md`。
 
+pub mod agent_message;
 pub mod attachments;
 pub mod cancel;
 pub mod compact;
@@ -38,6 +39,7 @@ pub mod system_prompt;
 pub mod tool_schema_validator;
 pub mod tools;
 pub mod window;
+pub mod window_state;
 pub mod window_use;
 pub mod workflow;
 pub mod workspace;

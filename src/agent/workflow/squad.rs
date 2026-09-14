@@ -137,6 +137,8 @@ impl SquadDispatcher {
                 original_prompt: None,
                 depends_on_outputs: vec![],
                 sibling_outputs: vec![],
+                window_context: None,
+                pending_agent_messages: vec![],
             };
             let permit = semaphore.clone().acquire_owned().await
                 .map_err(|e| crate::error::AgentError::Other(format!("信号量关闭: {}", e)))?;

@@ -7,10 +7,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::agent_message::AgentMessage;
 use crate::agent::cancel::CancelToken;
 use crate::agent::context::AgentRole;
 use crate::agent::extrace::ExecutionTrace;
 use crate::agent::memory;
+use crate::agent::window_state::WindowSessionState;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
@@ -37,6 +39,12 @@ pub struct SubFlowInput {
     /// 来自同一 WorkFlow 中前序步骤的产物
     #[serde(default)]
     pub sibling_outputs: Vec<String>,
+    /// ★窗口上下文(由 Orchestrator 注入,WindowUse 单元专用,跨轮持久化)。
+    #[serde(default)]
+    pub window_context: Option<WindowSessionState>,
+    /// ★待处理的 Agent 消息(其他 Agent 发来的)。
+    #[serde(default)]
+    pub pending_agent_messages: Vec<AgentMessage>,
 }
 
 impl SubFlowInput {
@@ -66,6 +74,22 @@ impl SubFlowInput {
             out.push_str("\n同 WorkFlow 前序步骤产物:\n");
             for (i, s) in self.sibling_outputs.iter().enumerate() {
                 out.push_str(&format!("  - [步骤 {}] {}\n", i + 1, s));
+            }
+        }
+        if let Some(ref ctx) = self.window_context {
+            if !ctx.is_empty() {
+                let state_prompt = crate::agent::window_state::build_window_state_prompt(ctx);
+                if !state_prompt.is_empty() {
+                    out.push_str(&format!(
+                        "\n【窗口会话上下文(系统注入)】\n{state_prompt}"
+                    ));
+                }
+            }
+        }
+        if !self.pending_agent_messages.is_empty() {
+            out.push_str("\n【来自其他 Agent 的消息】\n");
+            for (i, msg) in self.pending_agent_messages.iter().enumerate() {
+                out.push_str(&format!("  {}. {}\n", i + 1, msg.hint()));
             }
         }
         out.push_str("\n请按期望输出完成任务。完成后用简洁中文回答(1-3 句话)。");
@@ -300,6 +324,8 @@ mod tests {
             original_prompt: None,
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
+            window_context: None,
+            pending_agent_messages: vec![],
         };
 
         let outcome = runner.run_unit(&input, "s-x").await
@@ -331,6 +357,8 @@ mod tests {
             original_prompt: Some("请帮我看一下 src/foo.rs 这个文件的前 50 行".into()),
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
+            window_context: None,
+            pending_agent_messages: vec![],
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("wf-1.step-1"));
@@ -355,6 +383,8 @@ mod tests {
             original_prompt: None,
             depends_on_outputs: vec!["依赖产物 A".into()],
             sibling_outputs: vec!["前序步骤产物 B".into()],
+            window_context: None,
+            pending_agent_messages: vec![],
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("上游产物"));
@@ -374,6 +404,8 @@ mod tests {
             original_prompt: Some("   \n  \t  ".into()),
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
+            window_context: None,
+            pending_agent_messages: vec![],
         };
         let prompt = input.to_user_prompt();
         assert!(!prompt.contains("用户原始输入"));
@@ -389,10 +421,15 @@ mod tests {
             original_prompt: None,
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
+            window_context: None,
+            pending_agent_messages: vec![],
         };
         let json = serde_json::to_string(&input).unwrap();
         // original_prompt 默认值是 null,确保 SubAgent 输入 JSON 兼容老实现
         assert!(json.contains("\"original_prompt\":null"));
+        // 新字段默认值也应正确序列化
+        assert!(json.contains("\"window_context\":null"));
+        assert!(json.contains("\"pending_agent_messages\":[]"));
     }
 
     #[test]

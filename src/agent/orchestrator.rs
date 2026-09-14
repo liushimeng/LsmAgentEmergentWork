@@ -590,6 +590,8 @@ impl MultiAgentOrchestrator {
             original_prompt,
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
+            window_context: None,
+            pending_agent_messages: vec![],
         };
         emit_progress(progress, "wf-1 SubAgent 执行中…");
         let outcome = self
@@ -1314,6 +1316,8 @@ fn build_subflow_input(
         original_prompt: Some(wf.name.clone()),
         depends_on_outputs: deps,
         sibling_outputs: vec![],
+        window_context: None,
+        pending_agent_messages: vec![],
     }
 }
 

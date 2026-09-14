@@ -195,6 +195,8 @@ pub fn build_subflow_from_goal(goal: &Goal, subgoal: &Goal) -> SubFlowInput {
         original_prompt: Some(goal.description.clone()),
         depends_on_outputs: vec![],
         sibling_outputs: vec![],
+        window_context: None,
+        pending_agent_messages: vec![],
     }
 }
 

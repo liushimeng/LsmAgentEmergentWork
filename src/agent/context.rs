@@ -57,6 +57,25 @@ impl AgentRole {
     }
 }
 
+/// 从字符串解析 AgentRole(未知值回退到 SubAgent)。
+/// 用于从 SQLite 存储的 role 字符串反序列化。
+impl From<&str> for AgentRole {
+    fn from(s: &str) -> Self {
+        match s {
+            "yolo" => Self::Yolo,
+            "plan" => Self::Plan,
+            "main" => Self::MainWork,
+            "subagent" => Self::SubAgent,
+            "quality" => Self::QualityCheck,
+            "session" => Self::SessionContext,
+            "compact" => Self::Compact,
+            "windowuse" => Self::WindowUse,
+            "workflow" => Self::WorkFlow,
+            _ => Self::SubAgent,
+        }
+    }
+}
+
 /// Agent-Context:单个 Agent 在执行一个单元时持有的实时上下文。
 ///
 /// - 内存态,生命周期 = 当前单元

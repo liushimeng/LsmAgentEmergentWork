@@ -64,6 +64,10 @@ pub enum ConfigError {
     /// 环境变量覆盖非法(如 LAEW_PROVIDER_ID 指向不存在的记录)。
     #[error("环境变量错误: {0}")]
     Env(String),
+
+    /// 序列化/反序列化错误(通用)。
+    #[error("序列化错误: {0}")]
+    Serialization(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;

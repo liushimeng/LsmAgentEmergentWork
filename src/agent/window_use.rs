@@ -13,11 +13,16 @@
 
 use std::sync::Arc;
 
+use crate::agent::agent_message::AgentMessageManager;
 use crate::agent::cancel::CancelToken;
 use crate::agent::context::AgentRole;
 use crate::agent::extrace::ExecutionTrace;
 use crate::agent::memory;
 use crate::agent::subagent::{SubFlowInput, SubFlowOutcome};
+use crate::agent::window_state::{
+    build_window_state_message, build_window_state_prompt, WindowSessionState,
+    WindowStateManager, WINDOW_STATE_MARKER_END, WINDOW_STATE_MARKER_START,
+};
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
@@ -29,13 +34,25 @@ pub struct WindowUseRunner {
     db: Arc<Db>,
     #[allow(dead_code)]
     max_iterations: usize,
+    /// 窗口状态管理器(跨轮持久化)。
+    state_mgr: WindowStateManager,
+    /// Agent 间消息管理器。
+    msg_mgr: AgentMessageManager,
 }
 
 impl WindowUseRunner {
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>) -> Self {
         let agent = Agent::new(llm, AgentProfile::window_use_profile());
         let max_iterations = agent.max_iterations();
-        Self { agent, db, max_iterations }
+        let state_mgr = WindowStateManager::new(db.clone());
+        let msg_mgr = AgentMessageManager::new(db.clone());
+        Self {
+            agent,
+            db,
+            max_iterations,
+            state_mgr,
+            msg_mgr,
+        }
     }
 
     pub fn with_max_iterations(mut self, n: usize) -> Self {
@@ -70,9 +87,37 @@ impl WindowUseRunner {
         session_id: &str,
         cancel: Option<&CancelToken>,
     ) -> Result<SubFlowOutcome> {
+        // ★1) 加载窗口会话状态(跨轮持久化,首次为空)。
+        let mut win_state = self.state_mgr.load(session_id).await.unwrap_or_else(|| {
+            let mut s = WindowSessionState::new(session_id);
+            // 如果 SubFlowInput 携带了窗口上下文(由 Orchestrator 注入),合并之
+            if let Some(ref ctx) = input.window_context {
+                s = ctx.clone();
+                s.session_id = session_id.to_string();
+            }
+            s
+        });
+
         // 复用 SubFlowInput 的 prompt 构造(原始 prompt 优先 + 摘要 + 上下游产物),
         // 尾部追加窗口操控作业规范,提醒「先检视再操作」。
         let mut prompt = input.to_user_prompt();
+
+        // ★2) 注入窗口会话状态(如有),让 LLM 感知上一轮操作对象。
+        let state_prompt = build_window_state_prompt(&win_state);
+        if !state_prompt.is_empty() {
+            prompt.push_str(&format!(
+                "\n\n【窗口会话上下文(系统注入,非用户输入)】\n{state_prompt}"
+            ));
+        }
+
+        // ★3) 注入待处理的 Agent 消息(如有),如 SubAgent 发来「请写入这段文本」。
+        if let Some(msg) = self.msg_mgr.peek(session_id, AgentRole::WindowUse).await {
+            prompt.push_str(&format!(
+                "\n\n【来自其他 Agent 的消息】\n{}\n请基于此消息继续操作。",
+                msg.hint()
+            ));
+        }
+
         prompt.push_str(
             "\n\n【窗口操控作业规范】\n\
              1. 先用 WindowList 找到目标窗口(可用 filter 过滤),再用 WindowInspect 检视控件树;\n\
@@ -120,6 +165,16 @@ impl WindowUseRunner {
         trace.collect_failure_signals(&text);
         let failed = trace.is_failed();
 
+        // ★4) 从 trace 中提取窗口操作记录,更新窗口状态。
+        //    (当前 trace 不含单次调用参数详情,此步骤为 stub;
+        //     后续可扩展 ExecutionTrace 增加 tool_call_log 字段以自动提取)
+        // extract_window_state_from_trace(&mut win_state, &trace);
+
+        // ★5) 保存窗口状态供下一轮使用(取消路径已在上面提前返回,不会走到这里)。
+        if !win_state.is_empty() {
+            self.state_mgr.save(session_id, &win_state).await.ok();
+        }
+
         let error_summary_owned: Option<String> = if failed {
             if !trace.early_terminate_reason.is_empty() {
                 Some(trace.early_terminate_reason.clone())
@@ -141,6 +196,7 @@ impl WindowUseRunner {
                 "subflow_id": &input.id,
                 "expected": &input.expected_output,
                 "trace": &trace,
+                "window_state_version": win_state.version,
             }),
         );
 
