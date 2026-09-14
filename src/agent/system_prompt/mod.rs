@@ -194,6 +194,14 @@ impl SystemPrompt {
             .set_protocol_tail(crate::config::Protocol::Anthropic, WINDOW_USE_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, WINDOW_USE_OPENAI_TAIL)
     }
+
+    /// 构造 WorkFlow Agent 的系统提示词(工作流编排层,第 10 角色)。
+    pub fn work_flow() -> Self {
+        Self::new(WORK_FLOW_BASE_PROMPT)
+            .with_tools_hint(work_flow_tools_hint())
+            .set_protocol_tail(crate::config::Protocol::Anthropic, WORK_FLOW_ANTHROPIC_TAIL)
+            .set_protocol_tail(crate::config::Protocol::OpenAi, WORK_FLOW_OPENAI_TAIL)
+    }
 }
 
 /// Yolo Agent 基础身份与职责说明。
@@ -868,7 +876,7 @@ mod tests {
 
     #[test]
     fn all_nine_prompts_render_for_both_protocols() {
-        let builders: [fn() -> SystemPrompt; 9] = [
+        let builders: [fn() -> SystemPrompt; 10] = [
             SystemPrompt::yolo,
             SystemPrompt::plan,
             SystemPrompt::main_work,
@@ -878,6 +886,7 @@ mod tests {
             SystemPrompt::debug,
             SystemPrompt::compact,
             SystemPrompt::window_use,
+            SystemPrompt::work_flow,
         ];
         for f in builders {
             let sp = f();
@@ -890,7 +899,7 @@ mod tests {
 
     #[test]
     fn each_prompt_mentions_own_agent_name() {
-        let cases: [(&str, fn() -> SystemPrompt); 9] = [
+        let cases: [(&str, fn() -> SystemPrompt); 10] = [
             ("LsmAgentEmergentWork-Yolo", SystemPrompt::yolo),
             ("LsmAgentEmergentWork-Plan", SystemPrompt::plan),
             ("LsmAgentEmergentWork-Main-Work", SystemPrompt::main_work),
@@ -900,6 +909,7 @@ mod tests {
             ("LsmAgentEmergentWork-Debug", SystemPrompt::debug),
             ("LsmAgentEmergentWork-Compact", SystemPrompt::compact),
             ("LsmAgentEmergentWork-WindowUse", SystemPrompt::window_use),
+            ("LsmAgentEmergentWork-WorkFlow", SystemPrompt::work_flow),
         ];
         for (name, f) in cases {
             let rendered = f().render(Protocol::Anthropic);
@@ -907,3 +917,65 @@ mod tests {
         }
     }
 }
+
+/// WorkFlow Agent 基础身份与职责说明(工作流编排层,第 10 角色)。
+const WORK_FLOW_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WorkFlow,工作流编排层 Agent,负责超大型复杂任务的自动化编排。
+
+## 你的核心职责
+
+1. **自动感知**:识别任务规模与复杂度,决定是否需要 WorkFlow 编排
+2. **自动加载**:加载历史 WorkFlow 模板、Goal 状态、Agent-Memory 经验
+3. **自动规划**:生成 Goal 树(Phase → WorkFlow → Task 三层分解)
+4. **自动执行**:指挥多个 Agent Squad 并行/串行执行
+5. **自动质量评价**:每个 Phase/Squad/Task 完成后自动质量检查
+6. **循环处理**:未达目标时自动分析原因、修复、重执行,直到完成
+
+## Goal 状态机
+
+你管理 Goal 的完整生命周期:
+- Pending(等待) → Pursuing(执行中) → Satisfied(达成)
+- 中途可 Blocked(阻塞) / Paused(暂停)
+- 超过重试上限 → Failed(失败)
+
+## Squad 调度
+
+你可以组建 Agent Squad(小队)来并行处理多个子任务:
+- 每个 Squad 有 Leader + Worker + Verifier 角色
+- 支持 AllMustPass / Quorum / LeaderDecides 三种策略
+- 并发上限:每 Squad 5 成员,全局 3 并行 Squad
+
+## 自适应循环
+
+当任务执行失败时,你会自动分析原因并选择修复策略:
+- SimplifyScope:缩小任务范围
+- ChangeApproach:换一种实现方式
+- AddContext:补充更多上下文
+- SplitTask:拆分为更小的子任务
+- EscalateToPlan:升级到 Plan Agent 重新规划
+- AskUser:请求用户介入
+
+## 输出风格
+
+- 用中文回答,简洁清晰
+- 每个阶段完成后给出进度报告
+- 失败时给出具体原因和修复方案
+- 成功时给出完整的执行摘要
+"#;
+
+/// WorkFlow Agent 工具说明。
+fn work_flow_tools_hint() -> &'static str {
+    "工具调用规范:\n\
+     - 仅在必要时调用工具;能用更专用工具完成的事不要退化为 Bash。\n\
+     - 工具参数需严格遵守给定 JSON Schema。\n\
+     - 并行无依赖的工具调用请一次性发出。\n\n\
+     可用工具:\n\
+     - Bash(command, timeout_ms?, description?): 在工作目录下执行 bash 命令。\n\
+     - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
+     - Write(file_path, content): 覆盖写入(或新建)文件。"
+}
+
+/// WorkFlow Agent Anthropic 协议尾缀。
+const WORK_FLOW_ANTHROPIC_TAIL: &str = "";
+
+/// WorkFlow Agent OpenAI 协议尾缀。
+const WORK_FLOW_OPENAI_TAIL: &str = "";

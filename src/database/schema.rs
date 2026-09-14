@@ -48,6 +48,74 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             ON session_memory(session_id, seq);
         CREATE INDEX IF NOT EXISTS idx_agent_memory_role
             ON agent_memory(agent_role, id);
+
+        -- ========== WorkFlow Agent(第 10 角色)新表 ==========
+
+        -- Goal 状态机表
+        CREATE TABLE IF NOT EXISTS goals (
+            id              TEXT PRIMARY KEY,
+            session_id      TEXT NOT NULL,
+            parent_id       TEXT,
+            title           TEXT NOT NULL,
+            description     TEXT NOT NULL,
+            state           TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(state IN ('pending','pursuing','blocked','paused','satisfied','failed')),
+            priority        INTEGER NOT NULL DEFAULT 5,
+            phase_id        TEXT,
+            acceptance_criteria TEXT,
+            retry_count     INTEGER DEFAULT 0,
+            max_retries     INTEGER DEFAULT 3,
+            error_text      TEXT,
+            metadata        TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            completed_at    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_goals_session ON goals(session_id, state);
+        CREATE INDEX IF NOT EXISTS idx_goals_parent ON goals(parent_id);
+
+        -- Squad 表
+        CREATE TABLE IF NOT EXISTS squads (
+            id              TEXT PRIMARY KEY,
+            goal_id         TEXT NOT NULL,
+            phase_id        TEXT NOT NULL,
+            strategy        TEXT NOT NULL DEFAULT 'all_must_pass',
+            max_concurrent  INTEGER NOT NULL DEFAULT 5,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending','running','completed','failed','cancelled')),
+            created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            completed_at    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_squads_goal ON squads(goal_id);
+
+        -- Squad 成员表
+        CREATE TABLE IF NOT EXISTS squad_members (
+            id              TEXT PRIMARY KEY,
+            squad_id        TEXT NOT NULL,
+            member_role     TEXT NOT NULL DEFAULT 'worker',
+            task            TEXT NOT NULL,
+            expected_output TEXT,
+            actual_output   TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending','running','completed','failed','skipped')),
+            retry_count     INTEGER DEFAULT 0,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            completed_at    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_squad_members_squad ON squad_members(squad_id);
+
+        -- WorkFlow 模板表
+        CREATE TABLE IF NOT EXISTS workflow_templates (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL UNIQUE,
+            description     TEXT NOT NULL,
+            category        TEXT NOT NULL,
+            definition      TEXT NOT NULL,
+            tags            TEXT,
+            usage_count     INTEGER DEFAULT 0,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
         "#,
     )?;
     migrate(conn)?;

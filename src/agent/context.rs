@@ -1,6 +1,6 @@
 //! Agent 角色枚举 + Agent-Context(实时上下文)。
 //!
-//! - `AgentRole`:6 个 Agent 角色标识。
+//! - `AgentRole`:10 个 Agent 角色标识。
 //! - `AgentContext`:每个 Agent 在执行一个单元时持有的实时上下文(消息流 + 状态),
 //!   与 Session 主上下文隔离,生命周期 = 当前单元。
 //!
@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::llm::{ChatMessage, ContentBlock};
 
-/// 6 个 Agent 角色。
+/// 10 个 Agent 角色。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -35,6 +35,8 @@ pub enum AgentRole {
     /// 压缩层:Context 超阈值时自动压缩(第 8 角色)
     Compact,
     /// 桌面操控层:桌面软件窗口读取/操作(第 9 角色,Windows UIA / macOS AX)
+    /// 工作流编排层:超大型复杂任务自动化编排(第 10 角色)
+    WorkFlow,
     #[serde(rename = "windowuse")]
     WindowUse,
 }
@@ -50,6 +52,7 @@ impl AgentRole {
             Self::SessionContext => "session",
             Self::Compact => "compact",
             Self::WindowUse => "windowuse",
+            Self::WorkFlow => "workflow",
         }
     }
 }

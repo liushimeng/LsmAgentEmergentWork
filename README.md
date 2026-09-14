@@ -16,12 +16,12 @@
 ║        ╚══════╝╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝                           ║
 ║                                                                    ║
 ║        LLM · Agent · CLI · Rust · Multi-Agent · 6 Roles           ║
-║        双协议 · 6 工具 · 6 角色编排 · TUI · SQLite                 ║
+║        双协议 · 6 工具 · 10 角色编排 · TUI · SQLite                 ║
 ║                                                                    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-## 🦀 Rust 多 Agent CLI · 双协议 · 6 角色同台编排
+## 🦀 Rust 多 Agent CLI · 双协议 · 10 角色同台编排
 
 </div>
 <!-- markdownlint-restore -->
@@ -61,7 +61,7 @@
 - **持续迭代**：`CLAUDE.md` 中记录了海量 Agent 教训，每条都是 Agent 踩坑后自动写入的「经验记忆」，后续 Agent 自动加载避免重犯。
 - **知识库沉淀**：`docs/` 下 80+ 份调研文档 / 约 160k 行，全部由 Agent 自动产出。
 
-> **仓库数据**：Rust 多 Agent CLI、6 工具、6 角色编排、双协议、TUI 子屏自动化。
+> **仓库数据**：Rust 多 Agent CLI、多工具、10 角色编排、双协议、TUI 子屏自动化。
 > **这一切，没有一个人工手写字符。**
 
 ---
@@ -69,14 +69,14 @@
 ## 🎯 项目定位与核心能力
 
 `laew`（**L**lm **A**gent **E**mergent **W**ork）是一款基于 Rust 的 LLM 多 Agent CLI，
-支持 **Anthropic** 与 **OpenAI** 双协议，内置 6 个工具调用，提供 TUI 多轮对话、
+支持 **Anthropic** 与 **OpenAI** 双协议，内置多工具调用，提供 TUI 多轮对话、
 `-p` 单轮任务、`-f` 文件提示词三种模式。
 
 | 能力 | 说明 |
 |------|------|
 | 🧠 **双协议** | Anthropic（anthropic-messages）+ OpenAI（openai-completions），统一消息模型隔离协议差异 |
 | 🛠️ **6 工具** | Bash / Read / Write / Edit / Glob / Grep |
-| 🤖 **6 角色多 Agent** | Yolo / Plan / Main-Work / SubAgent-Work / Quality-Check / SessionContext |
+| 🤖 **10 角色多 Agent** | Yolo / Plan / Main-Work / SubAgent-Work / Quality-Check / SessionContext |
 | 📊 **三档分类** | simple / medium / hard，Yolo 自动分类后分层编排 |
 | 🖥️ **TUI** | crossterm 独立渲染引擎，alternate screen + raw mode + Screen 栈 + Tab 表单 |
 | 💾 **SQLite 持久化** | 根目录 `LsmAgentEmergentWork.db`，无配置文件 |
@@ -84,7 +84,7 @@
 
 ---
 
-## 🤖 多 Agent 架构 —— 6 角色同台编排
+## 🤖 多 Agent 架构 —— 10 角色同台编排
 
 由 `MultiAgentOrchestrator` 总编排：用户输入 → 项目上下文注入 → Yolo 三档分类 →
 简单档（SubAgent）/ 中档（Main → SubAgent）/ 高档（Plan → Main → SubAgent）

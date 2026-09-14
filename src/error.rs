@@ -80,6 +80,25 @@ pub enum AgentError {
     #[error("WorkFlow 拓扑错误: {0}")]
     WorkflowTopology(String),
 
+    /// Goal 状态转换错误(CAS 失败)。
+    #[error("Goal 状态转换失败: goal={goal_id}, 当前状态 {from}, 目标 {attempted_to}")]
+    StateTransition {
+        goal_id: String,
+        from: String,
+        attempted_to: String,
+    },
+
+    /// Goal 达到最大重试次数。
+    #[error("Goal {goal_id} 达到最大重试次数 ({max_retries})")]
+    GoalMaxRetries { goal_id: String, max_retries: usize },
+
+    /// 自适应循环熔断:连续无进展达到阈值。
+    #[error("Goal {goal_id} 自适应循环熔断:连续 {unproductive_count} 次无进展")]
+    AdaptiveCircuitBreaker {
+        goal_id: String,
+        unproductive_count: usize,
+    },
+
     #[error("编排失败: {0}")]
     Orchestration(String),
 

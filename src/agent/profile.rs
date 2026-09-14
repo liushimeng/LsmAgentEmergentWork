@@ -39,6 +39,8 @@ pub const DEBUG_AGENT_NAME: &str = "LsmAgentEmergentWork-Debug";
 pub const COMPACT_AGENT_NAME: &str = "LsmAgentEmergentWork-Compact";
 /// WindowUse Agent(桌面操控层,第 9 角色:Windows UIA / macOS Accessibility 窗口操控)
 pub const WINDOW_USE_AGENT_NAME: &str = "LsmAgentEmergentWork-WindowUse";
+/// WorkFlow Agent(工作流编排层,第 10 角色:超大型复杂任务自动化编排)
+pub const WORK_FLOW_AGENT_NAME: &str = "LsmAgentEmergentWork-WorkFlow";
 
 /// 兼容旧名(指向 SubAgent-Work)。
 pub const WORK_AGENT_NAME: &str = SUB_AGENT_WORK_NAME;
@@ -166,6 +168,17 @@ impl AgentProfile {
         }
     }
 
+    /// WorkFlow Agent profile(工作流编排层,第 10 角色:Goal 状态机 + Squad 调度)。
+    /// 工具集:Bash(执行编排命令) + Read(查看状态) + Write(产出报告)。
+    pub fn work_flow_profile() -> Self {
+        Self {
+            name: WORK_FLOW_AGENT_NAME.to_string(),
+            system_prompt: SystemPrompt::work_flow(),
+            tools: sub_agent_work_registry(),
+            emit_tool: None,
+        }
+    }
+
     /// 兼容旧名(等价于 sub_agent_work_profile)。
     pub fn work_profile() -> Self {
         Self::sub_agent_work_profile()
@@ -239,9 +252,11 @@ mod tests {
             AgentProfile::session_context_profile().name,
             AgentProfile::compact_profile().name,
             AgentProfile::window_use_profile().name,
+            AgentProfile::work_flow_profile().name,
+            AgentProfile::debug_profile().name,
         ];
         let unique: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(unique.len(), 8, "8 个 profile 必须名字互不相同");
+        assert_eq!(unique.len(), 10, "10 个 profile 必须名字互不相同");
     }
 
     #[test]
