@@ -108,6 +108,7 @@ impl Db {
                 "quality" => AgentRole::QualityCheck,
                 "session" => AgentRole::SessionContext,
                 "compact" => AgentRole::Compact,
+                "windowuse" => AgentRole::WindowUse,
                 other => {
                     return Err(rusqlite::Error::InvalidColumnType(
                         2,

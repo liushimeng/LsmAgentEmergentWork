@@ -23,6 +23,7 @@ use crate::agent::session_context::{
     inject_history_with_entries, SessionContextRunner, DEFAULT_HISTORY_LIMIT,
 };
 use crate::agent::subagent::{SubAgentRunner, SubFlowInput};
+use crate::agent::window_use::WindowUseRunner;
 use crate::agent::yolo::{TaskClassification, TaskLevel, YoloRunner};
 use crate::config::{Db, EventType};
 use crate::error::{AgentError, Result};
@@ -161,6 +162,8 @@ pub struct MultiAgentOrchestrator {
     main_work: MainWorkRunner,
     /// Arc 化:同层 WorkFlow 并行时共享给 tokio::spawn 任务
     sub_agent: Arc<SubAgentRunner>,
+    /// Arc 化:桌面窗口操控专项执行单元(delegate_to=windowuse 的 WorkFlow 路由至此)
+    window_use: Arc<WindowUseRunner>,
     /// Arc 化:同上(质检随执行单元并行)
     quality: Arc<QualityRunner>,
     session_context: SessionContextRunner,
@@ -195,6 +198,10 @@ impl MultiAgentOrchestrator {
             SubAgentRunner::new(llm.clone(), db.clone())
                 .with_max_iterations(cfg.subagent_max_iterations),
         );
+        let window_use = Arc::new(
+            WindowUseRunner::new(llm.clone(), db.clone())
+                .with_max_iterations(cfg.subagent_max_iterations),
+        );
         let quality = Arc::new(QualityRunner::new(llm.clone(), db.clone()));
         let session_context = SessionContextRunner::new(llm.clone(), db.clone());
         let compact = CompactRunner::new(llm, db.clone());
@@ -203,6 +210,7 @@ impl MultiAgentOrchestrator {
             plan,
             main_work,
             sub_agent,
+            window_use,
             quality,
             session_context,
             compact,
@@ -909,8 +917,10 @@ impl MultiAgentOrchestrator {
                 let (wf, input) = units.into_iter().next().expect("len==1");
                 let outcome = run_wf_unit(
                     self.sub_agent.clone(),
+                    self.window_use.clone(),
                     self.quality.clone(),
                     self.cfg.debug.clone(),
+                    wf.delegate_to,
                     input,
                     c.goal_summary.clone(),
                     session.id().to_string(),
@@ -926,8 +936,10 @@ impl MultiAgentOrchestrator {
                 let mut handles = Vec::with_capacity(units.len());
                 for (wf, input) in units {
                     let sub_agent = self.sub_agent.clone();
+                    let window_use = self.window_use.clone();
                     let quality = self.quality.clone();
                     let debug = self.cfg.debug.clone();
+                    let delegate_to = wf.delegate_to;
                     let goal = c.goal_summary.clone();
                     let sid = session.id().to_string();
                     let sem = semaphore.clone();
@@ -938,8 +950,10 @@ impl MultiAgentOrchestrator {
                     handles.push(tokio::spawn(async move {
                         let outcome = run_wf_unit(
                             sub_agent,
+                            window_use,
                             quality,
                             debug,
+                            delegate_to,
                             input,
                             goal,
                             sid,
@@ -1168,6 +1182,10 @@ struct WfUnitOk {
 
 /// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
 ///
+/// 按 `delegate_to` 路由执行 Runner(2026-09-14 第 9 角色 WindowUse):
+/// `SubAgent` → SubAgent-Work;`WindowUse` → WindowUse(桌面窗口操控专项);
+/// QC / Debug / 取消 / 进度通道两种委派完全复用。
+///
 /// 自由函数 + Arc 参数化,串行直通与 tokio::spawn 并行两种调用路径共用同一份逻辑;
 /// `semaphore` 为并行路径的有界并发许可(串行路径传 None);
 /// `cancel` 为任务级取消 token(传播进 SubAgent 的 Agent 循环,LLM/工具即时中断);
@@ -1175,8 +1193,10 @@ struct WfUnitOk {
 #[allow(clippy::too_many_arguments)]
 async fn run_wf_unit(
     sub_agent: Arc<SubAgentRunner>,
+    window_use: Arc<WindowUseRunner>,
     quality: Arc<QualityRunner>,
     debug: Option<Arc<DebugCollector>>,
+    delegate_to: AgentRole,
     input: SubFlowInput,
     goal: String,
     session_id: String,
@@ -1199,20 +1219,33 @@ async fn run_wf_unit(
     };
 
     let wf_id = input.id.clone();
-    emit_progress(&progress, format!("{wf_id} SubAgent 执行中…"));
-    let outcome = sub_agent
-        .run_unit_with_cancel(&input, &session_id, &cancel)
-        .await
-        .map_err(|e| {
-            QualityFailure::from_agent_error(
-                AgentRole::SubAgent,
-                &format!("SubAgent 执行失败(wf={wf_id})"),
-                &e,
-            )
-        })?;
+    let exec_role = if delegate_to == AgentRole::WindowUse {
+        AgentRole::WindowUse
+    } else {
+        AgentRole::SubAgent
+    };
+    let exec_label = if exec_role == AgentRole::WindowUse {
+        "WindowUse"
+    } else {
+        "SubAgent"
+    };
+    emit_progress(&progress, format!("{wf_id} {exec_label} 执行中…"));
+    let outcome = if exec_role == AgentRole::WindowUse {
+        window_use.run_unit_with_cancel(&input, &session_id, &cancel).await
+    } else {
+        sub_agent.run_unit_with_cancel(&input, &session_id, &cancel).await
+    }
+    .map_err(|e| {
+        QualityFailure::from_agent_error(
+            exec_role,
+            &format!("{exec_label} 执行失败(wf={wf_id})"),
+            &e,
+        )
+    })?;
 
     let (qc, qc_usage) = quality
-        .check_subagent(
+        .check_subagent_with_source(
+            exec_role,
             &goal,
             &input.description,
             &input.expected_output,
@@ -1241,7 +1274,7 @@ async fn run_wf_unit(
 
     if qc.verdict == Verdict::Fail {
         return Err(QualityFailure {
-            source: AgentRole::SubAgent,
+            source: exec_role,
             reason: format!("wf={}: {}", wf_id, qc.issues.join("; ")),
             retryable: qc.retryable,
             suggestion: qc.suggestion,

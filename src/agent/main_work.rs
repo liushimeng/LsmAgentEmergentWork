@@ -195,6 +195,7 @@ where
     let norm = raw.trim().to_lowercase().replace(['-', '_', ' '], "");
     let role = match norm.as_str() {
         "subagent" | "subagentwork" | "work" | "执行层" => AgentRole::SubAgent,
+        "windowuse" | "windowuseagent" | "window" | "窗口" => AgentRole::WindowUse,
         "main" | "mainwork" | "mainworkagent" => AgentRole::MainWork,
         "yolo" => AgentRole::Yolo,
         "plan" => AgentRole::Plan,
@@ -262,7 +263,9 @@ impl MainWorkRunner {
              约束:\n\
              - id/name/steps/acceptance/delegate_to 必填;branches/loops/depends_on/summary 可省略。\n\
              - branches/loops 元素是字符串(形如 \"条件: 动作\")或对象({\"condition\":…,\"then\":…} / {\"condition\":…,\"over\":…})均可。\n\
-             - delegate_to 固定填 \"subagent\"。\n\
+             - delegate_to 二选一:默认填 \"subagent\"(通用执行);若该流程是「读取/操作桌面软件窗口\n\
+               (枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本)」类任务,必须填 \"windowuse\",\n\
+               由 WindowUse Agent(LsmAgentEmergentWork-WindowUse)执行。\n\
              - acceptance 必须是可执行验证的验收标准(命令 / 可比对的预期输出),不要写「完成目标」这类空话。",
         );
 
@@ -1025,6 +1028,29 @@ mod tests {
         let plan: WorkFlowPlan =
             serde_json::from_str(r#"{"workflows": [{"id": "wf-1", "name": "n"}]}"#).unwrap();
         assert_eq!(plan.workflows[0].delegate_to, AgentRole::SubAgent);
+    }
+
+    /// WindowUse 委派(第 9 角色):windowuse 各别名归一到 AgentRole::WindowUse。
+    #[test]
+    fn parse_delegate_to_window_use_aliases() {
+        let mk = |v: &str| {
+            format!(r#"{{"workflows": [{{"id": "wf-1", "name": "n", "delegate_to": {v}}}]}}"#)
+        };
+        for alias in [
+            "\"windowuse\"",
+            "\"WindowUse\"",
+            "\"window-use\"",
+            "\"window_use\"",
+            "\"WindowUseAgent\"",
+            "\"窗口\"",
+        ] {
+            let plan: WorkFlowPlan = serde_json::from_str(&mk(alias)).unwrap();
+            assert_eq!(
+                plan.workflows[0].delegate_to,
+                AgentRole::WindowUse,
+                "alias={alias}"
+            );
+        }
     }
 
     /// F2:split_condition_then 的分隔符取最早出现者,切不开归 condition。

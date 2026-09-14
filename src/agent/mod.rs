@@ -37,6 +37,8 @@ pub mod subagent;
 pub mod system_prompt;
 pub mod tool_schema_validator;
 pub mod tools;
+pub mod window;
+pub mod window_use;
 pub mod workspace;
 pub mod yolo;
 

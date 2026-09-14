@@ -186,6 +186,14 @@ impl SystemPrompt {
     pub fn compact() -> Self {
         Self::without_tools(COMPACT_BASE_PROMPT)
     }
+
+    /// 构造 WindowUse Agent 的系统提示词(桌面操控层,第 9 角色)。
+    pub fn window_use() -> Self {
+        Self::new(WINDOW_USE_BASE_PROMPT)
+            .with_tools_hint(window_use_tools_hint())
+            .set_protocol_tail(crate::config::Protocol::Anthropic, WINDOW_USE_ANTHROPIC_TAIL)
+            .set_protocol_tail(crate::config::Protocol::OpenAi, WINDOW_USE_OPENAI_TAIL)
+    }
 }
 
 /// Yolo Agent 基础身份与职责说明。
@@ -224,6 +232,10 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 - 涉及多个文件或多个子任务
 - 需要先了解现状再动手
 - 需要你先给出分解计划,再交给 Main-Work 执行
+- ⚠️ 涉及「读取/操作桌面软件窗口」的任务(枚举窗口、遍历控件、点击按钮、
+  向窗口输入/读取文本,如「帮我点一下记事本的保存按钮」「读取某软件窗口里的文本」)
+  最低按 medium 档分类 —— 这类任务由 Main-Work 委派给 WindowUse 专项 Agent 执行,
+  不得按 simple 直派 SubAgent-Work
 
 【hard 高等难度】
 - 涉及多个文件、多个模块的综合改动
@@ -582,7 +594,7 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 【Main-Work 单元】
 - workflows 结构是否完整(每个 wf 有 id/name/steps/depends_on/acceptance)
 - 依赖关系是否有循环
-- 每个 workflow 是否明确 delegate_to: subagent
+- 每个 workflow 是否明确 delegate_to(subagent 通用执行 / windowuse 桌面窗口操控)
 - 验收标准是否可机器验证
 
 【Plan 单元】
@@ -752,6 +764,57 @@ const COMPACT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Compact,压缩�
 - 全文使用中文(用户原文为其它语言的关键内容可保留原文)
 - 严格遵守档位目标压缩率,不要超过"#;
 
+// =================== WindowUse Agent 提示词(第 9 角色,桌面操控层) ===================
+
+/// WindowUse Agent 基础身份与职责说明。
+///
+/// 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md`。
+const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,桌面操控层的专项执行 Agent。
+
+你的核心职责:读取与操作电脑上的桌面软件窗口(枚举窗口、遍历控件、点击按钮、读写文本),
+完成上层 Agent(Main-Work)委派给你的窗口操控流程单元。
+
+平台能力(由工具自动适配,你无需关心差异):
+- Windows:通过 UI Automation 遍历窗口控件树并操作(按钮 Invoke / 输入框 SetValue / 聚焦),
+  覆盖原生 Win32 / WPF / Qt 等带无障碍支持的程序;
+- macOS:通过 Accessibility(AXUIElementRef)读取/操作控件;需要用户授予「辅助功能」权限,
+  若工具返回权限未授予,必须把开启步骤(系统设置 → 隐私与安全性 → 辅助功能 → 勾选终端应用)
+  写进最终回答告知用户;
+- Linux 等其他平台:无统一控件级接口,工具会返回不支持说明,此时如实报告并给出替代建议。
+
+作业规范(严格遵守):
+1. 先检视后操作:WindowList 找窗口(filter 过滤)→ WindowInspect 看控件树(控件多时用
+   小 max_depth + filter 缩小范围)→ WindowAction 执行;
+2. 只用 WindowInspect 返回的 path 定位控件;操作失败报「路径失效/越界」时,重新检视再试;
+3. 控件是否支持某动作以检视返回的 actions 列表为准,不要盲调;
+4. 安全红线:禁止对疑似支付 / 删除 / 发送 / 确认提交类按钮做无把握点击;若任务必须点击
+   此类按钮,在最终回答中明确说明你点击了什么、为什么;
+5. 只读优先:能靠 WindowList / WindowInspect / get_text 回答的问题,不要做任何写操作;
+6. 窗口 UI 是动态的:一次任务内路径可能失效,失败时优先重新 WindowInspect 获取最新路径,
+   不要重复完全相同的失败调用。
+
+完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
+"#;
+
+fn window_use_tools_hint() -> &'static str {
+    "工具调用规范:\n\
+     - 工具参数需严格遵守给定 JSON Schema\n\
+     - 窗口操控三工具按「列表 → 检视 → 操作」顺序使用;无依赖的读取调用可并行发出\n\n\
+     可用工具:\n\
+     - WindowList(filter?): 枚举可见顶层窗口,返回 id/title/进程/PID/位置尺寸\n\
+     - WindowInspect(window_id, max_depth?, filter?): 枚举窗口控件树,返回每个控件的 \
+       path/role/name/value/bounds/actions/children\n\
+     - WindowAction(window_id, path, action, text?): 对控件执行 \
+       click/invoke/focus/set_text/get_text/send_keys\n\
+     - Read(file_path, offset?, limit?): 读取文本文件(理解任务上下文用),带行号"
+}
+
+const WINDOW_USE_ANTHROPIC_TAIL: &str = "\
+[Anthropic 补充] 窗口/控件查询类无依赖工具调用请并行发出;操作类调用按依赖顺序逐个执行。";
+
+const WINDOW_USE_OPENAI_TAIL: &str = "\
+[OpenAI 补充] 窗口/控件查询类无依赖工具调用请并行发出;操作类调用按依赖顺序逐个执行。";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,8 +867,8 @@ mod tests {
     }
 
     #[test]
-    fn all_seven_prompts_render_for_both_protocols() {
-        let builders: [fn() -> SystemPrompt; 8] = [
+    fn all_nine_prompts_render_for_both_protocols() {
+        let builders: [fn() -> SystemPrompt; 9] = [
             SystemPrompt::yolo,
             SystemPrompt::plan,
             SystemPrompt::main_work,
@@ -814,6 +877,7 @@ mod tests {
             SystemPrompt::session_context,
             SystemPrompt::debug,
             SystemPrompt::compact,
+            SystemPrompt::window_use,
         ];
         for f in builders {
             let sp = f();
@@ -826,7 +890,7 @@ mod tests {
 
     #[test]
     fn each_prompt_mentions_own_agent_name() {
-        let cases: [(&str, fn() -> SystemPrompt); 8] = [
+        let cases: [(&str, fn() -> SystemPrompt); 9] = [
             ("LsmAgentEmergentWork-Yolo", SystemPrompt::yolo),
             ("LsmAgentEmergentWork-Plan", SystemPrompt::plan),
             ("LsmAgentEmergentWork-Main-Work", SystemPrompt::main_work),
@@ -835,6 +899,7 @@ mod tests {
             ("LsmAgentEmergentWork-SessionContext", SystemPrompt::session_context),
             ("LsmAgentEmergentWork-Debug", SystemPrompt::debug),
             ("LsmAgentEmergentWork-Compact", SystemPrompt::compact),
+            ("LsmAgentEmergentWork-WindowUse", SystemPrompt::window_use),
         ];
         for (name, f) in cases {
             let rendered = f().render(Protocol::Anthropic);

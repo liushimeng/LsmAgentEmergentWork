@@ -15,8 +15,8 @@
 use crate::agent::system_prompt::SystemPrompt;
 use crate::agent::tools::{
     builtin_registry, compact_registry, debug_registry, main_work_registry, plan_registry,
-    quality_registry, session_context_registry, sub_agent_work_registry, yolo_registry,
-    ToolRegistry,
+    quality_registry, session_context_registry, sub_agent_work_registry, window_use_registry,
+    yolo_registry, ToolRegistry,
 };
 
 // =================== Agent 名称常量 ===================
@@ -37,6 +37,8 @@ pub const SESSION_CONTEXT_AGENT_NAME: &str = "LsmAgentEmergentWork-SessionContex
 pub const DEBUG_AGENT_NAME: &str = "LsmAgentEmergentWork-Debug";
 /// Compact Agent(压缩层,Context 超阈值时自动压缩)
 pub const COMPACT_AGENT_NAME: &str = "LsmAgentEmergentWork-Compact";
+/// WindowUse Agent(桌面操控层,第 9 角色:Windows UIA / macOS Accessibility 窗口操控)
+pub const WINDOW_USE_AGENT_NAME: &str = "LsmAgentEmergentWork-WindowUse";
 
 /// 兼容旧名(指向 SubAgent-Work)。
 pub const WORK_AGENT_NAME: &str = SUB_AGENT_WORK_NAME;
@@ -151,6 +153,19 @@ impl AgentProfile {
         }
     }
 
+    /// WindowUse Agent profile(桌面操控层,第 9 角色)。
+    ///
+    /// 工具集:Read + WindowList / WindowInspect / WindowAction;
+    /// 不带 Bash/Write(窗口操控单元不需要 shell / 文件写,收窄权限面)。
+    pub fn window_use_profile() -> Self {
+        Self {
+            name: WINDOW_USE_AGENT_NAME.to_string(),
+            system_prompt: SystemPrompt::window_use(),
+            tools: window_use_registry(),
+            emit_tool: None,
+        }
+    }
+
     /// 兼容旧名(等价于 sub_agent_work_profile)。
     pub fn work_profile() -> Self {
         Self::sub_agent_work_profile()
@@ -214,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn six_profiles_have_distinct_names() {
+    fn all_profiles_have_distinct_names() {
         let names = [
             AgentProfile::yolo_profile().name,
             AgentProfile::plan_profile().name,
@@ -223,9 +238,10 @@ mod tests {
             AgentProfile::quality_check_profile().name,
             AgentProfile::session_context_profile().name,
             AgentProfile::compact_profile().name,
+            AgentProfile::window_use_profile().name,
         ];
         let unique: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(unique.len(), 7, "7 个 profile 必须名字互不相同");
+        assert_eq!(unique.len(), 8, "8 个 profile 必须名字互不相同");
     }
 
     #[test]
@@ -257,6 +273,7 @@ mod tests {
             AgentProfile::session_context_profile(),
             AgentProfile::debug_profile(),
             AgentProfile::compact_profile(),
+            AgentProfile::window_use_profile(),
         ] {
             assert!(p.emit_tool.is_none(), "{} 不应声明 emit 工具", p.name);
         }
@@ -270,6 +287,9 @@ mod tests {
         assert!(q_names.contains(&"submit_quality_report".to_string()));
         // emit 工具不进入其他 registry
         assert!(!tool_names(&AgentProfile::sub_agent_work_profile())
+            .iter()
+            .any(|n| n.starts_with("submit_")));
+        assert!(!tool_names(&AgentProfile::window_use_profile())
             .iter()
             .any(|n| n.starts_with("submit_")));
     }
@@ -340,6 +360,7 @@ mod tests {
             AgentProfile::quality_check_profile(),
             AgentProfile::session_context_profile(),
             AgentProfile::compact_profile(),
+            AgentProfile::window_use_profile(),
         ] {
             let rendered = p.system_prompt.render(Protocol::Anthropic);
             assert!(!rendered.is_empty(), "{} 的系统提示词渲染不应为空", p.name);

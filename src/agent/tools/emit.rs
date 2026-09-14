@@ -124,7 +124,7 @@ impl Tool for SubmitQualityReport {
                 },
                 "source": {
                     "type": "string",
-                    "enum": ["yolo", "plan", "main", "subagent", "quality_check", "session_context", "compact"],
+                    "enum": ["yolo", "plan", "main", "subagent", "quality_check", "session_context", "compact", "windowuse"],
                     "description": "被检单元的来源角色"
                 },
                 "issues": {

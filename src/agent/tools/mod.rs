@@ -20,6 +20,7 @@ pub mod emit;
 pub mod glob;
 pub mod grep;
 pub mod read;
+pub mod window;
 pub mod write;
 
 /// 工具需要实现的异步 trait
@@ -180,6 +181,18 @@ pub fn compact_registry() -> ToolRegistry {
     ToolRegistry::new()
 }
 
+/// WindowUse Agent 工具注册表(第 9 角色,桌面操控层):
+/// Read(读文件理解上下文) + WindowList / WindowInspect / WindowAction(窗口操控)。
+/// 不带 Bash/Write —— 窗口操控单元不需要 shell / 文件写,收窄权限面。
+/// 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` §2.5。
+pub fn window_use_registry() -> ToolRegistry {
+    ToolRegistry::new()
+        .register(Arc::new(read::ReadTool))
+        .register(Arc::new(window::WindowListTool))
+        .register(Arc::new(window::WindowInspectTool))
+        .register(Arc::new(window::WindowActionTool))
+}
+
 #[cfg(test)]
 mod names_tests {
     use super::*;
@@ -196,5 +209,14 @@ mod names_tests {
     #[test]
     fn empty_registry_names_is_empty() {
         assert!(session_context_registry().names().is_empty());
+    }
+
+    #[test]
+    fn window_use_registry_names() {
+        let reg = window_use_registry();
+        assert_eq!(
+            reg.names(),
+            vec!["Read", "WindowList", "WindowInspect", "WindowAction"]
+        );
     }
 }

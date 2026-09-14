@@ -50,6 +50,23 @@ url = "2.5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# WindowUse Agent(第 9 角色)平台后端:Windows UI Automation + Win32
+# (枚举 HWND 顶层窗口 / UIA 控件树遍历与操作 / SendMessage 降级)
+# 设计见 docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+] }
+
+# WindowUse Agent macOS 后端:Accessibility(AXUIElementRef)经 core-foundation FFI 调用
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"

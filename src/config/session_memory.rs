@@ -165,6 +165,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMemoryRow> 
         "session" => AgentRole::SessionContext,
         "user" => AgentRole::SessionContext, // user 消息也归到 session
         "compact" => AgentRole::Compact,
+        "windowuse" => AgentRole::WindowUse,
         other => {
             return Err(rusqlite::Error::InvalidColumnType(
                 3,

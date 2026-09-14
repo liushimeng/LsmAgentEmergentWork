@@ -89,13 +89,43 @@ impl QualityRunner {
         trace: &ExecutionTrace,
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
+        self.check_subagent_with_source(
+            AgentRole::SubAgent,
+            goal,
+            unit_scope,
+            expected_output,
+            actual_output,
+            trace,
+            session_id,
+        )
+        .await
+    }
+
+    /// [`check_subagent`] 的来源角色参数化版本(2026-09-14 第 9 角色 WindowUse):
+    /// delegate_to=windowuse 的 WorkFlow 单元质检时传 `AgentRole::WindowUse`,
+    /// 让质检报告 source 与提示词标题反映真实执行角色。
+    pub async fn check_subagent_with_source(
+        &self,
+        source: AgentRole,
+        goal: &str,
+        unit_scope: &str,
+        expected_output: &str,
+        actual_output: &str,
+        trace: &ExecutionTrace,
+        session_id: &str,
+    ) -> Result<(QualityReport, Usage)> {
         let trace_summary = trace.render_prompt();
+        let unit_label = if source == AgentRole::WindowUse {
+            "WindowUse 单元(桌面窗口操控)"
+        } else {
+            "SubAgent 单元"
+        };
         // F10(2026-09-10 第 25 轮):判定基准是「本单元职责」,整体目标仅作背景。
         // 此前 prompt 只给整体 goal,QC(真实 LLM)按整体目标判单元产物,SubAgent
         // 只完成了 wf-1 前置检查也被判「核心任务未完成」→ 无效重试风暴
         // (Debug 报告 debug_report_20260910_150805 问题报告 P1)。
         let prompt = format!(
-            "【Quality-Check: SubAgent 单元】\n\
+            "【Quality-Check: {unit_label}】\n\
              整体目标(仅作背景,不作为本单元判定依据): {goal}\n\
              本单元职责(判定依据): {unit_scope}\n\
              本单元期望输出: {expected_output}\n\
@@ -110,7 +140,7 @@ impl QualityRunner {
         );
         self.run_check(
             prompt,
-            AgentRole::SubAgent,
+            source,
             actual_output,
             session_id,
             Some(trace),

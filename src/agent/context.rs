@@ -34,6 +34,9 @@ pub enum AgentRole {
     SessionContext,
     /// 压缩层:Context 超阈值时自动压缩(第 8 角色)
     Compact,
+    /// 桌面操控层:桌面软件窗口读取/操作(第 9 角色,Windows UIA / macOS AX)
+    #[serde(rename = "windowuse")]
+    WindowUse,
 }
 
 impl AgentRole {
@@ -46,6 +49,7 @@ impl AgentRole {
             Self::QualityCheck => "quality",
             Self::SessionContext => "session",
             Self::Compact => "compact",
+            Self::WindowUse => "windowuse",
         }
     }
 }
@@ -131,6 +135,7 @@ mod tests {
         assert_eq!(AgentRole::QualityCheck.as_str(), "quality");
         assert_eq!(AgentRole::SessionContext.as_str(), "session");
         assert_eq!(AgentRole::Compact.as_str(), "compact");
+        assert_eq!(AgentRole::WindowUse.as_str(), "windowuse");
     }
 
     #[test]
@@ -138,6 +143,15 @@ mod tests {
         let r = AgentRole::MainWork;
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(s, "\"main\"");
+        let back: AgentRole = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn window_use_role_serde_roundtrip() {
+        let r = AgentRole::WindowUse;
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, "\"windowuse\"");
         let back: AgentRole = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
     }
