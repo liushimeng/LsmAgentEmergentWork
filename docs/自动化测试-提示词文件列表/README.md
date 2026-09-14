@@ -2,7 +2,7 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **241 维度 × 10 个 = 2410 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **242 维度 × 10 个 = 2420 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
@@ -496,6 +496,7 @@ docs/自动化测试-提示词文件列表/
 | HZ01–HZ10 | QualityCheck 质检与报告实战 | Verdict Pass/Fail/QualityReport 结构/静态规则/LLM 评估/fail-closed/失败回流与重试/报告落盘/metrics 统计/与 QualityGate 协同/与 SessionContext 协同 | simple~hard |
 | IA01–IA10 | AgentMessage 消息总线与跨角色通信实战 | AgentMessage 五元组/MessagePayload 四变体(WindowTextRead/TextToWindow/WindowFocus/Data)/消费标记幂等/SQLite 持久化/WindowUse↔SubAgentWork 桥/MainWork→WindowUse 聚焦/Data 通用传递/跨 WorkFlow/消息过期清理 | simple~hard |
 | IB01–IB10 | 端到端超大工程编排实战 | Yolo 分类→Plan 方案→WorkFlow 拆解→Main-Work 编排→SubAgent 并行→WindowUse 操控→QC 质检→Compact 压缩→SessionContext 摘要→Debug 评估/全链路 metrics/失败回流/AgentMessage 协作/工作区感知/离线兜底/取消中断/溢出恢复 | medium~hard |
+| IC01–IC10 | LLM 弹性层与流式解析实战 | SSE 字节流解析/Anthropic 6 类事件/OpenAI delta 嵌套/JSON 修复链 stage1-4(裸文本/注释/围栏/末段截断)/tool_use.input nil 归一化/连续失败短路 + Yolo 降级 metrics/mock_llm_server 三模式故障注入/智能续轮 MAX_TOKENS + 流中断 + tool_use 链断裂/三方联动修复+续轮+QC | simple~hard |
 
 ## 每条提示词的字段
 
