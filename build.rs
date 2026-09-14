@@ -34,6 +34,10 @@ fn main() {
 
     // 源文件变化时重新运行
     println!("cargo:rerun-if-changed=build.rs");
+    // F6(2026-09-14 第 51 轮):src/ 变化同样重跑本脚本 —— 否则只改源码时
+    // LAEW_BUILD_TIME 沿用旧值,--version 显示的编译时间失真(本轮实测
+    // 09:51 构建 → 10:49 重编仍显示 09:51)。
+    println!("cargo:rerun-if-changed=src/");
     // HEAD ref 文件变化时重新运行(本地提交时 mtime 会被 git 刷新)
     println!("cargo:rerun-if-changed=.git/HEAD");
     if let Ok(head) = std::fs::read_to_string(".git/HEAD") {

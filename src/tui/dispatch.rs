@@ -174,13 +174,44 @@ impl TuiSession {
                             // 否则「recv 清行 → 心跳用过期 current_stage 复活旧行 →
                             // flush println 落在行中部」的竞态会复发行中部错位
                             // (心跳分支另有 queue.is_empty() 闸门双保险)。
+                            //
+                            // F3 补(2026-09-14 第 51 轮):`[laew]` 前缀的重要通知
+                            // (Context 压缩 / WorkFlow 并行调度)不走 1.5s hold ——
+                            // 立即冲刷,且任务快速完成时也不得被丢弃
+                            // (e2e 5c mock 场景 hold 窗口内结束曾把压缩提示整条吞掉)。
+                            if line.starts_with("[laew]") {
+                                if waiting_line_on_screen {
+                                    clear_waiting_line(stdout_is_tty);
+                                    waiting_line_on_screen = false;
+                                    initial_spinner_active = false;
+                                }
+                                // 先冲刷积压的普通阶段,保持时序
+                                while let Some(pending) = queue.pop_front() {
+                                    println!("  [stage] {pending}");
+                                }
+                                println!("  [stage] {line}");
+                                let _ = std::io::stdout().flush();
+                                idle.as_mut().reset(tokio::time::Instant::now() + tick);
+                                continue;
+                            }
                             if queue.is_empty() {
                                 idle.as_mut().reset(tokio::time::Instant::now() + hold);
                             }
                             queue.push_back(line);
                         }
                         None => {
-                            // 任务结束:清除屏幕上的 waiting 行,丢弃未显示的快速阶段
+                            // 任务结束:清除屏幕上的 waiting 行,丢弃未显示的快速阶段;
+                            // 但 [laew] 重要通知不允许丢弃(F3 补,同上)。
+                            while let Some(pending) = queue.pop_front() {
+                                if pending.starts_with("[laew]") {
+                                    if waiting_line_on_screen {
+                                        clear_waiting_line(stdout_is_tty);
+                                        waiting_line_on_screen = false;
+                                    }
+                                    println!("  [stage] {pending}");
+                                    let _ = std::io::stdout().flush();
+                                }
+                            }
                             if waiting_line_on_screen {
                                 clear_waiting_line(stdout_is_tty);
                             }

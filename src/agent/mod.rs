@@ -445,7 +445,22 @@ impl Agent {
                     Some(Ok(out)) => (out, false),
                     Some(Err(e)) => {
                         warn!(tool = %name, error = %e, "tool failed");
-                        (format!("[工具执行失败] {}: {}", name, e), true)
+                        // F1(2026-09-14 第 51 轮):工具不存在时,回填文本明示
+                        // 可用工具边界——auto tool_choice 降级后模型可能尝试
+                        // 越权工具(如 Yolo 调 Bash),裸错误「工具不存在」不足以
+                        // 让模型收敛,导致同一轮内反复试错浪费迭代。
+                        if matches!(e, AgentError::ToolNotFound(_)) {
+                            let avail = self.profile.tools.names().join(", ");
+                            (
+                                format!(
+                                    "[工具执行失败] {name}: {e}。你当前可用的工具仅有: [{avail}]。\
+                                     禁止再次调用 {name};请立即改用上述可用工具完成任务,或直接给出最终回答。"
+                                ),
+                                true,
+                            )
+                        } else {
+                            (format!("[工具执行失败] {}: {}", name, e), true)
+                        }
                     }
                     // 取消:本条 + 本轮剩余未执行的 tool_use 由 backfill 统一补全
                     None => {

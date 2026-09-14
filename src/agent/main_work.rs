@@ -402,16 +402,36 @@ pub fn topo_layers(workflows: &[WorkFlowSpec]) -> Result<Vec<Vec<WorkFlowSpec>>>
 pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
     if let Some(json_str) = extract_json_block(text) {
         // Main-Work 路径:启用 Tier-2 截断补全(关联报告: 2026-09-09_04 D-001)。
-        return crate::agent::json_repair::try_parse_lenient(json_str)
-            .map_err(AgentError::WorkflowParse);
+        let mut plan = crate::agent::json_repair::try_parse_lenient(json_str)
+            .map_err(AgentError::WorkflowParse)?;
+        dedup_workflow_ids(&mut plan);
+        return Ok(plan);
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        return crate::agent::json_repair::try_parse_lenient(json_str)
-            .map_err(AgentError::WorkflowParse);
+        let mut plan = crate::agent::json_repair::try_parse_lenient(json_str)
+            .map_err(AgentError::WorkflowParse)?;
+        dedup_workflow_ids(&mut plan);
+        return Ok(plan);
     }
     Err(AgentError::WorkflowParse(
         "未找到合法的 WorkFlow JSON".into(),
     ))
+}
+
+/// I4(2026-09-14 第 51 轮):workflows 数组按 id 去重(保留首次出现)。
+/// 真实网关实测 Main-Work 偶发把同一批 wf 输出两遍(wf-1..wf-5 各 2 条共 10 条,
+/// ak05),id 是依赖解析主键,重复触发 QC 必拒 + 依赖歧义;去重属无损修复。
+pub fn dedup_workflow_ids(plan: &mut WorkFlowPlan) {
+    let mut seen = std::collections::HashSet::new();
+    let before = plan.workflows.len();
+    plan.workflows.retain(|w| seen.insert(w.id.clone()));
+    if plan.workflows.len() != before {
+        tracing::warn!(
+            "WorkFlow 数组存在重复 id,已按 id 去重: {} → {} 条",
+            before,
+            plan.workflows.len()
+        );
+    }
 }
 
 fn extract_json_block(text: &str) -> Option<&str> {
@@ -513,6 +533,112 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                 delegate_to: AgentRole::SubAgent,
             });
         }
+        // I2c(2026-09-14 第 51 轮):兜底兼容表格行变体 `| **wf-1** | 名称 | 步骤 | 依赖 |`
+        // —— Plan 提示词漂移的另一常见形态(et08/et09 实测,表格行含全部四要素,
+        // 旧解析器对表格行零识别 → acceptance/depends 全丢或 0 workflow)。
+        if t.starts_with('|') && t.contains("wf-") && !t.contains("---") {
+            let cells: Vec<String> = t
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim().trim_matches('*').trim().to_string())
+                .collect();
+            let id_cell = cells.first().cloned().unwrap_or_default();
+            let id_num: String = id_cell
+                .trim_start_matches("wf-")
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !id_num.is_empty() && cells.len() >= 3 {
+                if let Some(w) = current.take() {
+                    workflows.push(w);
+                }
+                let name = cells.get(1).cloned().unwrap_or_default();
+                // 步骤列:整段作为一条步骤(保持语义完整,不粗暴切分)
+                let steps: Vec<String> = cells
+                    .get(2)
+                    .map(|s| {
+                        let s = s.trim();
+                        if s.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![s.to_string()]
+                        }
+                    })
+                    .unwrap_or_default();
+                // 依赖列:逗号/顿号分隔,忽略「无」与空
+                let depends_on: Vec<String> = cells
+                    .get(3)
+                    .map(|d| {
+                        d.split(|c| c == ',' || c == '、' || c == ';')
+                            .map(|p| p.trim())
+                            .filter(|p| {
+                                !p.is_empty() && *p != "无" && *p != "-" && *p != "—"
+                            })
+                            .map(|p| p.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                current = Some(WorkFlowSpec {
+                    id: format!("wf-{id_num}"),
+                    name,
+                    steps,
+                    branches: Vec::new(),
+                    loops: Vec::new(),
+                    depends_on,
+                    acceptance: Vec::new(),
+                    delegate_to: AgentRole::SubAgent,
+                });
+                continue;
+            }
+        }
+        // I2(2026-09-14 第 51 轮):兜底兼容粗体 bullet 变体 `- **wf-1 …** …` /
+        if t.starts_with("- **wf-") || t.starts_with("**wf-") {
+            let inner = t
+                .trim_start_matches("- ")
+                .trim_start_matches("**")
+                .to_string();
+            let id_num: String = inner
+                .trim_start_matches("wf-")
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !id_num.is_empty() {
+                // 拆出「wf-N 名称」与粗体闭合后的描述(描述兜底为首步骤)
+                let head = &inner[..(3 + id_num.len()).min(inner.len())];
+                let rest = &inner[head.len()..];
+                let (name_raw, desc) = match rest.find("**") {
+                    Some(i) => (
+                        &rest[..i],
+                        rest[i + 2..].trim_start_matches(':').trim().to_string(),
+                    ),
+                    None => (rest, String::new()),
+                };
+                let name = name_raw
+                    .trim_start_matches(|c: char| {
+                        matches!(c, '/' | ':' | '—' | '–' | '-' | ' ' | '\t')
+                    })
+                    .trim()
+                    .to_string();
+                if let Some(w) = current.take() {
+                    workflows.push(w);
+                }
+                let mut steps = Vec::new();
+                if !desc.is_empty() {
+                    steps.push(desc);
+                }
+                current = Some(WorkFlowSpec {
+                    id: format!("wf-{id_num}"),
+                    name,
+                    steps,
+                    branches: Vec::new(),
+                    loops: Vec::new(),
+                    depends_on: Vec::new(),
+                    acceptance: Vec::new(),
+                    delegate_to: AgentRole::SubAgent,
+                });
+                continue;
+            }
+        }
         if let Some(w) = current.as_mut() {
             if t.starts_with("- 依赖:") || t.starts_with("依赖:") {
                 // 提取冒号之后的内容
@@ -540,6 +666,20 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
             } else if t.starts_with("- [ ]") || t.starts_with("  - [ ]") {
                 w.steps
                     .push(t.trim_start_matches(|c: char| c == ' ').trim_start_matches("- [ ]").trim().to_string());
+            } else if t.starts_with("- ")
+                && !t.starts_with("- 委派")
+                && !t.starts_with("- 步骤")
+                && !t.starts_with("- 依赖")
+                && !t.starts_with("- 验收标准")
+            {
+                // I2(2026-09-14 第 51 轮):兜底把普通 bullet 视为步骤 ——
+                // 粗体变体方案(`- **wf-N …**` 开头)没有 `- [ ]` 步骤标记,
+                // 其后的说明 bullet 即步骤本体;模板格式方案不受影响
+                // (其普通 bullet 仅 `- 委派 Agent:` 一类,已在上面排除)。
+                let step = t.trim_start_matches("- ").trim();
+                if !step.is_empty() {
+                    w.steps.push(step.to_string());
+                }
             }
         }
     }
@@ -553,11 +693,13 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
         ));
     }
 
-    Ok(WorkFlowPlan {
+    let mut plan = WorkFlowPlan {
         workflows,
         summary: "从 Plan 文档解析得到".into(),
         degraded: false,
-    })
+    };
+    dedup_workflow_ids(&mut plan);
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -735,6 +877,63 @@ mod tests {
         assert_eq!(plan.workflows[1].depends_on, vec!["wf-1"]);
     }
 
+    /// I2(2026-09-14 第 51 轮):Plan 提示词漂移兜底 —— 粗体 bullet 变体
+    /// `- **wf-N …**`(无 `### WorkFlow N:` 标题)也必须解析出 workflow,
+    /// 否则 hard 任务「Plan 文档未解析出任何 WorkFlow」整链失败(fl10 实测)。
+    #[test]
+    fn parse_plan_markdown_bold_bullet_variant() {
+        let md = r#"
+# 任务方案摘要
+
+## 二、WorkFlow 拆解
+- **wf-1 / 子任务 1 — 编写 fl10_rps.py**:asyncio server + JSON Lines + --dry-run
+- **wf-2 / 子任务 2 — py_compile**:断言退出码 = 0
+- **wf-3 / 子任务 3 — JSON 配置**:两个配置文件 utf-8 保存
+
+## 三、关键决策
+决策
+"#;
+        let plan = parse_plan_markdown(md).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(plan.workflows.len(), 3, "粗体变体应解析出 3 个 WorkFlow");
+        assert_eq!(plan.workflows[0].id, "wf-1");
+        assert!(plan.workflows[0].name.contains("编写"), "name: {}", plan.workflows[0].name);
+        assert!(
+            !plan.workflows[0].steps.is_empty(),
+            "说明 bullet 应兜底成为步骤: {:?}",
+            plan.workflows[0].steps
+        );
+    }
+
+    /// I2c(2026-09-14 第 51 轮):表格行变体 `| **wf-N** | 名称 | 步骤 | 依赖 |`
+    /// 必须解析出 workflow 及依赖链(et08/et09 实测形态)。
+    #[test]
+    fn parse_plan_markdown_table_row_variant() {
+        let md = r#"
+# 任务方案
+
+## 二、WorkFlow 拆解
+| 编号 | WorkFlow 名称 | 核心步骤 | 依赖 |
+|------|--------------|---------|------|
+| **wf-1** | 目录准备 | 创建 tmpPlan/agent-test/ | 无 |
+| **wf-2** | 编写脚本 | 实现核心模型 + demo | wf-1 |
+| **wf-3** | 验证 | py_compile 断言 | wf-2、wf-1 |
+
+## 三、关键决策
+决策
+"#;
+        let plan = parse_plan_markdown(md).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(plan.workflows.len(), 3, "表格行应解析出 3 个 WorkFlow");
+        assert_eq!(plan.workflows[0].id, "wf-1");
+        assert_eq!(plan.workflows[1].depends_on, vec!["wf-1"]);
+        assert_eq!(
+            plan.workflows[2].depends_on,
+            vec!["wf-2", "wf-1"],
+            "顿号分隔依赖: {:?}",
+            plan.workflows[2].depends_on
+        );
+        assert_eq!(plan.workflows[1].steps, vec!["实现核心模型 + demo"]);
+    }
+
     /// 验证 parse_plan_markdown 支持 JSON 代码块格式(兜底解析)。
     /// 关联修复: 2026-09-10 hard 任务 Plan 解析 Bug。
     #[test]
@@ -837,5 +1036,25 @@ mod tests {
         let (c, t) = super::split_condition_then("无分隔符的整句");
         assert_eq!(c, "无分隔符的整句");
         assert_eq!(t, "");
+    }
+}
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    /// I4(2026-09-14 第 51 轮):重复 id 去重(ak05 实测 wf-1..wf-5 各出现 2 次)。
+    #[test]
+    fn dedup_workflow_ids_keeps_first_occurrence() {
+        let src = r#"{"workflows":[
+            {"id":"wf-1","name":"a","steps":["s1"],"acceptance":["x"]},
+            {"id":"wf-2","name":"b","steps":["s2"],"acceptance":["y"]},
+            {"id":"wf-1","name":"a2","steps":["dup"],"acceptance":["dup"]}
+        ],"summary":"s"}"#;
+        let mut plan = parse_workflow_plan(src).unwrap();
+        assert_eq!(plan.workflows.len(), 2, "parse_workflow_plan 内部已去重");
+        dedup_workflow_ids(&mut plan); // 幂等
+        assert_eq!(plan.workflows.len(), 2);
+        assert_eq!(plan.workflows[0].name, "a", "应保留首次出现");
+        assert_eq!(plan.workflows[1].id, "wf-2");
     }
 }

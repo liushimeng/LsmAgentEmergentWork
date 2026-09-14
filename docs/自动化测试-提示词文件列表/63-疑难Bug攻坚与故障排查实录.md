@@ -7,7 +7,7 @@
 ---
 
 ### BL01 段错误 SIGSEGV：C 程序空指针解引用 + gdb 回溯
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: 🔄 部分通过（2026-09-14 第 51 轮 TUI r1/r2 过(gcc 编译+segfault 复现+segfault_gdb.md 降级记录),r3 驱动器 1500s 超时截断(面板显示仍在正常执行);详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: medium
 - **考察维度**: core dump 捕获 + addr2line 符号化 + 栈回溯
 - **工具链**: Write → Bash → Read → Bash
@@ -18,7 +18,7 @@
   4. 修复：在 `tmpPlan/agent-test/fixed.c` 写 `if (!p) { fprintf(stderr, "null pointer\n"); return 1; }`；`gcc -g -o fixed fixed.c && ./fixed` 退出码 0 + stderr 含 `null pointer`；最后 `rm -f buggy.c buggy fixed.c fixed buggy core segfault.*` 清理。
 
 ### BL02 Python 内存泄漏：tracemalloc 定位到调用栈
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-14 第 51 轮 真实网关 -p 单发复合任务通过:详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: medium
 - **考察维度**: RSS 监控 + tracemalloc 栈采样 + 泄漏检测
 - **工具链**: Write → Bash → Read → Bash
@@ -29,7 +29,7 @@
   4. 修复：在 `tmpPlan/agent-test/fixed_leak.py` 改成 `x = bytearray(...) ; return None`（不挂全局列表）+ 调 `gc.collect()` 释放；再跑 `python3 fixed_leak.py` 断言 RSS < 50MB 且 tracemalloc top 1 栈不是 `leaky_func`；写「laew `agent_memory` 累积未截断泄漏」设计说明到 `tmpPlan/agent-test/leak_design.md`，最后清理测试文件。
 
 ### BL03 Python 死锁：threading 锁顺序反转 + 调试输出
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-14 第 51 轮 真实网关 -p 单发复合任务通过:详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: hard
 - **考察维度**: 锁顺序反转 + 信号 stack dump + 锁规约
 - **工具链**: Write → Bash → Read → Bash
@@ -40,7 +40,7 @@
   4. 修复：在 `tmpPlan/agent-test/fixed_deadlock.py` 统一锁顺序（先 lock_a 后 lock_b）→ 跑 `timeout 6 python3 fixed_deadlock.py` 断言 stderr 无 `Lock.acquire` 阻塞 + exit 0；写「laew agent_memory 表读写锁顺序规约」设计说明到 `tmpPlan/agent-test/deadlock_design.md`，最后清理测试文件。
 
 ### BL04 Python 数据竞争：threading 非线程安全 dict + 原子性
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-14 第 51 轮 真实网关 -p 单发复合任务通过:详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: hard
 - **考察维度**: 数据竞争 + GIL 边界 + 原子操作
 - **工具链**: Write → Bash → Read → Bash
@@ -51,7 +51,7 @@
   4. 修复：用 `collections.Counter` 替代 dict（Counter 的 `__setitem__` 在 C 层是原子操作）或加 `threading.Lock`；跑 `python3 fixed_race.py` 三次断言总和恒为 10000；写「laew SessionContext 跨 SubAgent 共享状态是否需加原子计数器」到 `tmpPlan/agent-test/race_design.md`，最后清理。
 
 ### BL05 fd 泄漏：open() 不 close + /proc/PID/fd 监控
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-14 第 51 轮 真实网关 TUI 4 轮全过:详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: medium
 - **考察维度**: fd 计数 + /proc fd 监控 + ResourceWarning
 - **工具链**: Write → Bash → Read → Bash
@@ -62,7 +62,7 @@
   4. 修复：用 `with open(...) as f:` 或显式 `f.close()`；跑 `python3 fixed_fd.py` 断言 `/proc/self/fd` 数量恒为 5（stdin/stdout/stderr + 2 个 ResourceWarning 自身）；写「laew LLM client fd 泄漏监控」设计说明到 `tmpPlan/agent-test/fd_design.md`，最后清理测试脚本。
 
 ### BL06 CPU 100%：灾难性正则回溯 + 防 ReDoS
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-14 第 51 轮 真实网关 TUI 4 轮全过:详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: medium
 - **考察维度**: ReDoS + regex 性能 + NFA/DFA 引擎
 - **工具链**: Write → Bash → Read → Bash
@@ -73,7 +73,7 @@
   4. 修复：在 `tmpPlan/agent-test/safe_regex.py` 改用 `regex_automata` Python 移植（非回溯 DFA）→ 跑 `python3 safe_regex.py` 测 `^(a+)+$` 在 30 个 `a` + `X` 输入耗时 < 0.05s（常数时间）；写「laew Bash 命令过滤用 NFA/DFA 自研引擎避免第三方 regex ReDoS」设计说明到 `tmpPlan/agent-test/regex_design.md`，最后清理。
 
 ### BL07 时区 off-by-one：DST 切换日 + Asia/Shanghai
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-14 第 51 轮 真实网关 -p 单发复合任务通过:详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: hard
 - **考察维度**: monotonic vs wall clock + DST 切换 + tz data
 - **工具链**: Write → Bash → Read → Bash
@@ -84,7 +84,7 @@
   4. 修复：在 `tmpPlan/agent-test/fixed_tz.py` 改用 `datetime(2024,3,10,3,30)`（跳到 DST 后的等同时刻）+ 异常时主动 `logger.warning` 告知用户；跑测试断言 NonExistent 抛 `NonExistentTimeError` + Ambiguous 抛 `AmbiguousTimeError`；写「laew SessionContext `created_at` UTC + ISO8601 + 纳秒精度」设计说明到 `tmpPlan/agent-test/tz_design.md`，最后清理。
 
 ### BL08 乱码：GBK 文件读取为 UTF-8 + chardetng 嗅探
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-14 第 51 轮 真实网关 -p 单发复合任务通过:详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: medium
 - **考察维度**: charset detection + encoding 转换 + BOM
 - **工具链**: Write → Bash → Read → Bash
@@ -95,7 +95,7 @@
   4. 修复：在 `tmpPlan/agent-test/fixed_encoding.py` 写 `detect_and_read(path)` 函数：先嗅探 → 嗅探失败 fallback UTF-8 → 强制 UTF-8 读 + `errors='replace'`；跑测试断言 GBK 文件正确读出 + UTF-8 文件正常；写「laew Read 工具统一编码嗅探」设计说明到 `tmpPlan/agent-test/encoding_design.md`，最后清理 sample_gbk.txt。
 
 ### BL09 时钟异常：单调时钟 vs wall clock 混用 + Duration 负值
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ✅ 已测试（2026-09-14 第 51 轮 真实网关 -p 单发复合任务通过:详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: medium
 - **考察维度**: monotonic clock + duration 计算 + NTP 跳变
 - **工具链**: Write → Bash → Read → Bash
@@ -106,7 +106,7 @@
   4. 修复：在 `tmpPlan/agent-test/fixed_clock.py` 用 `time.monotonic()` + `time.monotonic_ns()`；跑测试断言 fixed 版在模拟跳变下不出现负值；写「laew Session 持续时间统计统一用 monotonic clock」设计说明到 `tmpPlan/agent-test/clock_design.md`，最后清理测试脚本。
 
 ### BL10 变更归因：git bisect 风格二分定位 + 回归断言
-- **测试状态**: 🔄 待重测（2026-09-11 脚本重写；旧版曾通过，记录见 tmpPlan/2026-09-10_23-B09-B10-自动化测试与TUI慢链路显示错乱及wire合并修复方案.md）
+- **测试状态**: ⏳ 待重测（2026-09-14 第 51 轮 -p 首跑 Plan-QC 多轮回流超驱动器 1500s 截断,Plan 质检发现方案内二分初始化真缺陷属合理拦截;待网关空闲重测;详见 tmpPlan/2026-09-14_51-真实网关52提示词批量测试与TUI行粘连及工具边界回填修复方案.md）
 - **预期档位**: hard
 - **考察维度**: git bisect + 回归测试 + 变更影响分析
 - **工具链**: Write → Bash → Read → Bash

@@ -48,9 +48,23 @@ pub fn build_http_client(end_point: &str) -> reqwest::Client {
     if tls_insecure_for(end_point) {
         // rustls 后端下同时跳过证书链与主机名校验;仅跳过校验,TLS 加密不降级。
         builder = builder.danger_accept_invalid_certs(true);
-        tracing::warn!(
-            "TLS 证书校验已放宽(LAEW_TLS_INSECURE 或 IP 主机自动策略):{end_point}"
-        );
+        // 同一 endpoint 进程内只 WARN 一次(客户端可能随 provider 切换/连通性
+        // 探测反复重建,逐次告警在批量测试下刷屏 —— 2026-09-14 第 51 轮 F2)。
+        static ANNOUNCED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::LazyLock::new(|| {
+                std::sync::Mutex::new(std::collections::HashSet::new())
+            });
+        let first = ANNOUNCED
+            .lock()
+            .map(|mut s| s.insert(end_point.to_string()))
+            .unwrap_or(false);
+        if first {
+            tracing::warn!(
+                "TLS 证书校验已放宽(LAEW_TLS_INSECURE 或 IP 主机自动策略):{end_point}"
+            );
+        } else {
+            tracing::debug!("TLS 证书校验已放宽(本进程已提示过):{end_point}");
+        }
     }
     builder.build().expect("reqwest Client 构建失败")
 }

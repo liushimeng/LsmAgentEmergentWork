@@ -266,11 +266,25 @@ fn coerce_to_string_vec(val: &mut serde_json::Value) {
     }
     if let serde_json::Value::Array(items) = val {
         for it in items.iter_mut() {
-            if !matches!(it, serde_json::Value::String(_)) {
-                let s = value_brief_string(it);
-                *it = serde_json::Value::String(s);
-            }
+            // F4(2026-09-14 第 51 轮):多层「单元素数组」递归解包后再字符串化。
+            // 真实网关复现 issues 字段 5 层嵌套([[[["…"]]]]),旧逻辑只字符串化一层,
+            // 得到 "[[[\"…\"]]]" 带括号噪声文本;解包到最内层标量才是模型本意。
+            let unwrapped = unwrap_single_element_array(std::mem::take(it));
+            *it = match unwrapped {
+                serde_json::Value::String(s) => serde_json::Value::String(s),
+                other => serde_json::Value::String(value_brief_string(&other)),
+            };
         }
+    }
+}
+
+/// 递归解包「仅含 1 个元素的数组」直到最内层非数组值。
+fn unwrap_single_element_array(mut v: serde_json::Value) -> serde_json::Value {
+    loop {
+        v = match v {
+            serde_json::Value::Array(mut inner) if inner.len() == 1 => inner.swap_remove(0),
+            other => return other,
+        };
     }
 }
 
@@ -1047,6 +1061,19 @@ mod tests {
         let src = r#"{"issues": "单条问题"}"#;
         let parsed: FakeQuality = try_parse(src).unwrap();
         assert_eq!(parsed.issues, vec!["单条问题"]);
+    }
+
+    #[test]
+    fn tier3_deeply_nested_single_element_arrays_unwrapped() {
+        // F4(2026-09-14 第 51 轮):真实网关复现 issues 5 层嵌套([[[["…"]]]]),
+        // 递归解包到最内层字符串,不得把括号噪声留在文本里。
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct FakeQuality {
+            issues: Vec<String>,
+        }
+        let src = r#"{"issues": [[[[["WorkFlow JSON 结构本身合格"]]]]]}"#;
+        let parsed: FakeQuality = try_parse(src).unwrap();
+        assert_eq!(parsed.issues, vec!["WorkFlow JSON 结构本身合格"]);
     }
 
     #[test]

@@ -68,6 +68,12 @@ impl ToolRegistry {
             .ok_or_else(|| AgentError::ToolNotFound(name.to_string()))
     }
 
+    /// 注册表内全部工具名(按注册顺序)。用于 ToolNotFound 回填时
+    /// 向模型明示可用工具边界,促其立即改道(2026-09-14 第 51 轮 F1)。
+    pub fn names(&self) -> Vec<&str> {
+        self.order.iter().map(|s| s.as_str()).collect()
+    }
+
     /// 协议无关层的工具定义列表(按注册顺序)
     pub fn defs(&self) -> Vec<ToolDef> {
         self.order
@@ -172,4 +178,23 @@ pub fn debug_registry() -> ToolRegistry {
 /// Compact Agent 工具注册表:无工具(只做上下文摘要,不修改系统状态)
 pub fn compact_registry() -> ToolRegistry {
     ToolRegistry::new()
+}
+
+#[cfg(test)]
+mod names_tests {
+    use super::*;
+
+    #[test]
+    fn yolo_registry_names_only_read_and_emit() {
+        // F1(2026-09-14 第 51 轮):ToolNotFound 回填文本依赖 names() 列出
+        // 可用工具边界;Yolo 注册表必须恰好是 Read + submit_task_classification。
+        let reg = yolo_registry();
+        let names = reg.names();
+        assert_eq!(names, vec!["Read", "submit_task_classification"]);
+    }
+
+    #[test]
+    fn empty_registry_names_is_empty() {
+        assert!(session_context_registry().names().is_empty());
+    }
 }

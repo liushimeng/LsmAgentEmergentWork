@@ -275,13 +275,18 @@ impl MultiAgentOrchestrator {
                 .await
             {
                 Ok(Some(rep)) => {
-                    eprintln!(
-                        "[laew] Context 已自动压缩:档位={} 估算 token {} → {}(覆盖 {} 条历史消息{})",
-                        rep.tier.as_str(),
-                        rep.before_tokens,
-                        rep.after_tokens,
-                        rep.compacted_messages,
-                        if rep.fallback { ",硬截断降级" } else { "" },
+                    // F3 同族(2026-09-14 第 51 轮):经 progress 通道输出,
+                    // 避免 TUI 下与 waiting 行同行粘连;非 TTY 仍落 stderr。
+                    emit_progress(
+                        progress,
+                        format!(
+                            "[laew] Context 已自动压缩:档位={} 估算 token {} → {}(覆盖 {} 条历史消息{})",
+                            rep.tier.as_str(),
+                            rep.before_tokens,
+                            rep.after_tokens,
+                            rep.compacted_messages,
+                            if rep.fallback { ",硬截断降级" } else { "" },
+                        ),
                     );
                 }
                 Ok(None) => {}
@@ -422,7 +427,7 @@ impl MultiAgentOrchestrator {
                         .await
                 }
                 TaskLevel::Hard => {
-                    self.run_hard(&classification, session, cancel, progress)
+                    self.run_hard(&classification, session, cancel, progress, &retry_hint)
                         .await
                 }
             };
@@ -742,17 +747,21 @@ impl MultiAgentOrchestrator {
         session: &Session,
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
+        retry_hint: &str,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Plan 生成(2026-09-09 第 14 轮:带回 LLM Usage 用于累加)
+        // I3(2026-09-14 第 51 轮):重试轮回灌上一轮 QC 拒绝理由,
+        // Plan 针对性修复而非盲重生成(此前 hard 档重试链路唯一无反馈环)。
         emit_progress(progress, "Plan 规划中…");
         let (plan_output, plan_usage) = self
             .plan
-            .generate(
+            .generate_with_retry_hint(
                 &c.goal_summary,
                 &c.purpose,
                 &c.intent,
                 &c.decomposition_plan,
                 session.id(),
+                retry_hint,
             )
             .await
             .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;
@@ -872,12 +881,20 @@ impl MultiAgentOrchestrator {
                 ));
             }
             if layer.len() > 1 {
-                eprintln!(
-                    "[laew] WorkFlow 并行调度:第 {}/{} 层 {} 个流程并发执行(上限 {})",
-                    layer_idx + 1,
-                    total_layers,
-                    layer.len(),
-                    self.cfg.max_parallel_workflows,
+                // F3(2026-09-14 第 51 轮):改走 progress 通道而非裸 eprintln!
+                // TUI 下 eprintln! 不感知 waiting 行原地重写纪律,会把本条通知
+                // 拼接到 spinner 行尾(实测 c05:「…可 Ctrl-C 取消[laew] WorkFlow
+                // 并行调度…」同行粘连);经 progress 通道由打印协程统一
+                // 先 \r\x1b[K 清行再输出,非 TTY 下仍落 stderr,行为不回退。
+                emit_progress(
+                    progress,
+                    format!(
+                        "[laew] WorkFlow 并行调度:第 {}/{} 层 {} 个流程并发执行(上限 {})",
+                        layer_idx + 1,
+                        total_layers,
+                        layer.len(),
+                        self.cfg.max_parallel_workflows,
+                    ),
                 );
             }
 

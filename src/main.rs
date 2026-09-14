@@ -454,7 +454,12 @@ async fn run_one_shot(
         } => {
             // 2026-09-11 第三十八轮 BUG-2:失败路径补 [yolo] 分类摘要(与 TUI/Executed
             // 路径对齐),失败任务的难度与目标不随 `..` 解构丢失。
-            eprintln!(
+            // F5(2026-09-14 第 51 轮):失败块改打 **stdout** —— 它是任务的最终结果
+            // 内容(与 DirectAnswer/Executed 同级),旧实现只落 stderr,导致
+            // `laew -p ... > out.log` 管道消费方完全看不到失败结论(本轮 fl02/fl07
+            // 实测 stdout 为空、仅 stderr 有 [agent failed]);诊断流(stderr)保留
+            // stage/心跳,e2e 的 run() 为 2>&1 合流,行为兼容。
+            println!(
                 "[agent failed] difficulty={} goal={}",
                 classification.task_level.display_name(),
                 classification
@@ -465,10 +470,10 @@ async fn run_one_shot(
             );
             // F4(2026-09-10 第 25 轮):先呈现真实失败原因,再给建议
             if reason.is_empty() {
-                eprintln!("[agent failed] {suggestion}");
+                println!("[agent failed] {suggestion}");
             } else {
-                eprintln!("[agent failed] 原因: {reason}");
-                eprintln!("[agent failed] 建议: {suggestion}");
+                println!("[agent failed] 原因: {reason}");
+                println!("[agent failed] 建议: {suggestion}");
             }
             print_usage(&usage);
         }

@@ -369,6 +369,13 @@ const PLAN_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Plan,hard 难度�
 - 每个 WorkFlow 必须有可执行的步骤 + 委派 Agent + 验收标准
 - 依赖关系用 wf-{n} 引用其它 WorkFlow
 - 不要写具体代码,只写方案与步骤
+- 方案即回复(I2,2026-09-14 第 51 轮):你的**最终回复文本本身就是 Plan 文档**,
+  会被系统原样落盘与解析。**禁止**把完整方案 Write 到别的文件后只回一份
+  「摘要 + 文件路径」——系统解析的是你的回复文本,摘要里没有 `### WorkFlow N:`
+  结构会导致「Plan 文档未解析出任何 WorkFlow」整任务失败(第 51 轮 fl10 实测)。
+- WorkFlow 段必须逐字使用 `### WorkFlow 1:{名称}` 三级标题格式 +
+  `- 步骤:` / `- 依赖:` / `- 验收标准:` bullet;不要改用粗体 bullet
+  (`- **wf-1 …**`)或其它变体,解析器只认模板格式。
 "#;
 
 /// Plan Agent 工具说明
@@ -441,6 +448,13 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
   不得改写为绝对路径、不得省略目录层级、不得挪到工作区根目录
   (2026-09-13 第 50 轮:批量测试实测 Main-Work 改写用户相对路径导致
   SubAgent 忠实执行错误路径,QC 无原始路径对照而误判通过)
+- 拆解对齐(I1,2026-09-14 第 51 轮):workflow 数量与用户明确列出的子任务数
+  对齐(允许 ±1),**禁止**自造「环境准备/目录创建」「结果汇总/汇报」等用户未
+  要求的额外 workflow —— 实测此类过度拆解被 Quality-Check 以验收不可机器验证
+  判 Fail,触发整任务回流重试直至最大次数失败(第 51 轮 fl02/fl07/et02/et07)。
+- 验收可执行(I1):每条 acceptance 必须给出可机器执行的判定命令或明确的
+  文件存在/关键字命中条件;禁止「echo $? == 0」这类恒真断言(echo 自身退出码
+  恒 0),退出码断言应写「执行 X 后退出码为 0」
 "#;
 
 fn main_work_tools_hint() -> &'static str {

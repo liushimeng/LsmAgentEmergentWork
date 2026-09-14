@@ -43,18 +43,42 @@ impl PlanRunner {
         decomposition: &[String],
         session_id: &str,
     ) -> Result<(PlanOutput, Usage)> {
+        self.generate_with_retry_hint(goal, purpose, intent, decomposition, session_id, "").await
+    }
+
+    /// I3(2026-09-14 第 51 轮):带上一轮失败反馈生成 Plan。
+    /// 此前 hard 档 Plan-QC 失败重试时 Plan 看不到 QC 的拒绝理由,盲重生成
+    /// 产出几乎相同的方案被再次拒绝,直至 max_retries 整任务失败
+    /// (第 51 轮 fl02/fl07/et02/et07/et08 实测簇)。
+    pub async fn generate_with_retry_hint(
+        &self,
+        goal: &str,
+        purpose: &str,
+        intent: &str,
+        decomposition: &[String],
+        session_id: &str,
+        retry_hint: &str,
+    ) -> Result<(PlanOutput, Usage)> {
         // 确保 plans/ 存在
         std::fs::create_dir_all(&self.plans_dir).map_err(|e| {
             AgentError::PlanGen(format!("无法创建 plans/ 目录: {}", e))
         })?;
 
+        let retry_block = if retry_hint.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n【上一轮 Quality-Check 拒绝理由,本次方案必须针对性修复】\n{}\n",
+                retry_hint.trim()
+            )
+        };
         let prompt = format!(
             "【Plan 任务】\n\
              Session: {session_id}\n\
              目的: {purpose}\n\
              目标: {goal}\n\
              意图: {intent}\n\
-             分解步骤:\n{decomp}\n\n\
+             分解步骤:\n{decomp}\n{retry_block}\n\
              请按系统提示词中的 Markdown 模板输出方案(完整五段)。",
             decomp = decomposition
                 .iter()
