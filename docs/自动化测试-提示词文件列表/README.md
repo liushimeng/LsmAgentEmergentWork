@@ -2,7 +2,7 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **231 维度 × 10 个 = 2310 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **241 维度 × 10 个 = 2410 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
@@ -27,7 +27,7 @@ OJ 在线判题平台、图算法与社交网络分析、弹性系统与混沌�
 **软件许可密钥与激活系统**、**蓝牙BLE与无线外设通信**、**家谱数据工程与GEDCOM解析**、
 **代码演化度量与热点驱动重构**、**电话号码地址人名国际化**、**网页存档与数字保全**、
 **崩溃报告聚合与错误追踪系统**、**订阅计费与用量计量引擎**、**平铺窗口管理与键盘流桌面**、
-**远程电源与开关机治理**、**WindowUse 多轮连续性与 Agent 间通信**、**WorkFlow 工作流编排与 Goal 状态机**等多个角度，**无重复主题**。
+**远程电源与开关机治理**、**WindowUse 多轮连续性与 Agent 间通信**、**WorkFlow 工作流编排与 Goal 状态机**、**工作流编排与 Goal 状态机进阶**、**WindowUse 桌面操控与多轮连续性**、**权限拦截与 Bash 安全**、**上下文压缩与溢出恢复**、**取消传播与优雅中断**、**工作区感知与运行时注入**、**离线队列与弹性重试**、**QualityCheck 质检与报告**、**AgentMessage 消息总线与跨角色通信**、**端到端超大工程编排**等多个角度，**无重复主题**。
 
 ## 用途
 
@@ -486,6 +486,16 @@ docs/自动化测试-提示词文件列表/
 | HP01–HP10 | 远程电源与开关机治理实战 | WoL魔包/链路核查/三平台定时/合盖休眠/抑制保活/优雅关机/带外通道/唤醒审计/升级窗口/断电演练 | simple~hard |
 | HQ01–HQ10 | WindowUse 多轮连续性与 Agent 间通信 | 跨轮状态注入/历史回溯/跨应用搬运/AgentMessage 桥/注入幂等/别名记忆/多窗口隔离/失败保留/pending_data 跨 WF/跨 Session | medium~hard |
 | HR01–HR10 | WorkFlow 工作流编排与 Goal 状态机 | Goal 六态/Phase DAG/Squad 三策略/AdaptiveLoop 四级/QualityGate 五级/TemplateLibrary/BatchChannel/WorkFlow↔WindowUse 桥/端到端模板串联/熔断回流 | medium~hard |
+| HS01–HS10 | 工作流编排与 Goal 状态机进阶实战 | Goal 六态迁移/Phase DAG 拓扑/Squad 多角色(AllMustPass/Quorum/LeaderDecides)/AdaptiveLoop 六策略/QualityGate 四级/TemplateLibrary 模板/BatchChannel 批量/WorkFlow↔SubAgent/WorkFlow↔WindowUse/端到端超大任务 | medium~hard |
+| HT01–HT10 | WindowUse 桌面操控与多轮连续性实战 | WindowList 枚举/WindowInspect 控件树/WindowAction 操作/WindowState 持久化/操作历史回溯/别名记忆/pending_data 跨应用/AgentMessage 消息桥/多窗口并发隔离/失败恢复 | simple~hard |
+| HU01–HU10 | 权限拦截与 Bash 安全实战 | 危险命令检测(rm -rf/fork bomb/curl|bash)/敏感路径检测(SSH/AWS/.env)/fail-closed 默认拦截/错误反馈重试/进程组管理(setsig)/超时与资源限制/审计日志/白名单与环境变量 | simple~hard |
+| HV01–HV10 | 上下文压缩与溢出恢复实战 | token 估算/三档压缩率(Light/Medium/Aggressive)/触发阈值 80%/保护段识别/LLM 失败降级硬截断/溢出检测 15+ provider/Level 1 排水/Level 2 折叠/Level 3 暴露/恢复预算 4 次 | simple~hard |
+| HW01–HW10 | 取消传播与优雅中断实战 | CancellationToken 树形传播/child_token/orphan tool_use 补全/CANCELLED_TOOL_RESULT/协议一致性硬约束/SubAgent/WindowUse/WorkFlow 全链路穿透/优雅关闭/跨 Session 隔离 | simple~hard |
+| HX01–HX10 | 工作区感知与运行时注入实战 | git 分支/变更计数/工程类型与工具链/顶层结构/6h 最近改动/TTL 缓存/8 角色 system brief/会话级工作区段/TUI 变更对比/懒刷新/静默降级 | simple~hard |
+| HY01–HY10 | 离线队列与弹性重试实战 | 有界队列(50 条)/环境变量覆盖/LLM 不可达入队/恢复后自动 flush/三态连接检测/指数退避/熔断器三态/半开探测/队列满降级/完整生命周期 | simple~hard |
+| HZ01–HZ10 | QualityCheck 质检与报告实战 | Verdict Pass/Fail/QualityReport 结构/静态规则/LLM 评估/fail-closed/失败回流与重试/报告落盘/metrics 统计/与 QualityGate 协同/与 SessionContext 协同 | simple~hard |
+| IA01–IA10 | AgentMessage 消息总线与跨角色通信实战 | AgentMessage 五元组/MessagePayload 四变体(WindowTextRead/TextToWindow/WindowFocus/Data)/消费标记幂等/SQLite 持久化/WindowUse↔SubAgentWork 桥/MainWork→WindowUse 聚焦/Data 通用传递/跨 WorkFlow/消息过期清理 | simple~hard |
+| IB01–IB10 | 端到端超大工程编排实战 | Yolo 分类→Plan 方案→WorkFlow 拆解→Main-Work 编排→SubAgent 并行→WindowUse 操控→QC 质检→Compact 压缩→SessionContext 摘要→Debug 评估/全链路 metrics/失败回流/AgentMessage 协作/工作区感知/离线兜底/取消中断/溢出恢复 | medium~hard |
 
 ## 每条提示词的字段
 
