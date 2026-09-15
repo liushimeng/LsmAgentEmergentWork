@@ -11,6 +11,14 @@
 use std::process::Command;
 
 fn main() {
+    // macOS: 链接系统框架(AXUIElementRef / CGWindowList 等符号)
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-lib=framework=ApplicationServices");
+        println!("cargo:rustc-link-lib=framework=Accessibility");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    }
     // 编译时间(本地时区), 失败时退化为 Unix 时间戳
     let build_time = Command::new("date")
         .arg("+%Y-%m-%d %H:%M:%S %Z")

@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::sync::OnceLock;
 
 use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 use core_foundation::base::{CFIndex, CFRelease, CFTypeRef, TCFType};
@@ -79,17 +80,6 @@ extern "C" {
     ) -> AXError;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
     fn AXValueGetValue(value: CFTypeRef, the_type: AXValueType, value_ptr: *mut std::ffi::c_void) -> Boolean;
-
-    static kAXChildrenAttribute: CFStringRef;
-    static kAXRoleAttribute: CFStringRef;
-    static kAXTitleAttribute: CFStringRef;
-    static kAXValueAttribute: CFStringRef;
-    static kAXPositionAttribute: CFStringRef;
-    static kAXSizeAttribute: CFStringRef;
-    static kAXWindowsAttribute: CFStringRef;
-    static kAXFocusedAttribute: CFStringRef;
-    static kAXPressAction: CFStringRef;
-    static kAXTrustedCheckOptionPrompt: CFStringRef;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -98,6 +88,126 @@ extern "C" {
 }
 
 const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+
+// ===================== AX 字符串常量懒加载(macOS 26 兼容) =====================
+//
+// 2026-09-15 实测:macOS 26.5(Darwin 25.5,Tahoe)已将 `kAX*Attribute` / `kAX*Action`
+// 字符串常量从 `ApplicationServices.framework` 的 C ABI 中移除(dlsym 返回 NULL),
+// 整个 `HIServices.framework` 二进制亦不复存在。`AX*` 函数(`AXIsProcessTrustedWithOptions`
+// / `AXUIElementCreateApplication` 等)仍可解析,但已不保证向后兼容。
+// 处理:把所有 `kAX*` 常量改走 `libc::dlsym` 运行时查找,启动期一次性懒加载;
+// 缺失时 `MacOsDriver` 整体 fail-closed,Windows UIA 主路径不受影响。
+// 字段用 `usize` 存指针数值,确保 `AxStrings: Send + Sync` 才能装进 `OnceLock` 当 static;
+// helper 在访问时 cast 回 `CFStringRef`。
+
+struct AxStrings {
+    children: usize,
+    role: usize,
+    title: usize,
+    value: usize,
+    position: usize,
+    size: usize,
+    windows: usize,
+    focused: usize,
+    press_action: usize,
+    trusted_check_prompt: usize,
+}
+
+const EMPTY_AX_STRINGS: AxStrings = AxStrings {
+    children: 0,
+    role: 0,
+    title: 0,
+    value: 0,
+    position: 0,
+    size: 0,
+    windows: 0,
+    focused: 0,
+    press_action: 0,
+    trusted_check_prompt: 0,
+};
+
+static AX_STRINGS: OnceLock<AxStrings> = OnceLock::new();
+static AS_HANDLE: OnceLock<usize> = OnceLock::new();
+
+fn ax_handle() -> usize {
+    *AS_HANDLE.get_or_init(|| unsafe {
+        let s = std::ffi::CString::new(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
+        )
+        .unwrap();
+        libc::dlopen(s.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) as usize
+    })
+}
+
+unsafe fn dlsym_cfstring(name: &str) -> CFStringRef {
+    let h = ax_handle();
+    if h == 0 {
+        return std::ptr::null();
+    }
+    let c = match std::ffi::CString::new(name) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null(),
+    };
+    libc::dlsym(h as *mut _, c.as_ptr()) as CFStringRef
+}
+
+fn ax_strings() -> &'static AxStrings {
+    AX_STRINGS.get_or_init(|| unsafe {
+        if ax_handle() == 0 {
+            return EMPTY_AX_STRINGS;
+        }
+        let s = AxStrings {
+            children: dlsym_cfstring("kAXChildrenAttribute") as usize,
+            role: dlsym_cfstring("kAXRoleAttribute") as usize,
+            title: dlsym_cfstring("kAXTitleAttribute") as usize,
+            value: dlsym_cfstring("kAXValueAttribute") as usize,
+            position: dlsym_cfstring("kAXPositionAttribute") as usize,
+            size: dlsym_cfstring("kAXSizeAttribute") as usize,
+            windows: dlsym_cfstring("kAXWindowsAttribute") as usize,
+            focused: dlsym_cfstring("kAXFocusedAttribute") as usize,
+            press_action: dlsym_cfstring("kAXPressAction") as usize,
+            trusted_check_prompt: dlsym_cfstring("kAXTrustedCheckOptionPrompt") as usize,
+        };
+        // 任一关键字段缺失则整表作废:macOS 26 上 AX 调用会全部返回
+        // K_AX_ERROR_ATTRIBUTE_UNSUPPORTED,毫无意义,直接 fail-closed 更友好。
+        if s.children == 0
+            || s.role == 0
+            || s.title == 0
+            || s.value == 0
+            || s.position == 0
+            || s.size == 0
+            || s.windows == 0
+            || s.focused == 0
+            || s.press_action == 0
+        {
+            return EMPTY_AX_STRINGS;
+        }
+        s
+    })
+}
+
+fn ax_strings_loaded() -> bool {
+    !std::ptr::eq(ax_strings(), &EMPTY_AX_STRINGS)
+}
+
+// 让外部调用点保持 `kAX<X>Attribute` / `kAXPressAction` 的可读命名,提供等价 inline getter。
+// 语义上等价于原来的 `extern "C" static`,但实际数据走 `ax_strings()`。
+#[inline] fn kAXChildrenAttribute()      -> CFStringRef { ax_strings().children as CFStringRef }
+#[inline] fn kAXRoleAttribute()           -> CFStringRef { ax_strings().role as CFStringRef }
+#[inline] fn kAXTitleAttribute()          -> CFStringRef { ax_strings().title as CFStringRef }
+#[inline] fn kAXValueAttribute()          -> CFStringRef { ax_strings().value as CFStringRef }
+#[inline] fn kAXPositionAttribute()       -> CFStringRef { ax_strings().position as CFStringRef }
+#[inline] fn kAXSizeAttribute()           -> CFStringRef { ax_strings().size as CFStringRef }
+#[inline] fn kAXWindowsAttribute()        -> CFStringRef { ax_strings().windows as CFStringRef }
+#[inline] fn kAXFocusedAttribute()        -> CFStringRef { ax_strings().focused as CFStringRef }
+#[inline] fn kAXPressAction()             -> CFStringRef { ax_strings().press_action as CFStringRef }
+#[inline] fn kAXTrustedCheckOptionPrompt() -> CFStringRef { ax_strings().trusted_check_prompt as CFStringRef }
+
+/// macOS 26+ AX 不可用时的统一错误文案(供 require_trusted / permission_hint 共用)。
+const MACOS_AX_UNAVAILABLE_HINT: &str =
+    "macOS 26+ 已将 AX 无障碍 C API(kAX*Attribute / kAX*Action)从 \
+     ApplicationServices.framework 中移除,本构建暂不支持窗口无障碍操作。\
+     请使用 Windows/Linux 平台,或在 macOS 13/14 上重新编译。";
 
 // ===================== CF 辅助 =====================
 
@@ -207,7 +317,7 @@ impl MacOsDriver {
         unsafe {
             if prompt {
                 // {kAXTrustedCheckOptionPrompt: true}
-                let key = kAXTrustedCheckOptionPrompt;
+                let key = kAXTrustedCheckOptionPrompt();
                 let val: CFBooleanRef =
                     core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
                 let keys = [key as CFTypeRef];
@@ -232,6 +342,11 @@ impl MacOsDriver {
     }
 
     fn require_trusted(&self) -> Result<()> {
+        // macOS 26+ AX 字符串常量已从 ApplicationServices.framework 移除,
+        // 即便有权限也调不通 — 直接 fail-closed,避免后续每个调用都返回无意义错误。
+        if !ax_strings_loaded() {
+            return Err(platform_err("macos", MACOS_AX_UNAVAILABLE_HINT));
+        }
         if Self::trusted() {
             Ok(())
         } else {
@@ -262,7 +377,7 @@ impl MacOsDriver {
         if app.is_null() {
             return Err(platform_err("macos", format!("无法为 pid={pid} 创建 AX 应用元素")));
         }
-        let wins = ax_get(app, kAXWindowsAttribute);
+        let wins = ax_get(app, kAXWindowsAttribute());
         CFRelease(app);
         if wins.is_null() {
             return Err(platform_err(
@@ -293,7 +408,7 @@ impl MacOsDriver {
     /// 读取元素的几何信息(AXPosition + AXSize)。
     unsafe fn element_rect(el: AXUIElementRef) -> Rect {
         let mut rect = Rect::default();
-        let pos = ax_get(el, kAXPositionAttribute);
+        let pos = ax_get(el, kAXPositionAttribute());
         if !pos.is_null() {
             let mut p = CGPoint::default();
             if AXValueGetValue(pos, K_AX_VALUE_CGPOINT_TYPE, (&mut p as *mut CGPoint).cast()) != 0 {
@@ -302,7 +417,7 @@ impl MacOsDriver {
             }
             CFRelease(pos);
         }
-        let size = ax_get(el, kAXSizeAttribute);
+        let size = ax_get(el, kAXSizeAttribute());
         if !size.is_null() {
             let mut s = CGSize::default();
             if AXValueGetValue(size, K_AX_VALUE_CGSIZE_TYPE, (&mut s as *mut CGSize).cast()) != 0 {
@@ -340,16 +455,16 @@ impl MacOsDriver {
         max_depth: usize,
         filter: Option<&str>,
     ) -> Option<ControlNode> {
-        let role = ax_get_string(el, kAXRoleAttribute);
+        let role = ax_get_string(el, kAXRoleAttribute());
         let name = {
-            let t = ax_get_string(el, kAXTitleAttribute);
+            let t = ax_get_string(el, kAXTitleAttribute());
             if t.is_empty() {
-                ax_get_string(el, kAXValueAttribute)
+                ax_get_string(el, kAXValueAttribute())
             } else {
                 t
             }
         };
-        let value = ax_get_string(el, kAXValueAttribute);
+        let value = ax_get_string(el, kAXValueAttribute());
         let bounds = Self::element_rect(el);
 
         let mut node = ControlNode {
@@ -364,7 +479,7 @@ impl MacOsDriver {
         node.actions = Self::actions_for_role(&node.role);
 
         if depth < max_depth {
-            let children = ax_get(el, kAXChildrenAttribute);
+            let children = ax_get(el, kAXChildrenAttribute());
             if !children.is_null() {
                 let count = CFArrayGetCount(children as CFArrayRef);
                 for i in 0..count {
@@ -408,7 +523,7 @@ impl MacOsDriver {
             let idx: usize = seg.parse().map_err(|_| {
                 platform_err("macos", format!("控件路径段非法: {seg}(应为子控件下标)"))
             })?;
-            let children = ax_get(cur, kAXChildrenAttribute);
+            let children = ax_get(cur, kAXChildrenAttribute());
             CFRelease(cur);
             if children.is_null() {
                 return Err(platform_err(
@@ -525,7 +640,7 @@ impl WindowDriver for MacOsDriver {
             CFRelease(win);
             let result = match &action {
                 ControlAction::Click | ControlAction::Invoke => {
-                    let err = AXUIElementPerformAction(el, kAXPressAction);
+                    let err = AXUIElementPerformAction(el, kAXPressAction());
                     if err == K_AX_ERROR_SUCCESS {
                         Ok(format!("已对 {window_id}{path} 执行点击(AXPress)"))
                     } else {
@@ -535,7 +650,7 @@ impl WindowDriver for MacOsDriver {
                 ControlAction::Focus => {
                     let true_v: CFBooleanRef =
                         core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
-                    let err = AXUIElementSetAttributeValue(el, kAXFocusedAttribute, true_v.cast());
+                    let err = AXUIElementSetAttributeValue(el, kAXFocusedAttribute(), true_v.cast());
                     if err == K_AX_ERROR_SUCCESS {
                         Ok(format!("已聚焦 {window_id}{path}"))
                     } else {
@@ -544,7 +659,7 @@ impl WindowDriver for MacOsDriver {
                 }
                 ControlAction::SetText(text) => {
                     let cf = cfstring_new(text);
-                    let err = AXUIElementSetAttributeValue(el, kAXValueAttribute, cf.cast());
+                    let err = AXUIElementSetAttributeValue(el, kAXValueAttribute(), cf.cast());
                     CFRelease(cf.cast());
                     if err == K_AX_ERROR_SUCCESS {
                         Ok(format!("已向 {window_id}{path} 写入文本({} 字符)", text.chars().count()))
@@ -553,8 +668,8 @@ impl WindowDriver for MacOsDriver {
                     }
                 }
                 ControlAction::GetText => {
-                    let v = ax_get_string(el, kAXValueAttribute);
-                    let t = ax_get_string(el, kAXTitleAttribute);
+                    let v = ax_get_string(el, kAXValueAttribute());
+                    let t = ax_get_string(el, kAXTitleAttribute());
                     Ok(if v.is_empty() { t } else { v })
                 }
                 ControlAction::SendKeys(_) => Err(platform_err(
@@ -568,6 +683,9 @@ impl WindowDriver for MacOsDriver {
     }
 
     fn permission_hint(&self) -> Option<String> {
+        if !ax_strings_loaded() {
+            return Some(MACOS_AX_UNAVAILABLE_HINT.to_string());
+        }
         if Self::trusted() {
             None
         } else {
