@@ -439,7 +439,7 @@ def _strip_unsupported_tool_args(tool_name, args):
     return {k: v for k, v in args.items() if k in allowed}
 
 
-def _route_subagent_tool(call_no, prompt_text, default_call):
+def _route_subagent_tool(call_no, prompt_text, default_call, session_id=""):
     """按 prompt 关键词 + 实例内相对序号返回 (tool_name, args_json_str)。
 
     优先级:PROMPT_ROUTER 命中 > 现有 MODES(default_call 来自 first_tool_call)。
@@ -448,22 +448,49 @@ def _route_subagent_tool(call_no, prompt_text, default_call):
     表 call_no:1 规则永不命中。改为按工具在规则内的索引顺序返回
     (首调用返回 tools[0],第 2 次返回 tools[1],以此类推),
     与全局 call_no 解耦,适配每轮独立 laew -p 调用场景。
+
+    2026-09-15 会话级规则锁定:tool_result 回填内容(如 Read 到的脚本全文)
+    可能含其它规则的关键词(如 trigger.py 里的 "QualityReport" 命中 hz01),
+    逐次独立匹配会发生跨规则漂移 —— 前几步恰好同形掩盖,后续步骤错拿
+    别的规则工具(实测 hz02 第 4 步拿到 hz01 的 Write static.py)。
+    修复:按 X-Session-Id 首次命中锁定规则,后续调用直接从锁定规则取工具;
+    若 prompt 不再含锁定规则任一关键词(任务已切换)则解锁重匹配。
+    同 session 重试轮(QC fail 回流)实例计数归零但锁保留 → 工具链可重放。
     """
     if PROMPT_ROUTER:
         rules = PROMPT_ROUTER.get("rules", []) or []
-        for rule in rules:
-            keywords = rule.get("keywords", []) or []
-            if any(kw in prompt_text for kw in keywords):
-                tools = rule.get("tools", []) or []
-                # 实例内相对序号:首调用=0,第 2 次=1,以此类推
-                idx = max(0, call_no - 1)
-                if idx < len(tools):
-                    t = tools[idx]
-                    tool_name = t["tool"]
-                    args = _strip_unsupported_tool_args(tool_name, t.get("args", {}))
-                    return tool_name, json.dumps(args, ensure_ascii=False)
-                # 工具已耗尽:锁定在该规则内,不再扫后续规则
-                break
+        lock_key = f"router-lock:{session_id}" if session_id else ""
+        locked_idx = STATE.get(lock_key) if lock_key else None
+        if locked_idx is not None and not isinstance(locked_idx, int):
+            locked_idx = None
+        # 锁定校验:prompt 不再含锁定规则关键词 → 任务切换,解锁
+        if locked_idx is not None and 0 <= locked_idx < len(rules):
+            kws = rules[locked_idx].get("keywords", []) or []
+            if kws and not any(kw in prompt_text for kw in kws):
+                STATE.pop(lock_key, None)
+                locked_idx = None
+            elif not kws:
+                STATE.pop(lock_key, None)
+                locked_idx = None
+        if locked_idx is None:
+            for ri, rule in enumerate(rules):
+                keywords = rule.get("keywords", []) or []
+                if any(kw in prompt_text for kw in keywords):
+                    locked_idx = ri
+                    if lock_key:
+                        STATE[lock_key] = ri
+                    break
+        if locked_idx is not None:
+            rule = rules[locked_idx]
+            tools = rule.get("tools", []) or []
+            # 实例内相对序号:首调用=0,第 2 次=1,以此类推
+            idx = max(0, call_no - 1)
+            if idx < len(tools):
+                t = tools[idx]
+                tool_name = t["tool"]
+                args = _strip_unsupported_tool_args(tool_name, t.get("args", {}))
+                return tool_name, json.dumps(args, ensure_ascii=False)
+            # 工具已耗尽:保持锁定在该规则内,不再扫后续规则
     # 兜底:返回 default_call(Bash echo / 现有 MODES 派生)
     return default_call
 
@@ -951,28 +978,30 @@ find "$dir" -maxdepth 1 -type f -print0 |
     return "Bash", '{"command": "echo ' + default_cmd + '"}'
 
 
-def first_tool_call(call_no, prompt_text, default_cmd):
+def first_tool_call(call_no, prompt_text, default_cmd, session_id=""):
     """决定 subagent 第 call_no 次工具调用。
 
     2026-09-11 第三十三轮:支持 call_no > 1(多轮 SubAgent 工具序列),
     通过 _route_subagent_tool(call_no, prompt_text, default_call) 按
     PROMPT_ROUTER 命中返回对应工具,否则回退到 first_tool_call_inner。
+    2026-09-15:透传 session_id(会话级规则锁定,防 tool_result 关键词污染)。
     """
     default_call = first_tool_call_inner(default_cmd)
-    return _route_subagent_tool(call_no, prompt_text, default_call)
+    return _route_subagent_tool(call_no, prompt_text, default_call, session_id)
 
 
-def build_anthropic_stream(call_no, prompt_text="", tool_snippet=""):
+def build_anthropic_stream(call_no, prompt_text="", tool_snippet="", session_id=""):
     """构造 Anthropic 一次完整流的 SSE 字节。
 
     2026-09-11 第三十三轮:新增 prompt_text 参数,让 mock 在生成工具调用时
     能感知 prompt 内容(PROMPT_ROUTER 关键词命中)。call_no > 1 的轮次
     同样走 prompt 路由(用于 Read → Write → Bash 多轮序列)。
     2026-09-11 第三十四轮 BUG-M4:新增 tool_snippet 参数,终答追加工具输出摘录。
+    2026-09-15:透传 session_id(会话级规则锁定)。
     """
     if call_no == 1:
         # 第 1 次:返回工具调用(按 MODES 分流 + PROMPT_ROUTER)
-        tool_name, tool_args = first_tool_call(call_no, prompt_text, "LAEW_ANTHROPIC_OK")
+        tool_name, tool_args = first_tool_call(call_no, prompt_text, "LAEW_ANTHROPIC_OK", session_id)
         events = [
             {
                 "type": "message_start",
@@ -1024,7 +1053,7 @@ def build_anthropic_stream(call_no, prompt_text="", tool_snippet=""):
     # 若 PROMPT_ROUTER 命中第 N 个工具,返回 tool_use;
     # 否则回退纯文本 end_turn,保持原行为。
     routed = _route_subagent_tool(
-        call_no, prompt_text, None
+        call_no, prompt_text, None, session_id
     )
     if routed is not None:
         tool_name, tool_args = routed
@@ -1115,7 +1144,7 @@ def build_anthropic_stream(call_no, prompt_text="", tool_snippet=""):
     return make_anthropic_sse(events)
 
 
-def build_openai_stream(call_no, prompt_text="", tool_snippet=""):
+def build_openai_stream(call_no, prompt_text="", tool_snippet="", session_id=""):
     """构造 OpenAI 一次完整流的 SSE 字节。
 
     2026-09-11 第三十三轮:接收 prompt_text 用于 PROMPT_ROUTER 命中;
@@ -1123,7 +1152,7 @@ def build_openai_stream(call_no, prompt_text="", tool_snippet=""):
     """
     if call_no == 1:
         # 第 1 次:返回工具调用(按 MODES 分流,含 Write 沙箱两模式)
-        tool_name, tool_args = first_tool_call(call_no, prompt_text, "LAEW_MOCK_OK")
+        tool_name, tool_args = first_tool_call(call_no, prompt_text, "LAEW_MOCK_OK", session_id)
         chunks = [
             {
                 "id": "chatcmpl-mock-1",
@@ -1187,7 +1216,7 @@ def build_openai_stream(call_no, prompt_text="", tool_snippet=""):
         # 多步工具链(Write→Write→…)在 OpenAI 协议 mock 下第二步起直接回终答,
         # 导致 D06Q1 第二个 Write 永不执行、后续轮次连锁失败);
         # 否则回退纯文本 end_turn,保持原行为。
-        routed = _route_subagent_tool(call_no, prompt_text, None)
+        routed = _route_subagent_tool(call_no, prompt_text, None, session_id)
         if routed is not None:
             tool_name, tool_args = routed
             chunks = [
@@ -1441,10 +1470,12 @@ class Handler(BaseHTTPRequestHandler):
                 # BUG-M4:终答附带最后工具输出摘录。
                 _sub_prompt = _extract_user_corpus(body)
                 _tool_snippet = _extract_last_tool_result(body)
+                # 2026-09-15:透传 X-Session-Id 做 SubAgent 路由的会话级规则锁定
+                _sid = headers.get("x-session-id", "")
                 body_bytes = (
-                    build_openai_stream(call_no_for_stream, _sub_prompt, _tool_snippet)
+                    build_openai_stream(call_no_for_stream, _sub_prompt, _tool_snippet, _sid)
                     if key == "oai"
-                    else build_anthropic_stream(call_no_for_stream, _sub_prompt, _tool_snippet)
+                    else build_anthropic_stream(call_no_for_stream, _sub_prompt, _tool_snippet, _sid)
                 )
         else:
             self.send_response(404)
