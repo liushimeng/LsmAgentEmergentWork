@@ -14,7 +14,7 @@
 
 ## MS01 Chrome 浏览器窗口读取与标签页枚举
 
-- **测试状态**: ⏳ 待测试
+- **测试状态**: ✅ 已测试(2026-09-15 第 53 轮 macOS 26.5 实测 WindowList 链路,Yolo→Main-Work→WindowUse→WindowList 真实返回 Chrome/Code/微信等窗口列表)
 - **预期档位**: medium
 - **考察维度**: WindowList 枚举 Chrome 窗口 / WindowInspect 读取标签页列表 / 地址栏 URL 获取
 - **工具链**: WindowList → WindowInspect → WindowAction(get_text)
