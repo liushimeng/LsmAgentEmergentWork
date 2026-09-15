@@ -131,7 +131,15 @@ impl Tool for WindowListTool {
 
     async fn execute(&self, args: Value) -> Result<String> {
         let filter = get_str(&args, "filter").map(str::to_string);
-        driver_preflight(self.name())?;
+        // 2026-09-15 第 53 轮 P2 修复:WindowList 不调用 driver_preflight。
+        // 原设计是「缺权限/缺依赖时前置报错」,但实际上:
+        //   - Windows:WindowList 无需任何授权(UIA 仅 inspect/act 需权限);
+        //   - macOS:WindowList 走 CoreGraphics(CGWindowListCopyWindowInfo),
+        //     不需要 AX 无障碍权限(macOS 26+ AX C API 移除后仍可枚举);
+        //   - Fallback (Linux):缺 wmctrl 时由 list_windows 自身返回结构化错误。
+        // 旧 preflight 在 macOS 26+ 上误把 WindowList 也 fail-closed,
+        // 但 WindowList 完全可用 —— 改由 list_windows 内部自行处理平台差异。
+        // WindowInspect / WindowAction 仍保留 driver_preflight(真需要权限)。
         run_blocking(self.name(), move || {
             let driver = current_driver();
             let mut wins = driver.list_windows(filter.as_deref())?;

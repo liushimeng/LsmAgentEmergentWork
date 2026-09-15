@@ -1479,6 +1479,9 @@ class Handler(BaseHTTPRequestHandler):
                 # 实例内 call 计数与 subagent 同语义:无 assistant 消息=新实例,
                 # 计数归零;独立 STATE key 避免与 subagent 串味(同 session 内
                 # SubAgent 与 WindowUse Runner 会并存)。
+                # 2026-09-15 第 53 轮 P3:openai 协议下走 openai_tool_use_sse,
+                # 否则 laew/openai.rs::parse 期望 tool_calls.delta 而非
+                # Anthropic tool_use,会触发 JSON parse 失败 fall-back。
                 _wu_inst_key = f"{key}:windowuse:inst"
                 _wu_has_asst = any(
                     m.get("role") == "assistant" for m in (body.get("messages") or [])
@@ -1488,12 +1491,21 @@ class Handler(BaseHTTPRequestHandler):
                 STATE[_wu_inst_key] = STATE.get(_wu_inst_key, 0) + 1
                 _wu_call_no = STATE[_wu_inst_key]
                 if _wu_call_no == 1:
-                    body_bytes = anthropic_tool_use_sse("WindowList", {})
+                    body_bytes = (
+                        openai_tool_use_sse("WindowList", {})
+                        if key == "oai"
+                        else anthropic_tool_use_sse("WindowList", {})
+                    )
                 else:
-                    # 后续轮次:复用 build_anthropic_stream 标准流,laew 端真正
-                    # 执行工具后 tool_result 回填,自然进入下一轮调用。
+                    # 后续轮次:复用 build_openai/build_anthropic_stream 标准流,
+                    # laew 端真正执行工具后 tool_result 回填,自然进入下一轮调用。
                     _wu_prompt = _extract_user_corpus(body)
-                    body_bytes = build_anthropic_stream(_wu_call_no, _wu_prompt)
+                    _wu_snippet = _extract_last_tool_result(body)
+                    body_bytes = (
+                        build_openai_stream(_wu_call_no, _wu_prompt, _wu_snippet, session_id)
+                        if key == "oai"
+                        else build_anthropic_stream(_wu_call_no, _wu_prompt, _wu_snippet, session_id)
+                    )
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
                 # 2026-09-11 第三十四轮 BUG-M1/M2:改用全量 user 语料(任务
                 # prompt + tool_result 内容)做路由匹配,call_no 用实例内计数,
