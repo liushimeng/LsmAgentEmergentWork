@@ -2,7 +2,7 @@
 
 ## 是什么
 
-面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **242 维度 × 10 个 = 2420 个多轮对话提示词**。
+面向 laew（LsmAgentEmergentWork）的**自动化测试提示词集合**，共 **252 维度 × 10 个 = 2520 个多轮对话提示词**。
 每个提示词设计为 3~5 轮追问，覆盖任务处理、知识问答、工作日常、电脑使用、软件使用、
 编码 Coding、界面设计、文件整理处理、LLM 安全攻防、异步编程、软件供应链、技术写作、DDD、
 手写 Unix 命令、经典游戏复刻、从零造轮子、小众语言、编辑器插件、业务系统、桌面小工具、
@@ -27,7 +27,11 @@ OJ 在线判题平台、图算法与社交网络分析、弹性系统与混沌�
 **软件许可密钥与激活系统**、**蓝牙BLE与无线外设通信**、**家谱数据工程与GEDCOM解析**、
 **代码演化度量与热点驱动重构**、**电话号码地址人名国际化**、**网页存档与数字保全**、
 **崩溃报告聚合与错误追踪系统**、**订阅计费与用量计量引擎**、**平铺窗口管理与键盘流桌面**、
-**远程电源与开关机治理**、**WindowUse 多轮连续性与 Agent 间通信**、**WorkFlow 工作流编排与 Goal 状态机**、**工作流编排与 Goal 状态机进阶**、**WindowUse 桌面操控与多轮连续性**、**权限拦截与 Bash 安全**、**上下文压缩与溢出恢复**、**取消传播与优雅中断**、**工作区感知与运行时注入**、**离线队列与弹性重试**、**QualityCheck 质检与报告**、**AgentMessage 消息总线与跨角色通信**、**端到端超大工程编排**等多个角度，**无重复主题**。
+**远程电源与开关机治理**、**WindowUse 多轮连续性与 Agent 间通信**、**WorkFlow 工作流编排与 Goal 状态机**、**工作流编排与 Goal 状态机进阶**、**WindowUse 桌面操控与多轮连续性**、**权限拦截与 Bash 安全**、**上下文压缩与溢出恢复**、**取消传播与优雅中断**、**工作区感知与运行时注入**、**离线队列与弹性重试**、**QualityCheck 质检与报告**、**AgentMessage 消息总线与跨角色通信**、**端到端超大工程编排**、**LLM 弹性层与流式解析实战**、
+**终端 TUI 应用开发工程实战**、**Web API 服务端开发工程实战**、**数据库应用与数据迁移工程实战**、
+**DevOps 工具链与部署工程实战**、**系统监控与可观测性工程实战**、**爬虫与数据采集工程实战**、
+**RAG 知识库与检索增强工程实战**、**低代码平台与可视化搭建工程实战**、
+**多模态内容处理与工程实战**、**RPA 自动化与工作流编排工程实战**等多个角度，**无重复主题**。
 
 ## 用途
 
@@ -497,6 +501,16 @@ docs/自动化测试-提示词文件列表/
 | IA01–IA10 | AgentMessage 消息总线与跨角色通信实战 | AgentMessage 五元组/MessagePayload 四变体(WindowTextRead/TextToWindow/WindowFocus/Data)/消费标记幂等/SQLite 持久化/WindowUse↔SubAgentWork 桥/MainWork→WindowUse 聚焦/Data 通用传递/跨 WorkFlow/消息过期清理 | simple~hard |
 | IB01–IB10 | 端到端超大工程编排实战 | Yolo 分类→Plan 方案→WorkFlow 拆解→Main-Work 编排→SubAgent 并行→WindowUse 操控→QC 质检→Compact 压缩→SessionContext 摘要→Debug 评估/全链路 metrics/失败回流/AgentMessage 协作/工作区感知/离线兜底/取消中断/溢出恢复 | medium~hard |
 | IC01–IC10 | LLM 弹性层与流式解析实战 | SSE 字节流解析/Anthropic 6 类事件/OpenAI delta 嵌套/JSON 修复链 stage1-4(裸文本/注释/围栏/末段截断)/tool_use.input nil 归一化/连续失败短路 + Yolo 降级 metrics/mock_llm_server 三模式故障注入/智能续轮 MAX_TOKENS + 流中断 + tool_use 链断裂/三方联动修复+续轮+QC | simple~hard |
+| ID01–ID10 | 终端 TUI 应用开发工程实战 | curses(Python)/bubbletea(Go)/ratatui(Rust)三栈选型/MVU 架构/键盘事件分发/ANSI 转义重绘/对话框模态/主题配色/滚动列表虚拟化/表单验证/mock PTY 集成测试/多文件项目结构 | simple~hard |
+| IE01–IE10 | Web API 服务端开发工程实战 | FastAPI/Express/Axum/Gin 四栈选型/JWT 双 token/Pydantic 校验/CRUD 分页排序过滤/统一错误处理/SQLAlchemy 迁移/Swagger 自动生成/集成测试(TestClient/httpx)/Docker + docker-compose 部署 | simple~hard |
+| IF01–IF10 | 数据库应用与数据迁移工程实战 | SQLite/PostgreSQL/MySQL 三引擎/Schema 设计(3NF+反范式)/Alembic 迁移/种子数据工厂/EXPLAIN 查询优化/事务隔离级别/乐观锁/Snowflake 全局 ID/分片路由/慢查询分析 | simple~hard |
+| IG01–IG10 | DevOps 工具链与部署工程实战 | Dockerfile 多阶段/docker-compose 编排/GitHub Actions matrix + cache/蓝绿部署/滚动更新/回滚策略/配置中心(Vault)/制品管理(SBOM)/发布检查清单/ChatOps 通知 | simple~hard |
+| IH01–IH10 | 系统监控与可观测性工程实战 | Prometheus metrics + PromQL 告警/Grafana dashboard JSON/Loki LogQL/Tempo 链路追踪/Alertmanager 路由树/SLO 错误预算/黑盒探针(HTTP/TCP/DNS/ICMP)/On-Call 轮值/故障复盘(COE)模板 | simple~hard |
+| II01–II10 | 爬虫与数据采集工程实战 | aiohttp 异步并发/BeautifulSoup CSS 选择器/Playwright 无头浏览器/反反爬(UA 轮换+代理池+验证码)/令牌桶速率限制/Bloom Filter 去重/增量抓取(ETag/Last-Modified)/数据清洗管道/多存储后端/调度器(定时+失败重试) | simple~hard |
+| IJ01–IJ10 | RAG 知识库与检索增强工程实战 | PDF/DOCX/HTML/Markdown 解析/分块策略(固定/递归/语义)/Embedding(OpenAI/bge/e5)/向量库(FAISS/Chroma/Qdrant)/混合检索(BM25+vector+rerank)/提示组装(context 压缩+引用标注)/评估(Recall@k/MRR/Faithfulness)/增量更新 | simple~hard |
+| IK01–IK10 | 低代码平台与可视化搭建工程实战 | 表单设计器(拖拽+属性面板)/页面搭建(组件树+画布+响应式断点)/工作流设计器(BPMN 节点+连线+条件网关)/数据模型设计(ER 图+字段类型)/代码生成(Vue3+React+Flutter)/数据源对接(REST/GraphQL/SQL)/权限(RBAC+字段级+行级)/发布(版本+灰度+回滚)/插件市场 | simple~hard |
+| IL01–IL10 | 多模态内容处理与工程实战 | Pillow(图片 resize/crop/watermark/OCR/AVIF)/pydub+librosa(音频转码/剪辑/ASR/频谱)/ffmpeg-python(视频转码/抽帧/字幕)/PyMuPDF(PDF 合并/拆分/加密/表单)/批量队列(Celery)/元数据(exiftool)/缩略图 CDN/内容审核(敏感图/暴恐/色情) | simple~hard |
+| IM01–IM10 | RPA 自动化与工作流编排工程实战 | pyautogui(鼠标/键盘/截图)+ uiautomation(Windows UI 树)+ Playwright(浏览器自动化)+ 邮件自动化(IMAP/SMTP)+ Excel/Word/PDF 自动化+ 定时调度(cron+触发器)+ 异常处理(重试+告警+人工介入)+ 人机协作(暂停/恢复/审批)+ 日志审计/模板市场 | simple~hard |
 
 ## 每条提示词的字段
 
@@ -537,7 +551,7 @@ docs/自动化测试-提示词文件列表/
 
 ## 维护约定
 
-- 新增主题时**先检索本库 2310 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…，CL 之后用 CM/CN/CO/…，CX 之后用 CY/CZ/DA/…，DH 之后用 DI/DJ/DK/…，DP 之后用 DQ/DR/DS/DT/DU/DV/DW/DX/DY/DZ/EA/EB/EC/ED/EE/EF/EG/EH/EI/EJ/EK/EL/EM/EN/EO/EP/EQ/ER/ES/ET/…，ET 之后用 EU/EV/EW/EX/EY/EZ/FA/FB/FC/FD/FE/FF/FG/FH/FI/FJ/FK/FL/FM/FN/FO/FP/FQ/FR/FS/FT/FU/FV/…，FV 之后用 FW/FX/FY/FZ/GA/GB/…（185–194 号文件已用至 GF 编号段），GF 之后用 GG/GH/GI/…（195–209 号文件已用至 GU 编号段），GU 之后用 GV/GW/GX/GY/GZ、GZ 之后用 HA/HB/HC/HD/HE/…（210–219 号文件已用至 HE 编号段），HE 之后用 HF/HG/HI/…（220–229 号文件已用至 HP 编号段），HP 之后用 HQ/HR/HS/HT/HU/HV/HW/HX/HY/HZ（230–231 号文件已用至 HR 编号段，HR 之后用 HS/HT/…）。
+- 新增主题时**先检索本库 2520 个主题名，确认不重复**再追加；编号沿类别字母顺延（Z 之后用 AA/AB/…，AP 之后用 AQ/AR/…，AY 之后用 AZ/BA/BB/…，BP 之后用 BQ/BR/BS/…，CA 之后用 CB/CC/CD/…，CL 之后用 CM/CN/CO/…，CX 之后用 CY/CZ/DA/…，DH 之后用 DI/DJ/DK/…，DP 之后用 DQ/DR/DS/DT/DU/DV/DW/DX/DY/DZ/EA/EB/EC/ED/EE/EF/EG/EH/EI/EJ/EK/EL/EM/EN/EO/EP/EQ/ER/ES/ET/…，ET 之后用 EU/EV/EW/EX/EY/EZ/FA/FB/FC/FD/FE/FF/FG/FH/FI/FJ/FK/FL/FM/FN/FO/FP/FQ/FR/FS/FT/FU/FV/…，FV 之后用 FW/FX/FY/FZ/GA/GB/…（185–194 号文件已用至 GF 编号段），GF 之后用 GG/GH/GI/…（195–209 号文件已用至 GU 编号段），GU 之后用 GV/GW/GX/GY/GZ、GZ 之后用 HA/HB/HC/HD/HE/…（210–219 号文件已用至 HE 编号段），HE 之后用 HF/HG/HI/…（220–229 号文件已用至 HP 编号段），HP 之后用 HQ/HR/HS/HT/HU/HV/HW/HX/HY/HZ（230–231 号文件已用至 HR 编号段），HZ 之后用 IA/IB/IC/ID/IE/IF/IG/IH/II/IJ/IK/IL/IM（242–252 号文件已用至 IM 编号段），IM 之后用 IN/IO/IP/…。
 - 修改 laew 功能后（如新增工具、改档位策略），同步修订受影响条目的「预期档位」。
 - 每组提示词控制在 3~5 轮；后轮必须与前轮有显式承接关系，保证"多轮"语义成立。
 - 实测发现某条实际档位与预期不符时，先记录现象（写入 testReport/ 验证报告），
