@@ -212,24 +212,49 @@ while _i < len(_args_router):
 
 
 def _extract_last_user_text(body):
-    """从请求体提取最后一条 user 消息文本(Anthropic + OpenAI 兼容)。"""
+    """从请求体提取最后一条 user 消息文本(Anthropic + OpenAI 兼容)。
+
+    2026-09-15 第 52 轮 BUG-FIX:过滤掉 <<<LAEW:PROJECT_CONTEXT>>> 标记的
+    项目上下文注入块(32K 字符的 CLAUDE.md),防止 router 关键词被 CLAUDE.md
+    中的文档内容抢先匹配,导致 Yolo 分类错位(hu02 提示词匹配到 hu01 规则)。
+    """
     msgs = body.get("messages", []) or []
     for m in reversed(msgs):
         if m.get("role") != "user":
             continue
         content = m.get("content", "")
         if isinstance(content, str):
-            return content
+            return _strip_project_context(content)
         if isinstance(content, list):
             parts = []
             for p in content:
                 if isinstance(p, dict):
+                    txt = None
                     if p.get("type") == "text" and "text" in p:
-                        parts.append(p["text"])
+                        txt = p["text"]
                     elif "text" in p:
-                        parts.append(p["text"])
+                        txt = p["text"]
+                    if txt is not None and not txt.startswith("<<<LAEW:PROJECT_CONTEXT>>>"):
+                        parts.append(txt)
             return "\n".join(parts)
     return ""
+
+
+def _strip_project_context(text):
+    """从纯文本中移除 <<<LAEW:PROJECT_CONTEXT>>> ... <<<LAEW:PROJECT_CONTEXT>>> 块。"""
+    marker = "<<<LAEW:PROJECT_CONTEXT>>>"
+    if marker not in text:
+        return text
+    parts = text.split(marker)
+    # 移除成对标记之间的内容(保留标记外的用户文本)
+    result = []
+    i = 0
+    while i < len(parts):
+        if i % 2 == 0:
+            result.append(parts[i])
+        # 奇数索引是 PROJECT_CONTEXT 内容,跳过
+        i += 1
+    return "".join(result)
 
 
 def _extract_current_prompt(body):
