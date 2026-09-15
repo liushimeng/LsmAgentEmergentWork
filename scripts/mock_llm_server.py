@@ -915,7 +915,14 @@ def detect_role(body, key):
         ("LsmAgentEmergentWork-SessionContext", "session"),
         ("LsmAgentEmergentWork-Compact", "compact"),
         ("LsmAgentEmergentWork-Plan", "plan"),
+        # 2026-09-15:WindowUse 必须在 Main-Work 之前(src/agent/main_work.rs:268
+        # MAIN_WORK_BASE_PROMPT 引用了 "WindowUse Agent" 用于委派规范),否则
+        # Main-Work 自己的请求会被 WindowUse marker 截胡。
+        ("LsmAgentEmergentWork-WindowUse", "windowuse"),
         ("LsmAgentEmergentWork-Main-Work", "mainwork"),
+        # WorkFlow(第 10 角色):工具集与 SubAgent 完全一致,仅做角色识别,
+        # 响应分支 fall-through 到 subagent 兜底,行为兼容。
+        ("LsmAgentEmergentWork-WorkFlow", "workflow"),
         ("LsmAgentEmergentWork-Yolo", "yolo"),
     ]:
         if marker in system:
@@ -1463,6 +1470,30 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif role == "debug":
                 body_bytes = role_reply(debug_evaluation_text(body))
+            elif role == "windowuse":
+                # 2026-09-15 第 53 轮 P2:WindowUse Runner 首调必须返回 WindowList
+                # tool_use(src/agent/system_prompt/mod.rs:794 第 1 条作业规范)。
+                # WindowListTool.parameters() 允许 filter 缺省(空 dict 即合法),
+                # laew 端 WindowListTool.execute() 会经 fallback.rs::list_windows()
+                # 真正发起 wmctrl 调用或返回 UNSUPPORTED_MSG。
+                # 实例内 call 计数与 subagent 同语义:无 assistant 消息=新实例,
+                # 计数归零;独立 STATE key 避免与 subagent 串味(同 session 内
+                # SubAgent 与 WindowUse Runner 会并存)。
+                _wu_inst_key = f"{key}:windowuse:inst"
+                _wu_has_asst = any(
+                    m.get("role") == "assistant" for m in (body.get("messages") or [])
+                )
+                if not _wu_has_asst:
+                    STATE[_wu_inst_key] = 0
+                STATE[_wu_inst_key] = STATE.get(_wu_inst_key, 0) + 1
+                _wu_call_no = STATE[_wu_inst_key]
+                if _wu_call_no == 1:
+                    body_bytes = anthropic_tool_use_sse("WindowList", {})
+                else:
+                    # 后续轮次:复用 build_anthropic_stream 标准流,laew 端真正
+                    # 执行工具后 tool_result 回填,自然进入下一轮调用。
+                    _wu_prompt = _extract_user_corpus(body)
+                    body_bytes = build_anthropic_stream(_wu_call_no, _wu_prompt)
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
                 # 2026-09-11 第三十四轮 BUG-M1/M2:改用全量 user 语料(任务
                 # prompt + tool_result 内容)做路由匹配,call_no 用实例内计数,
