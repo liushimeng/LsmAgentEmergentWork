@@ -187,7 +187,19 @@ fn ax_strings() -> &'static AxStrings {
 }
 
 fn ax_strings_loaded() -> bool {
-    !std::ptr::eq(ax_strings(), &EMPTY_AX_STRINGS)
+    let ax = ax_strings();
+    // 一旦任一关键字段为 0(dlsym 失败),即视为不可用。EMPTY_AX_STRINGS 常量
+    // 仅用于 ax_strings() 闭包内部的「整表作废」返回,不会被存进 OnceLock
+    // (OnceLock 内部地址与 const 静态地址永远不相等,不能做指针相等判断)。
+    ax.children != 0
+        && ax.role != 0
+        && ax.title != 0
+        && ax.value != 0
+        && ax.position != 0
+        && ax.size != 0
+        && ax.windows != 0
+        && ax.focused != 0
+        && ax.press_action != 0
 }
 
 // 让外部调用点保持 `kAX<X>Attribute` / `kAXPressAction` 的可读命名,提供等价 inline getter。
