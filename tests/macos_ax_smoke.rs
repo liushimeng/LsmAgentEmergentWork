@@ -61,15 +61,29 @@ fn macos_permission_hint_on_tahoe() {
 }
 
 #[test]
-fn macos_list_windows_fail_closed_on_tahoe() {
+fn macos_list_windows_works_via_coregraphics_on_tahoe() {
+    // 2026-09-15 修复:list_windows 使用 CoreGraphics(CGWindowListCopyWindowInfo),
+    // 不需要 AX API,因此在 macOS 26+ 上仍然可用。
+    // 但 inspect/act 仍然需要 AX API,在 macOS 26+ 上不可用。
     let driver = current_driver();
     let result = driver.list_windows(None);
-    let err = result.expect_err("macOS 26+ 上 list_windows 必须返回 Err,而非空 Vec");
+    let windows = result.expect("macOS 26+ 上 list_windows 应成功(CoreGraphics 枚举)");
+    println!("[smoke] list_windows 返回 {} 个窗口", windows.len());
+    assert!(!windows.is_empty(), "应至少枚举到 1 个窗口");
+    println!("[smoke] ✓ list_windows 通过 CoreGraphics 工作(无需 AX API)");
+}
+
+#[test]
+fn macos_inspect_fail_closed_on_tahoe() {
+    // inspect 需要 AX API,在 macOS 26+ 上不可用
+    let driver = current_driver();
+    let result = driver.inspect("1:0", 5, None);
+    let err = result.expect_err("macOS 26+ 上 inspect 必须返回 Err");
     let msg = format!("{err}");
-    println!("[smoke] list_windows err = {msg}");
+    println!("[smoke] inspect err = {msg}");
     assert!(
         msg.contains("macOS 26") && msg.contains("AX"),
-        "list_windows 应返回 macOS 26+ AX 不可用错误,实际: {msg}"
+        "inspect 应返回 macOS 26+ AX 不可用错误,实际: {msg}"
     );
-    println!("[smoke] ✓ list_windows 入口 fail-closed");
+    println!("[smoke] ✓ inspect 入口 fail-closed");
 }

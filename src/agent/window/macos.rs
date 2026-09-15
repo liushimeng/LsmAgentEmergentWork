@@ -366,6 +366,14 @@ impl MacOsDriver {
         }
     }
 
+    /// 检查 AX API 是否可用(不检查权限)。
+    ///
+    /// macOS 26+ 上 AX 字符串常量已移除,此方法返回 false。
+    /// 用于 `list_windows` 判断是否可以降级到 CoreGraphics 枚举。
+    fn ax_available(&self) -> bool {
+        ax_strings_loaded()
+    }
+
     /// 解析窗口 id `"{pid}:{index}"`。
     fn parse_window_id(window_id: &str) -> Result<(i32, usize)> {
         let (pid_s, idx_s) = window_id.split_once(':').ok_or_else(|| {
@@ -572,7 +580,11 @@ impl WindowDriver for MacOsDriver {
     }
 
     fn list_windows(&self, filter: Option<&str>) -> Result<Vec<WindowInfo>> {
-        self.require_trusted()?;
+        // 注意:窗口枚举使用 CoreGraphics(CGWindowListCopyWindowInfo),
+        // 不需要 AX API,因此在 macOS 26+ 上仍然可用。
+        // 但 inspect/act 需要 AX API,在 macOS 26+ 上不可用。
+        // 这里不调用 require_trusted(),直接枚举窗口。
+        let _ = self.ax_available(); // 仅用于调试/日志
         unsafe {
             let list = CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, 0);
             if list.is_null() {
