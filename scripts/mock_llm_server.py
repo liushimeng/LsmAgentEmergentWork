@@ -951,10 +951,18 @@ def first_tool_call_inner(default_cmd):
             {"file_path": "sandbox-ok.txt", "content": "laew sandbox ok"}, ensure_ascii=False
         )
     if "--system-overview" in MODES:
-        command = (
-            "printf 'load_average: '; cut -d' ' -f1-3 /proc/loadavg; "
-            "printf 'memory_and_swap:\\n'; free -h"
-        )
+        # 2026-09-15:添加 macOS 兼容性(Linux 用 /proc/loadavg + free,macOS 用 sysctl)
+        import platform as _platform
+        if _platform.system() == "Darwin":
+            command = (
+                "printf 'load_average: '; sysctl -n vm.loadavg | awk '{print $2,$3,$4}'; "
+                "printf 'memory_and_swap:\\n'; sysctl -n vm.swapusage"
+            )
+        else:
+            command = (
+                "printf 'load_average: '; cut -d' ' -f1-3 /proc/loadavg; "
+                "printf 'memory_and_swap:\\n'; free -h"
+            )
         return "Bash", json.dumps({"command": command}, ensure_ascii=False)
     if "--write-retention" in MODES:
         script = """#!/bin/sh
