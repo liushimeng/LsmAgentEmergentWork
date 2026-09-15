@@ -15,7 +15,6 @@ use super::format::{
     waiting_line_text,
 };
 use super::pathfmt;
-use super::theme::{attrs_to_ansi, bg_color_ansi, color_to_ansi256};
 use crate::agent::debug::{DebugCollector, ReportMeta, finalize_report};
 use crate::agent::orchestrator::OrchestrationOutcome;
 use crate::llm::ChatMessage;
@@ -320,8 +319,10 @@ impl TuiSession {
                 // 等 TUI 元数据会污染 LLM 决策、浪费 token、跨轮指代干扰)。
                 // print_task_result 继续用人类版(含 trace 等可观测性信息,屏幕友好)。
                 // transcript/导出也用人类版(用户看到的完整记录)。
+                // 2026-09-15 TUIMarkdown 富文本渲染:transcript 走 styled=false 纯文本
+                // (导出/回填零 ANSI),屏幕打印走 styled=true(仅模型内容块着色)。
                 let transcript_text =
-                    format_task_result(result, &self.paths, self.task_started_at);
+                    format_task_result(result, &self.paths, self.task_started_at, false);
                 let context_text = format_task_result_for_context(result);
                 self.print_task_result(result);
                 Some((
@@ -464,7 +465,7 @@ impl TuiSession {
         if !text.is_empty() {
             println!();
             println!("  [agent: {agent_name}]");
-            self.print_with_optional_highlight(text);
+            self.print_assistant_markdown(text);
             println!();
         } else {
             println!("  (模型未返回文本)");
@@ -482,77 +483,29 @@ impl TuiSession {
         // 2026-09-10 第 27 轮 F05:从 self.task_started_at.take() 取任务开始时间,
         // 拼接到「本次用量」行末尾。take 保证只显示一次,后续命令不带耗时。
         let started = self.task_started_at.take();
-        for line in format_task_result(result, &self.paths, started).lines() {
+        // styled=true:仅模型内容块(subflow_outcome/摘要)经 Markdown 渲染加 ANSI,
+        // 结构标签行保持纯文本(2026-09-15,docs/TUIMarkdown富文本渲染/)。
+        for line in format_task_result(result, &self.paths, started, true).lines() {
             println!("{line}");
         }
     }
 
     /// 渲染 diff 输出(供 `/diff` 命令使用)。
     pub(crate) fn print_diff_hunk(&self, hunk: &crate::tui::render::diff::DiffHunk) {
+        // ANSI 编码收敛到 render::span_to_ansi(2026-09-15 TUIMarkdown 富文本渲染);
+        // 2026-09-10 第二十五轮 F04/B07 的 bg 序列语义保持(diff 字符级底色高亮生效)。
         let rendered = crate::tui::render::diff::render_diff_hunk(hunk);
-        for line_spans in rendered {
-            print!("  ");
-            for span in line_spans {
-                let attrs_ansi = attrs_to_ansi(span.attrs);
-                // 2026-09-10 第二十五轮 F04/B07 测试修复:输出 bg ANSI 序列,
-                // 让 `diff_added_char_bg` / `diff_removed_char_bg` 主题色真正生效(此前死代码)。
-                let bg_ansi = bg_color_ansi(span.bg);
-                print!(
-                    "\x1b[38;5;{}m{}{}{}\x1b[0m",
-                    color_to_ansi256(span.fg),
-                    bg_ansi,
-                    attrs_ansi,
-                    span.text
-                );
-            }
-            println!();
-        }
+        crate::tui::render::print_render_lines(&rendered, "  ");
     }
 
-    /// 带围栏检测的文本输出:在 ```lang ... ``` 围栏内按语言高亮,围栏外原样输出。
-    fn print_with_optional_highlight(&self, text: &str) {
-        let mut in_fence = false;
-        let mut fence_lang = crate::tui::render::highlight::HlLang::Plain;
-
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("```") {
-                let tag = trimmed.trim_start_matches('`').trim();
-                if in_fence {
-                    // 结束围栏
-                    println!("  {line}");
-                    in_fence = false;
-                } else {
-                    // 开始围栏
-                    fence_lang = crate::tui::render::highlight::lang_from_fence_tag(tag);
-                    println!("  {line}");
-                    in_fence = true;
-                }
-                continue;
-            }
-
-            if in_fence {
-                // 围栏内按语言高亮
-                let spans = crate::tui::render::highlight::highlight_line(line, fence_lang);
-                print!("  ");
-                for span in spans {
-                    let attrs_ansi = attrs_to_ansi(span.attrs);
-                    // 2026-09-10 第二十五轮 F04/B07 测试修复:同样支持 bg ANSI 输出,
-                    // 为后续语法高亮扩展(关键字底色 / 错误标注底色等)留口子。
-                    let bg_ansi = bg_color_ansi(span.bg);
-                    print!(
-                        "\x1b[38;5;{}m{}{}{}\x1b[0m",
-                        color_to_ansi256(span.fg),
-                        bg_ansi,
-                        attrs_ansi,
-                        span.text
-                    );
-                }
-                println!();
-            } else {
-                println!("  {line}");
-            }
-        }
+    /// 助手文本输出(2026-09-15 TUIMarkdown 富文本渲染):整段走 Markdown 渲染器。
+    ///
+    /// 旧实现只在 ```lang 围栏内做语法高亮、围栏外原样输出;现由
+    /// `render::markdown::print_markdown` 统一着色(标题/粗斜体/行内码/列表/
+    /// 引用/表格/链接/分隔线),围栏内语法高亮语义内嵌保留(行为向后兼容)。
+    /// 设计见 docs/TUIMarkdown富文本渲染/01-设计与解决方案.md。
+    fn print_assistant_markdown(&self, text: &str) {
+        crate::tui::render::markdown::print_markdown(text, "  ");
     }
 
     fn print_usage(&mut self, usage: &crate::llm::Usage) {

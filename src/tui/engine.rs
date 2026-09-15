@@ -267,6 +267,13 @@ fn attrs_to_list(attrs: u8) -> Vec<Attribute> {
     if attrs & attr::UNDERLINED != 0 {
         v.push(Attribute::Underlined);
     }
+    // Markdown 富文本渲染新增属性(2026-09-15,见 docs/TUIMarkdown富文本渲染/)
+    if attrs & attr::ITALIC != 0 {
+        v.push(Attribute::Italic);
+    }
+    if attrs & attr::CROSSED_OUT != 0 {
+        v.push(Attribute::CrossedOut);
+    }
     v
 }
 

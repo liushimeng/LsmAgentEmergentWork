@@ -9,10 +9,11 @@
 
 pub mod diff;
 pub mod highlight;
+pub mod markdown;
 
 use crossterm::style::Color;
 
-use crate::tui::theme::{self, attr};
+use crate::tui::theme::{self, attr, attrs_to_ansi, bg_color_ansi, color_to_ansi256};
 
 /// 渲染片段:一段文本 + 颜色 + 属性。
 #[derive(Debug, Clone)]
@@ -47,3 +48,54 @@ impl Span {
 
 /// 渲染结果:多行 span 列表。
 pub type RenderLines = Vec<Vec<Span>>;
+
+/// 把单个 Span 编码为完整 ANSI 序列(fg + bg + attrs + text + reset)。
+///
+/// TUIMarkdown 富文本渲染(2026-09-15)收敛:`dispatch.rs` 的 diff 打印 /
+/// 围栏高亮打印与 Markdown 渲染统一走此助手,消除三处重复的 ANSI 拼接。
+pub fn span_to_ansi(span: &Span) -> String {
+    // 全默认样式(Reset 前景 + 无底色 + 无属性)→ 直接输出原文:
+    // 避免 Markdown 渲染的普通文本行逐 span 包 ANSI(Markdown 富文本渲染,2026-09-15)。
+    if span.fg == Color::Reset && span.bg == Color::Reset && span.attrs == attr::NONE {
+        return span.text.clone();
+    }
+    format!(
+        "\x1b[38;5;{}m{}{}{}\x1b[0m",
+        color_to_ansi256(span.fg),
+        bg_color_ansi(span.bg),
+        attrs_to_ansi(span.attrs),
+        span.text
+    )
+}
+
+/// 把 RenderLines 逐行直出到 stdout(每行前缀固定缩进;空行只输出缩进)。
+pub fn print_render_lines(lines: &RenderLines, indent: &str) {
+    for spans in lines {
+        print!("{indent}");
+        for s in spans {
+            print!("{}", span_to_ansi(s));
+        }
+        println!();
+    }
+}
+
+/// RenderLines → 含 ANSI 的多行字符串(无尾换行;供需要 String 拼接的
+/// 渲染路径使用,如 `format_task_result` 的 Styled 模式)。
+pub fn render_lines_to_ansi_str(lines: &RenderLines, indent: &str) -> String {
+    let mut out = String::new();
+    for (i, spans) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(indent);
+        for s in spans {
+            out.push_str(&span_to_ansi(s));
+        }
+    }
+    out
+}
+
+/// 计算一组 Span 的纯文本显示宽度(供表格列宽对齐)。
+pub(crate) fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| crate::tui::input::display_width(&s.text) as usize).sum()
+}

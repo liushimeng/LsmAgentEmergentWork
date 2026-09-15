@@ -13,12 +13,21 @@ use crate::config::{Paths, ProviderRecord};
 use crate::tui::input::display_width;
 
 /// 格式化任务执行结果为多行文本(D8:屏幕打印与导出同源,避免两处漂移)。
+///
+/// `styled=true`(2026-09-15 TUIMarkdown 富文本渲染,docs/TUIMarkdown富文本渲染/):
+/// 模型生成的内容块(`subflow_outcome` / `session_context 摘要`)经
+/// `render::markdown` 渲染为带 ANSI 的富文本;**结构标签行保持纯文本**。
+/// transcript / 导出必须传 `false`(纯文本,零 ANSI 混入)。
 pub(crate) fn format_task_result(
     result: &crate::agent::orchestrator::TaskResult,
     paths: &Paths,
     task_started_at: Option<std::time::Instant>,
+    styled: bool,
 ) -> String {
     let mut out = String::new();
+    // styled 模式:动态字符串逐个先净化(防终端控制序列注入),内容块再渲染 ANSI;
+    // 末尾不再整体净化(否则会把注入的 ANSI 剥掉)。plain 模式维持整体净化。
+    let sv = |s: &str| sanitize_terminal_controls(s);
     let plan_doc_display = result
         .plan_doc
         .as_ref()
@@ -27,7 +36,7 @@ pub(crate) fn format_task_result(
     out.push_str(&format!(
         "  [task executed: difficulty={}, plan_doc={}, workflows={}]\n",
         result.classification.task_level.display_name(),
-        plan_doc_display,
+        if styled { sv(&plan_doc_display) } else { plan_doc_display },
         result.workflows.len()
     ));
     // 2026-09-10 第二十九轮 P06/M05 自动化测试:
@@ -38,16 +47,33 @@ pub(crate) fn format_task_result(
     let goal_short = truncate_chars(&c.goal_summary, 40);
     out.push_str(&format!(
         "  [yolo] purpose={} goal={} intent={} plan_steps={}\n",
-        purpose_short,
-        goal_short,
-        c.intent,
+        if styled { sv(&purpose_short) } else { purpose_short },
+        if styled { sv(&goal_short) } else { goal_short },
+        if styled { sv(&c.intent) } else { c.intent.clone() },
         c.decomposition_plan.len()
     ));
     // 每个 WorkFlow 的 subflow 输出
     for wf in &result.workflows {
-        out.push_str(&format!("  --- WorkFlow {} ({}) ---\n", wf.id, wf.name));
-        for line in wf.subflow_outcome.lines() {
-            out.push_str(&format!("  {line}\n"));
+        out.push_str(&format!(
+            "  --- WorkFlow {} ({}) ---\n",
+            wf.id,
+            if styled { sv(&wf.name) } else { wf.name.clone() }
+        ));
+        if styled {
+            // 模型内容块:净化后整段 Markdown 渲染(围栏高亮语义包含在内);
+            // 尾部空行按 lines() 语义忽略,保持与 plain 模式行数一致
+            let block = wf.subflow_outcome.trim_end_matches('\n');
+            if !block.is_empty() {
+                out.push_str(&crate::tui::render::markdown::markdown_to_ansi_str(
+                    &sv(block),
+                    "  ",
+                ));
+                out.push('\n');
+            }
+        } else {
+            for line in wf.subflow_outcome.lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
         }
         // Quality-Check 结论
         let (qc_icon, qc_text) = match wf.quality_report.verdict {
@@ -57,7 +83,10 @@ pub(crate) fn format_task_result(
         out.push_str(&format!("  [QC] {qc_icon} {qc_text}\n"));
         if !wf.quality_report.issues.is_empty() {
             for issue in &wf.quality_report.issues {
-                out.push_str(&format!("    问题: {issue}\n"));
+                out.push_str(&format!(
+                    "    问题: {}\n",
+                    if styled { sv(issue) } else { issue.clone() }
+                ));
             }
         }
         // SubAgent 执行轨迹摘要
@@ -75,8 +104,19 @@ pub(crate) fn format_task_result(
     if !result.summary.is_empty() {
         out.push('\n');
         out.push_str("  [session_context 摘要]\n");
-        for line in result.summary.lines() {
-            out.push_str(&format!("  {line}\n"));
+        if styled {
+            let block = result.summary.trim_end_matches('\n');
+            if !block.is_empty() {
+                out.push_str(&crate::tui::render::markdown::markdown_to_ansi_str(
+                    &sv(block),
+                    "  ",
+                ));
+                out.push('\n');
+            }
+        } else {
+            for line in result.summary.lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
         }
     }
     // 用量行(与 print_usage 同格式)
@@ -102,7 +142,13 @@ pub(crate) fn format_task_result(
             usage.input_tokens, usage.output_tokens, cache, elapsed_suffix
         ));
     }
-    sanitize_terminal_controls(&out)
+    // styled 模式下动态串已逐处净化、内容块刚渲染出 ANSI,不再整体净化;
+    // plain 模式维持 D8 既有行为(整体净化,防工具输出混入控制序列)。
+    if styled {
+        out
+    } else {
+        sanitize_terminal_controls(&out)
+    }
 }
 
 /// 清理人类可读任务结果中的终端控制序列。

@@ -21,11 +21,16 @@ use crossterm::style::Color;
 
 /// Cell 属性位掩码(engine.rs::Cell.attrs 使用)。
 pub mod attr {
-    pub const NONE: u8       = 0;
-    pub const BOLD: u8       = 1 << 0;
-    pub const REVERSE: u8    = 1 << 1;
-    pub const DIM: u8        = 1 << 2;
-    pub const UNDERLINED: u8 = 1 << 3;
+    pub const NONE: u8        = 0;
+    pub const BOLD: u8        = 1 << 0;
+    pub const REVERSE: u8     = 1 << 1;
+    pub const DIM: u8         = 1 << 2;
+    pub const UNDERLINED: u8  = 1 << 3;
+    /// 斜体(ANSI `3m`);Markdown `*em*` / 引用正文使用(TUIMarkdown富文本渲染,2026-09-15)。
+    /// 终端不支持时多数降级为普通字形,不影响内容可读。
+    pub const ITALIC: u8      = 1 << 4;
+    /// 删除线(ANSI `9m`);Markdown `~~del~~` 使用(同上)。
+    pub const CROSSED_OUT: u8 = 1 << 5;
 }
 
 // ============================================================
@@ -165,6 +170,58 @@ pub const HL_PUNCTUATION_FG: Color = Color::Reset;
 pub const HL_PLAIN_FG: Color = Color::Reset;
 
 // ============================================================
+// Markdown 富文本渲染颜色(D5/L1401+ TUIMarkdown富文本渲染,2026-09-15)
+// 设计见 docs/TUIMarkdown富文本渲染/01-设计与解决方案.md
+// const = default 主题导出(与下方 DEFAULT_PALETTE.md_* 一一对应);
+// 渲染层统一运行时读 palette(),四主题动态跟随。
+// ============================================================
+
+/// H1..H6 标题前景色(按级别索引 0..5)。
+pub const MD_HEADING_FGS: [Color; 6] = [
+    Color::Magenta,   // H1
+    Color::Cyan,      // H2(= ACCENT)
+    Color::Blue,      // H3
+    Color::Yellow,    // H4
+    Color::Green,     // H5
+    Color::DarkGrey,  // H6
+];
+/// 标题属性(六级共用)。
+pub const MD_HEADING_ATTRS: u8 = attr::BOLD;
+/// 标题前缀符(每个 `#` 渲染为一个 `▍`,最多 6 个)。
+pub const MD_HEADING_PREFIX: &str = "▍";
+/// 引用竖线 `│` 前景色。
+pub const MD_QUOTE_FG: Color = Color::Yellow;
+/// 引用正文前景色(配合 MD_QUOTE_ATTRS 弱化)。
+pub const MD_QUOTE_BODY_FG: Color = Color::DarkGrey;
+/// 引用正文属性(斜体,终端不支持时自然降级)。
+pub const MD_QUOTE_ATTRS: u8 = attr::ITALIC;
+/// 行内码前景色。
+pub const MD_CODE_FG: Color = Color::Yellow;
+/// 行内码背景色(Reset = 不加底色)。
+pub const MD_CODE_BG: Color = Color::Black;
+/// 链接文本前景色。
+pub const MD_LINK_FG: Color = Color::Cyan;
+/// 链接文本属性(下划线;浅色主题 Palette 覆写为 BOLD|UNDERLINED)。
+pub const MD_LINK_ATTRS: u8 = attr::UNDERLINED;
+/// 链接 url 括注 ` (url)` 前景色。
+pub const MD_LINK_URL_FG: Color = Color::DarkGrey;
+/// 列表标记符 `•` / 有序序号前景色。
+pub const MD_LIST_MARKER_FG: Color = Color::Cyan;
+/// 任务列表完成框 `☑` 前景色(未完成框 `☐` 用 palette.dim)。
+pub const MD_TASK_DONE_FG: Color = Color::Green;
+/// 分隔线 `─` 前景色。
+pub const MD_HR_FG: Color = Color::DarkGrey;
+/// 分隔线字符与宽度(固定 42,避免非 TTY 下探测终端宽度失败)。
+pub const MD_HR_CHAR: char = '─';
+pub const MD_HR_WIDTH: usize = 42;
+/// 表格盒线前景色。
+pub const MD_TABLE_BORDER_FG: Color = Color::DarkGrey;
+/// 表头文字前景色(叠加 BOLD)。
+pub const MD_TABLE_HEADER_FG: Color = Color::Cyan;
+/// 围栏 ``` 行前景色(语言名用 palette.accent)。
+pub const MD_FENCE_FG: Color = Color::DarkGrey;
+
+// ============================================================
 // 主题系统(2026-09-10 第二十三轮 D12 多主题)
 // ============================================================
 
@@ -271,6 +328,23 @@ pub struct Palette {
     pub hl_operator_fg: Color,
     pub hl_punctuation_fg: Color,
     pub hl_plain_fg: Color,
+    // --- Markdown 富文本渲染(TUIMarkdown富文本渲染,2026-09-15)---
+    pub md_heading_fgs: [Color; 6],
+    pub md_heading_attrs: u8,
+    pub md_quote_fg: Color,
+    pub md_quote_body_fg: Color,
+    pub md_quote_attrs: u8,
+    pub md_code_fg: Color,
+    pub md_code_bg: Color,
+    pub md_link_fg: Color,
+    pub md_link_attrs: u8,
+    pub md_link_url_fg: Color,
+    pub md_list_marker_fg: Color,
+    pub md_task_done_fg: Color,
+    pub md_hr_fg: Color,
+    pub md_table_border_fg: Color,
+    pub md_table_header_fg: Color,
+    pub md_fence_fg: Color,
 }
 
 /// 编译期 default 主题(向后兼容常量)。
@@ -316,9 +390,25 @@ const DEFAULT_PALETTE: Palette = Palette {
     hl_operator_fg: Color::White,
     hl_punctuation_fg: Color::Reset,
     hl_plain_fg: Color::Reset,
+    md_heading_fgs: MD_HEADING_FGS,
+    md_heading_attrs: MD_HEADING_ATTRS,
+    md_quote_fg: MD_QUOTE_FG,
+    md_quote_body_fg: MD_QUOTE_BODY_FG,
+    md_quote_attrs: MD_QUOTE_ATTRS,
+    md_code_fg: MD_CODE_FG,
+    md_code_bg: MD_CODE_BG,
+    md_link_fg: MD_LINK_FG,
+    md_link_attrs: MD_LINK_ATTRS,
+    md_link_url_fg: MD_LINK_URL_FG,
+    md_list_marker_fg: MD_LIST_MARKER_FG,
+    md_task_done_fg: MD_TASK_DONE_FG,
+    md_hr_fg: MD_HR_FG,
+    md_table_border_fg: MD_TABLE_BORDER_FG,
+    md_table_header_fg: MD_TABLE_HEADER_FG,
+    md_fence_fg: MD_FENCE_FG,
 };
 
-/// 暗色高对比(视力辅助):用 ANSI 256 色板的亮色档(n=15 White / 14 Cyan / 9+ 等)
+/// 暗色高对比(视力辅助):用 ANSI 256 色板(n=15 White / 14 Cyan / 9+ 等)
 /// 模拟 BrightXxx —— crossterm 0.27 无 BrightXxx 变体,只能走 Rgb。
 /// 256 色板 15=亮白, 14=亮青, 9=亮红, 10=亮绿, 11=亮黄, 13=亮品红。
 const DARK_CONTRAST_PALETTE: Palette = Palette {
@@ -363,6 +453,29 @@ const DARK_CONTRAST_PALETTE: Palette = Palette {
     hl_operator_fg: Color::AnsiValue(15),
     hl_punctuation_fg: Color::Reset,
     hl_plain_fg: Color::Reset,
+    md_heading_fgs: [
+        Color::AnsiValue(13), // H1 亮品红
+        Color::AnsiValue(14), // H2 亮青
+        Color::AnsiValue(12), // H3 亮蓝
+        Color::AnsiValue(11), // H4 亮黄
+        Color::AnsiValue(10), // H5 亮绿
+        Color::Grey,          // H6
+    ],
+    md_heading_attrs: attr::BOLD,
+    md_quote_fg: Color::AnsiValue(11),
+    md_quote_body_fg: Color::Grey,
+    md_quote_attrs: attr::ITALIC,
+    md_code_fg: Color::AnsiValue(11),
+    md_code_bg: Color::Black,
+    md_link_fg: Color::AnsiValue(14),
+    md_link_attrs: attr::UNDERLINED,
+    md_link_url_fg: Color::Grey,
+    md_list_marker_fg: Color::AnsiValue(14),
+    md_task_done_fg: Color::AnsiValue(10),
+    md_hr_fg: Color::Grey,
+    md_table_border_fg: Color::Grey,
+    md_table_header_fg: Color::AnsiValue(14),
+    md_fence_fg: Color::Grey,
 };
 
 /// 浅色配色(白底终端):选中态反白改下划线(浅底反白不可读);
@@ -409,6 +522,29 @@ const LIGHT_PALETTE: Palette = Palette {
     hl_operator_fg: Color::Black,
     hl_punctuation_fg: Color::Reset,
     hl_plain_fg: Color::Reset,
+    md_heading_fgs: [
+        Color::DarkMagenta, // H1
+        Color::DarkCyan,    // H2
+        Color::DarkBlue,    // H3
+        Color::DarkYellow,  // H4
+        Color::DarkGreen,   // H5
+        Color::DarkGrey,    // H6
+    ],
+    md_heading_attrs: attr::BOLD,
+    md_quote_fg: Color::DarkYellow,
+    md_quote_body_fg: Color::DarkGrey,
+    md_quote_attrs: attr::ITALIC,
+    md_code_fg: Color::DarkMagenta,
+    md_code_bg: Color::Grey,
+    md_link_fg: Color::DarkCyan,
+    md_link_attrs: attr::BOLD | attr::UNDERLINED,
+    md_link_url_fg: Color::DarkGrey,
+    md_list_marker_fg: Color::DarkCyan,
+    md_task_done_fg: Color::DarkGreen,
+    md_hr_fg: Color::DarkGrey,
+    md_table_border_fg: Color::DarkGrey,
+    md_table_header_fg: Color::DarkCyan,
+    md_fence_fg: Color::DarkGrey,
 };
 
 /// 色盲友好(Deuteranopia / Protanopia):红绿对换为蓝黄语义对比,
@@ -455,6 +591,30 @@ const DALTONIZED_PALETTE: Palette = Palette {
     hl_operator_fg: Color::White,
     hl_punctuation_fg: Color::Reset,
     hl_plain_fg: Color::Reset,
+    // 色盲友好:标题主用品红/青/蓝/黄语义,避开红绿对立;H5 用黄替代绿
+    md_heading_fgs: [
+        Color::Cyan,        // H1
+        Color::Magenta,     // H2
+        Color::Blue,        // H3
+        Color::Yellow,      // H4
+        Color::Yellow,      // H5
+        Color::DarkGrey,    // H6
+    ],
+    md_heading_attrs: attr::BOLD,
+    md_quote_fg: Color::Yellow,
+    md_quote_body_fg: Color::DarkGrey,
+    md_quote_attrs: attr::ITALIC,
+    md_code_fg: Color::Yellow,
+    md_code_bg: Color::Black,
+    md_link_fg: Color::Magenta,
+    md_link_attrs: attr::UNDERLINED,
+    md_link_url_fg: Color::DarkGrey,
+    md_list_marker_fg: Color::Magenta,
+    md_task_done_fg: Color::Yellow,
+    md_hr_fg: Color::DarkGrey,
+    md_table_border_fg: Color::DarkGrey,
+    md_table_header_fg: Color::Magenta,
+    md_fence_fg: Color::DarkGrey,
 };
 
 /// 主题到 Palette 的查表。
@@ -662,7 +822,7 @@ impl ThemeKind {
 
 // ── ANSI 转换辅助(2026-09-11 自 tui/mod.rs 迁入;ANSI 颜色集中管理的既有职责)──
 
-/// 把 `theme::attr` 位掩码转换为 ANSI 转义前缀(Bold/Underlined/DIM)。
+/// 把 `theme::attr` 位掩码转换为 ANSI 转义前缀(Bold/DIM/Underlined/Reverse/Italic/CrossedOut)。
 pub(crate) fn attrs_to_ansi(attrs: u8) -> String {
     let mut s = String::new();
     if attrs & crate::tui::theme::attr::BOLD != 0 {
@@ -676,6 +836,12 @@ pub(crate) fn attrs_to_ansi(attrs: u8) -> String {
     }
     if attrs & crate::tui::theme::attr::REVERSE != 0 {
         s.push_str("\x1b[7m");
+    }
+    if attrs & crate::tui::theme::attr::ITALIC != 0 {
+        s.push_str("\x1b[3m");
+    }
+    if attrs & crate::tui::theme::attr::CROSSED_OUT != 0 {
+        s.push_str("\x1b[9m");
     }
     s
 }
