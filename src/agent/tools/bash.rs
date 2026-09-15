@@ -436,6 +436,12 @@ fn truncate(s: &str, max: usize) -> Truncated {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 2026-09-15 第 53 轮:加锁防止与 llm::tls_insecure_* / safety::prompt_injection_*
+    /// 等同时改环境变量的测试产生竞态;Rust 测试默认并行跑。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[tokio::test]
     async fn echo_via_bash() {
@@ -536,6 +542,7 @@ mod tests {
     #[tokio::test]
     async fn utf8_env_switch_injects_and_defaults_off() {
         // 合并为单测试顺序执行:两个 #[test] 并行跑会因进程级 env 互相竞态
+        let _env = lock_env();
         std::env::set_var("LAEW_BASH_UTF8", "1");
         let on = BashTool
             .execute(json!({"command": "echo \"$LC_ALL/$PYTHONUTF8/$PYTHONIOENCODING\""}))
