@@ -1333,6 +1333,8 @@ class Handler(BaseHTTPRequestHandler):
             "anthropic-version": self.headers.get("anthropic-version", ""),
             "accept": self.headers.get("Accept", ""),
         }
+        # 2026-09-15:提取 session_id 用于 WindowUse / SubAgent 路由的会话级规则锁定
+        session_id = headers.get("x-session-id", "")
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(
                 {"path": self.path, "call_no": n, "headers": headers, "body": body},
