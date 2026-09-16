@@ -188,9 +188,10 @@ pub fn compact_registry() -> ToolRegistry {
 /// + **Bash**(白名单模式,仅放行桌面操控类命令)。
 ///
 /// 历史设计:不带 Bash/Write,收窄权限面。
-/// 现状问题:macOS 26+ 上 AX C API 已移除,WindowInspect/WindowAction 全部失败,
-/// 但 WindowUse Agent 完全无法执行 osascript / cliclick 等桌面操控 shell 命令,
-/// 导致 LLM 空转推理,任务失败。补丁 A 引入「白名单 Bash」模式:
+/// 现状问题:macOS 上 AX C API 全版本可用,但依赖「辅助功能」授权;未授权时
+/// WindowInspect/WindowAction 返回 -25211,而 WindowUse Agent 若完全不能执行
+/// osascript / cliclick 等桌面操控 shell 命令,LLM 会空转推理、任务失败。
+/// 补丁 A 引入「白名单 Bash」模式(同时覆盖不便授权时主动走 osascript 的场景):
 /// - WindowUseRunner 在调用 Bash 前设置 `LAEW_WINDOW_USE_MODE=1`;
 /// - BashTool 在该模式下仅放行 WINDOW_USE_BASH_ALLOWLIST 中的命令;
 /// - 危险命令 + 敏感路径黑名单(permissions::check_bash_command)永远优先;

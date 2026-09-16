@@ -266,7 +266,7 @@ mod tests {
         assert!(names.contains(&"WindowInspect".to_string()));
         assert!(names.contains(&"WindowAction".to_string()));
         // 2026-09-16 第 54 轮补丁 A:WindowUse 工具集扩 Bash(白名单模式)
-        // - 用于 macOS 26 上 AX C API 不可用时改走 osascript / cliclick / screencapture 路径
+        // - macOS AX 未授权(-25211)或用户不便授权时,改走 osascript / cliclick / screencapture 路径
         assert!(names.contains(&"Bash".to_string()));
         // WindowUse 不带 Write(写文件不属于窗口操控范围)
         assert!(!names.contains(&"Write".to_string()));

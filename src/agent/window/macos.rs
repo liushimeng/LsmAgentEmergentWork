@@ -184,41 +184,22 @@ fn ax_strings_loaded() -> bool {
 #[inline] fn kAXPressAction()             -> CFStringRef { ax_strings().press_action as CFStringRef }
 #[inline] fn kAXTrustedCheckOptionPrompt() -> CFStringRef { ax_strings().trusted_check_prompt as CFStringRef }
 
-/// 未授予「辅助功能」权限时的统一文案(供 require_trusted / permission_hint 共用)。
+/// 「辅助功能」未授权时的统一文案(供 require_trusted / permission_hint 共用)。
 ///
-/// AX C API 在 macOS 13~26 全版本可用,唯一前置条件是 TCC 授权;因此文案以
-/// 「怎么授权」为主,osascript/cliclick 模板仅作为用户不便授权时的降级路径。
+/// 2026-09-16 第 55 轮修正:AX C API 在 macOS 13~26 **全版本可用**(按字面量 CFString
+/// 调用,与系统版本无关),唯一前置条件是 TCC 辅助功能授权;「AX 不可用」只在**未授权**
+/// 这一种情况下成立(kAXErrorAPIDisabled = -25211)。因此文案以「怎么授权」为主,
+/// osascript/cliclick 模板仅作为用户不便授权时的降级路径。
 /// 文案会作为 tool_result 回填给 LLM,故控制在 ~500 字符内避免重复调用撑爆上下文。
-const MACOS_AX_PERMISSION_HINT: &str =
-    "macOS 未授予「辅助功能」权限,WindowInspect/WindowAction 读不到控件树(AX -25211 \
-     kAXErrorAPIDisabled)。AX C API 在 macOS 13~26 全版本可用,只差授权:\
+const MACOS_AX_UNAVAILABLE_HINT: &str =
+    "辅助功能未授权,WindowInspect/WindowAction 此时不可用(AX 返回 -25211 \
+     kAXErrorAPIDisabled)。AX C API 本身在 macOS 13~26 全版本可用,只差授权:\
      系统设置 → 隐私与安全性 → 辅助功能 → 勾选运行 laew 的宿主终端(Terminal/iTerm/VS Code),\
      然后完全退出并重开该终端(TCC 按进程启动时快照生效);设 LAEW_AX_PROMPT=1 可主动弹授权框。\
      授权前可降级走 Bash + osascript(WindowUse 已扩白名单):\
      activate 应用 / System Events keystroke 输入 / pbcopy·pbpaste 剪贴板 / \
      cliclick c:x,y 坐标点击 / screencapture -x 截图。\
      WindowList 走 CoreGraphics 不需授权,任何情况下都能枚举窗口标题·PID·位置。";
-
-// ===================== CF 辅助 =====================
-
-/// macOS 26+ AX 不可用时的统一错误文案(供 require_trusted / permission_hint 共用)。
-const MACOS_AX_UNAVAILABLE_HINT: &str =
-    "macOS 26+ 已将 AX 无障碍 C API(kAX*Attribute / kAX*Action)从 \
-     ApplicationServices.framework 中移除,WindowInspect/WindowAction \
-     在 macOS 26 上不可用。请优先改走 Bash + osascript 路径。\
-     \n\
-     ★ Bash + osascript 桌面操控模板(WindowUse 已扩 Bash 白名单):\
-     - 启动应用:   osascript -e 'tell application \"WeChat\" to activate'\
-     - 键盘输入:   osascript -e 'tell application \"System Events\" to keystroke \"...\"'\
-     - 剪贴板:     pbcopy / pbpaste\
-     - 坐标点击:   cliclick c:x,y(brew install cliclick)或 osascript click at\
-     - 截图:       screencapture -x /tmp/x.png\
-     - 应用检测:   osascript -e 'tell application \"System Events\" to (name of processes) contains \"WeChat\"'\
-     \n\
-     ★ WindowList 仍可用(走 CoreGraphics),可枚举窗口标题/PID;但 WindowInspect/WindowAction 已废,\
-     不要在这两个工具上耗时间,直接切 Bash 路径。\
-     \n\
-     如必须使用 AX,可在 macOS 13/14 上重新编译。";
 
 /// CFStringRef → String(UTF-8;先走快路径指针,失败回退拷贝缓冲区)。
 unsafe fn cfstr(s: CFStringRef) -> String {
@@ -362,7 +343,7 @@ impl MacOsDriver {
         if Self::trusted() {
             Ok(())
         } else {
-            Err(platform_err("macos", MACOS_AX_PERMISSION_HINT))
+            Err(platform_err("macos", MACOS_AX_UNAVAILABLE_HINT))
         }
     }
 
@@ -477,10 +458,18 @@ impl MacOsDriver {
         filter: Option<&str>,
     ) -> Option<ControlNode> {
         let role = ax_get_string(el, kAXRoleAttribute());
+        // 名称优先级:AXTitle > AXValue > AXDescription(微信/QQ 等应用按钮常用 AXDescription 承载可
+        // 读文案,AXTitle 反为空;补上这一级可显著提升控件可辨识度,便于 LLM 在控件树中定位目标)。
+        let description = ax_get_string(el, kAXDescriptionAttribute());
         let name = {
             let t = ax_get_string(el, kAXTitleAttribute());
             if t.is_empty() {
-                ax_get_string(el, kAXValueAttribute())
+                let v = ax_get_string(el, kAXValueAttribute());
+                if v.is_empty() {
+                    description.clone()
+                } else {
+                    v
+                }
             } else {
                 t
             }
@@ -582,8 +571,8 @@ impl WindowDriver for MacOsDriver {
 
     fn list_windows(&self, filter: Option<&str>) -> Result<Vec<WindowInfo>> {
         // 注意:窗口枚举使用 CoreGraphics(CGWindowListCopyWindowInfo),
-        // 不需要 AX API,因此在 macOS 26+ 上仍然可用。
-        // 但 inspect/act 需要 AX API,在 macOS 26+ 上不可用。
+        // 不需要 AX 辅助功能授权,因此任何情况下都可用(与 macOS 版本无关)。
+        // inspect/act 需要 AX + 授权,未授权时返回 -25211 与授权引导。
         // 这里不调用 require_trusted(),直接枚举窗口。
         let _ = self.ax_available(); // 仅用于调试/日志
         unsafe {
@@ -709,12 +698,14 @@ impl WindowDriver for MacOsDriver {
 
     fn permission_hint(&self) -> Option<String> {
         if !ax_strings_loaded() {
+            // 字面量创建失败(OOM 等极端情况):按"常量不可用"兜底,语义同未授权
             return Some(MACOS_AX_UNAVAILABLE_HINT.to_string());
         }
         if Self::trusted() {
             None
         } else {
-            Some(ax_error_text(K_AX_ERROR_API_DISABLED))
+            // 未授权时给完整引导(含授权步骤 + osascript 降级模板),作为 tool_result 回填给 LLM
+            Some(MACOS_AX_UNAVAILABLE_HINT.to_string())
         }
     }
 }

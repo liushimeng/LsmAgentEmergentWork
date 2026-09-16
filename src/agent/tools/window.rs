@@ -135,9 +135,9 @@ impl Tool for WindowListTool {
         // 原设计是「缺权限/缺依赖时前置报错」,但实际上:
         //   - Windows:WindowList 无需任何授权(UIA 仅 inspect/act 需权限);
         //   - macOS:WindowList 走 CoreGraphics(CGWindowListCopyWindowInfo),
-        //     不需要 AX 无障碍权限(macOS 26+ AX C API 移除后仍可枚举);
+        //     不需要 AX 无障碍权限(即使未授权也可枚举);
         //   - Fallback (Linux):缺 wmctrl 时由 list_windows 自身返回结构化错误。
-        // 旧 preflight 在 macOS 26+ 上误把 WindowList 也 fail-closed,
+        // 旧 preflight 曾误把 WindowList 也 fail-closed(源于「macOS 26 移除 AX」的误判),
         // 但 WindowList 完全可用 —— 改由 list_windows 内部自行处理平台差异。
         // WindowInspect / WindowAction 仍保留 driver_preflight(真需要权限)。
         run_blocking(self.name(), move || {

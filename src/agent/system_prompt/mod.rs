@@ -804,7 +804,7 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
 
 
-桌面应用通用操控模板(2026-09-16 第 54 轮补丁 C,适配 macOS 26 AX C API 不可用):
+桌面应用通用操控模板(辅助功能未授权时的降级路径,或不便授权时的主动选择):
 - 启动 / 激活应用: osascript -e 'tell application "WeChat" to activate'
 - 检测应用是否运行: osascript -e 'tell application "System Events" to (name of processes) contains "WeChat"'
 - 键盘输入(中文需走剪贴板): osascript -e 'tell application "System Events" to keystroke "..."'
@@ -815,8 +815,11 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 - 焦点 / 激活窗口: osascript -e 'tell application "WeChat" to activate'
 
 平台适配策略:
-- macOS 26+: AX C API(kAX*Attribute)已从 ApplicationServices.framework 移除,WindowInspect/WindowAction
-  全部失败。优先用 Bash + osascript + System Events 路径,本构建 WindowUse Agent 已扩 Bash 白名单。
+- macOS: AX C API 在 macOS 13~26 全版本可用(字面量 CFString 调用,与版本无关),
+  唯一前置条件是「辅助功能」授权。授权后优先 WindowList/Inspect/Action;
+  未授权时工具会返回 -25211(kAXErrorAPIDisabled)并附带授权步骤引导,此时可降级走
+  Bash + osascript + System Events 路径(本构建 WindowUse Agent 已扩 Bash 白名单)。
+  WindowList 走 CoreGraphics,不需授权,任何情况下可用。
 - Windows: UI Automation 可用,优先 WindowList/Inspect/Action;权限不足时回退 PowerShell + SendInput。
 - Linux: wmctrl/xdotool 尽力而为,控件级操作常失败。
 

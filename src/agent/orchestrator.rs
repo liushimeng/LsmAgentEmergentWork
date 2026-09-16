@@ -1081,14 +1081,12 @@ impl MultiAgentOrchestrator {
         // 探测当前平台 WindowUse 工具可用性
         #[cfg(target_os = "macos")]
         {
-            // 通过权限 hint 间接判断(无法直接访问 macos.rs 的 ax_strings_loaded,
-            // 但 permission_hint 在 AX 不可用时返回 MACOS_AX_UNAVAILABLE_HINT,
-            // 含"osascript"关键词 → 用该关键词作为信号)
+            // 2026-09-16 第 55 轮修正:macOS 上 AX C API 全版本可用,「不可用」只有一种
+            // 情况 = 辅助功能未授权(kAXErrorAPIDisabled)。通过 permission_hint 是否返回
+            // Some 判定:已授权 → None(无需 fallback);未授权 → 给 Yolo 精简重试指引。
             let driver = crate::agent::window::current_driver();
-            if let Some(hint) = driver.permission_hint() {
-                if hint.contains("Bash + osascript") || hint.contains("WindowInspect/WindowAction") {
-                    return "[platform-fallback] 当前平台 macOS 26+ AX C API 不可用,WindowInspect/WindowAction 已废。建议:含 osascript/screencapture/cliclick/System Events/keystroke 的步骤 delegate_to=subagent(WindowUse Bash 已扩白名单);控件点击类保持 windowuse,WindowList 仍可用(CoreGraphics 路径)。".to_string();
-                }
+            if driver.permission_hint().is_some() {
+                return "[platform-fallback] macOS 辅助功能未授权,WindowInspect/WindowAction 暂不可用。建议:提示用户到 系统设置→隐私与安全性→辅助功能 勾选宿主终端并重开;或把含 osascript/screencapture/cliclick/System Events/keystroke 的步骤改 delegate_to=subagent(WindowUse Bash 已扩白名单);WindowList 走 CoreGraphics 始终可用。".to_string();
             }
             String::new()
         }

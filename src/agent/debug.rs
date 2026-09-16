@@ -215,23 +215,36 @@ impl DebugCollector {
             .count();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
+        let mut cache_read = 0u32;
+        let mut cache_creation = 0u32;
         let mut total_ms = 0u128;
         for e in &events {
             if let DebugEvent::LlmCall {
                 usage, duration_ms, ..
             } = e
             {
+                // Anthropic 口径:input_tokens = 未命中缓存的新 token(不计 cache_*);
+                // 真实 prompt 规模 = input + cache_read + cache_creation。
                 input_tokens = input_tokens.saturating_add(usage.input_tokens);
                 output_tokens = output_tokens.saturating_add(usage.output_tokens);
+                cache_read = cache_read.saturating_add(usage.cache_read_input_tokens);
+                cache_creation = cache_creation.saturating_add(usage.cache_creation_input_tokens);
                 total_ms = total_ms.saturating_add(*duration_ms);
             }
         }
+        // prompt 总计 = 新输入 + 缓存命中 + 缓存写入(首轮较大,后续趋近 input+cache_read)
+        let prompt_total = input_tokens
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation);
         format!(
             "| 指标 | 值 |\n|---|---|\n\
              | LLM 调用次数 | {llm_calls} |\n\
              | LLM 调用失败数 | {errors} |\n\
              | LLM 累计耗时 | {total_ms} ms |\n\
-             | 输入 token 合计 | {input_tokens} |\n\
+             | 输入 token 合计(新 token) | {input_tokens} |\n\
+             | cache_read(缓存命中) | {cache_read} |\n\
+             | cache_creation(缓存写入) | {cache_creation} |\n\
+             | prompt 总计(新+命中+写入) | {prompt_total} |\n\
              | 输出 token 合计 | {output_tokens} |\n\
              | QC 检查次数 | {qc_total} |\n\
              | QC 通过次数 | {qc_pass} |\n\

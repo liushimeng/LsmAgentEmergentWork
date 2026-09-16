@@ -600,6 +600,8 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         let mut plan = crate::agent::json_repair::try_parse_lenient(json_str)
             .map_err(AgentError::WorkflowParse)?;
         dedup_workflow_ids(&mut plan);
+        // 2026-09-16 F2:归一化 depends_on(剥离 LLM 附加的变量透传注释)
+        sanitize_depends_on(&mut plan);
         // 2026-09-16 第 54 轮补丁 B:基于步骤关键词自动纠正 delegate_to
         // (解决 osascript 步骤被错委派到 WindowUse 的问题)
         infer_delegate_to_for_plan(&mut plan);
@@ -609,6 +611,7 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         let mut plan = crate::agent::json_repair::try_parse_lenient(json_str)
             .map_err(AgentError::WorkflowParse)?;
         dedup_workflow_ids(&mut plan);
+        sanitize_depends_on(&mut plan);
         infer_delegate_to_for_plan(&mut plan);
         return Ok(plan);
     }
@@ -629,6 +632,68 @@ pub fn dedup_workflow_ids(plan: &mut WorkFlowPlan) {
             "WorkFlow 数组存在重复 id,已按 id 去重: {} → {} 条",
             before,
             plan.workflows.len()
+        );
+    }
+}
+
+/// 归一化单条 `depends_on` 条目,提取其中引用的 wf id。
+///
+/// LLM 生成的依赖声明常附带「变量透传」注释,例如:
+///   - `wf-1（需要 FIRST_CHROME_WINDOW_ID）`(Plan 文档路径 / JSON 路径均有)
+///   - `wf-2 (needs data)` / `wf-3：控件树数据`
+/// 这些注释让 `topo_layers` 的精确匹配失败,报「依赖未知 wf=wf-1（需要...）」,整份计划
+/// 直接被丢弃,上游 Yolo 反复重试空转。修复:剥离注释,只保留开头的 wf id 记号。
+/// 返回 None 表示条目为空或剥离后无有效 id(调用方应丢弃该条目)。
+fn normalize_dep_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 取第一个「中文全角括号 / 半角括号 / 中文冒号 / 空白」之前的 token 作为 id;
+    // 同时去掉首尾可能残留的引号 / 方括号。
+    let end = trimmed
+        .find(|c: char| matches!(c, '（' | '(' | '：' | ':' | ' ' | '\t'))
+        .unwrap_or(trimmed.len());
+    let token = trimmed[..end].trim_matches(|c: char| matches!(c, '"' | '\'' | '[' | ']' | ',' | '、'));
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+/// 归一化整份计划的 `depends_on` 列表:剥离注释、去空、去自环、去重。
+/// 在两个解析入口(Main-Work JSON / Plan 文档)都调用,确保 `topo_layers` 拿到干净的 id 集合。
+pub fn sanitize_depends_on(plan: &mut WorkFlowPlan) {
+    let ids: std::collections::HashSet<String> =
+        plan.workflows.iter().map(|w| w.id.clone()).collect();
+    let mut changed = false;
+    for w in plan.workflows.iter_mut() {
+        let original = w.depends_on.clone();
+        let mut cleaned: Vec<String> = original
+            .iter()
+            .filter_map(|d| normalize_dep_id(d))
+            .filter(|d| {
+                if d == &w.id {
+                    // 自环无意义,丢弃
+                    return false;
+                }
+                if !ids.contains(d) {
+                    // 注释剥离后仍不是已知 wf id → 保留但 topo_layers 会报错;
+                    // 这里仅做归一化,不在解析层吞错,让拓扑层给出精准提示
+                    return true;
+                }
+                true
+            })
+            .collect();
+        cleaned.dedup();
+        if cleaned != original {
+            changed = true;
+            w.depends_on = cleaned;
+        }
+    }
+    if changed {
+        tracing::info!(
+            "[2026-09-16 F2] depends_on 已归一化(剥离变量透传注释 / 去自环 / 去重)"
         );
     }
 }
@@ -898,6 +963,10 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
         degraded: false,
     };
     dedup_workflow_ids(&mut plan);
+    // 2026-09-16 F2/F3:Plan 文档路径同样做 depends_on 归一化 + delegate_to 自动纠正
+    // (修复「检视 Chrome 窗口」hard 任务拓扑失败 + WindowUse 错委派为 subagent 的问题)
+    sanitize_depends_on(&mut plan);
+    infer_delegate_to_for_plan(&mut plan);
     Ok(plan)
 }
 
@@ -916,6 +985,61 @@ mod tests {
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
         }
+    }
+
+    #[test]
+    fn normalize_dep_id_strips_annotations() {
+        // 全角括号注释(Plan 文档路径典型形态)
+        assert_eq!(normalize_dep_id("wf-1（需要 FIRST_CHROME_WINDOW_ID）"), Some("wf-1".to_string()));
+        // 半角括号 + 中文说明
+        assert_eq!(normalize_dep_id("wf-2 (needs data)"), Some("wf-2".to_string()));
+        // 中文冒号
+        assert_eq!(normalize_dep_id("wf-3：控件树数据"), Some("wf-3".to_string()));
+        // 干净 id
+        assert_eq!(normalize_dep_id("wf-1"), Some("wf-1".to_string()));
+        // 带引号 / 空格 / 逗号
+        assert_eq!(normalize_dep_id("  \"wf-4\" "), Some("wf-4".to_string()));
+        assert_eq!(normalize_dep_id("wf-5, wf-6"), Some("wf-5".to_string()));
+        // 纯注释 / 空串
+        assert_eq!(normalize_dep_id("（需要 X）"), None);
+        assert_eq!(normalize_dep_id("   "), None);
+        assert_eq!(normalize_dep_id(""), None);
+    }
+
+    #[test]
+    fn sanitize_depends_on_fixes_unknown_dependency() {
+        // 复现 DebugReport_20260916_102929 的失败场景:wf-2 依赖 "wf-1(需要变量)"
+        // 未归一化时 topo_layers 报「依赖未知 wf=wf-1(需要 FIRST_CHROME_WINDOW_ID)」
+        let mut plan = WorkFlowPlan {
+            workflows: vec![
+                wf("wf-1", &[]),
+                wf("wf-2", &["wf-1（需要 FIRST_CHROME_WINDOW_ID）"]),
+                wf("wf-3", &["wf-2（需要控件树数据）", "wf-1"]),
+            ],
+            summary: "test".into(),
+            degraded: false,
+        };
+        sanitize_depends_on(&mut plan);
+        assert_eq!(plan.workflows[1].depends_on, vec!["wf-1".to_string()]);
+        assert_eq!(plan.workflows[2].depends_on, vec!["wf-2".to_string(), "wf-1".to_string()]);
+        // 归一化后 topo_layers 应成功分层(串行链 3 层)
+        let order = topo_sort(&plan.workflows).unwrap();
+        let ids: Vec<&str> = order.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, vec!["wf-1", "wf-2", "wf-3"]);
+    }
+
+    #[test]
+    fn sanitize_depends_on_removes_self_loop_and_dedup() {
+        let mut plan = WorkFlowPlan {
+            workflows: vec![
+                wf("wf-1", &["wf-1", "wf-1（注释）", ""]),
+            ],
+            summary: "test".into(),
+            degraded: false,
+        };
+        sanitize_depends_on(&mut plan);
+        // 自环剥离 + 去重 + 去空 → 空列表
+        assert!(plan.workflows[0].depends_on.is_empty());
     }
 
     #[test]
