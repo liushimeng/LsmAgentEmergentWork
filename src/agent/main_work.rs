@@ -428,6 +428,31 @@ impl MainWorkRunner {
         retry_hint: &str,
         original_prompt: Option<&str>,
     ) -> Result<(WorkFlowPlan, Usage)> {
+        Self::plan_workflows_inner(self, goal, decomposition, session_id, retry_hint, original_prompt, None).await
+    }
+
+    /// 2026-09-16 第 59 轮:带 suggested_delegate 的重载,供 Orchestrator 传入 Yolo 推断结果。
+    pub async fn plan_workflows_with_delegate(
+        &self,
+        goal: &str,
+        decomposition: &[String],
+        session_id: &str,
+        retry_hint: &str,
+        original_prompt: Option<&str>,
+        suggested_delegate: Option<&str>,
+    ) -> Result<(WorkFlowPlan, Usage)> {
+        Self::plan_workflows_inner(self, goal, decomposition, session_id, retry_hint, original_prompt, suggested_delegate).await
+    }
+
+    async fn plan_workflows_inner(
+        &self,
+        goal: &str,
+        decomposition: &[String],
+        session_id: &str,
+        retry_hint: &str,
+        original_prompt: Option<&str>,
+        suggested_delegate: Option<&str>,
+    ) -> Result<(WorkFlowPlan, Usage)> {
         let mut prompt = String::new();
         prompt.push_str(&format!("【Main-Work 任务编排】\n目标: {}\n", goal));
         if let Some(orig) = original_prompt.filter(|s| !s.trim().is_empty()) {
@@ -438,6 +463,13 @@ impl MainWorkRunner {
             for (i, s) in decomposition.iter().enumerate() {
                 prompt.push_str(&format!("  {}. {}\n", i + 1, s));
             }
+        }
+        // 2026-09-16 第 59 轮:透传 Yolo 推断的 suggested_delegate,引导 Main-Work 正确委派
+        if let Some(d) = suggested_delegate {
+            prompt.push_str(&format!(
+                "\n【重要】Yolo 基于用户输入关键词推断该任务应委派给: {d}\n\
+                 编排时所有涉及桌面软件窗口操作的流程,请将 delegate_to 设为 \"windowuse\"。\n"
+            ));
         }
         if !retry_hint.is_empty() {
             prompt.push_str(&format!(
@@ -458,7 +490,9 @@ impl MainWorkRunner {
              - delegate_to 二选一:默认填 \"subagent\"(通用执行);若该流程是「读取/操作桌面软件窗口\n\
                (枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本)」类任务,必须填 \"windowuse\",\n\
                由 WindowUse Agent(LsmAgentEmergentWork-WindowUse)执行。\n\
-             - acceptance 必须是可执行验证的验收标准(命令 / 可比对的预期输出),不要写「完成目标」这类空话。",
+             - acceptance 必须是可执行验证的验收标准(命令 / 可比对的预期输出),不要写「完成目标」这类空话。\n\
+             - acceptance 中涉及文本长度验证时,使用字符计数(wc -m / ${#var})而非字节计数(length($0) / wc -c),\n\
+               避免中文 UTF-8(每字 3 字节)导致计数偏差。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -466,7 +500,7 @@ impl MainWorkRunner {
         sub_session.id = session_id.to_string();
 
         let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
-        let plan = parse_workflow_plan(&text).unwrap_or_else(|e| {
+        let mut plan = parse_workflow_plan(&text).unwrap_or_else(|e| {
             tracing::warn!("Main-Work 解析失败,使用单 WorkFlow 兜底: {}", e);
             // F2:兜底 acceptance 继承 Yolo 分解步骤(可验证清单),不再退化「完成目标」;
             // degraded=true 供 run_medium 跳过 QC-main,消除必败重试循环。
@@ -475,6 +509,11 @@ impl MainWorkRunner {
             } else {
                 decomposition.to_vec()
             };
+            // 2026-09-16 第 59 轮:兜底 WorkFlow 也继承 suggested_delegate
+            let fallback_delegate = suggested_delegate
+                .filter(|&d| d == "windowuse")
+                .map(|_| AgentRole::WindowUse)
+                .unwrap_or(AgentRole::SubAgent);
             WorkFlowPlan {
                 workflows: vec![WorkFlowSpec {
                     id: "wf-1".into(),
@@ -484,12 +523,30 @@ impl MainWorkRunner {
                     loops: vec![],
                     depends_on: vec![],
                     acceptance: inherited,
-                    delegate_to: AgentRole::SubAgent,
+                    delegate_to: fallback_delegate,
                 }],
                 summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
                 degraded: true,
             }
         });
+
+        // 2026-09-16 第 59 轮:如果 Yolo 明确建议 windowuse 且 plan 未指定,强制覆盖
+        if let Some("windowuse") = suggested_delegate {
+            for wf in plan.workflows.iter_mut() {
+                if wf.delegate_to == AgentRole::SubAgent {
+                    // 仅当 WorkFlow 含窗口操作类步骤时才覆盖(避免误伤纯代码流程)
+                    let text = gather_spec_text(wf);
+                    let has_window_ops = text_contains_any_ci(&text, &[
+                        "微信", "wechat", "qq", "窗口", "window", "点击", "click",
+                        "打开", "open", "发送", "send", "应用", "app", "软件",
+                    ]);
+                    if has_window_ops {
+                        wf.delegate_to = AgentRole::WindowUse;
+                        tracing::info!(wf_id = %wf.id, "suggested_delegate=windowuse,已覆盖 WorkFlow delegate_to");
+                    }
+                }
+            }
+        }
 
         let _ = memory::record_entry(
             &self.db,

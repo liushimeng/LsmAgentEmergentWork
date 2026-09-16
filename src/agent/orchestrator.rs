@@ -845,14 +845,17 @@ impl MultiAgentOrchestrator {
         // 与 SubAgent #P-A 修复对齐,防止拆解只基于 Yolo 抽象摘要脱离用户意图。
         let original_prompt = Self::original_user_prompt(session);
         let mainwork_started = std::time::Instant::now();
+        // 2026-09-16 第 59 轮:透传 Yolo 推断的 suggested_delegate,引导 Main-Work 正确委派窗口操控类任务
+        let suggested_delegate = c.suggested_delegate.as_deref();
         let (plan, mainwork_usage) = self
             .main_work
-            .plan_workflows(
+            .plan_workflows_with_delegate(
                 &c.goal_summary,
                 &c.decomposition_plan,
                 session.id(),
                 retry_hint,
                 original_prompt.as_deref(),
+                suggested_delegate,
             )
             .await
             .map_err(|e| {
@@ -1960,6 +1963,7 @@ mod tests {
                 direct_answer: None,
                 user_suggestion_if_fail: String::new(),
                 yolo_degraded: false,
+                suggested_delegate: None,
             },
             plan_doc: None,
             workflows: vec![WorkflowResult {

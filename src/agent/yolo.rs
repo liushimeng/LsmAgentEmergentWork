@@ -98,6 +98,12 @@ pub struct TaskClassification {
     /// 旧 JSON 缺省 = false,新写入字段由 yolo runner 填充。
     #[serde(default)]
     pub yolo_degraded: bool,
+    /// 2026-09-16 第 59 轮:基于用户原始输入关键词推断的 delegate_to 建议。
+    /// Main-Work 拆解 WorkFlow 时优先采用此值设置 delegate_to,避免窗口操控类任务
+    /// 被错派给 SubAgent(导致 osascript 等命令无法执行)。
+    /// 取值:"windowuse" / "subagent" / None(不强制,由 Main-Work 自行判断)。
+    #[serde(default)]
+    pub suggested_delegate: Option<String>,
 }
 
 impl TaskClassification {
@@ -163,6 +169,9 @@ impl YoloRunner {
     ///
     /// `session_id` 用于 X-Session-Id 传播(2026-09-09 第 08 轮):与其它 6 个
     /// runner 对齐,让 Yolo 的请求在抓包中可关联到所属任务(此前为随机新 ID)。
+    ///
+    /// 2026-09-16 第 59 轮:从上下文中提取用户原始 prompt,推断 suggested_delegate
+    /// 并写入 classification,供 Main-Work 拆解 WorkFlow 时优先采用。
     pub async fn classify(
         &self,
         session_id: &str,
@@ -174,11 +183,19 @@ impl YoloRunner {
             yolo_session.context_mut().push(msg.clone());
         }
         let (text, usage, _trace) = self.yolo_agent.run_session(&mut yolo_session).await?;
-        let classification = parse_classification(&text).unwrap_or_else(|e| {
+        let mut classification = parse_classification(&text).unwrap_or_else(|e| {
             YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("Yolo 分类解析失败,降级为 simple: {}", e);
             degraded_classification(context)
         });
+        // 2026-09-16 第 59 轮:从上下文提取用户原始 prompt 推断 suggested_delegate
+        let user_prompt = extract_user_prompt(context);
+        if !user_prompt.is_empty() {
+            classification.suggested_delegate = infer_suggested_delegate(&user_prompt);
+            if let Some(ref d) = classification.suggested_delegate {
+                tracing::info!(suggested_delegate = %d, "Yolo 推断 delegate_to 建议");
+            }
+        }
         Ok((classification, text, usage))
     }
 
@@ -256,6 +273,13 @@ fn degraded_goal_from_context(context: &[ChatMessage]) -> String {
 
 /// 统一的降级分类构造(2026-09-13 第 50 轮):goal_summary 保留用户原始任务。
 fn degraded_classification(context: &[ChatMessage]) -> TaskClassification {
+    // 2026-09-16 第 59 轮:降级时也尝试推断 suggested_delegate
+    let user_prompt = extract_user_prompt(context);
+    let suggested_delegate = if user_prompt.is_empty() {
+        None
+    } else {
+        infer_suggested_delegate(&user_prompt)
+    };
     TaskClassification {
         task_level: TaskLevel::Simple,
         purpose: "(Yolo 解析失败,已降级)".to_string(),
@@ -266,6 +290,62 @@ fn degraded_classification(context: &[ChatMessage]) -> TaskClassification {
         direct_answer: None,
         user_suggestion_if_fail: String::new(),
         yolo_degraded: true, // 关联报告: 2026-09-09_04 D-002
+        suggested_delegate,
+    }
+}
+
+/// 从上下文消息中提取用户原始 prompt(最近一条 user 消息的文本内容)。
+fn extract_user_prompt(context: &[ChatMessage]) -> String {
+    context
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// 2026-09-16 第 59 轮:基于用户原始 prompt 关键词推断 delegate_to。
+///
+/// 解决「打开微信发消息」类任务被 Main-Work 错派给 SubAgent 的问题。
+/// 窗口操控类关键词命中 → 返回 "windowuse";代码/文件操作类 → "subagent";
+/// 无法判断 → None(让 Main-Work 自行判断)。
+///
+/// 关键词表覆盖:
+/// - 窗口操控:打开/启动/关闭/软件/应用/窗口/微信/WeChat/QQ/钉钉/Slack/
+///   点击/发送消息/联系人/聊天/对话框/菜单/按钮/Tab/控件
+/// - 代码/文件:编写/修改/创建文件/代码/rust/python/git/cargo/test
+const WINDOW_USE_KEYWORDS: &[&str] = &[
+    "打开", "启动", "关闭软件", "软件", "应用", "窗口", "微信", "wechat",
+    "qq", "钉钉", "dingtalk", "slack", "telegram", "whatsapp", "点击按钮",
+    "发送消息", "联系人", "聊天", "对话框", "菜单", "控件", "tab",
+    "open app", "launch", "window", "click", "send message", "contact",
+    "聊天窗口", "输入框", "登录", "切换", "最小化", "最大化",
+];
+
+const SUBAGENT_KEYWORDS: &[&str] = &[
+    "编写代码", "修改代码", "创建文件", "代码", "rust", "python",
+    "git", "cargo", "test", "编写", "修改", "创建", "重构", "实现",
+    "函数", "类", "模块", "接口", "算法", "write code", "programming",
+];
+
+pub fn infer_suggested_delegate(user_prompt: &str) -> Option<String> {
+    let lower = user_prompt.to_lowercase();
+    let window_hit = WINDOW_USE_KEYWORDS.iter().any(|k| lower.contains(k));
+    let code_hit = SUBAGENT_KEYWORDS.iter().any(|k| lower.contains(k));
+    match (window_hit, code_hit) {
+        (true, false) => Some("windowuse".to_string()),
+        (false, true) => Some("subagent".to_string()),
+        // 都命中 / 都不命中 → 不强制
+        _ => None,
     }
 }
 
@@ -524,6 +604,7 @@ mod tests {
             direct_answer: None,
             user_suggestion_if_fail: String::new(),
             yolo_degraded: false, // 关联报告: 2026-09-09_04 D-002(新字段)
+            suggested_delegate: None,
         };
         let prompt = build_work_prompt(&c);
         assert!(prompt.contains("验证"));
@@ -557,6 +638,7 @@ mod tests {
             direct_answer: None,
             user_suggestion_if_fail: String::new(),
             yolo_degraded: true,
+            suggested_delegate: None,
         };
         let prompt = build_work_prompt(&c);
         assert!(
@@ -586,12 +668,88 @@ mod tests {
             direct_answer: None,
             user_suggestion_if_fail: String::new(),
             yolo_degraded: false,
+            suggested_delegate: None,
         };
         let prompt = build_work_prompt(&c);
         assert!(
             !prompt.contains("Yolo 分类解析失败"),
             "正常模式不应含降级警告,实际: {prompt}"
         );
+    }
+
+    // ========== 2026-09-16 第 59 轮:suggested_delegate 推断测试 ==========
+
+    #[test]
+    fn infer_suggested_delegate_window_use_keywords() {
+        // 窗口操控类任务 → windowuse
+        let cases = [
+            "帮我打开微信软件,找到赵玲玲,给她发一个消息",
+            "打开 QQ 给张三发一条消息",
+            "启动 Slack 切换到工作区",
+            "open WeChat and send a message",
+            "点击按钮关闭窗口",
+        ];
+        for prompt in cases {
+            assert_eq!(
+                infer_suggested_delegate(prompt),
+                Some("windowuse".to_string()),
+                "窗口操控类应推断 windowuse: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_suggested_delegate_subagent_keywords() {
+        // 代码/文件操作类任务 → subagent
+        let cases = [
+            "编写一个 Rust 函数实现排序算法",
+            "修改 main.rs 中的 bug",
+            "创建一个新的 Python 脚本",
+            "write code for a web server",
+        ];
+        for prompt in cases {
+            assert_eq!(
+                infer_suggested_delegate(prompt),
+                Some("subagent".to_string()),
+                "代码类应推断 subagent: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_suggested_delegate_ambiguous_returns_none() {
+        // 无法判断 / 两边都命中 → None
+        let cases = [
+            "帮我处理一下这个任务",  // 无明确关键词
+            "",                       // 空串
+            "帮我打开文件管理器查看代码", // 两边都命中
+        ];
+        for prompt in cases {
+            assert_eq!(
+                infer_suggested_delegate(prompt),
+                None,
+                "模糊/空串应返回 None: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_user_prompt_extracts_last_user_message() {
+        let context = vec![
+            ChatMessage::assistant(vec![ContentBlock::text("上一轮回复")]),
+            ChatMessage::user("  Write 备份脚本\n并跑一次验证  "),
+            ChatMessage::assistant(vec![ContentBlock::text("中间回复")]),
+            ChatMessage::user("最新的用户输入"),
+        ];
+        assert_eq!(extract_user_prompt(&context), "最新的用户输入");
+    }
+
+    #[test]
+    fn extract_user_prompt_empty_without_user() {
+        let context = vec![ChatMessage::assistant(vec![ContentBlock::text(
+            "只有 assistant 消息",
+        )])];
+        assert_eq!(extract_user_prompt(&context), "");
     }
 
     #[test]

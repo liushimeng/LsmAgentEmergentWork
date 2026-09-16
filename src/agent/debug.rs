@@ -959,6 +959,7 @@ mod tests {
             direct_answer: Some("答".into()),
             user_suggestion_if_fail: String::new(),
             yolo_degraded: false, // 关联报告: 2026-09-09_04 D-002
+            suggested_delegate: None,
         });
         c.record_quality(&QualityReport::pass(AgentRole::SubAgent));
         c.record_task_end("executed", Usage::default());

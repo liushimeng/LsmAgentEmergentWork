@@ -129,6 +129,9 @@ impl TuiSession {
             // 计算真实等待秒数,30s/60s 慢提示在「首字节未到」阶段同样生效
             // (2026-09-10 第 28 轮 B09/B10 修复:此前固定 (0s),慢提示永不触发)。
             let spinner_started_at = std::time::Instant::now();
+            // 2026-09-16 第 59 轮:阶段计时 —— 每条 stage 消息的到达时间,
+            // 用于计算与上一条 stage 的时间差(Δ)。
+            let mut last_stage_at: Option<std::time::Instant> = None;
             let mut spinner_idx: usize = 0;
             // Braille Pattern 字符集(Braille spinner,宽 1,绝大多数 Unicode 终端可见)
             const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -186,10 +189,33 @@ impl TuiSession {
                                 }
                                 // 先冲刷积压的普通阶段,保持时序
                                 while let Some(pending) = queue.pop_front() {
-                                    println!("  [stage] {pending}");
+                                    // 2026-09-16 第 59 轮:积压阶段也带时间
+                                    let timing = if let Some(last) = last_stage_at {
+                                        let delta_ms = last.elapsed().as_millis();
+                                        if delta_ms < 1000 {
+                                            format!(" +{delta_ms}ms")
+                                        } else {
+                                            format!(" +{:.1}s", delta_ms as f64 / 1000.0)
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    println!("  [stage] {pending}{timing}");
+                                    last_stage_at = Some(std::time::Instant::now());
                                 }
-                                println!("  [stage] {line}");
+                                let timing = if let Some(last) = last_stage_at {
+                                    let delta_ms = last.elapsed().as_millis();
+                                    if delta_ms < 1000 {
+                                        format!(" +{delta_ms}ms")
+                                    } else {
+                                        format!(" +{:.1}s", delta_ms as f64 / 1000.0)
+                                    }
+                                } else {
+                                    String::new()
+                                };
+                                println!("  [stage] {line}{timing}");
                                 let _ = std::io::stdout().flush();
+                                last_stage_at = Some(std::time::Instant::now());
                                 idle.as_mut().reset(tokio::time::Instant::now() + tick);
                                 continue;
                             }
@@ -207,7 +233,18 @@ impl TuiSession {
                                         clear_waiting_line(stdout_is_tty);
                                         waiting_line_on_screen = false;
                                     }
-                                    println!("  [stage] {pending}");
+                                    // 2026-09-16 第 59 轮:任务结束时的 [laew] 也带时间
+                                    let timing = if let Some(last) = last_stage_at {
+                                        let delta_ms = last.elapsed().as_millis();
+                                        if delta_ms < 1000 {
+                                            format!(" +{delta_ms}ms")
+                                        } else {
+                                            format!(" +{:.1}s", delta_ms as f64 / 1000.0)
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    println!("  [stage] {pending}{timing}");
                                     let _ = std::io::stdout().flush();
                                 }
                             }
@@ -226,8 +263,20 @@ impl TuiSession {
                                 waiting_line_on_screen = false;
                                 initial_spinner_active = false;
                             }
-                            println!("  [stage] {line}");
+                            // 2026-09-16 第 59 轮:计算与上一条 stage 的时间差
+                            let timing = if let Some(last) = last_stage_at {
+                                let delta_ms = last.elapsed().as_millis();
+                                if delta_ms < 1000 {
+                                    format!(" +{delta_ms}ms")
+                                } else {
+                                    format!(" +{:.1}s", delta_ms as f64 / 1000.0)
+                                }
+                            } else {
+                                String::new()
+                            };
+                            println!("  [stage] {line}{timing}");
                             let _ = std::io::stdout().flush();
+                            last_stage_at = Some(std::time::Instant::now());
                             current_stage = Some((line, std::time::Instant::now()));
                         }
                         // 阶段内 waiting 心跳:每 1s 重写一行(覆盖上一帧)。

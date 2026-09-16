@@ -75,13 +75,20 @@ pub fn format_task_result(
     let yolo_elapsed_str = yolo_elapsed_ms
         .map(|ms| format!(" (Yolo 分类 {:.2}s)", ms as f64 / 1000.0))
         .unwrap_or_default();
+    // 2026-09-16 第 59 轮:显示 Yolo 推断的 suggested_delegate(若有)
+    let delegate_str = c
+        .suggested_delegate
+        .as_ref()
+        .map(|d| format!(" suggested_delegate={}", d))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "  [yolo] purpose={} goal={} intent={} plan_steps={}{}\n",
+        "  [yolo] purpose={} goal={} intent={} plan_steps={}{}{}\n",
         if styled { sv(&purpose_short) } else { purpose_short },
         if styled { sv(&goal_short) } else { goal_short },
         if styled { sv(&c.intent) } else { c.intent.clone() },
         c.decomposition_plan.len(),
         yolo_elapsed_str,
+        delegate_str,
     ));
 
     // 2026-09-16 第 57 轮:Main-Work / Plan 拆解耗时(供 TUI 时间线展示)。
@@ -367,13 +374,20 @@ pub fn format_failed_detail(
     let yolo_elapsed_str = yolo_elapsed_ms
         .map(|ms| format!(" (Yolo 分类 {:.2}s)", ms as f64 / 1000.0))
         .unwrap_or_default();
+    // 2026-09-16 第 59 轮:显示 Yolo 推断的 suggested_delegate(若有)
+    let delegate_str = c
+        .suggested_delegate
+        .as_ref()
+        .map(|d| format!(" suggested_delegate={}", d))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "  [yolo] purpose={} goal={} intent={} plan_steps={}{}\n",
+        "  [yolo] purpose={} goal={} intent={} plan_steps={}{}{}\n",
         sv(&purpose_short),
         sv(&goal_short),
         sv(&c.intent),
         c.decomposition_plan.len(),
         yolo_elapsed_str,
+        delegate_str,
     ));
     // 阶段耗时(参照 format_task_result L88-110)
     for s in &result.stage_durations {
@@ -1013,6 +1027,7 @@ mod format_task_result_for_context_tests {
                 direct_answer: None,
                 user_suggestion_if_fail: String::new(),
                 yolo_degraded: false,
+                suggested_delegate: None,
             },
             plan_doc: None,
             workflows,
