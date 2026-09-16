@@ -180,9 +180,30 @@ impl WindowDriver for MacosAxuiDriver {
                     self.platform_name(),
                     format!(
                         "send_keys({keys:?}) 暂未实现(axuielement 无 typed send_keys API);\
-                         建议改走 set_text 写入文本,或用 pbcopy/osascript"
+                         建议改走 set_text 写入文本,或用 pbcopy/osascript;\
+                         或使用默认 legacy 驱动(CGEvent 按键注入,第 66 轮起支持)"
                     ),
                 ));
+            }
+            // 2026-09-16 第 66 轮:axuielement feature 路径暂未实现 CGEvent 注入,
+            // 返回结构化引导(默认构建走 legacy 驱动,已支持 scroll/send_keys)。
+            ControlAction::Scroll { lines } => {
+                return Err(platform_err(
+                    self.platform_name(),
+                    format!(
+                        "scroll(lines={lines}) 在 macos-axui 路径暂未实现;\
+                         默认 legacy 驱动已支持,请移除 --features macos-axui 构建;\
+                         或降级 Bash 白名单 osascript/cliclick"
+                    ),
+                ));
+            }
+            ControlAction::ScrollToVisible => {
+                element
+                    .perform_action("AXScrollToVisible")
+                    .map_err(|e| {
+                        platform_err(self.platform_name(), format!("scroll_to_visible 失败:{e}"))
+                    })?;
+                Ok("scrolled_to_visible".into())
             }
         }
     }

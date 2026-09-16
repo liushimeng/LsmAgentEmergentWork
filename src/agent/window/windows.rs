@@ -19,7 +19,8 @@ use windows::Win32::System::ProcessStatus::GetModuleBaseNameW;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-    IUIAutomationValuePattern, UIA_InvokePatternId, UIA_ValuePatternId,
+    IUIAutomationScrollItemPattern, IUIAutomationValuePattern, UIA_InvokePatternId,
+    UIA_ScrollItemPatternId, UIA_ValuePatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
@@ -431,6 +432,25 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
             "windows",
             "Win32 降级路径不支持 send_keys(UIA 可用时请走 UIA,或改用 set_text/click)",
         )),
+        // 2026-09-16 第 66 轮:WM_MOUSEWHEEL 滚动(目标控件 HWND 优先,未命中发窗口根)。
+        ControlAction::Scroll { lines } => {
+            const WM_MOUSEWHEEL: u32 = 0x020A;
+            const WHEEL_DELTA: i32 = 120;
+            let delta = lines.saturating_mul(WHEEL_DELTA);
+            // wParam 高 16 位 = 带符号 delta(正=向上/远离用户)
+            let wparam = WPARAM(((delta as u16) as usize) << 16);
+            SendMessageW(hwnd, WM_MOUSEWHEEL, wparam, LPARAM(0));
+            Ok(format!(
+                "已向 HWND {:?} 发送 WM_MOUSEWHEEL({} 行,{})",
+                hwnd.0,
+                lines.abs(),
+                if *lines > 0 { "向上" } else { "向下" }
+            ))
+        }
+        ControlAction::ScrollToVisible => Err(platform_err(
+            "windows",
+            "Win32 降级路径不支持 scroll_to_visible(UIA 可用时走 ScrollItemPattern;或改用 scroll)",
+        )),
     }
 }
 
@@ -578,6 +598,31 @@ impl WindowDriver for WindowsDriver {
                                 "windows",
                                 format!("send_keys({keys}) 暂不支持:请先 focus 目标控件后用 set_text/click 组合完成"),
                             ))
+                        }
+                        // 2026-09-16 第 66 轮:scroll_to_visible 优先 UIA ScrollItemPattern,
+                        // 不支持时降级 WM_MOUSEWHEEL 小步滚动。
+                        ControlAction::ScrollToVisible => {
+                            match el.GetCurrentPatternAs::<IUIAutomationScrollItemPattern>(
+                                UIA_ScrollItemPatternId,
+                            ) {
+                                Ok(p) => {
+                                    p.ScrollIntoView().map_err(|e| {
+                                        platform_err("windows", format!("ScrollIntoView 失败: {e}"))
+                                    })?;
+                                    Ok(format!("已把 {window_id}{path} 滚动到可见区域(ScrollItemPattern)"))
+                                }
+                                Err(_) => {
+                                    drop(el);
+                                    win32_act(hwnd, path, &ControlAction::Scroll { lines: -3 })
+                                }
+                            }
+                        }
+                        // 2026-09-16 第 66 轮:UIA 无通用滚轮 Pattern 直达路径,
+                        // 滚动统一降级到 WM_MOUSEWHEEL(目标控件 HWND)。
+                        ControlAction::Scroll { lines } => {
+                            let lines = *lines;
+                            drop(el);
+                            win32_act(hwnd, path, &ControlAction::Scroll { lines })
                         }
                     }
                 }

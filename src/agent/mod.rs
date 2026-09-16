@@ -28,6 +28,7 @@ pub mod overflow;
 pub mod partial_json;
 pub mod permissions;
 pub mod plan;
+pub mod plan_validate;
 pub mod profile;
 pub mod project_context;
 pub mod quality;

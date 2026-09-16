@@ -140,7 +140,15 @@ impl WindowUseRunner {
                 - 设置 = Settings = Preferences\n\
              9. **【禁止 Read PNG】**:WindowScreenshot 只落盘 PNG 文件,当前 WindowUse 工具集**不包含 OCR 工具**;\
                 **不要**用 Read 工具读取 PNG(Read 仅支持 UTF-8 文本,二进制会失败);\
-                如需视觉识别,切换到 WindowInspect(控件树路线)或终止任务告知用户。",
+                如需视觉识别,切换到 WindowInspect(控件树路线)或终止任务告知用户。\n\
+             10. **【列表定位优先搜索】**(2026-09-16 第 66 轮):在列表中找指定条目(联系人/会话/文件)时,\
+                优先找搜索框 set_text 目标名直接定位;无搜索框再用 WindowAction(action=scroll, text=\"down:3\")\
+                逐屏滚动遍历,**每滚一屏后必须重新 WindowInspect**(滚动后旧 path 全部失效);\
+                目标控件已在树中但屏外时用 scroll_to_visible 精准定位;\n\
+             11. **【特殊字符名称匹配】**:目标名含 Unicode 上标(如 赵玲玲ᴬᴵᴬ)时,filter 直接写 ASCII\
+                归一形(赵玲玲AIA)即可,工具自动等价匹配;匹配不到再试原名与片段;\n\
+             12. **【发送消息范式】**:定位输入框 → set_text 写入消息 → send_keys(\"enter\") 发送\
+                (或 click「发送」按钮)→ WindowInspect 复查消息出现在对话区后再宣告完成。",
         );
 
         let mut sub_session = crate::session::Session::new();

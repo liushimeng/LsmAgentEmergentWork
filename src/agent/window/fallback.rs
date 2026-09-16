@@ -137,6 +137,44 @@ impl WindowDriver for FallbackDriver {
                 ),
             ));
         }
+        // 2026-09-16 第 66 轮:xdotool 滚轮滚动(click 4=向上 / click 5=向下,
+        // 先激活窗口再逐行投递;scroll_to_visible 无通用实现,回退小步 scroll)。
+        let scroll_lines = match &action {
+            ControlAction::Scroll { lines } => Some(*lines),
+            ControlAction::ScrollToVisible => Some(-3),
+            _ => None,
+        };
+        if let Some(lines) = scroll_lines {
+            if !self.has_xdotool {
+                return Err(platform_err(
+                    self.platform_name(),
+                    "scroll 需要 xdotool(可 sudo apt install xdotool)",
+                ));
+            }
+            let _ = Command::new("xdotool")
+                .args(["windowactivate", window_id])
+                .status();
+            let button = if lines > 0 { "4" } else { "5" };
+            for _ in 0..lines.abs() {
+                let status = Command::new("xdotool")
+                    .args(["click", button])
+                    .status()
+                    .map_err(|e| {
+                        platform_err(self.platform_name(), format!("执行 xdotool 失败: {e}"))
+                    })?;
+                if !status.success() {
+                    return Err(platform_err(
+                        self.platform_name(),
+                        format!("xdotool click {button} 退出码 {:?}", status.code()),
+                    ));
+                }
+            }
+            return Ok(format!(
+                "已在窗口 {window_id} 滚动 {} 行({})",
+                lines.abs(),
+                if lines > 0 { "向上" } else { "向下" }
+            ));
+        }
         Err(platform_err(self.platform_name(), UNSUPPORTED_MSG))
     }
 

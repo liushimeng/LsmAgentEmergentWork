@@ -91,9 +91,36 @@ extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
+    // 2026-09-16 第 66 轮:CGEvent 输入事件注入(滚轮滚动 / 按键 / 光标移动)。
+    // 注意:CGEventCreateScrollWheelEvent 是 C 可变参数函数(wheel1..N),
+    // 必须按 `...` 声明以满足 Apple aarch64 可变参数 ABI(变参走栈,不走寄存器)。
+    fn CGEventCreateScrollWheelEvent(
+        source: *const std::ffi::c_void,
+        units: u32,
+        wheel_count: u32,
+        ...
+    ) -> CFTypeRef;
+    fn CGEventCreateMouseEvent(
+        source: *const std::ffi::c_void,
+        mouse_type: u32,
+        position: CGPoint,
+        button: u32,
+    ) -> CFTypeRef;
+    fn CGEventCreateKeyboardEvent(
+        source: *const std::ffi::c_void,
+        keycode: u16,
+        keydown: bool,
+    ) -> CFTypeRef;
+    fn CGEventPost(tap: u32, event: CFTypeRef);
 }
 
 const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+/// kCGScrollEventUnitLine:滚轮事件按「行」计量。
+const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 0;
+/// kCGHIDEventTap:事件注入到 HID 层(等价真实硬件输入,目标为光标下/焦点应用)。
+const K_CG_HID_EVENT_TAP: u32 = 0;
+/// kCGEventMouseMoved。
+const K_CG_EVENT_MOUSE_MOVED: u32 = 5;
 
 // ===================== AX 字符串常量(字面量缓存,macOS 全版本通用) =====================
 //
@@ -133,6 +160,7 @@ struct AxStrings {
     windows: usize,
     focused: usize,
     press_action: usize,
+    scroll_to_visible_action: usize,
     trusted_check_prompt: usize,
     manual_accessibility: usize,
 }
@@ -157,6 +185,7 @@ fn ax_strings() -> &'static AxStrings {
             windows: cfstr_literal("AXWindows"),
             focused: cfstr_literal("AXFocused"),
             press_action: cfstr_literal("AXPress"),
+            scroll_to_visible_action: cfstr_literal("AXScrollToVisible"),
             trusted_check_prompt: cfstr_literal("AXTrustedCheckOptionPrompt"),
             manual_accessibility: cfstr_literal("AXManualAccessibility"),
         }
@@ -221,6 +250,10 @@ fn kAXPressAction() -> CFStringRef {
     ax_strings().press_action as CFStringRef
 }
 #[inline]
+fn kAXScrollToVisibleAction() -> CFStringRef {
+    ax_strings().scroll_to_visible_action as CFStringRef
+}
+#[inline]
 fn kAXTrustedCheckOptionPrompt() -> CFStringRef {
     ax_strings().trusted_check_prompt as CFStringRef
 }
@@ -277,6 +310,85 @@ unsafe fn cfstr(s: CFStringRef) -> String {
 unsafe fn cfstring_new(s: &str) -> CFStringRef {
     let c = std::ffi::CString::new(s).unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
     CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), kCFStringEncodingUTF8)
+}
+
+// ===================== CGEvent 输入注入(2026-09-16 第 66 轮) =====================
+//
+// 背景:微信「遍历通信录列表找联系人 → 打开会话 → Enter 发送」链路需要两个新原语:
+// - 滚轮滚动(控件树只能看到当前屏,列表其余条目必须滚动后才进 AX 树);
+// - 按键注入(Enter 发送消息 / PageDown 翻页),此前 macOS 后端 SendKeys 直接报错。
+// 实现:CGEventPost 到 HID 层,等价真实硬件输入;需要辅助功能授权(act() 入口已 gate)。
+
+/// 命名键 → macOS 虚拟键码(kVK_*,来源 HIToolbox/Events.h)。
+fn keycode_for_name(name: &str) -> Option<u16> {
+    Some(match name.trim().to_lowercase().as_str() {
+        "enter" | "return" | "回车" => 36,
+        "tab" => 48,
+        "esc" | "escape" => 53,
+        "space" | "空格" => 49,
+        "delete" | "backspace" | "退格" => 51,
+        "forwarddelete" | "del" => 117,
+        "up" | "arrowup" => 126,
+        "down" | "arrowdown" => 125,
+        "left" | "arrowleft" => 123,
+        "right" | "arrowright" => 124,
+        "pageup" => 116,
+        "pagedown" => 121,
+        "home" => 115,
+        "end" => 119,
+        _ => return None,
+    })
+}
+
+/// 把光标移到屏幕坐标(x, y)(CGEvent mouse-moved,无点击)。
+unsafe fn cg_move_cursor(x: f64, y: f64) {
+    let ev = CGEventCreateMouseEvent(
+        std::ptr::null(),
+        K_CG_EVENT_MOUSE_MOVED,
+        CGPoint { x, y },
+        0,
+    );
+    if !ev.is_null() {
+        CGEventPost(K_CG_HID_EVENT_TAP, ev);
+        CFRelease(ev);
+    }
+}
+
+/// 在光标当前位置注入滚轮事件:lines>0 向上,lines<0 向下(单位:行)。
+/// 分片投递(每片 ≤3 行 + 30ms 间隔),避免一次性大 delta 被应用按「甩尾」处理跳屏。
+unsafe fn cg_scroll_lines(lines: i32) {
+    let mut remaining = lines;
+    while remaining != 0 {
+        let step = remaining.clamp(-3, 3);
+        let ev = CGEventCreateScrollWheelEvent(
+            std::ptr::null(),
+            K_CG_SCROLL_EVENT_UNIT_LINE,
+            1,
+            step,
+        );
+        if ev.is_null() {
+            break;
+        }
+        CGEventPost(K_CG_HID_EVENT_TAP, ev);
+        CFRelease(ev);
+        remaining -= step;
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+}
+
+/// 注入一次按键(keydown + keyup,间隔 20ms)。
+unsafe fn cg_send_key(keycode: u16) {
+    for keydown in [true, false] {
+        let ev = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, keydown);
+        if ev.is_null() {
+            return;
+        }
+        CGEventPost(K_CG_HID_EVENT_TAP, ev);
+        CFRelease(ev);
+        if keydown {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 }
 
 /// CFNumberRef → i64。
@@ -628,6 +740,20 @@ impl MacOsDriver {
         {
             v.push("set_text".into());
         }
+        // 2026-09-16 第 66 轮:滚动容器/列表类角色补 scroll / scroll_to_visible 提示
+        if r.contains("scrollarea")
+            || r.contains("scroll")
+            || r.contains("table")
+            || r.contains("outline")
+            || r.contains("list")
+            || r.contains("row")
+            || r.contains("browser")
+        {
+            v.push("scroll".into());
+            v.push("scroll_to_visible".into());
+        }
+        // 任何可聚焦控件都可能接受按键(Enter 发送 / 方向键导航)
+        v.push("send_keys".into());
         v
     }
 
@@ -921,10 +1047,47 @@ impl WindowDriver for MacOsDriver {
                     let t = ax_get_string(el, kAXTitleAttribute());
                     Ok(if v.is_empty() { t } else { v })
                 }
-                ControlAction::SendKeys(_) => Err(platform_err(
-                    "macos",
-                    "macOS 后端暂不支持 send_keys(AX 无通用按键注入;请改用 set_text 写入,或 click 目标按钮)",
-                )),
+                // 2026-09-16 第 66 轮:CGEvent 按键注入(此前直接报「暂不支持」,
+                // 微信 Enter 发送 / PageDown 翻页链路无原语)。
+                ControlAction::SendKeys(keys) => {
+                    let key = keys.trim();
+                    match keycode_for_name(key) {
+                        Some(kc) => {
+                            cg_send_key(kc);
+                            Ok(format!("已向 {window_id}{path} 注入按键 {key}(keycode={kc})"))
+                        }
+                        None => Err(platform_err(
+                            "macos",
+                            format!(
+                                "未知按键: {key};支持 enter/tab/esc/space/delete/up/down/left/right/pageup/pagedown/home/end;\
+                                 输入文本请用 set_text,或 Bash 白名单 osascript keystroke"
+                            ),
+                        )),
+                    }
+                }
+                // 2026-09-16 第 66 轮:滚轮滚动。CGEvent 滚轮事件投递到光标下的窗口,
+                // 因此先把光标移到目标控件中心再滚动。
+                ControlAction::Scroll { lines } => {
+                    let rect = Self::element_rect(el);
+                    let cx = rect.x as f64 + rect.width as f64 / 2.0;
+                    let cy = rect.y as f64 + rect.height as f64 / 2.0;
+                    cg_move_cursor(cx, cy);
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    cg_scroll_lines(*lines);
+                    Ok(format!(
+                        "已在 {window_id}{path} 中心({cx:.0},{cy:.0})滚动 {} 行({})",
+                        lines.abs(),
+                        if *lines > 0 { "向上" } else { "向下" }
+                    ))
+                }
+                ControlAction::ScrollToVisible => {
+                    let err = AXUIElementPerformAction(el, kAXScrollToVisibleAction());
+                    if err == K_AX_ERROR_SUCCESS {
+                        Ok(format!("已把 {window_id}{path} 滚动到可见区域(AXScrollToVisible)"))
+                    } else {
+                        Err(platform_err("macos", ax_error_text(err)))
+                    }
+                }
             };
             CFRelease(el);
             result

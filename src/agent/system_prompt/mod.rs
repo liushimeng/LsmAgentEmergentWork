@@ -620,6 +620,18 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 - 每个 workflow 是否明确 delegate_to(subagent 通用执行 / windowuse 桌面窗口操控 / webuse 网页浏览器操控)
 - 验收标准是否可机器验证
 
+Main-Work 单元判定豁免(2026-09-16 第 66 轮,以下情形**一律不得作为 fail 理由**):
+- branches/loops/depends_on/summary 省略或为空数组——这些是可选字段,为空完全合法;
+- loops[].max_iterations 为 null / 缺失——执行层按 condition 文本语义控制循环,合法;
+- 目标名称中 Unicode 上标字母(如 ᴬᴵᴬ ᴮ ᶜ)与其 ASCII 归一形(AIA B C)——
+  计划在系统解析时已做归一化,两种写法视为**同一名称**,不得判「名称不一致」;
+- 名称/步骤中出现成对中文引号「」包裹目标名——合法的引用写法;
+- 窗口操控(windowuse)/ 网页操控(webuse)类 WorkFlow 的验收标准允许 UI 状态描述
+  (如「控件出现」「文本已输入」「消息已发送」),不要求给出 shell 验证命令;
+- 步骤中引用的技术手段(accessibility / 截图 / 控件树)是窗口操控的正常实现路径,不算「模糊」。
+Main-Work 单元只在以下**阻断性**情形判 fail:workflows 为空、wf 缺 id/name/steps、
+depends_on 引用未知 id 或成环、delegate_to 缺失。其余改进意见写在 issues 里但 verdict=pass。
+
 【Plan 单元】
 - Markdown 是否包含完整五段(目标/WorkFlow/关键决策/风险/验收总览)
 - 每个 WorkFlow 是否有完整步骤与验收标准
@@ -820,6 +832,17 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
    不要重复完全相同的失败调用。
 7. 同一应用的连续操作(打开 → 搜索 → 选择 → 输入 → 确认)必须在一个单元内连续完成;
    WindowOpen/Find 已返回 window_id 时直接复用,不要重复启动应用。
+8. 列表定位优先搜索(2026-09-16 第 66 轮):在列表中找指定条目(联系人/会话/文件)时,
+   优先找搜索框 set_text 目标名直接定位;无搜索框再用 WindowAction(action=scroll)
+   逐屏滚动遍历,每滚一屏后重新 WindowInspect 检查目标是否出现;
+   列表/表格/滚动区控件(scrollarea/table/outline/list/row)支持 scroll,
+   text 形如 "down:3" / "up:5"(缺省 3 行);send_keys 支持命名键
+   enter/tab/esc/space/delete/up/down/left/right/pageup/pagedown(发送消息常用 enter)。
+9. 目标名称含 Unicode 上标/特殊字符(如 赵玲玲ᴬᴵᴬ)时,filter 可直接写其 ASCII
+   归一形(赵玲玲AIA),工具会自动等价匹配;匹配不到再试原名。
+10. 发送消息链路范式:定位到目标会话/联系人 → click 打开会话 → 定位输入框 →
+    set_text 写入消息 → send_keys("enter") 或 click「发送」按钮 → WindowInspect
+    复查消息已出现在对话区。
 
 完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
 
@@ -864,7 +887,9 @@ fn window_use_tools_hint() -> &'static str {
      - WindowInspect(window_id, max_depth?, filter?): 枚举窗口控件树,返回每个控件的 \
        path/role/name/value/bounds/actions/children\n\
      - WindowAction(window_id, path, action, text?): 对控件执行 \
-       click/invoke/focus/set_text/get_text/send_keys\n\
+       click/invoke/focus/set_text/get_text/send_keys/scroll;\
+       scroll 用 text 传方向与行数(如 \"down:3\"/\"up:5\",缺省 3 行),\
+       send_keys 用 text 传命名键(enter/tab/esc/space/delete/up/down/left/right/pageup/pagedown)\n\
      - WindowScreenshot(output_path?, region?): 跨平台截图落盘,返回路径\n\
      - Bash(command, ...): 白名单模式,仅允许桌面操控类命令(osascript / cliclick / \
        screencapture / pbcopy / pbpaste / open / System Events keystroke / defaults 等)\n\

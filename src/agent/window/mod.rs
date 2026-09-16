@@ -94,6 +94,16 @@ pub enum ControlAction {
     SendKeys(String),
     /// 调用默认动作(等价 Click,保留给 UIA Invoke 语义明确的场景)
     Invoke,
+    /// 滚动(2026-09-16 第 66 轮):lines>0 向上滚,lines<0 向下滚,单位为「行」。
+    /// macOS 走 CGEvent 滚轮事件(光标先移到控件中心);Windows 走 WM_MOUSEWHEEL;
+    /// fallback 走 xdotool click 4/5。
+    Scroll {
+        /// 滚动行数(正=上,负=下)
+        lines: i32,
+    },
+    /// 把目标控件滚动到可见区域(2026-09-16 第 66 轮):
+    /// macOS AXScrollToVisible;Windows 暂等价 Scroll 小步;列表逐条定位场景比盲滚精准。
+    ScrollToVisible,
 }
 
 impl ControlAction {
@@ -117,15 +127,52 @@ impl ControlAction {
                 })?)
             }
             "invoke" | "press" => Self::Invoke,
+            // 2026-09-16 第 66 轮:scroll 动作,text 形如 "down:3" / "up:5" / "down"(缺省 3 行)。
+            "scroll" => Self::Scroll {
+                lines: parse_scroll_lines(text.as_deref())?,
+            },
+            "scrolltovisible" | "scrollintoview" | "reveal" => Self::ScrollToVisible,
             other => {
                 return Err(AgentError::ToolExecution {
                     tool: "WindowAction".into(),
                     reason: format!(
-                        "未知 action: {other};可用: click / focus / set_text / get_text / send_keys / invoke"
+                        "未知 action: {other};可用: click / focus / set_text / get_text / send_keys / invoke / scroll / scroll_to_visible"
                     ),
                 })
             }
         })
+    }
+}
+
+/// 解析 scroll 的方向与行数:"down:3" / "up:5" / "down"(缺省 3 行)。
+/// 返回 lines:正=向上,负=向下(对齐滚轮物理语义)。
+fn parse_scroll_lines(text: Option<&str>) -> Result<i32> {
+    let raw = text.unwrap_or("down").trim().to_lowercase();
+    let (dir, num_part) = match raw.split_once(':') {
+        Some((d, n)) => (d.trim(), n.trim()),
+        None => (raw.as_str(), ""),
+    };
+    let magnitude: i32 = if num_part.is_empty() {
+        3
+    } else {
+        num_part.parse().map_err(|_| AgentError::ToolExecution {
+            tool: "WindowAction".into(),
+            reason: format!("scroll 行数非法: {num_part}(应为正整数,如 \"down:3\")"),
+        })?
+    };
+    if magnitude <= 0 || magnitude > 100 {
+        return Err(AgentError::ToolExecution {
+            tool: "WindowAction".into(),
+            reason: format!("scroll 行数超出范围(1-100): {magnitude}"),
+        });
+    }
+    match dir {
+        "up" | "upward" | "上" => Ok(magnitude),
+        "down" | "downward" | "下" => Ok(-magnitude),
+        other => Err(AgentError::ToolExecution {
+            tool: "WindowAction".into(),
+            reason: format!("scroll 方向非法: {other}(应为 up/down)"),
+        }),
     }
 }
 
@@ -201,7 +248,8 @@ pub(crate) fn platform_err(platform: &str, msg: impl Into<String>) -> AgentError
 /// 「赵玲玲ᴵᴵᴬ」这种混用 Unicode Modifier Letter 与 Latin Letter
 /// 块导致的匹配失败场景。仅归一化常用上标字母子集,不引入 NFKC
 /// 完整归一化以免破坏其他匹配场景。
-fn normalize_unicode_for_match(s: &str) -> String {
+/// 第 66 轮:提升为 pub(crate),供 tools/window.rs 的 WindowFind 打分复用。
+pub(crate) fn normalize_unicode_for_match(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         let mapped = match c {
@@ -347,6 +395,47 @@ mod tests {
         assert!(ControlAction::parse("set_text", None).is_err());
         assert!(ControlAction::parse("send_keys", None).is_err());
         assert!(ControlAction::parse("explode", None).is_err());
+    }
+
+    #[test]
+    fn control_action_parse_scroll() {
+        // 2026-09-16 第 66 轮:scroll 动作解析(方向 + 行数,正=上,负=下)
+        assert_eq!(
+            ControlAction::parse("scroll", Some("down:3".into())).unwrap(),
+            ControlAction::Scroll { lines: -3 }
+        );
+        assert_eq!(
+            ControlAction::parse("scroll", Some("up:5".into())).unwrap(),
+            ControlAction::Scroll { lines: 5 }
+        );
+        // 缺省 3 行向下
+        assert_eq!(
+            ControlAction::parse("scroll", None).unwrap(),
+            ControlAction::Scroll { lines: -3 }
+        );
+        assert_eq!(
+            ControlAction::parse("scroll", Some("down".into())).unwrap(),
+            ControlAction::Scroll { lines: -3 }
+        );
+        // 中文方向别名
+        assert_eq!(
+            ControlAction::parse("scroll", Some("上:2".into())).unwrap(),
+            ControlAction::Scroll { lines: 2 }
+        );
+        // scroll_to_visible 别名
+        assert_eq!(
+            ControlAction::parse("scroll_to_visible", None).unwrap(),
+            ControlAction::ScrollToVisible
+        );
+        assert_eq!(
+            ControlAction::parse("scroll-into-view", None).unwrap(),
+            ControlAction::ScrollToVisible
+        );
+        // 非法:方向未知 / 行数非数 / 超范围
+        assert!(ControlAction::parse("scroll", Some("left:3".into())).is_err());
+        assert!(ControlAction::parse("scroll", Some("down:abc".into())).is_err());
+        assert!(ControlAction::parse("scroll", Some("down:0".into())).is_err());
+        assert!(ControlAction::parse("scroll", Some("down:101".into())).is_err());
     }
 
     #[test]

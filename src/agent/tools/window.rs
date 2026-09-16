@@ -19,7 +19,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::Tool;
-use crate::agent::window::{current_driver, ControlAction, ControlNode, WindowInfo};
+use crate::agent::window::{
+    current_driver, normalize_unicode_for_match, ControlAction, ControlNode, WindowInfo,
+};
 use crate::error::{AgentError, Result};
 
 /// 控件树节点数上限(超出截断)。
@@ -64,9 +66,15 @@ pub(crate) fn expand_window_query(query: &str) -> Vec<String> {
 }
 
 fn window_matches_any(w: &WindowInfo, queries: &[String]) -> bool {
+    // 2026-09-16 第 66 轮 P1-5:双侧 Unicode 上标归一化后再小写子串匹配
     queries.iter().any(|q| {
-        let q = q.to_lowercase();
-        w.title.to_lowercase().contains(&q) || w.process_name.to_lowercase().contains(&q)
+        let q = normalize_unicode_for_match(q).to_lowercase();
+        normalize_unicode_for_match(&w.title)
+            .to_lowercase()
+            .contains(&q)
+            || normalize_unicode_for_match(&w.process_name)
+                .to_lowercase()
+                .contains(&q)
     })
 }
 
@@ -366,8 +374,10 @@ struct ScoredHit<'a> {
 }
 
 fn score_exact<'a>(query_lower: &str, info: &'a WindowInfo) -> Option<ScoredHit<'a>> {
-    let title_l = info.title.to_lowercase();
-    let proc_l = info.process_name.to_lowercase();
+    // 2026-09-16 第 66 轮 P1-5:两侧先做 Unicode 上标归一化(ᴬᴵᴬ ↔ AIA 等价),
+    // 再小写比较;否则 filter 写 ASCII 形匹配不到真实窗口标题里的 Modifier Letter。
+    let title_l = normalize_unicode_for_match(&info.title).to_lowercase();
+    let proc_l = normalize_unicode_for_match(&info.process_name).to_lowercase();
     if title_l == query_lower {
         Some(ScoredHit {
             info,
@@ -386,8 +396,8 @@ fn score_exact<'a>(query_lower: &str, info: &'a WindowInfo) -> Option<ScoredHit<
 }
 
 fn score_contains<'a>(query_lower: &str, info: &'a WindowInfo) -> Option<ScoredHit<'a>> {
-    let title_l = info.title.to_lowercase();
-    let proc_l = info.process_name.to_lowercase();
+    let title_l = normalize_unicode_for_match(&info.title).to_lowercase();
+    let proc_l = normalize_unicode_for_match(&info.process_name).to_lowercase();
     if title_l.contains(query_lower) {
         let q_chars = query_lower.chars().count() as f64;
         let denom = title_l.chars().count().max(1) as f64;
@@ -450,9 +460,9 @@ fn damerau_levenshtein(a: &str, b: &str) -> usize {
 }
 
 fn score_fuzzy<'a>(query: &str, info: &'a WindowInfo) -> Option<ScoredHit<'a>> {
-    let q = query.to_lowercase();
-    let title_l = info.title.to_lowercase();
-    let proc_l = info.process_name.to_lowercase();
+    let q = normalize_unicode_for_match(query).to_lowercase();
+    let title_l = normalize_unicode_for_match(&info.title).to_lowercase();
+    let proc_l = normalize_unicode_for_match(&info.process_name).to_lowercase();
     let dt = damerau_levenshtein(&q, &title_l);
     let dp = damerau_levenshtein(&q, &proc_l);
     let max_len = q.chars().count().max(info.title.chars().count()).max(1);
@@ -478,7 +488,7 @@ fn score_fuzzy<'a>(query: &str, info: &'a WindowInfo) -> Option<ScoredHit<'a>> {
 
 /// 按窗口信息列表 + 模式 + 查询词匹配,返回 top-1。
 fn pick_top_hit<'a>(wins: &'a [WindowInfo], query: &str, mode: MatchMode) -> Option<ScoredHit<'a>> {
-    let query_lower = query.to_lowercase();
+    let query_lower = normalize_unicode_for_match(query).to_lowercase();
     wins.iter()
         .filter_map(|w| match mode {
             MatchMode::Exact => score_exact(&query_lower, w),
@@ -1039,8 +1049,11 @@ impl Tool for WindowActionTool {
          - window_id 必填:WindowList 返回的窗口 id。\n\
          - path 必填:WindowInspect 返回的控件路径(如 /0/2/1;\"/\" 表示窗口本身)。\n\
          - action 必填:click(点击按钮等) / invoke(同 click) / focus(聚焦) /\n\
-           set_text(写入文本,需 text 参数) / get_text(读取文本) / send_keys(按键,平台支持有限)。\n\
-         - text 可选:set_text/send_keys 的文本内容。\n\
+           set_text(写入文本,需 text 参数) / get_text(读取文本) /\n\
+           send_keys(按键,text 传命名键:enter/tab/esc/space/delete/up/down/left/right/pageup/pagedown) /\n\
+           scroll(滚轮滚动,text 传方向与行数:\"down:3\"/\"up:5\",缺省 3 行) /\n\
+           scroll_to_visible(把控件滚动到可见区域,列表定位场景比盲滚精准)。\n\
+         - text 可选:set_text/send_keys/scroll 的文本内容。\n\
          控件是否支持某动作请参考 WindowInspect 返回的 actions 列表;路径失效时重新 WindowInspect。"
     }
 
@@ -1052,10 +1065,10 @@ impl Tool for WindowActionTool {
                 "path": { "type": "string", "description": "控件路径,如 /0/2/1;\"/\" 表示窗口本身" },
                 "action": {
                     "type": "string",
-                    "enum": ["click", "invoke", "focus", "set_text", "get_text", "send_keys"],
+                    "enum": ["click", "invoke", "focus", "set_text", "get_text", "send_keys", "scroll", "scroll_to_visible"],
                     "description": "要执行的动作"
                 },
-                "text": { "type": "string", "description": "set_text/send_keys 的文本内容" }
+                "text": { "type": "string", "description": "set_text/send_keys/scroll 的文本内容(scroll 形如 down:3)" }
             },
             "required": ["window_id", "path", "action"],
             "additionalProperties": false

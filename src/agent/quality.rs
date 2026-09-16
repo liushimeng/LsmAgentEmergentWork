@@ -322,6 +322,47 @@ fn gate_report_on_trace(
                     trace.early_terminate_reason,
                 ),
             }
+        } else if source == AgentRole::WindowUse {
+            // 2026-09-16 第 66 轮 P1-6:WindowUse 专项诊断 —— 按 early_terminate_reason /
+            // failure_signals 给出可执行排查路径,LLM 重试轮据此直接调整策略。
+            let wu_reason = trace
+                .failure_signals
+                .iter()
+                .find(|s| s.starts_with("early_terminate:"))
+                .cloned();
+            let joined = trace.failure_signals.join(",");
+            let err_dist_hint = format!(
+                "iter={} tool_calls={} err={} early_terminate={}",
+                trace.iterations,
+                trace.tool_calls,
+                trace.tool_calls_err,
+                trace.early_terminate_reason
+            );
+            match wu_reason.as_deref() {
+                Some(r) if r.contains("no_tool_use_no_action_text") => format!(
+                    "WindowUse 单元 {} 次迭代内未调用任何 Window 工具,LLM 持续返回纯文本。{}\
+                     排查:首步强制 WindowOpen 是否生效;任务是否被误委派(应 delegate_to=windowuse)。",
+                    trace.iterations, err_dist_hint
+                ),
+                _ if joined.contains("-25211") || joined.contains("APIDisabled") => format!(
+                    "WindowUse 单元失败:macOS 辅助功能未授权(-25211)。{}\
+                     排查:系统设置→隐私与安全性→辅助功能勾选宿主终端并重开;\
+                     或降级 Bash 白名单 osascript/cliclick/pbcopy 路径。",
+                    err_dist_hint
+                ),
+                _ if joined.contains("-25212") || joined.contains("越界") || joined.contains("路径失效") => format!(
+                    "WindowUse 单元失败:控件路径失效/越界(-25212),UI 已变化。{}\
+                     排查:重新 WindowInspect 获取最新 path 后再 WindowAction,不要重复旧 path;\
+                     滚动列表后所有 path 都会失效,必须重新检视。",
+                    err_dist_hint
+                ),
+                _ => format!(
+                    "WindowUse 单元 {} 次迭代内出现 {} 次失败,early_terminate={}。{}\
+                     排查:WindowFind 匹配模式(contains→fuzzy)/ filter 同义词表 / \
+                     scroll+重新检视 循环 / send_keys(enter) 发送链路。",
+                    trace.iterations, trace.tool_calls_err, trace.early_terminate_reason, err_dist_hint
+                ),
+            }
         } else {
             "执行轨迹包含强失败信号,Quality-Check 的 pass 结论被 trace 证据门拒绝".to_string()
         }
@@ -336,6 +377,14 @@ fn gate_report_on_trace(
          2) 输入文本框用 BrowserControl(action=input_text, use_js:true) 触发框架 onChange;\
          3) 等待对话用 BrowserInspect(info=image_urls) + 5s 轮询直到 reply 元素出现;\
          4) 若浏览器不存在返回 code=3001,如实告知用户安装 Chrome/Edge/Chromium。"
+            .to_string()
+    } else if source == AgentRole::WindowUse && hard_strong_failure {
+        // 2026-09-16 第 66 轮 P1-6:WindowUse 专项重试指引
+        "下一轮重试时:1) 首步 WindowOpen(query) 启动/激活应用并拿 window_id;\
+         2) 列表中找目标条目优先用搜索框 set_text 定位,无搜索框再 scroll+重新 WindowInspect;\
+         3) 目标名含 Unicode 上标(ᴬᴵᴬ)时 filter 直接写 ASCII 归一形(AIA);\
+         4) 发送消息:输入框 set_text 后 send_keys(\"enter\"),或 click「发送」按钮;\
+         5) -25211 未授权时把授权步骤写进最终回答,或改走 Bash 白名单 osascript。"
             .to_string()
     } else {
         "请修正命令或产物后重跑;若非零退出是预期负例,Quality-Check 必须在 evidence 中说明。"
