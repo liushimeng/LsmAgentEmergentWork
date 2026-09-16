@@ -381,7 +381,7 @@ impl Agent {
                     );
                     session
                         .context_mut()
-                        .push(ChatMessage::user(WEB_OPS_NUDGE_TEXT));
+                        .push(ChatMessage::user(web_ops_nudge_text(iter)));
                     continue;
                 }
 
@@ -963,10 +963,25 @@ pub(crate) const WEB_OPS_NUDGE_TEXT: &str = "【laew 强制指令】你刚才没
 若 BrowserNew 返回 code=3001(未检测到浏览器),立即如实告知用户安装 Chrome/Edge/Chromium,不要编造结果。";
 
 /// 2026-09-16 第 63 轮:WebUse nudge 扩展为多轮触发(iter 1,2,3)。
-/// 此前仅 iter==1 触发一次,LLM 第 2/3 轮仍只回文本时无法纠正;
-/// 现在连续 3 轮无工具调用都会触发 nudge,提高纠正概率。
+/// 2026-09-16 第 64 轮:扩展为 1..=6(iter 4-6 用末次警告文本),LLM 在第 4-6 轮
+/// 仍只回文本时不再沉默,WebUseRunner 出口兜底确保 trace 标 failed。
 pub(crate) fn should_nudge_web_ops(profile_tools: &[&str], iter: usize) -> bool {
-    (1..=3).contains(&iter) && profile_tools.iter().any(|t| *t == "BrowserNew")
+    (1..=6).contains(&iter) && profile_tools.iter().any(|t| *t == "BrowserNew")
+}
+
+/// 2026-09-16 第 64 轮:WebUse nudge 文本分级(iter ≥ 4 用更严厉措辞 + 终止预告)。
+pub(crate) const WEB_OPS_NUDGE_FINAL_TEXT: &str = "【laew 终止预告】你已连续多轮(>=4 次)无浏览器工具调用,任务即将被强制终止。\n\
+请立即调用 BrowserNew 工具打开目标网页:\n\
+参数: {\"url\": \"https://目标网址\", \"headless\": true}\n\
+如果浏览器不存在返回 code=3001,如实告知用户,**不要再输出任何描述性文本**。\n\
+继续输出文本而不调用工具 = 任务立即失败,trace 直接标 failed。";
+
+pub(crate) fn web_ops_nudge_text(iter: usize) -> &'static str {
+    if iter >= 4 {
+        WEB_OPS_NUDGE_FINAL_TEXT
+    } else {
+        WEB_OPS_NUDGE_TEXT
+    }
 }
 
 /// 结构化输出强制通道总开关(L6/L19,2026-09-09 第 13 轮)。

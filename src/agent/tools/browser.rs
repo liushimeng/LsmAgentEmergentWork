@@ -863,7 +863,7 @@ impl Tool for BrowserInspectTool {
                     "console","network","elements","dom",
                     "localstorage","sessionstorage","cookies",
                     "screenshot","page_meta","viewport",
-                    "url","title","ping"
+                    "url","title","ping","image_urls"
                 ]},
                 "params":{"type":"object"}
             },
@@ -1040,6 +1040,34 @@ impl Tool for BrowserInspectTool {
             ).await,
             "url" => Ok(json!({"url": page.url().await.ok().flatten().unwrap_or_default()})),
             "title" => Ok(json!({"title": page.get_title().await.ok().flatten().unwrap_or_default()})),
+            // 2026-09-16 第 64 轮:image_urls —— 一键提取页面图片 URL + canvas/svg 计数。
+            // 文心一言 K 线图 / ChatGPT 图表 / Claude.ai 生成的图都是 <img src=...> 或 canvas。
+            // 限制 img_urls 最多 20 条避免大页面输出爆炸;canvas/svg 只计数。
+            "image_urls" => {
+                let max_n = params.get("max").and_then(Value::as_u64).unwrap_or(20).min(100) as usize;
+                let js = format!(
+                    r#"(() => {{
+                        const N = {max_n};
+                        const imgs = Array.from(document.querySelectorAll('img'))
+                            .map(i => i.src || i.getAttribute('data-src') || '')
+                            .filter(Boolean);
+                        const data_imgs = imgs.filter(s => s.startsWith('data:image/'));
+                        const canvases = document.querySelectorAll('canvas').length;
+                        const svgs = document.querySelectorAll('svg').length;
+                        const pics = document.querySelectorAll('picture').length;
+                        return {{
+                            img_count: imgs.length,
+                            img_urls: imgs.slice(0, N),
+                            data_image_count: data_imgs.length,
+                            canvas_count: canvases,
+                            svg_count: svgs,
+                            picture_count: pics
+                        }};
+                    }})()"#,
+                    max_n = max_n,
+                );
+                eval_js_string(&page, &js).await
+            }
             other => return envelope(1001, "未知 info", json!({"info": other})),
         };
         match res {

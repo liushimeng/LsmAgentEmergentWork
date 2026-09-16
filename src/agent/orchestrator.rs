@@ -1811,9 +1811,19 @@ fn build_subflow_input(
     // (WorkFlow.name + steps 是对原始需求的分解),这里把 wf.name 作为原始
     // 提示词的近似透传。如需更精确(传整段原始 prompt),可在 MainWorkRunner
     // 拆分 WorkFlowSpec 时额外携带 original_prompt 字段。
+    let mut description = format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n"));
+    // 2026-09-16 第 64 轮:WebUse 跨单元 page_id 复用提示。
+    if wf.delegate_to == AgentRole::WebUse {
+        description.push_str(
+            "\n\n【WebUse 跨单元上下文】\n\
+             - 第一个 WebUse 单元的 BrowserNew 返回 page_id(如 p_xxx);\n\
+             - 后续 WebUse 单元必须复用同一 page_id(WebUseRunner 自动注入到 user prompt 尾部);\n\
+             - 若 BrowserList 显示 page_id 已失效,重新 BrowserNew,新 page_id 替换 Runner 内 last_page_id。",
+        );
+    }
     SubFlowInput {
         id: format!("{}.step", wf.id),
-        description: format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n")),
+        description,
         expected_output: wf.acceptance.join("; "),
         original_prompt: Some(wf.name.clone()),
         depends_on_outputs: deps,

@@ -26,6 +26,22 @@ use crate::config::Db;
 use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Usage};
 
+/// 2026-09-16 第 64 轮:从 BrowserNew tool_result JSON 中提取 page_id 的正则。
+///
+/// 仅匹配 BrowserNew 成功时返回的 `data.page_id:"p_xxxxxxxx"`(8 位 hex),
+/// 防止误匹配其它字段。BrowserNew 失败(code=3001 等)时无 page_id,正则不命中。
+pub fn extract_page_id_from_text(text: &str) -> Option<String> {
+    const PREFIX: &str = "\"page_id\":\"p_";
+    let start = text.find(PREFIX)?;
+    let after = &text[start + PREFIX.len()..];
+    let end = after
+        .find('"')
+        .map(|i| start + PREFIX.len() + i + 1)
+        .unwrap_or(text.len());
+    let pid_start = start + PREFIX.len() - 2; // 含 "p_"
+    Some(text[pid_start..end].trim_matches('"').to_string())
+}
+
 /// Chromium-WebUse 执行器(浏览器网页操控专项单元)。
 pub struct WebUseRunner {
     agent: Agent,
@@ -242,6 +258,27 @@ mod tests {
     use super::*;
     use crate::agent::profile::WEB_USE_AGENT_NAME;
     use crate::agent::AgentProfile;
+
+    // 2026-09-16 第 64 轮:验证 page_id 提取函数对常见 BrowserNew 返回格式生效。
+    #[test]
+    fn extract_page_id_parses_success_envelope() {
+        let txt = r#"{"code":0,"message":"ok","data":{"page_id":"p_a1b2c3d4","title":"文心一言","final_url":"https://wenxin.baidu.com/"}}"#;
+        let pid = extract_page_id_from_text(txt);
+        assert_eq!(pid.as_deref(), Some("p_a1b2c3d4"));
+    }
+
+    #[test]
+    fn extract_page_id_returns_none_for_failure() {
+        // code=3001 时不含 page_id
+        let txt = r#"{"code":3001,"message":"未检测到浏览器","data":{"install":"请安装 Chrome"}}"#;
+        assert_eq!(extract_page_id_from_text(txt), None);
+    }
+
+    #[test]
+    fn extract_page_id_handles_non_json() {
+        assert_eq!(extract_page_id_from_text("plain text"), None);
+        assert_eq!(extract_page_id_from_text(""), None);
+    }
 
     #[test]
     fn web_use_profile_uses_web_registry() {

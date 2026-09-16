@@ -409,6 +409,10 @@ impl TuiSession {
                     crate::tui::format::truncate_chars(&reason_short, 240),
                     *wallclock_ms as f64 / 1000.0,
                 );
+                // 2026-09-16 第 64 轮:WebUse 任务失败时额外打印诊断。
+                if reason.contains("WebUse") || reason.contains("tool_calls=0") || reason.contains("no_tool_use") {
+                    println!("  [WebUse 失败诊断] 详见下方 [trace]/[tool]/[failure] 段;若 tool_calls=0 排查方向:1) Chrome/Edge/Chromium 安装;2) 设置 LAEW_BROWSER_PATH;3) 检查 LAEW_FORCED_TOOLS 未关闭首步强制。");
+                }
                 // 复用 format_task_result 渲染 stage_durations / retry_log / trace 段。
                 // stub_workflow 用 last_trace 携带失败单元的工具调用明细,便于 [trace] [tool] [failure] 段呈现。
                 let stub_workflow =
