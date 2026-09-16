@@ -44,7 +44,16 @@ pub struct WindowUseRunner {
 
 impl WindowUseRunner {
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>) -> Self {
-        let agent = Agent::new(llm, AgentProfile::window_use_profile());
+        // 2026-09-16 第 65 轮 P1-D:WindowUse 首迭代强制调用 WindowOpen。
+        // 对齐 WebUse 第 63 轮的 BrowserNew 强制首步机制(2026-09-16 第 63 轮):
+        //   - 解决"LLM 第 1 轮返回纯文本('让我先...')而非工具调用 → 16 次迭代
+        //     tool_calls=0 → QC 判失败"的同类根因;
+        //   - 强制 tool_choice={"type":"tool","name":"WindowOpen"},
+        //     后续轮次恢复 auto,让 LLM 自由决策;
+        //   - 与 Runner P0-B 兜底(looks_like_window_ops_action)形成双重防御:
+        //     即便 LLM 第 1 轮不响应强制,Runner 出口也会拦截。
+        let agent = Agent::new(llm, AgentProfile::window_use_profile())
+            .with_first_iter_forced_tool("WindowOpen");
         let max_iterations = agent.max_iterations();
         let state_mgr = WindowStateManager::new(db.clone());
         let msg_mgr = AgentMessageManager::new(db.clone());
@@ -121,7 +130,17 @@ impl WindowUseRunner {
              6. macOS WindowInspect/Action 返回 -25211 kAXErrorAPIDisabled 时,工具会弹出并等待授权;\
                 若最终仍未授权,把开权限步骤写进最终回答告知用户;\n\
              7. 同一应用的连续 UI 操作必须在本单元内连续完成,不要只完成“打开”后把搜索/输入\
-                留给下一个独立单元;窗口状态会按 Session ID 持久化,但真实 UI 焦点不应依赖重新启动。",
+                留给下一个独立单元;窗口状态会按 Session ID 持久化,但真实 UI 焦点不应依赖重新启动;\n\
+             8. **【中文 UI 名称同义词表】**(2026-09-16 第 65 轮 P1-B):filter 失败时优先试下表同义词,不要立即放弃或全量遍历:\n\
+                - 通讯录 = 通信录 = 联系人 = Contacts = contactsList\n\
+                - 消息 = 发送 = Send = submit\n\
+                - 按钮 = Button\n\
+                - 输入框 = 搜索 = Search = TextField = Edit\n\
+                - 关闭 = X = close = 退出\n\
+                - 设置 = Settings = Preferences\n\
+             9. **【禁止 Read PNG】**:WindowScreenshot 只落盘 PNG 文件,当前 WindowUse 工具集**不包含 OCR 工具**;\
+                **不要**用 Read 工具读取 PNG(Read 仅支持 UTF-8 文本,二进制会失败);\
+                如需视觉识别,切换到 WindowInspect(控件树路线)或终止任务告知用户。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -187,15 +206,25 @@ impl WindowUseRunner {
         trace.collect_failure_signals(&text);
 
         // 给 QC / TUI 追加机器可验证证据,防止最终文本与真实工具轨迹相悖。
+        // 2026-09-16 第 65 轮 P2:错误类型分布统计 —— 把 failure_signals 进一步分类汇总,
+        // 让 TUI 阶段打印协程显示「not_trusted=0 stale_handle=2 unsupported_action=1 ...」,
+        // 加速 LLM retry 阶段收敛(原版只给原始 signals 字符串,难以聚合分析)。
+        let signal_counts = count_failure_signals(&trace.failure_signals);
+        let error_dist = signal_counts
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
         text.push_str(&format!(
-            "\n\n[WindowUse执行证据] session={} iter={} tools={}(ok={},err={}) early={} signals=[{}]",
+            "\n\n[WindowUse执行证据] session={} iter={} tools={}(ok={},err={}) early={} signals=[{}] [错误类型分布] {}",
             session_id,
             trace.iterations,
             trace.tool_calls,
             trace.tool_calls_ok,
             trace.tool_calls_err,
             trace.early_terminated,
-            trace.failure_signals.join(",")
+            trace.failure_signals.join(","),
+            if error_dist.is_empty() { "无".to_string() } else { error_dist },
         ));
 
         // 2026-09-16 第 58 轮 P0-B:Runner 出口兜底。
@@ -302,6 +331,77 @@ impl Drop for WindowUseBashModeGuard {
     }
 }
 
+/// 2026-09-16 第 65 轮 P2:失败信号分类汇总。
+///
+/// 把 `failure_signals` 中的原始 token 归并到 5 类结构化错误类型,供 TUI 阶段打印协程
+/// 和 QC 报告使用。LLM 拿到这种分类信号后能精确决策:
+/// - not_trusted → 切到 Bash 路线 / 提示用户授权;
+/// - stale_handle → 重新 WindowList + WindowInspect;
+/// - unsupported_action → 改换控件路径或用其它 action;
+/// - platform_limit → 提示用户换平台 / 走 Bash 路线;
+/// - timeout → 缩小 max_depth / 重试。
+///
+/// 关键词映射(启发式,基于 WindowUse 已知的 failure 类型):
+/// - not_trusted: AX -25211 / NotTrusted / kAXErrorAPIDisabled / accessibility denied / 辅助功能未授权
+/// - stale_handle: -25212 / StaleHandle / 路径失效 / UI 已变化 / 控件已失效 / PathInvalid
+/// - unsupported_action: -25205 / -25206 / Unsupported / 控件不支持 / ActionUnsupported / AttributeUnsupported
+/// - platform_limit: PlatformLimit / PlatformNotSupport / SendKeys 不支持 / 平台不支持
+/// - timeout: Timeout / 超时 / killpg / sigterm
+fn count_failure_signals(signals: &[String]) -> Vec<(&'static str, usize)> {
+    use std::collections::BTreeMap;
+    let mut bucket: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for s in signals {
+        let lower = s.to_lowercase();
+        // not_trusted
+        if lower.contains("-25211")
+            || lower.contains("nottrusted")
+            || lower.contains("apidisabled")
+            || lower.contains("accessibility denied")
+            || lower.contains("辅助功能未授权")
+        {
+            *bucket.entry("not_trusted").or_insert(0) += 1;
+        }
+        // stale_handle
+        else if lower.contains("-25212")
+            || lower.contains("stalehandle")
+            || lower.contains("路径失效")
+            || lower.contains("ui 已变化")
+            || lower.contains("ui已变化")
+            || lower.contains("控件已失效")
+            || lower.contains("pathinvalid")
+            || lower.contains("越界")
+        {
+            *bucket.entry("stale_handle").or_insert(0) += 1;
+        }
+        // unsupported_action
+        else if lower.contains("-25205")
+            || lower.contains("-25206")
+            || lower.contains("unsupported")
+            || lower.contains("actionunsupported")
+            || lower.contains("attributeunsupported")
+            || lower.contains("控件不支持")
+        {
+            *bucket.entry("unsupported_action").or_insert(0) += 1;
+        }
+        // platform_limit
+        else if lower.contains("platformlimit")
+            || lower.contains("platformnotsupport")
+            || lower.contains("平台不支持")
+        {
+            *bucket.entry("platform_limit").or_insert(0) += 1;
+        }
+        // timeout
+        else if lower.contains("timeout") || lower.contains("超时") || lower.contains("killpg") {
+            *bucket.entry("timeout").or_insert(0) += 1;
+        }
+        // bash_exit_nonzero / other
+        else if lower.contains("bash_exit_nonzero") || lower.contains("exit code") {
+            *bucket.entry("bash_exit_nonzero").or_insert(0) += 1;
+        }
+    }
+    bucket.into_iter().collect()
+}
+///
 /// 窗口操作动作关键词探测(P0-B 兜底用)。
 ///
 /// 语义:LLM 在 WindowUse 单元里没有调用任何工具时,如果它给的文本里出现以下
@@ -482,5 +582,45 @@ mod tests {
             text.contains(WINDOW_STATE_MARKER_END),
             "state 消息应包含 WINDOW_STATE_MARKER_END 锚点"
         );
+    }
+
+    // ============== 2026-09-16 第 65 轮 P2 测试 ==============
+
+    #[test]
+    fn count_failure_signals_classifies_categories() {
+        // 真实任务里 failure_signals 通常包含:bash_exit_nonzero / not_trusted / 等
+        let signals = vec![
+            "kAXErrorAPIDisabled: -25211 辅助功能未授权".to_string(),
+            "AX 错误码 -25205 控件不支持".to_string(),
+            "AX 错误码 -25205 控件不支持".to_string(),
+            "Bash: 超时(>60000ms)被强制终止".to_string(),
+            "Bash: exit code 1".to_string(),
+            "路径 /0/2 在段 5 处越界".to_string(),
+        ];
+        let buckets = count_failure_signals(&signals);
+        let map: std::collections::HashMap<_, _> = buckets.into_iter().collect();
+        assert_eq!(map.get("not_trusted").copied(), Some(1));
+        assert_eq!(map.get("unsupported_action").copied(), Some(2));
+        assert_eq!(map.get("timeout").copied(), Some(1));
+        assert_eq!(map.get("bash_exit_nonzero").copied(), Some(1));
+        assert_eq!(map.get("stale_handle").copied(), Some(1));
+    }
+
+    #[test]
+    fn runner_emits_error_distribution_in_evidence() {
+        // P2:WindowUse 单元结束时的 text 应包含「[错误类型分布]」段。
+        // 这里仅验证 error_dist 字符串拼接正确,不跑完整 Runner(避免 LLM mock)。
+        let signals = vec![
+            "kAXErrorAPIDisabled".to_string(),
+            "路径越界".to_string(),
+        ];
+        let buckets = count_failure_signals(&signals);
+        let distribution = buckets
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(distribution.contains("not_trusted=1"));
+        assert!(distribution.contains("stale_handle=1"));
     }
 }

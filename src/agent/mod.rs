@@ -44,6 +44,7 @@ pub mod window;
 pub mod window_state;
 pub mod window_use;
 pub mod workflow;
+pub mod workflow_json_validate;
 pub mod workspace;
 pub mod yolo;
 

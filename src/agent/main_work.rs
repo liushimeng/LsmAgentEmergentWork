@@ -836,10 +836,18 @@ pub fn topo_layers(workflows: &[WorkFlowSpec]) -> Result<Vec<Vec<WorkFlowSpec>>>
 
 /// 解析 Main-Work JSON 输出(支持代码块 / 裸 JSON)。
 /// 直接解析失败时自动走 JSON 修复链(`json_repair`),修复不了仍 WorkflowParse。
+///
+/// 2026-09-16 第 65 轮 P0-A:在 `try_parse_lenient` 之前先走
+/// [`crate::agent::workflow_json_validate::sanitize_workflow_text`],把 LLM 常见的
+/// 智能引号 / 嵌套中文角括号 / 中文字符串内层 ASCII `"` / Unicode Modifier Letter
+/// 块(`ᴬᴵᴬ` 等)/ 控制字符 5 类错误模式归一化,根因修复上一轮「Main-Work 反复重拆」
+/// 死循环。`extract_json_block` 已经切出 JSON 段,sanitize 不会破坏外层 LLM 解释文字。
 pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
     if let Some(json_str) = extract_json_block(text) {
+        // P0-A:先 sanitize 再进 json_repair 修复链(关联:workflow_json_validate.rs)
+        let sanitized = crate::agent::workflow_json_validate::sanitize_workflow_text(json_str);
         // Main-Work 路径:启用 Tier-2 截断补全(关联报告: 2026-09-09_04 D-001)。
-        let mut plan = crate::agent::json_repair::try_parse_lenient(json_str)
+        let mut plan = crate::agent::json_repair::try_parse_lenient(&sanitized)
             .map_err(AgentError::WorkflowParse)?;
         dedup_workflow_ids(&mut plan);
         // 2026-09-16 F2:归一化 depends_on(剥离 LLM 附加的变量透传注释)
@@ -850,7 +858,9 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         return Ok(plan);
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        let mut plan = crate::agent::json_repair::try_parse_lenient(json_str)
+        // P0-A:同上,sanitize 后再解析
+        let sanitized = crate::agent::workflow_json_validate::sanitize_workflow_text(json_str);
+        let mut plan = crate::agent::json_repair::try_parse_lenient(&sanitized)
             .map_err(AgentError::WorkflowParse)?;
         dedup_workflow_ids(&mut plan);
         sanitize_depends_on(&mut plan);
@@ -1005,7 +1015,10 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
     // 关联修复: 2026-09-10 hard 任务 Plan 解析 Bug — Plan Agent 输出 JSON 代码块,
     // 但 parse_plan_markdown 只支持 markdown 行级格式,导致解析失败触发无意义重试循环。
     if let Some(json_str) = extract_json_block(content) {
-        if let Ok(plan) = serde_json::from_str::<WorkFlowPlan>(json_str) {
+        // P0-A:Plan 文档路径同样先 sanitize,防止 Plan Agent 输出含 Modifier Letter /
+        // 嵌套角括号的 JSON 时直接放弃整份计划。
+        let sanitized = crate::agent::workflow_json_validate::sanitize_workflow_text(json_str);
+        if let Ok(plan) = serde_json::from_str::<WorkFlowPlan>(&sanitized) {
             if !plan.workflows.is_empty() {
                 return Ok(plan);
             }
@@ -1435,6 +1448,94 @@ mod tests {
         assert_eq!(plan.workflows.len(), 1);
         assert_eq!(plan.workflows[0].id, "wf-1");
         assert_eq!(plan.workflows[0].delegate_to, AgentRole::SubAgent);
+    }
+
+    #[test]
+    fn parse_workflow_plan_sanitizes_modifier_letters_and_nested_quotes() {
+        // 2026-09-16 第 65 轮 P0-A:WorkFlow JSON 含 Unicode Modifier Letter 与
+        // 中文「」嵌套时,sanitize 后应能正常反序列化,而不是触发 JSON 校验失败。
+        // 真实场景:用户输入"赵玲玲AAAA",LLM 在多
+        // 个 JSON 字段里复制该字符串,反复出现嵌套「」和乱码。
+        // 注:Rust 原生字符 \u{1d2c}/\u{1d35} 在非 raw string 中正常,但因测试用
+        // raw string literal 嵌套 JSON 转义易踩坑,这里用普通字符串拼接含 Unicode
+        // 字符的 JSON,避免双重 escape 陷阱。
+        let modifier_a = '\u{1d2c}';
+        let modifier_i = '\u{1d35}';
+        let weird = format!("{modifier_a}{modifier_a}{modifier_i}{modifier_a}");
+        let json = format!(
+            r#"```json
+{{
+  "workflows": [
+    {{
+      "id": "wf-1",
+      "name": "微信自动化",
+      "steps": ["查找名为「赵玲玲{weird}」的用户"],
+      "acceptance": ["已发送消息"],
+      "delegate_to": "windowuse",
+      "depends_on": []
+    }}
+  ],
+  "summary": "找到「赵玲玲{weird}」并发送消息"
+}}
+```"#
+        );
+        let plan = parse_workflow_plan(&json).expect("sanitize 后应能解析");
+        assert_eq!(plan.workflows.len(), 1);
+        assert_eq!(plan.workflows[0].id, "wf-1");
+        assert_eq!(plan.workflows[0].delegate_to, AgentRole::WindowUse);
+        // Modifier Letter 已归一化为 Latin 等价字符:ᴬᴬᴵᴬ → AAIA
+        let first_step = &plan.workflows[0].steps[0];
+        assert!(first_step.contains("AAIA"), "ᴬᴬᴵᴬ 应归一为 AAIA: {first_step}");
+    }
+
+    #[test]
+    fn parse_workflow_plan_preserves_smart_quotes_in_json_strings() {
+        // 2026-09-16 第 65 轮修订:智能引号 \u{201C}\u{201D} 在 JSON 字符串值
+        // 内层是合法的装饰引号,与 JSON 解析器无冲突,无需 sanitize 替换。
+        // 本测试验证含智能引号的 JSON 能正常被 parse_workflow_plan 解析。
+        let left_smart = '\u{201C}';
+        let right_smart = '\u{201D}';
+        let raw = format!(
+            r#"```json
+{{
+  "workflows": [
+    {{"id":"wf-1","name":"{left_smart}测试{right_smart}","steps":["打开微信","点击通讯录"],"acceptance":["ok"],"delegate_to":"windowuse"}}
+  ],
+  "summary": "test"
+}}
+```"#
+        );
+        let plan = parse_workflow_plan(&raw).expect("sanitize 后应能解析");
+        assert_eq!(plan.workflows.len(), 1);
+        assert!(
+            plan.workflows[0].name.contains(left_smart),
+            "智能引号应保留(装饰引号): {0}",
+            plan.workflows[0].name
+        );
+        assert!(plan.workflows[0].name.contains(right_smart));
+    }
+
+    #[test]
+    fn parse_workflow_plan_handles_cjk_inner_ascii_quotes() {
+        // 真实场景:LLM 在中文字符串内层用 ASCII " 包裹用户名(典型错误)。
+        // 如 `"steps":["查找名为"张三"的用户"]`,sanitize 后内层 ASCII " 应被
+        // 替换为「」,JSON 仍合法。
+        let raw = r#"```json
+{
+  "workflows": [
+    {"id":"wf-1","name":"微信任务","steps":["查找名为"张三"的用户并发送消息"],"acceptance":["ok"],"delegate_to":"windowuse"}
+  ],
+  "summary": "test"
+}
+```"#;
+        let plan = parse_workflow_plan(raw).expect("sanitize 后应能解析");
+        assert_eq!(plan.workflows.len(), 1);
+        // 修复后的 step 文本应不含裸 ASCII "包围中文
+        let first_step = &plan.workflows[0].steps[0];
+        assert!(
+            !first_step.contains("\"张") && !first_step.contains("三\""),
+            "中文字符串内的 ASCII \" 应被替换为「」: {first_step}"
+        );
     }
 
     #[test]

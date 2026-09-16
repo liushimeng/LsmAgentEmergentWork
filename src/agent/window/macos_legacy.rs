@@ -850,7 +850,13 @@ impl WindowDriver for MacOsDriver {
             tree.ok_or_else(|| {
                 platform_err(
                     "macos",
-                    format!("filter 未命中窗口 {window_id} 内任何控件,请放宽过滤条件重试"),
+                    format!(
+                        "filter 未命中窗口 {window_id} 内任何控件(已遍历到 max_depth={max_depth})。\
+                         【同义词建议】中文 UI 名称常见笔误:通讯录 ↔ 通信录 ↔ 联系人 ↔ Contacts;\
+                         消息 ↔ 发送 ↔ Send;输入框 ↔ 搜索 ↔ Search;按钮 ↔ Button;关闭 ↔ X ↔ close。\
+                         建议:1) 改用上表同义词重试;2) filter 留空 + max_depth=4-5 看完整树;\
+                         3) 用 WindowScreenshot + 视觉识别(若应用无障碍支持极差)"
+                    ),
                 )
             })
         }

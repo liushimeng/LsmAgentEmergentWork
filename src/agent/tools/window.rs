@@ -725,8 +725,15 @@ impl Tool for WindowOpenTool {
         let wait_secs = args
             .get("wait_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(6)
-            .min(20);
+            // 2026-09-16 第 65 轮 P1-C:微信等大型应用首次启动需 8-10s,默认从 6 改 10。
+            // 可通过 LAEW_WINDOW_OPEN_WAIT 环境变量调整(默认 10,最大 30)。
+            .unwrap_or_else(|| {
+                std::env::var("LAEW_WINDOW_OPEN_WAIT")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(10)
+            })
+            .min(30);
 
         run_blocking(self.name(), move || {
             let driver = current_driver();
@@ -870,7 +877,16 @@ impl Tool for WindowScreenshotTool {
          - output_path 可选:默认 /tmp/laew_screenshot_<时间戳>.png;目录不存在自动 mkdir。\n\
          - region 可选:{\"x\":N,\"y\":N,\"width\":N,\"height\":N} 仅截指定区域。\n\
          平台差异(本工具自动选用):macOS screencapture / Windows PowerShell + System.Drawing /\n\
-         Linux ImageMagick import(尽力而为)。仅做截图,不做视觉识别 —— 若需 OCR/视觉,后续扩展。"
+         Linux ImageMagick import(尽力而为)。仅做截图,不做视觉识别 —— 若需 OCR/视觉,后续扩展。\n\
+         \n\
+         【⚠️ 重要提示(2026-09-16 第 65 轮 P1-A)】\n\
+         1) 本工具只产出 PNG 文件,不做 OCR / 视觉识别;\n\
+         2) **禁止**使用 Read 工具读取 PNG(Read 仅支持 UTF-8 文本,PNG 是二进制会失败);\n\
+         3) 当前 WindowUse 工具集**不包含 OCR 工具**,如需视觉识别须:\n\
+            a) 切换到 WindowInspect(控件树路线);或\n\
+            b) 缩小 region 重试;或\n\
+            c) 终止任务告知用户需 OCR 服务支持(未来扩展)。\n\
+         截图返回 JSON 含 next_action 字段引导后续步骤。"
     }
 
     fn parameters(&self) -> Value {
@@ -937,6 +953,10 @@ impl Tool for WindowScreenshotTool {
             "created_at_unix": ts,
             "platform": std::env::consts::OS,
             "command": command,
+            "next_action": "PNG 已落盘;WindowUse 当前无 OCR 工具,禁止 Read PNG(Read 仅支持 UTF-8 文本)。\
+                           推荐:1) 切换到 WindowInspect 控件树路线;2) 缩小 region 重试;\
+                           3) 若应用无障碍支持极差,终止任务并告知用户需 OCR 服务支持(未来扩展)。",
+            "ocr_available": false,
         });
         Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
     }
@@ -960,7 +980,16 @@ impl Tool for WindowInspectTool {
          - window_id 必填:WindowList 返回的窗口 id。\n\
          - max_depth 可选:遍历深度,默认 3,范围 1-12。控件很多时先用小深度+filter。\n\
          - filter 可选:按控件名/角色子串过滤,只保留命中控件及其祖先链。\n\
-         建议先检视再操作;树过大时输出会自动截断并标注。"
+         建议先检视再操作;树过大时输出会自动截断并标注。\n\
+         \n\
+         【filter 失败时常见同义词表(2026-09-16 第 65 轮 P0-B)】中文 UI 控件名常出现笔误或同义词:\n\
+         - 通讯录 = 通信录 = 联系人 = Contacts = contactsList\n\
+         - 消息 = 发送 = Send = submit\n\
+         - 按钮 = Button\n\
+         - 输入框 = 搜索 = Search = TextField = Edit\n\
+         - 关闭 = X = close = 退出\n\
+         - 设置 = 设置 = 设置 = Settings = Preferences\n\
+         filter 失败时优先改用上表同义词重试,不要立即放弃或全量遍历。"
     }
 
     fn parameters(&self) -> Value {
