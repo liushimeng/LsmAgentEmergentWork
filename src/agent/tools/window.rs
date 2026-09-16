@@ -1,5 +1,5 @@
-//! 窗口操控工具(WindowUse Agent 专用):WindowList / WindowFind / WindowInspect /
-//! WindowAction / WindowScreenshot。
+//! 窗口操控工具(WindowUse Agent 专用):WindowOpen / WindowList / WindowFind /
+//! WindowInspect / WindowAction(视觉工具 WindowOCR / WindowScreenshot 见 window_vision.rs)。
 //!
 //! - 平台差异封闭在 `agent::window` 驱动层,本模块只做参数校验、
 //!   `spawn_blocking` 包裹(UIA COM / AX IPC 可能阻塞)与输出截断;
@@ -31,33 +31,35 @@ const MAX_TREE_BYTES: usize = 32 * 1024;
 /// 窗口列表条数上限。
 const MAX_WINDOWS: usize = 200;
 
-fn tool_err(tool: &str, reason: impl Into<String>) -> AgentError {
+pub(crate) fn tool_err(tool: &str, reason: impl Into<String>) -> AgentError {
     AgentError::ToolExecution {
         tool: tool.into(),
         reason: reason.into(),
     }
 }
 
-fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
 }
 
-fn require_str<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
+pub(crate) fn require_str<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
     get_str(args, key).ok_or_else(|| tool_err(tool, format!("缺少 string 类型参数 {key}")))
 }
 
 /// 扩展常见桌面应用的中英文窗口 / 进程名别名。
 ///
-/// macOS 微信的 `kCGWindowOwnerName` 可能是「微信」,而模型常按英文查询「WeChat」。
-pub(crate) fn expand_window_query(query: &str) -> Vec<String> {
+/// - macOS 微信的 `kCGWindowOwnerName` 可能是「微信」,而模型常按英文查询「WeChat」;
+/// - **Windows 微信 4.x 的进程名是 `Weixin.exe`**(2026-09-16 第 67 轮实测),
+///   3.x 才是 `WeChat.exe` —— 缺这个别名会导致「窗口在眼前也找不到」。
+pub fn expand_window_query(query: &str) -> Vec<String> {
     let mut out = vec![query.to_string()];
     let lower = query.to_lowercase();
-    if lower.contains("wechat") || query.contains("微信") {
-        for alias in ["WeChat", "微信"] {
-            if !out.iter().any(|s| s == alias) {
+    if lower.contains("wechat") || lower.contains("weixin") || query.contains("微信") {
+        for alias in ["WeChat", "微信", "Weixin"] {
+            if !out.iter().any(|s| s.eq_ignore_ascii_case(alias)) {
                 out.push(alias.to_string());
             }
         }
@@ -245,7 +247,7 @@ fn driver_preflight_non_macos(tool: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_blocking<F>(tool: &str, f: F) -> Result<String>
+pub(crate) async fn run_blocking<F>(tool: &str, f: F) -> Result<String>
 where
     F: FnOnce() -> Result<String> + Send + 'static,
 {
@@ -638,70 +640,277 @@ fn safe_desktop_identifier(s: &str) -> bool {
         && s.chars().count() <= 128
 }
 
+// ===================== Windows 启动解析链(2026-09-16 第 67 轮) =====================
+//
+// 背景:微信 4.x(Weixin.exe)既不在 PATH 也不注册 App Paths,实测装在
+// `D:\Program Files (x86)\Tencent\Weixin\`,旧版 `powershell Start-Process WeChat`
+// 必然失败。新解析链(全部 OS API,无 PowerShell):
+//   a. app_name 是已存在的绝对路径(或带 .lnk)→ 直接 ShellExecuteW;
+//   b. `ShellExecuteW("<app>.exe")` —— shell 自动走 App Paths(覆盖多数传统应用);
+//   c. 开始菜单快捷方式扫描(%ProgramData% + %APPDATA%,文件名含别名,.lnk 直接打开)
+//      —— 本机微信 4.x 唯一可靠发现方式:`C:\ProgramData\...\微信\微信.lnk`;
+//   d. 已知安装路径探测(全部固定盘 × Program Files[(x86)] × Tencent\{Weixin,WeChat});
+//   e. 裸名 `ShellExecuteW(app_name)` 兜底(协议 / App Paths)。
+
+/// ShellExecuteW "open"(成功返回 Ok;失败带回 hresult 文案)。
+#[cfg(windows)]
+fn shell_execute_open(target: &str) -> std::result::Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY:标准 ShellExecuteW;参数均为合法宽字符串指针。
+    let r = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // 返回值 > 32 表示成功(SE_ERR_* 为 ≤32 的错误码)
+    let code = r.0 as isize;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW({target}) 失败,错误码 {code}"))
+    }
+}
+
+/// 枚举全部固定磁盘盘符(如 ["C:\\", "D:\\"])。
+#[cfg(windows)]
+fn fixed_drive_roots() -> Vec<String> {
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
+    use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
+    let mut buf = [0u16; 256];
+    // SAFETY:标准 GetLogicalDriveStringsW,缓冲区足够容纳所有盘符。
+    let n = unsafe { GetLogicalDriveStringsW(Some(&mut buf)) } as usize;
+    if n == 0 || n > buf.len() {
+        return vec!["C:\\".to_string()];
+    }
+    let raw = String::from_utf16_lossy(&buf[..n]);
+    let mut out = Vec::new();
+    for root in raw.split('\0').filter(|s| !s.is_empty()) {
+        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY:盘符字符串来自系统返回值。
+        let dt = unsafe { GetDriveTypeW(windows::core::PCWSTR(wide.as_ptr())) };
+        if dt == DRIVE_FIXED {
+            out.push(root.to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push("C:\\".to_string());
+    }
+    out
+}
+
+/// 扫描开始菜单快捷方式,返回「文件名含任一别名」的 .lnk 完整路径(深度 ≤4,数量 ≤5)。
+#[cfg(windows)]
+fn scan_start_menu_shortcuts(aliases: &[String]) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(pd) = std::env::var_os("ProgramData") {
+        let p = std::path::PathBuf::from(&pd).join("Microsoft/Windows/Start Menu/Programs");
+        if p.is_dir() {
+            roots.push(p);
+        }
+    }
+    if let Some(ad) = std::env::var_os("APPDATA") {
+        let p = std::path::PathBuf::from(&ad).join("Microsoft/Windows/Start Menu/Programs");
+        if p.is_dir() {
+            roots.push(p);
+        }
+    }
+    let lower_aliases: Vec<String> = aliases.iter().map(|a| a.to_lowercase()).collect();
+    let mut hits = Vec::new();
+    fn walk(
+        dir: &std::path::Path,
+        depth: usize,
+        lower_aliases: &[String],
+        hits: &mut Vec<std::path::PathBuf>,
+    ) {
+        if depth > 4 || hits.len() >= 5 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, depth + 1, lower_aliases, hits);
+            } else if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("lnk")).unwrap_or(false) {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_default();
+                if !stem.is_empty() && lower_aliases.iter().any(|a| stem.contains(a.as_str())) {
+                    hits.push(path);
+                }
+            }
+        }
+    }
+    for root in roots {
+        walk(&root, 0, &lower_aliases, &mut hits);
+    }
+    hits
+}
+
+/// Windows 启动解析链:返回成功执行的目标(用于错误信息回显)。
+#[cfg(windows)]
+fn launch_windows_app(app: &str, aliases: &[String]) -> std::result::Result<String, String> {
+    // a. 绝对路径 / 显式 .exe / .lnk
+    let p = std::path::Path::new(app);
+    if p.is_absolute() && p.exists() {
+        shell_execute_open(app)?;
+        return Ok(app.to_string());
+    }
+    // b. ShellExecuteW("<app>.exe")(App Paths 解析)
+    if !app.contains('\\') && !app.contains('/') {
+        let exe = if app.to_lowercase().ends_with(".exe") {
+            app.to_string()
+        } else {
+            format!("{app}.exe")
+        };
+        if let Ok(()) = shell_execute_open(&exe) {
+            return Ok(exe);
+        }
+    }
+    // c. 开始菜单快捷方式
+    for lnk in scan_start_menu_shortcuts(aliases) {
+        if let Some(s) = lnk.to_str() {
+            if shell_execute_open(s).is_ok() {
+                return Ok(s.to_string());
+            }
+        }
+    }
+    // d. 已知安装路径探测(Tencent 家族:微信 4.x=Weixin,3.x=WeChat;QQ 同目录族)
+    let lower = app.to_lowercase();
+    let family = ["weixin", "wechat", "微信", "qq"];
+    if family.iter().any(|f| lower.contains(f)) || aliases.iter().any(|a| {
+        let a = a.to_lowercase();
+        family.iter().any(|f| a.contains(f))
+    }) {
+        let mut candidates = Vec::new();
+        for root in fixed_drive_roots() {
+            for pf in ["Program Files", "Program Files (x86)"] {
+                candidates.push(format!("{root}{pf}\\Tencent\\Weixin\\Weixin.exe"));
+                candidates.push(format!("{root}{pf}\\Tencent\\WeChat\\WeChat.exe"));
+            }
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(format!(
+                "{}\\Programs\\Tencent\\Weixin\\Weixin.exe",
+                local.to_string_lossy()
+            ));
+            candidates.push(format!(
+                "{}\\Programs\\Tencent\\WeChat\\WeChat.exe",
+                local.to_string_lossy()
+            ));
+        }
+        let tried: Vec<String> = candidates.clone();
+        for c in candidates {
+            if std::path::Path::new(&c).exists() {
+                if let Ok(()) = shell_execute_open(&c) {
+                    return Ok(c);
+                }
+            }
+        }
+        // 都不存在 → 带尝试清单失败(排查可见)
+        return Err(format!(
+            "未找到微信安装路径;已探测: {:?};建议改用开始菜单快捷方式或提供完整 exe 路径作为 app_name",
+            tried
+                .iter()
+                .filter(|c| std::path::Path::new(c.as_str()).exists())
+                .cloned()
+                .collect::<Vec<_>>()
+        ));
+    }
+    // e. 裸名兜底(协议 / App Paths)
+    match shell_execute_open(app) {
+        Ok(()) => Ok(app.to_string()),
+        Err(e) => Err(format!(
+            "{e};建议:1) 提供 app_name 完整路径;2) 先手动打开应用再让 WindowOpen 激活"
+        )),
+    }
+}
+
 fn launch_desktop_app(
     app: &str,
     bundle_id: Option<&str>,
 ) -> std::result::Result<Vec<String>, String> {
-    use std::process::{Command, Stdio};
-
-    let aliases = expand_window_query(app);
-    let mut candidates = vec![app.to_string()];
-    for alias in aliases {
-        if !candidates.contains(&alias) {
-            candidates.push(alias);
+    // 2026-09-16 第 67 轮:Windows 走 OS API 解析链(ShellExecuteW / 快捷方式 / 安装路径)
+    #[cfg(windows)]
+    {
+        let aliases = expand_window_query(app);
+        if !safe_desktop_identifier(app) {
+            return Err(format!("非法应用标识: {app:?}"));
         }
-    }
-    let mut tried = Vec::new();
-    for candidate in candidates {
-        if !safe_desktop_identifier(&candidate) {
-            return Err(format!("非法应用标识: {candidate:?}"));
-        }
-        let display = if cfg!(target_os = "macos") {
-            bundle_id
-                .filter(|s| safe_desktop_identifier(s))
-                .map(|b| format!("open -b {b}"))
-                .unwrap_or_else(|| format!("open -a {candidate}"))
-        } else if cfg!(windows) {
-            if candidate.contains('\'') {
-                continue;
-            }
-            format!("Start-Process {candidate}")
-        } else {
-            format!("gtk-launch {}", candidate.trim_end_matches(".desktop"))
+        return match launch_windows_app(app, &aliases) {
+            Ok(target) => Ok(vec![format!("ShellExecuteW(open, {target})")]),
+            Err(e) => Err(e),
         };
+    }
 
-        let mut command = if cfg!(target_os = "macos") {
-            let mut c = Command::new("open");
-            if let Some(b) = bundle_id.filter(|s| safe_desktop_identifier(s)) {
-                c.arg("-b").arg(b);
+    // macOS / Linux 维持原 open / gtk-launch 路径
+    #[cfg(not(windows))]
+    {
+        use std::process::{Command, Stdio};
+        let aliases = expand_window_query(app);
+        let mut candidates = vec![app.to_string()];
+        for alias in aliases {
+            if !candidates.contains(&alias) {
+                candidates.push(alias);
+            }
+        }
+        let mut tried = Vec::new();
+        for candidate in candidates {
+            if !safe_desktop_identifier(&candidate) {
+                return Err(format!("非法应用标识: {candidate:?}"));
+            }
+            let display = if cfg!(target_os = "macos") {
+                bundle_id
+                    .filter(|s| safe_desktop_identifier(s))
+                    .map(|b| format!("open -b {b}"))
+                    .unwrap_or_else(|| format!("open -a {candidate}"))
             } else {
-                c.arg("-a").arg(&candidate);
+                format!("gtk-launch {}", candidate.trim_end_matches(".desktop"))
+            };
+
+            let mut command = if cfg!(target_os = "macos") {
+                let mut c = Command::new("open");
+                if let Some(b) = bundle_id.filter(|s| safe_desktop_identifier(s)) {
+                    c.arg("-b").arg(b);
+                } else {
+                    c.arg("-a").arg(&candidate);
+                }
+                c
+            } else {
+                let mut c = Command::new("gtk-launch");
+                c.arg(candidate.trim_end_matches(".desktop"));
+                c
+            };
+            let status = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            tried.push(display);
+            match status {
+                Ok(s) if s.success() => return Ok(tried),
+                Ok(s) => return Err(format!("启动命令退出码异常: {s};已尝试: {tried:?}")),
+                Err(e) if cfg!(target_os = "macos") && tried.len() < 3 => {
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => return Err(format!("无法执行启动命令: {e};已尝试: {tried:?}")),
             }
-            c
-        } else if cfg!(windows) {
-            let mut c = Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Process"])
-                .arg(&candidate);
-            c
-        } else {
-            let mut c = Command::new("gtk-launch");
-            c.arg(candidate.trim_end_matches(".desktop"));
-            c
-        };
-        let status = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        tried.push(display);
-        match status {
-            Ok(s) if s.success() => return Ok(tried),
-            Ok(s) => return Err(format!("启动命令退出码异常: {s};已尝试: {tried:?}")),
-            Err(e) if cfg!(target_os = "macos") && tried.len() < 3 => continue,
-            Err(e) => return Err(format!("无法执行启动命令: {e};已尝试: {tried:?}")),
         }
+        Err("未找到可执行的应用标识".into())
     }
-    Err("未找到可执行的应用标识".into())
 }
 
 #[async_trait]
@@ -751,6 +960,42 @@ impl Tool for WindowOpenTool {
             let aliases = expand_window_query(&query);
             let before_hit = find_window_by_aliases(&before, &aliases);
             let started = std::time::Instant::now();
+
+            // 2026-09-16 第 67 轮:已在运行(含最小化到托盘)→ 恢复 + 前置,不重复启动。
+            // 此前无视已有窗口直接再启动一次,既浪费又可能触发单实例冲突。
+            if let Some((matched_query, info)) = before_hit.clone() {
+                let activated = driver.bring_to_front(&info.id).is_ok();
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                // 前置后重取一次最新 bounds(恢复最小化后 -32000 会刷新为真实坐标)
+                let refreshed = driver
+                    .list_windows(None)
+                    .ok()
+                    .and_then(|ws| ws.into_iter().find(|w| w.id == info.id))
+                    .unwrap_or(info);
+                let permission_hint = driver.permission_hint();
+                let body = json!({
+                    "ok":true,
+                    "window_id":refreshed.id,
+                    "title":refreshed.title,
+                    "process_name":refreshed.process_name,
+                    "pid":refreshed.pid,
+                    "bounds":refreshed.bounds,
+                    "query":query,
+                    "matched_query":matched_query,
+                    "query_aliases":aliases,
+                    "already_visible_before_launch":true,
+                    "activated_existing":activated,
+                    "visible_before":before.len(),
+                "launch_commands":[],
+                    "wait_ms":started.elapsed().as_millis() as u64,
+                    "driver":driver.platform_name(),
+                    "inspect_ready":permission_hint.is_none(),
+                    "permission_hint":permission_hint,
+                    "next_action":"窗口已在运行并已激活;直接 WindowInspect / WindowOCR 继续。若控件树为空(自绘 UI),改用 WindowOCR 视觉路线。"
+                });
+                return Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()));
+            }
+
             let commands =
                 launch_desktop_app(&app_name, bundle_id.as_deref())
                     .map_err(|e| tool_err("WindowOpen", e))?;
@@ -774,7 +1019,8 @@ impl Tool for WindowOpenTool {
                 return Err(tool_err(
                     "WindowOpen",
                     format!(
-                        "启动命令已执行({commands:?},耗时 {:.1}s),但 {wait_secs}s 内未匹配到窗口。尝试别名:{aliases:?};当前可见前 10 个:{titles:?}",
+                        "启动命令已执行({commands:?},耗时 {:.1}s),但 {wait_secs}s 内未匹配到窗口。尝试别名:{aliases:?};当前可见前 10 个:{titles:?}。\
+                         提示:应用可能弹出了登录窗(标题不同)或启动较慢;可用 WindowList(filter=相关词)确认,或加大 wait_seconds 重试。",
                         started.elapsed().as_secs_f32()
                     ),
                 ));
@@ -798,177 +1044,11 @@ impl Tool for WindowOpenTool {
                 "driver":driver.platform_name(),
                 "inspect_ready":permission_hint.is_none(),
                 "permission_hint":permission_hint,
-                "next_action":"inspect_ready=true 时用 window_id 调 WindowInspect;否则先按权限提示完成授权。"
+                "next_action":"inspect_ready=true 时用 window_id 调 WindowInspect;控件树为空(自绘 UI)时改用 WindowOCR。"
             });
             Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
         })
         .await
-    }
-}
-
-// ===================== WindowScreenshot =====================
-//
-// 2026-09-16 第 56 轮:WindowUse 工具集新增 WindowScreenshot。
-// 背景:为后续 OCR / 视觉验证铺路 —— 当 WindowInspect 拿不到可读控件树(如
-// Electron 应用、canvas 渲染、自绘控件)时,截图 + 视觉模型是唯一出路。本工具
-// 仅做截图落盘,不做视觉识别(避免引入 OCR / ML 依赖,本轮只提供原图)。
-//
-// 平台实现(本工具不依赖 WindowDriver,直接走系统命令,白名单内可放行):
-// - macOS: `screencapture -x -t png <path>`(区域截图: `-R x,y,w,h`)。
-// - Windows: PowerShell + System.Drawing(Graphics.CopyFromScreen)。
-// - Linux: `import` (ImageMagick) 或 `scrot`(尽力而为,缺则失败提示)。
-//
-// 参数:
-// - output_path:可选,默认 `/tmp/laew_screenshot_<时间戳>.png`;若指定
-//   目录不存在则自动 mkdir。
-// - region:可选 JSON {x,y,width,height},仅截指定区域;不支持则报错。
-// 返回:JSON {"path":"...","size_bytes":N,"created_at":"..."}。
-
-/// 平台默认截图命令(白名单内)。
-#[cfg(target_os = "macos")]
-fn default_screenshot_command(output_path: &str, region: Option<&Value>) -> String {
-    if let Some(reg) = region {
-        let x = reg.get("x").and_then(Value::as_i64).unwrap_or(0);
-        let y = reg.get("y").and_then(Value::as_i64).unwrap_or(0);
-        let w = reg.get("width").and_then(Value::as_i64).unwrap_or(0);
-        let h = reg.get("height").and_then(Value::as_i64).unwrap_or(0);
-        format!("screencapture -x -R{x},{y},{w},{h} -t png {output_path}")
-    } else {
-        format!("screencapture -x -t png {output_path}")
-    }
-}
-
-#[cfg(windows)]
-fn default_screenshot_command(output_path: &str, region: Option<&Value>) -> String {
-    let script = if let Some(reg) = region {
-        let x = reg.get("x").and_then(Value::as_i64).unwrap_or(0);
-        let y = reg.get("y").and_then(Value::as_i64).unwrap_or(0);
-        let w = reg.get("width").and_then(Value::as_i64).unwrap_or(0);
-        let h = reg.get("height").and_then(Value::as_i64).unwrap_or(0);
-        format!(
-            "Add-Type -AssemblyName System.Drawing; \
-             $bmp = New-Object System.Drawing.Bitmap {w},{h}; \
-             $g = [System.Drawing.Graphics]::FromImage($bmp); \
-             $g.CopyFromScreen({x},{y},0,0,$bmp.Size); \
-             $bmp.Save('{output_path}',[System.Drawing.Imaging.ImageFormat]::Png); \
-             $g.Dispose(); $bmp.Dispose()"
-        )
-    } else {
-        format!(
-            "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
-             $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
-             $bmp = New-Object System.Drawing.Bitmap $b.Width,$b.Height; \
-             $g = [System.Drawing.Graphics]::FromImage($bmp); \
-             $g.CopyFromScreen($b.Location,[Drawing.Point]::Empty,$bmp.Size); \
-             $bmp.Save('{output_path}',[System.Drawing.Imaging.ImageFormat]::Png); \
-             $g.Dispose(); $bmp.Dispose()"
-        )
-    };
-    format!("powershell -NoProfile -NonInteractive -Command \"{script}\"")
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-fn default_screenshot_command(_output_path: &str, _region: Option<&Value>) -> String {
-    // Linux:ImageMagick import(常用);失败可改 scrot。
-    "import -window root /tmp/laew_screen.png".to_string()
-}
-
-/// 落盘截图(走系统命令,需 WindowUse Bash 白名单内)。
-pub struct WindowScreenshotTool;
-
-#[async_trait]
-impl Tool for WindowScreenshotTool {
-    fn name(&self) -> &str {
-        "WindowScreenshot"
-    }
-
-    fn description(&self) -> &str {
-        "截图落盘,返回 PNG 文件路径(为后续 OCR / 视觉验证铺路)。\n\
-         - output_path 可选:默认 /tmp/laew_screenshot_<时间戳>.png;目录不存在自动 mkdir。\n\
-         - region 可选:{\"x\":N,\"y\":N,\"width\":N,\"height\":N} 仅截指定区域。\n\
-         平台差异(本工具自动选用):macOS screencapture / Windows PowerShell + System.Drawing /\n\
-         Linux ImageMagick import(尽力而为)。仅做截图,不做视觉识别 —— 若需 OCR/视觉,后续扩展。\n\
-         \n\
-         【⚠️ 重要提示(2026-09-16 第 65 轮 P1-A)】\n\
-         1) 本工具只产出 PNG 文件,不做 OCR / 视觉识别;\n\
-         2) **禁止**使用 Read 工具读取 PNG(Read 仅支持 UTF-8 文本,PNG 是二进制会失败);\n\
-         3) 当前 WindowUse 工具集**不包含 OCR 工具**,如需视觉识别须:\n\
-            a) 切换到 WindowInspect(控件树路线);或\n\
-            b) 缩小 region 重试;或\n\
-            c) 终止任务告知用户需 OCR 服务支持(未来扩展)。\n\
-         截图返回 JSON 含 next_action 字段引导后续步骤。"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "output_path": { "type": "string", "description": "输出 PNG 路径,默认 /tmp/laew_screenshot_<ts>.png" },
-                "region": {
-                    "type": "object",
-                    "properties": {
-                        "x": { "type": "integer" },
-                        "y": { "type": "integer" },
-                        "width": { "type": "integer" },
-                        "height": { "type": "integer" }
-                    },
-                    "required": ["x", "y", "width", "height"],
-                    "description": "可选截图区域"
-                }
-            },
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<String> {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let output_path = get_str(&args, "output_path")
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("/tmp/laew_screenshot_{ts}.png"));
-        let region = args.get("region").cloned();
-
-        // 落盘前确保父目录存在(纯 Rust 调用,不进入白名单校验)。
-        if let Some(parent) = std::path::Path::new(&output_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    tool_err(self.name(), format!("创建父目录 {:?} 失败: {}", parent, e))
-                })?;
-            }
-        }
-
-        let command = default_screenshot_command(&output_path, region.as_ref());
-        // 走 BashTool 执行(WindowUse 白名单模式由 WindowUseRunner 提前开启,
-        // 此处直接调;在 WindowUse Runner 上下文里 LAEW_WINDOW_USE_MODE 已设 1)。
-        let bash = crate::agent::tools::bash::BashTool;
-        let bash_args = json!({
-            "command": command,
-            "timeout_ms": 30000
-        });
-        let output = bash.execute(bash_args).await?;
-
-        // 校验产物文件存在
-        let meta = std::fs::metadata(&output_path).map_err(|e| {
-            tool_err(
-                self.name(),
-                format!("截图未生成: {};命令输出={}", e, output),
-            )
-        })?;
-        let size_bytes = meta.len();
-        let body = json!({
-            "path": output_path,
-            "size_bytes": size_bytes,
-            "created_at_unix": ts,
-            "platform": std::env::consts::OS,
-            "command": command,
-            "next_action": "PNG 已落盘;WindowUse 当前无 OCR 工具,禁止 Read PNG(Read 仅支持 UTF-8 文本)。\
-                           推荐:1) 切换到 WindowInspect 控件树路线;2) 缩小 region 重试;\
-                           3) 若应用无障碍支持极差,终止任务并告知用户需 OCR 服务支持(未来扩展)。",
-            "ocr_available": false,
-        });
-        Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
     }
 }
 
@@ -1045,30 +1125,39 @@ impl Tool for WindowActionTool {
     }
 
     fn description(&self) -> &str {
-        "对指定窗口内指定控件执行一个操作。\n\
-         - window_id 必填:WindowList 返回的窗口 id。\n\
-         - path 必填:WindowInspect 返回的控件路径(如 /0/2/1;\"/\" 表示窗口本身)。\n\
-         - action 必填:click(点击按钮等) / invoke(同 click) / focus(聚焦) /\n\
-           set_text(写入文本,需 text 参数) / get_text(读取文本) /\n\
-           send_keys(按键,text 传命名键:enter/tab/esc/space/delete/up/down/left/right/pageup/pagedown) /\n\
-           scroll(滚轮滚动,text 传方向与行数:\"down:3\"/\"up:5\",缺省 3 行) /\n\
-           scroll_to_visible(把控件滚动到可见区域,列表定位场景比盲滚精准)。\n\
-         - text 可选:set_text/send_keys/scroll 的文本内容。\n\
-         控件是否支持某动作请参考 WindowInspect 返回的 actions 列表;路径失效时重新 WindowInspect。"
+        "对指定窗口执行一个操作 —— 双路线:\n\
+         【A. 控件树路线(原生/标准 UI)】window_id + path 定位控件:\n\
+         - path 用 WindowInspect 返回的控件路径(如 /0/2/1;\"/\" 表示窗口本身);\n\
+         - action:click(点击) / invoke(同 click) / focus(聚焦) /\n\
+           set_text(写入文本,需 text) / get_text(读取文本) /\n\
+           send_keys(按键,text 传命名键或组合键:enter/ctrl+a/alt+f4) /\n\
+           scroll(滚轮,text 传 \"down:3\"/\"up:5\" 缺省 3 行) /\n\
+           scroll_to_visible(把控件滚动到可见)。\n\
+         【B. 视觉/坐标路线(自绘 UI:微信 4.x、QQ、游戏等控件树为空的应用)】\n\
+         - 坐标来自 WindowOCR 返回的 blocks(screen_x/screen_y 取中心):\n\
+         - click_point / double_click_point / right_click_point(需 x,y:屏幕绝对坐标) /\n\
+           scroll_point(需 x,y;text 传方向行数如 \"down:3\") /\n\
+           type_text(向当前焦点真实键入 text,配合 click_point 先点输入框)。\n\
+         坐标动作的 path 照传 \"/\" 即可。控件是否支持某动作参考 WindowInspect 的 actions;路径失效时重新 WindowInspect。"
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "window_id": { "type": "string", "description": "WindowList 返回的窗口 id" },
-                "path": { "type": "string", "description": "控件路径,如 /0/2/1;\"/\" 表示窗口本身" },
+                "window_id": { "type": "string", "description": "WindowList/WindowOpen/WindowFind 返回的窗口 id" },
+                "path": { "type": "string", "description": "控件路径,如 /0/2/1;\"/\" 表示窗口本身(坐标动作照传 \"/\")" },
                 "action": {
                     "type": "string",
-                    "enum": ["click", "invoke", "focus", "set_text", "get_text", "send_keys", "scroll", "scroll_to_visible"],
-                    "description": "要执行的动作"
+                    "enum": [
+                        "click", "invoke", "focus", "set_text", "get_text", "send_keys", "scroll", "scroll_to_visible",
+                        "click_point", "double_click_point", "right_click_point", "scroll_point", "type_text"
+                    ],
+                    "description": "要执行的动作(控件树路线 / 坐标视觉路线)"
                 },
-                "text": { "type": "string", "description": "set_text/send_keys/scroll 的文本内容(scroll 形如 down:3)" }
+                "text": { "type": "string", "description": "set_text/send_keys/type_text 的文本;scroll/scroll_point 传方向行数(down:3)" },
+                "x": { "type": "integer", "description": "坐标动作必填:屏幕绝对 X(取 WindowOCR 返回 screen_x 中心)" },
+                "y": { "type": "integer", "description": "坐标动作必填:屏幕绝对 Y(取 WindowOCR 返回 screen_y 中心)" }
             },
             "required": ["window_id", "path", "action"],
             "additionalProperties": false
@@ -1080,7 +1169,10 @@ impl Tool for WindowActionTool {
         let path = require_str(&args, "path", self.name())?.to_string();
         let action_name = require_str(&args, "action", self.name())?;
         let text = get_str(&args, "text").map(str::to_string);
-        let action = ControlAction::parse(action_name, text)?;
+        // 2026-09-16 第 67 轮:坐标动作参数(x/y 屏幕绝对坐标,来自 WindowOCR)
+        let x = args.get("x").and_then(Value::as_i64);
+        let y = args.get("y").and_then(Value::as_i64);
+        let action = ControlAction::parse_ext(action_name, text, x, y)?;
         driver_preflight(self.name()).await?;
         run_blocking(self.name(), move || {
             let driver = current_driver();
@@ -1290,13 +1382,30 @@ mod tests {
 
     #[test]
     fn window_query_aliases_cover_localized_wechat() {
+        // 2026-09-16 第 67 轮:新增 Weixin 别名(Windows 微信 4.x 进程名 Weixin.exe)
         assert_eq!(
             expand_window_query("WeChat"),
-            vec!["WeChat".to_string(), "微信".to_string()]
+            vec![
+                "WeChat".to_string(),
+                "微信".to_string(),
+                "Weixin".to_string()
+            ]
         );
         assert_eq!(
             expand_window_query("微信"),
-            vec!["微信".to_string(), "WeChat".to_string()]
+            vec![
+                "微信".to_string(),
+                "WeChat".to_string(),
+                "Weixin".to_string()
+            ]
+        );
+        assert_eq!(
+            expand_window_query("weixin"),
+            vec![
+                "weixin".to_string(),
+                "WeChat".to_string(),
+                "微信".to_string(),
+            ]
         );
         assert_eq!(expand_window_query("Safari"), vec!["Safari".to_string()]);
     }
@@ -1341,31 +1450,11 @@ mod tests {
         assert!(hit.score > 0.3);
     }
 
-    #[test]
-    fn default_screenshot_command_macos() {
-        if cfg!(target_os = "macos") {
-            let cmd = default_screenshot_command("/tmp/x.png", None);
-            assert!(cmd.contains("screencapture"));
-            assert!(cmd.contains("/tmp/x.png"));
-            let cmd2 = default_screenshot_command(
-                "/tmp/x.png",
-                Some(&json!({"x":10,"y":20,"width":100,"height":200})),
-            );
-            assert!(cmd2.contains("10,20,100,200"));
-        }
-    }
-
-    #[test]
-    fn default_screenshot_command_linux() {
-        if cfg!(not(any(target_os = "macos", windows))) {
-            let cmd = default_screenshot_command("/tmp/x.png", None);
-            assert!(!cmd.is_empty());
-        }
-    }
 
     // ========== 2026-09-16 第 60 轮:macOS 辅助功能权限请求测试 ==========
 
     /// 测试 AxPermissionResult 枚举的创建和匹配。
+    #[cfg(target_os = "macos")]
     #[test]
     fn ax_permission_result_granted() {
         let result = AxPermissionResult::Granted;
@@ -1375,6 +1464,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn ax_permission_result_denied() {
         let msg = "测试拒绝消息".to_string();

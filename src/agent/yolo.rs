@@ -332,6 +332,7 @@ const WINDOW_USE_KEYWORDS: &[&str] = &[
     "窗口",
     "微信",
     "wechat",
+    "weixin",
     "qq",
     "钉钉",
     "dingtalk",

@@ -212,18 +212,21 @@ where
     Ok(role)
 }
 
-// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B) ==========
+// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B;第 67 轮语义修正) ==========
 //
 // 2026-09-16 第 54 轮:实测「打开微信发消息」任务 Main-Work 把含 osascript 步骤的工作流
-// delegate_to=windowuse,但 WindowUse 没有 Bash 工具,导致 SubAgent 循环无法执行命令 →
-// 任务空转失败。修复:解析 WorkFlowPlan 后,基于步骤文本 + branches 文本 + 验收文本
-// 的关键词匹配,自动纠正 delegate_to。
-//   - 命中 shell 命令关键词(osascript / screencapture / cliclick / pbcopy / System Events /
-//     坐标点击 / keystroke 等) → SubAgent(WindowUse 没有 Bash 工具,即便有也是白名单)
-//   - 命中 GUI 控件关键词(WindowList / WindowInspect / WindowAction / 点击按钮 /
-//     控件树 / 枚举窗口) → WindowUse
-//   - 都命中 / 都没命中 → 保持 Main-Work 显式选择(不强行覆盖)
-// 纯字符串匹配,无新依赖;纠正日志写到 tracing::info!,QC 报告可观察到。
+// delegate_to=windowuse,但当时 WindowUse 没有 Bash 工具,导致 SubAgent 循环无法执行命令。
+// 修复:解析 WorkFlowPlan 后,基于步骤文本 + branches 文本 + 验收文本的关键词匹配纠正。
+//
+// 2026-09-16 第 67 轮语义修正(微信 4.x 实测复盘):WindowUse 已带 Bash 白名单 +
+// SendInput/OCR 原生能力,推断优先级改为「GUI 优先」:
+//   - 命中 GUI 关键词(WindowList/WindowInspect/WindowAction/WindowOCR/点击按钮/
+//     控件树/微信/鼠标/滚轮/通讯录 等)→ WindowUse(即便同时出现 osascript 等 shell 词);
+//   - 仅命中 shell 关键词(osascript/xdotool/wmctrl/adb 等)→ SubAgent;
+//   - 网页关键词且无 GUI 词 → WebUse;
+//   - 都没命中 → 保持 Main-Work 显式选择(不强行覆盖)。
+// 旧版把 "powershell/shell/uiautomation" 列在 shell 侧且双命中判 SubAgent,是本次
+// 「微信任务被路由到 Bash 路线 → 判微信未安装」的直接根因。
 
 const SUBAGENT_KEYWORDS: &[&str] = &[
     "osascript",
@@ -236,9 +239,6 @@ const SUBAGENT_KEYWORDS: &[&str] = &[
     "keystroke",
     "坐标点击",
     "剪贴板",
-    "sendinput",
-    "uiautomation",
-    "powershell",
     "xdotool",
     "wmctrl",
     "adb shell",
@@ -246,13 +246,19 @@ const SUBAGENT_KEYWORDS: &[&str] = &[
     "input keyevent",
     "input tap",
     "adb ",
-    "shell",
+    // 2026-09-16 第 67 轮:移除 "powershell" / "shell" / "uiautomation" / "sendinput" ——
+    // 实测微信任务 Main-Work 在 steps 里写「用 PowerShell 检查进程」就会被这几个
+    // 过宽词强制改判 SubAgent(GUI 任务被路由到 Bash 路线的直接根因)。
+    // UIAutomation/SendInput 恰恰是 WindowUse 驱动层的本职能力,语义反转;
+    // WindowUse 自带 Bash 白名单(桌面操控类命令),GUI 优先不会丢失 shell 能力。
 ];
 
 const WINDOW_USE_KEYWORDS: &[&str] = &[
     "windowlist",
     "windowinspect",
     "windowaction",
+    "windowopen",
+    "windowocr",
     "控件树",
     "枚举窗口",
     "ui automation",
@@ -260,8 +266,22 @@ const WINDOW_USE_KEYWORDS: &[&str] = &[
     "set_text",
     "控件路径",
     "无障碍",
-    "ui automation",
     "invoke pattern",
+    // 2026-09-16 第 67 轮:GUI 动作词与桌面应用词扩充(对齐用户「OS API 优先」原则)
+    "鼠标",
+    "滚轮",
+    "通讯录",
+    "聊天窗口",
+    "输入框",
+    "点击按钮",
+    "桌面应用",
+    "微信",
+    "wechat",
+    "weixin",
+    "钉钉",
+    "dingtalk",
+    "飞书",
+    "feishu",
 ];
 
 /// 2026-09-16 第 61 轮:浏览器/网页操控关键词(Chromium-WebUse,第 11 角色)。
@@ -333,16 +353,20 @@ pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     let web_hit = text_contains_any_ci(&text, WEB_USE_KEYWORDS);
     // 2026-09-16 第 61 轮:网页/浏览器操控 → WebUse(shell 仍最优先,WebUse 无 Bash 工具;
     // web+gui 同命中按网页处理,网页语境也有"控件"表述)。
-    if web_hit && !shell_hit {
+    if web_hit && !shell_hit && !gui_hit {
         return Some(AgentRole::WebUse);
     }
     match (shell_hit, gui_hit) {
-        // shell 命令占主导 → 必须 SubAgent(WindowUse 没有 Bash / 只有白名单)
+        // shell 命令占主导 → 必须 SubAgent(纯 shell 流程)
         (true, false) => Some(AgentRole::SubAgent),
         // GUI 控件占主导 → WindowUse
         (false, true) => Some(AgentRole::WindowUse),
-        // 都命中 → shell 优先(更通用的工具集,且 WindowUse 已扩 Bash 白名单兜底)
-        (true, true) => Some(AgentRole::SubAgent),
+        // 2026-09-16 第 67 轮:双命中改判 WindowUse(原 SubAgent)。
+        // 微信任务实测根因:steps 同时出现「点击通讯录」与「osascript/剪贴板」时
+        // 被误判 SubAgent → 8 次 bash 进程检查全失败 →「微信客户端未安装」。
+        // WindowUse 自带 Bash 白名单(桌面操控类命令可执行),GUI 优先不丢 shell 能力,
+        // 且符合「优先 OS API(UIA/OCR/SendInput),Bash 其次」的产品原则。
+        (true, true) => Some(AgentRole::WindowUse),
         // 都没命中 → 保持原样
         (false, false) => None,
     }
@@ -371,10 +395,14 @@ mod infer_tests {
 
     #[test]
     fn shell_steps_route_to_subagent() {
+        // 2026-09-16 第 67 轮:纯 shell 流程(不含 GUI 词)仍判 SubAgent。
+        // 注:原用例的 'tell application "WeChat" to activate' 因含 GUI 词 WeChat,
+        // 新语义下正确改判 WindowUse(激活微信本就是窗口操控),已拆到
+        // wechat_powershell_steps_route_to_windowuse / both_keywords_pick_windowuse。
         let spec = WorkFlowSpec {
             id: "wf-1".into(),
-            name: "启动微信".into(),
-            steps: vec!["执行 osascript -e 'tell application \"WeChat\" to activate'".into()],
+            name: "音量查询".into(),
+            steps: vec!["执行 osascript -e 'output volume of (get volume settings)'".into()],
             branches: vec![],
             loops: vec![],
             depends_on: vec![],
@@ -444,15 +472,17 @@ mod infer_tests {
             summary: String::new(),
             degraded: false,
         };
-        coalesce_wechat_window_workflows(&mut plan);
+        coalesce_same_app_window_workflows(&mut plan);
         assert_eq!(plan.workflows.len(), 1);
         assert_eq!(plan.workflows[0].steps.len(), 3);
         assert!(plan.workflows[0].acceptance.len() >= 3);
     }
 
     #[test]
-    fn both_keywords_pick_subagent() {
-        // 混合型:osascript + 控件关键词 → 优先 SubAgent(通用工具集更稳妥)
+    fn both_keywords_pick_windowuse() {
+        // 2026-09-16 第 67 轮语义修正:混合型(osascript + 控件关键词)→ WindowUse。
+        // 旧版判 SubAgent 是「微信任务被路由到 Bash 路线」的直接根因;
+        // WindowUse 已带 Bash 白名单 + SendInput/OCR 原生能力,GUI 优先不丢 shell。
         let spec = WorkFlowSpec {
             id: "wf-mix".into(),
             name: "混合".into(),
@@ -465,6 +495,43 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WindowUse));
+    }
+
+    #[test]
+    fn wechat_powershell_steps_route_to_windowuse() {
+        // 第 67 轮核心回归:复现本次失败 —— steps 含「PowerShell 检查进程」+「点击通讯录」,
+        // 旧版被 "powershell/shell" 宽词判 SubAgent;新版必须 WindowUse。
+        let spec = WorkFlowSpec {
+            id: "wf-wx".into(),
+            name: "微信操控".into(),
+            steps: vec![
+                "用 PowerShell 确认微信客户端已启动".into(),
+                "找到通讯录按钮并点击".into(),
+                "遍历联系人列表找到目标用户".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec!["消息出现在会话窗口".into()],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WindowUse));
+    }
+
+    #[test]
+    fn pure_shell_steps_still_route_to_subagent() {
+        // 纯 shell 流程(无 GUI 词)仍判 SubAgent
+        let spec = WorkFlowSpec {
+            id: "wf-sh".into(),
+            name: "统计".into(),
+            steps: vec!["osascript -e 'get volume as string'".into()],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::WindowUse,
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -595,7 +662,14 @@ impl MainWorkRunner {
                跨单元会丢失真实焦点与控件状态。只有不同应用或互不依赖的窗口操作才允许拆分。\n\
              - acceptance 必须是可执行验证的验收标准(命令 / 可比对的预期输出),不要写「完成目标」这类空话。\n\
              - acceptance 中涉及文本长度验证时,使用字符计数(wc -m / ${#var})而非字节计数(length($0) / wc -c),\n\
-               避免中文 UTF-8(每字 3 字节)导致计数偏差。",
+               避免中文 UTF-8(每字 3 字节)导致计数偏差。\n\
+             - delegate_to=windowuse 的流程,acceptance 用 **UI 结果验证**(窗口内出现的目标文本/\n\
+               控件状态/OCR 可见性),不要写「进程存在/窗口标题/bash 检查」类验收 ——\n\
+               桌面应用的进程名常与产品名不一致(如微信 4.x 是 Weixin.exe 而非 WeChat.exe),\n\
+               bash 进程检查极易误判「应用未安装」。\n\
+             - 同一应用的连续 UI 操作链(打开/激活 → 检视/OCR → 点击 → 输入 → 发送 → 复查)必须\n\
+               合并为一个 windowuse WorkFlow;微信 4.x 等自绘 UI 的控件树为空,WindowUse 会自动\n\
+               走 WindowOCR + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -666,9 +740,8 @@ impl MainWorkRunner {
                 }
             }
         }
-        if let Some("windowuse") = suggested_delegate {
-            coalesce_wechat_window_workflows(&mut plan);
-        }
+        // 2026-09-16 第 67 轮:同应用 WindowUse 链合并不再要求 suggested_delegate=windowuse
+        coalesce_same_app_window_workflows(&mut plan);
 
         let _ = memory::record_entry(
             &self.db,
@@ -693,67 +766,85 @@ impl MainWorkRunner {
 }
 
 /// 2026-09-16 第 61 轮:把同一微信 UI 链的多个 WindowUse 单元自动合并。
+/// 2026-09-16 第 67 轮:泛化为 `coalesce_same_app_window_workflows` —— 按 app 家族
+/// (微信/QQ/钉钉/飞书/Telegram)分组,同族 ≥2 个 WindowUse 单元自动合并,
+/// 且不再要求 suggested_delegate=windowuse 才触发(所有 WindowUse 链都受益)。
 ///
 /// 实测 Main-Work 常把「打开微信 → 搜索联系人 → 打开会话 → 输入 → 发送」拆成
 /// 5 个串行单元。每个单元都有独立 Agent 上下文,真实焦点 / 搜索框状态无法传递。
-/// 这里在 Yolo 已判定 windowuse 时兜底合并,保留真实窗口连续性。
-fn coalesce_wechat_window_workflows(plan: &mut WorkFlowPlan) {
-    let same_wechat = |w: &WorkFlowSpec| {
-        w.delegate_to == AgentRole::WindowUse && {
-            let text = gather_spec_text(w).to_lowercase();
-            text.contains("微信") || text.contains("wechat")
+/// 合并保留真实窗口连续性。
+fn coalesce_same_app_window_workflows(plan: &mut WorkFlowPlan) {
+    /// app 家族关键词(小写匹配)。
+    const APP_FAMILIES: &[(&str, &[&str])] = &[
+        ("微信", &["微信", "wechat", "weixin"]),
+        ("QQ", &["qq"]),
+        ("钉钉", &["钉钉", "dingtalk"]),
+        ("飞书", &["飞书", "feishu", "lark"]),
+        ("Telegram", &["telegram", "tg"]),
+    ];
+    let family_of = |w: &WorkFlowSpec| -> Option<&'static str> {
+        if w.delegate_to != AgentRole::WindowUse {
+            return None;
         }
+        let text = gather_spec_text(w).to_lowercase();
+        APP_FAMILIES
+            .iter()
+            .find(|(_, kws)| kws.iter().any(|k| text.contains(k)))
+            .map(|(name, _)| *name)
     };
-    let Some(first_idx) = plan.workflows.iter().position(same_wechat) else {
-        return;
-    };
-    let group_ids: Vec<String> = plan
-        .workflows
-        .iter()
-        .filter(|w| same_wechat(w))
-        .map(|w| w.id.clone())
-        .collect();
-    if group_ids.len() < 2 {
-        return;
-    }
+    for (family_name, _) in APP_FAMILIES {
+        let same_family = |w: &WorkFlowSpec| family_of(w) == Some(*family_name);
+        let Some(first_idx) = plan.workflows.iter().position(same_family) else {
+            continue;
+        };
+        let group_ids: Vec<String> = plan
+            .workflows
+            .iter()
+            .filter(|w| same_family(w))
+            .map(|w| w.id.clone())
+            .collect();
+        if group_ids.len() < 2 {
+            continue;
+        }
 
-    let mut branches = Vec::new();
-    let mut loops = Vec::new();
-    let mut steps = Vec::new();
-    let mut acceptance = Vec::new();
-    for w in plan.workflows.iter().filter(|w| same_wechat(w)) {
-        branches.extend(w.branches.clone());
-        loops.extend(w.loops.clone());
-        steps.extend(w.steps.clone());
-        acceptance.extend(w.acceptance.clone());
-    }
-    let target_id = plan.workflows[first_idx].id.clone();
-    {
-        let first = &mut plan.workflows[first_idx];
-        first.name = "微信连续操控(自动合并同应用UI链)".into();
-        first.branches = branches;
-        first.loops = loops;
-        first.steps = steps;
-        first.acceptance = acceptance;
-        first
-            .depends_on
-            .retain(|dep| !group_ids.iter().any(|id| id == dep));
-    }
-    plan.workflows
-        .retain(|w| !same_wechat(w) || w.id == target_id);
-    for w in &mut plan.workflows {
-        for dep in &mut w.depends_on {
-            if group_ids.iter().any(|id| *id == *dep) {
-                *dep = target_id.clone();
-            }
+        let mut branches = Vec::new();
+        let mut loops = Vec::new();
+        let mut steps = Vec::new();
+        let mut acceptance = Vec::new();
+        for w in plan.workflows.iter().filter(|w| same_family(w)) {
+            branches.extend(w.branches.clone());
+            loops.extend(w.loops.clone());
+            steps.extend(w.steps.clone());
+            acceptance.extend(w.acceptance.clone());
         }
-        w.depends_on.dedup();
+        let target_id = plan.workflows[first_idx].id.clone();
+        {
+            let first = &mut plan.workflows[first_idx];
+            first.name = format!("{family_name}连续操控(自动合并同应用UI链)");
+            first.branches = branches;
+            first.loops = loops;
+            first.steps = steps;
+            first.acceptance = acceptance;
+            first
+                .depends_on
+                .retain(|dep| !group_ids.iter().any(|id| id == dep));
+        }
+        plan.workflows
+            .retain(|w| !same_family(w) || w.id == target_id);
+        for w in &mut plan.workflows {
+            for dep in &mut w.depends_on {
+                if group_ids.iter().any(|id| *id == *dep) {
+                    *dep = target_id.clone();
+                }
+            }
+            w.depends_on.dedup();
+        }
+        tracing::info!(
+            target = %target_id,
+            merged = group_ids.len(),
+            "同一 {} 应用 WindowUse 链已自动合并,保留真实窗口焦点连续性", family_name
+        );
     }
-    tracing::info!(
-        target = %target_id,
-        merged = group_ids.len(),
-        "同一微信应用 WindowUse 链已自动合并,保留真实窗口焦点连续性"
-    );
 }
 
 /// 拓扑排序(返回执行顺序)。

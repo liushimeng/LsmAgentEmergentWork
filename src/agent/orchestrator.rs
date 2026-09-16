@@ -473,6 +473,11 @@ impl MultiAgentOrchestrator {
         // 2026-09-16 第 58 轮 P0-C:跨轮透传最近一次失败的 ExecutionTrace,
         // 供 Failed outcome 复用 format_task_result 渲染 [trace] [tool] [failure] 段。
         let mut last_failure_trace: Option<Arc<ExecutionTrace>> = None;
+        // 2026-09-16 第 67 轮:medium 档计划复用缓存(效率优化)。
+        // 执行层失败(wf 单元 QC 拒)→ 计划本身没问题 → 下一轮跳过 Main-Work LLM 重拆,
+        // 失败反馈直接注入各执行单元;计划级失败(解析/校验)→ 清缓存强制重拆。
+        // 实测省 1-2 次 Main-Work 调用(30-120s/任务)。
+        let mut medium_plan_cache: Option<WorkFlowPlan> = None;
 
         // 1.2) simple + direct_answer 短路(2026-09-09 第 15 轮 AQ03 实测发现):
         // Yolo 已给出完整直接答案时,不再空转一轮 SubAgent+QC(实测多花 ~2.5 分钟
@@ -569,8 +574,15 @@ impl MultiAgentOrchestrator {
                         .await
                 }
                 TaskLevel::Medium => {
-                    self.run_medium(&classification, session, cancel, progress, &retry_hint)
-                        .await
+                    self.run_medium(
+                        &classification,
+                        session,
+                        cancel,
+                        progress,
+                        &retry_hint,
+                        &mut medium_plan_cache,
+                    )
+                    .await
                 }
                 TaskLevel::Hard => {
                     self.run_hard(&classification, session, cancel, progress, &retry_hint)
@@ -671,8 +683,10 @@ impl MultiAgentOrchestrator {
                             Ok(new_c) => {
                                 classification = new_c;
                                 self.dbg_classify(&classification);
-                                // 档位升级后旧失败原因不再适用(F3)
+                                // 档位升级后旧失败原因不再适用(F3);
+                                // 分类可能变化 → 计划缓存一并作废(第 67 轮)
                                 retry_hint.clear();
+                                medium_plan_cache = None;
                                 continue;
                             }
                             Err(e) => {
@@ -680,10 +694,27 @@ impl MultiAgentOrchestrator {
                             }
                         }
                     }
+                    // 2026-09-16 第 67 轮:执行层失败(单元 QC 拒 / Agent 执行错)保留计划缓存,
+                    // 下一轮 run_medium 直接复用(跳过重拆);计划级失败(MainWork/QC 调用错)
+                    // 由 run_medium 内部清空缓存。
+                    let is_exec_level_failure = matches!(
+                        failure.source,
+                        AgentRole::SubAgent | AgentRole::WindowUse | AgentRole::WebUse
+                    );
+                    if !is_exec_level_failure {
+                        medium_plan_cache = None;
+                    }
                     // retryable=true 留在当前档位继续重跑
                     // F3:记录失败原因,下一轮回灌 Main-Work / 供 Failed 呈现
                     retry_hint = failure.reason.clone();
-                    emit_progress(progress, format!("第 {retry_count} 轮重试当前档位…"));
+                    emit_progress(
+                        progress,
+                        if is_exec_level_failure && medium_plan_cache.is_some() {
+                            format!("第 {retry_count} 轮重试(复用 WorkFlow 计划,失败反馈注入执行单元)…")
+                        } else {
+                            format!("第 {retry_count} 轮重试当前档位…")
+                        },
+                    );
                     continue;
                 }
             }
@@ -866,7 +897,35 @@ impl MultiAgentOrchestrator {
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
         retry_hint: &str,
+        plan_cache: &mut Option<WorkFlowPlan>,
     ) -> std::result::Result<TaskResult, QualityFailure> {
+        // 0) 2026-09-16 第 67 轮:计划复用(效率优化)。
+        //    上一轮执行层失败(wf 单元 QC 拒)→ 计划本身没问题 → 跳过 Main-Work LLM 重拆,
+        //    失败反馈注入每个执行单元的 description。失败单元也会因 retry_hint 调整策略。
+        if retry_hint.trim().is_empty() {
+            // 首轮(或档位切换后)不复用
+            *plan_cache = None;
+        }
+        if let Some(cached) = plan_cache.take() {
+            emit_progress(
+                progress,
+                format!(
+                    "复用上一轮 WorkFlow 计划({} 个流程单元,跳过 Main-Work 重拆),失败反馈注入各单元",
+                    cached.workflows.len()
+                ),
+            );
+            let mut result = self
+                .execute_workflows(c, &cached, Usage::default(), session, cancel, progress, retry_hint)
+                .await?;
+            result.stage_durations.push(StageDuration {
+                stage: "main_work".to_string(),
+                wf_id: None,
+                started_offset_ms: 0,
+                elapsed_ms: 0, // 复用轮无 Main-Work LLM 调用
+            });
+            return Ok(result);
+        }
+
         // 1) Main-Work 拆 WorkFlow
         emit_progress(progress, "Main-Work 拆解中…");
         // 2026-09-11 第三十四轮 LA-1:Main-Work 拆解同样透传用户原始 prompt,
@@ -947,8 +1006,9 @@ impl MultiAgentOrchestrator {
                     plan.workflows.len()
                 ),
             );
+            // 兜底计划不进复用缓存(degraded 拆解质量不足,失败后应重新拆)
             let mut result = self
-                .execute_workflows(c, &plan, mainwork_usage, session, cancel, progress)
+                .execute_workflows(c, &plan, mainwork_usage, session, cancel, progress, retry_hint)
                 .await?;
             result.stage_durations.push(StageDuration {
                 stage: "main_work".to_string(),
@@ -958,6 +1018,9 @@ impl MultiAgentOrchestrator {
             });
             return Ok(result);
         }
+
+        // 2026-09-16 第 67 轮:确定性校验通过的真实计划进复用缓存(执行层失败时下一轮跳过重拆)
+        *plan_cache = Some(plan.clone());
 
         // 2) Quality 校验 Main-Work 输出
         // 2026-09-16 第 66 轮 P0-2:确定性校验已通过的计划默认跳过 LLM QC-main ——
@@ -977,7 +1040,7 @@ impl MultiAgentOrchestrator {
             );
             let pre_usage = mainwork_usage;
             let mut result = self
-                .execute_workflows(c, &plan, pre_usage, session, cancel, progress)
+                .execute_workflows(c, &plan, pre_usage, session, cancel, progress, retry_hint)
                 .await?;
             result.stage_durations.push(StageDuration {
                 stage: "main_work".to_string(),
@@ -1021,7 +1084,7 @@ impl MultiAgentOrchestrator {
 
         // 3) 拓扑排序并执行
         let mut result = self
-            .execute_workflows(c, &plan, pre_usage, session, cancel, progress)
+            .execute_workflows(c, &plan, pre_usage, session, cancel, progress, retry_hint)
             .await?;
         // 2026-09-16 第 57 轮:把 run_medium 收集的 Main-Work + QC-Main 阶段耗时
         // 写入 result.stage_durations,供 TUI 时间线展示。
@@ -1144,7 +1207,7 @@ impl MultiAgentOrchestrator {
 
         // 4) 执行 WorkFlow
         let mut task_result = self
-            .execute_workflows(c, &plan, pre_usage, session, cancel, progress)
+            .execute_workflows(c, &plan, pre_usage, session, cancel, progress, retry_hint)
             .await?;
         task_result.plan_doc = Some(plan_output.path);
         // 2026-09-16 第 57 轮:把 run_hard 收集的 Plan + QC-Plan + QC-Main 阶段耗时
@@ -1184,6 +1247,7 @@ impl MultiAgentOrchestrator {
         session: &Session,
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
+        unit_retry_hint: &str,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 依赖分层:同层 WorkFlow 互相无依赖,自动并行;跨层严格串行(自动感知 depends_on)
         let layers = main_work::topo_layers(&plan.workflows).map_err(|e| QualityFailure {
@@ -1238,7 +1302,12 @@ impl MultiAgentOrchestrator {
             // 构造本层全部单元的输入(上游产物按层传递)
             let units: Vec<(WorkFlowSpec, SubFlowInput)> = layer
                 .iter()
-                .map(|wf| (wf.clone(), build_subflow_input(wf, &dep_outputs)))
+                .map(|wf| {
+                    (
+                        wf.clone(),
+                        build_subflow_input(wf, &dep_outputs, unit_retry_hint),
+                    )
+                })
                 .collect();
 
             // 执行本层:单个直通(零 spawn 开销),多个 tokio::spawn + Semaphore 有界并发
@@ -1747,15 +1816,17 @@ async fn run_wf_unit(
         }
     );
     emit_progress(&progress, detail_summary);
-    // 2026-09-16 第 62 轮:工具调用明细(最近 5 条)走 [laew] 详情面板,
-    // 让 TUI 用户一眼看到「窗口操控到底调了哪些工具、参数是什么、为什么失败」。
-    // 字段:tool name | status | elapsed_ms | args 摘要 | error 摘要。
+    // 2026-09-16 第 62 轮:工具调用明细走 [laew] 详情面板,让 TUI 用户一眼看到
+    // 「窗口操控到底调了哪些工具、参数是什么、为什么失败」。
+    // 2026-09-16 第 67 轮:明细 5 → 8 条,且追加**参数摘要**(query/window_id/path/
+    // action/text/x/y/command 等关键字段,截 60 字符)—— 微信任务复盘时
+    // 「到底让它点了哪个坐标」此前无从排查。
     let tool_log = &outcome.trace.tool_call_log;
     if !tool_log.is_empty() {
         let recent: Vec<String> = tool_log
             .iter()
             .rev()
-            .take(5)
+            .take(8)
             .rev()
             .map(|entry| {
                 let status = if entry.ok { "✓" } else { "✗" };
@@ -1764,11 +1835,18 @@ async fn run_wf_unit(
                 } else {
                     format!(" err={}", truncate_progress_text_default(&entry.error_summary, 40))
                 };
+                let args_part = tool_args_digest(&entry.args_json);
+                let args_part = if args_part.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {args_part}")
+                };
                 format!(
-                    "{}{} ({}ms){}",
+                    "{}{} ({}ms){}{}",
                     status,
                     entry.tool,
                     entry.elapsed_ms,
+                    args_part,
                     err_part
                 )
             })
@@ -1871,6 +1949,7 @@ async fn run_wf_unit(
 fn build_subflow_input(
     wf: &WorkFlowSpec,
     dep_outputs: &std::collections::HashMap<String, String>,
+    retry_hint: &str,
 ) -> SubFlowInput {
     let deps: Vec<String> = wf
         .depends_on
@@ -1902,6 +1981,38 @@ fn build_subflow_input(
         window_context: None,
         pending_agent_messages: vec![],
     }
+}
+
+/// 2026-09-16 第 67 轮:工具参数摘要(供 [laew] 工具调用明细行)。
+///
+/// 从 ToolCallLogEntry.args_json(稳定序列化)提取关键字段拼 `k=v` 列表:
+/// query / filter / window_id / path / action / text / x / y / command / url / selector,
+/// 截 60 字符 —— 微信视觉路线复盘时能直接看到「点了哪个坐标 / 输了什么文本」。
+fn tool_args_digest(args_json: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return String::new();
+    };
+    let Some(obj) = v.as_object() else {
+        return String::new();
+    };
+    const KEYS: &[&str] = &[
+        "query", "filter", "window_id", "path", "action", "text", "x", "y", "command", "url",
+        "selector", "max_depth", "lang",
+    ];
+    let mut parts = Vec::new();
+    for k in KEYS {
+        if let Some(val) = obj.get(*k) {
+            let vs = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            if vs.is_empty() {
+                continue;
+            }
+            parts.push(format!("{k}={}", truncate_progress_text(&vs, 24)));
+        }
+    }
+    truncate_progress_text(&parts.join(" "), 60)
 }
 
 fn add_usage(mut total: Usage, delta: Usage) -> Usage {
@@ -2023,7 +2134,7 @@ mod tests {
             acceptance: vec!["OK".into()],
             delegate_to: AgentRole::SubAgent,
         };
-        let input = build_subflow_input(&wf, &std::collections::HashMap::new());
+        let input = build_subflow_input(&wf, &std::collections::HashMap::new(), "");
         assert_eq!(input.id, "wf-1.step");
         assert!(input.description.contains("读 a"));
         assert_eq!(input.expected_output, "OK");
@@ -2046,7 +2157,7 @@ mod tests {
             acceptance: vec!["修改完成".into()],
             delegate_to: AgentRole::SubAgent,
         };
-        let input = build_subflow_input(&wf, &deps);
+        let input = build_subflow_input(&wf, &deps, "");
         assert_eq!(input.depends_on_outputs.len(), 1);
         assert!(input.depends_on_outputs[0].contains("已读取 a.rs"));
     }

@@ -878,19 +878,27 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 fn window_use_tools_hint() -> &'static str {
     "工具调用规范:\n\
      - 工具参数需严格遵守给定 JSON Schema\n\
-     - 窗口操控按「WindowOpen(未启动时)→ WindowFind/WindowList → WindowInspect → WindowAction」顺序使用;无依赖的读取调用(WindowList / WindowFind / WindowInspect)可并行发出\n\n\
-     可用工具(共 8 个,与 builtin 严格对齐,缺则视为不可用):\n\
-     - WindowOpen(query, app_name?, bundle_id?, wait_seconds?): 启动/激活应用并等待窗口,\
-       返回 window_id、匹配别名、窗口前后数量与权限状态\n\
+     - 窗口操控按「WindowOpen(未启动时)→ WindowFind/WindowList → WindowInspect → WindowAction」顺序使用;\
+       无依赖的读取调用(WindowList / WindowFind / WindowInspect / WindowOCR)可并行发出\n\
+     - 双路线(2026-09-16 第 67 轮):WindowInspect 树为空/只有少量 Pane(自绘 UI,如微信 4.x)\
+       时立即切换视觉路线 WindowOCR + click_point/type_text,不要反复重试控件树\n\n\
+     可用工具(共 9 个,与 builtin 严格对齐,缺则视为不可用):\n\
+     - WindowOpen(query, app_name?, bundle_id?, wait_seconds?): 启动应用并等待窗口;\
+       已运行/最小化时直接恢复+前置(不重复启动)。返回 window_id、匹配别名、权限状态\n\
      - WindowList(filter?): 枚举可见顶层窗口,返回 id/title/进程/PID/位置尺寸\n\
      - WindowFind(title?, process?, match_mode?): 按标题/进程名查窗口,返回最佳匹配窗口的完整信息\n\
      - WindowInspect(window_id, max_depth?, filter?): 枚举窗口控件树,返回每个控件的 \
        path/role/name/value/bounds/actions/children\n\
-     - WindowAction(window_id, path, action, text?): 对控件执行 \
-       click/invoke/focus/set_text/get_text/send_keys/scroll;\
-       scroll 用 text 传方向与行数(如 \"down:3\"/\"up:5\",缺省 3 行),\
-       send_keys 用 text 传命名键(enter/tab/esc/space/delete/up/down/left/right/pageup/pagedown)\n\
-     - WindowScreenshot(output_path?, region?): 跨平台截图落盘,返回路径\n\
+     - WindowOCR(window_id, region?, lang?): 窗口 OCR 文字识别,返回词块文本 + 窗口相对坐标 + \
+       屏幕绝对坐标(screen_cx/screen_cy=词块中心)—— 视觉路线入口;region 可只识别局部\n\
+     - WindowAction(window_id, path, action, text?, x?, y?): 双路线操作。控件树路线:\
+       click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible;\
+       坐标视觉路线:click_point/double_click_point/right_click_point/scroll_point/type_text\
+       (x/y 传屏幕绝对坐标,取 WindowOCR 的 screen_cx/screen_cy;path 照传 \"/\")\
+       scroll 用 text 传方向与行数(如 \"down:3\"/\"up:5\",缺省 3 行);\
+       send_keys 用 text 传命名键或组合键(enter/ctrl+a/alt+f4/ctrl+enter)\n\
+     - WindowScreenshot(window_id, output_path?, region?): 截图落盘,返回路径\
+       (需要识别界面文字一律改用 WindowOCR,不要先截图)\n\
      - Bash(command, ...): 白名单模式,仅允许桌面操控类命令(osascript / cliclick / \
        screencapture / pbcopy / pbpaste / open / System Events keystroke / defaults 等)\n\
      - Read(file_path, offset?, limit?): 读取文本文件(理解任务上下文用),带行号\n\n\
@@ -1087,13 +1095,14 @@ mod tests {
     #[test]
     fn window_use_tools_hint_lists_six_tools() {
         let hint = window_use_tools_hint();
-        // 6 个工具 + Bash(白名单) + Read 必须全部列在提示词里
+        // 6 个工具 + WindowOCR(第 67 轮视觉路线)+ Bash(白名单) + Read 必须全部列在提示词里
         for tool in [
             "WindowOpen",
             "WindowList",
             "WindowFind",
             "WindowInspect",
             "WindowAction",
+            "WindowOCR",
             "WindowScreenshot",
             "Bash",
             "Read",

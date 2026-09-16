@@ -34,6 +34,11 @@ use macos_legacy::MacOsDriver as LegacyMacosDriver;
 pub use macos_legacy::MacOsDriver;
 #[cfg(windows)]
 mod windows;
+// 2026-09-16 第 67 轮:Windows 物理输入(SendInput)与 OCR(Windows.Media.Ocr)底座
+#[cfg(windows)]
+pub(crate) mod windows_input;
+#[cfg(windows)]
+pub(crate) mod windows_ocr;
 
 pub mod fallback;
 
@@ -104,12 +109,47 @@ pub enum ControlAction {
     /// 把目标控件滚动到可见区域(2026-09-16 第 66 轮):
     /// macOS AXScrollToVisible;Windows 暂等价 Scroll 小步;列表逐条定位场景比盲滚精准。
     ScrollToVisible,
+    /// ===== 2026-09-16 第 67 轮:坐标动作(自绘 UI 视觉路线) =====
+    /// 坐标信息来自 `WindowOCR` 返回的词块(screen_x/screen_y 取中心)或窗口 bounds 计算。
+    /// 在屏幕绝对坐标 (x,y) 执行物理鼠标左键单击(SendInput / CGEvent / xdotool)。
+    ClickPoint { x: i64, y: i64 },
+    /// 坐标双击(展开列表项 / 打开会话等场景)。
+    DoubleClickPoint { x: i64, y: i64 },
+    /// 坐标右键(呼出上下文菜单)。
+    RightClickPoint { x: i64, y: i64 },
+    /// 在 (x,y) 处滚动滚轮(先移光标再滚,自绘 UI 对消息滚动不敏感,物理事件最可靠)。
+    ScrollPoint { x: i64, y: i64, lines: i32 },
+    /// 向**当前焦点控件**真实键入文本(SendInput Unicode / CGEvent keystroke)。
+    /// 配合 `click_point` 先点输入框使用;自绘输入框(微信 4.x 等)唯一可靠的输入路径。
+    TypeText(String),
 }
 
 impl ControlAction {
     /// 从工具参数解析动作名(大小写不敏感,连字符/下划线归一)。
     pub fn parse(name: &str, text: Option<String>) -> Result<Self> {
+        Self::parse_ext(name, text, None, None)
+    }
+
+    /// 2026-09-16 第 67 轮:带坐标参数的动作解析(x/y 供 click_point / scroll_point 系使用)。
+    pub fn parse_ext(
+        name: &str,
+        text: Option<String>,
+        x: Option<i64>,
+        y: Option<i64>,
+    ) -> Result<Self> {
         let norm = name.trim().to_lowercase().replace(['-', '_'], "");
+        // 坐标类动作统一校验 x/y 必填(坐标动作不接受 path 定位,path 照传 "/")
+        let need_point = || -> std::result::Result<(i64, i64), AgentError> {
+            match (x, y) {
+                (Some(px), Some(py)) => Ok((px, py)),
+                _ => Err(AgentError::ToolExecution {
+                    tool: "WindowAction".into(),
+                    reason: format!(
+                        "action={norm} 缺少整数参数 x / y(屏幕绝对坐标,取 WindowOCR 返回的 screen_x/screen_y 中心)"
+                    ),
+                }),
+            }
+        };
         Ok(match norm.as_str() {
             "click" => Self::Click,
             "focus" => Self::Focus,
@@ -132,15 +172,53 @@ impl ControlAction {
                 lines: parse_scroll_lines(text.as_deref())?,
             },
             "scrolltovisible" | "scrollintoview" | "reveal" => Self::ScrollToVisible,
+            // ===== 第 67 轮:坐标动作 =====
+            "clickpoint" | "pointclick" | "clickat" => {
+                let (px, py) = need_point()?;
+                Self::ClickPoint { x: px, y: py }
+            }
+            "doubleclickpoint" | "pointdoubleclick" | "doubleclickat" => {
+                let (px, py) = need_point()?;
+                Self::DoubleClickPoint { x: px, y: py }
+            }
+            "rightclickpoint" | "pointrightclick" | "rightclickat" => {
+                let (px, py) = need_point()?;
+                Self::RightClickPoint { x: px, y: py }
+            }
+            "scrollpoint" | "pointscroll" | "scrollat" => {
+                let (px, py) = need_point()?;
+                Self::ScrollPoint {
+                    x: px,
+                    y: py,
+                    lines: parse_scroll_lines(text.as_deref())?,
+                }
+            }
+            "typetext" | "inputatfocus" | "typeatfocus" => {
+                Self::TypeText(text.ok_or_else(|| AgentError::ToolExecution {
+                    tool: "WindowAction".into(),
+                    reason: "action=type_text 缺少 string 类型参数 text".into(),
+                })?)
+            }
             other => {
                 return Err(AgentError::ToolExecution {
                     tool: "WindowAction".into(),
                     reason: format!(
-                        "未知 action: {other};可用: click / focus / set_text / get_text / send_keys / invoke / scroll / scroll_to_visible"
+                        "未知 action: {other};可用: click / focus / set_text / get_text / send_keys / invoke / scroll / scroll_to_visible / click_point / double_click_point / right_click_point / scroll_point / type_text"
                     ),
                 })
             }
         })
+    }
+
+    /// 是否为屏幕坐标类动作(工具层据此提示 LLM 坐标来源)。
+    pub fn is_point_action(&self) -> bool {
+        matches!(
+            self,
+            Self::ClickPoint { .. }
+                | Self::DoubleClickPoint { .. }
+                | Self::RightClickPoint { .. }
+                | Self::ScrollPoint { .. }
+        )
     }
 }
 
@@ -176,6 +254,20 @@ fn parse_scroll_lines(text: Option<&str>) -> Result<i32> {
     }
 }
 
+/// OCR 词块(2026-09-16 第 67 轮,视觉路线)。
+///
+/// 坐标为**窗口相对物理像素**;工具层会依据窗口 bounds 换算出屏幕绝对坐标
+/// (`screen_x/screen_y`)供坐标动作直接消费。
+#[derive(Debug, Clone, Serialize)]
+pub struct OcrBlock {
+    pub text: String,
+    /// 窗口相对坐标(左上角为原点,物理像素)
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
 /// 平台窗口驱动(同步方法;GUI 调用可能阻塞,工具层须 `spawn_blocking` 包裹)。
 pub trait WindowDriver: Send + Sync {
     /// 平台名(错误文案 / Debug trace 用)
@@ -200,6 +292,32 @@ pub trait WindowDriver: Send + Sync {
 
     /// 缺权限/缺依赖时的可读引导文案;`None` 表示一切就绪。
     fn permission_hint(&self) -> Option<String>;
+
+    /// 2026-09-16 第 67 轮:把窗口带到前台(恢复最小化 + 激活)。
+    ///
+    /// 语义:幂等、失败不 panic;默认 no-op(平台暂未实装时静默,
+    /// WindowOpen 在「已在运行」分支调用它,避免重复启动第二实例)。
+    fn bring_to_front(&self, _window_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// 2026-09-16 第 67 轮:对窗口(可选区域)做 OCR,返回词级文本块。
+    ///
+    /// - `region`:窗口相对矩形(物理像素);`None` = 整个窗口客户区;
+    /// - `lang`:BCP-47(如 "zh-Hans-CN");`None` = 用户配置语言;
+    /// - 默认实现返回「平台暂不支持」(fail-closed),Windows 实装
+    ///   (GDI 截图 + GDI+ PNG + Windows.Media.Ocr,全 OS API 离线)。
+    fn ocr(
+        &self,
+        _window_id: &str,
+        _region: Option<Rect>,
+        _lang: Option<&str>,
+    ) -> Result<Vec<OcrBlock>> {
+        Err(platform_err(
+            self.platform_name(),
+            "当前平台驱动暂不支持 OCR(Windows 已实装 Windows.Media.Ocr;macOS Vision 待后续轮次)",
+        ))
+    }
 }
 
 /// 构造当前平台的窗口驱动。
@@ -242,6 +360,24 @@ pub(crate) fn platform_err(platform: &str, msg: impl Into<String>) -> AgentError
         tool: "Window*".into(),
         reason: format!("[{platform}] {}", msg.into()),
     }
+}
+
+/// 2026-09-16 第 67 轮:window_id → HWND(供 tools/window_vision.rs 的
+/// Windows 截图路径直接拿句柄;非 Windows 平台不存在本函数)。
+#[cfg(windows)]
+pub fn windows_driver_hwnd(window_id: &str) -> Result<::windows::Win32::Foundation::HWND> {
+    windows::WindowsDriver::parse_hwnd(window_id)
+}
+
+/// 2026-09-16 第 67 轮:按窗口(可选区域)截图并**保存到指定路径**
+/// (WindowScreenshot 的 Windows 纯 Rust 路径;返回实际截取的屏幕矩形)。
+#[cfg(windows)]
+pub fn windows_ocr_capture_to(
+    hwnd: ::windows::Win32::Foundation::HWND,
+    region: Option<Rect>,
+    out_path: &std::path::Path,
+) -> Result<Rect> {
+    windows_ocr::capture_window_png_to(hwnd, region, out_path)
 }
 
 /// 2026-09-16 第 62 轮:Unicode 上标字母归一化,解决「赵玲玲ᴬᴵᴬ」vs

@@ -22,6 +22,7 @@ pub mod glob;
 pub mod grep;
 pub mod read;
 pub mod window;
+pub mod window_vision;
 pub mod write;
 
 /// 工具需要实现的异步 trait
@@ -201,7 +202,8 @@ pub fn window_use_registry() -> ToolRegistry {
         .register(Arc::new(window::WindowFindTool))
         .register(Arc::new(window::WindowInspectTool))
         .register(Arc::new(window::WindowActionTool))
-        .register(Arc::new(window::WindowScreenshotTool))
+        .register(Arc::new(window_vision::WindowOCRTool))
+        .register(Arc::new(window_vision::WindowScreenshotTool))
 }
 
 /// Chromium-WebUse Agent 工具注册表(第 11 角色,浏览器操控层,2026-09-16 第 61 轮):
@@ -257,6 +259,7 @@ mod names_tests {
         let reg = window_use_registry();
         // 2026-09-16 第 56 轮:WindowUse 工具集新增 WindowFind(标题/进程名查窗口)
         // + WindowScreenshot(截图落盘,为后续 OCR 铺路)。
+        // 2026-09-16 第 67 轮:新增 WindowOCR(视觉路线:自绘 UI 文本识别 + 坐标)。
         assert_eq!(
             reg.names(),
             vec![
@@ -267,6 +270,7 @@ mod names_tests {
                 "WindowFind",
                 "WindowInspect",
                 "WindowAction",
+                "WindowOCR",
                 "WindowScreenshot",
             ]
         );

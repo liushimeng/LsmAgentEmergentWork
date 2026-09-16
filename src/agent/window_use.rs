@@ -121,34 +121,42 @@ impl WindowUseRunner {
         // LLM 在 system / user 两端看到不同顺序易困惑。
         prompt.push_str(
             "\n\n【窗口操控作业规范】\n\
-             1. 目标应用未打开时优先用 WindowOpen(query,app_name?) 启动并等待窗口;已打开则用 WindowFind(推荐)或 WindowList 枚举;\n\
+             1. 目标应用未打开时优先用 WindowOpen(query,app_name?) 启动并等待窗口;已打开(含最小化到托盘)\
+                时 WindowOpen 会直接恢复并前置,不重复启动;Windows 微信 4.x 进程名是 Weixin.exe,\
+                别名表已含 WeChat/微信/Weixin,query 写任一都能命中;\n\
              2. macOS 上 WeChat/部分 Electron 应用 NSWindow title 可能为空,这是正常现象,\
                 WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明,应通过 process_name 定位;\n\
              3. 拿到窗口 id 后用 WindowInspect(max_depth 适度,filter 缩范围)检视控件树;\n\
-             4. 依据控件 actions 列表选择合法动作,用 WindowAction 执行;路径失效时重新 WindowInspect;\n\
-             5. 禁止对疑似支付/删除/发送/确认类按钮做无把握点击;只读操作优先;\n\
-             6. macOS WindowInspect/Action 返回 -25211 kAXErrorAPIDisabled 时,工具会弹出并等待授权;\
+             4. **【双路线决策】**(2026-09-16 第 67 轮):WindowInspect 树为空或只有少量 Pane/\
+                自绘节点(如微信 4.x 的 MMUIRenderSubWindow)时,不要反复重试控件树 —— 立即切换\
+                **视觉路线**:WindowOCR(window_id) 拿文本块坐标 → WindowAction(action=\
+                click_point/double_click_point, x=screen_cx, y=screen_cy) 点击 → 输入框先\
+                click_point 再 action=type_text → 操作后重新 WindowOCR 验证;\n\
+             5. 依据控件 actions 列表选择合法动作,用 WindowAction 执行;路径失效时重新 WindowInspect;\
+                send_keys 已实装(enter/ctrl+a/alt+f4 等命名键与组合键);\n\
+             6. 禁止对疑似支付/删除/发送/确认类按钮做无把握点击;只读操作优先;\n\
+             7. macOS WindowInspect/Action 返回 -25211 kAXErrorAPIDisabled 时,工具会弹出并等待授权;\
                 若最终仍未授权,把开权限步骤写进最终回答告知用户;\n\
-             7. 同一应用的连续 UI 操作必须在本单元内连续完成,不要只完成“打开”后把搜索/输入\
+             8. 同一应用的连续 UI 操作必须在本单元内连续完成,不要只完成“打开”后把搜索/输入\
                 留给下一个独立单元;窗口状态会按 Session ID 持久化,但真实 UI 焦点不应依赖重新启动;\n\
-             8. **【中文 UI 名称同义词表】**(2026-09-16 第 65 轮 P1-B):filter 失败时优先试下表同义词,不要立即放弃或全量遍历:\n\
+             9. **【中文 UI 名称同义词表】**(2026-09-16 第 65 轮 P1-B):filter 失败时优先试下表同义词,不要立即放弃或全量遍历:\n\
                 - 通讯录 = 通信录 = 联系人 = Contacts = contactsList\n\
                 - 消息 = 发送 = Send = submit\n\
                 - 按钮 = Button\n\
                 - 输入框 = 搜索 = Search = TextField = Edit\n\
                 - 关闭 = X = close = 退出\n\
                 - 设置 = Settings = Preferences\n\
-             9. **【禁止 Read PNG】**:WindowScreenshot 只落盘 PNG 文件,当前 WindowUse 工具集**不包含 OCR 工具**;\
-                **不要**用 Read 工具读取 PNG(Read 仅支持 UTF-8 文本,二进制会失败);\
-                如需视觉识别,切换到 WindowInspect(控件树路线)或终止任务告知用户。\n\
-             10. **【列表定位优先搜索】**(2026-09-16 第 66 轮):在列表中找指定条目(联系人/会话/文件)时,\
-                优先找搜索框 set_text 目标名直接定位;无搜索框再用 WindowAction(action=scroll, text=\"down:3\")\
-                逐屏滚动遍历,**每滚一屏后必须重新 WindowInspect**(滚动后旧 path 全部失效);\
-                目标控件已在树中但屏外时用 scroll_to_visible 精准定位;\n\
-             11. **【特殊字符名称匹配】**:目标名含 Unicode 上标(如 赵玲玲ᴬᴵᴬ)时,filter 直接写 ASCII\
-                归一形(赵玲玲AIA)即可,工具自动等价匹配;匹配不到再试原名与片段;\n\
-             12. **【发送消息范式】**:定位输入框 → set_text 写入消息 → send_keys(\"enter\") 发送\
-                (或 click「发送」按钮)→ WindowInspect 复查消息出现在对话区后再宣告完成。",
+             10. **【禁止 Read PNG】**:WindowScreenshot 只落盘 PNG 文件,Read 工具读 PNG 必然失败\
+                (仅支持 UTF-8 文本);需要识别界面文字一律用 **WindowOCR**(返回文本+坐标,无需截图文件);\n\
+             11. **【列表定位优先搜索】**(2026-09-16 第 66 轮):在列表中找指定条目(联系人/会话/文件)时,\
+                优先找搜索框 set_text 目标名直接定位;无搜索框再逐屏滚动遍历(控件树用 action=scroll;\
+                视觉路线用 action=scroll_point 于列表中心 text=\"down:3\"),**每滚一屏后必须重新检视/OCR**;\
+             12. **【特殊字符名称匹配】**:目标名含 Unicode 上标(如 赵玲玲ᴬᴵᴬ)时,filter/OCR 结果匹配\
+                直接写 ASCII 归一形(赵玲玲AIA)即可,工具自动等价匹配;匹配不到再试原名与片段;\n\
+             13. **【发送消息范式】**:定位输入框(控件树 set_text / 视觉路线 click_point 输入框)\
+                → 写入消息(set_text 或 type_text)→ send_keys(\"enter\") 发送(微信默认 Enter 发送,\
+                若应用设置不同可试 \"ctrl+enter\" 或点击「发送」按钮)→ 复查(WindowInspect/WindowOCR\
+                确认消息出现在对话区)后再宣告完成。",
         );
 
         let mut sub_session = crate::session::Session::new();

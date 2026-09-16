@@ -924,9 +924,15 @@ mod tests {
         fs::write(dir.path().join("src/fresh.rs"), "y").unwrap();
 
         let snap = snapshot(dir.path());
-        let paths: Vec<&str> = snap.recent_files.iter().map(|f| f.path.as_str()).collect();
+        // Windows 路径分隔符归一(历史 bug:该测试在 Windows 上从未跑过 ——
+        // HEAD 的 lib test 在 Windows 无法编译,第 67 轮修复后首次暴露)
+        let paths: Vec<String> = snap
+            .recent_files
+            .iter()
+            .map(|f| f.path.replace('\\', "/"))
+            .collect();
         assert!(
-            paths.contains(&"src/fresh.rs"),
+            paths.contains(&"src/fresh.rs".to_string()),
             "应含新写入文件,实际 {paths:?}"
         );
         assert!(
