@@ -262,6 +262,18 @@ impl Agent {
         // 首迭代强制调用指定工具(如 BrowserNew)后,后续轮次恢复 auto,
         // 避免全程强制导致 LLM 无法自由决策。
         let mut first_iter_forced_done = false;
+        // 2026-09-16 第 68 轮:首迭代 forced tool 是否真正生效(写回 trace)。
+        // iter=0 调用完成后,检查 LLM 是否真的调用了 forced tool;
+        // 若未调用(被降级或 LLM 忽略),标记 false 供 TUI 证据段展示。
+        let mut forced_tool_maybe_effective = if self.first_iter_forced_tool.is_some() {
+            Some(false) // 先假设未生效,iter=0 完成后更新
+        } else {
+            None
+        };
+        // 2026-09-16 第 68 轮 P1-C:连续无工具调用计数 —— 连续 N 轮无 tool_use 时
+        // 提前终止,避免 WindowUse/WebUse 等专项 Agent 在 nudge 失效时跑满 max_iterations。
+        const NO_TOOL_USE_THRESHOLD: usize = 3;
+        let mut consecutive_no_tool_rounds: usize = 0;
 
         for iter in 0..self.max_iterations {
             trace.iterations = iter + 1;
@@ -345,14 +357,52 @@ impl Agent {
                         )]));
                 }
 
-                // 2026-09-16 第 58 轮 P0-A:窗口操控型 Agent 第 1 轮 nudge 兜底。
-                // 根因:WindowUse Runner 把 LLM 当成"专项执行单元",但 LLM 第 1 轮
-                // 经常返回纯文本("让我先查窗口...")而不是直接调用 WindowList/WindowFind;
-                // 老的 !has_tool_calls 分支会直接 return finalize_with_max_tokens(),
-                // 把"我先看看"纯文本当作成功回答,trace.tool_calls=0 → Runner 视为成功。
+                // 2026-09-16 第 68 轮 P1-C:连续无工具调用计数 —— 避免专项 Agent
+                // (WindowUse/WebUse)在 forced tool 降级 + nudge 失效时跑满 max_iterations。
+                // 阈值 NO_TOOL_USE_THRESHOLD=3:给 LLM 3 次机会(含 nudge 引导),仍无工具
+                // 调用则提前终止,把失败信息返回 Runner/QC 而不是空跑 16 轮。
+                consecutive_no_tool_rounds += 1;
+                if consecutive_no_tool_rounds >= NO_TOOL_USE_THRESHOLD {
+                    warn!(
+                        rounds = consecutive_no_tool_rounds,
+                        total_iters = iter + 1,
+                        "连续多轮无工具调用,提前终止以避免空跑 max_iterations"
+                    );
+                    trace.early_terminated = true;
+                    trace.early_terminate_reason =
+                        format!("no_tool_use_{}_rounds", consecutive_no_tool_rounds);
+                    trace.collect_failure_signals(&accumulated_text);
+                    return Self::finalize_with_forced_flag(
+                        trace,
+                        &accumulated_text,
+                        total_usage,
+                        max_tokens_state.as_ref(),
+                        forced_tool_maybe_effective,
+                    );
+                }
+
+                // 2026-09-16 第 68 轮 P0-A(修复 v2):首迭代 forced tool 未生效时的强引导。
+                // 原 P0-A 的 nudge 仅在 iter==1 触发,但 LLM iter=0 返回纯文本时循环直接退出,
+                // nudge 永远无法触发。现在:iter=0 检测到 forced tool 设置但 LLM 未调用,
+                // 立即注入强引导 nudge,给 LLM 第二次机会。
+                if iter == 0 && self.first_iter_forced_tool.is_some() {
+                    warn!(
+                        forced_tool = self.first_iter_forced_tool.as_deref().unwrap_or("?"),
+                        text_len = completion.text.len(),
+                        "首迭代 forced tool 未生效,LLM 返回纯文本,注入强引导 nudge"
+                    );
+                    session
+                        .context_mut()
+                        .push(ChatMessage::user(FORCED_TOOL_NUDGE_TEXT));
+                    continue;
+                }
+
+                // 2026-09-16 第 58 轮 P0-A(原):窗口操控型 Agent nudge 兜底。
+                // 2026-09-16 第 68 轮 P0-B 修复:移除 truncation_resumes==0 约束,
+                // 截断续接后仍应 nudge;扩展触发范围到 iter <= 2(给更多机会)。
                 //
                 // 闸门双锁:
-                // 1) iter==1 —— 只在第 1 轮 nudge,后续轮次恢复原行为(避免长任务污染);
+                // 1) iter <= 2 —— 前 3 轮均可 nudge(0,1,2),覆盖 forced tool 失效场景;
                 // 2) profile.tools 含 "WindowList" —— 强白名单,只对窗口操控类 Agent 触发,
                 //    其它 Agent(Yolo/Main-Work/QC/SubAgent 普通任务)走原路径。
                 //
@@ -360,11 +410,10 @@ impl Agent {
                 // 也会被 Runner 标 failed,不会逃过 QC。
                 if should_nudge_window_ops(&self.profile.tools.names(), iter)
                     && !completion.text.trim().is_empty()
-                    && truncation_resumes == 0
                 {
                     info!(
                         iter = iter,
-                        "WindowUse 第 1 轮无工具调用,注入 nudge 强制 LLM 使用窗口操控工具"
+                        "WindowUse 无工具调用,注入 nudge 强制 LLM 使用窗口操控工具"
                     );
                     session
                         .context_mut()
@@ -372,14 +421,14 @@ impl Agent {
                     continue;
                 }
 
-                // 2026-09-16 第 61 轮:WebUse 第 1 轮无工具调用同款 nudge(与窗口版同构)
+                // 2026-09-16 第 61 轮:WebUse 第 1 轮无工具调用同款 nudge(与窗口版同构)。
+                // 2026-09-16 第 68 轮:移除 truncation_resumes==0 约束。
                 if should_nudge_web_ops(&self.profile.tools.names(), iter)
                     && !completion.text.trim().is_empty()
-                    && truncation_resumes == 0
                 {
                     info!(
                         iter = iter,
-                        "WebUse 第 1 轮无工具调用,注入 nudge 强制 LLM 使用浏览器操控工具"
+                        "WebUse 无工具调用,注入 nudge 强制 LLM 使用浏览器操控工具"
                     );
                     session
                         .context_mut()
@@ -410,11 +459,12 @@ impl Agent {
                             "截断续接达到上限,返回已累计文本"
                         );
                         trace.truncation_resumes = truncation_resumes;
-                        return Self::finalize_with_max_tokens(
+                        return Self::finalize_with_forced_flag(
                             trace,
                             &accumulated_text,
                             total_usage,
                             max_tokens_state.as_ref(),
+                            forced_tool_maybe_effective,
                         );
                     }
                     // 注入 nudge 并续接
@@ -434,12 +484,29 @@ impl Agent {
 
                 // 非截断,正常返回
                 debug!("agent finished with text answer");
-                return Self::finalize_with_max_tokens(
+                return Self::finalize_with_forced_flag(
                     trace,
                     &accumulated_text,
                     total_usage,
                     max_tokens_state.as_ref(),
+                    forced_tool_maybe_effective,
                 );
+            }
+
+            // 2026-09-16 第 68 轮 P1-B:记录首迭代 forced tool 是否真正生效。
+            // 如果 iter=0 且设置了 first_iter_forced_tool,检查 LLM 返回的 tool_calls
+            // 中是否包含 forced tool 名;若包含则标记 true,否则保持 false(说明被降级或忽略)。
+            if iter == 0 {
+                if let Some(ref forced_name) = self.first_iter_forced_tool {
+                    let effective = completion
+                        .tool_calls
+                        .iter()
+                        .any(|c| c.name == *forced_name);
+                    if let Some(ref mut flag) = forced_tool_maybe_effective {
+                        *flag = effective;
+                    }
+                    debug!(forced_tool = %forced_name, effective = effective, "首迭代 forced 效果检测");
+                }
             }
 
             // 记录 assistant 的工具调用请求(同时附带文本,如果有)
@@ -457,6 +524,10 @@ impl Agent {
             session
                 .context_mut()
                 .push(ChatMessage::assistant(assistant_blocks));
+
+            // 2026-09-16 第 68 轮 P1-C:有工具调用时重置连续无工具调用计数。
+            // (必须在工具执行前重置,因为工具执行中可能因取消/失败提前退出)
+            consecutive_no_tool_rounds = 0;
 
             // 关联报告: 2026-09-09_05 E-001 —— 快照本轮文本/工具状态供后续短路判断使用
             // (completion.text 与 completion.tool_calls 在下面的循环会被 move)
@@ -660,11 +731,12 @@ impl Agent {
                 }
                 accumulated_text.push_str(&format!("```json\n{json}\n```"));
                 debug!("agent finished with structured tool_use output");
-                return Self::finalize_with_max_tokens(
+                return Self::finalize_with_forced_flag(
                     trace,
                     &accumulated_text,
                     total_usage,
                     max_tokens_state.as_ref(),
+                    forced_tool_maybe_effective,
                 );
             }
 
@@ -750,11 +822,12 @@ impl Agent {
                     hist_len = recent_tool_history.len(),
                     history = history_block,
                 );
-                return Self::finalize_with_max_tokens(
+                return Self::finalize_with_forced_flag(
                     trace,
                     &fallback_text,
                     total_usage,
                     max_tokens_state.as_ref(),
+                    forced_tool_maybe_effective,
                 );
             }
         }
@@ -863,6 +936,9 @@ impl Agent {
 
     /// 同步填充 trace 的输出字节数 + 失败信号 + max_tokens 升级历史(2026-09-09 第 09 轮)
     /// 后返回 Ok 三元组(在循环正常结束后调用,异常路径由调用方继续包装)。
+    ///
+    /// `forced_tool_effective` 由调用方传入(None = 未设置 forced tool;
+    /// Some(true/false) = forced tool 是否被 LLM 真正执行)。
     fn finalize_with_max_tokens(
         mut trace: ExecutionTrace,
         text: &str,
@@ -874,6 +950,19 @@ impl Agent {
         trace.max_tokens_history = max_tokens_state.history_snapshot();
         trace.collect_failure_signals(text);
         Ok((text.to_string(), total_usage, trace))
+    }
+
+    /// 2026-09-16 第 68 轮 P1-B:包装 finalize,写入 forced_tool_effective 字段。
+    /// 所有正常/提前返回路径统一经本函数,确保 trace.forced_tool_effective 被填充。
+    fn finalize_with_forced_flag(
+        mut trace: ExecutionTrace,
+        text: &str,
+        total_usage: Usage,
+        max_tokens_state: &MaxTokensState,
+        forced_tool_effective: Option<bool>,
+    ) -> Result<(String, Usage, ExecutionTrace)> {
+        trace.forced_tool_effective = forced_tool_effective;
+        Self::finalize_with_max_tokens(trace, text, total_usage, max_tokens_state)
     }
 }
 
@@ -952,8 +1041,21 @@ pub(crate) const WINDOW_OPS_NUDGE_TEXT: &str = "【laew 系统提示】你刚才
 提示:macOS 上 WeChat/部分 Electron 应用的 NSWindow title 可能为空,这是正常的,\
 应通过 process_name=\"WeChat\" 定位窗口,WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明此现象。";
 
+/// 2026-09-16 第 68 轮 P0-A(修复 v2):首迭代 forced tool 未生效时的强引导 nudge。
+/// 触发条件:iter=0 且 first_iter_forced_tool 已设置,但 LLM 返回纯文本(无 tool_use)。
+/// 常见原因:Provider/网关拒绝 forced tool_choice 被 resilient 降级为 auto。
+/// 文本包含明确的 JSON 参数示例,降低 LLM 首次调用的参数构造门槛。
+pub(crate) const FORCED_TOOL_NUDGE_TEXT: &str = "【laew 强制指令】你在首轮回复中没有调用系统要求的工具,这是错误的。\
+请立即调用指定工具开始任务,这是硬性要求,不是建议。\
+如果你不调用工具,任务将被标记为失败(trace 标 early_terminated)。\
+注意:直接用工具规定的 JSON 参数格式调用,不要解释为什么要调用、不要描述计划。\
+如果工具返回权限错误(如 macOS -25211),在最终回答中告知用户如何授权,不要放弃任务。";
+
 pub(crate) fn should_nudge_window_ops(profile_tools: &[&str], iter: usize) -> bool {
-    iter == 1 && profile_tools.iter().any(|t| *t == "WindowList")
+    // 2026-09-16 第 68 轮 P0-B 修复:扩展触发范围到 iter <= 2(前 3 轮均可 nudge),
+    // 覆盖 iter=0 forced tool 失效 + iter=1 原 nudge + iter=2 补刀三种场景。
+    // 原 iter==1 在 forced tool 被降级时无法触达(循环在 iter=0 就退出)。
+    iter <= 2 && profile_tools.iter().any(|t| *t == "WindowList")
 }
 
 /// 2026-09-16 第 63 轮(升级):WebUse nudge 改为命令语气。

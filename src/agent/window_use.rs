@@ -231,14 +231,23 @@ impl WindowUseRunner {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(",");
+        // 2026-09-16 第 68 轮 P1-B:forced_tool 效果状态。
+        // forced=None 表示未设置;true 表示 iter=0 LLM 确实调用了 forced tool;
+        // false 表示 forced tool 被 Provider 降级或 LLM 未响应(常见根因)。
+        let forced_eff_str = match trace.forced_tool_effective {
+            None => "未设置".to_string(),
+            Some(true) => "✅生效".to_string(),
+            Some(false) => "❌未生效(可能被降级)".to_string(),
+        };
         text.push_str(&format!(
-            "\n\n[WindowUse执行证据] session={} iter={} tools={}(ok={},err={}) early={} signals=[{}] [错误类型分布] {}",
+            "\n\n[WindowUse执行证据] session={} iter={} tools={}(ok={},err={}) early={} forced={} signals=[{}] [错误类型分布] {}",
             session_id,
             trace.iterations,
             trace.tool_calls,
             trace.tool_calls_ok,
             trace.tool_calls_err,
             trace.early_terminated,
+            forced_eff_str,
             trace.failure_signals.join(","),
             if error_dist.is_empty() { "无".to_string() } else { error_dist },
         ));
@@ -522,18 +531,23 @@ mod tests {
 
     #[test]
     fn nudge_for_window_ops_triggers_on_first_iter_window_use() {
-        // P0-A:nudge 闸门双锁——iter==1 + profile.tools 含 WindowList
-        // should_nudge_window_ops 定义在 crate::agent::mod.rs,从父模块直接路径引用
+        // 2026-09-16 第 68 轮 P0-B 修复:nudge 触发范围扩展到 iter <= 2(前 3 轮均可),
+        // 覆盖 iter=0 forced tool 失效 + iter=1 原 nudge + iter=2 补刀三种场景。
         use crate::agent::should_nudge_window_ops;
         let window_use_tools = ["WindowList", "Read"];
         let subagent_tools = ["Read", "Write"];
 
-        // 第 1 轮 + 含 WindowList → 触发
+        // iter 0 + 含 WindowList → 触发(forced tool 失效时补刀)
+        assert!(should_nudge_window_ops(&window_use_tools, 0));
+        // iter 1 + 含 WindowList → 触发(原 nudge)
         assert!(should_nudge_window_ops(&window_use_tools, 1));
-        // 第 1 轮但不含 WindowList(SubAgent) → 不触发
+        // iter 2 + 含 WindowList → 触发(补刀)
+        assert!(should_nudge_window_ops(&window_use_tools, 2));
+        // iter 3 + 含 WindowList → 不触发(避免长任务污染)
+        assert!(!should_nudge_window_ops(&window_use_tools, 3));
+        // 不含 WindowList(SubAgent) → 不触发
+        assert!(!should_nudge_window_ops(&subagent_tools, 0));
         assert!(!should_nudge_window_ops(&subagent_tools, 1));
-        // 第 2 轮 + 含 WindowList → 不触发(避免长任务污染)
-        assert!(!should_nudge_window_ops(&window_use_tools, 2));
     }
 
     #[test]

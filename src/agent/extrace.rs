@@ -79,6 +79,14 @@ pub struct ExecutionTrace {
     /// - 字段以 serde 默认值兼容旧 trace 反序列化(新增字段对老数据为 `[]`)。
     #[serde(default)]
     pub tool_call_log: Vec<ToolCallLogEntry>,
+    /// 首迭代 forced tool 是否真正生效(2026-09-16 第 68 轮新增)。
+    ///
+    /// - `None` = 未设置 first_iter_forced_tool;
+    /// - `Some(true)` = 首迭代 LLM 确实调用了 forced tool;
+    /// - `Some(false)` = 首迭代 forced tool 被降级或 LLM 未响应,返回了纯文本。
+    /// 用于 TUI 证据段显示 forced_tool 状态,快速定位「0 工具调用」根因。
+    #[serde(default)]
+    pub forced_tool_effective: Option<bool>,
 }
 
 /// 单次工具调用摘要(2026-09-16 第 56 轮 + 第 57 轮)。
@@ -154,6 +162,7 @@ impl Default for ExecutionTrace {
             bash_exit_nonzero_count: 0,
             last_bash_exit_code: default_last_bash_exit_code(),
             tool_call_log: Vec::new(),
+            forced_tool_effective: None,
         }
     }
 }

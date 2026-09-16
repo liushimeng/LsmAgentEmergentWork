@@ -1107,10 +1107,46 @@ impl Tool for WindowInspectTool {
         run_blocking(self.name(), move || {
             let driver = current_driver();
             let tree = driver.inspect(&window_id, max_depth, filter.as_deref())?;
-            Ok(tree_to_json(tree))
+            // 2026-09-16 第 68 轮 P2-A:控件树为空/只有 Pane 时,自动追加视觉路线引导。
+            // 背景:微信 4.x 等自绘 UI 控件树为空(只有 MMUIRenderSubWindow 等 Pane),
+            // LLM 常反复重试 WindowInspect 浪费时间。检测到空树时立即引导切换到视觉路线。
+            // 注意:count_nodes / has_actionable_controls 必须在 tree_to_json 之前调用,
+            // 因为 tree_to_json 会 move tree(ControlNode 未实现 Copy)。
+            let node_count = count_nodes(&tree);
+            let has_meaningful_controls = has_actionable_controls(&tree);
+            let json_str = tree_to_json(tree);
+            if node_count <= 2 || !has_meaningful_controls {
+                return Ok(format!(
+                    "{json_str}\n\n[视觉路线引导]当前窗口控件树为空或无可操作控件(自绘 UI / Electron canvas),\
+                     请立即切换视觉路线:\n\
+                     1. WindowOCR(window_id=\"{window_id}\") 识别界面文字 + 坐标\n\
+                     2. WindowAction(window_id=\"{window_id}\", path=\"/\", action=\"click_point\", \
+                        x=screen_cx, y=screen_cy) 点击目标位置\n\
+                     坐标取 WindowOCR 返回的 screen_cx/screen_y(词块中心)。不要重复调用 WindowInspect。"
+                ));
+            }
+            Ok(json_str)
         })
         .await
     }
+}
+
+/// 2026-09-16 第 68 轮 P2-A:检测控件树是否有「可操作控件」。
+/// 可操作 = role 不是 Window / Pane / Group / Unknown 等容器类,而是 Button /
+/// Edit / Text / List / MenuItem 等可交互控件。
+fn has_actionable_controls(node: &ControlNode) -> bool {
+    const ACTIONABLE_ROLES: &[&str] = &[
+        "Button", "Edit", "Text", "List", "ListItem", "MenuItem", "CheckBox",
+        "RadioButton", "ComboBox", "Slider", "Tab", "TreeItem", "Hyperlink",
+        "DataItem", "Custom",
+    ];
+    if ACTIONABLE_ROLES
+        .iter()
+        .any(|r| node.role.eq_ignore_ascii_case(r))
+    {
+        return true;
+    }
+    node.children.iter().any(has_actionable_controls)
 }
 
 // ===================== WindowAction =====================
