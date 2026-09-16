@@ -412,6 +412,10 @@ async fn run_one_shot(
             reason,
             usage,
             classification,
+            last_trace,
+            stage_durations,
+            retry_log,
+            wallclock_ms,
         } => {
             // 2026-09-11 第三十八轮 BUG-2:失败路径补 [yolo] 分类摘要(与 TUI/Executed
             // 路径对齐),失败任务的难度与目标不随 `..` 解构丢失。
@@ -420,15 +424,57 @@ async fn run_one_shot(
             // `laew -p ... > out.log` 管道消费方完全看不到失败结论(本轮 fl02/fl07
             // 实测 stdout 为空、仅 stderr 有 [agent failed]);诊断流(stderr)保留
             // stage/心跳,e2e 的 run() 为 2>&1 合流,行为兼容。
+            // 2026-09-16 第 58 轮 P0-D:`-p` 模式同步失败详情渲染 —— 复用
+            // format_failed_detail 把 stage_durations / retry_log / 失败工具明细呈现。
+            let reason_short = if reason.is_empty() {
+                "(未提供失败原因)".to_string()
+            } else {
+                reason.clone()
+            };
             println!(
-                "[agent failed] difficulty={} goal={}",
+                "[task failed] difficulty={}, reason={}, 总耗时 {:.2}s",
                 classification.task_level.display_name(),
-                classification
-                    .goal_summary
-                    .chars()
-                    .take(40)
-                    .collect::<String>()
+                reason_short.chars().take(80).collect::<String>(),
+                wallclock_ms as f64 / 1000.0,
             );
+            let stub_workflow = last_trace.as_ref().map(|t| {
+                lsm_agent::agent::orchestrator::WorkflowResult {
+                    id: "wf-1".into(),
+                    name: "失败单元".into(),
+                    subflow_outcome: String::new(),
+                    quality_report: lsm_agent::agent::quality::QualityReport {
+                        verdict: lsm_agent::agent::quality::Verdict::Fail,
+                        issues: vec![reason.clone()],
+                        suggestion: suggestion.clone(),
+                        retryable: false,
+                        source: lsm_agent::agent::context::AgentRole::SubAgent,
+                        evidence: String::new(),
+                    },
+                    usage: lsm_agent::llm::Usage::default(),
+                    subflow_trace: Some(t.as_ref().clone()),
+                    exec_role: lsm_agent::agent::context::AgentRole::SubAgent,
+                    wallclock_ms: 0,
+                    qc_wallclock_ms: 0,
+                }
+            });
+            let stub_result = lsm_agent::agent::orchestrator::TaskResult {
+                goal: classification.goal_summary.clone(),
+                classification: classification.clone(),
+                plan_doc: None,
+                workflows: stub_workflow.into_iter().collect(),
+                summary: String::new(),
+                total_usage: usage.clone(),
+                stage_durations: stage_durations.clone(),
+                retry_log: retry_log.clone(),
+                layer_log: vec![],
+                wallclock_ms,
+            };
+            let detail = lsm_agent::tui::format::format_failed_detail(
+                &stub_result,
+                &reason,
+                &suggestion,
+            );
+            println!("{detail}");
             // F4(2026-09-10 第 25 轮):先呈现真实失败原因,再给建议
             if reason.is_empty() {
                 println!("[agent failed] {suggestion}");

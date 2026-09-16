@@ -63,9 +63,25 @@ windows = { version = "0.58", features = [
     "Win32_System_ProcessStatus",
 ] }
 
-# WindowUse Agent macOS 后端:Accessibility(AXUIElementRef)经 core-foundation FFI 调用
+# WindowUse Agent macOS 后端:Accessibility(AXUIElementRef)经 axuielement / core-foundation FFI 调用
+# 2026-09-16 第 58 轮 P2:axuielement = "0.9" 是 pure-Rust 绑定 Accessibility framework
+# (活跃维护,2026-06 更新),默认使用 axui 路径;旧 core-foundation 手写 FFI 落到
+# macos_legacy.rs,通过 LAEW_MACOS_DRIVER=legacy 环境变量回退。
+# 注意:axuielement 0.9 走 Swift 桥接,需要 macOS 13+ SDK 且系统装 Xcode 完整工具链
+# (含 swiftCompatibility56 等库);工具链不全时编译会链接失败,临时方案:
+#   cargo build --no-default-features --features macos-legacy
+# 或 cargo build 时不引入 axui 路径,默认走 legacy(本轮 P2-D 已提供环境切换)。
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
+axuielement = { version = "0.9", optional = true }
+
+[features]
+default = []
+# macos-legacy:启用 axuielement typed API 路径(macos_axui.rs);
+# 需 macOS 13+ SDK 与完整 Xcode 工具链;工具链不全时编译会链接失败。
+# 启用方式:cargo build --features macos-legacy
+# 或运行时切换:LAEW_MACOS_DRIVER=axui laew
+macos-legacy = ["dep:axuielement"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

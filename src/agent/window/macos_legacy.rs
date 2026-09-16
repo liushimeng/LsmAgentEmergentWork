@@ -564,68 +564,72 @@ impl MacOsDriver {
     }
 }
 
+/// 2026-09-16 第 58 轮 P2:抽离 list_windows CG 实现为 pub fn,
+/// 供 macos_axui.rs(axuielement 版)复用,以保证 list_windows 在两版下输出字段一致。
+pub fn list_windows_cg(filter: Option<&str>) -> Result<Vec<WindowInfo>> {
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, 0);
+        if list.is_null() {
+            return Err(platform_err(
+                "macos",
+                "CGWindowListCopyWindowInfo 返回空(无窗口服务器连接?)",
+            ));
+        }
+        let count = CFArrayGetCount(list);
+        // 每个 pid 已见到的窗口计数 → ax_index
+        let mut seen: HashMap<i64, usize> = HashMap::new();
+        let mut out = Vec::new();
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(list, i) as CFDictionaryRef;
+            if dict.is_null() {
+                continue;
+            }
+            let layer = cfnum_i64(dict_get(dict, "kCGWindowLayer"));
+            if layer != 0 {
+                continue; // 只要常规应用窗口
+            }
+            let pid = cfnum_i64(dict_get(dict, "kCGWindowOwnerPID"));
+            let owner = cfstr(dict_get(dict, "kCGWindowOwnerName") as CFStringRef);
+            let title = cfstr(dict_get(dict, "kCGWindowName") as CFStringRef);
+            if title.is_empty() && owner.is_empty() {
+                continue;
+            }
+            if !matches_filter(&title, filter) && !matches_filter(&owner, filter) {
+                continue;
+            }
+            let mut bounds = Rect::default();
+            let bdict = dict_get(dict, "kCGWindowBounds") as CFDictionaryRef;
+            if !bdict.is_null() {
+                bounds = Rect {
+                    x: cfnum_i64(dict_get(bdict, "X")),
+                    y: cfnum_i64(dict_get(bdict, "Y")),
+                    width: cfnum_i64(dict_get(bdict, "Width")),
+                    height: cfnum_i64(dict_get(bdict, "Height")),
+                };
+            }
+            let idx = seen.entry(pid).or_insert(0);
+            let id = format!("{pid}:{idx}");
+            *idx += 1;
+            out.push(WindowInfo {
+                id,
+                title,
+                process_name: owner,
+                pid: pid.max(0) as u32,
+                bounds,
+            });
+        }
+        CFRelease(list.cast());
+        Ok(out)
+    }
+}
+
 impl WindowDriver for MacOsDriver {
     fn platform_name(&self) -> &'static str {
         "macos"
     }
 
     fn list_windows(&self, filter: Option<&str>) -> Result<Vec<WindowInfo>> {
-        // 注意:窗口枚举使用 CoreGraphics(CGWindowListCopyWindowInfo),
-        // 不需要 AX 辅助功能授权,因此任何情况下都可用(与 macOS 版本无关)。
-        // inspect/act 需要 AX + 授权,未授权时返回 -25211 与授权引导。
-        // 这里不调用 require_trusted(),直接枚举窗口。
-        let _ = self.ax_available(); // 仅用于调试/日志
-        unsafe {
-            let list = CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, 0);
-            if list.is_null() {
-                return Err(platform_err("macos", "CGWindowListCopyWindowInfo 返回空(无窗口服务器连接?)"));
-            }
-            let count = CFArrayGetCount(list);
-            // 每个 pid 已见到的窗口计数 → ax_index
-            let mut seen: HashMap<i64, usize> = HashMap::new();
-            let mut out = Vec::new();
-            for i in 0..count {
-                let dict = CFArrayGetValueAtIndex(list, i) as CFDictionaryRef;
-                if dict.is_null() {
-                    continue;
-                }
-                let layer = cfnum_i64(dict_get(dict, "kCGWindowLayer"));
-                if layer != 0 {
-                    continue; // 只要常规应用窗口
-                }
-                let pid = cfnum_i64(dict_get(dict, "kCGWindowOwnerPID"));
-                let owner = cfstr(dict_get(dict, "kCGWindowOwnerName") as CFStringRef);
-                let title = cfstr(dict_get(dict, "kCGWindowName") as CFStringRef);
-                if title.is_empty() && owner.is_empty() {
-                    continue;
-                }
-                if !matches_filter(&title, filter) && !matches_filter(&owner, filter) {
-                    continue;
-                }
-                let mut bounds = Rect::default();
-                let bdict = dict_get(dict, "kCGWindowBounds") as CFDictionaryRef;
-                if !bdict.is_null() {
-                    bounds = Rect {
-                        x: cfnum_i64(dict_get(bdict, "X")),
-                        y: cfnum_i64(dict_get(bdict, "Y")),
-                        width: cfnum_i64(dict_get(bdict, "Width")),
-                        height: cfnum_i64(dict_get(bdict, "Height")),
-                    };
-                }
-                let idx = seen.entry(pid).or_insert(0);
-                let id = format!("{pid}:{idx}");
-                *idx += 1;
-                out.push(WindowInfo {
-                    id,
-                    title,
-                    process_name: owner,
-                    pid: pid.max(0) as u32,
-                    bounds,
-                });
-            }
-            CFRelease(list.cast());
-            Ok(out)
-        }
+        list_windows_cg(filter)
     }
 
     fn inspect(&self, window_id: &str, max_depth: usize, filter: Option<&str>) -> Result<ControlNode> {

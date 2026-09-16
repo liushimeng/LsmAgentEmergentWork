@@ -17,7 +17,7 @@ use super::format::{
 use super::pathfmt;
 use crate::agent::debug::{DebugCollector, ReportMeta, finalize_report};
 use crate::agent::orchestrator::OrchestrationOutcome;
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, Usage};
 
 impl TuiSession {
     pub async fn handle_user_input(&mut self, line: &str) -> Result<bool> {
@@ -337,21 +337,66 @@ impl TuiSession {
                 reason,
                 usage,
                 classification,
+                last_trace,
+                stage_durations,
+                retry_log,
+                wallclock_ms,
             }) => {
                 println!();
-                println!("  [agent failed]");
-                // 2026-09-11 第三十八轮 BUG-2:失败路径补 [yolo] 分类摘要(与
-                // Executed 路径对齐)—— 失败前任务按什么难度/目标执行过,用户应可见,
-                // 不应随 Failed 分支的 `..` 解构一起丢失。
-                let c = &classification;
+                // 2026-09-16 第 58 轮 P0-D:F4 头部呈现真实失败原因 + 总耗时
+                // (此前只有 suggestion,可能与真实失败无关而误导用户)。
+                let reason_short = if reason.is_empty() {
+                    "(未提供失败原因)".to_string()
+                } else {
+                    reason.clone()
+                };
                 println!(
-                    "  [yolo] difficulty={} purpose={} goal={} intent={} plan_steps={}",
-                    c.task_level.display_name(),
-                    crate::tui::format::truncate_chars(&c.purpose, 40),
-                    crate::tui::format::truncate_chars(&c.goal_summary, 40),
-                    c.intent,
-                    c.decomposition_plan.len()
+                    "  [task failed: difficulty={}, reason={}, 总耗时 {:.2}s]",
+                    classification.task_level.display_name(),
+                    crate::tui::format::truncate_chars(&reason_short, 80),
+                    *wallclock_ms as f64 / 1000.0,
                 );
+                // 复用 format_task_result 渲染 stage_durations / retry_log / trace 段。
+                // stub_workflow 用 last_trace 携带失败单元的工具调用明细,便于 [trace] [tool] [failure] 段呈现。
+                let stub_workflow = last_trace.as_ref().map(|t| {
+                    crate::agent::orchestrator::WorkflowResult {
+                        id: "wf-1".into(),
+                        name: "失败单元".into(),
+                        subflow_outcome: String::new(),
+                        quality_report: crate::agent::quality::QualityReport {
+                            verdict: crate::agent::quality::Verdict::Fail,
+                            issues: vec![reason.clone()],
+                            suggestion: suggestion.clone(),
+                            retryable: false,
+                            source: crate::agent::context::AgentRole::SubAgent,
+                            evidence: String::new(),
+                        },
+                        usage: Usage::default(),
+                        subflow_trace: Some(t.as_ref().clone()),
+                        exec_role: crate::agent::context::AgentRole::SubAgent,
+                        wallclock_ms: 0,
+                        qc_wallclock_ms: 0,
+                    }
+                });
+                let stub_result = crate::agent::orchestrator::TaskResult {
+                    goal: classification.goal_summary.clone(),
+                    classification: classification.clone(),
+                    plan_doc: None,
+                    workflows: stub_workflow.into_iter().collect(),
+                    summary: String::new(),
+                    total_usage: *usage,
+                    stage_durations: stage_durations.clone(),
+                    retry_log: retry_log.clone(),
+                    layer_log: vec![],
+                    wallclock_ms: *wallclock_ms,
+                };
+                // 复用 format_failed_detail 渲染 stage_durations / retry_log / 失败工具明细 / failure_signals,
+                // 不再走 format_task_result(其会打印 "[task executed]" 与失败语义冲突)。
+                for line in
+                    crate::tui::format::format_failed_detail(&stub_result, &reason, &suggestion).lines()
+                {
+                    println!("{line}");
+                }
                 // F4(2026-09-10 第 25 轮):先呈现真实失败原因,再给建议 ——
                 // 此前只显示 suggestion,可能与真实失败无关而误导用户。
                 if !reason.is_empty() {

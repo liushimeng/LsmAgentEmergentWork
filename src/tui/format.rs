@@ -110,9 +110,12 @@ pub fn format_task_result(
     }
 
     // 2026-09-16 第 57 轮:分层并行执行摘要(仅当 ≥ 2 层 或 任一层含 ≥ 2 wf 时打印)。
-    if result.layer_log.len() >= 2
-        || result.layer_log.iter().any(|l| l.parallel)
-            && !result.layer_log.is_empty()
+    // 2026-09-16 第 58 轮 P0-E 修复:原条件 `len>=2 || (any_parallel && non_empty)`
+    // 因 `&&` 优先级高于 `||`,实际等价于 `len>=2 || (any_parallel && non_empty)`,
+    // 但视觉上像写错,空 layer_log 永不入内 —— 修正为「非空 + (≥2 层 或 任一层并行)」,
+    // 真正表达「分层有意义才打印」。
+    if !result.layer_log.is_empty()
+        && (result.layer_log.len() >= 2 || result.layer_log.iter().any(|l| l.parallel))
     {
         let total_layers = result.layer_log.len();
         let total_wf = result.layer_log.iter().map(|l| l.wf_ids.len()).sum::<usize>();
@@ -320,6 +323,225 @@ pub fn format_task_result(
     } else {
         sanitize_terminal_controls(&out)
     }
+}
+
+/// 失败链路详情渲染(2026-09-16 第 58 轮 P0-D):
+///
+/// `format_task_result` 强锚定 `[task executed]`,Failed 分支复用会显示错误标签。
+/// 这里抽一个失败专用版,只输出:
+/// - Yolo 分类 + 耗时
+/// - 各阶段耗时(stage_durations: yolo/main_work/qc_main/qc_plan/qc_wf/wf/session_context)
+/// - 重试链路(retry_log)
+/// - 分层并行摘要(layer_log)
+/// - 失败单元的工具调用明细(tool_call_log) + failure_signals + early_terminate_reason
+/// - 用量 + 总耗时
+///
+/// `reason` / `suggestion` 由调用方在末尾单独打印(与现有 F4 顺序一致)。
+/// 失败链路详情渲染(2026-09-16 第 58 轮 P0-D):
+///
+/// `format_task_result` 强锚定 `[task executed]`,Failed 分支复用会显示错误标签。
+/// 这里抽一个失败专用版,只输出:
+/// - Yolo 分类 + 耗时
+/// - 各阶段耗时(stage_durations: yolo/main_work/qc_main/qc_plan/qc_wf/wf/session_context)
+/// - 重试链路(retry_log)
+/// - 分层并行摘要(layer_log)
+/// - 失败单元的工具调用明细(tool_call_log) + failure_signals + early_terminate_reason
+/// - 用量 + 总耗时
+///
+/// `reason` / `suggestion` 由调用方在末尾单独打印(与现有 F4 顺序一致)。
+pub fn format_failed_detail(
+    result: &crate::agent::orchestrator::TaskResult,
+    reason: &str,
+    _suggestion: &str,
+) -> String {
+    let sv = |s: &str| sanitize_terminal_controls(s);
+    let mut out = String::new();
+    let c = &result.classification;
+    let purpose_short = truncate_chars(&c.purpose, 40);
+    let goal_short = truncate_chars(&c.goal_summary, 40);
+    let yolo_elapsed_ms = result
+        .stage_durations
+        .iter()
+        .find(|s| s.stage == "yolo")
+        .map(|s| s.elapsed_ms);
+    let yolo_elapsed_str = yolo_elapsed_ms
+        .map(|ms| format!(" (Yolo 分类 {:.2}s)", ms as f64 / 1000.0))
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "  [yolo] purpose={} goal={} intent={} plan_steps={}{}\n",
+        sv(&purpose_short),
+        sv(&goal_short),
+        sv(&c.intent),
+        c.decomposition_plan.len(),
+        yolo_elapsed_str,
+    ));
+    // 阶段耗时(参照 format_task_result L88-110)
+    for s in &result.stage_durations {
+        match s.stage.as_str() {
+            "main_work" => out.push_str(&format!(
+                "  [main-work] Main-Work 拆解({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            )),
+            "plan" => out.push_str(&format!(
+                "  [plan] Plan 规划({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            )),
+            "qc_main" => out.push_str(&format!(
+                "  [qc-main] QC-Main({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            )),
+            "qc_plan" => out.push_str(&format!(
+                "  [qc-plan] QC-Plan({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            )),
+            "wf" => out.push_str(&format!(
+                "  [wf] {} SubAgent/WindowUse 执行({:.2}s)\n",
+                s.wf_id.as_deref().unwrap_or("?"),
+                s.elapsed_ms as f64 / 1000.0
+            )),
+            "qc_wf" => out.push_str(&format!(
+                "  [qc-wf] {} QC 校验({:.2}s)\n",
+                s.wf_id.as_deref().unwrap_or("?"),
+                s.elapsed_ms as f64 / 1000.0
+            )),
+            "session_context" => out.push_str(&format!(
+                "  [session-context] SessionContext({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            )),
+            _ => {}
+        }
+    }
+    // 分层并行摘要
+    if !result.layer_log.is_empty()
+        && (result.layer_log.len() >= 2 || result.layer_log.iter().any(|l| l.parallel))
+    {
+        let total_layers = result.layer_log.len();
+        let total_wf = result.layer_log.iter().map(|l| l.wf_ids.len()).sum::<usize>();
+        let parallel_layers = result.layer_log.iter().filter(|l| l.parallel).count();
+        let max_layer_wall = result
+            .layer_log
+            .iter()
+            .map(|l| l.elapsed_ms)
+            .max()
+            .unwrap_or(0);
+        let sum_wall: u64 = result.layer_log.iter().map(|l| l.elapsed_ms).sum();
+        out.push_str(&format!(
+            "  [work-flows] 共 {total_layers} 层 / {total_wf} 个流程(并行层 {parallel_layers});\
+             最长层墙钟 {max_wall:.2}s / 层累计 {sum_wall:.2}s\n",
+            max_wall = max_layer_wall as f64 / 1000.0,
+            sum_wall = sum_wall as f64 / 1000.0,
+        ));
+    }
+    // 重试链路
+    if !result.retry_log.is_empty() {
+        for r in &result.retry_log {
+            out.push_str(&format!(
+                "  [retry] 第 {} 轮重试(累计 {:.2}s)  上一轮失败原因: {}\n",
+                r.retry_count,
+                r.elapsed_ms as f64 / 1000.0,
+                sv(&truncate_chars(&r.retry_hint, 100))
+            ));
+        }
+    }
+    // 失败单元的工具调用明细(失败场景全量,成功场景 5 条 —— 与 format_task_result 对齐)
+    for wf in &result.workflows {
+        if let Some(trace) = &wf.subflow_trace {
+            out.push_str(&format!(
+                "  [trace] iter={} tools={}(ok={},err={}) early_term={}\n",
+                trace.iterations,
+                trace.tool_calls,
+                trace.tool_calls_ok,
+                trace.tool_calls_err,
+                trace.early_terminated
+            ));
+            if !trace.tool_call_log.is_empty() {
+                let show_all = trace.tool_calls_err > 0;
+                let max_show = if show_all { usize::MAX } else { 5 };
+                let icon = |ok: bool| if ok { "✅" } else { "❌" };
+                let mut count = 0;
+                for tc in &trace.tool_call_log {
+                    if count >= max_show {
+                        break;
+                    }
+                    let elapsed = format!("{:.2}s", tc.elapsed_ms as f64 / 1000.0);
+                    let detail = if tc.ok {
+                        String::new()
+                    } else {
+                        let err_short = truncate_chars(&tc.error_summary, 80);
+                        format!(" ← {}", sv(&err_short))
+                    };
+                    out.push_str(&format!(
+                        "    [tool] {:<14} {}{} {} {}B{}\n",
+                        tc.tool,
+                        elapsed,
+                        icon(tc.ok),
+                        sv(&truncate_chars(&tc.args_json, 80)),
+                        tc.output_bytes,
+                        detail,
+                    ));
+                    count += 1;
+                }
+                if !show_all && trace.tool_call_log.len() > max_show {
+                    out.push_str(&format!(
+                        "    [tool] ...(省略 {} 条,共 {} 条)\n",
+                        trace.tool_call_log.len() - max_show,
+                        trace.tool_call_log.len()
+                    ));
+                }
+            }
+            // 失败模式汇总
+            if !trace.failure_signals.is_empty() {
+                let failures: Vec<String> = trace
+                    .failure_signals
+                    .iter()
+                    .filter(|s| s.as_str() != "ok")
+                    .map(|s| s.to_string())
+                    .collect();
+                if !failures.is_empty() {
+                    out.push_str(&format!(
+                        "  [failure] signals={}{}\n",
+                        failures.join(","),
+                        if !trace.early_terminate_reason.is_empty() {
+                            format!(" early_terminate_reason={}", trace.early_terminate_reason)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+            }
+        }
+    }
+    // QC 提示(若 issues 非空且 reason 与 issues 不同源时显示)
+    if !reason.is_empty() {
+        out.push_str(&format!(
+            "  [qc] reason={}\n",
+            sv(&truncate_chars(reason, 200))
+        ));
+    }
+    // 用量 + 总耗时
+    let usage = &result.total_usage;
+    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+        let mut cache = String::new();
+        if usage.cache_read_input_tokens > 0 {
+            cache.push_str(&format!("  cache_read={}", usage.cache_read_input_tokens));
+        }
+        if usage.cache_creation_input_tokens > 0 {
+            cache.push_str(&format!(
+                "  cache_creation={}",
+                usage.cache_creation_input_tokens
+            ));
+        }
+        let elapsed_suffix = if result.wallclock_ms > 0 {
+            format!("  (总耗时 {:.2}s)", result.wallclock_ms as f64 / 1000.0)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "  本次用量: input={}  output={}{}{}\n",
+            usage.input_tokens, usage.output_tokens, cache, elapsed_suffix
+        ));
+    }
+    out
 }
 
 /// 清理人类可读任务结果中的终端控制序列。

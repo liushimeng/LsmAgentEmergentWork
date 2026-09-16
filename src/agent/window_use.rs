@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use tracing::warn;
+
 use crate::agent::agent_message::AgentMessageManager;
 use crate::agent::cancel::CancelToken;
 use crate::agent::context::AgentRole;
@@ -20,8 +22,8 @@ use crate::agent::extrace::ExecutionTrace;
 use crate::agent::memory;
 use crate::agent::subagent::{SubFlowInput, SubFlowOutcome};
 use crate::agent::window_state::{
-    build_window_state_message, build_window_state_prompt, WindowSessionState,
-    WindowStateManager, WINDOW_STATE_MARKER_END, WINDOW_STATE_MARKER_START,
+    build_window_state_message, WindowSessionState, WindowStateManager,
+    WINDOW_STATE_MARKER_END, WINDOW_STATE_MARKER_START,
 };
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
@@ -108,33 +110,43 @@ impl WindowUseRunner {
         // 尾部追加窗口操控作业规范,提醒「先检视再操作」。
         let mut prompt = input.to_user_prompt();
 
-        // ★2) 注入窗口会话状态(如有),让 LLM 感知上一轮操作对象。
-        let state_prompt = build_window_state_prompt(&win_state);
-        if !state_prompt.is_empty() {
-            prompt.push_str(&format!(
-                "\n\n【窗口会话上下文(系统注入,非用户输入)】\n{state_prompt}"
-            ));
-        }
-
-        // ★3) 注入待处理的 Agent 消息(如有),如 SubAgent 发来「请写入这段文本」。
-        if let Some(msg) = self.msg_mgr.peek(session_id, AgentRole::WindowUse).await {
-            prompt.push_str(&format!(
-                "\n\n【来自其他 Agent 的消息】\n{}\n请基于此消息继续操作。",
-                msg.hint()
-            ));
-        }
-
+        // 2026-09-16 第 58 轮 P1-C 作业规范顺序修正:Runner 末尾引导与 system_prompt
+        // 保持一致,统一为「WindowList / WindowFind → WindowInspect → WindowAction」。
+        // 旧版只提「先用 WindowList」,与 system_prompt 的「WindowFind(推荐)」错位,
+        // LLM 在 system / user 两端看到不同顺序易困惑。
         prompt.push_str(
             "\n\n【窗口操控作业规范】\n\
-             1. 先用 WindowList 找到目标窗口(可用 filter 过滤),再用 WindowInspect 检视控件树;\n\
-             2. 依据控件 actions 列表选择合法动作,用 WindowAction 执行;路径失效时重新检视;\n\
-             3. 禁止对疑似支付/删除/发送/确认类按钮做无把握点击;只读操作(list/inspect/get_text)优先;\n\
-             4. macOS 提示无障碍权限未授予时,把开权限步骤写进最终回答告知用户。",
+             1. 第一步必须用 WindowList(枚举)或 WindowFind(按进程名/标题直接查,推荐)找到目标窗口;\n\
+             2. macOS 上 WeChat/部分 Electron 应用 NSWindow title 可能为空,这是正常现象,\
+                WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明,应通过 process_name 定位;\n\
+             3. 拿到窗口 id 后用 WindowInspect(max_depth 适度,filter 缩范围)检视控件树;\n\
+             4. 依据控件 actions 列表选择合法动作,用 WindowAction 执行;路径失效时重新 WindowInspect;\n\
+             5. 禁止对疑似支付/删除/发送/确认类按钮做无把握点击;只读操作优先;\n\
+             6. macOS WindowInspect/Action 返回 -25211 kAXErrorAPIDisabled 时,把开权限步骤写进最终回答告知用户。",
         );
 
         let mut sub_session = crate::session::Session::new();
         sub_session.context_mut().push(ChatMessage::user(&prompt));
         sub_session.id = session_id.to_string();
+
+        // 2026-09-16 第 58 轮 P1-A:窗口会话状态改用 build_window_state_message 注入
+        // sub_session 第一条 user 消息(带 WINDOW_STATE_MARKER 锚点,可被 is_window_state_injected
+        // 幂等探测),不再追加到 prompt 末尾。原因:
+        // 1) 状态消息隔离成独立 turn,LLM 视觉上更易识别「系统注入」与「用户输入」;
+        // 2) 锚点标记便于跨轮幂等(避免重复注入时 LLM 看到多份「窗口会话上下文」块);
+        // 3) 与 SESSION_HISTORY / PROJECT_CONTEXT 等其它系统注入块对齐风格。
+        if let Some(state_msg) = build_window_state_message(&win_state) {
+            sub_session.context_mut().push(state_msg);
+        }
+
+        // ★3) 注入待处理的 Agent 消息(如有),如 SubAgent 发来「请写入这段文本」。
+        if let Some(msg) = self.msg_mgr.peek(session_id, AgentRole::WindowUse).await {
+            let agent_msg = format!(
+                "【来自其他 Agent 的消息】\n{}\n请基于此消息继续操作。",
+                msg.hint()
+            );
+            sub_session.context_mut().push(ChatMessage::user(&agent_msg));
+        }
 
         // 早终止路径语义与 SubAgentRunner 对齐:包装成失败摘要文本 + trace,
         // 交给 Quality-Check 判定,而不是直接升级为 Error。
@@ -169,6 +181,24 @@ impl WindowUseRunner {
         };
 
         trace.collect_failure_signals(&text);
+
+        // 2026-09-16 第 58 轮 P0-B:Runner 出口兜底。
+        // 根因场景:LLM 在 WindowUse 单元里完全没发出任何工具调用(trace.tool_calls=0),
+        // 但返回了一段"我先 WindowList 看看"的纯文本,Agent 循环把它当成功返回。
+        // 闸门:tool_calls==0 且文本中既无动作关键词、也不够长 → 强制标 failed。
+        // 配合 P0-A(LLM nudge)双重防御:即便 LLM 两次都只回文本,这里也会拦截。
+        let looks_like_action = looks_like_window_ops_action(&text);
+        if trace.tool_calls == 0 && !looks_like_action {
+            warn!(
+                window_use_runner = "p0_b_no_tool_use_no_action_text",
+                text_len = text.len(),
+                "WindowUse 单元未发出任何工具调用,触发出口兜底"
+            );
+            trace.early_terminated = true;
+            trace.early_terminate_reason =
+                format!("no_tool_use_no_action_text:text_len={}", text.len());
+            trace.collect_failure_signals(&text);
+        }
         let failed = trace.is_failed();
 
         // ★4) 从 trace 中提取窗口操作记录,更新窗口状态。
@@ -251,6 +281,43 @@ impl Drop for WindowUseBashModeGuard {
     }
 }
 
+/// 窗口操作动作关键词探测(P0-B 兜底用)。
+///
+/// 语义:LLM 在 WindowUse 单元里没有调用任何工具时,如果它给的文本里出现以下
+/// 中英文动作关键词,说明它已描述了具体操作结果(可能是 mock 场景或纯文本推理),
+/// 不算空跑;否则视为「LLM 没干活」,Runner 出口强制标 failed。
+///
+/// 关键词覆盖:
+/// - 中文:已点击/已发送/发送成功/已输入/键入/粘贴成功/激活窗口/已打开
+/// - 英文:clicked/sent/submitted/typed/windowId=/Pressed/已激活
+///
+/// 长度兜底:文本超过 200 字符也算「有实质内容」(复杂报告 / 路径解析 / 状态描述
+/// 等都可能无关键词但仍有信息量)。
+fn looks_like_window_ops_action(text: &str) -> bool {
+    if text.len() > 200 {
+        return true;
+    }
+    const KEYWORDS: &[&str] = &[
+        "已点击",
+        "已发送",
+        "发送成功",
+        "成功发送",
+        "已输入",
+        "键入",
+        "粘贴成功",
+        "激活窗口",
+        "已打开",
+        "clicked",
+        "sent",
+        "submitted",
+        "typed",
+        "windowId=",
+        "Pressed",
+        "已激活",
+    ];
+    KEYWORDS.iter().any(|k| text.contains(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +377,85 @@ mod tests {
         unsafe {
             std::env::remove_var(WINDOW_USE_MODE_ENV);
         }
+    }
+
+    // ============== 2026-09-16 第 58 轮 P0-A / P0-B / P1-A 测试 ==============
+
+    #[test]
+    fn nudge_for_window_ops_triggers_on_first_iter_window_use() {
+        // P0-A:nudge 闸门双锁——iter==1 + profile.tools 含 WindowList
+        // should_nudge_window_ops 定义在 crate::agent::mod.rs,从父模块直接路径引用
+        use crate::agent::should_nudge_window_ops;
+        let window_use_tools = ["WindowList", "Read"];
+        let subagent_tools = ["Read", "Write"];
+
+        // 第 1 轮 + 含 WindowList → 触发
+        assert!(should_nudge_window_ops(&window_use_tools, 1));
+        // 第 1 轮但不含 WindowList(SubAgent) → 不触发
+        assert!(!should_nudge_window_ops(&subagent_tools, 1));
+        // 第 2 轮 + 含 WindowList → 不触发(避免长任务污染)
+        assert!(!should_nudge_window_ops(&window_use_tools, 2));
+    }
+
+    #[test]
+    fn runner_flags_zero_tool_calls_as_failed() {
+        // P0-B:Runner 出口兜底——0 tool_calls + 无动作关键词 → 触发 early_terminate_reason
+        let text = "我需要先用 WindowList 查一下微信窗口,然后才能继续操作";
+        let looks_like_action = looks_like_window_ops_action(text);
+        assert!(!looks_like_action, "无关键词不应判为动作");
+        assert!(text.len() <= 200, "短文本不算有实质内容");
+    }
+
+    #[test]
+    fn runner_passes_action_keyword_text_as_success() {
+        // P0-B 兜底反例:含动作关键词 → 不标 failed
+        let keywords_texts = [
+            "已点击发送按钮",
+            "已成功发送消息",
+            "已输入赵玲玲并提交",
+            "windowId=12345:0 clicked",
+            "已激活微信窗口并定位联系人",
+        ];
+        for text in keywords_texts {
+            assert!(
+                looks_like_window_ops_action(text),
+                "动作关键词应判为有动作:{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn runner_passes_long_text_as_success_via_length_fallback() {
+        // P0-B 兜底:无关键词但文本长度 > 200 字符也算有实质内容(路径解析/状态描述)
+        let long_text = "x".repeat(250);
+        assert!(looks_like_window_ops_action(&long_text));
+    }
+
+    #[test]
+    fn state_injected_as_system_message_with_marker() {
+        // P1-A:窗口会话状态通过 build_window_state_message 注入 sub_session 第一条 user 消息,
+        // 文本含 WINDOW_STATE_MARKER_START 锚点便于幂等探测。
+        use crate::agent::window_state::{build_window_state_message, WindowSessionState};
+        let mut state = WindowSessionState::new("test-session");
+        state.window_aliases.insert("wechat".into(), "WeChat".into());
+        let msg = build_window_state_message(&state);
+        assert!(msg.is_some(), "非空状态应能构造消息");
+        // content 是 Vec<ContentBlock>,取首块文本
+        let blocks = &msg.unwrap().content;
+        let text = blocks
+            .first()
+            .and_then(|b| match b {
+                crate::llm::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            text.contains(WINDOW_STATE_MARKER_START),
+            "state 消息应包含 WINDOW_STATE_MARKER_START 锚点"
+        );
+        assert!(
+            text.contains(WINDOW_STATE_MARKER_END),
+            "state 消息应包含 WINDOW_STATE_MARKER_END 锚点"
+        );
     }
 }

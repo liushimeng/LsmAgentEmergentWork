@@ -178,6 +178,16 @@ pub enum OrchestrationOutcome {
         reason: String,
         suggestion: String,
         usage: Usage,
+        /// 2026-09-16 第 58 轮 P0-C:最后一次失败的 ExecutionTrace,
+        /// 让 Failed 分支能复用 format_task_result 渲染 [trace] / [tool] / [failure] 段,
+        /// 用户一眼看到「哪个工具失败 / early_terminate_reason / failure_signals」。
+        last_trace: Option<Arc<ExecutionTrace>>,
+        /// 2026-09-16 第 58 轮 P0-C:阶段耗时,与 Executed 分支共享同一渲染管线。
+        stage_durations: Vec<StageDuration>,
+        /// 2026-09-16 第 58 轮 P0-C:重试记录(每轮的失败原因与耗时)。
+        retry_log: Vec<RetryRecord>,
+        /// 2026-09-16 第 58 轮 P0-C:任务总墙钟,毫秒。
+        wallclock_ms: u64,
     },
 }
 
@@ -429,6 +439,9 @@ impl MultiAgentOrchestrator {
         // F3(2026-09-10 第 25 轮):上一轮失败原因,重试轮回灌 Main-Work(消除盲重试);
         // 档位升级回流 Yolo 后清空。同时作为 Failed 变体的 reason(F4)。
         let mut retry_hint = String::new();
+        // 2026-09-16 第 58 轮 P0-C:跨轮透传最近一次失败的 ExecutionTrace,
+        // 供 Failed outcome 复用 format_task_result 渲染 [trace] [tool] [failure] 段。
+        let mut last_failure_trace: Option<Arc<ExecutionTrace>> = None;
 
         // 1.2) simple + direct_answer 短路(2026-09-09 第 15 轮 AQ03 实测发现):
         // Yolo 已给出完整直接答案时,不再空转一轮 SubAgent+QC(实测多花 ~2.5 分钟
@@ -505,12 +518,19 @@ impl MultiAgentOrchestrator {
                 };
                 self.record_failure_event(session.id(), &classification, &suggestion);
                 self.dbg_task_end(&format!("failed: {suggestion}"), total_usage);
-                let _ = task_started; // 当前不再消费,但保留锚点(后续 Failed 变体可挂 wallclock_ms)
+                // 2026-09-16 第 58 轮 P0-C:把累计的 stage_durations / retry_log /
+                // 最近一次失败 trace / 任务总耗时 透传给 Failed outcome,让
+                // TUI Failed 分支复用 format_task_result 渲染 [trace] [tool] [failure] 段。
+                let wallclock_ms = task_started.elapsed().as_millis() as u64;
                 return Ok(OrchestrationOutcome::Failed {
                     classification,
                     reason: retry_hint.clone(),
                     suggestion,
                     usage: total_usage,
+                    last_trace: last_failure_trace.clone(),
+                    stage_durations: stage_durations.clone(),
+                    retry_log: retry_log.clone(),
+                    wallclock_ms,
                 });
             }
 
@@ -597,6 +617,11 @@ impl MultiAgentOrchestrator {
                         return Err(AgentError::Cancelled);
                     }
                     total_usage = add_usage(total_usage, failure_usage(&failure));
+                    // 2026-09-16 第 58 轮 P0-C:捕获最近一次失败的 ExecutionTrace,
+                    // 跨轮透传到 Failed outcome,让 TUI 能展示「哪个工具失败 / early_terminate_reason / failure_signals」。
+                    if let Some(trace) = failure.trace.as_ref() {
+                        last_failure_trace = Some(trace.clone());
+                    }
                     // 2026-09-16 第 57 轮:本轮 retry 结束 ——
                     // 把 retry_count / retry_hint / 本轮耗时记入 retry_log,
                     // 供 TUI 在「重试链路」段呈现(此前只能从 progress 阶段日志反推)。

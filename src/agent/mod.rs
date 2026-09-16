@@ -302,6 +302,33 @@ impl Agent {
                         )]));
                 }
 
+                // 2026-09-16 第 58 轮 P0-A:窗口操控型 Agent 第 1 轮 nudge 兜底。
+                // 根因:WindowUse Runner 把 LLM 当成"专项执行单元",但 LLM 第 1 轮
+                // 经常返回纯文本("让我先查窗口...")而不是直接调用 WindowList/WindowFind;
+                // 老的 !has_tool_calls 分支会直接 return finalize_with_max_tokens(),
+                // 把"我先看看"纯文本当作成功回答,trace.tool_calls=0 → Runner 视为成功。
+                //
+                // 闸门双锁:
+                // 1) iter==1 —— 只在第 1 轮 nudge,后续轮次恢复原行为(避免长任务污染);
+                // 2) profile.tools 含 "WindowList" —— 强白名单,只对窗口操控类 Agent 触发,
+                //    其它 Agent(Yolo/Main-Work/QC/SubAgent 普通任务)走原路径。
+                //
+                // 后续:P0-B 在 WindowUseRunner 出口兜底,即便 nudge 后 LLM 仍只回文本,
+                // 也会被 Runner 标 failed,不会逃过 QC。
+                if should_nudge_window_ops(&self.profile.tools.names(), iter)
+                    && !completion.text.trim().is_empty()
+                    && truncation_resumes == 0
+                {
+                    info!(
+                        iter = iter,
+                        "WindowUse 第 1 轮无工具调用,注入 nudge 强制 LLM 使用窗口操控工具"
+                    );
+                    session
+                        .context_mut()
+                        .push(ChatMessage::user(WINDOW_OPS_NUDGE_TEXT));
+                    continue;
+                }
+
                 // 检测截断:输出被 token 上限截断时自动续接
                 if is_truncation_stop_reason(completion.stop_reason.as_deref()) {
                     // max_tokens 静默升级(2026-09-09 第 09 轮,L1037):
@@ -842,6 +869,32 @@ pub(crate) fn build_runtime_hints(trace: &ExecutionTrace, consecutive_failures: 
 /// - OpenAI:`"length"` 表示输出达到 `max_tokens` 上限被截断
 fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
     matches!(stop_reason, Some("max_tokens") | Some("length"))
+}
+
+// ============== 2026-09-16 第 58 轮 P0-A:WindowUse nudge 兜底 ==============
+//
+// 微信任务失败根因(调研确认):
+// LLM 在 WindowUse Runner 第 1 轮经常返回"让我先 WindowList 看看..."纯文本,
+// 没有调任何窗口操控工具。Agent 循环 `!has_tool_calls() → finalize_with_max_tokens`
+// 把这段文本当作成功回答返回 → trace.tool_calls=0 → Runner 视为成功 →
+// 上层 QC 看到"无 WindowAction 调用"判未通过 → 整任务失败。
+//
+// 闸门双锁:
+// 1) iter==1:仅第 1 轮 nudge,后续轮次恢复原行为,避免长任务误判;
+// 2) profile.tools 含 "WindowList":强白名单,只对窗口操控类 Agent 触发,
+//    其它 Agent(Yolo/Main-Work/QC/SubAgent 普通任务)走原路径。
+//
+// P0-B 在 WindowUseRunner 出口兜底:即便 nudge 后 LLM 仍只回文本,也会被 Runner
+// 标 failed,不会逃过 QC。
+pub(crate) const WINDOW_OPS_NUDGE_TEXT: &str = "【laew 系统提示】你刚才的回复没有调用任何窗口操控工具。\
+请立即用 WindowList(枚举桌面窗口)或 WindowFind(按进程名/标题查窗口,推荐)找到目标应用窗口,\
+然后用 WindowInspect 检视控件树,再用 WindowAction 执行操作。\
+这是唯一被接受的工作方式 —— 纯文本回答将被判失败。\
+提示:macOS 上 WeChat/部分 Electron 应用的 NSWindow title 可能为空,这是正常的,\
+应通过 process_name=\"WeChat\" 定位窗口,WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明此现象。";
+
+pub(crate) fn should_nudge_window_ops(profile_tools: &[&str], iter: usize) -> bool {
+    iter == 1 && profile_tools.iter().any(|t| *t == "WindowList")
 }
 
 /// 结构化输出强制通道总开关(L6/L19,2026-09-09 第 13 轮)。

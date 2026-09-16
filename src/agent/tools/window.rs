@@ -359,7 +359,27 @@ impl Tool for WindowFindTool {
             }
             match pick_top_hit(&wins, &query, mode) {
                 Some(hit) => {
-                    let body = json!({
+                    // 2026-09-16 第 58 轮 P1-B:title 为空但 process_name 命中时,
+                    // 输出 note 字段说明 WeChat/部分 Electron 应用 NSWindow title
+                    // 私有化的已知行为,引导 LLM 继续 WindowInspect 而不是放弃。
+                    let note = if hit.info.title.is_empty()
+                        && hit.matched_field == "process"
+                    {
+                        Some(
+                            "macOS 上 WeChat / 部分 Electron 应用 NSWindow title \
+                             可能为空(CoreGraphics 拿不到),这是正常结果。\
+                             窗口已通过 process_name 成功定位,可以直接调用 \
+                             WindowInspect(window_id) 继续检视控件树。"
+                        )
+                    } else if hit.info.title.is_empty() {
+                        Some(
+                            "title 为空,可能 NSWindow 私有化;通过 process_name 匹配,\
+                             可继续 WindowInspect"
+                        )
+                    } else {
+                        None
+                    };
+                    let mut body = json!({
                         "window_id": hit.info.id,
                         "title": hit.info.title,
                         "process_name": hit.info.process_name,
@@ -372,6 +392,9 @@ impl Tool for WindowFindTool {
                             MatchMode::Fuzzy => "fuzzy",
                         },
                     });
+                    if let Some(n) = note {
+                        body["note"] = json!(n);
+                    }
                     Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
                 }
                 None => {

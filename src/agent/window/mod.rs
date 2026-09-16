@@ -6,8 +6,9 @@
 //!   (`CoCreateInstance(CUIAutomation)` + TreeWalker 控件树遍历 +
 //!   Invoke/Value Pattern 操作),`EnumWindows` 枚举 HWND 顶层窗口,
 //!   UIA 不可用时降级 `SendMessageW`(BM_CLICK / WM_SETTEXT / WM_GETTEXT);
-//! - **macOS**(`macos.rs`,`cfg(target_os = "macos")`):Accessibility API
-//!   (`AXUIElementRef`),`CGWindowListCopyWindowInfo` 枚举窗口,
+//! - **macOS**(默认 `macos_axui.rs`,`LAEW_MACOS_DRIVER=legacy` 切到 `macos_legacy.rs`):
+//!   Accessibility API(`AXUIElementRef` / `axuielement = "0.9"` typed accessor),
+//!   `CGWindowListCopyWindowInfo` 枚举窗口,
 //!   `AXIsProcessTrustedWithOptions` 权限检测(默认不弹窗,`LAEW_AX_PROMPT=1` 放开);
 //! - **其他平台**(`fallback.rs`):`wmctrl` / `xdotool` 尽力而为列举窗口,
 //!   控件级操作返回结构化「平台不支持」错误(fail-closed,供 QC 判 Fail 回流)。
@@ -18,8 +19,14 @@ use serde::Serialize;
 
 use crate::error::{AgentError, Result};
 
+#[cfg(all(target_os = "macos", feature = "macos-legacy"))]
+mod macos_axui;
+#[cfg(all(target_os = "macos", feature = "macos-legacy"))]
+use macos_axui::MacosAxuiDriver as DefaultMacosDriver;
 #[cfg(target_os = "macos")]
-mod macos;
+mod macos_legacy;
+#[cfg(target_os = "macos")]
+use macos_legacy::MacOsDriver as LegacyMacosDriver;
 #[cfg(windows)]
 mod windows;
 
@@ -139,6 +146,12 @@ pub trait WindowDriver: Send + Sync {
 }
 
 /// 构造当前平台的窗口驱动。
+///
+/// 2026-09-16 第 58 轮 P2-D:macOS 默认走 core-foundation 手写 FFI(macos_legacy.rs);
+/// `LAEW_MACOS_DRIVER=axui` 切到 axuielement typed API(macos_axui.rs,需 cargo feature macos-legacy)。
+/// 仅 macOS 平台有此分支,Windows / 其他平台行为不变。
+/// 注:axuielement 0.9 走 Swift 桥接,需要 macOS 13+ SDK 与 Xcode 完整工具链;
+/// 工具链不全时编译 axui 模块会链接失败,本平台默认走 legacy 是稳定选择。
 pub fn current_driver() -> Box<dyn WindowDriver> {
     #[cfg(windows)]
     {
@@ -146,7 +159,28 @@ pub fn current_driver() -> Box<dyn WindowDriver> {
     }
     #[cfg(target_os = "macos")]
     {
-        Box::new(macos::MacOsDriver::new())
+        let want_axui = std::env::var("LAEW_MACOS_DRIVER")
+            .map(|v| v == "axui")
+            .unwrap_or(false);
+        #[cfg(feature = "macos-legacy")]
+        {
+            if want_axui {
+                Box::new(DefaultMacosDriver::new())
+            } else {
+                Box::new(LegacyMacosDriver::new())
+            }
+        }
+        #[cfg(not(feature = "macos-legacy"))]
+        {
+            // 未启用 axui feature 时强制走 legacy;want_axui 仅给警告,避免编译错
+            if want_axui {
+                eprintln!(
+                    "[laew] LAEW_MACOS_DRIVER=axui 但未启用 macos-legacy feature,回退 legacy"
+                );
+            }
+            let _ = want_axui;
+            Box::new(LegacyMacosDriver::new())
+        }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
