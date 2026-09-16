@@ -773,11 +773,12 @@ impl TuiSession {
     }
 }
 
-/// 2026-09-16 第 62 轮:把 stage 文本压成短标题,waiting 心跳不再复读超长文本。
+/// 2026-09-16 第 63 轮(升级):把 stage 文本压成短标题,waiting 心跳不再复读超长文本。
 /// - 长描述(单元详情 / QC 详情)走 `[laew]` 前缀立即冲刷,不进入 waiting 流;
 /// - 短标题(单元 ID + 执行者)进入 stage 流 + waiting 心跳,每 1s 原地重写时只刷新 spinner。
+/// 2026-09-16 第 63 轮:从 60 → 40 字符,避免 waiting 行过长导致重复感。
 fn short_stage_label(line: &str) -> String {
-    const MAX_CHARS: usize = 60;
+    const MAX_CHARS: usize = 40;
     let clean = line.replace(['\n', '\r'], " ");
     if clean.chars().count() <= MAX_CHARS {
         clean
@@ -798,7 +799,7 @@ mod tests {
     fn short_stage_label_truncates_long_input() {
         let long = "wf-1.step WindowUse 执行中 | 职责: 微信通讯录查找用户并发送AI消息 | 期望: 微信进程存在且窗口可访问; 通讯录界面成功打开";
         let label = short_stage_label(long);
-        assert!(label.chars().count() <= 60, "短标题应 ≤ 60 字符:{} 字符", label.chars().count());
+        assert!(label.chars().count() <= 40, "短标题应 ≤ 40 字符:{} 字符", label.chars().count());
         assert!(label.ends_with('…'), "超长应加 …");
     }
 

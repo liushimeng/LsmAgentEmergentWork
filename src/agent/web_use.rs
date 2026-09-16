@@ -38,7 +38,14 @@ pub struct WebUseRunner {
 
 impl WebUseRunner {
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>) -> Self {
-        let agent = Agent::new(llm, AgentProfile::web_use_profile());
+        // 2026-09-16 第 63 轮:WebUse 首迭代强制调用 BrowserNew。
+        // 解决"16 次迭代 tool_calls=0"的根因问题:LLM 第 1 轮经常返回纯文本
+        // ("让我先...")而不是直接调用 BrowserNew,导致 Agent 循环把纯文本
+        // 当作成功回答返回,trace.tool_calls=0 → QC 判失败。
+        // 首迭代强制 tool_choice={"type":"tool","name":"BrowserNew"},
+        // 后续轮次恢复 auto,让 LLM 自由决策。
+        let agent = Agent::new(llm, AgentProfile::web_use_profile())
+            .with_first_iter_forced_tool("BrowserNew");
         let max_iterations = agent.max_iterations();
         let msg_mgr = AgentMessageManager::new(db.clone());
         Self {
@@ -195,9 +202,12 @@ impl WebUseRunner {
 /// 浏览器操作动作关键词探测(出口兜底用)。
 ///
 /// 语义同 WindowUse 的 looks_like_window_ops_action:无工具调用时,文本含中英文
-/// 动作关键词或超过 200 字符,视为「有实质内容」,否则强制标 failed。
+/// 动作关键词或超过阈值,视为「有实质内容」,否则强制标 failed。
+///
+/// 2026-09-16 第 63 轮:阈值从 200 → 100 字符,避免"伪动作描述"逃过 QC
+/// (如"我会先用 BrowserNew 打开页面..."这种纯文本意图描述)。
 fn looks_like_web_ops_action(text: &str) -> bool {
-    if text.len() > 200 {
+    if text.len() > 100 {
         return true;
     }
     const KEYWORDS: &[&str] = &[
@@ -208,14 +218,20 @@ fn looks_like_web_ops_action(text: &str) -> bool {
         "已抓取",
         "已采集",
         "已登录",
+        "已导航",
         "页面标题",
         "page_id",
+        "spawned_page_id",
         "opened",
         "clicked",
         "typed",
         "screenshot",
         "navigated",
         "crawled",
+        "browser_",
+        "BrowserNew",
+        "BrowserControl",
+        "BrowserInspect",
         "title",
     ];
     KEYWORDS.iter().any(|k| text.contains(k))
@@ -246,9 +262,10 @@ mod tests {
 
     #[test]
     fn runner_flags_zero_tool_calls_as_failed() {
-        let text = "我需要先用 BrowserNew 打开页面,然后才能继续操作";
+        // 2026-09-16 第 63 轮:阈值从 200 → 100,纯意图描述不算动作
+        let text = "我需要先打开页面然后才能继续操作";
         assert!(!looks_like_web_ops_action(text), "无关键词不应判为动作");
-        assert!(text.len() <= 200, "短文本不算有实质内容");
+        assert!(text.len() <= 100, "短文本不算有实质内容");
     }
 
     #[test]

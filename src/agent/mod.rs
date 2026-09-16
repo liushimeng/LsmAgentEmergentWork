@@ -85,6 +85,10 @@ pub struct Agent {
     max_truncation_resume: usize,
     /// 最大上下文溢出恢复次数(排水/折叠重试的全会话预算)。
     max_overflow_recoveries: usize,
+    /// 首迭代强制工具(2026-09-16 第 63 轮):WebUse/WindowUse 等专项 Agent 在第 0 轮
+    /// 强制调用指定工具(如 BrowserNew),后续轮次恢复 auto。None 表示不强制。
+    /// 设计见 tmpPlan/2026-09-16_08-WebUse全链路优化与TUI重复输出修复方案.md。
+    first_iter_forced_tool: Option<String>,
 }
 
 impl Agent {
@@ -95,11 +99,20 @@ impl Agent {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_truncation_resume: DEFAULT_MAX_TRUNCATION_RESUME,
             max_overflow_recoveries: DEFAULT_MAX_OVERFLOW_RECOVERIES,
+            first_iter_forced_tool: None,
         }
     }
 
     pub fn with_max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
+        self
+    }
+
+    /// 设置首迭代强制工具(2026-09-16 第 63 轮):仅在首次 LLM 调用时强制
+    /// 调用指定工具,后续轮次恢复 auto。用于 WebUse/WindowUse 等专项 Agent
+    /// 确保首步必定执行工具调用,避免"纯文本空转"。
+    pub fn with_first_iter_forced_tool(mut self, tool_name: impl Into<String>) -> Self {
+        self.first_iter_forced_tool = Some(tool_name.into());
         self
     }
 
@@ -243,6 +256,11 @@ impl Agent {
         // trace.artifacts 上限(2026-09-09 第 15 轮):防止极端任务写大量文件时轨迹膨胀。
         const ARTIFACTS_LIMIT: usize = 8;
 
+        // 2026-09-16 第 63 轮:首迭代强制工具状态跟踪。
+        // 首迭代强制调用指定工具(如 BrowserNew)后,后续轮次恢复 auto,
+        // 避免全程强制导致 LLM 无法自由决策。
+        let mut first_iter_forced_done = false;
+
         for iter in 0..self.max_iterations {
             trace.iterations = iter + 1;
             // 迭代边界:取消检查(轻量 is_cancelled,热路径零 await 开销)
@@ -250,6 +268,25 @@ impl Agent {
                 if token.is_cancelled() {
                     backfill_cancelled_tool_results(session.context_mut());
                     return Err(AgentError::Cancelled);
+                }
+            }
+            // 2026-09-16 第 63 轮:首迭代强制工具注入。
+            // iter==0 且 first_iter_forced_tool 已设置且未执行过 → 强制指定工具;
+            // 后续轮次恢复 auto(清除 forced_tool,保留 emit_tool 语义)。
+            if iter == 0 {
+                if let Some(tool) = &self.first_iter_forced_tool {
+                    meta.forced_tool = Some(tool.clone());
+                    debug!(forced_tool = %tool, "首迭代强制工具注入");
+                }
+            } else if !first_iter_forced_done {
+                // 首迭代已完成,恢复 auto(但保留 emit_tool 结构化通道)
+                if self.first_iter_forced_tool.is_some() {
+                    meta.forced_tool = if forced_tools_enabled() {
+                        self.profile.emit_tool.clone()
+                    } else {
+                        None
+                    };
+                    first_iter_forced_done = true;
                 }
             }
             debug!(iteration = iter, "agent step");
@@ -917,11 +954,19 @@ pub(crate) fn should_nudge_window_ops(profile_tools: &[&str], iter: usize) -> bo
     iter == 1 && profile_tools.iter().any(|t| *t == "WindowList")
 }
 
-/// 2026-09-16 第 61 轮:WebUse 同款 nudge(Chromium-WebUse,第 11 角色)。
-pub(crate) const WEB_OPS_NUDGE_TEXT: &str = "【laew 系统提示】你刚才的回复没有调用任何浏览器操控工具。请立即用 BrowserNew 打开目标网页拿到 page_id,然后用 BrowserControl 执行动作、BrowserInspect 观察结果。这是唯一被接受的工作方式 —— 纯文本回答将被判失败。若 BrowserNew 返回 code=3001(未检测到浏览器),如实告知用户安装 Chrome/Edge/Chromium,不要编造结果。";
+/// 2026-09-16 第 63 轮(升级):WebUse nudge 改为命令语气。
+/// 此前提示语气 LLM 仍可能只回文本,现改为硬性要求 + 直接给出 JSON 参数示例。
+pub(crate) const WEB_OPS_NUDGE_TEXT: &str = "【laew 强制指令】你刚才没有调用任何浏览器工具,这是错误的。\n\
+请立即调用 BrowserNew 工具打开目标网页。这是硬性要求,不是建议。\n\
+参数示例: {\"url\": \"https://目标网址\", \"headless\": true}\n\
+如果你不调用 BrowserNew,任务将被标记为失败。\n\
+若 BrowserNew 返回 code=3001(未检测到浏览器),立即如实告知用户安装 Chrome/Edge/Chromium,不要编造结果。";
 
+/// 2026-09-16 第 63 轮:WebUse nudge 扩展为多轮触发(iter 1,2,3)。
+/// 此前仅 iter==1 触发一次,LLM 第 2/3 轮仍只回文本时无法纠正;
+/// 现在连续 3 轮无工具调用都会触发 nudge,提高纠正概率。
 pub(crate) fn should_nudge_web_ops(profile_tools: &[&str], iter: usize) -> bool {
-    iter == 1 && profile_tools.iter().any(|t| *t == "BrowserNew")
+    (1..=3).contains(&iter) && profile_tools.iter().any(|t| *t == "BrowserNew")
 }
 
 /// 结构化输出强制通道总开关(L6/L19,2026-09-09 第 13 轮)。
