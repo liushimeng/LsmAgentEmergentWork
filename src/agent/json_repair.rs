@@ -877,8 +877,8 @@ mod tests {
     #[test]
     fn python_constants() {
         let repaired = repair_json("{\"flag\": True, \"count\": None, \"tags\": [True, False]}");
-        let v: serde_json::Value = serde_json::from_str(&repaired)
-            .unwrap_or_else(|e| panic!("{repaired}: {e}"));
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).unwrap_or_else(|e| panic!("{repaired}: {e}"));
         assert_eq!(v["flag"], true);
         assert!(v["count"].is_null());
         assert_eq!(v["tags"][1], false);
@@ -1009,7 +1009,10 @@ mod tests {
         let src = r#"{"verdict": "pass", "issues"#;
         let err = try_parse::<serde_json::Value>(src).unwrap_err();
         assert!(err.contains("原始"), "应保持原 error 信息: got {err}");
-        assert!(!err.contains("截断补全后仍失败"), "Quality 路径不应走 Tier-2: got {err}");
+        assert!(
+            !err.contains("截断补全后仍失败"),
+            "Quality 路径不应走 Tier-2: got {err}"
+        );
     }
 
     #[test]

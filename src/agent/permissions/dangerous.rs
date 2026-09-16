@@ -21,56 +21,102 @@ use regex::Regex;
 /// 命中任意一条即视为危险。
 const DESTRUCTIVE_PATTERNS_SRC: &[(&str, &str)] = &[
     // ───── rm:仅拦截目标 = 根目录 / 用户主目录 / 系统关键目录 ─────
-    (r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/\s*$", "rm 根目录 / ,可能毁掉整个系统"),
-    (r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/\*", "rm /* 全删根目录所有内容"),
-    (r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/etc", "rm /etc 系统配置目录"),
-    (r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/var", "rm /var 系统目录"),
-    (r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/usr", "rm /usr 系统目录"),
-    (r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/boot", "rm /boot 系统目录"),
-    (r"\brm\s+(-[rRfF]+|--recursive|--force|--no-preserve-root)\s+~", "rm ~ 用户主目录"),
-    (r"\brm\s+(-[rRfF]+|--recursive|--force|--no-preserve-root)\s+\$HOME", "rm $HOME 用户主目录"),
-    (r"\brm\s+.*--no-preserve-root", "rm --no-preserve-root 强制删除"),
-
+    (
+        r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/\s*$",
+        "rm 根目录 / ,可能毁掉整个系统",
+    ),
+    (
+        r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/\*",
+        "rm /* 全删根目录所有内容",
+    ),
+    (
+        r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/etc",
+        "rm /etc 系统配置目录",
+    ),
+    (
+        r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/var",
+        "rm /var 系统目录",
+    ),
+    (
+        r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/usr",
+        "rm /usr 系统目录",
+    ),
+    (
+        r"\brm\s+(-[rRfF]+\s+|--recursive\s+|--force\s+|--no-preserve-root\s+)*/boot",
+        "rm /boot 系统目录",
+    ),
+    (
+        r"\brm\s+(-[rRfF]+|--recursive|--force|--no-preserve-root)\s+~",
+        "rm ~ 用户主目录",
+    ),
+    (
+        r"\brm\s+(-[rRfF]+|--recursive|--force|--no-preserve-root)\s+\$HOME",
+        "rm $HOME 用户主目录",
+    ),
+    (
+        r"\brm\s+.*--no-preserve-root",
+        "rm --no-preserve-root 强制删除",
+    ),
     // ───── dd / mkfs / fdisk:磁盘破坏 ─────
-    (r"\bdd\s+.*of=/dev/(sd|hd|nvme|vd|mmcblk|xvd)[a-z0-9]+", "dd 写入磁盘设备,会销毁数据"),
+    (
+        r"\bdd\s+.*of=/dev/(sd|hd|nvme|vd|mmcblk|xvd)[a-z0-9]+",
+        "dd 写入磁盘设备,会销毁数据",
+    ),
     (r"\bmkfs(\.[a-z0-9]+)?\s+/dev/", "mkfs 格式化磁盘设备"),
     (r"\bfdisk\s+/dev/", "fdisk 修改磁盘分区表"),
     (r"\bparted\s+/dev/", "parted 修改磁盘分区"),
     (r"\bwipefs\s+/dev/", "wipefs 擦除文件系统签名"),
-
     // ───── 写磁盘设备直接 /dev/sda 等 ─────
-    (r">\s*/dev/(sd|hd|nvme|vd|mmcblk|xvd)[a-z0-9]+", "重定向输出到磁盘设备"),
-    (r">>\s*/dev/(sd|hd|nvme|vd|mmcblk|xvd)[a-z0-9]+", "追加到磁盘设备"),
-
+    (
+        r">\s*/dev/(sd|hd|nvme|vd|mmcblk|xvd)[a-z0-9]+",
+        "重定向输出到磁盘设备",
+    ),
+    (
+        r">>\s*/dev/(sd|hd|nvme|vd|mmcblk|xvd)[a-z0-9]+",
+        "追加到磁盘设备",
+    ),
     // ───── chmod / chown 危险用法 ─────
-    (r"\bchmod\s+(-R\s+)?[0-7][0-7][0-7][0-7]\s+/", "chmod 根目录权限过宽"),
-    (r"\bchmod\s+(-R\s+)?777\b", "chmod 777 全权限(任何人可读写执行)"),
+    (
+        r"\bchmod\s+(-R\s+)?[0-7][0-7][0-7][0-7]\s+/",
+        "chmod 根目录权限过宽",
+    ),
+    (
+        r"\bchmod\s+(-R\s+)?777\b",
+        "chmod 777 全权限(任何人可读写执行)",
+    ),
     (r"\bchmod\s+(-R\s+)?666\b", "chmod 666 全写权限"),
     (r"\bchown\s+(-R\s+)?\S+\s+/\b", "chown 改根目录属主"),
-
     // ───── 系统关机 / 重启 / init 切换 ─────
     (r"\bshutdown\b", "shutdown 关机"),
     (r"\breboot\b", "reboot 重启"),
     (r"\bhalt\b", "halt 关机"),
     (r"\bpoweroff\b", "poweroff 关机"),
     (r"\binit\s+[06]\b", "init 0/6 关机/重启"),
-    (r"\bsystemctl\s+(poweroff|reboot|halt)\b", "systemctl 关机/重启"),
-
+    (
+        r"\bsystemctl\s+(poweroff|reboot|halt)\b",
+        "systemctl 关机/重启",
+    ),
     // ───── 大范围杀进程 ─────
     (r"\bkill\s+-?9?\s*-?1\b", "kill -1/-9 1 杀 init 或所有进程"),
     (r"\bkill\s+-?9\s+1\b", "kill -9 1 杀 init 进程"),
     (r"\bkillall\s+-?9?\s+\*", "killall 通配符杀进程"),
     (r"\bpkill\s+-?9?\s+(-?[a-z]+\s+)*\*", "pkill 通配符杀进程"),
-
     // ───── 提权(注意:sudo 不再被 unwrap 剥除,直接命中危险规则)─────
     (r"\bsudo\b", "sudo 提权(默认拒绝,请改用工作目录内操作)"),
     (r"\bsu\s+(-\s*|root\b|-l\b|--login\b)", "su 切换到 root"),
-
     // ───── 网络下载到 shell(unquoted | 接 shell)─────
-    (r"\bcurl\b[^\n|]*\|\s*(bash|sh|zsh|python|perl|ruby)\b", "curl | bash 下载执行远程脚本"),
-    (r"\bwget\b[^\n|]*\|\s*(bash|sh|zsh|python|perl|ruby)\b", "wget | bash 下载执行远程脚本"),
-    (r"\bwget\s+-O-\s*\|\s*(bash|sh)\b", "wget -O- | bash 流式下载执行"),
-
+    (
+        r"\bcurl\b[^\n|]*\|\s*(bash|sh|zsh|python|perl|ruby)\b",
+        "curl | bash 下载执行远程脚本",
+    ),
+    (
+        r"\bwget\b[^\n|]*\|\s*(bash|sh|zsh|python|perl|ruby)\b",
+        "wget | bash 下载执行远程脚本",
+    ),
+    (
+        r"\bwget\s+-O-\s*\|\s*(bash|sh)\b",
+        "wget -O- | bash 流式下载执行",
+    ),
     // ───── fork 炸弹 ─────
     (r":\(\)\s*\{", "fork 炸弹 shell 函数"),
     (r"\bfork\(\)\s*\{", "fork 炸弹 shell 函数"),
@@ -197,7 +243,9 @@ fn match_shell_token(rest: &str) -> Option<&'static str> {
                 || after.starts_with('<')
                 || after.starts_with('>')
             {
-                return Some("网络下载到 shell 执行(curl|bash / wget|sh 等)很危险,可能执行恶意代码");
+                return Some(
+                    "网络下载到 shell 执行(curl|bash / wget|sh 等)很危险,可能执行恶意代码",
+                );
             }
         }
     }
@@ -392,9 +440,7 @@ fn unwrap_wrappers(seg: &str) -> &str {
                             break;
                         }
                         // 找到下一个 token
-                        let token_end = rest
-                            .find(char::is_whitespace)
-                            .unwrap_or(rest.len());
+                        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
                         let token = &rest[..token_end];
                         if token.contains('=') || (w == &"env" && in_eq) {
                             in_eq = true;

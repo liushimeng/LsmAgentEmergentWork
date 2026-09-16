@@ -4,9 +4,7 @@
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::database::models::{
-    ExportData, ImportInput, ImportResult, Protocol, ProviderRecord,
-};
+use crate::database::models::{ExportData, ImportInput, ImportResult, Protocol, ProviderRecord};
 use crate::database::{ConfigError, Db, Result};
 
 impl Db {
@@ -19,7 +17,14 @@ impl Db {
         end_point: &str,
         api_key: &str,
     ) -> Result<i64> {
-        self.add_with_context(protocol, provider_name, model_name, end_point, api_key, None)
+        self.add_with_context(
+            protocol,
+            provider_name,
+            model_name,
+            end_point,
+            api_key,
+            None,
+        )
     }
 
     /// 新增一条记录(可指定 context_max_size,None = 默认 800K);若库为空则自动激活
@@ -220,7 +225,9 @@ impl Db {
         let tx = conn.transaction()?;
         let mut stmt = tx.prepare("SELECT id, api_key FROM providers")?;
         let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
             .filter_map(|r| r.ok())
             .filter(|(_, key)| !crate::agent::safety::Vault::is_encrypted(key))
             .collect();
@@ -228,12 +235,19 @@ impl Db {
         let mut migrated = 0usize;
         for (id, plaintext) in &rows {
             let encrypted = crate::agent::safety::Vault::global()?.encrypt(plaintext)?;
-            tx.execute("UPDATE providers SET api_key = ?1 WHERE id = ?2", params![encrypted, id])?;
+            tx.execute(
+                "UPDATE providers SET api_key = ?1 WHERE id = ?2",
+                params![encrypted, id],
+            )?;
             migrated += 1;
         }
         tx.commit()?;
         if migrated > 0 {
-            tracing::info!(migrated, "D9-4 凭证加密迁移完成: {} 条明文 API Key 已加密", migrated);
+            tracing::info!(
+                migrated,
+                "D9-4 凭证加密迁移完成: {} 条明文 API Key 已加密",
+                migrated
+            );
         }
         Ok(())
     }
@@ -297,7 +311,12 @@ impl Db {
             }
 
             // 检查是否已存在
-            if self.exists(protocol, &item.provider_name, &item.model_name, &item.end_point)? {
+            if self.exists(
+                protocol,
+                &item.provider_name,
+                &item.model_name,
+                &item.end_point,
+            )? {
                 println!(
                     "⊘ 跳过重复: {}/{}/{}",
                     item.protocol, item.provider_name, item.model_name
@@ -343,7 +362,9 @@ impl Db {
                     println!("★ 已按文件声明激活 id={id}: {provider_name}/{model_name}");
                 }
                 None => {
-                    eprintln!("⚠ 文件声明的激活记录 {provider_name}/{model_name} 未能导入, 跳过激活");
+                    eprintln!(
+                        "⚠ 文件声明的激活记录 {provider_name}/{model_name} 未能导入, 跳过激活"
+                    );
                 }
             }
         } else if self.get_active()?.is_none() {
@@ -365,15 +386,20 @@ impl Db {
         let records = self.list()?;
         let redact = std::env::var("LAEW_EXPORT_REDACT").ok().as_deref() == Some("1");
         let export_data = if redact {
-            ExportData::from_records(records.into_iter().map(|mut r| {
-                // 对齐 tui::theme::mask_key 脱敏(避免 database→tui 反向依赖):保留末 4 位。
-                r.api_key = if r.api_key.len() > 4 {
-                    format!("****{}", &r.api_key[r.api_key.len()-4..])
-                } else {
-                    "****".to_string()
-                };
-                r
-            }).collect())
+            ExportData::from_records(
+                records
+                    .into_iter()
+                    .map(|mut r| {
+                        // 对齐 tui::theme::mask_key 脱敏(避免 database→tui 反向依赖):保留末 4 位。
+                        r.api_key = if r.api_key.len() > 4 {
+                            format!("****{}", &r.api_key[r.api_key.len() - 4..])
+                        } else {
+                            "****".to_string()
+                        };
+                        r
+                    })
+                    .collect(),
+            )
         } else {
             ExportData::from_records(records)
         };
@@ -575,8 +601,11 @@ mod tests {
     fn import_export_envelope_roundtrip() {
         // 导出 → 再导入到空库: 记录全量恢复, 且激活态被还原
         let (src, _d1) = fresh_db();
-        let id1 = src.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1").unwrap();
-        src.add(Protocol::OpenAi, "P2", "m2", "https://b", "k2").unwrap();
+        let id1 = src
+            .add(Protocol::Anthropic, "P1", "m1", "https://a", "k1")
+            .unwrap();
+        src.add(Protocol::OpenAi, "P2", "m2", "https://b", "k2")
+            .unwrap();
         src.set_active(id1).unwrap();
         let json = src.export_to_json().unwrap();
 
@@ -609,7 +638,9 @@ mod tests {
     fn import_keeps_existing_active_when_unmarked() {
         // 已有激活记录时, 导入无 is_active 标记的配置不得改变激活态
         let (db, _d) = fresh_db();
-        let id = db.add(Protocol::Anthropic, "Old", "m0", "https://old", "k0").unwrap();
+        let id = db
+            .add(Protocol::Anthropic, "Old", "m0", "https://old", "k0")
+            .unwrap();
         db.set_active(id).unwrap();
         let json = r#"{
             "protocol": "openai",
@@ -627,14 +658,19 @@ mod tests {
     fn import_envelope_restores_active_on_duplicate() {
         // 信封中标记激活的记录即使因重复被跳过, 也应恢复为激活
         let (src, _d1) = fresh_db();
-        src.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1").unwrap();
-        let id2 = src.add(Protocol::OpenAi, "P2", "m2", "https://b", "k2").unwrap();
+        src.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1")
+            .unwrap();
+        let id2 = src
+            .add(Protocol::OpenAi, "P2", "m2", "https://b", "k2")
+            .unwrap();
         src.set_active(id2).unwrap();
         let json = src.export_to_json().unwrap();
 
         let (dst, _d2) = fresh_db();
-        dst.add(Protocol::Anthropic, "P1", "m1", "https://a", "k-other").unwrap();
-        dst.add(Protocol::OpenAi, "P2", "m2", "https://b", "k-other").unwrap();
+        dst.add(Protocol::Anthropic, "P1", "m1", "https://a", "k-other")
+            .unwrap();
+        dst.add(Protocol::OpenAi, "P2", "m2", "https://b", "k-other")
+            .unwrap();
         let result = dst.import_from_json(&json).unwrap();
         assert_eq!(result.skipped, 2);
         let active = dst.get_active().unwrap().expect("应恢复激活态");
@@ -646,16 +682,27 @@ mod tests {
     #[test]
     fn add_defaults_context_max_size_to_800k() {
         let (db, _d) = fresh_db();
-        db.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1").unwrap();
+        db.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1")
+            .unwrap();
         let r = &db.list().unwrap()[0];
-        assert_eq!(r.context_max_size, crate::database::models::DEFAULT_CONTEXT_MAX_SIZE);
+        assert_eq!(
+            r.context_max_size,
+            crate::database::models::DEFAULT_CONTEXT_MAX_SIZE
+        );
     }
 
     #[test]
     fn add_with_context_max_size() {
         let (db, _d) = fresh_db();
-        db.add_with_context(Protocol::Anthropic, "P1", "m1", "https://a", "k1", Some(256_000))
-            .unwrap();
+        db.add_with_context(
+            Protocol::Anthropic,
+            "P1",
+            "m1",
+            "https://a",
+            "k1",
+            Some(256_000),
+        )
+        .unwrap();
         assert_eq!(db.list().unwrap()[0].context_max_size, 256_000);
     }
 
@@ -678,8 +725,15 @@ mod tests {
     fn import_export_context_max_size_roundtrip() {
         // 新版文件带字段 → 往返无损
         let (src, _d1) = fresh_db();
-        src.add_with_context(Protocol::Anthropic, "P1", "m1", "https://a", "k1", Some(128_000))
-            .unwrap();
+        src.add_with_context(
+            Protocol::Anthropic,
+            "P1",
+            "m1",
+            "https://a",
+            "k1",
+            Some(128_000),
+        )
+        .unwrap();
         let json = src.export_to_json().unwrap();
         assert!(json.contains("\"context_max_size\": 128000"));
 

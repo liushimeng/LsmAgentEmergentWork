@@ -993,7 +993,9 @@ echo "$MD_OUT_PLAIN" | grep -qF "内联码"; check $? "7d-2c 行内码文字保�
 echo "$MD_OUT_PLAIN" | grep -qF "列表甲"; check $? "7d-2d 列表文字保真"
 echo "$MD_OUT_PLAIN" | grep -qF "引用乙"; check $? "7d-2e 引用文字保真"
 # 标记符号被替换:** / # / - / > 不再以原文形态出现在渲染行中
-echo "$MD_OUT_PLAIN" | grep -qF "**加粗**"; [ $? -ne 0 ]; check $? "7d-3 ** 标记被渲染剥离"
+# 2026-09-16 第 61 轮:trace 区会原文保留工具参数以利于排查;检查渲染正文时
+# 排除 [tool] 行,不能把「参数里的 Markdown 源码」误判为富文本渲染失败。
+echo "$MD_OUT_PLAIN" | grep -v '^[[:space:]]*\[tool\]' | grep -qF "**加粗**"; [ $? -ne 0 ]; check $? "7d-3 ** 标记被渲染剥离"
 echo "$MD_OUT_PLAIN" | grep -qF "▍ 一级标题"; check $? "7d-4 标题渲染为 ▍ 前缀"
 echo "$MD_OUT_PLAIN" | grep -qF "• 列表甲"; check $? "7d-5 列表渲染为 • 符号"
 echo "$MD_OUT_PLAIN" | grep -qF "│ 引用乙"; check $? "7d-6 引用渲染为 │ 竖线"

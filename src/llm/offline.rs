@@ -120,7 +120,10 @@ impl ConnectivityTracker {
 
     /// 读取当前状态(轻量,供 dispatch 层决策)。
     pub fn state(&self) -> Connectivity {
-        self.inner.lock().expect("ConnectivityTracker poisoned").state
+        self.inner
+            .lock()
+            .expect("ConnectivityTracker poisoned")
+            .state
     }
 
     /// 是否应尝试 LLM 调用(便捷方法,等价于 `state().should_attempt_llm()`)。
@@ -134,9 +137,7 @@ impl ConnectivityTracker {
         ConnectivitySnapshot {
             state: inner.state,
             consecutive_network_errors: inner.consecutive_network_errors,
-            last_network_error_ago_secs: inner
-                .last_network_error_at
-                .map(|t| t.elapsed().as_secs()),
+            last_network_error_ago_secs: inner.last_network_error_at.map(|t| t.elapsed().as_secs()),
             last_network_error_kind: inner.last_network_error_kind.clone(),
         }
     }
@@ -218,7 +219,10 @@ mod tests {
         assert_eq!(snap.state, Connectivity::Degraded);
         assert_eq!(snap.consecutive_network_errors, 2);
         assert!(snap.last_network_error_ago_secs.is_some());
-        assert_eq!(snap.last_network_error_kind.as_deref(), Some("connection_refused"));
+        assert_eq!(
+            snap.last_network_error_kind.as_deref(),
+            Some("connection_refused")
+        );
     }
 
     #[test]

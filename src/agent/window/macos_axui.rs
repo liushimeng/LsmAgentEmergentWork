@@ -64,14 +64,24 @@ impl WindowDriver for MacosAxuiDriver {
         // axuielement typed API:AXUIElement::from_pid(pid) 创建应用级 element,
         // 再用 element_array_attribute("AXWindows") 拿到 Vec<AXUIElement>。
         let app = axuielement::AXUIElement::from_pid(pid).ok_or_else(|| {
-            platform_err(self.platform_name(), format!("AXUIElement::from_pid({pid}) 返回 null"))
+            platform_err(
+                self.platform_name(),
+                format!("AXUIElement::from_pid({pid}) 返回 null"),
+            )
         })?;
+        enable_manual_accessibility(&app);
         let windows = app
             .element_array_attribute(axuielement::ax_attribute::AX_WINDOWS_ATTRIBUTE)
-            .map_err(|e| platform_err(self.platform_name(), format!("AX_WINDOWS_ATTRIBUTE 失败:{e}")))?;
-        let target = windows.into_iter().nth(idx).ok_or_else(|| {
-            platform_err(self.platform_name(), format!("窗口 idx={idx} 不存在"))
-        })?;
+            .map_err(|e| {
+                platform_err(
+                    self.platform_name(),
+                    format!("AX_WINDOWS_ATTRIBUTE 失败:{e}"),
+                )
+            })?;
+        let target = windows
+            .into_iter()
+            .nth(idx)
+            .ok_or_else(|| platform_err(self.platform_name(), format!("窗口 idx={idx} 不存在")))?;
 
         // 根节点 = 窗口本身
         let title = read_string_attr(&target, axuielement::ax_attribute::AX_TITLE_ATTRIBUTE)
@@ -104,14 +114,24 @@ impl WindowDriver for MacosAxuiDriver {
     fn act(&self, window_id: &str, path: &str, action: ControlAction) -> Result<String> {
         let (pid, idx) = parse_window_id(window_id)?;
         let app = axuielement::AXUIElement::from_pid(pid).ok_or_else(|| {
-            platform_err(self.platform_name(), format!("AXUIElement::from_pid({pid}) 返回 null"))
+            platform_err(
+                self.platform_name(),
+                format!("AXUIElement::from_pid({pid}) 返回 null"),
+            )
         })?;
+        enable_manual_accessibility(&app);
         let windows = app
             .element_array_attribute(axuielement::ax_attribute::AX_WINDOWS_ATTRIBUTE)
-            .map_err(|e| platform_err(self.platform_name(), format!("AX_WINDOWS_ATTRIBUTE 失败:{e}")))?;
-        let target_window = windows.into_iter().nth(idx).ok_or_else(|| {
-            platform_err(self.platform_name(), format!("窗口 idx={idx} 不存在"))
-        })?;
+            .map_err(|e| {
+                platform_err(
+                    self.platform_name(),
+                    format!("AX_WINDOWS_ATTRIBUTE 失败:{e}"),
+                )
+            })?;
+        let target_window = windows
+            .into_iter()
+            .nth(idx)
+            .ok_or_else(|| platform_err(self.platform_name(), format!("窗口 idx={idx} 不存在")))?;
 
         // 沿 path 段(数字索引)逐层 descend
         let element = descend_by_path(&target_window, path)?;
@@ -136,15 +156,23 @@ impl WindowDriver for MacosAxuiDriver {
                 Ok("focused".into())
             }
             ControlAction::SetText(text) => {
-                let v = axuielement::AXValue::from_string(text.as_str())
-                    .map_err(|e| platform_err(self.platform_name(), format!("AXValue::from_string 失败:{e}")))?;
+                let v = axuielement::AXValue::from_string(text.as_str()).map_err(|e| {
+                    platform_err(
+                        self.platform_name(),
+                        format!("AXValue::from_string 失败:{e}"),
+                    )
+                })?;
                 element
                     .set_attribute(axuielement::ax_attribute::AX_VALUE_ATTRIBUTE, &v)
-                    .map_err(|e| platform_err(self.platform_name(), format!("set_text 失败:{e}")))?;
+                    .map_err(|e| {
+                        platform_err(self.platform_name(), format!("set_text 失败:{e}"))
+                    })?;
                 Ok(format!("set_text len={}", text.len()))
             }
-            ControlAction::GetText => read_string_attr(&element, axuielement::ax_attribute::AX_VALUE_ATTRIBUTE)
-                .ok_or_else(|| platform_err(self.platform_name(), "get_text 返回空")),
+            ControlAction::GetText => {
+                read_string_attr(&element, axuielement::ax_attribute::AX_VALUE_ATTRIBUTE)
+                    .ok_or_else(|| platform_err(self.platform_name(), "get_text 返回空"))
+            }
             ControlAction::SendKeys(keys) => {
                 // axuielement 不直接提供 send_keys typed API;
                 // 引导 LLM 改走 set_text + 复制粘贴路径。
@@ -192,6 +220,14 @@ fn parse_window_id(window_id: &str) -> Result<(i32, usize)> {
 /// 读 string attribute,转 String;失败返回 None。
 fn read_string_attr(element: &axuielement::AXUIElement, attr: &str) -> Option<String> {
     element.string_attribute(attr).ok().flatten()
+}
+
+/// 尽力开启 Electron / 自绘应用的 AXManualAccessibility。
+///
+/// 部分微信 / Electron 版本默认不导出控件树;该属性打开失败时不阻断读取。
+fn enable_manual_accessibility(app: &axuielement::AXUIElement) {
+    let value = axuielement::AXValue::from_bool(true);
+    let _ = app.set_attribute("AXManualAccessibility", &value);
 }
 
 /// 读 bounds:pos + size 合并成 Rect。
@@ -257,14 +293,24 @@ fn build_children(
             actions,
             children: Vec::new(),
         };
-        build_children(&child, &node.path.clone(), depth + 1, max_depth, filter, &mut node)?;
+        build_children(
+            &child,
+            &node.path.clone(),
+            depth + 1,
+            max_depth,
+            filter,
+            &mut node,
+        )?;
         parent_node.children.push(node);
     }
     Ok(())
 }
 
 /// 沿 path 段(/N/M/L)在 axuielement 树上 descend 到目标元素。
-fn descend_by_path(window: &axuielement::AXUIElement, path: &str) -> Result<axuielement::AXUIElement> {
+fn descend_by_path(
+    window: &axuielement::AXUIElement,
+    path: &str,
+) -> Result<axuielement::AXUIElement> {
     let trimmed = path.trim();
     if trimmed == "/" || trimmed.is_empty() {
         return Ok(window.clone());

@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 
-use super::TuiSession;
 use super::atty;
+use super::TuiSession;
 
 impl TuiSession {
     /// 进入 ProviderList 屏(子屏通过 engine 渲染)。

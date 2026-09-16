@@ -109,6 +109,7 @@ impl Db {
                 "session" => AgentRole::SessionContext,
                 "compact" => AgentRole::Compact,
                 "windowuse" => AgentRole::WindowUse,
+                "webuse" => AgentRole::WebUse,
                 other => {
                     return Err(rusqlite::Error::InvalidColumnType(
                         2,
@@ -172,7 +173,9 @@ mod tests {
         })
         .unwrap();
 
-        let in_s1 = db.list_agent_memory(AgentRole::SubAgent, Some("s-1"), 10).unwrap();
+        let in_s1 = db
+            .list_agent_memory(AgentRole::SubAgent, Some("s-1"), 10)
+            .unwrap();
         assert_eq!(in_s1.len(), 1);
         assert_eq!(in_s1[0].input_summary, "读取 x.rs");
         assert!(in_s1[0].error_summary.is_none());

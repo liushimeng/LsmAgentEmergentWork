@@ -21,7 +21,12 @@ impl ProviderDelPicker {
     pub fn new(db: Arc<Mutex<Db>>, paths: Paths, _seed_id: i64) -> Self {
         let records = db.lock().expect("db").list().unwrap_or_default();
         let cursor = records.iter().position(|r| r.id == _seed_id).unwrap_or(0);
-        Self { records, cursor, db, paths }
+        Self {
+            records,
+            cursor,
+            db,
+            paths,
+        }
     }
 }
 
@@ -56,7 +61,11 @@ impl Screen for ProviderDelPicker {
                 break;
             }
             let focused = i == self.cursor;
-            let marker = if focused { theme::SELECTED_PREFIX } else { "  " };
+            let marker = if focused {
+                theme::SELECTED_PREFIX
+            } else {
+                "  "
+            };
             let line = format!(
                 "{}id={}  [{}]  {}/{}  @ {}  key={}",
                 marker,
@@ -82,7 +91,12 @@ impl Screen for ProviderDelPicker {
 
         let help = "↑↓ 选择   Enter 进入确认页   Esc 返回";
         frame.put_str(
-            Rect::new(2, frame.area.height.saturating_sub(2), frame.area.width.saturating_sub(4), 1),
+            Rect::new(
+                2,
+                frame.area.height.saturating_sub(2),
+                frame.area.width.saturating_sub(4),
+                1,
+            ),
             help,
             theme::DIM,
             attr::NONE,
@@ -115,7 +129,11 @@ impl Screen for ProviderDelPicker {
             }
             KeyCode::Enter => {
                 if let Some(r) = self.records.get(self.cursor).cloned() {
-                    Outcome::Push(Box::new(ProviderDelConfirm::new(self.db.clone(), self.paths.clone(), r)))
+                    Outcome::Push(Box::new(ProviderDelConfirm::new(
+                        self.db.clone(),
+                        self.paths.clone(),
+                        r,
+                    )))
                 } else {
                     Outcome::Continue
                 }
@@ -135,7 +153,12 @@ pub struct ProviderDelConfirm {
 
 impl ProviderDelConfirm {
     pub fn new(db: Arc<Mutex<Db>>, paths: Paths, target: ProviderRecord) -> Self {
-        Self { target, cursor: 1, db, paths }
+        Self {
+            target,
+            cursor: 1,
+            db,
+            paths,
+        }
     }
 }
 
@@ -167,7 +190,10 @@ impl Screen for ProviderDelConfirm {
         let line6 = format!("  api_key  : {}", theme::mask_key(&r.api_key));
 
         let top = 3u16;
-        for (i, line) in [line1, line2, line3, line4, line5, line6].iter().enumerate() {
+        for (i, line) in [line1, line2, line3, line4, line5, line6]
+            .iter()
+            .enumerate()
+        {
             let y = top + i as u16;
             if y + 1 >= frame.area.height.saturating_sub(3) {
                 break;
@@ -189,7 +215,12 @@ impl Screen for ProviderDelConfirm {
             (
                 theme::SELECTED_FG,
                 theme::SELECTED_ATTRS,
-                format!("{}{}{}", theme::SELECTED_BUTTON_L, confirm_label, theme::SELECTED_BUTTON_R),
+                format!(
+                    "{}{}{}",
+                    theme::SELECTED_BUTTON_L,
+                    confirm_label,
+                    theme::SELECTED_BUTTON_R
+                ),
             )
         } else {
             (theme::FG, attr::NONE, format!("  {}  ", confirm_label))
@@ -199,7 +230,12 @@ impl Screen for ProviderDelConfirm {
             (
                 theme::SELECTED_FG,
                 theme::SELECTED_ATTRS,
-                format!("{}{}{}", theme::SELECTED_BUTTON_L, cancel_label, theme::SELECTED_BUTTON_R),
+                format!(
+                    "{}{}{}",
+                    theme::SELECTED_BUTTON_L,
+                    cancel_label,
+                    theme::SELECTED_BUTTON_R
+                ),
             )
         } else {
             (theme::FG, attr::NONE, format!("  {}  ", cancel_label))
@@ -224,7 +260,12 @@ impl Screen for ProviderDelConfirm {
 
         let help = "← → 切换按钮   Enter 触发   Esc 取消";
         frame.put_str(
-            Rect::new(2, frame.area.height.saturating_sub(2), frame.area.width.saturating_sub(4), 1),
+            Rect::new(
+                2,
+                frame.area.height.saturating_sub(2),
+                frame.area.width.saturating_sub(4),
+                1,
+            ),
             help,
             theme::DIM,
             attr::NONE,
@@ -273,7 +314,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = Paths::for_test(dir.path());
         let db = Db::open(&paths).unwrap();
-        let id = db.add(Protocol::Anthropic, "p", "m", "https://x", "k1234").unwrap();
+        let id = db
+            .add(Protocol::Anthropic, "p", "m", "https://x", "k1234")
+            .unwrap();
         let picker = ProviderDelPicker::new(Arc::new(Mutex::new(db)), paths, id);
         assert_eq!(picker.records.len(), 1);
         assert_eq!(picker.cursor, 0);
@@ -284,7 +327,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = Paths::for_test(dir.path());
         let db = Db::open(&paths).unwrap();
-        let id = db.add(Protocol::Anthropic, "p", "m", "https://x", "k1234").unwrap();
+        let id = db
+            .add(Protocol::Anthropic, "p", "m", "https://x", "k1234")
+            .unwrap();
         let r = db.get(id).unwrap();
         let confirm = ProviderDelConfirm::new(Arc::new(Mutex::new(db)), paths, r);
         // 默认 cursor=1 (取消);防止误删

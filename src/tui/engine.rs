@@ -5,14 +5,16 @@
 //! - `present` 全量清屏 + 输出,适合 < 30 行的子屏。
 //! - 主屏仍然走 `input.rs` 的单行渲染;引擎只接管子屏。
 
-use std::io::{self, Write};
 use crate::tui::input::{char_width, display_width};
+use std::io::{self, Write};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{KeyEvent, KeyEventKind},
     execute,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
@@ -31,12 +33,22 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn full_screen() -> Self {
         let (w, h) = terminal::size().unwrap_or((80, 24));
-        Self { x: 0, y: 0, width: w, height: h }
+        Self {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }
     }
 }
 
@@ -77,7 +89,10 @@ pub struct Frame {
 impl Frame {
     pub fn new(area: Rect) -> Self {
         let len = (area.width as usize) * (area.height as usize);
-        Self { area, cells: (0..len).map(|_| Cell::blank()).collect() }
+        Self {
+            area,
+            cells: (0..len).map(|_| Cell::blank()).collect(),
+        }
     }
 
     fn idx(&self, x: u16, y: u16) -> Option<usize> {
@@ -183,13 +198,7 @@ impl Frame {
         // 四角
         self.put_char(area.x, area.y, '╭', p.accent, attr::NONE);
         self.put_char(area.x + area.width - 1, area.y, '╮', p.accent, attr::NONE);
-        self.put_char(
-            area.x,
-            area.y + area.height - 1,
-            '╰',
-            p.accent,
-            attr::NONE,
-        );
+        self.put_char(area.x, area.y + area.height - 1, '╰', p.accent, attr::NONE);
         self.put_char(
             area.x + area.width - 1,
             area.y + area.height - 1,
@@ -241,7 +250,13 @@ pub fn enter_alt() -> io::Result<()> {
     // 先重置 DECSTBM 滚动区:主屏固定底部输入组件会设置滚动区,
     // 若泄漏进 alternate screen,present() 的行尾换行会在滚动区底缘
     // 触发滚动而非换行,破坏子屏渲染。
-    execute!(io::stdout(), ResetColor, Print("\x1b[r"), EnterAlternateScreen, Hide)?;
+    execute!(
+        io::stdout(),
+        ResetColor,
+        Print("\x1b[r"),
+        EnterAlternateScreen,
+        Hide
+    )?;
     Ok(())
 }
 
@@ -332,11 +347,7 @@ pub fn present(frame: &Frame) -> io::Result<()> {
             execute!(stdout, Print(&batch))?;
         }
         // 每行结束后复位,避免行间样式渗透
-        execute!(
-            stdout,
-            ResetColor,
-            SetAttribute(Attribute::Reset),
-        )?;
+        execute!(stdout, ResetColor, SetAttribute(Attribute::Reset),)?;
         cur_fg = Color::Reset;
         cur_bg = Color::Reset;
         cur_attrs = attr::NONE;

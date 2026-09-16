@@ -47,6 +47,11 @@ zeroize = "1"
 # D9-7 SSRF 防护(L1608/L1625):URL 解析 + 私网/CGNAT 拦截
 url = "2.5"
 
+# Chromium-WebUse Agent(第 11 角色,2026-09-16 第 61 轮):CDP 浏览器操控
+# 选型见 docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md
+chromiumoxide = "0.9"
+futures = "0.3"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -63,25 +68,21 @@ windows = { version = "0.58", features = [
     "Win32_System_ProcessStatus",
 ] }
 
-# WindowUse Agent macOS 后端:Accessibility(AXUIElementRef)经 axuielement / core-foundation FFI 调用
-# 2026-09-16 第 58 轮 P2:axuielement = "0.9" 是 pure-Rust 绑定 Accessibility framework
-# (活跃维护,2026-06 更新),默认使用 axui 路径;旧 core-foundation 手写 FFI 落到
-# macos_legacy.rs,通过 LAEW_MACOS_DRIVER=legacy 环境变量回退。
-# 注意:axuielement 0.9 走 Swift 桥接,需要 macOS 13+ SDK 且系统装 Xcode 完整工具链
-# (含 swiftCompatibility56 等库);工具链不全时编译会链接失败,临时方案:
-#   cargo build --no-default-features --features macos-legacy
-# 或 cargo build 时不引入 axui 路径,默认走 legacy(本轮 P2-D 已提供环境切换)。
+# WindowUse Agent macOS 后端:Accessibility(AXUIElementRef)
+# 2026-09-16 第 61 轮:集成 axuielement = "0.9" typed 绑定(推荐路径);
+# 本机若缺少 swiftCompatibility56 链接库,默认回退 core-foundation 手写 FFI
+# (macos_legacy.rs)。完整 Xcode 工具链下可 --features macos-axui 启用。
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
 axuielement = { version = "0.9", optional = true }
 
 [features]
 default = []
-# macos-legacy:启用 axuielement typed API 路径(macos_axui.rs);
-# 需 macOS 13+ SDK 与完整 Xcode 工具链;工具链不全时编译会链接失败。
-# 启用方式:cargo build --features macos-legacy
-# 或运行时切换:LAEW_MACOS_DRIVER=axui laew
-macos-legacy = ["dep:axuielement"]
+# axuielement typed API 路径(macos_axui.rs)。
+macos-axui = ["dep:axuielement"]
+# 兼容第 58-60 轮历史脚本的 alias;它现在同样启用 axui 路径。
+# 兼容第 58-60 轮历史脚本;显式启用时走 axui 路径。
+macos-legacy = ["macos-axui"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

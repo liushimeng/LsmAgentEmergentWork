@@ -360,11 +360,7 @@ impl LlmClient for OpenAiClient {
         // (此前 connect_timeout 只管握手,流内 idle/总超时只在拿到 Response 后生效)
         let resp = tokio::time::timeout(
             crate::llm::resilient::RESPONSE_HEADERS_TIMEOUT,
-            self.http
-                .post(&self.url)
-                .headers(headers)
-                .json(&req)
-                .send(),
+            self.http.post(&self.url).headers(headers).json(&req).send(),
         )
         .await
         .map_err(|_| {
@@ -631,7 +627,13 @@ mod tests {
         };
         let s = serde_json::to_string(&req).unwrap();
         let v: Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["tool_choice"]["type"], "function", "forced wire 应为 function 指名形态");
-        assert_eq!(v["tool_choice"]["function"]["name"], "submit_task_classification");
+        assert_eq!(
+            v["tool_choice"]["type"], "function",
+            "forced wire 应为 function 指名形态"
+        );
+        assert_eq!(
+            v["tool_choice"]["function"]["name"],
+            "submit_task_classification"
+        );
     }
 }

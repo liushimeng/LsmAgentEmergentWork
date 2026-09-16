@@ -88,18 +88,18 @@ impl SquadDispatcher {
         Self { config }
     }
 
-    pub fn build_squad(
-        &self,
-        phase_id: &str,
-        tasks: Vec<(String, String)>,
-    ) -> Squad {
+    pub fn build_squad(&self, phase_id: &str, tasks: Vec<(String, String)>) -> Squad {
         let squad_id = format!("squad-{}", phase_id);
         let members: Vec<SquadMember> = tasks
             .into_iter()
             .enumerate()
             .map(|(i, (task, expected))| SquadMember {
                 member_id: format!("{}-m{}", squad_id, i + 1),
-                role: if i == 0 { SquadRole::Leader } else { SquadRole::Worker },
+                role: if i == 0 {
+                    SquadRole::Leader
+                } else {
+                    SquadRole::Worker
+                },
                 task,
                 expected_output: expected,
                 status: MemberStatus::Pending,
@@ -140,7 +140,10 @@ impl SquadDispatcher {
                 window_context: None,
                 pending_agent_messages: vec![],
             };
-            let permit = semaphore.clone().acquire_owned().await
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
                 .map_err(|e| crate::error::AgentError::Other(format!("信号量关闭: {}", e)))?;
             let member_id = member.member_id.clone();
 
@@ -221,14 +224,10 @@ mod tests {
             max_concurrent: 5,
             timeout_secs: 60,
         };
-        assert!(dispatcher.evaluate_strategy(&squad, &[
-            ("m1".into(), true),
-            ("m2".into(), true),
-        ]));
-        assert!(!dispatcher.evaluate_strategy(&squad, &[
-            ("m1".into(), true),
-            ("m2".into(), false),
-        ]));
+        assert!(dispatcher.evaluate_strategy(&squad, &[("m1".into(), true), ("m2".into(), true),]));
+        assert!(
+            !dispatcher.evaluate_strategy(&squad, &[("m1".into(), true), ("m2".into(), false),])
+        );
     }
 
     #[test]
@@ -243,16 +242,22 @@ mod tests {
             max_concurrent: 5,
             timeout_secs: 60,
         };
-        assert!(dispatcher.evaluate_strategy(&squad, &[
-            ("m1".into(), true),
-            ("m2".into(), true),
-            ("m3".into(), false),
-        ]));
-        assert!(!dispatcher.evaluate_strategy(&squad, &[
-            ("m1".into(), true),
-            ("m2".into(), false),
-            ("m3".into(), false),
-        ]));
+        assert!(dispatcher.evaluate_strategy(
+            &squad,
+            &[
+                ("m1".into(), true),
+                ("m2".into(), true),
+                ("m3".into(), false),
+            ]
+        ));
+        assert!(!dispatcher.evaluate_strategy(
+            &squad,
+            &[
+                ("m1".into(), true),
+                ("m2".into(), false),
+                ("m3".into(), false),
+            ]
+        ));
     }
 
     #[test]
@@ -267,13 +272,9 @@ mod tests {
             max_concurrent: 5,
             timeout_secs: 60,
         };
-        assert!(dispatcher.evaluate_strategy(&squad, &[
-            ("m1".into(), true),
-            ("m2".into(), false),
-        ]));
-        assert!(!dispatcher.evaluate_strategy(&squad, &[
-            ("m1".into(), false),
-            ("m2".into(), true),
-        ]));
+        assert!(dispatcher.evaluate_strategy(&squad, &[("m1".into(), true), ("m2".into(), false),]));
+        assert!(
+            !dispatcher.evaluate_strategy(&squad, &[("m1".into(), false), ("m2".into(), true),])
+        );
     }
 }

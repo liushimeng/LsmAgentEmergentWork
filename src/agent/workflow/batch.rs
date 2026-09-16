@@ -61,10 +61,7 @@ impl BatchChannel {
             .collect()
     }
 
-    pub async fn process<T: BatchTask + Clone>(
-        &self,
-        tasks: Vec<T>,
-    ) -> Result<BatchResult> {
+    pub async fn process<T: BatchTask + Clone>(&self, tasks: Vec<T>) -> Result<BatchResult> {
         let chunks = self.chunk_tasks(&tasks);
         let mut result = BatchResult::default();
         result.total = tasks.len();
@@ -170,7 +167,9 @@ mod tests {
         };
         let channel = BatchChannel::new(config);
         let tasks: Vec<MockTask> = (0..10)
-            .map(|i| MockTask { id: format!("t-{}", i) })
+            .map(|i| MockTask {
+                id: format!("t-{}", i),
+            })
             .collect();
         let chunks = channel.chunk_tasks(&tasks);
         assert_eq!(chunks.len(), 4); // 3+3+3+1
@@ -183,7 +182,9 @@ mod tests {
         let config = WorkflowConfig::default();
         let channel = BatchChannel::new(config);
         let tasks: Vec<MockTask> = (0..20)
-            .map(|i| MockTask { id: format!("t-{}", i) })
+            .map(|i| MockTask {
+                id: format!("t-{}", i),
+            })
             .collect();
         let result = channel.process(tasks).await.unwrap();
         assert_eq!(result.total, 20);

@@ -28,11 +28,21 @@ pub struct Span {
 
 impl Span {
     pub fn new(text: impl Into<String>, fg: Color, attrs: u8) -> Self {
-        Self { text: text.into(), fg, bg: Color::Reset, attrs }
+        Self {
+            text: text.into(),
+            fg,
+            bg: Color::Reset,
+            attrs,
+        }
     }
 
     pub fn plain(text: impl Into<String>) -> Self {
-        Self { text: text.into(), fg: theme::FG, bg: Color::Reset, attrs: attr::NONE }
+        Self {
+            text: text.into(),
+            fg: theme::FG,
+            bg: Color::Reset,
+            attrs: attr::NONE,
+        }
     }
 
     pub fn with_attrs(text: impl Into<String>, fg: Color, attrs: u8) -> Self {
@@ -42,7 +52,12 @@ impl Span {
     /// 带背景色构造(2026-09-10 第二十五轮 F04/B07 测试新增)。
     /// 用于字符级 diff 高亮:让主题表中的 `diff_added_char_bg` / `diff_removed_char_bg` 真正生效。
     pub fn with_bg(text: impl Into<String>, fg: Color, bg: Color, attrs: u8) -> Self {
-        Self { text: text.into(), fg, bg, attrs }
+        Self {
+            text: text.into(),
+            fg,
+            bg,
+            attrs,
+        }
     }
 }
 
@@ -97,5 +112,8 @@ pub fn render_lines_to_ansi_str(lines: &RenderLines, indent: &str) -> String {
 
 /// 计算一组 Span 的纯文本显示宽度(供表格列宽对齐)。
 pub(crate) fn spans_width(spans: &[Span]) -> usize {
-    spans.iter().map(|s| crate::tui::input::display_width(&s.text) as usize).sum()
+    spans
+        .iter()
+        .map(|s| crate::tui::input::display_width(&s.text) as usize)
+        .sum()
 }

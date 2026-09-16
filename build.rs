@@ -68,7 +68,13 @@ fn resolve_git_hash() -> Option<String> {
         .args(["rev-parse", "--short=8", "HEAD^{commit}"])
         .output()
         .ok()
-        .and_then(|o| if o.status.success() { Some(o.stdout) } else { None })
+        .and_then(|o| {
+            if o.status.success() {
+                Some(o.stdout)
+            } else {
+                None
+            }
+        })
         .and_then(|o| String::from_utf8(o).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -81,7 +87,13 @@ fn resolve_git_hash() -> Option<String> {
         .args(["rev-parse", "--short=8", "HEAD"])
         .output()
         .ok()
-        .and_then(|o| if o.status.success() { Some(o.stdout) } else { None })
+        .and_then(|o| {
+            if o.status.success() {
+                Some(o.stdout)
+            } else {
+                None
+            }
+        })
         .and_then(|o| String::from_utf8(o).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

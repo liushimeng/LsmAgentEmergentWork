@@ -6,13 +6,13 @@
 
 use anyhow::Result;
 
-use super::TuiSession;
 use super::atty;
 use super::branches::BranchStore;
 use super::commands;
 use super::export;
 use super::format::{first_line_preview, merge_usage, print_help, suggest_similar_commands};
 use super::pathfmt;
+use super::TuiSession;
 use crate::session::Session;
 
 impl TuiSession {
@@ -246,25 +246,34 @@ impl TuiSession {
         match snap.state {
             crate::llm::Connectivity::Online => {
                 if snap.consecutive_network_errors > 0 {
-                    println!("  (近期错误已复位,连续 {} 次)", snap.consecutive_network_errors);
+                    println!(
+                        "  (近期错误已复位,连续 {} 次)",
+                        snap.consecutive_network_errors
+                    );
                 }
             }
             crate::llm::Connectivity::Degraded | crate::llm::Connectivity::Offline => {
                 println!("  连续网络错误: {} 次", snap.consecutive_network_errors);
-                if let (Some(kind), Some(secs)) =
-                    (&snap.last_network_error_kind, snap.last_network_error_ago_secs)
-                {
+                if let (Some(kind), Some(secs)) = (
+                    &snap.last_network_error_kind,
+                    snap.last_network_error_ago_secs,
+                ) {
                     println!("  最近错误: {kind} ({secs}s 前)");
                 }
-                println!("  阈值: {} 次 → Degraded, {} 次 → Offline",
+                println!(
+                    "  阈值: {} 次 → Degraded, {} 次 → Offline",
                     crate::llm::DEGRADED_THRESHOLD,
-                    crate::llm::OFFLINE_THRESHOLD);
+                    crate::llm::OFFLINE_THRESHOLD
+                );
             }
         }
         let qlen = self.offline_queue.len();
         if qlen > 0 {
-            println!("  离线队列: {}/{} 条 (恢复后输入任意提示词触发 flush)",
-                qlen, self.offline_queue.capacity());
+            println!(
+                "  离线队列: {}/{} 条 (恢复后输入任意提示词触发 flush)",
+                qlen,
+                self.offline_queue.capacity()
+            );
         } else {
             println!("  离线队列: 空 (容量 {})", self.offline_queue.capacity());
         }
@@ -285,7 +294,10 @@ impl TuiSession {
             crate::agent::workspace::invalidate();
         }
         let snap = crate::agent::workspace::snapshot(&self.paths.work_dir);
-        println!("  工作区快照(/workspace){}:", if force { " · 已刷新" } else { "" });
+        println!(
+            "  工作区快照(/workspace){}:",
+            if force { " · 已刷新" } else { "" }
+        );
         for line in snap.render_section().lines() {
             println!("  {line}");
         }
@@ -320,8 +332,13 @@ impl TuiSession {
                 let preview = first_line_preview(&t.prompt, 48);
                 println!("    #{} [{}] {}", t.order, ts, preview);
             }
-            println!("  用法: /rewind <编号>  回退到该轮之前(该轮及其后全部移除,原对话自动存为分支)");
-            println!("        /undo           撤销最后一轮(等价 /rewind {})", turns.len());
+            println!(
+                "  用法: /rewind <编号>  回退到该轮之前(该轮及其后全部移除,原对话自动存为分支)"
+            );
+            println!(
+                "        /undo           撤销最后一轮(等价 /rewind {})",
+                turns.len()
+            );
             return;
         }
         match trimmed.parse::<usize>() {
@@ -358,22 +375,27 @@ impl TuiSession {
         self.session_usage = self
             .transcript
             .iter()
-            .fold(crate::llm::Usage::default(), |acc, e| merge_usage(acc, e.usage));
+            .fold(crate::llm::Usage::default(), |acc, e| {
+                merge_usage(acc, e.usage)
+            });
         println!(
             "  ✓ 已回退到第 {order} 轮之前(移除 {removed_turns} 轮对话 / {removed_msgs} 条上下文消息)"
         );
         if order == 1 {
             println!("    已清空全部真实轮次(项目上下文等内部标记保留,不会重复注入)。");
         } else {
-            println!("    保留第 1..={} 轮,当前上下文 {} 条消息。", order - 1, boundary);
+            println!(
+                "    保留第 1..={} 轮,当前上下文 {} 条消息。",
+                order - 1,
+                boundary
+            );
         }
         println!("    原对话已存为分支 {name},可用 /switch {name} 找回。");
     }
 
     /// `/undo`(D3):撤销最后一轮(最常用路径一键化,等价 `/rewind <末轮>`)。
     fn run_undo(&mut self) {
-        let n = crate::agent::session_fork::scan_user_turns(self.session.context())
-            .len();
+        let n = crate::agent::session_fork::scan_user_turns(self.session.context()).len();
         if n == 0 {
             println!("  当前会话还没有可回退的对话轮次。");
             return;
@@ -399,7 +421,10 @@ impl TuiSession {
         let msg_count = forked.context.len();
         self.session = forked;
         println!("  ✓ 已从当前对话分叉出新会话: {new_id}");
-        println!("    上下文 {msg_count} 条消息 / {} 轮完整保留,后续对话在新会话上进行。", turns.len());
+        println!(
+            "    上下文 {msg_count} 条消息 / {} 轮完整保留,后续对话在新会话上进行。",
+            turns.len()
+        );
         println!("    原对话已存为分支 {name},可用 /switch {name} 找回。");
     }
 
@@ -425,7 +450,9 @@ impl TuiSession {
                 preview
             );
         }
-        println!("  切换: /switch <分支名>;分支保存在内存中(最多 10 个,超出淘汰最旧),退出 TUI 后失效。");
+        println!(
+            "  切换: /switch <分支名>;分支保存在内存中(最多 10 个,超出淘汰最旧),退出 TUI 后失效。"
+        );
     }
 
     /// `/switch <name>`(D3):切换到指定分支;切换前当前对话自动快照(零丢失)。
@@ -440,10 +467,7 @@ impl TuiSession {
             return;
         }
         let cur = self.snapshot_current("switch", &format!("/switch {name} 切换前"));
-        let (session, transcript, usage) = self
-            .branches
-            .restore(name)
-            .expect("上面已校验分支存在");
+        let (session, transcript, usage) = self.branches.restore(name).expect("上面已校验分支存在");
         let restored_id = session.id.clone();
         let restored_turns = transcript.len();
         self.session = session;
@@ -460,7 +484,12 @@ impl TuiSession {
     /// `/export [path]`(D8):导出当前会话 transcript。
     fn run_export(&mut self, path_arg: &str) {
         let model = match self.db.lock().expect("db").get_active_or_env() {
-            Ok(Some(r)) => format!("[{}] {}/{}", r.protocol.as_str(), r.provider_name, r.model_name),
+            Ok(Some(r)) => format!(
+                "[{}] {}/{}",
+                r.protocol.as_str(),
+                r.provider_name,
+                r.model_name
+            ),
             _ => "<未配置>".to_string(),
         };
         let default_ts = export::now_export_stamp(); // YYYYMMDD-HHMMSS
@@ -479,7 +508,11 @@ impl TuiSession {
         };
         match export::resolve_target(&self.paths.work_dir, explicit, "laew-export", &default_ts) {
             Ok((path, fmt)) => {
-                let fmt_name = if fmt == export::ExportFormat::Json { "JSON" } else { "Markdown" };
+                let fmt_name = if fmt == export::ExportFormat::Json {
+                    "JSON"
+                } else {
+                    "Markdown"
+                };
                 match export::write_export(&meta, &self.transcript, &path, fmt) {
                     Ok(()) => println!(
                         "{}",

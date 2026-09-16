@@ -12,6 +12,7 @@
 
 pub mod agent_message;
 pub mod attachments;
+pub mod browser;
 pub mod cancel;
 pub mod compact;
 pub mod context;
@@ -38,6 +39,7 @@ pub mod subagent;
 pub mod system_prompt;
 pub mod tool_schema_validator;
 pub mod tools;
+pub mod web_use;
 pub mod window;
 pub mod window_state;
 pub mod window_use;
@@ -271,7 +273,9 @@ impl Agent {
             // LLM 调用命中 prompt-too-long 类溢出错误时,自动执行
             // 排水(Level 1)→ 折叠(Level 2)→ 重试;两轮无效则上抛(三级暴露)。
             let completion: Completion = self
-                .complete_with_overflow_recovery(session, cancel, &system, &tool_defs, &meta, &mut trace)
+                .complete_with_overflow_recovery(
+                    session, cancel, &system, &tool_defs, &meta, &mut trace,
+                )
                 .await?;
 
             // 累计 usage
@@ -326,6 +330,21 @@ impl Agent {
                     session
                         .context_mut()
                         .push(ChatMessage::user(WINDOW_OPS_NUDGE_TEXT));
+                    continue;
+                }
+
+                // 2026-09-16 第 61 轮:WebUse 第 1 轮无工具调用同款 nudge(与窗口版同构)
+                if should_nudge_web_ops(&self.profile.tools.names(), iter)
+                    && !completion.text.trim().is_empty()
+                    && truncation_resumes == 0
+                {
+                    info!(
+                        iter = iter,
+                        "WebUse 第 1 轮无工具调用,注入 nudge 强制 LLM 使用浏览器操控工具"
+                    );
+                    session
+                        .context_mut()
+                        .push(ChatMessage::user(WEB_OPS_NUDGE_TEXT));
                     continue;
                 }
 
@@ -418,8 +437,8 @@ impl Agent {
 
                 // ---- 结构化输出通道短路(先于 schema 预校验与执行) ----
                 if self.profile.emit_tool.as_deref() == Some(name.as_str()) {
-                    let json = serde_json::to_string_pretty(&args)
-                        .unwrap_or_else(|_| args.to_string());
+                    let json =
+                        serde_json::to_string_pretty(&args).unwrap_or_else(|_| args.to_string());
                     // 回填 tool_result 保持上下文配对(assistant tool_use ↔ tool_result)
                     session.context_mut().push(ChatMessage::tool_result(
                         id,
@@ -573,6 +592,7 @@ impl Agent {
                     output.len(),
                     tool_call_elapsed_ms,
                     &error_summary,
+                    if is_error { "" } else { output.as_str() },
                 );
                 // 关联报告: 2026-09-09_06 F-002 — 累计最近工具调用历史
                 let args_digest = crate::agent::extrace::compact_args_digest(&args);
@@ -897,6 +917,13 @@ pub(crate) fn should_nudge_window_ops(profile_tools: &[&str], iter: usize) -> bo
     iter == 1 && profile_tools.iter().any(|t| *t == "WindowList")
 }
 
+/// 2026-09-16 第 61 轮:WebUse 同款 nudge(Chromium-WebUse,第 11 角色)。
+pub(crate) const WEB_OPS_NUDGE_TEXT: &str = "【laew 系统提示】你刚才的回复没有调用任何浏览器操控工具。请立即用 BrowserNew 打开目标网页拿到 page_id,然后用 BrowserControl 执行动作、BrowserInspect 观察结果。这是唯一被接受的工作方式 —— 纯文本回答将被判失败。若 BrowserNew 返回 code=3001(未检测到浏览器),如实告知用户安装 Chrome/Edge/Chromium,不要编造结果。";
+
+pub(crate) fn should_nudge_web_ops(profile_tools: &[&str], iter: usize) -> bool {
+    iter == 1 && profile_tools.iter().any(|t| *t == "BrowserNew")
+}
+
 /// 结构化输出强制通道总开关(L6/L19,2026-09-09 第 13 轮)。
 ///
 /// 环境变量 `LAEW_FORCED_TOOLS=off|0|false|no` 关闭 wire 层 forced tool_choice
@@ -911,7 +938,10 @@ fn forced_tools_enabled() -> bool {
 
 /// 开关取值解析(独立出来便于单测,OnceLock 缓存进程级一次)。
 fn forced_tools_enabled_from(raw: String) -> bool {
-    !matches!(raw.trim().to_lowercase().as_str(), "off" | "0" | "false" | "no")
+    !matches!(
+        raw.trim().to_lowercase().as_str(),
+        "off" | "0" | "false" | "no"
+    )
 }
 
 /// 将 `serde_json::Value` 序列化为「对象 key 排序后的字符串」,作为失败键的稳定摘要。
@@ -1635,10 +1665,13 @@ mod tests {
         agent.run_session(&mut session).await.unwrap();
         let seen = cap.seen.lock().expect("meta capture");
         assert!(
-            seen.iter()
-                .all(|m| m.user_agent.starts_with("LsmAgentEmergentWork-SubAgent-Work/")),
+            seen.iter().all(|m| m
+                .user_agent
+                .starts_with("LsmAgentEmergentWork-SubAgent-Work/")),
             "UA 应为 SubAgent-Work,实际: {:?}",
-            seen.iter().map(|m| m.user_agent.clone()).collect::<Vec<_>>()
+            seen.iter()
+                .map(|m| m.user_agent.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1651,7 +1684,10 @@ mod tests {
         let h = build_runtime_hints(&t, 0);
         assert!(h.is_empty(), "全 0 应返回空串,实际: {h:?}");
         let h = build_runtime_hints(&t, 1);
-        assert!(h.is_empty(), "consecutive_failures < 2 也不应触发,实际: {h:?}");
+        assert!(
+            h.is_empty(),
+            "consecutive_failures < 2 也不应触发,实际: {h:?}"
+        );
     }
 
     #[test]
@@ -1715,7 +1751,8 @@ mod tests {
         let mut t = ExecutionTrace::default();
         t.iterations = 2;
         let (text, _u, t) =
-            crate::agent::Agent::finalize_with_max_tokens(t, "hello", Usage::default(), &state).unwrap();
+            crate::agent::Agent::finalize_with_max_tokens(t, "hello", Usage::default(), &state)
+                .unwrap();
         assert_eq!(text, "hello");
         assert_eq!(t.max_tokens_upscalings, 2);
         assert_eq!(t.max_tokens_history, vec![(8192, 16384), (16384, 32768)]);
@@ -1753,10 +1790,7 @@ mod tests {
         }
     }
 
-    fn emit_completion(
-        calls: Vec<(&'static str, serde_json::Value)>,
-        text: &str,
-    ) -> Completion {
+    fn emit_completion(calls: Vec<(&'static str, serde_json::Value)>, text: &str) -> Completion {
         Completion {
             text: text.to_string(),
             tool_calls: calls
@@ -1799,7 +1833,10 @@ mod tests {
         let (text, _usage, trace) = agent.run_once("测试任务").await.unwrap();
 
         // 最终文本 = 模型文本 + emit input 的 ```json 块
-        assert!(text.contains("结构化输出验证"), "文本应含 emit input: {text}");
+        assert!(
+            text.contains("结构化输出验证"),
+            "文本应含 emit input: {text}"
+        );
         assert!(text.contains("```json"), "应输出 json 代码块: {text}");
         // 下游解析链直接命中
         let c = crate::agent::yolo::parse_classification(&text).unwrap();
@@ -1863,7 +1900,11 @@ mod tests {
             .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
             .collect();
         assert_eq!(tool_uses.len(), 2, "assistant 应含 2 个 tool_use");
-        assert_eq!(tool_results.len(), 2, "每个 tool_use 都应有 tool_result 回填");
+        assert_eq!(
+            tool_results.len(),
+            2,
+            "每个 tool_use 都应有 tool_result 回填"
+        );
         // 忽略回填的内容标记
         let ignored = tool_results
             .iter()

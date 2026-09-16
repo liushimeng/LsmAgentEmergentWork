@@ -38,8 +38,14 @@ pub struct CacheHint {
 }
 
 impl CacheHint {
-    pub const fn ephemeral_5m() -> Self { Self { ttl: None } }
-    pub const fn ephemeral_1h() -> Self { Self { ttl: Some(CacheTtl::OneHour) } }
+    pub const fn ephemeral_5m() -> Self {
+        Self { ttl: None }
+    }
+    pub const fn ephemeral_1h() -> Self {
+        Self {
+            ttl: Some(CacheTtl::OneHour),
+        }
+    }
 }
 
 /// Cache Policy 策略(对齐 opencode `CachePolicy`)。
@@ -73,7 +79,10 @@ pub struct CacheBreakpoints {
 
 impl CacheBreakpoints {
     pub fn new(cap: usize) -> Self {
-        Self { remaining: cap, dropped: 0 }
+        Self {
+            remaining: cap,
+            dropped: 0,
+        }
     }
 
     /// 尝试占一个断点配额。返回 `true` 表示配额可用,`false` 表示已耗尽。
@@ -108,7 +117,9 @@ fn default_hint() -> CacheHint {
 
 /// 检查 object 是否已带 `cache_control`(无论 type / ttl)。
 fn has_cache_control(obj: &Value) -> bool {
-    obj.get("cache_control").map(|v| !v.is_null()).unwrap_or(false)
+    obj.get("cache_control")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
 }
 
 /// 在最后一个 tool 上打 `cache_control`。
@@ -159,7 +170,12 @@ fn mark_last_system(system: Vec<Value>, hint: CacheHint, bp: &mut CacheBreakpoin
 }
 
 /// 在指定 index 的 message 的最后一个文本块上打 `cache_control`。
-fn mark_message_at(messages: Vec<Value>, index: usize, hint: CacheHint, bp: &mut CacheBreakpoints) -> Vec<Value> {
+fn mark_message_at(
+    messages: Vec<Value>,
+    index: usize,
+    hint: CacheHint,
+    bp: &mut CacheBreakpoints,
+) -> Vec<Value> {
     if index >= messages.len() {
         return messages;
     }
@@ -167,7 +183,12 @@ fn mark_message_at(messages: Vec<Value>, index: usize, hint: CacheHint, bp: &mut
         return messages;
     }
     let mut next = messages;
-    let Some(content_arr) = next.get(index).and_then(|m| m.get("content")).and_then(|c| c.as_array()).cloned() else {
+    let Some(content_arr) = next
+        .get(index)
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .cloned()
+    else {
         bp.remaining += 1;
         return next;
     };
@@ -175,18 +196,23 @@ fn mark_message_at(messages: Vec<Value>, index: usize, hint: CacheHint, bp: &mut
         bp.remaining += 1;
         return next;
     }
-    let last_text_idx = content_arr.iter().rposition(|p| {
-        p.get("type").and_then(|t| t.as_str()) == Some("text")
-    });
+    let last_text_idx = content_arr
+        .iter()
+        .rposition(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"));
     let mark_at = last_text_idx.unwrap_or_else(|| content_arr.len() - 1);
 
-    let already_marked = content_arr.get(mark_at).map(has_cache_control).unwrap_or(false);
+    let already_marked = content_arr
+        .get(mark_at)
+        .map(has_cache_control)
+        .unwrap_or(false);
     if already_marked {
         bp.remaining += 1;
         return next;
     }
 
-    let Some(msg) = next.get_mut(index) else { return next };
+    let Some(msg) = next.get_mut(index) else {
+        return next;
+    };
     let Some(content_mut) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
         return next;
     };
@@ -200,9 +226,9 @@ fn mark_message_at(messages: Vec<Value>, index: usize, hint: CacheHint, bp: &mut
 
 /// 找最后一条指定 role 的 message index。`None` 表示未找到。
 fn last_index_of_role(messages: &[Value], role: &str) -> Option<usize> {
-    messages.iter().rposition(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some(role)
-    })
+    messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some(role))
 }
 
 /// 把 `CachePolicy` 应用到 (system, tools, messages) 三元组上,返回新三元组与断点统计。
@@ -219,7 +245,12 @@ pub fn apply_cache_policy(
     mut messages: Vec<Value>,
 ) -> (Vec<Value>, Vec<Value>, Vec<Value>, CacheBreakpoints) {
     if matches!(policy, CachePolicy::None) {
-        return (system, tools, messages, CacheBreakpoints::new(ANTHROPIC_BREAKPOINT_CAP));
+        return (
+            system,
+            tools,
+            messages,
+            CacheBreakpoints::new(ANTHROPIC_BREAKPOINT_CAP),
+        );
     }
     let mut bp = CacheBreakpoints::new(ANTHROPIC_BREAKPOINT_CAP);
     let hint = default_hint();
@@ -238,8 +269,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn v_system(text: &str) -> Value { json!({ "type": "text", "text": text }) }
-    fn v_tool(name: &str) -> Value { json!({ "name": name, "description": "d", "input_schema": {} }) }
+    fn v_system(text: &str) -> Value {
+        json!({ "type": "text", "text": text })
+    }
+    fn v_tool(name: &str) -> Value {
+        json!({ "name": name, "description": "d", "input_schema": {} })
+    }
     fn v_user_msg(text: &str) -> Value {
         json!({ "role": "user", "content": [{ "type": "text", "text": text }] })
     }
@@ -259,7 +294,10 @@ mod tests {
         let sys = vec![v_system("you are x")];
         let msgs = vec![v_user_msg("hi")];
         let (_, out_tools, _, bp) = apply_cache_policy(CachePolicy::Auto, sys, tools, msgs);
-        assert!(out_tools[2].get("cache_control").is_some(), "last tool should be marked");
+        assert!(
+            out_tools[2].get("cache_control").is_some(),
+            "last tool should be marked"
+        );
         assert_eq!(bp.dropped, 0);
         // 1 tool + 1 system + 1 user = 3 断点 → remaining = 4 - 3 = 1
         assert_eq!(bp.remaining, ANTHROPIC_BREAKPOINT_CAP - 3);
@@ -271,8 +309,14 @@ mod tests {
         let sys = vec![v_system("alpha"), v_system("beta")];
         let msgs = vec![v_user_msg("hi")];
         let (out_sys, _, _, _) = apply_cache_policy(CachePolicy::Auto, sys, tools, msgs);
-        assert!(out_sys[1].get("cache_control").is_some(), "last system block marked");
-        assert!(out_sys[0].get("cache_control").is_none(), "first system block untouched");
+        assert!(
+            out_sys[1].get("cache_control").is_some(),
+            "last system block marked"
+        );
+        assert!(
+            out_sys[0].get("cache_control").is_none(),
+            "first system block untouched"
+        );
     }
 
     #[test]
@@ -287,7 +331,10 @@ mod tests {
         let (_, _, out_msgs, _) = apply_cache_policy(CachePolicy::Auto, sys, tools, msgs);
         let latest = &out_msgs[2];
         let content = latest.get("content").unwrap().as_array().unwrap();
-        assert!(content[0].get("cache_control").is_some(), "latest user text block marked");
+        assert!(
+            content[0].get("cache_control").is_some(),
+            "latest user text block marked"
+        );
         let first = &out_msgs[0];
         let c0 = first.get("content").unwrap().as_array().unwrap();
         assert!(c0[0].get("cache_control").is_none());
@@ -307,7 +354,11 @@ mod tests {
         let msgs = vec![v_user_msg("hi")];
         let (_, out_tools, _, bp) = apply_cache_policy(CachePolicy::Auto, sys, tools, msgs);
         assert_eq!(
-            out_tools[1].get("cache_control").unwrap().get("ttl").unwrap(),
+            out_tools[1]
+                .get("cache_control")
+                .unwrap()
+                .get("ttl")
+                .unwrap(),
             "1h"
         );
         assert!(out_tools[0].get("cache_control").is_none());
@@ -371,11 +422,7 @@ mod tests {
             apply_cache_policy(CachePolicy::Auto, sys, tools, msgs);
         assert!(out_sys.is_empty());
         assert!(out_tools.is_empty());
-        assert!(out_msgs[0]
-            .get("content")
-            .unwrap()
-            .as_array()
-            .unwrap()[0]
+        assert!(out_msgs[0].get("content").unwrap().as_array().unwrap()[0]
             .get("cache_control")
             .is_some());
         assert_eq!(bp.remaining, ANTHROPIC_BREAKPOINT_CAP - 1);
@@ -388,11 +435,7 @@ mod tests {
         let sys = vec![v_system("s")];
         let msgs = vec![v_assistant_msg("ack")];
         let (_, _, out_msgs, bp) = apply_cache_policy(CachePolicy::Auto, sys, tools, msgs);
-        assert!(out_msgs[0]
-            .get("content")
-            .unwrap()
-            .as_array()
-            .unwrap()[0]
+        assert!(out_msgs[0].get("content").unwrap().as_array().unwrap()[0]
             .get("cache_control")
             .is_none());
         assert_eq!(bp.remaining, ANTHROPIC_BREAKPOINT_CAP - 2);

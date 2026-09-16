@@ -31,7 +31,11 @@ pub struct PlanRunner {
 impl PlanRunner {
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>, plans_dir: PathBuf) -> Self {
         let agent = Agent::new(llm, AgentProfile::plan_profile());
-        Self { agent, db, plans_dir }
+        Self {
+            agent,
+            db,
+            plans_dir,
+        }
     }
 
     /// 构造并执行 Plan 生成(2026-09-09 第 14 轮:带回 LLM Usage 用于 Orchestrator 累加)。
@@ -43,7 +47,8 @@ impl PlanRunner {
         decomposition: &[String],
         session_id: &str,
     ) -> Result<(PlanOutput, Usage)> {
-        self.generate_with_retry_hint(goal, purpose, intent, decomposition, session_id, "").await
+        self.generate_with_retry_hint(goal, purpose, intent, decomposition, session_id, "")
+            .await
     }
 
     /// I3(2026-09-14 第 51 轮):带上一轮失败反馈生成 Plan。
@@ -60,9 +65,8 @@ impl PlanRunner {
         retry_hint: &str,
     ) -> Result<(PlanOutput, Usage)> {
         // 确保 plans/ 存在
-        std::fs::create_dir_all(&self.plans_dir).map_err(|e| {
-            AgentError::PlanGen(format!("无法创建 plans/ 目录: {}", e))
-        })?;
+        std::fs::create_dir_all(&self.plans_dir)
+            .map_err(|e| AgentError::PlanGen(format!("无法创建 plans/ 目录: {}", e)))?;
 
         let retry_block = if retry_hint.trim().is_empty() {
             String::new()
@@ -97,9 +101,8 @@ impl PlanRunner {
         // 落盘
         let seq = self.db.next_session_seq(session_id)?;
         let path = self.plans_dir.join(format!("{}-{}.md", session_id, seq));
-        std::fs::write(&path, &text).map_err(|e| {
-            AgentError::PlanGen(format!("写入 Plan 文档失败: {}", e))
-        })?;
+        std::fs::write(&path, &text)
+            .map_err(|e| AgentError::PlanGen(format!("写入 Plan 文档失败: {}", e)))?;
 
         // 写 Agent-Memory
         let _ = memory::record_entry(
@@ -113,7 +116,13 @@ impl PlanRunner {
         );
 
         let _ = usage;
-        Ok((PlanOutput { path, markdown: text }, usage))
+        Ok((
+            PlanOutput {
+                path,
+                markdown: text,
+            },
+            usage,
+        ))
     }
 }
 
@@ -122,9 +131,7 @@ pub fn validate_plan_markdown(content: &str) -> Result<()> {
     let required = ["目标", "WorkFlow 拆解", "关键决策", "风险", "验收总览"];
     for seg in required {
         if !content.contains(seg) && !content.contains(&format!("## {seg}")) {
-            return Err(AgentError::PlanGen(format!(
-                "Plan 文档缺少必要段: {seg}"
-            )));
+            return Err(AgentError::PlanGen(format!("Plan 文档缺少必要段: {seg}")));
         }
     }
     Ok(())
@@ -136,9 +143,9 @@ pub fn list_plan_docs(plans_dir: &Path) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(plans_dir).map_err(|e| {
-        AgentError::PlanGen(format!("无法读取 plans/ 目录: {}", e))
-    })? {
+    for entry in std::fs::read_dir(plans_dir)
+        .map_err(|e| AgentError::PlanGen(format!("无法读取 plans/ 目录: {}", e)))?
+    {
         let entry = entry.map_err(|e| AgentError::PlanGen(e.to_string()))?;
         let p = entry.path();
         if p.is_file() && p.extension().map(|s| s == "md").unwrap_or(false) {

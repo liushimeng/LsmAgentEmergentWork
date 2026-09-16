@@ -79,10 +79,7 @@ mod tests {
 
     #[test]
     fn backfill_fills_orphan_tool_use() {
-        let mut ctx = vec![
-            ChatMessage::user("跑一下"),
-            assistant_with_tools(&["t-1"]),
-        ];
+        let mut ctx = vec![ChatMessage::user("跑一下"), assistant_with_tools(&["t-1"])];
         let n = backfill_cancelled_tool_results(&mut ctx);
         assert_eq!(n, 1);
         assert_eq!(ctx.len(), 3);

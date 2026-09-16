@@ -16,7 +16,9 @@ pub struct ReadTool;
 
 #[async_trait]
 impl Tool for ReadTool {
-    fn name(&self) -> &str { "Read" }
+    fn name(&self) -> &str {
+        "Read"
+    }
 
     fn description(&self) -> &str {
         "读取文本文件并按 cat -n 风格返回带行号的内容。\n\
@@ -46,7 +48,11 @@ impl Tool for ReadTool {
                 tool: self.name().into(),
                 reason: "缺少 string 类型参数 file_path".into(),
             })?;
-        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+        let offset = args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as usize;
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -117,7 +123,12 @@ impl Tool for ReadTool {
             } else {
                 line.trim_end_matches('\n').to_string()
             };
-            buf.push_str(&format!("{:>width$}\t{}\n", line_num, display, width = width));
+            buf.push_str(&format!(
+                "{:>width$}\t{}\n",
+                line_num,
+                display,
+                width = width
+            ));
         }
         // L1208:文件内容是典型的「外部内容」,扫描 prompt injection 后返回
         Ok(crate::agent::safety::scan_and_wrap(
@@ -157,7 +168,11 @@ impl ResolveCandidates {
             ResolveCandidates::Single(p) => p,
             ResolveCandidates::WorkAndRoot { work, root } => {
                 // 优先选实际存在的(供 caller 使用);理论上两者都不存在时返回 work
-                if root.exists() { root } else { work }
+                if root.exists() {
+                    root
+                } else {
+                    work
+                }
             }
         }
     }
@@ -261,10 +276,7 @@ fn resolve_path_with_candidates(p: &str) -> ResolveCandidates {
 /// 不引入新依赖;纯字符串拼接;非命中场景不增加任何输出。
 fn format_path_diagnostic(path_str: &str, _work: &Path, root: &Path) -> String {
     let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let work_dir_name = work_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let work_dir_name = work_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let root_dir_name = root
         .parent()
         .and_then(|p| p.file_name())
@@ -281,8 +293,7 @@ fn format_path_diagnostic(path_str: &str, _work: &Path, root: &Path) -> String {
 
     // 场景 B:工作目录 = 根目录(就在 laew 根目录下跑),但相对路径在工作目录里查不到
     // → 提示「相对路径不在工作目录」即可
-    let same_dir = !work_dir_name.is_empty()
-        && work_dir_name == root_dir_name;
+    let same_dir = !work_dir_name.is_empty() && work_dir_name == root_dir_name;
 
     if looks_like_source_rel {
         format!(
@@ -292,7 +303,10 @@ fn format_path_diagnostic(path_str: &str, _work: &Path, root: &Path) -> String {
              \n    或先 `cd` 到 laew 根目录再使用相对路径。",
             path_str = path_str,
             work_dir_name = work_dir_name,
-            root = root.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+            root = root
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
         )
     } else if same_dir {
         format!(
@@ -310,8 +324,8 @@ fn format_path_diagnostic(path_str: &str, _work: &Path, root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn reads_with_line_numbers() {
@@ -365,9 +379,7 @@ mod tests {
                 // 根路径由 current_exe().parent() 推导,在此仅校验非空
                 assert!(!r.as_os_str().is_empty(), "根目录路径应存在");
             }
-            other => panic!(
-                "应返回 WorkAndRoot(两个路径均不存在),实际 {other:?}"
-            ),
+            other => panic!("应返回 WorkAndRoot(两个路径均不存在),实际 {other:?}"),
         }
     }
 
@@ -451,10 +463,7 @@ mod tests {
         let root = PathBuf::from("/tmp/rootdir").join(rel);
         let diag = format_path_diagnostic(rel, &work, &root);
         // 非典型场景:不应追加诊断
-        assert!(
-            diag.is_empty(),
-            "非典型场景应返回空诊断,实际: {diag}"
-        );
+        assert!(diag.is_empty(), "非典型场景应返回空诊断,实际: {diag}");
     }
 
     #[tokio::test]
@@ -473,10 +482,7 @@ mod tests {
                 assert!(reason.contains("[root]"), "应含 [root],实际: {reason}");
                 // 当前工作目录若是 laew 子目录(典型 TestWorkSpace),应有诊断
                 let work_dir = std::env::current_dir().unwrap_or_default();
-                let work_name = work_dir
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let work_name = work_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 if work_name != "LsmAgentEmergentWork" && !work_name.is_empty() {
                     assert!(
                         reason.contains("请改用绝对路径"),

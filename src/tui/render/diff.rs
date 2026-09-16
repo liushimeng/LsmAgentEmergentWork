@@ -43,7 +43,11 @@ pub struct DiffHunk {
 
 /// 行号宽度计算:取旧/新最大行号的位数,至少 2。
 fn line_no_width(n: usize) -> usize {
-    if n == 0 { 2 } else { ((n as f64).log10() as usize) + 1 }
+    if n == 0 {
+        2
+    } else {
+        ((n as f64).log10() as usize) + 1
+    }
 }
 
 /// 计算两个文本的行级 + 字符级 diff。
@@ -195,8 +199,18 @@ pub fn render_diff_hunk(hunk: &DiffHunk) -> RenderLines {
     )]);
 
     // 计算行号宽度
-    let max_old = hunk.lines.iter().filter_map(|l| l.line_no_last()).max().unwrap_or(1);
-    let max_new = hunk.lines.iter().filter_map(|l| l.line_no_new).max().unwrap_or(1);
+    let max_old = hunk
+        .lines
+        .iter()
+        .filter_map(|l| l.line_no_last())
+        .max()
+        .unwrap_or(1);
+    let max_new = hunk
+        .lines
+        .iter()
+        .filter_map(|l| l.line_no_new)
+        .max()
+        .unwrap_or(1);
     let w_old = line_no_width(max_old);
     let w_new = line_no_width(max_new);
 
@@ -216,17 +230,29 @@ fn render_diff_line(line: &DiffLine, w_old: usize, w_new: usize, p: &theme::Pale
         Some(n) => format!("{:>w_old$}", n, w_old = w_old),
         None => " ".repeat(w_old),
     };
-    spans.push(Span::with_attrs(old_str, p.diff_line_no_fg, p.diff_line_no_attrs));
+    spans.push(Span::with_attrs(
+        old_str,
+        p.diff_line_no_fg,
+        p.diff_line_no_attrs,
+    ));
 
     // 分隔
-    spans.push(Span::with_attrs("│", p.diff_line_no_fg, p.diff_line_no_attrs));
+    spans.push(Span::with_attrs(
+        "│",
+        p.diff_line_no_fg,
+        p.diff_line_no_attrs,
+    ));
 
     // 右栏行号(新)
     let new_str = match line.line_no_new {
         Some(n) => format!("{:>w_new$}", n, w_new = w_new),
         None => " ".repeat(w_new),
     };
-    spans.push(Span::with_attrs(new_str, p.diff_line_no_fg, p.diff_line_no_attrs));
+    spans.push(Span::with_attrs(
+        new_str,
+        p.diff_line_no_fg,
+        p.diff_line_no_attrs,
+    ));
 
     // 前缀符号(+/-/` `)
     let (prefix, prefix_fg, prefix_attrs) = match line.tag {
@@ -243,7 +269,12 @@ fn render_diff_line(line: &DiffLine, w_old: usize, w_new: usize, p: &theme::Pale
 }
 
 /// 追加文本,按字符级区间着色。
-fn append_text_with_char_spans(spans: &mut Vec<Span>, text: &str, line: &DiffLine, p: &theme::Palette) {
+fn append_text_with_char_spans(
+    spans: &mut Vec<Span>,
+    text: &str,
+    line: &DiffLine,
+    p: &theme::Palette,
+) {
     if line.char_spans.is_empty() {
         // 无字符级变更,整行统一着色
         let (fg, attrs) = match line.tag {
@@ -261,7 +292,11 @@ fn append_text_with_char_spans(spans: &mut Vec<Span>, text: &str, line: &DiffLin
     // 修复:真正使用 hl_bg 作为背景色,fg 保持行色以维持语义(added = 绿底,removed = 红底)。
     let (base_fg, base_attrs, hl_bg) = match line.tag {
         DiffTag::Added => (p.diff_added_fg, p.diff_added_attrs, p.diff_added_char_bg),
-        DiffTag::Removed => (p.diff_removed_fg, p.diff_removed_attrs, p.diff_removed_char_bg),
+        DiffTag::Removed => (
+            p.diff_removed_fg,
+            p.diff_removed_attrs,
+            p.diff_removed_char_bg,
+        ),
         DiffTag::Context => (p.diff_context_fg, attr::NONE, Color::Reset),
     };
 
@@ -271,18 +306,37 @@ fn append_text_with_char_spans(spans: &mut Vec<Span>, text: &str, line: &DiffLin
     let mut cursor: usize = 0;
     for (s, e) in byte_spans {
         if cursor < s {
-            spans.push(Span::with_bg(text[cursor..s].to_string(), base_fg, Color::Reset, base_attrs));
+            spans.push(Span::with_bg(
+                text[cursor..s].to_string(),
+                base_fg,
+                Color::Reset,
+                base_attrs,
+            ));
         }
         // 字符级变更区间:用 hl_bg 作为背景色,fg 保留行色;无 hl_bg(Context)时 fallback REVERSE
         if hl_bg == Color::Reset {
-            spans.push(Span::with_attrs(text[s..e].to_string(), Color::White, base_attrs | attr::REVERSE));
+            spans.push(Span::with_attrs(
+                text[s..e].to_string(),
+                Color::White,
+                base_attrs | attr::REVERSE,
+            ));
         } else {
-            spans.push(Span::with_bg(text[s..e].to_string(), base_fg, hl_bg, base_attrs));
+            spans.push(Span::with_bg(
+                text[s..e].to_string(),
+                base_fg,
+                hl_bg,
+                base_attrs,
+            ));
         }
         cursor = e;
     }
     if cursor < text.len() {
-        spans.push(Span::with_bg(text[cursor..].to_string(), base_fg, Color::Reset, base_attrs));
+        spans.push(Span::with_bg(
+            text[cursor..].to_string(),
+            base_fg,
+            Color::Reset,
+            base_attrs,
+        ));
     }
 }
 
@@ -431,7 +485,11 @@ mod tests {
         let hunk = compute_diff(old, new, "old.rs", "new.rs");
 
         // 应有一删一增行,且字符级区间非空
-        let removed = hunk.lines.iter().find(|l| l.tag == DiffTag::Removed).unwrap();
+        let removed = hunk
+            .lines
+            .iter()
+            .find(|l| l.tag == DiffTag::Removed)
+            .unwrap();
         let added = hunk.lines.iter().find(|l| l.tag == DiffTag::Added).unwrap();
         assert!(!removed.char_spans.is_empty() || !added.char_spans.is_empty());
     }

@@ -62,7 +62,11 @@ impl SandboxConfig {
                 }
             }
         }
-        Self { work_dir, temp_dir, roots }
+        Self {
+            work_dir,
+            temp_dir,
+            roots,
+        }
     }
 
     /// 白名单前缀集合(测试与诊断用)。
@@ -200,10 +204,10 @@ mod tests {
     /// 任何测试 chdir 都会瞬移其它并发测试的解析基准(第 50 轮实测:
     /// tempdir 落 C: 盘而仓库在 D: 盘,`/home/user/proj` 被解析成 C:\home\...)。
     /// 模块内全部测试经此锁串行化;chdir 测试额外用 CwdGuard 保证 panic 也恢复。
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
-        CWD_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::test_support::GLOBAL_ENV_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     struct CwdGuard(PathBuf);
@@ -330,9 +334,12 @@ mod tests {
         symlink(real.path(), &alias).unwrap();
         let cfg = SandboxConfig::for_test(alias.clone(), PathBuf::from("/var/run-sbx-nonexist"));
         assert!(check_write_path(&cfg, "Write", alias.join("new.txt").to_str().unwrap()).is_ok());
-        assert!(
-            check_write_path(&cfg, "Write", real.path().join("new2.txt").to_str().unwrap()).is_ok()
-        );
+        assert!(check_write_path(
+            &cfg,
+            "Write",
+            real.path().join("new2.txt").to_str().unwrap()
+        )
+        .is_ok());
     }
 
     /// canonical_prefix:自目标向上找最深已存在祖先,canonicalize 后拼回尾部。
@@ -368,7 +375,10 @@ mod tests {
         // Windows 适配:canonicalize 落到当前盘符且分隔符为 `\`;统一斜杠后断言,
         // 同时确认 verbatim 前缀(`\\?\`)已被 display_path 剥除。
         let norm = msg.replace('\\', "/");
-        assert!(norm.contains("/etc/evil.txt"), "错误应包含规范化路径: {msg}");
+        assert!(
+            norm.contains("/etc/evil.txt"),
+            "错误应包含规范化路径: {msg}"
+        );
         assert!(!msg.contains(r"\\?\"), "错误不应泄漏 verbatim 前缀: {msg}");
     }
 }

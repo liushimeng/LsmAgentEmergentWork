@@ -38,11 +38,7 @@ impl PhaseExecutor {
         Self { config }
     }
 
-    pub async fn execute(
-        &self,
-        phase: &Phase,
-        session_id: &str,
-    ) -> Result<PhaseExecutionResult> {
+    pub async fn execute(&self, phase: &Phase, session_id: &str) -> Result<PhaseExecutionResult> {
         let _ = (phase, session_id);
         Ok(PhaseExecutionResult {
             phase_id: phase.id.clone(),

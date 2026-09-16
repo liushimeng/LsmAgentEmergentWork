@@ -41,6 +41,8 @@ pub const COMPACT_AGENT_NAME: &str = "LsmAgentEmergentWork-Compact";
 pub const WINDOW_USE_AGENT_NAME: &str = "LsmAgentEmergentWork-WindowUse";
 /// WorkFlow Agent(工作流编排层,第 10 角色:超大型复杂任务自动化编排)
 pub const WORK_FLOW_AGENT_NAME: &str = "LsmAgentEmergentWork-WorkFlow";
+/// Chromium-WebUse Agent(浏览器操控层,第 11 角色:CDP 驱动 Chromium 系浏览器网页操控)
+pub const WEB_USE_AGENT_NAME: &str = "LsmAgentEmergentWork-Chromium-WebUse";
 
 /// 兼容旧名(指向 SubAgent-Work)。
 pub const WORK_AGENT_NAME: &str = SUB_AGENT_WORK_NAME;
@@ -168,6 +170,19 @@ impl AgentProfile {
         }
     }
 
+    /// Chromium-WebUse Agent profile(浏览器操控层,第 11 角色)。
+    ///
+    /// 工具集:Read + BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect;
+    /// 不带 Bash/Write(网页操控单元不需要 shell / 文件写,收窄权限面)。
+    pub fn web_use_profile() -> Self {
+        Self {
+            name: WEB_USE_AGENT_NAME.to_string(),
+            system_prompt: SystemPrompt::web_use(),
+            tools: crate::agent::tools::web_use_registry(),
+            emit_tool: None,
+        }
+    }
+
     /// WorkFlow Agent profile(工作流编排层,第 10 角色:Goal 状态机 + Squad 调度)。
     /// 工具集:Bash(执行编排命令) + Read(查看状态) + Write(产出报告)。
     pub fn work_flow_profile() -> Self {
@@ -254,9 +269,10 @@ mod tests {
             AgentProfile::window_use_profile().name,
             AgentProfile::work_flow_profile().name,
             AgentProfile::debug_profile().name,
+            AgentProfile::web_use_profile().name,
         ];
         let unique: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(unique.len(), 10, "10 个 profile 必须名字互不相同");
+        assert_eq!(unique.len(), 11, "11 个 profile 必须名字互不相同");
     }
 
     #[test]
@@ -289,6 +305,7 @@ mod tests {
             AgentProfile::debug_profile(),
             AgentProfile::compact_profile(),
             AgentProfile::window_use_profile(),
+            AgentProfile::web_use_profile(),
         ] {
             assert!(p.emit_tool.is_none(), "{} 不应声明 emit 工具", p.name);
         }
@@ -376,6 +393,7 @@ mod tests {
             AgentProfile::session_context_profile(),
             AgentProfile::compact_profile(),
             AgentProfile::window_use_profile(),
+            AgentProfile::web_use_profile(),
         ] {
             let rendered = p.system_prompt.render(Protocol::Anthropic);
             assert!(!rendered.is_empty(), "{} 的系统提示词渲染不应为空", p.name);

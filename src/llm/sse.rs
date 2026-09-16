@@ -86,7 +86,11 @@ impl SseStream {
                 None => break,
                 Some(idx) => {
                     // 提取本行(去掉 \n;若前一个字符是 \r 也去掉)
-                    let end = if idx > 0 && self.buf[idx - 1] == b'\r' { idx - 1 } else { idx };
+                    let end = if idx > 0 && self.buf[idx - 1] == b'\r' {
+                        idx - 1
+                    } else {
+                        idx
+                    };
                     let line = self.buf[..end].to_vec();
                     // consume 包括 \n
                     self.buf.drain(..=idx);
@@ -182,9 +186,7 @@ pub enum DeltaEvent {
         cache_creation: u32,
     },
     /// 输出侧 usage(Anthropic message_delta / OpenAI 尾部 usage chunk)。
-    OutputUsage {
-        output_tokens: u32,
-    },
+    OutputUsage { output_tokens: u32 },
     /// 文本增量。
     TextDelta(String),
     /// 工具调用开始(携带 id / name)。
@@ -447,11 +449,20 @@ mod tests {
     #[test]
     fn sink_tool_call_assembles_json() {
         let mut sink = ParseSink::new();
-        sink.feed(DeltaEvent::ToolCallStart { id: "c1".into(), name: "Bash".into() }).unwrap();
-        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":".into())).unwrap();
-        sink.feed(DeltaEvent::ToolCallJsonDelta("\"ls\"}".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("\"ls\"}".into()))
+            .unwrap();
         sink.feed(DeltaEvent::ToolCallEnd).unwrap();
-        sink.feed(DeltaEvent::Stop { stop_reason: Some("tool_use".into()) }).unwrap();
+        sink.feed(DeltaEvent::Stop {
+            stop_reason: Some("tool_use".into()),
+        })
+        .unwrap();
         let c = sink.finish().unwrap();
         assert_eq!(c.tool_calls.len(), 1);
         assert_eq!(c.tool_calls[0].id, "c1");
@@ -463,8 +474,13 @@ mod tests {
     #[test]
     fn sink_tool_call_bad_json_falls_back_to_raw() {
         let mut sink = ParseSink::new();
-        sink.feed(DeltaEvent::ToolCallStart { id: "c1".into(), name: "X".into() }).unwrap();
-        sink.feed(DeltaEvent::ToolCallJsonDelta("not json".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "X".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("not json".into()))
+            .unwrap();
         sink.feed(DeltaEvent::ToolCallEnd).unwrap();
         sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
         let c = sink.finish().unwrap();
@@ -474,7 +490,12 @@ mod tests {
     #[test]
     fn sink_input_usage_sets_input_tokens() {
         let mut sink = ParseSink::new();
-        sink.feed(DeltaEvent::InputUsage { input_tokens: 100, cache_read: 50, cache_creation: 10 }).unwrap();
+        sink.feed(DeltaEvent::InputUsage {
+            input_tokens: 100,
+            cache_read: 50,
+            cache_creation: 10,
+        })
+        .unwrap();
         sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
         let c = sink.finish().unwrap();
         assert_eq!(c.usage.input_tokens, 100);
@@ -508,12 +529,25 @@ mod tests {
     #[test]
     fn sink_tool_call_truncated_json_recovers_partial() {
         let mut sink = ParseSink::new();
-        sink.feed(DeltaEvent::ToolCallStart { id: "c1".into(), name: "Bash".into() }).unwrap();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+        })
+        .unwrap();
         // 模拟截断:command 完整、timeout 完整、workdir 在字符串中间断流
-        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":\"git log --oneline -n 50\",".into())).unwrap();
-        sink.feed(DeltaEvent::ToolCallJsonDelta("\"timeout\":30,\"workdir\":\"/ho".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta(
+            "{\"command\":\"git log --oneline -n 50\",".into(),
+        ))
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta(
+            "\"timeout\":30,\"workdir\":\"/ho".into(),
+        ))
+        .unwrap();
         sink.feed(DeltaEvent::ToolCallEnd).unwrap();
-        sink.feed(DeltaEvent::Stop { stop_reason: Some("max_tokens".into()) }).unwrap();
+        sink.feed(DeltaEvent::Stop {
+            stop_reason: Some("max_tokens".into()),
+        })
+        .unwrap();
         let c = sink.finish().unwrap();
         assert_eq!(c.tool_calls.len(), 1);
         let args = &c.tool_calls[0].arguments;
@@ -521,14 +555,23 @@ mod tests {
         assert_eq!(m["command"], "git log --oneline -n 50");
         assert_eq!(m["timeout"], 30);
         assert_eq!(m["workdir"], "/ho");
-        assert_eq!(m[crate::agent::partial_json::TRUNCATED_KEY], true, "应标记截断");
+        assert_eq!(
+            m[crate::agent::partial_json::TRUNCATED_KEY],
+            true,
+            "应标记截断"
+        );
     }
 
     #[test]
     fn sink_tool_call_unrecoverable_falls_back_to_raw() {
         let mut sink = ParseSink::new();
-        sink.feed(DeltaEvent::ToolCallStart { id: "c1".into(), name: "X".into() }).unwrap();
-        sink.feed(DeltaEvent::ToolCallJsonDelta("not json at all".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "X".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("not json at all".into()))
+            .unwrap();
         sink.feed(DeltaEvent::ToolCallEnd).unwrap();
         sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
         let c = sink.finish().unwrap();
@@ -541,10 +584,18 @@ mod tests {
     fn sink_tool_call_complete_json_unchanged() {
         // 完整 JSON 不应被 partial 路径触碰,也不应标截断
         let mut sink = ParseSink::new();
-        sink.feed(DeltaEvent::ToolCallStart { id: "c1".into(), name: "Bash".into() }).unwrap();
-        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":\"ls\"}".into())).unwrap();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":\"ls\"}".into()))
+            .unwrap();
         sink.feed(DeltaEvent::ToolCallEnd).unwrap();
-        sink.feed(DeltaEvent::Stop { stop_reason: Some("tool_use".into()) }).unwrap();
+        sink.feed(DeltaEvent::Stop {
+            stop_reason: Some("tool_use".into()),
+        })
+        .unwrap();
         let c = sink.finish().unwrap();
         let m = c.tool_calls[0].arguments.as_object().unwrap();
         assert_eq!(m["command"], "ls");

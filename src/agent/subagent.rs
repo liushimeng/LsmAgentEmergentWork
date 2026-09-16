@@ -80,9 +80,7 @@ impl SubFlowInput {
             if !ctx.is_empty() {
                 let state_prompt = crate::agent::window_state::build_window_state_prompt(ctx);
                 if !state_prompt.is_empty() {
-                    out.push_str(&format!(
-                        "\n【窗口会话上下文(系统注入)】\n{state_prompt}"
-                    ));
+                    out.push_str(&format!("\n【窗口会话上下文(系统注入)】\n{state_prompt}"));
                 }
             }
         }
@@ -119,7 +117,11 @@ impl SubAgentRunner {
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>) -> Self {
         let agent = Agent::new(llm, AgentProfile::sub_agent_work_profile());
         let max_iterations = agent.max_iterations();
-        Self { agent, db, max_iterations }
+        Self {
+            agent,
+            db,
+            max_iterations,
+        }
     }
 
     pub fn with_max_iterations(mut self, n: usize) -> Self {
@@ -129,11 +131,7 @@ impl SubAgentRunner {
     }
 
     /// 跑一次 SubFlow 单元。
-    pub async fn run_unit(
-        &self,
-        input: &SubFlowInput,
-        session_id: &str,
-    ) -> Result<SubFlowOutcome> {
+    pub async fn run_unit(&self, input: &SubFlowInput, session_id: &str) -> Result<SubFlowOutcome> {
         self.run_unit_inner(input, session_id, None).await
     }
 
@@ -171,7 +169,11 @@ impl SubAgentRunner {
             .await
         {
             Ok((t, u, tr)) => (t, u, tr),
-            Err(AgentError::RepeatedToolFailure { tool, attempts, last_error }) => {
+            Err(AgentError::RepeatedToolFailure {
+                tool,
+                attempts,
+                last_error,
+            }) => {
                 let summary = format!(
                     "[RepeatedToolFailure] 工具 {tool} 连续 {attempts} 次失败;last_error: {last_error}"
                 );
@@ -183,8 +185,7 @@ impl SubAgentRunner {
                 (summary, Usage::default(), tr)
             }
             Err(AgentError::MaxIterationsExceeded(n)) => {
-                let summary =
-                    format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
+                let summary = format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
                 let mut tr = ExecutionTrace::default();
                 tr.iterations = n;
                 tr.early_terminated = true;
@@ -225,7 +226,12 @@ impl SubAgentRunner {
             }),
         );
 
-        Ok(SubFlowOutcome { text, usage, failed, trace })
+        Ok(SubFlowOutcome {
+            text,
+            usage,
+            failed,
+            trace,
+        })
     }
 }
 
@@ -250,8 +256,17 @@ fn looks_like_failure(text: &str) -> bool {
 
     // 1) 英文失败关键词:大小写不敏感、容忍文本任意位置(LLM 自由格式输出)
     const EN_PATTERNS: &[&str] = &[
-        "[failure]", "[failed]", "[error]", "failed:", "error:", "exception:",
-        "fatal error", "panic:", "crash:", "aborted:", "killed:",
+        "[failure]",
+        "[failed]",
+        "[error]",
+        "failed:",
+        "error:",
+        "exception:",
+        "fatal error",
+        "panic:",
+        "crash:",
+        "aborted:",
+        "killed:",
     ];
     if EN_PATTERNS.iter().any(|p| lower.contains(p)) {
         return true;
@@ -259,8 +274,14 @@ fn looks_like_failure(text: &str) -> bool {
 
     // 2) 中文失败关键词:覆盖 LLM 中文输出的常见表达
     const ZH_PATTERNS: &[&str] = &[
-        "[失败]", "执行失败", "未完成", "未能", "无法完成", "无法",
-        "异常退出", "出错了",
+        "[失败]",
+        "执行失败",
+        "未完成",
+        "未能",
+        "无法完成",
+        "无法",
+        "异常退出",
+        "出错了",
     ];
     if ZH_PATTERNS.iter().any(|p| t.contains(p)) {
         return true;
@@ -273,8 +294,8 @@ fn looks_like_failure(text: &str) -> bool {
 mod tests {
     use super::*;
 
-    use async_trait::async_trait;
     use crate::llm::{ChatMessage, Completion, LlmClient, RequestMeta, Usage};
+    use async_trait::async_trait;
 
     /// 始终返回"rm -rf /" Bash 工具调用 → 触发 dangerous 命令拦截
     /// → 连续 3 次失败 → Agent 抛 RepeatedToolFailure 早终止。
@@ -328,24 +349,35 @@ mod tests {
             pending_agent_messages: vec![],
         };
 
-        let outcome = runner.run_unit(&input, "s-x").await
+        let outcome = runner
+            .run_unit(&input, "s-x")
+            .await
             .expect("早终止应被 SubAgent 包装为 Ok(outcome),而非 Err");
 
         // 关键断言:outcome.trace.early_terminated=true
-        assert!(outcome.trace.early_terminated,
-                "RepeatedToolFailure 早终止应反映在 trace.early_terminated");
+        assert!(
+            outcome.trace.early_terminated,
+            "RepeatedToolFailure 早终止应反映在 trace.early_terminated"
+        );
         assert!(!outcome.trace.early_terminate_reason.is_empty());
         assert!(outcome.trace.max_consecutive_failures >= 3);
         // outcome.failed=true(因 early_terminate 信号是强信号)
-        assert!(outcome.failed,
-                "outcome.failed 应为 true,触发 QC 判 Fail");
+        assert!(outcome.failed, "outcome.failed 应为 true,触发 QC 判 Fail");
         // outcome.text 是早期包装的摘要
-        assert!(outcome.text.contains("RepeatedToolFailure"),
-                "outcome.text 应包含早终止摘要,实际: {}", outcome.text);
+        assert!(
+            outcome.text.contains("RepeatedToolFailure"),
+            "outcome.text 应包含早终止摘要,实际: {}",
+            outcome.text
+        );
         // failure_signals 含 early_terminate
-        assert!(outcome.trace.failure_signals.iter()
+        assert!(
+            outcome
+                .trace
+                .failure_signals
+                .iter()
                 .any(|s| s.starts_with("early_terminate:")),
-                "failure_signals 应包含 early_terminate 信号");
+            "failure_signals 应包含 early_terminate 信号"
+        );
     }
 
     #[test]

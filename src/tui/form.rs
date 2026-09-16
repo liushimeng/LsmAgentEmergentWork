@@ -17,10 +17,7 @@ pub enum TabKind {
         masked: bool,
     },
     /// 二选一 / 多选一(Enter 切换)。
-    Choice {
-        choices: Vec<String>,
-        cursor: usize,
-    },
+    Choice { choices: Vec<String>, cursor: usize },
     /// 确认按钮组(由左右键切换子按钮)。
     Confirm {
         actions: Vec<ConfirmAction>,
@@ -31,10 +28,10 @@ pub enum TabKind {
 /// 确认按钮种类。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmAction {
-    Submit,   // [ 确认 ]
-    Cancel,   // [ 取消 ]
-    Delete,   // [ 确认删除 ]
-    Switch,   // [ 设为当前 ]
+    Submit, // [ 确认 ]
+    Cancel, // [ 取消 ]
+    Delete, // [ 确认删除 ]
+    Switch, // [ 设为当前 ]
 }
 
 impl ConfirmAction {
@@ -61,7 +58,10 @@ impl Tab {
     pub fn text(label: &str, placeholder: &str, masked: bool, initial: &str) -> Self {
         Self {
             label: label.to_string(),
-            kind: TabKind::Text { placeholder: placeholder.to_string(), masked },
+            kind: TabKind::Text {
+                placeholder: placeholder.to_string(),
+                masked,
+            },
             value: initial.to_string(),
         }
     }
@@ -70,7 +70,10 @@ impl Tab {
         let value = choices.get(initial).cloned().unwrap_or_default();
         Self {
             label: label.to_string(),
-            kind: TabKind::Choice { choices, cursor: initial },
+            kind: TabKind::Choice {
+                choices,
+                cursor: initial,
+            },
             value,
         }
     }
@@ -88,8 +91,8 @@ impl Tab {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormOutcome {
     Continue,
-    Submit,    // [ 确认 ] / [ 确认删除 ] / [ 设为当前 ]
-    Cancel,    // [ 取消 ]
+    Submit, // [ 确认 ] / [ 确认删除 ] / [ 设为当前 ]
+    Cancel, // [ 取消 ]
 }
 
 /// Tab 表单状态机。
@@ -103,7 +106,11 @@ pub struct TabForm {
 
 impl TabForm {
     pub fn new(tabs: Vec<Tab>) -> Self {
-        Self { tabs, focus: 0, editing: None }
+        Self {
+            tabs,
+            focus: 0,
+            editing: None,
+        }
     }
 
     pub fn current(&self) -> &Tab {
@@ -156,9 +163,9 @@ impl TabForm {
                     TabKind::Confirm { actions, cursor } => {
                         let action = actions[*cursor].clone();
                         match action {
-                            ConfirmAction::Submit | ConfirmAction::Delete | ConfirmAction::Switch => {
-                                FormOutcome::Submit
-                            }
+                            ConfirmAction::Submit
+                            | ConfirmAction::Delete
+                            | ConfirmAction::Switch => FormOutcome::Submit,
                             ConfirmAction::Cancel => FormOutcome::Cancel,
                         }
                     }
@@ -170,14 +177,19 @@ impl TabForm {
     }
 
     fn handle_editing_key(&mut self, key: KeyEvent) -> FormOutcome {
-        let kind = std::mem::replace(&mut self.tabs[self.focus].kind, TabKind::Text {
-            placeholder: String::new(),
-            masked: false,
-        });
+        let kind = std::mem::replace(
+            &mut self.tabs[self.focus].kind,
+            TabKind::Text {
+                placeholder: String::new(),
+                masked: false,
+            },
+        );
         let outcome = match &kind {
             TabKind::Text { .. } => self.edit_text(key),
             TabKind::Choice { .. } => self.edit_choice(key),
-            TabKind::Confirm { actions, cursor } => self.edit_confirm(key, actions.clone(), *cursor),
+            TabKind::Confirm { actions, cursor } => {
+                self.edit_confirm(key, actions.clone(), *cursor)
+            }
         };
         // 写回 kind(可能被 edit_choice / edit_confirm 修改)
         self.tabs[self.focus].kind = kind;
@@ -244,7 +256,12 @@ impl TabForm {
         }
     }
 
-    fn edit_confirm(&mut self, key: KeyEvent, actions: Vec<ConfirmAction>, cursor: usize) -> FormOutcome {
+    fn edit_confirm(
+        &mut self,
+        key: KeyEvent,
+        actions: Vec<ConfirmAction>,
+        cursor: usize,
+    ) -> FormOutcome {
         match key.code {
             KeyCode::Esc => {
                 self.editing = None;

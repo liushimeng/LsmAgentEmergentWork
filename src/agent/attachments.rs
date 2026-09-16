@@ -246,7 +246,10 @@ fn load_dir(path: &Path) -> Result<(String, String), String> {
     }
     Ok((
         names.join("\n"),
-        format!("目录, {total} 条目{}", if truncated { "(截断)" } else { "" }),
+        format!(
+            "目录, {total} 条目{}",
+            if truncated { "(截断)" } else { "" }
+        ),
     ))
 }
 
@@ -261,7 +264,10 @@ pub fn expand_mentions(text: &str, work_dir: &Path) -> ExpandOutcome {
 
     for m in mentions {
         if blocks.len() >= MAX_ATTACHMENTS {
-            missed.push(format!("{}(超过单轮 {} 个附件上限)", m.raw, MAX_ATTACHMENTS));
+            missed.push(format!(
+                "{}(超过单轮 {} 个附件上限)",
+                m.raw, MAX_ATTACHMENTS
+            ));
             continue;
         }
         let abs = resolve(work_dir, &m.path_text);

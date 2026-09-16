@@ -144,7 +144,8 @@ impl Tool for EditTool {
         if count == 0 {
             return Err(AgentError::ToolExecution {
                 tool: self.name().into(),
-                reason: "未找到匹配的 old_string;可能文件内容已变更,请先 Read 该文件确认内容。".into(),
+                reason: "未找到匹配的 old_string;可能文件内容已变更,请先 Read 该文件确认内容。"
+                    .into(),
             });
         }
         if count > 1 && !replace_all {

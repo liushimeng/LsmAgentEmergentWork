@@ -191,8 +191,19 @@ impl SystemPrompt {
     pub fn window_use() -> Self {
         Self::new(WINDOW_USE_BASE_PROMPT)
             .with_tools_hint(window_use_tools_hint())
-            .set_protocol_tail(crate::config::Protocol::Anthropic, WINDOW_USE_ANTHROPIC_TAIL)
+            .set_protocol_tail(
+                crate::config::Protocol::Anthropic,
+                WINDOW_USE_ANTHROPIC_TAIL,
+            )
             .set_protocol_tail(crate::config::Protocol::OpenAi, WINDOW_USE_OPENAI_TAIL)
+    }
+
+    /// 构造 Chromium-WebUse Agent 的系统提示词(浏览器操控层,第 11 角色)。
+    pub fn web_use() -> Self {
+        Self::new(WEB_USE_BASE_PROMPT)
+            .with_tools_hint(web_use_tools_hint())
+            .set_protocol_tail(crate::config::Protocol::Anthropic, WEB_USE_ANTHROPIC_TAIL)
+            .set_protocol_tail(crate::config::Protocol::OpenAi, WEB_USE_OPENAI_TAIL)
     }
 
     /// 构造 WorkFlow Agent 的系统提示词(工作流编排层,第 10 角色)。
@@ -244,6 +255,10 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
   向窗口输入/读取文本,如「帮我点一下记事本的保存按钮」「读取某软件窗口里的文本」)
   最低按 medium 档分类 —— 这类任务由 Main-Work 委派给 WindowUse 专项 Agent 执行,
   不得按 simple 直派 SubAgent-Work
+- ⚠️ 涉及「网页/浏览器操作」的任务(打开网址、浏览网页、网页登录、点击/输入/滚动页面、
+  网页截图、抓取页面信息、爬虫采集、查看 Console/Network/DOM,如「帮我打开 example.com 截图」
+  「抓取某网页的标题列表」)最低按 medium 档分类 —— 这类任务由 Main-Work 委派给
+  Chromium-WebUse 专项 Agent 执行,不得按 simple 直派 SubAgent-Work
 
 【hard 高等难度】
 - 涉及多个文件、多个模块的综合改动
@@ -602,7 +617,7 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 【Main-Work 单元】
 - workflows 结构是否完整(每个 wf 有 id/name/steps/depends_on/acceptance)
 - 依赖关系是否有循环
-- 每个 workflow 是否明确 delegate_to(subagent 通用执行 / windowuse 桌面窗口操控)
+- 每个 workflow 是否明确 delegate_to(subagent 通用执行 / windowuse 桌面窗口操控 / webuse 网页浏览器操控)
 - 验收标准是否可机器验证
 
 【Plan 单元】
@@ -791,7 +806,8 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 - Linux 等其他平台:无统一控件级接口,工具会返回不支持说明,此时如实报告并给出替代建议。
 
 作业规范(严格遵守):
-1. 先检视后操作:WindowList / WindowFind(按标题/进程名直接拿 id,推荐)→
+1. 先启动/检视后操作:目标应用未打开时 WindowOpen(推荐)→ WindowFind /
+   WindowList(按标题/进程名拿 id)→
    WindowInspect 看控件树(控件多时用小 max_depth + filter 缩小范围)→
    WindowAction 执行;若 WindowInspect 拿不到可读控件(Electron / canvas / 自绘),
    可用 WindowScreenshot 截图后视觉识别;
@@ -802,6 +818,8 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 5. 只读优先:能靠 WindowList / WindowInspect / get_text 回答的问题,不要做任何写操作;
 6. 窗口 UI 是动态的:一次任务内路径可能失效,失败时优先重新 WindowInspect 获取最新路径,
    不要重复完全相同的失败调用。
+7. 同一应用的连续操作(打开 → 搜索 → 选择 → 输入 → 确认)必须在一个单元内连续完成;
+   WindowOpen/Find 已返回 window_id 时直接复用,不要重复启动应用。
 
 完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
 
@@ -837,8 +855,10 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 fn window_use_tools_hint() -> &'static str {
     "工具调用规范:\n\
      - 工具参数需严格遵守给定 JSON Schema\n\
-     - 窗口操控按「WindowFind → WindowInspect → WindowAction」顺序使用;WindowList 用于全局枚举,WindowFind 用于按名称直查;无依赖的读取调用(WindowList / WindowFind / WindowInspect)可并行发出\n\n\
-     可用工具(共 6 个,与 builtin 严格对齐,缺则视为不可用):\n\
+     - 窗口操控按「WindowOpen(未启动时)→ WindowFind/WindowList → WindowInspect → WindowAction」顺序使用;无依赖的读取调用(WindowList / WindowFind / WindowInspect)可并行发出\n\n\
+     可用工具(共 8 个,与 builtin 严格对齐,缺则视为不可用):\n\
+     - WindowOpen(query, app_name?, bundle_id?, wait_seconds?): 启动/激活应用并等待窗口,\
+       返回 window_id、匹配别名、窗口前后数量与权限状态\n\
      - WindowList(filter?): 枚举可见顶层窗口,返回 id/title/进程/PID/位置尺寸\n\
      - WindowFind(title?, process?, match_mode?): 按标题/进程名查窗口,返回最佳匹配窗口的完整信息\n\
      - WindowInspect(window_id, max_depth?, filter?): 枚举窗口控件树,返回每个控件的 \
@@ -858,6 +878,70 @@ const WINDOW_USE_ANTHROPIC_TAIL: &str = "\
 
 const WINDOW_USE_OPENAI_TAIL: &str = "\
 [OpenAI 补充] 窗口/控件查询类无依赖工具调用请并行发出;操作类调用按依赖顺序逐个执行。";
+
+// =================== Chromium-WebUse Agent 提示词(第 11 角色,浏览器操控层) ===================
+
+/// Chromium-WebUse Agent 基础身份与职责说明。
+///
+/// 设计见 `docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md`。
+const WEB_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Chromium-WebUse,浏览器操控层的专项执行 Agent。
+
+你的核心职责:模拟人类操作浏览器——网页浏览、信息收集、爬虫采集、登录 Web 页面、
+点击/输入/滚动/截图、查看 Console/Network/DOM/localStorage 等,完成上层 Agent(Main-Work)
+委派给你的网页操控流程单元。Agent 集群中任何网页相关操作都由你执行。
+
+平台能力(由工具自动适配,你无需关心差异):
+- 浏览器检测:优先 Chrome,自动降级 Edge / Chromium / Brave;支持 Windows / macOS / Linux;
+- Firefox / Safari 不支持 CDP 协议,无法接入;
+- 默认使用「内存中的无头浏览器」(--headless=new,独立临时 profile,不干扰用户日常浏览器);
+- 也可通过 connect_url 接管用户已用 --remote-debugging-port 启动的浏览器。
+
+作业规范(严格遵守):
+1. 先开页后操作:BrowserNew 打开页面拿到 page_id → BrowserControl 执行动作 →
+   BrowserInspect 观察结果;page_id 是后续所有调用的句柄,务必保存;
+2. 元素定位一律用 CSS selector(+可选 nth);操作失败(code=2002)时换 selector 或换
+   input_text 的 use_js 路径重试,不要重复完全相同的失败调用;
+3. 点击链接 / window.open 派生新标签页时,响应会携带 spawned_page_id,
+   必须把它纳入你的页面索引,后续操作新页面用新 page_id;
+4. 错误码对策:1001 修正参数;2000 page_id 失效→重新 BrowserList 同步;2001 断连→重建页面;
+   2002 换 selector/路径重试;2003 页面崩溃→重建;3001 未安装浏览器→如实告知用户安装
+   Chrome/Edge/Chromium,并给出替代建议(不要假装成功);
+5. 截图优先用 save_path 落盘(返回文件路径),不要把大段 base64 当作回答内容;
+   DOM/outerHTML 提取注意 truncated 标记,被截断时缩小 selector 或 max_depth 分段提取;
+6. 安全红线:禁止对疑似支付/删除/确认提交类按钮做无把握点击;登录凭证只填入用户明确
+   提供的账号密码,不要编造;只读优先——能用 BrowserInspect 回答的问题不做任何写操作;
+7. 任务完成后用 BrowserClose 关闭不再需要的页面,释放内存。
+
+完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
+"#;
+
+fn web_use_tools_hint() -> &'static str {
+    "工具调用规范:\n\
+     - 工具参数需严格遵守给定 JSON Schema\n\
+     - 网页操控按「BrowserNew → BrowserControl/BrowserInspect → BrowserClose」顺序使用;\
+       无依赖的观察调用(BrowserInspect 各 info / BrowserList)可并行发出\n\n\
+     可用工具(共 6 个,与 builtin 严格对齐,缺则视为不可用):\n\
+     - BrowserNew(url, headless?, wait_until?, user_agent?, block_resources?, connect_url?): \
+       新建内存浏览器页面,返回 {page_id,title,final_url};connect_url 接管已开浏览器\n\
+     - BrowserList(): 列出存活页面 [{page_id,url,title,created_at}]\n\
+     - BrowserClose(page_id): 关闭页面(幂等);最后页面关闭时回收浏览器进程\n\
+     - BrowserControl(page_id, action, params): 写操作统一入口,action 枚举:\
+       click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/\
+       press_sequence/input_text/human_input/clear_input/upload_file/select_option/\
+       new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/\
+       set_storage/clear_storage/set_viewport/screenshot/heartbeat\n\
+     - BrowserInspect(page_id, info, params): 只读观察统一入口,info 枚举:\
+       console/network/elements/dom/localstorage/sessionstorage/cookies/screenshot/\
+       page_meta/viewport/url/title/ping\n\
+     - Read(file_path, offset?, limit?): 读取文本文件(理解任务上下文用),带行号\n\n\
+     返回信封:所有浏览器工具返回 {code,message,data} JSON;code=0 成功,非 0 按作业规范第 4 条处置。"
+}
+
+const WEB_USE_ANTHROPIC_TAIL: &str = "\
+[Anthropic 补充] 页面观察类无依赖工具调用请并行发出;页面操作类调用按依赖顺序逐个执行。";
+
+const WEB_USE_OPENAI_TAIL: &str = "\
+[OpenAI 补充] 页面观察类无依赖工具调用请并行发出;页面操作类调用按依赖顺序逐个执行。";
 
 #[cfg(test)]
 mod tests {
@@ -912,7 +996,7 @@ mod tests {
 
     #[test]
     fn all_nine_prompts_render_for_both_protocols() {
-        let builders: [fn() -> SystemPrompt; 10] = [
+        let builders: [fn() -> SystemPrompt; 11] = [
             SystemPrompt::yolo,
             SystemPrompt::plan,
             SystemPrompt::main_work,
@@ -923,6 +1007,7 @@ mod tests {
             SystemPrompt::compact,
             SystemPrompt::window_use,
             SystemPrompt::work_flow,
+            SystemPrompt::web_use,
         ];
         for f in builders {
             let sp = f();
@@ -935,17 +1020,30 @@ mod tests {
 
     #[test]
     fn each_prompt_mentions_own_agent_name() {
-        let cases: [(&str, fn() -> SystemPrompt); 10] = [
+        let cases: [(&str, fn() -> SystemPrompt); 11] = [
             ("LsmAgentEmergentWork-Yolo", SystemPrompt::yolo),
             ("LsmAgentEmergentWork-Plan", SystemPrompt::plan),
             ("LsmAgentEmergentWork-Main-Work", SystemPrompt::main_work),
-            ("LsmAgentEmergentWork-SubAgent-Work", SystemPrompt::sub_agent_work),
-            ("LsmAgentEmergentWork-Quality-Check", SystemPrompt::quality_check),
-            ("LsmAgentEmergentWork-SessionContext", SystemPrompt::session_context),
+            (
+                "LsmAgentEmergentWork-SubAgent-Work",
+                SystemPrompt::sub_agent_work,
+            ),
+            (
+                "LsmAgentEmergentWork-Quality-Check",
+                SystemPrompt::quality_check,
+            ),
+            (
+                "LsmAgentEmergentWork-SessionContext",
+                SystemPrompt::session_context,
+            ),
             ("LsmAgentEmergentWork-Debug", SystemPrompt::debug),
             ("LsmAgentEmergentWork-Compact", SystemPrompt::compact),
             ("LsmAgentEmergentWork-WindowUse", SystemPrompt::window_use),
             ("LsmAgentEmergentWork-WorkFlow", SystemPrompt::work_flow),
+            (
+                "LsmAgentEmergentWork-Chromium-WebUse",
+                SystemPrompt::web_use,
+            ),
         ];
         for (name, f) in cases {
             let rendered = f().render(Protocol::Anthropic);
@@ -961,6 +1059,7 @@ mod tests {
         let hint = window_use_tools_hint();
         // 6 个工具 + Bash(白名单) + Read 必须全部列在提示词里
         for tool in [
+            "WindowOpen",
             "WindowList",
             "WindowFind",
             "WindowInspect",
@@ -979,6 +1078,25 @@ mod tests {
             !hint.contains("列表 → 检视"),
             "WindowUse 工具提示词仍使用旧顺序『列表 → 检视 → 操作』,应改为 WindowFind 优先"
         );
+    }
+
+    /// 2026-09-16 第 61 轮:WebUse 工具提示词必须与注册表严格对齐。
+    #[test]
+    fn web_use_tools_hint_lists_all_tools() {
+        let hint = web_use_tools_hint();
+        for tool in [
+            "BrowserNew",
+            "BrowserList",
+            "BrowserClose",
+            "BrowserControl",
+            "BrowserInspect",
+            "Read",
+        ] {
+            assert!(
+                hint.contains(tool),
+                "WebUse 工具提示词必须列出 {tool};当前:\n{hint}"
+            );
+        }
     }
 }
 

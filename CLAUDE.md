@@ -57,6 +57,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
   - **Debug Agent**（`LsmAgentEmergentWork-Debug`）：调试层，仅在 `-debug` 调试模式下启用；任务结束后对采集的 trace（各 Agent LLM 调用输入输出 / Yolo 分类 / QC 结论 / 耗时与 token / 错误）做评估，产出「任务评估 / 质量报告 / 问题报告(P0-P2) / 优化建议」四章节；无工具。报告写入**根目录** `DebugReport/debug_report_{YYYYMMDD}_{HHMMSS}_{随机6位}.md`（已 gitignore，不入库）。设计见 `docs/Debug模式与DebugAgent设计/01-设计与解决方案.md`。
   - **Compact Agent**（`LsmAgentEmergentWork-Compact`）：压缩层（第 8 角色）；Session 主上下文估算 token（字符/4 +10%）达到当前 Provider `context_max_size` 的 80% 时由 Orchestrator 自动触发，按超出幅度自动选三档压缩率（Light ≤80% / Medium ≈50% / Aggressive ≤20%），LLM 摘要失败降级本地硬截断；保护带项目上下文/历史摘要/已压缩标记的消息与最近 4 条消息；无工具。**溢出兜底（reactive）**：估算可能低估（CJK 2-3 倍），真实溢出（Provider 返回 `prompt is too long` / `context_length_exceeded` 类 400）时由 Agent 循环自动三级恢复——排水（截短超长 tool_result）→ 折叠（历史合并为压缩摘要）→ 暴露（原错误上抛），见 `agent/overflow.rs`（一处包裹、8 角色全生效，全会话恢复预算 4 次）。设计见 `docs/Context设置与自动压缩设计/01-设计与解决方案.md`。
   - **WindowUse Agent**（`LsmAgentEmergentWork-WindowUse`）：桌面操控层（第 9 角色）；读取/操作电脑上的软件窗口——Windows 走 UI Automation（HWND 枚举 + 控件树遍历 + Invoke/Value Pattern，UIA 不可用时降级 SendMessage），macOS 走 Accessibility（AXUIElementRef，需「辅助功能」权限，未授权返回可读引导），Linux 等走 wmctrl/xdotool fallback（控件级 fail-closed 结构化报错）。工具集 Read + WindowList/WindowInspect/WindowAction（平台差异封闭在 `agent/window/` 驱动层）。委派链路：Yolo 把窗口操控类任务最低判 medium → Main-Work 拆 WorkFlow 时 `delegate_to="windowuse"` → `run_wf_unit` 路由到 `WindowUseRunner` → QC/SessionContext/Debug/取消/并行全链路复用。设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md`。
+  - **Chromium-WebUse Agent**(`LsmAgentEmergentWork-Chromium-WebUse`):浏览器操控层(第 11 角色);模拟人类操作浏览器——网页浏览/信息收集/爬虫/登录 Web 页面后的页面操作/截图/查看 Console·Network·DOM·localStorage 等,一切网页操作均委派给本角色。CDP 协议驱动(chromiumoxide),优先 Chrome 自动降级 Edge/Chromium/Brave(Firefox/Safari 不支持 CDP),支持 Windows/macOS/Linux;默认 `--headless=new` 内存无头浏览器 + 一次性 user-data-dir,也可 `connect_url` 接管带 `--remote-debugging-port` 的已开浏览器;未安装浏览器时返回结构化错误码 3001 + 安装引导(不崩溃)。工具集 Read + BrowserNew/BrowserList/BrowserClose/BrowserControl(写操作统一入口,action 枚举)/BrowserInspect(只读观察统一入口,info 枚举);page_id 不透明字符串注册表,派生标签页经 `spawned_page_id` 回传。委派链路:Yolo 把网页操控类任务最低判 medium → Main-Work 拆 WorkFlow 时 `delegate_to="webuse"` → `run_wf_unit` match 路由到 `WebUseRunner` → QC/SessionContext/Debug/取消/并行全链路复用。设计见 `docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md`。
   - 由 `MultiAgentOrchestrator` 总编排:用户输入 → 项目上下文注入 → Yolo 分类 → 简单档(SubAgent) / 中档(Main→SubAgent) / 高档(Plan→Main→SubAgent) → Quality-Check → SessionContext 收口。WorkFlow 执行时按 `depends_on` 自动 Kahn 分层(`main_work::topo_layers`),**同层无依赖的 SubAgent 自动并行**(tokio::spawn + Semaphore 上限 3,`OrchestratorConfig::max_parallel_workflows`),跨层严格串行、上游产物按层注入,失败语义与串行一致(fail-fast 回流 Yolo)。
 - **Agent-Context / Agent-Memory**：
   - **Agent-Context**：每个 Agent 独立的实时上下文(消息流 + 状态)，内存态，生命周期 = 当前单元。
@@ -102,6 +103,9 @@ agent/
   compact.rs   CompactRunner:token 估算 / 三档选档 / 自动压缩触发 / 硬截断降级 / 保护段识别
   window_use.rs WindowUseRunner(第 9 角色执行器,镜像 SubAgentRunner 结构)
   window/      窗口操控平台驱动层:mod.rs(模型+WindowDriver trait+工厂) / windows.rs(UIA+Win32) / macos.rs(AX) / fallback.rs(wmctrl/xdotool)
+  web_use.rs   WebUseRunner(第 11 角色执行器,镜像 WindowUseRunner 结构)
+  browser.rs   浏览器 CDP 驱动层:BrowserManager 单例(page_id 注册表 + 跨平台浏览器检测 + 引用计数关闭)
+  tools/browser.rs BrowserNew/BrowserList/BrowserClose/BrowserControl/BrowserInspect 五工具薄封装
   overflow.rs  上下文溢出检测(15+ provider 正则)+ 三级恢复(排水/折叠/暴露)
   project_context.rs 项目说明文件五级链发现 + README 自动生成 + 每会话首次注入(幂等标记)
   session_fork.rs 对话 Rewind 轮次扫描(D3):合成消息识别 + 截断边界(供 /rewind /undo /fork /switch)
@@ -210,6 +214,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/自动化测试-提示词文件列表/` — 10 维度 × 100 组多轮对话测试脚本(知识问答/编码/代码理解/调试/文件处理/电脑使用/软件使用/界面设计/文档规划/laew 元任务),每条 3~5 轮追问,标注预期档位(simple/medium/hard),用于人工/自动化回归与 Yolo 分类验证
 - `docs/Debug模式与DebugAgent设计/` — `-debug` 调试模式与 Debug Agent(第 7 角色):trace 采集 / LLM 装饰器 / DebugReport 报告生成 设计与解决方案
 - `docs/WindowUse桌面窗口操控Agent/` — WindowUse Agent(第 9 角色)桌面窗口操控:统一 WindowDriver 抽象 + Windows UIA / macOS AX / fallback 三后端 + delegate_to=windowuse 委派路由(01-设计与解决方案;prompts/ 测试提示词)
+- `docs/浏览器CDP工具/` — Chromium-WebUse Agent(第 11 角色)浏览器操控:chromiumoxide CDP 选型 + 内存无头浏览器 + page_id 会话管理 + BrowserControl/BrowserInspect 写读对偶工具面(01~03 前置调研 / 04-设计与解决方案)
 - `docs/Context设置与自动压缩设计/` — ContextMaxSize 上下文上限(默认 800K,DB 迁移自动补全)+ Compact Agent(第 8 角色)三档自动压缩 设计与解决方案
 - `docs/工作区感知与运行时环境注入/` — D4 工作区感知:懒刷新快照(git 分支/变更计数/工程类型与工具链建议/顶层结构/最近改动)+ 8 角色 system brief + PROJECT_CONTEXT 工作区段 + TUI 横幅·`/workspace`·任务后变更对比
 - `docs/自签名证书TLS适配/` — IP + 自签名证书 HTTPS 网关适配:TLS 三级校验策略(IP 自动放宽 / LAEW_TLS_INSECURE 全局开关)、跨平台一致性(rustls)、真实端点集成验证(tests/tls_self_signed.rs)

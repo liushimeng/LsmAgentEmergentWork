@@ -162,7 +162,10 @@ impl TuiSession {
         println!("║  项目说明: {} ║", fit_display(doc_source.as_str(), 45));
         // 工作区感知(D4,2026-09-13):工程类型 + git 分支/变更,与注入给模型的一致
         let ws = crate::agent::workspace::snapshot(&self.paths.work_dir);
-        println!("║  工作区 : {} ║", fit_display(&Self::workspace_status_line(&ws), 45));
+        println!(
+            "║  工作区 : {} ║",
+            fit_display(&Self::workspace_status_line(&ws), 45)
+        );
         match active {
             Some(r) => println!(
                 "║  当前模型: {} ║",
@@ -242,7 +245,10 @@ impl TuiSession {
                     .last_network_error_kind
                     .as_deref()
                     .unwrap_or("网络不稳");
-                format!("Degraded ⚠ ({kind}, {} 次)", snap.consecutive_network_errors)
+                format!(
+                    "Degraded ⚠ ({kind}, {} 次)",
+                    snap.consecutive_network_errors
+                )
             }
             Connectivity::Offline => {
                 let queued = queue.len();

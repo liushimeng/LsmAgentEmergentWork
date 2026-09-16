@@ -709,10 +709,9 @@ impl InputHandler {
                                 && completion_active
                                 && mention.token_start.is_some()
                             {
-                                if let (Some(start), Some(item)) = (
-                                    mention.token_start,
-                                    completion_items.get(completion_index),
-                                ) {
+                                if let (Some(start), Some(item)) =
+                                    (mention.token_start, completion_items.get(completion_index))
+                                {
                                     let drill = item.replacement.ends_with('/');
                                     let rep = item.replacement.clone();
                                     // start 指向 `@` 本身。第二十八轮修订:replacement 已含 `@` 前缀,
@@ -785,11 +784,8 @@ impl InputHandler {
                                     cursor = buffer.len();
                                     completion_active = false;
                                     completion_items.clear();
-                                    overlay_lines = self.clear_overlay(
-                                        &mut stdout,
-                                        &layout,
-                                        overlay_lines,
-                                    )?;
+                                    overlay_lines =
+                                        self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
                                     self.redraw_line(
                                         &mut stdout,
                                         &layout,
@@ -1401,7 +1397,10 @@ mod tests {
     #[test]
     fn large_paste_by_lines_gets_marker() {
         let mut reg = PasteRegistry::new();
-        let text = (1..=11).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let text = (1..=11)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         match handle_paste_text(&text, &mut reg) {
             PasteInsert::Marker(m) => assert_eq!(m, "[粘贴 #1 +11 行]"),
             PasteInsert::Inline(_) => panic!("11 行应转 marker"),
@@ -1479,7 +1478,10 @@ mod tests {
         // Tab + buffer 是补全项真前缀 → AcceptOnly(只补全,不提交,符合 Tab 传统语义)
         let items = items(vec!["/provider list"]);
         let d = completion_enter_tab_decision(KeyCode::Tab, "/provider", true, &items, 0);
-        assert_eq!(d, CompletionDecision::AcceptOnly("/provider list".to_string()));
+        assert_eq!(
+            d,
+            CompletionDecision::AcceptOnly("/provider list".to_string())
+        );
     }
 
     #[test]
@@ -1509,7 +1511,10 @@ mod tests {
         // 路径 A 容错:buffer 末尾有空格时,trim 后与 replacement 相等 → 提交 buffer
         let items = items(vec!["/provider list"]);
         let d = completion_enter_tab_decision(KeyCode::Enter, "/provider list  ", true, &items, 0);
-        assert_eq!(d, CompletionDecision::Submit("/provider list  ".to_string()));
+        assert_eq!(
+            d,
+            CompletionDecision::Submit("/provider list  ".to_string())
+        );
     }
 
     #[test]

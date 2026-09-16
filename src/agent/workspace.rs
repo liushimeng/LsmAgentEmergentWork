@@ -98,7 +98,12 @@ const PROJECT_KINDS: [(&str, &[&str], &str, &str); 11] = [
         "ctest --test-dir build",
     ),
     ("Ruby", &["Gemfile"], "bundle install", "bundle exec rspec"),
-    ("PHP", &["composer.json"], "composer install", "composer test"),
+    (
+        "PHP",
+        &["composer.json"],
+        "composer install",
+        "composer test",
+    ),
     (
         "容器",
         &["Dockerfile", "docker-compose.yml", "compose.yaml"],
@@ -210,7 +215,11 @@ impl WorkspaceSnapshot {
     /// 建议命令: 构建 `cargo build` / 测试 `cargo test` | 平台: linux/x86_64 | 日期: 2026-09-13
     /// ```
     pub fn brief(&self) -> String {
-        let mut line1 = format!("工作区: {} | 工程: {}", self.work_dir.display(), self.project_label());
+        let mut line1 = format!(
+            "工作区: {} | 工程: {}",
+            self.work_dir.display(),
+            self.project_label()
+        );
         if self.is_git {
             let branch = self.branch.as_deref().unwrap_or("?");
             let head = self
@@ -242,9 +251,14 @@ impl WorkspaceSnapshot {
         let mut out = String::new();
         out.push_str("### 工作区快照(系统自动采集)\n");
         out.push_str(&format!("- 工作目录: {}\n", self.work_dir.display()));
-        out.push_str(&format!("- 平台 / 日期: {} / {}\n", self.platform, self.today));
+        out.push_str(&format!(
+            "- 平台 / 日期: {} / {}\n",
+            self.platform, self.today
+        ));
         if self.projects.is_empty() {
-            out.push_str("- 工程类型: 未识别(无 Cargo.toml / package.json / pyproject.toml 等标记文件)\n");
+            out.push_str(
+                "- 工程类型: 未识别(无 Cargo.toml / package.json / pyproject.toml 等标记文件)\n",
+            );
         } else {
             for p in &self.projects {
                 out.push_str(&format!(
@@ -298,7 +312,9 @@ impl WorkspaceSnapshot {
                 out.push_str(&format!("  - {} ({})\n", f.path, f.age_text()));
             }
         }
-        out.push_str("- 说明: 以上为系统自动采集的工作区状态,可能略滞后于磁盘;涉及精确状态请用工具核对。\n");
+        out.push_str(
+            "- 说明: 以上为系统自动采集的工作区状态,可能略滞后于磁盘;涉及精确状态请用工具核对。\n",
+        );
         truncate_chars(out, MAX_SECTION_CHARS)
     }
 }
@@ -533,7 +549,10 @@ fn parse_status(out: &str) -> (Option<String>, usize, usize, usize, Vec<String>)
 fn parse_branch(s: &str) -> String {
     let s = s.trim();
     if s.starts_with("No commits yet on ") {
-        return s.trim_start_matches("No commits yet on ").trim().to_string();
+        return s
+            .trim_start_matches("No commits yet on ")
+            .trim()
+            .to_string();
     }
     if s.starts_with("HEAD (no branch)") {
         return "HEAD (分离)".to_string();
@@ -721,8 +740,7 @@ pub fn run_capture(
 
 /// 本地日期 `YYYY-MM-DD`(本地时区不可用时退化为 UTC)。
 pub fn today_local() -> String {
-    let now = time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     format!(
         "{:04}-{:02}-{:02}",
         now.year(),
@@ -941,7 +959,12 @@ mod tests {
     fn run_with_timeout_kills_on_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let start = Instant::now();
-        let out = run_with_timeout("sh", &["-c", "sleep 5"], dir.path(), Duration::from_millis(150));
+        let out = run_with_timeout(
+            "sh",
+            &["-c", "sleep 5"],
+            dir.path(),
+            Duration::from_millis(150),
+        );
         assert!(out.is_none(), "超时应返回 None");
         assert!(
             start.elapsed() < Duration::from_secs(3),
@@ -997,7 +1020,8 @@ mod tests {
         snap.branch = Some("main".to_string());
         snap.head = Some("abcdef1".to_string());
         for i in 0..200 {
-            snap.recent_commits.push(format!("{i:07} 很长的提交标题用于触发截断保护"));
+            snap.recent_commits
+                .push(format!("{i:07} 很长的提交标题用于触发截断保护"));
         }
         let section = snap.render_section();
         assert!(section.contains("已截断"), "超限应截断并注明");

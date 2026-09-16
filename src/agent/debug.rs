@@ -931,8 +931,8 @@ mod tests {
             seq: 1,
             started_at: "2026-09-09 00:00:00".into(),
             duration_ms: 10,
-            input_summary:
-                "<<<LAEW:RUNTIME_HINTS>>> truncation_resumes=1 overflow_recoveries=1".into(),
+            input_summary: "<<<LAEW:RUNTIME_HINTS>>> truncation_resumes=1 overflow_recoveries=1"
+                .into(),
             message_count: 1,
             tool_count: 0,
             output_summary: "完成".into(),
@@ -1001,7 +1001,9 @@ mod tests {
     #[test]
     fn detect_mock_provider_recognizes_mock_and_private_endpoint() {
         // mock 字样
-        assert!(detect_mock_provider("[anthropic] mockTest/claude-mock @ http://127.0.0.1:18930"));
+        assert!(detect_mock_provider(
+            "[anthropic] mockTest/claude-mock @ http://127.0.0.1:18930"
+        ));
         assert!(detect_mock_provider("Mock Provider Test"));
         assert!(detect_mock_provider("MOCK"));
         // 私有端点:非 mock 模型 → LocalReal(本地网关,真实模型)

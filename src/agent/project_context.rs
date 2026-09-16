@@ -114,9 +114,7 @@ pub fn load(work_dir: &Path) -> ProjectContext {
 
     let source = probe(work_dir);
     match source {
-        ProjectDocSource::ClaudeMd
-        | ProjectDocSource::AgentsMd
-        | ProjectDocSource::ReadMe => {
+        ProjectDocSource::ClaudeMd | ProjectDocSource::AgentsMd | ProjectDocSource::ReadMe => {
             let path = work_dir.join(ctx_source_name(&source));
             if let Some(raw) = read_non_empty(&path) {
                 ctx.source = source;
@@ -124,21 +122,19 @@ pub fn load(work_dir: &Path) -> ProjectContext {
                 ctx.content = truncate_chars(&raw, MAX_CONTEXT_CHARS);
             }
         }
-        ProjectDocSource::GeneratedReadme => {
-            match generate_readme(work_dir) {
-                Ok(Some(path)) => {
-                    if let Some(raw) = read_non_empty(&path) {
-                        ctx.source = ProjectDocSource::GeneratedReadme;
-                        ctx.path = Some(path);
-                        ctx.content = truncate_chars(&raw, MAX_CONTEXT_CHARS);
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(work_dir = %work_dir.display(), error = %e, "自动生成 README.md 失败,项目上下文为空");
+        ProjectDocSource::GeneratedReadme => match generate_readme(work_dir) {
+            Ok(Some(path)) => {
+                if let Some(raw) = read_non_empty(&path) {
+                    ctx.source = ProjectDocSource::GeneratedReadme;
+                    ctx.path = Some(path);
+                    ctx.content = truncate_chars(&raw, MAX_CONTEXT_CHARS);
                 }
             }
-        }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(work_dir = %work_dir.display(), error = %e, "自动生成 README.md 失败,项目上下文为空");
+            }
+        },
         ProjectDocSource::None => {}
     }
 
@@ -179,7 +175,8 @@ pub fn build_message(ctx: &ProjectContext) -> Option<ChatMessage> {
              - 发现规则: CLAUDE.md > AGENTS.md > README.md > 根目录 Markdown 自动生成\n"
         )
     } else {
-        "- 说明文件: (未发现 CLAUDE.md / AGENTS.md / README.md,以下为工作区自动采集信息)\n".to_string()
+        "- 说明文件: (未发现 CLAUDE.md / AGENTS.md / README.md,以下为工作区自动采集信息)\n"
+            .to_string()
     };
     let doc_body = if has_doc {
         format!(
@@ -494,7 +491,10 @@ mod tests {
         assert!(readme.is_file(), "README.md 应已落盘");
 
         let generated = fs::read_to_string(&readme).unwrap();
-        assert!(generated.contains("laew:auto-generated"), "应含自动生成标记");
+        assert!(
+            generated.contains("laew:auto-generated"),
+            "应含自动生成标记"
+        );
         assert!(generated.contains("架构总览"), "应含文档标题");
         assert!(generated.contains("架构说明.md"), "应含来源文件名");
         assert!(generated.contains("双 Agent 架构"), "应含摘要");
@@ -585,7 +585,14 @@ mod tests {
         let (title, summary, outline) = analyze_markdown(content, "fallback.md");
         assert_eq!(title, "标题一");
         assert_eq!(summary, "第一段摘要内容。");
-        assert_eq!(outline, vec!["# 标题一".to_string(), "## 小节A".to_string(), "### 小节B".to_string()]);
+        assert_eq!(
+            outline,
+            vec![
+                "# 标题一".to_string(),
+                "## 小节A".to_string(),
+                "### 小节B".to_string()
+            ]
+        );
 
         // 无一级标题 → 用文件名兜底;列表行不作摘要
         let content2 = "- 列表第一行\n\n普通段落。";

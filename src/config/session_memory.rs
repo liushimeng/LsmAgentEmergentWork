@@ -123,7 +123,11 @@ impl Db {
     }
 
     /// 列出指定 session 的最近 N 条(按 seq DESC)。
-    pub fn list_session_memory(&self, session_id: &str, limit: usize) -> Result<Vec<SessionMemoryRow>> {
+    pub fn list_session_memory(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMemoryRow>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, session_id, seq, role, event_type, content, usage_input, usage_output, created_at
@@ -166,6 +170,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMemoryRow> 
         "user" => AgentRole::SessionContext, // user 消息也归到 session
         "compact" => AgentRole::Compact,
         "windowuse" => AgentRole::WindowUse,
+        "webuse" => AgentRole::WebUse,
         other => {
             return Err(rusqlite::Error::InvalidColumnType(
                 3,

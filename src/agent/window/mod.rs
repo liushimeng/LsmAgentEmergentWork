@@ -6,7 +6,8 @@
 //!   (`CoCreateInstance(CUIAutomation)` + TreeWalker 控件树遍历 +
 //!   Invoke/Value Pattern 操作),`EnumWindows` 枚举 HWND 顶层窗口,
 //!   UIA 不可用时降级 `SendMessageW`(BM_CLICK / WM_SETTEXT / WM_GETTEXT);
-//! - **macOS**(默认 `macos_axui.rs`,`LAEW_MACOS_DRIVER=legacy` 切到 `macos_legacy.rs`):
+//! - **macOS**(默认 `macos_legacy.rs`;启用 `macos-axui` feature 时走 `macos_axui.rs`,
+//!   `LAEW_MACOS_DRIVER=legacy` 强制回退):
 //!   Accessibility API(`AXUIElementRef` / `axuielement = "0.9"` typed accessor),
 //!   `CGWindowListCopyWindowInfo` 枚举窗口,
 //!   `AXIsProcessTrustedWithOptions` 权限检测(默认不弹窗,`LAEW_AX_PROMPT=1` 放开);
@@ -19,9 +20,9 @@ use serde::Serialize;
 
 use crate::error::{AgentError, Result};
 
-#[cfg(all(target_os = "macos", feature = "macos-legacy"))]
+#[cfg(all(target_os = "macos", feature = "macos-axui"))]
 mod macos_axui;
-#[cfg(all(target_os = "macos", feature = "macos-legacy"))]
+#[cfg(all(target_os = "macos", feature = "macos-axui"))]
 use macos_axui::MacosAxuiDriver as DefaultMacosDriver;
 #[cfg(target_os = "macos")]
 mod macos_legacy;
@@ -140,7 +141,12 @@ pub trait WindowDriver: Send + Sync {
     ///
     /// - `max_depth`:遍历深度(1 = 仅根窗口本身,2 = 含直接子控件,依此类推);
     /// - `filter`:名称/角色子串过滤,命中节点的祖先链保留,其余子树剪枝。
-    fn inspect(&self, window_id: &str, max_depth: usize, filter: Option<&str>) -> Result<ControlNode>;
+    fn inspect(
+        &self,
+        window_id: &str,
+        max_depth: usize,
+        filter: Option<&str>,
+    ) -> Result<ControlNode>;
 
     /// 对 `path` 定位的控件执行操作,返回操作结果(get_text 返回读到的文本)。
     fn act(&self, window_id: &str, path: &str, action: ControlAction) -> Result<String>;
@@ -151,11 +157,8 @@ pub trait WindowDriver: Send + Sync {
 
 /// 构造当前平台的窗口驱动。
 ///
-/// 2026-09-16 第 58 轮 P2-D:macOS 默认走 core-foundation 手写 FFI(macos_legacy.rs);
-/// `LAEW_MACOS_DRIVER=axui` 切到 axuielement typed API(macos_axui.rs,需 cargo feature macos-legacy)。
-/// 仅 macOS 平台有此分支,Windows / 其他平台行为不变。
-/// 注:axuielement 0.9 走 Swift 桥接,需要 macOS 13+ SDK 与 Xcode 完整工具链;
-/// 工具链不全时编译 axui 模块会链接失败,本平台默认走 legacy 是稳定选择。
+/// 2026-09-16 第 61 轮:默认走稳定的 core-foundation FFI(macos_legacy.rs);
+/// 完整 Xcode 工具链可用 `--features macos-axui` 切到 axuielement typed API。
 pub fn current_driver() -> Box<dyn WindowDriver> {
     #[cfg(windows)]
     {
@@ -163,26 +166,20 @@ pub fn current_driver() -> Box<dyn WindowDriver> {
     }
     #[cfg(target_os = "macos")]
     {
-        let want_axui = std::env::var("LAEW_MACOS_DRIVER")
-            .map(|v| v == "axui")
+        let want_legacy = std::env::var("LAEW_MACOS_DRIVER")
+            .map(|v| v.eq_ignore_ascii_case("legacy"))
             .unwrap_or(false);
-        #[cfg(feature = "macos-legacy")]
+        #[cfg(feature = "macos-axui")]
         {
-            if want_axui {
-                Box::new(DefaultMacosDriver::new())
-            } else {
+            if want_legacy {
                 Box::new(LegacyMacosDriver::new())
+            } else {
+                Box::new(DefaultMacosDriver::new())
             }
         }
-        #[cfg(not(feature = "macos-legacy"))]
+        #[cfg(not(feature = "macos-axui"))]
         {
-            // 未启用 axui feature 时强制走 legacy;want_axui 仅给警告,避免编译错
-            if want_axui {
-                eprintln!(
-                    "[laew] LAEW_MACOS_DRIVER=axui 但未启用 macos-legacy feature,回退 legacy"
-                );
-            }
-            let _ = want_axui;
+            let _ = want_legacy;
             Box::new(LegacyMacosDriver::new())
         }
     }
@@ -270,9 +267,18 @@ mod tests {
 
     #[test]
     fn control_action_parse_aliases() {
-        assert_eq!(ControlAction::parse("click", None).unwrap(), ControlAction::Click);
-        assert_eq!(ControlAction::parse("CLICK", None).unwrap(), ControlAction::Click);
-        assert_eq!(ControlAction::parse("focus", None).unwrap(), ControlAction::Focus);
+        assert_eq!(
+            ControlAction::parse("click", None).unwrap(),
+            ControlAction::Click
+        );
+        assert_eq!(
+            ControlAction::parse("CLICK", None).unwrap(),
+            ControlAction::Click
+        );
+        assert_eq!(
+            ControlAction::parse("focus", None).unwrap(),
+            ControlAction::Focus
+        );
         assert_eq!(
             ControlAction::parse("set_text", Some("hi".into())).unwrap(),
             ControlAction::SetText("hi".into())
@@ -281,12 +287,18 @@ mod tests {
             ControlAction::parse("input", Some("x".into())).unwrap(),
             ControlAction::SetText("x".into())
         );
-        assert_eq!(ControlAction::parse("get-text", None).unwrap(), ControlAction::GetText);
+        assert_eq!(
+            ControlAction::parse("get-text", None).unwrap(),
+            ControlAction::GetText
+        );
         assert_eq!(
             ControlAction::parse("send_keys", Some("Enter".into())).unwrap(),
             ControlAction::SendKeys("Enter".into())
         );
-        assert_eq!(ControlAction::parse("invoke", None).unwrap(), ControlAction::Invoke);
+        assert_eq!(
+            ControlAction::parse("invoke", None).unwrap(),
+            ControlAction::Invoke
+        );
         assert!(ControlAction::parse("set_text", None).is_err());
         assert!(ControlAction::parse("send_keys", None).is_err());
         assert!(ControlAction::parse("explode", None).is_err());

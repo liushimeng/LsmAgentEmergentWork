@@ -16,7 +16,9 @@ impl Protocol {
         match s.to_ascii_lowercase().as_str() {
             "anthropic" => Ok(Protocol::Anthropic),
             "openai" => Ok(Protocol::OpenAi),
-            other => Err(crate::database::ConfigError::InvalidProtocol(other.to_string())),
+            other => Err(crate::database::ConfigError::InvalidProtocol(
+                other.to_string(),
+            )),
         }
     }
 
@@ -57,10 +59,9 @@ pub fn parse_context_size(s: &str) -> std::result::Result<u64, String> {
         Some(b'm') | Some(b'M') => (&t[..t.len() - 1], 1_000_000u64),
         _ => (t, 1u64),
     };
-    let n: u64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| format!("无效的 context_max_size: '{s}'(支持 800000 / 800K / 1M,0 表示不限制)"))?;
+    let n: u64 = digits.trim().parse().map_err(|_| {
+        format!("无效的 context_max_size: '{s}'(支持 800000 / 800K / 1M,0 表示不限制)")
+    })?;
     Ok(n.saturating_mul(mult))
 }
 

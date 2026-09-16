@@ -437,26 +437,27 @@ async fn run_one_shot(
                 reason_short.chars().take(80).collect::<String>(),
                 wallclock_ms as f64 / 1000.0,
             );
-            let stub_workflow = last_trace.as_ref().map(|t| {
-                lsm_agent::agent::orchestrator::WorkflowResult {
-                    id: "wf-1".into(),
-                    name: "失败单元".into(),
-                    subflow_outcome: String::new(),
-                    quality_report: lsm_agent::agent::quality::QualityReport {
-                        verdict: lsm_agent::agent::quality::Verdict::Fail,
-                        issues: vec![reason.clone()],
-                        suggestion: suggestion.clone(),
-                        retryable: false,
-                        source: lsm_agent::agent::context::AgentRole::SubAgent,
-                        evidence: String::new(),
-                    },
-                    usage: lsm_agent::llm::Usage::default(),
-                    subflow_trace: Some(t.as_ref().clone()),
-                    exec_role: lsm_agent::agent::context::AgentRole::SubAgent,
-                    wallclock_ms: 0,
-                    qc_wallclock_ms: 0,
-                }
-            });
+            let stub_workflow =
+                last_trace
+                    .as_ref()
+                    .map(|t| lsm_agent::agent::orchestrator::WorkflowResult {
+                        id: "wf-1".into(),
+                        name: "失败单元".into(),
+                        subflow_outcome: String::new(),
+                        quality_report: lsm_agent::agent::quality::QualityReport {
+                            verdict: lsm_agent::agent::quality::Verdict::Fail,
+                            issues: vec![reason.clone()],
+                            suggestion: suggestion.clone(),
+                            retryable: false,
+                            source: lsm_agent::agent::context::AgentRole::SubAgent,
+                            evidence: String::new(),
+                        },
+                        usage: lsm_agent::llm::Usage::default(),
+                        subflow_trace: Some(t.as_ref().clone()),
+                        exec_role: lsm_agent::agent::context::AgentRole::SubAgent,
+                        wallclock_ms: 0,
+                        qc_wallclock_ms: 0,
+                    });
             let stub_result = lsm_agent::agent::orchestrator::TaskResult {
                 goal: classification.goal_summary.clone(),
                 classification: classification.clone(),
@@ -469,11 +470,8 @@ async fn run_one_shot(
                 layer_log: vec![],
                 wallclock_ms,
             };
-            let detail = lsm_agent::tui::format::format_failed_detail(
-                &stub_result,
-                &reason,
-                &suggestion,
-            );
+            let detail =
+                lsm_agent::tui::format::format_failed_detail(&stub_result, &reason, &suggestion);
             println!("{detail}");
             // F4(2026-09-10 第 25 轮):先呈现真实失败原因,再给建议
             if reason.is_empty() {
@@ -812,16 +810,15 @@ fn unwrap_msys_slash_arg(input: &str) -> std::borrow::Cow<'_, str> {
                     if matches!(seg, "diff") {
                         // 切掉 `X:/.../<cmd>` 之前的所有内容,补回 `/<cmd>`
                         let after_seg = &trimmed_rest[seg.len()..];
-                        return std::borrow::Cow::Owned(format!(
-                            "/{seg}{}",
-                            after_seg
-                        ));
+                        return std::borrow::Cow::Owned(format!("/{seg}{}", after_seg));
                     }
                     // 否则这一段是路径目录(如 `Program Files/Git`),
                     // 继续往后看;但要跳过本段及紧随的分隔符或空白
                     if seg_end < trimmed_rest.len() {
                         let after_seg = &trimmed_rest[seg_end..];
-                        rest = after_seg.trim_start_matches(|c: char| c == '/' || c == '\\' || c.is_whitespace());
+                        rest = after_seg.trim_start_matches(|c: char| {
+                            c == '/' || c == '\\' || c.is_whitespace()
+                        });
                     } else {
                         break;
                     }

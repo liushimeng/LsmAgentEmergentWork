@@ -110,11 +110,15 @@ mod tests {
         let report = apply_pragmas(&conn).unwrap();
         // 本地 tmpfs/ext4 上 WAL 必然成功;若 CI 文件系统不支持,断言读回一致性即可
         if report.wal_enabled {
-            let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(mode.to_ascii_lowercase(), "wal");
         }
         assert_eq!(report.busy_timeout_ms, BUSY_TIMEOUT_MS);
-        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(sync, 1, "synchronous 应为 NORMAL(1)");
     }
 

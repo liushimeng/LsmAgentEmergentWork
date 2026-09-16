@@ -43,15 +43,9 @@ pub enum MessagePayload {
         content: String,
     },
     /// Main-Work → WindowUse:「请操作这个窗口」。
-    WindowFocus {
-        window_id: String,
-        reason: String,
-    },
+    WindowFocus { window_id: String, reason: String },
     /// 通用数据传递。
-    Data {
-        key: String,
-        value: String,
-    },
+    Data { key: String, value: String },
 }
 
 impl AgentMessage {
@@ -92,6 +86,7 @@ impl AgentMessage {
             AgentRole::SessionContext => "SessionContext",
             AgentRole::Compact => "Compact",
             AgentRole::WindowUse => "WindowUse",
+            AgentRole::WebUse => "WebUse",
             AgentRole::WorkFlow => "WorkFlow",
         }
     }
@@ -127,12 +122,12 @@ impl AgentMessage {
                     ""
                 };
                 match target_window_id {
-                    Some(wid) => format!(
-                        "[来自 {from}] 请把以下内容写入窗口 id={wid}:\n{preview}{suffix}"
-                    ),
-                    None => format!(
-                        "[来自 {from}] 请把以下内容写入合适的目标窗口:\n{preview}{suffix}"
-                    ),
+                    Some(wid) => {
+                        format!("[来自 {from}] 请把以下内容写入窗口 id={wid}:\n{preview}{suffix}")
+                    }
+                    None => {
+                        format!("[来自 {from}] 请把以下内容写入合适的目标窗口:\n{preview}{suffix}")
+                    }
                 }
             }
             MessagePayload::WindowFocus { window_id, reason } => {
@@ -164,7 +159,9 @@ impl AgentMessageManager {
 
     /// 发送(持久化)一条 Agent 消息。
     pub async fn send(&self, msg: &AgentMessage) -> crate::error::Result<()> {
-        self.db.insert_agent_message(msg).map_err(crate::error::AgentError::from)
+        self.db
+            .insert_agent_message(msg)
+            .map_err(crate::error::AgentError::from)
     }
 
     /// 查看(to_role 指定角色)未消费的消息(不标记消费,仅预览)。
@@ -185,12 +182,16 @@ impl AgentMessageManager {
 
     /// 标记指定消息为已消费。
     pub async fn mark_consumed(&self, msg_id: &str) -> crate::error::Result<()> {
-        self.db.mark_agent_message_consumed(msg_id).map_err(crate::error::AgentError::from)
+        self.db
+            .mark_agent_message_consumed(msg_id)
+            .map_err(crate::error::AgentError::from)
     }
 
     /// 清理指定 session 的全部消息(Session 结束时调用)。
     pub async fn clear_session(&self, session_id: &str) -> crate::error::Result<()> {
-        self.db.clear_agent_messages(session_id).map_err(crate::error::AgentError::from)
+        self.db
+            .clear_agent_messages(session_id)
+            .map_err(crate::error::AgentError::from)
     }
 }
 

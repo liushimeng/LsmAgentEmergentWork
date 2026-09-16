@@ -46,7 +46,9 @@ pub fn is_synthetic_user_message(msg: &ChatMessage) -> bool {
         return false;
     }
     match first_text(msg) {
-        Some(text) => text.contains(LAEW_MARKER_PREFIX) || text.starts_with(PREVIOUS_FAILURE_PREFIX),
+        Some(text) => {
+            text.contains(LAEW_MARKER_PREFIX) || text.starts_with(PREVIOUS_FAILURE_PREFIX)
+        }
         None => false,
     }
 }

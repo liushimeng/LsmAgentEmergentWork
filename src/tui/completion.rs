@@ -61,10 +61,20 @@ impl CompletionEngine {
             SlashCommand::builtin("clear", &["c"], "清空对话历史并开启新会话", "/clear"),
             SlashCommand::builtin("new", &["n"], "开启新会话(同 /clear)", "/new"),
             SlashCommand::builtin("model", &[], "显示当前使用的模型", "/model"),
-            SlashCommand::builtin("export", &[], "导出当前会话为 Markdown/JSON", "/export [path]"),
+            SlashCommand::builtin(
+                "export",
+                &[],
+                "导出当前会话为 Markdown/JSON",
+                "/export [path]",
+            ),
             SlashCommand::builtin("commands", &[], "列出可用的自定义斜杠命令", "/commands"),
             SlashCommand::builtin("provider", &["p"], "管理大模型接入记录", "/provider <sub>"),
-            SlashCommand::builtin("provider list", &["provider ls"], "列出所有接入记录", "/provider list"),
+            SlashCommand::builtin(
+                "provider list",
+                &["provider ls"],
+                "列出所有接入记录",
+                "/provider list",
+            ),
             SlashCommand::builtin("provider add", &[], "交互式新增接入记录", "/provider add"),
             SlashCommand::builtin("provider use", &[], "切换当前模型", "/provider use <id>"),
             SlashCommand::builtin(
@@ -95,19 +105,9 @@ impl CompletionEngine {
                 "列出轮次或回退到第 N 轮之前(原对话自动存分支)",
                 "/rewind [N]",
             ),
-            SlashCommand::builtin(
-                "undo",
-                &[],
-                "撤销最后一轮对话(等价 /rewind 末轮)",
-                "/undo",
-            ),
+            SlashCommand::builtin("undo", &[], "撤销最后一轮对话(等价 /rewind 末轮)", "/undo"),
             SlashCommand::builtin("fork", &[], "从当前对话分叉出新会话", "/fork"),
-            SlashCommand::builtin(
-                "branches",
-                &["branch"],
-                "列出已保存的对话分支",
-                "/branches",
-            ),
+            SlashCommand::builtin("branches", &["branch"], "列出已保存的对话分支", "/branches"),
             SlashCommand::builtin(
                 "switch",
                 &[],
@@ -115,12 +115,7 @@ impl CompletionEngine {
                 "/switch <name>",
             ),
             // D13 离线模式(2026-09-11):连接状态查看
-            SlashCommand::builtin(
-                "offline",
-                &["status"],
-                "查看连接状态与离线队列",
-                "/offline",
-            ),
+            SlashCommand::builtin("offline", &["status"], "查看连接状态与离线队列", "/offline"),
             // D4 工作区感知(2026-09-13):环境快照查看
             SlashCommand::builtin(
                 "workspace",
@@ -129,7 +124,10 @@ impl CompletionEngine {
                 "/workspace [refresh]",
             ),
         ];
-        Self { builtin, custom: Vec::new() }
+        Self {
+            builtin,
+            custom: Vec::new(),
+        }
     }
 
     /// 重扫自定义命令目录并替换补全快照(主循环每行输入前调用)。
@@ -190,7 +188,9 @@ fn command_matches(cmd: &SlashCommand, input: &str) -> bool {
         return true;
     }
     // 别名匹配
-    cmd.aliases.iter().any(|a| a.starts_with(input) && a.as_str() != input)
+    cmd.aliases
+        .iter()
+        .any(|a| a.starts_with(input) && a.as_str() != input)
 }
 
 /// 从 SlashCommand 构造 CompletionItem。
@@ -198,7 +198,11 @@ fn command_matches(cmd: &SlashCommand, input: &str) -> bool {
 fn item_from_command(cmd: &SlashCommand, raw: &str) -> CompletionItem {
     // 统计用户原始输入开头的 '/' 数量,作为 replacement 的前缀
     let slash_prefix: String = raw.chars().take_while(|c| *c == '/').collect();
-    let prefix = if slash_prefix.is_empty() { "/".to_string() } else { slash_prefix };
+    let prefix = if slash_prefix.is_empty() {
+        "/".to_string()
+    } else {
+        slash_prefix
+    };
     CompletionItem {
         display: format!("/{}", cmd.name),
         replacement: format!("{}{} ", prefix, cmd.name),
@@ -361,7 +365,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let dir = tmp.path().join(".laew").join("commands");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("deploy.md"), "---\ndescription: 部署\n---\n部署模板").unwrap();
+        std::fs::write(
+            dir.join("deploy.md"),
+            "---\ndescription: 部署\n---\n部署模板",
+        )
+        .unwrap();
         let mut engine = CompletionEngine::new();
         engine.reload_custom(tmp.path());
         let items = engine.complete("/dep");

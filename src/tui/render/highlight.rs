@@ -50,7 +50,6 @@ impl Rule {
     const fn new(token: HlToken, pattern: &'static str) -> Self {
         Rule { token, pattern }
     }
-
 }
 
 /// 获取指定语言+索引位置的 regex(每次调用重新编译,开销可忽略)。
@@ -72,15 +71,24 @@ fn rust_rules() -> &'static [Rule] {
             // 字符串(简化:双引号字符串)
             Rule::new(HlToken::String, r#""(?:[^"\\]|\\.)*""#),
             // 关键字
-            Rule::new(HlToken::Keyword, r"\b(?:as|async|await|break|const|continue|crate|dyn|else|enum|extern|false|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|true|type|unsafe|use|where|while|yield)\b"),
+            Rule::new(
+                HlToken::Keyword,
+                r"\b(?:as|async|await|break|const|continue|crate|dyn|else|enum|extern|false|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|true|type|unsafe|use|where|while|yield)\b",
+            ),
             // 类型(大写开头)
             Rule::new(HlToken::Type, r"\b[A-Z][a-zA-Z0-9]*\b"),
             // 函数定义/调用
             Rule::new(HlToken::Function, r"\b([a-z_][a-zA-Z0-9_]*)\s*\("),
             // 数字
-            Rule::new(HlToken::Number, r"\b(?:0x[0-9a-fA-F]+|0b[01]+|0o[0-7]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b"),
+            Rule::new(
+                HlToken::Number,
+                r"\b(?:0x[0-9a-fA-F]+|0b[01]+|0o[0-7]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b",
+            ),
             // 操作符
-            Rule::new(HlToken::Operator, r"[-+*/%=!<>&|^~]+|::|->|=>|\.\.|\.\.=|\?"),
+            Rule::new(
+                HlToken::Operator,
+                r"[-+*/%=!<>&|^~]+|::|->|=>|\.\.|\.\.=|\?",
+            ),
             // 标点
             Rule::new(HlToken::Punctuation, r"[()\[\]{}.,;:@#]"),
         ]
@@ -94,10 +102,16 @@ fn python_rules() -> &'static [Rule] {
         vec![
             Rule::new(HlToken::Comment, r"#.*$"),
             Rule::new(HlToken::String, r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#),
-            Rule::new(HlToken::Keyword, r"\b(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|False|finally|for|from|global|if|import|in|is|lambda|None|nonlocal|not|or|pass|raise|return|True|try|while|with|yield)\b"),
+            Rule::new(
+                HlToken::Keyword,
+                r"\b(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|False|finally|for|from|global|if|import|in|is|lambda|None|nonlocal|not|or|pass|raise|return|True|try|while|with|yield)\b",
+            ),
             Rule::new(HlToken::Type, r"\b[A-Z][a-zA-Z0-9]*\b"),
             Rule::new(HlToken::Function, r"\b([a-z_][a-zA-Z0-9_]*)\s*\("),
-            Rule::new(HlToken::Number, r"\b(?:0x[0-9a-fA-F]+|0b[01]+|0o[0-7]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b"),
+            Rule::new(
+                HlToken::Number,
+                r"\b(?:0x[0-9a-fA-F]+|0b[01]+|0o[0-7]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b",
+            ),
             Rule::new(HlToken::Operator, r"[-+*/%=!<>&|^~]+|//|<<|>>|\*\*"),
             Rule::new(HlToken::Punctuation, r"[()\[\]{}.,;:@#]"),
         ]
@@ -110,12 +124,24 @@ fn js_rules() -> &'static [Rule] {
     static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         vec![
             Rule::new(HlToken::Comment, r"//.*$|/\*[\s\S]*?\*/"),
-            Rule::new(HlToken::String, r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`"#),
-            Rule::new(HlToken::Keyword, r"\b(?:async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|export|extends|false|finally|for|function|if|implements|import|in|instanceof|interface|let|new|null|package|private|protected|public|return|super|switch|static|this|throw|true|try|typeof|undefined|var|void|while|with|yield)\b"),
+            Rule::new(
+                HlToken::String,
+                r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`"#,
+            ),
+            Rule::new(
+                HlToken::Keyword,
+                r"\b(?:async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|export|extends|false|finally|for|function|if|implements|import|in|instanceof|interface|let|new|null|package|private|protected|public|return|super|switch|static|this|throw|true|try|typeof|undefined|var|void|while|with|yield)\b",
+            ),
             Rule::new(HlToken::Type, r"\b[A-Z][a-zA-Z0-9]*\b"),
             Rule::new(HlToken::Function, r"\b([a-z_][a-zA-Z0-9_]*)\s*\("),
-            Rule::new(HlToken::Number, r"\b(?:0x[0-9a-fA-F]+|0b[01]+|0o[0-7]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b"),
-            Rule::new(HlToken::Operator, r"[-+*/%=!<>&|^~]+|&&|\|\||<<|>>|>>>|\?\?|=>|\?\."),
+            Rule::new(
+                HlToken::Number,
+                r"\b(?:0x[0-9a-fA-F]+|0b[01]+|0o[0-7]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b",
+            ),
+            Rule::new(
+                HlToken::Operator,
+                r"[-+*/%=!<>&|^~]+|&&|\|\||<<|>>|>>>|\?\?|=>|\?\.",
+            ),
             Rule::new(HlToken::Punctuation, r"[()\[\]{}.,;:@#]"),
         ]
     });
@@ -128,7 +154,10 @@ fn bash_rules() -> &'static [Rule] {
         vec![
             Rule::new(HlToken::Comment, r"#.*$"),
             Rule::new(HlToken::String, r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#),
-            Rule::new(HlToken::Keyword, r"\b(?:if|then|else|elif|fi|for|while|do|done|case|esac|function|select|time|until|in|return|exit|break|continue|shift|source|export|unset|readonly|declare|local|typeset)\b"),
+            Rule::new(
+                HlToken::Keyword,
+                r"\b(?:if|then|else|elif|fi|for|while|do|done|case|esac|function|select|time|until|in|return|exit|break|continue|shift|source|export|unset|readonly|declare|local|typeset)\b",
+            ),
             Rule::new(HlToken::Function, r"\b([a-z_][a-zA-Z0-9_]*)\s*\(\)"),
             Rule::new(HlToken::Number, r"\b\d+\b"),
             Rule::new(HlToken::Operator, r"[-+*/%=!<>&|^~]+|&&|\|\||<<|>>|=>"),
@@ -158,7 +187,10 @@ fn yaml_rules() -> &'static [Rule] {
             Rule::new(HlToken::Comment, r"#.*$"),
             Rule::new(HlToken::String, r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#),
             Rule::new(HlToken::Keyword, r"\b(?:true|false|null|yes|no)\b"),
-            Rule::new(HlToken::Number, r"\b(?:0x[0-9a-fA-F]+|0b[01]+|0o[0-7]+|\d+(?:\.\d+)?)\b"),
+            Rule::new(
+                HlToken::Number,
+                r"\b(?:0x[0-9a-fA-F]+|0b[01]+|0o[0-7]+|\d+(?:\.\d+)?)\b",
+            ),
             Rule::new(HlToken::Operator, r":"),
             Rule::new(HlToken::Punctuation, r"[-*&,]"),
         ]
@@ -170,11 +202,11 @@ fn yaml_rules() -> &'static [Rule] {
 fn markdown_rules() -> &'static [Rule] {
     static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         vec![
-            Rule::new(HlToken::Keyword, r"^#{1,6}\s.*$"),              // 标题
-            Rule::new(HlToken::String, r"`[^`]+`"),                    // 行内代码
-            Rule::new(HlToken::Function, r"\[([^\]]+)\]\([^)]+\)"),    // 链接
-            Rule::new(HlToken::Operator, r"\*\*[^*]+\*\*|^\s*[-*]\s"),  // 强调/列表
-            Rule::new(HlToken::Comment, r"^>.*$"),                     // 引用
+            Rule::new(HlToken::Keyword, r"^#{1,6}\s.*$"), // 标题
+            Rule::new(HlToken::String, r"`[^`]+`"),       // 行内代码
+            Rule::new(HlToken::Function, r"\[([^\]]+)\]\([^)]+\)"), // 链接
+            Rule::new(HlToken::Operator, r"\*\*[^*]+\*\*|^\s*[-*]\s"), // 强调/列表
+            Rule::new(HlToken::Comment, r"^>.*$"),        // 引用
         ]
     });
     &RULES
@@ -272,7 +304,9 @@ fn colorize(text: &str, token: HlToken) -> Span {
 
 /// 高亮多行文本。
 pub fn highlight_lines(text: &str, lang: HlLang) -> RenderLines {
-    text.lines().map(|line| highlight_line(line, lang)).collect()
+    text.lines()
+        .map(|line| highlight_line(line, lang))
+        .collect()
 }
 
 /// 自动检测语言(from shebang / file extension)。
@@ -339,7 +373,10 @@ mod tests {
         assert_eq!(text, "fn main() { let x = 42; }");
 
         // 验证 fn/let 被识别为 Keyword
-        let keyword_spans: Vec<_> = spans.iter().filter(|s| s.fg == theme::HL_KEYWORD_FG).collect();
+        let keyword_spans: Vec<_> = spans
+            .iter()
+            .filter(|s| s.fg == theme::HL_KEYWORD_FG)
+            .collect();
         let kw_text: String = keyword_spans.iter().map(|s| s.text.as_str()).collect();
         assert!(kw_text.contains("fn"));
         assert!(kw_text.contains("let"));
@@ -348,7 +385,10 @@ mod tests {
     #[test]
     fn highlight_string() {
         let spans = highlight_line(r#"let s = "hello world";"#, HlLang::Rust);
-        let string_spans: Vec<_> = spans.iter().filter(|s| s.fg == theme::HL_STRING_FG).collect();
+        let string_spans: Vec<_> = spans
+            .iter()
+            .filter(|s| s.fg == theme::HL_STRING_FG)
+            .collect();
         assert!(!string_spans.is_empty());
         let s_text: String = string_spans.iter().map(|s| s.text.as_str()).collect();
         assert!(s_text.contains("hello world"));
@@ -357,22 +397,34 @@ mod tests {
     #[test]
     fn highlight_comment() {
         let spans = highlight_line("// this is a comment", HlLang::Rust);
-        let comment_spans: Vec<_> = spans.iter().filter(|s| s.fg == theme::HL_COMMENT_FG).collect();
+        let comment_spans: Vec<_> = spans
+            .iter()
+            .filter(|s| s.fg == theme::HL_COMMENT_FG)
+            .collect();
         assert!(!comment_spans.is_empty());
     }
 
     #[test]
     fn highlight_number() {
         let spans = highlight_line("let x = 42;", HlLang::Rust);
-        let num_spans: Vec<_> = spans.iter().filter(|s| s.fg == theme::HL_NUMBER_FG).collect();
+        let num_spans: Vec<_> = spans
+            .iter()
+            .filter(|s| s.fg == theme::HL_NUMBER_FG)
+            .collect();
         assert!(!num_spans.is_empty());
     }
 
     #[test]
     fn detect_language_shebang() {
-        assert_eq!(detect_language("#!/usr/bin/env python3", None), HlLang::Python);
+        assert_eq!(
+            detect_language("#!/usr/bin/env python3", None),
+            HlLang::Python
+        );
         assert_eq!(detect_language("#!/bin/bash", None), HlLang::Bash);
-        assert_eq!(detect_language("#!/usr/bin/env node", None), HlLang::JavaScript);
+        assert_eq!(
+            detect_language("#!/usr/bin/env node", None),
+            HlLang::JavaScript
+        );
     }
 
     #[test]

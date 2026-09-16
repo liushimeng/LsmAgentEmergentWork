@@ -22,8 +22,8 @@ use crate::agent::extrace::ExecutionTrace;
 use crate::agent::memory;
 use crate::agent::subagent::{SubFlowInput, SubFlowOutcome};
 use crate::agent::window_state::{
-    build_window_state_message, WindowSessionState, WindowStateManager,
-    WINDOW_STATE_MARKER_END, WINDOW_STATE_MARKER_START,
+    build_window_state_message, WindowSessionState, WindowStateManager, WINDOW_STATE_MARKER_END,
+    WINDOW_STATE_MARKER_START,
 };
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
@@ -65,11 +65,7 @@ impl WindowUseRunner {
 
     /// 跑一次窗口操控单元(不可取消版本,语义对齐 SubAgentRunner::run_unit)。
     #[allow(dead_code)]
-    pub async fn run_unit(
-        &self,
-        input: &SubFlowInput,
-        session_id: &str,
-    ) -> Result<SubFlowOutcome> {
+    pub async fn run_unit(&self, input: &SubFlowInput, session_id: &str) -> Result<SubFlowOutcome> {
         self.run_unit_inner(input, session_id, None).await
     }
 
@@ -116,13 +112,16 @@ impl WindowUseRunner {
         // LLM 在 system / user 两端看到不同顺序易困惑。
         prompt.push_str(
             "\n\n【窗口操控作业规范】\n\
-             1. 第一步必须用 WindowList(枚举)或 WindowFind(按进程名/标题直接查,推荐)找到目标窗口;\n\
+             1. 目标应用未打开时优先用 WindowOpen(query,app_name?) 启动并等待窗口;已打开则用 WindowFind(推荐)或 WindowList 枚举;\n\
              2. macOS 上 WeChat/部分 Electron 应用 NSWindow title 可能为空,这是正常现象,\
                 WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明,应通过 process_name 定位;\n\
              3. 拿到窗口 id 后用 WindowInspect(max_depth 适度,filter 缩范围)检视控件树;\n\
              4. 依据控件 actions 列表选择合法动作,用 WindowAction 执行;路径失效时重新 WindowInspect;\n\
              5. 禁止对疑似支付/删除/发送/确认类按钮做无把握点击;只读操作优先;\n\
-             6. macOS WindowInspect/Action 返回 -25211 kAXErrorAPIDisabled 时,把开权限步骤写进最终回答告知用户。",
+             6. macOS WindowInspect/Action 返回 -25211 kAXErrorAPIDisabled 时,工具会弹出并等待授权;\
+                若最终仍未授权,把开权限步骤写进最终回答告知用户;\n\
+             7. 同一应用的连续 UI 操作必须在本单元内连续完成,不要只完成“打开”后把搜索/输入\
+                留给下一个独立单元;窗口状态会按 Session ID 持久化,但真实 UI 焦点不应依赖重新启动。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -145,18 +144,24 @@ impl WindowUseRunner {
                 "【来自其他 Agent 的消息】\n{}\n请基于此消息继续操作。",
                 msg.hint()
             );
-            sub_session.context_mut().push(ChatMessage::user(&agent_msg));
+            sub_session
+                .context_mut()
+                .push(ChatMessage::user(&agent_msg));
         }
 
         // 早终止路径语义与 SubAgentRunner 对齐:包装成失败摘要文本 + trace,
         // 交给 Quality-Check 判定,而不是直接升级为 Error。
-        let (text, usage, mut trace) = match self
+        let (mut text, usage, mut trace) = match self
             .agent
             .run_session_cancellable(&mut sub_session, cancel)
             .await
         {
             Ok((t, u, tr)) => (t, u, tr),
-            Err(AgentError::RepeatedToolFailure { tool, attempts, last_error }) => {
+            Err(AgentError::RepeatedToolFailure {
+                tool,
+                attempts,
+                last_error,
+            }) => {
                 let summary = format!(
                     "[RepeatedToolFailure] 工具 {tool} 连续 {attempts} 次失败;last_error: {last_error}"
                 );
@@ -168,8 +173,7 @@ impl WindowUseRunner {
                 (summary, Usage::default(), tr)
             }
             Err(AgentError::MaxIterationsExceeded(n)) => {
-                let summary =
-                    format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
+                let summary = format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
                 let mut tr = ExecutionTrace::default();
                 tr.iterations = n;
                 tr.early_terminated = true;
@@ -181,6 +185,18 @@ impl WindowUseRunner {
         };
 
         trace.collect_failure_signals(&text);
+
+        // 给 QC / TUI 追加机器可验证证据,防止最终文本与真实工具轨迹相悖。
+        text.push_str(&format!(
+            "\n\n[WindowUse执行证据] session={} iter={} tools={}(ok={},err={}) early={} signals=[{}]",
+            session_id,
+            trace.iterations,
+            trace.tool_calls,
+            trace.tool_calls_ok,
+            trace.tool_calls_err,
+            trace.early_terminated,
+            trace.failure_signals.join(",")
+        ));
 
         // 2026-09-16 第 58 轮 P0-B:Runner 出口兜底。
         // 根因场景:LLM 在 WindowUse 单元里完全没发出任何工具调用(trace.tool_calls=0),
@@ -237,7 +253,12 @@ impl WindowUseRunner {
             }),
         );
 
-        Ok(SubFlowOutcome { text, usage, failed, trace })
+        Ok(SubFlowOutcome {
+            text,
+            usage,
+            failed,
+            trace,
+        })
     }
 }
 
@@ -348,7 +369,9 @@ mod tests {
         // 与 cargo test 并行执行的其它 env 敏感测试(utf8_env 等)互相竞态,
         // 这里用独立 mutex 串行化。
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _env = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use crate::agent::tools::bash::{window_use_mode, WINDOW_USE_MODE_ENV};
 
         // (a) 默认未设置 → 模式关闭
@@ -437,7 +460,9 @@ mod tests {
         // 文本含 WINDOW_STATE_MARKER_START 锚点便于幂等探测。
         use crate::agent::window_state::{build_window_state_message, WindowSessionState};
         let mut state = WindowSessionState::new("test-session");
-        state.window_aliases.insert("wechat".into(), "WeChat".into());
+        state
+            .window_aliases
+            .insert("wechat".into(), "WeChat".into());
         let msg = build_window_state_message(&state);
         assert!(msg.is_some(), "非空状态应能构造消息");
         // content 是 Vec<ContentBlock>,取首块文本

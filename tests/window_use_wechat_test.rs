@@ -14,8 +14,8 @@
 
 use lsm_agent::agent::context::AgentRole;
 use lsm_agent::agent::main_work::{infer_delegate_to, WorkFlowSpec};
-use lsm_agent::agent::tools::bash::{check_window_use_bash, window_use_mode, WINDOW_USE_MODE_ENV};
 use lsm_agent::agent::tools::bash::BashTool;
+use lsm_agent::agent::tools::bash::{check_window_use_bash, window_use_mode, WINDOW_USE_MODE_ENV};
 use lsm_agent::agent::tools::Tool;
 use serde_json::json;
 use std::sync::Mutex;
@@ -81,10 +81,7 @@ async fn bash_window_use_mode_blocks_curl() {
         err.contains("windowuse-mode"),
         "错误应明确 windowuse-mode,实际: {err}"
     );
-    assert!(
-        err.contains("白名单"),
-        "错误应提及白名单,实际: {err}"
-    );
+    assert!(err.contains("白名单"), "错误应提及白名单,实际: {err}");
 
     unsafe {
         std::env::remove_var(WINDOW_USE_MODE_ENV);
@@ -152,10 +149,7 @@ fn infer_delegate_to_correction() {
 
     // (b) 含 screencapture + cliclick -> 自动改 subagent
     let wf = make_spec(
-        vec![
-            "screencapture -x /tmp/screen.png",
-            "cliclick c:200,300",
-        ],
+        vec!["screencapture -x /tmp/screen.png", "cliclick c:200,300"],
         AgentRole::WindowUse,
     );
     assert_eq!(infer_delegate_to(&wf), Some(AgentRole::SubAgent));
@@ -225,7 +219,7 @@ fn macos_ax_unavailable_hint_contains_osascript() {
     // 2) permission_hint 函数在 ax_strings_loaded()=false 时返回该常量。
     //
     // 这里仅做最直接的源码包含验证:
-    let macos_rs = include_str!("../src/agent/window/macos.rs");
+    let macos_rs = include_str!("../src/agent/window/macos_legacy.rs");
     let has_const = macos_rs.contains("MACOS_AX_UNAVAILABLE_HINT");
     let has_osascript = macos_rs.contains("osascript");
     let has_unavailable = macos_rs.contains("不可用");

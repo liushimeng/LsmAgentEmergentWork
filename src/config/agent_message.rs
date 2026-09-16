@@ -51,9 +51,8 @@ impl Db {
         match row {
             Some((msg_id, from_role, payload_json, created_at)) => {
                 let from_role: AgentRole = from_role.as_str().into();
-                let payload = serde_json::from_str(&payload_json).map_err(|e| {
-                    crate::config::ConfigError::Serialization(e.to_string())
-                })?;
+                let payload = serde_json::from_str(&payload_json)
+                    .map_err(|e| crate::config::ConfigError::Serialization(e.to_string()))?;
                 Ok(Some(AgentMessage {
                     id: msg_id,
                     session_id: session_id.to_string(),
@@ -94,9 +93,8 @@ impl Db {
                     params![&msg_id],
                 )?;
                 let from_role: AgentRole = from_role.as_str().into();
-                let payload = serde_json::from_str(&payload_json).map_err(|e| {
-                    crate::config::ConfigError::Serialization(e.to_string())
-                })?;
+                let payload = serde_json::from_str(&payload_json)
+                    .map_err(|e| crate::config::ConfigError::Serialization(e.to_string()))?;
                 Ok(Some(AgentMessage {
                     id: msg_id,
                     session_id: session_id.to_string(),
@@ -233,9 +231,15 @@ mod tests {
         db.insert_agent_message(&msg2).unwrap();
 
         db.clear_agent_messages("s1").unwrap();
-        assert!(db.peek_agent_message("s1", AgentRole::SubAgent).unwrap().is_none());
+        assert!(db
+            .peek_agent_message("s1", AgentRole::SubAgent)
+            .unwrap()
+            .is_none());
         // s2 的消息仍在
-        assert!(db.peek_agent_message("s2", AgentRole::SubAgent).unwrap().is_some());
+        assert!(db
+            .peek_agent_message("s2", AgentRole::SubAgent)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -255,6 +259,9 @@ mod tests {
         db.mark_agent_message_consumed(&msg_id).unwrap();
 
         // 已标记消费,peek 应为 None
-        assert!(db.peek_agent_message("s1", AgentRole::SubAgent).unwrap().is_none());
+        assert!(db
+            .peek_agent_message("s1", AgentRole::SubAgent)
+            .unwrap()
+            .is_none());
     }
 }

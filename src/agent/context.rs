@@ -39,6 +39,9 @@ pub enum AgentRole {
     WorkFlow,
     #[serde(rename = "windowuse")]
     WindowUse,
+    /// 浏览器操控层:网页浏览/信息收集/Web 页面操作(第 11 角色,CDP 驱动 Chromium 系浏览器)
+    #[serde(rename = "webuse")]
+    WebUse,
 }
 
 impl AgentRole {
@@ -52,6 +55,7 @@ impl AgentRole {
             Self::SessionContext => "session",
             Self::Compact => "compact",
             Self::WindowUse => "windowuse",
+            Self::WebUse => "webuse",
             Self::WorkFlow => "workflow",
         }
     }
@@ -70,6 +74,7 @@ impl From<&str> for AgentRole {
             "session" => Self::SessionContext,
             "compact" => Self::Compact,
             "windowuse" => Self::WindowUse,
+            "webuse" => Self::WebUse,
             "workflow" => Self::WorkFlow,
             _ => Self::SubAgent,
         }
@@ -94,7 +99,11 @@ pub struct AgentContext {
 
 impl AgentContext {
     /// 构造新的 Agent-Context(空消息 + 空状态)。
-    pub fn new(agent_role: AgentRole, session_id: impl Into<String>, unit_id: impl Into<String>) -> Self {
+    pub fn new(
+        agent_role: AgentRole,
+        session_id: impl Into<String>,
+        unit_id: impl Into<String>,
+    ) -> Self {
         Self {
             agent_role,
             session_id: session_id.into(),
@@ -158,6 +167,8 @@ mod tests {
         assert_eq!(AgentRole::SessionContext.as_str(), "session");
         assert_eq!(AgentRole::Compact.as_str(), "compact");
         assert_eq!(AgentRole::WindowUse.as_str(), "windowuse");
+        assert_eq!(AgentRole::WebUse.as_str(), "webuse");
+        assert_eq!(AgentRole::from("webuse"), AgentRole::WebUse);
     }
 
     #[test]
@@ -188,10 +199,7 @@ mod tests {
 
         assert_eq!(ctx.messages().len(), 3);
         assert_eq!(ctx.messages()[0].role, crate::llm::Role::User);
-        assert_eq!(
-            ctx.state_get("foo").and_then(|v| v.as_i64()),
-            Some(42)
-        );
+        assert_eq!(ctx.state_get("foo").and_then(|v| v.as_i64()), Some(42));
 
         ctx.iteration_inc();
         ctx.iteration_inc();

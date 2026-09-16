@@ -55,9 +55,7 @@ impl SessionContextRunner {
         } else {
             workflow_results
                 .iter()
-                .map(|(id, name, ok)| {
-                    format!("{} {}: {}", if *ok { "✅" } else { "❌" }, id, name)
-                })
+                .map(|(id, name, ok)| format!("{} {}: {}", if *ok { "✅" } else { "❌" }, id, name))
                 .collect::<Vec<_>>()
                 .join("; ")
         };
@@ -99,14 +97,16 @@ impl SessionContextRunner {
         let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
 
         // 写入 session_memory(Summary 事件)
-        let _ = self.db.insert_session_memory(&crate::config::SessionMemoryEntry {
-            session_id: session_id.to_string(),
-            role: AgentRole::SessionContext,
-            event_type: EventType::Summary,
-            content: text.clone(),
-            usage_input: usage.input_tokens,
-            usage_output: usage.output_tokens,
-        });
+        let _ = self
+            .db
+            .insert_session_memory(&crate::config::SessionMemoryEntry {
+                session_id: session_id.to_string(),
+                role: AgentRole::SessionContext,
+                event_type: EventType::Summary,
+                content: text.clone(),
+                usage_input: usage.input_tokens,
+                usage_output: usage.output_tokens,
+            });
 
         let _ = memory::record_entry(
             &self.db,
@@ -129,23 +129,25 @@ impl SessionContextRunner {
         reason: &str,
         suggestion: &str,
     ) -> Result<()> {
-        self.db.insert_session_memory(&crate::config::SessionMemoryEntry {
-            session_id: session_id.to_string(),
-            role: AgentRole::Yolo,
-            event_type: EventType::Failure,
-            content: format!("目标: {goal}\n原因: {reason}"),
-            usage_input: 0,
-            usage_output: 0,
-        })?;
-        if !suggestion.is_empty() {
-            self.db.insert_session_memory(&crate::config::SessionMemoryEntry {
+        self.db
+            .insert_session_memory(&crate::config::SessionMemoryEntry {
                 session_id: session_id.to_string(),
-                role: AgentRole::SessionContext,
-                event_type: EventType::Suggestion,
-                content: suggestion.into(),
+                role: AgentRole::Yolo,
+                event_type: EventType::Failure,
+                content: format!("目标: {goal}\n原因: {reason}"),
                 usage_input: 0,
                 usage_output: 0,
             })?;
+        if !suggestion.is_empty() {
+            self.db
+                .insert_session_memory(&crate::config::SessionMemoryEntry {
+                    session_id: session_id.to_string(),
+                    role: AgentRole::SessionContext,
+                    event_type: EventType::Suggestion,
+                    content: suggestion.into(),
+                    usage_input: 0,
+                    usage_output: 0,
+                })?;
         }
         Ok(())
     }
@@ -173,7 +175,11 @@ pub fn build_history_message(entries: &[crate::config::SessionMemoryRow]) -> Opt
             "- [seq={}, {}] {}\n",
             e.seq,
             e.created_at,
-            e.content.replace('\n', " ").chars().take(160).collect::<String>(),
+            e.content
+                .replace('\n', " ")
+                .chars()
+                .take(160)
+                .collect::<String>(),
         ));
     }
     text.push_str("--- 摘要结束 ---\n");

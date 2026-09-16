@@ -15,6 +15,7 @@ use crate::error::{AgentError, Result};
 use crate::llm::ToolDef;
 
 pub mod bash;
+pub mod browser;
 pub mod edit;
 pub mod emit;
 pub mod glob;
@@ -195,11 +196,26 @@ pub fn window_use_registry() -> ToolRegistry {
     ToolRegistry::new()
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(bash::BashTool))
+        .register(Arc::new(window::WindowOpenTool))
         .register(Arc::new(window::WindowListTool))
         .register(Arc::new(window::WindowFindTool))
         .register(Arc::new(window::WindowInspectTool))
         .register(Arc::new(window::WindowActionTool))
         .register(Arc::new(window::WindowScreenshotTool))
+}
+
+/// Chromium-WebUse Agent 工具注册表(第 11 角色,浏览器操控层,2026-09-16 第 61 轮):
+/// Read(读文件) + BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect。
+/// 不带 Bash/Write(网页操控单元收窄权限面)。
+/// 设计见 `docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md`。
+pub fn web_use_registry() -> ToolRegistry {
+    ToolRegistry::new()
+        .register(Arc::new(read::ReadTool))
+        .register(Arc::new(browser::BrowserNewTool))
+        .register(Arc::new(browser::BrowserListTool))
+        .register(Arc::new(browser::BrowserCloseTool))
+        .register(Arc::new(browser::BrowserControlTool))
+        .register(Arc::new(browser::BrowserInspectTool))
 }
 
 #[cfg(test)]
@@ -213,6 +229,22 @@ mod names_tests {
         let reg = yolo_registry();
         let names = reg.names();
         assert_eq!(names, vec!["Read", "submit_task_classification"]);
+    }
+
+    #[test]
+    fn web_use_registry_names() {
+        let reg = web_use_registry();
+        assert_eq!(
+            reg.names(),
+            vec![
+                "Read",
+                "BrowserNew",
+                "BrowserList",
+                "BrowserClose",
+                "BrowserControl",
+                "BrowserInspect",
+            ]
+        );
     }
 
     #[test]
@@ -230,6 +262,7 @@ mod names_tests {
             vec![
                 "Read",
                 "Bash",
+                "WindowOpen",
                 "WindowList",
                 "WindowFind",
                 "WindowInspect",

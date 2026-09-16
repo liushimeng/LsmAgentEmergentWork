@@ -47,6 +47,38 @@ fn require_str<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
     get_str(args, key).ok_or_else(|| tool_err(tool, format!("缺少 string 类型参数 {key}")))
 }
 
+/// 扩展常见桌面应用的中英文窗口 / 进程名别名。
+///
+/// macOS 微信的 `kCGWindowOwnerName` 可能是「微信」,而模型常按英文查询「WeChat」。
+pub(crate) fn expand_window_query(query: &str) -> Vec<String> {
+    let mut out = vec![query.to_string()];
+    let lower = query.to_lowercase();
+    if lower.contains("wechat") || query.contains("微信") {
+        for alias in ["WeChat", "微信"] {
+            if !out.iter().any(|s| s == alias) {
+                out.push(alias.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn window_matches_any(w: &WindowInfo, queries: &[String]) -> bool {
+    queries.iter().any(|q| {
+        let q = q.to_lowercase();
+        w.title.to_lowercase().contains(&q) || w.process_name.to_lowercase().contains(&q)
+    })
+}
+
+fn find_window_by_aliases(
+    windows: &[WindowInfo],
+    aliases: &[String],
+) -> Option<(String, WindowInfo)> {
+    aliases.iter().find_map(|q| {
+        pick_top_hit(windows, q, MatchMode::Contains).map(|h| (q.clone(), h.info.clone()))
+    })
+}
+
 /// 统计控件树节点数。
 fn count_nodes(node: &ControlNode) -> usize {
     1 + node.children.iter().map(count_nodes).sum::<usize>()
@@ -96,14 +128,14 @@ fn tree_to_json(mut root: ControlNode) -> String {
 /// 首次调用 WindowInspect/WindowAction 时,如果辅助功能未授权,
 /// 主动调用 `AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: true})`
 /// 触发系统弹窗,引导用户授权。
-fn driver_preflight(tool: &str) -> Result<()> {
+async fn driver_preflight(tool: &str) -> Result<()> {
     let driver = current_driver();
     if let Some(hint) = driver.permission_hint() {
         // macOS 未授权:尝试自动触发授权弹窗(第 60 轮新增)
         #[cfg(target_os = "macos")]
         {
             if hint.contains("辅助功能未授权") {
-                return match try_request_ax_permission() {
+                return match try_request_ax_permission(tool).await {
                     AxPermissionResult::Granted => Ok(()), // 授权成功,继续执行
                     AxPermissionResult::Denied { message } => {
                         // 授权失败/用户拒绝,返回带引导的提示
@@ -134,37 +166,66 @@ enum AxPermissionResult {
 /// - 弹窗后用户授权 → Granted
 /// - 用户拒绝/忽略/超时 → Denied(带引导文案)
 #[cfg(target_os = "macos")]
-fn try_request_ax_permission() -> AxPermissionResult {
+async fn try_request_ax_permission(tool: &str) -> AxPermissionResult {
     use crate::agent::window::MacOsDriver;
+    use std::time::{Duration, Instant};
 
     // 先检查是否已授权(避免重复弹窗)
     if MacOsDriver::is_trusted() {
         return AxPermissionResult::Granted;
     }
 
-    // 触发系统授权弹窗
-    let granted = MacOsDriver::request_permission();
-
-    if granted {
-        AxPermissionResult::Granted
-    } else {
-        // 授权失败,返回带手动授权引导的文案
-        let message = format!(
-            "辅助功能授权请求已弹出,但未获得授权。\n\
-             请按以下步骤手动授权:\n\
-             1. 系统设置 → 隐私与安全性 → 辅助功能\n\
-             2. 点击左下角锁图标解锁\n\
-             3. 添加并勾选运行 laew 的终端应用(Terminal/iTerm2/VS Code)\n\
-             4. 完全退出终端后重新打开(TCC 按进程启动时快照生效)\n\
-             授权完成后重试 WindowInspect/WindowAction。\n\
-             临时降级方案(无需授权):\n\
-             - 用 Bash + osascript 操作 GUI(activate/keystroke/click)\n\
-             - 用 Bash + cliclick c:x,y 坐标点击\n\
-             - 用 Bash + screencapture -x 截图\n\
-             - WindowList 走 CoreGraphics 不需授权,可枚举窗口"
-        );
-        AxPermissionResult::Denied { message }
+    let wait_secs = ax_permission_wait_secs();
+    let started = Instant::now();
+    let mut next_prompt = Instant::now();
+    let mut prompt_count = 0usize;
+    loop {
+        if MacOsDriver::request_permission() {
+            eprintln!("  [{tool}权限] ✓ macOS 辅助功能已授权,继续执行");
+            return AxPermissionResult::Granted;
+        }
+        if prompt_count == 0 {
+            eprintln!(
+                "  [{tool}权限] macOS 辅助功能未授权;已弹出系统授权引导,最多等待 {wait_secs}s"
+            );
+        }
+        prompt_count += 1;
+        if started.elapsed().as_secs() >= wait_secs {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        if Instant::now() >= next_prompt {
+            next_prompt = Instant::now() + Duration::from_secs(10);
+            if MacOsDriver::request_permission() {
+                eprintln!("  [{tool}权限] ✓ macOS 辅助功能已授权,继续执行");
+                return AxPermissionResult::Granted;
+            }
+            eprintln!(
+                "  [{tool}权限] 等待授权中 {}/{}s;请在系统设置 → 隐私与安全性 → 辅助功能添加/勾选宿主终端",
+                started.elapsed().as_secs(),
+                wait_secs
+            );
+        }
     }
+
+    let message = format!(
+        "辅助功能授权等待 {wait_secs}s 后仍未成功(已请求 {prompt_count} 次)。\n\
+         请完成:系统设置 → 隐私与安全性 → 辅助功能 → 添加并勾选运行 laew 的宿主终端\
+         (Terminal/iTerm2/VS Code);如系统提示,输入管理员密码。\n\
+         TCC 对进程启动时状态有快照语义:授权后通常需要完全退出并重开宿主终端。\
+         当前任务已保留 Session ID 与窗口状态;WindowOpen/WindowList 无需该权限,\
+         但控件检视、控件输入与 System Events 键盘注入必须授权。"
+    );
+    AxPermissionResult::Denied { message }
+}
+
+/// `LAEW_AX_WAIT_SECS` 控制授权等待;0 关闭,默认 120 秒,非法值回退默认。
+#[cfg(target_os = "macos")]
+fn ax_permission_wait_secs() -> u64 {
+    std::env::var("LAEW_AX_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(120)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -197,10 +258,11 @@ impl Tool for WindowListTool {
     }
 
     fn description(&self) -> &str {
-        "枚举当前桌面全部可见顶层窗口,返回 JSON 数组(id/title/进程名/PID/位置尺寸)。\n\
+        "枚举当前桌面全部可见顶层窗口,返回 JSON 对象(windows 数组含 id/title/进程名/PID/位置尺寸)。\n\
          - filter 可选:按窗口标题或进程名子串过滤(大小写不敏感)。\n\
+         - 常见应用支持中英文别名(如 WeChat ↔ 微信)。\n\
          - 返回的 id 是不透明标识,仅供 WindowInspect/WindowAction 回传使用。\n\
-         - macOS 需要「辅助功能」权限;未授权时返回可读的开权限引导。"
+         - macOS WindowList 走 CoreGraphics,不需要辅助功能权限;仅 WindowInspect/Action 需要授权。"
     }
 
     fn parameters(&self) -> Value {
@@ -226,21 +288,39 @@ impl Tool for WindowListTool {
         // WindowInspect / WindowAction 仍保留 driver_preflight(真需要权限)。
         run_blocking(self.name(), move || {
             let driver = current_driver();
-            let mut wins = driver.list_windows(filter.as_deref())?;
+            let all = driver.list_windows(None)?;
+            let aliases = filter.as_deref().map(expand_window_query).unwrap_or_default();
+            let mut wins = if filter.is_some() {
+                all.iter()
+                    .filter(|w| window_matches_any(w, &aliases))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                all.clone()
+            };
             let total = wins.len();
+            let truncated = total > MAX_WINDOWS;
             if total > MAX_WINDOWS {
                 wins.truncate(MAX_WINDOWS);
             }
-            let mut out = serde_json::to_string_pretty(&wins).unwrap_or_else(|_| "[]".into());
-            if total > MAX_WINDOWS {
-                out.push_str(&format!(
-                    "\n[truncated] 共 {total} 个窗口,仅展示前 {MAX_WINDOWS} 个;请用 filter 缩小范围"
-                ));
-            }
-            if wins.is_empty() {
-                out.push_str("\n(无匹配窗口;若预期有窗口,请确认目标应用已启动且未最小化)");
-            }
-            Ok(out)
+            let permission_hint = driver.permission_hint();
+            let body = json!({
+                "driver": driver.platform_name(),
+                "filter": filter,
+                "expanded_filters": aliases,
+                "total_matched": total,
+                "total_visible": all.len(),
+                "truncated": truncated,
+                "inspect_ready": permission_hint.is_none(),
+                "permission_hint": permission_hint,
+                "windows": wins,
+                "hint": if wins.is_empty() {
+                    "无匹配窗口;请确认目标应用已启动、已登录且窗口未最小化。可先用 WindowOpen(query) 启动/激活。"
+                } else {
+                    "window_id 仅在本轮窗口列表中稳定;UI 变化后请重新枚举。"
+                }
+            });
+            Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
         })
         .await
     }
@@ -289,9 +369,17 @@ fn score_exact<'a>(query_lower: &str, info: &'a WindowInfo) -> Option<ScoredHit<
     let title_l = info.title.to_lowercase();
     let proc_l = info.process_name.to_lowercase();
     if title_l == query_lower {
-        Some(ScoredHit { info, score: 1.0, matched_field: "title" })
+        Some(ScoredHit {
+            info,
+            score: 1.0,
+            matched_field: "title",
+        })
     } else if proc_l == query_lower {
-        Some(ScoredHit { info, score: 1.0, matched_field: "process" })
+        Some(ScoredHit {
+            info,
+            score: 1.0,
+            matched_field: "process",
+        })
     } else {
         None
     }
@@ -304,12 +392,20 @@ fn score_contains<'a>(query_lower: &str, info: &'a WindowInfo) -> Option<ScoredH
         let q_chars = query_lower.chars().count() as f64;
         let denom = title_l.chars().count().max(1) as f64;
         let s = (q_chars / denom).clamp(0.3, 0.95);
-        Some(ScoredHit { info, score: s, matched_field: "title" })
+        Some(ScoredHit {
+            info,
+            score: s,
+            matched_field: "title",
+        })
     } else if proc_l.contains(query_lower) {
         let q_chars = query_lower.chars().count() as f64;
         let denom = proc_l.chars().count().max(1) as f64;
         let s = (q_chars / denom).clamp(0.3, 0.95);
-        Some(ScoredHit { info, score: s, matched_field: "process" })
+        Some(ScoredHit {
+            info,
+            score: s,
+            matched_field: "process",
+        })
     } else {
         None
     }
@@ -338,7 +434,11 @@ fn damerau_levenshtein(a: &str, b: &str) -> usize {
     for i in 1..=m {
         prev1[0] = i;
         for j in 1..=n {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
             let del = prev1[j - 1] + 1; // insertion
             let ins = prev2[j] + 1; // deletion
             let sub = prev2[j - 1] + cost;
@@ -362,18 +462,22 @@ fn score_fuzzy<'a>(query: &str, info: &'a WindowInfo) -> Option<ScoredHit<'a>> {
         return None;
     }
     if score_t >= score_p {
-        Some(ScoredHit { info, score: score_t, matched_field: "title" })
+        Some(ScoredHit {
+            info,
+            score: score_t,
+            matched_field: "title",
+        })
     } else {
-        Some(ScoredHit { info, score: score_p, matched_field: "process" })
+        Some(ScoredHit {
+            info,
+            score: score_p,
+            matched_field: "process",
+        })
     }
 }
 
 /// 按窗口信息列表 + 模式 + 查询词匹配,返回 top-1。
-fn pick_top_hit<'a>(
-    wins: &'a [WindowInfo],
-    query: &str,
-    mode: MatchMode,
-) -> Option<ScoredHit<'a>> {
+fn pick_top_hit<'a>(wins: &'a [WindowInfo], query: &str, mode: MatchMode) -> Option<ScoredHit<'a>> {
     let query_lower = query.to_lowercase();
     wins.iter()
         .filter_map(|w| match mode {
@@ -381,7 +485,11 @@ fn pick_top_hit<'a>(
             MatchMode::Contains => score_contains(&query_lower, w),
             MatchMode::Fuzzy => score_fuzzy(query, w),
         })
-        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 /// 按标题/进程名子串找一个窗口,返回最佳匹配的 id。
@@ -421,7 +529,9 @@ impl Tool for WindowFindTool {
 
     async fn execute(&self, args: Value) -> Result<String> {
         let query = require_str(&args, "query", self.name())?.to_string();
-        let mode_str_owned = get_str(&args, "match_mode").unwrap_or("contains").to_string();
+        let mode_str_owned = get_str(&args, "match_mode")
+            .unwrap_or("contains")
+            .to_string();
         let mode = MatchMode::parse(&mode_str_owned);
         // WindowFind 仅基于 WindowList 结果(走 CoreGraphics,无授权要求),
         // 不调用 driver_preflight,避免误把 macOS AX 未授权也 fail-closed。
@@ -434,7 +544,17 @@ impl Tool for WindowFindTool {
                     "无可见窗口,请确认桌面有目标应用在前台",
                 ));
             }
-            match pick_top_hit(&wins, &query, mode) {
+            let aliases = expand_window_query(&query);
+            let mut hit = None;
+            let mut matched_query = query.clone();
+            for alias in &aliases {
+                if let Some(h) = pick_top_hit(&wins, alias, mode) {
+                    hit = Some(h);
+                    matched_query = alias.clone();
+                    break;
+                }
+            }
+            match hit {
                 Some(hit) => {
                     // 2026-09-16 第 58 轮 P1-B:title 为空但 process_name 命中时,
                     // 输出 note 字段说明 WeChat/部分 Electron 应用 NSWindow title
@@ -468,6 +588,8 @@ impl Tool for WindowFindTool {
                             MatchMode::Contains => "contains",
                             MatchMode::Fuzzy => "fuzzy",
                         },
+                        "matched_query": matched_query,
+                        "query_aliases": aliases,
                     });
                     if let Some(n) = note {
                         body["note"] = json!(n);
@@ -489,6 +611,179 @@ impl Tool for WindowFindTool {
                     ))
                 }
             }
+        })
+        .await
+    }
+}
+
+// ===================== WindowOpen =====================
+
+/// 桌面应用启动 / 激活工具:无 macOS AX 权限也能启动应用并轮询定位窗口。
+pub struct WindowOpenTool;
+
+fn safe_desktop_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.contains(['\0', '\r', '\n'])
+        && s.chars().count() <= 128
+}
+
+fn launch_desktop_app(
+    app: &str,
+    bundle_id: Option<&str>,
+) -> std::result::Result<Vec<String>, String> {
+    use std::process::{Command, Stdio};
+
+    let aliases = expand_window_query(app);
+    let mut candidates = vec![app.to_string()];
+    for alias in aliases {
+        if !candidates.contains(&alias) {
+            candidates.push(alias);
+        }
+    }
+    let mut tried = Vec::new();
+    for candidate in candidates {
+        if !safe_desktop_identifier(&candidate) {
+            return Err(format!("非法应用标识: {candidate:?}"));
+        }
+        let display = if cfg!(target_os = "macos") {
+            bundle_id
+                .filter(|s| safe_desktop_identifier(s))
+                .map(|b| format!("open -b {b}"))
+                .unwrap_or_else(|| format!("open -a {candidate}"))
+        } else if cfg!(windows) {
+            if candidate.contains('\'') {
+                continue;
+            }
+            format!("Start-Process {candidate}")
+        } else {
+            format!("gtk-launch {}", candidate.trim_end_matches(".desktop"))
+        };
+
+        let mut command = if cfg!(target_os = "macos") {
+            let mut c = Command::new("open");
+            if let Some(b) = bundle_id.filter(|s| safe_desktop_identifier(s)) {
+                c.arg("-b").arg(b);
+            } else {
+                c.arg("-a").arg(&candidate);
+            }
+            c
+        } else if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Process"])
+                .arg(&candidate);
+            c
+        } else {
+            let mut c = Command::new("gtk-launch");
+            c.arg(candidate.trim_end_matches(".desktop"));
+            c
+        };
+        let status = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        tried.push(display);
+        match status {
+            Ok(s) if s.success() => return Ok(tried),
+            Ok(s) => return Err(format!("启动命令退出码异常: {s};已尝试: {tried:?}")),
+            Err(e) if cfg!(target_os = "macos") && tried.len() < 3 => continue,
+            Err(e) => return Err(format!("无法执行启动命令: {e};已尝试: {tried:?}")),
+        }
+    }
+    Err("未找到可执行的应用标识".into())
+}
+
+#[async_trait]
+impl Tool for WindowOpenTool {
+    fn name(&self) -> &str {
+        "WindowOpen"
+    }
+
+    fn description(&self) -> &str {
+        "启动/激活桌面应用并等待窗口出现,返回 window_id、匹配别名、窗口数量与权限状态。支持 WeChat ↔ 微信别名。"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "query":{"type":"string"},
+                "app_name":{"type":"string"},
+                "bundle_id":{"type":"string"},
+                "wait_seconds":{"type":"integer","minimum":0,"maximum":20}
+            },
+            "required":["query"],
+            "additionalProperties":false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let query = require_str(&args, "query", self.name())?.to_string();
+        let app_name = get_str(&args, "app_name").unwrap_or(&query).to_string();
+        let bundle_id = get_str(&args, "bundle_id").map(str::to_string);
+        let wait_secs = args
+            .get("wait_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(6)
+            .min(20);
+
+        run_blocking(self.name(), move || {
+            let driver = current_driver();
+            let before = driver.list_windows(None)?;
+            let aliases = expand_window_query(&query);
+            let before_hit = find_window_by_aliases(&before, &aliases);
+            let started = std::time::Instant::now();
+            let commands =
+                launch_desktop_app(&app_name, bundle_id.as_deref())
+                    .map_err(|e| tool_err("WindowOpen", e))?;
+
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+            let mut after = before.clone();
+            let mut matched = before_hit.clone();
+            while matched.is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                after = driver.list_windows(None)?;
+                matched = find_window_by_aliases(&after, &aliases);
+            }
+
+            let Some((matched_query, info)) = matched else {
+                let titles: Vec<String> = after
+                    .iter()
+                    .take(10)
+                    .map(|w| format!("{} ({})", w.title, w.process_name))
+                    .collect();
+                return Err(tool_err(
+                    "WindowOpen",
+                    format!(
+                        "启动命令已执行({commands:?},耗时 {:.1}s),但 {wait_secs}s 内未匹配到窗口。尝试别名:{aliases:?};当前可见前 10 个:{titles:?}",
+                        started.elapsed().as_secs_f32()
+                    ),
+                ));
+            };
+            let permission_hint = driver.permission_hint();
+            let body = json!({
+                "ok":true,
+                "window_id":info.id,
+                "title":info.title,
+                "process_name":info.process_name,
+                "pid":info.pid,
+                "bounds":info.bounds,
+                "query":query,
+                "matched_query":matched_query,
+                "query_aliases":aliases,
+                "already_visible_before_launch":before_hit.is_some(),
+                "visible_before":before.len(),
+                "visible_after":after.len(),
+                "launch_commands":commands,
+                "wait_ms":started.elapsed().as_millis() as u64,
+                "driver":driver.platform_name(),
+                "inspect_ready":permission_hint.is_none(),
+                "permission_hint":permission_hint,
+                "next_action":"inspect_ready=true 时用 window_id 调 WindowInspect;否则先按权限提示完成授权。"
+            });
+            Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
         })
         .await
     }
@@ -629,8 +924,12 @@ impl Tool for WindowScreenshotTool {
         let output = bash.execute(bash_args).await?;
 
         // 校验产物文件存在
-        let meta = std::fs::metadata(&output_path)
-            .map_err(|e| tool_err(self.name(), format!("截图未生成: {};命令输出={}", e, output)))?;
+        let meta = std::fs::metadata(&output_path).map_err(|e| {
+            tool_err(
+                self.name(),
+                format!("截图未生成: {};命令输出={}", e, output),
+            )
+        })?;
         let size_bytes = meta.len();
         let body = json!({
             "path": output_path,
@@ -685,7 +984,7 @@ impl Tool for WindowInspectTool {
             .unwrap_or(3)
             .clamp(1, 12) as usize;
         let filter = get_str(&args, "filter").map(str::to_string);
-        driver_preflight(self.name())?;
+        driver_preflight(self.name()).await?;
         run_blocking(self.name(), move || {
             let driver = current_driver();
             let tree = driver.inspect(&window_id, max_depth, filter.as_deref())?;
@@ -740,7 +1039,7 @@ impl Tool for WindowActionTool {
         let action_name = require_str(&args, "action", self.name())?;
         let text = get_str(&args, "text").map(str::to_string);
         let action = ControlAction::parse(action_name, text)?;
-        driver_preflight(self.name())?;
+        driver_preflight(self.name()).await?;
         run_blocking(self.name(), move || {
             let driver = current_driver();
             driver.act(&window_id, &path, action)
@@ -948,6 +1247,35 @@ mod tests {
     }
 
     #[test]
+    fn window_query_aliases_cover_localized_wechat() {
+        assert_eq!(
+            expand_window_query("WeChat"),
+            vec!["WeChat".to_string(), "微信".to_string()]
+        );
+        assert_eq!(
+            expand_window_query("微信"),
+            vec!["微信".to_string(), "WeChat".to_string()]
+        );
+        assert_eq!(expand_window_query("Safari"), vec!["Safari".to_string()]);
+    }
+
+    #[tokio::test]
+    #[ignore = "会启动/激活本机微信,仅人工桌面环境验证;不发送消息"]
+    async fn window_open_finds_localized_wechat_without_sending() {
+        let output = WindowOpenTool
+            .execute(json!({"query":"WeChat","wait_seconds":8}))
+            .await
+            .expect("应能打开/激活微信并定位窗口");
+        let value: Value = serde_json::from_str(&output).expect("WindowOpen 应返回 JSON");
+        assert_eq!(value["ok"], json!(true));
+        assert!(value["window_id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(
+            value["matched_query"].as_str() == Some("WeChat")
+                || value["matched_query"].as_str() == Some("微信")
+        );
+    }
+
+    #[test]
     fn pick_top_hit_picks_higher_score_field() {
         // 测试同 query 在不同字段都有命中
         let wins = vec![
@@ -1023,12 +1351,15 @@ mod tests {
     /// 注意:此测试仅在 macOS 上运行,且会触发系统权限弹窗(如果未授权)。
     /// 为避免干扰正常测试流程,使用 #[ignore] 标记,需要时手动运行:
     ///   cargo test --lib -- --ignored
-    #[test]
+    #[tokio::test]
     #[ignore = "会触发系统权限弹窗,需手动运行"]
-    fn driver_preflight_requests_ax_permission_on_macos() {
+    async fn driver_preflight_requests_ax_permission_on_macos() {
         if cfg!(target_os = "macos") {
+            unsafe {
+                std::env::set_var("LAEW_AX_WAIT_SECS", "0");
+            }
             // 调用 driver_preflight,如果未授权应触发弹窗
-            let result = driver_preflight("TestTool");
+            let result = driver_preflight("TestTool").await;
             // 结果取决于用户是否授权:
             // - 已授权 → Ok(())
             // - 未授权但用户弹窗后授权 → Ok(())

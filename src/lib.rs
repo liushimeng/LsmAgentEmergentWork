@@ -15,4 +15,6 @@ pub mod database;
 pub mod error;
 pub mod llm;
 pub mod session;
+#[cfg(test)]
+pub mod test_support;
 pub mod tui;

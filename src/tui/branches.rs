@@ -150,8 +150,22 @@ mod tests {
     #[test]
     fn snapshot_names_increment() {
         let mut store = BranchStore::new();
-        let a = store.snapshot("rewind", "n1", &sample_session(1), &[], Usage::default(), "t".into());
-        let b = store.snapshot("rewind", "n2", &sample_session(2), &[], Usage::default(), "t".into());
+        let a = store.snapshot(
+            "rewind",
+            "n1",
+            &sample_session(1),
+            &[],
+            Usage::default(),
+            "t".into(),
+        );
+        let b = store.snapshot(
+            "rewind",
+            "n2",
+            &sample_session(2),
+            &[],
+            Usage::default(),
+            "t".into(),
+        );
         assert_eq!(a, "rewind-1");
         assert_eq!(b, "rewind-2");
         assert_eq!(store.len(), 2);
@@ -208,8 +222,22 @@ mod tests {
     fn counter_survives_eviction_no_name_reuse() {
         let mut store = BranchStore::new();
         store.cap = 1;
-        let a = store.snapshot("rewind", "n", &sample_session(1), &[], Usage::default(), "t".into());
-        let b = store.snapshot("rewind", "n", &sample_session(1), &[], Usage::default(), "t".into());
+        let a = store.snapshot(
+            "rewind",
+            "n",
+            &sample_session(1),
+            &[],
+            Usage::default(),
+            "t".into(),
+        );
+        let b = store.snapshot(
+            "rewind",
+            "n",
+            &sample_session(1),
+            &[],
+            Usage::default(),
+            "t".into(),
+        );
         assert_eq!(a, "rewind-1");
         assert_eq!(b, "rewind-2", "淘汰后 counter 不回退,分支名不复用");
     }
@@ -217,8 +245,22 @@ mod tests {
     #[test]
     fn list_is_newest_first() {
         let mut store = BranchStore::new();
-        store.snapshot("rewind", "n1", &sample_session(1), &[], Usage::default(), "t".into());
-        store.snapshot("fork", "n2", &sample_session(1), &[], Usage::default(), "t".into());
+        store.snapshot(
+            "rewind",
+            "n1",
+            &sample_session(1),
+            &[],
+            Usage::default(),
+            "t".into(),
+        );
+        store.snapshot(
+            "fork",
+            "n2",
+            &sample_session(1),
+            &[],
+            Usage::default(),
+            "t".into(),
+        );
         let names: Vec<&str> = store.list().iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["fork-2", "rewind-1"]);
     }
@@ -237,7 +279,14 @@ mod tests {
         let snap = store.get(&name).unwrap();
         assert_eq!(BranchStore::last_turn_preview(snap), "输入1");
 
-        let empty = store.snapshot("clear", "n", &sample_session(0), &[], Usage::default(), "t".into());
+        let empty = store.snapshot(
+            "clear",
+            "n",
+            &sample_session(0),
+            &[],
+            Usage::default(),
+            "t".into(),
+        );
         assert_eq!(
             BranchStore::last_turn_preview(store.get(&empty).unwrap()),
             "",

@@ -24,13 +24,15 @@ use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef
 use core_foundation::base::{CFIndex, CFRelease, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBooleanRef;
 use core_foundation::dictionary::{CFDictionaryGetValue, CFDictionaryRef};
-use core_foundation::number::{CFNumberGetValue, CFNumberRef, kCFNumberSInt64Type};
+use core_foundation::number::{kCFNumberSInt64Type, CFNumberGetValue, CFNumberRef};
 use core_foundation::string::{
-    CFStringCreateWithCString, CFStringGetCString, CFStringGetCStringPtr, CFStringGetLength,
-    CFStringRef, kCFStringEncodingUTF8,
+    kCFStringEncodingUTF8, CFStringCreateWithCString, CFStringGetCString, CFStringGetCStringPtr,
+    CFStringGetLength, CFStringRef,
 };
 
-use super::{matches_filter, platform_err, ControlAction, ControlNode, Rect, WindowDriver, WindowInfo};
+use super::{
+    matches_filter, platform_err, ControlAction, ControlNode, Rect, WindowDriver, WindowInfo,
+};
 use crate::error::Result;
 
 // ===================== FFI 声明 =====================
@@ -79,7 +81,11 @@ extern "C" {
         value: CFTypeRef,
     ) -> AXError;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
-    fn AXValueGetValue(value: CFTypeRef, the_type: AXValueType, value_ptr: *mut std::ffi::c_void) -> Boolean;
+    fn AXValueGetValue(
+        value: CFTypeRef,
+        the_type: AXValueType,
+        value_ptr: *mut std::ffi::c_void,
+    ) -> Boolean;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -128,6 +134,7 @@ struct AxStrings {
     focused: usize,
     press_action: usize,
     trusted_check_prompt: usize,
+    manual_accessibility: usize,
 }
 
 static AX_STRINGS: OnceLock<AxStrings> = OnceLock::new();
@@ -151,6 +158,7 @@ fn ax_strings() -> &'static AxStrings {
             focused: cfstr_literal("AXFocused"),
             press_action: cfstr_literal("AXPress"),
             trusted_check_prompt: cfstr_literal("AXTrustedCheckOptionPrompt"),
+            manual_accessibility: cfstr_literal("AXManualAccessibility"),
         }
     })
 }
@@ -172,17 +180,54 @@ fn ax_strings_loaded() -> bool {
 
 // 让外部调用点保持 `kAX<X>Attribute` / `kAXPressAction` 的可读命名,提供等价 inline getter。
 // 语义上等价于 SDK 的 `CFSTR("...")` 常量,但实际数据走 `ax_strings()` 缓存。
-#[inline] fn kAXChildrenAttribute()      -> CFStringRef { ax_strings().children as CFStringRef }
-#[inline] fn kAXRoleAttribute()           -> CFStringRef { ax_strings().role as CFStringRef }
-#[inline] fn kAXTitleAttribute()          -> CFStringRef { ax_strings().title as CFStringRef }
-#[inline] fn kAXValueAttribute()          -> CFStringRef { ax_strings().value as CFStringRef }
-#[inline] fn kAXDescriptionAttribute()    -> CFStringRef { ax_strings().description as CFStringRef }
-#[inline] fn kAXPositionAttribute()       -> CFStringRef { ax_strings().position as CFStringRef }
-#[inline] fn kAXSizeAttribute()           -> CFStringRef { ax_strings().size as CFStringRef }
-#[inline] fn kAXWindowsAttribute()        -> CFStringRef { ax_strings().windows as CFStringRef }
-#[inline] fn kAXFocusedAttribute()        -> CFStringRef { ax_strings().focused as CFStringRef }
-#[inline] fn kAXPressAction()             -> CFStringRef { ax_strings().press_action as CFStringRef }
-#[inline] fn kAXTrustedCheckOptionPrompt() -> CFStringRef { ax_strings().trusted_check_prompt as CFStringRef }
+#[inline]
+fn kAXChildrenAttribute() -> CFStringRef {
+    ax_strings().children as CFStringRef
+}
+#[inline]
+fn kAXRoleAttribute() -> CFStringRef {
+    ax_strings().role as CFStringRef
+}
+#[inline]
+fn kAXTitleAttribute() -> CFStringRef {
+    ax_strings().title as CFStringRef
+}
+#[inline]
+fn kAXValueAttribute() -> CFStringRef {
+    ax_strings().value as CFStringRef
+}
+#[inline]
+fn kAXDescriptionAttribute() -> CFStringRef {
+    ax_strings().description as CFStringRef
+}
+#[inline]
+fn kAXPositionAttribute() -> CFStringRef {
+    ax_strings().position as CFStringRef
+}
+#[inline]
+fn kAXSizeAttribute() -> CFStringRef {
+    ax_strings().size as CFStringRef
+}
+#[inline]
+fn kAXWindowsAttribute() -> CFStringRef {
+    ax_strings().windows as CFStringRef
+}
+#[inline]
+fn kAXFocusedAttribute() -> CFStringRef {
+    ax_strings().focused as CFStringRef
+}
+#[inline]
+fn kAXPressAction() -> CFStringRef {
+    ax_strings().press_action as CFStringRef
+}
+#[inline]
+fn kAXTrustedCheckOptionPrompt() -> CFStringRef {
+    ax_strings().trusted_check_prompt as CFStringRef
+}
+#[inline]
+fn kAXManualAccessibilityAttribute() -> CFStringRef {
+    ax_strings().manual_accessibility as CFStringRef
+}
 
 /// 「辅助功能」未授权时的统一文案(供 require_trusted / permission_hint 共用)。
 ///
@@ -213,9 +258,16 @@ unsafe fn cfstr(s: CFStringRef) -> String {
     let len = CFStringGetLength(s);
     let cap = (len as usize).saturating_mul(4).saturating_add(1);
     let mut buf = vec![0u8; cap];
-    let ok = CFStringGetCString(s, buf.as_mut_ptr().cast(), cap as CFIndex, kCFStringEncodingUTF8);
+    let ok = CFStringGetCString(
+        s,
+        buf.as_mut_ptr().cast(),
+        cap as CFIndex,
+        kCFStringEncodingUTF8,
+    );
     if ok != 0 {
-        CStr::from_ptr(buf.as_ptr().cast()).to_string_lossy().into_owned()
+        CStr::from_ptr(buf.as_ptr().cast())
+            .to_string_lossy()
+            .into_owned()
     } else {
         String::new()
     }
@@ -231,7 +283,11 @@ unsafe fn cfstring_new(s: &str) -> CFStringRef {
 unsafe fn cfnum_i64(n: CFTypeRef) -> i64 {
     let mut out: i64 = 0;
     if !n.is_null() {
-        CFNumberGetValue(n as CFNumberRef, kCFNumberSInt64Type, (&mut out as *mut i64).cast());
+        CFNumberGetValue(
+            n as CFNumberRef,
+            kCFNumberSInt64Type,
+            (&mut out as *mut i64).cast(),
+        );
     }
     out
 }
@@ -276,7 +332,9 @@ fn ax_error_text(code: AXError) -> String {
              中勾选本终端应用(laew 所在终端,如 Terminal/iTerm),然后重试"
                 .to_string()
         }
-        K_AX_ERROR_INVALID_UI_ELEMENT => "控件已失效(窗口可能已关闭或 UI 已刷新),请重新 WindowInspect".into(),
+        K_AX_ERROR_INVALID_UI_ELEMENT => {
+            "控件已失效(窗口可能已关闭或 UI 已刷新),请重新 WindowInspect".into()
+        }
         K_AX_ERROR_ATTRIBUTE_UNSUPPORTED => "该控件不支持此属性(应用未实现对应无障碍属性)".into(),
         K_AX_ERROR_ACTION_UNSUPPORTED => "该控件不支持此动作(应用未实现对应无障碍动作)".into(),
         K_AX_ERROR_CANNOT_COMPLETE => "AX 调用无法完成(目标应用无响应或 IPC 失败)".into(),
@@ -397,12 +455,12 @@ impl MacOsDriver {
                 format!("window_id 格式应为 \"{{pid}}:{{index}}\"(由 WindowList 返回),实际: {window_id}"),
             )
         })?;
-        let pid: i32 = pid_s.parse().map_err(|_| {
-            platform_err("macos", format!("window_id 中 pid 非法: {pid_s}"))
-        })?;
-        let idx: usize = idx_s.parse().map_err(|_| {
-            platform_err("macos", format!("window_id 中 index 非法: {idx_s}"))
-        })?;
+        let pid: i32 = pid_s
+            .parse()
+            .map_err(|_| platform_err("macos", format!("window_id 中 pid 非法: {pid_s}")))?;
+        let idx: usize = idx_s
+            .parse()
+            .map_err(|_| platform_err("macos", format!("window_id 中 index 非法: {idx_s}")))?;
         Ok((pid, idx))
     }
 
@@ -410,8 +468,16 @@ impl MacOsDriver {
     unsafe fn window_element(pid: i32, index: usize) -> Result<AXUIElementRef> {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
-            return Err(platform_err("macos", format!("无法为 pid={pid} 创建 AX 应用元素")));
+            return Err(platform_err(
+                "macos",
+                format!("无法为 pid={pid} 创建 AX 应用元素"),
+            ));
         }
+        // Electron / 自绘应用(含部分微信版本)常支持 AXManualAccessibility 开关。
+        // 打开失败不影响后续窗口读取,因此忽略错误。
+        let true_v: CFBooleanRef =
+            core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
+        let _ = AXUIElementSetAttributeValue(app, kAXManualAccessibilityAttribute(), true_v.cast());
         let wins = ax_get(app, kAXWindowsAttribute());
         CFRelease(app);
         if wins.is_null() {
@@ -446,7 +512,12 @@ impl MacOsDriver {
         let pos = ax_get(el, kAXPositionAttribute());
         if !pos.is_null() {
             let mut p = CGPoint::default();
-            if AXValueGetValue(pos, K_AX_VALUE_CGPOINT_TYPE, (&mut p as *mut CGPoint).cast()) != 0 {
+            if AXValueGetValue(
+                pos,
+                K_AX_VALUE_CGPOINT_TYPE,
+                (&mut p as *mut CGPoint).cast(),
+            ) != 0
+            {
                 rect.x = p.x as i64;
                 rect.y = p.y as i64;
             }
@@ -468,14 +539,21 @@ impl MacOsDriver {
     fn actions_for_role(role: &str) -> Vec<String> {
         let r = role.to_lowercase();
         let mut v = vec!["focus".to_string(), "get_text".to_string()];
-        if r.contains("button") || r.contains("menuitem") || r.contains("checkbox")
-            || r.contains("radio") || r.contains("link") || r.contains("tab")
+        if r.contains("button")
+            || r.contains("menuitem")
+            || r.contains("checkbox")
+            || r.contains("radio")
+            || r.contains("link")
+            || r.contains("tab")
         {
             v.push("click".into());
             v.push("invoke".into());
         }
-        if r.contains("textfield") || r.contains("textarea") || r.contains("combobox")
-            || r.contains("searchfield") || r.contains("securetextfield")
+        if r.contains("textfield")
+            || r.contains("textarea")
+            || r.contains("combobox")
+            || r.contains("searchfield")
+            || r.contains("securetextfield")
         {
             v.push("set_text".into());
         }
@@ -576,7 +654,8 @@ impl MacOsDriver {
             }
             let count = CFArrayGetCount(children as CFArrayRef);
             let next = if (idx as CFIndex) < count {
-                let e = CFArrayGetValueAtIndex(children as CFArrayRef, idx as CFIndex) as AXUIElementRef;
+                let e = CFArrayGetValueAtIndex(children as CFArrayRef, idx as CFIndex)
+                    as AXUIElementRef;
                 if !e.is_null() {
                     core_foundation::base::CFRetain(e);
                 }
@@ -665,7 +744,12 @@ impl WindowDriver for MacOsDriver {
         list_windows_cg(filter)
     }
 
-    fn inspect(&self, window_id: &str, max_depth: usize, filter: Option<&str>) -> Result<ControlNode> {
+    fn inspect(
+        &self,
+        window_id: &str,
+        max_depth: usize,
+        filter: Option<&str>,
+    ) -> Result<ControlNode> {
         self.require_trusted()?;
         let (pid, idx) = Self::parse_window_id(window_id)?;
         let max_depth = max_depth.clamp(1, 12);

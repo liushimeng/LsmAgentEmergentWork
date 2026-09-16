@@ -63,7 +63,11 @@ fn render_markdown_with(text: &str, pal: &Palette) -> RenderLines {
         // --- 围栏代码块(开/闭/内部,优先级最高)---
         if let Some((marker, len, lang)) = fence {
             if is_fence_close(trimmed, marker, len) {
-                out.push(vec![Span::new(trimmed.to_string(), pal.md_fence_fg, attr::NONE)]);
+                out.push(vec![Span::new(
+                    trimmed.to_string(),
+                    pal.md_fence_fg,
+                    attr::NONE,
+                )]);
                 fence = None;
             } else {
                 out.push(highlight_line(raw, lang));
@@ -140,7 +144,12 @@ fn render_markdown_with(text: &str, pal: &Palette) -> RenderLines {
                         for _ in 0..l {
                             spans.push(Span::new("│ ", pal.md_quote_fg, attr::NONE));
                         }
-                        spans.extend(parse_inline(content, pal, pal.md_quote_body_fg, pal.md_quote_attrs));
+                        spans.extend(parse_inline(
+                            content,
+                            pal,
+                            pal.md_quote_body_fg,
+                            pal.md_quote_attrs,
+                        ));
                         out.push(spans);
                         i += 1;
                     }
@@ -161,7 +170,11 @@ fn render_markdown_with(text: &str, pal: &Palette) -> RenderLines {
                     spans.push(Span::new("•", pal.md_list_marker_fg, attr::BOLD));
                 }
                 ItemMarker::Ordered(num, close) => {
-                    spans.push(Span::new(format!("{num}{close}"), pal.md_list_marker_fg, attr::BOLD));
+                    spans.push(Span::new(
+                        format!("{num}{close}"),
+                        pal.md_list_marker_fg,
+                        attr::BOLD,
+                    ));
                 }
                 ItemMarker::Task(done) => {
                     let (ch, fg) = if done {
@@ -316,7 +329,11 @@ fn parse_list_item(line: &str) -> Option<ListItem<'_>> {
             if ch.get(n + 1).is_some_and(|c| *c != ' ' && *c != '\t') {
                 return None;
             }
-            let num: u64 = ch[..n.min(9)].iter().collect::<String>().parse().unwrap_or(0);
+            let num: u64 = ch[..n.min(9)]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
             (ItemMarker::Ordered(num, close), n + 1)
         }
         _ => return None,
@@ -332,7 +349,11 @@ fn parse_list_item(line: &str) -> Option<ListItem<'_>> {
             });
         }
     }
-    Some(ListItem { indent: indent.min(12), marker, content })
+    Some(ListItem {
+        indent: indent.min(12),
+        marker,
+        content,
+    })
 }
 
 /// 剥离任务框 `[ ] `/`[x] `,返回 (剩余内容, 是否完成)。
@@ -480,7 +501,11 @@ fn render_table(
     let border = |l: char, m: char, r: char| -> Vec<Span> {
         let mut v = vec![Span::new(l.to_string(), pal.md_table_border_fg, attr::NONE)];
         for (ci, w) in widths.iter().enumerate() {
-            v.push(Span::new("─".repeat(w + 2), pal.md_table_border_fg, attr::NONE));
+            v.push(Span::new(
+                "─".repeat(w + 2),
+                pal.md_table_border_fg,
+                attr::NONE,
+            ));
             v.push(Span::new(
                 if ci + 1 == ncols { r } else { m }.to_string(),
                 pal.md_table_border_fg,
@@ -499,7 +524,11 @@ fn render_table(
                 Some(Align::Center) => (pad / 2, pad - pad / 2),
                 _ => (0usize, pad),
             };
-            v.push(Span::new(" ".repeat(left + 1), pal.md_table_border_fg, attr::NONE));
+            v.push(Span::new(
+                " ".repeat(left + 1),
+                pal.md_table_border_fg,
+                attr::NONE,
+            ));
             for s in sp {
                 let mut s2 = s.clone();
                 if bold {
@@ -507,7 +536,11 @@ fn render_table(
                 }
                 v.push(s2);
             }
-            v.push(Span::new(" ".repeat(right + 1), pal.md_table_border_fg, attr::NONE));
+            v.push(Span::new(
+                " ".repeat(right + 1),
+                pal.md_table_border_fg,
+                attr::NONE,
+            ));
             v.push(Span::new("│", pal.md_table_border_fg, attr::NONE));
         }
         // 行首补一条左边框
@@ -532,9 +565,40 @@ fn render_table(
 // ============================================================
 
 fn is_inline_punct(c: char) -> bool {
-    matches!(c, '!' | '"' | '#' | '$' | '%' | '&' | '\'' | '(' | ')' | '*' | '+'
-        | ',' | '-' | '.' | '/' | ':' | ';' | '<' | '=' | '>' | '?' | '@'
-        | '[' | '\\' | ']' | '^' | '_' | '`' | '{' | '|' | '}' | '~')
+    matches!(
+        c,
+        '!' | '"'
+            | '#'
+            | '$'
+            | '%'
+            | '&'
+            | '\''
+            | '('
+            | ')'
+            | '*'
+            | '+'
+            | ','
+            | '-'
+            | '.'
+            | '/'
+            | ':'
+            | ';'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '['
+            | '\\'
+            | ']'
+            | '^'
+            | '_'
+            | '`'
+            | '{'
+            | '|'
+            | '}'
+            | '~'
+    )
 }
 
 /// 行内解析:s → Span 序列。`base_fg` / `base_attrs` 为外层累积样式
@@ -687,7 +751,11 @@ fn parse_inline(s: &str, pal: &Palette, base_fg: Color, base_attrs: u8) -> Vec<S
             if let Some(j) = find_autolink_end(&ch, i) {
                 let inner: String = ch[i + 1..j].iter().collect();
                 flush!();
-                out.push(Span::new(inner, pal.md_link_fg, base_attrs | pal.md_link_attrs));
+                out.push(Span::new(
+                    inner,
+                    pal.md_link_fg,
+                    base_attrs | pal.md_link_attrs,
+                ));
                 i = j + 1;
                 continue;
             }
@@ -704,7 +772,11 @@ fn em_link(text: &str, url: &str, pal: &Palette, base_attrs: u8) -> Vec<Span> {
     let mut spans = parse_inline(text, pal, pal.md_link_fg, base_attrs | pal.md_link_attrs);
     let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
     if !url.is_empty() && url != plain {
-        spans.push(Span::new(format!(" ({url})"), pal.md_link_url_fg, attr::NONE));
+        spans.push(Span::new(
+            format!(" ({url})"),
+            pal.md_link_url_fg,
+            attr::NONE,
+        ));
     }
     spans
 }
@@ -763,7 +835,10 @@ fn parse_link(ch: &[char], start: usize) -> Option<(usize, String, String)> {
 /// URL 规整:剥离 `<>` 包裹与 `"title"` / `'title'` / `(title)` 后缀。
 fn normalize_url(raw: &str) -> String {
     let t = raw.trim();
-    let t = t.strip_prefix('<').and_then(|s| s.strip_suffix('>')).unwrap_or(t);
+    let t = t
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(t);
     // title 段:最后一个空格之后的引号内容
     if let Some(pos) = t.find(' ') {
         let tail = &t[pos + 1..];
@@ -778,7 +853,10 @@ fn normalize_url(raw: &str) -> String {
 
 /// 自动链接内容结束位置:到 '>' 且内部无空格且以协议前缀开始。
 fn find_autolink_end(ch: &[char], i: usize) -> Option<usize> {
-    let j = ch[i + 1..].iter().position(|&c| c == '>').map(|p| i + 1 + p)?;
+    let j = ch[i + 1..]
+        .iter()
+        .position(|&c| c == '>')
+        .map(|p| i + 1 + p)?;
     let inner: String = ch[i + 1..j].iter().collect();
     if inner.contains(' ') || inner.is_empty() {
         return None;
@@ -928,9 +1006,15 @@ mod tests {
     #[test]
     fn hr_recognized_and_distinguishes_workflow_label() {
         assert_eq!(plain1(&render_markdown_with("---", &pal())), "─".repeat(42));
-        assert_eq!(plain1(&render_markdown_with("- - -", &pal())), "─".repeat(42));
+        assert_eq!(
+            plain1(&render_markdown_with("- - -", &pal())),
+            "─".repeat(42)
+        );
         // 含其它字符的 --- WorkFlow 1 --- 不是 hr
-        assert_eq!(plain1(&render_markdown_with("--- WorkFlow 1 ---", &pal())), "--- WorkFlow 1 ---");
+        assert_eq!(
+            plain1(&render_markdown_with("--- WorkFlow 1 ---", &pal())),
+            "--- WorkFlow 1 ---"
+        );
     }
 
     // ---------- 块级:围栏 ----------
@@ -1012,7 +1096,9 @@ mod tests {
         assert!(rows[3].contains('1') && rows[3].contains('2'));
         assert!(rows[4].starts_with('└'));
         // 表头样式
-        let header_bold = out[1].iter().any(|s| s.attrs & attr::BOLD != 0 && s.text.contains("列A"));
+        let header_bold = out[1]
+            .iter()
+            .any(|s| s.attrs & attr::BOLD != 0 && s.text.contains("列A"));
         assert!(header_bold);
     }
 
@@ -1059,9 +1145,18 @@ mod tests {
 
     #[test]
     fn inline_unclosed_markers_pass_through() {
-        assert_eq!(plain1(&render_markdown_with("**未闭合粗体", &pal())), "**未闭合粗体");
-        assert_eq!(plain1(&render_markdown_with("~~未闭合", &pal())), "~~未闭合");
-        assert_eq!(plain1(&render_markdown_with("`未闭合码", &pal())), "`未闭合码");
+        assert_eq!(
+            plain1(&render_markdown_with("**未闭合粗体", &pal())),
+            "**未闭合粗体"
+        );
+        assert_eq!(
+            plain1(&render_markdown_with("~~未闭合", &pal())),
+            "~~未闭合"
+        );
+        assert_eq!(
+            plain1(&render_markdown_with("`未闭合码", &pal())),
+            "`未闭合码"
+        );
     }
 
     #[test]
@@ -1109,8 +1204,14 @@ mod tests {
 
     #[test]
     fn broken_link_pass_through() {
-        assert_eq!(plain1(&render_markdown_with("[文本] 无括号", &pal())), "[文本] 无括号");
-        assert_eq!(plain1(&render_markdown_with("数组 a[0] 取值", &pal())), "数组 a[0] 取值");
+        assert_eq!(
+            plain1(&render_markdown_with("[文本] 无括号", &pal())),
+            "[文本] 无括号"
+        );
+        assert_eq!(
+            plain1(&render_markdown_with("数组 a[0] 取值", &pal())),
+            "数组 a[0] 取值"
+        );
     }
 
     #[test]
@@ -1123,7 +1224,10 @@ mod tests {
 
     #[test]
     fn backslash_escape() {
-        assert_eq!(plain1(&render_markdown_with("价格 \\$5 不变", &pal())), "价格 $5 不变");
+        assert_eq!(
+            plain1(&render_markdown_with("价格 \\$5 不变", &pal())),
+            "价格 $5 不变"
+        );
     }
 
     #[test]
@@ -1140,7 +1244,10 @@ mod tests {
     fn plain_text_passthrough_unchanged() {
         let src = "这是一段普通中文说明,含 [附件] 与 # 号及 --- 符号组合但不构成语法。\n第二行 1) 无空格不算列表";
         let out = render_markdown_with(src, &pal());
-        assert_eq!(plain(&out)[0], "这是一段普通中文说明,含 [附件] 与 # 号及 --- 符号组合但不构成语法。");
+        assert_eq!(
+            plain(&out)[0],
+            "这是一段普通中文说明,含 [附件] 与 # 号及 --- 符号组合但不构成语法。"
+        );
         assert_eq!(plain(&out)[1], "第二行 1) 无空格不算列表");
     }
 

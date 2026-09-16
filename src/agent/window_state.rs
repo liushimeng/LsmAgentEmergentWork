@@ -244,12 +244,16 @@ impl WindowStateManager {
 
     /// 保存窗口状态(覆盖写入)。
     pub async fn save(&self, session_id: &str, state: &WindowSessionState) -> Result<()> {
-        self.db.save_window_state(session_id, state).map_err(AgentError::from)
+        self.db
+            .save_window_state(session_id, state)
+            .map_err(AgentError::from)
     }
 
     /// 删除指定 session 的窗口状态(Session 结束时可选调用)。
     pub async fn delete(&self, session_id: &str) -> Result<()> {
-        self.db.delete_window_state(session_id).map_err(AgentError::from)
+        self.db
+            .delete_window_state(session_id)
+            .map_err(AgentError::from)
     }
 }
 
@@ -274,6 +278,17 @@ pub fn build_window_state_prompt(state: &WindowSessionState) -> String {
         }
     }
 
+    // 2026-09-16 第 61 轮:已知窗口是连续操控的核心状态。
+    if !state.known_windows.is_empty() {
+        out.push_str("已知窗口(最近在前,window_id 可能随窗口重开失效,操作失败时必须重新枚举):\n");
+        for w in state.known_windows.iter().rev().take(10) {
+            out.push_str(&format!(
+                "  - id={} title={} process={} pid={}\n",
+                w.window_id, w.title, w.process_name, w.pid
+            ));
+        }
+    }
+
     // 2. 窗口别名
     if !state.window_aliases.is_empty() {
         out.push_str("窗口别名:\n");
@@ -288,20 +303,10 @@ pub fn build_window_state_prompt(state: &WindowSessionState) -> String {
         let total = state.action_history.len();
         for (i, rec) in state.action_history.iter().rev().take(5).enumerate() {
             let seq = total - i;
-            let ts_short = rec
-                .timestamp
-                .chars()
-                .skip(11)
-                .take(8)
-                .collect::<String>();
+            let ts_short = rec.timestamp.chars().skip(11).take(8).collect::<String>();
             out.push_str(&format!(
                 "  {}. [{}] \"{}\" {} → path={} → {}\n",
-                seq,
-                ts_short,
-                rec.window_title,
-                rec.action,
-                rec.path,
-                rec.result_summary
+                seq, ts_short, rec.window_title, rec.action, rec.path, rec.result_summary
             ));
         }
     }
@@ -367,56 +372,84 @@ pub fn extract_window_state_from_trace(
     state: &mut WindowSessionState,
     trace: &crate::agent::extrace::ExecutionTrace,
 ) {
-    let mut known: Vec<WindowSnapshot> = Vec::new();
-    let mut saw_window_list = false;
+    let mut latest_window: Option<WindowSnapshot> = None;
 
     for entry in &trace.tool_call_log {
         if !entry.ok {
             continue;
         }
         match entry.tool.as_str() {
-            "WindowList" | "WindowFind" => {
-                // WindowList / WindowFind 调用过(trace 不存输出,留作扩展位)。
-                saw_window_list = true;
+            "WindowList" | "WindowFind" | "WindowOpen" => {
+                let Some(found) = parse_window_snapshots(&entry.output_summary) else {
+                    continue;
+                };
+                if found.is_empty() {
+                    continue;
+                }
+                state.update_known_windows(found.clone());
+                latest_window = found.into_iter().last();
+
+                // WindowFind / WindowOpen 的 query 沉淀为别名,下一轮直接复用。
+                if entry.tool != "WindowList" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&entry.args_json) {
+                        if let Some(query) = args.get("query").and_then(serde_json::Value::as_str) {
+                            if let Some(w) = &latest_window {
+                                state.set_alias(query, &w.window_id);
+                            }
+                        }
+                    }
+                }
             }
             "WindowAction" => {
-                let parsed: Option<serde_json::Value> =
-                    serde_json::from_str(&entry.args_json).ok();
-                let args = match parsed {
-                    Some(a) => a,
-                    None => continue,
+                let Ok(args) = serde_json::from_str::<serde_json::Value>(&entry.args_json) else {
+                    continue;
                 };
-                let window_id = match args.get("window_id").and_then(serde_json::Value::as_str) {
-                    Some(s) => s.to_string(),
-                    None => continue,
+                let Some(window_id) = args.get("window_id").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
                 };
-                let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or("/").to_string();
-                let action = args.get("action").and_then(serde_json::Value::as_str).unwrap_or("?").to_string();
-                let text = args.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
-                let result_summary = if !text.is_empty() {
-                    format!("{action} {path} text={text}")
-                } else {
+                let path = args
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("/")
+                    .to_string();
+                let action = args
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                let text = args
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let result_summary = if text.is_empty() {
                     format!("{action} {path}")
+                } else {
+                    format!("{action} {path} text={text}")
                 };
-                // 推入 known_windows 占位(标题/进程名留空,后续 WindowList 补)
-                known.push(WindowSnapshot {
-                    window_id: window_id.clone(),
-                    title: String::new(),
-                    process_name: String::new(),
-                    pid: 0,
-                    last_inspect_path: None,
-                    known_controls: Vec::new(),
-                });
-                // 直接 push WindowActionRecord 到 history(标题用空串占位)
+                let known_meta = state
+                    .known_windows
+                    .iter()
+                    .find(|w| w.window_id == window_id)
+                    .cloned()
+                    .unwrap_or_else(|| WindowSnapshot {
+                        window_id: window_id.to_string(),
+                        title: String::new(),
+                        process_name: String::new(),
+                        pid: 0,
+                        last_inspect_path: None,
+                        known_controls: Vec::new(),
+                    });
+                state.update_known_windows(vec![known_meta.clone()]);
+                latest_window = Some(known_meta);
                 state.action_history.push(WindowActionRecord {
                     timestamp: now_readable(),
-                    window_id,
+                    window_id: window_id.to_string(),
                     window_title: String::new(),
                     path,
                     action,
                     result_summary,
                 });
-                // 维持 MAX_HISTORY 上限(record_action 内部已处理)
                 if state.action_history.len() > MAX_HISTORY {
                     let excess = state.action_history.len() - MAX_HISTORY;
                     state.action_history.drain(0..excess);
@@ -425,9 +458,49 @@ pub fn extract_window_state_from_trace(
             _ => {}
         }
     }
-    if saw_window_list && !known.is_empty() {
-        state.update_known_windows(known);
+    if let Some(w) = latest_window {
+        state.last_window = Some(w);
     }
+    state.updated_at = now_readable();
+}
+
+/// 从 WindowList / WindowFind / WindowOpen 的成功输出摘要恢复窗口快照。
+fn parse_window_snapshots(output: &str) -> Option<Vec<WindowSnapshot>> {
+    let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
+    let arr = if let serde_json::Value::Array(items) = &value {
+        items.clone()
+    } else if let serde_json::Value::Object(obj) = &value {
+        if let Some(items) = obj.get("windows").and_then(|v| v.as_array()) {
+            items.clone()
+        } else if obj.contains_key("window_id") {
+            vec![value.clone()]
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(window_id) = item
+            .get("window_id")
+            .or_else(|| item.get("id"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        out.push(WindowSnapshot::simple(
+            window_id,
+            item.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            item.get("process_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            item.get("pid").and_then(|v| v.as_u64()).unwrap_or_default() as u32,
+        ));
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -448,15 +521,7 @@ mod tests {
     fn record_action_caps_history() {
         let mut s = WindowSessionState::new("s1");
         for i in 0..(MAX_HISTORY + 5) {
-            s.record_action(
-                &format!("w{i}"),
-                "t",
-                "p",
-                i as u32,
-                "/0",
-                "click",
-                "ok",
-            );
+            s.record_action(&format!("w{i}"), "t", "p", i as u32, "/0", "click", "ok");
         }
         assert_eq!(s.action_history.len(), MAX_HISTORY);
         // 最新的应在末尾
@@ -508,13 +573,28 @@ mod tests {
     #[test]
     fn build_prompt_includes_last_window_and_history() {
         let mut s = WindowSessionState::new("s1");
-        s.record_action("w1", "记事本", "notepad.exe", 1234, "/0/1", "set_text", "输入hello");
+        s.record_action(
+            "w1",
+            "记事本",
+            "notepad.exe",
+            1234,
+            "/0/1",
+            "set_text",
+            "输入hello",
+        );
+        s.update_known_windows(vec![WindowSnapshot::simple(
+            "w1",
+            "记事本",
+            "notepad.exe",
+            1234,
+        )]);
         s.set_alias("我的记事本", "w1");
         let prompt = build_window_state_prompt(&s);
         assert!(prompt.contains("记事本"));
         assert!(prompt.contains("set_text"));
         assert!(prompt.contains("我的记事本"));
         assert!(prompt.contains("w1"));
+        assert!(prompt.contains("已知窗口"));
         assert!(prompt.contains("输入hello"));
     }
 
@@ -583,7 +663,7 @@ mod tests {
             "text": ""
         })
         .to_string();
-        trace.record_tool_call("WindowAction", &args_ok, true, 256, 100, "");
+        trace.record_tool_call("WindowAction", &args_ok, true, 256, 100, "", "");
 
         let args_fail = serde_json::json!({
             "window_id": "w-456",
@@ -591,7 +671,15 @@ mod tests {
             "action": "click"
         })
         .to_string();
-        trace.record_tool_call("WindowAction", &args_fail, false, 128, 50, "PathInvalid: / 越界");
+        trace.record_tool_call(
+            "WindowAction",
+            &args_fail,
+            false,
+            128,
+            50,
+            "PathInvalid: / 越界",
+            "",
+        );
 
         extract_window_state_from_trace(&mut state, &trace);
         // 仅成功调用写入 action_history
@@ -605,14 +693,14 @@ mod tests {
         let mut state = WindowSessionState::new("s1");
         let mut trace = crate::agent::extrace::ExecutionTrace::default();
         // WindowList 调用 + WindowAction 调用 → 应同时填充 known_windows
-        trace.record_tool_call("WindowList", "{}", true, 1024, 50, "");
+        trace.record_tool_call("WindowList", "{}", true, 1024, 50, "", "[]");
         let args = serde_json::json!({
             "window_id": "w-789",
             "path": "/0",
             "action": "focus"
         })
         .to_string();
-        trace.record_tool_call("WindowAction", &args, true, 64, 100, "");
+        trace.record_tool_call("WindowAction", &args, true, 64, 100, "", "");
 
         extract_window_state_from_trace(&mut state, &trace);
         assert_eq!(state.known_windows.len(), 1);
@@ -621,18 +709,34 @@ mod tests {
     }
 
     #[test]
+    fn extract_window_state_recovers_window_find_output_and_alias() {
+        let mut state = WindowSessionState::new("s1");
+        let mut trace = crate::agent::extrace::ExecutionTrace::default();
+        let args = r#"{"query":"WeChat","match_mode":"contains"}"#;
+        let output = r#"{"window_id":"1551:0","title":"微信","process_name":"微信","pid":1551}"#;
+        trace.record_tool_call("WindowFind", args, true, output.len(), 12, "", output);
+
+        extract_window_state_from_trace(&mut state, &trace);
+        assert_eq!(state.last_window.as_ref().unwrap().window_id, "1551:0");
+        assert_eq!(state.known_windows[0].process_name, "微信");
+        assert_eq!(state.resolve_alias("WeChat"), Some("1551:0"));
+    }
+
+    #[test]
     fn record_tool_call_respects_max_log_len() {
         use crate::agent::extrace::MAX_TOOL_CALL_LOG;
         let mut trace = crate::agent::extrace::ExecutionTrace::default();
         // 写入 MAX_TOOL_CALL_LOG + 5 条,验证 FIFO 截断
         for i in 0..(MAX_TOOL_CALL_LOG + 5) {
-            trace.record_tool_call("Test", &format!("{{\"i\":{i}}}"), true, 0, 0, "");
+            trace.record_tool_call("Test", &format!("{{\"i\":{i}}}"), true, 0, 0, "", "");
         }
         assert_eq!(trace.tool_call_log.len(), MAX_TOOL_CALL_LOG);
         // 最早的 5 条应被截断,留下的应是 i=5..MAX
         let first = &trace.tool_call_log[0];
         assert!(first.args_json.contains("\"i\":5"));
         let last = trace.tool_call_log.last().unwrap();
-        assert!(last.args_json.contains(&format!("\"i\":{}", MAX_TOOL_CALL_LOG + 4)));
+        assert!(last
+            .args_json
+            .contains(&format!("\"i\":{}", MAX_TOOL_CALL_LOG + 4)));
     }
 }

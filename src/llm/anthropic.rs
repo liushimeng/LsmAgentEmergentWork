@@ -257,12 +257,8 @@ mod cache_policy_tests {
         let sys_blocks = convert_system_blocks(system);
         let tool_blocks = convert_tools(&tools);
         let msg_blocks = convert_messages(&messages);
-        let (sys_blocks, tool_blocks, msg_blocks, _) = apply_cache_policy(
-            DEFAULT_CACHE_POLICY,
-            sys_blocks,
-            tool_blocks,
-            msg_blocks,
-        );
+        let (sys_blocks, tool_blocks, msg_blocks, _) =
+            apply_cache_policy(DEFAULT_CACHE_POLICY, sys_blocks, tool_blocks, msg_blocks);
 
         // 1) last tool
         assert!(tool_blocks.last().unwrap().get("cache_control").is_some());
@@ -422,12 +418,8 @@ impl LlmClient for AnthropicClient {
         let sys_blocks = convert_system_blocks(system);
         let tool_blocks = convert_tools(tools);
         let msg_blocks = convert_messages(messages);
-        let (sys_blocks, tool_blocks, msg_blocks, _bp) = apply_cache_policy(
-            DEFAULT_CACHE_POLICY,
-            sys_blocks,
-            tool_blocks,
-            msg_blocks,
-        );
+        let (sys_blocks, tool_blocks, msg_blocks, _bp) =
+            apply_cache_policy(DEFAULT_CACHE_POLICY, sys_blocks, tool_blocks, msg_blocks);
 
         let req = AnthropicRequest {
             model: self.model.clone(),
@@ -435,14 +427,18 @@ impl LlmClient for AnthropicClient {
             // 会话级 MaxTokensState 在 LLM 输出被截断时翻倍,默认 8K → 16K → 32K → 64K 上限。
             // 协议层仅负责读取 meta 注入的 override,不参与升级逻辑。
             max_tokens: meta.max_tokens_override.unwrap_or(DEFAULT_MAX_TOKENS),
-            system: if sys_blocks.is_empty() { None } else { Some(sys_blocks) },
+            system: if sys_blocks.is_empty() {
+                None
+            } else {
+                Some(sys_blocks)
+            },
             messages: msg_blocks,
             tools: tool_blocks,
             // 结构化输出强制通道(L6/L19):forced 指名调用 + 禁并行,
             // 引导模型先 Read 后单独 submit(分轮),避免混合并行调用被忽略。
-            tool_choice: meta.forced_tool.as_ref().map(|name| {
-                json!({ "type": "tool", "name": name, "disable_parallel_tool_use": true })
-            }),
+            tool_choice: meta.forced_tool.as_ref().map(
+                |name| json!({ "type": "tool", "name": name, "disable_parallel_tool_use": true }),
+            ),
             metadata: Some(Metadata {
                 user_id: build_user_id(&meta.device_id, &meta.session_id, agent_name),
             }),
@@ -467,11 +463,7 @@ impl LlmClient for AnthropicClient {
         // (此前 connect_timeout 只管握手,流内 idle/总超时只在拿到 Response 后生效)
         let resp = tokio::time::timeout(
             crate::llm::resilient::RESPONSE_HEADERS_TIMEOUT,
-            self.http
-                .post(&self.url)
-                .headers(headers)
-                .json(&req)
-                .send(),
+            self.http.post(&self.url).headers(headers).json(&req).send(),
         )
         .await
         .map_err(|_| {
@@ -900,7 +892,10 @@ mod tests {
         };
         let s = serde_json::to_string(&req).unwrap();
         let v: Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["tool_choice"]["type"], "tool", "forced wire 应为 tool 指名形态");
+        assert_eq!(
+            v["tool_choice"]["type"], "tool",
+            "forced wire 应为 tool 指名形态"
+        );
         assert_eq!(v["tool_choice"]["name"], "submit_task_classification");
         assert_eq!(
             v["tool_choice"]["disable_parallel_tool_use"], true,
@@ -1013,7 +1008,9 @@ mod tests {
         let v = convert_messages(&msgs);
         assert_eq!(v.len(), 3);
         assert_eq!(
-            v.iter().map(|m| m["role"].as_str().unwrap()).collect::<Vec<_>>(),
+            v.iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
             vec!["user", "assistant", "user"]
         );
     }

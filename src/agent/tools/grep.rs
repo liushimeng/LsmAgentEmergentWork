@@ -97,10 +97,7 @@ impl Tool for GrepTool {
             _ => OutputMode::FilesWithMatches,
         };
 
-        let context = args
-            .get("context")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        let context = args.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
         let before_context = args
             .get("before_context")
             .and_then(Value::as_u64)
@@ -188,7 +185,11 @@ impl Tool for GrepTool {
         // 根据输出模式返回
         match output_mode {
             OutputMode::FilesWithMatches => {
-                let limit = if head_limit == 0 { DEFAULT_LIMIT } else { head_limit };
+                let limit = if head_limit == 0 {
+                    DEFAULT_LIMIT
+                } else {
+                    head_limit
+                };
                 let slice = if files_with_matches.len() > limit {
                     &files_with_matches[..limit]
                 } else {
@@ -231,10 +232,7 @@ impl Tool for GrepTool {
                     pattern, total_matches, result_buf
                 );
                 if truncated {
-                    result_buf.push_str(&format!(
-                        "...[截断,已达到 head_limit={}]\n",
-                        head_limit
-                    ));
+                    result_buf.push_str(&format!("...[截断,已达到 head_limit={}]\n", head_limit));
                 }
             }
         }

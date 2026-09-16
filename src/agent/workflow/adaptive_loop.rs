@@ -120,7 +120,8 @@ impl AdaptiveLoop {
     pub fn select_repair_strategy(&self, failure_reason: &str) -> RepairStrategy {
         if failure_reason.contains("范围过大") || failure_reason.contains("too large") {
             RepairStrategy::SplitTask
-        } else if failure_reason.contains("方案错误") || failure_reason.contains("wrong approach") {
+        } else if failure_reason.contains("方案错误") || failure_reason.contains("wrong approach")
+        {
             RepairStrategy::EscalateToPlan
         } else if failure_reason.contains("工具失败") || failure_reason.contains("工具") {
             RepairStrategy::ChangeApproach

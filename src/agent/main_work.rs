@@ -35,7 +35,10 @@ pub struct WorkFlowSpec {
     pub depends_on: Vec<String>,
     #[serde(default, deserialize_with = "lenient_strings")]
     pub acceptance: Vec<String>,
-    #[serde(default = "default_delegate_to", deserialize_with = "lenient_delegate_to")]
+    #[serde(
+        default = "default_delegate_to",
+        deserialize_with = "lenient_delegate_to"
+    )]
     pub delegate_to: AgentRole,
 }
 
@@ -196,6 +199,8 @@ where
     let role = match norm.as_str() {
         "subagent" | "subagentwork" | "work" | "执行层" => AgentRole::SubAgent,
         "windowuse" | "windowuseagent" | "window" | "窗口" => AgentRole::WindowUse,
+        "webuse" | "webuseagent" | "chromium" | "chromiumwebuse" | "browser" | "web" | "浏览器"
+        | "网页" => AgentRole::WebUse,
         "main" | "mainwork" | "mainworkagent" => AgentRole::MainWork,
         "yolo" => AgentRole::Yolo,
         "plan" => AgentRole::Plan,
@@ -259,6 +264,35 @@ const WINDOW_USE_KEYWORDS: &[&str] = &[
     "invoke pattern",
 ];
 
+/// 2026-09-16 第 61 轮:浏览器/网页操控关键词(Chromium-WebUse,第 11 角色)。
+const WEB_USE_KEYWORDS: &[&str] = &[
+    "browsernew",
+    "browsercontrol",
+    "browserinspect",
+    "browserlist",
+    "browserclose",
+    "浏览器",
+    "网页",
+    "网站",
+    "网址",
+    "爬虫",
+    "抓取页面",
+    "采集页面",
+    "chrome",
+    "chromium",
+    "cdp",
+    "devtools",
+    "webdriver",
+    "headless",
+    "无头浏览器",
+    "dom",
+    "localstorage",
+    "页面截图",
+    "表单提交",
+    "http://",
+    "https://",
+];
+
 fn text_contains_any_ci(text: &str, keywords: &[&str]) -> bool {
     let lower = text.to_lowercase();
     keywords.iter().any(|k| lower.contains(k))
@@ -296,6 +330,12 @@ pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     let text = gather_spec_text(spec);
     let shell_hit = text_contains_any_ci(&text, SUBAGENT_KEYWORDS);
     let gui_hit = text_contains_any_ci(&text, WINDOW_USE_KEYWORDS);
+    let web_hit = text_contains_any_ci(&text, WEB_USE_KEYWORDS);
+    // 2026-09-16 第 61 轮:网页/浏览器操控 → WebUse(shell 仍最优先,WebUse 无 Bash 工具;
+    // web+gui 同命中按网页处理,网页语境也有"控件"表述)。
+    if web_hit && !shell_hit {
+        return Some(AgentRole::WebUse);
+    }
     match (shell_hit, gui_hit) {
         // shell 命令占主导 → 必须 SubAgent(WindowUse 没有 Bash / 只有白名单)
         (true, false) => Some(AgentRole::SubAgent),
@@ -334,9 +374,7 @@ mod infer_tests {
         let spec = WorkFlowSpec {
             id: "wf-1".into(),
             name: "启动微信".into(),
-            steps: vec![
-                "执行 osascript -e 'tell application \"WeChat\" to activate'".into(),
-            ],
+            steps: vec!["执行 osascript -e 'tell application \"WeChat\" to activate'".into()],
             branches: vec![],
             loops: vec![],
             depends_on: vec![],
@@ -377,6 +415,39 @@ mod infer_tests {
             delegate_to: AgentRole::SubAgent,
         };
         assert_eq!(infer_delegate_to(&spec), None);
+    }
+
+    #[test]
+    fn same_wechat_window_chain_is_coalesced() {
+        fn wf(id: &str, step: &str, dep: &str) -> WorkFlowSpec {
+            WorkFlowSpec {
+                id: id.into(),
+                name: format!("微信-{step}"),
+                steps: vec![step.into()],
+                branches: vec![],
+                loops: vec![],
+                depends_on: if dep.is_empty() {
+                    vec![]
+                } else {
+                    vec![dep.into()]
+                },
+                acceptance: vec![format!("完成{step}")],
+                delegate_to: AgentRole::WindowUse,
+            }
+        }
+        let mut plan = WorkFlowPlan {
+            workflows: vec![
+                wf("wf-1", "打开微信", ""),
+                wf("wf-2", "搜索赵玲玲", "wf-1"),
+                wf("wf-3", "发送消息", "wf-2"),
+            ],
+            summary: String::new(),
+            degraded: false,
+        };
+        coalesce_wechat_window_workflows(&mut plan);
+        assert_eq!(plan.workflows.len(), 1);
+        assert_eq!(plan.workflows[0].steps.len(), 3);
+        assert!(plan.workflows[0].acceptance.len() >= 3);
     }
 
     #[test]
@@ -428,7 +499,16 @@ impl MainWorkRunner {
         retry_hint: &str,
         original_prompt: Option<&str>,
     ) -> Result<(WorkFlowPlan, Usage)> {
-        Self::plan_workflows_inner(self, goal, decomposition, session_id, retry_hint, original_prompt, None).await
+        Self::plan_workflows_inner(
+            self,
+            goal,
+            decomposition,
+            session_id,
+            retry_hint,
+            original_prompt,
+            None,
+        )
+        .await
     }
 
     /// 2026-09-16 第 59 轮:带 suggested_delegate 的重载,供 Orchestrator 传入 Yolo 推断结果。
@@ -441,7 +521,16 @@ impl MainWorkRunner {
         original_prompt: Option<&str>,
         suggested_delegate: Option<&str>,
     ) -> Result<(WorkFlowPlan, Usage)> {
-        Self::plan_workflows_inner(self, goal, decomposition, session_id, retry_hint, original_prompt, suggested_delegate).await
+        Self::plan_workflows_inner(
+            self,
+            goal,
+            decomposition,
+            session_id,
+            retry_hint,
+            original_prompt,
+            suggested_delegate,
+        )
+        .await
     }
 
     async fn plan_workflows_inner(
@@ -466,9 +555,17 @@ impl MainWorkRunner {
         }
         // 2026-09-16 第 59 轮:透传 Yolo 推断的 suggested_delegate,引导 Main-Work 正确委派
         if let Some(d) = suggested_delegate {
+            let hint = match d {
+                "windowuse" => {
+                    "编排时所有涉及桌面软件窗口操作的流程,请将 delegate_to 设为 \"windowuse\"。"
+                }
+                "webuse" => {
+                    "编排时所有涉及网页/浏览器操作的流程,请将 delegate_to 设为 \"webuse\"。"
+                }
+                _ => "编排时请按上述建议设置 delegate_to。",
+            };
             prompt.push_str(&format!(
-                "\n【重要】Yolo 基于用户输入关键词推断该任务应委派给: {d}\n\
-                 编排时所有涉及桌面软件窗口操作的流程,请将 delegate_to 设为 \"windowuse\"。\n"
+                "\n【重要】Yolo 基于用户输入关键词推断该任务应委派给: {d}\n{hint}\n"
             ));
         }
         if !retry_hint.is_empty() {
@@ -487,9 +584,15 @@ impl MainWorkRunner {
              约束:\n\
              - id/name/steps/acceptance/delegate_to 必填;branches/loops/depends_on/summary 可省略。\n\
              - branches/loops 元素是字符串(形如 \"条件: 动作\")或对象({\"condition\":…,\"then\":…} / {\"condition\":…,\"over\":…})均可。\n\
-             - delegate_to 二选一:默认填 \"subagent\"(通用执行);若该流程是「读取/操作桌面软件窗口\n\
+             - delegate_to 三选一:默认填 \"subagent\"(通用执行);若该流程是「读取/操作桌面软件窗口\n\
                (枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本)」类任务,必须填 \"windowuse\",\n\
-               由 WindowUse Agent(LsmAgentEmergentWork-WindowUse)执行。\n\
+               由 WindowUse Agent(LsmAgentEmergentWork-WindowUse)执行;\n\
+               若该流程是「网页/浏览器操作(打开网址、浏览网页、网页登录、点击/输入/滚动页面、\n\
+               网页截图、抓取页面信息、爬虫采集、查看 Console/Network/DOM)」类任务,必须填 \"webuse\",\n\
+               由 Chromium-WebUse Agent(LsmAgentEmergentWork-Chromium-WebUse)执行。\n\
+             - 同一桌面应用的连续 UI 操作链(打开/激活 → 等待窗口 → 搜索 → 选择会话 → 输入 → 校验 →\n\
+               发送/提交)必须合并为一个 windowuse WorkFlow,不要按每个按钮拆成多个串行单元;\n\
+               跨单元会丢失真实焦点与控件状态。只有不同应用或互不依赖的窗口操作才允许拆分。\n\
              - acceptance 必须是可执行验证的验收标准(命令 / 可比对的预期输出),不要写「完成目标」这类空话。\n\
              - acceptance 中涉及文本长度验证时,使用字符计数(wc -m / ${#var})而非字节计数(length($0) / wc -c),\n\
                避免中文 UTF-8(每字 3 字节)导致计数偏差。",
@@ -510,10 +613,11 @@ impl MainWorkRunner {
                 decomposition.to_vec()
             };
             // 2026-09-16 第 59 轮:兜底 WorkFlow 也继承 suggested_delegate
-            let fallback_delegate = suggested_delegate
-                .filter(|&d| d == "windowuse")
-                .map(|_| AgentRole::WindowUse)
-                .unwrap_or(AgentRole::SubAgent);
+            let fallback_delegate = match suggested_delegate {
+                Some("windowuse") => AgentRole::WindowUse,
+                Some("webuse") => AgentRole::WebUse,
+                _ => AgentRole::SubAgent,
+            };
             WorkFlowPlan {
                 workflows: vec![WorkFlowSpec {
                     id: "wf-1".into(),
@@ -530,22 +634,40 @@ impl MainWorkRunner {
             }
         });
 
+        // 2026-09-16 第 61 轮:Yolo 建议 webuse 且 plan 未指定时,强制覆盖
+        if let Some("webuse") = suggested_delegate {
+            for wf in plan.workflows.iter_mut() {
+                if wf.delegate_to == AgentRole::SubAgent {
+                    let text = gather_spec_text(wf);
+                    if text_contains_any_ci(&text, WEB_USE_KEYWORDS) {
+                        wf.delegate_to = AgentRole::WebUse;
+                        tracing::info!(wf_id = %wf.id, "suggested_delegate=webuse,已覆盖 WorkFlow delegate_to");
+                    }
+                }
+            }
+        }
         // 2026-09-16 第 59 轮:如果 Yolo 明确建议 windowuse 且 plan 未指定,强制覆盖
         if let Some("windowuse") = suggested_delegate {
             for wf in plan.workflows.iter_mut() {
                 if wf.delegate_to == AgentRole::SubAgent {
                     // 仅当 WorkFlow 含窗口操作类步骤时才覆盖(避免误伤纯代码流程)
                     let text = gather_spec_text(wf);
-                    let has_window_ops = text_contains_any_ci(&text, &[
-                        "微信", "wechat", "qq", "窗口", "window", "点击", "click",
-                        "打开", "open", "发送", "send", "应用", "app", "软件",
-                    ]);
+                    let has_window_ops = text_contains_any_ci(
+                        &text,
+                        &[
+                            "微信", "wechat", "qq", "窗口", "window", "点击", "click", "打开",
+                            "open", "发送", "send", "应用", "app", "软件",
+                        ],
+                    );
                     if has_window_ops {
                         wf.delegate_to = AgentRole::WindowUse;
                         tracing::info!(wf_id = %wf.id, "suggested_delegate=windowuse,已覆盖 WorkFlow delegate_to");
                     }
                 }
             }
+        }
+        if let Some("windowuse") = suggested_delegate {
+            coalesce_wechat_window_workflows(&mut plan);
         }
 
         let _ = memory::record_entry(
@@ -570,6 +692,70 @@ impl MainWorkRunner {
     }
 }
 
+/// 2026-09-16 第 61 轮:把同一微信 UI 链的多个 WindowUse 单元自动合并。
+///
+/// 实测 Main-Work 常把「打开微信 → 搜索联系人 → 打开会话 → 输入 → 发送」拆成
+/// 5 个串行单元。每个单元都有独立 Agent 上下文,真实焦点 / 搜索框状态无法传递。
+/// 这里在 Yolo 已判定 windowuse 时兜底合并,保留真实窗口连续性。
+fn coalesce_wechat_window_workflows(plan: &mut WorkFlowPlan) {
+    let same_wechat = |w: &WorkFlowSpec| {
+        w.delegate_to == AgentRole::WindowUse && {
+            let text = gather_spec_text(w).to_lowercase();
+            text.contains("微信") || text.contains("wechat")
+        }
+    };
+    let Some(first_idx) = plan.workflows.iter().position(same_wechat) else {
+        return;
+    };
+    let group_ids: Vec<String> = plan
+        .workflows
+        .iter()
+        .filter(|w| same_wechat(w))
+        .map(|w| w.id.clone())
+        .collect();
+    if group_ids.len() < 2 {
+        return;
+    }
+
+    let mut branches = Vec::new();
+    let mut loops = Vec::new();
+    let mut steps = Vec::new();
+    let mut acceptance = Vec::new();
+    for w in plan.workflows.iter().filter(|w| same_wechat(w)) {
+        branches.extend(w.branches.clone());
+        loops.extend(w.loops.clone());
+        steps.extend(w.steps.clone());
+        acceptance.extend(w.acceptance.clone());
+    }
+    let target_id = plan.workflows[first_idx].id.clone();
+    {
+        let first = &mut plan.workflows[first_idx];
+        first.name = "微信连续操控(自动合并同应用UI链)".into();
+        first.branches = branches;
+        first.loops = loops;
+        first.steps = steps;
+        first.acceptance = acceptance;
+        first
+            .depends_on
+            .retain(|dep| !group_ids.iter().any(|id| id == dep));
+    }
+    plan.workflows
+        .retain(|w| !same_wechat(w) || w.id == target_id);
+    for w in &mut plan.workflows {
+        for dep in &mut w.depends_on {
+            if group_ids.iter().any(|id| *id == *dep) {
+                *dep = target_id.clone();
+            }
+        }
+        w.depends_on.dedup();
+    }
+    tracing::info!(
+        target = %target_id,
+        merged = group_ids.len(),
+        "同一微信应用 WindowUse 链已自动合并,保留真实窗口焦点连续性"
+    );
+}
+
 /// 拓扑排序(返回执行顺序)。
 ///
 /// 基于 `topo_layers` 分层结果扁平化(单一事实源);检测循环依赖与未知依赖。
@@ -589,8 +775,7 @@ pub fn topo_layers(workflows: &[WorkFlowSpec]) -> Result<Vec<Vec<WorkFlowSpec>>>
         by_id.insert(w.id.as_str(), w);
     }
     // 入度 = 它依赖的 wf 数;先校验所有依赖已知
-    let mut in_degree: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    let mut in_degree: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for w in workflows {
         for dep in &w.depends_on {
             if !by_id.contains_key(dep.as_str()) {
@@ -711,7 +896,8 @@ fn normalize_dep_id(raw: &str) -> Option<String> {
     let end = trimmed
         .find(|c: char| matches!(c, '（' | '(' | '：' | ':' | ' ' | '\t'))
         .unwrap_or(trimmed.len());
-    let token = trimmed[..end].trim_matches(|c: char| matches!(c, '"' | '\'' | '[' | ']' | ',' | '、'));
+    let token =
+        trimmed[..end].trim_matches(|c: char| matches!(c, '"' | '\'' | '[' | ']' | ',' | '、'));
     if token.is_empty() {
         return None;
     }
@@ -749,9 +935,7 @@ pub fn sanitize_depends_on(plan: &mut WorkFlowPlan) {
         }
     }
     if changed {
-        tracing::info!(
-            "[2026-09-16 F2] depends_on 已归一化(剥离变量透传注释 / 去自环 / 去重)"
-        );
+        tracing::info!("[2026-09-16 F2] depends_on 已归一化(剥离变量透传注释 / 去自环 / 去重)");
     }
 }
 
@@ -767,7 +951,11 @@ fn extract_json_block(text: &str) -> Option<&str> {
     let end = text[content_start..].find(end_marker)?;
     let json_text = &text[content_start..content_start + end];
     let json_text = json_text.trim();
-    if json_text.is_empty() { None } else { Some(json_text) }
+    if json_text.is_empty() {
+        None
+    } else {
+        Some(json_text)
+    }
 }
 
 fn extract_standalone_json(text: &str) -> Option<&str> {
@@ -777,15 +965,29 @@ fn extract_standalone_json(text: &str) -> Option<&str> {
     let mut escape = false;
     let mut end = None;
     for (i, c) in text[start..].char_indices() {
-        if escape { escape = false; continue; }
-        if c == '\\' && in_string { escape = true; continue; }
-        if c == '"' { in_string = !in_string; continue; }
-        if in_string { continue; }
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
         match c {
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
-                if depth == 0 { end = Some(start + i + 1); break; }
+                if depth == 0 {
+                    end = Some(start + i + 1);
+                    break;
+                }
             }
             _ => {}
         }
@@ -835,7 +1037,9 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                 workflows.push(w);
             }
             // 提取 id 与 name(形如 "1: 名称" 或 "1 名称")
-            let after_id = rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == ':' || c == ' ').to_string();
+            let after_id = rest
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == ':' || c == ' ')
+                .to_string();
             // 提取纯数字 id
             let id_num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             let id = if id_num.is_empty() {
@@ -892,9 +1096,7 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                     .map(|d| {
                         d.split(|c| c == ',' || c == '、' || c == ';')
                             .map(|p| p.trim())
-                            .filter(|p| {
-                                !p.is_empty() && *p != "无" && *p != "-" && *p != "—"
-                            })
+                            .filter(|p| !p.is_empty() && *p != "无" && *p != "-" && *p != "—")
                             .map(|p| p.to_string())
                             .collect()
                     })
@@ -985,8 +1187,12 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                 };
                 w.acceptance.push(after_colon);
             } else if t.starts_with("- [ ]") || t.starts_with("  - [ ]") {
-                w.steps
-                    .push(t.trim_start_matches(|c: char| c == ' ').trim_start_matches("- [ ]").trim().to_string());
+                w.steps.push(
+                    t.trim_start_matches(|c: char| c == ' ')
+                        .trim_start_matches("- [ ]")
+                        .trim()
+                        .to_string(),
+                );
             } else if t.starts_with("- ")
                 && !t.starts_with("- 委派")
                 && !t.starts_with("- 步骤")
@@ -1009,9 +1215,7 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
     }
 
     if workflows.is_empty() {
-        return Err(AgentError::PlanGen(
-            "Plan 文档未解析出任何 WorkFlow".into(),
-        ));
+        return Err(AgentError::PlanGen("Plan 文档未解析出任何 WorkFlow".into()));
     }
 
     let mut plan = WorkFlowPlan {
@@ -1047,11 +1251,20 @@ mod tests {
     #[test]
     fn normalize_dep_id_strips_annotations() {
         // 全角括号注释(Plan 文档路径典型形态)
-        assert_eq!(normalize_dep_id("wf-1（需要 FIRST_CHROME_WINDOW_ID）"), Some("wf-1".to_string()));
+        assert_eq!(
+            normalize_dep_id("wf-1（需要 FIRST_CHROME_WINDOW_ID）"),
+            Some("wf-1".to_string())
+        );
         // 半角括号 + 中文说明
-        assert_eq!(normalize_dep_id("wf-2 (needs data)"), Some("wf-2".to_string()));
+        assert_eq!(
+            normalize_dep_id("wf-2 (needs data)"),
+            Some("wf-2".to_string())
+        );
         // 中文冒号
-        assert_eq!(normalize_dep_id("wf-3：控件树数据"), Some("wf-3".to_string()));
+        assert_eq!(
+            normalize_dep_id("wf-3：控件树数据"),
+            Some("wf-3".to_string())
+        );
         // 干净 id
         assert_eq!(normalize_dep_id("wf-1"), Some("wf-1".to_string()));
         // 带引号 / 空格 / 逗号
@@ -1078,7 +1291,10 @@ mod tests {
         };
         sanitize_depends_on(&mut plan);
         assert_eq!(plan.workflows[1].depends_on, vec!["wf-1".to_string()]);
-        assert_eq!(plan.workflows[2].depends_on, vec!["wf-2".to_string(), "wf-1".to_string()]);
+        assert_eq!(
+            plan.workflows[2].depends_on,
+            vec!["wf-2".to_string(), "wf-1".to_string()]
+        );
         // 归一化后 topo_layers 应成功分层(串行链 3 层)
         let order = topo_sort(&plan.workflows).unwrap();
         let ids: Vec<&str> = order.iter().map(|w| w.id.as_str()).collect();
@@ -1088,9 +1304,7 @@ mod tests {
     #[test]
     fn sanitize_depends_on_removes_self_loop_and_dedup() {
         let mut plan = WorkFlowPlan {
-            workflows: vec![
-                wf("wf-1", &["wf-1", "wf-1（注释）", ""]),
-            ],
+            workflows: vec![wf("wf-1", &["wf-1", "wf-1（注释）", ""])],
             summary: "test".into(),
             degraded: false,
         };
@@ -1276,7 +1490,11 @@ mod tests {
         let plan = parse_plan_markdown(md).unwrap_or_else(|e| panic!("parse failed: {e}"));
         assert_eq!(plan.workflows.len(), 3, "粗体变体应解析出 3 个 WorkFlow");
         assert_eq!(plan.workflows[0].id, "wf-1");
-        assert!(plan.workflows[0].name.contains("编写"), "name: {}", plan.workflows[0].name);
+        assert!(
+            plan.workflows[0].name.contains("编写"),
+            "name: {}",
+            plan.workflows[0].name
+        );
         assert!(
             !plan.workflows[0].steps.is_empty(),
             "说明 bullet 应兜底成为步骤: {:?}",
@@ -1389,7 +1607,12 @@ mod tests {
         let mk = |v: &str| {
             format!(r#"{{"workflows": [{{"id": "wf-1", "name": "n", "delegate_to": {v}}}]}}"#)
         };
-        for alias in ["\"SubAgent-Work\"", "\"subagent\"", "\"work\"", "\"MAIN-WORK\""] {
+        for alias in [
+            "\"SubAgent-Work\"",
+            "\"subagent\"",
+            "\"work\"",
+            "\"MAIN-WORK\"",
+        ] {
             let plan: WorkFlowPlan = serde_json::from_str(&mk(alias)).unwrap();
             let expected = if alias.contains("MAIN") {
                 AgentRole::MainWork

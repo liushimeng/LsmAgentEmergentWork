@@ -252,16 +252,22 @@ impl CompactRunner {
             report.before_tokens,
             report.after_tokens,
             report.compacted_messages,
-            if report.fallback { "(硬截断降级)" } else { "" },
+            if report.fallback {
+                "(硬截断降级)"
+            } else {
+                ""
+            },
         );
-        let _ = self.db.insert_session_memory(&crate::config::SessionMemoryEntry {
-            session_id: session_id.to_string(),
-            role: AgentRole::Compact,
-            event_type: EventType::Summary,
-            content,
-            usage_input: report.usage.input_tokens,
-            usage_output: report.usage.output_tokens,
-        });
+        let _ = self
+            .db
+            .insert_session_memory(&crate::config::SessionMemoryEntry {
+                session_id: session_id.to_string(),
+                role: AgentRole::Compact,
+                event_type: EventType::Summary,
+                content,
+                usage_input: report.usage.input_tokens,
+                usage_output: report.usage.output_tokens,
+            });
         let _ = memory::record_entry(
             &self.db,
             AgentRole::Compact,
@@ -311,7 +317,9 @@ pub(crate) fn render_messages(messages: &[ChatMessage]) -> String {
                     let args: String = input.to_string().chars().take(200).collect();
                     out.push_str(&format!("[{role}] [工具调用] {name}({args})\n"));
                 }
-                ContentBlock::ToolResult { content, is_error, .. } => {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
                     let body: String = content.chars().take(500).collect();
                     let flag = if *is_error { "(失败)" } else { "" };
                     out.push_str(&format!("[{role}] [工具结果{flag}] {body}\n"));
@@ -330,10 +338,7 @@ pub(crate) fn hard_truncate(rendered: &str, tier: CompactTier) -> String {
         let n = line.chars().count();
         if n > 320 {
             let head: String = line.chars().take(200).collect();
-            let tail: String = line
-                .chars()
-                .skip(n.saturating_sub(100))
-                .collect();
+            let tail: String = line.chars().skip(n.saturating_sub(100)).collect();
             out.push_str(&format!("{head} ……[省略 {} 字符]…… {tail}\n", n - 300));
         } else {
             out.push_str(line);
@@ -389,11 +394,13 @@ mod tests {
     fn protected_messages_detected() {
         assert!(is_protected(&msg(&format!(
             "{} 项目说明 {}",
-            project_context::MARKER_START, project_context::MARKER_END
+            project_context::MARKER_START,
+            project_context::MARKER_END
         ))));
         assert!(is_protected(&msg(&format!(
             "{} 历史 {}",
-            session_context::HISTORY_MARKER_START, session_context::HISTORY_MARKER_END
+            session_context::HISTORY_MARKER_START,
+            session_context::HISTORY_MARKER_END
         ))));
         assert!(is_protected(&msg(&format!(
             "{COMPACT_MARKER_START} 摘要 {COMPACT_MARKER_END}"
@@ -424,9 +431,15 @@ mod tests {
             _meta: &crate::llm::RequestMeta,
         ) -> Result<crate::llm::Completion> {
             Ok(crate::llm::Completion {
-                text: "## 目标\n测试压缩\n\n## 进展与关键结论\n无\n\n## 重要上下文\n无\n\n## 待办\n无".into(),
+                text:
+                    "## 目标\n测试压缩\n\n## 进展与关键结论\n无\n\n## 重要上下文\n无\n\n## 待办\n无"
+                        .into(),
                 tool_calls: vec![],
-                usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
                 stop_reason: None,
             })
         }
@@ -464,10 +477,12 @@ mod tests {
         let mut s = Session::new();
         s.context_mut().push(msg(&format!(
             "{}\n项目说明\n{}",
-            project_context::MARKER_START, project_context::MARKER_END
+            project_context::MARKER_START,
+            project_context::MARKER_END
         )));
         for i in 0..8 {
-            s.context_mut().push(msg(&format!("第{i}轮 {}", "话".repeat(msg_chars))));
+            s.context_mut()
+                .push(msg(&format!("第{i}轮 {}", "话".repeat(msg_chars))));
         }
         s
     }
@@ -477,7 +492,11 @@ mod tests {
         let (runner, _d) = fresh_runner(Arc::new(SummaryLlm));
         let mut s = fat_session(400); // est ≈ (8×410)/4×1.1 ≈ 900+
         let before_len = s.context().len();
-        let rep = runner.maybe_compact(&mut s, 100).await.unwrap().expect("应触发压缩");
+        let rep = runner
+            .maybe_compact(&mut s, 100)
+            .await
+            .unwrap()
+            .expect("应触发压缩");
         assert!(!rep.fallback);
         // 保护:项目上下文(1) + 尾部 4 条 + 摘要 1 条 = 6
         assert_eq!(s.context().len(), before_len - rep.compacted_messages + 1);
@@ -486,7 +505,9 @@ mod tests {
         assert!(is_protected(&s.context()[0]));
         // 摘要带标记
         let has_marker = s.context().iter().any(|m| {
-            m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains(COMPACT_MARKER_START)))
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains(COMPACT_MARKER_START)),
+            )
         });
         assert!(has_marker);
         assert!(rep.after_tokens < rep.before_tokens);
@@ -497,7 +518,11 @@ mod tests {
         let (runner, _d) = fresh_runner(Arc::new(SummaryLlm));
         let mut s = Session::new();
         s.context_mut().push(msg("短对话"));
-        assert!(runner.maybe_compact(&mut s, 800_000).await.unwrap().is_none());
+        assert!(runner
+            .maybe_compact(&mut s, 800_000)
+            .await
+            .unwrap()
+            .is_none());
         // context_max_size = 0 关闭压缩
         let mut s2 = fat_session(10_000);
         let len = s2.context().len();
@@ -509,10 +534,16 @@ mod tests {
     async fn compact_fallback_on_llm_failure() {
         let (runner, _d) = fresh_runner(Arc::new(FailLlm));
         let mut s = fat_session(400);
-        let rep = runner.maybe_compact(&mut s, 100).await.unwrap().expect("应触发压缩");
+        let rep = runner
+            .maybe_compact(&mut s, 100)
+            .await
+            .unwrap()
+            .expect("应触发压缩");
         assert!(rep.fallback, "LLM 失败应走硬截断降级");
         let has_marker = s.context().iter().any(|m| {
-            m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains(COMPACT_MARKER_START)))
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains(COMPACT_MARKER_START)),
+            )
         });
         assert!(has_marker);
     }
@@ -570,7 +601,11 @@ mod tests {
             s.context_mut().push(msg(&format!("尾部{i}"))); // idx 2..6:尾部保护
         }
         let before = estimate_tokens(s.context());
-        let rep = runner.maybe_compact(&mut s, 100).await.unwrap().expect("应触发");
+        let rep = runner
+            .maybe_compact(&mut s, 100)
+            .await
+            .unwrap()
+            .expect("应触发");
         assert!(rep.fallback, "摘要长于原文应走守卫降级");
         assert!(rep.after_tokens < before, "压缩后必须变小");
     }

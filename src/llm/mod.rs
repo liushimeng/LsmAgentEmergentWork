@@ -22,7 +22,8 @@ pub mod resilient;
 pub mod sse;
 
 pub use cache_policy::{
-    apply_cache_policy, CacheBreakpoints, CacheHint, CachePolicy, CacheTtl, ANTHROPIC_BREAKPOINT_CAP,
+    apply_cache_policy, CacheBreakpoints, CacheHint, CachePolicy, CacheTtl,
+    ANTHROPIC_BREAKPOINT_CAP,
 };
 
 /// 默认 Cache Policy: Anthropic 路径自动注入(其他协议客户端忽略)。
@@ -31,7 +32,9 @@ pub use cache_policy::{
 /// 客户端消费它(第十六轮 L1047)。
 pub const DEFAULT_CACHE_POLICY: CachePolicy = CachePolicy::Auto;
 
-pub use offline::{Connectivity, ConnectivitySnapshot, ConnectivityTracker, DEGRADED_THRESHOLD, OFFLINE_THRESHOLD};
+pub use offline::{
+    Connectivity, ConnectivitySnapshot, ConnectivityTracker, DEGRADED_THRESHOLD, OFFLINE_THRESHOLD,
+};
 use resilient::{ResilientLlmClient, CONNECT_TIMEOUT};
 
 /// 统一的 HTTP 客户端构造入口:注入连接超时(防连接挂起导致 TUI 冻结)。
@@ -51,17 +54,13 @@ pub fn build_http_client(end_point: &str) -> reqwest::Client {
         // 同一 endpoint 进程内只 WARN 一次(客户端可能随 provider 切换/连通性
         // 探测反复重建,逐次告警在批量测试下刷屏 —— 2026-09-14 第 51 轮 F2)。
         static ANNOUNCED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-            std::sync::LazyLock::new(|| {
-                std::sync::Mutex::new(std::collections::HashSet::new())
-            });
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         let first = ANNOUNCED
             .lock()
             .map(|mut s| s.insert(end_point.to_string()))
             .unwrap_or(false);
         if first {
-            tracing::warn!(
-                "TLS 证书校验已放宽(LAEW_TLS_INSECURE 或 IP 主机自动策略):{end_point}"
-            );
+            tracing::warn!("TLS 证书校验已放宽(LAEW_TLS_INSECURE 或 IP 主机自动策略):{end_point}");
         } else {
             tracing::debug!("TLS 证书校验已放宽(本进程已提示过):{end_point}");
         }
@@ -90,7 +89,10 @@ fn endpoint_host_is_ip(end_point: &str) -> bool {
     let Ok(u) = url::Url::parse(end_point) else {
         return false;
     };
-    matches!(u.host(), Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)))
+    matches!(
+        u.host(),
+        Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_))
+    )
 }
 
 /// 解析 `Retry-After` 头(仅支持 delta-seconds;HTTP-date 形式少见,忽略)。
@@ -378,8 +380,11 @@ pub trait LlmClient: Send + Sync {
 pub fn client_from_record(record: &ProviderRecord, user_agent: &str) -> Result<Arc<dyn LlmClient>> {
     // D9-7 SSRF 防护(L1608/L1625):创建 LLM 客户端前校验 end_point 安全性,
     // 拒绝私网/CGNAT/link-local 请求,防 SSRF 攻击。
-    crate::agent::safety::url_safety::is_safe_endpoint(&record.end_point)
-        .map_err(|e| crate::error::AgentError::Config(crate::database::ConfigError::UrlSafety(format!("end_point 不安全: {e}"))))?;
+    crate::agent::safety::url_safety::is_safe_endpoint(&record.end_point).map_err(|e| {
+        crate::error::AgentError::Config(crate::database::ConfigError::UrlSafety(format!(
+            "end_point 不安全: {e}"
+        )))
+    })?;
     let inner: Arc<dyn LlmClient> = match record.protocol {
         Protocol::Anthropic => {
             let c = anthropic::AnthropicClient::new(
@@ -493,7 +498,9 @@ mod tests {
     static TLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn lock_tls_env() -> std::sync::MutexGuard<'static, ()> {
-        TLS_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TLS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]

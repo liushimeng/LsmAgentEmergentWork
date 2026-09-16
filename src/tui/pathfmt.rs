@@ -66,8 +66,9 @@ pub fn fit_line(prefix: &str, middle: &str, suffix: &str) -> String {
 
 /// [`fit_line`] 的可测试内核(显式宽度)。
 fn fit_line_with_width(prefix: &str, middle: &str, suffix: &str, width: usize) -> String {
-    let full_len =
-        display_width(prefix) as usize + display_width(middle) as usize + display_width(suffix) as usize;
+    let full_len = display_width(prefix) as usize
+        + display_width(middle) as usize
+        + display_width(suffix) as usize;
     if full_len <= width {
         return format!("{prefix}{middle}{suffix}");
     }

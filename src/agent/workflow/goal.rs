@@ -4,8 +4,8 @@
 //! 提供事务性任务生命周期管理。
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +65,11 @@ pub struct Goal {
 }
 
 impl Goal {
-    pub fn new(id: impl Into<String>, title: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             parent_id: None,
@@ -161,12 +165,19 @@ impl Goal {
 
     pub fn all_subgoals_satisfied(&self) -> bool {
         !self.subgoals.is_empty()
-            && self.subgoals.iter().all(|sg| sg.state == GoalState::Satisfied)
+            && self
+                .subgoals
+                .iter()
+                .all(|sg| sg.state == GoalState::Satisfied)
     }
 
     pub fn progress(&self) -> f64 {
         if self.subgoals.is_empty() {
-            return if self.state == GoalState::Satisfied { 1.0 } else { 0.0 };
+            return if self.state == GoalState::Satisfied {
+                1.0
+            } else {
+                0.0
+            };
         }
         let completed = self
             .subgoals

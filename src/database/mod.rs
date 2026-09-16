@@ -250,8 +250,7 @@ impl Db {
 /// 时间戳到秒,多次损坏不互相覆盖。文件系统层面 rename 失败时上抛(此时无法
 /// 安全继续——新库会与坏库同名互斥)。
 fn quarantine_corrupted(db_path: &Path) -> Result<()> {
-    let now = time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     // 手工拼 YYYYMMDD-HHMMSS,避开 time crate 已 deprecated 的 format_description::parse
     let stamp = format!(
         "{:04}{:02}{:02}-{:02}{:02}{:02}",
@@ -276,7 +275,10 @@ fn quarantine_corrupted(db_path: &Path) -> Result<()> {
     for suffix in ["-wal", "-shm"] {
         let side = db_path.with_file_name(format!(
             "{}{suffix}",
-            db_path.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+            db_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
         ));
         if side.exists() {
             // 脏 WAL/SHM 跟着坏库走;搬不动就算了(新库有自己的命名空间)
@@ -325,7 +327,11 @@ mod tests {
         let (db, _d) = fresh_db();
         // 本地临时目录上 WAL 必然成功;busy_timeout / synchronous 读回验证
         assert_eq!(pragma_string(&db, "busy_timeout"), "5000");
-        assert_eq!(pragma_string(&db, "synchronous"), "1", "synchronous 应为 NORMAL(1)");
+        assert_eq!(
+            pragma_string(&db, "synchronous"),
+            "1",
+            "synchronous 应为 NORMAL(1)"
+        );
         let mode = pragma_string(&db, "journal_mode");
         assert!(
             mode.eq_ignore_ascii_case("wal") || mode.eq_ignore_ascii_case("delete"),
@@ -380,7 +386,9 @@ mod tests {
             h.join().expect("并发写线程不应 panic");
         }
         let conn = open_connection(&db_path).unwrap();
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM cw", [], |r| r.get(0)).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cw", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(total as usize, THREADS * ROWS_EACH, "所有并发写都应落库");
     }
 
@@ -420,11 +428,7 @@ mod tests {
         let baks: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".corrupt-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
             .collect();
         assert!(!baks.is_empty(), "应存在 .corrupt-*.bak 隔离备份");
     }

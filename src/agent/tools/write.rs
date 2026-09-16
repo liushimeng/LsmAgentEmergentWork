@@ -37,7 +37,9 @@ impl WriteTool {
 
 #[async_trait]
 impl Tool for WriteTool {
-    fn name(&self) -> &str { "Write" }
+    fn name(&self) -> &str {
+        "Write"
+    }
 
     fn description(&self) -> &str {
         "将 content 完整写入 file_path(覆盖式)。\n\
@@ -67,13 +69,12 @@ impl Tool for WriteTool {
                 tool: self.name().into(),
                 reason: "缺少 string 类型参数 file_path".into(),
             })?;
-        let content = args
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AgentError::ToolExecution {
+        let content = args.get("content").and_then(Value::as_str).ok_or_else(|| {
+            AgentError::ToolExecution {
                 tool: self.name().into(),
                 reason: "缺少 string 类型参数 content".into(),
-            })?;
+            }
+        })?;
 
         // 沙箱拦截:Check-What-You-Write —— 先解析出最终落盘路径,再对该路径做
         // 白名单检查,保证「检查的就是要写的」(2026-09-09 第 08 轮沙箱细化)。

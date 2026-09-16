@@ -248,11 +248,7 @@ fn check_object_properties(
     }
 
     // additionalProperties:false 时检查多余字段
-    if schema
-        .get("additionalProperties")
-        .and_then(|v| v.as_bool())
-        == Some(false)
-    {
+    if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
         if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
             for key in map.keys() {
                 if !props.contains_key(key) {
@@ -444,9 +440,12 @@ mod tests {
             },
             "required": ["command"]
         });
-        let err =
-            validate_tool_args(TOOL, &schema, &json!({"command": "ls", "timeout_ms": "fast"}))
-                .unwrap_err();
+        let err = validate_tool_args(
+            TOOL,
+            &schema,
+            &json!({"command": "ls", "timeout_ms": "fast"}),
+        )
+        .unwrap_err();
         match err {
             AgentError::ToolSchemaValidation { path, expected, .. } => {
                 assert_eq!(path, "timeout_ms");
@@ -470,7 +469,10 @@ mod tests {
         let err = validate_tool_args(TOOL, &schema, &json!("delete")).unwrap_err();
         // 错误信息应包含实际值 "delete"
         let display = format!("{err}");
-        assert!(display.contains("delete"), "错误信息应包含实际值: {display}");
+        assert!(
+            display.contains("delete"),
+            "错误信息应包含实际值: {display}"
+        );
         // 错误信息应包含"取值"提示
         assert!(
             display.contains("取值") || display.contains("允许"),
@@ -535,7 +537,12 @@ mod tests {
         let schema = json!({"type": "string", "maxLength": 5});
         let err = validate_tool_args(TOOL, &schema, &json!("hello world")).unwrap_err();
         match err {
-            AgentError::ToolSchemaValidation { path, expected, actual, .. } => {
+            AgentError::ToolSchemaValidation {
+                path,
+                expected,
+                actual,
+                ..
+            } => {
                 assert_eq!(path, "$");
                 assert!(expected.contains("≤ 5"));
                 assert!(actual.contains("11"));
@@ -584,8 +591,8 @@ mod tests {
             "properties": {"name": {"type": "string"}},
             "additionalProperties": false
         });
-        let err = validate_tool_args(TOOL, &schema, &json!({"name": "test", "extra": 1}))
-            .unwrap_err();
+        let err =
+            validate_tool_args(TOOL, &schema, &json!({"name": "test", "extra": 1})).unwrap_err();
         match err {
             AgentError::ToolSchemaValidation { path, reason, .. } => {
                 assert_eq!(path, "extra");
@@ -653,16 +660,14 @@ mod tests {
         assert!(validate_tool_args("Bash", &schema, &json!({"timeout_ms": 5000})).is_err());
 
         // timeout_ms 越界
-        assert!(validate_tool_args("Bash", &schema, &json!({"command": "x", "timeout_ms": 0}))
-            .is_err());
+        assert!(
+            validate_tool_args("Bash", &schema, &json!({"command": "x", "timeout_ms": 0})).is_err()
+        );
 
         // 多余字段
-        assert!(validate_tool_args(
-            "Bash",
-            &schema,
-            &json!({"command": "x", "unknown": 1})
-        )
-        .is_err());
+        assert!(
+            validate_tool_args("Bash", &schema, &json!({"command": "x", "unknown": 1})).is_err()
+        );
     }
 
     #[test]

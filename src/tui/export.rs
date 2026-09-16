@@ -27,10 +27,8 @@ fn local_datetime(fmt: &str) -> String {
         Ok(offset) => base.to_offset(offset),
         Err(_) => base,
     };
-    dt.format(
-        &time::format_description::parse_borrowed::<2>(fmt).expect("format"),
-    )
-    .expect("fmt")
+    dt.format(&time::format_description::parse_borrowed::<2>(fmt).expect("format"))
+        .expect("fmt")
 }
 
 /// 当前本地时间 HH:MM:SS(transcript 轮次时间戳)。
@@ -167,12 +165,12 @@ pub fn render_markdown(meta: &ExportMeta, entries: &[TranscriptEntry]) -> String
         out.push_str(&format!("```text\n{}\n```\n", e.raw_input));
         // 自定义命令展开:提示词与原始输入不同时附引用块,保留「实际发了什么」
         if e.prompt.trim() != e.raw_input.trim() && !e.prompt.trim().is_empty() {
-            out.push_str(&format!("\n> 命令展开提示词:\n> \n```text\n{}\n```\n", e.prompt));
+            out.push_str(&format!(
+                "\n> 命令展开提示词:\n> \n```text\n{}\n```\n",
+                e.prompt
+            ));
         }
-        out.push_str(&format!(
-            "\n**laew**({}):\n\n",
-            e.outcome.display_name()
-        ));
+        out.push_str(&format!("\n**laew**({}):\n\n", e.outcome.display_name()));
         if e.response.trim().is_empty() {
             out.push_str("_(无输出)_\n");
         } else {
@@ -206,7 +204,10 @@ fn cache_suffix(u: &Usage) -> String {
         s.push_str(&format!(" cache_read={}", u.cache_read_input_tokens));
     }
     if u.cache_creation_input_tokens > 0 {
-        s.push_str(&format!(" cache_creation={}", u.cache_creation_input_tokens));
+        s.push_str(&format!(
+            " cache_creation={}",
+            u.cache_creation_input_tokens
+        ));
     }
     s
 }
@@ -378,15 +379,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let existing = tmp.path().join("out.md");
         std::fs::write(&existing, "已有内容").unwrap();
-        let err = resolve_target(tmp.path(), Some(existing.to_str().unwrap()), "x", "t").unwrap_err();
+        let err =
+            resolve_target(tmp.path(), Some(existing.to_str().unwrap()), "x", "t").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
     fn resolve_explicit_json_extension() {
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let (p, fmt) =
-            resolve_target(tmp.path(), Some("/tmp/whatever/a.json"), "x", "t").unwrap();
+        let (p, fmt) = resolve_target(tmp.path(), Some("/tmp/whatever/a.json"), "x", "t").unwrap();
         assert_eq!(fmt, ExportFormat::Json);
         assert!(p.ends_with("a.json"));
         // 无后缀 / .md → Markdown
@@ -407,10 +408,7 @@ mod tests {
 
     #[test]
     fn humanize_compact_formats_and_tolerates() {
-        assert_eq!(
-            humanize_compact("20260910-093820"),
-            "2026-09-10 09:38:20"
-        );
+        assert_eq!(humanize_compact("20260910-093820"), "2026-09-10 09:38:20");
         // 形态不符原样返回
         assert_eq!(humanize_compact("随便什么"), "随便什么");
         assert_eq!(humanize_compact(""), "");

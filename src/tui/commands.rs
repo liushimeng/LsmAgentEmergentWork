@@ -449,7 +449,10 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(dir.join("tmux速查.md"), "---\ndescription: 速查\n---\n正文").unwrap();
         let cmds = discover_with_home(tmp.path(), &tmp.path().join("nonexistent"));
-        assert!(cmds.iter().any(|c| c.name == "tmux速查"), "中文名应被加载: {cmds:?}");
+        assert!(
+            cmds.iter().any(|c| c.name == "tmux速查"),
+            "中文名应被加载: {cmds:?}"
+        );
     }
 
     #[test]
@@ -458,10 +461,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let work = tmp.path().join("work");
         let home = tmp.path().join("home");
-        for (base, desc) in [
-            (&work, "项目级版本"),
-            (&home, "用户级版本"),
-        ] {
+        for (base, desc) in [(&work, "项目级版本"), (&home, "用户级版本")] {
             let dir = base.join(".laew").join("commands");
             std::fs::create_dir_all(&dir).expect("mkdir");
             std::fs::write(

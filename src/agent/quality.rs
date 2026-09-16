@@ -115,10 +115,10 @@ impl QualityRunner {
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
         let trace_summary = trace.render_prompt();
-        let unit_label = if source == AgentRole::WindowUse {
-            "WindowUse 单元(桌面窗口操控)"
-        } else {
-            "SubAgent 单元"
+        let unit_label = match source {
+            AgentRole::WindowUse => "WindowUse 单元(桌面窗口操控)",
+            AgentRole::WebUse => "WebUse 单元(浏览器网页操控)",
+            _ => "SubAgent 单元",
         };
         // F10(2026-09-10 第 25 轮):判定基准是「本单元职责」,整体目标仅作背景。
         // 此前 prompt 只给整体 goal,QC(真实 LLM)按整体目标判单元产物,SubAgent
@@ -138,14 +138,8 @@ impl QualityRunner {
              判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。\n\
              若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。",
         );
-        self.run_check(
-            prompt,
-            source,
-            actual_output,
-            session_id,
-            Some(trace),
-        )
-        .await
+        self.run_check(prompt, source, actual_output, session_id, Some(trace))
+            .await
     }
 
     /// 校验 Main-Work WorkFlow 计划(返回带 LLM Usage)。
@@ -273,16 +267,18 @@ fn gate_report_on_trace(
         && trace.bash_exit_nonzero_count > 0
         && trace.last_bash_exit_code == 0;
     // 文本软信号单独判定:仅当不存在进程级硬信号时才允许证据豁免
-    let has_text_failure_phrase = trace.failure_signals.iter().any(|s| s == "text_failure_phrase");
+    let has_text_failure_phrase = trace
+        .failure_signals
+        .iter()
+        .any(|s| s == "text_failure_phrase");
     let has_hard_failure = trace
         .failure_signals
         .iter()
         .any(|s| s.starts_with("early_terminate:") || s.starts_with("high_error_rate:"));
     let text_phrase_only = has_text_failure_phrase && !has_hard_failure;
     let hard_strong_failure = trace.is_failed() && !text_phrase_only;
-    let unevidenced_text_phrase = text_phrase_only
-        && report.evidence.trim().is_empty()
-        && !expected_negative_confirmed;
+    let unevidenced_text_phrase =
+        text_phrase_only && report.evidence.trim().is_empty() && !expected_negative_confirmed;
     let unevidenced_bash_failure = trace.bash_exit_nonzero_count > 0
         && report.evidence.trim().is_empty()
         && !expected_negative_confirmed;
@@ -293,7 +289,8 @@ fn gate_report_on_trace(
     let issue = if hard_strong_failure {
         "执行轨迹包含强失败信号,Quality-Check 的 pass 结论被 trace 证据门拒绝".to_string()
     } else if unevidenced_text_phrase {
-        "终答包含失败措辞(可能引用了工具日志摘录)且 Quality-Check 未提供非空 evidence 说明预期性".to_string()
+        "终答包含失败措辞(可能引用了工具日志摘录)且 Quality-Check 未提供非空 evidence 说明预期性"
+            .to_string()
     } else {
         "Bash 命令非零退出且 Quality-Check 未提供非空 evidence 说明预期性".to_string()
     };

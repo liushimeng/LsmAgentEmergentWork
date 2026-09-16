@@ -93,7 +93,9 @@ impl ProgressGuard {
                 );
             }
         });
-        Self { handle: Some(handle) }
+        Self {
+            handle: Some(handle),
+        }
     }
 }
 
@@ -511,9 +513,14 @@ impl LlmClient for ResilientLlmClient {
         if meta.forced_tool.is_some() && self.forced_tool_rejected.load(Ordering::Relaxed) {
             let mut degraded = meta.clone();
             degraded.forced_tool = None;
-            return self.complete_with_retry(system, messages, tools, &degraded).await;
+            return self
+                .complete_with_retry(system, messages, tools, &degraded)
+                .await;
         }
-        match self.complete_with_retry(system, messages, tools, meta).await {
+        match self
+            .complete_with_retry(system, messages, tools, meta)
+            .await
+        {
             Ok(c) => Ok(c),
             Err(e) if meta.forced_tool.is_some() && looks_like_tool_choice_rejection(&e) => {
                 tracing::warn!(
@@ -524,7 +531,8 @@ impl LlmClient for ResilientLlmClient {
                 self.forced_tool_rejected.store(true, Ordering::Relaxed);
                 let mut degraded = meta.clone();
                 degraded.forced_tool = None;
-                self.complete_with_retry(system, messages, tools, &degraded).await
+                self.complete_with_retry(system, messages, tools, &degraded)
+                    .await
             }
             Err(e) => Err(e),
         }
@@ -541,7 +549,10 @@ impl LlmClient for ResilientLlmClient {
 /// tool + not support / function calling 不支持(大小写不敏感)。
 /// 命中即触发降级;401 鉴权错、400 溢出等其他 4xx 不命中。
 pub fn looks_like_tool_choice_rejection(err: &AgentError) -> bool {
-    let AgentError::LlmHttp { status, message, .. } = err else {
+    let AgentError::LlmHttp {
+        status, message, ..
+    } = err
+    else {
         return false;
     };
     if !matches!(status, 400 | 404 | 422) {
@@ -1060,7 +1071,9 @@ mod tests {
     }
 
     impl ForcedAwareMock {
-        fn new(responses: Vec<Result<Completion>>) -> (Self, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        fn new(
+            responses: Vec<Result<Completion>>,
+        ) -> (Self, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             (
                 Self {
@@ -1114,10 +1127,8 @@ mod tests {
     async fn forced_tool_choice_rejection_degrades_to_auto() {
         // 首次 forced 请求被 Provider 拒绝(400 tool_choice) → 自动去掉 forced
         // 降级重试 → 第二次(forced=None)成功返回。
-        let (mock, seen) = ForcedAwareMock::new(vec![
-            Err(tool_choice_rejection()),
-            Ok(ok_completion()),
-        ]);
+        let (mock, seen) =
+            ForcedAwareMock::new(vec![Err(tool_choice_rejection()), Ok(ok_completion())]);
         let client = ResilientLlmClient::with_config(Arc::new(mock), fast_cfg());
         let c = client
             .complete("sys", &[], &[], &forced_meta())
@@ -1161,7 +1172,10 @@ mod tests {
             3,
             "第二次调用应跳过 forced 直接 auto(共 1 次请求),实际: {seen:?}"
         );
-        assert!(seen[2].is_none(), "记忆化后的请求不应携带 forced tool_choice");
+        assert!(
+            seen[2].is_none(),
+            "记忆化后的请求不应携带 forced tool_choice"
+        );
     }
 
     #[tokio::test]
@@ -1205,7 +1219,10 @@ mod tests {
                 retry_after_ms: None,
                 message: msg.into(),
             };
-            assert!(looks_like_tool_choice_rejection(&e), "应命中: {status} {msg}");
+            assert!(
+                looks_like_tool_choice_rejection(&e),
+                "应命中: {status} {msg}"
+            );
         }
         // 不命中:其他状态码 / 无关 4xx / 非网络错误
         for e in [

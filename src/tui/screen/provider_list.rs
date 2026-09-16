@@ -14,7 +14,15 @@ use crate::tui::input::display_width;
 use crate::tui::screen::provider_del::ProviderDelPicker;
 use crate::tui::theme::{self, attr};
 
-const FIELD_LABELS: [&str; 7] = ["id", "protocol", "provider_name", "model_name", "end_point", "api_key", "context_max_size"];
+const FIELD_LABELS: [&str; 7] = [
+    "id",
+    "protocol",
+    "provider_name",
+    "model_name",
+    "end_point",
+    "api_key",
+    "context_max_size",
+];
 
 pub struct ProviderList {
     pub records: Vec<ProviderRecord>,
@@ -103,7 +111,10 @@ fn truncate_endpoint(url: &str, max_chars: usize) -> String {
     if head_budget == 0 {
         return format!("…/{}", tail.join("/"));
     }
-    let head_trunc: String = format!("{head}//{host}").chars().take(head_budget).collect();
+    let head_trunc: String = format!("{head}//{host}")
+        .chars()
+        .take(head_budget)
+        .collect();
     format!("{head_trunc}…/{}", tail.join("/"))
 }
 
@@ -121,7 +132,11 @@ impl Screen for ProviderList {
         // 标题行
         let header = format!(
             "记录: {}/{}   当前: {}   Tab ←→ 切换  ↑↓ 记录  Enter 按钮  Esc 返回",
-            if self.records.is_empty() { 0 } else { self.cursor + 1 },
+            if self.records.is_empty() {
+                0
+            } else {
+                self.cursor + 1
+            },
             self.records.len(),
             self.current()
                 .map(|r| format!("id={}", r.id))
@@ -136,7 +151,12 @@ impl Screen for ProviderList {
 
         if self.records.is_empty() {
             let area = Rect::new(4, 4, frame.area.width.saturating_sub(8), 1);
-            frame.put_str(area, "(空)尚未配置任何接入记录,使用 /provider add 新增。", theme::FG, attr::NONE);
+            frame.put_str(
+                area,
+                "(空)尚未配置任何接入记录,使用 /provider add 新增。",
+                theme::FG,
+                attr::NONE,
+            );
         } else {
             // 字段 Tab 列表
             let top = 3u16;
@@ -147,7 +167,12 @@ impl Screen for ProviderList {
                 }
                 let label_area = Rect::new(2, y, 18, 1);
                 let value_area = Rect::new(22, y, frame.area.width.saturating_sub(24), 1);
-                frame.put_str(label_area, &format!("{}:", label), theme::ACCENT, attr::NONE);
+                frame.put_str(
+                    label_area,
+                    &format!("{}:", label),
+                    theme::ACCENT,
+                    attr::NONE,
+                );
                 frame.put_str(value_area, &self.field_value(i), theme::FG, attr::NONE);
             }
 
@@ -161,7 +186,12 @@ impl Screen for ProviderList {
                     (
                         theme::SELECTED_FG,
                         theme::SELECTED_ATTRS,
-                        format!("{}{}{}", theme::SELECTED_BUTTON_L, l, theme::SELECTED_BUTTON_R),
+                        format!(
+                            "{}{}{}",
+                            theme::SELECTED_BUTTON_L,
+                            l,
+                            theme::SELECTED_BUTTON_R
+                        ),
                     )
                 } else {
                     (theme::FG, attr::NONE, format!("  {}  ", l))
@@ -179,7 +209,12 @@ impl Screen for ProviderList {
         // 帮助栏
         let help = "操作: s 设为当前   d 删除   n/p 下一/上一条   ← → 切换按钮   Esc 返回";
         frame.put_str(
-            Rect::new(2, frame.area.height.saturating_sub(2), frame.area.width.saturating_sub(4), 1),
+            Rect::new(
+                2,
+                frame.area.height.saturating_sub(2),
+                frame.area.width.saturating_sub(4),
+                1,
+            ),
             help,
             theme::DIM,
             attr::NONE,
@@ -225,7 +260,11 @@ impl Screen for ProviderList {
             KeyCode::Char('s') => self.switch_active(),
             KeyCode::Char('d') => {
                 if let Some(r) = self.current().cloned() {
-                    Outcome::Push(Box::new(ProviderDelPicker::new(self.db.clone(), self.paths.clone(), r.id)))
+                    Outcome::Push(Box::new(ProviderDelPicker::new(
+                        self.db.clone(),
+                        self.paths.clone(),
+                        r.id,
+                    )))
                 } else {
                     Outcome::Continue
                 }
@@ -299,7 +338,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = Paths::for_test(dir.path());
         let db = Db::open(&paths).unwrap();
-        db.add(Protocol::Anthropic, "p1", "m1", "https://x", "k1234").unwrap();
+        db.add(Protocol::Anthropic, "p1", "m1", "https://x", "k1234")
+            .unwrap();
         let screen = ProviderList::new(Arc::new(Mutex::new(db)), paths);
         assert_eq!(screen.records.len(), 1);
         assert_eq!(screen.field_value(0), "1");

@@ -76,18 +76,14 @@ impl OfflineQueue {
     }
 
     /// 入队。成功返 `Ok(())`;队列满返 `Err(QueueFull(当前容量))`。
-    pub fn enqueue(
-        &self,
-        prompt: String,
-        raw: String,
-    ) -> Result<(), QueueFull> {
+    pub fn enqueue(&self, prompt: String, raw: String) -> Result<(), QueueFull> {
         let mut inner = self.inner.lock().expect("OfflineQueue poisoned");
         if inner.items.len() >= inner.capacity {
             return Err(QueueFull(inner.capacity));
         }
         // 时间戳:优先本地时区,失败回退 UTC。格式 YYYY-MM-DD HH:MM:SS。
-        let now = time::OffsetDateTime::now_local()
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let now =
+            time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
         let enqueued_at = format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             now.year(),
@@ -113,7 +109,11 @@ impl OfflineQueue {
 
     /// 当前深度(横幅展示用)。
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("OfflineQueue poisoned").items.len()
+        self.inner
+            .lock()
+            .expect("OfflineQueue poisoned")
+            .items
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {

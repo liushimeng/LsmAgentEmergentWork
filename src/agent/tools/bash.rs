@@ -109,11 +109,7 @@ fn first_command_token(command: &str) -> String {
         .or_else(|| trimmed.strip_prefix("sh -c "))
         .or_else(|| trimmed.strip_prefix("env "))
         .unwrap_or(trimmed);
-    after
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+    after.split_whitespace().next().unwrap_or("").to_string()
 }
 
 /// WindowUse Bash 白名单校验:黑名单永远优先,白名单只在 WindowUse 模式下生效。
@@ -164,10 +160,16 @@ pub fn check_window_use_bash(command: &str) -> Result<()> {
 
 /// 命令首个 token(去掉前导空白 / env 前缀)。
 
-
 /// 当前进程工作目录(通过 env::current_dir 惰性获取)
 fn current_work_dir() -> std::path::PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // 并行测试可能创建/删除临时 cwd;Bash spawn 会因 current_dir 不存在而失败。
+    // 这里保持语义:优先当前工作目录,被删除时退回系统临时目录。
+    if cwd.exists() {
+        cwd
+    } else {
+        std::env::temp_dir()
+    }
 }
 
 /// `LAEW_BASH_UTF8=1/true/yes/on` 时为 bash 子进程注入 UTF-8 语言环境。
@@ -240,21 +242,31 @@ fn do_resolve_bash_binary() -> Option<String> {
             let mut v = Vec::new();
             // 候选前缀:(盘符, 路径)。覆盖 C/D/E(常见装在 D 盘的笔记本)。
             let prefixes: Vec<String> = std::iter::empty()
-                .chain(['C', 'D', 'E'].iter().map(|d| {
-                    format!(r"{}:\Program Files\Git\usr\bin", d)
-                }))
-                .chain(['C', 'D', 'E'].iter().map(|d| {
-                    format!(r"{}:\Program Files (x86)\Git\usr\bin", d)
-                }))
-                .chain(['C', 'D', 'E'].iter().map(|d| {
-                    format!(r"{}:\Program Files\Git\bin", d)
-                }))
-                .chain(['C', 'D', 'E'].iter().map(|d| {
-                    format!(r"{}:\Program Files (x86)\Git\bin", d)
-                }))
-                .chain(['C', 'D', 'E'].iter().map(|d| {
-                    format!(r"{}:\Program Files\Git\mingw64\bin", d)
-                }))
+                .chain(
+                    ['C', 'D', 'E']
+                        .iter()
+                        .map(|d| format!(r"{}:\Program Files\Git\usr\bin", d)),
+                )
+                .chain(
+                    ['C', 'D', 'E']
+                        .iter()
+                        .map(|d| format!(r"{}:\Program Files (x86)\Git\usr\bin", d)),
+                )
+                .chain(
+                    ['C', 'D', 'E']
+                        .iter()
+                        .map(|d| format!(r"{}:\Program Files\Git\bin", d)),
+                )
+                .chain(
+                    ['C', 'D', 'E']
+                        .iter()
+                        .map(|d| format!(r"{}:\Program Files (x86)\Git\bin", d)),
+                )
+                .chain(
+                    ['C', 'D', 'E']
+                        .iter()
+                        .map(|d| format!(r"{}:\Program Files\Git\mingw64\bin", d)),
+                )
                 .collect();
             for prefix in &prefixes {
                 let bash = format!(r"{}\bash.exe", prefix);
@@ -276,8 +288,7 @@ fn do_resolve_bash_binary() -> Option<String> {
                 }
             }
             // WSL bash launcher 兜底(可能工作也可能不工作,按实际探测结果)
-            for tail in [r"C:\Windows\System32\bash.exe",
-                         r"C:\Users\Public\bash.exe"] {
+            for tail in [r"C:\Windows\System32\bash.exe", r"C:\Users\Public\bash.exe"] {
                 if std::path::Path::new(tail).exists() && !v.iter().any(|x| x == tail) {
                     v.push(tail.to_string());
                 }
@@ -330,7 +341,9 @@ pub struct BashTool;
 
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &str { "Bash" }
+    fn name(&self) -> &str {
+        "Bash"
+    }
 
     fn description(&self) -> &str {
         "在工作目录下执行 bash 命令,返回 stdout + stderr + 退出码。\n\
@@ -466,7 +479,10 @@ impl Tool for BashTool {
                     buf.push_str("<stdout>\n");
                     buf.push_str(&stdout_trunc.text);
                     if stdout_trunc.omitted > 0 {
-                        buf.push_str(&format!("\n...[stdout 截断,省略 {} 字符]", stdout_trunc.omitted));
+                        buf.push_str(&format!(
+                            "\n...[stdout 截断,省略 {} 字符]",
+                            stdout_trunc.omitted
+                        ));
                     }
                     buf.push('\n');
                 }
@@ -474,7 +490,10 @@ impl Tool for BashTool {
                     buf.push_str("<stderr>\n");
                     buf.push_str(&stderr_trunc.text);
                     if stderr_trunc.omitted > 0 {
-                        buf.push_str(&format!("\n...[stderr 截断,省略 {} 字符]", stderr_trunc.omitted));
+                        buf.push_str(&format!(
+                            "\n...[stderr 截断,省略 {} 字符]",
+                            stderr_trunc.omitted
+                        ));
                     }
                     buf.push('\n');
                 }
@@ -554,11 +573,7 @@ fn truncate(s: &str, max: usize) -> Truncated {
         }
     } else {
         // 防止按 char 边界切割出错,按 char 索引切
-        let cut = s
-            .char_indices()
-            .nth(max)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
+        let cut = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
         Truncated {
             text: s[..cut].to_string(),
             truncated: s[..cut].to_string(),
@@ -572,9 +587,10 @@ mod tests {
     use super::*;
     /// 2026-09-15 第 53 轮:加锁防止与 llm::tls_insecure_* / safety::prompt_injection_*
     /// 等同时改环境变量的测试产生竞态;Rust 测试默认并行跑。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::test_support::GLOBAL_ENV_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[tokio::test]

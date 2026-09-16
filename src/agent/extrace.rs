@@ -112,6 +112,14 @@ pub struct ToolCallLogEntry {
     ///   真实工具错误被吞)。
     #[serde(default)]
     pub error_summary: String,
+    /// 成功工具输出的短摘要(2026-09-16 第 61 轮新增)。
+    ///
+    /// - 旧 trace 反序列化为空串;
+    /// - 仅保留前 512 字符,主要用于 WindowUse 恢复 WindowList / WindowFind
+    ///   的窗口 ID,以及 QC / TUI 看到真实执行证据;
+    /// - 不落全文,避免 Agent-Memory 与上下文膨胀。
+    #[serde(default)]
+    pub output_summary: String,
 }
 
 /// 工具调用日志上限;超出截断最早的(FIFO)。
@@ -256,6 +264,7 @@ impl ExecutionTrace {
         output_bytes: usize,
         elapsed_ms: u64,
         error_summary: &str,
+        output_summary: &str,
     ) {
         let error_truncated: String = error_summary.chars().take(200).collect();
         self.tool_call_log.push(ToolCallLogEntry {
@@ -265,6 +274,7 @@ impl ExecutionTrace {
             output_bytes,
             elapsed_ms,
             error_summary: error_truncated,
+            output_summary: output_summary.chars().take(512).collect(),
         });
         if self.tool_call_log.len() > MAX_TOOL_CALL_LOG {
             // FIFO 截断最早条目
@@ -284,7 +294,7 @@ impl ExecutionTrace {
 
     /// 把 trace 渲染成 QC prompt 可用的紧凑 Markdown(≤ 9 行,防止膨胀 prompt)。
     pub fn render_prompt(&self) -> String {
-        let base = format!(
+        let mut base = format!(
             "- iterations={} tool_calls={}(ok={},err={}) max_consec={}\n\
              - early_terminated={} truncation_resumes={} overflow_recoveries={}\n\
              - output_bytes={} bash_exit_nonzero={} last_exit={}\n\
@@ -302,11 +312,31 @@ impl ExecutionTrace {
             self.last_bash_exit_code,
             self.failure_signals.join(","),
         );
-        if self.artifacts.is_empty() {
-            base
-        } else {
-            format!("{base}\n- artifacts=[{}]", self.artifacts.join("; "))
+        if !self.artifacts.is_empty() {
+            base.push_str(&format!("\n- artifacts=[{}]", self.artifacts.join("; ")));
         }
+
+        // 2026-09-16 第 61 轮:QC 必须看到真实工具证据,避免最终文本与工具轨迹相悖。
+        const MAX_TOOL_EVIDENCE: usize = 12;
+        if !self.tool_call_log.is_empty() {
+            base.push_str("\n- recent_tools:");
+            let start = self.tool_call_log.len().saturating_sub(MAX_TOOL_EVIDENCE);
+            for tc in &self.tool_call_log[start..] {
+                let evidence = if tc.ok {
+                    tc.output_summary.chars().take(120).collect::<String>()
+                } else {
+                    tc.error_summary.chars().take(160).collect::<String>()
+                };
+                base.push_str(&format!(
+                    "\n  - {} {}ms args={} evidence={}",
+                    tc.tool,
+                    tc.elapsed_ms,
+                    tc.args_json.chars().take(100).collect::<String>(),
+                    evidence
+                ));
+            }
+        }
+        base
     }
 }
 
@@ -661,7 +691,10 @@ mod tests {
         assert!(!t.render_prompt().contains("artifacts="));
         t.artifacts.push("Write guide.md (4600B)".into());
         let s = t.render_prompt();
-        assert!(s.contains("artifacts=[Write guide.md (4600B)]"), "实际: {s}");
+        assert!(
+            s.contains("artifacts=[Write guide.md (4600B)]"),
+            "实际: {s}"
+        );
     }
 
     #[test]
@@ -735,10 +768,7 @@ mod tests {
         assert_eq!(t.bash_exit_nonzero_count, 1);
         assert_eq!(t.last_bash_exit_code, 1);
         t.record_bash_exit_code("<stdout>\nEXPECTED_NEGATIVE_OK rc=1\n<exit_code>0</exit_code>");
-        assert_eq!(
-            t.bash_exit_nonzero_count, 1,
-            "成功的 bash 不应累计失败次数"
-        );
+        assert_eq!(t.bash_exit_nonzero_count, 1, "成功的 bash 不应累计失败次数");
         assert_eq!(t.last_bash_exit_code, 0, "成功的 bash 必须刷新 last_exit");
     }
 

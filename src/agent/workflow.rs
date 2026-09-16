@@ -25,7 +25,9 @@ pub use batch::{BatchChannel, BatchResult, BatchTask};
 pub use goal::{Goal, GoalState, GoalStore, Priority};
 pub use phase::{Phase, PhaseExecutionResult, PhaseExecutor, PhaseFailurePolicy};
 pub use quality_gate::{QualityGate, QualityGateResult};
-pub use squad::{Squad, SquadDispatchResult, SquadDispatcher, SquadMember, SquadRole, SquadStrategy};
+pub use squad::{
+    Squad, SquadDispatchResult, SquadDispatcher, SquadMember, SquadRole, SquadStrategy,
+};
 pub use template::{TemplateCategory, TemplateLibrary, WorkflowTemplate};
 
 use crate::agent::cancel::CancelToken;
@@ -127,7 +129,14 @@ impl WorkFlowRunner {
 
         let adaptive = AdaptiveLoop::new(self.config.clone());
         let loop_result = adaptive
-            .run(goal, session_id, &self.sub_agent, &self.db, cancel, &mut result)
+            .run(
+                goal,
+                session_id,
+                &self.sub_agent,
+                &self.db,
+                cancel,
+                &mut result,
+            )
             .await;
 
         match loop_result {

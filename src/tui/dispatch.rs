@@ -8,14 +8,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::TuiSession;
 use super::export::{OutcomeKind, TranscriptEntry};
 use super::format::{
-    format_task_result, format_task_result_for_context, merge_usage, now_clock,
-    waiting_line_text,
+    format_task_result, format_task_result_for_context, merge_usage, now_clock, waiting_line_text,
 };
 use super::pathfmt;
-use crate::agent::debug::{DebugCollector, ReportMeta, finalize_report};
+use super::TuiSession;
+use crate::agent::debug::{finalize_report, DebugCollector, ReportMeta};
 use crate::agent::orchestrator::OrchestrationOutcome;
 use crate::llm::{ChatMessage, Usage};
 
@@ -85,7 +84,9 @@ impl TuiSession {
             None => (raw, prompt, false),
         };
         // 普通提示词:Orchestrator 编排(可取消:Ctrl-C 经 SIGINT 自动感知,零新增命令)
-        self.session.context_mut().push(ChatMessage::user(effective_prompt));
+        self.session
+            .context_mut()
+            .push(ChatMessage::user(effective_prompt));
         // debug 模式:每个任务开始前重置采集器
         if let Some(collector) = &self.debug {
             collector.reset(self.session.id());
@@ -402,31 +403,32 @@ impl TuiSession {
                 println!(
                     "  [task failed: difficulty={}, reason={}, 总耗时 {:.2}s]",
                     classification.task_level.display_name(),
-                    crate::tui::format::truncate_chars(&reason_short, 80),
+                    crate::tui::format::truncate_chars(&reason_short, 240),
                     *wallclock_ms as f64 / 1000.0,
                 );
                 // 复用 format_task_result 渲染 stage_durations / retry_log / trace 段。
                 // stub_workflow 用 last_trace 携带失败单元的工具调用明细,便于 [trace] [tool] [failure] 段呈现。
-                let stub_workflow = last_trace.as_ref().map(|t| {
-                    crate::agent::orchestrator::WorkflowResult {
-                        id: "wf-1".into(),
-                        name: "失败单元".into(),
-                        subflow_outcome: String::new(),
-                        quality_report: crate::agent::quality::QualityReport {
-                            verdict: crate::agent::quality::Verdict::Fail,
-                            issues: vec![reason.clone()],
-                            suggestion: suggestion.clone(),
-                            retryable: false,
-                            source: crate::agent::context::AgentRole::SubAgent,
-                            evidence: String::new(),
-                        },
-                        usage: Usage::default(),
-                        subflow_trace: Some(t.as_ref().clone()),
-                        exec_role: crate::agent::context::AgentRole::SubAgent,
-                        wallclock_ms: 0,
-                        qc_wallclock_ms: 0,
-                    }
-                });
+                let stub_workflow =
+                    last_trace
+                        .as_ref()
+                        .map(|t| crate::agent::orchestrator::WorkflowResult {
+                            id: "wf-1".into(),
+                            name: "失败单元".into(),
+                            subflow_outcome: String::new(),
+                            quality_report: crate::agent::quality::QualityReport {
+                                verdict: crate::agent::quality::Verdict::Fail,
+                                issues: vec![reason.clone()],
+                                suggestion: suggestion.clone(),
+                                retryable: false,
+                                source: crate::agent::context::AgentRole::SubAgent,
+                                evidence: String::new(),
+                            },
+                            usage: Usage::default(),
+                            subflow_trace: Some(t.as_ref().clone()),
+                            exec_role: crate::agent::context::AgentRole::SubAgent,
+                            wallclock_ms: 0,
+                            qc_wallclock_ms: 0,
+                        });
                 let stub_result = crate::agent::orchestrator::TaskResult {
                     goal: classification.goal_summary.clone(),
                     classification: classification.clone(),
@@ -442,7 +444,8 @@ impl TuiSession {
                 // 复用 format_failed_detail 渲染 stage_durations / retry_log / 失败工具明细 / failure_signals,
                 // 不再走 format_task_result(其会打印 "[task executed]" 与失败语义冲突)。
                 for line in
-                    crate::tui::format::format_failed_detail(&stub_result, &reason, &suggestion).lines()
+                    crate::tui::format::format_failed_detail(&stub_result, &reason, &suggestion)
+                        .lines()
                 {
                     println!("{line}");
                 }
@@ -461,12 +464,7 @@ impl TuiSession {
                     text.push_str(&format!("\n原因: {reason}"));
                 }
                 text.push_str(&format!("\n建议: {suggestion}"));
-                Some((
-                    OutcomeKind::Failed,
-                    text.clone(),
-                    text,
-                    *usage,
-                ))
+                Some((OutcomeKind::Failed, text.clone(), text, *usage))
             }
             Err(e) if matches!(e, crate::error::AgentError::Cancelled) => {
                 println!();
@@ -555,7 +553,12 @@ impl TuiSession {
         }
     }
 
-    fn print_assistant_text_with_agent(&mut self, agent_name: &str, text: &str, usage: &crate::llm::Usage) {
+    fn print_assistant_text_with_agent(
+        &mut self,
+        agent_name: &str,
+        text: &str,
+        usage: &crate::llm::Usage,
+    ) {
         if !text.is_empty() {
             println!();
             println!("  [agent: {agent_name}]");
@@ -570,10 +573,7 @@ impl TuiSession {
         self.task_started_at = None;
     }
 
-    fn print_task_result(
-        &mut self,
-        result: &crate::agent::orchestrator::TaskResult,
-    ) {
+    fn print_task_result(&mut self, result: &crate::agent::orchestrator::TaskResult) {
         // 2026-09-10 第 27 轮 F05:从 self.task_started_at.take() 取任务开始时间,
         // 拼接到「本次用量」行末尾。take 保证只显示一次,后续命令不带耗时。
         let started = self.task_started_at.take();
@@ -609,7 +609,10 @@ impl TuiSession {
                 cache.push_str(&format!("  cache_read={}", usage.cache_read_input_tokens));
             }
             if usage.cache_creation_input_tokens > 0 {
-                cache.push_str(&format!("  cache_creation={}", usage.cache_creation_input_tokens));
+                cache.push_str(&format!(
+                    "  cache_creation={}",
+                    usage.cache_creation_input_tokens
+                ));
             }
             // 任务总耗时(2026-09-10 第 27 轮 F05 / tmpPlan/2026-09-10_22):
             // 从任务提交到 print_usage 调用的 wall-clock 时间,以秒为单位显示,
@@ -670,9 +673,8 @@ impl TuiSession {
             Ok(OrchestrationOutcome::Failed { reason, .. }) => {
                 // 编排层失败:检查 reason 是否网络类。
                 if looks_like_network_failure(reason) {
-                    self.connectivity.record_network_error(
-                        categorize_failure_reason(reason),
-                    );
+                    self.connectivity
+                        .record_network_error(categorize_failure_reason(reason));
                 } else {
                     // 非网络失败(如 Yolo 解析失败 / 任务逻辑失败)→ 网络可达。
                     self.connectivity.record_success();
@@ -680,13 +682,11 @@ impl TuiSession {
             }
             Err(e) => match e {
                 crate::error::AgentError::LlmNetwork(_) => {
-                    self.connectivity
-                        .record_network_error("llm_network");
+                    self.connectivity.record_network_error("llm_network");
                 }
                 crate::error::AgentError::LlmHttp { status, .. } => {
                     // 5xx 视为 Provider 不可达;4xx(除 429/408)视为服务可达。
-                    if *status == 502 || *status == 503 || *status == 504 || *status == 429
-                    {
+                    if *status == 502 || *status == 503 || *status == 504 || *status == 429 {
                         self.connectivity
                             .record_network_error(format!("http_{status}"));
                     } else {
@@ -758,11 +758,7 @@ impl TuiSession {
             print!("  [工作区] 变更文件集变化(共 {} 个未提交)", after.dirty);
         }
         if !new_files.is_empty() {
-            let shown: Vec<&str> = new_files
-                .iter()
-                .take(3)
-                .map(|f| f.as_str())
-                .collect();
+            let shown: Vec<&str> = new_files.iter().take(3).map(|f| f.as_str()).collect();
             let more = if new_files.len() > shown.len() {
                 format!(" 等 {} 个", new_files.len())
             } else {

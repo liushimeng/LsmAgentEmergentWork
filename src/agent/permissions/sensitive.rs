@@ -61,9 +61,7 @@ pub fn references_sensitive_path(command: &str) -> bool {
         return true;
     }
     // 4) 特定后缀文件(如 .netrc / _netrc / .git-credentials 等)
-    env_file_sensitive(&lower)
-        || shell_history_sensitive(&lower)
-        || proc_self_environ(&lower)
+    env_file_sensitive(&lower) || shell_history_sensitive(&lower) || proc_self_environ(&lower)
 }
 
 /// 文件名型敏感标记(需 word-boundary 匹配,避免 `rsa:2048` 等子串误中)
@@ -182,9 +180,9 @@ fn is_after_openssl_write_flag(lower: &str, pos: usize) -> bool {
         "-passout",
         "-passin",
         "-write-out",
-        "-o",   // curl / tar 等通用输出
-        "-i",   // 输入文件但仍允许
-        "-f",   // file(通用)
+        "-o", // curl / tar 等通用输出
+        "-i", // 输入文件但仍允许
+        "-f", // file(通用)
     ];
     let bytes = lower.as_bytes();
     let n = bytes.len();
@@ -226,7 +224,10 @@ fn env_file_sensitive(lower: &str) -> bool {
         let abs = search_from + idx;
         // 必须前面是路径分隔符或字符串开头(避免误判 .environment / .envision)
         let before_ok = abs == 0
-            || matches!(lower.as_bytes()[abs - 1], b'/' | b'"' | b'\'' | b' ' | b'$' | b'{');
+            || matches!(
+                lower.as_bytes()[abs - 1],
+                b'/' | b'"' | b'\'' | b' ' | b'$' | b'{'
+            );
         if before_ok {
             let after = &lower[abs + 4..];
             // 后面必须接分隔符 / 引号 / 字符串结尾,避免 .environment 误判
@@ -311,13 +312,17 @@ mod tests {
     #[test]
     fn blocks_gnupg_kube() {
         assert!(references_sensitive_path("ls ~/.gnupg/"));
-        assert!(references_sensitive_path("kubectl --kubeconfig ~/.kube/config"));
+        assert!(references_sensitive_path(
+            "kubectl --kubeconfig ~/.kube/config"
+        ));
     }
 
     #[test]
     fn blocks_netrc_gitcredentials() {
         assert!(references_sensitive_path("cat ~/.netrc"));
-        assert!(references_sensitive_path("git clone https://x@github.com --config ~/.git-credentials"));
+        assert!(references_sensitive_path(
+            "git clone https://x@github.com --config ~/.git-credentials"
+        ));
     }
 
     #[test]
@@ -326,9 +331,13 @@ mod tests {
         // 匹配 + openssl/curl 输出参数白名单(`-keyout` / `-out` / `-config` 等),
         // 正确放行合法证书生成命令,同时仍拦截可疑的证书引用。
         assert!(references_sensitive_path("cat /etc/ssl/certs/cert.pem"));
-        assert!(references_sensitive_path("keytool -importkeystore /tmp/.p12"));
-        assert!(references_sensitive_path("cat cert.pem"));  // 漏报但已被新逻辑拦截
-        assert!(!references_sensitive_path("openssl req -x509 -keyout key.pem -out cert.pem"));
+        assert!(references_sensitive_path(
+            "keytool -importkeystore /tmp/.p12"
+        ));
+        assert!(references_sensitive_path("cat cert.pem")); // 漏报但已被新逻辑拦截
+        assert!(!references_sensitive_path(
+            "openssl req -x509 -keyout key.pem -out cert.pem"
+        ));
     }
 
     #[test]
@@ -374,10 +383,14 @@ mod tests {
         // 回归 P1-1 (2026-09-12 第 47 轮):openssl -newkey rsa:2048 的
         // `rsa:2048` 子串误中旧的 `id_rsa` 敏感标记,导致合法 TLS 证书
         // 生成命令被误判为引用 SSH 私钥。
-        assert!(!references_sensitive_path("openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem"));
-        assert!(!references_sensitive_path("openssl genrsa -out rsa_key.pem 2048"));
-        assert!(!references_sensitive_path("ssh-keygen -t rsa -b 4096"));  // 这是生成命令,合法
-        // 但实际引用私钥文件路径仍应被拦截
+        assert!(!references_sensitive_path(
+            "openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem"
+        ));
+        assert!(!references_sensitive_path(
+            "openssl genrsa -out rsa_key.pem 2048"
+        ));
+        assert!(!references_sensitive_path("ssh-keygen -t rsa -b 4096")); // 这是生成命令,合法
+                                                                          // 但实际引用私钥文件路径仍应被拦截
         assert!(references_sensitive_path("cat ~/.ssh/id_rsa"));
         assert!(references_sensitive_path("cp id_rsa /tmp/"));
         assert!(references_sensitive_path("less .ssh/id_ed25519"));

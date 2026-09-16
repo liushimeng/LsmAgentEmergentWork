@@ -82,7 +82,9 @@ const NON_OVERFLOW_PATTERNS: &[&str] = &[
 /// - 其余按 OVERFLOW_PATTERNS 子串匹配(大小写不敏感)。
 pub fn is_context_overflow(err: &AgentError) -> bool {
     let (status, message) = match err {
-        AgentError::LlmHttp { status, message, .. } => (Some(*status), message.as_str()),
+        AgentError::LlmHttp {
+            status, message, ..
+        } => (Some(*status), message.as_str()),
         // 部分网关以 200 + SSE error 事件或纯文本报溢出,无状态码可依
         AgentError::LlmStream { message, .. } => (None, message.as_str()),
         AgentError::Llm(m) => (None, m.as_str()),
@@ -186,8 +188,7 @@ pub fn fold_history(session: &mut Session) -> Option<usize> {
          {COMPACT_MARKER_END}",
         compact_idx.len(),
     ));
-    let compact_set: std::collections::HashSet<usize> =
-        compact_idx.iter().copied().collect();
+    let compact_set: std::collections::HashSet<usize> = compact_idx.iter().copied().collect();
     let mut new_ctx: Vec<ChatMessage> = Vec::with_capacity(len - compact_idx.len() + 1);
     for (i, m) in session.context().iter().enumerate() {
         if i == first {
@@ -284,11 +285,12 @@ mod tests {
     fn session_with_fat_result(fat_chars: usize) -> Session {
         let mut s = Session::new();
         s.context_mut().push(ChatMessage::user("跑命令"));
-        s.context_mut().push(ChatMessage::assistant(vec![ContentBlock::ToolUse {
-            id: "t1".into(),
-            name: "Bash".into(),
-            input: serde_json::json!({"command": "seq 1 5000"}),
-        }]));
+        s.context_mut()
+            .push(ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "seq 1 5000"}),
+            }]));
         s.context_mut()
             .push(ChatMessage::tool_result("t1", "x".repeat(fat_chars), false));
         s
@@ -406,20 +408,23 @@ mod tests {
             crate::agent::project_context::MARKER_START,
             crate::agent::project_context::MARKER_END
         )));
-        s.context_mut().push(ChatMessage::user(format!("u1 {}", "胖".repeat(400))));
-        s.context_mut().push(ChatMessage::assistant(vec![ContentBlock::ToolUse {
-            id: "t1".into(),
-            name: "Bash".into(),
-            input: serde_json::json!({"command": "echo 1"}),
-        }]));
+        s.context_mut()
+            .push(ChatMessage::user(format!("u1 {}", "胖".repeat(400))));
+        s.context_mut()
+            .push(ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "echo 1"}),
+            }]));
         s.context_mut()
             .push(ChatMessage::tool_result("t1", "r1 输出".repeat(100), false));
         s.context_mut().push(ChatMessage::user("u2 当前任务"));
-        s.context_mut().push(ChatMessage::assistant(vec![ContentBlock::ToolUse {
-            id: "t2".into(),
-            name: "Bash".into(),
-            input: serde_json::json!({"command": "echo 2"}),
-        }]));
+        s.context_mut()
+            .push(ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t2".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "echo 2"}),
+            }]));
         s.context_mut()
             .push(ChatMessage::tool_result("t2", "r2 输出", false));
 

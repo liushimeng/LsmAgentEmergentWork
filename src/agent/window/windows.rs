@@ -12,7 +12,9 @@
 
 use windows::core::BSTR;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::ProcessStatus::GetModuleBaseNameW;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Accessibility::{
@@ -25,7 +27,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GW_CHILD, GW_HWNDNEXT, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT,
 };
 
-use super::{matches_filter, platform_err, ControlAction, ControlNode, Rect, WindowDriver, WindowInfo};
+use super::{
+    matches_filter, platform_err, ControlAction, ControlNode, Rect, WindowDriver, WindowInfo,
+};
 use crate::error::Result;
 
 pub struct WindowsDriver;
@@ -78,7 +82,10 @@ struct EnumCtx {
     filter: Option<String>,
 }
 
-unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+unsafe extern "system" fn enum_windows_proc(
+    hwnd: HWND,
+    lparam: LPARAM,
+) -> windows::Win32::Foundation::BOOL {
     let ctx = &mut *(lparam.0 as *mut EnumCtx);
     if IsWindowVisible(hwnd).as_bool() {
         let len = GetWindowTextLengthW(hwnd);
@@ -143,11 +150,17 @@ fn uia_role_name(el: &IUIAutomationElement) -> String {
 fn uia_actions(el: &IUIAutomationElement) -> Vec<String> {
     let mut v = vec!["focus".to_string(), "get_text".to_string()];
     unsafe {
-        if el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId).is_ok() {
+        if el
+            .GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
+            .is_ok()
+        {
             v.push("click".into());
             v.push("invoke".into());
         }
-        if el.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId).is_ok() {
+        if el
+            .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+            .is_ok()
+        {
             v.push("set_text".into());
         }
     }
@@ -269,18 +282,34 @@ unsafe fn uia_element_at_path(
 // ===================== Win32 降级路径 =====================
 
 /// 子 HWND 递归枚举(GW_CHILD + GW_HWNDNEXT)。
-unsafe fn win32_build_tree(hwnd: HWND, path: String, depth: usize, max_depth: usize, filter: Option<&str>) -> Option<ControlNode> {
+unsafe fn win32_build_tree(
+    hwnd: HWND,
+    path: String,
+    depth: usize,
+    max_depth: usize,
+    filter: Option<&str>,
+) -> Option<ControlNode> {
     let mut class_buf = [0u16; 256];
     let n = GetClassNameW(hwnd, &mut class_buf);
     let class = String::from_utf16_lossy(&class_buf[..n as usize]);
     let text_len = SendMessageW(hwnd, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0)).0 as usize;
     let mut tbuf = vec![0u16; text_len + 1];
-    let got = SendMessageW(hwnd, WM_GETTEXT, WPARAM(tbuf.len()), LPARAM(tbuf.as_mut_ptr() as isize)).0 as usize;
+    let got = SendMessageW(
+        hwnd,
+        WM_GETTEXT,
+        WPARAM(tbuf.len()),
+        LPARAM(tbuf.as_mut_ptr() as isize),
+    )
+    .0 as usize;
     let name = String::from_utf16_lossy(&tbuf[..got.min(text_len)]);
     let mut rc = RECT::default();
     let _ = GetWindowRect(hwnd, &mut rc);
 
-    let role = if class.is_empty() { "Window".to_string() } else { class };
+    let role = if class.is_empty() {
+        "Window".to_string()
+    } else {
+        class
+    };
     let mut node = ControlNode {
         path: path.clone(),
         role,
@@ -292,7 +321,12 @@ unsafe fn win32_build_tree(hwnd: HWND, path: String, depth: usize, max_depth: us
             width: (rc.right - rc.left) as i64,
             height: (rc.bottom - rc.top) as i64,
         },
-        actions: vec!["focus".into(), "get_text".into(), "click".into(), "set_text".into()],
+        actions: vec![
+            "focus".into(),
+            "get_text".into(),
+            "click".into(),
+            "set_text".into(),
+        ],
         children: Vec::new(),
     };
 
@@ -375,12 +409,22 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
             let mut wide: Vec<u16> = text.encode_utf16().collect();
             wide.push(0);
             SendMessageW(hwnd, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
-            Ok(format!("已向 HWND {:?} 写入文本({} 字符)", hwnd.0, text.chars().count()))
+            Ok(format!(
+                "已向 HWND {:?} 写入文本({} 字符)",
+                hwnd.0,
+                text.chars().count()
+            ))
         }
         ControlAction::GetText => {
             let len = SendMessageW(hwnd, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0)).0 as usize;
             let mut buf = vec![0u16; len + 1];
-            let got = SendMessageW(hwnd, WM_GETTEXT, WPARAM(buf.len()), LPARAM(buf.as_mut_ptr() as isize)).0 as usize;
+            let got = SendMessageW(
+                hwnd,
+                WM_GETTEXT,
+                WPARAM(buf.len()),
+                LPARAM(buf.as_mut_ptr() as isize),
+            )
+            .0 as usize;
             Ok(String::from_utf16_lossy(&buf[..got.min(len)]))
         }
         ControlAction::SendKeys(_) => Err(platform_err(
@@ -412,7 +456,12 @@ impl WindowDriver for WindowsDriver {
         Ok(ctx.windows)
     }
 
-    fn inspect(&self, window_id: &str, max_depth: usize, filter: Option<&str>) -> Result<ControlNode> {
+    fn inspect(
+        &self,
+        window_id: &str,
+        max_depth: usize,
+        filter: Option<&str>,
+    ) -> Result<ControlNode> {
         let hwnd = Self::parse_hwnd(window_id)?;
         let max_depth = max_depth.clamp(1, 12);
         let _com = ComGuard::init()?;
@@ -422,12 +471,16 @@ impl WindowDriver for WindowsDriver {
                     let root = uia.ElementFromHandle(hwnd).map_err(|e| {
                         platform_err("windows", format!("UIA ElementFromHandle 失败: {e}"))
                     })?;
-                    uia_build_tree(&uia, &root, "/".to_string(), 1, max_depth, filter).ok_or_else(|| {
-                        platform_err(
-                            "windows",
-                            format!("filter 未命中窗口 {window_id} 内任何控件,请放宽过滤条件重试"),
-                        )
-                    })
+                    uia_build_tree(&uia, &root, "/".to_string(), 1, max_depth, filter).ok_or_else(
+                        || {
+                            platform_err(
+                                "windows",
+                                format!(
+                                    "filter 未命中窗口 {window_id} 内任何控件,请放宽过滤条件重试"
+                                ),
+                            )
+                        },
+                    )
                 }
                 Err(_) => {
                     // UIA 不可用 → Win32 子控件降级(仅原生 Win32 控件可见)
@@ -454,9 +507,13 @@ impl WindowDriver for WindowsDriver {
                     let el = uia_element_at_path(&uia, &root, path)?;
                     match &action {
                         ControlAction::Click | ControlAction::Invoke => {
-                            match el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId) {
+                            match el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(
+                                UIA_InvokePatternId,
+                            ) {
                                 Ok(p) => {
-                                    p.Invoke().map_err(|e| platform_err("windows", format!("Invoke 失败: {e}")))?;
+                                    p.Invoke().map_err(|e| {
+                                        platform_err("windows", format!("Invoke 失败: {e}"))
+                                    })?;
                                     Ok(format!("已对 {window_id}{path} 执行 Invoke(点击)"))
                                 }
                                 Err(_) => {
@@ -468,15 +525,23 @@ impl WindowDriver for WindowsDriver {
                             }
                         }
                         ControlAction::Focus => {
-                            el.SetFocus().map_err(|e| platform_err("windows", format!("SetFocus 失败: {e}")))?;
+                            el.SetFocus().map_err(|e| {
+                                platform_err("windows", format!("SetFocus 失败: {e}"))
+                            })?;
                             Ok(format!("已聚焦 {window_id}{path}"))
                         }
                         ControlAction::SetText(text) => {
-                            match el.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
+                            match el.GetCurrentPatternAs::<IUIAutomationValuePattern>(
+                                UIA_ValuePatternId,
+                            ) {
                                 Ok(p) => {
-                                    p.SetValue(&BSTR::from(text.as_str()))
-                                        .map_err(|e| platform_err("windows", format!("SetValue 失败: {e}")))?;
-                                    Ok(format!("已向 {window_id}{path} 写入文本({} 字符)", text.chars().count()))
+                                    p.SetValue(&BSTR::from(text.as_str())).map_err(|e| {
+                                        platform_err("windows", format!("SetValue 失败: {e}"))
+                                    })?;
+                                    Ok(format!(
+                                        "已向 {window_id}{path} 写入文本({} 字符)",
+                                        text.chars().count()
+                                    ))
                                 }
                                 Err(_) => {
                                     drop(el);
@@ -485,7 +550,9 @@ impl WindowDriver for WindowsDriver {
                             }
                         }
                         ControlAction::GetText => {
-                            if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
+                            if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationValuePattern>(
+                                UIA_ValuePatternId,
+                            ) {
                                 let v = p.CurrentValue().map(|b| b.to_string()).unwrap_or_default();
                                 if !v.is_empty() {
                                     return Ok(v);

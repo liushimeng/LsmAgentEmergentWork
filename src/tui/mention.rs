@@ -209,10 +209,7 @@ pub fn mention_token_at(buffer: &str, cursor: usize) -> Option<(usize, String)> 
         }
     }
     // 裸形态:光标前最后一个空白之后的 token
-    let start = head
-        .rfind(char::is_whitespace)
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let start = head.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
     let token = &head[start..];
     // 注意:token 自身以 @ 开头,链式吞噬检查必须看 @ 之后的部分
     if token.starts_with('@') && token.len() > 1 && !token[1..].contains('@') {
@@ -329,8 +326,14 @@ mod tests {
         let mut s = FileSuggester::new(tmp.path());
         let items = s.suggest("src/");
         let dir = items.iter().find(|i| i.display == "@src/agent/").unwrap();
-        assert!(dir.replacement.starts_with('@'), "@ prefix must be preserved for dirs");
-        assert!(dir.replacement.ends_with('/'), "trailing slash for drilling");
+        assert!(
+            dir.replacement.starts_with('@'),
+            "@ prefix must be preserved for dirs"
+        );
+        assert!(
+            dir.replacement.ends_with('/'),
+            "trailing slash for drilling"
+        );
     }
 
     #[test]

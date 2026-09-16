@@ -23,6 +23,7 @@ use crate::agent::session_context::{
     inject_history_with_entries, SessionContextRunner, DEFAULT_HISTORY_LIMIT,
 };
 use crate::agent::subagent::{SubAgentRunner, SubFlowInput};
+use crate::agent::web_use::WebUseRunner;
 use crate::agent::window_use::WindowUseRunner;
 use crate::agent::yolo::{TaskClassification, TaskLevel, YoloRunner};
 use crate::config::{Db, EventType};
@@ -41,6 +42,21 @@ pub type ProgressTx = tokio::sync::mpsc::UnboundedSender<String>;
 fn emit_progress(tx: &Option<ProgressTx>, msg: impl Into<String>) {
     if let Some(tx) = tx {
         let _ = tx.send(msg.into());
+    }
+}
+
+/// 进阶段子用短文本,避免单条 stage 消息撑爆 TUI。
+fn truncate_progress_text(s: &str) -> String {
+    const MAX_CHARS: usize = 180;
+    let clean = s.replace(['\n', '\r'], " ");
+    if clean.chars().count() <= MAX_CHARS {
+        clean
+    } else {
+        clean
+            .chars()
+            .take(MAX_CHARS.saturating_sub(1))
+            .chain(['…'])
+            .collect()
     }
 }
 
@@ -239,6 +255,8 @@ pub struct MultiAgentOrchestrator {
     sub_agent: Arc<SubAgentRunner>,
     /// Arc 化:桌面窗口操控专项执行单元(delegate_to=windowuse 的 WorkFlow 路由至此)
     window_use: Arc<WindowUseRunner>,
+    /// Arc 化:浏览器网页操控专项执行单元(delegate_to=webuse 的 WorkFlow 路由至此,第 11 角色)
+    web_use: Arc<WebUseRunner>,
     /// Arc 化:同上(质检随执行单元并行)
     quality: Arc<QualityRunner>,
     session_context: SessionContextRunner,
@@ -277,6 +295,10 @@ impl MultiAgentOrchestrator {
             WindowUseRunner::new(llm.clone(), db.clone())
                 .with_max_iterations(cfg.subagent_max_iterations),
         );
+        let web_use = Arc::new(
+            WebUseRunner::new(llm.clone(), db.clone())
+                .with_max_iterations(cfg.subagent_max_iterations),
+        );
         let quality = Arc::new(QualityRunner::new(llm.clone(), db.clone()));
         let session_context = SessionContextRunner::new(llm.clone(), db.clone());
         let compact = CompactRunner::new(llm, db.clone());
@@ -286,6 +308,7 @@ impl MultiAgentOrchestrator {
             main_work,
             sub_agent,
             window_use,
+            web_use,
             quality,
             session_context,
             compact,
@@ -466,10 +489,7 @@ impl MultiAgentOrchestrator {
                 emit_progress(progress, "Yolo 直接作答(跳过执行层)");
                 // 2026-09-11 第三十三轮:#P-C 修复 — 显式输出 trace 行,
                 // 让用户/调试脚本区分「Yolo 直答」与「SubAgent 委派执行」两条路径。
-                emit_progress(
-                    progress,
-                    "[trace] subagent=skipped(direct_answer=true)",
-                );
+                emit_progress(progress, "[trace] subagent=skipped(direct_answer=true)");
                 let sc_started = std::time::Instant::now();
                 let summary = self
                     .session_context
@@ -1148,6 +1168,7 @@ impl MultiAgentOrchestrator {
                 let outcome = run_wf_unit(
                     self.sub_agent.clone(),
                     self.window_use.clone(),
+                    self.web_use.clone(),
                     self.quality.clone(),
                     self.cfg.debug.clone(),
                     wf.delegate_to,
@@ -1167,6 +1188,7 @@ impl MultiAgentOrchestrator {
                 for (wf, input) in units {
                     let sub_agent = self.sub_agent.clone();
                     let window_use = self.window_use.clone();
+                    let web_use = self.web_use.clone();
                     let quality = self.quality.clone();
                     let debug = self.cfg.debug.clone();
                     let delegate_to = wf.delegate_to;
@@ -1181,6 +1203,7 @@ impl MultiAgentOrchestrator {
                         let outcome = run_wf_unit(
                             sub_agent,
                             window_use,
+                            web_use,
                             quality,
                             debug,
                             delegate_to,
@@ -1344,10 +1367,8 @@ impl MultiAgentOrchestrator {
     /// 返回值限制 200 字符以内,避免撑爆 token。
     fn platform_fallback_hint(&self, failure: &QualityFailure) -> String {
         // 仅当失败来源与 WindowUse 相关时才追加(其它场景避免噪声)
-        let is_windowuse_related = matches!(
-            failure.source,
-            AgentRole::WindowUse | AgentRole::MainWork
-        );
+        let is_windowuse_related =
+            matches!(failure.source, AgentRole::WindowUse | AgentRole::MainWork);
         if !is_windowuse_related {
             return String::new();
         }
@@ -1401,11 +1422,15 @@ impl MultiAgentOrchestrator {
             const MAX_REASON_CHARS: usize = 400;
             let truncated_reason: String = failure.reason.chars().take(MAX_REASON_CHARS).collect();
             if truncated_reason.chars().count() == MAX_REASON_CHARS {
-                format!("{truncated_reason}…
-{platform_hint}")
+                format!(
+                    "{truncated_reason}…
+{platform_hint}"
+                )
             } else {
-                format!("{truncated_reason}
-{platform_hint}")
+                format!(
+                    "{truncated_reason}
+{platform_hint}"
+                )
             }
         };
 
@@ -1541,6 +1566,7 @@ struct WfUnitOk {
 async fn run_wf_unit(
     sub_agent: Arc<SubAgentRunner>,
     window_use: Arc<WindowUseRunner>,
+    web_use: Arc<WebUseRunner>,
     quality: Arc<QualityRunner>,
     debug: Option<Arc<DebugCollector>>,
     delegate_to: AgentRole,
@@ -1566,24 +1592,43 @@ async fn run_wf_unit(
     };
 
     let wf_id = input.id.clone();
-    let exec_role = if delegate_to == AgentRole::WindowUse {
-        AgentRole::WindowUse
-    } else {
-        AgentRole::SubAgent
+    let exec_role = match delegate_to {
+        AgentRole::WindowUse => AgentRole::WindowUse,
+        AgentRole::WebUse => AgentRole::WebUse,
+        _ => AgentRole::SubAgent,
     };
-    let exec_label = if exec_role == AgentRole::WindowUse {
-        "WindowUse"
-    } else {
-        "SubAgent"
+    let exec_label = match exec_role {
+        AgentRole::WindowUse => "WindowUse",
+        AgentRole::WebUse => "WebUse",
+        _ => "SubAgent",
     };
-    emit_progress(&progress, format!("{wf_id} {exec_label} 执行中…"));
+    emit_progress(
+        &progress,
+        format!(
+            "{wf_id} {exec_label} 执行中 | 职责: {} | 期望: {}",
+            truncate_progress_text(&input.description),
+            truncate_progress_text(&input.expected_output)
+        ),
+    );
     // 2026-09-16 第 57 轮:SubAgent/WindowUse 墙钟计时 ——
     // 用于 TaskResult.wallclock_ms / TUI 时间线展示。
     let sub_started = std::time::Instant::now();
-    let outcome = if exec_role == AgentRole::WindowUse {
-        window_use.run_unit_with_cancel(&input, &session_id, &cancel).await
-    } else {
-        sub_agent.run_unit_with_cancel(&input, &session_id, &cancel).await
+    let outcome = match exec_role {
+        AgentRole::WindowUse => {
+            window_use
+                .run_unit_with_cancel(&input, &session_id, &cancel)
+                .await
+        }
+        AgentRole::WebUse => {
+            web_use
+                .run_unit_with_cancel(&input, &session_id, &cancel)
+                .await
+        }
+        _ => {
+            sub_agent
+                .run_unit_with_cancel(&input, &session_id, &cancel)
+                .await
+        }
     }
     .map_err(|e| {
         QualityFailure::from_agent_error(
@@ -1593,6 +1638,18 @@ async fn run_wf_unit(
         )
     })?;
     let wallclock_ms = sub_started.elapsed().as_millis() as u64;
+    emit_progress(
+        &progress,
+        format!(
+            "{wf_id} {exec_label} 完成 | 执行 {:.1}s | iter={} tools={}({}成功/{}失败) early_term={}",
+            wallclock_ms as f64 / 1000.0,
+            outcome.trace.iterations,
+            outcome.trace.tool_calls,
+            outcome.trace.tool_calls_ok,
+            outcome.trace.tool_calls_err,
+            outcome.trace.early_terminated
+        ),
+    );
 
     // 2026-09-16 第 57 轮:QC LLM 调用单独计时。
     let qc_started = std::time::Instant::now();
@@ -1627,6 +1684,21 @@ async fn run_wf_unit(
     );
 
     if qc.verdict == Verdict::Fail {
+        if !qc.issues.is_empty() {
+            emit_progress(
+                &progress,
+                format!(
+                    "{wf_id} QC问题: {}",
+                    truncate_progress_text(&qc.issues.join(" | "))
+                ),
+            );
+        }
+        if !qc.suggestion.is_empty() {
+            emit_progress(
+                &progress,
+                format!("{wf_id} QC建议: {}", truncate_progress_text(&qc.suggestion)),
+            );
+        }
         return Err(QualityFailure {
             source: exec_role,
             reason: format!("wf={}: {}", wf_id, qc.issues.join("; ")),
@@ -1873,7 +1945,9 @@ mod tests {
     #[test]
     fn placeholder_direct_answer_normalizes() {
         // 字面量 "null" / "None" / "NULL" / "Nil" / 空字符串 → 视为未填(继续走委派)
-        for s in ["", "  ", "null", "NULL", "Null", "None", "none", "NIL", "nil"] {
+        for s in [
+            "", "  ", "null", "NULL", "Null", "None", "none", "NIL", "nil",
+        ] {
             assert!(
                 is_placeholder_direct_answer(s),
                 "{s:?} 应被识别为占位字符串,实际未识别"

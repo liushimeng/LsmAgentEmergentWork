@@ -25,7 +25,11 @@ impl Paths {
             .to_path_buf();
         let work_dir = std::env::current_dir().unwrap_or_else(|_| root_dir.clone());
         let db_path = root_dir.join(DB_FILE_NAME);
-        Ok(Self { root_dir, work_dir, db_path })
+        Ok(Self {
+            root_dir,
+            work_dir,
+            db_path,
+        })
     }
 
     /// 用于测试:人为指定目录

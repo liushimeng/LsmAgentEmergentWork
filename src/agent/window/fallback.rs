@@ -11,7 +11,9 @@
 
 use std::process::Command;
 
-use super::{matches_filter, platform_err, ControlAction, ControlNode, Rect, WindowDriver, WindowInfo};
+use super::{
+    matches_filter, platform_err, ControlAction, ControlNode, Rect, WindowDriver, WindowInfo,
+};
 use crate::error::Result;
 
 /// 不支持控件级操作时的统一文案(LLM 可读,指导改道)。
@@ -57,7 +59,9 @@ impl WindowDriver for FallbackDriver {
         if !self.has_wmctrl {
             return Err(platform_err(
                 self.platform_name(),
-                format!("未检测到 wmctrl(窗口列举依赖),且当前平台无控件级操控能力。{UNSUPPORTED_MSG}"),
+                format!(
+                    "未检测到 wmctrl(窗口列举依赖),且当前平台无控件级操控能力。{UNSUPPORTED_MSG}"
+                ),
             ));
         }
         // wmctrl -l -p 输出: <win_id> <desktop> <pid> <host> <title...>
@@ -104,7 +108,12 @@ impl WindowDriver for FallbackDriver {
         Ok(wins)
     }
 
-    fn inspect(&self, _window_id: &str, _max_depth: usize, _filter: Option<&str>) -> Result<ControlNode> {
+    fn inspect(
+        &self,
+        _window_id: &str,
+        _max_depth: usize,
+        _filter: Option<&str>,
+    ) -> Result<ControlNode> {
         Err(platform_err(self.platform_name(), UNSUPPORTED_MSG))
     }
 
@@ -114,13 +123,18 @@ impl WindowDriver for FallbackDriver {
             let status = Command::new("xdotool")
                 .args(["windowactivate", window_id])
                 .status()
-                .map_err(|e| platform_err(self.platform_name(), format!("执行 xdotool 失败: {e}")))?;
+                .map_err(|e| {
+                    platform_err(self.platform_name(), format!("执行 xdotool 失败: {e}"))
+                })?;
             if status.success() {
                 return Ok(format!("已聚焦窗口 {window_id}"));
             }
             return Err(platform_err(
                 self.platform_name(),
-                format!("xdotool windowactivate {window_id} 退出码 {:?}", status.code()),
+                format!(
+                    "xdotool windowactivate {window_id} 退出码 {:?}",
+                    status.code()
+                ),
             ));
         }
         Err(platform_err(self.platform_name(), UNSUPPORTED_MSG))

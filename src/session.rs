@@ -245,8 +245,9 @@ mod tests {
     fn fork_from_copies_context_with_new_id() {
         let mut src = Session::new();
         src.context_mut().push(ChatMessage::user("第一轮"));
-        src.context_mut()
-            .push(ChatMessage::assistant(vec![crate::llm::ContentBlock::text("回答")]));
+        src.context_mut().push(ChatMessage::assistant(vec![
+            crate::llm::ContentBlock::text("回答"),
+        ]));
 
         let forked = Session::fork_from(&src);
         assert_ne!(forked.id, src.id, "分叉必须生成新 Session ID");

@@ -48,7 +48,11 @@ pub fn format_task_result(
     out.push_str(&format!(
         "  [task executed: difficulty={}, plan_doc={}, workflows={}, 总耗时 {}{}]\n",
         result.classification.task_level.display_name(),
-        if styled { sv(&plan_doc_display) } else { plan_doc_display },
+        if styled {
+            sv(&plan_doc_display)
+        } else {
+            plan_doc_display
+        },
         result.workflows.len(),
         wallclock_secs
             .map(|s| format!("{:.2}s", s))
@@ -83,9 +87,17 @@ pub fn format_task_result(
         .unwrap_or_default();
     out.push_str(&format!(
         "  [yolo] purpose={} goal={} intent={} plan_steps={}{}{}\n",
-        if styled { sv(&purpose_short) } else { purpose_short },
+        if styled {
+            sv(&purpose_short)
+        } else {
+            purpose_short
+        },
         if styled { sv(&goal_short) } else { goal_short },
-        if styled { sv(&c.intent) } else { c.intent.clone() },
+        if styled {
+            sv(&c.intent)
+        } else {
+            c.intent.clone()
+        },
         c.decomposition_plan.len(),
         yolo_elapsed_str,
         delegate_str,
@@ -125,7 +137,11 @@ pub fn format_task_result(
         && (result.layer_log.len() >= 2 || result.layer_log.iter().any(|l| l.parallel))
     {
         let total_layers = result.layer_log.len();
-        let total_wf = result.layer_log.iter().map(|l| l.wf_ids.len()).sum::<usize>();
+        let total_wf = result
+            .layer_log
+            .iter()
+            .map(|l| l.wf_ids.len())
+            .sum::<usize>();
         let parallel_layers = result.layer_log.iter().filter(|l| l.parallel).count();
         let max_layer_wall = result
             .layer_log
@@ -166,7 +182,11 @@ pub fn format_task_result(
         out.push_str(&format!(
             "  --- WorkFlow {} ({}) [{}] {:.2}s ---\n",
             wf.id,
-            if styled { sv(&wf.name) } else { wf.name.clone() },
+            if styled {
+                sv(&wf.name)
+            } else {
+                wf.name.clone()
+            },
             exec_role_str,
             wf.wallclock_ms as f64 / 1000.0,
         ));
@@ -225,7 +245,14 @@ pub fn format_task_result(
                     }
                     let elapsed = format!("{:.2}s", tc.elapsed_ms as f64 / 1000.0);
                     let detail = if tc.ok {
-                        String::new()
+                        // 仅 Window* 工具展示成功输出摘要;避免普通 SubAgent / Emit
+                        // 的 Markdown 原文在 trace 区再次出现,破坏富文本渲染测试。
+                        if tc.tool.starts_with("Window") && !tc.output_summary.trim().is_empty() {
+                            let ok_short = truncate_chars(&tc.output_summary, 80);
+                            format!(" → {}", if styled { sv(&ok_short) } else { ok_short })
+                        } else {
+                            String::new()
+                        }
                     } else {
                         // 失败时附错误摘要(供一眼看出"为什么失败")
                         let err_short = truncate_chars(&tc.error_summary, 80);
@@ -236,7 +263,11 @@ pub fn format_task_result(
                         tc.tool,
                         elapsed,
                         icon(tc.ok),
-                        if styled { sv(&truncate_chars(&tc.args_json, 80)) } else { truncate_chars(&tc.args_json, 80) },
+                        if styled {
+                            sv(&truncate_chars(&tc.args_json, 80))
+                        } else {
+                            truncate_chars(&tc.args_json, 80)
+                        },
                         tc.output_bytes,
                         detail,
                     ));
@@ -409,7 +440,7 @@ pub fn format_failed_detail(
                 s.elapsed_ms as f64 / 1000.0
             )),
             "wf" => out.push_str(&format!(
-                "  [wf] {} SubAgent/WindowUse 执行({:.2}s)\n",
+                "  [wf] {} SubAgent/WindowUse/WebUse 执行({:.2}s)\n",
                 s.wf_id.as_deref().unwrap_or("?"),
                 s.elapsed_ms as f64 / 1000.0
             )),
@@ -430,7 +461,11 @@ pub fn format_failed_detail(
         && (result.layer_log.len() >= 2 || result.layer_log.iter().any(|l| l.parallel))
     {
         let total_layers = result.layer_log.len();
-        let total_wf = result.layer_log.iter().map(|l| l.wf_ids.len()).sum::<usize>();
+        let total_wf = result
+            .layer_log
+            .iter()
+            .map(|l| l.wf_ids.len())
+            .sum::<usize>();
         let parallel_layers = result.layer_log.iter().filter(|l| l.parallel).count();
         let max_layer_wall = result
             .layer_log
@@ -479,7 +514,12 @@ pub fn format_failed_detail(
                     }
                     let elapsed = format!("{:.2}s", tc.elapsed_ms as f64 / 1000.0);
                     let detail = if tc.ok {
-                        String::new()
+                        if tc.tool.starts_with("Window") && !tc.output_summary.trim().is_empty() {
+                            let ok_short = truncate_chars(&tc.output_summary, 80);
+                            format!(" → {}", sv(&ok_short))
+                        } else {
+                            String::new()
+                        }
                     } else {
                         let err_short = truncate_chars(&tc.error_summary, 80);
                         format!(" ← {}", sv(&err_short))

@@ -52,9 +52,8 @@ impl Vault {
     /// 首次调用即加载/生成主密钥;后续调用返回同一实例。
     /// 主密钥加载失败时返回 `ConfigError::Vault`(如权限不安全)。
     pub fn global() -> Result<&'static Vault> {
-        GLOBAL_VAULT.get_or_init(|| {
-            Self::load_or_create().expect("Vault 初始化失败(主密钥加载/生成异常)")
-        });
+        GLOBAL_VAULT
+            .get_or_init(|| Self::load_or_create().expect("Vault 初始化失败(主密钥加载/生成异常)"));
         // SAFETY:get_or_init 内 panic 会直接 abort,故 Ok 分支必然已初始化。
         Ok(GLOBAL_VAULT.get().expect("Vault 单例必然存在"))
     }
@@ -63,7 +62,9 @@ impl Vault {
     #[cfg(test)]
     pub fn from_key(key: &[u8; KEY_LEN]) -> Self {
         let key = Key::<Aes256Gcm>::from_slice(key);
-        Self { cipher: Aes256Gcm::new(key) }
+        Self {
+            cipher: Aes256Gcm::new(key),
+        }
     }
 
     /// 加载主密钥(不存在则自动生成 0o600 落盘)。
@@ -71,9 +72,8 @@ impl Vault {
         let path = master_key_path()?;
         let key_bytes = if path.exists() {
             ensure_0o600(&path)?;
-            let bytes = fs::read(&path).map_err(|e| {
-                ConfigError::Vault(format!("读取 {} 失败: {e}", path.display()))
-            })?;
+            let bytes = fs::read(&path)
+                .map_err(|e| ConfigError::Vault(format!("读取 {} 失败: {e}", path.display())))?;
             if bytes.len() != KEY_LEN {
                 return Err(ConfigError::Vault(format!(
                     "主密钥长度异常: {} 字节,期望 {KEY_LEN}",
@@ -105,7 +105,13 @@ impl Vault {
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = self
             .cipher
-            .encrypt(nonce, Payload { msg: plaintext.as_bytes(), aad: &[] })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: &[],
+                },
+            )
             .map_err(|e| ConfigError::Vault(format!("加密失败: {e}")))?;
         let mut buf = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
         buf.push(VERSION);
@@ -121,9 +127,9 @@ impl Vault {
         let raw = blob
             .strip_prefix(CREDENTIAL_PREFIX)
             .ok_or_else(|| ConfigError::Vault("密文缺少 enc:v1: 前缀".to_string()))?;
-        let bytes = B64.decode(raw).map_err(|e| {
-            ConfigError::Vault(format!("base64 解码失败: {e}"))
-        })?;
+        let bytes = B64
+            .decode(raw)
+            .map_err(|e| ConfigError::Vault(format!("base64 解码失败: {e}")))?;
         if bytes.len() < 1 + NONCE_LEN + 16 {
             return Err(ConfigError::Vault(format!(
                 "密文长度异常: {} 字节",
@@ -140,15 +146,17 @@ impl Vault {
         let ciphertext = &bytes[1 + NONCE_LEN..];
         let plaintext = self
             .cipher
-            .decrypt(nonce, Payload { msg: ciphertext, aad: &[] })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &[],
+                },
+            )
             .map_err(|_| {
-                ConfigError::Vault(
-                    "GCM tag 校验失败(主密钥错误或数据被篡改)".to_string(),
-                )
+                ConfigError::Vault("GCM tag 校验失败(主密钥错误或数据被篡改)".to_string())
             })?;
-        String::from_utf8(plaintext).map_err(|e| {
-            ConfigError::Vault(format!("UTF-8 解码失败: {e}"))
-        })
+        String::from_utf8(plaintext).map_err(|e| ConfigError::Vault(format!("UTF-8 解码失败: {e}")))
     }
 
     /// 判断 api_key 字段是否已加密(前缀探测)。
@@ -200,23 +208,24 @@ fn ensure_0o600(path: &Path) -> Result<()> {
 /// 对齐 atomcode `auth/lib.rs` 完整链路(专题-第十九轮 D9-4)。
 fn write_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            ConfigError::Vault(format!("创建 {} 失败: {e}", parent.display()))
-        })?;
+        fs::create_dir_all(parent)
+            .map_err(|e| ConfigError::Vault(format!("创建 {} 失败: {e}", parent.display())))?;
     }
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, contents).map_err(|e| {
-        ConfigError::Vault(format!("写入 {} 失败: {e}", tmp.display()))
-    })?;
+    fs::write(&tmp, contents)
+        .map_err(|e| ConfigError::Vault(format!("写入 {} 失败: {e}", tmp.display())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).map_err(|e| {
-            ConfigError::Vault(format!("设置 {} 权限失败: {e}", tmp.display()))
-        })?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+            .map_err(|e| ConfigError::Vault(format!("设置 {} 权限失败: {e}", tmp.display())))?;
     }
     fs::rename(&tmp, path).map_err(|e| {
-        ConfigError::Vault(format!("重命名 {} → {} 失败: {e}", tmp.display(), path.display()))
+        ConfigError::Vault(format!(
+            "重命名 {} → {} 失败: {e}",
+            tmp.display(),
+            path.display()
+        ))
     })?;
     Ok(())
 }
@@ -297,7 +306,10 @@ mod tests {
     fn decrypt_too_short_fails() {
         let v = Vault::from_key(&[9u8; KEY_LEN]);
         // 构造过短密文:version + 12B nonce + 5B(< 16B tag)
-        let short = format!("{CREDENTIAL_PREFIX}{}", B64.encode(&[0x01u8; 1 + NONCE_LEN + 5]));
+        let short = format!(
+            "{CREDENTIAL_PREFIX}{}",
+            B64.encode(&[0x01u8; 1 + NONCE_LEN + 5])
+        );
         assert!(v.decrypt(&short).is_err());
     }
 

@@ -324,23 +324,114 @@ fn extract_user_prompt(context: &[ChatMessage]) -> String {
 ///   点击/发送消息/联系人/聊天/对话框/菜单/按钮/Tab/控件
 /// - 代码/文件:编写/修改/创建文件/代码/rust/python/git/cargo/test
 const WINDOW_USE_KEYWORDS: &[&str] = &[
-    "打开", "启动", "关闭软件", "软件", "应用", "窗口", "微信", "wechat",
-    "qq", "钉钉", "dingtalk", "slack", "telegram", "whatsapp", "点击按钮",
-    "发送消息", "联系人", "聊天", "对话框", "菜单", "控件", "tab",
-    "open app", "launch", "window", "click", "send message", "contact",
-    "聊天窗口", "输入框", "登录", "切换", "最小化", "最大化",
+    "打开",
+    "启动",
+    "关闭软件",
+    "软件",
+    "应用",
+    "窗口",
+    "微信",
+    "wechat",
+    "qq",
+    "钉钉",
+    "dingtalk",
+    "slack",
+    "telegram",
+    "whatsapp",
+    "点击按钮",
+    "发送消息",
+    "联系人",
+    "聊天",
+    "对话框",
+    "菜单",
+    "控件",
+    "tab",
+    "open app",
+    "launch",
+    "window",
+    "click",
+    "send message",
+    "contact",
+    "聊天窗口",
+    "输入框",
+    "登录",
+    "切换",
+    "最小化",
+    "最大化",
 ];
 
 const SUBAGENT_KEYWORDS: &[&str] = &[
-    "编写代码", "修改代码", "创建文件", "代码", "rust", "python",
-    "git", "cargo", "test", "编写", "修改", "创建", "重构", "实现",
-    "函数", "类", "模块", "接口", "算法", "write code", "programming",
+    "编写代码",
+    "修改代码",
+    "创建文件",
+    "代码",
+    "rust",
+    "python",
+    "git",
+    "cargo",
+    "test",
+    "编写",
+    "修改",
+    "创建",
+    "重构",
+    "实现",
+    "函数",
+    "类",
+    "模块",
+    "接口",
+    "算法",
+    "write code",
+    "programming",
+];
+
+/// 2026-09-16 第 61 轮:浏览器/网页操控类关键词(Chromium-WebUse,第 11 角色)。
+/// 命中且未命中代码关键词时,suggested_delegate 返回 "webuse"。
+const WEB_USE_KEYWORDS: &[&str] = &[
+    "浏览器",
+    "网页",
+    "网站",
+    "网址",
+    "打开网页",
+    "访问网站",
+    "登录网站",
+    "登录页",
+    "爬虫",
+    "抓取网页",
+    "抓取页面",
+    "采集",
+    "chrome",
+    "chromium",
+    "edge",
+    "browser",
+    "web page",
+    "website",
+    "webpage",
+    "截图网页",
+    "页面截图",
+    "表单提交",
+    "下拉",
+    "滚动页面",
+    "悬停",
+    "双击",
+    "右键点击",
+    "http://",
+    "https://",
+    "url",
+    "链接打开",
+    "web 端",
+    "web端",
 ];
 
 pub fn infer_suggested_delegate(user_prompt: &str) -> Option<String> {
     let lower = user_prompt.to_lowercase();
     let window_hit = WINDOW_USE_KEYWORDS.iter().any(|k| lower.contains(k));
     let code_hit = SUBAGENT_KEYWORDS.iter().any(|k| lower.contains(k));
+    let web_hit = WEB_USE_KEYWORDS.iter().any(|k| lower.contains(k));
+    // 优先级:code 最优先(“修改网页代码”本质是代码任务);
+    // web > window(“打开网页”含窗口词“打开”,但属网页任务)
+    if web_hit && !code_hit {
+        return Some("webuse".to_string());
+    }
     match (window_hit, code_hit) {
         (true, false) => Some("windowuse".to_string()),
         (false, true) => Some("subagent".to_string()),
@@ -717,11 +808,34 @@ mod tests {
     }
 
     #[test]
+    fn infer_suggested_delegate_web_use_keywords() {
+        // 2026-09-16 第 61 轮:网页/浏览器操控类任务 → webuse
+        let cases = [
+            "帮我打开网页 https://example.com 并截图",
+            "抓取这个网站的标题列表",
+            "登录网站后台下载报表",
+            "用浏览器访问 https://example.com 查看控制台报错",
+        ];
+        for prompt in cases {
+            assert_eq!(
+                infer_suggested_delegate(prompt),
+                Some("webuse".to_string()),
+                "网页操控类应推断 webuse: {prompt}"
+            );
+        }
+        // 代码任务含"网页"字样仍归 subagent
+        assert_eq!(
+            infer_suggested_delegate("修改网页代码里的 bug"),
+            Some("subagent".to_string())
+        );
+    }
+
+    #[test]
     fn infer_suggested_delegate_ambiguous_returns_none() {
         // 无法判断 / 两边都命中 → None
         let cases = [
-            "帮我处理一下这个任务",  // 无明确关键词
-            "",                       // 空串
+            "帮我处理一下这个任务",       // 无明确关键词
+            "",                           // 空串
             "帮我打开文件管理器查看代码", // 两边都命中
         ];
         for prompt in cases {
@@ -827,14 +941,18 @@ mod tests {
         });
         let runner = YoloRunner::new(cap.clone());
         let (c, _text, _usage) = runner
-            .classify("20260909-120000-abcd1234-1700000000000-1a2b3c", &[ChatMessage::user("hi")])
+            .classify(
+                "20260909-120000-abcd1234-1700000000000-1a2b3c",
+                &[ChatMessage::user("hi")],
+            )
             .await
             .unwrap();
         assert_eq!(c.task_level, TaskLevel::Simple);
         let seen = cap.seen.lock().expect("session capture");
         assert!(!seen.is_empty());
         assert!(
-            seen.iter().all(|s| s == "20260909-120000-abcd1234-1700000000000-1a2b3c"),
+            seen.iter()
+                .all(|s| s == "20260909-120000-abcd1234-1700000000000-1a2b3c"),
             "Yolo 请求的 X-Session-Id 应为任务主会话 ID,实际: {seen:?}"
         );
     }

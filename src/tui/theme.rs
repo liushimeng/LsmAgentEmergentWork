@@ -21,14 +21,14 @@ use crossterm::style::Color;
 
 /// Cell 属性位掩码(engine.rs::Cell.attrs 使用)。
 pub mod attr {
-    pub const NONE: u8        = 0;
-    pub const BOLD: u8        = 1 << 0;
-    pub const REVERSE: u8     = 1 << 1;
-    pub const DIM: u8         = 1 << 2;
-    pub const UNDERLINED: u8  = 1 << 3;
+    pub const NONE: u8 = 0;
+    pub const BOLD: u8 = 1 << 0;
+    pub const REVERSE: u8 = 1 << 1;
+    pub const DIM: u8 = 1 << 2;
+    pub const UNDERLINED: u8 = 1 << 3;
     /// 斜体(ANSI `3m`);Markdown `*em*` / 引用正文使用(TUIMarkdown富文本渲染,2026-09-15)。
     /// 终端不支持时多数降级为普通字形,不影响内容可读。
-    pub const ITALIC: u8      = 1 << 4;
+    pub const ITALIC: u8 = 1 << 4;
     /// 删除线(ANSI `9m`);Markdown `~~del~~` 使用(同上)。
     pub const CROSSED_OUT: u8 = 1 << 5;
 }
@@ -178,12 +178,12 @@ pub const HL_PLAIN_FG: Color = Color::Reset;
 
 /// H1..H6 标题前景色(按级别索引 0..5)。
 pub const MD_HEADING_FGS: [Color; 6] = [
-    Color::Magenta,   // H1
-    Color::Cyan,      // H2(= ACCENT)
-    Color::Blue,      // H3
-    Color::Yellow,    // H4
-    Color::Green,     // H5
-    Color::DarkGrey,  // H6
+    Color::Magenta,  // H1
+    Color::Cyan,     // H2(= ACCENT)
+    Color::Blue,     // H3
+    Color::Yellow,   // H4
+    Color::Green,    // H5
+    Color::DarkGrey, // H6
 ];
 /// 标题属性(六级共用)。
 pub const MD_HEADING_ATTRS: u8 = attr::BOLD;
@@ -266,9 +266,9 @@ impl ThemeKind {
         match std::env::var("LAEW_THEME").ok().as_deref() {
             None => Self::Default,
             Some("") | Some("default") => Self::Default,
-            Some("dark-contrast" | "dark_contrast" | "high-contrast" | "high_contrast" | "dark") => {
-                Self::DarkContrast
-            }
+            Some(
+                "dark-contrast" | "dark_contrast" | "high-contrast" | "high_contrast" | "dark",
+            ) => Self::DarkContrast,
             Some("light") => Self::Light,
             Some("daltonized" | "colorblind" | "cb") => Self::Daltonized,
             Some(other) => {
@@ -414,15 +414,15 @@ const DEFAULT_PALETTE: Palette = Palette {
 const DARK_CONTRAST_PALETTE: Palette = Palette {
     fg: Color::Reset,
     dim: Color::Grey,
-    accent: Color::AnsiValue(14),         // 亮青
-    error: Color::AnsiValue(9),           // 亮红
-    success: Color::AnsiValue(10),        // 亮绿
+    accent: Color::AnsiValue(14),  // 亮青
+    error: Color::AnsiValue(9),    // 亮红
+    success: Color::AnsiValue(10), // 亮绿
     selected_fg: Color::AnsiValue(14),
     selected_attrs: attr::BOLD | attr::REVERSE,
     tab_focused_fg: Color::AnsiValue(14),
     tab_focused_attrs: attr::BOLD,
     choice_focused_attrs: attr::BOLD,
-    highlight_fg: Color::AnsiValue(15),   // 亮白
+    highlight_fg: Color::AnsiValue(15), // 亮白
     input_bg: Color::Black,
     input_fg: Color::AnsiValue(15),
     input_prompt_fg: Color::AnsiValue(14),
@@ -593,12 +593,12 @@ const DALTONIZED_PALETTE: Palette = Palette {
     hl_plain_fg: Color::Reset,
     // 色盲友好:标题主用品红/青/蓝/黄语义,避开红绿对立;H5 用黄替代绿
     md_heading_fgs: [
-        Color::Cyan,        // H1
-        Color::Magenta,     // H2
-        Color::Blue,        // H3
-        Color::Yellow,      // H4
-        Color::Yellow,      // H5
-        Color::DarkGrey,    // H6
+        Color::Cyan,     // H1
+        Color::Magenta,  // H2
+        Color::Blue,     // H3
+        Color::Yellow,   // H4
+        Color::Yellow,   // H5
+        Color::DarkGrey, // H6
     ],
     md_heading_attrs: attr::BOLD,
     md_quote_fg: Color::Yellow,
@@ -718,11 +718,26 @@ mod tests {
     #[test]
     fn theme_kind_from_env_str_accepts_aliases() {
         // 别名映射(给 /theme <kind> 与 LAEW_THEME 共享入口)
-        assert_eq!(ThemeKind::from_env_str("dark-contrast"), Some(ThemeKind::DarkContrast));
-        assert_eq!(ThemeKind::from_env_str("dark_contrast"), Some(ThemeKind::DarkContrast));
-        assert_eq!(ThemeKind::from_env_str("high-contrast"), Some(ThemeKind::DarkContrast));
-        assert_eq!(ThemeKind::from_env_str("dark"), Some(ThemeKind::DarkContrast));
-        assert_eq!(ThemeKind::from_env_str("colorblind"), Some(ThemeKind::Daltonized));
+        assert_eq!(
+            ThemeKind::from_env_str("dark-contrast"),
+            Some(ThemeKind::DarkContrast)
+        );
+        assert_eq!(
+            ThemeKind::from_env_str("dark_contrast"),
+            Some(ThemeKind::DarkContrast)
+        );
+        assert_eq!(
+            ThemeKind::from_env_str("high-contrast"),
+            Some(ThemeKind::DarkContrast)
+        );
+        assert_eq!(
+            ThemeKind::from_env_str("dark"),
+            Some(ThemeKind::DarkContrast)
+        );
+        assert_eq!(
+            ThemeKind::from_env_str("colorblind"),
+            Some(ThemeKind::Daltonized)
+        );
         assert_eq!(ThemeKind::from_env_str("cb"), Some(ThemeKind::Daltonized));
     }
 
@@ -738,10 +753,17 @@ mod tests {
         let palettes: Vec<Palette> = kinds.iter().copied().map(palette_for_kind).collect();
         // 浅色主题选中态不用反白(改下划线)
         assert_ne!(palettes[2].selected_attrs & attr::REVERSE, attr::REVERSE);
-        assert_eq!(palettes[2].selected_attrs & attr::UNDERLINED, attr::UNDERLINED);
+        assert_eq!(
+            palettes[2].selected_attrs & attr::UNDERLINED,
+            attr::UNDERLINED
+        );
         // 其他主题用反白
         for p in &palettes[..2] {
-            assert_ne!(p.selected_attrs & attr::REVERSE, 0, "dark themes use reverse");
+            assert_ne!(
+                p.selected_attrs & attr::REVERSE,
+                0,
+                "dark themes use reverse"
+            );
         }
         // daltonized: ERROR 是 Blue 不是 Red
         assert_eq!(palettes[3].error, Color::Blue);
@@ -776,7 +798,10 @@ mod tests {
         assert!(
             matches!(
                 kind,
-                ThemeKind::Default | ThemeKind::DarkContrast | ThemeKind::Light | ThemeKind::Daltonized
+                ThemeKind::Default
+                    | ThemeKind::DarkContrast
+                    | ThemeKind::Light
+                    | ThemeKind::Daltonized
             ),
             "active_kind 必须在 4 主题之一"
         );
@@ -883,7 +908,7 @@ mod bg_color_ansi_tests {
 pub(crate) fn color_to_ansi256(color: crossterm::style::Color) -> u8 {
     use crossterm::style::Color;
     match color {
-        Color::Reset => 7,        // 白色/默认
+        Color::Reset => 7, // 白色/默认
         Color::Black => 0,
         Color::DarkRed => 1,
         Color::DarkGreen => 2,
