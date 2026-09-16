@@ -919,6 +919,9 @@ def detect_role(body, key):
         # MAIN_WORK_BASE_PROMPT 引用了 "WindowUse Agent" 用于委派规范),否则
         # Main-Work 自己的请求会被 WindowUse marker 截胡。
         ("LsmAgentEmergentWork-WindowUse", "windowuse"),
+        # 2026-09-16 第 61 轮:Chromium-WebUse(第 11 角色)同样必须在 Main-Work 之前
+        # (main_work 运行时 prompt 的 delegate_to 三选一说明引用了本角色名)。
+        ("LsmAgentEmergentWork-Chromium-WebUse", "webuse"),
         ("LsmAgentEmergentWork-Main-Work", "mainwork"),
         # WorkFlow(第 10 角色):工具集与 SubAgent 完全一致,仅做角色识别,
         # 响应分支 fall-through 到 subagent 兜底,行为兼容。
@@ -1527,6 +1530,33 @@ class Handler(BaseHTTPRequestHandler):
                         build_openai_stream(_wu_call_no, _wu_prompt, _wu_snippet, session_id)
                         if key == "oai"
                         else build_anthropic_stream(_wu_call_no, _wu_prompt, _wu_snippet, session_id)
+                    )
+            elif role == "webuse":
+                # 2026-09-16 第 61 轮:Chromium-WebUse Runner 首调返回 BrowserNew
+                # tool_use(data: URL 离线;e2e 机器无 Chrome 时 laew 返回 3001 信封,
+                # is_error=false,链路继续),后续轮次标准流(终答 MOCK_FINAL_ANSWER)。
+                _wb_inst_key = f"{key}:webuse:inst"
+                _wb_has_asst = any(
+                    m.get("role") == "assistant" for m in (body.get("messages") or [])
+                )
+                if not _wb_has_asst:
+                    STATE[_wb_inst_key] = 0
+                STATE[_wb_inst_key] = STATE.get(_wb_inst_key, 0) + 1
+                _wb_call_no = STATE[_wb_inst_key]
+                if _wb_call_no == 1:
+                    _wb_args = {"url": "data:text/html,<html><head><title>webuse-e2e</title></head><body><h1>e2e</h1></body></html>"}
+                    body_bytes = (
+                        openai_tool_use_sse("BrowserNew", _wb_args)
+                        if key == "oai"
+                        else anthropic_tool_use_sse("BrowserNew", _wb_args)
+                    )
+                else:
+                    _wb_prompt = _extract_user_corpus(body)
+                    _wb_snippet = _extract_last_tool_result(body)
+                    body_bytes = (
+                        build_openai_stream(_wb_call_no, _wb_prompt, _wb_snippet, session_id)
+                        if key == "oai"
+                        else build_anthropic_stream(_wb_call_no, _wb_prompt, _wb_snippet, session_id)
                     )
             else:  # subagent:保留原有"第 1 次工具调用,之后纯文本"脚本
                 # 2026-09-11 第三十四轮 BUG-M1/M2:改用全量 user 语料(任务

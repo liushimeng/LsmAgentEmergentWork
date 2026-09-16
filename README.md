@@ -15,13 +15,13 @@
 ║        ███████╗██║  ██║███████╗╚███╔███╔╝                          ║
 ║        ╚══════╝╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝                           ║
 ║                                                                    ║
-║        LLM · Agent · CLI · Rust · Multi-Agent · 6 Roles           ║
-║        双协议 · 6 工具 · 10 角色编排 · TUI · SQLite                 ║
+║        LLM · Agent · CLI · Rust · Multi-Agent · 11 Roles          ║
+║        双协议 · 6 工具 · 11 角色编排 · TUI · SQLite                 ║
 ║                                                                    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-## 🦀 Rust 多 Agent CLI · 双协议 · 10 角色同台编排
+## 🦀 Rust 多 Agent CLI · 双协议 · 11 角色同台编排
 
 </div>
 <!-- markdownlint-restore -->
@@ -61,7 +61,7 @@
 - **持续迭代**：`CLAUDE.md` 中记录了海量 Agent 教训，每条都是 Agent 踩坑后自动写入的「经验记忆」，后续 Agent 自动加载避免重犯。
 - **知识库沉淀**：`docs/` 下 80+ 份调研文档 / 约 160k 行，全部由 Agent 自动产出。
 
-> **仓库数据**：Rust 多 Agent CLI、多工具、10 角色编排、双协议、TUI 子屏自动化。
+> **仓库数据**：Rust 多 Agent CLI、多工具、11 角色编排、双协议、TUI 子屏自动化。
 > **这一切，没有一个人工手写字符。**
 
 ---
@@ -75,8 +75,9 @@
 | 能力 | 说明 |
 |------|------|
 | 🧠 **双协议** | Anthropic（anthropic-messages）+ OpenAI（openai-completions），统一消息模型隔离协议差异 |
+| 🌐 **浏览器操控** | Chromium-WebUse Agent（第 11 角色）：CDP 驱动内存无头 Chrome，网页浏览 / 爬虫 / 表单 / 截图 / Console·Network·DOM 观察 |
 | 🛠️ **6 工具** | Bash / Read / Write / Edit / Glob / Grep |
-| 🤖 **10 角色多 Agent** | Yolo / Plan / Main-Work / SubAgent-Work / Quality-Check / SessionContext |
+| 🤖 **11 角色多 Agent** | Yolo / Plan / Main-Work / SubAgent-Work / Quality-Check / SessionContext / Compact / WorkFlow / WindowUse / Chromium-WebUse |
 | 📊 **三档分类** | simple / medium / hard，Yolo 自动分类后分层编排 |
 | 🖥️ **TUI** | crossterm 独立渲染引擎，alternate screen + raw mode + Screen 栈 + Tab 表单 |
 | 💾 **SQLite 持久化** | 根目录 `LsmAgentEmergentWork.db`，无配置文件 |
@@ -84,7 +85,7 @@
 
 ---
 
-## 🤖 多 Agent 架构 —— 10 角色同台编排
+## 🤖 多 Agent 架构 —— 11 角色同台编排
 
 由 `MultiAgentOrchestrator` 总编排：用户输入 → 项目上下文注入 → Yolo 三档分类 →
 简单档（SubAgent）/ 中档（Main → SubAgent）/ 高档（Plan → Main → SubAgent）
@@ -98,6 +99,10 @@
 | ⚡ **SubAgent-Work Agent** | 执行层最小单元：每个流程委派一个 SubAgent | Bash / Read / Write |
 | ✅ **Quality-Check Agent** | 质检层：每个执行单元完成后必经 QC | 可选 Read |
 | 🧠 **SessionContext Agent** | 会话层：任务完成后汇总写 `session_memory` | 无工具 |
+| 🗜️ **Compact Agent** | 压缩层：上下文接近上限时三档自动压缩 | 无工具 |
+| 🧩 **WorkFlow Agent** | 工作流编排层：超大型任务 Goal 状态机 + Squad 调度 | Bash / Read / Write |
+| 🪟 **WindowUse Agent** | 桌面操控层：Windows UIA / macOS AX 读写桌面软件窗口 | Read / Bash 白名单 / Window* |
+| 🌐 **Chromium-WebUse Agent** | 浏览器操控层：CDP 驱动内存无头 Chrome（优先 Chrome，降级 Edge/Chromium），网页浏览 / 信息收集 / 爬虫 / 登录后页面操作 / 截图 / Console·Network·DOM·localStorage 观察；`page_id` 多轮会话管理，派生标签页自动 adopt；未安装浏览器时结构化降级（code=3001 + 安装引导） | Read / BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect |
 
 ### 编排拓扑
 

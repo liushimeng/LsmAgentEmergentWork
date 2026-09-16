@@ -100,6 +100,8 @@ struct BrowserInner {
     handler: Option<tokio::task::JoinHandle<()>>,
     connect_mode: bool,
     pages: HashMap<String, PageEntry>,
+    /// launch 模式的一次性 user-data-dir(关闭浏览器时整目录清理)。
+    user_data_dir: Option<PathBuf>,
 }
 
 /// 浏览器会话管理器(进程内单例)。
@@ -212,6 +214,7 @@ impl BrowserManager {
                         handler: None,
                         connect_mode: false,
                         pages: HashMap::new(),
+                        user_data_dir: None,
                     }),
                 })
             })
@@ -229,6 +232,7 @@ impl BrowserManager {
         user_agent: Option<&str>,
     ) -> chromiumoxide::error::Result<(String, String, String)> {
         let mut inner = self.inner.lock().await;
+        let mut launch_dir: Option<PathBuf> = None;
         if inner.browser.is_none() {
             let (browser, handler, connect_mode) = if let Some(connect_url) = connect_url {
                 let (browser, mut handler) = Browser::connect(connect_url.to_string()).await?;
@@ -257,9 +261,18 @@ impl BrowserManager {
                     builder = builder.with_head();
                 }
                 builder = builder.window_size(1440, 900);
+                // 一次性 user-data-dir:避免 chromiumoxide 默认固定目录的 SingletonLock 冲突
+                // (并行/上次异常退出后残留锁会导致 Chrome 拒启),同时与用户日常 profile 隔离。
+                let dir = std::env::temp_dir().join(format!("laew_browser_{}", {
+                    let mut b = [0u8; 4];
+                    rand::Rng::fill(&mut rand::thread_rng(), &mut b);
+                    b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                }));
+                builder = builder.user_data_dir(&dir);
                 let config = builder
                     .build()
                     .map_err(chromiumoxide::error::CdpError::msg)?;
+                launch_dir = Some(dir);
                 let (browser, mut handler) = Browser::launch(config).await?;
                 let task = tokio::spawn(async move {
                     while let Some(msg) = handler.next().await {
@@ -273,6 +286,7 @@ impl BrowserManager {
             inner.browser = Some(browser);
             inner.handler = Some(handler);
             inner.connect_mode = connect_mode;
+            inner.user_data_dir = launch_dir;
         }
 
         let browser = inner.browser.as_ref().expect("browser initialized");
@@ -418,6 +432,17 @@ impl BrowserManager {
             if !inner.connect_mode {
                 if let Some(mut browser) = inner.browser.take() {
                     let _ = browser.close().await;
+                }
+                // 清理一次性 user-data-dir(Chrome 退出可能有几百 ms 延迟,重试几次)
+                if let Some(dir) = inner.user_data_dir.take() {
+                    tokio::spawn(async move {
+                        for _ in 0..10 {
+                            if std::fs::remove_dir_all(&dir).is_ok() {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        }
+                    });
                 }
             }
             if let Some(handler) = inner.handler.take() {

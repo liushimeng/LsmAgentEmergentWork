@@ -761,6 +761,44 @@ rm -f "$DBG_MARKER"
 # 清理本节生成的报告(mock 产物,无保留价值;DebugReport 本身已 gitignore)
 echo "$DBG_NEW_FILES" | while read -r f; do [ -n "$f" ] && rm -f "$f"; done
 
+# --- 5e. Chromium-WebUse 委派路由端到端(第 11 角色,2026-09-16 第 61 轮) ---
+# 验证:Yolo 判 medium → Main-Work 拆出 delegate_to="webuse" 的 WorkFlow →
+# run_wf_unit match 路由到 WebUseRunner → 首调 BrowserNew(mock data: URL)→
+# QC/SessionContext 收口。无浏览器机器上 BrowserNew 返回 3001 信封(is_error=false),
+# 链路仍贯通 —— 兼容"未安装浏览器"是本角色的设计约束。
+section "5e. Chromium-WebUse 委派路由端到端(第 11 角色)"
+WEBUSE_MOCK_PORT=$((MOCK_PORT + 61))
+WEBUSE_MOCK_LOG="$ROOT_DIR/testReport/mock_requests-5e-$TS.jsonl"
+WEBUSE_ROUTER=$(mktemp)
+cat > "$WEBUSE_ROUTER" <<'JSONEOF'
+{
+  "rules": [
+    {"keywords": ["WEB_E2E 打开网页"],
+     "yolo": {"task_level": "medium", "goal_summary": "用浏览器打开网页并截图",
+              "purpose": "验证 WebUse 委派路由", "intent": "web_automation",
+              "decomposition_plan": ["打开页面", "截图"]},
+     "mainwork": {"workflows": [{"id": "wf-1", "name": "WEB_E2E 打开网页截图",
+                                  "steps": ["BrowserNew 打开 data: 页面", "截图落盘"],
+                                  "acceptance": ["页面已打开并截图"],
+                                  "delegate_to": "webuse"}]}}
+  ]
+}
+JSONEOF
+python3 scripts/mock_llm_server.py $WEBUSE_MOCK_PORT "$WEBUSE_MOCK_LOG" --prompt-router-file "$WEBUSE_ROUTER" &>/dev/null &
+WEBUSE_MOCK_PID=$!; sleep 0.6
+run "$LAEW" provider add --protocol anthropic --provider-name mockW --model-name mock-webuse \
+    --end-point "http://127.0.0.1:$WEBUSE_MOCK_PORT" --api-key sk-webuse-e2e
+LIST_WEBUSE=$(run "$LAEW" provider list 2>&1)
+ID_WEBUSE=$(echo "$LIST_WEBUSE" | grep mockW | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+run "$LAEW" provider use "$ID_WEBUSE" >/dev/null 2>&1
+OUT=$(run timeout 90 "$LAEW" -p "WEB_E2E 打开网页并截图存档")
+echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "5e-1 WebUse 任务链路贯通(终答保真)"
+grep -q '"user-agent": "LsmAgentEmergentWork-Chromium-WebUse/' "$WEBUSE_MOCK_LOG"; check $? "5e-2 mock 收到 WebUse Agent 请求(User-Agent 可辨识)"
+grep -q '"name": "BrowserNew"' "$WEBUSE_MOCK_LOG"; check $? "5e-3 WebUse 首调发出 BrowserNew 工具调用"
+kill $WEBUSE_MOCK_PID 2>/dev/null
+run "$LAEW" provider delete "$ID_WEBUSE" >/dev/null 2>&1
+rm -f "$WEBUSE_ROUTER" "$WEBUSE_MOCK_LOG"
+
 kill $MOCK_PID 2>/dev/null
 
 # --- 6. 协议请求格式校验(抓包日志) ---
@@ -983,6 +1021,11 @@ cat > "$MD_ROUTER" <<'JSONEOF'
 JSONEOF
 python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7d-$TS.jsonl" --prompt-router-file "$MD_ROUTER" &>/dev/null &
 MOCK7D_PID=$!; sleep 0.6
+# 2026-09-16 第 61 轮 5e 补加的 provider use 可能改写当前记录 → 7d 跑到这里时
+# provider 已切到 mockW,任务链路会走 mockW(mockA 上的 router 已无意义)。
+# 切回 mockA 保持 7d 既有行为(MockA 是默认 mock,Yolo/SubAgent 都可达)。
+ID_7D=$(run "$LAEW" provider list 2>&1 | grep mockA | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+run "$LAEW" provider use "$ID_7D" >/dev/null 2>&1
 rm -rf /tmp/laew-e2e-md-work; mkdir -p /tmp/laew-e2e-md-work
 OUT=$(cd /tmp/laew-e2e-md-work && printf '处理 MD_E2E_MARKDOWN 任务\n/export\n/exit\n' | run timeout 90 "$LAEW")
 MD_OUT_PLAIN=$(printf '%s\n' "$OUT" | sed -E 's/\x1b\[[0-9;]*m//g')

@@ -586,3 +586,23 @@ git 状态 / 平台 / 日期,只能 `ls` 试探,常猜错构建命令(`npm test`
 **D4 维度现状**:0% → 75%(未做:文件系统监听 / 快照跨 Session 持久化 / mtime 与 @提及去重联动)。
 
 **累计**:本轮新增 6 ✅(L1459+/L1498-L1499/L1549+/D4-env/D4-execlayer/D4-tui)。
+
+## 第 61 轮（2026-09-16）— Chromium-WebUse Agent（第 11 角色）
+
+| 编号 | gap | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|---------|---------|
+| BrowserRole | 无网页/浏览器操控角色（chromiumoxide 选型未落地 + 无 BrowserManager 单例 + 无 page_id 会话管理 + 无写读对偶工具面） | ✅ | `Cargo.toml`(`chromiumoxide=0.9`+`futures=0.3`)+ `src/agent/browser.rs`(`BrowserManager` 进程内单例 + 跨平台浏览器 detect + 一次性 user-data-dir 防 SingletonLock + console/network 环形缓冲 + 派生标签页 adopt + 引用计数关闭)+ `src/agent/tools/browser.rs` 5 个 Tool(BrowserNew/BrowserList/BrowserClose/BrowserControl action 枚举 27 项 / BrowserInspect info 枚举 13 项)+ `src/agent/web_use.rs` `WebUseRunner`(镜像 WindowUseRunner)+ `src/agent/orchestrator.rs::run_wf_unit` match 三分支路由+ `main_work.rs` `lenient_delegate_to` 加 webuse 别名 + `WEB_USE_KEYWORDS` + Yolo `WEB_USE_KEYWORDS` 关键词推断(优先级 web>window,code 最优先)+ `system_prompt/mod.rs` `WEB_USE_BASE_PROMPT`/`web_use_tools_hint()`/`SystemPrompt::web_use()`+ `quality.rs::check_subagent_with_source` unit_label 加 WebUse 分支 + `config/{agent,session}_memory.rs` 角色字符串 fail-closed 加 `"webuse"` + `agent_message.rs` 显示名 + CLAUDE.md/README.{md,en,ja}.md 角色表加 11th + `docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md` 设计文档 + `testReport/run_e2e.sh` §5e(mock 端 WebUse 角色识别+首调 BrowserNew)+ `scripts/mock_llm_server.py` 加 webuse 分支 + 桌面代理层 nudge (WEB_OPS_NUDGE_TEXT) | 2026-09-16 第 61 轮 |
+
+**设计要点**:
+- **chromiumoxide 0.9 选型**：单 crate 覆盖 `Browser::launch(BrowserConfig::builder().new_headless_mode())` 内存无头 + `Browser::connect(url)` 接管已开浏览器；CDP 协议 via WebSocket，rustls 跨平台一致。
+- **page_id 不透明**：`p_` + 8 位随机 hex，Agent 视为句柄；点击/新 Tab 通过「动作后 `browser.pages()` diff」adopt，响应附 `spawned_page_id`。
+- **统一错误信封**：`{code,message,data}` JSON，0/1001/2000/2001/2002/2003/3000/3001，Agent 据错误码机械决策（2002 → 换 selector 重试；3001 → 如实告知用户安装）。
+- **兼容性降级**：未安装浏览器时 BrowserNew 返回 `code=3001` + 安装引导文案，e2e 兼容 CI 无 Chrome 环境（真实链路仍贯通）。
+- **拟人化与 JS 直通**：click 走 `Input.dispatchMouseEvent`（坐标点击前 scrollIntoView）；input_text 默认 JS 原生 setter（React 受控组件兼容），可降级 `Element::type_str`；upload_file 走 `DOM.setFileInputFiles`；截图 >200KB 自动落盘防 base64 进 LLM 上下文。
+- **derive DebugClone 事件流**：每页 spawn 3 个 tokio 任务消费 chromiumoxide EventStream（consoleAPICalled/RequestWillBeSent/ResponseReceived），写入 500 条环形缓冲 + `collection_healthy` 健康度；不影响 page 自身生命周期。
+- **路由解耦**：`run_wf_unit` if/else 改 match 三分支（WindowUse / WebUse / SubAgent）；delegate_to 默认 WindowUse 不被误改，`delegate_to="webuse"` 走 WebUseRunner 走相同 QC / SessionContext / Debug / 取消 / 并行全链路。
+- **零回归**：单元测试 7/7 全过（envelope/key_code_tuple/parse_modifiers/event_buffer 截断/健康/page_id 格式）+ `tests/web_use_smoke.rs` 真浏览器冒烟（data: URL 离线，验证 BrowserNew→Inspect title→input_text→eval_js→click→elements→screenshot 落盘→BrowserClose 幂等）+ `bash testReport/run_e2e.sh` PASS=173 FAIL=0（5e 路由断言全绿）。
+
+**D11 维度现状**：0% → 90%（未做：事件级实时分发 / 视频录制 / 反检测指纹 / 网络拦截 Fetch 全协议）。
+
+**累计**：本轮新增 1 个角色 + 1 类驱动层 + 5 个工具 + 1 个执行器 + 6 处共享代码接入（角色枚举/profile/registry/prompt/orchestrator/memory 角色字符串 fail-closed）。

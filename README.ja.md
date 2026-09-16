@@ -15,7 +15,7 @@
 ║        ███████╗██║  ██║███████╗╚███╔███╔╝                          ║
 ║        ╚══════╝╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝                           ║
 ║                                                                    ║
-║        LLM · Agent · CLI · Rust · Multi-Agent · 6 Roles           ║
+║        LLM · Agent · CLI · Rust · Multi-Agent · 11 Roles          ║
 ║        デュアルプロトコル · 6 ツール · 6 ロール編成 · TUI          ║
 ║                                                                    ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -101,6 +101,10 @@ hard（Plan → Main → SubAgent）→ Quality-Check → SessionContext 締め�
 | ⚡ **SubAgent-Work Agent** | 実行レイヤ最小単位：各フローに 1 つの SubAgent を派遣 | Bash / Read / Write |
 | ✅ **Quality-Check Agent** | QC レイヤ：各実行ユニット完了後必須 QC | オプション Read |
 | 🧠 **SessionContext Agent** | セッションレイヤ：タスク完了後に `session_memory` に要約書き込み | ツールなし |
+| 🗜️ **Compact Agent** | 圧縮レイヤ：コンテキスト上限近くで 3 段階自動圧縮 | ツールなし |
+| 🧩 **WorkFlow Agent** | ワークフロー編排レイヤ：Goal 状態機械 + Squad スケジューリング | Bash / Read / Write |
+| 🪟 **WindowUse Agent** | デスクトップ操作レイヤ：Windows UIA / macOS AX | Read / Bash ホワイトリスト / Window* |
+| 🌐 **Chromium-WebUse Agent** | ブラウザ操作レイヤ(第 11 ロール)：CDP 駆動のメモリ内ヘッドレス Chrome(Chrome 優先、Edge/Chromium フォールバック)— ウェブ閲覧 / クローリング / ログイン後操作 / スクリーンショット / Console·Network·DOM·localStorage 観察;`page_id` マルチターン管理と派生タブ自動取り込み;ブラウザ未インストール時は構造化降級(code=3001 + インストール案内) | Read / BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect |
 
 ### 編成トポロジー
 
