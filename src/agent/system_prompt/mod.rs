@@ -837,14 +837,20 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 fn window_use_tools_hint() -> &'static str {
     "工具调用规范:\n\
      - 工具参数需严格遵守给定 JSON Schema\n\
-     - 窗口操控三工具按「列表 → 检视 → 操作」顺序使用;无依赖的读取调用可并行发出\n\n\
-     可用工具:\n\
+     - 窗口操控按「WindowFind → WindowInspect → WindowAction」顺序使用;WindowList 用于全局枚举,WindowFind 用于按名称直查;无依赖的读取调用(WindowList / WindowFind / WindowInspect)可并行发出\n\n\
+     可用工具(共 6 个,与 builtin 严格对齐,缺则视为不可用):\n\
      - WindowList(filter?): 枚举可见顶层窗口,返回 id/title/进程/PID/位置尺寸\n\
+     - WindowFind(title?, process?, match_mode?): 按标题/进程名查窗口,返回最佳匹配窗口的完整信息\n\
      - WindowInspect(window_id, max_depth?, filter?): 枚举窗口控件树,返回每个控件的 \
        path/role/name/value/bounds/actions/children\n\
      - WindowAction(window_id, path, action, text?): 对控件执行 \
        click/invoke/focus/set_text/get_text/send_keys\n\
-     - Read(file_path, offset?, limit?): 读取文本文件(理解任务上下文用),带行号"
+     - WindowScreenshot(output_path?, region?): 跨平台截图落盘,返回路径\n\
+     - Bash(command, ...): 白名单模式,仅允许桌面操控类命令(osascript / cliclick / \
+       screencapture / pbcopy / pbpaste / open / System Events keystroke / defaults 等)\n\
+     - Read(file_path, offset?, limit?): 读取文本文件(理解任务上下文用),带行号\n\n\
+     Bash 白名单提醒:含 osascript / cliclick / pbcopy / System Events keystroke 等子串的命令 \
+     可直接放行;首 token 不在白名单的命令会 PermissionDenied,降级时把命令拆成白名单内的形式即可。"
 }
 
 const WINDOW_USE_ANTHROPIC_TAIL: &str = "\
@@ -945,6 +951,34 @@ mod tests {
             let rendered = f().render(Protocol::Anthropic);
             assert!(rendered.contains(name), "{name} 的提示词应包含自身名称");
         }
+    }
+
+    /// 2026-09-16 第 57 轮:WindowUse 工具提示词必须与 builtin 注册表严格对齐,
+    /// 否则 LLM 看不到 WindowFind / WindowScreenshot / Bash 白名单模式,
+    /// 会沿用过时的「WindowInspect 穷举」思路,绕开白名单 Bash + 截图路径。
+    #[test]
+    fn window_use_tools_hint_lists_six_tools() {
+        let hint = window_use_tools_hint();
+        // 6 个工具 + Bash(白名单) + Read 必须全部列在提示词里
+        for tool in [
+            "WindowList",
+            "WindowFind",
+            "WindowInspect",
+            "WindowAction",
+            "WindowScreenshot",
+            "Bash",
+            "Read",
+        ] {
+            assert!(
+                hint.contains(tool),
+                "WindowUse 工具提示词必须列出 {tool};当前:\n{hint}"
+            );
+        }
+        // 「列表 → 检视 → 操作」是旧版顺序,新版应反映 WindowFind → Inspect → Action
+        assert!(
+            !hint.contains("列表 → 检视"),
+            "WindowUse 工具提示词仍使用旧顺序『列表 → 检视 → 操作』,应改为 WindowFind 优先"
+        );
     }
 }
 

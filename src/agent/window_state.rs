@@ -583,7 +583,7 @@ mod tests {
             "text": ""
         })
         .to_string();
-        trace.record_tool_call("WindowAction", &args_ok, true, 256);
+        trace.record_tool_call("WindowAction", &args_ok, true, 256, 100, "");
 
         let args_fail = serde_json::json!({
             "window_id": "w-456",
@@ -591,7 +591,7 @@ mod tests {
             "action": "click"
         })
         .to_string();
-        trace.record_tool_call("WindowAction", &args_fail, false, 128);
+        trace.record_tool_call("WindowAction", &args_fail, false, 128, 50, "PathInvalid: / 越界");
 
         extract_window_state_from_trace(&mut state, &trace);
         // 仅成功调用写入 action_history
@@ -605,14 +605,14 @@ mod tests {
         let mut state = WindowSessionState::new("s1");
         let mut trace = crate::agent::extrace::ExecutionTrace::default();
         // WindowList 调用 + WindowAction 调用 → 应同时填充 known_windows
-        trace.record_tool_call("WindowList", "{}", true, 1024);
+        trace.record_tool_call("WindowList", "{}", true, 1024, 50, "");
         let args = serde_json::json!({
             "window_id": "w-789",
             "path": "/0",
             "action": "focus"
         })
         .to_string();
-        trace.record_tool_call("WindowAction", &args, true, 64);
+        trace.record_tool_call("WindowAction", &args, true, 64, 100, "");
 
         extract_window_state_from_trace(&mut state, &trace);
         assert_eq!(state.known_windows.len(), 1);
@@ -626,7 +626,7 @@ mod tests {
         let mut trace = crate::agent::extrace::ExecutionTrace::default();
         // 写入 MAX_TOOL_CALL_LOG + 5 条,验证 FIFO 截断
         for i in 0..(MAX_TOOL_CALL_LOG + 5) {
-            trace.record_tool_call("Test", &format!("{{\"i\":{i}}}"), true, 0);
+            trace.record_tool_call("Test", &format!("{{\"i\":{i}}}"), true, 0, 0, "");
         }
         assert_eq!(trace.tool_call_log.len(), MAX_TOOL_CALL_LOG);
         // 最早的 5 条应被截断,留下的应是 i=5..MAX

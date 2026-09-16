@@ -14,7 +14,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::context::AgentRole;
 use crate::agent::{Agent, AgentProfile};
@@ -41,7 +41,8 @@ pub fn reset_yolo_parse_failures() {
 }
 
 /// 任务难度等级(三档)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+// 2026-09-16 第 57 轮:补 Serialize — TaskClassification 走 Serialize 时连带需要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskLevel {
     /// 简单:单步操作,委派 SubAgent-Work
@@ -71,7 +72,9 @@ impl TaskLevel {
 }
 
 /// Yolo 输出的结构化分类结果(三档 + agent_role)
-#[derive(Debug, Clone, Deserialize)]
+// 2026-09-16 第 57 轮:补 Serialize — TaskResult 走 Serialize 时需要
+// TaskClassification 也实现(derive 一致性)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskClassification {
     pub task_level: TaskLevel,
     /// 三步识别之一:用户目的(为什么问)

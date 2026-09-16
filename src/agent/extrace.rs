@@ -81,10 +81,12 @@ pub struct ExecutionTrace {
     pub tool_call_log: Vec<ToolCallLogEntry>,
 }
 
-/// 单次工具调用摘要(2026-09-16 第 56 轮)。
+/// 单次工具调用摘要(2026-09-16 第 56 轮 + 第 57 轮)。
 ///
 /// `args_json` 是工具参数的稳定序列化(对象按 key 排序后),便于后续做
 /// 「相同参数重复失败」检测与窗口会话状态提取。
+/// 第 57 轮新增 `elapsed_ms`(单次工具调用墙钟耗时)与 `error_summary`(失败时
+/// 的简短错误描述,用于 TUI 反推失败原因 + QC 拿到真实执行证据)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallLogEntry {
     /// 工具名
@@ -95,6 +97,21 @@ pub struct ToolCallLogEntry {
     pub ok: bool,
     /// 输出字节数
     pub output_bytes: usize,
+    /// 单次工具调用墙钟耗时(毫秒;2026-09-16 第 57 轮新增)。
+    ///
+    /// - `serde(default)` 兼容旧 trace 反序列化为 0;
+    /// - 用于 TUI 在最终结果块打印 `[tool] WindowList 1.21s ✅`,反推哪个步骤卡死。
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// 失败时的简短错误描述(2026-09-16 第 57 轮新增)。
+    ///
+    /// - 仅 `ok=false` 时非空;成功时为空串;
+    /// - 截断到 200 字符,避免 trace 暴涨;
+    /// - 用于 TUI 打印 `[tool] Bash osascript -1 ❌  ← PermissionDenied: ...`,
+    ///   以及 QC 拿到「真实失败原因」辅助判据(此前 QC 只看 issues / suggestion,
+    ///   真实工具错误被吞)。
+    #[serde(default)]
+    pub error_summary: String,
 }
 
 /// 工具调用日志上限;超出截断最早的(FIFO)。
@@ -223,18 +240,31 @@ impl ExecutionTrace {
         }
     }
 
-    /// 记录一次工具调用(2026-09-16 第 56 轮):
+    /// 记录一次工具调用(2026-09-16 第 56 轮,第 57 轮扩展耗时/错误):
     /// 写入 tool_call_log(FIFO 截断到 MAX_TOOL_CALL_LOG)。
     /// - `tool`: 工具名
     /// - `args_json`: 参数的稳定 JSON(对象 key 排序后)
     /// - `ok`: 是否成功
     /// - `output_bytes`: 输出字节数(不含 trace 全文,避免 trace 暴涨)
-    pub fn record_tool_call(&mut self, tool: &str, args_json: &str, ok: bool, output_bytes: usize) {
+    /// - `elapsed_ms`: 单次工具调用墙钟耗时(2026-09-16 第 57 轮新增)
+    /// - `error_summary`: 失败时的简短错误描述(2026-09-16 第 57 轮新增,成功时传空串)
+    pub fn record_tool_call(
+        &mut self,
+        tool: &str,
+        args_json: &str,
+        ok: bool,
+        output_bytes: usize,
+        elapsed_ms: u64,
+        error_summary: &str,
+    ) {
+        let error_truncated: String = error_summary.chars().take(200).collect();
         self.tool_call_log.push(ToolCallLogEntry {
             tool: tool.to_string(),
             args_json: args_json.to_string(),
             ok,
             output_bytes,
+            elapsed_ms,
+            error_summary: error_truncated,
         });
         if self.tool_call_log.len() > MAX_TOOL_CALL_LOG {
             // FIFO 截断最早条目

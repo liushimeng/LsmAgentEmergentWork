@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::cancel::CancelToken;
 use crate::agent::compact::CompactRunner;
@@ -72,7 +72,7 @@ impl Default for OrchestratorConfig {
 }
 
 /// 单个 WorkFlow 执行结果(对外可读)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowResult {
     pub id: String,
     pub name: String,
@@ -81,10 +81,63 @@ pub struct WorkflowResult {
     pub usage: Usage,
     /// SubAgent 执行轨迹(2026-09-09 第 05 轮),失败时为 None。
     pub subflow_trace: Option<ExecutionTrace>,
+    /// 2026-09-16 第 57 轮:执行器角色(SubAgent / WindowUse),TUI 据此标识责任 Agent
+    #[serde(default = "default_wf_exec_role")]
+    pub exec_role: AgentRole,
+    /// 2026-09-16 第 57 轮:SubAgent/WindowUse 墙钟耗时(毫秒)
+    #[serde(default)]
+    pub wallclock_ms: u64,
+    /// 2026-09-16 第 57 轮:QC LLM 调用单独耗时(毫秒)
+    #[serde(default)]
+    pub qc_wallclock_ms: u64,
+}
+
+fn default_wf_exec_role() -> AgentRole {
+    AgentRole::SubAgent
+}
+
+/// 阶段耗时记录(2026-09-16 第 57 轮):每个 Yolo / Main-Work / QC / WF / SessionContext
+/// 阶段的开始偏移 + 实际耗时,供 TUI 终端打印阶段时间线。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageDuration {
+    /// 阶段名:yolo / main_work / qc_main / wf / qc_wf / session_context / plan
+    pub stage: String,
+    /// wf / qc_wf 时填,标识所属 WorkFlow id
+    pub wf_id: Option<String>,
+    /// 相对任务开始的偏移(毫秒)
+    pub started_offset_ms: u64,
+    /// 阶段耗时(毫秒)
+    pub elapsed_ms: u64,
+}
+
+/// 重试记录(2026-09-16 第 57 轮):把 orchestrator handle_inner 的 retry loop
+/// 暴露给 TUI,用户能看到「第 N 轮重试当前档位」+ 上轮失败原因。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryRecord {
+    pub retry_count: usize,
+    pub retry_hint: String,
+    pub started_offset_ms: u64,
+    pub elapsed_ms: u64,
+}
+
+/// 分层执行记录(2026-09-16 第 57 轮):把 execute_workflows 的层结构 +
+/// 并行/串行语义 + 每层耗时暴露给 TUI。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerInfo {
+    /// 0-based 层序号
+    pub layer_idx: usize,
+    /// 本层 WorkFlow id 列表(保持确定性顺序)
+    pub wf_ids: Vec<String>,
+    /// 是否并行层(layer.len() > 1)
+    pub parallel: bool,
+    /// 本层开始相对任务起点的偏移(毫秒)
+    pub started_offset_ms: u64,
+    /// 本层耗时:并行层=墙钟,串行层=累计
+    pub elapsed_ms: u64,
 }
 
 /// 任务结果
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub goal: String,
     pub classification: TaskClassification,
@@ -92,6 +145,18 @@ pub struct TaskResult {
     pub workflows: Vec<WorkflowResult>,
     pub summary: String,
     pub total_usage: Usage,
+    /// 2026-09-16 第 57 轮:阶段耗时记录(Yolo/Main-Work/QC-main/每个 WF/每个 QC/SessionContext)
+    #[serde(default)]
+    pub stage_durations: Vec<StageDuration>,
+    /// 2026-09-16 第 57 轮:重试事件(retry_count + retry_hint + 耗时)
+    #[serde(default)]
+    pub retry_log: Vec<RetryRecord>,
+    /// 2026-09-16 第 57 轮:分层执行信息
+    #[serde(default)]
+    pub layer_log: Vec<LayerInfo>,
+    /// 2026-09-16 第 57 轮:任务总墙钟(进入 handle_inner 到离开)
+    #[serde(default)]
+    pub wallclock_ms: u64,
 }
 
 /// Orchestrator 终态
@@ -263,6 +328,12 @@ impl MultiAgentOrchestrator {
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
     ) -> Result<OrchestrationOutcome> {
+        // 2026-09-16 第 57 轮:任务级墙钟锚点(所有 StageDuration.started_offset_ms
+        // / wallclock_ms 都相对这一刻)。
+        let task_started = std::time::Instant::now();
+        let mut stage_durations: Vec<StageDuration> = Vec::new();
+        let mut retry_log: Vec<RetryRecord> = Vec::new();
+
         // 0) 项目上下文首次注入(幂等)
         if let Some(work_dir) = project_context::current_work_dir() {
             project_context::inject_once(session, work_dir);
@@ -304,8 +375,16 @@ impl MultiAgentOrchestrator {
         }
 
         // 1) Yolo 入口
+        let yolo_started = std::time::Instant::now();
         let (mut classification, yolo_usage) = self.run_yolo_classification(session).await?;
         Self::check_cancelled(cancel)?;
+        let yolo_elapsed_ms = yolo_started.elapsed().as_millis() as u64;
+        stage_durations.push(StageDuration {
+            stage: "yolo".to_string(),
+            wf_id: None,
+            started_offset_ms: 0,
+            elapsed_ms: yolo_elapsed_ms,
+        });
         self.dbg_classify(&classification);
         // 2026-09-11 第三十三轮:#P-C 修复 — 此处只能确定档位,无法确定 simple
         // 是否走 direct_answer 短路(短路判断在 stage 之后)。文案采用「预期路径」:
@@ -378,6 +457,7 @@ impl MultiAgentOrchestrator {
                     progress,
                     "[trace] subagent=skipped(direct_answer=true)",
                 );
+                let sc_started = std::time::Instant::now();
                 let summary = self
                     .session_context
                     .summarize(
@@ -391,6 +471,13 @@ impl MultiAgentOrchestrator {
                         &classification.task_level,
                     )
                     .await?;
+                let sc_elapsed_ms = sc_started.elapsed().as_millis() as u64;
+                stage_durations.push(StageDuration {
+                    stage: "session_context".to_string(),
+                    wf_id: None,
+                    started_offset_ms: 0,
+                    elapsed_ms: sc_elapsed_ms,
+                });
                 total_usage = add_usage(total_usage, summary.usage);
                 self.dbg_task_end("direct_answer", total_usage);
                 return Ok(OrchestrationOutcome::DirectAnswer {
@@ -405,6 +492,8 @@ impl MultiAgentOrchestrator {
             // 重试轮入口:取消短路(取消不是失败,不消耗重试预算)
             Self::check_cancelled(cancel)?;
             retry_count += 1;
+            // 2026-09-16 第 57 轮:本轮入口计时(用于 retry_log.elapsed_ms)。
+            let retry_started = std::time::Instant::now();
             if retry_count > self.cfg.max_retry_per_level {
                 // 超过最大重试,输出失败 / 建议
                 // 关联报告: 2026-09-09_05 E-003 —— 当 Yolo 没提供 user_suggestion 时,
@@ -416,6 +505,7 @@ impl MultiAgentOrchestrator {
                 };
                 self.record_failure_event(session.id(), &classification, &suggestion);
                 self.dbg_task_end(&format!("failed: {suggestion}"), total_usage);
+                let _ = task_started; // 当前不再消费,但保留锚点(后续 Failed 变体可挂 wallclock_ms)
                 return Ok(OrchestrationOutcome::Failed {
                     classification,
                     reason: retry_hint.clone(),
@@ -449,6 +539,7 @@ impl MultiAgentOrchestrator {
                     // 此前直接传 task_result.total_usage(仅执行层),漏记 Yolo 分类调用,
                     // 导致写入 session_memory 的摘要用量系统性偏小。
                     let usage_for_summary = add_usage(yolo_usage, task_result.total_usage);
+                    let sc_started = std::time::Instant::now();
                     let summary = self
                         .session_context
                         .summarize(
@@ -472,6 +563,13 @@ impl MultiAgentOrchestrator {
                             &task_result.classification.task_level,
                         )
                         .await?;
+                    let sc_elapsed_ms = sc_started.elapsed().as_millis() as u64;
+                    stage_durations.push(StageDuration {
+                        stage: "session_context".to_string(),
+                        wf_id: None,
+                        started_offset_ms: 0,
+                        elapsed_ms: sc_elapsed_ms,
+                    });
                     task_result.summary = summary.text.clone();
                     // 2026-09-09 第 14 轮:total_usage 累加策略
                     // - handle_inner 在 L260 已用 yolo_usage 初始化 total_usage
@@ -482,6 +580,11 @@ impl MultiAgentOrchestrator {
                     total_usage = add_usage(total_usage, task_result.total_usage);
                     total_usage = add_usage(total_usage, summary.usage);
                     task_result.total_usage = total_usage;
+                    // 2026-09-16 第 57 轮:把本函数收集的 stage_durations / retry_log /
+                    // wallclock_ms 合并进 task_result(执行层自己也有 stage_durations)。
+                    task_result.stage_durations.extend(stage_durations);
+                    task_result.retry_log = retry_log;
+                    task_result.wallclock_ms = task_started.elapsed().as_millis() as u64;
                     self.dbg_task_end("executed", task_result.total_usage);
                     return Ok(OrchestrationOutcome::Executed {
                         result: task_result,
@@ -494,6 +597,16 @@ impl MultiAgentOrchestrator {
                         return Err(AgentError::Cancelled);
                     }
                     total_usage = add_usage(total_usage, failure_usage(&failure));
+                    // 2026-09-16 第 57 轮:本轮 retry 结束 ——
+                    // 把 retry_count / retry_hint / 本轮耗时记入 retry_log,
+                    // 供 TUI 在「重试链路」段呈现(此前只能从 progress 阶段日志反推)。
+                    let retry_elapsed_ms = retry_started.elapsed().as_millis() as u64;
+                    retry_log.push(RetryRecord {
+                        retry_count,
+                        retry_hint: retry_hint.clone(),
+                        started_offset_ms: 0,
+                        elapsed_ms: retry_elapsed_ms,
+                    });
                     // 升级或重试
                     if !failure.retryable {
                         emit_progress(progress, "失败回流 Yolo 重新评估…");
@@ -594,6 +707,7 @@ impl MultiAgentOrchestrator {
             pending_agent_messages: vec![],
         };
         emit_progress(progress, "wf-1 SubAgent 执行中…");
+        let sub_started = std::time::Instant::now();
         let outcome = self
             .sub_agent
             .run_unit_with_cancel(&input, session.id(), cancel)
@@ -601,7 +715,9 @@ impl MultiAgentOrchestrator {
             .map_err(|e| {
                 QualityFailure::from_agent_error(AgentRole::SubAgent, "SubAgent 执行失败", &e)
             })?;
+        let sub_elapsed_ms = sub_started.elapsed().as_millis() as u64;
 
+        let qc_started = std::time::Instant::now();
         let (qc, qc_usage) = self
             .quality
             .check_subagent(
@@ -616,6 +732,7 @@ impl MultiAgentOrchestrator {
             .map_err(|e| {
                 QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
             })?;
+        let qc_elapsed_ms = qc_started.elapsed().as_millis() as u64;
         self.dbg_qc(&qc);
         emit_progress(
             progress,
@@ -650,9 +767,29 @@ impl MultiAgentOrchestrator {
                     quality_report: qc,
                     usage: outcome.usage,
                     subflow_trace: Some(outcome.trace),
+                    exec_role: AgentRole::SubAgent,
+                    wallclock_ms: sub_elapsed_ms,
+                    qc_wallclock_ms: qc_elapsed_ms,
                 }],
                 summary: String::new(),
                 total_usage,
+                stage_durations: vec![
+                    StageDuration {
+                        stage: "wf".to_string(),
+                        wf_id: Some("wf-1".into()),
+                        started_offset_ms: 0,
+                        elapsed_ms: sub_elapsed_ms,
+                    },
+                    StageDuration {
+                        stage: "qc_wf".to_string(),
+                        wf_id: Some("wf-1".into()),
+                        started_offset_ms: 0,
+                        elapsed_ms: qc_elapsed_ms,
+                    },
+                ],
+                retry_log: Vec::new(),
+                layer_log: Vec::new(),
+                wallclock_ms: 0,
             })
         } else {
             Err(QualityFailure {
@@ -682,6 +819,7 @@ impl MultiAgentOrchestrator {
         // 2026-09-11 第三十四轮 LA-1:Main-Work 拆解同样透传用户原始 prompt,
         // 与 SubAgent #P-A 修复对齐,防止拆解只基于 Yolo 抽象摘要脱离用户意图。
         let original_prompt = Self::original_user_prompt(session);
+        let mainwork_started = std::time::Instant::now();
         let (plan, mainwork_usage) = self
             .main_work
             .plan_workflows(
@@ -695,6 +833,7 @@ impl MultiAgentOrchestrator {
             .map_err(|e| {
                 QualityFailure::from_agent_error(AgentRole::MainWork, "Main-Work 拆解失败", &e)
             })?;
+        let mainwork_elapsed_ms = mainwork_started.elapsed().as_millis() as u64;
 
         // 1.5) F2(2026-09-10 第 25 轮):兜底计划跳过 QC-main 直接执行。
         // 兜底 WorkFlowPlan 的 summary 自证「解析失败」,送 QC 必然 fail+retryable,
@@ -708,13 +847,21 @@ impl MultiAgentOrchestrator {
                     plan.workflows.len()
                 ),
             );
-            return self
+            let mut result = self
                 .execute_workflows(c, &plan, mainwork_usage, session, cancel, progress)
-                .await;
+                .await?;
+            result.stage_durations.push(StageDuration {
+                stage: "main_work".to_string(),
+                wf_id: None,
+                started_offset_ms: 0,
+                elapsed_ms: mainwork_elapsed_ms,
+            });
+            return Ok(result);
         }
 
         // 2) Quality 校验 Main-Work 输出
         let wf_json = serde_json::to_string(&plan).unwrap_or_default();
+        let qc_started = std::time::Instant::now();
         let (qc_main, qc_usage) = self
             .quality
             .check_main(&c.goal_summary, &wf_json, session.id())
@@ -722,6 +869,7 @@ impl MultiAgentOrchestrator {
             .map_err(|e| {
                 QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
             })?;
+        let qc_main_elapsed_ms = qc_started.elapsed().as_millis() as u64;
         self.dbg_qc(&qc_main);
         emit_progress(
             progress,
@@ -745,8 +893,24 @@ impl MultiAgentOrchestrator {
         let pre_usage = add_usage(mainwork_usage, qc_usage);
 
         // 3) 拓扑排序并执行
-        self.execute_workflows(c, &plan, pre_usage, session, cancel, progress)
-            .await
+        let mut result = self
+            .execute_workflows(c, &plan, pre_usage, session, cancel, progress)
+            .await?;
+        // 2026-09-16 第 57 轮:把 run_medium 收集的 Main-Work + QC-Main 阶段耗时
+        // 写入 result.stage_durations,供 TUI 时间线展示。
+        result.stage_durations.push(StageDuration {
+            stage: "main_work".to_string(),
+            wf_id: None,
+            started_offset_ms: 0,
+            elapsed_ms: mainwork_elapsed_ms,
+        });
+        result.stage_durations.push(StageDuration {
+            stage: "qc_main".to_string(),
+            wf_id: None,
+            started_offset_ms: 0,
+            elapsed_ms: qc_main_elapsed_ms,
+        });
+        Ok(result)
     }
 
     // ========== 高等档 ==========
@@ -763,6 +927,7 @@ impl MultiAgentOrchestrator {
         // I3(2026-09-14 第 51 轮):重试轮回灌上一轮 QC 拒绝理由,
         // Plan 针对性修复而非盲重生成(此前 hard 档重试链路唯一无反馈环)。
         emit_progress(progress, "Plan 规划中…");
+        let plan_started = std::time::Instant::now();
         let (plan_output, plan_usage) = self
             .plan
             .generate_with_retry_hint(
@@ -775,6 +940,7 @@ impl MultiAgentOrchestrator {
             )
             .await
             .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;
+        let plan_elapsed_ms = plan_started.elapsed().as_millis() as u64;
         emit_progress(
             progress,
             format!(
@@ -788,6 +954,7 @@ impl MultiAgentOrchestrator {
         );
 
         // 2) Quality 校验 Plan
+        let qc_plan_started = std::time::Instant::now();
         let (qc_plan, qc_plan_usage) = self
             .quality
             .check_plan(&plan_output.markdown, session.id())
@@ -795,6 +962,7 @@ impl MultiAgentOrchestrator {
             .map_err(|e| {
                 QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
             })?;
+        let qc_plan_elapsed_ms = qc_plan_started.elapsed().as_millis() as u64;
         self.dbg_qc(&qc_plan);
         if qc_plan.verdict == Verdict::Fail {
             return Err(QualityFailure {
@@ -813,6 +981,7 @@ impl MultiAgentOrchestrator {
             QualityFailure::from_agent_error(AgentRole::MainWork, "解析 Plan 失败", &e)
         })?;
 
+        let qc_main_started = std::time::Instant::now();
         let (qc_main, qc_main_usage) = self
             .quality
             .check_main(
@@ -824,6 +993,7 @@ impl MultiAgentOrchestrator {
             .map_err(|e| {
                 QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
             })?;
+        let qc_main_elapsed_ms = qc_main_started.elapsed().as_millis() as u64;
         self.dbg_qc(&qc_main);
         emit_progress(
             progress,
@@ -850,6 +1020,30 @@ impl MultiAgentOrchestrator {
             .execute_workflows(c, &plan, pre_usage, session, cancel, progress)
             .await?;
         task_result.plan_doc = Some(plan_output.path);
+        // 2026-09-16 第 57 轮:把 run_hard 收集的 Plan + QC-Plan + QC-Main 阶段耗时
+        // 写入 task_result.stage_durations,供 TUI 时间线展示。
+        task_result.stage_durations.push(StageDuration {
+            stage: "plan".to_string(),
+            wf_id: None,
+            started_offset_ms: 0,
+            elapsed_ms: plan_elapsed_ms,
+        });
+        task_result.stage_durations.push(StageDuration {
+            stage: "qc_main".to_string(),
+            wf_id: None,
+            started_offset_ms: 0,
+            elapsed_ms: qc_main_elapsed_ms,
+        });
+        // QC-Plan 阶段(在 qc_main 之前)
+        task_result.stage_durations.insert(
+            task_result.stage_durations.len() - 2,
+            StageDuration {
+                stage: "qc_plan".to_string(),
+                wf_id: None,
+                started_offset_ms: 0,
+                elapsed_ms: qc_plan_elapsed_ms,
+            },
+        );
         Ok(task_result)
     }
 
@@ -880,6 +1074,9 @@ impl MultiAgentOrchestrator {
             std::collections::HashMap::new();
         let mut total_usage = pre_usage;
         let total_layers = layers.len();
+        // 2026-09-16 第 57 轮:任务级阶段耗时 + 分层执行记录收集器。
+        let mut stage_durations: Vec<StageDuration> = Vec::new();
+        let mut layer_log: Vec<LayerInfo> = Vec::new();
 
         for (layer_idx, layer) in layers.into_iter().enumerate() {
             // 层边界:取消短路(下一层不再启动)
@@ -890,6 +1087,9 @@ impl MultiAgentOrchestrator {
                     &e,
                 ));
             }
+            // 2026-09-16 第 57 轮:本层开始时刻(用于 LayerInfo.elapsed_ms 与
+            // StageDuration.started_offset_ms 的统一基准)。
+            let layer_started = std::time::Instant::now();
             if layer.len() > 1 {
                 // F3(2026-09-14 第 51 轮):改走 progress 通道而非裸 eprintln!
                 // TUI 下 eprintln! 不感知 waiting 行原地重写纪律,会把本条通知
@@ -1018,20 +1218,61 @@ impl MultiAgentOrchestrator {
                 return Err(f);
             }
 
+            // 2026-09-16 第 57 轮:本层墙钟(用于 LayerInfo.elapsed_ms;并行层取
+            // 最长单元耗时,串行层取累计 = 实时差)。
+            let layer_elapsed_ms = layer_started.elapsed().as_millis() as u64;
+
             for (wf, ok) in ok_units {
                 // 2026-09-09 第 14 轮:同时累加 SubAgent 用量与 Quality-Check 用量
                 total_usage = add_usage(total_usage, ok.usage);
                 total_usage = add_usage(total_usage, ok.qc_usage);
                 dep_outputs.insert(wf.id.clone(), ok.outcome_text.clone());
-                results.push(WorkflowResult {
-                    id: wf.id.clone(),
-                    name: wf.name.clone(),
-                    subflow_outcome: ok.outcome_text,
-                    quality_report: ok.qc,
-                    usage: ok.usage,
-                    subflow_trace: Some(ok.trace),
+                let wf_id = wf.id.clone();
+                let wf_name = wf.name.clone();
+                let sub_text = ok.outcome_text;
+                let qc_report = ok.qc;
+                let exec_role = ok.exec_role;
+                let wallclock_ms = ok.wallclock_ms;
+                let qc_wallclock_ms = ok.qc_wallclock_ms;
+                let sub_trace = ok.trace;
+                let sub_usage = ok.usage;
+                let qc_usage = ok.qc_usage;
+                // 2026-09-16 第 57 轮:每个 WF + 每个 QC 单独写阶段耗时(供 TUI 时间线)。
+                let layer_elapsed_ms_now = layer_started.elapsed().as_millis() as u64;
+                stage_durations.push(StageDuration {
+                    stage: "wf".to_string(),
+                    wf_id: Some(wf_id.clone()),
+                    started_offset_ms: layer_elapsed_ms_now.saturating_sub(wallclock_ms),
+                    elapsed_ms: wallclock_ms,
                 });
+                stage_durations.push(StageDuration {
+                    stage: "qc_wf".to_string(),
+                    wf_id: Some(wf_id.clone()),
+                    started_offset_ms: layer_elapsed_ms_now.saturating_sub(qc_wallclock_ms),
+                    elapsed_ms: qc_wallclock_ms,
+                });
+                results.push(WorkflowResult {
+                    id: wf_id,
+                    name: wf_name,
+                    subflow_outcome: sub_text,
+                    quality_report: qc_report,
+                    usage: sub_usage,
+                    subflow_trace: Some(sub_trace),
+                    exec_role,
+                    wallclock_ms,
+                    qc_wallclock_ms,
+                });
+                let _ = qc_usage; // 已在 stage_durations / total_usage 累加
             }
+
+            // 2026-09-16 第 57 轮:本层信息汇总。
+            layer_log.push(LayerInfo {
+                layer_idx,
+                wf_ids: layer.iter().map(|w| w.id.clone()).collect(),
+                parallel: layer.len() > 1,
+                started_offset_ms: 0, // 由 TUI 在最终呈现时计算相对任务起点的偏移
+                elapsed_ms: layer_elapsed_ms,
+            });
         }
 
         Ok(TaskResult {
@@ -1041,6 +1282,10 @@ impl MultiAgentOrchestrator {
             workflows: results,
             summary: String::new(),
             total_usage,
+            stage_durations,
+            retry_log: Vec::new(),
+            layer_log,
+            wallclock_ms: 0, // 由 handle_inner 在收口时根据入口 Instant 覆盖
         })
     }
 
@@ -1246,6 +1491,12 @@ struct WfUnitOk {
     qc_usage: Usage,
     /// SubAgent 执行轨迹(2026-09-09 第 05 轮)。
     trace: ExecutionTrace,
+    /// 2026-09-16 第 57 轮:执行器角色(SubAgent / WindowUse)
+    exec_role: AgentRole,
+    /// 2026-09-16 第 57 轮:SubAgent/WindowUse 墙钟耗时(毫秒)
+    wallclock_ms: u64,
+    /// 2026-09-16 第 57 轮:QC LLM 调用单独耗时(毫秒)
+    qc_wallclock_ms: u64,
 }
 
 /// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
@@ -1298,6 +1549,9 @@ async fn run_wf_unit(
         "SubAgent"
     };
     emit_progress(&progress, format!("{wf_id} {exec_label} 执行中…"));
+    // 2026-09-16 第 57 轮:SubAgent/WindowUse 墙钟计时 ——
+    // 用于 TaskResult.wallclock_ms / TUI 时间线展示。
+    let sub_started = std::time::Instant::now();
     let outcome = if exec_role == AgentRole::WindowUse {
         window_use.run_unit_with_cancel(&input, &session_id, &cancel).await
     } else {
@@ -1310,7 +1564,10 @@ async fn run_wf_unit(
             &e,
         )
     })?;
+    let wallclock_ms = sub_started.elapsed().as_millis() as u64;
 
+    // 2026-09-16 第 57 轮:QC LLM 调用单独计时。
+    let qc_started = std::time::Instant::now();
     let (qc, qc_usage) = quality
         .check_subagent_with_source(
             exec_role,
@@ -1325,6 +1582,7 @@ async fn run_wf_unit(
         .map_err(|e| {
             QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
         })?;
+    let qc_wallclock_ms = qc_started.elapsed().as_millis() as u64;
     if let Some(d) = &debug {
         d.record_quality(&qc);
     }
@@ -1358,6 +1616,9 @@ async fn run_wf_unit(
         qc,
         qc_usage,
         trace: outcome.trace,
+        exec_role,
+        wallclock_ms,
+        qc_wallclock_ms,
     })
 }
 
@@ -1608,5 +1869,117 @@ mod tests {
                 "{s:?} 不应被识别为占位,实际被误判"
             );
         }
+    }
+
+    // ========== 第 57 轮:阶段耗时 / 分层 / 重试数据结构 ==========
+
+    #[test]
+    fn stage_duration_serializes_roundtrip() {
+        // 2026-09-16 第 57 轮:新增数据结构必须能 Serialize/Deserialize(任务写库
+        // + 未来 transcript 导出走 JSON 时会消费这些字段)。
+        let s = StageDuration {
+            stage: "wf".to_string(),
+            wf_id: Some("wf-1".to_string()),
+            started_offset_ms: 100,
+            elapsed_ms: 1234,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: StageDuration = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stage, "wf");
+        assert_eq!(back.wf_id.as_deref(), Some("wf-1"));
+        assert_eq!(back.elapsed_ms, 1234);
+    }
+
+    #[test]
+    fn retry_record_and_layer_info_roundtrip() {
+        let r = RetryRecord {
+            retry_count: 2,
+            retry_hint: "wf-3 步骤 2 缺空格".to_string(),
+            started_offset_ms: 0,
+            elapsed_ms: 8765,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: RetryRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.retry_count, 2);
+        assert_eq!(back.elapsed_ms, 8765);
+
+        let l = LayerInfo {
+            layer_idx: 1,
+            wf_ids: vec!["wf-1".into(), "wf-2".into()],
+            parallel: true,
+            started_offset_ms: 50,
+            elapsed_ms: 41234,
+        };
+        let json = serde_json::to_string(&l).unwrap();
+        let back: LayerInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.layer_idx, 1);
+        assert!(back.parallel);
+        assert_eq!(back.wf_ids.len(), 2);
+    }
+
+    #[test]
+    fn task_result_serde_with_new_fields_roundtrip() {
+        // 2026-09-16 第 57 轮:TaskResult 新增 stage_durations / retry_log /
+        // layer_log / wallclock_ms 必须走 Serialize 完整往返(否则下次 db 升级
+        // 或 transcript 导出时会丢字段)。
+        use crate::agent::quality::{QualityReport, Verdict};
+        let tr = TaskResult {
+            goal: "测试目标".into(),
+            classification: TaskClassification {
+                task_level: TaskLevel::Simple,
+                purpose: "p".into(),
+                goal_summary: "g".into(),
+                intent: "info".into(),
+                agent_role: None,
+                decomposition_plan: vec![],
+                direct_answer: None,
+                user_suggestion_if_fail: String::new(),
+                yolo_degraded: false,
+            },
+            plan_doc: None,
+            workflows: vec![WorkflowResult {
+                id: "wf-1".into(),
+                name: "n".into(),
+                subflow_outcome: "out".into(),
+                quality_report: QualityReport {
+                    verdict: Verdict::Pass,
+                    issues: vec![],
+                    suggestion: String::new(),
+                    retryable: false,
+                    source: AgentRole::SubAgent,
+                    evidence: String::new(),
+                },
+                usage: Usage::default(),
+                subflow_trace: None,
+                exec_role: AgentRole::SubAgent,
+                wallclock_ms: 100,
+                qc_wallclock_ms: 50,
+            }],
+            summary: String::new(),
+            total_usage: Usage::default(),
+            stage_durations: vec![StageDuration {
+                stage: "yolo".into(),
+                wf_id: None,
+                started_offset_ms: 0,
+                elapsed_ms: 8,
+            }],
+            retry_log: vec![RetryRecord {
+                retry_count: 1,
+                retry_hint: "x".into(),
+                started_offset_ms: 0,
+                elapsed_ms: 100,
+            }],
+            layer_log: vec![],
+            wallclock_ms: 1000,
+        };
+        let json = serde_json::to_string(&tr).unwrap();
+        let back: TaskResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wallclock_ms, 1000);
+        assert_eq!(back.stage_durations.len(), 1);
+        assert_eq!(back.stage_durations[0].stage, "yolo");
+        assert_eq!(back.retry_log.len(), 1);
+        assert_eq!(back.retry_log[0].retry_count, 1);
+        assert_eq!(back.workflows[0].exec_role, AgentRole::SubAgent);
+        assert_eq!(back.workflows[0].wallclock_ms, 100);
     }
 }

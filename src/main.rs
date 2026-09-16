@@ -398,52 +398,13 @@ async fn run_one_shot(
             print_usage(&usage);
         }
         OrchestrationOutcome::Executed { result } => {
-            // 2026-09-10 第二十九轮 P06/M05 自动化测试发现:
-            // -p 单轮模式此前只打印 WorkFlow 文本,没有 [trace] 工具调用统计。
-            // 与 TUI 模式 (src/tui/mod.rs:1229) 对齐,把每个 workflow 的 trace 行也补上,
-            // 便于 -p 用户 / 脚本解析时区分 "LLM 直接 end_turn" vs "工具被调用"
-            // vs "工具失败" 三种语义,改善可观测性。
-            for wf in &result.workflows {
-                println!(
-                    "--- WorkFlow {} ({}) ---",
-                    wf.id,
-                    lsm_agent::tui::sanitize_terminal_controls(&wf.name)
-                );
-                println!(
-                    "{}",
-                    lsm_agent::tui::sanitize_terminal_controls(&wf.subflow_outcome)
-                );
-                if let Some(trace) = &wf.subflow_trace {
-                    println!(
-                        "[trace] iter={} tools={}(ok={},err={}) early_term={}",
-                        trace.iterations,
-                        trace.tool_calls,
-                        trace.tool_calls_ok,
-                        trace.tool_calls_err,
-                        trace.early_terminated
-                    );
-                }
-            }
-            // 暴露 Yolo 三步分析(2026-09-10 第二十九轮 P06/M05):
-            // 让用户在 -p 输出里能看到 Yolo 怎么理解任务,
-            // 避免 mock Yolo 返回固定 JSON 时只看 mock 行为看不到 Yolo 决策。
-            let c = &result.classification;
-            let purpose = truncate_for_display(&c.purpose, 60);
-            let goal = truncate_for_display(&c.goal_summary, 60);
-            let intent = &c.intent;
-            let plan_count = c.decomposition_plan.len();
-            println!(
-                "[yolo] purpose={} goal={} intent={} plan_steps={}",
-                purpose, goal, intent, plan_count
-            );
-            if !result.summary.is_empty() {
-                println!();
-                println!("[session_context 摘要]");
-                println!(
-                    "{}",
-                    lsm_agent::tui::sanitize_terminal_controls(&result.summary)
-                );
-            }
+            // 2026-09-16 第 57 轮:走与 TUI 同源的 format_task_result,补阶段耗时 +
+            // WorkFlow exec_role + 工具调用明细 + 重试日志 + 分层摘要。
+            // (-p 单轮模式此前只打 WF 文本 + trace,缺 TUI 同等的可观测性增强;
+            // 这次借格式复用统一两路输出,避免再次漂移。)
+            let formatted =
+                lsm_agent::tui::format::format_task_result(&result, &paths, None, false);
+            println!("{formatted}");
             print_usage(&result.total_usage);
         }
         OrchestrationOutcome::Failed {

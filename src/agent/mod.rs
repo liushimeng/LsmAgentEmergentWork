@@ -446,14 +446,20 @@ impl Agent {
                     }
                     Err(e) => Some(Err(e)),
                 };
-                let (output, is_error) = match executed {
-                    Some(Ok(out)) => (out, false),
+                // 2026-09-16 第 57 轮:工具调用墙钟计时 —— 从执行入口开始,
+                // 不论 Ok/Err/取消都走 elapsed.as_millis() 取时长,记入
+                // ExecutionTrace.tool_call_log.elapsed_ms,供 TUI 反推卡在哪一步。
+                let tool_call_started = std::time::Instant::now();
+                let (output, is_error, error_summary) = match executed {
+                    Some(Ok(out)) => (out, false, String::new()),
                     Some(Err(e)) => {
                         warn!(tool = %name, error = %e, "tool failed");
                         // F1(2026-09-14 第 51 轮):工具不存在时,回填文本明示
                         // 可用工具边界——auto tool_choice 降级后模型可能尝试
                         // 越权工具(如 Yolo 调 Bash),裸错误「工具不存在」不足以
                         // 让模型收敛,导致同一轮内反复试错浪费迭代。
+                        let brief = format!("{e}");
+                        let brief_short: String = brief.chars().take(120).collect();
                         if matches!(e, AgentError::ToolNotFound(_)) {
                             let avail = self.profile.tools.names().join(", ");
                             (
@@ -462,9 +468,14 @@ impl Agent {
                                      禁止再次调用 {name};请立即改用上述可用工具完成任务,或直接给出最终回答。"
                                 ),
                                 true,
+                                format!("ToolNotFound: {brief_short}"),
                             )
                         } else {
-                            (format!("[工具执行失败] {}: {}", name, e), true)
+                            (
+                                format!("[工具执行失败] {}: {}", name, e),
+                                true,
+                                format!("{name}: {brief_short}"),
+                            )
                         }
                     }
                     // 取消:本条 + 本轮剩余未执行的 tool_use 由 backfill 统一补全
@@ -525,7 +536,17 @@ impl Agent {
                 trace.tool_calls += 1;
                 // 2026-09-16 第 56 轮:工具调用日志(供 WindowUseRunner 恢复窗口状态 +
                 // QC 拿到真实调用证据);FIFO 上限 MAX_TOOL_CALL_LOG。
-                trace.record_tool_call(&name, &stable_json_string(&args), !is_error, output.len());
+                // 第 57 轮:补 elapsed_ms(墙钟耗时)与 error_summary(失败原因摘要),
+                // TUI 据此反推「哪个工具哪一步卡死 / 为何失败」。
+                let tool_call_elapsed_ms = tool_call_started.elapsed().as_millis() as u64;
+                trace.record_tool_call(
+                    &name,
+                    &stable_json_string(&args),
+                    !is_error,
+                    output.len(),
+                    tool_call_elapsed_ms,
+                    &error_summary,
+                );
                 // 关联报告: 2026-09-09_06 F-002 — 累计最近工具调用历史
                 let args_digest = crate::agent::extrace::compact_args_digest(&args);
                 recent_tool_history.push((name.clone(), args_digest, is_error));

@@ -39,7 +39,7 @@ pub mod screen;
 pub mod theme;
 
 mod dispatch;
-mod format;
+pub mod format;
 mod input;
 mod provider_screen;
 mod slash;

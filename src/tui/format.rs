@@ -18,7 +18,10 @@ use crate::tui::input::display_width;
 /// 模型生成的内容块(`subflow_outcome` / `session_context 摘要`)经
 /// `render::markdown` 渲染为带 ANSI 的富文本;**结构标签行保持纯文本**。
 /// transcript / 导出必须传 `false`(纯文本,零 ANSI 混入)。
-pub(crate) fn format_task_result(
+///
+/// 2026-09-16 第 57 轮:补 stage_durations / retry_log / layer_log / 工具调用明细 —
+/// 让用户在终端一眼看到每个阶段耗时、每个 WF 的责任 Agent、每个工具调用耗时与失败原因。
+pub fn format_task_result(
     result: &crate::agent::orchestrator::TaskResult,
     paths: &Paths,
     task_started_at: Option<std::time::Instant>,
@@ -33,31 +36,129 @@ pub(crate) fn format_task_result(
         .as_ref()
         .map(|p| pathfmt::display_path(paths, p))
         .unwrap_or_else(|| "无".into());
+
+    // 2026-09-16 第 57 轮:任务总耗时 —— 优先用 orchestrator 埋点的 wallclock_ms,
+    // 兜底用 task_started_at(老路径)。
+    let wallclock_secs = if result.wallclock_ms > 0 {
+        Some(result.wallclock_ms as f64 / 1000.0)
+    } else {
+        task_started_at.map(|t| t.elapsed().as_secs_f64())
+    };
+
     out.push_str(&format!(
-        "  [task executed: difficulty={}, plan_doc={}, workflows={}]\n",
+        "  [task executed: difficulty={}, plan_doc={}, workflows={}, 总耗时 {}{}]\n",
         result.classification.task_level.display_name(),
         if styled { sv(&plan_doc_display) } else { plan_doc_display },
-        result.workflows.len()
+        result.workflows.len(),
+        wallclock_secs
+            .map(|s| format!("{:.2}s", s))
+            .unwrap_or_else(|| "?".into()),
+        if !result.retry_log.is_empty() {
+            format!(" (重试 {} 次)", result.retry_log.len())
+        } else {
+            String::new()
+        }
     ));
+
     // 2026-09-10 第二十九轮 P06/M05 自动化测试:
     // TUI 也补一行 Yolo 三步分析摘要,让用户看到 Yolo 怎么理解任务
     // (与 main.rs OrchestrationOutcome::Executed 分支对齐)
     let c = &result.classification;
     let purpose_short = truncate_chars(&c.purpose, 40);
     let goal_short = truncate_chars(&c.goal_summary, 40);
+    // 2026-09-16 第 57 轮:Yolo 行后补 Yolo 阶段耗时(供一眼看出分类调用多慢)。
+    let yolo_elapsed_ms = result
+        .stage_durations
+        .iter()
+        .find(|s| s.stage == "yolo")
+        .map(|s| s.elapsed_ms);
+    let yolo_elapsed_str = yolo_elapsed_ms
+        .map(|ms| format!(" (Yolo 分类 {:.2}s)", ms as f64 / 1000.0))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "  [yolo] purpose={} goal={} intent={} plan_steps={}\n",
+        "  [yolo] purpose={} goal={} intent={} plan_steps={}{}\n",
         if styled { sv(&purpose_short) } else { purpose_short },
         if styled { sv(&goal_short) } else { goal_short },
         if styled { sv(&c.intent) } else { c.intent.clone() },
-        c.decomposition_plan.len()
+        c.decomposition_plan.len(),
+        yolo_elapsed_str,
     ));
+
+    // 2026-09-16 第 57 轮:Main-Work / Plan 拆解耗时(供 TUI 时间线展示)。
+    for s in &result.stage_durations {
+        if s.stage == "main_work" {
+            out.push_str(&format!(
+                "  [main-work] Main-Work 拆解({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            ));
+        } else if s.stage == "plan" {
+            out.push_str(&format!(
+                "  [plan] Plan 规划({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            ));
+        } else if s.stage == "qc_main" {
+            out.push_str(&format!(
+                "  [qc-main] QC-Main({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            ));
+        } else if s.stage == "qc_plan" {
+            out.push_str(&format!(
+                "  [qc-plan] QC-Plan({:.2}s)\n",
+                s.elapsed_ms as f64 / 1000.0
+            ));
+        }
+    }
+
+    // 2026-09-16 第 57 轮:分层并行执行摘要(仅当 ≥ 2 层 或 任一层含 ≥ 2 wf 时打印)。
+    if result.layer_log.len() >= 2
+        || result.layer_log.iter().any(|l| l.parallel)
+            && !result.layer_log.is_empty()
+    {
+        let total_layers = result.layer_log.len();
+        let total_wf = result.layer_log.iter().map(|l| l.wf_ids.len()).sum::<usize>();
+        let parallel_layers = result.layer_log.iter().filter(|l| l.parallel).count();
+        let max_layer_wall = result
+            .layer_log
+            .iter()
+            .map(|l| l.elapsed_ms)
+            .max()
+            .unwrap_or(0);
+        let sum_wall: u64 = result.layer_log.iter().map(|l| l.elapsed_ms).sum();
+        out.push_str(&format!(
+            "  [work-flows] 共 {total_layers} 层 / {total_wf} 个流程(并行层 {parallel_layers});\
+             最长层墙钟 {max_wall:.2}s / 层累计 {sum_wall:.2}s\n",
+            max_wall = max_layer_wall as f64 / 1000.0,
+            sum_wall = sum_wall as f64 / 1000.0,
+        ));
+    }
+
+    // 2026-09-16 第 57 轮:重试链路(用户问「第 N 轮重试当前档位」时直观可见)。
+    if !result.retry_log.is_empty() {
+        for r in &result.retry_log {
+            out.push_str(&format!(
+                "  [retry] 第 {} 轮重试(累计 {:.2}s)  上一轮失败原因: {}\n",
+                r.retry_count,
+                r.elapsed_ms as f64 / 1000.0,
+                if styled {
+                    sv(&truncate_chars(&r.retry_hint, 100))
+                } else {
+                    truncate_chars(&r.retry_hint, 100)
+                }
+            ));
+        }
+    }
+
     // 每个 WorkFlow 的 subflow 输出
     for wf in &result.workflows {
+        // 2026-09-16 第 57 轮:WorkFlow 头部补 [exec_role] + 墙钟耗时 +
+        // QC 耗时,让用户一眼看到责任 Agent + 这一格跑了几秒。
+        let exec_role_str = wf.exec_role.as_str();
         out.push_str(&format!(
-            "  --- WorkFlow {} ({}) ---\n",
+            "  --- WorkFlow {} ({}) [{}] {:.2}s ---\n",
             wf.id,
-            if styled { sv(&wf.name) } else { wf.name.clone() }
+            if styled { sv(&wf.name) } else { wf.name.clone() },
+            exec_role_str,
+            wf.wallclock_ms as f64 / 1000.0,
         ));
         if styled {
             // 模型内容块:净化后整段 Markdown 渲染(围栏高亮语义包含在内);
@@ -75,12 +176,15 @@ pub(crate) fn format_task_result(
                 out.push_str(&format!("  {line}\n"));
             }
         }
-        // Quality-Check 结论
+        // Quality-Check 结论(2026-09-16 第 57 轮:QC 行末尾补 QC 调用耗时)
         let (qc_icon, qc_text) = match wf.quality_report.verdict {
             crate::agent::quality::Verdict::Pass => ("✅", "通过"),
             crate::agent::quality::Verdict::Fail => ("❌", "未通过"),
         };
-        out.push_str(&format!("  [QC] {qc_icon} {qc_text}\n"));
+        out.push_str(&format!(
+            "  [QC] {qc_icon} {qc_text}(QC 耗时 {:.2}s)\n",
+            wf.qc_wallclock_ms as f64 / 1000.0,
+        ));
         if !wf.quality_report.issues.is_empty() {
             for issue in &wf.quality_report.issues {
                 out.push_str(&format!(
@@ -89,7 +193,7 @@ pub(crate) fn format_task_result(
                 ));
             }
         }
-        // SubAgent 执行轨迹摘要
+        // SubAgent 执行轨迹摘要(2026-09-16 第 57 轮:补工具调用明细)
         if let Some(trace) = &wf.subflow_trace {
             out.push_str(&format!(
                 "  [trace] iter={} tools={}(ok={},err={}) early_term={}\n",
@@ -99,11 +203,77 @@ pub(crate) fn format_task_result(
                 trace.tool_calls_err,
                 trace.early_terminated
             ));
+            // 工具调用明细:成功 WF 取首 5 条,失败 WF 全量(便于反推失败步骤)
+            if !trace.tool_call_log.is_empty() {
+                let show_all = trace.tool_calls_err > 0;
+                let max_show = if show_all { usize::MAX } else { 5 };
+                let icon = |ok: bool| if ok { "✅" } else { "❌" };
+                let mut count = 0;
+                for tc in &trace.tool_call_log {
+                    if count >= max_show {
+                        break;
+                    }
+                    let elapsed = format!("{:.2}s", tc.elapsed_ms as f64 / 1000.0);
+                    let detail = if tc.ok {
+                        String::new()
+                    } else {
+                        // 失败时附错误摘要(供一眼看出"为什么失败")
+                        let err_short = truncate_chars(&tc.error_summary, 80);
+                        format!(" ← {}", if styled { sv(&err_short) } else { err_short })
+                    };
+                    out.push_str(&format!(
+                        "    [tool] {:<14} {}{} {} {}B{}\n",
+                        tc.tool,
+                        elapsed,
+                        icon(tc.ok),
+                        if styled { sv(&truncate_chars(&tc.args_json, 80)) } else { truncate_chars(&tc.args_json, 80) },
+                        tc.output_bytes,
+                        detail,
+                    ));
+                    count += 1;
+                }
+                if !show_all && trace.tool_call_log.len() > max_show {
+                    out.push_str(&format!(
+                        "    [tool] ...(省略 {} 条,共 {} 条)\n",
+                        trace.tool_call_log.len() - max_show,
+                        trace.tool_call_log.len()
+                    ));
+                }
+            }
+            // 失败模式汇总(供一眼看出卡在哪类失败)
+            if !trace.failure_signals.is_empty() {
+                let failures: Vec<String> = trace
+                    .failure_signals
+                    .iter()
+                    .filter(|s| *s != "ok")
+                    .map(|s| s.to_string())
+                    .collect();
+                if !failures.is_empty() {
+                    out.push_str(&format!(
+                        "  [failure] signals={}{}\n",
+                        failures.join(","),
+                        if !trace.early_terminate_reason.is_empty() {
+                            format!(" early_terminate_reason={}", trace.early_terminate_reason)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+            }
         }
     }
     if !result.summary.is_empty() {
         out.push('\n');
-        out.push_str("  [session_context 摘要]\n");
+        // 2026-09-16 第 57 轮:SessionContext 行尾补耗时
+        let sc_elapsed = result
+            .stage_durations
+            .iter()
+            .find(|s| s.stage == "session_context")
+            .map(|s| s.elapsed_ms);
+        let sc_suffix = sc_elapsed
+            .map(|ms| format!("({:.2}s)", ms as f64 / 1000.0))
+            .unwrap_or_default();
+        out.push_str(&format!("  [session_context 摘要] {sc_suffix}\n"));
         if styled {
             let block = result.summary.trim_end_matches('\n');
             if !block.is_empty() {
@@ -134,8 +304,9 @@ pub(crate) fn format_task_result(
         }
         // 任务总耗时(2026-09-10 第 27 轮 F05 / tmpPlan/2026-09-10_22):
         // 由 print_task_result 调用方从 self.task_started_at.take() 传入,这里直接拼接。
-        let elapsed_suffix = task_started_at
-            .map(|t| format!("  (耗时 {:.2}s)", t.elapsed().as_secs_f64()))
+        // 2026-09-16 第 57 轮:优先用 orchestrator 埋点的 wallclock_ms,fallback 用 task_started_at。
+        let elapsed_suffix = wallclock_secs
+            .map(|s| format!("  (耗时 {:.2}s)", s))
             .unwrap_or_default();
         out.push_str(&format!(
             "  本次用量: input={}  output={}{}{}\n",
@@ -600,6 +771,10 @@ mod format_task_result_for_context_tests {
             },
             usage: Usage::default(),
             subflow_trace: None,
+            // 2026-09-16 第 57 轮:测试 fixture 补齐新增字段(默认值即可)
+            exec_role: crate::agent::context::AgentRole::SubAgent,
+            wallclock_ms: 0,
+            qc_wallclock_ms: 0,
         }
     }
 
@@ -621,6 +796,11 @@ mod format_task_result_for_context_tests {
             workflows,
             summary: summary.into(),
             total_usage: Usage::default(),
+            // 2026-09-16 第 57 轮:测试 fixture 补齐新增字段(默认值即可)
+            stage_durations: Vec::new(),
+            retry_log: Vec::new(),
+            layer_log: Vec::new(),
+            wallclock_ms: 0,
         }
     }
 
