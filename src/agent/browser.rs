@@ -233,9 +233,24 @@ impl BrowserManager {
     ) -> chromiumoxide::error::Result<(String, String, String)> {
         let mut inner = self.inner.lock().await;
         let mut launch_dir: Option<PathBuf> = None;
+
+        // Browser 操作超时(2026-09-16 第 66 轮):launch/connect/goto 统一 30s,
+        // 防止页面挂起/Chrome 启动失败导致无限等待(用户反馈 WebUse 任务卡住 58.8s)。
+        let browser_timeout = std::time::Duration::from_secs(30);
+
         if inner.browser.is_none() {
             let (browser, handler, connect_mode) = if let Some(connect_url) = connect_url {
-                let (browser, mut handler) = Browser::connect(connect_url.to_string()).await?;
+                let (browser, mut handler) = tokio::time::timeout(
+                    browser_timeout,
+                    Browser::connect(connect_url.to_string()),
+                )
+                .await
+                .map_err(|_| {
+                    chromiumoxide::error::CdpError::msg(format!(
+                        "Browser connect 超时({}s),请检查 connect_url 是否正确",
+                        browser_timeout.as_secs()
+                    ))
+                })??;
                 let task = tokio::spawn(async move {
                     // 必须持续驱动 handler,否则 CDP 连接挂起
                     while let Some(msg) = handler.next().await {
@@ -273,7 +288,17 @@ impl BrowserManager {
                     .build()
                     .map_err(chromiumoxide::error::CdpError::msg)?;
                 launch_dir = Some(dir);
-                let (browser, mut handler) = Browser::launch(config).await?;
+                let (browser, mut handler) = tokio::time::timeout(
+                    browser_timeout,
+                    Browser::launch(config),
+                )
+                .await
+                .map_err(|_| {
+                    chromiumoxide::error::CdpError::msg(format!(
+                        "Browser launch 超时({}s),请检查 Chrome 是否可正常启动",
+                        browser_timeout.as_secs()
+                    ))
+                })??;
                 let task = tokio::spawn(async move {
                     while let Some(msg) = handler.next().await {
                         if msg.is_err() {
@@ -291,7 +316,14 @@ impl BrowserManager {
 
         let browser = inner.browser.as_ref().expect("browser initialized");
         let page = browser.new_page(url.to_string()).await?;
-        page.goto(url.to_string()).await?;
+        tokio::time::timeout(browser_timeout, page.goto(url.to_string()))
+            .await
+            .map_err(|_| {
+                chromiumoxide::error::CdpError::msg(format!(
+                    "page.goto({url}) 超时({}s),请检查网络连接或稍后重试",
+                    browser_timeout.as_secs()
+                ))
+            })??;
 
         // UA 覆盖(可选)
         if let Some(ua) = user_agent.filter(|s| !s.is_empty()) {

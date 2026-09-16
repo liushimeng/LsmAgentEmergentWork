@@ -289,11 +289,32 @@ impl TuiSession {
                         if queue.is_empty() {
                             let (text, next) =
                                 if let Some((stage, started)) = &current_stage {
+                                    // 2026-09-16 第 66 轮:阶段超时提示 ——
+                                    // 30s 提示「耗时较长」,60s 提示「耗时过长,Ctrl-C 取消」,
+                                    // 让用户感知进度而非「卡住无响应」。
+                                    let elapsed = started.elapsed().as_secs();
+                                    if elapsed == 30 {
+                                        let _ = std::io::stdout().write_all(
+                                            format!(
+                                                "\r  [laew] 阶段「{stage}」耗时较长,请稍候... ({elapsed}s)\x1b[K\n"
+                                            )
+                                            .as_bytes(),
+                                        );
+                                        let _ = std::io::stdout().flush();
+                                    } else if elapsed == 60 {
+                                        let _ = std::io::stdout().write_all(
+                                            format!(
+                                                "\r  [laew] 阶段「{stage}」耗时过长,Ctrl-C 取消 ({elapsed}s)\x1b[K\n"
+                                            )
+                                            .as_bytes(),
+                                        );
+                                        let _ = std::io::stdout().flush();
+                                    }
                                     (
                                         waiting_line_text(
                                             Some(stage),
                                             SPINNER[spinner_idx % SPINNER.len()],
-                                            started.elapsed().as_secs(),
+                                            elapsed,
                                         ),
                                         tick,
                                     )

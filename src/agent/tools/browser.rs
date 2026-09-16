@@ -600,7 +600,14 @@ async fn act_close_tab(id: &str) -> std::result::Result<Value, String> {
 async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let Some(url) = str_arg(p, "url") else { return Err("缺少 url".into()); };
     let page = ensure_page(id).await?;
-    page.goto(url.to_string()).await.map_err(|e| e.to_string())?;
+    // 2026-09-16 第 66 轮:navigate 超时 30s,防止页面挂起导致无限等待
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        page.goto(url.to_string()),
+    )
+    .await
+    .map_err(|_| format!("navigate 超时(30s): {url}"))?
+    .map_err(|e| e.to_string())?;
     if let Some(ms) = p.get("wait_ms").and_then(Value::as_u64) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }

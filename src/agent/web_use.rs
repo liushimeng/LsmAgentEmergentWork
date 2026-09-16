@@ -85,13 +85,30 @@ impl WebUseRunner {
     }
 
     /// 可取消版本:任务级取消 token 传入 Agent 循环,LLM/工具即时中断。
+    ///
+    /// 2026-09-16 第 66 轮:单元总超时(默认 300s,环境变量 LAEW_WEBUSE_TIMEOUT),
+    /// 防止 Agent 循环 16 轮迭代总耗时过长(用户反馈 WebUse 任务卡住 58.8s)。
     pub async fn run_unit_with_cancel(
         &self,
         input: &SubFlowInput,
         session_id: &str,
         cancel: &CancelToken,
     ) -> Result<SubFlowOutcome> {
-        self.run_unit_inner(input, session_id, Some(cancel)).await
+        let unit_timeout = std::env::var("LAEW_WEBUSE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(unit_timeout),
+            self.run_unit_inner(input, session_id, Some(cancel)),
+        )
+        .await
+        .map_err(|_| {
+            crate::error::AgentError::Llm(format!(
+                "WebUse 单元执行超时({}s),请检查网络或稍后重试",
+                unit_timeout
+            ))
+        })?
     }
 
     async fn run_unit_inner(

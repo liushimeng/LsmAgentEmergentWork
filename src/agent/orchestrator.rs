@@ -875,21 +875,65 @@ impl MultiAgentOrchestrator {
         let mainwork_started = std::time::Instant::now();
         // 2026-09-16 第 59 轮:透传 Yolo 推断的 suggested_delegate,引导 Main-Work 正确委派窗口操控类任务
         let suggested_delegate = c.suggested_delegate.as_deref();
-        let (plan, mainwork_usage) = self
-            .main_work
-            .plan_workflows_with_delegate(
+        // 2026-09-16 第 66 轮:Main-Work LLM 调用超时(默认 120s,环境变量 LAEW_MAINWORK_TIMEOUT),
+        // 防止 LLM 响应慢/挂起导致无限等待(用户反馈 WebUse 任务卡住 58.8s)。
+        let mainwork_timeout = std::env::var("LAEW_MAINWORK_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120);
+        let (mut plan, mainwork_usage) = tokio::time::timeout(
+            std::time::Duration::from_secs(mainwork_timeout),
+            self.main_work.plan_workflows_with_delegate(
                 &c.goal_summary,
                 &c.decomposition_plan,
                 session.id(),
                 retry_hint,
                 original_prompt.as_deref(),
                 suggested_delegate,
-            )
-            .await
-            .map_err(|e| {
-                QualityFailure::from_agent_error(AgentRole::MainWork, "Main-Work 拆解失败", &e)
-            })?;
+            ),
+        )
+        .await
+        .map_err(|_| {
+            QualityFailure {
+                source: AgentRole::MainWork,
+                reason: format!("Main-Work 拆解超时({}s)", mainwork_timeout),
+                retryable: true,
+                suggestion: "重试".into(),
+                cancelled: false,
+                trace: None,
+                usage: Usage::default(),
+            }
+        })?
+        .map_err(|e| {
+            QualityFailure::from_agent_error(AgentRole::MainWork, "Main-Work 拆解失败", &e)
+        })?;
         let mainwork_elapsed_ms = mainwork_started.elapsed().as_millis() as u64;
+
+        // 1.2) 2026-09-16 第 66 轮 P0-1/P0-2:确定性自动修复 + 阻断校验,先于一切 LLM QC。
+        // 根因:QC-main(LLM)对计划做品相质检(loops.max_iterations=null / branches 为空 /
+        // Unicode 上标名归一化差异),误判率与成本双高,形成确定性必败重试风暴
+        // (实测 162.8s 三轮重试零执行)。程序可判定的部分收回程序判定:
+        // - auto_repair:loops.max_iterations 从文本回填(最多N次/max_iterations=N/无界滚动兜底10);
+        // - validate_blocking:workflows 空 / id 重复 / steps 空 / 依赖未知或成环。
+        crate::agent::plan_validate::auto_repair_plan(&mut plan);
+        let blocking_issues = crate::agent::plan_validate::validate_plan_blocking(&plan);
+        if !blocking_issues.is_empty() {
+            // 秒级失败回流:不调 QC LLM,精确原因回灌 Main-Work 下一轮重拆
+            emit_progress(
+                progress,
+                format!("计划确定性校验未通过:{}(秒级回流重拆)", blocking_issues[0]),
+            );
+            return Err(QualityFailure {
+                source: AgentRole::MainWork,
+                reason: blocking_issues.join("; "),
+                retryable: true,
+                suggestion: "请补齐缺失字段(id/name/steps)、消除重复 id 与循环依赖后重新拆解"
+                    .to_string(),
+                cancelled: false,
+                trace: None,
+                usage: mainwork_usage,
+            });
+        }
 
         // 1.5) F2(2026-09-10 第 25 轮):兜底计划跳过 QC-main 直接执行。
         // 兜底 WorkFlowPlan 的 summary 自证「解析失败」,送 QC 必然 fail+retryable,
@@ -916,6 +960,33 @@ impl MultiAgentOrchestrator {
         }
 
         // 2) Quality 校验 Main-Work 输出
+        // 2026-09-16 第 66 轮 P0-2:确定性校验已通过的计划默认跳过 LLM QC-main ——
+        // 计划品相问题(可省略字段为空 / 名称归一化差异 / UI 类验收措辞)不再阻断执行,
+        // 真实产物质量仍由 execute_workflows 内每 WorkFlow 的 QC 把守(对齐 degraded 路径)。
+        // 逃生门:LAEW_QC_MAIN_LLM=1 恢复 LLM 计划级质检。
+        let qc_main_llm_enabled = std::env::var("LAEW_QC_MAIN_LLM")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if !qc_main_llm_enabled {
+            emit_progress(
+                progress,
+                format!(
+                    "Main-Work 拆解 {} 个流程单元,确定性校验通过(跳过计划级 LLM 质检)",
+                    plan.workflows.len()
+                ),
+            );
+            let pre_usage = mainwork_usage;
+            let mut result = self
+                .execute_workflows(c, &plan, pre_usage, session, cancel, progress)
+                .await?;
+            result.stage_durations.push(StageDuration {
+                stage: "main_work".to_string(),
+                wf_id: None,
+                started_offset_ms: 0,
+                elapsed_ms: mainwork_elapsed_ms,
+            });
+            return Ok(result);
+        }
         let wf_json = serde_json::to_string(&plan).unwrap_or_default();
         let qc_started = std::time::Instant::now();
         let (qc_main, qc_usage) = self
