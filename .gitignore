@@ -17,6 +17,7 @@
 
 # tmpPlan(临时计划,不入库)
 tmpPlan/
+plans/
 
 # logs(AutoTestAndSaveReport 运行日志,不入库)
 /logs/
@@ -28,7 +29,8 @@ tmpPlan/
 .DS_Store
 
 # testReport:保留报告与脚本,仅忽略大体量原始产物
-/testReport/
+testReport/
+tests/
 
 # DebugReport(laew -debug 调试报告,自动落盘,不入库)
 DebugReport/
@@ -42,4 +44,3 @@ TestWorkSpace/
 # scripts(本地脚本目录;注意:mock_llm_server.py 为已跟踪文件,忽略规则仅对新增文件生效)
 /scripts/
 
-tests/mock_*.jsonl
