@@ -422,6 +422,77 @@ impl MacOsDriver {
         Self::trusted_quiet()
     }
 
+    /// 2026-09-16 第 62 轮:持续等待 macOS 辅助功能授权,带进度回调。
+    ///
+    /// 行为:
+    /// - `prompt=true` 时每 10s 主动触发系统授权弹窗(避免用户错过);
+    /// - 每 2s 静默轮询授权状态(不弹窗);
+    /// - 默认上限 120s(`LAEW_AX_WAIT_SECS` 环境变量可调,0 = 立即返回不等待);
+    /// - 授权成功后立即返回 `(true, waited_secs)`;
+    /// - 超时返回 `(false, waited_secs)`;
+    /// - `on_progress(secs, granted)` 回调用于上报到 TUI(可空)。
+    ///
+    /// 设计要点:
+    /// - 阻塞在 `inspect/act` 调用上时,TUI 阶段打印协程持续刷 spinner;
+    /// - 系统授权弹窗由 TCC 异步派发,本函数轮询时立即看到授权状态变化;
+    /// - 等待期间用户需在系统设置手动勾选终端 / 输入密码,函数自然阻塞。
+    pub fn is_ax_trusted_with_retry<F>(
+        prompt: bool,
+        max_wait_secs: u64,
+        mut on_progress: F,
+    ) -> (bool, u64)
+    where
+        F: FnMut(u64, bool),
+    {
+        let wait_secs = std::env::var("LAEW_AX_WAIT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(max_wait_secs);
+        if wait_secs == 0 {
+            let granted = Self::trusted_quiet();
+            on_progress(0, granted);
+            return (granted, 0);
+        }
+        // 首次检查
+        if Self::trusted_quiet() {
+            on_progress(0, true);
+            return (true, 0);
+        }
+        // 立即触发一次系统授权弹窗,缩短用户响应路径
+        if prompt {
+            unsafe {
+                let _ = Self::request_permission_internal();
+            }
+        }
+        let start = std::time::Instant::now();
+        let mut last_prompt_at = start;
+        loop {
+            let elapsed = start.elapsed().as_secs();
+            if elapsed >= wait_secs {
+                on_progress(elapsed, false);
+                return (false, elapsed);
+            }
+            if prompt && last_prompt_at.elapsed().as_secs() >= 10 {
+                unsafe {
+                    let _ = Self::request_permission_internal();
+                }
+                last_prompt_at = std::time::Instant::now();
+            }
+            // 每 2 秒静默轮询 + 进度回报
+            let poll_deadline = start + std::time::Duration::from_secs(elapsed + 2);
+            let now = std::time::Instant::now();
+            if poll_deadline > now {
+                std::thread::sleep(poll_deadline - now);
+            }
+            if Self::trusted_quiet() {
+                let waited = start.elapsed().as_secs();
+                on_progress(waited, true);
+                return (true, waited);
+            }
+            on_progress(start.elapsed().as_secs(), false);
+        }
+    }
+
     fn require_trusted(&self) -> Result<()> {
         // AX 常量走字面量缓存,与系统版本无关;仅在极端情况(内存不足导致 CFString
         // 创建失败)下 fail-closed,避免把空指针传进 AX 调用。
@@ -750,7 +821,26 @@ impl WindowDriver for MacOsDriver {
         max_depth: usize,
         filter: Option<&str>,
     ) -> Result<ControlNode> {
-        self.require_trusted()?;
+        // 2026-09-16 第 62 轮:未授权时持续等待用户完成系统设置 / 密码输入;
+        // 默认上限 120s(LAEW_AX_WAIT_SECS 环境变量可调,0 = 立即失败)。
+        let prompt = std::env::var("LAEW_AX_PROMPT")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        let (granted, waited) = Self::is_ax_trusted_with_retry(prompt, 120, |elapsed, granted| {
+            tracing::debug!(
+                elapsed_secs = elapsed,
+                granted = granted,
+                "WindowInspect 等待 macOS 辅助功能授权"
+            );
+        });
+        if !granted {
+            return Err(platform_err(
+                "macos",
+                format!(
+                    "辅助功能未授权;已等待 {waited}s。请到「系统设置→隐私与安全性→辅助功能」勾选当前终端后重试"
+                ),
+            ));
+        }
         let (pid, idx) = Self::parse_window_id(window_id)?;
         let max_depth = max_depth.clamp(1, 12);
         unsafe {
@@ -767,7 +857,25 @@ impl WindowDriver for MacOsDriver {
     }
 
     fn act(&self, window_id: &str, path: &str, action: ControlAction) -> Result<String> {
-        self.require_trusted()?;
+        // 2026-09-16 第 62 轮:同 inspect,未授权时持续等待。
+        let prompt = std::env::var("LAEW_AX_PROMPT")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        let (granted, waited) = Self::is_ax_trusted_with_retry(prompt, 120, |elapsed, granted| {
+            tracing::debug!(
+                elapsed_secs = elapsed,
+                granted = granted,
+                "WindowAction 等待 macOS 辅助功能授权"
+            );
+        });
+        if !granted {
+            return Err(platform_err(
+                "macos",
+                format!(
+                    "辅助功能未授权;已等待 {waited}s。请到「系统设置→隐私与安全性→辅助功能」勾选当前终端后重试"
+                ),
+            ));
+        }
         let (pid, idx) = Self::parse_window_id(window_id)?;
         unsafe {
             let win = Self::window_element(pid, idx)?;

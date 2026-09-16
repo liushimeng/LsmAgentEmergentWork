@@ -197,10 +197,55 @@ pub(crate) fn platform_err(platform: &str, msg: impl Into<String>) -> AgentError
     }
 }
 
-/// 子串过滤(大小写不敏感);`filter` 为空/None 时恒真。
+/// 2026-09-16 第 62 轮:Unicode 上标字母归一化,解决「赵玲玲ᴬᴵᴬ」vs
+/// 「赵玲玲ᴵᴵᴬ」这种混用 Unicode Modifier Letter 与 Latin Letter
+/// 块导致的匹配失败场景。仅归一化常用上标字母子集,不引入 NFKC
+/// 完整归一化以免破坏其他匹配场景。
+fn normalize_unicode_for_match(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let mapped = match c {
+            // Modifier Letter 块常用上标字母 → Latin 等价
+            '\u{1d2c}' => 'A',
+            '\u{1d2e}' => 'B',
+            '\u{1d30}' => 'D',
+            '\u{1d31}' => 'E',
+            '\u{1d33}' => 'G',
+            '\u{1d34}' => 'H',
+            '\u{1d35}' => 'I',
+            '\u{1d36}' => 'J',
+            '\u{1d37}' => 'K',
+            '\u{1d38}' => 'L',
+            '\u{1d39}' => 'M',
+            '\u{1d3a}' => 'N',
+            '\u{1d3c}' => 'O',
+            '\u{1d3e}' => 'P',
+            '\u{1d40}' => 'R',
+            '\u{1d41}' => 'T',
+            '\u{1d42}' => 'U',
+            '\u{1d43}' => 'W',
+            // 小写上标
+            '\u{1d62}' => 'i',
+            '\u{1d63}' => 'r',
+            '\u{1d64}' => 'u',
+            '\u{1d65}' => 'v',
+            '\u{1d66}' => 'x',
+            '\u{1d67}' => 'y',
+            _ => c,
+        };
+        out.push(mapped);
+    }
+    out
+}
+
+/// 子串过滤(大小写不敏感 + Unicode 上标字母归一化);`filter` 为空/None 时恒真。
 pub(crate) fn matches_filter(haystack: &str, filter: Option<&str>) -> bool {
     match filter.map(str::trim).filter(|f| !f.is_empty()) {
-        Some(f) => haystack.to_lowercase().contains(&f.to_lowercase()),
+        Some(f) => {
+            let h = normalize_unicode_for_match(haystack).to_lowercase();
+            let q = normalize_unicode_for_match(f).to_lowercase();
+            h.contains(&q)
+        }
         None => true,
     }
 }
@@ -310,6 +355,33 @@ mod tests {
         assert!(matches_filter("anything", None));
         assert!(matches_filter("anything", Some("  ")));
         assert!(!matches_filter("abc", Some("xyz")));
+    }
+
+    #[test]
+    fn matches_filter_normalizes_modifier_letters() {
+        // 2026-09-16 第 62 轮:Unicode Modifier Letter 归一化。
+        // 关键场景:haystack=赵玲玲ᴬᴵᴵᵢ → normalize → 赵玲玲AIIi
+        // filter=aii → 子串匹配 AIIi。
+        assert!(matches_filter(
+            "赵玲玲\u{1d2c}\u{1d35}\u{1d35}\u{1d62}",
+            Some("aii")
+        ));
+        // 反向:filter=ᴬᴵᴵᵢ → normalize → AIIi → lowercase → aiii,
+        // haystack 含 aii 子串。
+        assert!(matches_filter(
+            "张三aIIi",
+            Some("\u{1d2c}\u{1d35}\u{1d35}\u{1d62}")
+        ));
+        // 大写 filter 同样命中(整体 lowercase 比较)
+        assert!(matches_filter("AII", Some("aii")));
+        // 不归一化的字符保持原样
+        assert!(matches_filter("赵玲玲", Some("赵玲玲")));
+        assert!(!matches_filter("赵玲玲", Some("赵丽丽")));
+        // 极端 case:filter 跟 haystack 完全归一化后相等
+        assert!(matches_filter(
+            "\u{1d2c}\u{1d35}\u{1d35}",
+            Some("\u{1d2c}\u{1d35}\u{1d35}")
+        ));
     }
 
     #[test]

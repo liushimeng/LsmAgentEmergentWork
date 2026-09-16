@@ -278,7 +278,10 @@ impl TuiSession {
                             println!("  [stage] {line}{timing}");
                             let _ = std::io::stdout().flush();
                             last_stage_at = Some(std::time::Instant::now());
-                            current_stage = Some((line, std::time::Instant::now()));
+                            // 2026-09-16 第 62 轮:current_stage 只保留短标题,
+                            // 避免 waiting 心跳每 1s 把超长 stage 文本原地重写。
+                            // 超长详情走 [laew] 前缀立即冲刷,不进 waiting 流。
+                            current_stage = Some((short_stage_label(&line), std::time::Instant::now()));
                         }
                         // 阶段内 waiting 心跳:每 1s 重写一行(覆盖上一帧)。
                         // queue 非空(有待冲刷阶段)时绝不重写 —— 防止用旧
@@ -767,6 +770,49 @@ impl TuiSession {
             print!(": {}{more}", shown.join(", "));
         }
         println!();
+    }
+}
+
+/// 2026-09-16 第 62 轮:把 stage 文本压成短标题,waiting 心跳不再复读超长文本。
+/// - 长描述(单元详情 / QC 详情)走 `[laew]` 前缀立即冲刷,不进入 waiting 流;
+/// - 短标题(单元 ID + 执行者)进入 stage 流 + waiting 心跳,每 1s 原地重写时只刷新 spinner。
+fn short_stage_label(line: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let clean = line.replace(['\n', '\r'], " ");
+    if clean.chars().count() <= MAX_CHARS {
+        clean
+    } else {
+        clean
+            .chars()
+            .take(MAX_CHARS.saturating_sub(1))
+            .chain(['…'])
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_stage_label_truncates_long_input() {
+        let long = "wf-1.step WindowUse 执行中 | 职责: 微信通讯录查找用户并发送AI消息 | 期望: 微信进程存在且窗口可访问; 通讯录界面成功打开";
+        let label = short_stage_label(long);
+        assert!(label.chars().count() <= 60, "短标题应 ≤ 60 字符:{} 字符", label.chars().count());
+        assert!(label.ends_with('…'), "超长应加 …");
+    }
+
+    #[test]
+    fn short_stage_label_keeps_short_input_intact() {
+        let short = "Yolo 分类中";
+        let label = short_stage_label(short);
+        assert_eq!(label, short);
+    }
+
+    #[test]
+    fn short_stage_label_strips_newlines() {
+        let label = short_stage_label("a\nb\rc");
+        assert_eq!(label, "a b c");
     }
 }
 

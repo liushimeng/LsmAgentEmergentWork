@@ -46,18 +46,26 @@ fn emit_progress(tx: &Option<ProgressTx>, msg: impl Into<String>) {
 }
 
 /// 进阶段子用短文本,避免单条 stage 消息撑爆 TUI。
-fn truncate_progress_text(s: &str) -> String {
-    const MAX_CHARS: usize = 180;
+///
+/// 2026-09-16 第 62 轮新增可变长度参数:短标题 60 字符(waiting 心跳用)、
+/// 详细描述 180 字符(单元详情面板用),不再固定 180。
+fn truncate_progress_text(s: &str, max_chars: usize) -> String {
     let clean = s.replace(['\n', '\r'], " ");
-    if clean.chars().count() <= MAX_CHARS {
+    if clean.chars().count() <= max_chars {
         clean
     } else {
         clean
             .chars()
-            .take(MAX_CHARS.saturating_sub(1))
+            .take(max_chars.saturating_sub(1))
             .chain(['…'])
             .collect()
     }
+}
+
+/// 兼容旧调用:固定 180 字符上限。可选长度参数供 [laew] 详情面板
+/// 在工具调用明细等场景下调小(避免 TUI 一行过长)。
+fn truncate_progress_text_default(s: &str, max_chars: usize) -> String {
+    truncate_progress_text(s, max_chars)
 }
 
 /// Orchestrator 行为参数
@@ -1602,12 +1610,20 @@ async fn run_wf_unit(
         AgentRole::WebUse => "WebUse",
         _ => "SubAgent",
     };
+    // 2026-09-16 第 62 轮:拆分 stage 短标题 / 详情面板。
+    // 短标题(≤80 字符)进入 TUI stage 流 + waiting 心跳,避免每 1s
+    // 原地重写整段超长文本;详情面板走 [laew] 前缀,立即冲刷、不进
+    // waiting 心跳,任务快速完成时也保留。
+    emit_progress(
+        &progress,
+        format!("{wf_id} {exec_label} 执行中"),
+    );
     emit_progress(
         &progress,
         format!(
-            "{wf_id} {exec_label} 执行中 | 职责: {} | 期望: {}",
-            truncate_progress_text(&input.description),
-            truncate_progress_text(&input.expected_output)
+            "[laew] {wf_id} {exec_label} 详情 | 职责: {} | 期望: {}",
+            truncate_progress_text(&input.description, 80),
+            truncate_progress_text(&input.expected_output, 80)
         ),
     );
     // 2026-09-16 第 57 轮:SubAgent/WindowUse 墙钟计时 ——
@@ -1638,18 +1654,72 @@ async fn run_wf_unit(
         )
     })?;
     let wallclock_ms = sub_started.elapsed().as_millis() as u64;
-    emit_progress(
-        &progress,
-        format!(
-            "{wf_id} {exec_label} 完成 | 执行 {:.1}s | iter={} tools={}({}成功/{}失败) early_term={}",
-            wallclock_ms as f64 / 1000.0,
-            outcome.trace.iterations,
-            outcome.trace.tool_calls,
-            outcome.trace.tool_calls_ok,
-            outcome.trace.tool_calls_err,
-            outcome.trace.early_terminated
-        ),
+    // 2026-09-16 第 62 轮:单元结束走 [laew] 详情面板 + 短标题 stage。
+    // 详情面板显示 iter / tools / early_term / 错误摘要,即使 LLM 没调
+    // 工具也立即可见,避免用户看到「卡住 100 秒没动作」。
+    let summary_line = format!(
+        "{wf_id} {exec_label} 完成 | {:.1}s",
+        wallclock_ms as f64 / 1000.0
     );
+    emit_progress(&progress, summary_line);
+    let detail_summary = format!(
+        "[laew] {wf_id} {exec_label} 执行证据 | iter={} tools={}({}成功/{}失败) early_term={} reason={}",
+        outcome.trace.iterations,
+        outcome.trace.tool_calls,
+        outcome.trace.tool_calls_ok,
+        outcome.trace.tool_calls_err,
+        outcome.trace.early_terminated,
+        if outcome.trace.early_terminate_reason.is_empty() {
+            "<none>".to_string()
+        } else {
+            truncate_progress_text_default(&outcome.trace.early_terminate_reason, 180)
+        }
+    );
+    emit_progress(&progress, detail_summary);
+    // 2026-09-16 第 62 轮:工具调用明细(最近 5 条)走 [laew] 详情面板,
+    // 让 TUI 用户一眼看到「窗口操控到底调了哪些工具、参数是什么、为什么失败」。
+    // 字段:tool name | status | elapsed_ms | args 摘要 | error 摘要。
+    let tool_log = &outcome.trace.tool_call_log;
+    if !tool_log.is_empty() {
+        let recent: Vec<String> = tool_log
+            .iter()
+            .rev()
+            .take(5)
+            .rev()
+            .map(|entry| {
+                let status = if entry.ok { "✓" } else { "✗" };
+                let err_part = if entry.error_summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(" err={}", truncate_progress_text_default(&entry.error_summary, 40))
+                };
+                format!(
+                    "{}{} ({}ms){}",
+                    status,
+                    entry.tool,
+                    entry.elapsed_ms,
+                    err_part
+                )
+            })
+            .collect();
+        emit_progress(
+            &progress,
+            format!(
+                "[laew] {wf_id} {exec_label} 工具调用(最近 {} 条): {}",
+                recent.len(),
+                recent.join(" | ")
+            ),
+        );
+    }
+    if !outcome.trace.failure_signals.is_empty() {
+        emit_progress(
+            &progress,
+            format!(
+                "[laew] {wf_id} {exec_label} 失败信号: {}",
+                truncate_progress_text_default(&outcome.trace.failure_signals.join(","), 180)
+            ),
+        );
+    }
 
     // 2026-09-16 第 57 轮:QC LLM 调用单独计时。
     let qc_started = std::time::Instant::now();
@@ -1684,19 +1754,24 @@ async fn run_wf_unit(
     );
 
     if qc.verdict == Verdict::Fail {
+        // 2026-09-16 第 62 轮:QC 失败详情走 [laew] 立即冲刷,即使任务快速
+        // 完成也保留 issues / suggestion,便于用户/QC 后续定位。
         if !qc.issues.is_empty() {
             emit_progress(
                 &progress,
                 format!(
-                    "{wf_id} QC问题: {}",
-                    truncate_progress_text(&qc.issues.join(" | "))
+                    "[laew] {wf_id} QC问题: {}",
+                    truncate_progress_text_default(&qc.issues.join(" | "), 180)
                 ),
             );
         }
         if !qc.suggestion.is_empty() {
             emit_progress(
                 &progress,
-                format!("{wf_id} QC建议: {}", truncate_progress_text(&qc.suggestion)),
+                format!(
+                    "[laew] {wf_id} QC建议: {}",
+                    truncate_progress_text_default(&qc.suggestion, 180)
+                ),
             );
         }
         return Err(QualityFailure {
