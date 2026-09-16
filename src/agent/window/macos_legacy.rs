@@ -299,6 +299,11 @@ impl MacOsDriver {
         Self
     }
 
+    /// 是否已获无障碍授权(不弹窗)。
+    fn trusted_quiet() -> bool {
+        unsafe { AXIsProcessTrustedWithOptions(std::ptr::null()) != 0 }
+    }
+
     /// 是否已获无障碍授权。`LAEW_AX_PROMPT=1` 时允许触发系统授权弹窗。
     fn trusted() -> bool {
         let prompt = std::env::var("LAEW_AX_PROMPT")
@@ -306,29 +311,57 @@ impl MacOsDriver {
             .unwrap_or(false);
         unsafe {
             if prompt {
-                // {kAXTrustedCheckOptionPrompt: true}
-                let key = kAXTrustedCheckOptionPrompt();
-                let val: CFBooleanRef =
-                    core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
-                let keys = [key as CFTypeRef];
-                let vals = [val as CFTypeRef];
-                let dict = core_foundation::dictionary::CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_ptr() as *const *const std::ffi::c_void,
-                    vals.as_ptr() as *const *const std::ffi::c_void,
-                    1,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                );
-                let ok = AXIsProcessTrustedWithOptions(dict);
-                if !dict.is_null() {
-                    CFRelease(dict.cast());
-                }
-                ok != 0
+                Self::request_permission_internal()
             } else {
-                AXIsProcessTrustedWithOptions(std::ptr::null()) != 0
+                Self::trusted_quiet()
             }
         }
+    }
+
+    /// 2026-09-16 第 60 轮:主动触发系统授权弹窗,返回用户是否已授权。
+    ///
+    /// 内部实现:调用 `AXIsProcessTrustedWithOptions` 并传入
+    /// `{kAXTrustedCheckOptionPrompt: true}`,系统会弹出授权对话框。
+    /// 用户点击「打开系统设置」后可手动添加终端到辅助功能白名单。
+    ///
+    /// 返回值:
+    /// - `true`:用户已授权(弹窗前已授权,或弹窗后用户授权)
+    /// - `false`:用户未授权(拒绝、忽略、或弹窗后仍未授权)
+    unsafe fn request_permission_internal() -> bool {
+        let key = kAXTrustedCheckOptionPrompt();
+        let val: CFBooleanRef =
+            core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
+        let keys = [key as CFTypeRef];
+        let vals = [val as CFTypeRef];
+        let dict = core_foundation::dictionary::CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr() as *const *const std::ffi::c_void,
+            vals.as_ptr() as *const *const std::ffi::c_void,
+            1,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        let ok = AXIsProcessTrustedWithOptions(dict);
+        if !dict.is_null() {
+            CFRelease(dict.cast());
+        }
+        ok != 0
+    }
+
+    /// 公开接口:主动请求辅助功能授权(触发系统弹窗)。
+    ///
+    /// 2026-09-16 第 60 轮:供 `driver_preflight` 在检测到未授权时调用,
+    /// 让 LLM 在首次使用 WindowInspect/WindowAction 时自动触发授权流程。
+    pub fn request_permission() -> bool {
+        unsafe { Self::request_permission_internal() }
+    }
+
+    /// 公开接口:静默检查辅助功能授权状态(不弹窗)。
+    ///
+    /// 2026-09-16 第 60 轮:供 `try_request_ax_permission` 在弹窗前检查,
+    /// 避免重复弹窗干扰用户。
+    pub fn is_trusted() -> bool {
+        Self::trusted_quiet()
     }
 
     fn require_trusted(&self) -> Result<()> {
@@ -340,7 +373,7 @@ impl MacOsDriver {
                 "AX 属性名常量初始化失败(CFString 创建返回空,通常为内存不足),请重试",
             ));
         }
-        if Self::trusted() {
+        if Self::trusted_quiet() {
             Ok(())
         } else {
             Err(platform_err("macos", MACOS_AX_UNAVAILABLE_HINT))

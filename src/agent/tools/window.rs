@@ -90,8 +90,85 @@ fn tree_to_json(mut root: ControlNode) -> String {
     s
 }
 
-/// 驱动不可用/缺权限时的前置检查:有 permission_hint 时优先返回引导文案。
+/// 驱动不可用/缺权限时的前置检查。
+///
+/// 2026-09-16 第 60 轮:macOS 上未授权时自动触发系统授权弹窗。
+/// 首次调用 WindowInspect/WindowAction 时,如果辅助功能未授权,
+/// 主动调用 `AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: true})`
+/// 触发系统弹窗,引导用户授权。
 fn driver_preflight(tool: &str) -> Result<()> {
+    let driver = current_driver();
+    if let Some(hint) = driver.permission_hint() {
+        // macOS 未授权:尝试自动触发授权弹窗(第 60 轮新增)
+        #[cfg(target_os = "macos")]
+        {
+            if hint.contains("辅助功能未授权") {
+                return match try_request_ax_permission() {
+                    AxPermissionResult::Granted => Ok(()), // 授权成功,继续执行
+                    AxPermissionResult::Denied { message } => {
+                        // 授权失败/用户拒绝,返回带引导的提示
+                        Err(tool_err(tool, message))
+                    }
+                };
+            }
+        }
+        // 其他平台或 AX 常量初始化失败:返回原提示
+        return Err(tool_err(tool, hint));
+    }
+    Ok(())
+}
+
+/// macOS 辅助功能授权请求结果。
+#[cfg(target_os = "macos")]
+enum AxPermissionResult {
+    /// 授权成功(用户已授权或弹窗后授权)。
+    Granted,
+    /// 授权失败/用户拒绝。
+    Denied { message: String },
+}
+
+/// 2026-09-16 第 60 轮:尝试请求 macOS 辅助功能授权。
+///
+/// 触发系统授权弹窗,等待用户响应后返回结果。
+/// - 用户已授权(弹窗前) → Granted
+/// - 弹窗后用户授权 → Granted
+/// - 用户拒绝/忽略/超时 → Denied(带引导文案)
+#[cfg(target_os = "macos")]
+fn try_request_ax_permission() -> AxPermissionResult {
+    use crate::agent::window::MacOsDriver;
+
+    // 先检查是否已授权(避免重复弹窗)
+    if MacOsDriver::is_trusted() {
+        return AxPermissionResult::Granted;
+    }
+
+    // 触发系统授权弹窗
+    let granted = MacOsDriver::request_permission();
+
+    if granted {
+        AxPermissionResult::Granted
+    } else {
+        // 授权失败,返回带手动授权引导的文案
+        let message = format!(
+            "辅助功能授权请求已弹出,但未获得授权。\n\
+             请按以下步骤手动授权:\n\
+             1. 系统设置 → 隐私与安全性 → 辅助功能\n\
+             2. 点击左下角锁图标解锁\n\
+             3. 添加并勾选运行 laew 的终端应用(Terminal/iTerm2/VS Code)\n\
+             4. 完全退出终端后重新打开(TCC 按进程启动时快照生效)\n\
+             授权完成后重试 WindowInspect/WindowAction。\n\
+             临时降级方案(无需授权):\n\
+             - 用 Bash + osascript 操作 GUI(activate/keystroke/click)\n\
+             - 用 Bash + cliclick c:x,y 坐标点击\n\
+             - 用 Bash + screencapture -x 截图\n\
+             - WindowList 走 CoreGraphics 不需授权,可枚举窗口"
+        );
+        AxPermissionResult::Denied { message }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn driver_preflight_non_macos(tool: &str) -> Result<()> {
     let driver = current_driver();
     if let Some(hint) = driver.permission_hint() {
         return Err(tool_err(tool, hint));
@@ -913,6 +990,54 @@ mod tests {
         if cfg!(not(any(target_os = "macos", windows))) {
             let cmd = default_screenshot_command("/tmp/x.png", None);
             assert!(!cmd.is_empty());
+        }
+    }
+
+    // ========== 2026-09-16 第 60 轮:macOS 辅助功能权限请求测试 ==========
+
+    /// 测试 AxPermissionResult 枚举的创建和匹配。
+    #[test]
+    fn ax_permission_result_granted() {
+        let result = AxPermissionResult::Granted;
+        match result {
+            AxPermissionResult::Granted => {} // 正确
+            _ => panic!("应为 Granted"),
+        }
+    }
+
+    #[test]
+    fn ax_permission_result_denied() {
+        let msg = "测试拒绝消息".to_string();
+        let result = AxPermissionResult::Denied {
+            message: msg.clone(),
+        };
+        match result {
+            AxPermissionResult::Denied { message } => {
+                assert_eq!(message, msg);
+            }
+            _ => panic!("应为 Denied"),
+        }
+    }
+
+    /// 测试 driver_preflight 在 macOS 上的权限请求行为。
+    /// 注意:此测试仅在 macOS 上运行,且会触发系统权限弹窗(如果未授权)。
+    /// 为避免干扰正常测试流程,使用 #[ignore] 标记,需要时手动运行:
+    ///   cargo test --lib -- --ignored
+    #[test]
+    #[ignore = "会触发系统权限弹窗,需手动运行"]
+    fn driver_preflight_requests_ax_permission_on_macos() {
+        if cfg!(target_os = "macos") {
+            // 调用 driver_preflight,如果未授权应触发弹窗
+            let result = driver_preflight("TestTool");
+            // 结果取决于用户是否授权:
+            // - 已授权 → Ok(())
+            // - 未授权但用户弹窗后授权 → Ok(())
+            // - 未授权且用户拒绝 → Err(...)
+            // 不断言具体结果,只确保不 panic
+            match result {
+                Ok(()) => println!("权限已授权"),
+                Err(e) => println!("权限请求结果: {e}"),
+            }
         }
     }
 }

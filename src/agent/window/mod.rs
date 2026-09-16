@@ -27,6 +27,10 @@ use macos_axui::MacosAxuiDriver as DefaultMacosDriver;
 mod macos_legacy;
 #[cfg(target_os = "macos")]
 use macos_legacy::MacOsDriver as LegacyMacosDriver;
+
+// 2026-09-16 第 60 轮:公开 macOS 辅助功能权限相关接口,供 tools/window.rs 调用
+#[cfg(target_os = "macos")]
+pub use macos_legacy::MacOsDriver;
 #[cfg(windows)]
 mod windows;
 
