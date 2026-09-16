@@ -207,6 +207,198 @@ where
     Ok(role)
 }
 
+// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B) ==========
+//
+// 2026-09-16 第 54 轮:实测「打开微信发消息」任务 Main-Work 把含 osascript 步骤的工作流
+// delegate_to=windowuse,但 WindowUse 没有 Bash 工具,导致 SubAgent 循环无法执行命令 →
+// 任务空转失败。修复:解析 WorkFlowPlan 后,基于步骤文本 + branches 文本 + 验收文本
+// 的关键词匹配,自动纠正 delegate_to。
+//   - 命中 shell 命令关键词(osascript / screencapture / cliclick / pbcopy / System Events /
+//     坐标点击 / keystroke 等) → SubAgent(WindowUse 没有 Bash 工具,即便有也是白名单)
+//   - 命中 GUI 控件关键词(WindowList / WindowInspect / WindowAction / 点击按钮 /
+//     控件树 / 枚举窗口) → WindowUse
+//   - 都命中 / 都没命中 → 保持 Main-Work 显式选择(不强行覆盖)
+// 纯字符串匹配,无新依赖;纠正日志写到 tracing::info!,QC 报告可观察到。
+
+const SUBAGENT_KEYWORDS: &[&str] = &[
+    "osascript",
+    "applescript",
+    "screencapture",
+    "cliclick",
+    "pbcopy",
+    "pbpaste",
+    "system events",
+    "keystroke",
+    "坐标点击",
+    "剪贴板",
+    "sendinput",
+    "uiautomation",
+    "powershell",
+    "xdotool",
+    "wmctrl",
+    "adb shell",
+    "sendevent",
+    "input keyevent",
+    "input tap",
+    "adb ",
+    "shell",
+];
+
+const WINDOW_USE_KEYWORDS: &[&str] = &[
+    "windowlist",
+    "windowinspect",
+    "windowaction",
+    "控件树",
+    "枚举窗口",
+    "ui automation",
+    "axpress",
+    "set_text",
+    "控件路径",
+    "无障碍",
+    "ui automation",
+    "invoke pattern",
+];
+
+fn text_contains_any_ci(text: &str, keywords: &[&str]) -> bool {
+    let lower = text.to_lowercase();
+    keywords.iter().any(|k| lower.contains(k))
+}
+
+fn gather_spec_text(spec: &WorkFlowSpec) -> String {
+    let mut s = String::new();
+    s.push_str(&spec.name);
+    s.push('\n');
+    for st in &spec.steps {
+        s.push_str(st);
+        s.push('\n');
+    }
+    for b in &spec.branches {
+        s.push_str(&b.condition);
+        s.push('\n');
+        s.push_str(&b.then);
+        s.push('\n');
+    }
+    for l in &spec.loops {
+        s.push_str(&l.condition);
+        s.push('\n');
+        s.push_str(&l.over);
+        s.push('\n');
+    }
+    for a in &spec.acceptance {
+        s.push_str(a);
+        s.push('\n');
+    }
+    s
+}
+
+/// 基于步骤文本推断 delegate_to(返回 None 表示不强行纠正,保留原值)。
+pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
+    let text = gather_spec_text(spec);
+    let shell_hit = text_contains_any_ci(&text, SUBAGENT_KEYWORDS);
+    let gui_hit = text_contains_any_ci(&text, WINDOW_USE_KEYWORDS);
+    match (shell_hit, gui_hit) {
+        // shell 命令占主导 → 必须 SubAgent(WindowUse 没有 Bash / 只有白名单)
+        (true, false) => Some(AgentRole::SubAgent),
+        // GUI 控件占主导 → WindowUse
+        (false, true) => Some(AgentRole::WindowUse),
+        // 都命中 → shell 优先(更通用的工具集,且 WindowUse 已扩 Bash 白名单兜底)
+        (true, true) => Some(AgentRole::SubAgent),
+        // 都没命中 → 保持原样
+        (false, false) => None,
+    }
+}
+
+/// 对整份 plan 做 delegate_to 推断 + 纠正 + 日志。
+pub fn infer_delegate_to_for_plan(plan: &mut WorkFlowPlan) {
+    for wf in plan.workflows.iter_mut() {
+        if let Some(inferred) = infer_delegate_to(wf) {
+            if inferred != wf.delegate_to {
+                tracing::info!(
+                    wf_id = %wf.id,
+                    from = %wf.delegate_to.as_str(),
+                    to = %inferred.as_str(),
+                    "[2026-09-16 B] delegate_to 已自动纠正(基于步骤关键词推断)"
+                );
+                wf.delegate_to = inferred;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod infer_tests {
+    use super::*;
+
+    #[test]
+    fn shell_steps_route_to_subagent() {
+        let spec = WorkFlowSpec {
+            id: "wf-1".into(),
+            name: "启动微信".into(),
+            steps: vec![
+                "执行 osascript -e 'tell application \"WeChat\" to activate'".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::WindowUse, // 显式选错
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
+    }
+
+    #[test]
+    fn gui_steps_route_to_windowuse() {
+        let spec = WorkFlowSpec {
+            id: "wf-2".into(),
+            name: "枚举窗口".into(),
+            steps: vec![
+                "调用 WindowList 找目标窗口".into(),
+                "调用 WindowInspect 遍历控件树".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec!["找到目标窗口 id".into()],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WindowUse));
+    }
+
+    #[test]
+    fn no_keyword_keeps_explicit_choice() {
+        let spec = WorkFlowSpec {
+            id: "wf-3".into(),
+            name: "通用操作".into(),
+            steps: vec!["读取项目根目录结构".into()],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), None);
+    }
+
+    #[test]
+    fn both_keywords_pick_subagent() {
+        // 混合型:osascript + 控件关键词 → 优先 SubAgent(通用工具集更稳妥)
+        let spec = WorkFlowSpec {
+            id: "wf-mix".into(),
+            name: "混合".into(),
+            steps: vec![
+                "osascript -e 'tell application \"WeChat\" to activate'".into(),
+                "WindowInspect 检视".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
+    }
+}
+
 /// Main-Work 执行器。
 pub struct MainWorkRunner {
     agent: Agent,
@@ -408,12 +600,16 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         let mut plan = crate::agent::json_repair::try_parse_lenient(json_str)
             .map_err(AgentError::WorkflowParse)?;
         dedup_workflow_ids(&mut plan);
+        // 2026-09-16 第 54 轮补丁 B:基于步骤关键词自动纠正 delegate_to
+        // (解决 osascript 步骤被错委派到 WindowUse 的问题)
+        infer_delegate_to_for_plan(&mut plan);
         return Ok(plan);
     }
     if let Some(json_str) = extract_standalone_json(text) {
         let mut plan = crate::agent::json_repair::try_parse_lenient(json_str)
             .map_err(AgentError::WorkflowParse)?;
         dedup_workflow_ids(&mut plan);
+        infer_delegate_to_for_plan(&mut plan);
         return Ok(plan);
     }
     Err(AgentError::WorkflowParse(

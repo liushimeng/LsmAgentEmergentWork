@@ -1064,12 +1064,80 @@ impl MultiAgentOrchestrator {
         Ok((c, usage))
     }
 
+    /// 平台级 fallback 提示(2026-09-16 第 54 轮补丁 E)。
+    ///
+    /// 当 WindowUse 单元失败时,在失败原因中追加「当前平台 WindowUse 工具可用性 +
+    /// 推荐替代路径」,让 Yolo 重新评估时拿到完整上下文,避免反复在死路上重试。
+    /// 返回值限制 200 字符以内,避免撑爆 token。
+    fn platform_fallback_hint(&self, failure: &QualityFailure) -> String {
+        // 仅当失败来源与 WindowUse 相关时才追加(其它场景避免噪声)
+        let is_windowuse_related = matches!(
+            failure.source,
+            AgentRole::WindowUse | AgentRole::MainWork
+        );
+        if !is_windowuse_related {
+            return String::new();
+        }
+        // 探测当前平台 WindowUse 工具可用性
+        #[cfg(target_os = "macos")]
+        {
+            // 通过权限 hint 间接判断(无法直接访问 macos.rs 的 ax_strings_loaded,
+            // 但 permission_hint 在 AX 不可用时返回 MACOS_AX_UNAVAILABLE_HINT,
+            // 含"osascript"关键词 → 用该关键词作为信号)
+            let driver = crate::agent::window::current_driver();
+            if let Some(hint) = driver.permission_hint() {
+                if hint.contains("Bash + osascript") || hint.contains("WindowInspect/WindowAction") {
+                    return "[platform-fallback] 当前平台 macOS 26+ AX C API 不可用,WindowInspect/WindowAction 已废。建议:含 osascript/screencapture/cliclick/System Events/keystroke 的步骤 delegate_to=subagent(WindowUse Bash 已扩白名单);控件点击类保持 windowuse,WindowList 仍可用(CoreGraphics 路径)。".to_string();
+                }
+            }
+            String::new()
+        }
+        #[cfg(windows)]
+        {
+            // Windows:若 WindowUse 失败,建议改 PowerShell + UI Automation
+            let hint = std::env::var("LAEW_WINDOWS_UIA_FALLBACK")
+                .ok()
+                .filter(|v| !v.is_empty());
+            if let Some(_) = hint {
+                return "[platform-fallback] Windows UIA 不可用,建议改 PowerShell + System.Windows.Automation 路径。".to_string();
+            }
+            String::new()
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            // Linux:无 GUI 自动化时建议改 xdotool / wmctrl 完整命令模板
+            let driver = crate::agent::window::current_driver();
+            if driver.permission_hint().is_some() {
+                return "[platform-fallback] 当前 Linux 平台 WindowUse 仅支持 wmctrl/xdotool 尽力而为,控件级操作常失败。建议:delegate_to=subagent 用 Bash 直接调 xdotool/wmctrl 命令模板。".to_string();
+            }
+            String::new()
+        }
+    }
+
     async fn run_yolo_with_failure(
         &self,
         prev: &TaskClassification,
         failure: &QualityFailure,
         session: &mut Session,
     ) -> Result<TaskClassification> {
+        // 2026-09-16 第 54 轮补丁 E:在失败原因末尾追加平台级 fallback 提示
+        // (限制 200 字符以内,避免撑爆 token)
+        let platform_hint = self.platform_fallback_hint(failure);
+        let reason_with_hint = if platform_hint.is_empty() {
+            failure.reason.clone()
+        } else {
+            // 截断原 reason,防止总长度超限
+            const MAX_REASON_CHARS: usize = 400;
+            let truncated_reason: String = failure.reason.chars().take(MAX_REASON_CHARS).collect();
+            if truncated_reason.chars().count() == MAX_REASON_CHARS {
+                format!("{truncated_reason}…
+{platform_hint}")
+            } else {
+                format!("{truncated_reason}
+{platform_hint}")
+            }
+        };
+
         // 构造失败摘要消息,让 Yolo 重新评估。
         // 2026-09-09 第 05 轮:把 ExecutionTrace 的 failure_signals 也带上,
         // 让 Yolo 看到具体失败模式而非仅凭自由文本判定。
@@ -1083,7 +1151,7 @@ impl MultiAgentOrchestrator {
             failure.source.as_str(),
             prev.task_level.as_str(),
             prev.goal_summary,
-            failure.reason,
+            reason_with_hint,
             failure_signals,
             failure.suggestion,
         );

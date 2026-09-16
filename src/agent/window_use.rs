@@ -87,6 +87,12 @@ impl WindowUseRunner {
         session_id: &str,
         cancel: Option<&CancelToken>,
     ) -> Result<SubFlowOutcome> {
+        // ★0) 2026-09-16 第 54 轮补丁 A:切换 Bash 工具到 WindowUse 白名单模式。
+        //    (在 BashTool.execute 内 check_window_use_bash 检查 LAEW_WINDOW_USE_MODE 环境变量)
+        //    Drop guard 保证函数返回时(无论 Ok / Err / early-return)自动清除,
+        //    避免污染后续 SubAgent 的 Bash 调用。
+        let _wu_mode_guard = WindowUseBashModeGuard::enter();
+
         // ★1) 加载窗口会话状态(跨轮持久化,首次为空)。
         let mut win_state = self.state_mgr.load(session_id).await.unwrap_or_else(|| {
             let mut s = WindowSessionState::new(session_id);
@@ -204,8 +210,49 @@ impl WindowUseRunner {
     }
 }
 
+// ============== WindowUse Bash 模式 Guard(2026-09-16 第 54 轮补丁 A) ==============
+//
+// 在 WindowUseRunner::run_unit_inner 入口临时设置 LAEW_WINDOW_USE_MODE=1,
+// 函数返回时通过 Drop 自动清除,避免污染其它 Agent 的 Bash 调用。
+//
+// 设计要点:
+// - Drop 顺序:栈展开时 guard 后入先出,设置时压栈,清除时弹栈,严格嵌套;
+// - 跨 await 边界:BashTool.execute 是异步调用,但环境变量是进程全局,
+//   设置后整个进程内所有后续 Bash 调用都受 guard 影响;guard 在
+//   run_unit_inner 返回(Ok / Err / panic unwind)时自动清除;
+// - panic 安全:即使 WindowUse Runner panic,Drop 仍会触发(env::remove_var)。
+
+struct WindowUseBashModeGuard {
+    prev: Option<String>,
+}
+
+impl WindowUseBashModeGuard {
+    fn enter() -> Self {
+        let prev = std::env::var(crate::agent::tools::bash::WINDOW_USE_MODE_ENV).ok();
+        // SAFETY:进程级环境变量写,主流程内对 LAEW_WINDOW_USE_MODE 的所有读写
+        // 都通过 check_window_use_bash 集中,无并发竞争(单进程单线程 tokio 模型)。
+        unsafe {
+            std::env::set_var(crate::agent::tools::bash::WINDOW_USE_MODE_ENV, "1");
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for WindowUseBashModeGuard {
+    fn drop(&mut self) {
+        // SAFETY:同上,集中串行访问。
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(crate::agent::tools::bash::WINDOW_USE_MODE_ENV, v),
+                None => std::env::remove_var(crate::agent::tools::bash::WINDOW_USE_MODE_ENV),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::agent::profile::WINDOW_USE_AGENT_NAME;
     use crate::agent::AgentProfile;
 
@@ -218,9 +265,49 @@ mod tests {
         assert!(names.contains(&"WindowList".to_string()));
         assert!(names.contains(&"WindowInspect".to_string()));
         assert!(names.contains(&"WindowAction".to_string()));
-        // 执行层窗口单元不带 Bash/Write(窗口操控不需要 shell / 文件写)
-        assert!(!names.contains(&"Bash".to_string()));
+        // 2026-09-16 第 54 轮补丁 A:WindowUse 工具集扩 Bash(白名单模式)
+        // - 用于 macOS 26 上 AX C API 不可用时改走 osascript / cliclick / screencapture 路径
+        assert!(names.contains(&"Bash".to_string()));
+        // WindowUse 不带 Write(写文件不属于窗口操控范围)
         assert!(!names.contains(&"Write".to_string()));
         assert!(p.emit_tool.is_none());
+    }
+
+    #[test]
+    fn window_use_bash_mode_env_and_guard_combined() {
+        // 2026-09-16 第 54 轮补丁 A:WindowUse Bash 白名单 + Drop guard 语义
+        // 合并为单测试顺序执行:LAEW_WINDOW_USE_MODE 是进程级 env,
+        // 与 cargo test 并行执行的其它 env 敏感测试(utf8_env 等)互相竞态,
+        // 这里用独立 mutex 串行化。
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crate::agent::tools::bash::{window_use_mode, WINDOW_USE_MODE_ENV};
+
+        // (a) 默认未设置 → 模式关闭
+        unsafe {
+            std::env::remove_var(WINDOW_USE_MODE_ENV);
+        }
+        assert!(!window_use_mode());
+
+        // (b) 设置 "1" → 模式打开
+        unsafe {
+            std::env::set_var(WINDOW_USE_MODE_ENV, "1");
+        }
+        assert!(window_use_mode());
+
+        // (c) Drop guard 测试:进入 WindowUse 模式后,Drop 自动还原原值
+        unsafe {
+            std::env::set_var(WINDOW_USE_MODE_ENV, "0");
+        }
+        assert!(!window_use_mode());
+        {
+            let _g = WindowUseBashModeGuard::enter();
+            assert!(window_use_mode());
+        }
+        // Drop 后还原为 "0"
+        assert!(!window_use_mode());
+        unsafe {
+            std::env::remove_var(WINDOW_USE_MODE_ENV);
+        }
     }
 }

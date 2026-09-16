@@ -802,6 +802,31 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
    不要重复完全相同的失败调用。
 
 完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
+
+
+桌面应用通用操控模板(2026-09-16 第 54 轮补丁 C,适配 macOS 26 AX C API 不可用):
+- 启动 / 激活应用: osascript -e 'tell application "WeChat" to activate'
+- 检测应用是否运行: osascript -e 'tell application "System Events" to (name of processes) contains "WeChat"'
+- 键盘输入(中文需走剪贴板): osascript -e 'tell application "System Events" to keystroke "..."'
+- 剪贴板写入: echo -n "消息内容" | pbcopy
+- 剪贴板读取: pbpaste
+- 坐标点击: cliclick c:x,y(需 brew install cliclick;回退用 osascript click at {x, y})
+- 截图识别: screencapture -x /tmp/x.png(本轮先文本提示,后续接 OCR)
+- 焦点 / 激活窗口: osascript -e 'tell application "WeChat" to activate'
+
+平台适配策略:
+- macOS 26+: AX C API(kAX*Attribute)已从 ApplicationServices.framework 移除,WindowInspect/WindowAction
+  全部失败。优先用 Bash + osascript + System Events 路径,本构建 WindowUse Agent 已扩 Bash 白名单。
+- Windows: UI Automation 可用,优先 WindowList/Inspect/Action;权限不足时回退 PowerShell + SendInput。
+- Linux: wmctrl/xdotool 尽力而为,控件级操作常失败。
+
+绝对禁止:
+- 不要假设「Cmd+C 复制最近一条消息」「Cmd+Shift+M 截图」之类的快捷键 —— 微信没有这些;
+  直接用剪贴板(pbcopy/pbpaste)+ osascript System Events 是最稳的路径。
+- 不要编造应用不存在的快捷键;对不确定的操作,先 WindowList 列出可见窗口,确认应用是否启动;
+  未启动先 tell application "X" to activate,等 1-2 秒,再走剪贴板 + 键盘事件。
+- 涉及发送类按钮(微信的「发送」/ 邮件的「发送」/ 支付的「确认」)若没有 100% 把握,先截图
+  + 读屏幕文字确认再点击,避免误触。
 "#;
 
 fn window_use_tools_hint() -> &'static str {

@@ -89,22 +89,39 @@ extern "C" {
 
 const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
 
-// ===================== AX 字符串常量懒加载(macOS 26 兼容) =====================
+// ===================== AX 字符串常量(字面量缓存,macOS 全版本通用) =====================
 //
-// 2026-09-15 实测:macOS 26.5(Darwin 25.5,Tahoe)已将 `kAX*Attribute` / `kAX*Action`
-// 字符串常量从 `ApplicationServices.framework` 的 C ABI 中移除(dlsym 返回 NULL),
-// 整个 `HIServices.framework` 二进制亦不复存在。`AX*` 函数(`AXIsProcessTrustedWithOptions`
-// / `AXUIElementCreateApplication` 等)仍可解析,但已不保证向后兼容。
-// 处理:把所有 `kAX*` 常量改走 `libc::dlsym` 运行时查找,启动期一次性懒加载;
-// 缺失时 `MacOsDriver` 整体 fail-closed,Windows UIA 主路径不受影响。
-// 字段用 `usize` 存指针数值,确保 `AxStrings: Send + Sync` 才能装进 `OnceLock` 当 static;
+// 2026-09-16 第 55 轮修正 —— 推翻此前「macOS 26 移除了 AX C API」的错误结论。
+// 旧实现用 `dlsym("kAXChildrenAttribute")` 运行时取常量,实测在 macOS 26.5 返回 NULL,
+// 于是 `ax_strings_loaded()` 恒为 false → `require_trusted()` 无条件 fail-closed,
+// WindowInspect / WindowAction 在 macOS 上**整体不可用**(只有走 CoreGraphics 的
+// WindowList 幸免);该错误结论还被写进系统提示词与 orchestrator 的 fallback 提示,
+// 反过来把 LLM 主动引离本来可用的工具。
+//
+// 探针实测(C 程序 clang 链接 ApplicationServices;对照 CommandLineTools SDK 头文件
+// `HIServices.framework/Headers/AXAttributeConstants.h`)证明:
+//   1. `kAX*Attribute` / `kAX*Action` 在现代 SDK 里是**编译期字面量**
+//      (`#define kAXChildrenAttribute CFSTR("AXChildren")`),从来不是导出符号 ——
+//      dlsym 返回 NULL 与 macOS 版本无关,任何版本都取不到;
+//   2. AX 运行时按**字符串值**比较属性名,用字面量 CFString 调用与 SDK 常量完全等价:
+//      探针以 `CFSTR("AXWindows")` 调 Finder 返回 -25211(kAXErrorAPIDisabled = 未授权),
+//      而不是 -25205(属性不支持),说明字面量被 API 正常接受;
+//   3. 旧实现即便 dlsym 成功也是错的:`const CFStringRef kAXX` 是**全局变量**,
+//      dlsym 给的是变量地址,必须再解引用一次才是 CFStringRef;直接 cast 会传野指针,
+//      外在表现恰好就是「所有 AX 调用返回 ATTRIBUTE_UNSUPPORTED」——当时的误诊来源。
+//
+// 处理:改为进程内一次性创建的**字面量 CFString 缓存**(常驻不释放,数量固定),
+// 不再依赖 dlopen/dlsym;macOS 13~26 行为一致,Windows UIA 主路径不受影响。
+// 字段仍用 `usize` 存指针数值,保证 `AxStrings: Send + Sync` 才能装进 `OnceLock` 当 static;
 // helper 在访问时 cast 回 `CFStringRef`。
+// 字面量取值来源:SDK `AXAttributeConstants.h` / `AXActionConstants.h` / `AXUIElement.h`。
 
 struct AxStrings {
     children: usize,
     role: usize,
     title: usize,
     value: usize,
+    description: usize,
     position: usize,
     size: usize,
     windows: usize,
@@ -113,84 +130,35 @@ struct AxStrings {
     trusted_check_prompt: usize,
 }
 
-const EMPTY_AX_STRINGS: AxStrings = AxStrings {
-    children: 0,
-    role: 0,
-    title: 0,
-    value: 0,
-    position: 0,
-    size: 0,
-    windows: 0,
-    focused: 0,
-    press_action: 0,
-    trusted_check_prompt: 0,
-};
-
 static AX_STRINGS: OnceLock<AxStrings> = OnceLock::new();
-static AS_HANDLE: OnceLock<usize> = OnceLock::new();
 
-fn ax_handle() -> usize {
-    *AS_HANDLE.get_or_init(|| unsafe {
-        let s = std::ffi::CString::new(
-            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
-        )
-        .unwrap();
-        libc::dlopen(s.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) as usize
-    })
-}
-
-unsafe fn dlsym_cfstring(name: &str) -> CFStringRef {
-    let h = ax_handle();
-    if h == 0 {
-        return std::ptr::null();
-    }
-    let c = match std::ffi::CString::new(name) {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null(),
-    };
-    libc::dlsym(h as *mut _, c.as_ptr()) as CFStringRef
+/// 由字面量创建常驻 CFString(进程级常量,数量固定,故意不 CFRelease)。
+unsafe fn cfstr_literal(lit: &str) -> usize {
+    cfstring_new(lit) as usize
 }
 
 fn ax_strings() -> &'static AxStrings {
     AX_STRINGS.get_or_init(|| unsafe {
-        if ax_handle() == 0 {
-            return EMPTY_AX_STRINGS;
+        AxStrings {
+            children: cfstr_literal("AXChildren"),
+            role: cfstr_literal("AXRole"),
+            title: cfstr_literal("AXTitle"),
+            value: cfstr_literal("AXValue"),
+            description: cfstr_literal("AXDescription"),
+            position: cfstr_literal("AXPosition"),
+            size: cfstr_literal("AXSize"),
+            windows: cfstr_literal("AXWindows"),
+            focused: cfstr_literal("AXFocused"),
+            press_action: cfstr_literal("AXPress"),
+            trusted_check_prompt: cfstr_literal("AXTrustedCheckOptionPrompt"),
         }
-        let s = AxStrings {
-            children: dlsym_cfstring("kAXChildrenAttribute") as usize,
-            role: dlsym_cfstring("kAXRoleAttribute") as usize,
-            title: dlsym_cfstring("kAXTitleAttribute") as usize,
-            value: dlsym_cfstring("kAXValueAttribute") as usize,
-            position: dlsym_cfstring("kAXPositionAttribute") as usize,
-            size: dlsym_cfstring("kAXSizeAttribute") as usize,
-            windows: dlsym_cfstring("kAXWindowsAttribute") as usize,
-            focused: dlsym_cfstring("kAXFocusedAttribute") as usize,
-            press_action: dlsym_cfstring("kAXPressAction") as usize,
-            trusted_check_prompt: dlsym_cfstring("kAXTrustedCheckOptionPrompt") as usize,
-        };
-        // 任一关键字段缺失则整表作废:macOS 26 上 AX 调用会全部返回
-        // K_AX_ERROR_ATTRIBUTE_UNSUPPORTED,毫无意义,直接 fail-closed 更友好。
-        if s.children == 0
-            || s.role == 0
-            || s.title == 0
-            || s.value == 0
-            || s.position == 0
-            || s.size == 0
-            || s.windows == 0
-            || s.focused == 0
-            || s.press_action == 0
-        {
-            return EMPTY_AX_STRINGS;
-        }
-        s
     })
 }
 
+/// AX 常量是否就绪。字面量创建不依赖系统符号,正常恒为 true;
+/// 保留该判定仅作为 OOM 等极端情况下的防御(此时 fail-closed 比传空指针安全)。
 fn ax_strings_loaded() -> bool {
     let ax = ax_strings();
-    // 一旦任一关键字段为 0(dlsym 失败),即视为不可用。EMPTY_AX_STRINGS 常量
-    // 仅用于 ax_strings() 闭包内部的「整表作废」返回,不会被存进 OnceLock
-    // (OnceLock 内部地址与 const 静态地址永远不相等,不能做指针相等判断)。
     ax.children != 0
         && ax.role != 0
         && ax.title != 0
@@ -203,11 +171,12 @@ fn ax_strings_loaded() -> bool {
 }
 
 // 让外部调用点保持 `kAX<X>Attribute` / `kAXPressAction` 的可读命名,提供等价 inline getter。
-// 语义上等价于原来的 `extern "C" static`,但实际数据走 `ax_strings()`。
+// 语义上等价于 SDK 的 `CFSTR("...")` 常量,但实际数据走 `ax_strings()` 缓存。
 #[inline] fn kAXChildrenAttribute()      -> CFStringRef { ax_strings().children as CFStringRef }
 #[inline] fn kAXRoleAttribute()           -> CFStringRef { ax_strings().role as CFStringRef }
 #[inline] fn kAXTitleAttribute()          -> CFStringRef { ax_strings().title as CFStringRef }
 #[inline] fn kAXValueAttribute()          -> CFStringRef { ax_strings().value as CFStringRef }
+#[inline] fn kAXDescriptionAttribute()    -> CFStringRef { ax_strings().description as CFStringRef }
 #[inline] fn kAXPositionAttribute()       -> CFStringRef { ax_strings().position as CFStringRef }
 #[inline] fn kAXSizeAttribute()           -> CFStringRef { ax_strings().size as CFStringRef }
 #[inline] fn kAXWindowsAttribute()        -> CFStringRef { ax_strings().windows as CFStringRef }
@@ -215,13 +184,41 @@ fn ax_strings_loaded() -> bool {
 #[inline] fn kAXPressAction()             -> CFStringRef { ax_strings().press_action as CFStringRef }
 #[inline] fn kAXTrustedCheckOptionPrompt() -> CFStringRef { ax_strings().trusted_check_prompt as CFStringRef }
 
+/// 未授予「辅助功能」权限时的统一文案(供 require_trusted / permission_hint 共用)。
+///
+/// AX C API 在 macOS 13~26 全版本可用,唯一前置条件是 TCC 授权;因此文案以
+/// 「怎么授权」为主,osascript/cliclick 模板仅作为用户不便授权时的降级路径。
+/// 文案会作为 tool_result 回填给 LLM,故控制在 ~500 字符内避免重复调用撑爆上下文。
+const MACOS_AX_PERMISSION_HINT: &str =
+    "macOS 未授予「辅助功能」权限,WindowInspect/WindowAction 读不到控件树(AX -25211 \
+     kAXErrorAPIDisabled)。AX C API 在 macOS 13~26 全版本可用,只差授权:\
+     系统设置 → 隐私与安全性 → 辅助功能 → 勾选运行 laew 的宿主终端(Terminal/iTerm/VS Code),\
+     然后完全退出并重开该终端(TCC 按进程启动时快照生效);设 LAEW_AX_PROMPT=1 可主动弹授权框。\
+     授权前可降级走 Bash + osascript(WindowUse 已扩白名单):\
+     activate 应用 / System Events keystroke 输入 / pbcopy·pbpaste 剪贴板 / \
+     cliclick c:x,y 坐标点击 / screencapture -x 截图。\
+     WindowList 走 CoreGraphics 不需授权,任何情况下都能枚举窗口标题·PID·位置。";
+
+// ===================== CF 辅助 =====================
+
 /// macOS 26+ AX 不可用时的统一错误文案(供 require_trusted / permission_hint 共用)。
 const MACOS_AX_UNAVAILABLE_HINT: &str =
     "macOS 26+ 已将 AX 无障碍 C API(kAX*Attribute / kAX*Action)从 \
-     ApplicationServices.framework 中移除,本构建暂不支持窗口无障碍操作。\
-     请使用 Windows/Linux 平台,或在 macOS 13/14 上重新编译。";
-
-// ===================== CF 辅助 =====================
+     ApplicationServices.framework 中移除,WindowInspect/WindowAction \
+     在 macOS 26 上不可用。请优先改走 Bash + osascript 路径。\
+     \n\
+     ★ Bash + osascript 桌面操控模板(WindowUse 已扩 Bash 白名单):\
+     - 启动应用:   osascript -e 'tell application \"WeChat\" to activate'\
+     - 键盘输入:   osascript -e 'tell application \"System Events\" to keystroke \"...\"'\
+     - 剪贴板:     pbcopy / pbpaste\
+     - 坐标点击:   cliclick c:x,y(brew install cliclick)或 osascript click at\
+     - 截图:       screencapture -x /tmp/x.png\
+     - 应用检测:   osascript -e 'tell application \"System Events\" to (name of processes) contains \"WeChat\"'\
+     \n\
+     ★ WindowList 仍可用(走 CoreGraphics),可枚举窗口标题/PID;但 WindowInspect/WindowAction 已废,\
+     不要在这两个工具上耗时间,直接切 Bash 路径。\
+     \n\
+     如必须使用 AX,可在 macOS 13/14 上重新编译。";
 
 /// CFStringRef → String(UTF-8;先走快路径指针,失败回退拷贝缓冲区)。
 unsafe fn cfstr(s: CFStringRef) -> String {
@@ -354,22 +351,26 @@ impl MacOsDriver {
     }
 
     fn require_trusted(&self) -> Result<()> {
-        // macOS 26+ AX 字符串常量已从 ApplicationServices.framework 移除,
-        // 即便有权限也调不通 — 直接 fail-closed,避免后续每个调用都返回无意义错误。
+        // AX 常量走字面量缓存,与系统版本无关;仅在极端情况(内存不足导致 CFString
+        // 创建失败)下 fail-closed,避免把空指针传进 AX 调用。
         if !ax_strings_loaded() {
-            return Err(platform_err("macos", MACOS_AX_UNAVAILABLE_HINT));
+            return Err(platform_err(
+                "macos",
+                "AX 属性名常量初始化失败(CFString 创建返回空,通常为内存不足),请重试",
+            ));
         }
         if Self::trusted() {
             Ok(())
         } else {
-            Err(platform_err("macos", ax_error_text(K_AX_ERROR_API_DISABLED)))
+            Err(platform_err("macos", MACOS_AX_PERMISSION_HINT))
         }
     }
 
-    /// 检查 AX API 是否可用(不检查权限)。
+    /// AX 常量是否就绪(不检查权限)。
     ///
-    /// macOS 26+ 上 AX 字符串常量已移除,此方法返回 false。
-    /// 用于 `list_windows` 判断是否可以降级到 CoreGraphics 枚举。
+    /// 字面量缓存与 macOS 版本无关,正常恒为 true;`list_windows` 用它决定
+    /// 是否需要降级到 CoreGraphics 枚举(实际上 macOS 后端窗口枚举恒走 CoreGraphics,
+    /// 因为它不需要授权、且能拿到窗口标题/位置)。
     fn ax_available(&self) -> bool {
         ax_strings_loaded()
     }

@@ -182,12 +182,25 @@ pub fn compact_registry() -> ToolRegistry {
 }
 
 /// WindowUse Agent 工具注册表(第 9 角色,桌面操控层):
-/// Read(读文件理解上下文) + WindowList / WindowInspect / WindowAction(窗口操控)。
-/// 不带 Bash/Write —— 窗口操控单元不需要 shell / 文件写,收窄权限面。
+///
+/// 2026-09-16 第 54 轮补丁 A(综合修复):
+/// Read(读文件) + WindowList / WindowInspect / WindowAction(窗口操控)
+/// + **Bash**(白名单模式,仅放行桌面操控类命令)。
+///
+/// 历史设计:不带 Bash/Write,收窄权限面。
+/// 现状问题:macOS 26+ 上 AX C API 已移除,WindowInspect/WindowAction 全部失败,
+/// 但 WindowUse Agent 完全无法执行 osascript / cliclick 等桌面操控 shell 命令,
+/// 导致 LLM 空转推理,任务失败。补丁 A 引入「白名单 Bash」模式:
+/// - WindowUseRunner 在调用 Bash 前设置 `LAEW_WINDOW_USE_MODE=1`;
+/// - BashTool 在该模式下仅放行 WINDOW_USE_BASH_ALLOWLIST 中的命令;
+/// - 危险命令 + 敏感路径黑名单(permissions::check_bash_command)永远优先;
+/// - 模式标志由 WindowUseRunner 在 run_unit_inner 入口临时设置、出口清除。
+///
 /// 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` §2.5。
 pub fn window_use_registry() -> ToolRegistry {
     ToolRegistry::new()
         .register(Arc::new(read::ReadTool))
+        .register(Arc::new(bash::BashTool))
         .register(Arc::new(window::WindowListTool))
         .register(Arc::new(window::WindowInspectTool))
         .register(Arc::new(window::WindowActionTool))
@@ -216,7 +229,7 @@ mod names_tests {
         let reg = window_use_registry();
         assert_eq!(
             reg.names(),
-            vec!["Read", "WindowList", "WindowInspect", "WindowAction"]
+            vec!["Read", "Bash", "WindowList", "WindowInspect", "WindowAction"]
         );
     }
 }

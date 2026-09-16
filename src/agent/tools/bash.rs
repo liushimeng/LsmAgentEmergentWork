@@ -32,6 +32,138 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_OUTPUT_CHARS: usize = 30_000;
 /// SIGTERM → SIGKILL 升级等待时间,给进程清理时间(写文件 / flush buffer)
 const KILL_GRACE_MS: u64 = 5_000;
+// ============== WindowUse Bash 白名单模式(2026-09-16 第 54 轮补丁 A) ==============
+//
+// 当 Bash 工具被 WindowUse Agent 调用时,通过 LAEW_WINDOW_USE_MODE=1 环境变量
+// 切换到「白名单」模式:只允许桌面操控类命令(osascript / cliclick / screencapture /
+// pbcopy / open 等),其它命令拒绝并给出可读提示,避免 LLM 误用 Bash 跑任意命令。
+// 黑名单(dangerous.rs / sensitive.rs)优先于白名单,确保危险命令 / 敏感路径拦截
+// 在白名单模式下仍然生效(fail-closed 默认)。
+
+/// WindowUse Bash 模式开关(由 WindowUseRunner 设置)。
+/// pub 暴露供外部测试使用。
+pub const WINDOW_USE_MODE_ENV: &str = "LAEW_WINDOW_USE_MODE";
+
+/// 当前进程是否处于 WindowUse Bash 模式。
+pub fn window_use_mode() -> bool {
+    matches!(
+        std::env::var(WINDOW_USE_MODE_ENV).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// WindowUse Bash 白名单(命令首个 token)。
+/// 含子串匹配:命令首个 token 命中表中任一前缀即视为白名单命令。
+/// 设计参考:macOS 桌面操控真实工作流,加上截图 / 剪贴板 / 启动 / 坐标点击四类。
+const WINDOW_USE_BASH_ALLOWLIST: &[&str] = &[
+    // AppleScript 桌面操控主路径
+    "osascript",
+    "ascript",
+    // 截图识别
+    "screencapture",
+    // 坐标点击(需 brew install cliclick;缺失时优雅报错而非拦截)
+    "cliclick",
+    // 剪贴板
+    "pbcopy",
+    "pbpaste",
+    // 启动 / 激活应用
+    "open",
+    // 进程 / 应用查询
+    "pgrep",
+    "pkill",
+    "ps",
+    "lsof",
+    "lsappinfo",
+    "osascript",
+    // 文件 / 目录枚举(WindowUse 用 Read 已能完成,这里只列 Bash 调试补充)
+    "ls",
+    "which",
+    "command",
+    "type",
+    "echo",
+    "printf",
+    "test",
+    "[",
+    // 系统信息查询
+    "uname",
+    "sw_vers",
+    "defaults",
+    "system_profiler",
+    // 时间戳 / 延时
+    "sleep",
+    "date",
+    // 帮助与说明
+    "man",
+    "tput",
+    // 串行连接 CLI 工具(便于测试)
+    "true",
+    "false",
+];
+
+/// 命令首个 token(去掉前导空白 / env 前缀)。
+fn first_command_token(command: &str) -> String {
+    let trimmed = command.trim_start();
+    // 跳过 bash -c / sh -c / env 前缀
+    let after = trimmed
+        .strip_prefix("bash -c ")
+        .or_else(|| trimmed.strip_prefix("sh -c "))
+        .or_else(|| trimmed.strip_prefix("env "))
+        .unwrap_or(trimmed);
+    after
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// WindowUse Bash 白名单校验:黑名单永远优先,白名单只在 WindowUse 模式下生效。
+/// - 黑名单命中(危险命令 / 敏感路径)→ 拒绝 + PermissionDenied(原有逻辑)
+/// - 白名单模式下首个 token 不在白名单 → 拒绝 + 给出"建议改用 windowuse 工具 / 明确原因"
+/// - 白名单模式下首个 token 在白名单 → 放行
+pub fn check_window_use_bash(command: &str) -> Result<()> {
+    if !window_use_mode() {
+        return Ok(()); // 非 WindowUse 模式,白名单不生效
+    }
+    let token = first_command_token(command);
+    if token.is_empty() {
+        return Err(AgentError::PermissionDenied {
+            tool: "Bash".into(),
+            reason: "[windowuse-mode] 空命令".into(),
+        });
+    }
+    // 命令中含 osascript 子串(可能用 sh -c 拼接),放行
+    let lower = command.to_lowercase();
+    let allowed_direct = WINDOW_USE_BASH_ALLOWLIST
+        .iter()
+        .any(|k| token.eq_ignore_ascii_case(k));
+    // 兜底:命令全文含已知白名单子串也放行(覆盖 `do shell script "..."` 这类)
+    let allowed_substring = [
+        "osascript",
+        "screencapture",
+        "cliclick",
+        "pbcopy",
+        "pbpaste",
+        "tell application",
+        "system events",
+        "keystroke",
+        "do shell script",
+        "activate",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    if allowed_direct || allowed_substring {
+        return Ok(());
+    }
+    Err(AgentError::PermissionDenied {
+        tool: "Bash".into(),
+        reason: format!(
+            "[windowuse-mode] 命令首 token \"{token}\" 不在白名单(白名单见 BashTool description)。WindowUse Bash 仅允许桌面操控类命令(osascript / cliclick / screencapture / pbcopy / open / ls / ps / defaults / sleep 等);通用任务请改走 SubAgent Bash(非白名单模式)。"
+        ),
+    })
+}
+
+/// 命令首个 token(去掉前导空白 / env 前缀)。
+
 
 /// 当前进程工作目录(通过 env::current_dir 惰性获取)
 fn current_work_dir() -> std::path::PathBuf {
@@ -251,6 +383,8 @@ impl Tool for BashTool {
 
         // P0:危险命令 + 敏感路径拦截(fail-closed)
         permissions::check_bash_command(&command)?;
+        // 2026-09-16 第 54 轮补丁 A:WindowUse Bash 白名单校验(黑名单仍优先)
+        check_window_use_bash(&command)?;
 
         // 解析 bash 二进制路径:Windows 上必须跳过 WSL bash launcher
         // (详见 resolve_bash_binary 注释)。解析失败给清晰错误提示,
