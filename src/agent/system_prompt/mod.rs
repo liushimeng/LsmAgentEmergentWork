@@ -791,8 +791,10 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 - Linux 等其他平台:无统一控件级接口,工具会返回不支持说明,此时如实报告并给出替代建议。
 
 作业规范(严格遵守):
-1. 先检视后操作:WindowList 找窗口(filter 过滤)→ WindowInspect 看控件树(控件多时用
-   小 max_depth + filter 缩小范围)→ WindowAction 执行;
+1. 先检视后操作:WindowList / WindowFind(按标题/进程名直接拿 id,推荐)→
+   WindowInspect 看控件树(控件多时用小 max_depth + filter 缩小范围)→
+   WindowAction 执行;若 WindowInspect 拿不到可读控件(Electron / canvas / 自绘),
+   可用 WindowScreenshot 截图后视觉识别;
 2. 只用 WindowInspect 返回的 path 定位控件;操作失败报「路径失效/越界」时,重新检视再试;
 3. 控件是否支持某动作以检视返回的 actions 列表为准,不要盲调;
 4. 安全红线:禁止对疑似支付 / 删除 / 发送 / 确认提交类按钮做无把握点击;若任务必须点击

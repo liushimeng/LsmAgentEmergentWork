@@ -69,7 +69,36 @@ pub struct ExecutionTrace {
     /// LA-4 修复:成功命令也要能复位,预期负例契约才可达成);-1 表示无记录。
     #[serde(default = "default_last_bash_exit_code")]
     pub last_bash_exit_code: i32,
+    /// 工具调用日志(2026-09-16 第 56 轮,新增):
+    /// 每次工具调用的轻量摘要(工具名 + 关键参数 + 是否成功)。
+    /// 供 WindowUseRunner 从 trace 恢复窗口会话状态 / QC 拿到真实调用证据。
+    /// 设计原则:
+    /// - 仅保留工具名 + 参数稳定 JSON + 成功/失败 + 输出字节数,**不存输出全文**
+    ///   (避免 trace 暴涨);
+    /// - 上限 `MAX_TOOL_CALL_LOG = 64` 条,超出截断最早的(先进先出,FIFO);
+    /// - 字段以 serde 默认值兼容旧 trace 反序列化(新增字段对老数据为 `[]`)。
+    #[serde(default)]
+    pub tool_call_log: Vec<ToolCallLogEntry>,
 }
+
+/// 单次工具调用摘要(2026-09-16 第 56 轮)。
+///
+/// `args_json` 是工具参数的稳定序列化(对象按 key 排序后),便于后续做
+/// 「相同参数重复失败」检测与窗口会话状态提取。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallLogEntry {
+    /// 工具名
+    pub tool: String,
+    /// 参数稳定 JSON(对象 key 排序后)
+    pub args_json: String,
+    /// 是否成功(对应 ExecutionTrace.tool_calls_ok/err)
+    pub ok: bool,
+    /// 输出字节数
+    pub output_bytes: usize,
+}
+
+/// 工具调用日志上限;超出截断最早的(FIFO)。
+pub const MAX_TOOL_CALL_LOG: usize = 64;
 
 fn default_last_bash_exit_code() -> i32 {
     -1
@@ -99,6 +128,7 @@ impl Default for ExecutionTrace {
             failure_signals: Vec::new(),
             bash_exit_nonzero_count: 0,
             last_bash_exit_code: default_last_bash_exit_code(),
+            tool_call_log: Vec::new(),
         }
     }
 }
@@ -190,6 +220,26 @@ impl ExecutionTrace {
         }
         if code > 0 {
             self.bash_exit_nonzero_count += 1;
+        }
+    }
+
+    /// 记录一次工具调用(2026-09-16 第 56 轮):
+    /// 写入 tool_call_log(FIFO 截断到 MAX_TOOL_CALL_LOG)。
+    /// - `tool`: 工具名
+    /// - `args_json`: 参数的稳定 JSON(对象 key 排序后)
+    /// - `ok`: 是否成功
+    /// - `output_bytes`: 输出字节数(不含 trace 全文,避免 trace 暴涨)
+    pub fn record_tool_call(&mut self, tool: &str, args_json: &str, ok: bool, output_bytes: usize) {
+        self.tool_call_log.push(ToolCallLogEntry {
+            tool: tool.to_string(),
+            args_json: args_json.to_string(),
+            ok,
+            output_bytes,
+        });
+        if self.tool_call_log.len() > MAX_TOOL_CALL_LOG {
+            // FIFO 截断最早条目
+            let excess = self.tool_call_log.len() - MAX_TOOL_CALL_LOG;
+            self.tool_call_log.drain(0..excess);
         }
     }
 

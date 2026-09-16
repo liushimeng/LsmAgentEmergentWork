@@ -172,9 +172,10 @@ impl WindowUseRunner {
         let failed = trace.is_failed();
 
         // ★4) 从 trace 中提取窗口操作记录,更新窗口状态。
-        //    (当前 trace 不含单次调用参数详情,此步骤为 stub;
-        //     后续可扩展 ExecutionTrace 增加 tool_call_log 字段以自动提取)
-        // extract_window_state_from_trace(&mut win_state, &trace);
+        //    2026-09-16 第 56 轮:ExecutionTrace.tool_call_log 落地后,这里真实生效
+        //    —— 把 WindowAction / WindowList 调用写回 win_state。
+        //    (Runner 也可在工具回调中直接维护 win_state,这里作为 trace-driven 兜底)
+        crate::agent::window_state::extract_window_state_from_trace(&mut win_state, &trace);
 
         // ★5) 保存窗口状态供下一轮使用(取消路径已在上面提前返回,不会走到这里)。
         if !win_state.is_empty() {

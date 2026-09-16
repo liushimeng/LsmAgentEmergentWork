@@ -187,15 +187,8 @@ pub fn compact_registry() -> ToolRegistry {
 /// Read(读文件) + WindowList / WindowInspect / WindowAction(窗口操控)
 /// + **Bash**(白名单模式,仅放行桌面操控类命令)。
 ///
-/// 历史设计:不带 Bash/Write,收窄权限面。
-/// 现状问题:macOS 上 AX C API 全版本可用,但依赖「辅助功能」授权;未授权时
-/// WindowInspect/WindowAction 返回 -25211,而 WindowUse Agent 若完全不能执行
-/// osascript / cliclick 等桌面操控 shell 命令,LLM 会空转推理、任务失败。
-/// 补丁 A 引入「白名单 Bash」模式(同时覆盖不便授权时主动走 osascript 的场景):
-/// - WindowUseRunner 在调用 Bash 前设置 `LAEW_WINDOW_USE_MODE=1`;
-/// - BashTool 在该模式下仅放行 WINDOW_USE_BASH_ALLOWLIST 中的命令;
-/// - 危险命令 + 敏感路径黑名单(permissions::check_bash_command)永远优先;
-/// - 模式标志由 WindowUseRunner 在 run_unit_inner 入口临时设置、出口清除。
+/// 2026-09-16 第 56 轮:新增 WindowFind(按标题/进程名查窗口,省一次 WindowList 后
+/// 人工匹配)与 WindowScreenshot(跨平台截图落盘,为后续 OCR / 视觉验证铺路)。
 ///
 /// 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` §2.5。
 pub fn window_use_registry() -> ToolRegistry {
@@ -203,8 +196,10 @@ pub fn window_use_registry() -> ToolRegistry {
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(bash::BashTool))
         .register(Arc::new(window::WindowListTool))
+        .register(Arc::new(window::WindowFindTool))
         .register(Arc::new(window::WindowInspectTool))
         .register(Arc::new(window::WindowActionTool))
+        .register(Arc::new(window::WindowScreenshotTool))
 }
 
 #[cfg(test)]
@@ -228,9 +223,19 @@ mod names_tests {
     #[test]
     fn window_use_registry_names() {
         let reg = window_use_registry();
+        // 2026-09-16 第 56 轮:WindowUse 工具集新增 WindowFind(标题/进程名查窗口)
+        // + WindowScreenshot(截图落盘,为后续 OCR 铺路)。
         assert_eq!(
             reg.names(),
-            vec!["Read", "Bash", "WindowList", "WindowInspect", "WindowAction"]
+            vec![
+                "Read",
+                "Bash",
+                "WindowList",
+                "WindowFind",
+                "WindowInspect",
+                "WindowAction",
+                "WindowScreenshot",
+            ]
         );
     }
 }

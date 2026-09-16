@@ -353,17 +353,81 @@ pub fn build_window_state_message(state: &WindowSessionState) -> Option<crate::l
     Some(crate::llm::ChatMessage::user(text))
 }
 
-/// 从 ExecutionTrace 的工具调用中提取窗口状态变更。
+/// 从 ExecutionTrace 的工具调用中提取窗口状态变更(2026-09-16 第 56 轮)。
 ///
-/// 注意:当前 ExecutionTrace 仅聚合计数(tool_calls/tool_calls_ok/tool_calls_err),
-/// 不存储单次调用的参数详情。因此本函数为 stub,窗口状态由 WindowUseRunner
-/// 在工具回调中直接填充(见 `window_use.rs`)。
-/// 后续如需从 trace 恢复状态,可扩展 ExecutionTrace 增加 tool_call_log 字段。
+/// 实现要点:
+/// - ExecutionTrace.tool_call_log 含每次工具调用的 (tool, args_json, ok, output_bytes),
+///   从中识别 WindowList / WindowFind / WindowAction 三类调用,反序列化 args_json
+///   拿到 window_id/path/action,更新到 WindowSessionState;
+/// - WindowScreenshot 与窗口状态无关(只产 PNG 文件),跳过;
+/// - 失败调用 (ok=false) 不写入状态(避免污染历史)。
+/// - 当前 Runner 已直接在工具回调中维护 win_state;本函数作为「事后从 trace 恢复」
+///   的兜底,主要用于:进程崩溃后从落库 trace 重建、或第三方工具触发。
 pub fn extract_window_state_from_trace(
-    _state: &mut WindowSessionState,
-    _trace: &crate::agent::extrace::ExecutionTrace,
+    state: &mut WindowSessionState,
+    trace: &crate::agent::extrace::ExecutionTrace,
 ) {
-    // stub: 当前 trace 不含单次调用参数详情,状态由 Runner 直接填充
+    let mut known: Vec<WindowSnapshot> = Vec::new();
+    let mut saw_window_list = false;
+
+    for entry in &trace.tool_call_log {
+        if !entry.ok {
+            continue;
+        }
+        match entry.tool.as_str() {
+            "WindowList" | "WindowFind" => {
+                // WindowList / WindowFind 调用过(trace 不存输出,留作扩展位)。
+                saw_window_list = true;
+            }
+            "WindowAction" => {
+                let parsed: Option<serde_json::Value> =
+                    serde_json::from_str(&entry.args_json).ok();
+                let args = match parsed {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let window_id = match args.get("window_id").and_then(serde_json::Value::as_str) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or("/").to_string();
+                let action = args.get("action").and_then(serde_json::Value::as_str).unwrap_or("?").to_string();
+                let text = args.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
+                let result_summary = if !text.is_empty() {
+                    format!("{action} {path} text={text}")
+                } else {
+                    format!("{action} {path}")
+                };
+                // 推入 known_windows 占位(标题/进程名留空,后续 WindowList 补)
+                known.push(WindowSnapshot {
+                    window_id: window_id.clone(),
+                    title: String::new(),
+                    process_name: String::new(),
+                    pid: 0,
+                    last_inspect_path: None,
+                    known_controls: Vec::new(),
+                });
+                // 直接 push WindowActionRecord 到 history(标题用空串占位)
+                state.action_history.push(WindowActionRecord {
+                    timestamp: now_readable(),
+                    window_id,
+                    window_title: String::new(),
+                    path,
+                    action,
+                    result_summary,
+                });
+                // 维持 MAX_HISTORY 上限(record_action 内部已处理)
+                if state.action_history.len() > MAX_HISTORY {
+                    let excess = state.action_history.len() - MAX_HISTORY;
+                    state.action_history.drain(0..excess);
+                }
+            }
+            _ => {}
+        }
+    }
+    if saw_window_list && !known.is_empty() {
+        state.update_known_windows(known);
+    }
 }
 
 #[cfg(test)]
@@ -494,5 +558,81 @@ mod tests {
         assert!(text.contains(WINDOW_STATE_MARKER_START));
         assert!(text.contains(WINDOW_STATE_MARKER_END));
         assert!(text.contains("记事本"));
+    }
+
+    // ===== 2026-09-16 第 56 轮:extract_window_state_from_trace 测试 =====
+
+    #[test]
+    fn extract_window_state_from_empty_trace() {
+        let mut state = WindowSessionState::new("s1");
+        let trace = crate::agent::extrace::ExecutionTrace::default();
+        extract_window_state_from_trace(&mut state, &trace);
+        assert!(state.action_history.is_empty());
+        assert!(state.known_windows.is_empty());
+    }
+
+    #[test]
+    fn extract_window_state_from_window_action_log() {
+        let mut state = WindowSessionState::new("s1");
+        let mut trace = crate::agent::extrace::ExecutionTrace::default();
+        // 模拟一次 WindowAction 成功调用 + 一次失败
+        let args_ok = serde_json::json!({
+            "window_id": "w-123",
+            "path": "/0/2",
+            "action": "click",
+            "text": ""
+        })
+        .to_string();
+        trace.record_tool_call("WindowAction", &args_ok, true, 256);
+
+        let args_fail = serde_json::json!({
+            "window_id": "w-456",
+            "path": "/",
+            "action": "click"
+        })
+        .to_string();
+        trace.record_tool_call("WindowAction", &args_fail, false, 128);
+
+        extract_window_state_from_trace(&mut state, &trace);
+        // 仅成功调用写入 action_history
+        assert_eq!(state.action_history.len(), 1);
+        assert_eq!(state.action_history[0].window_id, "w-123");
+        assert_eq!(state.action_history[0].action, "click");
+    }
+
+    #[test]
+    fn extract_window_state_records_list_known_windows() {
+        let mut state = WindowSessionState::new("s1");
+        let mut trace = crate::agent::extrace::ExecutionTrace::default();
+        // WindowList 调用 + WindowAction 调用 → 应同时填充 known_windows
+        trace.record_tool_call("WindowList", "{}", true, 1024);
+        let args = serde_json::json!({
+            "window_id": "w-789",
+            "path": "/0",
+            "action": "focus"
+        })
+        .to_string();
+        trace.record_tool_call("WindowAction", &args, true, 64);
+
+        extract_window_state_from_trace(&mut state, &trace);
+        assert_eq!(state.known_windows.len(), 1);
+        assert_eq!(state.known_windows[0].window_id, "w-789");
+        assert_eq!(state.action_history.len(), 1);
+    }
+
+    #[test]
+    fn record_tool_call_respects_max_log_len() {
+        use crate::agent::extrace::MAX_TOOL_CALL_LOG;
+        let mut trace = crate::agent::extrace::ExecutionTrace::default();
+        // 写入 MAX_TOOL_CALL_LOG + 5 条,验证 FIFO 截断
+        for i in 0..(MAX_TOOL_CALL_LOG + 5) {
+            trace.record_tool_call("Test", &format!("{{\"i\":{i}}}"), true, 0);
+        }
+        assert_eq!(trace.tool_call_log.len(), MAX_TOOL_CALL_LOG);
+        // 最早的 5 条应被截断,留下的应是 i=5..MAX
+        let first = &trace.tool_call_log[0];
+        assert!(first.args_json.contains("\"i\":5"));
+        let last = trace.tool_call_log.last().unwrap();
+        assert!(last.args_json.contains(&format!("\"i\":{}", MAX_TOOL_CALL_LOG + 4)));
     }
 }

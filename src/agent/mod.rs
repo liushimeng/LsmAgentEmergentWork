@@ -523,6 +523,9 @@ impl Agent {
                     }
                 }
                 trace.tool_calls += 1;
+                // 2026-09-16 第 56 轮:工具调用日志(供 WindowUseRunner 恢复窗口状态 +
+                // QC 拿到真实调用证据);FIFO 上限 MAX_TOOL_CALL_LOG。
+                trace.record_tool_call(&name, &stable_json_string(&args), !is_error, output.len());
                 // 关联报告: 2026-09-09_06 F-002 — 累计最近工具调用历史
                 let args_digest = crate::agent::extrace::compact_args_digest(&args);
                 recent_tool_history.push((name.clone(), args_digest, is_error));
