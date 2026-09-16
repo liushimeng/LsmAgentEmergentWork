@@ -1492,6 +1492,9 @@ class Handler(BaseHTTPRequestHandler):
                 # 2026-09-15 第 53 轮 P3:openai 协议下走 openai_tool_use_sse,
                 # 否则 laew/openai.rs::parse 期望 tool_calls.delta 而非
                 # Anthropic tool_use,会触发 JSON parse 失败 fall-back。
+                # 2026-09-16 第 54 轮增强:WindowUse 首调也走 PROMPT_ROUTER,
+                # 支持从 router 规则中读取 filter 参数,避免恒返回空 filter
+                # 导致 WindowList 枚举全量窗口、输出被截断、特定应用窗口不可见。
                 _wu_inst_key = f"{key}:windowuse:inst"
                 _wu_has_asst = any(
                     m.get("role") == "assistant" for m in (body.get("messages") or [])
@@ -1501,10 +1504,19 @@ class Handler(BaseHTTPRequestHandler):
                 STATE[_wu_inst_key] = STATE.get(_wu_inst_key, 0) + 1
                 _wu_call_no = STATE[_wu_inst_key]
                 if _wu_call_no == 1:
+                    # 尝试从 PROMPT_ROUTER 获取 WindowList 工具参数(含 filter)
+                    _wu_prompt = _extract_user_corpus(body)
+                    _wu_tool_name, _wu_tool_args_str = _route_subagent_tool(
+                        1, _wu_prompt, ("WindowList", "{}"), session_id
+                    )
+                    try:
+                        _wu_tool_args = json.loads(_wu_tool_args_str) if _wu_tool_args_str else {}
+                    except json.JSONDecodeError:
+                        _wu_tool_args = {}
                     body_bytes = (
-                        openai_tool_use_sse("WindowList", {})
+                        openai_tool_use_sse(_wu_tool_name, _wu_tool_args)
                         if key == "oai"
-                        else anthropic_tool_use_sse("WindowList", {})
+                        else anthropic_tool_use_sse(_wu_tool_name, _wu_tool_args)
                     )
                 else:
                     # 后续轮次:复用 build_openai/build_anthropic_stream 标准流,
