@@ -848,6 +848,22 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 10. 发送消息链路范式:定位到目标会话/联系人 → click 打开会话 → 定位输入框 →
     set_text 写入消息 → send_keys("enter") 或 click「发送」按钮 → WindowInspect
     复查消息已出现在对话区。
+11. **窗口会话状态(SESSION 级持久化,2026-09-17 第 76 轮)**:系统会在任务开始时注入
+    「[窗口会话状态]」块,含上次操作窗口 + 已知窗口列表(含 cg_window_id / hwnd / wmctrl_id
+    平台原生句柄)。Runner 已自动校验 stale:窗口重开会自动更新 cg_window_id,无需你重做;
+    进程退出 / 窗口消失会自动清空,触发你重新 WindowList 枚举。不要假设注入的 window_id
+    永远有效——若 WindowOCR/Screenshot 报错,先 WindowList 重新拿窗口再试。
+12. **失败时 fallback 链(2026-09-17 第 76 轮)**:
+    - WindowOCR/Screenshot 报错(权限 / CGWindowID 错位)→ 先 WindowList 重新枚举 →
+      用新返回的 cg_window_id 重试 → 仍失败则改视觉坐标路线(WindowOCR 取坐标 + click_point)
+    - 控件树路线失败 → 视觉路线(WindowOCR + click_point + type_text)
+    - 视觉路线失败 → Bash 路线(cliclick + screencapture -o $TMPDIR/...)
+    - 三重防线都失败 → 立即报告失败 + 当前窗口 bounds + 用户需检查权限
+13. **禁止操作**:
+    - 禁止 Read PNG(WindowScreenshot 只产 PNG,Read 不支持二进制)
+    - 禁止 Bash 调 python3 / 写 `/tmp/` 硬编码路径(macOS 沙盒可能不可写,
+      用 $TMPDIR 或当前工作目录)
+    - 禁止对同一窗口连续 5 次以上相同 OCR 调用 — 切视觉路线或上报失败
 
 完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
 
@@ -890,7 +906,7 @@ fn window_use_tools_hint() -> &'static str {
      可用工具(共 9 个,与 builtin 严格对齐,缺则视为不可用):\n\
      - WindowOpen(query, app_name?, bundle_id?, wait_seconds?): 启动应用并等待窗口;\
        已运行/最小化时直接恢复+前置(不重复启动)。返回 window_id、匹配别名、权限状态\n\
-     - WindowList(filter?): 枚举可见顶层窗口,返回 id/title/进程/PID/位置尺寸\n\
+     - WindowList(filter?): 枚举可见顶层窗口,返回 id/title/进程/PID/位置尺寸/cg_window_id(2026-09-17 第 76 轮 P0-1:\n     后续 WindowOCR/Screenshot 直接使用,避免按 PID 匹配拿错窗口)\n\
      - WindowFind(title?, process?, match_mode?): 按标题/进程名查窗口,返回最佳匹配窗口的完整信息\n\
      - WindowInspect(window_id, max_depth?, filter?): 枚举窗口控件树,返回每个控件的 \
        path/role/name/value/bounds/actions/children\n\
@@ -933,6 +949,19 @@ const WEB_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Chromium-WebUse
 不允许先输出"让我先..."、"我需要..."等描述性文本——直接调用 BrowserNew。
 如果你不调用 BrowserNew,任务将被标记为失败。这是硬性要求,不是建议。
 
+## ⚠️ 效率铁律(2026-09-17 第 75 轮新增,防止无效迭代浪费时间)
+1. 严禁无进展重试:同一工具调用连续失败 2 次,必须换路径(换 selector/换 action/换 use_js);
+2. 页面加载后操作:BrowserNew 返回后,如需等待动态内容,先 BrowserControl(action=wait, selector="目标元素");
+3. 中文输入方案:优先 use_js:true(已验证可靠);sendkeys 模式在部分网站中文输入会乱码;
+4. 复杂页面先探测:微信公众号后台、电商后台等复杂页面,先 BrowserInspect(info=elements, selector="body") 看 DOM;
+5. 截图只在用户明确要求"看截图"时用,默认 save_path 落盘;
+6. 任务完成后 BrowserClose 关闭不再需要的页面,释放内存。
+7. 对话型 AI 网站(文心一言/ChatGPT/DeepSeek)特别提示:
+   - 输入框选择器:textarea, [contenteditable=true], input[type=text]
+   - 提交/发送按钮:button[type=submit], [class*=send], [class*=submit], img[id*=submit], img[class*=button]
+   - AI 回复等待:BrowserControl(action=wait, selector="[class*=response],[class*=answer],[class*=result],[class*=message]", timeout_ms=30000)
+   - 回复内容提取:BrowserInspect(info=elements, selector="[class*=response],[class*=answer]", include_text=true)
+
 平台能力(由工具自动适配,你无需关心差异):
 - 浏览器检测:优先 Chrome,自动降级 Edge / Chromium / Brave;支持 Windows / macOS / Linux;
 - Firefox / Safari 不支持 CDP 协议,无法接入;
@@ -962,10 +991,14 @@ fn web_use_tools_hint() -> &'static str {
     "工具调用规范:\n\
      - 工具参数需严格遵守给定 JSON Schema\n\
      - 网页操控按「BrowserNew → BrowserControl/BrowserInspect → BrowserClose」顺序使用;\
-       无依赖的观察调用(BrowserInspect 各 info / BrowserList)可并行发出\n\n\
-     可用工具(共 6 个,与 builtin 严格对齐,缺则视为不可用):\n\
-     - BrowserNew(url, headless?, wait_until?, user_agent?, block_resources?, connect_url?): \
-       新建内存浏览器页面,返回 {page_id,title,final_url};connect_url 接管已开浏览器\n\
+       无依赖的观察调用(BrowserInspect 各 info / BrowserList)可并行发出\n\
+     - 中文输入优先 use_js:true,避免 sendkeys 模式中文乱码\n\
+     - 复杂页面先 BrowserInspect(info=elements) 探测真实 DOM,不要硬猜 selector\n\n\
+     可用工具(共 6 个):\n\
+     - BrowserNew(url, mode?, wait_until?, user_agent?, block_resources?, connect_url?): \
+       新建内存浏览器页面,返回 {page_id,title,final_url,next_steps};\
+       mode=hidden(默认纯 CDP 无窗口) / new_headless / headed(显式开窗);\
+       next_steps 含 input_text/click/wait/elements 四步引导,严格按 next_steps 执行\n\
      - BrowserList(): 列出存活页面 [{page_id,url,title,created_at}]\n\
      - BrowserClose(page_id): 关闭页面(幂等);最后页面关闭时回收浏览器进程\n\
      - BrowserControl(page_id, action, params): 写操作统一入口,action 枚举:\
@@ -975,7 +1008,7 @@ fn web_use_tools_hint() -> &'static str {
        set_storage/clear_storage/set_viewport/screenshot/heartbeat\n\
      - BrowserInspect(page_id, info, params): 只读观察统一入口,info 枚举:\
        console/network/elements/dom/localstorage/sessionstorage/cookies/screenshot/\
-       page_meta/viewport/url/title/ping\n\
+       page_meta/viewport/url/title/ping/image_urls\n\
      - Read(file_path, offset?, limit?): 读取文本文件(理解任务上下文用),带行号\n\n\
      返回信封:所有浏览器工具返回 {code,message,data} JSON;code=0 成功,非 0 按作业规范第 4 条处置。"
 }
