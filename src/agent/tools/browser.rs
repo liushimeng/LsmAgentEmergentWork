@@ -150,8 +150,9 @@ impl Tool for BrowserNewTool {
                          "tip": "点击提交按钮(图片按钮可用 selector 命中 img 元素)"},
                         {"step": 3, "tool": "BrowserControl", "action": "wait",
                          "selector_hint": "[class*=response], [class*=answer], [class*=result], [class*=message]",
-                         "timeout_ms": 30000,
-                         "tip": "等待 AI 回复出现,最长等 30 秒"},
+                         // ★ 第 82 轮 P0-3:30s → 60s,覆盖 AI 长尾响应
+                         "timeout_ms": 60000,
+                         "tip": "等待 AI 回复出现,最长等 60 秒(AI 类网站长尾常见 30-60s)"},
                         {"step": 4, "tool": "BrowserInspect", "info": "elements",
                          "selector_hint": "[class*=response], [class*=answer], [class*=result]",
                          "include_text": true,
@@ -719,7 +720,14 @@ async fn act_reload(id: &str, p: &Value) -> std::result::Result<Value, String> {
 async fn act_wait(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let page = ensure_page(id).await?;
     if let Some(sel) = str_arg(p, "selector") {
-        let timeout_ms = p.get("timeout_ms").and_then(Value::as_u64).unwrap_or(15000);
+        // ★ 第 82 轮 P0-3:wait 默认 15s → 30s,覆盖 AI 类网站(文心一言 / ChatGPT /
+        // DeepSeek)首次响应长尾场景(30-60s 常见)。可通过 timeout_ms 参数覆盖,
+        // 上限 120s(防止 hang 死)。
+        let timeout_ms = p
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .min(120_000);
         let state = str_arg(p, "state").unwrap_or("visible");
         let js = format!(
             r#"async () => {{

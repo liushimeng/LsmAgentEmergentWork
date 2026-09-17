@@ -129,6 +129,11 @@ fn extract_nested_string(v: &Value) -> Option<String> {
 /// 4. 取长度最长且 ≥ 50 字符的候选,跳过纯 CSS/JSON 短串;
 /// 5. 返回 `Some((text, source_tool))` —— text 已 trim,长度截断 8000 字符。
 pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(String, String)> {
+    // ★ 第 82 轮 P0-3:从 50 字符提升到 200,且过滤 placeholder/UI 文本启发式白名单,
+    // 避免抓取 input placeholder / 热搜推荐词 / 弹窗广告等 UI 文本误判为 AI 回复。
+    // 实测 2026-09-17 文心一言任务,placeholder="潍坊市寒亭区委书记王勇被查"(实时热搜)
+    // 被当 AI 回复贴出,Runner 出口出现"任务已完成,内容超过 500 字符"占位句。
+    const MIN_CHARS_AI_REPLY: usize = 200;
     let mut best: Option<(String, String, usize)> = None; // (text, source_tool, len)
 
     // 倒序遍历,优先取最近一次抓取结果(避免旧结果覆盖)
@@ -173,7 +178,8 @@ pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(Stri
             for key in CANDIDATE_KEYS {
                 if let Some(s) = data.get(key).and_then(Value::as_str) {
                     let s = s.trim();
-                    if s.chars().count() >= 50 {
+                    // ★ 第 82 轮 P0-3:阈值 50 → 200,且过滤 placeholder/UI 文本
+                    if s.chars().count() >= MIN_CHARS_AI_REPLY && !is_likely_ui_text(s) {
                         picked = Some((s.to_string(), *key));
                         break;
                     }
@@ -184,7 +190,13 @@ pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(Stri
             if picked.is_none() {
                 if let Some(extracted) = extract_nested_string(data) {
                     let trimmed = extracted.trim();
-                    if trimmed.chars().count() >= 50 {
+                    // ★ 第 82 轮 P0-3:阈值 50 → 200,且新增 placeholder/UI 文本启发式过滤,
+                    // 避免抓取 placeholder/快捷短语/输入框 placeholder 等 UI 文本误判为 AI 回复。
+                    // 实测 2026-09-17 16:25 文心一言任务,placeholder="潍坊市寒亭区委书记王勇被查"
+                    // (实时热搜新闻)被当 AI 回复贴出,用户看到的是"任务已完成,内容超过 500 字符"。
+                    if trimmed.chars().count() >= MIN_CHARS_AI_REPLY
+                        && !is_likely_ui_text(trimmed)
+                    {
                         picked = Some((trimmed.to_string(), "nested"));
                     }
                 }
@@ -221,6 +233,62 @@ pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(Stri
         );
         (kept, source)
     })
+}
+
+/// ★ 第 82 轮 P0-3:启发式判定一段文本是否是 UI 占位文本(input placeholder / 热搜推荐 /
+/// 弹窗广告 / 输入框默认提示),而非 AI 生成的真实回复。
+///
+/// 触发任一即视为 UI 文本,Runner 出口丢弃:
+/// - 文本以常见 UI 占位开头("请输入"/"搜索"/"你好,我是" 等)
+/// - 文本包含 input/textarea placeholder 特征属性名(placeholder= / data-placeholder=)
+/// - 文本以列表形态开始(常见热搜推荐:"- 标题1\n- 标题2")
+/// - 文本里以"你可能想"等推荐短语打头
+/// - 文本是 url 列表(每行 < 100 字且每行含 http:// 或 https://)
+fn is_likely_ui_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    const UI_PREFIXES: &[&str] = &[
+        "请输入",
+        "搜索",
+        "search",
+        "你好",
+        "您好",
+        "你可能想",
+        "试试问",
+        "示例:",
+        "热门",
+        "推荐",
+        "placeholder=",
+        "data-placeholder=",
+    ];
+    if UI_PREFIXES
+        .iter()
+        .any(|p| trimmed.to_lowercase().starts_with(p))
+    {
+        return true;
+    }
+    // 文本以列表形态开始(每行 `- xxx` 或 `1. xxx`)
+    let first_line = trimmed.lines().next().unwrap_or("");
+    if first_line.starts_with("- ") || first_line.starts_with("• ") {
+        return true;
+    }
+    // URL 列表:行数 ≥ 3 且每行 < 100 字且每行都含 http:// 或 https://
+    let lines: Vec<&str> = trimmed.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() >= 3 && lines.iter().all(|l| l.chars().count() < 100) {
+        if lines
+            .iter()
+            .all(|l| l.contains("http://") || l.contains("https://") || l.contains("www."))
+        {
+            return true;
+        }
+    }
+    // 短文本(< 100 字)直接视为 UI
+    if trimmed.chars().count() < 100 {
+        return true;
+    }
+    false
 }
 
 /// Chromium-WebUse 执行器(浏览器网页操控专项单元)。
@@ -627,10 +695,71 @@ mod tests {
         assert_eq!(extract_page_id_from_text(""), None);
     }
 
+    // ★ 第 82 轮 P0-3:UI 文本启发式过滤单元测试
+    #[test]
+    fn is_likely_ui_text_filters_placeholders() {
+        // 输入框 placeholder
+        assert!(is_likely_ui_text("请输入你的问题"));
+        assert!(is_likely_ui_text("搜索"));
+        assert!(is_likely_ui_text("潍坊市寒亭区委书记王勇被查")); // 热搜词,80字
+        // URL 列表(每行短且含 http)
+        assert!(is_likely_ui_text(
+            "- https://example.com/page1\n- https://example.com/page2\n- https://example.com/page3"
+        ));
+        // 列表开头
+        assert!(is_likely_ui_text("- 新对话\n- 工作任务\n- 知识库"));
+        // 短文本
+        assert!(is_likely_ui_text("登录"));
+        assert!(is_likely_ui_text(""));
+        // 真实 AI 回复:长文 + 非 UI 开头 + 无 URL 列表
+        assert!(!is_likely_ui_text(
+            "根据最近3个月的黄金白银走势分析:7月份国际金价从853元/克上涨至906元/克,8月份突破1000元大关达到1012.85元/克的历史高点,9月份有所回落收于926.86元/克。白银方面,7月份在54-58美元区间震荡,8月份突破70美元后回落至63.80美元。综合来看,近期金银价格波动较大,投资者需注意风险控制。"
+        ));
+    }
+
+    #[test]
+    fn extract_page_reply_skips_placeholder_with_50_chars() {
+        // ★ 第 82 轮 P0-3:旧阈值 50 字符下,placeholder "潍坊市寒亭区委书记王勇被查"(13字符)
+        // 长度不够不会进 best,但若 LLM 抓一段 80 字符的搜索推荐词,旧版会误判;
+        // 新版 is_likely_ui_text 拦截 + 阈值 200 双重保险。
+        let placeholder_80chars = "潍坊市寒亭区委书记王勇被查,某某某最新消息,某某某官方回应,持续关注中";
+        let msgs = vec![ChatMessage::tool_result(
+            "t1",
+            &format!(
+                r#"{{"code":0,"message":"ok","data":{{"text":"{}"}}}}"#,
+                placeholder_80chars
+            ),
+            false,
+        )];
+        // 80 字符 < 200 阈值,直接 None
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_none(), "短 placeholder 文本不应被采纳");
+    }
+
+    #[test]
+    fn extract_page_reply_skips_url_list() {
+        // URL 列表型文本即使 200+ 字符也应被 UI 过滤拦截
+        let url_list = (0..10)
+            .map(|i| format!("- https://example.com/page{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msgs = vec![ChatMessage::tool_result(
+            "t1",
+            &format!(
+                r#"{{"code":0,"message":"ok","data":{{"text":"{}"}}}}"#,
+                url_list
+            ),
+            false,
+        )];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_none(), "URL 列表型 UI 文本不应被采纳");
+    }
+
     // 2026-09-17 第 76 轮:验证从 sub_session 中提取最长可读文本。
+    // ★ 第 82 轮 P0-3:阈值提升到 200,文本相应加长。
     #[test]
     fn extract_page_reply_picks_longest_text() {
-        let long_text = "黄金近3个月走势:7月853-906元/克、8月最高触及1012.85元/克、9月回落至926.86元/克。白银走势:7月54-58美元、8月突破70美元后回落至63.80美元。";
+        let long_text = "黄金近3个月走势详细分析报告:7月份国际金价从853元/克持续上涨至906元/克,8月份突破1000元大关达到1012.85元/克的历史高点,9月份有所回落收于926.86元/克。白银方面,7月份在54-58美元区间震荡,8月份突破70美元后回落至63.80美元。综合来看,近期金银价格波动较大,投资者需密切关注美联储利率政策、地缘政治风险以及美元指数走势,合理配置资产以分散风险,以上分析仅供参考。";
         let short = "ok";
         let msgs = vec![
             ChatMessage::tool_result("t1", short, false),
@@ -640,15 +769,15 @@ mod tests {
             ), false),
         ];
         let result = extract_page_reply_from_session(&msgs);
-        assert!(result.is_some(), "应能提取到长文本");
+        assert!(result.is_some(), "应能提取到长文本(实际: {result:?})");
         let (text, _) = result.unwrap();
         assert!(text.contains("1012.85"), "应包含真实原文片段");
     }
 
     #[test]
     fn extract_page_reply_skips_failure_code() {
-        // code=2002 失败时不应被当作提取源
-        let long_text = "实际回复文本长度足够长通过门槛测试,这是文心一言生成的金银价格走势详细分析报告,包含国内国际金价白银价格数据";
+        // code=2002 失败时不应被当作提取源;文本长度 ≥ 200(第 82 轮阈值提升)
+        let long_text = "实际回复文本长度足够长通过门槛测试,这是文心一言生成的金银价格走势详细分析报告,包含国内国际金价白银价格数据。7月份国际金价从853元/克持续上涨至906元/克,8月份突破1000元大关达到1012.85元/克的历史高点,9月份回落至926.86元/克,白银方面7月份54-58美元区间震荡,8月突破70美元后回落63.80美元。投资者需密切关注美联储利率政策、地缘政治风险以及美元指数走势,合理配置资产以分散风险,以上分析仅供参考。";
         let msgs = vec![
             ChatMessage::tool_result("t1", r#"{"code":2002,"message":"err","data":{}}"#, false),
             ChatMessage::tool_result("t2", &format!(r#"{{"code":0,"message":"ok","data":{{"text":"{}"}}}}"#, long_text), false),
@@ -761,7 +890,8 @@ mod tests {
     #[test]
     fn extract_page_reply_handles_nested_choices() {
         // 实际嵌套:tool_result.content = {"code":0, "data": {"choices": [{"message": {"content": "..."}}]}}
-        let nested = r#"{"code":0,"message":"ok","data":{"choices":[{"message":{"content":"AI 回复: 国内金价 927.79 元/克,国际金价 4301.95 美元/盎司,国际白银 63.80 美元/盎司,沪银主力 15586 元/千克,数据来源文心一言实时查询,以上价格仅供参考,实际交易以市场为准。"}}]}}"#;
+        // ★ 第 82 轮 P0-3:文本加长到 ≥ 200 字符,通过 MIN_CHARS_AI_REPLY 阈值
+        let nested = r#"{"code":0,"message":"ok","data":{"choices":[{"message":{"content":"AI 回复: 根据最近3个月的黄金白银价格走势详细分析报告。国内金价从7月份的853元/克持续上涨至8月份的1012.85元/克历史高点,9月份回落至926.86元/克。国际金价目前4301.95美元/盎司,国际白银63.80美元/盎司,沪银主力15586元/千克。整体来看,近期金银价格波动较大,投资者需密切关注美联储利率政策、地缘政治风险以及美元指数走势,合理配置资产以分散风险。数据来源文心一言实时查询,以上价格仅供参考,实际交易以市场为准。"}}]}}"#;
         let msgs = vec![ChatMessage::tool_result("t1", nested, false)];
         let result = extract_page_reply_from_session(&msgs);
         assert!(result.is_some(), "嵌套字段应能提取,实际值: {result:?}");

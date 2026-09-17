@@ -118,6 +118,14 @@ impl Agent {
         // trace.artifacts 上限(2026-09-09 第 15 轮):防止极端任务写大量文件时轨迹膨胀。
         const ARTIFACTS_LIMIT: usize = 8;
 
+        // ★ 第 82 轮 P1-3:浏览器失败学习 —— 同一 (tool, selector) 连续失败 ≥2 次时,
+        // 自动在 error_summary 追加换姿势提示(scroll_into_view / wait / 换 selector /
+        // eval_js),避免 LLM 在 16 次迭代里用同一 selector 反复重试。
+        // 用 HashMap 维护累计计数;selector 从 BrowserControl / BrowserInspect 的
+        // args.selector 字段提取,非浏览器工具不参与。
+        use std::collections::HashMap;
+        let mut browser_failure_counts: HashMap<(String, String), u32> = HashMap::new();
+
         // 2026-09-16 第 63 轮:首迭代强制工具状态跟踪。
         // 首迭代强制调用指定工具(如 BrowserNew)后,后续轮次恢复 auto,
         // 避免全程强制导致 LLM 无法自由决策。
@@ -522,6 +530,12 @@ impl Agent {
                 //
                 // ★ Schema 预校验(L16):工具执行前校验参数类型/必填/越界/多余字段,
                 // 校验失败直接返回结构化错误,避免浪费一次工具执行往返
+                //
+                // ★ 第 82 轮 P0-1:工具调用墙钟计时 —— 必须放在 tool.execute() 之前,
+                // 否则 Instant::now() 在 future 已 await 完成后才被采样,elapsed_ms 永远为 0
+                // (原第 57 轮修复把计时器放错位置,实测所有工具耗时都显示 0ms,
+                //  见 tmpPlan/2026-09-17_13 §3.1)。改为在拿到 tool 句柄后立即采样。
+                let tool_call_started = std::time::Instant::now();
                 let executed = match self.profile.tools.get(&name) {
                     Ok(tool) => {
                         // Schema 预校验(校验失败 → 返回错误,不执行工具)
@@ -549,8 +563,10 @@ impl Agent {
                 // 2026-09-16 第 57 轮:工具调用墙钟计时 —— 从执行入口开始,
                 // 不论 Ok/Err/取消都走 elapsed.as_millis() 取时长,记入
                 // ExecutionTrace.tool_call_log.elapsed_ms,供 TUI 反推卡在哪一步。
-                let tool_call_started = std::time::Instant::now();
-                let (output, is_error, error_summary) = match executed {
+                // ★ 第 82 轮:Instant 已上移至 tool.execute 之前,这里只读 elapsed。
+                // (label `_ = tool_call_started` 仅用来压制 unused warning)
+                debug_assert!(tool_call_started.elapsed().as_nanos() > 0);
+                let (output, is_error, mut error_summary) = match executed {
                     Some(Ok(out)) => (out, false, String::new()),
                     Some(Err(e)) => {
                         warn!(tool = %name, error = %e, "tool failed");
@@ -584,6 +600,33 @@ impl Agent {
                         return Err(AgentError::Cancelled);
                     }
                 };
+                // ★ 第 82 轮 P1-3:浏览器失败学习 —— 同一 (tool, selector) 连续失败 ≥2 次时,
+                // 在 error_summary 追加换姿势提示,避免 LLM 死磕同 selector。
+                // 适用工具:BrowserControl / BrowserInspect(从 args.selector / args.page_id 提 key);
+                // 非浏览器工具不参与。失败计数实时递增,成功调用同一 key 不重置(简化)。
+                if is_error && matches!(name.as_str(), "BrowserControl" | "BrowserInspect") {
+                    let sel_key = args
+                        .get("selector")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "<no_selector>".to_string());
+                    let map_key = (name.clone(), sel_key);
+                    let count = browser_failure_counts.entry(map_key).or_insert(0);
+                    *count += 1;
+                    if *count >= 2 {
+                        let hint = format!(
+                            " [提示:已连续失败 {} 次,建议:1) scroll_into_view 2) BrowserControl(wait) 等 500ms 3) 换 selector 或加 nth=N 4) eval_js 直接触发]",
+                            *count
+                        );
+                        error_summary.push_str(&hint);
+                        warn!(
+                            tool = %name,
+                            selector = %args.get("selector").and_then(|v| v.as_str()).unwrap_or(""),
+                            consecutive = *count,
+                            "浏览器工具连续失败,自动追加换姿势提示"
+                        );
+                    }
+                }
                 // 2026-09-11 第三十六轮 LA-2:无论工具返回成功与否,
                 // bash 工具的输出文本都含 `<exit_code>N</exit_code>`,
                 // 即使工具返回 Ok(exit_code=1)也累计 trace 失败信号,

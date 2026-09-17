@@ -114,6 +114,8 @@ pub(super) const WEB_DOM_GUI_KEYWORDS: &[&str] = &[
 pub(super) const WINDOW_USE_KEYWORDS: &[&str] = WINDOW_USE_STRICT_KEYWORDS;
 
 /// 2026-09-16 第 61 轮:浏览器/网页操控关键词(Chromium-WebUse,第 11 角色)。
+/// ★ 第 82 轮:补充 AI 对话类网站强信号 + 中文提交按钮 selector 名,覆盖
+/// Plan agent 输出极简步骤(如"输入问题文本并提交")时的路由误判问题。
 pub(super) const WEB_USE_KEYWORDS: &[&str] = &[
     "browsernew",
     "browsercontrol",
@@ -140,11 +142,24 @@ pub(super) const WEB_USE_KEYWORDS: &[&str] = &[
     "表单提交",
     "http://",
     "https://",
+    // ★ 第 82 轮:AI 对话类网站 + 提交按钮 selector 强信号
+    // 解决 Plan agent 输出"输入文本+点击提交"等极简描述时无 web 锚被误判 SubAgent 的问题。
+    "wenxin", "baidu.com", "chatgpt", "deepseek", "kimi", "doubao", "claude.ai", "gemini",
+    "ci-submit-button", "submit-button", "提交按钮", "搜素按钮", "搜索按钮", "发送按钮",
+    "对话窗口", "对话输入框", "智能助手", "AI助手", "AI 回复", "AI回复",
 ];
 
 pub(super) fn text_contains_any_ci(text: &str, keywords: &[&str]) -> bool {
     let lower = text.to_lowercase();
     keywords.iter().any(|k| lower.contains(k))
+}
+
+/// ★ 第 82 轮:检测文本中是否包含 HTTP/HTTPS URL(覆盖关键词表里没列出的网址)。
+/// 用最简 URL regex 抓 `http(s)://xxx`,避开 false-positive(如命令行参数里的 -http)。
+fn text_contains_url(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // 简单子串扫描 + 协议头判定,避免 regex crate 依赖
+    lower.contains("http://") || lower.contains("https://") || lower.contains("www.")
 }
 
 pub(super) fn gather_spec_text(spec: &WorkFlowSpec) -> String {
@@ -191,6 +206,8 @@ pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     let shell_hit = text_contains_any_ci(&text, SUBAGENT_KEYWORDS);
     let desktop_gui_hit = text_contains_any_ci(&text, WINDOW_USE_STRICT_KEYWORDS);
     let web_hit = text_contains_any_ci(&text, WEB_USE_KEYWORDS);
+    // ★ 第 82 轮:URL 出现也作为 web 强信号(关键词表可能漏列新网站)
+    let url_hit = text_contains_url(&text);
 
     // 规则 1:桌面 GUI 强信号 → 强制 WindowUse(覆盖 web/shell)。
     // 例:微信 + osascript 剪贴板 → 仍判 WindowUse(第 67 轮逻辑保留)。
@@ -199,7 +216,8 @@ pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     }
     // 规则 2:web 命中(无 desktop-gui 强信号)→ WebUse。第 75 轮 P0 修复核心。
     // shell 词同时出现不构成压制(web 任务是主体,shell 是辅助)。
-    if web_hit {
+    // ★ 第 82 轮:URL 出现同样判 web(覆盖关键词漏列新域名)。
+    if web_hit || url_hit {
         return Some(AgentRole::WebUse);
     }
     // 规则 3:仅 shell 词 → SubAgent(WebUse 没有 Bash,WindowUse 是白名单模式)。
@@ -473,5 +491,64 @@ mod infer_tests {
             delegate_to: AgentRole::SubAgent, // explicit 选 SubAgent
         };
         assert_eq!(infer_delegate_to(&spec), None);
+    }
+
+    // ★ 第 82 轮:URL 出现也应判 WebUse(覆盖关键词漏列的新域名/未被白名单收录的网址)
+    #[test]
+    fn url_in_steps_routes_to_webuse() {
+        let spec = WorkFlowSpec {
+            id: "wf-url".into(),
+            name: "新站点".into(),
+            steps: vec!["访问 https://new-site-2026.com/".into()],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+    }
+
+    // ★ 第 82 轮:AI 对话类网站关键词也应判 WebUse
+    #[test]
+    fn ai_chat_keywords_route_to_webuse() {
+        let spec = WorkFlowSpec {
+            id: "wf-ai".into(),
+            name: "DeepSeek 对话".into(),
+            steps: vec![
+                "打开 deepseek 官网".into(),
+                "输入问题".into(),
+                "找到发送按钮点击".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+    }
+
+    // ★ 第 82 轮:极简步骤("输入文本+点击提交")无任何关键词,加 URL 后才判 WebUse
+    #[test]
+    fn minimal_input_click_with_url_routes_to_webuse() {
+        // 模拟 2026-09-17 16:25 Plan agent 输出的极简步骤("输入问题文本并提交")。
+        // 旧版会被判 SubAgent(LLM 默认值);新版因 acceptance 含 URL 仍判 WebUse。
+        let spec = WorkFlowSpec {
+            id: "wf-min".into(),
+            name: "极简输入".into(),
+            steps: vec![
+                "定位对话输入框".into(),
+                "输入问题文本".into(),
+                "点击提交".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            // acceptance 里有 URL,触发 URL 检测
+            acceptance: vec!["对话窗口出现 AI 回复,内容与 https://wenxin.baidu.com/ 一致".into()],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
     }
 }

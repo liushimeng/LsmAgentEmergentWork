@@ -169,10 +169,22 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
                     160,
                 )
             } else {
-                truncate_progress_text(&format!("cmd={}", truncate_progress_text(cmd, 40)), 80)
+                truncate_progress_text(&format!("cmd={}", truncate_progress_text(cmd, 80)), 120)
             }
         }
-        "Read" | "Write" | "Edit" => {
+        "Read" => {
+            // ★ 第 82 轮 P1-1 增强:Read 工具展示 path + offset + limit(便于排查大文件读取)
+            let path = obj.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let mut parts = vec![format!("path={}", truncate_progress_text(path, 60))];
+            if let Some(off) = obj.get("offset").and_then(|v| v.as_u64()) {
+                parts.push(format!("off={}", off));
+            }
+            if let Some(lim) = obj.get("limit").and_then(|v| v.as_u64()) {
+                parts.push(format!("limit={}", lim));
+            }
+            truncate_progress_text(&parts.join(" "), 160)
+        }
+        "Write" | "Edit" => {
             // ★ 2026-09-17 第 78 轮 P1-1:Write/Edit 大数据量精简
             // file_path 完整保留(< 80),但 Write/Edit 的 content 字段经常是 5KB+ 脚本,
             // 不能在 TUI stage 完整展示;改为展示 path + content 总字符数 + 首行
@@ -191,7 +203,18 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
                     parts.push(format!("content={}", truncate_progress_text(c, 60)));
                 }
             }
-            truncate_progress_text(&parts.join(" "), 160)
+            // Edit 工具展示 old_string 截断(供排查匹配位置)
+            if tool_name == "Edit" {
+                if let Some(old) = obj.get("old_string").and_then(|v| v.as_str()) {
+                    let first_line = old.lines().next().unwrap_or("");
+                    parts.push(format!(
+                        "old=[{}字符] 首行:{}",
+                        old.chars().count(),
+                        truncate_progress_text(first_line, 30)
+                    ));
+                }
+            }
+            truncate_progress_text(&parts.join(" "), 200)
         }
         "Glob" => {
             let pat = obj.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
@@ -476,7 +499,8 @@ mod tests {
         let long = "x".repeat(200);
         let args = format!(r#"{{"command":"{long}"}}"#);
         let s = tool_args_digest("Bash", &args);
-        assert!(s.len() <= 80, "摘要应被截断到 80 字符内,实际 {} 字符", s.len());
+        // ★ 第 82 轮 P1-1:Bash cmd 截断上限从 80 提到 120(包含 cmd= 前缀)
+        assert!(s.len() <= 130, "摘要应被截断到 130 字符内,实际 {} 字符", s.len());
         assert!(s.starts_with("cmd="));
     }
 
