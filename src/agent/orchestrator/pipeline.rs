@@ -507,6 +507,27 @@ impl MultiAgentOrchestrator {
         // (实测 P10「对 p10_inject.txt 做词频统计」被改写为「完成 laew 端到端链路验证」)。
         let original_prompt =
             Self::prompt_with_retry_hint(Self::original_user_prompt(session), retry_hint);
+
+        // ★ 2026-09-17 第 78 轮 P0-1:按 suggested_delegate 路由 Runner。
+        // 解决「Yolo 降级 simple + suggested_delegate=webuse」任务被错派 SubAgent
+        // 的根本问题(llaew_20260917_135513.log 复盘:文心一言任务把 AI 回复写到
+        // wenxin_result.txt 但 TUI 不显示真实内容)。之前注释写「simple 档直接 SubAgent
+        // 无需 trace 委派诊断」是错的——WebUseRunner 自带 extract_page_reply_from_session
+        // 出口兜底,可以让真实抓取的页面文本直接落到 outcome.text。
+        let delegate_to = Self::resolve_simple_delegate(c);
+        let exec_label = match delegate_to {
+            AgentRole::WebUse => "WebUse",
+            AgentRole::WindowUse => "WindowUse",
+            _ => "SubAgent",
+        };
+        // 运行日志(第 69 轮):simple 档委派决策,记录 Yolo 建议 vs 实际 Runner 路由
+        info!(
+            suggested = c.suggested_delegate.as_deref().unwrap_or(""),
+            actual = delegate_to.as_str(),
+            yolo_degraded = c.yolo_degraded,
+            "simple 档委派路由决策"
+        );
+
         let input = SubFlowInput {
             id: "wf-1".into(),
             description: c.goal_summary.clone(),
@@ -520,24 +541,42 @@ impl MultiAgentOrchestrator {
             sibling_outputs: vec![],
             window_context: None,
             pending_agent_messages: vec![],
-            // 2026-09-17 第 75 轮:simple 档直接 SubAgent,无需 trace 委派诊断。
-            intended_role: Some(crate::agent::context::AgentRole::SubAgent),
+            // 写入 trace 供 QC + TUI delegate_mismatch 诊断
+            intended_role: Some(delegate_to),
         };
-        emit_progress(progress, "wf-1 SubAgent 执行中…");
+        emit_progress(progress, format!("wf-1 {exec_label} 执行中…"));
         let sub_started = std::time::Instant::now();
-        let outcome = self
-            .sub_agent
-            .run_unit_with_cancel(&input, session.id(), cancel)
-            .await
-            .map_err(|e| {
-                QualityFailure::from_agent_error(AgentRole::SubAgent, "SubAgent 执行失败", &e)
-            })?;
+        let outcome = match delegate_to {
+            AgentRole::WebUse => {
+                // ★ 第 78 轮 P1-3:WebUse 走带 progress 的版本,出口兜底抓取文本时
+                // 通过 progress 通道给 TUI 用户实时预览
+                self.web_use
+                    .run_unit_with_cancel_progress(&input, session.id(), cancel, progress.clone())
+                    .await
+            }
+            AgentRole::WindowUse => {
+                self.window_use
+                    .run_unit_with_cancel(&input, session.id(), cancel)
+                    .await
+            }
+            _ => {
+                self.sub_agent
+                    .run_unit_with_cancel(&input, session.id(), cancel)
+                    .await
+            }
+        }
+        .map_err(|e| {
+            QualityFailure::from_agent_error(delegate_to, &format!("{exec_label} 执行失败"), &e)
+        })?;
         let sub_elapsed_ms = sub_started.elapsed().as_millis() as u64;
 
         let qc_started = std::time::Instant::now();
+        // ★ 第 78 轮 P0-1:QC 也按 exec_role 路由,不再硬编码 SubAgent
+        // (对齐 medium 档 run_wf_unit 的 check_subagent_with_source 语义)
         let (qc, qc_usage) = self
             .quality
-            .check_subagent(
+            .check_subagent_with_source(
+                delegate_to,
                 &c.goal_summary,
                 &input.description,
                 &input.expected_output,
@@ -584,7 +623,9 @@ impl MultiAgentOrchestrator {
                     quality_report: qc,
                     usage: outcome.usage,
                     subflow_trace: Some(outcome.trace),
-                    exec_role: AgentRole::SubAgent,
+                    // ★ 第 78 轮 P0-1:exec_role 同步使用实际执行的 Runner 角色
+                    // (TUI 的 [WebUse]/[WindowUse]/[SubAgent] 标识与 trace 一致)
+                    exec_role: delegate_to,
                     wallclock_ms: sub_elapsed_ms,
                     qc_wallclock_ms: qc_elapsed_ms,
                 }],
@@ -610,7 +651,8 @@ impl MultiAgentOrchestrator {
             })
         } else {
             Err(QualityFailure {
-                source: AgentRole::SubAgent,
+                // ★ 第 78 轮 P0-1:失败来源也用实际执行的 Runner
+                source: delegate_to,
                 reason: qc.issues.join("; "),
                 retryable: qc.retryable,
                 suggestion: qc.suggestion,
@@ -618,6 +660,26 @@ impl MultiAgentOrchestrator {
                 trace: Some(Arc::new(outcome.trace)),
                 usage: add_usage(outcome.usage, qc_usage),
             })
+        }
+    }
+
+    /// 2026-09-17 第 78 轮 P0-1:simple 档 Runner 路由决策。
+    ///
+    /// 优先级:
+    /// 1. `suggested_delegate=webuse` → WebUseRunner(网页操控专项,带 extract_page_reply_from_session 兜底)
+    /// 2. `suggested_delegate=windowuse` → WindowUseRunner(桌面窗口操控专项)
+    /// 3. 其它(含 `subagent` / `None`) → SubAgentRunner(通用执行)
+    ///
+    /// **关键变化**: 第 75 轮注释认为 simple 档硬编码 SubAgent「无需 trace 委派诊断」
+    /// 是错的;Yolo 降级时 suggested_delegate 仍然能正确推断(浏览器/网页关键词),
+    /// 此时必须路由到对应的专项 Runner,否则文心一言类任务会用 Bash+Write 写脚本,
+    /// 真实抓取的页面文本被 LLM 描述性占位句吞掉,TUI 看不到内容。
+    pub(super) fn resolve_simple_delegate(c: &TaskClassification) -> AgentRole {
+        match c.suggested_delegate.as_deref() {
+            Some("webuse") => AgentRole::WebUse,
+            Some("windowuse") => AgentRole::WindowUse,
+            Some("subagent") | None => AgentRole::SubAgent,
+            _ => AgentRole::SubAgent,
         }
     }
 

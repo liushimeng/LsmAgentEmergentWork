@@ -43,6 +43,76 @@ pub fn extract_page_id_from_text(text: &str) -> Option<String> {
     Some(text[pid_start..end].trim_matches('"').to_string())
 }
 
+/// 2026-09-17 第 78 轮 P0-3 扩展:从 JSON Value 中递归提取字符串内容。
+///
+/// 解决 AI 对话网站(文心一言 / ChatGPT / DeepSeek)返回的嵌套字段:
+/// `data.choices[0].message.content` / `data.markdown` / `data.reply_text` /
+/// `data.result.text` / `data.content` 等异构命名。
+///
+/// 策略:
+/// - 字符串 → 直接返回
+/// - 数组 → 遍历元素递归查找
+/// - 对象 → 优先 `content` / `message` / `text` 字段;都失败则深度优先遍历
+/// - 其它类型(数字/布尔/null) → None
+fn extract_nested_string(v: &Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            if let Some(s) = extract_nested_string(item) {
+                return Some(s);
+            }
+        }
+        return None;
+    }
+    if let Some(obj) = v.as_object() {
+        // 优先 message.content (OpenAI / DeepSeek 风格)
+        if let Some(m) = obj.get("message") {
+            if let Some(s) = extract_nested_string(m) {
+                return Some(s);
+            }
+        }
+        // 优先 content (直接字段)
+        if let Some(c) = obj.get("content") {
+            if let Some(s) = extract_nested_string(c) {
+                return Some(s);
+            }
+        }
+        // 优先 text
+        if let Some(t) = obj.get("text") {
+            if let Some(s) = extract_nested_string(t) {
+                return Some(s);
+            }
+        }
+        // 优先 result (DeepSeek / 自研 API 风格)
+        if let Some(r) = obj.get("result") {
+            if let Some(s) = extract_nested_string(r) {
+                return Some(s);
+            }
+        }
+        // 优先 markdown
+        if let Some(m) = obj.get("markdown") {
+            if let Some(s) = extract_nested_string(m) {
+                return Some(s);
+            }
+        }
+        // 优先 reply / answer / reply_text / ai_answer
+        for key in &["reply", "answer", "reply_text", "ai_answer", "value", "outer_html", "html", "body"] {
+            if let Some(found) = obj.get(*key).and_then(extract_nested_string) {
+                return Some(found);
+            }
+        }
+        // 兜底:深度优先遍历所有字段
+        for (_, v) in obj {
+            if let Some(s) = extract_nested_string(v) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 /// 2026-09-17 第 76 轮:从 WebUse 子会话中提取「真实从浏览器抓到的可读文本」。
 ///
 /// 业务背景(来自 llaew_20260917_130701.log):
@@ -52,9 +122,12 @@ pub fn extract_page_id_from_text(text: &str) -> Option<String> {
 ///
 /// 提取策略:
 /// 1. 倒序遍历 sub_session,过滤 role=Tool 的 ChatMessage;
-/// 2. 对每个 tool_result.content 做 JSON 解析,寻找 `code==0 && data.{text|outer_html|value|html|body}`;
-/// 3. 取长度最长且 ≥ 50 字符的候选,跳过纯 CSS/JSON 短串;
-/// 4. 返回 `Some((text, source_tool))` —— text 已 trim,长度截断 8000 字符。
+/// 2. 对每个 tool_result.content 做 JSON 解析,寻找 `code==0 && data.{text|outer_html|...}`;
+/// 3. ★ 2026-09-17 第 78 轮 P0-3 扩展:同时支持嵌套字段(`data.choices[0].message.content` /
+///    `data.markdown` / `data.content` / `data.result.text` 等异构命名),通过
+///    `extract_nested_string` 递归展开;
+/// 4. 取长度最长且 ≥ 50 字符的候选,跳过纯 CSS/JSON 短串;
+/// 5. 返回 `Some((text, source_tool))` —— text 已 trim,长度截断 8000 字符。
 pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(String, String)> {
     let mut best: Option<(String, String, usize)> = None; // (text, source_tool, len)
 
@@ -88,26 +161,35 @@ pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(Stri
                 Some(d) => d,
                 None => continue,
             };
-            // 尝试常见字段:text / outer_html / value / html / body / console_text
-            let candidates: Vec<(&str, &str)> = vec![
-                ("text", "text"),
-                ("outer_html", "outer_html"),
-                ("value", "value"),
-                ("html", "html"),
-                ("body", "body"),
-                ("reply", "reply"),
-                ("answer", "answer"),
+
+            // ★ 第 78 轮 P0-3:先用候选字段集快速匹配,失败再走递归嵌套提取
+            // 候选字段涵盖主流 CDP 响应形态
+            const CANDIDATE_KEYS: &[&str] = &[
+                "text", "outer_html", "value", "html", "body",
+                "reply", "answer", "markdown", "content",
+                "reply_text", "ai_answer", "result", "result_text",
             ];
-            let mut picked: Option<(String, &str)> = None;
-            for (key, label) in &candidates {
+            let mut picked: Option<(String, &'static str)> = None;
+            for key in CANDIDATE_KEYS {
                 if let Some(s) = data.get(key).and_then(Value::as_str) {
                     let s = s.trim();
-                    if s.len() >= 50 {
-                        picked = Some((s.to_string(), *label));
+                    if s.chars().count() >= 50 {
+                        picked = Some((s.to_string(), *key));
                         break;
                     }
                 }
             }
+            // ★ 候选字段都没命中 → 递归嵌套提取(覆盖 choices[0].message.content /
+            //   result.text / data.text / message.content 等异构命名)
+            if picked.is_none() {
+                if let Some(extracted) = extract_nested_string(data) {
+                    let trimmed = extracted.trim();
+                    if trimmed.chars().count() >= 50 {
+                        picked = Some((trimmed.to_string(), "nested"));
+                    }
+                }
+            }
+
             if let Some((text, label)) = picked {
                 let len = text.chars().count();
                 let better = match &best {
@@ -117,53 +199,6 @@ pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(Stri
                 if better {
                     best = Some((text, format!("tool_result[{}]→{}", tool_use_id, label), len));
                 }
-            }
-            // image_urls 是数组,不直接当文本;但保留作 metadata(下面单独处理)
-        }
-    }
-
-    // 兜底:若所有 tool_result 都没抓到 text 字段,尝试从 outerHTML 数组里挑最长的元素文本
-    if best.is_none() {
-        for msg in messages.iter().rev() {
-            if msg.role != Role::Tool {
-                continue;
-            }
-            for block in &msg.content {
-                let (tool_use_id, content, _) = match block {
-                    crate::llm::ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => (tool_use_id.clone(), content.clone(), *is_error),
-                    _ => continue,
-                };
-                let _ = tool_use_id;
-                let parsed: Value = match serde_json::from_str(&content) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if parsed.get("code").and_then(Value::as_i64) != Some(0) {
-                    continue;
-                }
-                let data = match parsed.get("data") {
-                    Some(d) => d,
-                    None => continue,
-                };
-                // elements info 形态:{data:{text:"...", outer_html:"...", ...}}
-                if let Some(text) = data.get("text").and_then(Value::as_str) {
-                    let t = text.trim();
-                    if t.chars().count() >= 50 {
-                        best = Some((
-                            t.to_string(),
-                            "tool_result[fallback].data.text".to_string(),
-                            t.chars().count(),
-                        ));
-                        break;
-                    }
-                }
-            }
-            if best.is_some() {
-                break;
             }
         }
     }
@@ -235,18 +270,32 @@ impl WebUseRunner {
     /// 跑一次浏览器操控单元(不可取消版本,语义对齐 SubAgentRunner::run_unit)。
     #[allow(dead_code)]
     pub async fn run_unit(&self, input: &SubFlowInput, session_id: &str) -> Result<SubFlowOutcome> {
-        self.run_unit_inner(input, session_id, None).await
+        self.run_unit_inner(input, session_id, None, None).await
     }
 
     /// 可取消版本:任务级取消 token 传入 Agent 循环,LLM/工具即时中断。
     ///
     /// 2026-09-16 第 66 轮:单元总超时(默认 300s,环境变量 LAEW_WEBUSE_TIMEOUT),
     /// 防止 Agent 循环 16 轮迭代总耗时过长(用户反馈 WebUse 任务卡住 58.8s)。
+    /// ★ 2026-09-17 第 78 轮:可选 progress 通道,Runner 出口抓取到真实页面文本时,
+    ///   通过 progress 通道发一条 [laew] 通知给 TUI 用户「正在抓取 AI 回复」+ 前 200 字预览,
+    ///   避免 TUI 静默期超过 30s 让用户以为卡死(对齐 WindowUse 第 67 轮)。
     pub async fn run_unit_with_cancel(
         &self,
         input: &SubFlowInput,
         session_id: &str,
         cancel: &CancelToken,
+    ) -> Result<SubFlowOutcome> {
+        self.run_unit_with_cancel_progress(input, session_id, cancel, None).await
+    }
+
+    /// 带进度通道的可取消版本(2026-09-17 第 78 轮 P1-3 新增)。
+    pub async fn run_unit_with_cancel_progress(
+        &self,
+        input: &SubFlowInput,
+        session_id: &str,
+        cancel: &CancelToken,
+        progress: Option<crate::agent::orchestrator::ProgressTx>,
     ) -> Result<SubFlowOutcome> {
         let unit_timeout = std::env::var("LAEW_WEBUSE_TIMEOUT")
             .ok()
@@ -254,7 +303,7 @@ impl WebUseRunner {
             .unwrap_or(300);
         tokio::time::timeout(
             std::time::Duration::from_secs(unit_timeout),
-            self.run_unit_inner(input, session_id, Some(cancel)),
+            self.run_unit_inner(input, session_id, Some(cancel), progress),
         )
         .await
         .map_err(|_| {
@@ -270,6 +319,7 @@ impl WebUseRunner {
         input: &SubFlowInput,
         session_id: &str,
         cancel: Option<&CancelToken>,
+        progress: Option<crate::agent::orchestrator::ProgressTx>,
     ) -> Result<SubFlowOutcome> {
         // 复用 SubFlowInput 的 prompt 构造(原始 prompt 优先 + 摘要 + 上下游产物),
         // 尾部追加浏览器操控作业规范。
@@ -407,6 +457,20 @@ impl WebUseRunner {
             let extracted = extract_page_reply_from_session(sub_session.context());
             match extracted {
                 Some((reply, source)) if !reply.trim().is_empty() => {
+                    // ★ 2026-09-17 第 78 轮 P1-3:通过 progress 通道发 [laew] 通知,
+                    // 让 TUI 任务执行中就能看到「正在抓取 AI 回复」+ 前 200 字预览,
+                    // 避免 LLM 终答全是描述性占位句时 TUI 静默让用户以为卡死。
+                    if let Some(tx) = &progress {
+                        let preview: String = reply.chars().take(200).collect();
+                        let tail = if reply.chars().count() > 200 { "..." } else { "" };
+                        let _ = tx.send(format!(
+                            "[laew] WebUse 出口兜底 | 抓取 {} 字符(来源: {})\n预览: {}{}",
+                            reply.chars().count(),
+                            source,
+                            preview,
+                            tail
+                        ));
+                    }
                     let mut combined = text;
                     if !combined.trim().is_empty() {
                         combined.push_str("\n\n");
@@ -532,9 +596,10 @@ mod tests {
     #[test]
     fn extract_page_reply_skips_failure_code() {
         // code=2002 失败时不应被当作提取源
+        let long_text = "实际回复文本长度足够长通过门槛测试,这是文心一言生成的金银价格走势详细分析报告,包含国内国际金价白银价格数据";
         let msgs = vec![
             ChatMessage::tool_result("t1", r#"{"code":2002,"message":"err","data":{}}"#, false),
-            ChatMessage::tool_result("t2", r#"{"code":0,"message":"ok","data":{"text":"实际回复文本长度足够长通过门槛测试"}} "#, false),
+            ChatMessage::tool_result("t2", &format!(r#"{{"code":0,"message":"ok","data":{{"text":"{}"}}}}"#, long_text), false),
         ];
         let result = extract_page_reply_from_session(&msgs);
         assert!(result.is_some());
@@ -594,5 +659,59 @@ mod tests {
     fn runner_passes_long_text_as_success_via_length_fallback() {
         let long_text = "x".repeat(250);
         assert!(looks_like_web_ops_action(&long_text));
+    }
+
+    // ================== 2026-09-17 第 78 轮 P0-3 新增:嵌套字段提取测试 ==================
+
+    #[test]
+    fn extract_nested_string_handles_choices_message_content() {
+        // 模拟 OpenAI 风格嵌套响应:data.choices[0].message.content
+        let v = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "AI 回复内容长度足够长通过门槛测试,实际是文心一言给的金价分析"
+                    }
+                }
+            ]
+        });
+        let result = extract_nested_string(&v);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("金价分析"));
+    }
+
+    #[test]
+    fn extract_nested_string_handles_markdown_field() {
+        let v = serde_json::json!({
+            "markdown": "# 标题\n这是 AI 生成的 markdown 内容,长度足够长通过门槛测试,包含代码块和列表"
+        });
+        let result = extract_nested_string(&v);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("代码块"));
+    }
+
+    #[test]
+    fn extract_nested_string_handles_reply_text() {
+        let v = serde_json::json!({
+            "reply_text": "AI 直接回复文本,长度足够长通过门槛测试"
+        });
+        let result = extract_nested_string(&v);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn extract_nested_string_returns_none_for_non_string_types() {
+        let v = serde_json::json!({"count": 42, "flag": true, "items": null});
+        let result = extract_nested_string(&v);
+        assert!(result.is_none(), "纯数字/布尔/null 应返回 None");
+    }
+
+    #[test]
+    fn extract_page_reply_handles_nested_choices() {
+        // 实际嵌套:tool_result.content = {"code":0, "data": {"choices": [{"message": {"content": "..."}}]}}
+        let nested = r#"{"code":0,"message":"ok","data":{"choices":[{"message":{"content":"AI 回复: 国内金价 927.79 元/克,国际金价 4301.95 美元/盎司,国际白银 63.80 美元/盎司,沪银主力 15586 元/千克,数据来源文心一言实时查询,以上价格仅供参考,实际交易以市场为准。"}}]}}"#;
+        let msgs = vec![ChatMessage::tool_result("t1", nested, false)];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_some(), "嵌套字段应能提取,实际值: {result:?}");
     }
 }

@@ -670,3 +670,44 @@ cache 读折扣/写溢价，见第三轮成本控制专题 §1.2）实现全链�
 pi 式 cache miss 浪费量化 / 自定义价格覆盖(环境变量或 DB 字段)/ 按模型分桶统计。
 
 **方案**:`tmpPlan/2026-09-17_05-D8会话成本估算与cost面板方案.md`
+
+---
+
+## 第 78 轮:WebUse 全链路根治与 sub_session 真实内容展示(2026-09-17)
+
+**触发问题**:用户测试「打开 https://wenxin.baidu.com/ 输入黄金白银价格查询 → 显示输出」任务
+实测发现:Yolo 降级 simple + suggested_delegate=webuse → simple 档硬编码 SubAgentRunner →
+SubAgent 写 Python Playwright 脚本 → AI 回复写入 wenxin_result.txt(530 字符)但 TUI 不显示,
+仅看到「任务成功完成,内容已保存到 xxx.txt」描述性占位句。必须二次追问「结果显示在哪里了」。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| L1415 | simple 档硬编码 SubAgentRunner,suggested_delegate=webuse 被忽略 | P0 | ✅ | `src/agent/orchestrator/pipeline.rs::run_simple` 新增 `resolve_simple_delegate()` 三路分发(webuse→WebUseRunner / windowuse→WindowUseRunner / 其它→SubAgentRunner);QC 走 `check_subagent_with_source(exec_role)`,exec_role=强 fail source | 2026-09-17 第 78 轮 |
+| L1416 | SubAgentRunner 无 sub_session 内容兜底,LLM 终答被描述性占位句吞掉 | P0 | ✅ | `src/agent/subagent.rs::extract_runner_evidence_from_session` + `runner_text_needs_fallback` + `extract_bash_main_output`:倒序遍历 role=Tool,按工具名(Bash stdout / Read text / Write file_path+bytes)分类提取实质产物,3 条最长优先,Runner 出口追加 `[Runner 出口兜底 · 来源]` 段 | 2026-09-17 第 78 轮 |
+| L1417 | WebUseRunner `extract_page_reply_from_session` 仅认 7 个字段,AI 对话网站嵌套字段(choices[0].message.content / markdown / reply_text)抓不到 | P0 | ✅ | `src/agent/web_use.rs::extract_nested_string` 递归提取(字符串/数组/对象 → 优先 content/message/text/result/markdown → 兜底 reply/answer/reply_text/ai_answer 等异构命名 → 深度优先遍历),候选字段集 7→13 个 | 2026-09-17 第 78 轮 |
+| L1418 | TUI 工具调用明细 Read/Write/Bash 大数据量铺满屏幕 | P1 | ✅ | `src/agent/orchestrator/usage.rs::tool_args_digest` Bash/Write/Edit 分支:>200 字符时显示「共 N 字符 + 前 80 字符 + 首行 40 字符」摘要,避免 Python 脚本 + Playwright 完整代码撑爆 TUI | 2026-09-17 第 78 轮 |
+| L1419 | WorkFlow 头部不显示 delegate 实际 vs 期望 | P1 | ✅ | `src/tui/format.rs::format_task_result` WorkFlow 头部按 trace.runner_role / intended_role 自动追加 `[intended→actual]` 路由提示 | 2026-09-17 第 78 轮 |
+| L1420 | `infer_suggested_delegate` 双命中(web+code)返回 None,错失 WebUseRunner 兜底 | P1 | ✅ | `src/agent/yolo.rs::infer_suggested_delegate` 优先级改为「web > window > code」,三向命中也强制返回;配套测试更新 | 2026-09-17 第 78 轮 |
+| L1421 | WebUseRunner 出口兜底无 TUI 实时预览,任务长期间 TUI 静默让用户以为卡死 | P1 | ✅ | `src/agent/web_use.rs::run_unit_with_cancel_progress` + `run_unit_inner` 出口抓取真实文本时通过 progress 通道发 `[laew] WebUse 出口兜底 \| 抓取 N 字符(来源: ...)\n预览: ...` 立即冲刷,simple 档委派 WebUse 时自动接通 | 2026-09-17 第 78 轮 |
+
+**设计要点**:
+- **三路委派而非硬编码**:simple 档一直被认为是「SubAgent 一锅端」是错的;Yolo 推断
+  suggested_delegate=webuse 时,即使 simple 档也应路由到 WebUseRunner 享受出口兜底。
+- **Runner 出口兜底机制**:LLM 终答常输出「任务已完成,内容已保存到 xxx.txt」描述性占位句,
+  Runner 必须从 sub_session 反查实质产物(已调用工具的真实输出);WebUseRunner 已有该兜底,
+  现 SubAgentRunner 补齐。
+- **嵌套字段递归**:`choices[0].message.content` 形态在文心一言/OpenAI/DeepSeek 接口
+  通用,但 CDP 响应信封里通常嵌套;递归提取覆盖异构命名。
+- **TUI 信息密度**:Python Playwright 脚本完整 content(5KB+)进入 stage 流会撑爆屏幕,
+  >200 字符自动折叠为「共 N 字符 + 首行」摘要。
+- **delegate 路由可视化**:trace.runner_role / intended_role 不一致时在 WorkFlow 头部
+  直接显示 `[subagent→webuse]` 路径,无需翻 trace 段排查。
+
+**验证**:单元测试 1134 全过(新增 runner_evidence 4 + nested_string 4 + page_reply_nested 1
++ yolo infer 优先级更新);`run_e2e.sh` PASS=185 FAIL=0。
+
+**未做(后续候选)**:WebUseRunner 跨 Session 浏览器状态保持 / 截图内嵌到 TUI 富文本渲染
+/ Bash 命令结果超过 30KB 时的二级截断 / Write 文件保存到 sub_session 后用 Read 回读
+做 Round-trip 校验。
+
+**方案**:`tmpPlan/2026-09-17_09-WebUse全链路根治与sub_session内容展示方案.md`

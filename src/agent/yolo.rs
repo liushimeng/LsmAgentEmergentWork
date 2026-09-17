@@ -428,17 +428,20 @@ pub fn infer_suggested_delegate(user_prompt: &str) -> Option<String> {
     let window_hit = WINDOW_USE_KEYWORDS.iter().any(|k| lower.contains(k));
     let code_hit = SUBAGENT_KEYWORDS.iter().any(|k| lower.contains(k));
     let web_hit = WEB_USE_KEYWORDS.iter().any(|k| lower.contains(k));
-    // 优先级:code 最优先(“修改网页代码”本质是代码任务);
-    // web > window(“打开网页”含窗口词“打开”,但属网页任务)
-    if web_hit && !code_hit {
+    // ★ 2026-09-17 第 78 轮 P1-3:优先级改为「web > window > code」——
+    // 「写 Python 脚本访问浏览器」本质是 web 任务,code 仅辅助;此前 web+code 双命中
+    // 时直接返回 None → 委派默认 SubAgent → 错失 WebUseRunner 的
+    // extract_page_reply_from_session 出口兜底,真实抓取的页面文本无法落到 TUI。
+    if web_hit {
         return Some("webuse".to_string());
     }
-    match (window_hit, code_hit) {
-        (true, false) => Some("windowuse".to_string()),
-        (false, true) => Some("subagent".to_string()),
-        // 都命中 / 都不命中 → 不强制
-        _ => None,
+    if window_hit {
+        return Some("windowuse".to_string());
     }
+    if code_hit {
+        return Some("subagent".to_string());
+    }
+    None
 }
 
 /// 从 Yolo 返回的文本中解析结构化分类结果。
@@ -824,20 +827,21 @@ mod tests {
                 "网页操控类应推断 webuse: {prompt}"
             );
         }
-        // 代码任务含"网页"字样仍归 subagent
+        // ★ 2026-09-17 第 78 轮 P1-3:优先级改为「web > window > code」。
+        // 「修改网页代码」含 web 关键词 → 仍判 webuse(网页代码修改本质上仍涉及网页上下文)。
         assert_eq!(
             infer_suggested_delegate("修改网页代码里的 bug"),
-            Some("subagent".to_string())
+            Some("webuse".to_string())
         );
     }
 
     #[test]
     fn infer_suggested_delegate_ambiguous_returns_none() {
-        // 无法判断 / 两边都命中 → None
+        // 无法判断 → None(注意:第 78 轮优先级 web > window > code,所以「打开 + 代码」
+        // 也会被判 windowuse,因为「打开」是 window 关键词且优先级高于 code)
         let cases = [
             "帮我处理一下这个任务",       // 无明确关键词
             "",                           // 空串
-            "帮我打开文件管理器查看代码", // 两边都命中
         ];
         for prompt in cases {
             assert_eq!(

@@ -153,12 +153,45 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
             truncate_progress_text(&format!("page_id={}", truncate_progress_text(pid, 20)), 60)
         }
         "Bash" => {
+            // ★ 2026-09-17 第 78 轮 P1-1:大命令精简
+            // command 字段通常 < 80 字符,但 Python 脚本 + Playwright 完整代码可超过 5000 字符
+            // 完整展示会撑爆 TUI stage 流,只显示前 80 字符 + 总长度 + 首行(若超出)
             let cmd = obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            truncate_progress_text(&format!("cmd={}", truncate_progress_text(cmd, 40)), 80)
+            let cmd_chars = cmd.chars().count();
+            let cmd_first_line = cmd.lines().next().unwrap_or("").to_string();
+            if cmd_chars > 200 {
+                let preview = truncate_progress_text(cmd, 80);
+                let first_line_short = truncate_progress_text(&cmd_first_line, 40);
+                truncate_progress_text(
+                    &format!(
+                        "cmd=[共{cmd_chars}字符] {preview} 首行:{first_line_short}"
+                    ),
+                    160,
+                )
+            } else {
+                truncate_progress_text(&format!("cmd={}", truncate_progress_text(cmd, 40)), 80)
+            }
         }
         "Read" | "Write" | "Edit" => {
+            // ★ 2026-09-17 第 78 轮 P1-1:Write/Edit 大数据量精简
+            // file_path 完整保留(< 80),但 Write/Edit 的 content 字段经常是 5KB+ 脚本,
+            // 不能在 TUI stage 完整展示;改为展示 path + content 总字符数 + 首行
             let path = obj.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            truncate_progress_text(&format!("path={}", truncate_progress_text(path, 50)), 80)
+            let content = obj.get("content").and_then(|v| v.as_str());
+            let mut parts = vec![format!("path={}", truncate_progress_text(path, 50))];
+            if let Some(c) = content {
+                let total_chars = c.chars().count();
+                if total_chars > 200 {
+                    let first_line = c.lines().next().unwrap_or("").to_string();
+                    parts.push(format!(
+                        "content=[共{total_chars}字符] 首行:{}",
+                        truncate_progress_text(&first_line, 40)
+                    ));
+                } else if total_chars > 0 {
+                    parts.push(format!("content={}", truncate_progress_text(c, 60)));
+                }
+            }
+            truncate_progress_text(&parts.join(" "), 160)
         }
         "Glob" => {
             let pat = obj.get("pattern").and_then(|v| v.as_str()).unwrap_or("");

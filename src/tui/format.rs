@@ -183,8 +183,21 @@ pub fn format_task_result(
         // 2026-09-16 第 57 轮:WorkFlow 头部补 [exec_role] + 墙钟耗时 +
         // QC 耗时,让用户一眼看到责任 Agent + 这一格跑了几秒。
         let exec_role_str = wf.exec_role.as_str();
+        // ★ 2026-09-17 第 78 轮 P1-2:delegate 路由提示 —— 当 trace.intended_role
+        // 与 trace.runner_role 不一致时,头部追加 [intended→actual] 提示,
+        // 让用户一眼看出「Yolo 期望是 X,实际跑了 Y」,无需翻 trace。
+        let delegate_hint = if let Some(trace) = &wf.subflow_trace {
+            match (trace.runner_role, trace.intended_role) {
+                (Some(runner), Some(intended)) if runner != intended => {
+                    format!(" [{}→{}]", intended.as_str(), runner.as_str())
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "  --- WorkFlow {} ({}) [{}] {:.2}s ---\n",
+            "  --- WorkFlow {} ({}) [{}{}]{:.2}s ---\n",
             wf.id,
             if styled {
                 sv(&wf.name)
@@ -192,6 +205,7 @@ pub fn format_task_result(
                 wf.name.clone()
             },
             exec_role_str,
+            delegate_hint,
             wf.wallclock_ms as f64 / 1000.0,
         ));
         if styled {

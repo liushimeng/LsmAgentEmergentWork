@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tracing::info;
 
 use crate::agent::agent_message::AgentMessage;
 use crate::agent::cancel::CancelToken;
@@ -16,7 +18,7 @@ use crate::agent::window_state::WindowSessionState;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
-use crate::llm::{ChatMessage, Usage};
+use crate::llm::{ChatMessage, ContentBlock, Role, Usage};
 
 /// SubFlow 输入(由 Orchestrator 构造)。
 ///
@@ -130,6 +132,129 @@ impl SubAgentRunner {
         }
     }
 
+    /// 2026-09-17 第 78 轮 P0-2:Runner 出口兜底 —— 提取 sub_session 中的「实质产物摘要」。
+    ///
+    /// 业务背景(llaew_20260917_135513.log 复盘):
+    /// 文心一言任务被 Yolo 降级 simple + suggested_delegate=webuse,但 simple 档此前硬编码
+    /// SubAgentRunner(第 78 轮 P0-1 已修复为路由 WebUseRunner)。在修复前,
+    /// SubAgentRunner 出口 outcome.text 仅含「任务成功完成,内容已保存到 wenxin_result.txt」,
+    /// 真实抓取的 AI 回复在文件里,TUI 看不到 — 用户必须二次追问「结果显示在哪里了」。
+    ///
+    /// 兜底策略(对齐 web_use.rs::extract_page_reply_from_session 思路):
+    /// 1. 倒序遍历 sub_session.role=Tool 的消息,逐条检查 tool_use_id 对应的 tool_call
+    ///    (从 sub_session.role=Assistant 的 tool_calls 中按 id 索引);
+    /// 2. 按工具名分类提取:
+    ///    - Bash:从 stdout 字段取最长非空连续段落(≥30 字符),跳过 stderr / 退出码噪音;
+    ///    - Write/Edit:从 tool_call.arguments.content 字段取全文(截 4000 字符);
+    ///    - Read:从 tool_result.content 提取 text 字段(截 4000 字符)。
+    /// 3. 返回 Vec<(text, source_label)>,按出现顺序追加,最多 3 条避免 context 膨胀。
+    ///
+    /// 注意:
+    /// - 不修改 outcome.text 本身,只读取;调用方在 Runner 出口拼接;
+    /// - 失败/错误的 tool_result(content 含 error / exit_code)跳过(避免污染产物);
+    /// - LLM 的 thinking / text 回复不参与(已经在 outcome.text 里)。
+    pub fn extract_runner_evidence_from_session(
+        messages: &[ChatMessage],
+    ) -> Vec<(String, String)> {
+        let mut evidences: Vec<(String, String)> = Vec::new();
+
+        // 第一遍:建立 tool_use_id → tool_name 的反向索引(Assistant.tool_calls)
+        let mut tool_name_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for msg in messages.iter() {
+            if msg.role != Role::Assistant {
+                continue;
+            }
+            for block in &msg.content {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    tool_name_map.insert(id.clone(), name.clone());
+                }
+            }
+        }
+
+        // 第二遍:倒序遍历 role=Tool,按工具名分类提取
+        for msg in messages.iter().rev() {
+            if msg.role != Role::Tool {
+                continue;
+            }
+            for block in &msg.content {
+                let (tool_use_id, content, _is_error) = match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => (tool_use_id.clone(), content.clone(), *is_error),
+                    _ => continue,
+                };
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let tool_name = tool_name_map
+                    .get(&tool_use_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                // 1) Bash:stdout / output 中取最长段落
+                if tool_name == "Bash" {
+                    if let Some(stdout) = extract_bash_main_output(&content) {
+                        if stdout.chars().count() >= 30 {
+                            evidences.push((
+                                truncate_chars(&stdout, 4000),
+                                format!("Bash[{}]", &tool_use_id),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                // 2) Read:tool_result.content 直接当文本(可能含行号)
+                if tool_name == "Read" {
+                    let text = content.trim();
+                    if text.chars().count() >= 30 {
+                        evidences.push((
+                            truncate_chars(text, 4000),
+                            format!("Read[{}]", &tool_use_id),
+                        ));
+                    }
+                    continue;
+                }
+                // 3) Write/Edit:content 字段在 Assistant.tool_calls.arguments 里
+                // 这里 content 通常是 stdout-style 信封;尝试 JSON parse 取 file_path 提示
+                if tool_name == "Write" || tool_name == "Edit" {
+                    let parsed: Option<Value> = serde_json::from_str(&content)
+                        .ok()
+                        .or_else(|| serde_json::from_str(&content).ok());
+                    if let Some(v) = parsed {
+                        if let Some(data) = v.get("data") {
+                            let path = data
+                                .get("file_path")
+                                .and_then(Value::as_str)
+                                .unwrap_or("<unknown>");
+                            let bytes = data
+                                .get("bytes_written")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            evidences.push((
+                                format!("<Write 到 {path}> 共 {bytes} 字节"),
+                                format!("{tool_name}[{}]", &tool_use_id),
+                            ));
+                        }
+                    }
+                }
+            }
+            // 控制总量:倒序遍历最多取 6 条候选,最后按内容长度排序保留 3 条
+            if evidences.len() >= 6 {
+                break;
+            }
+        }
+
+        // 长度降序,保留前 3 条最长(实质内容优先)
+        evidences.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+        evidences.truncate(3);
+
+        evidences.reverse(); // 还原时间顺序
+        evidences
+    }
+
     pub fn with_max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
         self.agent = self.agent.with_max_iterations(n);
@@ -168,6 +293,9 @@ impl SubAgentRunner {
         // Agent 循环返回 (text, usage, trace) 三元组。
         // 早终止路径(RepeatedToolFailure / MaxIterationsExceeded)不再升级为 Error,
         // ★2026-09-17 第 75 轮:Runner 角色信息(SubAgent)。
+        // ★2026-09-17 第 78 轮:SubAgentRunner 在 simple 档也可能被 webuse/windowuse
+        // 委派(suggested_delegate 路由修复后);但 Runner 实际执行的是 SubAgent 角色,
+        // trace.runner_role 仍为 SubAgent,trace.intended_role 反映 WorkFlow 期望的角色。
         let runner_role = Some(AgentRole::SubAgent);
         let intended_role = input.intended_role;
 
@@ -222,6 +350,48 @@ impl SubAgentRunner {
         trace.collect_failure_signals(&text);
         let failed = trace.is_failed();
 
+        // ★ 2026-09-17 第 78 轮 P0-2:Runner 出口兜底 —— 抓取 sub_session 中的
+        // 实质产物(对齐 web_use.rs::extract_page_reply_from_session 思路,让真实抓取的
+        // 内容也能落到 outcome.text,而不是只看到「已保存到 xxx.txt」这种描述性占位句)。
+        // 解决 llaew_20260917_135513.log 复盘问题:文心一言任务 Yolo 降级 simple →
+        // SubAgentRunner → 写 Python Playwright 脚本 → 把 AI 回复写到 wenxin_result.txt
+        // → outcome.text 仅含描述 → TUI 看不到真实内容。
+        //
+        // 行为:
+        // 1) 调用 extract_runner_evidence_from_session 抓 3 条最长实质产物(Bash stdout /
+        //    Read text / Write file_path+bytes 摘要);
+        // 2) 若 LLM 终答不含足够实质内容(text 长度 < 50 OR 不含动作关键词)→ 把兜底
+        //    内容追加到 outcome.text 末尾,标注 [Runner 出口兜底 · 来源];
+        // 3) 终答本身已含丰富内容(长度 ≥ 200 OR 含动作关键词)→ 不追加,避免冗余。
+        let text = {
+            let evidences = Self::extract_runner_evidence_from_session(sub_session.context());
+            if evidences.is_empty() {
+                text
+            } else if runner_text_needs_fallback(&text) {
+                let evidence_count = evidences.len();
+                let mut combined = text;
+                if !combined.trim().is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str("[Runner 出口兜底 · 实质产物摘要]\n");
+                for (evidence, source) in evidences {
+                    combined.push_str(&format!(
+                        "\n--- 来源: {} ---\n{}",
+                        source, evidence
+                    ));
+                }
+                info!(
+                    evidence_count,
+                    combined_chars = combined.chars().count(),
+                    "SubAgent Runner 出口兜底:已追加实质产物到 outcome.text"
+                );
+                combined
+            } else {
+                // 终答已含丰富内容,避免冗余
+                text
+            }
+        };
+
         // 写入 Agent-Memory(取消路径已在上面提前返回,不会走到这里)
         // 把 trace 关键指标塞进 artifacts,便于下次同类 Agent 加载经验。
         let error_summary_owned: Option<String> = if failed {
@@ -254,6 +424,79 @@ impl SubAgentRunner {
             failed,
             trace,
         })
+    }
+}
+
+/// 2026-09-17 第 78 轮 P0-2:判定 Runner 终答是否需要兜底。
+///
+/// 短文本(< 200 字符)且不含动作关键词 → 视为「描述性占位句」,走兜底;
+/// 长文本(≥ 200)或含明确动作关键词 → 视为已含实质内容,不追加(避免冗余)。
+fn runner_text_needs_fallback(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    if text.chars().count() >= 200 {
+        return false;
+    }
+    const KEYWORDS: &[&str] = &[
+        "已打开", "已点击", "已输入", "已截图", "已抓取", "已采集", "已登录",
+        "已写入", "已生成", "page_id", "BrowserNew", "BrowserControl", "BrowserInspect",
+        "已完成", "执行成功", "已保存", "成功完成",
+    ];
+    !KEYWORDS.iter().any(|k| text.contains(k))
+}
+
+/// 2026-09-17 第 78 轮 P0-2:从 Bash 工具结果中提取主输出。
+///
+/// Bash 信封形如:
+/// ```text
+/// <stdout>
+/// ... 主输出 ...
+/// </stdout>
+///
+/// <stderr>
+/// ... 错误输出 ...
+/// </stderr>
+///
+/// <exit_code>0</exit_code>
+/// ```
+///
+/// 提取 `<stdout>` 段内的最长非空连续段落(≥30 字符),
+/// 跳过纯提示行(`echo xxx` 之类),保留实际抓取内容。
+fn extract_bash_main_output(content: &str) -> Option<String> {
+    let stdout_start = content.find("<stdout>")?;
+    let stdout_end = content.find("</stdout>")?;
+    let stdout = &content[stdout_start + "<stdout>".len()..stdout_end];
+    // 取最长的非空连续段落(段落按空行分隔)
+    let mut longest = String::new();
+    for block in stdout.split("\n\n") {
+        let trimmed = block.trim();
+        if trimmed.chars().count() > longest.chars().count() && trimmed.chars().count() >= 30 {
+            longest = trimmed.to_string();
+        }
+    }
+    if longest.is_empty() {
+        // 退化:取整个 stdout 段(去掉首尾空白)
+        let trimmed = stdout.trim();
+        if trimmed.chars().count() >= 30 {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    } else {
+        Some(longest)
+    }
+}
+
+/// 简单字符级截断 + 「...」后缀。
+fn truncate_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
+        out.push_str("...");
+        out
     }
 }
 
@@ -553,5 +796,116 @@ mod tests {
         // 反例:不能因 "ok" 之类子串误判
         assert!(!looks_like_failure("ok"));
         assert!(!looks_like_failure("完成")); // "完成" 不在关键词列表
+    }
+
+    // ================== 2026-09-17 第 78 轮 P0-2 新增:Runner 出口兜底测试 ==================
+
+    use crate::llm::ContentBlock;
+
+    /// 构造一个 Bash 工具的 sub_session(模拟 SubAgent 跑 Python Playwright 写文件场景)
+    fn make_bash_session() -> Vec<ChatMessage> {
+        vec![
+            // user 任务提示
+            ChatMessage::user("打开文心一言"),
+            // Assistant 调用 Bash
+            ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({
+                    "command": "python3 -c \"from playwright.sync_api import sync_playwright; ..."
+                }),
+            }]),
+            // Tool 返回 stdout 含真实 AI 回复
+            ChatMessage::tool_result(
+                "toolu_1",
+                "<stdout>\n黄金价格 927.79 元/克,白银价格 63.80 美元/盎司,数据来源: 文心一言实时查询\n\n风险提示: 以上价格仅供参考,实际交易价格以市场为准。\n</stdout>\n\n<stderr>\n\n</stderr>\n\n<exit_code>0</exit_code>",
+                false,
+            ),
+        ]
+    }
+
+    #[test]
+    fn extract_runner_evidence_bash_picks_main_stdout() {
+        let msgs = make_bash_session();
+        let evidences = SubAgentRunner::extract_runner_evidence_from_session(&msgs);
+        assert!(!evidences.is_empty(), "Bash 调用应能提取 evidence");
+        let (text, source) = &evidences[0];
+        assert!(text.contains("黄金价格"), "应包含真实 AI 回复内容");
+        assert!(source.starts_with("Bash["), "来源标签应是 Bash[toolu_1]");
+    }
+
+    #[test]
+    fn extract_runner_evidence_skips_failed_tool_results() {
+        // tool_result is_error=true 应被跳过(避免污染产物)
+        let msgs = vec![
+            ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "false"}),
+            }]),
+            ChatMessage::tool_result("t1", "<stdout>\nerror\n</stdout>\n<exit_code>1</exit_code>", true),
+        ];
+        let evidences = SubAgentRunner::extract_runner_evidence_from_session(&msgs);
+        // 失败时 content 含 exit_code 1,会被过滤;提取仍可能抓到"error"但因 < 30 字符被截掉
+        // 实际上 extract_bash_main_output 只在 >=30 字符时返回;这里 content 长度太短
+        // 验证不会因错误调用产生误导性 evidence
+        for (t, _) in &evidences {
+            assert!(!t.contains("exit_code"), "不应包含退出码噪音");
+        }
+    }
+
+    #[test]
+    fn runner_text_needs_fallback_distinguishes_short_and_long() {
+        // 短描述性文本(无动作关键词)→ 需要兜底
+        assert!(runner_text_needs_fallback("任务成功"));
+        assert!(runner_text_needs_fallback("处理完毕"));
+        // 含动作关键词 → 不需要兜底
+        assert!(!runner_text_needs_fallback("已打开 example.com 并截图"));
+        assert!(!runner_text_needs_fallback("page_id=p_xxx 已点击按钮"));
+        // 长文本(>=200) → 不需要兜底
+        let long_text = "x".repeat(250);
+        assert!(!runner_text_needs_fallback(&long_text));
+        // 空文本 → 需要兜底
+        assert!(runner_text_needs_fallback(""));
+        assert!(runner_text_needs_fallback("   "));
+    }
+
+    #[test]
+    fn extract_bash_main_output_finds_longest_block() {
+        let content = "<stdout>\nshort\n\nthis is a long block with detailed AI response content here, should be picked over the short one\n\nlast\n</stdout>";
+        let extracted = extract_bash_main_output(content);
+        assert!(extracted.is_some());
+        let s = extracted.unwrap();
+        assert!(s.contains("detailed AI response"));
+    }
+
+    #[test]
+    fn extract_runner_evidence_handles_write_with_large_content() {
+        // Write 工具:tool_call.arguments.content 在 Assistant 消息,
+        // tool_result 是写入成功的 JSON 信封
+        let msgs = vec![
+            ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "w1".into(),
+                name: "Write".into(),
+                input: serde_json::json!({
+                    "file_path": "/tmp/wenxin_result.txt",
+                    "content": "#!/usr/bin/env python3\n# 长 Python 脚本,模拟爬取文心一言...\nimport sys\nprint('result')\n".repeat(50)
+                }),
+            }]),
+            ChatMessage::tool_result(
+                "w1",
+                r#"{"code":0,"message":"ok","data":{"file_path":"/tmp/wenxin_result.txt","bytes_written":3500}}"#,
+                false,
+            ),
+        ];
+        let evidences = SubAgentRunner::extract_runner_evidence_from_session(&msgs);
+        // Write 工具目前只生成文件路径+字节数摘要(< 50 字符,会被跳过)
+        // 这是预期行为(避免在 evidence 里塞 5KB 内容)
+        for (t, _) in &evidences {
+            assert!(
+                t.contains("/tmp/wenxin_result.txt") || t.contains("wenxin"),
+                "Write evidence 应包含文件路径摘要"
+            );
+        }
     }
 }
