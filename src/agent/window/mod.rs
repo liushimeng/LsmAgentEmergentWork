@@ -535,8 +535,9 @@ impl PermissionReport {
 ///
 /// 关键设计:窗口期间权限状态可能变化(用户主动授权),故缓存仅 30 秒,
 /// 让重试链路在合理时间内拿到最新状态。`LAEW_PERMISSION_CACHE_SECS` 可覆盖。
-static PERMISSION_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, PermissionReport)>>> =
-    std::sync::OnceLock::new();
+static PERMISSION_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::time::Instant, PermissionReport)>>,
+> = std::sync::OnceLock::new();
 
 /// 进程级单点权限探测(2026-09-17 第 77 轮 P0-1)。
 ///
@@ -661,9 +662,7 @@ fn probe_macos_permissions() -> PermissionReport {
 fn probe_macos_screen_recording() -> bool {
     use core_graphics::display::CGRectNull;
     use core_graphics::image::CGImage;
-    use core_graphics::window::{
-        kCGWindowImageBoundsIgnoreFraming, kCGWindowListOptionAll,
-    };
+    use core_graphics::window::{kCGWindowImageBoundsIgnoreFraming, kCGWindowListOptionAll};
     use foreign_types::ForeignType;
 
     // 全屏截 1 像素测试;屏幕录制未授权时 CGWindowListCreateImage 返回 NULL。
@@ -707,7 +706,9 @@ fn probe_macos_screen_recording() -> bool {
 /// ```
 pub fn build_permission_failure_message(report: &PermissionReport) -> String {
     let mut lines = Vec::new();
-    lines.push(format!("\n\n【平台权限快速检测(2026-09-17 第 77 轮 P0-1)】"));
+    lines.push(format!(
+        "\n\n【平台权限快速检测(2026-09-17 第 77 轮 P0-1)】"
+    ));
     let mut missing = Vec::new();
     if !report.accessibility {
         missing.push("辅助功能(accessibility)");
@@ -724,7 +725,10 @@ pub fn build_permission_failure_message(report: &PermissionReport) -> String {
             missing.join("\n  - ")
         ));
         if !report.accessibility_hint.is_empty() {
-            lines.push(format!("【辅助功能授权步骤】\n  {}", report.accessibility_hint));
+            lines.push(format!(
+                "【辅助功能授权步骤】\n  {}",
+                report.accessibility_hint
+            ));
         }
         if !report.screen_recording_hint.is_empty() {
             lines.push(format!(
@@ -732,11 +736,10 @@ pub fn build_permission_failure_message(report: &PermissionReport) -> String {
                 report.screen_recording_hint
             ));
         }
+        lines.push("【降级路径(WindowUse 已扩 Bash 白名单,无需授权)】".to_string());
         lines.push(
-            "【降级路径(WindowUse 已扩 Bash 白名单,无需授权)】".to_string(),
-        );
-        lines.push(
-            "  - 启动 / 激活应用: osascript -e 'tell application \"WeChat\" to activate'".to_string(),
+            "  - 启动 / 激活应用: osascript -e 'tell application \"WeChat\" to activate'"
+                .to_string(),
         );
         lines.push(
             "  - 检测应用是否运行: osascript -e 'tell application \"System Events\" to (name of processes) contains \"WeChat\"'".to_string(),
@@ -745,7 +748,8 @@ pub fn build_permission_failure_message(report: &PermissionReport) -> String {
             "  - 键盘输入(ASCII): osascript -e 'tell application \"System Events\" to keystroke \"text\"'".to_string(),
         );
         lines.push(
-            "  - 键盘输入(CJK): echo -n \"消息内容\" | pbcopy  + osascript keystroke \"v\" / cmd+v".to_string(),
+            "  - 键盘输入(CJK): echo -n \"消息内容\" | pbcopy  + osascript keystroke \"v\" / cmd+v"
+                .to_string(),
         );
         lines.push("  - 坐标点击: cliclick c:x,y(需 brew install cliclick)".to_string());
         lines.push("  - 截图: screencapture -x $TMPDIR/x.png".to_string());
@@ -1036,6 +1040,32 @@ mod tests {
         assert!(ControlAction::parse("scroll", Some("down:abc".into())).is_err());
         assert!(ControlAction::parse("scroll", Some("down:0".into())).is_err());
         assert!(ControlAction::parse("scroll", Some("down:101".into())).is_err());
+    }
+
+    #[test]
+    fn control_action_parse_type_text_submit() {
+        // 2026-09-17 第 80 轮:原子发送动作是跨平台工具契约。
+        assert_eq!(
+            ControlAction::parse_ext("type_text_submit", Some("hello".into()), None, None).unwrap(),
+            ControlAction::TypeTextSubmit {
+                text: "hello".into(),
+                x: None,
+                y: None
+            }
+        );
+        assert_eq!(
+            ControlAction::parse_ext("sendtext", Some("发送".into()), Some(120), Some(240))
+                .unwrap(),
+            ControlAction::TypeTextSubmit {
+                text: "发送".into(),
+                x: Some(120),
+                y: Some(240)
+            }
+        );
+        assert!(
+            ControlAction::parse_ext("type_text_submit", None, None, None).is_err(),
+            "缺少 text 时必须结构化报错"
+        );
     }
 
     #[test]

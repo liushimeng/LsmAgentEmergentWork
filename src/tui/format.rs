@@ -277,7 +277,8 @@ pub fn format_task_result(
                         // 原文不重复出现(破坏富文本渲染测试)。
                         let ok_brief: Option<String> = if tc.tool.starts_with("Browser") {
                             browser_output_brief(&tc.output_summary)
-                        } else if tc.tool.starts_with("Window") && !tc.output_summary.trim().is_empty()
+                        } else if tc.tool.starts_with("Window")
+                            && !tc.output_summary.trim().is_empty()
                         {
                             Some(truncate_chars(&tc.output_summary, 80))
                         } else {
@@ -384,9 +385,7 @@ pub fn format_task_result(
             .unwrap_or_default();
         // D8 成本估算(2026-09-17 第 76 轮):调用方据当前模型内置价预算好传入;
         // None(模型无内置参考价 / 无 provider)时不追加,行格式与此前完全一致。
-        let cost_suffix = cost_hint
-            .map(|c| format!("  成本≈{c}"))
-            .unwrap_or_default();
+        let cost_suffix = cost_hint.map(|c| format!("  成本≈{c}")).unwrap_or_default();
         out.push_str(&format!(
             "  本次用量: input={}  output={}{}{}{}\n",
             usage.input_tokens, usage.output_tokens, cache, elapsed_suffix, cost_suffix
@@ -562,7 +561,8 @@ pub fn format_failed_detail(
                         // ★第 79 轮 P2-5:Browser* 走信封精简摘要(同 format_task_result 段)
                         let ok_brief: Option<String> = if tc.tool.starts_with("Browser") {
                             browser_output_brief(&tc.output_summary)
-                        } else if tc.tool.starts_with("Window") && !tc.output_summary.trim().is_empty()
+                        } else if tc.tool.starts_with("Window")
+                            && !tc.output_summary.trim().is_empty()
                         {
                             Some(truncate_chars(&tc.output_summary, 80))
                         } else {
@@ -850,7 +850,8 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
     match tool {
         "Bash" => {
             // 提取 command 字段(尝试简单解析;失败回退到原文)
-            let cmd = extract_json_field(args_json, "command").unwrap_or_else(|| args_json.to_string());
+            let cmd =
+                extract_json_field(args_json, "command").unwrap_or_else(|| args_json.to_string());
             let short = truncate_chars(&cmd, 44);
             format!("cmd={short}")
         }
@@ -1059,9 +1060,16 @@ mod tool_args_brief_tests {
     fn bash_brief_extracts_command() {
         let json = r#"{"command":"screencapture -x /tmp/wechat_main.png","timeout_ms":30000}"#;
         let brief = tool_args_brief("Bash", json);
-        assert!(brief.starts_with("cmd="), "Bash brief 应以 cmd= 开头, 实际: {brief}");
+        assert!(
+            brief.starts_with("cmd="),
+            "Bash brief 应以 cmd= 开头, 实际: {brief}"
+        );
         assert!(brief.contains("screencapture"), "应保留命令关键字: {brief}");
-        assert!(brief.len() <= 60, "Bash brief 应精简,实际长度: {}", brief.len());
+        assert!(
+            brief.len() <= 60,
+            "Bash brief 应精简,实际长度: {}",
+            brief.len()
+        );
     }
 
     #[test]
@@ -1105,7 +1113,10 @@ mod tool_args_brief_tests {
     #[test]
     fn extract_json_field_handles_escapes() {
         let json = r#"{"path":"C:\\Users\\foo\\bar.txt","name":"a\"b"}"#;
-        assert_eq!(extract_json_field(json, "path").as_deref(), Some(r"C:\Users\foo\bar.txt"));
+        assert_eq!(
+            extract_json_field(json, "path").as_deref(),
+            Some(r"C:\Users\foo\bar.txt")
+        );
         assert_eq!(extract_json_field(json, "name").as_deref(), Some(r#"a"b"#));
     }
 
@@ -1135,7 +1146,10 @@ mod tool_args_brief_tests {
     fn browser_new_brief_extracts_url() {
         let json = r#"{"url":"https://wenxin.baidu.com/","mode":"hidden"}"#;
         let brief = tool_args_brief("BrowserNew", json);
-        assert!(brief.starts_with("url="), "BrowserNew brief 应以 url= 开头,实际: {brief}");
+        assert!(
+            brief.starts_with("url="),
+            "BrowserNew brief 应以 url= 开头,实际: {brief}"
+        );
         assert!(brief.contains("wenxin.baidu.com"));
     }
 
@@ -1150,7 +1164,8 @@ mod tool_args_brief_tests {
 
     #[test]
     fn browser_inspect_brief_combines_page_id_and_info() {
-        let json = r#"{"page_id":"p_ab12cd34","info":"elements","params":{"selector":"[class*=answer]"}}"#;
+        let json =
+            r#"{"page_id":"p_ab12cd34","info":"elements","params":{"selector":"[class*=answer]"}}"#;
         let brief = tool_args_brief("BrowserInspect", json);
         assert!(brief.contains("p_ab12cd34"));
         assert!(brief.contains("info=elements"));
@@ -1168,16 +1183,17 @@ mod tool_args_brief_tests {
         let env = r#"{"code":0,"message":"ok","data":{"page_id":"p_ab12cd34","title":"文心一言","url":"https://wenxin.baidu.com/"}}"#;
         let brief = browser_output_brief(env).expect("信封应可解析");
         assert!(brief.contains("code=0"), "应含 code: {brief}");
-        assert!(brief.contains("page_id=p_ab12cd34"), "应含 page_id: {brief}");
+        assert!(
+            brief.contains("page_id=p_ab12cd34"),
+            "应含 page_id: {brief}"
+        );
         assert!(brief.contains("文心一言"), "应含 title: {brief}");
     }
 
     #[test]
     fn browser_output_brief_reports_text_len_not_content() {
         let long_text = "黄".repeat(600);
-        let env = format!(
-            r#"{{"code":0,"message":"ok","data":{{"text":"{long_text}"}}}}"#
-        );
+        let env = format!(r#"{{"code":0,"message":"ok","data":{{"text":"{long_text}"}}}}"#);
         let brief = browser_output_brief(&env).expect("信封应可解析");
         assert!(brief.contains("text_len=600"), "应报文本长度: {brief}");
         assert!(!brief.matches('黄').count() > 5, "正文不应刷屏: {brief}");
