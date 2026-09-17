@@ -24,7 +24,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-use crate::database::{ConfigError, Result};
+use crate::database::{ConfigError, ProviderRecord, Result};
 
 /// 默认拒绝的 hostname(小写比对)。
 ///
@@ -82,6 +82,46 @@ fn is_safe_endpoint_with_override(endpoint: &str, allow_private: bool) -> Result
 /// 兼容旧调用名(与 is_safe_endpoint 同义)。
 pub fn check_endpoint_safety(endpoint: &str) -> Result<()> {
     is_safe_endpoint(endpoint)
+}
+
+/// per-provider 感知的 endpoint 校验入口(第 72 轮新增)。
+///
+/// 优先级:
+/// 1. 该 provider 显式 `allow_private_endpoint = true` → 跳过私网拦截(仍走 scheme/URL 解析校验,
+///    但不判 IP 私有性),用于本地 Ollama / LMStudio / mock LLM 服务;
+/// 2. 否则回落 `is_safe_endpoint` 完整校验(含全局 `LAEW_ALLOW_PRIVATE_ENDPOINT=1` 兜底)。
+///
+/// 设计动机:全局 `LAEW_ALLOW_PRIVATE_ENDPOINT=1` 一刀切所有 provider,
+/// 一个本地 mock 会让公网 Anthropic 也失去 SSRF 防护。per-provider 粒度允许用户
+/// 仅对确实指向 loopback/私网的记录放行,其余记录仍 fail-closed。
+pub fn is_safe_endpoint_for_record(record: &ProviderRecord) -> Result<()> {
+    if record.allow_private_endpoint {
+        // 显式放行:仅做 scheme 校验 + URL 解析,跳过 IP 私有性判定。
+        return is_safe_endpoint_permissive(&record.end_point);
+    }
+    is_safe_endpoint(&record.end_point)
+}
+
+/// 宽松校验:只判 scheme(http/https) + URL 可解析,不判 IP 私有性。
+///
+/// 用于 per-provider `allow_private_endpoint = true` 的场景:
+/// 用户已显式声明「这条记录就是指向本机/局域网的」,信任该配置,
+/// 但仍拒绝明显不合法的 URL(如 scheme 错误)以防无意误配。
+fn is_safe_endpoint_permissive(endpoint: &str) -> Result<()> {
+    let url = url::Url::parse(endpoint)
+        .map_err(|e| ConfigError::UrlSafety(format!("URL 解析失败: {e}")))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(ConfigError::UrlSafety(format!(
+                "scheme `{other}` 不被允许(仅 http/https)"
+            )));
+        }
+    }
+    let _ = url
+        .host_str()
+        .ok_or_else(|| ConfigError::UrlSafety("URL 缺少 host".to_string()))?;
+    Ok(())
 }
 
 /// hostname 字符串层校验(大小写不敏感)。
@@ -365,6 +405,92 @@ mod tests {
     #[test]
     fn endpoint_malformed_url_fails() {
         assert!(is_safe_endpoint("not a url").is_err());
+    }
+
+    // ===== per-provider allow_private_endpoint (第 72 轮) =====
+
+    #[test]
+    fn permissive_localhost_ok() {
+        // permissive 模式:loopback / 私网 IP 一律放行(仅校验 scheme + URL 解析)。
+        assert!(is_safe_endpoint_permissive("http://127.0.0.1:11434").is_ok());
+        assert!(is_safe_endpoint_permissive("http://localhost:8080/v1/messages").is_ok());
+        assert!(is_safe_endpoint_permissive("http://10.0.0.1:11434").is_ok());
+        assert!(is_safe_endpoint_permissive("http://192.168.1.100").is_ok());
+    }
+
+    #[test]
+    fn permissive_public_still_ok() {
+        assert!(is_safe_endpoint_permissive("https://api.anthropic.com").is_ok());
+        assert!(is_safe_endpoint_permissive("https://api.openai.com/v1").is_ok());
+    }
+
+    #[test]
+    fn permissive_scheme_still_blocked() {
+        // permissive 仍要拒绝非 http/https scheme(防无意误配)。
+        assert!(is_safe_endpoint_permissive("ftp://127.0.0.1/key").is_err());
+        assert!(is_safe_endpoint_permissive("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn permissive_malformed_url_fails() {
+        assert!(is_safe_endpoint_permissive("not a url").is_err());
+    }
+
+    #[test]
+    fn record_allow_private_bypass_ssrf() {
+        // allow_private_endpoint = true 的记录 → 跳过私网拦截。
+        use crate::database::{Protocol, ProviderRecord};
+        let record = ProviderRecord {
+            id: 1,
+            protocol: Protocol::Anthropic,
+            provider_name: "ollama".into(),
+            model_name: "llama3".into(),
+            end_point: "http://127.0.0.1:11434".into(),
+            api_key: "sk-x".into(),
+            is_active: true,
+            created_at: String::new(),
+            context_max_size: 800_000,
+            allow_private_endpoint: true,
+        };
+        assert!(is_safe_endpoint_for_record(&record).is_ok());
+    }
+
+    #[test]
+    fn record_disallow_private_still_blocked() {
+        // allow_private_endpoint = false → 走完整校验,loopback 仍被拦截。
+        use crate::database::{Protocol, ProviderRecord};
+        let record = ProviderRecord {
+            id: 1,
+            protocol: Protocol::Anthropic,
+            provider_name: "x".into(),
+            model_name: "m".into(),
+            end_point: "http://127.0.0.1:11434".into(),
+            api_key: "sk-x".into(),
+            is_active: false,
+            created_at: String::new(),
+            context_max_size: 800_000,
+            allow_private_endpoint: false,
+        };
+        assert!(is_safe_endpoint_for_record(&record).is_err());
+    }
+
+    #[test]
+    fn record_public_endpoint_ok_regardless() {
+        // 公网 endpoint + allow_private = false → 仍应通过。
+        use crate::database::{Protocol, ProviderRecord};
+        let record = ProviderRecord {
+            id: 1,
+            protocol: Protocol::OpenAi,
+            provider_name: "openai".into(),
+            model_name: "gpt-4o".into(),
+            end_point: "https://api.openai.com/v1".into(),
+            api_key: "sk-x".into(),
+            is_active: true,
+            created_at: String::new(),
+            context_max_size: 800_000,
+            allow_private_endpoint: false,
+        };
+        assert!(is_safe_endpoint_for_record(&record).is_ok());
     }
 
     #[test]

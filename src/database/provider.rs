@@ -27,7 +27,7 @@ impl Db {
         )
     }
 
-    /// 新增一条记录(可指定 context_max_size,None = 默认 800K);若库为空则自动激活
+    /// 新增一条记录(可指定 context_max_size/allow_private_endpoint,None = 默认);若库为空则自动激活
     pub fn add_with_context(
         &self,
         protocol: Protocol,
@@ -37,15 +37,41 @@ impl Db {
         api_key: &str,
         context_max_size: Option<u64>,
     ) -> Result<i64> {
+        self.add_with_all(
+            protocol,
+            provider_name,
+            model_name,
+            end_point,
+            api_key,
+            context_max_size,
+            None, // allow_private_endpoint: None → 默认 false
+            true, // 库为空自动激活
+        )
+    }
+
+    /// 全参数新增(第 72 轮:支持 per-provider allow_private_endpoint)。
+    /// `allow_private = None` 时默认 false;`auto_activate = true` 时库空自动激活。
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with_all(
+        &self,
+        protocol: Protocol,
+        provider_name: &str,
+        model_name: &str,
+        end_point: &str,
+        api_key: &str,
+        context_max_size: Option<u64>,
+        allow_private_endpoint: Option<bool>,
+        auto_activate: bool,
+    ) -> Result<i64> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM providers", [], |r| r.get::<_, i64>(0))?;
-        let activate = count == 0;
+        let activate = auto_activate && count == 0;
         // D9-4 凭证加密(L1600):API Key 落 SQLite 前 AES-256-GCM 加密。
         let encrypted_key = crate::agent::safety::Vault::global()?.encrypt(api_key)?;
         conn.execute(
-            "INSERT INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active, context_max_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active, context_max_size, allow_private_endpoint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 protocol.as_str(),
                 provider_name,
@@ -53,14 +79,19 @@ impl Db {
                 end_point,
                 encrypted_key,
                 if activate { 1 } else { 0 },
-                context_max_size.unwrap_or(crate::database::models::DEFAULT_CONTEXT_MAX_SIZE) as i64
+                context_max_size.unwrap_or(crate::database::models::DEFAULT_CONTEXT_MAX_SIZE) as i64,
+                if allow_private_endpoint.unwrap_or(false) {
+                    1
+                } else {
+                    0
+                }
             ],
         )?;
         let id = conn.last_insert_rowid();
         Ok(id)
     }
 
-    /// 插入一条记录（不自动激活），用于导入
+    /// 插入一条记录（不自动激活），用于导入(第 72 轮:支持 per-provider allow_private_endpoint)
     fn add_without_activate(
         &self,
         protocol: Protocol,
@@ -69,20 +100,22 @@ impl Db {
         end_point: &str,
         api_key: &str,
         context_max_size: Option<u64>,
+        allow_private_endpoint: Option<bool>,
     ) -> Result<i64> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         // D9-4 凭证加密(L1600):API Key 落 SQLite 前 AES-256-GCM 加密。
         let encrypted_key = crate::agent::safety::Vault::global()?.encrypt(api_key)?;
         conn.execute(
-            "INSERT OR IGNORE INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active, context_max_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            "INSERT OR IGNORE INTO providers(protocol, provider_name, model_name, end_point, api_key, is_active, context_max_size, allow_private_endpoint)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
             params![
                 protocol.as_str(),
                 provider_name,
                 model_name,
                 end_point,
                 encrypted_key,
-                context_max_size.unwrap_or(crate::database::models::DEFAULT_CONTEXT_MAX_SIZE) as i64
+                context_max_size.unwrap_or(crate::database::models::DEFAULT_CONTEXT_MAX_SIZE) as i64,
+                if allow_private_endpoint.unwrap_or(false) { 1 } else { 0 }
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -92,7 +125,7 @@ impl Db {
     pub fn list(&self) -> Result<Vec<ProviderRecord>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size
+            "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size, allow_private_endpoint
              FROM providers ORDER BY id ASC",
         )?;
         let iter = stmt.query_map([], row_to_record)?;
@@ -107,7 +140,7 @@ impl Db {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn
             .query_row(
-                "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size
+                "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size, allow_private_endpoint
                  FROM providers WHERE is_active = 1 LIMIT 1",
                 [],
                 row_to_record,
@@ -147,7 +180,7 @@ impl Db {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn
             .query_row(
-                "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size
+                "SELECT id, protocol, provider_name, model_name, end_point, api_key, is_active, created_at, context_max_size, allow_private_endpoint
                  FROM providers WHERE id = ?1",
                 params![id],
                 row_to_record,
@@ -333,6 +366,7 @@ impl Db {
                 &item.end_point,
                 &item.api_key,
                 item.context_max_size,
+                item.allow_private_endpoint,
             ) {
                 Ok(id) => {
                     println!(
@@ -424,6 +458,9 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
     };
     let is_active_int: i64 = row.get(6)?;
     let ctx: i64 = row.get(8)?;
+    // allow_private_endpoint 列可能不存在(旧库未迁移时读后备库场景,但正常路径迁移已补列);
+    // 缺省 false 以保持 SSRF fail-closed 行为。
+    let allow_private: i64 = row.get(9).unwrap_or(0);
     // D9-4 凭证加密(L1600):读出时透明解密;未加密(旧明文)直接透传。
     // 解密失败(主密钥轮换/损坏/记录被篡改)→ 优雅降级为占位符 + 告警,
     // 不崩溃整个列表(用户仍可查看/删除其他记录)。
@@ -450,6 +487,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
         is_active: is_active_int != 0,
         created_at: row.get(7)?,
         context_max_size: ctx.max(0) as u64,
+        allow_private_endpoint: allow_private != 0,
     })
 }
 
@@ -580,11 +618,13 @@ mod tests {
         let json = db.export_to_json().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["version"], "1.1");
+        assert_eq!(parsed["version"], "1.2");
         assert_eq!(parsed["count"], 2);
         assert_eq!(parsed["providers"].as_array().unwrap().len(), 2);
         // 导出携带 context_max_size(默认 800K)
         assert_eq!(parsed["providers"][0]["context_max_size"], 800_000);
+        // 导出携带 allow_private_endpoint(默认 false)
+        assert_eq!(parsed["providers"][0]["allow_private_endpoint"], false);
     }
 
     #[test]
@@ -742,6 +782,71 @@ mod tests {
         assert_eq!(dst.list().unwrap()[0].context_max_size, 128_000);
     }
 
+    // ===== per-provider allow_private_endpoint (第 72 轮) =====
+
+    #[test]
+    fn add_with_defaults_false() {
+        let (db, _d) = fresh_db();
+        db.add(Protocol::Anthropic, "P1", "m1", "https://a", "k1")
+            .unwrap();
+        assert!(!db.list().unwrap()[0].allow_private_endpoint);
+    }
+
+    #[test]
+    fn add_with_all_allow_private_true() {
+        let (db, _d) = fresh_db();
+        db.add_with_all(
+            Protocol::Anthropic,
+            "Ollama",
+            "llama3",
+            "http://127.0.0.1:11434",
+            "sk-x",
+            Some(800_000),
+            Some(true),
+            true,
+        )
+        .unwrap();
+        let r = &db.list().unwrap()[0];
+        assert!(r.allow_private_endpoint);
+    }
+
+    #[test]
+    fn import_allow_private_endpoint_roundtrip() {
+        let (src, _d1) = fresh_db();
+        src.add_with_all(
+            Protocol::Anthropic,
+            "Ollama",
+            "llama3",
+            "http://127.0.0.1:11434",
+            "sk-x",
+            Some(800_000),
+            Some(true),
+            true,
+        )
+        .unwrap();
+        let json = src.export_to_json().unwrap();
+        assert!(json.contains("\"allow_private_endpoint\": true"));
+
+        let (dst, _d2) = fresh_db();
+        dst.import_from_json(&json).unwrap();
+        assert!(dst.list().unwrap()[0].allow_private_endpoint);
+    }
+
+    #[test]
+    fn import_defaults_false_when_field_missing() {
+        // 旧版导出文件(无 allow_private_endpoint 字段)→ 导入时默认 false
+        let (db, _d) = fresh_db();
+        let json = r#"{
+            "protocol": "anthropic",
+            "provider_name": "Old",
+            "model_name": "m1",
+            "end_point": "https://a",
+            "api_key": "k1"
+        }"#;
+        db.import_from_json(json).unwrap();
+        assert!(!db.list().unwrap()[0].allow_private_endpoint);
+    }
+
     #[test]
     fn migration_backfills_context_max_size_on_old_db() {
         // 模拟旧版数据库(无 context_max_size 列 + 旧 CHECK):打开后自动迁移并回填
@@ -798,6 +903,8 @@ mod tests {
         let r = &db.list().unwrap()[0];
         assert_eq!(r.provider_name, "Old");
         assert_eq!(r.context_max_size, 800_000);
+        // 存量记录 allow_private_endpoint 默认 false(保持 SSRF fail-closed)
+        assert!(!r.allow_private_endpoint);
         // CHECK 重建后旧数据保留,且 compact 角色可写
         let rows = db.list_session_memory("s-old", 10).unwrap();
         assert_eq!(rows.len(), 1);

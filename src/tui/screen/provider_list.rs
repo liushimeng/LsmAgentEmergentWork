@@ -14,7 +14,7 @@ use crate::tui::input::display_width;
 use crate::tui::screen::provider_del::ProviderDelPicker;
 use crate::tui::theme::{self, attr};
 
-const FIELD_LABELS: [&str; 7] = [
+const FIELD_LABELS: [&str; 8] = [
     "id",
     "protocol",
     "provider_name",
@@ -22,6 +22,7 @@ const FIELD_LABELS: [&str; 7] = [
     "end_point",
     "api_key",
     "context_max_size",
+    "allow_private_endpoint",
 ];
 
 pub struct ProviderList {
@@ -68,6 +69,13 @@ impl ProviderList {
                 r.context_max_size,
                 crate::config::format_context_size(r.context_max_size)
             ),
+            7 => {
+                if r.allow_private_endpoint {
+                    "允许(私网/loopback)".to_string()
+                } else {
+                    "禁止(默认)".to_string()
+                }
+            }
             _ => String::new(),
         }
     }

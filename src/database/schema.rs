@@ -150,12 +150,33 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
 /// 幂等迁移:
 /// 1. providers 表补 `context_max_size` 列(ADD COLUMN 带常量 DEFAULT,存量行自动回填);
-/// 2. session_memory / agent_memory 的 role CHECK 约束扩展 'compact'/'debug'/'session'
+/// 2. providers 表补 `allow_private_endpoint` 列(默认 0/false,存量记录保持原 SSRF fail-closed 行为);
+/// 3. session_memory / agent_memory 的 role CHECK 约束扩展 'compact'/'debug'/'session'
 ///    (SQLite 不支持修改 CHECK,采用表重建;仅当旧 CHECK 不含 'compact' 时执行)。
 pub fn migrate(conn: &Connection) -> Result<()> {
     migrate_providers_context_max_size(conn)?;
+    migrate_providers_allow_private_endpoint(conn)?;
     rebuild_role_check(conn, "session_memory")?;
     rebuild_role_check(conn, "agent_memory")?;
+    Ok(())
+}
+
+/// providers 表补 allow_private_endpoint 列(默认 0/false,存量记录保持原 SSRF fail-closed 行为)。
+///
+/// 用于本地 Ollama / LMStudio / mock LLM 用户显式放行 loopback / 私网 endpoint,
+/// 避免全局 `LAEW_ALLOW_PRIVATE_ENDPOINT=1` 一刀切(第 72 轮 per-provider 支持)。
+fn migrate_providers_allow_private_endpoint(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(providers)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if cols.iter().any(|c| c == "allow_private_endpoint") {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE providers ADD COLUMN allow_private_endpoint INTEGER NOT NULL DEFAULT 0",
+        [],
+    )?;
     Ok(())
 }
 
