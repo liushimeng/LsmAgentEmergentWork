@@ -381,9 +381,14 @@ pub fn client_from_record(record: &ProviderRecord, user_agent: &str) -> Result<A
     // D9-7 SSRF 防护(L1608/L1625):创建 LLM 客户端前校验 end_point 安全性。
     // 第 72 轮:per-provider `allow_private_endpoint = true` 时跳过私网拦截,
     // 用于本地 Ollama/LMStudio/mock LLM 服务(避免全局 LAEW_ALLOW_PRIVATE_ENDPOINT=1 一刀切)。
+    // 第 73 轮:错误文案末尾追加可执行的 escape hatch 命令(`laew provider allow-private <id>`),
+    // 让用户在 CLI/TUI 任何入口撞到拦截时都能立刻知道「下一步该敲哪条命令」。
     crate::agent::safety::url_safety::is_safe_endpoint_for_record(record).map_err(|e| {
         crate::error::AgentError::Config(crate::database::ConfigError::UrlSafety(format!(
-            "end_point 不安全: {e}"
+            "end_point 不安全: {e}\n  \
+             一键放行(per-provider,推荐): laew provider allow-private {}\n  \
+             全局放行(影响全部 provider): export LAEW_ALLOW_PRIVATE_ENDPOINT=1",
+            record.id
         )))
     })?;
     let inner: Arc<dyn LlmClient> = match record.protocol {

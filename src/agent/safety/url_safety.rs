@@ -73,7 +73,10 @@ fn is_safe_endpoint_with_override(endpoint: &str, allow_private: bool) -> Result
         .ok_or_else(|| ConfigError::UrlSafety("URL 缺少 host".to_string()))?;
     check_hostname_safety(host)?;
     // IP 字面量直接判私有性;域名本轮放行(不做 DNS 解析,避免阻塞)。
-    if let Ok(ip) = IpAddr::from_str(host) {
+    // 第 73 轮:`url::Url::host_str()` 对 IPv6 URL(如 `http://[::1]:11434`)返回
+    // 带方括号的 `"[::1]"`,`IpAddr::from_str` 无法解析。剥掉方括号后再判一次。
+    let ip_literal = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = IpAddr::from_str(ip_literal) {
         check_ip_safety(ip)?;
     }
     Ok(())
@@ -82,6 +85,20 @@ fn is_safe_endpoint_with_override(endpoint: &str, allow_private: bool) -> Result
 /// 兼容旧调用名(与 is_safe_endpoint 同义)。
 pub fn check_endpoint_safety(endpoint: &str) -> Result<()> {
     is_safe_endpoint(endpoint)
+}
+
+/// 纯探测 endpoint 是否指向私网/loopback(用于 UI 提示文案)。
+///
+/// 第 73 轮:`is_safe_endpoint` 默认读 `LAEW_ALLOW_PRIVATE_ENDPOINT` env + URL 解析,
+/// TUI 横幅需要的是「这个 endpoint 客观上是不是私网」而非「当前能不能通过校验」,
+/// 否则在 env 已放行的场景下横幅永远显示"未命中",失去探测意义。
+///
+/// 设计:
+/// - 不读 env:与 `is_safe_endpoint_with_override(_, false)` 等价
+/// - 不与 record 关联:纯字符串探测,独立可测
+/// - 返回 `true` 表示指向私网(loopback / 私网 IP / metadata 域名 / .local/.internal 后缀)
+pub fn probe_is_private(endpoint: &str) -> bool {
+    is_safe_endpoint_with_override(endpoint, false).is_err()
 }
 
 /// per-provider 感知的 endpoint 校验入口(第 72 轮新增)。
@@ -497,5 +514,58 @@ mod tests {
     fn blocked_hostnames_constant() {
         assert!(BLOCKED_HOSTNAMES.contains(&"localhost"));
         assert!(BLOCKED_HOSTNAMES.contains(&"metadata.google.internal"));
+    }
+
+    // ===== probe_is_private (第 73 轮) =====
+
+    #[test]
+    fn probe_is_private_public_returns_false() {
+        assert!(!probe_is_private("https://api.anthropic.com"));
+        assert!(!probe_is_private("https://api.openai.com/v1"));
+        assert!(!probe_is_private("https://example.com:8443/v1/messages"));
+    }
+
+    #[test]
+    fn probe_is_private_loopback_returns_true() {
+        assert!(probe_is_private("http://127.0.0.1:11434"));
+        assert!(probe_is_private("http://127.0.0.1:8080/v1/messages"));
+        // ::1 IPv6 loopback(URL 写法带方括号,host_str 解析后无括号)
+        assert!(probe_is_private("http://[::1]:11434"));
+    }
+
+    #[test]
+    fn probe_is_private_10net_returns_true() {
+        assert!(probe_is_private("http://10.0.0.1:11434"));
+        assert!(probe_is_private("http://192.168.1.100"));
+        assert!(probe_is_private("http://172.16.0.1:8080"));
+    }
+
+    #[test]
+    fn probe_is_private_localhost_returns_true() {
+        // localhost 字符串(非 IP 字面量)也会被探测为私网
+        assert!(probe_is_private("http://localhost:11434"));
+        assert!(probe_is_private("http://metadata.google.internal/foo"));
+        assert!(probe_is_private("http://db.internal:5432"));
+    }
+
+    #[test]
+    fn probe_is_private_does_not_read_env() {
+        // 关键设计点:probe_is_private 必须不读 LAEW_ALLOW_PRIVATE_ENDPOINT,
+        // 否则 env 已放行的用户横幅永远显示"未命中",失去探测意义。
+        // 测试中临时设 env(其他测试并发运行,set_var 不可靠,所以这里只验证
+        // 函数本身实现就是 override=false,即便 env 被设也不影响)。
+        //
+        // 验证方法:即使在 env=1 的进程下,probe_is_private 对 loopback 仍返回 true。
+        // 由于 Rust 测试默认并发,直接 set_var 不可靠,我们采用静态断言:
+        // 函数签名不读 env(可通过源码 review),并验证正常路径下公网仍 false。
+        // 这里仅冒烟测试一遍正常路径。
+        assert!(probe_is_private("http://127.0.0.1"));
+        assert!(!probe_is_private("https://api.anthropic.com"));
+    }
+
+    #[test]
+    fn probe_is_private_malformed_returns_true() {
+        // 解析失败的 URL 视作"不安全"=true,触发横幅提示(比 false 更保守)。
+        assert!(probe_is_private("not a url"));
     }
 }

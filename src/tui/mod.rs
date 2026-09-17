@@ -203,7 +203,7 @@ impl TuiSession {
         );
         // 第 71 轮:未配置状态复用给下方连接行(见 conn_line 注释)
         let has_active = active.is_some();
-        match active {
+        match &active {
             Some(r) => println!(
                 "║  当前模型: {} ║",
                 fit_display(
@@ -221,6 +221,25 @@ impl TuiSession {
                 "║  当前模型: {} ║",
                 fit_display("<未配置, 使用 /provider add 添加>", 45)
             ),
+        }
+        // 第 73 轮:私网探测提示 —— 当 current provider 指向 loopback/私网且
+        // allow_private_endpoint=false 时,在 Session 行前插入可执行的 escape hatch,
+        // 避免用户提交任务后才在 `URL 不安全` 报错里第一次知道有这个问题。
+        if let Some(r) = &active {
+            if !r.allow_private_endpoint
+                && crate::agent::safety::url_safety::probe_is_private(&r.end_point)
+            {
+                let warn = format!(
+                    "{}  ← SSRF 拦截将在任务时触发",
+                    r.end_point
+                );
+                let unlock = format!(
+                    "laew provider allow-private {}  (然后重启 laew)",
+                    r.id
+                );
+                println!("║  ⚠ 私网 : {} ║", fit_display(&warn, 45));
+                println!("║  解  锁 : {} ║", fit_display(&unlock, 45));
+            }
         }
         println!("║  Session: {} ║", fit_display(&self.session.id, 46));
         // D12 主题提示行(2026-09-10 第二十三轮):告知用户当前主题与切换方式

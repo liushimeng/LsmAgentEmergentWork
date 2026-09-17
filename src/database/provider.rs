@@ -206,6 +206,28 @@ impl Db {
         Ok(())
     }
 
+    /// 原子翻转单条记录的 `allow_private_endpoint`(不动其他字段)。
+    ///
+    /// 第 73 轮:为 `laew provider allow-private <id>` 命令提供持久化支持。
+    /// 用于:当前 provider 指向 loopback/私网但 allow_private_endpoint=false
+    /// 导致 `laew --debug` / `laew` 启动时 `URL 不安全` 报错,可一键解锁。
+    ///
+    /// 行为:
+    /// - 仅更新 `allow_private_endpoint` 一列,其他字段(protocol/model/end_point/api_key/is_active/context_max_size)完全不动
+    /// - `value` 写为 0/1,与 schema 迁移时 `DEFAULT 0` 一致
+    /// - `id` 不存在 → `ConfigError::NotFound`(与 `get`/`delete` 行为一致)
+    pub fn set_allow_private_endpoint(&self, id: i64, value: bool) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE providers SET allow_private_endpoint = ?1 WHERE id = ?2",
+            params![if value { 1 } else { 0 }, id],
+        )?;
+        if updated == 0 {
+            return Err(ConfigError::NotFound(id));
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let n = conn.execute("DELETE FROM providers WHERE id = ?1", params![id])?;
@@ -936,5 +958,90 @@ mod tests {
             artifacts: "{}".into(),
         })
         .unwrap();
+    }
+
+    // ===== set_allow_private_endpoint 一键翻转 (第 73 轮) =====
+
+    #[test]
+    fn set_allow_private_endpoint_flips_value() {
+        let (db, _d) = fresh_db();
+        db.add(Protocol::Anthropic, "Ollama", "llama3", "http://127.0.0.1:11434", "k1")
+            .unwrap();
+        let id = db.list().unwrap()[0].id;
+        assert!(!db.get(id).unwrap().allow_private_endpoint);
+
+        // 翻转为 true
+        db.set_allow_private_endpoint(id, true).unwrap();
+        assert!(db.get(id).unwrap().allow_private_endpoint);
+
+        // 再翻回 false
+        db.set_allow_private_endpoint(id, false).unwrap();
+        assert!(!db.get(id).unwrap().allow_private_endpoint);
+
+        // 幂等:同值再写不报错
+        db.set_allow_private_endpoint(id, false).unwrap();
+        assert!(!db.get(id).unwrap().allow_private_endpoint);
+    }
+
+    #[test]
+    fn set_allow_private_endpoint_not_found() {
+        let (db, _d) = fresh_db();
+        // 不存在的 id → ConfigError::NotFound
+        let err = db.set_allow_private_endpoint(999999, true).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::NotFound(_)),
+            "expected NotFound, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn set_allow_private_endpoint_preserves_other_fields() {
+        // 修改后 protocol/model/end_point/api_key/is_active/context_max_size 完全不动
+        let (db, _d) = fresh_db();
+        db.add_with_all(
+            Protocol::OpenAi,
+            "OpenAI",
+            "gpt-4o",
+            "https://api.openai.com/v1",
+            "sk-original",
+            Some(200_000),
+            Some(false),
+            true,
+        )
+        .unwrap();
+        let id = db.list().unwrap()[0].id;
+        let before = db.get(id).unwrap();
+
+        db.set_allow_private_endpoint(id, true).unwrap();
+
+        let after = db.get(id).unwrap();
+        assert_eq!(after.protocol, before.protocol);
+        assert_eq!(after.provider_name, before.provider_name);
+        assert_eq!(after.model_name, before.model_name);
+        assert_eq!(after.end_point, before.end_point);
+        assert_eq!(after.api_key, before.api_key, "api_key 必须不被破坏(Vault 加密链路不能丢)");
+        assert_eq!(after.is_active, before.is_active);
+        assert_eq!(after.context_max_size, before.context_max_size);
+        assert!(after.allow_private_endpoint);
+    }
+
+    #[test]
+    fn set_allow_private_endpoint_vault_roundtrip() {
+        // api_key 经 Vault AES-256-GCM 加密存库,set 后仍能正确解密回明文
+        let (db, _d) = fresh_db();
+        db.add(Protocol::Anthropic, "Mock", "m", "http://127.0.0.1:8080", "sk-secret-xyz")
+            .unwrap();
+        let id = db.list().unwrap()[0].id;
+
+        // 取一次解密后的明文
+        let key_before = db.get(id).unwrap().api_key.clone();
+        assert_eq!(key_before, "sk-secret-xyz");
+
+        // 翻转
+        db.set_allow_private_endpoint(id, true).unwrap();
+
+        // 再取,必须仍是同一明文
+        let key_after = db.get(id).unwrap().api_key;
+        assert_eq!(key_after, "sk-secret-xyz");
     }
 }

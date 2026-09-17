@@ -127,7 +127,11 @@ enum Cmd {
                   \n  # 自定义上下文上限(200K Token):\n    \
                   laew provider add --protocol anthropic --provider-name x \\\n      \
                     --model-name y --end-point https://example.com --api-key sk-z \\\n      \
-                    --context-max-size 200K")]
+                    --context-max-size 200K\n  \
+                  \n  # 本地 mock LLM(127.0.0.1)一键放行 SSRF 拦截(第 73 轮):\n    \
+                  laew provider allow-private 3\n  \
+                  \n  # 关闭放行(还原 SSRF fail-closed):\n    \
+                  laew provider allow-private 3 --off")]
 enum ProviderCmd {
     /// 新增一条接入记录(若库为空则自动激活)
     Add {
@@ -160,6 +164,19 @@ enum ProviderCmd {
     Use { id: i64 },
     /// 删除一条接入记录
     Delete { id: i64 },
+    /// 一键开启/关闭单条接入记录的 allow_private_endpoint(不改动其他字段,第 73 轮)。
+    /// 用于:当前 provider 指向 loopback/私网且 allow_private_endpoint=false
+    /// 导致 `laew --debug`/`laew` 启动时 `URL 不安全` 报错,可直接执行此命令解锁。
+    AllowPrivate {
+        /// 目标接入记录 id(可用 `laew provider list` 查看)
+        id: i64,
+        /// --off = 关闭(置 false),默认 = 开启(置 true)
+        #[arg(long)]
+        off: bool,
+        /// --toggle = 在当前值基础上取反(true ↔ false),与 --off 互斥
+        #[arg(long, conflicts_with = "off")]
+        toggle: bool,
+    },
 }
 
 fn parse_protocol(s: &str) -> std::result::Result<Protocol, String> {
@@ -254,6 +271,34 @@ async fn cmd_provider(p: ProviderCmd) -> Result<()> {
         ProviderCmd::Delete { id } => {
             db.delete(id).map_err(anyhow::Error::from)?;
             println!("✓ 已删除 id={id}");
+        }
+        ProviderCmd::AllowPrivate { id, off, toggle } => {
+            // 第 73 轮:一键翻转 allow_private_endpoint,不动其他字段。
+            // 用于:当前 provider 指向 loopback/私网导致 `URL 不安全` 报错时一键解锁。
+            // 流程:读当前值 → 计算目标值 → UPDATE 单列 → 提示用户(若为 active 则提示重启)
+            let current = db.get(id).map_err(anyhow::Error::from)?;
+            let target = if toggle {
+                !current.allow_private_endpoint
+            } else {
+                !off // --off=true → false;否则默认 true
+            };
+            db.set_allow_private_endpoint(id, target)
+                .map_err(anyhow::Error::from)?;
+            println!(
+                "✓ id={id} ({}/{} @ {}) allow_private_endpoint: {} → {}",
+                current.provider_name,
+                current.model_name,
+                current.end_point,
+                if current.allow_private_endpoint {
+                    "允许"
+                } else {
+                    "禁止"
+                },
+                if target { "允许" } else { "禁止" }
+            );
+            if current.is_active {
+                println!("  注意:该记录为当前激活 provider,本进程内 LLM 客户端已缓存,改动需重启 laew 生效");
+            }
         }
     }
     Ok(())
