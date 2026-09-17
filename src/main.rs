@@ -396,16 +396,38 @@ async fn run_one_shot(
     //     会阻塞进程直到测试超时发 SIGKILL(rc=137),导致 §10 全部 5 项失败。
     let cancel = lsm_agent::agent::cancel::CancelToken::new();
     let sig_cancel = cancel.clone();
+    // 第 78 轮:修改 Ctrl+C 处理,先清理浏览器再退出,避免孤儿 Chrome 进程泄漏。
     let sig_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_err() {
             return;
         }
         sig_cancel.cancel();
-        // 立即以 128+SIGINT=130 惯例退出,与 Unix CLI 一次 Ctrl+C 行为一致。
-        // eprintln 在前:stderr 无缓冲,测试可 grep 到"已取消"作为优雅中断证据。
+        // 等待任务取消完成(给 orchestrator 时间响应 Cancelled),再清理浏览器。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // 清理浏览器子进程(launch 模式),防止孤儿进程泄漏。
+        lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
         eprintln!("[laew] 任务已取消(用户中断)");
         std::process::exit(130);
     });
+    // 第 78 轮:新增 SIGTERM handler(kill 默认信号),同样清理浏览器后退出。
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let sigterm_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            sigterm.recv().await;
+            sigterm_cancel.cancel();
+            // 等待取消传播 + 清理浏览器。
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
+            eprintln!("[laew] 收到 SIGTERM,正在退出");
+            std::process::exit(128 + 15); // 128 + SIGTERM
+        });
+    }
     // 阶段进度(stderr 立即打印,stdout 保持只含答案与用量;与等待心跳同流,
     // 2026-09-10 第 23 轮 D05/D07 测试轮)
     let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -422,6 +444,8 @@ async fn run_one_shot(
         Err(e) if matches!(e, lsm_agent::error::AgentError::Cancelled) => {
             sig_task.abort();
             let _ = stage_printer.await;
+            // 第 78 轮:取消路径也清理浏览器(双重保险,async 路径可能先于 sig_task 完成)。
+            lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
             eprintln!("[laew] 任务已取消(用户中断)");
             std::process::exit(130);
         }
@@ -433,6 +457,8 @@ async fn run_one_shot(
     };
     sig_task.abort();
     let _ = stage_printer.await;
+    // 第 78 轮:任务正常完成后,清理浏览器子进程(避免长驻会话浏览器泄漏)。
+    lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
 
     // debug 模式:任务结束后生成 Debug 报告(用未装饰的 llm 驱动 Debug Agent,避免自我采集递归)
     if let Some(collector) = collector {
@@ -693,11 +719,34 @@ async fn cmd_export_provider(file_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// 第 78 轮:注册进程退出守卫,通过 libc::atexit 在进程退出时清理浏览器子进程。
+///
+/// 覆盖以下路径的浏览器清理:
+/// - main 函数正常返回(主动 shutdown 后的双重保险)
+/// - std::process::exit() 调用(触发 atexit handler)
+///
+/// 不覆盖:
+/// - SIGKILL / SIGSTOP(无法捕获,OS 限制)
+/// - panic(由 crash.rs panic_hook 中 cleanup_sync 处理)
+/// - abort() / 段错误(无法处理)
+fn install_browser_cleanup_guard() {
+    extern "C" fn atexit_cleanup() {
+        lsm_agent::agent::browser::BrowserManager::cleanup_sync();
+    }
+    unsafe {
+        libc::atexit(atexit_cleanup);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // SIGPIPE 必须早于任何 stdout 输出与 panic hook：`laew ... | head` 提前关闭
     // 管道是 Unix CLI 正常行为，不应进入 CrashDump 流程。
     lsm_agent::crash::restore_sigpipe_default();
+
+    // 第 78 轮:注册进程退出守卫(atexit),作为浏览器清理的 L2 兜底。
+    // 覆盖正常 exit / main 返回路径;覆盖 panic 路径(crash.rs panic_hook 中也清理)。
+    install_browser_cleanup_guard();
 
     // 崩溃取证必须先于 CLI 解析 / TUI 初始化 / Tokio worker 创建安装。
     // 报告目录沿用 laew 根目录约定，不依赖数据库配置，用户零配置。

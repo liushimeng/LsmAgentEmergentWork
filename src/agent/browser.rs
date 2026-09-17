@@ -363,6 +363,8 @@ impl BrowserManager {
             inner.handler = Some(handler);
             inner.connect_mode = connect_mode;
             inner.user_data_dir = launch_dir;
+            // 第 78 轮:标记浏览器已启动,供 cleanup_sync() 快速判断避免无意义创建 Runtime。
+            browser_started_flag::set_started();
         }
 
         let browser = inner.browser.as_ref().expect("browser initialized");
@@ -518,14 +520,7 @@ impl BrowserManager {
                 }
                 // 清理一次性 user-data-dir(Chrome 退出可能有几百 ms 延迟,重试几次)
                 if let Some(dir) = inner.user_data_dir.take() {
-                    tokio::spawn(async move {
-                        for _ in 0..10 {
-                            if std::fs::remove_dir_all(&dir).is_ok() {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        }
-                    });
+                    spawn_tempdir_cleanup(dir);
                 }
             }
             if let Some(handler) = inner.handler.take() {
@@ -535,6 +530,111 @@ impl BrowserManager {
         }
         true
     }
+
+    /// 主动关闭所有页面 + 浏览器进程 + handler + 清理 tempdir。
+    ///
+    /// 幂等:重复调用安全(首次调用后 inner.browser=None,后续为 no-op)。
+    /// 供 main 退出 / 任务完成后 / atexit 兜底调用,确保 Chrome 子进程不泄漏。
+    ///
+    /// 设计(第 78 轮,2026-09-17):解决孤儿 Chrome 进程泄漏问题。
+    /// 任务完成或进程退出时,laew 进程终止但 Chrome 子进程变孤儿(reparented to init),
+    /// 本次新增 shutdown 统一回收路径,配合 cleanup_sync() 多层防御。
+    pub async fn shutdown(&self) {
+        let mut inner = self.inner.lock().await;
+        // 关闭所有注册页面(存活性已不重要,全部 drain)。
+        if !inner.pages.is_empty() {
+            let pages: Vec<PageEntry> = inner.pages.drain().map(|(_, e)| e).collect();
+            for entry in pages {
+                let _ = entry.page.close().await;
+            }
+        }
+        // launch 模式才拥有浏览器进程所有权;connect 模式接管外部浏览器,不关闭。
+        if !inner.connect_mode {
+            if let Some(mut browser) = inner.browser.take() {
+                // browser.close() 发送 CDP Browser.close,等待浏览器退出。
+                // 超时 5s 兜底,避免清理挂起。
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    browser.close(),
+                )
+                .await;
+            }
+            // 清理一次性 user-data-dir。
+            if let Some(dir) = inner.user_data_dir.take() {
+                spawn_tempdir_cleanup(dir);
+            }
+        }
+        if let Some(handler) = inner.handler.take() {
+            handler.abort();
+        }
+        inner.connect_mode = false;
+    }
+
+    /// 同步清理入口(供 atexit / panic hook / signal handler 调用)。
+    ///
+    /// 内部创建独立 current-thread Runtime 执行异步 shutdown,避免依赖可能已销毁的
+    /// 主 Runtime(panic/atexit 场景主 Runtime 可能正在 teardown)。
+    /// 清理失败不 panic,避免 panic-in-panic 递归。
+    ///
+    /// 设计(第 78 轮,2026-09-17):多层防御的 L2/L3 兜底。
+    pub fn cleanup_sync() {
+        // 快速路径:通过全局静态 flag 判断是否曾启动浏览器,避免无意义创建 Runtime。
+        if !browser_started_flag::is_started() {
+            return;
+        }
+        // 清理过程中忽略任何 panic,防止 panic-in-panic。
+        let result = std::panic::catch_unwind(|| {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async {
+                let manager = Self::global();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    manager.shutdown(),
+                )
+                .await;
+            });
+        });
+        if let Err(_) = result {
+            // cleanup 中 panic,静默忽略;此时进程即将终止,无影响。
+            #[cfg(debug_assertions)]
+            eprintln!("[laew] browser cleanup_sync panic suppressed");
+        }
+    }
+}
+
+/// 浏览器启动标记 flag。
+///
+/// BrowserManager 首次启动浏览器时置 true,供 cleanup_sync() 快速判断
+/// "是否曾启动过浏览器",避免无意义创建 Runtime。
+/// 使用 AtomicBool + SeqCst 保证跨线程可见。
+mod browser_started_flag {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    pub fn set_started() {
+        STARTED.store(true, Ordering::SeqCst);
+    }
+    pub fn is_started() -> bool {
+        STARTED.load(Ordering::SeqCst)
+    }
+}
+
+/// 生成 user-data-dir 清理辅助:spawn 异步任务重试删除。
+/// Chrome 退出有几百 ms 延迟(写 SingletonLock 等),重试 10 次、每次 300ms。
+fn spawn_tempdir_cleanup(dir: PathBuf) {
+    tokio::spawn(async move {
+        for _ in 0..10 {
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    });
 }
 
 /// 挂 Console / Network 事件监听任务(chromiumoxide EventStream → 环形缓冲)。

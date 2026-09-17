@@ -64,6 +64,12 @@ pub fn install_panic_hook(report_dir: impl Into<PathBuf>) {
         let _ = PREVIOUS_HOOK.set(previous);
 
         panic::set_hook(Box::new(|info| {
+            // 第 78 轮:panic 时优先清理浏览器子进程,防止孤儿 Chrome 进程泄漏。
+            // 使用 catch_unwind 防止清理过程中再次 panic 导致 abort。
+            let _ = std::panic::catch_unwind(|| {
+                crate::agent::browser::BrowserManager::cleanup_sync();
+            });
+
             if let Some(dir) = REPORT_DIR.get() {
                 let record = capture_crash_record(info);
                 match write_crash_report(dir, &record) {
