@@ -87,6 +87,16 @@ pub struct ExecutionTrace {
     /// 用于 TUI 证据段显示 forced_tool 状态,快速定位「0 工具调用」根因。
     #[serde(default)]
     pub forced_tool_effective: Option<bool>,
+    /// 2026-09-17 第 75 轮:Runner 实际执行的 Agent 角色(SubAgent / WindowUse / WebUse)。
+    /// 由 Runner 在 `run_unit_inner` 入口写入;若 `runner_role != intended_role`,
+    /// 说明 WorkFlow 被路由到了一个与步骤需求不匹配的 Runner(典型场景:网页任务
+    /// 错误路由到 WindowUseRunner,Runner 没有 Browser* 工具 → tool_calls=0)。
+    #[serde(default)]
+    pub runner_role: Option<crate::agent::context::AgentRole>,
+    /// 2026-09-17 第 75 轮:WorkFlow 期望的 Agent 角色(`wf.delegate_to`)。
+    /// 与 `runner_role` 对比可识别「委派错配」(`delegate_mismatch` 弱信号)。
+    #[serde(default)]
+    pub intended_role: Option<crate::agent::context::AgentRole>,
 }
 
 /// 单次工具调用摘要(2026-09-16 第 56 轮 + 第 57 轮)。
@@ -163,6 +173,8 @@ impl Default for ExecutionTrace {
             last_bash_exit_code: default_last_bash_exit_code(),
             tool_call_log: Vec::new(),
             forced_tool_effective: None,
+            runner_role: None,
+            intended_role: None,
         }
     }
 }
@@ -232,6 +244,22 @@ impl ExecutionTrace {
         if signals.is_empty() {
             signals.push("ok".into());
         }
+
+        // 5.5) 委派错配信号(2026-09-17 第 75 轮):Runner 实际角色 ≠ WorkFlow 期望角色。
+        // 弱信号,不进入 `is_failed()`;典型场景:网页任务被路由到 WindowUseRunner,
+        // Runner 没有 Browser* 工具 → tool_calls=0 → 单元"看起来"失败但其实是路由问题。
+        // QC 拿到此信号后可以给出明确文案("该 WorkFlow 应走 webuse 但走了 windowuse"),
+        // TUI 据此打印 `[路由错配]` 诊断行(见 `src/tui/dispatch.rs`)。
+        if let (Some(r), Some(i)) = (self.runner_role, self.intended_role) {
+            if r != i && self.tool_calls == 0 {
+                signals.push(format!(
+                    "delegate_mismatch:runner={} intended={}",
+                    r.as_str(),
+                    i.as_str()
+                ));
+            }
+        }
+
         self.failure_signals = signals;
     }
 

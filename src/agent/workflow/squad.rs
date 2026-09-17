@@ -139,6 +139,8 @@ impl SquadDispatcher {
                 sibling_outputs: vec![],
                 window_context: None,
                 pending_agent_messages: vec![],
+                // 2026-09-17 第 75 轮:Squad 成员默认 SubAgent 委派。
+                intended_role: Some(crate::agent::context::AgentRole::SubAgent),
             };
             let permit = semaphore
                 .clone()

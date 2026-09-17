@@ -520,6 +520,8 @@ impl MultiAgentOrchestrator {
             sibling_outputs: vec![],
             window_context: None,
             pending_agent_messages: vec![],
+            // 2026-09-17 第 75 轮:simple 档直接 SubAgent,无需 trace 委派诊断。
+            intended_role: Some(crate::agent::context::AgentRole::SubAgent),
         };
         emit_progress(progress, "wf-1 SubAgent 执行中…");
         let sub_started = std::time::Instant::now();

@@ -143,7 +143,11 @@ impl WebUseRunner {
              9. BrowserNew 成功返回的 next_steps 字段是关键引导,里面列了 input_text/click/wait/elements\n\
                 四步最常见动作的 selector_hint,严格按 next_steps 顺序执行可大幅提升成功率。\n\
              10. 复杂页面(微信公众号后台、电商后台)务必先 BrowserInspect(info=elements) 探测真实\n\
-                DOM 结构(尤其是动态加载的输入框/按钮),不要凭 selector 名字硬猜。",
+                DOM 结构(尤其是动态加载的输入框/按钮),不要凭 selector 名字硬猜。\n\
+             11. ★2026-09-17 第 75 轮:若 BrowserNew 返回 code=3001(未检测到 Chrome/Edge/Chromium),\n\
+                这是确定性失败(浏览器不可执行),请立即在最终回答里直接告知用户安装引导,\n\
+                **不要再尝试别的浏览器启动方式**(xdg-open/open/etc 都不在 Bash 白名单),\n\
+                不要循环重试 BrowserNew,不要改 mode 重试。本机没浏览器 = 任务不可完成。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -160,6 +164,11 @@ impl WebUseRunner {
                 .context_mut()
                 .push(ChatMessage::user(&agent_msg));
         }
+
+        // ★2026-09-17 第 75 轮:提取 Runner 角色信息,供 collect_failure_signals 计算
+        // delegate_mismatch 弱信号 + TUI [路由错配] 诊断行。
+        let runner_role = Some(AgentRole::WebUse);
+        let intended_role = input.intended_role;
 
         // 早终止路径语义与 SubAgentRunner / WindowUseRunner 对齐:包装成失败摘要文本 + trace,
         // 交给 Quality-Check 判定,而不是直接升级为 Error。
@@ -178,6 +187,8 @@ impl WebUseRunner {
                     "[RepeatedToolFailure] 工具 {tool} 连续 {attempts} 次失败;last_error: {last_error}"
                 );
                 let mut tr = ExecutionTrace::default();
+                tr.runner_role = runner_role;
+                tr.intended_role = intended_role;
                 tr.early_terminated = true;
                 tr.early_terminate_reason = format!("tool={tool} attempts={attempts}");
                 tr.max_consecutive_failures = attempts;
@@ -187,6 +198,8 @@ impl WebUseRunner {
             Err(AgentError::MaxIterationsExceeded(n)) => {
                 let summary = format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
                 let mut tr = ExecutionTrace::default();
+                tr.runner_role = runner_role;
+                tr.intended_role = intended_role;
                 tr.iterations = n;
                 tr.early_terminated = true;
                 tr.early_terminate_reason = format!("max_iter:{n}");
@@ -196,6 +209,10 @@ impl WebUseRunner {
             Err(e) => return Err(e), // Cancelled / Llm 等真正错误依然上抛
         };
 
+        // 2026-09-17 第 75 轮:把 Runner 实际角色 + WorkFlow 期望角色写入 trace,
+        // 供 collect_failure_signals 计算 delegate_mismatch 弱信号。
+        trace.runner_role = runner_role;
+        trace.intended_role = intended_role;
         trace.collect_failure_signals(&text);
 
         // Runner 出口兜底(对齐 WindowUse P0-B):0 工具调用且无动作关键词 → 强制标 failed。

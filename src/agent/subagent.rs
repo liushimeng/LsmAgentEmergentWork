@@ -45,6 +45,12 @@ pub struct SubFlowInput {
     /// ★待处理的 Agent 消息(其他 Agent 发来的)。
     #[serde(default)]
     pub pending_agent_messages: Vec<AgentMessage>,
+    /// ★2026-09-17 第 75 轮:WorkFlow 期望的 Agent 角色(`wf.delegate_to` 派生)。
+    /// Runner 写入 `trace.intended_role`;与 `trace.runner_role` 对比可识别
+    /// 「委派错配」(`delegate_mismatch` 弱信号),供 QC + TUI 给出明确诊断。
+    /// `None` 表示 Orchestrator 未注入(老调用点兼容)。
+    #[serde(default)]
+    pub intended_role: Option<AgentRole>,
 }
 
 impl SubFlowInput {
@@ -161,6 +167,10 @@ impl SubAgentRunner {
 
         // Agent 循环返回 (text, usage, trace) 三元组。
         // 早终止路径(RepeatedToolFailure / MaxIterationsExceeded)不再升级为 Error,
+        // ★2026-09-17 第 75 轮:Runner 角色信息(SubAgent)。
+        let runner_role = Some(AgentRole::SubAgent);
+        let intended_role = input.intended_role;
+
         // 而是包装成一段失败摘要文本 + 已填充 early_terminated 的 trace,
         // 让 Quality-Check 仍可基于 trace 判定 Fail。
         let (text, usage, mut trace) = match self
@@ -178,6 +188,8 @@ impl SubAgentRunner {
                     "[RepeatedToolFailure] 工具 {tool} 连续 {attempts} 次失败;last_error: {last_error}"
                 );
                 let mut tr = ExecutionTrace::default();
+                tr.runner_role = runner_role;
+                tr.intended_role = intended_role;
                 tr.early_terminated = true;
                 tr.early_terminate_reason = format!("tool={tool} attempts={attempts}");
                 tr.max_consecutive_failures = attempts;
@@ -187,6 +199,8 @@ impl SubAgentRunner {
             Err(AgentError::MaxIterationsExceeded(n)) => {
                 let summary = format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
                 let mut tr = ExecutionTrace::default();
+                tr.runner_role = runner_role;
+                tr.intended_role = intended_role;
                 tr.iterations = n;
                 tr.early_terminated = true;
                 tr.early_terminate_reason = format!("max_iter:{n}");
@@ -196,6 +210,10 @@ impl SubAgentRunner {
             Err(e) => return Err(e), // Cancelled / Llm 等真正错误依然上抛
         };
 
+        // 2026-09-17 第 75 轮:把 Runner 实际角色 + WorkFlow 期望角色写入 trace,
+        // 供 collect_failure_signals 计算 delegate_mismatch 弱信号。
+        trace.runner_role = runner_role;
+        trace.intended_role = intended_role;
         // 计算多维失败信号 + 综合判定
         trace.collect_failure_signals(&text);
         let failed = trace.is_failed();
@@ -347,6 +365,8 @@ mod tests {
             sibling_outputs: vec![],
             window_context: None,
             pending_agent_messages: vec![],
+            // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
+            intended_role: Some(AgentRole::SubAgent),
         };
 
         let outcome = runner
@@ -391,6 +411,8 @@ mod tests {
             sibling_outputs: vec![],
             window_context: None,
             pending_agent_messages: vec![],
+            // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
+            intended_role: Some(AgentRole::SubAgent),
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("wf-1.step-1"));
@@ -417,6 +439,8 @@ mod tests {
             sibling_outputs: vec!["前序步骤产物 B".into()],
             window_context: None,
             pending_agent_messages: vec![],
+            // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
+            intended_role: Some(AgentRole::SubAgent),
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("上游产物"));
@@ -438,6 +462,8 @@ mod tests {
             sibling_outputs: vec![],
             window_context: None,
             pending_agent_messages: vec![],
+            // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
+            intended_role: Some(AgentRole::SubAgent),
         };
         let prompt = input.to_user_prompt();
         assert!(!prompt.contains("用户原始输入"));
@@ -455,6 +481,8 @@ mod tests {
             sibling_outputs: vec![],
             window_context: None,
             pending_agent_messages: vec![],
+            // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
+            intended_role: Some(AgentRole::SubAgent),
         };
         let json = serde_json::to_string(&input).unwrap();
         // original_prompt 默认值是 null,确保 SubAgent 输入 JSON 兼容老实现

@@ -5,21 +5,23 @@
 
 use super::*;
 
-// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B;第 67 轮语义修正) ==========
+// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B;第 67 轮语义修正;2026-09-17 第 75 轮 WebUse 优先修正) ==========
 //
 // 2026-09-16 第 54 轮:实测「打开微信发消息」任务 Main-Work 把含 osascript 步骤的工作流
 // delegate_to=windowuse,但当时 WindowUse 没有 Bash 工具,导致 SubAgent 循环无法执行命令。
 // 修复:解析 WorkFlowPlan 后,基于步骤文本 + branches 文本 + 验收文本的关键词匹配纠正。
 //
 // 2026-09-16 第 67 轮语义修正(微信 4.x 实测复盘):WindowUse 已带 Bash 白名单 +
-// SendInput/OCR 原生能力,推断优先级改为「GUI 优先」:
-//   - 命中 GUI 关键词(WindowList/WindowInspect/WindowAction/WindowOCR/点击按钮/
-//     控件树/微信/鼠标/滚轮/通讯录 等)→ WindowUse(即便同时出现 osascript 等 shell 词);
-//   - 仅命中 shell 关键词(osascript/xdotool/wmctrl/adb 等)→ SubAgent;
-//   - 网页关键词且无 GUI 词 → WebUse;
-//   - 都没命中 → 保持 Main-Work 显式选择(不强行覆盖)。
-// 旧版把 "powershell/shell/uiautomation" 列在 shell 侧且双命中判 SubAgent,是本次
-// 「微信任务被路由到 Bash 路线 → 判微信未安装」的直接根因。
+// SendInput/OCR 原生能力,推断优先级改为「GUI 优先」。
+//
+// 2026-09-17 第 75 轮(本轮):实测「打开网址 wenxin.baidu.com,中间有一个对话的输入框,
+// 输入内容..., 找到搜素确认的按钮,点击按钮」任务被路由到 WindowUse,16 轮 0 工具调用
+// 失败(Debot 报告 P0-1 / P0-2)。根因:第 67 轮为修微信任务把「输入框」「点击按钮」
+// 「鼠标」「滚轮」等中文 GUI 词加进 WINDOW_USE_KEYWORDS,但这些词在 HTML Web 场景同样存在,
+// 命中后压制 web_hit → 误判 WindowUse → WindowUseRunner 无 Browser* 工具 → 死循环。
+// 修复:把 GUI 关键词拆分为「桌面 GUI 强信号」(WINDOW_USE_STRICT_KEYWORDS)与
+// 「Web DOM 通用词」(WEB_DOM_GUI_KEYWORDS);Web 命中即优先 WebUse,仅当桌面应用
+// 强信号(微信/钉钉/飞书/WindowList/UIA/控件树 等)出现时才覆盖到 WindowUse。
 
 pub(super) const SUBAGENT_KEYWORDS: &[&str] = &[
     "osascript",
@@ -46,28 +48,31 @@ pub(super) const SUBAGENT_KEYWORDS: &[&str] = &[
     // WindowUse 自带 Bash 白名单(桌面操控类命令),GUI 优先不会丢失 shell 能力。
 ];
 
-pub(super) const WINDOW_USE_KEYWORDS: &[&str] = &[
+/// 2026-09-17 第 75 轮:桌面应用专属词 —— 命中基本可锁定 WindowUse。
+///
+/// 与 Web DOM 词汇无交集:微信/钉钉/飞书 等独立桌面应用,以及
+/// `WindowList/WindowInspect/UIA/控件树` 等明确指代 OS 原生窗口/控件树的 API。
+/// 命中后将压制 web_hit(防止把「https://example.com 这个链接粘到微信对话框」误判为 WebUse)。
+pub(super) const WINDOW_USE_STRICT_KEYWORDS: &[&str] = &[
+    // 桌面 OS 窗口 API(UIA/AX/wmctrl 全部)
     "windowlist",
     "windowinspect",
     "windowaction",
     "windowopen",
     "windowocr",
+    "windowscreenshot",
+    "windowfind",
     "控件树",
     "枚举窗口",
     "ui automation",
+    "uiautomation",
     "axpress",
     "set_text",
     "控件路径",
     "无障碍",
     "invoke pattern",
-    // 2026-09-16 第 67 轮:GUI 动作词与桌面应用词扩充(对齐用户「OS API 优先」原则)
-    "鼠标",
-    "滚轮",
-    "通讯录",
-    "聊天窗口",
-    "输入框",
-    "点击按钮",
-    "桌面应用",
+    "sendinput",
+    // 桌面应用专属词(独立 App,非 Web)
     "微信",
     "wechat",
     "weixin",
@@ -75,7 +80,38 @@ pub(super) const WINDOW_USE_KEYWORDS: &[&str] = &[
     "dingtalk",
     "飞书",
     "feishu",
+    "QQ",
+    "telegram",
+    "lark",
+    "wecom",
+    "企业微信",
 ];
+
+/// 2026-09-17 第 75 轮:Web DOM 通用词 —— 在 Web 场景同样存在,不应作为 GUI 强证据。
+///
+/// 保留以供 LLM 进一步细粒度决策(例如纯「输入框填写 100」无 web/desktop 锚时,作次级辅助),
+/// 但**不**进入 `WINDOW_USE_STRICT_KEYWORDS`,不再压制 web_hit。
+pub(super) const WEB_DOM_GUI_KEYWORDS: &[&str] = &[
+    "输入框",
+    "搜索框",
+    "对话框",
+    "点击按钮",
+    "提交按钮",
+    "表单",
+    "弹窗",
+    "页面",
+    "点击",
+    "鼠标",
+    "滚轮",
+    "桌面应用",
+    "通讯录",
+    "聊天窗口",
+];
+
+/// 2026-09-17 第 75 轮:为了不破坏 `mod.rs` 兄弟模块 `use super::*` 取用的常量名,保留
+/// `WINDOW_USE_KEYWORDS` 别名指向 `WINDOW_USE_STRICT_KEYWORDS`(合并语义,新版推断逻辑
+/// 直接用 strict 列表,旧引用仍编译通过)。
+pub(super) const WINDOW_USE_KEYWORDS: &[&str] = WINDOW_USE_STRICT_KEYWORDS;
 
 /// 2026-09-16 第 61 轮:浏览器/网页操控关键词(Chromium-WebUse,第 11 角色)。
 pub(super) const WEB_USE_KEYWORDS: &[&str] = &[
@@ -139,30 +175,39 @@ pub(super) fn gather_spec_text(spec: &WorkFlowSpec) -> String {
 }
 
 /// 基于步骤文本推断 delegate_to(返回 None 表示不强行纠正,保留原值)。
+///
+/// 2026-09-17 第 75 轮推断优先级(修复 web 任务误路由到 windowuse 的 P0 bug):
+///   1. 桌面 GUI 强信号(微信/钉钉/飞书/WindowList/UIA/控件树 等) → 强制 WindowUse
+///   2. web 命中 + 无 desktop-gui 强信号 → WebUse(无论 shell 是否同时出现,
+///      也无论「输入框/按钮」等 Web DOM 词是否出现)
+///   3. 仅 shell 词(无 web 无 desktop-gui) → SubAgent
+///   4. shell + desktop-gui 强信号 → WindowUse(GUI 优先;WindowUse 自带 Bash 白名单)
+///   5. 都没命中 → None(保持 Main-Work 显式选择)
+///
+/// 与第 67 轮版本的关键差异:不再用「输入框/按钮/鼠标/滚轮」等 Web DOM 词作为
+/// GUI 强证据 —— 这些词在 HTML 页面里同样常见,误命中后会压制 web_hit 导致路由错误。
 pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     let text = gather_spec_text(spec);
     let shell_hit = text_contains_any_ci(&text, SUBAGENT_KEYWORDS);
-    let gui_hit = text_contains_any_ci(&text, WINDOW_USE_KEYWORDS);
+    let desktop_gui_hit = text_contains_any_ci(&text, WINDOW_USE_STRICT_KEYWORDS);
     let web_hit = text_contains_any_ci(&text, WEB_USE_KEYWORDS);
-    // 2026-09-16 第 61 轮:网页/浏览器操控 → WebUse(shell 仍最优先,WebUse 无 Bash 工具;
-    // web+gui 同命中按网页处理,网页语境也有"控件"表述)。
-    if web_hit && !shell_hit && !gui_hit {
+
+    // 规则 1:桌面 GUI 强信号 → 强制 WindowUse(覆盖 web/shell)。
+    // 例:微信 + osascript 剪贴板 → 仍判 WindowUse(第 67 轮逻辑保留)。
+    if desktop_gui_hit {
+        return Some(AgentRole::WindowUse);
+    }
+    // 规则 2:web 命中(无 desktop-gui 强信号)→ WebUse。第 75 轮 P0 修复核心。
+    // shell 词同时出现不构成压制(web 任务是主体,shell 是辅助)。
+    if web_hit {
         return Some(AgentRole::WebUse);
     }
-    match (shell_hit, gui_hit) {
-        // shell 命令占主导 → 必须 SubAgent(纯 shell 流程)
-        (true, false) => Some(AgentRole::SubAgent),
-        // GUI 控件占主导 → WindowUse
-        (false, true) => Some(AgentRole::WindowUse),
-        // 2026-09-16 第 67 轮:双命中改判 WindowUse(原 SubAgent)。
-        // 微信任务实测根因:steps 同时出现「点击通讯录」与「osascript/剪贴板」时
-        // 被误判 SubAgent → 8 次 bash 进程检查全失败 →「微信客户端未安装」。
-        // WindowUse 自带 Bash 白名单(桌面操控类命令可执行),GUI 优先不丢 shell 能力,
-        // 且符合「优先 OS API(UIA/OCR/SendInput),Bash 其次」的产品原则。
-        (true, true) => Some(AgentRole::WindowUse),
-        // 都没命中 → 保持原样
-        (false, false) => None,
+    // 规则 3:仅 shell 词 → SubAgent(WebUse 没有 Bash,WindowUse 是白名单模式)。
+    if shell_hit {
+        return Some(AgentRole::SubAgent);
     }
+    // 规则 4:都没命中 → 保持 Main-Work 显式选择(不强行覆盖)。
+    None
 }
 
 /// 对整份 plan 做 delegate_to 推断 + 纠正 + 日志。
@@ -327,5 +372,106 @@ mod infer_tests {
             delegate_to: AgentRole::WindowUse,
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
+    }
+
+    // ========== 2026-09-17 第 75 轮 新增回归用例(WebUse 优先 / 桌面 GUI 严判) ==========
+
+    #[test]
+    fn wenxin_url_with_input_box_routes_to_webuse() {
+        // 第 75 轮 P0 修复核心回归:用户真实失败任务。
+        // steps 同时含 web 词(打开网址/wenxin.baidu.com)和 web DOM 词(输入框/按钮),
+        // 旧版被"输入框/点击按钮"压制 → WindowUse → 死循环;新版必须 WebUse。
+        let spec = WorkFlowSpec {
+            id: "wf-wenxin".into(),
+            name: "文心一言对话".into(),
+            steps: vec![
+                "打开网址 https://wenxin.baidu.com/".into(),
+                "中间有一个对话的输入框,输入内容:最新的最近3个月的黄金和白银的价格K线图帮忙生成一下".into(),
+                "找到搜素确认的按钮,点击按钮".into(),
+                "等待对话结束后,把文心一言输出的信息显示出来".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec!["对话窗口出现 AI 回复内容".into()],
+            delegate_to: AgentRole::WindowUse, // LLM 错判
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+    }
+
+    #[test]
+    fn pure_browser_open_url_routes_to_webuse() {
+        // 通用 web 场景:无 strict GUI 词,只有 web 词 → WebUse
+        let spec = WorkFlowSpec {
+            id: "wf-browser-open".into(),
+            name: "浏览器截图".into(),
+            steps: vec![
+                "用浏览器打开 https://example.com/".into(),
+                "截屏后保存到本地".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+    }
+
+    #[test]
+    fn wechat_desktop_app_with_url_still_routes_to_windowuse() {
+        // 反向用例:步骤中包含 URL 但桌面应用强信号(微信)出现 → 仍判 WindowUse,
+        // 防止「在微信对话框里发送 https://example.com」任务被误判 WebUse。
+        let spec = WorkFlowSpec {
+            id: "wf-wx-url".into(),
+            name: "微信发送链接".into(),
+            steps: vec![
+                "打开微信".into(),
+                "在聊天窗口输入 https://example.com 这个链接".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::WebUse, // LLM 错判
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WindowUse));
+    }
+
+    #[test]
+    fn web_with_shell_helper_still_routes_to_webuse() {
+        // web 任务主体 + shell 辅助(常见模式):不开 GUI strict → WebUse。
+        // 旧版双命中会判 SubAgent(WebUse 没 Bash),新版明确 WebUse 优先。
+        let spec = WorkFlowSpec {
+            id: "wf-sh-web".into(),
+            name: "网页辅助".into(),
+            steps: vec![
+                "打开网址 https://example.com/".into(),
+                "用 curl 抓取首页 HTML 备用".into(),
+            ],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent,
+        };
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+    }
+
+    #[test]
+    fn browser_dom_gui_words_alone_stay_subagent() {
+        // 极端纯描述:仅 web DOM 词、无 web/desktop 锚,LLM 没选明确 → 保持 None。
+        // 这条保证不引入过激 Web 判定(纯描述步骤不应被关键词单方面改判)。
+        let spec = WorkFlowSpec {
+            id: "wf-ambiguous".into(),
+            name: "模糊描述".into(),
+            steps: vec!["在输入框填写 100".into(), "点击按钮提交".into()],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent, // explicit 选 SubAgent
+        };
+        assert_eq!(infer_delegate_to(&spec), None);
     }
 }

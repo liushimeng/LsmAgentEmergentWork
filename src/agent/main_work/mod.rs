@@ -247,6 +247,12 @@ impl MainWorkRunner {
         }
         // 2026-09-16 第 67 轮:同应用 WindowUse 链合并不再要求 suggested_delegate=windowuse
         coalesce_same_app_window_workflows(&mut plan);
+        // 2026-09-17 第 75 轮:兜底 plan 也跑一次关键词推断。
+        // Main-Work JSON 解析失败时构造的单 WorkFlow 兜底不会经过
+        // `parse_workflow_plan → infer_delegate_to_for_plan`(那是 JSON 路径),
+        // 这里手动调用一次,保证「打开网址 + 输入框」等 web 任务被纠正到 WebUse。
+        // 成功路径 `infer_delegate_to_for_plan` 已在 parse.rs 中调用,本调用幂等。
+        infer_delegate_to_for_plan(&mut plan);
 
         let _ = memory::record_entry(
             &self.db,

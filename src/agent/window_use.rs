@@ -100,6 +100,11 @@ impl WindowUseRunner {
         //    避免污染后续 SubAgent 的 Bash 调用。
         let _wu_mode_guard = WindowUseBashModeGuard::enter();
 
+        // ★0.5) 2026-09-17 第 75 轮:提取 Runner 角色信息,供 collect_failure_signals
+        // 计算 delegate_mismatch 弱信号 + TUI [路由错配] 诊断行。
+        let runner_role = Some(AgentRole::WindowUse);
+        let intended_role = input.intended_role;
+
         // ★1) 加载窗口会话状态(跨轮持久化,首次为空)。
         let mut win_state = self.state_mgr.load(session_id).await.unwrap_or_else(|| {
             let mut s = WindowSessionState::new(session_id);
@@ -208,6 +213,8 @@ impl WindowUseRunner {
                     "[RepeatedToolFailure] 工具 {tool} 连续 {attempts} 次失败;last_error: {last_error}"
                 );
                 let mut tr = ExecutionTrace::default();
+                tr.runner_role = runner_role;
+                tr.intended_role = intended_role;
                 tr.early_terminated = true;
                 tr.early_terminate_reason = format!("tool={tool} attempts={attempts}");
                 tr.max_consecutive_failures = attempts;
@@ -217,6 +224,8 @@ impl WindowUseRunner {
             Err(AgentError::MaxIterationsExceeded(n)) => {
                 let summary = format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
                 let mut tr = ExecutionTrace::default();
+                tr.runner_role = runner_role;
+                tr.intended_role = intended_role;
                 tr.iterations = n;
                 tr.early_terminated = true;
                 tr.early_terminate_reason = format!("max_iter:{n}");
@@ -226,6 +235,10 @@ impl WindowUseRunner {
             Err(e) => return Err(e), // Cancelled / Llm 等真正错误依然上抛
         };
 
+        // 2026-09-17 第 75 轮:把 Runner 实际角色 + WorkFlow 期望角色写入 trace,
+        // 供 collect_failure_signals 计算 delegate_mismatch 弱信号。
+        trace.runner_role = runner_role;
+        trace.intended_role = intended_role;
         trace.collect_failure_signals(&text);
 
         // 给 QC / TUI 追加机器可验证证据,防止最终文本与真实工具轨迹相悖。

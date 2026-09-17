@@ -599,5 +599,9 @@ pub(super) fn build_subflow_input(
         sibling_outputs: vec![],
         window_context: None,
         pending_agent_messages: vec![],
+        // 2026-09-17 第 75 轮:把 WorkFlow 期望的角色写入 SubFlowInput,
+        // Runner 在 trace.intended_role 落地,供 collect_failure_signals 计算
+        // delegate_mismatch 弱信号。
+        intended_role: Some(wf.delegate_to),
     }
 }

@@ -309,6 +309,19 @@ fn gate_report_on_trace(
                 .find(|s| s.starts_with("early_terminate:"))
                 .cloned();
             match web_use_reason.as_deref() {
+                // 2026-09-17 第 75 轮:delegate_mismatch 弱信号给出明确文案。
+                // 典型场景:网页任务被路由到 WindowUseRunner,Runner 没 Browser* 工具,
+                // 16 轮 0 工具调用。trace.failure_signals 会含 "delegate_mismatch:runner=WindowUse intended=WebUse"。
+                _ if trace.failure_signals.iter().any(|s| s.starts_with("delegate_mismatch:runner=WindowUse intended=WebUse"))
+                    => format!(
+                        "WebUse 委派错配:WorkFlow 期望执行 Chromium-WebUse 工具集(BrowserNew/BrowserControl/BrowserInspect),\
+                         但 Runner 实际是 WindowUse(无 Browser* 工具)。\
+                         iter={} tool_calls={}。\
+                         排查:1) 检查 Main-Work delegate_to 字段是否被 infer_delegate_to 纠正;\
+                         2) 若纠正失败,检查 steps 是否含 WINDOW_USE_STRICT 桌面 GUI 强信号词被误命中;\
+                         3) 跑下轮重试前确认 trace.runner_role=WebUse trace.intended_role=WebUse。",
+                        trace.iterations, trace.tool_calls
+                    ),
                 Some(r) if r.contains("no_tool_use_no_action_text") => format!(
                     "WebUse 单元 {} 次迭代内未调用任何 BrowserNew/BrowserControl/BrowserInspect 工具,\
                      LLM 持续返回纯文本。trace 工具调用次数=0。\
@@ -352,6 +365,16 @@ fn gate_report_on_trace(
                 trace.early_terminate_reason
             );
             match wu_reason.as_deref() {
+                // 2026-09-17 第 75 轮:WindowUse 接到了 web 任务(委派错配反方向)。
+                _ if trace.failure_signals.iter().any(|s| s.starts_with("delegate_mismatch:runner=WebUse intended=WindowUse"))
+                    => format!(
+                        "WindowUse 委派错配:WorkFlow 期望执行桌面窗口操控工具集(WindowList/WindowInspect/WindowAction),\
+                         但 Runner 实际是 WebUse(无 Window* 工具)。\
+                         iter={} tool_calls={}。\
+                         排查:1) 确认任务目标是桌面应用(微信/钉钉等)而非网页;\
+                         2) 若确实是桌面应用,delegate_to 字段被改判成 webuse 通常意味着 Yolo 误分类,应回退到 medium/hard 档或重新委派。",
+                        trace.iterations, trace.tool_calls
+                    ),
                 Some(r) if r.contains("no_tool_use_no_action_text") => format!(
                     "WindowUse 单元 {} 次迭代内未调用任何 Window 工具,LLM 持续返回纯文本。{}\
                      排查:首步强制 WindowOpen 是否生效;任务是否被误委派(应 delegate_to=windowuse)。",

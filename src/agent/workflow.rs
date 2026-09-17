@@ -206,6 +206,8 @@ pub fn build_subflow_from_goal(goal: &Goal, subgoal: &Goal) -> SubFlowInput {
         sibling_outputs: vec![],
         window_context: None,
         pending_agent_messages: vec![],
+        // 2026-09-17 第 75 轮:Goal 派生 WorkFlow 默认 SubAgent 委派。
+        intended_role: Some(crate::agent::context::AgentRole::SubAgent),
     }
 }
 

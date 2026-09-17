@@ -1,8 +1,54 @@
 # Chromium-WebUse Agent（第 11 角色）设计与解决方案
 
-> 2026-09-16 第 61 轮。前置调研：`Rust语言操作浏览器CDP工具相关的技术信息.md` /
+> 2026-09-16 第 61 轮创建。前置调研：`Rust语言操作浏览器CDP工具相关的技术信息.md` /
 > `Rust语言操作内存浏览器.md` / `Rust语言操作已经打开的浏览器.md`（选型与 CDP 机制），
 > 以及 Go 工程 `go-web-debug-tool`（MCP 风格浏览器操控服务，35 action + 17 info）的参数级移植参考。
+>
+> **2026-09-17 第 75 轮更新**：修复 delegate_to 路由错配（网页任务被错误路由到 WindowUse），
+> 详见 §0「第 75 轮 P0 修复摘要」。
+
+## 0. 第 75 轮 P0 修复摘要(2026-09-17)
+
+### 0.1 问题背景
+
+实测「打开网址 wenxin.baidu.com,中间有一个对话的输入框,输入内容..., 找到搜素确认的按钮,
+点击按钮」任务 51 次 LLM 调用、299 秒、409k cache_read,最终以 `[windowuse-mode] Bash`
+权限拒绝 + 16 轮 0 工具调用失败(Debug 报告:`DebugReport/debug_report_20260917_114355_ade10f.md`,
+P0-1 + P0-2)。
+
+### 0.2 根因
+
+`src/agent/main_work/delegate.rs:142-166` 的 `infer_delegate_to` 把第 67 轮为修微信
+任务加的「输入框」「点击按钮」「鼠标」「滚轮」等中文 GUI 词视为强 GUI 证据,但这些
+词在 HTML Web 场景同样存在。命中后压制 web_hit → 误判 `WindowUse` → WindowUseRunner
+无 Browser* 工具 → 死循环。
+
+### 0.3 修复(本轮 4 处代码改动)
+
+1. **`src/agent/main_work/delegate.rs`** — 拆分 GUI 关键词为 `WINDOW_USE_STRICT_KEYWORDS`
+   (桌面应用专属)与 `WEB_DOM_GUI_KEYWORDS`(Web 通用,不再作为 GUI 强证据);`infer_delegate_to`
+   优先级改为:桌面 GUI 强信号 → WindowUse;web 命中 → WebUse(shell 不再压制);仅 shell → SubAgent。
+
+2. **`src/agent/main_work/mod.rs:248-252`** — Main-Work JSON 解析失败时构造的兜底
+   WorkFlowPlan 也会跑一次 `infer_delegate_to_for_plan`,确保 fallback 路径也能纠正。
+
+3. **`src/agent/extrace.rs` + `src/agent/subagent.rs` + `src/agent/web_use.rs` +
+   `src/agent/window_use.rs`** — `ExecutionTrace` 新增 `runner_role`/`intended_role`
+   字段,Runner 在 `run_unit_inner` 入口注入;`collect_failure_signals` 计算
+   `delegate_mismatch:runner=X intended=Y` 弱信号(`runner_role != intended_role && tool_calls == 0`)。
+
+4. **`src/tui/dispatch.rs:461-475` + `src/agent/quality.rs`** — TUI 任务失败块新增
+   `[路由错配]` 诊断行;QC WebUse/WindowUse early-terminate 文案加
+   `delegate_mismatch` 分支,给出明确文案。
+
+### 0.4 兼容性
+
+- 新增 `ExecutionTrace.runner_role`/`intended_role` 字段加 `#[serde(default)]`,旧
+  trace 反序列化无破坏。
+- `delegate_mismatch` 是**弱信号**,不进入 `is_failed()`,仅作诊断提示。
+- 全部 7 条旧 delegate 推断测试保持 PASS(`wechat_powershell_steps_route_to_windowuse`
+  中"通讯录"仍在 strict 列表)。新增 5 条回归测试(详见 `src/agent/main_work/delegate.rs::infer_tests`)。
+- 回滚:单 commit revert 即可,无 DB 迁移。
 
 ## 1. 需求与定位
 

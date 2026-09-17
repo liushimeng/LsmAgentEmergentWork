@@ -457,6 +457,25 @@ impl TuiSession {
                 if reason.contains("WebUse") || reason.contains("tool_calls=0") || reason.contains("no_tool_use") {
                     println!("  [WebUse 失败诊断] 详见下方 [trace]/[tool]/[failure] 段;若 tool_calls=0 排查方向:1) Chrome/Edge/Chromium 安装;2) 设置 LAEW_BROWSER_PATH;3) 检查 LAEW_FORCED_TOOLS 未关闭首步强制。");
                 }
+                // 2026-09-17 第 75 轮:trace 携带 delegate_mismatch 弱信号时,直接打印
+                // 「路由错配」诊断行,说明 WorkFlow 期望的角色与 Runner 实际执行的角色
+                // 不一致(典型场景:网页任务被路由到 WindowUseRunner,该 Runner 无 Browser*
+                // 工具,导致 tool_calls=0)。让用户/QA 一眼看出问题根因,不必翻 Debug 报告。
+                let mismatch_info: Option<(String, String)> = last_trace
+                    .as_ref()
+                    .and_then(|t| {
+                        let sig = t.failure_signals.iter().find(|s| s.starts_with("delegate_mismatch:"))?;
+                        let runner = t.runner_role.map(|r| r.as_str().to_string()).unwrap_or_default();
+                        let intended = t.intended_role.map(|r| r.as_str().to_string()).unwrap_or_default();
+                        // 取掉信号前缀,展示简洁对
+                        let _ = sig;
+                        Some((runner, intended))
+                    });
+                if let Some((runner, intended)) = mismatch_info {
+                    println!(
+                        "  [路由错配] Runner={runner} 但 WorkFlow 期望={intended};\n    ↳ Runner 的工具集与任务需求不匹配,典型场景:网页任务 → WindowUseRunner(无 Browser* 工具)。\n    ↳ 排查:1) Main-Work delegate 推断是否被 infer_delegate_to 正确覆盖;2) 提交 issue 时附 [trace] 段 runner_role/intended_role。"
+                    );
+                }
                 // 复用 format_task_result 渲染 stage_durations / retry_log / trace 段。
                 // stub_workflow 用 last_trace 携带失败单元的工具调用明细,便于 [trace] [tool] [failure] 段呈现。
                 let stub_workflow =
