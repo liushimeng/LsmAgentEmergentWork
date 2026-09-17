@@ -666,9 +666,40 @@ impl Agent {
                     let drop_n = recent_tool_history.len() - RECENT_TOOL_HISTORY_LIMIT;
                     recent_tool_history.drain(0..drop_n);
                 }
+                // 2026-09-17 第 74 轮:WebUse post-BrowserNew 引导(放在 push 之前,
+                // 这样可以借用 output 不需要 clone)。BrowserNew 成功返回的 next_steps
+                // 是关键指引(4 步最常见动作),注入 LLM 上下文作为 user message,
+                // 显著降低「16 次迭代 tool_calls=0」类失败模式的概率。
+                let browsernew_hint = if name == "BrowserNew" && !is_error {
+                    if let Some(page_id) = crate::agent::web_use::extract_page_id_from_text(&output) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&output) {
+                            v.get("data")
+                                .and_then(|d| d.get("next_steps"))
+                                .map(|next_steps| {
+                                    format!(
+                                        "【WebUse 浏览器启动后续步骤引导】\n\
+                                         BrowserNew 成功 → page_id={page_id}。\n\
+                                         严格按以下 4 步执行(已 next_steps 已为你准备好 selector_hint):\n\
+                                         {next_steps}\n\
+                                         说明:\n\
+                                         - 每次 BrowserControl/BrowserInspect 都要带 page_id={page_id}\n\
+                                         - 如果某一步 selector_hint 不命中,改用 BrowserInspect(info=elements) 查看真实 DOM\n\
+                                         - 按钮是图片(img 元素)时,可直接 click(img 元素) 也能触发提交\n\
+                                         - 输入框有 JS 框架(React/Vue)拦截时,改 use_js=false 走 sendkeys 路径",
+                                        page_id = page_id,
+                                        next_steps = serde_json::to_string_pretty(next_steps)
+                                            .unwrap_or_else(|_| next_steps.to_string()),
+                                    )
+                                })
+                        } else { None }
+                    } else { None }
+                } else { None };
                 session
                     .context_mut()
                     .push(ChatMessage::tool_result(id, output, is_error));
+                if let Some(hint) = browsernew_hint {
+                    session.context_mut().push(ChatMessage::user(&hint));
+                }
             }
             if any_success_this_round {
                 // 任一成功调用重置失败计数

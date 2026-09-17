@@ -445,7 +445,7 @@ pub(super) async fn run_wf_unit(
                 } else {
                     format!(" err={}", truncate_progress_text_default(&entry.error_summary, 40))
                 };
-                let args_part = tool_args_digest(&entry.args_json);
+                let args_part = tool_args_digest(&entry.tool, &entry.args_json);
                 let args_part = if args_part.is_empty() {
                     String::new()
                 } else {

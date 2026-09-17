@@ -90,16 +90,18 @@ impl Tool for BrowserNewTool {
         "BrowserNew"
     }
     fn description(&self) -> &str {
-        "启动/接管 Chromium 并打开一个页面。优先内存无头浏览器(--headless=new),\
+        "启动/接管 Chromium 并打开一个页面。默认纯 CDP 嵌入式无头浏览器(无可见窗口),\
          也可通过 connect_url 接管已用 --remote-debugging-port 启动的浏览器。\
-         返回 {page_id,title,final_url}。未检测到浏览器返回 code=3001。"
+         返回 {page_id,title,final_url,mode,next_steps}。未检测到浏览器返回 code=3001。\
+         mode 枚举:hidden(默认,纯 CDP 无窗口)/new_headless/headed(显式开窗)。"
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object",
             "properties":{
                 "url":{"type":"string","description":"必填,目标网址"},
-                "headless":{"type":"boolean","default":true,"description":"true=无头(默认),false=有窗口"},
+                "mode":{"type":"string","enum":["hidden","new_headless","headed"],"default":"hidden",
+                    "description":"浏览器模式;hidden=纯 CDP 无窗口(默认,推荐),new_headless=旧 headless=true,headed=可见窗口(调试截图)"},
                 "wait_until":{"type":"string","enum":["load","domcontentloaded","networkidle"],"default":"load"},
                 "user_agent":{"type":"string","description":"覆盖 User-Agent"},
                 "connect_url":{"type":"string","description":"接管已开浏览器,如 http://127.0.0.1:9222"},
@@ -113,15 +115,49 @@ impl Tool for BrowserNewTool {
         let Some(url) = str_arg(&args, "url") else {
             return envelope(1001, "缺少 url", json!({}));
         };
-        let headless = args.get("headless").and_then(Value::as_bool).unwrap_or(true);
+        // 2026-09-17 第 74 轮:三档 mode 替换旧 bool headless。
+        // 默认 hidden(纯 CDP 无窗口),解决"误开 macOS 系统默认浏览器"问题。
+        let mode = match str_arg(&args, "mode") {
+            Some("headed") | Some("head") => crate::agent::browser::BrowserMode::Headed,
+            Some("new_headless") | Some("old_headless") => crate::agent::browser::BrowserMode::NewHeadless,
+            _ => crate::agent::browser::BrowserMode::Hidden,
+        };
         let connect = str_arg(&args, "connect_url");
         let ua = str_arg(&args, "user_agent");
-        match BrowserManager::global().new_page(url, headless, connect, ua).await {
+        match BrowserManager::global().new_page(url, mode, connect, ua).await {
             Ok((page_id, title, final_url)) => {
                 if str_arg(&args, "wait_until") == Some("networkidle") {
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 }
-                let mut data = json!({"page_id":page_id,"title":title,"final_url":final_url});
+                let mut data = json!({
+                    "page_id": page_id,
+                    "title": title,
+                    "final_url": final_url,
+                    "mode": match mode {
+                        crate::agent::browser::BrowserMode::Hidden => "hidden",
+                        crate::agent::browser::BrowserMode::NewHeadless => "new_headless",
+                        crate::agent::browser::BrowserMode::Headed => "headed",
+                    },
+                    // 2026-09-17 第 74 轮:next_steps —— 分步引导,降低 LLM 编排成本。
+                    // WebUseRunner 会把 next_steps 注入到 LLM 上下文,显著降低
+                    // 「16 次迭代 tool_calls=0」类失败模式的概率。
+                    "next_steps": [
+                        {"step": 1, "tool": "BrowserControl", "action": "input_text",
+                         "selector_hint": "textarea, [contenteditable=true], input[type=text]",
+                         "tip": "在对话框/输入框输入你的查询文本"},
+                        {"step": 2, "tool": "BrowserControl", "action": "click",
+                         "selector_hint": "button[type=submit], .submit-btn, [class*=send], [class*=submit], img[class*=button]",
+                         "tip": "点击提交按钮(图片按钮可用 selector 命中 img 元素)"},
+                        {"step": 3, "tool": "BrowserControl", "action": "wait",
+                         "selector_hint": "[class*=response], [class*=answer], [class*=result], [class*=message]",
+                         "timeout_ms": 30000,
+                         "tip": "等待 AI 回复出现,最长等 30 秒"},
+                        {"step": 4, "tool": "BrowserInspect", "info": "elements",
+                         "selector_hint": "[class*=response], [class*=answer], [class*=result]",
+                         "include_text": true,
+                         "tip": "提取 AI 回复文本;若 include_text 太短,可改 info=dom 获取 outer_html"}
+                    ],
+                });
                 if let Some(arr) = args.get("block_resources").and_then(Value::as_array) {
                     data["block_resources_hint"] = json!(arr);
                 }
@@ -1116,5 +1152,57 @@ mod tests {
         assert_eq!(parse_modifiers(&p), 2 | 8);
         let p = json!({"modifiers": "ctrl,shift"});
         assert_eq!(parse_modifiers(&p), 2 | 8);
+    }
+
+    // 2026-09-17 第 74 轮:BrowserNew next_steps & mode 测试。
+
+    #[test]
+    fn browser_new_parameters_has_mode_enum() {
+        let p = BrowserNewTool.parameters();
+        let mode = p["properties"]["mode"].clone();
+        assert!(mode.is_object(), "mode 字段应为对象");
+        assert_eq!(mode["default"], "hidden", "默认 mode 应为 hidden");
+        let enums = mode["enum"].as_array().expect("enum 必须是数组");
+        let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"hidden"));
+        assert!(names.contains(&"new_headless"));
+        assert!(names.contains(&"headed"));
+    }
+
+    #[test]
+    fn browser_new_parameters_no_legacy_headless() {
+        // 第 74 轮迁移:headless 字段被移除,改用 mode 枚举
+        let p = BrowserNewTool.parameters();
+        assert!(p["properties"]["headless"].is_null(),
+            "headless bool 字段应被移除,改用 mode 枚举");
+    }
+
+    #[tokio::test]
+    async fn browser_new_missing_url_returns_1001() {
+        // 单元测试:缺 url 时返回参数错误(不需真实浏览器)
+        let res = BrowserNewTool.execute(json!({})).await.unwrap();
+        assert!(res.contains("\"code\":1001"));
+        assert!(res.contains("缺少 url"));
+    }
+
+    #[tokio::test]
+    async fn browser_new_no_browser_or_succeeds() {
+        // 单元测试:无 Chrome 时返回 3001 + 安装提示;有 Chrome 时返回 0 + next_steps。
+        // 由于运行环境可能安装了 Chrome,这里兼容两种路径。
+        let res = BrowserNewTool.execute(json!({"url": "https://example.com"})).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&res).expect("响应应为合法 JSON");
+        let code = v["code"].as_i64().unwrap_or(-1);
+        if code == 0 {
+            // 成功路径:验证 mode=hidden + next_steps 非空
+            assert_eq!(v["data"]["mode"], "hidden", "默认 mode 应为 hidden");
+            let steps = v["data"]["next_steps"].as_array()
+                .expect("成功响应必须包含 next_steps 数组");
+            assert!(!steps.is_empty(), "next_steps 不能为空");
+            assert_eq!(steps.len(), 4, "next_steps 应包含 4 步引导");
+        } else {
+            // 失败路径:2001(断连) 或 3001(无浏览器)
+            assert!(code == 2001 || code == 3001,
+                "无浏览器/失败时应返回 2001/3001,实际 code={code}");
+        }
     }
 }

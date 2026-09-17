@@ -154,7 +154,7 @@ impl MultiAgentOrchestrator {
         );
         let web_use = Arc::new(
             WebUseRunner::new(llm.clone(), db.clone())
-                .with_max_iterations(cfg.subagent_max_iterations),
+                .with_max_iterations(cfg.webuse_max_iterations),
         );
         let quality = Arc::new(QualityRunner::new(llm.clone(), db.clone()));
         let session_context = SessionContextRunner::new(llm.clone(), db.clone());

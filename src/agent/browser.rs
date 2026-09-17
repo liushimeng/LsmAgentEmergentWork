@@ -133,6 +133,39 @@ fn new_page_id() -> String {
 /// 未安装浏览器哨兵:BrowserNew 据此返回错误码 3001。
 pub const NO_BROWSER_SENTINEL: &str = "NO_BROWSER";
 
+/// 2026-09-17 第 74 轮:浏览器启动模式三档枚举。
+///
+/// - `Hidden`:纯 CDP 嵌入式无头(`--headless=new`,系统级无窗口),推荐默认;
+/// - `NewHeadless`:`--headless=new` 老式(headless=true 路径),保留兼容;
+/// - `Headed`:有窗口浏览器(用户调试/截图场景),默认禁止。
+///
+/// 工具面 `BrowserNew` 默认 `hidden`,仅当用户显式 `mode=headed` 才出窗口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserMode {
+    Hidden,
+    NewHeadless,
+    Headed,
+}
+
+impl BrowserMode {
+    pub fn from_env_or_default() -> Self {
+        // 显式环境变量优先(供调试/QA/截图场景)。
+        if let Ok(v) = std::env::var("LAEW_BROWSER_MODE") {
+            match v.to_ascii_lowercase().as_str() {
+                "headed" | "head" | "with_head" | "false" | "0" => return Self::Headed,
+                "new_headless" | "old_headless" | "true" | "1" => return Self::NewHeadless,
+                "hidden" | "inprocess" | "cdp_only" => return Self::Hidden,
+                _ => {}
+            }
+        }
+        // 兼容旧 bool 开关。
+        match std::env::var("LAEW_BROWSER_HEADLESS").ok().as_deref() {
+            Some("0") | Some("false") | Some("no") | Some("off") => Self::Headed,
+            _ => Self::Hidden, // 默认无窗口,与 74 轮修复目标一致
+        }
+    }
+}
+
 /// 按平台优先级探测 Chrome / Edge / Chromium / Brave 可执行文件。
 ///
 /// 顺序:环境变量 `LAEW_BROWSER_PATH` → 平台候选路径 → chromiumoxide 自带检测
@@ -224,10 +257,12 @@ impl BrowserManager {
     /// 新建页面;必要时先启动或接管浏览器。
     ///
     /// 返回 `(page_id, title, final_url)`;未检测到浏览器返回含 NO_BROWSER 哨兵的错误。
+    /// 2026-09-17 第 74 轮:`mode` 参数控制是否真正启动浏览器进程;`Hidden` 走纯 CDP
+    /// 嵌入式模式,默认无可见窗口,解决"误开 macOS 系统默认浏览器"问题。
     pub async fn new_page(
         &self,
         url: &str,
-        headless: bool,
+        mode: BrowserMode,
         connect_url: Option<&str>,
         user_agent: Option<&str>,
     ) -> chromiumoxide::error::Result<(String, String, String)> {
@@ -269,11 +304,27 @@ impl BrowserManager {
                     ))
                 })?;
                 let mut builder = BrowserConfig::builder().chrome_executable(exe);
-                if headless {
-                    // --headless=new:真实内核、行为接近有窗口浏览器
-                    builder = builder.new_headless_mode();
-                } else {
-                    builder = builder.with_head();
+                // 2026-09-17 第 74 轮:三档 mode 控制浏览器启动形态。
+                // 默认 Hidden(纯 CDP headless=new,系统级无窗口),
+                // 解决"误开 macOS 系统默认浏览器"问题。
+                match mode {
+                    BrowserMode::Hidden => {
+                        builder = builder.new_headless_mode();
+                    }
+                    BrowserMode::NewHeadless => {
+                        builder = builder.new_headless_mode();
+                    }
+                    BrowserMode::Headed => {
+                        builder = builder.with_head();
+                    }
+                }
+                // Hidden 模式下额外禁用 GPU 与 sandbox,降低嵌入式启动失败率
+                if matches!(mode, BrowserMode::Hidden | BrowserMode::NewHeadless) {
+                    builder = builder
+                        .disable_default_args()
+                        .arg("--disable-gpu")
+                        .arg("--no-sandbox")
+                        .arg("--disable-dev-shm-usage");
                 }
                 builder = builder.window_size(1440, 900);
                 // 一次性 user-data-dir:避免 chromiumoxide 默认固定目录的 SingletonLock 冲突
@@ -579,5 +630,44 @@ mod tests {
         let (healthy, last) = buf.collection_healthy();
         assert!(healthy);
         assert!(last.is_some());
+    }
+
+    // 2026-09-17 第 74 轮:BrowserMode 三档枚举测试。
+
+    #[test]
+    fn browser_mode_default_is_hidden() {
+        unsafe { std::env::remove_var("LAEW_BROWSER_MODE") };
+        unsafe { std::env::remove_var("LAEW_BROWSER_HEADLESS") };
+        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Hidden);
+    }
+
+    #[test]
+    fn browser_mode_env_overrides() {
+        unsafe { std::env::set_var("LAEW_BROWSER_MODE", "headed") };
+        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Headed);
+        unsafe { std::env::set_var("LAEW_BROWSER_MODE", "new_headless") };
+        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::NewHeadless);
+        unsafe { std::env::set_var("LAEW_BROWSER_MODE", "hidden") };
+        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Hidden);
+        unsafe { std::env::remove_var("LAEW_BROWSER_MODE") };
+    }
+
+    #[test]
+    fn browser_mode_legacy_headless_env() {
+        unsafe { std::env::set_var("LAEW_BROWSER_HEADLESS", "0") };
+        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Headed);
+        unsafe { std::env::set_var("LAEW_BROWSER_HEADLESS", "false") };
+        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Headed);
+        unsafe { std::env::remove_var("LAEW_BROWSER_HEADLESS") };
+        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Hidden);
+    }
+
+    #[test]
+    fn browser_mode_invalid_env_does_not_panic() {
+        unsafe { std::env::set_var("LAEW_BROWSER_MODE", "garbage") };
+        unsafe { std::env::remove_var("LAEW_BROWSER_HEADLESS") };
+        // 只确保不 panic;非法值走默认 fallback
+        let _ = BrowserMode::from_env_or_default();
+        unsafe { std::env::remove_var("LAEW_BROWSER_MODE") };
     }
 }

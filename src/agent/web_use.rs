@@ -62,6 +62,14 @@ impl WebUseRunner {
         // 后续轮次恢复 auto,让 LLM 自由决策。
         let agent = Agent::new(llm, AgentProfile::web_use_profile())
             .with_first_iter_forced_tool("BrowserNew");
+        // 2026-09-17 第 74 轮:WebUse 默认迭代上限从 16 → 32。
+        // 环境变量 LAEW_WEBUSE_MAX_ITER 可覆盖(范围 8-128)。
+        let default_max = std::env::var("LAEW_WEBUSE_MAX_ITER")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n >= 8 && *n <= 128)
+            .unwrap_or(32);
+        let agent = agent.with_max_iterations(default_max);
         let max_iterations = agent.max_iterations();
         let msg_mgr = AgentMessageManager::new(db.clone());
         Self {
@@ -122,14 +130,20 @@ impl WebUseRunner {
         let mut prompt = input.to_user_prompt();
         prompt.push_str(
             "\n\n【浏览器操控作业规范】\n\
-             1. 第一步用 BrowserNew 打开目标页面拿到 page_id(默认无头内存浏览器);\n\
+             1. 第一步用 BrowserNew 打开目标页面拿到 page_id(默认无头内存浏览器 mode=hidden);\n\
              2. 后续所有操作都带 page_id:BrowserControl 执行动作、BrowserInspect 观察结果;\n\
              3. 点击链接/新开标签页时,注意响应里的 spawned_page_id,操作新页面要用新 id;\n\
              4. 错误码对策:2000 → 重新 BrowserList 同步索引;2002 → 换 selector 或换 \
                 input_text 的 use_js 路径;3001 → 本机未安装 Chrome/Edge/Chromium,如实告知用户;\n\
              5. 截图优先 save_path 落盘;DOM 提取注意 truncated 标记,分段提取;\n\
              6. 禁止对疑似支付/删除/确认提交类按钮做无把握点击;只读操作优先;\n\
-             7. 任务完成后用 BrowserClose 关闭不再需要的页面。",
+             7. 任务完成后用 BrowserClose 关闭不再需要的页面。\n\
+             8. 浏览器启动模式:BrowserNew 默认 mode=hidden(纯 CDP 无窗口,不会弹出 macOS 系统浏览器)。\n\
+                只有当用户明确要求「看截图/可视化调试」时才用 mode=headed。\n\
+             9. BrowserNew 成功返回的 next_steps 字段是关键引导,里面列了 input_text/click/wait/elements\n\
+                四步最常见动作的 selector_hint,严格按 next_steps 顺序执行可大幅提升成功率。\n\
+             10. 复杂页面(微信公众号后台、电商后台)务必先 BrowserInspect(info=elements) 探测真实\n\
+                DOM 结构(尤其是动态加载的输入框/按钮),不要凭 selector 名字硬猜。",
         );
 
         let mut sub_session = crate::session::Session::new();
