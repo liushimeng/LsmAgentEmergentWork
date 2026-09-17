@@ -37,6 +37,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 | | `0`/`false`/`no`/`off` | TLS 全局严格：所有 endpoint 严格校验（安全基线） |
 | | 未设置（默认） | 自动模式：endpoint 主机为 IP（IPv4/IPv6）时自动跳过证书校验，域名主机仍严格校验。适配 IP + 自签名证书的内网/自建 HTTPS 网关；仅跳过校验，TLS 加密不降级；rustls 纯 Rust 实现，Windows/macOS/CentOS/Ubuntu 行为一致。设计见 `docs/自签名证书TLS适配/01-设计与解决方案.md` |
 | `LAEW_ALLOW_PRIVATE_ENDPOINT` | `1` | SSRF 防护放行私网/loopback endpoint（本地 Ollama / 局域网 / mock 测试 provider 用；默认拦截，见 `src/agent/safety/url_safety.rs`） |
+| `LAEW_BASH_UTF8` | `1`/`true`/`yes`/`on` | Bash 工具为子进程注入 UTF-8 环境（`PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8`/`LC_ALL=C.UTF-8`），消除 Windows 区域设置(GBK)导致的 python/coreutils 输出乱码；默认关闭。行尾(CRLF)不受影响，精确 diff 场景脚本仍需 `reconfigure(newline=...)`，见 `src/agent/tools/bash.rs`（2026-09-13 第 50 轮新增） |
 
 ## 领域概念（改代码前必读）
 
@@ -55,7 +56,8 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
   - **SessionContext Agent**（`LsmAgentEmergentWork-SessionContext`）：会话层，每次任务完成后汇总并写入 `session_memory` 表；无工具。
   - **Debug Agent**（`LsmAgentEmergentWork-Debug`）：调试层，仅在 `-debug` 调试模式下启用；任务结束后对采集的 trace（各 Agent LLM 调用输入输出 / Yolo 分类 / QC 结论 / 耗时与 token / 错误）做评估，产出「任务评估 / 质量报告 / 问题报告(P0-P2) / 优化建议」四章节；无工具。报告写入**根目录** `DebugReport/debug_report_{YYYYMMDD}_{HHMMSS}_{随机6位}.md`（已 gitignore，不入库）。设计见 `docs/Debug模式与DebugAgent设计/01-设计与解决方案.md`。
   - **Compact Agent**（`LsmAgentEmergentWork-Compact`）：压缩层（第 8 角色）；Session 主上下文估算 token（字符/4 +10%）达到当前 Provider `context_max_size` 的 80% 时由 Orchestrator 自动触发，按超出幅度自动选三档压缩率（Light ≤80% / Medium ≈50% / Aggressive ≤20%），LLM 摘要失败降级本地硬截断；保护带项目上下文/历史摘要/已压缩标记的消息与最近 4 条消息；无工具。**溢出兜底（reactive）**：估算可能低估（CJK 2-3 倍），真实溢出（Provider 返回 `prompt is too long` / `context_length_exceeded` 类 400）时由 Agent 循环自动三级恢复——排水（截短超长 tool_result）→ 折叠（历史合并为压缩摘要）→ 暴露（原错误上抛），见 `agent/overflow.rs`（一处包裹、8 角色全生效，全会话恢复预算 4 次）。设计见 `docs/Context设置与自动压缩设计/01-设计与解决方案.md`。
-  - **WindowUse Agent**（`LsmAgentEmergentWork-WindowUse`）：桌面操控层（第 9 角色）；读取/操作电脑上的软件窗口——Windows 走 UI Automation（HWND 枚举 + 控件树遍历 + Invoke/Value Pattern，UIA 不可用时降级 SendMessage），macOS 走 Accessibility（AXUIElementRef，需「辅助功能」权限，未授权返回可读引导），Linux 等走 wmctrl/xdotool fallback（控件级 fail-closed 结构化报错）。工具集 Read + WindowList/WindowInspect/WindowAction（平台差异封闭在 `agent/window/` 驱动层）。委派链路：Yolo 把窗口操控类任务最低判 medium → Main-Work 拆 WorkFlow 时 `delegate_to="windowuse"` → `run_wf_unit` 路由到 `WindowUseRunner` → QC/SessionContext/Debug/取消/并行全链路复用。设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md`。
+  - **WindowUse Agent**（`LsmAgentEmergentWork-WindowUse`）：桌面操控层（第 9 角色）；读取/操作电脑上的软件窗口，**双路线**——控件树路线（Windows UIA HWND 枚举 + 控件树 + Invoke/Value Pattern；macOS AX（需「辅助功能」权限）；Linux wmctrl/xdotool fallback）+ **视觉路线**（2026-09-16 第 67 轮：微信 4.x 等自绘 UI 控件树为空 → `WindowOCR` GDI 截图 + Windows.Media.Ocr 行级文本坐标 + `click_point/type_text/scroll_point` SendInput 物理输入坐标动作；SendInput 底座含前台化三保险/Unicode 键入/组合键 send_keys/DPI 感知；WindowOpen 解析链：已在运行直接恢复前置、开始菜单快捷方式扫描、固定盘 Tencent 安装路径探测、ShellExecuteW）。工具集 Read + Bash(白名单) + WindowOpen/WindowList/WindowFind/WindowInspect/WindowAction/WindowOCR/WindowScreenshot（平台差异封闭在 `agent/window/` 驱动层）。委派链路：Yolo 把窗口操控类任务最低判 medium → Main-Work 拆 WorkFlow 时 `delegate_to="windowuse"`（关键词推断 GUI 优先，双命中判 WindowUse）→ `run_wf_unit` 路由到 `WindowUseRunner` → QC/SessionContext/Debug/取消/并行全链路复用。设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` + `tmpPlan/2026-09-16_02-WindowUse第67轮全链路强化与微信4x视觉路线方案.md`。
+  - **Chromium-WebUse Agent**(`LsmAgentEmergentWork-Chromium-WebUse`):浏览器操控层(第 11 角色);模拟人类操作浏览器——网页浏览/信息收集/爬虫/登录 Web 页面后的页面操作/截图/查看 Console·Network·DOM·localStorage 等,一切网页操作均委派给本角色。CDP 协议驱动(chromiumoxide),优先 Chrome 自动降级 Edge/Chromium/Brave(Firefox/Safari 不支持 CDP),支持 Windows/macOS/Linux;默认 `--headless=new` 内存无头浏览器 + 一次性 user-data-dir,也可 `connect_url` 接管带 `--remote-debugging-port` 的已开浏览器;未安装浏览器时返回结构化错误码 3001 + 安装引导(不崩溃)。工具集 Read + BrowserNew/BrowserList/BrowserClose/BrowserControl(写操作统一入口,action 枚举)/BrowserInspect(只读观察统一入口,info 枚举);page_id 不透明字符串注册表,派生标签页经 `spawned_page_id` 回传。委派链路:Yolo 把网页操控类任务最低判 medium → Main-Work 拆 WorkFlow 时 `delegate_to="webuse"` → `run_wf_unit` match 路由到 `WebUseRunner` → QC/SessionContext/Debug/取消/并行全链路复用。设计见 `docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md`。
   - 由 `MultiAgentOrchestrator` 总编排:用户输入 → 项目上下文注入 → Yolo 分类 → 简单档(SubAgent) / 中档(Main→SubAgent) / 高档(Plan→Main→SubAgent) → Quality-Check → SessionContext 收口。WorkFlow 执行时按 `depends_on` 自动 Kahn 分层(`main_work::topo_layers`),**同层无依赖的 SubAgent 自动并行**(tokio::spawn + Semaphore 上限 3,`OrchestratorConfig::max_parallel_workflows`),跨层严格串行、上游产物按层注入,失败语义与串行一致(fail-fast 回流 Yolo)。
 - **Agent-Context / Agent-Memory**：
   - **Agent-Context**：每个 Agent 独立的实时上下文(消息流 + 状态)，内存态，生命周期 = 当前单元。
@@ -71,7 +73,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 ```
 main.rs        clap CLI:默认进 tui; -p 单轮; -f 文件提示词; provider 子命令
 tui/
-  mod.rs       会话外壳:TuiSession 结构 + 生命周期(bootstrap/banner/provider 增删查/分支快照)+ orchestrator 装配 + run()/run_with_debug() 入口(2026-09-11 按 ≤1800 行规范自单文件拆分,方案 tmpPlan/2026-09-11_代码文件1800行上限模块化拆分方案.md)
+  mod.rs       会话外壳:TuiSession 结构 + 生命周期(bootstrap/banner/provider 增删查/分支快照)+ orchestrator 装配 + run()/run_with_debug() 入口(按 ≤1800 行规范自单文件拆分为 dispatch/slash/format 等职责子模块)
   dispatch.rs  输入分发与任务输出:handle_user_input / dispatch_prompt(@提及展开 + 阶段进度协程 + SIGINT 取消)/ emit_debug_report / print_* 家族
   slash.rs     斜杠命令路由:handle_slash + run_theme/run_rewind/run_undo/run_fork/run_branches/run_switch/run_export + print_custom_commands
   provider_screen.rs /provider 子屏桥接:list/add/del 三屏接入 + run_screen_loop(通用 Screen 栈循环,非 TTY 回退 print)
@@ -82,13 +84,18 @@ tui/
   completion.rs 斜杠命令补全引擎(内置 + 自定义命令动态注册)
   commands.rs   自定义斜杠命令(D2):两级目录发现/frontmatter/占位符渲染
   export.rs     会话导出(D8):transcript 记录 + Markdown/JSON 落盘
+  branches.rs   对话分支存储(D3):rewind/fork/switch/clear 前自动快照(内存态上限 10)
   theme.rs     ANSI 颜色 / mask_key 脱敏 / attrs·bg·color→ANSI 转换 集中管理
   screen/
     provider_list.rs   /provider list —— Tab 化展示 + 操作按钮
     provider_form.rs   /provider add  —— 5+1 Tab 表单
     provider_del.rs    /provider del  —— Picker + 二次确认
 agent/
-  mod.rs       协议无关循环:run_session(Session) → complete → tool_calls → 执行 → tool_result 回填
+  mod.rs       agent 域模块注册表 + Agent 结构体/构造器/访问器(协议无关循环的总装配)
+  agent_loop.rs Agent 核心循环实现:run_session(Session) → complete → tool_calls → 执行 → tool_result 回填 + 截断续接/溢出恢复
+  runtime_hints.rs Agent 循环运行时辅助:runtime hint 拼装/截断判定/首迭代强制工具开关/稳定 JSON 序列化
+  orchestrator/ MultiAgentOrchestrator 总编排器目录:mod.rs(结构体+入口+进度通道) / types.rs(共享类型) / pipeline.rs(handle_inner+三档链路) / workflows.rs(分层并行+run_wf_unit) / yolo_reflow.rs(Yolo 分类封装+失败回流) / usage.rs(用量累加) / tests.rs
+  main_work/   Main-Work 流程层目录:mod.rs(MainWorkRunner) / spec.rs(WorkFlow 规格模型+宽松反序列化) / delegate.rs(委派推断 GUI 优先) / topo.rs(Kahn 分层+依赖治理) / parse.rs(JSON/Markdown 双通道解析) / tests.rs
   profile.rs   AgentProfile(名称 / 系统提示词 / 工具集) + work_profile()/yolo_profile() + User-Agent
   system_prompt/mod.rs  SystemPrompt 组合与渲染(基础 + 工具说明 + 协议尾缀)
   tools/
@@ -96,12 +103,18 @@ agent/
     bash.rs    BashTool
     read.rs    ReadTool
     write.rs   WriteTool
+    window/    窗口操控五工具目录:mod.rs(共享辅助:树预算剪枝/查询扩展/别名匹配/preflight/AX 权限) / matching.rs(WindowList+WindowFind+模糊打分) / open.rs(WindowOpen+应用启动) / inspect.rs(WindowInspect/WindowAction) / tests.rs
   yolo.rs      YoloRunner 双 Agent 编排器 + TaskLevel + TaskClassification + JSON 解析
   compact.rs   CompactRunner:token 估算 / 三档选档 / 自动压缩触发 / 硬截断降级 / 保护段识别
-  overflow.rs  上下文溢出检测(15+ provider 正则)+ 三级恢复(排水/折叠/暴露)
   window_use.rs WindowUseRunner(第 9 角色执行器,镜像 SubAgentRunner 结构)
   window/      窗口操控平台驱动层:mod.rs(模型+WindowDriver trait+工厂) / windows.rs(UIA+Win32) / macos.rs(AX) / fallback.rs(wmctrl/xdotool)
+  web_use.rs   WebUseRunner(第 11 角色执行器,镜像 WindowUseRunner 结构)
+  browser.rs   浏览器 CDP 驱动层:BrowserManager 单例(page_id 注册表 + 跨平台浏览器检测 + 引用计数关闭)
+  tools/browser.rs BrowserNew/BrowserList/BrowserClose/BrowserControl/BrowserInspect 五工具薄封装
+  overflow.rs  上下文溢出检测(15+ provider 正则)+ 三级恢复(排水/折叠/暴露)
   project_context.rs 项目说明文件五级链发现 + README 自动生成 + 每会话首次注入(幂等标记)
+  session_fork.rs 对话 Rewind 轮次扫描(D3):合成消息识别 + 截断边界(供 /rewind /undo /fork /switch)
+  workspace.rs 工作区感知(D4):懒刷新快照(git 分支/变更计数/工程类型与工具链建议/顶层结构/6h 最近改动)+ TTL 缓存 + 8 角色 system brief `<<<LAEW:WORKSPACE>>>` + 会话级「工作区快照」段 + TUI 变更对比
 session.rs       Session:本机指纹 device_id + Session ID 生成 + 独立对话上下文 context
 llm/mod.rs       统一消息模型 + LlmClient trait + RequestMeta + build_common_headers + build_http_client(TLS 三级策略:IP 主机自动放宽自签名证书 / LAEW_TLS_INSECURE 全局开关)
 llm/anthropic.rs  Anthropic wire 转换(x-api-key + anthropic-version + metadata.user_id)
@@ -118,7 +131,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 
 ### 屏幕拓扑
 
-- **REPL 主屏**：保留 0.1.2 的 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。
+- **REPL 主屏**：保留 0.1.2 的 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。**D6 大粘贴防护**（2026-09-10）：bracketed paste 整体接收 + 大粘贴（>10 行或 >1000 字符）转 `[粘贴 #N]` marker、提交时展开还原（单份 >10000 字符截断为首尾各 500 + 省略标注）+ 快速输入批量合并（IME/旧终端粘贴逐字重绘优化）。
 - **子屏（Modal）**：`engine.rs` 的 Screen 栈接管 `/provider *` 系列，进入 alternate screen + 原始模式，Esc 退回主屏。
 - **非 TTY 回退**：stdin 不是终端时（管道 / e2e），子屏与主屏都回退到 print 输出，保证 `run_e2e.sh` 兼容。
 
@@ -131,6 +144,13 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 | `/clear` (c)      | 清空对话历史，开启新 Session     |
 | `/new` (n)        | 同 `/clear`（开启新 Session）    |
 | `/model`          | 显示当前模型                     |
+| `/rewind [N]`     | 对话回退（D3）：无参列出全部真实轮次（#编号+时间+预览）；`/rewind N` 回退到第 N 轮之前（context/transcript/累计用量三处一致截断，回退前自动快照存分支）；合成消息（`<<<LAEW:>>>` 标记 / `[PREVIOUS_FAILURE]`）不计轮次，实现 `agent/session_fork.rs` |
+| `/undo`           | 撤销最后一轮对话（等价 `/rewind 末轮`） |
+| `/fork`           | 从当前对话分叉出新 Session（上下文完整拷贝 + 新 ID，原对话自动存分支） |
+| `/branches`       | 列出已存分支（`/rewind` `/fork` `/switch` `/clear` 改动前自动快照；内存态上限 10 个，退出 TUI 失效），实现 `tui/branches.rs` |
+| `/switch <name>`  | 切换到指定分支（切换前当前对话自动快照，零丢失） |
+| `/offline` (`status`)| 查看连接状态(Online/Degraded/Offline 三态)与离线队列深度;D13 离线模式 |
+| `/workspace` (`ws`) | 查看工作区快照(D4):git 分支/未提交变更/工程类型与工具链建议/顶层结构/6h 内最近改动;`/workspace refresh` 强制失效 TTL 缓存重采集 |
 | `/export [path]`  | 导出当前会话为 Markdown（`.json` 后缀导出 JSON）；默认落工作目录 `laew-export-{时间戳}.md`，同名冲突自动 `-1` 后缀，显式路径已存在拒绝覆盖 |
 | `/commands`       | 列出已加载的自定义斜杠命令与来源 |
 | `/provider`       | 管理接入记录（默认进入 list 屏） |
@@ -197,14 +217,16 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/Yolo项目上下文注入/` — 项目说明文件五级链发现（CLAUDE.md→AGENTS.md→README.md→自动生成→空）+ 每会话首次注入 + 三步意图识别优化（01-设计与解决方案 / 02-技术实现文档）
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/自动化测试-提示词文件列表/` — 10 维度 × 100 组多轮对话测试脚本(知识问答/编码/代码理解/调试/文件处理/电脑使用/软件使用/界面设计/文档规划/laew 元任务),每条 3~5 轮追问,标注预期档位(simple/medium/hard),用于人工/自动化回归与 Yolo 分类验证
-- `docs/WindowUse桌面窗口操控Agent/` — WindowUse Agent(第 9 角色)桌面窗口操控:统一 WindowDriver 抽象 + Windows UIA / macOS AX / fallback 三后端 + delegate_to=windowuse 委派路由(01-设计与解决方案;prompts/ 测试提示词)
 - `docs/Debug模式与DebugAgent设计/` — `-debug` 调试模式与 Debug Agent(第 7 角色):trace 采集 / LLM 装饰器 / DebugReport 报告生成 设计与解决方案
+- `docs/WindowUse桌面窗口操控Agent/` — WindowUse Agent(第 9 角色)桌面窗口操控:统一 WindowDriver 抽象 + Windows UIA / macOS AX / fallback 三后端 + delegate_to=windowuse 委派路由(01-设计与解决方案;prompts/ 测试提示词)
+- `docs/浏览器CDP工具/` — Chromium-WebUse Agent(第 11 角色)浏览器操控:chromiumoxide CDP 选型 + 内存无头浏览器 + page_id 会话管理 + BrowserControl/BrowserInspect 写读对偶工具面(01~03 前置调研 / 04-设计与解决方案)
 - `docs/Context设置与自动压缩设计/` — ContextMaxSize 上下文上限(默认 800K,DB 迁移自动补全)+ Compact Agent(第 8 角色)三档自动压缩 设计与解决方案
+- `docs/工作区感知与运行时环境注入/` — D4 工作区感知:懒刷新快照(git 分支/变更计数/工程类型与工具链建议/顶层结构/最近改动)+ 8 角色 system brief + PROJECT_CONTEXT 工作区段 + TUI 横幅·`/workspace`·任务后变更对比
 - `docs/自签名证书TLS适配/` — IP + 自签名证书 HTTPS 网关适配:TLS 三级校验策略(IP 自动放宽 / LAEW_TLS_INSECURE 全局开关)、跨平台一致性(rustls)、真实端点集成验证(tests/tls_self_signed.rs)
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考
 - `docs/其他Agent工具定义/` — claude-code / codex / hermes / openclaw / open-code / pi / WorkBuddy 等的工具定义，新增工具时先读这里
 - `docs/Agent源码调研/` — **15 个外部项目源码**的系统调研与深度分析，**共 80+ 份文档/约 168k 行**（15 份综合文档 + 55 份横向专题；按轮次组织，主文档每轮追加新章节，专题目录按主题持续扩容）。每轮合集见 `专题/专题-第N轮深挖合集.md`。
-  - **2026-09-09 第十九轮（当前最新）**：6 份全新专题（**~7,700+ 行 / ~450 KB**）—— 7 工程（atomcode / claudecode / deepseek-harness / openclaw / opencode / pi / undici）主文档各追加一章 + 6 份专题文档 + 1 份跨项目缺口分析。聚焦前 18 轮未覆盖的「**用户交互体验层续 + 安全纵深 + 多模态 + A2A + a11y + 离线 + 同步**」6 大全新维度：D9 安全与威胁模型 / D10 多模态输出 / D11 A2A 协议 / D12 可访问性 a11y / D13 离线模式 / D14 跨设备同步。新增 laew gap: L1591-L1930+（340+ 个）。合集见 `专题/专题-第十九轮深挖合集.md`。累计 100+ 维度（90+ 基础设施与协议层 + 16+ 用户交互体验层）。**第二十轮候选**：国际化 i18n 完整实现 / Web UI + Desktop App / OAuth 认证与多账号 / Release 工程化与 AutoUpdate / DevContainer 与容器化 / CRDT 与多端冲突。
+  - **2026-09-09 第十九轮（当前最新）**：6 份全新专题（**~7,700+ 行 / ~450 KB**）—— 7 工程（atomcode / claudecode / deepseek-harness / openclaw / opencode / pi / undici）主文档各追加一章 + 6 份专题文档 + 1 份跨项目缺口分析。聚焦前 18 轮未覆盖的「**用户交互体验层续 + 安全纵深 + 多模态 + A2A + a11y + 离线 + 同步**」6 大全新维度：D9 安全与威胁模型（STRIDE / Prompt 注入 / Bash 检测 / 凭证 / SSRF / 沙箱 / 审计）/ D10 多模态输出（图表 / Mermaid / 图片协议 / 数学公式 / HTML / SVG）/ D11 A2A 协议（A2A/ACP/E2A/A2UI/MCP 双向/跨语言）/ D12 可访问性 a11y（屏幕阅读器 / 高对比主题 / 减动效 / RTL / 键盘可达）/ D13 离线模式（离线检测 / 请求队列 / 本地缓存 / 同步合并）/ D14 跨设备同步（设备发现 / 配对 / 同步协议 / 加密 / 状态合并）。新增 laew gap: L1591-L1930+（340+ 个）。合集见 `专题/专题-第十九轮深挖合集.md`。累计 100+ 维度（90+ 基础设施与协议层 + 16+ 用户交互体验层）。**第二十轮候选**：国际化 i18n 完整实现 / Web UI + Desktop App / OAuth 认证与多账号 / Release 工程化与 AutoUpdate / DevContainer 与容器化 / CRDT 与多端冲突。
   - **2026-09-09 第十八轮**：8 份全新专题（**~8,657 行 / ~350 KB**）—— 7 工程主文档各追加一章 + 7 份专题文档 + 1 份跨项目缺口分析。聚焦「**用户交互体验层**」8 维度：D1 @提及系统 / D2 自定义斜杠命令 / D3 对话 Rewind/分支 / D4 文件监视与工作区感知 / D5 工具输出富文本内容渲染 / D6 输入体验工程 / D7 Onboarding/目录信任/主题 / D8 会话导出/Statusline/实时成本 + undici N1-N5 Agent 富内容获取底座。新增 laew gap: L1396-L1590（184 个，**含编号冲突修正**：pi D8 12 gap 从 L1576-L1587 修正为 L1564-L1575，atomcode 预留 L1415-L1425 11 空位）。合集见 `专题/专题-第十八轮深挖合集.md`。
   - **2026-09-06 第五轮**：7 个主文档追加「第五轮深挖补充」章节（atomcode 19 章 / claudecode 17 章 / deepseek-harness 14 章 / openclaw 16 章 / opencode 18 章 / pi 12 章 / undici 专题），新增 2 份横向专题（中断取消与后台任务 / 工具结果回填与消息组装）。
   - **2026-09-06 第六轮**：6 个主文档追加「第六轮深挖」章节（atomcode 第 20 章协议 wire/流式/错误重试 +722 行 / claudecode 第 19 章 40+ Tool 系统统一抽象/权限拦截 +508 行 / deepseek-harness 第 17 章 Goal 域模型/Workflow ralph/SubAgent 11 包 +374 行 / openclaw 第 17 章 Gateway/Harness/Adapter 三层契约/162 Extensions/Lane 调度器/Workshop 自演化 +1370 行 / opencode 第六轮 Effect/Schema DI/LayerNode/Durable Object +1198 行 / pi 第 13 章 Lane 三态/CBOR 帧协议/WriterLease/14 种损坏检测 +1386 行），新增 6 份横向专题（协议调用真实实现增量深挖 13 维度 / SubAgent 调度与并发模型 / Goal 状态机与任务生命周期 / TUI 与终端渲染管线 / Hook 系统与拦截器 / Skill 系统深度对比）。
@@ -456,7 +478,11 @@ SCREEN=$(tmux capture-pane -p -t laew_e2e)
 ## 约定
 
 - 注释、CLI 文案、文档一律中文；代码标识符英文。
-- **单源码文件 ≤ 1800 行**（2026-09-11 起）：超过必须按功能/业务/架构维度拆分模块（TUI 层范例：`src/tui/` 的 dispatch / slash / provider_screen / format 分层）；临界文件（≥ 1700 行，如 `src/agent/mod.rs` 1799 行）新增代码优先落到职责子模块，防止越线。
+- **单源码文件 ≤ 1800 行**：超过必须按功能/业务/架构维度拆分模块；临界文件（≥ 1700 行）新增代码优先落到职责子模块，防止越线。**拆分规范**（目录化拆分统一按此执行，最新方案 `tmpPlan/2026-09-17_01-单文件1800行超标拆分重构方案.md`）：
+  - 单文件超线 → 转同名目录（`xxx.rs` → `xxx/mod.rs` + 职责子模块）；`mod.rs` 承载结构体定义 + 构造器/入口 + `pub use` 再导出，**外部 `crate::…::xxx::Yyy` 路径零改动**；
+  - 原私有项搬入子模块标 `pub(super)`（可见域 = 本目录子树，与拆分前单文件作用域等价），由 `mod.rs` 私有 `use` 重导入供兄弟模块 `use super::*` 取用；
+  - 代码**逐行机械搬移零改写**（不重构逻辑/注释），仅新增模块文档头与 `use super::*`；测试搬 `tests.rs`（mod.rs 声明 `#[cfg(test)] mod tests;`），拆分前后测试数必须对账一致；
+  - 高速增长文件（近几轮每轮 +50 行以上）在破线前预防性拆分。已按此规范拆分：`src/tui/`（分层）、`src/agent/`（agent_loop + runtime_hints + tests 平铺拆分）、`agent/orchestrator/`、`agent/main_work/`、`agent/tools/window/`。
 - 新工具：在 `src/agent/tools/` 建同名模块实现 `Tool` trait，注册进 `builtin_registry()`（Work Agent）或相应 registry，Schema 参考 `docs/其他Agent工具定义/`。
 - 新协议：实现 `LlmClient` trait + `client_from_record()` 增加分支，不改动 agent 层。
 - 新 Agent 类型：实现 `AgentProfile`（独立名称/系统提示词/工具集），在 `YoloRunner` 或相应编排器中接入。
