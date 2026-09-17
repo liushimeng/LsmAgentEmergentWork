@@ -646,6 +646,11 @@ async fn main() -> Result<()> {
         lsm_agent::crash::install_panic_hook_from_root(&root_dir);
     }
 
+    // 进程启动时刻(第 72 轮,2026-09-17):只在此处捕获一次,日志文件命名
+    // (`--debug`/`--info` 的 llaew_YYYYMMDD_HHMMSS.log)与 TUI 横幅「启动时间」行
+    // 共用同一时刻,保证两者严格同刻、不因各自取 now 在跨秒边界差 1 秒。
+    let startup_ts = lsm_agent::session::now_readable();
+
     let cli = {
         // 兼容用户习惯写法 `-debug` / `-info` / `-inprovider` / `-outprovider`
         // (单横线长参数)且**大小写不敏感**(clap 的 ignore_case 只作用于参数值,
@@ -706,7 +711,7 @@ async fn main() -> Result<()> {
             .ok()
             .or_else(|| Paths::detect().ok().map(|p| p.work_dir))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let path = lsm_agent::logging::startup_log_path(&work_dir);
+        let path = lsm_agent::logging::startup_log_path_at(&work_dir, &startup_ts);
         match lsm_agent::logging::make_log_maker(&path) {
             Some(maker) => Some((level, maker, path)),
             None => {
@@ -729,6 +734,18 @@ async fn main() -> Result<()> {
             }
         );
     }
+    // 第 72 轮:横幅展示用的日志文件元信息 —— 在 agent_log 被 move 进 subscriber 之前
+    // 克隆出来,随 TuiLaunch 传入 TUI(横幅「日志文件」行,会话内 /clear /new 重印可见)。
+    let agent_log_info = agent_log.as_ref().map(|(level, _, path)| {
+        lsm_agent::logging::AgentLogInfo {
+            path: path.clone(),
+            level: if *level == tracing_subscriber::filter::LevelFilter::DEBUG {
+                "DEBUG"
+            } else {
+                "INFO"
+            },
+        }
+    });
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
@@ -780,7 +797,11 @@ async fn main() -> Result<()> {
                 } else if let Some(file_path) = cli.file {
                     run_from_file(file_path, cli.max_iterations, cli.debug).await
                 } else {
-                    lsm_agent::tui::run_with_debug(cli.debug).await
+                    let launch = lsm_agent::tui::TuiLaunch {
+                        startup_ts: startup_ts.clone(),
+                        agent_log: agent_log_info,
+                    };
+                    lsm_agent::tui::run_with_debug(cli.debug, launch).await
                 }
             }
         }

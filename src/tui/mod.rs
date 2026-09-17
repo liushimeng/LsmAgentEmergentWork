@@ -50,11 +50,37 @@ use export::TranscriptEntry;
 use format::{fit_display, print_record, read_line_prompt};
 use input::{InputHandler, InputResult};
 
+/// TUI 启动参数(第 72 轮,2026-09-17):横幅「启动时间」「日志文件」行的数据源。
+///
+/// main 在进程最早期捕获一次启动时刻,日志文件命名与横幅显示共用,保证同刻;
+/// `run()` 兜底路径用 [`TuiLaunch::now`] 现取。
+#[derive(Debug, Clone)]
+pub struct TuiLaunch {
+    /// 进程启动时刻(`YYYYMMDD-HHMMSS`,session::now_readable 形态,本地时区)
+    pub startup_ts: String,
+    /// 运行日志文件元信息(`--debug` / `--info` 启动时 Some)
+    pub agent_log: Option<crate::logging::AgentLogInfo>,
+}
+
+impl TuiLaunch {
+    /// 现取启动时刻、无日志文件(非 main 入口的兜底构造)。
+    pub fn now() -> Self {
+        Self {
+            startup_ts: crate::session::now_readable(),
+            agent_log: None,
+        }
+    }
+}
+
 pub struct TuiSession {
     pub paths: Paths,
     pub db: Arc<Mutex<Db>>,
     pub orchestrator: MultiAgentOrchestrator,
     pub session: Session,
+    /// 进程启动时刻(横幅「启动时间」行;/clear /new 重印横幅时保持)
+    pub startup_ts: String,
+    /// 运行日志文件元信息(横幅「日志文件」行,`--debug`/`--info` 时 Some)
+    pub agent_log: Option<crate::logging::AgentLogInfo>,
     /// 调试模式采集器(`-debug` 时 Some;每个用户任务前 reset)
     pub debug: Option<Arc<DebugCollector>>,
     /// 未装饰的原始 LLM 客户端(驱动 Debug Agent 评估,避免自我采集递归)
@@ -81,11 +107,12 @@ pub fn sanitize_terminal_controls(input: &str) -> String {
 
 impl TuiSession {
     pub fn bootstrap() -> Result<Self> {
-        Self::bootstrap_with_debug(false)
+        Self::bootstrap_with_debug(false, TuiLaunch::now())
     }
 
-    /// 启动 TUI 会话;`debug=true` 时开启调试采集(对应 `laew -debug`)。
-    pub fn bootstrap_with_debug(debug: bool) -> Result<Self> {
+    /// 启动 TUI 会话;`debug=true` 时开启调试采集(对应 `laew -debug`),
+    /// `launch` 携带横幅「启动时间」「日志文件」行数据(第 72 轮)。
+    pub fn bootstrap_with_debug(debug: bool, launch: TuiLaunch) -> Result<Self> {
         let paths = Paths::detect().map_err(anyhow::Error::from)?;
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
         let db = Arc::new(Mutex::new(db));
@@ -105,6 +132,8 @@ impl TuiSession {
             db,
             orchestrator,
             session,
+            startup_ts: launch.startup_ts,
+            agent_log: launch.agent_log,
             debug: collector,
             debug_llm_raw,
             transcript: Vec::new(),
@@ -147,6 +176,12 @@ impl TuiSession {
         println!(
             "║  编译时间: {}                          ║",
             env!("LAEW_BUILD_TIME")
+        );
+        // 第 72 轮(2026-09-17):启动时刻行 —— main 最早期捕获,与日志文件名时间戳同刻;
+        // humanize_compact 把 YYYYMMDD-HHMMSS 转为 YYYY-MM-DD HH:MM:SS(与编译时间同宽)。
+        println!(
+            "║  启动时间: {}                          ║",
+            export::humanize_compact(&self.startup_ts)
         );
         println!("╠══════════════════════════════════════════════════════════╣");
         println!(
@@ -207,6 +242,14 @@ impl TuiSession {
             "未配置(先 /provider add)".to_string()
         };
         println!("║  连  接 : {} ║", fit_display(&conn_line, 45));
+        // 第 72 轮(2026-09-17):`--debug`/`--info` 启动时展示运行日志文件落点,
+        // /clear /new 重印横幅仍可见(会话内随时能找到日志);未开启时不显示该行。
+        if let Some(log) = &self.agent_log {
+            println!(
+                "║  日志文件: {} ║",
+                fit_display(&Self::log_banner_text(&self.paths, log), 45)
+            );
+        }
         println!("╚══════════════════════════════════════════════════════════╝");
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
         println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出");
@@ -233,6 +276,18 @@ impl TuiSession {
             s.push_str(" 非 git");
         }
         s
+    }
+
+    /// 第 72 轮:横幅「日志文件」行内容(纯函数,便于测试)。
+    ///
+    /// 路径经 `display_path` 相对化(日志文件必在工作目录下,横幅已标注工作目录,
+    /// 相对化后 `llaew_YYYYMMDD_HHMMSS.log` 一行放得下),再拼级别后缀。
+    fn log_banner_text(paths: &Paths, log: &crate::logging::AgentLogInfo) -> String {
+        format!(
+            "{} (级别: {})",
+            pathfmt::display_path(paths, &log.path),
+            log.level
+        )
     }
 
     /// D13 离线模式:生成连接状态行文本(供横幅显示)。
@@ -485,17 +540,18 @@ fn tui_log_path() -> std::path::PathBuf {
 
 /// 启动 TUI 交互式 REPL
 pub async fn run() -> Result<()> {
-    run_with_debug(false).await
+    run_with_debug(false, TuiLaunch::now()).await
 }
 
 /// 启动 TUI 交互式 REPL;`debug=true` 时开启调试模式(对应 `laew -debug`),
 /// 每个用户任务结束后生成 Debug 报告到根目录 `DebugReport/`。
-pub async fn run_with_debug(debug: bool) -> Result<()> {
+/// `launch` 携带启动时刻与运行日志文件元信息(横幅展示,第 72 轮)。
+pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
     // TUI 视觉规范(选中态 / 主题色 / 固定底部输入组件的独立配色)依赖颜色输出;
     // 显式覆盖 NO_COLOR 环境变量导致的 crossterm 全局禁色,保证配色可达。
     crossterm::style::Colored::set_ansi_color_disabled(false);
 
-    let mut session = TuiSession::bootstrap_with_debug(debug)?;
+    let mut session = TuiSession::bootstrap_with_debug(debug, launch)?;
     session.print_banner();
     if session.debug.is_some() {
         println!("  [debug] 调试模式已开启,报告将写入根目录 DebugReport/");
@@ -575,4 +631,60 @@ pub async fn run_with_debug(debug: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(root: &str, work: &str) -> Paths {
+        Paths {
+            root_dir: std::path::PathBuf::from(root),
+            work_dir: std::path::PathBuf::from(work),
+            db_path: std::path::PathBuf::from("/tmp/x.db"),
+        }
+    }
+
+    #[test]
+    fn tui_launch_now_形态与默认无日志() {
+        let l = TuiLaunch::now();
+        assert!(l.agent_log.is_none(), "兜底构造不带日志文件");
+        assert_eq!(l.startup_ts.len(), 15, "YYYYMMDD-HHMMSS 形态(15 字符)");
+        assert!(l.startup_ts.as_bytes()[8] == b'-', "日期与时间以 '-' 分隔");
+    }
+
+    #[test]
+    fn log_banner_text_工作目录内相对化并带级别() {
+        let p = paths("/opt/laew", "/home/u/work");
+        let info = crate::logging::AgentLogInfo {
+            path: std::path::PathBuf::from("/home/u/work/llaew_20260917_150412.log"),
+            level: "DEBUG",
+        };
+        assert_eq!(
+            TuiSession::log_banner_text(&p, &info),
+            "llaew_20260917_150412.log (级别: DEBUG)"
+        );
+    }
+
+    #[test]
+    fn log_banner_text_目录外回退绝对路径() {
+        let p = paths("/opt/laew", "/home/u/work");
+        let info = crate::logging::AgentLogInfo {
+            path: std::path::PathBuf::from("/var/tmp/llaew_20260917_150412.log"),
+            level: "INFO",
+        };
+        assert_eq!(
+            TuiSession::log_banner_text(&p, &info),
+            "/var/tmp/llaew_20260917_150412.log (级别: INFO)"
+        );
+    }
+
+    #[test]
+    fn 启动时间行_紧凑形态转可读() {
+        // 与横幅同款转换:YYYYMMDD-HHMMSS → YYYY-MM-DD HH:MM:SS(与编译时间同宽 19 字符)
+        assert_eq!(
+            export::humanize_compact("20260917-150412"),
+            "2026-09-17 15:04:12"
+        );
+    }
 }

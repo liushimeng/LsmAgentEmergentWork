@@ -33,8 +33,27 @@ const DEFAULT_CLIP_LIMIT: usize = 4000;
 /// 时间戳取「调用此刻」——main.rs 在进程启动最早期调用,即为 laew 运行启动时间;
 /// 复用 `session::now_readable()` 的本地时区方案(取不到本地偏移回退 UTC)。
 pub fn startup_log_path(work_dir: &Path) -> PathBuf {
-    let ts = crate::session::now_readable().replace('-', "_"); // YYYYMMDD_HHMMSS
-    work_dir.join(format!("{LOG_FILE_PREFIX}{ts}.log"))
+    startup_log_path_at(work_dir, &crate::session::now_readable())
+}
+
+/// 按给定启动时刻(`YYYYMMDD-HHMMSS`,session::now_readable 形态)生成日志文件路径。
+///
+/// 第 72 轮(2026-09-17):main 最早期捕获一次启动时刻,同时用于日志文件命名与
+/// TUI 横幅「启动时间」行 —— 保证两者严格同刻,不因各自取 now 在跨秒边界差 1 秒。
+pub fn startup_log_path_at(work_dir: &Path, ts: &str) -> PathBuf {
+    work_dir.join(format!("{LOG_FILE_PREFIX}{}.log", ts.replace('-', "_")))
+}
+
+/// 运行日志文件元信息(第 72 轮):TUI 横幅「日志文件」行展示用。
+///
+/// main 构造日志层时顺手克隆一份(路径 + 级别)传给 TUI,让用户在会话内
+/// 随时(/clear /new 重印横幅)可见日志落盘位置,不再只靠启动时一闪而过的 stderr 提示。
+#[derive(Debug, Clone)]
+pub struct AgentLogInfo {
+    /// 日志文件完整路径(工作目录下 `llaew_YYYYMMDD_HHMMSS.log`)
+    pub path: PathBuf,
+    /// 日志级别:"DEBUG"(`--debug`) / "INFO"(`--info`)
+    pub level: &'static str,
 }
 
 /// 日志超长字段截断长度:环境变量 `LAEW_LOG_CLIP`(字符数),默认 4000。
@@ -157,6 +176,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_log_path_at_固定时刻与格式() {
+        let dir = Path::new("/tmp/some_workdir");
+        // YYYYMMDD-HHMMSS(now_readable 形态,'-' 分隔)→ 文件名 '_' 分隔
+        let p = startup_log_path_at(dir, "20260917-150412");
+        assert_eq!(
+            p,
+            PathBuf::from("/tmp/some_workdir/llaew_20260917_150412.log"),
+            "时刻经 '-' → '_' 归一后拼文件名"
+        );
+    }
 
     #[test]
     fn startup_log_path_格式与目录() {
