@@ -175,6 +175,7 @@ struct AxStrings {
     size: usize,
     windows: usize,
     focused: usize,
+    frontmost: usize,
     press_action: usize,
     raise_action: usize,
     pick_action: usize,
@@ -182,6 +183,7 @@ struct AxStrings {
     open_action: usize,
     scroll_to_visible_action: usize,
     manual_accessibility: usize,
+    enhanced_ui: usize,
 }
 
 static AX_STRINGS: OnceLock<AxStrings> = OnceLock::new();
@@ -203,6 +205,7 @@ fn ax_strings() -> &'static AxStrings {
             size: cfstr_literal("AXSize"),
             windows: cfstr_literal("AXWindows"),
             focused: cfstr_literal("AXFocused"),
+            frontmost: cfstr_literal("AXFrontmost"),
             press_action: cfstr_literal("AXPress"),
             raise_action: cfstr_literal("AXRaise"),
             pick_action: cfstr_literal("AXPick"),
@@ -210,6 +213,7 @@ fn ax_strings() -> &'static AxStrings {
             open_action: cfstr_literal("AXOpen"),
             scroll_to_visible_action: cfstr_literal("AXScrollToVisible"),
             manual_accessibility: cfstr_literal("AXManualAccessibility"),
+            enhanced_ui: cfstr_literal("AXEnhancedUserInterface"),
         }
     })
 }
@@ -268,6 +272,10 @@ fn kAXFocusedAttribute() -> CFStringRef {
     ax_strings().focused as CFStringRef
 }
 #[inline]
+fn kAXFrontmostAttribute() -> CFStringRef {
+    ax_strings().frontmost as CFStringRef
+}
+#[inline]
 fn kAXPressAction() -> CFStringRef {
     ax_strings().press_action as CFStringRef
 }
@@ -294,6 +302,10 @@ fn kAXScrollToVisibleAction() -> CFStringRef {
 #[inline]
 fn kAXManualAccessibilityAttribute() -> CFStringRef {
     ax_strings().manual_accessibility as CFStringRef
+}
+#[inline]
+fn kAXEnhancedUserInterfaceAttribute() -> CFStringRef {
+    ax_strings().enhanced_ui as CFStringRef
 }
 
 /// 「辅助功能」未授权时的统一文案(供 require_trusted / permission_hint 共用)。
@@ -460,35 +472,35 @@ unsafe fn cg_click_at(x: f64, y: f64, right: bool, double: bool) {
     }
 }
 
-/// 向当前焦点控件真实键入文本(2026-09-17 第 70 轮)。
-/// CGEventKeyboardSetUnicodeString 按 UTF-16 直达,无键盘布局/IME 依赖;
-/// 单个事件携带 ≤20 个 UTF-16 单元,分批注入(SendInput Unicode 的 macOS 对偶)。
+/// 向当前焦点控件真实键入文本(2026-09-17 第 70 轮;第 81 轮改**逐字符**注入)。
 ///
-/// 2026-09-17 第 77 轮 P1-3:完成所有 chunk 注入后等待 80ms,确保应用消费字符;
-/// 否则后续立即调用的 `send_keys("enter")` 等操作可能在输入框还没接收完整
-/// 文本时就把当前片段("i" 等首个字符)发送出去。LLM 调用范式:
-/// `click_point(输入框) → type_text(完整消息) → send_keys("enter")`,
-/// 这里的 80ms 等待让 type_text 完整生效。
+/// 第 81 轮根因修复(用户实测「只输入了 i 字符」):旧实现一次
+/// `CGEventKeyboardSetUnicodeString` 携带 20 个 UTF-16 单元,微信 macOS 等
+/// 自绘输入框对单个 keyDown 事件**只消费首个字符**,后续字符全部丢失。
+/// 逐字符注入(每字符一对 keyDown/keyUp)是 cliclick / Appium mac2 driver
+/// 的同款稳健路径,任何按 `NSEvent.characters` 消费的应用都能完整接收。
+///
+/// - 每字符一个事件对,字间隔 10ms(200 字 ≈ 2.4s,正确性优先);
+/// - 尾部保留 80ms 消化等待(第 77 轮 P1-3 修复,避免与后续 Enter 竞争)。
 unsafe fn cg_type_text(text: &str) {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    for chunk in units.chunks(20) {
+    for ch in text.chars() {
+        let mut units = [0u16; 2];
+        let len = ch.encode_utf16(&mut units).len();
         for &keydown in &[true, false] {
             let ev = CGEventCreateKeyboardEvent(std::ptr::null(), 0, keydown);
             if ev.is_null() {
                 return;
             }
-            CGEventKeyboardSetUnicodeString(ev, chunk.len() as isize, chunk.as_ptr());
+            CGEventKeyboardSetUnicodeString(ev, len as isize, units.as_ptr());
             CGEventPost(K_CG_HID_EVENT_TAP, ev);
             CFRelease(ev);
             if keydown {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    // 2026-09-17 第 77 轮 P1-3:全部 chunk 注入完成后等待 80ms,
-    // 让目标应用的输入事件循环完整消化 Unicode 字符,避免后续
-    // send_keys("enter") 等操作与残余字符竞争导致输入不完整。
+    // 全部字符注入完成后等待 80ms,让目标应用的输入事件循环完整消化,
+    // 避免后续 send_keys("enter") 与残余字符竞争导致输入不完整。
     // (经验值:微信 macOS 输入框事件循环周期约 50ms,80ms 留 30ms 余量)
     std::thread::sleep(std::time::Duration::from_millis(80));
 }
@@ -753,11 +765,14 @@ impl MacOsDriver {
                 format!("无法为 pid={pid} 创建 AX 应用元素"),
             ));
         }
-        // Electron / 自绘应用(含部分微信版本)常支持 AXManualAccessibility 开关。
-        // 打开失败不影响后续窗口读取,因此忽略错误。
+        // Electron / 自绘应用(含部分微信版本)常支持 AXManualAccessibility 开关;
+        // Qt / wx / 更多自绘框架认 **AXEnhancedUserInterface**(Appium mac2 同款技巧,
+        // 第 81 轮新增):置 true 强制应用构建完整无障碍树。两者均 best-effort,
+        // 打开失败不影响后续窗口读取;应用异步建树,浅树重试由 inspect 的 warmup 承担。
         let true_v: CFBooleanRef =
             core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
         let _ = AXUIElementSetAttributeValue(app, kAXManualAccessibilityAttribute(), true_v.cast());
+        let _ = AXUIElementSetAttributeValue(app, kAXEnhancedUserInterfaceAttribute(), true_v.cast());
         let wins = ax_get(app, kAXWindowsAttribute());
         CFRelease(app);
         if wins.is_null() {
@@ -973,6 +988,69 @@ impl MacOsDriver {
         }
     }
 
+    /// 第 81 轮:控件树是否「浅」—— 需要等待异步建树重试的判定:
+    /// 1. 总节点数 ≤ 4(微信实测空壳 = 根 AXWindow + 3 个红绿灯 AXButton);
+    /// 2. 或除纯容器(Window/Pane/Group/ScrollArea)外没有任何内容控件。
+    /// Electron / Qt / 微信等自绘 App 在 AXEnhancedUserInterface 置位后需要
+    /// 数百毫秒才把完整树搭出来,首读常为浅树。
+    ///
+    /// 注意:macOS 角色带 `AX` 前缀(AXButton),判定前先剥离再做容器名比对。
+    fn tree_is_shallow(root: &ControlNode) -> bool {
+        const CONTAINERS: &[&str] = &[
+            "window",
+            "pane",
+            "group",
+            "scrollarea",
+            "application",
+            "layoutarea",
+            "splitgroup",
+            "splitter",
+            "tabgroup",
+            "unknown",
+            "",
+        ];
+        fn is_pure_container(role: &str) -> bool {
+            let r = role.trim().to_ascii_lowercase();
+            let r = r.strip_prefix("ax").unwrap_or(&r);
+            CONTAINERS.contains(&r)
+        }
+        fn count(node: &ControlNode) -> usize {
+            1 + node.children.iter().map(count).sum::<usize>()
+        }
+        fn has_content(node: &ControlNode) -> bool {
+            if !is_pure_container(&node.role) {
+                return true;
+            }
+            node.children.iter().any(has_content)
+        }
+        count(root) <= 4 || !has_content(root)
+    }
+
+    /// 第 81 轮:应用是否已处于前台(读应用级 AXFrontmost;失败回退 false)。
+    ///
+    /// kAXFrontmostAttribute 返回 kCFBooleanTrue/False,直接做指针等值比较,
+    /// 不引入新 FFI;属性读取失败(权限/不支持)一律按 false 处理 ——
+    /// 后果只是多做一次幂等激活,与旧行为一致(安全降级)。
+    fn is_frontmost_pid(pid: i32) -> bool {
+        unsafe {
+            let app = AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                return false;
+            }
+            let v = ax_get(app, kAXFrontmostAttribute());
+            CFRelease(app);
+            if v.is_null() {
+                return false;
+            }
+            let true_ref = core_foundation::boolean::CFBoolean::true_value()
+                .as_concrete_TypeRef()
+                as *const std::ffi::c_void;
+            let is_true = v == true_ref;
+            CFRelease(v);
+            is_true
+        }
+    }
+
     /// 按路径定位元素(返回 retained ref,调用方负责 CFRelease)。
     unsafe fn element_at_path(root: AXUIElementRef, path: &str) -> Result<AXUIElementRef> {
         let trimmed = path.trim();
@@ -1122,21 +1200,44 @@ impl WindowDriver for MacOsDriver {
         let (pid, idx) = Self::parse_window_id(window_id)?;
         let max_depth = max_depth.clamp(1, 12);
         unsafe {
-            let win = Self::window_element(pid, idx)?;
-            let tree = Self::build_tree(win, "/".to_string(), 1, max_depth, filter);
-            CFRelease(win);
-            tree.ok_or_else(|| {
-                platform_err(
-                    "macos",
-                    format!(
-                        "filter 未命中窗口 {window_id} 内任何控件(已遍历到 max_depth={max_depth})。\
-                         【同义词建议】中文 UI 名称常见笔误:通讯录 ↔ 通信录 ↔ 联系人 ↔ Contacts;\
-                         消息 ↔ 发送 ↔ Send;输入框 ↔ 搜索 ↔ Search;按钮 ↔ Button;关闭 ↔ X ↔ close。\
-                         建议:1) 改用上表同义词重试;2) filter 留空 + max_depth=4-5 看完整树;\
-                         3) 用 WindowScreenshot + 视觉识别(若应用无障碍支持极差)"
-                    ),
-                )
-            })
+            // 第 81 轮:AX 异步建树等待(warmup)。AXEnhancedUserInterface 置位后
+            // Electron/Qt/自绘 App 需要数百毫秒搭树,首读常为「浅树」;检测到浅树时
+            // 等 300ms 重建,最多 3 次。带 filter 的调用不参与(命中即返回,避免把
+            // 合法的「仅容器命中」当浅树);LAEW_DISABLE_AX_WARMUP=1 一键关闭。
+            let warmup_enabled = !std::env::var("LAEW_DISABLE_AX_WARMUP")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
+            let attempts = if warmup_enabled && filter.is_none() { 3 } else { 1 };
+            for attempt in 0..attempts {
+                let win = Self::window_element(pid, idx)?;
+                let tree = Self::build_tree(win, "/".to_string(), 1, max_depth, filter);
+                CFRelease(win);
+                let tree = tree.ok_or_else(|| {
+                    platform_err(
+                        "macos",
+                        format!(
+                            "filter 未命中窗口 {window_id} 内任何控件(已遍历到 max_depth={max_depth})。\
+                             【同义词建议】中文 UI 名称常见笔误:通讯录 ↔ 通信录 ↔ 联系人 ↔ Contacts;\
+                             消息 ↔ 发送 ↔ Send;输入框 ↔ 搜索 ↔ Search;按钮 ↔ Button;关闭 ↔ X ↔ close。\
+                             建议:1) 改用上表同义词重试;2) filter 留空 + max_depth=4-5 看完整树;\
+                             3) 用 WindowScreenshot + 视觉识别(若应用无障碍支持极差)"
+                        ),
+                    )
+                })?;
+                let shallow = attempts > 1 && Self::tree_is_shallow(&tree);
+                if !shallow || attempt + 1 == attempts {
+                    return Ok(tree);
+                }
+                tracing::debug!(
+                    attempt = attempt + 1,
+                    attempts,
+                    window_id = %window_id,
+                    "AX 树为浅树(自绘 UI 异步建树中),300ms 后重建"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            // 循环内必然 return;此处仅为类型闭合
+            unreachable!("inspect warmup loop must return")
         }
     }
 
@@ -1343,6 +1444,12 @@ impl WindowDriver for MacOsDriver {
     }
 
     fn bring_to_front(&self, window_id: &str) -> Result<()> {
+        // 第 81 轮:已前台 → 直接返回(跳过 AXRaise + osascript frontmost),
+        // 消除 WindowOpen 在多单元/重试链路中把窗口反复前置导致的闪烁与焦点断续。
+        if self.is_frontmost(window_id) {
+            tracing::debug!(window_id = %window_id, "窗口已在前台,跳过激活(幂等前置)");
+            return Ok(());
+        }
         let (pid, idx) = Self::parse_window_id(window_id)?;
         // 先 AXRaise 对应 NSWindow,再通过 System Events 让 App frontmost。
         // AXRaise 只调整窗口层级;部分 App(尤其微信/Electron)仍需 frontmost
@@ -1374,6 +1481,15 @@ impl WindowDriver for MacOsDriver {
             ));
         }
         Ok(())
+    }
+
+    // 第 81 轮:窗口所属应用是否已处于前台(AXFrontmost)。
+    // WindowOpen 对已存在窗口先查本方法,已前台则跳过激活(窗口不再反复闪烁)。
+    fn is_frontmost(&self, window_id: &str) -> bool {
+        match Self::parse_window_id(window_id) {
+            Ok((pid, _)) => Self::is_frontmost_pid(pid),
+            Err(_) => false,
+        }
     }
 
     fn permission_hint(&self) -> Option<String> {
@@ -1544,5 +1660,78 @@ impl WindowDriver for MacOsDriver {
         macos_vision_ocr::screenshot_window(cg_window_id, region_tuple, output_path)
             .map_err(|e| platform_err(self.platform_name(), format!("CGWindow 截图失败: {e}")))?;
         Ok(info.bounds)
+    }
+}
+
+#[cfg(test)]
+mod shallow_tree_tests {
+    use super::*;
+
+    fn node(role: &str, children: Vec<ControlNode>) -> ControlNode {
+        ControlNode {
+            role: role.into(),
+            children,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wechat_chrome_only_tree_is_shallow() {
+        // 第 81 轮根因场景:微信 4.x 实测空壳树 = 根 AXWindow + 3 个红绿灯 AXButton。
+        // 必须判为浅树以触发 AXEnhancedUserInterface 建树等待重试。
+        let tree = node(
+            "AXWindow",
+            vec![
+                node("AXButton", vec![]),
+                node("AXButton", vec![]),
+                node("AXButton", vec![]),
+            ],
+        );
+        assert!(
+            MacOsDriver::tree_is_shallow(&tree),
+            "窗口 + 3 红绿灯按钮的空壳树应判为浅树"
+        );
+    }
+
+    #[test]
+    fn container_only_tree_is_shallow() {
+        let tree = node(
+            "AXWindow",
+            vec![node("AXGroup", vec![node("AXScrollArea", vec![])])],
+        );
+        assert!(MacOsDriver::tree_is_shallow(&tree), "纯容器树应判为浅树");
+    }
+
+    #[test]
+    fn tree_with_content_control_is_not_shallow() {
+        let tree = node(
+            "AXWindow",
+            vec![
+                node("AXButton", vec![]),
+                node("AXButton", vec![]),
+                node("AXButton", vec![]),
+                node("AXTextField", vec![]),
+            ],
+        );
+        assert!(
+            !MacOsDriver::tree_is_shallow(&tree),
+            "含输入框等真实控件树不应判为浅树"
+        );
+    }
+
+    #[test]
+    fn action_pure_trees_are_not_shallow() {
+        // 常规应用窗口:大量内容控件 → 深树
+        let tree = node(
+            "AXWindow",
+            vec![
+                node("AXToolbar", vec![node("AXButton", vec![])]),
+                node(
+                    "AXList",
+                    vec![node("AXStaticText", vec![]), node("AXStaticText", vec![])],
+                ),
+            ],
+        );
+        assert!(!MacOsDriver::tree_is_shallow(&tree));
     }
 }

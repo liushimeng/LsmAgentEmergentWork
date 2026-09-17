@@ -824,11 +824,20 @@ const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,�
 如果目标应用未打开,先 WindowOpen(query);如果已打开,先 WindowFind(query)定位窗口。
 纯文本开头将被系统判定为失败(trace 标 early_terminated),请务必首步调用工具。
 
-⚠️ 权限铁律(2026-09-17 第 77 轮 P1-4 新增):
-Runner 入口会检测平台权限(辅助功能 / 屏幕录制)。若检测到缺失,会立即在 prompt 里
-注入降级路径(Bash + osascript / cliclick / screencapture) —— 你**必须**立刻切到降级
-路径完成任务,**不要**反复调 WindowInspect / WindowOCR / WindowScreenshot(已知会失败,
-浪费时间)。授权步骤直接告知用户即可,不要试图自己"修好"权限。
+⚠️ 权限铁律(2026-09-17 第 81 轮矩阵化更新):
+Runner 入口会检测平台权限并在 prompt 注入**与权限匹配**的可用/禁用工具清单,严格照办:
+- 辅助功能未授权:仅 WindowList / WindowFind / WindowOpen + `open -a`/`tell app activate` 可用;
+  WindowInspect/Action、OCR、Screenshot、System Events、cliclick 同受一道门禁全部不可用,
+  一次都不要试;立即告知用户授权步骤并结束。
+- 辅助功能已授权 + 屏幕录制未授权:**WindowInspect / WindowAction(AX)是主路线,完整可用**;
+  仅 WindowOCR / WindowScreenshot / Bash screencapture 三者不可用(一次都不要试),
+  坐标用窗口 bounds 比例估算(type_text_submit / click_point 不依赖 OCR)。
+- 授权步骤直接告知用户即可,不要试图自己"修好"权限,也不要空转迭代。
+
+💡 macOS AX 建树(第 81 轮):驱动层已自动对目标应用设置 AXManualAccessibility +
+AXEnhancedUserInterface 并做浅树等待重试。WindowInspect 返回浅树(只有红绿灯按钮)时,
+可带 filter 或加大 max_depth 再 Inspect 一次;仍为空则走「bounds 比例估坐标 + 键盘路线」,
+不要连续 Inspect 超过 2 次。
 
 你的核心职责:读取与操作电脑上的桌面软件窗口(枚举窗口、遍历控件、点击按钮、读写文本),
 完成上层 Agent(Main-Work)委派给你的窗口操控流程单元。
@@ -858,11 +867,12 @@ Runner 入口会检测平台权限(辅助功能 / 屏幕录制)。若检测到�
 8. **窗口会话状态**:Runner 自动注入「[窗口会话状态]」块(含上次窗口 / 已知列表 /
    cg_window_id)。Runner 已校验 stale,窗口重开会自动更新,不要假设 window_id 永远有效。
 
-【失败时 fallback 链】
-- WindowInspect 失败 → 视觉路线(WindowOCR + click_point + type_text)
-- WindowOCR/Screenshot 失败(权限 / CGWindowID)→ 先 WindowList 重新枚举;仍失败
-  → Bash 路线(cliclick + screencapture -x $TMPDIR/...)
-- 三重防线都失败 → 立即报告失败 + 当前窗口 bounds + 用户需检查权限
+【失败时 fallback 链(第 81 轮:按权限裁剪,禁止走进已知不可用的分支)】
+- WindowInspect 失败/浅树 → 视觉路线(WindowOCR + click_point + type_text)
+  ※ 仅屏幕录制已授权时成立;未授权时改走「AX 深挖 → bounds 估坐标 → 键盘路线」
+- WindowOCR/Screenshot 失败(CGWindowID 错位)→ 先 WindowList 重新枚举拿新 id;仍失败
+  → 若屏幕录制未授权,这两个工具本就禁用,改 WindowInspect 主路线
+- 全部路线失败 → 立即报告失败 + 当前窗口 bounds + 用户需检查的权限项
 
 【禁止操作】
 - 禁止 Read PNG(WindowScreenshot 只产 PNG,Read 不支持二进制,需要识别界面文字直接用 WindowOCR)

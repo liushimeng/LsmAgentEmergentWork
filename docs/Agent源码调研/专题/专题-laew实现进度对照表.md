@@ -741,3 +741,42 @@ SubAgent 写 Python Playwright 脚本 → AI 回复写入 wenxin_result.txt(530 
 重复图片去重缓存 / EXIF orientation 应用。
 
 **方案**:`tmpPlan/2026-09-17_05-Read工具多模态与编码探测增强方案.md`
+
+---
+
+## 第 81 轮（2026-09-17）— macOS 无障碍 API 强化 WindowUse 与会话连续性优化
+
+**主题**:微信自动化聊天任务三场次 DEBUG 日志根因修复。14:38 场次实测权限状态为
+「辅助功能 ✅ / 屏幕录制 ❌」,但引导文案与权限事实脱节:降级建议推荐必败的
+screencapture、禁令实际可用的 WindowInspect、空树引导把 LLM 推向必败的 WindowOCR,
+三处矛盾引导致 16 迭代烧光;微信 4.x AX 树仅红绿灯 3 按钮(未设 AXEnhancedUserInterface);
+`type_text` 单事件携带 20 UTF-16 单元被自绘输入框只消费首字符(用户实测「只输入了 i」);
+WindowOpen 对已存在窗口无条件激活致窗口反复闪烁。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| wu-ax-warmup | 自绘 UI AX 树为空:未设 AXEnhancedUserInterface,无浅树等待重试 | P0 | ✅ | `src/agent/window/macos_legacy.rs`(`window_element` 双开关 AXManualAccessibility+AXEnhancedUserInterface;`inspect` 浅树 300ms×3 重建,`LAEW_DISABLE_AX_WARMUP=1` 关闭;`tree_is_shallow`:≤4 节点或纯容器) | 2026-09-17 第 81 轮 |
+| wu-perchar-type | `cg_type_text` 单事件 20 UTF-16 单元,自绘输入框只消费首字符(丢字) | P0 | ✅ | `src/agent/window/macos_legacy.rs::cg_type_text` 逐字符 CGEvent 注入(每字符 keyDown/keyUp,字间隔 10ms,尾部保留 80ms 消化等待) | 2026-09-17 第 81 轮 |
+| wu-perm-matrix | 权限引导与事实矛盾:屏幕录制缺失仍荐 screencapture;辅助功能已授权仍禁 WindowInspect;空树引导推向必败 OCR | P0 | ✅ | `src/agent/window/mod.rs::build_permission_failure_message` 按真实 TCC 矩阵两分支重写 + `src/agent/tools/window/inspect.rs` 空树引导权限分派 + `src/agent/tools/window/open.rs` `next_action` 权限分派 + `window_use.rs` Runner 规范 + `system_prompt/mod.rs` 权限铁律矩阵化 | 2026-09-17 第 81 轮 |
+| wu-idempotent-front | WindowOpen 无条件激活已存在窗口,多单元/重试链路窗口反复前置闪烁 | P1 | ✅ | `WindowDriver::is_frontmost`(默认 false;macOS AXFrontmost 指针对比 / Windows GetForegroundWindow / Linux xdotool getactivewindow)+ `macos_legacy::bring_to_front` 已前台短路 + `tools/window/open.rs` 已前台跳过激活/400ms sleep/bounds 重取,返回体增 `already_frontmost` | 2026-09-17 第 81 轮 |
+| wu-ax-role-match | `has_actionable_controls` 用 `eq_ignore_ascii_case("Button")` 匹配 macOS `AXButton` 永不命中 → macOS 任何树都误触发视觉路线引导 | P1 | ✅ | `src/agent/tools/window/inspect.rs::has_actionable_controls` 剥离 AX 前缀后子串匹配(覆盖 AXStaticText/AXRows 变体,Windows UIA 不变) | 2026-09-17 第 81 轮 |
+| wu-tui-digest | TUI 工具调用摘要:窗口工具无差异化规则,大参数刷屏 | P1 | ✅ | `src/agent/orchestrator/usage.rs::tool_args_digest` 窗口 7 工具差异化摘要(WindowOpen=query / WindowList=filter / WindowInspect=win+depth+filter / WindowOCR=win+lang / WindowAction=action+path+@x,y+text截16,值统一 ≤24 字符) | 2026-09-17 第 81 轮 |
+
+**设计要点**:
+- **引导 = 真实权限矩阵**:macOS TCC 事实是 osascript System Events / cliclick / CGEvent
+  注入与 WindowInspect 同受「辅助功能」一道门禁;辅助功能缺失时唯一可用是
+  WindowList/Find/Open + Apple Events 激活;辅助功能✅+屏幕录制❌时 AX 主路线完整可用,
+  仅 OCR/Screenshot/screencapture 三者禁用 —— 三处注入点(Runner/Open/Inspect)统一。
+- **无 OCR 的界面识别**:坐标动作(click_point/type_text_submit)不依赖 OCR,可按窗口
+  bounds 比例估算(输入框≈底部 85% 高度等);AX 深挖(max_depth 6-8)+ 键盘路线兜底。
+- **幂等前置安全降级**:is_frontmost 误判(多工作区)后果 = 多做一次激活 = 旧行为。
+- **逐字符键入耗时**:≈12ms/字符(200 字 ≈2.4s),正确性优先;Windows SendInput /
+  Linux xdotool 本就逐块,不动。
+
+**验证**:单元测试 1183 全过(新增 shallow_tree_tests 4 + 权限矩阵 3 重写 + tool_args_digest 窗口工具 2);
+`cargo test` 全套 + `run_e2e.sh` PASS=188 FAIL=0。
+
+**未做(后续候选)**:微信 4.x AX 树真机复测(需授权终端)/ act 路径 AXValue 回读校验 /
+ocr_with_info 在屏幕录制未授权时返回结构化「权限缺失」错误码。
+
+**方案**:`tmpPlan/2026-09-17_12-macOS无障碍API强化WindowUse与会话连续性优化方案.md`

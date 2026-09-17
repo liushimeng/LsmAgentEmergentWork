@@ -31,9 +31,9 @@ use windows::Win32::UI::Accessibility::{
     UIA_ScrollItemPatternId, UIA_ValuePatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, SendMessageW, SetForegroundWindow, BM_CLICK,
-    GW_CHILD, GW_HWNDNEXT, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendMessageW,
+    SetForegroundWindow, BM_CLICK, GW_CHILD, GW_HWNDNEXT, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT,
 };
 
 use super::windows_input as winput;
@@ -854,6 +854,17 @@ impl WindowDriver for WindowsDriver {
     fn bring_to_front(&self, window_id: &str) -> Result<()> {
         let hwnd = Self::parse_hwnd(window_id)?;
         winput::force_foreground(hwnd)
+    }
+
+    // 第 81 轮:已前台 → 跳过激活(WindowOpen 幂等前置,消除窗口反复闪烁)。
+    fn is_frontmost(&self, window_id: &str) -> bool {
+        match Self::parse_hwnd(window_id) {
+            Ok(hwnd) => {
+                // SAFETY:标准 GetForegroundWindow 查询,无副作用。
+                unsafe { GetForegroundWindow() == hwnd }
+            }
+            Err(_) => false,
+        }
     }
 
     fn ocr(

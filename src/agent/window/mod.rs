@@ -356,6 +356,18 @@ pub trait WindowDriver: Send + Sync {
         Ok(())
     }
 
+    /// 2026-09-17 第 81 轮:窗口所属应用当前是否已处于前台。
+    ///
+    /// 用途:WindowOpen 对「已存在窗口」先查本方法 —— 已前台则**跳过激活**
+    /// (跳过 AXRaise / osascript frontmost / 400ms sleep),消除失败回流与
+    /// 多单元链路中窗口被反复前置导致的闪烁与焦点断续(会话连续性)。
+    ///
+    /// 默认 `false`:平台未实现时保持旧行为(总是尝试激活,安全降级 ——
+    /// 误判的后果只是多做一次幂等激活,与第 80 轮之前行为一致)。
+    fn is_frontmost(&self, _window_id: &str) -> bool {
+        false
+    }
+
     /// 2026-09-16 第 67 轮:对窗口(可选区域)做 OCR,返回词级文本块。
     ///
     /// - `region`:窗口相对矩形(物理像素);`None` = 整个窗口客户区;
@@ -684,31 +696,24 @@ fn probe_macos_screen_recording() -> bool {
     }
 }
 
-/// 把缺失项翻译成 LLM 可读的引导文案(2026-09-17 第 77 轮 P0-1)。
+/// 把缺失项翻译成 LLM 可读的引导文案(第 77 轮 P0-1 引入,第 81 轮按**真实权限矩阵**重写)。
 ///
 /// 用途:WindowUseRunner 入口在权限缺失时把这段文案追加到 prompt,
-/// LLM 第一轮响应即可拿到完整降级路径,不必通过 14+ 次失败自己摸索。
+/// LLM 第一轮响应即可拿到与权限事实一致的可用/禁用工具清单,不必通过
+/// 14+ 次失败自己摸索。
 ///
-/// 输出结构:
-/// ```text
-/// 【平台权限快速检测】⚠️ 检测到权限缺失:
-///   - 辅助功能: 未授权
-///   - 屏幕录制: 未授权
-/// 【降级路径】已为你开 Bash 白名单(osascript / cliclick / screencapture),可用:
-///   - 启动应用: osascript -e 'tell application "WeChat" to activate'
-///   - 坐标点击: cliclick c:x,y
-///   - 键盘输入: osascript -e 'tell application "System Events" to keystroke "..."'
-///   - 截图: screencapture -x $TMPDIR/x.png
-/// 【推荐策略】
-///   1. 立即走 Bash 路线完成核心任务(发消息 / 截图识别)
-///   2. 同时引导用户去系统设置授权(下次任务可用原生路线)
-///   3. 禁止再尝试 WindowInspect / WindowOCR / WindowScreenshot(已知会失败)
-/// ```
+/// 第 81 轮根因修复:旧版文案与权限事实脱节 —— 屏幕录制缺失时仍建议
+/// 「screencapture 截图」(实际必失败);辅助功能已授权时仍禁令 WindowInspect
+/// (实际是唯一可用主路线)。新版按 macOS TCC 真实矩阵分两个分支输出:
+///
+/// - **辅助功能缺失**:仅 WindowList/Find/Open + Apple Events 激活可用;
+///   System Events / cliclick / CGEvent 同受一道门禁,一并列入禁用;
+/// - **辅助功能 ✅ + 屏幕录制 ❌**:WindowInspect / WindowAction(AX 主路线)
+///   完整可用;仅禁 WindowOCR / WindowScreenshot / screencapture 截图识别路线,
+///   并给出「AX 深挖 / bounds 比例估坐标 / 键盘路线」三条替代识别方案。
 pub fn build_permission_failure_message(report: &PermissionReport) -> String {
     let mut lines = Vec::new();
-    lines.push(format!(
-        "\n\n【平台权限快速检测(2026-09-17 第 77 轮 P0-1)】"
-    ));
+    lines.push("\n\n【平台权限快速检测(第 81 轮矩阵化)】".to_string());
     let mut missing = Vec::new();
     if !report.accessibility {
         missing.push("辅助功能(accessibility)");
@@ -718,45 +723,70 @@ pub fn build_permission_failure_message(report: &PermissionReport) -> String {
     }
     if missing.is_empty() {
         lines.push("✅ 平台权限齐全,WindowUse 全工具正常可用。".to_string());
-    } else {
-        lines.push(format!(
-            "⚠️ 检测到权限缺失({} 项):\n  - {}",
-            missing.len(),
-            missing.join("\n  - ")
-        ));
+        return lines.join("\n");
+    }
+
+    lines.push(format!(
+        "⚠️ 检测到权限缺失({} 项):{}",
+        missing.len(),
+        missing.join("、")
+    ));
+
+    // ---------- 分支 1:辅助功能缺失(最受限,一切 UI 读取/操控不可用) ----------
+    // TCC 事实:osascript System Events / cliclick / CGEvent 注入与 WindowInspect
+    // 同受「辅助功能」一道门禁,未授权时全部失败 —— 降级清单里绝不能出现它们。
+    if !report.accessibility {
         if !report.accessibility_hint.is_empty() {
-            lines.push(format!(
-                "【辅助功能授权步骤】\n  {}",
-                report.accessibility_hint
-            ));
+            lines.push(format!("【辅助功能授权步骤】\n  {}", report.accessibility_hint));
         }
+        lines.push(
+            "【可用工具(仅此 4 个)】WindowList / WindowFind / WindowOpen / Bash(open -a、\
+             osascript tell app to activate —— Apple Events 不受辅助功能门禁)。"
+                .to_string(),
+        );
+        lines.push(
+            "【禁止尝试(已知必败,连 1 次都不要试)】WindowInspect / WindowAction / \
+             WindowOCR / WindowScreenshot / Bash screencapture / cliclick / \
+             osascript System Events —— 它们与 WindowInspect 同受一道辅助功能门禁,\
+             未授权时全部失败。"
+                .to_string(),
+        );
+        lines.push(
+            "【策略】只能完成「启动/激活应用 + 枚举窗口」级别的工作;读取/操作 UI \
+             必须等用户授权。立即在最终回答里告知用户授权步骤并结束,不要空转迭代。"
+                .to_string(),
+        );
+        return lines.join("\n");
+    }
+
+    // ---------- 分支 2:辅助功能 ✅、屏幕录制 ❌(AX 主路线完整可用) ----------
+    if !report.screen_recording {
         if !report.screen_recording_hint.is_empty() {
             lines.push(format!(
                 "【屏幕录制授权步骤】\n  {}",
                 report.screen_recording_hint
             ));
         }
-        lines.push("【降级路径(WindowUse 已扩 Bash 白名单,无需授权)】".to_string());
         lines.push(
-            "  - 启动 / 激活应用: osascript -e 'tell application \"WeChat\" to activate'"
+            "✅ 辅助功能已授权:**WindowInspect / WindowAction(AX 控件树 + 坐标动作)完整可用,\
+             这是主路线**。osascript System Events / pbcopy / pbpaste 同样可用。"
                 .to_string(),
         );
         lines.push(
-            "  - 检测应用是否运行: osascript -e 'tell application \"System Events\" to (name of processes) contains \"WeChat\"'".to_string(),
-        );
-        lines.push(
-            "  - 键盘输入(ASCII): osascript -e 'tell application \"System Events\" to keystroke \"text\"'".to_string(),
-        );
-        lines.push(
-            "  - 键盘输入(CJK): echo -n \"消息内容\" | pbcopy  + osascript keystroke \"v\" / cmd+v"
+            "【禁止尝试(屏幕录制缺失,已知必败)】WindowOCR / WindowScreenshot / \
+             Bash screencapture —— 全部截图识别路线一次都不要试。"
                 .to_string(),
         );
-        lines.push("  - 坐标点击: cliclick c:x,y(需 brew install cliclick)".to_string());
-        lines.push("  - 截图: screencapture -x $TMPDIR/x.png".to_string());
         lines.push(
-            "【推荐策略】\n  1. 立即走 Bash 路线完成核心任务(发消息 / 截图识别)\n  \
-             2. 同时引导用户去系统设置授权(下次任务可用原生路线)\n  \
-             3. 禁止再尝试 WindowInspect / WindowOCR / WindowScreenshot(已知会失败浪费时间)"
+            "【无 OCR 的界面识别替代路线】\n  \
+             1. WindowInspect 加大 max_depth(6-8)且不带 filter 深挖\
+                (驱动已自动 AXEnhancedUserInterface 建树等待);\n  \
+             2. 控件树仍为空(自绘 UI):按窗口 bounds **比例估算坐标**直接用坐标动作\
+                (click_point 不依赖 OCR;如输入框≈窗口底部 85% 高度、搜索框≈顶部 5%),\
+                操作后用 WindowInspect/GetText 验证;\n  \
+             3. 键盘路线:type_text_submit 直接向焦点控件键入(无需知道控件路径);\n  \
+             4. 文本读取优先 AX:get_text / AXValue,其次 pbpaste\
+                (先 System Events keystroke \"c\" cmd+c)。"
                 .to_string(),
         );
     }
@@ -805,11 +835,48 @@ mod permission_tests {
         let msg = build_permission_failure_message(&r);
         assert!(msg.contains("✅"));
         assert!(!msg.contains("⚠️"));
-        assert!(!msg.contains("降级路径"));
+        assert!(!msg.contains("禁止尝试"));
     }
 
     #[test]
-    fn build_permission_message_with_missing() {
+    fn build_permission_message_ax_only_screencapture_missing() {
+        // 第 81 轮核心回归:辅助功能 ✅ + 屏幕录制 ❌(14:38 场次的真实状态)。
+        // 必须主推 WindowInspect/WindowAction(可用),只禁截图识别路线。
+        let r = PermissionReport {
+            platform: "macos".into(),
+            accessibility: true,
+            screen_recording: false,
+            can_ocr: false,
+            can_screenshot: false,
+            accessibility_hint: String::new(),
+            screen_recording_hint: "授权步骤...".into(),
+        };
+        let msg = build_permission_failure_message(&r);
+        assert!(msg.contains("⚠️"));
+        assert!(msg.contains("屏幕录制"));
+        // AX 主路线必须被肯定(不再一刀切禁令 WindowInspect)
+        assert!(
+            msg.contains("完整可用"),
+            "辅助功能已授权时必须明确 WindowInspect/WindowAction 可用: {msg}"
+        );
+        assert!(msg.contains("WindowInspect / WindowAction"));
+        // 截图识别路线必须整体禁止
+        assert!(msg.contains("禁止尝试"));
+        assert!(msg.contains("WindowOCR / WindowScreenshot"));
+        // 不得再建议 screencapture 作为可用降级路径(第 77 轮 bug)
+        assert!(
+            !msg.contains("screencapture -x"),
+            "不得把 screencapture 列为可用降级路径: {msg}"
+        );
+        // 必须给出无 OCR 的替代识别路线
+        assert!(msg.contains("比例估算坐标"));
+        assert!(msg.contains("type_text_submit"));
+    }
+
+    #[test]
+    fn build_permission_message_accessibility_missing_forbids_all_ui_tools() {
+        // 辅助功能 ❌:System Events / cliclick 与 WindowInspect 同受一道门禁,
+        // 全部列入禁用;只保留 WindowList/Find/Open + Apple Events 激活。
         let r = PermissionReport {
             platform: "macos".into(),
             accessibility: false,
@@ -822,11 +889,12 @@ mod permission_tests {
         let msg = build_permission_failure_message(&r);
         assert!(msg.contains("⚠️"));
         assert!(msg.contains("辅助功能"));
-        assert!(msg.contains("屏幕录制"));
-        assert!(msg.contains("osascript"));
-        assert!(msg.contains("cliclick"));
-        assert!(msg.contains("screencapture"));
-        assert!(msg.contains("禁止再尝试 WindowInspect"));
+        assert!(msg.contains("仅此 4 个"));
+        assert!(msg.contains("WindowList / WindowFind / WindowOpen"));
+        assert!(msg.contains("禁止尝试"));
+        assert!(msg.contains("WindowInspect"));
+        assert!(msg.contains("System Events"));
+        assert!(msg.contains("不要空转迭代"));
     }
 }
 

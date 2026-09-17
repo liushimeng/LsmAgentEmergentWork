@@ -201,17 +201,21 @@ impl WindowUseRunner {
                 description 中完整列出):通讯录/通信录/联系人/Contacts、按钮/Button、\
                 输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences。\n\
              4. **【原子发送范式】**定位输入框后首选一个 `type_text_submit` 完成\
-                键入完整内容 + Enter 提交;视觉路线传输入框中心 x/y,控件树路线先聚焦/传 path。\
+                键入完整内容 + Enter 提交(驱动层已逐字符注入,长文本不会丢字);\
+                视觉路线传输入框中心 x/y,控件树路线先聚焦/传 path。\
                 仅当应用把 Enter 定义为换行时,才用 type_text + click「发送」按钮。\
-                发送后重新 WindowInspect/OCR 复查消息已出现在对话区。\n\
-             5. **【效率规范 - 2026-09-17 第 77 轮】**:\n\
+                发送后用**可用的**手段复查(WindowInspect/get_text 或 OCR)消息已出现在对话区。\n\
+             5. **【效率规范 - 2026-09-17 第 81 轮更新】**:\n\
                 - 状态块中的窗口 freshness=Fresh 时直接复用 window_id;禁止重复 \
                   WindowOpen/WindowFind/激活同一目标,避免 UI 反复前置导致焦点断续;\n\
-                - 禁止 Bash 调 screencapture(WindowScreenshot 已走 CGWindow 原生路径);\n\
+                - WindowOpen 返回 already_frontmost=true(或窗口明显未变)时**不要再激活**,\
+                  驱动层已做幂等前置,重复激活只会打断当前输入焦点;\n\
+                - 禁止 Bash 调 screencapture(WindowScreenshot 已走 CGWindow 原生路径;\
+                  屏幕录制未授权时两者都不可用,见上方权限检测提示);\n\
                 - 禁止 Bash 调 osascript 枚举 UI 或获取窗口位置(WindowInspect / WindowList 已覆盖);\n\
                 - Bash 仅用于:cliclick 坐标点击(控件树+视觉路线都失败时)、open 启动应用、\
                   权限未授权场景的 osascript System Events 降级路径;\n\
-                - 每步操作后必须验证(WindowOCR / WindowInspect)再继续;\n\
+                - 每步操作后用当前权限下**可用**的手段验证再继续(权限缺失时 OCR 不可用,改 Inspect/get_text);\n\
                 - 连续 3 轮无进展立即止损,不要重复相同失败操作。",
         );
 
@@ -726,8 +730,8 @@ mod tests {
 
     #[test]
     fn permission_message_contains_degradation_guide_when_missing() {
-        // 验证权限缺失时 build_permission_failure_message 输出包含降级路径
-        // 关键命令(osascript / cliclick / screencapture)。
+        // 第 81 轮矩阵化:辅助功能 ❌ 时只保留 WindowList/Find/Open + Apple Events,
+        // System Events / cliclick / screencapture 一并列入禁用(同受一道 TCC 门禁)。
         use crate::agent::window::{build_permission_failure_message, PermissionReport};
 
         // Windows 上 granted=true,无缺失
@@ -743,7 +747,7 @@ mod tests {
         let msg = build_permission_failure_message(&r);
         assert!(msg.contains("✅"), "Windows 全授权应给出成功文案: {msg}");
 
-        // macOS 缺权限
+        // macOS 辅助功能缺失(最受限分支)
         let r = PermissionReport {
             platform: "macos".into(),
             accessibility: false,
@@ -755,16 +759,35 @@ mod tests {
         };
         let msg = build_permission_failure_message(&r);
         assert!(msg.contains("⚠️"), "macOS 缺权限应给出警告文案");
-        assert!(msg.contains("osascript"), "应包含 osascript 降级命令");
-        assert!(msg.contains("cliclick"), "应包含 cliclick 降级命令");
+        assert!(msg.contains("osascript"), "应包含 osascript 激活命令");
+        assert!(msg.contains("WindowList / WindowFind / WindowOpen"));
+        assert!(msg.contains("禁止尝试"), "应明确禁止重复尝试");
+        assert!(msg.contains("不要空转迭代"));
+    }
+
+    #[test]
+    fn permission_message_ax_granted_keeps_inspect_usable() {
+        // 第 81 轮核心回归(14:38 场次):辅助功能 ✅ + 屏幕录制 ❌。
+        // 旧版文案一刀切禁令 WindowInspect 与事实矛盾(AX 是唯一主路线),
+        // 且把 screencapture 列为可用降级 —— 两者都必须纠正。
+        use crate::agent::window::{build_permission_failure_message, PermissionReport};
+        let r = PermissionReport {
+            platform: "macos".into(),
+            accessibility: true,
+            screen_recording: false,
+            can_ocr: false,
+            can_screenshot: false,
+            accessibility_hint: String::new(),
+            screen_recording_hint: "授权步骤...".into(),
+        };
+        let msg = build_permission_failure_message(&r);
+        assert!(msg.contains("完整可用"), "AX 主路线必须被肯定: {msg}");
         assert!(
-            msg.contains("screencapture"),
-            "应包含 screencapture 降级命令"
+            !msg.contains("screencapture -x"),
+            "screencapture 不得作为可用路径出现: {msg}"
         );
-        assert!(
-            msg.contains("禁止再尝试 WindowInspect"),
-            "应明确禁止重复尝试"
-        );
+        assert!(msg.contains("WindowOCR / WindowScreenshot"));
+        assert!(msg.contains("比例估算坐标"));
     }
 
     #[test]

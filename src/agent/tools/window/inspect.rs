@@ -69,14 +69,32 @@ impl Tool for WindowInspectTool {
             let has_meaningful_controls = has_actionable_controls(&tree);
             let json_str = tree_to_json(tree);
             if node_count <= 2 || !has_meaningful_controls {
-                return Ok(format!(
-                    "{json_str}\n\n[视觉路线引导]当前窗口控件树为空或无可操作控件(自绘 UI / Electron canvas),\
-                     请立即切换视觉路线:\n\
-                     1. WindowOCR(window_id=\"{window_id}\") 识别界面文字 + 坐标\n\
-                     2. WindowAction(window_id=\"{window_id}\", path=\"/\", action=\"click_point\", \
-                        x=screen_cx, y=screen_cy) 点击目标位置\n\
-                     坐标取 WindowOCR 返回的 screen_cx/screen_y(词块中心)。不要重复调用 WindowInspect。"
-                ));
+                // 第 81 轮:引导按权限分派 —— 屏幕录制缺失时推 WindowOCR 是把 LLM
+                // 送进必败路线(14:38 场次 16 迭代烧光的直接推手),改推 AX 深挖 +
+                // bounds 比例估坐标 + 键盘路线;屏幕录制可用时保留原视觉路线引导。
+                let perm = crate::agent::window::check_platform_permissions();
+                let guide = if perm.screen_recording {
+                    format!(
+                        "[视觉路线引导]当前窗口控件树为空或无可操作控件(自绘 UI / Electron canvas),\
+                         请立即切换视觉路线:\n\
+                         1. WindowOCR(window_id=\"{window_id}\") 识别界面文字 + 坐标\n\
+                         2. WindowAction(window_id=\"{window_id}\", path=\"/\", action=\"click_point\", \
+                            x=screen_cx, y=screen_cy) 点击目标位置\n\
+                         坐标取 WindowOCR 返回的 screen_cx/screen_y(词块中心)。不要重复调用 WindowInspect。"
+                    )
+                } else {
+                    format!(
+                        "[无 OCR 引导]控件树为空/浅树,且屏幕录制未授权 —— WindowOCR / WindowScreenshot / \
+                         Bash screencapture 均不可用,不要尝试。替代路线:\n\
+                         1. 已自动 AXEnhancedUserInterface 建树等待,可带 filter 或加大 max_depth(6-8)再 Inspect 一次;\n\
+                         2. 仍为空:按窗口 bounds **比例估算坐标**直接操作(click_point 不依赖 OCR:\n\
+                            输入框≈底部 85% 高度、搜索框≈顶部 5%、导航栏≈左侧 3-8% 宽度),\
+                            操作后用 WindowAction(get_text) 验证;\n\
+                         3. 键盘路线:WindowAction(action=\"type_text_submit\", text=内容) 直接向焦点控件键入并提交;\n\
+                         4. System Events keystroke / pbcopy + cmd+v 走 Bash 白名单(辅助功能已授权时可用)。"
+                    )
+                };
+                return Ok(format!("{json_str}\n\n{guide}"));
             }
             Ok(json_str)
         })
@@ -87,28 +105,43 @@ impl Tool for WindowInspectTool {
 /// 2026-09-16 第 68 轮 P2-A:检测控件树是否有「可操作控件」。
 /// 可操作 = role 不是 Window / Pane / Group / Unknown 等容器类,而是 Button /
 /// Edit / Text / List / MenuItem 等可交互控件。
+///
+/// 第 81 轮修复:macOS AX 角色带 `AX` 前缀(AXButton / AXTextField),旧实现的
+/// `eq_ignore_ascii_case("Button")` 永不命中 → **任何 macOS 控件树都被误判为
+/// 「无可操作控件」并误触发视觉路线引导**。现剥离 AX 前缀后做子串匹配,
+/// 覆盖 AXStaticText / AXRows 等变体;Windows UIA 角色(Button / Edit)不变。
 fn has_actionable_controls(node: &ControlNode) -> bool {
     const ACTIONABLE_ROLES: &[&str] = &[
-        "Button",
-        "Edit",
-        "Text",
-        "List",
-        "ListItem",
-        "MenuItem",
-        "CheckBox",
-        "RadioButton",
-        "ComboBox",
-        "Slider",
-        "Tab",
-        "TreeItem",
-        "Hyperlink",
-        "DataItem",
-        "Custom",
+        "button",
+        "edit",
+        "text",
+        "list",
+        "listitem",
+        "menuitem",
+        "menu",
+        "checkbox",
+        "radiobutton",
+        "combo",
+        "slider",
+        "tab",
+        "treeitem",
+        "tree",
+        "hyperlink",
+        "link",
+        "dataitem",
+        "custom",
+        "row",
+        "cell",
+        "outline",
+        "image",
+        "scrollbar",
     ];
-    if ACTIONABLE_ROLES
-        .iter()
-        .any(|r| node.role.eq_ignore_ascii_case(r))
-    {
+    fn role_matches(node_role: &str) -> bool {
+        let r = node_role.trim().to_ascii_lowercase();
+        let r = r.strip_prefix("ax").unwrap_or(&r);
+        ACTIONABLE_ROLES.iter().any(|k| r.contains(k))
+    }
+    if role_matches(&node.role) {
         return true;
     }
     node.children.iter().any(has_actionable_controls)

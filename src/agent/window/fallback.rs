@@ -253,6 +253,29 @@ impl WindowDriver for FallbackDriver {
         Err(platform_err(self.platform_name(), UNSUPPORTED_MSG))
     }
 
+    // 第 81 轮:已前台 → 跳过激活。xdotool getactivewindow 返回十进制窗口 id,
+    // wmctrl id 是 0x 十六进制,统一成 u64 对比;失败一律 false(保持旧行为)。
+    fn is_frontmost(&self, window_id: &str) -> bool {
+        if !self.has_xdotool {
+            return false;
+        }
+        let Ok(target) = u64::from_str_radix(window_id.trim().trim_start_matches("0x"), 16) else {
+            return false;
+        };
+        let Ok(out) = Command::new("xdotool").arg("getactivewindow").output() else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|active| active == target)
+            .unwrap_or(false)
+    }
+
     fn permission_hint(&self) -> Option<String> {
         if self.has_wmctrl || self.has_xdotool {
             None

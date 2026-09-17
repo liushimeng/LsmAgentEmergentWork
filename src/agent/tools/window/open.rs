@@ -339,28 +339,46 @@ impl Tool for WindowOpenTool {
             let started = std::time::Instant::now();
 
             // 2026-09-16 第 67 轮:已在运行(含最小化到托盘)→ 恢复 + 前置,不重复启动。
-            // 此前无视已有窗口直接再启动一次,既浪费又可能触发单实例冲突。
-            if let Some((matched_query, info)) = before_hit.clone() {
-                let activated = driver.bring_to_front(&info.id).is_ok();
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                // 前置后重取一次最新 bounds(恢复最小化后 -32000 会刷新为真实坐标)
-                let refreshed = driver
-                    .list_windows(None)
-                    .ok()
-                    .and_then(|ws| ws.into_iter().find(|w| w.id == info.id))
-                    .unwrap_or(info);
+            // 2026-09-17 第 81 轮:已在前台 → **跳过激活**(不再 AXRaise/osascript/400ms
+            // sleep/bounds 重取),多单元与重试链路中窗口不再被反复前置闪烁(会话连续性)。
+            if let Some((matched_query, mut info)) = before_hit.clone() {
+                let already_frontmost = driver.is_frontmost(&info.id);
+                let activated = if already_frontmost {
+                    true
+                } else {
+                    let ok = driver.bring_to_front(&info.id).is_ok();
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    // 前置后重取一次最新 bounds(恢复最小化后 -32000 会刷新为真实坐标)
+                    if let Some(fresh) = driver
+                        .list_windows(None)
+                        .ok()
+                        .and_then(|ws| ws.into_iter().find(|w| w.id == info.id))
+                    {
+                        info = fresh;
+                    }
+                    ok
+                };
                 let permission_hint = driver.permission_hint();
+                let perm = crate::agent::window::check_platform_permissions();
+                let next_action = if perm.screen_recording {
+                    "窗口已在运行;直接 WindowInspect / WindowOCR 继续。若控件树为空(自绘 UI),改用 WindowOCR 视觉路线。"
+                } else if perm.accessibility {
+                    "窗口已在运行;屏幕录制未授权 → WindowOCR/WindowScreenshot/Bash screencapture 均不可用,直接 WindowInspect(AX 主路线)+ 坐标估算 / type_text_submit。"
+                } else {
+                    "窗口已在运行;辅助功能未授权 → 仅可 WindowList/WindowFind,读取/操作 UI 需用户先授权。"
+                };
                 let body = json!({
                     "ok":true,
-                    "window_id":refreshed.id,
-                    "title":refreshed.title,
-                    "process_name":refreshed.process_name,
-                    "pid":refreshed.pid,
-                    "bounds":refreshed.bounds,
+                    "window_id":info.id,
+                    "title":info.title,
+                    "process_name":info.process_name,
+                    "pid":info.pid,
+                    "bounds":info.bounds,
                     "query":query,
                     "matched_query":matched_query,
                     "query_aliases":aliases,
                     "already_visible_before_launch":true,
+                    "already_frontmost":already_frontmost,
                     "activated_existing":activated,
                     "visible_before":before.len(),
                 "launch_commands":[],
@@ -368,7 +386,7 @@ impl Tool for WindowOpenTool {
                     "driver":driver.platform_name(),
                     "inspect_ready":permission_hint.is_none(),
                     "permission_hint":permission_hint,
-                    "next_action":"窗口已在运行并已激活;直接 WindowInspect / WindowOCR 继续。若控件树为空(自绘 UI),改用 WindowOCR 视觉路线。"
+                    "next_action":next_action,
                 });
                 return Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()));
             }
@@ -403,6 +421,15 @@ impl Tool for WindowOpenTool {
                 ));
             };
             let permission_hint = driver.permission_hint();
+            // 第 81 轮:next_action 按屏幕录制权限分派(避免把 LLM 推向不可用的 OCR 路线)
+            let perm = crate::agent::window::check_platform_permissions();
+            let next_action = if perm.screen_recording {
+                "inspect_ready=true 时用 window_id 调 WindowInspect;控件树为空(自绘 UI)时改用 WindowOCR。"
+            } else if perm.accessibility {
+                "inspect_ready=true 时用 window_id 调 WindowInspect(AX 主路线);屏幕录制未授权,WindowOCR/WindowScreenshot/Bash screencapture 均不可用,坐标用窗口 bounds 比例估算。"
+            } else {
+                "辅助功能未授权:仅可 WindowList/WindowFind 定位窗口;读取/操作 UI 需用户先授权。"
+            };
             let body = json!({
                 "ok":true,
                 "window_id":info.id,
@@ -421,7 +448,7 @@ impl Tool for WindowOpenTool {
                 "driver":driver.platform_name(),
                 "inspect_ready":permission_hint.is_none(),
                 "permission_hint":permission_hint,
-                "next_action":"inspect_ready=true 时用 window_id 调 WindowInspect;控件树为空(自绘 UI)时改用 WindowOCR。"
+                "next_action":next_action,
             });
             Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
         })
