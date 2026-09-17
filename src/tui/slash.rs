@@ -163,6 +163,10 @@ impl TuiSession {
             "offline" | "status" => {
                 self.run_offline_status();
             }
+            // D8 会话成本估算面板(2026-09-17 第 76 轮)
+            "cost" | "usage" => {
+                self.run_cost();
+            }
             // D4 工作区感知(2026-09-13):查看/刷新工作区快照。
             "workspace" | "ws" => {
                 self.run_workspace(rest_args);
@@ -506,6 +510,8 @@ impl TuiSession {
             model,
             turns: self.transcript.len(),
             total_usage: self.session_usage,
+            cost_partial: false,
+            total_cost_usd: None,
         };
         match export::resolve_target(&self.paths.work_dir, explicit, "laew-export", &default_ts) {
             Ok((path, fmt)) => {

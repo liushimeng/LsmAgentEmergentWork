@@ -418,8 +418,13 @@ impl TuiSession {
                 // transcript/导出也用人类版(用户看到的完整记录)。
                 // 2026-09-15 TUIMarkdown 富文本渲染:transcript 走 styled=false 纯文本
                 // (导出/回填零 ANSI),屏幕打印走 styled=true(仅模型内容块着色)。
-                let transcript_text =
-                    format_task_result(result, &self.paths, self.task_started_at, false);
+                let transcript_text = format_task_result(
+                    result,
+                    &self.paths,
+                    self.task_started_at,
+                    false,
+                    None,
+                );
                 let context_text = format_task_result_for_context(result);
                 self.print_task_result(result);
                 Some((
@@ -576,6 +581,7 @@ impl TuiSession {
                 prompt: effective_prompt.to_string(),
                 response: transcript_response,
                 usage,
+                cost_usd: None,
                 outcome,
             });
         }
@@ -649,7 +655,15 @@ impl TuiSession {
         let started = self.task_started_at.take();
         // styled=true:仅模型内容块(subflow_outcome/摘要)经 Markdown 渲染加 ANSI,
         // 结构标签行保持纯文本(2026-09-15,docs/TUIMarkdown富文本渲染/)。
-        for line in format_task_result(result, &self.paths, started, true).lines() {
+        for line in format_task_result(
+            result,
+            &self.paths,
+            started,
+            true,
+            self.task_cost_hint(&result.total_usage).as_deref(),
+        )
+        .lines()
+        {
             println!("{line}");
         }
     }
@@ -670,6 +684,54 @@ impl TuiSession {
     /// 设计见 docs/TUIMarkdown富文本渲染/01-设计与解决方案.md。
     fn print_assistant_markdown(&self, text: &str) {
         crate::tui::render::markdown::print_markdown(text, "  ");
+    }
+
+    // ========================================================================
+    // D8 会话成本估算(2026-09-17 第 76 轮)
+    // ========================================================================
+
+    /// 当前 active 模型的 model_name;未配置/查询失败 → None。
+    pub(crate) fn current_model_name(&self) -> Option<String> {
+        self.db
+            .lock()
+            .expect("db")
+            .get_active_or_env()
+            .ok()
+            .flatten()
+            .map(|r| r.model_name)
+    }
+
+    /// 估算单轮用量成本(USD):零用量(取消/错误轮)与无价模型 → None。
+    fn estimate_entry_cost(&self, usage: &crate::llm::Usage) -> Option<f64> {
+        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+            return None;
+        }
+        let model = self.current_model_name()?;
+        crate::llm::estimate_cost_usd(&model, usage)
+    }
+
+    /// 会话成本汇总:从 transcript 逐轮实记 fold(rewind/switch/clear 后自动一致)。
+    /// 返回 (已计价合计 USD, 是否存在无价轮次)。
+    pub(crate) fn session_cost_summary(&self) -> (f64, bool) {
+        let mut total = 0.0;
+        let mut partial = false;
+        for e in &self.transcript {
+            match e.cost_usd {
+                Some(c) => total += c,
+                None => {
+                    if e.usage.input_tokens > 0 || e.usage.output_tokens > 0 {
+                        partial = true;
+                    }
+                }
+            }
+        }
+        (total, partial)
+    }
+
+    /// 用量行的成本提示串(`$X.XXXX` 形态);无价/零用量 → None。
+    fn task_cost_hint(&self, usage: &crate::llm::Usage) -> Option<String> {
+        self.estimate_entry_cost(usage)
+            .map(|c| crate::llm::format_usd(c))
     }
 
     fn print_usage(&mut self, usage: &crate::llm::Usage) {
@@ -694,9 +756,15 @@ impl TuiSession {
                 .take()
                 .map(|t| format!("  (耗时 {:.2}s)", t.elapsed().as_secs_f64()))
                 .unwrap_or_default();
+            // D8 成本(2026-09-17 第 76 轮):模型有内置参考价时行尾追加估算成本;
+            // 无价/未配置时不追加,行格式与旧版一致。
+            let cost_str = self
+                .estimate_entry_cost(usage)
+                .map(|c| format!("  成本≈{}", crate::llm::format_usd(c)))
+                .unwrap_or_default();
             println!(
-                "  本次用量: input={}  output={}{}{}",
-                usage.input_tokens, usage.output_tokens, cache, elapsed_str
+                "  本次用量: input={}  output={}{}{}{}",
+                usage.input_tokens, usage.output_tokens, cache, elapsed_str, cost_str
             );
         } else {
             // 非任务场景(usage 全 0)也清空,防止 /model /provider 等命令误带耗时。

@@ -83,6 +83,11 @@ pub struct TranscriptEntry {
     /// 本轮 token 用量。
     #[serde(flatten)]
     pub usage: Usage,
+    /// 本轮成本估算(USD,2026-09-17 第 76 轮 D8):任务收口时按当时 active
+    /// 模型的内置参考价估出;模型无价/无 provider 为 None。
+    /// 成本随 transcript 截断(/rewind)/分支切换自动重算,与 session_usage 同源。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     /// 本轮结局。
     pub outcome: OutcomeKind,
 }
@@ -126,6 +131,12 @@ pub struct ExportMeta {
     /// 累计 token 用量(全轮次相加)。
     #[serde(flatten)]
     pub total_usage: Usage,
+    /// 累计成本估算(USD,全轮次实记相加);全轮模型均无内置价为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    /// 成本是否为下限(存在无价模型的轮次,未计入合计)。
+    #[serde(default)]
+    pub cost_partial: bool,
 }
 
 /// JSON 导出的顶层结构。
@@ -151,6 +162,15 @@ pub fn render_markdown(meta: &ExportMeta, entries: &[TranscriptEntry]) -> String
             meta.total_usage.input_tokens,
             meta.total_usage.output_tokens,
             cache_suffix(&meta.total_usage)
+        ));
+    }
+    // D8 成本(2026-09-17 第 76 轮):有任一轮可计价即显示;partial 标注为下限。
+    if let Some(cost) = meta.total_cost_usd {
+        let suffix = if meta.cost_partial { "(下限,部分轮次模型无价)" } else { "" };
+        out.push_str(&format!(
+            "| 累计成本(估算) | ≈{}{} |\n",
+            crate::llm::format_usd(cost),
+            suffix
         ));
     }
     out.push('\n');
@@ -294,6 +314,7 @@ mod tests {
                 output_tokens: 50,
                 ..Default::default()
             },
+            cost_usd: None,
             outcome,
         }
     }
@@ -310,6 +331,8 @@ mod tests {
                 output_tokens: 50,
                 ..Default::default()
             },
+            cost_partial: false,
+            total_cost_usd: None,
         }
     }
 

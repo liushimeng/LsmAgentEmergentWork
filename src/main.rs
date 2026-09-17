@@ -474,7 +474,7 @@ async fn run_one_shot(
             // (-p 单轮模式此前只打 WF 文本 + trace,缺 TUI 同等的可观测性增强;
             // 这次借格式复用统一两路输出,避免再次漂移。)
             let formatted =
-                lsm_agent::tui::format::format_task_result(&result, &paths, None, false);
+                lsm_agent::tui::format::format_task_result(&result, &paths, None, false, None);
             println!("{formatted}");
             print_usage(&result.total_usage);
         }

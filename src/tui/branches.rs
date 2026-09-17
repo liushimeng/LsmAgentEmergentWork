@@ -142,6 +142,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                cost_usd: None,
                 outcome: super::super::export::OutcomeKind::DirectAnswer,
             })
             .collect()
