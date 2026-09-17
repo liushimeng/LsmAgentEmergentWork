@@ -353,6 +353,67 @@ pub struct ToolCallReq {
     pub arguments: Value,
 }
 
+/// 2026-09-17 第 76 轮:D8 会话成本估算的轻量实现。
+///
+/// 历史:git HEAD `cc8f73b` 提交调用了 `format_usd` / `estimate_cost_usd` 两个函数,
+/// 但函数体从未实现。本补丁补充最小可用实现 —— 内置几个常见模型的「每 1K token 单价」
+/// 静态表(USD),未命中模型返回 `None`,TUI 的 `本次用量` 行只显示用量与耗时,不追加
+/// 成本段;命中模型时按 `(input/1000)*input_price + (output/1000)*output_price` 估算。
+///
+/// 设计取舍:
+/// - 暂不引入外部定价数据源,避免新增网络依赖;后续可扩为远端拉取 + 缓存;
+/// - cache_read_input_tokens 单价取 input 的 10%(常见折扣区间);
+/// - cache_creation_input_tokens 单价取 input 的 125%(Anthropic 1.25× 系数)。
+fn model_pricing(model_name: &str) -> Option<(f64, f64)> {
+    // (input_usd_per_1k, output_usd_per_1k)
+    let m = model_name.to_lowercase();
+    let pair: (f64, f64) = if m.contains("opus") {
+        (0.015, 0.075)
+    } else if m.contains("haiku") {
+        (0.0008, 0.004)
+    } else if m.contains("sonnet") || m.contains("claude") {
+        (0.003, 0.015)
+    } else if m.contains("gpt-4o") {
+        (0.0025, 0.010)
+    } else if m.contains("gpt-4") {
+        (0.030, 0.060)
+    } else if m.contains("gpt-3.5") {
+        (0.0005, 0.0015)
+    } else if m.contains("deepseek") {
+        (0.00014, 0.00028)
+    } else if m.contains("qwen") {
+        (0.0007, 0.0007)
+    } else {
+        return None;
+    };
+    Some(pair)
+}
+
+/// 估算单轮用量成本(USD)。未命中定价表返回 `None`。
+pub fn estimate_cost_usd(model_name: &str, usage: &Usage) -> Option<f64> {
+    let (in_p, out_p) = model_pricing(model_name)?;
+    let input = usage.input_tokens as f64 / 1000.0;
+    let output = usage.output_tokens as f64 / 1000.0;
+    let cache_read = usage.cache_read_input_tokens as f64 / 1000.0;
+    let cache_create = usage.cache_creation_input_tokens as f64 / 1000.0;
+    let cost = input * in_p + output * out_p
+        + cache_read * in_p * 0.10
+        + cache_create * in_p * 1.25;
+    Some(cost)
+}
+
+/// 格式化美元为 `$X.XXXX` 形式(保留 4 位小数,小于 1 美分时回退微元)。
+pub fn format_usd(cost: f64) -> String {
+    if !cost.is_finite() {
+        return "$0.0000".to_string();
+    }
+    if cost < 0.0001 {
+        format!("${:.6}", cost)
+    } else {
+        format!("${:.4}", cost)
+    }
+}
+
 /// LLM 客户端抽象
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -422,6 +483,51 @@ pub fn normalize_endpoint(ep: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 2026-09-17 第 76 轮:format_usd / estimate_cost_usd 单元测试。
+    #[test]
+    fn format_usd_basic() {
+        // 小于 0.0001 走 6 位精度
+        assert_eq!(format_usd(0.0), "$0.000000");
+        assert_eq!(format_usd(0.5), "$0.5000");
+        assert_eq!(format_usd(1.5), "$1.5000");
+        // 大于等于 0.0001 走 4 位
+        assert_eq!(format_usd(0.1234), "$0.1234");
+        // 非有限值(NaN / Inf)兜底为 4 位 "$0.0000"
+        assert_eq!(format_usd(f64::NAN), "$0.0000");
+    }
+
+    #[test]
+    fn estimate_cost_known_models() {
+        let mut usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let c = estimate_cost_usd("claude-3-5-sonnet-20240620", &usage);
+        assert!(c.is_some(), "sonnet 应能命中定价表");
+        // 1000/1000 * 0.003 + 500/1000 * 0.015 = 0.003 + 0.0075 = 0.0105
+        assert!((c.unwrap() - 0.0105).abs() < 1e-9);
+
+        // 加入 cache 折扣
+        usage.cache_read_input_tokens = 2000;
+        usage.cache_creation_input_tokens = 0;
+        let c2 = estimate_cost_usd("claude-3-5-sonnet-20240620", &usage);
+        // 0.0105 + 2 * 0.003 * 0.10 = 0.0105 + 0.0006 = 0.0111
+        assert!((c2.unwrap() - 0.0111).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_cost_unknown_model_returns_none() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 100,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        assert!(estimate_cost_usd("totally-unknown-model-xyz", &usage).is_none());
+    }
 
     #[test]
     fn build_common_headers_contains_all() {

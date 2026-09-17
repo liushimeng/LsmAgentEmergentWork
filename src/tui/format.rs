@@ -26,6 +26,7 @@ pub fn format_task_result(
     paths: &Paths,
     task_started_at: Option<std::time::Instant>,
     styled: bool,
+    cost_hint: Option<&str>,
 ) -> String {
     let mut out = String::new();
     // styled 模式:动态字符串逐个先净化(防终端控制序列注入),内容块再渲染 ANSI;
@@ -349,9 +350,12 @@ pub fn format_task_result(
         let elapsed_suffix = wallclock_secs
             .map(|s| format!("  (耗时 {:.2}s)", s))
             .unwrap_or_default();
+        let cost_suffix = cost_hint
+            .map(|c| format!("  成本≈{}", c))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  本次用量: input={}  output={}{}{}\n",
-            usage.input_tokens, usage.output_tokens, cache, elapsed_suffix
+            "  本次用量: input={}  output={}{}{}{}\n",
+            usage.input_tokens, usage.output_tokens, cache, elapsed_suffix, cost_suffix
         ));
     }
     // styled 模式下动态串已逐处净化、内容块刚渲染出 ANSI,不再整体净化;

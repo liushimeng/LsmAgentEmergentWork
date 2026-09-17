@@ -13,7 +13,8 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
+use serde_json::Value;
+use tracing::{info, warn};
 
 use crate::agent::agent_message::AgentMessageManager;
 use crate::agent::cancel::CancelToken;
@@ -24,7 +25,7 @@ use crate::agent::subagent::{SubFlowInput, SubFlowOutcome};
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
-use crate::llm::{ChatMessage, Usage};
+use crate::llm::{ChatMessage, Role, Usage};
 
 /// 2026-09-16 第 64 轮:从 BrowserNew tool_result JSON 中提取 page_id 的正则。
 ///
@@ -40,6 +41,151 @@ pub fn extract_page_id_from_text(text: &str) -> Option<String> {
         .unwrap_or(text.len());
     let pid_start = start + PREFIX.len() - 2; // 含 "p_"
     Some(text[pid_start..end].trim_matches('"').to_string())
+}
+
+/// 2026-09-17 第 76 轮:从 WebUse 子会话中提取「真实从浏览器抓到的可读文本」。
+///
+/// 业务背景(来自 llaew_20260917_130701.log):
+/// WebUse 抓取 AI 回复后,LLM 终答(iter=23)常输出模板句"任务已完成,AI回复已提取,
+/// 内容超过 500 字符",把真实回复吞掉。Runner 出口必须把 BrowserInspect/eval_js
+/// 抓到的真实文本追加到 outcome.text 末尾,让 QC 与 TUI 看到原文。
+///
+/// 提取策略:
+/// 1. 倒序遍历 sub_session,过滤 role=Tool 的 ChatMessage;
+/// 2. 对每个 tool_result.content 做 JSON 解析,寻找 `code==0 && data.{text|outer_html|value|html|body}`;
+/// 3. 取长度最长且 ≥ 50 字符的候选,跳过纯 CSS/JSON 短串;
+/// 4. 返回 `Some((text, source_tool))` —— text 已 trim,长度截断 8000 字符。
+pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(String, String)> {
+    let mut best: Option<(String, String, usize)> = None; // (text, source_tool, len)
+
+    // 倒序遍历,优先取最近一次抓取结果(避免旧结果覆盖)
+    for msg in messages.iter().rev() {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        for block in &msg.content {
+            let (tool_use_id, content, _is_error) = match block {
+                crate::llm::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => (tool_use_id.clone(), content.clone(), *is_error),
+                _ => continue,
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            // 仅解析 JSON 信封
+            let parsed: Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // 失败码直接跳过
+            if parsed.get("code").and_then(Value::as_i64) != Some(0) {
+                continue;
+            }
+            let data = match parsed.get("data") {
+                Some(d) => d,
+                None => continue,
+            };
+            // 尝试常见字段:text / outer_html / value / html / body / console_text
+            let candidates: Vec<(&str, &str)> = vec![
+                ("text", "text"),
+                ("outer_html", "outer_html"),
+                ("value", "value"),
+                ("html", "html"),
+                ("body", "body"),
+                ("reply", "reply"),
+                ("answer", "answer"),
+            ];
+            let mut picked: Option<(String, &str)> = None;
+            for (key, label) in &candidates {
+                if let Some(s) = data.get(key).and_then(Value::as_str) {
+                    let s = s.trim();
+                    if s.len() >= 50 {
+                        picked = Some((s.to_string(), *label));
+                        break;
+                    }
+                }
+            }
+            if let Some((text, label)) = picked {
+                let len = text.chars().count();
+                let better = match &best {
+                    Some((_, _, l)) => len > *l,
+                    None => true,
+                };
+                if better {
+                    best = Some((text, format!("tool_result[{}]→{}", tool_use_id, label), len));
+                }
+            }
+            // image_urls 是数组,不直接当文本;但保留作 metadata(下面单独处理)
+        }
+    }
+
+    // 兜底:若所有 tool_result 都没抓到 text 字段,尝试从 outerHTML 数组里挑最长的元素文本
+    if best.is_none() {
+        for msg in messages.iter().rev() {
+            if msg.role != Role::Tool {
+                continue;
+            }
+            for block in &msg.content {
+                let (tool_use_id, content, _) = match block {
+                    crate::llm::ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => (tool_use_id.clone(), content.clone(), *is_error),
+                    _ => continue,
+                };
+                let _ = tool_use_id;
+                let parsed: Value = match serde_json::from_str(&content) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if parsed.get("code").and_then(Value::as_i64) != Some(0) {
+                    continue;
+                }
+                let data = match parsed.get("data") {
+                    Some(d) => d,
+                    None => continue,
+                };
+                // elements info 形态:{data:{text:"...", outer_html:"...", ...}}
+                if let Some(text) = data.get("text").and_then(Value::as_str) {
+                    let t = text.trim();
+                    if t.chars().count() >= 50 {
+                        best = Some((
+                            t.to_string(),
+                            "tool_result[fallback].data.text".to_string(),
+                            t.chars().count(),
+                        ));
+                        break;
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+    }
+
+    best.map(|(text, source, len)| {
+        // 截断到 8000 字符,避免 LLM 上下文中爆
+        const MAX_CHARS: usize = 8000;
+        let truncated = text.chars().count() > MAX_CHARS;
+        let kept: String = if truncated {
+            text.chars().take(MAX_CHARS).collect::<String>() + "\n...(已截断,原长="
+                + &len.to_string()
+                + "字符)"
+        } else {
+            text.to_string()
+        };
+        info!(
+            extracted_chars = kept.chars().count(),
+            source = %source,
+            "WebUse 真实页面文本已抓取,准备追加到 Runner 出口"
+        );
+        (kept, source)
+    })
 }
 
 /// Chromium-WebUse 执行器(浏览器网页操控专项单元)。
@@ -147,7 +293,14 @@ impl WebUseRunner {
              11. ★2026-09-17 第 75 轮:若 BrowserNew 返回 code=3001(未检测到 Chrome/Edge/Chromium),\n\
                 这是确定性失败(浏览器不可执行),请立即在最终回答里直接告知用户安装引导,\n\
                 **不要再尝试别的浏览器启动方式**(xdg-open/open/etc 都不在 Bash 白名单),\n\
-                不要循环重试 BrowserNew,不要改 mode 重试。本机没浏览器 = 任务不可完成。",
+                不要循环重试 BrowserNew,不要改 mode 重试。本机没浏览器 = 任务不可完成。\n\
+             12. ★2026-09-17 第 76 轮:终答必须包含真实页面文本,禁止敷衍。\n\
+                - 任务完成后,必须用 BrowserInspect(info=elements, include_text=true) 或\n\
+                  BrowserControl(action=eval_js) 把目标节点的真实文本抓到工具返回值里;\n\
+                - 最终回答里**必须把抓到的真实文本完整贴出来**(200-4000 字,带结构),\n\
+                  不得仅用「AI回复已提取,内容超过 N 字符」「任务已完成,内容涵盖...」\n\
+                  等描述性占位句。Runner 会从 sub_session 抓取最长 tool_result 文本兜底\n\
+                  追加,但请你主动把真实内容写到终答里,避免二次抽象漂移。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -244,6 +397,32 @@ impl WebUseRunner {
             None
         };
         let error_summary = error_summary_owned.as_deref();
+
+        // 2026-09-17 第 76 轮:Runner 出口文本强制附加「真实从浏览器抓取的可读文本」。
+        // 解决 llaew_20260917_130701.log 中"Agent 显示提取内容成功了,但是相关的结果
+        // 没有显示出来呀"的根本原因:LLM 终答常输出"任务已完成,AI回复已提取,内容
+        // 超过 500 字符"模板句,把真实回复吞掉;Runner 必须从 sub_session 的 tool_result
+        // 中反查最长一段可读文本,作为最终产物追加。
+        let text = {
+            let extracted = extract_page_reply_from_session(sub_session.context());
+            match extracted {
+                Some((reply, source)) if !reply.trim().is_empty() => {
+                    let mut combined = text;
+                    if !combined.trim().is_empty() {
+                        combined.push_str("\n\n");
+                    }
+                    combined.push_str(&format!(
+                        "[来自浏览器抓取的真实页面回复,共 {} 字符,来源: {}]\n{}",
+                        reply.chars().count(),
+                        source,
+                        reply,
+                    ));
+                    combined
+                }
+                _ => text,
+            }
+        };
+
         let _ = memory::record_entry(
             &self.db,
             AgentRole::WebUse,
@@ -330,6 +509,45 @@ mod tests {
     fn extract_page_id_handles_non_json() {
         assert_eq!(extract_page_id_from_text("plain text"), None);
         assert_eq!(extract_page_id_from_text(""), None);
+    }
+
+    // 2026-09-17 第 76 轮:验证从 sub_session 中提取最长可读文本。
+    #[test]
+    fn extract_page_reply_picks_longest_text() {
+        let long_text = "黄金近3个月走势:7月853-906元/克、8月最高触及1012.85元/克、9月回落至926.86元/克。白银走势:7月54-58美元、8月突破70美元后回落至63.80美元。";
+        let short = "ok";
+        let msgs = vec![
+            ChatMessage::tool_result("t1", short, false),
+            ChatMessage::tool_result("t2", &format!(
+                r#"{{"code":0,"message":"ok","data":{{"text":"{}"}}}}"#,
+                long_text
+            ), false),
+        ];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_some(), "应能提取到长文本");
+        let (text, _) = result.unwrap();
+        assert!(text.contains("1012.85"), "应包含真实原文片段");
+    }
+
+    #[test]
+    fn extract_page_reply_skips_failure_code() {
+        // code=2002 失败时不应被当作提取源
+        let msgs = vec![
+            ChatMessage::tool_result("t1", r#"{"code":2002,"message":"err","data":{}}"#, false),
+            ChatMessage::tool_result("t2", r#"{"code":0,"message":"ok","data":{"text":"实际回复文本长度足够长通过门槛测试"}} "#, false),
+        ];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn extract_page_reply_returns_none_when_no_text() {
+        // 只有 metadata,没有 text 字段
+        let msgs = vec![
+            ChatMessage::tool_result("t1", r#"{"code":0,"message":"ok","data":{"page_id":"p_x"}}"#, false),
+        ];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_none());
     }
 
     #[test]

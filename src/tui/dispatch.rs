@@ -728,6 +728,21 @@ impl TuiSession {
         (total, partial)
     }
 
+    /// D8 会话成本估算面板(2026-09-17 第 76 轮):
+    /// 汇总当前 Session transcript 中所有已计价的轮次,展示总成本与无价轮次提示。
+    /// 复用 session_cost_summary(),输出格式与 `format_usd` 一致。
+    pub(crate) fn run_cost(&mut self) {
+        let (total, partial) = self.session_cost_summary();
+        let cost_str = crate::llm::format_usd(total);
+        let partial_hint = if partial {
+            " (部分轮次因模型未在定价表中未计入)"
+        } else {
+            ""
+        };
+        println!("  累计成本(估算): {cost_str}{partial_hint}");
+        println!("  备注: 成本按内置定价模型估算(USD/1K token);实际费用以 Provider 账单为准。");
+    }
+
     /// 用量行的成本提示串(`$X.XXXX` 形态);无价/零用量 → None。
     fn task_cost_hint(&self, usage: &crate::llm::Usage) -> Option<String> {
         self.estimate_entry_cost(usage)

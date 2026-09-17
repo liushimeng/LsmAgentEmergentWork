@@ -261,7 +261,9 @@ impl Tool for BrowserControlTool {
                     "wait","eval_js",
                     "set_cookie","delete_cookie",
                     "set_storage","clear_storage","set_viewport",
-                    "screenshot","heartbeat"
+                    "screenshot","heartbeat",
+                    // 2026-09-17 第 76 轮:扩展动作面
+                    "drag","focus","blur","mouse_move","dispatch_event"
                 ]},
                 "params":{"type":"object"}
             },
@@ -306,6 +308,12 @@ impl Tool for BrowserControlTool {
             "set_viewport" => act_set_viewport(id, &params).await,
             "screenshot" => act_screenshot(id, &params).await,
             "heartbeat" => act_heartbeat(id).await,
+            // 2026-09-17 第 76 轮:扩展动作面 —— 拖拽 / 焦点 / 鼠标移动 / 自定义事件分发
+            "drag" => act_drag(id, &params).await,
+            "focus" => act_focus_or_blur(id, &params, true).await,
+            "blur" => act_focus_or_blur(id, &params, false).await,
+            "mouse_move" => act_mouse_move(id, &params).await,
+            "dispatch_event" => act_dispatch_event(id, &params).await,
             other => return envelope(1001, "未知 action", json!({"action": other})),
         };
         let spawned = BrowserManager::global().adopt_spawned_pages().await;
@@ -594,17 +602,57 @@ async fn act_upload_file(id: &str, p: &Value) -> std::result::Result<Value, Stri
 async fn act_select_option(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
     let page = ensure_page(id).await?;
-    let value_js = if let Some(v) = p.get("value") {
-        js_str(v.as_str().unwrap_or(""))
+    // 2026-09-17 第 76 轮:四种选择方式(value/values/text/index)归一化为 JS 字面量;
+    // 原代码 else if 链过绕(`if let Some(i) = ... i.to_string() else { "" }.is_empty()`),
+    // index 分支未真正生效。重写为清晰的 if/else if 分支。
+    let value_js: String = if let Some(v) = p.get("value").and_then(Value::as_str) {
+        js_str(v)
     } else if let Some(arr) = p.get("values").and_then(Value::as_array) {
-        let parts: Vec<String> = arr.iter()
+        let parts: Vec<String> = arr
+            .iter()
             .filter_map(|v| v.as_str().map(|s| js_str(s)))
             .collect();
         format!("[{}]", parts.join(","))
-    } else if let Some(t) = p.get("text") { js_str(t.as_str().unwrap_or("")) }
-    else if if let Some(i) = p.get("index").and_then(Value::as_i64) { i.to_string() } else { String::new() }.is_empty() {
-        return Err("缺 value/values/text/index".into());
-    } else { p.get("index").and_then(Value::as_i64).unwrap().to_string() };
+    } else if let Some(t) = p.get("text").and_then(Value::as_str) {
+        // 文本选择:在 JS 端遍历 <option>,找到 text 匹配的 index 后赋 value
+        let js = format!(
+            r#"(() => {{
+                const el = document.querySelector({sel});
+                if (!el) return false;
+                const target = {txt};
+                let found = -1;
+                for (let i = 0; i < el.options.length; i++) {{
+                    if (el.options[i].text === target) {{ found = i; break; }}
+                }}
+                if (found < 0) return false;
+                el.selectedIndex = found;
+                el.dispatchEvent(new Event('change',{{bubbles:true}}));
+                return true;
+            }})()"#,
+            sel = js_str(sel),
+            txt = js_str(t),
+        );
+        let ok = eval_js_string(&page, &js).await?;
+        return Ok(json!({"selected": ok, "selector": sel, "mode": "text"}));
+    } else if let Some(i) = p.get("index").and_then(Value::as_i64) {
+        // 索引选择:在 JS 端直接设 selectedIndex
+        let js = format!(
+            r#"(() => {{
+                const el = document.querySelector({sel});
+                if (!el) return false;
+                if ({i} < 0 || {i} >= el.options.length) return false;
+                el.selectedIndex = {i};
+                el.dispatchEvent(new Event('change',{{bubbles:true}}));
+                return true;
+            }})()"#,
+            sel = js_str(sel),
+            i = i,
+        );
+        let ok = eval_js_string(&page, &js).await?;
+        return Ok(json!({"selected": ok, "selector": sel, "mode": "index", "index": i}));
+    } else {
+        return Err("缺 value/values/text/index 之一".into());
+    };
     let js = format!(
         r#"(() => {{
             const el = document.querySelector({sel});
@@ -616,7 +664,7 @@ async fn act_select_option(id: &str, p: &Value) -> std::result::Result<Value, St
         sel = js_str(sel), v = value_js
     );
     let ok = eval_js_string(&page, &js).await?;
-    Ok(json!({"selected": ok, "selector": sel}))
+    Ok(json!({"selected": ok, "selector": sel, "mode": "value"}))
 }
 
 async fn act_new_tab(id: &str, p: &Value) -> std::result::Result<Value, String> {
@@ -843,6 +891,121 @@ async fn act_heartbeat(id: &str) -> std::result::Result<Value, String> {
     let title = page.get_title().await.ok().flatten().unwrap_or_default();
     let _ = BrowserManager::global().events(id).await;
     Ok(json!({"ok": true, "title": title}))
+}
+
+// =================== 2026-09-17 第 76 轮:扩展动作实现 ===================
+
+/// 拖拽:从源坐标 → 目标坐标(支持 source_selector 或 source_xy,target_selector 或 target_xy)。
+/// 用于 HTML5 拖拽(滑块/排序)、文件拖拽、列表重排等场景。
+async fn act_drag(id: &str, p: &Value) -> std::result::Result<Value, String> {
+    let page = ensure_page(id).await?;
+    // 源坐标
+    let src = if let Some(sel) = str_arg(p, "source_selector") {
+        let nth = p.get("source_nth").and_then(Value::as_u64).unwrap_or(0) as usize;
+        eval_find_center(&page, sel, nth).await?
+    } else {
+        json!({
+            "x": p.get("source_x").and_then(Value::as_f64).unwrap_or(0.0),
+            "y": p.get("source_y").and_then(Value::as_f64).unwrap_or(0.0),
+        })
+    };
+    // 目标坐标
+    let dst = if let Some(sel) = str_arg(p, "target_selector") {
+        let nth = p.get("target_nth").and_then(Value::as_u64).unwrap_or(0) as usize;
+        eval_find_center(&page, sel, nth).await?
+    } else {
+        json!({
+            "x": p.get("target_x").and_then(Value::as_f64).unwrap_or(0.0),
+            "y": p.get("target_y").and_then(Value::as_f64).unwrap_or(0.0),
+        })
+    };
+    let sx = src["x"].as_f64().unwrap_or_default();
+    let sy = src["y"].as_f64().unwrap_or_default();
+    let dx = dst["x"].as_f64().unwrap_or_default();
+    let dy = dst["y"].as_f64().unwrap_or_default();
+    // mousePressed → 多次 mouseMoved(平滑)→ mouseReleased
+    dispatch_mouse(&page, "mouseMoved", sx, sy, "left", 0, 0, 0).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    dispatch_mouse(&page, "mousePressed", sx, sy, "left", 1, 0, 0).await?;
+    // 8 步插值,每步 15ms
+    for step in 1..=8 {
+        let t = step as f64 / 8.0;
+        let mx = sx + (dx - sx) * t;
+        let my = sy + (dy - sy) * t;
+        dispatch_mouse(&page, "mouseMoved", mx, my, "left", 0, 0, 0).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+    dispatch_mouse(&page, "mouseReleased", dx, dy, "left", 1, 0, 0).await?;
+    Ok(json!({"dragged_from":[sx, sy], "to":[dx, dy]}))
+}
+
+/// 焦点控制:focus=true 时 .focus(),false 时 .blur()。用于主动聚焦输入框、
+/// 主动失焦(关闭下拉/隐藏 tooltip)、JS 受控组件等场景。
+async fn act_focus_or_blur(id: &str, p: &Value, focus: bool) -> std::result::Result<Value, String> {
+    let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
+    let page = ensure_page(id).await?;
+    let js = format!(
+        r#"(() => {{
+            const el = document.querySelector({sel});
+            if (!el) return false;
+            if ({focus}) el.focus(); else el.blur();
+            return document.activeElement === el;
+        }})()"#,
+        sel = js_str(sel),
+        focus = focus,
+    );
+    let ok = eval_js_string(&page, &js).await?;
+    Ok(json!({"selector": sel, "mode": if focus {"focus"} else {"blur"}, "active": ok}))
+}
+
+/// 鼠标纯移动(不点击):用于悬停菜单、tooltip 触发、长按场景。
+async fn act_mouse_move(id: &str, p: &Value) -> std::result::Result<Value, String> {
+    let page = ensure_page(id).await?;
+    let x = if let Some(sel) = str_arg(p, "selector") {
+        let nth = p.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let find = eval_find_center(&page, sel, nth).await?;
+        find["x"].as_f64().unwrap_or_default()
+    } else {
+        p.get("x").and_then(Value::as_f64).unwrap_or_default()
+    };
+    let y = if let Some(sel) = str_arg(p, "selector") {
+        let nth = p.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let find = eval_find_center(&page, sel, nth).await?;
+        find["y"].as_f64().unwrap_or_default()
+    } else {
+        p.get("y").and_then(Value::as_f64).unwrap_or_default()
+    };
+    dispatch_mouse(&page, "mouseMoved", x, y, "left", 0, 0, 0).await?;
+    Ok(json!({"x": x, "y": y}))
+}
+
+/// 分发自定义 DOM 事件:用于绕过被劫持的 input/change 监听,或触发受控组件的合成事件。
+/// event 枚举:input / change / click / focus / blur / submit / keydown / keyup / mousedown / mouseup。
+async fn act_dispatch_event(id: &str, p: &Value) -> std::result::Result<Value, String> {
+    let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
+    let Some(event) = str_arg(p, "event") else { return Err("缺少 event".into()); };
+    // 白名单事件,防止注入恶意事件名
+    const ALLOWED: &[&str] = &[
+        "input","change","click","focus","blur","submit","keydown","keyup",
+        "mousedown","mouseup","mousemove","mouseenter","mouseleave","dblclick",
+        "contextmenu","wheel","pointerdown","pointerup","pointermove",
+    ];
+    if !ALLOWED.contains(&event) {
+        return Err(format!("不支持的事件:{event}(允许:{ALLOWED:?})"));
+    }
+    let page = ensure_page(id).await?;
+    let js = format!(
+        r#"(() => {{
+            const el = document.querySelector({sel});
+            if (!el) return false;
+            el.dispatchEvent(new Event({evt}, {{bubbles:true, cancelable:true}}));
+            return true;
+        }})()"#,
+        sel = js_str(sel),
+        evt = js_str(event),
+    );
+    let ok = eval_js_string(&page, &js).await?;
+    Ok(json!({"selector": sel, "event": event, "dispatched": ok}))
 }
 
 // —— mouse 派发辅助 ——
@@ -1203,6 +1366,24 @@ mod tests {
             // 失败路径:2001(断连) 或 3001(无浏览器)
             assert!(code == 2001 || code == 3001,
                 "无浏览器/失败时应返回 2001/3001,实际 code={code}");
+        }
+    }
+
+    // 2026-09-17 第 76 轮:BrowserControl action enum 校验新 actions。
+    #[test]
+    fn browser_control_includes_new_actions() {
+        let p = BrowserControlTool.parameters();
+        let enums = p["properties"]["action"]["enum"].as_array()
+            .expect("action enum 应为数组");
+        let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
+        for required in &[
+            "drag", "focus", "blur", "mouse_move", "dispatch_event",
+            "right_click", "double_click", "hover", "scroll", "scroll_to",
+            "press_sequence", "upload_file", "select_option",
+            "new_tab", "close_tab", "navigate", "back", "forward", "reload",
+            "set_cookie", "delete_cookie", "set_storage", "clear_storage",
+        ] {
+            assert!(names.contains(required), "action enum 缺失 {required}");
         }
     }
 }

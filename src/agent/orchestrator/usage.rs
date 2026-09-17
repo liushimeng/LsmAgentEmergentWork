@@ -55,7 +55,75 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
             if let Some(ms) = obj.get("timeout_ms").and_then(|v| v.as_u64()) {
                 parts.push(format!("timeout={}ms", ms));
             }
-            truncate_progress_text(&parts.join(" "), 80)
+            // 2026-09-17 第 76 轮:扩展关键字段(file_paths / event / source_selector
+            // / target_selector / value / index / keys / keys 数组),覆盖新增 actions。
+            if let Some(files) = obj.get("file_paths").and_then(|v| v.as_array()) {
+                if !files.is_empty() {
+                    let joined = files
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| truncate_progress_text(s, 16))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    parts.push(format!("files=[{}]({})", joined, files.len()));
+                }
+            }
+            if let Some(file) = obj.get("file_path").and_then(|v| v.as_str()) {
+                if !file.is_empty() {
+                    parts.push(format!("file={}", truncate_progress_text(file, 30)));
+                }
+            }
+            if let Some(event) = obj.get("event").and_then(|v| v.as_str()) {
+                if !event.is_empty() {
+                    parts.push(format!("event={event}"));
+                }
+            }
+            if let Some(ssel) = obj.get("source_selector").and_then(|v| v.as_str()) {
+                if !ssel.is_empty() {
+                    parts.push(format!("src={}", truncate_progress_text(ssel, 18)));
+                }
+            }
+            if let Some(tsel) = obj.get("target_selector").and_then(|v| v.as_str()) {
+                if !tsel.is_empty() {
+                    parts.push(format!("dst={}", truncate_progress_text(tsel, 18)));
+                }
+            }
+            if let Some(value) = obj.get("value").and_then(|v| v.as_str()) {
+                if !value.is_empty() {
+                    parts.push(format!("value={}", truncate_progress_text(value, 20)));
+                }
+            }
+            if let Some(idx) = obj.get("index").and_then(|v| v.as_i64()) {
+                parts.push(format!("idx={idx}"));
+            }
+            if let Some(keys) = obj.get("keys").and_then(|v| v.as_array()) {
+                let joined: Vec<String> = keys
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect();
+                if !joined.is_empty() {
+                    parts.push(format!("keys={}", truncate_progress_text(&joined.join("+"), 24)));
+                }
+            } else if let Some(keys_str) = obj.get("keys").and_then(|v| v.as_str()) {
+                if !keys_str.is_empty() {
+                    parts.push(format!("keys={}", truncate_progress_text(keys_str, 24)));
+                }
+            }
+            // drag / mouse_move 坐标对
+            if let Some(sx) = obj.get("source_x").and_then(|v| v.as_f64()) {
+                parts.push(format!("sx={:.0}", sx));
+            }
+            if let Some(sy) = obj.get("source_y").and_then(|v| v.as_f64()) {
+                parts.push(format!("sy={:.0}", sy));
+            }
+            if let Some(tx) = obj.get("target_x").and_then(|v| v.as_f64()) {
+                parts.push(format!("tx={:.0}", tx));
+            }
+            if let Some(ty) = obj.get("target_y").and_then(|v| v.as_f64()) {
+                parts.push(format!("ty={:.0}", ty));
+            }
+            truncate_progress_text(&parts.join(" "), 100)
         }
         "BrowserInspect" => {
             let info = obj.get("info").and_then(|v| v.as_str()).unwrap_or("");
