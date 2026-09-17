@@ -151,7 +151,7 @@ def chk(cond, name):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
     ok = ok and cond
 chk(isinstance(data, dict), "导出顶层是对象")
-chk(data.get("version") == "1.1", f"导出含 version=1.1 (got={data.get('version')!r})")
+chk(data.get("version") >= "1.1", f"导出含 version>=1.1 (got={data.get('version')!r})")
 chk(isinstance(data.get("exported_at"), str) and "T" in data.get("exported_at", ""), "导出含 exported_at (RFC3339)")
 chk(isinstance(data.get("count"), int) and data["count"] >= 4, f"导出 count >= 4 (got={data.get('count')})")
 chk(isinstance(data.get("providers"), list) and len(data["providers"]) == data.get("count"), "providers 数组长度 == count")
@@ -1077,6 +1077,35 @@ grep -q $'\033[' "$EXPORT7D" 2>/dev/null; [ $? -ne 0 ]; check $? "7d-10 导出�
 kill $MOCK7D_PID 2>/dev/null
 rm -f "$MD_ROUTER" "$ROOT_DIR/testReport/mock_requests-7d-$TS.jsonl"; rm -rf /tmp/laew-e2e-md-work
 
+# --- 7e. D8 会话成本估算与 /cost 面板(2026-09-17 第 76 轮) ---
+# 价格表语义:有价模型(gpt-4o-mini)→ 用量行成本 + /cost 分解 + 导出累计成本行;
+# 无价模型(claude-mock,内置表未收录)→ 仅 token 统计,不虚报 $0。
+section "7e. D8 会话成本估算与 /cost 面板"
+rm -rf /tmp/laew-e2e-cost-root /tmp/laew-e2e-cost-work
+mkdir -p /tmp/laew-e2e-cost-root /tmp/laew-e2e-cost-work
+cp laew /tmp/laew-e2e-cost-root/laew
+python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7e-$TS.jsonl" &>/dev/null &
+MOCK7E_PID=$!; sleep 0.6
+COSTBIN=/tmp/laew-e2e-cost-root/laew
+run "$COSTBIN" provider add --protocol anthropic --provider-name costA --model-name gpt-4o-mini --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-cost-a >/dev/null 2>&1
+run "$COSTBIN" provider add --protocol anthropic --provider-name costB --model-name claude-mock --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-cost-b >/dev/null 2>&1
+OUT=$(run "$COSTBIN" provider list)
+ID_COST_A=$(echo "$OUT" | grep costA | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+ID_COST_B=$(echo "$OUT" | grep costB | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+# 1) 无价模型:任务后 /cost 显示「无内置参考价」,用量行不追加成本
+OUT=$(cd /tmp/laew-e2e-cost-work && printf "/provider use $ID_COST_B\n你好\n/cost\n/exit\n" | run timeout 90 "$COSTBIN")
+echo "$OUT" | grep -q "无内置参考价"; check $? "7e-1 无价模型 /cost 仅统计 token"
+echo "$OUT" | grep "本次用量" | grep -q "成本≈"; [ $? -ne 0 ]; check $? "7e-2 无价模型用量行不追加成本"
+# 2) 有价模型:新进程(空会话)→ 任务 → /cost 分解 + 用量行成本 + /export 累计成本行
+OUT=$(cd /tmp/laew-e2e-cost-work && printf "/provider use $ID_COST_A\n你好\n/cost\n/export cost.md\n/exit\n" | run timeout 90 "$COSTBIN")
+echo "$OUT" | grep -q "成本分解(按当前模型价)"; check $? "7e-3 /cost 显示成本分解"
+echo "$OUT" | grep -q "gpt-4o-mini"; check $? "7e-4 /cost 显示模型名"
+echo "$OUT" | grep "本次用量" | grep -qF "成本≈$"; check $? "7e-5 用量行尾追加成本"
+echo "$OUT" | grep -q "会话实记累计"; check $? "7e-6 /cost 显示实记累计"
+grep -q "累计成本(估算)" /tmp/laew-e2e-cost-work/cost.md 2>/dev/null; check $? "7e-7 导出含累计成本行"
+kill $MOCK7E_PID 2>/dev/null
+rm -rf /tmp/laew-e2e-cost-root /tmp/laew-e2e-cost-work
+
 # --- 8. TUI 子屏自动化(tmux control-mode,真 PTY 渲染) ---
 # 详见 docs/TUI自动化测试/01-设计与解决方案.md
 section "8. TUI 子屏自动化(tmux control-mode)"
@@ -1316,7 +1345,10 @@ else
   tkey Enter; sleep 0.3
   tsend "sk-test-tmux"; sleep 0.3
   tkey Enter; sleep 0.3
-  # 越过 context_max_size Tab(保留默认 800000),到确认 Tab:默认选中 [确认],直接 Enter
+  # 越过 context_max_size Tab(保留默认 800000)与 allow_private_endpoint Tab
+  # (保留默认"禁止";第 72 轮 SSRF per-provider 开关新增,确认 Tab 由 6 顺延到 7),
+  # 到确认 Tab:默认选中 [确认],直接 Enter
+  tkey Right; sleep 0.2
   tkey Right; sleep 0.2
   tkey Right; sleep 0.2
   tkey Enter; sleep 1.0

@@ -18,6 +18,7 @@ pub mod cache_policy;
 pub mod cancellable;
 pub mod offline;
 pub mod openai;
+pub mod pricing;
 pub mod resilient;
 pub mod sse;
 
@@ -35,6 +36,7 @@ pub const DEFAULT_CACHE_POLICY: CachePolicy = CachePolicy::Auto;
 pub use offline::{
     Connectivity, ConnectivitySnapshot, ConnectivityTracker, DEGRADED_THRESHOLD, OFFLINE_THRESHOLD,
 };
+pub use pricing::{cost_breakdown, estimate_cost_usd, format_usd, lookup_price, CostBreakdown, ModelPrice};
 use resilient::{ResilientLlmClient, CONNECT_TIMEOUT};
 
 /// 统一的 HTTP 客户端构造入口:注入连接超时(防连接挂起导致 TUI 冻结)。

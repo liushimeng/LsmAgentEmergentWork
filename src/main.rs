@@ -466,7 +466,7 @@ async fn run_one_shot(
     match outcome {
         OrchestrationOutcome::DirectAnswer { text, usage, .. } => {
             println!("{}", lsm_agent::tui::sanitize_terminal_controls(&text));
-            print_usage(&usage);
+            print_usage(&usage, Some(&active.model_name));
         }
         OrchestrationOutcome::Executed { result } => {
             // 2026-09-16 第 57 轮:走与 TUI 同源的 format_task_result,补阶段耗时 +
@@ -476,7 +476,7 @@ async fn run_one_shot(
             let formatted =
                 lsm_agent::tui::format::format_task_result(&result, &paths, None, false, None);
             println!("{formatted}");
-            print_usage(&result.total_usage);
+            print_usage(&result.total_usage, Some(&active.model_name));
         }
         OrchestrationOutcome::Failed {
             suggestion,
@@ -551,16 +551,16 @@ async fn run_one_shot(
                 println!("[agent failed] 原因: {reason}");
                 println!("[agent failed] 建议: {suggestion}");
             }
-            print_usage(&usage);
+            print_usage(&usage, Some(&active.model_name));
         }
     }
     Ok(())
 }
 
-fn print_usage(usage: &lsm_agent::llm::Usage) {
+fn print_usage(usage: &lsm_agent::llm::Usage, model: Option<&str>) {
     if usage.input_tokens > 0 || usage.output_tokens > 0 {
         eprintln!(
-            "[laew] 用量: input={}  output={}{}{}",
+            "[laew] 用量: input={}  output={}{}{}{}",
             usage.input_tokens,
             usage.output_tokens,
             if usage.cache_read_input_tokens > 0 {
@@ -572,7 +572,12 @@ fn print_usage(usage: &lsm_agent::llm::Usage) {
                 format!("  cache_creation={}", usage.cache_creation_input_tokens)
             } else {
                 String::new()
-            }
+            },
+            // D8 成本(2026-09-17 第 76 轮):模型有内置参考价时追加估算成本。
+            model
+                .and_then(|m| lsm_agent::llm::estimate_cost_usd(m, usage))
+                .map(|c| format!("  成本≈{}", lsm_agent::llm::format_usd(c)))
+                .unwrap_or_default()
         );
     }
 }

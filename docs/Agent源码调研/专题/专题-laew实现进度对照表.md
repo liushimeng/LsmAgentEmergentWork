@@ -169,7 +169,7 @@
 | D5 | 工具输出富文本内容渲染 | ❌ 第 18 轮首次(内容层) | 🟡 45%(✅ 2026-09-15 Markdown 富文本渲染:`src/tui/render/markdown.rs` 标题/列表/引用/表格/围栏高亮/行内样式/链接 + 四主题 `md_*` 配色 + styled/plain 同源分流 + e2e §7d;未做:DiffViewer modal / 流式增量渲染 / 图片协议 / mdast 级完整 CommonMark) | L1401-L1402 / L1436-L1445 / L1460+ / L1500-L1506 / L1528-L1530 / L1550+ |
 | D6 | 输入体验工程 | ❌ 第 18 轮首次(系统化) | 🟡 55%(✅ 2026-09-10 第二十二轮:bracketed paste + 大粘贴 marker 登记簿 L1573 + 提交展开/10000 字符截断注入 L1448 + 快速输入批量合并;未做多行编辑器/Vim 模式/kill ring;✅ 2026-09-11 第三十七轮补 Ctrl+J/LF 按键拦截与 CONTROL 通用防护) | L1403-L1405 / L1446-L1450 / L1461+ / L1531-L1539 / L1551+ |
 | D7 | Onboarding/目录信任/主题 | ❌ 第 18 轮首次 | ❌ 10%(1 套 ANSI) | L1406-L1409 / L1451+ / L1462+ / L1507-L1513 / L1540+ / L1552+ |
-| D8 | 会话导出/Statusline/实时成本 | ❌ 第 18 轮首次 | 🟡 25%(✅ 2026-09-10:`/export [path]` Markdown/JSON + TUI 层 transcript + 每轮/累计用量;未做 Statusline/实时成本/脱敏/分享) | L1410-L1414 / L1452-L1455 / L1463+ / L1514-L1515 / L1541-L1545 / **L1564-L1575** |
+| D8 | 会话导出/Statusline/实时成本 | ❌ 第 18 轮首次 | 🟡 45%(✅ 2026-09-10:`/export [path]` Markdown/JSON + TUI 层 transcript + 每轮/累计用量;✅ 2026-09-17 第 76 轮:实时成本估算 `src/llm/pricing.rs` 内置参考价表 + 用量行/`/cost` 面板/`-p`/导出全链路,L1411;未做 Statusline/远程 quota/脱敏分享) | L1410-L1414 / L1452-L1455 / L1463+ / L1514-L1515 / L1541-L1545 / **L1564-L1575** |
 | N1-N5 | undici 内容获取底座 | ❌ 第 18 轮首次(WebFetch 底座) | ❌ 0% | **L1576-L1590**(15 个,与 pi D8 冲突后修正) |
 
 **统一编号总表**(已修正冲突,详见合集 §四):
@@ -634,3 +634,39 @@ git 状态 / 平台 / 日期,只能 `ls` 试探,常猜错构建命令(`npm test`
 - **LAEW_PROVIDER_ID Err 透传**：环境变量指向不存在记录时 `get_active_or_env` 返回 Err，守门拦截并透出原始错误（其本身含修复指引）。
 - **e2e 修复连带发现**：§5e `provider delete` 掉 active 记录后未恢复，§7/§7b/§7c 此前全靠「NoopLlm 全链路空转」产生对话轮次/导出内容——属用例依赖了被修复的缺陷行为，已改为真实 mock 链路。
 - **验证**：cargo test 1017 全过 + 手动验证（空 DB 管道模式秒回指引、横幅连接行正确）+ `run_e2e.sh` PASS=177 FAIL=1（仅 5e-1 WebUse 存量失败，与第 69 轮记录一致）。
+
+---
+
+## 第 76 轮（2026-09-17）— D8 会话成本估算与 `/cost` 面板
+
+**主题**：第十八轮 D8 维度 P0 路线图第 6 项「实时 token/cost 显示」落地。laew 此前只有
+token 计数无任何成本视角；本轮按 claudecode 派（写死 tier 价格表 + 按 Mtok 计价 +
+cache 读折扣/写溢价，见第三轮成本控制专题 §1.2）实现全链路成本估算。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| L1411 | atomcode D8:无 `/cost` local token accounting(成本视角) | P1 | ✅ | `src/llm/pricing.rs`(ModelPrice 内置参考价表:Claude 5 档/OpenAI 6 档/DeepSeek 2 档,cache_write=1.25×input、cache_read=0.1×input 的 Anthropic 语义 + OpenAI/DeepSeek 官方 cached 价;lowercase contains 最长 pattern 优先匹配,`gpt-4o-mini` 先于 `gpt-4o`;未知模型 → None 不估价,本地模型不误报)+ `estimate_cost_usd`/`cost_breakdown`/`format_usd`(自适应精度)/`cache_hit_rate` | 2026-09-17 第 76 轮 |
+| D8-costline | 任务用量行无成本 | P1 | ✅ | `src/tui/format.rs::format_task_result` 第 5 参 `cost_hint`(Executed/transcript 同源)+ `src/tui/dispatch.rs::print_usage`(DirectAnswer/Failed 路径)+ `src/main.rs::print_usage`(-p/-f stderr 行尾追加);无价时行格式与旧版逐字节一致 | 2026-09-17 第 76 轮 |
+| D8-costcmd | 无 `/cost` 成本面板 | P1 | ✅ | `src/tui/slash.rs::run_cost`(模型行 + 累计用量 + 缓存命中率 + 按当前模型价四分量分解 + 会话实记累计,partial 标下限;无价模型只统计 token)+ 补全/help 注册;别名 `/usage` | 2026-09-17 第 76 轮 |
+| D8-costpersist | 成本随 rewind/分支/clear 一致性 | P1 | ✅ | `TranscriptEntry.cost_usd: Option<f64>`(serde skip_if_none,JSON 导出向后兼容)收口时按当时 active 模型估价;会话成本从 transcript fold 现算,/rewind 截断、/switch 恢复、/clear 清空自动一致(沿用 D3「三处一致」第 4 计数器,无独立运行态字段);`/export` 汇总表加「累计成本(估算)」行(ExportMeta.total_cost_usd/cost_partial) | 2026-09-17 第 76 轮 |
+
+**设计要点**:
+- **未知模型不估价**(None 而非 $0 或默认档):本地 Ollama/私有网关按 Claude 价误估比
+  不估更误导;/cost 明确显示「无内置参考价,仅统计 token」。
+- **实记与分解双轨**:「实记累计」= 逐轮按当时模型价估的 transcript 合计(切模型历史不错价);
+  「成本分解」= 按当前模型价对 session_usage 总量的分量参考。
+- **零新 crate、零网络**:纯静态表 + f64 算术;价格为 2026-09 刊例参考价,输出均带
+  「估算,非账单依据」语义(≈ 前缀)。
+- **e2e §7e**(7 断言):无价模型(claude-mock)/cost 仅 token + 用量行无成本;
+  有价模型(gpt-4o-mini)用量行成本 + /cost 分解 + 实记累计 + 导出成本行。
+- **连带修复**:① provider 导出版本断言放宽 `==1.1` → `>=1.1`(对齐第 72 轮 per-provider
+  allow_private_endpoint 引入的 version 1.2);② tmux §8 add 表单流程补 1 次 Right
+  (allow_private_endpoint 新 Tab 使确认 Tab 由 6 顺延到 7,并行会话新增字段未同步用例)。
+
+**验证**:单元测试 1103 全过(新增 pricing 12 + format cost_hint 3 + export 4);
+`run_e2e.sh` PASS=185 FAIL=0(含既有基线清零)。
+
+**未做(后续候选)**:Statusline 常驻行(L1412/L1413)/ 远程 quota 拉取(L1414)/
+pi 式 cache miss 浪费量化 / 自定义价格覆盖(环境变量或 DB 字段)/ 按模型分桶统计。
+
+**方案**:`tmpPlan/2026-09-17_05-D8会话成本估算与cost面板方案.md`

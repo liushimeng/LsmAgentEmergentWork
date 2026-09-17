@@ -285,6 +285,76 @@ impl TuiSession {
         println!("  提示:离线时输入自动排队,恢复连接后逐条自动处理。");
     }
 
+    /// `/cost`(别名 `/usage`,D8,2026-09-17 第 76 轮):会话用量与成本估算面板。
+    ///
+    /// 成本语义:
+    /// - 「会话实记累计」= transcript 逐轮收口时按当时 active 模型内置价估出的成本之和
+    ///   (/rewind 截断、/switch 分支恢复后自动重算,与 session_usage 同源);
+    /// - 「成本分解」= 按**当前**模型价对 session_usage 总量估价(中途切过模型时
+    ///   仅供分量参考,以实记累计为准);
+    /// - 模型无内置参考价(本地模型/未收录)→ 只统计 token,不虚报 $0。
+    fn run_cost(&self) {
+        let active = self.db.lock().expect("db").get_active_or_env().ok().flatten();
+        let model_line = active
+            .as_ref()
+            .map(|r| {
+                format!(
+                    "[{}] {}/{} @ {}",
+                    r.protocol.as_str(),
+                    r.provider_name,
+                    r.model_name,
+                    r.end_point
+                )
+            })
+            .unwrap_or_else(|| "<未配置>".to_string());
+        println!("  会话成本(估算,内置参考价 2026-09,非账单依据):");
+        println!("    模型: {model_line}");
+        let u = &self.session_usage;
+        if u.input_tokens == 0 && u.output_tokens == 0 {
+            println!("    (本会话尚无 LLM 调用)");
+            return;
+        }
+        println!(
+            "    累计用量: input={}  output={}  cache_read={}  cache_creation={}",
+            u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens
+        );
+        if let Some(rate) = crate::llm::pricing::cache_hit_rate(u) {
+            println!("    缓存命中率: {:.1}%", rate * 100.0);
+        }
+        let (recorded, partial) = self.session_cost_summary();
+        // 按当前模型价的总量分解(当前模型有价时)
+        if let Some(model) = active.as_ref().map(|r| r.model_name.as_str()) {
+            if let Some(b) = crate::llm::cost_breakdown(model, u) {
+                println!(
+                    "    成本分解(按当前模型价): input {} + output {} + cache_read {} + cache_write {} ≈ {}",
+                    crate::llm::format_usd(b.input_usd),
+                    crate::llm::format_usd(b.output_usd),
+                    crate::llm::format_usd(b.cache_read_usd),
+                    crate::llm::format_usd(b.cache_write_usd),
+                    crate::llm::format_usd(b.total()),
+                );
+            }
+        }
+        if recorded > 0.0 {
+            let suffix = if partial {
+                "(下限:部分轮次模型无内置价,未计入)"
+            } else {
+                ""
+            };
+            println!(
+                "    会话实记累计: ≈{} {}",
+                crate::llm::format_usd(recorded),
+                suffix
+            );
+        } else {
+            let name = active
+                .as_ref()
+                .map(|r| r.model_name.as_str())
+                .unwrap_or("<未配置>");
+            println!("    模型 {name} 无内置参考价,仅统计 token。");
+        }
+    }
+
     /// `/workspace [refresh|ws]`(D4,2026-09-13 第 01 轮):查看工作区快照。
     ///
     /// - 无参数 / 默认:命中进程级 TTL 缓存(5s)后展示,零额外开销
@@ -503,6 +573,8 @@ impl TuiSession {
         } else {
             Some(path_arg.trim())
         };
+        // D8 成本(2026-09-17 第 76 轮):全轮实记合计;全无价 → None(导出不显示)。
+        let (recorded_cost, cost_partial) = self.session_cost_summary();
         let meta = export::ExportMeta {
             session_id: self.session.id.clone(),
             session_created_at: export::humanize_compact(&self.session.created_at),
@@ -510,8 +582,8 @@ impl TuiSession {
             model,
             turns: self.transcript.len(),
             total_usage: self.session_usage,
-            cost_partial: false,
-            total_cost_usd: None,
+            cost_partial,
+            total_cost_usd: (recorded_cost > 0.0).then_some(recorded_cost),
         };
         match export::resolve_target(&self.paths.work_dir, explicit, "laew-export", &default_ts) {
             Ok((path, fmt)) => {

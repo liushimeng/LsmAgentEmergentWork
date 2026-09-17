@@ -352,7 +352,7 @@ atomcode 在「**会话导出 + 实时成本 + statusline**」三个相关但独
 | L 编号 | 描述 | 优先级 | 推荐 Rust crate |
 |---|---|---|---|
 | L1410 | laew 无 `/save` 会话导出 markdown | P1 | `chrono` + `serde_json` |
-| L1411 | laew 无 `/cost` local token accounting | P1 | 累积 session token 即可 |
+| L1411 | laew 无 `/cost` local token accounting ✅ 已实现(2026-09-17 第 76 轮,`src/llm/pricing.rs` + `/cost` 面板 + 逐轮成本实记) | P1 | 累积 session token 即可 |
 | L1412 | laew 无 token-usage statusline hint（80%/95% 阈值） | P1 | 简单 `Arc<Mutex<Option<UsageInfo>>>` slot |
 | L1413 | laew 无 5 级 hint 优先级链（status row 右侧单 hint） | P2 | 自研 `build_status` 函数 |
 | L1414 | laew 无 `/usage` 远程 quota 拉取（如果用 CodingPlan 类订阅） | P2 | reqwest + 30s cooldown |
@@ -378,7 +378,7 @@ atomcode 在「**会话导出 + 实时成本 + statusline**」三个相关但独
 | L1408 | D7 | laew 无「欢迎提示池」hand-curated tip 轮播 | P3 | 简单 const 数组即可 |
 | L1409 | D7 | laew 无主题偏好持久化（默认 ANSI 16 色） | P3 | `directories` + serde_json |
 | L1410 | D8 | laew 无 `/save` 会话导出 markdown | P1 | `chrono` + `serde_json` |
-| L1411 | D8 | laew 无 `/cost` local token accounting | P1 | 累积 session token 即可 |
+| L1411 | D8 | laew 无 `/cost` local token accounting ✅ 已实现(2026-09-17 第 76 轮) | P1 | 累积 session token 即可 |
 | L1412 | D8 | laew 无 token-usage statusline hint（80%/95% 阈值） | P1 | 简单 `Arc<Mutex<Option<UsageInfo>>>` slot |
 | L1413 | D8 | laew 无 5 级 hint 优先级链 | P2 | 自研 `build_status` 函数 |
 | L1414 | D8 | laew 无 `/usage` 远程 quota 拉取 | P2 | reqwest + 30s cooldown |

@@ -116,6 +116,8 @@ impl CompletionEngine {
             ),
             // D13 离线模式(2026-09-11):连接状态查看
             SlashCommand::builtin("offline", &["status"], "查看连接状态与离线队列", "/offline"),
+            // D8 会话成本(2026-09-17 第 76 轮):用量与成本估算面板
+            SlashCommand::builtin("cost", &["usage"], "查看会话用量与成本估算", "/cost"),
             // D4 工作区感知(2026-09-13):环境快照查看
             SlashCommand::builtin(
                 "workspace",

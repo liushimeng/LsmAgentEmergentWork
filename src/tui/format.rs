@@ -21,6 +21,9 @@ use crate::tui::input::display_width;
 ///
 /// 2026-09-16 第 57 轮:补 stage_durations / retry_log / layer_log / 工具调用明细 —
 /// 让用户在终端一眼看到每个阶段耗时、每个 WF 的责任 Agent、每个工具调用耗时与失败原因。
+///
+/// `cost_hint`(2026-09-17 第 76 轮 D8 成本):Some 时在「本次用量」行尾追加
+/// `成本≈$X`;None(模型无内置参考价)时行格式与旧版完全一致。
 pub fn format_task_result(
     result: &crate::agent::orchestrator::TaskResult,
     paths: &Paths,
@@ -350,8 +353,10 @@ pub fn format_task_result(
         let elapsed_suffix = wallclock_secs
             .map(|s| format!("  (耗时 {:.2}s)", s))
             .unwrap_or_default();
+        // D8 成本估算(2026-09-17 第 76 轮):调用方据当前模型内置价预算好传入;
+        // None(模型无内置参考价 / 无 provider)时不追加,行格式与此前完全一致。
         let cost_suffix = cost_hint
-            .map(|c| format!("  成本≈{}", c))
+            .map(|c| format!("  成本≈{c}"))
             .unwrap_or_default();
         out.push_str(&format!(
             "  本次用量: input={}  output={}{}{}{}\n",
@@ -927,6 +932,7 @@ pub(crate) fn print_help() {
     println!("  │  /export [path]    导出当前会话(Markdown, .json 后缀 JSON) │");
     println!("  │  /diff <old> <new> 并排 diff 两个文件(行级+字符级着色)    │");
     println!("  │  /theme [kind]     查看或切换主题(D12 a11y 配色)          │");
+    println!("  │  /cost (usage)     查看会话用量与成本估算                 │");
     println!("  │  /workspace [rf]   查看工作区快照(git/工程/最近改动)       │");
     println!("  │  /commands         列出自定义斜杠命令                      │");
     println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
@@ -1168,5 +1174,110 @@ mod format_task_result_for_context_tests {
         let result = make_result(vec![wf], "");
         let ctx = format_task_result_for_context(&result);
         assert!(ctx.contains("(质检通过)"));
+    }
+}
+
+#[cfg(test)]
+mod format_task_result_cost_hint_tests {
+    //! D8 成本提示(2026-09-17 第 76 轮):cost_hint 拼接契约。
+    use super::format_task_result;
+    use super::format_task_result_cost_hint_tests_support::*;
+
+    #[test]
+    fn cost_hint_appended_to_usage_line() {
+        let result = make_priced_result(1000, 500);
+        let out = format_task_result(&result, &test_paths(), None, false, Some("$0.0105"));
+        assert!(
+            out.contains("本次用量: input=1000  output=500  成本≈$0.0105"),
+            "成本应拼在用量行尾,实际: {out}"
+        );
+    }
+
+    #[test]
+    fn no_cost_hint_keeps_legacy_line() {
+        let result = make_priced_result(1000, 500);
+        let out = format_task_result(&result, &test_paths(), None, false, None);
+        assert!(out.contains("本次用量: input=1000  output=500"));
+        assert!(!out.contains("成本"), "无价时行格式与旧版一致,实际: {out}");
+    }
+
+    #[test]
+    fn cost_hint_with_elapsed_ordering() {
+        // 耗时在前、成本在后(与 print_usage 行序一致)
+        let result = make_priced_result_with_wallclock(10, 5, 1500);
+        let out = format_task_result(&result, &test_paths(), None, false, Some("$0.000030"));
+        let line = out.lines().find(|l| l.contains("本次用量")).unwrap();
+        let elapsed_pos = line.find("(耗时").unwrap();
+        let cost_pos = line.find("成本≈").unwrap();
+        assert!(elapsed_pos < cost_pos, "耗时应在前成本在后: {line}");
+    }
+}
+
+#[cfg(test)]
+mod format_task_result_cost_hint_tests_support {
+    //! 支撑 fixture:构造带用量/耗时的最小 TaskResult。
+    use crate::agent::orchestrator::{TaskResult, WorkflowResult};
+    use crate::agent::quality::{QualityReport, Verdict};
+    use crate::config::Paths;
+    use crate::llm::Usage;
+
+    pub fn test_paths() -> Paths {
+        let dir = std::env::temp_dir();
+        Paths {
+            root_dir: dir.clone(),
+            work_dir: dir.clone(),
+            db_path: dir.join("test-cost-hint.db"),
+        }
+    }
+
+    pub fn make_priced_result(input: u32, output: u32) -> TaskResult {
+        make_priced_result_with_wallclock(input, output, 0)
+    }
+
+    pub fn make_priced_result_with_wallclock(input: u32, output: u32, ms: u64) -> TaskResult {
+        TaskResult {
+            goal: "g".into(),
+            classification: crate::agent::yolo::TaskClassification {
+                task_level: crate::agent::yolo::TaskLevel::Simple,
+                purpose: "p".into(),
+                goal_summary: "g".into(),
+                intent: "info_query".into(),
+                agent_role: None,
+                decomposition_plan: vec![],
+                direct_answer: None,
+                user_suggestion_if_fail: String::new(),
+                yolo_degraded: false,
+                suggested_delegate: None,
+            },
+            plan_doc: None,
+            workflows: vec![WorkflowResult {
+                id: "wf-1".into(),
+                name: "测试单元".into(),
+                subflow_outcome: "done".into(),
+                quality_report: QualityReport {
+                    verdict: Verdict::Pass,
+                    issues: vec![],
+                    suggestion: String::new(),
+                    retryable: false,
+                    source: crate::agent::context::AgentRole::SubAgent,
+                    evidence: String::new(),
+                },
+                usage: Usage::default(),
+                subflow_trace: None,
+                exec_role: crate::agent::context::AgentRole::SubAgent,
+                wallclock_ms: 0,
+                qc_wallclock_ms: 0,
+            }],
+            summary: "摘要".into(),
+            total_usage: Usage {
+                input_tokens: input,
+                output_tokens: output,
+                ..Default::default()
+            },
+            stage_durations: Vec::new(),
+            retry_log: Vec::new(),
+            layer_log: Vec::new(),
+            wallclock_ms: ms,
+        }
     }
 }

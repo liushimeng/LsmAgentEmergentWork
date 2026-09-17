@@ -423,7 +423,7 @@ impl TuiSession {
                     &self.paths,
                     self.task_started_at,
                     false,
-                    None,
+                    self.task_cost_hint(&result.total_usage).as_deref(),
                 );
                 let context_text = format_task_result_for_context(result);
                 self.print_task_result(result);
@@ -581,7 +581,9 @@ impl TuiSession {
                 prompt: effective_prompt.to_string(),
                 response: transcript_response,
                 usage,
-                cost_usd: None,
+                // D8 成本(2026-09-17 第 76 轮):按当时 active 模型内置价估算;
+                // 零用量(取消/错误)与无价模型记 None,不污染会话合计。
+                cost_usd: self.estimate_entry_cost(&usage),
                 outcome,
             });
         }

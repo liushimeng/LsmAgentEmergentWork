@@ -153,6 +153,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 | `/branches`       | 列出已存分支（`/rewind` `/fork` `/switch` `/clear` 改动前自动快照；内存态上限 10 个，退出 TUI 失效），实现 `tui/branches.rs` |
 | `/switch <name>`  | 切换到指定分支（切换前当前对话自动快照，零丢失） |
 | `/offline` (`status`)| 查看连接状态(Online/Degraded/Offline 三态)与离线队列深度;D13 离线模式 |
+| `/cost` (`usage`)    | 查看会话用量与成本估算(D8):累计四类 token / 缓存命中率 / 按内置参考价(2026-09)的成本分解与实记累计;模型无内置价时仅统计 token |
 | `/workspace` (`ws`) | 查看工作区快照(D4):git 分支/未提交变更/工程类型与工具链建议/顶层结构/6h 内最近改动;`/workspace refresh` 强制失效 TTL 缓存重采集 |
 | `/export [path]`  | 导出当前会话为 Markdown（`.json` 后缀导出 JSON）；默认落工作目录 `laew-export-{时间戳}.md`，同名冲突自动 `-1` 后缀，显式路径已存在拒绝覆盖 |
 | `/commands`       | 列出已加载的自定义斜杠命令与来源 |

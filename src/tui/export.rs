@@ -357,6 +357,45 @@ mod tests {
     }
 
     #[test]
+    fn markdown_cost_row_when_priced() {
+        // D8 成本(2026-09-17 第 76 轮):有计价轮次时汇总表显示累计成本行
+        let mut m = meta(1);
+        m.total_cost_usd = Some(0.0123);
+        let md = render_markdown(&m, &[entry(OutcomeKind::Executed, "ok")]);
+        assert!(md.contains("累计成本(估算)"), "md: {md}");
+        assert!(md.contains("$0.0123"), "md: {md}");
+        assert!(!md.contains("下限"), "非 partial 不应标注下限, md: {md}");
+    }
+
+    #[test]
+    fn markdown_cost_row_partial_suffix() {
+        let mut m = meta(1);
+        m.total_cost_usd = Some(0.0123);
+        m.cost_partial = true;
+        let md = render_markdown(&m, &[entry(OutcomeKind::Executed, "ok")]);
+        assert!(md.contains("下限"), "partial 应标注下限, md: {md}");
+    }
+
+    #[test]
+    fn markdown_no_cost_row_when_unpriced() {
+        // 全轮模型无内置价 → None → 不显示成本行(不虚报 $0)
+        let md = render_markdown(&meta(1), &[entry(OutcomeKind::Executed, "ok")]);
+        assert!(!md.contains("累计成本"), "md: {md}");
+    }
+
+    #[test]
+    fn json_entry_cost_field_serde() {
+        // cost_usd=None 不序列化;Some 序列化(向后兼容)
+        let e = entry(OutcomeKind::Executed, "ok");
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(!j.contains("cost_usd"), "None 应跳过序列化: {j}");
+        let mut e2 = entry(OutcomeKind::Executed, "ok");
+        e2.cost_usd = Some(0.5);
+        let j2 = serde_json::to_string(&e2).unwrap();
+        assert!(j2.contains("\"cost_usd\":0.5"), "Some 应携带: {j2}");
+    }
+
+    #[test]
     fn markdown_command_expansion_shown_once() {
         let mut e = entry(OutcomeKind::Executed, "ok");
         e.raw_input = "/review src/main.rs".into();
