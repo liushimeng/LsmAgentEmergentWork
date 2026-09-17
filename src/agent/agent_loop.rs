@@ -631,6 +631,8 @@ impl Agent {
                             tool: name,
                             attempts: consecutive_failures,
                             last_error: output,
+                            // 2026-09-17 第 75 轮:携带真实 trace,Runner 不再丢工具调用历史
+                            trace: Box::new(trace),
                         });
                     }
                 } else {
@@ -820,7 +822,12 @@ impl Agent {
             }
         }
 
-        Err(AgentError::MaxIterationsExceeded(self.max_iterations))
+        // 2026-09-17 第 75 轮:携带中断时刻的真实 trace(工具调用历史/失败信号),
+        // Runner 侧不再用 default 兜底丢证据。
+        Err(AgentError::MaxIterationsExceeded {
+            iterations: self.max_iterations,
+            trace: Box::new(trace),
+        })
     }
 
     /// 单次 LLM 调用 + 上下文溢出三级恢复(L1038/L1044,第 06 轮)。

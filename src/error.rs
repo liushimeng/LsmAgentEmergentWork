@@ -46,8 +46,18 @@ pub enum AgentError {
     #[error("工具执行失败[{tool}]: {reason}")]
     ToolExecution { tool: String, reason: String },
 
-    #[error("达到最大迭代次数({0})仍未得到最终答案")]
-    MaxIterationsExceeded(usize),
+    /// 达到最大迭代次数仍未得到最终答案。
+    ///
+    /// 2026-09-17 第 75 轮:携带中断时刻的真实 ExecutionTrace(工具调用历史 /
+    /// 失败信号),Runner 据此保留完整执行证据。此前仅携带次数,Runner 侧用
+    /// `ExecutionTrace::default()` 兜底会把真实工具调用记录丢成 0(真实回归实测:
+    /// 第 3 轮实际几十次浏览器工具调用在 trace 里显示 tool_calls=0,QC 拿到失真
+    /// 证据误判「完全未执行任何浏览器操作」)。
+    #[error("达到最大迭代次数({iterations})仍未得到最终答案")]
+    MaxIterationsExceeded {
+        iterations: usize,
+        trace: Box<crate::agent::extrace::ExecutionTrace>,
+    },
 
     /// 用户中断(Ctrl-C / SIGINT)触发的任务取消。
     ///
@@ -68,6 +78,9 @@ pub enum AgentError {
         tool: String,
         attempts: usize,
         last_error: String,
+        /// 2026-09-17 第 75 轮:携带中断时刻的真实 trace(早终止前已累计的工具调用
+        /// 历史与失败信号),避免 Runner 侧 default 兜底丢证据。
+        trace: Box<crate::agent::extrace::ExecutionTrace>,
     },
 
     #[error("Yolo 分类解析失败: {0}")]

@@ -182,22 +182,26 @@ impl WebUseRunner {
                 tool,
                 attempts,
                 last_error,
+                trace: carried,
             }) => {
                 let summary = format!(
                     "[RepeatedToolFailure] 工具 {tool} 连续 {attempts} 次失败;last_error: {last_error}"
                 );
-                let mut tr = ExecutionTrace::default();
+                // 2026-09-17 第 75 轮:使用 Agent 循环携带的真实 trace(工具调用历史不丢;
+                // early_terminated/reason/max_consecutive_failures 已在抛出点设置)
+                let mut tr = *carried;
                 tr.runner_role = runner_role;
                 tr.intended_role = intended_role;
-                tr.early_terminated = true;
-                tr.early_terminate_reason = format!("tool={tool} attempts={attempts}");
-                tr.max_consecutive_failures = attempts;
                 tr.collect_failure_signals(&summary);
                 (summary, Usage::default(), tr)
             }
-            Err(AgentError::MaxIterationsExceeded(n)) => {
+            Err(AgentError::MaxIterationsExceeded {
+                iterations: n,
+                trace: carried,
+            }) => {
                 let summary = format!("[MaxIterationsExceeded] 迭代达到 {n} 次上限未得到最终答案");
-                let mut tr = ExecutionTrace::default();
+                // 2026-09-17 第 75 轮:使用 Agent 循环携带的真实 trace(工具调用历史不丢)
+                let mut tr = *carried;
                 tr.runner_role = runner_role;
                 tr.intended_role = intended_role;
                 tr.iterations = n;
