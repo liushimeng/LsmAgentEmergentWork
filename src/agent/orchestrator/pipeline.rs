@@ -18,6 +18,19 @@ impl MultiAgentOrchestrator {
         let mut stage_durations: Vec<StageDuration> = Vec::new();
         let mut retry_log: Vec<RetryRecord> = Vec::new();
 
+        // 任务开始(2026-09-17 第 69 轮运行日志):感知输入 —— 用户原始 prompt
+        // (注入项目上下文/历史摘要之前的原始形态)入日志。
+        {
+            let prompt_desc = Self::original_user_prompt(session)
+                .unwrap_or_else(|| "(无用户文本输入)".to_string());
+            info!(
+                session = %session.id(),
+                messages = session.context().len(),
+                prompt = %crate::logging::clip(&prompt_desc),
+                "任务开始(感知输入)"
+            );
+        }
+
         // 0) 项目上下文首次注入(幂等)
         if let Some(work_dir) = project_context::current_work_dir() {
             project_context::inject_once(session, work_dir);
@@ -70,6 +83,20 @@ impl MultiAgentOrchestrator {
             elapsed_ms: yolo_elapsed_ms,
         });
         self.dbg_classify(&classification);
+        // Yolo 分类(2026-09-17 第 69 轮运行日志):决策事件 —— 三步分析
+        // (目的/目标/意图)+ 档位 + 委派建议 + 直答有无,全量入日志。
+        info!(
+            session = %session.id(),
+            task_level = %classification.task_level.display_name(),
+            purpose = %crate::logging::clip(&classification.purpose),
+            goal = %crate::logging::clip(&classification.goal_summary),
+            intent = %crate::logging::clip(&classification.intent),
+            delegate = classification.suggested_delegate.as_deref().unwrap_or(""),
+            direct_answer = classification.direct_answer.is_some(),
+            decomposition = classification.decomposition_plan.len(),
+            degraded_parse = classification.yolo_degraded,
+            "Yolo 分类(决策)"
+        );
         // 2026-09-11 第三十三轮:#P-C 修复 — 此处只能确定档位,无法确定 simple
         // 是否走 direct_answer 短路(短路判断在 stage 之后)。文案采用「预期路径」:
         // - simple 期望委派 SubAgent → "SubAgent 委派执行"
@@ -143,6 +170,12 @@ impl MultiAgentOrchestrator {
             {
                 Self::check_cancelled(cancel)?;
                 emit_progress(progress, "Yolo 直接作答(跳过执行层)");
+                // 运行日志(第 69 轮):直答短路决策
+                info!(
+                    session = %session.id(),
+                    answer_chars = answer.chars().count(),
+                    "Yolo 直接作答短路(感知→决策→直答)"
+                );
                 // 2026-09-11 第三十三轮:#P-C 修复 — 显式输出 trace 行,
                 // 让用户/调试脚本区分「Yolo 直答」与「SubAgent 委派执行」两条路径。
                 emit_progress(progress, "[trace] subagent=skipped(direct_answer=true)");
@@ -169,6 +202,15 @@ impl MultiAgentOrchestrator {
                 });
                 total_usage = add_usage(total_usage, summary.usage);
                 self.dbg_task_end("direct_answer", total_usage);
+                // 运行日志(第 69 轮):任务收口 —— 直答结局
+                info!(
+                    session = %session.id(),
+                    outcome = "direct_answer",
+                    usage_in = total_usage.input_tokens,
+                    usage_out = total_usage.output_tokens,
+                    wallclock_ms = task_started.elapsed().as_millis() as u64,
+                    "任务收口"
+                );
                 return Ok(OrchestrationOutcome::DirectAnswer {
                     text: answer,
                     classification,
@@ -194,6 +236,18 @@ impl MultiAgentOrchestrator {
                 };
                 self.record_failure_event(session.id(), &classification, &suggestion);
                 self.dbg_task_end(&format!("failed: {suggestion}"), total_usage);
+                // 运行日志(第 69 轮):重试预算耗尽,任务最终失败
+                info!(
+                    session = %session.id(),
+                    outcome = "failed",
+                    attempts = retry_count,
+                    reason = %crate::logging::clip(&retry_hint),
+                    suggestion = %crate::logging::clip(&suggestion),
+                    usage_in = total_usage.input_tokens,
+                    usage_out = total_usage.output_tokens,
+                    wallclock_ms = task_started.elapsed().as_millis() as u64,
+                    "任务收口"
+                );
                 // 2026-09-16 第 58 轮 P0-C:把累计的 stage_durations / retry_log /
                 // 最近一次失败 trace / 任务总耗时 透传给 Failed outcome,让
                 // TUI Failed 分支复用 format_task_result 渲染 [trace] [tool] [failure] 段。
@@ -211,6 +265,13 @@ impl MultiAgentOrchestrator {
             }
 
             // 2) 调度执行(执行层取消:token 贯穿 SubAgent / 并行层)
+            // 运行日志(第 69 轮):执行链路路由决策(simple/medium/hard)
+            info!(
+                session = %session.id(),
+                route = %classification.task_level.display_name(),
+                retry_count,
+                "进入执行链路"
+            );
             let exec_result = match classification.task_level {
                 TaskLevel::Simple => {
                     self.run_simple(&classification, session, cancel, progress, &retry_hint)
@@ -289,6 +350,17 @@ impl MultiAgentOrchestrator {
                     task_result.retry_log = retry_log;
                     task_result.wallclock_ms = task_started.elapsed().as_millis() as u64;
                     self.dbg_task_end("executed", task_result.total_usage);
+                    // 运行日志(第 69 轮):任务收口 —— 执行成功结局
+                    info!(
+                        session = %session.id(),
+                        outcome = "executed",
+                        workflows = task_result.workflows.len(),
+                        summary_chars = task_result.summary.chars().count(),
+                        usage_in = total_usage.input_tokens,
+                        usage_out = total_usage.output_tokens,
+                        wallclock_ms = task_result.wallclock_ms,
+                        "任务收口"
+                    );
                     return Ok(OrchestrationOutcome::Executed {
                         result: task_result,
                     });
@@ -316,6 +388,15 @@ impl MultiAgentOrchestrator {
                         elapsed_ms: retry_elapsed_ms,
                     });
                     // 升级或重试
+                    // 运行日志(第 69 轮):执行失败,回流/重试决策
+                    info!(
+                        session = %session.id(),
+                        retry_count,
+                        retryable = failure.retryable,
+                        source_role = %failure.source.as_str(),
+                        reason = %crate::logging::clip(&failure.reason),
+                        "执行失败(决策:回流/重试)"
+                    );
                     if !failure.retryable {
                         emit_progress(progress, "失败回流 Yolo 重新评估…");
                         // 升级到上一层(由 Yolo 重新评估)
@@ -326,6 +407,13 @@ impl MultiAgentOrchestrator {
                             Ok(new_c) => {
                                 classification = new_c;
                                 self.dbg_classify(&classification);
+                                // 运行日志(第 69 轮):失败回流 Yolo 后的新分类
+                                info!(
+                                    session = %session.id(),
+                                    task_level = %classification.task_level.display_name(),
+                                    goal = %crate::logging::clip(&classification.goal_summary),
+                                    "Yolo 重新分类(失败回流)"
+                                );
                                 // 档位升级后旧失败原因不再适用(F3);
                                 // 分类可能变化 → 计划缓存一并作废(第 67 轮)
                                 retry_hint.clear();

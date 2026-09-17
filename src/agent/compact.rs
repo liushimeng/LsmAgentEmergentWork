@@ -222,6 +222,17 @@ impl CompactRunner {
             usage,
         };
         self.persist(session.id(), &report, &summary);
+        // 运行日志(2026-09-17 第 69 轮):Context 自动压缩(执行)—— 档位/前后 token/降级
+        tracing::info!(
+            agent = "LsmAgentEmergentWork-Compact",
+            session = %session.id(),
+            tier = %report.tier.as_str(),
+            before_tokens = report.before_tokens,
+            after_tokens = report.after_tokens,
+            compacted_messages = report.compacted_messages,
+            fallback = report.fallback,
+            "Context 自动压缩(执行)"
+        );
         Ok(Some(report))
     }
 

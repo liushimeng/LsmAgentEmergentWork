@@ -135,6 +135,16 @@ impl Agent {
         const NO_TOOL_USE_THRESHOLD: usize = 3;
         let mut consecutive_no_tool_rounds: usize = 0;
 
+        // Agent 会话开始(2026-09-17 第 69 轮运行日志):--debug/--info 日志文件的
+        // 角色级起点事件;所有 11 个角色都经本函数,一处埋点全角色覆盖。
+        info!(
+            agent = %self.profile.name,
+            session = %session.id(),
+            max_iterations = self.max_iterations,
+            tools = %self.profile.tools.names().join(","),
+            "Agent 会话开始"
+        );
+
         for iter in 0..self.max_iterations {
             trace.iterations = iter + 1;
             // 迭代边界:取消检查(轻量 is_cancelled,热路径零 await 开销)
@@ -180,6 +190,17 @@ impl Agent {
             } else {
                 format!("{base_system}{workspace_hint}{runtime_hints}")
             };
+            // LLM 请求(2026-09-17 第 69 轮运行日志):--debug 级记录每轮请求元信息,
+            // 排查「模型看到了什么」(消息条数/system 规模/强制工具/输出上限)。
+            debug!(
+                agent = %self.profile.name,
+                iter,
+                messages = session.context().len(),
+                system_chars = system.chars().count(),
+                forced_tool = meta.forced_tool.as_deref().unwrap_or(""),
+                max_tokens = meta.max_tokens_override.unwrap_or(0),
+                "LLM 请求"
+            );
             // 上下文溢出自动恢复(L1038/L1044,2026-09-09 第 06 轮):
             // LLM 调用命中 prompt-too-long 类溢出错误时,自动执行
             // 排水(Level 1)→ 折叠(Level 2)→ 重试;两轮无效则上抛(三级暴露)。
@@ -202,6 +223,35 @@ impl Agent {
             total_usage.cache_creation_input_tokens = total_usage
                 .cache_creation_input_tokens
                 .saturating_add(completion.usage.cache_creation_input_tokens);
+
+            // LLM 响应(2026-09-17 第 69 轮运行日志):思考文本(assistant 可见文本)+
+            // 工具调用意图逐条记录 —— 排查「模型想了什么、打算做什么」的核心事件。
+            {
+                let calls_desc = completion
+                    .tool_calls
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}#{} args={}",
+                            c.name,
+                            c.id,
+                            crate::logging::clip(&c.arguments.to_string())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                debug!(
+                    agent = %self.profile.name,
+                    iter,
+                    stop_reason = completion.stop_reason.as_deref().unwrap_or(""),
+                    usage_in = completion.usage.input_tokens,
+                    usage_out = completion.usage.output_tokens,
+                    cache_read = completion.usage.cache_read_input_tokens,
+                    thinking = %crate::logging::clip(&completion.text),
+                    tool_calls = %calls_desc,
+                    "LLM 响应"
+                );
+            }
 
             if !completion.has_tool_calls() {
                 // 累计文本(续接场景下可能多次进入此分支)
@@ -233,6 +283,7 @@ impl Agent {
                         format!("no_tool_use_{}_rounds", consecutive_no_tool_rounds);
                     trace.collect_failure_signals(&accumulated_text);
                     return Self::finalize_with_forced_flag(
+                        &self.profile.name,
                         trace,
                         &accumulated_text,
                         total_usage,
@@ -320,6 +371,7 @@ impl Agent {
                         );
                         trace.truncation_resumes = truncation_resumes;
                         return Self::finalize_with_forced_flag(
+                            &self.profile.name,
                             trace,
                             &accumulated_text,
                             total_usage,
@@ -345,6 +397,7 @@ impl Agent {
                 // 非截断,正常返回
                 debug!("agent finished with text answer");
                 return Self::finalize_with_forced_flag(
+                    &self.profile.name,
                     trace,
                     &accumulated_text,
                     total_usage,
@@ -430,7 +483,15 @@ impl Agent {
                     continue;
                 }
 
-                info!(tool = %name, "executing tool");
+                // 工具调用(2026-09-17 第 69 轮运行日志):名称 + 参数(截断)入日志,
+                // 所有角色所有工具(Bash/Read/Write/Window*/Browser*)统一经此记录。
+                info!(
+                    agent = %self.profile.name,
+                    iter,
+                    tool = %name,
+                    args = %crate::logging::clip(&stable_json_string(&args)),
+                    "工具调用"
+                );
 
                 // 工具执行取消:select 命中后工具 future 被 drop——Bash 工具的
                 // `kill_on_drop` 会随之 SIGKILL 子进程、setsid+killpg 清理整组
@@ -511,6 +572,17 @@ impl Agent {
                 if name == "Bash" {
                     trace.record_bash_exit_code(&output);
                 }
+                // 工具结果(2026-09-17 第 69 轮运行日志):成功/失败都记录,且早于
+                // RepeatedToolFailure 等提前返回,保证失败调用的结果也不丢日志。
+                info!(
+                    agent = %self.profile.name,
+                    iter,
+                    tool = %name,
+                    is_error,
+                    elapsed_ms = tool_call_started.elapsed().as_millis() as u64,
+                    output = %crate::logging::clip(&output),
+                    "工具结果"
+                );
                 if is_error {
                     trace.tool_calls_err += 1;
                     // 失败键:工具名 + 稳定 JSON(对象按 key 排序后序列化)
@@ -592,6 +664,7 @@ impl Agent {
                 accumulated_text.push_str(&format!("```json\n{json}\n```"));
                 debug!("agent finished with structured tool_use output");
                 return Self::finalize_with_forced_flag(
+                    &self.profile.name,
                     trace,
                     &accumulated_text,
                     total_usage,
@@ -683,6 +756,7 @@ impl Agent {
                     history = history_block,
                 );
                 return Self::finalize_with_forced_flag(
+                    &self.profile.name,
                     trace,
                     &fallback_text,
                     total_usage,
@@ -814,7 +888,11 @@ impl Agent {
 
     /// 2026-09-16 第 68 轮 P1-B:包装 finalize,写入 forced_tool_effective 字段。
     /// 所有正常/提前返回路径统一经本函数,确保 trace.forced_tool_effective 被填充。
+    ///
+    /// 2026-09-17 第 69 轮:同时作为 Agent 会话结束日志的单一收口
+    /// (迭代数 / 工具成败计数 / 提前终止原因 / 用量)。
     fn finalize_with_forced_flag(
+        agent_name: &str,
         mut trace: ExecutionTrace,
         text: &str,
         total_usage: Usage,
@@ -822,6 +900,19 @@ impl Agent {
         forced_tool_effective: Option<bool>,
     ) -> Result<(String, Usage, ExecutionTrace)> {
         trace.forced_tool_effective = forced_tool_effective;
+        info!(
+            agent = agent_name,
+            iterations = trace.iterations,
+            tool_calls = trace.tool_calls,
+            tool_ok = trace.tool_calls_ok,
+            tool_err = trace.tool_calls_err,
+            early_terminated = trace.early_terminated,
+            early_reason = %trace.early_terminate_reason,
+            usage_in = total_usage.input_tokens,
+            usage_out = total_usage.output_tokens,
+            output_chars = text.chars().count(),
+            "Agent 会话结束"
+        );
         Self::finalize_with_max_tokens(trace, text, total_usage, max_tokens_state)
     }
 }

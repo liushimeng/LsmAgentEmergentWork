@@ -606,3 +606,18 @@ git 状态 / 平台 / 日期,只能 `ls` 试探,常猜错构建命令(`npm test`
 **D11 维度现状**：0% → 90%（未做：事件级实时分发 / 视频录制 / 反检测指纹 / 网络拦截 Fetch 全协议）。
 
 **累计**：本轮新增 1 个角色 + 1 类驱动层 + 5 个工具 + 1 个执行器 + 6 处共享代码接入（角色枚举/profile/registry/prompt/orchestrator/memory 角色字符串 fail-closed）。
+
+## 第 69 轮（2026-09-17）— 输出 log 文件功能与全链路日志埋点
+
+| 编号 | gap | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|---------|---------|
+| LogFile | 无运行日志文件（第十二轮 P0「无结构化日志」的用户侧子集：`--debug`/`--info` 无法把 Agent 感知/决策/执行/思考与工具调用落盘排查；tracing 只写控制台/TUI log，核心链路零埋点） | ✅ | `src/logging.rs`（新：`llaew_{YYYYMMDD_HHMMSS}.log` 路径生成/字符级 clip/`LAEW_LOG_CLIP` 环境变量/`AgentLogMaker` 共享 LineWriter MakeWriter/本地时区 FormatTime/`file_fmt_layer` 文件 fmt 层）+ `src/main.rs`（`--info` 新参数 + `-debug/-info/--DEBUG` 等大小写单双横线启动归一化 + registry 双层订阅器组装：原控制台层行为不变 + 文件层按 flag 定级 DEBUG/INFO + stderr 提示日志路径 + help 全量更新）+ 埋点：`agent_loop.rs`（Agent 会话开始/结束 + 每轮 LLM 请求[DEBUG]/响应[DEBUG，思考文本+tool_calls 逐条] + 工具调用/工具结果[INFO，名称+参数+结果+耗时]，11 角色全覆盖）、`orchestrator/pipeline.rs`（任务开始/Yolo 分类/直答短路/进入执行链路/执行失败回流/任务收口）、`orchestrator/workflows.rs`（拓扑分层/WorkFlow 单元开始/执行完成/质检）、`quality.rs::run_check`（QC 报告统一收口）、`main_work/mod.rs`（拆解完成 + hard 档解析 Plan 对偶事件）、`compact.rs`（自动压缩）、`session_context.rs`（会话摘要）、`plan.rs`（Plan 生成）+ `.gitignore` `/llaew_*.log` + CLAUDE.md（命令/环境变量/领域概念） | 2026-09-17 第 69 轮 |
+
+**设计要点**:
+- **双层订阅器**：`tracing_subscriber::registry().with(原控制台 fmt 层 with_filter(EnvFilter)).with(文件 fmt 层 with_filter(LevelFilter))` —— 控制台行为（TUI 写 logs/laew-tui.log、-p 写 stderr）完全不变，文件层确定性级别不受 RUST_LOG 干扰。
+- **文件层格式**：ANSI 关闭 + 无 target + 本地时区毫秒时间戳（`time` crate，多线程取不到本地偏移回退 UTC，与 session.rs 同款）。
+- **容错**：文件创建失败静默降级 + stderr 提示，绝不影响主流程；`Arc<Mutex<LineWriter<File>>>` 一次打开进程复用，多线程安全。
+- **截断**：单字段默认 4000 字符（char 边界，CJK 安全），`LAEW_LOG_CLIP` 可调，尾部 `…(截断,省略N字符)` 标注。
+- **stdout 纯净性**：一切用户可见提示走 stderr，`-p` 模式 stdout 仍只含答案与用量。
+- **大小写/单双横线**：clap `ignore_case` 只作用于参数值，flag 拼写大小写在启动归一化层处理（`trim_start_matches('-')` + lowercase 比对四个长参数词）。
+- **验证**：单元测试 7 项（文件名格式/clip/CJK/env/创建续写/降级）+ cargo test 1017 全过 + mock e2e 手动验证（--info/-INFO/--DEBUG/-Debug/--info TUI/-f 五类形态 × simple/medium并行/hard 三档链路事件覆盖）+ `run_e2e.sh` PASS=172 FAIL=1（5e-1 WebUse 为存量失败，与改动前 09:38 报告一致）。

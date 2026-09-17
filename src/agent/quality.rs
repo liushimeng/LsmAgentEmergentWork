@@ -218,6 +218,19 @@ impl QualityRunner {
             Some(trace) => gate_report_on_trace(report, source, trace, actual),
             None => report,
         };
+        // 运行日志(2026-09-17 第 69 轮):Quality-Check 报告(决策)—— 全部 QC 入口
+        // (单元/计划/Plan)汇聚本函数,一处记录 verdict/issues/建议/证据。
+        tracing::info!(
+            agent = "LsmAgentEmergentWork-Quality-Check",
+            session = session_id,
+            source = %source.as_str(),
+            verdict = if report.verdict == Verdict::Pass { "pass" } else { "fail" },
+            retryable = report.retryable,
+            issues = %crate::logging::clip(&report.issues.join(" | ")),
+            suggestion = %crate::logging::clip(&report.suggestion),
+            evidence = %crate::logging::clip(&report.evidence),
+            "Quality-Check 报告(决策)"
+        );
 
         let _ = memory::record_entry(
             &self.db,

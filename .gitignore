@@ -35,6 +35,9 @@ tests/
 # DebugReport(laew -debug 调试报告,自动落盘,不入库)
 DebugReport/
 
+# 运行日志文件(--debug/--info 落工作目录 llaew_YYYYMMDD_HHMMSS.log,不入库)
+/llaew_*.log
+
 # CrashReport(全局 panic hook 崩溃取证,自动落盘,不入库)
 CrashReport/
 

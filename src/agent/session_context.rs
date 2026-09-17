@@ -118,6 +118,16 @@ impl SessionContextRunner {
             serde_json::json!({ "summary_seq": self.db.next_session_seq(session_id).unwrap_or(0) }),
         );
 
+        // 运行日志(2026-09-17 第 69 轮):SessionContext 会话摘要(记忆)已写入 session_memory
+        tracing::info!(
+            agent = "LsmAgentEmergentWork-SessionContext",
+            session = session_id,
+            summary_chars = text.chars().count(),
+            usage_in = usage.input_tokens,
+            usage_out = usage.output_tokens,
+            "SessionContext 会话摘要(记忆)"
+        );
+
         Ok(SessionSummary { text, usage })
     }
 

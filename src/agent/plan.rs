@@ -115,6 +115,16 @@ impl PlanRunner {
             serde_json::json!({ "plan_path": path.to_string_lossy(), "seq": seq }),
         );
 
+        // 运行日志(2026-09-17 第 69 轮):Plan 生成(决策)—— hard 档规划落盘
+        tracing::info!(
+            agent = "LsmAgentEmergentWork-Plan",
+            session = session_id,
+            plan_path = %path.display(),
+            markdown_chars = text.chars().count(),
+            plan_head = %crate::logging::clip_for_log(&text, 400),
+            "Plan 生成(决策)"
+        );
+
         let _ = usage;
         Ok((
             PlanOutput {

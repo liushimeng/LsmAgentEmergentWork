@@ -8,6 +8,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// 运行日志(2026-09-17 第 69 轮):pipeline/workflows 的任务级主干 INFO 事件经 super::* 取用
+use tracing::info;
+
 use serde::{Deserialize, Serialize};
 
 use crate::agent::cancel::CancelToken;

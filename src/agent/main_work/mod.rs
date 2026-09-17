@@ -258,6 +258,35 @@ impl MainWorkRunner {
             serde_json::json!({ "workflow_ids": plan.workflows.iter().map(|w| &w.id).collect::<Vec<_>>() }),
         );
 
+        // 运行日志(2026-09-17 第 69 轮):Main-Work 拆解完成(决策)—— 逐单元
+        // id/name/delegate/depends_on,排查「任务被拆成了什么、委派给了谁」。
+        let units_desc = plan
+            .workflows
+            .iter()
+            .map(|w| {
+                format!(
+                    "{}[{}]→{}(deps:{})",
+                    w.id,
+                    crate::logging::clip_for_log(&w.name, 60),
+                    w.delegate_to.as_str(),
+                    if w.depends_on.is_empty() {
+                        "-".to_string()
+                    } else {
+                        w.depends_on.join("+")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        tracing::info!(
+            agent = "LsmAgentEmergentWork-Main-Work",
+            session = session_id,
+            workflows = plan.workflows.len(),
+            degraded = plan.degraded,
+            units = %units_desc,
+            "Main-Work 拆解完成(决策)"
+        );
+
         Ok((plan, usage))
     }
 
@@ -266,7 +295,16 @@ impl MainWorkRunner {
         let content = std::fs::read_to_string(plan_path).map_err(|e| {
             AgentError::PlanGen(format!("无法读取 Plan 文档 {}: {}", plan_path.display(), e))
         })?;
-        parse_plan_markdown(&content)
+        let plan = parse_plan_markdown(&content)?;
+        // 运行日志(2026-09-17 第 69 轮):hard 档 Main-Work 从 Plan 文档解析出的
+        // WorkFlow(非 LLM 拆解路径,与 plan_workflows_inner 的拆解事件对偶)。
+        tracing::info!(
+            agent = "LsmAgentEmergentWork-Main-Work",
+            plan_path = %plan_path.display(),
+            workflows = plan.workflows.len(),
+            "Main-Work 解析 Plan 完成(决策)"
+        );
+        Ok(plan)
     }
 }
 

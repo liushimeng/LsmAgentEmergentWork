@@ -14,6 +14,7 @@ pub mod crash;
 pub mod database;
 pub mod error;
 pub mod llm;
+pub mod logging;
 pub mod session;
 #[cfg(test)]
 pub mod test_support;

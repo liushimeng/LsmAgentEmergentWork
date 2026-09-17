@@ -51,6 +51,15 @@ impl MultiAgentOrchestrator {
             // 2026-09-16 第 57 轮:本层开始时刻(用于 LayerInfo.elapsed_ms 与
             // StageDuration.started_offset_ms 的统一基准)。
             let layer_started = std::time::Instant::now();
+            // 运行日志(2026-09-17 第 69 轮):拓扑分层执行 —— 层号/单元 id/并行与否
+            info!(
+                session = %session.id(),
+                layer = layer_idx + 1,
+                total_layers,
+                parallel = layer.len() > 1,
+                wf_ids = %layer.iter().map(|w| w.id.clone()).collect::<Vec<_>>().join(","),
+                "拓扑分层执行"
+            );
             if layer.len() > 1 {
                 // F3(2026-09-14 第 51 轮):改走 progress 通道而非裸 eprintln!
                 // TUI 下 eprintln! 不感知 waiting 行原地重写纪律,会把本条通知
@@ -331,6 +340,15 @@ pub(super) async fn run_wf_unit(
     // 短标题(≤80 字符)进入 TUI stage 流 + waiting 心跳,避免每 1s
     // 原地重写整段超长文本;详情面板走 [laew] 前缀,立即冲刷、不进
     // waiting 心跳,任务快速完成时也保留。
+    // 运行日志(2026-09-17 第 69 轮):单元开始(职责 + 期望输出)
+    info!(
+        session = %session_id,
+        wf_id = %wf_id,
+        executor = exec_label,
+        description = %crate::logging::clip(&input.description),
+        expected = %crate::logging::clip(&input.expected_output),
+        "WorkFlow 单元开始"
+    );
     emit_progress(
         &progress,
         format!("{wf_id} {exec_label} 执行中"),
@@ -377,6 +395,21 @@ pub(super) async fn run_wf_unit(
     let summary_line = format!(
         "{wf_id} {exec_label} 完成 | {:.1}s",
         wallclock_ms as f64 / 1000.0
+    );
+    // 运行日志(2026-09-17 第 69 轮):单元执行完成 —— 迭代/工具成败/耗时/产物规模
+    info!(
+        session = %session_id,
+        wf_id = %wf_id,
+        executor = exec_label,
+        iterations = outcome.trace.iterations,
+        tool_calls = outcome.trace.tool_calls,
+        tool_ok = outcome.trace.tool_calls_ok,
+        tool_err = outcome.trace.tool_calls_err,
+        early_terminated = outcome.trace.early_terminated,
+        early_reason = %outcome.trace.early_terminate_reason,
+        wallclock_ms,
+        output_chars = outcome.text.chars().count(),
+        "WorkFlow 单元执行完成"
     );
     emit_progress(&progress, summary_line);
     let detail_summary = format!(
@@ -464,6 +497,15 @@ pub(super) async fn run_wf_unit(
             QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
         })?;
     let qc_wallclock_ms = qc_started.elapsed().as_millis() as u64;
+    // 运行日志(2026-09-17 第 69 轮):单元质检判定(详细报告由 quality.rs 统一记录)
+    info!(
+        session = %session_id,
+        wf_id = %wf_id,
+        executor = exec_label,
+        verdict = if qc.verdict == Verdict::Pass { "pass" } else { "fail" },
+        qc_wallclock_ms,
+        "WorkFlow 单元质检"
+    );
     if let Some(d) = &debug {
         d.record_quality(&qc);
     }

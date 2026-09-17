@@ -29,7 +29,9 @@ const VERSION_INFO: &str = concat!(
     about = "LsmAgentEmergentWork - LLM Agent CLI",
     long_about = "LsmAgentEmergentWork (laew) 是由 LLM 驱动的 Rust Agent CLI。\n\
                   支持 Anthropic / OpenAI 双协议、多 Agent 协作(6 角色 + 三档难度)、\n\
-                  TUI 多轮对话、单轮 -p / -f 文件模式。",
+                  TUI 多轮对话、单轮 -p / -f 文件模式。\n\
+                  --debug / --info 可在工作目录输出运行日志文件 llaew_YYYYMMDD_HHMMSS.log\n\
+                  (记录各 Agent 感知/决策/执行/思考与工具调用详情,便于排查问题)。",
     after_help = "EXAMPLES:\n  \
                   # 跑一条单轮任务:\n    \
                   laew -p \"用一句话解释 Rust 所有权\"\n  \
@@ -40,8 +42,10 @@ const VERSION_INFO: &str = concat!(
                   laew provider list\n    \
                   laew provider use 3\n    \
                   laew provider delete 5\n  \
-                  \n  # 调试模式(任务结束后生成 Debug 报告):\n    \
+                  \n  # 调试模式(任务结束后生成 Debug 报告 + DEBUG 级运行日志):\n    \
                   laew -debug -p \"...\"\n  \
+                  \n  # 输出 INFO 级运行日志到工作目录 llaew_YYYYMMDD_HHMMSS.log:\n    \
+                  laew --info -p \"...\"\n  \
                   \n文档: docs/工程初始化方案/ 与 docs/TUI界面与CLI渲染引擎/",
     disable_help_subcommand = false
 )]
@@ -88,9 +92,17 @@ struct Cli {
     max_iterations: usize,
 
     /// 调试模式:采集各 Agent 输入/输出/性能/质量,任务结束后由 Debug Agent 评估,
-    /// 报告写入根目录 DebugReport/(也支持 `-debug` 单横线写法)
+    /// 报告写入根目录 DebugReport/;同时在工作目录输出 DEBUG 级运行日志文件
+    /// `llaew_YYYYMMDD_HHMMSS.log`(启动时刻命名),记录各 Agent 感知/决策/执行/
+    /// 思考与工具调用详情(支持 `-debug` 单横线与 `--DEBUG` 等大小写变体)
     #[arg(long = "debug", global = true, help_heading = "运行调优")]
     debug: bool,
+
+    /// 在工作目录输出 INFO 级运行日志文件 `llaew_YYYYMMDD_HHMMSS.log`
+    /// (启动时刻命名),记录各 Agent 感知/决策/执行与工具调用主干事件,
+    /// 便于排查问题(不生成 Debug 报告;支持 `-info` 单横线与 `--INFO` 等大小写变体)
+    #[arg(long = "info", global = true, help_heading = "运行调优")]
+    info: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -635,14 +647,31 @@ async fn main() -> Result<()> {
     }
 
     let cli = {
-        // 兼容用户习惯写法 `-debug` / `-inprovider` / `-outprovider`(单横线长参数),
-        // 归一化为 `--xxx` 再交给 clap
+        // 兼容用户习惯写法 `-debug` / `-info` / `-inprovider` / `-outprovider`
+        // (单横线长参数)且**大小写不敏感**(clap 的 ignore_case 只作用于参数值,
+        // flag 拼写的大小写在启动归一化层处理):`-DEBUG` / `--Info` 等统一
+        // 归一化为规范 `--xxx` 再交给 clap。
+        let known_long_flags: &[(&str, &str)] = &[
+            ("debug", "debug"),
+            ("info", "info"),
+            ("inprovider", "inprovider"),
+            ("outprovider", "outprovider"),
+        ];
         let args: Vec<std::ffi::OsString> = std::env::args_os()
-            .map(|a| match a.to_str() {
-                Some("-debug") => "--debug".into(),
-                Some("-inprovider") => "--inprovider".into(),
-                Some("-outprovider") => "--outprovider".into(),
-                _ => a,
+            .map(|a| {
+                let Some(s) = a.to_str() else {
+                    return a;
+                };
+                let stripped = s.trim_start_matches('-');
+                let lower = stripped.to_ascii_lowercase();
+                // 仅归一化「长参数」形态(单/双横线 + 完整词),不碰 -p/-f 等短参数
+                if let Some((_, canonical)) =
+                    known_long_flags.iter().find(|(name, _)| *name == lower)
+                {
+                    std::ffi::OsString::from(format!("--{canonical}"))
+                } else {
+                    a
+                }
             })
             .collect();
         Cli::parse_from(args)
@@ -659,22 +688,78 @@ async fn main() -> Result<()> {
     let default_level = if is_tui { "warn" } else { "info" };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_level.into());
+    // Agent 运行日志文件(2026-09-17 第 69 轮):`--debug` / `--info`(含单横线与
+    // 大小写变体)时在工作目录生成 `llaew_{YYYYMMDD_HHMMSS}.log`(启动时刻命名),
+    // `--debug` → DEBUG 级,`--info` → INFO 级;文件创建失败静默降级不影响主流程。
+    // 组装方式:registry + 原控制台 fmt 层(行为不变)+ 文件 fmt 层(各自过滤)。
+    let agent_log: Option<(
+        tracing_subscriber::filter::LevelFilter,
+        lsm_agent::logging::AgentLogMaker,
+        std::path::PathBuf,
+    )> = if cli.debug || cli.info {
+        let level = if cli.debug {
+            tracing_subscriber::filter::LevelFilter::DEBUG
+        } else {
+            tracing_subscriber::filter::LevelFilter::INFO
+        };
+        let work_dir = std::env::current_dir()
+            .ok()
+            .or_else(|| Paths::detect().ok().map(|p| p.work_dir))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = lsm_agent::logging::startup_log_path(&work_dir);
+        match lsm_agent::logging::make_log_maker(&path) {
+            Some(maker) => Some((level, maker, path)),
+            None => {
+                eprintln!("[laew] 运行日志文件创建失败(已跳过): {}", path.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some((level, _, path)) = &agent_log {
+        // 提示走 stderr:-p 模式 stdout 只含答案与用量;TUI 横幅打印前输出也不破坏渲染
+        eprintln!(
+            "[laew] Agent 运行日志: {} (级别: {})",
+            path.display(),
+            if *level == tracing_subscriber::filter::LevelFilter::DEBUG {
+                "DEBUG"
+            } else {
+                "INFO"
+            }
+        );
+    }
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
     if is_tui {
         // F5(2026-09-10 第 25 轮):TUI 模式 WARN 级 tracing 原始行直写 stdout,
         // 与全量重绘交错破坏对话区布局(D06 实测 3 段 6 行 WARN 裸奔在屏上)。
         // 改写入 {根目录}/logs/laew-tui.log(追加,目录/文件创建失败则静默丢弃,
         // 不影响主流程);关键降级事件已由 orchestrator 的 [stage] 进度行呈现。
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
+        let console = tracing_subscriber::fmt::layer()
             .with_target(false)
             .with_writer(lsm_agent::tui::tui_log_writer())
-            .init();
+            .with_filter(env_filter);
+        match agent_log {
+            Some((level, maker, _)) => tracing_subscriber::registry()
+                .with(console)
+                .with(lsm_agent::logging::file_fmt_layer(maker, level))
+                .init(),
+            None => tracing_subscriber::registry().with(console).init(),
+        }
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
+        let console = tracing_subscriber::fmt::layer()
             .with_target(false)
             .with_writer(std::io::stderr)
-            .init();
+            .with_filter(env_filter);
+        match agent_log {
+            Some((level, maker, _)) => tracing_subscriber::registry()
+                .with(console)
+                .with(lsm_agent::logging::file_fmt_layer(maker, level))
+                .init(),
+            None => tracing_subscriber::registry().with(console).init(),
+        }
     }
 
     // 优先处理导入/导出命令
