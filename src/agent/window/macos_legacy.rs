@@ -112,6 +112,9 @@ extern "C" {
         keydown: bool,
     ) -> CFTypeRef;
     fn CGEventPost(tap: u32, event: CFTypeRef);
+    // 2026-09-17 第 70 轮:坐标动作(视觉路线)所需 —— 点击计数(双击)与 Unicode 键入。
+    fn CGEventSetIntegerValueField(event: CFTypeRef, field: u32, value: i64);
+    fn CGEventKeyboardSetUnicodeString(event: CFTypeRef, length: isize, string: *const u16);
 }
 
 const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
@@ -121,6 +124,16 @@ const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 0;
 const K_CG_HID_EVENT_TAP: u32 = 0;
 /// kCGEventMouseMoved。
 const K_CG_EVENT_MOUSE_MOVED: u32 = 5;
+// 2026-09-17 第 70 轮:kCGEventLeftMouseDown/Up=1/2,RightMouseDown/Up=3/4(来源 HIToolbox/Events.h)。
+const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+const K_CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
+const K_CG_EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
+const K_CG_EVENT_RIGHT_MOUSE_UP: u32 = 4;
+/// kCGMouseEventClickState 字段号:同一位置的点击计数(双击第 2 次点击置 2)。
+const K_CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
+/// 鼠标按键编号(左 0 / 右 1)。
+const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
+const K_CG_MOUSE_BUTTON_RIGHT: u32 = 1;
 
 // ===================== AX 字符串常量(字面量缓存,macOS 全版本通用) =====================
 //
@@ -161,7 +174,6 @@ struct AxStrings {
     focused: usize,
     press_action: usize,
     scroll_to_visible_action: usize,
-    trusted_check_prompt: usize,
     manual_accessibility: usize,
 }
 
@@ -186,7 +198,6 @@ fn ax_strings() -> &'static AxStrings {
             focused: cfstr_literal("AXFocused"),
             press_action: cfstr_literal("AXPress"),
             scroll_to_visible_action: cfstr_literal("AXScrollToVisible"),
-            trusted_check_prompt: cfstr_literal("AXTrustedCheckOptionPrompt"),
             manual_accessibility: cfstr_literal("AXManualAccessibility"),
         }
     })
@@ -252,10 +263,6 @@ fn kAXPressAction() -> CFStringRef {
 #[inline]
 fn kAXScrollToVisibleAction() -> CFStringRef {
     ax_strings().scroll_to_visible_action as CFStringRef
-}
-#[inline]
-fn kAXTrustedCheckOptionPrompt() -> CFStringRef {
-    ax_strings().trusted_check_prompt as CFStringRef
 }
 #[inline]
 fn kAXManualAccessibilityAttribute() -> CFStringRef {
@@ -391,6 +398,71 @@ unsafe fn cg_send_key(keycode: u16) {
     }
 }
 
+/// 在屏幕坐标 (x,y) 注入物理鼠标点击(2026-09-17 第 70 轮,坐标动作视觉路线)。
+/// 先移光标到位再按压;双击时第二次点击 clickState=2(应用按该字段判定双击语义)。
+unsafe fn cg_click_at(x: f64, y: f64, right: bool, double: bool) {
+    let (down, up, button) = if right {
+        (
+            K_CG_EVENT_RIGHT_MOUSE_DOWN,
+            K_CG_EVENT_RIGHT_MOUSE_UP,
+            K_CG_MOUSE_BUTTON_RIGHT,
+        )
+    } else {
+        (
+            K_CG_EVENT_LEFT_MOUSE_DOWN,
+            K_CG_EVENT_LEFT_MOUSE_UP,
+            K_CG_MOUSE_BUTTON_LEFT,
+        )
+    };
+    cg_move_cursor(x, y);
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let clicks = if double { 2 } else { 1 };
+    for seq in 1..=clicks {
+        for &mouse_type in &[down, up] {
+            let ev = CGEventCreateMouseEvent(
+                std::ptr::null(),
+                mouse_type,
+                CGPoint { x, y },
+                button,
+            );
+            if ev.is_null() {
+                return;
+            }
+            if double {
+                CGEventSetIntegerValueField(ev, K_CG_MOUSE_EVENT_CLICK_STATE, seq as i64);
+            }
+            CGEventPost(K_CG_HID_EVENT_TAP, ev);
+            CFRelease(ev);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if double {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    }
+}
+
+/// 向当前焦点控件真实键入文本(2026-09-17 第 70 轮)。
+/// CGEventKeyboardSetUnicodeString 按 UTF-16 直达,无键盘布局/IME 依赖;
+/// 单个事件携带 ≤20 个 UTF-16 单元,分批注入(SendInput Unicode 的 macOS 对偶)。
+unsafe fn cg_type_text(text: &str) {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    for chunk in units.chunks(20) {
+        for &keydown in &[true, false] {
+            let ev = CGEventCreateKeyboardEvent(std::ptr::null(), 0, keydown);
+            if ev.is_null() {
+                return;
+            }
+            CGEventKeyboardSetUnicodeString(ev, chunk.len() as isize, chunk.as_ptr());
+            CGEventPost(K_CG_HID_EVENT_TAP, ev);
+            CFRelease(ev);
+            if keydown {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// CFNumberRef → i64。
 unsafe fn cfnum_i64(n: CFTypeRef) -> i64 {
     let mut out: i64 = 0;
@@ -488,34 +560,33 @@ impl MacOsDriver {
         }
     }
 
-    /// 2026-09-16 第 60 轮:主动触发系统授权弹窗,返回用户是否已授权。
+    /// 2026-09-16 第 60 轮:主动触发系统授权引导,返回用户是否已授权。
     ///
-    /// 内部实现:调用 `AXIsProcessTrustedWithOptions` 并传入
-    /// `{kAXTrustedCheckOptionPrompt: true}`,系统会弹出授权对话框。
-    /// 用户点击「打开系统设置」后可手动添加终端到辅助功能白名单。
+    /// 2026-09-17 第 70 轮改版:不再调用带 `{kAXTrustedCheckOptionPrompt: true}` 的
+    /// `AXIsProcessTrustedWithOptions` —— macOS 26.5 未授权进程走该路径会在
+    /// HIServices 内部 SIGSEGV 连带崩掉主进程(C 探针实测,详见函数体注释)。
+    /// 现行为:先静默探测;未授权则进程外 `open` 系统设置的辅助功能面板引导用户。
     ///
     /// 返回值:
-    /// - `true`:用户已授权(弹窗前已授权,或弹窗后用户授权)
-    /// - `false`:用户未授权(拒绝、忽略、或弹窗后仍未授权)
+    /// - `true`:已授权
+    /// - `false`:未授权(已拉起系统设置面板,等待用户操作;轮询方静默感知授权变化)
     unsafe fn request_permission_internal() -> bool {
-        let key = kAXTrustedCheckOptionPrompt();
-        let val: CFBooleanRef =
-            core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
-        let keys = [key as CFTypeRef];
-        let vals = [val as CFTypeRef];
-        let dict = core_foundation::dictionary::CFDictionaryCreate(
-            std::ptr::null(),
-            keys.as_ptr() as *const *const std::ffi::c_void,
-            vals.as_ptr() as *const *const std::ffi::c_void,
-            1,
-            std::ptr::null(),
-            std::ptr::null(),
-        );
-        let ok = AXIsProcessTrustedWithOptions(dict);
-        if !dict.is_null() {
-            CFRelease(dict.cast());
+        // 2026-09-17 第 70 轮:先静默探测(NULL options,macOS 26.5 实测安全);
+        // 已授权直接返回,不进入弹窗路径。
+        if Self::trusted_quiet() {
+            return true;
         }
-        ok != 0
+        // macOS 26.5(25F71)实测(C 探针 /tmp/ax_probe.c 复现):未授权进程调用带
+        // `{kAXTrustedCheckOptionPrompt: true}` 字典的 AXIsProcessTrustedWithOptions
+        // 会在 HIServices 内部 SIGSEGV(CFGetTypeID 野指针),**整个进程连带崩溃** ——
+        // 主进程绝不能冒这个险。改为进程外打开系统设置的辅助功能面板:
+        // `open` 命令无崩溃风险,用户操作路径等价(勾选终端 → 授权生效),
+        // 授权状态变化由 is_ax_trusted_with_retry 的静默轮询感知。
+        // 非 GUI 会话(SSH/CI)下 open 可能失败,忽略错误静默降级。
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn();
+        false
     }
 
     /// 公开接口:主动请求辅助功能授权(触发系统弹窗)。
@@ -577,19 +648,15 @@ impl MacOsDriver {
             }
         }
         let start = std::time::Instant::now();
-        let mut last_prompt_at = start;
         loop {
             let elapsed = start.elapsed().as_secs();
             if elapsed >= wait_secs {
                 on_progress(elapsed, false);
                 return (false, elapsed);
             }
-            if prompt && last_prompt_at.elapsed().as_secs() >= 10 {
-                unsafe {
-                    let _ = Self::request_permission_internal();
-                }
-                last_prompt_at = std::time::Instant::now();
-            }
+            // 2026-09-17 第 70 轮:移除旧的「每 10s 重触发弹窗」——弹窗路径已改为
+            // 进程外 open 系统设置面板(见 request_permission_internal),周期性重触发
+            // 会反复拉起系统设置干扰用户;入口处的首次触发已足够。
             // 每 2 秒静默轮询 + 进度回报
             let poll_deadline = start + std::time::Duration::from_secs(elapsed + 2);
             let now = std::time::Instant::now();
@@ -1087,6 +1154,39 @@ impl WindowDriver for MacOsDriver {
                     } else {
                         Err(platform_err("macos", ax_error_text(err)))
                     }
+                }
+                // ===== 2026-09-17 第 70 轮:补齐第 67 轮坐标动作(视觉路线)的 macOS 路径 =====
+                // 此前仅 windows.rs(SendInput)实现了 5 个坐标变体,本 match 漏覆盖导致
+                // 编译失败(E0004)→ rebuild 脚本中止 → 产物不更新。
+                // 坐标动作用屏幕绝对坐标,与 path 控件无关(path 恒传 "/",el 为窗口根)。
+                ControlAction::ClickPoint { x, y } => {
+                    cg_click_at(*x as f64, *y as f64, false, false);
+                    Ok(format!("已在屏幕坐标 ({x},{y}) 执行物理左键单击(CGEvent)"))
+                }
+                ControlAction::DoubleClickPoint { x, y } => {
+                    cg_click_at(*x as f64, *y as f64, false, true);
+                    Ok(format!("已在屏幕坐标 ({x},{y}) 执行物理双击(CGEvent,clickState=2)"))
+                }
+                ControlAction::RightClickPoint { x, y } => {
+                    cg_click_at(*x as f64, *y as f64, true, false);
+                    Ok(format!("已在屏幕坐标 ({x},{y}) 执行物理右键单击(CGEvent)"))
+                }
+                ControlAction::ScrollPoint { x, y, lines } => {
+                    cg_move_cursor(*x as f64, *y as f64);
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    cg_scroll_lines(*lines);
+                    Ok(format!(
+                        "已在 ({x},{y}) 滚动 {} 行({})",
+                        lines.abs(),
+                        if *lines > 0 { "向上" } else { "向下" }
+                    ))
+                }
+                ControlAction::TypeText(text) => {
+                    cg_type_text(text);
+                    Ok(format!(
+                        "已向当前焦点控件真实键入 {} 字符(CGEvent Unicode)",
+                        text.chars().count()
+                    ))
                 }
             };
             CFRelease(el);

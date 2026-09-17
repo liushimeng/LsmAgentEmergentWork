@@ -163,8 +163,14 @@ echo "[rebuild] 当前代码: $(git log -1 --format='%h %ci %s' 2>/dev/null || e
 echo "[rebuild] 产物版本: $("$ROOT_DIR/laew" --version)"
 
 # 7) PATH 解析提示: 直接敲 `laew` 时命中的可能不是刚构建的产物
+# 2026-09-17 第 70 轮:先解析符号链接(realpath)再比对 —— 常见部署
+# `/opt/homebrew/bin/laew -> 工程根/laew` 实际就是刚构建的产物,字符串直比会误报。
 PATH_HIT="$(command -v laew 2>/dev/null || true)"
-if [[ -n "$PATH_HIT" && "$PATH_HIT" != "$ROOT_DIR/laew" ]]; then
+PATH_RESOLVED=""
+if [[ -n "$PATH_HIT" ]]; then
+  PATH_RESOLVED="$(realpath "$PATH_HIT" 2>/dev/null || readlink -f "$PATH_HIT" 2>/dev/null || echo "$PATH_HIT")"
+fi
+if [[ -n "$PATH_HIT" && "$PATH_RESOLVED" != "$ROOT_DIR/laew" ]]; then
   echo "" >&2
   echo "[rebuild] ⚠️  ============================================================" >&2
   echo "[rebuild] ⚠️  PATH 中的 laew 解析到: $PATH_HIT" >&2

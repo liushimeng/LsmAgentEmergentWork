@@ -122,16 +122,23 @@ echo [rebuild] artifact version:
 "%ROOT_DIR%\laew.exe" --version
 
 rem ---------- 7) PATH resolution hint ----------
+rem 2026-09-17 round 70: PATH entry may be a symlink pointing at the fresh
+rem artifact; compare --version output instead of path strings to avoid false alarm.
 set "PATH_HIT="
 for /f "delims=" %%p in ('where laew 2^>nul') do if not defined PATH_HIT set "PATH_HIT=%%p"
 if defined PATH_HIT if /i not "%PATH_HIT%"=="%ROOT_DIR%\laew.exe" (
-  echo.
-  echo [rebuild] WARN: ============================================================
-  echo [rebuild] WARN: PATH resolves laew to: !PATH_HIT!
-  echo [rebuild] WARN: which differs from the fresh build: %ROOT_DIR%\laew.exe
-  echo [rebuild] WARN: typing 'laew' may hit an older binary
-  echo [rebuild] WARN: use absolute path '%ROOT_DIR%\laew.exe' or fix PATH
-  echo [rebuild] WARN: ============================================================
+  set "V_PATH=" & set "V_LOCAL="
+  for /f "delims=" %%v in ('laew --version 2^>nul') do if not defined V_PATH set "V_PATH=%%v"
+  for /f "delims=" %%v in ('"%ROOT_DIR%\laew.exe" --version 2^>nul') do if not defined V_LOCAL set "V_LOCAL=%%v"
+  if /i not "!V_PATH!"=="!V_LOCAL!" (
+    echo.
+    echo [rebuild] WARN: ============================================================
+    echo [rebuild] WARN: PATH resolves laew to: !PATH_HIT!  version: !V_PATH!
+    echo [rebuild] WARN: which differs from the fresh build: !V_LOCAL!
+    echo [rebuild] WARN: typing 'laew' may hit an older binary
+    echo [rebuild] WARN: use absolute path '%ROOT_DIR%\laew.exe' or fix PATH
+    echo [rebuild] WARN: ============================================================
+  )
 )
 
 echo [rebuild] output: %ROOT_DIR%\laew.exe

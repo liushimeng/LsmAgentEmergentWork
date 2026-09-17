@@ -205,6 +205,28 @@ impl WindowDriver for MacosAxuiDriver {
                     })?;
                 Ok("scrolled_to_visible".into())
             }
+            // 2026-09-17 第 70 轮:第 67 轮坐标动作(视觉路线)在 macos-axui 路径未实现,
+            // 返回结构化引导(默认构建走 legacy 驱动,第 69 轮起已支持 CGEvent 全套坐标动作)。
+            point @ (ControlAction::ClickPoint { .. }
+            | ControlAction::DoubleClickPoint { .. }
+            | ControlAction::RightClickPoint { .. }
+            | ControlAction::ScrollPoint { .. }) => {
+                return Err(platform_err(
+                    self.platform_name(),
+                    format!(
+                        "{point:?} 在 macos-axui 路径暂未实现;\
+                         默认 legacy 驱动已支持(CGEvent 物理输入,第 69 轮),请移除 --features macos-axui 构建;\
+                         或降级 Bash 白名单 osascript/cliclick"
+                    ),
+                ));
+            }
+            ControlAction::TypeText(_) => {
+                return Err(platform_err(
+                    self.platform_name(),
+                    "type_text 在 macos-axui 路径暂未实现(无 CGEvent Unicode 键入);\
+                     默认 legacy 驱动已支持,或改用 set_text / Bash 白名单 osascript keystroke",
+                ));
+            }
         }
     }
 

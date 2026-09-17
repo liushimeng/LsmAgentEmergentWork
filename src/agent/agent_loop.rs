@@ -135,7 +135,7 @@ impl Agent {
         const NO_TOOL_USE_THRESHOLD: usize = 3;
         let mut consecutive_no_tool_rounds: usize = 0;
 
-        // Agent 会话开始(2026-09-17 第 69 轮运行日志):--debug/--info 日志文件的
+        // Agent 会话开始(2026-09-17 第 70 轮运行日志):--debug/--info 日志文件的
         // 角色级起点事件;所有 11 个角色都经本函数,一处埋点全角色覆盖。
         info!(
             agent = %self.profile.name,
@@ -190,7 +190,7 @@ impl Agent {
             } else {
                 format!("{base_system}{workspace_hint}{runtime_hints}")
             };
-            // LLM 请求(2026-09-17 第 69 轮运行日志):--debug 级记录每轮请求元信息,
+            // LLM 请求(2026-09-17 第 70 轮运行日志):--debug 级记录每轮请求元信息,
             // 排查「模型看到了什么」(消息条数/system 规模/强制工具/输出上限)。
             debug!(
                 agent = %self.profile.name,
@@ -224,7 +224,7 @@ impl Agent {
                 .cache_creation_input_tokens
                 .saturating_add(completion.usage.cache_creation_input_tokens);
 
-            // LLM 响应(2026-09-17 第 69 轮运行日志):思考文本(assistant 可见文本)+
+            // LLM 响应(2026-09-17 第 70 轮运行日志):思考文本(assistant 可见文本)+
             // 工具调用意图逐条记录 —— 排查「模型想了什么、打算做什么」的核心事件。
             {
                 let calls_desc = completion
@@ -273,6 +273,29 @@ impl Agent {
                 // 调用则提前终止,把失败信息返回 Runner/QC 而不是空跑 16 轮。
                 consecutive_no_tool_rounds += 1;
                 if consecutive_no_tool_rounds >= NO_TOOL_USE_THRESHOLD {
+                    // 2026-09-17 第 70 轮:已有工具调用产出时降级为「优雅收尾」。
+                    // 第 68 轮 P1-C 的 no_tool_use 硬失败针对「全程 0 工具调用的空跑」;
+                    // 但 WebUse/WindowUse 常见合法路径是「先完成工具动作、再输出终答文本」,
+                    // 配合 nudge(1..=6 轮)会把终答反复顶回,计数到 3 后硬失败 ——
+                    // 真实成果被 early_terminate 吞掉(e2e 5e-1 回归:BrowserNew 已执行,
+                    // MOCK_FINAL_ANSWER 终答被判 failed)。改为正常 finalize 交 QC 判定,
+                    // 仅 trace.tool_calls == 0 时保留硬失败语义(防 forced tool + nudge
+                    // 双失效时空跑 max_iterations,第 68 轮本意)。
+                    if trace.tool_calls > 0 {
+                        info!(
+                            rounds = consecutive_no_tool_rounds,
+                            tool_calls = trace.tool_calls,
+                            "连续文本轮但本单元已有工具调用,按正常收尾处理(交 QC 判定)"
+                        );
+                        return Self::finalize_with_forced_flag(
+                            &self.profile.name,
+                            trace,
+                            &accumulated_text,
+                            total_usage,
+                            max_tokens_state.as_ref(),
+                            forced_tool_maybe_effective,
+                        );
+                    }
                     warn!(
                         rounds = consecutive_no_tool_rounds,
                         total_iters = iter + 1,
@@ -483,7 +506,7 @@ impl Agent {
                     continue;
                 }
 
-                // 工具调用(2026-09-17 第 69 轮运行日志):名称 + 参数(截断)入日志,
+                // 工具调用(2026-09-17 第 70 轮运行日志):名称 + 参数(截断)入日志,
                 // 所有角色所有工具(Bash/Read/Write/Window*/Browser*)统一经此记录。
                 info!(
                     agent = %self.profile.name,
@@ -572,7 +595,7 @@ impl Agent {
                 if name == "Bash" {
                     trace.record_bash_exit_code(&output);
                 }
-                // 工具结果(2026-09-17 第 69 轮运行日志):成功/失败都记录,且早于
+                // 工具结果(2026-09-17 第 70 轮运行日志):成功/失败都记录,且早于
                 // RepeatedToolFailure 等提前返回,保证失败调用的结果也不丢日志。
                 info!(
                     agent = %self.profile.name,
@@ -889,7 +912,7 @@ impl Agent {
     /// 2026-09-16 第 68 轮 P1-B:包装 finalize,写入 forced_tool_effective 字段。
     /// 所有正常/提前返回路径统一经本函数,确保 trace.forced_tool_effective 被填充。
     ///
-    /// 2026-09-17 第 69 轮:同时作为 Agent 会话结束日志的单一收口
+    /// 2026-09-17 第 70 轮:同时作为 Agent 会话结束日志的单一收口
     /// (迭代数 / 工具成败计数 / 提前终止原因 / 用量)。
     fn finalize_with_forced_flag(
         agent_name: &str,
