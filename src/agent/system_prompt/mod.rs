@@ -537,6 +537,11 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
 - 描述实际产出与 expected_output 的对应关系
 - 列出用到的关键工具调用(简要)
 - 失败时明确指出原因
+- ★ 内容直显(2026-09-17 第 79 轮):单元要求「显示/展示/返回/告诉用户」某内容时,
+  最终回答必须直接包含该内容本身(文本 200-8000 字原样贴出,超长贴关键部分并注明
+  总长度);禁止只写「已保存到 <路径>」「内容已提取,共 N 字符」等路径/占位描述——
+  用户在终端只能看到你的回答,看不到文件;文件落盘仅作补充产物一并说明。
+  截图等二进制产物例外:给出路径 + 大小 + 简述
 
 重要规则:
 - 不要尝试规划下一步
@@ -612,6 +617,10 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 - 实际输出是否回应了 expected_output 的所有要点
 - 是否遗漏关键步骤
 - 是否包含错误信息
+- 内容展示类检查(2026-09-17 第 79 轮):单元输入要求「显示/展示/返回/告诉用户」
+  某内容时,实际输出必须包含该内容本身(或其关键部分);仅回答「已保存到 <路径>」
+  「已提取 N 字符」等路径/占位描述而未贴出内容 → 判 fail(retryable=true,
+  issue 写明「终答必须直接包含目标内容」)
 - retryable=true 如果只是局部不完整;retryable=false 如果整体方向错误
 
 【Main-Work 单元】
@@ -962,6 +971,9 @@ const WEB_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Chromium-WebUse
 作业规范(严格遵守):
 1. 先开页后操作:BrowserNew 打开页面拿到 page_id → BrowserControl 执行动作 →
    BrowserInspect 观察结果;page_id 是后续所有调用的句柄,务必保存;
+   ★ 多轮复用(2026-09-17 第 79 轮):若输入含「已打开的浏览器页面」列表,
+   优先直接操作这些页面(免重新打开/登录),仅当任务需要其它网址或页面失效
+   (code=2000)时才 BrowserNew 新开;
 2. 元素定位一律用 CSS selector(+可选 nth);操作失败(code=2002)时换 selector 或换
    input_text 的 use_js 路径重试,不要重复完全相同的失败调用;
 3. 点击链接 / window.open 派生新标签页时,响应会携带 spawned_page_id,
@@ -973,7 +985,12 @@ const WEB_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Chromium-WebUse
    DOM/outerHTML 提取注意 truncated 标记,被截断时缩小 selector 或 max_depth 分段提取;
 6. 安全红线:禁止对疑似支付/删除/确认提交类按钮做无把握点击;登录凭证只填入用户明确
    提供的账号密码,不要编造;只读优先——能用 BrowserInspect 回答的问题不做任何写操作;
-7. 任务完成后用 BrowserClose 关闭不再需要的页面,释放内存。
+7. 任务完成后关闭**确定不再需要**的页面释放内存;对话型页面(文心一言/ChatGPT 等,
+   用户可能继续追问)**可保留不关**——后续任务会通过「已打开的浏览器页面」列表自动复用,
+   进程退出时浏览器自动回收;
+8. 高级交互(2026-09-17 第 79 轮提示):拖拽用 action=drag(source_selector→target_selector);
+   悬停菜单/tooltip 用 hover 或 mouse_move;受控组件输入不生效时用 dispatch_event
+   (input/change)或 focus 后再 input_text。
 
 完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
 "#;
@@ -996,7 +1013,8 @@ fn web_use_tools_hint() -> &'static str {
        click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/\
        press_sequence/input_text/human_input/clear_input/upload_file/select_option/\
        new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/\
-       set_storage/clear_storage/set_viewport/screenshot/heartbeat\n\
+       set_storage/clear_storage/set_viewport/screenshot/heartbeat\
+       /drag(拖拽)/focus/blur(焦点)/mouse_move(纯移动)/dispatch_event(自定义DOM事件)\n\
      - BrowserInspect(page_id, info, params): 只读观察统一入口,info 枚举:\
        console/network/elements/dom/localstorage/sessionstorage/cookies/screenshot/\
        page_meta/viewport/url/title/ping/image_urls\n\

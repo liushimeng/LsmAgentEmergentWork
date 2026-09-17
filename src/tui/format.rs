@@ -271,13 +271,21 @@ pub fn format_task_result(
                     }
                     let elapsed = format!("{:.2}s", tc.elapsed_ms as f64 / 1000.0);
                     let detail = if tc.ok {
-                        // 仅 Window* 工具展示成功输出摘要;避免普通 SubAgent / Emit
-                        // 的 Markdown 原文在 trace 区再次出现,破坏富文本渲染测试。
-                        if tc.tool.starts_with("Window") && !tc.output_summary.trim().is_empty() {
-                            let ok_short = truncate_chars(&tc.output_summary, 80);
-                            format!(" → {}", if styled { sv(&ok_short) } else { ok_short })
+                        // Window*/Browser* 工具展示成功输出摘要;Browser* 走信封精简
+                        // (★第 79 轮 P2-5:code/message/page_id/text_len 等要素,避免
+                        // 原始 JSON 转义噪声刷屏)。普通 SubAgent / Emit 的 Markdown
+                        // 原文不重复出现(破坏富文本渲染测试)。
+                        let ok_brief: Option<String> = if tc.tool.starts_with("Browser") {
+                            browser_output_brief(&tc.output_summary)
+                        } else if tc.tool.starts_with("Window") && !tc.output_summary.trim().is_empty()
+                        {
+                            Some(truncate_chars(&tc.output_summary, 80))
                         } else {
-                            String::new()
+                            None
+                        };
+                        match ok_brief.filter(|b| !b.trim().is_empty()) {
+                            Some(b) => format!(" → {}", if styled { sv(&b) } else { b }),
+                            None => String::new(),
                         }
                     } else {
                         // 失败时附错误摘要(供一眼看出"为什么失败")
@@ -551,11 +559,18 @@ pub fn format_failed_detail(
                     }
                     let elapsed = format!("{:.2}s", tc.elapsed_ms as f64 / 1000.0);
                     let detail = if tc.ok {
-                        if tc.tool.starts_with("Window") && !tc.output_summary.trim().is_empty() {
-                            let ok_short = truncate_chars(&tc.output_summary, 80);
-                            format!(" → {}", sv(&ok_short))
+                        // ★第 79 轮 P2-5:Browser* 走信封精简摘要(同 format_task_result 段)
+                        let ok_brief: Option<String> = if tc.tool.starts_with("Browser") {
+                            browser_output_brief(&tc.output_summary)
+                        } else if tc.tool.starts_with("Window") && !tc.output_summary.trim().is_empty()
+                        {
+                            Some(truncate_chars(&tc.output_summary, 80))
                         } else {
-                            String::new()
+                            None
+                        };
+                        match ok_brief.filter(|b| !b.trim().is_empty()) {
+                            Some(b) => format!(" → {}", sv(&b)),
+                            None => String::new(),
                         }
                     } else {
                         let err_short = truncate_chars(&tc.error_summary, 80);
@@ -874,8 +889,92 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
                 .unwrap_or_default();
             format!("query={}", truncate_chars(&q, 32))
         }
+        // ★ 2026-09-17 第 79 轮 P2-5:Browser* 工具差异化简报。
+        // WebUse 是第 11 角色的主工具面,统一信封 JSON 截 80 噪声大;
+        // 突出「定位(page_id/url)+ 意图(action/info)」两要素。
+        "BrowserNew" => {
+            let url = extract_json_field(args_json, "url").unwrap_or_default();
+            if url.is_empty() {
+                truncate_chars(args_json, 60)
+            } else {
+                format!("url={}", truncate_chars(&url, 44))
+            }
+        }
+        "BrowserControl" => {
+            let pid = extract_json_field(args_json, "page_id").unwrap_or_default();
+            let action = extract_json_field(args_json, "action").unwrap_or_default();
+            if pid.is_empty() && action.is_empty() {
+                truncate_chars(args_json, 60)
+            } else {
+                format!(
+                    "{} action={}",
+                    truncate_chars(&pid, 12),
+                    truncate_chars(&action, 18)
+                )
+            }
+        }
+        "BrowserInspect" => {
+            let pid = extract_json_field(args_json, "page_id").unwrap_or_default();
+            let info = extract_json_field(args_json, "info").unwrap_or_default();
+            if pid.is_empty() && info.is_empty() {
+                truncate_chars(args_json, 60)
+            } else {
+                format!(
+                    "{} info={}",
+                    truncate_chars(&pid, 12),
+                    truncate_chars(&info, 18)
+                )
+            }
+        }
+        "BrowserClose" | "BrowserList" => {
+            let pid = extract_json_field(args_json, "page_id").unwrap_or_default();
+            if pid.is_empty() {
+                truncate_chars(args_json, 40)
+            } else {
+                truncate_chars(&pid, 12)
+            }
+        }
         _ => truncate_chars(args_json, 80),
     }
+}
+
+/// ★ 2026-09-17 第 79 轮 P2-5:Browser 工具成功输出的信封精简摘要。
+///
+/// Browser* 工具返回 `{code,message,data}` JSON 信封,原始 output_summary 截 80
+/// 全是转义噪声。这里解析信封后拼「code/message + 关键 data 字段」:
+/// page_id / url / title / spawned_page_id / 文本长度(text·outer_html 等字段)。
+/// 解析失败回退 None(调用方走普通截断)。
+pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(output_summary.trim()).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let mut parts: Vec<String> = vec![format!("code={code}")];
+    if !message.is_empty() {
+        parts.push(truncate_chars(message, 24));
+    }
+    if let Some(d) = data.as_object() {
+        for key in ["page_id", "url", "title", "spawned_page_id"] {
+            if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
+                if !s.is_empty() {
+                    parts.push(format!("{key}={}", truncate_chars(s, 30)));
+                }
+            }
+        }
+        // 文本类字段只报长度(内容本身不该在 trace 区刷屏)
+        for key in ["text", "outer_html", "markdown", "content"] {
+            if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
+                let n = s.chars().count();
+                if n > 0 {
+                    parts.push(format!("{key}_len={n}"));
+                }
+            }
+        }
+    }
+    Some(parts.join(" "))
 }
 
 /// 极简 JSON 字段提取 —— 仅支持 string 值,无需 serde 完整解析。
@@ -1014,6 +1113,66 @@ mod tool_args_brief_tests {
         let json = r#"{"k":"v"}"#;
         let brief = tool_args_brief("SomeUnknownTool", json);
         assert!(brief.len() <= 81); // 80 + …
+    }
+
+    // ========== 2026-09-17 第 79 轮 P2-5:Browser* 工具简报 ==========
+
+    #[test]
+    fn browser_new_brief_extracts_url() {
+        let json = r#"{"url":"https://wenxin.baidu.com/","mode":"hidden"}"#;
+        let brief = tool_args_brief("BrowserNew", json);
+        assert!(brief.starts_with("url="), "BrowserNew brief 应以 url= 开头,实际: {brief}");
+        assert!(brief.contains("wenxin.baidu.com"));
+    }
+
+    #[test]
+    fn browser_control_brief_combines_page_id_and_action() {
+        let json = r#"{"page_id":"p_ab12cd34","action":"input_text","params":{"selector":"textarea","text":"你好"}}"#;
+        let brief = tool_args_brief("BrowserControl", json);
+        assert!(brief.contains("p_ab12cd34"), "应含 page_id: {brief}");
+        assert!(brief.contains("action=input_text"), "应含 action: {brief}");
+        assert!(!brief.contains("你好"), "params 正文不应刷屏: {brief}");
+    }
+
+    #[test]
+    fn browser_inspect_brief_combines_page_id_and_info() {
+        let json = r#"{"page_id":"p_ab12cd34","info":"elements","params":{"selector":"[class*=answer]"}}"#;
+        let brief = tool_args_brief("BrowserInspect", json);
+        assert!(brief.contains("p_ab12cd34"));
+        assert!(brief.contains("info=elements"));
+    }
+
+    #[test]
+    fn browser_close_brief_is_page_id_only() {
+        let json = r#"{"page_id":"p_ff00ee11"}"#;
+        let brief = tool_args_brief("BrowserClose", json);
+        assert_eq!(brief, "p_ff00ee11");
+    }
+
+    #[test]
+    fn browser_output_brief_parses_envelope() {
+        let env = r#"{"code":0,"message":"ok","data":{"page_id":"p_ab12cd34","title":"文心一言","url":"https://wenxin.baidu.com/"}}"#;
+        let brief = browser_output_brief(env).expect("信封应可解析");
+        assert!(brief.contains("code=0"), "应含 code: {brief}");
+        assert!(brief.contains("page_id=p_ab12cd34"), "应含 page_id: {brief}");
+        assert!(brief.contains("文心一言"), "应含 title: {brief}");
+    }
+
+    #[test]
+    fn browser_output_brief_reports_text_len_not_content() {
+        let long_text = "黄".repeat(600);
+        let env = format!(
+            r#"{{"code":0,"message":"ok","data":{{"text":"{long_text}"}}}}"#
+        );
+        let brief = browser_output_brief(&env).expect("信封应可解析");
+        assert!(brief.contains("text_len=600"), "应报文本长度: {brief}");
+        assert!(!brief.matches('黄').count() > 5, "正文不应刷屏: {brief}");
+    }
+
+    #[test]
+    fn browser_output_brief_non_json_returns_none() {
+        assert!(browser_output_brief("").is_none());
+        assert!(browser_output_brief("plain text").is_none());
     }
 }
 

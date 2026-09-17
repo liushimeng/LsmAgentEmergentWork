@@ -449,78 +449,129 @@ pub fn infer_suggested_delegate(user_prompt: &str) -> Option<String> {
 /// 优先匹配 ```json ... ``` 代码块;找不到则尝试匹配最大合法 JSON 对象。
 /// 直接解析失败时自动走 JSON 修复链(`json_repair`,Tier-1 语法修复),
 /// 修复不了仍返回 YoloParse(fail-closed 不变)。
+///
+/// ★ 2026-09-17 第 79 轮 P0-2:多候选提取。此前只试「第一个 ```json 块」和
+/// 「第一个顶层 `{`」,LLM 在 JSON 前后夹带回显内容(用户输入含 HTML 围栏时高发,
+/// 实测 llaew_20260917_135249.log 两轮输入全部降级)就直接放弃 → 降级 simple。
+/// 现在遍历**全部** ```json 块 + **全部**顶层平衡 `{...}` 候选,逐个过修复链,
+/// 首个可解析者胜出;全部失败才 YoloParse(错误信息含候选数,便于日志定位)。
 pub fn parse_classification(text: &str) -> Result<TaskClassification> {
-    if let Some(json_str) = extract_json_block(text) {
+    // 候选按优先级排序:显式 ```json 块在前(模型明示意图),裸 `{}` 对象在后。
+    let mut candidates: Vec<&str> = extract_all_json_blocks(text);
+    candidates.extend(extract_all_json_objects(text));
+    let total = candidates.len();
+    let mut last_err = String::new();
+    for (idx, json_str) in candidates.iter().enumerate() {
         // Yolo 路径:启用 Tier-2 截断补全(LLM 输出被 token 触顶截断的场景),
         // 仅在 Quality-Check fail-closed 路径禁用。关联报告: 2026-09-09_04 D-001。
-        return crate::agent::json_repair::try_parse_lenient(json_str)
-            .map_err(AgentError::YoloParse);
+        match crate::agent::json_repair::try_parse_lenient::<TaskClassification>(json_str) {
+            Ok(c) => {
+                if idx > 0 {
+                    tracing::debug!(candidate = idx, "Yolo 多候选提取命中非首选候选");
+                }
+                return Ok(c);
+            }
+            Err(e) => last_err = e,
+        }
     }
-    if let Some(json_str) = extract_standalone_json(text) {
-        return crate::agent::json_repair::try_parse_lenient(json_str)
-            .map_err(AgentError::YoloParse);
-    }
-    Err(AgentError::YoloParse(
-        "未找到合法的 JSON 分类结果".to_string(),
-    ))
+    Err(AgentError::YoloParse(format!(
+        "未找到合法的 JSON 分类结果(共尝试 {total} 个候选;最后错误: {last_err})"
+    )))
 }
 
-/// 提取第一个 ```json ... ``` 代码块中的内容。
-fn extract_json_block(text: &str) -> Option<&str> {
+/// 提取**全部** ```json ... ``` 代码块中的内容(第 79 轮:单块 → 多块迭代)。
+fn extract_all_json_blocks(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
     let start_marker = "```json";
-    let start = text.find(start_marker)?;
-    let content_start = start + start_marker.len();
-    let content_start = text[content_start..]
-        .find(|c: char| !c.is_whitespace())
-        .map(|i| content_start + i)
-        .unwrap_or(content_start);
-    let end_marker = "```";
-    let end = text[content_start..].find(end_marker)?;
-    let json_text = &text[content_start..content_start + end];
-    let json_text = json_text.trim();
-    if json_text.is_empty() {
-        None
-    } else {
-        Some(json_text)
+    let mut rest = text;
+    // 起点(字节偏移),用于把子串结果映射回原 text 的切片。
+    let mut base = 0usize;
+    while let Some(rel) = rest.find(start_marker) {
+        let start = base + rel;
+        let content_start = start + start_marker.len();
+        let content_start = text[content_start..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|i| content_start + i)
+            .unwrap_or(content_start);
+        let Some(end_rel) = text[content_start..].find("```") else {
+            break; // 无闭合围栏:后面的块也不可能闭合
+        };
+        let json_text = text[content_start..content_start + end_rel].trim();
+        if !json_text.is_empty() {
+            out.push(json_text);
+        }
+        // 从闭合围栏之后继续找下一个块。
+        let next_base = content_start + end_rel + 3;
+        if next_base >= text.len() {
+            break;
+        }
+        rest = &text[next_base..];
+        base = next_base;
     }
+    out
 }
 
-/// 尝试提取文本中第一个顶层合法 JSON 对象。
-fn extract_standalone_json(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut end = None;
-    for (i, c) in text[start..].char_indices() {
-        if escape {
-            escape = false;
+/// 提取**全部**顶层平衡 `{...}` 候选(第 79 轮:首个 → 全部)。
+///
+/// 跳过字符串字面量内的花括号;从某个 `{` 出发未平衡(前置噪声花括号吞掉后续)
+/// 时**从下一个 `{` 重试**而非放弃——保证噪声段落不会遮蔽后面的真实 JSON。
+fn extract_all_json_objects(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
             continue;
         }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(start + i + 1);
-                    break;
+        let start = i;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut end = None;
+        let mut j = i;
+        while j < bytes.len() {
+            let c = bytes[j] as char;
+            if escape {
+                escape = false;
+                j += 1;
+                continue;
+            }
+            if c == '\\' && in_string {
+                escape = true;
+                j += 1;
+                continue;
+            }
+            if c == '"' {
+                in_string = !in_string;
+                j += 1;
+                continue;
+            }
+            if !in_string {
+                if c == '{' {
+                    depth += 1;
+                } else if c == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(j + 1);
+                        break;
+                    }
                 }
             }
-            _ => {}
+            j += 1;
+        }
+        match end {
+            Some(e) => {
+                out.push(&text[start..e]);
+                i = e; // 从闭合 `}` 之后继续扫下一个候选
+            }
+            None => {
+                // 未平衡:该 `{` 是噪声,从它的下一个字符重试后续 `{`
+                i = start + 1;
+            }
         }
     }
-    end.map(|e| &text[start..e])
+    out
 }
 
 /// 把 TaskClassification 转成 work prompt 文本(用于把分类结果作为下一步 user 消息)。
@@ -627,21 +678,76 @@ mod tests {
     #[test]
     fn extract_json_block_basic() {
         let text = "一些前置文本\n```json\n{\"key\": \"value\"}\n```\n后续文本";
-        let result = extract_json_block(text).unwrap();
-        assert_eq!(result, "{\"key\": \"value\"}");
+        let blocks = extract_all_json_blocks(text);
+        assert_eq!(blocks, vec!["{\"key\": \"value\"}"]);
     }
 
     #[test]
     fn extract_json_block_no_block() {
         let text = "没有 JSON 代码块的普通文本";
-        assert!(extract_json_block(text).is_none());
+        assert!(extract_all_json_blocks(text).is_empty());
     }
 
     #[test]
     fn extract_standalone_json_nested() {
         let text = "prefix {\"a\": {\"b\": 1}, \"c\": [1,2]} suffix";
-        let result = extract_standalone_json(text).unwrap();
-        assert_eq!(result, "{\"a\": {\"b\": 1}, \"c\": [1,2]}");
+        let objs = extract_all_json_objects(text);
+        assert_eq!(objs, vec!["{\"a\": {\"b\": 1}, \"c\": [1,2]}"]);
+    }
+
+    // ========== 2026-09-17 第 79 轮 P0-2:多候选提取测试 ==========
+
+    #[test]
+    fn extract_all_json_blocks_finds_multiple() {
+        // 两个 ```json 块都要被提取(旧版只取第一个)
+        let text = "噪声\n```json\n{\"a\":1}\n```\n中间噪声\n```json\n{\"b\":2}\n```";
+        let blocks = extract_all_json_blocks(text);
+        assert_eq!(blocks.len(), 2, "应提取两个块,实际: {blocks:?}");
+        assert_eq!(blocks[0], "{\"a\":1}");
+        assert_eq!(blocks[1], "{\"b\":2}");
+    }
+
+    #[test]
+    fn extract_all_json_objects_multiple_and_string_safe() {
+        // 前置噪声含 `{`(非平衡)+ 字符串内花括号不算深度
+        let text = "杂项 { 不完整\n首{\"k\":\"a{b}c\"}\n尾{\"x\":2}";
+        let objs = extract_all_json_objects(text);
+        assert_eq!(objs.len(), 2, "应提取两个平衡对象,实际: {objs:?}");
+        assert!(objs[0].contains("a{b}c"));
+        assert_eq!(objs[1], "{\"x\":2}");
+    }
+
+    #[test]
+    fn parse_classification_survives_leading_noise_objects() {
+        // 第 79 轮核心场景:LLM 在真正的分类 JSON 之前回显了含 `{}` 的噪声
+        // (用户输入带 HTML 围栏时高发),旧版取第一个 `{` 候选失败即降级,
+        // 新版应继续尝试后续候选并成功解析。
+        // 无 ```json 围栏,纯裸对象序列:噪声对象(缺 task_level 等必填字段)在前,
+        // 真分类对象在后 → 旧版取首个 `{` 即失败降级,新版跳过噪声命中后者。
+        let text = "我先分析一下任务:表单 {\"class\":\"ci-submit-button\"} 是提交按钮。\n\
+                    分类如下:{\"task_level\":\"medium\",\"goal_summary\":\"打开文心一言对话\",\"intent\":\"web_dialog\"} 完毕";
+        let c = parse_classification(text).unwrap();
+        assert_eq!(c.task_level, TaskLevel::Medium);
+        assert_eq!(c.goal_summary, "打开文心一言对话");
+    }
+
+    #[test]
+    fn parse_classification_falls_back_to_second_json_block() {
+        // 第一个 ```json 块非法(截断),第二个块合法 → 应解析成功
+        let text = "```json\n{\"task_level\": \"simp\n```\n重试后:\n```json\n{\"task_level\":\"simple\",\"goal_summary\":\"g\",\"intent\":\"t\"}\n```";
+        let c = parse_classification(text).unwrap();
+        assert_eq!(c.task_level, TaskLevel::Simple);
+    }
+
+    #[test]
+    fn parse_classification_all_candidates_fail_reports_count() {
+        // 全部候选失败 → 错误信息含候选数(fail-closed 语义不变)
+        let text = "```json\n{broken\n```\n还有 { 也broken";
+        let err = match parse_classification(text) {
+            Err(AgentError::YoloParse(msg)) => msg,
+            other => panic!("应返回 YoloParse,实际: {other:?}"),
+        };
+        assert!(err.contains("候选"), "错误应含候选数,实际: {err}");
     }
 
     #[test]

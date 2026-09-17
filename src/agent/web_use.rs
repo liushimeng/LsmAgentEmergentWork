@@ -226,6 +226,10 @@ pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(Stri
 /// Chromium-WebUse 执行器(浏览器网页操控专项单元)。
 pub struct WebUseRunner {
     agent: Agent,
+    /// ★ 2026-09-17 第 79 轮 P1-3:多轮复用副本(不带首迭代强制 BrowserNew)。
+    /// 已有存活浏览器页面时用本副本跑单元,让 LLM 首迭代自由选择
+    /// (BrowserInspect 直接观察已有页面),避免重复开页/丢登录态。
+    agent_reuse: Agent,
     db: Arc<Db>,
     #[allow(dead_code)]
     max_iterations: usize,
@@ -251,10 +255,12 @@ impl WebUseRunner {
             .filter(|n| *n >= 8 && *n <= 128)
             .unwrap_or(32);
         let agent = agent.with_max_iterations(default_max);
+        let agent_reuse = agent.replicate_without_forced_tool();
         let max_iterations = agent.max_iterations();
         let msg_mgr = AgentMessageManager::new(db.clone());
         Self {
             agent,
+            agent_reuse,
             db,
             max_iterations,
             msg_mgr,
@@ -264,6 +270,7 @@ impl WebUseRunner {
     pub fn with_max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
         self.agent = self.agent.with_max_iterations(n);
+        self.agent_reuse = self.agent_reuse.with_max_iterations(n);
         self
     }
 
@@ -321,19 +328,40 @@ impl WebUseRunner {
         cancel: Option<&CancelToken>,
         progress: Option<crate::agent::orchestrator::ProgressTx>,
     ) -> Result<SubFlowOutcome> {
+        // ★ 2026-09-17 第 79 轮 P1-3:探测存活页面(顺带让 list_pages 清理失效 entry)。
+        // 有存活页面 → 注入「已打开页面」提示 + 用无强制 BrowserNew 的 Agent 副本;
+        // 无存活页面 → 维持第 63 轮行为(首迭代强制 BrowserNew,防纯文本空转)。
+        let live_pages = crate::agent::browser::BrowserManager::global().list_pages().await;
+        let pages_hint = build_existing_pages_hint(&live_pages);
+        let agent_for_run: &Agent = if live_pages.is_empty() {
+            &self.agent
+        } else {
+            info!(
+                live_pages = live_pages.len(),
+                "WebUse 多轮复用:注入已打开页面,跳过首迭代强制 BrowserNew"
+            );
+            &self.agent_reuse
+        };
+
         // 复用 SubFlowInput 的 prompt 构造(原始 prompt 优先 + 摘要 + 上下游产物),
         // 尾部追加浏览器操控作业规范。
         let mut prompt = input.to_user_prompt();
+        if let Some(hint) = &pages_hint {
+            prompt.push_str("\n\n");
+            prompt.push_str(hint);
+        }
         prompt.push_str(
             "\n\n【浏览器操控作业规范】\n\
-             1. 第一步用 BrowserNew 打开目标页面拿到 page_id(默认无头内存浏览器 mode=hidden);\n\
+             1. 第一步用 BrowserNew 打开目标页面拿到 page_id(默认无头内存浏览器 mode=hidden);\
+                ★若上方有「已打开的浏览器页面」列表,优先直接操作那些页面,不要重复开页;\n\
              2. 后续所有操作都带 page_id:BrowserControl 执行动作、BrowserInspect 观察结果;\n\
              3. 点击链接/新开标签页时,注意响应里的 spawned_page_id,操作新页面要用新 id;\n\
              4. 错误码对策:2000 → 重新 BrowserList 同步索引;2002 → 换 selector 或换 \
                 input_text 的 use_js 路径;3001 → 本机未安装 Chrome/Edge/Chromium,如实告知用户;\n\
              5. 截图优先 save_path 落盘;DOM 提取注意 truncated 标记,分段提取;\n\
              6. 禁止对疑似支付/删除/确认提交类按钮做无把握点击;只读操作优先;\n\
-             7. 任务完成后用 BrowserClose 关闭不再需要的页面。\n\
+             7. 任务完成后关闭确定不再需要的页面;对话型页面(文心一言/ChatGPT 等,用户可能\
+                继续追问)可保留——后续任务会自动复用「已打开的浏览器页面」,进程退出时回收。\n\
              8. 浏览器启动模式:BrowserNew 默认 mode=hidden(纯 CDP 无窗口,不会弹出 macOS 系统浏览器)。\n\
                 只有当用户明确要求「看截图/可视化调试」时才用 mode=headed。\n\
              9. BrowserNew 成功返回的 next_steps 字段是关键引导,里面列了 input_text/click/wait/elements\n\
@@ -350,7 +378,9 @@ impl WebUseRunner {
                 - 最终回答里**必须把抓到的真实文本完整贴出来**(200-4000 字,带结构),\n\
                   不得仅用「AI回复已提取,内容超过 N 字符」「任务已完成,内容涵盖...」\n\
                   等描述性占位句。Runner 会从 sub_session 抓取最长 tool_result 文本兜底\n\
-                  追加,但请你主动把真实内容写到终答里,避免二次抽象漂移。",
+                  追加,但请你主动把真实内容写到终答里,避免二次抽象漂移。\n\
+             13. ★2026-09-17 第 79 轮:你的第一个动作必须是**工具调用**(BrowserNew / \
+                BrowserInspect / BrowserControl 均可),不允许先输出纯文本描述。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -375,8 +405,8 @@ impl WebUseRunner {
 
         // 早终止路径语义与 SubAgentRunner / WindowUseRunner 对齐:包装成失败摘要文本 + trace,
         // 交给 Quality-Check 判定,而不是直接升级为 Error。
-        let (text, usage, mut trace) = match self
-            .agent
+        // ★ 第 79 轮 P1-3:按存活页面状态选择 Agent(冷启动强制 BrowserNew / 多轮自由决策)。
+        let (text, usage, mut trace) = match agent_for_run
             .run_session_cancellable(&mut sub_session, cancel)
             .await
         {
@@ -508,6 +538,28 @@ impl WebUseRunner {
             trace,
         })
     }
+}
+
+/// ★ 2026-09-17 第 79 轮 P1-3:构造「已打开的浏览器页面」注入提示块。
+///
+/// 输入为 `BrowserManager::list_pages()` 的 `(page_id, url, title, created_at)` 列表;
+/// 空列表返回 None(冷启动,不注入)。纯函数,便于单测。
+pub fn build_existing_pages_hint(pages: &[(String, String, String, String)]) -> Option<String> {
+    if pages.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "【已打开的浏览器页面(可直接复用,免重新打开/登录)】\n",
+    );
+    for (id, url, title, _ts) in pages.iter().take(10) {
+        let title_disp = if title.trim().is_empty() { "(无标题)" } else { title.as_str() };
+        out.push_str(&format!("  - page_id={id} | 标题: {title_disp} | URL: {url}\n"));
+    }
+    out.push_str(
+        "优先用 BrowserInspect / BrowserControl 直接操作上述页面;仅当任务需要其它网址\n\
+         或页面已失效(code=2000)时才 BrowserNew 新开。你的第一个动作必须是工具调用。",
+    );
+    Some(out)
 }
 
 /// 浏览器操作动作关键词探测(出口兜底用)。
@@ -713,5 +765,105 @@ mod tests {
         let msgs = vec![ChatMessage::tool_result("t1", nested, false)];
         let result = extract_page_reply_from_session(&msgs);
         assert!(result.is_some(), "嵌套字段应能提取,实际值: {result:?}");
+    }
+
+    // ================== 2026-09-17 第 79 轮 P1-3:已打开页面注入提示 ==================
+
+    #[test]
+    fn build_existing_pages_hint_empty_returns_none() {
+        assert!(build_existing_pages_hint(&[]).is_none(), "空列表不应注入提示");
+    }
+
+    #[test]
+    fn build_existing_pages_hint_lists_page_id_url_title() {
+        let pages = vec![
+            (
+                "p_ab12cd34".to_string(),
+                "https://wenxin.baidu.com/".to_string(),
+                "文心一言".to_string(),
+                "1758100000000".to_string(),
+            ),
+            (
+                "p_ff00ee11".to_string(),
+                "https://example.com/".to_string(),
+                String::new(), // 空标题 → (无标题)
+                "1758100000001".to_string(),
+            ),
+        ];
+        let hint = build_existing_pages_hint(&pages).expect("非空列表应返回提示块");
+        assert!(hint.contains("已打开的浏览器页面"), "应含标题行: {hint}");
+        assert!(hint.contains("page_id=p_ab12cd34"));
+        assert!(hint.contains("文心一言"));
+        assert!(hint.contains("https://wenxin.baidu.com/"));
+        assert!(hint.contains("(无标题)"), "空标题应有占位: {hint}");
+        assert!(hint.contains("第一个动作必须是工具调用"), "应含首步工具要求: {hint}");
+        assert!(hint.contains("BrowserNew"), "应说明何时才新开页面: {hint}");
+    }
+
+    #[test]
+    fn build_existing_pages_hint_caps_at_ten_pages() {
+        let pages: Vec<(String, String, String, String)> = (0..15)
+            .map(|i| (
+                format!("p_{i:08x}"),
+                format!("https://example.com/{i}"),
+                format!("标题{i}"),
+                "1758100000000".to_string(),
+            ))
+            .collect();
+        let hint = build_existing_pages_hint(&pages).unwrap();
+        assert!(hint.contains("p_00000009"), "前 10 个页面应列出");
+        assert!(!hint.contains("p_0000000a"), "第 11 个起应截断");
+    }
+
+    // ================== 2026-09-17 第 79 轮 P1-3:多轮复用 Agent 副本 ==================
+
+    #[test]
+    fn runner_holds_reuse_agent_without_forced_tool() {
+        // Agent::replicate_without_forced_tool 语义:副本无 forced tool,原 Agent 保留。
+        struct NoopLlm;
+        #[async_trait::async_trait]
+        impl crate::llm::LlmClient for NoopLlm {
+            async fn complete(
+                &self,
+                _system: &str,
+                _messages: &[crate::llm::ChatMessage],
+                _tools: &[crate::llm::ToolDef],
+                _meta: &crate::llm::RequestMeta,
+            ) -> Result<crate::llm::Completion> {
+                Ok(crate::llm::Completion {
+                    text: String::new(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                })
+            }
+            fn protocol(&self) -> crate::config::Protocol {
+                crate::config::Protocol::Anthropic
+            }
+        }
+        let agent = crate::agent::Agent::new(
+            std::sync::Arc::new(NoopLlm),
+            AgentProfile::web_use_profile(),
+        )
+        .with_first_iter_forced_tool("BrowserNew");
+        assert_eq!(agent.first_iter_forced_tool(), Some("BrowserNew"));
+        let reuse = agent.replicate_without_forced_tool();
+        assert_eq!(reuse.first_iter_forced_tool(), None, "副本不应带首迭代强制工具");
+        assert_eq!(reuse.max_iterations(), agent.max_iterations(), "迭代上限应复制");
+        assert_eq!(reuse.profile().name, agent.profile().name, "profile 应复制");
+    }
+
+    #[test]
+    fn web_use_profile_tools_hint_lists_round76_actions() {
+        // 第 79 轮 P1-4:工具说明必须告知第 76 轮扩展动作,否则 LLM 不知道能力存在。
+        let rendered = AgentProfile::web_use_profile()
+            .system_prompt
+            .render(crate::config::Protocol::Anthropic);
+        for action in ["drag", "focus", "blur", "mouse_move", "dispatch_event"] {
+            assert!(
+                rendered.contains(action),
+                "WebUse 系统提示词应包含动作 {action}(与 BrowserControl Schema 对齐)"
+            );
+        }
     }
 }

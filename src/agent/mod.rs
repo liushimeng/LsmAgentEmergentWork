@@ -134,6 +134,27 @@ impl Agent {
         self
     }
 
+    /// 读取首迭代强制工具(测试/诊断用)。
+    pub fn first_iter_forced_tool(&self) -> Option<&str> {
+        self.first_iter_forced_tool.as_deref()
+    }
+
+    /// 复制本 Agent 的配置(llm/profile/迭代上限等),但**不带**首迭代强制工具。
+    ///
+    /// 2026-09-17 第 79 轮:WebUse 多轮场景使用——已有存活浏览器页面时,
+    /// 强制 BrowserNew 反而会重复开页;换用本副本让首迭代自由决策
+    /// (prompt 中注入「已打开页面」列表 + 出口兜底防纯文本空转)。
+    pub fn replicate_without_forced_tool(&self) -> Self {
+        Self {
+            llm: self.llm.clone(),
+            profile: self.profile.clone(),
+            max_iterations: self.max_iterations,
+            max_truncation_resume: self.max_truncation_resume,
+            max_overflow_recoveries: self.max_overflow_recoveries,
+            first_iter_forced_tool: None,
+        }
+    }
+
     /// 设置最大截断续接次数(测试 / 特殊场景用)。
     pub fn with_max_truncation_resume(mut self, n: usize) -> Self {
         self.max_truncation_resume = n;

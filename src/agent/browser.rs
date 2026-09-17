@@ -733,9 +733,18 @@ mod tests {
     }
 
     // 2026-09-17 第 74 轮:BrowserMode 三档枚举测试。
+    // ★ 2026-09-17 第 79 轮:环境变量类测试用互斥锁串行 —— 4 个测试并行跑时
+    // set_var/remove_var 互相踩(default 测试读到 env_overrides 设置的 headed),
+    // 全量 `cargo test` 偶发失败(存量 flaky,与功能无关)。
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn browser_mode_default_is_hidden() {
+        let _g = env_lock();
         unsafe { std::env::remove_var("LAEW_BROWSER_MODE") };
         unsafe { std::env::remove_var("LAEW_BROWSER_HEADLESS") };
         assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Hidden);
@@ -743,6 +752,7 @@ mod tests {
 
     #[test]
     fn browser_mode_env_overrides() {
+        let _g = env_lock();
         unsafe { std::env::set_var("LAEW_BROWSER_MODE", "headed") };
         assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Headed);
         unsafe { std::env::set_var("LAEW_BROWSER_MODE", "new_headless") };
@@ -754,6 +764,7 @@ mod tests {
 
     #[test]
     fn browser_mode_legacy_headless_env() {
+        let _g = env_lock();
         unsafe { std::env::set_var("LAEW_BROWSER_HEADLESS", "0") };
         assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Headed);
         unsafe { std::env::set_var("LAEW_BROWSER_HEADLESS", "false") };
@@ -764,6 +775,7 @@ mod tests {
 
     #[test]
     fn browser_mode_invalid_env_does_not_panic() {
+        let _g = env_lock();
         unsafe { std::env::set_var("LAEW_BROWSER_MODE", "garbage") };
         unsafe { std::env::remove_var("LAEW_BROWSER_HEADLESS") };
         // 只确保不 panic;非法值走默认 fallback
