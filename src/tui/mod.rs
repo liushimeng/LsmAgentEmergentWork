@@ -166,6 +166,8 @@ impl TuiSession {
             "║  工作区 : {} ║",
             fit_display(&Self::workspace_status_line(&ws), 45)
         );
+        // 第 71 轮:未配置状态复用给下方连接行(见 conn_line 注释)
+        let has_active = active.is_some();
         match active {
             Some(r) => println!(
                 "║  当前模型: {} ║",
@@ -195,8 +197,15 @@ impl TuiSession {
                 46
             )
         );
-        // D13 离线模式(2026-09-11):连接状态行
-        let conn_line = Self::connectivity_status_line(&self.connectivity, &self.offline_queue);
+        // D13 离线模式(2026-09-11):连接状态行。
+        // 2026-09-17 第 71 轮:未配置接入记录时,ConnectivityTracker 的「Online ✓」
+        // 只反映网络不反映配置,会误导用户以为链路可用;此时连接行直接呈现未配置
+        // 状态与操作指引,让横幅自身就能解释「为什么任务不执行」。
+        let conn_line = if has_active {
+            Self::connectivity_status_line(&self.connectivity, &self.offline_queue)
+        } else {
+            "未配置(先 /provider add)".to_string()
+        };
         println!("║  连  接 : {} ║", fit_display(&conn_line, 45));
         println!("╚══════════════════════════════════════════════════════════╝");
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
@@ -403,7 +412,13 @@ fn build_orchestrator_with_active_shared(
     }
 }
 
-/// 未配置模型时的占位 LLM(避免 null deref);`complete` 返回错误提示。
+/// 未配置模型时的占位 LLM(避免 null deref);`complete` 返回结构化错误。
+///
+/// 2026-09-17 第 71 轮(tmpPlan/2026-09-17_03):此前返回 `Ok(占位文本)`,占位提示
+/// 被当成"成功的 LLM 响应"送进全链路 —— Yolo 解析失败降级 → SubAgent 零工具空转 →
+/// QC fail-closed 盲重试,最终以「Quality 报告解析失败」误导收口。改为返回 `Err`:
+/// Agent 循环 `complete_with_overflow_recovery` 对非溢出错误原样上抛(不重试),
+/// 任何绕过 dispatch 守门的路径都会以正确的根因信息快速失败。
 struct NoopLlm;
 
 #[async_trait::async_trait]
@@ -415,12 +430,10 @@ impl crate::llm::LlmClient for NoopLlm {
         _tools: &[crate::llm::ToolDef],
         _meta: &crate::llm::RequestMeta,
     ) -> crate::error::Result<crate::llm::Completion> {
-        Ok(crate::llm::Completion {
-            text: "尚未配置大模型接入记录, 请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置。".to_string(),
-            tool_calls: vec![],
-            usage: Default::default(),
-            stop_reason: None,
-        })
+        Err(crate::error::AgentError::Other(
+            "尚未配置大模型接入记录, 请先使用 `laew provider add` 或 TUI 内 `/provider add` 完成配置。"
+                .to_string(),
+        ))
     }
 
     /// 占位客户端默认返回 Anthropic(仅影响系统提示词渲染,不会实际发起请求)。

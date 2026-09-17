@@ -77,7 +77,8 @@ impl TuiSession {
                         r.end_point
                     );
                 } else {
-                    println!("  当前未配置模型。");
+                    // 第 71 轮:空态补操作指引,与横幅/dispatch 守门文案一致
+                    println!("  当前未配置模型。请先执行 /provider add 添加接入记录。");
                 }
             }
             "provider" | "p" => {

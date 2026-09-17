@@ -621,3 +621,16 @@ git 状态 / 平台 / 日期,只能 `ls` 试探,常猜错构建命令(`npm test`
 - **stdout 纯净性**：一切用户可见提示走 stderr，`-p` 模式 stdout 仍只含答案与用量。
 - **大小写/单双横线**：clap `ignore_case` 只作用于参数值，flag 拼写大小写在启动归一化层处理（`trim_start_matches('-')` + lowercase 比对四个长参数词）。
 - **验证**：单元测试 7 项（文件名格式/clip/CJK/env/创建续写/降级）+ cargo test 1017 全过 + mock e2e 手动验证（--info/-INFO/--DEBUG/-Debug/--info TUI/-f 五类形态 × simple/medium并行/hard 三档链路事件覆盖）+ `run_e2e.sh` PASS=172 FAIL=1（5e-1 WebUse 为存量失败，与改动前 09:38 报告一致）。
+
+## 第 71 轮（2026-09-17）— 未配置 Provider 时 TUI 任务误导性失败修复
+
+| 编号 | gap | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|---------|---------|
+| ProviderGate | 未配置接入记录时 TUI 任务误导性失败（NoopLlm 把「尚未配置」占位文本当成功 LLM 响应送进全链路：Yolo 解析失败降级 → SubAgent 零工具空转 → QC fail-closed「Quality 报告解析失败」→ 3 轮盲重试 → 与根因无关的误导收口；`-p` 模式早有 fail fast 而 TUI 缺守门） | ✅ | `src/tui/dispatch.rs`（`dispatch_prompt` 前置守门：@ 展开后、D13 离线检查前查 `get_active_or_env`，None/Err 均 fail fast 秒回指引，不 push 上下文不进编排器零重试）+ `src/tui/mod.rs`（NoopLlm `complete` 由 `Ok(占位文本)` 改 `Err(Other(指引))` 防御纵深——Agent 循环对非溢出错误原样上抛不重试，绕过守门的新入口也以正确根因快速失败；横幅连接行在未配置时由误导的「Online ✓」改「未配置(先 /provider add)」）+ `src/tui/slash.rs`（/model 空态补操作指引）+ `testReport/run_e2e.sh`（新增 §2b TUI 管道模式守门 5 断言；§7b dispatch 前补 `provider use`（§5e delete 掉 active 后主库一直无 provider，旧用例靠 NoopLlm 空转侥幸通过）；§7c 由「无 provider NoopLlm 空转累积轮次」改造为「独立根目录 + 专用 mock + provider add 真实链路累积轮次」） | 2026-09-17 第 71 轮 |
+
+**设计要点**:
+- **三层防御**：入口守门（主修复，TUI 与 `-p` 语义对齐）→ NoopLlm 返回 Err（防御纵深，`complete_with_overflow_recovery` 非溢出错误原样上抛）→ 横幅/`/model` 可观测性（未配置状态自解释）。
+- **守门位置**：在 D13 离线检查**之前**——配置缺失是本地 DB 状态而非网络问题，入队毫无意义；也不更新 connectivity（未发生任何 LLM 行为）。
+- **LAEW_PROVIDER_ID Err 透传**：环境变量指向不存在记录时 `get_active_or_env` 返回 Err，守门拦截并透出原始错误（其本身含修复指引）。
+- **e2e 修复连带发现**：§5e `provider delete` 掉 active 记录后未恢复，§7/§7b/§7c 此前全靠「NoopLlm 全链路空转」产生对话轮次/导出内容——属用例依赖了被修复的缺陷行为，已改为真实 mock 链路。
+- **验证**：cargo test 1017 全过 + 手动验证（空 DB 管道模式秒回指引、横幅连接行正确）+ `run_e2e.sh` PASS=177 FAIL=1（仅 5e-1 WebUse 存量失败，与第 69 轮记录一致）。

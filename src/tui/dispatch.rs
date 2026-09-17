@@ -60,6 +60,29 @@ impl TuiSession {
         } else {
             prompt
         };
+        // 未配置 Provider 前置守门(2026-09-17 第 71 轮,tmpPlan/2026-09-17_03):
+        // 无 active 接入记录时,orchestrator 挂的是 NoopLlm —— 占位文本会被当成
+        // "成功的 LLM 响应" 送进全链路:Yolo 解析失败降级 → SubAgent 零工具空转 →
+        // QC fail-closed「Quality 报告解析失败」→ 盲重试 3 轮,最终以与根因完全
+        // 无关的误导性错误收口。与 -p 单轮模式(main.rs run_one_shot)对齐:fail fast,
+        // 不 push session 上下文、不进编排器、零 LLM 调用、零重试、不动连接状态。
+        // 放在 D13 离线检查之前:配置缺失是本地 DB 状态而非网络问题,入队毫无意义。
+        match self.db.lock().expect("db").get_active_or_env() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                println!();
+                println!("  [未配置] 尚未配置大模型接入记录,本条任务未执行(未进入编排器)。");
+                println!("  [未配置] 请先在 TUI 内执行 /provider add 添加接入记录,");
+                println!("  [未配置] 或使用 CLI: laew provider add …;配置完成后重新发送提示词。");
+                return Ok(false);
+            }
+            Err(e) => {
+                // LAEW_PROVIDER_ID 指向不存在记录等配置错误:错误信息本身含修复指引
+                eprintln!("  [未配置] 读取接入记录失败: {e}");
+                eprintln!("  [未配置] 可用 /provider list 检查接入记录,或 /provider add 新增。");
+                return Ok(false);
+            }
+        }
         // D13 离线模式(2026-09-11):
         // - Offline → 入队跳过 LLM 调用(避免浪费 30s 重试链),等恢复后 flush;
         // - Online/Degraded 且有积压队列 → 本条用户输入触发 flush 一条队列头部

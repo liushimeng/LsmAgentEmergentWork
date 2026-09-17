@@ -74,6 +74,18 @@ OUT=$(run "$LAEW" --help); echo "$OUT" | grep -q "provider"; check $? "--help �
 section "2. 未配置模型时 -p 的引导提示"
 OUT=$(run "$LAEW" -p "hello"); echo "$OUT" | grep -q "provider add"; check $? "提示先 provider add"
 
+# --- 2b. 未配置模型时 TUI 管道模式守门(第 71 轮,tmpPlan/2026-09-17_03) ---
+# 非 TTY 管道输入走 TUI run() 回退,与交互 TUI 同一条 dispatch_prompt 链路。
+# 修复前:NoopLlm 占位文本进全链路 → Yolo 降级 → QC fail-closed → 3 轮盲重试,
+# 以「Quality 报告解析失败」误导收口;修复后:守门秒回指引,不进编排器。
+section "2b. 未配置模型时 TUI 管道模式守门"
+OUT=$(echo "查看一下,当前进程列表" | timeout 10 "$LAEW" 2>&1)
+echo "$OUT" | grep -q "provider add"; check $? "TUI 管道模式提示先 provider add"
+echo "$OUT" | grep -q "未配置"; check $? "TUI 管道模式含未配置指引"
+echo "$OUT" | grep -q "未进入编排器"; check $? "守门明确说明未进入编排器"
+echo "$OUT" | grep -q "orchestrator 调度中"; [ $? -ne 0 ]; check $? "未触发编排器调度"
+echo "$OUT" | grep -q "Quality 报告解析失败"; [ $? -ne 0 ]; check $? "不再出现误导性 Quality 解析失败"
+
 # --- 3. provider 增/列/切换/删 ---
 section "3. provider CRUD"
 run "$LAEW" provider add --protocol anthropic --provider-name mockA --model-name claude-mock --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-mock-ant
@@ -943,6 +955,10 @@ section "7b. 自定义斜杠命令与会话导出"
 # 输出仍在通过,真实编排链路从未被测到。本节独立拉起 mock 复用 18899 端口。
 python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7b-$TS.jsonl" &>/dev/null &
 MOCK7B_PID=$!; sleep 0.6
+# 2026-09-17 第 71 轮:§5e delete 掉 active 记录后主库处于无 provider 状态,
+# TUI dispatch 守门会拦截 /e2e-hello(不再走 NoopLlm 空转)。本节 dispatch 前
+# 显式切回 mockA(端点=本节 mock 端口),恢复真实编排链路覆盖。
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 rm -rf /tmp/laew-e2e-cmd-work; mkdir -p /tmp/laew-e2e-cmd-work/.laew/commands
 cat > /tmp/laew-e2e-cmd-work/.laew/commands/e2e-hello.md <<'CMDEOF'
 ---
@@ -977,12 +993,19 @@ kill $MOCK7B_PID 2>/dev/null
 rm -rf /tmp/laew-e2e-cmd-work
 
 # --- 7c. D3 对话 Rewind 与分支(2026-09-10 第二十四轮) ---
-# 独立根目录 + 无 provider(NoopLlm 全本地确定性,不依赖 mock;QC fail-closed 回流
-# 属预期噪音,不影响轮次累积断言)。
+# 2026-09-17 第 71 轮改造:原「独立根目录 + 无 provider」依赖 NoopLlm 空转产生
+# 对话轮次(QC fail-closed 回流属预期噪音);NoopLlm 改为 Err + dispatch 守门后,
+# 无 provider 的提示词被 fail-fast 拦截、不再累积轮次。改为独立根目录 + 专用
+# mock + provider add,让两轮提示词真实走编排链路(与交互 TUI 行为一致),
+# 轮次累积语义不变。
 section "7c. D3 对话 Rewind 与分支"
 rm -rf /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
 mkdir -p /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
 cp laew /tmp/laew-e2e-rw-root/laew
+# §7b 的 mock 已 kill,18899 端口空闲;本节独立拉起专用 mock
+python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7c-$TS.jsonl" &>/dev/null &
+MOCK7C_PID=$!; sleep 0.6
+run /tmp/laew-e2e-rw-root/laew provider add --protocol anthropic --provider-name rw --model-name claude-rw --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-rw >/dev/null 2>&1
 OUT=$(cd /tmp/laew-e2e-rw-work && printf '第一轮问题\n第二轮问题\n/rewind\n/rewind 99\n/rewind 2\n/branches\n/switch rewind-1\n/undo\n/fork\n/clear\n/rewind\n/exit\n' | run timeout 90 /tmp/laew-e2e-rw-root/laew)
 echo "$OUT" | grep -q "可回退的对话轮次(共 2 轮"; check $? "/rewind 列出 2 轮"
 echo "$OUT" | grep -q "#1 \[.*第一轮问题"; check $? "/rewind 轮次预览含时间与原文"
@@ -997,6 +1020,7 @@ echo "$OUT" | grep -q "已从当前对话分叉出新会话"; check $? "/fork �
 echo "$OUT" | grep -q "已存为分支 fork-4"; check $? "/fork 分叉前自动存分支"
 echo "$OUT" | grep -q "已自动保存分支 clear-5"; check $? "/clear 自动快照找回提示"
 echo "$OUT" | grep -q "当前会话还没有可回退的对话轮次"; check $? "/clear 后无可回退轮次"
+kill $MOCK7C_PID 2>/dev/null
 rm -rf /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
 
 # --- 7d. Markdown 富文本渲染(TUI 任务结果路径,2026-09-15) ---
