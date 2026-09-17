@@ -178,6 +178,78 @@ impl WindowDriver for FallbackDriver {
                 if lines > 0 { "向上" } else { "向下" }
             ));
         }
+        // 2026-09-17 第 80 轮:Linux 键入/原子提交走 xdotool,与其他平台的
+        // SendInput/CGEvent 语义对齐。仍只是 X11/XWayland 下尽力而为。
+        let typed = match &action {
+            ControlAction::TypeText(text) => Some((text, None, false)),
+            ControlAction::TypeTextSubmit { text, x, y } => {
+                let point = match (x, y) {
+                    (Some(x), Some(y)) => Some((*x, *y)),
+                    _ => None,
+                };
+                Some((text, point, true))
+            }
+            _ => None,
+        };
+        if let Some((text, point, submit)) = typed {
+            if !self.has_xdotool {
+                return Err(platform_err(
+                    self.platform_name(),
+                    "type_text/type_text_submit 需要 xdotool(可 sudo apt install xdotool)",
+                ));
+            }
+            let _ = Command::new("xdotool")
+                .args(["windowactivate", window_id])
+                .status();
+            if let Some((x, y)) = point {
+                for args in [
+                    vec!["mousemove".to_string(), x.to_string(), y.to_string()],
+                    vec!["click".to_string(), "1".to_string()],
+                ] {
+                    let status = Command::new("xdotool").args(args).status().map_err(|e| {
+                        platform_err(self.platform_name(), format!("执行 xdotool 失败: {e}"))
+                    })?;
+                    if !status.success() {
+                        return Err(platform_err(
+                            self.platform_name(),
+                            format!("xdotool 坐标定位退出码 {:?}", status.code()),
+                        ));
+                    }
+                }
+            }
+            let status = Command::new("xdotool")
+                .args(["type", "--delay", "25", "--", text])
+                .status()
+                .map_err(|e| {
+                    platform_err(self.platform_name(), format!("执行 xdotool type 失败: {e}"))
+                })?;
+            if !status.success() {
+                return Err(platform_err(
+                    self.platform_name(),
+                    format!("xdotool type 退出码 {:?}", status.code()),
+                ));
+            }
+            if submit {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                let status = Command::new("xdotool")
+                    .args(["key", "--clearmodifiers", "Return"])
+                    .status()
+                    .map_err(|e| {
+                        platform_err(self.platform_name(), format!("执行 xdotool key 失败: {e}"))
+                    })?;
+                if !status.success() {
+                    return Err(platform_err(
+                        self.platform_name(),
+                        format!("xdotool Return 退出码 {:?}", status.code()),
+                    ));
+                }
+            }
+            return Ok(format!(
+                "已键入 {} 字符{}",
+                text.chars().count(),
+                if submit { "并提交" } else { "" }
+            ));
+        }
         Err(platform_err(self.platform_name(), UNSUPPORTED_MSG))
     }
 

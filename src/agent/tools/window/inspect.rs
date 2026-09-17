@@ -89,9 +89,21 @@ impl Tool for WindowInspectTool {
 /// Edit / Text / List / MenuItem 等可交互控件。
 fn has_actionable_controls(node: &ControlNode) -> bool {
     const ACTIONABLE_ROLES: &[&str] = &[
-        "Button", "Edit", "Text", "List", "ListItem", "MenuItem", "CheckBox",
-        "RadioButton", "ComboBox", "Slider", "Tab", "TreeItem", "Hyperlink",
-        "DataItem", "Custom",
+        "Button",
+        "Edit",
+        "Text",
+        "List",
+        "ListItem",
+        "MenuItem",
+        "CheckBox",
+        "RadioButton",
+        "ComboBox",
+        "Slider",
+        "Tab",
+        "TreeItem",
+        "Hyperlink",
+        "DataItem",
+        "Custom",
     ];
     if ACTIONABLE_ROLES
         .iter()
@@ -125,8 +137,9 @@ impl Tool for WindowActionTool {
          【B. 视觉/坐标路线(自绘 UI:微信 4.x、QQ、游戏等控件树为空的应用)】\n\
          - 坐标来自 WindowOCR 返回的 blocks(screen_x/screen_y 取中心):\n\
          - click_point / double_click_point / right_click_point(需 x,y:屏幕绝对坐标) /\n\
-           scroll_point(需 x,y;text 传方向行数如 \"down:3\") /\n\
-           type_text(向当前焦点真实键入 text,配合 click_point 先点输入框)。\n\
+         scroll_point(需 x,y;text 传方向行数如 \"down:3\")。\n\
+         - type_text_submit(聊天/搜索框首选): text=完整内容;可选 x,y 先点击输入框,\n\
+           驱动层会在同一调用内键入完整文本并按 Enter 提交。\n\
          坐标动作的 path 照传 \"/\" 即可。控件是否支持某动作参考 WindowInspect 的 actions;路径失效时重新 WindowInspect。"
     }
 
@@ -140,13 +153,13 @@ impl Tool for WindowActionTool {
                     "type": "string",
                     "enum": [
                         "click", "invoke", "focus", "set_text", "get_text", "send_keys", "scroll", "scroll_to_visible",
-                        "click_point", "double_click_point", "right_click_point", "scroll_point", "type_text"
+                        "click_point", "double_click_point", "right_click_point", "scroll_point", "type_text", "type_text_submit"
                     ],
                     "description": "要执行的动作(控件树路线 / 坐标视觉路线)"
                 },
-                "text": { "type": "string", "description": "set_text/send_keys/type_text 的文本;scroll/scroll_point 传方向行数(down:3)" },
-                "x": { "type": "integer", "description": "坐标动作必填:屏幕绝对 X(取 WindowOCR 返回 screen_x 中心)" },
-                "y": { "type": "integer", "description": "坐标动作必填:屏幕绝对 Y(取 WindowOCR 返回 screen_y 中心)" }
+                "text": { "type": "string", "description": "set_text/send_keys/type_text/type_text_submit 的文本;scroll/scroll_point 传方向行数(down:3)" },
+                "x": { "type": "integer", "description": "坐标动作必填;type_text_submit 可选。屏幕绝对 X(取 WindowOCR 返回 screen_x 中心)" },
+                "y": { "type": "integer", "description": "坐标动作必填;type_text_submit 可选。屏幕绝对 Y(取 WindowOCR 返回 screen_y 中心)" }
             },
             "required": ["window_id", "path", "action"],
             "additionalProperties": false

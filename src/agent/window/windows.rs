@@ -23,8 +23,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
@@ -38,7 +37,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::windows_input as winput;
-use super::{matches_filter, platform_err, ControlAction, ControlNode, OcrBlock, Rect, WindowDriver, WindowInfo};
+use super::{
+    matches_filter, platform_err, ControlAction, ControlNode, OcrBlock, Rect, WindowDriver,
+    WindowInfo,
+};
 use crate::error::Result;
 
 pub struct WindowsDriver;
@@ -147,9 +149,12 @@ fn process_name_of(pid: u32) -> String {
         };
         let mut buf = [0u16; 512];
         let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, windows::core::PWSTR(
-            buf.as_mut_ptr(),
-        ), &mut len);
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
         let _ = CloseHandle(handle);
         if ok.is_ok() && len > 0 {
             let path = String::from_utf16_lossy(&buf[..len as usize]);
@@ -167,9 +172,7 @@ fn process_name_of(pid: u32) -> String {
 /// 原 `format!("{t:?}")` 输出 `UIA_CONTROLTYPE_ID(50032)`,LLM 不可读)。
 fn uia_role_name(el: &IUIAutomationElement) -> String {
     // SAFETY:属性读取,失败回退 Unknown。
-    let raw = unsafe { el.CurrentControlType() }
-        .map(|t| t.0)
-        .unwrap_or(0);
+    let raw = unsafe { el.CurrentControlType() }.map(|t| t.0).unwrap_or(0);
     let name = match raw {
         50000 => "Button",
         50001 => "Calendar",
@@ -520,7 +523,26 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
         ControlAction::TypeText(text) => {
             winput::force_foreground(hwnd)?;
             winput::type_text(text)?;
-            Ok(format!("已向 HWND {:?} 真实键入 {} 字符", hwnd.0, text.chars().count()))
+            Ok(format!(
+                "已向 HWND {:?} 真实键入 {} 字符",
+                hwnd.0,
+                text.chars().count()
+            ))
+        }
+        ControlAction::TypeTextSubmit { text, x, y } => {
+            if let (Some(x), Some(y)) = (x, y) {
+                winput::click_point(*x, *y, false, false)?;
+            } else {
+                winput::force_foreground(hwnd)?;
+            }
+            winput::type_text(text)?;
+            // 给 Win32 消息队列/Electron 输入模型一个固定吸收窗口,再提交。
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            winput::send_keys_spec("enter")?;
+            Ok(format!(
+                "已键入 {} 字符并提交(type_text_submit)",
+                text.chars().count()
+            ))
         }
         // 2026-09-16 第 66 轮:WM_MOUSEWHEEL 滚动(目标控件 HWND 优先,未命中发窗口根)。
         ControlAction::Scroll { lines } => {
@@ -555,7 +577,11 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
         }
         ControlAction::ScrollPoint { x, y, lines } => {
             winput::wheel_at(*x, *y, *lines)?;
-            Ok(format!("已在 ({x},{y}) 滚动 {} 行({})", lines.abs(), if *lines > 0 { "向上" } else { "向下" }))
+            Ok(format!(
+                "已在 ({x},{y}) 滚动 {} 行({})",
+                lines.abs(),
+                if *lines > 0 { "向上" } else { "向下" }
+            ))
         }
     }
 }
@@ -737,7 +763,9 @@ impl WindowDriver for WindowsDriver {
                                     p.ScrollIntoView().map_err(|e| {
                                         platform_err("windows", format!("ScrollIntoView 失败: {e}"))
                                     })?;
-                                    Ok(format!("已把 {window_id}{path} 滚动到可见区域(ScrollItemPattern)"))
+                                    Ok(format!(
+                                        "已把 {window_id}{path} 滚动到可见区域(ScrollItemPattern)"
+                                    ))
                                 }
                                 Err(_) => {
                                     let bounds = el.CurrentBoundingRectangle().unwrap_or_default();
@@ -791,6 +819,25 @@ impl WindowDriver for WindowsDriver {
                             Ok(format!(
                                 "已向 {window_id} 当前焦点真实键入 {} 字符(SendInput)",
                                 text.chars().count()
+                            ))
+                        }
+                        ControlAction::TypeTextSubmit { text, x, y } => {
+                            let clicked = if let (Some(x), Some(y)) = (x, y) {
+                                winput::click_point(*x, *y, false, false)?;
+                                true
+                            } else {
+                                let _ = el.SetFocus();
+                                false
+                            };
+                            drop(el);
+                            winput::force_foreground(hwnd)?;
+                            winput::type_text(text)?;
+                            std::thread::sleep(std::time::Duration::from_millis(120));
+                            winput::send_keys_spec("enter")?;
+                            Ok(format!(
+                                "已向 {window_id} 键入 {} 字符并提交(SendInput{})",
+                                text.chars().count(),
+                                if clicked { ", 坐标定位" } else { "" }
                             ))
                         }
                     }

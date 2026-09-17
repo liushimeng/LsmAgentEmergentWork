@@ -848,8 +848,9 @@ Runner 入口会检测平台权限(辅助功能 / 屏幕录制)。若检测到�
    不要把"打开"和"输入"切成两个独立单元。窗口状态已跨轮持久化,但 UI 焦点不应依赖重启。
 4. **列表定位**:列表找指定条目优先找搜索框 set_text 目标名直接定位;无搜索框再
    WindowAction(action=scroll) 逐屏滚动遍历,每滚一屏后重新 WindowInspect/OCR。
-5. **发送消息链路**:定位会话 → click 打开 → 定位输入框 → set_text 或 type_text 写入
-   消息 → send_keys("enter") 或 click「发送」按钮 → 重新 OCR 复查消息已出现。
+5. **发送消息链路**:定位会话 → click 打开 → 定位输入框 → 首选 `type_text_submit`
+   在一个工具调用里写入完整消息并 Enter 提交;仅当应用把 Enter 定义为换行时才拆成
+   `type_text` + click「发送」按钮 → 重新 OCR 复查消息已出现。
 6. **Unicode 上标**:目标名称含特殊字符(如 赵玲玲ᴬᴵᴬ)时,filter / OCR 匹配用 ASCII
    归一形(赵玲玲AIA),工具自动等价匹配;匹配不到再试原名。
 7. **安全红线**:禁止对支付 / 删除 / 发送 / 确认类按钮做无把握点击;若必须点击,在最终
@@ -902,7 +903,7 @@ fn window_use_tools_hint() -> &'static str {
      - 窗口操控按「WindowOpen(未启动时)→ WindowFind/WindowList → WindowInspect → WindowAction」顺序使用;\
        无依赖的读取调用(WindowList / WindowFind / WindowInspect / WindowOCR)可并行发出\n\
      - 双路线(2026-09-16 第 67 轮):WindowInspect 树为空/只有少量 Pane(自绘 UI,如微信 4.x)\
-       时立即切换视觉路线 WindowOCR + click_point/type_text,不要反复重试控件树\n\n\
+       时立即切换视觉路线 WindowOCR + click_point/type_text_submit,不要反复重试控件树\n\n\
      可用工具(共 9 个,与 builtin 严格对齐,缺则视为不可用):\n\
      - WindowOpen(query, app_name?, bundle_id?, wait_seconds?): 启动应用并等待窗口;\
        已运行/最小化时直接恢复+前置(不重复启动)。返回 window_id、匹配别名、权限状态\n\
@@ -914,7 +915,7 @@ fn window_use_tools_hint() -> &'static str {
        屏幕绝对坐标(screen_cx/screen_cy=词块中心)—— 视觉路线入口;region 可只识别局部\n\
      - WindowAction(window_id, path, action, text?, x?, y?): 双路线操作。控件树路线:\
        click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible;\
-       坐标视觉路线:click_point/double_click_point/right_click_point/scroll_point/type_text\
+       坐标视觉路线:click_point/double_click_point/right_click_point/scroll_point/type_text/type_text_submit\
        (x/y 传屏幕绝对坐标,取 WindowOCR 的 screen_cx/screen_cy;path 照传 \"/\")\
        scroll 用 text 传方向与行数(如 \"down:3\"/\"up:5\",缺省 3 行);\
        send_keys 用 text 传命名键或组合键(enter/ctrl+a/alt+f4/ctrl+enter)\n\

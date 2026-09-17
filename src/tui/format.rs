@@ -876,12 +876,26 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
             let wid = extract_json_field(args_json, "window_id").unwrap_or_default();
             let path = extract_json_field(args_json, "path").unwrap_or_else(|| "/".into());
             let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
-            format!(
+            let text = extract_json_field(args_json, "text").unwrap_or_default();
+            let x = extract_json_field(args_json, "x").unwrap_or_default();
+            let y = extract_json_field(args_json, "y").unwrap_or_default();
+            let mut brief = format!(
                 "wid={} path={} action={}",
                 truncate_chars(&wid, 12),
                 truncate_chars(&path, 16),
-                truncate_chars(&action, 12)
-            )
+                truncate_chars(&action, 18)
+            );
+            if !text.is_empty() {
+                brief.push_str(&format!(" text={}", truncate_chars(&text, 24)));
+            }
+            if !x.is_empty() && !y.is_empty() {
+                brief.push_str(&format!(
+                    " xy=({},{})",
+                    truncate_chars(&x, 8),
+                    truncate_chars(&y, 8)
+                ));
+            }
+            brief
         }
         "WindowOpen" => {
             let q = extract_json_field(args_json, "query")

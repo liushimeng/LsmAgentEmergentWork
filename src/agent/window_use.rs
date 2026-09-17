@@ -200,10 +200,13 @@ impl WindowUseRunner {
              3. **【中文 UI 同义词表】**filter 失败时优先试同义词(已在 WindowInspect 工具 \
                 description 中完整列出):通讯录/通信录/联系人/Contacts、按钮/Button、\
                 输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences。\n\
-             4. **【发送消息范式】**定位输入框 → set_text 或 type_text 写入消息 →\
-                send_keys(\"enter\") 发送(微信默认 Enter 发送,若应用设置不同可试 \"ctrl+enter\"\
-                或点击「发送」按钮)→ 重新 WindowInspect/OCR 复查消息已出现在对话区。\n\
+             4. **【原子发送范式】**定位输入框后首选一个 `type_text_submit` 完成\
+                键入完整内容 + Enter 提交;视觉路线传输入框中心 x/y,控件树路线先聚焦/传 path。\
+                仅当应用把 Enter 定义为换行时,才用 type_text + click「发送」按钮。\
+                发送后重新 WindowInspect/OCR 复查消息已出现在对话区。\n\
              5. **【效率规范 - 2026-09-17 第 77 轮】**:\n\
+                - 状态块中的窗口 freshness=Fresh 时直接复用 window_id;禁止重复 \
+                  WindowOpen/WindowFind/激活同一目标,避免 UI 反复前置导致焦点断续;\n\
                 - 禁止 Bash 调 screencapture(WindowScreenshot 已走 CGWindow 原生路径);\n\
                 - 禁止 Bash 调 osascript 枚举 UI 或获取窗口位置(WindowInspect / WindowList 已覆盖);\n\
                 - Bash 仅用于:cliclick 坐标点击(控件树+视觉路线都失败时)、open 启动应用、\
@@ -483,7 +486,8 @@ fn count_failure_signals(signals: &[String]) -> Vec<(&'static str, usize)> {
             *bucket.entry("platform_limit").or_insert(0) += 1;
         }
         // timeout
-        else if lower.contains("timeout") || lower.contains("超时") || lower.contains("killpg") {
+        else if lower.contains("timeout") || lower.contains("超时") || lower.contains("killpg")
+        {
             *bucket.entry("timeout").or_insert(0) += 1;
         }
         // bash_exit_nonzero / other
@@ -707,10 +711,7 @@ mod tests {
     fn runner_emits_error_distribution_in_evidence() {
         // P2:WindowUse 单元结束时的 text 应包含「[错误类型分布]」段。
         // 这里仅验证 error_dist 字符串拼接正确,不跑完整 Runner(避免 LLM mock)。
-        let signals = vec![
-            "kAXErrorAPIDisabled".to_string(),
-            "路径越界".to_string(),
-        ];
+        let signals = vec!["kAXErrorAPIDisabled".to_string(), "路径越界".to_string()];
         let buckets = count_failure_signals(&signals);
         let distribution = buckets
             .iter()
@@ -756,8 +757,14 @@ mod tests {
         assert!(msg.contains("⚠️"), "macOS 缺权限应给出警告文案");
         assert!(msg.contains("osascript"), "应包含 osascript 降级命令");
         assert!(msg.contains("cliclick"), "应包含 cliclick 降级命令");
-        assert!(msg.contains("screencapture"), "应包含 screencapture 降级命令");
-        assert!(msg.contains("禁止再尝试 WindowInspect"), "应明确禁止重复尝试");
+        assert!(
+            msg.contains("screencapture"),
+            "应包含 screencapture 降级命令"
+        );
+        assert!(
+            msg.contains("禁止再尝试 WindowInspect"),
+            "应明确禁止重复尝试"
+        );
     }
 
     #[test]
@@ -767,7 +774,10 @@ mod tests {
         let mut t = ExecutionTrace::default();
         assert!(t.permission_missing.is_empty());
 
-        t.permission_missing = vec!["accessibility(macos)".into(), "screen_recording(macos)".into()];
+        t.permission_missing = vec![
+            "accessibility(macos)".into(),
+            "screen_recording(macos)".into(),
+        ];
         let json = serde_json::to_string(&t).expect("serialize ok");
         assert!(json.contains("permission_missing"));
         assert!(json.contains("accessibility(macos)"));

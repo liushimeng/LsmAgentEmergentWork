@@ -198,11 +198,9 @@ impl WindowDriver for MacosAxuiDriver {
                 ));
             }
             ControlAction::ScrollToVisible => {
-                element
-                    .perform_action("AXScrollToVisible")
-                    .map_err(|e| {
-                        platform_err(self.platform_name(), format!("scroll_to_visible 失败:{e}"))
-                    })?;
+                element.perform_action("AXScrollToVisible").map_err(|e| {
+                    platform_err(self.platform_name(), format!("scroll_to_visible 失败:{e}"))
+                })?;
                 Ok("scrolled_to_visible".into())
             }
             // 2026-09-17 第 70 轮:第 67 轮坐标动作(视觉路线)在 macos-axui 路径未实现,
@@ -225,6 +223,13 @@ impl WindowDriver for MacosAxuiDriver {
                     self.platform_name(),
                     "type_text 在 macos-axui 路径暂未实现(无 CGEvent Unicode 键入);\
                      默认 legacy 驱动已支持,或改用 set_text / Bash 白名单 osascript keystroke",
+                ));
+            }
+            ControlAction::TypeTextSubmit { .. } => {
+                return Err(platform_err(
+                    self.platform_name(),
+                    "type_text_submit 请使用默认 legacy 驱动(CGEvent 原子键入+Enter);\
+                     macos-axui typed 路径暂无物理键盘注入",
                 ));
             }
         }

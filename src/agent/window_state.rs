@@ -351,9 +351,13 @@ pub fn build_window_state_prompt(state: &WindowSessionState) -> String {
     // 1. 最后操作窗口
     if let Some(w) = &state.last_window {
         out.push_str(&format!(
-            "上次操作窗口: {} (id={}, 进程={}, PID={})\n",
+            "上次操作窗口: {} (id={}, 进程={}, PID={}, 同一 laew Session)\n",
             w.title, w.window_id, w.process_name, w.pid
         ));
+        out.push_str(
+            "连续性规则: Runner 已校验快照;若操作未报 stale,直接复用该 window_id,\n\
+             不要重复 WindowOpen/WindowFind/激活同一目标。\n",
+        );
         if let Some(p) = &w.last_inspect_path {
             out.push_str(&format!("上次检视路径根: {p}\n"));
         }
@@ -580,7 +584,10 @@ fn parse_window_snapshots(output: &str) -> Option<Vec<WindowSnapshot>> {
             .get("cg_window_id")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
-        let hwnd = item.get("hwnd").and_then(|v| v.as_i64()).map(|v| v as isize);
+        let hwnd = item
+            .get("hwnd")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as isize);
         let wmctrl_id = item
             .get("wmctrl_id")
             .and_then(|v| v.as_str())

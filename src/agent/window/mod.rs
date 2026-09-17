@@ -156,6 +156,16 @@ pub enum ControlAction {
     /// 向**当前焦点控件**真实键入文本(SendInput Unicode / CGEvent keystroke)。
     /// 配合 `click_point` 先点输入框使用;自绘输入框(微信 4.x 等)唯一可靠的输入路径。
     TypeText(String),
+    /// 键入完整文本后立即提交(2026-09-17 第 80 轮)。
+    ///
+    /// 聊天发送框、搜索框、命令面板等场景中,`type_text` 与 `send_keys(enter)`
+    /// 拆成两次工具调用会引入 LLM 返场和焦点迁移窗口;本动作在驱动层原子完成
+    /// “可选点击定位 → 键入 → 等待应用消费 → Enter”。`x/y` 为可选屏幕绝对坐标。
+    TypeTextSubmit {
+        text: String,
+        x: Option<i64>,
+        y: Option<i64>,
+    },
 }
 
 impl ControlAction {
@@ -233,11 +243,22 @@ impl ControlAction {
                     reason: "action=type_text 缺少 string 类型参数 text".into(),
                 })?)
             }
+            "typetextsubmit" | "sendtext" | "typeandsubmit" => {
+                let text = text.ok_or_else(|| AgentError::ToolExecution {
+                    tool: "WindowAction".into(),
+                    reason: "action=type_text_submit 缺少 string 类型参数 text".into(),
+                })?;
+                Self::TypeTextSubmit {
+                    text,
+                    x: x.filter(|v| *v > 0),
+                    y: y.filter(|v| *v > 0),
+                }
+            }
             other => {
                 return Err(AgentError::ToolExecution {
                     tool: "WindowAction".into(),
                     reason: format!(
-                        "未知 action: {other};可用: click / focus / set_text / get_text / send_keys / invoke / scroll / scroll_to_visible / click_point / double_click_point / right_click_point / scroll_point / type_text"
+                        "未知 action: {other};可用: click / focus / set_text / get_text / send_keys / invoke / scroll / scroll_to_visible / click_point / double_click_point / right_click_point / scroll_point / type_text / type_text_submit"
                     ),
                 })
             }
@@ -753,7 +774,10 @@ mod permission_tests {
     fn permission_report_missing_summary_works() {
         let mut r = PermissionReport::default();
         r.platform = "macos".into();
-        assert_eq!(r.missing_summary(), vec!["accessibility(macos)", "screen_recording(macos)"]);
+        assert_eq!(
+            r.missing_summary(),
+            vec!["accessibility(macos)", "screen_recording(macos)"]
+        );
 
         r.accessibility = true;
         assert_eq!(r.missing_summary(), vec!["screen_recording(macos)"]);

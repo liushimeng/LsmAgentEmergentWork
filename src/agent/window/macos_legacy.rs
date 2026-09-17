@@ -75,11 +75,14 @@ extern "C" {
         attribute: CFStringRef,
         value: *mut CFTypeRef,
     ) -> AXError;
+    // 2026-09-17 第 80 轮:读取控件真实支持的 AX action。
+    // 微信 4.x/Electron/Qt 控件不一定支持 AXPress,常用 AXPick/AXConfirm/AXOpen。
     fn AXUIElementSetAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> AXError;
+    fn AXUIElementCopyActionNames(element: AXUIElementRef, value: *mut CFTypeRef) -> AXError;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
     fn AXValueGetValue(
         value: CFTypeRef,
@@ -173,6 +176,10 @@ struct AxStrings {
     windows: usize,
     focused: usize,
     press_action: usize,
+    raise_action: usize,
+    pick_action: usize,
+    confirm_action: usize,
+    open_action: usize,
     scroll_to_visible_action: usize,
     manual_accessibility: usize,
 }
@@ -197,6 +204,10 @@ fn ax_strings() -> &'static AxStrings {
             windows: cfstr_literal("AXWindows"),
             focused: cfstr_literal("AXFocused"),
             press_action: cfstr_literal("AXPress"),
+            raise_action: cfstr_literal("AXRaise"),
+            pick_action: cfstr_literal("AXPick"),
+            confirm_action: cfstr_literal("AXConfirm"),
+            open_action: cfstr_literal("AXOpen"),
             scroll_to_visible_action: cfstr_literal("AXScrollToVisible"),
             manual_accessibility: cfstr_literal("AXManualAccessibility"),
         }
@@ -259,6 +270,22 @@ fn kAXFocusedAttribute() -> CFStringRef {
 #[inline]
 fn kAXPressAction() -> CFStringRef {
     ax_strings().press_action as CFStringRef
+}
+#[inline]
+fn kAXRaiseAction() -> CFStringRef {
+    ax_strings().raise_action as CFStringRef
+}
+#[inline]
+fn kAXPickAction() -> CFStringRef {
+    ax_strings().pick_action as CFStringRef
+}
+#[inline]
+fn kAXConfirmAction() -> CFStringRef {
+    ax_strings().confirm_action as CFStringRef
+}
+#[inline]
+fn kAXOpenAction() -> CFStringRef {
+    ax_strings().open_action as CFStringRef
 }
 #[inline]
 fn kAXScrollToVisibleAction() -> CFStringRef {
@@ -367,12 +394,8 @@ unsafe fn cg_scroll_lines(lines: i32) {
     let mut remaining = lines;
     while remaining != 0 {
         let step = remaining.clamp(-3, 3);
-        let ev = CGEventCreateScrollWheelEvent(
-            std::ptr::null(),
-            K_CG_SCROLL_EVENT_UNIT_LINE,
-            1,
-            step,
-        );
+        let ev =
+            CGEventCreateScrollWheelEvent(std::ptr::null(), K_CG_SCROLL_EVENT_UNIT_LINE, 1, step);
         if ev.is_null() {
             break;
         }
@@ -419,12 +442,8 @@ unsafe fn cg_click_at(x: f64, y: f64, right: bool, double: bool) {
     let clicks = if double { 2 } else { 1 };
     for seq in 1..=clicks {
         for &mouse_type in &[down, up] {
-            let ev = CGEventCreateMouseEvent(
-                std::ptr::null(),
-                mouse_type,
-                CGPoint { x, y },
-                button,
-            );
+            let ev =
+                CGEventCreateMouseEvent(std::ptr::null(), mouse_type, CGPoint { x, y }, button);
             if ev.is_null() {
                 return;
             }
@@ -796,6 +815,52 @@ impl MacOsDriver {
         rect
     }
 
+    /// 读取控件真实支持的 AX action 名称(2026-09-17 第 80 轮)。
+    ///
+    /// AX 返回的 CFArray 元素生命周期由数组持有;这里拷贝为 Rust String 后
+    /// 只释放外层数组,不释放元素。
+    unsafe fn element_action_names(el: AXUIElementRef) -> Vec<String> {
+        let mut value: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyActionNames(el, &mut value);
+        if err != K_AX_ERROR_SUCCESS || value.is_null() {
+            return Vec::new();
+        }
+        let array = value as CFArrayRef;
+        let mut out = Vec::new();
+        for i in 0..CFArrayGetCount(array) {
+            let action = CFArrayGetValueAtIndex(array, i) as CFStringRef;
+            if !action.is_null() {
+                let name = cfstr(action);
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+        }
+        CFRelease(value);
+        out
+    }
+
+    /// 把真实 AX action 名称映射成 WindowAction 工具动作名,并与 role 推断合并。
+    fn merge_ax_actions(role_actions: Vec<String>, ax_actions: &[String]) -> Vec<String> {
+        let mut out = role_actions;
+        let has = |v: &Vec<String>, key: &str| v.iter().any(|s| s == key);
+        let ax_has = |needle: &str| ax_actions.iter().any(|s| s == needle);
+        if !has(&out, "click")
+            && (ax_has("AXPress") || ax_has("AXPick") || ax_has("AXConfirm") || ax_has("AXOpen"))
+        {
+            out.push("click".into());
+        }
+        if !has(&out, "focus") && ax_has("AXRaise") {
+            out.push("focus".into());
+        }
+        if !has(&out, "scroll_to_visible") && ax_has("AXScrollToVisible") {
+            out.push("scroll_to_visible".into());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// 按角色推断支持动作(LLM 检视后据此选择合法操作)。
     fn actions_for_role(role: &str) -> Vec<String> {
         let r = role.to_lowercase();
@@ -872,7 +937,9 @@ impl MacOsDriver {
             actions: Vec::new(),
             children: Vec::new(),
         };
-        node.actions = Self::actions_for_role(&node.role);
+        let role_actions = Self::actions_for_role(&node.role);
+        let ax_actions = Self::element_action_names(el);
+        node.actions = Self::merge_ax_actions(role_actions, &ax_actions);
 
         if depth < max_depth {
             let children = ax_get(el, kAXChildrenAttribute());
@@ -1100,17 +1167,47 @@ impl WindowDriver for MacOsDriver {
             CFRelease(win);
             let result = match &action {
                 ControlAction::Click | ControlAction::Invoke => {
-                    let err = AXUIElementPerformAction(el, kAXPressAction());
-                    if err == K_AX_ERROR_SUCCESS {
-                        Ok(format!("已对 {window_id}{path} 执行点击(AXPress)"))
-                    } else {
-                        Err(platform_err("macos", ax_error_text(err)))
+                    // 第 80 轮:按控件真实 action 能力选择,而不是硬编码 AXPress。
+                    let ax_actions = Self::element_action_names(el);
+                    let candidates: &[(&str, CFStringRef)] = &[
+                        ("AXPress", kAXPressAction()),
+                        ("AXPick", kAXPickAction()),
+                        ("AXConfirm", kAXConfirmAction()),
+                        ("AXOpen", kAXOpenAction()),
+                    ];
+                    let mut selected: Option<(String, AXError)> = None;
+                    for (name, action) in candidates {
+                        if ax_actions.is_empty() || ax_actions.iter().any(|s| s == name) {
+                            let err = AXUIElementPerformAction(el, *action);
+                            if err == K_AX_ERROR_SUCCESS {
+                                selected = Some(((*name).to_string(), err));
+                                break;
+                            }
+                            selected = Some(((*name).to_string(), err));
+                            if err != K_AX_ERROR_ACTION_UNSUPPORTED {
+                                break;
+                            }
+                        }
+                    }
+                    match selected {
+                        Some((name, K_AX_ERROR_SUCCESS)) => {
+                            Ok(format!("已对 {window_id}{path} 执行点击({name})"))
+                        }
+                        Some((name, err)) => Err(platform_err(
+                            "macos",
+                            format!("AX {name} 失败: {}", ax_error_text(err)),
+                        )),
+                        None => Err(platform_err(
+                            "macos",
+                            "控件未暴露任何可点击 AX action;请重新 WindowInspect 确认 path",
+                        )),
                     }
                 }
                 ControlAction::Focus => {
                     let true_v: CFBooleanRef =
                         core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
-                    let err = AXUIElementSetAttributeValue(el, kAXFocusedAttribute(), true_v.cast());
+                    let err =
+                        AXUIElementSetAttributeValue(el, kAXFocusedAttribute(), true_v.cast());
                     if err == K_AX_ERROR_SUCCESS {
                         Ok(format!("已聚焦 {window_id}{path}"))
                     } else {
@@ -1122,7 +1219,10 @@ impl WindowDriver for MacOsDriver {
                     let err = AXUIElementSetAttributeValue(el, kAXValueAttribute(), cf.cast());
                     CFRelease(cf.cast());
                     if err == K_AX_ERROR_SUCCESS {
-                        Ok(format!("已向 {window_id}{path} 写入文本({} 字符)", text.chars().count()))
+                        Ok(format!(
+                            "已向 {window_id}{path} 写入文本({} 字符)",
+                            text.chars().count()
+                        ))
                     } else {
                         Err(platform_err("macos", ax_error_text(err)))
                     }
@@ -1168,7 +1268,9 @@ impl WindowDriver for MacOsDriver {
                 ControlAction::ScrollToVisible => {
                     let err = AXUIElementPerformAction(el, kAXScrollToVisibleAction());
                     if err == K_AX_ERROR_SUCCESS {
-                        Ok(format!("已把 {window_id}{path} 滚动到可见区域(AXScrollToVisible)"))
+                        Ok(format!(
+                            "已把 {window_id}{path} 滚动到可见区域(AXScrollToVisible)"
+                        ))
                     } else {
                         Err(platform_err("macos", ax_error_text(err)))
                     }
@@ -1183,7 +1285,9 @@ impl WindowDriver for MacOsDriver {
                 }
                 ControlAction::DoubleClickPoint { x, y } => {
                     cg_click_at(*x as f64, *y as f64, false, true);
-                    Ok(format!("已在屏幕坐标 ({x},{y}) 执行物理双击(CGEvent,clickState=2)"))
+                    Ok(format!(
+                        "已在屏幕坐标 ({x},{y}) 执行物理双击(CGEvent,clickState=2)"
+                    ))
                 }
                 ControlAction::RightClickPoint { x, y } => {
                     cg_click_at(*x as f64, *y as f64, true, false);
@@ -1206,10 +1310,70 @@ impl WindowDriver for MacOsDriver {
                         text.chars().count()
                     ))
                 }
+                // 第 80 轮:原子发送链路。可选坐标点击 → 完整 Unicode 键入 →
+                // 等待 App 消费 → Enter,消除三次工具调用之间的焦点竞态。
+                ControlAction::TypeTextSubmit { text, x, y } => {
+                    if let (Some(x), Some(y)) = (x, y) {
+                        cg_click_at(*x as f64, *y as f64, false, false);
+                    } else {
+                        // 控件树路径操作时先聚焦,保证 CGEvent 投递到目标控件。
+                        let true_v: CFBooleanRef =
+                            core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
+                        let _ =
+                            AXUIElementSetAttributeValue(el, kAXFocusedAttribute(), true_v.cast());
+                    }
+                    cg_type_text(text);
+                    // WeChat/Electron 在收到 Unicode key-up 后才把文本入输入模型;
+                    // 120ms 足以吸收一次 App 内部 runloop,又几乎不感知延迟。
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    cg_send_key(keycode_for_name("enter").unwrap_or(36));
+                    Ok(format!(
+                        "已键入 {} 字符并提交(type_text_submit{})",
+                        text.chars().count(),
+                        match (x, y) {
+                            (Some(x), Some(y)) => format!(", 坐标=({x},{y})"),
+                            _ => String::new(),
+                        }
+                    ))
+                }
             };
             CFRelease(el);
             result
         }
+    }
+
+    fn bring_to_front(&self, window_id: &str) -> Result<()> {
+        let (pid, idx) = Self::parse_window_id(window_id)?;
+        // 先 AXRaise 对应 NSWindow,再通过 System Events 让 App frontmost。
+        // AXRaise 只调整窗口层级;部分 App(尤其微信/Electron)仍需 frontmost
+        // 才会接受键盘事件,因此两步都不能省。
+        unsafe {
+            let win = Self::window_element(pid, idx)?;
+            let raise_err = AXUIElementPerformAction(win, kAXRaiseAction());
+            CFRelease(win);
+            if raise_err != K_AX_ERROR_SUCCESS
+                && raise_err != K_AX_ERROR_ACTION_UNSUPPORTED
+                && raise_err != K_AX_ERROR_ATTRIBUTE_UNSUPPORTED
+            {
+                return Err(platform_err("macos", ax_error_text(raise_err)));
+            }
+        }
+        let script = format!(
+            "tell application \"System Events\" to set frontmost of (first application process whose unix id is {pid}) to true"
+        );
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .map_err(|e| platform_err("macos", format!("执行 osascript 激活窗口失败: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(platform_err(
+                "macos",
+                format!("osascript 激活 pid={pid} 失败: {}", stderr.trim()),
+            ));
+        }
+        Ok(())
     }
 
     fn permission_hint(&self) -> Option<String> {
@@ -1234,9 +1398,7 @@ impl WindowDriver for MacOsDriver {
         region: Option<Rect>,
         lang: Option<&str>,
     ) -> Result<Vec<super::OcrBlock>> {
-        use crate::agent::window::macos_vision_ocr::{
-            self, VisionOcrConfig, VisionOcrBlock,
-        };
+        use crate::agent::window::macos_vision_ocr::{self, VisionOcrBlock, VisionOcrConfig};
 
         // 1. 解析 window_id → CGWindowID
         let (pid, _) = Self::parse_window_id(window_id)?;
@@ -1258,14 +1420,8 @@ impl WindowDriver for MacOsDriver {
         let region_tuple = region.map(|r| (r.x, r.y, r.width, r.height));
 
         // 4. 执行 OCR
-        let blocks = macos_vision_ocr::ocr_window(cg_window_id, region_tuple, Some(cfg)).map_err(
-            |e| {
-                platform_err(
-                    self.platform_name(),
-                    format!("Vision OCR 失败: {e}"),
-                )
-            },
-        )?;
+        let blocks = macos_vision_ocr::ocr_window(cg_window_id, region_tuple, Some(cfg))
+            .map_err(|e| platform_err(self.platform_name(), format!("Vision OCR 失败: {e}")))?;
 
         // 5. 转换为统一的 OcrBlock 格式
         Ok(blocks
@@ -1310,13 +1466,8 @@ impl WindowDriver for MacOsDriver {
             cfg.languages = lang_str.split(',').map(|s| s.trim().to_string()).collect();
         }
         let region_tuple = region.map(|r| (r.x, r.y, r.width, r.height));
-        let blocks =
-            macos_vision_ocr::ocr_window(cg_window_id, region_tuple, Some(cfg)).map_err(|e| {
-                platform_err(
-                    self.platform_name(),
-                    format!("Vision OCR 失败: {e}"),
-                )
-            })?;
+        let blocks = macos_vision_ocr::ocr_window(cg_window_id, region_tuple, Some(cfg))
+            .map_err(|e| platform_err(self.platform_name(), format!("Vision OCR 失败: {e}")))?;
         Ok(blocks
             .into_iter()
             .map(|b| super::OcrBlock {
@@ -1352,21 +1503,12 @@ impl WindowDriver for MacOsDriver {
         let region_tuple = region.map(|r| (r.x, r.y, r.width, r.height));
 
         // 3. 执行截图
-        macos_vision_ocr::screenshot_window(cg_window_id, region_tuple, output_path).map_err(
-            |e| {
-                platform_err(
-                    self.platform_name(),
-                    format!("CGWindow 截图失败: {e}"),
-                )
-            },
-        )?;
+        macos_vision_ocr::screenshot_window(cg_window_id, region_tuple, output_path)
+            .map_err(|e| platform_err(self.platform_name(), format!("CGWindow 截图失败: {e}")))?;
 
         // 4. 返回实际截取的区域
         let meta = std::fs::metadata(output_path).map_err(|e| {
-            platform_err(
-                self.platform_name(),
-                format!("读取截图文件元数据失败: {e}"),
-            )
+            platform_err(self.platform_name(), format!("读取截图文件元数据失败: {e}"))
         })?;
 
         // 返回窗口 bounds(截图前已获取)
@@ -1399,14 +1541,8 @@ impl WindowDriver for MacOsDriver {
         };
 
         let region_tuple = region.map(|r| (r.x, r.y, r.width, r.height));
-        macos_vision_ocr::screenshot_window(cg_window_id, region_tuple, output_path).map_err(
-            |e| {
-                platform_err(
-                    self.platform_name(),
-                    format!("CGWindow 截图失败: {e}"),
-                )
-            },
-        )?;
+        macos_vision_ocr::screenshot_window(cg_window_id, region_tuple, output_path)
+            .map_err(|e| platform_err(self.platform_name(), format!("CGWindow 截图失败: {e}")))?;
         Ok(info.bounds)
     }
 }
