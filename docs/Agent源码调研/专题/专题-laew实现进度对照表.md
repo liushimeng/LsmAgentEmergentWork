@@ -711,3 +711,33 @@ SubAgent 写 Python Playwright 脚本 → AI 回复写入 wenxin_result.txt(530 
 做 Round-trip 校验。
 
 **方案**:`tmpPlan/2026-09-17_09-WebUse全链路根治与sub_session内容展示方案.md`
+
+---
+
+## 第 77 轮（2026-09-17）— Read 工具多模态与编码探测增强
+
+**主题**:第七轮多模态专题 P0 路线 (b)「Read 工具按扩展名与 magic number 探测分流文本 / 图片 / PDF」落地。
+此前 Read 工具仅支持 UTF-8 文本,读图片/PDF/UTF-16 直接报「stream did not contain valid UTF-8」;
+本轮按 claudecode 分流基线实现:纯 Rust 字节常量匹配常见 magic number(PNG/JPEG/GIF/WebP/BMP/PDF/UTF-16 BOM),
+零新 crate 依赖(避开 crate.io 慢网络 + 构建时间)。
+
+| 编号 | gap | 等级 | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|------|---------|---------|
+| read-multimodal | 第七轮多模态 P0 路线 (b):Read 工具仅 UTF-8,无图片/PDF/UTF-16 探测 | P0 | ✅ | `src/agent/tools/read_detect.rs`(FileClass 枚举 + `classify_bytes`/`classify`,零新 crate,字节常量匹配 10 类 magic number + UTF-16 BOM + 扩展名兜底白名单 60+ 种)+ `src/agent/tools/read.rs` 分流(图片 base64 标记块/UTF-16 解码/PDF pdftotext 提示/二进制兜底)+ `src/agent/tools/mod.rs` 注册 `pub mod read_detect;` | 2026-09-17 第 77 轮 |
+
+**设计要点**:
+- **零新 crate**:纯 Rust 字节常量匹配,不引入 `infer`/`image` 等(规避 crate.io 慢网络与构建膨胀)。
+- **图片 base64 标记块**:PNG/JPEG/GIF/WebP/BMP ≤ 5MB → `<<<LAEW:FILE path="..." media_type="image/png" bytes=N base64_bytes=M>>>` + 76 字符/行 base64 + `<<<END_LAEW:FILE>>>`,LLM 可直接感知图片内容。
+- **大小限制**:图片 5MB / PDF 10MB / 未知二进制 1MB 超限友好拒绝(非崩溃),提示 Bash 替代方案。
+- **UTF-16 BOM 探测**:FF FE → UTF-16 LE / FE FF → UTF-16 BE,跳过 BOM 后 `String::from_utf16_lossy` 解码。
+- **PDF 友好提示**:≤ 10MB 返回 `application/pdf` 标记 + `pdftotext` 抽取命令提示;不依赖外部工具解析。
+- **扩展名兜底白名单**:字节探测为 Binary 但扩展名明确是文本(.txt/.md/.rs/.py 等 60+ 种) → 回退 Text。
+- **全 UTF-8 文本主路径零回归**:原 `read_text` 函数完整保留,仅新增分支。
+
+**验证**:单元测试 1135 全过(新增 read_detect 18 + read 7 = 25 项);
+`run_e2e.sh` PASS=188 FAIL=0(含既有基线)。真实网关实测 108 字节 PNG 返回完整 base64 标记块 + LLM 正确解读。
+
+**未做(后续候选)**:图片 resize(> 2000px 长边)/ PDF 内容解析(poppler 依赖)/ Notebook(.ipynb) 解码/
+重复图片去重缓存 / EXIF orientation 应用。
+
+**方案**:`tmpPlan/2026-09-17_05-Read工具多模态与编码探测增强方案.md`

@@ -21,6 +21,7 @@ pub mod emit;
 pub mod glob;
 pub mod grep;
 pub mod read;
+pub mod read_detect;
 pub mod window;
 pub mod window_vision;
 pub mod write;
