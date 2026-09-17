@@ -43,6 +43,9 @@ pub struct ProviderRecord {
     pub created_at: String,
     /// 上下文最大 Token 数(默认 800K;0 = 不限制,关闭自动压缩)
     pub context_max_size: u64,
+    /// 是否显式放行私网/loopback endpoint(用于本地 Ollama/LMStudio/mock LLM 服务)。
+    /// true = 跳过该 provider 的 SSRF 私网拦截;false = 走完整校验(默认 fail-closed)。
+    pub allow_private_endpoint: bool,
 }
 
 /// ContextMaxSize 默认值:800K tokens。
@@ -98,6 +101,9 @@ pub struct ProviderImport {
     /// 可选:旧版(1.0)导出文件/手写配置无此字段,导入时补默认值 800K。
     #[serde(default)]
     pub context_max_size: Option<u64>,
+    /// 可选:旧版导出文件无此字段,导入时默认 false(保持 SSRF fail-closed)。
+    #[serde(default)]
+    pub allow_private_endpoint: Option<bool>,
 }
 
 /// 导入用：导出信封格式(`--outprovider` 产出的 JSON),支持原样再导入(往返兼容)
@@ -138,6 +144,7 @@ pub struct ExportRecord {
     pub is_active: bool,
     pub created_at: String,
     pub context_max_size: u64,
+    pub allow_private_endpoint: bool,
 }
 
 /// 导出用：完整导出数据结构
@@ -164,11 +171,13 @@ impl ExportData {
                 is_active: r.is_active,
                 created_at: r.created_at,
                 context_max_size: r.context_max_size,
+                allow_private_endpoint: r.allow_private_endpoint,
             })
             .collect();
 
         Self {
-            version: "1.1".to_string(),
+            // version 1.2:新增 per-provider allow_private_endpoint 字段(第 72 轮)。
+            version: "1.2".to_string(),
             exported_at: time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
                 .format(&time::format_description::well_known::Rfc3339)

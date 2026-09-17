@@ -378,9 +378,10 @@ pub trait LlmClient: Send + Sync {
 /// 自动包一层 [`ResilientLlmClient`]:超时感知 + 自动重试 + 指数退避 +
 /// 三态熔断,调用方(main / tui)零改动即获得弹性与故障隔离。
 pub fn client_from_record(record: &ProviderRecord, user_agent: &str) -> Result<Arc<dyn LlmClient>> {
-    // D9-7 SSRF 防护(L1608/L1625):创建 LLM 客户端前校验 end_point 安全性,
-    // 拒绝私网/CGNAT/link-local 请求,防 SSRF 攻击。
-    crate::agent::safety::url_safety::is_safe_endpoint(&record.end_point).map_err(|e| {
+    // D9-7 SSRF 防护(L1608/L1625):创建 LLM 客户端前校验 end_point 安全性。
+    // 第 72 轮:per-provider `allow_private_endpoint = true` 时跳过私网拦截,
+    // 用于本地 Ollama/LMStudio/mock LLM 服务(避免全局 LAEW_ALLOW_PRIVATE_ENDPOINT=1 一刀切)。
+    crate::agent::safety::url_safety::is_safe_endpoint_for_record(record).map_err(|e| {
         crate::error::AgentError::Config(crate::database::ConfigError::UrlSafety(format!(
             "end_point 不安全: {e}"
         )))

@@ -32,7 +32,7 @@ impl ProviderForm {
     pub fn new_add(db: Arc<Mutex<Db>>, paths: Paths, on_done: OnDone) -> Self {
         Self {
             mode: Mode::Add,
-            form: TabForm::new(Self::default_tabs(None, None, None, None, None)),
+            form: TabForm::new(Self::default_tabs(None, None, None, None, None, None)),
             db,
             paths,
             error: None,
@@ -54,6 +54,7 @@ impl ProviderForm {
                 Some(&record.model_name),
                 Some(&record.end_point),
                 Some(&record.api_key),
+                Some(record.allow_private_endpoint),
             )),
             db,
             paths,
@@ -68,10 +69,17 @@ impl ProviderForm {
         model_name: Option<&str>,
         end_point: Option<&str>,
         api_key: Option<&str>,
+        allow_private_endpoint: Option<bool>,
     ) -> Vec<Tab> {
         let proto_idx = match proto.unwrap_or(Protocol::Anthropic) {
             Protocol::Anthropic => 0,
             Protocol::OpenAi => 1,
+        };
+        // allow_private_endpoint:默认 false(禁止);仅本地 Ollama/LMStudio/mock LLM 用户显式选"允许"。
+        let priv_idx = if allow_private_endpoint.unwrap_or(false) {
+            1
+        } else {
+            0
         };
         vec![
             Tab::choice(
@@ -89,11 +97,18 @@ impl ProviderForm {
                 false,
                 &crate::config::DEFAULT_CONTEXT_MAX_SIZE.to_string(),
             ),
+            Tab::choice(
+                "allow_private_endpoint",
+                vec!["禁止".into(), "允许".into()],
+                priv_idx,
+            ),
             Tab::confirm("确认", vec![ConfirmAction::Submit, ConfirmAction::Cancel]),
         ]
     }
 
-    fn validate(&self) -> Result<(Protocol, String, String, String, String, u64), String> {
+    fn validate(
+        &self,
+    ) -> Result<(Protocol, String, String, String, String, u64, bool), String> {
         let p = self.parse_protocol()?;
         let provider_name = self.form.tabs[1].value.trim().to_string();
         if provider_name.is_empty() {
@@ -119,6 +134,8 @@ impl ProviderForm {
         } else {
             crate::config::parse_context_size(&ctx_raw)?
         };
+        // allow_private_endpoint:Choice tab,index 6,值 "允许"=true / "禁止"=false
+        let allow_private = self.form.tabs[6].value == "允许";
         Ok((
             p,
             provider_name,
@@ -126,6 +143,7 @@ impl ProviderForm {
             end_point,
             api_key,
             context_max_size,
+            allow_private,
         ))
     }
 
@@ -140,12 +158,21 @@ impl ProviderForm {
                 self.error = Some(e);
                 Outcome::Continue
             }
-            Ok((p, pn, mn, ep, ak, ctx)) => {
+            Ok((p, pn, mn, ep, ak, ctx, allow_private)) => {
                 let db = self.db.clone();
                 let res = match self.mode {
                     Mode::Add => {
                         let guard = db.lock().expect("db");
-                        guard.add_with_context(p, &pn, &mn, &ep, &ak, Some(ctx))
+                        guard.add_with_all(
+                            p,
+                            &pn,
+                            &mn,
+                            &ep,
+                            &ak,
+                            Some(ctx),
+                            Some(allow_private),
+                            true,
+                        )
                     }
                     Mode::Edit(id) => {
                         // Edit 模式暂未通过 TUI 触发;这里走 set_active/use 路径即可

@@ -149,6 +149,10 @@ enum ProviderCmd {
         /// 上下文最大 Token 数(默认 800K;支持 800000/800K/1M 写法;0 = 不限制,关闭自动压缩)
         #[arg(long, value_parser = parse_context_size)]
         context_max_size: Option<u64>,
+        /// 显式放行私网/loopback endpoint(用于本地 Ollama/LMStudio/mock LLM 服务)。
+        /// 默认 false = 走完整 SSRF 校验;设 true 后跳过该 provider 的私网拦截。
+        #[arg(long)]
+        allow_private_endpoint: bool,
     },
     /// 列出全部接入记录(标记当前激活项)
     List,
@@ -182,22 +186,26 @@ async fn cmd_provider(p: ProviderCmd) -> Result<()> {
             end_point,
             api_key,
             context_max_size,
+            allow_private_endpoint,
         } => {
             let id = db
-                .add_with_context(
+                .add_with_all(
                     protocol,
                     &provider_name,
                     &model_name,
                     &end_point,
                     &api_key,
                     context_max_size,
+                    Some(allow_private_endpoint),
+                    true,
                 )
                 .map_err(anyhow::Error::from)?;
             println!(
-                "✓ 已新增接入记录 id={id}(context_max_size={})",
+                "✓ 已新增接入记录 id={id}(context_max_size={}, allow_private_endpoint={})",
                 lsm_agent::config::format_context_size(
                     context_max_size.unwrap_or(lsm_agent::config::DEFAULT_CONTEXT_MAX_SIZE)
-                )
+                ),
+                if allow_private_endpoint { "允许" } else { "禁止" }
             );
         }
         ProviderCmd::List => {
@@ -209,14 +217,15 @@ async fn cmd_provider(p: ProviderCmd) -> Result<()> {
             for r in records {
                 let marker = if r.is_active { "*" } else { " " };
                 println!(
-                    "{marker} id={:<3} [{:<9}] {}/{:<24} @ {}  (key 末4位: {}, ctx: {})",
+                    "{marker} id={:<3} [{:<9}] {}/{:<24} @ {}  (key 末4位: {}, ctx: {}, priv: {})",
                     r.id,
                     r.protocol.as_str(),
                     r.provider_name,
                     r.model_name,
                     r.end_point,
                     tail(&r.api_key, 4),
-                    lsm_agent::config::format_context_size(r.context_max_size)
+                    lsm_agent::config::format_context_size(r.context_max_size),
+                    if r.allow_private_endpoint { "允许" } else { "禁止" }
                 );
             }
         }
@@ -227,11 +236,16 @@ async fn cmd_provider(p: ProviderCmd) -> Result<()> {
             // 避免「use 完以为生效,但实际默认还是旧 provider」的认知偏差。
             if let Ok(Some(active)) = db.get_active() {
                 println!(
-                    "✓ 已切换当前模型为 id={id} → {} / {} @ {} (ctx: {})",
+                    "✓ 已切换当前模型为 id={id} → {} / {} @ {} (ctx: {}, priv: {})",
                     active.provider_name,
                     active.model_name,
                     active.end_point,
-                    lsm_agent::config::format_context_size(active.context_max_size)
+                    lsm_agent::config::format_context_size(active.context_max_size),
+                    if active.allow_private_endpoint {
+                        "允许"
+                    } else {
+                        "禁止"
+                    }
                 );
             } else {
                 println!("✓ 已切换当前模型为 id={id}");

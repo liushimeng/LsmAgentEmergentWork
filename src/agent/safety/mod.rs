@@ -16,4 +16,6 @@ pub use credentials::{Vault, CREDENTIAL_PREFIX};
 pub use prompt_injection::{
     scan_and_wrap, InjectionSource, InjectionVerdict, MatchHit, Severity, INJECTION_BOUNDARY,
 };
-pub use url_safety::{check_endpoint_safety, is_safe_endpoint, BLOCKED_HOSTNAMES};
+pub use url_safety::{
+    check_endpoint_safety, is_safe_endpoint, is_safe_endpoint_for_record, BLOCKED_HOSTNAMES,
+};
