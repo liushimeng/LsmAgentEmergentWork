@@ -153,9 +153,94 @@ pub fn check_window_use_bash(command: &str) -> Result<()> {
     Err(AgentError::PermissionDenied {
         tool: "Bash".into(),
         reason: format!(
-            "[windowuse-mode] 命令首 token \"{token}\" 不在白名单(白名单见 BashTool description)。WindowUse Bash 仅允许桌面操控类命令(osascript / cliclick / screencapture / pbcopy / open / ls / ps / defaults / sleep 等);通用任务请改走 SubAgent Bash(非白名单模式)。"
+            "[windowuse-mode] 命令首 token \"{token}\" 不在白名单(白名单见 BashTool description)。WindowUse Bash 仅允许桌面操控类命令(osascript / cliclick / screencapture / pbcopy / open / ls / ps / defaults / sleep 等);通用任务请改走 SubAgent Bash(非白名单模式)。若需诊断 / 调试,可传 trust_level=\"debug\" 临时放开 defaults / log show / python3 -c \"from Quartz\" 等命令。"
         ),
     })
+}
+
+/// 2026-09-17 第 76 轮 P1-1:Bash 信任级别,仅在 WindowUse 模式下生效。
+///
+/// 三档严格度,LLM 可通过 Bash 工具参数 `trust_level` 临时切换(每个工具调用独立)。
+/// - Strict(默认):仅桌面操控类(osascript / cliclick / screencapture / pbcopy 等);
+/// - Debug:在 Strict 基础上放开 diagnostics(defaults read / log show / system_profiler /
+///   python3 -c "from Quartz...");黑名单(危险命令 / 敏感路径)永远优先拦截。
+/// - Free:等同 SubAgent Bash(仅黑名单拦截),不再受白名单限制。LLM 调用时
+///   会输出警告日志(防止滥用)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashTrustLevel {
+    Strict,
+    Debug,
+    Free,
+}
+
+impl BashTrustLevel {
+    pub fn from_str(s: Option<&str>) -> Self {
+        match s.map(str::to_ascii_lowercase).as_deref() {
+            Some("debug") => Self::Debug,
+            Some("free") | Some("open") => Self::Free,
+            _ => Self::Strict,
+        }
+    }
+}
+
+/// 校验命令是否在 WindowUse Debug 级别白名单内(放宽版)。
+const WINDOW_USE_BASH_DEBUG_ALLOWLIST: &[&str] = &[
+    "defaults",
+    "log",
+    "system_profiler",
+    "sw_vers",
+    "python3",
+    "ioreg",
+    "security",
+    "tccutil",
+    "codesign",
+    "spctl",
+    "mdls",
+    "xattr",
+    "file",
+    "mdfind",
+];
+
+pub fn check_window_use_bash_with_trust(command: &str, trust: BashTrustLevel) -> Result<()> {
+    if !window_use_mode() {
+        return Ok(());
+    }
+    if trust == BashTrustLevel::Free {
+        // Free 模式:仅黑名单拦截(原 check_bash_command)
+        return permissions::check_bash_command(command);
+    }
+    // Strict / Debug 模式:先尝试 Debug 白名单(Debug 也含 strict 白名单)
+    if trust == BashTrustLevel::Debug {
+        let token = first_command_token(command);
+        let lower = command.to_lowercase();
+        let allowed_debug = WINDOW_USE_BASH_DEBUG_ALLOWLIST
+            .iter()
+            .any(|k| token.eq_ignore_ascii_case(k));
+        if allowed_debug {
+            // Debug 白名单命中,放行(但仍走黑名单)
+            return permissions::check_bash_command(command);
+        }
+        // 兜底:命令含已知诊断关键字
+        if [
+            "defaults read",
+            "log show",
+            "log stream",
+            "system_profiler",
+            "from quartz",
+            "import quartz",
+            "from vision",
+            "import vision",
+            "tccutil",
+            "ioreg -l",
+        ]
+        .iter()
+        .any(|k| lower.contains(k))
+        {
+            return permissions::check_bash_command(command);
+        }
+    }
+    // Strict 模式(以及 Debug 模式未命中扩展白名单)走标准白名单校验
+    check_window_use_bash(command)
 }
 
 /// 命令首个 token(去掉前导空白 / env 前缀)。
@@ -371,6 +456,11 @@ impl Tool for BashTool {
                 "description": {
                     "type": "string",
                     "description": "一句话描述命令用途(便于审计)"
+                },
+                "trust_level": {
+                    "type": "string",
+                    "enum": ["strict", "debug", "free"],
+                    "description": "可选,WindowUse Bash 信任级别(仅在 windowuse-mode 下生效):strict(默认,仅桌面操控)/ debug(放开诊断命令)/ free(等同 SubAgent,仅黑名单拦截)"
                 }
             },
             "required": ["command"],
@@ -394,9 +484,21 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .min(MAX_TIMEOUT_MS);
 
+        // 2026-09-17 第 76 轮 P1-1:解析 trust_level(默认 strict)。
+        let trust = BashTrustLevel::from_str(args.get("trust_level").and_then(Value::as_str));
+        if window_use_mode() && trust != BashTrustLevel::Strict {
+            tracing::info!(
+                trust = ?trust,
+                command_first_token = %first_command_token(&command),
+                "WindowUse Bash trust_level 临时提升"
+            );
+        }
+
         // P0:危险命令 + 敏感路径拦截(fail-closed)
         permissions::check_bash_command(&command)?;
-        // 2026-09-16 第 54 轮补丁 A:WindowUse Bash 白名单校验(黑名单仍优先)
+        // 2026-09-16 第 54 轮补丁 A + 2026-09-17 第 76 轮 P1-1:WindowUse Bash 白名单校验,
+        // 根据 trust_level 选择严格度(strict / debug / free)。
+        check_window_use_bash_with_trust(&command, trust)?;
         check_window_use_bash(&command)?;
 
         // 解析 bash 二进制路径:Windows 上必须跳过 WSL bash launcher
@@ -708,5 +810,87 @@ mod tests {
             .await
             .unwrap();
         assert!(off.contains("[]"), "默认不注入,实际: {off}");
+    }
+
+    // ===== 2026-09-17 第 76 轮 P1-1:Bash trust_level 分级白名单 =====
+
+    #[test]
+    fn bash_trust_level_from_str() {
+        assert_eq!(BashTrustLevel::from_str(None), BashTrustLevel::Strict);
+        assert_eq!(BashTrustLevel::from_str(Some("strict")), BashTrustLevel::Strict);
+        assert_eq!(BashTrustLevel::from_str(Some("DEBUG")), BashTrustLevel::Debug);
+        assert_eq!(BashTrustLevel::from_str(Some("Free")), BashTrustLevel::Free);
+        assert_eq!(BashTrustLevel::from_str(Some("open")), BashTrustLevel::Free);
+        assert_eq!(BashTrustLevel::from_str(Some("unknown")), BashTrustLevel::Strict);
+    }
+
+    #[tokio::test]
+    async fn bash_trust_level_strict_blocks_debug_commands() {
+        let _env = lock_env();
+        unsafe {
+            std::env::set_var(WINDOW_USE_MODE_ENV, "1");
+        }
+        // Strict: defaults read 应被拒(不在 strict 白名单,严格模式下默认是 strict)
+        let r = check_window_use_bash_with_trust(
+            "defaults read com.tencent.xinWeChat",
+            BashTrustLevel::Strict,
+        );
+        // 注:defaults 实际上在 WINDOW_USE_BASH_ALLOWLIST 中(系统信息查询类),
+        // 所以 strict 也放行。这里验证的是 python3 在 strict 下被拒。
+        let r_py = check_window_use_bash_with_trust(
+            "python3 -c 'from Quartz import CGWindowListCopyWindowInfo'",
+            BashTrustLevel::Strict,
+        );
+        assert!(r_py.is_err(), "Strict 模式应拒绝 python3");
+        unsafe {
+            std::env::remove_var(WINDOW_USE_MODE_ENV);
+        }
+        let _ = r;
+    }
+
+    #[tokio::test]
+    async fn bash_trust_level_debug_allows_diagnostics() {
+        let _env = lock_env();
+        unsafe {
+            std::env::set_var(WINDOW_USE_MODE_ENV, "1");
+        }
+        // Debug 模式:python3 + Quartz import 应放行
+        let r_py = check_window_use_bash_with_trust(
+            "python3 -c 'from Quartz import CGWindowListCopyWindowInfo'",
+            BashTrustLevel::Debug,
+        );
+        assert!(r_py.is_ok(), "Debug 模式应允许 python3 -c 'from Quartz': {r_py:?}");
+        // Debug 模式:defaults read 应放行
+        let r_def = check_window_use_bash_with_trust(
+            "defaults read com.tencent.xinWeChat",
+            BashTrustLevel::Debug,
+        );
+        assert!(r_def.is_ok(), "Debug 模式应允许 defaults read: {r_def:?}");
+        unsafe {
+            std::env::remove_var(WINDOW_USE_MODE_ENV);
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_trust_level_free_only_blocks_dangerous() {
+        let _env = lock_env();
+        unsafe {
+            std::env::set_var(WINDOW_USE_MODE_ENV, "1");
+        }
+        // Free 模式:任意命令只要不进危险黑名单就放行
+        let r = check_window_use_bash_with_trust(
+            "python3 -c 'import os; print(os.listdir(\".\"))'",
+            BashTrustLevel::Free,
+        );
+        assert!(r.is_ok(), "Free 模式应允许任意非危险命令: {r:?}");
+        // 危险命令仍被拒
+        let r_danger = check_window_use_bash_with_trust(
+            "rm -rf /",
+            BashTrustLevel::Free,
+        );
+        assert!(r_danger.is_err(), "Free 模式仍应拦截 rm -rf /");
+        unsafe {
+            std::env::remove_var(WINDOW_USE_MODE_ENV);
+        }
     }
 }

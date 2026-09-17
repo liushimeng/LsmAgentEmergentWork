@@ -103,6 +103,9 @@ impl WindowDriver for FallbackDriver {
                 process_name: String::new(),
                 pid,
                 bounds: Rect::default(),
+                cg_window_id: None,
+                hwnd: None,
+                wmctrl_id: None,
             });
         }
         Ok(wins)

@@ -983,6 +983,10 @@ pub fn list_windows_cg(filter: Option<&str>) -> Result<Vec<WindowInfo>> {
                     height: cfnum_i64(dict_get(bdict, "Height")),
                 };
             }
+            // 2026-09-17 第 76 轮 P0-1:记录 CGWindowID(kCGWindowNumber),
+            // 用于 WindowOCR / WindowScreenshot 直接命中目标窗口(避免多窗口
+            // 进程按 PID 匹配拿错窗口)。对 LLM 暴露的稳定 token 仍是 {pid}:{idx}。
+            let cg_window_id = cfnum_i64(dict_get(dict, "kCGWindowNumber")).max(0) as u32;
             let idx = seen.entry(pid).or_insert(0);
             let id = format!("{pid}:{idx}");
             *idx += 1;
@@ -992,6 +996,9 @@ pub fn list_windows_cg(filter: Option<&str>) -> Result<Vec<WindowInfo>> {
                 process_name: owner,
                 pid: pid.max(0) as u32,
                 bounds,
+                cg_window_id: Some(cg_window_id),
+                hwnd: None,
+                wmctrl_id: None,
             });
         }
         CFRelease(list.cast());
@@ -1262,6 +1269,55 @@ impl WindowDriver for MacOsDriver {
             .collect())
     }
 
+    // 2026-09-17 第 76 轮 P0-1:带 WindowInfo 的 OCR(优先使用 cached cg_window_id,
+    // 避免多窗口进程按 PID 匹配拿到错窗口的 CGWindowID 导致截图/OCR 失败)。
+    fn ocr_with_info(
+        &self,
+        info: &super::WindowInfo,
+        region: Option<Rect>,
+        lang: Option<&str>,
+    ) -> Result<Vec<super::OcrBlock>> {
+        use crate::agent::window::macos_vision_ocr::{self, VisionOcrConfig};
+
+        // 优先使用 WindowInfo 中缓存的 cg_window_id;
+        // 缺失(legacy / fallback 路径)时降级到按 PID 解析
+        let cg_window_id = match info.cg_window_id {
+            Some(id) if id > 0 => id,
+            _ => {
+                let (pid, _) = Self::parse_window_id(&info.id)?;
+                macos_vision_ocr::resolve_cgwindow_id(pid, None).map_err(|e| {
+                    platform_err(
+                        self.platform_name(),
+                        format!("解析 CGWindowID 失败(pid={pid}): {e}"),
+                    )
+                })?
+            }
+        };
+
+        let mut cfg = VisionOcrConfig::default();
+        if let Some(lang_str) = lang {
+            cfg.languages = lang_str.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        let region_tuple = region.map(|r| (r.x, r.y, r.width, r.height));
+        let blocks =
+            macos_vision_ocr::ocr_window(cg_window_id, region_tuple, Some(cfg)).map_err(|e| {
+                platform_err(
+                    self.platform_name(),
+                    format!("Vision OCR 失败: {e}"),
+                )
+            })?;
+        Ok(blocks
+            .into_iter()
+            .map(|b| super::OcrBlock {
+                text: b.text,
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            })
+            .collect())
+    }
+
     // 2026-09-17 第 74 轮 T2:macOS 原生截图(CGWindowListCreateImage)
     // 替代 screencapture 命令行,无需屏幕录制权限,只需辅助功能权限。
     fn screenshot_to(
@@ -1306,5 +1362,40 @@ impl WindowDriver for MacOsDriver {
         let win = self.list_windows(None).unwrap_or_default();
         let window_info = win.iter().find(|w| w.id == window_id);
         Ok(window_info.map(|w| w.bounds).unwrap_or_default())
+    }
+
+    // 2026-09-17 第 76 轮 P0-1:带 WindowInfo 的截图(优先使用 cached cg_window_id,
+    // 避免多窗口进程按 PID 匹配拿到错窗口的 CGWindowID 导致截图失败)。
+    fn screenshot_to_with_info(
+        &self,
+        info: &super::WindowInfo,
+        region: Option<Rect>,
+        output_path: &std::path::Path,
+    ) -> Result<Rect> {
+        use crate::agent::window::macos_vision_ocr;
+
+        let cg_window_id = match info.cg_window_id {
+            Some(id) if id > 0 => id,
+            _ => {
+                let (pid, _) = Self::parse_window_id(&info.id)?;
+                macos_vision_ocr::resolve_cgwindow_id(pid, None).map_err(|e| {
+                    platform_err(
+                        self.platform_name(),
+                        format!("解析 CGWindowID 失败(pid={pid}): {e}"),
+                    )
+                })?
+            }
+        };
+
+        let region_tuple = region.map(|r| (r.x, r.y, r.width, r.height));
+        macos_vision_ocr::screenshot_window(cg_window_id, region_tuple, output_path).map_err(
+            |e| {
+                platform_err(
+                    self.platform_name(),
+                    format!("CGWindow 截图失败: {e}"),
+                )
+            },
+        )?;
+        Ok(info.bounds)
     }
 }

@@ -35,6 +35,21 @@ pub struct WindowSnapshot {
     pub title: String,
     pub process_name: String,
     pub pid: u32,
+    /// 2026-09-17 第 76 轮 P0-4:macOS CGWindowID(kCGWindowNumber),
+    /// WindowOCR / WindowScreenshot 直接命中目标窗口(避免按 PID 匹配错位)。
+    /// 多窗口进程(微信 / 钉钉 / 飞书等 Electron 应用)必须保存该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cg_window_id: Option<u32>,
+    /// 2026-09-17 第 76 轮 P0-4:Windows HWND,UIA / SendInput 直接使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwnd: Option<isize>,
+    /// 2026-09-17 第 76 轮 P0-4:Linux wmctrl 窗口 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wmctrl_id: Option<String>,
+    /// 2026-09-17 第 76 轮 P0-4:上次观察到该快照的时间(ISO 8601 本地时区)。
+    /// Runner 启动时用此判定 stale(window 重开或 PID 变化超过阈值时主动重新解析)。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_seen_at: String,
     /// 上次检视的根路径(如有)。
     pub last_inspect_path: Option<String>,
     /// 已发现的控件列表 (path, role)。
@@ -49,6 +64,26 @@ impl WindowSnapshot {
             title: title.to_string(),
             process_name: process_name.to_string(),
             pid,
+            cg_window_id: None,
+            hwnd: None,
+            wmctrl_id: None,
+            last_seen_at: String::new(),
+            last_inspect_path: None,
+            known_controls: Vec::new(),
+        }
+    }
+
+    /// 从完整 WindowInfo 构造快照(2026-09-17 第 76 轮)。
+    pub fn from_window_info(info: &crate::agent::window::WindowInfo) -> Self {
+        Self {
+            window_id: info.id.clone(),
+            title: info.title.clone(),
+            process_name: info.process_name.clone(),
+            pid: info.pid,
+            cg_window_id: info.cg_window_id,
+            hwnd: info.hwnd,
+            wmctrl_id: info.wmctrl_id.clone(),
+            last_seen_at: now_readable(),
             last_inspect_path: None,
             known_controls: Vec::new(),
         }
@@ -230,6 +265,52 @@ impl WindowSessionState {
 #[derive(Clone)]
 pub struct WindowStateManager {
     db: Arc<Db>,
+}
+
+/// 2026-09-17 第 76 轮 P0-4:窗口 stale 判定结果。
+///
+/// Runner 加载持久化窗口状态后,用本结果决定:
+/// - `Fresh`:直接复用,无需重新解析;
+/// - `SamePidCgChanged` 但 cg_window_id 变化(窗口重开):更新快照但不报错;
+/// - `Stale`(PID 变化或窗口消失):从 known_windows 移除并返回 None,
+///   强制 Runner 调 list_windows 重新枚举。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowFreshness {
+    /// 与当前 list_windows 一致,可直接复用(含 cg_window_id)
+    Fresh,
+    /// PID 一致但 cg_window_id 变化(窗口重开),快照已就地更新
+    SamePidCgChanged {
+        old_cg: Option<u32>,
+        new_cg: Option<u32>,
+    },
+    /// 窗口已不在当前 list(进程退出 / 窗口关闭)
+    Stale,
+}
+
+/// 校验持久化窗口快照与当前 list_windows 结果的一致性,
+/// 决定是否需要重新枚举 / 重新解析 cg_window_id。
+pub fn check_window_freshness(
+    snapshot: &WindowSnapshot,
+    current_list: &[crate::agent::window::WindowInfo],
+) -> WindowFreshness {
+    let cur = current_list.iter().find(|w| w.id == snapshot.window_id);
+    match cur {
+        None => WindowFreshness::Stale,
+        Some(info) => {
+            if info.pid != snapshot.pid {
+                // PID 变化(进程重启)→ 直接 stale
+                return WindowFreshness::Stale;
+            }
+            if info.cg_window_id != snapshot.cg_window_id {
+                WindowFreshness::SamePidCgChanged {
+                    old_cg: snapshot.cg_window_id,
+                    new_cg: info.cg_window_id,
+                }
+            } else {
+                WindowFreshness::Fresh
+            }
+        }
+    }
 }
 
 impl WindowStateManager {
@@ -437,6 +518,10 @@ pub fn extract_window_state_from_trace(
                         title: String::new(),
                         process_name: String::new(),
                         pid: 0,
+                        cg_window_id: None,
+                        hwnd: None,
+                        wmctrl_id: None,
+                        last_seen_at: now_readable(),
                         last_inspect_path: None,
                         known_controls: Vec::new(),
                     });
@@ -489,16 +574,37 @@ fn parse_window_snapshots(output: &str) -> Option<Vec<WindowSnapshot>> {
         else {
             continue;
         };
-        out.push(WindowSnapshot::simple(
-            window_id,
-            item.get("title")
+        // 2026-09-17 第 76 轮 P0-4:从 JSON 中解析 cg_window_id / hwnd / wmctrl_id,
+        // WindowOCR / WindowScreenshot 后续可直接使用,避免按 PID 匹配错窗口。
+        let cg_window_id = item
+            .get("cg_window_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let hwnd = item.get("hwnd").and_then(|v| v.as_i64()).map(|v| v as isize);
+        let wmctrl_id = item
+            .get("wmctrl_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        out.push(WindowSnapshot {
+            window_id: window_id.to_string(),
+            title: item
+                .get("title")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default(),
-            item.get("process_name")
+                .unwrap_or_default()
+                .to_string(),
+            process_name: item
+                .get("process_name")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default(),
-            item.get("pid").and_then(|v| v.as_u64()).unwrap_or_default() as u32,
-        ));
+                .unwrap_or_default()
+                .to_string(),
+            pid: item.get("pid").and_then(|v| v.as_u64()).unwrap_or_default() as u32,
+            cg_window_id,
+            hwnd,
+            wmctrl_id,
+            last_seen_at: now_readable(),
+            last_inspect_path: None,
+            known_controls: Vec::new(),
+        });
     }
     Some(out)
 }
@@ -738,5 +844,201 @@ mod tests {
         assert!(last
             .args_json
             .contains(&format!("\"i\":{}", MAX_TOOL_CALL_LOG + 4)));
+    }
+
+    // ===== 2026-09-17 第 76 轮 P0-4:cg_window_id 持久化与 stale 检测 =====
+
+    #[test]
+    fn window_snapshot_carries_cg_window_id() {
+        let s = WindowSnapshot {
+            window_id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 682,
+            cg_window_id: Some(2893),
+            hwnd: None,
+            wmctrl_id: None,
+            last_seen_at: now_readable(),
+            last_inspect_path: None,
+            known_controls: Vec::new(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        // cg_window_id 必须序列化进 JSON
+        assert!(json.contains("\"cg_window_id\":2893"));
+        // 反序列化恢复
+        let restored: WindowSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.cg_window_id, Some(2893));
+    }
+
+    #[test]
+    fn window_snapshot_from_window_info() {
+        use crate::agent::window::WindowInfo;
+        let info = WindowInfo {
+            id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 682,
+            bounds: Default::default(),
+            cg_window_id: Some(2893),
+            hwnd: None,
+            wmctrl_id: None,
+        };
+        let snap = WindowSnapshot::from_window_info(&info);
+        assert_eq!(snap.window_id, "682:0");
+        assert_eq!(snap.cg_window_id, Some(2893));
+        assert_eq!(snap.pid, 682);
+        assert!(!snap.last_seen_at.is_empty());
+    }
+
+    #[test]
+    fn window_freshness_fresh_when_pid_and_cg_match() {
+        use crate::agent::window::WindowInfo;
+        let snap = WindowSnapshot {
+            window_id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 682,
+            cg_window_id: Some(2893),
+            hwnd: None,
+            wmctrl_id: None,
+            last_seen_at: now_readable(),
+            last_inspect_path: None,
+            known_controls: Vec::new(),
+        };
+        let current = vec![WindowInfo {
+            id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 682,
+            bounds: Default::default(),
+            cg_window_id: Some(2893),
+            hwnd: None,
+            wmctrl_id: None,
+        }];
+        let r = check_window_freshness(&snap, &current);
+        assert_eq!(r, WindowFreshness::Fresh);
+    }
+
+    #[test]
+    fn window_freshness_cg_changed_when_window_reopened() {
+        use crate::agent::window::WindowInfo;
+        let snap = WindowSnapshot {
+            window_id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 682,
+            cg_window_id: Some(2893),
+            hwnd: None,
+            wmctrl_id: None,
+            last_seen_at: now_readable(),
+            last_inspect_path: None,
+            known_controls: Vec::new(),
+        };
+        let current = vec![WindowInfo {
+            id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 682,
+            bounds: Default::default(),
+            cg_window_id: Some(3501), // 新的 cg_window_id(窗口重开)
+            hwnd: None,
+            wmctrl_id: None,
+        }];
+        let r = check_window_freshness(&snap, &current);
+        assert_eq!(
+            r,
+            WindowFreshness::SamePidCgChanged {
+                old_cg: Some(2893),
+                new_cg: Some(3501),
+            }
+        );
+    }
+
+    #[test]
+    fn window_freshness_stale_when_window_closed() {
+        use crate::agent::window::WindowInfo;
+        let snap = WindowSnapshot {
+            window_id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 682,
+            cg_window_id: Some(2893),
+            hwnd: None,
+            wmctrl_id: None,
+            last_seen_at: now_readable(),
+            last_inspect_path: None,
+            known_controls: Vec::new(),
+        };
+        let current = vec![WindowInfo {
+            id: "999:0".into(),
+            title: "记事本".into(),
+            process_name: "Notepad".into(),
+            pid: 999,
+            bounds: Default::default(),
+            cg_window_id: Some(1000),
+            hwnd: None,
+            wmctrl_id: None,
+        }];
+        assert_eq!(
+            check_window_freshness(&snap, &current),
+            WindowFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn window_freshness_stale_when_pid_changes() {
+        use crate::agent::window::WindowInfo;
+        let snap = WindowSnapshot {
+            window_id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 682,
+            cg_window_id: Some(2893),
+            hwnd: None,
+            wmctrl_id: None,
+            last_seen_at: now_readable(),
+            last_inspect_path: None,
+            known_controls: Vec::new(),
+        };
+        let current = vec![WindowInfo {
+            id: "682:0".into(),
+            title: "微信".into(),
+            process_name: "WeChat".into(),
+            pid: 700,
+            bounds: Default::default(),
+            cg_window_id: Some(2893),
+            hwnd: None,
+            wmctrl_id: None,
+        }];
+        assert_eq!(
+            check_window_freshness(&snap, &current),
+            WindowFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn parse_window_snapshots_extracts_cg_window_id_from_json() {
+        let json = r#"{
+            "windows": [
+                {
+                    "window_id": "682:0",
+                    "title": "微信",
+                    "process_name": "WeChat",
+                    "pid": 682,
+                    "cg_window_id": 2893
+                },
+                {
+                    "window_id": "999:0",
+                    "title": "记事本",
+                    "process_name": "Notepad",
+                    "pid": 999
+                }
+            ]
+        }"#;
+        let snaps = parse_window_snapshots(json).unwrap();
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].window_id, "682:0");
+        assert_eq!(snaps[0].cg_window_id, Some(2893));
+        assert_eq!(snaps[1].cg_window_id, None);
     }
 }

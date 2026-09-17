@@ -59,6 +59,11 @@ pub struct Rect {
 /// `id` 是平台相关的不透明标识字符串(Windows = HWND 十进制;macOS = `"{pid}"`
 /// 应用级标识;fallback = wmctrl 十六进制窗口 id),仅供同一次任务内回传给
 /// `inspect` / `act` 使用,不做持久化假设。
+///
+/// 2026-09-17 第 76 轮:为多窗口进程(Electron / 自绘 UI 等同一 PID 下多个窗口的进程)
+/// 修复 CGWindowID 错位问题,新增 `cg_window_id` / `hwnd` / `wmctrl_id` 三平台
+/// 底层句柄字段,WindowOCR / WindowScreenshot 优先使用平台原生句柄(避免按 PID 匹配
+/// 拿到非目标窗口的 CGWindowID)。LLM 始终只看到 `id` 这一个稳定 token。
 #[derive(Debug, Clone, Serialize)]
 pub struct WindowInfo {
     pub id: String,
@@ -66,6 +71,32 @@ pub struct WindowInfo {
     pub process_name: String,
     pub pid: u32,
     pub bounds: Rect,
+    /// macOS CGWindowID(kCGWindowNumber),用于 CGWindowListCreateImage 直接截图。
+    /// 多窗口进程下,该字段保证截图/OCR 命中正确的目标窗口(按 PID 匹配会拿到第一个窗口)。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cg_window_id: Option<u32>,
+    /// Windows HWND(同位 isize),UIA / SendInput 直接使用。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hwnd: Option<isize>,
+    /// Linux wmctrl 十六进制窗口 ID,xdotool / wmctrl 命令直接使用。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub wmctrl_id: Option<String>,
+}
+
+impl WindowInfo {
+    /// 构造不含平台原生句柄的基础 WindowInfo(用于 mock / 测试 / fallback)。
+    pub fn basic(id: String, title: String, process_name: String, pid: u32, bounds: Rect) -> Self {
+        Self {
+            id,
+            title,
+            process_name,
+            pid,
+            bounds,
+            cg_window_id: None,
+            hwnd: None,
+            wmctrl_id: None,
+        }
+    }
 }
 
 /// 控件树节点。
@@ -323,6 +354,20 @@ pub trait WindowDriver: Send + Sync {
         ))
     }
 
+    /// 2026-09-17 第 76 轮 P0-1:带 WindowInfo 的 OCR(优先使用平台原生句柄)。
+    ///
+    /// 默认实现降级到 `ocr(window_id, region, lang)`,macOS 实装直接读取
+    /// `info.cg_window_id` 避免按 PID 匹配错位。`WindowOCRTool` 会先调
+    /// `list_windows` 拿到完整 WindowInfo 后再调本方法,保持向后兼容。
+    fn ocr_with_info(
+        &self,
+        info: &WindowInfo,
+        region: Option<Rect>,
+        lang: Option<&str>,
+    ) -> Result<Vec<OcrBlock>> {
+        self.ocr(&info.id, region, lang)
+    }
+
     /// 2026-09-17 第 74 轮 T2:原生截图(落盘到指定路径)。
     ///
     /// 语义:平台原生截图实现,替代 screencapture 等外部命令。
@@ -341,6 +386,20 @@ pub trait WindowDriver: Send + Sync {
             self.platform_name(),
             "当前平台驱动暂未实装原生截图,工具层将降级到外部命令(screencapture/import)",
         ))
+    }
+
+    /// 2026-09-17 第 76 轮 P0-1:带 WindowInfo 的截图(优先使用平台原生句柄)。
+    ///
+    /// 默认实现降级到 `screenshot_to(window_id, region, path)`,macOS 实装
+    /// 直接使用 `info.cg_window_id`(避免按 PID 匹配错位)。`WindowScreenshot`
+    /// 工具会先调 `list_windows` 拿到完整 WindowInfo 后再调本方法。
+    fn screenshot_to_with_info(
+        &self,
+        info: &WindowInfo,
+        region: Option<Rect>,
+        output_path: &std::path::Path,
+    ) -> Result<Rect> {
+        self.screenshot_to(&info.id, region, output_path)
     }
 }
 

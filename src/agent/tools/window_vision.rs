@@ -80,37 +80,64 @@ impl Tool for WindowOCRTool {
             }
             Some(Rect { x, y, width, height })
         });
-        super::window::run_blocking(self.name(), move || {
+        let tool_name_owned = self.name().to_string();
+        let window_id = require_str(&args, "window_id", &tool_name_owned)?.to_string();
+        let lang = get_str(&args, "lang").map(str::to_string);
+        let region = args.get("region").and_then(|r| {
+            let x = r.get("x").and_then(Value::as_i64)?;
+            let y = r.get("y").and_then(Value::as_i64)?;
+            let width = r.get("width").and_then(Value::as_i64)?;
+            let height = r.get("height").and_then(Value::as_i64)?;
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            Some(Rect { x, y, width, height })
+        });
+        let tool_name_for_blocking = tool_name_owned.clone();
+        super::window::run_blocking(&tool_name_for_blocking, move || {
             let driver = current_driver();
-            let blocks = driver.ocr(&window_id, region, lang.as_deref())?;
-            // 找窗口原点换算屏幕绝对坐标(list_windows 按 id 精确回查)
+            // 2026-09-17 第 76 轮 P0-1:先 list_windows 拿到完整 WindowInfo
+            // (含 cg_window_id),再调 ocr_with_info —— 避免按 PID 匹配错窗口。
             let all = driver.list_windows(None)?;
-            let win = all.iter().find(|w| w.id == window_id);
-            let origin = win.map(|w| (w.bounds.x, w.bounds.y, w.bounds.width, w.bounds.height));
+            let info = all
+                .iter()
+                .find(|w| w.id == window_id)
+                .cloned()
+                .ok_or_else(|| {
+                    tool_err(
+                        tool_name_owned.as_str(),
+                        format!(
+                            "window_id={window_id} 不在当前可见窗口列表;可能已关闭/最小化,或 UI 已变化;请先 WindowList 重新枚举"
+                        ),
+                    )
+                })?;
+            let blocks = driver.ocr_with_info(&info, region, lang.as_deref())?;
+            // 屏幕绝对坐标基于窗口 bounds 计算
+            let origin = (info.bounds.x, info.bounds.y, info.bounds.width, info.bounds.height);
             let blocks_json: Vec<Value> = blocks
                 .iter()
                 .take(MAX_OCR_BLOCKS)
                 .map(|b| {
                     let (cx, cy) = (b.x + b.width / 2, b.y + b.height / 2);
+                    let (ox, oy, _, _) = origin;
                     let mut obj = json!({
                         "text": b.text,
                         "x": b.x,
                         "y": b.y,
                         "width": b.width,
                         "height": b.height,
-                        "screen_cx": origin.map(|(ox, oy, _, _)| ox + cx),
-                        "screen_cy": origin.map(|(ox, oy, _, _)| oy + cy),
+                        "screen_cx": ox + cx,
+                        "screen_cy": oy + cy,
                     });
-                    if let Some((ox, oy, _, _)) = origin {
-                        obj["screen_x"] = json!(ox + b.x);
-                        obj["screen_y"] = json!(oy + b.y);
-                    }
+                    obj["screen_x"] = json!(ox + b.x);
+                    obj["screen_y"] = json!(oy + b.y);
                     obj
                 })
                 .collect();
             let body = json!({
                 "window_id": window_id,
-                "window_bounds": origin.map(|(x, y, w, h)| json!({"x": x, "y": y, "width": w, "height": h})),
+                "cg_window_id": info.cg_window_id,
+                "window_bounds": json!({"x": origin.0, "y": origin.1, "width": origin.2, "height": origin.3}),
                 "lang": lang,
                 "block_count": blocks.len(),
                 "truncated": blocks.len() > MAX_OCR_BLOCKS,
@@ -288,7 +315,19 @@ impl Tool for WindowScreenshotTool {
                 if let Some(ref wid) = window_id_str {
                     let driver = crate::agent::window::current_driver();
                     let path = std::path::Path::new(&output_path);
-                    match driver.screenshot_to(wid, region_rect, path) {
+                    // 2026-09-17 第 76 轮 P0-1:先 list_windows 拿完整 WindowInfo
+                    // (含 cg_window_id),避免多窗口进程按 PID 匹配错位。
+                    let info_opt = driver
+                        .list_windows(None)
+                        .ok()
+                        .and_then(|all| all.into_iter().find(|w| w.id == *wid));
+                    let screen_result = match info_opt {
+                        Some(info) => {
+                            driver.screenshot_to_with_info(&info, region_rect, path)
+                        }
+                        None => driver.screenshot_to(wid, region_rect, path),
+                    };
+                    match screen_result {
                         Ok(_) => {
                             let meta = std::fs::metadata(&output_path).map_err(|e| {
                                 tool_err(

@@ -139,6 +139,9 @@
                 process_name: "WeChat".into(),
                 pid: 100,
                 bounds: Default::default(),
+                cg_window_id: Some(1001),
+                hwnd: None,
+                wmctrl_id: None,
             },
             WindowInfo {
                 id: "w-2".into(),
@@ -146,6 +149,9 @@
                 process_name: "Notepad".into(),
                 pid: 101,
                 bounds: Default::default(),
+                cg_window_id: None,
+                hwnd: None,
+                wmctrl_id: None,
             },
             WindowInfo {
                 id: "w-3".into(),
@@ -153,6 +159,9 @@
                 process_name: "System Preferences".into(),
                 pid: 102,
                 bounds: Default::default(),
+                cg_window_id: None,
+                hwnd: None,
+                wmctrl_id: None,
             },
         ]
     }
@@ -252,6 +261,9 @@
                 process_name: "x".into(),
                 pid: 1,
                 bounds: Default::default(),
+                cg_window_id: None,
+                hwnd: None,
+                wmctrl_id: None,
             },
             WindowInfo {
                 id: "b".into(),
@@ -259,6 +271,9 @@
                 process_name: "abc".into(),
                 pid: 2,
                 bounds: Default::default(),
+                cg_window_id: None,
+                hwnd: None,
+                wmctrl_id: None,
             },
         ];
         let hit = pick_top_hit(&wins, "abc", MatchMode::Contains).unwrap();

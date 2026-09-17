@@ -124,6 +124,9 @@ unsafe extern "system" fn enum_windows_proc(
                         width: (rc.right - rc.left) as i64,
                         height: (rc.bottom - rc.top) as i64,
                     },
+                    cg_window_id: None,
+                    hwnd: Some(hwnd.0 as isize),
+                    wmctrl_id: None,
                 });
             }
         }

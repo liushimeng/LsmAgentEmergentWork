@@ -22,13 +22,14 @@ use crate::agent::extrace::ExecutionTrace;
 use crate::agent::memory;
 use crate::agent::subagent::{SubFlowInput, SubFlowOutcome};
 use crate::agent::window_state::{
-    build_window_state_message, WindowSessionState, WindowStateManager, WINDOW_STATE_MARKER_END,
-    WINDOW_STATE_MARKER_START,
+    build_window_state_message, check_window_freshness, WindowFreshness, WindowSessionState,
+    WindowStateManager, WINDOW_STATE_MARKER_END, WINDOW_STATE_MARKER_START,
 };
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Usage};
+use crate::session::now_readable;
 
 /// WindowUse 执行器(桌面窗口操控专项单元)。
 pub struct WindowUseRunner {
@@ -115,6 +116,51 @@ impl WindowUseRunner {
             }
             s
         });
+
+        // ★1.5) 2026-09-17 第 76 轮 P0-4:校验持久化窗口快照的 stale 性。
+        // 上一轮持久化的 cg_window_id / window_id / PID 在新一轮可能已变化:
+        //   - Fresh:直接复用,prompt 注入 last_window + 已知列表;
+        //   - SamePidCgChanged:窗口重开但 PID 一致,自动更新 cg_window_id
+        //     (避免 LLM 用 stale CGWindowID 调 WindowOCR 失败);
+        //   - Stale:PID 变化 / 窗口已消失,从 known_windows 移除 last_window,
+        //     强制 LLM 走 WindowList 重新枚举(避免 GC 报错盲调)。
+        if let Some(ref last) = win_state.last_window.clone() {
+            let driver = crate::agent::window::current_driver();
+            let current = driver.list_windows(None).unwrap_or_default();
+            let freshness = check_window_freshness(last, &current);
+            match freshness {
+                WindowFreshness::Fresh => {
+                    tracing::debug!(
+                        window_id = %last.window_id,
+                        cg_window_id = ?last.cg_window_id,
+                        "WindowUse state fresh, reusing cached cg_window_id"
+                    );
+                }
+                WindowFreshness::SamePidCgChanged { old_cg, new_cg } => {
+                    tracing::info!(
+                        window_id = %last.window_id,
+                        old_cg = ?old_cg,
+                        new_cg = ?new_cg,
+                        "WindowUse state cg_window_id changed (window reopened), auto-updating"
+                    );
+                    if let Some(ref mut last_mut) = win_state.last_window {
+                        last_mut.cg_window_id = new_cg;
+                        last_mut.last_seen_at = now_readable();
+                    }
+                }
+                WindowFreshness::Stale => {
+                    tracing::warn!(
+                        window_id = %last.window_id,
+                        pid = last.pid,
+                        "WindowUse state stale (window closed or process restarted), clearing"
+                    );
+                    win_state
+                        .known_windows
+                        .retain(|w| w.window_id != last.window_id);
+                    win_state.last_window = None;
+                }
+            }
+        }
 
         // 复用 SubFlowInput 的 prompt 构造(原始 prompt 优先 + 摘要 + 上下游产物),
         // 尾部追加窗口操控作业规范,提醒「先检视再操作」。
