@@ -267,8 +267,59 @@ impl Tool for WindowScreenshotTool {
                     })?;
                 }
             }
+
+            // 2026-09-17 第 74 轮 T2:优先走原生 CGWindow 截图(macOS)
+            // 只需辅助功能权限,无需屏幕录制权限(screencapture 需要)
+            #[cfg(target_os = "macos")]
+            {
+                let window_id_str = get_str(&args, "window_id").map(str::to_string);
+                let region_rect = region.as_ref().and_then(|r| {
+                    let x = r.get("x").and_then(Value::as_i64)?;
+                    let y = r.get("y").and_then(Value::as_i64)?;
+                    let width = r.get("width").and_then(Value::as_i64)?;
+                    let height = r.get("height").and_then(Value::as_i64)?;
+                    if width <= 0 || height <= 0 {
+                        return None;
+                    }
+                    Some(crate::agent::window::Rect { x, y, width, height })
+                });
+
+                // 尝试原生截图(需要 window_id)
+                if let Some(ref wid) = window_id_str {
+                    let driver = crate::agent::window::current_driver();
+                    let path = std::path::Path::new(&output_path);
+                    match driver.screenshot_to(wid, region_rect, path) {
+                        Ok(_) => {
+                            let meta = std::fs::metadata(&output_path).map_err(|e| {
+                                tool_err(
+                                    self.name(),
+                                    format!("截图未生成: {e}"),
+                                )
+                            })?;
+                            let body = json!({
+                                "path": output_path,
+                                "size_bytes": meta.len(),
+                                "created_at_unix": ts,
+                                "platform": std::env::consts::OS,
+                                "method": "cgwindow_native",
+                                "next_action": "PNG 已落盘(CGWindow 原生截图,无需屏幕录制权限);需要识别文字直接用 WindowOCR,禁止 Read PNG。"
+                            });
+                            return Ok(serde_json::to_string_pretty(&body)
+                                .unwrap_or_else(|_| "{}".into()));
+                        }
+                        Err(e) => {
+                            // 原生截图失败,记录日志并降级到 screencapture
+                            tracing::debug!(
+                                error = %e,
+                                "CGWindow 原生截图失败,降级到 screencapture"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 降级方案:走 BashTool 执行 screencapture / import
             let command = default_screenshot_command(&output_path, region.as_ref());
-            // 走 BashTool 执行(白名单模式由 WindowUseRunner 开启)
             let bash = crate::agent::tools::bash::BashTool;
             let bash_args = json!({
                 "command": command,

@@ -28,6 +28,9 @@ use macos_axui::MacosAxuiDriver as DefaultMacosDriver;
 mod macos_legacy;
 #[cfg(target_os = "macos")]
 use macos_legacy::MacOsDriver as LegacyMacosDriver;
+// 2026-09-17 第 74 轮:macOS Vision OCR + CGWindow 原生截图
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_vision_ocr;
 
 // 2026-09-16 第 60 轮:公开 macOS 辅助功能权限相关接口,供 tools/window.rs 调用
 #[cfg(target_os = "macos")]
@@ -307,6 +310,7 @@ pub trait WindowDriver: Send + Sync {
     /// - `lang`:BCP-47(如 "zh-Hans-CN");`None` = 用户配置语言;
     /// - 默认实现返回「平台暂不支持」(fail-closed),Windows 实装
     ///   (GDI 截图 + GDI+ PNG + Windows.Media.Ocr,全 OS API 离线)。
+    /// - 2026-09-17 第 74 轮:macOS 实装 Vision.framework OCR。
     fn ocr(
         &self,
         _window_id: &str,
@@ -316,6 +320,26 @@ pub trait WindowDriver: Send + Sync {
         Err(platform_err(
             self.platform_name(),
             "当前平台驱动暂不支持 OCR(Windows 已实装 Windows.Media.Ocr;macOS Vision 待后续轮次)",
+        ))
+    }
+
+    /// 2026-09-17 第 74 轮 T2:原生截图(落盘到指定路径)。
+    ///
+    /// 语义:平台原生截图实现,替代 screencapture 等外部命令。
+    /// - macOS:CGWindowListCreateImage(只需辅助功能权限,无需屏幕录制权限)
+    /// - Windows:GDI 截图(已有 windows_ocr::capture_window_png_to)
+    /// - 其他平台:返回 Err,工具层降级到外部命令
+    ///
+    /// 返回实际截取的屏幕矩形(用于工具层记录)。
+    fn screenshot_to(
+        &self,
+        _window_id: &str,
+        _region: Option<Rect>,
+        _output_path: &std::path::Path,
+    ) -> Result<Rect> {
+        Err(platform_err(
+            self.platform_name(),
+            "当前平台驱动暂未实装原生截图,工具层将降级到外部命令(screencapture/import)",
         ))
     }
 }

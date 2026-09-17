@@ -1206,4 +1206,105 @@ impl WindowDriver for MacOsDriver {
             Some(MACOS_AX_UNAVAILABLE_HINT.to_string())
         }
     }
+
+    // 2026-09-17 第 74 轮 T1:macOS Vision OCR 实装
+    // 此前默认实现返回「平台暂不支持」,导致微信 4.x 等自绘 UI 完全无法识别。
+    // 现在走 CGWindowListCreateImage 截图 + Vision.framework OCR,返回词级坐标。
+    fn ocr(
+        &self,
+        window_id: &str,
+        region: Option<Rect>,
+        lang: Option<&str>,
+    ) -> Result<Vec<super::OcrBlock>> {
+        use crate::agent::window::macos_vision_ocr::{
+            self, VisionOcrConfig, VisionOcrBlock,
+        };
+
+        // 1. 解析 window_id → CGWindowID
+        let (pid, _) = Self::parse_window_id(window_id)?;
+        let cg_window_id = macos_vision_ocr::resolve_cgwindow_id(pid, None).map_err(|e| {
+            platform_err(
+                self.platform_name(),
+                format!("解析 CGWindowID 失败(pid={pid}): {e}"),
+            )
+        })?;
+
+        // 2. 构建 OCR 配置
+        let mut cfg = VisionOcrConfig::default();
+        if let Some(lang_str) = lang {
+            // 解析 BCP-47 语言标签
+            cfg.languages = lang_str.split(',').map(|s| s.trim().to_string()).collect();
+        }
+
+        // 3. 转换 region 格式
+        let region_tuple = region.map(|r| (r.x, r.y, r.width, r.height));
+
+        // 4. 执行 OCR
+        let blocks = macos_vision_ocr::ocr_window(cg_window_id, region_tuple, Some(cfg)).map_err(
+            |e| {
+                platform_err(
+                    self.platform_name(),
+                    format!("Vision OCR 失败: {e}"),
+                )
+            },
+        )?;
+
+        // 5. 转换为统一的 OcrBlock 格式
+        Ok(blocks
+            .into_iter()
+            .map(|b| super::OcrBlock {
+                text: b.text,
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            })
+            .collect())
+    }
+
+    // 2026-09-17 第 74 轮 T2:macOS 原生截图(CGWindowListCreateImage)
+    // 替代 screencapture 命令行,无需屏幕录制权限,只需辅助功能权限。
+    fn screenshot_to(
+        &self,
+        window_id: &str,
+        region: Option<Rect>,
+        output_path: &std::path::Path,
+    ) -> Result<Rect> {
+        use crate::agent::window::macos_vision_ocr;
+
+        // 1. 解析 window_id → CGWindowID
+        let (pid, _) = Self::parse_window_id(window_id)?;
+        let cg_window_id = macos_vision_ocr::resolve_cgwindow_id(pid, None).map_err(|e| {
+            platform_err(
+                self.platform_name(),
+                format!("解析 CGWindowID 失败(pid={pid}): {e}"),
+            )
+        })?;
+
+        // 2. 转换 region 格式
+        let region_tuple = region.map(|r| (r.x, r.y, r.width, r.height));
+
+        // 3. 执行截图
+        macos_vision_ocr::screenshot_window(cg_window_id, region_tuple, output_path).map_err(
+            |e| {
+                platform_err(
+                    self.platform_name(),
+                    format!("CGWindow 截图失败: {e}"),
+                )
+            },
+        )?;
+
+        // 4. 返回实际截取的区域
+        let meta = std::fs::metadata(output_path).map_err(|e| {
+            platform_err(
+                self.platform_name(),
+                format!("读取截图文件元数据失败: {e}"),
+            )
+        })?;
+
+        // 返回窗口 bounds(截图前已获取)
+        let win = self.list_windows(None).unwrap_or_default();
+        let window_info = win.iter().find(|w| w.id == window_id);
+        Ok(window_info.map(|w| w.bounds).unwrap_or_default())
+    }
 }

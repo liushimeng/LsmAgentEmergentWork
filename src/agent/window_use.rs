@@ -156,7 +156,14 @@ impl WindowUseRunner {
              13. **【发送消息范式】**:定位输入框(控件树 set_text / 视觉路线 click_point 输入框)\
                 → 写入消息(set_text 或 type_text)→ send_keys(\"enter\") 发送(微信默认 Enter 发送,\
                 若应用设置不同可试 \"ctrl+enter\" 或点击「发送」按钮)→ 复查(WindowInspect/WindowOCR\
-                确认消息出现在对话区)后再宣告完成。",
+                确认消息出现在对话区)后再宣告完成。\n\
+             14. **【效率规范 - 2026-09-17 第 74 轮】**:\n\
+                - **禁止用 Bash 调 screencapture**:WindowScreenshot 已走 CGWindow 原生路径,无需屏幕录制权限;\n\
+                - **禁止用 Bash 调 osascript 枚举 UI**:WindowInspect 已走 AX API,直接返回控件树;\n\
+                - **禁止用 Bash 调 osascript 获取窗口位置**:WindowList 已返回 bounds;\n\
+                - **Bash 仅用于**:cliclick 坐标点击(控件树+视觉路线都失败时)、open 启动应用;\n\
+                - **每步操作后必须验证**:操作后用 WindowOCR/WindowInspect 确认结果,不要盲目继续;\n\
+                - **连续 3 轮无进展立即止损**:不要重复相同操作超过 3 次,及时调整策略或报告失败。",
         );
 
         let mut sub_session = crate::session::Session::new();
