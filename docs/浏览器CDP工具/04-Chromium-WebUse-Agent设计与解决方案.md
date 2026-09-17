@@ -189,3 +189,41 @@ returnByValue 严格还原）/ `set_cookie` / `delete_cookie` / `set_storage` / 
 | 无浏览器环境 | 3001 结构化降级，Yolo 失败回流建议用户安装或改用其它方案 |
 | 大截图/DOM 撑爆上下文 | save_path 落盘优先；DOM 双闸门 + truncated 标记；工具结果接入既有截断体系 |
 | 僵尸 Chrome 进程 | tempfile user-data-dir 自动清理 + 页面归零关进程 + 进程退出时 Drop 兜底 |
+
+## 7. 工具能力对照表(2026-09-17 第 75 轮盘点)
+
+用户需求逐条对照 —— **全部已具备**,无需新增工具:
+
+| 需求能力 | 工具/入口 | 实现位置 |
+| ---- | ---- | ---- |
+| 多轮对话(跨轮复用浏览器) | Agent 循环 + page_id 注册表跨 WorkFlow 复用 | `web_use.rs` / `browser.rs`(BrowserManager 单例) |
+| 鼠标点击 | `BrowserControl action=click` / `human_click`(遮挡检测+scrollIntoView) | `tools/browser.rs` act_click |
+| 右键点击 | `BrowserControl action=right_click` | act_simple_click(button=right) |
+| 双击 | `BrowserControl action=double_click` | act_simple_click(clicks=2) |
+| 悬停 | `BrowserControl action=hover` | act_hover |
+| 滚轮滚动 | `BrowserControl action=scroll`(selector/wheel/scrollBy 三模式)/ `scroll_to` | act_scroll / act_scroll_to |
+| 键盘按键 | `BrowserControl action=key_press`(特殊键+修饰键)/ `press_sequence`(组合键序列) | act_key_press / act_press_sequence |
+| 输入文本 | `BrowserControl action=input_text`(JS 原生 setter 双路径,React 受控组件兼容)/ `human_input`(逐字符随机延迟)/ `clear_input` | act_input_text / act_human_input |
+| 上传文件 | `BrowserControl action=upload_file`(DOM SetFileInputFiles,绝对路径数组) | act_upload_file |
+| 下拉选择 | `BrowserControl action=select_option`(value/values/text/index) | act_select_option |
+| 打开新 Tab | `BrowserControl action=new_tab`;点击 target=_blank 自动 adopt 经 `spawned_page_id` 回传 | act_new_tab + adopt_spawned_pages |
+| 关闭 Tab | `BrowserControl action=close_tab` / `BrowserClose` | act_close_tab |
+| 页面导航 | `navigate` / `back` / `forward` / `reload` | act_navigate / act_history / act_reload |
+| 截图 | `BrowserControl action=screenshot`(save_path 落盘与 base64 互斥) | act_screenshot |
+| 等待 | `BrowserControl action=wait`(selector visible/hidden/attached 或 duration) | act_wait |
+| 执行 JS | `BrowserControl action=eval_js`(expression/expression_b64,await_promise) | act_eval_js |
+| Cookie | `set_cookie` / `delete_cookie` | act_set_cookie / act_delete_cookie |
+| 查看 Console 输出 | `BrowserInspect info=console`(500 条环形缓冲 + collection_healthy) | browser.rs EventBuffer |
+| 查看 Network 信息 | `BrowserInspect info=network`(request/response 两相位环形缓冲) | spawn_event_listeners |
+| 查看 Elements 信息 | `BrowserInspect info=elements` | tools/browser.rs |
+| 查看 DOM 信息 | `BrowserInspect info=dom`(max_depth 硬上限 + node_count_limit 双闸门 + truncated 标记) | tools/browser.rs |
+| 查看 localStorage / sessionStorage | `BrowserInspect info=localstorage` / `sessionstorage` | tools/browser.rs |
+| 查看 Cookies | `BrowserInspect info=cookies` | tools/browser.rs |
+| 调试 Chrome(可视化) | `BrowserNew mode=headed`(显式开窗,默认 hidden 无窗口) | browser.rs BrowserMode |
+| 接管已开浏览器 | `BrowserNew connect_url=http://127.0.0.1:9222`(close 不杀用户浏览器) | browser.rs Browser::connect |
+| 视口控制 | `BrowserControl action=set_viewport` | act_set_viewport |
+| 存活探测 | `BrowserControl action=heartbeat` / `BrowserInspect info=ping` | act_heartbeat |
+
+**统一信封**:`{code, message, data}`;错误码 0 成功 / 1001 参数 / 2000 page_id 失效 /
+2001 断连 / 2002 动作失败 / 2003 页面崩溃 / 3001 未检测到浏览器(第 75 轮起 fail-fast,
+立即输出安装引导,不再循环重试)。
