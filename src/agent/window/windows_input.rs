@@ -233,6 +233,11 @@ pub fn wheel_at(x: i64, y: i64, lines: i32) -> Result<()> {
 /// 向当前焦点控件真实键入文本(KEYEVENTF_UNICODE,绕过 IME,中文直入)。
 ///
 /// 逐字符 5ms 节拍 + 每字符 keydown/keyup 成对;上限 2000 字符防失控。
+///
+/// 2026-09-17 第 77 轮 P1-3:全部字符注入完成后等待 80ms,确保应用消费字符;
+/// 否则后续立即调用的 `send_keys("enter")` 等操作可能在输入框还没接收完整
+/// 文本时就把当前片段发送出去。LLM 调用范式:
+/// `click_point(输入框) → type_text(完整消息) → send_keys("enter")`。
 pub fn type_text(text: &str) -> Result<()> {
     let chars: Vec<char> = text.chars().take(2000).collect();
     if chars.is_empty() {
@@ -245,6 +250,9 @@ pub fn type_text(text: &str) -> Result<()> {
             send_unicode_char(c as u16, true);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // 2026-09-17 第 77 轮 P1-3:80ms 等待(对齐 macOS CGEvent 注入的等待时长),
+        // 让目标应用输入事件循环完整消化字符,避免后续 send_keys 与残余字符竞争。
+        std::thread::sleep(std::time::Duration::from_millis(80));
     }
     Ok(())
 }

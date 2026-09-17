@@ -97,6 +97,12 @@ pub struct ExecutionTrace {
     /// 与 `runner_role` 对比可识别「委派错配」(`delegate_mismatch` 弱信号)。
     #[serde(default)]
     pub intended_role: Option<crate::agent::context::AgentRole>,
+    /// 2026-09-17 第 77 轮 P0-1:WindowUse Runner 入口检测到平台权限缺失项。
+    /// 空数组表示所有权限齐全;非空数组列出缺失的能力名(如
+    /// `["accessibility(macos)", "screen_recording(macos)"]`)。
+    /// 供 QC / Debug 报告 / TUI 阶段打印快速识别权限类失败根因。
+    #[serde(default)]
+    pub permission_missing: Vec<String>,
 }
 
 /// 单次工具调用摘要(2026-09-16 第 56 轮 + 第 57 轮)。
@@ -175,6 +181,7 @@ impl Default for ExecutionTrace {
             forced_tool_effective: None,
             runner_role: None,
             intended_role: None,
+            permission_missing: Vec::new(),
         }
     }
 }

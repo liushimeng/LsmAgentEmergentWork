@@ -229,6 +229,14 @@ pub fn format_task_result(
         }
         // SubAgent 执行轨迹摘要(2026-09-16 第 57 轮:补工具调用明细)
         if let Some(trace) = &wf.subflow_trace {
+            // 2026-09-17 第 77 轮 P0-1:权限缺失项(若有)在 trace 行前单列,
+            // 便于一眼看出"工具调用失败=权限缺失"根因。
+            if !trace.permission_missing.is_empty() {
+                out.push_str(&format!(
+                    "  [perm] 缺失: {}\n",
+                    trace.permission_missing.join(", ")
+                ));
+            }
             out.push_str(&format!(
                 "  [trace] iter={} tools={}(ok={},err={}) early_term={}\n",
                 trace.iterations,
@@ -262,16 +270,15 @@ pub fn format_task_result(
                         let err_short = truncate_chars(&tc.error_summary, 80);
                         format!(" ← {}", if styled { sv(&err_short) } else { err_short })
                     };
+                    // 2026-09-17 第 77 轮 P1-1:按工具类型差异化精简参数展示
+                    // (Bash cmd 截 40, Read/Write/Edit path 截 50, Window* 突出关键字段)
+                    let brief = tool_args_brief(&tc.tool, &tc.args_json);
                     out.push_str(&format!(
                         "    [tool] {:<14} {}{} {} {}B{}\n",
                         tc.tool,
                         elapsed,
                         icon(tc.ok),
-                        if styled {
-                            sv(&truncate_chars(&tc.args_json, 80))
-                        } else {
-                            truncate_chars(&tc.args_json, 80)
-                        },
+                        if styled { sv(&brief) } else { brief },
                         tc.output_bytes,
                         detail,
                     ));
@@ -504,6 +511,13 @@ pub fn format_failed_detail(
     // 失败单元的工具调用明细(失败场景全量,成功场景 5 条 —— 与 format_task_result 对齐)
     for wf in &result.workflows {
         if let Some(trace) = &wf.subflow_trace {
+            // 2026-09-17 第 77 轮 P0-1:权限缺失项(若有)在 trace 行前单列
+            if !trace.permission_missing.is_empty() {
+                out.push_str(&format!(
+                    "  [perm] 缺失: {}\n",
+                    trace.permission_missing.join(", ")
+                ));
+            }
             out.push_str(&format!(
                 "  [trace] iter={} tools={}(ok={},err={}) early_term={}\n",
                 trace.iterations,
@@ -533,12 +547,14 @@ pub fn format_failed_detail(
                         let err_short = truncate_chars(&tc.error_summary, 80);
                         format!(" ← {}", sv(&err_short))
                     };
+                    // 2026-09-17 第 77 轮 P1-1:差异化精简(同 format_task_result 段)
+                    let brief = tool_args_brief(&tc.tool, &tc.args_json);
                     out.push_str(&format!(
                         "    [tool] {:<14} {}{} {} {}B{}\n",
                         tc.tool,
                         elapsed,
                         icon(tc.ok),
-                        sv(&truncate_chars(&tc.args_json, 80)),
+                        sv(&brief),
                         tc.output_bytes,
                         detail,
                     ));
@@ -771,6 +787,219 @@ pub(crate) fn truncate_chars(s: &str, limit: usize) -> String {
         let mut out: String = s.chars().take(limit.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+/// 2026-09-17 第 77 轮 P1-1:工具调用参数差异化精简。
+///
+/// 背景:终态 `[tool]` 行原本统一截 80 字符 `args_json`,在 Bash 长命令
+/// (`osascript -e 'tell application ...'`) 或 WindowInspect 控件树 JSON 下
+/// 仍然过长,失败场景 14+ 条全量展示时刷屏。
+///
+/// 新规则(优先级从高到低):
+/// - **Bash**: 提取 `command` 字段,截 40;其他字段忽略
+///   (Bash 通常 1-2 个核心参数)
+/// - **Read/Write/Edit**: 提取 `path` 字段,截 50
+///   (路径本身就是最关键信息)
+/// - **WindowInspect/WindowOCR/WindowScreenshot**: 突出 `window_id`
+///   (窗口定位是核心)
+/// - **WindowAction**: `window_id + path + action` 拼接(限 60)
+/// - **其他**: 保持原 `args_json` 截 80 行为(向后兼容)
+///
+/// 环境变量开关:`LAEW_TOOL_DISPLAY_VERBOSE=1` 关闭精简,
+/// 全部走原始 `args_json` 截 80(便于排查具体参数)。
+pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
+    // 环境变量开关:verbose 模式保留原始 args_json 截 80
+    if std::env::var("LAEW_TOOL_DISPLAY_VERBOSE")
+        .ok()
+        .filter(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .is_some()
+    {
+        return truncate_chars(args_json, 80);
+    }
+
+    match tool {
+        "Bash" => {
+            // 提取 command 字段(尝试简单解析;失败回退到原文)
+            let cmd = extract_json_field(args_json, "command").unwrap_or_else(|| args_json.to_string());
+            let short = truncate_chars(&cmd, 44);
+            format!("cmd={short}")
+        }
+        "Write" | "Edit" => {
+            let p = extract_json_field(args_json, "path").unwrap_or_else(|| args_json.to_string());
+            format!("path={}", truncate_chars(&p, 50))
+        }
+        "Read" => {
+            let p = extract_json_field(args_json, "path").unwrap_or_else(|| args_json.to_string());
+            format!("path={}", truncate_chars(&p, 50))
+        }
+        "WindowInspect" | "WindowOCR" | "WindowScreenshot" | "WindowFind" | "WindowList" => {
+            let wid = extract_json_field(args_json, "window_id")
+                .or_else(|| extract_json_field(args_json, "query"))
+                .unwrap_or_default();
+            if wid.is_empty() {
+                truncate_chars(args_json, 60)
+            } else {
+                format!("wid={}", truncate_chars(&wid, 24))
+            }
+        }
+        "WindowAction" => {
+            let wid = extract_json_field(args_json, "window_id").unwrap_or_default();
+            let path = extract_json_field(args_json, "path").unwrap_or_else(|| "/".into());
+            let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
+            format!(
+                "wid={} path={} action={}",
+                truncate_chars(&wid, 12),
+                truncate_chars(&path, 16),
+                truncate_chars(&action, 12)
+            )
+        }
+        "WindowOpen" => {
+            let q = extract_json_field(args_json, "query")
+                .or_else(|| extract_json_field(args_json, "app_name"))
+                .unwrap_or_default();
+            format!("query={}", truncate_chars(&q, 32))
+        }
+        _ => truncate_chars(args_json, 80),
+    }
+}
+
+/// 极简 JSON 字段提取 —— 仅支持 string 值,无需 serde 完整解析。
+///
+/// 输入是稳定 JSON (key 排序后,值用 `"` 包裹);算法:
+/// 1. 在 args_json 中找 `"key":"` 模式;
+/// 2. 从匹配末尾开始扫描直到下一个未转义的 `"`;
+/// 3. 处理 `\"` 转义。
+///
+/// 不支持嵌套对象 / 数组 / 数字 —— 那些场景下回退 None,调用方用原文。
+fn extract_json_field(args_json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let start = args_json.find(&needle)? + needle.len();
+    let bytes = args_json.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+    // 跳过空白
+    let mut i = start;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'"' {
+        // 值不是 string(可能是数字 / 数组 / 对象),不支持
+        return None;
+    }
+    i += 1; // 跳过开引号
+    let value_start = i;
+    let mut out = String::new();
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' && i + 1 < bytes.len() {
+            // 处理常见转义
+            match bytes[i + 1] {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'r' => out.push('\r'),
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                _ => {
+                    out.push(c as char);
+                    out.push(bytes[i + 1] as char);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            return Some(out);
+        }
+        out.push(c as char);
+        i += 1;
+        // 安全阀:单字段超长(很可能是误匹配)截断
+        if out.chars().count() > 4096 {
+            return None;
+        }
+    }
+    // 没找到结束引号 → 截到末尾
+    let _ = value_start;
+    Some(out)
+}
+
+#[cfg(test)]
+mod tool_args_brief_tests {
+    use super::*;
+
+    #[test]
+    fn bash_brief_extracts_command() {
+        let json = r#"{"command":"screencapture -x /tmp/wechat_main.png","timeout_ms":30000}"#;
+        let brief = tool_args_brief("Bash", json);
+        assert!(brief.starts_with("cmd="), "Bash brief 应以 cmd= 开头, 实际: {brief}");
+        assert!(brief.contains("screencapture"), "应保留命令关键字: {brief}");
+        assert!(brief.len() <= 60, "Bash brief 应精简,实际长度: {}", brief.len());
+    }
+
+    #[test]
+    fn read_write_edit_extract_path() {
+        let json = r#"{"path":"/Users/dev/foo/Cargo.toml","limit":200}"#;
+        let brief = tool_args_brief("Read", json);
+        assert!(brief.starts_with("path="));
+        assert!(brief.contains("Cargo.toml"));
+
+        let write_brief = tool_args_brief("Write", json);
+        assert!(write_brief.starts_with("path="));
+
+        let edit_brief = tool_args_brief("Edit", json);
+        assert!(edit_brief.starts_with("path="));
+    }
+
+    #[test]
+    fn window_inspect_extracts_window_id() {
+        let json = r#"{"window_id":"682:0","max_depth":3,"filter":"button"}"#;
+        let brief = tool_args_brief("WindowInspect", json);
+        assert!(brief.contains("wid="));
+        assert!(brief.contains("682:0"));
+    }
+
+    #[test]
+    fn window_action_combines_fields() {
+        let json = r#"{"window_id":"682:0","path":"/0/2/1","x":100,"y":200}"#;
+        let brief = tool_args_brief("WindowAction", json);
+        assert!(brief.contains("wid=682:0"));
+        assert!(brief.contains("path=/0/2/1"));
+    }
+
+    #[test]
+    fn window_open_uses_query() {
+        let json = r#"{"query":"WeChat","wait_seconds":10}"#;
+        let brief = tool_args_brief("WindowOpen", json);
+        assert!(brief.starts_with("query="));
+        assert!(brief.contains("WeChat"));
+    }
+
+    #[test]
+    fn extract_json_field_handles_escapes() {
+        let json = r#"{"path":"C:\\Users\\foo\\bar.txt","name":"a\"b"}"#;
+        assert_eq!(extract_json_field(json, "path").as_deref(), Some(r"C:\Users\foo\bar.txt"));
+        assert_eq!(extract_json_field(json, "name").as_deref(), Some(r#"a"b"#));
+    }
+
+    #[test]
+    fn extract_json_field_missing_returns_none() {
+        let json = r#"{"foo":"bar"}"#;
+        assert_eq!(extract_json_field(json, "baz"), None);
+    }
+
+    #[test]
+    fn extract_json_field_skips_non_string_values() {
+        let json = r#"{"timeout_ms":30000,"path":"foo"}"#;
+        assert_eq!(extract_json_field(json, "timeout_ms"), None);
+        assert_eq!(extract_json_field(json, "path").as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn unknown_tool_falls_back_to_truncate() {
+        let json = r#"{"k":"v"}"#;
+        let brief = tool_args_brief("SomeUnknownTool", json);
+        assert!(brief.len() <= 81); // 80 + …
     }
 }
 

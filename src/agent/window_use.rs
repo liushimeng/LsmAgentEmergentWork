@@ -106,6 +106,13 @@ impl WindowUseRunner {
         let runner_role = Some(AgentRole::WindowUse);
         let intended_role = input.intended_role;
 
+        // ★0.8) 2026-09-17 第 77 轮 P0-1:平台权限快速检测。
+        // 一次性扫描 macOS 辅助功能 + 屏幕录制状态,缺失时把降级路径注入 prompt,
+        // 避免 LLM 在 WindowInspect/WindowOCR/WindowScreenshot 反复失败 14+ 次。
+        // 缓存 30s(LAEW_PERMISSION_CACHE_SECS 可调),Runner 重试时零开销。
+        let perm_report = crate::agent::window::check_platform_permissions();
+        let permission_missing = !perm_report.has_critical_grants();
+
         // ★1) 加载窗口会话状态(跨轮持久化,首次为空)。
         let mut win_state = self.state_mgr.load(session_id).await.unwrap_or_else(|| {
             let mut s = WindowSessionState::new(session_id);
@@ -166,55 +173,43 @@ impl WindowUseRunner {
         // 尾部追加窗口操控作业规范,提醒「先检视再操作」。
         let mut prompt = input.to_user_prompt();
 
-        // 2026-09-16 第 58 轮 P1-C 作业规范顺序修正:Runner 末尾引导与 system_prompt
-        // 保持一致,统一为「WindowList / WindowFind → WindowInspect → WindowAction」。
-        // 旧版只提「先用 WindowList」,与 system_prompt 的「WindowFind(推荐)」错位,
-        // LLM 在 system / user 两端看到不同顺序易困惑。
+        // ★1.2) 2026-09-17 第 77 轮 P0-1:权限缺失时把降级路径注入 prompt。
+        // LLM 第一轮响应即可拿到完整 Bash + osascript 降级文案,
+        // 避免反复尝试 WindowInspect 等已知失败的工具浪费迭代次数。
+        if permission_missing {
+            let perm_msg = crate::agent::window::build_permission_failure_message(&perm_report);
+            prompt.push_str(&perm_msg);
+            tracing::warn!(
+                missing = ?perm_report.missing_summary(),
+                "WindowUse 检测到权限缺失,已注入降级路径到 prompt"
+            );
+        }
+
+        // 2026-09-17 第 77 轮 P1-4:作业规范精简 —— 把 system_prompt 已覆盖的通用规则
+        // (双路线决策 / 失败 fallback / 安全红线等)从 Runner user-prompt 中移除,
+        // 仅保留**与 Runner 状态相关的指引**与跨平台别名等 LLM 不易推断的信息。
+        // 此前 14 条规则合计约 2000 字符,精简到 5 条核心约 600 字符,
+        // 减少首轮 system+user 双份加载带来的 token 浪费。
         prompt.push_str(
-            "\n\n【窗口操控作业规范】\n\
-             1. 目标应用未打开时优先用 WindowOpen(query,app_name?) 启动并等待窗口;已打开(含最小化到托盘)\
-                时 WindowOpen 会直接恢复并前置,不重复启动;Windows 微信 4.x 进程名是 Weixin.exe,\
-                别名表已含 WeChat/微信/Weixin,query 写任一都能命中;\n\
-             2. macOS 上 WeChat/部分 Electron 应用 NSWindow title 可能为空,这是正常现象,\
-                WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明,应通过 process_name 定位;\n\
-             3. 拿到窗口 id 后用 WindowInspect(max_depth 适度,filter 缩范围)检视控件树;\n\
-             4. **【双路线决策】**(2026-09-16 第 67 轮):WindowInspect 树为空或只有少量 Pane/\
-                自绘节点(如微信 4.x 的 MMUIRenderSubWindow)时,不要反复重试控件树 —— 立即切换\
-                **视觉路线**:WindowOCR(window_id) 拿文本块坐标 → WindowAction(action=\
-                click_point/double_click_point, x=screen_cx, y=screen_cy) 点击 → 输入框先\
-                click_point 再 action=type_text → 操作后重新 WindowOCR 验证;\n\
-             5. 依据控件 actions 列表选择合法动作,用 WindowAction 执行;路径失效时重新 WindowInspect;\
-                send_keys 已实装(enter/ctrl+a/alt+f4 等命名键与组合键);\n\
-             6. 禁止对疑似支付/删除/发送/确认类按钮做无把握点击;只读操作优先;\n\
-             7. macOS WindowInspect/Action 返回 -25211 kAXErrorAPIDisabled 时,工具会弹出并等待授权;\
-                若最终仍未授权,把开权限步骤写进最终回答告知用户;\n\
-             8. 同一应用的连续 UI 操作必须在本单元内连续完成,不要只完成“打开”后把搜索/输入\
-                留给下一个独立单元;窗口状态会按 Session ID 持久化,但真实 UI 焦点不应依赖重新启动;\n\
-             9. **【中文 UI 名称同义词表】**(2026-09-16 第 65 轮 P1-B):filter 失败时优先试下表同义词,不要立即放弃或全量遍历:\n\
-                - 通讯录 = 通信录 = 联系人 = Contacts = contactsList\n\
-                - 消息 = 发送 = Send = submit\n\
-                - 按钮 = Button\n\
-                - 输入框 = 搜索 = Search = TextField = Edit\n\
-                - 关闭 = X = close = 退出\n\
-                - 设置 = Settings = Preferences\n\
-             10. **【禁止 Read PNG】**:WindowScreenshot 只落盘 PNG 文件,Read 工具读 PNG 必然失败\
-                (仅支持 UTF-8 文本);需要识别界面文字一律用 **WindowOCR**(返回文本+坐标,无需截图文件);\n\
-             11. **【列表定位优先搜索】**(2026-09-16 第 66 轮):在列表中找指定条目(联系人/会话/文件)时,\
-                优先找搜索框 set_text 目标名直接定位;无搜索框再逐屏滚动遍历(控件树用 action=scroll;\
-                视觉路线用 action=scroll_point 于列表中心 text=\"down:3\"),**每滚一屏后必须重新检视/OCR**;\
-             12. **【特殊字符名称匹配】**:目标名含 Unicode 上标(如 赵玲玲ᴬᴵᴬ)时,filter/OCR 结果匹配\
-                直接写 ASCII 归一形(赵玲玲AIA)即可,工具自动等价匹配;匹配不到再试原名与片段;\n\
-             13. **【发送消息范式】**:定位输入框(控件树 set_text / 视觉路线 click_point 输入框)\
-                → 写入消息(set_text 或 type_text)→ send_keys(\"enter\") 发送(微信默认 Enter 发送,\
-                若应用设置不同可试 \"ctrl+enter\" 或点击「发送」按钮)→ 复查(WindowInspect/WindowOCR\
-                确认消息出现在对话区)后再宣告完成。\n\
-             14. **【效率规范 - 2026-09-17 第 74 轮】**:\n\
-                - **禁止用 Bash 调 screencapture**:WindowScreenshot 已走 CGWindow 原生路径,无需屏幕录制权限;\n\
-                - **禁止用 Bash 调 osascript 枚举 UI**:WindowInspect 已走 AX API,直接返回控件树;\n\
-                - **禁止用 Bash 调 osascript 获取窗口位置**:WindowList 已返回 bounds;\n\
-                - **Bash 仅用于**:cliclick 坐标点击(控件树+视觉路线都失败时)、open 启动应用;\n\
-                - **每步操作后必须验证**:操作后用 WindowOCR/WindowInspect 确认结果,不要盲目继续;\n\
-                - **连续 3 轮无进展立即止损**:不要重复相同操作超过 3 次,及时调整策略或报告失败。",
+            "\n\n【Runner 补充作业规范】\n\
+             1. 目标应用未打开时优先用 WindowOpen(query,app_name?);已打开(含最小化到托盘)\
+                时 WindowOpen 会直接恢复+前置,**不重复启动**。Windows 微信 4.x 进程名是 \
+                Weixin.exe(3.x 才是 WeChat.exe),别名表已含 WeChat/微信/Weixin。\n\
+             2. macOS 上 WeChat / 部分 Electron 应用 NSWindow title 可能为空,这是正常现象,\
+                WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明,**应通过 process_name 定位**。\n\
+             3. **【中文 UI 同义词表】**filter 失败时优先试同义词(已在 WindowInspect 工具 \
+                description 中完整列出):通讯录/通信录/联系人/Contacts、按钮/Button、\
+                输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences。\n\
+             4. **【发送消息范式】**定位输入框 → set_text 或 type_text 写入消息 →\
+                send_keys(\"enter\") 发送(微信默认 Enter 发送,若应用设置不同可试 \"ctrl+enter\"\
+                或点击「发送」按钮)→ 重新 WindowInspect/OCR 复查消息已出现在对话区。\n\
+             5. **【效率规范 - 2026-09-17 第 77 轮】**:\n\
+                - 禁止 Bash 调 screencapture(WindowScreenshot 已走 CGWindow 原生路径);\n\
+                - 禁止 Bash 调 osascript 枚举 UI 或获取窗口位置(WindowInspect / WindowList 已覆盖);\n\
+                - Bash 仅用于:cliclick 坐标点击(控件树+视觉路线都失败时)、open 启动应用、\
+                  权限未授权场景的 osascript System Events 降级路径;\n\
+                - 每步操作后必须验证(WindowOCR / WindowInspect)再继续;\n\
+                - 连续 3 轮无进展立即止损,不要重复相同失败操作。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -289,6 +284,8 @@ impl WindowUseRunner {
         // 供 collect_failure_signals 计算 delegate_mismatch 弱信号。
         trace.runner_role = runner_role;
         trace.intended_role = intended_role;
+        // 2026-09-17 第 77 轮 P0-1:权限缺失项写入 trace,供 QC / Debug 报告观测。
+        trace.permission_missing = perm_report.missing_summary();
         trace.collect_failure_signals(&text);
 
         // 给 QC / TUI 追加机器可验证证据,防止最终文本与真实工具轨迹相悖。
@@ -722,5 +719,61 @@ mod tests {
             .join(",");
         assert!(distribution.contains("not_trusted=1"));
         assert!(distribution.contains("stale_handle=1"));
+    }
+
+    // ============== 2026-09-17 第 77 轮 P0-1 测试 ==============
+
+    #[test]
+    fn permission_message_contains_degradation_guide_when_missing() {
+        // 验证权限缺失时 build_permission_failure_message 输出包含降级路径
+        // 关键命令(osascript / cliclick / screencapture)。
+        use crate::agent::window::{build_permission_failure_message, PermissionReport};
+
+        // Windows 上 granted=true,无缺失
+        let r = PermissionReport {
+            platform: "windows".into(),
+            accessibility: true,
+            screen_recording: true,
+            can_ocr: true,
+            can_screenshot: true,
+            accessibility_hint: String::new(),
+            screen_recording_hint: String::new(),
+        };
+        let msg = build_permission_failure_message(&r);
+        assert!(msg.contains("✅"), "Windows 全授权应给出成功文案: {msg}");
+
+        // macOS 缺权限
+        let r = PermissionReport {
+            platform: "macos".into(),
+            accessibility: false,
+            screen_recording: false,
+            can_ocr: false,
+            can_screenshot: false,
+            accessibility_hint: "授权步骤...".into(),
+            screen_recording_hint: "授权步骤...".into(),
+        };
+        let msg = build_permission_failure_message(&r);
+        assert!(msg.contains("⚠️"), "macOS 缺权限应给出警告文案");
+        assert!(msg.contains("osascript"), "应包含 osascript 降级命令");
+        assert!(msg.contains("cliclick"), "应包含 cliclick 降级命令");
+        assert!(msg.contains("screencapture"), "应包含 screencapture 降级命令");
+        assert!(msg.contains("禁止再尝试 WindowInspect"), "应明确禁止重复尝试");
+    }
+
+    #[test]
+    fn trace_carries_permission_missing_field() {
+        // 验证 ExecutionTrace 新增 permission_missing 字段,可写入 + 反序列化。
+        use crate::agent::extrace::ExecutionTrace;
+        let mut t = ExecutionTrace::default();
+        assert!(t.permission_missing.is_empty());
+
+        t.permission_missing = vec!["accessibility(macos)".into(), "screen_recording(macos)".into()];
+        let json = serde_json::to_string(&t).expect("serialize ok");
+        assert!(json.contains("permission_missing"));
+        assert!(json.contains("accessibility(macos)"));
+
+        // 反序列化恢复
+        let restored: ExecutionTrace = serde_json::from_str(&json).expect("deserialize ok");
+        assert_eq!(restored.permission_missing, t.permission_missing);
     }
 }

@@ -445,6 +445,363 @@ pub(crate) fn platform_err(platform: &str, msg: impl Into<String>) -> AgentError
     }
 }
 
+// ===================== 平台权限快速检测(2026-09-17 第 77 轮 P0-1/P0-2) =====================
+//
+// 背景:WindowUseRunner 之前依赖 `driver_preflight` 在每个工具入口触发授权等待,
+// 导致 LLM 在 WindowInspect/WindowOCR/WindowScreenshot 全部失败时仍会反复重试
+// (14-16 次迭代),浪费 200s+ 与 token。Runner 入口需要「一次扫描报告」能力。
+//
+// 设计:
+// - `PermissionReport` 统一结构:accessibility / screen_recording / can_ocr / can_screenshot
+// - `check_platform_permissions()` 单点探测 + 缓存(进程级 OnceLock),避免每次重试
+//   都触发系统调用;LLM retry 期间缓存命中 → 零开销
+// - `build_permission_failure_message()` 把缺失项翻译成 LLM 可读的引导文案 + Bash
+//   降级路径(osascript / cliclick / screencapture)
+// - 三平台分支:
+//   * macOS:accessibility(AX) + screen_recording(CGWindowListCreateImage)
+//   * Windows:无 TCC 等价机制(UIA 受 AppContainer / 进程完整性影响);返回全授权
+//   * Linux:依赖 xdotool/wmctrl 可执行文件存在;返回全授权(无统一机制)
+//
+// 落地位置:
+// - `WindowUseRunner::run_unit_inner` 入口在 `WindowUseBashModeGuard::enter()` 之后
+//   调用 `check_platform_permissions()`,若 `!has_critical_grants()` 则把
+//   `build_permission_failure_message(report)` 注入 prompt,LLM 首轮即得引导
+// - ExecutionTrace 写 `permission_denied: Vec<String>` 字段,供 QC/Debug 报告观测
+
+/// 平台权限报告(2026-09-17 第 77 轮 P0-1)。
+///
+/// `granted=true` 表示对应能力可用;`false` 表示缺权限或驱动不支持。
+/// `hint` 为 LLM 可读的具体引导文案(每个字段独立,缺失时才填)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PermissionReport {
+    /// 平台名(macos / windows / linux)
+    pub platform: String,
+    /// 辅助功能 / UI Automation 等窗口控件枚举能力
+    pub accessibility: bool,
+    /// 屏幕录制 / 截图能力(macOS CGWindowListCreateImage 必需)
+    pub screen_recording: bool,
+    /// OCR 能力(综合权限 + 引擎可用性,如 Vision / Windows.Media.Ocr)
+    pub can_ocr: bool,
+    /// 截图能力(综合权限 + 引擎)
+    pub can_screenshot: bool,
+    /// 辅助功能未授权引导文案(为空表示已授权)
+    pub accessibility_hint: String,
+    /// 屏幕录制未授权引导文案(为空表示已授权)
+    pub screen_recording_hint: String,
+}
+
+impl PermissionReport {
+    /// 关键权限是否全部就绪(accessibility + screen_recording)。
+    /// can_ocr / can_screenshot 跟随前两项 + 引擎可用性。
+    pub fn has_critical_grants(&self) -> bool {
+        self.accessibility && self.screen_recording
+    }
+
+    /// 缺失项摘要(供 trace / Debug 报告)。
+    pub fn missing_summary(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.accessibility {
+            out.push(format!("accessibility({})", self.platform));
+        }
+        if !self.screen_recording {
+            out.push(format!("screen_recording({})", self.platform));
+        }
+        out
+    }
+}
+
+/// 单点探测缓存(进程级 OnceLock),避免 Runner 入口每次重试都触发系统调用。
+///
+/// 关键设计:窗口期间权限状态可能变化(用户主动授权),故缓存仅 30 秒,
+/// 让重试链路在合理时间内拿到最新状态。`LAEW_PERMISSION_CACHE_SECS` 可覆盖。
+static PERMISSION_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, PermissionReport)>>> =
+    std::sync::OnceLock::new();
+
+/// 进程级单点权限探测(2026-09-17 第 77 轮 P0-1)。
+///
+/// 三平台分支:
+/// - macOS:accessibility = `AXIsProcessTrustedWithOptions(NULL)`;
+///   screen_recording = 探测 `CGWindowListCreateImage` 是否返回非空(发 10×10 像素测试);
+/// - Windows:全 true(UIA / SendInput 走标准用户权限);
+/// - Linux:全 true(wmctrl/xdotool 是普通进程命令,无统一权限机制)。
+pub fn check_platform_permissions() -> PermissionReport {
+    if let Some(mutex) = PERMISSION_CACHE.get() {
+        if let Ok(mut cached) = mutex.lock() {
+            let ttl_secs = std::env::var("LAEW_PERMISSION_CACHE_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(30);
+            if let Some((when, report)) = cached.as_ref() {
+                if when.elapsed().as_secs() < ttl_secs {
+                    return report.clone();
+                }
+            }
+            let fresh = probe_platform_permissions();
+            *cached = Some((std::time::Instant::now(), fresh.clone()));
+            return fresh;
+        }
+    }
+    // 第一次初始化
+    let probe = probe_platform_permissions();
+    let _ = PERMISSION_CACHE.set(std::sync::Mutex::new(Some((
+        std::time::Instant::now(),
+        probe.clone(),
+    ))));
+    probe
+}
+
+/// 强制刷新缓存(WindowUseRunner 单元之间需要拿到最新状态时调用)。
+pub fn invalidate_permission_cache() {
+    if let Some(mutex) = PERMISSION_CACHE.get() {
+        if let Ok(mut cached) = mutex.lock() {
+            *cached = None;
+        }
+    }
+}
+
+/// 真实探测(各平台实现)。
+fn probe_platform_permissions() -> PermissionReport {
+    #[cfg(target_os = "macos")]
+    {
+        probe_macos_permissions()
+    }
+    #[cfg(windows)]
+    {
+        PermissionReport {
+            platform: "windows".into(),
+            accessibility: true,
+            screen_recording: true,
+            can_ocr: true,
+            can_screenshot: true,
+            accessibility_hint: String::new(),
+            screen_recording_hint: String::new(),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        // Linux:wmctrl / xdotool 是普通进程命令,无统一权限机制。
+        // 但 xdotool / wmctrl 不在 → 工具层会报"命令未找到",这里不影响 grant 标记。
+        PermissionReport {
+            platform: "linux".into(),
+            accessibility: true,
+            screen_recording: true,
+            can_ocr: false,
+            can_screenshot: false,
+            accessibility_hint: String::new(),
+            screen_recording_hint: String::new(),
+        }
+    }
+}
+
+/// macOS 权限探测:accessibility = `AXIsProcessTrustedWithOptions(NULL)`,
+/// screen_recording = 探测 CGWindowListCreateImage 是否返回非空(10×10 像素测试)。
+///
+/// 实现细节:
+/// - accessibility 探测直接调 macos_legacy::trusted_quiet,避免重复实现;
+/// - screen_recording 探测是「写一个 10×10 透明 PNG 到磁盘 → 检查文件大小 > 0」,
+///   不需要启动截图会话;CGWindowListCreateImage 屏幕录制未授权时返回 NULL,
+///   而窗口级(`kCGWindowListOptionIncludingWindow`)即使未授权也可能返回有效图像,
+///   所以这里用全屏 `kCGWindowListOptionAll` + 单像素测试:
+///   - 已授权 → 创建 image 成功 → 释放 → 返回 true
+///   - 未授权 → 创建 image 返回 NULL → 返回 false
+/// - 该探测是 best-effort:第一次探测失败时缓存 false,后续不再尝试(避免阻塞);
+///   用户授权后需手动 `LAEW_PERMISSION_CACHE_SECS=0` 重启或等待 TTL 过期
+#[cfg(target_os = "macos")]
+fn probe_macos_permissions() -> PermissionReport {
+    use crate::agent::window::macos_legacy::MacOsDriver;
+
+    let accessibility = MacOsDriver::is_trusted();
+    let screen_recording = probe_macos_screen_recording();
+
+    PermissionReport {
+        platform: "macos".into(),
+        accessibility,
+        screen_recording,
+        can_ocr: accessibility && screen_recording,
+        can_screenshot: accessibility && screen_recording,
+        accessibility_hint: if accessibility {
+            String::new()
+        } else {
+            // 与 macos_legacy::MACOS_AX_UNAVAILABLE_HINT 保持一致文案
+            "辅助功能未授权(AX -25211 kAXErrorAPIDisabled)。授权:系统设置 → 隐私与安全性 → 辅助功能 → 勾选宿主终端(Terminal/iTerm2/VS Code);TCC 按进程启动时快照,授权后需完全退出并重开终端。授权前可降级走 Bash + osascript(已扩白名单)或 cliclick / screencapture -x $TMPDIR/x.png。".into()
+        },
+        screen_recording_hint: if screen_recording {
+            String::new()
+        } else {
+            "屏幕录制未授权(CGWindowListCreateImage 返回 NULL)。授权:系统设置 → 隐私与安全性 → 屏幕录制 → 勾选宿主终端;授权后必须重启终端生效。授权前可改用 WindowInspect 控件树路线(纯辅助功能),或降级到 screencapture / osascript System Events 路径。".into()
+        },
+    }
+}
+
+/// macOS 屏幕录制权限探测:CGWindowListCreateImage(全屏) 是否返回非 NULL。
+///
+/// best-effort 实现,失败时不重试(避免阻塞)。缓存 30s 由调用方控制。
+#[cfg(target_os = "macos")]
+fn probe_macos_screen_recording() -> bool {
+    use core_graphics::display::CGRectNull;
+    use core_graphics::image::CGImage;
+    use core_graphics::window::{
+        kCGWindowImageBoundsIgnoreFraming, kCGWindowListOptionAll,
+    };
+    use foreign_types::ForeignType;
+
+    // 全屏截 1 像素测试;屏幕录制未授权时 CGWindowListCreateImage 返回 NULL。
+    unsafe {
+        let cg_image = core_graphics::window::CGWindowListCreateImage(
+            CGRectNull,
+            kCGWindowListOptionAll,
+            0,
+            kCGWindowImageBoundsIgnoreFraming,
+        );
+        if cg_image.is_null() {
+            return false;
+        }
+        // 立即释放(避免泄漏);CGImage 不是 Send,这里只取 width 字段即可判定成功
+        let img = CGImage::from_ptr(cg_image);
+        let ok = img.width() > 0;
+        drop(img);
+        ok
+    }
+}
+
+/// 把缺失项翻译成 LLM 可读的引导文案(2026-09-17 第 77 轮 P0-1)。
+///
+/// 用途:WindowUseRunner 入口在权限缺失时把这段文案追加到 prompt,
+/// LLM 第一轮响应即可拿到完整降级路径,不必通过 14+ 次失败自己摸索。
+///
+/// 输出结构:
+/// ```
+/// 【平台权限快速检测】⚠️ 检测到权限缺失:
+///   - 辅助功能: 未授权
+///   - 屏幕录制: 未授权
+/// 【降级路径】已为你开 Bash 白名单(osascript / cliclick / screencapture),可用:
+///   - 启动应用: osascript -e 'tell application "WeChat" to activate'
+///   - 坐标点击: cliclick c:x,y
+///   - 键盘输入: osascript -e 'tell application "System Events" to keystroke "..."'
+///   - 截图: screencapture -x $TMPDIR/x.png
+/// 【推荐策略】
+///   1. 立即走 Bash 路线完成核心任务(发消息 / 截图识别)
+///   2. 同时引导用户去系统设置授权(下次任务可用原生路线)
+///   3. 禁止再尝试 WindowInspect / WindowOCR / WindowScreenshot(已知会失败)
+/// ```
+pub fn build_permission_failure_message(report: &PermissionReport) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("\n\n【平台权限快速检测(2026-09-17 第 77 轮 P0-1)】"));
+    let mut missing = Vec::new();
+    if !report.accessibility {
+        missing.push("辅助功能(accessibility)");
+    }
+    if !report.screen_recording {
+        missing.push("屏幕录制(screen_recording)");
+    }
+    if missing.is_empty() {
+        lines.push("✅ 平台权限齐全,WindowUse 全工具正常可用。".to_string());
+    } else {
+        lines.push(format!(
+            "⚠️ 检测到权限缺失({} 项):\n  - {}",
+            missing.len(),
+            missing.join("\n  - ")
+        ));
+        if !report.accessibility_hint.is_empty() {
+            lines.push(format!("【辅助功能授权步骤】\n  {}", report.accessibility_hint));
+        }
+        if !report.screen_recording_hint.is_empty() {
+            lines.push(format!(
+                "【屏幕录制授权步骤】\n  {}",
+                report.screen_recording_hint
+            ));
+        }
+        lines.push(
+            "【降级路径(WindowUse 已扩 Bash 白名单,无需授权)】".to_string(),
+        );
+        lines.push(
+            "  - 启动 / 激活应用: osascript -e 'tell application \"WeChat\" to activate'".to_string(),
+        );
+        lines.push(
+            "  - 检测应用是否运行: osascript -e 'tell application \"System Events\" to (name of processes) contains \"WeChat\"'".to_string(),
+        );
+        lines.push(
+            "  - 键盘输入(ASCII): osascript -e 'tell application \"System Events\" to keystroke \"text\"'".to_string(),
+        );
+        lines.push(
+            "  - 键盘输入(CJK): echo -n \"消息内容\" | pbcopy  + osascript keystroke \"v\" / cmd+v".to_string(),
+        );
+        lines.push("  - 坐标点击: cliclick c:x,y(需 brew install cliclick)".to_string());
+        lines.push("  - 截图: screencapture -x $TMPDIR/x.png".to_string());
+        lines.push(
+            "【推荐策略】\n  1. 立即走 Bash 路线完成核心任务(发消息 / 截图识别)\n  \
+             2. 同时引导用户去系统设置授权(下次任务可用原生路线)\n  \
+             3. 禁止再尝试 WindowInspect / WindowOCR / WindowScreenshot(已知会失败浪费时间)"
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn permission_report_default_is_empty() {
+        let r = PermissionReport::default();
+        assert!(!r.has_critical_grants());
+        assert!(r.missing_summary().is_empty() == false || r.missing_summary().len() == 2);
+    }
+
+    #[test]
+    fn permission_report_missing_summary_works() {
+        let mut r = PermissionReport::default();
+        r.platform = "macos".into();
+        assert_eq!(r.missing_summary(), vec!["accessibility(macos)", "screen_recording(macos)"]);
+
+        r.accessibility = true;
+        assert_eq!(r.missing_summary(), vec!["screen_recording(macos)"]);
+
+        r.screen_recording = true;
+        assert!(r.missing_summary().is_empty());
+        assert!(r.has_critical_grants());
+    }
+
+    #[test]
+    fn build_permission_message_with_all_granted() {
+        let r = PermissionReport {
+            platform: "macos".into(),
+            accessibility: true,
+            screen_recording: true,
+            can_ocr: true,
+            can_screenshot: true,
+            accessibility_hint: String::new(),
+            screen_recording_hint: String::new(),
+        };
+        let msg = build_permission_failure_message(&r);
+        assert!(msg.contains("✅"));
+        assert!(!msg.contains("⚠️"));
+        assert!(!msg.contains("降级路径"));
+    }
+
+    #[test]
+    fn build_permission_message_with_missing() {
+        let r = PermissionReport {
+            platform: "macos".into(),
+            accessibility: false,
+            screen_recording: false,
+            can_ocr: false,
+            can_screenshot: false,
+            accessibility_hint: "授权步骤...".into(),
+            screen_recording_hint: "授权步骤...".into(),
+        };
+        let msg = build_permission_failure_message(&r);
+        assert!(msg.contains("⚠️"));
+        assert!(msg.contains("辅助功能"));
+        assert!(msg.contains("屏幕录制"));
+        assert!(msg.contains("osascript"));
+        assert!(msg.contains("cliclick"));
+        assert!(msg.contains("screencapture"));
+        assert!(msg.contains("禁止再尝试 WindowInspect"));
+    }
+}
+
 /// 2026-09-16 第 67 轮:window_id → HWND(供 tools/window_vision.rs 的
 /// Windows 截图路径直接拿句柄;非 Windows 平台不存在本函数)。
 #[cfg(windows)]

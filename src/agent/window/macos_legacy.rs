@@ -444,6 +444,12 @@ unsafe fn cg_click_at(x: f64, y: f64, right: bool, double: bool) {
 /// 向当前焦点控件真实键入文本(2026-09-17 第 70 轮)。
 /// CGEventKeyboardSetUnicodeString 按 UTF-16 直达,无键盘布局/IME 依赖;
 /// 单个事件携带 ≤20 个 UTF-16 单元,分批注入(SendInput Unicode 的 macOS 对偶)。
+///
+/// 2026-09-17 第 77 轮 P1-3:完成所有 chunk 注入后等待 80ms,确保应用消费字符;
+/// 否则后续立即调用的 `send_keys("enter")` 等操作可能在输入框还没接收完整
+/// 文本时就把当前片段("i" 等首个字符)发送出去。LLM 调用范式:
+/// `click_point(输入框) → type_text(完整消息) → send_keys("enter")`,
+/// 这里的 80ms 等待让 type_text 完整生效。
 unsafe fn cg_type_text(text: &str) {
     let units: Vec<u16> = text.encode_utf16().collect();
     for chunk in units.chunks(20) {
@@ -461,6 +467,11 @@ unsafe fn cg_type_text(text: &str) {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // 2026-09-17 第 77 轮 P1-3:全部 chunk 注入完成后等待 80ms,
+    // 让目标应用的输入事件循环完整消化 Unicode 字符,避免后续
+    // send_keys("enter") 等操作与残余字符竞争导致输入不完整。
+    // (经验值:微信 macOS 输入框事件循环周期约 50ms,80ms 留 30ms 余量)
+    std::thread::sleep(std::time::Duration::from_millis(80));
 }
 
 /// CFNumberRef → i64。
