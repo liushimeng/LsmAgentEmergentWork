@@ -161,6 +161,8 @@ mod tests {
             depends_on: vec![],
             acceptance: vec!["ok".into()],
             delegate_to: AgentRole::SubAgent,
+            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
+            target_app: None,
         }
     }
 

@@ -207,6 +207,8 @@ impl MainWorkRunner {
                     depends_on: vec![],
                     acceptance: inherited,
                     delegate_to: fallback_delegate,
+                    // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
+                    target_app: None,
                 }],
                 summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
                 degraded: true,

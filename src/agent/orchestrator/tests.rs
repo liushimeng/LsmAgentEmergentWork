@@ -46,6 +46,8 @@
             depends_on: vec![],
             acceptance: vec!["OK".into()],
             delegate_to: AgentRole::SubAgent,
+            // 2026-09-17 第 82+ 轮 P0-1:测试 fixture 无目标应用。
+            target_app: None,
         };
         let input = build_subflow_input(&wf, &std::collections::HashMap::new(), "");
         assert_eq!(input.id, "wf-1.step");
@@ -69,6 +71,8 @@
             depends_on: vec!["wf-1".into()],
             acceptance: vec!["修改完成".into()],
             delegate_to: AgentRole::SubAgent,
+            // 2026-09-17 第 82+ 轮 P0-1:测试 fixture 无目标应用。
+            target_app: None,
         };
         let input = build_subflow_input(&wf, &deps, "");
         assert_eq!(input.depends_on_outputs.len(), 1);

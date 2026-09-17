@@ -30,6 +30,12 @@ pub struct WorkFlowSpec {
         deserialize_with = "lenient_delegate_to"
     )]
     pub delegate_to: AgentRole,
+    /// ★2026-09-17 第 82+ 轮 P0-1:目标桌面应用标识(供 WindowUse Runner 自动启动兜底)。
+    /// LLM 可显式指定(WeChat/Chrome/Slack/Telegram/QQ 等已知应用),
+    /// `None` 时 Runner 跳过自动启动;LLM 未指定但 prompt 含「打开 X」关键词
+    /// 时 Orchestrator 启发式推断。
+    #[serde(default)]
+    pub target_app: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

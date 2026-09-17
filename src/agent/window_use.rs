@@ -173,6 +173,98 @@ impl WindowUseRunner {
         // 尾部追加窗口操控作业规范,提醒「先检视再操作」。
         let mut prompt = input.to_user_prompt();
 
+        // ★0.7) 2026-09-17 第 82+ 轮 P0-1:目标应用自动启动兜底。
+        // 背景:微信任务实测 16:45 场次,LLCM 第 1 轮 forced_tool=WindowOpen 被
+        // 绕过 → Runner 没兜底 → 整个 Session 浪费 591s 但零产出。本轮新增:
+        //   - LLM/Orchestrator 在 SubFlowInput.expected_target_app 显式提供
+        //     目标应用(WeChat/Chrome/Slack 等),Runner 入口先探测可见性;
+        //   - 不可见 → 自动 launch_desktop_app + 等待 10s,把启动结果作为
+        //     prompt 注入,LLM 第一轮即可拿到 ready window_id;
+        //   - 启动失败或不在白名单 → 注入「自动启动失败」提示,LLCM 走 WindowOpen
+        //     或 Bash(open -a) 兜底。
+        // 与 forced_tool(LLM 层) + nudge(LLM 层) 形成三层防御:
+        //   1) Runner 自动启动(本步骤);
+        //   2) forced_tool=WindowOpen(iter=0);
+        //   3) nudge_window_ops(iter≤2)。
+        if let Some(target_app) = input
+            .expected_target_app
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let driver = crate::agent::window::current_driver();
+            let pre_check = driver.list_windows(None).unwrap_or_default();
+            let aliases: Vec<String> = if target_app.to_lowercase().contains("wechat")
+                || target_app.to_lowercase().contains("weixin")
+                || target_app.contains("微信")
+            {
+                vec!["WeChat".to_string(), "微信".to_string(), "Weixin".to_string()]
+            } else {
+                vec![target_app.to_string()]
+            };
+            let already_visible = pre_check.iter().any(|w| {
+                aliases.iter().any(|a| {
+                    let a = a.to_lowercase();
+                    w.title.to_lowercase().contains(&a)
+                        || w.process_name.to_lowercase().contains(&a)
+                })
+            });
+            if !already_visible {
+                // 不可见 → 自动启动 + 等待 10s(可在 LAEW_AUTO_LAUNCH_WAIT_SECS 覆盖)
+                let wait = std::env::var("LAEW_AUTO_LAUNCH_WAIT_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(10);
+                let launch_outcome = std::panic::catch_unwind(|| {
+                    crate::agent::window::auto_launch_target(target_app, None, wait)
+                });
+                match launch_outcome {
+                    Ok(Ok(info)) => {
+                        tracing::info!(
+                            target = %target_app,
+                            window_id = %info.id,
+                            "Runner 自动启动目标应用成功"
+                        );
+                        prompt.push_str(&format!(
+                            "\n\n【Runner 自动启动结果】✅ 已自动启动目标应用 {target_app:?},\
+                             window_id={}, title={:?}, process={:?}。\
+                             请直接基于此 window_id 调 WindowInspect / WindowAction / WindowOCR(若需要)。",
+                            info.id, info.title, info.process_name
+                        ));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            target = %target_app,
+                            error = %e,
+                            "Runner 自动启动失败"
+                        );
+                        prompt.push_str(&format!(
+                            "\n\n【Runner 自动启动失败】目标应用 {target_app:?} 启动未果:{e}。\
+                             请改用 WindowOpen(query=\"{target_app}\") 显式启动,\
+                             或走 Bash(osascript / open -a) 兜底。"
+                        ));
+                    }
+                    Err(_) => {
+                        prompt.push_str(&format!(
+                            "\n\n【Runner 自动启动异常】目标应用 {target_app:?} 启动过程中 panic;\
+                             请改用 WindowOpen 或 Bash(open -a) 手动启动。"
+                        ));
+                    }
+                }
+            } else {
+                let visible = pre_check.len();
+                tracing::debug!(
+                    target = %target_app,
+                    visible,
+                    "Runner 探测:目标应用已可见,跳过自动启动"
+                );
+                prompt.push_str(&format!(
+                    "\n\n【Runner 探测】目标应用 {target_app:?} 已在可见窗口列表中(共 {visible} 个);\
+                     请先 WindowFind(\"{target_app}\") 或 WindowList 取最新 window_id,\
+                     再调 WindowInspect / WindowAction。"
+                ));
+            }
+        }
+
         // ★1.2) 2026-09-17 第 77 轮 P0-1:权限缺失时把降级路径注入 prompt。
         // LLM 第一轮响应即可拿到完整 Bash + osascript 降级文案,
         // 避免反复尝试 WindowInspect 等已知失败的工具浪费迭代次数。
@@ -191,32 +283,21 @@ impl WindowUseRunner {
         // 此前 14 条规则合计约 2000 字符,精简到 5 条核心约 600 字符,
         // 减少首轮 system+user 双份加载带来的 token 浪费。
         prompt.push_str(
-            "\n\n【Runner 补充作业规范】\n\
-             1. 目标应用未打开时优先用 WindowOpen(query,app_name?);已打开(含最小化到托盘)\
-                时 WindowOpen 会直接恢复+前置,**不重复启动**。Windows 微信 4.x 进程名是 \
-                Weixin.exe(3.x 才是 WeChat.exe),别名表已含 WeChat/微信/Weixin。\n\
-             2. macOS 上 WeChat / 部分 Electron 应用 NSWindow title 可能为空,这是正常现象,\
-                WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明,**应通过 process_name 定位**。\n\
-             3. **【中文 UI 同义词表】**filter 失败时优先试同义词(已在 WindowInspect 工具 \
-                description 中完整列出):通讯录/通信录/联系人/Contacts、按钮/Button、\
-                输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences。\n\
-             4. **【原子发送范式】**定位输入框后首选一个 `type_text_submit` 完成\
-                键入完整内容 + Enter 提交(驱动层已逐字符注入,长文本不会丢字);\
-                视觉路线传输入框中心 x/y,控件树路线先聚焦/传 path。\
-                仅当应用把 Enter 定义为换行时,才用 type_text + click「发送」按钮。\
-                发送后用**可用的**手段复查(WindowInspect/get_text 或 OCR)消息已出现在对话区。\n\
-             5. **【效率规范 - 2026-09-17 第 81 轮更新】**:\n\
-                - 状态块中的窗口 freshness=Fresh 时直接复用 window_id;禁止重复 \
-                  WindowOpen/WindowFind/激活同一目标,避免 UI 反复前置导致焦点断续;\n\
-                - WindowOpen 返回 already_frontmost=true(或窗口明显未变)时**不要再激活**,\
-                  驱动层已做幂等前置,重复激活只会打断当前输入焦点;\n\
-                - 禁止 Bash 调 screencapture(WindowScreenshot 已走 CGWindow 原生路径;\
-                  屏幕录制未授权时两者都不可用,见上方权限检测提示);\n\
-                - 禁止 Bash 调 osascript 枚举 UI 或获取窗口位置(WindowInspect / WindowList 已覆盖);\n\
-                - Bash 仅用于:cliclick 坐标点击(控件树+视觉路线都失败时)、open 启动应用、\
-                  权限未授权场景的 osascript System Events 降级路径;\n\
-                - 每步操作后用当前权限下**可用**的手段验证再继续(权限缺失时 OCR 不可用,改 Inspect/get_text);\n\
-                - 连续 3 轮无进展立即止损,不要重复相同失败操作。",
+            "\n\n【Runner 补充作业规范(第 82+ 轮精简)】\n\
+             1. **目标应用可见性**:Runner 已在上方「Runner 自动启动结果/探测」中告知目标应用状态。\
+                若 ready window_id 已给出,直接进入 WindowInspect / WindowAction;若未 ready\
+                请调 WindowOpen(query=目标名) 显式启动;Runner 已自动启动过的目标**禁止重复 WindowOpen**。\n\
+             2. **中文 UI 同义词表**(filter 失败时优先试):通讯录/通信录/联系人/Contacts、按钮/Button、\
+                输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences。\
+                macOS 上 WeChat/部分 Electron 应用 NSWindow title 可能为空,WindowFind 返回 title=\"\" 时\
+                JSON 含 note 说明,通过 process_name 定位(WindowInspect 继续)。\n\
+             3. **原子发送范式**:首选 `type_text_submit` 一调用完成「点击输入框 + 键入完整内容 + Enter 提交」\
+                (驱动层逐字符 CGEvent 注入,长文本不会丢字);视觉路线传输入框中心 x/y,\
+                控件树路线先 focus 再传 path。仅当应用把 Enter 定义为换行时,才用 type_text + click「发送」。\
+                发送后用**当前权限可用**手段复查(WindowInspect/get_text 或 OCR)消息已出现在对话区。\n\
+             4. **效率规范**:3 轮无进展立即止损,不要重复相同失败操作;WindowOpen 返回 already_frontmost=true\
+                时不再激活;Bash 仅用于 cliclick 坐标点击 / open 启动 / 权限未授权场景的 \
+                osascript System Events 降级;禁止 Bash screencapture / osascript 枚举 UI(已由 WindowInspect 覆盖)。",
         );
 
         let mut sub_session = crate::session::Session::new();

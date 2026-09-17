@@ -208,6 +208,8 @@ pub fn build_subflow_from_goal(goal: &Goal, subgoal: &Goal) -> SubFlowInput {
         pending_agent_messages: vec![],
         // 2026-09-17 第 75 轮:Goal 派生 WorkFlow 默认 SubAgent 委派。
         intended_role: Some(crate::agent::context::AgentRole::SubAgent),
+        // 2026-09-17 第 82+ 轮 P0-1:Goal 路径默认无目标应用自动启动,LLM 可显式指定。
+        expected_target_app: None,
     }
 }
 

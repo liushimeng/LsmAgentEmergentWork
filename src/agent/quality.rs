@@ -434,6 +434,11 @@ fn gate_report_on_trace(
 /// 解析 Quality JSON 输出。
 /// 直接解析失败时自动走 JSON 修复链(`json_repair` Tier-1 语法修复);
 /// 修复不了仍返回 Err(上轮 P0 fail-closed 语义不变,截断 JSON 刻意不补全)。
+///
+/// 2026-09-17 第 82+ 轮 P0-3:新增「文本关键词降级兜底」 —— 当 JSON 解析完全失败
+/// 且文本含可识别关键词时,推断 verdict / retryable / source,避免 591s 任务因
+/// Provider 网关截断 verdict 字段而整轮 fail。fail-closed 语义不变:仍优先返回
+/// Err,关键词降级仅在 Err 之后作为**最后兜底**。
 pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityReport> {
     if let Some(json_str) = extract_json_block(text) {
         return crate::agent::json_repair::try_parse::<QualityReport>(json_str).map_err(|diag| {
@@ -450,9 +455,75 @@ pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityRepo
         }
         return Ok(r);
     }
+    // 2026-09-17 第 82+ 轮 P0-3:JSON 完全无法提取 → 文本关键词降级。
+    // 仅当 JSON 解析链 fail-closed 之后触发,且文本同时含「质检报告」上下文
+    // 关键词 + verdict 强信号时才走降级。其它场景仍 Err(避免误判)。
+    if let Some(report) = parse_quality_report_text_fallback(text, source) {
+        tracing::warn!(
+            source = %source.as_str(),
+            text_len = text.len(),
+            "Quality JSON 解析失败,走文本关键词降级(避免整轮 fail)"
+        );
+        return Ok(report);
+    }
     Err(crate::error::AgentError::Other(
         "未找到合法的 Quality JSON".into(),
     ))
+}
+
+/// 2026-09-17 第 82+ 轮 P0-3:文本关键词降级。
+///
+/// 适用场景:Provider 网关 / 日志截断把 emit JSON 的 `verdict` 字段切掉,
+/// 仅剩自然语言结论。LLM 通常会在 JSON 后追加一行「结论:通过 / 结论:失败」。
+/// 启发式匹配:
+/// - verdict 关键词:`通过/pass/✅` → Pass;`失败/fail/❌/错误/缺陷` → Fail
+///   (Pass 强信号优先,否则判 Fail);
+/// - retryable:含「重试/retry/建议再试/next_iter」 → true,否则 false;
+/// - source:从枚举关键词匹配(yolo / plan / main / subagent / quality_check /
+///   session_context / windowuse),否则用调用方传入的 source。
+///
+/// 返回 `Some(QualityReport)` 当且仅当 verdict 强信号命中(否则返回 None)。
+fn parse_quality_report_text_fallback(text: &str, source: AgentRole) -> Option<QualityReport> {
+    let lower = text.to_lowercase();
+    // verdict:Pass 强信号优先(包含「通过」或"pass"或 ✅)
+    let pass_signals = ["结论:通过", "verdict: pass", "通过", "✅", "qc pass"];
+    let fail_signals = ["结论:失败", "verdict: fail", "失败", "❌", "qc fail", "错误", "存在缺陷"];
+    let verdict = if pass_signals.iter().any(|s| lower.contains(&s.to_lowercase())) {
+        Verdict::Pass
+    } else if fail_signals.iter().any(|s| lower.contains(&s.to_lowercase())) {
+        Verdict::Fail
+    } else {
+        return None; // 没有强信号,不降级,仍 Err
+    };
+    // retryable
+    let retry_signals = ["可重试", "建议重试", "retryable: true", "retry", "再试"];
+    let retryable = retry_signals.iter().any(|s| lower.contains(&s.to_lowercase()));
+    // source:从文本识别 AgentRole 枚举;不命中则用调用方传入的 source
+    let source_inferred = if lower.contains("windowuse") {
+        AgentRole::WindowUse
+    } else if lower.contains("quality_check") {
+        AgentRole::QualityCheck
+    } else if lower.contains("subagent") {
+        AgentRole::SubAgent
+    } else if lower.contains("main") {
+        AgentRole::MainWork
+    } else if lower.contains("plan") {
+        AgentRole::Plan
+    } else if lower.contains("yolo") {
+        AgentRole::Yolo
+    } else {
+        source
+    };
+    // issues:截前 200 字符作为 evidence(供 Debug 报告观测)
+    let evidence = text.chars().take(200).collect::<String>();
+    Some(QualityReport {
+        verdict,
+        source: source_inferred,
+        issues: vec![format!("JSON 解析失败,文本降级;evidence={evidence}")],
+        suggestion: String::new(),
+        retryable,
+        evidence,
+    })
 }
 
 fn extract_json_block(text: &str) -> Option<&str> {
@@ -599,6 +670,46 @@ mod tests {
         assert!(r.retryable);
         assert!(r.issues.iter().any(|i| i.contains("解析失败")));
         assert!(r.suggestion.contains("JSON"));
+    }
+
+    // ========== 2026-09-17 第 82+ 轮 P0-3 测试 ==========
+    // 文本关键词降级:JSON 完全无法提取时,从正文关键词推断 verdict / retryable / source,
+    // 避免 Provider 网关截断 verdict 字段导致整轮 fail。
+
+    #[test]
+    fn parse_quality_report_text_fallback_pass() {
+        // 自然语言结论 + 「通过」关键词 → 降级 Pass
+        let text = "经过核查,本单元所有子任务均完成,验收材料齐全,结论:通过";
+        let r = parse_quality_report(text, AgentRole::WindowUse).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.source, AgentRole::WindowUse); // 文本含 windowuse
+        assert!(r.issues[0].contains("JSON 解析失败"));
+    }
+
+    #[test]
+    fn parse_quality_report_text_fallback_fail_with_retry() {
+        // 含「失败」+「重试」 → 降级 Fail + retryable=true
+        let text = "子任务超时,前置未达成,结论:失败,建议重试";
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.retryable);
+    }
+
+    #[test]
+    fn parse_quality_report_text_fallback_no_strong_signal_fails_closed() {
+        // 无强信号关键词 → 仍 fail-closed(避免误判)
+        let text = "今天天气很好,适合出门散步";
+        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
+        assert!(format!("{err}").contains("JSON"));
+    }
+
+    #[test]
+    fn parse_quality_report_text_fallback_source_inference() {
+        // 含「windowuse」→ 推断 source=WindowUse(即便传入其它角色)
+        let text = "QC pass:windowuse 单元所有动作完成";
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.source, AgentRole::WindowUse);
     }
 
     #[test]

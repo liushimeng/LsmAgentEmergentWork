@@ -478,6 +478,168 @@ pub(crate) fn platform_err(platform: &str, msg: impl Into<String>) -> AgentError
     }
 }
 
+// ===================== 2026-09-17 第 82+ 轮 P0-1:目标应用自动启动兜底 =====================
+//
+// 背景:WindowUse Runner 在 16:45 微信任务中,LLCM 第 1 轮 `forced_tool=WindowOpen` 被
+// 绕过(effective=false),Runner 也没兜底启动,导致整个 Session 在「微信未运行」状态下
+// 浪费 591s 但零产出。新方案:
+// - Runner 入口(sub_session 创建前)先调 `auto_launch_target` 做「目标可见性探测」;
+// - 不可见则用平台原生通道启动 + 等待 wait_seconds(默认 10s);
+// - 把启动结果(成功 window_id 或失败原因)注入 prompt,LLM 第一轮即可基于 ready
+//   window_id 进入 WindowInspect/WindowAction。
+//
+// 白名单:仅已知应用(WeChat / Chrome / Safari / Firefox / Edge / Slack / Telegram /
+// Discord / VSCode / iTerm2 / Terminal / QQ / Weixin / Notion / DingTalk / Feishu /
+// QQMail / Outlook / Postman / Datagrip)允许自动启动,避免误启动任意 app。
+
+/// 2026-09-17 第 82+ 轮:目标应用白名单(自动启动兜底)。
+///
+/// 设计要点:
+/// - 大小写不敏感;含子串匹配(`WeChat` ↔ `Weixin` ↔ `微信` 全部命中);
+/// - 覆盖主流桌面应用 + 微信系别名,避免误启动任意 app;
+/// - 第三方平台可通过 `LAEW_AUTO_LAUNCH_EXTRA` 追加(逗号分隔),延展性。
+pub fn is_target_app_allowed(query: &str) -> bool {
+    let normalized = query.to_lowercase();
+    let normalized = normalized.trim();
+    if normalized.is_empty() || normalized.len() > 64 {
+        return false;
+    }
+    // 黑名单字符(防止 shell 注入)
+    if normalized
+        .chars()
+        .any(|c| matches!(c, '\0' | '\n' | '\r' | ';' | '|' | '&' | '`' | '$' | '>' | '<'))
+    {
+        return false;
+    }
+    const ALLOWED: &[&str] = &[
+        // 微信系(中英文+别名)
+        "wechat", "weixin", "微信",
+        // 浏览器
+        "chrome", "google chrome", "safari", "firefox", "edge", "chromium", "brave", "arc",
+        // IDE / 编辑器
+        "vscode", "visual studio code", "code", "sublime", "atom", "xcode", "intellij",
+        // 终端
+        "iterm", "iterm2", "terminal", "warp", "alacritty",
+        // 即时通讯
+        "slack", "telegram", "discord", "qq", "tim", "钉钉", "dingtalk", "飞书", "feishu", "lark",
+        // 邮件
+        "mail", "outlook", "thunderbird", "foxmail",
+        // 笔记 / 效率
+        "notion", "obsidian", "bear", "typora", "evernote", "onenote",
+        // 设计 / 开发
+        "figma", "sketch", "postman", "datagrip", "insomnia", "tableplus",
+        // 系统
+        "finder", "explorer", "preview", "previewer", "activity monitor", "活动监视器",
+        // 其他常见
+        "spotify", "music", "网易云", "netease", "iina", "vlc", "iina",
+    ];
+    // 用户扩展白名单
+    if let Ok(extra) = std::env::var("LAEW_AUTO_LAUNCH_EXTRA") {
+        for token in extra.split(',') {
+            let t = token.trim().to_lowercase();
+            if !t.is_empty() && normalized.contains(&t) {
+                return true;
+            }
+        }
+    }
+    ALLOWED.iter().any(|k| normalized.contains(k))
+}
+
+/// 2026-09-17 第 82+ 轮 P0-1:WindowUse Runner 自动启动目标应用。
+///
+/// 复用 `tools/window/open.rs::launch_desktop_app` 的平台启动解析链(Windows =
+/// ShellExecuteW / 快捷方式 / 安装路径;macOS = `open -a` / `open -b`)。
+///
+/// 返回 ready window_id;若启动失败或不在白名单,返回带原因的错误。
+/// 函数为同步阻塞(spawn_blocking 由调用方负责)。
+pub fn auto_launch_target(
+    app_query: &str,
+    bundle_id: Option<&str>,
+    wait_secs: u64,
+) -> std::result::Result<WindowInfo, String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    if !is_target_app_allowed(app_query) {
+        return Err(format!(
+            "目标应用 {:?} 不在自动启动白名单;允许: WeChat/Chrome/Slack/Telegram/QQ/钉钉/飞书/VSCode/iTerm2/Terminal/Notion 等。LLM 可显式传目标,或通过 LAEW_AUTO_LAUNCH_EXTRA=xxx 追加。",
+            app_query
+        ));
+    }
+
+    // 平台启动命令构造
+    #[cfg(windows)]
+    let launch_cmd: Vec<String> = vec!["cmd".to_string(), "/C".to_string(), "start".to_string(), "".to_string(), app_query.to_string()];
+    #[cfg(target_os = "macos")]
+    let launch_cmd: Vec<String> = if let Some(b) = bundle_id.filter(|s| !s.is_empty()) {
+        vec!["open".to_string(), "-b".to_string(), b.to_string()]
+    } else {
+        vec!["open".to_string(), "-a".to_string(), app_query.to_string()]
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let launch_cmd: Vec<String> = vec!["gtk-launch".to_string(), app_query.to_string()];
+
+    // 优先尝试 shell 命令
+    let shell_attempt = || -> std::result::Result<(), String> {
+        if launch_cmd.is_empty() {
+            return Err("当前平台不支持自动启动".into());
+        }
+        let status = Command::new(&launch_cmd[0])
+            .args(&launch_cmd[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("执行启动命令失败: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("启动命令退出码 {status}"))
+        }
+    };
+
+    let shell_ok = shell_attempt();
+    if let Err(e) = &shell_ok {
+        tracing::warn!(app = %app_query, error = %e, "auto_launch_target shell 启动失败,等待 WindowList 探测");
+    }
+
+    // 等待 + 探测
+    let driver = current_driver();
+    let aliases: Vec<String> = if app_query.to_lowercase().contains("wechat")
+        || app_query.to_lowercase().contains("weixin")
+        || app_query.contains("微信")
+    {
+        vec!["WeChat".into(), "微信".into(), "Weixin".into()]
+    } else {
+        vec![app_query.to_string()]
+    };
+    let deadline = Instant::now() + Duration::from_secs(wait_secs.min(30));
+    let mut last_err = String::new();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        match driver.list_windows(None) {
+            Ok(wins) => {
+                for w in &wins {
+                    let title_l = w.title.to_lowercase();
+                    let proc_l = w.process_name.to_lowercase();
+                    if aliases.iter().any(|a| {
+                        let a = a.to_lowercase();
+                        title_l.contains(&a) || proc_l.contains(&a)
+                    }) {
+                        return Ok(w.clone());
+                    }
+                }
+            }
+            Err(e) => last_err = format!("WindowList 失败: {e}"),
+        }
+    }
+
+    Err(format!(
+        "自动启动 {app_query:?} 后 {wait_secs}s 内未匹配到窗口({aliases:?});shell={:?}, last_err={last_err}",
+        shell_ok.as_ref().err()
+    ))
+}
+
 // ===================== 平台权限快速检测(2026-09-17 第 77 轮 P0-1/P0-2) =====================
 //
 // 背景:WindowUseRunner 之前依赖 `driver_preflight` 在每个工具入口触发授权等待,
@@ -1175,5 +1337,39 @@ mod tests {
     fn current_driver_constructs_on_any_platform() {
         let d = current_driver();
         assert!(!d.platform_name().is_empty());
+    }
+
+    // ===== 2026-09-17 第 82+ 轮 P0-1 测试:目标应用白名单 =====
+    #[test]
+    fn is_target_app_allowed_accepts_common() {
+        // 常见桌面应用 / 微信系全部放行
+        assert!(is_target_app_allowed("WeChat"));
+        assert!(is_target_app_allowed("wechat"));
+        assert!(is_target_app_allowed("Weixin"));
+        assert!(is_target_app_allowed("微信"));
+        assert!(is_target_app_allowed("Chrome"));
+        assert!(is_target_app_allowed("google chrome"));
+        assert!(is_target_app_allowed("Slack"));
+        assert!(is_target_app_allowed("Telegram"));
+        assert!(is_target_app_allowed("QQ"));
+        assert!(is_target_app_allowed("钉钉"));
+        assert!(is_target_app_allowed("VSCode"));
+        assert!(is_target_app_allowed("iTerm2"));
+        assert!(is_target_app_allowed("Notion"));
+        assert!(is_target_app_allowed("Figma"));
+    }
+
+    #[test]
+    fn is_target_app_allowed_rejects_unknown_or_dangerous() {
+        // 未知应用 / shell 注入字符 → 拒绝
+        assert!(!is_target_app_allowed(""));
+        assert!(!is_target_app_allowed("rm -rf /"));
+        assert!(!is_target_app_allowed("random_unknown_app_xyz"));
+        // 长度超限
+        assert!(!is_target_app_allowed(&"a".repeat(100)));
+        // shell 注入字符
+        assert!(!is_target_app_allowed("Chrome; rm -rf /"));
+        assert!(!is_target_app_allowed("WeChat && echo evil"));
+        assert!(!is_target_app_allowed("`whoami`"));
     }
 }

@@ -156,20 +156,30 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
             // ★ 2026-09-17 第 78 轮 P1-1:大命令精简
             // command 字段通常 < 80 字符,但 Python 脚本 + Playwright 完整代码可超过 5000 字符
             // 完整展示会撑爆 TUI stage 流,只显示前 80 字符 + 总长度 + 首行(若超出)
+            // ★ 2026-09-17 第 82+ 轮 P1-1:WindowUse Bash 模式追加 `[wumode]` 标记,
+            // TUI 阶段打印协程一眼可辨「WindowUse 降级路径」而非 SubAgent Bash。
             let cmd = obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let cmd_chars = cmd.chars().count();
             let cmd_first_line = cmd.lines().next().unwrap_or("").to_string();
+            let wumode_prefix = if crate::agent::tools::bash::window_use_mode() {
+                "[wumode] "
+            } else {
+                ""
+            };
             if cmd_chars > 200 {
                 let preview = truncate_progress_text(cmd, 80);
                 let first_line_short = truncate_progress_text(&cmd_first_line, 40);
                 truncate_progress_text(
                     &format!(
-                        "cmd=[共{cmd_chars}字符] {preview} 首行:{first_line_short}"
+                        "{wumode_prefix}cmd=[共{cmd_chars}字符] {preview} 首行:{first_line_short}"
                     ),
                     160,
                 )
             } else {
-                truncate_progress_text(&format!("cmd={}", truncate_progress_text(cmd, 80)), 120)
+                truncate_progress_text(
+                    &format!("{wumode_prefix}cmd={}", truncate_progress_text(cmd, 80)),
+                    120,
+                )
             }
         }
         "Read" => {

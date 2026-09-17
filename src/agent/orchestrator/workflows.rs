@@ -162,6 +162,8 @@ impl MultiAgentOrchestrator {
                                     depends_on: vec![],
                                     acceptance: vec![],
                                     delegate_to: AgentRole::SubAgent,
+                                    // 2026-09-17 第 82+ 轮 P0-1:并行任务无目标应用自动启动。
+                                    target_app: None,
                                 },
                                 Err(QualityFailure {
                                     source: AgentRole::SubAgent,
@@ -603,5 +605,9 @@ pub(super) fn build_subflow_input(
         // Runner 在 trace.intended_role 落地,供 collect_failure_signals 计算
         // delegate_mismatch 弱信号。
         intended_role: Some(wf.delegate_to),
+        // 2026-09-17 第 82+ 轮 P0-1:把 WorkFlow 的 target_app 透传给 SubFlowInput,
+        // WindowUse Runner 据此在 sub_session 创建前自动启动目标应用(LLM
+        // 不自觉调 WindowOpen 也能拿到 ready window_id)。
+        expected_target_app: wf.target_app.clone(),
     }
 }

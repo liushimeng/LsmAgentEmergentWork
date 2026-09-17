@@ -53,6 +53,14 @@ pub struct SubFlowInput {
     /// `None` 表示 Orchestrator 未注入(老调用点兼容)。
     #[serde(default)]
     pub intended_role: Option<AgentRole>,
+    /// ★2026-09-17 第 82+ 轮 P0-1:目标桌面应用标识(WindowUse Runner 自动启动兜底用)。
+    /// `None` 时 Runner 跳过自动启动;若提供(WeChat/Chrome/Slack/Telegram 等),
+    /// Runner 在 sub_session 创建前先做一次「目标可见性探测」,不可见则主动
+    /// launch_desktop_app + wait_seconds,把启动结果作为 prompt 注入,
+    /// 让 LLM 第一轮即可拿到 ready window_id,不再因「目标应用不在」反复失败。
+    /// 白名单:仅已知应用被允许,避免误启动任意应用。
+    #[serde(default)]
+    pub expected_target_app: Option<String>,
 }
 
 impl SubFlowInput {
@@ -625,6 +633,7 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            expected_target_app: None,
         };
 
         let outcome = runner
@@ -671,6 +680,7 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            expected_target_app: None,
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("wf-1.step-1"));
@@ -699,6 +709,7 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            expected_target_app: None,
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("上游产物"));
@@ -722,6 +733,7 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            expected_target_app: None,
         };
         let prompt = input.to_user_prompt();
         assert!(!prompt.contains("用户原始输入"));
@@ -741,6 +753,7 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            expected_target_app: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         // original_prompt 默认值是 null,确保 SubAgent 输入 JSON 兼容老实现

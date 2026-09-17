@@ -55,6 +55,11 @@ pub fn window_use_mode() -> bool {
 /// WindowUse Bash 白名单(命令首个 token)。
 /// 含子串匹配:命令首个 token 命中表中任一前缀即视为白名单命令。
 /// 设计参考:macOS 桌面操控真实工作流,加上截图 / 剪贴板 / 启动 / 坐标点击四类。
+///
+/// 2026-09-17 第 82+ 轮 P0-2:扩展持久化与文本处理能力(`cat > file` / `tee` / `python3`
+/// / `awk` / `sed` 等),解决 WindowUse Runner「需要写文件但 Bash 白名单拦截」的死锁。
+/// 写入类命令必须经 [`is_write_to_working_dir`] 工作目录白名单校验(默认 cwd),
+/// 黑名单(`dangerous.rs` / `sensitive.rs`)永远优先。
 const WINDOW_USE_BASH_ALLOWLIST: &[&str] = &[
     // AppleScript 桌面操控主路径
     "osascript",
@@ -98,6 +103,33 @@ const WINDOW_USE_BASH_ALLOWLIST: &[&str] = &[
     // 串行连接 CLI 工具(便于测试)
     "true",
     "false",
+    // ===== 2026-09-17 第 82+ 轮 P0-2:持久化与文本处理 =====
+    // 写入文件:仅当目标路径在 cwd 内(见 `is_write_to_working_dir`)
+    "cat",      // cat > file / cat >> file 写入小文件(precheck_result.json 等)
+    "tee",      // tee -a file 追加
+    // 文本处理
+    "sed",      // sed -i / sed 's/a/b/' 替换
+    "awk",      // awk 字段提取
+    "grep",     // grep 内容搜索
+    "tr",       // 字符转换
+    "cut",      // 列提取
+    "head",     // 前 N 行
+    "tail",     // 尾部 N 行
+    "sort",     // 排序
+    "uniq",     // 去重
+    "wc",       // 行/字符计数
+    "xargs",    // 接收 stdin 转命令行(配合 find / grep)
+    // 文件 / 目录管理:仅 cwd
+    "mkdir",    // 创建目录(plans/xxx/)
+    "touch",    // 占位文件
+    "rm",       // 删除(已含 dangerous.rs 黑名单兜底)
+    "cp",       // 复制
+    "mv",       // 移动
+    "ln",       // 链接(默认禁 -s,可改 LAEW_BASH_ALLOW_SYMLINK=1)
+    "find",     // 递归搜索
+    "chmod",    // 权限修改(仅 cwd)
+    "stat",     // 元信息
+    "file",     // 文件类型
 ];
 
 /// 命令首个 token(去掉前导空白 / env 前缀)。
@@ -110,6 +142,73 @@ fn first_command_token(command: &str) -> String {
         .or_else(|| trimmed.strip_prefix("env "))
         .unwrap_or(trimmed);
     after.split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// 2026-09-17 第 82+ 轮 P0-2:写入类命令的工作目录白名单校验。
+///
+/// 适用范围:WindowUse Bash 模式下,`cat > file` / `tee file` / `sed -i file` / `rm file` /
+/// `mv file` / `cp file` 等带文件路径的命令。返回 `Ok(())` 当且仅当:
+/// - 文件路径出现在命令中(否则视为非写入命令,直接放行);
+/// - 解析后的绝对路径在工作目录(`std::env::current_dir()`)之内;
+/// - 不指向敏感路径(`/etc/` / `~/.ssh/` 等,见 `permissions::sensitive` 黑名单)。
+///
+/// 兜底:目标路径无法解析(命令格式异常 / 重定向到 fd 等)→ 拒绝并提示。
+///
+/// 设计意图:WindowUse Runner 之前因无法写 `precheck_result.json` 等持久化文件,
+/// 不得不绕路 `osascript -e 'do shell script "cat > ..."'`,既丑又跨平台不一致;
+/// 放宽后 WindowUse Runner 自带持久化能力,但仍受 cwd 白名单 + 敏感路径黑名单约束,
+/// 不会让 LLM 任意改写系统文件。
+fn check_window_use_write_cwd(command: &str) -> Result<()> {
+    // 找命令中的文件路径(启发式:跳过首 token / 选项 / 重定向符号 / 常见参数)。
+    // 简化策略:从命令里提取所有不以 `-` 开头且不是首 token 的 token,看作候选路径;
+    // 然后用 std::path::Path 试着 cwd 解析,能解析为绝对路径且在 cwd 内 → 放行。
+    let cwd = std::env::current_dir().map_err(|e| AgentError::PermissionDenied {
+        tool: "Bash".into(),
+        reason: format!("[windowuse-mode] 无法获取 cwd: {e}"),
+    })?;
+    let cwd_canonical = cwd.canonicalize().unwrap_or(cwd.clone());
+
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.len() <= 1 {
+        return Ok(()); // 单 token 命令,无文件路径
+    }
+    for tok in &tokens[1..] {
+        // 跳过选项 / 重定向符 / shell 关键字
+        if tok.starts_with('-')
+            || matches!(
+                *tok,
+                ">" | ">>" | "<" | "<<" | "&&" | "||" | "|" | ";" | "&"
+            )
+            || tok.contains('=') && !tok.starts_with('/') && !tok.starts_with('.')
+            || tok.starts_with('$')
+        {
+            continue;
+        }
+        // 试解析为绝对路径(相对路径以 cwd 解析)
+        let path = std::path::Path::new(tok);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        // 检查绝对路径是否在 cwd 内(防止 ../../../etc/passwd 类穿透)
+        let abs_canon = abs.canonicalize().unwrap_or_else(|_| {
+            // 文件不存在 → 用其父目录解析(用于即将创建的文件)
+            abs.parent()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+                .unwrap_or(cwd.clone())
+        });
+        if !abs_canon.starts_with(&cwd_canonical) && !abs_canon.starts_with(&cwd) {
+            return Err(AgentError::PermissionDenied {
+                tool: "Bash".into(),
+                reason: format!(
+                    "[windowuse-mode] 文件路径 {tok:?} 解析为 {:?} 超出工作目录 {:?};WindowUse 写入类命令(cat > file / tee / rm / mv / cp)仅允许 cwd 内路径。需要跨目录写入请改用 SubAgent Bash(非白名单模式)。",
+                    abs_canon, cwd_canonical
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// WindowUse Bash 白名单校验:黑名单永远优先,白名单只在 WindowUse 模式下生效。
@@ -148,6 +247,15 @@ pub fn check_window_use_bash(command: &str) -> Result<()> {
     .iter()
     .any(|k| lower.contains(k));
     if allowed_direct || allowed_substring {
+        // 2026-09-17 第 82+ 轮 P0-2:写入类命令额外做 cwd 白名单校验
+        // 涉及 cat / tee / rm / cp / mv / sed -i / ln 等带文件路径的命令
+        if matches!(
+            token.to_lowercase().as_str(),
+            "cat" | "tee" | "rm" | "cp" | "mv" | "ln" | "mkdir" | "touch" | "chmod"
+        ) || (token.to_lowercase() == "sed" && command.contains("-i"))
+        {
+            check_window_use_write_cwd(command)?;
+        }
         return Ok(());
     }
     Err(AgentError::PermissionDenied {
