@@ -283,7 +283,7 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
 - find(query*, match_mode?): 按标题/进程名子串找单一最佳窗口,直接返回 window_id(exact/contains/fuzzy,默认 contains)。
 - inspect(window_id*, max_depth?, filter?): 枚举窗口控件树(Windows UIA / macOS AX),每个控件含 path(如 /0/2/1)/role/name/value/bounds/actions。需要 macOS 辅助功能授权。
 - control(window_id*, path*, control_action*, text?, x?, y?): 对窗口执行操作,双路线——
-  控件树路线(原生 UI):path 取 inspect 返回的控件路径,control_action=click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible;
+  控件树路线(原生 UI):path 取 inspect 返回的控件路径,control_action=click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible(send_keys 第 87 轮起支持 cmd/ctrl/alt/shift 组合键与字母/数字键,如 cmd+f 微信搜索联系人);
   视觉坐标路线(自绘 UI,如微信 4.x 控件树为空):control_action=click_point/double_click_point/right_click_point/scroll_point/type_text/type_text_submit,x/y 传屏幕绝对坐标(取 ocr 返回的 screen_cx/screen_cy),path 照传 "/"。
 - ocr(window_id*, region?, lang?): 窗口 OCR 文字识别,返回词块文本 + 窗口相对坐标 + 屏幕绝对坐标(视觉路线入口)。**macOS 26.5 实测需要屏幕录制授权**(CGWindowListCreateImage + Vision 都走 TCC 屏录门控,屏录未授权时返回空);screen_recording=false 时直接改走 chat_send(osascript_fallback)。
 - screenshot(window_id?, output_path?, region?): 截图落盘 PNG,返回路径。只做截图不做识别;需要识别文字一律用 ocr。macOS 上需要屏幕录制授权(屏录未授权时 screencapture 也失败)。

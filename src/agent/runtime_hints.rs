@@ -120,6 +120,13 @@ pub(super) fn forced_tools_enabled_from(raw: String) -> bool {
 
 /// 将 `serde_json::Value` 序列化为「对象 key 排序后的字符串」,作为失败键的稳定摘要。
 /// 顺序无关,LLM 调换参数顺序不触发「不同目标」误判。
+///
+/// 2026-09-18 第 87 轮修正:key 必须带 JSON 引号 —— 此前 `{action:"x"}` 无引号
+/// 形态不是合法 JSON,导致下游消费者静默失效:
+/// - `orchestrator/usage.rs::tool_args_digest`(serde 解析)→ 解析失败返回空,
+///   stage「工具调用(最近 N 条)」参数摘要整列丢失;
+/// - `tui/format.rs::tool_args_brief` → `extract_json_field` 找不到 `"action":`,
+///   [tool] 行退化为 `action=?`。
 pub(super) fn stable_json_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Object(map) => {
@@ -127,7 +134,12 @@ pub(super) fn stable_json_string(v: &serde_json::Value) -> String {
             entries.sort_by(|a, b| a.0.cmp(b.0));
             let parts: Vec<String> = entries
                 .into_iter()
-                .map(|(k, v)| format!("{}:{}", k, stable_json_string(v)))
+                .map(|(k, v)| {
+                    // key 必须是带引号的合法 JSON 字符串(见上方第 87 轮修正说明)
+                    let key_json =
+                        serde_json::to_string(k).unwrap_or_else(|_| format!("\"{k}\""));
+                    format!("{key_json}:{}", stable_json_string(v))
+                })
                 .collect();
             format!("{{{}}}", parts.join(","))
         }

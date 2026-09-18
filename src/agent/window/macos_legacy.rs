@@ -118,6 +118,8 @@ extern "C" {
     // 2026-09-17 第 70 轮:坐标动作(视觉路线)所需 —— 点击计数(双击)与 Unicode 键入。
     fn CGEventSetIntegerValueField(event: CFTypeRef, field: u32, value: i64);
     fn CGEventKeyboardSetUnicodeString(event: CFTypeRef, length: isize, string: *const u16);
+    // 2026-09-18 第 87 轮:修饰键组合(cmd+f 等)所需 —— 设置事件修饰键位。
+    fn CGEventSetFlags(event: CFTypeRef, flags: u64);
 }
 
 const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
@@ -382,8 +384,46 @@ fn keycode_for_name(name: &str) -> Option<u16> {
         "pagedown" => 121,
         "home" => 115,
         "end" => 119,
+        // 2026-09-18 第 87 轮:字母 / 数字 ANSI 键码(kVK_ANSI_*),
+        // 支撑 cmd+f(微信搜索)等修饰键组合。
+        "a" => 0x00, "s" => 0x01, "d" => 0x02, "f" => 0x03, "h" => 0x04,
+        "g" => 0x05, "z" => 0x06, "x" => 0x07, "c" => 0x08, "v" => 0x09,
+        "b" => 0x0B, "q" => 0x0C, "w" => 0x0D, "e" => 0x0E, "r" => 0x0F,
+        "y" => 0x10, "t" => 0x11, "1" => 0x12, "2" => 0x13, "3" => 0x14,
+        "4" => 0x15, "6" => 0x16, "5" => 0x17, "9" => 0x19, "7" => 0x1A,
+        "8" => 0x1C, "0" => 0x1D, "o" => 0x1F, "u" => 0x20, "i" => 0x22,
+        "p" => 0x23, "l" => 0x25, "j" => 0x26, "k" => 0x28, "n" => 0x2D,
+        "m" => 0x2E,
         _ => return None,
     })
+}
+
+/// 修饰键名 → CGEventFlags 位(2026-09-18 第 87 轮)。
+///
+/// 值来源 `<CoreGraphics/CGEventTypes.h>`:kCGEventFlagMaskShift/Control/Alternate/Command。
+fn modifier_flag_for_name(name: &str) -> Option<u64> {
+    Some(match name.trim().to_lowercase().as_str() {
+        "shift" | "⇧" => 0x0002_0000,
+        "ctrl" | "control" | "⌃" => 0x0004_0000,
+        "alt" | "option" | "opt" | "⌥" => 0x0008_0000,
+        "cmd" | "command" | "meta" | "⌘" => 0x0010_0000,
+        _ => return None,
+    })
+}
+
+/// 解析按键表达式:`cmd+f` / `ctrl+shift+t` / `enter` 等。
+///
+/// `+` 分隔,末段为键名,前缀为修饰键(可多个);无修饰键时 flags=0。
+/// 返回 `(keycode, flags)`;任何一段无法识别返回 None。
+fn parse_key_combo(expr: &str) -> Option<(u16, u64)> {
+    let parts: Vec<&str> = expr.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let (key_part, mod_parts) = parts.split_last()?;
+    let keycode = keycode_for_name(key_part)?;
+    let mut flags = 0u64;
+    for m in mod_parts {
+        flags |= modifier_flag_for_name(m)?;
+    }
+    Some((keycode, flags))
 }
 
 /// 把光标移到屏幕坐标(x, y)(CGEvent mouse-moved,无点击)。
@@ -420,10 +460,19 @@ unsafe fn cg_scroll_lines(lines: i32) {
 
 /// 注入一次按键(keydown + keyup,间隔 20ms)。
 unsafe fn cg_send_key(keycode: u16) {
+    cg_send_key_with_flags(keycode, 0);
+}
+
+/// 注入一次带修饰键的按键(2026-09-18 第 87 轮):
+/// keydown/keyup 事件均 `CGEventSetFlags(flags)`,支撑 cmd+f 等组合键。
+unsafe fn cg_send_key_with_flags(keycode: u16, flags: u64) {
     for keydown in [true, false] {
         let ev = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, keydown);
         if ev.is_null() {
             return;
+        }
+        if flags != 0 {
+            CGEventSetFlags(ev, flags);
         }
         CGEventPost(K_CG_HID_EVENT_TAP, ev);
         CFRelease(ev);
@@ -1335,18 +1384,28 @@ impl WindowDriver for MacOsDriver {
                 }
                 // 2026-09-16 第 66 轮:CGEvent 按键注入(此前直接报「暂不支持」,
                 // 微信 Enter 发送 / PageDown 翻页链路无原语)。
+                // 2026-09-18 第 87 轮:修饰键组合(cmd+f 微信搜索联系人 / cmd+enter 等),
+                // 字母/数字 ANSI 键码全量支持。
                 ControlAction::SendKeys(keys) => {
                     let key = keys.trim();
-                    match keycode_for_name(key) {
-                        Some(kc) => {
-                            cg_send_key(kc);
-                            Ok(format!("已向 {window_id}{path} 注入按键 {key}(keycode={kc})"))
+                    match parse_key_combo(key) {
+                        Some((kc, flags)) => {
+                            if flags != 0 {
+                                unsafe { cg_send_key_with_flags(kc, flags) };
+                                Ok(format!(
+                                    "已向 {window_id}{path} 注入组合键 {key}(keycode={kc},flags=0x{flags:x})"
+                                ))
+                            } else {
+                                cg_send_key(kc);
+                                Ok(format!("已向 {window_id}{path} 注入按键 {key}(keycode={kc})"))
+                            }
                         }
                         None => Err(platform_err(
                             "macos",
                             format!(
-                                "未知按键: {key};支持 enter/tab/esc/space/delete/up/down/left/right/pageup/pagedown/home/end;\
-                                 输入文本请用 set_text,或 Bash 白名单 osascript keystroke"
+                                "未知按键: {key};支持 enter/tab/esc/space/delete/up/down/left/right/pageup/pagedown/home/end、\
+                                 字母 a-z、数字 0-9,以及修饰键组合(cmd/ctrl/alt/shift+键,如 cmd+f / cmd+enter / ctrl+shift+t);\
+                                 输入文本请用 set_text / type_text"
                             ),
                         )),
                     }
@@ -1733,5 +1792,46 @@ mod shallow_tree_tests {
             ],
         );
         assert!(!MacOsDriver::tree_is_shallow(&tree));
+    }
+}
+
+#[cfg(test)]
+mod key_combo_tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_key_without_modifier() {
+        assert_eq!(parse_key_combo("enter"), Some((36, 0)));
+        assert_eq!(parse_key_combo("f"), Some((0x03, 0)));
+        assert_eq!(parse_key_combo("tab"), Some((48, 0)));
+    }
+
+    #[test]
+    fn parse_cmd_letter_combo() {
+        // 微信搜索联系人关键组合:cmd+f
+        let (kc, flags) = parse_key_combo("cmd+f").expect("cmd+f 应可解析");
+        assert_eq!(kc, 0x03);
+        assert_eq!(flags, 0x0010_0000);
+    }
+
+    #[test]
+    fn parse_multi_modifier_combo() {
+        let (kc, flags) = parse_key_combo("ctrl+shift+t").expect("ctrl+shift+t 应可解析");
+        assert_eq!(kc, 0x11);
+        assert_eq!(flags, 0x0004_0000 | 0x0002_0000);
+    }
+
+    #[test]
+    fn parse_modifier_aliases() {
+        assert_eq!(parse_key_combo("command+enter").map(|(_, f)| f), Some(0x0010_0000));
+        assert_eq!(parse_key_combo("option+space").map(|(_, f)| f), Some(0x0008_0000));
+        assert_eq!(parse_key_combo("cmd+0").map(|(k, _)| k), Some(0x1D));
+    }
+
+    #[test]
+    fn parse_unknown_key_rejected() {
+        assert_eq!(parse_key_combo("cmd+notakey"), None);
+        assert_eq!(parse_key_combo("banana+f"), None);
+        assert_eq!(parse_key_combo(""), None);
     }
 }

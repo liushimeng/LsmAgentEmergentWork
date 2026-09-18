@@ -20,6 +20,35 @@ use crate::error::Result;
 /// OCR 词数返回上限。
 const MAX_OCR_BLOCKS: usize = 200;
 
+/// 2026-09-18 第 87 轮:OCR/截图失败后的能力缓存自愈。
+///
+/// 实测场景(macOS 26.5):能力探测假阳性导致 LLM 走视觉路线,OCR 连续失败
+/// 16 轮烧光迭代。此处失败即 `invalidate_permission_cache()` 重探测,把修正后
+/// 的能力矩阵与「禁止重试」引导拼进错误文本 —— LLM 下一次决策立即转向
+/// inspect / chat_send(osascript_fallback),不再撞墙。
+fn augment_visual_failure(base_err: crate::error::AgentError) -> crate::error::AgentError {
+    crate::agent::window::invalidate_permission_cache();
+    let cap = crate::agent::window::probe_capability();
+    let guidance = if !cap.ocr_screenshot_cgwindow {
+        format!(
+            "【能力重探测】screen_recording=false → ocr/screenshot 确认不可用(capability={});\
+             禁止再次调用 ocr/screenshot;改走 action=inspect 控件树路线,\
+             或 action=chat_send / chat_loop(osascript_fallback 路线,不依赖截图)",
+            cap.tag()
+        )
+    } else {
+        format!(
+            "【能力重探测】screen_recording=true(capability={});失败原因更可能是窗口 id 失效,\
+             请 action=list 重新枚举 window_id 后重试一次;仍失败则改走 inspect / chat_send",
+            cap.tag()
+        )
+    };
+    tool_err(
+        MCP_WINDOW_USE_TOOL_NAME,
+        format!("{base_err}\n{guidance}"),
+    )
+}
+
 /// 对窗口区域做 OCR,返回带坐标的词块(视觉路线的「读界面」入口)。
 pub(super) async fn run_ocr(args: Value) -> Result<String> {
     let window_id = require_str(&args, "window_id", MCP_WINDOW_USE_TOOL_NAME)?.to_string();
@@ -51,7 +80,11 @@ pub(super) async fn run_ocr(args: Value) -> Result<String> {
                     ),
                 )
             })?;
-        let blocks = driver.ocr_with_info(&info, region, lang.as_deref())?;
+        let blocks = match driver.ocr_with_info(&info, region, lang.as_deref()) {
+            Ok(b) => b,
+            // 第 87 轮:OCR 失败 → 能力缓存自愈 + 替代路线引导(防 16 轮撞墙)
+            Err(e) => return Err(augment_visual_failure(e)),
+        };
         // 屏幕绝对坐标基于窗口 bounds 计算
         let origin = (info.bounds.x, info.bounds.y, info.bounds.width, info.bounds.height);
         let blocks_json: Vec<Value> = blocks
@@ -263,12 +296,16 @@ pub(super) async fn run_screenshot(args: Value) -> Result<String> {
             "timeout_ms": 30000
         });
         let output = bash.execute(bash_args).await?;
-        let meta = std::fs::metadata(&output_path).map_err(|e| {
-            tool_err(
-                MCP_WINDOW_USE_TOOL_NAME,
-                format!("截图未生成: {};命令输出={}", e, output),
-            )
-        })?;
+        let meta = match std::fs::metadata(&output_path) {
+            Ok(m) => m,
+            Err(e) => {
+                // 第 87 轮:screencapture 也失败(基本可断定屏录未授权)→ 能力缓存自愈
+                return Err(augment_visual_failure(tool_err(
+                    MCP_WINDOW_USE_TOOL_NAME,
+                    format!("截图未生成: {e};命令输出={output}"),
+                )));
+            }
+        };
         let body = json!({
             "path": output_path,
             "size_bytes": meta.len(),

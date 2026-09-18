@@ -909,6 +909,18 @@ control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与
     → `osascript -e 'tell application "System Events" to key code 36'` (Return)。
     整链路不调用 driver,完全不走截图/OCR;window_id 内嵌 app 名映射表自动识别
     (微信=WeChat / 钉钉=DingTalk / 飞书=Lark / QQ)。
+12. **反伪造红线(2026-09-18 第 87 轮)**:禁止用 Bash echo / Write 手写本应由工具
+    产出的工作日志、验收文件、capability 矩阵或 chat_log —— Quality-Check 会对账
+    执行轨迹中的真实工具调用次数,文本与轨迹不一致必判 fail;
+    chat_log 的 [SEND]/[RECV]/[SUMMARY] 行只能由 chat_send/chat_loop 内部落盘。
+13. **长时多轮会话必须 chat_loop**:15 分钟级多轮聊天(如每分钟 2 条)必须
+    `action=chat_loop(window_id, messages, interval_seconds, chat_log_path)` 一次调用完成
+    —— 你的迭代上限只有 16 次,逐条 chat_send 必然超限失败;messages 数组一次给全
+    (围绕任务主题预写 20~30 条),reply_detect 在屏录未授权时自动跳过。
+14. **send_keys 修饰键组合(第 87 轮)**:`control(control_action=send_keys, text=...)`
+    支持 `cmd/ctrl/alt/shift+键` 组合与字母/数字键 —— 微信搜索联系人首选
+    `send_keys(text="cmd+f")` → `type_text(text="联系人名")` → `send_keys(text="enter")`;
+    也支持 cmd+enter / ctrl+shift+t 等。
 "#;
 
 // =================== Chromium-WebUse Agent 提示词(第 11 角色,浏览器操控层) ===================

@@ -199,6 +199,16 @@
         assert_ne!(stable_json_string(&a), stable_json_string(&b));
     }
 
+    #[test]
+    fn stable_json_string_emits_valid_json_keys_quoted() {
+        // 第 87 轮:key 必须带引号(下游 tool_args_digest / tool_args_brief 按
+        // 合法 JSON 消费);此前 `{action:"x"}` 无引号形态导致参数摘要静默丢失。
+        let s = stable_json_string(&json!({"action": "capability_probe", "x": 1}));
+        assert_eq!(s, r#"{"action":"capability_probe","x":1}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("必须是合法 JSON");
+        assert_eq!(parsed["action"], "capability_probe");
+    }
+
     // ========== ExecutionTrace 累计(2026-09-09 第 05 轮) ==========
 
     /// 模拟 1 个工具调用成功(第 1 次返回工具,第 2 次返回最终文本)。

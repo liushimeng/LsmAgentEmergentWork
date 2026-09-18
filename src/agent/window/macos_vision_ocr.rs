@@ -93,7 +93,8 @@ pub fn ocr_window(
 
 /// 对指定窗口截图并保存到文件(2026-09-17 第 74 轮 T2)。
 ///
-/// 使用 CGWindowListCreateImage,只需辅助功能权限,无需屏幕录制权限。
+/// 使用 CGWindowListCreateImage;**第 86/87 轮实测需要屏幕录制授权**
+/// (未授权时按窗口截取返回 null,此前「无需屏幕录制」注释为误写)。
 pub fn screenshot_window(
     window_id: u32,
     region: Option<(i64, i64, i64, i64)>,
@@ -138,11 +139,16 @@ fn capture_window_image(
     };
 
     if cg_image.is_null() {
+        // 2026-09-18 第 87 轮:错误归因修正 —— 按窗口截取返回 null 的首要原因是
+        // **屏幕录制未授权**(macOS 26.5 实测;辅助功能授权与此无关),而非辅助功能。
         return Err(AgentError::ToolExecution {
             tool: "MCP_Window_Use(action=screenshot)".into(),
             reason: format!(
-                "CGWindowListCreateImage 返回 null (window_id={window_id});\
-                 可能是辅助功能权限未授权或窗口 ID 无效"
+                "CGWindowListCreateImage 返回 null (window_id={window_id}):\
+                 屏幕录制未授权(macOS 按窗口截取走 TCC 屏录门控),或窗口已失效。\
+                 处置:1) 禁止继续重试 ocr/screenshot;2) 改走 action=inspect 控件树路线,\
+                 或 action=chat_send(osascript_fallback 路线,不依赖截图);\
+                 3) 如需视觉路线:系统设置 → 隐私与安全性 → 屏幕录制 → 勾选宿主终端后重开终端"
             ),
         });
     }

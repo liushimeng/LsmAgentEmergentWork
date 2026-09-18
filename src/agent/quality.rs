@@ -378,21 +378,35 @@ fn gate_report_on_trace(
 /// 且文本含可识别关键词时,推断 verdict / retryable / source,避免 591s 任务因
 /// Provider 网关截断 verdict 字段而整轮 fail。fail-closed 语义不变:仍优先返回
 /// Err,关键词降级仅在 Err 之后作为**最后兜底**。
+///
+/// 2026-09-18 第 87 轮:JSON 块**提取成功但反序列化失败**(如 LLM 输出畸形
+/// `{"$text":...}` 缺 verdict)时不再立即 Err —— 记录诊断后继续尝试独立 JSON
+/// 与文本关键词降级,全部失败才返回合并诊断。实测场景:QC 正文 suggestion 里
+/// 明确含「失败」信号,却因顶层 JSON 畸形被浪费,触发无谓回流。
 pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityReport> {
+    let mut last_diag: Option<String> = None;
     if let Some(json_str) = extract_json_block(text) {
-        return crate::agent::json_repair::try_parse::<QualityReport>(json_str).map_err(|diag| {
-            crate::error::AgentError::Other(format!("Quality JSON 解析失败: {diag}"))
-        });
+        match crate::agent::json_repair::try_parse::<QualityReport>(json_str) {
+            Ok(r) => return Ok(r),
+            Err(diag) => {
+                tracing::warn!(diag = %diag, "Quality ```json 块解析失败,继续降级链");
+                last_diag = Some(diag);
+            }
+        }
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        let mut r: QualityReport =
-            crate::agent::json_repair::try_parse(json_str).map_err(|diag| {
-                crate::error::AgentError::Other(format!("Quality JSON 解析失败: {diag}"))
-            })?;
-        if r.source != source {
-            r.source = source;
+        match crate::agent::json_repair::try_parse::<QualityReport>(json_str) {
+            Ok(mut r) => {
+                if r.source != source {
+                    r.source = source;
+                }
+                return Ok(r);
+            }
+            Err(diag) => {
+                tracing::warn!(diag = %diag, "Quality 独立 JSON 解析失败,继续降级链");
+                last_diag = Some(diag);
+            }
         }
-        return Ok(r);
     }
     // 2026-09-17 第 82+ 轮 P0-3:JSON 完全无法提取 → 文本关键词降级。
     // 仅当 JSON 解析链 fail-closed 之后触发,且文本同时含「质检报告」上下文
@@ -405,9 +419,10 @@ pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityRepo
         );
         return Ok(report);
     }
-    Err(crate::error::AgentError::Other(
-        "未找到合法的 Quality JSON".into(),
-    ))
+    Err(crate::error::AgentError::Other(match last_diag {
+        Some(diag) => format!("Quality JSON 解析失败: {diag}"),
+        None => "未找到合法的 Quality JSON".into(),
+    }))
 }
 
 /// 2026-09-17 第 82+ 轮 P0-3:文本关键词降级。
@@ -647,6 +662,38 @@ mod tests {
         let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
         assert_eq!(r.verdict, Verdict::Pass);
         assert_eq!(r.source, AgentRole::QualityCheck);
+    }
+
+    // ========== 2026-09-18 第 87 轮 ==========
+    // JSON 块提取成功但顶层畸形(缺 verdict)时,不再立即 Err ——
+    // 继续走文本关键词降级,正文里的 fail 信号不应被浪费(实测:QC 输出
+    // `{"$text":...}` 畸形 JSON 触发无谓回流)。
+
+    #[test]
+    fn parse_quality_report_malformed_json_falls_back_to_text_keywords() {
+        let text = r#"```json
+{
+  "$text": "subagent 自我归因错误:声称工具未暴露,但日志显示已真实执行",
+  "item": {"$text": "期望输出缺失:发送记录 0 条,任务失败,建议重试"}
+}
+```"#;
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.retryable);
+        assert!(r.issues[0].contains("JSON 解析失败"));
+    }
+
+    #[test]
+    fn parse_quality_report_malformed_json_without_signal_still_fails_closed() {
+        // 畸形 JSON 且正文无 verdict 强信号 → 仍 fail-closed Err(语义不变)
+        let text = r#"```json
+{
+  "$text": "今天天气很好",
+  "item": {"$text": "适合出门散步"}
+}
+```"#;
+        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
+        assert!(format!("{err}").contains("verdict"));
     }
 
     #[test]

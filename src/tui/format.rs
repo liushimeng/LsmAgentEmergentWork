@@ -867,7 +867,7 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
             let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
             let wid = extract_json_field(args_json, "window_id").unwrap_or_default();
             let query = extract_json_field(args_json, "query").unwrap_or_default();
-            let mut brief = format!("action={}", truncate_chars(&action, 12));
+            let mut brief = format!("action={}", truncate_chars(&action, 16));
             if !wid.is_empty() {
                 brief.push_str(&format!(" wid={}", truncate_chars(&wid, 16)));
             }

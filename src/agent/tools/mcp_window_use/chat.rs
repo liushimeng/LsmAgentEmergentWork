@@ -137,6 +137,35 @@ pub(super) fn infer_target_app_name(window_id: &str) -> Option<String> {
     None
 }
 
+/// 从进程名推断目标应用名(2026-09-18 第 87 轮:补中文进程名映射)。
+///
+/// window_id 形如 `44978:0`(pid:wid)时无法直接推断,需先 list 拿 process_name
+/// 再过本映射;微信 macOS 进程名可能是「微信」或「WeChat」。
+pub(super) fn infer_app_name_from_process(process_name: &str) -> Option<String> {
+    let lower = process_name.to_lowercase();
+    if lower.contains("wechat") || lower.contains("weixin") || process_name.contains("微信") {
+        return Some("WeChat".to_string());
+    }
+    if lower.contains("dingtalk") || process_name.contains("钉钉") {
+        return Some("DingTalk".to_string());
+    }
+    if lower.contains("lark") || lower.contains("feishu") || process_name.contains("飞书") {
+        return Some("Lark".to_string());
+    }
+    if lower.contains("qq") || process_name.contains("QQ") {
+        return Some("QQ".to_string());
+    }
+    None
+}
+
+/// window_id(pid:wid 形态)→ list_windows 查 process_name → 推断应用名。
+fn infer_app_name_from_window_list(window_id: &str) -> Option<String> {
+    let driver = current_driver();
+    let wins = driver.list_windows(None).ok()?;
+    let info = wins.into_iter().find(|w| w.id == window_id)?;
+    infer_app_name_from_process(&info.process_name)
+}
+
 // ===================== capability_probe(第 86 轮新增) =====================
 
 /// `action=capability_probe` —— 返回当前进程真实能力矩阵。
@@ -171,6 +200,11 @@ pub(super) async fn run_capability_probe(_args: Value) -> Result<String> {
     let body = json!({
         "ok": true,
         "platform": std::env::consts::OS,
+        "probe_method": if cfg!(target_os = "macos") {
+            "CGPreflightScreenCaptureAccess(TCC 官方 API,第 87 轮起;语义与按窗口 OCR 截图一致)"
+        } else {
+            "platform_default"
+        },
         "permissions": {
             "accessibility": ax_available,
             "screen_recording": cap.ocr_screenshot_cgwindow || cap.screencapture_cli,
@@ -188,6 +222,11 @@ pub(super) async fn run_capability_probe(_args: Value) -> Result<String> {
         "fallback_available": ax_available && !cap.coordinate_input,
         "recommended_route": recommended_route,
         "next_action": next_action,
+        "hard_constraint": if cap.ocr_screenshot_cgwindow {
+            "无"
+        } else {
+            "screen_recording=false:禁止调用 ocr/screenshot(必败),直接走 inspect 或 chat_send(osascript_fallback)"
+        },
     });
     Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
 }
@@ -286,10 +325,13 @@ pub(super) async fn run_chat_send(args: Value) -> Result<String> {
     driver_preflight(MCP_WINDOW_USE_TOOL_NAME).await?;
 
     let cap = probe_capability();
-    // 选择路线(第 86 轮新增 osascript_fallback):
+    // 选择路线(第 86 轮新增 osascript_fallback;第 87 轮修正 macOS 无坐标/路径时的优先级):
     // - input_field_path + inspect_control  -> AX 控件树路线
     // - click_point + coordinate_input      -> 视觉路线(CGEvent 物理点击+键入)
-    // - coordinate_input(无 click_point)    -> visual_no_input(假定焦点已对)
+    // - macOS + AX 已授权(无 click_point/input_field_path) -> osascript_fallback
+    //   (activate + System Events keystroke 直达焦点控件;visual_no_input 裸 CGEvent
+    //   打窗口根,实测微信输入框拿不到字符 —— 第 87 轮修正)
+    // - 非 macOS + coordinate_input(无 click_point) -> visual_no_input(假定焦点已对)
     // - AX 已授权但屏录未授权 / 无 CGEvent  -> osascript_fallback(第 86 轮新增)
     // - 完全无授权                          -> degraded_no_op
     let ax_available = cfg!(target_os = "macos")
@@ -298,10 +340,10 @@ pub(super) async fn run_chat_send(args: Value) -> Result<String> {
         "ax"
     } else if click_point.is_some() && cap.coordinate_input {
         "visual"
-    } else if cap.coordinate_input {
-        "visual_no_input"
     } else if ax_available {
         "osascript_fallback"
+    } else if cap.coordinate_input {
+        "visual_no_input"
     } else {
         "degraded_no_op"
     };
@@ -486,7 +528,11 @@ async fn run_osascript_fallback_send(
     submit_key: &str,
     chat_log_path: &str,
 ) -> Result<String> {
-    let app_name = infer_target_app_name(window_id).unwrap_or_else(|| "WeChat".to_string());
+    // 第 87 轮:window_id 是 pid:wid 形态时先经窗口列表拿进程名再推断,
+    // 避免对非微信应用误默认 "WeChat"。
+    let app_name = infer_target_app_name(window_id)
+        .or_else(|| infer_app_name_from_window_list(window_id))
+        .unwrap_or_else(|| "WeChat".to_string());
     let ts0 = now_unix();
 
     // 1. activate

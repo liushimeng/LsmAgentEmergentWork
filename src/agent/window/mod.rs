@@ -406,7 +406,8 @@ pub trait WindowDriver: Send + Sync {
     /// 2026-09-17 第 74 轮 T2:原生截图(落盘到指定路径)。
     ///
     /// 语义:平台原生截图实现,替代 screencapture 等外部命令。
-    /// - macOS:CGWindowListCreateImage(只需辅助功能权限,无需屏幕录制权限)
+    /// - macOS:CGWindowListCreateImage(第 86/87 轮实测:**需要屏幕录制授权**,
+    ///   未授权时按窗口截取返回 null;此前「无需屏幕录制」注释为误写)
     /// - Windows:GDI 截图(已有 windows_ocr::capture_window_png_to)
     /// - 其他平台:返回 Err,工具层降级到外部命令
     ///
@@ -715,7 +716,8 @@ static PERMISSION_CACHE: std::sync::OnceLock<
 ///
 /// 三平台分支:
 /// - macOS:accessibility = `AXIsProcessTrustedWithOptions(NULL)`;
-///   screen_recording = 探测 `CGWindowListCreateImage` 是否返回非空(发 10×10 像素测试);
+///   screen_recording = TCC 官方 `CGPreflightScreenCaptureAccess()`(第 87 轮起;
+///   此前全屏 CGWindowListCreateImage 非空判定在 macOS 26.5 实测假阳性);
 /// - Windows:全 true(UIA / SendInput 走标准用户权限);
 /// - Linux:全 true(wmctrl/xdotool 是普通进程命令,无统一权限机制)。
 /// 2026-09-18 第 85 轮:细粒度能力矩阵(MCP_Window_Use 各路线可用性)。
@@ -901,6 +903,14 @@ fn probe_platform_permissions() -> PermissionReport {
 ///   - 未授权 → 创建 image 返回 NULL → 返回 false
 /// - 该探测是 best-effort:第一次探测失败时缓存 false,后续不再尝试(避免阻塞);
 ///   用户授权后需手动 `LAEW_PERMISSION_CACHE_SECS=0` 重启或等待 TTL 过期
+///
+/// 2026-09-18 第 87 轮 P0 修正:上述「全屏截图未授权返回 NULL」的假设在 macOS 26.5
+/// 实测**不成立** —— 未授权屏录时全屏 CGWindowListCreateImage 仍返回非空(壁纸
+/// 图像),导致 capability_probe 误报 screen_recording=true,LLM 走视觉路线反复
+/// OCR 撞墙(按窗口截 `kCGWindowListOptionIncludingWindow` 才返回 null)。
+/// 故 screen_recording 主判定改用 TCC 官方 API `CGPreflightScreenCaptureAccess()`
+/// (core-graphics 0.23 `ScreenCaptureAccess::preflight()`),全屏 CGWindow 测试
+/// 降级为辅助参考(见 [`probe_macos_screen_recording`])。
 #[cfg(target_os = "macos")]
 fn probe_macos_permissions() -> PermissionReport {
     use crate::agent::window::macos_legacy::MacOsDriver;
@@ -923,22 +933,44 @@ fn probe_macos_permissions() -> PermissionReport {
         screen_recording_hint: if screen_recording {
             String::new()
         } else {
-            "屏幕录制未授权(CGWindowListCreateImage 返回 NULL)。授权:系统设置 → 隐私与安全性 → 屏幕录制 → 勾选宿主终端;授权后必须重启终端生效。授权前可改用 MCP_Window_Use(action=inspect) 控件树路线(纯辅助功能),或降级到 screencapture / osascript System Events 路径。".into()
+            "屏幕录制未授权(CGPreflightScreenCaptureAccess=false)。授权:系统设置 → 隐私与安全性 → 屏幕录制 → 勾选宿主终端;授权后必须重启终端生效。授权前可改用 MCP_Window_Use(action=inspect) 控件树路线(纯辅助功能),或降级到 screencapture / osascript System Events 路径。".into()
         },
     }
 }
 
-/// macOS 屏幕录制权限探测:CGWindowListCreateImage(全屏) 是否返回非 NULL。
+/// macOS 屏幕录制权限探测(2026-09-18 第 87 轮重写)。
 ///
-/// best-effort 实现,失败时不重试(避免阻塞)。缓存 30s 由调用方控制。
+/// 主判定:`CGPreflightScreenCaptureAccess()` —— TCC 官方 preflight API,
+/// 语义与实际 OCR/截图路径(按窗口 `kCGWindowListOptionIncludingWindow`)一致。
+///
+/// 历史教训(第 86 轮前):「全屏 CGWindowListCreateImage 非空即已授权」的假设在
+/// macOS 26.5 实测不成立 —— 未授权时全屏截图返回非空壁纸图像,造成假阳性;
+/// 只有按窗口截取才在未授权时返回 null。全屏测试保留为辅助参考,仅当与
+/// preflight 结论不一致时打 debug 日志(便于现场排查),不影响判定。
 #[cfg(target_os = "macos")]
 fn probe_macos_screen_recording() -> bool {
+    let preflight = core_graphics::access::ScreenCaptureAccess::default().preflight();
+    // 辅助参考:全屏 1 像素测试(第 87 轮起仅作日志对照,不参与判定)。
+    let cgwindow_ok = probe_macos_screen_recording_cgwindow();
+    if preflight != cgwindow_ok {
+        tracing::debug!(
+            preflight,
+            cgwindow_ok,
+            "屏录探测:preflight 与全屏 CGWindow 测试不一致,以 preflight 为准\
+             (macOS 未授权屏录时全屏截图返回壁纸图像,属预期假阳性)"
+        );
+    }
+    preflight
+}
+
+/// 全屏 CGWindowListCreateImage 1 像素测试(辅助参考,第 87 轮起不作主判定)。
+#[cfg(target_os = "macos")]
+fn probe_macos_screen_recording_cgwindow() -> bool {
     use core_graphics::display::CGRectNull;
     use core_graphics::image::CGImage;
     use core_graphics::window::{kCGWindowImageBoundsIgnoreFraming, kCGWindowListOptionAll};
     use foreign_types::ForeignType;
 
-    // 全屏截 1 像素测试;屏幕录制未授权时 CGWindowListCreateImage 返回 NULL。
     unsafe {
         let cg_image = core_graphics::window::CGWindowListCreateImage(
             CGRectNull,
@@ -949,7 +981,6 @@ fn probe_macos_screen_recording() -> bool {
         if cg_image.is_null() {
             return false;
         }
-        // 立即释放(避免泄漏);CGImage 不是 Send,这里只取 width 字段即可判定成功
         let img = CGImage::from_ptr(cg_image);
         let ok = img.width() > 0;
         drop(img);

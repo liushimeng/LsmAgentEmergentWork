@@ -171,7 +171,19 @@ impl MainWorkRunner {
                bash 进程检查极易误判「应用未安装」。\n\
              - 同一应用的连续 UI 操作链(打开/激活 → 检视/OCR → 点击 → 输入 → 发送 → 复查)必须\n\
                合并为一个 subagent WorkFlow;微信 4.x 等自绘 UI 的控件树为空,MCP_Window_Use\n\
-               支持 action=ocr + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。",
+               支持 action=ocr + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。\n\
+             - 桌面窗口操控流程引用 MCP_Window_Use 时(2026-09-18 第 87 轮),steps 中只允许使用\n\
+               以下合法 action:open / list / find / inspect / control / ocr / screenshot /\n\
+               capability_probe / osascript_run / chat_send / chat_loop;禁止臆造 list_windows /\n\
+               get_window_info / get_ui_tree 等不存在的接口名 —— 执行层按字面调用会直接失败空转。\n\
+             - 长时多轮桌面会话(如 15 分钟微信自动聊天):steps 必须引导执行层用\n\
+               chat_loop(window_id, messages, interval_seconds, chat_log_path) 一次调用完成多轮\n\
+               发送 —— SubAgent 迭代上限 16 次,逐条 chat_send 必然超限失败;\n\
+               acceptance 引用 chat_log 落盘文件中的 [SEND]/[RECV]/[SUMMARY] 行计数\n\
+               (该日志由 MCP_Window_Use 工具内部落盘,执行轨迹可对账)。\n\
+             - acceptance 禁止自定义执行层可用 Bash echo / Write 伪造的文本标记\n\
+               (如 mcp_action= / probe_msg_sent=OK 这类自造 grep 锚点)—— 实测执行层会\n\
+               手写假日志交差;验收锚点只能用工具自产证据(chat_log [SEND] 行)或 UI 状态。",
         );
 
         let mut sub_session = crate::session::Session::new();

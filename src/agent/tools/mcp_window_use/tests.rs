@@ -584,3 +584,18 @@ async fn chat_send_requires_text() {
         .unwrap_err();
     assert!(err.to_string().contains("text"));
 }
+
+// ===================== 2026-09-18 第 87 轮 =====================
+
+#[test]
+fn infer_app_name_from_process_chinese_aliases() {
+    // 微信 macOS 进程名可能是「微信」或「WeChat」,window_id 为 pid:wid 时
+    // 需经 process_name 映射,osascript_fallback 才能 activate 正确应用。
+    use super::chat::infer_app_name_from_process;
+    assert_eq!(infer_app_name_from_process("微信").as_deref(), Some("WeChat"));
+    assert_eq!(infer_app_name_from_process("WeChat").as_deref(), Some("WeChat"));
+    assert_eq!(infer_app_name_from_process("Weixin").as_deref(), Some("WeChat"));
+    assert_eq!(infer_app_name_from_process("钉钉").as_deref(), Some("DingTalk"));
+    assert_eq!(infer_app_name_from_process("飞书").as_deref(), Some("Lark"));
+    assert_eq!(infer_app_name_from_process("Finder"), None);
+}
