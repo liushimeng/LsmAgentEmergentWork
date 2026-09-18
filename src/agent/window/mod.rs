@@ -724,11 +724,15 @@ static PERMISSION_CACHE: std::sync::OnceLock<
 /// 实际工具能力切分,LLM 据此选择路线:
 /// - `list_find`:枚举窗口 + 找窗口(CGWindowList 不需授权,始终 true);
 /// - `inspect_control`:AX / UIA 控件树路线(需 accessibility);
-/// - `ocr_screenshot_cgwindow`:CGWindow + Vision / WMI 截图 OCR(实测 macOS 26.5
-///   **不需要屏幕录制授权**,走 CGImage 数据源;Windows UIA 同理);
+/// - `ocr_screenshot_cgwindow`:CGWindow + Vision / WMI 截图 OCR(**macOS 26.5 实测
+///   需要屏幕录制权限**,Windows 的 GDI 不需要);
 /// - `coordinate_input`:物理输入(CGEvent / SendInput,需 accessibility);
 /// - `screencapture_cli`:走 `screencapture -x` / `import`(macOS 需要屏幕录制);
 /// - `ax_warmup`:AXEnhancedUserInterface + AXManualAccessibility 双开关(自绘 UI 必需)。
+///
+/// 第 86 轮修正:之前的注释误写为"macOS 26.5 CGWindowListCreateImage 不需要屏幕录制",
+/// 经实测(bundle_id 自动启动微信后多次 OCR 仍 CGWindowListCreateImage 返回 null),
+/// 实测 macOS 26.5 该 API 需要屏幕录制授权,修正 capability 矩阵与文档保持一致。
 #[derive(Debug, Clone, Serialize)]
 pub struct WindowCapability {
     pub list_find: bool,
@@ -744,12 +748,15 @@ impl WindowCapability {
     pub fn from_permissions(report: &PermissionReport) -> Self {
         #[cfg(target_os = "macos")]
         {
+            // 第 86 轮修正:CGWindowListCreateImage 实测 macOS 26.5 需要屏幕录制权限,
+            // 之前误写为"无需屏幕录制"导致 LLM 反复尝试 OCR/screenshot 全失败。
+            // screencapture_cli / ocr_screenshot_cgwindow 都依赖 screen_recording。
             Self {
-                list_find: true, // CGWindowList 永远可用
-                inspect_control: report.accessibility,
-                ocr_screenshot_cgwindow: true, // CGWindowListCreateImage + Vision
-                coordinate_input: report.accessibility, // CGEvent 输入需 AX
-                screencapture_cli: report.screen_recording, // screencapture 命令需屏录
+                list_find: true,                            // CGWindowListCopyWindowInfo 永远可用
+                inspect_control: report.accessibility,      // AX 控件树
+                ocr_screenshot_cgwindow: report.screen_recording, // CGWindow + Vision 需屏录
+                coordinate_input: report.accessibility,      // CGEvent 输入需 AX
+                screencapture_cli: report.screen_recording,  // screencapture 命令需屏录
                 ax_warmup: report.accessibility,
             }
         }

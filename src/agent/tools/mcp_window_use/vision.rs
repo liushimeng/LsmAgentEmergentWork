@@ -238,7 +238,8 @@ pub(super) async fn run_screenshot(args: Value) -> Result<String> {
                             "created_at_unix": ts,
                             "platform": std::env::consts::OS,
                             "method": "cgwindow_native",
-                            "next_action": "PNG 已落盘(CGWindow 原生截图,无需屏幕录制权限);需要识别文字直接用 action=ocr,禁止 Read PNG。"
+                            "next_action": "PNG 已落盘(CGWindow 原生截图);需要识别文字直接用 action=ocr,禁止 Read PNG。\
+                                            注意:CGWindow 原生截图实际仍需 macOS 屏幕录制授权(screen_recording=false 时 CGWindow 返回 null 走 screencapture 降级)。"
                         });
                         return Ok(serde_json::to_string_pretty(&body)
                             .unwrap_or_else(|_| "{}".into()));

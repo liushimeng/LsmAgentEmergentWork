@@ -1,7 +1,10 @@
-//! macOS Vision OCR 引擎(2026-09-17 第 74 轮 T1)
+//! macOS Vision OCR 引擎(2026-09-17 第 74 轮 T1,第 86 轮修正)
 //!
 //! 基于 Vision.framework 的 VNRecognizeTextRequest:
-//! 1. CGWindowListCreateImage 截取窗口图像(无需屏幕录制权限,只需辅助功能权限)
+//! 1. CGWindowListCreateImage 截取窗口图像 —— **macOS 26.5 实测需要屏幕录制权限**;
+//!    第 86 轮修正了之前「无需屏幕录制」的错误注释。屏录未授权时 CGWindow 返回
+//!    null,工具层会自动降级到 screencapture 命令(screencapture -x 同样需屏录,
+//!    最终全失败,LLM 应改走 osascript_fallback 路线)。
 //! 2. 转为 CGImage → Vision 处理
 //! 3. VNRecognizeTextRequest 识别文字 + 坐标
 //! 4. 返回 OcrBlock {text, x, y, width, height}(窗口相对坐标)

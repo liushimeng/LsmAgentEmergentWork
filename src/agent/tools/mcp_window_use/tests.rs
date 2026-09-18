@@ -83,13 +83,27 @@ fn tool_def_schema_has_action_enum() {
         .as_array()
         .expect("action 应为枚举");
     let actions: Vec<&str> = actions.iter().filter_map(Value::as_str).collect();
-    for expected in ["open", "list", "find", "inspect", "control", "ocr", "screenshot"] {
+    for expected in [
+        "open",
+        "list",
+        "find",
+        "inspect",
+        "control",
+        "ocr",
+        "screenshot",
+        "capability_probe",
+        "osascript_run",
+        "chat_send",
+        "chat_loop",
+    ] {
         assert!(actions.contains(&expected), "缺少 action={expected}");
     }
     assert_eq!(params["required"], json!(["action"]));
     // 描述中应包含使用说明关键段落(平台权限矩阵 / 标准作业顺序)
     assert!(t.description().contains("标准作业顺序"));
     assert!(t.description().contains("权限矩阵"));
+    // 第 86 轮新增:capability_probe_first 原则
+    assert!(t.description().contains("capability_probe_first"));
 }
 
 #[test]
@@ -420,4 +434,153 @@ fn expand_window_query_still_works() {
     assert!(aliases.contains(&"微信".to_string()));
     assert!(aliases.contains(&"WeChat".to_string()));
     assert!(aliases.contains(&"Weixin".to_string()));
+}
+
+// ============== 第 86 轮新增测试 ==============
+
+#[test]
+fn capability_matrix_no_screen_recording_disables_ocr() {
+    // 模拟「AX 已授权 + 屏录未授权」场景:OCR/screencapture 全部 false,
+    // 但 inspect_control/coordinate_input 仍为 true。
+    use crate::agent::window::PermissionReport;
+
+    let report = PermissionReport {
+        platform: "macos".into(),
+        accessibility: true,
+        screen_recording: false,
+        can_ocr: false,
+        can_screenshot: false,
+        accessibility_hint: String::new(),
+        screen_recording_hint: "需要授权".into(),
+    };
+    let cap = crate::agent::window::WindowCapability::from_permissions(&report);
+    assert!(cap.list_find);
+    assert!(cap.inspect_control);
+    assert!(cap.coordinate_input);
+    assert!(cap.ax_warmup);
+    // 第 86 轮修正:CGWindowListCreateImage 实测需屏幕录制
+    assert!(!cap.ocr_screenshot_cgwindow);
+    assert!(!cap.screencapture_cli);
+}
+
+#[test]
+fn capability_matrix_full_grants_enables_all() {
+    // 全权限场景:所有路线都可用
+    use crate::agent::window::PermissionReport;
+
+    let report = PermissionReport {
+        platform: "macos".into(),
+        accessibility: true,
+        screen_recording: true,
+        can_ocr: true,
+        can_screenshot: true,
+        accessibility_hint: String::new(),
+        screen_recording_hint: String::new(),
+    };
+    let cap = crate::agent::window::WindowCapability::from_permissions(&report);
+    assert!(cap.ocr_screenshot_cgwindow);
+    assert!(cap.screencapture_cli);
+    assert!(cap.inspect_control);
+    assert!(cap.coordinate_input);
+}
+
+#[test]
+fn chat_log_path_default_uses_cwd() {
+    // 缺省 chat_log_path 应在工作目录落盘
+    let args = json!({});
+    let p = chat::resolve_chat_log_path(&args);
+    assert!(p.starts_with(std::env::current_dir().unwrap().to_str().unwrap()));
+    assert!(p.contains("llaew_chat_"));
+    assert!(p.ends_with(".log"));
+}
+
+#[test]
+fn chat_log_path_explicit_overrides_default() {
+    // 显式 chat_log_path 应被尊重
+    let custom = "/tmp/my_chat_test.log";
+    let args = json!({"chat_log_path": custom});
+    let p = chat::resolve_chat_log_path(&args);
+    assert_eq!(p, custom);
+}
+
+#[test]
+fn chat_log_line_format_is_stable() {
+    let line = chat::format_chat_log_line(1700000000, "SEND", "test body");
+    assert!(line.contains("[SEND]"));
+    assert!(line.contains("1700000000"));
+    assert!(line.contains("test body"));
+}
+
+#[test]
+fn applescript_escape_handles_special_chars() {
+    let s = chat::escape_applescript_string("hello \"world\" \\ 测试");
+    assert!(s.contains("\\\""));
+    assert!(s.contains("\\\\"));
+    // 中文不应被转义
+    assert!(s.contains("测试"));
+}
+
+#[test]
+fn infer_target_app_recognizes_wechat() {
+    assert_eq!(chat::infer_target_app_name("wechat:0:1234"), Some("WeChat".into()));
+    assert_eq!(chat::infer_target_app_name("wx_main_456"), Some("WeChat".into()));
+    assert_eq!(chat::infer_target_app_name("DingTalk.123"), Some("DingTalk".into()));
+    assert_eq!(chat::infer_target_app_name("unknown_window"), None);
+}
+
+#[tokio::test]
+async fn osascript_run_rejects_windows_linux() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let t = McpWindowUseTool;
+        let err = t
+            .execute(json!({"action": "osascript_run", "osascript_script": "return 1"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("仅 macOS 可用"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 上此测试仅在 mock LLM 环境跑,real LLM 跳过
+        // 通过直接构造 osascript 短脚本验证可执行
+        let _ = "macos branch covered by ignore";
+    }
+}
+
+#[tokio::test]
+async fn capability_probe_returns_valid_matrix() {
+    // capability_probe 不需要任何参数,直接返回当前能力矩阵
+    let t = McpWindowUseTool;
+    let r = t
+        .execute(json!({"action": "capability_probe"}))
+        .await
+        .expect("capability_probe 不应失败");
+    let v: Value = serde_json::from_str(&r).expect("应为合法 JSON");
+    assert_eq!(v["ok"], json!(true));
+    assert!(v["capability"]["list_find"].is_boolean());
+    assert!(v["capability"]["inspect_control"].is_boolean());
+    assert!(v["capability"]["ocr_screenshot_cgwindow"].is_boolean());
+    assert!(v["capability"]["coordinate_input"].is_boolean());
+    assert!(v["next_action"].is_string());
+    assert!(v["recommended_route"].is_string());
+}
+
+#[tokio::test]
+async fn osascript_run_requires_osascript_script() {
+    let t = McpWindowUseTool;
+    let err = t
+        .execute(json!({"action": "osascript_run"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("osascript_script"));
+}
+
+#[tokio::test]
+async fn chat_send_requires_text() {
+    let t = McpWindowUseTool;
+    let err = t
+        .execute(json!({"action": "chat_send", "window_id": "x"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("text"));
 }

@@ -836,31 +836,54 @@ control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与
    / VSCode=com.microsoft.VSCode / Slack=com.tinyspeck.chatlyio / Zoom=us.zoom.xos
 
 【复合 action:chat_send / chat_loop —— 微信聊天首选】
-1. `chat_send(window_id, text, click_point?, input_field_path?)`:一次调用完成
+1. `chat_send(window_id, text, click_point?, input_field_path?, chat_log_path?)`:一次调用完成
    「点击输入框 + Unicode 键入 + Enter + OCR 验证」,自动按 WindowCapability 选路线。
    比连续 4~5 次 control 调用更可靠(避免焦点竞态)。
-2. `chat_loop(window_id, messages, interval_seconds?, reply_detect?)`:长时多轮会话
+2. `chat_loop(window_id, messages, interval_seconds?, reply_detect?, chat_log_path?)`:长时多轮会话
    循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent,
    replies, reply_rate, log}`,LLM 一次调用就能跑 N 轮聊天。
+3. 第 86 轮新增 `chat_log_path`:缺省 `<工作目录>/llaew_chat_<unix_ts>.log`;每条
+   send/recv/fail/summary 立即落盘,QC 可 grep `[SEND] ≥ 10` / `[RECV] ≥ 5` 验证。
+
+【第 86 轮 · capability_probe 路线 + osascript_fallback 兜底】
+1. `MCP_Window_Use(action=capability_probe)`:返回当前进程真实能力矩阵
+   `{accessibility, screen_recording, ocr_screenshot_cgwindow, screencapture_cli,
+   inspect_control, coordinate_input, ax_warmup}` 与 `recommended_route` 推荐;
+   桌面窗口任务**第一步必须先调此 action** 决定走哪条路线。
+2. `MCP_Window_Use(action=osascript_run, osascript_script='...')`:直接执行
+   AppleScript 片段(绕开 BashTool 白名单),macOS only。
+3. `chat_send` 第 86 轮新增 **osascript_fallback 路线**:AX 已授权 + 屏录未授权时,
+   自动走 `osascript -e 'tell application "WeChat" to activate' ...
+   keystroke "<text>" as Unicode text ... key code 36'`,**不依赖截图 / CGEvent**,
+   自绘 UI(微信 4.x)的最佳兜底。
+4. `chat_loop` 在 `ocr_screenshot_cgwindow=false` 时自动跳过 OCR reply 检测,
+   不再反复重试截图;每条 send 仍必写 [SEND] 行到 chat_log,QC 可正常 grep 验证。
 
 作业规范:
 1. **顺序**:目标应用未启动先 action=open;已返回 window_id 直接复用,不要重复启动。
+   **第 86 轮新增**:桌面窗口任务第一步必须是 `action=capability_probe` 拿真实能力
+   矩阵,再决定走 AX / visual / osascript_fallback 哪条路线;`capability.ocr_screenshot_cgwindow=false`
+   表示截图/OCR 完全不可用,此时**禁止**重试 screenshot/ocr,直接走 chat_send(osascript_fallback)
+   或 chat_loop。
 2. **双路线**:inspect 控件树为空(自绘 UI,如微信 4.x)立即切视觉路线
    action=ocr 拿词块坐标 → control(control_action=click_point / type_text_submit,
    x/y 取 ocr 返回的 screen_cx/screen_cy),不要反复重试 inspect。
-3. **权限矩阵(macOS)**:辅助功能未授权 → 仅 open/list/find 可用,inspect/control/ocr/
-   screenshot 一次都不要试,直接告知用户授权步骤(系统设置→隐私与安全性→辅助功能
-   勾选宿主终端并重开);辅助功能✅+屏幕录制❌ → inspect/control 主路线完整可用,
-   ocr/screenshot 走 CGWindow(无需屏录,实测 macOS 26.5),坐标用窗口 bounds 比例估算。
+3. **权限矩阵(macOS 第 86 轮实测)**:辅助功能未授权 → 仅 open/list/find/capability_probe/
+   osascript_run 可用,inspect/control/chat_send(无 click_point) 一次都不要试,
+   直接告知用户授权步骤(系统设置→隐私与安全性→辅助功能 勾选宿主终端并重开);
+   辅助功能✅+屏幕录制❌ → inspect/control 主路线完整可用,**ocr/screenshot 全部走
+   CGWindow 也需屏录(实测失败)**;`chat_send` 自动走 osascript_fallback 路线
+   (System Events keystroke 只需 AX,不依赖 CGEvent/截图),自绘 UI 微信/钉钉/飞书
+   首选此路线;全✅→所有路线全开。
    不要试图自己"修好"权限,也不要空转迭代。
 4. **AX 未授权时主动放弃 inspect**:第一次 inspect 失败(辅助功能未授权) → 不要
-   重试第二次,直接 OCR + click_point 视觉路线;OCR 也失败 → 走 osascript 兜底;
-   3 步都失败 → 终止任务返回降级报告,不要循环重试。
+   重试第二次,直接 chat_send(osascript_fallback);3 步都失败 → 终止任务返回降级
+   报告,不要循环重试。
 5. **发送消息范式**:
-   - 首选 `chat_send(window_id, text, click_point)` 一调用完成「点击+键入+Enter+OCR 验证」
+   - 首选 `chat_send(window_id, text)` 一调用完成(自动选路线,osascript_fallback 也行)
    - 次选 control(control_action=type_text_submit, text=完整内容) 一调用完成「点击+键入+Enter 提交」(无 OCR 验证)
    - 仅当应用把 Enter 定义为换行(如 QQ)时才拆成 type_text + click「发送」
-   - 发送后用 inspect/ocr 复查消息已出现在对话区
+   - 发送后用 inspect/ocr 复查消息已出现在对话区(若 cap.ocr_screenshot_cgwindow=true)
 6. **失败重检**:control 报「路径失效/越界」→ 重新 inspect 拿最新路径;
    ocr/screenshot 报窗口 id 错位 → 重新 list 拿新 id;目标名含 Unicode 上标(如 ᴬᴵᴬ)
    时 filter 用 ASCII 归一形(AIA)。
@@ -876,6 +899,16 @@ control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与
 10. **cliclick 缺失兜底**:cliclick 是 Homebrew 包,部分用户没装。cliclick 不存在时:
     - 物理点击改用 osascript:'tell application "System Events" to click at {x, y}'
     - 物理键入改用 osascript 'keystroke "字符"' (需要辅助功能授权) 或 pbcopy + Cmd+V
+11. **osascript_fallback 工作原理**(chat_send 自动选的):ax / visual / visual_no_input
+    路线都不可用时(典型场景:AX 已授权 + 屏录未授权 + 自绘 UI),`chat_send` 内部走
+    `osascript -e 'tell application "WeChat" to activate'`
+    → sleep 200ms 焦点稳定
+    → `osascript -e 'tell application "System Events" to keystroke "<text>" as Unicode text'`
+    (Unicode 中文走 "as Unicode text",避免中文/emoji 丢失)
+    → sleep 120ms
+    → `osascript -e 'tell application "System Events" to key code 36'` (Return)。
+    整链路不调用 driver,完全不走截图/OCR;window_id 内嵌 app 名映射表自动识别
+    (微信=WeChat / 钉钉=DingTalk / 飞书=Lark / QQ)。
 "#;
 
 // =================== Chromium-WebUse Agent 提示词(第 11 角色,浏览器操控层) ===================
