@@ -718,6 +718,100 @@ static PERMISSION_CACHE: std::sync::OnceLock<
 ///   screen_recording = 探测 `CGWindowListCreateImage` 是否返回非空(发 10×10 像素测试);
 /// - Windows:全 true(UIA / SendInput 走标准用户权限);
 /// - Linux:全 true(wmctrl/xdotool 是普通进程命令,无统一权限机制)。
+/// 2026-09-18 第 85 轮:细粒度能力矩阵(MCP_Window_Use 各路线可用性)。
+///
+/// 与 `PermissionReport`(粗粒度:accessibility / screen_recording)不同,本结构按
+/// 实际工具能力切分,LLM 据此选择路线:
+/// - `list_find`:枚举窗口 + 找窗口(CGWindowList 不需授权,始终 true);
+/// - `inspect_control`:AX / UIA 控件树路线(需 accessibility);
+/// - `ocr_screenshot_cgwindow`:CGWindow + Vision / WMI 截图 OCR(实测 macOS 26.5
+///   **不需要屏幕录制授权**,走 CGImage 数据源;Windows UIA 同理);
+/// - `coordinate_input`:物理输入(CGEvent / SendInput,需 accessibility);
+/// - `screencapture_cli`:走 `screencapture -x` / `import`(macOS 需要屏幕录制);
+/// - `ax_warmup`:AXEnhancedUserInterface + AXManualAccessibility 双开关(自绘 UI 必需)。
+#[derive(Debug, Clone, Serialize)]
+pub struct WindowCapability {
+    pub list_find: bool,
+    pub inspect_control: bool,
+    pub ocr_screenshot_cgwindow: bool,
+    pub coordinate_input: bool,
+    pub screencapture_cli: bool,
+    pub ax_warmup: bool,
+}
+
+impl WindowCapability {
+    /// 从权限报告推导能力矩阵(各平台统一的探测逻辑)。
+    pub fn from_permissions(report: &PermissionReport) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                list_find: true, // CGWindowList 永远可用
+                inspect_control: report.accessibility,
+                ocr_screenshot_cgwindow: true, // CGWindowListCreateImage + Vision
+                coordinate_input: report.accessibility, // CGEvent 输入需 AX
+                screencapture_cli: report.screen_recording, // screencapture 命令需屏录
+                ax_warmup: report.accessibility,
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                list_find: true,
+                inspect_control: report.accessibility, // UIA 需启用
+                ocr_screenshot_cgwindow: true, // GDI 截图不需特殊授权
+                coordinate_input: report.accessibility, // SendInput 通常不限
+                screencapture_cli: true, // PowerShell 可执行
+                ax_warmup: false,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            Self {
+                list_find: true,
+                inspect_control: false,
+                ocr_screenshot_cgwindow: false,
+                coordinate_input: true, // xdotool 通常可执行
+                screencapture_cli: true,
+                ax_warmup: false,
+            }
+        }
+    }
+
+    /// 候选的"下一步行动"提示,LLM 据此选择路线。
+    pub fn next_action_hint(&self) -> &'static str {
+        match (
+            self.list_find,
+            self.inspect_control,
+            self.ocr_screenshot_cgwindow,
+            self.coordinate_input,
+        ) {
+            (_, true, true, true) => "全权限:inspect/control/ocr/screenshot/click_point 全部可用,任意路线组合",
+            (_, true, false, true) => "AX 已授权 + 屏录未授权:inspect/control 主路线完整;ocr/screenshot 改用 CGWindow(无需屏录);坐标用窗口 bounds 估",
+            (_, true, _, false) => "AX 已授权但 CGEvent 注入受阻:走 AX 控件路线(click/set_text/send_keys/scroll)",
+            (_, false, true, true) => "AX 未授权 + 屏录 OK:走 ocr + click_point + type_text_submit 视觉路线,或 osascript keystroke",
+            (_, false, true, false) => "AX 未授权 + CGEvent 也不可用:仅 ocr + osascript(需要单独授权);或授权 AX 后重试",
+            (_, false, false, _) => "深度权限全无:仅 list/find;读/操作需先到 系统设置→隐私与安全性→辅助功能 勾选宿主终端",
+        }
+    }
+
+    /// 当前 capability 简码,供 debug 日志 / agent_context 摘要用。
+    pub fn tag(&self) -> String {
+        format!(
+            "list={}/insp={}/ocr={}/coord={}/scap={}",
+            self.list_find as u8,
+            self.inspect_control as u8,
+            self.ocr_screenshot_cgwindow as u8,
+            self.coordinate_input as u8,
+            self.screencapture_cli as u8
+        )
+    }
+}
+
+/// 探测当前进程的实际能力矩阵(走 cache + PermissionReport 派生)。
+pub fn probe_capability() -> WindowCapability {
+    WindowCapability::from_permissions(&check_platform_permissions())
+}
+
 pub fn check_platform_permissions() -> PermissionReport {
     if let Some(mutex) = PERMISSION_CACHE.get() {
         if let Ok(mut cached) = mutex.lock() {

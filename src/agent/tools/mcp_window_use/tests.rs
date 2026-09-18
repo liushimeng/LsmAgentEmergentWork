@@ -382,3 +382,42 @@ async fn driver_preflight_requests_ax_permission_on_macos() {
         }
     }
 }
+
+// ===================== 2026-09-18 第 85 轮新增单测 =====================
+//
+// 覆盖 KNOWN_BUNDLE_IDS 已知桌面应用映射表(解决 open -a 中文名无法启动微信的根因)。
+
+#[test]
+fn lookup_known_bundle_id_resolves_wechat_aliases() {
+    // 中文 query 必须命中 com.tencent.xinWeChat
+    assert_eq!(super::open::lookup_known_bundle_id("微信"), Some("com.tencent.xinWeChat"));
+    // 英文别名(包含子串)
+    assert_eq!(super::open::lookup_known_bundle_id("WeChat"), Some("com.tencent.xinWeChat"));
+    assert_eq!(super::open::lookup_known_bundle_id("wechat"), Some("com.tencent.xinWeChat"));
+    assert_eq!(super::open::lookup_known_bundle_id("Weixin"), Some("com.tencent.xinWeChat"));
+}
+
+#[test]
+fn lookup_known_bundle_id_resolves_dingtalk_feishu_qq() {
+    assert_eq!(super::open::lookup_known_bundle_id("钉钉"), Some("com.laiwang.DingTalk"));
+    assert_eq!(super::open::lookup_known_bundle_id("DingTalk"), Some("com.laiwang.DingTalk"));
+    assert_eq!(super::open::lookup_known_bundle_id("飞书"), Some("com.bytedance.feishu"));
+    assert_eq!(super::open::lookup_known_bundle_id("Lark"), Some("com.bytedance.feishu"));
+    assert_eq!(super::open::lookup_known_bundle_id("QQ"), Some("com.tencent.qq"));
+}
+
+#[test]
+fn lookup_known_bundle_id_returns_none_for_unknown() {
+    assert_eq!(super::open::lookup_known_bundle_id(""), None);
+    assert_eq!(super::open::lookup_known_bundle_id("完全未知的应用名xyz"), None);
+    assert_eq!(super::open::lookup_known_bundle_id("RandomUnknownApp"), None);
+}
+
+#[test]
+fn expand_window_query_still_works() {
+    // 回归:扩名表没坏
+    let aliases = expand_window_query("微信");
+    assert!(aliases.contains(&"微信".to_string()));
+    assert!(aliases.contains(&"WeChat".to_string()));
+    assert!(aliases.contains(&"Weixin".to_string()));
+}

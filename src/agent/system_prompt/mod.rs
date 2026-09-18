@@ -822,7 +822,26 @@ const MCP_WINDOW_USE_PROMPT_SECTION: &str = r#"
 当任务涉及「读取/操作桌面软件窗口」(枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本,
 如微信/钉钉/记事本等桌面应用)时,使用 MCP_Window_Use 工具(单工具 + action 分发):
 open(启动/激活应用)→ list/find(定位 window_id)→ inspect 或 ocr(理解界面)→
-control(操作)→ inspect/ocr 复查。各 action 参数与用法见工具 description。
+control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与用法见工具 description。
+
+【启动应用 —— 必须传 bundle_id 或中文别名】
+1. 微信/钉钉/飞书 等桌面应用,CFBundleName 与中文 DisplayName 不一致,
+   `open -a 微信` 在 macOS 上**直接失败**(Unable to find application named '微信',exit 1)。
+   正确做法:传 `bundle_id=com.tencent.xinWeChat` / `com.laiwang.DingTalk` /
+   `com.bytedance.feishu`;若不知道 bundle_id,只用中文 `query=微信` 也能成功
+   (第 85 轮新增 KNOWN_BUNDLE_IDS 自动映射)。
+2. 已知常用 bundle id:
+   微信=com.tencent.xinWeChat / 钉钉=com.laiwang.DingTalk / 飞书=com.bytedance.feishu
+   / QQ=com.tencent.qq / 腾讯会议=com.tencent.meeting / 豆包=com.doubao.mac
+   / VSCode=com.microsoft.VSCode / Slack=com.tinyspeck.chatlyio / Zoom=us.zoom.xos
+
+【复合 action:chat_send / chat_loop —— 微信聊天首选】
+1. `chat_send(window_id, text, click_point?, input_field_path?)`:一次调用完成
+   「点击输入框 + Unicode 键入 + Enter + OCR 验证」,自动按 WindowCapability 选路线。
+   比连续 4~5 次 control 调用更可靠(避免焦点竞态)。
+2. `chat_loop(window_id, messages, interval_seconds?, reply_detect?)`:长时多轮会话
+   循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent,
+   replies, reply_rate, log}`,LLM 一次调用就能跑 N 轮聊天。
 
 作业规范:
 1. **顺序**:目标应用未启动先 action=open;已返回 window_id 直接复用,不要重复启动。
@@ -832,22 +851,31 @@ control(操作)→ inspect/ocr 复查。各 action 参数与用法见工具 desc
 3. **权限矩阵(macOS)**:辅助功能未授权 → 仅 open/list/find 可用,inspect/control/ocr/
    screenshot 一次都不要试,直接告知用户授权步骤(系统设置→隐私与安全性→辅助功能
    勾选宿主终端并重开);辅助功能✅+屏幕录制❌ → inspect/control 主路线完整可用,
-   仅 ocr/screenshot 不可用,坐标用窗口 bounds 比例估算。不要试图自己"修好"权限,
-   也不要空转迭代。
-4. **发送消息范式**:首选 control(control_action=type_text_submit, text=完整内容)
-   一调用完成「点击输入框+键入+Enter 提交」;仅当应用把 Enter 定义为换行时才拆成
-   type_text + click「发送」;发送后复查消息已出现在对话区。
-5. **失败重检**:control 报「路径失效/越界」→ 重新 inspect 拿最新路径;
+   ocr/screenshot 走 CGWindow(无需屏录,实测 macOS 26.5),坐标用窗口 bounds 比例估算。
+   不要试图自己"修好"权限,也不要空转迭代。
+4. **AX 未授权时主动放弃 inspect**:第一次 inspect 失败(辅助功能未授权) → 不要
+   重试第二次,直接 OCR + click_point 视觉路线;OCR 也失败 → 走 osascript 兜底;
+   3 步都失败 → 终止任务返回降级报告,不要循环重试。
+5. **发送消息范式**:
+   - 首选 `chat_send(window_id, text, click_point)` 一调用完成「点击+键入+Enter+OCR 验证」
+   - 次选 control(control_action=type_text_submit, text=完整内容) 一调用完成「点击+键入+Enter 提交」(无 OCR 验证)
+   - 仅当应用把 Enter 定义为换行(如 QQ)时才拆成 type_text + click「发送」
+   - 发送后用 inspect/ocr 复查消息已出现在对话区
+6. **失败重检**:control 报「路径失效/越界」→ 重新 inspect 拿最新路径;
    ocr/screenshot 报窗口 id 错位 → 重新 list 拿新 id;目标名含 Unicode 上标(如 ᴬᴵᴬ)
    时 filter 用 ASCII 归一形(AIA)。
-6. **filter 同义词表**:通讯录/通信录/联系人/Contacts、按钮/Button、
+7. **filter 同义词表**:通讯录/通信录/联系人/Contacts、按钮/Button、
    输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences。
-7. **安全红线**:禁止对支付/删除/发送/确认类按钮做无把握点击,必须点击时在最终
+8. **安全红线**:禁止对支付/删除/发送/确认类按钮做无把握点击,必须点击时在最终
    回答里明确说明点了什么、为什么;只读优先:能 list/inspect/get_text 回答的不操作;
    禁止用 Read 读取 screenshot 产出的 PNG;3 轮无进展立即止损,不要重复相同失败操作。
-8. **Bash 降级路径**(macOS,辅助功能已授权时):启动/激活
-   `osascript -e 'tell application "WeChat" to activate'`;坐标点击 `cliclick c:x,y`;
+9. **Bash 降级路径**(macOS,辅助功能已授权时):启动/激活
+   `osascript -e 'tell application "WeChat" to activate'`;坐标点击 `cliclick c:x,y`
+   (Homebrew 包,缺失时改走 osascript 'click at {x,y}');
    剪贴板 `echo -n "..." | pbcopy` + `osascript -e 'tell application "System Events" to keystroke "v" using command down'`。
+10. **cliclick 缺失兜底**:cliclick 是 Homebrew 包,部分用户没装。cliclick 不存在时:
+    - 物理点击改用 osascript:'tell application "System Events" to click at {x, y}'
+    - 物理键入改用 osascript 'keystroke "字符"' (需要辅助功能授权) 或 pbcopy + Cmd+V
 "#;
 
 // =================== Chromium-WebUse Agent 提示词(第 11 角色,浏览器操控层) ===================

@@ -211,6 +211,113 @@ fn launch_windows_app(app: &str, aliases: &[String]) -> std::result::Result<Stri
     }
 }
 
+// ===================== 2026-09-18 第 85 轮:已知桌面应用 Bundle ID 映射 =====================
+//
+// 背景:`open -a <name>` 在 macOS 上只匹配 CFBundleName,对中文 DisplayName(如"微信")
+// 直接报 `Unable to find application named '微信'`,exit 1。这是本次微信桌面自动化任务
+// 失败的头号根因(llaew_20260918_114507.log 实证:open -a 微信 exit status: 1,后续
+// 3 次重试 928s 全部走降级,从未实际启动微信)。
+//
+// 解决:把"常见中文/英文别名的桌面应用"映射到它们真实的 CFBundleIdentifier,统一走
+// `open -b <bundle_id>` 启动;LLM 仍可只传 query="微信",工具自动查表用 bundle id 启动。
+//
+// 维护来源:Apple Stack Exchange / macadmins Slack / 各厂商官方下载页;
+// 版本变更时如 bundle id 改名,需同步更新本表;新增应用直接追加,无需改调用方。
+const KNOWN_BUNDLE_IDS: &[(&str, &str)] = &[
+    // 微信(macOS 当前主版本 / 历史版本)
+    ("微信", "com.tencent.xinWeChat"),
+    ("wechat", "com.tencent.xinWeChat"),
+    ("WeChat", "com.tencent.xinWeChat"),
+    ("Weixin", "com.tencent.xinWeChat"),
+    ("weixin", "com.tencent.xinWeChat"),
+    // 钉钉
+    ("钉钉", "com.laiwang.DingTalk"),
+    ("DingTalk", "com.laiwang.DingTalk"),
+    ("dingtalk", "com.laiwang.DingTalk"),
+    // 飞书 / Lark
+    ("飞书", "com.bytedance.feishu"),
+    ("Feishu", "com.bytedance.feishu"),
+    ("Lark", "com.bytedance.feishu"),
+    ("lark", "com.bytedance.feishu"),
+    // QQ
+    ("QQ", "com.tencent.qq"),
+    ("qq", "com.tencent.qq"),
+    // 腾讯会议
+    ("腾讯会议", "com.tencent.meeting"),
+    ("TencentMeeting", "com.tencent.meeting"),
+    ("VooV", "com.tencent.meeting"),
+    // 腾讯文档
+    ("腾讯文档", "com.tencent.tdocument"),
+    ("TencentDocs", "com.tencent.tdocument"),
+    // 字节系
+    ("豆包", "com.doubao.mac"),
+    ("Doubao", "com.doubao.mac"),
+    // 网易
+    ("网易云音乐", "com.netease.amp.mac"),
+    ("NetEaseMusic", "com.netease.amp.mac"),
+    // 微软(Mac 版)
+    ("VSCode", "com.microsoft.VSCode"),
+    ("Visual Studio Code", "com.microsoft.VSCode"),
+    ("Edge", "com.microsoft.edgemac"),
+    // 笔记 / 协作
+    ("Notion", "notion.id"),
+    ("Obsidian", "md.obsidian"),
+    ("Slack", "com.tinyspeck.chatlyio"),
+    ("Discord", "com.hnc.Discord"),
+    ("Zoom", "us.zoom.xos"),
+    ("Telegram", "ru.keepcoder.Telegram"),
+    // 系统 / 工具
+    ("Terminal", "com.apple.Terminal"),
+    ("终端", "com.apple.Terminal"),
+    ("Finder", "com.apple.finder"),
+    ("访达", "com.apple.finder"),
+    ("Safari", "com.apple.Safari"),
+    ("System Settings", "com.apple.systempreferences"),
+    ("系统设置", "com.apple.systempreferences"),
+];
+
+/// 在已知 Bundle ID 表里查 query 命中(忽略大小写、全词子串)。
+pub(super) fn lookup_known_bundle_id(query: &str) -> Option<&'static str> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    for (alias, bundle_id) in KNOWN_BUNDLE_IDS {
+        if q.eq_ignore_ascii_case(alias) || q.contains(alias) {
+            return Some(bundle_id);
+        }
+    }
+    None
+}
+
+/// 通过 mdfind 在 Spotlight 元数据里查 kind:application 命中的应用路径。
+///
+/// 兜底:表里没命中且 open -a 失败时,先尝试 mdfind 拿到 .app 完整路径再 open <path>。
+/// mdfind 索引可能为空(Spotlight 关闭或首次启动未完成),失败静默返回 None。
+#[cfg(target_os = "macos")]
+fn mdfind_app_path(query: &str) -> Option<String> {
+    use std::process::Command;
+    let escaped = query.replace('"', "");
+    if escaped.is_empty() {
+        return None;
+    }
+    let output = Command::new("mdfind")
+        .arg(format!("kind:application AND name:\"{escaped}\""))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let p = line.trim();
+        if p.ends_with(".app") && std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
 fn launch_desktop_app(
     app: &str,
     bundle_id: Option<&str>,
@@ -228,7 +335,9 @@ fn launch_desktop_app(
         };
     }
 
-    // macOS / Linux 维持原 open / gtk-launch 路径
+    // macOS / Linux 启动解析链(2026-09-18 第 85 轮 P0-1 强化):
+    // 优先级 a -> b -> c -> d;bundle_id 优先 + 已知映射表 + mdfind 兜底,
+    // 解决 open -a 中文名报 Unable to find application named '微信' 的根本问题。
     #[cfg(not(windows))]
     {
         use std::process::{Command, Stdio};
@@ -239,50 +348,105 @@ fn launch_desktop_app(
                 candidates.push(alias);
             }
         }
-        let mut tried = Vec::new();
-        for candidate in candidates {
-            if !safe_desktop_identifier(&candidate) {
-                return Err(format!("非法应用标识: {candidate:?}"));
-            }
-            let display = if cfg!(target_os = "macos") {
-                bundle_id
-                    .filter(|s| safe_desktop_identifier(s))
-                    .map(|b| format!("open -b {b}"))
-                    .unwrap_or_else(|| format!("open -a {candidate}"))
-            } else {
-                format!("gtk-launch {}", candidate.trim_end_matches(".desktop"))
-            };
 
-            let mut command = if cfg!(target_os = "macos") {
-                let mut c = Command::new("open");
-                if let Some(b) = bundle_id.filter(|s| safe_desktop_identifier(s)) {
-                    c.arg("-b").arg(b);
-                } else {
-                    c.arg("-a").arg(&candidate);
+        // 优先级 a:LLM 显式给了 bundle_id -> 直接 open -b(最高优先级,不走别名)
+        let explicit_bundle = bundle_id
+            .filter(|s| safe_desktop_identifier(s))
+            .map(str::to_string);
+        // 优先级 b:从已知映射表反查(微信 / 钉钉 / 飞书 等)
+        let mut resolved_bundle: Option<String> = explicit_bundle;
+        if resolved_bundle.is_none() {
+            for candidate in &candidates {
+                if let Some(b) = lookup_known_bundle_id(candidate) {
+                    resolved_bundle = Some(b.to_string());
+                    break;
                 }
-                c
-            } else {
-                let mut c = Command::new("gtk-launch");
-                c.arg(candidate.trim_end_matches(".desktop"));
-                c
-            };
-            let status = command
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            tried.push(display);
-            match status {
-                Ok(s) if s.success() => return Ok(tried),
-                Ok(s) => return Err(format!("启动命令退出码异常: {s};已尝试: {tried:?}")),
-                Err(e) if cfg!(target_os = "macos") && tried.len() < 3 => {
-                    let _ = e;
-                    continue;
-                }
-                Err(e) => return Err(format!("无法执行启动命令: {e};已尝试: {tried:?}")),
             }
         }
-        Err("未找到可执行的应用标识".into())
+
+        let mut tried: Vec<String> = Vec::new();
+
+        // 优先级 a/b:open -b(走 Bundle ID;最稳定,绕过中文 DisplayName 匹配问题)
+        if let Some(ref bid) = resolved_bundle {
+            if safe_desktop_identifier(bid) {
+                let display = format!("open -b {bid}");
+                let mut c = Command::new("open");
+                c.arg("-b").arg(bid)
+                    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                match c.status() {
+                    Ok(s) if s.success() => return Ok(vec![display]),
+                    _ => tried.push(display),
+                }
+            }
+        }
+
+        // 优先级 c:open -a 遍历别名(英文优先,中文 DisplayName 一般会失败但试一下无成本)
+        for candidate in &candidates {
+            if !safe_desktop_identifier(candidate) {
+                continue;
+            }
+            let display = format!("open -a {candidate}");
+            let mut c = Command::new("open");
+            c.arg("-a").arg(candidate)
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            match c.status() {
+                Ok(s) if s.success() => {
+                    tried.push(display);
+                    return Ok(tried);
+                }
+                _ => tried.push(display),
+            }
+        }
+
+        // 优先级 d:mdfind 兜底 —— 表里没有 + open -a 失败时,Spotlight 查 .app 路径直接 open <path>
+        #[cfg(target_os = "macos")]
+        {
+            for candidate in &candidates {
+                if let Some(path) = mdfind_app_path(candidate) {
+                    if !safe_desktop_identifier(&path) {
+                        continue;
+                    }
+                    let display = format!("open {path}");
+                    let mut c = Command::new("open");
+                    c.arg(&path)
+                        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                    match c.status() {
+                        Ok(s) if s.success() => {
+                            tried.push(display);
+                            return Ok(tried);
+                        }
+                        _ => tried.push(display),
+                    }
+                    break; // 只取首个命中
+                }
+            }
+        }
+
+        // 优先级 e:Linux gtk-launch 兜底
+        #[cfg(not(target_os = "macos"))]
+        {
+            for candidate in &candidates {
+                if !safe_desktop_identifier(candidate) {
+                    continue;
+                }
+                let display = format!("gtk-launch {}", candidate.trim_end_matches(".desktop"));
+                let mut c = Command::new("gtk-launch");
+                c.arg(candidate.trim_end_matches(".desktop"))
+                    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                match c.status() {
+                    Ok(s) if s.success() => {
+                        tried.push(display);
+                        return Ok(tried);
+                    }
+                    _ => tried.push(display),
+                }
+            }
+        }
+
+        // 全部失败 -> 统一错误文案(让 LLM 下次直接给 bundle_id)
+        Err(format!(
+            "启动 {app:?} 全部失败;已尝试: {tried:?}。建议:1) 在 action=open 时显式传 bundle_id(微信=com.tencent.xinWeChat / 钉钉=com.laiwang.DingTalk / 飞书=com.bytedance.feishu);             2) 用 system_profiler SPApplicationsDataType | grep -B1 -A6 bundle 查真实 bundle id;             3) 手动启动应用后再 action=open 激活。"
+        ))
     }
 }
 

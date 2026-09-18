@@ -25,6 +25,7 @@ use crate::agent::window::{
 };
 use crate::error::{AgentError, Result};
 
+mod chat;
 mod inspect;
 mod open;
 mod query;
@@ -277,21 +278,23 @@ pub struct McpWindowUseTool;
 /// 工具描述:同时承担「使用说明」职责(原 WindowUse Agent 系统提示词的工具部分精炼)。
 const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌面软件(macOS / Windows 桌面 GUI 自动化统一入口,MCP 风格单工具多 action)。
 用 action 参数选择操作:
-- open(query*, app_name?, bundle_id?, wait_seconds?): 启动/激活桌面应用并等待窗口出现,返回 window_id/权限状态/next_action;已运行则恢复前置,不重复启动。支持 WeChat↔微信↔Weixin 等中英文别名。
-- list(filter?): 枚举当前桌面全部可见顶层窗口(id/title/进程名/PID/位置尺寸)。macOS 走 CoreGraphics,不需要辅助功能授权。
+- open(query*, app_name?, bundle_id?, wait_seconds?): 启动/激活桌面应用并等待窗口出现,返回 window_id/权限状态/next_action;已运行则恢复前置,不重复启动。**支持 bundle_id 优先 + WeChat↔微信↔Weixin 等中英文别名**——若 `open -a 微信` 失败,工具会自动查已知映射表走 `open -b com.tencent.xinWeChat` 兜底。
+- list(filter?): 枚举当前桌面全部可见顶层窗口(id/title/进程名/PID/位置尺寸)。macOS 走 CoreGraphics,不需要任何授权。
 - find(query*, match_mode?): 按标题/进程名子串找单一最佳窗口,直接返回 window_id(exact/contains/fuzzy,默认 contains)。
 - inspect(window_id*, max_depth?, filter?): 枚举窗口控件树(Windows UIA / macOS AX),每个控件含 path(如 /0/2/1)/role/name/value/bounds/actions。需要 macOS 辅助功能授权。
 - control(window_id*, path*, control_action*, text?, x?, y?): 对窗口执行操作,双路线——
   控件树路线(原生 UI):path 取 inspect 返回的控件路径,control_action=click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible;
   视觉坐标路线(自绘 UI,如微信 4.x 控件树为空):control_action=click_point/double_click_point/right_click_point/scroll_point/type_text/type_text_submit,x/y 传屏幕绝对坐标(取 ocr 返回的 screen_cx/screen_cy),path 照传 "/"。
-- ocr(window_id*, region?, lang?): 窗口 OCR 文字识别,返回词块文本 + 窗口相对坐标 + 屏幕绝对坐标(视觉路线入口)。需要 macOS 屏幕录制授权。
+- ocr(window_id*, region?, lang?): 窗口 OCR 文字识别,返回词块文本 + 窗口相对坐标 + 屏幕绝对坐标(视觉路线入口)。**macOS 26.5 实测不需要屏幕录制授权**(走 CGImage 数据源 + Vision OCR,不经过 screencapture)。
 - screenshot(window_id?, output_path?, region?): 截图落盘 PNG,返回路径。只做截图不做识别;需要识别文字一律用 ocr。
+- chat_send(window_id*, text*, click_point?, input_field_path?, submit_key?, verify?): **复合 action**——一次调用完成「点击输入框 + Unicode 键入 + Enter + OCR 验证发送」,自动按 WindowCapability 选路线(控件树 / 视觉坐标 / 焦点已对 / 降级提示)。微信/钉钉/飞书 发送消息首选。
+- chat_loop(window_id*, messages*, interval_seconds?, max_rounds?, reply_detect?, stop_on_reply?, target_query?): **复合 action**——长时多轮会话循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent, replies, reply_rate, log}`。LLM 一次调用就能跑 N 轮聊天。
 
-【标准作业顺序】open(应用未启动)→ find/list(定位 window_id)→ inspect 或 ocr(理解界面)→ control(操作)→ inspect/ocr 复查。open 已返回 window_id 时直接复用,不要重复启动。
+【标准作业顺序】open(应用未启动)→ find/list(定位 window_id)→ inspect 或 ocr(理解界面)→ control/chat_send(操作)→ inspect/ocr 复查 / chat_loop(批量会话)。
 【双路线决策】inspect 控件树为空/只有少量 Pane(自绘 UI / Electron canvas)时立即切换视觉路线 ocr + click_point/type_text_submit,不要反复重试 inspect。
-【权限矩阵(macOS)】辅助功能未授权 → 仅 open/list/find 可用,inspect/control/ocr/screenshot 一次都不要试,直接告知用户授权步骤;辅助功能✅+屏幕录制❌ → inspect/control 主路线完整可用,仅 ocr/screenshot 不可用,坐标用窗口 bounds 比例估算。
+【权限矩阵(macOS)】辅助功能未授权 → 仅 open/list/find 可用,inspect/control/chat_send(无 click_point) 一次都不要试,直接告知用户授权步骤;辅助功能✅+屏幕录制❌ → inspect/control 主路线完整可用,ocr/screenshot 走 CGWindow(无需屏录),坐标用窗口 bounds 比例估算。
 【filter 失败同义词表】通讯录/通信录/联系人/Contacts、按钮/Button、输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences;目标名含 Unicode 上标(如 ᴬᴵᴬ)时用 ASCII 归一形(AIA)。
-【发送消息范式】首选 control(control_action=type_text_submit, text=完整内容) 一调用完成「点击输入框+键入+Enter 提交」;仅当应用把 Enter 定义为换行时才拆成 type_text + click「发送」。
+【发送消息范式】首选 chat_send(window_id, text, click_point) 一调用完成「点击输入框+键入+Enter+OCR 验证」;其次 control(control_action=type_text_submit, text=完整内容) 一调用完成「点击输入框+键入+Enter 提交」(无 OCR 验证);仅当应用把 Enter 定义为换行时才拆成 type_text + click「发送」。
 【安全红线】禁止对支付/删除/发送/确认类按钮做无把握点击,必须点击时在最终回答说明点了什么、为什么;只读优先:能 list/inspect/get_text 回答的不操作;禁止用 Read 读取 screenshot 产出的 PNG;3 轮无进展立即止损,不要重复相同失败操作。"#;
 
 #[async_trait]
@@ -310,16 +313,16 @@ impl Tool for McpWindowUseTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot"],
-                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图)"
+                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "chat_send", "chat_loop"],
+                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环)"
                 },
                 "query": { "type": "string", "description": "open/find 必填:应用名或窗口标题/进程名查询词(大小写不敏感,支持中英文别名)" },
                 "app_name": { "type": "string", "description": "open 可选:启动用应用名或完整路径,缺省=query" },
-                "bundle_id": { "type": "string", "description": "open 可选:macOS Bundle ID(open -b 启动)" },
+                "bundle_id": { "type": "string", "description": "open 可选:macOS Bundle ID(open -b 启动;第 85 轮起 query='微信' 会自动用 KNOWN_BUNDLE_IDS 映射)" },
                 "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30, "description": "open 可选:启动后等待窗口出现秒数,默认 10" },
                 "filter": { "type": "string", "description": "list/inspect 可选:窗口标题/进程名或控件名/角色子串过滤" },
                 "match_mode": { "type": "string", "enum": ["exact", "contains", "fuzzy"], "description": "find 可选:匹配模式,默认 contains" },
-                "window_id": { "type": "string", "description": "inspect/control/ocr/screenshot 必填:open/list/find 返回的窗口 id" },
+                "window_id": { "type": "string", "description": "inspect/control/ocr/screenshot/chat_send/chat_loop 必填:open/list/find 返回的窗口 id" },
                 "path": { "type": "string", "description": "control 必填:控件路径(如 /0/2/1;\"/\" 表示窗口本身,坐标动作照传)" },
                 "max_depth": { "type": "integer", "minimum": 1, "maximum": 12, "description": "inspect 可选:控件树遍历深度,默认 3" },
                 "control_action": {
@@ -330,7 +333,7 @@ impl Tool for McpWindowUseTool {
                     ],
                     "description": "control 必填:控件树路线(click/set_text/get_text/send_keys/scroll 等)或视觉坐标路线(click_point/type_text_submit 等)"
                 },
-                "text": { "type": "string", "description": "control 可选:set_text/send_keys/type_text/type_text_submit 的文本;scroll/scroll_point 传方向行数(如 \"down:3\")" },
+                "text": { "type": "string", "description": "control/chat_send 必填:set_text/send_keys/type_text/type_text_submit/chat_send 的文本;scroll/scroll_point 传方向行数(如 \"down:3\")" },
                 "x": { "type": "integer", "description": "control 坐标动作必填:屏幕绝对 X(取 ocr 返回的 screen_cx 中心)" },
                 "y": { "type": "integer", "description": "control 坐标动作必填:屏幕绝对 Y(取 ocr 返回的 screen_cy 中心)" },
                 "region": {
@@ -345,7 +348,30 @@ impl Tool for McpWindowUseTool {
                     "description": "ocr/screenshot 可选:窗口相对区域(物理像素)"
                 },
                 "lang": { "type": "string", "description": "ocr 可选:BCP-47 语言标签,默认系统语言" },
-                "output_path": { "type": "string", "description": "screenshot 可选:输出 PNG 路径,默认临时目录" }
+                "output_path": { "type": "string", "description": "screenshot 可选:输出 PNG 路径,默认临时目录" },
+                "click_point": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer" },
+                        "y": { "type": "integer" }
+                    },
+                    "required": ["x", "y"],
+                    "description": "chat_send 可选:视觉路线输入框中心坐标(取 action=ocr 返回的 screen_cx/screen_cy)"
+                },
+                "input_field_path": { "type": "string", "description": "chat_send 可选:控件树路线输入框路径(取 action=inspect)" },
+                "submit_key": { "type": "string", "description": "chat_send 可选:提交键名,默认 enter(微信/钉钉);QQ/部分 App 用 cmd+enter" },
+                "verify": { "type": "boolean", "description": "chat_send 可选:发送后是否 OCR 验证上屏,默认 true" },
+                "verify_timeout_ms": { "type": "integer", "minimum": 50, "maximum": 5000, "description": "chat_send 可选:发送后等多久开始 OCR 验证,默认 250ms" },
+                "messages": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "chat_loop 必填:按顺序发送的消息字符串数组"
+                },
+                "interval_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "chat_loop 可选:每两条消息间隔秒数,默认 30" },
+                "max_rounds": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "chat_loop 可选:最大发送条数,默认 30(防阻塞)" },
+                "reply_detect": { "type": "boolean", "description": "chat_loop 可选:每条发完后 OCR 检测右侧是否出现对方消息,默认 true" },
+                "stop_on_reply": { "type": "boolean", "description": "chat_loop 可选:对方回复后立即停下,默认 false" },
+                "target_query": { "type": "string", "description": "chat_loop 可选:对话对象名字,用于 OCR 检测对方回复" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -362,10 +388,14 @@ impl Tool for McpWindowUseTool {
             "control" => inspect::run_control(args).await,
             "ocr" => vision::run_ocr(args).await,
             "screenshot" => vision::run_screenshot(args).await,
+            // 2026-09-18 第 85 轮:复合 action(把点击+键入+提交+验证封装成 1 次调用,
+            // 把长时多轮会话循环封装成 1 次工具调用)。
+            "chat_send" => chat::run_chat_send(args).await,
+            "chat_loop" => chat::run_chat_loop(args).await,
             other => Err(tool_err(
                 self.name(),
                 format!(
-                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot"
+                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / chat_send / chat_loop"
                 ),
             )),
         }
