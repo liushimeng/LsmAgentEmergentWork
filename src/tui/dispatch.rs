@@ -226,6 +226,13 @@ impl TuiSession {
                                     };
                                     println!("  [stage] {pending}{timing}");
                                     last_stage_at = Some(std::time::Instant::now());
+                                    // 2026-09-18 第 88 轮:即时冲刷分支也要推进 current_stage,
+                                    // 否则 waiting 心跳一直显示更早的旧阶段名
+                                    // (实测 SubAgent 执行 550s,spinner 仍显示「Main-Work 拆解中…」)。
+                                    current_stage = Some((
+                                        short_stage_label(&pending),
+                                        std::time::Instant::now(),
+                                    ));
                                 }
                                 let timing = if let Some(last) = last_stage_at {
                                     let delta_ms = last.elapsed().as_millis();

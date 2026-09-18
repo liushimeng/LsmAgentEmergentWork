@@ -280,7 +280,12 @@ pub fn format_task_result(
                         } else if tc.tool == "MCP_Window_Use"
                             && !tc.output_summary.trim().is_empty()
                         {
-                            Some(truncate_chars(&tc.output_summary, 80))
+                            // 第 88 轮:优先提取 route/verified/rounds/exit_code 等
+                            // 关键字段,解析失败回退原文截断。
+                            Some(
+                                super::format_brief::window_use_output_brief(&tc.output_summary)
+                                    .unwrap_or_else(|| truncate_chars(&tc.output_summary, 80)),
+                            )
                         } else {
                             None
                         };
@@ -564,7 +569,12 @@ pub fn format_failed_detail(
                         } else if tc.tool == "MCP_Window_Use"
                             && !tc.output_summary.trim().is_empty()
                         {
-                            Some(truncate_chars(&tc.output_summary, 80))
+                            // 第 88 轮:优先提取 route/verified/rounds/exit_code 等
+                            // 关键字段,解析失败回退原文截断。
+                            Some(
+                                super::format_brief::window_use_output_brief(&tc.output_summary)
+                                    .unwrap_or_else(|| truncate_chars(&tc.output_summary, 80)),
+                            )
                         } else {
                             None
                         };
@@ -864,6 +874,7 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
         }
         "MCP_Window_Use" => {
             // 2026-09-18 第 84 轮:窗口操控统一入口,突出 action + 定位要素
+            // 第 88 轮:chat_send/chat_loop 附消息摘录,osascript_run 附脚本首行
             let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
             let wid = extract_json_field(args_json, "window_id").unwrap_or_default();
             let query = extract_json_field(args_json, "query").unwrap_or_default();
@@ -884,6 +895,29 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
                 if !path.is_empty() && path != "/" {
                     brief.push_str(&format!(" path={}", truncate_chars(&path, 12)));
                 }
+            }
+            match action.as_str() {
+                "chat_send" => {
+                    if let Some(text) = extract_json_field(args_json, "text") {
+                        brief.push_str(&format!(" text=\"{}\"", truncate_chars(&text, 20)));
+                    }
+                }
+                "chat_loop" => {
+                    let n = serde_json::from_str::<serde_json::Value>(args_json)
+                        .ok()
+                        .and_then(|v| v.get("messages")?.as_array().map(|a| a.len()))
+                        .unwrap_or(0);
+                    if n > 0 {
+                        brief.push_str(&format!(" msgs={n}"));
+                    }
+                }
+                "osascript_run" => {
+                    if let Some(script) = extract_json_field(args_json, "osascript_script") {
+                        let first = script.lines().next().unwrap_or("");
+                        brief.push_str(&format!(" script=\"{}\"", truncate_chars(first, 28)));
+                    }
+                }
+                _ => {}
             }
             brief
         }
@@ -974,6 +1008,9 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
     }
     Some(parts.join(" "))
 }
+
+// 第 88 轮:本文件已达 1700+ 临界线,新增的工具输出摘要函数(window_use_output_brief)
+// 落到职责子模块 `format_brief.rs`(见 tui/mod.rs 模块注册)。
 
 /// 极简 JSON 字段提取 —— 仅支持 string 值,无需 serde 完整解析。
 ///

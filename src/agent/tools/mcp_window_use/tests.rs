@@ -599,3 +599,72 @@ fn infer_app_name_from_process_chinese_aliases() {
     assert_eq!(infer_app_name_from_process("飞书").as_deref(), Some("Lark"));
     assert_eq!(infer_app_name_from_process("Finder"), None);
 }
+
+// ===================== 2026-09-18 第 88 轮 =====================
+
+#[test]
+fn estimate_input_point_right_bottom_region() {
+    // 主流 IM 主界面输入框比例估算:右 72% 宽 × 下 88% 高(微信 4.x 实测布局)。
+    use super::chat::estimate_input_point;
+    let bounds = crate::agent::window::Rect {
+        x: 1602,
+        y: 822,
+        width: 1541,
+        height: 923,
+    };
+    let (px, py) = estimate_input_point(&bounds);
+    assert!(px > bounds.x + bounds.width / 2, "必须在右半区: {px}");
+    assert!(py > bounds.y + bounds.height / 2, "必须在下半区: {py}");
+    assert!(px < bounds.x + bounds.width, "不得超出窗口右缘");
+    assert!(py < bounds.y + bounds.height, "不得超出窗口下缘");
+    assert_eq!(px, 1602 + (1541.0 * 0.72) as i64);
+    assert_eq!(py, 822 + (923.0 * 0.88) as i64);
+}
+
+#[test]
+fn escape_applescript_string_escapes_quotes_and_backslash() {
+    use super::chat::escape_applescript_string;
+    assert_eq!(escape_applescript_string("a\"b"), "a\\\"b");
+    assert_eq!(escape_applescript_string("a\\b"), "a\\\\b");
+    assert_eq!(escape_applescript_string("微信"), "微信");
+}
+
+/// 第 88 轮 P0-1 回归:osascript 经 argv 直传(不经 shell),脚本内双引号
+/// 不再被 `\\\"` 腐蚀;多行 tell 块 + `return` 正常执行,非零退出真实上报。
+#[cfg(target_os = "macos")]
+#[test]
+fn osascript_exec_argv_direct_no_shell_quoting() {
+    use super::chat::osascript_exec;
+    // 成功路径:脚本内双引号原样生效(旧 shell 包裹实现必败,-2741)
+    let ok = osascript_exec("return 42", 5000).unwrap();
+    assert!(ok.ok, "return 42 应成功: {:?}", ok);
+    assert_eq!(ok.exit_code, 0);
+    assert_eq!(ok.stdout, "42");
+    // 多行 tell 块(含双引号)编译通过即可,不要求执行成功语义
+    let multi = osascript_exec("tell application \"Finder\"\nend tell\nreturn 7", 5000)
+        .unwrap();
+    assert!(multi.ok, "多行 tell 块应正常执行: {:?}", multi);
+    assert_eq!(multi.stdout, "7");
+    // 失败路径:语法错误 → ok=false + 非零 exit_code + stderr 非空(不再静默)
+    let bad = osascript_exec("this is not applescript", 5000).unwrap();
+    assert!(!bad.ok, "非法脚本必须 ok=false");
+    assert_ne!(bad.exit_code, 0);
+    assert!(!bad.stderr.is_empty(), "stderr 必须有 AppleScript 报错原文");
+    assert!(!bad.timed_out);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn osascript_exec_timeout_kills_child() {
+    use super::chat::osascript_exec;
+    // 明显超过 timeout 的 delay → timed_out=true(快速返回,不真等 30s)
+    let started = std::time::Instant::now();
+    let out = osascript_exec("delay 30", 1200).unwrap();
+    assert!(out.timed_out, "超时脚本必须 timed_out: {:?}", out);
+    assert!(!out.ok);
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "超时 kill 应快速返回,实际 {:?}",
+        started.elapsed()
+    );
+}

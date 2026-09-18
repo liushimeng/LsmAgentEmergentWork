@@ -23,9 +23,8 @@ use serde_json::{json, Value};
 use super::{
     driver_preflight, get_str, require_str, run_blocking, tool_err, Tool, MCP_WINDOW_USE_TOOL_NAME,
 };
-use crate::agent::tools::bash::BashTool;
 use crate::agent::window::{current_driver, probe_capability, Rect};
-use crate::error::Result;
+use crate::error::{AgentError, Result};
 
 // ===================== chat_send 参数与默认值 =====================
 
@@ -188,9 +187,10 @@ pub(super) async fn run_capability_probe(_args: Value) -> Result<String> {
     let next_action = if cap.ocr_screenshot_cgwindow {
         "全权限:inspect / ocr / screenshot / chat_send(visual) / chat_loop 全路线可用"
     } else if cap.inspect_control || cap.coordinate_input {
-        "AX 已授权但屏录未授权:inspect/control 主路线完整可用;ocr/screenshot 不可用;\
-         chat_send 将走 visual_no_input/auto* 路线(无 OCR 验证);\
-         自绘 UI(微信 4.x / 飞书 / 钉钉)建议直接走 osascript_fallback。"
+        "AX 已授权但屏录未授权:inspect/control 主路线完整可用;ocr/screenshot 不可用\
+         (CGWindow 按窗口截取同样走 TCC 屏录门控,禁止重试);\
+         聊天发送首选 chat_send —— macOS 无 click_point/input_field_path 时自动走\
+         osascript_fallback 路线(activate + 前台守卫 + 输入框定位点击 + keystroke)。"
     } else if ax_available {
         "AX 已授权 + 屏录未授权 + 无坐标输入:直接走 MCP_Window_Use(action=chat_send, ..., chat_log_path=...) 用 osascript_fallback 路线发送,或 action=chat_loop 一次跑 N 轮。\
          screen_recording 授权路径:系统设置 → 隐私与安全性 → 屏幕录制 → 勾选宿主终端 → 完全退出并重启终端。"
@@ -219,7 +219,10 @@ pub(super) async fn run_capability_probe(_args: Value) -> Result<String> {
         },
         "capability_tag": cap.tag(),
         "next_action_hint": cap.next_action_hint(),
-        "fallback_available": ax_available && !cap.coordinate_input,
+        // 第 88 轮语义修正:osascript_fallback 路线可用性(System Events keystroke 只需
+        // AX 授权,与 coordinate_input 无关;旧写法 ax && !coord 在 AX✅+coord✅ 时报
+        // false,但 chat_send 实际仍选 osascript_fallback,自相矛盾)。
+        "osascript_fallback_available": ax_available,
         "recommended_route": recommended_route,
         "next_action": next_action,
         "hard_constraint": if cap.ocr_screenshot_cgwindow {
@@ -233,11 +236,95 @@ pub(super) async fn run_capability_probe(_args: Value) -> Result<String> {
 
 // ===================== osascript_run(第 86 轮新增) =====================
 
+// ===================== osascript 执行底座(2026-09-18 第 88 轮重写) =====================
+//
+// 历史教训(第 86/87 轮实现,llaew_20260918_151628.log 实证):
+// 旧实现把脚本包进 shell 单引号 `osascript -e '<script>'` 且预先
+// `.replace('"', "\\\"")` —— 单引号内 `\"` 原样保留,AppleScript 收到
+// `tell application \"WeChat\" …` 直接语法错误 -2741,三调三败;
+// 且 BashTool 对非零退出码仍返回 Ok(`<exit_code>1</exit_code>` 埋在 stdout),
+// ok:true 假成功把 LLM 推向 BashTool 绕行(违反「窗口操控全程 MCP_Window_Use」约束)。
+//
+// 第 88 轮根治:不经 shell,`Command::new("osascript").arg("-e").arg(script)`
+// argv 直传(脚本里可自由写双引号/反斜杠/多行 tell 块);真实 exit_code +
+// 独立 stderr;try_wait 轮询 + 超时 kill。
+
+/// osascript 一次执行的结构化结果。
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub(super) struct OsascriptOutcome {
+    /// 退出码为 0。
+    pub ok: bool,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// 是否因超时被杀。
+    pub timed_out: bool,
+}
+
+/// 直接执行 AppleScript 片段(argv 直传,不经 shell;macOS only)。
+///
+/// 多行脚本整体作为一个 `-e` 参数传入(osascript 会把所有 -e 拼接编译,
+/// 单个含换行的 -e 合法)。超时(默认 5s)后 kill 子进程并返回 timed_out。
+#[cfg(target_os = "macos")]
+pub(super) fn osascript_exec(script: &str, timeout_ms: u64) -> Result<OsascriptOutcome> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| tool_err(MCP_WINDOW_USE_TOOL_NAME, format!("spawn osascript 失败: {e}")))?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(500));
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                // 进程已退出,wait_with_output 立即返回并收干管道
+                let out = child.wait_with_output().map_err(|e| {
+                    tool_err(MCP_WINDOW_USE_TOOL_NAME, format!("回收 osascript 输出失败: {e}"))
+                })?;
+                let code = out.status.code().unwrap_or(-1);
+                return Ok(OsascriptOutcome {
+                    ok: out.status.success(),
+                    exit_code: code,
+                    stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    timed_out: false,
+                });
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(OsascriptOutcome {
+                        ok: false,
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: format!("osascript 执行超时({}ms),已 kill", timeout_ms),
+                        timed_out: true,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(tool_err(
+                    MCP_WINDOW_USE_TOOL_NAME,
+                    format!("等待 osascript 退出失败: {e}"),
+                ));
+            }
+        }
+    }
+}
+
 /// `action=osascript_run` —— 直接执行 AppleScript 片段,绕开 BashTool 白名单。
 ///
 /// macOS only;Windows 上返回结构化错误。
 /// 参数:
-/// - `osascript_script` *(必填)*:AppleScript 字符串(将被 `osascript -e '<script>'` 包裹)
+/// - `osascript_script` *(必填)*:AppleScript 字符串(第 88 轮起 argv 直传 osascript,
+///   不经 shell;脚本内双引号/反斜杠/多行 tell 块原样生效)
 /// - `osascript_timeout_ms` *(可选)*:默认 5000ms
 pub(super) async fn run_osascript_run(args: Value) -> Result<String> {
     let script = require_str(&args, "osascript_script", MCP_WINDOW_USE_TOOL_NAME)?.to_string();
@@ -249,6 +336,7 @@ pub(super) async fn run_osascript_run(args: Value) -> Result<String> {
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = (script, timeout_ms);
         return Err(tool_err(
             MCP_WINDOW_USE_TOOL_NAME,
             "osascript_run 仅 macOS 可用;Windows/Linux 请改用 control / PowerShell / BashTool",
@@ -257,34 +345,32 @@ pub(super) async fn run_osascript_run(args: Value) -> Result<String> {
 
     #[cfg(target_os = "macos")]
     {
-        let escaped = script
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\'', "'\\''");
-        let command = format!("osascript -e '{}'", escaped);
-        let bash = BashTool;
-        let result = bash
-            .execute(json!({
-                "command": command,
-                "timeout_ms": timeout_ms,
-            }))
-            .await;
-        let body = match result {
-            Ok(output) => json!({
+        // osascript_exec 自带 try_wait 轮询 + 超时 kill,直接调用
+        // (本模块 async 上下文已有 std::thread::sleep 先例;最长阻塞 = timeout_ms)。
+        let outcome = osascript_exec(&script, timeout_ms)?;
+        let body = if outcome.ok {
+            json!({
                 "ok": true,
-                "stdout": output,
-                "stderr": "",
-                "command": command,
-                "next_action": "AppleScript 已执行;如需进一步操作,继续 osascript_run 或 chat_send"
-            }),
-            Err(e) => json!({
+                "exit_code": outcome.exit_code,
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+                "engine": "osascript -e <argv 直传,不经 shell>(第 88 轮)",
+                "next_action": "AppleScript 已执行成功;如需进一步操作,继续 osascript_run 或 chat_send"
+            })
+        } else {
+            json!({
                 "ok": false,
-                "error": e.to_string(),
-                "command": command,
-                "next_action": "AppleScript 执行失败;若提示辅助功能未授权,请到系统设置 → 隐私与安全性 → 辅助功能 勾选宿主终端"
-            }),
+                "exit_code": outcome.exit_code,
+                "timed_out": outcome.timed_out,
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+                "engine": "osascript -e <argv 直传,不经 shell>(第 88 轮)",
+                "next_action": "AppleScript 执行失败(见 stderr 原文)。先按 stderr 修正脚本后用 osascript_run 重试;\
+                                禁止改用 BashTool 执行 osascript 绕行(窗口操控必须全程 MCP_Window_Use);\
+                                若提示辅助功能未授权(-1719/-1743),请到 系统设置 → 隐私与安全性 → 辅助功能 勾选宿主终端"
+            })
         };
-        Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
+        return Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()));
     }
 }
 
@@ -361,7 +447,46 @@ pub(super) async fn run_chat_send(args: Value) -> Result<String> {
     let route_for_body = route.to_string();
     let cap_tag_for_body = cap.tag();
 
-    // 执行阶段(osascript_fallback 走 BashTool;其余走 driver)
+    // 第 88 轮:前台焦点守卫 —— 所有非降级路线执行前先把目标窗口带到前台并轮询
+    // 确认;拿不到前台立即结构化报错,**不盲打**(System Events keystroke / CGEvent
+    // 都投递到当前焦点应用,旧实现无校验,用户切窗后消息会打进别的软件)。
+    let mut frontmost_state: Option<FrontmostState> = None;
+    if route != "degraded_no_op" {
+        let guard = ensure_frontmost(&window_id).await?;
+        if !guard.frontmost {
+            append_chat_log(
+                &chat_log_path,
+                &format_chat_log_line(
+                    now_unix(),
+                    "FAIL",
+                    &format!(
+                        "window_id={window_id} text=\"{}\" route={route} stage=focus_acquire error=窗口 {}ms 内未前台",
+                        truncate_for_log(&text, 80),
+                        guard.elapsed_ms
+                    ),
+                ),
+            );
+            let body = json!({
+                "ok": false,
+                "window_id": window_id,
+                "route": route_for_body,
+                "capability": cap_tag_for_body,
+                "stage": "focus_acquire",
+                "frontmost_acquired": false,
+                "chat_log_path": chat_log_path,
+                "error": format!(
+                    "窗口前置后 {}ms 内仍未前台(轮询 {} 次);用户可能正在操作其他窗口,\
+                     已放弃本次发送防止误输入到其他软件",
+                    guard.elapsed_ms, guard.attempts
+                ),
+                "next_action": "前台守卫未通过,本次未发送;可稍后重试 chat_send,或 action=open 重新激活目标窗口后再发"
+            });
+            return Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()));
+        }
+        frontmost_state = Some(guard);
+    }
+
+    // 执行阶段(osascript_fallback 走 osascript_exec argv 直传;其余走 driver)
     let exec_result: Result<String> = if route == "osascript_fallback" {
         run_osascript_fallback_send(&window_id, &text, &submit_key, &chat_log_path).await
     } else {
@@ -427,11 +552,14 @@ pub(super) async fn run_chat_send(args: Value) -> Result<String> {
         "route": route_for_body,
         "capability": cap_tag_for_body,
         "verified": verified,
+        "frontmost_acquired": frontmost_state.map(|g| g.frontmost),
+        "focus_acquire_ms": frontmost_state.map(|g| g.elapsed_ms),
         "chat_log_path": chat_log_path,
         "next_action": if verified {
             format!("已发送并 OCR 验证:{} 字符已在右侧对话显示框出现", text.chars().count())
         } else {
-            "已发送(verified=false:可能 OCR 未识别 / 文本过短 / 窗口焦点丢失 / 走的是 osascript_fallback 路线无需 OCR);可继续下一条或 chat_loop".to_string()
+            "已发送(verified=false:可能 OCR 未识别 / 文本过短 / 走的是 osascript_fallback 路线无需 OCR;\
+             前台守卫已通过,消息投递到目标窗口);可继续下一条或 chat_loop".to_string()
         }
     });
     Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
@@ -514,14 +642,107 @@ async fn run_driver_send(
     .await
 }
 
-/// 第 86 轮新增:走 osascript System Events 的发送实现。
+// ===================== 前台焦点守卫 + 输入框定位(2026-09-18 第 88 轮新增) =====================
+//
+// 用户实测痛点(llaew_20260918_151628.log + 现场反馈):
+// - 「用户切换软件到其他窗口,输入的信息还是一样的」——System Events keystroke /
+//   CGEvent 键入都投递到**当前焦点应用**,旧实现只在发送开头 activate 一次,
+//   30s 间隔内用户切窗 → 后续消息全部打进别的应用;
+// - 「看不到聊天窗口」——窗口未真正前置/未恢复最小化,且焦点未知时盲打。
+//
+// 对策:所有 chat_send 路线执行前 ensure_frontmost(bring_to_front + 轮询确认),
+// 拿不到前台就结构化报错不盲打;fallback 路线在 keystroke 前再用窗口 bounds
+// 比例估算点击输入框聚焦。
+
+/// ensure_frontmost 轮询确认窗口前台的超时(毫秒)。
+const FRONTMOST_TIMEOUT_MS: u64 = 1500;
+/// ensure_frontmost 轮询间隔(毫秒)。
+const FRONTMOST_POLL_MS: u64 = 150;
+
+/// 前台确认结果(供应答体与日志观测)。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FrontmostState {
+    /// 最终是否前台。
+    pub frontmost: bool,
+    /// 轮询次数。
+    pub attempts: u32,
+    pub elapsed_ms: u64,
+}
+
+/// 把窗口带到前台并轮询确认(跨平台走 WindowDriver trait)。
 ///
-/// 步骤:
-/// 1. `osascript -e 'tell application "<App>" to activate'`
-/// 2. 等 200ms(微信 runloop 拿焦点)
-/// 3. `osascript -e 'tell application "System Events" to keystroke "<text>" as Unicode text'`
-/// 4. 等 120ms
-/// 5. `osascript -e 'tell application "System Events" to key code 36'` (Return)
+/// macOS = AXRaise + System Events frontmost;Windows = SetForegroundWindow 系;
+/// fallback 平台 is_frontmost 默认 false、bring_to_front 默认 no-op ——
+/// 为避免 Linux 误阻断,平台不支持真实前台探测时超时放行(frontmost=true 返回)。
+/// (本模块 async 上下文已有 std::thread::sleep 先例;最长阻塞 = FRONTMOST_TIMEOUT_MS)
+pub(super) async fn ensure_frontmost(window_id: &str) -> Result<FrontmostState> {
+    let driver = current_driver();
+    let started = std::time::Instant::now();
+    let mut attempts = 0u32;
+    // 先幂等前置一次(已前台时 bring_to_front 内部直接返回)
+    let _ = driver.bring_to_front(window_id);
+    loop {
+        attempts += 1;
+        if driver.is_frontmost(window_id) {
+            return Ok(FrontmostState {
+                frontmost: true,
+                attempts,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+        if started.elapsed().as_millis() as u64 >= FRONTMOST_TIMEOUT_MS {
+            // 平台不支持前台探测(fallback 默认恒 false)时放行,避免误阻断;
+            // macOS / Windows 实现了真实探测,超时即判定失败。
+            let supported = cfg!(any(target_os = "macos", windows));
+            return Ok(FrontmostState {
+                frontmost: !supported,
+                attempts,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(FRONTMOST_POLL_MS)).await;
+    }
+}
+
+/// 主流 IM(微信/钉钉/飞书/QQ)主界面输入框的比例估算坐标:
+/// 右侧会话区下部 —— x = 左 + 72% 宽,y = 上 + 88% 高(微信 4.x 实测布局吻合)。
+/// 返回屏幕绝对坐标。
+pub(super) fn estimate_input_point(bounds: &Rect) -> (i64, i64) {
+    (
+        bounds.x + (bounds.width as f64 * 0.72) as i64,
+        bounds.y + (bounds.height as f64 * 0.88) as i64,
+    )
+}
+
+/// window_id → 最新 WindowInfo(list_windows 现查,保证 bounds 新鲜)。
+fn lookup_window_info(window_id: &str) -> Result<crate::agent::window::WindowInfo> {
+    let driver = current_driver();
+    driver
+        .list_windows(None)?
+        .into_iter()
+        .find(|w| w.id == window_id)
+        .ok_or_else(|| {
+            tool_err(
+                MCP_WINDOW_USE_TOOL_NAME,
+                format!(
+                    "window_id={window_id} 不在当前可见窗口列表(可能已关闭/最小化/切到托盘);\
+                     请先 action=list 或 action=open 重新定位"
+                ),
+            )
+        })
+}
+
+/// 第 86 轮新增 / 第 88 轮重写:走 osascript System Events 的发送实现。
+///
+/// 第 88 轮改动(根治实测三连败 + 焦点漂移):
+/// 1. 全部经 [`osascript_exec`] argv 直传(不经 shell,无引号腐蚀;真实 exit_code);
+/// 2. 发送前 ensure_frontmost 前台守卫(拿不到前台 → 结构化报错,不盲打);
+/// 3. keystroke 前按窗口 bounds 比例估算**点击输入框聚焦**(coordinate_input 可用时),
+///    消除「会话切换后焦点不在输入框」的盲打;
+/// 4. keystroke 后二次校验 frontmost,丢失则落盘 [FOCUS_LOST] + 重激活重试一次。
+///
+/// 步骤:activate(osascript)→ ensure_frontmost → click 输入框(CGEvent)
+/// → keystroke(Unicode)→ frontmost 复检 → key code 36 (Return)。
 async fn run_osascript_fallback_send(
     window_id: &str,
     text: &str,
@@ -535,68 +756,111 @@ async fn run_osascript_fallback_send(
         .unwrap_or_else(|| "WeChat".to_string());
     let ts0 = now_unix();
 
-    // 1. activate
-    let activate_script = format!("tell application \"{app_name}\" to activate");
-    let activate_cmd = format!(
-        "osascript -e '{}'",
-        activate_script.replace('\'', "'\\''")
-    );
-    if let Err(e) = BashTool
-        .execute(json!({
-            "command": activate_cmd,
-            "timeout_ms": 5000,
-        }))
-        .await
-    {
-        append_chat_log(
-            chat_log_path,
-            &format_chat_log_line(
-                ts0,
-                "FAIL",
-                &format!(
-                    "window_id={window_id} text=\"{}\" route=osascript_fallback stage=activate error={}",
-                    truncate_for_log(text, 80),
-                    e
-                ),
-            ),
-        );
-        return Err(e);
-    }
-    std::thread::sleep(Duration::from_millis(200));
-
-    // 2. keystroke (Unicode 中文走 "as Unicode text")
-    let keystroke_script = format!(
-        "tell application \"System Events\" to keystroke \"{}\" as Unicode text",
-        escape_applescript_string(text)
-    );
-    let keystroke_cmd = format!(
-        "osascript -e '{}'",
-        keystroke_script.replace('\'', "'\\''")
-    );
-    if let Err(e) = BashTool
-        .execute(json!({
-            "command": keystroke_cmd,
-            "timeout_ms": 15000,
-        }))
-        .await
-    {
+    let fail = |stage: &str, err: &str| -> AgentError {
         append_chat_log(
             chat_log_path,
             &format_chat_log_line(
                 now_unix(),
                 "FAIL",
                 &format!(
-                    "window_id={window_id} text=\"{}\" route=osascript_fallback stage=keystroke error={}",
+                    "window_id={window_id} text=\"{}\" route=osascript_fallback stage={stage} error={}",
                     truncate_for_log(text, 80),
-                    e
+                    err
                 ),
             ),
         );
-        return Err(e);
+        tool_err(
+            MCP_WINDOW_USE_TOOL_NAME,
+            format!("osascript_fallback {stage} 失败: {err}"),
+        )
+    };
+
+    // 1. activate(恢复最小化 + 提到前台;Apple Events 不受 AX 门禁)
+    let activate = osascript_exec(
+        &format!("tell application \"{}\" to activate", escape_applescript_string(&app_name)),
+        5000,
+    )?;
+    if !activate.ok {
+        return Err(fail("activate", &activate.stderr));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // 2. 前台守卫:拿不到前台就不盲打(用户可能正操作其他窗口)
+    let guard = ensure_frontmost(window_id).await?;
+    if !guard.frontmost {
+        return Err(fail(
+            "focus_acquire",
+            &format!(
+                "activate 后 {}ms 内窗口仍未前台(轮询 {} 次);用户可能正在操作其他窗口,\
+                 已放弃本次发送防止误输入;请稍后重试或提醒用户不要切换窗口",
+                guard.elapsed_ms, guard.attempts
+            ),
+        ));
+    }
+
+    // 3. 点击输入框聚焦(coordinate_input 可用时;失败降级 warn 不阻断)
+    let cap = probe_capability();
+    if cap.coordinate_input {
+        let wid = window_id.to_string();
+        let click_res = run_blocking(MCP_WINDOW_USE_TOOL_NAME, move || {
+            let info = lookup_window_info(&wid)?;
+            let (px, py) = estimate_input_point(&info.bounds);
+            current_driver().act(
+                &wid,
+                "/",
+                crate::agent::window::ControlAction::ClickPoint { x: px, y: py },
+            )?;
+            Ok(format!("{px},{py}"))
+        })
+        .await;
+        match click_res {
+            Ok(pt) => {
+                tracing::debug!(point = %pt, "osascript_fallback 输入框聚焦点击完成");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "osascript_fallback 输入框聚焦点击失败(降级继续 keystroke)");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(CHAT_SEND_TYPE_DELAY_MS));
+    }
+
+    // 4. keystroke(Unicode 中文走 "as Unicode text"),失败真实上报
+    let keystroke = osascript_exec(
+        &format!(
+            "tell application \"System Events\" to keystroke \"{}\" as Unicode text",
+            escape_applescript_string(text)
+        ),
+        15000,
+    )?;
+    if !keystroke.ok {
+        return Err(fail("keystroke", &keystroke.stderr));
     }
     std::thread::sleep(Duration::from_millis(CHAT_SEND_ENTER_DELAY_MS));
 
-    // 3. submit_key (默认 enter / Return)
+    // 5. Enter 前二次校验前台(键入期间用户切窗 → Enter 会把内容发到别的应用)
+    if !current_driver().is_frontmost(window_id) {
+        append_chat_log(
+            chat_log_path,
+            &format_chat_log_line(
+                now_unix(),
+                "FOCUS_LOST",
+                &format!(
+                    "window_id={window_id} text=\"{}\" 键入后前台丢失,重新激活重试一次",
+                    truncate_for_log(text, 80)
+                ),
+            ),
+        );
+        let guard2 = ensure_frontmost(window_id).await?;
+        if !guard2.frontmost {
+            return Err(fail(
+                "focus_recheck",
+                "键入后窗口前台丢失且重新激活失败;文本可能滞留在目标输入框,\
+                 已跳过 Enter 防止误发送;请重新 chat_send 本条消息",
+            ));
+        }
+    }
+
+    // 6. submit_key(默认 enter / Return)
     let enter_script = match submit_key.to_lowercase().as_str() {
         "enter" | "return" | "回车" => {
             "tell application \"System Events\" to key code 36"
@@ -610,30 +874,13 @@ async fn run_osascript_fallback_send(
             "tell application \"System Events\" to key code 36"
         }
     };
-    let enter_cmd = format!("osascript -e '{}'", enter_script.replace('\'', "'\\''"));
-    if let Err(e) = BashTool
-        .execute(json!({
-            "command": enter_cmd,
-            "timeout_ms": 5000,
-        }))
-        .await
-    {
-        append_chat_log(
-            chat_log_path,
-            &format_chat_log_line(
-                now_unix(),
-                "FAIL",
-                &format!(
-                    "window_id={window_id} text=\"{}\" route=osascript_fallback stage=enter error={}",
-                    truncate_for_log(text, 80),
-                    e
-                ),
-            ),
-        );
-        return Err(e);
+    let enter = osascript_exec(enter_script, 5000)?;
+    if !enter.ok {
+        return Err(fail("enter", &enter.stderr));
     }
 
-    Ok("osascript_fallback sent".into())
+    let _ = ts0;
+    Ok(format!("osascript_fallback sent (app={app_name}, frontmost 守卫通过)"))
 }
 
 fn parse_point(v: Option<&Value>) -> Option<(i64, i64)> {
@@ -737,9 +984,14 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
     let mut total_replies = 0usize;
     let mut last_reply_text = String::new();
     let started = std::time::Instant::now();
+    // 第 88 轮:连续前台守卫失败计数(用户长时间操作其他窗口时及时止损,
+    // 避免 30 条消息全部打进别的软件)。
+    let mut consecutive_focus_fail = 0usize;
+    const MAX_CONSECUTIVE_FOCUS_FAIL: usize = 3;
+    let mut focus_aborted = false;
 
     for (i, msg) in messages.iter().take(total).enumerate() {
-        // 发送(内部 chat_send 会自己落盘 [SEND] / [FAIL])
+        // 发送(内部 chat_send 会自己落盘 [SEND] / [FAIL];第 88 轮起含前台守卫)
         let send_args = json!({
             "action": "chat_send",
             "window_id": window_id,
@@ -747,29 +999,46 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
             "verify": false, // chat_loop 自己统一做 reply 检测
             "chat_log_path": chat_log_path,
         });
-        let sent_ok = match super::McpWindowUseTool.execute(send_args).await {
-            Ok(s) => {
-                total_sent += 1;
-                s.contains("\"ok\": true")
-            }
-            Err(e) => {
-                log.push(json!({
-                    "round": i,
-                    "sent_text": msg,
-                    "sent_ok": false,
-                    "error": e.to_string(),
-                    "reply_seen": false,
-                    "reply_sample": null
-                }));
-                continue;
-            }
-        };
+        let (sent_ok, focus_failed, send_error) =
+            match super::McpWindowUseTool.execute(send_args).await {
+                Ok(s) => {
+                    let ok = s.contains("\"ok\": true");
+                    let focus_fail = s.contains("\"stage\": \"focus_acquire\"")
+                        || s.contains("focus_acquire_failed")
+                        || s.contains("focus_recheck");
+                    (ok, focus_fail, None)
+                }
+                Err(e) => {
+                    let msg_err = e.to_string();
+                    let focus_fail = msg_err.contains("focus");
+                    (false, focus_fail, Some(msg_err))
+                }
+            };
+        if sent_ok {
+            total_sent += 1;
+            consecutive_focus_fail = 0;
+        } else if focus_failed {
+            consecutive_focus_fail += 1;
+            append_chat_log(
+                &chat_log_path,
+                &format_chat_log_line(
+                    now_unix(),
+                    "FOCUS_LOST",
+                    &format!(
+                        "window_id={window_id} round={i} 连续前台守卫失败 {consecutive_focus_fail}/{MAX_CONSECUTIVE_FOCUS_FAIL}"
+                    ),
+                ),
+            );
+        } else {
+            consecutive_focus_fail = 0;
+        }
 
         // 回复检测(可选;osascript_fallback 路线下 OCR 不可用,跳过 reply 检测)
+        // 第 88 轮:前台守卫失败的轮次跳过 reply 检测(消息根本没发进目标窗口)。
         let cap = probe_capability();
         let mut reply_seen = false;
         let mut reply_sample = String::new();
-        if reply_detect && cap.ocr_screenshot_cgwindow {
+        if reply_detect && sent_ok && cap.ocr_screenshot_cgwindow {
             std::thread::sleep(Duration::from_millis(250));
             let detect_deadline = std::time::Instant::now()
                 + Duration::from_secs(CHAT_LOOP_REPLY_DETECT_TIMEOUT_SECS);
@@ -803,11 +1072,18 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
             "round": i,
             "sent_text": msg,
             "sent_ok": sent_ok,
+            "error": send_error,
+            "focus_failed": focus_failed,
             "reply_seen": reply_seen,
             "reply_sample": reply_sample,
             "elapsed_secs": started.elapsed().as_secs()
         }));
 
+        // 第 88 轮:连续前台守卫失败止损(消息可能打进别的软件,立即中止)
+        if consecutive_focus_fail >= MAX_CONSECUTIVE_FOCUS_FAIL {
+            focus_aborted = true;
+            break;
+        }
         if stop_on_reply && reply_seen {
             break;
         }
@@ -858,10 +1134,17 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
         "total_replies": total_replies,
         "reply_rate": reply_rate,
         "elapsed_secs": started.elapsed().as_secs(),
+        "focus_aborted": focus_aborted,
         "target_query": target_query,
         "log": log,
         "chat_log_path": chat_log_path,
-        "next_action": if total_replies > 0 {
+        "next_action": if focus_aborted {
+            format!(
+                "chat_loop 连续 {MAX_CONSECUTIVE_FOCUS_FAIL} 轮前台守卫失败已止损中止(已发 {total_sent} 条);\
+                 用户可能正在操作其他窗口,继续发送会误输入到别的软件;\
+                 请提醒用户保持目标窗口前台后重新发起 chat_loop"
+            )
+        } else if total_replies > 0 {
             format!(
                 "chat_loop 完成 {} 轮,对方回复 {} 条,回复率 {:.1}%;\
                  可基于 log 撰写结构化聊天报告",
@@ -870,7 +1153,7 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
         } else {
             format!(
                 "chat_loop 完成 {} 轮,但全程未检测到对方回复;\
-                 可能窗口焦点丢失 / target_query 不匹配 / OCR 失败(屏录未授权时属于正常);\
+                 可能 target_query 不匹配 / OCR 不可用(屏录未授权时属于正常,reply_detect 自动跳过);\
                  已落盘 {total} 条 [SEND] 与 [SUMMARY] 到工作日志 {}",
                 total_sent, chat_log_path
             )

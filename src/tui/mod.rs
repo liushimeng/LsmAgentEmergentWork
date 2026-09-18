@@ -40,6 +40,8 @@ pub mod theme;
 
 mod dispatch;
 pub mod format;
+// 第 88 轮:format.rs 达 1700+ 临界线,新增工具输出摘要落本职责子模块
+pub(crate) mod format_brief;
 mod input;
 mod provider_screen;
 mod slash;

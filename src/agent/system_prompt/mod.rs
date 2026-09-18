@@ -851,11 +851,19 @@ control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与
    inspect_control, coordinate_input, ax_warmup}` 与 `recommended_route` 推荐;
    桌面窗口任务**第一步必须先调此 action** 决定走哪条路线。
 2. `MCP_Window_Use(action=osascript_run, osascript_script='...')`:直接执行
-   AppleScript 片段(绕开 BashTool 白名单),macOS only。
+   AppleScript 片段(绕开 BashTool 白名单),macOS only。第 88 轮起 argv 直传
+   不经 shell —— 脚本内双引号/多行 tell 块原样书写,**不要做 shell 转义**;
+   返回真实 exit_code + stderr,ok=false 时按 stderr 修正脚本后重试,
+   **禁止改用 BashTool 执行 osascript 绕行**(窗口操控必须全程 MCP_Window_Use)。
 3. `chat_send` 第 86 轮新增 **osascript_fallback 路线**:AX 已授权 + 屏录未授权时,
-   自动走 `osascript -e 'tell application "WeChat" to activate' ...
-   keystroke "<text>" as Unicode text ... key code 36'`,**不依赖截图 / CGEvent**,
-   自绘 UI(微信 4.x)的最佳兜底。
+   自动走 `activate + keystroke "<text>" as Unicode text + key code 36'`,
+   **不依赖截图 / CGEvent**,自绘 UI(微信 4.x)的最佳兜底。
+   **第 88 轮新增前台焦点守卫**:chat_send 所有路线发送前先把目标窗口前置并轮询
+   确认 frontmost(1.5s 拿不到前台 → focus_acquire 失败不盲打);osascript_fallback
+   路线 keystroke 前自动按窗口 bounds 比例估算点击右下输入框聚焦,Enter 前二次
+   校验前台;chat_loop 连续 3 轮前台守卫失败自动止损中止(focus_aborted=true),
+   防止用户离开期间消息误发到其他软件 —— 看到 focus_acquire/focus_aborted 时
+   提醒用户保持目标窗口前台,不要换路线重试。
 4. `chat_loop` 在 `ocr_screenshot_cgwindow=false` 时自动跳过 OCR reply 检测,
    不再反复重试截图;每条 send 仍必写 [SEND] 行到 chat_log,QC 可正常 grep 验证。
 
@@ -899,16 +907,16 @@ control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与
 10. **cliclick 缺失兜底**:cliclick 是 Homebrew 包,部分用户没装。cliclick 不存在时:
     - 物理点击改用 osascript:'tell application "System Events" to click at {x, y}'
     - 物理键入改用 osascript 'keystroke "字符"' (需要辅助功能授权) 或 pbcopy + Cmd+V
-11. **osascript_fallback 工作原理**(chat_send 自动选的):ax / visual / visual_no_input
-    路线都不可用时(典型场景:AX 已授权 + 屏录未授权 + 自绘 UI),`chat_send` 内部走
-    `osascript -e 'tell application "WeChat" to activate'`
-    → sleep 200ms 焦点稳定
-    → `osascript -e 'tell application "System Events" to keystroke "<text>" as Unicode text'`
-    (Unicode 中文走 "as Unicode text",避免中文/emoji 丢失)
-    → sleep 120ms
-    → `osascript -e 'tell application "System Events" to key code 36'` (Return)。
-    整链路不调用 driver,完全不走截图/OCR;window_id 内嵌 app 名映射表自动识别
-    (微信=WeChat / 钉钉=DingTalk / 飞书=Lark / QQ)。
+11. **osascript_fallback 工作原理**(chat_send 自动选的,第 88 轮版):ax / visual /
+    visual_no_input 路线都不可用时(典型场景:AX 已授权 + 屏录未授权 + 自绘 UI),
+    `chat_send` 内部走
+    `activate 目标 App`(osascript argv 直传,真实 exit_code 校验)
+    → ensure_frontmost 前台守卫(bring_to_front + 150ms 轮询至 1.5s)
+    → 按窗口 bounds 比例估算点击右下输入框聚焦(CGEvent click_point)
+    → `keystroke "<text>" as Unicode text`(Unicode 中文走 "as Unicode text")
+    → Enter 前二次校验前台(丢失则重激活重试一次,仍失败则不按 Enter)
+    → `key code 36` (Return)。
+    window_id 内嵌 app 名映射表自动识别(微信=WeChat / 钉钉=DingTalk / 飞书=Lark / QQ)。
 12. **反伪造红线(2026-09-18 第 87 轮)**:禁止用 Bash echo / Write 手写本应由工具
     产出的工作日志、验收文件、capability 矩阵或 chat_log —— Quality-Check 会对账
     执行轨迹中的真实工具调用次数,文本与轨迹不一致必判 fail;

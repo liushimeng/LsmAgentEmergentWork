@@ -288,9 +288,9 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
 - ocr(window_id*, region?, lang?): 窗口 OCR 文字识别,返回词块文本 + 窗口相对坐标 + 屏幕绝对坐标(视觉路线入口)。**macOS 26.5 实测需要屏幕录制授权**(CGWindowListCreateImage + Vision 都走 TCC 屏录门控,屏录未授权时返回空);screen_recording=false 时直接改走 chat_send(osascript_fallback)。
 - screenshot(window_id?, output_path?, region?): 截图落盘 PNG,返回路径。只做截图不做识别;需要识别文字一律用 ocr。macOS 上需要屏幕录制授权(屏录未授权时 screencapture 也失败)。
 - capability_probe(): **第 86 轮新增**——返回当前进程真实能力矩阵 `{accessibility, screen_recording, ocr_screenshot_cgwindow, screencapture_cli, inspect_control, coordinate_input, ax_warmup}` 与 next_action 推荐;LLM 第一步必须先调此 action,再决定走 AX/视觉/osascript_fallback 哪条路线。无参数。
-- osascript_run(osascript_script*, timeout_ms?): **第 86 轮新增**——直接调 osascript 执行 AppleScript 片段,无需走 BashTool(绕开白名单)。macOS only。LLM 需要 System Events 键盘注入等场景使用。
-- chat_send(window_id*, text*, click_point?, input_field_path?, submit_key?, verify?, chat_log_path?): **复合 action**——一次调用完成「点击输入框 + Unicode 键入 + Enter + OCR 验证发送」,自动按 WindowCapability 选路线(控件树 / 视觉坐标 / osascript_fallback / 降级提示)。微信/钉钉/飞书 发送消息首选。**第 86 轮新增 osascript_fallback 路线**(AX 已授权 + 屏录未授权时,直接走 `osascript -e 'tell application "WeChat" to activate' ... keystroke ... key code 36',不依赖截图)。**chat_log_path 指定后,每条 send/recv/fail 落盘到该文件**。
-- chat_loop(window_id*, messages*, interval_seconds?, max_rounds?, reply_detect?, stop_on_reply?, target_query?, chat_log_path?): **复合 action**——长时多轮会话循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent, replies, reply_rate, log}`。LLM 一次调用就能跑 N 轮聊天。**chat_log_path 同样支持**。
+- osascript_run(osascript_script*, timeout_ms?): **第 86 轮新增,第 88 轮重写**——直接调 osascript 执行 AppleScript 片段,无需走 BashTool(绕开白名单)。macOS only。**argv 直传不经 shell**:脚本内双引号/反斜杠/多行 tell 块原样生效,不要再做 shell 转义;返回真实 exit_code + stderr,ok=false 时先按 stderr 修正脚本重试,**禁止改用 BashTool 执行 osascript 绕行**(窗口操控必须全程 MCP_Window_Use)。LLM 需要 System Events 键盘注入等场景使用。
+- chat_send(window_id*, text*, click_point?, input_field_path?, submit_key?, verify?, chat_log_path?): **复合 action**——一次调用完成「前置窗口 + 前台守卫 + 点击输入框 + Unicode 键入 + Enter + OCR 验证发送」,自动按 WindowCapability 选路线(控件树 / 视觉坐标 / osascript_fallback / 降级提示)。微信/钉钉/飞书 发送消息首选。**第 88 轮新增前台焦点守卫**:所有路线发送前先把目标窗口前置并轮询确认 frontmost,1.5s 拿不到前台就报 focus_acquire 失败**不盲打**(防止用户切窗后消息打进别的软件);osascript_fallback 路线 keystroke 前自动按窗口 bounds 比例估算点击右下输入框聚焦,Enter 前二次校验前台。**第 86 轮新增 osascript_fallback 路线**(AX 已授权 + 屏录未授权时,走 System Events keystroke,不依赖截图)。**chat_log_path 指定后,每条 send/recv/fail/focus_lost 落盘到该文件**。
+- chat_loop(window_id*, messages*, interval_seconds?, max_rounds?, reply_detect?, stop_on_reply?, target_query?, chat_log_path?): **复合 action**——长时多轮会话循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent, replies, reply_rate, focus_aborted, log}`。LLM 一次调用就能跑 N 轮聊天。**第 88 轮新增:连续 3 轮前台守卫失败自动止损中止**(focus_aborted=true),防止用户离开期间消息误发到其他软件。**chat_log_path 同样支持**。
 
 【第 86 轮 · capability_probe_first 原则】**第一步必须是 `MCP_Window_Use(action=capability_probe)` 拿到真实能力矩阵**,再决定下一步。capability.ocr_screenshot_cgwindow=false 表示截图/OCR 完全不可用,此时**禁止**重试 screenshot/ocr,直接走 `chat_send(osascript_fallback)` 或 `chat_loop`。
 【标准作业顺序】open(应用未启动)→ find/list(定位 window_id)→ capability_probe(拿真实能力)→ inspect 或 ocr(理解界面,前提 cap=true)→ control/chat_send(操作)→ inspect/ocr 复查 / chat_loop(批量会话)。
@@ -376,7 +376,7 @@ impl Tool for McpWindowUseTool {
                 "stop_on_reply": { "type": "boolean", "description": "chat_loop 可选:对方回复后立即停下,默认 false" },
                 "target_query": { "type": "string", "description": "chat_loop 可选:对话对象名字,用于 OCR 检测对方回复" },
                 "chat_log_path": { "type": "string", "description": "chat_send/chat_loop 可选:每次 send/recv/fail 落盘的工作日志文件绝对路径;默认 <工作目录>/llaew_chat_<unix_ts>.log。QC 可 grep `[SEND]`/`[RECV]`/`[FAIL]` 行验证(第 86 轮新增)" },
-                "osascript_script": { "type": "string", "description": "osascript_run 必填:要执行的 AppleScript 片段(将被 `osascript -e '<script>'` 包裹,macOS only)" },
+                "osascript_script": { "type": "string", "description": "osascript_run 必填:要执行的 AppleScript 片段(第 88 轮起 argv 直传 osascript -e,不经 shell;双引号/多行 tell 块原样书写,不要做 shell 转义;macOS only)" },
                 "osascript_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "description": "osascript_run 可选:超时毫秒,默认 5000" }
             },
             "required": ["action"],

@@ -795,7 +795,9 @@ impl WindowCapability {
             self.coordinate_input,
         ) {
             (_, true, true, true) => "全权限:inspect/control/ocr/screenshot/click_point 全部可用,任意路线组合",
-            (_, true, false, true) => "AX 已授权 + 屏录未授权:inspect/control 主路线完整;ocr/screenshot 改用 CGWindow(无需屏录);坐标用窗口 bounds 估",
+            // 第 88 轮修正:CGWindow 按窗口截取同样走 TCC 屏录门控(第 87 轮实测),
+            // 旧文案「ocr/screenshot 改用 CGWindow(无需屏录)」是错的,会诱导 LLM 撞墙。
+            (_, true, false, true) => "AX 已授权 + 屏录未授权:inspect/control 主路线完整;ocr/screenshot 不可用(禁止重试);坐标用窗口 bounds 比例估算;聊天发送走 chat_send(osascript_fallback 自动选线)",
             (_, true, _, false) => "AX 已授权但 CGEvent 注入受阻:走 AX 控件路线(click/set_text/send_keys/scroll)",
             (_, false, true, true) => "AX 未授权 + 屏录 OK:走 ocr + click_point + type_text_submit 视觉路线,或 osascript keystroke",
             (_, false, true, false) => "AX 未授权 + CGEvent 也不可用:仅 ocr + osascript(需要单独授权);或授权 AX 后重试",
