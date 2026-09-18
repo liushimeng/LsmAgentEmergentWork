@@ -36,9 +36,7 @@ pub use parse::{parse_plan_markdown, parse_workflow_plan};
 pub use spec::{BranchSpec, LoopSpec, WorkFlowPlan, WorkFlowSpec};
 pub use topo::{dedup_workflow_ids, sanitize_depends_on, topo_layers, topo_sort};
 // 原私有项:供本模块 impl 与测试经 `use super::*` 取用(可见域与拆分前等价)
-use delegate::{
-    gather_spec_text, text_contains_any_ci, DESKTOP_GUI_STRICT_KEYWORDS, WEB_USE_KEYWORDS,
-};
+use delegate::{gather_spec_text, text_contains_any_ci, DESKTOP_GUI_STRICT_KEYWORDS};
 use spec::split_condition_then;
 use topo::normalize_dep_id;
 
@@ -126,15 +124,10 @@ impl MainWorkRunner {
             }
         }
         // 2026-09-16 第 59 轮:透传 Yolo 推断的 suggested_delegate,引导 Main-Work 正确委派
+        // (第 89 轮:执行器唯一化为 subagent,提示语相应简化)
         if let Some(d) = suggested_delegate {
-            let hint = match d {
-                "webuse" => {
-                    "编排时所有涉及网页/浏览器操作的流程,请将 delegate_to 设为 \"webuse\"。"
-                }
-                _ => "编排时请按上述建议设置 delegate_to。",
-            };
             prompt.push_str(&format!(
-                "\n【重要】Yolo 基于用户输入关键词推断该任务应委派给: {d}\n{hint}\n"
+                "\n【重要】Yolo 基于用户输入关键词推断该任务应委派给: {d}\n编排时请按上述建议设置 delegate_to。\n"
             ));
         }
         if !retry_hint.is_empty() {
@@ -153,12 +146,12 @@ impl MainWorkRunner {
              约束:\n\
              - id/name/steps/acceptance/delegate_to 必填;branches/loops/depends_on/summary 可省略。\n\
              - branches/loops 元素是字符串(形如 \"条件: 动作\")或对象({\"condition\":…,\"then\":…} / {\"condition\":…,\"over\":…})均可。\n\
-             - delegate_to 二选一:默认填 \"subagent\"(通用执行,含「读取/操作桌面软件窗口:\n\
-               枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本」类任务 —— 执行层 SubAgent-Work\n\
-               在 macOS / Windows 上持有 MCP_Window_Use 工具,可完成桌面窗口操控);\n\
-               若该流程是「网页/浏览器操作(打开网址、浏览网页、网页登录、点击/输入/滚动页面、\n\
-               网页截图、抓取页面信息、爬虫采集、查看 Console/Network/DOM)」类任务,必须填 \"webuse\",\n\
-               由 Chromium-WebUse Agent(LsmAgentEmergentWork-Chromium-WebUse)执行。\n\
+             - delegate_to 唯一合法值:\"subagent\"(通用执行层 SubAgent-Work)。桌面窗口操控类任务\n\
+               (枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本)由 SubAgent-Work 的\n\
+               MCP_Window_Use 工具承担(macOS / Windows);网页/浏览器操作类任务(打开网址、\n\
+               浏览网页、网页登录、点击/输入/滚动页面、网页截图、抓取页面信息、爬虫采集、\n\
+               查看 Console/Network/DOM)由 SubAgent-Work 的 MCP_Web_Use 工具承担\n\
+               (CDP 内存无头浏览器,全平台)—— 两类任务照常描述步骤即可,不需要特殊 delegate 值。\n\
              - 同一桌面应用的连续 UI 操作链(打开/激活 → 等待窗口 → 搜索 → 选择会话 → 输入 → 校验 →\n\
                发送/提交)必须合并为一个 subagent WorkFlow,不要按每个按钮拆成多个串行单元;\n\
                跨单元会丢失真实焦点与控件状态。只有不同应用或互不依赖的窗口操作才允许拆分。\n\
@@ -176,6 +169,11 @@ impl MainWorkRunner {
                以下合法 action:open / list / find / inspect / control / ocr / screenshot /\n\
                capability_probe / osascript_run / chat_send / chat_loop;禁止臆造 list_windows /\n\
                get_window_info / get_ui_tree 等不存在的接口名 —— 执行层按字面调用会直接失败空转。\n\
+             - 浏览器操控流程引用 MCP_Web_Use 时(2026-09-18 第 89 轮),steps 中只允许使用\n\
+               以下合法 action:open / list / close / control / inspect;control 内层动作用\n\
+               control_action(click/input_text/wait/navigate/screenshot/eval_js 等),inspect\n\
+               观察维度用 info(console/network/elements/dom/localstorage 等);禁止臆造\n\
+               BrowserNew/goto_page/get_dom_tree 等不存在的接口名。\n\
              - 长时多轮桌面会话(如 15 分钟微信自动聊天):steps 必须引导执行层用\n\
                chat_loop(window_id, messages, interval_seconds, chat_log_path) 一次调用完成多轮\n\
                发送 —— SubAgent 迭代上限 16 次,逐条 chat_send 必然超限失败;\n\
@@ -201,10 +199,7 @@ impl MainWorkRunner {
                 decomposition.to_vec()
             };
             // 2026-09-16 第 59 轮:兜底 WorkFlow 也继承 suggested_delegate
-            let fallback_delegate = match suggested_delegate {
-                Some("webuse") => AgentRole::WebUse,
-                _ => AgentRole::SubAgent,
-            };
+            // (第 89 轮:执行器唯一化,兜底与正常路径统一 SubAgent)
             WorkFlowPlan {
                 workflows: vec![WorkFlowSpec {
                     id: "wf-1".into(),
@@ -214,31 +209,20 @@ impl MainWorkRunner {
                     loops: vec![],
                     depends_on: vec![],
                     acceptance: inherited,
-                    delegate_to: fallback_delegate,
+                    delegate_to: AgentRole::SubAgent,
                 }],
                 summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
                 degraded: true,
             }
         });
 
-        // 2026-09-16 第 61 轮:Yolo 建议 webuse 且 plan 未指定时,强制覆盖
-        if let Some("webuse") = suggested_delegate {
-            for wf in plan.workflows.iter_mut() {
-                if wf.delegate_to == AgentRole::SubAgent {
-                    let text = gather_spec_text(wf);
-                    if text_contains_any_ci(&text, WEB_USE_KEYWORDS) {
-                        wf.delegate_to = AgentRole::WebUse;
-                        tracing::info!(wf_id = %wf.id, "suggested_delegate=webuse,已覆盖 WorkFlow delegate_to");
-                    }
-                }
-            }
-        }
         // 2026-09-16 第 67 轮:同应用桌面窗口操控链自动合并(保留真实窗口焦点连续性)
         coalesce_same_app_window_workflows(&mut plan);
         // 2026-09-17 第 75 轮:兜底 plan 也跑一次关键词推断。
         // Main-Work JSON 解析失败时构造的单 WorkFlow 兜底不会经过
         // `parse_workflow_plan → infer_delegate_to_for_plan`(那是 JSON 路径),
-        // 这里手动调用一次,保证「打开网址 + 输入框」等 web 任务被纠正到 WebUse。
+        // 这里手动调用一次,保证「打开网址 + 输入框」等浏览器类任务被归一到 SubAgent
+        // (第 89 轮:浏览器操控由 SubAgent-Work 的 MCP_Web_Use 工具承担)。
         // 成功路径 `infer_delegate_to_for_plan` 已在 parse.rs 中调用,本调用幂等。
         infer_delegate_to_for_plan(&mut plan);
 

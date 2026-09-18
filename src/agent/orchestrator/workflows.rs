@@ -1,8 +1,8 @@
 //! WorkFlow 执行单元(2026-09-17 自 orchestrator.rs 拆分)。
 //!
 //! `execute_workflows` 按 `depends_on` Kahn 分层、同层 SubAgent 并行;
-//! `run_wf_unit` 是单个执行单元(SubAgent / WebUse 委派路由 + QC +
-//! Debug 采集),串行直通与 tokio::spawn 并行两种调用路径共用。
+//! `run_wf_unit` 是单个执行单元(SubAgent 执行 + QC + Debug 采集),
+//! 串行直通与 tokio::spawn 并行两种调用路径共用。
 
 use super::*;
 
@@ -94,10 +94,8 @@ impl MultiAgentOrchestrator {
                 let (wf, input) = units.into_iter().next().expect("len==1");
                 let outcome = run_wf_unit(
                     self.sub_agent.clone(),
-                    self.web_use.clone(),
                     self.quality.clone(),
                     self.cfg.debug.clone(),
-                    wf.delegate_to,
                     input,
                     c.goal_summary.clone(),
                     session.id().to_string(),
@@ -113,10 +111,8 @@ impl MultiAgentOrchestrator {
                 let mut handles = Vec::with_capacity(units.len());
                 for (wf, input) in units {
                     let sub_agent = self.sub_agent.clone();
-                    let web_use = self.web_use.clone();
                     let quality = self.quality.clone();
                     let debug = self.cfg.debug.clone();
-                    let delegate_to = wf.delegate_to;
                     let goal = c.goal_summary.clone();
                     let sid = session.id().to_string();
                     let sem = semaphore.clone();
@@ -127,10 +123,8 @@ impl MultiAgentOrchestrator {
                     handles.push(tokio::spawn(async move {
                         let outcome = run_wf_unit(
                             sub_agent,
-                            web_use,
                             quality,
                             debug,
-                            delegate_to,
                             input,
                             goal,
                             sid,
@@ -285,9 +279,9 @@ struct WfUnitOk {
 
 /// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
 ///
-/// 按 `delegate_to` 路由执行 Runner:`WebUse` → WebUseRunner(浏览器网页操控专项);
-/// 其余(含桌面窗口操控,SubAgent-Work 在 macOS / Windows 持 MCP_Window_Use 工具)
-/// → SubAgentRunner;QC / Debug / 取消 / 进度通道两种委派完全复用。
+/// 第 89 轮(2026-09-18)起执行器统一为 SubAgentRunner(原 Chromium-WebUse 专项
+/// Runner 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_Use 工具承担;
+/// 桌面窗口操控由 MCP_Window_Use 工具承担)。QC / Debug / 取消 / 进度通道全链路复用。
 ///
 /// 自由函数 + Arc 参数化,串行直通与 tokio::spawn 并行两种调用路径共用同一份逻辑;
 /// `semaphore` 为并行路径的有界并发许可(串行路径传 None);
@@ -296,10 +290,8 @@ struct WfUnitOk {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_wf_unit(
     sub_agent: Arc<SubAgentRunner>,
-    web_use: Arc<WebUseRunner>,
     quality: Arc<QualityRunner>,
     debug: Option<Arc<DebugCollector>>,
-    delegate_to: AgentRole,
     input: SubFlowInput,
     goal: String,
     session_id: String,
@@ -322,14 +314,9 @@ pub(super) async fn run_wf_unit(
     };
 
     let wf_id = input.id.clone();
-    let exec_role = match delegate_to {
-        AgentRole::WebUse => AgentRole::WebUse,
-        _ => AgentRole::SubAgent,
-    };
-    let exec_label = match exec_role {
-        AgentRole::WebUse => "WebUse",
-        _ => "SubAgent",
-    };
+    // 第 89 轮:执行器统一 SubAgent(delegate_to 仅作 trace 对账,不再有第二执行器)。
+    let exec_role = AgentRole::SubAgent;
+    let exec_label = "SubAgent";
     // 2026-09-16 第 62 轮:拆分 stage 短标题 / 详情面板。
     // 短标题(≤80 字符)进入 TUI stage 流 + waiting 心跳,避免每 1s
     // 原地重写整段超长文本;详情面板走 [laew] 前缀,立即冲刷、不进
@@ -358,25 +345,16 @@ pub(super) async fn run_wf_unit(
     // 2026-09-16 第 57 轮:执行器墙钟计时 ——
     // 用于 TaskResult.wallclock_ms / TUI 时间线展示。
     let sub_started = std::time::Instant::now();
-    let outcome = match exec_role {
-        AgentRole::WebUse => {
-            web_use
-                .run_unit_with_cancel(&input, &session_id, &cancel)
-                .await
-        }
-        _ => {
-            sub_agent
-                .run_unit_with_cancel(&input, &session_id, &cancel)
-                .await
-        }
-    }
-    .map_err(|e| {
-        QualityFailure::from_agent_error(
-            exec_role,
-            &format!("{exec_label} 执行失败(wf={wf_id})"),
-            &e,
-        )
-    })?;
+    let outcome = sub_agent
+        .run_unit_with_cancel(&input, &session_id, &cancel)
+        .await
+        .map_err(|e| {
+            QualityFailure::from_agent_error(
+                exec_role,
+                &format!("{exec_label} 执行失败(wf={wf_id})"),
+                &e,
+            )
+        })?;
     let wallclock_ms = sub_started.elapsed().as_millis() as u64;
     // 2026-09-16 第 62 轮:单元结束走 [laew] 详情面板 + 短标题 stage。
     // 详情面板显示 iter / tools / early_term / 错误摘要,即使 LLM 没调
@@ -569,16 +547,9 @@ pub(super) fn build_subflow_input(
     // (WorkFlow.name + steps 是对原始需求的分解),这里把 wf.name 作为原始
     // 提示词的近似透传。如需更精确(传整段原始 prompt),可在 MainWorkRunner
     // 拆分 WorkFlowSpec 时额外携带 original_prompt 字段。
-    let mut description = format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n"));
-    // 2026-09-16 第 64 轮:WebUse 跨单元 page_id 复用提示。
-    if wf.delegate_to == AgentRole::WebUse {
-        description.push_str(
-            "\n\n【WebUse 跨单元上下文】\n\
-             - 第一个 WebUse 单元的 BrowserNew 返回 page_id(如 p_xxx);\n\
-             - 后续 WebUse 单元必须复用同一 page_id(WebUseRunner 自动注入到 user prompt 尾部);\n\
-             - 若 BrowserList 显示 page_id 已失效,重新 BrowserNew,新 page_id 替换 Runner 内 last_page_id。",
-        );
-    }
+    // (2026-09-18 第 89 轮:跨单元浏览器页面复用不再由编排层注入提示 ——
+    //  SubAgentRunner 入口统一探测存活页面并注入「已打开的浏览器页面」列表。)
+    let description = format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n"));
     SubFlowInput {
         id: format!("{}.step", wf.id),
         description,

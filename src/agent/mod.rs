@@ -42,7 +42,6 @@ pub mod subagent;
 pub mod system_prompt;
 pub mod tool_schema_validator;
 pub mod tools;
-pub mod web_use;
 pub mod window;
 pub mod workflow;
 pub mod workflow_json_validate;
@@ -53,9 +52,7 @@ pub mod yolo;
 mod tests;
 
 // 运行时辅助项再导出:保持拆分前 `crate::agent::Xxx` 路径对外完全兼容
-pub(crate) use runtime_hints::{
-    build_runtime_hints, should_nudge_web_ops, web_ops_nudge_text, FORCED_TOOL_NUDGE_TEXT,
-};
+pub(crate) use runtime_hints::build_runtime_hints;
 // 原私有辅助:经本模块命名空间供 agent_loop / tests 子模块 `use super::*` 取用
 use runtime_hints::{
     forced_tools_enabled, forced_tools_enabled_from, is_truncation_stop_reason, stable_json_string,
@@ -99,10 +96,6 @@ pub struct Agent {
     max_truncation_resume: usize,
     /// 最大上下文溢出恢复次数(排水/折叠重试的全会话预算)。
     max_overflow_recoveries: usize,
-    /// 首迭代强制工具(2026-09-16 第 63 轮):WebUse 等专项 Agent 在第 0 轮
-    /// 强制调用指定工具(如 BrowserNew),后续轮次恢复 auto。None 表示不强制。
-    /// 设计见 tmpPlan/2026-09-16_08-WebUse全链路优化与TUI重复输出修复方案.md。
-    first_iter_forced_tool: Option<String>,
 }
 
 impl Agent {
@@ -113,42 +106,12 @@ impl Agent {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_truncation_resume: DEFAULT_MAX_TRUNCATION_RESUME,
             max_overflow_recoveries: DEFAULT_MAX_OVERFLOW_RECOVERIES,
-            first_iter_forced_tool: None,
         }
     }
 
     pub fn with_max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
         self
-    }
-
-    /// 设置首迭代强制工具(2026-09-16 第 63 轮):仅在首次 LLM 调用时强制
-    /// 调用指定工具,后续轮次恢复 auto。用于 WebUse 等专项 Agent
-    /// 确保首步必定执行工具调用,避免"纯文本空转"。
-    pub fn with_first_iter_forced_tool(mut self, tool_name: impl Into<String>) -> Self {
-        self.first_iter_forced_tool = Some(tool_name.into());
-        self
-    }
-
-    /// 读取首迭代强制工具(测试/诊断用)。
-    pub fn first_iter_forced_tool(&self) -> Option<&str> {
-        self.first_iter_forced_tool.as_deref()
-    }
-
-    /// 复制本 Agent 的配置(llm/profile/迭代上限等),但**不带**首迭代强制工具。
-    ///
-    /// 2026-09-17 第 79 轮:WebUse 多轮场景使用——已有存活浏览器页面时,
-    /// 强制 BrowserNew 反而会重复开页;换用本副本让首迭代自由决策
-    /// (prompt 中注入「已打开页面」列表 + 出口兜底防纯文本空转)。
-    pub fn replicate_without_forced_tool(&self) -> Self {
-        Self {
-            llm: self.llm.clone(),
-            profile: self.profile.clone(),
-            max_iterations: self.max_iterations,
-            max_truncation_resume: self.max_truncation_resume,
-            max_overflow_recoveries: self.max_overflow_recoveries,
-            first_iter_forced_tool: None,
-        }
     }
 
     /// 设置最大截断续接次数(测试 / 特殊场景用)。

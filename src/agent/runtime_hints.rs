@@ -58,46 +58,6 @@ pub(super) fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
     matches!(stop_reason, Some("max_tokens") | Some("length"))
 }
 
-/// 2026-09-16 第 68 轮 P0-A(修复 v2):首迭代 forced tool 未生效时的强引导 nudge。
-/// 触发条件:iter=0 且 first_iter_forced_tool 已设置,但 LLM 返回纯文本(无 tool_use)。
-/// 常见原因:Provider/网关拒绝 forced tool_choice 被 resilient 降级为 auto。
-/// 文本包含明确的 JSON 参数示例,降低 LLM 首次调用的参数构造门槛。
-pub(crate) const FORCED_TOOL_NUDGE_TEXT: &str = "【laew 强制指令】你在首轮回复中没有调用系统要求的工具,这是错误的。\
-请立即调用指定工具开始任务,这是硬性要求,不是建议。\
-如果你不调用工具,任务将被标记为失败(trace 标 early_terminated)。\
-注意:直接用工具规定的 JSON 参数格式调用,不要解释为什么要调用、不要描述计划。\
-如果工具返回权限错误(如 macOS -25211),在最终回答中告知用户如何授权,不要放弃任务。";
-
-/// 2026-09-16 第 63 轮(升级):WebUse nudge 改为命令语气。
-/// 此前提示语气 LLM 仍可能只回文本,现改为硬性要求 + 直接给出 JSON 参数示例。
-pub(crate) const WEB_OPS_NUDGE_TEXT: &str = "【laew 强制指令】你刚才没有调用任何浏览器工具,这是错误的。\n\
-请立即调用 BrowserNew 工具打开目标网页。这是硬性要求,不是建议。\n\
-参数示例: {\"url\": \"https://目标网址\", \"headless\": true}\n\
-如果你不调用 BrowserNew,任务将被标记为失败。\n\
-若 BrowserNew 返回 code=3001(未检测到浏览器),立即如实告知用户安装 Chrome/Edge/Chromium,不要编造结果。";
-
-/// 2026-09-16 第 63 轮:WebUse nudge 扩展为多轮触发(iter 1,2,3)。
-/// 2026-09-16 第 64 轮:扩展为 1..=6(iter 4-6 用末次警告文本),LLM 在第 4-6 轮
-/// 仍只回文本时不再沉默,WebUseRunner 出口兜底确保 trace 标 failed。
-pub(crate) fn should_nudge_web_ops(profile_tools: &[&str], iter: usize) -> bool {
-    (1..=6).contains(&iter) && profile_tools.iter().any(|t| *t == "BrowserNew")
-}
-
-/// 2026-09-16 第 64 轮:WebUse nudge 文本分级(iter ≥ 4 用更严厉措辞 + 终止预告)。
-pub(crate) const WEB_OPS_NUDGE_FINAL_TEXT: &str = "【laew 终止预告】你已连续多轮(>=4 次)无浏览器工具调用,任务即将被强制终止。\n\
-请立即调用 BrowserNew 工具打开目标网页:\n\
-参数: {\"url\": \"https://目标网址\", \"headless\": true}\n\
-如果浏览器不存在返回 code=3001,如实告知用户,**不要再输出任何描述性文本**。\n\
-继续输出文本而不调用工具 = 任务立即失败,trace 直接标 failed。";
-
-pub(crate) fn web_ops_nudge_text(iter: usize) -> &'static str {
-    if iter >= 4 {
-        WEB_OPS_NUDGE_FINAL_TEXT
-    } else {
-        WEB_OPS_NUDGE_TEXT
-    }
-}
-
 /// 结构化输出强制通道总开关(L6/L19,2026-09-09 第 13 轮)。
 ///
 /// 环境变量 `LAEW_FORCED_TOOLS=off|0|false|no` 关闭 wire 层 forced tool_choice

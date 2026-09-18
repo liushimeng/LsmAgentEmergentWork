@@ -1,14 +1,17 @@
-//! Chromium-WebUse 的 CDP 浏览器会话管理器(第 11 角色)。
+//! MCP_Web_Use 工具的 CDP 浏览器驱动层(2026-09-18 第 89 轮起,
+//! 原 Chromium-WebUse Agent 的「MCP 服务」实现,Agent 删除后由
+//! SubAgent-Work 的 MCP_Web_Use 工具调用,能力零改写保留)。
 //!
 //! 进程内单浏览器 + 多 Page 注册表语义:`page_id` 对 LLM 不透明,
-//! BrowserNew 首次调用时启动(内存无头 `--headless=new`)/ 接管(connect_url)浏览器,
-//! BrowserClose 在最后一个页面关闭后回收浏览器进程(launch 模式)。
+//! action=open 首次调用时启动(内存无头 `--headless=new`)/ 接管(connect_url)浏览器,
+//! action=close 在最后一个页面关闭后回收浏览器进程(launch 模式)。
 //! 平台浏览器路径差异封闭在 [`detect_browser`]。
 //!
 //! 派生标签页(window.open / target=_blank / 中键点击)通过「动作前后 diff
 //! `browser.pages()`」adopt 进注册表,新 page_id 经响应 `spawned_page_id` 回传。
 //!
-//! 设计见 `docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md`。
+//! 设计见 `docs/MCP_Web_Use/01-设计与解决方案.md`;
+//! 技术参考 `docs/浏览器CDP工具/Rust操作Chrome浏览器CDP完整技术方案.md`。
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -270,7 +273,7 @@ impl BrowserManager {
         let mut launch_dir: Option<PathBuf> = None;
 
         // Browser 操作超时(2026-09-16 第 66 轮):launch/connect/goto 统一 30s,
-        // 防止页面挂起/Chrome 启动失败导致无限等待(用户反馈 WebUse 任务卡住 58.8s)。
+        // 防止页面挂起/Chrome 启动失败导致无限等待(用户反馈浏览器任务卡住 58.8s)。
         let browser_timeout = std::time::Duration::from_secs(30);
 
         if inner.browser.is_none() {

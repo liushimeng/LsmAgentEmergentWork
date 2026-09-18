@@ -134,12 +134,11 @@ impl SubAgentRunner {
     /// 2026-09-17 第 78 轮 P0-2:Runner 出口兜底 —— 提取 sub_session 中的「实质产物摘要」。
     ///
     /// 业务背景(llaew_20260917_135513.log 复盘):
-    /// 文心一言任务被 Yolo 降级 simple + suggested_delegate=webuse,但 simple 档此前硬编码
-    /// SubAgentRunner(第 78 轮 P0-1 已修复为路由 WebUseRunner)。在修复前,
+    /// 文心一言任务被降级 simple 直派 SubAgentRunner 时,
     /// SubAgentRunner 出口 outcome.text 仅含「任务成功完成,内容已保存到 wenxin_result.txt」,
     /// 真实抓取的 AI 回复在文件里,TUI 看不到 — 用户必须二次追问「结果显示在哪里了」。
     ///
-    /// 兜底策略(对齐 web_use.rs::extract_page_reply_from_session 思路):
+    /// 兜底策略(与浏览器页面文本提取 `extract_page_reply_from_session` 同族思路):
     /// 1. 倒序遍历 sub_session.role=Tool 的消息,逐条检查 tool_use_id 对应的 tool_call
     ///    (从 sub_session.role=Assistant 的 tool_calls 中按 id 索引);
     /// 2. 按工具名分类提取:
@@ -283,7 +282,19 @@ impl SubAgentRunner {
         session_id: &str,
         cancel: Option<&CancelToken>,
     ) -> Result<SubFlowOutcome> {
-        let prompt = input.to_user_prompt();
+        // ★ 2026-09-18 第 89 轮:多轮浏览器页面复用(自原 WebUseRunner 第 79 轮平移)。
+        // 存活页面探测(顺带让 list_pages 清理失效 entry),非空时注入
+        // 「已打开的浏览器页面」提示块,免重新打开/登录;冷启动零开销不注入。
+        let live_pages = crate::agent::browser::BrowserManager::global().list_pages().await;
+        let mut prompt = input.to_user_prompt();
+        if let Some(hint) = build_existing_pages_hint(&live_pages) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&hint);
+            info!(
+                live_pages = live_pages.len(),
+                "SubAgent 注入已打开的浏览器页面提示(多轮复用)"
+            );
+        }
         let mut sub_session = crate::session::Session::new();
         sub_session.context_mut().push(ChatMessage::user(&prompt));
         // 让 sub_session 共享 session_id 便于追踪
@@ -292,9 +303,9 @@ impl SubAgentRunner {
         // Agent 循环返回 (text, usage, trace) 三元组。
         // 早终止路径(RepeatedToolFailure / MaxIterationsExceeded)不再升级为 Error,
         // ★2026-09-17 第 75 轮:Runner 角色信息(SubAgent)。
-        // ★2026-09-17 第 78 轮:SubAgentRunner 在 simple 档也可能被 webuse
-        // 委派(suggested_delegate 路由修复后);但 Runner 实际执行的是 SubAgent 角色,
-        // trace.runner_role 仍为 SubAgent,trace.intended_role 反映 WorkFlow 期望的角色。
+        // ★2026-09-18 第 89 轮:执行器唯一化(Chromium-WebUse Agent 已删除,浏览器
+        // 操控由本 Runner 的 MCP_Web_Use 工具承担),trace.runner_role 恒为 SubAgent,
+        // trace.intended_role 反映 WorkFlow 期望的角色(供 delegate_mismatch 对账)。
         let runner_role = Some(AgentRole::SubAgent);
         let intended_role = input.intended_role;
 
@@ -350,8 +361,8 @@ impl SubAgentRunner {
         let failed = trace.is_failed();
 
         // ★ 2026-09-17 第 78 轮 P0-2:Runner 出口兜底 —— 抓取 sub_session 中的
-        // 实质产物(对齐 web_use.rs::extract_page_reply_from_session 思路,让真实抓取的
-        // 内容也能落到 outcome.text,而不是只看到「已保存到 xxx.txt」这种描述性占位句)。
+        // 实质产物(让真实抓取的内容也能落到 outcome.text,而不是只看到
+        // 「已保存到 xxx.txt」这种描述性占位句)。
         // 解决 llaew_20260917_135513.log 复盘问题:文心一言任务 Yolo 降级 simple →
         // SubAgentRunner → 写 Python Playwright 脚本 → 把 AI 回复写到 wenxin_result.txt
         // → outcome.text 仅含描述 → TUI 看不到真实内容。
@@ -389,6 +400,33 @@ impl SubAgentRunner {
                 // 终答已含丰富内容,避免冗余
                 text
             }
+        };
+
+        // ★ 2026-09-18 第 89 轮:浏览器真实页面文本出口兜底(自原 WebUseRunner
+        // 第 76/78/82 轮平移)。MCP_Web_Use 抓取的页面文本(inspect elements /
+        // control eval_js 的 tool_result 信封)在 LLM 终答常被「任务已完成,
+        // 内容超过 N 字符」模板句吞掉;Runner 出口从 sub_session 反查最长一段
+        // 可读文本(≥200 字符 + UI 占位文本过滤),作为最终产物追加。
+        let text = match extract_page_reply_from_session(sub_session.context()) {
+            Some((reply, source)) if !reply.trim().is_empty() => {
+                info!(
+                    extracted_chars = reply.chars().count(),
+                    source = %source,
+                    "SubAgent 出口兜底:追加浏览器抓取的真实页面文本"
+                );
+                let mut combined = text;
+                if !combined.trim().is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(&format!(
+                    "[来自浏览器抓取的真实页面回复,共 {} 字符,来源: {}]\n{}",
+                    reply.chars().count(),
+                    source,
+                    reply,
+                ));
+                combined
+            }
+            _ => text,
         };
 
         // 写入 Agent-Memory(取消路径已在上面提前返回,不会走到这里)
@@ -439,7 +477,7 @@ fn runner_text_needs_fallback(text: &str) -> bool {
     }
     const KEYWORDS: &[&str] = &[
         "已打开", "已点击", "已输入", "已截图", "已抓取", "已采集", "已登录",
-        "已写入", "已生成", "page_id", "BrowserNew", "BrowserControl", "BrowserInspect",
+        "已写入", "已生成", "page_id", "MCP_Web_Use", "action=open", "spawned_page_id",
         "已完成", "执行成功", "已保存", "成功完成",
     ];
     !KEYWORDS.iter().any(|k| text.contains(k))
@@ -551,6 +589,238 @@ fn looks_like_failure(text: &str) -> bool {
         return true;
     }
 
+    false
+}
+
+// =================== 浏览器页面复用与真实文本出口兜底(2026-09-18 第 89 轮,自原
+// =================== WebUseRunner 平移的纯函数;Agent 删除后能力归 SubAgent-Work) ===================
+
+/// 构造「已打开的浏览器页面」注入提示块(原 WebUseRunner 第 79 轮能力平移)。
+///
+/// 输入为 `BrowserManager::list_pages()` 的 `(page_id, url, title, created_at)` 列表;
+/// 空列表返回 None(冷启动,不注入)。纯函数,便于单测。
+pub fn build_existing_pages_hint(pages: &[(String, String, String, String)]) -> Option<String> {
+    if pages.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "【已打开的浏览器页面(可直接复用,免重新打开/登录)】\n",
+    );
+    for (id, url, title, _ts) in pages.iter().take(10) {
+        let title_disp = if title.trim().is_empty() { "(无标题)" } else { title.as_str() };
+        out.push_str(&format!("  - page_id={id} | 标题: {title_disp} | URL: {url}\n"));
+    }
+    out.push_str(
+        "网页类任务优先用 MCP_Web_Use 的 inspect/control 直接操作上述页面;\
+         仅当任务需要其它网址或页面已失效(code=2000)时才 action=open 新开。",
+    );
+    Some(out)
+}
+
+/// 从 sub_session 中提取「真实从浏览器抓到的可读文本」(原 WebUseRunner
+/// 第 76/78/82 轮能力平移;第 89 轮起解析 MCP_Web_Use 的 tool_result 信封,
+/// 信封形态与原 Browser* 工具一致,解析逻辑零改动)。
+///
+/// 业务背景:网页任务终答常输出模板句「任务已完成,AI回复已提取,内容超过 500 字符」,
+/// 把真实回复吞掉。Runner 出口必须把 MCP_Web_Use inspect/control 抓到的真实文本
+/// 追加到 outcome.text,让 QC 与 TUI 看到原文。
+///
+/// 提取策略:
+/// 1. 倒序遍历 sub_session,过滤 role=Tool 的 ChatMessage;
+/// 2. 对每个 tool_result.content 做 JSON 解析,寻找 `code==0 && data.{text|outer_html|...}`;
+/// 3. 支持嵌套字段(`data.choices[0].message.content` / `data.markdown` /
+///    `data.result.text` 等异构命名),通过 `extract_nested_string` 递归展开;
+/// 4. 取长度最长且 ≥ 200 字符的候选,过滤 placeholder/UI 文本启发式白名单;
+/// 5. 返回 `Some((text, source_tool))` —— text 已 trim,长度截断 8000 字符。
+pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(String, String)> {
+    // 阈值 200 + UI 文本过滤,避免抓取 input placeholder / 热搜推荐词 / 弹窗广告
+    // 等 UI 文本误判为 AI 回复(第 82 轮实测文心一言任务曾中招)。
+    const MIN_CHARS_AI_REPLY: usize = 200;
+    let mut best: Option<(String, String, usize)> = None; // (text, source_tool, len)
+
+    // 倒序遍历,优先取最近一次抓取结果(避免旧结果覆盖)
+    for msg in messages.iter().rev() {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        for block in &msg.content {
+            let (tool_use_id, content, _is_error) = match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => (tool_use_id.clone(), content.clone(), *is_error),
+                _ => continue,
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            // 仅解析 JSON 信封
+            let parsed: Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // 失败码直接跳过
+            if parsed.get("code").and_then(Value::as_i64) != Some(0) {
+                continue;
+            }
+            let data = match parsed.get("data") {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // 先用候选字段集快速匹配,失败再走递归嵌套提取
+            // 候选字段涵盖主流 CDP 响应形态
+            const CANDIDATE_KEYS: &[&str] = &[
+                "text", "outer_html", "value", "html", "body",
+                "reply", "answer", "markdown", "content",
+                "reply_text", "ai_answer", "result", "result_text",
+            ];
+            let mut picked: Option<(String, &'static str)> = None;
+            for key in CANDIDATE_KEYS {
+                if let Some(s) = data.get(key).and_then(Value::as_str) {
+                    let s = s.trim();
+                    if s.chars().count() >= MIN_CHARS_AI_REPLY && !is_likely_ui_text(s) {
+                        picked = Some((s.to_string(), *key));
+                        break;
+                    }
+                }
+            }
+            // 候选字段都没命中 → 递归嵌套提取(覆盖 choices[0].message.content /
+            // result.text / data.text / message.content 等异构命名)
+            if picked.is_none() {
+                if let Some(extracted) = extract_nested_string(data) {
+                    let trimmed = extracted.trim();
+                    if trimmed.chars().count() >= MIN_CHARS_AI_REPLY
+                        && !is_likely_ui_text(trimmed)
+                    {
+                        picked = Some((trimmed.to_string(), "nested"));
+                    }
+                }
+            }
+
+            if let Some((text, label)) = picked {
+                let len = text.chars().count();
+                let better = match &best {
+                    Some((_, _, l)) => len > *l,
+                    None => true,
+                };
+                if better {
+                    best = Some((text, format!("tool_result[{}]→{}", tool_use_id, label), len));
+                }
+            }
+        }
+    }
+
+    best.map(|(text, source, len)| {
+        // 截断到 8000 字符,避免 LLM 上下文中爆
+        const MAX_CHARS: usize = 8000;
+        let truncated = text.chars().count() > MAX_CHARS;
+        let kept: String = if truncated {
+            text.chars().take(MAX_CHARS).collect::<String>() + "\n...(已截断,原长="
+                + &len.to_string()
+                + "字符)"
+        } else {
+            text.to_string()
+        };
+        (kept, source)
+    })
+}
+
+/// 从 JSON Value 中递归提取字符串内容(覆盖 AI 对话网站返回的嵌套字段:
+/// `choices[0].message.content` / `markdown` / `reply_text` / `result.text` /
+/// `content` 等异构命名)。
+fn extract_nested_string(v: &Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            if let Some(s) = extract_nested_string(item) {
+                return Some(s);
+            }
+        }
+        return None;
+    }
+    if let Some(obj) = v.as_object() {
+        // 优先 message.content (OpenAI / DeepSeek 风格)
+        if let Some(m) = obj.get("message") {
+            if let Some(s) = extract_nested_string(m) {
+                return Some(s);
+            }
+        }
+        for key in &["content", "text", "result", "markdown"] {
+            if let Some(found) = obj.get(*key).and_then(extract_nested_string) {
+                return Some(found);
+            }
+        }
+        for key in &["reply", "answer", "reply_text", "ai_answer", "value", "outer_html", "html", "body"] {
+            if let Some(found) = obj.get(*key).and_then(extract_nested_string) {
+                return Some(found);
+            }
+        }
+        // 兜底:深度优先遍历所有字段
+        for (_, v) in obj {
+            if let Some(s) = extract_nested_string(v) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// 启发式判定一段文本是否是 UI 占位文本(input placeholder / 热搜推荐 /
+/// 弹窗广告 / 输入框默认提示),而非 AI 生成的真实回复。
+///
+/// 触发任一即视为 UI 文本,出口兜底丢弃:
+/// - 文本以常见 UI 占位开头("请输入"/"搜索"/"你好,我是" 等)
+/// - 文本以列表形态开始(常见热搜推荐:"- 标题1\n- 标题2")
+/// - 文本是 url 列表(每行 < 100 字且每行含 http:// 或 https://)
+/// - 短文本(< 100 字)
+fn is_likely_ui_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    const UI_PREFIXES: &[&str] = &[
+        "请输入",
+        "搜索",
+        "search",
+        "你好",
+        "您好",
+        "你可能想",
+        "试试问",
+        "示例:",
+        "热门",
+        "推荐",
+        "placeholder=",
+        "data-placeholder=",
+    ];
+    if UI_PREFIXES
+        .iter()
+        .any(|p| trimmed.to_lowercase().starts_with(p))
+    {
+        return true;
+    }
+    // 文本以列表形态开始(每行 `- xxx` 或 `1. xxx`)
+    let first_line = trimmed.lines().next().unwrap_or("");
+    if first_line.starts_with("- ") || first_line.starts_with("• ") {
+        return true;
+    }
+    // URL 列表:行数 ≥ 3 且每行 < 100 字且每行都含 http:// 或 https://
+    let lines: Vec<&str> = trimmed.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() >= 3 && lines.iter().all(|l| l.chars().count() < 100) {
+        if lines
+            .iter()
+            .all(|l| l.contains("http://") || l.contains("https://") || l.contains("www."))
+        {
+            return true;
+        }
+    }
+    // 短文本(< 100 字)直接视为 UI
+    if trimmed.chars().count() < 100 {
+        return true;
+    }
     false
 }
 
@@ -900,5 +1170,135 @@ mod tests {
                 "Write evidence 应包含文件路径摘要"
             );
         }
+    }
+
+    // =================== 2026-09-18 第 89 轮:页面复用提示 + 真实文本出口兜底 ===================
+
+    #[test]
+    fn build_existing_pages_hint_empty_returns_none() {
+        assert!(build_existing_pages_hint(&[]).is_none(), "空列表不应注入提示");
+    }
+
+    #[test]
+    fn build_existing_pages_hint_lists_page_id_url_title() {
+        let pages = vec![
+            (
+                "p_ab12cd34".to_string(),
+                "https://wenxin.baidu.com/".to_string(),
+                "文心一言".to_string(),
+                "1758100000000".to_string(),
+            ),
+            (
+                "p_ff00ee11".to_string(),
+                "https://example.com/".to_string(),
+                String::new(), // 空标题 → (无标题)
+                "1758100000001".to_string(),
+            ),
+        ];
+        let hint = build_existing_pages_hint(&pages).expect("非空列表应返回提示块");
+        assert!(hint.contains("已打开的浏览器页面"), "应含标题行: {hint}");
+        assert!(hint.contains("page_id=p_ab12cd34"));
+        assert!(hint.contains("文心一言"));
+        assert!(hint.contains("https://wenxin.baidu.com/"));
+        assert!(hint.contains("(无标题)"), "空标题应有占位: {hint}");
+        assert!(hint.contains("MCP_Web_Use"), "应引导使用 MCP_Web_Use: {hint}");
+    }
+
+    #[test]
+    fn build_existing_pages_hint_caps_at_ten_pages() {
+        let pages: Vec<(String, String, String, String)> = (0..15)
+            .map(|i| (
+                format!("p_{i:08x}"),
+                format!("https://example.com/{i}"),
+                format!("标题{i}"),
+                "1758100000000".to_string(),
+            ))
+            .collect();
+        let hint = build_existing_pages_hint(&pages).unwrap();
+        assert!(hint.contains("p_00000009"), "前 10 个页面应列出");
+        assert!(!hint.contains("p_0000000a"), "第 11 个起应截断");
+    }
+
+    #[test]
+    fn is_likely_ui_text_filters_placeholders() {
+        assert!(is_likely_ui_text("请输入你的问题"));
+        assert!(is_likely_ui_text("搜索"));
+        assert!(is_likely_ui_text("潍坊市寒亭区委书记王勇被查")); // 热搜词,短文本
+        assert!(is_likely_ui_text(
+            "- https://example.com/page1\n- https://example.com/page2\n- https://example.com/page3"
+        ));
+        assert!(is_likely_ui_text("- 新对话\n- 工作任务\n- 知识库"));
+        assert!(is_likely_ui_text("登录"));
+        assert!(is_likely_ui_text(""));
+        // 真实 AI 回复:长文 + 非 UI 开头 + 无 URL 列表
+        assert!(!is_likely_ui_text(
+            "根据最近3个月的黄金白银走势分析:7月份国际金价从853元/克上涨至906元/克,8月份突破1000元大关达到1012.85元/克的历史高点,9月份有所回落收于926.86元/克。白银方面,7月份在54-58美元区间震荡,8月份突破70美元后回落至63.80美元。综合来看,近期金银价格波动较大,投资者需注意风险控制。"
+        ));
+    }
+
+    #[test]
+    fn extract_page_reply_skips_placeholder_with_short_text() {
+        // 80 字符 < 200 阈值,直接 None
+        let placeholder_80chars = "潍坊市寒亭区委书记王勇被查,某某某最新消息,某某某官方回应,持续关注中";
+        let msgs = vec![ChatMessage::tool_result(
+            "t1",
+            &format!(
+                r#"{{"code":0,"message":"ok","data":{{"text":"{}"}}}}"#,
+                placeholder_80chars
+            ),
+            false,
+        )];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_none(), "短 placeholder 文本不应被采纳");
+    }
+
+    #[test]
+    fn extract_page_reply_picks_longest_text() {
+        let long_text = "黄金近3个月走势详细分析报告:7月份国际金价从853元/克持续上涨至906元/克,8月份突破1000元大关达到1012.85元/克的历史高点,9月份有所回落收于926.86元/克。白银方面,7月份在54-58美元区间震荡,8月份突破70美元后回落至63.80美元。综合来看,近期金银价格波动较大,投资者需密切关注美联储利率政策、地缘政治风险以及美元指数走势,合理配置资产以分散风险,以上分析仅供参考。";
+        let short = "ok";
+        let msgs = vec![
+            ChatMessage::tool_result("t1", short, false),
+            ChatMessage::tool_result("t2", &format!(
+                r#"{{"code":0,"message":"ok","data":{{"text":"{}"}}}}"#,
+                long_text
+            ), false),
+        ];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_some(), "应能提取到长文本(实际: {result:?})");
+        let (text, _) = result.unwrap();
+        assert!(text.contains("1012.85"), "应包含真实原文片段");
+    }
+
+    #[test]
+    fn extract_page_reply_skips_failure_code() {
+        // code=2002 失败时不应被当作提取源
+        let long_text = "实际回复文本长度足够长通过门槛测试,这是文心一言生成的金银价格走势详细分析报告,包含国内国际金价白银价格数据。7月份国际金价从853元/克持续上涨至906元/克,8月份突破1000元大关达到1012.85元/克的历史高点,9月份回落至926.86元/克,白银方面7月份54-58美元区间震荡,8月突破70美元后回落63.80美元。投资者需密切关注美联储利率政策、地缘政治风险以及美元指数走势,合理配置资产以分散风险,以上分析仅供参考。";
+        let msgs = vec![
+            ChatMessage::tool_result("t1", r#"{"code":2002,"message":"err","data":{}}"#, false),
+            ChatMessage::tool_result("t2", &format!(r#"{{"code":0,"message":"ok","data":{{"text":"{}"}}}}"#, long_text), false),
+        ];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn extract_page_reply_handles_nested_choices() {
+        // 实际嵌套:tool_result.content = {"code":0, "data": {"choices": [{"message": {"content": "..."}}]}}
+        let nested = r#"{"code":0,"message":"ok","data":{"choices":[{"message":{"content":"AI 回复: 根据最近3个月的黄金白银价格走势详细分析报告。国内金价从7月份的853元/克持续上涨至8月份的1012.85元/克历史高点,9月份回落至926.86元/克。国际金价目前4301.95美元/盎司,国际白银63.80美元/盎司,沪银主力15586元/千克。整体来看,近期金银价格波动较大,投资者需密切关注美联储利率政策、地缘政治风险以及美元指数走势,合理配置资产以分散风险。数据来源文心一言实时查询,以上价格仅供参考,实际交易以市场为准。"}}]}}"#;
+        let msgs = vec![ChatMessage::tool_result("t1", nested, false)];
+        let result = extract_page_reply_from_session(&msgs);
+        assert!(result.is_some(), "嵌套字段应能提取,实际值: {result:?}");
+    }
+
+    #[test]
+    fn extract_nested_string_handles_variants() {
+        let v = serde_json::json!({
+            "choices": [{"message": {"content": "AI 回复内容长度足够长通过门槛测试,实际是文心一言给的金价分析"}}]
+        });
+        assert!(extract_nested_string(&v).unwrap().contains("金价分析"));
+        let v = serde_json::json!({"markdown": "# 标题\n这是 AI 生成的 markdown 内容"});
+        assert!(extract_nested_string(&v).unwrap().contains("markdown 内容"));
+        assert!(extract_nested_string(&serde_json::json!({"reply_text": "直接回复"})).is_some());
+        assert!(extract_nested_string(&serde_json::json!({"count": 42, "flag": true})).is_none());
     }
 }

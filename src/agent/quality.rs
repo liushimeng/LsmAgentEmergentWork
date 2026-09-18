@@ -102,8 +102,8 @@ impl QualityRunner {
     }
 
     /// [`check_subagent`] 的来源角色参数化版本:
-    /// delegate_to=webuse 的 WorkFlow 单元质检时传 `AgentRole::WebUse`,
-    /// 让质检报告 source 与提示词标题反映真实执行角色。
+    /// 让质检报告 source 与提示词标题反映真实执行角色(第 89 轮起执行器统一
+    /// SubAgent,浏览器操控由 MCP_Web_Use 工具承担,参数保留供未来执行器扩展)。
     pub async fn check_subagent_with_source(
         &self,
         source: AgentRole,
@@ -115,10 +115,7 @@ impl QualityRunner {
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
         let trace_summary = trace.render_prompt();
-        let unit_label = match source {
-            AgentRole::WebUse => "WebUse 单元(浏览器网页操控)",
-            _ => "SubAgent 单元",
-        };
+        let unit_label = "SubAgent 单元";
         // F10(2026-09-10 第 25 轮):判定基准是「本单元职责」,整体目标仅作背景。
         // 此前 prompt 只给整体 goal,QC(真实 LLM)按整体目标判单元产物,SubAgent
         // 只完成了 wf-1 前置检查也被判「核心任务未完成」→ 无效重试风暴
@@ -299,72 +296,15 @@ fn gate_report_on_trace(
     }
 
     let issue = if hard_strong_failure {
-        // 2026-09-16 第 64 轮:WebUse 专项 issue 文案,根据 early_terminate_reason
-        // 拆分子类,给出可执行诊断(此前 boilerplate 对用户无帮助)。
-        if source == AgentRole::WebUse {
-            let web_use_reason = trace
-                .failure_signals
-                .iter()
-                .find(|s| s.starts_with("early_terminate:"))
-                .cloned();
-            match web_use_reason.as_deref() {
-                // 2026-09-17 第 75 轮:delegate_mismatch 弱信号给出明确文案。
-                // 典型场景:网页任务被路由到 SubAgentRunner,Runner 没 Browser* 工具,
-                // 16 轮 0 工具调用。trace.failure_signals 会含 "delegate_mismatch:runner=SubAgent intended=WebUse"。
-                _ if trace.failure_signals.iter().any(|s| s.starts_with("delegate_mismatch:") && s.contains("intended=WebUse"))
-                    => format!(
-                        "WebUse 委派错配:WorkFlow 期望执行 Chromium-WebUse 工具集(BrowserNew/BrowserControl/BrowserInspect),\
-                         但 Runner 实际不是 WebUse(无 Browser* 工具)。\
-                         iter={} tool_calls={}。\
-                         排查:1) 检查 Main-Work delegate_to 字段是否被 infer_delegate_to 纠正;\
-                         2) 跑下轮重试前确认 trace.runner_role=WebUse trace.intended_role=WebUse。",
-                        trace.iterations, trace.tool_calls
-                    ),
-                Some(r) if r.contains("no_tool_use_no_action_text") => format!(
-                    "WebUse 单元 {} 次迭代内未调用任何 BrowserNew/BrowserControl/BrowserInspect 工具,\
-                     LLM 持续返回纯文本。trace 工具调用次数=0。\
-                     排查:(a) 首步强制 BrowserNew 是否被 LAEW_FORCED_TOOLS=off 关闭;\
-                     (b) use_js=true 是否触发 React onChange;\
-                     (c) page_id 是否因 overflow 截断丢失(已修复为 prompt 尾部注入)。",
-                    trace.iterations
-                ),
-                Some(r) if r.contains("no_text_converge") => format!(
-                    "WebUse 单元连续 8 轮仅 tool_use 无 final_text,触发 no_text_converge 短路。\
-                     iter={} tool_calls={}。建议:LLM 输出改为'短文本 + 工具调用'混合模式。",
-                    trace.iterations, trace.tool_calls
-                ),
-                _ => format!(
-                    "WebUse 单元 {} 次迭代内出现 {} 次失败({}%),early_terminate={}。\
-                     排查:selector / page_id 流转 / 浏览器进程是否存活。",
-                    trace.iterations,
-                    trace.tool_calls_err,
-                    if trace.tool_calls > 0 {
-                        trace.tool_calls_err * 100 / trace.tool_calls
-                    } else {
-                        0
-                    },
-                    trace.early_terminate_reason,
-                ),
-            }
-        } else {
-            "执行轨迹包含强失败信号,Quality-Check 的 pass 结论被 trace 证据门拒绝".to_string()
-        }
+        "执行轨迹包含强失败信号,Quality-Check 的 pass 结论被 trace 证据门拒绝".to_string()
     } else if unevidenced_text_phrase {
         "终答包含失败措辞(可能引用了工具日志摘录)且 Quality-Check 未提供非空 evidence 说明预期性"
             .to_string()
     } else {
         "Bash 命令非零退出且 Quality-Check 未提供非空 evidence 说明预期性".to_string()
     };
-    let suggestion = if source == AgentRole::WebUse && hard_strong_failure {
-        "下一轮重试时:1) 确认首步 BrowserNew 被调用(visible in TUI);\
-         2) 输入文本框用 BrowserControl(action=input_text, use_js:true) 触发框架 onChange;\
-         3) 等待对话用 BrowserInspect(info=image_urls) + 5s 轮询直到 reply 元素出现;\
-         4) 若浏览器不存在返回 code=3001,如实告知用户安装 Chrome/Edge/Chromium。"
-            .to_string()
-    } else {
-        "请修正命令或产物后重跑;若非零退出是预期负例,Quality-Check 必须在 evidence 中说明。"
-            .to_string()
-    };
+    let suggestion =
+        "请修正命令或产物后重跑;若非零退出是预期负例,Quality-Check 必须在 evidence 中说明。".to_string();
     let mut gated = QualityReport::fail(source, vec![issue], &suggestion, true);
     gated.evidence = trace.render_prompt();
     gated
@@ -632,9 +572,9 @@ mod tests {
     fn parse_quality_report_text_fallback_pass() {
         // 自然语言结论 + 「通过」关键词 → 降级 Pass
         let text = "经过核查,本单元所有子任务均完成,验收材料齐全,结论:通过";
-        let r = parse_quality_report(text, AgentRole::WebUse).unwrap();
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
         assert_eq!(r.verdict, Verdict::Pass);
-        assert_eq!(r.source, AgentRole::WebUse);
+        assert_eq!(r.source, AgentRole::SubAgent);
         assert!(r.issues[0].contains("JSON 解析失败"));
     }
 

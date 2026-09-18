@@ -465,14 +465,16 @@ impl TuiSession {
                     crate::tui::format::truncate_chars(&reason_short, 240),
                     *wallclock_ms as f64 / 1000.0,
                 );
-                // 2026-09-16 第 64 轮:WebUse 任务失败时额外打印诊断。
-                if reason.contains("WebUse") || reason.contains("tool_calls=0") || reason.contains("no_tool_use") {
-                    println!("  [WebUse 失败诊断] 详见下方 [trace]/[tool]/[failure] 段;若 tool_calls=0 排查方向:1) Chrome/Edge/Chromium 安装;2) 设置 LAEW_BROWSER_PATH;3) 检查 LAEW_FORCED_TOOLS 未关闭首步强制。");
+                // 2026-09-16 第 64 轮(第 89 轮更新):浏览器类任务失败时额外打印诊断。
+                // Chromium-WebUse Agent 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_Use
+                // 工具承担;tool_calls=0 的排查方向相应更新。
+                if reason.contains("tool_calls=0") || reason.contains("no_tool_use") {
+                    println!("  [浏览器任务失败诊断] 详见下方 [trace]/[tool]/[failure] 段;若 tool_calls=0 排查方向:1) Chrome/Edge/Chromium 安装(MCP_Web_Use 返回 code=3001 时如实告知用户);2) 设置 LAEW_BROWSER_PATH 指向浏览器可执行文件。");
                 }
                 // 2026-09-17 第 75 轮:trace 携带 delegate_mismatch 弱信号时,直接打印
                 // 「路由错配」诊断行,说明 WorkFlow 期望的角色与 Runner 实际执行的角色
-                // 不一致(典型场景:网页任务被路由到 SubAgentRunner,该 Runner 无 Browser*
-                // 工具,导致 tool_calls=0)。让用户/QA 一眼看出问题根因,不必翻 Debug 报告。
+                // 不一致。让用户/QA 一眼看出问题根因,不必翻 Debug 报告
+                // (第 89 轮起执行器统一 SubAgent,该信号保留供未来执行器扩展对账)。
                 let mismatch_info: Option<(String, String)> = last_trace
                     .as_ref()
                     .and_then(|t| {

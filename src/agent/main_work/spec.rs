@@ -191,8 +191,10 @@ where
         // 2026-09-18 第 84 轮:WindowUse Agent 已删除,旧别名兼容映射 SubAgent-Work
         // (macOS / Windows 上 SubAgent-Work 持 MCP_Window_Use 工具承担窗口操控)。
         "windowuse" | "windowuseagent" | "window" | "窗口" => AgentRole::SubAgent,
+        // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_Use 工具),
+        // 旧别名兼容映射 SubAgent-Work。
         "webuse" | "webuseagent" | "chromium" | "chromiumwebuse" | "browser" | "web" | "浏览器"
-        | "网页" => AgentRole::WebUse,
+        | "网页" => AgentRole::SubAgent,
         "main" | "mainwork" | "mainworkagent" => AgentRole::MainWork,
         "yolo" => AgentRole::Yolo,
         "plan" => AgentRole::Plan,

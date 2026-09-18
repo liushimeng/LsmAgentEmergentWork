@@ -157,11 +157,14 @@ impl SystemPrompt {
     ///
     /// 2026-09-18 第 84 轮:macOS / Windows 追加 MCP_Window_Use 使用说明
     /// (桌面窗口操控统一工具,平台门控与工具注册一致)。
+    /// 2026-09-18 第 89 轮:全平台追加 MCP_Web_Use 使用说明(浏览器操控统一工具,
+    /// CDP 三平台一致,无平台门控)。
     pub fn sub_agent_work() -> Self {
         let prompt = Self::new(SUB_AGENT_BASE_PROMPT)
             .with_tools_hint(sub_agent_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, SUB_AGENT_ANTHROPIC_TAIL)
-            .set_protocol_tail(crate::config::Protocol::OpenAi, SUB_AGENT_OPENAI_TAIL);
+            .set_protocol_tail(crate::config::Protocol::OpenAi, SUB_AGENT_OPENAI_TAIL)
+            .append_base(MCP_WEB_USE_PROMPT_SECTION);
         if crate::agent::tools::mcp_window_use::mcp_window_use_available() {
             prompt.append_base(MCP_WINDOW_USE_PROMPT_SECTION)
         } else {
@@ -193,14 +196,6 @@ impl SystemPrompt {
     /// 构造 Compact Agent 的系统提示词(压缩层,上下文摘要,无工具)。
     pub fn compact() -> Self {
         Self::without_tools(COMPACT_BASE_PROMPT)
-    }
-
-    /// 构造 Chromium-WebUse Agent 的系统提示词(浏览器操控层,第 11 角色)。
-    pub fn web_use() -> Self {
-        Self::new(WEB_USE_BASE_PROMPT)
-            .with_tools_hint(web_use_tools_hint())
-            .set_protocol_tail(crate::config::Protocol::Anthropic, WEB_USE_ANTHROPIC_TAIL)
-            .set_protocol_tail(crate::config::Protocol::OpenAi, WEB_USE_OPENAI_TAIL)
     }
 
     /// 构造 WorkFlow Agent 的系统提示词(工作流编排层,第 10 角色)。
@@ -254,8 +249,9 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
   在 macOS / Windows 上 SubAgent-Work 持有 MCP_Window_Use 工具(桌面窗口操控统一入口)
 - ⚠️ 涉及「网页/浏览器操作」的任务(打开网址、浏览网页、网页登录、点击/输入/滚动页面、
   网页截图、抓取页面信息、爬虫采集、查看 Console/Network/DOM,如「帮我打开 example.com 截图」
-  「抓取某网页的标题列表」)最低按 medium 档分类 —— 这类任务由 Main-Work 委派给
-  Chromium-WebUse 专项 Agent 执行,不得按 simple 直派 SubAgent-Work
+  「抓取某网页的标题列表」)最低按 medium 档分类 —— 这类任务由 Main-Work 拆解后交
+  SubAgent-Work 执行,SubAgent-Work 持有 MCP_Web_Use 工具(浏览器操控统一入口,
+  CDP 内存无头浏览器),不得按 simple 直派
 
 【hard 高等难度】
 - 涉及多个文件、多个模块的综合改动
@@ -623,7 +619,8 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 【Main-Work 单元】
 - workflows 结构是否完整(每个 wf 有 id/name/steps/depends_on/acceptance)
 - 依赖关系是否有循环
-- 每个 workflow 是否明确 delegate_to(subagent 通用执行,含桌面窗口操控 / webuse 网页浏览器操控)
+- 每个 workflow 是否明确 delegate_to(subagent 通用执行,含桌面窗口操控
+  MCP_Window_Use / 网页浏览器操控 MCP_Web_Use)
 - 验收标准是否可机器验证
 
 Main-Work 单元判定豁免(2026-09-16 第 66 轮,以下情形**一律不得作为 fail 理由**):
@@ -632,9 +629,10 @@ Main-Work 单元判定豁免(2026-09-16 第 66 轮,以下情形**一律不得作
 - 目标名称中 Unicode 上标字母(如 ᴬᴵᴬ ᴮ ᶜ)与其 ASCII 归一形(AIA B C)——
   计划在系统解析时已做归一化,两种写法视为**同一名称**,不得判「名称不一致」;
 - 名称/步骤中出现成对中文引号「」包裹目标名——合法的引用写法;
-- 桌面窗口操控 / 网页操控(webuse)类 WorkFlow 的验收标准允许 UI 状态描述
-  (如「控件出现」「文本已输入」「消息已发送」),不要求给出 shell 验证命令;
-- 步骤中引用的技术手段(MCP_Window_Use / accessibility / 截图 / 控件树)是窗口操控的正常实现路径,不算「模糊」。
+- 桌面窗口操控 / 网页操控类 WorkFlow 的验收标准允许 UI / 页面状态描述
+  (如「控件出现」「文本已输入」「消息已发送」「页面已截图」),不要求给出 shell 验证命令;
+- 步骤中引用的技术手段(MCP_Window_Use / accessibility / 截图 / 控件树 /
+  MCP_Web_Use / CDP / page_id)是窗口与网页操控的正常实现路径,不算「模糊」。
 Main-Work 单元只在以下**阻断性**情形判 fail:workflows 为空、wf 缺 id/name/steps、
 depends_on 引用未知 id 或成环、delegate_to 缺失。其余改进意见写在 issues 里但 verdict=pass。
 
@@ -931,100 +929,60 @@ control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与
     也支持 cmd+enter / ctrl+shift+t 等。
 "#;
 
-// =================== Chromium-WebUse Agent 提示词(第 11 角色,浏览器操控层) ===================
+// =================== MCP_Web_Use 工具使用说明(2026-09-18 第 89 轮) ===================
+//
+// 原 Chromium-WebUse Agent(第 11 角色)系统提示词的作业规范精炼版:随 Agent 删除,
+// 能力降级为 SubAgent-Work 的 MCP_Web_Use 工具;本段全平台追加到 SubAgent-Work
+// 系统提示词(CDP 三平台一致,未装浏览器返回结构化 3001 信封,无需平台门控)。
+// 设计见 `docs/MCP_Web_Use/01-设计与解决方案.md`。
 
-/// Chromium-WebUse Agent 基础身份与职责说明。
-///
-/// 设计见 `docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md`。
-const WEB_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Chromium-WebUse,浏览器操控层的专项执行 Agent。
+/// SubAgent-Work 浏览器操控补充说明(全平台注入)。
+const MCP_WEB_USE_PROMPT_SECTION: &str = r#"
 
-你的核心职责:模拟人类操作浏览器——网页浏览、信息收集、爬虫采集、登录 Web 页面、
-点击/输入/滚动/截图、查看 Console/Network/DOM/localStorage 等,完成上层 Agent(Main-Work)
-委派给你的网页操控流程单元。Agent 集群中任何网页相关操作都由你执行。
+---
 
-## ⚠️ 首步强制要求(2026-09-16 第 63 轮新增)
-你的第一个动作必须是调用 BrowserNew 工具打开目标网页拿到 page_id。
-不允许先输出"让我先..."、"我需要..."等描述性文本——直接调用 BrowserNew。
-如果你不调用 BrowserNew,任务将被标记为失败。这是硬性要求,不是建议。
+【浏览器网页操控:MCP_Web_Use 工具使用说明】(全平台可用)
 
-## ⚠️ 效率铁律(2026-09-17 第 75 轮新增,防止无效迭代浪费时间)
-1. 严禁无进展重试:同一工具调用连续失败 2 次,必须换路径(换 selector/换 action/换 use_js);
-2. 页面加载后操作:BrowserNew 返回后,如需等待动态内容,先 BrowserControl(action=wait, selector="目标元素");
-3. 中文输入方案:优先 use_js:true(已验证可靠);sendkeys 模式在部分网站中文输入会乱码;
-4. 复杂页面先探测:微信公众号后台、电商后台等复杂页面,先 BrowserInspect(info=elements, selector="body") 看 DOM;
-5. 截图只在用户明确要求"看截图"时用,默认 save_path 落盘;
-6. 任务完成后 BrowserClose 关闭不再需要的页面,释放内存。
-7. 对话型 AI 网站(文心一言/ChatGPT/DeepSeek)特别提示:
-   - 输入框选择器:textarea, [contenteditable=true], input[type=text]
-   - 提交/发送按钮:button[type=submit], [class*=send], [class*=submit], img[id*=submit], img[class*=button]
-   - AI 回复等待:BrowserControl(action=wait, selector="[class*=response],[class*=answer],[class*=result],[class*=message]", timeout_ms=30000)
-   - 回复内容提取:BrowserInspect(info=elements, selector="[class*=response],[class*=answer]", include_text=true)
-
-平台能力(由工具自动适配,你无需关心差异):
-- 浏览器检测:优先 Chrome,自动降级 Edge / Chromium / Brave;支持 Windows / macOS / Linux;
-- Firefox / Safari 不支持 CDP 协议,无法接入;
-- 默认使用「内存中的无头浏览器」(--headless=new,独立临时 profile,不干扰用户日常浏览器);
-- 也可通过 connect_url 接管用户已用 --remote-debugging-port 启动的浏览器。
+当任务涉及「网页/浏览器操作」(打开网址、浏览网页、网页登录、点击/输入/滚动页面、
+网页截图、抓取页面信息、爬虫采集、查看 Console/Network/DOM/localStorage,
+如文心一言/ChatGPT 等 AI 网站对话、表单提交、数据采集)时,使用 MCP_Web_Use 工具
+(单工具 + action 分发):open(打开页面拿 page_id)→ control(写操作)/
+inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法见工具 description。
 
 作业规范(严格遵守):
-1. 先开页后操作:BrowserNew 打开页面拿到 page_id → BrowserControl 执行动作 →
-   BrowserInspect 观察结果;page_id 是后续所有调用的句柄,务必保存;
-   ★ 多轮复用(2026-09-17 第 79 轮):若输入含「已打开的浏览器页面」列表,
-   优先直接操作这些页面(免重新打开/登录),仅当任务需要其它网址或页面失效
-   (code=2000)时才 BrowserNew 新开;
+1. 先开页后操作:MCP_Web_Use(action=open, url=...) 打开页面拿到 page_id →
+   control 执行动作 → inspect 观察结果;page_id 是后续所有调用的句柄,务必保存。
+   ★ 页面复用:若输入含「已打开的浏览器页面」列表,优先直接操作这些页面
+   (免重新打开/登录),仅当任务需要其它网址或页面失效(code=2000)时才 open 新开;
 2. 元素定位一律用 CSS selector(+可选 nth);操作失败(code=2002)时换 selector 或换
-   input_text 的 use_js 路径重试,不要重复完全相同的失败调用;
+   input_text 的 use_js 路径重试,同一动作连续失败 2 次必须换路径,不要重复相同调用;
 3. 点击链接 / window.open 派生新标签页时,响应会携带 spawned_page_id,
    必须把它纳入你的页面索引,后续操作新页面用新 page_id;
-4. 错误码对策:1001 修正参数;2000 page_id 失效→重新 BrowserList 同步;2001 断连→重建页面;
-   2002 换 selector/路径重试;2003 页面崩溃→重建;3001 未安装浏览器→如实告知用户安装
-   Chrome/Edge/Chromium,并给出替代建议(不要假装成功);
-5. 截图优先用 save_path 落盘(返回文件路径),不要把大段 base64 当作回答内容;
+4. 错误码对策:1001 修正参数;2000 page_id 失效→action=list 重新同步;2001 断连→重建页面;
+   2002 换 selector/路径重试;3001 未安装浏览器→如实告知用户安装 Chrome/Edge/Chromium
+   (确定性失败,不要循环重试 open,不要改 mode 重试,不要编造结果);
+5. 效率铁律:页面加载后需等动态内容先 control(control_action=wait, selector=目标元素);
+   中文输入优先 params.use_js=true(React/Vue 受控组件兼容,sendkeys 模式中文可能乱码);
+   复杂页面(公众号后台/电商后台)先 inspect(info=elements, selector="body") 探测真实 DOM,
+   不要凭 selector 名字硬猜;AI 对话类网站回复等待用 wait(selector=[class*=response],
+   timeout_ms=60000),回复提取用 inspect(info=elements, include_text=true);
+6. 截图优先 save_path 落盘(返回文件路径),不要把大段 base64 当作回答内容;
    DOM/outerHTML 提取注意 truncated 标记,被截断时缩小 selector 或 max_depth 分段提取;
-6. 安全红线:禁止对疑似支付/删除/确认提交类按钮做无把握点击;登录凭证只填入用户明确
-   提供的账号密码,不要编造;只读优先——能用 BrowserInspect 回答的问题不做任何写操作;
-7. 任务完成后关闭**确定不再需要**的页面释放内存;对话型页面(文心一言/ChatGPT 等,
-   用户可能继续追问)**可保留不关**——后续任务会通过「已打开的浏览器页面」列表自动复用,
-   进程退出时浏览器自动回收;
-8. 高级交互(2026-09-17 第 79 轮提示):拖拽用 action=drag(source_selector→target_selector);
-   悬停菜单/tooltip 用 hover 或 mouse_move;受控组件输入不生效时用 dispatch_event
-   (input/change)或 focus 后再 input_text。
-
-完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
+7. 安全红线:禁止对疑似支付/删除/确认提交类按钮做无把握点击;登录凭证只填入用户明确
+   提供的账号密码,不要编造;只读优先——能 inspect 回答的问题不做任何写操作;
+8. 资源释放:任务完成后关闭**确定不再需要**的页面(close);对话型页面(文心一言/
+   ChatGPT 等,用户可能继续追问)**可保留不关**——后续任务会通过「已打开的浏览器页面」
+   列表自动复用,进程退出时浏览器自动回收;
+9. 内容直显:任务要求「显示/展示/返回」某网页内容时,终答必须直接贴出真实抓取的
+   文本(用 inspect(info=elements, include_text=true) 或 control(control_action=eval_js)
+   抓取),禁止只写「内容已提取,共 N 字符」等占位描述;
+10. 反伪造红线(对齐 MCP_Window_Use 第 87 轮):禁止用 Bash echo / Write 手写本应由
+    MCP_Web_Use 产出的截图/抓取证据 —— Quality-Check 会对账执行轨迹中的真实工具调用,
+    文本与轨迹不一致必判 fail;
+11. 高级交互:拖拽用 control_action=drag(source_selector→target_selector);悬停菜单/
+    tooltip 用 hover 或 mouse_move;受控组件输入不生效时用 dispatch_event(input/change)
+    或 focus 后再 input_text;上传文件用 upload_file(file_paths)。
 "#;
-
-fn web_use_tools_hint() -> &'static str {
-    "工具调用规范:\n\
-     - 工具参数需严格遵守给定 JSON Schema\n\
-     - 网页操控按「BrowserNew → BrowserControl/BrowserInspect → BrowserClose」顺序使用;\
-       无依赖的观察调用(BrowserInspect 各 info / BrowserList)可并行发出\n\
-     - 中文输入优先 use_js:true,避免 sendkeys 模式中文乱码\n\
-     - 复杂页面先 BrowserInspect(info=elements) 探测真实 DOM,不要硬猜 selector\n\n\
-     可用工具(共 6 个):\n\
-     - BrowserNew(url, mode?, wait_until?, user_agent?, block_resources?, connect_url?): \
-       新建内存浏览器页面,返回 {page_id,title,final_url,next_steps};\
-       mode=hidden(默认纯 CDP 无窗口) / new_headless / headed(显式开窗);\
-       next_steps 含 input_text/click/wait/elements 四步引导,严格按 next_steps 执行\n\
-     - BrowserList(): 列出存活页面 [{page_id,url,title,created_at}]\n\
-     - BrowserClose(page_id): 关闭页面(幂等);最后页面关闭时回收浏览器进程\n\
-     - BrowserControl(page_id, action, params): 写操作统一入口,action 枚举:\
-       click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/\
-       press_sequence/input_text/human_input/clear_input/upload_file/select_option/\
-       new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/\
-       set_storage/clear_storage/set_viewport/screenshot/heartbeat\
-       /drag(拖拽)/focus/blur(焦点)/mouse_move(纯移动)/dispatch_event(自定义DOM事件)\n\
-     - BrowserInspect(page_id, info, params): 只读观察统一入口,info 枚举:\
-       console/network/elements/dom/localstorage/sessionstorage/cookies/screenshot/\
-       page_meta/viewport/url/title/ping/image_urls\n\
-     - Read(file_path, offset?, limit?): 读取文本文件(理解任务上下文用),带行号\n\n\
-     返回信封:所有浏览器工具返回 {code,message,data} JSON;code=0 成功,非 0 按作业规范第 4 条处置。"
-}
-
-const WEB_USE_ANTHROPIC_TAIL: &str = "\
-[Anthropic 补充] 页面观察类无依赖工具调用请并行发出;页面操作类调用按依赖顺序逐个执行。";
-
-const WEB_USE_OPENAI_TAIL: &str = "\
-[OpenAI 补充] 页面观察类无依赖工具调用请并行发出;页面操作类调用按依赖顺序逐个执行。";
 
 #[cfg(test)]
 mod tests {
@@ -1079,7 +1037,7 @@ mod tests {
 
     #[test]
     fn all_prompts_render_for_both_protocols() {
-        let builders: [fn() -> SystemPrompt; 10] = [
+        let builders: [fn() -> SystemPrompt; 9] = [
             SystemPrompt::yolo,
             SystemPrompt::plan,
             SystemPrompt::main_work,
@@ -1089,7 +1047,6 @@ mod tests {
             SystemPrompt::debug,
             SystemPrompt::compact,
             SystemPrompt::work_flow,
-            SystemPrompt::web_use,
         ];
         for f in builders {
             let sp = f();
@@ -1102,7 +1059,7 @@ mod tests {
 
     #[test]
     fn each_prompt_mentions_own_agent_name() {
-        let cases: [(&str, fn() -> SystemPrompt); 10] = [
+        let cases: [(&str, fn() -> SystemPrompt); 9] = [
             ("LsmAgentEmergentWork-Yolo", SystemPrompt::yolo),
             ("LsmAgentEmergentWork-Plan", SystemPrompt::plan),
             ("LsmAgentEmergentWork-Main-Work", SystemPrompt::main_work),
@@ -1121,10 +1078,6 @@ mod tests {
             ("LsmAgentEmergentWork-Debug", SystemPrompt::debug),
             ("LsmAgentEmergentWork-Compact", SystemPrompt::compact),
             ("LsmAgentEmergentWork-WorkFlow", SystemPrompt::work_flow),
-            (
-                "LsmAgentEmergentWork-Chromium-WebUse",
-                SystemPrompt::web_use,
-            ),
         ];
         for (name, f) in cases {
             let rendered = f().render(Protocol::Anthropic);
@@ -1145,23 +1098,23 @@ mod tests {
         );
     }
 
-    /// 2026-09-16 第 61 轮:WebUse 工具提示词必须与注册表严格对齐。
+    /// 2026-09-18 第 89 轮:MCP_Web_Use 使用说明全平台注入 SubAgent-Work 提示词
+    /// (CDP 三平台一致,无平台门控)。
     #[test]
-    fn web_use_tools_hint_lists_all_tools() {
-        let hint = web_use_tools_hint();
-        for tool in [
-            "BrowserNew",
-            "BrowserList",
-            "BrowserClose",
-            "BrowserControl",
-            "BrowserInspect",
-            "Read",
-        ] {
+    fn sub_agent_prompt_mcp_web_use_all_platforms() {
+        let rendered = SystemPrompt::sub_agent_work().render(Protocol::Anthropic);
+        assert!(
+            rendered.contains("MCP_Web_Use 工具使用说明"),
+            "MCP_Web_Use 使用说明应全平台注入"
+        );
+        for action in ["action=open", "control", "inspect", "spawned_page_id"] {
             assert!(
-                hint.contains(tool),
-                "WebUse 工具提示词必须列出 {tool};当前:\n{hint}"
+                rendered.contains(action),
+                "MCP_Web_Use 使用说明应提及 {action}"
             );
         }
+        // 原 Chromium-WebUse 专项提示词应彻底移除
+        assert!(!rendered.contains("Chromium-WebUse"));
     }
 }
 

@@ -1,20 +1,25 @@
 //! delegate_to 委派推断(2026-09-17 自 main_work.rs 拆分)。
 //!
-//! 基于步骤 / branches / 验收文本的关键词匹配纠正委派:
-//! 网页关键词且无桌面 GUI 强信号 → WebUse;其余(含桌面 GUI 强信号 / 仅 shell 词)
-//! → SubAgent。2026-09-18 第 84 轮:WindowUse Agent 已删除,桌面窗口操控流程
-//! 一律委派 SubAgent-Work(macOS / Windows 上持 MCP_Window_Use 工具)。
+//! 基于步骤 / branches / 验收文本的关键词匹配备注与归一:第 89 轮(2026-09-18)
+//! Chromium-WebUse Agent 删除后,执行器统一为 SubAgent-Work(桌面窗口操控走
+//! MCP_Window_Use 工具,浏览器操控走 MCP_Web_Use 工具),本模块仅保留信号
+//! 探测用于「LLM 写了历史遗留 delegate 值时的归一纠正」。
 
 use super::*;
 
-// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B;第 75 轮 WebUse 优先;第 84 轮收缩) ==========
+// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B;第 75 轮 WebUse 优先;
+// ========== 第 84 轮收缩;第 89 轮归一为唯一执行器 SubAgent) ==========
 //
 // 2026-09-17 第 75 轮:把 GUI 关键词拆分为「桌面 GUI 强信号」(DESKTOP_GUI_STRICT_KEYWORDS)
-// 与「Web DOM 通用词」(WEB_DOM_GUI_KEYWORDS);Web 命中即优先 WebUse。
+// 与「Web DOM 通用词」(WEB_DOM_GUI_KEYWORDS)。
 //
 // 2026-09-18 第 84 轮:WindowUse Agent 删除。桌面 GUI 强信号不再路由到专项 Runner,
 // 而是强制 SubAgent-Work(macOS / Windows 上持 MCP_Window_Use 工具,可完成
 // 控件树 / 视觉坐标双路线窗口操控;Bash 全量可用,osascript 等降级路径天然兼容)。
+//
+// 2026-09-18 第 89 轮:Chromium-WebUse Agent 删除。浏览器操控同样降级为
+// SubAgent-Work 的 MCP_Web_Use 工具,执行器唯一化 —— 推断结果只剩
+// Some(SubAgent)(信号命中,归一纠正)或 None(无信号,保持原值)。
 
 pub(super) const SUBAGENT_KEYWORDS: &[&str] = &[
     "osascript",
@@ -40,7 +45,7 @@ pub(super) const SUBAGENT_KEYWORDS: &[&str] = &[
 ///
 /// 与 Web DOM 词汇无交集:微信/钉钉/飞书 等独立桌面应用,以及
 /// `MCP_Window_Use/UIA/控件树` 等明确指代 OS 原生窗口/控件树的 API。
-/// 命中后将压制 web_hit(防止把「https://example.com 这个链接粘到微信对话框」误判为 WebUse)。
+/// 命中后优先归一 SubAgent(防止把「https://example.com 这个链接粘到微信对话框」误判为浏览器操控流程)。
 /// 2026-09-18 第 84 轮:命中改判 SubAgent-Work(原 WindowUse Agent 已删除)。
 pub(super) const DESKTOP_GUI_STRICT_KEYWORDS: &[&str] = &[
     // 桌面 OS 窗口 API(UIA/AX/MCP_Window_Use)
@@ -92,9 +97,10 @@ pub(super) const WEB_DOM_GUI_KEYWORDS: &[&str] = &[
 ];
 
 
-/// 2026-09-16 第 61 轮:浏览器/网页操控关键词(Chromium-WebUse,第 11 角色)。
-/// ★ 第 82 轮:补充 AI 对话类网站强信号 + 中文提交按钮 selector 名,覆盖
-/// Plan agent 输出极简步骤(如"输入问题文本并提交")时的路由误判问题。
+/// 2026-09-16 第 61 轮:浏览器/网页操控关键词(原 Chromium-WebUse 信号)。
+/// ★ 第 82 轮:补充 AI 对话类网站强信号 + 中文提交按钮 selector 名。
+/// 第 89 轮:信号保留但仅用于「确认这是浏览器类流程 → 归一 SubAgent-Work
+/// (持 MCP_Web_Use 工具)」,不再路由到专项 Runner。
 pub(super) const WEB_USE_KEYWORDS: &[&str] = &[
     "browsernew",
     "browsercontrol",
@@ -122,7 +128,6 @@ pub(super) const WEB_USE_KEYWORDS: &[&str] = &[
     "http://",
     "https://",
     // ★ 第 82 轮:AI 对话类网站 + 提交按钮 selector 强信号
-    // 解决 Plan agent 输出"输入文本+点击提交"等极简描述时无 web 锚被误判 SubAgent 的问题。
     "wenxin", "baidu.com", "chatgpt", "deepseek", "kimi", "doubao", "claude.ai", "gemini",
     "ci-submit-button", "submit-button", "提交按钮", "搜素按钮", "搜索按钮", "发送按钮",
     "对话窗口", "对话输入框", "智能助手", "AI助手", "AI 回复", "AI回复",
@@ -170,16 +175,18 @@ pub(super) fn gather_spec_text(spec: &WorkFlowSpec) -> String {
 
 /// 基于步骤文本推断 delegate_to(返回 None 表示不强行纠正,保留原值)。
 ///
-/// 2026-09-18 第 84 轮推断优先级(WindowUse Agent 删除后收缩为两路):
-///   1. 桌面 GUI 强信号(微信/钉钉/飞书/MCP_Window_Use/UIA/控件树 等) → 强制 SubAgent
+/// 2026-09-18 第 89 轮(执行器唯一化后):
+///   1. 桌面 GUI 强信号(微信/钉钉/飞书/MCP_Window_Use/UIA/控件树 等) → SubAgent
 ///      (SubAgent-Work 在 macOS / Windows 持 MCP_Window_Use 工具,Bash 全量可用)
-///   2. web 命中(含 URL)+ 无 desktop-gui 强信号 → WebUse(无论 shell 是否同时出现,
-///      也无论「输入框/按钮」等 Web DOM 词是否出现)
-///   3. 仅 shell 词(无 web 无 desktop-gui) → SubAgent
+///   2. web 命中(含 URL)→ SubAgent(SubAgent-Work 持 MCP_Web_Use 工具,
+///      浏览器操控与 shell 辅助可同单元完成)
+///   3. 仅 shell 词 → SubAgent
 ///   4. 都没命中 → None(保持 Main-Work 显式选择)
 ///
+/// 三类信号命中都归一 SubAgent;保留分层结构是为了日志可读性(哪类信号触发纠正)
+/// 与未来新增执行器时恢复差异化路由的空间。
 /// 不用「输入框/按钮/鼠标/滚轮」等 Web DOM 词作为 GUI 强证据 —— 这些词在
-/// HTML 页面里同样常见,误命中后会压制 web_hit 导致路由错误(第 75 轮 P0 修复)。
+/// HTML 页面里同样常见(第 75 轮 P0 修复)。
 pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     let text = gather_spec_text(spec);
     let shell_hit = text_contains_any_ci(&text, SUBAGENT_KEYWORDS);
@@ -188,16 +195,16 @@ pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     // ★ 第 82 轮:URL 出现也作为 web 强信号(关键词表可能漏列新网站)
     let url_hit = text_contains_url(&text);
 
-    // 规则 1:桌面 GUI 强信号 → 强制 SubAgent(覆盖 web/shell;MCP_Window_Use 承担窗口操控)。
+    // 规则 1:桌面 GUI 强信号 → SubAgent(MCP_Window_Use 承担窗口操控)。
     if desktop_gui_hit {
         return Some(AgentRole::SubAgent);
     }
-    // 规则 2:web 命中(无 desktop-gui 强信号)→ WebUse。
-    // shell 词同时出现不构成压制(web 任务是主体,shell 是辅助)。
+    // 规则 2:web 命中(含 URL)→ SubAgent(MCP_Web_Use 承担浏览器操控,
+    // LLM 若写了历史遗留 delegate 值在此归一)。
     if web_hit || url_hit {
-        return Some(AgentRole::WebUse);
+        return Some(AgentRole::SubAgent);
     }
-    // 规则 3:仅 shell 词 → SubAgent(WebUse 没有 Bash)。
+    // 规则 3:仅 shell 词 → SubAgent。
     if shell_hit {
         return Some(AgentRole::SubAgent);
     }
@@ -237,7 +244,7 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec![],
-            delegate_to: AgentRole::WebUse, // 显式选错
+            delegate_to: AgentRole::MainWork, // 显式选错
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -256,7 +263,7 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec!["找到目标窗口 id".into()],
-            delegate_to: AgentRole::WebUse, // 显式选错
+            delegate_to: AgentRole::MainWork, // 显式选错
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -324,7 +331,7 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec![],
-            delegate_to: AgentRole::WebUse, // 显式选错
+            delegate_to: AgentRole::MainWork, // 显式选错
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -344,7 +351,7 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec!["消息出现在会话窗口".into()],
-            delegate_to: AgentRole::WebUse, // 显式选错
+            delegate_to: AgentRole::MainWork, // 显式选错
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -360,18 +367,18 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec![],
-            delegate_to: AgentRole::WebUse, // 显式选错
+            delegate_to: AgentRole::MainWork, // 显式选错
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
-    // ========== 2026-09-17 第 75 轮 新增回归用例(WebUse 优先 / 桌面 GUI 严判) ==========
+    // ========== 2026-09-17 第 75 轮回归用例(第 89 轮起断言统一 SubAgent) ==========
 
     #[test]
     fn wenxin_url_with_input_box_routes_to_webuse() {
         // 第 75 轮 P0 修复核心回归:用户真实失败任务。
         // steps 同时含 web 词(打开网址/wenxin.baidu.com)和 web DOM 词(输入框/按钮),
-        // 旧版被"输入框/点击按钮"压制 → WindowUse → 死循环;新版必须 WebUse。
+        // 第 89 轮:浏览器类流程统一 SubAgent-Work(MCP_Web_Use 工具)。
         let spec = WorkFlowSpec {
             id: "wf-wenxin".into(),
             name: "文心一言对话".into(),
@@ -387,12 +394,12 @@ mod infer_tests {
             acceptance: vec!["对话窗口出现 AI 回复内容".into()],
             delegate_to: AgentRole::SubAgent, // LLM 错判
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
     fn pure_browser_open_url_routes_to_webuse() {
-        // 通用 web 场景:无 strict GUI 词,只有 web 词 → WebUse
+        // 通用 web 场景:无 strict GUI 词,只有 web 词 → SubAgent(MCP_Web_Use)
         let spec = WorkFlowSpec {
             id: "wf-browser-open".into(),
             name: "浏览器截图".into(),
@@ -406,13 +413,13 @@ mod infer_tests {
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
     fn wechat_desktop_app_with_url_still_routes_to_subagent() {
         // 反向用例:步骤中包含 URL 但桌面应用强信号(微信)出现 → 仍判 SubAgent-Work,
-        // 防止「在微信对话框里发送 https://example.com」任务被误判 WebUse。
+        // 防止「在微信对话框里发送 https://example.com」任务被误判为浏览器流程。
         let spec = WorkFlowSpec {
             id: "wf-wx-url".into(),
             name: "微信发送链接".into(),
@@ -424,15 +431,14 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec![],
-            delegate_to: AgentRole::WebUse, // LLM 错判
+            delegate_to: AgentRole::MainWork, // LLM 错判
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
     fn web_with_shell_helper_still_routes_to_webuse() {
-        // web 任务主体 + shell 辅助(常见模式):不开 GUI strict → WebUse。
-        // 旧版双命中会判 SubAgent(WebUse 没 Bash),新版明确 WebUse 优先。
+        // web 任务主体 + shell 辅助(常见模式):不开 GUI strict → SubAgent(MCP_Web_Use + Bash 同单元可用)。
         let spec = WorkFlowSpec {
             id: "wf-sh-web".into(),
             name: "网页辅助".into(),
@@ -446,7 +452,7 @@ mod infer_tests {
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
@@ -479,7 +485,7 @@ mod infer_tests {
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     // ★ 第 82 轮:AI 对话类网站关键词也应判 WebUse
@@ -499,7 +505,7 @@ mod infer_tests {
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     // ★ 第 82 轮:极简步骤("输入文本+点击提交")无任何关键词,加 URL 后才判 WebUse
@@ -522,6 +528,6 @@ mod infer_tests {
             acceptance: vec!["对话窗口出现 AI 回复,内容与 https://wenxin.baidu.com/ 一致".into()],
             delegate_to: AgentRole::SubAgent,
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 }

@@ -79,18 +79,9 @@ pub struct ExecutionTrace {
     /// - 字段以 serde 默认值兼容旧 trace 反序列化(新增字段对老数据为 `[]`)。
     #[serde(default)]
     pub tool_call_log: Vec<ToolCallLogEntry>,
-    /// 首迭代 forced tool 是否真正生效(2026-09-16 第 68 轮新增)。
-    ///
-    /// - `None` = 未设置 first_iter_forced_tool;
-    /// - `Some(true)` = 首迭代 LLM 确实调用了 forced tool;
-    /// - `Some(false)` = 首迭代 forced tool 被降级或 LLM 未响应,返回了纯文本。
-    /// 用于 TUI 证据段显示 forced_tool 状态,快速定位「0 工具调用」根因。
-    #[serde(default)]
-    pub forced_tool_effective: Option<bool>,
-    /// 2026-09-17 第 75 轮:Runner 实际执行的 Agent 角色(SubAgent / WebUse)。
+    /// 2026-09-17 第 75 轮:Runner 实际执行的 Agent 角色(当前执行器统一为 SubAgent)。
     /// 由 Runner 在 `run_unit_inner` 入口写入;若 `runner_role != intended_role`,
-    /// 说明 WorkFlow 被路由到了一个与步骤需求不匹配的 Runner(典型场景:网页任务
-    /// 错误路由到 SubAgentRunner,Runner 没有 Browser* 工具 → tool_calls=0)。
+    /// 说明 WorkFlow 被路由到了一个与步骤需求不匹配的 Runner。
     #[serde(default)]
     pub runner_role: Option<crate::agent::context::AgentRole>,
     /// 2026-09-17 第 75 轮:WorkFlow 期望的 Agent 角色(`wf.delegate_to`)。
@@ -178,7 +169,6 @@ impl Default for ExecutionTrace {
             bash_exit_nonzero_count: 0,
             last_bash_exit_code: default_last_bash_exit_code(),
             tool_call_log: Vec::new(),
-            forced_tool_effective: None,
             runner_role: None,
             intended_role: None,
             permission_missing: Vec::new(),
@@ -253,10 +243,9 @@ impl ExecutionTrace {
         }
 
         // 5.5) 委派错配信号(2026-09-17 第 75 轮):Runner 实际角色 ≠ WorkFlow 期望角色。
-        // 弱信号,不进入 `is_failed()`;典型场景:网页任务被路由到 SubAgentRunner,
-        // Runner 没有 Browser* 工具 → tool_calls=0 → 单元"看起来"失败但其实是路由问题。
-        // QC 拿到此信号后可以给出明确文案("该 WorkFlow 应走 webuse 但走了 subagent"),
-        // TUI 据此打印 `[路由错配]` 诊断行(见 `src/tui/dispatch.rs`)。
+        // 弱信号,不进入 `is_failed()`;第 89 轮起执行器统一为 SubAgent-Work
+        // (浏览器操控由 MCP_Web_Use 工具承担),该信号保留用于未来新增执行器时的
+        // 路由对账,TUI 据此打印 `[路由错配]` 诊断行(见 `src/tui/dispatch.rs`)。
         if let (Some(r), Some(i)) = (self.runner_role, self.intended_role) {
             if r != i && self.tool_calls == 0 {
                 signals.push(format!(

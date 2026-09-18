@@ -482,7 +482,7 @@ pub fn format_failed_detail(
                 s.elapsed_ms as f64 / 1000.0
             )),
             "wf" => out.push_str(&format!(
-                "  [wf] {} SubAgent/WebUse 执行({:.2}s)\n",
+                "  [wf] {} SubAgent 执行({:.2}s)\n",
                 s.wf_id.as_deref().unwrap_or("?"),
                 s.elapsed_ms as f64 / 1000.0
             )),
@@ -921,58 +921,46 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
             }
             brief
         }
-        // ★ 2026-09-17 第 79 轮 P2-5:Browser* 工具差异化简报。
-        // WebUse 是第 11 角色的主工具面,统一信封 JSON 截 80 噪声大;
-        // 突出「定位(page_id/url)+ 意图(action/info)」两要素。
-        "BrowserNew" => {
-            let url = extract_json_field(args_json, "url").unwrap_or_default();
-            if url.is_empty() {
-                truncate_chars(args_json, 60)
-            } else {
-                format!("url={}", truncate_chars(&url, 44))
-            }
-        }
-        "BrowserControl" => {
+        // ★ 2026-09-18 第 89 轮:MCP_Web_Use 统一入口简报(原 Browser* 四分支合并)。
+        // 突出「定位(page_id/url)+ 意图(action/act/info)」两要素。
+        "MCP_Web_Use" => {
+            let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
             let pid = extract_json_field(args_json, "page_id").unwrap_or_default();
-            let action = extract_json_field(args_json, "action").unwrap_or_default();
-            if pid.is_empty() && action.is_empty() {
-                truncate_chars(args_json, 60)
-            } else {
-                format!(
-                    "{} action={}",
-                    truncate_chars(&pid, 12),
-                    truncate_chars(&action, 18)
-                )
+            let mut brief = format!("action={}", truncate_chars(&action, 16));
+            if !pid.is_empty() {
+                brief.push_str(&format!(" page={}", truncate_chars(&pid, 12)));
             }
-        }
-        "BrowserInspect" => {
-            let pid = extract_json_field(args_json, "page_id").unwrap_or_default();
-            let info = extract_json_field(args_json, "info").unwrap_or_default();
-            if pid.is_empty() && info.is_empty() {
-                truncate_chars(args_json, 60)
-            } else {
-                format!(
-                    "{} info={}",
-                    truncate_chars(&pid, 12),
-                    truncate_chars(&info, 18)
-                )
+            match action.as_str() {
+                "open" => {
+                    let url = extract_json_field(args_json, "url").unwrap_or_default();
+                    if !url.is_empty() {
+                        brief.push_str(&format!(" url={}", truncate_chars(&url, 40)));
+                    }
+                }
+                "control" => {
+                    let cact =
+                        extract_json_field(args_json, "control_action").unwrap_or_default();
+                    if !cact.is_empty() {
+                        brief.push_str(&format!(" act={}", truncate_chars(&cact, 16)));
+                    }
+                }
+                "inspect" => {
+                    let info = extract_json_field(args_json, "info").unwrap_or_default();
+                    if !info.is_empty() {
+                        brief.push_str(&format!(" info={}", truncate_chars(&info, 16)));
+                    }
+                }
+                _ => {}
             }
-        }
-        "BrowserClose" | "BrowserList" => {
-            let pid = extract_json_field(args_json, "page_id").unwrap_or_default();
-            if pid.is_empty() {
-                truncate_chars(args_json, 40)
-            } else {
-                truncate_chars(&pid, 12)
-            }
+            brief
         }
         _ => truncate_chars(args_json, 80),
     }
 }
 
-/// ★ 2026-09-17 第 79 轮 P2-5:Browser 工具成功输出的信封精简摘要。
+/// ★ 2026-09-17 第 79 轮 P2-5(第 89 轮随 MCP_Web_Use 更名):浏览器工具成功输出的信封精简摘要。
 ///
-/// Browser* 工具返回 `{code,message,data}` JSON 信封,原始 output_summary 截 80
+/// MCP_Web_Use 返回 `{code,message,data}` JSON 信封,原始 output_summary 截 80
 /// 全是转义噪声。这里解析信封后拼「code/message + 关键 data 字段」:
 /// page_id / url / title / spawned_page_id / 文本长度(text·outer_html 等字段)。
 /// 解析失败回退 None(调用方走普通截断)。
@@ -1161,42 +1149,35 @@ mod tool_args_brief_tests {
         assert!(brief.len() <= 81); // 80 + …
     }
 
-    // ========== 2026-09-17 第 79 轮 P2-5:Browser* 工具简报 ==========
+    // ========== 2026-09-18 第 89 轮:MCP_Web_Use 工具简报(原 Browser* 合并) ==========
 
     #[test]
-    fn browser_new_brief_extracts_url() {
-        let json = r#"{"url":"https://wenxin.baidu.com/","mode":"hidden"}"#;
-        let brief = tool_args_brief("BrowserNew", json);
+    fn mcp_web_use_open_brief_extracts_url() {
+        let json = r#"{"action":"open","url":"https://wenxin.baidu.com/","mode":"hidden"}"#;
+        let brief = tool_args_brief("MCP_Web_Use", json);
         assert!(
-            brief.starts_with("url="),
-            "BrowserNew brief 应以 url= 开头,实际: {brief}"
+            brief.starts_with("action=open"),
+            "MCP_Web_Use open brief 应以 action=open 开头,实际: {brief}"
         );
         assert!(brief.contains("wenxin.baidu.com"));
     }
 
     #[test]
-    fn browser_control_brief_combines_page_id_and_action() {
-        let json = r#"{"page_id":"p_ab12cd34","action":"input_text","params":{"selector":"textarea","text":"你好"}}"#;
-        let brief = tool_args_brief("BrowserControl", json);
+    fn mcp_web_use_control_brief_combines_page_id_and_act() {
+        let json = r#"{"action":"control","page_id":"p_ab12cd34","control_action":"input_text","params":{"selector":"textarea","text":"你好"}}"#;
+        let brief = tool_args_brief("MCP_Web_Use", json);
         assert!(brief.contains("p_ab12cd34"), "应含 page_id: {brief}");
-        assert!(brief.contains("action=input_text"), "应含 action: {brief}");
+        assert!(brief.contains("act=input_text"), "应含 act: {brief}");
         assert!(!brief.contains("你好"), "params 正文不应刷屏: {brief}");
     }
 
     #[test]
-    fn browser_inspect_brief_combines_page_id_and_info() {
+    fn mcp_web_use_inspect_brief_combines_page_id_and_info() {
         let json =
-            r#"{"page_id":"p_ab12cd34","info":"elements","params":{"selector":"[class*=answer]"}}"#;
-        let brief = tool_args_brief("BrowserInspect", json);
+            r#"{"action":"inspect","page_id":"p_ab12cd34","info":"elements","params":{"selector":"[class*=answer]"}}"#;
+        let brief = tool_args_brief("MCP_Web_Use", json);
         assert!(brief.contains("p_ab12cd34"));
         assert!(brief.contains("info=elements"));
-    }
-
-    #[test]
-    fn browser_close_brief_is_page_id_only() {
-        let json = r#"{"page_id":"p_ff00ee11"}"#;
-        let brief = tool_args_brief("BrowserClose", json);
-        assert_eq!(brief, "p_ff00ee11");
     }
 
     #[test]

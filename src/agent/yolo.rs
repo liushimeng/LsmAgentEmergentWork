@@ -100,9 +100,11 @@ pub struct TaskClassification {
     pub yolo_degraded: bool,
     /// 2026-09-16 第 59 轮:基于用户原始输入关键词推断的 delegate_to 建议。
     /// Main-Work 拆解 WorkFlow 时优先采用此值设置 delegate_to。
-    /// 取值:"webuse" / "subagent" / None(不强制,由 Main-Work 自行判断)。
+    /// 取值:"subagent" / None(不强制,由 Main-Work 自行判断)。
     /// 2026-09-18 第 84 轮:删除 "windowuse" 产出(WindowUse Agent 已删除,
     /// 桌面窗口操控由 SubAgent-Work 的 MCP_Window_Use 工具承担)。
+    /// 2026-09-18 第 89 轮:删除 "webuse" 产出(Chromium-WebUse Agent 已删除,
+    /// 浏览器操控由 SubAgent-Work 的 MCP_Web_Use 工具承担)。
     #[serde(default)]
     pub suggested_delegate: Option<String>,
 }
@@ -316,11 +318,13 @@ fn extract_user_prompt(context: &[ChatMessage]) -> String {
 
 /// 2026-09-16 第 59 轮:基于用户原始 prompt 关键词推断 delegate_to。
 ///
-/// 网页操控类关键词命中 → 返回 "webuse";代码/文件操作类 → "subagent";
-/// 无法判断 → None(让 Main-Work 自行判断)。
+/// 代码/文件操作类 → "subagent";无法判断 → None(让 Main-Work 自行判断)。
 /// 2026-09-18 第 84 轮:删除窗口操控关键词表与 "windowuse" 产出 ——
 /// WindowUse Agent 已删除,桌面窗口操控任务走 medium 档由 Main-Work
 /// 关键词推断委派给 SubAgent-Work(MCP_Window_Use 工具)。
+/// 2026-09-18 第 89 轮:删除网页操控关键词表与 "webuse" 产出 ——
+/// Chromium-WebUse Agent 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_Use
+/// 工具承担(网页类任务仍按 Yolo 提示词最低判 medium,拆解后统一 SubAgent 执行)。
 ///
 /// 关键词表覆盖:
 /// - 代码/文件:编写/修改/创建文件/代码/rust/python/git/cargo/test
@@ -348,55 +352,9 @@ const SUBAGENT_KEYWORDS: &[&str] = &[
     "programming",
 ];
 
-/// 2026-09-16 第 61 轮:浏览器/网页操控类关键词(Chromium-WebUse,第 11 角色)。
-/// 命中且未命中代码关键词时,suggested_delegate 返回 "webuse"。
-const WEB_USE_KEYWORDS: &[&str] = &[
-    "浏览器",
-    "网页",
-    "网站",
-    "网址",
-    "打开网页",
-    "访问网站",
-    "登录网站",
-    "登录页",
-    "爬虫",
-    "抓取网页",
-    "抓取页面",
-    "采集",
-    "chrome",
-    "chromium",
-    "edge",
-    "browser",
-    "web page",
-    "website",
-    "webpage",
-    "截图网页",
-    "页面截图",
-    "表单提交",
-    "下拉",
-    "滚动页面",
-    "悬停",
-    "双击",
-    "右键点击",
-    "http://",
-    "https://",
-    "url",
-    "链接打开",
-    "web 端",
-    "web端",
-];
-
 pub fn infer_suggested_delegate(user_prompt: &str) -> Option<String> {
     let lower = user_prompt.to_lowercase();
     let code_hit = SUBAGENT_KEYWORDS.iter().any(|k| lower.contains(k));
-    let web_hit = WEB_USE_KEYWORDS.iter().any(|k| lower.contains(k));
-    // ★ 2026-09-17 第 78 轮 P1-3:web 优先于 code——
-    // 「写 Python 脚本访问浏览器」本质是 web 任务,code 仅辅助;此前 web+code 双命中
-    // 时直接返回 None → 委派默认 SubAgent → 错失 WebUseRunner 的
-    // extract_page_reply_from_session 出口兜底,真实抓取的页面文本无法落到 TUI。
-    if web_hit {
-        return Some("webuse".to_string());
-    }
     if code_hit {
         return Some("subagent".to_string());
     }
@@ -879,8 +837,9 @@ mod tests {
     }
 
     #[test]
-    fn infer_suggested_delegate_web_use_keywords() {
-        // 2026-09-16 第 61 轮:网页/浏览器操控类任务 → webuse
+    fn infer_suggested_delegate_web_keywords_return_none() {
+        // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_Use 工具),
+        // 网页类关键词不再产出 "webuse";执行器统一 SubAgent,无需专项委派。
         let cases = [
             "帮我打开网页 https://example.com 并截图",
             "抓取这个网站的标题列表",
@@ -890,15 +849,14 @@ mod tests {
         for prompt in cases {
             assert_eq!(
                 infer_suggested_delegate(prompt),
-                Some("webuse".to_string()),
-                "网页操控类应推断 webuse: {prompt}"
+                None,
+                "网页操控类不再产出专项委派: {prompt}"
             );
         }
-        // ★ 2026-09-17 第 78 轮 P1-3:优先级 web > code。
-        // 「修改网页代码」含 web 关键词 → 仍判 webuse(网页代码修改本质上仍涉及网页上下文)。
+        // 「修改网页代码」含代码关键词 → 判 subagent。
         assert_eq!(
             infer_suggested_delegate("修改网页代码里的 bug"),
-            Some("webuse".to_string())
+            Some("subagent".to_string())
         );
     }
 

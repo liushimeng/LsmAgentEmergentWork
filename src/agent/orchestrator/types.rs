@@ -12,11 +12,6 @@ pub struct OrchestratorConfig {
     pub history_limit: usize,
     /// SubAgent-Work 单次单元最大迭代
     pub subagent_max_iterations: usize,
-    /// 2026-09-17 第 74 轮:WebUse 单次单元最大迭代独立配置。
-    /// 浏览器操控任务通常需要 10-15 轮(打开/等待/查询/输入/点击/等待/提取),
-    /// 16 上限极易过早耗尽,默认上调至 32。
-    /// 环境变量 `LAEW_WEBUSE_MAX_ITER` 可覆盖。
-    pub webuse_max_iterations: usize,
     /// 同层无依赖 WorkFlow 的最大并行数(信号量上限,对齐 atomcode Semaphore(3) 惯例)
     pub max_parallel_workflows: usize,
     /// 调试事件采集器(`-debug` 调试模式时注入,默认 None 零开销)
@@ -25,16 +20,10 @@ pub struct OrchestratorConfig {
 
 impl Default for OrchestratorConfig {
     fn default() -> Self {
-        let webuse_max_iterations = std::env::var("LAEW_WEBUSE_MAX_ITER")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n >= 8 && *n <= 128)
-            .unwrap_or(32);
         Self {
             max_retry_per_level: 3,
             history_limit: DEFAULT_HISTORY_LIMIT,
             subagent_max_iterations: 16,
-            webuse_max_iterations,
             max_parallel_workflows: 3,
             debug: None,
         }
@@ -51,7 +40,7 @@ pub struct WorkflowResult {
     pub usage: Usage,
     /// SubAgent 执行轨迹(2026-09-09 第 05 轮),失败时为 None。
     pub subflow_trace: Option<ExecutionTrace>,
-    /// 2026-09-16 第 57 轮:执行器角色(SubAgent / WebUse),TUI 据此标识责任 Agent
+    /// 2026-09-16 第 57 轮:执行器角色(当前统一为 SubAgent),TUI 据此标识责任 Agent
     #[serde(default = "default_wf_exec_role")]
     pub exec_role: AgentRole,
     /// 2026-09-16 第 57 轮:执行器墙钟耗时(毫秒)

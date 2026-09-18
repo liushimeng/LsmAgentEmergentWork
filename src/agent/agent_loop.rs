@@ -118,33 +118,21 @@ impl Agent {
         // trace.artifacts 上限(2026-09-09 第 15 轮):防止极端任务写大量文件时轨迹膨胀。
         const ARTIFACTS_LIMIT: usize = 8;
 
-        // ★ 第 82 轮 P1-3:浏览器失败学习 —— 同一 (tool, selector) 连续失败 ≥2 次时,
-        // 自动在 error_summary 追加换姿势提示(scroll_into_view / wait / 换 selector /
-        // eval_js),避免 LLM 在 16 次迭代里用同一 selector 反复重试。
-        // 用 HashMap 维护累计计数;selector 从 BrowserControl / BrowserInspect 的
-        // args.selector 字段提取,非浏览器工具不参与。
+        // ★ 第 82 轮 P1-3(第 89 轮单工具化):浏览器失败学习 —— 同一 (tool, selector)
+        // 连续失败 ≥2 次时,自动在 error_summary 追加换姿势提示(scroll_into_view /
+        // wait / 换 selector / eval_js),避免 LLM 在 16 次迭代里用同一 selector 反复重试。
+        // 用 HashMap 维护累计计数;selector 从 MCP_Web_Use 的 args.params.selector
+        // 字段提取(兼容顶层 args.selector),非浏览器工具不参与。
         use std::collections::HashMap;
         let mut browser_failure_counts: HashMap<(String, String), u32> = HashMap::new();
 
-        // 2026-09-16 第 63 轮:首迭代强制工具状态跟踪。
-        // 首迭代强制调用指定工具(如 BrowserNew)后,后续轮次恢复 auto,
-        // 避免全程强制导致 LLM 无法自由决策。
-        let mut first_iter_forced_done = false;
-        // 2026-09-16 第 68 轮:首迭代 forced tool 是否真正生效(写回 trace)。
-        // iter=0 调用完成后,检查 LLM 是否真的调用了 forced tool;
-        // 若未调用(被降级或 LLM 忽略),标记 false 供 TUI 证据段展示。
-        let mut forced_tool_maybe_effective = if self.first_iter_forced_tool.is_some() {
-            Some(false) // 先假设未生效,iter=0 完成后更新
-        } else {
-            None
-        };
         // 2026-09-16 第 68 轮 P1-C:连续无工具调用计数 —— 连续 N 轮无 tool_use 时
-        // 提前终止,避免 WebUse 等专项 Agent 在 nudge 失效时跑满 max_iterations。
+        // 提前终止,避免专项任务空跑跑满 max_iterations。
         const NO_TOOL_USE_THRESHOLD: usize = 3;
         let mut consecutive_no_tool_rounds: usize = 0;
 
         // Agent 会话开始(2026-09-17 第 70 轮运行日志):--debug/--info 日志文件的
-        // 角色级起点事件;所有 11 个角色都经本函数,一处埋点全角色覆盖。
+        // 角色级起点事件;所有角色都经本函数,一处埋点全角色覆盖。
         info!(
             agent = %self.profile.name,
             session = %session.id(),
@@ -160,25 +148,6 @@ impl Agent {
                 if token.is_cancelled() {
                     backfill_cancelled_tool_results(session.context_mut());
                     return Err(AgentError::Cancelled);
-                }
-            }
-            // 2026-09-16 第 63 轮:首迭代强制工具注入。
-            // iter==0 且 first_iter_forced_tool 已设置且未执行过 → 强制指定工具;
-            // 后续轮次恢复 auto(清除 forced_tool,保留 emit_tool 语义)。
-            if iter == 0 {
-                if let Some(tool) = &self.first_iter_forced_tool {
-                    meta.forced_tool = Some(tool.clone());
-                    debug!(forced_tool = %tool, "首迭代强制工具注入");
-                }
-            } else if !first_iter_forced_done {
-                // 首迭代已完成,恢复 auto(但保留 emit_tool 结构化通道)
-                if self.first_iter_forced_tool.is_some() {
-                    meta.forced_tool = if forced_tools_enabled() {
-                        self.profile.emit_tool.clone()
-                    } else {
-                        None
-                    };
-                    first_iter_forced_done = true;
                 }
             }
             debug!(iteration = iter, "agent step");
@@ -275,33 +244,30 @@ impl Agent {
                         )]));
                 }
 
-                // 2026-09-16 第 68 轮 P1-C:连续无工具调用计数 —— 避免专项 Agent
-                // (WebUse)在 forced tool 降级 + nudge 失效时跑满 max_iterations。
+                // 2026-09-16 第 68 轮 P1-C:连续无工具调用计数 —— 避免专项任务
+                // 在引导失效时跑满 max_iterations。
                 // 阈值 NO_TOOL_USE_THRESHOLD=3:给 LLM 3 次机会(含 nudge 引导),仍无工具
                 // 调用则提前终止,把失败信息返回 Runner/QC 而不是空跑 16 轮。
                 consecutive_no_tool_rounds += 1;
                 if consecutive_no_tool_rounds >= NO_TOOL_USE_THRESHOLD {
                     // 2026-09-17 第 70 轮:已有工具调用产出时降级为「优雅收尾」。
                     // 第 68 轮 P1-C 的 no_tool_use 硬失败针对「全程 0 工具调用的空跑」;
-                    // 但 WebUse 常见合法路径是「先完成工具动作、再输出终答文本」,
-                    // 配合 nudge(1..=6 轮)会把终答反复顶回,计数到 3 后硬失败 ——
-                    // 真实成果被 early_terminate 吞掉(e2e 5e-1 回归:BrowserNew 已执行,
-                    // MOCK_FINAL_ANSWER 终答被判 failed)。改为正常 finalize 交 QC 判定,
-                    // 仅 trace.tool_calls == 0 时保留硬失败语义(防 forced tool + nudge
-                    // 双失效时空跑 max_iterations,第 68 轮本意)。
+                    // 但浏览器类任务的常见合法路径是「先完成工具动作、再输出终答文本」,
+                    // 硬失败会把真实成果被 early_terminate 吞掉(e2e 5e-1 回归)。
+                    // 改为正常 finalize 交 QC 判定,仅 trace.tool_calls == 0 时保留
+                    // 硬失败语义(防空跑 max_iterations,第 68 轮本意)。
                     if trace.tool_calls > 0 {
                         info!(
                             rounds = consecutive_no_tool_rounds,
                             tool_calls = trace.tool_calls,
                             "连续文本轮但本单元已有工具调用,按正常收尾处理(交 QC 判定)"
                         );
-                        return Self::finalize_with_forced_flag(
+                        return Self::finalize_logged(
                             &self.profile.name,
                             trace,
                             &accumulated_text,
                             total_usage,
                             max_tokens_state.as_ref(),
-                            forced_tool_maybe_effective,
                         );
                     }
                     warn!(
@@ -313,45 +279,13 @@ impl Agent {
                     trace.early_terminate_reason =
                         format!("no_tool_use_{}_rounds", consecutive_no_tool_rounds);
                     trace.collect_failure_signals(&accumulated_text);
-                    return Self::finalize_with_forced_flag(
+                    return Self::finalize_logged(
                         &self.profile.name,
                         trace,
                         &accumulated_text,
                         total_usage,
                         max_tokens_state.as_ref(),
-                        forced_tool_maybe_effective,
                     );
-                }
-
-                // 2026-09-16 第 68 轮 P0-A(修复 v2):首迭代 forced tool 未生效时的强引导。
-                // 原 P0-A 的 nudge 仅在 iter==1 触发,但 LLM iter=0 返回纯文本时循环直接退出,
-                // nudge 永远无法触发。现在:iter=0 检测到 forced tool 设置但 LLM 未调用,
-                // 立即注入强引导 nudge,给 LLM 第二次机会。
-                if iter == 0 && self.first_iter_forced_tool.is_some() {
-                    warn!(
-                        forced_tool = self.first_iter_forced_tool.as_deref().unwrap_or("?"),
-                        text_len = completion.text.len(),
-                        "首迭代 forced tool 未生效,LLM 返回纯文本,注入强引导 nudge"
-                    );
-                    session
-                        .context_mut()
-                        .push(ChatMessage::user(FORCED_TOOL_NUDGE_TEXT));
-                    continue;
-                }
-
-                // 2026-09-16 第 61 轮:WebUse 第 1 轮无工具调用 nudge。
-                // 2026-09-16 第 68 轮:移除 truncation_resumes==0 约束。
-                if should_nudge_web_ops(&self.profile.tools.names(), iter)
-                    && !completion.text.trim().is_empty()
-                {
-                    info!(
-                        iter = iter,
-                        "WebUse 无工具调用,注入 nudge 强制 LLM 使用浏览器操控工具"
-                    );
-                    session
-                        .context_mut()
-                        .push(ChatMessage::user(web_ops_nudge_text(iter)));
-                    continue;
                 }
 
                 // 检测截断:输出被 token 上限截断时自动续接
@@ -377,13 +311,12 @@ impl Agent {
                             "截断续接达到上限,返回已累计文本"
                         );
                         trace.truncation_resumes = truncation_resumes;
-                        return Self::finalize_with_forced_flag(
+                        return Self::finalize_logged(
                             &self.profile.name,
                             trace,
                             &accumulated_text,
                             total_usage,
                             max_tokens_state.as_ref(),
-                            forced_tool_maybe_effective,
                         );
                     }
                     // 注入 nudge 并续接
@@ -403,30 +336,13 @@ impl Agent {
 
                 // 非截断,正常返回
                 debug!("agent finished with text answer");
-                return Self::finalize_with_forced_flag(
+                return Self::finalize_logged(
                     &self.profile.name,
                     trace,
                     &accumulated_text,
                     total_usage,
                     max_tokens_state.as_ref(),
-                    forced_tool_maybe_effective,
                 );
-            }
-
-            // 2026-09-16 第 68 轮 P1-B:记录首迭代 forced tool 是否真正生效。
-            // 如果 iter=0 且设置了 first_iter_forced_tool,检查 LLM 返回的 tool_calls
-            // 中是否包含 forced tool 名;若包含则标记 true,否则保持 false(说明被降级或忽略)。
-            if iter == 0 {
-                if let Some(ref forced_name) = self.first_iter_forced_tool {
-                    let effective = completion
-                        .tool_calls
-                        .iter()
-                        .any(|c| c.name == *forced_name);
-                    if let Some(ref mut flag) = forced_tool_maybe_effective {
-                        *flag = effective;
-                    }
-                    debug!(forced_tool = %forced_name, effective = effective, "首迭代 forced 效果检测");
-                }
             }
 
             // 记录 assistant 的工具调用请求(同时附带文本,如果有)
@@ -576,13 +492,15 @@ impl Agent {
                         return Err(AgentError::Cancelled);
                     }
                 };
-                // ★ 第 82 轮 P1-3:浏览器失败学习 —— 同一 (tool, selector) 连续失败 ≥2 次时,
-                // 在 error_summary 追加换姿势提示,避免 LLM 死磕同 selector。
-                // 适用工具:BrowserControl / BrowserInspect(从 args.selector / args.page_id 提 key);
+                // ★ 第 82 轮 P1-3(第 89 轮单工具化):浏览器失败学习 —— 同一 (tool, selector)
+                // 连续失败 ≥2 次时,在 error_summary 追加换姿势提示,避免 LLM 死磕同 selector。
+                // 适用工具:MCP_Web_Use(从 args.params.selector / args.selector 提 key);
                 // 非浏览器工具不参与。失败计数实时递增,成功调用同一 key 不重置(简化)。
-                if is_error && matches!(name.as_str(), "BrowserControl" | "BrowserInspect") {
+                if is_error && name.as_str() == "MCP_Web_Use" {
                     let sel_key = args
-                        .get("selector")
+                        .get("params")
+                        .and_then(|p| p.get("selector"))
+                        .or_else(|| args.get("selector"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "<no_selector>".to_string());
@@ -591,13 +509,18 @@ impl Agent {
                     *count += 1;
                     if *count >= 2 {
                         let hint = format!(
-                            " [提示:已连续失败 {} 次,建议:1) scroll_into_view 2) BrowserControl(wait) 等 500ms 3) 换 selector 或加 nth=N 4) eval_js 直接触发]",
+                            " [提示:已连续失败 {} 次,建议:1) scroll_into_view 2) MCP_Web_Use(control_action=wait) 等 500ms 3) 换 selector 或加 nth=N 4) eval_js 直接触发]",
                             *count
                         );
                         error_summary.push_str(&hint);
                         warn!(
                             tool = %name,
-                            selector = %args.get("selector").and_then(|v| v.as_str()).unwrap_or(""),
+                            selector = %args
+                                .get("params")
+                                .and_then(|p| p.get("selector"))
+                                .or_else(|| args.get("selector"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(""),
                             consecutive = *count,
                             "浏览器工具连续失败,自动追加换姿势提示"
                         );
@@ -687,24 +610,29 @@ impl Agent {
                     let drop_n = recent_tool_history.len() - RECENT_TOOL_HISTORY_LIMIT;
                     recent_tool_history.drain(0..drop_n);
                 }
-                // 2026-09-17 第 74 轮:WebUse post-BrowserNew 引导(放在 push 之前,
-                // 这样可以借用 output 不需要 clone)。BrowserNew 成功返回的 next_steps
-                // 是关键指引(4 步最常见动作),注入 LLM 上下文作为 user message,
-                // 显著降低「16 次迭代 tool_calls=0」类失败模式的概率。
-                let browsernew_hint = if name == "BrowserNew" && !is_error {
-                    if let Some(page_id) = crate::agent::web_use::extract_page_id_from_text(&output) {
+                // 2026-09-17 第 74 轮(第 89 轮单工具化):MCP_Web_Use post-open 引导
+                // (放在 push 之前,这样可以借用 output 不需要 clone)。action=open 成功
+                // 返回的 next_steps 是关键指引(4 步最常见动作),注入 LLM 上下文作为
+                // user message,显著降低「多次迭代 tool_calls=0」类失败模式的概率。
+                let web_open_hint = if name == "MCP_Web_Use"
+                    && !is_error
+                    && args.get("action").and_then(|v| v.as_str()) == Some("open")
+                {
+                    if let Some(page_id) =
+                        crate::agent::tools::mcp_web_use::extract_page_id_from_text(&output)
+                    {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&output) {
                             v.get("data")
                                 .and_then(|d| d.get("next_steps"))
                                 .map(|next_steps| {
                                     format!(
-                                        "【WebUse 浏览器启动后续步骤引导】\n\
-                                         BrowserNew 成功 → page_id={page_id}。\n\
-                                         严格按以下 4 步执行(已 next_steps 已为你准备好 selector_hint):\n\
+                                        "【MCP_Web_Use 浏览器启动后续步骤引导】\n\
+                                         action=open 成功 → page_id={page_id}。\n\
+                                         严格按以下 4 步执行(next_steps 已为你准备好 selector_hint):\n\
                                          {next_steps}\n\
                                          说明:\n\
-                                         - 每次 BrowserControl/BrowserInspect 都要带 page_id={page_id}\n\
-                                         - 如果某一步 selector_hint 不命中,改用 BrowserInspect(info=elements) 查看真实 DOM\n\
+                                         - 每次 control/inspect 都要带 page_id={page_id}\n\
+                                         - 如果某一步 selector_hint 不命中,改用 inspect(info=elements) 查看真实 DOM\n\
                                          - 按钮是图片(img 元素)时,可直接 click(img 元素) 也能触发提交\n\
                                          - 输入框有 JS 框架(React/Vue)拦截时,改 use_js=false 走 sendkeys 路径",
                                         page_id = page_id,
@@ -718,7 +646,7 @@ impl Agent {
                 session
                     .context_mut()
                     .push(ChatMessage::tool_result(id, output, is_error));
-                if let Some(hint) = browsernew_hint {
+                if let Some(hint) = web_open_hint {
                     session.context_mut().push(ChatMessage::user(&hint));
                 }
             }
@@ -738,13 +666,12 @@ impl Agent {
                 }
                 accumulated_text.push_str(&format!("```json\n{json}\n```"));
                 debug!("agent finished with structured tool_use output");
-                return Self::finalize_with_forced_flag(
+                return Self::finalize_logged(
                     &self.profile.name,
                     trace,
                     &accumulated_text,
                     total_usage,
                     max_tokens_state.as_ref(),
-                    forced_tool_maybe_effective,
                 );
             }
 
@@ -830,13 +757,12 @@ impl Agent {
                     hist_len = recent_tool_history.len(),
                     history = history_block,
                 );
-                return Self::finalize_with_forced_flag(
+                return Self::finalize_logged(
                     &self.profile.name,
                     trace,
                     &fallback_text,
                     total_usage,
                     max_tokens_state.as_ref(),
-                    forced_tool_maybe_effective,
                 );
             }
         }
@@ -950,9 +876,6 @@ impl Agent {
 
     /// 同步填充 trace 的输出字节数 + 失败信号 + max_tokens 升级历史(2026-09-09 第 09 轮)
     /// 后返回 Ok 三元组(在循环正常结束后调用,异常路径由调用方继续包装)。
-    ///
-    /// `forced_tool_effective` 由调用方传入(None = 未设置 forced tool;
-    /// Some(true/false) = forced tool 是否被 LLM 真正执行)。
     pub(super) fn finalize_with_max_tokens(
         mut trace: ExecutionTrace,
         text: &str,
@@ -966,20 +889,17 @@ impl Agent {
         Ok((text.to_string(), total_usage, trace))
     }
 
-    /// 2026-09-16 第 68 轮 P1-B:包装 finalize,写入 forced_tool_effective 字段。
-    /// 所有正常/提前返回路径统一经本函数,确保 trace.forced_tool_effective 被填充。
+    /// finalize 包装:所有正常/提前返回路径统一经本函数。
     ///
     /// 2026-09-17 第 70 轮:同时作为 Agent 会话结束日志的单一收口
     /// (迭代数 / 工具成败计数 / 提前终止原因 / 用量)。
-    fn finalize_with_forced_flag(
+    fn finalize_logged(
         agent_name: &str,
-        mut trace: ExecutionTrace,
+        trace: ExecutionTrace,
         text: &str,
         total_usage: Usage,
         max_tokens_state: &MaxTokensState,
-        forced_tool_effective: Option<bool>,
     ) -> Result<(String, Usage, ExecutionTrace)> {
-        trace.forced_tool_effective = forced_tool_effective;
         info!(
             agent = agent_name,
             iterations = trace.iterations,

@@ -83,7 +83,6 @@ impl AgentMessage {
             AgentRole::QualityCheck => "Quality-Check",
             AgentRole::SessionContext => "SessionContext",
             AgentRole::Compact => "Compact",
-            AgentRole::WebUse => "WebUse",
             AgentRole::WorkFlow => "WorkFlow",
         }
     }
@@ -200,7 +199,7 @@ mod tests {
     fn hint_window_text_read() {
         let msg = AgentMessage::new(
             "s1",
-            AgentRole::WebUse,
+            AgentRole::Compact,
             AgentRole::SubAgent,
             MessagePayload::WindowTextRead {
                 window_id: "w1".into(),
@@ -210,7 +209,7 @@ mod tests {
             },
         );
         let hint = msg.hint();
-        assert!(hint.contains("WebUse"));
+        assert!(hint.contains("Compact"));
         assert!(hint.contains("记事本"));
         assert!(hint.contains("hello world"));
     }
@@ -220,7 +219,7 @@ mod tests {
         let msg = AgentMessage::new(
             "s1",
             AgentRole::SubAgent,
-            AgentRole::WebUse,
+            AgentRole::Compact,
             MessagePayload::TextToWindow {
                 target_window_id: Some("w2".into()),
                 content: "写入这段".into(),
@@ -236,7 +235,7 @@ mod tests {
         let msg = AgentMessage::new(
             "s1",
             AgentRole::SubAgent,
-            AgentRole::WebUse,
+            AgentRole::Compact,
             MessagePayload::TextToWindow {
                 target_window_id: None,
                 content: "xxx".into(),
@@ -251,7 +250,7 @@ mod tests {
         let long = "x".repeat(500);
         let msg = AgentMessage::new(
             "s1",
-            AgentRole::WebUse,
+            AgentRole::Compact,
             AgentRole::SubAgent,
             MessagePayload::WindowTextRead {
                 window_id: "w".into(),
@@ -271,7 +270,7 @@ mod tests {
         let msg = AgentMessage::new(
             "s1",
             AgentRole::MainWork,
-            AgentRole::WebUse,
+            AgentRole::Compact,
             MessagePayload::Data {
                 key: "target_file".into(),
                 value: "/path/to/file.rs".into(),
@@ -287,7 +286,7 @@ mod tests {
         let msg = AgentMessage::new(
             "s1",
             AgentRole::MainWork,
-            AgentRole::WebUse,
+            AgentRole::Compact,
             MessagePayload::WindowFocus {
                 window_id: "w5".into(),
                 reason: "用户需要操作这个窗口".into(),

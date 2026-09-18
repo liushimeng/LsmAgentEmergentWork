@@ -13,8 +13,10 @@ use serde_json::Value;
 
 use crate::llm::{ChatMessage, ContentBlock};
 
-/// 9 个 Agent 角色(2026-09-18 第 84 轮:删除 WindowUse,窗口操控能力降级为
-/// SubAgent-Work 的 MCP_Window_Use 工具,见 docs/MCP_Window_Use/01-设计与解决方案.md)。
+/// 8 个 Agent 角色(2026-09-18 第 84 轮:删除 WindowUse,窗口操控能力降级为
+/// SubAgent-Work 的 MCP_Window_Use 工具;第 89 轮:删除 Chromium-WebUse,
+/// 浏览器操控能力降级为 SubAgent-Work 的 MCP_Web_Use 工具,
+/// 见 docs/MCP_Web_Use/01-设计与解决方案.md)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -37,9 +39,6 @@ pub enum AgentRole {
     Compact,
     /// 工作流编排层:超大型复杂任务自动化编排(第 10 角色)
     WorkFlow,
-    /// 浏览器操控层:网页浏览/信息收集/Web 页面操作(第 11 角色,CDP 驱动 Chromium 系浏览器)
-    #[serde(rename = "webuse")]
-    WebUse,
 }
 
 impl AgentRole {
@@ -52,7 +51,6 @@ impl AgentRole {
             Self::QualityCheck => "quality",
             Self::SessionContext => "session",
             Self::Compact => "compact",
-            Self::WebUse => "webuse",
             Self::WorkFlow => "workflow",
         }
     }
@@ -72,7 +70,9 @@ impl From<&str> for AgentRole {
             "compact" => Self::Compact,
             // 2026-09-18 第 84 轮:WindowUse Agent 已删除,存量序列化值归并 SubAgent。
             "windowuse" => Self::SubAgent,
-            "webuse" => Self::WebUse,
+            // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_Use 工具),
+            // 存量序列化值归并 SubAgent。
+            "webuse" => Self::SubAgent,
             "workflow" => Self::WorkFlow,
             _ => Self::SubAgent,
         }
@@ -164,8 +164,7 @@ mod tests {
         assert_eq!(AgentRole::QualityCheck.as_str(), "quality");
         assert_eq!(AgentRole::SessionContext.as_str(), "session");
         assert_eq!(AgentRole::Compact.as_str(), "compact");
-        assert_eq!(AgentRole::WebUse.as_str(), "webuse");
-        assert_eq!(AgentRole::from("webuse"), AgentRole::WebUse);
+        assert_eq!(AgentRole::from("workflow"), AgentRole::WorkFlow);
     }
 
     #[test]
@@ -181,6 +180,12 @@ mod tests {
     fn legacy_windowuse_str_maps_to_subagent() {
         // 2026-09-18 第 84 轮:存量 "windowuse" 字符串(旧 DB / 旧 WorkFlow JSON)兼容映射
         assert_eq!(AgentRole::from("windowuse"), AgentRole::SubAgent);
+    }
+
+    #[test]
+    fn legacy_webuse_str_maps_to_subagent() {
+        // 2026-09-18 第 89 轮:存量 "webuse" 字符串(旧 DB / 旧 WorkFlow JSON)兼容映射
+        assert_eq!(AgentRole::from("webuse"), AgentRole::SubAgent);
     }
 
     #[test]

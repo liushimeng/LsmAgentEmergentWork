@@ -15,11 +15,11 @@ use crate::error::{AgentError, Result};
 use crate::llm::ToolDef;
 
 pub mod bash;
-pub mod browser;
 pub mod edit;
 pub mod emit;
 pub mod glob;
 pub mod grep;
+pub mod mcp_web_use;
 pub mod mcp_window_use;
 pub mod read;
 pub mod read_detect;
@@ -104,6 +104,8 @@ fn sandbox_with(work_dir: PathBuf) -> SandboxConfig {
 /// 写操作(Write / Edit)带有沙箱拦截,限制在工作目录与系统临时目录。
 /// 2026-09-18 第 84 轮:macOS / Windows 追加 MCP_Window_Use(桌面窗口操控统一入口,
 /// 平台门控见 [`mcp_window_use::mcp_window_use_available`])。
+/// 2026-09-18 第 89 轮:全平台追加 MCP_Web_Use(浏览器网页操控统一入口,
+/// CDP 三平台一致,未装浏览器返回结构化 3001 不崩溃,无需平台门控)。
 pub fn builtin_registry() -> ToolRegistry {
     let sandbox = default_sandbox();
     let mut reg = ToolRegistry::new()
@@ -112,7 +114,8 @@ pub fn builtin_registry() -> ToolRegistry {
         .register(Arc::new(write::WriteTool::new(sandbox.clone())))
         .register(Arc::new(edit::EditTool::new(sandbox.clone())))
         .register(Arc::new(glob::GlobTool))
-        .register(Arc::new(grep::GrepTool));
+        .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(mcp_web_use::McpWebUseTool));
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
     }
@@ -128,7 +131,8 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
         .register(Arc::new(write::WriteTool::new(sandbox.clone())))
         .register(Arc::new(edit::EditTool::new(sandbox.clone())))
         .register(Arc::new(glob::GlobTool))
-        .register(Arc::new(grep::GrepTool));
+        .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(mcp_web_use::McpWebUseTool));
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
     }
@@ -193,20 +197,6 @@ pub fn compact_registry() -> ToolRegistry {
     ToolRegistry::new()
 }
 
-/// Chromium-WebUse Agent 工具注册表(第 11 角色,浏览器操控层,2026-09-16 第 61 轮):
-/// Read(读文件) + BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect。
-/// 不带 Bash/Write(网页操控单元收窄权限面)。
-/// 设计见 `docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md`。
-pub fn web_use_registry() -> ToolRegistry {
-    ToolRegistry::new()
-        .register(Arc::new(read::ReadTool))
-        .register(Arc::new(browser::BrowserNewTool))
-        .register(Arc::new(browser::BrowserListTool))
-        .register(Arc::new(browser::BrowserCloseTool))
-        .register(Arc::new(browser::BrowserControlTool))
-        .register(Arc::new(browser::BrowserInspectTool))
-}
-
 #[cfg(test)]
 mod names_tests {
     use super::*;
@@ -218,22 +208,6 @@ mod names_tests {
         let reg = yolo_registry();
         let names = reg.names();
         assert_eq!(names, vec!["Read", "submit_task_classification"]);
-    }
-
-    #[test]
-    fn web_use_registry_names() {
-        let reg = web_use_registry();
-        assert_eq!(
-            reg.names(),
-            vec![
-                "Read",
-                "BrowserNew",
-                "BrowserList",
-                "BrowserClose",
-                "BrowserControl",
-                "BrowserInspect",
-            ]
-        );
     }
 
     #[test]
@@ -258,5 +232,27 @@ mod names_tests {
             names.contains(&"MCP_Window_Use"),
             cfg!(any(target_os = "macos", target_os = "windows")),
         );
+    }
+
+    #[test]
+    fn builtin_registry_mcp_web_use_all_platforms() {
+        // 2026-09-18 第 89 轮:MCP_Web_Use 全平台注册(CDP 三平台一致,
+        // 未装浏览器返回结构化 3001 信封,无需平台门控)。
+        for reg in [builtin_registry(), builtin_registry_with_work_dir(PathBuf::from("."))] {
+            let names = reg.names();
+            assert!(
+                names.contains(&"MCP_Web_Use"),
+                "MCP_Web_Use 应注册: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn yolo_and_main_work_registries_exclude_mcp_web_use() {
+        // 权限面不扩大:Yolo / Main-Work / Plan / QC 不持浏览器操控工具。
+        assert!(!yolo_registry().names().contains(&"MCP_Web_Use"));
+        assert!(!main_work_registry().names().contains(&"MCP_Web_Use"));
+        assert!(!plan_registry().names().contains(&"MCP_Web_Use"));
+        assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
     }
 }
