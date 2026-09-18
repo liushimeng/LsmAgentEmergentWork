@@ -99,9 +99,10 @@ pub struct TaskClassification {
     #[serde(default)]
     pub yolo_degraded: bool,
     /// 2026-09-16 第 59 轮:基于用户原始输入关键词推断的 delegate_to 建议。
-    /// Main-Work 拆解 WorkFlow 时优先采用此值设置 delegate_to,避免窗口操控类任务
-    /// 被错派给 SubAgent(导致 osascript 等命令无法执行)。
-    /// 取值:"windowuse" / "subagent" / None(不强制,由 Main-Work 自行判断)。
+    /// Main-Work 拆解 WorkFlow 时优先采用此值设置 delegate_to。
+    /// 取值:"webuse" / "subagent" / None(不强制,由 Main-Work 自行判断)。
+    /// 2026-09-18 第 84 轮:删除 "windowuse" 产出(WindowUse Agent 已删除,
+    /// 桌面窗口操控由 SubAgent-Work 的 MCP_Window_Use 工具承担)。
     #[serde(default)]
     pub suggested_delegate: Option<String>,
 }
@@ -315,52 +316,14 @@ fn extract_user_prompt(context: &[ChatMessage]) -> String {
 
 /// 2026-09-16 第 59 轮:基于用户原始 prompt 关键词推断 delegate_to。
 ///
-/// 解决「打开微信发消息」类任务被 Main-Work 错派给 SubAgent 的问题。
-/// 窗口操控类关键词命中 → 返回 "windowuse";代码/文件操作类 → "subagent";
+/// 网页操控类关键词命中 → 返回 "webuse";代码/文件操作类 → "subagent";
 /// 无法判断 → None(让 Main-Work 自行判断)。
+/// 2026-09-18 第 84 轮:删除窗口操控关键词表与 "windowuse" 产出 ——
+/// WindowUse Agent 已删除,桌面窗口操控任务走 medium 档由 Main-Work
+/// 关键词推断委派给 SubAgent-Work(MCP_Window_Use 工具)。
 ///
 /// 关键词表覆盖:
-/// - 窗口操控:打开/启动/关闭/软件/应用/窗口/微信/WeChat/QQ/钉钉/Slack/
-///   点击/发送消息/联系人/聊天/对话框/菜单/按钮/Tab/控件
 /// - 代码/文件:编写/修改/创建文件/代码/rust/python/git/cargo/test
-const WINDOW_USE_KEYWORDS: &[&str] = &[
-    "打开",
-    "启动",
-    "关闭软件",
-    "软件",
-    "应用",
-    "窗口",
-    "微信",
-    "wechat",
-    "weixin",
-    "qq",
-    "钉钉",
-    "dingtalk",
-    "slack",
-    "telegram",
-    "whatsapp",
-    "点击按钮",
-    "发送消息",
-    "联系人",
-    "聊天",
-    "对话框",
-    "菜单",
-    "控件",
-    "tab",
-    "open app",
-    "launch",
-    "window",
-    "click",
-    "send message",
-    "contact",
-    "聊天窗口",
-    "输入框",
-    "登录",
-    "切换",
-    "最小化",
-    "最大化",
-];
-
 const SUBAGENT_KEYWORDS: &[&str] = &[
     "编写代码",
     "修改代码",
@@ -425,18 +388,14 @@ const WEB_USE_KEYWORDS: &[&str] = &[
 
 pub fn infer_suggested_delegate(user_prompt: &str) -> Option<String> {
     let lower = user_prompt.to_lowercase();
-    let window_hit = WINDOW_USE_KEYWORDS.iter().any(|k| lower.contains(k));
     let code_hit = SUBAGENT_KEYWORDS.iter().any(|k| lower.contains(k));
     let web_hit = WEB_USE_KEYWORDS.iter().any(|k| lower.contains(k));
-    // ★ 2026-09-17 第 78 轮 P1-3:优先级改为「web > window > code」——
+    // ★ 2026-09-17 第 78 轮 P1-3:web 优先于 code——
     // 「写 Python 脚本访问浏览器」本质是 web 任务,code 仅辅助;此前 web+code 双命中
     // 时直接返回 None → 委派默认 SubAgent → 错失 WebUseRunner 的
     // extract_page_reply_from_session 出口兜底,真实抓取的页面文本无法落到 TUI。
     if web_hit {
         return Some("webuse".to_string());
-    }
-    if window_hit {
-        return Some("windowuse".to_string());
     }
     if code_hit {
         return Some("subagent".to_string());
@@ -881,8 +840,10 @@ mod tests {
     // ========== 2026-09-16 第 59 轮:suggested_delegate 推断测试 ==========
 
     #[test]
-    fn infer_suggested_delegate_window_use_keywords() {
-        // 窗口操控类任务 → windowuse
+    fn infer_suggested_delegate_desktop_window_no_longer_windowuse() {
+        // 2026-09-18 第 84 轮:窗口操控类任务不再产出 "windowuse"
+        // (WindowUse Agent 已删除,桌面窗口操控由 SubAgent-Work 的
+        // MCP_Window_Use 工具承担;返回 None 交 Main-Work 关键词推断)。
         let cases = [
             "帮我打开微信软件,找到赵玲玲,给她发一个消息",
             "打开 QQ 给张三发一条消息",
@@ -891,10 +852,10 @@ mod tests {
             "点击按钮关闭窗口",
         ];
         for prompt in cases {
-            assert_eq!(
+            assert_ne!(
                 infer_suggested_delegate(prompt),
                 Some("windowuse".to_string()),
-                "窗口操控类应推断 windowuse: {prompt}"
+                "窗口操控类不应再推断 windowuse: {prompt}"
             );
         }
     }
@@ -933,7 +894,7 @@ mod tests {
                 "网页操控类应推断 webuse: {prompt}"
             );
         }
-        // ★ 2026-09-17 第 78 轮 P1-3:优先级改为「web > window > code」。
+        // ★ 2026-09-17 第 78 轮 P1-3:优先级 web > code。
         // 「修改网页代码」含 web 关键词 → 仍判 webuse(网页代码修改本质上仍涉及网页上下文)。
         assert_eq!(
             infer_suggested_delegate("修改网页代码里的 bug"),
@@ -943,8 +904,7 @@ mod tests {
 
     #[test]
     fn infer_suggested_delegate_ambiguous_returns_none() {
-        // 无法判断 → None(注意:第 78 轮优先级 web > window > code,所以「打开 + 代码」
-        // 也会被判 windowuse,因为「打开」是 window 关键词且优先级高于 code)
+        // 无法判断 → None
         let cases = [
             "帮我处理一下这个任务",       // 无明确关键词
             "",                           // 空串

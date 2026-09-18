@@ -117,20 +117,9 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         );
 
-        -- ========== WindowUse 多轮对话状态表 ==========
+        -- ========== Agent 间消息表 ==========
 
-        -- 窗口会话状态(每 session_id 一条,覆盖更新)
-        CREATE TABLE IF NOT EXISTS window_state (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id      TEXT NOT NULL UNIQUE,
-            state_json      TEXT NOT NULL,
-            version         INTEGER NOT NULL DEFAULT 0,
-            created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-            updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_window_state_session ON window_state(session_id);
-
-        -- Agent 间消息表(WindowUse ↔ SubAgent 等)
+        -- Agent 间消息表(SubAgent ↔ WorkFlow/squad 等)
         CREATE TABLE IF NOT EXISTS agent_messages (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             msg_id          TEXT NOT NULL UNIQUE,

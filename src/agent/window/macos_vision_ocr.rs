@@ -136,7 +136,7 @@ fn capture_window_image(
 
     if cg_image.is_null() {
         return Err(AgentError::ToolExecution {
-            tool: "WindowScreenshot".into(),
+            tool: "MCP_Window_Use(action=screenshot)".into(),
             reason: format!(
                 "CGWindowListCreateImage 返回 null (window_id={window_id});\
                  可能是辅助功能权限未授权或窗口 ID 无效"
@@ -170,7 +170,7 @@ fn capture_fullscreen_image(region: Option<(i64, i64, i64, i64)>) -> Result<CGIm
 
     if cg_image.is_null() {
         return Err(AgentError::ToolExecution {
-            tool: "WindowScreenshot".into(),
+            tool: "MCP_Window_Use(action=screenshot)".into(),
             reason: "全屏截图失败:CGWindowListCreateImage 返回 null".into(),
         });
     }
@@ -185,7 +185,7 @@ fn save_cgimage_as_png(cg_image: &CGImage, output_path: &Path) -> Result<()> {
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| AgentError::ToolExecution {
-                tool: "WindowScreenshot".into(),
+                tool: "MCP_Window_Use(action=screenshot)".into(),
                 reason: format!("创建父目录 {parent:?} 失败: {e}"),
             })?;
         }
@@ -218,7 +218,7 @@ fn save_cgimage_as_png(cg_image: &CGImage, output_path: &Path) -> Result<()> {
     let image_buffer =
         image::RgbaImage::from_raw(width as u32, height as u32, rgba_bytes).ok_or_else(
             || AgentError::ToolExecution {
-                tool: "WindowScreenshot".into(),
+                tool: "MCP_Window_Use(action=screenshot)".into(),
                 reason: "CGImage 数据转换失败".into(),
             },
         )?;
@@ -226,7 +226,7 @@ fn save_cgimage_as_png(cg_image: &CGImage, output_path: &Path) -> Result<()> {
     image_buffer
         .save_with_format(output_path, image::ImageFormat::Png)
         .map_err(|e| AgentError::ToolExecution {
-            tool: "WindowScreenshot".into(),
+            tool: "MCP_Window_Use(action=screenshot)".into(),
             reason: format!("PNG 编码失败: {e}"),
         })?;
 
@@ -274,7 +274,7 @@ fn call_vision_ocr_helper(
 
     let script_path = std::env::temp_dir().join(format!("laew_ocr_script_{}.swift", std::process::id()));
     std::fs::write(&script_path, &swift_script).map_err(|e| AgentError::ToolExecution {
-        tool: "WindowOCR".into(),
+        tool: "MCP_Window_Use(action=ocr)".into(),
         reason: format!("写入 Swift 脚本失败: {e}"),
     })?;
 
@@ -285,7 +285,7 @@ fn call_vision_ocr_helper(
         .map_err(|e| {
             // swift 未安装,使用降级方案
             AgentError::ToolExecution {
-                tool: "WindowOCR".into(),
+                tool: "MCP_Window_Use(action=ocr)".into(),
                 reason: format!(
                     "调用 swift 失败: {}。\
                      macOS Vision OCR 需要安装 Xcode Command Line Tools,\
@@ -302,14 +302,14 @@ fn call_vision_ocr_helper(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AgentError::ToolExecution {
-            tool: "WindowOCR".into(),
+            tool: "MCP_Window_Use(action=ocr)".into(),
             reason: format!("Vision OCR 执行失败: {stderr}"),
         });
     }
 
     // 读取输出 JSON
     let json_str = std::fs::read_to_string(output_path).map_err(|e| AgentError::ToolExecution {
-        tool: "WindowOCR".into(),
+        tool: "MCP_Window_Use(action=ocr)".into(),
         reason: format!("读取 OCR 结果失败: {e}"),
     })?;
 
@@ -423,7 +423,7 @@ do {{
 fn parse_ocr_json_output(json_str: &str) -> Result<Vec<VisionOcrBlock>> {
     let json: serde_json::Value =
         serde_json::from_str(json_str).map_err(|e| AgentError::ToolExecution {
-            tool: "WindowOCR".into(),
+            tool: "MCP_Window_Use(action=ocr)".into(),
             reason: format!("OCR 结果 JSON 解析失败: {e}"),
         })?;
 
@@ -431,7 +431,7 @@ fn parse_ocr_json_output(json_str: &str) -> Result<Vec<VisionOcrBlock>> {
         .get("blocks")
         .and_then(|v| v.as_array())
         .ok_or_else(|| AgentError::ToolExecution {
-            tool: "WindowOCR".into(),
+            tool: "MCP_Window_Use(action=ocr)".into(),
             reason: "OCR 结果缺少 blocks 字段".into(),
         })?;
 
@@ -482,7 +482,7 @@ pub fn resolve_cgwindow_id(pid: i32, title: Option<&str>) -> Result<u32> {
 
         if list.is_null() {
             return Err(AgentError::ToolExecution {
-                tool: "WindowOCR".into(),
+                tool: "MCP_Window_Use(action=ocr)".into(),
                 reason: "CGWindowListCopyWindowInfo 返回 null".into(),
             });
         }
@@ -535,7 +535,7 @@ pub fn resolve_cgwindow_id(pid: i32, title: Option<&str>) -> Result<u32> {
         CFRelease(list as CFTypeRef);
 
         found_id.ok_or_else(|| AgentError::ToolExecution {
-            tool: "WindowOCR".into(),
+            tool: "MCP_Window_Use(action=ocr)".into(),
             reason: format!("未找到 pid={pid} 的 CGWindowID"),
         })
     }

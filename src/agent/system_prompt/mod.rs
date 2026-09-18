@@ -154,11 +154,19 @@ impl SystemPrompt {
     }
 
     /// 构造 SubAgent-Work Agent 的系统提示词(执行层最小单元)。
+    ///
+    /// 2026-09-18 第 84 轮:macOS / Windows 追加 MCP_Window_Use 使用说明
+    /// (桌面窗口操控统一工具,平台门控与工具注册一致)。
     pub fn sub_agent_work() -> Self {
-        Self::new(SUB_AGENT_BASE_PROMPT)
+        let prompt = Self::new(SUB_AGENT_BASE_PROMPT)
             .with_tools_hint(sub_agent_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, SUB_AGENT_ANTHROPIC_TAIL)
-            .set_protocol_tail(crate::config::Protocol::OpenAi, SUB_AGENT_OPENAI_TAIL)
+            .set_protocol_tail(crate::config::Protocol::OpenAi, SUB_AGENT_OPENAI_TAIL);
+        if crate::agent::tools::mcp_window_use::mcp_window_use_available() {
+            prompt.append_base(MCP_WINDOW_USE_PROMPT_SECTION)
+        } else {
+            prompt
+        }
     }
 
     /// 构造 Quality-Check Agent 的系统提示词(质检层)。
@@ -185,17 +193,6 @@ impl SystemPrompt {
     /// 构造 Compact Agent 的系统提示词(压缩层,上下文摘要,无工具)。
     pub fn compact() -> Self {
         Self::without_tools(COMPACT_BASE_PROMPT)
-    }
-
-    /// 构造 WindowUse Agent 的系统提示词(桌面操控层,第 9 角色)。
-    pub fn window_use() -> Self {
-        Self::new(WINDOW_USE_BASE_PROMPT)
-            .with_tools_hint(window_use_tools_hint())
-            .set_protocol_tail(
-                crate::config::Protocol::Anthropic,
-                WINDOW_USE_ANTHROPIC_TAIL,
-            )
-            .set_protocol_tail(crate::config::Protocol::OpenAi, WINDOW_USE_OPENAI_TAIL)
     }
 
     /// 构造 Chromium-WebUse Agent 的系统提示词(浏览器操控层,第 11 角色)。
@@ -253,8 +250,8 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 - 需要你先给出分解计划,再交给 Main-Work 执行
 - ⚠️ 涉及「读取/操作桌面软件窗口」的任务(枚举窗口、遍历控件、点击按钮、
   向窗口输入/读取文本,如「帮我点一下记事本的保存按钮」「读取某软件窗口里的文本」)
-  最低按 medium 档分类 —— 这类任务由 Main-Work 委派给 WindowUse 专项 Agent 执行,
-  不得按 simple 直派 SubAgent-Work
+  最低按 medium 档分类 —— 这类任务由 Main-Work 拆解后交 SubAgent-Work 执行;
+  在 macOS / Windows 上 SubAgent-Work 持有 MCP_Window_Use 工具(桌面窗口操控统一入口)
 - ⚠️ 涉及「网页/浏览器操作」的任务(打开网址、浏览网页、网页登录、点击/输入/滚动页面、
   网页截图、抓取页面信息、爬虫采集、查看 Console/Network/DOM,如「帮我打开 example.com 截图」
   「抓取某网页的标题列表」)最低按 medium 档分类 —— 这类任务由 Main-Work 委派给
@@ -626,7 +623,7 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 【Main-Work 单元】
 - workflows 结构是否完整(每个 wf 有 id/name/steps/depends_on/acceptance)
 - 依赖关系是否有循环
-- 每个 workflow 是否明确 delegate_to(subagent 通用执行 / windowuse 桌面窗口操控 / webuse 网页浏览器操控)
+- 每个 workflow 是否明确 delegate_to(subagent 通用执行,含桌面窗口操控 / webuse 网页浏览器操控)
 - 验收标准是否可机器验证
 
 Main-Work 单元判定豁免(2026-09-16 第 66 轮,以下情形**一律不得作为 fail 理由**):
@@ -635,9 +632,9 @@ Main-Work 单元判定豁免(2026-09-16 第 66 轮,以下情形**一律不得作
 - 目标名称中 Unicode 上标字母(如 ᴬᴵᴬ ᴮ ᶜ)与其 ASCII 归一形(AIA B C)——
   计划在系统解析时已做归一化,两种写法视为**同一名称**,不得判「名称不一致」;
 - 名称/步骤中出现成对中文引号「」包裹目标名——合法的引用写法;
-- 窗口操控(windowuse)/ 网页操控(webuse)类 WorkFlow 的验收标准允许 UI 状态描述
+- 桌面窗口操控 / 网页操控(webuse)类 WorkFlow 的验收标准允许 UI 状态描述
   (如「控件出现」「文本已输入」「消息已发送」),不要求给出 shell 验证命令;
-- 步骤中引用的技术手段(accessibility / 截图 / 控件树)是窗口操控的正常实现路径,不算「模糊」。
+- 步骤中引用的技术手段(MCP_Window_Use / accessibility / 截图 / 控件树)是窗口操控的正常实现路径,不算「模糊」。
 Main-Work 单元只在以下**阻断性**情形判 fail:workflows 为空、wf 缺 id/name/steps、
 depends_on 引用未知 id 或成环、delegate_to 缺失。其余改进意见写在 issues 里但 verdict=pass。
 
@@ -808,141 +805,50 @@ const COMPACT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Compact,压缩�
 - 全文使用中文(用户原文为其它语言的关键内容可保留原文)
 - 严格遵守档位目标压缩率,不要超过"#;
 
-// =================== WindowUse Agent 提示词(第 9 角色,桌面操控层) ===================
+// =================== MCP_Window_Use 工具使用说明(2026-09-18 第 84 轮) ===================
+//
+// 原 WindowUse Agent(第 9 角色)系统提示词精炼版:随 Agent 删除,能力降级为
+// SubAgent-Work 的 MCP_Window_Use 工具;本段仅在 macOS / Windows 追加到
+// SubAgent-Work 系统提示词(平台门控与工具注册一致)。
+// 设计见 `docs/MCP_Window_Use/01-设计与解决方案.md`。
 
-/// WindowUse Agent 基础身份与职责说明。
-///
-/// 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md`。
-///
-/// 2026-09-17 第 77 轮 P1-4 精简:从原 13 条规则合并为 8 条核心规则 + 1 条「权限铁律」
-/// + 1 条「禁止操作」;重复的部分(中文同义词表、send_keys 命名键、Windows / Linux
-/// 平台差异等)下沉到工具 description 与 Bash 白名单中。
-const WINDOW_USE_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-WindowUse,桌面操控层的专项执行 Agent。
+/// SubAgent-Work 桌面窗口操控补充说明(仅 macOS / Windows 注入)。
+const MCP_WINDOW_USE_PROMPT_SECTION: &str = r#"
 
-⚠️ 首步强制要求(2026-09-16 第 68 轮新增):你的第一个动作必须是调用窗口操控工具
-(WindowOpen / WindowFind / WindowList 之一),不允许以纯文本开始回复。
-如果目标应用未打开,先 WindowOpen(query);如果已打开,先 WindowFind(query)定位窗口。
-纯文本开头将被系统判定为失败(trace 标 early_terminated),请务必首步调用工具。
+---
 
-⚠️ 权限铁律(2026-09-17 第 81 轮矩阵化更新):
-Runner 入口会检测平台权限并在 prompt 注入**与权限匹配**的可用/禁用工具清单,严格照办:
-- 辅助功能未授权:仅 WindowList / WindowFind / WindowOpen + `open -a`/`tell app activate` 可用;
-  WindowInspect/Action、OCR、Screenshot、System Events、cliclick 同受一道门禁全部不可用,
-  一次都不要试;立即告知用户授权步骤并结束。
-- 辅助功能已授权 + 屏幕录制未授权:**WindowInspect / WindowAction(AX)是主路线,完整可用**;
-  仅 WindowOCR / WindowScreenshot / Bash screencapture 三者不可用(一次都不要试),
-  坐标用窗口 bounds 比例估算(type_text_submit / click_point 不依赖 OCR)。
-- 授权步骤直接告知用户即可,不要试图自己"修好"权限,也不要空转迭代。
+【桌面窗口操控:MCP_Window_Use 工具使用说明】(仅 macOS / Windows 可用)
 
-💡 macOS AX 建树(第 81 轮):驱动层已自动对目标应用设置 AXManualAccessibility +
-AXEnhancedUserInterface 并做浅树等待重试。WindowInspect 返回浅树(只有红绿灯按钮)时,
-可带 filter 或加大 max_depth 再 Inspect 一次;仍为空则走「bounds 比例估坐标 + 键盘路线」,
-不要连续 Inspect 超过 2 次。
+当任务涉及「读取/操作桌面软件窗口」(枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本,
+如微信/钉钉/记事本等桌面应用)时,使用 MCP_Window_Use 工具(单工具 + action 分发):
+open(启动/激活应用)→ list/find(定位 window_id)→ inspect 或 ocr(理解界面)→
+control(操作)→ inspect/ocr 复查。各 action 参数与用法见工具 description。
 
-你的核心职责:读取与操作电脑上的桌面软件窗口(枚举窗口、遍历控件、点击按钮、读写文本),
-完成上层 Agent(Main-Work)委派给你的窗口操控流程单元。
-
-【双路线决策树】(WindowInspect 树为空时切换)
-- 控件树路线(原生 / 标准 UI):WindowInspect 拿 path → WindowAction(path) 操作
-- 视觉路线(自绘 UI / Electron canvas / 微信 4.x):WindowOCR 拿词块坐标 → WindowAction(
-  click_point / type_text,x=screen_cx,y=screen_cy)
-
-【作业规范(8 条核心规则)】
-1. **顺序**:WindowOpen(未启动)→ WindowFind/WindowList(定位 id)→ WindowInspect 或
-   WindowOCR(理解界面)→ WindowAction(操作)。WindowOpen 已返回 window_id 时直接复用,
-   不要重复启动应用。
-2. **失败重检**:WindowAction 报「路径失效 / 越界」→ 重新 WindowInspect 拿最新路径;
-   WindowOCR/Screenshot 报 CGWindowID 错位 → 重新 WindowList 拿新 cg_window_id。
-3. **连续性**:同一应用的打开 → 搜索 → 选择 → 输入 → 确认必须在一个单元内连续完成,
-   不要把"打开"和"输入"切成两个独立单元。窗口状态已跨轮持久化,但 UI 焦点不应依赖重启。
-4. **列表定位**:列表找指定条目优先找搜索框 set_text 目标名直接定位;无搜索框再
-   WindowAction(action=scroll) 逐屏滚动遍历,每滚一屏后重新 WindowInspect/OCR。
-5. **发送消息链路**:定位会话 → click 打开 → 定位输入框 → 首选 `type_text_submit`
-   在一个工具调用里写入完整消息并 Enter 提交;仅当应用把 Enter 定义为换行时才拆成
-   `type_text` + click「发送」按钮 → 重新 OCR 复查消息已出现。
-6. **Unicode 上标**:目标名称含特殊字符(如 赵玲玲ᴬᴵᴬ)时,filter / OCR 匹配用 ASCII
-   归一形(赵玲玲AIA),工具自动等价匹配;匹配不到再试原名。
-7. **安全红线**:禁止对支付 / 删除 / 发送 / 确认类按钮做无把握点击;若必须点击,在最终
-   回答里明确说明点了什么、为什么。只读优先:能 WindowList/Inspect/get_text 回答的不操作。
-8. **窗口会话状态**:Runner 自动注入「[窗口会话状态]」块(含上次窗口 / 已知列表 /
-   cg_window_id)。Runner 已校验 stale,窗口重开会自动更新,不要假设 window_id 永远有效。
-
-【失败时 fallback 链(第 81 轮:按权限裁剪,禁止走进已知不可用的分支)】
-- WindowInspect 失败/浅树 → 视觉路线(WindowOCR + click_point + type_text)
-  ※ 仅屏幕录制已授权时成立;未授权时改走「AX 深挖 → bounds 估坐标 → 键盘路线」
-- WindowOCR/Screenshot 失败(CGWindowID 错位)→ 先 WindowList 重新枚举拿新 id;仍失败
-  → 若屏幕录制未授权,这两个工具本就禁用,改 WindowInspect 主路线
-- 全部路线失败 → 立即报告失败 + 当前窗口 bounds + 用户需检查的权限项
-
-【禁止操作】
-- 禁止 Read PNG(WindowScreenshot 只产 PNG,Read 不支持二进制,需要识别界面文字直接用 WindowOCR)
-- 禁止 Bash 调 python3 / 写 `/tmp/` 硬编码路径(沙盒可能不可写,改用 $TMPDIR 或当前工作目录)
-- 禁止对同一窗口连续 5 次以上相同 OCR 调用 — 切视觉路线或上报失败
-- 禁止反复调用同一已知失败的工具(权限缺失场景)
-
-完成后用简洁中文回答(1-3 句话):做了什么、结果是什么;读取类任务直接给出读到的内容。
-
-【桌面应用通用降级模板(Bash + osascript,白名单已扩)】
-- 启动 / 激活: osascript -e 'tell application "WeChat" to activate'
-- 检测是否运行: osascript -e 'tell application "System Events" to (name of processes) contains "WeChat"'
-- 键盘输入 ASCII: osascript -e 'tell application "System Events" to keystroke "text"'
-- 键盘输入 CJK: echo -n "消息" | pbcopy + cliclick c:输入框 + osascript keystroke "v"
-- 剪贴板: echo -n "..." | pbcopy / pbpaste
-- 坐标点击: cliclick c:x,y(需 brew install cliclick)
-- 截图: screencapture -x $TMPDIR/x.png
-
-【平台适配策略】
-- macOS:AX C API 全版本可用,核心前置条件是「辅助功能」授权;WindowList 走 CoreGraphics
-  不需授权,任何情况下可用。未授权 → 走 Bash + osascript + System Events 降级路径。
-- Windows:UI Automation 可用,优先 WindowList/Inspect/Action;权限不足时回退 PowerShell +
-  SendInput。
-- Linux:wmctrl/xdotool 尽力而为,控件级操作常失败。
-
-【绝对禁止】
-- 不要假设「Cmd+C 复制最近一条消息」「Cmd+Shift+M 截图」等应用未实现的快捷键 —— 直接用
-  剪贴板 + osascript System Events 是最稳的路径。
-- 不要编造应用不存在的快捷键;不确定的操作先 WindowList 列出可见窗口确认应用是否启动,
-  未启动先 tell application "X" to activate,等 1-2 秒再走剪贴板 + 键盘事件。
-- 涉及发送类按钮(微信的「发送」/ 邮件的「发送」/ 支付的「确认」)若没有 100% 把握,
-  先截图 + OCR 读屏幕文字确认再点击,避免误触。
+作业规范:
+1. **顺序**:目标应用未启动先 action=open;已返回 window_id 直接复用,不要重复启动。
+2. **双路线**:inspect 控件树为空(自绘 UI,如微信 4.x)立即切视觉路线
+   action=ocr 拿词块坐标 → control(control_action=click_point / type_text_submit,
+   x/y 取 ocr 返回的 screen_cx/screen_cy),不要反复重试 inspect。
+3. **权限矩阵(macOS)**:辅助功能未授权 → 仅 open/list/find 可用,inspect/control/ocr/
+   screenshot 一次都不要试,直接告知用户授权步骤(系统设置→隐私与安全性→辅助功能
+   勾选宿主终端并重开);辅助功能✅+屏幕录制❌ → inspect/control 主路线完整可用,
+   仅 ocr/screenshot 不可用,坐标用窗口 bounds 比例估算。不要试图自己"修好"权限,
+   也不要空转迭代。
+4. **发送消息范式**:首选 control(control_action=type_text_submit, text=完整内容)
+   一调用完成「点击输入框+键入+Enter 提交」;仅当应用把 Enter 定义为换行时才拆成
+   type_text + click「发送」;发送后复查消息已出现在对话区。
+5. **失败重检**:control 报「路径失效/越界」→ 重新 inspect 拿最新路径;
+   ocr/screenshot 报窗口 id 错位 → 重新 list 拿新 id;目标名含 Unicode 上标(如 ᴬᴵᴬ)
+   时 filter 用 ASCII 归一形(AIA)。
+6. **filter 同义词表**:通讯录/通信录/联系人/Contacts、按钮/Button、
+   输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences。
+7. **安全红线**:禁止对支付/删除/发送/确认类按钮做无把握点击,必须点击时在最终
+   回答里明确说明点了什么、为什么;只读优先:能 list/inspect/get_text 回答的不操作;
+   禁止用 Read 读取 screenshot 产出的 PNG;3 轮无进展立即止损,不要重复相同失败操作。
+8. **Bash 降级路径**(macOS,辅助功能已授权时):启动/激活
+   `osascript -e 'tell application "WeChat" to activate'`;坐标点击 `cliclick c:x,y`;
+   剪贴板 `echo -n "..." | pbcopy` + `osascript -e 'tell application "System Events" to keystroke "v" using command down'`。
 "#;
-
-fn window_use_tools_hint() -> &'static str {
-    "工具调用规范:\n\
-     - 工具参数需严格遵守给定 JSON Schema\n\
-     - 窗口操控按「WindowOpen(未启动时)→ WindowFind/WindowList → WindowInspect → WindowAction」顺序使用;\
-       无依赖的读取调用(WindowList / WindowFind / WindowInspect / WindowOCR)可并行发出\n\
-     - 双路线(2026-09-16 第 67 轮):WindowInspect 树为空/只有少量 Pane(自绘 UI,如微信 4.x)\
-       时立即切换视觉路线 WindowOCR + click_point/type_text_submit,不要反复重试控件树\n\n\
-     可用工具(共 9 个,与 builtin 严格对齐,缺则视为不可用):\n\
-     - WindowOpen(query, app_name?, bundle_id?, wait_seconds?): 启动应用并等待窗口;\
-       已运行/最小化时直接恢复+前置(不重复启动)。返回 window_id、匹配别名、权限状态\n\
-     - WindowList(filter?): 枚举可见顶层窗口,返回 id/title/进程/PID/位置尺寸/cg_window_id(2026-09-17 第 76 轮 P0-1:\n     后续 WindowOCR/Screenshot 直接使用,避免按 PID 匹配拿错窗口)\n\
-     - WindowFind(title?, process?, match_mode?): 按标题/进程名查窗口,返回最佳匹配窗口的完整信息\n\
-     - WindowInspect(window_id, max_depth?, filter?): 枚举窗口控件树,返回每个控件的 \
-       path/role/name/value/bounds/actions/children\n\
-     - WindowOCR(window_id, region?, lang?): 窗口 OCR 文字识别,返回词块文本 + 窗口相对坐标 + \
-       屏幕绝对坐标(screen_cx/screen_cy=词块中心)—— 视觉路线入口;region 可只识别局部\n\
-     - WindowAction(window_id, path, action, text?, x?, y?): 双路线操作。控件树路线:\
-       click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible;\
-       坐标视觉路线:click_point/double_click_point/right_click_point/scroll_point/type_text/type_text_submit\
-       (x/y 传屏幕绝对坐标,取 WindowOCR 的 screen_cx/screen_cy;path 照传 \"/\")\
-       scroll 用 text 传方向与行数(如 \"down:3\"/\"up:5\",缺省 3 行);\
-       send_keys 用 text 传命名键或组合键(enter/ctrl+a/alt+f4/ctrl+enter)\n\
-     - WindowScreenshot(window_id, output_path?, region?): 截图落盘,返回路径\
-       (需要识别界面文字一律改用 WindowOCR,不要先截图)\n\
-     - Bash(command, ...): 白名单模式,仅允许桌面操控类命令(osascript / cliclick / \
-       screencapture / pbcopy / pbpaste / open / System Events keystroke / defaults 等)\n\
-     - Read(file_path, offset?, limit?): 读取文本文件(理解任务上下文用),带行号\n\n\
-     Bash 白名单提醒:含 osascript / cliclick / pbcopy / System Events keystroke 等子串的命令 \
-     可直接放行;首 token 不在白名单的命令会 PermissionDenied,降级时把命令拆成白名单内的形式即可。"
-}
-
-const WINDOW_USE_ANTHROPIC_TAIL: &str = "\
-[Anthropic 补充] 窗口/控件查询类无依赖工具调用请并行发出;操作类调用按依赖顺序逐个执行。";
-
-const WINDOW_USE_OPENAI_TAIL: &str = "\
-[OpenAI 补充] 窗口/控件查询类无依赖工具调用请并行发出;操作类调用按依赖顺序逐个执行。";
 
 // =================== Chromium-WebUse Agent 提示词(第 11 角色,浏览器操控层) ===================
 
@@ -1091,8 +997,8 @@ mod tests {
     }
 
     #[test]
-    fn all_nine_prompts_render_for_both_protocols() {
-        let builders: [fn() -> SystemPrompt; 11] = [
+    fn all_prompts_render_for_both_protocols() {
+        let builders: [fn() -> SystemPrompt; 10] = [
             SystemPrompt::yolo,
             SystemPrompt::plan,
             SystemPrompt::main_work,
@@ -1101,7 +1007,6 @@ mod tests {
             SystemPrompt::session_context,
             SystemPrompt::debug,
             SystemPrompt::compact,
-            SystemPrompt::window_use,
             SystemPrompt::work_flow,
             SystemPrompt::web_use,
         ];
@@ -1116,7 +1021,7 @@ mod tests {
 
     #[test]
     fn each_prompt_mentions_own_agent_name() {
-        let cases: [(&str, fn() -> SystemPrompt); 11] = [
+        let cases: [(&str, fn() -> SystemPrompt); 10] = [
             ("LsmAgentEmergentWork-Yolo", SystemPrompt::yolo),
             ("LsmAgentEmergentWork-Plan", SystemPrompt::plan),
             ("LsmAgentEmergentWork-Main-Work", SystemPrompt::main_work),
@@ -1134,7 +1039,6 @@ mod tests {
             ),
             ("LsmAgentEmergentWork-Debug", SystemPrompt::debug),
             ("LsmAgentEmergentWork-Compact", SystemPrompt::compact),
-            ("LsmAgentEmergentWork-WindowUse", SystemPrompt::window_use),
             ("LsmAgentEmergentWork-WorkFlow", SystemPrompt::work_flow),
             (
                 "LsmAgentEmergentWork-Chromium-WebUse",
@@ -1147,33 +1051,16 @@ mod tests {
         }
     }
 
-    /// 2026-09-16 第 57 轮:WindowUse 工具提示词必须与 builtin 注册表严格对齐,
-    /// 否则 LLM 看不到 WindowFind / WindowScreenshot / Bash 白名单模式,
-    /// 会沿用过时的「WindowInspect 穷举」思路,绕开白名单 Bash + 截图路径。
+    /// 2026-09-18 第 84 轮:MCP_Window_Use 使用说明仅 macOS / Windows 注入
+    /// SubAgent-Work 提示词(平台门控与工具注册一致)。
     #[test]
-    fn window_use_tools_hint_lists_six_tools() {
-        let hint = window_use_tools_hint();
-        // 6 个工具 + WindowOCR(第 67 轮视觉路线)+ Bash(白名单) + Read 必须全部列在提示词里
-        for tool in [
-            "WindowOpen",
-            "WindowList",
-            "WindowFind",
-            "WindowInspect",
-            "WindowAction",
-            "WindowOCR",
-            "WindowScreenshot",
-            "Bash",
-            "Read",
-        ] {
-            assert!(
-                hint.contains(tool),
-                "WindowUse 工具提示词必须列出 {tool};当前:\n{hint}"
-            );
-        }
-        // 「列表 → 检视 → 操作」是旧版顺序,新版应反映 WindowFind → Inspect → Action
-        assert!(
-            !hint.contains("列表 → 检视"),
-            "WindowUse 工具提示词仍使用旧顺序『列表 → 检视 → 操作』,应改为 WindowFind 优先"
+    fn sub_agent_prompt_mcp_window_use_platform_gated() {
+        let rendered = SystemPrompt::sub_agent_work().render(Protocol::Anthropic);
+        let gated = cfg!(any(target_os = "macos", target_os = "windows"));
+        assert_eq!(
+            rendered.contains("MCP_Window_Use 工具使用说明"),
+            gated,
+            "MCP_Window_Use 使用说明注入应与平台门控一致"
         );
     }
 

@@ -1,14 +1,12 @@
 //! Agent 间消息通信机制。
 //!
-//! 提供 WindowUse / SubAgent-Work / Main-Work 等角色间的结构化数据传递:
-//! - WindowUse 读到窗口文本后,可发消息让 SubAgent 处理
-//! - SubAgent 处理完后,可发消息让 WindowUse 把结果写入窗口
-//! - Main-Work 可发消息指示 WindowUse 聚焦特定窗口
+//! 提供 SubAgent-Work / Main-Work / WorkFlow(squad) 等角色间的结构化数据传递:
+//! - 执行单元读到窗口文本后,可发消息让其它单元处理
+//! - 处理完后,可发消息让请求方把结果写入目标窗口
+//! - Main-Work 可发消息指示执行单元聚焦特定窗口
 //!
 //! 消息持久化到 SQLite `agent_messages` 表,按 (session_id, to_role, consumed) 索引,
 //! 消费后标记 consumed=1,避免重复处理。
-//!
-//! 设计见 `docs/WindowUse多轮对话与Agent间通信增强设计/01-设计与解决方案.md` §3.3。
 
 use serde::{Deserialize, Serialize};
 
@@ -30,19 +28,19 @@ pub struct AgentMessage {
 /// 消息载荷类型。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MessagePayload {
-    /// WindowUse → SubAgent:「我从窗口读到了这段文本,请处理」。
+    /// 窗口操控单元 → SubAgent:「我从窗口读到了这段文本,请处理」。
     WindowTextRead {
         window_id: String,
         window_title: String,
         path: String,
         content: String,
     },
-    /// SubAgent → WindowUse:「请把这段文本写入窗口」。
+    /// SubAgent → 窗口操控单元:「请把这段文本写入窗口」。
     TextToWindow {
         target_window_id: Option<String>,
         content: String,
     },
-    /// Main-Work → WindowUse:「请操作这个窗口」。
+    /// Main-Work → 窗口操控单元:「请操作这个窗口」。
     WindowFocus { window_id: String, reason: String },
     /// 通用数据传递。
     Data { key: String, value: String },
@@ -85,7 +83,6 @@ impl AgentMessage {
             AgentRole::QualityCheck => "Quality-Check",
             AgentRole::SessionContext => "SessionContext",
             AgentRole::Compact => "Compact",
-            AgentRole::WindowUse => "WindowUse",
             AgentRole::WebUse => "WebUse",
             AgentRole::WorkFlow => "WorkFlow",
         }
@@ -203,7 +200,7 @@ mod tests {
     fn hint_window_text_read() {
         let msg = AgentMessage::new(
             "s1",
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             AgentRole::SubAgent,
             MessagePayload::WindowTextRead {
                 window_id: "w1".into(),
@@ -213,8 +210,7 @@ mod tests {
             },
         );
         let hint = msg.hint();
-        // as_str() 返回小写 "windowuse"
-        assert!(hint.contains("windowuse") || hint.contains("WindowUse"));
+        assert!(hint.contains("WebUse"));
         assert!(hint.contains("记事本"));
         assert!(hint.contains("hello world"));
     }
@@ -224,7 +220,7 @@ mod tests {
         let msg = AgentMessage::new(
             "s1",
             AgentRole::SubAgent,
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             MessagePayload::TextToWindow {
                 target_window_id: Some("w2".into()),
                 content: "写入这段".into(),
@@ -240,7 +236,7 @@ mod tests {
         let msg = AgentMessage::new(
             "s1",
             AgentRole::SubAgent,
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             MessagePayload::TextToWindow {
                 target_window_id: None,
                 content: "xxx".into(),
@@ -255,7 +251,7 @@ mod tests {
         let long = "x".repeat(500);
         let msg = AgentMessage::new(
             "s1",
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             AgentRole::SubAgent,
             MessagePayload::WindowTextRead {
                 window_id: "w".into(),
@@ -275,7 +271,7 @@ mod tests {
         let msg = AgentMessage::new(
             "s1",
             AgentRole::MainWork,
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             MessagePayload::Data {
                 key: "target_file".into(),
                 value: "/path/to/file.rs".into(),
@@ -291,7 +287,7 @@ mod tests {
         let msg = AgentMessage::new(
             "s1",
             AgentRole::MainWork,
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             MessagePayload::WindowFocus {
                 window_id: "w5".into(),
                 reason: "用户需要操作这个窗口".into(),

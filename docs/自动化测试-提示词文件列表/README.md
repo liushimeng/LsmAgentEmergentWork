@@ -27,7 +27,7 @@ OJ 在线判题平台、图算法与社交网络分析、弹性系统与混沌�
 **软件许可密钥与激活系统**、**蓝牙BLE与无线外设通信**、**家谱数据工程与GEDCOM解析**、
 **代码演化度量与热点驱动重构**、**电话号码地址人名国际化**、**网页存档与数字保全**、
 **崩溃报告聚合与错误追踪系统**、**订阅计费与用量计量引擎**、**平铺窗口管理与键盘流桌面**、
-**远程电源与开关机治理**、**WindowUse 多轮连续性与 Agent 间通信**、**WorkFlow 工作流编排与 Goal 状态机**、**工作流编排与 Goal 状态机进阶**、**WindowUse 桌面操控与多轮连续性**、**权限拦截与 Bash 安全**、**上下文压缩与溢出恢复**、**取消传播与优雅中断**、**工作区感知与运行时注入**、**离线队列与弹性重试**、**QualityCheck 质检与报告**、**AgentMessage 消息总线与跨角色通信**、**端到端超大工程编排**、**LLM 弹性层与流式解析实战**、
+**远程电源与开关机治理**、**WorkFlow 工作流编排与 Goal 状态机**、**工作流编排与 Goal 状态机进阶**、**权限拦截与 Bash 安全**、**上下文压缩与溢出恢复**、**取消传播与优雅中断**、**工作区感知与运行时注入**、**离线队列与弹性重试**、**QualityCheck 质检与报告**、**AgentMessage 消息总线与跨角色通信**、**端到端超大工程编排**、**LLM 弹性层与流式解析实战**、
 **终端 TUI 应用开发工程实战**、**Web API 服务端开发工程实战**、**数据库应用与数据迁移工程实战**、
 **DevOps 工具链与部署工程实战**、**系统监控与可观测性工程实战**、**爬虫与数据采集工程实战**、
 **RAG 知识库与检索增强工程实战**、**低代码平台与可视化搭建工程实战**、
@@ -276,7 +276,6 @@ docs/自动化测试-提示词文件列表/
   227-订阅计费与用量计量引擎编程.md            ← 计划目录版本化四定价模型/订阅状态机幂等转移/proration日折算与残分/计量去重与阶梯累进/发票红字冲正与三向引用/dunning失败码分级/Webhook原始字节验签/三方对账挂账不自动冲正/月末边界1096日枚举/test-clock剧本回归
   228-平铺窗口管理与键盘流桌面工程.md          ← 三平台栈探测选型/i3-sway配置变量化生成/键位DUP-SHADOW冲突求解/工作区assign与浮动例外/三栈状态栏与palette注入/多显示器位置矩阵与热插拔/scratchpad老板键/焦点对比度与深浅主题/dotfiles差异层软链安装/lint与逃生键审计
   229-远程电源与开关机治理实战.md              ← WoL魔包构造与定向广播/唤醒四层链路核查/systemd-launchd-schtasks三平台定时/合盖策略与快速启动陷阱/睡眠抑制三通道审计/优雅关机30s强杀幂等/IPMI与智能插座模拟/pmset唤醒源排行排查/升级窗回滚优先/SIGKILL断电演练RTO报告
-  230-WindowUse多轮连续性与Agent间通信实战.md  ← WindowState注入跨轮连续/操作历史回溯/跨应用数据搬运/AgentMessage五元组消息桥/状态注入幂等/别名记忆/多窗口并发隔离/失败状态保留/pending_data跨WorkFlow/跨Session隔离（配套 2ea6a23 WindowUse多轮对话增强 + agent_messages表）
   231-WorkFlow工作流编排与Goal状态机实战.md    ← Goal六态状态机迁移/Phase DAG与失败策略矩阵/Squad三种strategy并行调度/AdaptiveLoop四级修复/QualityGate五级门禁/TemplateLibrary六分类/BatchChannel并发限速/WorkFlow↔WindowUse桥接/端到端重构模板串联/熔断回流Yolo（配套 f3d80b0 WorkFlow第10角色）
 ```
 
@@ -488,10 +487,8 @@ docs/自动化测试-提示词文件列表/
 | HN01–HN10 | 订阅计费与用量计量引擎编程 | 计划版本化/订阅状态机/proration折算/计量阶梯/发票红字/dunning/Webhook验签/三方对账/周期边界/test-clock | medium~hard |
 | HO01–HO10 | 平铺窗口管理与键盘流桌面工程 | 栈选型探测/配置生成/键位冲突/工作区指派/状态栏/多屏布局/scratchpad/主题对比度/dotfiles/lint与逃生键 | simple~hard |
 | HP01–HP10 | 远程电源与开关机治理实战 | WoL魔包/链路核查/三平台定时/合盖休眠/抑制保活/优雅关机/带外通道/唤醒审计/升级窗口/断电演练 | simple~hard |
-| HQ01–HQ10 | WindowUse 多轮连续性与 Agent 间通信 | 跨轮状态注入/历史回溯/跨应用搬运/AgentMessage 桥/注入幂等/别名记忆/多窗口隔离/失败保留/pending_data 跨 WF/跨 Session | medium~hard |
 | HR01–HR10 | WorkFlow 工作流编排与 Goal 状态机 | Goal 六态/Phase DAG/Squad 三策略/AdaptiveLoop 四级/QualityGate 五级/TemplateLibrary/BatchChannel/WorkFlow↔WindowUse 桥/端到端模板串联/熔断回流 | medium~hard |
 | HS01–HS10 | 工作流编排与 Goal 状态机进阶实战 | Goal 六态迁移/Phase DAG 拓扑/Squad 多角色(AllMustPass/Quorum/LeaderDecides)/AdaptiveLoop 六策略/QualityGate 四级/TemplateLibrary 模板/BatchChannel 批量/WorkFlow↔SubAgent/WorkFlow↔WindowUse/端到端超大任务 | medium~hard |
-| HT01–HT10 | WindowUse 桌面操控与多轮连续性实战 | WindowList 枚举/WindowInspect 控件树/WindowAction 操作/WindowState 持久化/操作历史回溯/别名记忆/pending_data 跨应用/AgentMessage 消息桥/多窗口并发隔离/失败恢复 | simple~hard |
 | HU01–HU10 | 权限拦截与 Bash 安全实战 | 危险命令检测(rm -rf/fork bomb/curl|bash)/敏感路径检测(SSH/AWS/.env)/fail-closed 默认拦截/错误反馈重试/进程组管理(setsig)/超时与资源限制/审计日志/白名单与环境变量 | simple~hard |
 | HV01–HV10 | 上下文压缩与溢出恢复实战 | token 估算/三档压缩率(Light/Medium/Aggressive)/触发阈值 80%/保护段识别/LLM 失败降级硬截断/溢出检测 15+ provider/Level 1 排水/Level 2 折叠/Level 3 暴露/恢复预算 4 次 | simple~hard |
 | HW01–HW10 | 取消传播与优雅中断实战 | CancellationToken 树形传播/child_token/orphan tool_use 补全/CANCELLED_TOOL_RESULT/协议一致性硬约束/SubAgent/WindowUse/WorkFlow 全链路穿透/优雅关闭/跨 Session 隔离 | simple~hard |

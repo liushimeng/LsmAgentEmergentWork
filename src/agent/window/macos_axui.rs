@@ -1,4 +1,4 @@
-//! WindowUse Agent macOS 后端(axuielement 版,第 58 轮 P2-B)。
+//! MCP_Window_Use 驱动层 macOS 后端(axuielement 版,第 58 轮 P2-B)。
 //!
 //! 设计目标:
 //! - 替换 `macos_legacy.rs` 中手写的 `core-foundation` FFI(700 行 + 5 个 `extern "C"` 块);
@@ -242,10 +242,10 @@ impl WindowDriver for MacosAxuiDriver {
             None
         } else {
             Some(
-                "[macos-axui] 辅助功能未授权,WindowInspect/WindowAction 暂不可用。\
+                "[macos-axui] 辅助功能未授权,MCP_Window_Use(action=inspect)/MCP_Window_Use(action=control) 暂不可用。\
                  建议:系统设置 → 隐私与安全性 → 辅助功能 → 勾选宿主终端并重开;\
                  或把含 osascript/screencapture/cliclick 的步骤改 delegate_to=subagent \
-                 (WindowUse Bash 已扩白名单);WindowList 走 CoreGraphics 始终可用。"
+                 (SubAgent Bash 全量可用);MCP_Window_Use(action=list) 走 CoreGraphics 始终可用。"
                     .into(),
             )
         }

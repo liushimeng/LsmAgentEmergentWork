@@ -27,7 +27,6 @@ use crate::agent::session_context::{
 };
 use crate::agent::subagent::{SubAgentRunner, SubFlowInput};
 use crate::agent::web_use::WebUseRunner;
-use crate::agent::window_use::WindowUseRunner;
 use crate::agent::yolo::{TaskClassification, TaskLevel, YoloRunner};
 use crate::config::{Db, EventType};
 use crate::error::{AgentError, Result};
@@ -110,8 +109,6 @@ pub struct MultiAgentOrchestrator {
     main_work: MainWorkRunner,
     /// Arc 化:同层 WorkFlow 并行时共享给 tokio::spawn 任务
     sub_agent: Arc<SubAgentRunner>,
-    /// Arc 化:桌面窗口操控专项执行单元(delegate_to=windowuse 的 WorkFlow 路由至此)
-    window_use: Arc<WindowUseRunner>,
     /// Arc 化:浏览器网页操控专项执行单元(delegate_to=webuse 的 WorkFlow 路由至此,第 11 角色)
     web_use: Arc<WebUseRunner>,
     /// Arc 化:同上(质检随执行单元并行)
@@ -148,10 +145,6 @@ impl MultiAgentOrchestrator {
             SubAgentRunner::new(llm.clone(), db.clone())
                 .with_max_iterations(cfg.subagent_max_iterations),
         );
-        let window_use = Arc::new(
-            WindowUseRunner::new(llm.clone(), db.clone())
-                .with_max_iterations(cfg.subagent_max_iterations),
-        );
         let web_use = Arc::new(
             WebUseRunner::new(llm.clone(), db.clone())
                 .with_max_iterations(cfg.webuse_max_iterations),
@@ -164,7 +157,6 @@ impl MultiAgentOrchestrator {
             plan,
             main_work,
             sub_agent,
-            window_use,
             web_use,
             quality,
             session_context,

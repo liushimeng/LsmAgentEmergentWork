@@ -464,7 +464,7 @@ impl TuiSession {
                 }
                 // 2026-09-17 第 75 轮:trace 携带 delegate_mismatch 弱信号时,直接打印
                 // 「路由错配」诊断行,说明 WorkFlow 期望的角色与 Runner 实际执行的角色
-                // 不一致(典型场景:网页任务被路由到 WindowUseRunner,该 Runner 无 Browser*
+                // 不一致(典型场景:网页任务被路由到 SubAgentRunner,该 Runner 无 Browser*
                 // 工具,导致 tool_calls=0)。让用户/QA 一眼看出问题根因,不必翻 Debug 报告。
                 let mismatch_info: Option<(String, String)> = last_trace
                     .as_ref()
@@ -478,7 +478,7 @@ impl TuiSession {
                     });
                 if let Some((runner, intended)) = mismatch_info {
                     println!(
-                        "  [路由错配] Runner={runner} 但 WorkFlow 期望={intended};\n    ↳ Runner 的工具集与任务需求不匹配,典型场景:网页任务 → WindowUseRunner(无 Browser* 工具)。\n    ↳ 排查:1) Main-Work delegate 推断是否被 infer_delegate_to 正确覆盖;2) 提交 issue 时附 [trace] 段 runner_role/intended_role。"
+                        "  [路由错配] Runner={runner} 但 WorkFlow 期望={intended};\n    ↳ Runner 的工具集与任务需求不匹配,典型场景:网页任务 → SubAgentRunner(无 Browser* 工具)。\n    ↳ 排查:1) Main-Work delegate 推断是否被 infer_delegate_to 正确覆盖;2) 提交 issue 时附 [trace] 段 runner_role/intended_role。"
                     );
                 }
                 // 复用 format_task_result 渲染 stage_durations / retry_log / trace 段。
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn short_stage_label_truncates_long_input() {
-        let long = "wf-1.step WindowUse 执行中 | 职责: 微信通讯录查找用户并发送AI消息 | 期望: 微信进程存在且窗口可访问; 通讯录界面成功打开";
+        let long = "wf-1.step SubAgent 执行中 | 职责: 微信通讯录查找用户并发送AI消息 | 期望: 微信进程存在且窗口可访问; 通讯录界面成功打开";
         let label = short_stage_label(long);
         assert!(label.chars().count() <= 40, "短标题应 ≤ 40 字符:{} 字符", label.chars().count());
         assert!(label.ends_with('…'), "超长应加 …");

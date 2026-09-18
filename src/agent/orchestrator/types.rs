@@ -51,10 +51,10 @@ pub struct WorkflowResult {
     pub usage: Usage,
     /// SubAgent 执行轨迹(2026-09-09 第 05 轮),失败时为 None。
     pub subflow_trace: Option<ExecutionTrace>,
-    /// 2026-09-16 第 57 轮:执行器角色(SubAgent / WindowUse),TUI 据此标识责任 Agent
+    /// 2026-09-16 第 57 轮:执行器角色(SubAgent / WebUse),TUI 据此标识责任 Agent
     #[serde(default = "default_wf_exec_role")]
     pub exec_role: AgentRole,
-    /// 2026-09-16 第 57 轮:SubAgent/WindowUse 墙钟耗时(毫秒)
+    /// 2026-09-16 第 57 轮:执行器墙钟耗时(毫秒)
     #[serde(default)]
     pub wallclock_ms: u64,
     /// 2026-09-16 第 57 轮:QC LLM 调用单独耗时(毫秒)

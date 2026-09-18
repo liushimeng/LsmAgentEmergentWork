@@ -1,27 +1,20 @@
 //! delegate_to 委派推断(2026-09-17 自 main_work.rs 拆分)。
 //!
-//! 基于步骤 / branches / 验收文本的关键词匹配,按「GUI 优先」语义纠正委派:
-//! GUI 关键词 → WindowUse;网页关键词且无 GUI 词 → WebUse;仅 shell 词 → SubAgent。
+//! 基于步骤 / branches / 验收文本的关键词匹配纠正委派:
+//! 网页关键词且无桌面 GUI 强信号 → WebUse;其余(含桌面 GUI 强信号 / 仅 shell 词)
+//! → SubAgent。2026-09-18 第 84 轮:WindowUse Agent 已删除,桌面窗口操控流程
+//! 一律委派 SubAgent-Work(macOS / Windows 上持 MCP_Window_Use 工具)。
 
 use super::*;
 
-// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B;第 67 轮语义修正;2026-09-17 第 75 轮 WebUse 优先修正) ==========
+// ========== delegate_to 推断(2026-09-16 第 54 轮补丁 B;第 75 轮 WebUse 优先;第 84 轮收缩) ==========
 //
-// 2026-09-16 第 54 轮:实测「打开微信发消息」任务 Main-Work 把含 osascript 步骤的工作流
-// delegate_to=windowuse,但当时 WindowUse 没有 Bash 工具,导致 SubAgent 循环无法执行命令。
-// 修复:解析 WorkFlowPlan 后,基于步骤文本 + branches 文本 + 验收文本的关键词匹配纠正。
+// 2026-09-17 第 75 轮:把 GUI 关键词拆分为「桌面 GUI 强信号」(DESKTOP_GUI_STRICT_KEYWORDS)
+// 与「Web DOM 通用词」(WEB_DOM_GUI_KEYWORDS);Web 命中即优先 WebUse。
 //
-// 2026-09-16 第 67 轮语义修正(微信 4.x 实测复盘):WindowUse 已带 Bash 白名单 +
-// SendInput/OCR 原生能力,推断优先级改为「GUI 优先」。
-//
-// 2026-09-17 第 75 轮(本轮):实测「打开网址 wenxin.baidu.com,中间有一个对话的输入框,
-// 输入内容..., 找到搜素确认的按钮,点击按钮」任务被路由到 WindowUse,16 轮 0 工具调用
-// 失败(Debot 报告 P0-1 / P0-2)。根因:第 67 轮为修微信任务把「输入框」「点击按钮」
-// 「鼠标」「滚轮」等中文 GUI 词加进 WINDOW_USE_KEYWORDS,但这些词在 HTML Web 场景同样存在,
-// 命中后压制 web_hit → 误判 WindowUse → WindowUseRunner 无 Browser* 工具 → 死循环。
-// 修复:把 GUI 关键词拆分为「桌面 GUI 强信号」(WINDOW_USE_STRICT_KEYWORDS)与
-// 「Web DOM 通用词」(WEB_DOM_GUI_KEYWORDS);Web 命中即优先 WebUse,仅当桌面应用
-// 强信号(微信/钉钉/飞书/WindowList/UIA/控件树 等)出现时才覆盖到 WindowUse。
+// 2026-09-18 第 84 轮:WindowUse Agent 删除。桌面 GUI 强信号不再路由到专项 Runner,
+// 而是强制 SubAgent-Work(macOS / Windows 上持 MCP_Window_Use 工具,可完成
+// 控件树 / 视觉坐标双路线窗口操控;Bash 全量可用,osascript 等降级路径天然兼容)。
 
 pub(super) const SUBAGENT_KEYWORDS: &[&str] = &[
     "osascript",
@@ -41,27 +34,17 @@ pub(super) const SUBAGENT_KEYWORDS: &[&str] = &[
     "input keyevent",
     "input tap",
     "adb ",
-    // 2026-09-16 第 67 轮:移除 "powershell" / "shell" / "uiautomation" / "sendinput" ——
-    // 实测微信任务 Main-Work 在 steps 里写「用 PowerShell 检查进程」就会被这几个
-    // 过宽词强制改判 SubAgent(GUI 任务被路由到 Bash 路线的直接根因)。
-    // UIAutomation/SendInput 恰恰是 WindowUse 驱动层的本职能力,语义反转;
-    // WindowUse 自带 Bash 白名单(桌面操控类命令),GUI 优先不会丢失 shell 能力。
 ];
 
-/// 2026-09-17 第 75 轮:桌面应用专属词 —— 命中基本可锁定 WindowUse。
+/// 2026-09-17 第 75 轮:桌面应用专属词 —— 命中基本可锁定桌面窗口操控任务。
 ///
 /// 与 Web DOM 词汇无交集:微信/钉钉/飞书 等独立桌面应用,以及
-/// `WindowList/WindowInspect/UIA/控件树` 等明确指代 OS 原生窗口/控件树的 API。
+/// `MCP_Window_Use/UIA/控件树` 等明确指代 OS 原生窗口/控件树的 API。
 /// 命中后将压制 web_hit(防止把「https://example.com 这个链接粘到微信对话框」误判为 WebUse)。
-pub(super) const WINDOW_USE_STRICT_KEYWORDS: &[&str] = &[
-    // 桌面 OS 窗口 API(UIA/AX/wmctrl 全部)
-    "windowlist",
-    "windowinspect",
-    "windowaction",
-    "windowopen",
-    "windowocr",
-    "windowscreenshot",
-    "windowfind",
+/// 2026-09-18 第 84 轮:命中改判 SubAgent-Work(原 WindowUse Agent 已删除)。
+pub(super) const DESKTOP_GUI_STRICT_KEYWORDS: &[&str] = &[
+    // 桌面 OS 窗口 API(UIA/AX/MCP_Window_Use)
+    "mcp_window_use",
     "控件树",
     "枚举窗口",
     "ui automation",
@@ -90,7 +73,7 @@ pub(super) const WINDOW_USE_STRICT_KEYWORDS: &[&str] = &[
 /// 2026-09-17 第 75 轮:Web DOM 通用词 —— 在 Web 场景同样存在,不应作为 GUI 强证据。
 ///
 /// 保留以供 LLM 进一步细粒度决策(例如纯「输入框填写 100」无 web/desktop 锚时,作次级辅助),
-/// 但**不**进入 `WINDOW_USE_STRICT_KEYWORDS`,不再压制 web_hit。
+/// 但**不**进入 `DESKTOP_GUI_STRICT_KEYWORDS`,不再压制 web_hit。
 pub(super) const WEB_DOM_GUI_KEYWORDS: &[&str] = &[
     "输入框",
     "搜索框",
@@ -108,10 +91,6 @@ pub(super) const WEB_DOM_GUI_KEYWORDS: &[&str] = &[
     "聊天窗口",
 ];
 
-/// 2026-09-17 第 75 轮:为了不破坏 `mod.rs` 兄弟模块 `use super::*` 取用的常量名,保留
-/// `WINDOW_USE_KEYWORDS` 别名指向 `WINDOW_USE_STRICT_KEYWORDS`(合并语义,新版推断逻辑
-/// 直接用 strict 列表,旧引用仍编译通过)。
-pub(super) const WINDOW_USE_KEYWORDS: &[&str] = WINDOW_USE_STRICT_KEYWORDS;
 
 /// 2026-09-16 第 61 轮:浏览器/网页操控关键词(Chromium-WebUse,第 11 角色)。
 /// ★ 第 82 轮:补充 AI 对话类网站强信号 + 中文提交按钮 selector 名,覆盖
@@ -191,36 +170,34 @@ pub(super) fn gather_spec_text(spec: &WorkFlowSpec) -> String {
 
 /// 基于步骤文本推断 delegate_to(返回 None 表示不强行纠正,保留原值)。
 ///
-/// 2026-09-17 第 75 轮推断优先级(修复 web 任务误路由到 windowuse 的 P0 bug):
-///   1. 桌面 GUI 强信号(微信/钉钉/飞书/WindowList/UIA/控件树 等) → 强制 WindowUse
-///   2. web 命中 + 无 desktop-gui 强信号 → WebUse(无论 shell 是否同时出现,
+/// 2026-09-18 第 84 轮推断优先级(WindowUse Agent 删除后收缩为两路):
+///   1. 桌面 GUI 强信号(微信/钉钉/飞书/MCP_Window_Use/UIA/控件树 等) → 强制 SubAgent
+///      (SubAgent-Work 在 macOS / Windows 持 MCP_Window_Use 工具,Bash 全量可用)
+///   2. web 命中(含 URL)+ 无 desktop-gui 强信号 → WebUse(无论 shell 是否同时出现,
 ///      也无论「输入框/按钮」等 Web DOM 词是否出现)
 ///   3. 仅 shell 词(无 web 无 desktop-gui) → SubAgent
-///   4. shell + desktop-gui 强信号 → WindowUse(GUI 优先;WindowUse 自带 Bash 白名单)
-///   5. 都没命中 → None(保持 Main-Work 显式选择)
+///   4. 都没命中 → None(保持 Main-Work 显式选择)
 ///
-/// 与第 67 轮版本的关键差异:不再用「输入框/按钮/鼠标/滚轮」等 Web DOM 词作为
-/// GUI 强证据 —— 这些词在 HTML 页面里同样常见,误命中后会压制 web_hit 导致路由错误。
+/// 不用「输入框/按钮/鼠标/滚轮」等 Web DOM 词作为 GUI 强证据 —— 这些词在
+/// HTML 页面里同样常见,误命中后会压制 web_hit 导致路由错误(第 75 轮 P0 修复)。
 pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     let text = gather_spec_text(spec);
     let shell_hit = text_contains_any_ci(&text, SUBAGENT_KEYWORDS);
-    let desktop_gui_hit = text_contains_any_ci(&text, WINDOW_USE_STRICT_KEYWORDS);
+    let desktop_gui_hit = text_contains_any_ci(&text, DESKTOP_GUI_STRICT_KEYWORDS);
     let web_hit = text_contains_any_ci(&text, WEB_USE_KEYWORDS);
     // ★ 第 82 轮:URL 出现也作为 web 强信号(关键词表可能漏列新网站)
     let url_hit = text_contains_url(&text);
 
-    // 规则 1:桌面 GUI 强信号 → 强制 WindowUse(覆盖 web/shell)。
-    // 例:微信 + osascript 剪贴板 → 仍判 WindowUse(第 67 轮逻辑保留)。
+    // 规则 1:桌面 GUI 强信号 → 强制 SubAgent(覆盖 web/shell;MCP_Window_Use 承担窗口操控)。
     if desktop_gui_hit {
-        return Some(AgentRole::WindowUse);
+        return Some(AgentRole::SubAgent);
     }
-    // 规则 2:web 命中(无 desktop-gui 强信号)→ WebUse。第 75 轮 P0 修复核心。
+    // 规则 2:web 命中(无 desktop-gui 强信号)→ WebUse。
     // shell 词同时出现不构成压制(web 任务是主体,shell 是辅助)。
-    // ★ 第 82 轮:URL 出现同样判 web(覆盖关键词漏列新域名)。
     if web_hit || url_hit {
         return Some(AgentRole::WebUse);
     }
-    // 规则 3:仅 shell 词 → SubAgent(WebUse 没有 Bash,WindowUse 是白名单模式)。
+    // 规则 3:仅 shell 词 → SubAgent(WebUse 没有 Bash)。
     if shell_hit {
         return Some(AgentRole::SubAgent);
     }
@@ -251,10 +228,7 @@ mod infer_tests {
 
     #[test]
     fn shell_steps_route_to_subagent() {
-        // 2026-09-16 第 67 轮:纯 shell 流程(不含 GUI 词)仍判 SubAgent。
-        // 注:原用例的 'tell application "WeChat" to activate' 因含 GUI 词 WeChat,
-        // 新语义下正确改判 WindowUse(激活微信本就是窗口操控),已拆到
-        // wechat_powershell_steps_route_to_windowuse / both_keywords_pick_windowuse。
+        // 纯 shell 流程(不含 GUI 词)判 SubAgent。
         let spec = WorkFlowSpec {
             id: "wf-1".into(),
             name: "音量查询".into(),
@@ -263,31 +237,28 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec![],
-            delegate_to: AgentRole::WindowUse, // 显式选错
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
+            delegate_to: AgentRole::WebUse, // 显式选错
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
-    fn gui_steps_route_to_windowuse() {
+    fn gui_steps_route_to_subagent() {
+        // 2026-09-18 第 84 轮:桌面 GUI 强信号 → SubAgent-Work(MCP_Window_Use 工具)。
         let spec = WorkFlowSpec {
             id: "wf-2".into(),
             name: "枚举窗口".into(),
             steps: vec![
-                "调用 WindowList 找目标窗口".into(),
-                "调用 WindowInspect 遍历控件树".into(),
+                "调用 MCP_Window_Use 枚举窗口".into(),
+                "遍历控件树找目标按钮".into(),
             ],
             branches: vec![],
             loops: vec![],
             depends_on: vec![],
             acceptance: vec!["找到目标窗口 id".into()],
-            delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
+            delegate_to: AgentRole::WebUse, // 显式选错
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WindowUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
@@ -301,8 +272,6 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
         };
         assert_eq!(infer_delegate_to(&spec), None);
     }
@@ -322,9 +291,7 @@ mod infer_tests {
                     vec![dep.into()]
                 },
                 acceptance: vec![format!("完成{step}")],
-                delegate_to: AgentRole::WindowUse,
-                // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-                target_app: None,
+                delegate_to: AgentRole::SubAgent,
             }
         }
         let mut plan = WorkFlowPlan {
@@ -343,32 +310,28 @@ mod infer_tests {
     }
 
     #[test]
-    fn both_keywords_pick_windowuse() {
-        // 2026-09-16 第 67 轮语义修正:混合型(osascript + 控件关键词)→ WindowUse。
-        // 旧版判 SubAgent 是「微信任务被路由到 Bash 路线」的直接根因;
-        // WindowUse 已带 Bash 白名单 + SendInput/OCR 原生能力,GUI 优先不丢 shell。
+    fn both_keywords_pick_subagent() {
+        // 混合型(osascript + 桌面 GUI 强信号)→ SubAgent-Work:
+        // MCP_Window_Use 承担控件树/视觉双路线,Bash 全量可用不丢 shell 能力。
         let spec = WorkFlowSpec {
             id: "wf-mix".into(),
             name: "混合".into(),
             steps: vec![
                 "osascript -e 'tell application \"WeChat\" to activate'".into(),
-                "WindowInspect 检视".into(),
+                "MCP_Window_Use 遍历控件树检视".into(),
             ],
             branches: vec![],
             loops: vec![],
             depends_on: vec![],
             acceptance: vec![],
-            delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
+            delegate_to: AgentRole::WebUse, // 显式选错
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WindowUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
-    fn wechat_powershell_steps_route_to_windowuse() {
-        // 第 67 轮核心回归:复现本次失败 —— steps 含「PowerShell 检查进程」+「点击通讯录」,
-        // 旧版被 "powershell/shell" 宽词判 SubAgent;新版必须 WindowUse。
+    fn wechat_desktop_steps_route_to_subagent() {
+        // 桌面应用强信号(微信)命中 → SubAgent-Work(MCP_Window_Use 承担窗口操控)。
         let spec = WorkFlowSpec {
             id: "wf-wx".into(),
             name: "微信操控".into(),
@@ -381,11 +344,9 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec!["消息出现在会话窗口".into()],
-            delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
+            delegate_to: AgentRole::WebUse, // 显式选错
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WindowUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
@@ -399,9 +360,7 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec![],
-            delegate_to: AgentRole::WindowUse,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
+            delegate_to: AgentRole::WebUse, // 显式选错
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -426,9 +385,7 @@ mod infer_tests {
             loops: vec![],
             depends_on: vec![],
             acceptance: vec!["对话窗口出现 AI 回复内容".into()],
-            delegate_to: AgentRole::WindowUse, // LLM 错判
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
+            delegate_to: AgentRole::SubAgent, // LLM 错判
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
     }
@@ -448,15 +405,13 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
     }
 
     #[test]
-    fn wechat_desktop_app_with_url_still_routes_to_windowuse() {
-        // 反向用例:步骤中包含 URL 但桌面应用强信号(微信)出现 → 仍判 WindowUse,
+    fn wechat_desktop_app_with_url_still_routes_to_subagent() {
+        // 反向用例:步骤中包含 URL 但桌面应用强信号(微信)出现 → 仍判 SubAgent-Work,
         // 防止「在微信对话框里发送 https://example.com」任务被误判 WebUse。
         let spec = WorkFlowSpec {
             id: "wf-wx-url".into(),
@@ -470,10 +425,8 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::WebUse, // LLM 错判
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
         };
-        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WindowUse));
+        assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
     #[test]
@@ -492,8 +445,6 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
     }
@@ -511,8 +462,6 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent, // explicit 选 SubAgent
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
         };
         assert_eq!(infer_delegate_to(&spec), None);
     }
@@ -529,8 +478,6 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
     }
@@ -551,8 +498,6 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
     }
@@ -576,8 +521,6 @@ mod infer_tests {
             // acceptance 里有 URL,触发 URL 检测
             acceptance: vec!["对话窗口出现 AI 回复,内容与 https://wenxin.baidu.com/ 一致".into()],
             delegate_to: AgentRole::SubAgent,
-            // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-            target_app: None,
         };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::WebUse));
     }

@@ -67,7 +67,7 @@ fn ensure_gdiplus() -> Result<()> {
     }
 }
 
-/// 截取并保存到**指定路径**(WindowScreenshot 的 Windows 纯 Rust 路径)。
+/// 截取并保存到**指定路径**(MCP_Window_Use(action=screenshot) 的 Windows 纯 Rust 路径)。
 pub fn capture_window_png_to(
     hwnd: HWND,
     region: Option<Rect>,
@@ -94,7 +94,7 @@ fn capture_window_png_impl(
     ensure_dpi_aware();
     ensure_gdiplus()?;
 
-    // 窗口矩形(物理像素;含标题栏 —— 与 WindowList bounds 同基准)
+    // 窗口矩形(物理像素;含标题栏 —— 与 MCP_Window_Use(action=list) bounds 同基准)
     let mut wr = RECT::default();
     // SAFETY:按 HWND 取矩形,失败转错误。
     unsafe {
@@ -111,7 +111,7 @@ fn capture_window_png_impl(
     if win.width <= 0 || win.height <= 0 {
         return Err(platform_err(
             "windows",
-            format!("窗口矩形非法({win:?});最小化窗口请先恢复(WindowOpen 会自动恢复)"),
+            format!("窗口矩形非法({win:?});最小化窗口请先恢复(MCP_Window_Use(action=open) 会自动恢复)"),
         ));
     }
     let cap = match region {

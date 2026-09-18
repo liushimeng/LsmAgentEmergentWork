@@ -58,28 +58,6 @@ pub(super) fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
     matches!(stop_reason, Some("max_tokens") | Some("length"))
 }
 
-// ============== 2026-09-16 第 58 轮 P0-A:WindowUse nudge 兜底 ==============
-//
-// 微信任务失败根因(调研确认):
-// LLM 在 WindowUse Runner 第 1 轮经常返回"让我先 WindowList 看看..."纯文本,
-// 没有调任何窗口操控工具。Agent 循环 `!has_tool_calls() → finalize_with_max_tokens`
-// 把这段文本当作成功回答返回 → trace.tool_calls=0 → Runner 视为成功 →
-// 上层 QC 看到"无 WindowAction 调用"判未通过 → 整任务失败。
-//
-// 闸门双锁:
-// 1) iter==1:仅第 1 轮 nudge,后续轮次恢复原行为,避免长任务误判;
-// 2) profile.tools 含 "WindowList":强白名单,只对窗口操控类 Agent 触发,
-//    其它 Agent(Yolo/Main-Work/QC/SubAgent 普通任务)走原路径。
-//
-// P0-B 在 WindowUseRunner 出口兜底:即便 nudge 后 LLM 仍只回文本,也会被 Runner
-// 标 failed,不会逃过 QC。
-pub(crate) const WINDOW_OPS_NUDGE_TEXT: &str = "【laew 系统提示】你刚才的回复没有调用任何窗口操控工具。\
-请立即用 WindowList(枚举桌面窗口)或 WindowFind(按进程名/标题查窗口,推荐)找到目标应用窗口,\
-然后用 WindowInspect 检视控件树,再用 WindowAction 执行操作。\
-这是唯一被接受的工作方式 —— 纯文本回答将被判失败。\
-提示:macOS 上 WeChat/部分 Electron 应用的 NSWindow title 可能为空,这是正常的,\
-应通过 process_name=\"WeChat\" 定位窗口,WindowFind 返回 title=\"\" 时 JSON 含 note 字段说明此现象。";
-
 /// 2026-09-16 第 68 轮 P0-A(修复 v2):首迭代 forced tool 未生效时的强引导 nudge。
 /// 触发条件:iter=0 且 first_iter_forced_tool 已设置,但 LLM 返回纯文本(无 tool_use)。
 /// 常见原因:Provider/网关拒绝 forced tool_choice 被 resilient 降级为 auto。
@@ -89,13 +67,6 @@ pub(crate) const FORCED_TOOL_NUDGE_TEXT: &str = "【laew 强制指令】你在�
 如果你不调用工具,任务将被标记为失败(trace 标 early_terminated)。\
 注意:直接用工具规定的 JSON 参数格式调用,不要解释为什么要调用、不要描述计划。\
 如果工具返回权限错误(如 macOS -25211),在最终回答中告知用户如何授权,不要放弃任务。";
-
-pub(crate) fn should_nudge_window_ops(profile_tools: &[&str], iter: usize) -> bool {
-    // 2026-09-16 第 68 轮 P0-B 修复:扩展触发范围到 iter <= 2(前 3 轮均可 nudge),
-    // 覆盖 iter=0 forced tool 失效 + iter=1 原 nudge + iter=2 补刀三种场景。
-    // 原 iter==1 在 forced tool 被降级时无法触达(循环在 iter=0 就退出)。
-    iter <= 2 && profile_tools.iter().any(|t| *t == "WindowList")
-}
 
 /// 2026-09-16 第 63 轮(升级):WebUse nudge 改为命令语气。
 /// 此前提示语气 LLM 仍可能只回文本,现改为硬性要求 + 直接给出 JSON 参数示例。

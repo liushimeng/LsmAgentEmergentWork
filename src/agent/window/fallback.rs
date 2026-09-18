@@ -7,7 +7,7 @@
 //!   AT-SPI 覆盖率差),一律返回结构化「平台不支持」错误,fail-closed,
 //!   让 QC 判定失败并回流 Yolo 给出「请在 Windows/macOS 执行」的用户建议。
 //!
-//! 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` §2.3 Fallback 后端。
+//! 设计见 `docs/MCP_Window_Use/01-设计与解决方案.md` §2.3 Fallback 后端。
 
 use std::process::Command;
 

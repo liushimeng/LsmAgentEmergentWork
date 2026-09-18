@@ -71,7 +71,7 @@ pub struct ExecutionTrace {
     pub last_bash_exit_code: i32,
     /// 工具调用日志(2026-09-16 第 56 轮,新增):
     /// 每次工具调用的轻量摘要(工具名 + 关键参数 + 是否成功)。
-    /// 供 WindowUseRunner 从 trace 恢复窗口会话状态 / QC 拿到真实调用证据。
+    /// 供执行器 Runner 从 trace 恢复状态 / QC 拿到真实调用证据。
     /// 设计原则:
     /// - 仅保留工具名 + 参数稳定 JSON + 成功/失败 + 输出字节数,**不存输出全文**
     ///   (避免 trace 暴涨);
@@ -87,17 +87,17 @@ pub struct ExecutionTrace {
     /// 用于 TUI 证据段显示 forced_tool 状态,快速定位「0 工具调用」根因。
     #[serde(default)]
     pub forced_tool_effective: Option<bool>,
-    /// 2026-09-17 第 75 轮:Runner 实际执行的 Agent 角色(SubAgent / WindowUse / WebUse)。
+    /// 2026-09-17 第 75 轮:Runner 实际执行的 Agent 角色(SubAgent / WebUse)。
     /// 由 Runner 在 `run_unit_inner` 入口写入;若 `runner_role != intended_role`,
     /// 说明 WorkFlow 被路由到了一个与步骤需求不匹配的 Runner(典型场景:网页任务
-    /// 错误路由到 WindowUseRunner,Runner 没有 Browser* 工具 → tool_calls=0)。
+    /// 错误路由到 SubAgentRunner,Runner 没有 Browser* 工具 → tool_calls=0)。
     #[serde(default)]
     pub runner_role: Option<crate::agent::context::AgentRole>,
     /// 2026-09-17 第 75 轮:WorkFlow 期望的 Agent 角色(`wf.delegate_to`)。
     /// 与 `runner_role` 对比可识别「委派错配」(`delegate_mismatch` 弱信号)。
     #[serde(default)]
     pub intended_role: Option<crate::agent::context::AgentRole>,
-    /// 2026-09-17 第 77 轮 P0-1:WindowUse Runner 入口检测到平台权限缺失项。
+    /// 2026-09-17 第 77 轮 P0-1:执行器 Runner 入口检测到平台权限缺失项。
     /// 空数组表示所有权限齐全;非空数组列出缺失的能力名(如
     /// `["accessibility(macos)", "screen_recording(macos)"]`)。
     /// 供 QC / Debug 报告 / TUI 阶段打印快速识别权限类失败根因。
@@ -139,7 +139,7 @@ pub struct ToolCallLogEntry {
     /// 成功工具输出的短摘要(2026-09-16 第 61 轮新增)。
     ///
     /// - 旧 trace 反序列化为空串;
-    /// - 仅保留前 512 字符,主要用于 WindowUse 恢复 WindowList / WindowFind
+    /// - 仅保留前 512 字符,主要用于执行器恢复上轮工具结果
     ///   的窗口 ID,以及 QC / TUI 看到真实执行证据;
     /// - 不落全文,避免 Agent-Memory 与上下文膨胀。
     #[serde(default)]
@@ -253,9 +253,9 @@ impl ExecutionTrace {
         }
 
         // 5.5) 委派错配信号(2026-09-17 第 75 轮):Runner 实际角色 ≠ WorkFlow 期望角色。
-        // 弱信号,不进入 `is_failed()`;典型场景:网页任务被路由到 WindowUseRunner,
+        // 弱信号,不进入 `is_failed()`;典型场景:网页任务被路由到 SubAgentRunner,
         // Runner 没有 Browser* 工具 → tool_calls=0 → 单元"看起来"失败但其实是路由问题。
-        // QC 拿到此信号后可以给出明确文案("该 WorkFlow 应走 webuse 但走了 windowuse"),
+        // QC 拿到此信号后可以给出明确文案("该 WorkFlow 应走 webuse 但走了 subagent"),
         // TUI 据此打印 `[路由错配]` 诊断行(见 `src/tui/dispatch.rs`)。
         if let (Some(r), Some(i)) = (self.runner_role, self.intended_role) {
             if r != i && self.tool_calls == 0 {

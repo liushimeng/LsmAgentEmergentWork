@@ -150,7 +150,7 @@ mod tests {
         let (db, _d) = fresh_db();
         let msg = AgentMessage::new(
             "s1",
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             AgentRole::SubAgent,
             MessagePayload::WindowTextRead {
                 window_id: "w1".into(),
@@ -164,7 +164,7 @@ mod tests {
         let peeked = db.peek_agent_message("s1", AgentRole::SubAgent).unwrap();
         assert!(peeked.is_some());
         let peeked = peeked.unwrap();
-        assert_eq!(peeked.from_role, AgentRole::WindowUse);
+        assert_eq!(peeked.from_role, AgentRole::WebUse);
         assert_eq!(peeked.consumed, false);
         match &peeked.payload {
             MessagePayload::WindowTextRead { content, .. } => assert_eq!(content, "hello"),
@@ -184,7 +184,7 @@ mod tests {
         let (db, _d) = fresh_db();
         let msg = AgentMessage::new(
             "s1",
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             AgentRole::SubAgent,
             MessagePayload::Data {
                 key: "k".into(),
@@ -209,7 +209,7 @@ mod tests {
         for _ in 0..3 {
             let msg = AgentMessage::new(
                 "s1",
-                AgentRole::WindowUse,
+                AgentRole::WebUse,
                 AgentRole::SubAgent,
                 MessagePayload::Data {
                     key: "k".into(),
@@ -221,7 +221,7 @@ mod tests {
         // 插入另一 session 的消息(不应被清理)
         let msg2 = AgentMessage::new(
             "s2",
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             AgentRole::SubAgent,
             MessagePayload::Data {
                 key: "k".into(),
@@ -247,7 +247,7 @@ mod tests {
         let (db, _d) = fresh_db();
         let msg = AgentMessage::new(
             "s1",
-            AgentRole::WindowUse,
+            AgentRole::WebUse,
             AgentRole::SubAgent,
             MessagePayload::Data {
                 key: "k".into(),

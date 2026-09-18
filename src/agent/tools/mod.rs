@@ -20,10 +20,9 @@ pub mod edit;
 pub mod emit;
 pub mod glob;
 pub mod grep;
+pub mod mcp_window_use;
 pub mod read;
 pub mod read_detect;
-pub mod window;
-pub mod window_vision;
 pub mod write;
 
 /// 工具需要实现的异步 trait
@@ -103,27 +102,37 @@ fn sandbox_with(work_dir: PathBuf) -> SandboxConfig {
 /// 默认注册表:内置 Bash / Read / Write / Edit / Glob / Grep(SubAgent-Work / 兼容别名)
 ///
 /// 写操作(Write / Edit)带有沙箱拦截,限制在工作目录与系统临时目录。
+/// 2026-09-18 第 84 轮:macOS / Windows 追加 MCP_Window_Use(桌面窗口操控统一入口,
+/// 平台门控见 [`mcp_window_use::mcp_window_use_available`])。
 pub fn builtin_registry() -> ToolRegistry {
     let sandbox = default_sandbox();
-    ToolRegistry::new()
+    let mut reg = ToolRegistry::new()
         .register(Arc::new(bash::BashTool))
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(write::WriteTool::new(sandbox.clone())))
         .register(Arc::new(edit::EditTool::new(sandbox.clone())))
         .register(Arc::new(glob::GlobTool))
-        .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(grep::GrepTool));
+    if mcp_window_use::mcp_window_use_available() {
+        reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
+    }
+    reg
 }
 
 /// 带指定工作目录的沙箱注册表(供编排器使用)。
 pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
     let sandbox = sandbox_with(work_dir);
-    ToolRegistry::new()
+    let mut reg = ToolRegistry::new()
         .register(Arc::new(bash::BashTool))
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(write::WriteTool::new(sandbox.clone())))
         .register(Arc::new(edit::EditTool::new(sandbox.clone())))
         .register(Arc::new(glob::GlobTool))
-        .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(grep::GrepTool));
+    if mcp_window_use::mcp_window_use_available() {
+        reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
+    }
+    reg
 }
 
 /// Yolo Agent 工具注册表:Read(理解上下文)+ 结构化输出通道
@@ -184,29 +193,6 @@ pub fn compact_registry() -> ToolRegistry {
     ToolRegistry::new()
 }
 
-/// WindowUse Agent 工具注册表(第 9 角色,桌面操控层):
-///
-/// 2026-09-16 第 54 轮补丁 A(综合修复):
-/// Read(读文件) + WindowList / WindowInspect / WindowAction(窗口操控)
-/// + **Bash**(白名单模式,仅放行桌面操控类命令)。
-///
-/// 2026-09-16 第 56 轮:新增 WindowFind(按标题/进程名查窗口,省一次 WindowList 后
-/// 人工匹配)与 WindowScreenshot(跨平台截图落盘,为后续 OCR / 视觉验证铺路)。
-///
-/// 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` §2.5。
-pub fn window_use_registry() -> ToolRegistry {
-    ToolRegistry::new()
-        .register(Arc::new(read::ReadTool))
-        .register(Arc::new(bash::BashTool))
-        .register(Arc::new(window::WindowOpenTool))
-        .register(Arc::new(window::WindowListTool))
-        .register(Arc::new(window::WindowFindTool))
-        .register(Arc::new(window::WindowInspectTool))
-        .register(Arc::new(window::WindowActionTool))
-        .register(Arc::new(window_vision::WindowOCRTool))
-        .register(Arc::new(window_vision::WindowScreenshotTool))
-}
-
 /// Chromium-WebUse Agent 工具注册表(第 11 角色,浏览器操控层,2026-09-16 第 61 轮):
 /// Read(读文件) + BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect。
 /// 不带 Bash/Write(网页操控单元收窄权限面)。
@@ -256,24 +242,21 @@ mod names_tests {
     }
 
     #[test]
-    fn window_use_registry_names() {
-        let reg = window_use_registry();
-        // 2026-09-16 第 56 轮:WindowUse 工具集新增 WindowFind(标题/进程名查窗口)
-        // + WindowScreenshot(截图落盘,为后续 OCR 铺路)。
-        // 2026-09-16 第 67 轮:新增 WindowOCR(视觉路线:自绘 UI 文本识别 + 坐标)。
+    fn builtin_registry_mcp_window_use_platform_gated() {
+        // 2026-09-18 第 84 轮:MCP_Window_Use 仅 macOS / Windows 注册。
+        let reg = builtin_registry();
+        let names = reg.names();
+        let has = names.contains(&"MCP_Window_Use");
         assert_eq!(
-            reg.names(),
-            vec![
-                "Read",
-                "Bash",
-                "WindowOpen",
-                "WindowList",
-                "WindowFind",
-                "WindowInspect",
-                "WindowAction",
-                "WindowOCR",
-                "WindowScreenshot",
-            ]
+            has,
+            cfg!(any(target_os = "macos", target_os = "windows")),
+            "MCP_Window_Use 注册应与平台门控一致: {names:?}"
+        );
+        let reg = builtin_registry_with_work_dir(PathBuf::from("."));
+        let names = reg.names();
+        assert_eq!(
+            names.contains(&"MCP_Window_Use"),
+            cfg!(any(target_os = "macos", target_os = "windows")),
         );
     }
 }

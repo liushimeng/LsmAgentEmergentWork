@@ -14,7 +14,6 @@ use crate::agent::cancel::CancelToken;
 use crate::agent::context::AgentRole;
 use crate::agent::extrace::ExecutionTrace;
 use crate::agent::memory;
-use crate::agent::window_state::WindowSessionState;
 use crate::agent::{Agent, AgentProfile};
 use crate::config::Db;
 use crate::error::{AgentError, Result};
@@ -41,9 +40,6 @@ pub struct SubFlowInput {
     /// 来自同一 WorkFlow 中前序步骤的产物
     #[serde(default)]
     pub sibling_outputs: Vec<String>,
-    /// ★窗口上下文(由 Orchestrator 注入,WindowUse 单元专用,跨轮持久化)。
-    #[serde(default)]
-    pub window_context: Option<WindowSessionState>,
     /// ★待处理的 Agent 消息(其他 Agent 发来的)。
     #[serde(default)]
     pub pending_agent_messages: Vec<AgentMessage>,
@@ -53,14 +49,6 @@ pub struct SubFlowInput {
     /// `None` 表示 Orchestrator 未注入(老调用点兼容)。
     #[serde(default)]
     pub intended_role: Option<AgentRole>,
-    /// ★2026-09-17 第 82+ 轮 P0-1:目标桌面应用标识(WindowUse Runner 自动启动兜底用)。
-    /// `None` 时 Runner 跳过自动启动;若提供(WeChat/Chrome/Slack/Telegram 等),
-    /// Runner 在 sub_session 创建前先做一次「目标可见性探测」,不可见则主动
-    /// launch_desktop_app + wait_seconds,把启动结果作为 prompt 注入,
-    /// 让 LLM 第一轮即可拿到 ready window_id,不再因「目标应用不在」反复失败。
-    /// 白名单:仅已知应用被允许,避免误启动任意应用。
-    #[serde(default)]
-    pub expected_target_app: Option<String>,
 }
 
 impl SubFlowInput {
@@ -90,14 +78,6 @@ impl SubFlowInput {
             out.push_str("\n同 WorkFlow 前序步骤产物:\n");
             for (i, s) in self.sibling_outputs.iter().enumerate() {
                 out.push_str(&format!("  - [步骤 {}] {}\n", i + 1, s));
-            }
-        }
-        if let Some(ref ctx) = self.window_context {
-            if !ctx.is_empty() {
-                let state_prompt = crate::agent::window_state::build_window_state_prompt(ctx);
-                if !state_prompt.is_empty() {
-                    out.push_str(&format!("\n【窗口会话上下文(系统注入)】\n{state_prompt}"));
-                }
             }
         }
         if !self.pending_agent_messages.is_empty() {
@@ -312,7 +292,7 @@ impl SubAgentRunner {
         // Agent 循环返回 (text, usage, trace) 三元组。
         // 早终止路径(RepeatedToolFailure / MaxIterationsExceeded)不再升级为 Error,
         // ★2026-09-17 第 75 轮:Runner 角色信息(SubAgent)。
-        // ★2026-09-17 第 78 轮:SubAgentRunner 在 simple 档也可能被 webuse/windowuse
+        // ★2026-09-17 第 78 轮:SubAgentRunner 在 simple 档也可能被 webuse
         // 委派(suggested_delegate 路由修复后);但 Runner 实际执行的是 SubAgent 角色,
         // trace.runner_role 仍为 SubAgent,trace.intended_role 反映 WorkFlow 期望的角色。
         let runner_role = Some(AgentRole::SubAgent);
@@ -629,11 +609,9 @@ mod tests {
             original_prompt: None,
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
-            window_context: None,
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
-            expected_target_app: None,
         };
 
         let outcome = runner
@@ -676,11 +654,9 @@ mod tests {
             original_prompt: Some("请帮我看一下 src/foo.rs 这个文件的前 50 行".into()),
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
-            window_context: None,
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
-            expected_target_app: None,
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("wf-1.step-1"));
@@ -705,11 +681,9 @@ mod tests {
             original_prompt: None,
             depends_on_outputs: vec!["依赖产物 A".into()],
             sibling_outputs: vec!["前序步骤产物 B".into()],
-            window_context: None,
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
-            expected_target_app: None,
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("上游产物"));
@@ -729,11 +703,9 @@ mod tests {
             original_prompt: Some("   \n  \t  ".into()),
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
-            window_context: None,
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
-            expected_target_app: None,
         };
         let prompt = input.to_user_prompt();
         assert!(!prompt.contains("用户原始输入"));
@@ -749,17 +721,14 @@ mod tests {
             original_prompt: None,
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
-            window_context: None,
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
-            expected_target_app: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         // original_prompt 默认值是 null,确保 SubAgent 输入 JSON 兼容老实现
         assert!(json.contains("\"original_prompt\":null"));
         // 新字段默认值也应正确序列化
-        assert!(json.contains("\"window_context\":null"));
         assert!(json.contains("\"pending_agent_messages\":[]"));
     }
 

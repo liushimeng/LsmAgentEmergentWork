@@ -1,14 +1,10 @@
-//! 桌面应用启动工具(2026-09-17 自 tools/window.rs 拆分)。
-//!
-//! `WindowOpenTool`:已在运行直接恢复前置、开始菜单快捷方式扫描、固定盘
-//! 安装路径探测、ShellExecuteW 兜底;无 macOS AX 权限也能启动并轮询定位窗口。
+//! MCP_Window_Use 启动类 action(2026-09-18 第 84 轮自 tools/window/open.rs 迁入):
+//! `open` —— 已在运行直接恢复前置、开始菜单快捷方式扫描、固定盘安装路径探测、
+//! ShellExecuteW 兜底;无 macOS AX 权限也能启动并轮询定位窗口。
 
 use super::*;
 
-// ===================== WindowOpen =====================
-
-/// 桌面应用启动 / 激活工具:无 macOS AX 权限也能启动应用并轮询定位窗口。
-pub struct WindowOpenTool;
+// ===================== action=open =====================
 
 fn safe_desktop_identifier(s: &str) -> bool {
     !s.is_empty()
@@ -17,7 +13,7 @@ fn safe_desktop_identifier(s: &str) -> bool {
         && s.chars().count() <= 128
 }
 
-// ===================== Windows 启动解析链(2026-09-16 第 67 轮) =====================
+// ===================== Windows 启动解析链 =====================
 //
 // 背景:微信 4.x(Weixin.exe)既不在 PATH 也不注册 App Paths,实测装在
 // `D:\Program Files (x86)\Tencent\Weixin\`,旧版 `powershell Start-Process WeChat`
@@ -210,7 +206,7 @@ fn launch_windows_app(app: &str, aliases: &[String]) -> std::result::Result<Stri
     match shell_execute_open(app) {
         Ok(()) => Ok(app.to_string()),
         Err(e) => Err(format!(
-            "{e};建议:1) 提供 app_name 完整路径;2) 先手动打开应用再让 WindowOpen 激活"
+            "{e};建议:1) 提供 app_name 完整路径;2) 先手动打开应用再让 MCP_Window_Use(action=open) 激活"
         )),
     }
 }
@@ -219,7 +215,7 @@ fn launch_desktop_app(
     app: &str,
     bundle_id: Option<&str>,
 ) -> std::result::Result<Vec<String>, String> {
-    // 2026-09-16 第 67 轮:Windows 走 OS API 解析链(ShellExecuteW / 快捷方式 / 安装路径)
+    // Windows 走 OS API 解析链(ShellExecuteW / 快捷方式 / 安装路径)
     #[cfg(windows)]
     {
         let aliases = expand_window_query(app);
@@ -290,145 +286,60 @@ fn launch_desktop_app(
     }
 }
 
-#[async_trait]
-impl Tool for WindowOpenTool {
-    fn name(&self) -> &str {
-        "WindowOpen"
-    }
-
-    fn description(&self) -> &str {
-        "启动/激活桌面应用并等待窗口出现,返回 window_id、匹配别名、窗口数量与权限状态。支持 WeChat ↔ 微信别名。"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type":"object",
-            "properties":{
-                "query":{"type":"string"},
-                "app_name":{"type":"string"},
-                "bundle_id":{"type":"string"},
-                "wait_seconds":{"type":"integer","minimum":0,"maximum":20}
-            },
-            "required":["query"],
-            "additionalProperties":false
+/// 启动/激活桌面应用并等待窗口出现,返回 window_id、匹配别名、窗口数量与权限状态。
+///
+/// 已在运行(含最小化到托盘)→ 恢复 + 前置,不重复启动;已在前台 → 跳过激活
+/// (不再 AXRaise/osascript/400ms sleep/bounds 重取),窗口不被反复前置闪烁。
+pub(super) async fn run(args: Value) -> Result<String> {
+    let query = require_str(&args, "query", MCP_WINDOW_USE_TOOL_NAME)?.to_string();
+    let app_name = get_str(&args, "app_name").unwrap_or(&query).to_string();
+    let bundle_id = get_str(&args, "bundle_id").map(str::to_string);
+    let wait_secs = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        // 微信等大型应用首次启动需 8-10s,默认 10。
+        // 可通过 LAEW_WINDOW_OPEN_WAIT 环境变量调整(默认 10,最大 30)。
+        .unwrap_or_else(|| {
+            std::env::var("LAEW_WINDOW_OPEN_WAIT")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(10)
         })
-    }
+        .min(30);
 
-    async fn execute(&self, args: Value) -> Result<String> {
-        let query = require_str(&args, "query", self.name())?.to_string();
-        let app_name = get_str(&args, "app_name").unwrap_or(&query).to_string();
-        let bundle_id = get_str(&args, "bundle_id").map(str::to_string);
-        let wait_secs = args
-            .get("wait_seconds")
-            .and_then(Value::as_u64)
-            // 2026-09-16 第 65 轮 P1-C:微信等大型应用首次启动需 8-10s,默认从 6 改 10。
-            // 可通过 LAEW_WINDOW_OPEN_WAIT 环境变量调整(默认 10,最大 30)。
-            .unwrap_or_else(|| {
-                std::env::var("LAEW_WINDOW_OPEN_WAIT")
+    run_blocking(MCP_WINDOW_USE_TOOL_NAME, move || {
+        let driver = current_driver();
+        let before = driver.list_windows(None)?;
+        let aliases = expand_window_query(&query);
+        let before_hit = find_window_by_aliases(&before, &aliases);
+        let started = std::time::Instant::now();
+
+        // 已在运行(含最小化到托盘)→ 恢复 + 前置,不重复启动。
+        if let Some((matched_query, mut info)) = before_hit.clone() {
+            let already_frontmost = driver.is_frontmost(&info.id);
+            let activated = if already_frontmost {
+                true
+            } else {
+                let ok = driver.bring_to_front(&info.id).is_ok();
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                // 前置后重取一次最新 bounds(恢复最小化后 -32000 会刷新为真实坐标)
+                if let Some(fresh) = driver
+                    .list_windows(None)
                     .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .unwrap_or(10)
-            })
-            .min(30);
-
-        run_blocking(self.name(), move || {
-            let driver = current_driver();
-            let before = driver.list_windows(None)?;
-            let aliases = expand_window_query(&query);
-            let before_hit = find_window_by_aliases(&before, &aliases);
-            let started = std::time::Instant::now();
-
-            // 2026-09-16 第 67 轮:已在运行(含最小化到托盘)→ 恢复 + 前置,不重复启动。
-            // 2026-09-17 第 81 轮:已在前台 → **跳过激活**(不再 AXRaise/osascript/400ms
-            // sleep/bounds 重取),多单元与重试链路中窗口不再被反复前置闪烁(会话连续性)。
-            if let Some((matched_query, mut info)) = before_hit.clone() {
-                let already_frontmost = driver.is_frontmost(&info.id);
-                let activated = if already_frontmost {
-                    true
-                } else {
-                    let ok = driver.bring_to_front(&info.id).is_ok();
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    // 前置后重取一次最新 bounds(恢复最小化后 -32000 会刷新为真实坐标)
-                    if let Some(fresh) = driver
-                        .list_windows(None)
-                        .ok()
-                        .and_then(|ws| ws.into_iter().find(|w| w.id == info.id))
-                    {
-                        info = fresh;
-                    }
-                    ok
-                };
-                let permission_hint = driver.permission_hint();
-                let perm = crate::agent::window::check_platform_permissions();
-                let next_action = if perm.screen_recording {
-                    "窗口已在运行;直接 WindowInspect / WindowOCR 继续。若控件树为空(自绘 UI),改用 WindowOCR 视觉路线。"
-                } else if perm.accessibility {
-                    "窗口已在运行;屏幕录制未授权 → WindowOCR/WindowScreenshot/Bash screencapture 均不可用,直接 WindowInspect(AX 主路线)+ 坐标估算 / type_text_submit。"
-                } else {
-                    "窗口已在运行;辅助功能未授权 → 仅可 WindowList/WindowFind,读取/操作 UI 需用户先授权。"
-                };
-                let body = json!({
-                    "ok":true,
-                    "window_id":info.id,
-                    "title":info.title,
-                    "process_name":info.process_name,
-                    "pid":info.pid,
-                    "bounds":info.bounds,
-                    "query":query,
-                    "matched_query":matched_query,
-                    "query_aliases":aliases,
-                    "already_visible_before_launch":true,
-                    "already_frontmost":already_frontmost,
-                    "activated_existing":activated,
-                    "visible_before":before.len(),
-                "launch_commands":[],
-                    "wait_ms":started.elapsed().as_millis() as u64,
-                    "driver":driver.platform_name(),
-                    "inspect_ready":permission_hint.is_none(),
-                    "permission_hint":permission_hint,
-                    "next_action":next_action,
-                });
-                return Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()));
-            }
-
-            let commands =
-                launch_desktop_app(&app_name, bundle_id.as_deref())
-                    .map_err(|e| tool_err("WindowOpen", e))?;
-
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
-            let mut after = before.clone();
-            let mut matched = before_hit.clone();
-            while matched.is_none() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                after = driver.list_windows(None)?;
-                matched = find_window_by_aliases(&after, &aliases);
-            }
-
-            let Some((matched_query, info)) = matched else {
-                let titles: Vec<String> = after
-                    .iter()
-                    .take(10)
-                    .map(|w| format!("{} ({})", w.title, w.process_name))
-                    .collect();
-                return Err(tool_err(
-                    "WindowOpen",
-                    format!(
-                        "启动命令已执行({commands:?},耗时 {:.1}s),但 {wait_secs}s 内未匹配到窗口。尝试别名:{aliases:?};当前可见前 10 个:{titles:?}。\
-                         提示:应用可能弹出了登录窗(标题不同)或启动较慢;可用 WindowList(filter=相关词)确认,或加大 wait_seconds 重试。",
-                        started.elapsed().as_secs_f32()
-                    ),
-                ));
+                    .and_then(|ws| ws.into_iter().find(|w| w.id == info.id))
+                {
+                    info = fresh;
+                }
+                ok
             };
             let permission_hint = driver.permission_hint();
-            // 第 81 轮:next_action 按屏幕录制权限分派(避免把 LLM 推向不可用的 OCR 路线)
             let perm = crate::agent::window::check_platform_permissions();
             let next_action = if perm.screen_recording {
-                "inspect_ready=true 时用 window_id 调 WindowInspect;控件树为空(自绘 UI)时改用 WindowOCR。"
+                "窗口已在运行;直接 action=inspect / action=ocr 继续。若控件树为空(自绘 UI),改用 action=ocr 视觉路线。"
             } else if perm.accessibility {
-                "inspect_ready=true 时用 window_id 调 WindowInspect(AX 主路线);屏幕录制未授权,WindowOCR/WindowScreenshot/Bash screencapture 均不可用,坐标用窗口 bounds 比例估算。"
+                "窗口已在运行;屏幕录制未授权 → ocr/screenshot/screencapture 均不可用,直接 action=inspect(AX 主路线)+ 坐标估算 / type_text_submit。"
             } else {
-                "辅助功能未授权:仅可 WindowList/WindowFind 定位窗口;读取/操作 UI 需用户先授权。"
+                "窗口已在运行;辅助功能未授权 → 仅可 action=list/action=find,读取/操作 UI 需用户先授权。"
             };
             let body = json!({
                 "ok":true,
@@ -440,18 +351,80 @@ impl Tool for WindowOpenTool {
                 "query":query,
                 "matched_query":matched_query,
                 "query_aliases":aliases,
-                "already_visible_before_launch":before_hit.is_some(),
+                "already_visible_before_launch":true,
+                "already_frontmost":already_frontmost,
+                "activated_existing":activated,
                 "visible_before":before.len(),
-                "visible_after":after.len(),
-                "launch_commands":commands,
+                "launch_commands":[],
                 "wait_ms":started.elapsed().as_millis() as u64,
                 "driver":driver.platform_name(),
                 "inspect_ready":permission_hint.is_none(),
                 "permission_hint":permission_hint,
                 "next_action":next_action,
             });
-            Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
-        })
-        .await
-    }
+            return Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()));
+        }
+
+        let commands =
+            launch_desktop_app(&app_name, bundle_id.as_deref())
+                .map_err(|e| tool_err(MCP_WINDOW_USE_TOOL_NAME, e))?;
+
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+        let mut after = before.clone();
+        let mut matched = before_hit.clone();
+        while matched.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            after = driver.list_windows(None)?;
+            matched = find_window_by_aliases(&after, &aliases);
+        }
+
+        let Some((matched_query, info)) = matched else {
+            let titles: Vec<String> = after
+                .iter()
+                .take(10)
+                .map(|w| format!("{} ({})", w.title, w.process_name))
+                .collect();
+            return Err(tool_err(
+                MCP_WINDOW_USE_TOOL_NAME,
+                format!(
+                    "启动命令已执行({commands:?},耗时 {:.1}s),但 {wait_secs}s 内未匹配到窗口。尝试别名:{aliases:?};当前可见前 10 个:{titles:?}。\
+                     提示:应用可能弹出了登录窗(标题不同)或启动较慢;可用 action=list(filter=相关词)确认,或加大 wait_seconds 重试。",
+                    started.elapsed().as_secs_f32()
+                ),
+            ));
+        };
+        let permission_hint = driver.permission_hint();
+        // next_action 按屏幕录制权限分派(避免把 LLM 推向不可用的 OCR 路线)
+        let perm = crate::agent::window::check_platform_permissions();
+        let next_action = if perm.screen_recording {
+            "inspect_ready=true 时用 window_id 调 action=inspect;控件树为空(自绘 UI)时改用 action=ocr。"
+        } else if perm.accessibility {
+            "inspect_ready=true 时用 window_id 调 action=inspect(AX 主路线);屏幕录制未授权,ocr/screenshot/screencapture 均不可用,坐标用窗口 bounds 比例估算。"
+        } else {
+            "辅助功能未授权:仅可 action=list/action=find 定位窗口;读取/操作 UI 需用户先授权。"
+        };
+        let body = json!({
+            "ok":true,
+            "window_id":info.id,
+            "title":info.title,
+            "process_name":info.process_name,
+            "pid":info.pid,
+            "bounds":info.bounds,
+            "query":query,
+            "matched_query":matched_query,
+            "query_aliases":aliases,
+            "already_visible_before_launch":before_hit.is_some(),
+            "visible_before":before.len(),
+            "visible_after":after.len(),
+            "launch_commands":commands,
+            "wait_ms":started.elapsed().as_millis() as u64,
+            "driver":driver.platform_name(),
+            "inspect_ready":permission_hint.is_none(),
+            "permission_hint":permission_hint,
+            "next_action":next_action,
+        });
+        Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()))
+    })
+    .await
 }

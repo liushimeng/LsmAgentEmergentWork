@@ -37,7 +37,7 @@ pub use spec::{BranchSpec, LoopSpec, WorkFlowPlan, WorkFlowSpec};
 pub use topo::{dedup_workflow_ids, sanitize_depends_on, topo_layers, topo_sort};
 // 原私有项:供本模块 impl 与测试经 `use super::*` 取用(可见域与拆分前等价)
 use delegate::{
-    gather_spec_text, text_contains_any_ci, SUBAGENT_KEYWORDS, WEB_USE_KEYWORDS, WINDOW_USE_KEYWORDS,
+    gather_spec_text, text_contains_any_ci, DESKTOP_GUI_STRICT_KEYWORDS, WEB_USE_KEYWORDS,
 };
 use spec::split_condition_then;
 use topo::normalize_dep_id;
@@ -128,9 +128,6 @@ impl MainWorkRunner {
         // 2026-09-16 第 59 轮:透传 Yolo 推断的 suggested_delegate,引导 Main-Work 正确委派
         if let Some(d) = suggested_delegate {
             let hint = match d {
-                "windowuse" => {
-                    "编排时所有涉及桌面软件窗口操作的流程,请将 delegate_to 设为 \"windowuse\"。"
-                }
                 "webuse" => {
                     "编排时所有涉及网页/浏览器操作的流程,请将 delegate_to 设为 \"webuse\"。"
                 }
@@ -156,25 +153,25 @@ impl MainWorkRunner {
              约束:\n\
              - id/name/steps/acceptance/delegate_to 必填;branches/loops/depends_on/summary 可省略。\n\
              - branches/loops 元素是字符串(形如 \"条件: 动作\")或对象({\"condition\":…,\"then\":…} / {\"condition\":…,\"over\":…})均可。\n\
-             - delegate_to 三选一:默认填 \"subagent\"(通用执行);若该流程是「读取/操作桌面软件窗口\n\
-               (枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本)」类任务,必须填 \"windowuse\",\n\
-               由 WindowUse Agent(LsmAgentEmergentWork-WindowUse)执行;\n\
+             - delegate_to 二选一:默认填 \"subagent\"(通用执行,含「读取/操作桌面软件窗口:\n\
+               枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本」类任务 —— 执行层 SubAgent-Work\n\
+               在 macOS / Windows 上持有 MCP_Window_Use 工具,可完成桌面窗口操控);\n\
                若该流程是「网页/浏览器操作(打开网址、浏览网页、网页登录、点击/输入/滚动页面、\n\
                网页截图、抓取页面信息、爬虫采集、查看 Console/Network/DOM)」类任务,必须填 \"webuse\",\n\
                由 Chromium-WebUse Agent(LsmAgentEmergentWork-Chromium-WebUse)执行。\n\
              - 同一桌面应用的连续 UI 操作链(打开/激活 → 等待窗口 → 搜索 → 选择会话 → 输入 → 校验 →\n\
-               发送/提交)必须合并为一个 windowuse WorkFlow,不要按每个按钮拆成多个串行单元;\n\
+               发送/提交)必须合并为一个 subagent WorkFlow,不要按每个按钮拆成多个串行单元;\n\
                跨单元会丢失真实焦点与控件状态。只有不同应用或互不依赖的窗口操作才允许拆分。\n\
              - acceptance 必须是可执行验证的验收标准(命令 / 可比对的预期输出),不要写「完成目标」这类空话。\n\
              - acceptance 中涉及文本长度验证时,使用字符计数(wc -m / ${#var})而非字节计数(length($0) / wc -c),\n\
                避免中文 UTF-8(每字 3 字节)导致计数偏差。\n\
-             - delegate_to=windowuse 的流程,acceptance 用 **UI 结果验证**(窗口内出现的目标文本/\n\
+             - 桌面窗口操控类流程,acceptance 用 **UI 结果验证**(窗口内出现的目标文本/\n\
                控件状态/OCR 可见性),不要写「进程存在/窗口标题/bash 检查」类验收 ——\n\
                桌面应用的进程名常与产品名不一致(如微信 4.x 是 Weixin.exe 而非 WeChat.exe),\n\
                bash 进程检查极易误判「应用未安装」。\n\
              - 同一应用的连续 UI 操作链(打开/激活 → 检视/OCR → 点击 → 输入 → 发送 → 复查)必须\n\
-               合并为一个 windowuse WorkFlow;微信 4.x 等自绘 UI 的控件树为空,WindowUse 会自动\n\
-               走 WindowOCR + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。",
+               合并为一个 subagent WorkFlow;微信 4.x 等自绘 UI 的控件树为空,MCP_Window_Use\n\
+               支持 action=ocr + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。",
         );
 
         let mut sub_session = crate::session::Session::new();
@@ -193,7 +190,6 @@ impl MainWorkRunner {
             };
             // 2026-09-16 第 59 轮:兜底 WorkFlow 也继承 suggested_delegate
             let fallback_delegate = match suggested_delegate {
-                Some("windowuse") => AgentRole::WindowUse,
                 Some("webuse") => AgentRole::WebUse,
                 _ => AgentRole::SubAgent,
             };
@@ -207,8 +203,6 @@ impl MainWorkRunner {
                     depends_on: vec![],
                     acceptance: inherited,
                     delegate_to: fallback_delegate,
-                    // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
-                    target_app: None,
                 }],
                 summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
                 degraded: true,
@@ -227,27 +221,7 @@ impl MainWorkRunner {
                 }
             }
         }
-        // 2026-09-16 第 59 轮:如果 Yolo 明确建议 windowuse 且 plan 未指定,强制覆盖
-        if let Some("windowuse") = suggested_delegate {
-            for wf in plan.workflows.iter_mut() {
-                if wf.delegate_to == AgentRole::SubAgent {
-                    // 仅当 WorkFlow 含窗口操作类步骤时才覆盖(避免误伤纯代码流程)
-                    let text = gather_spec_text(wf);
-                    let has_window_ops = text_contains_any_ci(
-                        &text,
-                        &[
-                            "微信", "wechat", "qq", "窗口", "window", "点击", "click", "打开",
-                            "open", "发送", "send", "应用", "app", "软件",
-                        ],
-                    );
-                    if has_window_ops {
-                        wf.delegate_to = AgentRole::WindowUse;
-                        tracing::info!(wf_id = %wf.id, "suggested_delegate=windowuse,已覆盖 WorkFlow delegate_to");
-                    }
-                }
-            }
-        }
-        // 2026-09-16 第 67 轮:同应用 WindowUse 链合并不再要求 suggested_delegate=windowuse
+        // 2026-09-16 第 67 轮:同应用桌面窗口操控链自动合并(保留真实窗口焦点连续性)
         coalesce_same_app_window_workflows(&mut plan);
         // 2026-09-17 第 75 轮:兜底 plan 也跑一次关键词推断。
         // Main-Work JSON 解析失败时构造的单 WorkFlow 兜底不会经过
@@ -316,10 +290,11 @@ impl MainWorkRunner {
     }
 }
 
-/// 2026-09-16 第 61 轮:把同一微信 UI 链的多个 WindowUse 单元自动合并。
+/// 2026-09-16 第 61 轮:把同一微信 UI 链的多个桌面窗口操控单元自动合并。
 /// 2026-09-16 第 67 轮:泛化为 `coalesce_same_app_window_workflows` —— 按 app 家族
-/// (微信/QQ/钉钉/飞书/Telegram)分组,同族 ≥2 个 WindowUse 单元自动合并,
-/// 且不再要求 suggested_delegate=windowuse 才触发(所有 WindowUse 链都受益)。
+/// (微信/QQ/钉钉/飞书/Telegram)分组,同族 ≥2 个窗口操控单元自动合并。
+/// 2026-09-18 第 84 轮:WindowUse Agent 删除,判定条件改为
+/// `delegate_to == SubAgent` + 桌面 GUI 强信号(MCP_Window_Use 承担窗口操控)。
 ///
 /// 实测 Main-Work 常把「打开微信 → 搜索联系人 → 打开会话 → 输入 → 发送」拆成
 /// 5 个串行单元。每个单元都有独立 Agent 上下文,真实焦点 / 搜索框状态无法传递。
@@ -334,10 +309,14 @@ fn coalesce_same_app_window_workflows(plan: &mut WorkFlowPlan) {
         ("Telegram", &["telegram", "tg"]),
     ];
     let family_of = |w: &WorkFlowSpec| -> Option<&'static str> {
-        if w.delegate_to != AgentRole::WindowUse {
+        if w.delegate_to != AgentRole::SubAgent {
             return None;
         }
         let text = gather_spec_text(w).to_lowercase();
+        // 2026-09-18 第 84 轮:必须同时含桌面 GUI 强信号,避免误并普通 SubAgent 流程
+        if !text_contains_any_ci(&text, DESKTOP_GUI_STRICT_KEYWORDS) {
+            return None;
+        }
         APP_FAMILIES
             .iter()
             .find(|(_, kws)| kws.iter().any(|k| text.contains(k)))
@@ -393,7 +372,7 @@ fn coalesce_same_app_window_workflows(plan: &mut WorkFlowPlan) {
         tracing::info!(
             target = %target_id,
             merged = group_ids.len(),
-            "同一 {} 应用 WindowUse 链已自动合并,保留真实窗口焦点连续性", family_name
+            "同一 {} 应用桌面窗口操控链已自动合并,保留真实窗口焦点连续性", family_name
         );
     }
 }

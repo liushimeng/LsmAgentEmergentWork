@@ -13,7 +13,6 @@
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
             // 2026-09-17 第 82+ 轮 P0-1:测试 fixture 默认无目标应用。
-            target_app: None,
         }
     }
 
@@ -227,7 +226,7 @@
       "name": "微信自动化",
       "steps": ["查找名为「赵玲玲{weird}」的用户"],
       "acceptance": ["已发送消息"],
-      "delegate_to": "windowuse",
+      "delegate_to": "subagent",
       "depends_on": []
     }}
   ],
@@ -238,7 +237,7 @@
         let plan = parse_workflow_plan(&json).expect("sanitize 后应能解析");
         assert_eq!(plan.workflows.len(), 1);
         assert_eq!(plan.workflows[0].id, "wf-1");
-        assert_eq!(plan.workflows[0].delegate_to, AgentRole::WindowUse);
+        assert_eq!(plan.workflows[0].delegate_to, AgentRole::SubAgent);
         // Modifier Letter 已归一化为 Latin 等价字符:ᴬᴬᴵᴬ → AAIA
         let first_step = &plan.workflows[0].steps[0];
         assert!(first_step.contains("AAIA"), "ᴬᴬᴵᴬ 应归一为 AAIA: {first_step}");
@@ -487,7 +486,8 @@
         assert_eq!(plan.workflows[0].delegate_to, AgentRole::SubAgent);
     }
 
-    /// WindowUse 委派(第 9 角色):windowuse 各别名归一到 AgentRole::WindowUse。
+    /// 2026-09-18 第 84 轮:windowuse 旧别名兼容归一到 AgentRole::SubAgent
+    /// (WindowUse Agent 已删除,窗口操控由 SubAgent-Work 的 MCP_Window_Use 工具承担)。
     #[test]
     fn parse_delegate_to_window_use_aliases() {
         let mk = |v: &str| {
@@ -504,7 +504,7 @@
             let plan: WorkFlowPlan = serde_json::from_str(&mk(alias)).unwrap();
             assert_eq!(
                 plan.workflows[0].delegate_to,
-                AgentRole::WindowUse,
+                AgentRole::SubAgent,
                 "alias={alias}"
             );
         }

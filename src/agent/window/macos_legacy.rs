@@ -12,7 +12,7 @@
 //!   (`LAEW_AX_PROMPT=1` 时才带 `kAXTrustedCheckOptionPrompt=true`),
 //!   未授权返回可读引导文案(fail-closed)。
 //!
-//! 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` §2.3 macOS 后端。
+//! 设计见 `docs/MCP_Window_Use/01-设计与解决方案.md` §2.3 macOS 后端。
 
 #![allow(non_snake_case)]
 
@@ -143,8 +143,8 @@ const K_CG_MOUSE_BUTTON_RIGHT: u32 = 1;
 // 2026-09-16 第 55 轮修正 —— 推翻此前「macOS 26 移除了 AX C API」的错误结论。
 // 旧实现用 `dlsym("kAXChildrenAttribute")` 运行时取常量,实测在 macOS 26.5 返回 NULL,
 // 于是 `ax_strings_loaded()` 恒为 false → `require_trusted()` 无条件 fail-closed,
-// WindowInspect / WindowAction 在 macOS 上**整体不可用**(只有走 CoreGraphics 的
-// WindowList 幸免);该错误结论还被写进系统提示词与 orchestrator 的 fallback 提示,
+// MCP_Window_Use(action=inspect) / MCP_Window_Use(action=control) 在 macOS 上**整体不可用**(只有走 CoreGraphics 的
+// MCP_Window_Use(action=list) 幸免);该错误结论还被写进系统提示词与 orchestrator 的 fallback 提示,
 // 反过来把 LLM 主动引离本来可用的工具。
 //
 // 探针实测(C 程序 clang 链接 ApplicationServices;对照 CommandLineTools SDK 头文件
@@ -316,14 +316,14 @@ fn kAXEnhancedUserInterfaceAttribute() -> CFStringRef {
 /// osascript/cliclick 模板仅作为用户不便授权时的降级路径。
 /// 文案会作为 tool_result 回填给 LLM,故控制在 ~500 字符内避免重复调用撑爆上下文。
 const MACOS_AX_UNAVAILABLE_HINT: &str =
-    "辅助功能未授权,WindowInspect/WindowAction 此时不可用(AX 返回 -25211 \
+    "辅助功能未授权,MCP_Window_Use(action=inspect)/MCP_Window_Use(action=control) 此时不可用(AX 返回 -25211 \
      kAXErrorAPIDisabled)。AX C API 本身在 macOS 13~26 全版本可用,只差授权:\
      系统设置 → 隐私与安全性 → 辅助功能 → 勾选运行 laew 的宿主终端(Terminal/iTerm/VS Code),\
      然后完全退出并重开该终端(TCC 按进程启动时快照生效);设 LAEW_AX_PROMPT=1 可主动弹授权框。\
-     授权前可降级走 Bash + osascript(WindowUse 已扩白名单):\
+     授权前可降级走 Bash + osascript(SubAgent Bash 全量可用):\
      activate 应用 / System Events keystroke 输入 / pbcopy·pbpaste 剪贴板 / \
      cliclick c:x,y 坐标点击 / screencapture -x 截图。\
-     WindowList 走 CoreGraphics 不需授权,任何情况下都能枚举窗口标题·PID·位置。";
+     MCP_Window_Use(action=list) 走 CoreGraphics 不需授权,任何情况下都能枚举窗口标题·PID·位置。";
 
 /// CFStringRef → String(UTF-8;先走快路径指针,失败回退拷贝缓冲区)。
 unsafe fn cfstr(s: CFStringRef) -> String {
@@ -559,7 +559,7 @@ fn ax_error_text(code: AXError) -> String {
                 .to_string()
         }
         K_AX_ERROR_INVALID_UI_ELEMENT => {
-            "控件已失效(窗口可能已关闭或 UI 已刷新),请重新 WindowInspect".into()
+            "控件已失效(窗口可能已关闭或 UI 已刷新),请重新 MCP_Window_Use(action=inspect)".into()
         }
         K_AX_ERROR_ATTRIBUTE_UNSUPPORTED => "该控件不支持此属性(应用未实现对应无障碍属性)".into(),
         K_AX_ERROR_ACTION_UNSUPPORTED => "该控件不支持此动作(应用未实现对应无障碍动作)".into(),
@@ -634,7 +634,7 @@ impl MacOsDriver {
     /// 公开接口:主动请求辅助功能授权(触发系统弹窗)。
     ///
     /// 2026-09-16 第 60 轮:供 `driver_preflight` 在检测到未授权时调用,
-    /// 让 LLM 在首次使用 WindowInspect/WindowAction 时自动触发授权流程。
+    /// 让 LLM 在首次使用 MCP_Window_Use(action=inspect)/MCP_Window_Use(action=control) 时自动触发授权流程。
     pub fn request_permission() -> bool {
         unsafe { Self::request_permission_internal() }
     }
@@ -744,7 +744,7 @@ impl MacOsDriver {
         let (pid_s, idx_s) = window_id.split_once(':').ok_or_else(|| {
             platform_err(
                 "macos",
-                format!("window_id 格式应为 \"{{pid}}:{{index}}\"(由 WindowList 返回),实际: {window_id}"),
+                format!("window_id 格式应为 \"{{pid}}:{{index}}\"(由 MCP_Window_Use(action=list) 返回),实际: {window_id}"),
             )
         })?;
         let pid: i32 = pid_s
@@ -795,7 +795,7 @@ impl MacOsDriver {
         if el.is_null() {
             return Err(platform_err(
                 "macos",
-                format!("pid={pid} 第 {index} 个窗口不存在(窗口可能已关闭),请重新 WindowList"),
+                format!("pid={pid} 第 {index} 个窗口不存在(窗口可能已关闭),请重新 MCP_Window_Use(action=list)"),
             ));
         }
         Ok(el)
@@ -855,7 +855,7 @@ impl MacOsDriver {
         out
     }
 
-    /// 把真实 AX action 名称映射成 WindowAction 工具动作名,并与 role 推断合并。
+    /// 把真实 AX action 名称映射成 MCP_Window_Use(action=control) 工具动作名,并与 role 推断合并。
     fn merge_ax_actions(role_actions: Vec<String>, ax_actions: &[String]) -> Vec<String> {
         let mut out = role_actions;
         let has = |v: &Vec<String>, key: &str| v.iter().any(|s| s == key);
@@ -1069,7 +1069,7 @@ impl MacOsDriver {
             if children.is_null() {
                 return Err(platform_err(
                     "macos",
-                    format!("路径 {path} 在段 {seg} 处中断:父控件无子节点,请重新 WindowInspect 获取最新路径"),
+                    format!("路径 {path} 在段 {seg} 处中断:父控件无子节点,请重新 MCP_Window_Use(action=inspect) 获取最新路径"),
                 ));
             }
             let count = CFArrayGetCount(children as CFArrayRef);
@@ -1087,7 +1087,7 @@ impl MacOsDriver {
             if next.is_null() {
                 return Err(platform_err(
                     "macos",
-                    format!("路径 {path} 下标 {idx} 越界(UI 可能已变化),请重新 WindowInspect"),
+                    format!("路径 {path} 下标 {idx} 越界(UI 可能已变化),请重新 MCP_Window_Use(action=inspect)"),
                 ));
             }
             cur = next;
@@ -1140,7 +1140,7 @@ pub fn list_windows_cg(filter: Option<&str>) -> Result<Vec<WindowInfo>> {
                 };
             }
             // 2026-09-17 第 76 轮 P0-1:记录 CGWindowID(kCGWindowNumber),
-            // 用于 WindowOCR / WindowScreenshot 直接命中目标窗口(避免多窗口
+            // 用于 MCP_Window_Use(action=ocr) / MCP_Window_Use(action=screenshot) 直接命中目标窗口(避免多窗口
             // 进程按 PID 匹配拿错窗口)。对 LLM 暴露的稳定 token 仍是 {pid}:{idx}。
             let cg_window_id = cfnum_i64(dict_get(dict, "kCGWindowNumber")).max(0) as u32;
             let idx = seen.entry(pid).or_insert(0);
@@ -1186,7 +1186,7 @@ impl WindowDriver for MacOsDriver {
             tracing::debug!(
                 elapsed_secs = elapsed,
                 granted = granted,
-                "WindowInspect 等待 macOS 辅助功能授权"
+                "MCP_Window_Use(action=inspect) 等待 macOS 辅助功能授权"
             );
         });
         if !granted {
@@ -1220,7 +1220,7 @@ impl WindowDriver for MacOsDriver {
                              【同义词建议】中文 UI 名称常见笔误:通讯录 ↔ 通信录 ↔ 联系人 ↔ Contacts;\
                              消息 ↔ 发送 ↔ Send;输入框 ↔ 搜索 ↔ Search;按钮 ↔ Button;关闭 ↔ X ↔ close。\
                              建议:1) 改用上表同义词重试;2) filter 留空 + max_depth=4-5 看完整树;\
-                             3) 用 WindowScreenshot + 视觉识别(若应用无障碍支持极差)"
+                             3) 用 MCP_Window_Use(action=screenshot) + 视觉识别(若应用无障碍支持极差)"
                         ),
                     )
                 })?;
@@ -1250,7 +1250,7 @@ impl WindowDriver for MacOsDriver {
             tracing::debug!(
                 elapsed_secs = elapsed,
                 granted = granted,
-                "WindowAction 等待 macOS 辅助功能授权"
+                "MCP_Window_Use(action=control) 等待 macOS 辅助功能授权"
             );
         });
         if !granted {
@@ -1300,7 +1300,7 @@ impl WindowDriver for MacOsDriver {
                         )),
                         None => Err(platform_err(
                             "macos",
-                            "控件未暴露任何可点击 AX action;请重新 WindowInspect 确认 path",
+                            "控件未暴露任何可点击 AX action;请重新 MCP_Window_Use(action=inspect) 确认 path",
                         )),
                     }
                 }
@@ -1445,7 +1445,7 @@ impl WindowDriver for MacOsDriver {
 
     fn bring_to_front(&self, window_id: &str) -> Result<()> {
         // 第 81 轮:已前台 → 直接返回(跳过 AXRaise + osascript frontmost),
-        // 消除 WindowOpen 在多单元/重试链路中把窗口反复前置导致的闪烁与焦点断续。
+        // 消除 MCP_Window_Use(action=open) 在多单元/重试链路中把窗口反复前置导致的闪烁与焦点断续。
         if self.is_frontmost(window_id) {
             tracing::debug!(window_id = %window_id, "窗口已在前台,跳过激活(幂等前置)");
             return Ok(());
@@ -1484,7 +1484,7 @@ impl WindowDriver for MacOsDriver {
     }
 
     // 第 81 轮:窗口所属应用是否已处于前台(AXFrontmost)。
-    // WindowOpen 对已存在窗口先查本方法,已前台则跳过激活(窗口不再反复闪烁)。
+    // MCP_Window_Use(action=open) 对已存在窗口先查本方法,已前台则跳过激活(窗口不再反复闪烁)。
     fn is_frontmost(&self, window_id: &str) -> bool {
         match Self::parse_window_id(window_id) {
             Ok((pid, _)) => Self::is_frontmost_pid(pid),

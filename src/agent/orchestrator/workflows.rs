@@ -1,7 +1,7 @@
 //! WorkFlow 执行单元(2026-09-17 自 orchestrator.rs 拆分)。
 //!
 //! `execute_workflows` 按 `depends_on` Kahn 分层、同层 SubAgent 并行;
-//! `run_wf_unit` 是单个执行单元(SubAgent / WindowUse / WebUse 委派路由 + QC +
+//! `run_wf_unit` 是单个执行单元(SubAgent / WebUse 委派路由 + QC +
 //! Debug 采集),串行直通与 tokio::spawn 并行两种调用路径共用。
 
 use super::*;
@@ -94,7 +94,6 @@ impl MultiAgentOrchestrator {
                 let (wf, input) = units.into_iter().next().expect("len==1");
                 let outcome = run_wf_unit(
                     self.sub_agent.clone(),
-                    self.window_use.clone(),
                     self.web_use.clone(),
                     self.quality.clone(),
                     self.cfg.debug.clone(),
@@ -114,7 +113,6 @@ impl MultiAgentOrchestrator {
                 let mut handles = Vec::with_capacity(units.len());
                 for (wf, input) in units {
                     let sub_agent = self.sub_agent.clone();
-                    let window_use = self.window_use.clone();
                     let web_use = self.web_use.clone();
                     let quality = self.quality.clone();
                     let debug = self.cfg.debug.clone();
@@ -129,7 +127,6 @@ impl MultiAgentOrchestrator {
                     handles.push(tokio::spawn(async move {
                         let outcome = run_wf_unit(
                             sub_agent,
-                            window_use,
                             web_use,
                             quality,
                             debug,
@@ -162,8 +159,6 @@ impl MultiAgentOrchestrator {
                                     depends_on: vec![],
                                     acceptance: vec![],
                                     delegate_to: AgentRole::SubAgent,
-                                    // 2026-09-17 第 82+ 轮 P0-1:并行任务无目标应用自动启动。
-                                    target_app: None,
                                 },
                                 Err(QualityFailure {
                                     source: AgentRole::SubAgent,
@@ -280,9 +275,9 @@ struct WfUnitOk {
     qc_usage: Usage,
     /// SubAgent 执行轨迹(2026-09-09 第 05 轮)。
     trace: ExecutionTrace,
-    /// 2026-09-16 第 57 轮:执行器角色(SubAgent / WindowUse)
+    /// 2026-09-16 第 57 轮:执行器角色(SubAgent / WebUse)
     exec_role: AgentRole,
-    /// 2026-09-16 第 57 轮:SubAgent/WindowUse 墙钟耗时(毫秒)
+    /// 2026-09-16 第 57 轮:执行器墙钟耗时(毫秒)
     wallclock_ms: u64,
     /// 2026-09-16 第 57 轮:QC LLM 调用单独耗时(毫秒)
     qc_wallclock_ms: u64,
@@ -290,9 +285,9 @@ struct WfUnitOk {
 
 /// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
 ///
-/// 按 `delegate_to` 路由执行 Runner(2026-09-14 第 9 角色 WindowUse):
-/// `SubAgent` → SubAgent-Work;`WindowUse` → WindowUse(桌面窗口操控专项);
-/// QC / Debug / 取消 / 进度通道两种委派完全复用。
+/// 按 `delegate_to` 路由执行 Runner:`WebUse` → WebUseRunner(浏览器网页操控专项);
+/// 其余(含桌面窗口操控,SubAgent-Work 在 macOS / Windows 持 MCP_Window_Use 工具)
+/// → SubAgentRunner;QC / Debug / 取消 / 进度通道两种委派完全复用。
 ///
 /// 自由函数 + Arc 参数化,串行直通与 tokio::spawn 并行两种调用路径共用同一份逻辑;
 /// `semaphore` 为并行路径的有界并发许可(串行路径传 None);
@@ -301,7 +296,6 @@ struct WfUnitOk {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_wf_unit(
     sub_agent: Arc<SubAgentRunner>,
-    window_use: Arc<WindowUseRunner>,
     web_use: Arc<WebUseRunner>,
     quality: Arc<QualityRunner>,
     debug: Option<Arc<DebugCollector>>,
@@ -329,12 +323,10 @@ pub(super) async fn run_wf_unit(
 
     let wf_id = input.id.clone();
     let exec_role = match delegate_to {
-        AgentRole::WindowUse => AgentRole::WindowUse,
         AgentRole::WebUse => AgentRole::WebUse,
         _ => AgentRole::SubAgent,
     };
     let exec_label = match exec_role {
-        AgentRole::WindowUse => "WindowUse",
         AgentRole::WebUse => "WebUse",
         _ => "SubAgent",
     };
@@ -363,15 +355,10 @@ pub(super) async fn run_wf_unit(
             truncate_progress_text(&input.expected_output, 80)
         ),
     );
-    // 2026-09-16 第 57 轮:SubAgent/WindowUse 墙钟计时 ——
+    // 2026-09-16 第 57 轮:执行器墙钟计时 ——
     // 用于 TaskResult.wallclock_ms / TUI 时间线展示。
     let sub_started = std::time::Instant::now();
     let outcome = match exec_role {
-        AgentRole::WindowUse => {
-            window_use
-                .run_unit_with_cancel(&input, &session_id, &cancel)
-                .await
-        }
         AgentRole::WebUse => {
             web_use
                 .run_unit_with_cancel(&input, &session_id, &cancel)
@@ -429,7 +416,7 @@ pub(super) async fn run_wf_unit(
     );
     emit_progress(&progress, detail_summary);
     // 2026-09-16 第 62 轮:工具调用明细走 [laew] 详情面板,让 TUI 用户一眼看到
-    // 「窗口操控到底调了哪些工具、参数是什么、为什么失败」。
+    // 「到底调了哪些工具、参数是什么、为什么失败」。
     // 2026-09-16 第 67 轮:明细 5 → 8 条,且追加**参数摘要**(query/window_id/path/
     // action/text/x/y/command 等关键字段,截 60 字符)—— 微信任务复盘时
     // 「到底让它点了哪个坐标」此前无从排查。
@@ -599,15 +586,10 @@ pub(super) fn build_subflow_input(
         original_prompt: Some(wf.name.clone()),
         depends_on_outputs: deps,
         sibling_outputs: vec![],
-        window_context: None,
         pending_agent_messages: vec![],
         // 2026-09-17 第 75 轮:把 WorkFlow 期望的角色写入 SubFlowInput,
         // Runner 在 trace.intended_role 落地,供 collect_failure_signals 计算
         // delegate_mismatch 弱信号。
         intended_role: Some(wf.delegate_to),
-        // 2026-09-17 第 82+ 轮 P0-1:把 WorkFlow 的 target_app 透传给 SubFlowInput,
-        // WindowUse Runner 据此在 sub_session 创建前自动启动目标应用(LLM
-        // 不自觉调 WindowOpen 也能拿到 ready window_id)。
-        expected_target_app: wf.target_app.clone(),
     }
 }

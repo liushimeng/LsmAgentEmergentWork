@@ -169,7 +169,9 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMemoryRow> 
         "session" => AgentRole::SessionContext,
         "user" => AgentRole::SessionContext, // user 消息也归到 session
         "compact" => AgentRole::Compact,
-        "windowuse" => AgentRole::WindowUse,
+        // 2026-09-18 第 84 轮:WindowUse Agent 已删除(能力降级为
+        // MCP_Window_Use 工具);存量库 role='windowuse' 历史行归并到 SubAgent。
+        "windowuse" => AgentRole::SubAgent,
         "webuse" => AgentRole::WebUse,
         other => {
             return Err(rusqlite::Error::InvalidColumnType(

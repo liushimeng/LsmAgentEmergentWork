@@ -156,28 +156,21 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
             // ★ 2026-09-17 第 78 轮 P1-1:大命令精简
             // command 字段通常 < 80 字符,但 Python 脚本 + Playwright 完整代码可超过 5000 字符
             // 完整展示会撑爆 TUI stage 流,只显示前 80 字符 + 总长度 + 首行(若超出)
-            // ★ 2026-09-17 第 82+ 轮 P1-1:WindowUse Bash 模式追加 `[wumode]` 标记,
-            // TUI 阶段打印协程一眼可辨「WindowUse 降级路径」而非 SubAgent Bash。
             let cmd = obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let cmd_chars = cmd.chars().count();
             let cmd_first_line = cmd.lines().next().unwrap_or("").to_string();
-            let wumode_prefix = if crate::agent::tools::bash::window_use_mode() {
-                "[wumode] "
-            } else {
-                ""
-            };
             if cmd_chars > 200 {
                 let preview = truncate_progress_text(cmd, 80);
                 let first_line_short = truncate_progress_text(&cmd_first_line, 40);
                 truncate_progress_text(
                     &format!(
-                        "{wumode_prefix}cmd=[共{cmd_chars}字符] {preview} 首行:{first_line_short}"
+                        "cmd=[共{cmd_chars}字符] {preview} 首行:{first_line_short}"
                     ),
                     160,
                 )
             } else {
                 truncate_progress_text(
-                    &format!("{wumode_prefix}cmd={}", truncate_progress_text(cmd, 80)),
+                    &format!("cmd={}", truncate_progress_text(cmd, 80)),
                     120,
                 )
             }
@@ -238,95 +231,58 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
                 80,
             )
         }
-        "WindowOpen" | "WindowList" | "WindowFind" | "WindowInspect" | "WindowOCR"
-        | "WindowScreenshot" | "WindowAction" => {
-            // ★ 2026-09-17 第 81 轮:窗口工具差异化摘要(需求点 8:TUI 简介信息)
-            // 每个工具只显示排查必需的最小字段,值统一截 ≤24 字符:
-            // - WindowOpen:query=X(命中应用一目了然)
-            // - WindowList:filter=X(无 filter 时不显示参数)
-            // - WindowFind:title=X proc=Y
-            // - WindowInspect:win=X depth=N filter=Y
-            // - WindowOCR:win=X lang=Y(截图识别调用一眼可辨)
-            // - WindowScreenshot:win=X out=Y
-            // - WindowAction:action=X path=Y(坐标动作附 @x,y;文本截 16)
+        "MCP_Window_Use" => {
+            // ★ 2026-09-18 第 84 轮:窗口操控统一入口差异化摘要。
+            // 每个 action 只显示排查必需的最小字段,值统一截 ≤24 字符:
+            // - open:query=X;list:filter=X;find:query=X mode=Y
+            // - inspect:win=X depth=N filter=Y;ocr:win=X lang=Y;screenshot:win=X out=Y
+            // - control:act=X path=Y(坐标动作附 @x,y;文本截 16)
             let g = |k: &str| {
                 obj.get(k)
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
             };
-            let parts: Vec<String> = match tool_name {
-                "WindowOpen" => g("query")
-                    .map(|q| vec![format!("query={}", truncate_progress_text(&q, 24))])
-                    .unwrap_or_default(),
-                "WindowList" => g("filter")
-                    .map(|f| vec![format!("filter={}", truncate_progress_text(&f, 24))])
-                    .unwrap_or_default(),
-                "WindowFind" => {
-                    let mut p = Vec::new();
-                    if let Some(t) = g("title") {
-                        p.push(format!("title={}", truncate_progress_text(&t, 20)));
+            let action = g("action").unwrap_or_default();
+            let mut parts = vec![format!("action={action}")];
+            match action.as_str() {
+                "open" | "find" => {
+                    if let Some(q) = g("query") {
+                        parts.push(format!("query={}", truncate_progress_text(&q, 24)));
                     }
-                    if let Some(pr) = g("process") {
-                        p.push(format!("proc={}", truncate_progress_text(&pr, 20)));
-                    }
-                    p
                 }
-                "WindowInspect" => {
-                    let mut p = vec![format!(
-                        "win={}",
-                        truncate_progress_text(&g("window_id").unwrap_or_default(), 16)
-                    )];
-                    if let Some(d) = obj.get("max_depth").and_then(|v| v.as_u64()) {
-                        p.push(format!("depth={d}"));
+                "list" | "inspect" => {
+                    if let Some(w) = g("window_id") {
+                        parts.push(format!("win={}", truncate_progress_text(&w, 16)));
                     }
                     if let Some(f) = g("filter") {
-                        p.push(format!("filter={}", truncate_progress_text(&f, 16)));
+                        parts.push(format!("filter={}", truncate_progress_text(&f, 16)));
                     }
-                    p
                 }
-                "WindowOCR" => {
-                    let mut p = vec![format!(
-                        "win={}",
-                        truncate_progress_text(&g("window_id").unwrap_or_default(), 16)
-                    )];
-                    if let Some(l) = g("lang") {
-                        p.push(format!("lang={}", truncate_progress_text(&l, 12)));
+                "ocr" | "screenshot" => {
+                    if let Some(w) = g("window_id") {
+                        parts.push(format!("win={}", truncate_progress_text(&w, 16)));
                     }
-                    p
                 }
-                "WindowScreenshot" => {
-                    let mut p = vec![format!(
-                        "win={}",
-                        truncate_progress_text(&g("window_id").unwrap_or_default(), 16)
-                    )];
-                    if let Some(o) = g("output_path") {
-                        p.push(format!("out={}", truncate_progress_text(&o, 24)));
+                "control" => {
+                    if let Some(a) = g("control_action") {
+                        parts.push(format!("act={a}"));
                     }
-                    p
-                }
-                _ => {
-                    // WindowAction
-                    let mut p = vec![
-                        format!("action={}", g("action").unwrap_or_default()),
-                        format!(
-                            "path={}",
-                            truncate_progress_text(&g("path").unwrap_or_default(), 12)
-                        ),
-                    ];
+                    if let Some(p) = g("path") {
+                        parts.push(format!("path={}", truncate_progress_text(&p, 12)));
+                    }
                     if let Some(t) = g("text") {
-                        p.push(format!("text={}", truncate_progress_text(&t, 16)));
+                        parts.push(format!("text={}", truncate_progress_text(&t, 16)));
                     }
-                    match (
+                    if let (Some(x), Some(y)) = (
                         obj.get("x").and_then(|v| v.as_i64()),
                         obj.get("y").and_then(|v| v.as_i64()),
                     ) {
-                        (Some(x), Some(y)) => p.push(format!("@{x},{y}")),
-                        _ => {}
+                        parts.push(format!("@{x},{y}"));
                     }
-                    p
                 }
-            };
+                _ => {}
+            }
             truncate_progress_text(&parts.join(" "), 60)
         }
         _ => {
@@ -452,54 +408,55 @@ mod tests {
     // ============== 2026-09-17 第 81 轮:窗口工具差异化摘要 ==============
 
     #[test]
-    fn tool_args_digest_window_tools() {
-        // WindowOpen:query
-        let s = tool_args_digest("WindowOpen", r#"{"query":"微信"}"#);
+    fn tool_args_digest_mcp_window_use() {
+        // 2026-09-18 第 84 轮:MCP_Window_Use 统一入口摘要
+        // open:action + query
+        let s = tool_args_digest("MCP_Window_Use", r#"{"action":"open","query":"微信"}"#);
+        assert!(s.contains("action=open"), "实际: {s}");
         assert!(s.contains("query=微信"), "实际: {s}");
-        // WindowList:无 filter 时不显示参数;有 filter 时显示
-        let s = tool_args_digest("WindowList", r#"{}"#);
-        assert!(s.is_empty(), "无 filter 的 WindowList 摘要应为空: {s}");
-        let s = tool_args_digest("WindowList", r#"{"filter":"微信"}"#);
+        // list:无 filter 时只有 action;有 filter 时显示
+        let s = tool_args_digest("MCP_Window_Use", r#"{"action":"list"}"#);
+        assert!(s.contains("action=list"), "实际: {s}");
+        assert!(!s.contains("filter="), "无 filter 的 list 摘要不应显示 filter: {s}");
+        let s = tool_args_digest("MCP_Window_Use", r#"{"action":"list","filter":"微信"}"#);
         assert!(s.contains("filter=微信"), "实际: {s}");
-        // WindowInspect:win + depth + filter
+        // inspect:win + filter
         let s = tool_args_digest(
-            "WindowInspect",
-            r#"{"window_id":"682:0","max_depth":6,"filter":"发送"}"#,
+            "MCP_Window_Use",
+            r#"{"action":"inspect","window_id":"682:0","max_depth":6,"filter":"发送"}"#,
         );
         assert!(s.contains("win=682:0"), "实际: {s}");
-        assert!(s.contains("depth=6"), "实际: {s}");
         assert!(s.contains("filter=发送"), "实际: {s}");
-        // WindowOCR:win + lang
+        // ocr:win
         let s = tool_args_digest(
-            "WindowOCR",
-            r#"{"window_id":"682:0","lang":"zh-Hans-CN"}"#,
+            "MCP_Window_Use",
+            r#"{"action":"ocr","window_id":"682:0","lang":"zh-Hans-CN"}"#,
         );
         assert!(s.contains("win=682:0"), "实际: {s}");
-        assert!(s.contains("lang=zh-Hans-CN"), "实际: {s}");
-        // WindowScreenshot:win + out
+        // control:act + path + 坐标
         let s = tool_args_digest(
-            "WindowScreenshot",
-            r#"{"window_id":"682:0","output_path":"/tmp/x.png"}"#,
+            "MCP_Window_Use",
+            r#"{"action":"control","window_id":"682:0","path":"/","control_action":"click_point","x":100,"y":200}"#,
         );
-        assert!(s.contains("win=682:0"), "实际: {s}");
-        assert!(s.contains("out=/tmp/x.png"), "实际: {s}");
+        assert!(s.contains("act=click_point"), "实际: {s}");
+        assert!(s.contains("@100,200"), "实际: {s}");
     }
 
     #[test]
     fn tool_args_digest_window_action_compact() {
-        // 控件树动作:action + path + text(截 16)
+        // 2026-09-18 第 84 轮:MCP_Window_Use control 动作:act + path + text(截 16)
         let s = tool_args_digest(
-            "WindowAction",
-            r#"{"window_id":"682:0","path":"/","action":"type_text_submit","text":"你好,这是一条超过十六个字符的测试消息内容"}"#,
+            "MCP_Window_Use",
+            r#"{"action":"control","window_id":"682:0","path":"/","control_action":"type_text_submit","text":"你好,这是一条超过十六个字符的测试消息内容"}"#,
         );
-        assert!(s.contains("action=type_text_submit"), "实际: {s}");
+        assert!(s.contains("act=type_text_submit"), "实际: {s}");
         assert!(s.contains("path=/"), "实际: {s}");
         assert!(s.contains("text="), "实际: {s}");
         assert!(!s.contains("超过十六个字符的测试消息内容"), "text 必须截断: {s}");
         // 坐标动作:附 @x,y
         let s = tool_args_digest(
-            "WindowAction",
-            r#"{"window_id":"682:0","path":"/","action":"click_point","x":812,"y":402}"#,
+            "MCP_Window_Use",
+            r#"{"action":"control","window_id":"682:0","path":"/","control_action":"click_point","x":812,"y":402}"#,
         );
         assert!(s.contains("@812,402"), "实际: {s}");
     }

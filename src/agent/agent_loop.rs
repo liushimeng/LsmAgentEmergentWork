@@ -139,7 +139,7 @@ impl Agent {
             None
         };
         // 2026-09-16 第 68 轮 P1-C:连续无工具调用计数 —— 连续 N 轮无 tool_use 时
-        // 提前终止,避免 WindowUse/WebUse 等专项 Agent 在 nudge 失效时跑满 max_iterations。
+        // 提前终止,避免 WebUse 等专项 Agent 在 nudge 失效时跑满 max_iterations。
         const NO_TOOL_USE_THRESHOLD: usize = 3;
         let mut consecutive_no_tool_rounds: usize = 0;
 
@@ -276,14 +276,14 @@ impl Agent {
                 }
 
                 // 2026-09-16 第 68 轮 P1-C:连续无工具调用计数 —— 避免专项 Agent
-                // (WindowUse/WebUse)在 forced tool 降级 + nudge 失效时跑满 max_iterations。
+                // (WebUse)在 forced tool 降级 + nudge 失效时跑满 max_iterations。
                 // 阈值 NO_TOOL_USE_THRESHOLD=3:给 LLM 3 次机会(含 nudge 引导),仍无工具
                 // 调用则提前终止,把失败信息返回 Runner/QC 而不是空跑 16 轮。
                 consecutive_no_tool_rounds += 1;
                 if consecutive_no_tool_rounds >= NO_TOOL_USE_THRESHOLD {
                     // 2026-09-17 第 70 轮:已有工具调用产出时降级为「优雅收尾」。
                     // 第 68 轮 P1-C 的 no_tool_use 硬失败针对「全程 0 工具调用的空跑」;
-                    // 但 WebUse/WindowUse 常见合法路径是「先完成工具动作、再输出终答文本」,
+                    // 但 WebUse 常见合法路径是「先完成工具动作、再输出终答文本」,
                     // 配合 nudge(1..=6 轮)会把终答反复顶回,计数到 3 后硬失败 ——
                     // 真实成果被 early_terminate 吞掉(e2e 5e-1 回归:BrowserNew 已执行,
                     // MOCK_FINAL_ANSWER 终答被判 failed)。改为正常 finalize 交 QC 判定,
@@ -339,31 +339,7 @@ impl Agent {
                     continue;
                 }
 
-                // 2026-09-16 第 58 轮 P0-A(原):窗口操控型 Agent nudge 兜底。
-                // 2026-09-16 第 68 轮 P0-B 修复:移除 truncation_resumes==0 约束,
-                // 截断续接后仍应 nudge;扩展触发范围到 iter <= 2(给更多机会)。
-                //
-                // 闸门双锁:
-                // 1) iter <= 2 —— 前 3 轮均可 nudge(0,1,2),覆盖 forced tool 失效场景;
-                // 2) profile.tools 含 "WindowList" —— 强白名单,只对窗口操控类 Agent 触发,
-                //    其它 Agent(Yolo/Main-Work/QC/SubAgent 普通任务)走原路径。
-                //
-                // 后续:P0-B 在 WindowUseRunner 出口兜底,即便 nudge 后 LLM 仍只回文本,
-                // 也会被 Runner 标 failed,不会逃过 QC。
-                if should_nudge_window_ops(&self.profile.tools.names(), iter)
-                    && !completion.text.trim().is_empty()
-                {
-                    info!(
-                        iter = iter,
-                        "WindowUse 无工具调用,注入 nudge 强制 LLM 使用窗口操控工具"
-                    );
-                    session
-                        .context_mut()
-                        .push(ChatMessage::user(WINDOW_OPS_NUDGE_TEXT));
-                    continue;
-                }
-
-                // 2026-09-16 第 61 轮:WebUse 第 1 轮无工具调用同款 nudge(与窗口版同构)。
+                // 2026-09-16 第 61 轮:WebUse 第 1 轮无工具调用 nudge。
                 // 2026-09-16 第 68 轮:移除 truncation_resumes==0 约束。
                 if should_nudge_web_ops(&self.profile.tools.names(), iter)
                     && !completion.text.trim().is_empty()
@@ -690,7 +666,7 @@ impl Agent {
                     }
                 }
                 trace.tool_calls += 1;
-                // 2026-09-16 第 56 轮:工具调用日志(供 WindowUseRunner 恢复窗口状态 +
+                // 2026-09-16 第 56 轮:工具调用日志(供执行器 trace 恢复与
                 // QC 拿到真实调用证据);FIFO 上限 MAX_TOOL_CALL_LOG。
                 // 第 57 轮:补 elapsed_ms(墙钟耗时)与 error_summary(失败原因摘要),
                 // TUI 据此反推「哪个工具哪一步卡死 / 为何失败」。

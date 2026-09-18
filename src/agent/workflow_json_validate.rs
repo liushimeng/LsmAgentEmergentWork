@@ -18,7 +18,7 @@
 //! - validate 失败时返回具体可读问题描述,供 retry_hint 反馈给 LLM;
 //! - 单文件 ~200 行,无外部依赖(纯字符串处理)。
 //!
-//! 设计见 `tmpPlan/2026-09-16_09-WindowUse微信任务根因修复与全链路加固方案.md` §3.1。
+//! 设计见 `tmpPlan/2026-09-16_09-微信任务根因修复与全链路加固方案.md` §3.1。
 
 /// 对 LLM 输出的 WorkFlow JSON 文本做字符级 sanitize,返回新 String。
 ///
@@ -291,7 +291,7 @@ mod tests {
     fn end_to_end_realistic_failure() {
         // 真实失败模式:Main-Work 输出含嵌套「」+ Modifier Letter。
         // 第 65 轮修订:智能引号不再被替换(其作为 JSON 字符串值装饰引号是合法的)。
-        let raw = "{\"workflows\":[{\"id\":\"wf-1\",\"name\":\"微信自动化\",\"steps\":[\"打开微信\",\"查找名为赵玲玲ᴬᴵᴬ的用户\"],\"acceptance\":[\"\u{300C}赵玲玲\u{300C}赵玲玲ᴬᴵᴬ\u{300D}\"],\"delegate_to\":\"windowuse\"}],\"summary\":\"目标\u{300C}赵玲玲\u{300C}赵玲玲ᴬᴵᴬ\u{300D}\"}";
+        let raw = "{\"workflows\":[{\"id\":\"wf-1\",\"name\":\"微信自动化\",\"steps\":[\"打开微信\",\"查找名为赵玲玲ᴬᴵᴬ的用户\"],\"acceptance\":[\"\u{300C}赵玲玲\u{300C}赵玲玲ᴬᴵᴬ\u{300D}\"],\"delegate_to\":\"subagent\"}],\"summary\":\"目标\u{300C}赵玲玲\u{300C}赵玲玲ᴬᴵᴬ\u{300D}\"}";
         let s = sanitize_workflow_text(raw);
         // Modifier Letter ᴬᴵᴬ 应被归一为 AIA
         assert!(s.contains("AIA"), "ᴬᴵᴬ 应归一为 AIA: {s}");

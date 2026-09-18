@@ -430,7 +430,7 @@ impl MultiAgentOrchestrator {
                     // 由 run_medium 内部清空缓存。
                     let is_exec_level_failure = matches!(
                         failure.source,
-                        AgentRole::SubAgent | AgentRole::WindowUse | AgentRole::WebUse
+                        AgentRole::SubAgent | AgentRole::WebUse
                     );
                     if !is_exec_level_failure {
                         medium_plan_cache = None;
@@ -510,14 +510,11 @@ impl MultiAgentOrchestrator {
 
         // ★ 2026-09-17 第 78 轮 P0-1:按 suggested_delegate 路由 Runner。
         // 解决「Yolo 降级 simple + suggested_delegate=webuse」任务被错派 SubAgent
-        // 的根本问题(llaew_20260917_135513.log 复盘:文心一言任务把 AI 回复写到
-        // wenxin_result.txt 但 TUI 不显示真实内容)。之前注释写「simple 档直接 SubAgent
-        // 无需 trace 委派诊断」是错的——WebUseRunner 自带 extract_page_reply_from_session
+        // 的根本问题——WebUseRunner 自带 extract_page_reply_from_session
         // 出口兜底,可以让真实抓取的页面文本直接落到 outcome.text。
         let delegate_to = Self::resolve_simple_delegate(c);
         let exec_label = match delegate_to {
             AgentRole::WebUse => "WebUse",
-            AgentRole::WindowUse => "WindowUse",
             _ => "SubAgent",
         };
         // 运行日志(第 69 轮):simple 档委派决策,记录 Yolo 建议 vs 实际 Runner 路由
@@ -539,12 +536,10 @@ impl MultiAgentOrchestrator {
             original_prompt,
             depends_on_outputs: vec![],
             sibling_outputs: vec![],
-            window_context: None,
-            pending_agent_messages: vec![],
+                pending_agent_messages: vec![],
             // 写入 trace 供 QC + TUI delegate_mismatch 诊断
             intended_role: Some(delegate_to),
             // 2026-09-17 第 82+ 轮 P0-1:simple 档无目标应用自动启动(simple 任务通常无需)。
-            expected_target_app: None,
         };
         emit_progress(progress, format!("wf-1 {exec_label} 执行中…"));
         let sub_started = std::time::Instant::now();
@@ -554,11 +549,6 @@ impl MultiAgentOrchestrator {
                 // 通过 progress 通道给 TUI 用户实时预览
                 self.web_use
                     .run_unit_with_cancel_progress(&input, session.id(), cancel, progress.clone())
-                    .await
-            }
-            AgentRole::WindowUse => {
-                self.window_use
-                    .run_unit_with_cancel(&input, session.id(), cancel)
                     .await
             }
             _ => {
@@ -626,7 +616,7 @@ impl MultiAgentOrchestrator {
                     usage: outcome.usage,
                     subflow_trace: Some(outcome.trace),
                     // ★ 第 78 轮 P0-1:exec_role 同步使用实际执行的 Runner 角色
-                    // (TUI 的 [WebUse]/[WindowUse]/[SubAgent] 标识与 trace 一致)
+                    // (TUI 的 [WebUse]/[SubAgent] 标识与 trace 一致)
                     exec_role: delegate_to,
                     wallclock_ms: sub_elapsed_ms,
                     qc_wallclock_ms: qc_elapsed_ms,
@@ -669,17 +659,11 @@ impl MultiAgentOrchestrator {
     ///
     /// 优先级:
     /// 1. `suggested_delegate=webuse` → WebUseRunner(网页操控专项,带 extract_page_reply_from_session 兜底)
-    /// 2. `suggested_delegate=windowuse` → WindowUseRunner(桌面窗口操控专项)
-    /// 3. 其它(含 `subagent` / `None`) → SubAgentRunner(通用执行)
-    ///
-    /// **关键变化**: 第 75 轮注释认为 simple 档硬编码 SubAgent「无需 trace 委派诊断」
-    /// 是错的;Yolo 降级时 suggested_delegate 仍然能正确推断(浏览器/网页关键词),
-    /// 此时必须路由到对应的专项 Runner,否则文心一言类任务会用 Bash+Write 写脚本,
-    /// 真实抓取的页面文本被 LLM 描述性占位句吞掉,TUI 看不到内容。
+    /// 2. 其它(含 `subagent` / `None`) → SubAgentRunner(通用执行;
+    ///    桌面窗口操控由 SubAgent-Work 的 MCP_Window_Use 工具承担,2026-09-18 第 84 轮)
     pub(super) fn resolve_simple_delegate(c: &TaskClassification) -> AgentRole {
         match c.suggested_delegate.as_deref() {
             Some("webuse") => AgentRole::WebUse,
-            Some("windowuse") => AgentRole::WindowUse,
             Some("subagent") | None => AgentRole::SubAgent,
             _ => AgentRole::SubAgent,
         }

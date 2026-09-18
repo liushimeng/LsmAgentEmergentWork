@@ -44,8 +44,6 @@ pub mod tool_schema_validator;
 pub mod tools;
 pub mod web_use;
 pub mod window;
-pub mod window_state;
-pub mod window_use;
 pub mod workflow;
 pub mod workflow_json_validate;
 pub mod workspace;
@@ -55,10 +53,8 @@ pub mod yolo;
 mod tests;
 
 // 运行时辅助项再导出:保持拆分前 `crate::agent::Xxx` 路径对外完全兼容
-// (window_use.rs 等测试直接引用 `crate::agent::should_nudge_window_ops`)。
 pub(crate) use runtime_hints::{
-    build_runtime_hints, should_nudge_web_ops, should_nudge_window_ops, web_ops_nudge_text,
-    FORCED_TOOL_NUDGE_TEXT, WINDOW_OPS_NUDGE_TEXT,
+    build_runtime_hints, should_nudge_web_ops, web_ops_nudge_text, FORCED_TOOL_NUDGE_TEXT,
 };
 // 原私有辅助:经本模块命名空间供 agent_loop / tests 子模块 `use super::*` 取用
 use runtime_hints::{
@@ -103,7 +99,7 @@ pub struct Agent {
     max_truncation_resume: usize,
     /// 最大上下文溢出恢复次数(排水/折叠重试的全会话预算)。
     max_overflow_recoveries: usize,
-    /// 首迭代强制工具(2026-09-16 第 63 轮):WebUse/WindowUse 等专项 Agent 在第 0 轮
+    /// 首迭代强制工具(2026-09-16 第 63 轮):WebUse 等专项 Agent 在第 0 轮
     /// 强制调用指定工具(如 BrowserNew),后续轮次恢复 auto。None 表示不强制。
     /// 设计见 tmpPlan/2026-09-16_08-WebUse全链路优化与TUI重复输出修复方案.md。
     first_iter_forced_tool: Option<String>,
@@ -127,7 +123,7 @@ impl Agent {
     }
 
     /// 设置首迭代强制工具(2026-09-16 第 63 轮):仅在首次 LLM 调用时强制
-    /// 调用指定工具,后续轮次恢复 auto。用于 WebUse/WindowUse 等专项 Agent
+    /// 调用指定工具,后续轮次恢复 auto。用于 WebUse 等专项 Agent
     /// 确保首步必定执行工具调用,避免"纯文本空转"。
     pub fn with_first_iter_forced_tool(mut self, tool_name: impl Into<String>) -> Self {
         self.first_iter_forced_tool = Some(tool_name.into());

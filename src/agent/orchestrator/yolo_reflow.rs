@@ -26,33 +26,33 @@ impl MultiAgentOrchestrator {
         Ok((c, usage))
     }
 
-    /// 平台级 fallback 提示(2026-09-16 第 54 轮补丁 E)。
+    /// 平台级 fallback 提示(2026-09-16 第 54 轮补丁 E;2026-09-18 第 84 轮改写)。
     ///
-    /// 当 WindowUse 单元失败时,在失败原因中追加「当前平台 WindowUse 工具可用性 +
-    /// 推荐替代路径」,让 Yolo 重新评估时拿到完整上下文,避免反复在死路上重试。
-    /// 返回值限制 200 字符以内,避免撑爆 token。
+    /// 当桌面窗口操控相关单元失败时,在失败原因中追加「当前平台 MCP_Window_Use
+    /// 工具可用性 + 推荐替代路径」,让 Yolo 重新评估时拿到完整上下文,
+    /// 避免反复在死路上重试。返回值限制 200 字符以内,避免撑爆 token。
     pub(super) fn platform_fallback_hint(&self, failure: &QualityFailure) -> String {
-        // 仅当失败来源与 WindowUse 相关时才追加(其它场景避免噪声)
-        let is_windowuse_related =
-            matches!(failure.source, AgentRole::WindowUse | AgentRole::MainWork);
-        if !is_windowuse_related {
+        // 仅当失败来源与执行层相关时才追加(其它场景避免噪声)
+        let is_exec_related =
+            matches!(failure.source, AgentRole::SubAgent | AgentRole::MainWork);
+        if !is_exec_related {
             return String::new();
         }
-        // 探测当前平台 WindowUse 工具可用性
+        // 探测当前平台窗口操控可用性(MCP_Window_Use 仅 macOS / Windows 定义)
         #[cfg(target_os = "macos")]
         {
-            // 2026-09-16 第 55 轮修正:macOS 上 AX C API 全版本可用,「不可用」只有一种
-            // 情况 = 辅助功能未授权(kAXErrorAPIDisabled)。通过 permission_hint 是否返回
+            // macOS 上 AX C API 全版本可用,「不可用」只有一种情况 =
+            // 辅助功能未授权(kAXErrorAPIDisabled)。通过 permission_hint 是否返回
             // Some 判定:已授权 → None(无需 fallback);未授权 → 给 Yolo 精简重试指引。
             let driver = crate::agent::window::current_driver();
             if driver.permission_hint().is_some() {
-                return "[platform-fallback] macOS 辅助功能未授权,WindowInspect/WindowAction 暂不可用。建议:提示用户到 系统设置→隐私与安全性→辅助功能 勾选宿主终端并重开;或把含 osascript/screencapture/cliclick/System Events/keystroke 的步骤改 delegate_to=subagent(WindowUse Bash 已扩白名单);WindowList 走 CoreGraphics 始终可用。".to_string();
+                return "[platform-fallback] macOS 辅助功能未授权,MCP_Window_Use 的 inspect/control/ocr 不可用。建议:提示用户到 系统设置→隐私与安全性→辅助功能 勾选宿主终端并重开;或把含 osascript/cliclick/System Events/keystroke 的步骤直接走 SubAgent Bash;MCP_Window_Use(action=list) 走 CoreGraphics 始终可用。".to_string();
             }
             String::new()
         }
         #[cfg(windows)]
         {
-            // Windows:若 WindowUse 失败,建议改 PowerShell + UI Automation
+            // Windows:若 UIA 不可用,建议改 PowerShell + UI Automation
             let hint = std::env::var("LAEW_WINDOWS_UIA_FALLBACK")
                 .ok()
                 .filter(|v| !v.is_empty());
@@ -63,10 +63,10 @@ impl MultiAgentOrchestrator {
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
-            // Linux:无 GUI 自动化时建议改 xdotool / wmctrl 完整命令模板
+            // Linux:MCP_Window_Use 不注册;建议直接用 Bash 调 xdotool/wmctrl
             let driver = crate::agent::window::current_driver();
             if driver.permission_hint().is_some() {
-                return "[platform-fallback] 当前 Linux 平台 WindowUse 仅支持 wmctrl/xdotool 尽力而为,控件级操作常失败。建议:delegate_to=subagent 用 Bash 直接调 xdotool/wmctrl 命令模板。".to_string();
+                return "[platform-fallback] 当前平台未定义 MCP_Window_Use(仅 macOS/Windows)。建议:用 Bash 直接调 xdotool/wmctrl 命令模板,控件级操作尽力而为。".to_string();
             }
             String::new()
         }

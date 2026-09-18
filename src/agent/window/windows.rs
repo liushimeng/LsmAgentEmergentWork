@@ -15,7 +15,7 @@
 //! - OCR:`windows_ocr::ocr_window`(GDI 截图 + Windows.Media.Ocr);
 //! - `bring_to_front`:`windows_input::force_foreground`(恢复最小化 + 三保险激活)。
 //!
-//! 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` §2.3 Windows 后端。
+//! 设计见 `docs/MCP_Window_Use/01-设计与解决方案.md` §2.3 Windows 后端。
 
 use windows::core::BSTR;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
@@ -61,7 +61,7 @@ impl WindowsDriver {
         let raw: isize = window_id.trim().parse().map_err(|_| {
             platform_err(
                 "windows",
-                format!("window_id 应为 WindowList 返回的 HWND 十进制字符串,实际: {window_id}"),
+                format!("window_id 应为 MCP_Window_Use(action=list) 返回的 HWND 十进制字符串,实际: {window_id}"),
             )
         })?;
         Ok(HWND(raw as *mut std::ffi::c_void))
@@ -140,7 +140,7 @@ unsafe extern "system" fn enum_windows_proc(
 ///
 /// 2026-09-16 第 67 轮:`QueryFullProcessImageNameW` 替换 `GetModuleBaseNameW` ——
 /// 后者需要 PROCESS_VM_READ,LIMITED 权限下实测返回空串(微信 4.x 主进程即如此),
-/// 导致 WindowFind 无法按进程名(Weixin)匹配。
+/// 导致 MCP_Window_Use(action=find) 无法按进程名(Weixin)匹配。
 fn process_name_of(pid: u32) -> String {
     // SAFETY:标准进程查询;句柄本函数内释放。
     unsafe {
@@ -350,7 +350,7 @@ unsafe fn uia_element_at_path(
         cur = target.ok_or_else(|| {
             platform_err(
                 "windows",
-                format!("路径 {path} 下标 {idx} 不存在(UI 可能已变化),请重新 WindowInspect"),
+                format!("路径 {path} 下标 {idx} 不存在(UI 可能已变化),请重新 MCP_Window_Use(action=inspect)"),
             )
         })?;
     }
@@ -469,7 +469,7 @@ unsafe fn win32_hwnd_at_path(root: HWND, path: &str) -> Result<HWND> {
         if found.0.is_null() {
             return Err(platform_err(
                 "windows",
-                format!("路径 {path} 下标 {idx} 不存在(UI 可能已变化),请重新 WindowInspect"),
+                format!("路径 {path} 下标 {idx} 不存在(UI 可能已变化),请重新 MCP_Window_Use(action=inspect)"),
             ));
         }
         cur = found;
@@ -634,7 +634,7 @@ impl WindowDriver for WindowsDriver {
                                      消息 ↔ 发送 ↔ Send;输入框 ↔ 搜索 ↔ Search;按钮 ↔ Button;关闭 ↔ X ↔ close。\
                                      建议:1) 改用上表同义词重试;2) filter 留空 + max_depth=4-5 看完整树;\
                                      3) 若树里只有少量 Pane(如微信 4.x 的 MMUIRenderSubWindow,自绘 UI 无控件),\
-                                     改走视觉路线:WindowOCR(window_id) 拿文本坐标 → WindowAction click_point/type_text"
+                                     改走视觉路线:MCP_Window_Use(action=ocr)(window_id) 拿文本坐标 → MCP_Window_Use(action=control) click_point/type_text"
                                 ),
                             )
                         },
@@ -649,7 +649,7 @@ impl WindowDriver for WindowsDriver {
                                 "filter 未命中窗口 {window_id} 内任何控件(Win32 降级路径,仅原生控件可见)。\
                                  【同义词建议】中文 UI 名称常见笔误:通讯录 ↔ 通信录 ↔ 联系人 ↔ Contacts;\
                                  消息 ↔ 发送 ↔ Send;输入框 ↔ 搜索 ↔ Search;按钮 ↔ Button;关闭 ↔ X ↔ close。\
-                                 建议改用上表同义词,或改走视觉路线 WindowOCR + click_point"
+                                 建议改用上表同义词,或改走视觉路线 MCP_Window_Use(action=ocr) + click_point"
                             ),
                         )
                     })
@@ -856,7 +856,7 @@ impl WindowDriver for WindowsDriver {
         winput::force_foreground(hwnd)
     }
 
-    // 第 81 轮:已前台 → 跳过激活(WindowOpen 幂等前置,消除窗口反复闪烁)。
+    // 第 81 轮:已前台 → 跳过激活(MCP_Window_Use(action=open) 幂等前置,消除窗口反复闪烁)。
     fn is_frontmost(&self, window_id: &str) -> bool {
         match Self::parse_hwnd(window_id) {
             Ok(hwnd) => {

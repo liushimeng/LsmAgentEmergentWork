@@ -1,4 +1,4 @@
-//! 桌面窗口操控抽象层(WindowUse Agent 的平台底座,第 9 角色)。
+//! 桌面窗口操控抽象层(MCP_Window_Use 工具的平台驱动层 / "MCP 服务"实现)。
 //!
 //! 统一数据模型 + [`WindowDriver`] trait,隔离三个平台后端:
 //!
@@ -14,7 +14,9 @@
 //! - **其他平台**(`fallback.rs`):`wmctrl` / `xdotool` 尽力而为列举窗口,
 //!   控件级操作返回结构化「平台不支持」错误(fail-closed,供 QC 判 Fail 回流)。
 //!
-//! 设计见 `docs/WindowUse桌面窗口操控Agent/01-设计与解决方案.md` §2.3。
+//! 设计见 `docs/MCP_Window_Use/01-设计与解决方案.md`;
+//! 平台技术参考:`docs/MCP_Window_Use/MCP_Window_Use_MacOS_技术文档.md` /
+//! `docs/MCP_Window_Use/MCP_Window_Use_Window_技术文档.md`。
 
 use serde::Serialize;
 
@@ -62,7 +64,7 @@ pub struct Rect {
 ///
 /// 2026-09-17 第 76 轮:为多窗口进程(Electron / 自绘 UI 等同一 PID 下多个窗口的进程)
 /// 修复 CGWindowID 错位问题,新增 `cg_window_id` / `hwnd` / `wmctrl_id` 三平台
-/// 底层句柄字段,WindowOCR / WindowScreenshot 优先使用平台原生句柄(避免按 PID 匹配
+/// 底层句柄字段,MCP_Window_Use(action=ocr) / MCP_Window_Use(action=screenshot) 优先使用平台原生句柄(避免按 PID 匹配
 /// 拿到非目标窗口的 CGWindowID)。LLM 始终只看到 `id` 这一个稳定 token。
 #[derive(Debug, Clone, Serialize)]
 pub struct WindowInfo {
@@ -102,7 +104,7 @@ impl WindowInfo {
 /// 控件树节点。
 ///
 /// `path` 为控件在树中的稳定定位路径(子索引链,如 `/0/2/1`;根为 `/`),
-/// `WindowAction` 工具凭它定位目标控件,避免 LLM 传递平台句柄等不透明值。
+/// `MCP_Window_Use(action=control)` 工具凭它定位目标控件,避免 LLM 传递平台句柄等不透明值。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ControlNode {
     pub path: String,
@@ -144,7 +146,7 @@ pub enum ControlAction {
     /// macOS AXScrollToVisible;Windows 暂等价 Scroll 小步;列表逐条定位场景比盲滚精准。
     ScrollToVisible,
     /// ===== 2026-09-16 第 67 轮:坐标动作(自绘 UI 视觉路线) =====
-    /// 坐标信息来自 `WindowOCR` 返回的词块(screen_x/screen_y 取中心)或窗口 bounds 计算。
+    /// 坐标信息来自 `MCP_Window_Use(action=ocr)` 返回的词块(screen_x/screen_y 取中心)或窗口 bounds 计算。
     /// 在屏幕绝对坐标 (x,y) 执行物理鼠标左键单击(SendInput / CGEvent / xdotool)。
     ClickPoint { x: i64, y: i64 },
     /// 坐标双击(展开列表项 / 打开会话等场景)。
@@ -187,9 +189,9 @@ impl ControlAction {
             match (x, y) {
                 (Some(px), Some(py)) => Ok((px, py)),
                 _ => Err(AgentError::ToolExecution {
-                    tool: "WindowAction".into(),
+                    tool: "MCP_Window_Use(action=control)".into(),
                     reason: format!(
-                        "action={norm} 缺少整数参数 x / y(屏幕绝对坐标,取 WindowOCR 返回的 screen_x/screen_y 中心)"
+                        "action={norm} 缺少整数参数 x / y(屏幕绝对坐标,取 MCP_Window_Use(action=ocr) 返回的 screen_x/screen_y 中心)"
                     ),
                 }),
             }
@@ -199,14 +201,14 @@ impl ControlAction {
             "focus" => Self::Focus,
             "settext" | "input" | "type" => {
                 Self::SetText(text.ok_or_else(|| AgentError::ToolExecution {
-                    tool: "WindowAction".into(),
+                    tool: "MCP_Window_Use(action=control)".into(),
                     reason: "action=set_text 缺少 string 类型参数 text".into(),
                 })?)
             }
             "gettext" | "read" => Self::GetText,
             "sendkeys" | "keys" => {
                 Self::SendKeys(text.ok_or_else(|| AgentError::ToolExecution {
-                    tool: "WindowAction".into(),
+                    tool: "MCP_Window_Use(action=control)".into(),
                     reason: "action=send_keys 缺少 string 类型参数 text".into(),
                 })?)
             }
@@ -239,13 +241,13 @@ impl ControlAction {
             }
             "typetext" | "inputatfocus" | "typeatfocus" => {
                 Self::TypeText(text.ok_or_else(|| AgentError::ToolExecution {
-                    tool: "WindowAction".into(),
+                    tool: "MCP_Window_Use(action=control)".into(),
                     reason: "action=type_text 缺少 string 类型参数 text".into(),
                 })?)
             }
             "typetextsubmit" | "sendtext" | "typeandsubmit" => {
                 let text = text.ok_or_else(|| AgentError::ToolExecution {
-                    tool: "WindowAction".into(),
+                    tool: "MCP_Window_Use(action=control)".into(),
                     reason: "action=type_text_submit 缺少 string 类型参数 text".into(),
                 })?;
                 Self::TypeTextSubmit {
@@ -256,7 +258,7 @@ impl ControlAction {
             }
             other => {
                 return Err(AgentError::ToolExecution {
-                    tool: "WindowAction".into(),
+                    tool: "MCP_Window_Use(action=control)".into(),
                     reason: format!(
                         "未知 action: {other};可用: click / focus / set_text / get_text / send_keys / invoke / scroll / scroll_to_visible / click_point / double_click_point / right_click_point / scroll_point / type_text / type_text_submit"
                     ),
@@ -289,13 +291,13 @@ fn parse_scroll_lines(text: Option<&str>) -> Result<i32> {
         3
     } else {
         num_part.parse().map_err(|_| AgentError::ToolExecution {
-            tool: "WindowAction".into(),
+            tool: "MCP_Window_Use(action=control)".into(),
             reason: format!("scroll 行数非法: {num_part}(应为正整数,如 \"down:3\")"),
         })?
     };
     if magnitude <= 0 || magnitude > 100 {
         return Err(AgentError::ToolExecution {
-            tool: "WindowAction".into(),
+            tool: "MCP_Window_Use(action=control)".into(),
             reason: format!("scroll 行数超出范围(1-100): {magnitude}"),
         });
     }
@@ -303,7 +305,7 @@ fn parse_scroll_lines(text: Option<&str>) -> Result<i32> {
         "up" | "upward" | "上" => Ok(magnitude),
         "down" | "downward" | "下" => Ok(-magnitude),
         other => Err(AgentError::ToolExecution {
-            tool: "WindowAction".into(),
+            tool: "MCP_Window_Use(action=control)".into(),
             reason: format!("scroll 方向非法: {other}(应为 up/down)"),
         }),
     }
@@ -351,14 +353,14 @@ pub trait WindowDriver: Send + Sync {
     /// 2026-09-16 第 67 轮:把窗口带到前台(恢复最小化 + 激活)。
     ///
     /// 语义:幂等、失败不 panic;默认 no-op(平台暂未实装时静默,
-    /// WindowOpen 在「已在运行」分支调用它,避免重复启动第二实例)。
+    /// MCP_Window_Use(action=open) 在「已在运行」分支调用它,避免重复启动第二实例)。
     fn bring_to_front(&self, _window_id: &str) -> Result<()> {
         Ok(())
     }
 
     /// 2026-09-17 第 81 轮:窗口所属应用当前是否已处于前台。
     ///
-    /// 用途:WindowOpen 对「已存在窗口」先查本方法 —— 已前台则**跳过激活**
+    /// 用途:MCP_Window_Use(action=open) 对「已存在窗口」先查本方法 —— 已前台则**跳过激活**
     /// (跳过 AXRaise / osascript frontmost / 400ms sleep),消除失败回流与
     /// 多单元链路中窗口被反复前置导致的闪烁与焦点断续(会话连续性)。
     ///
@@ -390,7 +392,7 @@ pub trait WindowDriver: Send + Sync {
     /// 2026-09-17 第 76 轮 P0-1:带 WindowInfo 的 OCR(优先使用平台原生句柄)。
     ///
     /// 默认实现降级到 `ocr(window_id, region, lang)`,macOS 实装直接读取
-    /// `info.cg_window_id` 避免按 PID 匹配错位。`WindowOCRTool` 会先调
+    /// `info.cg_window_id` 避免按 PID 匹配错位。`MCP_Window_Use(action=ocr)Tool` 会先调
     /// `list_windows` 拿到完整 WindowInfo 后再调本方法,保持向后兼容。
     fn ocr_with_info(
         &self,
@@ -424,7 +426,7 @@ pub trait WindowDriver: Send + Sync {
     /// 2026-09-17 第 76 轮 P0-1:带 WindowInfo 的截图(优先使用平台原生句柄)。
     ///
     /// 默认实现降级到 `screenshot_to(window_id, region, path)`,macOS 实装
-    /// 直接使用 `info.cg_window_id`(避免按 PID 匹配错位)。`WindowScreenshot`
+    /// 直接使用 `info.cg_window_id`(避免按 PID 匹配错位)。`MCP_Window_Use(action=screenshot)`
     /// 工具会先调 `list_windows` 拿到完整 WindowInfo 后再调本方法。
     fn screenshot_to_with_info(
         &self,
@@ -478,15 +480,12 @@ pub(crate) fn platform_err(platform: &str, msg: impl Into<String>) -> AgentError
     }
 }
 
-// ===================== 2026-09-17 第 82+ 轮 P0-1:目标应用自动启动兜底 =====================
+// ===================== 目标应用自动启动兜底(2026-09-17 第 82+ 轮 P0-1) =====================
 //
-// 背景:WindowUse Runner 在 16:45 微信任务中,LLCM 第 1 轮 `forced_tool=WindowOpen` 被
-// 绕过(effective=false),Runner 也没兜底启动,导致整个 Session 在「微信未运行」状态下
-// 浪费 591s 但零产出。新方案:
-// - Runner 入口(sub_session 创建前)先调 `auto_launch_target` 做「目标可见性探测」;
+// 供 MCP_Window_Use(action=open) 与未来的编排层复用:
+// - 先调 `auto_launch_target` 做「目标可见性探测」;
 // - 不可见则用平台原生通道启动 + 等待 wait_seconds(默认 10s);
-// - 把启动结果(成功 window_id 或失败原因)注入 prompt,LLM 第一轮即可基于 ready
-//   window_id 进入 WindowInspect/WindowAction。
+// - 返回 ready window_id 或带原因的错误。
 //
 // 白名单:仅已知应用(WeChat / Chrome / Safari / Firefox / Edge / Slack / Telegram /
 // Discord / VSCode / iTerm2 / Terminal / QQ / Weixin / Notion / DingTalk / Feishu /
@@ -545,10 +544,10 @@ pub fn is_target_app_allowed(query: &str) -> bool {
     ALLOWED.iter().any(|k| normalized.contains(k))
 }
 
-/// 2026-09-17 第 82+ 轮 P0-1:WindowUse Runner 自动启动目标应用。
+/// 自动启动目标应用(2026-09-17 第 82+ 轮 P0-1)。
 ///
-/// 复用 `tools/window/open.rs::launch_desktop_app` 的平台启动解析链(Windows =
-/// ShellExecuteW / 快捷方式 / 安装路径;macOS = `open -a` / `open -b`)。
+/// 与 `tools/mcp_window_use/open.rs::launch_desktop_app` 同源的平台启动解析链
+/// (Windows = ShellExecuteW / 快捷方式 / 安装路径;macOS = `open -a` / `open -b`)。
 ///
 /// 返回 ready window_id;若启动失败或不在白名单,返回带原因的错误。
 /// 函数为同步阻塞(spawn_blocking 由调用方负责)。
@@ -600,7 +599,7 @@ pub fn auto_launch_target(
 
     let shell_ok = shell_attempt();
     if let Err(e) = &shell_ok {
-        tracing::warn!(app = %app_query, error = %e, "auto_launch_target shell 启动失败,等待 WindowList 探测");
+        tracing::warn!(app = %app_query, error = %e, "auto_launch_target shell 启动失败,等待 MCP_Window_Use(action=list) 探测");
     }
 
     // 等待 + 探测
@@ -630,7 +629,7 @@ pub fn auto_launch_target(
                     }
                 }
             }
-            Err(e) => last_err = format!("WindowList 失败: {e}"),
+            Err(e) => last_err = format!("MCP_Window_Use(action=list) 失败: {e}"),
         }
     }
 
@@ -642,9 +641,9 @@ pub fn auto_launch_target(
 
 // ===================== 平台权限快速检测(2026-09-17 第 77 轮 P0-1/P0-2) =====================
 //
-// 背景:WindowUseRunner 之前依赖 `driver_preflight` 在每个工具入口触发授权等待,
-// 导致 LLM 在 WindowInspect/WindowOCR/WindowScreenshot 全部失败时仍会反复重试
-// (14-16 次迭代),浪费 200s+ 与 token。Runner 入口需要「一次扫描报告」能力。
+// 背景:窗口操控任务此前依赖 `driver_preflight` 在每个工具入口触发授权等待,
+// 导致 LLM 在 inspect/ocr/screenshot 全部失败时仍会反复重试
+// (14-16 次迭代),浪费 200s+ 与 token。调用方需要「一次扫描报告」能力。
 //
 // 设计:
 // - `PermissionReport` 统一结构:accessibility / screen_recording / can_ocr / can_screenshot
@@ -658,10 +657,9 @@ pub fn auto_launch_target(
 //   * Linux:依赖 xdotool/wmctrl 可执行文件存在;返回全授权(无统一机制)
 //
 // 落地位置:
-// - `WindowUseRunner::run_unit_inner` 入口在 `WindowUseBashModeGuard::enter()` 之后
-//   调用 `check_platform_permissions()`,若 `!has_critical_grants()` 则把
-//   `build_permission_failure_message(report)` 注入 prompt,LLM 首轮即得引导
-// - ExecutionTrace 写 `permission_denied: Vec<String>` 字段,供 QC/Debug 报告观测
+// - MCP_Window_Use 的 open/inspect action 在返回体中携带权限状态与 next_action 引导;
+//   `build_permission_failure_message(report)` 供编排层在权限缺失时注入 prompt
+// - ExecutionTrace 写 `permission_missing: Vec<String>` 字段,供 QC/Debug 报告观测
 
 /// 平台权限报告(2026-09-17 第 77 轮 P0-1)。
 ///
@@ -746,7 +744,7 @@ pub fn check_platform_permissions() -> PermissionReport {
     probe
 }
 
-/// 强制刷新缓存(WindowUseRunner 单元之间需要拿到最新状态时调用)。
+/// 强制刷新缓存(连续窗口操控任务之间需要拿到最新状态时调用)。
 pub fn invalidate_permission_cache() {
     if let Some(mutex) = PERMISSION_CACHE.get() {
         if let Ok(mut cached) = mutex.lock() {
@@ -824,7 +822,7 @@ fn probe_macos_permissions() -> PermissionReport {
         screen_recording_hint: if screen_recording {
             String::new()
         } else {
-            "屏幕录制未授权(CGWindowListCreateImage 返回 NULL)。授权:系统设置 → 隐私与安全性 → 屏幕录制 → 勾选宿主终端;授权后必须重启终端生效。授权前可改用 WindowInspect 控件树路线(纯辅助功能),或降级到 screencapture / osascript System Events 路径。".into()
+            "屏幕录制未授权(CGWindowListCreateImage 返回 NULL)。授权:系统设置 → 隐私与安全性 → 屏幕录制 → 勾选宿主终端;授权后必须重启终端生效。授权前可改用 MCP_Window_Use(action=inspect) 控件树路线(纯辅助功能),或降级到 screencapture / osascript System Events 路径。".into()
         },
     }
 }
@@ -858,20 +856,19 @@ fn probe_macos_screen_recording() -> bool {
     }
 }
 
-/// 把缺失项翻译成 LLM 可读的引导文案(第 77 轮 P0-1 引入,第 81 轮按**真实权限矩阵**重写)。
+/// 把缺失项翻译成 LLM 可读的引导文案(第 77 轮 P0-1 引入,第 81 轮矩阵化,
+/// 第 84 轮改写为 MCP_Window_Use action 命名)。
 ///
-/// 用途:WindowUseRunner 入口在权限缺失时把这段文案追加到 prompt,
-/// LLM 第一轮响应即可拿到与权限事实一致的可用/禁用工具清单,不必通过
+/// 用途:编排层 / 工具调用方在权限缺失时把这段文案追加到 prompt,
+/// LLM 第一轮响应即可拿到与权限事实一致的可用/禁用清单,不必通过
 /// 14+ 次失败自己摸索。
 ///
-/// 第 81 轮根因修复:旧版文案与权限事实脱节 —— 屏幕录制缺失时仍建议
-/// 「screencapture 截图」(实际必失败);辅助功能已授权时仍禁令 WindowInspect
-/// (实际是唯一可用主路线)。新版按 macOS TCC 真实矩阵分两个分支输出:
+/// 按 macOS TCC 真实矩阵分两个分支输出:
 ///
-/// - **辅助功能缺失**:仅 WindowList/Find/Open + Apple Events 激活可用;
+/// - **辅助功能缺失**:仅 list/find/open + Apple Events 激活可用;
 ///   System Events / cliclick / CGEvent 同受一道门禁,一并列入禁用;
-/// - **辅助功能 ✅ + 屏幕录制 ❌**:WindowInspect / WindowAction(AX 主路线)
-///   完整可用;仅禁 WindowOCR / WindowScreenshot / screencapture 截图识别路线,
+/// - **辅助功能 ✅ + 屏幕录制 ❌**:inspect / control(AX 主路线)
+///   完整可用;仅禁 ocr / screenshot / screencapture 截图识别路线,
 ///   并给出「AX 深挖 / bounds 比例估坐标 / 键盘路线」三条替代识别方案。
 pub fn build_permission_failure_message(report: &PermissionReport) -> String {
     let mut lines = Vec::new();
@@ -884,7 +881,7 @@ pub fn build_permission_failure_message(report: &PermissionReport) -> String {
         missing.push("屏幕录制(screen_recording)");
     }
     if missing.is_empty() {
-        lines.push("✅ 平台权限齐全,WindowUse 全工具正常可用。".to_string());
+        lines.push("✅ 平台权限齐全,MCP_Window_Use 全部 action 正常可用。".to_string());
         return lines.join("\n");
     }
 
@@ -895,21 +892,21 @@ pub fn build_permission_failure_message(report: &PermissionReport) -> String {
     ));
 
     // ---------- 分支 1:辅助功能缺失(最受限,一切 UI 读取/操控不可用) ----------
-    // TCC 事实:osascript System Events / cliclick / CGEvent 注入与 WindowInspect
+    // TCC 事实:osascript System Events / cliclick / CGEvent 注入与 MCP_Window_Use(action=inspect)
     // 同受「辅助功能」一道门禁,未授权时全部失败 —— 降级清单里绝不能出现它们。
     if !report.accessibility {
         if !report.accessibility_hint.is_empty() {
             lines.push(format!("【辅助功能授权步骤】\n  {}", report.accessibility_hint));
         }
         lines.push(
-            "【可用工具(仅此 4 个)】WindowList / WindowFind / WindowOpen / Bash(open -a、\
+            "【可用操作(仅此 4 个)】MCP_Window_Use(action=list) / MCP_Window_Use(action=find) / MCP_Window_Use(action=open) / Bash(open -a、\
              osascript tell app to activate —— Apple Events 不受辅助功能门禁)。"
                 .to_string(),
         );
         lines.push(
-            "【禁止尝试(已知必败,连 1 次都不要试)】WindowInspect / WindowAction / \
-             WindowOCR / WindowScreenshot / Bash screencapture / cliclick / \
-             osascript System Events —— 它们与 WindowInspect 同受一道辅助功能门禁,\
+            "【禁止尝试(已知必败,连 1 次都不要试)】MCP_Window_Use(action=inspect) / MCP_Window_Use(action=control) / \
+             MCP_Window_Use(action=ocr) / MCP_Window_Use(action=screenshot) / Bash screencapture / cliclick / \
+             osascript System Events —— 它们与 inspect 同受一道辅助功能门禁,\
              未授权时全部失败。"
                 .to_string(),
         );
@@ -930,22 +927,22 @@ pub fn build_permission_failure_message(report: &PermissionReport) -> String {
             ));
         }
         lines.push(
-            "✅ 辅助功能已授权:**WindowInspect / WindowAction(AX 控件树 + 坐标动作)完整可用,\
+            "✅ 辅助功能已授权:**MCP_Window_Use(action=inspect) / MCP_Window_Use(action=control)(AX 控件树 + 坐标动作)完整可用,\
              这是主路线**。osascript System Events / pbcopy / pbpaste 同样可用。"
                 .to_string(),
         );
         lines.push(
-            "【禁止尝试(屏幕录制缺失,已知必败)】WindowOCR / WindowScreenshot / \
+            "【禁止尝试(屏幕录制缺失,已知必败)】MCP_Window_Use(action=ocr) / MCP_Window_Use(action=screenshot) / \
              Bash screencapture —— 全部截图识别路线一次都不要试。"
                 .to_string(),
         );
         lines.push(
             "【无 OCR 的界面识别替代路线】\n  \
-             1. WindowInspect 加大 max_depth(6-8)且不带 filter 深挖\
+             1. action=inspect 加大 max_depth(6-8)且不带 filter 深挖\
                 (驱动已自动 AXEnhancedUserInterface 建树等待);\n  \
              2. 控件树仍为空(自绘 UI):按窗口 bounds **比例估算坐标**直接用坐标动作\
                 (click_point 不依赖 OCR;如输入框≈窗口底部 85% 高度、搜索框≈顶部 5%),\
-                操作后用 WindowInspect/GetText 验证;\n  \
+                操作后用 action=inspect / get_text 验证;\n  \
              3. 键盘路线:type_text_submit 直接向焦点控件键入(无需知道控件路径);\n  \
              4. 文本读取优先 AX:get_text / AXValue,其次 pbpaste\
                 (先 System Events keystroke \"c\" cmd+c)。"
@@ -1003,7 +1000,7 @@ mod permission_tests {
     #[test]
     fn build_permission_message_ax_only_screencapture_missing() {
         // 第 81 轮核心回归:辅助功能 ✅ + 屏幕录制 ❌(14:38 场次的真实状态)。
-        // 必须主推 WindowInspect/WindowAction(可用),只禁截图识别路线。
+        // 必须主推 MCP_Window_Use(action=inspect)/MCP_Window_Use(action=control)(可用),只禁截图识别路线。
         let r = PermissionReport {
             platform: "macos".into(),
             accessibility: true,
@@ -1016,15 +1013,15 @@ mod permission_tests {
         let msg = build_permission_failure_message(&r);
         assert!(msg.contains("⚠️"));
         assert!(msg.contains("屏幕录制"));
-        // AX 主路线必须被肯定(不再一刀切禁令 WindowInspect)
+        // AX 主路线必须被肯定(不再一刀切禁令 MCP_Window_Use(action=inspect))
         assert!(
             msg.contains("完整可用"),
-            "辅助功能已授权时必须明确 WindowInspect/WindowAction 可用: {msg}"
+            "辅助功能已授权时必须明确 MCP_Window_Use(action=inspect)/MCP_Window_Use(action=control) 可用: {msg}"
         );
-        assert!(msg.contains("WindowInspect / WindowAction"));
+        assert!(msg.contains("MCP_Window_Use(action=inspect) / MCP_Window_Use(action=control)"));
         // 截图识别路线必须整体禁止
         assert!(msg.contains("禁止尝试"));
-        assert!(msg.contains("WindowOCR / WindowScreenshot"));
+        assert!(msg.contains("MCP_Window_Use(action=ocr) / MCP_Window_Use(action=screenshot)"));
         // 不得再建议 screencapture 作为可用降级路径(第 77 轮 bug)
         assert!(
             !msg.contains("screencapture -x"),
@@ -1037,8 +1034,8 @@ mod permission_tests {
 
     #[test]
     fn build_permission_message_accessibility_missing_forbids_all_ui_tools() {
-        // 辅助功能 ❌:System Events / cliclick 与 WindowInspect 同受一道门禁,
-        // 全部列入禁用;只保留 WindowList/Find/Open + Apple Events 激活。
+        // 辅助功能 ❌:System Events / cliclick 与 MCP_Window_Use(action=inspect) 同受一道门禁,
+        // 全部列入禁用;只保留 MCP_Window_Use(action=list)/Find/Open + Apple Events 激活。
         let r = PermissionReport {
             platform: "macos".into(),
             accessibility: false,
@@ -1052,15 +1049,15 @@ mod permission_tests {
         assert!(msg.contains("⚠️"));
         assert!(msg.contains("辅助功能"));
         assert!(msg.contains("仅此 4 个"));
-        assert!(msg.contains("WindowList / WindowFind / WindowOpen"));
+        assert!(msg.contains("MCP_Window_Use(action=list) / MCP_Window_Use(action=find) / MCP_Window_Use(action=open)"));
         assert!(msg.contains("禁止尝试"));
-        assert!(msg.contains("WindowInspect"));
+        assert!(msg.contains("MCP_Window_Use(action=inspect)"));
         assert!(msg.contains("System Events"));
         assert!(msg.contains("不要空转迭代"));
     }
 }
 
-/// 2026-09-16 第 67 轮:window_id → HWND(供 tools/window_vision.rs 的
+/// 2026-09-16 第 67 轮:window_id → HWND(供 tools/mcp_window_use/vision.rs 的
 /// Windows 截图路径直接拿句柄;非 Windows 平台不存在本函数)。
 #[cfg(windows)]
 pub fn windows_driver_hwnd(window_id: &str) -> Result<::windows::Win32::Foundation::HWND> {
@@ -1068,7 +1065,7 @@ pub fn windows_driver_hwnd(window_id: &str) -> Result<::windows::Win32::Foundati
 }
 
 /// 2026-09-16 第 67 轮:按窗口(可选区域)截图并**保存到指定路径**
-/// (WindowScreenshot 的 Windows 纯 Rust 路径;返回实际截取的屏幕矩形)。
+/// (MCP_Window_Use(action=screenshot) 的 Windows 纯 Rust 路径;返回实际截取的屏幕矩形)。
 #[cfg(windows)]
 pub fn windows_ocr_capture_to(
     hwnd: ::windows::Win32::Foundation::HWND,
@@ -1082,7 +1079,7 @@ pub fn windows_ocr_capture_to(
 /// 「赵玲玲ᴵᴵᴬ」这种混用 Unicode Modifier Letter 与 Latin Letter
 /// 块导致的匹配失败场景。仅归一化常用上标字母子集,不引入 NFKC
 /// 完整归一化以免破坏其他匹配场景。
-/// 第 66 轮:提升为 pub(crate),供 tools/window.rs 的 WindowFind 打分复用。
+/// 第 66 轮:提升为 pub(crate),供 tools/window.rs 的 MCP_Window_Use(action=find) 打分复用。
 pub(crate) fn normalize_unicode_for_match(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

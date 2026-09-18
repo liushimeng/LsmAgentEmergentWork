@@ -271,13 +271,13 @@ pub fn format_task_result(
                     }
                     let elapsed = format!("{:.2}s", tc.elapsed_ms as f64 / 1000.0);
                     let detail = if tc.ok {
-                        // Window*/Browser* 工具展示成功输出摘要;Browser* 走信封精简
+                        // MCP_Window_Use/Browser* 工具展示成功输出摘要;Browser* 走信封精简
                         // (★第 79 轮 P2-5:code/message/page_id/text_len 等要素,避免
                         // 原始 JSON 转义噪声刷屏)。普通 SubAgent / Emit 的 Markdown
                         // 原文不重复出现(破坏富文本渲染测试)。
                         let ok_brief: Option<String> = if tc.tool.starts_with("Browser") {
                             browser_output_brief(&tc.output_summary)
-                        } else if tc.tool.starts_with("Window")
+                        } else if tc.tool == "MCP_Window_Use"
                             && !tc.output_summary.trim().is_empty()
                         {
                             Some(truncate_chars(&tc.output_summary, 80))
@@ -294,7 +294,7 @@ pub fn format_task_result(
                         format!(" ← {}", if styled { sv(&err_short) } else { err_short })
                     };
                     // 2026-09-17 第 77 轮 P1-1:按工具类型差异化精简参数展示
-                    // (Bash cmd 截 40, Read/Write/Edit path 截 50, Window* 突出关键字段)
+                    // (Bash cmd 截 40, Read/Write/Edit path 截 50, MCP_Window_Use 突出关键字段)
                     let brief = tool_args_brief(&tc.tool, &tc.args_json);
                     out.push_str(&format!(
                         "    [tool] {:<14} {}{} {} {}B{}\n",
@@ -477,7 +477,7 @@ pub fn format_failed_detail(
                 s.elapsed_ms as f64 / 1000.0
             )),
             "wf" => out.push_str(&format!(
-                "  [wf] {} SubAgent/WindowUse/WebUse 执行({:.2}s)\n",
+                "  [wf] {} SubAgent/WebUse 执行({:.2}s)\n",
                 s.wf_id.as_deref().unwrap_or("?"),
                 s.elapsed_ms as f64 / 1000.0
             )),
@@ -561,7 +561,7 @@ pub fn format_failed_detail(
                         // ★第 79 轮 P2-5:Browser* 走信封精简摘要(同 format_task_result 段)
                         let ok_brief: Option<String> = if tc.tool.starts_with("Browser") {
                             browser_output_brief(&tc.output_summary)
-                        } else if tc.tool.starts_with("Window")
+                        } else if tc.tool == "MCP_Window_Use"
                             && !tc.output_summary.trim().is_empty()
                         {
                             Some(truncate_chars(&tc.output_summary, 80))
@@ -822,7 +822,7 @@ pub(crate) fn truncate_chars(s: &str, limit: usize) -> String {
 /// 2026-09-17 第 77 轮 P1-1:工具调用参数差异化精简。
 ///
 /// 背景:终态 `[tool]` 行原本统一截 80 字符 `args_json`,在 Bash 长命令
-/// (`osascript -e 'tell application ...'`) 或 WindowInspect 控件树 JSON 下
+/// (`osascript -e 'tell application ...'`) 或窗口操控控件树 JSON 下
 /// 仍然过长,失败场景 14+ 条全量展示时刷屏。
 ///
 /// 新规则(优先级从高到低):
@@ -830,9 +830,8 @@ pub(crate) fn truncate_chars(s: &str, limit: usize) -> String {
 ///   (Bash 通常 1-2 个核心参数)
 /// - **Read/Write/Edit**: 提取 `path` 字段,截 50
 ///   (路径本身就是最关键信息)
-/// - **WindowInspect/WindowOCR/WindowScreenshot**: 突出 `window_id`
-///   (窗口定位是核心)
-/// - **WindowAction**: `window_id + path + action` 拼接(限 60)
+/// - **MCP_Window_Use**: 突出 `action + window_id/query`(窗口定位是核心);
+///   control 动作附 `path + control_action`(限 60)
 /// - **其他**: 保持原 `args_json` 截 80 行为(向后兼容)
 ///
 /// 环境变量开关:`LAEW_TOOL_DISPLAY_VERBOSE=1` 关闭精简,
@@ -863,46 +862,30 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
             let p = extract_json_field(args_json, "path").unwrap_or_else(|| args_json.to_string());
             format!("path={}", truncate_chars(&p, 50))
         }
-        "WindowInspect" | "WindowOCR" | "WindowScreenshot" | "WindowFind" | "WindowList" => {
-            let wid = extract_json_field(args_json, "window_id")
-                .or_else(|| extract_json_field(args_json, "query"))
-                .unwrap_or_default();
-            if wid.is_empty() {
-                truncate_chars(args_json, 60)
-            } else {
-                format!("wid={}", truncate_chars(&wid, 24))
-            }
-        }
-        "WindowAction" => {
-            let wid = extract_json_field(args_json, "window_id").unwrap_or_default();
-            let path = extract_json_field(args_json, "path").unwrap_or_else(|| "/".into());
+        "MCP_Window_Use" => {
+            // 2026-09-18 第 84 轮:窗口操控统一入口,突出 action + 定位要素
             let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
-            let text = extract_json_field(args_json, "text").unwrap_or_default();
-            let x = extract_json_field(args_json, "x").unwrap_or_default();
-            let y = extract_json_field(args_json, "y").unwrap_or_default();
-            let mut brief = format!(
-                "wid={} path={} action={}",
-                truncate_chars(&wid, 12),
-                truncate_chars(&path, 16),
-                truncate_chars(&action, 18)
-            );
-            if !text.is_empty() {
-                brief.push_str(&format!(" text={}", truncate_chars(&text, 24)));
+            let wid = extract_json_field(args_json, "window_id").unwrap_or_default();
+            let query = extract_json_field(args_json, "query").unwrap_or_default();
+            let mut brief = format!("action={}", truncate_chars(&action, 12));
+            if !wid.is_empty() {
+                brief.push_str(&format!(" wid={}", truncate_chars(&wid, 16)));
             }
-            if !x.is_empty() && !y.is_empty() {
-                brief.push_str(&format!(
-                    " xy=({},{})",
-                    truncate_chars(&x, 8),
-                    truncate_chars(&y, 8)
-                ));
+            if !query.is_empty() {
+                brief.push_str(&format!(" query={}", truncate_chars(&query, 24)));
+            }
+            if action == "control" {
+                let path = extract_json_field(args_json, "path").unwrap_or_default();
+                let cact =
+                    extract_json_field(args_json, "control_action").unwrap_or_default();
+                if !cact.is_empty() {
+                    brief.push_str(&format!(" act={}", truncate_chars(&cact, 16)));
+                }
+                if !path.is_empty() && path != "/" {
+                    brief.push_str(&format!(" path={}", truncate_chars(&path, 12)));
+                }
             }
             brief
-        }
-        "WindowOpen" => {
-            let q = extract_json_field(args_json, "query")
-                .or_else(|| extract_json_field(args_json, "app_name"))
-                .unwrap_or_default();
-            format!("query={}", truncate_chars(&q, 32))
         }
         // ★ 2026-09-17 第 79 轮 P2-5:Browser* 工具差异化简报。
         // WebUse 是第 11 角色的主工具面,统一信封 JSON 截 80 噪声大;
@@ -1087,26 +1070,27 @@ mod tool_args_brief_tests {
     }
 
     #[test]
-    fn window_inspect_extracts_window_id() {
-        let json = r#"{"window_id":"682:0","max_depth":3,"filter":"button"}"#;
-        let brief = tool_args_brief("WindowInspect", json);
-        assert!(brief.contains("wid="));
+    fn mcp_window_use_inspect_extracts_window_id() {
+        let json = r#"{"action":"inspect","window_id":"682:0","max_depth":3,"filter":"button"}"#;
+        let brief = tool_args_brief("MCP_Window_Use", json);
+        assert!(brief.contains("action=inspect"));
         assert!(brief.contains("682:0"));
     }
 
     #[test]
-    fn window_action_combines_fields() {
-        let json = r#"{"window_id":"682:0","path":"/0/2/1","x":100,"y":200}"#;
-        let brief = tool_args_brief("WindowAction", json);
+    fn mcp_window_use_control_combines_fields() {
+        let json = r#"{"action":"control","window_id":"682:0","path":"/0/2/1","control_action":"click","x":100,"y":200}"#;
+        let brief = tool_args_brief("MCP_Window_Use", json);
         assert!(brief.contains("wid=682:0"));
         assert!(brief.contains("path=/0/2/1"));
+        assert!(brief.contains("act=click"));
     }
 
     #[test]
-    fn window_open_uses_query() {
-        let json = r#"{"query":"WeChat","wait_seconds":10}"#;
-        let brief = tool_args_brief("WindowOpen", json);
-        assert!(brief.starts_with("query="));
+    fn mcp_window_use_open_uses_query() {
+        let json = r#"{"action":"open","query":"WeChat","wait_seconds":10}"#;
+        let brief = tool_args_brief("MCP_Window_Use", json);
+        assert!(brief.contains("action=open"));
         assert!(brief.contains("WeChat"));
     }
 

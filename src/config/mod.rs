@@ -13,7 +13,6 @@ pub use crate::database::{
 pub mod agent_memory;
 pub mod agent_message;
 pub mod session_memory;
-pub mod window_state;
 
 // 重新导出子模块的类型
 pub use agent_memory::{AgentMemoryEntry, AgentMemoryRow};

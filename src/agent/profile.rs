@@ -15,8 +15,8 @@
 use crate::agent::system_prompt::SystemPrompt;
 use crate::agent::tools::{
     builtin_registry, compact_registry, debug_registry, main_work_registry, plan_registry,
-    quality_registry, session_context_registry, sub_agent_work_registry, window_use_registry,
-    yolo_registry, ToolRegistry,
+    quality_registry, session_context_registry, sub_agent_work_registry, yolo_registry,
+    ToolRegistry,
 };
 
 // =================== Agent 名称常量 ===================
@@ -37,8 +37,6 @@ pub const SESSION_CONTEXT_AGENT_NAME: &str = "LsmAgentEmergentWork-SessionContex
 pub const DEBUG_AGENT_NAME: &str = "LsmAgentEmergentWork-Debug";
 /// Compact Agent(压缩层,Context 超阈值时自动压缩)
 pub const COMPACT_AGENT_NAME: &str = "LsmAgentEmergentWork-Compact";
-/// WindowUse Agent(桌面操控层,第 9 角色:Windows UIA / macOS Accessibility 窗口操控)
-pub const WINDOW_USE_AGENT_NAME: &str = "LsmAgentEmergentWork-WindowUse";
 /// WorkFlow Agent(工作流编排层,第 10 角色:超大型复杂任务自动化编排)
 pub const WORK_FLOW_AGENT_NAME: &str = "LsmAgentEmergentWork-WorkFlow";
 /// Chromium-WebUse Agent(浏览器操控层,第 11 角色:CDP 驱动 Chromium 系浏览器网页操控)
@@ -157,19 +155,6 @@ impl AgentProfile {
         }
     }
 
-    /// WindowUse Agent profile(桌面操控层,第 9 角色)。
-    ///
-    /// 工具集:Read + WindowList / WindowInspect / WindowAction;
-    /// 不带 Bash/Write(窗口操控单元不需要 shell / 文件写,收窄权限面)。
-    pub fn window_use_profile() -> Self {
-        Self {
-            name: WINDOW_USE_AGENT_NAME.to_string(),
-            system_prompt: SystemPrompt::window_use(),
-            tools: window_use_registry(),
-            emit_tool: None,
-        }
-    }
-
     /// Chromium-WebUse Agent profile(浏览器操控层,第 11 角色)。
     ///
     /// 工具集:Read + BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect;
@@ -266,13 +251,12 @@ mod tests {
             AgentProfile::quality_check_profile().name,
             AgentProfile::session_context_profile().name,
             AgentProfile::compact_profile().name,
-            AgentProfile::window_use_profile().name,
             AgentProfile::work_flow_profile().name,
             AgentProfile::debug_profile().name,
             AgentProfile::web_use_profile().name,
         ];
         let unique: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(unique.len(), 11, "11 个 profile 必须名字互不相同");
+        assert_eq!(unique.len(), 10, "10 个 profile 必须名字互不相同");
     }
 
     #[test]
@@ -304,7 +288,6 @@ mod tests {
             AgentProfile::session_context_profile(),
             AgentProfile::debug_profile(),
             AgentProfile::compact_profile(),
-            AgentProfile::window_use_profile(),
             AgentProfile::web_use_profile(),
         ] {
             assert!(p.emit_tool.is_none(), "{} 不应声明 emit 工具", p.name);
@@ -319,9 +302,6 @@ mod tests {
         assert!(q_names.contains(&"submit_quality_report".to_string()));
         // emit 工具不进入其他 registry
         assert!(!tool_names(&AgentProfile::sub_agent_work_profile())
-            .iter()
-            .any(|n| n.starts_with("submit_")));
-        assert!(!tool_names(&AgentProfile::window_use_profile())
             .iter()
             .any(|n| n.starts_with("submit_")));
     }
@@ -392,7 +372,6 @@ mod tests {
             AgentProfile::quality_check_profile(),
             AgentProfile::session_context_profile(),
             AgentProfile::compact_profile(),
-            AgentProfile::window_use_profile(),
             AgentProfile::web_use_profile(),
         ] {
             let rendered = p.system_prompt.render(Protocol::Anthropic);

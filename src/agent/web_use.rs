@@ -1,11 +1,11 @@
 //! Chromium-WebUse Agent(第 11 角色,浏览器操控层):执行网页浏览与浏览器操作。
 //!
-//! 与 SubAgent-Work / WindowUse 平级的「专项执行单元」:由 Main-Work 拆解 WorkFlow 时按
+//! 与 SubAgent-Work 平级的「专项执行单元」:由 Main-Work 拆解 WorkFlow 时按
 //! `delegate_to = "webuse"` 委派,持 Read + BrowserNew / BrowserList / BrowserClose /
 //! BrowserControl / BrowserInspect 工具集,CDP 协议与浏览器进程管理封闭在
 //! `agent::browser` 驱动层(chromiumoxide,Chrome / Edge / Chromium,Windows/macOS/Linux)。
 //!
-//! 结构与 [`crate::agent::window_use::WindowUseRunner`] 完全一致:独立 sub-Session、
+//! 结构与 [`crate::agent::subagent::SubAgentRunner`] 完全一致:独立 sub-Session、
 //! `run_session_cancellable`、ExecutionTrace、Agent-Memory 落库 —— QC /
 //! SessionContext / Debug / 取消传播 / 并行调度全链路复用。
 //!
@@ -354,7 +354,7 @@ impl WebUseRunner {
     /// 防止 Agent 循环 16 轮迭代总耗时过长(用户反馈 WebUse 任务卡住 58.8s)。
     /// ★ 2026-09-17 第 78 轮:可选 progress 通道,Runner 出口抓取到真实页面文本时,
     ///   通过 progress 通道发一条 [laew] 通知给 TUI 用户「正在抓取 AI 回复」+ 前 200 字预览,
-    ///   避免 TUI 静默期超过 30s 让用户以为卡死(对齐 WindowUse 第 67 轮)。
+    ///   避免 TUI 静默期超过 30s 让用户以为卡死。
     pub async fn run_unit_with_cancel(
         &self,
         input: &SubFlowInput,
@@ -471,7 +471,7 @@ impl WebUseRunner {
         let runner_role = Some(AgentRole::WebUse);
         let intended_role = input.intended_role;
 
-        // 早终止路径语义与 SubAgentRunner / WindowUseRunner 对齐:包装成失败摘要文本 + trace,
+        // 早终止路径语义与 SubAgentRunner 对齐:包装成失败摘要文本 + trace,
         // 交给 Quality-Check 判定,而不是直接升级为 Error。
         // ★ 第 79 轮 P1-3:按存活页面状态选择 Agent(冷启动强制 BrowserNew / 多轮自由决策)。
         let (text, usage, mut trace) = match agent_for_run
@@ -520,7 +520,7 @@ impl WebUseRunner {
         trace.intended_role = intended_role;
         trace.collect_failure_signals(&text);
 
-        // Runner 出口兜底(对齐 WindowUse P0-B):0 工具调用且无动作关键词 → 强制标 failed。
+        // Runner 出口兜底:0 工具调用且无动作关键词 → 强制标 failed。
         let looks_like_action = looks_like_web_ops_action(&text);
         if trace.tool_calls == 0 && !looks_like_action {
             warn!(
@@ -632,7 +632,7 @@ pub fn build_existing_pages_hint(pages: &[(String, String, String, String)]) -> 
 
 /// 浏览器操作动作关键词探测(出口兜底用)。
 ///
-/// 语义同 WindowUse 的 looks_like_window_ops_action:无工具调用时,文本含中英文
+/// 语义:无工具调用时,文本含中英文
 /// 动作关键词或超过阈值,视为「有实质内容」,否则强制标 failed。
 ///
 /// 2026-09-16 第 63 轮:阈值从 200 → 100 字符,避免"伪动作描述"逃过 QC
