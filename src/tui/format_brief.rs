@@ -103,7 +103,7 @@ mod tests {
             "frontmost_acquired": true,
             "chat_log_path": "/tmp/x.log"
         }"#;
-        let b = window_use_output_brief(out).expect("应能解析");
+        let b = window_use_output_brief("", out).expect("应能解析");
         assert!(b.contains("route=osascript_fallback"), "{b}");
         assert!(b.contains("verified=false"), "{b}");
         assert!(b.contains("frontmost=✓"), "{b}");
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn brief_chat_loop_rounds_and_focus_abort() {
         let out = r#"{"ok": true, "total_rounds": 5, "total_sent": 4, "total_replies": 1, "focus_aborted": true}"#;
-        let b = window_use_output_brief(out).unwrap();
+        let b = window_use_output_brief("", out).unwrap();
         assert!(b.contains("rounds=5 sent=4 replies=1"), "{b}");
         assert!(b.contains("focus_aborted!"), "{b}");
     }
@@ -120,22 +120,22 @@ mod tests {
     #[test]
     fn brief_osascript_run_exit_code_with_stderr() {
         let out = r#"{"ok": false, "exit_code": 1, "stderr": "17:18: syntax error (-2741)\nmore"}"#;
-        let b = window_use_output_brief(out).unwrap();
+        let b = window_use_output_brief("", out).unwrap();
         assert!(b.contains("exit=1"), "{b}");
         assert!(b.contains("syntax error"), "{b}");
         // 成功时不带 err
-        let ok = window_use_output_brief(r#"{"ok": true, "exit_code": 0}"#).unwrap();
+        let ok = window_use_output_brief("", r#"{"ok": true, "exit_code": 0}"#).unwrap();
         assert_eq!(ok, "exit=0");
     }
 
     #[test]
     fn brief_fallback_for_unparseable_or_empty() {
-        assert!(window_use_output_brief("not json").is_none());
-        assert!(window_use_output_brief("[]").is_none());
+        assert!(window_use_output_brief("", "not json").is_none());
+        assert!(window_use_output_brief("", "[]").is_none());
         // 纯 ok:true 无任何关键字段 → None(调用方回退截断)
-        assert!(window_use_output_brief(r#"{"ok": true}"#).is_none());
+        assert!(window_use_output_brief("", r#"{"ok": true}"#).is_none());
         // ocr blocks
-        let b = window_use_output_brief(r#"{"block_count": 42}"#).unwrap();
+        let b = window_use_output_brief("", r#"{"block_count": 42}"#).unwrap();
         assert_eq!(b, "blocks=42");
     }
 
@@ -143,11 +143,11 @@ mod tests {
     fn brief_input_batch_round90() {
         // 第 90 轮:input_batch 摘要 steps=成功/总数。
         let out = r#"{"ok": true, "action": "input_batch", "steps_total": 5, "steps_ok": 5}"#;
-        let b = window_use_output_brief(out).unwrap();
+        let b = window_use_output_brief("", out).unwrap();
         assert!(b.contains("steps=5/5"), "{b}");
         // 部分失败
         let out = r#"{"ok": false, "action": "input_batch", "steps_total": 4, "steps_ok": 2}"#;
-        let b = window_use_output_brief(out).unwrap();
+        let b = window_use_output_brief("", out).unwrap();
         assert!(b.contains("steps=2/4"), "{b}");
     }
 
@@ -155,14 +155,14 @@ mod tests {
     fn brief_run_sequence_round91() {
         // 第 91 轮:run_sequence 摘要 steps + focus_lost + retries。
         let out = r#"{"ok": true, "action": "run_sequence", "steps_total": 12, "steps_ok": 12, "focus_lost_count": 1, "retried_steps": 2, "focus_aborted": false}"#;
-        let b = window_use_output_brief(out).unwrap();
+        let b = window_use_output_brief("", out).unwrap();
         assert!(b.contains("steps=12/12"), "{b}");
         assert!(b.contains("focus_lost=1"), "{b}");
         assert!(b.contains("retries=2"), "{b}");
         assert!(!b.contains("focus_aborted"), "{b}");
         // 止损中止
         let out = r#"{"ok": false, "action": "run_sequence", "steps_total": 7, "steps_ok": 4, "focus_lost_count": 3, "retried_steps": 0, "focus_aborted": true}"#;
-        let b = window_use_output_brief(out).unwrap();
+        let b = window_use_output_brief("", out).unwrap();
         assert!(b.contains("steps=4/7"), "{b}");
         assert!(b.contains("focus_aborted!"), "{b}");
     }
