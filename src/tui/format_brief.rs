@@ -7,12 +7,13 @@
 
 use super::format::truncate_chars;
 
-/// MCP_Window_Use 成功输出的关键字段摘要(第 88 轮)。
+/// MCP_Window_Use 成功输出的关键字段摘要(第 88 轮;第 90 轮 +input_batch)。
 ///
 /// 原始 output_summary 是 pretty JSON,截 80 字只看得到 `"ok": true` 前缀噪声。
 /// 这里按 action 产物提取排查最关心的字段(解析失败回退 None → 调用方截断):
 /// - chat_send:`route / verified / frontmost_acquired`;
 /// - chat_loop:`rounds / sent / replies / focus_aborted`;
+/// - input_batch(第 90 轮):`steps_total / steps_ok`;
 /// - osascript_run:`exit_code / stderr 首行`;
 /// - ocr:`block_count`;open/find:`window_id`;任意失败:`error`。
 pub(crate) fn window_use_output_brief(output_summary: &str) -> Option<String> {
@@ -32,6 +33,11 @@ pub(crate) fn window_use_output_brief(output_summary: &str) -> Option<String> {
         if let Some(fm) = get_b("frontmost_acquired") {
             parts.push(format!("frontmost={}", if fm { "✓" } else { "✗" }));
         }
+    }
+    // 第 90 轮:input_batch 批处理摘要(总步数 / 成功步数)。
+    if let Some(total) = get_n("steps_total") {
+        let ok = get_n("steps_ok").unwrap_or(0);
+        parts.push(format!("steps={ok}/{total}"));
     }
     if let Some(sent) = get_n("total_sent") {
         parts.push(format!(
@@ -116,5 +122,17 @@ mod tests {
         // ocr blocks
         let b = window_use_output_brief(r#"{"block_count": 42}"#).unwrap();
         assert_eq!(b, "blocks=42");
+    }
+
+    #[test]
+    fn brief_input_batch_round90() {
+        // 第 90 轮:input_batch 摘要 steps=成功/总数。
+        let out = r#"{"ok": true, "action": "input_batch", "steps_total": 5, "steps_ok": 5}"#;
+        let b = window_use_output_brief(out).unwrap();
+        assert!(b.contains("steps=5/5"), "{b}");
+        // 部分失败
+        let out = r#"{"ok": false, "action": "input_batch", "steps_total": 4, "steps_ok": 2}"#;
+        let b = window_use_output_brief(out).unwrap();
+        assert!(b.contains("steps=2/4"), "{b}");
     }
 }

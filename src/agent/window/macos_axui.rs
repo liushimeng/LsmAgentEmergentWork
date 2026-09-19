@@ -204,11 +204,15 @@ impl WindowDriver for MacosAxuiDriver {
                 Ok("scrolled_to_visible".into())
             }
             // 2026-09-17 第 70 轮:第 67 轮坐标动作(视觉路线)在 macos-axui 路径未实现,
-            // 返回结构化引导(默认构建走 legacy 驱动,第 69 轮起已支持 CGEvent 全套坐标动作)。
+            // 返回结构化引导(默认构建走 legacy 驱动,第 69 轮起已支持 CGEvent 全套坐标动作;
+            // 第 90 轮起含 move_point / middle_click_point / drag_point / modifiers 新原语)。
             point @ (ControlAction::ClickPoint { .. }
             | ControlAction::DoubleClickPoint { .. }
             | ControlAction::RightClickPoint { .. }
-            | ControlAction::ScrollPoint { .. }) => {
+            | ControlAction::ScrollPoint { .. }
+            | ControlAction::MovePoint { .. }
+            | ControlAction::MiddleClickPoint { .. }
+            | ControlAction::DragPoint { .. }) => {
                 return Err(platform_err(
                     self.platform_name(),
                     format!(

@@ -32,6 +32,204 @@ impl Default for FallbackDriver {
     }
 }
 
+/// xdotool 单命令执行(失败转结构化错误)。
+fn xdotool(args: &[&str]) -> Result<()> {
+    let status = Command::new("xdotool")
+        .args(args)
+        .status()
+        .map_err(|e| platform_err("fallback", format!("执行 xdotool 失败: {e}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(platform_err(
+            "fallback",
+            format!("xdotool {} 退出码 {:?}", args.join(" "), status.code()),
+        ))
+    }
+}
+
+/// 修饰键规格 → xdotool 键名序列(第 90 轮;空规格 → 空序列)。
+fn xdotool_mod_names(spec: Option<&str>) -> Result<Vec<&str>> {
+    let Some(s) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for seg in s.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+        let name = match seg.to_lowercase().as_str() {
+            "ctrl" | "control" => "ctrl",
+            "shift" => "shift",
+            "alt" | "option" | "opt" => "alt",
+            "win" | "meta" | "cmd" | "command" => "super",
+            other => {
+                return Err(platform_err(
+                    "fallback",
+                    format!("modifiers 段无法识别: {other:?}(仅允许 ctrl/shift/alt/win 组合)"),
+                ))
+            }
+        };
+        out.push(name);
+    }
+    Ok(out)
+}
+
+impl FallbackDriver {
+    /// 第 90 轮:坐标/鼠标原语(xdotool)。返回 Ok(Some(文案)) 表示已处理;
+    /// Ok(None) 表示该动作不是坐标原语,交回上层原有链路(scroll/type_text/...)。
+    ///
+    /// 支持:click_point(含 modifiers)/ double_click_point / right_click_point /
+    /// middle_click_point / move_point / drag_point / scroll_point。
+    fn act_point_action(&self, action: &ControlAction) -> Result<Option<String>> {
+        let need_xdotool = || -> Result<()> {
+            if self.has_xdotool {
+                Ok(())
+            } else {
+                Err(platform_err(
+                    self.platform_name(),
+                    "坐标鼠标动作需要 xdotool(可 sudo apt install xdotool)",
+                ))
+            }
+        };
+        // 修饰键包裹:keydown 序列 → 动作 → keyup 逆序
+        let with_mods = |mods: &[&str], body: &[&str]| -> Result<()> {
+            for m in mods {
+                xdotool(&["keydown", m])?;
+            }
+            let r = xdotool(body);
+            for m in mods.iter().rev() {
+                let _ = xdotool(&["keyup", m]);
+            }
+            r
+        };
+        match action {
+            ControlAction::ClickPoint {
+                x,
+                y,
+                modifiers,
+            } => {
+                need_xdotool()?;
+                let mods = xdotool_mod_names(modifiers.as_deref())?;
+                let xs = x.to_string();
+                let ys = y.to_string();
+                with_mods(&mods, &["mousemove", &xs, &ys])?;
+                xdotool(&["click", "1"])?;
+                Ok(Some(format!(
+                    "已在 ({x},{y}) 执行左键单击(xdotool,route=physical{})",
+                    modifiers
+                        .as_deref()
+                        .map(|m| format!(" + 按住 {m}"))
+                        .unwrap_or_default()
+                )))
+            }
+            ControlAction::DoubleClickPoint {
+                x,
+                y,
+                modifiers,
+            } => {
+                need_xdotool()?;
+                let mods = xdotool_mod_names(modifiers.as_deref())?;
+                let xs = x.to_string();
+                let ys = y.to_string();
+                with_mods(&mods, &["mousemove", &xs, &ys])?;
+                xdotool(&["click", "--repeat", "2", "--delay", "80", "1"])?;
+                Ok(Some(format!(
+                    "已在 ({x},{y}) 执行双击(xdotool,route=physical{})",
+                    modifiers
+                        .as_deref()
+                        .map(|m| format!(" + 按住 {m}"))
+                        .unwrap_or_default()
+                )))
+            }
+            ControlAction::RightClickPoint {
+                x,
+                y,
+                modifiers,
+            } => {
+                need_xdotool()?;
+                let mods = xdotool_mod_names(modifiers.as_deref())?;
+                let xs = x.to_string();
+                let ys = y.to_string();
+                with_mods(&mods, &["mousemove", &xs, &ys])?;
+                xdotool(&["click", "3"])?;
+                Ok(Some(format!(
+                    "已在 ({x},{y}) 执行右键单击(xdotool,route=physical{})",
+                    modifiers
+                        .as_deref()
+                        .map(|m| format!(" + 按住 {m}"))
+                        .unwrap_or_default()
+                )))
+            }
+            ControlAction::MiddleClickPoint { x, y } => {
+                need_xdotool()?;
+                let xs = x.to_string();
+                let ys = y.to_string();
+                xdotool(&["mousemove", &xs, &ys])?;
+                xdotool(&["click", "2"])?;
+                Ok(Some(format!(
+                    "已在 ({x},{y}) 执行中键单击(xdotool,route=physical)"
+                )))
+            }
+            ControlAction::MovePoint { x, y } => {
+                need_xdotool()?;
+                let xs = x.to_string();
+                let ys = y.to_string();
+                xdotool(&["mousemove", &xs, &ys])?;
+                Ok(Some(format!("已把光标移动到 ({x},{y})(悬停,xdotool)")))
+            }
+            ControlAction::DragPoint {
+                x,
+                y,
+                x2,
+                y2,
+                modifiers,
+            } => {
+                need_xdotool()?;
+                let mods = xdotool_mod_names(modifiers.as_deref())?;
+                let fx = x.to_string();
+                let fy = y.to_string();
+                let tx = x2.to_string();
+                let ty = y2.to_string();
+                for m in &mods {
+                    xdotool(&["keydown", m])?;
+                }
+                let r = (|| -> Result<()> {
+                    xdotool(&["mousemove", &fx, &fy])?;
+                    xdotool(&["mousedown", "1"])?;
+                    xdotool(&["mousemove", "--sync", &tx, &ty])?;
+                    xdotool(&["mouseup", "1"])
+                })();
+                for m in mods.iter().rev() {
+                    let _ = xdotool(&["keyup", m]);
+                }
+                r?;
+                Ok(Some(format!(
+                    "已从 ({x},{y}) 拖拽到 ({x2},{y2})(xdotool,route=physical{})",
+                    modifiers
+                        .as_deref()
+                        .map(|m| format!(" + 按住 {m}"))
+                        .unwrap_or_default()
+                )))
+            }
+            ControlAction::ScrollPoint { x, y, lines } => {
+                need_xdotool()?;
+                let xs = x.to_string();
+                let ys = y.to_string();
+                xdotool(&["mousemove", &xs, &ys])?;
+                // click 4=向上 / 5=向下(x11 鼠标键约定)
+                let button = if *lines > 0 { "4" } else { "5" };
+                for _ in 0..lines.abs().min(100) {
+                    xdotool(&["click", button])?;
+                }
+                Ok(Some(format!(
+                    "已在 ({x},{y}) 滚动 {} 行({},route=physical)",
+                    lines.abs(),
+                    if *lines > 0 { "向上" } else { "向下" }
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 impl FallbackDriver {
     pub fn new() -> Self {
         Self {
@@ -139,6 +337,11 @@ impl WindowDriver for FallbackDriver {
                     status.code()
                 ),
             ));
+        }
+        // ===== 2026-09-19 第 90 轮:鼠标键盘原子能力(xdotool 尽力而为) =====
+        // 坐标动作不依赖控件树(自绘 UI 视觉路线),Linux 走 xdotool 物理注入等价物。
+        if let Some(done) = self.act_point_action(&action)? {
+            return Ok(done);
         }
         // 2026-09-16 第 66 轮:xdotool 滚轮滚动(click 4=向上 / click 5=向下,
         // 先激活窗口再逐行投递;scroll_to_visible 无通用实现,回退小步 scroll)。

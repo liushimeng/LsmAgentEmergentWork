@@ -820,7 +820,7 @@ const MCP_WINDOW_USE_PROMPT_SECTION: &str = r#"
 当任务涉及「读取/操作桌面软件窗口」(枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本,
 如微信/钉钉/记事本等桌面应用)时,使用 MCP_Window_Use 工具(单工具 + action 分发):
 open(启动/激活应用)→ list/find(定位 window_id)→ inspect 或 ocr(理解界面)→
-control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与用法见工具 description。
+control/input_batch/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与用法见工具 description。
 
 【启动应用 —— 必须传 bundle_id 或中文别名】
 1. 微信/钉钉/飞书 等桌面应用,CFBundleName 与中文 DisplayName 不一致,
@@ -927,6 +927,27 @@ control/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与
     支持 `cmd/ctrl/alt/shift+键` 组合与字母/数字键 —— 微信搜索联系人首选
     `send_keys(text="cmd+f")` → `type_text(text="联系人名")` → `send_keys(text="enter")`;
     也支持 cmd+enter / ctrl+shift+t 等。
+15. **操作优先级链(2026-09-19 第 90 轮)**:control 的控件树路线内建四层优先级:
+    T1 系统无障碍 API(Windows UIA Pattern / macOS AX action,语义级,不抢焦点)
+    → T2 Windows 消息(BM_CLICK / WM_SETTEXT / WM_GETTEXT / PostMessage 按键)
+    → T3 物理鼠标键盘(SendInput / CGEvent,自绘 UI 唯一可靠路径,兜底)。
+    你不需要手工选层 —— 驱动自动降级;返回文案中的 `route=uia / win32_msg / physical`
+    标注实际路线,复查与报告时引用它即可。
+16. **鼠标键盘原子能力(第 90 轮)**:`control_action=move_point`(悬停)、
+    `middle_click_point`(中键)、`drag_point`(拖拽:x/y 起点 + x2/y2 终点);
+    `modifiers="ctrl"/"ctrl+shift"/"alt"/"win"` 参数配合 click_point/double_click_point/
+    right_click_point/drag_point 实现**修饰键 + 鼠标同时操作**(ctrl+点击多选、
+    shift+点击区选、ctrl+拖拽复制)。坐标来自 ocr 的 screen_cx/screen_cy 或
+    窗口 bounds 比例估算。
+17. **input_batch 复合步骤(第 90 轮)**:需要 3 步以上连续鼠标/键盘/控件操作时,
+    用 `action=input_batch(window_id, steps=[...])` 一次调用编排全部步骤
+    (一次前台守卫,步骤间零返场零焦点竞态):steps 元素 op ∈ mouse_move / mouse_click
+    (button/clicks/modifiers)/ mouse_drag / mouse_scroll / key_press(keys 支持 ctrl+a 等
+    组合)/ type_text / click(path)/ set_text(path,text)/ get_text(path,key —— 读取值
+    直接出现在返回 results 里,无需二次调用)/ wait(ms)。典型范式:清空并重填输入框
+    `[mouse_click 输入框, key_press ctrl+a, type_text 新文本, key_press enter]`;
+    滑块拉满 `[mouse_drag x,y → x2,y2]`;多选 `[mouse_click+modifiers=ctrl, mouse_click+modifiers=ctrl]`。
+    steps ≤ 40、整批 ≤ 60s;默认失败即停,可 continue_on_error=true。
 "#;
 
 // =================== MCP_Web_Use 工具使用说明(2026-09-18 第 89 轮) ===================

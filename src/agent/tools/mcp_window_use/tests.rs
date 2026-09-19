@@ -95,6 +95,7 @@ fn tool_def_schema_has_action_enum() {
         "osascript_run",
         "chat_send",
         "chat_loop",
+        "input_batch",
     ] {
         assert!(actions.contains(&expected), "缺少 action={expected}");
     }
@@ -104,6 +105,48 @@ fn tool_def_schema_has_action_enum() {
     assert!(t.description().contains("权限矩阵"));
     // 第 86 轮新增:capability_probe_first 原则
     assert!(t.description().contains("capability_probe_first"));
+    // 第 90 轮:鼠标键盘原子能力 + input_batch + 优先级链说明
+    assert!(t.description().contains("move_point"));
+    assert!(t.description().contains("drag_point"));
+    assert!(t.description().contains("modifiers"));
+    assert!(t.description().contains("input_batch"));
+    assert!(t.description().contains("无障碍 API"), "应说明优先级链");
+    // control_action 枚举含第 90 轮新值
+    let cas = params["properties"]["control_action"]["enum"]
+        .as_array()
+        .expect("control_action 应为枚举");
+    let cas: Vec<&str> = cas.iter().filter_map(Value::as_str).collect();
+    for expected in ["move_point", "middle_click_point", "drag_point", "click_point", "type_text_submit"] {
+        assert!(cas.contains(&expected), "缺少 control_action={expected}");
+    }
+    // 第 90 轮新参数
+    for key in ["modifiers", "x2", "y2", "steps", "continue_on_error"] {
+        assert!(
+            params["properties"].get(key).is_some(),
+            "缺少参数 {key}"
+        );
+    }
+    // steps 子 Schema:op 枚举 + maxItems
+    let steps = &params["properties"]["steps"];
+    assert_eq!(steps["maxItems"], json!(40));
+    let ops = steps["items"]["properties"]["op"]["enum"]
+        .as_array()
+        .unwrap();
+    let ops: Vec<&str> = ops.iter().filter_map(Value::as_str).collect();
+    for expected in [
+        "mouse_move",
+        "mouse_click",
+        "mouse_drag",
+        "mouse_scroll",
+        "key_press",
+        "type_text",
+        "click",
+        "set_text",
+        "get_text",
+        "wait",
+    ] {
+        assert!(ops.contains(&expected), "缺少 input_batch op={expected}");
+    }
 }
 
 #[test]
@@ -442,6 +485,8 @@ fn expand_window_query_still_works() {
 fn capability_matrix_no_screen_recording_disables_ocr() {
     // 模拟「AX 已授权 + 屏录未授权」场景:OCR/screencapture 全部 false,
     // 但 inspect_control/coordinate_input 仍为 true。
+    // 第 90 轮修复:from_permissions 按**编译期平台**分支,此前断言按 macOS cfg
+    // 写死,Windows 上(此前编译损坏从未跑过)必败;改为按平台分叉断言。
     use crate::agent::window::PermissionReport;
 
     let report = PermissionReport {
@@ -457,10 +502,16 @@ fn capability_matrix_no_screen_recording_disables_ocr() {
     assert!(cap.list_find);
     assert!(cap.inspect_control);
     assert!(cap.coordinate_input);
-    assert!(cap.ax_warmup);
-    // 第 86 轮修正:CGWindowListCreateImage 实测需屏幕录制
-    assert!(!cap.ocr_screenshot_cgwindow);
-    assert!(!cap.screencapture_cli);
+    if cfg!(target_os = "macos") {
+        assert!(cap.ax_warmup);
+        // 第 86 轮修正:CGWindowListCreateImage 实测需屏幕录制
+        assert!(!cap.ocr_screenshot_cgwindow);
+        assert!(!cap.screencapture_cli);
+    } else {
+        // Windows / Linux:无 TCC 门控,GDI 截图 / screencapture CLI 不受屏录影响;
+        // ax_warmup 仅 macOS 有意义。
+        assert!(!cap.ax_warmup);
+    }
 }
 
 #[test]
@@ -667,4 +718,61 @@ fn osascript_exec_timeout_kills_child() {
         "超时 kill 应快速返回,实际 {:?}",
         started.elapsed()
     );
+}
+
+// ========== 第 90 轮:input_batch 参数校验(校验在前台守卫之前,不触驱动) ==========
+
+#[tokio::test]
+async fn input_batch_requires_steps_array() {
+    let t = McpWindowUseTool;
+    // 缺 steps → 结构化报错
+    let err = t
+        .execute(json!({"action": "input_batch", "window_id": "123"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("steps"), "{err}");
+    // steps 空数组 → 报错
+    let err = t
+        .execute(json!({"action": "input_batch", "window_id": "123", "steps": []}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("不能为空"), "{err}");
+    // steps 超上限(41 > 40)→ 报错
+    let too_many: Vec<Value> = (0..41)
+        .map(|i| json!({"op": "wait", "ms": 1, "i": i}))
+        .collect();
+    let err = t
+        .execute(json!({"action": "input_batch", "window_id": "123", "steps": too_many}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("超上限"), "{err}");
+}
+
+#[test]
+fn control_action_parse_round90_tool_level() {
+    use crate::agent::window::ControlAction;
+    // drag_point 缺 x2/y2 → 结构化报错(文案点名参数)
+    let err = ControlAction::parse_ext(
+        "drag_point",
+        None,
+        Some(1),
+        Some(2),
+        None,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("x2 / y2"), "{err}");
+    // modifiers 非法段报错
+    let err = ControlAction::parse_ext(
+        "click_point",
+        None,
+        Some(1),
+        Some(2),
+        None,
+        None,
+        Some("ctrl+banana".into()),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("modifiers"), "{err}");
 }

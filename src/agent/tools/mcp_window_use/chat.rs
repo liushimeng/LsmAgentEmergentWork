@@ -250,7 +250,7 @@ pub(super) async fn run_capability_probe(_args: Value) -> Result<String> {
 // 独立 stderr;try_wait 轮询 + 超时 kill。
 
 /// osascript 一次执行的结构化结果。
-#[cfg(target_os = "macos")]
+/// 第 90 轮:去掉 macOS cfg 门控(非 macOS 存根同样引用本类型,否则 Windows 编译损坏)。
 #[derive(Debug, Clone)]
 pub(super) struct OsascriptOutcome {
     /// 退出码为 0。
@@ -317,6 +317,20 @@ pub(super) fn osascript_exec(script: &str, timeout_ms: u64) -> Result<OsascriptO
             }
         }
     }
+}
+
+/// 非 macOS 平台的 `osascript_exec` 存根(2026-09-19 第 90 轮补:
+/// 第 88 轮把实现加了 `#[cfg(target_os = "macos")]` 但三个调用点
+/// (run_osascript_fallback_send)未门控,Windows 编译损坏)。
+///
+/// Windows / Linux 上 osascript_fallback 路线在选择层(`run_chat_send` 路线
+/// 分派)就不会被选中,本存根仅为编译完整性;被误调时返回结构化错误。
+#[cfg(not(target_os = "macos"))]
+pub(super) fn osascript_exec(_script: &str, _timeout_ms: u64) -> Result<OsascriptOutcome> {
+    Err(tool_err(
+        MCP_WINDOW_USE_TOOL_NAME,
+        "osascript 仅 macOS 可用;Windows 请改用 control(send_keys/type_text)或 PowerShell",
+    ))
 }
 
 /// `action=osascript_run` —— 直接执行 AppleScript 片段,绕开 BashTool 白名单。
@@ -607,7 +621,11 @@ async fn run_driver_send(
                 driver.act(
                     &window_id_owned,
                     "/",
-                    crate::agent::window::ControlAction::ClickPoint { x: cx, y: cy },
+                    crate::agent::window::ControlAction::ClickPoint {
+                        x: cx,
+                        y: cy,
+                        modifiers: None,
+                    },
                 )?;
                 std::thread::sleep(Duration::from_millis(CHAT_SEND_TYPE_DELAY_MS));
                 driver.act(
@@ -808,7 +826,11 @@ async fn run_osascript_fallback_send(
             current_driver().act(
                 &wid,
                 "/",
-                crate::agent::window::ControlAction::ClickPoint { x: px, y: py },
+                crate::agent::window::ControlAction::ClickPoint {
+                    x: px,
+                    y: py,
+                    modifiers: None,
+                },
             )?;
             Ok(format!("{px},{py}"))
         })

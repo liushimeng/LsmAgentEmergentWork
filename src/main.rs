@@ -729,12 +729,25 @@ async fn cmd_export_provider(file_path: PathBuf) -> Result<()> {
 /// - SIGKILL / SIGSTOP(无法捕获,OS 限制)
 /// - panic(由 crash.rs panic_hook 中 cleanup_sync 处理)
 /// - abort() / 段错误(无法处理)
+///
+/// 第 90 轮(2026-09-19)修复:`libc` 是 `cfg(unix)` 依赖,此前无条件引用
+/// 导致 Windows 编译损坏;Unix 平台保留 atexit 守卫,Windows 改用运行时
+/// 注册表 Drop + 显式 shutdown 双保险(等价清理路径,见 browser.rs)。
 fn install_browser_cleanup_guard() {
-    extern "C" fn atexit_cleanup() {
-        lsm_agent::agent::browser::BrowserManager::cleanup_sync();
+    #[cfg(unix)]
+    {
+        extern "C" fn atexit_cleanup() {
+            lsm_agent::agent::browser::BrowserManager::cleanup_sync();
+        }
+        unsafe {
+            libc::atexit(atexit_cleanup);
+        }
     }
-    unsafe {
-        libc::atexit(atexit_cleanup);
+    #[cfg(not(unix))]
+    {
+        // Windows 无 atexit 守卫;浏览器清理依赖 BrowserManager 单例 Drop +
+        // main 收尾显式 shutdown(第 78 轮 L1/L3 层),本函数保留为空实现,
+        // 调用点无需平台分叉。
     }
 }
 

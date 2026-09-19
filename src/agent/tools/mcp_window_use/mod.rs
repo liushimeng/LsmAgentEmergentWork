@@ -27,6 +27,7 @@ use crate::error::{AgentError, Result};
 
 mod chat;
 mod inspect;
+mod input_batch;
 mod open;
 mod query;
 mod vision;
@@ -282,15 +283,21 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
 - list(filter?): 枚举当前桌面全部可见顶层窗口(id/title/进程名/PID/位置尺寸)。macOS 走 CoreGraphics,不需要任何授权。
 - find(query*, match_mode?): 按标题/进程名子串找单一最佳窗口,直接返回 window_id(exact/contains/fuzzy,默认 contains)。
 - inspect(window_id*, max_depth?, filter?): 枚举窗口控件树(Windows UIA / macOS AX),每个控件含 path(如 /0/2/1)/role/name/value/bounds/actions。需要 macOS 辅助功能授权。
-- control(window_id*, path*, control_action*, text?, x?, y?): 对窗口执行操作,双路线——
-  控件树路线(原生 UI):path 取 inspect 返回的控件路径,control_action=click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible(send_keys 第 87 轮起支持 cmd/ctrl/alt/shift 组合键与字母/数字键,如 cmd+f 微信搜索联系人);
-  视觉坐标路线(自绘 UI,如微信 4.x 控件树为空):control_action=click_point/double_click_point/right_click_point/scroll_point/type_text/type_text_submit,x/y 传屏幕绝对坐标(取 ocr 返回的 screen_cx/screen_cy),path 照传 "/"。
+- control(window_id*, path*, control_action*, text?, x?, y?, x2?, y2?, modifiers?): 对窗口执行操作,双路线——
+  控件树路线(原生 UI,**无障碍 API → Windows 消息 → 物理鼠标键盘 兜底的优先级链**,返回文案 route= 标注实际路线):path 取 inspect 返回的控件路径,control_action=click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible(send_keys 第 87 轮起支持 cmd/ctrl/alt/shift 组合键与字母/数字键,如 cmd+f 微信搜索联系人);
+  视觉坐标路线(自绘 UI,如微信 4.x 控件树为空;物理鼠标键盘注入):control_action=click_point/double_click_point/right_click_point/scroll_point/type_text/type_text_submit + **第 90 轮新增 move_point(悬停)/ middle_click_point(中键)/ drag_point(拖拽,x/y 起点 + x2/y2 终点)**;x/y 传屏幕绝对坐标(取 ocr 返回的 screen_cx/screen_cy),path 照传 "/";
+  **modifiers**(第 90 轮新增,"ctrl"/"ctrl+shift" 等):修饰键 + 鼠标同时操作 —— ctrl+click_point 多选 / shift+click_point 区选 / ctrl+drag_point 拖拽复制。
 - ocr(window_id*, region?, lang?): 窗口 OCR 文字识别,返回词块文本 + 窗口相对坐标 + 屏幕绝对坐标(视觉路线入口)。**macOS 26.5 实测需要屏幕录制授权**(CGWindowListCreateImage + Vision 都走 TCC 屏录门控,屏录未授权时返回空);screen_recording=false 时直接改走 chat_send(osascript_fallback)。
 - screenshot(window_id?, output_path?, region?): 截图落盘 PNG,返回路径。只做截图不做识别;需要识别文字一律用 ocr。macOS 上需要屏幕录制授权(屏录未授权时 screencapture 也失败)。
 - capability_probe(): **第 86 轮新增**——返回当前进程真实能力矩阵 `{accessibility, screen_recording, ocr_screenshot_cgwindow, screencapture_cli, inspect_control, coordinate_input, ax_warmup}` 与 next_action 推荐;LLM 第一步必须先调此 action,再决定走 AX/视觉/osascript_fallback 哪条路线。无参数。
 - osascript_run(osascript_script*, timeout_ms?): **第 86 轮新增,第 88 轮重写**——直接调 osascript 执行 AppleScript 片段,无需走 BashTool(绕开白名单)。macOS only。**argv 直传不经 shell**:脚本内双引号/反斜杠/多行 tell 块原样生效,不要再做 shell 转义;返回真实 exit_code + stderr,ok=false 时先按 stderr 修正脚本重试,**禁止改用 BashTool 执行 osascript 绕行**(窗口操控必须全程 MCP_Window_Use)。LLM 需要 System Events 键盘注入等场景使用。
 - chat_send(window_id*, text*, click_point?, input_field_path?, submit_key?, verify?, chat_log_path?): **复合 action**——一次调用完成「前置窗口 + 前台守卫 + 点击输入框 + Unicode 键入 + Enter + OCR 验证发送」,自动按 WindowCapability 选路线(控件树 / 视觉坐标 / osascript_fallback / 降级提示)。微信/钉钉/飞书 发送消息首选。**第 88 轮新增前台焦点守卫**:所有路线发送前先把目标窗口前置并轮询确认 frontmost,1.5s 拿不到前台就报 focus_acquire 失败**不盲打**(防止用户切窗后消息打进别的软件);osascript_fallback 路线 keystroke 前自动按窗口 bounds 比例估算点击右下输入框聚焦,Enter 前二次校验前台。**第 86 轮新增 osascript_fallback 路线**(AX 已授权 + 屏录未授权时,走 System Events keystroke,不依赖截图)。**chat_log_path 指定后,每条 send/recv/fail/focus_lost 落盘到该文件**。
 - chat_loop(window_id*, messages*, interval_seconds?, max_rounds?, reply_detect?, stop_on_reply?, target_query?, chat_log_path?): **复合 action**——长时多轮会话循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent, replies, reply_rate, focus_aborted, log}`。LLM 一次调用就能跑 N 轮聊天。**第 88 轮新增:连续 3 轮前台守卫失败自动止损中止**(focus_aborted=true),防止用户离开期间消息误发到其他软件。**chat_log_path 同样支持**。
+- input_batch(window_id*, steps*, continue_on_error?): **第 90 轮新增复合 action**——一次调用编排「鼠标 + 键盘 + 控件树」任意顺序多步操作(同时操作鼠标键盘的统一入口),一次前台守卫 + 批量执行,步骤间零返场零焦点竞态。steps 数组每步 {\"op\":...}:
+  鼠标:mouse_move{x,y} / mouse_click{x,y,button?=left|right|middle,clicks?=1|2,modifiers?} / mouse_drag{x,y,x2,y2,modifiers?} / mouse_scroll{x,y,direction?=down,lines?=3};
+  键盘:key_press{keys}(组合键如 ctrl+a) / type_text{text};
+  控件树(自动走无障碍→消息→物理优先级链):click{path} / set_text{path,text} / get_text{path,key?}(读取值进 results 回传);
+  wait{ms}(≤5000)。每步可选 delay_ms(≤2000);steps ≤ 40;整批 ≤ 60s;默认失败即停,continue_on_error=true 继续。典型:点输入框→ctrl+a→type_text→enter 一次完成;滑块/文件用 mouse_drag;多选用 mouse_click+modifiers=ctrl。
 
 【第 86 轮 · capability_probe_first 原则】**第一步必须是 `MCP_Window_Use(action=capability_probe)` 拿到真实能力矩阵**,再决定下一步。capability.ocr_screenshot_cgwindow=false 表示截图/OCR 完全不可用,此时**禁止**重试 screenshot/ocr,直接走 `chat_send(osascript_fallback)` 或 `chat_loop`。
 【标准作业顺序】open(应用未启动)→ find/list(定位 window_id)→ capability_probe(拿真实能力)→ inspect 或 ocr(理解界面,前提 cap=true)→ control/chat_send(操作)→ inspect/ocr 复查 / chat_loop(批量会话)。
@@ -316,8 +323,8 @@ impl Tool for McpWindowUseTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "capability_probe", "osascript_run", "chat_send", "chat_loop"],
-                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / capability_probe(第 86 轮新增:探测真实能力矩阵) / osascript_run(第 86 轮新增:执行 AppleScript 片段) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环)"
+                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "capability_probe", "osascript_run", "chat_send", "chat_loop", "input_batch"],
+                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / capability_probe(第 86 轮新增:探测真实能力矩阵) / osascript_run(第 86 轮新增:执行 AppleScript 片段) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环) / input_batch(第 90 轮新增:鼠标+键盘+控件树复合步骤批处理)"
                 },
                 "query": { "type": "string", "description": "open/find 必填:应用名或窗口标题/进程名查询词(大小写不敏感,支持中英文别名)" },
                 "app_name": { "type": "string", "description": "open 可选:启动用应用名或完整路径,缺省=query" },
@@ -332,13 +339,17 @@ impl Tool for McpWindowUseTool {
                     "type": "string",
                     "enum": [
                         "click", "invoke", "focus", "set_text", "get_text", "send_keys", "scroll", "scroll_to_visible",
-                        "click_point", "double_click_point", "right_click_point", "scroll_point", "type_text", "type_text_submit"
+                        "click_point", "double_click_point", "right_click_point", "scroll_point", "type_text", "type_text_submit",
+                        "move_point", "middle_click_point", "drag_point"
                     ],
-                    "description": "control 必填:控件树路线(click/set_text/get_text/send_keys/scroll 等)或视觉坐标路线(click_point/type_text_submit 等)"
+                    "description": "control 必填:控件树路线(click/set_text/get_text/send_keys/scroll 等,无障碍→消息→物理优先级链)或视觉坐标路线(click_point/type_text_submit/move_point 悬停/middle_click_point 中键/drag_point 拖拽等)"
                 },
                 "text": { "type": "string", "description": "control/chat_send 必填:set_text/send_keys/type_text/type_text_submit/chat_send 的文本;scroll/scroll_point 传方向行数(如 \"down:3\")" },
-                "x": { "type": "integer", "description": "control 坐标动作必填:屏幕绝对 X(取 ocr 返回的 screen_cx 中心)" },
-                "y": { "type": "integer", "description": "control 坐标动作必填:屏幕绝对 Y(取 ocr 返回的 screen_cy 中心)" },
+                "x": { "type": "integer", "description": "control 坐标动作必填:屏幕绝对 X(取 ocr 返回的 screen_cx 中心;drag_point 为起点 X)" },
+                "y": { "type": "integer", "description": "control 坐标动作必填:屏幕绝对 Y(取 ocr 返回的 screen_cy 中心;drag_point 为起点 Y)" },
+                "x2": { "type": "integer", "description": "第 90 轮新增:drag_point 必填,拖拽终点屏幕绝对 X" },
+                "y2": { "type": "integer", "description": "第 90 轮新增:drag_point 必填,拖拽终点屏幕绝对 Y" },
+                "modifiers": { "type": "string", "description": "第 90 轮新增:修饰键规格(\"ctrl\" / \"ctrl+shift\" / \"alt\" / \"win\"),作用于 click_point/double_click_point/right_click_point/drag_point —— 按住修饰键执行鼠标操作(ctrl+点击多选 / shift+点击区选 / ctrl+拖拽复制),键盘与鼠标同时操作" },
                 "region": {
                     "type": "object",
                     "properties": {
@@ -377,7 +388,34 @@ impl Tool for McpWindowUseTool {
                 "target_query": { "type": "string", "description": "chat_loop 可选:对话对象名字,用于 OCR 检测对方回复" },
                 "chat_log_path": { "type": "string", "description": "chat_send/chat_loop 可选:每次 send/recv/fail 落盘的工作日志文件绝对路径;默认 <工作目录>/llaew_chat_<unix_ts>.log。QC 可 grep `[SEND]`/`[RECV]`/`[FAIL]` 行验证(第 86 轮新增)" },
                 "osascript_script": { "type": "string", "description": "osascript_run 必填:要执行的 AppleScript 片段(第 88 轮起 argv 直传 osascript -e,不经 shell;双引号/多行 tell 块原样书写,不要做 shell 转义;macOS only)" },
-                "osascript_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "description": "osascript_run 可选:超时毫秒,默认 5000" }
+                "osascript_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "description": "osascript_run 可选:超时毫秒,默认 5000" },
+                "steps": {
+                    "type": "array",
+                    "maxItems": 40,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": { "type": "string", "enum": ["mouse_move", "mouse_click", "mouse_drag", "mouse_scroll", "key_press", "type_text", "click", "set_text", "get_text", "wait"], "description": "步骤类型(第 90 轮)" },
+                            "x": { "type": "integer" }, "y": { "type": "integer" },
+                            "x2": { "type": "integer" }, "y2": { "type": "integer" },
+                            "button": { "type": "string", "enum": ["left", "right", "middle"] },
+                            "clicks": { "type": "integer", "minimum": 1, "maximum": 2 },
+                            "modifiers": { "type": "string" },
+                            "direction": { "type": "string", "enum": ["up", "down"] },
+                            "lines": { "type": "integer", "minimum": 1, "maximum": 100 },
+                            "keys": { "type": "string", "description": "key_press:单键或组合键(如 ctrl+a / enter / cmd+f)" },
+                            "text": { "type": "string", "description": "type_text / set_text 文本" },
+                            "path": { "type": "string", "description": "click / set_text / get_text 控件路径(取 action=inspect)" },
+                            "key": { "type": "string", "description": "get_text 读取值在 results 中的键名(缺省用 path)" },
+                            "ms": { "type": "integer", "minimum": 0, "maximum": 5000, "description": "wait 毫秒数" },
+                            "delay_ms": { "type": "integer", "minimum": 0, "maximum": 2000, "description": "本步执行前等待毫秒" }
+                        },
+                        "required": ["op"],
+                        "additionalProperties": false
+                    },
+                    "description": "input_batch 必填:操作步骤数组(第 90 轮,鼠标+键盘+控件树混合编排,一次前台守卫批量执行)"
+                },
+                "continue_on_error": { "type": "boolean", "description": "input_batch 可选:步骤失败后继续执行后续步骤(默认 false 即 fail-fast 停止)" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -401,10 +439,12 @@ impl Tool for McpWindowUseTool {
             // 把长时多轮会话循环封装成 1 次工具调用)。
             "chat_send" => chat::run_chat_send(args).await,
             "chat_loop" => chat::run_chat_loop(args).await,
+            // 2026-09-19 第 90 轮:鼠标 + 键盘 + 控件树复合步骤动作(同时操作鼠标键盘)。
+            "input_batch" => input_batch::run_input_batch(args).await,
             other => Err(tool_err(
                 self.name(),
                 format!(
-                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send / chat_loop"
+                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send / chat_loop / input_batch"
                 ),
             )),
         }

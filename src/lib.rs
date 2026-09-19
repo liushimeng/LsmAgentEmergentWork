@@ -8,6 +8,10 @@
 //! - [`tui`]:   交互式 REPL
 //! - [`error`]: 统一错误类型
 
+// 2026-09-19 第 90 轮:MCP_Window_Use 的 input_batch steps 嵌套 Schema 使
+// serde_json::json! 宏展开超过默认递归上限(128),提升到 256。
+#![recursion_limit = "256"]
+
 pub mod agent;
 pub mod config;
 pub mod crash;

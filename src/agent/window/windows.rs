@@ -6,12 +6,17 @@
 //! - 控件遍历:UIA(`CoCreateInstance(CUIAutomation)` → `ElementFromHandle` →
 //!   RawViewWalker 深度遍历),覆盖 Win32 原生 / WPF / Qt(带 UIA Provider)等;
 //!   UIA 初始化失败时降级 `GetWindow(GW_CHILD/HWNDNEXT)` 递归枚举子 HWND;
-//! - 操作决策链(2026-09-16 第 67 轮重排,自绘 UI 优先真实输入):
-//!   - click:UIA Invoke → 元素中心 SendInput 物理点击(前台化)→ BM_CLICK;
-//!   - set_text:UIA ValuePattern → focus + SendInput 逐字键入 → WM_SETTEXT;
-//!   - send_keys:force_foreground + SendInput(组合键已实装);
-//!   - scroll:控件中心 SendInput 滚轮 → WM_MOUSEWHEEL 兜底;
-//!   - 坐标动作(ClickPoint/ScrollPoint/TypeText):直接走 SendInput 底座;
+//! - 操作决策链(2026-09-19 第 90 轮重构为四层优先级:**无障碍 UIA → Win32 消息 →
+//!   SendInput 物理输入兜底**;设计见 `docs/MCP_Window_Use/02-鼠标键盘操控与优先级链方案.md`):
+//!   - click:UIA Invoke/Toggle/ExpandCollapse/SelectionItem(T1)→ BM_CLICK(原生 Button 系
+//!     HWND,T2)→ 元素中心物理点击(T3);
+//!   - set_text:UIA ValuePattern(T1)→ WM_SETTEXT(原生 HWND,T2)→ focus+SendInput 逐字键入(T3);
+//!   - get_text:Value/Name(T1)→ WM_GETTEXT(原生 HWND,T2);
+//!   - send_keys:PostMessage WM_KEYDOWN+WM_CHAR+WM_KEYUP(仅原生 HWND,T2)→ SendInput(T3);
+//!   - scroll:UIA ScrollPattern(T1)→ WM_MOUSEWHEEL(T2)→ 物理滚轮(T3);
+//!   - 坐标动作(ClickPoint/ScrollPoint/TypeText/MovePoint/MiddleClick/DragPoint):T3 SendInput
+//!     底座(第 90 轮:支持 modifiers 修饰键点击 + 插值拖拽);
+//!   - 每步返回文案带 route= 标注(uia / win32_msg / physical),QC/Debug 可对账;
 //! - OCR:`windows_ocr::ocr_window`(GDI 截图 + Windows.Media.Ocr);
 //! - `bring_to_front`:`windows_input::force_foreground`(恢复最小化 + 三保险激活)。
 //!
@@ -26,15 +31,20 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-    IUIAutomationScrollItemPattern, IUIAutomationValuePattern, UIA_InvokePatternId,
-    UIA_ScrollItemPatternId, UIA_ValuePatternId,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationExpandCollapsePattern,
+    IUIAutomationInvokePattern, IUIAutomationScrollItemPattern, IUIAutomationScrollPattern,
+    IUIAutomationSelectionItemPattern, IUIAutomationTogglePattern, IUIAutomationValuePattern,
+    ScrollAmount_NoAmount, ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement,
+    UIA_ExpandCollapsePatternId, UIA_InvokePatternId, UIA_ScrollItemPatternId, UIA_ScrollPatternId,
+    UIA_SelectionItemPatternId, UIA_TogglePatternId, UIA_ValuePatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendMessageW,
-    SetForegroundWindow, BM_CLICK, GW_CHILD, GW_HWNDNEXT, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    PostMessageW, SendMessageW, SetForegroundWindow, BM_CLICK, GW_CHILD, GW_HWNDNEXT, WM_CHAR,
+    WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_KEYUP, WM_SETTEXT,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, VIRTUAL_KEY, MAPVK_VK_TO_VSC};
 
 use super::windows_input as winput;
 use super::{
@@ -235,8 +245,116 @@ fn uia_actions(el: &IUIAutomationElement) -> Vec<String> {
         {
             v.push("set_text".into());
         }
+        // 第 90 轮:Toggle(复选框/开关)/ ExpandCollapse(下拉/树节点)/
+        // SelectionItem(列表项)都具备语义化「点击」能力,标注进 actions 供 LLM 决策。
+        if el
+            .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+            .is_ok()
+        {
+            v.push("click".into());
+        }
+        if el
+            .GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId)
+            .is_ok()
+        {
+            v.push("click".into());
+        }
+        if el
+            .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+            .is_ok()
+        {
+            v.push("click".into());
+        }
     }
     v
+}
+
+// ===================== 第 90 轮:T2 消息层辅助(优先级链中间层) =====================
+
+/// UIA 元素的原生 HWND(非空 = 标准 Win32 控件,WM_* 消息路线可用;
+/// 空/读取失败 = 自绘/虚拟元素,只能走 T1 Pattern 或 T3 物理输入)。
+fn uia_native_hwnd(el: &IUIAutomationElement) -> Option<HWND> {
+    // SAFETY:属性读取,失败(自绘 UI)返回 None。
+    let h = unsafe { el.CurrentNativeWindowHandle() }.ok()?;
+    if h.0.is_null() {
+        None
+    } else {
+        Some(h)
+    }
+}
+
+/// HWND 的窗口类名(空串 = 获取失败)。
+fn class_name_of(hwnd: HWND) -> String {
+    // SAFETY:标准类名查询,无副作用。
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// 是否为标准 Button 系类(标准按钮/复选框/单选按钮同为 "Button" 类,BM_CLICK 语义成立)。
+fn is_button_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("Button")
+}
+
+/// 消息级单键投递(WM_KEYDOWN / WM_CHAR / WM_KEYUP)。
+///
+/// lParam 布局:0-15 重复数 1;16-23 扫描码(MapVirtualKeyW);30 上次状态;
+/// 31 转换状态(keyup 置 30|31)。异步 PostMessage,不要求目标响应、不阻塞。
+///
+/// # Safety
+/// `hwnd` 必须有效;`vk` 必须是合法虚拟键码。
+unsafe fn post_key_msg(hwnd: HWND, vk: VIRTUAL_KEY, down: bool) {
+    let scan = MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) as isize;
+    let mut lparam = 1 | (scan << 16);
+    if !down {
+        lparam |= 1 << 30 | 1 << 31; // 上次按下 + 状态转换
+    }
+    let msg = if down { WM_KEYDOWN } else { WM_KEYUP };
+    let _ = PostMessageW(hwnd, msg, WPARAM(vk.0 as usize), LPARAM(lparam));
+}
+
+/// 消息级按键规格投递(2026-09-19 第 90 轮,T2 层):
+/// 修饰键逐个 WM_KEYDOWN → 主键 WM_KEYDOWN(+可打印字符补 WM_CHAR)→ WM_KEYUP →
+/// 修饰键逆序 WM_KEYUP。全部 PostMessage 异步投递,不抢前台焦点。
+///
+/// 仅对**原生 HWND 控件**启用(标准 Win32 应用);Electron/自绘根窗口(无子 HWND)
+/// 保持物理 SendInput 路线,零回归。消息注入对部分应用可能无效且无法感知失败,
+/// 返回文案带 route=win32_msg 标注,QC/Debug 可对账。
+fn post_message_keys(hwnd: HWND, spec: &str) -> Result<()> {
+    let (modifiers, main) = winput::parse_key_spec(spec)?;
+    // SAFETY:hwnd 由 uia_native_hwnd 产出(元素原生 HWND);VK 均为合法常量。
+    unsafe {
+        for m in &modifiers {
+            post_key_msg(hwnd, *m, true);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        post_key_msg(hwnd, main, true);
+        // 可打印 ASCII 主键补 WM_CHAR(字母/数字;ctrl 组合键/命名键不补 ——
+        // Ctrl+X 语义由目标控件按 WM_KEYDOWN 自行解释)
+        if modifiers.is_empty() {
+            let c = main.0 as u8 as char;
+            if main.0 >= 0x30 && main.0 <= 0x5A && c.is_ascii_alphanumeric() {
+                let ch = c.to_ascii_lowercase();
+                let _ = PostMessageW(hwnd, WM_CHAR, WPARAM(ch as usize), LPARAM(1));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        post_key_msg(hwnd, main, false);
+        for m in modifiers.iter().rev() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            post_key_msg(hwnd, *m, false);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    Ok(())
+}
+
+/// 修饰键规格 → SendInput VK 序列(空规格 → 空序列)。
+fn modifier_vks(spec: Option<&str>) -> Result<Vec<VIRTUAL_KEY>> {
+    match spec.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => winput::parse_modifiers(s),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// UIA 递归构建控件树。
@@ -486,7 +604,7 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
     match action {
         ControlAction::Click | ControlAction::Invoke => {
             SendMessageW(hwnd, BM_CLICK, WPARAM(0), LPARAM(0));
-            Ok(format!("已向 HWND {:?} 发送 BM_CLICK", hwnd.0))
+            Ok(format!("已向 HWND {:?} 发送 BM_CLICK(route=win32_msg)", hwnd.0))
         }
         ControlAction::Focus => {
             let _ = SetForegroundWindow(hwnd);
@@ -497,7 +615,7 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
             wide.push(0);
             SendMessageW(hwnd, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
             Ok(format!(
-                "已向 HWND {:?} 写入文本({} 字符)",
+                "已向 HWND {:?} 写入文本({} 字符,route=win32_msg)",
                 hwnd.0,
                 text.chars().count()
             ))
@@ -552,7 +670,7 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
             let wparam = WPARAM(((delta as u16) as usize) << 16);
             SendMessageW(hwnd, WM_MOUSEWHEEL, wparam, LPARAM(0));
             Ok(format!(
-                "已向 HWND {:?} 发送 WM_MOUSEWHEEL({} 行,{})",
+                "已向 HWND {:?} 发送 WM_MOUSEWHEEL({} 行,{},route=win32_msg)",
                 hwnd.0,
                 lines.abs(),
                 if *lines > 0 { "向上" } else { "向下" }
@@ -562,25 +680,72 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
             "windows",
             "Win32 降级路径不支持 scroll_to_visible(UIA 可用时走 ScrollItemPattern;或改用 scroll)",
         )),
-        // 坐标动作与 UIA 无关,直接走 SendInput
-        ControlAction::ClickPoint { x, y } => {
-            winput::click_point(*x, *y, false, false)?;
-            Ok(format!("已在 ({x},{y}) 执行物理左键单击"))
+        // 坐标动作与 UIA 无关,直接走 SendInput(第 90 轮:含 modifiers / 新原语)
+        ControlAction::ClickPoint { x, y, modifiers } => {
+            let mods = modifier_vks(modifiers.as_deref())?;
+            winput::click_point_ex(*x, *y, winput::MouseButton::Left, 1, &mods)?;
+            Ok(format!(
+                "已在 ({x},{y}) 执行物理左键单击{}(route=physical)",
+                modifiers
+                    .as_deref()
+                    .map(|m| format!(" + 按住 {m}"))
+                    .unwrap_or_default()
+            ))
         }
-        ControlAction::DoubleClickPoint { x, y } => {
-            winput::click_point(*x, *y, true, false)?;
-            Ok(format!("已在 ({x},{y}) 执行物理双击"))
+        ControlAction::DoubleClickPoint { x, y, modifiers } => {
+            let mods = modifier_vks(modifiers.as_deref())?;
+            winput::click_point_ex(*x, *y, winput::MouseButton::Left, 2, &mods)?;
+            Ok(format!(
+                "已在 ({x},{y}) 执行物理双击{}(route=physical)",
+                modifiers
+                    .as_deref()
+                    .map(|m| format!(" + 按住 {m}"))
+                    .unwrap_or_default()
+            ))
         }
-        ControlAction::RightClickPoint { x, y } => {
-            winput::click_point(*x, *y, false, true)?;
-            Ok(format!("已在 ({x},{y}) 执行物理右键单击"))
+        ControlAction::RightClickPoint { x, y, modifiers } => {
+            let mods = modifier_vks(modifiers.as_deref())?;
+            winput::click_point_ex(*x, *y, winput::MouseButton::Right, 1, &mods)?;
+            Ok(format!(
+                "已在 ({x},{y}) 执行物理右键单击{}(route=physical)",
+                modifiers
+                    .as_deref()
+                    .map(|m| format!(" + 按住 {m}"))
+                    .unwrap_or_default()
+            ))
         }
         ControlAction::ScrollPoint { x, y, lines } => {
             winput::wheel_at(*x, *y, *lines)?;
             Ok(format!(
-                "已在 ({x},{y}) 滚动 {} 行({})",
+                "已在 ({x},{y}) 滚动 {} 行({})(route=physical)",
                 lines.abs(),
                 if *lines > 0 { "向上" } else { "向下" }
+            ))
+        }
+        // ===== 第 90 轮:鼠标原子能力(悬停 / 中键 / 拖拽) =====
+        ControlAction::MovePoint { x, y } => {
+            winput::move_cursor(*x, *y)?;
+            Ok(format!("已把光标移动到 ({x},{y})(悬停,route=physical)"))
+        }
+        ControlAction::MiddleClickPoint { x, y } => {
+            winput::click_point_ex(*x, *y, winput::MouseButton::Middle, 1, &[])?;
+            Ok(format!("已在 ({x},{y}) 执行物理中键单击(route=physical)"))
+        }
+        ControlAction::DragPoint {
+            x,
+            y,
+            x2,
+            y2,
+            modifiers,
+        } => {
+            let mods = modifier_vks(modifiers.as_deref())?;
+            winput::drag_point(*x, *y, *x2, *y2, &mods)?;
+            Ok(format!(
+                "已从 ({x},{y}) 拖拽到 ({x2},{y2}){}(route=physical)",
+                modifiers
+                    .as_deref()
+                    .map(|m| format!(" + 按住 {m}"))
+                    .unwrap_or_default()
             ))
         }
     }
@@ -671,33 +836,77 @@ impl WindowDriver for WindowsDriver {
                     let el = uia_element_at_path(&uia, &root, path)?;
                     match &action {
                         ControlAction::Click | ControlAction::Invoke => {
-                            match el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(
-                                UIA_InvokePatternId,
-                            ) {
-                                Ok(p) => {
-                                    p.Invoke().map_err(|e| {
-                                        platform_err("windows", format!("Invoke 失败: {e}"))
-                                    })?;
-                                    Ok(format!("已对 {window_id}{path} 执行 Invoke(点击)"))
-                                }
-                                Err(_) => {
-                                    // 第 67 轮:无 Invoke Pattern → 元素中心 SendInput 物理点击
-                                    // (自绘 UI 的可靠路径)→ BM_CLICK 最终兜底
-                                    let bounds = el.CurrentBoundingRectangle().unwrap_or_default();
-                                    let cx = (bounds.left + bounds.right) / 2;
-                                    let cy = (bounds.top + bounds.bottom) / 2;
-                                    if cx > 0 && cy > 0 && bounds.right > bounds.left {
-                                        let _ = el.SetFocus();
-                                        winput::force_foreground(hwnd)?;
-                                        winput::click_point(cx as i64, cy as i64, false, false)?;
-                                        Ok(format!(
-                                            "已对 {window_id}{path} 中心 ({cx},{cy}) 执行物理点击(SendInput)"
-                                        ))
-                                    } else {
-                                        let _ = el.SetFocus();
-                                        drop(el);
-                                        win32_act(hwnd, path, &ControlAction::Click)
+                            // 第 90 轮四层优先级链:T1 UIA Pattern(Invoke/Toggle/
+                            // ExpandCollapse/SelectionItem,语义化点击)→ T2 BM_CLICK
+                            // (原生 Button 系 HWND)→ T3 元素中心物理点击(自绘 UI 兜底)。
+                            // SAFETY:模式查询与调用均为 UIA COM;失败逐层降级。
+                            unsafe {
+                                // T1a Invoke(按钮/链接)
+                                if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(
+                                    UIA_InvokePatternId,
+                                ) {
+                                    if p.Invoke().is_ok() {
+                                        return Ok(format!(
+                                            "已对 {window_id}{path} 执行 Invoke(点击,route=uia)"
+                                        ));
                                     }
+                                }
+                                // T1b Toggle(复选框/开关:点击语义 = 切换状态)
+                                if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationTogglePattern>(
+                                    UIA_TogglePatternId,
+                                ) {
+                                    if p.Toggle().is_ok() {
+                                        return Ok(format!(
+                                            "已对 {window_id}{path} 执行 Toggle(点击,route=uia)"
+                                        ));
+                                    }
+                                }
+                                // T1c ExpandCollapse(下拉框/树节点:点击语义 = 展开)
+                                if let Ok(p) = el
+                                    .GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(
+                                    UIA_ExpandCollapsePatternId,
+                                ) {
+                                    if p.Expand().is_ok() {
+                                        return Ok(format!(
+                                            "已对 {window_id}{path} 执行 Expand(点击,route=uia)"
+                                        ));
+                                    }
+                                }
+                                // T1d SelectionItem(列表项:点击语义 = 选中)
+                                if let Ok(p) = el
+                                    .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                                    UIA_SelectionItemPatternId,
+                                ) {
+                                    if p.Select().is_ok() {
+                                        return Ok(format!(
+                                            "已对 {window_id}{path} 执行 Select(点击,route=uia)"
+                                        ));
+                                    }
+                                }
+                                // T2 BM_CLICK(标准 Button 系 HWND;同步消息,仅对语义成立的类)
+                                if let Some(nh) = uia_native_hwnd(&el) {
+                                    if is_button_class(&class_name_of(nh)) {
+                                        SendMessageW(nh, BM_CLICK, WPARAM(0), LPARAM(0));
+                                        return Ok(format!(
+                                            "已向 {window_id}{path} 原生 HWND 发送 BM_CLICK(route=win32_msg)"
+                                        ));
+                                    }
+                                }
+                                // T3 物理点击(自绘 UI 唯一可靠路径,第 67 轮行为保留)
+                                let bounds = el.CurrentBoundingRectangle().unwrap_or_default();
+                                let cx = (bounds.left + bounds.right) / 2;
+                                let cy = (bounds.top + bounds.bottom) / 2;
+                                if cx > 0 && cy > 0 && bounds.right > bounds.left {
+                                    let _ = el.SetFocus();
+                                    winput::force_foreground(hwnd)?;
+                                    winput::click_point(cx as i64, cy as i64, false, false)?;
+                                    Ok(format!(
+                                        "已对 {window_id}{path} 中心 ({cx},{cy}) 执行物理点击(route=physical)"
+                                    ))
+                                } else {
+                                    let _ = el.SetFocus();
+                                    drop(el);
+                                    win32_act(hwnd, path, &ControlAction::Click)
                                 }
                             }
                         }
@@ -708,31 +917,48 @@ impl WindowDriver for WindowsDriver {
                             Ok(format!("已聚焦 {window_id}{path}"))
                         }
                         ControlAction::SetText(text) => {
-                            match el.GetCurrentPatternAs::<IUIAutomationValuePattern>(
-                                UIA_ValuePatternId,
-                            ) {
-                                Ok(p) => {
-                                    p.SetValue(&BSTR::from(text.as_str())).map_err(|e| {
-                                        platform_err("windows", format!("SetValue 失败: {e}"))
-                                    })?;
-                                    Ok(format!(
-                                        "已向 {window_id}{path} 写入文本({} 字符)",
-                                        text.chars().count()
-                                    ))
+                            // 第 90 轮三层链:T1 ValuePattern → T2 WM_SETTEXT(原生 HWND)
+                            // → T3 focus+SendInput 逐字键入(自绘输入框唯一可靠路径)。
+                            // SAFETY:UIA/Win32 消息调用;失败逐层降级。
+                            unsafe {
+                                // T1 UIA ValuePattern(语义级,不抢焦点)
+                                if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationValuePattern>(
+                                    UIA_ValuePatternId,
+                                ) {
+                                    if p.SetValue(&BSTR::from(text.as_str())).is_ok() {
+                                        return Ok(format!(
+                                            "已向 {window_id}{path} 写入文本({} 字符,route=uia)",
+                                            text.chars().count()
+                                        ));
+                                    }
                                 }
-                                Err(_) => {
-                                    // 第 67 轮:focus + SendInput 逐字键入(自绘输入框唯一可靠路径)
-                                    let _ = el.SetFocus();
-                                    winput::force_foreground(hwnd)?;
-                                    winput::type_text(text)?;
-                                    Ok(format!(
-                                        "已向 {window_id}{path} 真实键入文本({} 字符,SendInput)",
+                                // T2 WM_SETTEXT(标准 Win32 控件;整体替换语义)
+                                if let Some(nh) = uia_native_hwnd(&el) {
+                                    let mut wide: Vec<u16> = text.encode_utf16().collect();
+                                    wide.push(0);
+                                    SendMessageW(
+                                        nh,
+                                        WM_SETTEXT,
+                                        WPARAM(0),
+                                        LPARAM(wide.as_ptr() as isize),
+                                    );
+                                    return Ok(format!(
+                                        "已向 {window_id}{path} 原生 HWND 写入文本({} 字符,route=win32_msg)",
                                         text.chars().count()
-                                    ))
+                                    ));
                                 }
+                                // T3 物理:焦点 + SendInput 逐字键入(第 67 轮路径保留)
+                                let _ = el.SetFocus();
+                                winput::force_foreground(hwnd)?;
+                                winput::type_text(text)?;
+                                Ok(format!(
+                                    "已向 {window_id}{path} 真实键入文本({} 字符,route=physical)",
+                                    text.chars().count()
+                                ))
                             }
                         }
                         ControlAction::GetText => {
+                            // T1 Value → T1 Name → T2 WM_GETTEXT(原生 HWND,第 90 轮补)
                             if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationValuePattern>(
                                 UIA_ValuePatternId,
                             ) {
@@ -741,17 +967,63 @@ impl WindowDriver for WindowsDriver {
                                     return Ok(v);
                                 }
                             }
-                            el.CurrentName().map(|b| b.to_string()).map_err(|e| {
-                                platform_err("windows", format!("读取控件文本失败: {e}"))
-                            })
+                            if let Ok(name) = el.CurrentName() {
+                                let n = name.to_string();
+                                if !n.is_empty() {
+                                    return Ok(n);
+                                }
+                            }
+                            // SAFETY:标准 WM_GETTEXT 同步消息;缓冲区指针本栈有效。
+                            unsafe {
+                                if let Some(nh) = uia_native_hwnd(&el) {
+                                    let len = SendMessageW(
+                                        nh,
+                                        WM_GETTEXTLENGTH,
+                                        WPARAM(0),
+                                        LPARAM(0),
+                                    )
+                                    .0 as usize;
+                                    if len > 0 && len < 1_000_000 {
+                                        let mut buf = vec![0u16; len + 1];
+                                        let got = SendMessageW(
+                                            nh,
+                                            WM_GETTEXT,
+                                            WPARAM(buf.len()),
+                                            LPARAM(buf.as_mut_ptr() as isize),
+                                        )
+                                        .0 as usize;
+                                        let t = String::from_utf16_lossy(&buf[..got.min(len)]);
+                                        if !t.is_empty() {
+                                            return Ok(t);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(platform_err(
+                                "windows",
+                                "读取控件文本失败:元素无 Value/Name 属性且原生 HWND 无文本",
+                            ))
                         }
                         ControlAction::SendKeys(spec) => {
-                            // 第 67 轮实装:聚焦 + 前台化 + SendInput(支持 enter / ctrl+a 等组合键)
-                            let _ = el.SetFocus();
-                            drop(el);
-                            winput::force_foreground(hwnd)?;
-                            winput::send_keys_spec(spec)?;
-                            Ok(format!("已向 {window_id} 发送按键 {spec:?}(SendInput)"))
+                            // 第 90 轮两层链:T2 PostMessage 消息级按键(仅原生 HWND 控件,
+                            // 不抢焦点)→ T3 物理 SendInput(Electron/自绘 UI 路径,第 67 轮保留)。
+                            // SAFETY:消息投递目标为元素原生 HWND。
+                            unsafe {
+                                if let Some(nh) = uia_native_hwnd(&el) {
+                                    drop(el);
+                                    post_message_keys(nh, spec)?;
+                                    return Ok(format!(
+                                        "已向 {window_id}{path} 投递按键 {spec:?}(route=win32_msg)"
+                                    ));
+                                }
+                                let _ = el.SetFocus();
+                                drop(el);
+                                winput::force_foreground(hwnd)?;
+                                winput::send_keys_spec(spec)?;
+                                Ok(format!(
+                                    "已向 {window_id} 发送按键 {spec:?}(route=physical)"
+                                ))
+                            }
                         }
                         // 2026-09-16 第 66 轮:scroll_to_visible 优先 UIA ScrollItemPattern,
                         // 不支持时降级控件中心物理滚轮。
@@ -783,33 +1055,84 @@ impl WindowDriver for WindowsDriver {
                                 }
                             }
                         }
-                        // 第 67 轮:滚动优先「控件中心物理滚轮」(自绘 UI 忽略消息滚动),
-                        // 元素无有效 bounds 时降级 WM_MOUSEWHEEL。
+                        // 第 90 轮滚动三层链:T1 UIA ScrollPattern(语义级)→
+                        // T2 WM_MOUSEWHEEL(原生 HWND)→ T3 物理滚轮(自绘 UI 兜底,
+                        // 第 67 轮「自绘 UI 忽略消息滚动」的行为经前两层自然落穿保留)。
                         ControlAction::Scroll { lines } => {
                             let lines = *lines;
-                            let bounds = el.CurrentBoundingRectangle().unwrap_or_default();
-                            let cx = (bounds.left + bounds.right) / 2;
-                            let cy = (bounds.top + bounds.bottom) / 2;
-                            drop(el);
-                            if cx > 0 && cy > 0 && bounds.right > bounds.left {
-                                winput::wheel_at(cx as i64, cy as i64, lines)?;
-                                Ok(format!(
-                                    "已对 {window_id}{path} 中心 ({cx},{cy}) 滚动 {} 行(物理滚轮,{})",
-                                    lines.abs(),
-                                    if lines > 0 { "向上" } else { "向下" }
-                                ))
-                            } else {
-                                win32_act(hwnd, path, &ControlAction::Scroll { lines })
+                            // SAFETY:UIA Pattern 调用;失败逐层降级。
+                            unsafe {
+                                // T1 ScrollPattern:Small 步进 × min(|lines|,3) 次(有界 IPC)
+                                if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationScrollPattern>(
+                                    UIA_ScrollPatternId,
+                                ) {
+                                    let amount = if lines > 0 {
+                                        ScrollAmount_SmallDecrement
+                                    } else {
+                                        ScrollAmount_SmallIncrement
+                                    };
+                                    let mut ok_calls = 0u32;
+                                    for _ in 0..lines.unsigned_abs().min(3) {
+                                        if p.Scroll(ScrollAmount_NoAmount, amount).is_ok() {
+                                            ok_calls += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if ok_calls > 0 {
+                                        return Ok(format!(
+                                            "已对 {window_id}{path} 滚动(UIA ScrollPattern Small×{ok_calls},请求 {} 行,{},route=uia)",
+                                            lines.abs(),
+                                            if lines > 0 { "向上" } else { "向下" }
+                                        ));
+                                    }
+                                }
+                                // T2 WM_MOUSEWHEEL(原生 HWND)
+                                if let Some(nh) = uia_native_hwnd(&el) {
+                                    const WM_MOUSEWHEEL: u32 = 0x020A;
+                                    let delta = lines.saturating_mul(120);
+                                    let wparam = WPARAM(((delta as u16) as usize) << 16);
+                                    SendMessageW(nh, WM_MOUSEWHEEL, wparam, LPARAM(0));
+                                    return Ok(format!(
+                                        "已向 {window_id}{path} 原生 HWND 发送 WM_MOUSEWHEEL({} 行,{},route=win32_msg)",
+                                        lines.abs(),
+                                        if lines > 0 { "向上" } else { "向下" }
+                                    ));
+                                }
+                                // T3 物理滚轮
+                                let bounds = el.CurrentBoundingRectangle().unwrap_or_default();
+                                let cx = (bounds.left + bounds.right) / 2;
+                                let cy = (bounds.top + bounds.bottom) / 2;
+                                drop(el);
+                                if cx > 0 && cy > 0 && bounds.right > bounds.left {
+                                    winput::wheel_at(cx as i64, cy as i64, lines)?;
+                                    Ok(format!(
+                                        "已对 {window_id}{path} 中心 ({cx},{cy}) 滚动 {} 行(物理滚轮,{})",
+                                        lines.abs(),
+                                        if lines > 0 { "向上" } else { "向下" }
+                                    ))
+                                } else {
+                                    win32_act(hwnd, path, &ControlAction::Scroll { lines })
+                                }
                             }
                         }
                         // 坐标动作(视觉路线):前台化 + SendInput
+                        // 第 90 轮:纳入 move_point(悬停,免前台化)/
+                        // middle_click_point / drag_point 新原语,全部 route=physical。
                         point @ (ControlAction::ClickPoint { .. }
                         | ControlAction::DoubleClickPoint { .. }
                         | ControlAction::RightClickPoint { .. }
-                        | ControlAction::ScrollPoint { .. }) => {
+                        | ControlAction::ScrollPoint { .. }
+                        | ControlAction::MiddleClickPoint { .. }
+                        | ControlAction::DragPoint { .. }) => {
                             drop(el);
                             winput::force_foreground(hwnd)?;
                             win32_act(hwnd, "/", point)
+                        }
+                        // move_point 仅移动光标,不需要前台化(悬停语义)
+                        ControlAction::MovePoint { .. } => {
+                            drop(el);
+                            win32_act(hwnd, "/", &action)
                         }
                         ControlAction::TypeText(text) => {
                             let _ = el.SetFocus();

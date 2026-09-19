@@ -21,10 +21,11 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
-    VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12,
-    VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_LEFT, VK_LMENU,
-    VK_LWIN, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8,
+    VK_F9, VK_HOME, VK_LEFT, VK_LMENU, VK_LWIN, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SetCursorPos, SetForegroundWindow,
@@ -174,16 +175,44 @@ pub fn move_cursor(x: i64, y: i64) -> Result<()> {
 /// 点击前会把光标移到目标点;按下/抬起间隔 30ms,双击间隔 80ms(贴近真人节拍,
 /// 自绘 UI 依赖消息时序区分单击/双击)。
 pub fn click_point(x: i64, y: i64, double: bool, right: bool) -> Result<()> {
+    click_point_ex(x, y, if right { MouseButton::Right } else { MouseButton::Left }, if double { 2 } else { 1 }, &[])
+}
+
+/// 鼠标按键(2026-09-19 第 90 轮,click_point_ex 参数)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// 在 (x,y) 执行物理鼠标点击的完整原语(2026-09-19 第 90 轮):
+/// 任意按键(左/右/中)+ 1~2 次(单击/双击)+ 可选按住修饰键(ctrl/shift 组合点击)。
+///
+/// 修饰键序列先按下 → 执行点击 → 逆序释放 —— 键盘与鼠标**同时操作**
+/// (ctrl+点击多选 / shift+点击区选 / alt+拖拽复制等)。
+pub fn click_point_ex(
+    x: i64,
+    y: i64,
+    button: MouseButton,
+    clicks: u8,
+    modifiers: &[VIRTUAL_KEY],
+) -> Result<()> {
+    let clicks = clicks.clamp(1, 2);
     move_cursor(x, y)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
-    let (down, up) = if right {
-        (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
-    } else {
-        (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+    let (down, up) = match button {
+        MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        MouseButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
     };
-    // SAFETY:固定合法鼠标事件标志组合。
+    // SAFETY:固定合法鼠标事件标志组合 + 修饰键 VK 常量由 parse_key_spec 产出。
     unsafe {
-        for round in 0..(if double { 2 } else { 1 }) {
+        for m in modifiers {
+            send_key_raw(*m, false);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for round in 0..clicks {
             send_mouse(MOUSEINPUT {
                 dx: 0,
                 dy: 0,
@@ -201,9 +230,62 @@ pub fn click_point(x: i64, y: i64, double: bool, right: bool) -> Result<()> {
                 time: 0,
                 dwExtraInfo: 0,
             });
-            if round == 0 && double {
+            if round == 0 && clicks > 1 {
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }
+        }
+        for m in modifiers.iter().rev() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            send_key_raw(*m, true);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    Ok(())
+}
+
+/// 从 (fx,fy) 按住左键拖拽到 (tx,ty)(2026-09-19 第 90 轮),可选按住修饰键。
+///
+/// 实现:移到起点 → 修饰键按下 → 左键按下 → **10 步线性插值移动**(每步 15ms,
+/// 贴近真人拖拽轨迹,自绘 UI 的拖拽启动阈值依赖移动序列)→ 左键抬起 → 修饰键释放。
+pub fn drag_point(fx: i64, fy: i64, tx: i64, ty: i64, modifiers: &[VIRTUAL_KEY]) -> Result<()> {
+    const STEPS: i64 = 10;
+    move_cursor(fx, fy)?;
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    // SAFETY:修饰键 VK 常量由 parse_key_spec 产出;鼠标事件标志组合固定合法。
+    unsafe {
+        for m in modifiers {
+            send_key_raw(*m, false);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        send_mouse(MOUSEINPUT {
+            dx: 0,
+            dy: 0,
+            mouseData: 0,
+            dwFlags: MOUSEEVENTF_LEFTDOWN,
+            time: 0,
+            dwExtraInfo: 0,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        for i in 1..=STEPS {
+            let nx = fx + (tx - fx) * i / STEPS;
+            let ny = fy + (ty - fy) * i / STEPS;
+            SetCursorPos(nx as i32, ny as i32).map_err(|_| {
+                platform_err("windows", format!("拖拽插值移动 SetCursorPos({nx},{ny}) 失败"))
+            })?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        send_mouse(MOUSEINPUT {
+            dx: 0,
+            dy: 0,
+            mouseData: 0,
+            dwFlags: MOUSEEVENTF_LEFTUP,
+            time: 0,
+            dwExtraInfo: 0,
+        });
+        for m in modifiers.iter().rev() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            send_key_raw(*m, true);
         }
     }
     std::thread::sleep(std::time::Duration::from_millis(60));
@@ -403,6 +485,39 @@ pub fn send_keys_spec(spec: &str) -> Result<()> {
     Ok(())
 }
 
+/// 解析**纯修饰键**规格("ctrl" / "ctrl+shift" / "alt")→ VK 序列
+/// (2026-09-19 第 90 轮,供 click_point_ex / drag_point 按住)。
+///
+/// 与 `parse_key_spec` 的区别:后者末段必须是主键;本函数每一段都必须是修饰键,
+/// 任一段是非修饰键(如 "ctrl+a")即结构化报错。
+pub fn parse_modifiers(spec: &str) -> Result<Vec<VIRTUAL_KEY>> {
+    let parts: Vec<&str> = spec.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Err(platform_err(
+            "windows",
+            "modifiers 规格为空(应形如 \"ctrl\" / \"ctrl+shift\")",
+        ));
+    }
+    let mut vks = Vec::with_capacity(parts.len());
+    for p in parts {
+        let vk = key_vk(p).ok_or_else(|| {
+            platform_err(
+                "windows",
+                format!("modifiers 段无法识别: {p:?}(仅允许 ctrl/shift/alt/win 组合)"),
+            )
+        })?;
+        let is_modifier = vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_LMENU || vk == VK_LWIN;
+        if !is_modifier {
+            return Err(platform_err(
+                "windows",
+                format!("modifiers 段 {p:?} 不是修饰键(仅允许 ctrl/shift/alt/win 组合)"),
+            ));
+        }
+        vks.push(vk);
+    }
+    Ok(vks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +554,22 @@ mod tests {
         assert!(parse_key_spec("multiword").is_err());
         // 段数上限
         assert!(parse_key_spec("a+b+c+d+e+f").is_err());
+    }
+
+    #[test]
+    fn parse_modifiers_round90() {
+        // 第 90 轮:纯修饰键规格解析(修饰键 + 点击/拖拽)。
+        assert_eq!(parse_modifiers("ctrl").unwrap(), vec![VK_CONTROL]);
+        assert_eq!(
+            parse_modifiers("Ctrl+Shift").unwrap(),
+            vec![VK_CONTROL, VK_SHIFT]
+        );
+        assert_eq!(parse_modifiers("alt").unwrap(), vec![VK_LMENU]);
+        assert_eq!(parse_modifiers("win").unwrap(), vec![VK_LWIN]);
+        // 主键混入修饰键规格 → 报错
+        assert!(parse_modifiers("ctrl+a").is_err());
+        assert!(parse_modifiers("enter").is_err());
+        assert!(parse_modifiers("").is_err());
+        assert!(parse_modifiers("unknown").is_err());
     }
 }

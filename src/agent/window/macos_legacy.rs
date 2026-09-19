@@ -139,6 +139,10 @@ const K_CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
 /// 鼠标按键编号(左 0 / 右 1)。
 const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
 const K_CG_MOUSE_BUTTON_RIGHT: u32 = 1;
+// 2026-09-19 第 90 轮:中键(kCGEventOtherMouseDown/Up = 25/26,button 2)。
+const K_CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
+const K_CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
+const K_CG_MOUSE_BUTTON_CENTER: u32 = 2;
 
 // ===================== AX 字符串常量(字面量缓存,macOS 全版本通用) =====================
 //
@@ -426,6 +430,44 @@ fn parse_key_combo(expr: &str) -> Option<(u16, u64)> {
     Some((keycode, flags))
 }
 
+/// 解析**纯修饰键**规格 → CGEventFlags(2026-09-19 第 90 轮,修饰键 + 鼠标操作)。
+///
+/// 与 `parse_key_combo` 的区别:每一段都必须是修饰键(ctrl/shift/alt/cmd 及别名),
+/// 无主键;任一段非修饰键返回 None。macOS 修饰键以 flags 位形式与鼠标事件同时携带。
+fn parse_modifier_flags(spec: &str) -> Option<u64> {
+    let parts: Vec<&str> = spec.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut flags = 0u64;
+    for p in parts {
+        flags |= modifier_flag_for_name(p)?;
+    }
+    Some(flags)
+}
+
+/// 修饰键规格 → CGEventFlags(空规格 = 0;非法段结构化报错,2026-09-19 第 90 轮)。
+fn cg_mod_flags(spec: Option<&str>) -> std::result::Result<u64, crate::error::AgentError> {
+    match spec.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => parse_modifier_flags(s).ok_or_else(|| {
+            platform_err(
+                "macos",
+                format!(
+                    "modifiers 规格非法: {s:?}(仅允许 ctrl/shift/alt/cmd(+组合),如 \"ctrl\" / \"cmd+shift\")"
+                ),
+            )
+        }),
+        None => Ok(0),
+    }
+}
+
+/// 修饰键规格 → 返回文案后缀(无修饰键为空串,第 90 轮)。
+fn cg_mod_note(spec: &Option<String>) -> String {
+    spec.as_deref()
+        .map(|m| format!(" + 按住 {m}"))
+        .unwrap_or_default()
+}
+
 /// 把光标移到屏幕坐标(x, y)(CGEvent mouse-moved,无点击)。
 unsafe fn cg_move_cursor(x: f64, y: f64) {
     let ev = CGEventCreateMouseEvent(
@@ -485,40 +527,131 @@ unsafe fn cg_send_key_with_flags(keycode: u16, flags: u64) {
 /// 在屏幕坐标 (x,y) 注入物理鼠标点击(2026-09-17 第 70 轮,坐标动作视觉路线)。
 /// 先移光标到位再按压;双击时第二次点击 clickState=2(应用按该字段判定双击语义)。
 unsafe fn cg_click_at(x: f64, y: f64, right: bool, double: bool) {
-    let (down, up, button) = if right {
-        (
-            K_CG_EVENT_RIGHT_MOUSE_DOWN,
-            K_CG_EVENT_RIGHT_MOUSE_UP,
-            K_CG_MOUSE_BUTTON_RIGHT,
-        )
-    } else {
-        (
+    cg_click_at_ex(
+        x,
+        y,
+        if right {
+            CgMouseButton::Right
+        } else {
+            CgMouseButton::Left
+        },
+        if double { 2 } else { 1 },
+        0,
+    );
+}
+
+/// CGEvent 鼠标按键(2026-09-19 第 90 轮,cg_click_at_ex 参数)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgMouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// 任意按键 + 1~2 次点击 + 修饰键的完整鼠标点击原语(2026-09-19 第 90 轮)。
+///
+/// `flags` 为 CGEventFlags 修饰键位(`parse_modifier_flags` 产出),按下/抬起
+/// 事件均携带 —— 实现 ctrl+点击 / shift+点击等「键盘修饰键 + 鼠标」同时操作。
+unsafe fn cg_click_at_ex(x: f64, y: f64, button: CgMouseButton, clicks: u8, flags: u64) {
+    let clicks = clicks.clamp(1, 2);
+    let (down, up, btn) = match button {
+        CgMouseButton::Left => (
             K_CG_EVENT_LEFT_MOUSE_DOWN,
             K_CG_EVENT_LEFT_MOUSE_UP,
             K_CG_MOUSE_BUTTON_LEFT,
-        )
+        ),
+        CgMouseButton::Right => (
+            K_CG_EVENT_RIGHT_MOUSE_DOWN,
+            K_CG_EVENT_RIGHT_MOUSE_UP,
+            K_CG_MOUSE_BUTTON_RIGHT,
+        ),
+        CgMouseButton::Middle => (
+            K_CG_EVENT_OTHER_MOUSE_DOWN,
+            K_CG_EVENT_OTHER_MOUSE_UP,
+            K_CG_MOUSE_BUTTON_CENTER,
+        ),
     };
     cg_move_cursor(x, y);
     std::thread::sleep(std::time::Duration::from_millis(60));
-    let clicks = if double { 2 } else { 1 };
     for seq in 1..=clicks {
         for &mouse_type in &[down, up] {
             let ev =
-                CGEventCreateMouseEvent(std::ptr::null(), mouse_type, CGPoint { x, y }, button);
+                CGEventCreateMouseEvent(std::ptr::null(), mouse_type, CGPoint { x, y }, btn);
             if ev.is_null() {
                 return;
             }
-            if double {
+            if clicks > 1 {
                 CGEventSetIntegerValueField(ev, K_CG_MOUSE_EVENT_CLICK_STATE, seq as i64);
+            }
+            if flags != 0 {
+                CGEventSetFlags(ev, flags);
             }
             CGEventPost(K_CG_HID_EVENT_TAP, ev);
             CFRelease(ev);
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        if double {
+        if clicks > 1 {
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
     }
+}
+
+/// 从 (fx,fy) 按住左键拖拽到 (tx,ty)(2026-09-19 第 90 轮),可选修饰键。
+///
+/// 实现:移到起点 → 左键按下(携带修饰 flags)→ **10 步线性插值 mouseMoved**
+/// (每步 15ms,拖拽启动阈值依赖移动序列)→ 左键抬起。macOS 修饰键以 flags
+/// 形式挂在每个鼠标事件上(与 cliclick 同款做法)。
+unsafe fn cg_drag(fx: f64, fy: f64, tx: f64, ty: f64, flags: u64) {
+    const STEPS: i64 = 10;
+    cg_move_cursor(fx, fy);
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    // 按下(带修饰键)
+    let ev = CGEventCreateMouseEvent(
+        std::ptr::null(),
+        K_CG_EVENT_LEFT_MOUSE_DOWN,
+        CGPoint { x: fx, y: fy },
+        K_CG_MOUSE_BUTTON_LEFT,
+    );
+    if !ev.is_null() {
+        if flags != 0 {
+            CGEventSetFlags(ev, flags);
+        }
+        CGEventPost(K_CG_HID_EVENT_TAP, ev);
+        CFRelease(ev);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    // 插值移动(kCGEventMouseMoved,保持修饰 flags)
+    for i in 1..=STEPS {
+        let nx = fx + (tx - fx) * (i as f64) / (STEPS as f64);
+        let ny = fy + (ty - fy) * (i as f64) / (STEPS as f64);
+        let mv = CGEventCreateMouseEvent(
+            std::ptr::null(),
+            K_CG_EVENT_MOUSE_MOVED,
+            CGPoint { x: nx, y: ny },
+            0,
+        );
+        if !mv.is_null() {
+            if flags != 0 {
+                CGEventSetFlags(mv, flags);
+            }
+            CGEventPost(K_CG_HID_EVENT_TAP, mv);
+            CFRelease(mv);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    // 抬起(修饰键随事件释放)
+    let up = CGEventCreateMouseEvent(
+        std::ptr::null(),
+        K_CG_EVENT_LEFT_MOUSE_UP,
+        CGPoint { x: tx, y: ty },
+        K_CG_MOUSE_BUTTON_LEFT,
+    );
+    if !up.is_null() {
+        CGEventPost(K_CG_HID_EVENT_TAP, up);
+        CFRelease(up);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(60));
 }
 
 /// 向当前焦点控件真实键入文本(2026-09-17 第 70 轮;第 81 轮改**逐字符**注入)。
@@ -1439,19 +1572,56 @@ impl WindowDriver for MacOsDriver {
                 // 此前仅 windows.rs(SendInput)实现了 5 个坐标变体,本 match 漏覆盖导致
                 // 编译失败(E0004)→ rebuild 脚本中止 → 产物不更新。
                 // 坐标动作用屏幕绝对坐标,与 path 控件无关(path 恒传 "/",el 为窗口根)。
-                ControlAction::ClickPoint { x, y } => {
-                    cg_click_at(*x as f64, *y as f64, false, false);
-                    Ok(format!("已在屏幕坐标 ({x},{y}) 执行物理左键单击(CGEvent)"))
-                }
-                ControlAction::DoubleClickPoint { x, y } => {
-                    cg_click_at(*x as f64, *y as f64, false, true);
+                // 第 90 轮:点击系动作支持 modifiers(修饰键 flags 同事件携带),
+                // 新增 move_point(悬停)/ middle_click_point / drag_point 原语。
+                ControlAction::ClickPoint { x, y, modifiers } => {
+                    let flags = cg_mod_flags(modifiers.as_deref())?;
+                    cg_click_at_ex(*x as f64, *y as f64, CgMouseButton::Left, 1, flags);
                     Ok(format!(
-                        "已在屏幕坐标 ({x},{y}) 执行物理双击(CGEvent,clickState=2)"
+                        "已在屏幕坐标 ({x},{y}) 执行物理左键单击{}(CGEvent,route=physical)",
+                        cg_mod_note(modifiers)
                     ))
                 }
-                ControlAction::RightClickPoint { x, y } => {
-                    cg_click_at(*x as f64, *y as f64, true, false);
-                    Ok(format!("已在屏幕坐标 ({x},{y}) 执行物理右键单击(CGEvent)"))
+                ControlAction::DoubleClickPoint { x, y, modifiers } => {
+                    let flags = cg_mod_flags(modifiers.as_deref())?;
+                    cg_click_at_ex(*x as f64, *y as f64, CgMouseButton::Left, 2, flags);
+                    Ok(format!(
+                        "已在屏幕坐标 ({x},{y}) 执行物理双击{}(CGEvent,clickState=2,route=physical)",
+                        cg_mod_note(modifiers)
+                    ))
+                }
+                ControlAction::RightClickPoint { x, y, modifiers } => {
+                    let flags = cg_mod_flags(modifiers.as_deref())?;
+                    cg_click_at_ex(*x as f64, *y as f64, CgMouseButton::Right, 1, flags);
+                    Ok(format!(
+                        "已在屏幕坐标 ({x},{y}) 执行物理右键单击{}(CGEvent,route=physical)",
+                        cg_mod_note(modifiers)
+                    ))
+                }
+                // ===== 2026-09-19 第 90 轮:鼠标键盘原子能力 =====
+                ControlAction::MovePoint { x, y } => {
+                    cg_move_cursor(*x as f64, *y as f64);
+                    Ok(format!("已把光标移动到 ({x},{y})(悬停,route=physical)"))
+                }
+                ControlAction::MiddleClickPoint { x, y } => {
+                    cg_click_at_ex(*x as f64, *y as f64, CgMouseButton::Middle, 1, 0);
+                    Ok(format!(
+                        "已在屏幕坐标 ({x},{y}) 执行物理中键单击(CGEvent,route=physical)"
+                    ))
+                }
+                ControlAction::DragPoint {
+                    x,
+                    y,
+                    x2,
+                    y2,
+                    modifiers,
+                } => {
+                    let flags = cg_mod_flags(modifiers.as_deref())?;
+                    cg_drag(*x as f64, *y as f64, *x2 as f64, *y2 as f64, flags);
+                    Ok(format!(
+                        "已从 ({x},{y}) 拖拽到 ({x2},{y2}){}(CGEvent 插值,route=physical)",
+                        cg_mod_note(modifiers)
+                    ))
                 }
                 ControlAction::ScrollPoint { x, y, lines } => {
                     cg_move_cursor(*x as f64, *y as f64);
@@ -1833,5 +2003,28 @@ mod key_combo_tests {
         assert_eq!(parse_key_combo("cmd+notakey"), None);
         assert_eq!(parse_key_combo("banana+f"), None);
         assert_eq!(parse_key_combo(""), None);
+    }
+
+    // ===== 第 90 轮:纯修饰键规格(修饰键 + 鼠标同时操作) =====
+
+    #[test]
+    fn parse_modifier_flags_round90() {
+        assert_eq!(parse_modifier_flags("ctrl"), Some(0x0004_0000));
+        assert_eq!(parse_modifier_flags("shift"), Some(0x0002_0000));
+        assert_eq!(parse_modifier_flags("alt"), Some(0x0008_0000));
+        assert_eq!(parse_modifier_flags("cmd"), Some(0x0010_0000));
+        assert_eq!(
+            parse_modifier_flags("ctrl+shift"),
+            Some(0x0004_0000 | 0x0002_0000)
+        );
+        assert_eq!(
+            parse_modifier_flags("Cmd+Option"),
+            Some(0x0010_0000 | 0x0008_0000)
+        );
+        // 主键混入修饰键规格 → None(规格语义非法)
+        assert_eq!(parse_modifier_flags("ctrl+a"), None);
+        assert_eq!(parse_modifier_flags("enter"), None);
+        assert_eq!(parse_modifier_flags(""), None);
+        assert_eq!(parse_modifier_flags("unknown"), None);
     }
 }

@@ -124,10 +124,15 @@ pub(super) async fn run_control(args: Value) -> Result<String> {
     let path = require_str(&args, "path", MCP_WINDOW_USE_TOOL_NAME)?.to_string();
     let control_action_name = require_str(&args, "control_action", MCP_WINDOW_USE_TOOL_NAME)?;
     let text = get_str(&args, "text").map(str::to_string);
-    // 坐标动作参数(x/y 屏幕绝对坐标,来自 action=ocr)
+    // 坐标动作参数(x/y 屏幕绝对坐标,来自 action=ocr;第 90 轮:x2/y2 = drag_point
+    // 终点,modifiers = 修饰键规格,作用于 click_point 系 / drag_point)
     let x = args.get("x").and_then(Value::as_i64);
     let y = args.get("y").and_then(Value::as_i64);
-    let action = ControlAction::parse_ext(control_action_name, text, x, y)?;
+    let x2 = args.get("x2").and_then(Value::as_i64);
+    let y2 = args.get("y2").and_then(Value::as_i64);
+    let modifiers = get_str(&args, "modifiers").map(str::to_string);
+    let action =
+        ControlAction::parse_ext(control_action_name, text, x, y, x2, y2, modifiers)?;
     driver_preflight(MCP_WINDOW_USE_TOOL_NAME).await?;
     run_blocking(MCP_WINDOW_USE_TOOL_NAME, move || {
         let driver = current_driver();

@@ -165,9 +165,9 @@ impl MainWorkRunner {
              - 同一应用的连续 UI 操作链(打开/激活 → 检视/OCR → 点击 → 输入 → 发送 → 复查)必须\n\
                合并为一个 subagent WorkFlow;微信 4.x 等自绘 UI 的控件树为空,MCP_Window_Use\n\
                支持 action=ocr + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。\n\
-             - 桌面窗口操控流程引用 MCP_Window_Use 时(2026-09-18 第 87 轮),steps 中只允许使用\n\
+             - 桌面窗口操控流程引用 MCP_Window_Use 时(2026-09-18 第 87 轮;第 90 轮 +input_batch),steps 中只允许使用\n\
                以下合法 action:open / list / find / inspect / control / ocr / screenshot /\n\
-               capability_probe / osascript_run / chat_send / chat_loop;禁止臆造 list_windows /\n\
+               capability_probe / osascript_run / chat_send / chat_loop / input_batch;禁止臆造 list_windows /\n\
                get_window_info / get_ui_tree 等不存在的接口名 —— 执行层按字面调用会直接失败空转。\n\
              - 浏览器操控流程引用 MCP_Web_Use 时(2026-09-18 第 89 轮),steps 中只允许使用\n\
                以下合法 action:open / list / close / control / inspect;control 内层动作用\n\
