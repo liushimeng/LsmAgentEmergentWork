@@ -52,6 +52,12 @@ url = "2.5"
 chromiumoxide = "0.9"
 futures = "0.3"
 
+# build.rs 跨平台时间格式化(第 90 轮:修复 Windows 上 Command::new("date") 失败
+# 导致 LAEW_BUILD_TIME 退化为 unix:xxx 的问题)。time 已在本 crate 出现,
+# 在 [build-dependencies] 复用同一 crate,不增加新下载。
+[build-dependencies]
+time = { version = "0.3", features = ["local-offset", "formatting", "macros", "std"], default-features = false }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

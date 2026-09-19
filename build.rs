@@ -9,6 +9,7 @@
 //!    也提供 `--force` 选项让用户随时强制重编。
 
 use std::process::Command;
+use time::{macros::format_description, OffsetDateTime};
 
 fn main() {
     // macOS: 链接系统框架(AXUIElementRef / CGWindowList 等符号)
@@ -19,21 +20,23 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=Foundation");
     }
-    // 编译时间(本地时区), 失败时退化为 Unix 时间戳
-    let build_time = Command::new("date")
-        .arg("+%Y-%m-%d %H:%M:%S %Z")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            format!("unix:{secs}")
-        });
+    // 编译时间(本地时区, 跨平台)
+    //
+    // 第 90 轮(2026-09-19)修复:之前用 `Command::new("date")` 调用 Unix 日期命令,
+    // 在 Windows cmd.exe / PowerShell 上 `date` 行为完全不同:
+    //   - cmd.exe 内置 `date` 不接受 `+%Y-%m-%d ...` 参数, 会卡在交互式日期输入
+    //   - PowerShell 中 `date` 是 `Get-Date` 的别名, 不接受 Unix 格式字符串
+    // 导致 `cargo:rustc-env=LAEW_BUILD_TIME` 退化为 `unix:1789782004` 字面值,
+    // `laew --version` 在 Windows 上输出 `unix:xxx` 而不是可读时间。
+    //
+    // 修复:用 `time` crate 跨平台格式化 `YYYY-MM-DD HH:MM:SS ±HH:MM`。
+    // `time` 已在 [build-dependencies] 复用本仓库已引入的同一 crate,
+    // 不增加新依赖 / 不增加下载 / 不增加 build 缓存。
+    //
+    // 本机调试命令(单测):
+    //   powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'"
+    //   date '+%Y-%m-%d %H:%M:%S %z'   # Unix / Git Bash
+    let build_time = current_local_build_time();
     println!("cargo:rustc-env=LAEW_BUILD_TIME={build_time}");
 
     // Git 短哈希(尽力而为):HEAD^{commit} 优先,失败回退 HEAD
@@ -97,4 +100,42 @@ fn resolve_git_hash() -> Option<String> {
         .and_then(|o| String::from_utf8(o).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 跨平台获取本地编译时间字符串(第 90 轮 Windows 修复)。
+///
+/// 优先 `OffsetDateTime::now_local()` + 本地 UTC 偏移;
+/// 失败(沙箱/WSL/单线程初始化失败)回退到 UTC + "UTC" 标记;
+/// 任何格式化失败回退到 `unix:<secs>`(等价于修复前的 fallback)。
+///
+/// 输出格式:`YYYY-MM-DD HH:MM:SS ±HH:MM`(例:`2026-09-19 09:51:00 +08:00`)。
+/// - TUI 横幅可见
+/// - HTTP User-Agent 头可视读(`+` 在 header value 中无需转义, RFC 7230 允许)
+/// - crash 报告 / `laew --version` 友好
+fn current_local_build_time() -> String {
+    const FMT_LOCAL: &[time::format_description::FormatItem<'_>] = format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]"
+    );
+    const FMT_UTC: &[time::format_description::FormatItem<'_>] = format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second] UTC"
+    );
+
+    // 1) 本地时间 + 本地偏移(优先)
+    if let Ok(local) = OffsetDateTime::now_local() {
+        if let Ok(s) = local.format(&FMT_LOCAL) {
+            return s;
+        }
+    }
+
+    // 2) UTC 时间 + "UTC" 标记(本地偏移不可用时)
+    if let Ok(s) = OffsetDateTime::now_utc().format(&FMT_UTC) {
+        return s;
+    }
+
+    // 3) 极端兜底:Unix 时间戳(原行为, 诊断可见)
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix:{secs}")
 }
