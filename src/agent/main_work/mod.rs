@@ -113,12 +113,14 @@ impl MainWorkRunner {
         suggested_delegate: Option<&str>,
     ) -> Result<(WorkFlowPlan, Usage)> {
         let mut prompt = String::new();
-        prompt.push_str(&format!("【Main-Work 任务编排】\n目标: {}\n", goal));
+        // 2026-09-19 第91轮 P0-1 改动1: 三条绝对关键约束 + 第一性事实优先 + 输出前自检清单
+        prompt.push_str(&format!("【Main-Work 任务编排 · 第91轮】三条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop/input_batch wait,严禁 Bash sleep 循环。\n"));
         if let Some(orig) = original_prompt.filter(|s| !s.trim().is_empty()) {
-            prompt.push_str(&format!("\n用户原始输入:\n{orig}\n"));
+            prompt.push_str(&format!("第一性事实 · 用户原始输入(必读):\n{orig}\n"));
         }
+        prompt.push_str(&format!("Yolo 摘要 · 仅作参考:\n目标: {goal}\n"));
         if !decomposition.is_empty() {
-            prompt.push_str("\nYolo 给出的分解步骤(可参考,不一定照搬):\n");
+            prompt.push_str("Yolo 分解步骤(可参考不一定照搬):\n");
             for (i, s) in decomposition.iter().enumerate() {
                 prompt.push_str(&format!("  {}. {}\n", i + 1, s));
             }
@@ -136,15 +138,17 @@ impl MainWorkRunner {
                  请在本轮拆解中针对上述原因调整编排(补充前置检查 / 拆细步骤 / 明确验收命令)。\n"
             ));
         }
+        prompt.push_str(&format!("输出前自检清单(必填):原始每条编号是否都映射到某 wf 的 steps+acceptance? 核心动作动词(聊天/发送/保存报告/截图/...)是否完整保留? 时长/数量/频率是否在 acceptance 出现? 长时任务是否走 chat_loop/input_batch wait 而非 Bash sleep?\n"));
         // F8:补全 branches/loops 的 schema 示例并注明可省略 —— 此前提示词只列了
         // 六个必填字段,LLM 自行发明 branches 字符串形态导致类型失配(F1 的源头)。
         prompt.push_str(
             "\n请严格按以下 JSON 结构输出(可包裹在 ```json 代码块中):\n\
              {\"workflows\": [{\"id\": \"wf-1\", \"name\": \"流程名\", \"steps\": [\"步骤\"], \
              \"branches\": [\"条件: 动作\"], \"loops\": [\"条件: 遍历对象\"], \"depends_on\": [], \
-             \"acceptance\": [\"可验证的验收标准\"], \"delegate_to\": \"subagent\"}], \"summary\": \"编排思路\"}\n\
+             \"acceptance\": [\"可验证的验收标准\"], \"delegate_to\": \"subagent\", \"max_iterations\": 24}], \"summary\": \"编排思路\"}\n\
              约束:\n\
              - id/name/steps/acceptance/delegate_to 必填;branches/loops/depends_on/summary 可省略。\n\
+             - max_iterations: 可选整数 4~32;长时多轮聊天(>5 分钟或 >10 轮)/ 长时保活 / 含 5+ 步骤的复杂单元建议显式设置(如 24 或 32),避免 SubAgent 跑满 16 次迭代上限半途而废。\n\
              - branches/loops 元素是字符串(形如 \"条件: 动作\")或对象({\"condition\":…,\"then\":…} / {\"condition\":…,\"over\":…})均可。\n\
              - delegate_to 唯一合法值:\"subagent\"(通用执行层 SubAgent-Work)。桌面窗口操控类任务\n\
                (枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本)由 SubAgent-Work 的\n\

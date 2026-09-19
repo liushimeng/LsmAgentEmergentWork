@@ -60,7 +60,7 @@ impl Tool for SubmitTaskClassification {
                 },
                 "goal_summary": {
                     "type": "string",
-                    "description": "一句话概括用户的核心目标"
+                    "description": "一句话概括用户的核心目标(必须保留原句中的核心动词: 聊天/发送/保存/读取/截图/启动/查找/枚举/关闭/点击/键入/输入 等；不得压缩为「完成任务 / 自动化任务」等空动词)"
                 },
                 "intent": {
                     "type": "string",

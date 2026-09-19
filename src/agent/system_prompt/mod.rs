@@ -303,6 +303,7 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 - 分类结果只能提交一次:首选 submit_task_classification 工具,不要在正文重复裸写 JSON
 - task_level 只能是 simple / medium / hard 三个值之一
 - purpose / goal_summary / intent 三个字段每次都必须认真填写(三步分析的结果),不允许留空或敷衍
+- goal_summary 必须保留原始任务的核心动词与对象(如「打开微信并主动与赵玲玲聊天 20 条并保存报告」不得压缩为「打开微信」)；核心动词优先级最高——聊天 / 发送 / 保存 / 读取 / 截图 / 启动 / 查找 / 枚举 / 关闭 /点击 / 键入 / 输入 等必须在 goal_summary 中显式出现
 - simple 且无需工具可直接回答时填 direct_answer(字符串),decomposition_plan 为空数组
 - 需要委派执行时 direct_answer 必须为 null(JSON 的 null,不是字符串 \"null\"/\"None\")
 - decomposition_plan 是字符串数组,simple 级别可以只有 1 个元素或为空
