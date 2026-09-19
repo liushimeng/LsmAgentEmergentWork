@@ -18,6 +18,7 @@ pub mod cancel;
 pub mod compact;
 pub mod context;
 pub mod debug;
+pub mod decision_audit;
 pub mod extrace;
 pub mod json_repair;
 pub mod main_work;
