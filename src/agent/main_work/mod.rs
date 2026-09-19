@@ -210,12 +210,31 @@ impl MainWorkRunner {
                     depends_on: vec![],
                     acceptance: inherited,
                     delegate_to: AgentRole::SubAgent,
+                    // 2026-09-19 第 91 轮 P0-6/P0-8:允底 plan 默认底
+                    max_iterations: None, original_prompt: None,
                 }],
                 summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
                 degraded: true,
             }
         });
 
+        // 2026-09-19 第 91 轮 P0-6/P0-8:per-unit max_iterations 适配 + original_prompt 透传
+        // 给每个 WorkFlow,SubAgentRunner 能在 retry 轮真正看到
+        // 失败原因 + 整段用户原始 prompt,避免意图预失
+        for wf in plan.workflows.iter_mut() {
+            if wf.original_prompt.is_none() {
+                wf.original_prompt = original_prompt.map(str::to_string);
+            }
+            // 长任务推荐 max_iterations=24(从 16 半 50%)
+            if wf.max_iterations.is_none() {
+                let is_long = wf.steps.iter().any(|s| {
+                    s.contains("长") || s.contains("待") || s.contains("每分钟") || s.contains("秒")
+                }) || wf.steps.len() >= 5;
+                if is_long {
+                    wf.max_iterations = Some(24);
+                }
+            }
+        }
         // 2026-09-16 第 67 轮:同应用桌面窗口操控链自动合并(保留真实窗口焦点连续性)
         coalesce_same_app_window_workflows(&mut plan);
         // 2026-09-17 第 75 轮:兜底 plan 也跑一次关键词推断。

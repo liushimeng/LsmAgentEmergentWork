@@ -533,6 +533,8 @@ impl MultiAgentOrchestrator {
             // 写入 trace 供 QC + TUI delegate_mismatch 诊断
             intended_role: Some(exec_role),
             // 2026-09-17 第 82+ 轮 P0-1:simple 档无目标应用自动启动(simple 任务通常无需)。
+            // 2026-09-19 第 91 轮 P0-7/P0-8:
+            retry_count: 0, retry_hint: String::new(), max_iterations: None,
         };
         emit_progress(progress, format!("wf-1 {exec_label} 执行中…"));
         let sub_started = std::time::Instant::now();

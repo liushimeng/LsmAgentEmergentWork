@@ -153,6 +153,8 @@ impl MultiAgentOrchestrator {
                                     depends_on: vec![],
                                     acceptance: vec![],
                                     delegate_to: AgentRole::SubAgent,
+                                    // 2026-09-19 第 91 轮 P0-6/P0-8:允底^73底]e73
+                                    max_iterations: None, original_prompt: None,
                                 },
                                 Err(QualityFailure {
                                     source: AgentRole::SubAgent,
@@ -549,12 +551,20 @@ pub(super) fn build_subflow_input(
     // 拆分 WorkFlowSpec 时额外携带 original_prompt 字段。
     // (2026-09-18 第 89 轮:跨单元浏览器页面复用不再由编排层注入提示 ——
     //  SubAgentRunner 入口统一探测存活页面并注入「已打开的浏览器页面」列表。)
-    let description = format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n"));
+    // 2026-09-19 第 91 轮 P0-7:retry_hint 真正接入 description 避免子单元重复撞同样墙(连续 3 轮 retry 都撞 max_iter 失败)
+    let mut description = format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n"));
+    if !retry_hint.trim().is_empty() {
+        description.push_str(&format!(
+            "\n\n⚠️ 上一轮本单元失败原因,必须改变策略\n{retry_hint}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 跃跃环境异常等)。"
+        ));
+    }
+    // 2026-09-19 第 91 轮 P0-8:wf.original_prompt 透传整段用户原始 prompt(允底回退 wf.name)
+    let original_prompt = wf.original_prompt.clone().or_else(|| Some(wf.name.clone()));
     SubFlowInput {
         id: format!("{}.step", wf.id),
         description,
         expected_output: wf.acceptance.join("; "),
-        original_prompt: Some(wf.name.clone()),
+        original_prompt,
         depends_on_outputs: deps,
         sibling_outputs: vec![],
         pending_agent_messages: vec![],
@@ -562,5 +572,8 @@ pub(super) fn build_subflow_input(
         // Runner 在 trace.intended_role 落地,供 collect_failure_signals 计算
         // delegate_mismatch 弱信号。
         intended_role: Some(wf.delegate_to),
+        retry_count: 0,
+        retry_hint: retry_hint.to_string(),
+        max_iterations: wf.max_iterations,
     }
 }

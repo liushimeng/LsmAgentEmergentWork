@@ -30,6 +30,12 @@ pub struct WorkFlowSpec {
         deserialize_with = "lenient_delegate_to"
     )]
     pub delegate_to: AgentRole,
+    /// 2026-09-19 第 91 轮 P0-6:per-unit 计算迭代上限(None 表示 Runner 默认;SubAgentRunner 默认 16,长任务可达 24~32).
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    /// 2026-09-19 第 91 轮 P0-8:Main-WorkRunner 在拆解 WorkFlowSpec 时填入(整段用户原始 prompt);SubAgentRunner 透传给 SubAgent,允底 SubFlowInput.description 内原样保留.
+    #[serde(default)]
+    pub original_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

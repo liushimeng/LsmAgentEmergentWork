@@ -49,6 +49,21 @@ pub struct SubFlowInput {
     /// `None` 表示 Orchestrator 未注入(老调用点兼容)。
     #[serde(default)]
     pub intended_role: Option<AgentRole>,
+    /// 2026-09-19 第 91 轮 P0-7/P0-8:
+    /// - `retry_count`: 本单元目前已进入 retry 第几轮(从 0 开始);
+    /// Runner 写入 trace.failure_signals(方便 QC 判 Fail 时包含 retry 回次信息)。
+    #[serde(default)]
+    pub retry_count: usize,
+    /// 2026-09-19 第 91 轮 P0-8:
+    /// - `retry_hint`: 上一轮失败原因(由 Orchestrator 透传)。runner 将其接入 description 内印刷,
+    /// SubAgent 在 retry 轮明示看到失败信息以避免原样重做同样的事(历史 llaew_*.log 实证第四轮都撞同墙)。
+    #[serde(default)]
+    pub retry_hint: String,
+    /// 2026-09-19 第 91 轮 P0-6:
+    /// - `max_iterations`: per-unit 计算迭代上限(SubAgentRunner 默认 16,长任务可递增至 24~32);
+    /// `None` 表示使用 Runner 默认值。
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
 }
 
 impl SubFlowInput {
@@ -308,11 +323,24 @@ impl SubAgentRunner {
         // trace.intended_role 反映 WorkFlow 期望的角色(供 delegate_mismatch 对账)。
         let runner_role = Some(AgentRole::SubAgent);
         let intended_role = input.intended_role;
+        // 2026-09-19 第 91 轮 P0-6:per-unit max_iterations override
+        // SubAgentRunner 默认 16,为长任务(长时待/多轮)审核 Main-Work 提供
+        // 的 max_iterations 值(限 4..=64);默认 16 实现仍需超过 4 的交付
+        let per_unit_max = input.max_iterations.unwrap_or(self.max_iterations).clamp(4, 64);
+        let per_unit_agent = if per_unit_max != self.max_iterations {
+            // Agent 不可 Clone,通过 with_max_iterations 重新构造(共享 llm + profile)
+            Some(crate::agent::Agent::with_max_iterations(
+                crate::agent::Agent::new(self.agent.llm(), self.agent.profile().clone()),
+                per_unit_max,
+            ))
+        } else {
+            None
+        };
+        let agent_ref = per_unit_agent.as_ref().unwrap_or(&self.agent);
 
         // 而是包装成一段失败摘要文本 + 已填充 early_terminated 的 trace,
         // 让 Quality-Check 仍可基于 trace 判定 Fail。
-        let (text, usage, mut trace) = match self
-            .agent
+        let (text, usage, mut trace) = match agent_ref
             .run_session_cancellable(&mut sub_session, cancel)
             .await
         {
@@ -882,6 +910,9 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            retry_count: 0,
+            retry_hint: String::new(),
+            max_iterations: None,
         };
 
         let outcome = runner
@@ -927,6 +958,9 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            retry_count: 0,
+            retry_hint: String::new(),
+            max_iterations: None,
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("wf-1.step-1"));
@@ -954,6 +988,9 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            retry_count: 0,
+            retry_hint: String::new(),
+            max_iterations: None,
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("上游产物"));
@@ -976,6 +1013,9 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            retry_count: 0,
+            retry_hint: String::new(),
+            max_iterations: None,
         };
         let prompt = input.to_user_prompt();
         assert!(!prompt.contains("用户原始输入"));
@@ -994,6 +1034,9 @@ mod tests {
             pending_agent_messages: vec![],
             // 2026-09-17 第 75 轮:SubAgent Runner 自测试默认走 SubAgent。
             intended_role: Some(AgentRole::SubAgent),
+            retry_count: 0,
+            retry_hint: String::new(),
+            max_iterations: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         // original_prompt 默认值是 null,确保 SubAgent 输入 JSON 兼容老实现

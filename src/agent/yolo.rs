@@ -186,11 +186,34 @@ impl YoloRunner {
             yolo_session.context_mut().push(msg.clone());
         }
         let (text, usage, _trace) = self.yolo_agent.run_session(&mut yolo_session).await?;
-        let mut classification = parse_classification(&text).unwrap_or_else(|e| {
-            YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("Yolo 分类解析失败,降级为 simple: {}", e);
-            degraded_classification(context)
-        });
+        let mut classification = match parse_classification(&text) {
+            Ok(c) => c,
+            Err(parse_err) => {
+                YOLO_PARSE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    error = %parse_err,
+                    "Yolo 分类解析失败,尝试重试一次"
+                );
+                let retry_text = retry_classify_with_hint(
+                    &self.yolo_agent, session_id, context, &text,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Yolo 重试也失败,降级为 simple");
+                    text.clone()
+                });
+                match parse_classification(&retry_text) {
+                    Ok(c) => {
+                        tracing::info!("Yolo 重试一次后解析成功(避免降级)");
+                        c
+                    }
+                    Err(e2) => {
+                        tracing::warn!(error = %e2, "Yolo 重试后仍解析失败,降级为 simple");
+                        degraded_classification(context)
+                    }
+                }
+            }
+        };
         // 2026-09-16 第 59 轮:从上下文提取用户原始 prompt 推断 suggested_delegate
         let user_prompt = extract_user_prompt(context);
         if !user_prompt.is_empty() {
@@ -271,6 +294,49 @@ fn degraded_goal_from_context(context: &[ChatMessage]) -> String {
         "(解析失败,已降级)".to_string()
     } else {
         flat.chars().take(300).collect()
+    }
+}
+
+/// 2026-09-19 第 91 轮 P0-3:Yolo 解析失败时 LLM 重试一次。
+///
+/// 在原 session context 后追加一条 user 消息,把上一次模型输出 + 强约束
+/// 「只输出 JSON,字段见原提示词」追加进去,让 Yolo Agent 重新跑一次(本身
+/// 已 max_iterations=4,这里只是再调一次 `run_session`)。返回新文本;
+/// 失败/异常时返回 Err,供 classify 走降级分支。
+async fn retry_classify_with_hint(
+    agent: &Agent,
+    session_id: &str,
+    context: &[ChatMessage],
+    bad_output: &str,
+) -> Result<String> {
+    let mut retry_session = Session::new();
+    retry_session.id = session_id.to_string();
+    for m in context {
+        retry_session.context_mut().push(m.clone());
+    }
+    let truncated = truncate_for_hint(bad_output);
+    retry_session.context_mut().push(ChatMessage::user(format!(
+        "\n\n⚠️ 你上一轮输出无法被解析为合法的 JSON(系统已尝试 JSON 修复,仍失败):\n\
+         ```\n{truncated}\n```\n\n\
+         请**严格只输出 JSON 对象**(可包在 ```json 代码块):\n\
+         - task_level ∈ [\"simple\", \"medium\", \"hard\"]\n\
+         - goal_summary / purpose / intent(中文字符串)\n\
+         - steps / decomposition_plan / suggested_delegate(可选)\n\
+         不要再输出 Markdown 解释或 ``` fences 之外的文字。",
+    )));
+    let (text, _usage, _trace) = agent.run_session(&mut retry_session).await?;
+    Ok(text)
+}
+
+/// 截断上轮输出用于 retry hint(避免再次产出 5000+ 字符的大文本)。\n/// CJK 按 char 计。
+fn truncate_for_hint(s: &str) -> String {
+    const MAX: usize = 600;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(MAX).collect();
+        out.push_str("\n...(truncated)");
+        out
     }
 }
 

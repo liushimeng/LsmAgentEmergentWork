@@ -293,7 +293,8 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
 - capability_probe(): **第 86 轮新增**——返回当前进程真实能力矩阵 `{accessibility, screen_recording, ocr_screenshot_cgwindow, screencapture_cli, inspect_control, coordinate_input, ax_warmup}` 与 next_action 推荐;LLM 第一步必须先调此 action,再决定走 AX/视觉/osascript_fallback 哪条路线。无参数。
 - osascript_run(osascript_script*, timeout_ms?): **第 86 轮新增,第 88 轮重写**——直接调 osascript 执行 AppleScript 片段,无需走 BashTool(绕开白名单)。macOS only。**argv 直传不经 shell**:脚本内双引号/反斜杠/多行 tell 块原样生效,不要再做 shell 转义;返回真实 exit_code + stderr,ok=false 时先按 stderr 修正脚本重试,**禁止改用 BashTool 执行 osascript 绕行**(窗口操控必须全程 MCP_Window_Use)。LLM 需要 System Events 键盘注入等场景使用。
 - chat_send(window_id*, text*, click_point?, input_field_path?, submit_key?, verify?, chat_log_path?): **复合 action**——一次调用完成「前置窗口 + 前台守卫 + 点击输入框 + Unicode 键入 + Enter + OCR 验证发送」,自动按 WindowCapability 选路线(控件树 / 视觉坐标 / osascript_fallback / 降级提示)。微信/钉钉/飞书 发送消息首选。**第 88 轮新增前台焦点守卫**:所有路线发送前先把目标窗口前置并轮询确认 frontmost,1.5s 拿不到前台就报 focus_acquire 失败**不盲打**(防止用户切窗后消息打进别的软件);osascript_fallback 路线 keystroke 前自动按窗口 bounds 比例估算点击右下输入框聚焦,Enter 前二次校验前台。**第 86 轮新增 osascript_fallback 路线**(AX 已授权 + 屏录未授权时,走 System Events keystroke,不依赖截图)。**chat_log_path 指定后,每条 send/recv/fail/focus_lost 落盘到该文件**。
-- chat_loop(window_id*, messages*, interval_seconds?, max_rounds?, reply_detect?, stop_on_reply?, target_query?, chat_log_path?): **复合 action**——长时多轮会话循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent, replies, reply_rate, focus_aborted, log}`。LLM 一次调用就能跑 N 轮聊天。**第 88 轮新增:连续 3 轮前台守卫失败自动止损中止**(focus_aborted=true),防止用户离开期间消息误发到其他软件。**chat_log_path 同样支持**。
+- chat_loop(window_id*, messages*, interval_seconds?, max_rounds?, reply_detect?, stop_on_reply?, target_query?, chat_log_path?):
+   (+第 91 轮 P0-4:click_point?/input_field_path? 透传 chat_send) **复合 action**——长时多轮会话循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent, replies, reply_rate, focus_aborted, log}`。LLM 一次调用就能跑 N 轮聊天。**第 88 轮新增:连续 3 轮前台守卫失败自动止损中止**(focus_aborted=true),防止用户离开期间消息误发到其他软件。**chat_log_path 同样支持**。
 - input_batch(window_id*, steps*, continue_on_error?): **第 90 轮新增复合 action**——一次调用编排「鼠标 + 键盘 + 控件树」任意顺序多步操作(同时操作鼠标键盘的统一入口),一次前台守卫 + 批量执行,步骤间零返场零焦点竞态。steps 数组每步 {\"op\":...}:
   鼠标:mouse_move{x,y} / mouse_click{x,y,button?=left|right|middle,clicks?=1|2,modifiers?} / mouse_drag{x,y,x2,y2,modifiers?} / mouse_scroll{x,y,direction?=down,lines?=3};
   键盘:key_press{keys}(组合键如 ctrl+a) / type_text{text};
@@ -394,6 +395,8 @@ impl Tool for McpWindowUseTool {
                 "stop_on_reply": { "type": "boolean", "description": "chat_loop 可选:对方回复后立即停下,默认 false" },
                 "target_query": { "type": "string", "description": "chat_loop 可选:对话对象名字,用于 OCR 检测对方回复" },
                 "chat_log_path": { "type": "string", "description": "chat_send/chat_loop 可选:每次 send/recv/fail 落盘的工作日志文件绝对路径;默认 <工作目录>/llaew_chat_<unix_ts>.log。QC 可 grep `[SEND]`/`[RECV]`/`[FAIL]` 行验证(第 86 轮新增)" },
+                "chat_loop_click_point": { "type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"], "description": "chat_loop 可选(第 91 轮 P0-4):向内部 chat_send 透传视觉路径的输入框中心坐标;Windows 必须依赖 OCR 或 bounds 比例估算的点击点以保证键入不会打到别处" },
+                "chat_loop_input_field_path": { "type": "string", "description": "chat_loop 可选(第 91 轮 P0-4):内部 chat_send 透传的 input_field_path(控件树路径,取 action=inspect)" },
                 "osascript_script": { "type": "string", "description": "osascript_run 必填:要执行的 AppleScript 片段(第 88 轮起 argv 直传 osascript -e,不经 shell;双引号/多行 tell 块原样书写,不要做 shell 转义;macOS only)" },
                 "osascript_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "description": "osascript_run 可选:超时毫秒,默认 5000" },
                 "steps": {

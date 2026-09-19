@@ -245,7 +245,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::MainWork, // 显式选错
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -264,7 +267,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec!["找到目标窗口 id".into()],
             delegate_to: AgentRole::MainWork, // 显式选错
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -279,7 +285,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), None);
     }
 
@@ -299,6 +308,8 @@ mod infer_tests {
                 },
                 acceptance: vec![format!("完成{step}")],
                 delegate_to: AgentRole::SubAgent,
+                // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+                max_iterations: None, original_prompt: None,
             }
         }
         let mut plan = WorkFlowPlan {
@@ -332,7 +343,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::MainWork, // 显式选错
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -352,7 +366,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec!["消息出现在会话窗口".into()],
             delegate_to: AgentRole::MainWork, // 显式选错
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -368,7 +385,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::MainWork, // 显式选错
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -393,7 +413,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec!["对话窗口出现 AI 回复内容".into()],
             delegate_to: AgentRole::SubAgent, // LLM 错判
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -412,7 +435,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -432,7 +458,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::MainWork, // LLM 错判
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -451,7 +480,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -468,7 +500,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent, // explicit 选 SubAgent
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), None);
     }
 
@@ -484,7 +519,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -504,7 +542,10 @@ mod infer_tests {
             depends_on: vec![],
             acceptance: vec![],
             delegate_to: AgentRole::SubAgent,
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 
@@ -527,7 +568,10 @@ mod infer_tests {
             // acceptance 里有 URL,触发 URL 检测
             acceptance: vec!["对话窗口出现 AI 回复,内容与 https://wenxin.baidu.com/ 一致".into()],
             delegate_to: AgentRole::SubAgent,
-        };
+        
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
+};
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
 }

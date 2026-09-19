@@ -283,7 +283,10 @@ pub fn format_task_result(
                             // 第 88 轮:优先提取 route/verified/rounds/exit_code 等
                             // 关键字段,解析失败回退原文截断。
                             Some(
-                                super::format_brief::window_use_output_brief(&tc.output_summary)
+                                super::format_brief::window_use_output_brief(
+                extract_json_field(&tc.args_json, "action").unwrap_or_default().as_str(),
+                &tc.output_summary,
+            )
                                     .unwrap_or_else(|| truncate_chars(&tc.output_summary, 80)),
                             )
                         } else {
@@ -572,7 +575,10 @@ pub fn format_failed_detail(
                             // 第 88 轮:优先提取 route/verified/rounds/exit_code 等
                             // 关键字段,解析失败回退原文截断。
                             Some(
-                                super::format_brief::window_use_output_brief(&tc.output_summary)
+                                super::format_brief::window_use_output_brief(
+                extract_json_field(&tc.args_json, "action").unwrap_or_default().as_str(),
+                &tc.output_summary,
+            )
                                     .unwrap_or_else(|| truncate_chars(&tc.output_summary, 80)),
                             )
                         } else {

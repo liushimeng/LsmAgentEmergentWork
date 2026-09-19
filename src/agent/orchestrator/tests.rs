@@ -47,6 +47,8 @@
             acceptance: vec!["OK".into()],
             delegate_to: AgentRole::SubAgent,
             // 2026-09-17 第 82+ 轮 P0-1:测试 fixture 无目标应用。
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
         };
         let input = build_subflow_input(&wf, &std::collections::HashMap::new(), "");
         assert_eq!(input.id, "wf-1.step");
@@ -71,6 +73,8 @@
             acceptance: vec!["修改完成".into()],
             delegate_to: AgentRole::SubAgent,
             // 2026-09-17 第 82+ 轮 P0-1:测试 fixture 无目标应用。
+            // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+            max_iterations: None, original_prompt: None,
         };
         let input = build_subflow_input(&wf, &deps, "");
         assert_eq!(input.depends_on_outputs.len(), 1);

@@ -307,7 +307,11 @@ impl ExecutionTrace {
             output_bytes,
             elapsed_ms,
             error_summary: error_truncated,
-            output_summary: output_summary.chars().take(512).collect(),
+            // 2026-09-19 第 91 轮 P0-5:per-tool 截断长度(MCP_Window_Use/MCP_Web_Use JSON 较大,提宽到 2048)
+            output_summary: output_summary.chars().take(match tool {
+                "MCP_Window_Use" | "MCP_Web_Use" => 2048,
+                _ => 512,
+            }).collect(),
         });
         if self.tool_call_log.len() > MAX_TOOL_CALL_LOG {
             // FIFO 截断最早条目

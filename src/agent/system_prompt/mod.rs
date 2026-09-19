@@ -948,6 +948,16 @@ control/input_batch/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 acti
     `[mouse_click 输入框, key_press ctrl+a, type_text 新文本, key_press enter]`;
     滑块拉满 `[mouse_drag x,y → x2,y2]`;多选 `[mouse_click+modifiers=ctrl, mouse_click+modifiers=ctrl]`。
     steps ≤ 40、整批 ≤ 60s;默认失败即停,可 continue_on_error=true。
+18. 长时等待/保活/心跳/定时类红线 (第 91 轮):
+    严禁用 Bash (Start-Sleep / sleep / python time.sleep / PowerShell Start-Sleep) 循环凑时长
+    (SubAgent 迭代上限 16, 50s×16=800s 仍可能不夠,且每轮浪费 token);
+    (a) 多轮聊天(每分钟 N 条,持续 M 分钟) → chat_loop(messages, interval_seconds, max_rounds) 一次;
+    (b) 周期检测 → input_batch(steps=[wait ms=N, ocr, ...]) 或多次 chat_loop;
+    (c) 限时等待 → action=open(wait_seconds=N) 已内置;
+19. Windows 平台专属 (第 91 轮):
+    (a) capability_probe 恒全 true;osascript_run/fallback Windows 不可用;
+    (b) 微信 4.x 自绘 UI 走 visual_no_input 路线 → 必须依赖 ocr 拿精坐标;
+    (c) chat_loop 默认 visual_no_input:一定要 ocr 取入框\70 70\u70b9 click_point 递\u4f20;
 "#;
 
 // =================== MCP_Web_Use 工具使用说明(2026-09-18 第 89 轮) ===================

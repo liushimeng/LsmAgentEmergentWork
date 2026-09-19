@@ -163,6 +163,8 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                 acceptance: Vec::new(),
                 delegate_to: AgentRole::SubAgent,
                 // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
+                // 2026-09-19 第 91 轮 P0-6/P0-8:允底
+                max_iterations: None, original_prompt: None,
             });
         }
         // I2c(2026-09-14 第 51 轮):兜底兼容表格行变体 `| **wf-1** | 名称 | 步骤 | 依赖 |`
@@ -217,6 +219,7 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                     depends_on,
                     acceptance: Vec::new(),
                     delegate_to: AgentRole::SubAgent,
+                    max_iterations: None, original_prompt: None,
                     // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
                 });
                 continue;
@@ -266,6 +269,7 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                     depends_on: Vec::new(),
                     acceptance: Vec::new(),
                     delegate_to: AgentRole::SubAgent,
+                    max_iterations: None, original_prompt: None,
                     // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
                 });
                 continue;

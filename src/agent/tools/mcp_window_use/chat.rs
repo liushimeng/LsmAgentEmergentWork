@@ -447,6 +447,32 @@ pub(super) async fn run_chat_send(args: Value) -> Result<String> {
     } else {
         "degraded_no_op"
     };
+    // 2026-09-19 第 91 轮 P0-4:Windows visual_no_input 自动 upgrade
+    #[cfg(target_os = "windows")]
+    let effective_click_point: Option<(i64, i64)> = if route == "visual_no_input" {
+        let wid_for_click = window_id.clone();
+        let res = tokio::task::spawn_blocking(move || -> Result<(i64, i64)> {
+            let info = lookup_window_info(&wid_for_click)?;
+            Ok(estimate_input_point(&info.bounds))
+        }).await;
+        match res {
+            Ok(Ok(p)) => Some(p),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "windows"))]
+    let effective_click_point: Option<(i64, i64)> = None;
+    // 确定 route:visual_no_input + effective_click_point 有值 升级 visual
+    let mut route_owned: String = if route == "visual_no_input" && effective_click_point.is_some() {
+        "visual".to_string()
+    } else {
+        route.to_string()
+    };
+    let route: &str = &route_owned;
+    // effective_click_point 进 run_driver_send 时使用,run_chat_send 将 effective_click_point 传给 run_driver_send
+
 
     tracing::debug!(
         target: "mcp_window_use::chat_send",
@@ -507,7 +533,7 @@ pub(super) async fn run_chat_send(args: Value) -> Result<String> {
         run_driver_send(
             route,
             &window_id,
-            click_point,
+            effective_click_point,
             input_field_path.clone(),
             &text,
             &submit_key,
@@ -972,6 +998,9 @@ async fn verify_sent(window_id: &str, text: &str) -> Result<bool> {
 /// - `chat_log_path` *(可选, 第 86 轮新增)*:send/recv/fail/summary 落盘路径
 pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
     let window_id = require_str(&args, "window_id", MCP_WINDOW_USE_TOOL_NAME)?.to_string();
+    // 2026-09-19 第 91 轮 P0-4:chat_loop 透传 click_point / input_field_path 给 chat_send
+    let click_point = parse_point(args.get("click_point"));
+    let input_field_path = get_str(&args, "input_field_path").map(str::to_string);
     let messages = parse_messages(args.get("messages"))?;
     if messages.is_empty() {
         return Err(tool_err(
@@ -1014,13 +1043,20 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
 
     for (i, msg) in messages.iter().take(total).enumerate() {
         // 发送(内部 chat_send 会自己落盘 [SEND] / [FAIL];第 88 轮起含前台守卫)
-        let send_args = json!({
+        let mut send_args = json!({
             "action": "chat_send",
             "window_id": window_id,
             "text": msg,
             "verify": false, // chat_loop 自己统一做 reply 检测
             "chat_log_path": chat_log_path,
         });
+        // 2026-09-19 第 91 轮 P0-4:透传 click_point / input_field_path 给 chat_send
+        if let Some((cx, cy)) = click_point {
+            send_args["click_point"] = json!({"x": cx, "y": cy});
+        }
+        if let Some(ref p) = input_field_path {
+            send_args["input_field_path"] = json!(p);
+        }
         let (sent_ok, focus_failed, send_error) =
             match super::McpWindowUseTool.execute(send_args).await {
                 Ok(s) => {

@@ -141,6 +141,8 @@ impl SquadDispatcher {
                 // 2026-09-17 第 75 轮:Squad 成员默认 SubAgent 委派。
                 intended_role: Some(crate::agent::context::AgentRole::SubAgent),
                 // 2026-09-17 第 82+ 轮 P0-1:Squad 成员默认无目标应用自动启动。
+                // 2026-09-19 第 91 轮 P0-7/P0-8:
+                retry_count: 0, retry_hint: String::new(), max_iterations: None,
             };
             let permit = semaphore
                 .clone()

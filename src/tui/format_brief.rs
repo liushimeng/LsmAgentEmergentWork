@@ -17,7 +17,7 @@ use super::format::truncate_chars;
 /// - run_sequence(第 91 轮):`steps_total / steps_ok` + `focus_lost_count / retried_steps / focus_aborted`;
 /// - osascript_run:`exit_code / stderr 首行`;
 /// - ocr:`block_count`;open/find:`window_id`;任意失败:`error`。
-pub(crate) fn window_use_output_brief(output_summary: &str) -> Option<String> {
+pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(output_summary.trim()).ok()?;
     if !v.is_object() {
         return None;
