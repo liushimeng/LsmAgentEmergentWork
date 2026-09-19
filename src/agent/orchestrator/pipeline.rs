@@ -537,36 +537,32 @@ impl MultiAgentOrchestrator {
             retry_count: 0, retry_hint: String::new(), max_iterations: None,
         };
         emit_progress(progress, format!("wf-1 {exec_label} 执行中…"));
-        let sub_started = std::time::Instant::now();
-        let outcome = self
-            .sub_agent
-            .run_unit_with_cancel(&input, session.id(), cancel)
-            .await
-            .map_err(|e| {
-                QualityFailure::from_agent_error(exec_role, &format!("{exec_label} 执行失败"), &e)
-            })?;
-        let sub_elapsed_ms = sub_started.elapsed().as_millis() as u64;
+        let retry_budget = self.cfg.unit_retry_budget;
+        // 第 95 轮:simple 档单元素同样享受单元级局部重试(QC 拒 retryable → 注入本单元
+        // 结论重试该元素,预算耗尽才升级为档位级失败)。
+        // 原内联 SubAgent + QC 执行路径统一收敛到 run_wf_unit,重复实现消除。
+        let ok = run_wf_unit(
+            self.sub_agent.clone(),
+            self.quality.clone(),
+            self.cfg.debug.clone(),
+            input,
+            c.goal_summary.clone(),
+            session.id().to_string(),
+            None,
+            cancel.clone(),
+            progress.clone(),
+            retry_budget,
+        )
+        .await?;
+        let sub_elapsed_ms = ok.wallclock_ms;
+        let qc_elapsed_ms = ok.qc_wallclock_ms;
+        let qc = ok.qc;
+        let outcome_text = ok.outcome_text;
+        let outcome_usage = ok.usage;
+        let outcome_trace = ok.trace;
+        let exec_role = ok.exec_role;
+        let total_usage = outcome_usage;
 
-        let qc_started = std::time::Instant::now();
-        let (qc, qc_usage) = self
-            .quality
-            .check_subagent_with_source(
-                exec_role,
-                &c.goal_summary,
-                &input.description,
-                &input.expected_output,
-                &outcome.text,
-                &outcome.trace,
-                session.id(),
-                // 2026-09-19 第 93 轮:simple 档 QC 同样透传用户原始输入
-                input.original_prompt.as_deref(),
-            )
-            .await
-            .map_err(|e| {
-                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
-            })?;
-        let qc_elapsed_ms = qc_started.elapsed().as_millis() as u64;
-        self.dbg_qc(&qc);
         emit_progress(
             progress,
             format!(
@@ -580,9 +576,9 @@ impl MultiAgentOrchestrator {
         );
 
         // 2026-09-09 第 14 轮:累加 Quality-Check 调用的 LLM 用量
-        let total_usage = add_usage(outcome.usage, qc_usage);
+        // 第 95 轮:total_usage 已在 run_wf_unit 内部累计完成(QC usage 含于 ok.usage)
 
-        if qc.verdict == Verdict::Pass {
+        {
             // WorkFlow 名称使用 goal_summary 截断(最多 20 字符),便于在 TUI 区分不同任务
             let wf_name = if c.goal_summary.chars().count() > 20 {
                 format!("{}…", c.goal_summary.chars().take(19).collect::<String>())
@@ -596,10 +592,10 @@ impl MultiAgentOrchestrator {
                 workflows: vec![WorkflowResult {
                     id: "wf-1".into(),
                     name: wf_name,
-                    subflow_outcome: outcome.text,
+                    subflow_outcome: outcome_text,
                     quality_report: qc,
-                    usage: outcome.usage,
-                    subflow_trace: Some(outcome.trace),
+                    usage: outcome_usage,
+                    subflow_trace: Some(outcome_trace),
                     exec_role,
                     wallclock_ms: sub_elapsed_ms,
                     qc_wallclock_ms: qc_elapsed_ms,
@@ -623,16 +619,6 @@ impl MultiAgentOrchestrator {
                 retry_log: Vec::new(),
                 layer_log: Vec::new(),
                 wallclock_ms: 0,
-            })
-        } else {
-            Err(QualityFailure {
-                source: exec_role,
-                reason: qc.issues.join("; "),
-                retryable: qc.retryable,
-                suggestion: qc.suggestion,
-                cancelled: false,
-                trace: Some(Arc::new(outcome.trace)),
-                usage: add_usage(outcome.usage, qc_usage),
             })
         }
     }

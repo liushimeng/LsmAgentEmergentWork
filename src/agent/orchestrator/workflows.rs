@@ -90,6 +90,8 @@ impl MultiAgentOrchestrator {
                 .collect();
 
             // 执行本层:单个直通(零 spawn 开销),多个 tokio::spawn + Semaphore 有界并发
+            // 第 95 轮:单元级局部重试预算(单元素语义=num_attempt - 1)
+            let retry_budget = self.cfg.unit_retry_budget;
             let layer_outcomes = if units.len() == 1 {
                 let (wf, input) = units.into_iter().next().expect("len==1");
                 let outcome = run_wf_unit(
@@ -102,6 +104,7 @@ impl MultiAgentOrchestrator {
                     None,
                     cancel.clone(),
                     progress.clone(),
+                    retry_budget,
                 )
                 .await;
                 vec![(wf, outcome)]
@@ -131,6 +134,7 @@ impl MultiAgentOrchestrator {
                             Some(sem),
                             cancel_tok,
                             progress_tx,
+                            retry_budget,
                         )
                         .await;
                         (wf, outcome)
@@ -261,22 +265,22 @@ impl MultiAgentOrchestrator {
     }
 }
 
-/// 单个 WorkFlow 执行单元的成功产物
-struct WfUnitOk {
-    outcome_text: String,
-    /// SubAgent 自身的 LLM 用量(2026-09-09 第 14 轮:Quality 用量单独累加,见 `qc_usage`)。
-    usage: Usage,
-    qc: QualityReport,
+/// 单个 WorkFlow 执行单元的成功产物(类型及字段 pub(super) 供 pipeline 简单档复用包装)。
+pub(super) struct WfUnitOk {
+    pub(super) outcome_text: String,
+    /// SubAgent 自身的 LLM 用量(2026-09-09 第 14 轮:Quality 用量单独累加,见 `qc_usage`;第 95 轮起含局部重试各次累计)。
+    pub(super) usage: Usage,
+    pub(super) qc: QualityReport,
     /// Quality-Check 调用的 LLM 用量(2026-09-09 第 14 轮:从 check_subagent 返回值中带回)。
-    qc_usage: Usage,
+    pub(super) qc_usage: Usage,
     /// SubAgent 执行轨迹(2026-09-09 第 05 轮)。
-    trace: ExecutionTrace,
+    pub(super) trace: ExecutionTrace,
     /// 2026-09-16 第 57 轮:执行器角色(SubAgent / WebUse)
-    exec_role: AgentRole,
-    /// 2026-09-16 第 57 轮:执行器墙钟耗时(毫秒)
-    wallclock_ms: u64,
-    /// 2026-09-16 第 57 轮:QC LLM 调用单独耗时(毫秒)
-    qc_wallclock_ms: u64,
+    pub(super) exec_role: AgentRole,
+    /// 2026-09-16 第 57 轮:执行器墙钟耗时(毫秒;第 95 轮起为局部重试各次累计)
+    pub(super) wallclock_ms: u64,
+    /// 2026-09-16 第 57 轮:QC LLM 调用单独耗时(毫秒;第 95 轮起为各次累计)
+    pub(super) qc_wallclock_ms: u64,
 }
 
 /// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
@@ -294,14 +298,17 @@ pub(super) async fn run_wf_unit(
     sub_agent: Arc<SubAgentRunner>,
     quality: Arc<QualityRunner>,
     debug: Option<Arc<DebugCollector>>,
-    input: SubFlowInput,
+    mut input: SubFlowInput,
     goal: String,
     session_id: String,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
     cancel: CancelToken,
     progress: Option<ProgressTx>,
+    // 第 95 轮:执行单元级局部重试预算(0 = 首执行 QC 拒即升级,旧行为)
+    retry_budget: usize,
 ) -> std::result::Result<WfUnitOk, QualityFailure> {
-    // 有界并发:先抢许可(对齐 atomcode Semaphore(3) FIFO 惯例)
+    // 有界并发:先抢许可(对齐 atomcode Semaphore(3) FIFO 惯例)。
+    // 整单元(含局部重试各次尝试)期间持续持有许可,互斥域不放大(同层单元间仍并行)。
     let _permit = match &semaphore {
         Some(sem) => Some(sem.acquire().await.map_err(|e| QualityFailure {
             source: AgentRole::SubAgent,
@@ -315,226 +322,323 @@ pub(super) async fn run_wf_unit(
         None => None,
     };
 
-    let wf_id = input.id.clone();
-    // 第 89 轮:执行器统一 SubAgent(delegate_to 仅作 trace 对账,不再有第二执行器)。
-    let exec_role = AgentRole::SubAgent;
-    let exec_label = "SubAgent";
-    // 2026-09-16 第 62 轮:拆分 stage 短标题 / 详情面板。
-    // 短标题(≤80 字符)进入 TUI stage 流 + waiting 心跳,避免每 1s
-    // 原地重写整段超长文本;详情面板走 [laew] 前缀,立即冲刷、不进
-    // waiting 心跳,任务快速完成时也保留。
-    // 运行日志(2026-09-17 第 69 轮):单元开始(职责 + 期望输出)
-    info!(
-        session = %session_id,
-        wf_id = %wf_id,
-        executor = exec_label,
-        description = %crate::logging::clip(&input.description),
-        expected = %crate::logging::clip(&input.expected_output),
-        "WorkFlow 单元开始"
-    );
-    emit_progress(
-        &progress,
-        format!("{wf_id} {exec_label} 执行中"),
-    );
-    emit_progress(
-        &progress,
-        format!(
-            "[laew] {wf_id} {exec_label} 详情 | 职责: {} | 期望: {}",
-            truncate_progress_text(&input.description, 80),
-            truncate_progress_text(&input.expected_output, 80)
-        ),
-    );
-    // 2026-09-16 第 57 轮:执行器墙钟计时 ——
-    // 用于 TaskResult.wallclock_ms / TUI 时间线展示。
-    let sub_started = std::time::Instant::now();
-    let outcome = sub_agent
-        .run_unit_with_cancel(&input, &session_id, &cancel)
-        .await
-        .map_err(|e| {
-            QualityFailure::from_agent_error(
-                exec_role,
-                &format!("{exec_label} 执行失败(wf={wf_id})"),
-                &e,
-            )
-        })?;
-    let wallclock_ms = sub_started.elapsed().as_millis() as u64;
-    // 2026-09-16 第 62 轮:单元结束走 [laew] 详情面板 + 短标题 stage。
-    // 详情面板显示 iter / tools / early_term / 错误摘要,即使 LLM 没调
-    // 工具也立即可见,避免用户看到「卡住 100 秒没动作」。
-    let summary_line = format!(
-        "{wf_id} {exec_label} 完成 | {:.1}s",
-        wallclock_ms as f64 / 1000.0
-    );
-    // 运行日志(2026-09-17 第 69 轮):单元执行完成 —— 迭代/工具成败/耗时/产物规模
-    info!(
-        session = %session_id,
-        wf_id = %wf_id,
-        executor = exec_label,
-        iterations = outcome.trace.iterations,
-        tool_calls = outcome.trace.tool_calls,
-        tool_ok = outcome.trace.tool_calls_ok,
-        tool_err = outcome.trace.tool_calls_err,
-        early_terminated = outcome.trace.early_terminated,
-        early_reason = %outcome.trace.early_terminate_reason,
-        wallclock_ms,
-        output_chars = outcome.text.chars().count(),
-        "WorkFlow 单元执行完成"
-    );
-    emit_progress(&progress, summary_line);
-    let detail_summary = format!(
-        "[laew] {wf_id} {exec_label} 执行证据 | iter={} tools={}({}成功/{}失败) early_term={} reason={}",
-        outcome.trace.iterations,
-        outcome.trace.tool_calls,
-        outcome.trace.tool_calls_ok,
-        outcome.trace.tool_calls_err,
-        outcome.trace.early_terminated,
-        if outcome.trace.early_terminate_reason.is_empty() {
-            "<none>".to_string()
-        } else {
-            truncate_progress_text_default(&outcome.trace.early_terminate_reason, 180)
+    // ===== 第 95 轮:单元级局部重试循环(方案 tmpPlan/2026-09-19_06) =====
+    // retry_hint 分层:attempt=0 用编排器注入的档位级 hint(build_subflow_input 已拼入
+    // description);attempt≥1 用本单元 QC 结论原位覆盖 hint 段,写入 retry_count 供 QC 对账。
+    // QC 拒 retryable=true 且预算未满 → 仅重试该单元(同层姊妹单元不受影响);预算耗尽
+    // 或不可重试 → 升级为档位级失败,走旧路径(档位级 retry_hint 回灌 / Yolo 回流)。
+    // usage 各次尝试累计进单元 usage(成功随 WfUnitOk,失败随 QualityFailure);
+    // wallclock 采用历次累计 —— 语义更准(单元总耗时),TUI 时间线不再被短跑误导。
+    let mut attempt = 0usize;
+    let mut unit_retry_hint = String::new();
+    let mut acc_sub_elapsed_ms: u64 = 0;
+    let mut acc_qc_elapsed_ms: u64 = 0;
+    let mut acc_usage = Usage::default();
+
+    loop {
+        if attempt > 0 {
+            // retry_hint 分层:attempt≥1 时用本单元上一轮 QC 结论原位覆盖 description 的
+            // hint 段(基础任务描述保留),retry_count 写入供 failure_signals 对账(第 91 轮)
+            input.retry_count = attempt;
+            apply_retry_hint_overlay(&mut input, &unit_retry_hint, attempt);
         }
-    );
-    emit_progress(&progress, detail_summary);
-    // 2026-09-16 第 62 轮:工具调用明细走 [laew] 详情面板,让 TUI 用户一眼看到
-    // 「到底调了哪些工具、参数是什么、为什么失败」。
-    // 2026-09-16 第 67 轮:明细 5 → 8 条,且追加**参数摘要**(query/window_id/path/
-    // action/text/x/y/command 等关键字段,截 60 字符)—— 微信任务复盘时
-    // 「到底让它点了哪个坐标」此前无从排查。
-    let tool_log = &outcome.trace.tool_call_log;
-    if !tool_log.is_empty() {
-        let recent: Vec<String> = tool_log
-            .iter()
-            .rev()
-            .take(8)
-            .rev()
-            .map(|entry| {
-                let status = if entry.ok { "✓" } else { "✗" };
-                let err_part = if entry.error_summary.is_empty() {
-                    String::new()
-                } else {
-                    format!(" err={}", truncate_progress_text_default(&entry.error_summary, 40))
-                };
-                let args_part = tool_args_digest(&entry.tool, &entry.args_json);
-                let args_part = if args_part.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {args_part}")
-                };
-                format!(
-                    "{}{} ({}ms){}{}",
-                    status,
-                    entry.tool,
-                    entry.elapsed_ms,
-                    args_part,
-                    err_part
+        // ===== SubAgent 执行(原逻辑) =====
+        // 2026-09-16 第 62 轮:拆分 stage 短标题 / 详情面板。
+        // 短标题(≤80 字符)进入 TUI stage 流 + waiting 心跳,避免每 1s
+        // 原地重写整段超长文本;详情面板走 [laew] 前缀,立即冲刷、不进
+        // waiting 心跳,任务快速完成时也保留。
+        // 运行日志(2026-09-17 第 69 轮):单元开始(职责 + 期望输出)
+        info!(
+            session = %session_id,
+            wf_id = %input.id,
+            executor = "SubAgent",
+            description = %crate::logging::clip(&input.description),
+            expected = %crate::logging::clip(&input.expected_output),
+            attempt = attempt,
+            "WorkFlow 单元开始"
+        );
+        emit_progress(
+            &progress,
+            format!("{} SubAgent 执行中{}",
+                input.id,
+                if attempt > 0 { "(局部重试)" } else { "" }
+            ),
+        );
+        emit_progress(
+            &progress,
+            format!(
+                "[laew] {} SubAgent 详情 | 职责: {} | 期望: {}",
+                input.id,
+                truncate_progress_text(&input.description, 80),
+                truncate_progress_text(&input.expected_output, 80)
+            ),
+        );
+        // 2026-09-16 第 57 轮:执行器墙钟计时 ——
+        // 用于 TaskResult.wallclock_ms / TUI 时间线展示。
+        let sub_started = std::time::Instant::now();
+        let outcome = sub_agent
+            .run_unit_with_cancel(&input, &session_id, &cancel)
+            .await
+            .map_err(|e| {
+                QualityFailure::from_agent_error(
+                    AgentRole::SubAgent,
+                    &format!("SubAgent 执行失败(wf={})", input.id),
+                    &e,
                 )
-            })
-            .collect();
-        emit_progress(
-            &progress,
-            format!(
-                "[laew] {wf_id} {exec_label} 工具调用(最近 {} 条): {}",
-                recent.len(),
-                recent.join(" | ")
-            ),
+            })?;
+        let sub_elapsed_ms = sub_started.elapsed().as_millis() as u64;
+        acc_sub_elapsed_ms = acc_sub_elapsed_ms.saturating_add(sub_elapsed_ms);
+        // 2026-09-16 第 62 轮:单元结束走 [laew] 详情面板 + 短标题 stage。
+        // 详情面板显示 iter / tools / early_term / 错误摘要,即使 LLM 没调
+        // 工具也立即可见,避免用户看到「卡住 100 秒没动作」。
+        let summary_line = format!(
+            "{} SubAgent 完成 | {:.1}s",
+            input.id,
+            sub_elapsed_ms as f64 / 1000.0
         );
-    }
-    if !outcome.trace.failure_signals.is_empty() {
-        emit_progress(
-            &progress,
-            format!(
-                "[laew] {wf_id} {exec_label} 失败信号: {}",
-                truncate_progress_text_default(&outcome.trace.failure_signals.join(","), 180)
-            ),
+        // 运行日志(2026-09-17 第 69 轮):单元执行完成 —— 迭代/工具成败/耗时/产物规模
+        info!(
+            session = %session_id,
+            wf_id = %input.id,
+            executor = "SubAgent",
+            iterations = outcome.trace.iterations,
+            tool_calls = outcome.trace.tool_calls,
+            tool_ok = outcome.trace.tool_calls_ok,
+            tool_err = outcome.trace.tool_calls_err,
+            early_terminated = outcome.trace.early_terminated,
+            early_reason = %outcome.trace.early_terminate_reason,
+            wallclock_ms = sub_elapsed_ms,
+            output_chars = outcome.text.chars().count(),
+            "WorkFlow 单元执行完成"
         );
-    }
-
-    // 2026-09-16 第 57 轮:QC LLM 调用单独计时。
-    let qc_started = std::time::Instant::now();
-    let (qc, qc_usage) = quality
-        .check_subagent_with_source(
-            exec_role,
-            &goal,
-            &input.description,
-            &input.expected_output,
-            &outcome.text,
-            &outcome.trace,
-            &session_id,
-            // 2026-09-19 第 93 轮:QC 透传用户原始输入(第一性事实),
-            // 识别「验收标准本身偏离任务」的编排降级(保活冒充聊天)。
-            input.original_prompt.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-            QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
-        })?;
-    let qc_wallclock_ms = qc_started.elapsed().as_millis() as u64;
-    // 运行日志(2026-09-17 第 69 轮):单元质检判定(详细报告由 quality.rs 统一记录)
-    info!(
-        session = %session_id,
-        wf_id = %wf_id,
-        executor = exec_label,
-        verdict = if qc.verdict == Verdict::Pass { "pass" } else { "fail" },
-        qc_wallclock_ms,
-        "WorkFlow 单元质检"
-    );
-    if let Some(d) = &debug {
-        d.record_quality(&qc);
-    }
-    emit_progress(
-        &progress,
-        format!(
-            "{wf_id} QC:{}",
-            if qc.verdict == Verdict::Pass {
-                "✅ 通过"
+        emit_progress(&progress, summary_line);
+        let detail_summary = format!(
+            "[laew] {} SubAgent 执行证据 | iter={} tools={}({}成功/{}失败) early_term={} reason={}",
+            input.id,
+            outcome.trace.iterations,
+            outcome.trace.tool_calls,
+            outcome.trace.tool_calls_ok,
+            outcome.trace.tool_calls_err,
+            outcome.trace.early_terminated,
+            if outcome.trace.early_terminate_reason.is_empty() {
+                "<none>".to_string()
             } else {
-                "❌ 未通过"
+                truncate_progress_text_default(&outcome.trace.early_terminate_reason, 180)
             }
-        ),
-    );
+        );
+        emit_progress(&progress, detail_summary);
+        // 2026-09-16 第 62 轮:工具调用明细走 [laew] 详情面板,让 TUI 用户一眼看到
+        // 「到底调了哪些工具、参数是什么、为什么失败」。
+        // 2026-09-16 第 67 轮:明细 5 → 8 条,且追加**参数摘要**(query/window_id/path/
+        // action/text/x/y/command 等关键字段,截 60 字符)—— 微信任务复盘时
+        // 「到底让它点了哪个坐标」此前无从排查。
+        let tool_log = &outcome.trace.tool_call_log;
+        if !tool_log.is_empty() {
+            let recent: Vec<String> = tool_log
+                .iter()
+                .rev()
+                .take(8)
+                .rev()
+                .map(|entry| {
+                    let status = if entry.ok { "✓" } else { "✗" };
+                    let err_part = if entry.error_summary.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" err={}", truncate_progress_text_default(&entry.error_summary, 40))
+                    };
+                    let args_part = tool_args_digest(&entry.tool, &entry.args_json);
+                    let args_part = if args_part.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {args_part}")
+                    };
+                    format!(
+                        "{}{} ({}ms){}{}",
+                        status,
+                        entry.tool,
+                        entry.elapsed_ms,
+                        args_part,
+                        err_part
+                    )
+                })
+                .collect();
+            emit_progress(
+                &progress,
+                format!(
+                    "[laew] {} SubAgent 工具调用(最近 {} 条): {}",
+                    input.id,
+                    recent.len(),
+                    recent.join(" | ")
+                ),
+            );
+        }
+        if !outcome.trace.failure_signals.is_empty() {
+            emit_progress(
+                &progress,
+                format!(
+                    "[laew] {} SubAgent 失败信号: {}",
+                    input.id,
+                    truncate_progress_text_default(&outcome.trace.failure_signals.join(","), 180)
+                ),
+            );
+        }
 
-    if qc.verdict == Verdict::Fail {
-        // 2026-09-16 第 62 轮:QC 失败详情走 [laew] 立即冲刷,即使任务快速
-        // 完成也保留 issues / suggestion,便于用户/QC 后续定位。
-        if !qc.issues.is_empty() {
-            emit_progress(
-                &progress,
-                format!(
-                    "[laew] {wf_id} QC问题: {}",
-                    truncate_progress_text_default(&qc.issues.join(" | "), 180)
-                ),
-            );
+        // 2026-09-16 第 57 轮:QC LLM 调用单独计时。
+        let qc_started = std::time::Instant::now();
+        let (mut qc, qc_usage) = quality
+            .check_subagent_with_source(
+                AgentRole::SubAgent,
+                &goal,
+                &input.description,
+                &input.expected_output,
+                &outcome.text,
+                &outcome.trace,
+                &session_id,
+                // 2026-09-19 第 93 轮:QC 透传用户原始输入(第一性事实),
+                // 识别「验收标准本身偏离任务」的编排降级(保活冒充聊天)。
+                input.original_prompt.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+            })?;
+        let qc_elapsed_ms = qc_started.elapsed().as_millis() as u64;
+        acc_qc_elapsed_ms = acc_qc_elapsed_ms.saturating_add(qc_elapsed_ms);
+        acc_usage = add_usage(acc_usage, add_usage(outcome.usage, qc_usage));
+        // 2026-09-17 第 69 轮:单元质检判定(详细报告由 quality.rs 统一记录)
+        info!(
+            session = %session_id,
+            wf_id = %input.id,
+            executor = "SubAgent",
+            verdict = if qc.verdict == Verdict::Pass { "pass" } else { "fail" },
+            retryable = qc.retryable,
+            qc_wallclock_ms = qc_elapsed_ms,
+            "WorkFlow 单元质检"
+        );
+        if let Some(d) = &debug {
+            d.record_quality(&qc);
         }
-        if !qc.suggestion.is_empty() {
-            emit_progress(
-                &progress,
+        emit_progress(
+            &progress,
+            format!(
+                "{} QC:{}",
+                input.id,
+                if qc.verdict == Verdict::Pass {
+                    "✅ 通过"
+                } else {
+                    "❌ 未通过"
+                }
+            ),
+        );
+
+        if qc.verdict == Verdict::Fail {
+            // 2026-09-16 第 62 轮:QC 失败详情走 [laew] 立即冲刷,即使任务快速
+            // 完成也保留 issues / suggestion,便于用户/QC 后续定位。
+            if !qc.issues.is_empty() {
+                emit_progress(
+                    &progress,
+                    format!(
+                        "[laew] {} QC问题: {}",
+                        input.id,
+                        truncate_progress_text_default(&qc.issues.join(" | "), 180)
+                    ),
+                );
+            }
+            if !qc.suggestion.is_empty() {
+                emit_progress(
+                    &progress,
+                    format!(
+                        "[laew] {} QC建议: {}",
+                        input.id,
+                        truncate_progress_text_default(&qc.suggestion, 180)
+                    ),
+                );
+            }
+            // ★第 95 轮:局部重试判定 —— retryable=true 且预算未满 → 注入本单元 QC 结论,
+            // 仅重试该单元(attempt+1);否则升级为档位级失败。
+            // QC 调用本身失败(LLM 层错)不消耗预算,直接抛(重试大概率同样失败)。
+            if qc.retryable && attempt < retry_budget {
+                // hint 暂存,下一次循环开头统一覆盖 input(description hint 段原位替换 +
+                // retry_count 写入),不在此处覆盖以免与循环头职责重复
+                unit_retry_hint = format!(
+                    "{}\nqc suggestion: {}",
+                    qc.issues.join("; "),
+                    qc.suggestion
+                );
+                emit_progress(
+                    &progress,
+                    format!(
+                        "[laew] {} 局部重试预算内(第 {}/{} 次尝试) → 注入本单元 QC 结论重试该单元",
+                        input.id,
+                        attempt + 1,
+                        retry_budget + 1
+                    ),
+                );
+                info!(
+                    session = %session_id,
+                    wf_id = %input.id,
+                    attempt = attempt + 1,
+                    hint_chars = unit_retry_hint.chars().count(),
+                    "WorkFlow 单元局部重试"
+                );
+                attempt += 1;
+                continue;
+            }
+            // 预算耗尽或不可重试 → 升级为档位级失败(旧路径)
+            let reason = if attempt > 0 {
                 format!(
-                    "[laew] {wf_id} QC建议: {}",
-                    truncate_progress_text_default(&qc.suggestion, 180)
-                ),
-            );
+                    "wf={}: 单元局部重试 {} 次仍失败: {}",
+                    input.id,
+                    attempt,
+                    qc.issues.join("; ")
+                )
+            } else {
+                format!("wf={}: {}", input.id, qc.issues.join("; "))
+            };
+            return Err(QualityFailure {
+                source: AgentRole::SubAgent,
+                reason,
+                retryable: qc.retryable,
+                suggestion: qc.suggestion,
+                cancelled: false,
+                trace: Some(Arc::new(outcome.trace)),
+                usage: acc_usage,
+            });
         }
-        return Err(QualityFailure {
-            source: exec_role,
-            reason: format!("wf={}: {}", wf_id, qc.issues.join("; ")),
-            retryable: qc.retryable,
-            suggestion: qc.suggestion,
-            cancelled: false,
-            trace: Some(Arc::new(outcome.trace)),
-            usage: add_usage(outcome.usage, qc_usage),
+
+        return Ok(WfUnitOk {
+            outcome_text: outcome.text,
+            usage: acc_usage,
+            qc,
+            qc_usage,
+            trace: outcome.trace,
+            exec_role: AgentRole::SubAgent,
+            wallclock_ms: acc_sub_elapsed_ms,
+            qc_wallclock_ms: acc_qc_elapsed_ms,
         });
     }
+}
 
-    Ok(WfUnitOk {
-        outcome_text: outcome.text,
-        usage: outcome.usage,
-        qc,
-        qc_usage,
-        trace: outcome.trace,
-        exec_role,
-        wallclock_ms,
-        qc_wallclock_ms,
-    })
+/// 第 95 轮:把「上一轮本单元失败原因」hint 段覆盖为局部重试版本。
+///
+/// description 中 hint 段由 build_subflow_input 以固定段头
+/// `"\n\n⚠️ 上一轮本单元失败原因"` 拼入;线圈 N 次重试时原位替换该段(基础段即任务名与
+/// 步骤完整保留),避免多轮 retry hint 线性叠加撑爆 context。
+pub(super) fn apply_retry_hint_overlay(input: &mut SubFlowInput, local_hint: &str, next_attempt: usize) {
+    const HINT_MARK: &str = "\n\n⚠️ 上一轮本单元失败原因";
+    let base = match input.description.find(HINT_MARK) {
+        Some(idx) => input.description[..idx].to_string(),
+        None => std::mem::take(&mut input.description),
+    };
+    // 局部重试段头与档位级段头同族,便于下次覆盖时定位一致;带「(局部重试 第 N 轮)」标记,
+    // 与档位级 hint 在 TUI [tool] 行 / 运行日志可区分。
+    input.description = format!(
+        "{}{}\n第 {} 轮局部重试,失败原因,必须改变策略改变策略\n{}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。",
+        base,
+        HINT_MARK,
+        next_attempt,
+        local_hint
+    );
 }
 
 pub(super) fn build_subflow_input(

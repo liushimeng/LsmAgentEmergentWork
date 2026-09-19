@@ -14,6 +14,12 @@ pub struct OrchestratorConfig {
     pub subagent_max_iterations: usize,
     /// 同层无依赖 WorkFlow 的最大并行数(信号量上限,对齐 atomcode Semaphore(3) 惯例)
     pub max_parallel_workflows: usize,
+    /// ★2026-09-19 第 95 轮:执行单元级局部重试预算 —— 单单元 QC 判 retryable 后,
+    /// **仅重试该单元**(不连坐同层姊妹单元)的次数;0 = 关闭(保持旧行为:QC 拒即升级到档位级),
+    /// 默认 2 = 单单元最多 3 次尝试(首执行 + 2 次局部重试),预算耗尽才升级到档位级
+    /// 重试(loop / Yolo 回流)。零配置即生效,向后兼容。
+    /// 实现见 tmpPlan/2026-09-19_06-单元级局部重试闭环方案.md。
+    pub unit_retry_budget: usize,
     /// 调试事件采集器(`-debug` 调试模式时注入,默认 None 零开销)
     pub debug: Option<Arc<DebugCollector>>,
 }
@@ -25,6 +31,7 @@ impl Default for OrchestratorConfig {
             history_limit: DEFAULT_HISTORY_LIMIT,
             subagent_max_iterations: 16,
             max_parallel_workflows: 3,
+            unit_retry_budget: 2,
             debug: None,
         }
     }

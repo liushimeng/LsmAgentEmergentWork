@@ -2,6 +2,8 @@
 
     use super::*;
     use crate::config::{Db, Paths};
+    // 第 95 轮:单元级局部重试辅助函数(workflows 私有,测试模块直接导入)
+    use crate::agent::orchestrator::workflows::apply_retry_hint_overlay;
     use tempfile::tempdir;
 
     fn fresh_orchestrator() -> (MultiAgentOrchestrator, tempfile::TempDir) {
@@ -271,4 +273,124 @@
         assert_eq!(back.retry_log[0].retry_count, 1);
         assert_eq!(back.workflows[0].exec_role, AgentRole::SubAgent);
         assert_eq!(back.workflows[0].wallclock_ms, 100);
+    }
+
+    // ========== 第 95 轮:单元级局部重试(方案 tmpPlan/2026-09-19_06) ==========
+
+    #[test]
+    fn unit_retry_budget_defaults_to_two() {
+        // 单元级局部重试预算默认 2:单单元最多 3 次尝试(首执行 + 2 次局部重试)
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.unit_retry_budget, 2, "默认预算应为 2");
+        // 向后兼容边界:0 = 首执行 QC 拒即升级,旧行为
+        let mut zero = OrchestratorConfig::default();
+        zero.unit_retry_budget = 0;
+        assert_eq!(zero.unit_retry_budget, 0);
+    }
+
+    #[test]
+    fn apply_retry_hint_overlay_replaces_existing_hint_segment() {
+        // 场景:build_subflow_input 已注入档位级 hint,局部重试时原位覆盖(不叠加)
+        let mut input = SubFlowInput {
+            id: "wf-1.step".into(),
+            description: "任务甲\n\n步骤:\n1. 读 a\n\n⚠️ 上一轮本单元失败原因,必须改变策略\n[档位级] 上轮 max_iter 耗尽\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。".into(),
+            expected_output: "OK".into(),
+            original_prompt: None,
+            depends_on_outputs: vec![],
+            sibling_outputs: vec![],
+            pending_agent_messages: vec![],
+            intended_role: Some(AgentRole::SubAgent),
+            retry_count: 0,
+            retry_hint: String::new(),
+            max_iterations: None,
+        };
+        apply_retry_hint_overlay(&mut input, "读文件失败: permission denied", 1);
+        // 基础段保留(wf.name + 步骤)
+        assert!(
+            input.description.starts_with("任务甲\n\n步骤:\n1. 读 a"),
+            "基础段必须保留,实际: {}",
+            &input.description[..40]
+        );
+        // hint 段被覆盖为局部重试版本(档位级文案消失)
+        assert!(
+            input.description.contains("⚠️ 上一轮本单元失败原因"),
+            "hint 段头必须保留"
+        );
+        assert!(
+            input.description.contains("第 1 轮局部重试"),
+            "段头必须带局部重试轮次标记,实际: {}",
+            input.description
+        );
+        assert!(
+            input.description.contains("读文件失败: permission denied"),
+            "局部 hint 内容必须写入"
+        );
+        assert!(
+            !input.description.contains("[档位级]"),
+            "档位级 hint 内容必须被覆盖清除,实际: {}",
+            input.description
+        );
+    }
+
+    #[test]
+    fn apply_retry_hint_overlay_appends_when_no_hint_segment() {
+        // 场景:simple 档直传 input(description 无 hint 段)→ 整段为基础段,追加局部 hint
+        let mut input = SubFlowInput {
+            id: "wf-1".into(),
+            description: "直接完成任务甲".into(),
+            expected_output: "完成".into(),
+            original_prompt: Some("原始 prompt".into()),
+            depends_on_outputs: vec![],
+            sibling_outputs: vec![],
+            pending_agent_messages: vec![],
+            intended_role: Some(AgentRole::SubAgent),
+            retry_count: 0,
+            retry_hint: String::new(),
+            max_iterations: None,
+        };
+        apply_retry_hint_overlay(&mut input, "QC: 输出不含 EXPECTED", 2);
+        assert!(
+            input.description.starts_with("直接完成任务甲"),
+            "无 hint 段时基础描述必须完整保留"
+        );
+        assert!(input.description.contains("第 2 轮局部重试"));
+        assert!(input.description.contains("QC: 输出不含 EXPECTED"));
+        // 覆盖幂等:再次调用应原位替换而非叠加
+        apply_retry_hint_overlay(&mut input, "第二次 QC 拒: 仍不含", 3);
+        assert!(
+            !input.description.contains("第 2 轮局部重试"),
+            "第二次覆盖应清除前一轮标记"
+        );
+        assert!(input.description.contains("第 3 轮局部重试"));
+        assert!(input.description.contains("第二次 QC 拒: 仍不含"));
+    }
+
+    #[test]
+    fn subflow_input_retry_fields_roundtrip() {
+        // SubFlowInput 的 retry_count / retry_hint 新字段必须 serde 完整往返
+        // (JSON 导出/Agent-Memory 记录会消费)
+        let input = SubFlowInput {
+            id: "wf-1.step".into(),
+            description: "任务甲".into(),
+            expected_output: "OK".into(),
+            original_prompt: Some("原始".into()),
+            depends_on_outputs: vec!["上游产物".into()],
+            sibling_outputs: vec![],
+            pending_agent_messages: vec![],
+            intended_role: Some(AgentRole::SubAgent),
+            retry_count: 2,
+            retry_hint: "第 2 轮局部重试 hint".into(),
+            max_iterations: Some(24),
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        let back: SubFlowInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.retry_count, 2);
+        assert_eq!(back.retry_hint, "第 2 轮局部重试 hint");
+        assert_eq!(back.max_iterations, Some(24));
+        // 反序列化兼容老 JSON(缺字段 → 默认值)
+        let legacy = r#"{"id":"wf-1.step","description":"d","expected_output":"e"}"#;
+        let old: SubFlowInput = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.retry_count, 0);
+        assert!(old.retry_hint.is_empty());
+        assert!(old.max_iterations.is_none());
     }
