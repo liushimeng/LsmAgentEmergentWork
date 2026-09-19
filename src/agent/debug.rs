@@ -554,8 +554,52 @@ pub struct ReportMeta {
     pub task: String,
     /// 当前模型描述,如 "anthropic my-provider/claude-x @ https://..."
     pub model: String,
+    /// Round 92: Yolo classification for Debug Agent activation control.
+    pub classification: Option<crate::agent::yolo::TaskClassification>,
 }
 
+/// Round 92: 判断本次任务是否应激活 Debug Agent 做 trace 语义评估。
+pub fn should_invoke_debug_agent(classification: &crate::agent::yolo::TaskClassification) -> bool {
+    classification.debug_eligible
+}
+
+fn format_skip_reason(c: &crate::agent::yolo::TaskClassification) -> String {
+    format!("任务非软件工程相关场景 (intent={}, purpose={})",
+        if c.intent.is_empty() { "<未提供>" } else { c.intent.as_str() },
+        if c.purpose.is_empty() { "<未提供>" } else { c.purpose.as_str() }
+    )
+}
+
+/// Round 92: 跳过模式说明性章节。
+pub fn render_skipped_evaluation(reason: &str, collector: &Arc<DebugCollector>) -> String {
+    let events = collector.events();
+    let llm_calls = events.iter().filter(|e| matches!(e, DebugEvent::LlmCall { .. })).count();
+    let llm_errors = events.iter().filter(|e| matches!(e, DebugEvent::LlmCall { error: Some(_), .. })).count();
+    let qc_total = events.iter().filter(|e| matches!(e, DebugEvent::QualityCheck { .. })).count();
+    let qc_pass = events.iter().filter(|e| matches!(e, DebugEvent::QualityCheck { verdict: Verdict::Pass, .. })).count();
+    format!(
+        "## Task Assessment
+
+- Source: Skipped Mode (Debug Agent not invoked)
+- Reason: {reason}
+- Summary: LLM calls {llm_calls} (errors {llm_errors}), QC {qc_total} (passed {qc_pass}). Task not classified as software engineering; skipping Debug Agent evaluation to save tokens.
+
+## Quality Report
+
+- LLM calls: {llm_calls} / errors {llm_errors}
+- QC chain: {qc_pass}/{qc_total} passed
+- Skip reason: Yolo marked debug_eligible=false
+
+## Issues
+
+- (None - skipped mode does not invoke LLM)
+
+## Suggestions
+
+- No debug suggestions for non-engineering tasks
+- To force evaluation, set TaskClassification::debug_eligible=true and rerun"
+    )
+}
 /// 检测 `meta.model` 字符串是否描述了一个 mock / 本地端点 provider。
 ///
 /// 触发任一条件即视为 mock:
@@ -663,15 +707,32 @@ pub async fn finalize_report(
     // Debug Agent 评估;失败不阻塞报告落盘 —— 改为填入「降级骨架」+ 头部横幅提示。
     // 关联报告: 2026-09-09_07 F-007-2
     // session_id 取自采集器(第 08 轮):Debug 请求与被评估任务同 X-Session-Id
-    let (evaluation, degraded) = match DebugRunner::new(llm)
-        .evaluate(&collector.session_id(), &trace, &stats)
-        .await
+    // Round 92: 选择是否调用 Debug Agent
+    let (evaluation, degraded, skipped_reason) = match meta
+        .classification
+        .as_ref()
+        .map(should_invoke_debug_agent)
+        .unwrap_or(true)
     {
-        Ok(text) => (text, false),
-        Err(e) => (
-            render_degraded_evaluation(&anyhow::Error::from(e), collector),
-            true,
-        ),
+        true => match DebugRunner::new(llm)
+            .evaluate(&collector.session_id(), &trace, &stats)
+            .await
+        {
+            Ok(text) => (text, false, None),
+            Err(e) => (
+                render_degraded_evaluation(&anyhow::Error::from(e), collector),
+                true,
+                None,
+            ),
+        },
+        false => {
+            let reason = meta
+                .classification
+                .as_ref()
+                .map(format_skip_reason)
+                .unwrap_or_else(|| "任务未提供分类信息".to_string());
+            (render_skipped_evaluation(&reason, collector), false, Some(reason))
+        }
     };
 
     // 2026-09-10 第 21 轮:Mock provider 识别 + 评估边界提示。
@@ -690,6 +751,13 @@ pub async fn finalize_report(
         ProviderKind::Real => "",
     };
 
+    // Round 92: 跳过模式标题
+    let skipped_banner = if let Some(reason) = &skipped_reason {
+        format!("\n> ⚠️ **Debug Agent 已跳过** —— {}\n", reason)
+    } else {
+        String::new()
+    };
+
     let banner = if degraded {
         "\n> ⚠️ **Debug Agent 评估失败,已降级到基于 trace 的自检骨架** — 下方「任务评估 / 质量报告 / 问题报告 / 优化建议」\
          章节由 `src/agent/debug.rs::render_degraded_evaluation` 根据 trace 指标自动归类,\
@@ -703,7 +771,7 @@ pub async fn finalize_report(
     let task_one_line = truncate_chars(&meta.task, 500).replace('\n', " ⏎ ");
     let content = format!(
         "# laew Debug 报告\n\n\
-         - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n{}{}\n\n\
+         - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n{}{}{}\n\n\
          ## 一、统计总览\n\n{}\n\n\
          ## 二、Debug Agent 评估\n\n{}\n\n\
          ## 三、原始 Trace 附录\n\n{}\n",
@@ -713,6 +781,7 @@ pub async fn finalize_report(
         meta.model,
         task_one_line,
         banner,
+        skipped_banner,
         mock_notice,
         stats,
         evaluation,
@@ -960,6 +1029,7 @@ mod tests {
             user_suggestion_if_fail: String::new(),
             yolo_degraded: false, // 关联报告: 2026-09-09_04 D-002
             suggested_delegate: None,
+            debug_eligible: true,
         });
         c.record_quality(&QualityReport::pass(AgentRole::SubAgent));
         c.record_task_end("executed", Usage::default());
@@ -1053,5 +1123,55 @@ mod tests {
         assert!(out.ends_with('9'), "应保留尾部(终态)");
         let short = "短文本";
         assert_eq!(head_tail_chars(short, 100), short);
+    }
+
+
+    /// Round 92: should_invoke_debug_agent should respect debug_eligible field.
+    #[test]
+    fn should_invoke_debug_agent_respects_field() {
+        use crate::agent::yolo::{TaskClassification, TaskLevel};
+        let mut c = TaskClassification {
+            task_level: TaskLevel::Simple,
+            purpose: "p".to_string(),
+            goal_summary: "test".to_string(),
+            intent: "info_query".to_string(),
+            agent_role: None,
+            decomposition_plan: vec![],
+            direct_answer: None,
+            user_suggestion_if_fail: String::new(),
+            yolo_degraded: false,
+            suggested_delegate: None,
+            debug_eligible: false,
+        };
+        assert!(!should_invoke_debug_agent(&c), "should skip when debug_eligible=false");
+        c.debug_eligible = true;
+        assert!(should_invoke_debug_agent(&c), "should invoke when debug_eligible=true");
+    }
+
+
+
+    /// Round 92: render_skipped_evaluation should produce 4-section output.
+    #[test]
+    fn render_skipped_evaluation_has_four_sections() {
+        let c = Arc::new(DebugCollector::new("sess-r92-skip"));
+        c.record_task_end("executed", Usage::default());
+        let reason = "Task not classified as software engineering (intent=chat)";
+        let md = render_skipped_evaluation(reason, &c);
+        assert!(md.contains("## Task Assessment"), "missing task assessment section: {md}");
+        assert!(md.contains("## Quality Report"), "missing quality report section: {md}");
+        assert!(md.contains("## Issues"), "missing issues section: {md}");
+        assert!(md.contains("## Suggestions"), "missing suggestions section: {md}");
+        assert!(md.contains("Skipped Mode"), "missing skipped-mode label: {md}");
+        assert!(md.contains(reason), "missing skip reason: {md}");
+    }
+
+    /// Round 92: TaskClassification serde default debug_eligible=true (backward compat).
+    #[test]
+    fn task_classification_debug_eligible_default_true() {
+        use crate::agent::yolo::TaskClassification;
+        // JSON missing debug_eligible field => default true (backward compatible)
+        let json = r#"{"task_level":"simple","goal_summary":"g","intent":"i"}"#;
+        let c: TaskClassification = serde_json::from_str(json).expect("parse");
+        assert!(c.debug_eligible, "default debug_eligible must be true for backward compat");
     }
 }

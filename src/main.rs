@@ -462,6 +462,16 @@ async fn run_one_shot(
 
     // debug 模式:任务结束后生成 Debug 报告(用未装饰的 llm 驱动 Debug Agent,避免自我采集递归)
     if let Some(collector) = collector {
+        // Round 92: extract classification from outcome for Debug Agent activation control.
+        let classification = match &outcome {
+            lsm_agent::agent::orchestrator::OrchestrationOutcome::DirectAnswer { classification, .. }
+            | lsm_agent::agent::orchestrator::OrchestrationOutcome::Failed { classification, .. } => {
+                Some(classification.clone())
+            }
+            lsm_agent::agent::orchestrator::OrchestrationOutcome::Executed { result } => {
+                Some(result.classification.clone())
+            }
+        };
         let meta = lsm_agent::agent::debug::ReportMeta {
             mode: mode.to_string(),
             task: prompt.clone(),
@@ -472,6 +482,7 @@ async fn run_one_shot(
                 active.model_name,
                 active.end_point
             ),
+            classification,
         };
         let report_dir = paths.root_dir.join("DebugReport");
         match lsm_agent::agent::debug::finalize_report(&collector, llm.clone(), &report_dir, &meta)

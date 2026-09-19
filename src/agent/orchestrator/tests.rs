@@ -224,6 +224,7 @@
                 user_suggestion_if_fail: String::new(),
                 yolo_degraded: false,
                 suggested_delegate: None,
+                debug_eligible: true,
             },
             plan_doc: None,
             workflows: vec![WorkflowResult {

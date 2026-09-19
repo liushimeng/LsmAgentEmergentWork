@@ -1518,6 +1518,7 @@ mod format_task_result_for_context_tests {
                 user_suggestion_if_fail: String::new(),
                 yolo_degraded: false,
                 suggested_delegate: None,
+                debug_eligible: true,
             },
             plan_doc: None,
             workflows,
@@ -1688,6 +1689,7 @@ mod format_task_result_cost_hint_tests_support {
                 user_suggestion_if_fail: String::new(),
                 yolo_degraded: false,
                 suggested_delegate: None,
+                debug_eligible: true,
             },
             plan_doc: None,
             workflows: vec![WorkflowResult {

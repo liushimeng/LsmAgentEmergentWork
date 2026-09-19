@@ -621,10 +621,22 @@ impl TuiSession {
             ),
             _ => "<未配置>".to_string(),
         };
+        // Round 92: extract classification from handle_result for Debug Agent activation control.
+        let classification = match handle_result {
+            Ok(crate::agent::orchestrator::OrchestrationOutcome::DirectAnswer { classification, .. })
+            | Ok(crate::agent::orchestrator::OrchestrationOutcome::Failed { classification, .. }) => {
+                Some(classification.clone())
+            }
+            Ok(crate::agent::orchestrator::OrchestrationOutcome::Executed { result }) => {
+                Some(result.classification.clone())
+            }
+            Err(_) => None,
+        };
         let meta = ReportMeta {
             mode: "TUI 多轮".to_string(),
             task: task.to_string(),
             model,
+            classification,
         };
         let report_dir = self.paths.root_dir.join("DebugReport");
         match finalize_report(collector, raw_llm, &report_dir, &meta).await {

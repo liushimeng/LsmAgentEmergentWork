@@ -107,8 +107,20 @@ pub struct TaskClassification {
     /// 浏览器操控由 SubAgent-Work 的 MCP_Web_Use 工具承担)。
     #[serde(default)]
     pub suggested_delegate: Option<String>,
+    /// 2026-09-19 Round 92: Debug Agent activation scope control.
+    /// Yolo decides whether the task is software engineering related.
+    /// Default true (backward compatible).
+    /// See docs/Debug模式与DebugAgent设计/02-DebugAgent激活范围强化与软件工程场景收敛.md
+    #[serde(default = "default_debug_eligible")]
+    pub debug_eligible: bool,
 }
 
+
+
+/// Serde default for TaskClassification::debug_eligible (backward compatible).
+fn default_debug_eligible() -> bool {
+    true
+}
 impl TaskClassification {
     /// 获取 agent_role(若为 None 则按 task_level 推断)
     pub fn effective_agent_role(&self) -> AgentRole {
@@ -360,6 +372,7 @@ fn degraded_classification(context: &[ChatMessage]) -> TaskClassification {
         user_suggestion_if_fail: String::new(),
         yolo_degraded: true, // 关联报告: 2026-09-09_04 D-002
         suggested_delegate,
+        debug_eligible: true,
     }
 }
 
@@ -789,6 +802,7 @@ mod tests {
             user_suggestion_if_fail: String::new(),
             yolo_degraded: false, // 关联报告: 2026-09-09_04 D-002(新字段)
             suggested_delegate: None,
+            debug_eligible: true,
         };
         let prompt = build_work_prompt(&c);
         assert!(prompt.contains("验证"));
@@ -823,6 +837,7 @@ mod tests {
             user_suggestion_if_fail: String::new(),
             yolo_degraded: true,
             suggested_delegate: None,
+            debug_eligible: true,
         };
         let prompt = build_work_prompt(&c);
         assert!(
@@ -853,6 +868,7 @@ mod tests {
             user_suggestion_if_fail: String::new(),
             yolo_degraded: false,
             suggested_delegate: None,
+            debug_eligible: true,
         };
         let prompt = build_work_prompt(&c);
         assert!(
