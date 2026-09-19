@@ -301,7 +301,8 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
   控件树(自动走无障碍→消息→物理优先级链):click{path} / set_text{path,text} / get_text{path,key?}(读取值进 results 回传);
   wait{ms}(≤5000)。每步可选 delay_ms(≤2000);steps ≤ 40;整批 ≤ 60s;默认失败即停,continue_on_error=true 继续。典型:点输入框→ctrl+a→type_text→enter 一次完成;滑块/文件用 mouse_drag;多选用 mouse_click+modifiers=ctrl。
 - run_sequence(window_id*, steps*, on_error?, retry_times?, retry_delay_ms?, focus_guard?, focus_wait_ms?, max_total_ms?, log_path?): **第 91 轮新增「连续工作模式」复合 action**——先摸索排查窗口结构(capability_probe→open/list/find→inspect/ocr),统一 plan 之后,把一整套动作(含验证/等待)一次调用连续执行完毕,逐步落盘执行记录,异常按策略处理。
-  在 input_batch 10 个 op 之上新增 3 个验证/等待 op:assert_text{path,contains}(关键节点断言)/ wait_for_text{path,contains,timeout_ms≤30000,poll_ms}(轮询等异步 UI 就绪,替代盲 wait)/ wait_front{timeout_ms≤30000}(显式恢复前台);wait 上限放宽到 30000。
+  在 input_batch 10 个 op 之上新增 3 个验证/等待 op:assert_text{path,contains}(关键节点断言;**第 93 轮起控件树为空/自绘 UI 时自动整窗 OCR 兜底,path="/" 即断言窗口可见文本,微信 4.x 推荐**)/ wait_for_text{path,contains,timeout_ms≤30000,poll_ms}(轮询等异步 UI 就绪,替代盲 wait;同样 OCR 兜底)/ wait_front{timeout_ms≤30000}(显式恢复前台);wait 上限放宽到 30000。
+  **第 93 轮纯 wait 自检**:整批全 wait/断言、零 UI 动作时返回 wait_only=true + 警示——纯等待不构成「操作软件」的完成证据,交互类任务必须含 mouse_click/type_text/chat_send 等动作步骤。
   **逐步焦点守护(focus_guard 默认 true)**:每个物理输入步骤(mouse_click/mouse_drag/mouse_scroll/key_press/type_text/click)执行前确认窗口仍在前台——用户随时会用键盘鼠标切窗;焦点丢失自动 bring_to_front + 轮询 ≤focus_wait_ms(默认 5000)重夺,连续 3 次重夺失败止损中止(focus_aborted=true,防止误输入其他软件,与 chat_loop 止损同源)。
   **错误策略 on_error**:abort(默认,失败即停,剩余标记 skipped)/ continue(记 failed_steps 继续)/ retry(逐步自动重试,retry_times≤3 默认 1、retry_delay_ms≤5000 默认 500,步骤级同名键覆盖);步骤级 optional=true 容忍非关键步骤失败。
   **执行记录**:每步落盘 [STEP]/[RETRY]/[FOCUS_LOST]/[FOCUS_REGAINED]/[FAIL] + 末尾 [SUMMARY] 到 log_path(默认 <工作目录>/laew_sequence_<unix_ts>.log);返回 steps 逐步记录 + results(get_text 读取值)+ failed_steps + focus_lost_count。

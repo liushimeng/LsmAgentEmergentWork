@@ -51,6 +51,10 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
             parts.push(format!("retries={n}"));
         }
     }
+    // 第 93 轮:纯 wait 批次(零 UI 动作)醒目标记 —— 纯等待不是完成证据。
+    if get_b("wait_only") == Some(true) {
+        parts.push("⚠wait_only".to_string());
+    }
     if get_b("focus_aborted") == Some(true) && get_n("total_sent").is_none() {
         parts.push("focus_aborted!".to_string());
     }
@@ -165,5 +169,18 @@ mod tests {
         let b = window_use_output_brief("", out).unwrap();
         assert!(b.contains("steps=4/7"), "{b}");
         assert!(b.contains("focus_aborted!"), "{b}");
+    }
+
+    #[test]
+    fn brief_run_sequence_wait_only_round93() {
+        // 第 93 轮:纯 wait 批次(零 UI 动作)摘要带 ⚠wait_only 警示。
+        let out = r#"{"ok": true, "action": "run_sequence", "steps_total": 18, "steps_ok": 16, "wait_only": true, "focus_lost_count": 0, "retried_steps": 2, "focus_aborted": false}"#;
+        let b = window_use_output_brief("", out).unwrap();
+        assert!(b.contains("steps=16/18"), "{b}");
+        assert!(b.contains("⚠wait_only"), "{b}");
+        // 有 UI 动作的批次不带警示
+        let out = r#"{"ok": true, "action": "run_sequence", "steps_total": 6, "steps_ok": 6, "wait_only": false}"#;
+        let b = window_use_output_brief("", out).unwrap();
+        assert!(!b.contains("wait_only"), "{b}");
     }
 }

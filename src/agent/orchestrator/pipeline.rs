@@ -558,6 +558,8 @@ impl MultiAgentOrchestrator {
                 &outcome.text,
                 &outcome.trace,
                 session.id(),
+                // 2026-09-19 第 93 轮:simple 档 QC 同样透传用户原始输入
+                input.original_prompt.as_deref(),
             )
             .await
             .map_err(|e| {

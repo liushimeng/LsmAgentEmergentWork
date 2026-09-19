@@ -59,6 +59,58 @@ impl QualityReport {
     }
 }
 
+/// 组装 SubAgent 单元 QC 提示词(纯函数,2026-09-19 第 93 轮抽出便于单测)。
+///
+/// F10(2026-09-10 第 25 轮):判定基准是「本单元职责」,整体目标仅作背景。
+/// 此前 prompt 只给整体 goal,QC(真实 LLM)按整体目标判单元产物,SubAgent
+/// 只完成了 wf-1 前置检查也被判「核心任务未完成」→ 无效重试风暴
+/// (Debug 报告 debug_report_20260910_150805 问题报告 P1)。
+///
+/// 第 93 轮:`original_prompt`(用户原始输入)作为第一性事实插入 ——
+/// 实测「主动聊天」被编排层降级为「保活等待」时,单元职责/期望输出均已失真,
+/// QC 只对照失真标准必然蒙混通过;有原始输入时 QC 可识别「验收标准本身偏离任务」。
+fn build_unit_qc_prompt(
+    goal: &str,
+    unit_scope: &str,
+    expected_output: &str,
+    actual_output: &str,
+    trace_summary: &str,
+    original_prompt: Option<&str>,
+) -> String {
+    let unit_label = "SubAgent 单元";
+    let original_section = match original_prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(orig) => format!(
+            "第一性事实 · 用户原始输入(最高优先级,用于校验单元职责是否偏离任务):\n{orig}\n"
+        ),
+        None => String::new(),
+    };
+    let degradation_rule = if original_section.is_empty() {
+        String::new()
+    } else {
+        "\n\
+         反降级规则:若「本单元职责/期望输出」本身偏离用户原始输入(漏掉核心动作动词 —— 如把\n\
+         「主动聊天/发送消息/保存报告」降级为「保活/等待/进程存活」,或把「操作界面」降级为\n\
+         「纯 wait 空等」),无论执行是否达标都判 Fail 且 retryable=true,issues 中逐一指出\n\
+         被漏掉的动词;纯等待/时间差/进程存活不构成任何 UI 操作的完成证据。"
+            .to_string()
+    };
+    format!(
+        "【Quality-Check: {unit_label}】\n\
+         {original_section}\
+         整体目标(仅作背景,不作为本单元判定依据): {goal}\n\
+         本单元职责(判定依据): {unit_scope}\n\
+         本单元期望输出: {expected_output}\n\
+         实际输出: {actual_output}\n\
+         \n\
+         【执行轨迹】\n{trace_summary}\n\
+         \n\
+         请基于「本单元职责 + 期望输出 + 实际输出 + 执行轨迹」判定本单元是否完成,**不要用整体目标苛求本单元**\
+         (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
+         判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。\n\
+         若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。{degradation_rule}",
+    )
+}
+
 /// Quality 执行器。
 pub struct QualityRunner {
     agent: Agent,
@@ -97,6 +149,7 @@ impl QualityRunner {
             actual_output,
             trace,
             session_id,
+            None,
         )
         .await
     }
@@ -104,6 +157,12 @@ impl QualityRunner {
     /// [`check_subagent`] 的来源角色参数化版本:
     /// 让质检报告 source 与提示词标题反映真实执行角色(第 89 轮起执行器统一
     /// SubAgent,浏览器操控由 MCP_Web_Use 工具承担,参数保留供未来执行器扩展)。
+    ///
+    /// `original_prompt`(2026-09-19 第 93 轮):用户原始输入(第一性事实)。
+    /// 实测微信聊天任务中,Main-Work 把「主动聊天/发送消息」降级为「保活等待」,
+    /// QC 只看已降级的单元职责与期望输出,判 ✅ 蒙混通过 —— QC 必须能对照
+    /// 用户原始输入发现「验收标准本身偏离任务」。
+    #[allow(clippy::too_many_arguments)]
     pub async fn check_subagent_with_source(
         &self,
         source: AgentRole,
@@ -113,26 +172,16 @@ impl QualityRunner {
         actual_output: &str,
         trace: &ExecutionTrace,
         session_id: &str,
+        original_prompt: Option<&str>,
     ) -> Result<(QualityReport, Usage)> {
         let trace_summary = trace.render_prompt();
-        let unit_label = "SubAgent 单元";
-        // F10(2026-09-10 第 25 轮):判定基准是「本单元职责」,整体目标仅作背景。
-        // 此前 prompt 只给整体 goal,QC(真实 LLM)按整体目标判单元产物,SubAgent
-        // 只完成了 wf-1 前置检查也被判「核心任务未完成」→ 无效重试风暴
-        // (Debug 报告 debug_report_20260910_150805 问题报告 P1)。
-        let prompt = format!(
-            "【Quality-Check: {unit_label}】\n\
-             整体目标(仅作背景,不作为本单元判定依据): {goal}\n\
-             本单元职责(判定依据): {unit_scope}\n\
-             本单元期望输出: {expected_output}\n\
-             实际输出: {actual_output}\n\
-             \n\
-             【执行轨迹】\n{trace_summary}\n\
-             \n\
-             请基于「本单元职责 + 期望输出 + 实际输出 + 执行轨迹」判定本单元是否完成,**不要用整体目标苛求本单元**\
-             (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
-             判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。\n\
-             若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。",
+        let prompt = build_unit_qc_prompt(
+            goal,
+            unit_scope,
+            expected_output,
+            actual_output,
+            &trace_summary,
+            original_prompt,
         );
         self.run_check(prompt, source, actual_output, session_id, Some(trace))
             .await
@@ -490,6 +539,34 @@ mod tests {
         assert_eq!(r.verdict, Verdict::Fail);
         assert!(r.retryable);
         assert_eq!(r.suggestion, "再试一次");
+    }
+
+    // ========== 第 93 轮:QC prompt 反降级(原始输入透传) ==========
+
+    #[test]
+    fn qc_prompt_includes_original_prompt_and_anti_degradation_rule() {
+        let p = build_unit_qc_prompt(
+            "启动微信保持10分钟",
+            "打开微信并维持对话功能10分钟",
+            "保活≥600s",
+            "已保活612s",
+            "iter=10 tools=9",
+            Some("打开微信并主动与赵玲玲聊天,每分钟2次,保存 Markdown 报告"),
+        );
+        assert!(p.contains("第一性事实 · 用户原始输入"));
+        assert!(p.contains("赵玲玲"));
+        assert!(p.contains("反降级规则"));
+        assert!(p.contains("纯等待/时间差/进程存活不构成任何 UI 操作的完成证据"));
+    }
+
+    #[test]
+    fn qc_prompt_without_original_prompt_has_no_degradation_rule() {
+        let p = build_unit_qc_prompt("g", "scope", "exp", "act", "trace", None);
+        assert!(!p.contains("第一性事实"));
+        assert!(!p.contains("反降级规则"));
+        // 空白原始输入视同无
+        let p2 = build_unit_qc_prompt("g", "scope", "exp", "act", "trace", Some("  \n "));
+        assert!(!p2.contains("第一性事实"));
     }
 
     #[test]

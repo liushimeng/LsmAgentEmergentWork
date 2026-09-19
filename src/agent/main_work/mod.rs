@@ -114,7 +114,10 @@ impl MainWorkRunner {
     ) -> Result<(WorkFlowPlan, Usage)> {
         let mut prompt = String::new();
         // 2026-09-19 第91轮 P0-1 改动1: 三条绝对关键约束 + 第一性事实优先 + 输出前自检清单
-        prompt.push_str(&format!("【Main-Work 任务编排 · 第91轮】三条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop/input_batch wait,严禁 Bash sleep 循环。\n"));
+        // 2026-09-19 第93轮: 第(3)条修正 —— 长等待正确载体是 run_sequence(单步≤30s)/chat_loop,
+        // input_batch wait ≤5s 仅限步骤间节奏(实测 SubAgent 按旧指引 input_batch 20×30s wait 第 1 步即败);
+        // 新增第(4)条 —— 首响应直接输出 JSON,禁止先探索(实测浪费 36s 一次 LLM 往返)。
+        prompt.push_str(&format!("【Main-Work 任务编排 · 第93轮】四条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop / run_sequence wait(单步≤30s)编排节奏,严禁 Bash sleep 循环;input_batch wait ≤5s 仅限步骤间节奏微调;(4)首次响应直接输出 JSON 编排,禁止先调用 Read/Bash 探索——任务所需信息已全部在本提示中。\n"));
         if let Some(orig) = original_prompt.filter(|s| !s.trim().is_empty()) {
             prompt.push_str(&format!("第一性事实 · 用户原始输入(必读):\n{orig}\n"));
         }
@@ -138,7 +141,7 @@ impl MainWorkRunner {
                  请在本轮拆解中针对上述原因调整编排(补充前置检查 / 拆细步骤 / 明确验收命令)。\n"
             ));
         }
-        prompt.push_str(&format!("输出前自检清单(必填):原始每条编号是否都映射到某 wf 的 steps+acceptance? 核心动作动词(聊天/发送/保存报告/截图/...)是否完整保留? 时长/数量/频率是否在 acceptance 出现? 长时任务是否走 chat_loop/input_batch wait 而非 Bash sleep?\n"));
+        prompt.push_str(&format!("输出前自检清单(必填):原始每条编号是否都映射到某 wf 的 steps+acceptance? 核心动作动词(聊天/发送/保存报告/截图/...)是否完整保留? 时长/数量/频率是否在 acceptance 出现? 长时任务是否走 chat_loop/run_sequence wait 而非 Bash sleep 或 input_batch 长 wait? 交互类任务 acceptance 是否锚定 UI 动作产物而非「保活/进程存活/时间差」?\n"));
         // F8:补全 branches/loops 的 schema 示例并注明可省略 —— 此前提示词只列了
         // 六个必填字段,LLM 自行发明 branches 字符串形态导致类型失配(F1 的源头)。
         prompt.push_str(
@@ -184,6 +187,10 @@ impl MainWorkRunner {
                并把执行记录落盘 log_path(默认 <工作目录>/laew_sequence_<unix_ts>.log),\n\
                失败后可对账。长批 steps ≤ 100,整批默认 ≤180s,典型范式见\n\
                系统提示词「连续工作模式 run_sequence」段落。\n\
+               注意(第 93 轮):assert_text/wait_for_text 在控件树为空(自绘 UI)时自动 OCR 兜底,\n\
+               path=\"/\" 即对整窗可见文本断言(微信 4.x 推荐);**纯 wait 保活不是任何操作的完成证据**\n\
+               —— 交互类任务 acceptance 必须锚定 UI 动作产物(chat_log [SEND]/OCR 文本/读取值),\n\
+               不得仅锚定「进程存活/时间差」。\n\
              - 浏览器操控流程引用 MCP_Web_Use 时(2026-09-18 第 89 轮),steps 中只允许使用\n\
                以下合法 action:open / list / close / control / inspect;control 内层动作用\n\
                control_action(click/input_text/wait/navigate/screenshot/eval_js 等),inspect\n\
@@ -225,7 +232,7 @@ impl MainWorkRunner {
                     depends_on: vec![],
                     acceptance: inherited,
                     delegate_to: AgentRole::SubAgent,
-                    // 2026-09-19 第 91 轮 P0-6/P0-8:允底 plan 默认底
+                    // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
                     max_iterations: None, original_prompt: None,
                 }],
                 summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
@@ -235,12 +242,12 @@ impl MainWorkRunner {
 
         // 2026-09-19 第 91 轮 P0-6/P0-8:per-unit max_iterations 适配 + original_prompt 透传
         // 给每个 WorkFlow,SubAgentRunner 能在 retry 轮真正看到
-        // 失败原因 + 整段用户原始 prompt,避免意图预失
+        // 失败原因 + 整段用户原始 prompt,避免意图丢失
         for wf in plan.workflows.iter_mut() {
             if wf.original_prompt.is_none() {
                 wf.original_prompt = original_prompt.map(str::to_string);
             }
-            // 长任务推荐 max_iterations=24(从 16 半 50%)
+            // 长任务推荐 max_iterations=24(较默认 16 提升 50%)
             if wf.max_iterations.is_none() {
                 let is_long = wf.steps.iter().any(|s| {
                     s.contains("长") || s.contains("待") || s.contains("每分钟") || s.contains("秒")

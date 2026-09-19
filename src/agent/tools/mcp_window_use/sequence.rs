@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use super::chat::{append_chat_log, format_chat_log_line};
 use super::input_batch::{execute_step, step_i64, step_str};
 use super::*;
-use crate::agent::window::ControlAction;
+use crate::agent::window::{probe_capability, ControlAction};
 
 /// steps 数组长度上限(连续工作模式面向长批,比 input_batch 40 放宽)。
 const MAX_SEQ_STEPS: usize = 100;
@@ -125,6 +125,56 @@ fn truncate_log(text: &str, max: usize) -> String {
     }
 }
 
+// ===================== 第 93 轮:自绘 UI OCR 兜底断言 =====================
+
+/// 全窗口 OCR 文本(assert_text / wait_for_text 在控件树为空时的视觉兜底)。
+///
+/// 实测背景(llaew_20260919_121348.log):微信 4.x 自绘 UI 控件树只有空 Pane,
+/// `assert_text{path:"/", contains:"发送"}` 断言到的是**窗口标题**(如
+/// 「lsm(刘诗萌)」),3 次重试必败;LLM 真正想断言的是「窗口里能否看到某文本」,
+/// 那正是 OCR 的语义。GetText 未命中时经本函数对整窗 OCR 再断言。
+fn ocr_window_text(
+    driver: &dyn crate::agent::window::WindowDriver,
+    window_id: &str,
+) -> Result<String> {
+    let wins = driver.list_windows(None)?;
+    let info = wins.into_iter().find(|w| w.id == window_id).ok_or_else(|| {
+        tool_err(
+            MCP_WINDOW_USE_TOOL_NAME,
+            "window_id 已失效(可能已关闭/最小化),请重新 action=list",
+        )
+    })?;
+    let blocks = driver.ocr_with_info(&info, None, None)?;
+    Ok(blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+/// 当前平台 OCR 是否可用(不可用时不进 OCR 兜底,直接按控件文本结果判定)。
+fn ocr_available() -> bool {
+    probe_capability().ocr_screenshot_cgwindow
+}
+
+// ===================== 第 93 轮:纯 wait 批次自检 =====================
+
+/// 非动作 op(等待 / 验证类,不产生 UI 交互证据)。
+const NON_ACTION_OPS: &[&str] = &["wait", "wait_for_text", "wait_front", "assert_text"];
+
+/// 判定整批是否「纯等待/断言、零 UI 动作」。
+///
+/// 实测背景:SubAgent 把「10 分钟微信聊天」降级成 16×30s wait 充时长,
+/// QC 凭时间差验收蒙混通过。`wait_only=true` 时返回体 next_action 给出
+/// 明确警示:纯等待不构成任何操作的完成证据。
+fn compute_wait_only(results: &[Value]) -> bool {
+    !results.is_empty()
+        && results.iter().all(|s| {
+            let op = s["op"].as_str().unwrap_or("");
+            NON_ACTION_OPS.contains(&op)
+        })
+}
+
 /// `action=run_sequence` 入口:参数校验 + 同步执行循环(run_blocking 包裹)。
 pub(super) async fn run_input_sequence(args: Value) -> Result<String> {
     let window_id = require_str(&args, "window_id", MCP_WINDOW_USE_TOOL_NAME)?.to_string();
@@ -198,6 +248,8 @@ pub(super) async fn run_input_sequence(args: Value) -> Result<String> {
             .iter()
             .filter(|s| s["ok"].as_bool().unwrap_or(false))
             .count();
+        // 第 93 轮:纯 wait 批次自检(全批无任何 UI 动作 → 完成证据为零)
+        let wait_only = compute_wait_only(&outcome.results);
         let mut body = json!({
             "ok": outcome.failed.is_empty() && !outcome.focus_aborted,
             "action": "run_sequence",
@@ -206,6 +258,7 @@ pub(super) async fn run_input_sequence(args: Value) -> Result<String> {
             "on_error": format!("{on_error:?}").to_lowercase(),
             "steps_total": outcome.results.len(),
             "steps_ok": steps_ok,
+            "wait_only": wait_only,
             "steps": outcome.results,
             "results": outcome.read_values,
             "retried_steps": outcome.retried_steps,
@@ -225,6 +278,13 @@ pub(super) async fn run_input_sequence(args: Value) -> Result<String> {
         } else if !outcome.failed.is_empty() {
             "部分步骤失败(见 failed_steps 与 log_path 落盘记录);UI 可能已变化,\
              先 action=inspect 或 action=ocr 重新定位,再把失败片段拆成新的 run_sequence 补做"
+                .to_string()
+        } else if wait_only {
+            // 第 93 轮:整批全 wait/断言、零 UI 动作 —— 明确警示这不是完成证据
+            "⚠️ 本批全部步骤均为 wait/断言(纯等待),未执行任何 UI 交互动作:\
+             纯等待不构成「操作软件」的完成证据。若任务要求点击/输入/发送/读取界面内容,\
+             请改用 mouse_click / type_text / chat_send / chat_loop 等动作步骤重新编排;\
+             仅当用户明确要求「保持窗口打开不操作」时,纯 wait 保活才是合理交付"
                 .to_string()
         } else {
             "全部步骤执行完成;执行记录已落盘 log_path,可 action=inspect / action=ocr 复查 UI 状态"
@@ -592,19 +652,40 @@ fn execute_seq_step(
             let Some(contains) = step_str(step, "contains") else {
                 return fail("op=assert_text 缺少 string 参数 contains(期望包含的文本)".into());
             };
-            match driver.act(window_id, path, ControlAction::GetText) {
-                Ok(text) => {
-                    if text.contains(contains) {
-                        json!({"i": idx, "op": op, "ok": true,
-                               "detail": format!("断言通过:控件文本包含 {contains:?}")})
-                    } else {
-                        fail(format!(
-                            "断言失败:控件文本不含 {contains:?},实际=\"{}\"",
-                            truncate_log(&text, 120)
-                        ))
+            let uia_text = driver.act(window_id, path, ControlAction::GetText).ok();
+            if let Some(text) = &uia_text {
+                if text.contains(contains) {
+                    return json!({"i": idx, "op": op, "ok": true,
+                                  "detail": format!("断言通过:控件文本包含 {contains:?} (route=uia)")});
+                }
+            }
+            // 第 93 轮:自绘 UI(控件树空 / 窗口根 GetText=标题)OCR 兜底 ——
+            // LLM 断言的通常是「窗口里能否看到某文本」,正是 OCR 语义。
+            if ocr_available() {
+                match ocr_window_text(driver, window_id) {
+                    Ok(ocr_text) if ocr_text.contains(contains) => {
+                        return json!({"i": idx, "op": op, "ok": true,
+                                      "detail": format!("断言通过:窗口 OCR 文本包含 {contains:?} (route=ocr)")});
+                    }
+                    Ok(ocr_text) => {
+                        return fail(format!(
+                            "断言失败:控件文本与窗口 OCR 均不含 {contains:?};控件=\"{}\",OCR=\"{}\" (route=uia+ocr)",
+                            truncate_log(uia_text.as_deref().unwrap_or("<读取失败>"), 60),
+                            truncate_log(&ocr_text, 120)
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "assert_text OCR 兜底失败,按控件文本结果判定");
                     }
                 }
-                Err(e) => fail(format!("读取控件文本失败: {e}")),
+            }
+            match uia_text {
+                Some(text) => fail(format!(
+                    "断言失败:控件文本不含 {contains:?},实际=\"{}\" (route=uia;\
+                     若为自绘 UI 且 OCR 可用,工具已自动 OCR 兜底仍未命中)",
+                    truncate_log(&text, 120)
+                )),
+                None => fail("读取控件文本失败:控件树不可用;自绘 UI 请确认 OCR 能力(action=capability_probe)".into()),
             }
         }
         "wait_for_text" => {
@@ -630,21 +711,29 @@ fn execute_seq_step(
                 .clamp(100, 5000);
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            let ocr_ok = ocr_available();
             loop {
-                match driver.act(window_id, path, ControlAction::GetText) {
-                    Ok(text) if text.contains(contains) => {
+                if let Ok(text) = driver.act(window_id, path, ControlAction::GetText) {
+                    if text.contains(contains) {
                         return json!({"i": idx, "op": op, "ok": true,
-                                      "detail": format!("等到目标文本 {contains:?}")});
-                    }
-                    _ => {
-                        if std::time::Instant::now() >= deadline {
-                            return fail(format!(
-                                "等待超时({timeout_ms}ms):控件文本始终未出现 {contains:?}"
-                            ));
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+                                      "detail": format!("等到目标文本 {contains:?} (route=uia)")});
                     }
                 }
+                // 第 93 轮:自绘 UI OCR 兜底(每轮一次;OCR ~300ms 在 500ms 轮询预算内)
+                if ocr_ok {
+                    if let Ok(ocr_text) = ocr_window_text(driver, window_id) {
+                        if ocr_text.contains(contains) {
+                            return json!({"i": idx, "op": op, "ok": true,
+                                          "detail": format!("等到目标文本 {contains:?} (route=ocr)")});
+                        }
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return fail(format!(
+                        "等待超时({timeout_ms}ms):控件文本与窗口 OCR 始终未出现 {contains:?}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(poll_ms));
             }
         }
         "wait_front" => {
@@ -734,6 +823,29 @@ mod tests {
         ] {
             assert!(!is_physical_op(op), "{op} 不应受焦点守护");
         }
+    }
+
+    #[test]
+    fn compute_wait_only_flags_pure_wait_batches() {
+        // 第 93 轮实测形态:16×wait + 2×assert_text(断言可走 optional 蒙混)→ wait_only
+        let results: Vec<Value> = (0..16)
+            .map(|i| json!({"i": i, "op": "wait", "ok": true}))
+            .chain([
+                json!({"i": 16, "op": "assert_text", "ok": false, "optional": true}),
+                json!({"i": 17, "op": "assert_text", "ok": false, "optional": true}),
+            ])
+            .collect();
+        assert!(compute_wait_only(&results));
+        // 任意一个真实 UI 动作 → 非 wait_only
+        let mut with_action = results.clone();
+        with_action.push(json!({"i": 18, "op": "type_text", "ok": true}));
+        assert!(!compute_wait_only(&with_action));
+        // get_text 产出读取证据 → 非 wait_only
+        let mut with_read = results.clone();
+        with_read.push(json!({"i": 18, "op": "get_text", "ok": true}));
+        assert!(!compute_wait_only(&with_read));
+        // 空批次 → false(不产生误报)
+        assert!(!compute_wait_only(&[]));
     }
 
     #[test]

@@ -153,7 +153,7 @@ impl MultiAgentOrchestrator {
                                     depends_on: vec![],
                                     acceptance: vec![],
                                     delegate_to: AgentRole::SubAgent,
-                                    // 2026-09-19 第 91 轮 P0-6/P0-8:允底^73底]e73
+                                    // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
                                     max_iterations: None, original_prompt: None,
                                 },
                                 Err(QualityFailure {
@@ -460,6 +460,9 @@ pub(super) async fn run_wf_unit(
             &outcome.text,
             &outcome.trace,
             &session_id,
+            // 2026-09-19 第 93 轮:QC 透传用户原始输入(第一性事实),
+            // 识别「验收标准本身偏离任务」的编排降级(保活冒充聊天)。
+            input.original_prompt.as_deref(),
         )
         .await
         .map_err(|e| {
@@ -555,10 +558,10 @@ pub(super) fn build_subflow_input(
     let mut description = format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n"));
     if !retry_hint.trim().is_empty() {
         description.push_str(&format!(
-            "\n\n⚠️ 上一轮本单元失败原因,必须改变策略\n{retry_hint}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 跃跃环境异常等)。"
+            "\n\n⚠️ 上一轮本单元失败原因,必须改变策略\n{retry_hint}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。"
         ));
     }
-    // 2026-09-19 第 91 轮 P0-8:wf.original_prompt 透传整段用户原始 prompt(允底回退 wf.name)
+    // 2026-09-19 第 91 轮 P0-8:wf.original_prompt 透传整段用户原始 prompt(兜底回退 wf.name)
     let original_prompt = wf.original_prompt.clone().or_else(|| Some(wf.name.clone()));
     SubFlowInput {
         id: format!("{}.step", wf.id),

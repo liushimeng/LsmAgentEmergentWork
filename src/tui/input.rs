@@ -238,6 +238,100 @@ fn handle_paste_text(text: &str, registry: &mut PasteRegistry) -> PasteInsert {
     }
 }
 
+// ========== 第 93 轮:无 bracketed paste 终端的 Enter 粘贴突发探测 ==========
+//
+// 背景(实测 llaew_20260919_121348.log):Windows conhost / 不支持 bracketed paste
+// 的终端里,多行提示词粘贴以「逐键 Char 事件 + 行间 Enter」形式到达,旧实现 Enter
+// 到达即提交 —— 8 条编号需求只有首行标题进入任务,其余行在任务结束后被当作新任务
+// 逐条提交(微信聊天任务被截成「打开窗口保持10分钟」的主根因)。
+// 本探测在 Enter 提交前检查输入队列:粘贴的后续行此刻必然已排在终端输入缓冲里,
+// Enter 之后还有排队事件 → 判定为粘贴突发,Enter 按换行处理不提交,整段经 D6
+// 粘贴管线进 buffer(小粘贴归一化 / 大粘贴 [粘贴 #N] marker),最后一次 Enter
+// (队列已空)或用户复查后再按 Enter 才提交完整提示词。
+// 人类击键间隔 ≫15ms,正常单击 Enter 队列恒空,零误伤;bracketed paste 生效的
+// 终端粘贴整体以 Event::Paste 送达,不经本路径。
+
+/// Enter 突发探测:首个排队事件的等待窗口(毫秒)。
+const PASTE_BURST_PROBE_MS: u64 = 15;
+/// 队列排空后的宽限轮数(终端分块投递,每轮等 PASTE_BURST_GRACE_MS)。
+const PASTE_BURST_GRACE_ROUNDS: usize = 2;
+/// 宽限轮单轮等待(毫秒)。
+const PASTE_BURST_GRACE_MS: u64 = 8;
+
+/// 把一串已排队事件折叠为粘贴文本(纯函数,可单测):
+/// - `Key(Press) Char(c)`(无 Ctrl)→ 收 `c`;
+/// - `Key(Press) Enter` → 收 `\n`(行间换行);
+/// - `Event::Paste(t)` → 收 `t`(混合形态兜底);
+/// - 首个其它事件原样回吐(调用方存入 pending,不丢事件)。
+fn burst_events_to_text(events: Vec<Event>) -> (String, Option<Event>) {
+    let mut text = String::new();
+    let mut spill = None;
+    for ev in events {
+        match ev {
+            Event::Key(k)
+                if k.kind == KeyEventKind::Press
+                    && matches!(k.code, KeyCode::Char(_))
+                    && !k.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if let KeyCode::Char(c) = k.code {
+                    text.push(c);
+                }
+            }
+            Event::Key(k) if k.kind == KeyEventKind::Press && k.code == KeyCode::Enter => {
+                text.push('\n');
+            }
+            Event::Paste(t) => text.push_str(&t),
+            other => {
+                spill = Some(other);
+                break;
+            }
+        }
+    }
+    (text, spill)
+}
+
+/// Enter 提交前探测粘贴突发:队列有后续事件 → Some(突发文本),无 → None(正常提交)。
+///
+/// 非文本事件(Ctrl 组合 / Resize 等)存入 `pending` 回吐,主循环下轮优先处理。
+fn drain_paste_burst(pending: &mut Option<Event>) -> Option<String> {
+    // 首证据:短暂等待(人类单击 Enter 时队列恒空,直接 None,零感知延迟)
+    if !matches!(
+        event::poll(Duration::from_millis(PASTE_BURST_PROBE_MS)),
+        Ok(true)
+    ) {
+        return None;
+    }
+    let mut events = Vec::new();
+    let mut grace_left = PASTE_BURST_GRACE_ROUNDS;
+    loop {
+        match event::poll(Duration::ZERO) {
+            Ok(true) => {
+                if let Ok(ev) = event::read() {
+                    events.push(ev);
+                }
+            }
+            _ => {
+                // 队列空:宽限几轮捕捉终端分块投递的尾部
+                if grace_left == 0 {
+                    break;
+                }
+                grace_left -= 1;
+                if !matches!(
+                    event::poll(Duration::from_millis(PASTE_BURST_GRACE_MS)),
+                    Ok(true)
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+    let (text, spill) = burst_events_to_text(events);
+    if let Some(ev) = spill {
+        *pending = Some(ev);
+    }
+    Some(text)
+}
+
 /// 补全菜单 + Tab/Enter 行为的决策结果(2026-09-10 第 24 轮 Enter 吞键修复)。
 /// - `Submit(text)`  : 调用方应以 text 作为输入行提交(进入 handle_user_input);
 /// - `AcceptOnly(s)` : 调用方仅把 s 写入输入框,不提交(原「接受补全」语义,Tab 路径);
@@ -770,6 +864,34 @@ impl InputHandler {
                                 completion_index,
                             ) {
                                 CompletionDecision::Submit(text) => {
+                                    // 第 93 轮:无 bracketed paste 终端的多行粘贴突发 ——
+                                    // Enter 之后已有排队事件,说明本次 Enter 是粘贴的行间
+                                    // 换行而非用户提交意图;整段并入粘贴管线,不提交。
+                                    if key.code == KeyCode::Enter {
+                                        if let Some(burst) = drain_paste_burst(&mut pending) {
+                                            let paste_text = format!("\n{burst}");
+                                            match handle_paste_text(&paste_text, &mut pastes) {
+                                                PasteInsert::Inline(s) | PasteInsert::Marker(s) => {
+                                                    buffer.insert_str(cursor, &s);
+                                                    cursor += s.len();
+                                                }
+                                            }
+                                            overlay_lines = self.update_completion(
+                                                &mut stdout,
+                                                &layout,
+                                                prompt,
+                                                &buffer,
+                                                cursor,
+                                                &mut completion_active,
+                                                &mut completion_index,
+                                                &mut completion_items,
+                                                overlay_lines,
+                                                engine,
+                                                &mut mention,
+                                            )?;
+                                            continue;
+                                        }
+                                    }
                                     return self.submit(
                                         &mut stdout,
                                         &layout,
@@ -1578,5 +1700,94 @@ mod tests {
         assert_eq!(PasteRegistry::truncate_for_inject(s), s);
         let exact = "a".repeat(PASTE_TRUNCATE_CHARS);
         assert_eq!(PasteRegistry::truncate_for_inject(&exact), exact);
+    }
+
+    // ========== 第 93 轮:Enter 粘贴突发探测(burst_events_to_text 纯函数) ==========
+
+    use crossterm::event::KeyEvent;
+
+    fn key_char(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    fn key_enter() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn burst_folds_chars_and_enters_to_multiline_text() {
+        // 粘贴「第二行\n第三行」到达:Char 序列 + 行间 Enter + Char 序列
+        let events: Vec<Event> = "第二行"
+            .chars()
+            .map(key_char)
+            .chain(std::iter::once(key_enter()))
+            .chain("第三行".chars().map(key_char))
+            .collect();
+        let (text, spill) = burst_events_to_text(events);
+        assert_eq!(text, "第二行\n第三行");
+        assert!(spill.is_none());
+    }
+
+    #[test]
+    fn burst_ctrl_char_events_excluded() {
+        // Ctrl 组合键不作为文本(Ctrl-J 等),应终止折叠并回吐
+        let events = vec![
+            key_char('a'),
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            key_char('b'),
+        ];
+        let (text, spill) = burst_events_to_text(events);
+        assert_eq!(text, "a");
+        assert!(spill.is_some()); // Ctrl-J 回吐进 pending,不丢事件
+    }
+
+    #[test]
+    fn burst_paste_event_text_appended() {
+        // 混合形态:突发中夹 Event::Paste(终端分块),文本原样并入
+        let events = vec![
+            key_char('x'),
+            Event::Paste("粘贴段".to_string()),
+            key_enter(),
+        ];
+        let (text, spill) = burst_events_to_text(events);
+        assert_eq!(text, "x粘贴段\n");
+        assert!(spill.is_none());
+    }
+
+    #[test]
+    fn burst_non_text_event_spills_and_stops() {
+        // Resize 等非文本事件:回吐并终止,后续事件不再消费
+        let events = vec![key_char('a'), Event::Resize(80, 24), key_char('b')];
+        let (text, spill) = burst_events_to_text(events);
+        assert_eq!(text, "a");
+        assert!(matches!(spill, Some(Event::Resize(80, 24))));
+    }
+
+    #[test]
+    fn burst_empty_events_yields_empty_text() {
+        let (text, spill) = burst_events_to_text(vec![]);
+        assert_eq!(text, "");
+        assert!(spill.is_none());
+    }
+
+    /// 端到端语义:突发文本经 D6 管线,>10 行 → marker / 小粘贴归一 → 空格。
+    #[test]
+    fn burst_text_feeds_paste_pipeline() {
+        let mut reg = PasteRegistry::new();
+        // 12 行任务书突发(首行已在 buffer,突发含 11 次行间换行)> 10 行阈值 → marker
+        let burst: String = (1..=12)
+            .map(|i| format!("\n{i}. 任务步骤{i}"))
+            .collect();
+        match handle_paste_text(&burst, &mut reg) {
+            PasteInsert::Inline(s) => panic!("12 行应转 marker,实际 Inline: {s}"),
+            PasteInsert::Marker(m) => {
+                assert!(m.starts_with("[粘贴 #1 +"), "marker 应带行数: {m}")
+            }
+        }
+        // 小突发(1 个换行)→ 归一为空格直接插入
+        match handle_paste_text("\n第二行", &mut reg) {
+            PasteInsert::Inline(s) => assert_eq!(s, " 第二行"),
+            PasteInsert::Marker(m) => panic!("小粘贴不应转 marker: {m}"),
+        }
     }
 }
