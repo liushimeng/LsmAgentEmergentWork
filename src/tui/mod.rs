@@ -273,7 +273,7 @@ impl TuiSession {
         }
         println!("╚══════════════════════════════════════════════════════════╝");
         println!("  输入提示词开始对话, 输入 / 查看可用命令。");
-        println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出");
+        println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出  Ctrl-C 清行/退出");
         println!();
     }
 

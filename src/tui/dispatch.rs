@@ -375,7 +375,7 @@ impl TuiSession {
         let cancel = crate::agent::cancel::CancelToken::new();
         // 任务窗口 SIGINT 监听:第一次中断取消当前任务(claudecode 语义),
         // 第二次强制退出(exit 130)。输入等待窗口由 InputHandler raw mode
-        // 按键事件处理(既有 Interrupted 行为,不变)。
+        // 按键事件处理:空输入 Ctrl-C → 退出;非空输入 Ctrl-C → 清行(第 94 轮)。
         let sig_cancel = cancel.clone();
         let sig_task = tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_err() {

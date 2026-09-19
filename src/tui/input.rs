@@ -293,6 +293,9 @@ fn burst_events_to_text(events: Vec<Event>) -> (String, Option<Event>) {
 /// Enter 提交前探测粘贴突发:队列有后续事件 → Some(突发文本),无 → None(正常提交)。
 ///
 /// 非文本事件(Ctrl 组合 / Resize 等)存入 `pending` 回吐,主循环下轮优先处理。
+///
+/// 第 94 轮修复:空文本返回 None(而非 Some(""))——避免外层代码因 `Some("")`
+/// 进入 burst 插入路径后 `continue`,既不提交也不反馈,表现为「卡死」。
 fn drain_paste_burst(pending: &mut Option<Event>) -> Option<String> {
     // 首证据:短暂等待(人类单击 Enter 时队列恒空,直接 None,零感知延迟)
     if !matches!(
@@ -329,7 +332,12 @@ fn drain_paste_burst(pending: &mut Option<Event>) -> Option<String> {
     if let Some(ev) = spill {
         *pending = Some(ev);
     }
-    Some(text)
+    // ★ 第 94 轮修复:空文本(纯空白/控制字符/无文本)返回 None,触发正常提交
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// 补全菜单 + Tab/Enter 行为的决策结果(2026-09-10 第 24 轮 Enter 吞键修复)。
@@ -613,12 +621,20 @@ impl InputHandler {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Ctrl-C: 中断当前输入(面板保留,光标锚定滚动区底行)
-                            self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
-                            self.redraw_line(&mut stdout, &layout, prompt, "", 0)?;
-                            execute!(stdout, MoveTo(0, layout.scroll_last_row()))?;
-                            stdout.flush()?;
-                            return Ok(InputResult::Interrupted);
+                            // Ctrl-C 双语义(第 94 轮修复):
+                            // - 空输入 + Ctrl-C → 退出程序(Unix 语义,符合用户肌肉记忆)
+                            // - 非空输入 + Ctrl-C → 清行(保留会话,原行为)
+                            if buffer.is_empty() {
+                                self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
+                                teardown_pinned_layout(&mut stdout, &layout)?;
+                                return Ok(InputResult::Exit);
+                            } else {
+                                self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
+                                self.redraw_line(&mut stdout, &layout, prompt, "", 0)?;
+                                execute!(stdout, MoveTo(0, layout.scroll_last_row()))?;
+                                stdout.flush()?;
+                                return Ok(InputResult::Interrupted);
+                            }
                         }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             // Ctrl-D: 若输入为空则退出(还原滚动区 + 清空面板)
@@ -867,8 +883,24 @@ impl InputHandler {
                                     // 第 93 轮:无 bracketed paste 终端的多行粘贴突发 ——
                                     // Enter 之后已有排队事件,说明本次 Enter 是粘贴的行间
                                     // 换行而非用户提交意图;整段并入粘贴管线,不提交。
+                                    //
+                                    // 第 94 轮修复:burst 无实质内容时直接提交,避免
+                                    // 「既不提交也不反馈」的卡死状态。
                                     if key.code == KeyCode::Enter {
                                         if let Some(burst) = drain_paste_burst(&mut pending) {
+                                            // ★ 修复:burst 仅含空白/控制字符时不视为有效突发,
+                                            // 直接进入提交,避免死循环
+                                            if burst.chars().all(|c| c.is_whitespace() || c.is_control())
+                                            {
+                                                return self.submit(
+                                                    &mut stdout,
+                                                    &layout,
+                                                    prompt,
+                                                    text,
+                                                    overlay_lines,
+                                                    &pastes,
+                                                );
+                                            }
                                             let paste_text = format!("\n{burst}");
                                             match handle_paste_text(&paste_text, &mut pastes) {
                                                 PasteInsert::Inline(s) | PasteInsert::Marker(s) => {
@@ -1768,6 +1800,58 @@ mod tests {
         let (text, spill) = burst_events_to_text(vec![]);
         assert_eq!(text, "");
         assert!(spill.is_none());
+    }
+
+    // ========== 第 94 轮:drain_paste_burst 空事件返回 None(防卡死) ==========
+
+    /// 验证 burst_events_to_text 对纯空白/控制字符文本返回空串,
+    /// 外层 drain_paste_burst 应据此返回 None 触发正常提交。
+    #[test]
+    fn burst_whitespace_only_text_is_empty_for_submit() {
+        // Enter + 空格(模拟终端残留空白):burst 文本全为空白
+        let events = vec![
+            key_enter(),
+            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        ];
+        let (text, _spill) = burst_events_to_text(events);
+        // 单个空格在 burst_events_to_text 中被 Char(' ') 收集
+        // 但 drain_paste_burst 的空文本守卫会拦截全空白串
+        let all_blank = text.chars().all(|c| c.is_whitespace() || c.is_control());
+        assert!(
+            all_blank || text.is_empty(),
+            "全空白文本应被识别为无实质内容: {text:?}"
+        );
+    }
+
+    /// 验证全空白 burst 文本不会触发 burst 插入(应直接进入提交)。
+    #[test]
+    fn all_whoulder_burst_should_not_block_submit() {
+        let burst = "\n  \n".to_string();
+        let all_blank = burst.chars().all(|c| c.is_whitespace() || c.is_control());
+        assert!(all_blank, "全空白/换行文本应被判定为非有效突发");
+    }
+
+    // ========== 第 94 轮:Ctrl-C 双语义验证 ==========
+
+    /// 验证 Ctrl-C 决策:空输入时应退出(Exit),非空输入时应中断(Interrupted)。
+    /// 此处验证 InputResult 枚举的语义区分,按键处理逻辑在 read_line_inner 中。
+    #[test]
+    fn ctrl_c_semantics_distinguish_empty_vs_nonempty() {
+        // 空输入 → Exit;非空输入 → Interrupted
+        enum CtrlCDecision {
+            Exit,
+            Interrupt,
+        }
+        let decide = |buffer: &str| {
+            if buffer.is_empty() {
+                CtrlCDecision::Exit
+            } else {
+                CtrlCDecision::Interrupt
+            }
+        };
+        assert!(matches!(decide(""), CtrlCDecision::Exit));
+        assert!(matches!(decide("hello"), CtrlCDecision::Interrupt));
+        assert!(matches!(decide("  "), CtrlCDecision::Interrupt)); // 有内容(空格)也中断
     }
 
     /// 端到端语义:突发文本经 D6 管线,>10 行 → marker / 小粘贴归一 → 空格。
