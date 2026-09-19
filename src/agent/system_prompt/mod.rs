@@ -948,13 +948,52 @@ control/input_batch/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 acti
     `[mouse_click 输入框, key_press ctrl+a, type_text 新文本, key_press enter]`;
     滑块拉满 `[mouse_drag x,y → x2,y2]`;多选 `[mouse_click+modifiers=ctrl, mouse_click+modifiers=ctrl]`。
     steps ≤ 40、整批 ≤ 60s;默认失败即停,可 continue_on_error=true。
-18. 长时等待/保活/心跳/定时类红线 (第 91 轮):
+18. **run_sequence 连续工作模式(2026-09-19 第 91 轮新增,人机共用机器首选)**:
+    同应用连续 UI 操作(打开 → 检视/OCR → 点击 → 等异步 UI 就绪 → 输入 → 断言已发送,
+    涉及 OCR 验证、异步等待、用户随时切窗)一律用 `action=run_sequence(window_id, steps=[...])`
+    一次调用完成,不要拆成多次 control/input_batch(input_batch 只在开头做一次前台守卫,
+    中途用户切窗会打进别的窗口;run_sequence 每个物理输入步骤前都做焦点守护):
+    - steps.op 集合(input_batch 10 op + 3 验证/等待 op):mouse_move / mouse_click /
+      mouse_drag / mouse_scroll / key_press / type_text / click / set_text / get_text / wait +
+      **assert_text{path,contains}(关键节点自检,文本不含 contains 走 on_error 策略)** /
+      **wait_for_text{path,contains,timeout_ms<=30000,poll_ms}(轮询等异步 UI 就绪,替代盲 wait)** /
+      **wait_front{timeout_ms<=30000}(显式恢复前台,长时间动作前的保险)**。
+    - **逐步焦点守护 focus_guard**(默认 true):每个物理输入步骤(mouse_*/key_press/type_text/click)
+      执行前确认窗口仍在前台,丢失则 bring_to_front + 轮询 <=focus_wait_ms(默认 5000)重夺;
+      **连续 3 次重夺失败止损中止(focus_aborted=true)**,与 chat_loop 止损同源 - 防止误输入
+      到其他软件。看到 focus_aborted 时不要换路线重试,提醒用户保持目标窗口前台。
+    - **错误策略 on_error**:abort(默认,失败即停)/ continue(记 failed_steps 继续)/
+      retry(逐步自动重试,retry_times<=3、retry_delay_ms<=5000,步骤级同名键覆盖)。
+      步骤级 `optional=true` 容忍非关键步骤失败。
+    - **执行记录落盘 log_path**(默认 <工作目录>/laew_sequence_<unix_ts>.log):每步
+      [STEP]/[RETRY]/[FOCUS_LOST]/[FOCUS_REGAINED]/[FAIL] + 末尾 [SUMMARY],
+      长批失败后可对账。
+    - 护栏:steps <= 100;wait <= 30s;wait_for_text timeout <= 30s;focus_wait_ms <= 30s;
+      retry_times <= 3;max_total_ms <= 600s(默认 180s,超时剩余步骤标记 skipped)。
+    - **典型范式**(打开会话 -> 等待列表刷新 -> 输入文本 -> 提交 -> 断言已发送):
+      steps = [
+        {op:"mouse_click", x:<会话坐标>, y:<会话坐标>},
+        {op:"wait_for_text", path:"/<输入框 path>", contains:"<目标会话名>", timeout_ms:5000},
+        {op:"click", path:"/<输入框 path>"},
+        {op:"type_text", text:"<消息内容>"},
+        {op:"key_press", keys:"enter"},
+        {op:"assert_text", path:"/<消息区 path>", contains:"<消息内容首 5 字>", optional:true}
+      ]。
+    - **方法论**(先摸索 -> 统一 plan -> 连续执行):
+      ① 摸索(capability_probe -> open/list/find -> inspect/ocr)
+      ② 统一 plan(LLM 在上下文里排 steps,异步 UI 处插 wait_for_text,关键节点插 assert_text)
+      ③ 连续执行(一次 run_sequence 调用,逐步焦点守护 + 三级错误策略 + 落盘记录)
+      ④ 复查(按返回 steps 记录 + log_path 对账;失败片段 re-inspect 后用新 run_sequence 补做)。
+    - **input_batch vs run_sequence 选型**:input_batch 适合 <=10 步的短复合动作(点输入框->ctrl+a
+      ->输文本->enter 一次完成),fail-fast + 开头一次守卫即可;run_sequence 适合任何含
+      OCR 断言 / 异步 UI 等待 / 错误重试 / 用户长时间操作中途会切窗的场景,**默认首选 run_sequence**。
+19. 长时等待/保活/心跳/定时类红线 (第 91 轮):
     严禁用 Bash (Start-Sleep / sleep / python time.sleep / PowerShell Start-Sleep) 循环凑时长
     (SubAgent 迭代上限 16, 50s×16=800s 仍可能不夠,且每轮浪费 token);
     (a) 多轮聊天(每分钟 N 条,持续 M 分钟) → chat_loop(messages, interval_seconds, max_rounds) 一次;
     (b) 周期检测 → input_batch(steps=[wait ms=N, ocr, ...]) 或多次 chat_loop;
     (c) 限时等待 → action=open(wait_seconds=N) 已内置;
-19. Windows 平台专属 (第 91 轮):
+20. Windows 平台专属 (第 91 轮):
     (a) capability_probe 恒全 true;osascript_run/fallback Windows 不可用;
     (b) 微信 4.x 自绘 UI 走 visual_no_input 路线 → 必须依赖 ocr 拿精坐标;
     (c) chat_loop 默认 visual_no_input:一定要 ocr 取入框\70 70\u70b9 click_point 递\u4f20;

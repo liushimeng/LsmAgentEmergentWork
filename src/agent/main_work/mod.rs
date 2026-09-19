@@ -165,10 +165,21 @@ impl MainWorkRunner {
              - 同一应用的连续 UI 操作链(打开/激活 → 检视/OCR → 点击 → 输入 → 发送 → 复查)必须\n\
                合并为一个 subagent WorkFlow;微信 4.x 等自绘 UI 的控件树为空,MCP_Window_Use\n\
                支持 action=ocr + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。\n\
-             - 桌面窗口操控流程引用 MCP_Window_Use 时(2026-09-18 第 87 轮;第 90 轮 +input_batch),steps 中只允许使用\n\
+             - 桌面窗口操控流程引用 MCP_Window_Use 时(2026-09-18 第 87 轮;第 90 轮 +input_batch;\n\
+               2026-09-19 第 91 轮 +run_sequence 连续工作模式),steps 中只允许使用\n\
                以下合法 action:open / list / find / inspect / control / ocr / screenshot /\n\
-               capability_probe / osascript_run / chat_send / chat_loop / input_batch;禁止臆造 list_windows /\n\
-               get_window_info / get_ui_tree 等不存在的接口名 —— 执行层按字面调用会直接失败空转。\n\
+               capability_probe / osascript_run / chat_send / chat_loop / input_batch / run_sequence;\n\
+               禁止臆造 list_windows / get_window_info / get_ui_tree 等不存在的接口名 ——\n\
+               执行层按字面调用会直接失败空转。\n\
+             - **同应用连续 UI 链优先 run_sequence(第 91 轮「连续工作模式」)**:同一桌面应用的多步\n\
+               UI 链(打开 → 检视/OCR → 点击会话 → 等列表刷新 → 输入 → 提交 → 断言已发送),\n\
+               在 subagent WorkFlow 内优先用 `action=run_sequence(window_id, steps=[...])` 一次\n\
+               调用完成 —— 相比 input_batch 多 3 项能力:**assert_text / wait_for_text 验证等待\n\
+               (关键节点自检 + 异步 UI 就绪,不再盲 wait)、on_error=retry 逐步自动重试、\n\
+               逐步焦点守护 focus_guard(用户切窗时自动重夺 + 连续 3 次失败止损)**;\n\
+               并把执行记录落盘 log_path(默认 <工作目录>/laew_sequence_<unix_ts>.log),\n\
+               失败后可对账。长批 steps ≤ 100,整批默认 ≤180s,典型范式见\n\
+               系统提示词「连续工作模式 run_sequence」段落。\n\
              - 浏览器操控流程引用 MCP_Web_Use 时(2026-09-18 第 89 轮),steps 中只允许使用\n\
                以下合法 action:open / list / close / control / inspect;control 内层动作用\n\
                control_action(click/input_text/wait/navigate/screenshot/eval_js 等),inspect\n\
