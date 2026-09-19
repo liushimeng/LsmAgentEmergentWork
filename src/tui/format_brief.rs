@@ -14,6 +14,7 @@ use super::format::truncate_chars;
 /// - chat_send:`route / verified / frontmost_acquired`;
 /// - chat_loop:`rounds / sent / replies / focus_aborted`;
 /// - input_batch(第 90 轮):`steps_total / steps_ok`;
+/// - run_sequence(第 91 轮):`steps_total / steps_ok` + `focus_lost_count / retried_steps / focus_aborted`;
 /// - osascript_run:`exit_code / stderr 首行`;
 /// - ocr:`block_count`;open/find:`window_id`;任意失败:`error`。
 pub(crate) fn window_use_output_brief(output_summary: &str) -> Option<String> {
@@ -38,6 +39,20 @@ pub(crate) fn window_use_output_brief(output_summary: &str) -> Option<String> {
     if let Some(total) = get_n("steps_total") {
         let ok = get_n("steps_ok").unwrap_or(0);
         parts.push(format!("steps={ok}/{total}"));
+    }
+    // 第 91 轮:run_sequence 连续工作模式摘要(焦点丢失 / 重试 / 止损)。
+    if let Some(n) = get_n("focus_lost_count") {
+        if n > 0 {
+            parts.push(format!("focus_lost={n}"));
+        }
+    }
+    if let Some(n) = get_n("retried_steps") {
+        if n > 0 {
+            parts.push(format!("retries={n}"));
+        }
+    }
+    if get_b("focus_aborted") == Some(true) && get_n("total_sent").is_none() {
+        parts.push("focus_aborted!".to_string());
     }
     if let Some(sent) = get_n("total_sent") {
         parts.push(format!(
@@ -134,5 +149,21 @@ mod tests {
         let out = r#"{"ok": false, "action": "input_batch", "steps_total": 4, "steps_ok": 2}"#;
         let b = window_use_output_brief(out).unwrap();
         assert!(b.contains("steps=2/4"), "{b}");
+    }
+
+    #[test]
+    fn brief_run_sequence_round91() {
+        // 第 91 轮:run_sequence 摘要 steps + focus_lost + retries。
+        let out = r#"{"ok": true, "action": "run_sequence", "steps_total": 12, "steps_ok": 12, "focus_lost_count": 1, "retried_steps": 2, "focus_aborted": false}"#;
+        let b = window_use_output_brief(out).unwrap();
+        assert!(b.contains("steps=12/12"), "{b}");
+        assert!(b.contains("focus_lost=1"), "{b}");
+        assert!(b.contains("retries=2"), "{b}");
+        assert!(!b.contains("focus_aborted"), "{b}");
+        // 止损中止
+        let out = r#"{"ok": false, "action": "run_sequence", "steps_total": 7, "steps_ok": 4, "focus_lost_count": 3, "retried_steps": 0, "focus_aborted": true}"#;
+        let b = window_use_output_brief(out).unwrap();
+        assert!(b.contains("steps=4/7"), "{b}");
+        assert!(b.contains("focus_aborted!"), "{b}");
     }
 }

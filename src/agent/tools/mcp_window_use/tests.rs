@@ -96,6 +96,7 @@ fn tool_def_schema_has_action_enum() {
         "chat_send",
         "chat_loop",
         "input_batch",
+        "run_sequence",
     ] {
         assert!(actions.contains(&expected), "缺少 action={expected}");
     }
@@ -126,9 +127,28 @@ fn tool_def_schema_has_action_enum() {
             "缺少参数 {key}"
         );
     }
+    // 第 91 轮新参数(run_sequence 连续工作模式)
+    for key in [
+        "on_error",
+        "retry_times",
+        "retry_delay_ms",
+        "focus_guard",
+        "focus_wait_ms",
+        "max_total_ms",
+        "log_path",
+    ] {
+        assert!(
+            params["properties"].get(key).is_some(),
+            "缺少参数 {key}"
+        );
+    }
+    // 描述中应包含连续工作模式说明
+    assert!(t.description().contains("run_sequence"));
+    assert!(t.description().contains("连续工作模式"));
+    assert!(t.description().contains("焦点守护"));
     // steps 子 Schema:op 枚举 + maxItems
     let steps = &params["properties"]["steps"];
-    assert_eq!(steps["maxItems"], json!(40));
+    assert_eq!(steps["maxItems"], json!(100));
     let ops = steps["items"]["properties"]["op"]["enum"]
         .as_array()
         .unwrap();
@@ -146,6 +166,10 @@ fn tool_def_schema_has_action_enum() {
         "wait",
     ] {
         assert!(ops.contains(&expected), "缺少 input_batch op={expected}");
+    }
+    // 第 91 轮 run_sequence 新增验证/等待 op
+    for expected in ["assert_text", "wait_for_text", "wait_front"] {
+        assert!(ops.contains(&expected), "缺少 run_sequence op={expected}");
     }
 }
 

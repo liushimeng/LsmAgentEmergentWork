@@ -174,13 +174,13 @@ fn execute_steps(
     Ok(outcome)
 }
 
-/// 取步骤整型参数。
-fn step_i64(step: &Value, key: &str) -> Option<i64> {
+/// 取步骤整型参数(第 91 轮起 pub(super),供 run_sequence 复用)。
+pub(super) fn step_i64(step: &Value, key: &str) -> Option<i64> {
     step.get(key).and_then(Value::as_i64)
 }
 
-/// 取步骤字符串参数(trim + 非空)。
-fn step_str<'a>(step: &'a Value, key: &str) -> Option<&'a str> {
+/// 取步骤字符串参数(trim + 非空;第 91 轮起 pub(super),供 run_sequence 复用)。
+pub(super) fn step_str<'a>(step: &'a Value, key: &str) -> Option<&'a str> {
     step.get(key)
         .and_then(Value::as_str)
         .map(str::trim)
@@ -188,7 +188,8 @@ fn step_str<'a>(step: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 /// 执行单步,返回 {i, op, ok, route?, detail} 记录。
-fn execute_step(
+/// (第 91 轮起 pub(super):run_sequence 连续工作模式复用同一执行函数。)
+pub(super) fn execute_step(
     window_id: &str,
     driver: &dyn crate::agent::window::WindowDriver,
     step: &Value,

@@ -30,6 +30,7 @@ mod inspect;
 mod input_batch;
 mod open;
 mod query;
+mod sequence;
 mod vision;
 
 #[cfg(test)]
@@ -298,9 +299,15 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
   键盘:key_press{keys}(组合键如 ctrl+a) / type_text{text};
   控件树(自动走无障碍→消息→物理优先级链):click{path} / set_text{path,text} / get_text{path,key?}(读取值进 results 回传);
   wait{ms}(≤5000)。每步可选 delay_ms(≤2000);steps ≤ 40;整批 ≤ 60s;默认失败即停,continue_on_error=true 继续。典型:点输入框→ctrl+a→type_text→enter 一次完成;滑块/文件用 mouse_drag;多选用 mouse_click+modifiers=ctrl。
+- run_sequence(window_id*, steps*, on_error?, retry_times?, retry_delay_ms?, focus_guard?, focus_wait_ms?, max_total_ms?, log_path?): **第 91 轮新增「连续工作模式」复合 action**——先摸索排查窗口结构(capability_probe→open/list/find→inspect/ocr),统一 plan 之后,把一整套动作(含验证/等待)一次调用连续执行完毕,逐步落盘执行记录,异常按策略处理。
+  在 input_batch 10 个 op 之上新增 3 个验证/等待 op:assert_text{path,contains}(关键节点断言)/ wait_for_text{path,contains,timeout_ms≤30000,poll_ms}(轮询等异步 UI 就绪,替代盲 wait)/ wait_front{timeout_ms≤30000}(显式恢复前台);wait 上限放宽到 30000。
+  **逐步焦点守护(focus_guard 默认 true)**:每个物理输入步骤(mouse_click/mouse_drag/mouse_scroll/key_press/type_text/click)执行前确认窗口仍在前台——用户随时会用键盘鼠标切窗;焦点丢失自动 bring_to_front + 轮询 ≤focus_wait_ms(默认 5000)重夺,连续 3 次重夺失败止损中止(focus_aborted=true,防止误输入其他软件,与 chat_loop 止损同源)。
+  **错误策略 on_error**:abort(默认,失败即停,剩余标记 skipped)/ continue(记 failed_steps 继续)/ retry(逐步自动重试,retry_times≤3 默认 1、retry_delay_ms≤5000 默认 500,步骤级同名键覆盖);步骤级 optional=true 容忍非关键步骤失败。
+  **执行记录**:每步落盘 [STEP]/[RETRY]/[FOCUS_LOST]/[FOCUS_REGAINED]/[FAIL] + 末尾 [SUMMARY] 到 log_path(默认 <工作目录>/laew_sequence_<unix_ts>.log);返回 steps 逐步记录 + results(get_text 读取值)+ failed_steps + focus_lost_count。
+  护栏:steps ≤ 100;整批默认 ≤180s(max_total_ms 可调,≤600s)。典型:点会话→wait_for_text 等列表刷新→click 控件→type_text→key_press enter→assert_text 验证已发送,一次调用完成。
 
 【第 86 轮 · capability_probe_first 原则】**第一步必须是 `MCP_Window_Use(action=capability_probe)` 拿到真实能力矩阵**,再决定下一步。capability.ocr_screenshot_cgwindow=false 表示截图/OCR 完全不可用,此时**禁止**重试 screenshot/ocr,直接走 `chat_send(osascript_fallback)` 或 `chat_loop`。
-【标准作业顺序】open(应用未启动)→ find/list(定位 window_id)→ capability_probe(拿真实能力)→ inspect 或 ocr(理解界面,前提 cap=true)→ control/chat_send(操作)→ inspect/ocr 复查 / chat_loop(批量会话)。
+【标准作业顺序】open(应用未启动)→ find/list(定位 window_id)→ capability_probe(拿真实能力)→ inspect 或 ocr(理解界面,前提 cap=true)→ control/chat_send(单步/发送)→ **run_sequence(第 91 轮:探索后统一 plan 的多步连续执行,含 assert_text/wait_for_text 验证等待、retry 重试、逐步焦点守护、逐步落盘记录;人机共用机器、用户会切窗的场景一律用它,不要拆成多次 control)** → inspect/ocr 复查 / chat_loop(批量会话)。
 【双路线决策】inspect 控件树为空/只有少量 Pane(自绘 UI / Electron canvas)时立即切换视觉路线 ocr + click_point/type_text_submit(前提 cap.ocr_screenshot_cgwindow=true),或切到 osascript_fallback(AX 已授权但屏录未授权时)。
 【权限矩阵(macOS 第 86 轮实测)】辅助功能未授权 → 仅 open/list/find/capability_probe/osascript_run 可用;辅助功能✅+屏幕录制❌ → inspect/control 主路线完整可用,ocr/screenshot 全部走 CGWindow 也需屏录(实测失败),**chat_send 自动走 osascript_fallback 路线**(System Events keystroke 只需 AX);全✅→所有路线全开。
 【filter 失败同义词表】通讯录/通信录/联系人/Contacts、按钮/Button、输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences;目标名含 Unicode 上标(如 ᴬᴵᴬ)时用 ASCII 归一形(AIA)。
@@ -323,8 +330,8 @@ impl Tool for McpWindowUseTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "capability_probe", "osascript_run", "chat_send", "chat_loop", "input_batch"],
-                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / capability_probe(第 86 轮新增:探测真实能力矩阵) / osascript_run(第 86 轮新增:执行 AppleScript 片段) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环) / input_batch(第 90 轮新增:鼠标+键盘+控件树复合步骤批处理)"
+                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "capability_probe", "osascript_run", "chat_send", "chat_loop", "input_batch", "run_sequence"],
+                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / capability_probe(第 86 轮新增:探测真实能力矩阵) / osascript_run(第 86 轮新增:执行 AppleScript 片段) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环) / input_batch(第 90 轮新增:鼠标+键盘+控件树复合步骤批处理) / run_sequence(第 91 轮新增:连续工作模式——探索后统一 plan 的一整套动作连续执行,含验证/等待/重试/逐步焦点守护/落盘记录)"
                 },
                 "query": { "type": "string", "description": "open/find 必填:应用名或窗口标题/进程名查询词(大小写不敏感,支持中英文别名)" },
                 "app_name": { "type": "string", "description": "open 可选:启动用应用名或完整路径,缺省=query" },
@@ -391,11 +398,11 @@ impl Tool for McpWindowUseTool {
                 "osascript_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "description": "osascript_run 可选:超时毫秒,默认 5000" },
                 "steps": {
                     "type": "array",
-                    "maxItems": 40,
+                    "maxItems": 100,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "op": { "type": "string", "enum": ["mouse_move", "mouse_click", "mouse_drag", "mouse_scroll", "key_press", "type_text", "click", "set_text", "get_text", "wait"], "description": "步骤类型(第 90 轮)" },
+                            "op": { "type": "string", "enum": ["mouse_move", "mouse_click", "mouse_drag", "mouse_scroll", "key_press", "type_text", "click", "set_text", "get_text", "wait", "assert_text", "wait_for_text", "wait_front"], "description": "步骤类型(第 90 轮 10 个动作 op + 第 91 轮 run_sequence 3 个验证/等待 op)" },
                             "x": { "type": "integer" }, "y": { "type": "integer" },
                             "x2": { "type": "integer" }, "y2": { "type": "integer" },
                             "button": { "type": "string", "enum": ["left", "right", "middle"] },
@@ -405,17 +412,30 @@ impl Tool for McpWindowUseTool {
                             "lines": { "type": "integer", "minimum": 1, "maximum": 100 },
                             "keys": { "type": "string", "description": "key_press:单键或组合键(如 ctrl+a / enter / cmd+f)" },
                             "text": { "type": "string", "description": "type_text / set_text 文本" },
-                            "path": { "type": "string", "description": "click / set_text / get_text 控件路径(取 action=inspect)" },
+                            "path": { "type": "string", "description": "click / set_text / get_text / assert_text / wait_for_text 控件路径(取 action=inspect)" },
                             "key": { "type": "string", "description": "get_text 读取值在 results 中的键名(缺省用 path)" },
-                            "ms": { "type": "integer", "minimum": 0, "maximum": 5000, "description": "wait 毫秒数" },
-                            "delay_ms": { "type": "integer", "minimum": 0, "maximum": 2000, "description": "本步执行前等待毫秒" }
+                            "ms": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "wait 毫秒数(input_batch ≤5000;run_sequence ≤30000)" },
+                            "delay_ms": { "type": "integer", "minimum": 0, "maximum": 2000, "description": "本步执行前等待毫秒" },
+                            "contains": { "type": "string", "description": "第 91 轮 run_sequence:assert_text / wait_for_text 期望包含的文本" },
+                            "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "第 91 轮 run_sequence:wait_for_text / wait_front 超时毫秒(默认 10000 / focus_wait_ms)" },
+                            "poll_ms": { "type": "integer", "minimum": 100, "maximum": 5000, "description": "第 91 轮 run_sequence:wait_for_text 轮询间隔毫秒,默认 500" },
+                            "optional": { "type": "boolean", "description": "第 91 轮 run_sequence:本步失败容忍(不触发 on_error 策略、不进 failed_steps),默认 false" },
+                            "retry_times": { "type": "integer", "minimum": 0, "maximum": 3, "description": "第 91 轮 run_sequence:本步重试次数(覆盖顶层,仅 on_error=retry 生效)" },
+                            "retry_delay_ms": { "type": "integer", "minimum": 0, "maximum": 5000, "description": "第 91 轮 run_sequence:本步重试间隔毫秒(覆盖顶层)" }
                         },
                         "required": ["op"],
                         "additionalProperties": false
                     },
-                    "description": "input_batch 必填:操作步骤数组(第 90 轮,鼠标+键盘+控件树混合编排,一次前台守卫批量执行)"
+                    "description": "input_batch / run_sequence 必填:操作步骤数组(第 90 轮鼠标+键盘+控件树混合编排;第 91 轮 run_sequence 扩展 assert_text/wait_for_text/wait_front 验证与等待 op,≤100 步)"
                 },
-                "continue_on_error": { "type": "boolean", "description": "input_batch 可选:步骤失败后继续执行后续步骤(默认 false 即 fail-fast 停止)" }
+                "continue_on_error": { "type": "boolean", "description": "input_batch 可选:步骤失败后继续执行后续步骤(默认 false 即 fail-fast 停止)" },
+                "on_error": { "type": "string", "enum": ["abort", "continue", "retry"], "description": "第 91 轮 run_sequence 可选:错误策略——abort(默认,失败即停)/ continue(记 failed_steps 继续)/ retry(逐步自动重试,仍败则停)" },
+                "retry_times": { "type": "integer", "minimum": 0, "maximum": 3, "description": "第 91 轮 run_sequence 可选:每步重试次数,默认 1(仅 on_error=retry 生效;步骤级同名键覆盖)" },
+                "retry_delay_ms": { "type": "integer", "minimum": 0, "maximum": 5000, "description": "第 91 轮 run_sequence 可选:重试前等待毫秒,默认 500(步骤级同名键覆盖)" },
+                "focus_guard": { "type": "boolean", "description": "第 91 轮 run_sequence 可选:逐步焦点守护(默认 true)——物理输入步骤执行前确认窗口前台,丢失自动重夺;连续 3 次重夺失败止损中止" },
+                "focus_wait_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "第 91 轮 run_sequence 可选:焦点丢失后重夺预算毫秒,默认 5000" },
+                "max_total_ms": { "type": "integer", "minimum": 1000, "maximum": 600000, "description": "第 91 轮 run_sequence 可选:整批时长硬顶毫秒,默认 180000" },
+                "log_path": { "type": "string", "description": "第 91 轮 run_sequence 可选:执行记录落盘路径([STEP]/[RETRY]/[FOCUS_LOST]/[FAIL]/[SUMMARY]);默认 <工作目录>/laew_sequence_<unix_ts>.log" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -441,10 +461,12 @@ impl Tool for McpWindowUseTool {
             "chat_loop" => chat::run_chat_loop(args).await,
             // 2026-09-19 第 90 轮:鼠标 + 键盘 + 控件树复合步骤动作(同时操作鼠标键盘)。
             "input_batch" => input_batch::run_input_batch(args).await,
+            // 2026-09-19 第 91 轮:连续工作模式(探索→统一 plan→连续执行+验证/重试/焦点守护/落盘记录)。
+            "run_sequence" => sequence::run_input_sequence(args).await,
             other => Err(tool_err(
                 self.name(),
                 format!(
-                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send / chat_loop / input_batch"
+                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send / chat_loop / input_batch / run_sequence"
                 ),
             )),
         }
