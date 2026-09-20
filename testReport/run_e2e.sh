@@ -7,13 +7,31 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 TS=$(date +%Y%m%d-%H%M%S)
+RUN_ID="${TS}-$$"
 # 2026-09-11 第三十四轮修复:REPORT 用绝对路径 —— run() 的 tee -a 在被 cd 到
 # /tmp 子目录的子壳里以相对路径打开会静默失败,导致这些小节的 laew 原始输出
 # 不落报告(例:7b 自定义命令节),事后排查无据可查。
-REPORT="$ROOT_DIR/testReport/e2e-$TS.txt"
+REPORT="$ROOT_DIR/testReport/e2e-$RUN_ID.txt"
 MOCK_PORT=18899
-MOCK_LOG="testReport/mock_requests-$TS.jsonl"
+MOCK_LOG="testReport/mock_requests-$RUN_ID.jsonl"
 PASS=0; FAIL=0
+
+# 2026-09-20 并发保护:固定临时根目录 / DB / mock 端口会被并行执行互相删除,
+# 抓包日志与报告也会串流。先用同机锁串行化 e2e,再用 PID 区分产物文件。
+LOCK_DIR="${TMPDIR:-/tmp}/laew-e2e.lock"
+cleanup_e2e_lock() {
+  rm -rf "$LOCK_DIR"
+}
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+  lock_owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ -n "$lock_owner" ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
+    rm -rf "$LOCK_DIR"
+    continue
+  fi
+  sleep 1
+done
+echo $$ > "$LOCK_DIR/pid"
+trap cleanup_e2e_lock EXIT INT TERM
 
 # 2026-09-10 第 25 轮:D9-7 SSRF 守卫(url_safety.rs)落库后,mock 服务的
 # 127.0.0.1 端点在请求期被拦截,全量用例挂在这一行(92 FAIL)。
@@ -206,7 +224,7 @@ run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 # 使用 mock --bash-block 模式,subagent 角色第一次 tool_call 命令即 `rm -rf /`。
 section "4b. Bash 危险命令 fail-closed 端到端"
 # 起一个独立 mock(开启 --bash-block),只用于本节
-BASH_MOCK_LOG="testReport/mock_requests-bash-$TS.jsonl"
+BASH_MOCK_LOG="testReport/mock_requests-bash-$RUN_ID.jsonl"
 BASH_MOCK_PORT=18900
 python3 scripts/mock_llm_server.py $BASH_MOCK_PORT "$BASH_MOCK_LOG" --bash-block &>/dev/null &
 BASH_MOCK_PID=$!; sleep 0.6
@@ -239,7 +257,7 @@ rm -rf "$BASH_GUARD_DIR"
 # 验证:当 LLM 返回含 smart quote / 全角逗号 / trailing comma 的"半坏 JSON"时,
 # src/agent/json_repair.rs 的 8 段修复链真实生效,Yolo 分类仍能解析成功。
 section "4c. JSON 自动修复链端到端(半坏 JSON 模式)"
-FLAKY_MOCK_LOG="testReport/mock_requests-flaky-$TS.jsonl"
+FLAKY_MOCK_LOG="testReport/mock_requests-flaky-$RUN_ID.jsonl"
 FLAKY_MOCK_PORT=18901
 python3 scripts/mock_llm_server.py $FLAKY_MOCK_PORT "$FLAKY_MOCK_LOG" --flaky &>/dev/null &
 FLAKY_MOCK_PID=$!; sleep 0.6
@@ -264,7 +282,7 @@ rm -f "$FLAKY_MOCK_LOG"
 # 验证:当 QC 角色返回非 JSON 文本时,quality.rs 走 JSON 解析失败路径,
 # 产出 Verdict::Fail + retryable=true,回流触发且不整体 panic。
 section "4d. Quality fail-closed 端到端(非 JSON 模式)"
-BQ_MOCK_LOG="testReport/mock_requests-bq-$TS.jsonl"
+BQ_MOCK_LOG="testReport/mock_requests-bq-$RUN_ID.jsonl"
 BQ_MOCK_PORT=18902
 python3 scripts/mock_llm_server.py $BQ_MOCK_PORT "$BQ_MOCK_LOG" --broken-quality &>/dev/null &
 BQ_MOCK_PID=$!; sleep 0.6
@@ -291,7 +309,7 @@ rm -f "$BQ_MOCK_LOG"
 # 验证:medium 档位下 Main-Work 拆出 3 个互相独立(无 depends_on)的 WorkFlow 时,
 # orchestrator 自动分层并在同层并发执行(tokio::spawn + Semaphore 上限 3)。
 section "4e. WorkFlow 同层并行调度端到端(--parallel-wfs 模式)"
-PAR_MOCK_LOG="testReport/mock_requests-par-$TS.jsonl"
+PAR_MOCK_LOG="testReport/mock_requests-par-$RUN_ID.jsonl"
 PAR_MOCK_PORT=18903
 python3 scripts/mock_llm_server.py $PAR_MOCK_PORT "$PAR_MOCK_LOG" --parallel-wfs &>/dev/null &
 PAR_MOCK_PID=$!; sleep 0.6
@@ -317,7 +335,7 @@ rm -f "$PAR_MOCK_LOG"
 # HTTP 400 "prompt is too long" 时,Agent 循环自动「排水截短工具结果 → 重试」,
 # 链路最终仍返回最终文本,而不是任务失败。
 section "4f. 上下文溢出自动恢复端到端(--overflow-once 模式)"
-OVF_MOCK_LOG="testReport/mock_requests-ovf-$TS.jsonl"
+OVF_MOCK_LOG="testReport/mock_requests-ovf-$RUN_ID.jsonl"
 OVF_MOCK_PORT=18904
 python3 scripts/mock_llm_server.py $OVF_MOCK_PORT "$OVF_MOCK_LOG" --overflow-once &>/dev/null &
 OVF_MOCK_PID=$!; sleep 0.6
@@ -351,7 +369,7 @@ SBX_CANARY="$HOME/laew-sandbox-e2e-canary.txt"
 rm -f "$SBX_CANARY"
 
 # 4g-1 负例:白名单外写入被拦截
-SBX_OUT_LOG="testReport/mock_requests-sbx-out-$TS.jsonl"
+SBX_OUT_LOG="testReport/mock_requests-sbx-out-$RUN_ID.jsonl"
 SBX_OUT_PORT=18905
 python3 scripts/mock_llm_server.py $SBX_OUT_PORT "$SBX_OUT_LOG" --write-outside &>/dev/null &
 SBX_OUT_PID=$!; sleep 0.6
@@ -369,7 +387,7 @@ run "$LAEW" provider delete "$ID_SBXO" >/dev/null 2>&1
 rm -f "$SBX_OUT_LOG"; rm -rf "$SBX_OUT_DIR"
 
 # 4g-2 正例:工作目录内写入放行
-SBX_IN_LOG="testReport/mock_requests-sbx-in-$TS.jsonl"
+SBX_IN_LOG="testReport/mock_requests-sbx-in-$RUN_ID.jsonl"
 SBX_IN_PORT=18906
 python3 scripts/mock_llm_server.py $SBX_IN_PORT "$SBX_IN_LOG" --write-inside &>/dev/null &
 SBX_IN_PID=$!; sleep 0.6
@@ -526,7 +544,7 @@ run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 # last system + latest user message),且 mock 回填的 cache_read_input_tokens
 # 能正确落到 laew 的 Usage 度量,最终经 print_usage 输出。
 section "4h. Anthropic Prompt Caching 自动注入(L1047)"
-CACHE_MOCK_LOG="testReport/mock_requests-cache-$TS.jsonl"
+CACHE_MOCK_LOG="testReport/mock_requests-cache-$RUN_ID.jsonl"
 CACHE_MOCK_PORT=18902
 python3 scripts/mock_llm_server.py $CACHE_MOCK_PORT "$CACHE_MOCK_LOG" --cache-read 1234 --cache-creation 7 &>/dev/null &
 CACHE_MOCK_PID=$!; sleep 0.6
@@ -561,7 +579,7 @@ rm -f "$CACHE_MOCK_LOG"
 # 告警包含 [P05] curl_pipe_sh 模式 ID 与 severity=Critical 标签;
 # 执行不被阻断(Bash 仍返回 exit_code=0)。
 section "4i. Prompt 注入防护端到端(L1208)"
-INJECT_MOCK_LOG="testReport/mock_requests-inject-$TS.jsonl"
+INJECT_MOCK_LOG="testReport/mock_requests-inject-$RUN_ID.jsonl"
 INJECT_MOCK_PORT=18903
 python3 scripts/mock_llm_server.py "$INJECT_MOCK_PORT" "$INJECT_MOCK_LOG" --inject-bash &>/dev/null &
 INJECT_MOCK_PID=$!; sleep 0.6
@@ -591,7 +609,7 @@ rm -f "$INJECT_MOCK_LOG"
 # 4j-2: mock --forced-tool --reject-tool-choice — 首次 forced 请求被 400 拒绝;
 #       断言 resilient.rs 自适应降级(第二次请求无 tool_choice)后链路仍贯通。
 section "4j. 结构化输出强制通道(L6/L19 forced tool_choice)"
-FT_MOCK_LOG="testReport/mock_requests-forced-$TS.jsonl"
+FT_MOCK_LOG="testReport/mock_requests-forced-$RUN_ID.jsonl"
 FT_MOCK_PORT=18904
 python3 scripts/mock_llm_server.py $FT_MOCK_PORT "$FT_MOCK_LOG" --forced-tool &>/dev/null &
 FT_MOCK_PID=$!; sleep 0.6
@@ -650,7 +668,7 @@ run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 rm -f "$FT_MOCK_LOG"
 
 # 4j-2: forced 被 Provider 拒绝 → resilient 自动降级 auto 重试 → 链路仍贯通
-FT2_MOCK_LOG="testReport/mock_requests-forced-reject-$TS.jsonl"
+FT2_MOCK_LOG="testReport/mock_requests-forced-reject-$RUN_ID.jsonl"
 FT2_MOCK_PORT=18905
 python3 scripts/mock_llm_server.py $FT2_MOCK_PORT "$FT2_MOCK_LOG" --forced-tool --reject-tool-choice &>/dev/null &
 FT2_MOCK_PID=$!; sleep 0.6
@@ -811,7 +829,7 @@ echo "$DBG_NEW_FILES" | while read -r f; do [ -n "$f" ] && rm -f "$f"; done
 # 兼容"未安装浏览器"是工具的设计约束。
 section "5e. MCP_Web_Use 浏览器操控工具链路端到端(第 89 轮)"
 WEBUSE_MOCK_PORT=$((MOCK_PORT + 61))
-WEBUSE_MOCK_LOG="$ROOT_DIR/testReport/mock_requests-5e-$TS.jsonl"
+WEBUSE_MOCK_LOG="$ROOT_DIR/testReport/mock_requests-5e-$RUN_ID.jsonl"
 WEBUSE_ROUTER=$(mktemp)
 cat > "$WEBUSE_ROUTER" <<'JSONEOF'
 {
@@ -988,7 +1006,7 @@ section "7b. 自定义斜杠命令与会话导出"
 # 2026-09-11 第三十四轮修复:基础 mock 在 §5d 后已被 kill,本节 /e2e-hello
 # dispatch 依赖 mock 编排 —— 此前静默降级为 [agent error],断言只覆盖本地
 # 输出仍在通过,真实编排链路从未被测到。本节独立拉起 mock 复用 18899 端口。
-python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7b-$TS.jsonl" &>/dev/null &
+python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7b-$RUN_ID.jsonl" &>/dev/null &
 MOCK7B_PID=$!; sleep 0.6
 # 2026-09-17 第 71 轮:§5e delete 掉 active 记录后主库处于无 provider 状态,
 # TUI dispatch 守门会拦截 /e2e-hello(不再走 NoopLlm 空转)。本节 dispatch 前
@@ -1038,7 +1056,7 @@ rm -rf /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
 mkdir -p /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
 cp laew /tmp/laew-e2e-rw-root/laew
 # §7b 的 mock 已 kill,18899 端口空闲;本节独立拉起专用 mock
-python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7c-$TS.jsonl" &>/dev/null &
+python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7c-$RUN_ID.jsonl" &>/dev/null &
 MOCK7C_PID=$!; sleep 0.6
 run /tmp/laew-e2e-rw-root/laew provider add --protocol anthropic --provider-name rw --model-name claude-rw --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-rw >/dev/null 2>&1
 OUT=$(cd /tmp/laew-e2e-rw-work && printf '第一轮问题\n第二轮问题\n/rewind\n/rewind 99\n/rewind 2\n/branches\n/switch rewind-1\n/undo\n/fork\n/clear\n/rewind\n/exit\n' | run timeout 90 /tmp/laew-e2e-rw-root/laew)
@@ -1078,7 +1096,7 @@ cat > "$MD_ROUTER" <<'JSONEOF'
    ]}
 ]}
 JSONEOF
-python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7d-$TS.jsonl" --prompt-router-file "$MD_ROUTER" &>/dev/null &
+python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7d-$RUN_ID.jsonl" --prompt-router-file "$MD_ROUTER" &>/dev/null &
 MOCK7D_PID=$!; sleep 0.6
 # 2026-09-16 第 61 轮 5e 补加的 provider use 可能改写当前记录 → 7d 跑到这里时
 # provider 已切到 mockW,任务链路会走 mockW(mockA 上的 router 已无意义)。
@@ -1096,8 +1114,8 @@ echo "$MD_OUT_PLAIN" | grep -qF "列表甲"; check $? "7d-2d 列表文字保真"
 echo "$MD_OUT_PLAIN" | grep -qF "引用乙"; check $? "7d-2e 引用文字保真"
 # 标记符号被替换:** / # / - / > 不再以原文形态出现在渲染行中
 # 2026-09-16 第 61 轮:trace 区会原文保留工具参数以利于排查;检查渲染正文时
-# 排除 [tool] 行,不能把「参数里的 Markdown 源码」误判为富文本渲染失败。
-echo "$MD_OUT_PLAIN" | grep -v '^[[:space:]]*\[tool\]' | grep -qF "**加粗**"; [ $? -ne 0 ]; check $? "7d-3 ** 标记被渲染剥离"
+# 排除 [tool] / [stage] 行,不能把「参数里的 Markdown 源码」误判为富文本渲染失败。
+echo "$MD_OUT_PLAIN" | grep -v -E '^[[:space:]]*\[(tool|stage)\]' | grep -qF "**加粗**"; [ $? -ne 0 ]; check $? "7d-3 ** 标记被渲染剥离"
 echo "$MD_OUT_PLAIN" | grep -qF "▍ 一级标题"; check $? "7d-4 标题渲染为 ▍ 前缀"
 echo "$MD_OUT_PLAIN" | grep -qF "• 列表甲"; check $? "7d-5 列表渲染为 • 符号"
 echo "$MD_OUT_PLAIN" | grep -qF "│ 引用乙"; check $? "7d-6 引用渲染为 │ 竖线"
@@ -1110,7 +1128,7 @@ EXPORT7D="/tmp/laew-e2e-md-work/${EXPORT_NAME7D:-not-found}"
 grep -qF '**加粗**' "$EXPORT7D" 2>/dev/null; check $? "7d-9 导出为原始 Markdown 文本(** 未剥离)"
 grep -q $'\033[' "$EXPORT7D" 2>/dev/null; [ $? -ne 0 ]; check $? "7d-10 导出不含 ANSI(纯文本同源)"
 kill $MOCK7D_PID 2>/dev/null
-rm -f "$MD_ROUTER" "$ROOT_DIR/testReport/mock_requests-7d-$TS.jsonl"; rm -rf /tmp/laew-e2e-md-work
+rm -f "$MD_ROUTER" "$ROOT_DIR/testReport/mock_requests-7d-$RUN_ID.jsonl"; rm -rf /tmp/laew-e2e-md-work
 
 # --- 7e. D8 会话成本估算与 /cost 面板(2026-09-17 第 76 轮) ---
 # 价格表语义:有价模型(gpt-4o-mini)→ 用量行成本 + /cost 分解 + 导出累计成本行;
@@ -1119,7 +1137,7 @@ section "7e. D8 会话成本估算与 /cost 面板"
 rm -rf /tmp/laew-e2e-cost-root /tmp/laew-e2e-cost-work
 mkdir -p /tmp/laew-e2e-cost-root /tmp/laew-e2e-cost-work
 cp laew /tmp/laew-e2e-cost-root/laew
-python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7e-$TS.jsonl" &>/dev/null &
+python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7e-$RUN_ID.jsonl" &>/dev/null &
 MOCK7E_PID=$!; sleep 0.6
 COSTBIN=/tmp/laew-e2e-cost-root/laew
 run "$COSTBIN" provider add --protocol anthropic --provider-name costA --model-name gpt-4o-mini --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-cost-a >/dev/null 2>&1
@@ -1498,7 +1516,7 @@ OUT=$(run "$LAEW" provider list); echo "$OUT" | grep -vq mockO; check $? "list �
 # 即时中断并优雅退出,而不是陪 mock 的 4s 延迟跑完全部角色调用。
 # 设计见 tmpPlan/2026-09-08_07-取消传播与优雅中断方案.md §3.7。
 section "10. 取消传播(SIGINT 优雅中断)"
-CANCEL_MOCK_LOG="testReport/mock_requests-cancel-$TS.jsonl"
+CANCEL_MOCK_LOG="testReport/mock_requests-cancel-$RUN_ID.jsonl"
 CANCEL_MOCK_PORT=18904
 python3 scripts/mock_llm_server.py $CANCEL_MOCK_PORT "$CANCEL_MOCK_LOG" --delay-ms 4000 &>/dev/null &
 CANCEL_MOCK_PID=$!; sleep 0.6

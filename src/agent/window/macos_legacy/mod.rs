@@ -23,8 +23,7 @@
 use std::collections::HashMap;
 
 use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
-use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
-use core_foundation::boolean::CFBooleanRef;
+use core_foundation::base::{CFRelease, CFTypeRef};
 use core_foundation::dictionary::{CFDictionaryGetValue, CFDictionaryRef};
 use core_foundation::string::CFStringRef;
 
@@ -154,24 +153,22 @@ mod tests;
 
 // 把 ax_attrs / cg_event / inspect 子模块的常用导出在本模块内再导出(供 act 子模块 super::* 取用),
 // 子模块间的 cross-use 通过 super::xxx 自然可见。
-pub(super) use ax_attrs::{
-    ax_error_text, ax_get, ax_get_string, ax_strings, ax_strings_loaded, cfnum_i64, cfstr,
-    cfstring_new, dict_get, kAXChildrenAttribute, kAXConfirmAction, kAXDescriptionAttribute,
+use ax_attrs::{
+    ax_error_text, ax_get, ax_get_string, ax_strings_loaded, cfnum_i64, cfstr, cfstring_new,
+    dict_get, kAXChildrenAttribute, kAXConfirmAction, kAXDescriptionAttribute,
     kAXEnhancedUserInterfaceAttribute, kAXFocusedAttribute, kAXFrontmostAttribute,
     kAXManualAccessibilityAttribute, kAXOpenAction, kAXPickAction, kAXPositionAttribute,
-    kAXPressAction, kAXRaiseAction, kAXRoleAttribute, kAXScrollToVisibleAction,
-    kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute, kAXWindowsAttribute, AxStrings,
-    MACOS_AX_UNAVAILABLE_HINT,
+    kAXPressAction, kAXRaiseAction, kAXRoleAttribute, kAXScrollToVisibleAction, kAXSizeAttribute,
+    kAXTitleAttribute, kAXValueAttribute, kAXWindowsAttribute, MACOS_AX_UNAVAILABLE_HINT,
 };
-pub(super) use cg_event::{
+use cg_event::{
     cg_click_at, cg_click_at_ex, cg_drag, cg_mod_flags, cg_mod_note, cg_move_cursor,
     cg_scroll_lines, cg_send_key, cg_send_key_with_flags, cg_type_text, keycode_for_name,
-    modifier_flag_for_name, parse_key_combo, parse_modifier_flags, CgMouseButton,
+    parse_key_combo, CgMouseButton,
 };
-pub(super) use inspect::{
-    actions_for_role, build_tree, element_action_names, element_at_path, element_rect,
-    is_frontmost_pid, merge_ax_actions, parse_window_id, require_trusted, tree_is_shallow,
-    window_element,
+use inspect::{
+    build_tree, element_action_names, element_at_path, is_frontmost_pid, parse_window_id,
+    tree_is_shallow, window_element,
 };
 
 // ===================== 驱动实现(2026-09-20 第 97 轮拆分,核心逻辑仍在 mod.rs) =====================
@@ -317,28 +314,11 @@ impl MacOsDriver {
         }
     }
 
-    fn ax_available(&self) -> bool {
-        ax_strings_loaded()
-    }
-
-    fn permission_hint(&self) -> Option<String> {
-        if !ax_strings_loaded() {
-            // 字面量创建失败(OOM 等极端情况):按"常量不可用"兜底,语义同未授权
-            return Some(MACOS_AX_UNAVAILABLE_HINT.to_string());
-        }
-        if Self::trusted() {
-            None
-        } else {
-            // 未授权时给完整引导(含授权步骤 + osascript 降级模板),作为 tool_result 回填给 LLM
-            Some(MACOS_AX_UNAVAILABLE_HINT.to_string())
-        }
-    }
-
     /// 第 81 轮:窗口所属应用是否已处于前台(AXFrontmost)。
     /// MCP_Window_Use(action=open) 对已存在窗口先查本方法,已前台则跳过激活(窗口不再反复闪烁)。
     fn is_frontmost(&self, window_id: &str) -> bool {
-        match Self::parse_window_id(window_id) {
-            Ok((pid, _)) => Self::is_frontmost_pid(pid),
+        match parse_window_id(window_id) {
+            Ok((pid, _)) => is_frontmost_pid(pid),
             Err(_) => false,
         }
     }
@@ -415,6 +395,19 @@ impl WindowDriver for MacOsDriver {
         "macos"
     }
 
+    fn permission_hint(&self) -> Option<String> {
+        if !ax_strings_loaded() {
+            // 字面量创建失败(OOM 等极端情况):按"常量不可用"兜底,语义同未授权
+            return Some(MACOS_AX_UNAVAILABLE_HINT.to_string());
+        }
+        if Self::trusted() {
+            None
+        } else {
+            // 未授权时给完整引导(含授权步骤 + osascript 降级模板),作为 tool_result 回填给 LLM
+            Some(MACOS_AX_UNAVAILABLE_HINT.to_string())
+        }
+    }
+
     fn list_windows(&self, filter: Option<&str>) -> Result<Vec<WindowInfo>> {
         list_windows_cg(filter)
     }
@@ -445,7 +438,7 @@ impl WindowDriver for MacOsDriver {
                 ),
             ));
         }
-        let (pid, idx) = Self::parse_window_id(window_id)?;
+        let (pid, idx) = parse_window_id(window_id)?;
         let max_depth = max_depth.clamp(1, 12);
         unsafe {
             // 第 81 轮:AX 异步建树等待(warmup)。AXEnhancedUserInterface 置位后
@@ -455,10 +448,14 @@ impl WindowDriver for MacOsDriver {
             let warmup_enabled = !std::env::var("LAEW_DISABLE_AX_WARMUP")
                 .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false);
-            let attempts = if warmup_enabled && filter.is_none() { 3 } else { 1 };
+            let attempts = if warmup_enabled && filter.is_none() {
+                3
+            } else {
+                1
+            };
             for attempt in 0..attempts {
-                let win = Self::window_element(pid, idx)?;
-                let tree = Self::build_tree(win, "/".to_string(), 1, max_depth, filter);
+                let win = window_element(pid, idx)?;
+                let tree = build_tree(win, "/".to_string(), 1, max_depth, filter);
                 CFRelease(win);
                 let tree = tree.ok_or_else(|| {
                     platform_err(
@@ -473,7 +470,7 @@ impl WindowDriver for MacOsDriver {
                     )
                 })?;
                 // 第 81 轮:浅树重试(warmup)。
-                if warmup_enabled && filter.is_none() && Self::tree_is_shallow(&tree) {
+                if warmup_enabled && filter.is_none() && tree_is_shallow(&tree) {
                     if attempt + 1 < attempts {
                         tracing::debug!(
                             attempt = attempt + 1,
@@ -503,12 +500,12 @@ impl WindowDriver for MacOsDriver {
             tracing::debug!(window_id = %window_id, "窗口已在前台,跳过激活(幂等前置)");
             return Ok(());
         }
-        let (pid, idx) = Self::parse_window_id(window_id)?;
+        let (pid, idx) = parse_window_id(window_id)?;
         // 先 AXRaise 对应 NSWindow,再通过 System Events 让 App frontmost。
         // AXRaise 只调整窗口层级;部分 App(尤其微信/Electron)仍需 frontmost
         // 才会接受键盘事件,因此两步都不能省。
         unsafe {
-            let win = Self::window_element(pid, idx)?;
+            let win = window_element(pid, idx)?;
             let raise_err = AXUIElementPerformAction(win, kAXRaiseAction());
             CFRelease(win);
             if raise_err != K_AX_ERROR_SUCCESS
@@ -548,7 +545,7 @@ impl WindowDriver for MacOsDriver {
         use crate::agent::window::macos_vision_ocr::{self, VisionOcrConfig};
 
         // 1. 解析 window_id → CGWindowID
-        let (pid, _) = Self::parse_window_id(window_id)?;
+        let (pid, _) = parse_window_id(window_id)?;
         let cg_window_id = macos_vision_ocr::resolve_cgwindow_id(pid, None).map_err(|e| {
             platform_err(
                 self.platform_name(),
@@ -598,7 +595,7 @@ impl WindowDriver for MacOsDriver {
         let cg_window_id = match info.cg_window_id {
             Some(id) if id > 0 => id,
             _ => {
-                let (pid, _) = Self::parse_window_id(&info.id)?;
+                let (pid, _) = parse_window_id(&info.id)?;
                 macos_vision_ocr::resolve_cgwindow_id(pid, None).map_err(|e| {
                     platform_err(
                         self.platform_name(),
@@ -638,7 +635,7 @@ impl WindowDriver for MacOsDriver {
         use crate::agent::window::macos_vision_ocr;
 
         // 1. 解析 window_id → CGWindowID
-        let (pid, _) = Self::parse_window_id(window_id)?;
+        let (pid, _) = parse_window_id(window_id)?;
         let cg_window_id = macos_vision_ocr::resolve_cgwindow_id(pid, None).map_err(|e| {
             platform_err(
                 self.platform_name(),
@@ -654,7 +651,7 @@ impl WindowDriver for MacOsDriver {
             .map_err(|e| platform_err(self.platform_name(), format!("CGWindow 截图失败: {e}")))?;
 
         // 4. 返回实际截取的区域
-        let meta = std::fs::metadata(output_path).map_err(|e| {
+        let _meta = std::fs::metadata(output_path).map_err(|e| {
             platform_err(self.platform_name(), format!("读取截图文件元数据失败: {e}"))
         })?;
 
@@ -677,7 +674,7 @@ impl WindowDriver for MacOsDriver {
         let cg_window_id = match info.cg_window_id {
             Some(id) if id > 0 => id,
             _ => {
-                let (pid, _) = Self::parse_window_id(&info.id)?;
+                let (pid, _) = parse_window_id(&info.id)?;
                 macos_vision_ocr::resolve_cgwindow_id(pid, None).map_err(|e| {
                     platform_err(
                         self.platform_name(),

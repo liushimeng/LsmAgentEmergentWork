@@ -14,9 +14,9 @@
 
 // 从父模块 mod.rs 取用 FFI 函数 / 常量 / 类型。
 use super::{
-    CGEventCreateKeyboardEvent, CGEventCreateMouseEvent, CGEventCreateScrollWheelEvent,
-    CGEventKeyboardSetUnicodeString, CGEventPost, CGEventSetFlags, CGEventSetIntegerValueField,
-    CFRelease, CGPoint, K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_EVENT_LEFT_MOUSE_UP,
+    platform_err, CFRelease, CGEventCreateKeyboardEvent, CGEventCreateMouseEvent,
+    CGEventCreateScrollWheelEvent, CGEventKeyboardSetUnicodeString, CGEventPost, CGEventSetFlags,
+    CGEventSetIntegerValueField, CGPoint, K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_EVENT_LEFT_MOUSE_UP,
     K_CG_EVENT_MOUSE_MOVED, K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_UP,
     K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_HID_EVENT_TAP,
     K_CG_MOUSE_BUTTON_CENTER, K_CG_MOUSE_BUTTON_LEFT, K_CG_MOUSE_BUTTON_RIGHT,
@@ -43,13 +43,41 @@ pub(super) fn keycode_for_name(name: &str) -> Option<u16> {
         "end" => 119,
         // 2026-09-18 第 87 轮:字母 / 数字 ANSI 键码(kVK_ANSI_*),
         // 支撑 cmd+f(微信搜索)等修饰键组合。
-        "a" => 0x00, "s" => 0x01, "d" => 0x02, "f" => 0x03, "h" => 0x04,
-        "g" => 0x05, "z" => 0x06, "x" => 0x07, "c" => 0x08, "v" => 0x09,
-        "b" => 0x0B, "q" => 0x0C, "w" => 0x0D, "e" => 0x0E, "r" => 0x0F,
-        "y" => 0x10, "t" => 0x11, "1" => 0x12, "2" => 0x13, "3" => 0x14,
-        "4" => 0x15, "6" => 0x16, "5" => 0x17, "9" => 0x19, "7" => 0x1A,
-        "8" => 0x1C, "0" => 0x1D, "o" => 0x1F, "u" => 0x20, "i" => 0x22,
-        "p" => 0x23, "l" => 0x25, "j" => 0x26, "k" => 0x28, "n" => 0x2D,
+        "a" => 0x00,
+        "s" => 0x01,
+        "d" => 0x02,
+        "f" => 0x03,
+        "h" => 0x04,
+        "g" => 0x05,
+        "z" => 0x06,
+        "x" => 0x07,
+        "c" => 0x08,
+        "v" => 0x09,
+        "b" => 0x0B,
+        "q" => 0x0C,
+        "w" => 0x0D,
+        "e" => 0x0E,
+        "r" => 0x0F,
+        "y" => 0x10,
+        "t" => 0x11,
+        "1" => 0x12,
+        "2" => 0x13,
+        "3" => 0x14,
+        "4" => 0x15,
+        "6" => 0x16,
+        "5" => 0x17,
+        "9" => 0x19,
+        "7" => 0x1A,
+        "8" => 0x1C,
+        "0" => 0x1D,
+        "o" => 0x1F,
+        "u" => 0x20,
+        "i" => 0x22,
+        "p" => 0x23,
+        "l" => 0x25,
+        "j" => 0x26,
+        "k" => 0x28,
+        "n" => 0x2D,
         "m" => 0x2E,
         _ => return None,
     })
@@ -73,7 +101,11 @@ pub(super) fn modifier_flag_for_name(name: &str) -> Option<u64> {
 /// `+` 分隔,末段为键名,前缀为修饰键(可多个);无修饰键时 flags=0。
 /// 返回 `(keycode, flags)`;任何一段无法识别返回 None。
 pub(super) fn parse_key_combo(expr: &str) -> Option<(u16, u64)> {
-    let parts: Vec<&str> = expr.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = expr
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
     let (key_part, mod_parts) = parts.split_last()?;
     let keycode = keycode_for_name(key_part)?;
     let mut flags = 0u64;
@@ -88,7 +120,11 @@ pub(super) fn parse_key_combo(expr: &str) -> Option<(u16, u64)> {
 /// 与 `parse_key_combo` 的区别:每一段都必须是修饰键(ctrl/shift/alt/cmd 及别名),
 /// 无主键;任一段非修饰键返回 None。macOS 修饰键以 flags 位形式与鼠标事件同时携带。
 pub(super) fn parse_modifier_flags(spec: &str) -> Option<u64> {
-    let parts: Vec<&str> = spec.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = spec
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.is_empty() {
         return None;
     }
@@ -101,7 +137,6 @@ pub(super) fn parse_modifier_flags(spec: &str) -> Option<u64> {
 
 /// 修饰键规格 → CGEventFlags(空规格 = 0;非法段结构化报错,2026-09-19 第 90 轮)。
 pub(super) fn cg_mod_flags(spec: Option<&str>) -> Result<u64, AgentError> {
-    use crate::agent::safety::platform_err;
     match spec.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => parse_modifier_flags(s).ok_or_else(|| {
             platform_err(
@@ -229,8 +264,7 @@ pub(super) unsafe fn cg_click_at_ex(x: f64, y: f64, button: CgMouseButton, click
     std::thread::sleep(std::time::Duration::from_millis(60));
     for seq in 1..=clicks {
         for &mouse_type in &[down, up] {
-            let ev =
-                CGEventCreateMouseEvent(std::ptr::null(), mouse_type, CGPoint { x, y }, btn);
+            let ev = CGEventCreateMouseEvent(std::ptr::null(), mouse_type, CGPoint { x, y }, btn);
             if ev.is_null() {
                 return;
             }

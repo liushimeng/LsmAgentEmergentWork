@@ -17,18 +17,18 @@
 #![allow(non_snake_case)]
 
 use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
-use core_foundation::base::{CFIndex, CFRetain, CFRelease, CFTypeRef};
+use core_foundation::base::{CFIndex, CFRelease, CFRetain, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBooleanRef;
 use core_foundation::string::CFStringRef;
 
 use super::{
-    ax_get, ax_get_string, ax_strings_loaded, platform_err, AXError, AXUIElementCreateApplication,
-    AXUIElementCopyActionNames, AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue,
-    Boolean, ControlNode, Rect, K_AX_ERROR_SUCCESS, K_AX_VALUE_CGPOINT_TYPE,
-    K_AX_VALUE_CGSIZE_TYPE, CGPoint, CGSize, kAXChildrenAttribute, kAXDescriptionAttribute,
+    ax_get, ax_get_string, kAXChildrenAttribute, kAXDescriptionAttribute,
     kAXEnhancedUserInterfaceAttribute, kAXFrontmostAttribute, kAXManualAccessibilityAttribute,
-    kAXPositionAttribute, kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute,
-    kAXValueAttribute, kAXWindowsAttribute,
+    kAXPositionAttribute, kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute,
+    kAXWindowsAttribute, platform_err, AXError, AXUIElementCopyActionNames,
+    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue,
+    Boolean, CGPoint, CGSize, ControlNode, Rect, K_AX_ERROR_SUCCESS, K_AX_VALUE_CGPOINT_TYPE,
+    K_AX_VALUE_CGSIZE_TYPE,
 };
 use crate::error::Result;
 
@@ -243,6 +243,10 @@ pub(super) unsafe fn build_tree(
         value,
         bounds,
         actions: Vec::new(),
+        help_text: String::new(),
+        access_key: String::new(),
+        accelerator_key: String::new(),
+        is_selected: false,
         children: Vec::new(),
     };
     let role_actions = actions_for_role(&node.role);
@@ -273,8 +277,8 @@ pub(super) unsafe fn build_tree(
     }
 
     // 过滤:自身命中 或 任一子孙命中(祖先链保留) 或 无过滤条件
-    let self_hit = super::matches_filter(&node.name, filter)
-        || super::matches_filter(&node.role, filter);
+    let self_hit =
+        super::matches_filter(&node.name, filter) || super::matches_filter(&node.role, filter);
     if filter.is_none() || self_hit || !node.children.is_empty() {
         Some(node)
     } else {
@@ -336,8 +340,7 @@ pub(super) fn is_frontmost_pid(pid: i32) -> bool {
         if v.is_null() {
             return false;
         }
-        let true_ref = core_foundation::boolean::CFBoolean::true_value()
-            .as_concrete_TypeRef()
+        let true_ref = core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef()
             as *const std::ffi::c_void;
         let is_true = v == true_ref;
         CFRelease(v);
@@ -355,9 +358,9 @@ pub(super) unsafe fn element_at_path(root: AXUIElementRef, path: &str) -> Result
     let mut cur = root;
     CFRetain(cur);
     for seg in trimmed.trim_start_matches('/').split('/') {
-        let idx: usize = seg.parse().map_err(|_| {
-            platform_err("macos", format!("控件路径段非法: {seg}(应为子控件下标)"))
-        })?;
+        let idx: usize = seg
+            .parse()
+            .map_err(|_| platform_err("macos", format!("控件路径段非法: {seg}(应为子控件下标)")))?;
         let children = ax_get(cur, kAXChildrenAttribute());
         CFRelease(cur);
         if children.is_null() {
@@ -368,8 +371,8 @@ pub(super) unsafe fn element_at_path(root: AXUIElementRef, path: &str) -> Result
         }
         let count = CFArrayGetCount(children as CFArrayRef);
         let next = if (idx as CFIndex) < count {
-            let e = CFArrayGetValueAtIndex(children as CFArrayRef, idx as CFIndex)
-                as AXUIElementRef;
+            let e =
+                CFArrayGetValueAtIndex(children as CFArrayRef, idx as CFIndex) as AXUIElementRef;
             if !e.is_null() {
                 CFRetain(e);
             }

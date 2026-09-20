@@ -9,26 +9,24 @@
 
 #![allow(non_snake_case)]
 
-use core_foundation::base::{CFRelease, CFTypeRef};
+use core_foundation::base::{CFRelease, TCFType};
 use core_foundation::boolean::CFBooleanRef;
 use core_foundation::string::CFStringRef;
 
 use super::{
-    ax_error_text, ax_get_string, cfstring_new, cg_click_at, cg_click_at_ex, cg_drag,
-    cg_mod_flags, cg_mod_note, cg_move_cursor, cg_scroll_lines, cg_send_key, cg_type_text,
-    element_action_names, element_at_path, is_ax_trusted_with_retry, keycode_for_name,
-    parse_key_combo, parse_window_id, platform_err, window_element, CgMouseButton,
-    ControlAction, MacOsDriver, AXError, AXUIElementCopyAttributeValue, AXUIElementPerformAction,
-    AXUIElementRef, AXUIElementSetAttributeValue, K_AX_ERROR_ACTION_UNSUPPORTED,
-    K_AX_ERROR_ATTRIBUTE_UNSUPPORTED, K_AX_ERROR_SUCCESS, kAXFocusedAttribute, kAXPressAction,
-    kAXPickAction, kAXConfirmAction, kAXOpenAction, kAXScrollToVisibleAction, kAXValueAttribute,
-    kAXTitleAttribute,
+    ax_error_text, ax_get_string, cfstring_new, cg_click_at, cg_click_at_ex, cg_drag, cg_mod_flags,
+    cg_mod_note, cg_move_cursor, cg_scroll_lines, cg_send_key, cg_type_text, element_action_names,
+    element_at_path, kAXConfirmAction, kAXFocusedAttribute, kAXOpenAction, kAXPickAction,
+    kAXPressAction, kAXScrollToVisibleAction, kAXTitleAttribute, kAXValueAttribute,
+    keycode_for_name, parse_key_combo, parse_window_id, platform_err, window_element, AXError,
+    AXUIElementPerformAction, AXUIElementSetAttributeValue, CgMouseButton, ControlAction,
+    MacOsDriver, K_AX_ERROR_ACTION_UNSUPPORTED, K_AX_ERROR_SUCCESS,
 };
 use crate::error::Result;
 
 /// WindowDriver::act 的实际实现。逐行与拆分前一致。
 pub(super) fn dispatch_act(
-    driver: &MacOsDriver,
+    _driver: &MacOsDriver,
     window_id: &str,
     path: &str,
     action: ControlAction,
@@ -37,13 +35,14 @@ pub(super) fn dispatch_act(
     let prompt = std::env::var("LAEW_AX_PROMPT")
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(true);
-    let (granted, waited) = is_ax_trusted_with_retry(prompt, 120, |elapsed, granted| {
-        tracing::debug!(
-            elapsed_secs = elapsed,
-            granted = granted,
-            "MCP_Window_Use(action=control) 等待 macOS 辅助功能授权"
-        );
-    });
+    let (granted, waited) =
+        MacOsDriver::is_ax_trusted_with_retry(prompt, 120, |elapsed, granted| {
+            tracing::debug!(
+                elapsed_secs = elapsed,
+                granted = granted,
+                "MCP_Window_Use(action=control) 等待 macOS 辅助功能授权"
+            );
+        });
     if !granted {
         return Err(platform_err(
             "macos",
@@ -98,8 +97,7 @@ pub(super) fn dispatch_act(
             ControlAction::Focus => {
                 let true_v: CFBooleanRef =
                     core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
-                let err =
-                    AXUIElementSetAttributeValue(el, kAXFocusedAttribute(), true_v.cast());
+                let err = AXUIElementSetAttributeValue(el, kAXFocusedAttribute(), true_v.cast());
                 if err == K_AX_ERROR_SUCCESS {
                     Ok(format!("已聚焦 {window_id}{path}"))
                 } else {
@@ -132,11 +130,7 @@ pub(super) fn dispatch_act(
                     super::cg_send_key_with_flags(keycode, flags);
                     Ok(format!(
                         "已通过 CGEvent 注入按键 \"{expr}\"(route=physical{})",
-                        if flags != 0 {
-                            " + 修饰键"
-                        } else {
-                            ""
-                        }
+                        if flags != 0 { " + 修饰键" } else { "" }
                     ))
                 } else {
                     Err(platform_err(
@@ -242,8 +236,7 @@ pub(super) fn dispatch_act(
                     // 控件树路径操作时先聚焦,保证 CGEvent 投递到目标控件。
                     let true_v: CFBooleanRef =
                         core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
-                    let _ =
-                        AXUIElementSetAttributeValue(el, kAXFocusedAttribute(), true_v.cast());
+                    let _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute(), true_v.cast());
                 }
                 cg_type_text(text);
                 // WeChat/Electron 在收到 Unicode key-up 后才把文本入输入模型;
