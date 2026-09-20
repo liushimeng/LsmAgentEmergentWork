@@ -16,8 +16,7 @@
 //! - **无平台门控**:CDP 三平台行为一致,未安装浏览器时返回结构化 3001 信封 + 安装引导
 //!   (不崩溃),因此全平台注册进 `builtin_registry()` 并同步注入系统提示词使用说明。
 //!
-//! 设计见 `docs/MCP_Web_Use/01-设计与解决方案.md` 与
-//! `docs/MCP_Web_Use/02-连续执行模式与下载能力增强设计方案.md`。
+//! 设计见 `docs/MCP_Web_Use/01-设计与解决方案.md`(唯一最新版)。
 //! 技术参考:`docs/浏览器CDP工具/Rust操作Chrome浏览器CDP完整技术方案.md`。
 
 use async_trait::async_trait;
