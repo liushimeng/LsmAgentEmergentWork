@@ -206,6 +206,24 @@ impl MultiAgentOrchestrator {
                 let wf_name = wf.name.clone();
                 let sub_text = ok.outcome_text;
                 let qc_report = ok.qc;
+                // D9-8 决策审计(2026-09-19):QC 质检判定写入审计 JSONL
+                //(在 qc_report move 进 WorkflowResult 前提取字段)。
+                {
+                    let verdict_str =
+                        if qc_report.verdict == crate::agent::quality::Verdict::Pass {
+                            "pass"
+                        } else {
+                            "fail"
+                        };
+                    crate::agent::decision_audit::record_verdict(
+                        session.id(),
+                        &wf.id,
+                        verdict_str,
+                        &qc_report.issues,
+                        qc_report.retryable,
+                        &qc_report.evidence,
+                    );
+                }
                 let exec_role = ok.exec_role;
                 let wallclock_ms = ok.wallclock_ms;
                 let qc_wallclock_ms = ok.qc_wallclock_ms;

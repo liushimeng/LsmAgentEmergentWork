@@ -64,6 +64,16 @@ impl MultiAgentOrchestrator {
                             if rep.fallback { ",硬截断降级" } else { "" },
                         ),
                     );
+                    // D9-8 决策审计(2026-09-19):Compact 压缩决策写入审计 JSONL。
+                    crate::agent::decision_audit::record_compact(
+                        session.id(),
+                        rep.tier.as_str(),
+                        rep.before_tokens,
+                        rep.after_tokens,
+                        rep.compacted_messages,
+                        rep.fallback,
+                        0,
+                    );
                 }
                 Ok(None) => {}
                 Err(e) if matches!(e, AgentError::Cancelled) => return Err(e),
@@ -96,6 +106,17 @@ impl MultiAgentOrchestrator {
             decomposition = classification.decomposition_plan.len(),
             degraded_parse = classification.yolo_degraded,
             "Yolo 分类(决策)"
+        );
+        // D9-8 决策审计(2026-09-19):Yolo 分类决策写入审计 JSONL。
+        crate::agent::decision_audit::record_classify(
+            session.id(),
+            classification.task_level.as_str(),
+            &classification.purpose,
+            &classification.goal_summary,
+            classification.suggested_delegate.as_deref(),
+            classification.yolo_degraded,
+            yolo_elapsed_ms,
+            yolo_usage,
         );
         // 2026-09-11 第三十三轮:#P-C 修复 — 此处只能确定档位,无法确定 simple
         // 是否走 direct_answer 短路(短路判断在 stage 之后)。文案采用「预期路径」:
@@ -563,6 +584,17 @@ impl MultiAgentOrchestrator {
         let exec_role = ok.exec_role;
         let total_usage = outcome_usage;
 
+        // D9-8 决策审计(2026-09-19):simple 档 QC 质检判定写入审计 JSONL
+        //(medium/hard 档在 workflows.rs 每 WorkFlow 判定后写入;
+        // QC 自身已在 run_wf_unit 内完成并 record_quality,此处不再重复 dbg_qc)。
+        crate::agent::decision_audit::record_verdict(
+            session.id(),
+            "wf-1",
+            if qc.verdict == Verdict::Pass { "pass" } else { "fail" },
+            &qc.issues,
+            qc.retryable,
+            &qc.evidence,
+        );
         emit_progress(
             progress,
             format!(
@@ -757,6 +789,21 @@ impl MultiAgentOrchestrator {
         // 2026-09-16 第 67 轮:确定性校验通过的真实计划进复用缓存(执行层失败时下一轮跳过重拆)
         *plan_cache = Some(plan.clone());
 
+        // D9-8 决策审计(2026-09-19):Main-Work 流程拆解决策写入审计 JSONL。
+        {
+            let layers = crate::agent::main_work::topo_layers(&plan.workflows)
+                .map(|l| l.len())
+                .unwrap_or(0);
+            crate::agent::decision_audit::record_decompose(
+                session.id(),
+                &c.goal_summary,
+                plan.workflows.len(),
+                layers,
+                mainwork_elapsed_ms,
+                mainwork_usage,
+            );
+        }
+
         // 2) Quality 校验 Main-Work 输出
         // 2026-09-16 第 66 轮 P0-2:确定性校验已通过的计划默认跳过 LLM QC-main ——
         // 计划品相问题(可省略字段为空 / 名称归一化差异 / UI 类验收措辞)不再阻断执行,
@@ -876,6 +923,14 @@ impl MultiAgentOrchestrator {
                     .map(|n| n.display().to_string())
                     .unwrap_or_default()
             ),
+        );
+        // D9-8 决策审计(2026-09-19):Plan 规划决策写入审计 JSONL。
+        crate::agent::decision_audit::record_plan(
+            session.id(),
+            &c.goal_summary,
+            c.decomposition_plan.len(),
+            plan_elapsed_ms,
+            plan_usage,
         );
 
         // 2) Quality 校验 Plan
