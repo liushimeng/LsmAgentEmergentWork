@@ -105,6 +105,11 @@ impl WindowInfo {
 ///
 /// `path` 为控件在树中的稳定定位路径(子索引链,如 `/0/2/1`;根为 `/`),
 /// `MCP_Window_Use(action=control)` 工具凭它定位目标控件,避免 LLM 传递平台句柄等不透明值。
+///
+/// 2026-09-20 第 98 轮(G7):追加 `help_text` / `access_key` / `accelerator_key` /
+/// `is_selected` 四个 UIA 辅助功能属性,LLM 据此识别「Alt+F 是文件菜单」/「Ctrl+S
+/// 是保存」/「列表项是否当前选中」等基础语义,无需反复尝试。空值 `skip_serializing_if`
+/// 保护旧 inspect JSON 形态不变。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ControlNode {
     pub path: String,
@@ -117,6 +122,18 @@ pub struct ControlNode {
     pub bounds: Rect,
     /// 该控件支持的动作名列表("click" / "set_text" / "get_text" / "focus" / "invoke")
     pub actions: Vec<String>,
+    /// 第 98 轮 G7:UIA HelpTextProperty 鼠标悬停提示(空时不序列化)。
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub help_text: String,
+    /// 第 98 轮 G7:UIA AccessKeyProperty 助记键(如 "Alt+F")。
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub access_key: String,
+    /// 第 98 轮 G7:UIA AcceleratorKeyProperty 快捷键(如 "Ctrl+S")。
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub accelerator_key: String,
+    /// 第 98 轮 G7:列表项/选项当前是否选中(只读状态,空/false 不序列化)。
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub is_selected: bool,
     pub children: Vec<ControlNode>,
 }
 

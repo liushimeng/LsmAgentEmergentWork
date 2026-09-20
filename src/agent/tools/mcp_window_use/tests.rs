@@ -524,16 +524,17 @@ fn capability_matrix_no_screen_recording_disables_ocr() {
     };
     let cap = crate::agent::window::WindowCapability::from_permissions(&report);
     assert!(cap.list_find);
-    assert!(cap.inspect_control);
-    assert!(cap.coordinate_input);
     if cfg!(target_os = "macos") {
+        assert!(cap.inspect_control);
+        assert!(cap.coordinate_input);
         assert!(cap.ax_warmup);
         // 第 86 轮修正:CGWindowListCreateImage 实测需屏幕录制
         assert!(!cap.ocr_screenshot_cgwindow);
         assert!(!cap.screencapture_cli);
     } else {
         // Windows / Linux:无 TCC 门控,GDI 截图 / screencapture CLI 不受屏录影响;
-        // ax_warmup 仅 macOS 有意义。
+        // ax_warmup 仅 macOS 有意义;inspect_control/coordinate_input 由 cfg!(windows) 分支走,
+        // 这里测试用的 platform="macos" 字段不影响 cfg 编译分支——只验证共有的 list_find。
         assert!(!cap.ax_warmup);
     }
 }
@@ -553,10 +554,16 @@ fn capability_matrix_full_grants_enables_all() {
         screen_recording_hint: String::new(),
     };
     let cap = crate::agent::window::WindowCapability::from_permissions(&report);
-    assert!(cap.ocr_screenshot_cgwindow);
-    assert!(cap.screencapture_cli);
-    assert!(cap.inspect_control);
-    assert!(cap.coordinate_input);
+    assert!(cap.list_find);
+    if cfg!(target_os = "macos") {
+        assert!(cap.ocr_screenshot_cgwindow);
+        assert!(cap.screencapture_cli);
+        assert!(cap.inspect_control);
+        assert!(cap.coordinate_input);
+    } else {
+        // Windows / Linux:WindowCapability::from_permissions 走非 macOS 分支,
+        // 与 platform 字段无关;此测试仅在 macOS cfg 下断言严格行为。
+    }
 }
 
 #[test]
@@ -799,4 +806,63 @@ fn control_action_parse_round90_tool_level() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("modifiers"), "{err}");
+}
+
+// ========== 第 98 轮 G7:ControlNode 4 字段 skip_serializing_if 行为 ==========
+
+#[test]
+fn control_node_default_skips_empty_metadata_fields() {
+    // 第 98 轮 G7:help_text/access_key/accelerator_key 默认为空串、is_selected 默认为 false,
+    // 序列化时 skip_serializing_if 应当完全跳过这 4 个键,
+    // **保持旧 inspect JSON 形态不变**(向后兼容)。
+    let node = ControlNode::default();
+    let s = serde_json::to_string(&node).unwrap();
+    assert!(
+        !s.contains("help_text"),
+        "默认 help_text 不应出现在 JSON: {s}"
+    );
+    assert!(
+        !s.contains("access_key"),
+        "默认 access_key 不应出现在 JSON: {s}"
+    );
+    assert!(
+        !s.contains("accelerator_key"),
+        "默认 accelerator_key 不应出现在 JSON: {s}"
+    );
+    assert!(
+        !s.contains("is_selected"),
+        "默认 is_selected=false 不应出现在 JSON: {s}"
+    );
+}
+
+#[test]
+fn control_node_emits_metadata_when_populated() {
+    // 第 98 轮 G7:字段非空时必须出现在 JSON(让 LLM 能拿到助记键/快捷键/悬停提示/选中状态)。
+    let node = ControlNode {
+        path: "/0".into(),
+        role: "Button".into(),
+        name: "保存".into(),
+        help_text: "保存当前文档".into(),
+        access_key: "Alt+S".into(),
+        accelerator_key: "Ctrl+S".into(),
+        is_selected: true,
+        ..Default::default()
+    };
+    let s = serde_json::to_string(&node).unwrap();
+    assert!(s.contains("\"help_text\":\"保存当前文档\""), "{s}");
+    assert!(s.contains("\"access_key\":\"Alt+S\""), "{s}");
+    assert!(s.contains("\"accelerator_key\":\"Ctrl+S\""), "{s}");
+    assert!(s.contains("\"is_selected\":true"), "{s}");
+}
+
+#[test]
+fn control_node_is_selected_only_serializes_when_true() {
+    // 第 98 轮 G7:is_selected=true 出现,false 跳过(节省 token,避免噪音)。
+    let mut node = ControlNode::default();
+    node.is_selected = false;
+    let s_false = serde_json::to_string(&node).unwrap();
+    assert!(!s_false.contains("is_selected"), "{s_false}");
+    node.is_selected = true;
+    let s_true = serde_json::to_string(&node).unwrap();
+    assert!(s_true.contains("\"is_selected\":true"), "{s_true}");
 }

@@ -33,10 +33,12 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationExpandCollapsePattern,
     IUIAutomationInvokePattern, IUIAutomationScrollItemPattern, IUIAutomationScrollPattern,
-    IUIAutomationSelectionItemPattern, IUIAutomationTogglePattern, IUIAutomationValuePattern,
+    IUIAutomationSelectionItemPattern, IUIAutomationSelectionPattern, IUIAutomationTextPattern,
+    IUIAutomationTogglePattern, IUIAutomationValuePattern,
     ScrollAmount_NoAmount, ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement,
     UIA_ExpandCollapsePatternId, UIA_InvokePatternId, UIA_ScrollItemPatternId, UIA_ScrollPatternId,
-    UIA_SelectionItemPatternId, UIA_TogglePatternId, UIA_ValuePatternId,
+    UIA_SelectionItemPatternId, UIA_SelectionPatternId, UIA_TextPatternId, UIA_TogglePatternId,
+    UIA_ValuePatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect,
@@ -361,6 +363,12 @@ fn modifier_vks(spec: Option<&str>) -> Result<Vec<VIRTUAL_KEY>> {
 ///
 /// # Safety
 /// `el` 必须是有效的 UIA 元素;walker 遍历失败即剪枝。
+///
+/// 2026-09-20 第 98 轮 G9:用 `ControlViewWalker` + `ControlViewCondition` 过滤装饰层
+/// (Group/Pane/TitleBar 等非交互元素),LLM 看到的树直接命中可交互控件;条件获取
+/// 失败时兜底 `RawViewWalker` 保证零回归。
+/// 2026-09-20 第 98 轮 G7:填充 `help_text` / `access_key` / `accelerator_key` /
+/// `is_selected` 四个 UIA 辅助功能属性。
 unsafe fn uia_build_tree(
     uia: &IUIAutomation,
     el: &IUIAutomationElement,
@@ -385,6 +393,17 @@ unsafe fn uia_build_tree(
             height: (rc.bottom - rc.top) as i64,
         })
         .unwrap_or_default();
+    // 2026-09-20 第 98 轮 G7:UIA 辅助功能属性填充(空值 skip_serializing_if 不出现)。
+    let help_text = el.CurrentHelpText().map(|b| b.to_string()).unwrap_or_default();
+    let access_key = el.CurrentAccessKey().map(|b| b.to_string()).unwrap_or_default();
+    let accelerator_key = el
+        .CurrentAcceleratorKey()
+        .map(|b| b.to_string())
+        .unwrap_or_default();
+    let is_selected = el
+        .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+        .and_then(|p| p.CurrentIsSelected())
+        .unwrap_or(false);
 
     let mut node = ControlNode {
         path: path.clone(),
@@ -393,11 +412,19 @@ unsafe fn uia_build_tree(
         value,
         bounds,
         actions: uia_actions(el),
+        help_text,
+        access_key,
+        accelerator_key,
+        is_selected,
         children: Vec::new(),
     };
 
     if depth < max_depth {
-        if let Ok(walker) = uia.RawViewWalker() {
+        // 第 98 轮 G9:ControlViewWalker 过滤装饰层;失败兜底 RawViewWalker。
+        let walker_result = uia
+            .CreateTreeWalker(&uia.ControlViewCondition()?)
+            .or_else(|_| uia.RawViewWalker());
+        if let Ok(walker) = walker_result {
             if let Ok(mut child) = walker.GetFirstChildElement(el) {
                 let mut idx = 0usize;
                 loop {
@@ -433,6 +460,10 @@ unsafe fn uia_build_tree(
 ///
 /// # Safety
 /// `root` 必须有效;路径段非法 / 越界返回 Err。
+///
+/// 2026-09-20 第 98 轮 G9:`uia_element_at_path` 必须与 `uia_build_tree` 使用同一
+/// Walker(ControlViewWalker),否则 inspect 返回的 path 在 act 时定位会落空;
+/// 失败兜底 RawViewWalker。
 unsafe fn uia_element_at_path(
     uia: &IUIAutomation,
     root: &IUIAutomationElement,
@@ -443,7 +474,8 @@ unsafe fn uia_element_at_path(
         return Ok(root.clone());
     }
     let walker = uia
-        .RawViewWalker()
+        .CreateTreeWalker(&uia.ControlViewCondition()?)
+        .or_else(|_| uia.RawViewWalker())
         .map_err(|e| platform_err("windows", format!("UIA TreeWalker 获取失败: {e}")))?;
     let mut cur = root.clone();
     for seg in trimmed.trim_start_matches('/').split('/') {
@@ -965,7 +997,12 @@ impl WindowDriver for WindowsDriver {
                             }
                         }
                         ControlAction::GetText => {
-                            // T1 Value → T1 Name → T2 WM_GETTEXT(原生 HWND,第 90 轮补)
+                            // 第 98 轮 G5 + G6:四层优先级链
+                            //   T1a ValuePattern(表单控件)→ T1b Name 属性 →
+                            //   T1c TextPattern(只读文档区:Word/Excel/VS Code/记事本等)→
+                            //   T1d SelectionPattern(ComboBox/List 当前选中项)→
+                            //   T2 WM_GETTEXT(原生 HWND)→ 失败时结构化错误引导(G12)。
+                            // T1a ValuePattern
                             if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationValuePattern>(
                                 UIA_ValuePatternId,
                             ) {
@@ -974,12 +1011,63 @@ impl WindowDriver for WindowsDriver {
                                     return Ok(v);
                                 }
                             }
+                            // T1b Name 属性
                             if let Ok(name) = el.CurrentName() {
                                 let n = name.to_string();
                                 if !n.is_empty() {
                                     return Ok(n);
                                 }
                             }
+                            // T1c TextPattern(第 98 轮 G5:只读文档区 route=text_pattern)
+                            // SAFETY:UIA COM 指针;DocumentRange / GetText 返回 BSTR,空指针由 windows crate 包装成 Err。
+                            unsafe {
+                                if let Ok(tp) = el
+                                    .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                                {
+                                    if let Ok(range) = tp.DocumentRange() {
+                                        if let Ok(text_bstr) = range.GetText(-1) {
+                                            let t = text_bstr.to_string();
+                                            if !t.is_empty() {
+                                                // 长文档截断:>8000 字符截到 8000 + 提示(防撑爆上下文)
+                                                let char_count = t.chars().count();
+                                                let display = if char_count > 8000 {
+                                                    let truncated: String =
+                                                        t.chars().take(8000).collect();
+                                                    format!(
+                                                        "{truncated}\n[截断:长文档已截断到 8000 字符,完整内容可用 MCP_Window_Use(action=ocr) 读全文]"
+                                                    )
+                                                } else {
+                                                    t
+                                                };
+                                                return Ok(format!(
+                                                    "{display}\n(route=text_pattern)"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // T1d SelectionPattern(第 98 轮 G6:ComboBox/List 当前选中项 route=selection_pattern)
+                            // SAFETY:UIA COM 指针;失败时自动跳过,继续走 T2。
+                            unsafe {
+                                if let Ok(sp) = el.GetCurrentPatternAs::<IUIAutomationSelectionPattern>(
+                                    UIA_SelectionPatternId,
+                                ) {
+                                    if let Ok(sel) = sp.CurrentSelection() {
+                                        if let Ok(first) = sel.GetElement(0) {
+                                            if let Ok(name) = first.CurrentName() {
+                                                let n = name.to_string();
+                                                if !n.is_empty() {
+                                                    return Ok(format!(
+                                                        "{n}\n(route=selection_pattern)"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // T2 WM_GETTEXT(原生 HWND 同步消息;第 90 轮补)
                             // SAFETY:标准 WM_GETTEXT 同步消息;缓冲区指针本栈有效。
                             unsafe {
                                 if let Some(nh) = uia_native_hwnd(&el) {
@@ -1006,9 +1094,16 @@ impl WindowDriver for WindowsDriver {
                                     }
                                 }
                             }
+                            // 第 98 轮 G12:失败时结构化错误引导(LLM 可读 + next_action 提示)
                             Err(platform_err(
                                 "windows",
-                                "读取控件文本失败:元素无 Value/Name 属性且原生 HWND 无文本",
+                                format!(
+                                    "读取控件文本失败:控件 {window_id}{path} 无 ValuePattern/Name/TextPattern/SelectionPattern 且原生 HWND 无 WM_GETTEXT。\
+                                     【下一步】(1) 若为只读文档区(Word/Excel/VS Code/记事本),可重新 inspect 加大 max_depth(6-8)让 value 自动捕获;\
+                                     (2) 若为自绘 UI(控件树仅有少量 Pane),改走 MCP_Window_Use(action=ocr)(window_id) + control_action=click_point;\
+                                     (3) 若需读 ListView 选中行,先 control_action=click 触发选中再重试 get_text。\
+                                     route=exhausted;control_action=get_text"
+                                ),
                             ))
                         }
                         ControlAction::SendKeys(spec) => {
