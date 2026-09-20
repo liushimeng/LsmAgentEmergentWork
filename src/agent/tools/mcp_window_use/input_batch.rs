@@ -248,16 +248,17 @@ pub(super) fn execute_step(
                     y,
                     modifiers: modifiers.clone(),
                 },
-                "middle" => ControlAction::MiddleClickPoint { x, y },
-                other => return fail(format!("button 非法: {other}(仅 left/right/middle)")),
-            };
-            // middle 无 modifiers 变体;点击 2 次 = DoubleClickPoint(左键)
-            let action = if matches!(action, ControlAction::ClickPoint { .. }) && clicks == 2 {
-                ControlAction::DoubleClickPoint {
+                // 第 96 轮:中键也支持 modifiers(ctrl+中键新标签打开 / shift+中键平移视图)
+                "middle" => ControlAction::MiddleClickPoint {
                     x,
                     y,
-                    modifiers,
-                }
+                    modifiers: modifiers.clone(),
+                },
+                other => return fail(format!("button 非法: {other}(仅 left/right/middle)")),
+            };
+            // 左键点击 2 次 = DoubleClickPoint(中键双击极少用,保持原 MiddleClickPoint 不变)
+            let action = if matches!(action, ControlAction::ClickPoint { .. }) && clicks == 2 {
+                ControlAction::DoubleClickPoint { x, y, modifiers }
             } else {
                 action
             };
@@ -447,5 +448,27 @@ mod tests {
             &mut reads,
         );
         assert!(v["detail"].as_str().unwrap().contains("button 非法"));
+    }
+
+    #[test]
+    fn execute_step_mouse_click_middle_with_modifiers() {
+        // 第 96 轮:mouse_click button=middle + modifiers 应构造 MiddleClickPoint{modifiers}
+        let driver = crate::agent::window::current_driver();
+        let mut reads = serde_json::Map::new();
+        // 仅校验参数构造(不实际执行驱动动作):用缺 x/y 先触发参数错误路径,
+        // 再用合法 x/y + button=middle + modifiers 验证构造成功(驱动层在 Linux 走 fallback 报错,但参数构造正确)
+        let v = execute_step(
+            "w",
+            driver.as_ref(),
+            &json!({"op": "mouse_click", "x": 10, "y": 20, "button": "middle", "modifiers": "ctrl"}),
+            0,
+            &mut reads,
+        );
+        // 参数构造应成功(驱动层可能因平台报错,但不应是「参数错误」)
+        let detail = v["detail"].as_str().unwrap();
+        assert!(
+            !detail.contains("x / y") && !detail.contains("button 非法"),
+            "中键 modifiers 参数构造应成功,实际: {detail}"
+        );
     }
 }

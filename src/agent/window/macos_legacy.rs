@@ -1603,10 +1603,12 @@ impl WindowDriver for MacOsDriver {
                     cg_move_cursor(*x as f64, *y as f64);
                     Ok(format!("已把光标移动到 ({x},{y})(悬停,route=physical)"))
                 }
-                ControlAction::MiddleClickPoint { x, y } => {
-                    cg_click_at_ex(*x as f64, *y as f64, CgMouseButton::Middle, 1, 0);
+                ControlAction::MiddleClickPoint { x, y, modifiers } => {
+                    let flags = cg_mod_flags(modifiers.as_deref())?;
+                    cg_click_at_ex(*x as f64, *y as f64, CgMouseButton::Middle, 1, flags);
                     Ok(format!(
-                        "已在屏幕坐标 ({x},{y}) 执行物理中键单击(CGEvent,route=physical)"
+                        "已在屏幕坐标 ({x},{y}) 执行物理中键单击{}(CGEvent,route=physical)",
+                        cg_mod_note(modifiers)
                     ))
                 }
                 ControlAction::DragPoint {

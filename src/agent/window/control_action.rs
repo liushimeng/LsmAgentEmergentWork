@@ -65,7 +65,13 @@ pub enum ControlAction {
     /// 仅移动光标到 (x,y),不点击(悬停触发菜单展开 / tooltip / 列表预览)。
     MovePoint { x: i64, y: i64 },
     /// 坐标中键点击(浏览器链接新标签打开 / 某些 CAD 平移视图)。
-    MiddleClickPoint { x: i64, y: i64 },
+    /// `modifiers` 可选修饰键规格(与 [`ControlAction::ClickPoint`] 同源):
+    /// ctrl+中键 = 新标签打开(浏览器);shift+中键 = 平移视图(CAD/3D)。
+    MiddleClickPoint {
+        x: i64,
+        y: i64,
+        modifiers: Option<String>,
+    },
     /// 从 (x,y) 按住左键拖拽到 (x2,y2)(文件拖动 / 滑块 / 选区);
     /// `modifiers` 可选修饰键(ctrl+拖=复制等),拖拽期间按住 —— 键盘与鼠标同时操作。
     /// 拖拽无 T1/T2 路径(UIA DragPattern 极少实现,Win32 无通用内容拖拽消息),
@@ -222,7 +228,11 @@ impl ControlAction {
             }
             "middleclickpoint" | "pointmiddleclick" | "middleclickat" => {
                 let (px, py) = need_point()?;
-                Self::MiddleClickPoint { x: px, y: py }
+                Self::MiddleClickPoint {
+                    x: px,
+                    y: py,
+                    modifiers: modifiers.clone(),
+                }
             }
             "dragpoint" | "pointdrag" | "dragat" | "drag" => {
                 let (px, py) = need_point()?;
@@ -266,6 +276,19 @@ impl ControlAction {
                 | Self::RightClickPoint { .. }
                 | Self::ScrollPoint { .. }
                 | Self::MovePoint { .. }
+                | Self::MiddleClickPoint { .. }
+                | Self::DragPoint { .. }
+        )
+    }
+
+    /// 是否支持 modifiers(修饰键 + 鼠标操作)。
+    /// 2026-09-20 第 96 轮:中键也纳入修饰键支持。
+    pub fn supports_modifiers(&self) -> bool {
+        matches!(
+            self,
+            Self::ClickPoint { .. }
+                | Self::DoubleClickPoint { .. }
+                | Self::RightClickPoint { .. }
                 | Self::MiddleClickPoint { .. }
                 | Self::DragPoint { .. }
         )
@@ -457,7 +480,29 @@ mod tests {
                 None
             )
             .unwrap(),
-            ControlAction::MiddleClickPoint { x: 7, y: 8 }
+            ControlAction::MiddleClickPoint {
+                x: 7,
+                y: 8,
+                modifiers: None
+            }
+        );
+        // 第 96 轮:中键支持 modifiers
+        assert_eq!(
+            ControlAction::parse_ext(
+                "middle_click_point",
+                None,
+                Some(7),
+                Some(8),
+                None,
+                None,
+                Some("ctrl".into())
+            )
+            .unwrap(),
+            ControlAction::MiddleClickPoint {
+                x: 7,
+                y: 8,
+                modifiers: Some("ctrl".into())
+            }
         );
         // 拖拽:x/y 起点 + x2/y2 终点 + 修饰键
         assert_eq!(
@@ -516,7 +561,14 @@ mod tests {
         );
         // 新变体 is_point_action 覆盖
         assert!(ControlAction::MovePoint { x: 0, y: 0 }.is_point_action());
-        assert!(ControlAction::MiddleClickPoint { x: 0, y: 0 }.is_point_action());
+        assert!(
+            ControlAction::MiddleClickPoint {
+                x: 0,
+                y: 0,
+                modifiers: None
+            }
+            .is_point_action()
+        );
         assert!(ControlAction::DragPoint {
             x: 0,
             y: 0,
@@ -525,5 +577,11 @@ mod tests {
             modifiers: None
         }
         .is_point_action());
+        // 第 96 轮:supports_modifiers 覆盖 click/drag/middle 系
+        assert!(ControlAction::MiddleClickPoint { x: 0, y: 0, modifiers: None }.supports_modifiers());
+        assert!(ControlAction::ClickPoint { x: 0, y: 0, modifiers: None }.supports_modifiers());
+        assert!(ControlAction::DragPoint { x: 0, y: 0, x2: 1, y2: 1, modifiers: None }.supports_modifiers());
+        assert!(!ControlAction::MovePoint { x: 0, y: 0 }.supports_modifiers());
+        assert!(!ControlAction::TypeText("x".into()).supports_modifiers());
     }
 }

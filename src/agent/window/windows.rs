@@ -727,9 +727,16 @@ unsafe fn win32_act(root: HWND, path: &str, action: &ControlAction) -> Result<St
             winput::move_cursor(*x, *y)?;
             Ok(format!("已把光标移动到 ({x},{y})(悬停,route=physical)"))
         }
-        ControlAction::MiddleClickPoint { x, y } => {
-            winput::click_point_ex(*x, *y, winput::MouseButton::Middle, 1, &[])?;
-            Ok(format!("已在 ({x},{y}) 执行物理中键单击(route=physical)"))
+        ControlAction::MiddleClickPoint { x, y, modifiers } => {
+            let mods = modifier_vks(modifiers.as_deref())?;
+            winput::click_point_ex(*x, *y, winput::MouseButton::Middle, 1, &mods)?;
+            Ok(format!(
+                "已在 ({x},{y}) 执行物理中键单击{}(route=physical)",
+                modifiers
+                    .as_deref()
+                    .map(|m| format!(" + 按住 {m}"))
+                    .unwrap_or_default()
+            ))
         }
         ControlAction::DragPoint {
             x,

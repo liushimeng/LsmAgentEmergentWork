@@ -158,14 +158,29 @@ impl FallbackDriver {
                         .unwrap_or_default()
                 )))
             }
-            ControlAction::MiddleClickPoint { x, y } => {
+            ControlAction::MiddleClickPoint { x, y, modifiers } => {
                 need_xdotool()?;
+                let mods = xdotool_mod_names(modifiers.as_deref())?;
                 let xs = x.to_string();
                 let ys = y.to_string();
-                xdotool(&["mousemove", &xs, &ys])?;
-                xdotool(&["click", "2"])?;
+                // 修饰键按住 → 移到目标 → 中键点击(中键在修饰键仍按住时投递)
+                for m in &mods {
+                    xdotool(&["keydown", m])?;
+                }
+                let r = (|| -> Result<()> {
+                    xdotool(&["mousemove", &xs, &ys])?;
+                    xdotool(&["click", "2"])
+                })();
+                for m in mods.iter().rev() {
+                    let _ = xdotool(&["keyup", m]);
+                }
+                r?;
                 Ok(Some(format!(
-                    "已在 ({x},{y}) 执行中键单击(xdotool,route=physical)"
+                    "已在 ({x},{y}) 执行中键单击(xdotool,route=physical{})",
+                    modifiers
+                        .as_deref()
+                        .map(|m| format!(" + 按住 {m}"))
+                        .unwrap_or_default()
                 )))
             }
             ControlAction::MovePoint { x, y } => {

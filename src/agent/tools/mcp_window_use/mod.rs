@@ -286,7 +286,7 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
 - inspect(window_id*, max_depth?, filter?): 枚举窗口控件树(Windows UIA / macOS AX),每个控件含 path(如 /0/2/1)/role/name/value/bounds/actions。需要 macOS 辅助功能授权。
 - control(window_id*, path*, control_action*, text?, x?, y?, x2?, y2?, modifiers?): 对窗口执行操作,双路线——
   控件树路线(原生 UI,**无障碍 API → Windows 消息 → 物理鼠标键盘 兜底的优先级链**,返回文案 route= 标注实际路线):path 取 inspect 返回的控件路径,control_action=click/invoke/focus/set_text/get_text/send_keys/scroll/scroll_to_visible(send_keys 第 87 轮起支持 cmd/ctrl/alt/shift 组合键与字母/数字键,如 cmd+f 微信搜索联系人);
-  视觉坐标路线(自绘 UI,如微信 4.x 控件树为空;物理鼠标键盘注入):control_action=click_point/double_click_point/right_click_point/scroll_point/type_text/type_text_submit + **第 90 轮新增 move_point(悬停)/ middle_click_point(中键)/ drag_point(拖拽,x/y 起点 + x2/y2 终点)**;x/y 传屏幕绝对坐标(取 ocr 返回的 screen_cx/screen_cy),path 照传 "/";
+  视觉坐标路线(自绘 UI,如微信 4.x 控件树为空;物理鼠标键盘注入):control_action=click_point/double_click_point/right_click_point/scroll_point/type_text/type_text_submit + **第 90 轮新增 move_point(悬停)/ middle_click_point(中键,第 96 轮起支持 modifiers)/ drag_point(拖拽,x/y 起点 + x2/y2 终点)**;x/y 传屏幕绝对坐标(取 ocr 返回的 screen_cx/screen_cy),path 照传 "/";click/drag/middle_click_point 均支持 modifiers 修饰键(同时操作鼠标+键盘:ctrl+点击多选 / shift+点击区选 / ctrl+中键新标签打开 / shift+中键平移视图);
   **modifiers**(第 90 轮新增,"ctrl"/"ctrl+shift" 等):修饰键 + 鼠标同时操作 —— ctrl+click_point 多选 / shift+click_point 区选 / ctrl+drag_point 拖拽复制。
 - ocr(window_id*, region?, lang?): 窗口 OCR 文字识别,返回词块文本 + 窗口相对坐标 + 屏幕绝对坐标(视觉路线入口)。**macOS 26.5 实测需要屏幕录制授权**(CGWindowListCreateImage + Vision 都走 TCC 屏录门控,屏录未授权时返回空);screen_recording=false 时直接改走 chat_send(osascript_fallback)。
 - screenshot(window_id?, output_path?, region?): 截图落盘 PNG,返回路径。只做截图不做识别;需要识别文字一律用 ocr。macOS 上需要屏幕录制授权(屏录未授权时 screencapture 也失败)。
@@ -296,7 +296,7 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
 - chat_loop(window_id*, messages*, interval_seconds?, max_rounds?, reply_detect?, stop_on_reply?, target_query?, chat_log_path?):
    (+第 91 轮 P0-4:click_point?/input_field_path? 透传 chat_send) **复合 action**——长时多轮会话循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent, replies, reply_rate, focus_aborted, log}`。LLM 一次调用就能跑 N 轮聊天。**第 88 轮新增:连续 3 轮前台守卫失败自动止损中止**(focus_aborted=true),防止用户离开期间消息误发到其他软件。**chat_log_path 同样支持**。
 - input_batch(window_id*, steps*, continue_on_error?): **第 90 轮新增复合 action**——一次调用编排「鼠标 + 键盘 + 控件树」任意顺序多步操作(同时操作鼠标键盘的统一入口),一次前台守卫 + 批量执行,步骤间零返场零焦点竞态。steps 数组每步 {\"op\":...}:
-  鼠标:mouse_move{x,y} / mouse_click{x,y,button?=left|right|middle,clicks?=1|2,modifiers?} / mouse_drag{x,y,x2,y2,modifiers?} / mouse_scroll{x,y,direction?=down,lines?=3};
+  鼠标:mouse_move{x,y} / mouse_click{x,y,button?=left|right|middle,clicks?=1|2,modifiers?} / mouse_drag{x,y,x2,y2,modifiers?} / mouse_scroll{x,y,direction?=down,lines?=3};(**第 96 轮:mouse_click button=middle 也支持 modifiers,ctrl+中键=浏览器新标签打开,shift+中键=CAD 平移视图**)
   键盘:key_press{keys}(组合键如 ctrl+a) / type_text{text};
   控件树(自动走无障碍→消息→物理优先级链):click{path} / set_text{path,text} / get_text{path,key?}(读取值进 results 回传);
   wait{ms}(≤5000)。每步可选 delay_ms(≤2000);steps ≤ 40;整批 ≤ 60s;默认失败即停,continue_on_error=true 继续。典型:点输入框→ctrl+a→type_text→enter 一次完成;滑块/文件用 mouse_drag;多选用 mouse_click+modifiers=ctrl。
