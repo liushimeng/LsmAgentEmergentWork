@@ -7,6 +7,88 @@
 
 use super::format::truncate_chars;
 
+/// MCP_Web_Use `{code,message,data}` 信封的精简摘要。
+///
+/// ★ 2026-09-17 第 79 轮 P2-5 引入(format.rs);第 89 轮随 MCP_Web_Use 更名;
+/// **第 99 轮迁入本子模块**(format.rs 已达临界线)+ 扩展:
+/// - `save_path` → `out=<文件名>`、`byte_size` → `bytes=N`(screenshot/download 落盘);
+/// - `reused=true` → `reused`(open 复用一眼可辨);
+/// - `ocr_text` → `ocr_len=N`、`ocr_error` → `err=...`(验证码 OCR 结果);
+/// - `result`(eval_js)→ `result=<头 24 字>`;`result_truncated` → 长度标注;
+/// - `closed`(close all)→ `closed=N`。
+/// 解析失败回退 None(调用方走普通截断)。
+pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(output_summary.trim()).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let mut parts: Vec<String> = vec![format!("code={code}")];
+    if !message.is_empty() {
+        parts.push(truncate_chars(message, 24));
+    }
+    if let Some(d) = data.as_object() {
+        for key in ["page_id", "url", "title", "spawned_page_id"] {
+            if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
+                if !s.is_empty() {
+                    parts.push(format!("{key}={}", truncate_chars(s, 30)));
+                }
+            }
+        }
+        // 文本类字段只报长度(内容本身不该在 trace 区刷屏)
+        for key in ["text", "outer_html", "markdown", "content"] {
+            if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
+                let n = s.chars().count();
+                if n > 0 {
+                    parts.push(format!("{key}_len={n}"));
+                }
+            }
+        }
+        // ===== 第 99 轮扩展 =====
+        if d.get("reused").and_then(|x| x.as_bool()) == Some(true) {
+            parts.push("reused".to_string());
+        }
+        if let Some(n) = d.get("closed").and_then(|x| x.as_i64()) {
+            parts.push(format!("closed={n}"));
+        }
+        if let Some(s) = d.get("save_path").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+            let name = std::path::Path::new(s)
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or(s);
+            parts.push(format!("out={}", truncate_chars(name, 24)));
+        }
+        if let Some(n) = d.get("byte_size").and_then(|x| x.as_i64()) {
+            parts.push(format!("bytes={n}"));
+        }
+        if let Some(s) = d.get("ocr_text").and_then(|x| x.as_str()) {
+            let n = s.chars().count();
+            if n > 0 {
+                parts.push(format!("ocr_len={n}"));
+            }
+        }
+        if let Some(s) = d.get("ocr_error").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+            parts.push(format!("ocr_err={}", truncate_chars(s, 30)));
+        }
+        match d.get("result") {
+            Some(serde_json::Value::String(s)) => {
+                parts.push(format!("result={}", truncate_chars(s, 24)));
+            }
+            Some(other @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => {
+                parts.push(format!("result={other}"));
+            }
+            _ => {}
+        }
+        if d.get("result_truncated").and_then(|x| x.as_bool()) == Some(true) {
+            let n = d.get("result_len").and_then(|x| x.as_i64()).unwrap_or(0);
+            parts.push(format!("result=[已落盘 共{n}字符]"));
+        }
+    }
+    Some(parts.join(" "))
+}
+
 /// MCP_Window_Use 成功输出的关键字段摘要(第 88 轮;第 90 轮 +input_batch)。
 ///
 /// 原始 output_summary 是 pretty JSON,截 80 字只看得到 `"ok": true` 前缀噪声。
@@ -182,5 +264,60 @@ mod tests {
         let out = r#"{"ok": true, "action": "run_sequence", "steps_total": 6, "steps_ok": 6, "wait_only": false}"#;
         let b = window_use_output_brief("", out).unwrap();
         assert!(!b.contains("wait_only"), "{b}");
+    }
+}
+
+#[cfg(test)]
+mod browser_output_brief_tests {
+    use super::*;
+
+    #[test]
+    fn brief_reused_and_page() {
+        let out = r#"{"code":0,"message":"ok","data":{"page_id":"p_a1b2c3d4","reused":true,"final_url":"http://10.0.0.1:20122/"}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("reused"), "{b}");
+        assert!(b.contains("page_id=p_a1b2c3d4"), "{b}");
+    }
+
+    #[test]
+    fn brief_screenshot_save_path_and_bytes() {
+        let out = r#"{"code":0,"message":"ok","data":{"save_path":"/tmp/laew/captcha.png","byte_size":104527,"format":"png"}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("out=captcha.png"), "{b}");
+        assert!(b.contains("bytes=104527"), "{b}");
+    }
+
+    #[test]
+    fn brief_ocr_len_not_content() {
+        let out = r#"{"code":0,"message":"ok","data":{"ocr_text":"4a7c","ocr_block_count":4,"save_path":"/tmp/x.png"}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("ocr_len=4"), "{b}");
+        assert!(!b.contains("4a7c"), "验证码内容不应进摘要: {b}");
+    }
+
+    #[test]
+    fn brief_eval_js_result_head_and_truncated() {
+        let out = r#"{"code":0,"message":"ok","data":{"result":"https://example.com/page"}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("result=https://example.com"), "{b}");
+        // 超长落盘
+        let out = r#"{"code":0,"message":"ok","data":{"result_truncated":true,"result_len":140000,"saved_to":"/tmp/laew_web_result_1.png"}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("result=[已落盘 共140000字符]"), "{b}");
+    }
+
+    #[test]
+    fn brief_close_all_count() {
+        let out = r#"{"code":0,"message":"closed","data":{"page_id":"all","closed":3}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("closed=3"), "{b}");
+    }
+
+    #[test]
+    fn brief_data_envelope_still_works() {
+        // 存量行为回归:文本类字段只报长度
+        let out = r#"{"code":0,"message":"ok","data":{"page_id":"p_1","text":"一二三四五"}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("text_len=5"), "{b}");
     }
 }

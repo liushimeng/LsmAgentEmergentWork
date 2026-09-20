@@ -80,10 +80,34 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
                             parts.push(format!("text={}", truncate_progress_text(&text, 26)));
                         }
                         if let Some(url) = ps("url") {
-                            parts.push(format!("url={}", truncate_progress_text(&url, 28)));
+                            // 第 99 轮:data: URL 只报长度(实测 140KB base64 撑爆摘要行)
+                            if url.starts_with("data:") {
+                                parts.push(format!("url=[data:{}字符]", url.chars().count()));
+                            } else {
+                                parts.push(format!("url={}", truncate_progress_text(&url, 28)));
+                            }
                         }
                         if let Some(key) = ps("key") {
                             parts.push(format!("key={}", truncate_progress_text(&key, 14)));
+                        }
+                        // 第 99 轮:eval_js 表达式头(排查「到底执行了什么 JS」)
+                        if let Some(expr) = ps("expression")
+                            .or_else(|| ps("script"))
+                            .or_else(|| ps("function"))
+                        {
+                            parts.push(format!("js={}", truncate_progress_text(&expr, 30)));
+                        }
+                        // 第 99 轮:OCR 标记(验证码任务一眼可辨)
+                        if params.get("ocr").and_then(|v| v.as_bool()) == Some(true) {
+                            parts.push("ocr".to_string());
+                        }
+                        // 第 99 轮:screenshot/download 落盘目标(只报文件名)
+                        if let Some(sp) = ps("save_path").or_else(|| ps("save_dir")) {
+                            let name = std::path::Path::new(&sp)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(&sp);
+                            parts.push(format!("out={}", truncate_progress_text(name, 20)));
                         }
                         if let Some(ms) = params.get("timeout_ms").and_then(|v| v.as_u64()) {
                             parts.push(format!("timeout={}ms", ms));
@@ -96,18 +120,16 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
         }
         "Bash" => {
             // ★ 2026-09-17 第 78 轮 P1-1:大命令精简
-            // command 字段通常 < 80 字符,但 Python 脚本 + Playwright 完整代码可超过 5000 字符
-            // 完整展示会撑爆 TUI stage 流,只显示前 80 字符 + 总长度 + 首行(若超出)
+            // ★ 第 99 轮:长命令不再倾倒正文前 80 字符 —— 实测 python base64 解码
+            // 脚本把摘要行变成 140KB 乱码头;只保留首行 + heredoc 标注 + 总长度。
             let cmd = obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let cmd_chars = cmd.chars().count();
             let cmd_first_line = cmd.lines().next().unwrap_or("").to_string();
             if cmd_chars > 200 {
-                let preview = truncate_progress_text(cmd, 80);
+                let heredoc = if cmd.contains("<<") { " 含heredoc" } else { "" };
                 let first_line_short = truncate_progress_text(&cmd_first_line, 40);
                 truncate_progress_text(
-                    &format!(
-                        "cmd=[共{cmd_chars}字符] {preview} 首行:{first_line_short}"
-                    ),
+                    &format!("cmd=[共{cmd_chars}字符{heredoc}] 首行:{first_line_short}"),
                     160,
                 )
             } else {
@@ -426,5 +448,50 @@ mod tests {
         assert_eq!(tool_args_digest("Bash", "[]"), "");
         assert_eq!(tool_args_digest("Bash", "null"), "");
         assert_eq!(tool_args_digest("Bash", "42"), "");
+    }
+
+    // ============== 2026-09-20 第 99 轮:效能复盘实测改进 ==============
+
+    #[test]
+    fn tool_args_digest_bash_heredoc_no_base64_dump() {
+        // 实测 python base64 解码脚本把摘要行变成 140KB 乱码头;
+        // 长命令只保留首行 + heredoc 标注,正文一律不出现。
+        let script = format!(
+            "python3 << 'PYEOF'\nimport base64\nb64 = \"{}\"\nprint(b64)\nPYEOF",
+            "iVBORw0KGgo".repeat(30)
+        );
+        let args = serde_json::json!({ "command": script }).to_string();
+        let s = tool_args_digest("Bash", &args);
+        assert!(s.contains("含heredoc"), "应带 heredoc 标注: {s}");
+        assert!(s.contains("首行:python3"), "应保留首行: {s}");
+        assert!(!s.contains("iVBORw0KGgo"), "base64 正文不得出现在摘要: {s}");
+    }
+
+    #[test]
+    fn tool_args_digest_web_eval_js_expression_head() {
+        let args = r#"{"action":"control","page_id":"p_1","control_action":"eval_js","params":{"expression":"document.querySelector('.code img').src"}}"#;
+        let s = tool_args_digest("MCP_Web_Use", args);
+        assert!(s.contains("js=document.querySelector"), "应带表达式头: {s}");
+    }
+
+    #[test]
+    fn tool_args_digest_web_ocr_marker_and_save_path() {
+        let args = r#"{"action":"control","page_id":"p_1","control_action":"screenshot","params":{"save_path":"/tmp/laew/captcha.png","ocr":true}}"#;
+        let s = tool_args_digest("MCP_Web_Use", args);
+        assert!(s.contains("ocr"), "应带 ocr 标记: {s}");
+        assert!(s.contains("out=captcha.png"), "应带落盘文件名: {s}");
+        assert!(!s.contains("/tmp/laew"), "不应带完整路径: {s}");
+    }
+
+    #[test]
+    fn tool_args_digest_web_data_url_collapsed() {
+        // 实测 data: URL 直灌摘要行;应只报长度
+        let args = format!(
+            r#"{{"action":"control","page_id":"p_1","control_action":"download","params":{{"url":"data:image/png;base64,{}"}}}}"#,
+            "iVBOR".repeat(200)
+        );
+        let s = tool_args_digest("MCP_Web_Use", &args);
+        assert!(s.contains("url=[data:"), "data: URL 应折叠: {s}");
+        assert!(!s.contains("iVBOR"), "data 载荷不得出现: {s}");
     }
 }

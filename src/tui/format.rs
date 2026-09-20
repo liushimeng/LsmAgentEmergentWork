@@ -8,6 +8,7 @@
 use anyhow::Result;
 
 use super::export;
+use super::format_brief::browser_output_brief;
 use super::pathfmt;
 use crate::config::{Paths, ProviderRecord};
 use crate::tui::input::display_width;
@@ -964,47 +965,10 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
     }
 }
 
-/// ★ 2026-09-17 第 79 轮 P2-5(第 89 轮随 MCP_Web_Use 更名):浏览器工具成功输出的信封精简摘要。
-///
-/// MCP_Web_Use 返回 `{code,message,data}` JSON 信封,原始 output_summary 截 80
-/// 全是转义噪声。这里解析信封后拼「code/message + 关键 data 字段」:
-/// page_id / url / title / spawned_page_id / 文本长度(text·outer_html 等字段)。
-/// 解析失败回退 None(调用方走普通截断)。
-pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(output_summary.trim()).ok()?;
-    if !v.is_object() {
-        return None;
-    }
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
-    let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
-    let mut parts: Vec<String> = vec![format!("code={code}")];
-    if !message.is_empty() {
-        parts.push(truncate_chars(message, 24));
-    }
-    if let Some(d) = data.as_object() {
-        for key in ["page_id", "url", "title", "spawned_page_id"] {
-            if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
-                if !s.is_empty() {
-                    parts.push(format!("{key}={}", truncate_chars(s, 30)));
-                }
-            }
-        }
-        // 文本类字段只报长度(内容本身不该在 trace 区刷屏)
-        for key in ["text", "outer_html", "markdown", "content"] {
-            if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
-                let n = s.chars().count();
-                if n > 0 {
-                    parts.push(format!("{key}_len={n}"));
-                }
-            }
-        }
-    }
-    Some(parts.join(" "))
-}
-
 // 第 88 轮:本文件已达 1700+ 临界线,新增的工具输出摘要函数(window_use_output_brief)
 // 落到职责子模块 `format_brief.rs`(见 tui/mod.rs 模块注册)。
+// 第 99 轮:browser_output_brief 同步迁入 format_brief.rs(本文件保持临界线下),
+// 本文件经 use 引入,调用点零改动。
 
 /// 极简 JSON 字段提取 —— 仅支持 string 值,无需 serde 完整解析。
 ///

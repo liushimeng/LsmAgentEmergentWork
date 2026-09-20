@@ -91,6 +91,34 @@ pub fn ocr_window(
     Ok(blocks)
 }
 
+/// 对 PNG 文件直接 OCR(第 99 轮:供 MCP_Web_Use 截图链路复用)。
+///
+/// 与 [`ocr_window`] 的差异:输入已是磁盘上的 PNG(浏览器 CDP 截图字节落盘),
+/// 不触碰 CGWindowListCreateImage —— **无需屏幕录制权限**;输出同为词块列表
+/// (图像左上角原点坐标),与窗口 OCR 工具层语义一致。
+/// 输出临时 JSON 加时间戳防同进程并发覆盖。
+pub fn ocr_png_file(
+    input_path: &Path,
+    config: Option<VisionOcrConfig>,
+) -> Result<Vec<VisionOcrBlock>> {
+    let cfg = config.unwrap_or_default();
+    let output_path = std::env::temp_dir().join(format!(
+        "laew_ocr_output_{}_{}.json",
+        std::process::id(),
+        now_millis_safe()
+    ));
+    let result = call_vision_ocr_helper(input_path, &output_path, &cfg);
+    let _ = std::fs::remove_file(&output_path);
+    result
+}
+
+fn now_millis_safe() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default()
+}
+
 /// 对指定窗口截图并保存到文件(2026-09-17 第 74 轮 T2)。
 ///
 /// 使用 CGWindowListCreateImage;**第 86/87 轮实测需要屏幕录制授权**

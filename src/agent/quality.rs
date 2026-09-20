@@ -13,6 +13,10 @@ use crate::error::Result;
 use crate::llm::{ChatMessage, Usage};
 use crate::session;
 
+/// 第 99 轮:QC 输出 JSON 形状硬性提示(三个 QC 提示词共用;实测 LLM 偶发漏掉
+/// verdict 字段导致反序列化失败白耗局部重试预算,提示词 + 解析端修复双保险)。
+const QC_JSON_SHAPE_HINT: &str = "\n\n【输出格式硬性要求】只输出一个合法 JSON 对象,第一个字段必须是 verdict(缺 verdict 视为无效输出,会被 fail-closed 拒收):\n{\"verdict\":\"pass\",\"source\":\"subagent\",\"issues\":[\"仅失败时列出问题\"],\"suggestion\":\"失败时给出可执行修改建议,通过时留空\",\"retryable\":false,\"evidence\":\"关键证据摘录\"}";
+
 /// 质检结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -107,7 +111,7 @@ fn build_unit_qc_prompt(
          请基于「本单元职责 + 期望输出 + 实际输出 + 执行轨迹」判定本单元是否完成,**不要用整体目标苛求本单元**\
          (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
          判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。\n\
-         若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。{degradation_rule}",
+         若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。{degradation_rule}{QC_JSON_SHAPE_HINT}",
     )
 }
 
@@ -195,7 +199,7 @@ impl QualityRunner {
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
         let prompt = format!(
-            "【Quality-Check: Main-Work 单元】\n目标: {goal}\nWorkFlow JSON: {workflow_json}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。",
+            "【Quality-Check: Main-Work 单元】\n目标: {goal}\nWorkFlow JSON: {workflow_json}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。{QC_JSON_SHAPE_HINT}",
         );
         self.run_check(prompt, AgentRole::MainWork, workflow_json, session_id, None)
             .await
@@ -208,7 +212,7 @@ impl QualityRunner {
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
         let prompt = format!(
-            "【Quality-Check: Plan 单元】\nPlan Markdown:\n{plan_markdown}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。",
+            "【Quality-Check: Plan 单元】\nPlan Markdown:\n{plan_markdown}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。{QC_JSON_SHAPE_HINT}",
         );
         self.run_check(prompt, AgentRole::Plan, plan_markdown, session_id, None)
             .await
@@ -375,7 +379,9 @@ fn gate_report_on_trace(
 pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityReport> {
     let mut last_diag: Option<String> = None;
     if let Some(json_str) = extract_json_block(text) {
-        match crate::agent::json_repair::try_parse::<QualityReport>(json_str) {
+        // 第 99 轮:先做 verdict/source/retryable 缺失的语义修复,再走语法修复链
+        let prepared = repair_quality_json(json_str, source).unwrap_or_else(|| json_str.to_string());
+        match crate::agent::json_repair::try_parse::<QualityReport>(&prepared) {
             Ok(r) => return Ok(r),
             Err(diag) => {
                 tracing::warn!(diag = %diag, "Quality ```json 块解析失败,继续降级链");
@@ -384,7 +390,8 @@ pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityRepo
         }
     }
     if let Some(json_str) = extract_standalone_json(text) {
-        match crate::agent::json_repair::try_parse::<QualityReport>(json_str) {
+        let prepared = repair_quality_json(json_str, source).unwrap_or_else(|| json_str.to_string());
+        match crate::agent::json_repair::try_parse::<QualityReport>(&prepared) {
             Ok(mut r) => {
                 if r.source != source {
                     r.source = source;
@@ -465,6 +472,55 @@ fn parse_quality_report_text_fallback(text: &str, source: AgentRole) -> Option<Q
         retryable,
         evidence,
     })
+}
+
+/// 第 99 轮:verdict / source / retryable 缺失的语义修复(serde 反序列化前的兜底,
+/// 语法修复链管不到「字段缺失」这类语义级残缺)。
+///
+/// 实测场景(云智眼登录任务,2026-09-20):QC LLM 输出合法 JSON 但漏掉 `verdict`
+/// 字段 → `missing field 'verdict'` 反序列化失败 → fail-closed 判 Fail 白白消耗
+/// 一次局部重试预算。推断优先级:
+/// 1. `pass`(bool)→ pass/fail;
+/// 2. `result` / `status` / `conclusion` 字符串含 pass/通过 或 fail/失败;
+/// 3. `issues` 非空 → Fail(列出问题即发现问题)。
+/// 均无信号 → 返回 None(保持 fail-closed Err,不误判)。
+/// `source` 缺失时用调用方 source 补齐(serde_json::to_value,与反序列化严格互逆);
+/// `retryable` 缺失时按 verdict 推断(fail → true)。
+fn repair_quality_json(json_str: &str, source: AgentRole) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let obj = v.as_object_mut()?;
+    if !obj.contains_key("verdict") {
+        let result_str = |k: &str| -> Option<String> {
+            let s = obj.get(k)?.as_str()?.to_lowercase();
+            if s.contains("pass") || s.contains("通过") {
+                Some("pass".to_string())
+            } else if s.contains("fail") || s.contains("失败") {
+                Some("fail".to_string())
+            } else {
+                None
+            }
+        };
+        let inferred: String = obj
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            .map(|b| if b { "pass" } else { "fail" }.to_string())
+            .or_else(|| ["result", "status", "conclusion"].iter().find_map(|k| result_str(k)))
+            .or_else(|| {
+                let issues = obj.get("issues")?;
+                let non_empty = issues.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+                non_empty.then(|| "fail".to_string())
+            })?;
+        obj.insert("verdict".into(), serde_json::Value::String(inferred));
+    }
+    if !obj.contains_key("source") {
+        let sv = serde_json::to_value(source).ok()?;
+        obj.insert("source".into(), sv);
+    }
+    if !obj.contains_key("retryable") {
+        let is_fail = obj.get("verdict").and_then(serde_json::Value::as_str) == Some("fail");
+        obj.insert("retryable".into(), serde_json::Value::Bool(is_fail));
+    }
+    Some(v.to_string())
 }
 
 fn extract_json_block(text: &str) -> Option<&str> {
@@ -870,4 +926,65 @@ mod tests {
         assert_eq!(gated.verdict, Verdict::Fail);
         assert!(gated.issues[0].contains("强失败信号"));
     }
+
+    // ========== 2026-09-20 第 99 轮:verdict 缺失语义修复测试 ==========
+    // 实测场景:QC LLM 输出合法 JSON 但漏 verdict → 反序列化失败 → fail-closed
+    // 白耗一次局部重试预算。修复链在语法修复前按信号推断补字段。
+
+    #[test]
+    fn repair_quality_report_missing_verdict_with_result_string() {
+        let text = r#"```json
+{
+  "source": "subagent",
+  "result": "fail",
+  "issues": ["未执行切换子账号操作"],
+  "suggestion": "先 click 切换子账号 Tab"
+}
+```"#;
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.retryable, "verdict 推断为 fail 时 retryable 应补 true");
+        assert!(r.issues.iter().any(|i| i.contains("子账号")));
+    }
+
+    #[test]
+    fn repair_quality_report_missing_verdict_with_pass_bool() {
+        let text = r#"{"pass": true, "issues": [], "retryable": false}"#;
+        let r = parse_quality_report(text, AgentRole::MainWork).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.source, AgentRole::MainWork, "缺失 source 应被调用方补齐");
+    }
+
+    #[test]
+    fn repair_quality_report_missing_verdict_with_nonempty_issues() {
+        // issues 非空 + 无其它信号 → 推断 Fail
+        let text = r#"{"issues": ["登录按钮未点击"], "suggestion": "重试"}"#;
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn repair_quality_report_missing_all_signals_still_fails_closed() {
+        // 无任何可推断信号 → 保持 fail-closed Err(不误判)
+        let text = r#"{"source": "subagent", "issues": [], "retryable": false}"#;
+        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
+        assert!(format!("{err}").contains("verdict"));
+    }
+
+    #[test]
+    fn repair_quality_report_conclusion_chinese_keyword() {
+        let text = r#"{"conclusion": "验收通过", "evidence": "菜单已抓取"}"#;
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn quality_prompt_contains_json_shape_hint() {
+        // 提示词硬化:三个 QC 提示词都必须携带 JSON 形状硬性要求
+        let p = build_unit_qc_prompt(
+            "目标", "职责", "期望", "实际", "执行轨迹", None,
+        );
+        assert!(p.contains("第一个字段必须是 verdict"), "单元 QC 提示词应含形状提示");
+    }
+
 }
