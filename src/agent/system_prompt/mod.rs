@@ -1044,6 +1044,12 @@ const MCP_WEB_USE_PROMPT_SECTION: &str = r#"
 如文心一言/ChatGPT 等 AI 网站对话、表单提交、数据采集)时,使用 MCP_Web_Use 工具
 (单工具 + action 分发):open(打开页面拿 page_id)→ control(写操作)/
 inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法见工具 description。
+工具提供两种可混合的工作模式:
+- 单步执行模式:一次调用一个 open/control/inspect/list/close,适合未知页面探索、
+  问题定位、高风险或不可逆操作;
+- 连续执行模式:先用 inspect(elements/dom/console/network)收集结构与状态,再
+  action=sequence + steps 一次执行已明确的动作链;批内用 $page_id /
+  $spawned_page_id 占位符保持页面句柄连贯,默认自动跟随新标签页。
 
 作业规范(严格遵守):
 1. 先开页后操作:MCP_Web_Use(action=open, url=...) 打开页面拿到 page_id →
@@ -1077,7 +1083,11 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     文本与轨迹不一致必判 fail;
 11. 高级交互:拖拽用 control_action=drag(source_selector→target_selector);悬停菜单/
     tooltip 用 hover 或 mouse_move;受控组件输入不生效时用 dispatch_event(input/change)
-    或 focus 后再 input_text;上传文件用 upload_file(file_paths)。
+    或 focus 后再 input_text;上传文件用 upload_file(file_paths);下载文件用
+    download(url 或 selector, save_dir?, filename?, timeout_ms?),完成后必须核验 save_path
+    与 byte_size,不要凭 HTTP 200 猜测文件已落盘;
+12. 连续模式安全边界:sequence 适合稳定的浏览/输入/等待/截图/采集链;支付、删除、
+    确认提交、登出等不可逆动作不得放进批处理,必须单步执行并在动作后 inspect 验证。
 "#;
 
 #[cfg(test)]

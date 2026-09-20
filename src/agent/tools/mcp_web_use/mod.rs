@@ -16,7 +16,8 @@
 //! - **无平台门控**:CDP 三平台行为一致,未安装浏览器时返回结构化 3001 信封 + 安装引导
 //!   (不崩溃),因此全平台注册进 `builtin_registry()` 并同步注入系统提示词使用说明。
 //!
-//! 设计见 `docs/MCP_Web_Use/01-设计与解决方案.md`。
+//! 设计见 `docs/MCP_Web_Use/01-设计与解决方案.md` 与
+//! `docs/MCP_Web_Use/02-连续执行模式与下载能力增强设计方案.md`。
 //! 技术参考:`docs/浏览器CDP工具/Rust操作Chrome浏览器CDP完整技术方案.md`。
 
 use async_trait::async_trait;
@@ -211,6 +212,187 @@ async fn run_close(args: Value) -> Result<String> {
     }
 }
 
+// ===================== action=sequence(连续执行模式) =====================
+
+/// 连续模式单批步骤上限:兼顾长任务编排与单次 tool_result 输出预算。
+const MAX_SEQUENCE_STEPS: usize = 24;
+
+/// 递归替换步骤里的 page_id 占位符。
+fn resolve_page_placeholders(value: &mut Value, current: Option<&str>, spawned: Option<&str>) {
+    match value {
+        Value::String(s) => {
+            if let Some(id) = current {
+                *s = s.replace("${page_id}", id).replace("$page_id", id);
+            }
+            if let Some(id) = spawned {
+                *s = s
+                    .replace("${spawned_page_id}", id)
+                    .replace("$spawned_page_id", id);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                resolve_page_placeholders(item, current, spawned);
+            }
+        }
+        Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                resolve_page_placeholders(item, current, spawned);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 连续执行一组已明确的浏览器动作(连续执行模式)。
+async fn run_sequence(args: Value) -> Result<String> {
+    let Some(steps) = args.get("steps").and_then(Value::as_array) else {
+        return envelope(1001, "缺少 steps 数组", json!({}));
+    };
+    if steps.is_empty() {
+        return envelope(1001, "steps 不能为空", json!({}));
+    }
+    if steps.len() > MAX_SEQUENCE_STEPS {
+        return envelope(
+            1001,
+            &format!("steps 数量超过上限({MAX_SEQUENCE_STEPS})"),
+            json!({"count": steps.len(), "max": MAX_SEQUENCE_STEPS}),
+        );
+    }
+
+    let stop_on_error = args
+        .get("stop_on_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut current_page = str_arg(&args, "page_id").map(str::to_string);
+    let mut last_spawned: Option<String> = None;
+    let mut results: Vec<Value> = Vec::with_capacity(steps.len());
+    let mut failed_at: Option<usize> = None;
+    let mut first_error: Option<(i32, String)> = None;
+
+    for (index, raw_step) in steps.iter().enumerate() {
+        if !raw_step.is_object() {
+            failed_at = Some(index);
+            first_error = Some((1001, "step 必须是对象".into()));
+            results.push(json!({
+                "index": index + 1,
+                "code": 1001,
+                "message": "step 必须是对象",
+                "data": {},
+            }));
+            break;
+        }
+        let mut step = raw_step.clone();
+        let action = step
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if action == "sequence" {
+            failed_at = Some(index);
+            first_error = Some((1001, "sequence 步骤不允许嵌套 sequence".into()));
+            results.push(json!({
+                "index": index + 1,
+                "action": action,
+                "code": 1001,
+                "message": "sequence 步骤不允许嵌套 sequence",
+                "data": {},
+            }));
+            break;
+        }
+
+        let follow_spawned = step
+            .get("follow_spawned")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if let Value::Object(ref mut map) = step {
+            map.remove("follow_spawned");
+        }
+        resolve_page_placeholders(&mut step, current_page.as_deref(), last_spawned.as_deref());
+        let control_action = step
+            .get("control_action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let step_page_id = str_arg(&step, "page_id").map(str::to_string);
+
+        let output = McpWebUseTool.execute(step).await?;
+        let parsed: Value = serde_json::from_str(&output).unwrap_or_else(
+            |_| json!({"code": 2002, "message": "步骤返回非法 JSON", "data": {"raw": output}}),
+        );
+        let code = parsed.get("code").and_then(Value::as_i64).unwrap_or(2002) as i32;
+        let message = parsed
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let data = parsed.get("data").cloned().unwrap_or_else(|| json!({}));
+
+        if code == 0 {
+            if action == "open" {
+                if let Some(id) = data.get("page_id").and_then(Value::as_str) {
+                    current_page = Some(id.to_string());
+                }
+            } else if action == "control" {
+                if control_action == "new_tab" {
+                    if let Some(id) = data.get("spawned_page_id").and_then(Value::as_str) {
+                        current_page = Some(id.to_string());
+                    }
+                }
+            } else if action == "close" && current_page.as_deref() == step_page_id.as_deref() {
+                current_page = None;
+            }
+
+            if let Some(spawned) = data.get("spawned_page_id").and_then(Value::as_str) {
+                last_spawned = Some(spawned.to_string());
+                if follow_spawned {
+                    current_page = Some(spawned.to_string());
+                }
+            }
+        }
+
+        results.push(json!({
+            "index": index + 1,
+            "action": action,
+            "code": code,
+            "message": message,
+            "data": data,
+        }));
+        if code != 0 {
+            failed_at = Some(index);
+            first_error = Some((code, message));
+            if stop_on_error {
+                break;
+            }
+        }
+    }
+
+    let completed = failed_at.is_none();
+    let mut data = json!({
+        "mode": "continuous",
+        "steps": results,
+        "step_count": steps.len(),
+        "completed": completed,
+        "stop_on_error": stop_on_error,
+    });
+    if let Some(index) = failed_at {
+        data["failed_at"] = json!(index + 1);
+    }
+    if let Some(id) = &current_page {
+        data["page_id"] = json!(id);
+    }
+    if let Some(id) = &last_spawned {
+        data["spawned_page_id"] = json!(id);
+    }
+
+    match first_error {
+        Some((code, message)) if !completed => {
+            envelope(code, &format!("sequence 未完成:{message}"), data)
+        }
+        Some(_) | None => envelope(0, "sequence completed", data),
+    }
+}
+
 // ===================== MCP_Web_Use 工具门面 =====================
 
 /// 浏览器网页操控统一入口(MCP 风格单工具 + action 分发)。
@@ -223,13 +405,15 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 - open(url*, mode?, connect_url?, user_agent?, wait_until?): 启动/接管 Chromium 并打开页面。默认纯 CDP 嵌入式无头浏览器(mode=hidden,无可见窗口,一次性临时 profile 不干扰日常浏览器);connect_url 接管已用 --remote-debugging-port 启动的浏览器。返回 {page_id,title,final_url,mode,next_steps};next_steps 是 input_text→click→wait→elements 四步引导(selector_hint 已备好)。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
 - list(): 列出当前存活页面 [{page_id,url,title,created_at}];返回前自动清理失效 entry。冷启动后多轮任务优先用它同步页面索引。
 - close(page_id*): 关闭指定页面;最后一个页面关闭时回收浏览器进程。幂等;对话型页面(用户可能继续追问)可保留复用。
-- control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。
+- control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。download 支持 url 或 selector、save_dir、filename、timeout_ms,完成后返回绝对 save_path 与 byte_size。
 - inspect(page_id*, info*, params?): 全部只读观察统一入口。info 枚举:console(控制台输出)/network(请求响应流)/elements(元素文本与矩形)/dom(outerHTML 或节点树)/localstorage/sessionstorage/cookies/screenshot/page_meta/viewport/url/title/ping/image_urls。
+- sequence(steps*, stop_on_error?): 连续执行模式。steps 最多 24 个,每项结构与单步调用相同(open/list/close/control/inspect),禁止嵌套 sequence;批内 page_id 用 "$page_id"/"${page_id}" 占位,点击派生新页可用 "$spawned_page_id"/"${spawned_page_id}",默认自动跟随 spawned_page_id,单步可 follow_spawned=false 保持原页。响应逐步返回 code/message/data,并给出最终 page_id。
 
-【标准作业顺序】open 拿 page_id → control 执行动作 → inspect 观察结果 → 任务完成后 close 释放(确定不再需要的页面)。
+【两种工作模式】1) 单步执行模式:直接调用 open/control/inspect/list/close,一次一个动作,适合探索、调试和高风险操作;2) 连续执行模式:先用单步 inspect(elements/dom/console/network)探索结构,再 action=sequence 一次执行已明确动作链,适合流程稳定任务。两种模式可混合、可多次调用。
+【标准作业顺序】open 拿 page_id → inspect 探索真实 DOM → control 执行动作 → inspect 验证结果 → 任务完成后 close 释放(确定不再需要的页面)。
 【错误码对策】1001 修正参数;2000 page_id 失效→action=list 重新同步;2001 断连→重新 open;2002 换 selector 或 input_text 的 use_js 路径重试;3001 未安装浏览器→如实告知用户,不要编造结果。
 【作业要点】中文输入优先 params.use_js=true(React/Vue 受控组件兼容);复杂页面先 inspect(info=elements) 探测真实 DOM 再操作,不要硬猜 selector;AI 对话类网站回复等待用 control(wait, selector=[class*=response]..., timeout_ms=60000);截图优先 params.save_path 落盘;DOM 提取注意 truncated 标记分段。
-【安全红线】禁止对疑似支付/删除/确认提交类按钮做无把握点击;登录凭证只填用户明确提供的账号密码,不要编造;只读优先——能 inspect 回答的问题不做任何写操作。"#;
+【安全红线】支付/删除/确认提交/登出等不可逆或高风险动作禁止放进 sequence,必须单步执行并检查页面状态;登录凭证只填用户明确提供的账号密码,不要编造;只读优先——能 inspect 回答的问题不做任何写操作。"#;
 
 #[async_trait]
 impl Tool for McpWebUseTool {
@@ -247,8 +431,8 @@ impl Tool for McpWebUseTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open", "list", "close", "control", "inspect"],
-                    "description": "要执行的浏览器操作:open(启动/接管浏览器并打开页面) / list(列出存活页面) / close(关闭页面) / control(写操作统一入口) / inspect(只读观察统一入口)"
+                    "enum": ["open", "list", "close", "control", "inspect", "sequence"],
+                    "description": "要执行的浏览器操作:open(启动/接管浏览器并打开页面) / list(列出存活页面) / close(关闭页面) / control(写操作统一入口) / inspect(只读观察统一入口) / sequence(连续执行一批操作)"
                 },
                 "url": { "type": "string", "description": "open 必填:目标网址" },
                 "mode": { "type": "string", "enum": ["hidden", "new_headless", "headed"], "default": "hidden", "description": "open 可选:浏览器模式;hidden=纯 CDP 无窗口(默认,推荐),new_headless=旧 headless=true,headed=可见窗口(调试截图)" },
@@ -263,7 +447,7 @@ impl Tool for McpWebUseTool {
                         "click", "human_click", "right_click", "double_click", "hover",
                         "scroll", "scroll_to", "key_press", "press_sequence",
                         "input_text", "human_input", "clear_input",
-                        "upload_file", "select_option",
+                        "upload_file", "select_option", "download",
                         "new_tab", "close_tab",
                         "navigate", "back", "forward", "reload",
                         "wait", "eval_js",
@@ -272,7 +456,7 @@ impl Tool for McpWebUseTool {
                         "screenshot", "heartbeat",
                         "drag", "focus", "blur", "mouse_move", "dispatch_event"
                     ],
-                    "description": "control 必填:具体写操作(鼠标/键盘/输入/上传/标签页/导航/等待/JS/Cookie/Storage/视口/截图等 34 个)"
+                    "description": "control 必填:具体写操作(鼠标/键盘/输入/上传/下载/标签页/导航/等待/JS/Cookie/Storage/视口/截图等 35 个)"
                 },
                 "info": {
                     "type": "string",
@@ -284,7 +468,21 @@ impl Tool for McpWebUseTool {
                     ],
                     "description": "inspect 必填:观察维度(Console 输出 / Network 流 / Elements 元素 / DOM / localStorage 等 14 个)"
                 },
-                "params": { "type": "object", "description": "control/inspect 可选:动作参数对象(selector/text/key/keys/timeout_ms/url/x/y/file_paths/items 等按 control_action/info 各异)" }
+                "params": { "type": "object", "description": "control/inspect 可选:动作参数对象(selector/text/key/keys/timeout_ms/url/x/y/file_paths/save_dir/filename 等按 control_action/info 各异)" },
+                "execution_mode": {
+                    "type": "string",
+                    "enum": ["single_step", "continuous"],
+                    "default": "single_step",
+                    "description": "使用模式说明。single_step=默认,一次调用一个 action,适合探索/调试/高风险操作;continuous=action=sequence,先探索后在 steps 中一次执行动作链,适合稳定流程。两种模式可混合多次调用"
+                },
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 24,
+                    "description": "sequence 必填:连续执行步骤。每项结构与单步入参相同(action/page_id/control_action/info/params),可用 $page_id、$spawned_page_id 占位符;单步级 follow_spawned=false 可禁止自动跟随新标签页",
+                    "items": { "type": "object", "additionalProperties": true }
+                },
+                "stop_on_error": { "type": "boolean", "default": true, "description": "sequence 可选:默认 true,任一步失败立即停止;false 用于采集全量执行报告" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -301,6 +499,7 @@ impl Tool for McpWebUseTool {
             "close" => run_close(args).await,
             "control" => control::run(args).await,
             "inspect" => inspect::run(args).await,
+            "sequence" => run_sequence(args).await,
             other => envelope(1001, "未知 action", json!({"action": other})),
         }
     }

@@ -35,11 +35,14 @@ fn parse_modifiers_combo() {
 // =================== Schema 枚举完整性(第 89 轮单工具化) ===================
 
 #[test]
-fn parameters_action_enum_is_five_values() {
+fn parameters_action_enum_is_six_values() {
     let p = McpWebUseTool.parameters();
     let enums = p["properties"]["action"]["enum"].as_array().expect("action enum 应为数组");
     let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(names, vec!["open", "list", "close", "control", "inspect"]);
+    assert_eq!(
+        names,
+        vec!["open", "list", "close", "control", "inspect", "sequence"]
+    );
     assert_eq!(p["required"][0], "action", "action 必填");
 }
 
@@ -53,7 +56,7 @@ fn parameters_control_action_enum_complete() {
     for required in &[
         "click", "right_click", "double_click", "hover", "scroll", "scroll_to",
         "key_press", "press_sequence", "input_text", "human_input", "clear_input",
-        "upload_file", "select_option", "new_tab", "close_tab",
+        "upload_file", "select_option", "download", "new_tab", "close_tab",
         "navigate", "back", "forward", "reload", "wait", "eval_js",
         "set_cookie", "delete_cookie", "set_storage", "clear_storage", "set_viewport",
         "screenshot", "heartbeat",
@@ -61,7 +64,7 @@ fn parameters_control_action_enum_complete() {
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
-    assert_eq!(names.len(), 34, "control_action 应为 34 个,实际 {names:?}");
+    assert_eq!(names.len(), 35, "control_action 应为 35 个,实际 {names:?}");
 }
 
 #[test]
@@ -134,6 +137,49 @@ async fn inspect_missing_page_id_returns_1001() {
         .unwrap();
     assert!(res.contains("\"code\":1001"));
     assert!(res.contains("缺少 page_id"));
+}
+
+#[tokio::test]
+async fn sequence_missing_steps_returns_1001() {
+    let res = McpWebUseTool.execute(json!({"action": "sequence"})).await.unwrap();
+    assert!(res.contains("\"code\":1001"));
+    assert!(res.contains("缺少 steps"));
+}
+
+#[tokio::test]
+async fn sequence_empty_steps_returns_1001() {
+    let res = McpWebUseTool
+        .execute(json!({"action": "sequence", "steps": []}))
+        .await
+        .unwrap();
+    assert!(res.contains("\"code\":1001"));
+    assert!(res.contains("steps 不能为空"));
+}
+
+#[tokio::test]
+async fn sequence_rejects_nested_sequence_without_browser() {
+    let res = McpWebUseTool
+        .execute(json!({"action": "sequence", "steps": [{"action": "sequence", "steps": []}]}))
+        .await
+        .unwrap();
+    assert!(res.contains("\"code\":1001"));
+    assert!(res.contains("不允许嵌套 sequence"));
+}
+
+#[test]
+fn sequence_placeholders_resolve_recursively() {
+    let mut value = json!({
+        "page_id": "$page_id",
+        "params": {
+            "selector": "a[data-page='${page_id}']",
+            "values": ["$spawned_page_id", "${spawned_page_id}"]
+        }
+    });
+    resolve_page_placeholders(&mut value, Some("p_current"), Some("p_spawn"));
+    assert_eq!(value["page_id"], "p_current");
+    assert_eq!(value["params"]["selector"], "a[data-page='p_current']");
+    assert_eq!(value["params"]["values"][0], "p_spawn");
+    assert_eq!(value["params"]["values"][1], "p_spawn");
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 //! MCP_Web_Use action=control:全部写操作统一入口(自 tools/browser.rs 平移)。
 //!
-//! `control_action` 枚举对应原 BrowserControl 的 `action` 字段(34 个);
+//! `control_action` 枚举对应原 BrowserControl 的 `action` 字段(35 个);
 //! 动作参数集中在 `params` 对象;派生标签页经响应 `spawned_page_id` 回传。
 
 use base64::Engine;
@@ -32,6 +32,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "clear_input" => act_clear_input(id, &params).await,
         "upload_file" => act_upload_file(id, &params).await,
         "select_option" => act_select_option(id, &params).await,
+        "download" => act_download(id, &params).await,
         "new_tab" => act_new_tab(id, &params).await,
         "close_tab" => act_close_tab(id).await,
         "navigate" => act_navigate(id, &params).await,
@@ -400,6 +401,30 @@ async fn act_select_option(id: &str, p: &Value) -> std::result::Result<Value, St
     );
     let ok = eval_js_string(&page, &js).await?;
     Ok(json!({"selected": ok, "selector": sel, "mode": "value"}))
+}
+
+/// 下载文件:支持直接 URL 或点击页面上的下载链接/按钮。
+///
+/// BrowserManager 会先配置 Chrome 下载目录并监听 Browser 域下载事件,再触发动作;
+/// 完成后返回绝对 `save_path` 与字节数。`filename` 只允许文件名,不能携带路径。
+async fn act_download(id: &str, p: &Value) -> std::result::Result<Value, String> {
+    let url = str_arg(p, "url");
+    let selector = str_arg(p, "selector");
+    if url.is_none() && selector.is_none() {
+        return Err("缺少 url 或 selector".into());
+    }
+    crate::agent::browser::BrowserManager::global()
+        .download(
+            id,
+            url,
+            selector,
+            str_arg(p, "save_dir"),
+            str_arg(p, "filename"),
+            p.get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(120_000),
+        )
+        .await
 }
 
 async fn act_new_tab(id: &str, p: &Value) -> std::result::Result<Value, String> {

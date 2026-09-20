@@ -8,6 +8,8 @@ use lsm_agent::agent::browser::detect_browser;
 use lsm_agent::agent::tools::mcp_web_use::McpWebUseTool;
 use lsm_agent::agent::tools::Tool;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 // data: URL 中属性一律单引号(未编码双引号会被 Chrome 截断解析)
 const PAGE: &str = "data:text/html,<html><head><title>laew-smoke</title></head>\
@@ -16,6 +18,41 @@ const PAGE: &str = "data:text/html,<html><head><title>laew-smoke</title></head>\
 
 fn data_of(out: &str) -> Value {
     serde_json::from_str(out).unwrap_or(Value::Null)
+}
+
+/// 启动一次性本地 HTTP 服务,验证 CDP 下载事件与真实落盘路径。
+async fn spawn_download_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let _ = serve_download_once(&mut socket).await;
+        }
+    });
+    format!("http://{addr}/download")
+}
+
+async fn serve_download_once(socket: &mut TcpStream) -> std::io::Result<()> {
+    let mut buf = vec![0_u8; 4096];
+    let mut read = 0;
+    loop {
+        let n = socket.read(&mut buf[read..]).await?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") || read == buf.len() {
+            break;
+        }
+    }
+    let body = b"laew-download-ok\n";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=laew-download.txt\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(response.as_bytes()).await?;
+    socket.write_all(body).await?;
+    socket.shutdown().await
 }
 
 #[tokio::test]
@@ -107,6 +144,30 @@ async fn mcp_web_use_open_control_inspect_smoke() {
     let v = data_of(&out);
     assert_eq!(v["data"]["title"], "clicked", "点击后标题应变");
 
+    // 7.5) 连续执行模式:同一 page_id 批内占位符传递,一次完成输入/点击/验证
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "sequence",
+            "page_id": page_id,
+            "steps": [
+                {"action": "control", "page_id": "$page_id", "control_action": "input_text",
+                 "params": {"selector": "#q", "text": "sequence 你好", "use_js": true}},
+                {"action": "control", "page_id": "$page_id", "control_action": "click",
+                 "params": {"selector": "#go"}},
+                {"action": "control", "page_id": "$page_id", "control_action": "wait",
+                 "params": {"duration_ms": 300}},
+                {"action": "inspect", "page_id": "$page_id", "info": "title"}
+            ]
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "sequence 应成功: {out}");
+    assert_eq!(v["data"]["completed"], true);
+    assert_eq!(v["data"]["step_count"], 4);
+    assert_eq!(v["data"]["page_id"], page_id);
+    assert_eq!(v["data"]["steps"][3]["data"]["title"], "clicked");
+
     // 7) elements 检视
     let out = McpWebUseTool
         .execute(json!({"action": "inspect", "page_id": page_id, "info": "elements", "params": {"selector": "#h"}}))
@@ -136,6 +197,38 @@ async fn mcp_web_use_open_control_inspect_smoke() {
     let v = data_of(&out);
     assert_eq!(v["code"], 0, "screenshot 应成功: {out}");
     assert!(path.exists() && std::fs::metadata(&path).unwrap().len() > 100);
+
+    // 8.5) 真实下载:监听 Browser.downloadWillBegin/Progress,验证最终文件内容
+    let url = spawn_download_server().await;
+    let dir = std::env::temp_dir().join(format!(
+        "laew_download_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "download",
+            "params": {
+                "url": url,
+                "save_dir": dir.to_str().unwrap(),
+                "filename": "laew-download-final.txt",
+                "timeout_ms": 10000
+            }
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "download 应成功: {out}");
+    let saved = v["data"]["save_path"].as_str().unwrap().to_string();
+    assert_eq!(v["data"]["byte_size"], json!("laew-download-ok\n".len()));
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "laew-download-ok\n"
+    );
 
     // 9) action=close 幂等
     let out = McpWebUseTool

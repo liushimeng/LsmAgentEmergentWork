@@ -19,6 +19,10 @@ use std::sync::{Arc, OnceLock};
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::Page;
+use chromiumoxide::cdp::browser_protocol::browser::{
+    EventDownloadProgress, EventDownloadWillBegin, SetDownloadBehaviorBehavior,
+    SetDownloadBehaviorParams,
+};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -465,6 +469,222 @@ impl BrowserManager {
             .pages
             .get(page_id)
             .map(|e| e.events.clone())
+    }
+
+    /// 通过页面触发一次下载,并等待 Browser 域事件给出最终落盘路径。
+    ///
+    /// 设计要点:
+    /// - `Browser.setDownloadBehavior(allowAndName)` 统一指定下载目录并开启事件;
+    /// - 先注册 `downloadWillBegin` / `downloadProgress` 监听,再用页面内 anchor 或
+    ///   selector click 触发,避免事件竞态;
+    /// - `guid` 贯穿 begin/progress,过滤并发浏览器下载中的无关事件;
+    /// - `filename` 只作为最终重命名目标,先做 file_name 归一化,防止路径穿越。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn download(
+        &self,
+        page_id: &str,
+        url: Option<&str>,
+        selector: Option<&str>,
+        save_dir: Option<&str>,
+        filename: Option<&str>,
+        timeout_ms: u64,
+    ) -> std::result::Result<Value, String> {
+        const DEFAULT_DOWNLOAD_TIMEOUT_MS: u64 = 120_000;
+        let timeout_ms = if timeout_ms == 0 {
+            DEFAULT_DOWNLOAD_TIMEOUT_MS
+        } else {
+            timeout_ms.clamp(1_000, 300_000)
+        };
+
+        let base = if let Some(dir) = save_dir.filter(|s| !s.is_empty()) {
+            PathBuf::from(dir)
+        } else {
+            std::env::current_dir().map_err(|e| format!("获取工作目录失败:{e}"))?
+        };
+        tokio::fs::create_dir_all(&base)
+            .await
+            .map_err(|e| format!("创建下载目录失败({}):{e}", base.display()))?;
+        let base = tokio::fs::canonicalize(&base)
+            .await
+            .map_err(|e| format!("解析下载目录失败({}):{e}", base.display()))?;
+
+        // 在同一个临界区内完成:查找页面、配置下载行为、注册全局 Browser 事件流。
+        // EventStream 与 Page 都是克隆句柄,离开临界区后仍可使用;触发动作前锁已释放。
+        let (page, mut begin_stream, mut progress_stream) = {
+            let inner = self.inner.lock().await;
+            let Some(browser) = inner.browser.as_ref() else {
+                return Err("浏览器会话不存在".into());
+            };
+            let Some(entry) = inner.pages.get(page_id) else {
+                return Err("page_id 不存在".into());
+            };
+            let page = entry.page.clone();
+            let params = SetDownloadBehaviorParams::builder()
+                .behavior(SetDownloadBehaviorBehavior::AllowAndName)
+                .download_path(base.to_string_lossy().to_string())
+                .events_enabled(true)
+                .build()
+                .map_err(|e| e.to_string())?;
+            browser
+                .execute(params)
+                .await
+                .map_err(|e| format!("配置下载行为失败:{e}"))?;
+            let begin_stream = browser
+                .event_listener::<EventDownloadWillBegin>()
+                .await
+                .map_err(|e| format!("注册下载开始事件失败:{e}"))?;
+            let progress_stream = browser
+                .event_listener::<EventDownloadProgress>()
+                .await
+                .map_err(|e| format!("注册下载进度事件失败:{e}"))?;
+            (page, begin_stream, progress_stream)
+        };
+
+        // 触发下载。优先点击页面既有链接;没有 selector 时注入临时 anchor,
+        // 避免用 page.goto 下载 URL 导致 Chrome 以 net::ERR_ABORTED 结束导航。
+        if let Some(selector) = selector.filter(|s| !s.is_empty()) {
+            let element = page
+                .find_element(selector.to_string())
+                .await
+                .map_err(|e| format!("查找下载元素失败:{e}"))?;
+            element
+                .click()
+                .await
+                .map_err(|e| format!("触发下载失败:{e}"))?;
+        } else {
+            let Some(url) = url.filter(|s| !s.is_empty()) else {
+                return Err("缺少 url 或 selector".into());
+            };
+            let js = format!(
+                r#"(() => {{
+                    const a = document.createElement('a');
+                    a.href = {url};
+                    a.rel = 'noopener';
+                    a.download = '';
+                    a.style.display = 'none';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    return true;
+                }})()"#,
+                url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".into()),
+            );
+            page.evaluate(js.as_str())
+                .await
+                .map_err(|e| format!("触发下载失败:{e}"))?;
+        }
+
+        let started_at = std::time::Instant::now();
+        let begin = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+            loop {
+                match begin_stream.next().await {
+                    Some(ev) => return ev,
+                    None => {
+                        return Arc::new(EventDownloadWillBegin {
+                            frame_id: Default::default(),
+                            guid: String::new(),
+                            url: String::new(),
+                            suggested_filename: String::new(),
+                        })
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| format!("等待下载开始超时({timeout_ms}ms)"))?;
+        if begin.guid.is_empty() {
+            return Err("下载事件流已关闭".into());
+        }
+
+        let mut final_progress: Option<EventDownloadProgress> = None;
+        let wait_deadline = std::time::Duration::from_millis(timeout_ms);
+        let progress = tokio::time::timeout(wait_deadline, async {
+            loop {
+                match progress_stream.next().await {
+                    Some(ev) if ev.guid == begin.guid => {
+                        match ev.state {
+                            chromiumoxide::cdp::browser_protocol::browser::DownloadProgressState::Completed
+                            | chromiumoxide::cdp::browser_protocol::browser::DownloadProgressState::Canceled => {
+                                return (*ev).clone()
+                            }
+                            _ => {
+                                final_progress = Some((*ev).clone());
+                            }
+                        }
+                    }
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+            final_progress.take().unwrap_or(EventDownloadProgress {
+                guid: begin.guid.clone(),
+                total_bytes: 0.0,
+                received_bytes: 0.0,
+                state: chromiumoxide::cdp::browser_protocol::browser::DownloadProgressState::Canceled,
+                file_path: None,
+            })
+        })
+        .await
+        .map_err(|_| format!("等待下载完成超时({timeout_ms}ms)"))?;
+
+        if !matches!(
+            progress.state,
+            chromiumoxide::cdp::browser_protocol::browser::DownloadProgressState::Completed
+        ) {
+            return Err(format!(
+                "下载未完成(state={:?}, received={}, total={})",
+                progress.state, progress.received_bytes, progress.total_bytes
+            ));
+        }
+
+        let source = progress
+            .file_path
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| base.join(&begin.suggested_filename));
+        if !source.exists() {
+            return Err(format!(
+                "Chrome 报告下载完成但文件不存在:{}",
+                source.display()
+            ));
+        }
+
+        let target = if let Some(filename) = filename.filter(|s| !s.is_empty()) {
+            let safe_name = Path::new(filename)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                .ok_or_else(|| format!("非法下载文件名:{filename}"))?;
+            base.join(safe_name)
+        } else {
+            base.join(&begin.suggested_filename)
+        };
+        if source != target {
+            tokio::fs::rename(&source, &target).await.map_err(|e| {
+                format!(
+                    "重命名下载文件失败({} → {}):{e}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+        }
+        let byte_size = tokio::fs::metadata(&target)
+            .await
+            .map_err(|e| format!("读取下载文件大小失败({}):{e}", target.display()))?
+            .len();
+
+        Ok(json!({
+            "guid": begin.guid,
+            "url": begin.url,
+            "suggested_filename": begin.suggested_filename,
+            "save_path": target,
+            "byte_size": byte_size,
+            "received_bytes": progress.received_bytes,
+            "total_bytes": progress.total_bytes,
+            "state": "completed",
+            "elapsed_ms": started_at.elapsed().as_millis() as u64,
+        }))
     }
 
     /// 动作后 adopt 派生标签页:diff browser.pages() 与注册表,
