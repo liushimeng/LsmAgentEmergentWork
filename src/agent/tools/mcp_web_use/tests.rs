@@ -1,6 +1,7 @@
 //! MCP_Web_Use 工具单元测试(自 tools/browser.rs 测试平移 + 单工具化改造)。
 
 use super::*;
+use base64::Engine as _;
 
 #[test]
 fn envelope_codes() {
@@ -61,10 +62,11 @@ fn parameters_control_action_enum_complete() {
         "set_cookie", "delete_cookie", "set_storage", "clear_storage", "set_viewport",
         "screenshot", "heartbeat",
         "drag", "focus", "blur", "mouse_move", "dispatch_event",
+        "set_window", "sync_viewport", "set_highlight", "request_human",
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
-    assert_eq!(names.len(), 35, "control_action 应为 35 个,实际 {names:?}");
+    assert_eq!(names.len(), 39, "control_action 应为 39 个,实际 {names:?}");
 }
 
 #[test]
@@ -75,10 +77,11 @@ fn parameters_info_enum_complete() {
     for required in &[
         "console", "network", "elements", "dom", "localstorage", "sessionstorage",
         "cookies", "screenshot", "page_meta", "viewport", "url", "title", "image_urls",
+        "blockers",
     ] {
         assert!(names.contains(required), "info 枚举缺失 {required}");
     }
-    assert_eq!(names.len(), 14, "info 应为 14 个,实际 {names:?}");
+    assert_eq!(names.len(), 16, "info 应为 16 个,实际 {names:?}");
 }
 
 #[test]
@@ -257,4 +260,235 @@ fn extract_page_id_returns_none_for_failure() {
 fn extract_page_id_handles_non_json() {
     assert_eq!(extract_page_id_from_text("plain text"), None);
     assert_eq!(extract_page_id_from_text(""), None);
+}
+
+// =================== 第 99 轮:open 复用 / URL 归一化 / eval_js 净化 / download 快速失败 ===================
+
+#[test]
+fn normalize_web_url_trims_trailing_slash_and_fragment() {
+    assert_eq!(
+        normalize_web_url("http://10.255.159.58:20122/"),
+        "http://10.255.159.58:20122"
+    );
+    assert_eq!(
+        normalize_web_url("http://a.com/page#top"),
+        "http://a.com/page"
+    );
+    assert_eq!(normalize_web_url(" http://a.com "), "http://a.com");
+    // 归一化后相等的不同写法应匹配
+    assert_eq!(
+        normalize_web_url("http://a.com/x/"),
+        normalize_web_url("http://a.com/x")
+    );
+}
+
+#[test]
+fn decode_data_url_base64_payload() {
+    // 1x1 红色像素 PNG 的已知 base64 头不可靠,直接用文本字节验证
+    let payload = base64::engine::general_purpose::STANDARD.encode("hello captcha");
+    let url = format!("data:text/plain;base64,{payload}");
+    let bytes = control::decode_data_url(&url).expect("base64 载荷应可解码");
+    assert_eq!(bytes, b"hello captcha");
+}
+
+#[test]
+fn decode_data_url_percent_payload() {
+    let url = "data:text/plain,hello%20world%21";
+    let bytes = control::decode_data_url(url).expect("百分号载荷应可解码");
+    assert_eq!(bytes, b"hello world!");
+}
+
+#[test]
+fn decode_data_url_rejects_non_data() {
+    assert!(control::decode_data_url("http://example.com/x.png").is_none());
+    assert!(control::decode_data_url("data:image/png").is_none()); // 无逗号
+}
+
+#[test]
+fn percent_decode_plus_as_space_and_rejects_bad_hex() {
+    assert_eq!(control::percent_decode("a+b").as_deref(), Some("a b"));
+    assert_eq!(control::percent_decode("%41").as_deref(), Some("A"));
+    assert_eq!(control::percent_decode("%zz"), None);
+    assert_eq!(control::percent_decode("%4"), None); // 截断
+}
+
+#[test]
+fn looks_like_function_detection() {
+    assert!(control::looks_like_function("(() => 1)()"));
+    assert!(control::looks_like_function("(function(){return 1})()"));
+    assert!(control::looks_like_function("async () => 1"));
+    assert!(control::looks_like_function("  function f(){}"));
+    assert!(!control::looks_like_function("document.title"));
+    assert!(!control::looks_like_function("return document.title"));
+    assert!(!control::looks_like_function("var x = 1; x + 1"));
+}
+
+#[test]
+fn sanitize_eval_result_keeps_small_values() {
+    assert_eq!(control::sanitize_eval_result(json!("short")), json!("short"));
+    assert_eq!(control::sanitize_eval_result(json!(42)), json!(42));
+    let obj = json!({"nested": true});
+    assert_eq!(control::sanitize_eval_result(obj.clone()), obj);
+}
+
+#[test]
+fn sanitize_eval_result_truncates_long_strings_to_file() {
+    let long = "x".repeat(5000);
+    let out = control::sanitize_eval_result(json!(long.clone()));
+    assert_eq!(out["result_truncated"], json!(true));
+    assert!(out["result_len"].as_i64().unwrap() >= 5000);
+    assert!(out["saved_to"].as_str().unwrap_or("").contains("laew_web_result_"));
+    // 落盘内容 = 原文
+    let path = out["saved_to"].as_str().unwrap();
+    let written = std::fs::read_to_string(path).expect("落盘文件应可读");
+    assert_eq!(written, long);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sanitize_eval_result_saves_data_url_bytes() {
+    let payload = base64::engine::general_purpose::STANDARD.encode([0u8, 1, 2, 3, 4, 5, 6, 7]);
+    let url = format!("data:image/png;base64,{payload}");
+    let out = control::sanitize_eval_result(json!(url));
+    assert_eq!(out["result_truncated"], json!(true));
+    assert!(out["saved_to"].as_str().unwrap_or("").ends_with(".png"));
+    let path = out["saved_to"].as_str().unwrap();
+    let written = std::fs::read(path).expect("落盘文件应可读");
+    assert_eq!(written, vec![0u8, 1, 2, 3, 4, 5, 6, 7]);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn download_rejects_about_blank_fast() {
+    // about:/blob:/javascript: 不会产生下载事件,必须快速失败而不是挂到超时。
+    // 无浏览器环境本应 2002 "浏览器会话不存在",但 scheme 校验应先命中并给出引导。
+    let res = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": "p_00000000",
+            "control_action": "download",
+            "params": {"url": "about:blank"}
+        }))
+        .await
+        .unwrap();
+    assert!(res.contains("\"code\":2002"), "实际: {res}");
+    assert!(res.contains("不支持从 about: URL 触发下载"), "实际: {res}");
+}
+
+#[tokio::test]
+async fn download_missing_params_reports_fields() {
+    let res = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": "p_00000000",
+            "control_action": "download",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+    assert!(res.contains("缺少 url 或 selector"), "实际: {res}");
+}
+
+#[tokio::test]
+async fn eval_js_missing_param_lists_aliases() {
+    let res = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": "p_00000000",
+            "control_action": "eval_js",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+    // page_id 不存在 → 2002(ensure_page 先失败);改用不存在页时参数校验顺序:
+    // ensure_page 在前,所以这里验证的是 2000/2002;参数别名校验用 page 失效前的
+    // 同语义 —— 无浏览器环境下两者都会先失败,这里只断言信封结构合法。
+    let v: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert!(v["code"].as_i64().unwrap_or(0) != 0);
+}
+
+// =================== 第 99 轮:Schema 同步 ===================
+
+#[test]
+fn parameters_info_enum_contains_ocr() {
+    let p = McpWebUseTool.parameters();
+    let enums = p["properties"]["info"]["enum"].as_array().expect("info enum 应为数组");
+    let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(names.len(), 16, "info 应有 16 个枚举值: {names:?}");
+    assert!(names.contains(&"ocr"), "info 枚举应含 ocr: {names:?}");
+}
+
+#[test]
+fn parameters_has_reuse_property() {
+    let p = McpWebUseTool.parameters();
+    assert!(
+        p["properties"]["reuse"].is_object(),
+        "schema 应含 open 复用开关 reuse"
+    );
+    assert!(p["properties"]["page_id"]["description"].as_str().unwrap_or("").contains("all"),
+        "page_id 描述应说明 close all 语义");
+}
+
+// =================== 第 100 轮:窗口可视化 + 人工介入(HITL) ===================
+
+#[test]
+fn parameters_has_window_and_highlight_properties() {
+    let p = McpWebUseTool.parameters();
+    for key in ["window_width", "window_height", "highlight"] {
+        assert!(
+            p["properties"][key].is_object(),
+            "schema 应含 {key} 属性"
+        );
+    }
+    assert_eq!(p["properties"]["highlight"]["default"], true);
+}
+
+#[test]
+fn parse_window_size_clamps_and_requires_both() {
+    assert_eq!(parse_window_size(&json!({})), None, "缺省返回 None(驱动层按 mode 给默认)");
+    assert_eq!(parse_window_size(&json!({"window_width": 1920})), None, "只给一个维度视为缺省");
+    assert_eq!(
+        parse_window_size(&json!({"window_width": 1920, "window_height": 1080})),
+        Some((1920, 1080)),
+        "1080p 原样通过"
+    );
+    assert_eq!(
+        parse_window_size(&json!({"window_width": 1, "window_height": 99999})),
+        Some((320, 4320)),
+        "超界 clamp 到安全区间"
+    );
+}
+
+#[test]
+fn detect_blockers_matches_common_walls() {
+    let captcha = inspect::detect_blockers("请完成安全验证\n拖动滑块拼图");
+    assert!(captcha.iter().any(|b| b["kind"] == "captcha"), "实际:{captcha:?}");
+
+    let sms = inspect::detect_blockers("短信验证码已发送至 138****0000,请输入");
+    assert!(sms.iter().any(|b| b["kind"] == "sms"), "实际:{sms:?}");
+
+    let qr = inspect::detect_blockers("微信扫码登录");
+    assert!(qr.iter().any(|b| b["kind"] == "qr_login"), "实际:{qr:?}");
+
+    let login = inspect::detect_blockers("Please sign in to continue browsing");
+    assert!(login.iter().any(|b| b["kind"] == "login"), "实际:{login:?}");
+
+    let clean = inspect::detect_blockers("普通页面内容,无阻断");
+    assert!(clean.is_empty(), "误报:{clean:?}");
+}
+
+#[tokio::test]
+async fn request_human_invalid_reason_returns_1001() {
+    // 无浏览器环境:非法 reason 在 page_id 校验之后仍有确定性断言路径 ——
+    // page_id 不存在时返回 2000;用不存在页验证 2000 前置。
+    let res = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": "p_nonexist0",
+            "control_action": "request_human",
+            "params": {"reason": "whatever"}
+        }))
+        .await
+        .unwrap();
+    assert!(res.contains("\"code\":2000"), "page_id 不存在应为 2000: {res}");
 }

@@ -16,6 +16,20 @@ const PAGE: &str = "data:text/html,<html><head><title>laew-smoke</title></head>\
 <body><input id='q' value=''><button id='go' onclick='document.title=\"clicked\"'>Go</button>\
 <h1 id='h'>hello laew</h1></body></html>";
 
+/// 第 100 轮:blockers 冒烟页(含短信验证码文案,percent-encode 防中文被截断)。
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 fn data_of(out: &str) -> Value {
     serde_json::from_str(out).unwrap_or(Value::Null)
 }
@@ -246,4 +260,116 @@ async fn mcp_web_use_open_control_inspect_smoke() {
         .unwrap();
     let v = data_of(&out);
     assert_eq!(v["code"], 2000, "重复关闭应 2000");
+
+    // 10) 第 100 轮:窗口可视化 + 人工介入元数据冒烟(headed 1080p / 高亮 /
+    //      set_window / sync_viewport / blockers / 浏览器实例复用 / HITL 非交互 4001)
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+    let sms_html = percent_encode(
+        "<html><head><title>sms-wall</title></head><body><p>短信验证码已发送,请输入</p></body></html>",
+    );
+    let sms_url = format!("data:text/html;charset=utf-8,{sms_html}");
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "open",
+            "url": sms_url,
+            "mode": "headed",
+            "window_width": 1280,
+            "window_height": 800
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "headed open 应成功: {out}");
+    assert_eq!(v["data"]["mode"], "headed", "实际 mode 应为 headed: {out}");
+    assert_eq!(v["data"]["browser_reused"], false, "全新浏览器不应标记复用: {out}");
+    assert_eq!(v["data"]["highlight"], true, "headed 默认注入高亮: {out}");
+    assert_eq!(v["data"]["window"]["width"], 1280, "窗口宽应回显请求值: {out}");
+    assert_eq!(v["data"]["window"]["height"], 800, "窗口高应回显请求值: {out}");
+    let headed_page = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    // set_window 运行时调窗(headed 冒烟用小尺寸,避免打扰桌面)
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": headed_page,
+            "control_action": "set_window",
+            "params": {"width": 1100, "height": 700}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "set_window 应成功: {out}");
+    assert_eq!(v["data"]["window"]["width"], 1100, "回读窗口宽: {out}");
+
+    // sync_viewport:视口=窗口内容区(自适应渲染)
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": headed_page,
+            "control_action": "sync_viewport"
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "sync_viewport 应成功: {out}");
+    assert!(v["data"]["width"].as_i64().unwrap_or(0) > 0, "视口宽应非零: {out}");
+
+    // blockers:短信验证码墙检测
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "inspect", "page_id": headed_page, "info": "blockers"
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "blockers 应成功: {out}");
+    assert_eq!(v["data"]["blocked"], true, "应检出阻断: {out}");
+    assert!(
+        v["data"]["blockers"]
+            .as_array()
+            .map(|arr| arr.iter().any(|b| b["kind"] == "sms"))
+            .unwrap_or(false),
+        "应检出 sms 阻断(徽标文本不得误报 captcha): {out}"
+    );
+    assert_eq!(v["data"]["suggested_action"], "request_human");
+
+    // set_highlight 运行时开关
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": headed_page,
+            "control_action": "set_highlight", "params": {"enabled": false}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "set_highlight 应成功: {out}");
+    assert_eq!(v["data"]["enabled"], false);
+
+    // 浏览器实例复用:再次 open(同 URL)→ 页面 reused + 浏览器 browser_reused
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": sms_url, "mode": "headed"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "二次 open 应成功: {out}");
+    assert_eq!(v["data"]["reused"], true, "同 URL 页面应复用: {out}");
+    assert_eq!(v["data"]["browser_reused"], true, "浏览器实例应复用: {out}");
+    assert_eq!(v["data"]["page_id"], headed_page.as_str(), "page_id 应不变: {out}");
+
+    // request_human:测试进程非 TUI(未 attach)→ 4001 快速失败(不挂起)
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": headed_page,
+            "control_action": "request_human",
+            "params": {"reason": "sms", "timeout_ms": 10000}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 4001, "非交互环境应 4001: {out}");
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+
 }

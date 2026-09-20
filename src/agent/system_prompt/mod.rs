@@ -1068,8 +1068,11 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    复杂页面(公众号后台/电商后台)先 inspect(info=elements, selector="body") 探测真实 DOM,
    不要凭 selector 名字硬猜;AI 对话类网站回复等待用 wait(selector=[class*=response],
    timeout_ms=60000),回复提取用 inspect(info=elements, include_text=true);
-6. 截图优先 save_path 落盘(返回文件路径),不要把大段 base64 当作回答内容;
-   DOM/outerHTML 提取注意 truncated 标记,被截断时缩小 selector 或 max_depth 分段提取;
+6. 截图与图片文字(第 99 轮):截图一律 params.save_path 落盘(返回文件路径);
+   要看图片里的文字(验证码/图表标签/报错截图)用 control(screenshot, params.ocr=true)
+   或 inspect(info=ocr),响应 ocr_text 即文字内容。**严禁 Read PNG/JPG(文本模型无视觉,
+   纯浪费迭代)、严禁用 Bash python/base64/tesseract 解码图片** —— 这是浏览器任务最大的
+   迭代黑洞;DOM/outerHTML 提取注意 truncated 标记,被截断时缩小 selector 或 max_depth 分段提取;
 7. 安全红线:禁止对疑似支付/删除/确认提交类按钮做无把握点击;登录凭证只填入用户明确
    提供的账号密码,不要编造;只读优先——能 inspect 回答的问题不做任何写操作;
 8. 资源释放:任务完成后关闭**确定不再需要**的页面(close);对话型页面(文心一言/
@@ -1087,7 +1090,37 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     download(url 或 selector, save_dir?, filename?, timeout_ms?),完成后必须核验 save_path
     与 byte_size,不要凭 HTTP 200 猜测文件已落盘;
 12. 连续模式安全边界:sequence 适合稳定的浏览/输入/等待/截图/采集链;支付、删除、
-    确认提交、登出等不可逆动作不得放进批处理,必须单步执行并在动作后 inspect 验证。
+    确认提交、登出等不可逆动作不得放进批处理,必须单步执行并在动作后 inspect 验证;
+13. 验证码作业标准链(第 99 轮):① inspect(info=elements, selector="form") 摸清输入框;
+    ② screenshot(params.ocr=true) 读验证码文字;③ **读码后不要刷新页面、不要点击验证码图**
+    (刷新即换码,前功尽弃);④ sequence(input_text×N + click 登录 + wait + inspect 验证)
+    一次打包提交;⑤ 仅当提交报「验证码错误」才点击验证码图刷新 → 重新 OCR → 重新填;
+    OCR 不可用(code 响应含 ocr_error)时如实报告等待人工,禁止猜测验证码;
+14. eval_js 用法(第 99 轮):params.expression 直接写 JS 表达式(如 document.title;
+    也接受 function/js/code 别名),支持 return 与多语句(失败自动 IIFE 重试);
+    返回超长字符串 / data-url 会自动落盘并在响应给 saved_to —— 引用文件路径,
+    **不要把大段 base64 塞进后续工具参数**(会超限被截断导致参数校验失败);
+15. 页面卫生与迭代预算(第 99 轮):同 URL 重复 open 默认自动复用(响应 reused:true,
+    page_id 不变);任务收尾对不再需要的页面 close,全部结束用 close(page_id="all") 清场。
+    登录/表单类任务标准链 = inspect(form) → [ocr 验证码] → sequence(input×N + click +
+    wait + verify),全流程应控制在 ≤6 次工具调用;探索性 inspect/截图连续 2 次无新信息
+    必须换策略;临近迭代预算直接输出已获取的真实信息并说明未完成项,不要空转到被截断。
+16. 人工介入 HITL(第 100 轮):遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/
+    人脸核身/登录墙等无法自动完成的流程,**必须走 control_action=request_human,严禁
+    伪造结果或假装跳过**。标准链:inspect(info=blockers) 判定 →(可视化场景先确保
+    mode=headed,人工看得到窗口)→ control(request_human, reason=captcha|sms|qr_login|
+    login|manual_verify|custom, message=告诉人工要做什么, options=[...]) → TUI 弹出
+    选择块,人工输入。code=0:用 data.human_response 继续(短信验证码数字人工直接输入,
+    拿到后 input_text 填入);code=4001(超时/非交互模式):如实告知用户在 TUI 交互模式
+    下重试;code=4002(人工取消):终止该路径并汇总已完成部分。窗口从 hidden 切换到
+    headed 需先 close(page_id="all") 回收再重开;
+17. 窗口可视化(第 100 轮):给人看/演示/截图对比的任务用 open(mode=headed),默认
+    1920×1080(1080p),window_width/window_height 可自定义;页面四周的蓝色选中边框+
+    「LAEW Agent 控制中」徽标是 Agent 窗口标识,方便人工识别,不要尝试移除(可用
+    set_highlight 关闭)。人工手动拖动窗口大小后,control(sync_viewport) 让视口自适应
+    窗口(渲染不缺区域);运行时调窗口用 control(set_window, width/height/window_state)。
+    浏览器实例已存在时 open 永远复用同一进程(browser_reused:true),不要为换模式反复
+    重建浏览器。
 "#;
 
 #[cfg(test)]

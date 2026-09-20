@@ -580,6 +580,9 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
     }
 
     if atty() {
+        // 第 100 轮(HITL):交互式 TUI 挂载人工介入枢纽;
+        // 非 TTY(-p 单轮/管道)不 attach,工具侧 request_human fail-fast → 4001。
+        crate::agent::human_assist::HumanAssistHub::global().attach();
         let input_handler = InputHandler::new();
         let mut completion_engine = CompletionEngine::new();
 
@@ -605,11 +608,13 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
             match session.handle_user_input(&line).await {
                 Ok(true) => {
                     // /exit 退出:拆除固定底部输入组件,还原终端滚动区
+                    crate::agent::human_assist::HumanAssistHub::global().detach();
                     input::teardown_pinned();
                     break;
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    crate::agent::human_assist::HumanAssistHub::global().detach();
                     input::teardown_pinned();
                     return Err(e);
                 }

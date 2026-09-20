@@ -152,7 +152,7 @@ impl TuiSession {
             // 初始 spinner 的计时起点:首个 LLM 请求在途(尚无 stage 消息)期间用它
             // 计算真实等待秒数,30s/60s 慢提示在「首字节未到」阶段同样生效
             // (2026-09-10 第 28 轮 B09/B10 修复:此前固定 (0s),慢提示永不触发)。
-            let spinner_started_at = std::time::Instant::now();
+            let mut spinner_started_at = std::time::Instant::now();
             // 2026-09-16 第 59 轮:阶段计时 —— 每条 stage 消息的到达时间,
             // 用于计算与上一条 stage 的时间差(Δ)。
             let mut last_stage_at: Option<std::time::Instant> = None;
@@ -191,6 +191,14 @@ impl TuiSession {
                 let _ = std::io::stdout().write_all(b"\r  [waiting] \xe2\xa0\x8b  (0s)\x1b[K");
                 let _ = std::io::stdout().flush();
             }
+            // 第 100 轮(HITL):人工介入轮询 —— MCP_Web_Use request_human 时,
+            // HumanAssistHub 槽位出现待答请求,本协程渲染请求块并阻塞读 stdin。
+            // 任务执行期终端处于 cooked mode(InputHandler 未占用),行读即回显;
+            // 空回车=选项1,数字=对应选项,q/取消=取消(→工具 4002),其余原文返回。
+            let mut assist_interval =
+                tokio::time::interval(std::time::Duration::from_millis(250));
+            assist_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut handled_assist_id: Option<u64> = None;
 
             loop {
                 tokio::select! {
@@ -285,6 +293,40 @@ impl TuiSession {
                             break;
                         }
                     },
+                    _ = assist_interval.tick() => {
+                        if let Some(req) =
+                            crate::agent::human_assist::HumanAssistHub::global().poll()
+                        {
+                            if handled_assist_id != Some(req.id) {
+                                handled_assist_id = Some(req.id);
+                                if waiting_line_on_screen {
+                                    clear_waiting_line(stdout_is_tty);
+                                    waiting_line_on_screen = false;
+                                }
+                                initial_spinner_active = false;
+                                print_human_assist_block(&req);
+                                let answer = read_human_assist_answer().await;
+                                let mapped =
+                                    map_human_assist_input(&answer, &req.options);
+                                let ok = crate::agent::human_assist::HumanAssistHub::global()
+                                    .respond(req.id, mapped.clone());
+                                if ok {
+                                    match mapped {
+                                        Some(a) => {
+                                            println!("  [laew] 已收到人工输入:{a}")
+                                        }
+                                        None => println!(
+                                            "  [laew] 人工已取消介入,任务按取消路径继续"
+                                        ),
+                                    }
+                                } else {
+                                    println!("  [laew] 该人工介入请求已失效(可能已超时)");
+                                }
+                                // 恢复 spinner 计时,避免把等待人工的时间算进阶段耗时
+                                spinner_started_at = std::time::Instant::now();
+                            }
+                        }
+                    }
                     _ = &mut idle => {
                         // 阶段切换 flush:第一批 stage 行打印前先清 waiting 行
                         // (统一 \r\x1b[K,从列 0 打印,不吞历史行)。
@@ -396,6 +438,9 @@ impl TuiSession {
         // 阶段打印协程收尾:通道已随任务结束关闭,快速阶段静默丢弃后再输出结果块,
         // 保证 [stage] 行不会插进最终结果中间
         let _ = stage_printer.await;
+        // 第 100 轮(HITL)兜底:任务结束时丢弃未应答的人工介入请求,
+        // 防止挂起请求跨任务泄漏(工具侧收到 Unavailable → 4001 语义)。
+        crate::agent::human_assist::HumanAssistHub::global().cancel_pending();
         // debug 模式:任务结束(无论成败)后生成 Debug 报告
         if let (Some(collector), Some(raw_llm)) = (&self.debug, &self.debug_llm_raw) {
             self.emit_debug_report(collector, raw_llm.clone(), effective_prompt, &handle_result)
@@ -972,6 +1017,135 @@ mod tests {
     fn short_stage_label_strips_newlines() {
         let label = short_stage_label("a\nb\rc");
         assert_eq!(label, "a b c");
+    }
+}
+
+// =================== 第 100 轮:人工介入(HITL)TUI 渲染与输入 ===================
+
+use crate::agent::human_assist::HumanAssistDisplay;
+
+/// kind 展示标签(request_human 的 reason 映射;与工具侧 human_assist_defaults 对齐)。
+fn human_assist_kind_label(kind: &str) -> &str {
+    match kind {
+        "captcha" => "图形/滑块验证码",
+        "sms" => "短信验证码",
+        "qr_login" => "扫码登录",
+        "login" => "账密登录",
+        "manual_verify" => "人工核验",
+        _ => "人工介入",
+    }
+}
+
+/// 渲染人工介入请求块(蓝色框线,与浏览器窗口蓝框呼应)。
+fn print_human_assist_block(req: &HumanAssistDisplay) {
+    use std::io::Write as _;
+    let mut out = String::new();
+    out.push_str("\n  \x1b[36m┌─ 🔐 人工介入请求 ────────────────────────────────\x1b[0m\n");
+    out.push_str(&format!(
+        "  \x1b[36m│\x1b[0m 类型: \x1b[1m{}\x1b[0m",
+        human_assist_kind_label(&req.kind)
+    ));
+    if !req.url.is_empty() {
+        out.push_str(&format!("   页面: {}", pathfmt::elide_middle(&req.url, 56)));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "  \x1b[36m│\x1b[0m 说明: {}\n",
+        req.message.replace('\n', " ")
+    ));
+    if !req.options.is_empty() {
+        out.push_str("  \x1b[36m│\x1b[0m 选项:\n");
+        for (i, opt) in req.options.iter().enumerate() {
+            out.push_str(&format!("  \x1b[36m│\x1b[0m   {}. {}\n", i + 1, opt));
+        }
+    }
+    out.push_str(&format!(
+        "  \x1b[36m│\x1b[0m 超时: {}s\n",
+        req.timeout_ms / 1000
+    ));
+    out.push_str("  \x1b[36m└──────────────────────────────────────────────\x1b[0m\n");
+    let prompt_line = if req.options.is_empty() {
+        "  请输入内容后回车(q=取消): "
+    } else {
+        "  请输入选项编号或直接输入内容(回车=1,q=取消): "
+    };
+    out.push_str(prompt_line);
+    print!("{out}");
+    let _ = std::io::stdout().flush();
+}
+
+/// 阻塞读一行 stdin(spawn_blocking 防 tokio 协程阻塞;cooked mode 自带回显)。
+/// EOF / 读取失败 → 空串(按默认选项 1 处理,避免 e2e 管道场景挂死)。
+async fn read_human_assist_answer() -> String {
+    tokio::task::spawn_blocking(|| {
+        let mut buf = String::new();
+        match std::io::stdin().read_line(&mut buf) {
+            Ok(0) | Err(_) => String::new(),
+            Ok(_) => buf.trim_end_matches(['\n', '\r']).to_string(),
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// 人工输入映射:空回车 → 选项 1;数字 → 对应选项;q/取消/cancel → None(取消);
+/// 其余原文返回(短信验证码数字即自由文本路径)。
+fn map_human_assist_input(input: &str, options: &[String]) -> Option<String> {
+    let t = input.trim();
+    if t.is_empty() {
+        return options.first().map(|o| format!("1. {o}"));
+    }
+    let lower = t.to_lowercase();
+    if matches!(lower.as_str(), "q" | "quit" | "取消" | "cancel" | "exit") {
+        return None;
+    }
+    if let Ok(n) = t.parse::<usize>() {
+        if (1..=options.len()).contains(&n) {
+            return Some(format!("{n}. {}", options[n - 1]));
+        }
+    }
+    Some(t.to_string())
+}
+
+#[cfg(test)]
+mod human_assist_tui_tests {
+    use super::*;
+
+    #[test]
+    fn maps_empty_input_to_first_option() {
+        let opts = vec!["已完成".to_string(), "取消".to_string()];
+        assert_eq!(
+            map_human_assist_input("", &opts),
+            Some("1. 已完成".to_string())
+        );
+        assert_eq!(
+            map_human_assist_input("  \n", &opts),
+            Some("1. 已完成".into())
+        );
+    }
+
+    #[test]
+    fn maps_numeric_choice() {
+        let opts = vec!["继续".to_string(), "跳过".to_string()];
+        assert_eq!(map_human_assist_input("2", &opts), Some("2. 跳过".into()));
+        assert_eq!(map_human_assist_input("99", &opts), Some("99".to_string()));
+    }
+
+    #[test]
+    fn maps_cancel_keywords_to_none() {
+        let opts = vec!["继续".to_string()];
+        for kw in ["q", "Q", "取消", "cancel", "exit"] {
+            assert_eq!(map_human_assist_input(kw, &opts), None, "kw={kw}");
+        }
+    }
+
+    #[test]
+    fn maps_free_text_verbatim() {
+        let opts = vec!["已完成".to_string()];
+        assert_eq!(
+            map_human_assist_input("482913", &opts),
+            Some("482913".to_string())
+        );
     }
 }
 

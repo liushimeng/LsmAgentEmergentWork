@@ -109,5 +109,5 @@ macos-axui = ["dep:axuielement"]
 macos-legacy = ["macos-axui"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tempfile = "3"

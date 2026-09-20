@@ -20,8 +20,8 @@ use std::sync::{Arc, OnceLock};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::browser::{
-    EventDownloadProgress, EventDownloadWillBegin, SetDownloadBehaviorBehavior,
-    SetDownloadBehaviorParams,
+    Bounds, EventDownloadProgress, EventDownloadWillBegin, GetWindowForTargetParams,
+    SetDownloadBehaviorBehavior, SetDownloadBehaviorParams, SetWindowBoundsParams, WindowState,
 };
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -111,6 +111,10 @@ struct BrowserInner {
     pages: HashMap<String, PageEntry>,
     /// launch 模式的一次性 user-data-dir(关闭浏览器时整目录清理)。
     user_data_dir: Option<PathBuf>,
+    /// 当前浏览器实例的启动模式(open 复用判定 / adopted 页高亮注入用)。
+    mode: BrowserMode,
+    /// Agent 高亮蓝框是否启用(headed 可视化场景标识 Agent 控制的窗口)。
+    highlight: bool,
 }
 
 /// 浏览器会话管理器(进程内单例)。
@@ -137,6 +141,58 @@ fn new_page_id() -> String {
         "p_{}",
         b.iter().map(|x| format!("{x:02x}")).collect::<String>()
     )
+}
+
+/// Agent 高亮蓝框注入脚本(2026-09-20 第 100 轮):
+///
+/// headed 可视化模式下,桌面上可能同时存在多个浏览器窗口,人工介入时必须一眼
+/// 识别「哪个窗口被 Agent 控制」。本脚本在页面四周渲染一圈 Chrome 品牌蓝
+/// (#1a73e8)选中效果 + 右上角「LAEW Agent 控制中」徽标:
+/// - `pointer-events:none` 不拦截任何鼠标/键盘事件,渲染与普通浏览器一致;
+/// - `data-laew-agent="1"` 标记,MCP_Web_Use 的 elements/dom 提取自动过滤该子树;
+/// - 通过 `Page.addScriptToEvaluateOnNewDocument` 挂载,导航/派生新页自动重注入。
+pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
+    if (window.__laewAgentHighlightInstalled) return;
+    window.__laewAgentHighlightInstalled = true;
+    const ensure = () => {
+        let frame = document.getElementById('__laew_agent_frame__');
+        if (!frame) {
+            frame = document.createElement('div');
+            frame.id = '__laew_agent_frame__';
+            frame.setAttribute('data-laew-agent', '1');
+            frame.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;box-shadow:inset 0 0 0 3px #1a73e8;';
+            const badge = document.createElement('div');
+            badge.id = '__laew_agent_badge__';
+            badge.setAttribute('data-laew-agent', '1');
+            badge.style.cssText = 'position:absolute;top:8px;right:8px;padding:2px 10px;background:#1a73e8;color:#fff;font:600 12px/1.6 system-ui,sans-serif;border-radius:10px;box-shadow:0 1px 4px rgba(26,115,232,.45);';
+            badge.textContent = 'LAEW Agent 控制中';
+            frame.appendChild(badge);
+            (document.body || document.documentElement).appendChild(frame);
+        }
+        frame.style.display = window.__laewAgentHighlight === false ? 'none' : '';
+    };
+    window.__laewAgentApplyHighlight = (enabled) => {
+        window.__laewAgentHighlight = !!enabled;
+        ensure();
+        const f = document.getElementById('__laew_agent_frame__');
+        if (f) f.style.display = enabled ? '' : 'none';
+        return !!enabled;
+    };
+    ensure();
+})()"#;
+
+/// 给页面注入 Agent 高亮蓝框(新文档自动重挂 + 当前文档立即执行)。
+async fn inject_agent_highlight(page: &Page) {
+    use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+    let _ = page
+        .execute(AddScriptToEvaluateOnNewDocumentParams {
+            source: AGENT_HIGHLIGHT_JS.to_string(),
+            world_name: None,
+            include_command_line_api: None,
+            // 立即在已存在的执行上下文运行(等效旧 evaluate 路径)
+            run_immediately: Some(true),
+        })
+        .await;
 }
 
 /// 未安装浏览器哨兵:BrowserNew 据此返回错误码 3001。
@@ -258,10 +314,23 @@ impl BrowserManager {
                         connect_mode: false,
                         pages: HashMap::new(),
                         user_data_dir: None,
+                        mode: BrowserMode::Hidden,
+                        highlight: true,
                     }),
                 })
             })
             .clone()
+    }
+
+    /// 浏览器实例是否已存在(open 复用判定:「不要重复打开多个浏览器」)。
+    pub async fn has_browser(&self) -> bool {
+        self.inner.lock().await.browser.is_some()
+    }
+
+    /// 当前浏览器实例的启动模式(实例复用时报告真实 mode)。
+    pub async fn current_mode(&self) -> Option<BrowserMode> {
+        let inner = self.inner.lock().await;
+        inner.browser.as_ref().map(|_| inner.mode)
     }
 
     /// 新建页面;必要时先启动或接管浏览器。
@@ -269,12 +338,17 @@ impl BrowserManager {
     /// 返回 `(page_id, title, final_url)`;未检测到浏览器返回含 NO_BROWSER 哨兵的错误。
     /// 2026-09-17 第 74 轮:`mode` 参数控制是否真正启动浏览器进程;`Hidden` 走纯 CDP
     /// 嵌入式模式,默认无可见窗口,解决"误开 macOS 系统默认浏览器"问题。
+    /// 2026-09-20 第 100 轮:`window_size` 支持自定义启动窗口(headed 默认 1920×1080
+    /// 1080p);`highlight` 控制 Agent 高亮蓝框注入(headed 可视化标识)。
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_page(
         &self,
         url: &str,
         mode: BrowserMode,
         connect_url: Option<&str>,
         user_agent: Option<&str>,
+        window_size: Option<(u32, u32)>,
+        highlight: bool,
     ) -> chromiumoxide::error::Result<(String, String, String)> {
         let mut inner = self.inner.lock().await;
         let mut launch_dir: Option<PathBuf> = None;
@@ -343,7 +417,13 @@ impl BrowserManager {
                         .arg("--no-sandbox")
                         .arg("--disable-dev-shm-usage");
                 }
-                builder = builder.window_size(1440, 900);
+                // 窗口尺寸(第 100 轮):显式参数优先;缺省 headed=1920×1080(1080p,
+                // 人工可视 + fullPage 截图基准),hidden=1440×900(既有默认,保持兼容)。
+                let (win_w, win_h) = window_size.unwrap_or(match mode {
+                    BrowserMode::Headed => (1920, 1080),
+                    _ => (1440, 900),
+                });
+                builder = builder.window_size(win_w, win_h);
                 // 一次性 user-data-dir:避免 chromiumoxide 默认固定目录的 SingletonLock 冲突
                 // (并行/上次异常退出后残留锁会导致 Chrome 拒启),同时与用户日常 profile 隔离。
                 let dir = std::env::temp_dir().join(format!("laew_browser_{}", {
@@ -386,6 +466,8 @@ impl BrowserManager {
             inner.watchdog = launch_watchdog;
             inner.connect_mode = connect_mode;
             inner.user_data_dir = launch_dir;
+            inner.mode = mode;
+            inner.highlight = highlight;
             // 第 78 轮:标记浏览器已启动,供 cleanup_sync() 快速判断避免无意义创建 Runtime。
             browser_started_flag::set_started();
         }
@@ -419,6 +501,14 @@ impl BrowserManager {
             .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
             .await;
         spawn_event_listeners(&page, events.clone()).await;
+        // 第 100 轮:headed 可视化模式注入 Agent 高亮蓝框(hidden 无窗口,注入无意义
+        // 且污染 DOM 提取,跳过)。注意:浏览器已存在时以实例真实 mode 为准
+        // (inner.mode),而非本次 open 请求的 mode —— 单实例复用,不新启浏览器。
+        let want_highlight =
+            inner.highlight && matches!(inner.mode, BrowserMode::Headed);
+        if want_highlight {
+            inject_agent_highlight(&page).await;
+        }
 
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
         let final_url = page
@@ -485,6 +575,169 @@ impl BrowserManager {
             .pages
             .get(page_id)
             .map(|e| e.events.clone())
+    }
+
+    // =================== 第 100 轮:窗口可视化 / 人工介入支撑 ===================
+
+    /// 把指定页面的标签页带到前台(`Page.bringToFront`),人工介入前调用,
+    /// 保证用户能看到被 Agent 控制的页面。仅 headed 模式有视觉效果。
+    pub async fn bring_page_to_front(&self, page_id: &str) -> std::result::Result<(), String> {
+        let page = self
+            .page(page_id)
+            .await
+            .ok_or_else(|| "page_id 不存在".to_string())?;
+        page.bring_to_front()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 运行时调整浏览器窗口位置/尺寸/状态(CDP `Browser.setWindowBounds`)。
+    ///
+    /// - `window_state` 为 maximized/fullscreen/minimized 时只发状态(协议禁止
+    ///   与几何字段混用),normal 可与 left/top/width/height 任意组合;
+    /// - 调整成功后自动清除视口覆盖(`Emulation.clearDeviceMetricsOverride`),
+    ///   让视口=窗口内容区 —— 人工拖动/Agent 缩放窗口后渲染自适应、不缺区域;
+    /// - 返回调整后的真实窗口 bounds + 页面视口(供 Agent 校验)。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_window_bounds(
+        &self,
+        page_id: &str,
+        width: Option<i64>,
+        height: Option<i64>,
+        left: Option<i64>,
+        top: Option<i64>,
+        window_state: Option<&str>,
+    ) -> std::result::Result<Value, String> {
+        let page = self
+            .page(page_id)
+            .await
+            .ok_or_else(|| "page_id 不存在".to_string())?;
+        // 持锁完成 browser 命令(Browser 不可 Clone;窗口调整是低频操作,
+        // 短暂持锁不影响并发页面操作)。
+        let inner = self.inner.lock().await;
+        let browser = inner
+            .browser
+            .as_ref()
+            .ok_or_else(|| "浏览器会话不存在".to_string())?;
+
+        let before = page
+            .execute(GetWindowForTargetParams::default())
+            .await
+            .map_err(|e| format!("获取窗口信息失败:{e}"))?;
+        let window_id = before.window_id;
+
+        let state = match window_state {
+            Some("maximized") => Some(WindowState::Maximized),
+            Some("minimized") => Some(WindowState::Minimized),
+            Some("fullscreen") => Some(WindowState::Fullscreen),
+            Some("normal") | None => None,
+            Some(other) => return Err(format!("非法 window_state:{other}")),
+        };
+        let mut bounds = Bounds::builder();
+        if let Some(s) = state {
+            bounds = bounds.window_state(s);
+        } else {
+            if let Some(w) = width {
+                bounds = bounds.width(w);
+            }
+            if let Some(h) = height {
+                bounds = bounds.height(h);
+            }
+            if let Some(l) = left {
+                bounds = bounds.left(l);
+            }
+            if let Some(t) = top {
+                bounds = bounds.top(t);
+            }
+        }
+        let params = SetWindowBoundsParams::builder()
+            .window_id(window_id)
+            .bounds(bounds.build())
+            .build()
+            .map_err(|e| e.to_string())?;
+        browser
+            .execute(params)
+            .await
+            .map_err(|e| format!("调整窗口失败:{e}"))?;
+
+        // 视口跟随窗口:清除 device metrics 覆盖,渲染=窗口内容区(自适应、不缺区域)。
+        let _ = page.execute(
+            chromiumoxide::cdp::browser_protocol::emulation::ClearDeviceMetricsOverrideParams::default(),
+        )
+        .await;
+        // 窗口 resize 是异步的,短暂等待后回读真实值。
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let after = page
+            .execute(GetWindowForTargetParams::default())
+            .await
+            .map_err(|e| format!("回读窗口信息失败:{e}"))?;
+        let viewport = page
+            .evaluate("({width: window.innerWidth, height: window.innerHeight})")
+            .await
+            .ok()
+            .and_then(|v| v.value().cloned())
+            .unwrap_or(Value::Null);
+        Ok(json!({
+            "window": {
+                "left": after.bounds.left,
+                "top": after.bounds.top,
+                "width": after.bounds.width,
+                "height": after.bounds.height,
+                "window_state": after.bounds.window_state.as_ref().map(|s| s.as_ref().to_string()),
+            },
+            "viewport": viewport,
+        }))
+    }
+
+    /// 视口同步:清除 `Emulation.setDeviceMetricsOverride` 覆盖,让页面视口
+    /// 自适应真实窗口内容区(人工拖动窗口大小后调用,消除黑边/缺区域/渲染不全)。
+    pub async fn sync_viewport(&self, page_id: &str) -> std::result::Result<Value, String> {
+        let page = self
+            .page(page_id)
+            .await
+            .ok_or_else(|| "page_id 不存在".to_string())?;
+        page.execute(
+            chromiumoxide::cdp::browser_protocol::emulation::ClearDeviceMetricsOverrideParams::default(),
+        )
+        .await
+        .map_err(|e| format!("清除视口覆盖失败:{e}"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let viewport = page
+            .evaluate(
+                "({width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, scrollHeight: document.documentElement.scrollHeight})",
+            )
+            .await
+            .map_err(|e| format!("读取视口失败:{e}"))?;
+        Ok(viewport.value().cloned().unwrap_or(Value::Null))
+    }
+
+    /// 运行时开关 Agent 高亮蓝框(对当前页面文档立即生效;新文档由挂载脚本
+    /// 依据 `window.__laewAgentHighlight` 延续)。
+    pub async fn set_highlight(
+        &self,
+        page_id: &str,
+        enabled: bool,
+    ) -> std::result::Result<Value, String> {
+        let page = self
+            .page(page_id)
+            .await
+            .ok_or_else(|| "page_id 不存在".to_string())?;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.highlight = enabled;
+        }
+        let js = format!(
+            "window.__laewAgentApplyHighlight ? window.__laewAgentApplyHighlight({enabled}) : null"
+        );
+        let r = page
+            .evaluate(js)
+            .await
+            .map_err(|e| format!("切换高亮失败:{e}"))?;
+        Ok(json!({
+            "enabled": enabled,
+            "applied": !r.value().map(|v| v.is_null()).unwrap_or(true),
+        }))
     }
 
     /// 通过页面触发一次下载,并等待 Browser 域事件给出最终落盘路径。
@@ -729,6 +982,10 @@ impl BrowserManager {
                 .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
                 .await;
             spawn_event_listeners(&page, events.clone()).await;
+            // 第 100 轮:headed + highlight 时,派生/adopt 的新标签页同样注入蓝框。
+            if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
+                inject_agent_highlight(&page).await;
+            }
             let id = new_page_id();
             inner.pages.insert(
                 id.clone(),
@@ -824,6 +1081,8 @@ impl BrowserManager {
             spawn_watchdog_reaper(child);
         }
         inner.connect_mode = false;
+        inner.mode = BrowserMode::Hidden;
+        inner.highlight = true;
     }
 
     /// 同步清理入口(供 atexit / panic hook / signal handler 调用)。

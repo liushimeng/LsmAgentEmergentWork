@@ -8,6 +8,74 @@ use serde_json::{json, Value};
 use super::*;
 use super::control::act_screenshot;
 
+/// 阻断模式表:(kind, 关键词列表, 处置建议)。
+const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
+    (
+        "captcha",
+        &[
+            "captcha", "验证码", "滑动验证", "拖动滑块", "拼图验证", "recaptcha",
+            "人机验证", "安全验证",
+        ],
+        "图形/滑块验证码:OCR 可读走 screenshot(ocr=true) 自动链;滑块/不可读用 control(request_human, reason=captcha)",
+    ),
+    (
+        "sms",
+        &["短信验证码", "手机验证码", "验证码已发送", "sms code", "短信校验码"],
+        "短信验证码:Agent 无法获取手机短信,control(request_human, reason=sms) 让人工在 TUI 直接输入数字",
+    ),
+    (
+        "qr_login",
+        &["扫码登录", "二维码登录", "扫描二维码", "qr code", "微信扫码", "支付宝扫码"],
+        "扫码登录:人工用手机扫码,control(request_human, reason=qr_login)",
+    ),
+    (
+        "login",
+        &["请登录", "登录后查看", "立即登录", "sign in", "log in to continue", "账号登录"],
+        "登录墙:用户已提供凭证则自动登录;否则 control(request_human, reason=login) 让人工在窗口登录",
+    ),
+];
+
+/// 在页面文本中检测人工阻断(Rust 侧模式表,可单测)。
+/// 返回命中列表 [{kind, snippet}](每种 kind 最多 1 条,避免重复刷屏)。
+pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
+    let lower = text.to_lowercase();
+    let mut out: Vec<Value> = Vec::new();
+    for (kind, keywords, _) in BLOCKER_PATTERNS {
+        if let Some(kw) = keywords
+            .iter()
+            .find(|kw| lower.contains(&kw.to_lowercase()))
+        {
+            // 截取关键词上下文片段(前 12 后 40 字符),便于 LLM 确认
+            if let Some(pos) = lower.find(&kw.to_lowercase()) {
+                let start = pos.saturating_sub(12).min(text.len());
+                // 对齐 char 边界,防中文截断 panic
+                let start = text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|i| *i >= start)
+                    .unwrap_or(start);
+                let end = (pos + kw.len() + 40).min(text.len());
+                let end = text
+                    .char_indices()
+                    .rev()
+                    .map(|(i, _)| i)
+                    .find(|i| *i <= end)
+                    .unwrap_or(end);
+                let snippet: String = text
+                    .get(start..end)
+                    .map(|s| s.replace(['\n', '\r', '\t'], " "))
+                    .unwrap_or_default();
+                out.push(json!({
+                    "kind": kind,
+                    "matched": kw,
+                    "snippet": snippet,
+                }));
+            }
+        }
+    }
+    out
+}
+
 /// inspect 分发入口。
 pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     let Some(id) = str_arg(&args, "page_id") else {
@@ -68,7 +136,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             let include_text = params.get("include_text").and_then(Value::as_bool).unwrap_or(true);
             let include_outer = params.get("include_outer_html").and_then(Value::as_bool).unwrap_or(false);
             let js = format!(
-                r#"(() => {{ const els=document.querySelectorAll({sel}); const el=els[{nth}];
+                // 过滤 [data-laew-agent] 子树:Agent 高亮蓝框 overlay 不参与元素观察
+                r#"(() => {{ const els=[...document.querySelectorAll({sel})].filter(e=>!e.closest('[data-laew-agent]')); const el=els[{nth}];
                 if(!el) return {{ok:false, count: els.length, index:{nth}}};
                 const r=el.getBoundingClientRect();
                 return {{ok:true, tag:el.tagName.toLowerCase(), count:els.length, index:{nth},
@@ -84,7 +153,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             let sel = str_arg(&params, "selector").unwrap_or("html");
             if sel != "html" {
                 let js = format!(
-                    r#"(() => {{ const el=document.querySelector({sel});
+                    // 过滤 Agent 高亮 overlay(#[data-laew-agent] 不属于页面真实 DOM)
+                    r#"(() => {{ const el=[...document.querySelectorAll({sel})].find(e=>!e.closest('[data-laew-agent]'));
                     if(!el) return {{ok:false, selector:{sel}}};
                     return {{ok:true, selector:{sel}, outer_html:el.outerHTML}}; }})()"#,
                     sel = js_str(sel)
@@ -100,6 +170,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                         function walk(n, d) {{
                             if (nodes>=NODE_LIMIT) {{ truncated=true; return null; }}
                             if (d>MAX_DEPTH) return null;
+                            // Agent 高亮 overlay 子树不进入节点树(真实页面结构观察)
+                            if (n.nodeType===1 && n.closest && n.closest('[data-laew-agent]')) return null;
                             const obj={{
                                 node_type: n.nodeType, node_name: n.nodeName,
                                 node_value: n.nodeValue, attributes: {{}};
@@ -157,6 +229,38 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             Ok(json!({"cookies": cookies}))
         }
         "screenshot" => act_screenshot(id, &params).await,
+        // 第 99 轮:截图 + OCR 一体 —— 验证码/图表标签等图片文字的一步读取
+        // (macOS Vision;region 过滤词块;图像默认落临时目录,响应带 save_path)。
+        "ocr" => {
+            let mut p = params.clone();
+            p["ocr"] = json!(true);
+            act_screenshot(id, &p).await
+        }
+        // 第 100 轮:人工阻断检测 —— 验证码/短信/扫码/登录墙的确定性启发式,
+        // 作为 SubAgent「无法自动跳过 → request_human」的判定依据。
+        "blockers" => {
+            let text = eval_js_string(
+                &page,
+                // 克隆 body 并剥离 [data-laew-agent] 子树再读 innerText:
+                // Agent 高亮徽标文本(「LAEW Agent 控制中」)不应参与阻断判定。
+                r#"(() => { try {
+                    if (!document.body) return '';
+                    const clone = document.body.cloneNode(true);
+                    clone.querySelectorAll('[data-laew-agent]').forEach(e => e.remove());
+                    return clone.innerText.slice(0, 20000);
+                } catch(e) { return ''; } })()"#,
+            )
+            .await
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+            let blockers = detect_blockers(&text);
+            Ok(json!({
+                "blockers": blockers,
+                "blocked": !blockers.is_empty(),
+                "suggested_action": if blockers.is_empty() { "continue" } else { "request_human" },
+            }))
+        }
         "page_meta" => {
             let url = page.url().await.ok().flatten().unwrap_or_default();
             let title = page.get_title().await.ok().flatten().unwrap_or_default();
