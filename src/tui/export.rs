@@ -80,6 +80,13 @@ pub struct TranscriptEntry {
     pub prompt: String,
     /// assistant 输出文本(与屏幕显示同源)。
     pub response: String,
+    /// assistant 输出的**上下文回填版**(第 96 轮,2026-09-19 会话持久化):
+    /// Executed 轮与 `response`(人类版,含 [task executed]/[trace]/用量等 TUI 元数据)
+    /// 分流,仅含 subflow_outcome + QC verdict(第 30 轮 BA01/CA31 语义)。持久化与
+    /// 恢复重建 context 时优先取此字段,None 回退 `response`(DirectAnswer 等两版相同)。
+    /// 导出 JSON 向后兼容:None 时跳过序列化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_response: Option<String>,
     /// 本轮 token 用量。
     #[serde(flatten)]
     pub usage: Usage,
@@ -117,6 +124,28 @@ impl OutcomeKind {
             OutcomeKind::Error => "错误",
             OutcomeKind::Cancelled => "已取消",
         }
+    }
+
+    /// 持久化存储形态(第 96 轮 chat_turns.outcome 列,受 CHECK 约束)。
+    pub fn as_store_str(&self) -> &'static str {
+        match self {
+            OutcomeKind::DirectAnswer => "direct",
+            OutcomeKind::Executed => "executed",
+            OutcomeKind::Failed => "failed",
+            OutcomeKind::Error => "error",
+            OutcomeKind::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// 从持久化字符串还原结局;未知值容错为 Error(历史数据/手改库不炸恢复链路)。
+pub fn outcome_from_store_str(s: &str) -> OutcomeKind {
+    match s {
+        "direct" => OutcomeKind::DirectAnswer,
+        "executed" => OutcomeKind::Executed,
+        "failed" => OutcomeKind::Failed,
+        "cancelled" => OutcomeKind::Cancelled,
+        _ => OutcomeKind::Error,
     }
 }
 
@@ -309,6 +338,7 @@ mod tests {
             raw_input: "跑个任务".into(),
             prompt: "跑个任务".into(),
             response: response.into(),
+            context_response: None,
             usage: Usage {
                 input_tokens: 100,
                 output_tokens: 50,

@@ -20,6 +20,12 @@ use crate::llm::{ChatMessage, Usage};
 
 impl TuiSession {
     pub async fn handle_user_input(&mut self, line: &str) -> Result<bool> {
+        // 启动期恢复(第 96 轮,--resume / -c):main 在 TUI 启动前写入静态请求,
+        // 此处(所有输入的统一入口,先于斜杠/提示词分流)消费一次。经静态量传递而非
+        // 改 run_with_debug 签名,规避对并行任务占用中的 tui/mod.rs 的改动。
+        if let Some(spec) = crate::database::chat_store::take_startup_resume() {
+            self.apply_startup_resume(&spec);
+        }
         let line = line.trim();
         if line.is_empty() {
             return Ok(false);
@@ -634,14 +640,63 @@ impl TuiSession {
                 raw_input: effective_raw.to_string(),
                 prompt: effective_prompt.to_string(),
                 response: transcript_response,
+                // 会话持久化(第 96 轮):上下文回填版单独留存,恢复重建 context 时
+                // 优先取此字段(Executed 轮与人类版分流,第 30 轮语义)。
+                context_response: Some(context_response),
                 usage,
                 // D8 成本(2026-09-17 第 76 轮):按当时 active 模型内置价估算;
                 // 零用量(取消/错误)与无价模型记 None,不污染会话合计。
                 cost_usd: self.estimate_entry_cost(&usage),
                 outcome,
             });
+            // 会话持久化(第 96 轮,2026-09-19):每轮收口整快照落盘,零配置;
+            // 失败仅告警不影响对话(方案 tmpPlan/2026-09-19_02)。
+            self.persist_chat_history();
         }
         Ok(false)
+    }
+
+    /// 会话持久化(第 96 轮):把当前 transcript 整快照写入根目录 SQLite
+    /// `chat_sessions`/`chat_turns`,供 `/sessions` `/resume` 与 `--resume` 跨进程恢复。
+    ///
+    /// - 标题 = 首轮 raw_input 首行预览(≤40 字符),只在会话行首次插入生效;
+    /// - `context_response` 缺失(DirectAnswer 等两版相同)回退 `response`;
+    /// - 失败语义:**绝不打断对话**,tracing::warn 落 {根目录}/logs/laew-tui.log。
+    pub(crate) fn persist_chat_history(&self) {
+        if self.transcript.is_empty() {
+            return;
+        }
+        let turns: Vec<crate::database::chat_store::ChatTurnRow> = self
+            .transcript
+            .iter()
+            .enumerate()
+            .map(|(i, e)| crate::database::chat_store::ChatTurnRow {
+                seq: i as i64 + 1,
+                ts: e.ts.clone(),
+                raw_input: e.raw_input.clone(),
+                prompt: e.prompt.clone(),
+                response: e.response.clone(),
+                context_response: e
+                    .context_response
+                    .clone()
+                    .unwrap_or_else(|| e.response.clone()),
+                outcome: e.outcome.as_store_str().to_string(),
+                usage: e.usage,
+                cost_usd: e.cost_usd,
+            })
+            .collect();
+        let title = super::format::first_line_preview(&self.transcript[0].raw_input, 40);
+        let work_dir = self.paths.work_dir.display().to_string();
+        if let Err(e) = self.db.lock().expect("db").save_chat_snapshot(
+            &self.session.id,
+            &self.session.created_at,
+            &work_dir,
+            self.current_model_name().as_deref(),
+            &title,
+            &turns,
+        ) {
+            tracing::warn!(session_id = %self.session.id, error = %e, "会话持久化失败(不影响当前对话)");
+        }
     }
 
     /// debug 模式:任务结束后调用 Debug Agent 评估并落盘报告(失败仅打印,不影响主流程)。

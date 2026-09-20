@@ -104,6 +104,28 @@ struct Cli {
     #[arg(long = "info", global = true, help_heading = "运行调优")]
     info: bool,
 
+    /// 恢复历史会话后进入 TUI(第 96 轮会话持久化):无参 = 恢复最近一次;
+    /// 也可给 `/sessions` 序号或 session-id 前缀;短参 `-c`。恢复在你输入第一条
+    /// 消息前生效,当前新会话如有对话会先自动存分支。与 -p/-f 互斥
+    #[arg(
+        long = "resume",
+        short = 'c',
+        value_name = "SESSION",
+        num_args = 0..=1,
+        default_missing_value = "latest",
+        conflicts_with_all = ["prompt", "file"],
+        help_heading = "输入来源"
+    )]
+    resume: Option<String>,
+
+    /// 列出已持久化的历史会话(显示后退出,不进入 TUI;第 96 轮)
+    #[arg(
+        long = "sessions",
+        conflicts_with_all = ["prompt", "file", "inprovider", "outprovider", "resume"],
+        help_heading = "输入来源"
+    )]
+    sessions: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -807,6 +829,8 @@ async fn main() -> Result<()> {
             ("info", "info"),
             ("inprovider", "inprovider"),
             ("outprovider", "outprovider"),
+            ("resume", "resume"),
+            ("sessions", "sessions"),
         ];
         let args: Vec<std::ffi::OsString> = std::env::args_os()
             .map(|a| {
@@ -844,6 +868,7 @@ async fn main() -> Result<()> {
         && cli.file.is_none()
         && cli.inprovider.is_none()
         && cli.outprovider.is_none()
+        && !cli.sessions
         && cli.cmd.is_none();
     let default_level = if is_tui { "warn" } else { "info" };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -934,8 +959,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 优先处理导入/导出命令
-    if let Some(path) = cli.inprovider {
+    // 优先处理导入/导出命令与历史会话列表(第 96 轮 --sessions)
+    if cli.sessions {
+        cmd_list_sessions().await
+    } else if let Some(path) = cli.inprovider {
         cmd_import_provider(path).await
     } else if let Some(path) = cli.outprovider {
         cmd_export_provider(path).await
@@ -958,11 +985,58 @@ async fn main() -> Result<()> {
                         startup_ts: startup_ts.clone(),
                         agent_log: agent_log_info,
                     };
+                    // 启动期恢复(第 96 轮,--resume / -c):写入静态请求,TUI 首条
+                    // 用户输入前由 handle_user_input 消费执行(经静态量传递而非改
+                    // run_with_debug 签名)。这里先给出可见提示,避免「排定了但用户
+                    // 不知道」的静默状态。
+                    if let Some(spec) = &cli.resume {
+                        lsm_agent::database::chat_store::set_startup_resume(spec.clone());
+                        println!("  [resume] 已排定启动恢复({spec});输入第一条消息时生效,可用 /sessions 查看历史会话。");
+                    }
                     lsm_agent::tui::run_with_debug(cli.debug, launch).await
                 }
             }
         }
     }
+}
+
+/// `laew --sessions`(第 96 轮):列出持久化历史会话后退出(不进 TUI)。
+async fn cmd_list_sessions() -> Result<()> {
+    let paths = Paths::detect().map_err(anyhow::Error::from)?;
+    let db = lsm_agent::database::Db::open(&paths).map_err(anyhow::Error::from)?;
+    let sessions = db
+        .list_chat_sessions(30)
+        .map_err(anyhow::Error::from)?;
+    if sessions.is_empty() {
+        println!("暂无历史会话。TUI 内完成首轮对话后自动保存,之后可用 laew --resume 恢复。");
+        return Ok(());
+    }
+    println!("历史会话(跨进程持久化,最近 {} 个,新→旧):", sessions.len());
+    for (i, s) in sessions.iter().enumerate() {
+        let model = s.model_name.as_deref().unwrap_or("-");
+        let preview = if s.title.is_empty() {
+            "-".to_string()
+        } else {
+            lsm_agent::tui::format::first_line_preview(&s.title, 24)
+        };
+        println!(
+            "  #{} [{}] {} 轮 | {} | 首条: {} | {}",
+            i + 1,
+            s.updated_at,
+            s.turn_count,
+            model,
+            preview,
+            s.session_id
+        );
+    }
+    println!(
+        "恢复: laew --resume(最近一次)/ laew --resume <序号|session-id 前缀>;TUI 内: /sessions /resume。"
+    );
+    println!(
+        "保留策略: 自动保留最近 {} 个会话。",
+        lsm_agent::database::chat_store::CHAT_SESSIONS_KEEP
+    );
+    Ok(())
 }
 
 /// 纯函数斜杠命令前置检测与执行。

@@ -784,15 +784,15 @@ ocr_with_info 在屏幕录制未授权时返回结构化「权限缺失」错误
 
 ---
 
-## 第 95 轮（2026-09-19）— 会话持久化与跨进程恢复
+## 第 96 轮（2026-09-19）— 会话持久化与跨进程恢复
 
 **主题**：第八轮 Session 持久化专题 §7 laew 借鉴路线 P0（每 turn 落盘）+ P1（SQLite 索引 + `/resume`）一次性落地，兼补第十七轮 P0 清单「无会话恢复」与第二十四轮 D3 预留「消息树持久化」。此前 `Session.context` 纯内存，TUI 退出/崩溃即全丢。
 
 | 编号 | gap | 状态 | 实现位置 | 完成轮次 |
 |------|-----|------|---------|---------|
-| 第八轮§7-P0 | 无每 turn 持久化（context 进程退出即失） | ✅ | `src/database/chat_store.rs`（新）+ `src/database/schema.rs`（chat_sessions/chat_turns 表）+ `src/tui/dispatch.rs::persist_chat_history`（每轮收口整快照重写，失败仅 tracing::warn 不打断对话）+ `src/tui/export.rs`（TranscriptEntry 增 `context_response` 字段 + OutcomeKind::as_store_str） | 2026-09-19 第 95 轮 |
-| 第八轮§7-P1 | 无 list_sessions / resume / SQLite 索引 | ✅ | `src/database/chat_store.rs`（list/load/resolve 纯函数 + CHAT_SESSIONS_KEEP=50 同事务超额淘汰）+ `src/tui/slash.rs`（`/sessions` `/resume` + `rebuild_from_turns` 重建三处一致）+ `src/main.rs`（`--resume [N|id]` 短参 `-c` + `--sessions`） | 2026-09-19 第 95 轮 |
-| 第十七轮P0 | 无会话恢复（跨进程） | ✅ | 同上;恢复保持原 Session ID（session_memory 摘要链连续），PROJECT_CONTEXT 幂等重注入 | 2026-09-19 第 95 轮 |
+| 第八轮§7-P0 | 无每 turn 持久化（context 进程退出即失） | ✅ | `src/database/chat_store.rs`（新）+ `src/database/schema.rs`（chat_sessions/chat_turns 表）+ `src/tui/dispatch.rs::persist_chat_history`（每轮收口整快照重写，失败仅 tracing::warn 不打断对话）+ `src/tui/export.rs`（TranscriptEntry 增 `context_response` 字段 + OutcomeKind::as_store_str） | 2026-09-19 第 96 轮 |
+| 第八轮§7-P1 | 无 list_sessions / resume / SQLite 索引 | ✅ | `src/database/chat_store.rs`（list/load/resolve 纯函数 + CHAT_SESSIONS_KEEP=50 同事务超额淘汰）+ `src/tui/slash.rs`（`/sessions` `/resume` + `rebuild_from_turns` 重建三处一致）+ `src/main.rs`（`--resume [N|id]` 短参 `-c` + `--sessions`） | 2026-09-19 第 96 轮 |
+| 第十七轮P0 | 无会话恢复（跨进程） | ✅ | 同上;恢复保持原 Session ID（session_memory 摘要链连续），PROJECT_CONTEXT 幂等重注入 | 2026-09-19 第 96 轮 |
 
 **设计要点**:
 - **选型偏离知识库路线**:第八轮建议 JSONL+SQLite 双后端（pi 派）,本轮选 openclaw §3.4 SQLite 单一后端 —— laew SQLite 已有 WAL/busy_timeout/quick_check 隔离自愈（L1041/L1042）,事务原子性天然免除 JSONL 撕裂修复（tornMarker/tail-tombstone 整套机制）,写路径 Mutex 串行即 writer-queue 语义。

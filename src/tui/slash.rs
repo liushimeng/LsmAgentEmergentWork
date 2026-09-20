@@ -10,9 +10,14 @@ use super::atty;
 use super::branches::BranchStore;
 use super::commands;
 use super::export;
+use super::export::{outcome_from_store_str, TranscriptEntry};
 use super::format::{first_line_preview, merge_usage, print_help, suggest_similar_commands};
 use super::pathfmt;
 use super::TuiSession;
+use crate::database::chat_store::{
+    resolve_chat_session, ChatTurnRow, ResumeResolution, SessionSummary,
+};
+use crate::llm::{ChatMessage, ContentBlock, Usage};
 use crate::session::Session;
 
 impl TuiSession {
@@ -158,6 +163,13 @@ impl TuiSession {
             }
             "switch" => {
                 self.run_switch(rest_args);
+            }
+            // 会话持久化(第 96 轮,2026-09-19):跨进程历史会话列表与恢复
+            "sessions" | "hist" => {
+                self.run_sessions();
+            }
+            "resume" => {
+                self.run_resume(rest_args);
             }
             // D13 离线模式状态查看(2026-09-11):显示连接状态、最近错误、队列深度。
             "offline" | "status" => {
@@ -608,9 +620,151 @@ impl TuiSession {
         }
     }
 
+    // ========================================================================
+    // 会话持久化与跨进程恢复(第 96 轮,2026-09-19,tmpPlan/2026-09-19_02)
+    // ========================================================================
+
+    /// `/sessions`(别名 `/hist`):列出持久化历史会话(新→旧)。
+    ///
+    /// 数据来自根目录 SQLite `chat_sessions`/`chat_turns`(每轮任务收口自动整快照落盘),
+    /// 跨进程存活;自动保留最近 [`crate::database::chat_store::CHAT_SESSIONS_KEEP`] 个,
+    /// 超出随新会话落盘淘汰。
+    fn run_sessions(&self) {
+        let sessions = match self.db.lock().expect("db").list_chat_sessions(200) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("  [sessions] 读取历史会话失败: {e}");
+                return;
+            }
+        };
+        if sessions.is_empty() {
+            println!("  暂无历史会话。TUI 内完成首轮对话后自动保存,之后可用 /resume 恢复。");
+            return;
+        }
+        let shown: Vec<&SessionSummary> = sessions.iter().take(15).collect();
+        println!(
+            "  历史会话(跨进程持久化,显示最近 {} / 共 {} 个,新→旧):",
+            shown.len(),
+            sessions.len()
+        );
+        for (i, s) in shown.iter().enumerate() {
+            let model = s.model_name.as_deref().unwrap_or("-");
+            let preview = if s.title.is_empty() {
+                "-".to_string()
+            } else {
+                first_line_preview(&s.title, 24)
+            };
+            println!(
+                "    #{} [{}] {} 轮 | {} | 首条: {} | {}",
+                i + 1,
+                s.updated_at,
+                s.turn_count,
+                model,
+                preview,
+                s.session_id
+            );
+        }
+        println!("  恢复: /resume <序号> 或 /resume <session-id 前缀>;CLI 启动恢复: laew --resume(最近一次)/ laew -c 2。");
+        println!(
+            "  保留策略: 自动保留最近 {} 个会话,超出自动清理。",
+            crate::database::chat_store::CHAT_SESSIONS_KEEP
+        );
+    }
+
+    /// `/resume [N|id前缀]`:恢复历史会话(当前对话自动快照存分支,零丢失)。
+    fn run_resume(&mut self, arg: &str) {
+        let spec = arg.trim();
+        if spec.is_empty() {
+            println!("  用法: /resume <序号|session-id 前缀>(输入 /sessions 查看可用会话)");
+            println!("        /resume latest  恢复最近一次会话");
+            return;
+        }
+        self.resume_by_spec(spec, "[resume]");
+    }
+
+    /// `--resume` / `-c` 启动期恢复(由 dispatch.rs `handle_user_input` 首次输入时调用)。
+    pub(crate) fn apply_startup_resume(&mut self, spec: &str) {
+        self.resume_by_spec(spec, "[resume]");
+    }
+
+    /// 恢复规格解析与执行:`latest` / 列表序号 / session-id 唯一前缀。
+    fn resume_by_spec(&mut self, spec: &str, tag: &str) {
+        let sessions = match self.db.lock().expect("db").list_chat_sessions(200) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("  {tag} 读取历史会话失败: {e}");
+                return;
+            }
+        };
+        if sessions.is_empty() {
+            println!("  {tag} 暂无历史会话可恢复(TUI 内完成首轮对话后自动保存)。");
+            return;
+        }
+        match resolve_chat_session(&sessions, spec) {
+            ResumeResolution::Latest => {
+                self.apply_resume(&sessions[0]);
+            }
+            ResumeResolution::Index(i) | ResumeResolution::Prefix(i) => {
+                self.apply_resume(&sessions[i]);
+            }
+            ResumeResolution::Ambiguous(ids) => {
+                let shown: Vec<&str> = ids.iter().take(3).map(|s| s.as_str()).collect();
+                println!(
+                    "  {tag} 前缀命中 {} 个会话,请补长前缀或改用序号: {}",
+                    ids.len(),
+                    shown.join(" / ")
+                );
+            }
+            ResumeResolution::NotFound => {
+                println!(
+                    "  {tag} 未找到会话「{spec}」;输入 /sessions 查看可用会话(支持序号或 session-id 前缀)。"
+                );
+            }
+        }
+    }
+
+    /// 执行恢复:重建 context/transcript/usage 三处一致(D3 不变量),保持原 Session ID
+    /// (session_memory 历史摘要链连续);恢复前当前对话自动快照存分支(零丢失)。
+    ///
+    /// 返回是否成功(失败时当前会话保持原状)。
+    fn apply_resume(&mut self, s: &SessionSummary) -> bool {
+        let turns = match self.db.lock().expect("db").load_chat_turns(&s.session_id) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("  [resume] 读取会话 {} 轮次失败: {e}", s.session_id);
+                return false;
+            }
+        };
+        if turns.is_empty() {
+            println!("  [resume] 会话 {} 没有对话轮次,无需恢复。", s.session_id);
+            return false;
+        }
+        // 破坏性操作前快照(D3 零丢失语义,与 /rewind /fork /switch 一致)
+        let cur = self.snapshot_current("resume", "resume 前原会话");
+        let (context, transcript, usage) = rebuild_from_turns(&turns);
+        let restored_turns = transcript.len();
+        self.session = Session {
+            id: s.session_id.clone(),
+            device_id: crate::session::device_id().to_string(),
+            created_at: s.created_at.clone(),
+            context,
+        };
+        self.transcript = transcript;
+        self.session_usage = usage;
+        println!(
+            "  ✓ 已恢复会话 {}({restored_turns} 轮,input={} output={})",
+            s.session_id, usage.input_tokens, usage.output_tokens
+        );
+        println!("    创建于 {};最近更新 {}。", s.created_at, s.updated_at);
+        if let Some(name) = cur {
+            println!("    恢复前的对话已自动存为分支 {name},可用 /switch {name} 找回。");
+        }
+        println!("    可直接继续对话;项目说明文件将在下个任务按当前工作目录重新探测注入。");
+        true
+    }
+
     /// `/commands`(D2):列出已加载的自定义命令(名称/描述/来源)。
-    fn print_custom_commands(&self) {
-        let customs = commands::discover(&self.paths.work_dir);
+    fn print_custom_commands(&self) {        let customs = commands::discover(&self.paths.work_dir);
         if customs.is_empty() {
             println!("  当前无自定义命令。创建方法(Markdown 模板):");
             println!(
@@ -643,5 +797,117 @@ impl TuiSession {
             println!("  /{}{hint}", c.name);
             println!("    {} — {}", c.description, src);
         }
+    }
+}
+
+/// 持久化轮次 → 恢复态重建(第 96 轮):context 交替 user(prompt) / assistant(上下文版)
+/// + transcript 逐字段还原 + usage 求和。纯函数,与 TuiSession 解耦便于单测。
+///
+/// - `context_response` 优先于 `response`(Executed 轮两版分流,第 30 轮语义);
+/// - 空 `context_response` 容错回退 `response`(历史数据防御);
+/// - 未知 outcome 字符串容错为 Error,不炸恢复链路。
+fn rebuild_from_turns(turns: &[ChatTurnRow]) -> (Vec<ChatMessage>, Vec<TranscriptEntry>, Usage) {
+    let mut context: Vec<ChatMessage> = Vec::with_capacity(turns.len() * 2);
+    let mut transcript: Vec<TranscriptEntry> = Vec::with_capacity(turns.len());
+    let mut usage = Usage::default();
+    for t in turns {
+        let reply = if t.context_response.is_empty() {
+            t.response.clone()
+        } else {
+            t.context_response.clone()
+        };
+        context.push(ChatMessage::user(t.prompt.clone()));
+        context.push(ChatMessage::assistant(vec![ContentBlock::text(reply.clone())]));
+        usage.input_tokens = usage.input_tokens.saturating_add(t.usage.input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(t.usage.output_tokens);
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(t.usage.cache_read_input_tokens);
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .saturating_add(t.usage.cache_creation_input_tokens);
+        transcript.push(TranscriptEntry {
+            ts: t.ts.clone(),
+            raw_input: t.raw_input.clone(),
+            prompt: t.prompt.clone(),
+            response: t.response.clone(),
+            context_response: (!t.context_response.is_empty()).then(|| t.context_response.clone()),
+            usage: t.usage,
+            cost_usd: t.cost_usd,
+            outcome: outcome_from_store_str(&t.outcome),
+        });
+    }
+    (context, transcript, usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(seq: i64, prompt: &str, response: &str, ctx: &str, outcome: &str) -> ChatTurnRow {
+        ChatTurnRow {
+            seq,
+            ts: "14:00:00".into(),
+            raw_input: format!("原始{seq}"),
+            prompt: prompt.into(),
+            response: response.into(),
+            context_response: ctx.into(),
+            outcome: outcome.into(),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_read_input_tokens: 5,
+                cache_creation_input_tokens: 2,
+            },
+            cost_usd: Some(0.5),
+        }
+    }
+
+    #[test]
+    fn rebuild_alternating_roles_and_usage_sum() {
+        let turns = vec![
+            row(1, "问一", "人类版答一", "上下文版答一", "executed"),
+            row(2, "问二", "答二", "答二", "direct"),
+        ];
+        let (context, transcript, usage) = rebuild_from_turns(&turns);
+        assert_eq!(context.len(), 4, "每轮 user+assistant 两条");
+        assert_eq!(context[0].content_text(), "问一");
+        assert_eq!(context[1].content_text(), "上下文版答一", "assistant 用上下文回填版");
+        assert_eq!(context[2].content_text(), "问二");
+        assert_eq!(context[3].content_text(), "答二");
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].response, "人类版答一", "transcript 保留人类版");
+        assert_eq!(
+            transcript[0].context_response.as_deref(),
+            Some("上下文版答一"),
+            "持久化字段原样回填"
+        );
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 80);
+        assert_eq!(usage.cache_read_input_tokens, 10);
+        assert_eq!(usage.cache_creation_input_tokens, 4);
+    }
+
+    #[test]
+    fn rebuild_falls_back_when_context_response_empty() {
+        let turns = vec![row(1, "问", "答(两版相同)", "", "direct")];
+        let (context, transcript, _) = rebuild_from_turns(&turns);
+        assert_eq!(context[1].content_text(), "答(两版相同)", "空上下文版回退人类版");
+        assert!(transcript[0].context_response.is_none(), "空串不写成 Some");
+    }
+
+    #[test]
+    fn rebuild_unknown_outcome_tolerated_as_error() {
+        let turns = vec![row(1, "问", "答", "答", "???")];
+        let (_, transcript, _) = rebuild_from_turns(&turns);
+        assert_eq!(transcript[0].outcome, export::OutcomeKind::Error);
+    }
+
+    #[test]
+    fn rebuild_empty_turns_yields_empty_state() {
+        let (context, transcript, usage) = rebuild_from_turns(&[]);
+        assert!(context.is_empty());
+        assert!(transcript.is_empty());
+        assert_eq!(usage.input_tokens, 0);
     }
 }

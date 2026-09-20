@@ -137,6 +137,7 @@ mod tests {
                 raw_input: format!("输入{i}"),
                 prompt: format!("输入{i}"),
                 response: format!("回答{i}"),
+                context_response: None,
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,

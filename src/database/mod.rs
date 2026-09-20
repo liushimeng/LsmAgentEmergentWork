@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use thiserror::Error;
 
+pub mod chat_store;
 pub mod models;
 pub mod paths;
 pub mod pragmas;

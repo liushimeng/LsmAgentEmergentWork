@@ -1206,6 +1206,8 @@ pub(crate) fn suggest_similar_commands(input: &str) -> Vec<String> {
         "fork",
         "branches",
         "switch",
+        "sessions",
+        "resume",
     ];
     let input_lower = input.to_lowercase();
     all_commands
@@ -1280,7 +1282,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// 取首行非空内容并压缩空白,截断到 `max` 显示宽度(D3 轮次/分支列表预览用)。
-pub(crate) fn first_line_preview(s: &str, max: usize) -> String {
+pub fn first_line_preview(s: &str, max: usize) -> String {
     let first = s
         .lines()
         .map(str::trim)
@@ -1333,6 +1335,8 @@ pub(crate) fn print_help() {
     println!("  │  /fork             从当前对话分叉出新会话                  │");
     println!("  │  /branches         列出已存分支(/rewind /fork /clear 自动存)│");
     println!("  │  /switch <name>    切换到指定分支                          │");
+    println!("  │  /sessions (hist)  列出可跨进程恢复的历史会话(自动持久化)  │");
+    println!("  │  /resume [N|id]    恢复历史会话(原对话自动存分支)          │");
     println!("  │  /export [path]    导出当前会话(Markdown, .json 后缀 JSON) │");
     println!("  │  /diff <old> <new> 并排 diff 两个文件(行级+字符级着色)    │");
     println!("  │  /theme [kind]     查看或切换主题(D12 a11y 配色)          │");

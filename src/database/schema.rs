@@ -117,6 +117,50 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         );
 
+        -- ========== 会话持久化(第 96 轮,2026-09-19) ==========
+        -- 设计见 tmpPlan/2026-09-19_02-会话持久化与跨进程恢复方案.md:
+        -- SQLite 单一后端(openclaw §3.4 派)替代知识库建议的 JSONL 双后端 —— WAL/事务
+        -- 原子性天然免除 JSONL 撕裂修复;整快照重写使 rewind/fork/switch/resume 全部
+        -- mutation 路径自动一致。chat_turns.context_response 与 response 分列存储,
+        -- 对应第 30 轮「上下文回填版与人类版分流」语义。
+
+        -- 会话索引行(一个 TUI 会话一行,updated_at 为列表排序键)
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            session_id   TEXT PRIMARY KEY,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            turn_count   INTEGER NOT NULL DEFAULT 0,
+            work_dir     TEXT NOT NULL DEFAULT '',
+            model_name   TEXT,
+            title        TEXT NOT NULL DEFAULT '',
+            total_input  INTEGER NOT NULL DEFAULT 0,
+            total_output INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated
+            ON chat_sessions(updated_at DESC);
+
+        -- 对话轮次(整快照重写:每轮收口后事务内 DELETE 全量 + INSERT 全量)
+        CREATE TABLE IF NOT EXISTS chat_turns (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id       TEXT NOT NULL,
+            seq              INTEGER NOT NULL,
+            ts               TEXT NOT NULL,
+            raw_input        TEXT NOT NULL,
+            prompt           TEXT NOT NULL,
+            response         TEXT NOT NULL,
+            context_response TEXT NOT NULL,
+            outcome          TEXT NOT NULL CHECK(outcome IN ('direct','executed','failed','error','cancelled')),
+            input_tokens     INTEGER NOT NULL DEFAULT 0,
+            output_tokens    INTEGER NOT NULL DEFAULT 0,
+            cache_read       INTEGER NOT NULL DEFAULT 0,
+            cache_creation   INTEGER NOT NULL DEFAULT 0,
+            cost_usd         REAL,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UNIQUE(session_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_turns_session
+            ON chat_turns(session_id, seq);
+
         -- ========== Agent 间消息表 ==========
 
         -- Agent 间消息表(SubAgent ↔ WorkFlow/squad 等)

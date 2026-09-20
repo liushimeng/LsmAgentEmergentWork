@@ -114,6 +114,19 @@ impl CompletionEngine {
                 "切换到指定分支(切换前自动快照当前对话)",
                 "/switch <name>",
             ),
+            // 会话持久化(第 96 轮,2026-09-19):跨进程历史会话
+            SlashCommand::builtin(
+                "sessions",
+                &["hist"],
+                "列出可跨进程恢复的历史会话(自动持久化)",
+                "/sessions",
+            ),
+            SlashCommand::builtin(
+                "resume",
+                &[],
+                "恢复历史会话(恢复前自动快照当前对话)",
+                "/resume [N|id前缀]",
+            ),
             // D13 离线模式(2026-09-11):连接状态查看
             SlashCommand::builtin("offline", &["status"], "查看连接状态与离线队列", "/offline"),
             // D8 会话成本(2026-09-17 第 76 轮):用量与成本估算面板

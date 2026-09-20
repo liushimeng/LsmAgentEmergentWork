@@ -48,7 +48,7 @@
 4. **opencode `database.ts:27-32` 一行 PRAGMA 设置了 6 个内核参数**——这是 WAL + NORMAL + 64MB cache + 5s busy_timeout 的性能最佳点,但 NORMAL 牺牲了崩溃边界 1 个 page 的写。
 5. **claudecode 的 `removeMessageByUuid` 是行级精确修复的典范**——`sessionStorage.ts:871-924` 在 64KB tail 窗口里用字节扫描定位目标行,做 `ftruncate + 重写尾段`,而不是整文件重写。
 6. **openclaw 的「dual-mode 持久化」(JSONL + SQLite)实际是迁移过渡态**——`session-accessor.sqlite-archive-store.ts` 仍在维护归档,新的写入已全部走 SQLite。
-7. **laew 的真正漏洞**:`src/session.rs:122-128` 的 `context: Vec<ChatMessage>` 在内存,完全无 WAL、无 fsync、无 checkpoint——本专题 P0-P2 路线图给出 rusqlite + bincode + sha2 的最小可用方案。~~已修复~~ **✅ 已实现(2026-09-19 第 95 轮)**:采用本专题 §3.4 openclaw 的 **SQLite 单一后端**(而非 §7 路线图的 JSONL 双后端)——复用既有 WAL/busy_timeout/quick_check 自愈层(L1041/L1042),每轮收口**整快照重写**(单事务,免 JSONL 撕裂修复),`chat_sessions`/`chat_turns` 两表 + 最近 50 会话自动淘汰 + `/sessions` `/resume` `--resume`(`-c`)`--sessions` 全接口;实现 `src/database/chat_store.rs`,方案 `tmpPlan/2026-09-19_02-会话持久化与跨进程恢复方案.md`。
+7. **laew 的真正漏洞**:`src/session.rs:122-128` 的 `context: Vec<ChatMessage>` 在内存,完全无 WAL、无 fsync、无 checkpoint——本专题 P0-P2 路线图给出 rusqlite + bincode + sha2 的最小可用方案。~~已修复~~ **✅ 已实现(2026-09-19 第 96 轮)**:采用本专题 §3.4 openclaw 的 **SQLite 单一后端**(而非 §7 路线图的 JSONL 双后端)——复用既有 WAL/busy_timeout/quick_check 自愈层(L1041/L1042),每轮收口**整快照重写**(单事务,免 JSONL 撕裂修复),`chat_sessions`/`chat_turns` 两表 + 最近 50 会话自动淘汰 + `/sessions` `/resume` `--resume`(`-c`)`--sessions` 全接口;实现 `src/database/chat_store.rs`,方案 `tmpPlan/2026-09-19_02-会话持久化与跨进程恢复方案.md`。
 
 ---
 
@@ -1286,7 +1286,7 @@ interface SessionStorage<TMetadata> {
 
 ## 7. laew 借鉴路线 (P0/P1/P2)
 
-> **✅ P0 + P1 已实现(2026-09-19 第 95 轮)**:`src/database/chat_store.rs` + `chat_sessions`/`chat_turns` 表 + `/sessions` `/resume` `--resume`(`-c`)`--sessions`。**选型偏离**:放弃 JSONL 双后端,改 §3.4 openclaw 的 SQLite 单一后端 + 每轮整快照重写(单事务)——事务原子性天然免除撕裂修复,rewind/fork/switch/resume 全 mutation 路径自动一致;恢复保持原 Session ID(session_memory 摘要链连续)。P2(WriterLease + 双后端)维持 ⏳ 不做(单用户单进程 CLI,同 L1043 决策)。
+> **✅ P0 + P1 已实现(2026-09-19 第 96 轮)**:`src/database/chat_store.rs` + `chat_sessions`/`chat_turns` 表 + `/sessions` `/resume` `--resume`(`-c`)`--sessions`。**选型偏离**:放弃 JSONL 双后端,改 §3.4 openclaw 的 SQLite 单一后端 + 每轮整快照重写(单事务)——事务原子性天然免除撕裂修复,rewind/fork/switch/resume 全 mutation 路径自动一致;恢复保持原 Session ID(session_memory 摘要链连续)。P2(WriterLease + 双后端)维持 ⏳ 不做(单用户单进程 CLI,同 L1043 决策)。
 
 ### laew 现状(必读基线)
 
