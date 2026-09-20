@@ -58,6 +58,9 @@ async fn serve_download_once(socket: &mut TcpStream) -> std::io::Result<()> {
 #[tokio::test]
 #[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
 async fn mcp_web_use_open_control_inspect_smoke() {
+    // BrowserManager 的 watchdog 需要调用 laew 隐藏子命令；测试 harness 自身的
+    // current_exe 不能解析该 CLI，这里显式指向编译产物。
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
     // 0) 信封永不 panic:无浏览器环境返回 code=3001 + 安装引导;有浏览器 code=0。
     //    先验证这一点,成功打开的页面立即关闭(不留脏状态,后续步骤重新开页)。
     let out = McpWebUseTool

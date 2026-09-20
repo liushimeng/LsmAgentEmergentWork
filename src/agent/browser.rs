@@ -105,6 +105,8 @@ pub struct PageEntry {
 struct BrowserInner {
     browser: Option<Browser>,
     handler: Option<tokio::task::JoinHandle<()>>,
+    /// 进程外 parent-death watchdog（仅 launch 模式）。
+    watchdog: Option<std::process::Child>,
     connect_mode: bool,
     pages: HashMap<String, PageEntry>,
     /// launch 模式的一次性 user-data-dir(关闭浏览器时整目录清理)。
@@ -252,6 +254,7 @@ impl BrowserManager {
                     inner: Mutex::new(BrowserInner {
                         browser: None,
                         handler: None,
+                        watchdog: None,
                         connect_mode: false,
                         pages: HashMap::new(),
                         user_data_dir: None,
@@ -275,12 +278,19 @@ impl BrowserManager {
     ) -> chromiumoxide::error::Result<(String, String, String)> {
         let mut inner = self.inner.lock().await;
         let mut launch_dir: Option<PathBuf> = None;
+        let mut launch_watchdog: Option<std::process::Child> = None;
 
         // Browser 操作超时(2026-09-16 第 66 轮):launch/connect/goto 统一 30s,
         // 防止页面挂起/Chrome 启动失败导致无限等待(用户反馈浏览器任务卡住 58.8s)。
         let browser_timeout = std::time::Duration::from_secs(30);
 
         if inner.browser.is_none() {
+            // 上一版进程内清理无法覆盖 kill -9；先做一次性迁移清扫，再交给新 watchdog。
+            if connect_url.is_none() {
+                #[cfg(unix)]
+                cleanup_legacy_orphans();
+                cleanup_stale_profiles();
+            }
             let (browser, handler, connect_mode) = if let Some(connect_url) = connect_url {
                 let (browser, mut handler) = tokio::time::timeout(
                     browser_timeout,
@@ -345,8 +355,8 @@ impl BrowserManager {
                 let config = builder
                     .build()
                     .map_err(chromiumoxide::error::CdpError::msg)?;
-                launch_dir = Some(dir);
-                let (browser, mut handler) = tokio::time::timeout(
+                launch_dir = Some(dir.clone());
+                let (mut browser, mut handler) = tokio::time::timeout(
                     browser_timeout,
                     Browser::launch(config),
                 )
@@ -357,6 +367,11 @@ impl BrowserManager {
                         browser_timeout.as_secs()
                     ))
                 })??;
+                write_profile_owner(&dir);
+                let browser_pid = browser
+                    .get_mut_child()
+                    .and_then(|child| child.as_mut_inner().id());
+                launch_watchdog = browser_pid.and_then(|pid| spawn_parent_watchdog(pid, &dir));
                 let task = tokio::spawn(async move {
                     while let Some(msg) = handler.next().await {
                         if msg.is_err() {
@@ -368,6 +383,7 @@ impl BrowserManager {
             };
             inner.browser = Some(browser);
             inner.handler = Some(handler);
+            inner.watchdog = launch_watchdog;
             inner.connect_mode = connect_mode;
             inner.user_data_dir = launch_dir;
             // 第 78 轮:标记浏览器已启动,供 cleanup_sync() 快速判断避免无意义创建 Runtime。
@@ -740,6 +756,11 @@ impl BrowserManager {
             if !inner.connect_mode {
                 if let Some(mut browser) = inner.browser.take() {
                     let _ = browser.close().await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        browser.kill(),
+                    )
+                    .await;
                 }
                 // 清理一次性 user-data-dir(Chrome 退出可能有几百 ms 延迟,重试几次)
                 if let Some(dir) = inner.user_data_dir.take() {
@@ -748,6 +769,9 @@ impl BrowserManager {
             }
             if let Some(handler) = inner.handler.take() {
                 handler.abort();
+            }
+            if let Some(child) = inner.watchdog.take() {
+                spawn_watchdog_reaper(child);
             }
             inner.connect_mode = false;
         }
@@ -781,6 +805,12 @@ impl BrowserManager {
                     browser.close(),
                 )
                 .await;
+                // Browser.close 只发 CDP 指令；极端卡死的浏览器还需要进程级兜底。
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    browser.kill(),
+                )
+                .await;
             }
             // 清理一次性 user-data-dir。
             if let Some(dir) = inner.user_data_dir.take() {
@@ -789,6 +819,9 @@ impl BrowserManager {
         }
         if let Some(handler) = inner.handler.take() {
             handler.abort();
+        }
+        if let Some(child) = inner.watchdog.take() {
+            spawn_watchdog_reaper(child);
         }
         inner.connect_mode = false;
     }
@@ -858,6 +891,154 @@ fn spawn_tempdir_cleanup(dir: PathBuf) {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     });
+}
+
+/// 把 Browser 主进程 PID 交给进程外 watchdog。stdin pipe 保持打开；
+/// laew 消失后 pipe EOF 是 kill -9 也无法绕过的退出事实。
+fn spawn_parent_watchdog(browser_pid: u32, user_data_dir: &Path) -> Option<std::process::Child> {
+    // 正式进程是 laew 本体；集成测试运行在 test harness 里，通过 env 指向 laew
+    // binary，保证 BrowserManager 的真实生命周期路径也能被自动化验证。
+    let exe = std::env::var_os("LAEW_BROWSER_WATCHDOG_EXE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg(super::browser_watchdog::WATCHDOG_COMMAND)
+        .arg(browser_pid.to_string())
+        .arg(user_data_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    // 独立进程组避免终端 Ctrl-C 同步终止 watchdog；父进程真正退出仍会关闭 pipe。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    unsafe {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    command.spawn().ok()
+}
+
+/// 正常关闭路径收割 watchdog；浏览器退出后它通常已自行返回。
+fn spawn_watchdog_reaper(mut child: std::process::Child) {
+    tokio::spawn(async move {
+        for _ in 0..10 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+}
+
+/// 新版本每个 launch profile 都带 owner marker。发现 owner 已不存在时只清理
+/// 自己命名空间下的目录，不扫描/不杀无关进程；活跃 owner（并行 laew）跳过。
+fn cleanup_stale_profiles() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let is_laew_profile = dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("laew_browser_"));
+        if !dir.is_dir() || !is_laew_profile {
+            continue;
+        }
+        let owner = std::fs::read_to_string(dir.join(".laew-owner"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        if owner.map_or(true, |pid| !super::browser_watchdog::process_alive(pid)) {
+            for _ in 0..3 {
+                if std::fs::remove_dir_all(&dir).is_ok() || !dir.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// 清理旧版本（无 marker/watchdog）遗留的 laew 专用 Chrome 进程。
+///
+/// 只匹配 `--user-data-dir=<tmp>/laew_browser_*` 参数；不扫描普通用户浏览器。
+#[cfg(unix)]
+fn cleanup_legacy_orphans() {
+    let Ok(output) = std::process::Command::new("ps")
+        .arg("-axo")
+        .arg("pid=,command=")
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for pid in legacy_orphan_pids(&text) {
+        if let Ok(raw) = i32::try_from(pid) {
+            unsafe {
+                libc::kill(raw, libc::SIGTERM);
+            }
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    for pid in legacy_orphan_pids(&text) {
+        if let Ok(raw) = i32::try_from(pid) {
+            unsafe {
+                libc::kill(raw, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn legacy_orphan_pids(ps_output: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for line in ps_output.lines() {
+        let Some((pid_text, command)) = line.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_text.trim().parse::<u32>() else {
+            continue;
+        };
+        let owns_laew_profile = command.split_whitespace().any(|arg| {
+            arg.strip_prefix("--user-data-dir=")
+                .map(Path::new)
+                .and_then(Path::file_name)
+                .is_some_and(|name| name.to_string_lossy().starts_with("laew_browser_"))
+        });
+        if !owns_laew_profile {
+            continue;
+        }
+        // 新版本 profile 有 owner；活跃并行 laew 不允许被本次启动误杀。
+        let profile_path = command
+            .split_whitespace()
+            .find_map(|arg| arg.strip_prefix("--user-data-dir=").map(Path::new));
+        let owner_alive = profile_path
+            .and_then(|dir| std::fs::read_to_string(dir.join(".laew-owner")).ok())
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .is_some_and(super::browser_watchdog::process_alive);
+        if !owner_alive {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// profile owner marker。watchdog 负责杀进程，marker 负责下次启动清理空目录。
+fn write_profile_owner(dir: &Path) {
+    if std::fs::create_dir_all(dir).is_ok() {
+        let _ = std::fs::write(dir.join(".laew-owner"), std::process::id().to_string());
+    }
 }
 
 /// 挂 Console / Network 事件监听任务(chromiumoxide EventStream → 环形缓冲)。
@@ -930,6 +1111,25 @@ mod tests {
         assert!(id.starts_with("p_"));
         assert_eq!(id.len(), 2 + 8);
         assert!(id[2..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_orphan_parser_scopes_to_laew_profiles_and_live_owner() {
+        let live = tempfile::tempdir().unwrap();
+        std::fs::write(
+            live.path().join(".laew-owner"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let ps = format!(
+            "  123 /chrome --user-data-dir=/tmp/laew_browser_dead --x\n \
+             456 /other-browser --user-data-dir=/tmp/not_laew_profile\n \
+             789 /chrome --user-data-dir={} --x\n",
+            live.path().display()
+        );
+        let pids = legacy_orphan_pids(&ps);
+        assert_eq!(pids, vec![123]);
     }
 
     #[test]

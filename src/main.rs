@@ -113,6 +113,15 @@ enum Cmd {
     /// 管理大模型接入记录(增/删/列/切换)
     #[command(subcommand)]
     Provider(ProviderCmd),
+
+    /// 内部隐藏子命令：由 BrowserManager 在 launch 后创建，禁止手工调用。
+    #[command(name = "__browser-watchdog", hide = true)]
+    BrowserWatchdog {
+        /// Chromium 主进程 PID。
+        browser_pid: u32,
+        /// launch 模式的一次性 user-data-dir。
+        user_data_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -819,6 +828,15 @@ async fn main() -> Result<()> {
         Cli::parse_from(args)
     };
 
+    // watchdog 是最小启动路径：不打开数据库、不初始化 tracing/TUI/Agent。
+    if let Some(Cmd::BrowserWatchdog {
+        browser_pid,
+        user_data_dir,
+    }) = &cli.cmd
+    {
+        return lsm_agent::agent::browser_watchdog::run(*browser_pid, user_data_dir).await;
+    }
+
     // TUI 模式下 INFO 级日志会与对话内容交错打印,造成视觉混乱 + 闪烁。
     // 单轮 / -debug / provider 子命令场景不受影响,沿用 RUST_LOG 默认行为。
     // 关联报告: 2026-09-09_07 F-007-1
@@ -924,6 +942,8 @@ async fn main() -> Result<()> {
     } else {
         match cli.cmd {
             Some(Cmd::Provider(p)) => cmd_provider(p).await,
+            // 已在 main 初始化前返回；此分支仅为穷尽性匹配。
+            Some(Cmd::BrowserWatchdog { .. }) => unreachable!("watchdog returned before setup"),
             None => {
                 // 纯函数斜杠命令前置检测(/diff 等不依赖 LLM 的命令在 -p 模式也可直接执行)
                 if let Some(prompt) = &cli.prompt {
