@@ -222,7 +222,7 @@ async fn open_no_browser_or_succeeds() {
         let steps = v["data"]["next_steps"].as_array()
             .expect("成功响应必须包含 next_steps 数组");
         assert!(!steps.is_empty(), "next_steps 不能为空");
-        assert_eq!(steps.len(), 4, "next_steps 应包含 4 步引导");
+        assert_eq!(steps.len(), 5, "next_steps 应包含 5 步引导(含登录场景提示)");
         // 单工具化后引导字段指向 action=control/inspect 语义
         let first = &steps[0];
         assert_eq!(first["action"], "control");

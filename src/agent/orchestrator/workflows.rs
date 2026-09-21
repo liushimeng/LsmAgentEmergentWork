@@ -648,15 +648,36 @@ pub(super) fn apply_retry_hint_overlay(input: &mut SubFlowInput, local_hint: &st
         Some(idx) => input.description[..idx].to_string(),
         None => std::mem::take(&mut input.description),
     };
-    // 局部重试段头与档位级段头同族,便于下次覆盖时定位一致;带「(局部重试 第 N 轮)」标记,
-    // 与档位级 hint 在 TUI [tool] 行 / 运行日志可区分。
+    // 第 106 轮:提取上一轮失败方法列表,注入到重试 hint,让 LLM 明确看到哪些方法已失败,
+    // 避免完全重复上一轮工具调用序列(实证连续 3 轮都完全重复 Bash tesseract 调用)。
+    let failed_methods = extract_failed_methods(local_hint);
+    let anti_repeat = if failed_methods.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n❌ 以下方法已失败,禁止重复: {}",
+            failed_methods.join(" → ")
+        )
+    };
     input.description = format!(
-        "{}{}\n第 {} 轮局部重试,失败原因,必须改变策略改变策略\n{}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。",
+        "{}{}\n第 {} 轮局部重试,失败原因,必须改变策略改变策略\n{}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。{}",
         base,
         HINT_MARK,
         next_attempt,
-        local_hint
+        local_hint,
+        anti_repeat
     );
+}
+
+/// 第 106 轮:从 QC 提示中提取已失败的方法名列表。
+/// 解析 QC suggestion 中的关键方法名(如 tesseract/psm/ddddocr 等),构建禁止重复列表。
+fn extract_failed_methods(qc_hint: &str) -> Vec<String> {
+    let keywords = ["tesseract", "pytesseract", "ddddocr", "easyocr", "psm", "二值化", "灰度", "base64"];
+    keywords
+        .iter()
+        .filter(|kw| qc_hint.contains(**kw))
+        .map(|kw| kw.to_string())
+        .collect()
 }
 
 pub(super) fn build_subflow_input(

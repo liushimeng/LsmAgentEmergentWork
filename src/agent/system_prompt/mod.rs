@@ -882,7 +882,7 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
 // 设计见 `docs/MCP_Web_Use/01-设计与解决方案.md`。
 
 /// SubAgent-Work 浏览器操控补充说明(全平台注入)。
-const MCP_WEB_USE_PROMPT_SECTION: &str = r#"
+const MCP_WEB_USE_PROMPT_SECTION: &str = r##"
 
 ---
 
@@ -919,9 +919,19 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    timeout_ms=60000),回复提取用 inspect(info=elements, include_text=true);
 6. 截图与图片文字(第 99 轮):截图一律 params.save_path 落盘(返回文件路径);
    要看图片里的文字(验证码/图表标签/报错截图)用 control(screenshot, params.ocr=true)
-   或 inspect(info=ocr),响应 ocr_text 即文字内容。**严禁 Read PNG/JPG(文本模型无视觉,
-   纯浪费迭代)、严禁用 Bash python/base64/tesseract 解码图片** —— 这是浏览器任务最大的
-   迭代黑洞;DOM/outerHTML 提取注意 truncated 标记,被截断时缩小 selector 或 max_depth 分段提取;
+   或 inspect(info=ocr),响应 ocr_text 即文字内容。
+   ❌❌❌ **绝对禁止**(违反必浪费迭代,实测占 60%+ 迭代预算):
+   - 禁止 Read PNG/JPG/图片文件(文本模型无视觉,Read 只返回乱码)
+   - 禁止 Bash(tesseract/pytesseract/easyocr/ddddocr/python PIL/base64) 解码图片
+   - 禁止用 Bash 编写 Swift/Objective-C 脚本调用 Vision框架
+   这些工具在当前环境不可用或路径不通,调用必失败且每调用一次浪费 1-2 迭代。
+   ✅ **唯一正确路径**: MCP_Web_Use(control_action=screenshot, params={ocr:true, save_path:"/tmp/captcha.png"})
+   ✅ **备选**: inspect(info=ocr)
+   ✅ **OCR 失败后的行为**(第 106 轮):
+   - 第一次 ocr_error:换 region 参数截取验证码区域精确 OCR
+   - 第二次 ocr_error:填入 "NEED_HUMAN_OCR" 占位并标注需要人工,停止 OCR 尝试
+   - 绝对不要第三次 OCR 或转 Bash 路径 —— 直接如实报告 OCR 不可用并继续后续步骤;
+   DOM/outerHTML 提取注意 truncated 标记,被截断时缩小 selector 或 max_depth 分段提取;
 7. 安全红线:禁止对疑似支付/删除/确认提交类按钮做无把握点击;登录凭证只填入用户明确
    提供的账号密码,不要编造;只读优先——能 inspect 回答的问题不做任何写操作;
 8. 资源释放:任务完成后关闭**确定不再需要**的页面(close);对话型页面(文心一言/
@@ -970,7 +980,30 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     窗口(渲染不缺区域);运行时调窗口用 control(set_window, width/height/window_state)。
     浏览器实例已存在时 open 永远复用同一进程(browser_reused:true),不要为换模式反复
     重建浏览器。
-"#;
+18. 登录流程 sequence 模板(第 106 轮):登录/注册/表单提交类任务优先用 sequence 模式
+    一次打包提交,减少迭代消耗。模板:
+    {
+      "action": "sequence",
+      "page_id": "$page_id",
+      "stop_on_error": false,
+      "steps": [
+        {"action":"control","control_action":"input_text","params":{"selector":"#mainUser","text":"主账号"}},
+        {"action":"control","control_action":"input_text","params":{"selector":"#username","text":"子账号"}},
+        {"action":"control","control_action":"input_text","params":{"selector":"#password","text":"密码"}},
+        {"action":"control","control_action":"screenshot","params":{"save_path":"/tmp/captcha.png","ocr":true}},
+        {"action":"control","control_action":"input_text","params":{"selector":"#verifyCode","text":"$ocr_result"}},
+        {"action":"control","control_action":"click","params":{"selector":"#loginBtn"}},
+        {"action":"control","control_action":"wait","params":{"selector":".dashboard,.main-layout,.sidebar","timeout_ms":15000}}
+      ]
+    }
+    注意:sequence 中不能引用前一步的返回值(步骤是静态的),所以 OCR 结果需要单独先执行,
+    然后用 eval_js 读取 ocr_text 拼入后续 input_text 的 text 字段。
+    推荐流程:① inspect(form) → ② screenshot(ocr=true) → ③ eval_js 取 ocr_text
+    → ④ sequence(填表+点击+等待) → ⑤ inspect 验证。全流程控制在 ≤8 次工具调用。
+19. 可写路径提示(第 106 轮):Write 工具在 macOS 沙箱下仅允许写工作目录($CWD)及其子目录;
+    需要写临时文件时优先用 Bash(cmd="cat > $TMPDIR/xxx" 或 heredoc),或 Write 写到工作目录下。
+    推荐:mkdir -p $CWD/.laew_tmp 然后 Write(path="$CWD/.laew_tmp/xxx")。
+"##;
 
 #[cfg(test)]
 mod tests {

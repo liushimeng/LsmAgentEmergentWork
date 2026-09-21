@@ -256,6 +256,31 @@ impl ExecutionTrace {
             }
         }
 
+        // 5.6) 重复工具调用序列检测(第 106 轮):连续 N 轮工具调用序列与上一轮高度重复
+        // 实测登录任务中 SubAgent 在 16 次迭代里用同一 selector 反复调 Bash(tesseract),
+        // 每轮重试都完全重复上一轮的工具调用序列,浪费全部迭代预算。
+        // 检测:tool_call_log 中连续 3 次相同 (tool, args_json) 调用且均失败。
+        if self.tool_call_log.len() >= 3 {
+            let mut repeat_count = 0;
+            for window in self.tool_call_log.windows(3) {
+                if window[0].tool == window[1].tool
+                    && window[1].tool == window[2].tool
+                    && window[0].args_json == window[1].args_json
+                    && window[1].args_json == window[2].args_json
+                    && !window[0].ok && !window[1].ok && !window[2].ok
+                {
+                    repeat_count += 1;
+                }
+            }
+            if repeat_count > 0 {
+                signals.push(format!(
+                    "repeated_tool_seq:{}x({})",
+                    repeat_count,
+                    self.tool_call_log.last().map(|e| e.tool.as_str()).unwrap_or("?")
+                ));
+            }
+        }
+
         self.failure_signals = signals;
     }
 
@@ -530,6 +555,64 @@ mod tests {
         t.collect_failure_signals("正常输出");
         assert_eq!(t.failure_signals, vec!["ok"]);
         assert!(!t.is_failed());
+    }
+
+    /// 第 106 轮:重复工具调用序列检测
+    #[test]
+    fn repeated_tool_sequence_detected() {
+        let mut t = ExecutionTrace::default();
+        // 模拟连续 3 次相同的 Bash tesseract 调用失败
+        for _ in 0..3 {
+            t.tool_call_log.push(crate::agent::extrace::ToolCallLogEntry {
+                tool: "Bash".to_string(),
+                args_json: r#"{"command":"tesseract captcha.png stdout --psm 7"}"#.to_string(),
+                ok: false,
+                output_bytes: 100,
+                elapsed_ms: 200,
+                error_summary: "exit_code=1".to_string(),
+                output_summary: "".to_string(),
+            });
+        }
+        t.tool_calls = 3;
+        t.tool_calls_err = 3;
+        t.collect_failure_signals("正常输出");
+        assert!(
+            t.failure_signals.iter().any(|s| s.contains("repeated_tool_seq")),
+            "应检测到重复工具序列: {:?}",
+            t.failure_signals
+        );
+    }
+
+    /// 第 106 轮:不重复的工具调用不触发信号
+    #[test]
+    fn non_repeated_tools_no_signal() {
+        let mut t = ExecutionTrace::default();
+        t.tool_call_log.push(crate::agent::extrace::ToolCallLogEntry {
+            tool: "Bash".to_string(),
+            args_json: r#"{"command":"echo hello"}"#.to_string(),
+            ok: true,
+            output_bytes: 10,
+            elapsed_ms: 10,
+            error_summary: "".to_string(),
+            output_summary: "hello".to_string(),
+        });
+        t.tool_call_log.push(crate::agent::extrace::ToolCallLogEntry {
+            tool: "Read".to_string(),
+            args_json: r#"{"path":"/tmp/x.txt"}"#.to_string(),
+            ok: true,
+            output_bytes: 50,
+            elapsed_ms: 5,
+            error_summary: "".to_string(),
+            output_summary: "content".to_string(),
+        });
+        t.tool_calls = 2;
+        t.tool_calls_ok = 2;
+        t.collect_failure_signals("正常输出");
+        assert!(
+            !t.failure_signals.iter().any(|s| s.contains("repeated_tool_seq")),
+            "不应检测到重复: {:?}",
+            t.failure_signals
+        );
     }
 
     #[test]

@@ -73,7 +73,7 @@ use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, Completion, ContentBlock, LlmClient, RequestMeta, Usage};
 use crate::session::Session;
 
-const DEFAULT_MAX_ITERATIONS: usize = 16;
+const DEFAULT_MAX_ITERATIONS: usize = 20;
 
 /// 默认最大截断续接次数(对齐 AtomCode `MAX_TRUNCATION_RESUME = 4` 惯例)。
 ///

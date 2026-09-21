@@ -184,13 +184,26 @@ async fn save_data_url_file(s: &str, p: &Value) -> std::result::Result<Value, St
 
 /// OCR 截图 PNG 文件(macOS Vision;图像来自 CDP 截图字节,不触碰 CGWindow,
 /// 无需屏幕录制权限)。region=(x,y,w,h) 时只保留中心点落入区域的词块。
+/// 第 106 轮:增强错误诊断,返回结构化 ocr_error 信息帮助 LLM 决策下一步。
 #[cfg(target_os = "macos")]
 fn ocr_png_text(
     path: &std::path::Path,
     region: Option<(i64, i64, i64, i64)>,
 ) -> std::result::Result<(String, usize), String> {
     let blocks = crate::agent::window::macos_vision_ocr::ocr_png_file(path, None)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let err_str = e.to_string();
+            // 第 106 轮:分类错误类型,给出明确指导
+            if err_str.contains("Swift") || err_str.contains("compile") {
+                format!("OCR 失败:Swift 脚本编译错误({err_str})。Vision 框架不可用,请停止 OCR 尝试,直接标注需要人工输入验证码")
+            } else if err_str.contains("permission") || err_str.contains("Permission") {
+                format!("OCR 失败:权限不足({err_str})。请停止 OCR 尝试,直接标注需要人工输入验证码")
+            } else if err_str.contains("file") || err_str.contains("No such file") {
+                format!("OCR 失败:截图文件不存在({err_str})。请先 screenshot 落盘再 OCR")
+            } else {
+                format!("OCR 失败:({err_str})。已无更多 OCR 路径,请停止 OCR 尝试,直接标注需要人工输入验证码")
+            }
+        })?;
     let kept: Vec<_> = blocks
         .into_iter()
         .filter(|b| match region {

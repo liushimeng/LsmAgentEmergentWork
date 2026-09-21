@@ -157,7 +157,8 @@ fn open_next_steps() -> Value {
         {"step": 4, "action": "inspect", "info": "elements",
          "selector_hint": "[class*=response], [class*=answer], [class*=result]",
          "include_text": true,
-         "tip": "提取 AI 回复文本;若 include_text 太短,可改 info=dom 获取 outer_html"}
+         "tip": "提取 AI 回复文本;若 include_text 太短,可改 info=dom 获取 outer_html"},
+        {"step": "alt:登录场景", "note": "如果页面是登录表单,推荐流程:inspect(elements)→screenshot(ocr=true读验证码)→sequence(填表+点击+等待)→inspect(验证登录成功)"}
     ])
 }
 

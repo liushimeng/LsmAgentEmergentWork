@@ -93,7 +93,12 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
         if let Some(s) = d.get("ocr_text").and_then(|x| x.as_str()) {
             let n = s.chars().count();
             if n > 0 {
-                parts.push(format!("ocr_len={n}"));
+                // 第 106 轮:验证码等短文本直接显示内容(≤20字符),长文本只显示长度
+                if n <= 20 {
+                    parts.push(format!("ocr={s}"));
+                } else {
+                    parts.push(format!("ocr_len={n}"));
+                }
             }
         }
         if let Some(s) = d.get("ocr_error").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
@@ -101,7 +106,8 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
         }
         match d.get("result") {
             Some(serde_json::Value::String(s)) => {
-                parts.push(format!("result={}", truncate_chars(s, 24)));
+                // 第 106 轮:eval_js 结果显示前 40 字符(足够看到关键返回值)
+                parts.push(format!("result={}", truncate_chars(s, 40)));
             }
             Some(other @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => {
                 parts.push(format!("result={other}"));
@@ -110,7 +116,22 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
         }
         if d.get("result_truncated").and_then(|x| x.as_bool()) == Some(true) {
             let n = d.get("result_len").and_then(|x| x.as_i64()).unwrap_or(0);
-            parts.push(format!("result=[已落盘 共{n}字符]"));
+            let saved = d.get("saved_to").and_then(|x| x.as_str())
+                .map(|p| std::path::Path::new(p).file_name()
+                    .and_then(|n| n.to_str()).unwrap_or(p))
+                .unwrap_or("");
+            if saved.is_empty() {
+                parts.push(format!("result=[已落盘 共{n}字符]"));
+            } else {
+                parts.push(format!("result=[已落盘→{saved}]"));
+            }
+        }
+        // 第 106 轮:elements 首个元素 text 预览(快速看到按钮/链接文字)
+        if let Some(s) = d.get("text").and_then(|x| x.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                parts.push(format!("el_text={}", truncate_chars(t, 30)));
+            }
         }
     }
     Some(parts.join(" "))
@@ -409,22 +430,47 @@ mod browser_output_brief_tests {
     }
 
     #[test]
-    fn brief_ocr_len_not_content() {
+    fn brief_ocr_short_text_shows_content() {
+        // 第 106 轮:短文本(≤20字符)直接显示内容,方便看验证码
         let out = r#"{"code":0,"message":"ok","data":{"ocr_text":"4a7c","ocr_block_count":4,"save_path":"/tmp/x.png"}}"#;
         let b = browser_output_brief(out).unwrap();
-        assert!(b.contains("ocr_len=4"), "{b}");
-        assert!(!b.contains("4a7c"), "验证码内容不应进摘要: {b}");
+        assert!(b.contains("ocr=4a7c"), "短验证码应直接显示内容: {b}");
+    }
+
+    #[test]
+    fn brief_ocr_long_text_shows_len_only() {
+        // 长文本只报长度
+        let long_text = "a".repeat(100);
+        let out = format!(r#"{{"code":0,"message":"ok","data":{{"ocr_text":"{long_text}","ocr_block_count":4,"save_path":"/tmp/x.png"}}}}"#);
+        let b = browser_output_brief(&out).unwrap();
+        assert!(b.contains("ocr_len=100"), "长文本只报长度: {b}");
+        assert!(!b.contains(&long_text), "长文本内容不应进摘要");
+    }
+
+    #[test]
+    fn brief_saved_to_filename() {
+        let out = r#"{"code":0,"message":"ok","data":{"result_truncated":true,"result_len":140000,"saved_to":"/tmp/laew_web_result_12345.captcha.png"}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("captcha.png"), "应显示落盘文件名: {b}");
+    }
+
+    #[test]
+    fn brief_elements_text_preview() {
+        let out = r#"{"code":0,"message":"ok","data":{"tag":"button","count":5,"text":"  登录  "}}"#;
+        let b = browser_output_brief(out).unwrap();
+        assert!(b.contains("el_text=登录"), "应显示元素文字: {b}");
     }
 
     #[test]
     fn brief_eval_js_result_head_and_truncated() {
         let out = r#"{"code":0,"message":"ok","data":{"result":"https://example.com/page"}}"#;
         let b = browser_output_brief(out).unwrap();
-        assert!(b.contains("result=https://example.com"), "{b}");
-        // 超长落盘
+        assert!(b.contains("result=https://example.com/p"), "应显示 result 前40字符: {b}");
+        // 超长落盘(第 106 轮:格式改为 result=[已落盘→文件名])
         let out = r#"{"code":0,"message":"ok","data":{"result_truncated":true,"result_len":140000,"saved_to":"/tmp/laew_web_result_1.png"}}"#;
         let b = browser_output_brief(out).unwrap();
-        assert!(b.contains("result=[已落盘 共140000字符]"), "{b}");
+        assert!(b.contains("result=[已落盘"), "应显示已落盘: {b}");
+        assert!(b.contains("laew_web_result_1.png"), "应显示文件名: {b}");
     }
 
     #[test]
