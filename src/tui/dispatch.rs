@@ -421,18 +421,21 @@ impl TuiSession {
             }
         });
         let cancel = crate::agent::cancel::CancelToken::new();
-        // 任务窗口 SIGINT 监听:第一次中断取消当前任务(claudecode 语义),
-        // 第二次强制退出(exit 130)。输入等待窗口由 InputHandler raw mode
-        // 按键事件处理:空输入 Ctrl-C → 退出;非空输入 Ctrl-C → 清行(第 94 轮)。
+        // 任务窗口 SIGINT 监听(第 101 轮优化):第一次 Ctrl+C 立即取消 + exit(130),
+        // 与 main.rs 单轮模式行为一致。旧实现「第一次取消、等第二次才 exit」在
+        // crossterm 原始模式下 tokio::signal::ctrl_c() 可能无法再次触发,导致进程
+        // 被用户 Ctrl-Z suspend 而非正常退出。
         let sig_cancel = cancel.clone();
         let sig_task = tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_err() {
                 return;
             }
-            println!();
-            println!("  [laew] 收到中断信号,正在取消当前任务(再次 Ctrl-C 强制退出)...");
+            eprintln!();
+            eprintln!("  [laew] 收到中断信号,正在取消当前任务...");
             sig_cancel.cancel();
-            let _ = tokio::signal::ctrl_c().await;
+            // 给取消传播 300ms 窗口,然后强制退出(不等第二次 Ctrl-C)。
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            eprintln!("  [laew] 任务已取消(用户中断)");
             std::process::exit(130);
         });
         let handle_result = self

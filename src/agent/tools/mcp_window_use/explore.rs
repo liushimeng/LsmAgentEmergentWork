@@ -207,11 +207,35 @@ pub(super) async fn run_explore(args: Value) -> Result<String> {
         if !ocr_blocks.is_empty() {
             body["ocr_blocks"] = json!(ocr_blocks_to_value(&ocr_blocks, &window_info));
         }
-        body["next_action"] = json!(format!(
-            "snapshot 已落盘(可 Read 加载细节);连续执行请用 action=run_sequence(steps=[...]),\
-             步骤中 path 直接引用 actionable[*].path 或坐标取 actionable[*].screen_cx/screen_cy;\
-             snapshot_id={snapshot_id} 节点亦可用 @explore_ref/{snapshot_id}/<path> 引用(同会话缓存命中,零 RTT)"
-        ));
+        // 第 101 轮:self_drawn 场景生成专属 next_action,强制引导 chat_send/chat_loop。
+        let next_action_text = if self_drawn {
+            if !capability.ocr_screenshot_cgwindow {
+                // 自绘 UI + 屏录未授权:AX 与视觉路线均不可用,唯一正确路径是 chat_send
+                format!(
+                    "⚠️ 自绘 UI 检测到(self_drawn=true,屏录未授权):AX 树与视觉路线均不可用。\
+                     唯一正确路径: chat_send(window_id={}, text=...) 一调用完成\
+                     (自动选 osascript_fallback 路线,不依赖截图);\
+                     多轮聊天: chat_loop(window_id={}, messages, interval_seconds=30, chat_log_path=...)。\
+                     ❌ 禁止继续 inspect/osascript_run/ocr(全部无效,浪费迭代)。",
+                    window_info.id, window_info.id
+                )
+            } else {
+                // 自绘 UI + 屏录授权:走 OCR 视觉路线
+                format!(
+                    "⚠️ 自绘 UI 检测到(self_drawn=true):AX 树不可用,走 OCR 视觉路线。\
+                     ocr_blocks={} 个词块已识别,直接用 mouse_click/click_point + x/y 坐标操作。",
+                    ocr_blocks.len()
+                )
+            }
+        } else {
+            // 通用模板(非自绘 UI)
+            format!(
+                "snapshot 已落盘(可 Read 加载细节);连续执行请用 action=run_sequence(steps=[...]),\
+                 步骤中 path 直接引用 actionable[*].path 或坐标取 actionable[*].screen_cx/screen_cy;\
+                 snapshot_id={snapshot_id} 节点亦可用 @explore_ref/{snapshot_id}/<path> 引用(同会话缓存命中,零 RTT)"
+            )
+        };
+        body["next_action"] = json!(next_action_text);
 
         let body_text = serde_json::to_string_pretty(&body).map_err(|e| {
             tool_err(

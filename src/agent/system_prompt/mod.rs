@@ -1050,7 +1050,26 @@ control/input_batch/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 acti
 20. Windows 平台专属 (第 91 轮):
     (a) capability_probe 恒全 true;osascript_run/fallback Windows 不可用;
     (b) 微信 4.x 自绘 UI 走 visual_no_input 路线 → 必须依赖 ocr 拿精坐标;
-    (c) chat_loop 默认 visual_no_input:一定要 ocr 取入框\70 70\u70b9 click_point 递\u4f20;
+    (c) chat_loop 默认 visual_no_input:一定要 ocr 取入框 70 70\u70b9 click_point 递\u4f20;
+21. **自绘 UI + 屏录未授权 = chat_send/chat_loop 唯一路径(最高优先级,第 101 轮)**:
+    当 capability_probe 返回 screen_recording=false 且 inspect/explore 控件树
+    只有窗口框架(AXWindow + ≤5 个标题栏按钮,无 AXTextField/AXScrollArea/AXGroup
+    等功能区控件)时 —— 这是自绘 UI(微信 4.x/钉钉/飞书/QQ/Electron canvas),
+    **AX 路线与视觉路线均不可用**,唯一正确路径:
+    → chat_send(window_id, text) 一调用完成(工具自动选 osascript_fallback 路线:
+       activate + 前台守卫 + bounds 比例估算输入框 + keystroke + Enter,不依赖截图)
+    → 10 分钟级多轮聊天: chat_loop(window_id, messages, interval_seconds=30,
+       max_rounds=20, chat_log_path="...") 一调用完成
+    **绝对禁止**(浪费迭代,全部无效):
+    × 继续 inspect / 换 filter / 换 max_depth 重试
+    × osascript_run 遍历 AX 子元素(微信不暴露)
+    × action=ocr(屏录未授权,必败)
+    看到 self_drawn=true 或 tree_summary.actionable_count=0 时,
+    第 2 步必须走 chat_send/chat_loop,没有第 3 条路。
+    **迭代预算红线**: 你的迭代上限只有 16 次,分配建议 ——
+    第 1 步: explore(一次拿全); 第 2 步: chat_send 或 chat_loop(执行);
+    第 3 步: chat_send/inspect 复查。连续 2 次相同 action 返回相同空结果 →
+    立即止损换路线,不要第 3 次。\70 70\u70b9 click_point 递\u4f20;
 "#;
 
 // =================== MCP_Web_Use 工具使用说明(2026-09-18 第 89 轮) ===================

@@ -219,7 +219,16 @@ impl MainWorkRunner {
                (该日志由 MCP_Window_Use 工具内部落盘,执行轨迹可对账)。\n\
              - acceptance 禁止自定义执行层可用 Bash echo / Write 伪造的文本标记\n\
                (如 mcp_action= / probe_msg_sent=OK 这类自造 grep 锚点)—— 实测执行层会\n\
-               手写假日志交差;验收锚点只能用工具自产证据(chat_log [SEND] 行)或 UI 状态。",
+               手写假日志交差;验收锚点只能用工具自产证据(chat_log [SEND] 行)或 UI 状态。\n\
+             - **自绘 UI 任务 WorkFlow 简化(第 101 轮)**:当用户任务涉及「微信」「钉钉」\n\
+               「飞书」「QQ」「桌面聊天」等自绘 UI 应用时 —— **禁止**生成「控件结构深度解析」\n\
+               「控件路径映射表」「AX 路径枚举」等 wf 单元(自绘 UI 控件树为空,这些任务不可能完成,\n\
+               浪费迭代预算);正确模板(2~3 个 wf,不要 6 个):\n\
+               wf-1:打开/激活目标应用 + explore 快照(一次拿全);\n\
+               wf-2:执行核心任务(chat_loop 多轮聊天 / run_sequence 批量操作);\n\
+               wf-3(可选):生成报告(读取 chat_log 落盘 Markdown)。\n\
+               wf-2 的 acceptance 锚定 chat_log_path 文件中的 [SEND]/[RECV] 行数,\n\
+               不锚定控件路径(自绘 UI 无路径可引用)。",
         );
 
         let mut sub_session = crate::session::Session::new();

@@ -114,21 +114,37 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
         parts.push(format!("⚠doom_loop={n}"));
     }
     // 第 100 轮:explore 摘要 —— snapshot_id / 路径 / actionable 数 / 能力路线。
+    // 第 101 轮:self_drawn 场景用 ⚠️ 醒目标记 + 推荐路线(放在 actionable 之前,
+    // 避免 route 被 80 字符截断,route 是自绘 UI 场景最关键的排查字段)。
     if let Some(sid) = Some(get_s("snapshot_id")).filter(|s| !s.is_empty()) {
         parts.push(format!("snap={sid}"));
+        // 第 101 轮:route 放在最前面(紧接 snap),确保自绘 UI 场景可见
+        // route 截断至 12 字符,避免总输出超 80 字符被截断
+        if let Some(route) = v.get("recommended_route").and_then(|x| x.as_str()) {
+            if !route.is_empty() && route != "none" {
+                parts.push(format!("route={}", truncate_chars(route, 12)));
+            }
+        }
         if let Some(sp) = Some(get_s("snapshot_path")).filter(|s| !s.is_empty()) {
             let name = std::path::Path::new(sp)
                 .file_name()
                 .and_then(|x| x.to_str())
                 .unwrap_or(sp);
-            parts.push(format!("snapshot={}", truncate_chars(name, 24)));
+            // filename 截断至 16 字符,避免总输出超 80 字符
+            parts.push(format!("snapshot={}", truncate_chars(name, 16)));
         }
-        if let Some(n) = get_n("actionable_count") {
+        // actionable_count 从 tree_summary 提取(explore 返回结构)
+        let actionable_count = v.get("tree_summary")
+            .and_then(|x| x.as_object())
+            .and_then(|sd| sd.get("actionable_count"))
+            .and_then(|x| x.as_i64());
+        if let Some(n) = actionable_count {
             parts.push(format!("actionable={n}"));
         }
         if let Some(sd) = v.get("tree_summary").and_then(|x| x.as_object()) {
             if sd.get("self_drawn").and_then(|x| x.as_bool()) == Some(true) {
-                parts.push("self_drawn".into());
+                // 第 101 轮:自绘 UI 醒目标记,帮助快速识别降级场景
+                parts.push("⚠自绘UI".into());
             }
             if sd.get("ocr_used").and_then(|x| x.as_bool()) == Some(true) {
                 parts.push("ocr_fallback".into());
@@ -296,20 +312,27 @@ mod tests {
     #[test]
     fn brief_explore_round100() {
         // 第 100 轮:explore 摘要含 snapshot 标记 / actionable 数 / 自绘 UI 警示。
+        // 第 101 轮:自绘 UI 标记改为 ⚠自绘UI,新增 recommended_route 展示。
+        // 注意:actionable_count 在 tree_summary 内部,format_brief 从 tree_summary 提取。
         let out = r#"{
             "ok": true,
             "action": "explore",
             "snapshot_id": "a1b2c3",
             "snapshot_path": "/Users/x/ll/laew_ui_snapshot_1700000000.json",
             "window_info": {"id": "w"},
+            "recommended_route": "osascript_fallback",
             "tree_summary": {"total_nodes": 87, "actionable_count": 12, "self_drawn": false, "ocr_used": false}
         }"#;
         let b = window_use_output_brief("", out).unwrap();
         assert!(b.contains("snap=a1b2c3"), "{b}");
-        assert!(b.contains("snapshot=laew_ui_snapshot_1700000000.json"), "{b}");
+        // route 截断至 12 字符(osascript_f…),放在 snap 之后确保可见
+        assert!(b.contains("route=osascript_f"), "{b}");
+        // 文件名截断至 16 字符(laew_ui_snapsho…)
+        assert!(b.contains("snapshot=laew_ui_snapsho"), "{b}");
+        // actionable_count 从 tree_summary 提取
         assert!(b.contains("actionable=12"), "{b}");
-        assert!(!b.contains("self_drawn"), "非自绘 UI 不应带 self_drawn: {b}");
-        // 自绘 UI + OCR 兜底
+        assert!(!b.contains("⚠自绘UI"), "非自绘 UI 不应带 ⚠自绘UI: {b}");
+        // 自绘 UI + OCR 兜底(第 101 轮:标记改为 ⚠自绘UI)
         let out = r#"{
             "ok": true,
             "action": "explore",
@@ -318,7 +341,7 @@ mod tests {
             "tree_summary": {"actionable_count": 0, "self_drawn": true, "ocr_used": true}
         }"#;
         let b = window_use_output_brief("", out).unwrap();
-        assert!(b.contains("self_drawn"), "{b}");
+        assert!(b.contains("⚠自绘UI"), "{b}");
         assert!(b.contains("ocr_fallback"), "{b}");
     }
 
