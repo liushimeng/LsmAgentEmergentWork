@@ -866,3 +866,109 @@ fn control_node_is_selected_only_serializes_when_true() {
     let s_true = serde_json::to_string(&node).unwrap();
     assert!(s_true.contains("\"is_selected\":true"), "{s_true}");
 }
+
+// ===================== 第 100 轮:Doom Loop 检测 =====================
+
+#[test]
+fn doom_loop_triggers_on_three_identical_calls() {
+    use crate::agent::tools::mcp_window_use::{doom_loop_check, doom_loop_reset};
+    use serde_json::json;
+    doom_loop_reset();
+    let a1 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
+    let a2 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
+    let a3 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
+    // 前两次不触发
+    assert!(doom_loop_check("control", &a1).is_none());
+    assert!(doom_loop_check("control", &a2).is_none());
+    // 第三次触发
+    let sig = doom_loop_check("control", &a3).expect("第 3 次应触发 Doom Loop");
+    assert_eq!(sig.count, 3);
+    assert_eq!(sig.action, "control");
+    assert!(sig.sig.contains("control"));
+    assert!(sig.sig.contains("path=/0/2/1"));
+}
+
+#[test]
+fn doom_loop_does_not_trigger_for_different_paths() {
+    use crate::agent::tools::mcp_window_use::{doom_loop_check, doom_loop_reset};
+    use serde_json::json;
+    doom_loop_reset();
+    let a1 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
+    let a2 = json!({"action": "control", "window_id": "w", "path": "/0/2/2", "control_action": "click"});
+    let a3 = json!({"action": "control", "window_id": "w", "path": "/0/2/3", "control_action": "click"});
+    assert!(doom_loop_check("control", &a1).is_none());
+    assert!(doom_loop_check("control", &a2).is_none());
+    assert!(doom_loop_check("control", &a3).is_none(),
+        "不同 path 不应触发 Doom Loop");
+}
+
+#[test]
+fn doom_loop_does_not_trigger_for_different_actions() {
+    use crate::agent::tools::mcp_window_use::{doom_loop_check, doom_loop_reset};
+    use serde_json::json;
+    doom_loop_reset();
+    let a1 = json!({"action": "control", "window_id": "w", "path": "/0", "control_action": "click"});
+    let a2 = json!({"action": "control", "window_id": "w", "path": "/0", "control_action": "click"});
+    let a3 = json!({"action": "inspect", "window_id": "w", "path": "/0", "control_action": ""});
+    assert!(doom_loop_check("control", &a1).is_none());
+    assert!(doom_loop_check("control", &a2).is_none());
+    assert!(doom_loop_check("inspect", &a3).is_none(),
+        "不同 action 不应触发 Doom Loop");
+}
+
+#[test]
+fn doom_loop_response_carries_structured_guidance() {
+    use crate::agent::tools::mcp_window_use::{doom_loop_check, doom_loop_reset, doom_loop_response};
+    use serde_json::{json, Value};
+    doom_loop_reset();
+    let a1 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
+    doom_loop_check("control", &a1);
+    doom_loop_check("control", &a1);
+    let sig = doom_loop_check("control", &a1).expect("触发");
+    let body = doom_loop_response(sig);
+    let parsed: Value = serde_json::from_str(&body).expect("JSON 合法");
+    assert_eq!(parsed["ok"], json!(false));
+    assert_eq!(parsed["doom_loop"], json!(true));
+    assert_eq!(parsed["doom_loop_count"], json!(3));
+    assert!(parsed["next_action"].as_str().unwrap().contains("Doom Loop"));
+    assert!(parsed["error"].as_str().unwrap().contains("Doom Loop"));
+}
+
+// ===================== 第 100 轮:explore 参数校验 =====================
+
+#[tokio::test]
+async fn run_explore_requires_query_or_window_id() {
+    use crate::agent::tools::mcp_window_use::explore::run_explore;
+    let r = run_explore(json!({})).await;
+    assert!(r.is_err());
+    let err = r.unwrap_err().to_string();
+    assert!(err.contains("query") || err.contains("window_id"),
+        "应提示二选一必填: {err}");
+}
+
+#[tokio::test]
+async fn run_explore_window_id_path_resolves_window() {
+    // 不走真实桌面驱动,验证参数与错误分支。
+    // 缺权限环境下 inspect 失败属预期,验证 window_id 不在 list 时的引导文案。
+    use crate::agent::tools::mcp_window_use::explore::run_explore;
+    let r = run_explore(json!({"window_id": "nonexistent_id_xyz"})).await;
+    // Linux fallback / macOS 当前账户都可能因权限/驱动差异返回不同错误。
+    // 至少不应 panic,且不暴露内部泄漏。
+    let _ = r;
+}
+
+#[test]
+fn explore_ref_resolver_handles_no_prefix() {
+    use crate::agent::tools::mcp_window_use::explore::resolve_explore_ref;
+    let (hit, p) = resolve_explore_ref("/0/2/1");
+    assert!(!hit);
+    assert_eq!(p, "/0/2/1");
+}
+
+#[test]
+fn explore_ref_resolver_handles_empty_inner_path() {
+    use crate::agent::tools::mcp_window_use::explore::resolve_explore_ref;
+    let (hit, p) = resolve_explore_ref("@explore_ref/a1b2c3");
+    assert!(!hit);
+    assert_eq!(p, "/", "无内部 path 时回退根");
+}

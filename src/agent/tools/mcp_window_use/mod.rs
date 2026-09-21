@@ -26,6 +26,7 @@ use crate::agent::window::{
 use crate::error::{AgentError, Result};
 
 mod chat;
+mod explore;
 mod inspect;
 mod input_batch;
 mod open;
@@ -272,13 +273,126 @@ where
         .map_err(|e| tool_err(tool, format!("窗口驱动任务 join 失败: {e}")))?
 }
 
+// ===================== Doom Loop 检测(2026-09-21 第 100 轮,源自 opencode L1516) =====================
+//
+// 背景:SubAgent 在死循环 click→fail→click→fail 时反复 16 次迭代上限仍撞墙。
+// opencode `DOOM_LOOP_THRESHOLD = 3` 用 ~30 行代码阻断「连续 3 次相同工具+相同输入」。
+// laew 第 100 轮借鉴:工具层记录最近窗口内的 (action, sig) 调用,第 3 次严格相同 sig 时
+// 返回结构化 `doom_loop=true` + next_action 引导 SubAgent 换 selector / 路线 / 询问用户,
+// 而不是默默死循环。
+//
+// 设计:
+// - sig = (action, window_id, path, control_action) —— 严格相等才触发;
+//   explore/inspect/ocr/screenshot/chat_send 不看 sig 后续内容(脚本同理);
+// - 滑动窗口 DOOM_LOOP_WINDOW = 12(防止长任务早期重复误命中);
+// - 命中不影响主流程:SubAgent 仍可重试(返回 Err),但拿到明确的 next_action 引导。
+
+const DOOM_LOOP_THRESHOLD: usize = 3;
+const DOOM_LOOP_WINDOW: usize = 12;
+
+/// Doom Loop 命中信号(命中后返回给 LLM)。
+struct DoomLoopSignal {
+    /// 重复次数(= DOOM_LOOP_THRESHOLD)
+    count: usize,
+    /// 重复的 action 名
+    action: String,
+    /// 重复的 sig 字符串(供 next_action 显示)
+    sig: String,
+}
+
+fn doom_loop_recent() -> &'static std::sync::Mutex<VecDeque<(String, String)>> {
+    static Q: std::sync::OnceLock<std::sync::Mutex<VecDeque<(String, String)>>> =
+        std::sync::OnceLock::new();
+    Q.get_or_init(|| std::sync::Mutex::new(VecDeque::with_capacity(DOOM_LOOP_WINDOW + 1)))
+}
+
+/// 清空 Doom Loop 滑动窗口(测试用 —— 进程内全局状态,跨测试会污染)。
+#[cfg(test)]
+pub(crate) fn doom_loop_reset() {
+    if let Ok(mut q) = doom_loop_recent().lock() {
+        q.clear();
+    }
+}
+
+/// 从 args 提取 sig —— 只看 4 个决定行为差异的字段,屏蔽文本字段。
+fn doom_loop_sig(action: &str, args: &Value) -> String {
+    let wid = get_str(args, "window_id").unwrap_or("");
+    let path = get_str(args, "path").unwrap_or("");
+    let ctrl = get_str(args, "control_action").unwrap_or("");
+    format!("{action}|wid={wid}|path={path}|ctrl={ctrl}")
+}
+
+/// 记录本次调用并判定是否 Doom Loop。
+///
+/// - 命中条件:滑动窗口内最近 DOOM_LOOP_THRESHOLD 条记录全部与当前 sig 严格相等
+///   (同 action + 同 window_id + 同 path + 同 control_action)。
+/// - 命中后返回 `Some(DoomLoopSignal)`;调用方应把它当作工具执行返回错误 + 引导。
+fn doom_loop_check(action: &str, args: &Value) -> Option<DoomLoopSignal> {
+    let sig = doom_loop_sig(action, args);
+    if let Ok(mut q) = doom_loop_recent().lock() {
+        q.push_back((action.to_string(), sig.clone()));
+        while q.len() > DOOM_LOOP_WINDOW {
+            q.pop_front();
+        }
+        let mut same = 0usize;
+        for (a, s) in q.iter().rev().take(DOOM_LOOP_THRESHOLD) {
+            if a == action && s == &sig {
+                same += 1;
+            } else {
+                break;
+            }
+        }
+        if same >= DOOM_LOOP_THRESHOLD {
+            return Some(DoomLoopSignal {
+                count: same,
+                action: action.to_string(),
+                sig,
+            });
+        }
+    }
+    None
+}
+
+/// 把 Doom Loop 信号渲染成结构化 next_action JSON(供 execute 分发兜底返回)。
+fn doom_loop_response(signal: DoomLoopSignal) -> String {
+    let body = serde_json::json!({
+        "ok": false,
+        "action": signal.action,
+        "doom_loop": true,
+        "doom_loop_count": signal.count,
+        "error": format!(
+            "Doom Loop: 连续 {} 次完全相同的 {} 调用(签名 {});继续重试不会改变结果。请改换路线:\
+             1. inspect 控件树看真实结构,换 path / filter 重试;\
+             2. 改走视觉路线 action=ocr 拿屏幕坐标 + action=control(control_action=click_point);\
+             3. 改走 ask_send(osascript_fallback)(macOS 屏录未授权时);\
+             4. 调整执行计划后询问用户。",
+            signal.count, signal.action, signal.sig
+        ),
+        "next_action": format!(
+            "⚠ Doom Loop 已触发(连续 {} 次同 {} 调用)。请先 action=inspect / action=explore 重新探索 UI,再换 selector / 路线重试;不要重复相同输入。",
+            signal.count, signal.action
+        ),
+    });
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())
+}
+
+use std::collections::VecDeque;
+
 // ===================== MCP_Window_Use 工具门面 =====================
 
 /// 桌面软件窗口操控统一入口(MCP 风格单工具 + action 分发)。
 pub struct McpWindowUseTool;
 
 /// 工具描述:同时承担「使用说明」职责(原 WindowUse Agent 系统提示词的工具部分精炼)。
-const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌面软件(macOS / Windows 桌面 GUI 自动化统一入口,MCP 风格单工具多 action)。
+const MCP_WINDOW_USE_DESCRIPTION: &str = r#"【两种工作模式 —— 可混合使用,可多次连续调用】
+1) **单步执行模式(Single-Step Mode)**:一次工具调用只执行一个 action,适合未知页面探索、问题定位、高风险操作、不可逆操作。标准序列:capability_probe → find/open → inspect/ocr → control → inspect/ocr 复查(4~5 次往返)。
+2) **连续执行模式(Continuous Mode)**:**默认首选**,适合人机共用机器、任务链 ≥ 3 步、需要长时间停留窗口的场景。
+   - **探索侧**:`action=explore` 一次拿全(快照落盘 + 摘要 + 能力矩阵 + 路线建议),把发现阶段从 4~5 次往返压缩到 1 次;
+   - **执行侧**:`action=run_sequence` 一次连续执行 ≤100 步(含 assert_text / wait_for_text 验证与等待、on_error=retry 逐步重试、逐步焦点守护 focus_guard、log 落盘)。
+   - 两种模式可混合:explore 失败片段拆新 run_sequence + re-explore;run_sequence 中可嵌套 get_text / assert_text 验证步骤(自带 OCR 兜底,自绘 UI 微信/QQ 4.x 适用);chat_send/chat_loop 与 run_sequence 互斥(发送动作不进 run_sequence);多次连续调用 run_sequence 可串联长链。
+   - **方法论**:先 explore(探索拿快照+摘要)→ 在 LLM 上下文里统一 plan(从 actionable[*] 拼装 steps)→ 一次 run_sequence 连续执行 → 复查 + 失败片段 re-explore 重做。
+
+通过软件窗口读取与操作桌面软件(macOS / Windows 桌面 GUI 自动化统一入口,MCP 风格单工具多 action)。
 用 action 参数选择操作:
 - open(query*, app_name?, bundle_id?, wait_seconds?): 启动/激活桌面应用并等待窗口出现,返回 window_id/权限状态/next_action;已运行则恢复前置,不重复启动。**支持 bundle_id 优先 + WeChat↔微信↔Weixin 等中英文别名**——若 `open -a 微信` 失败,工具会自动查已知映射表走 `open -b com.tencent.xinWeChat` 兜底。
 - list(filter?): 枚举当前桌面全部可见顶层窗口(id/title/进程名/PID/位置尺寸)。macOS 走 CoreGraphics,不需要任何授权。
@@ -309,6 +423,19 @@ const MCP_WINDOW_USE_DESCRIPTION: &str = r#"通过软件窗口读取与操作桌
   **执行记录**:每步落盘 [STEP]/[RETRY]/[FOCUS_LOST]/[FOCUS_REGAINED]/[FAIL] + 末尾 [SUMMARY] 到 log_path(默认 <工作目录>/laew_sequence_<unix_ts>.log);返回 steps 逐步记录 + results(get_text 读取值)+ failed_steps + focus_lost_count。
   护栏:steps ≤ 100;整批默认 ≤180s(max_total_ms 可调,≤600s)。典型:点会话→wait_for_text 等列表刷新→click 控件→type_text→key_press enter→assert_text 验证已发送,一次调用完成。
 
+- explore(query? 或 window_id*, max_depth?=6, include_ocr?=true, snapshot_label?, snapshot_path?, filter?, wait_seconds?=10, app_name?, bundle_id?): **第 100 轮新增「连续执行模式 · 探索侧」复合 action**——一次调用完成 capability 探测 + 窗口定位(find/open 双路径)+ 控件树枚举(空树时自动 OCR 兜底,自绘 UI 微信 4.x 适用)+ **快照落盘到 snapshot_path**(默认 `<工作目录>/laew_ui_snapshot_<unix_ts>.json`,全量控件树无截断,LLM 后续可 Read 工具按需加载)+ 返回紧凑 actionable 摘要(控件 path/role/name/value/bounds/**screen_cx/screen_cy 屏幕绝对坐标**/actions)。
+  典型范式(双调用一步走完连续模式):
+  ① action=explore(window_id, max_depth=6, snapshot_label="微信主界面") 拿快照 + digest
+  ② action=run_sequence(window_id, steps=[
+     {op:"click", path:"<digest.actionable[2].path>"},      // 引用探索摘要中的控件路径
+     {op:"type_text", text:"..."},
+     {op:"key_press", keys:"enter"},
+     {op:"assert_text", path:"/", contains:"...", optional:true}
+  ]) 一次执行 + 验证
+  snapshot 文件含 `tree_full`(无截断)+ `ocr_blocks` + `window_info` + `capability` + `snapshot_id`(随机 6 位)。digest 不进 32KB 截断但目标 ≤ 80KB(超出建议加大 filter 或减小 max_depth)。
+  **path 引用约定**:steps.path 支持 `@explore_ref/<snapshot_id>/<path>` 形式(纯命名约定,运行时仍按字面 path 走驱动;当前会话缓存命中可优化未来跳过 inspect,本轮先提供解析器)。**Doom Loop 防护**(工具层内置):连续 3 次完全相同 `(action, window_id, path, control_action)` 的调用,第三次返回 `doom_loop=true` + next_action 引导换 selector/路线 —— 防止 click→fail→click→fail 死循环(opencode L1516 同机制)。
+  query 与 window_id 二选一;query 模式先 find 找现有窗口,找不到再按白名单 open 启动(走 auto_launch_target,白名单详见 auto_launch_target)。LLM 一律首选 **explore + run_sequence 双调用**,不要把 capability_probe + find + inspect + ocr 拆成 4 次单步 —— 那正是第 100 轮要消除的人机冲突源头。
+
 【第 86 轮 · capability_probe_first 原则】**第一步必须是 `MCP_Window_Use(action=capability_probe)` 拿到真实能力矩阵**,再决定下一步。capability.ocr_screenshot_cgwindow=false 表示截图/OCR 完全不可用,此时**禁止**重试 screenshot/ocr,直接走 `chat_send(osascript_fallback)` 或 `chat_loop`。
 【标准作业顺序】open(应用未启动)→ find/list(定位 window_id)→ capability_probe(拿真实能力)→ inspect 或 ocr(理解界面,前提 cap=true)→ control/chat_send(单步/发送)→ **run_sequence(第 91 轮:探索后统一 plan 的多步连续执行,含 assert_text/wait_for_text 验证等待、retry 重试、逐步焦点守护、逐步落盘记录;人机共用机器、用户会切窗的场景一律用它,不要拆成多次 control)** → inspect/ocr 复查 / chat_loop(批量会话)。
 【双路线决策】inspect 控件树为空/只有少量 Pane(自绘 UI / Electron canvas)时立即切换视觉路线 ocr + click_point/type_text_submit(前提 cap.ocr_screenshot_cgwindow=true),或切到 osascript_fallback(AX 已授权但屏录未授权时)。
@@ -333,8 +460,8 @@ impl Tool for McpWindowUseTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "capability_probe", "osascript_run", "chat_send", "chat_loop", "input_batch", "run_sequence"],
-                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / capability_probe(第 86 轮新增:探测真实能力矩阵) / osascript_run(第 86 轮新增:执行 AppleScript 片段) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环) / input_batch(第 90 轮新增:鼠标+键盘+控件树复合步骤批处理) / run_sequence(第 91 轮新增:连续工作模式——探索后统一 plan 的一整套动作连续执行,含验证/等待/重试/逐步焦点守护/落盘记录)"
+                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "capability_probe", "osascript_run", "chat_send", "chat_loop", "input_batch", "run_sequence", "explore"],
+                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / capability_probe(第 86 轮新增:探测真实能力矩阵) / osascript_run(第 86 轮新增:执行 AppleScript 片段) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环) / input_batch(第 90 轮新增:鼠标+键盘+控件树复合步骤批处理) / run_sequence(第 91 轮新增:连续工作模式——探索后统一 plan 的一整套动作连续执行,含验证/等待/重试/逐步焦点守护/落盘记录) / explore(第 100 轮新增:连续执行模式探索侧——一次调用拿全能力矩阵 + 窗口定位 + 控件树 + 快照落盘 + actionable 摘要,把发现阶段从 4~5 次往返压缩到 1 次,与 run_sequence 组合形成「先 explore 后 run_sequence」标准范式)"
                 },
                 "query": { "type": "string", "description": "open/find 必填:应用名或窗口标题/进程名查询词(大小写不敏感,支持中英文别名)" },
                 "app_name": { "type": "string", "description": "open 可选:启动用应用名或完整路径,缺省=query" },
@@ -342,7 +469,7 @@ impl Tool for McpWindowUseTool {
                 "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30, "description": "open 可选:启动后等待窗口出现秒数,默认 10" },
                 "filter": { "type": "string", "description": "list/inspect 可选:窗口标题/进程名或控件名/角色子串过滤" },
                 "match_mode": { "type": "string", "enum": ["exact", "contains", "fuzzy"], "description": "find 可选:匹配模式,默认 contains" },
-                "window_id": { "type": "string", "description": "inspect/control/ocr/screenshot/chat_send/chat_loop 必填:open/list/find 返回的窗口 id" },
+                "window_id": { "type": "string", "description": "inspect/control/ocr/screenshot/chat_send/chat_loop 必填;explore 也接受(已知 window_id 时跳过 find):open/list/find 返回的窗口 id" },
                 "path": { "type": "string", "description": "control 必填:控件路径(如 /0/2/1;\"/\" 表示窗口本身,坐标动作照传)" },
                 "max_depth": { "type": "integer", "minimum": 1, "maximum": 12, "description": "inspect 可选:控件树遍历深度,默认 3" },
                 "control_action": {
@@ -440,7 +567,12 @@ impl Tool for McpWindowUseTool {
                 "focus_guard": { "type": "boolean", "description": "第 91 轮 run_sequence 可选:逐步焦点守护(默认 true)——物理输入步骤执行前确认窗口前台,丢失自动重夺;连续 3 次重夺失败止损中止" },
                 "focus_wait_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "第 91 轮 run_sequence 可选:焦点丢失后重夺预算毫秒,默认 5000" },
                 "max_total_ms": { "type": "integer", "minimum": 1000, "maximum": 600000, "description": "第 91 轮 run_sequence 可选:整批时长硬顶毫秒,默认 180000" },
-                "log_path": { "type": "string", "description": "第 91 轮 run_sequence 可选:执行记录落盘路径([STEP]/[RETRY]/[FOCUS_LOST]/[FAIL]/[SUMMARY]);默认 <工作目录>/laew_sequence_<unix_ts>.log" }
+                "log_path": { "type": "string", "description": "第 91 轮 run_sequence 可选:执行记录落盘路径([STEP]/[RETRY]/[FOCUS_LOST]/[FAIL]/[SUMMARY]);默认 <工作目录>/laew_sequence_<unix_ts>.log" },
+                "snapshot_label": { "type": "string", "description": "第 100 轮 explore 可选:快照短标签(写入 snapshot 文件头部与 digest,便于后续引用)" },
+                "snapshot_path": { "type": "string", "description": "第 100 轮 explore 可选:快照落盘路径;默认 <工作目录>/laew_ui_snapshot_<unix_ts>.json(全量 tree 无截断,LLM 后续可 Read 按需加载)" },
+                "include_ocr": { "type": "boolean", "description": "第 100 轮 explore 可选:控件树为空/自绘 UI 时自动追加窗口 OCR(屏录必需,默认 true)" },
+                "app_name": { "type": "string", "description": "explore 可选:query 模式下,启动用的应用名或完整路径(缺省=query)" },
+                "bundle_id": { "type": "string", "description": "explore 可选:macOS Bundle ID(open -b 启动,优先于 app_name)" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -449,6 +581,18 @@ impl Tool for McpWindowUseTool {
 
     async fn execute(&self, args: Value) -> Result<String> {
         let action = require_str(&args, "action", self.name())?;
+        // 2026-09-21 第 100 轮:Doom Loop 检测 —— 阻断 click→fail 死循环。
+        // 仅 control / inspect / ocr / control 系行为动作受检;chat_send / chat_loop /
+        // explore / run_sequence / input_batch / osascript_run 不参与(本身已
+        // 含循环/重试/批处理,再叠加会误命中)。
+        let doom_check_actions: &[&str] = &[
+            "control", "inspect", "ocr", "screenshot", "list", "find",
+        ];
+        if doom_check_actions.contains(&action) {
+            if let Some(signal) = doom_loop_check(action, &args) {
+                return Ok(doom_loop_response(signal));
+            }
+        }
         match action {
             "open" => open::run(args).await,
             "list" => query::run_list(args).await,
@@ -468,10 +612,12 @@ impl Tool for McpWindowUseTool {
             "input_batch" => input_batch::run_input_batch(args).await,
             // 2026-09-19 第 91 轮:连续工作模式(探索→统一 plan→连续执行+验证/重试/焦点守护/落盘记录)。
             "run_sequence" => sequence::run_input_sequence(args).await,
+            // 2026-09-21 第 100 轮:连续执行模式探索侧 —— 一次拿全 + 快照落盘 + actionable 摘要。
+            "explore" => explore::run_explore(args).await,
             other => Err(tool_err(
                 self.name(),
                 format!(
-                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send / chat_loop / input_batch / run_sequence"
+                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send / chat_loop / input_batch / run_sequence / explore"
                 ),
             )),
         }

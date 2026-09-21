@@ -1013,6 +1013,34 @@ control/input_batch/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 acti
     - **input_batch vs run_sequence 选型**:input_batch 适合 <=10 步的短复合动作(点输入框->ctrl+a
       ->输文本->enter 一次完成),fail-fast + 开头一次守卫即可;run_sequence 适合任何含
       OCR 断言 / 异步 UI 等待 / 错误重试 / 用户长时间操作中途会切窗的场景,**默认首选 run_sequence**。
+20. **第 100 轮 · 双工作模式与 UI 快照治理(2026-09-21)**:
+    工具提供 **两种工作模式,可混合、可多次连续调用**:
+    - **单步执行模式**(Single-Step Mode):一次调用一个 action(capability_probe / find /
+      inspect / ocr / control),适合未知页面探索、高风险操作、不可逆操作;
+    - **连续执行模式**(Continuous Mode,**默认首选**,人机共用机器必备):
+      **探索侧** `action=explore` 一次拿全 + 快照落盘 + actionable 摘要 +
+      **执行侧** `action=run_sequence` 一次连续执行 + 验证/重试/焦点守护。
+    - **首选双调用范式**(不要拆 capability_probe+find+inspect+ocr 四步):
+      ① action=explore(query="微信", max_depth=6, snapshot_label="微信主界面") 拿快照 + digest
+      ② action=run_sequence(steps=[{op:"click", path:"<actionable[2].path>"}, ...])
+    - **explore 返回体关键字段**:
+      snapshot_id(随机 6 位,供 `@explore_ref/<id>/<path>` 引用);
+      snapshot_path(全量 tree 无截断,LLM 后续可 Read 按需加载);
+      capability + recommended_route(决定走 AX / 视觉 / osascript_fallback);
+      tree_summary{total_nodes, actionable_count, self_drawn, ocr_used};
+      actionable[*]{path, role, name, value, bounds, screen_cx, screen_cy, actions}
+      (屏幕绝对坐标,可直接喂给 click_point);
+      ocr_blocks(自绘 UI 微信 4.x 自动 OCR 兜底)。
+    - **混合用法**:`explore + run_sequence`(标准);`explore + run_sequence + explore +
+      run_sequence`(失败片段 re-explore 重做);`chat_send/chat_loop` 与 run_sequence 互斥;
+      `run_sequence` 内可夹 `get_text / assert_text / wait_for_text` 验证步骤。
+    - **Doom Loop 防护**(工具层内置,opencode L1516 同机制):连续 3 次完全相同
+      (action, window_id, path, control_action) 的调用,第三次返回 `doom_loop=true` +
+      next_action 引导换 selector / 路线 / 询问用户;看到 ⚠doom_loop=3 时不要重复相同输入,
+      先 action=explore 重新探索 UI。
+    - 设计参考 docs/MCP_Window_Use/01-设计与解决方案.md §15 +
+      openclaw frameId 去重 / claudecode partitionToolCalls /
+      hermes-agent discriminator 单工具 / pi snapshot + event 双轨。
 19. 长时等待/保活/心跳/定时类红线 (第 91 轮):
     严禁用 Bash (Start-Sleep / sleep / python time.sleep / PowerShell Start-Sleep) 循环凑时长
     (SubAgent 迭代上限 16, 50s×16=800s 仍可能不夠,且每轮浪费 token);

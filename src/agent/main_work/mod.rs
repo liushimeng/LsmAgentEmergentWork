@@ -173,11 +173,27 @@ impl MainWorkRunner {
                合并为一个 subagent WorkFlow;微信 4.x 等自绘 UI 的控件树为空,MCP_Window_Use\n\
                支持 action=ocr + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。\n\
              - 桌面窗口操控流程引用 MCP_Window_Use 时(2026-09-18 第 87 轮;第 90 轮 +input_batch;\n\
-               2026-09-19 第 91 轮 +run_sequence 连续工作模式),steps 中只允许使用\n\
-               以下合法 action:open / list / find / inspect / control / ocr / screenshot /\n\
-               capability_probe / osascript_run / chat_send / chat_loop / input_batch / run_sequence;\n\
-               禁止臆造 list_windows / get_window_info / get_ui_tree 等不存在的接口名 ——\n\
-               执行层按字面调用会直接失败空转。\n\
+               2026-09-19 第 91 轮 +run_sequence 连续工作模式;**2026-09-21 第 100 轮 +explore\n\
+               探索侧 + 双工作模式框架**),steps 中只允许使用以下合法 action:open / list / find /\n\
+               inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send /\n\
+               chat_loop / input_batch / run_sequence / **explore**(第 100 轮新增:探索快照,把\n\
+               capability_probe + find + inspect + ocr 四步合并为一次调用);禁止臆造\n\
+               list_windows / get_window_info / get_ui_tree 等不存在的接口名 —— 执行层按字面调用\n\
+               会直接失败空转。\n\
+             - **首选 explore + run_sequence 双调用(第 100 轮 · 连续执行模式,人机共用机器\n\
+               必备)**:同一桌面应用连续 UI 链(打开 → 检视/OCR → 点击 → 输入 → 发送 → 复查),\n\
+               在 subagent WorkFlow 内**两步走完**,禁止拆 capability_probe + find + inspect +\n\
+               ocr 四次单步调用 —— 那正是要消除的「Agent 操作太慢与人冲突」源头:\n\
+               ① `action=explore(query=..., window_id=..., max_depth=6, snapshot_label=...)` 一次\n\
+                  拿全 + 快照落盘 `<工作目录>/laew_ui_snapshot_<ts>.json` + actionable 摘要\n\
+                  (含屏幕绝对坐标,可直接喂给后续 click_point);\n\
+               ② `action=run_sequence(window_id=..., steps=[...], focus_guard=true,\n\
+                  on_error=retry)` 一次连续执行 + 验证/重试/焦点守护 + log 落盘;\n\
+               acceptance 锚定 UI 动作产物 + run_sequence 落盘 log_path(默认\n\
+               <工作目录>/laew_sequence_<ts>.log)。失败片段 re-explore 后新 run_sequence\n\
+               补做,验收看 [STEP]/[RETRY]/[FAIL]/[SUMMARY] 行。**人机共用机器、任务链 ≥\n\
+               3 步、用户随时会切窗的场景一律首选此双调用范式**;仅 ≤2 步的纯读取才走单步模式\n\
+               (单 inspect / 单 ocr)。\n\
              - **同应用连续 UI 链优先 run_sequence(第 91 轮「连续工作模式」)**:同一桌面应用的多步\n\
                UI 链(打开 → 检视/OCR → 点击会话 → 等列表刷新 → 输入 → 提交 → 断言已发送),\n\
                在 subagent WorkFlow 内优先用 `action=run_sequence(window_id, steps=[...])` 一次\n\

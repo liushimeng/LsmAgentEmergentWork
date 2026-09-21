@@ -108,6 +108,33 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
     let get_b = |k: &str| v.get(k).and_then(|x| x.as_bool());
     let get_n = |k: &str| v.get(k).and_then(|x| x.as_i64());
     let mut parts: Vec<String> = Vec::new();
+    // 第 100 轮:Doom Loop 触发时(返回 ok=false + doom_loop=true),醒目标记。
+    if get_b("doom_loop") == Some(true) {
+        let n = get_n("doom_loop_count").unwrap_or(0);
+        parts.push(format!("⚠doom_loop={n}"));
+    }
+    // 第 100 轮:explore 摘要 —— snapshot_id / 路径 / actionable 数 / 能力路线。
+    if let Some(sid) = Some(get_s("snapshot_id")).filter(|s| !s.is_empty()) {
+        parts.push(format!("snap={sid}"));
+        if let Some(sp) = Some(get_s("snapshot_path")).filter(|s| !s.is_empty()) {
+            let name = std::path::Path::new(sp)
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or(sp);
+            parts.push(format!("snapshot={}", truncate_chars(name, 24)));
+        }
+        if let Some(n) = get_n("actionable_count") {
+            parts.push(format!("actionable={n}"));
+        }
+        if let Some(sd) = v.get("tree_summary").and_then(|x| x.as_object()) {
+            if sd.get("self_drawn").and_then(|x| x.as_bool()) == Some(true) {
+                parts.push("self_drawn".into());
+            }
+            if sd.get("ocr_used").and_then(|x| x.as_bool()) == Some(true) {
+                parts.push("ocr_fallback".into());
+            }
+        }
+    }
     if let Some(route) = Some(get_s("route")).filter(|s| !s.is_empty()) {
         parts.push(format!("route={route}"));
         if let Some(vf) = get_b("verified") {
@@ -264,6 +291,50 @@ mod tests {
         let out = r#"{"ok": true, "action": "run_sequence", "steps_total": 6, "steps_ok": 6, "wait_only": false}"#;
         let b = window_use_output_brief("", out).unwrap();
         assert!(!b.contains("wait_only"), "{b}");
+    }
+
+    #[test]
+    fn brief_explore_round100() {
+        // 第 100 轮:explore 摘要含 snapshot 标记 / actionable 数 / 自绘 UI 警示。
+        let out = r#"{
+            "ok": true,
+            "action": "explore",
+            "snapshot_id": "a1b2c3",
+            "snapshot_path": "/Users/x/ll/laew_ui_snapshot_1700000000.json",
+            "window_info": {"id": "w"},
+            "tree_summary": {"total_nodes": 87, "actionable_count": 12, "self_drawn": false, "ocr_used": false}
+        }"#;
+        let b = window_use_output_brief("", out).unwrap();
+        assert!(b.contains("snap=a1b2c3"), "{b}");
+        assert!(b.contains("snapshot=laew_ui_snapshot_1700000000.json"), "{b}");
+        assert!(b.contains("actionable=12"), "{b}");
+        assert!(!b.contains("self_drawn"), "非自绘 UI 不应带 self_drawn: {b}");
+        // 自绘 UI + OCR 兜底
+        let out = r#"{
+            "ok": true,
+            "action": "explore",
+            "snapshot_id": "zzz",
+            "snapshot_path": "/tmp/x.json",
+            "tree_summary": {"actionable_count": 0, "self_drawn": true, "ocr_used": true}
+        }"#;
+        let b = window_use_output_brief("", out).unwrap();
+        assert!(b.contains("self_drawn"), "{b}");
+        assert!(b.contains("ocr_fallback"), "{b}");
+    }
+
+    #[test]
+    fn brief_doom_loop_round100() {
+        // 第 100 轮:Doom Loop 触发时醒目标记。
+        let out = r#"{
+            "ok": false,
+            "action": "control",
+            "doom_loop": true,
+            "doom_loop_count": 3,
+            "error": "Doom Loop..."
+        }"#;
+        let b = window_use_output_brief("", out).unwrap();
+        assert!(b.contains("⚠doom_loop=3"), "{b}");
+        assert!(b.contains("err=\"Doom Loop"), "{b}");
     }
 }
 
