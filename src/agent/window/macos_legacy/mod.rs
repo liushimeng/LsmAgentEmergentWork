@@ -167,8 +167,8 @@ use cg_event::{
     parse_key_combo, CgMouseButton,
 };
 use inspect::{
-    build_tree, element_action_names, element_at_path, is_frontmost_pid, parse_window_id,
-    tree_is_shallow, window_element,
+    ax_window_title_quiet, build_tree, element_action_names, element_at_path, is_frontmost_pid,
+    parse_window_id, tree_is_shallow, window_element,
 };
 
 // ===================== 驱动实现(2026-09-20 第 97 轮拆分,核心逻辑仍在 mod.rs) =====================
@@ -386,7 +386,74 @@ pub fn list_windows_cg(filter: Option<&str>) -> Result<Vec<WindowInfo>> {
             });
         }
         CFRelease(list.cast());
+        // 第 109 轮:无屏录权限时 kCGWindowName 恒为空(豆包实测窗口列表全部
+        // "title=(进程)" 形态),LLM 无法辨识窗口、按标题匹配失效。AX 已授权时用
+        // AXTitle 安静富化(ax_window_title_quiet,不设 ManualAccessibility,无
+        // 系统级副作用);2s TTL 缓存避免 open 等待循环 250ms 一轮的重复 AX IPC。
+        enrich_titles_with_ax(&mut out);
         Ok(out)
+    }
+}
+
+/// AX 标题富化缓存(2s TTL;窗口标题变化低频,枚举循环复用)。
+fn title_enrich_cache(
+) -> &'static std::sync::Mutex<Option<(std::time::Instant, HashMap<String, String>)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<Option<(std::time::Instant, HashMap<String, String>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// title 为空的窗口用 AXTitle 补全(上限 40 个;未授权/缓存命中时零开销)。
+fn enrich_titles_with_ax(windows: &mut [WindowInfo]) {
+    if !windows.iter().any(|w| w.title.is_empty()) {
+        return;
+    }
+    if !MacOsDriver::is_trusted() {
+        return; // AX 未授权:安静跳过,list 本身不需要该权限
+    }
+    // TTL 缓存命中 → 直接回填
+    if let Ok(mut cached) = title_enrich_cache().lock() {
+        match cached.as_ref() {
+            Some((at, map)) if at.elapsed().as_secs() < 2 => {
+                for w in windows.iter_mut() {
+                    if w.title.is_empty() {
+                        if let Some(t) = map.get(&w.id) {
+                            w.title = t.clone();
+                        }
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+    let mut fetched: HashMap<String, String> = HashMap::new();
+    let mut enriched = 0usize;
+    for w in windows.iter_mut() {
+        if enriched >= 40 || !w.title.is_empty() {
+            continue;
+        }
+        let pid = w.pid as i32;
+        if pid <= 0 {
+            continue;
+        }
+        let idx = w
+            .id
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        if let Some(t) = unsafe { ax_window_title_quiet(pid, idx) } {
+            w.title = t.clone();
+            fetched.insert(w.id.clone(), t);
+            enriched += 1;
+        }
+    }
+    if !fetched.is_empty() {
+        if let Ok(mut cached) = title_enrich_cache().lock() {
+            *cached = Some((std::time::Instant::now(), fetched));
+        }
     }
 }
 
@@ -442,18 +509,25 @@ impl WindowDriver for MacOsDriver {
         let max_depth = max_depth.clamp(1, 12);
         unsafe {
             // 第 81 轮:AX 异步建树等待(warmup)。AXEnhancedUserInterface 置位后
-            // Electron/Qt/自绘 App 需要数百毫秒搭树,首读常为「浅树」;检测到浅树时
-            // 等 300ms 重建,最多 3 次。带 filter 的调用不参与(命中即返回,避免把
-            // 合法的「仅容器命中」当浅树);LAEW_DISABLE_AX_WARMUP=1 一键关闭。
+            // Electron/Qt/自绘 App 需要数百毫秒搭树,首读常为「浅树」。
+            // 第 109 轮加深:固定 3×300ms(总 900ms)不够 Electron(豆包实测 1-3s+
+            // 才长出 web 树),改为退避序列 [300,500,800,1200,2000]ms,总预算默认
+            // 4800ms(LAEW_AX_WARMUP_MAX_MS 可调,0 = 关闭);每次重试都会重新执行
+            // window_element 内的 ManualAccessibility/EnhancedUserInterface 置位
+            // (每次属性通知都可能再次触发 Chromium 重建)。带 filter 的调用不参与
+            // (命中即返回,避免把合法的「仅容器命中」当浅树);
+            // LAEW_DISABLE_AX_WARMUP=1 一键关闭(兼容旧行为)。
             let warmup_enabled = !std::env::var("LAEW_DISABLE_AX_WARMUP")
                 .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false);
-            let attempts = if warmup_enabled && filter.is_none() {
-                3
-            } else {
-                1
-            };
-            for attempt in 0..attempts {
+            let warmup_budget_ms: u64 = std::env::var("LAEW_AX_WARMUP_MAX_MS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(4800);
+            const BACKOFF_SEQ_MS: [u64; 5] = [300, 500, 800, 1200, 2000];
+            let mut warmup_total_ms: u64 = 0;
+            let mut warmup_retries: u32 = 0;
+            loop {
                 let win = window_element(pid, idx)?;
                 let tree = build_tree(win, "/".to_string(), 1, max_depth, filter);
                 CFRelease(win);
@@ -469,22 +543,29 @@ impl WindowDriver for MacOsDriver {
                         ),
                     )
                 })?;
-                // 第 81 轮:浅树重试(warmup)。
-                if warmup_enabled && filter.is_none() && tree_is_shallow(&tree) {
-                    if attempt + 1 < attempts {
-                        tracing::debug!(
-                            attempt = attempt + 1,
-                            window_id = %window_id,
-                            "AX 浅树(异步建树未完成),等待 300ms 后重建"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                        continue;
-                    }
+                let need_wait = warmup_enabled
+                    && filter.is_none()
+                    && warmup_total_ms < warmup_budget_ms
+                    && tree_is_shallow(&tree);
+                if !need_wait {
+                    // 第 109 轮:记录本次 inspect 的建树等待总时长(explore 快照消费)
+                    super::set_last_ax_warmup_ms(warmup_total_ms);
+                    return Ok(tree);
                 }
-                return Ok(tree);
+                // 浅树 → 退避等待后重建(warmup)
+                let seq_idx = (warmup_retries as usize).min(BACKOFF_SEQ_MS.len() - 1);
+                let pause = BACKOFF_SEQ_MS[seq_idx].min(warmup_budget_ms - warmup_total_ms);
+                tracing::debug!(
+                    retry = warmup_retries + 1,
+                    wait_ms = pause,
+                    total_ms = warmup_total_ms + pause,
+                    window_id = %window_id,
+                    "AX 浅树(异步建树未完成),退避等待后重建(第 109 轮退避序列)"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(pause));
+                warmup_total_ms += pause;
+                warmup_retries += 1;
             }
-            // 循环内必然 return;此处仅为类型闭合
-            unreachable!("inspect warmup loop must return")
         }
     }
 

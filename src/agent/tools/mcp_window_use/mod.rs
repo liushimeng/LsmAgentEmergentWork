@@ -495,12 +495,12 @@ impl Tool for McpWindowUseTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "capability_probe", "osascript_run", "chat_send", "chat_loop", "input_batch", "run_sequence", "explore"],
-                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / capability_probe(第 86 轮新增:探测真实能力矩阵) / osascript_run(第 86 轮新增:执行 AppleScript 片段) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环) / input_batch(第 90 轮新增:鼠标+键盘+控件树复合步骤批处理) / run_sequence(第 91 轮新增:连续工作模式——探索后统一 plan 的一整套动作连续执行,含验证/等待/重试/逐步焦点守护/落盘记录) / explore(第 100 轮新增:连续执行模式探索侧——一次调用拿全能力矩阵 + 窗口定位 + 控件树 + 快照落盘 + actionable 摘要,把发现阶段从 4~5 次往返压缩到 1 次,与 run_sequence 组合形成「先 explore 后 run_sequence」标准范式)"
+                    "enum": ["open", "list", "find", "inspect", "control", "ocr", "screenshot", "capability_probe", "osascript_run", "chat_send", "chat_loop", "read_text", "input_batch", "run_sequence", "explore"],
+                    "description": "要执行的窗口操作:open(启动/激活应用) / list(枚举窗口) / find(查窗口) / inspect(控件树) / control(执行操作) / ocr(文字识别) / screenshot(截图) / capability_probe(第 86 轮新增:探测真实能力矩阵) / osascript_run(第 86 轮新增:执行 AppleScript 片段) / chat_send(单条消息原子发送) / chat_loop(长时多轮会话循环) / read_text(第 109 轮新增:读取窗口文本/对话返回结果,AX 树收集或剪贴板路线) / input_batch(第 90 轮新增:鼠标+键盘+控件树复合步骤批处理) / run_sequence(第 91 轮新增:连续工作模式——探索后统一 plan 的一整套动作连续执行,含验证/等待/重试/逐步焦点守护/落盘记录) / explore(第 100 轮新增:连续执行模式探索侧——一次调用拿全能力矩阵 + 窗口定位 + 控件树 + 快照落盘 + actionable 摘要,把发现阶段从 4~5 次往返压缩到 1 次,与 run_sequence 组合形成「先 explore 后 run_sequence」标准范式)"
                 },
                 "query": { "type": "string", "description": "open/find 必填:应用名或窗口标题/进程名查询词(大小写不敏感,支持中英文别名)" },
                 "app_name": { "type": "string", "description": "open 可选:启动用应用名或完整路径,缺省=query" },
-                "bundle_id": { "type": "string", "description": "open 可选:macOS Bundle ID(open -b 启动;第 85 轮起 query='微信' 会自动用 KNOWN_BUNDLE_IDS 映射)" },
+                "bundle_id": { "type": "string", "description": "open/explore 可选:macOS Bundle ID(open -b 启动,优先于 app_name;第 85 轮起 query='微信'/'豆包' 会自动用 KNOWN_BUNDLE_IDS 映射,优先只传 query 即可;注意同名陷阱:open -a '豆包' 会被 LaunchServices 解析到豆包浏览器而非豆包主应用)" },
                 "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30, "description": "open 可选:启动后等待窗口出现秒数,默认 10" },
                 "filter": { "type": "string", "description": "list/inspect 可选:窗口标题/进程名或控件名/角色子串过滤" },
                 "match_mode": { "type": "string", "enum": ["exact", "contains", "fuzzy"], "description": "find 可选:匹配模式,默认 contains" },
@@ -607,7 +607,11 @@ impl Tool for McpWindowUseTool {
                 "snapshot_path": { "type": "string", "description": "第 100 轮 explore 可选:快照落盘路径;默认 <工作目录>/laew_ui_snapshot_<unix_ts>.json(全量 tree 无截断,LLM 后续可 Read 按需加载)" },
                 "include_ocr": { "type": "boolean", "description": "第 100 轮 explore 可选:控件树为空/自绘 UI 时自动追加窗口 OCR(屏录必需,默认 true)" },
                 "app_name": { "type": "string", "description": "explore 可选:query 模式下,启动用的应用名或完整路径(缺省=query)" },
-                "bundle_id": { "type": "string", "description": "explore 可选:macOS Bundle ID(open -b 启动,优先于 app_name)" }
+                "strategy": { "type": "string", "enum": ["auto", "ax", "clipboard"], "description": "第 109 轮 read_text 可选:读取路线 —— auto(默认:AX 树有 web 内容走 ax,否则 clipboard)/ ax(遍历控件树收集文本)/ clipboard(点消息区 → cmd+a → cmd+c → pbpaste;屏录未授权 + Electron 空壳树时的唯一读取路线)" },
+                "expect_contains": { "type": "string", "description": "第 109 轮 read_text 可选:期望包含的关键词(如 AI 回复关键词);提供后与 timeout_ms 配合轮询等待回复流完" },
+                "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "description": "第 109 轮 read_text 可选:expect_contains 的轮询超时毫秒,默认 0 即读一次;期间每 1s 重新复制检查" },
+                "max_chars": { "type": "integer", "minimum": 200, "maximum": 64000, "description": "第 109 轮 read_text 可选:返回文本上限字符数,默认 8000;超长保留尾部(对话内容向底部追加)" },
+                "focus_point": { "type": "object", "properties": { "x": { "type": "integer" }, "y": { "type": "integer" } }, "required": ["x", "y"], "description": "第 109 轮 read_text 可选:clipboard 路线首轮点击的消息区坐标(屏幕绝对);缺省 = 窗口 (50%宽, 40%高)" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -643,6 +647,9 @@ impl Tool for McpWindowUseTool {
             // 把长时多轮会话循环封装成 1 次工具调用)。
             "chat_send" => chat::run_chat_send(args).await,
             "chat_loop" => chat::run_chat_loop(args).await,
+            // 2026-09-21 第 109 轮:窗口文本读取(对话返回结果)—— AX 树收集 /
+            // 剪贴板路线(cmd+a/cmd+c/pbpaste),屏录未授权 + Electron 空壳树时的唯一读取路线。
+            "read_text" => chat::run_read_text(args).await,
             // 2026-09-19 第 90 轮:鼠标 + 键盘 + 控件树复合步骤动作(同时操作鼠标键盘)。
             "input_batch" => input_batch::run_input_batch(args).await,
             // 2026-09-19 第 91 轮:连续工作模式(探索→统一 plan→连续执行+验证/重试/焦点守护/落盘记录)。
@@ -652,7 +659,7 @@ impl Tool for McpWindowUseTool {
             other => Err(tool_err(
                 self.name(),
                 format!(
-                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send / chat_loop / input_batch / run_sequence / explore"
+                    "未知 action={other:?};合法值:open / list / find / inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send / chat_loop / read_text / input_batch / run_sequence / explore"
                 ),
             )),
         }

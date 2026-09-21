@@ -363,6 +363,9 @@ pub fn is_target_app_allowed(query: &str) -> bool {
         "finder", "explorer", "preview", "previewer", "activity monitor", "活动监视器",
         // 其他常见
         "spotify", "music", "网易云", "netease", "iina", "vlc", "iina",
+        // 第 109 轮(2026-09-21):豆包桌面应用(explore query 模式自动启动路径;
+        // 此前缺失导致豆包未运行时 auto_launch_target 直接拒绝)
+        "doubao", "豆包",
     ];
     // 用户扩展白名单
     if let Ok(extra) = std::env::var("LAEW_AUTO_LAUNCH_EXTRA") {
@@ -1094,6 +1097,121 @@ pub(crate) fn matches_filter(haystack: &str, filter: Option<&str>) -> bool {
     }
 }
 
+// ===================== 第 109 轮(2026-09-21):AX 空壳树识别 + warmup 观测 =====================
+//
+// 背景:豆包(Electron)实测快照 —— AXWindow("豆包") → AXGroup×6(同 bounds 空壳)
+// + 3 个 16×16 红绿灯 AXButton,共 10 节点。旧 `tree_is_shallow` 判定「节点数 ≤ 4 或
+// 无内容控件」,红绿灯按钮被当成内容控件 → 浅树重试从不触发、explore self_drawn
+// 永为 false,「chat_send 唯一路径」引导(第 101 轮)全部失效。
+//
+// 修复:抽出跨驱动共享的三个判定,macOS 驱动与 explore 工具层统一取用:
+// - `is_traffic_light_button`:红绿灯级装饰按钮(无名称 + ≤24×24)不算内容;
+// - `tree_is_shell_only`:容器链 + 仅红绿灯 → 空壳树(需 warmup / 换路线);
+// - `tree_has_web_content`:树中出现 web 内容角色(webarea/textfield/statictext/
+//   带名称按钮等)→ AX 路线可用。
+
+/// 判定节点是否「红绿灯级别的装饰按钮」:无名称/无值、尺寸 ≤ 24×24 的叶子按钮。
+///
+/// macOS 窗口左上角 关闭/最小化/最大化 按钮恒为该形态(豆包实测 16×16);Electron
+/// 空壳树里它们是仅有的"内容控件",不豁免则空壳树永远判不出(第 109 轮根因 R2/R3)。
+pub fn is_traffic_light_button(node: &ControlNode) -> bool {
+    let r = node.role.trim().to_ascii_lowercase();
+    let r = r.strip_prefix("ax").unwrap_or(&r);
+    r.contains("button")
+        && node.name.trim().is_empty()
+        && node.value.trim().is_empty()
+        && node.bounds.width <= 24
+        && node.bounds.height <= 24
+        && node.children.is_empty()
+}
+
+/// 空壳容器角色(树内仅这些角色 + 红绿灯 → 判空壳)。
+const SHELL_CONTAINER_ROLES: &[&str] = &[
+    "window", "pane", "group", "scrollarea", "application", "layoutarea",
+    "splitgroup", "splitter", "tabgroup", "unknown", "",
+];
+
+fn is_shell_container_role(role: &str) -> bool {
+    let r = role.trim().to_ascii_lowercase();
+    let r = r.strip_prefix("ax").unwrap_or(&r);
+    SHELL_CONTAINER_ROLES.contains(&r)
+}
+
+/// 控件树是否「空壳」—— 需要等待异步建树(warmup)或切换路线的判定:
+/// 1. 总节点数 ≤ 4(微信实测空壳 = 根 AXWindow + 3 个红绿灯 AXButton);
+/// 2. 或除空壳容器与红绿灯按钮外,没有任何内容控件(Electron 建树未完成的典型形态)。
+pub fn tree_is_shell_only(root: &ControlNode) -> bool {
+    fn count(node: &ControlNode) -> usize {
+        1 + node.children.iter().map(count).sum::<usize>()
+    }
+    fn has_content(node: &ControlNode) -> bool {
+        if is_traffic_light_button(node) {
+            return false;
+        }
+        if !is_shell_container_role(&node.role) {
+            return true;
+        }
+        node.children.iter().any(has_content)
+    }
+    count(root) <= 4 || !has_content(root)
+}
+
+/// web 内容角色子串(命中即认为 AX 树已长出真实界面内容)。
+const WEB_CONTENT_ROLE_KEYWORDS: &[&str] = &[
+    "webarea", "textfield", "textarea", "statictext", "combobox", "searchfield",
+    "securetextfield", "radiobutton", "checkbox", "link", "menuitem", "outline",
+    "table", "image", "row", "cell", "valueindicator", "slider",
+];
+
+/// 控件树是否包含 web/界面内容控件(Electron AX 建树完成的正向信号)。
+pub fn tree_has_web_content(root: &ControlNode) -> bool {
+    fn walk(node: &ControlNode) -> bool {
+        if is_traffic_light_button(node) {
+            // 红绿灯不算;但子树照常递归
+            return node.children.iter().any(walk);
+        }
+        let r = node.role.trim().to_ascii_lowercase();
+        let r = r.strip_prefix("ax").unwrap_or(&r);
+        if WEB_CONTENT_ROLE_KEYWORDS.iter().any(|k| r.contains(k)) {
+            return true;
+        }
+        // 带名称的按钮/菜单(如"发送")也是内容信号
+        if r.contains("button") && !node.name.trim().is_empty() {
+            return true;
+        }
+        node.children.iter().any(walk)
+    }
+    walk(root)
+}
+
+// ---- warmup / ManualAccessibility ack 观测(进程级,explore 快照与 Debug 报告消费) ----
+
+use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+
+static LAST_AX_WARMUP_MS: AtomicU64 = AtomicU64::new(0);
+/// -1 = 未探测 / 平台不支持;0 = 应用回读为 false;1 = 应用回读为 true。
+static LAST_AX_MANUAL_ACK: AtomicI8 = AtomicI8::new(-1);
+
+/// 记录最近一次 inspect 的 AX 建树等待总毫秒(驱动层调用)。
+pub fn set_last_ax_warmup_ms(ms: u64) {
+    LAST_AX_WARMUP_MS.store(ms, Ordering::Relaxed);
+}
+
+/// 读取最近一次 inspect 的 AX 建树等待总毫秒(explore 快照消费)。
+pub fn last_ax_warmup_ms() -> u64 {
+    LAST_AX_WARMUP_MS.load(Ordering::Relaxed)
+}
+
+/// 记录最近一次 AXManualAccessibility 回读结果(驱动层调用)。
+pub fn set_last_ax_manual_ack(v: bool) {
+    LAST_AX_MANUAL_ACK.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// 读取最近一次 AXManualAccessibility 回读结果:-1 未探测 / 0 false / 1 true。
+pub fn last_ax_manual_ack() -> i8 {
+    LAST_AX_MANUAL_ACK.load(Ordering::Relaxed)
+}
+
 /// 按子索引路径(如 `/0/2/1`)在控件树中定位节点;路径非法/越界返回 None。
 pub fn find_by_path<'a>(root: &'a ControlNode, path: &str) -> Option<&'a ControlNode> {
     let trimmed = path.trim();
@@ -1228,5 +1346,121 @@ mod tests {
         assert!(!is_target_app_allowed("Chrome; rm -rf /"));
         assert!(!is_target_app_allowed("WeChat && echo evil"));
         assert!(!is_target_app_allowed("`whoami`"));
+    }
+
+    // ===== 第 109 轮:AX 空壳树识别 =====
+
+    #[test]
+    fn is_target_app_allowed_accepts_doubao() {
+        // 第 109 轮:豆包桌面应用白名单(explore query 模式自动启动)
+        assert!(is_target_app_allowed("豆包"));
+        assert!(is_target_app_allowed("Doubao"));
+        assert!(is_target_app_allowed("doubao"));
+    }
+
+    fn tl_button(path: &str, x: i64, y: i64) -> ControlNode {
+        ControlNode {
+            path: path.into(),
+            role: "AXButton".into(),
+            name: String::new(),
+            bounds: Rect { x, y, width: 16, height: 16 },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_traffic_light_button_detects_tiny_unnamed_button() {
+        // 红绿灯:无名称 + 16×16 叶子按钮
+        assert!(is_traffic_light_button(&tl_button("/1", 1488, 498)));
+        // 带名称的小按钮(如关闭图标带 accessibility label)→ 不是红绿灯
+        let mut named = tl_button("/2", 1488, 498);
+        named.name = "关闭".into();
+        assert!(!is_traffic_light_button(&named));
+        // 无名称但尺寸大(正常功能按钮)→ 不是红绿灯
+        let mut big = tl_button("/3", 100, 200);
+        big.bounds = Rect { x: 100, y: 200, width: 80, height: 30 };
+        assert!(!is_traffic_light_button(&big));
+        // 无名称小组件但不是按钮 → 不是红绿灯
+        let mut group = tl_button("/4", 0, 0);
+        group.role = "AXGroup".into();
+        assert!(!is_traffic_light_button(&group));
+    }
+
+    #[test]
+    fn tree_is_shell_only_doubao_electron_form() {
+        // 第 109 轮核心场景:豆包实测快照形态 —— AXWindow → AXGroup("豆包") →
+        // 6 层同 bounds 空 AXGroup + 3 个红绿灯 AXButton(共 10 节点)。
+        // 旧判定(节点数 > 4 且有 AXButton 内容)误判为健康树;新判定必须识别为空壳。
+        let mut deep = ControlNode {
+            path: "/".into(),
+            role: "AXWindow".into(),
+            name: "豆包".into(),
+            ..Default::default()
+        };
+        let mut chain = ControlNode {
+            path: "/0".into(),
+            role: "AXGroup".into(),
+            name: "豆包".into(),
+            ..Default::default()
+        };
+        let mut cur = &mut chain;
+        for i in 0..5 {
+            cur.children.push(ControlNode {
+                path: format!("/0/{}", "0/".repeat(i as usize)).trim_end_matches('/').into(),
+                role: "AXGroup".into(),
+                ..Default::default()
+            });
+            cur = cur.children.last_mut().unwrap();
+        }
+        deep.children.push(chain);
+        deep.children.push(tl_button("/1", 1488, 498));
+        deep.children.push(tl_button("/2", 1511, 498));
+        deep.children.push(tl_button("/3", 1534, 498));
+        assert!(tree_is_shell_only(&deep), "豆包空壳树应判 shell_only");
+        assert!(!tree_has_web_content(&deep), "豆包空壳树无 web 内容");
+    }
+
+    #[test]
+    fn tree_is_shell_only_false_for_real_content() {
+        // 真实内容树:窗口 → 容器 → 命名按钮「发送」+ 文本框 → 不是空壳
+        let mut root = ControlNode {
+            path: "/".into(),
+            role: "AXWindow".into(),
+            name: "微信".into(),
+            ..Default::default()
+        };
+        let mut send = ControlNode {
+            path: "/0/0".into(),
+            role: "AXButton".into(),
+            name: "发送".into(),
+            bounds: Rect { x: 10, y: 20, width: 80, height: 30 },
+            ..Default::default()
+        };
+        send.children = vec![];
+        let input = ControlNode {
+            path: "/0/1".into(),
+            role: "AXTextField".into(),
+            name: "消息输入框".into(),
+            ..Default::default()
+        };
+        root.children = vec![
+            ControlNode {
+                path: "/0".into(),
+                role: "AXGroup".into(),
+                children: vec![send, input],
+                ..Default::default()
+            },
+            tl_button("/1", 0, 0),
+        ];
+        assert!(!tree_is_shell_only(&root));
+        assert!(tree_has_web_content(&root));
+        // webarea 命中(Electron 建树完成的典型信号)
+        let web = ControlNode {
+            path: "/".into(),
+            role: "AXWebArea".into(),
+            ..Default::default()
+        };
+        assert!(!tree_is_shell_only(&web));
+        assert!(tree_has_web_content(&web));
     }
 }

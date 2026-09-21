@@ -318,6 +318,34 @@ fn mdfind_app_path(query: &str) -> Option<String> {
     None
 }
 
+/// 第 109 轮:mdfind 按 Bundle ID 精确查询真实 .app 路径。
+///
+/// 用途:`open -b <id>` 失败(LaunchServices 过期缓存)但 bundle id 本身正确时的
+/// 兜底 —— 与应用显示名/目录名无关,不受「豆包 → 豆包浏览器」同名解析陷阱影响。
+#[cfg(target_os = "macos")]
+fn mdfind_app_path_by_bundle_id(bundle_id: &str) -> Option<String> {
+    use std::process::Command;
+    let bid = bundle_id.replace(['"', '\\'], "");
+    if bid.is_empty() {
+        return None;
+    }
+    let output = Command::new("mdfind")
+        .arg(format!("kMDItemCFBundleIdentifier == '{bid}'"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let p = line.trim();
+        if p.ends_with(".app") && std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
 fn launch_desktop_app(
     app: &str,
     bundle_id: Option<&str>,
@@ -409,21 +437,48 @@ fn launch_desktop_app(
             }
         }
 
-        // 优先级 c:open -a 遍历别名(英文优先,中文 DisplayName 一般会失败但试一下无成本)
-        for candidate in &candidates {
-            if !safe_desktop_identifier(candidate) {
-                continue;
-            }
-            let display = format!("open -a {candidate}");
-            let mut c = Command::new("open");
-            c.arg("-a").arg(candidate)
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            match c.status() {
-                Ok(s) if s.success() => {
-                    tried.push(display);
-                    return Ok(tried);
+        // 优先级 b2(第 109 轮):mdfind 按 bundle id 精确定位真实 .app 路径。
+        // 场景:bundle id 已解析(表命中/LLM 显式)但 open -b 失败(LaunchServices
+        // 缓存损坏 / bundle 改名)。Spotlight 按 kMDItemCFBundleIdentifier 查询
+        // 与应用显示名无关,不受「豆包 → 豆包浏览器」同名解析陷阱影响。
+        #[cfg(target_os = "macos")]
+        if let Some(ref bid) = resolved_bundle {
+            if let Some(path) = mdfind_app_path_by_bundle_id(bid) {
+                let display = format!("open {path}");
+                let mut c = Command::new("open");
+                c.arg(&path)
+                    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                match c.status() {
+                    Ok(s) if s.success() => {
+                        tried.push(display);
+                        return Ok(tried);
+                    }
+                    _ => tried.push(display),
                 }
-                _ => tried.push(display),
+            }
+        }
+
+        // 优先级 c:open -a 遍历别名(英文优先,中文 DisplayName 一般会失败但试一下无成本)。
+        // 第 109 轮:bundle id 已解析时**跳过中文别名** —— LaunchServices 同名陷阱:
+        // 「豆包」被解析到 豆包浏览器(com.bot.pc.doubao.linkrouter)而非豆包主应用
+        // (com.bot.pc.doubao),open -a 豆包 表面成功实则启动错误应用,窗口永远匹配不上。
+        let skip_open_a_aliases = resolved_bundle.is_some();
+        if !skip_open_a_aliases {
+            for candidate in &candidates {
+                if !safe_desktop_identifier(candidate) {
+                    continue;
+                }
+                let display = format!("open -a {candidate}");
+                let mut c = Command::new("open");
+                c.arg("-a").arg(candidate)
+                    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                match c.status() {
+                    Ok(s) if s.success() => {
+                        tried.push(display);
+                        return Ok(tried);
+                    }
+                    _ => tried.push(display),
+                }
             }
         }
 
@@ -474,7 +529,7 @@ fn launch_desktop_app(
 
         // 全部失败 -> 统一错误文案(让 LLM 下次直接给 bundle_id)
         Err(format!(
-            "启动 {app:?} 全部失败;已尝试: {tried:?}。建议:1) 在 action=open 时显式传 bundle_id(微信=com.tencent.xinWeChat / 钉钉=com.laiwang.DingTalk / 飞书=com.bytedance.feishu);             2) 用 system_profiler SPApplicationsDataType | grep -B1 -A6 bundle 查真实 bundle id;             3) 手动启动应用后再 action=open 激活。"
+            "启动 {app:?} 全部失败;已尝试: {tried:?}。建议:1) 在 action=open 时显式传 bundle_id(微信=com.tencent.xinWeChat / 钉钉=com.laiwang.DingTalk / 飞书=com.bytedance.feishu / 豆包=com.bot.pc.doubao);             2) 用 system_profiler SPApplicationsDataType | grep -B1 -A6 bundle 查真实 bundle id;             3) 注意 macOS 同名应用陷阱:「豆包」可被 LaunchServices 解析到 豆包浏览器(com.bot.pc.doubao.linkrouter)而非豆包主应用,勿用 open -a 中文名;             4) 手动启动应用后再 action=open 激活。"
         ))
     }
 }

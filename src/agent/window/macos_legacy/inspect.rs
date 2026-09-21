@@ -26,9 +26,9 @@ use super::{
     kAXEnhancedUserInterfaceAttribute, kAXFrontmostAttribute, kAXManualAccessibilityAttribute,
     kAXPositionAttribute, kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute,
     kAXWindowsAttribute, platform_err, AXError, AXUIElementCopyActionNames,
-    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue,
-    Boolean, CGPoint, CGSize, ControlNode, Rect, K_AX_ERROR_SUCCESS, K_AX_VALUE_CGPOINT_TYPE,
-    K_AX_VALUE_CGSIZE_TYPE,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetAttributeValue, AXValueGetValue, Boolean, CGPoint, CGSize, ControlNode, Rect,
+    K_AX_ERROR_SUCCESS, K_AX_VALUE_CGPOINT_TYPE, K_AX_VALUE_CGSIZE_TYPE,
 };
 use crate::error::Result;
 
@@ -62,10 +62,24 @@ pub(super) unsafe fn window_element(pid: i32, index: usize) -> Result<AXUIElemen
     // Qt / wx / 更多自绘框架认 **AXEnhancedUserInterface**(Appium mac2 同款技巧,
     // 第 81 轮新增):置 true 强制应用构建完整无障碍树。两者均 best-effort,
     // 打开失败不影响后续窗口读取;应用异步建树,浅树重试由 inspect 的 warmup 承担。
+    // 第 109 轮:置位后回读 AXManualAccessibility 作 ack 观测(explore 快照 /
+    // Debug 报告消费)—— 回读 false/不支持说明该 Electron 构建可能忽略了手动
+    // 无障碍开关,LLM 应尽早切 chat_send + read_text 剪贴板路线,不再等树。
     let true_v: CFBooleanRef =
         core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef();
     let _ = AXUIElementSetAttributeValue(app, kAXManualAccessibilityAttribute(), true_v.cast());
     let _ = AXUIElementSetAttributeValue(app, kAXEnhancedUserInterfaceAttribute(), true_v.cast());
+    let mut ack_v: CFTypeRef = std::ptr::null();
+    if AXUIElementCopyAttributeValue(app, kAXManualAccessibilityAttribute(), &mut ack_v)
+        == K_AX_ERROR_SUCCESS
+        && !ack_v.is_null()
+    {
+        let true_ptr =
+            core_foundation::boolean::CFBoolean::true_value().as_concrete_TypeRef()
+                as *const std::ffi::c_void;
+        super::super::set_last_ax_manual_ack(ack_v == true_ptr);
+        CFRelease(ack_v);
+    }
     let wins = ax_get(app, kAXWindowsAttribute());
     CFRelease(app);
     if wins.is_null() {
@@ -286,42 +300,48 @@ pub(super) unsafe fn build_tree(
     }
 }
 
-/// 第 81 轮:控件树是否「浅」—— 需要等待异步建树重试的判定:
-/// 1. 总节点数 ≤ 4(微信实测空壳 = 根 AXWindow + 3 个红绿灯 AXButton);
-/// 2. 或除纯容器(Window/Pane/Group/ScrollArea)外没有任何内容控件。
-/// Electron / Qt / 微信等自绘 App 在 AXEnhancedUserInterface 置位后需要
-/// 数百毫秒才把完整树搭出来,首读常为浅树。
+/// 第 81 轮:控件树是否「浅」—— 需要等待异步建树重试的判定。
 ///
-/// 注意:macOS 角色带 `AX` 前缀(AXButton),判定前先剥离再做容器名比对。
+/// 第 109 轮:实现上移到 `window::tree_is_shell_only` 共享(explore 的
+/// self_drawn 判定 / read_text 的路线选择同源),本函数保留为薄委托。
+/// 判定规则见共享实现:节点数 ≤ 4,或除空壳容器与红绿灯按钮(无名称 + ≤24×24,
+/// 豆包实测 3 个 16×16 标题栏按钮)外没有任何内容控件。
 pub(super) fn tree_is_shallow(root: &ControlNode) -> bool {
-    const CONTAINERS: &[&str] = &[
-        "window",
-        "pane",
-        "group",
-        "scrollarea",
-        "application",
-        "layoutarea",
-        "splitgroup",
-        "splitter",
-        "tabgroup",
-        "unknown",
-        "",
-    ];
-    fn is_pure_container(role: &str) -> bool {
-        let r = role.trim().to_ascii_lowercase();
-        let r = r.strip_prefix("ax").unwrap_or(&r);
-        CONTAINERS.contains(&r)
+    super::super::tree_is_shell_only(root)
+}
+
+/// 安静读取应用第 index 个 AX 窗口的 AXTitle(第 109 轮)。
+///
+/// 与 [`window_element`] 的区别:**不设置** AXManualAccessibility /
+/// AXEnhancedUserInterface —— 供 `list_windows_cg` 的标题富化使用,
+/// 避免枚举窗口的副作用把全系统应用都强制建无障碍树。失败返回 None。
+pub(super) unsafe fn ax_window_title_quiet(pid: i32, index: usize) -> Option<String> {
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        return None;
     }
-    fn count(node: &ControlNode) -> usize {
-        1 + node.children.iter().map(count).sum::<usize>()
+    let wins = ax_get(app, kAXWindowsAttribute());
+    CFRelease(app);
+    if wins.is_null() {
+        return None;
     }
-    fn has_content(node: &ControlNode) -> bool {
-        if !is_pure_container(&node.role) {
-            return true;
+    let count = CFArrayGetCount(wins as CFArrayRef);
+    let el = if (index as CFIndex) < count {
+        let e = CFArrayGetValueAtIndex(wins as CFArrayRef, index as CFIndex) as AXUIElementRef;
+        if !e.is_null() {
+            CFRetain(e);
         }
-        node.children.iter().any(has_content)
+        e
+    } else {
+        std::ptr::null()
+    };
+    CFRelease(wins);
+    if el.is_null() {
+        return None;
     }
-    count(root) <= 4 || !has_content(root)
+    let title = ax_get_string(el, kAXTitleAttribute());
+    CFRelease(el);
+    (!title.is_empty()).then_some(title)
 }
 
 /// 第 81 轮:应用是否已处于前台(读应用级 AXFrontmost;失败回退 false)。

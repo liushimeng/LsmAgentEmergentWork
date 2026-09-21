@@ -788,11 +788,15 @@ const MCP_WINDOW_USE_PROMPT_SECTION: &str = r#"
 如微信/钉钉/记事本等桌面应用)时,使用 MCP_Window_Use 工具(单工具 + action 分发):
 open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loop(操作)→ 复查。
 
-1. **启动应用**:必传 `bundle_id` 或中文别名;`open -a 微信` 在 macOS 上**直接失败**。
-   微信=com.tencent.xinWeChat / 钉钉=com.laiwang.DingTalk / 飞书=com.bytedance.feishu
-   / QQ=com.tencent.qq / VSCode=com.microsoft.VSCode / Slack=com.tinyspeck.chatlyio
-   / 腾讯会议=com.tencent.meeting / 豆包=com.doubao.mac / Zoom=us.zoom.xos
-   (亦可只用中文 query=微信;工具内置 KNOWN_BUNDLE_IDS 自动映射)
+1. **启动应用**:**优先只传中文 query(如 query=豆包 / query=微信)** —— 工具内置
+   KNOWN_BUNDLE_IDS 自动映射 + 真实安装包探测(按 .app 文件名 / Info.plist / Spotlight),
+   LLM 无需硬编码 bundle id(提示词侧硬编码 id 极易随厂商版本腐烂,第 109 轮教训)。
+   仅当 query 反复失败才显式传 `bundle_id`。注意 `open -a 中文名` 可能失败或命中同名
+   错误应用(如「豆包」会被 LaunchServices 解析到豆包浏览器 com.bot.pc.doubao.linkrouter,
+   而非豆包主应用),一律走 query / bundle_id。
+   参考 bundle id:微信=com.tencent.xinWeChat / 钉钉=com.laiwang.DingTalk /
+   飞书=com.bytedance.feishu / QQ=com.tencent.qq / **豆包=com.bot.pc.doubao** /
+   VSCode=com.microsoft.VSCode / 腾讯会议=com.tencent.meeting / Zoom=us.zoom.xos
 
 2. **chat_send/chat_loop —— 微信聊天首选**:
    - `chat_send(window_id, text, click_point?, input_field_path?, chat_log_path?)`:
@@ -842,6 +846,11 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
    - `chat_send(window_id, text)` 一调用完成(自动选 osascript_fallback 路线)
    - 10 分钟级多轮聊天:`chat_loop(window_id, messages, interval_seconds=30,
      max_rounds=20, chat_log_path="...")` 一调用完成
+   - **读取窗口文本 / 对话返回结果**(第 109 轮新增):`read_text(window_id,
+     expect_contains="回复关键词", timeout_ms=30000)` —— 剪贴板路线(点消息区 →
+     cmd+a → cmd+c → pbpaste),发送后等 AI 回复流完再读;豆包/微信桌面版等
+     Electron 聊天 UI 可达,是屏录未授权时的唯一读取路线(会覆盖剪贴板,
+     返回体 clipboard_overwritten=true 明示)。
    **绝对禁止**(浪费迭代):× 继续 inspect / 换 filter/换 max_depth 重试;
    × osascript_run 遍历 AX 子元素(微信不暴露);× action=ocr(屏录未授权,必败)。
    看到 self_drawn=true 或 tree_summary.actionable_count=0 时,第 2 步必须走
@@ -864,6 +873,12 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
 
 通用规范:
 - **顺序**:目标应用未启动先 action=open;已返回 window_id 直接复用,不要重复启动。
+- **桌面目标保真(最高红线,第 109 轮)**:任务目标是独立桌面软件(豆包/微信/钉钉/飞书/
+  QQ 等)且用户未明确说「网页/Web 版」时,全程只用 MCP_Window_Use。open/explore 启动失败的
+  救援顺序:① `action=list` 确认进程是否已起(可能已启动只是窗口匹配慢)→ ② 加大
+  wait_seconds 重试 → ③ 换别名(query=豆包 / Doubao)。**禁止转 MCP_Web_Use 打开该软件的
+  网页版**——网页版不构成桌面软件任务的等效完成,QC 会判 Fail。发送用 chat_send/chat_loop,
+  读取对话结果用 read_text。
 - **inspect 控件树失败**(自绘 UI 标志):< 500 节点全是 AXWindow/Group 框架 → 切
   chat_send/osascript_fallback 或 ocr 视觉路线。**禁止**反复 inspect 换 max_depth/filter 重试。
 - **OCR / screenshot 不可用**:`capability.ocr_screenshot_cgwindow=false` 表示完全不可用,

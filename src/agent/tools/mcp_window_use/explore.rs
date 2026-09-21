@@ -121,9 +121,16 @@ pub(super) async fn run_explore(args: Value) -> Result<String> {
         // 4. inspect 控件树
         driver_preflight_sync()?;
         let tree = driver.inspect(&window_id, max_depth as usize, filter.as_deref())?;
+        // 第 109 轮:warmup 等待与 ManualAccessibility ack 由驱动层记录(进程级
+        // atomic),inspect 返回后立取,即本次调用的真实值。
+        let warmup_ms = crate::agent::window::last_ax_warmup_ms();
+        let ax_manual_ack = crate::agent::window::last_ax_manual_ack();
         let total_nodes = count_nodes(&tree);
         let actionable = collect_actionable(&tree);
-        let self_drawn = actionable.is_empty();
+        let web_content = crate::agent::window::tree_has_web_content(&tree);
+        // self_drawn 判定第 109 轮收紧:actionable 为空(红绿灯已豁免)或树仍为
+        // 空壳(容器链 + 仅红绿灯)都算自绘/建树未完成,强制走 chat_send + read_text。
+        let self_drawn = actionable.is_empty() || crate::agent::window::tree_is_shell_only(&tree);
 
         // 5. OCR 兜底(自绘 UI + 屏录可用时)
         let mut ocr_blocks: Vec<OcrBlock> = Vec::new();
@@ -154,6 +161,11 @@ pub(super) async fn run_explore(args: Value) -> Result<String> {
             "created_at": created_at,
             "window_info": window_info,
             "capability": capability_as_value(&capability),
+            // 第 109 轮:AX 建树观测 —— warmup_ms=本次 inspect 的浅树退避等待总时长;
+            // ax_manual_accessibility_ack=AXManualAccessibility 回读(-1 未探测/0 false/1 true),
+            // false 说明该 Electron 构建可能忽略手动无障碍开关,应切 chat_send + read_text。
+            "ax_warmup_ms": warmup_ms,
+            "ax_manual_accessibility_ack": ax_manual_ack,
             "tree_full": tree,
             "ocr_blocks": ocr_blocks,
         });
@@ -190,6 +202,9 @@ pub(super) async fn run_explore(args: Value) -> Result<String> {
             "truncated": total_nodes >= MAX_TREE_NODES,
             "self_drawn": self_drawn,
             "ocr_used": ocr_used,
+            // 第 109 轮:web 内容正向信号 + 建树等待观测(TUI/QC/Debug 消费)
+            "web_content": web_content,
+            "warmup_ms": warmup_ms,
         });
 
         let mut body = json!({
@@ -208,16 +223,19 @@ pub(super) async fn run_explore(args: Value) -> Result<String> {
             body["ocr_blocks"] = json!(ocr_blocks_to_value(&ocr_blocks, &window_info));
         }
         // 第 101 轮:self_drawn 场景生成专属 next_action,强制引导 chat_send/chat_loop。
+        // 第 109 轮:屏录未授权分支补 read_text(剪贴板读取路线)—— 发送 + 读取闭环,
+        // Electron 空壳树下任务依然可完成。
         let next_action_text = if self_drawn {
             if !capability.ocr_screenshot_cgwindow {
                 // 自绘 UI + 屏录未授权:AX 与视觉路线均不可用,唯一正确路径是 chat_send
                 format!(
                     "⚠️ 自绘 UI 检测到(self_drawn=true,屏录未授权):AX 树与视觉路线均不可用。\
-                     唯一正确路径: chat_send(window_id={}, text=...) 一调用完成\
-                     (自动选 osascript_fallback 路线,不依赖截图);\
-                     多轮聊天: chat_loop(window_id={}, messages, interval_seconds=30, chat_log_path=...)。\
+                     发送: chat_send(window_id={}, text=...) 一调用完成(自动选 osascript_fallback 路线,\
+                     不依赖截图);多轮聊天: chat_loop(window_id={}, messages, interval_seconds=30, chat_log_path=...)。\
+                     读取对话返回结果: read_text(window_id={}, expect_contains=\"关键词\", timeout_ms=30000)\
+                     (剪贴板路线,等待 AI 回复流完后读取)。\
                      ❌ 禁止继续 inspect/osascript_run/ocr(全部无效,浪费迭代)。",
-                    window_info.id, window_info.id
+                    window_info.id, window_info.id, window_info.id
                 )
             } else {
                 // 自绘 UI + 屏录授权:走 OCR 视觉路线
@@ -283,8 +301,15 @@ fn launch_for_explore(
 }
 
 /// 递归收集所有可操作控件(走 inspect.rs 的 has_actionable_controls 同款角色表)。
+///
+/// 第 109 轮:红绿灯按钮(无名称 + ≤24×24,豆包实测 3 个 16×16 标题栏按钮)
+/// 不计入 actionable —— 否则 Electron 空壳树 actionable=3,self_drawn 永为 false,
+/// 「chat_send 唯一路径」引导(第 101 轮)从不触发,LLM 继续无效探索。
 fn collect_actionable(root: &ControlNode) -> Vec<ControlNode> {
     fn walk(n: &ControlNode, out: &mut Vec<ControlNode>) {
+        if crate::agent::window::is_traffic_light_button(n) {
+            return;
+        }
         if !n.role.is_empty() && is_actionable_role(&n.role) {
             out.push(n.clone());
         }

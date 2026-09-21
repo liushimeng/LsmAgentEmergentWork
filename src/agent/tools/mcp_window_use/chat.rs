@@ -145,6 +145,9 @@ pub(super) fn infer_app_name_from_process(process_name: &str) -> Option<String> 
     if lower.contains("wechat") || lower.contains("weixin") || process_name.contains("微信") {
         return Some("WeChat".to_string());
     }
+    if lower.contains("doubao") || process_name.contains("豆包") {
+        return Some("Doubao".to_string());
+    }
     if lower.contains("dingtalk") || process_name.contains("钉钉") {
         return Some("DingTalk".to_string());
     }
@@ -153,6 +156,9 @@ pub(super) fn infer_app_name_from_process(process_name: &str) -> Option<String> 
     }
     if lower.contains("qq") || process_name.contains("QQ") {
         return Some("QQ".to_string());
+    }
+    if lower.contains("meeting") || process_name.contains("会议") {
+        return Some("腾讯会议".to_string());
     }
     None
 }
@@ -453,7 +459,8 @@ pub(super) async fn run_chat_send(args: Value) -> Result<String> {
         let wid_for_click = window_id.clone();
         let res = tokio::task::spawn_blocking(move || -> Result<(i64, i64)> {
             let info = lookup_window_info(&wid_for_click)?;
-            Ok(estimate_input_point(&info.bounds))
+            // 第 109 轮:按进程名选布局覆盖(豆包=底部居中输入区)
+            Ok(estimate_input_point_for(&info.process_name, &info.bounds))
         }).await;
         match res {
             Ok(Ok(p)) => Some(p),
@@ -758,6 +765,23 @@ pub(super) fn estimate_input_point(bounds: &Rect) -> (i64, i64) {
     )
 }
 
+/// 第 109 轮:按进程名选输入框布局覆盖,再估算坐标。
+///
+/// 豆包等 Electron 聊天 UI 的输入框是**底部居中大输入区**(非 IM 右栏形态),
+/// 默认 (0.72, 0.88) 会点到输入区右缘甚至消息区;豆包用 (0.50, 0.90)。
+pub(super) fn estimate_input_point_for(process_name: &str, bounds: &Rect) -> (i64, i64) {
+    let lower = process_name.to_lowercase();
+    let (fx, fy) = if lower.contains("doubao") || process_name.contains("豆包") {
+        (0.50, 0.90)
+    } else {
+        (0.72, 0.88)
+    };
+    (
+        bounds.x + (bounds.width as f64 * fx) as i64,
+        bounds.y + (bounds.height as f64 * fy) as i64,
+    )
+}
+
 /// window_id → 最新 WindowInfo(list_windows 现查,保证 bounds 新鲜)。
 fn lookup_window_info(window_id: &str) -> Result<crate::agent::window::WindowInfo> {
     let driver = current_driver();
@@ -785,7 +809,15 @@ fn lookup_window_info(window_id: &str) -> Result<crate::agent::window::WindowInf
 ///    消除「会话切换后焦点不在输入框」的盲打;
 /// 4. keystroke 后二次校验 frontmost,丢失则落盘 [FOCUS_LOST] + 重激活重试一次。
 ///
-/// 步骤:activate(osascript)→ ensure_frontmost → click 输入框(CGEvent)
+/// 第 109 轮改动(根治「消息打进别的软件」残余风险):
+/// 5. 激活改 **pid 制** —— 旧实现按应用名 activate,映射表查不到时兜底
+///    "WeChat"(豆包实测必错,激活的是微信)。现改为从 window_id 解析 pid,用
+///    System Events `set frontmost of (first application process whose unix id is
+///    {pid})` 定位(与 bring_to_front 同源,不会认错应用);app_name 仅作日志,
+///    查不到记 "unknown",不再猜测。
+/// 6. 输入框聚焦点击按进程名选布局覆盖(豆包底部居中输入区,见 estimate_input_point_for)。
+///
+/// 步骤:pid 前置(System Events)→ ensure_frontmost → click 输入框(CGEvent)
 /// → keystroke(Unicode)→ frontmost 复检 → key code 36 (Return)。
 async fn run_osascript_fallback_send(
     window_id: &str,
@@ -793,11 +825,10 @@ async fn run_osascript_fallback_send(
     submit_key: &str,
     chat_log_path: &str,
 ) -> Result<String> {
-    // 第 87 轮:window_id 是 pid:wid 形态时先经窗口列表拿进程名再推断,
-    // 避免对非微信应用误默认 "WeChat"。
+    // 第 109 轮:app_name 仅作日志;激活不再按名(见函数头注释第 5 点)。
     let app_name = infer_target_app_name(window_id)
         .or_else(|| infer_app_name_from_window_list(window_id))
-        .unwrap_or_else(|| "WeChat".to_string());
+        .unwrap_or_else(|| "unknown".to_string());
     let ts0 = now_unix();
 
     let fail = |stage: &str, err: &str| -> AgentError {
@@ -819,13 +850,19 @@ async fn run_osascript_fallback_send(
         )
     };
 
-    // 1. activate(恢复最小化 + 提到前台;Apple Events 不受 AX 门禁)
-    let activate = osascript_exec(
-        &format!("tell application \"{}\" to activate", escape_applescript_string(&app_name)),
-        5000,
-    )?;
-    if !activate.ok {
-        return Err(fail("activate", &activate.stderr));
+    // 1. 前置到前台(pid 制;AX 已授权前提下的 System Events 调用,不会认错应用)。
+    //    window_id 形如 "{pid}:{idx}";pid 解析失败时跳过本步,交由 ensure_frontmost
+    //    的 bring_to_front(内部同样是 pid 制)兜底。
+    if let Some(pid) = window_id.split_once(':').and_then(|(p, _)| p.parse::<i32>().ok()) {
+        let frontmost = osascript_exec(
+            &format!(
+                "tell application \"System Events\" to set frontmost of (first application process whose unix id is {pid}) to true"
+            ),
+            5000,
+        )?;
+        if !frontmost.ok {
+            return Err(fail("activate", &frontmost.stderr));
+        }
     }
     std::thread::sleep(Duration::from_millis(200));
 
@@ -842,13 +879,14 @@ async fn run_osascript_fallback_send(
         ));
     }
 
-    // 3. 点击输入框聚焦(coordinate_input 可用时;失败降级 warn 不阻断)
+    // 3. 点击输入框聚焦(coordinate_input 可用时;失败降级 warn 不阻断)。
+    //    第 109 轮:按进程名选布局覆盖(豆包=底部居中输入区,其余=IM 右栏形态)。
     let cap = probe_capability();
     if cap.coordinate_input {
         let wid = window_id.to_string();
         let click_res = run_blocking(MCP_WINDOW_USE_TOOL_NAME, move || {
             let info = lookup_window_info(&wid)?;
-            let (px, py) = estimate_input_point(&info.bounds);
+            let (px, py) = estimate_input_point_for(&info.process_name, &info.bounds);
             current_driver().act(
                 &wid,
                 "/",
