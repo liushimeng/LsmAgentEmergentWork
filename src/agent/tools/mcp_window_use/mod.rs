@@ -90,6 +90,13 @@ pub fn expand_window_query(query: &str) -> Vec<String> {
             }
         }
     }
+    if lower.contains("doubao") || query.contains("豆包") {
+        for alias in ["Doubao", "豆包"] {
+            if !out.iter().any(|s| s.eq_ignore_ascii_case(alias)) {
+                out.push(alias.to_string());
+            }
+        }
+    }
     out
 }
 

@@ -659,13 +659,22 @@ pub(super) fn apply_retry_hint_overlay(input: &mut SubFlowInput, local_hint: &st
             failed_methods.join(" → ")
         )
     };
+    // 第 107 轮:Window/Web 混用是桌面任务的高成本失败根因。QC 同时提到两个工具
+    // 时,必须明确“桌面目标不降级为 Web”;纯 Web 任务不受该护栏影响。
+    let tool_route_guard = if local_hint.contains("MCP_Window_Use") && local_hint.contains("MCP_Web_Use") {
+        "\n🚫 桌面目标路由护栏:目标仍是独立桌面软件时,禁止把 MCP_Web_Use 作为完成证据;\
+         必须根据 MCP_Window_Use 的真实错误修正 app_name/bundle_id/query 后继续。"
+    } else {
+        ""
+    };
     input.description = format!(
-        "{}{}\n第 {} 轮局部重试,失败原因,必须改变策略改变策略\n{}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。{}",
+        "{}{}\n第 {} 轮局部重试,失败原因,必须改变策略改变策略\n{}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。{}{}",
         base,
         HINT_MARK,
         next_attempt,
         local_hint,
-        anti_repeat
+        anti_repeat,
+        tool_route_guard
     );
 }
 

@@ -73,6 +73,9 @@ pub(super) const DESKTOP_GUI_STRICT_KEYWORDS: &[&str] = &[
     "lark",
     "wecom",
     "企业微信",
+    // 豆包有桌面/Web 双形态;未显式说 Web/网址时先按独立桌面应用处理。
+    "豆包",
+    "doubao",
 ];
 
 /// 2026-09-17 第 75 轮:Web DOM 通用词 —— 在 Web 场景同样存在,不应作为 GUI 强证据。

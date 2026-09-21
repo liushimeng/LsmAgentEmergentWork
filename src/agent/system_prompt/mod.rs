@@ -459,7 +459,11 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
   (此类过度拆解会被 QC 以「验收不可机器验证」判 Fail,触发整任务回流重试)。
 - 验收可执行:每条 acceptance 必须给出可机器执行的判定命令或明确的
   文件存在 / 关键字命中条件;禁止「echo $? == 0」这类恒真断言
-  (echo 自身退出码恒 0),退出码断言应写「执行 X 后退出码为 0」。"#;
+  (echo 自身退出码恒 0),退出码断言应写「执行 X 后退出码为 0」。
+- 桌面目标保真:用户指向独立桌面软件(微信/钉钉/飞书/豆包/QQ 等)且未明确说
+  「网页/Web 版」时,所有 UI workflow 必须锚定 `MCP_Window_Use`;`MCP_Web_Use`
+  只处理明确网页任务,不得在桌面 open/explore 失败后当作等价降级。启动失败
+  应保留真实错误、已尝试 bundle/别名,并在下一轮修正应用身份。"#;
 
 fn main_work_tools_hint() -> &'static str {
     "工具调用规范:\n\

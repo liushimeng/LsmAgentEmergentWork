@@ -117,7 +117,7 @@ impl MainWorkRunner {
         // 2026-09-19 第93轮: 第(3)条修正 —— 长等待正确载体是 run_sequence(单步≤30s)/chat_loop,
         // input_batch wait ≤5s 仅限步骤间节奏(实测 SubAgent 按旧指引 input_batch 20×30s wait 第 1 步即败);
         // 新增第(4)条 —— 首响应直接输出 JSON,禁止先探索(实测浪费 36s 一次 LLM 往返)。
-        prompt.push_str(&format!("【Main-Work 任务编排 · 第93轮】四条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop / run_sequence wait(单步≤30s)编排节奏,严禁 Bash sleep 循环;input_batch wait ≤5s 仅限步骤间节奏微调;(4)首次响应直接输出 JSON 编排,禁止先调用 Read/Bash 探索——任务所需信息已全部在本提示中。\n"));
+        prompt.push_str(&format!("【Main-Work 任务编排 · 第107轮】五条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop / run_sequence wait(单步≤30s)编排节奏,严禁 Bash sleep 循环;input_batch wait ≤5s 仅限步骤间节奏微调;(4)首次响应直接输出 JSON 编排,禁止先调用 Read/Bash 探索——任务所需信息已全部在本提示中;(5)独立桌面软件目标(含豆包/Doubao)必须锚定 MCP_Window_Use,禁止改写为 MCP_Web_Use/网页任务。\n"));
         if let Some(orig) = original_prompt.filter(|s| !s.trim().is_empty()) {
             prompt.push_str(&format!("第一性事实 · 用户原始输入(必读):\n{orig}\n"));
         }

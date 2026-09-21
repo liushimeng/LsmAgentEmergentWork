@@ -223,6 +223,17 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
                         parts.push(format!("filter={}", truncate_progress_text(&f, 16)));
                     }
                 }
+                "explore" | "run_sequence" | "input_batch" | "chat_send" | "chat_loop" => {
+                    if let Some(w) = g("window_id") {
+                        parts.push(format!("win={}", truncate_progress_text(&w, 16)));
+                    }
+                    push_window_composite_core(obj, &mut parts);
+                    if matches!(action.as_str(), "chat_send" | "chat_loop") {
+                        if let Some(t) = g("text") {
+                            parts.push(format!("text={}", truncate_progress_text(&t, 16)));
+                        }
+                    }
+                }
                 "ocr" | "screenshot" => {
                     if let Some(w) = g("window_id") {
                         parts.push(format!("win={}", truncate_progress_text(&w, 16)));
@@ -247,7 +258,15 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
                 }
                 _ => {}
             }
-            truncate_progress_text(&parts.join(" "), 60)
+            // run_sequence/input_batch 的错误策略比步骤明细更能解释失败链路。
+            if matches!(action.as_str(), "run_sequence" | "input_batch") {
+                if let Some(e) = g("on_error") {
+                    parts.push(format!("on_error={e}"));
+                }
+            }
+            // 复合 action 需要多保留 log/snapshot 路径;外层仍强制截断,
+            // 保持 TUI 一行可读。
+            truncate_progress_text(&parts.join(" "), 110)
         }
         _ => {
             // 通用 fallback: 提取已知的几个关键字段
@@ -289,6 +308,58 @@ pub(super) fn failure_usage(_failure: &QualityFailure) -> Usage {
     // QC fail 时由 QualityFailure 携带 SubAgent + QC 用量;Agent 错误路径为默认零。
     // 外层调用方只累加一次,避免与下一次执行层返回值重复计算。
     _failure.usage.clone()
+}
+
+/// MCP_Window_Use 复合 action 的最小核心字段:定位窗口 + 批量规模 + 产物路径。
+fn push_window_composite_core(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    parts: &mut Vec<String>,
+) {
+    let g = |k: &str| {
+        obj.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(q) = g("query") {
+        parts.push(format!("query={}", truncate_progress_text(&q, 20)));
+    }
+    if let Some(app) = g("app_name") {
+        parts.push(format!("app={}", truncate_progress_text(&app, 20)));
+    }
+    if let Some(label) = g("snapshot_label") {
+        parts.push(format!("label={}", truncate_progress_text(&label, 16)));
+    }
+    if let Some(path) = g("snapshot_path")
+        .or_else(|| g("log_path"))
+        .or_else(|| g("chat_log_path"))
+    {
+        parts.push(format!("out={}", truncate_progress_text(&path, 36)));
+    }
+    if let Some(count) = obj
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .or_else(|| {
+            obj.get("messages")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        })
+    {
+        parts.push(format!("n={count}"));
+    }
+    if let Some(count) = obj.get("max_rounds").and_then(serde_json::Value::as_u64) {
+        parts.push(format!("rounds<={count}"));
+    }
+    if let Some(secs) = obj
+        .get("interval_seconds")
+        .and_then(serde_json::Value::as_u64)
+    {
+        parts.push(format!("interval={secs}s"));
+    }
+    if let Some(path) = g("input_field_path") {
+        parts.push(format!("path={}", truncate_progress_text(&path, 14)));
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +496,29 @@ mod tests {
             r#"{"action":"control","window_id":"682:0","path":"/","control_action":"click_point","x":812,"y":402}"#,
         );
         assert!(s.contains("@812,402"), "实际: {s}");
+    }
+
+    #[test]
+    fn tool_args_digest_window_sequence_and_explore_core_fields() {
+        // 第 107 轮:复合 action 不展示全量 steps,但必须能定位窗口/产物/规模。
+        let s = tool_args_digest(
+            "MCP_Window_Use",
+            r#"{"action":"run_sequence","window_id":"918:0","steps":[1,2,3],"on_error":"retry","log_path":"/tmp/laew_sequence.log"}"#,
+        );
+        assert!(s.contains("action=run_sequence"), "实际: {s}");
+        assert!(s.contains("win=918:0"), "实际: {s}");
+        assert!(s.contains("n=3"), "实际: {s}");
+        assert!(s.contains("on_error=retry"), "实际: {s}");
+        assert!(s.contains("out=/tmp/laew_sequence.log"), "实际: {s}");
+
+        let s = tool_args_digest(
+            "MCP_Window_Use",
+            r#"{"action":"explore","query":"豆包","snapshot_path":"/tmp/snapshot.json","snapshot_label":"doubao"}"#,
+        );
+        assert!(s.contains("action=explore"), "实际: {s}");
+        assert!(s.contains("query=豆包"), "实际: {s}");
+        assert!(s.contains("label=doubao"), "实际: {s}");
+        assert!(s.contains("out=/tmp/snapshot.json"), "实际: {s}");
     }
 
     #[test]

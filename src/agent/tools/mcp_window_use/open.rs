@@ -250,8 +250,8 @@ const KNOWN_BUNDLE_IDS: &[(&str, &str)] = &[
     ("腾讯文档", "com.tencent.tdocument"),
     ("TencentDocs", "com.tencent.tdocument"),
     // 字节系
-    ("豆包", "com.doubao.mac"),
-    ("Doubao", "com.doubao.mac"),
+    ("豆包", "com.bot.pc.doubao"),
+    ("Doubao", "com.bot.pc.doubao"),
     // 网易
     ("网易云音乐", "com.netease.amp.mac"),
     ("NetEaseMusic", "com.netease.amp.mac"),
@@ -353,8 +353,20 @@ fn launch_desktop_app(
         let explicit_bundle = bundle_id
             .filter(|s| safe_desktop_identifier(s))
             .map(str::to_string);
-        // 优先级 b:从已知映射表反查(微信 / 钉钉 / 飞书 等)
+        // 真实安装包探测:硬编码 Bundle 表可能随厂商版本过期。先在常规
+        // Applications 目录与 Spotlight 中找实际 .app,并读取真实 Bundle ID。
+        #[cfg(target_os = "macos")]
+        let installed_apps = discover_installed_mac_apps(&candidates);
+        #[cfg(not(target_os = "macos"))]
+        let installed_apps: Vec<InstalledMacApp> = Vec::new();
+
+        // 优先级 b:从真实安装包 / 已知映射表反查(微信 / 钉钉 / 飞书 等)
         let mut resolved_bundle: Option<String> = explicit_bundle;
+        if resolved_bundle.is_none() {
+            if let Some(app) = installed_apps.iter().find(|app| app.bundle_id.is_some()) {
+                resolved_bundle = app.bundle_id.clone();
+            }
+        }
         if resolved_bundle.is_none() {
             for candidate in &candidates {
                 if let Some(b) = lookup_known_bundle_id(candidate) {
@@ -365,6 +377,23 @@ fn launch_desktop_app(
         }
 
         let mut tried: Vec<String> = Vec::new();
+
+        // 优先级 a0:真实安装包路径最可靠,不受 LaunchServices 的过期 Bundle
+        // ID 缓存影响; discovery 顺序与候选顺序一致。
+        if cfg!(target_os = "macos") {
+            for app in &installed_apps {
+                let display = format!("open {}", app.path);
+                let mut c = Command::new("open");
+                c.arg(&app.path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                match c.status() {
+                    Ok(s) if s.success() => return Ok(vec![display]),
+                    _ => tried.push(display),
+                }
+            }
+        }
 
         // 优先级 a/b:open -b(走 Bundle ID;最稳定,绕过中文 DisplayName 匹配问题)
         if let Some(ref bid) = resolved_bundle {
@@ -448,6 +477,79 @@ fn launch_desktop_app(
             "启动 {app:?} 全部失败;已尝试: {tried:?}。建议:1) 在 action=open 时显式传 bundle_id(微信=com.tencent.xinWeChat / 钉钉=com.laiwang.DingTalk / 飞书=com.bytedance.feishu);             2) 用 system_profiler SPApplicationsDataType | grep -B1 -A6 bundle 查真实 bundle id;             3) 手动启动应用后再 action=open 激活。"
         ))
     }
+}
+
+/// macOS 实际安装包记录;非 macOS 仅作空 vector 的类型占位。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledMacApp {
+    path: String,
+    bundle_id: Option<String>,
+}
+
+/// 从 Info.plist 读取真实 Bundle ID(defaults 失败时返回 None)。
+#[cfg(target_os = "macos")]
+fn installed_mac_bundle_id(path: &str) -> Option<String> {
+    let output = std::process::Command::new("defaults")
+        .arg("read")
+        .arg(format!("{path}/Contents/Info"))
+        .arg("CFBundleIdentifier")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty() && safe_desktop_identifier(&value)).then_some(value)
+}
+
+/// 按候选别名发现实际 .app,优先常规目录精确命中,Spotlight 只作兜底。
+#[cfg(target_os = "macos")]
+fn discover_installed_mac_apps(candidates: &[String]) -> Vec<InstalledMacApp> {
+    use std::path::PathBuf;
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let roots = [
+        Some(PathBuf::from("/Applications")),
+        home.as_ref().map(|h| h.join("Applications")),
+        Some(PathBuf::from("/System/Applications")),
+    ];
+    let mut out: Vec<InstalledMacApp> = Vec::new();
+    let mut push_app = |path: String, out: &mut Vec<InstalledMacApp>| {
+        if !safe_desktop_identifier(&path) || !std::path::Path::new(&path).exists() {
+            return;
+        }
+        if out.iter().any(|app| app.path == path) {
+            return;
+        }
+        out.push(InstalledMacApp {
+            path,
+            bundle_id: None,
+        });
+    };
+
+    for candidate in candidates {
+        for root in roots.iter().flatten() {
+            let path = root.join(format!("{candidate}.app"));
+            push_app(path.to_string_lossy().to_string(), &mut out);
+        }
+        if out.len() >= 3 {
+            break;
+        }
+    }
+
+    if out.is_empty() {
+        for candidate in candidates {
+            if let Some(path) = mdfind_app_path(candidate) {
+                push_app(path, &mut out);
+                break;
+            }
+        }
+    }
+
+    for app in &mut out {
+        app.bundle_id = installed_mac_bundle_id(&app.path);
+    }
+    out
 }
 
 /// 启动/激活桌面应用并等待窗口出现,返回 window_id、匹配别名、窗口数量与权限状态。

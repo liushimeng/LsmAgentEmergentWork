@@ -364,6 +364,29 @@ fn window_query_aliases_cover_localized_wechat() {
     assert_eq!(expand_window_query("Safari"), vec!["Safari".to_string()]);
 }
 
+#[test]
+fn window_query_aliases_and_bundle_id_cover_doubao() {
+    // 第 107 轮:macOS CGWindow owner/title 可能是英文 Doubao,用户输入是中文豆包。
+    assert_eq!(
+        expand_window_query("豆包"),
+        vec!["豆包".to_string(), "Doubao".to_string()]
+    );
+    assert_eq!(
+        expand_window_query("Doubao"),
+        vec!["Doubao".to_string(), "豆包".to_string()]
+    );
+    // 真实安装包 /Applications/Doubao.app 的 CFBundleIdentifier 是 com.bot.pc.doubao;
+    // 旧表 com.doubao.mac 会导致 open -b 直接失败并把 Agent 误导到 Web 版。
+    assert_eq!(
+        super::open::lookup_known_bundle_id("豆包"),
+        Some("com.bot.pc.doubao")
+    );
+    assert_eq!(
+        super::open::lookup_known_bundle_id("Doubao"),
+        Some("com.bot.pc.doubao")
+    );
+}
+
 #[tokio::test]
 #[ignore = "会启动/激活本机微信,仅人工桌面环境验证;不发送消息"]
 async fn open_finds_localized_wechat_without_sending() {
@@ -379,6 +402,25 @@ async fn open_finds_localized_wechat_without_sending() {
         value["matched_query"].as_str() == Some("WeChat")
             || value["matched_query"].as_str() == Some("微信")
     );
+}
+
+#[tokio::test]
+#[ignore = "会启动/激活本机豆包,仅人工桌面环境验证;不发送消息"]
+async fn open_finds_doubao_desktop_app() {
+    let t = McpWindowUseTool;
+    let output = t
+        .execute(json!({"action": "open", "query": "豆包", "wait_seconds": 12}))
+        .await
+        .expect("应通过真实安装包打开/激活豆包");
+    let value: Value = serde_json::from_str(&output).expect("open 应返回 JSON");
+    assert_eq!(value["ok"], json!(true));
+    assert_eq!(value["title"], json!("豆包"));
+    assert!(
+        value["process_name"] == json!("豆包") || value["process_name"] == json!("Doubao"),
+        "进程名应命中中英文别名: {}",
+        value["process_name"]
+    );
+    assert!(value["window_id"].as_str().is_some_and(|s| !s.is_empty()));
 }
 
 #[test]
