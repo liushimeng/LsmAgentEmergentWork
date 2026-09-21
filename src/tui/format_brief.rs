@@ -305,6 +305,34 @@ mod tests {
         assert_eq!(ok, "exit=0");
     }
 
+    // ===== 第 109 轮:read_text / explore web 内容摘要 =====
+
+    #[test]
+    fn brief_read_text_strategy_chars_contains() {
+        let out = r#"{"ok": true, "action": "read_text", "strategy": "clipboard", "chars": 1520, "contains_hit": true}"#;
+        let b = window_use_output_brief("", out).unwrap();
+        assert!(b.contains("strategy=clipboard"), "{b}");
+        assert!(b.contains("chars=1520"), "{b}");
+        assert!(b.contains("contains=✓"), "{b}");
+        // 未命中
+        let miss = r#"{"ok": false, "action": "read_text", "strategy": "clipboard", "chars": 0, "contains_hit": false}"#;
+        let b2 = window_use_output_brief("", miss).unwrap();
+        assert!(b2.contains("contains=✗"), "{b2}");
+    }
+
+    #[test]
+    fn brief_explore_web_content_and_warmup() {
+        let out = r#"{"ok": true, "snapshot_id": "ab12cd", "tree_summary": {"actionable_count": 0, "self_drawn": true, "web_content": false, "warmup_ms": 4800}}"#;
+        let b = window_use_output_brief("", out).unwrap();
+        assert!(b.contains("web=0"), "{b}");
+        assert!(b.contains("warmup=4800ms"), "{b}");
+        assert!(b.contains("⚠自绘UI"), "{b}");
+        // web 内容已长出
+        let ok = r#"{"ok": true, "snapshot_id": "ab12cd", "tree_summary": {"actionable_count": 12, "web_content": true}}"#;
+        let b2 = window_use_output_brief("", ok).unwrap();
+        assert!(b2.contains("web=1"), "{b2}");
+    }
+
     #[test]
     fn brief_fallback_for_unparseable_or_empty() {
         assert!(window_use_output_brief("", "not json").is_none());

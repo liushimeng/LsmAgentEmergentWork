@@ -1028,6 +1028,24 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
 mod tests {
     use super::*;
 
+    // ===== 第 109 轮:豆包 bundle id 防回归(陈旧 id 曾把 LLM 引向 open -b 必败) =====
+
+    #[test]
+    fn window_prompt_section_has_correct_doubao_bundle_id() {
+        // 陈旧 id com.doubao.mac 曾导致 LLM 显式传错 bundle_id(实测日志
+        // llaew_20260921_151442 15:18/15:24 两次 open 失败的根因 R1),此处防回归。
+        assert!(
+            !MCP_WINDOW_USE_PROMPT_SECTION.contains("com.doubao.mac"),
+            "系统提示词不得再出现陈旧 bundle id com.doubao.mac"
+        );
+        assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("com.bot.pc.doubao"));
+        // 桌面目标保真红线(第 109 轮 R5)
+        assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("桌面目标保真"));
+        assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("禁止转 MCP_Web_Use"));
+        // read_text 读取路线引导(R7)
+        assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("read_text"));
+    }
+
     #[test]
     fn render_equals_legacy_format() {
         let sp = default_system_prompt();

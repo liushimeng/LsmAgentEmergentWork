@@ -625,4 +625,48 @@ mod tests {
         // name 为空 → None
         assert!(ocr_aligned_center(&blocks, 0, 0, "").is_none());
     }
+
+    // ===== 第 109 轮:红绿灯按钮不计 actionable(Electron 空壳树 self_drawn 修复) =====
+
+    #[test]
+    fn collect_actionable_skips_traffic_light_buttons() {
+        // 豆包实测形态:窗口 + 容器链 + 3 个 16×16 无名按钮 → actionable 必须为空
+        // (self_drawn=true → 强制走 chat_send + read_text 引导)。
+        let tl = |path: &str, x: i64, y: i64| ControlNode {
+            path: path.into(),
+            role: "AXButton".into(),
+            name: String::new(),
+            bounds: Rect { x, y, width: 16, height: 16 },
+            ..Default::default()
+        };
+        let root = ControlNode {
+            path: "/".into(),
+            role: "AXWindow".into(),
+            name: "豆包".into(),
+            children: vec![
+                ControlNode {
+                    path: "/0".into(),
+                    role: "AXGroup".into(),
+                    name: "豆包".into(),
+                    children: vec![ControlNode {
+                        path: "/0/0".into(),
+                        role: "AXGroup".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                tl("/1", 1488, 498),
+                tl("/2", 1511, 498),
+                tl("/3", 1534, 498),
+            ],
+            ..Default::default()
+        };
+        assert!(collect_actionable(&root).is_empty(), "红绿灯按钮不应计入 actionable");
+        // 混入一个命名按钮后应只收集到它
+        let mut with_named = root.clone();
+        with_named.children.push(btn("/4", "发送", 900, 900, 80, 30));
+        let v = collect_actionable(&with_named);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "发送");
+    }
 }

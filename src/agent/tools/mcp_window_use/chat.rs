@@ -140,6 +140,8 @@ pub(super) fn infer_target_app_name(window_id: &str) -> Option<String> {
 ///
 /// window_id 形如 `44978:0`(pid:wid)时无法直接推断,需先 list 拿 process_name
 /// 再过本映射;微信 macOS 进程名可能是「微信」或「WeChat」。
+/// 第 109 轮:补 豆包/腾讯会议/网易云 映射;此映射仅用于日志与 telemetry ——
+/// **激活一律走 pid 制**(见 run_osascript_fallback_send),不再按应用名 activate。
 pub(super) fn infer_app_name_from_process(process_name: &str) -> Option<String> {
     let lower = process_name.to_lowercase();
     if lower.contains("wechat") || lower.contains("weixin") || process_name.contains("微信") {
@@ -810,11 +812,11 @@ fn lookup_window_info(window_id: &str) -> Result<crate::agent::window::WindowInf
 /// 4. keystroke 后二次校验 frontmost,丢失则落盘 [FOCUS_LOST] + 重激活重试一次。
 ///
 /// 第 109 轮改动(根治「消息打进别的软件」残余风险):
-/// 5. 激活改 **pid 制** —— 旧实现按应用名 activate,映射表查不到时兜底
-///    "WeChat"(豆包实测必错,激活的是微信)。现改为从 window_id 解析 pid,用
-///    System Events `set frontmost of (first application process whose unix id is
-///    {pid})` 定位(与 bring_to_front 同源,不会认错应用);app_name 仅作日志,
-///    查不到记 "unknown",不再猜测。
+/// 5. 激活改 **pid 制** —— 旧实现按应用名 activate,`tell application "X" to activate`
+///    在映射表查不到时兜底 "WeChat"(豆包实测必错,激活的是微信)。现改为从
+///    window_id 解析 pid,用 System Events `set frontmost of (first application
+///    process whose unix id is {pid})` 定位(与 bring_to_front 同源,不会认错应用);
+///    app_name 仅作日志,查不到记 "unknown",不再猜测。
 /// 6. 输入框聚焦点击按进程名选布局覆盖(豆包底部居中输入区,见 estimate_input_point_for)。
 ///
 /// 步骤:pid 前置(System Events)→ ensure_frontmost → click 输入框(CGEvent)
@@ -1364,4 +1366,404 @@ async fn ocr_right_panel(window_id: &str) -> Result<String> {
     };
     let blocks: Vec<OcrBlock> = driver.ocr_with_info(&info, Some(region), None)?;
     Ok(blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" "))
+}
+
+// ===================== read_text(2026-09-21 第 109 轮新增) =====================
+//
+// 背景:豆包实测任务第 3 步「读取对话返回的结果」结构性不可完成 —— 宿主终端
+// 辅助功能 ✅ / 屏幕录制 ❌(OCR/screenshot 全禁)+ Electron 空壳 AX 树(get_text
+// 无内容),两条既有读取路线同时不可用。
+//
+// 方案:补第三条读取路线 —— **剪贴板**:点窗口消息区(避开底部输入框)→
+// cmd+a 全选 → cmd+c 复制 → pbpaste 读取 → Escape 清选。System Events 键盘
+// 注入只需辅助功能权限;Electron 网页聊天(豆包/微信桌面版)点击消息区后
+// 焦点在 body,cmd+a 选中页面全部文本。副作用:覆盖用户剪贴板,返回体
+// clipboard_overwritten=true 明示(不自动恢复 —— 图片类剪贴板内容无法可靠还原)。
+
+/// 剪贴板读取轮询间隔(等待 expect_contains 命中时)。
+const READ_TEXT_POLL_MS: u64 = 1000;
+
+/// `action=read_text` —— 读取窗口文本(对话内容),自动按能力选路线:
+/// - `strategy=ax`(默认 auto 时树有 web 内容优先):遍历控件树收集文本类
+///   节点的 name/value;
+/// - `strategy=clipboard`:焦点守卫 → 点击消息区 → cmd+a → cmd+c → pbpaste →
+///   Escape;屏录未授权 + 空壳树时的唯一读取路线。
+/// - `expect_contains + timeout_ms`:轮询等待文本出现(AI 回复流式输出完成),
+///   首轮完整流程,后续轮只 cmd+c(选中态保持,不再点击)。
+///
+/// 参数:window_id*(必填)/ strategy?(auto|ax|clipboard)/ focus_point?(消息区
+/// 点击坐标,默认窗口 (50%w, 40%h))/ expect_contains?/ timeout_ms?(≤60000,
+/// 默认 0 即读一次)/ max_chars?(默认 8000,≤64000)。
+pub(super) async fn run_read_text(args: Value) -> Result<String> {
+    let window_id = require_str(&args, "window_id", MCP_WINDOW_USE_TOOL_NAME)?.to_string();
+    let strategy = get_str(&args, "strategy").unwrap_or("auto").to_string();
+    let focus_point = parse_point(args.get("focus_point"));
+    let expect_contains = get_str(&args, "expect_contains").map(str::to_string);
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(60_000);
+    let max_chars = args
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .unwrap_or(8000)
+        .clamp(200, 64_000) as usize;
+
+    driver_preflight(MCP_WINDOW_USE_TOOL_NAME).await?;
+
+    let valid_strategy = matches!(strategy.as_str(), "auto" | "ax" | "clipboard");
+    if !valid_strategy {
+        return Err(tool_err(
+            MCP_WINDOW_USE_TOOL_NAME,
+            format!("strategy 非法: {strategy:?};合法值: auto / ax / clipboard"),
+        ));
+    }
+
+    // 路线选择:auto 时先看 AX 树是否有 web 内容(浅树/空壳 → 剪贴板)。
+    let mut strategy_used = strategy.clone();
+    if strategy == "auto" {
+        let wid = window_id.clone();
+        let ax_has_content = run_blocking(MCP_WINDOW_USE_TOOL_NAME, move || {
+            let driver = current_driver();
+            let has = driver
+                .inspect(&wid, 6, None)
+                .map(|t| crate::agent::window::tree_has_web_content(&t))
+                .unwrap_or(false);
+            Ok(if has { "1" } else { "0" }.to_string())
+        })
+        .await
+        .map(|s| s == "1")
+        .unwrap_or(false);
+        strategy_used = if ax_has_content { "ax".into() } else { "clipboard".into() };
+    }
+
+    let started = std::time::Instant::now();
+
+    // ---- AX 路线:遍历控件树收集文本 ----
+    if strategy_used == "ax" {
+        let wid = window_id.clone();
+        let collected = run_blocking(MCP_WINDOW_USE_TOOL_NAME, move || {
+            let driver = current_driver();
+            let tree = driver.inspect(&wid, 8, None)?;
+            Ok(collect_tree_text(&tree))
+        })
+        .await;
+        match collected {
+            Ok(text) => {
+                let (text, truncated) = tail_truncate(text, max_chars);
+                let chars = text.chars().count();
+                let hit = expect_contains
+                    .as_ref()
+                    .map(|n| text.contains(n.as_str()))
+                    .unwrap_or(true);
+                return Ok(read_text_body(
+                    &window_id,
+                    "ax",
+                    text,
+                    chars,
+                    truncated,
+                    hit,
+                    false,
+                    started.elapsed().as_millis() as u64,
+                    &expect_contains,
+                    "tree walk (depth=8)",
+                ));
+            }
+            Err(e) => {
+                // AX 失败 → 降级剪贴板(macOS;其余平台直接报错)
+                if cfg!(target_os = "macos") {
+                    tracing::warn!(error = %e, "read_text AX 路线失败,降级 clipboard");
+                    strategy_used = "clipboard".into();
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // ---- 剪贴板路线(macOS pbpaste / Windows Get-Clipboard) ----
+    if strategy_used == "clipboard" {
+        if !cfg!(any(target_os = "macos", target_os = "windows")) {
+            return Err(tool_err(
+                MCP_WINDOW_USE_TOOL_NAME,
+                "read_text clipboard 路线仅 macOS / Windows 可用;Linux 请改用 strategy=ax",
+            ));
+        }
+        // 前台守卫:读取前必须前台(点击/键盘都投递到焦点应用)
+        let guard = ensure_frontmost(&window_id).await?;
+        if !guard.frontmost {
+            let body = json!({
+                "ok": false,
+                "window_id": window_id,
+                "stage": "focus_acquire",
+                "error": format!("窗口前置后 {}ms 内仍未前台,已放弃读取(防止全选/复制打到其他软件)", guard.elapsed_ms),
+                "next_action": "稍后重试 read_text,或 action=open 重新激活目标窗口",
+            });
+            return Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into()));
+        }
+
+        let mut first_round = true;
+        loop {
+            let wid = window_id.clone();
+            let fp = focus_point;
+            let do_click = first_round;
+            let read = run_blocking(MCP_WINDOW_USE_TOOL_NAME, move || {
+                // run_blocking 约定闭包返回 Result<String>;把 (text, desc)
+                // 序列化为 JSON 数组字符串传出,调用方再解析回二元组。
+                clipboard_read_once(&wid, do_click, fp).map(|(text, desc)| {
+                    serde_json::to_string(&(text, desc)).unwrap_or_else(|_| "[]".into())
+                })
+            })
+            .await?;
+            let (raw, click_desc): (String, String) =
+                serde_json::from_str(&read).unwrap_or((String::new(), String::new()));
+            let (text, truncated) = tail_truncate(raw, max_chars);
+            let chars = text.chars().count();
+            let hit = expect_contains
+                .as_ref()
+                .map(|n| text.contains(n.as_str()))
+                .unwrap_or(true);
+            let waited_ms = started.elapsed().as_millis() as u64;
+            if hit || timeout_ms == 0 || waited_ms >= timeout_ms {
+                return Ok(read_text_body(
+                    &window_id,
+                    "clipboard",
+                    text,
+                    chars,
+                    truncated,
+                    hit,
+                    true,
+                    waited_ms,
+                    &expect_contains,
+                    &click_desc,
+                ));
+            }
+            first_round = false;
+            tracing::debug!(
+                waited_ms,
+                timeout_ms,
+                "read_text 未命中 expect_contains,1s 后仅重复制再查(选中态保持)",
+            );
+            std::thread::sleep(Duration::from_millis(READ_TEXT_POLL_MS));
+        }
+    }
+
+    Err(tool_err(
+        MCP_WINDOW_USE_TOOL_NAME,
+        format!("read_text 内部路线异常: strategy_used={strategy_used:?}"),
+    ))
+}
+
+/// 文本超长时保留**尾部**(对话内容向底部追加,最新回复在末尾),头部以省略标注。
+fn tail_truncate(text: String, max_chars: usize) -> (String, bool) {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return (text, false);
+    }
+    let skipped = total - max_chars;
+    let tail: String = text.chars().skip(skipped).collect();
+    (
+        format!("…[已截断,省略前 {skipped} 字符,保留尾部 {max_chars} 字符]…\n{tail}"),
+        true,
+    )
+}
+
+/// AX 路线:深度优先收集文本类节点的 name/value(截断由 tail_truncate 统一处理)。
+fn collect_tree_text(root: &crate::agent::window::ControlNode) -> String {
+    fn walk(n: &crate::agent::window::ControlNode, out: &mut String) {
+        let r = n.role.trim().to_ascii_lowercase();
+        let r = r.strip_prefix("ax").unwrap_or(&r);
+        let text_like = [
+            "statictext", "textarea", "textfield", "webarea", "text", "cell", "row",
+            "button", "menuitem", "heading",
+        ]
+        .iter()
+        .any(|k| r.contains(k));
+        if text_like {
+            for part in [&n.value, &n.name] {
+                let p = part.trim();
+                if !p.is_empty() {
+                    out.push_str(p);
+                    out.push('\n');
+                }
+            }
+        }
+        for c in &n.children {
+            walk(c, out);
+        }
+    }
+    let mut out = String::new();
+    walk(root, &mut out);
+    out
+}
+
+/// 剪贴板路线单轮:`do_click=true`(首轮)先点击消息区把焦点移出输入框;
+/// 后续轮(do_click=false)选中态保持,直接 cmd+c 再查。
+/// 返回 (剪贴板文本, 点击点描述)。
+fn clipboard_read_once(
+    window_id: &str,
+    do_click: bool,
+    focus_point: Option<(i64, i64)>,
+) -> Result<(String, String)> {
+    let driver = current_driver();
+    let mut click_desc = String::new();
+    if do_click {
+        // 点击消息区(focus_point 或默认估算:窗口 50% 宽 / 40% 高,避开底部
+        // 输入框与顶部工具栏,落在消息列表中部)。
+        let info = lookup_window_info(window_id)?;
+        let (px, py) = focus_point.unwrap_or_else(|| {
+            (
+                info.bounds.x + (info.bounds.width as f64 * 0.50) as i64,
+                info.bounds.y + (info.bounds.height as f64 * 0.40) as i64,
+            )
+        });
+        driver.act(
+            window_id,
+            "/",
+            crate::agent::window::ControlAction::ClickPoint {
+                x: px,
+                y: py,
+                modifiers: None,
+            },
+        )?;
+        click_desc = format!("click=({px},{py}) cmd+a cmd+c pbpaste");
+        std::thread::sleep(Duration::from_millis(120));
+    } else {
+        click_desc = "cmd+c pbpaste(选中态保持,复检)".into();
+    }
+    // cmd+a 全选 → cmd+c 复制(焦点在 body 时选中页面全部文本)
+    driver.act(
+        window_id,
+        "/",
+        crate::agent::window::ControlAction::SendKeys("cmd+a".into()),
+    )?;
+    std::thread::sleep(Duration::from_millis(80));
+    driver.act(
+        window_id,
+        "/",
+        crate::agent::window::ControlAction::SendKeys("cmd+c".into()),
+    )?;
+    std::thread::sleep(Duration::from_millis(300));
+    // 读取剪贴板
+    let text = read_clipboard_text()?;
+    // Escape 清除全选态(还原视觉状态;失败不阻断)
+    let _ = driver.act(
+        window_id,
+        "/",
+        crate::agent::window::ControlAction::SendKeys("escape".into()),
+    );
+    Ok((text, click_desc))
+}
+
+/// 读取系统剪贴板文本(macOS: pbpaste;Windows: powershell Get-Clipboard)。
+fn read_clipboard_text() -> Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("pbpaste")
+            .output()
+            .map_err(|e| tool_err(MCP_WINDOW_USE_TOOL_NAME, format!("执行 pbpaste 失败: {e}")))?;
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Clipboard"])
+            .output()
+            .map_err(|e| {
+                tool_err(MCP_WINDOW_USE_TOOL_NAME, format!("执行 Get-Clipboard 失败: {e}"))
+            })?;
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err(tool_err(
+            MCP_WINDOW_USE_TOOL_NAME,
+            "剪贴板读取仅 macOS / Windows 可用",
+        ))
+    }
+}
+
+/// 组装 read_text 返回体。
+#[allow(clippy::too_many_arguments)]
+fn read_text_body(
+    window_id: &str,
+    strategy: &str,
+    text: String,
+    chars: usize,
+    truncated: bool,
+    hit: bool,
+    clipboard_overwritten: bool,
+    elapsed_ms: u64,
+    expect_contains: &Option<String>,
+    detail: &str,
+) -> String {
+    let body = json!({
+        "ok": hit,
+        "action": "read_text",
+        "window_id": window_id,
+        "strategy": strategy,
+        "chars": chars,
+        "text": text,
+        "contains_hit": hit,
+        "expect_contains": expect_contains,
+        "elapsed_ms": elapsed_ms,
+        "truncated": truncated,
+        "clipboard_overwritten": clipboard_overwritten,
+        "detail": detail,
+        "next_action": if hit {
+            "文本已读取(text 字段);对话任务可基于此内容撰写报告/回答用户".to_string()
+        } else if expect_contains.is_some() {
+            "expect_contains 未命中(回复可能尚未流完):加大 timeout_ms 重试,或先等 10-20s 再读一次;\
+             仍为空时传 focus_point 点击消息列表中部后重试".to_string()
+        } else {
+            "文本已读取(text 字段)".to_string()
+        },
+    });
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())
+}#[cfg(test)]
+mod read_text_tests {
+    use super::*;
+
+    // ===== 第 109 轮:豆包映射 + 输入点布局覆盖 =====
+
+    #[test]
+    fn infer_app_name_maps_doubao() {
+        assert_eq!(infer_app_name_from_process("豆包").as_deref(), Some("Doubao"));
+        assert_eq!(infer_app_name_from_process("Doubao").as_deref(), Some("Doubao"));
+        assert_eq!(infer_app_name_from_process("WeChat").as_deref(), Some("WeChat"));
+        assert_eq!(infer_app_name_from_process("微信").as_deref(), Some("WeChat"));
+        assert_eq!(infer_app_name_from_process("腾讯会议").as_deref(), Some("腾讯会议"));
+        assert_eq!(infer_app_name_from_process("未知应用"), None);
+    }
+
+    #[test]
+    fn estimate_input_point_overrides_doubao_layout() {
+        let b = Rect { x: 1471, y: 478, width: 1744, height: 1110 };
+        // 豆包:底部居中输入区 (0.50, 0.90)
+        let (dx, dy) = estimate_input_point_for("豆包", &b);
+        assert_eq!(dx, 1471 + 872);
+        assert_eq!(dy, 478 + 999);
+        // 默认 IM 右栏形态 (0.72, 0.88)
+        let (wx, wy) = estimate_input_point_for("WeChat", &b);
+        assert_eq!(wx, 1471 + (1744.0_f64 * 0.72) as i64);
+        assert_eq!(wy, 478 + (1110.0_f64 * 0.88) as i64);
+        // 旧入口保持兼容
+        let (ox, oy) = estimate_input_point(&b);
+        assert_eq!((ox, oy), (wx, wy));
+    }
+
+    #[test]
+    fn tail_truncate_keeps_tail_for_chat_replies() {
+        // 对话内容向底部追加:截断必须保尾部
+        let long = "旧内容。".repeat(4000) + "最新回复:黄金上涨";
+        let (out, truncated) = tail_truncate(long.clone(), 100);
+        assert!(truncated);
+        assert!(out.contains("黄金上涨"), "尾部必须保留: {out}");
+        assert!(out.contains("省略前"));
+        // 不超长原样返回
+        let (same, truncated2) = tail_truncate("短文本".to_string(), 100);
+        assert_eq!(same, "短文本");
+        assert!(!truncated2);
+    }
 }
