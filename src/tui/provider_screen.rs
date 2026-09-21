@@ -138,7 +138,16 @@ impl TuiSession {
                     }
                     return Ok(Some(msg));
                 }
-                Outcome::Quit => std::process::exit(0),
+                Outcome::Quit => {
+                    // 第 108 轮:不再 std::process::exit(0)(会跳过 leave_alt 与 Drop 链),
+                    // 改为弹光栈 → 触发 shutdown 协调器 → 由主循环统一退出。
+                    // 这样保证 leave_alt() 在调用点正常执行 + Drop 链自动跑。
+                    while let Some(mut s) = stack.pop() {
+                        s.on_exit();
+                    }
+                    crate::shutdown::global().trigger(crate::shutdown::ShutdownReason::Internal);
+                    return Ok(None);
+                }
             }
         }
         Ok(None)

@@ -20,6 +20,7 @@ pub mod error;
 pub mod llm;
 pub mod logging;
 pub mod session;
+pub mod shutdown;
 #[cfg(test)]
 pub mod test_support;
 pub mod tui;

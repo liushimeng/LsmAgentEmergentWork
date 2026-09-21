@@ -426,39 +426,23 @@ async fn run_one_shot(
     //   - 旧实现「第一次设 token、await 第二次 Ctrl+C 才 exit 130」在 mock 延迟场景
     //     会阻塞进程直到测试超时发 SIGKILL(rc=137),导致 §10 全部 5 项失败。
     let cancel = lsm_agent::agent::cancel::CancelToken::new();
-    let sig_cancel = cancel.clone();
-    // 第 78 轮:修改 Ctrl+C 处理,先清理浏览器再退出,避免孤儿 Chrome 进程泄漏。
-    let sig_task = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_err() {
+    // 第 108 轮:把 cancel 接到全局 shutdown 协调器,这样 SIGINT/SIGTERM/SIGHUP
+    // 任一信号触发都会自动 cancel 当前任务。不再各自 std::process::exit,
+    // 让 main 走正常 return 路径,Drop 链 + 终端还原全部生效。
+    let shutdown_sig = lsm_agent::shutdown::global();
+    // 当 shutdown 已触发时,本地 cancel token 也立即 cancel(双绑)
+    let cancel_already = shutdown_sig.is_triggered();
+    let cancel_for_task = cancel.clone();
+    let shutdown_for_link = shutdown_sig.clone();
+    tokio::spawn(async move {
+        if cancel_already {
+            cancel_for_task.cancel();
             return;
         }
-        sig_cancel.cancel();
-        // 等待任务取消完成(给 orchestrator 时间响应 Cancelled),再清理浏览器。
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        // 清理浏览器子进程(launch 模式),防止孤儿进程泄漏。
-        lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
-        eprintln!("[laew] 任务已取消(用户中断)");
-        std::process::exit(130);
+        let reason = shutdown_for_link.wait().await;
+        tracing::info!("[shutdown] reason={} forwarding to cancel token", reason.as_str());
+        cancel_for_task.cancel();
     });
-    // 第 78 轮:新增 SIGTERM handler(kill 默认信号),同样清理浏览器后退出。
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let sigterm_cancel = cancel.clone();
-        tokio::spawn(async move {
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            sigterm.recv().await;
-            sigterm_cancel.cancel();
-            // 等待取消传播 + 清理浏览器。
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
-            eprintln!("[laew] 收到 SIGTERM,正在退出");
-            std::process::exit(128 + 15); // 128 + SIGTERM
-        });
-    }
     // 阶段进度(stderr 立即打印,stdout 保持只含答案与用量;与等待心跳同流,
     // 2026-09-10 第 23 轮 D05/D07 测试轮)
     let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -473,20 +457,27 @@ async fn run_one_shot(
     {
         Ok(o) => o,
         Err(e) if matches!(e, lsm_agent::error::AgentError::Cancelled) => {
-            sig_task.abort();
             let _ = stage_printer.await;
-            // 第 78 轮:取消路径也清理浏览器(双重保险,async 路径可能先于 sig_task 完成)。
+            // 第 108 轮:不再"裸" std::process::exit (会跳过 Drop 链 + 终端还原)。
+            // 先:
+            //   1) 显式调 terminal_restore_sync() —— 把 alt screen/raw mode/
+            //      滚动区/光标 全部还原(ANSI 序列 flush,无 raw mode 状态)。
+            //   2) 显式 BrowserManager::global().shutdown().await —— 清理浏览器
+            //      子进程(防止孤儿进程)。
+            //   3) 打 stderr 提示。
+            // 再 std::process::exit(130) —— 这是「已经 graceful 过了」+ 退出码
+            // 130 (128+SIGINT 惯例, e2e 用例断言 rc=130)。atexit handler
+            // (libc::atexit 装的 BrowserManager::cleanup_sync) 仍会跑兜底。
+            lsm_agent::shutdown::terminal_restore_sync();
             lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
             eprintln!("[laew] 任务已取消(用户中断)");
             std::process::exit(130);
         }
         Err(e) => {
-            sig_task.abort();
             let _ = stage_printer.await;
             return Err(anyhow::Error::from(e));
         }
     };
-    sig_task.abort();
     let _ = stage_printer.await;
     // 第 78 轮:任务正常完成后,清理浏览器子进程(避免长驻会话浏览器泄漏)。
     lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
@@ -798,6 +789,16 @@ async fn main() -> Result<()> {
     // SIGPIPE 必须早于任何 stdout 输出与 panic hook：`laew ... | head` 提前关闭
     // 管道是 Unix CLI 正常行为，不应进入 CrashDump 流程。
     lsm_agent::crash::restore_sigpipe_default();
+
+    // 第 108 轮:启动期安装统一信号 handler(必须在 Tokio runtime 内 + CLI 解析前)
+    //   - Unix:SIGTSTP/SIGTTIN/SIGTTOU 显式 SIG_IGN(防 Ctrl+Z suspend);
+    //     SIGINT/SIGTERM/SIGHUP 转给 shutdown 协调器。
+    //   - Windows:简化实现,留作后续接入。
+    // 失败时仅打印告警,不影响主流程。
+    let shutdown_sig = lsm_agent::shutdown::global();
+    if let Err(e) = lsm_agent::shutdown::install_signal_handlers(shutdown_sig.clone()) {
+        eprintln!("[laew] signal handler 安装失败(已忽略): {e}");
+    }
 
     // 第 78 轮:注册进程退出守卫(atexit),作为浏览器清理的 L2 兜底。
     // 覆盖正常 exit / main 返回路径;覆盖 panic 路径(crash.rs panic_hook 中也清理)。

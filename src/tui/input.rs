@@ -652,26 +652,35 @@ impl InputHandler {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Ctrl-C 双语义(第 94 轮修复):
-                            // - 空输入 + Ctrl-C → 退出程序(Unix 语义,符合用户肌肉记忆)
-                            // - 非空输入 + Ctrl-C → 清行(保留会话,原行为)
+                            // Ctrl-C 双语义(第 108 轮加强):
+                            // - 空输入 + Ctrl-C → 触发 shutdown 协调器并退出程序
+                            //   (Unix 语义,符合用户肌肉记忆)
+                            // - 非空输入 + Ctrl-C → 清空当前行 + 触发 shutdown 协调器
+                            //   (root cause:任务运行时 Ctrl+C 走 SIGINT 路径被旧实现
+                            //   「只清行」吞掉,导致 Ctrl+C 多次按后 Ctrl-Z suspend 整个
+                            //   laew → 终端僵死。本轮统一触发 shutdown 协调器,
+                            //   由主循环统一处理退出与终端还原。)
                             if buffer.is_empty() {
                                 self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
                                 teardown_pinned_layout(&mut stdout, &layout)?;
+                                crate::shutdown::global().trigger(crate::shutdown::ShutdownReason::UserInterrupt);
                                 return Ok(InputResult::Exit);
                             } else {
                                 self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
                                 self.redraw_line(&mut stdout, &layout, prompt, "", 0)?;
                                 execute!(stdout, MoveTo(0, layout.scroll_last_row()))?;
                                 stdout.flush()?;
+                                crate::shutdown::global().trigger(crate::shutdown::ShutdownReason::UserInterrupt);
                                 return Ok(InputResult::Interrupted);
                             }
                         }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             // Ctrl-D: 若输入为空则退出(还原滚动区 + 清空面板)
+                            // 第 108 轮:同时触发 shutdown 协调器,统一退出语义
                             if buffer.is_empty() {
                                 self.clear_overlay(&mut stdout, &layout, overlay_lines)?;
                                 teardown_pinned_layout(&mut stdout, &layout)?;
+                                crate::shutdown::global().trigger(crate::shutdown::ShutdownReason::UserInterrupt);
                                 return Ok(InputResult::Exit);
                             }
                         }

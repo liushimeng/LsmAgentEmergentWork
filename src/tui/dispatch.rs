@@ -422,29 +422,30 @@ impl TuiSession {
             }
         });
         let cancel = crate::agent::cancel::CancelToken::new();
-        // 任务窗口 SIGINT 监听(第 101 轮优化):第一次 Ctrl+C 立即取消 + exit(130),
-        // 与 main.rs 单轮模式行为一致。旧实现「第一次取消、等第二次才 exit」在
-        // crossterm 原始模式下 tokio::signal::ctrl_c() 可能无法再次触发,导致进程
-        // 被用户 Ctrl-Z suspend 而非正常退出。
-        let sig_cancel = cancel.clone();
-        let sig_task = tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_err() {
+        // 第 108 轮:统一走 shutdown 协调器,不再各自 std::process::exit。
+        // 全局 signal handler 已安装(SIGINT/SIGTERM/SIGHUP 转 trigger shutdown);
+        // 这里把 cancel token 绑到 shutdown:任一信号触发 → cancel 当前任务 →
+        // 编排器响应 Cancelled → 主循环 break → 终端还原 → 走正常退出路径。
+        let shutdown_sig = crate::shutdown::global();
+        let cancel_link = cancel.clone();
+        let shutdown_link = shutdown_sig.clone();
+        let already_triggered = shutdown_sig.is_triggered();
+        let link_task = tokio::spawn(async move {
+            if already_triggered {
+                cancel_link.cancel();
                 return;
             }
+            let reason = shutdown_link.wait().await;
             eprintln!();
-            eprintln!("  [laew] 收到中断信号,正在取消当前任务...");
-            sig_cancel.cancel();
-            // 给取消传播 300ms 窗口,然后强制退出(不等第二次 Ctrl-C)。
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            eprintln!("  [laew] 任务已取消(用户中断)");
-            std::process::exit(130);
+            eprintln!("  [laew] 收到中断信号({}),正在取消当前任务...", reason.as_str());
+            cancel_link.cancel();
         });
         let handle_result = self
             .orchestrator
             .handle_cancellable_with_progress(&mut self.session, &cancel, Some(stage_tx))
             .await;
-        // 任务结束:撤掉 SIGINT 监听,避免游离监听吞掉后续按键窗口外的信号
-        sig_task.abort();
+        // 任务结束:撤掉 shutdown link,避免游离监听吞掉下一次任务的触发
+        link_task.abort();
         // 阶段打印协程收尾:通道已随任务结束关闭,快速阶段静默丢弃后再输出结果块,
         // 保证 [stage] 行不会插进最终结果中间
         let _ = stage_printer.await;

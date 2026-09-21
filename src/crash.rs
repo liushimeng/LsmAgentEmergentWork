@@ -64,6 +64,11 @@ pub fn install_panic_hook(report_dir: impl Into<PathBuf>) {
         let _ = PREVIOUS_HOOK.set(previous);
 
         panic::set_hook(Box::new(|info| {
+            // 第 108 轮:panic 时优先还原终端(alt screen / raw mode / 滚动区 / 光标),
+            // 否则终端残留 alt screen + raw mode 会导致整个 Terminal 软件僵死。
+            // sync 版本不依赖 tokio runtime(panic 时 runtime 状态不可靠)。
+            crate::shutdown::terminal_restore_sync();
+
             // 第 78 轮:panic 时优先清理浏览器子进程,防止孤儿 Chrome 进程泄漏。
             // 使用 catch_unwind 防止清理过程中再次 panic 导致 abort。
             let _ = std::panic::catch_unwind(|| {

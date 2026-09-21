@@ -586,8 +586,20 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
         crate::agent::human_assist::HumanAssistHub::global().attach();
         let input_handler = InputHandler::new();
         let mut completion_engine = CompletionEngine::new();
+        // 第 108 轮:在主循环开头拍快照 shutdown 协调器,跨轮复用避免每轮查全局。
+        let shutdown_sig = crate::shutdown::global();
 
         loop {
+            // 第 108 轮:shutdown 信号先于 read_line 判定 —— Ctrl+C/SIGTERM/SIGHUP
+            // 任一触发时,即使 read_line 在阻塞等用户输入,也能立即 break,
+            // 走 graceful exit 路径而不是被永久 swap 挂起。
+            if shutdown_sig.is_triggered() {
+                eprintln!();
+                eprintln!("  [laew] 收到 shutdown 信号({:?}),退出 TUI。",
+                    shutdown_sig.current_reason());
+                break;
+            }
+
             // 每行输入前重扫自定义命令目录(D2):命令文件增删即时生效,无需重启
             completion_engine.reload_custom(&session.paths.work_dir);
             let line = match input_handler.read_line(">> ", &completion_engine)? {
@@ -661,6 +673,9 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
             }
         }
     }
+    // 第 108 轮:TUI 主循环退出 → 统一终端还原(任何退出路径都执行,
+    // 包括 Ctrl+C / Ctrl-D / Ctrl+Z 被拦截后 / 正常 /exit / shutdown 信号触发)。
+    crate::shutdown::terminal_restore().await;
     Ok(())
 }
 
