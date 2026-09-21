@@ -680,7 +680,21 @@ impl Agent {
             // → 增加计数;否则(有文本 / 无工具调用)归零
             // 注:completion.text 与 completion.tool_calls 在前面循环已被消费,
             // 这里通过本轮迭代开始时记录的 snapshot 判断。
-            if this_round_text_empty && this_round_had_tool_calls {
+            //
+            // 第 103 轮:MCP_Web_Use(浏览器)与 MCP_Window_Use(桌面窗口)任务天然需要
+            // 多轮 tool_use(open→inspect→control)才能产出最终结果。若本轮有浏览器/窗口
+            // 工具调用且返回 code=0(成功获取到页面数据/窗口信息),视为"有效产出轮",不纳入
+            // 无文本收敛计数,避免合法的多步浏览器任务被提前终止。
+            let browser_tool_productive = if this_round_text_empty && this_round_had_tool_calls {
+                // 检查最近工具调用中是否有成功的 MCP_Web_Use / MCP_Window_Use
+                // 浏览器/窗口任务天然多轮 tool_use,成功调用即视为有效产出
+                recent_tool_history.iter().rev().take(3).any(|(tool, _args, err)| {
+                    !err && (tool == "MCP_Web_Use" || tool == "MCP_Window_Use")
+                })
+            } else {
+                false
+            };
+            if this_round_text_empty && this_round_had_tool_calls && !browser_tool_productive {
                 consecutive_no_text_rounds += 1;
             } else {
                 consecutive_no_text_rounds = 0;

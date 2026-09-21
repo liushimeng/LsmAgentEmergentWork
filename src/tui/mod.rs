@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::Result;
+use crossterm::terminal;
 
 use crate::agent::debug::{DebugCollector, DebugLlmClient};
 use crate::agent::offline_queue::OfflineQueue;
@@ -607,15 +608,19 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
 
             match session.handle_user_input(&line).await {
                 Ok(true) => {
-                    // /exit 退出:拆除固定底部输入组件,还原终端滚动区
+                    // /exit 退出:拆除固定底部输入组件,还原终端滚动区 + 确保 raw mode 关闭
                     crate::agent::human_assist::HumanAssistHub::global().detach();
                     input::teardown_pinned();
+                    let _ = terminal::disable_raw_mode();
                     break;
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    // 第 103 轮:错误路径同样拆除固定输入区 + 重置滚动区 + 还原光标,
+                    // 避免异常返回后终端残留 pinned 布局(焦点丢失)。
                     crate::agent::human_assist::HumanAssistHub::global().detach();
                     input::teardown_pinned();
+                    let _ = terminal::disable_raw_mode();
                     return Err(e);
                 }
             }

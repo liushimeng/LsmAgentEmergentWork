@@ -581,6 +581,12 @@ impl InputHandler {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
 
+        // 第 103 轮:强制重置终端状态,消除前一轮 dispatch_prompt 大量输出后
+        // 可能残留的滚动区/光标位置异常(焦点丢失 bug 的根因)。
+        // DECRST 重置滚动区为全屏 + 确保光标可见,再进入 pinned 布局。
+        execute!(stdout, ResetColor, Print("[r"))?;
+        execute!(stdout, crossterm::cursor::Show)?;
+        stdout.flush()?;
         // 设置滚动区 + 绘制固定面板 + 空输入行
         self.enter_pinned(&mut stdout, &layout)?;
         self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;

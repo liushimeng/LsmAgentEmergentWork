@@ -4,6 +4,7 @@
 //! `dispatch_prompt` 统一任务分发(@ 提及展开 / 阶段进度协程 / SIGINT 取消 /
 //! debug 报告 / 终态打印 / transcript 记录),以及结果渲染 `print_*` 家族。
 
+use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -656,6 +657,10 @@ impl TuiSession {
             // 失败仅告警不影响对话(方案 tmpPlan/2026-09-19_02)。
             self.persist_chat_history();
         }
+        // 第 103 轮:返回前强制冲刷 stdout,确保 dispatch_prompt 内所有异步阶段输出
+        // (stage_printer 协程的 println!) 已全部落盘,再交还主循环进入 read_line。
+        // 避免「输出未完成就重绘输入面板」的竞态(焦点丢失的根因之一)。
+        let _ = std::io::stdout().flush();
         Ok(false)
     }
 

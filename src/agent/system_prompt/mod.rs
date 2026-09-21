@@ -566,6 +566,12 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
 - 不要尝试规划下一步
 - 不要修改 subflow 之外的范围
 - 失败时如实回报,不要伪造成功
+- ★ 网络 fail-fast(第 103 轮):若 Bash(curl/ping)已确认目标主机不可达
+  (curl 返回 "000 FAILED" / "Connection timed out"、ping 100% 丢包、
+   MCP_Web_Use open 返回 net::ERR_CONNECTION_TIMED_OUT),立即停止重试,
+  直接返回失败原因+排查建议(VPN?服务器是否运行?端口是否开放?);
+  不要在不可达的目标上反复重试 MCP_Web_Use open,那只会浪费迭代预算;
+  网络探测优先用 curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5
 - 路径保真:用户/上游指定的文件路径必须逐字使用(相对当前工作目录),
   不得自行更换目录或在工作区根目录另建副本;中间产物也一样落到处方路径,
   汇报时写明实际落盘路径(2026-09-13 第 50 轮:批量测试实测执行层路径漂移,

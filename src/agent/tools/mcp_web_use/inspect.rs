@@ -129,9 +129,12 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             Ok(json!({"events": events, "count": events.len(), "collection_healthy": healthy, "last_event_at": last}))
         }
         "elements" => {
-            let Some(sel) = str_arg(&params, "selector") else {
-                return envelope(1001, "缺 selector", json!({}));
-            };
+            // 第 103 轮:selector 可选,缺失时默认返回全页交互元素列表
+            // (input/button/select/textarea/a/[role=button]/[contenteditable=true]),
+            // 消除 LLM 因 Schema additionalProperties:false 无法在顶层传入 selector
+            // 而反复试错浪费迭代的低频错误。
+            let sel = str_arg(&params, "selector")
+                .unwrap_or("input,button,select,textarea,a,[role=button],[role=link],[contenteditable=true]");
             let nth = params.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
             let include_text = params.get("include_text").and_then(Value::as_bool).unwrap_or(true);
             let include_outer = params.get("include_outer_html").and_then(Value::as_bool).unwrap_or(false);

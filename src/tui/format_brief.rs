@@ -46,6 +46,33 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
                 }
             }
         }
+        // 第 103 轮:浏览器任务核心 data 字段摘要(消除 TUI trace 区信息黑洞)
+        // dom 返回: node_count / truncated
+        if let Some(n) = d.get("node_count").and_then(|x| x.as_i64()) {
+            parts.push(format!("nodes={n}"));
+        }
+        // elements 返回: count(匹配元素数) / tag(首元素标签)
+        if let Some(n) = d.get("count").and_then(|x| x.as_i64()) {
+            parts.push(format!("count={n}"));
+        }
+        if let Some(s) = d.get("tag").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+            parts.push(format!("tag={s}"));
+        }
+        // console/network 返回: count(事件数)
+        // (console 和 network 的 count 通过 events 数组长度体现)
+        // blockers 返回: blocked + 命中 kind 列表
+        if let Some(true) = d.get("blocked").and_then(|x| x.as_bool()) {
+            if let Some(arr) = d.get("blockers").and_then(|x| x.as_array()) {
+                let kinds: Vec<&str> = arr.iter()
+                    .filter_map(|b| b.get("kind").and_then(|k| k.as_str()))
+                    .collect();
+                if !kinds.is_empty() {
+                    parts.push(format!("blocked=[{}]", kinds.join(",")));
+                }
+            }
+        }
+        // page_meta/url/title: 已在顶层处理,此处跳过避免重复
+        // ocr 返回: ocr_text 已在文本类字段处理为 ocr_len
         // ===== 第 99 轮扩展 =====
         if d.get("reused").and_then(|x| x.as_bool()) == Some(true) {
             parts.push("reused".to_string());
