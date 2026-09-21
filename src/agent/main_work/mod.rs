@@ -174,10 +174,13 @@ impl MainWorkRunner {
                支持 action=ocr + click_point 视觉路线,编排时正常按步骤描述即可,不需要拆成 Bash 检查单元。\n\
              - 桌面窗口操控流程引用 MCP_Window_Use 时(2026-09-18 第 87 轮;第 90 轮 +input_batch;\n\
                2026-09-19 第 91 轮 +run_sequence 连续工作模式;**2026-09-21 第 100 轮 +explore\n\
-               探索侧 + 双工作模式框架**),steps 中只允许使用以下合法 action:open / list / find /\n\
+               探索侧 + 双工作模式框架;第 109 轮 +read_text 窗口文本读取**),steps 中只允许\n\
+               使用以下合法 action:open / list / find /\n\
                inspect / control / ocr / screenshot / capability_probe / osascript_run / chat_send /\n\
                chat_loop / input_batch / run_sequence / **explore**(第 100 轮新增:探索快照,把\n\
-               capability_probe + find + inspect + ocr 四步合并为一次调用);禁止臆造\n\
+               capability_probe + find + inspect + ocr 四步合并为一次调用)/ **read_text**(第\n\
+               109 轮新增:读取窗口文本/对话返回结果,expect_contains+timeout_ms 等回复流完);\n\
+               禁止臆造\n\
                list_windows / get_window_info / get_ui_tree 等不存在的接口名 —— 执行层按字面调用\n\
                会直接失败空转。\n\
              - **首选 explore + run_sequence 双调用(第 100 轮 · 连续执行模式,人机共用机器\n\

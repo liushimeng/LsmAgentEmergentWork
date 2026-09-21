@@ -629,6 +629,26 @@ mod tests {
         assert!(!p2.contains("第一性事实"));
     }
 
+    // ========== 第 109 轮:桌面目标保真(网页版不构成等效完成) ==========
+
+    #[test]
+    fn qc_prompt_desktop_fidelity_rule_present() {
+        let p = build_unit_qc_prompt(
+            "找到软件豆包,输入信息,读取对话返回的结果",
+            "在豆包中输入查询并读取结果",
+            "chat_log 含 [SEND] 行",
+            "已在网页版完成",
+            "iter=8 tools=MCP_Web_Use",
+            Some("找到软件 豆包 , 输入信息,读取对话返回的结果,显示相关的对话信息"),
+        );
+        // 反降级规则必须包含桌面目标保真条款
+        assert!(p.contains("桌面目标保真"), "{p}");
+        assert!(p.contains("不构成等效完成"), "{p}");
+        // suggestion 层面禁止推荐网页版
+        assert!(p.contains("禁止推荐「改用网页版"), "{p}");
+        assert!(p.contains("MCP_Web_Use"), "{p}");
+    }
+
     #[test]
     fn parse_quality_report_from_block() {
         let text = r#"
