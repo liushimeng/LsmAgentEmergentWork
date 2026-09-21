@@ -695,11 +695,39 @@ impl TuiSession {
             .collect();
         let title = super::format::first_line_preview(&self.transcript[0].raw_input, 40);
         let work_dir = self.paths.work_dir.display().to_string();
-        if let Err(e) = self.db.lock().expect("db").save_chat_snapshot(
+
+        // 第 104 轮修复:把 current_model_name() 调用挪到 outer db Mutex 之外
+        // 之前在持锁状态下调用,会触发 std::sync::Mutex<Db> 的非可重入死锁,
+        // 导致 dispatch_prompt 在 persist_chat_history 阶段永远阻塞、main loop 不再
+        // 进入下一次 read_line —— TUI 表现为「焦点失守」「Ctrl-C 显式 ^C」根因。
+        // turns / title / work_dir 都是 &self 上的纯只读借用,锁外组装安全。
+        let model_name = self.current_model_name();
+
+        // 外层 Mutex 改用 try_lock,避免极端情况下再次死锁时主循环阻塞;
+        // 失败仅 warn,不影响当前对话(会话持久化本来就是 best-effort)。
+        let guard = match self.db.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::warn!(
+                    session_id = %self.session.id,
+                    "会话持久化:outer db Mutex 暂不可用,本轮跳过"
+                );
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                tracing::warn!(
+                    session_id = %self.session.id,
+                    error = ?p,
+                    "会话持久化:outer db Mutex 中毒,本轮跳过"
+                );
+                return;
+            }
+        };
+        if let Err(e) = guard.save_chat_snapshot(
             &self.session.id,
             &self.session.created_at,
             &work_dir,
-            self.current_model_name().as_deref(),
+            model_name.as_deref(),
             &title,
             &turns,
         ) {

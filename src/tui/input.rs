@@ -552,15 +552,40 @@ impl InputHandler {
         let _ = execute!(stdout, EnableBracketedPaste);
         drop(stdout);
 
-        let result = self.read_line_inner(prompt, engine);
+        // 第 104 轮加固:read_line_inner 内部 panic 时(任意 bug 触发)
+        // 必须保证 raw mode + bracketed paste 被关掉,主循环错误分支才能正常
+        // 清理终端。否则一旦 read_line_inner panic,raw mode 残留 + 滚动区残留 +
+        // 焦点失守,Ctrl-C 显式 ^C、Ctrl-D 不退。catch_unwind 把 panic 捕获为
+        //    `Err(panic_payload)`,我们把它转成 IO 错误上抛给主循环。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.read_line_inner(prompt, engine)
+        }));
 
-        // 退出原始模式 + 关闭 bracketed paste(无论成功失败)
+        // 无论成功失败,都要退出原始模式 + 关闭 bracketed paste。
+        // 这一段即使 panic 也会执行 —— 它在 catch_unwind 的外层。
         let mut stdout = io::stdout().lock();
         let _ = execute!(stdout, DisableBracketedPaste);
         drop(stdout);
         let _ = terminal::disable_raw_mode();
 
-        result
+        match result {
+            Ok(r) => r,
+            Err(panic_payload) => {
+                // 不要把 panic 抛出去炸进程,把 panic 信息塞进 IO 错误返回。
+                // 主循环错误分支会调用 teardown_pinned + disable_raw_mode 二次兜底。
+                let detail = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                    Some(*s)
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    Some(s.as_str())
+                } else {
+                    None
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("read_line_inner panicked: {:?}", detail),
+                ));
+            }
+        }
     }
 
     fn read_line_inner(&self, prompt: &str, engine: &CompletionEngine) -> io::Result<InputResult> {
