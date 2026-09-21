@@ -813,6 +813,19 @@ impl TuiSession {
         // 2026-09-10 第 27 轮 F05:从 self.task_started_at.take() 取任务开始时间,
         // 拼接到「本次用量」行末尾。take 保证只显示一次,后续命令不带耗时。
         let started = self.task_started_at.take();
+        // TODO 任务清单进度(2026-09-21 第二十轮候选 5):若 SubAgent 在本轮
+        // 创建/更新了 todo,任务结果行前先输出「Tasks: ...」一行便于用户定位进度;
+        // 空列表则静默。render_for_session_memory 把 JSON 摘要顺手写到 session_memory,
+        // 后续 reset_session / /export 时可被引用为「上一次到哪了」快照。
+        let todo_summary = self.todo_state.summary_line();
+        if !todo_summary.is_empty() {
+            let todo_render = self.todo_state.render();
+            println!("┌─ 📋 Tasks ─────────────────────────────────────────────────┐");
+            for line in todo_render.lines() {
+                println!("│ {line}");
+            }
+            println!("└─────────────────────────────────────────────────────────────┘");
+        }
         // styled=true:仅模型内容块(subflow_outcome/摘要)经 Markdown 渲染加 ANSI,
         // 结构标签行保持纯文本(2026-09-15,docs/TUIMarkdown富文本渲染/)。
         for line in format_task_result(

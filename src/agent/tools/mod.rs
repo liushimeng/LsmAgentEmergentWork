@@ -24,6 +24,7 @@ pub mod mcp_window_use;
 pub mod read;
 pub mod read_detect;
 pub mod write;
+pub mod todo;
 
 /// 工具需要实现的异步 trait
 #[async_trait]
@@ -115,6 +116,7 @@ pub fn builtin_registry() -> ToolRegistry {
         .register(Arc::new(edit::EditTool::new(sandbox.clone())))
         .register(Arc::new(glob::GlobTool))
         .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(todo::TodoWriteTool::shared()))
         .register(Arc::new(mcp_web_use::McpWebUseTool));
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
@@ -132,6 +134,7 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
         .register(Arc::new(edit::EditTool::new(sandbox.clone())))
         .register(Arc::new(glob::GlobTool))
         .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(todo::TodoWriteTool::shared()))
         .register(Arc::new(mcp_web_use::McpWebUseTool));
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
@@ -165,6 +168,7 @@ pub fn main_work_registry() -> ToolRegistry {
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(glob::GlobTool))
         .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(todo::TodoWriteTool::shared()))
 }
 
 /// SubAgent-Work Agent 工具注册表:全套工具(执行层最小单元)
@@ -254,5 +258,21 @@ mod names_tests {
         assert!(!main_work_registry().names().contains(&"MCP_Web_Use"));
         assert!(!plan_registry().names().contains(&"MCP_Web_Use"));
         assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
+    }
+
+    // 第二十轮候选 5(2026-09-21):TodoWrite 注册面验证 —— SubAgent-Work 与
+    // Main-Work 应看到TodoWrite;Yolo / Plan / QC 不应持(粒度对齐:规划型工具,
+    // Yolo 入口层与 QC 判定层用不到)。
+    #[test]
+    fn todo_write_registered_in_subagent_and_main_work_only() {
+        assert!(builtin_registry().names().contains(&"TodoWrite"));
+        assert!(builtin_registry_with_work_dir(PathBuf::from("."))
+            .names()
+            .contains(&"TodoWrite"));
+        assert!(main_work_registry().names().contains(&"TodoWrite"));
+        // 仅规划阶段的 Yolo / Plan / QC 不应暴露。
+        assert!(!yolo_registry().names().contains(&"TodoWrite"));
+        assert!(!plan_registry().names().contains(&"TodoWrite"));
+        assert!(!quality_registry().names().contains(&"TodoWrite"));
     }
 }

@@ -23,6 +23,7 @@ use crossterm::terminal;
 use crate::agent::debug::{DebugCollector, DebugLlmClient};
 use crate::agent::offline_queue::OfflineQueue;
 use crate::agent::orchestrator::MultiAgentOrchestrator;
+use crate::agent::todo_state::{TodoState, global_or_init};
 use crate::config::{Db, Paths};
 use crate::llm::{client_from_record, ChatMessage, Connectivity, ConnectivityTracker};
 use crate::session::Session;
@@ -101,6 +102,9 @@ pub struct TuiSession {
     pub connectivity: std::sync::Arc<ConnectivityTracker>,
     /// D13 离线模式(2026-09-11):离线请求队列,LLM 不可达时暂存用户输入。
     pub offline_queue: OfflineQueue,
+    /// TODO 任务清单状态(第二十轮候选 5,2026-09-21):SubAgent 显式跟踪多步任务进度。
+    /// 与 TodoWrite tool 共享同一全局实例(也允许直接在 TuiSession 中持有独立实例)。
+    pub todo_state: std::sync::Arc<TodoState>,
 }
 
 /// 清理外部工具/模型输出中的终端控制序列,供 `-p` 与 TUI 共用。
@@ -124,6 +128,8 @@ impl TuiSession {
         let collector = debug.then(|| Arc::new(DebugCollector::new(session.id())));
         // D13 离线模式:创建连接状态跟踪器(TUI 侧持有,基于任务结果更新)。
         let connectivity = std::sync::Arc::new(ConnectivityTracker::new());
+        // TODO 任务清单(2026-09-21):初始化关联当前 session 的 TodoState。
+        let todo_state = global_or_init(&session.id());
         let (orchestrator, debug_llm_raw) = build_orchestrator_with_active_shared(
             &db,
             plans_dir,
@@ -145,6 +151,7 @@ impl TuiSession {
             task_started_at: None,
             connectivity,
             offline_queue: OfflineQueue::new(),
+            todo_state,
         })
     }
 
@@ -264,6 +271,15 @@ impl TuiSession {
             "未配置(先 /provider add)".to_string()
         };
         println!("║  连  接 : {} ║", fit_display(&conn_line, 45));
+        // TODO 任务清单进度(2026-09-21 第二十轮候选 5):仅在有 todo 时显示,
+        // 空列表时静默(避免横幅噪声)。形如 `[✓]3 [→]1 [○]2 · last "xxx"`。
+        let todo_summary = self.todo_state.summary_line();
+        if !todo_summary.is_empty() {
+            println!(
+                "║  任  务 : {} ║",
+                fit_display(&todo_summary, 45)
+            );
+        }
         // 第 72 轮(2026-09-17):`--debug`/`--info` 启动时展示运行日志文件落点,
         // /clear /new 重印横幅仍可见(会话内随时能找到日志);未开启时不显示该行。
         if let Some(log) = &self.agent_log {
@@ -375,6 +391,9 @@ impl TuiSession {
         self.session = Session::new();
         self.transcript.clear();
         self.session_usage = crate::llm::Usage::default();
+        // TODO 任务清单(2026-09-21):新会话重置全局 todo,避免看到旧会话的列表。
+        // 同步更新 self.todo_state 引用(指向新会话的 TodoState)。
+        self.todo_state = crate::agent::todo_state::reset_global_for_session(&self.session.id);
         saved
     }
 
