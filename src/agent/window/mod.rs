@@ -1140,7 +1140,13 @@ fn is_shell_container_role(role: &str) -> bool {
 /// 控件树是否「空壳」—— 需要等待异步建树(warmup)或切换路线的判定:
 /// 1. 总节点数 ≤ 4(微信实测空壳 = 根 AXWindow + 3 个红绿灯 AXButton);
 /// 2. 或除空壳容器与红绿灯按钮外,没有任何内容控件(Electron 建树未完成的典型形态)。
+/// 前置:树中已有 web 内容角色(AXWebArea/AXTextField/带名称按钮等,见
+/// [`tree_has_web_content`])时一律不算空壳 —— 即便只有 1 个 AXWebArea 根节点
+/// (Electron 建树刚完成的形态,不能被判浅树反复 warmup)。
 pub fn tree_is_shell_only(root: &ControlNode) -> bool {
+    if tree_has_web_content(root) {
+        return false;
+    }
     fn count(node: &ControlNode) -> usize {
         1 + node.children.iter().map(count).sum::<usize>()
     }

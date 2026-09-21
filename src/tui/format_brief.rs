@@ -197,6 +197,32 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
             if sd.get("ocr_used").and_then(|x| x.as_bool()) == Some(true) {
                 parts.push("ocr_fallback".into());
             }
+            // 第 109 轮:web 内容正向信号(0 = Electron 树未长出)+ 建树等待时长
+            match sd.get("web_content").and_then(|x| x.as_bool()) {
+                Some(false) => parts.push("web=0".into()),
+                Some(true) => parts.push("web=1".into()),
+                None => {}
+            }
+            if let Some(w) = sd.get("warmup_ms").and_then(|x| x.as_i64()) {
+                if w > 0 {
+                    parts.push(format!("warmup={w}ms"));
+                }
+            }
+        }
+    }
+    // 第 109 轮:read_text 摘要 —— 路线 / 字符数 / 关键词命中
+    if get_s("action") == "read_text" || v.get("chars").is_some() {
+        let strategy = get_s("strategy");
+        if !strategy.is_empty() {
+            parts.push(format!("strategy={}", truncate_chars(strategy, 10)));
+        }
+        if let Some(n) = get_n("chars") {
+            parts.push(format!("chars={n}"));
+        }
+        match get_b("contains_hit") {
+            Some(true) => parts.push("contains=✓".into()),
+            Some(false) => parts.push("contains=✗".into()),
+            None => {}
         }
     }
     if let Some(route) = Some(get_s("route")).filter(|s| !s.is_empty()) {
