@@ -145,7 +145,7 @@ impl MainWorkRunner {
         // F8:补全 branches/loops 的 schema 示例并注明可省略 —— 此前提示词只列了
         // 六个必填字段,LLM 自行发明 branches 字符串形态导致类型失配(F1 的源头)。
         prompt.push_str(
-            "\n请严格按以下 JSON 结构输出(可包裹在 ```json 代码块中):\n\
+            "\n\n【重要:编排范式——请严格按下方结构输出】\n★ 例 1(★最重要★ 自绘 UI 任务:微信/钉钉/飞书/QQ/桌面聊天 等)\n当任务涉及上述自绘 UI 应用时,**禁止**生成「控件结构深度解析」「控件路径映射表」\n\"AX 路径枚举」等 wf 单元(自绘 UI 控件树为空,这些任务不可能完成,浪费迭代预算)。\n**正确模板(2~3 个 wf,不要 6 个)**:\n  wf-1:打开/激活目标应用 + explore 快照(一次拿全:capability + 控件树 + 屏幕坐标);\n  wf-2:执行核心任务(chat_loop 多轮聊天 / run_sequence 批量操作);\n  wf-3(可选):生成报告(读取 chat_log 落盘 Markdown)。\nwf-2 的 acceptance 锚定 chat_log_path 文件中的 [SEND]/[RECV]/[SUMMARY] 行数,\n不锚定控件路径(自绘 UI 无路径可引用)。\n\n例 2(常规 GUI 任务:VSCode / Notion / 浏览器 DevTools):3~4 个 wf,explore 后\nrun_sequence 连续执行 + 验证,详见下方说明。\n\n请严格按以下 JSON 结构输出(可包裹在 \x60\x60\x60json 代码块中):\n\
              {\"workflows\": [{\"id\": \"wf-1\", \"name\": \"流程名\", \"steps\": [\"步骤\"], \
              \"branches\": [\"条件: 动作\"], \"loops\": [\"条件: 遍历对象\"], \"depends_on\": [], \
              \"acceptance\": [\"可验证的验收标准\"], \"delegate_to\": \"subagent\", \"max_iterations\": 24}], \"summary\": \"编排思路\"}\n\
@@ -236,8 +236,20 @@ impl MainWorkRunner {
         sub_session.id = session_id.to_string();
 
         let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
+        // M8 (2026-09-21 第 102 轮):Plan 解析失败时,若原 prompt 含自绘 UI 关键词
+        // (微信/钉钉/飞书/QQ),兜底走 2 wf 模板(探索 + chat_loop),避免退化
+        // 「单 wf 默认流程」让 LLM 重蹈 inspect 失败循环。
+        let self_drawn_keywords = ["微信", "钉钉", "飞书", "QQ", "wechat", "dingtalk",
+            "feishu", "lark", "wecom", "桌面聊天", "桌面 IM"];
+        let is_self_drawn_task = original_prompt
+            .map(|p| self_drawn_keywords.iter()
+                .any(|kw| p.to_lowercase().contains(&kw.to_lowercase())))
+            .unwrap_or(false)
+            || decomposition.iter().any(|d| self_drawn_keywords.iter()
+                .any(|kw| d.to_lowercase().contains(&kw.to_lowercase())));
+
         let mut plan = parse_workflow_plan(&text).unwrap_or_else(|e| {
-            tracing::warn!("Main-Work 解析失败,使用单 WorkFlow 兜底: {}", e);
+            tracing::warn!("Main-Work 解析失败,使用兜底 WorkFlow: {}", e);
             // F2:兜底 acceptance 继承 Yolo 分解步骤(可验证清单),不再退化「完成目标」;
             // degraded=true 供 run_medium 跳过 QC-main,消除必败重试循环。
             let inherited = if decomposition.is_empty() {
@@ -247,21 +259,68 @@ impl MainWorkRunner {
             };
             // 2026-09-16 第 59 轮:兜底 WorkFlow 也继承 suggested_delegate
             // (第 89 轮:执行器唯一化,兜底与正常路径统一 SubAgent)
-            WorkFlowPlan {
-                workflows: vec![WorkFlowSpec {
-                    id: "wf-1".into(),
-                    name: "默认流程".into(),
-                    steps: decomposition.to_vec(),
-                    branches: vec![],
-                    loops: vec![],
-                    depends_on: vec![],
-                    acceptance: inherited,
-                    delegate_to: AgentRole::SubAgent,
-                    // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
-                    max_iterations: None, original_prompt: None,
-                }],
-                summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
-                degraded: true,
+            if is_self_drawn_task {
+                // M8:自绘 UI 任务兜底 —— 2 wf 模板(探索 + chat_loop),
+                // 强制引导 LLM 走正确路径,避免「控件解析」不可能任务
+                WorkFlowPlan {
+                    workflows: vec![
+                        WorkFlowSpec {
+                            id: "wf-1".into(),
+                            name: "目标应用激活 + 探索快照".into(),
+                            steps: vec![
+                                "MCP_Window_Use(action=capability_probe) 拿真实能力矩阵".to_string(),
+                                "MCP_Window_Use(action=explore, query=微信, snapshot_label=wechat) 一次拿全".to_string(),
+                            ],
+                            branches: vec![],
+                            loops: vec![],
+                            depends_on: vec![],
+                            acceptance: vec![
+                                "explore 返回 snapshot_path 落盘".to_string(),
+                                "tree_summary.self_drawn=true 或 actionable_count<5".to_string(),
+                            ],
+                            delegate_to: AgentRole::SubAgent,
+                            max_iterations: Some(8),
+                            original_prompt: original_prompt.map(str::to_string),
+                        },
+                        WorkFlowSpec {
+                            id: "wf-2".into(),
+                            name: "执行核心任务(自绘 UI 唯一路径)".into(),
+                            steps: vec![
+                                "MCP_Window_Use(action=chat_loop, window_id=<wf-1.window_id>, messages=[...], interval_seconds=30, chat_log_path=...)".to_string(),
+                            ],
+                            branches: vec![],
+                            loops: vec![],
+                            depends_on: vec!["wf-1".to_string()],
+                            acceptance: vec![
+                                "chat_log_path 落盘含 [SEND] 行 >= 1".to_string(),
+                                "[RECV] 行 >= 1(若对方回复)".to_string(),
+                                "[SUMMARY] 行存在且 focus_aborted=false".to_string(),
+                            ],
+                            delegate_to: AgentRole::SubAgent,
+                            max_iterations: Some(24),
+                            original_prompt: original_prompt.map(str::to_string),
+                        },
+                    ],
+                    summary: "Main-Work 解析失败,自绘 UI 任务 2 wf 兜底模板(M8)".into(),
+                    degraded: true,
+                }
+            } else {
+                WorkFlowPlan {
+                    workflows: vec![WorkFlowSpec {
+                        id: "wf-1".into(),
+                        name: "默认流程".into(),
+                        steps: decomposition.to_vec(),
+                        branches: vec![],
+                        loops: vec![],
+                        depends_on: vec![],
+                        acceptance: inherited,
+                        delegate_to: AgentRole::SubAgent,
+                        // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
+                        max_iterations: None, original_prompt: None,
+                    }],
+                    summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
+                    degraded: true,
+                }
             }
         });
 

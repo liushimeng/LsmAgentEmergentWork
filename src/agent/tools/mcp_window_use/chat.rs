@@ -1137,10 +1137,63 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
             "elapsed_secs": started.elapsed().as_secs()
         }));
 
-        // 第 88 轮:连续前台守卫失败止损(消息可能打进别的软件,立即中止)
+        // 第 88 轮 + 第 102 轮(M5):连续前台守卫失败时,先通过 HumanAssistHub
+        // 向 TUI 询问用户:继续重试 / 暂停等待 / 立即中止。TUI 内弹出选择菜单,
+        // 人工答复经 oneshot 回填;非 TUI 模式 fail-fast 沿用旧行为(直接止损)。
         if consecutive_focus_fail >= MAX_CONSECUTIVE_FOCUS_FAIL {
-            focus_aborted = true;
-            break;
+            // 仅在「本轮是最后一次可能的尝试」时打断用户 —— 不每条都问,
+            // 避免在 30s 间隔里把用户刷到烦。
+            let last_choice = crate::agent::human_assist::HumanAssistHub::global()
+                .request(
+                    "manual_verify",
+                    &format!(
+                        "chat_loop 连续 {MAX_CONSECUTIVE_FOCUS_FAIL} 轮前台守卫失败 ——                          目标窗口可能不在前台(用户切到其他窗口)。                         已发 {total_sent} 条,落盘到 {chat_log_path}。请选择:",
+                    ),
+                    vec![
+                        "继续重试一次".to_string(),
+                        "暂停等待(回前台后自动恢复)".to_string(),
+                        "立即中止 chat_loop".to_string(),
+                    ],
+                    "",
+                    "",
+                    30000, // 30s 超时,超时 = 「立即中止」(保守兜底)
+                )
+                .await;
+            match last_choice {
+                crate::agent::human_assist::HumanAssistOutcome::Answered(answer)
+                    if answer.contains("继续") =>
+                {
+                    consecutive_focus_fail = 0;
+                    append_chat_log(
+                        &chat_log_path,
+                        &format_chat_log_line(
+                            now_unix(),
+                            "USER_RESUME",
+                            "用户选择继续重试一次,重置焦点守卫计数",
+                        ),
+                    );
+                }
+                crate::agent::human_assist::HumanAssistOutcome::Answered(answer)
+                    if answer.contains("暂停") =>
+                {
+                    // 暂停 = 阻塞等待 60s 后再试一次焦点守卫
+                    append_chat_log(
+                        &chat_log_path,
+                        &format_chat_log_line(
+                            now_unix(),
+                            "USER_PAUSE",
+                            "用户选择暂停等待 60s",
+                        ),
+                    );
+                    std::thread::sleep(Duration::from_secs(60));
+                    consecutive_focus_fail = 0;
+                }
+                _ => {
+                    // 用户选择中止 / 超时 / 取消 / Unavailable → 止损
+                    focus_aborted = true;
+                    break;
+                }
+            }
         }
         if stop_on_reply && reply_seen {
             break;

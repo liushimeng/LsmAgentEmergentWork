@@ -273,6 +273,34 @@ where
         .map_err(|e| tool_err(tool, format!("窗口驱动任务 join 失败: {e}")))?
 }
 
+/// 第 102 轮(M6):带 cancel token 的 run_blocking。
+///
+/// osascript / Windows SendInput / macOS CGEvent 等阻塞操作在 cancel 触发时
+/// 不能即时退出 → Ctrl-C 后 zsh suspend 而非 exit。spawn_blocking 返回的
+/// JoinHandle 持有 handle,cancel 时调用 abort() 强制终结。
+///
+/// 用法:`run_blocking_with_cancel(tool, cancel, move || { ... }).await`
+pub(crate) async fn run_blocking_with_cancel<F>(
+    tool: &str,
+    cancel: &crate::agent::cancel::CancelToken,
+    f: F,
+) -> Result<String>
+where
+    F: FnOnce() -> Result<String> + Send + 'static,
+{
+    let join = tokio::task::spawn_blocking(f);
+    tokio::select! {
+        result = join => {
+            result.map_err(|e| tool_err(tool, format!("窗口驱动任务 join 失败: {e}")))?
+        }
+        _ = cancel.cancelled() => {
+            tracing::warn!(target: "mcp_window_use::run_blocking", tool = tool,
+                "cancel 触发,窗口驱动任务被强制中止");
+            Err(tool_err(tool, "任务被用户取消(驱动层阻塞操作已终止)"))
+        }
+    }
+}
+
 // ===================== Doom Loop 检测(2026-09-21 第 100 轮,源自 opencode L1516) =====================
 //
 // 背景:SubAgent 在死循环 click→fail→click→fail 时反复 16 次迭代上限仍撞墙。

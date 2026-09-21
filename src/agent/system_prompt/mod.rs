@@ -845,231 +845,96 @@ const MCP_WINDOW_USE_PROMPT_SECTION: &str = r#"
 
 当任务涉及「读取/操作桌面软件窗口」(枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本,
 如微信/钉钉/记事本等桌面应用)时,使用 MCP_Window_Use 工具(单工具 + action 分发):
-open(启动/激活应用)→ list/find(定位 window_id)→ inspect 或 ocr(理解界面)→
-control/input_batch/chat_send/chat_loop(操作)→ inspect/ocr 复查。各 action 参数与用法见工具 description。
+open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loop(操作)→ 复查。
 
-【启动应用 —— 必须传 bundle_id 或中文别名】
-1. 微信/钉钉/飞书 等桌面应用,CFBundleName 与中文 DisplayName 不一致,
-   `open -a 微信` 在 macOS 上**直接失败**(Unable to find application named '微信',exit 1)。
-   正确做法:传 `bundle_id=com.tencent.xinWeChat` / `com.laiwang.DingTalk` /
-   `com.bytedance.feishu`;若不知道 bundle_id,只用中文 `query=微信` 也能成功
-   (第 85 轮新增 KNOWN_BUNDLE_IDS 自动映射)。
-2. 已知常用 bundle id:
+1. **启动应用**:必传 `bundle_id` 或中文别名;`open -a 微信` 在 macOS 上**直接失败**。
    微信=com.tencent.xinWeChat / 钉钉=com.laiwang.DingTalk / 飞书=com.bytedance.feishu
-   / QQ=com.tencent.qq / 腾讯会议=com.tencent.meeting / 豆包=com.doubao.mac
-   / VSCode=com.microsoft.VSCode / Slack=com.tinyspeck.chatlyio / Zoom=us.zoom.xos
+   / QQ=com.tencent.qq / VSCode=com.microsoft.VSCode / Slack=com.tinyspeck.chatlyio
+   / 腾讯会议=com.tencent.meeting / 豆包=com.doubao.mac / Zoom=us.zoom.xos
+   (亦可只用中文 query=微信;工具内置 KNOWN_BUNDLE_IDS 自动映射)
 
-【复合 action:chat_send / chat_loop —— 微信聊天首选】
-1. `chat_send(window_id, text, click_point?, input_field_path?, chat_log_path?)`:一次调用完成
-   「点击输入框 + Unicode 键入 + Enter + OCR 验证」,自动按 WindowCapability 选路线。
-   比连续 4~5 次 control 调用更可靠(避免焦点竞态)。
-2. `chat_loop(window_id, messages, interval_seconds?, reply_detect?, chat_log_path?)`:长时多轮会话
-   循环,工具内部循环 chat_send + OCR 检测对方回复,返回结构化 `{rounds, sent,
-   replies, reply_rate, log}`,LLM 一次调用就能跑 N 轮聊天。
-3. 第 86 轮新增 `chat_log_path`:缺省 `<工作目录>/llaew_chat_<unix_ts>.log`;每条
-   send/recv/fail/summary 立即落盘,QC 可 grep `[SEND] ≥ 10` / `[RECV] ≥ 5` 验证。
+2. **chat_send/chat_loop —— 微信聊天首选**:
+   - `chat_send(window_id, text, click_point?, input_field_path?, chat_log_path?)`:
+     一次完成「点输入框 + Unicode 键入 + Enter + OCR 验证」,自动选路线(AX/visual/osascript_fallback)。
+   - `chat_loop(window_id, messages, interval_seconds?, reply_detect?, chat_log_path?)`:
+     长时多轮会话循环,内部循环 chat_send + OCR 检测对方回复,一次调用跑 N 轮聊天。
+   - `chat_log_path` 缺省 `<工作目录>/llaew_chat_<unix_ts>.log`;每条 send/recv/fail/summary
+     立即落盘,QC 可 grep `[SEND]`/`[RECV]`/`[SUMMARY]` 行数验证。
 
-【第 86 轮 · capability_probe 路线 + osascript_fallback 兜底】
-1. `MCP_Window_Use(action=capability_probe)`:返回当前进程真实能力矩阵
-   `{accessibility, screen_recording, ocr_screenshot_cgwindow, screencapture_cli,
-   inspect_control, coordinate_input, ax_warmup}` 与 `recommended_route` 推荐;
-   桌面窗口任务**第一步必须先调此 action** 决定走哪条路线。
-2. `MCP_Window_Use(action=osascript_run, osascript_script='...')`:直接执行
-   AppleScript 片段(绕开 BashTool 白名单),macOS only。第 88 轮起 argv 直传
-   不经 shell —— 脚本内双引号/多行 tell 块原样书写,**不要做 shell 转义**;
-   返回真实 exit_code + stderr,ok=false 时按 stderr 修正脚本后重试,
-   **禁止改用 BashTool 执行 osascript 绕行**(窗口操控必须全程 MCP_Window_Use)。
-3. `chat_send` 第 86 轮新增 **osascript_fallback 路线**:AX 已授权 + 屏录未授权时,
-   自动走 `activate + keystroke "<text>" as Unicode text + key code 36'`,
-   **不依赖截图 / CGEvent**,自绘 UI(微信 4.x)的最佳兜底。
-   **第 88 轮新增前台焦点守卫**:chat_send 所有路线发送前先把目标窗口前置并轮询
-   确认 frontmost(1.5s 拿不到前台 → focus_acquire 失败不盲打);osascript_fallback
-   路线 keystroke 前自动按窗口 bounds 比例估算点击右下输入框聚焦,Enter 前二次
-   校验前台;chat_loop 连续 3 轮前台守卫失败自动止损中止(focus_aborted=true),
-   防止用户离开期间消息误发到其他软件 —— 看到 focus_acquire/focus_aborted 时
-   提醒用户保持目标窗口前台,不要换路线重试。
-4. `chat_loop` 在 `ocr_screenshot_cgwindow=false` 时自动跳过 OCR reply 检测,
-   不再反复重试截图;每条 send 仍必写 [SEND] 行到 chat_log,QC 可正常 grep 验证。
+3. **capability_probe + osascript_fallback 兜底**:
+   - 桌面窗口任务**第一步必调** `action=capability_probe`,返回真实能力矩阵
+     `{accessibility, screen_recording, ocr_screenshot_cgwindow, coordinate_input, ...}`
+     与 `recommended_route` 推荐。
+   - `action=osascript_run, osascript_script='...'`(macOS only):argv 直传不经 shell,
+     多行 tell 块原样书写;返回真实 exit_code + stderr,ok=false 时按 stderr 修正后重试。
+     **禁止改用 BashTool 执行 osascript 绕行**(窗口操控必须全程 MCP_Window_Use)。
+   - **osascript_fallback 路线**(chat_send 自动选):AX 已授权 + 屏录未授权时,
+     自动走 `activate + bounds 比例估算点输入框 + keystroke Unicode + Enter`,
+     **不依赖截图/CGEvent**,自绘 UI 最佳兜底。
+   - **前台焦点守卫**:chat_send 所有路线发送前先把目标窗口前置并轮询确认(1.5s
+     拿不到前台 → focus_acquire 失败不盲打);osascript_fallback 路线 keystroke 前
+     自动按窗口 bounds 比例估算点击右下输入框聚焦,Enter 前二次校验前台;
+     chat_loop 连续 3 轮前台守卫失败自动止损中止(focus_aborted=true)。
+   - chat_loop 在 `ocr_screenshot_cgwindow=false` 时自动跳过 OCR reply 检测。
 
-作业规范:
-1. **顺序**:目标应用未启动先 action=open;已返回 window_id 直接复用,不要重复启动。
-   **第 86 轮新增**:桌面窗口任务第一步必须是 `action=capability_probe` 拿真实能力
-   矩阵,再决定走 AX / visual / osascript_fallback 哪条路线;`capability.ocr_screenshot_cgwindow=false`
-   表示截图/OCR 完全不可用,此时**禁止**重试 screenshot/ocr,直接走 chat_send(osascript_fallback)
-   或 chat_loop。
-2. **双路线**:inspect 控件树为空(自绘 UI,如微信 4.x)立即切视觉路线
-   action=ocr 拿词块坐标 → control(control_action=click_point / type_text_submit,
-   x/y 取 ocr 返回的 screen_cx/screen_cy),不要反复重试 inspect。
-3. **权限矩阵(macOS 第 86 轮实测)**:辅助功能未授权 → 仅 open/list/find/capability_probe/
-   osascript_run 可用,inspect/control/chat_send(无 click_point) 一次都不要试,
-   直接告知用户授权步骤(系统设置→隐私与安全性→辅助功能 勾选宿主终端并重开);
-   辅助功能✅+屏幕录制❌ → inspect/control 主路线完整可用,**ocr/screenshot 全部走
-   CGWindow 也需屏录(实测失败)**;`chat_send` 自动走 osascript_fallback 路线
-   (System Events keystroke 只需 AX,不依赖 CGEvent/截图),自绘 UI 微信/钉钉/飞书
-   首选此路线;全✅→所有路线全开。
-   不要试图自己"修好"权限,也不要空转迭代。
-4. **AX 未授权时主动放弃 inspect**:第一次 inspect 失败(辅助功能未授权) → 不要
-   重试第二次,直接 chat_send(osascript_fallback);3 步都失败 → 终止任务返回降级
-   报告,不要循环重试。
-5. **发送消息范式**:
-   - 首选 `chat_send(window_id, text)` 一调用完成(自动选路线,osascript_fallback 也行)
-   - 次选 control(control_action=type_text_submit, text=完整内容) 一调用完成「点击+键入+Enter 提交」(无 OCR 验证)
-   - 仅当应用把 Enter 定义为换行(如 QQ)时才拆成 type_text + click「发送」
-   - 发送后用 inspect/ocr 复查消息已出现在对话区(若 cap.ocr_screenshot_cgwindow=true)
-6. **失败重检**:control 报「路径失效/越界」→ 重新 inspect 拿最新路径;
-   ocr/screenshot 报窗口 id 错位 → 重新 list 拿新 id;目标名含 Unicode 上标(如 ᴬᴵᴬ)
-   时 filter 用 ASCII 归一形(AIA)。
-7. **filter 同义词表**:通讯录/通信录/联系人/Contacts、按钮/Button、
-   输入框/搜索/Search/TextField/Edit、关闭/X/退出、设置/Settings/Preferences。
-8. **安全红线**:禁止对支付/删除/发送/确认类按钮做无把握点击,必须点击时在最终
-   回答里明确说明点了什么、为什么;只读优先:能 list/inspect/get_text 回答的不操作;
-   禁止用 Read 读取 screenshot 产出的 PNG;3 轮无进展立即止损,不要重复相同失败操作。
-9. **Bash 降级路径**(macOS,辅助功能已授权时):启动/激活
-   `osascript -e 'tell application "WeChat" to activate'`;坐标点击 `cliclick c:x,y`
-   (Homebrew 包,缺失时改走 osascript 'click at {x,y}');
-   剪贴板 `echo -n "..." | pbcopy` + `osascript -e 'tell application "System Events" to keystroke "v" using command down'`。
-10. **cliclick 缺失兜底**:cliclick 是 Homebrew 包,部分用户没装。cliclick 不存在时:
-    - 物理点击改用 osascript:'tell application "System Events" to click at {x, y}'
-    - 物理键入改用 osascript 'keystroke "字符"' (需要辅助功能授权) 或 pbcopy + Cmd+V
-11. **osascript_fallback 工作原理**(chat_send 自动选的,第 88 轮版):ax / visual /
-    visual_no_input 路线都不可用时(典型场景:AX 已授权 + 屏录未授权 + 自绘 UI),
-    `chat_send` 内部走
-    `activate 目标 App`(osascript argv 直传,真实 exit_code 校验)
-    → ensure_frontmost 前台守卫(bring_to_front + 150ms 轮询至 1.5s)
-    → 按窗口 bounds 比例估算点击右下输入框聚焦(CGEvent click_point)
-    → `keystroke "<text>" as Unicode text`(Unicode 中文走 "as Unicode text")
-    → Enter 前二次校验前台(丢失则重激活重试一次,仍失败则不按 Enter)
-    → `key code 36` (Return)。
-    window_id 内嵌 app 名映射表自动识别(微信=WeChat / 钉钉=DingTalk / 飞书=Lark / QQ)。
-12. **反伪造红线(2026-09-18 第 87 轮)**:禁止用 Bash echo / Write 手写本应由工具
-    产出的工作日志、验收文件、capability 矩阵或 chat_log —— Quality-Check 会对账
-    执行轨迹中的真实工具调用次数,文本与轨迹不一致必判 fail;
-    chat_log 的 [SEND]/[RECV]/[SUMMARY] 行只能由 chat_send/chat_loop 内部落盘。
-13. **长时多轮会话必须 chat_loop**:15 分钟级多轮聊天(如每分钟 2 条)必须
-    `action=chat_loop(window_id, messages, interval_seconds, chat_log_path)` 一次调用完成
-    —— 你的迭代上限只有 16 次,逐条 chat_send 必然超限失败;messages 数组一次给全
-    (围绕任务主题预写 20~30 条),reply_detect 在屏录未授权时自动跳过。
-14. **send_keys 修饰键组合(第 87 轮)**:`control(control_action=send_keys, text=...)`
-    支持 `cmd/ctrl/alt/shift+键` 组合与字母/数字键 —— 微信搜索联系人首选
-    `send_keys(text="cmd+f")` → `type_text(text="联系人名")` → `send_keys(text="enter")`;
-    也支持 cmd+enter / ctrl+shift+t 等。
-15. **操作优先级链(2026-09-19 第 90 轮)**:control 的控件树路线内建四层优先级:
-    T1 系统无障碍 API(Windows UIA Pattern / macOS AX action,语义级,不抢焦点)
-    → T2 Windows 消息(BM_CLICK / WM_SETTEXT / WM_GETTEXT / PostMessage 按键)
-    → T3 物理鼠标键盘(SendInput / CGEvent,自绘 UI 唯一可靠路径,兜底)。
-    你不需要手工选层 —— 驱动自动降级;返回文案中的 `route=uia / win32_msg / physical`
-    标注实际路线,复查与报告时引用它即可。
-16. **鼠标键盘原子能力(第 90 轮)**:`control_action=move_point`(悬停)、
-    `middle_click_point`(中键)、`drag_point`(拖拽:x/y 起点 + x2/y2 终点);
-    `modifiers="ctrl"/"ctrl+shift"/"alt"/"win"` 参数配合 click_point/double_click_point/
-    right_click_point/drag_point 实现**修饰键 + 鼠标同时操作**(ctrl+点击多选、
-    shift+点击区选、ctrl+拖拽复制)。坐标来自 ocr 的 screen_cx/screen_cy 或
-    窗口 bounds 比例估算。
-17. **input_batch 复合步骤(第 90 轮)**:需要 3 步以上连续鼠标/键盘/控件操作时,
-    用 `action=input_batch(window_id, steps=[...])` 一次调用编排全部步骤
-    (一次前台守卫,步骤间零返场零焦点竞态):steps 元素 op ∈ mouse_move / mouse_click
-    (button/clicks/modifiers)/ mouse_drag / mouse_scroll / key_press(keys 支持 ctrl+a 等
-    组合)/ type_text / click(path)/ set_text(path,text)/ get_text(path,key —— 读取值
-    直接出现在返回 results 里,无需二次调用)/ wait(ms)。典型范式:清空并重填输入框
-    `[mouse_click 输入框, key_press ctrl+a, type_text 新文本, key_press enter]`;
-    滑块拉满 `[mouse_drag x,y → x2,y2]`;多选 `[mouse_click+modifiers=ctrl, mouse_click+modifiers=ctrl]`。
-    steps ≤ 40、整批 ≤ 60s;默认失败即停,可 continue_on_error=true。
-18. **run_sequence 连续工作模式(2026-09-19 第 91 轮新增,人机共用机器首选)**:
-    同应用连续 UI 操作(打开 → 检视/OCR → 点击 → 等异步 UI 就绪 → 输入 → 断言已发送,
-    涉及 OCR 验证、异步等待、用户随时切窗)一律用 `action=run_sequence(window_id, steps=[...])`
-    一次调用完成,不要拆成多次 control/input_batch(input_batch 只在开头做一次前台守卫,
-    中途用户切窗会打进别的窗口;run_sequence 每个物理输入步骤前都做焦点守护):
-    - steps.op 集合(input_batch 10 op + 3 验证/等待 op):mouse_move / mouse_click /
-      mouse_drag / mouse_scroll / key_press / type_text / click / set_text / get_text / wait +
-      **assert_text{path,contains}(关键节点自检,文本不含 contains 走 on_error 策略)** /
-      **wait_for_text{path,contains,timeout_ms<=30000,poll_ms}(轮询等异步 UI 就绪,替代盲 wait)** /
-      **wait_front{timeout_ms<=30000}(显式恢复前台,长时间动作前的保险)**。
-    - **逐步焦点守护 focus_guard**(默认 true):每个物理输入步骤(mouse_*/key_press/type_text/click)
-      执行前确认窗口仍在前台,丢失则 bring_to_front + 轮询 <=focus_wait_ms(默认 5000)重夺;
-      **连续 3 次重夺失败止损中止(focus_aborted=true)**,与 chat_loop 止损同源 - 防止误输入
-      到其他软件。看到 focus_aborted 时不要换路线重试,提醒用户保持目标窗口前台。
-    - **错误策略 on_error**:abort(默认,失败即停)/ continue(记 failed_steps 继续)/
-      retry(逐步自动重试,retry_times<=3、retry_delay_ms<=5000,步骤级同名键覆盖)。
-      步骤级 `optional=true` 容忍非关键步骤失败。
-    - **执行记录落盘 log_path**(默认 <工作目录>/laew_sequence_<unix_ts>.log):每步
-      [STEP]/[RETRY]/[FOCUS_LOST]/[FOCUS_REGAINED]/[FAIL] + 末尾 [SUMMARY],
-      长批失败后可对账。
-    - 护栏:steps <= 100;wait <= 30s;wait_for_text timeout <= 30s;focus_wait_ms <= 30s;
-      retry_times <= 3;max_total_ms <= 600s(默认 180s,超时剩余步骤标记 skipped)。
-    - **典型范式**(打开会话 -> 等待列表刷新 -> 输入文本 -> 提交 -> 断言已发送):
-      steps = [
-        {op:"mouse_click", x:<会话坐标>, y:<会话坐标>},
-        {op:"wait_for_text", path:"/<输入框 path>", contains:"<目标会话名>", timeout_ms:5000},
-        {op:"click", path:"/<输入框 path>"},
-        {op:"type_text", text:"<消息内容>"},
-        {op:"key_press", keys:"enter"},
-        {op:"assert_text", path:"/<消息区 path>", contains:"<消息内容首 5 字>", optional:true}
-      ]。
-    - **方法论**(先摸索 -> 统一 plan -> 连续执行):
-      ① 摸索(capability_probe -> open/list/find -> inspect/ocr)
-      ② 统一 plan(LLM 在上下文里排 steps,异步 UI 处插 wait_for_text,关键节点插 assert_text)
-      ③ 连续执行(一次 run_sequence 调用,逐步焦点守护 + 三级错误策略 + 落盘记录)
-      ④ 复查(按返回 steps 记录 + log_path 对账;失败片段 re-inspect 后用新 run_sequence 补做)。
-    - **input_batch vs run_sequence 选型**:input_batch 适合 <=10 步的短复合动作(点输入框->ctrl+a
-      ->输文本->enter 一次完成),fail-fast + 开头一次守卫即可;run_sequence 适合任何含
-      OCR 断言 / 异步 UI 等待 / 错误重试 / 用户长时间操作中途会切窗的场景,**默认首选 run_sequence**。
-20. **第 100 轮 · 双工作模式与 UI 快照治理(2026-09-21)**:
-    工具提供 **两种工作模式,可混合、可多次连续调用**:
-    - **单步执行模式**(Single-Step Mode):一次调用一个 action(capability_probe / find /
-      inspect / ocr / control),适合未知页面探索、高风险操作、不可逆操作;
-    - **连续执行模式**(Continuous Mode,**默认首选**,人机共用机器必备):
-      **探索侧** `action=explore` 一次拿全 + 快照落盘 + actionable 摘要 +
-      **执行侧** `action=run_sequence` 一次连续执行 + 验证/重试/焦点守护。
-    - **首选双调用范式**(不要拆 capability_probe+find+inspect+ocr 四步):
-      ① action=explore(query="微信", max_depth=6, snapshot_label="微信主界面") 拿快照 + digest
-      ② action=run_sequence(steps=[{op:"click", path:"<actionable[2].path>"}, ...])
-    - **explore 返回体关键字段**:
-      snapshot_id(随机 6 位,供 `@explore_ref/<id>/<path>` 引用);
-      snapshot_path(全量 tree 无截断,LLM 后续可 Read 按需加载);
-      capability + recommended_route(决定走 AX / 视觉 / osascript_fallback);
-      tree_summary{total_nodes, actionable_count, self_drawn, ocr_used};
-      actionable[*]{path, role, name, value, bounds, screen_cx, screen_cy, actions}
-      (屏幕绝对坐标,可直接喂给 click_point);
-      ocr_blocks(自绘 UI 微信 4.x 自动 OCR 兜底)。
-    - **混合用法**:`explore + run_sequence`(标准);`explore + run_sequence + explore +
-      run_sequence`(失败片段 re-explore 重做);`chat_send/chat_loop` 与 run_sequence 互斥;
-      `run_sequence` 内可夹 `get_text / assert_text / wait_for_text` 验证步骤。
-    - **Doom Loop 防护**(工具层内置,opencode L1516 同机制):连续 3 次完全相同
-      (action, window_id, path, control_action) 的调用,第三次返回 `doom_loop=true` +
-      next_action 引导换 selector / 路线 / 询问用户;看到 ⚠doom_loop=3 时不要重复相同输入,
-      先 action=explore 重新探索 UI。
-    - 设计参考 docs/MCP_Window_Use/01-设计与解决方案.md §15 +
-      openclaw frameId 去重 / claudecode partitionToolCalls /
-      hermes-agent discriminator 单工具 / pi snapshot + event 双轨。
-19. 长时等待/保活/心跳/定时类红线 (第 91 轮):
-    严禁用 Bash (Start-Sleep / sleep / python time.sleep / PowerShell Start-Sleep) 循环凑时长
-    (SubAgent 迭代上限 16, 50s×16=800s 仍可能不夠,且每轮浪费 token);
-    (a) 多轮聊天(每分钟 N 条,持续 M 分钟) → chat_loop(messages, interval_seconds, max_rounds) 一次;
-    (b) 周期检测 → input_batch(steps=[wait ms=N, ocr, ...]) 或多次 chat_loop;
-    (c) 限时等待 → action=open(wait_seconds=N) 已内置;
-20. Windows 平台专属 (第 91 轮):
-    (a) capability_probe 恒全 true;osascript_run/fallback Windows 不可用;
-    (b) 微信 4.x 自绘 UI 走 visual_no_input 路线 → 必须依赖 ocr 拿精坐标;
-    (c) chat_loop 默认 visual_no_input:一定要 ocr 取入框 70 70\u70b9 click_point 递\u4f20;
-21. **自绘 UI + 屏录未授权 = chat_send/chat_loop 唯一路径(最高优先级,第 101 轮)**:
-    当 capability_probe 返回 screen_recording=false 且 inspect/explore 控件树
-    只有窗口框架(AXWindow + ≤5 个标题栏按钮,无 AXTextField/AXScrollArea/AXGroup
-    等功能区控件)时 —— 这是自绘 UI(微信 4.x/钉钉/飞书/QQ/Electron canvas),
-    **AX 路线与视觉路线均不可用**,唯一正确路径:
-    → chat_send(window_id, text) 一调用完成(工具自动选 osascript_fallback 路线:
-       activate + 前台守卫 + bounds 比例估算输入框 + keystroke + Enter,不依赖截图)
-    → 10 分钟级多轮聊天: chat_loop(window_id, messages, interval_seconds=30,
-       max_rounds=20, chat_log_path="...") 一调用完成
-    **绝对禁止**(浪费迭代,全部无效):
-    × 继续 inspect / 换 filter / 换 max_depth 重试
-    × osascript_run 遍历 AX 子元素(微信不暴露)
-    × action=ocr(屏录未授权,必败)
-    看到 self_drawn=true 或 tree_summary.actionable_count=0 时,
-    第 2 步必须走 chat_send/chat_loop,没有第 3 条路。
-    **迭代预算红线**: 你的迭代上限只有 16 次,分配建议 ——
-    第 1 步: explore(一次拿全); 第 2 步: chat_send 或 chat_loop(执行);
-    第 3 步: chat_send/inspect 复查。连续 2 次相同 action 返回相同空结果 →
-    立即止损换路线,不要第 3 次。\70 70\u70b9 click_point 递\u4f20;
+4. **explore + run_sequence 双调用(连续工作模式,人机共用机器必备)**:
+   - **首选** `explore` 一次拿全(快照落盘 + 摘要 + 能力矩阵 + 路线建议),
+     把发现阶段从 4~5 次往返压缩到 1 次。
+   - 再用 `run_sequence(steps=[...], focus_guard=true, on_error=retry)` 一次
+     连续执行(≤100 步),含 assert_text/wait_for_text 验证等待、逐步焦点守护、
+     log 落盘。
+   - 失败片段可 re-explore + 新 run_sequence 补做;**chat_send/chat_loop 与
+     run_sequence 互斥**(发送动作不进 run_sequence)。
+   - **人机共用机器 / 任务链 ≥ 3 步 / 用户随时会切窗**一律首选此双调用范式;
+     仅 ≤2 步纯读取才走单步模式。
+   - 返回体关键字段:`snapshot_id` / `recommended_route` / `tree_summary{
+     self_drawn, ocr_used}` / `actionable[*]{screen_cx, screen_cy}`(屏幕绝对坐标)。
+   - **Doom Loop 防护**(工具层内置):连续 3 次完全相同 (action, window_id, path,
+     control_action) 时第三次返回 `doom_loop=true` + 引导换 selector;看到
+     ⚠doom_loop=3 不要重复相同输入,先 action=explore 重新探索。
+
+5. **自绘 UI + 屏录未授权 = chat_send/chat_loop 唯一路径(最高优先级)**:
+   适用:微信 4.x / 钉钉 / 飞书 / QQ / Electron canvas 等自绘 UI。
+   当 capability_probe 返回 `screen_recording=false` 且 inspect/explore 控件树
+   只有窗口框架(AXWindow + ≤5 个标题栏按钮,无 AXTextField/AXScrollArea/AXGroup
+   等功能区控件)时 —— **AX 路线与视觉路线均不可用**,唯一正确路径:
+   - `chat_send(window_id, text)` 一调用完成(自动选 osascript_fallback 路线)
+   - 10 分钟级多轮聊天:`chat_loop(window_id, messages, interval_seconds=30,
+     max_rounds=20, chat_log_path="...")` 一调用完成
+   **绝对禁止**(浪费迭代):× 继续 inspect / 换 filter/换 max_depth 重试;
+   × osascript_run 遍历 AX 子元素(微信不暴露);× action=ocr(屏录未授权,必败)。
+   看到 self_drawn=true 或 tree_summary.actionable_count=0 时,第 2 步必须走
+   chat_send/chat_loop,没有第 3 条路。
+
+6. **长时等待/保活红线**:
+   严禁用 Bash (Start-Sleep / sleep / python time.sleep / PowerShell Start-Sleep)
+   循环凑时长(SubAgent 迭代上限 16,50s×16=800s 仍可能不够且每轮浪费 token)。
+   - 多轮聊天(每分钟 N 条,持续 M 分钟)→ chat_loop 一次
+   - 周期检测 → input_batch(steps=[wait ms=N, ocr, ...]) 或多次 chat_loop
+   - 限时等待 → action=open(wait_seconds=N) 已内置
+
+7. **迭代预算红线**: 上限 16 次,分配建议 ——
+   第 1 步 explore(一次拿全);第 2 步 chat_send/chat_loop(执行);
+   第 3 步 复查。连续 2 次相同 action 返回相同空结果 → 立即止损换路线,不要第 3 次。
+
+8. **Windows 平台专属**:capability_probe 恒全 true;osascript_run/fallback 不可用;
+   微信 4.x 自绘 UI 走 visual_no_input 路线 → 必须 ocr 取右下输入框坐标
+   click_point 传给 chat_loop。
+
+通用规范:
+- **顺序**:目标应用未启动先 action=open;已返回 window_id 直接复用,不要重复启动。
+- **inspect 控件树失败**(自绘 UI 标志):< 500 节点全是 AXWindow/Group 框架 → 切
+  chat_send/osascript_fallback 或 ocr 视觉路线。**禁止**反复 inspect 换 max_depth/filter 重试。
+- **OCR / screenshot 不可用**:`capability.ocr_screenshot_cgwindow=false` 表示完全不可用,
+  **禁止**重试 ocr/screenshot,直接走 chat_send(osascript_fallback)。
+- **多 action 串联**:典型 `open → inspect/ocr → control/input_batch → 复查`;
+  微信/钉钉等自绘 UI 直接 `open → explore → chat_loop`(跳过中间步骤)。
+- **平台门控**:仅 macOS / Windows 注册本工具;Linux 上 inspect/control/ocr 失败,
+  仅 list/find/open 仍可用,但工具不进 builtin_registry。
+- **白名单 app**(auto_launch_target):WeChat/Chrome/Slack/Telegram/QQ/钉钉/飞书/
+  VSCode/iTerm2/Terminal/Notion 等允许自动启动;其他 app 必须用户授权。
+- 严禁 Bash echo / Write 手写假「窗口已打开」/`mcp_action=` 等标记蒙混 QC;
+  任务以工具自产 chat_log [SEND]/summary_report 行数为验收锚点。
 "#;
 
 // =================== MCP_Web_Use 工具使用说明(2026-09-18 第 89 轮) ===================

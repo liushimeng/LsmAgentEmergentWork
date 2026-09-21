@@ -263,7 +263,7 @@ pub fn format_task_result(
             // 工具调用明细:成功 WF 取首 5 条,失败 WF 全量(便于反推失败步骤)
             if !trace.tool_call_log.is_empty() {
                 let show_all = trace.tool_calls_err > 0;
-                let max_show = if show_all { usize::MAX } else { 5 };
+                let max_show = if show_all { usize::MAX } else { 3 }; // M7: 精简 5→3
                 let icon = |ok: bool| if ok { "✅" } else { "❌" };
                 let mut count = 0;
                 for tc in &trace.tool_call_log {
@@ -868,16 +868,16 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
             // 提取 command 字段(尝试简单解析;失败回退到原文)
             let cmd =
                 extract_json_field(args_json, "command").unwrap_or_else(|| args_json.to_string());
-            let short = truncate_chars(&cmd, 44);
+            let short = truncate_chars(&cmd, 30); // M7: 44→30
             format!("cmd={short}")
         }
         "Write" | "Edit" => {
             let p = extract_json_field(args_json, "path").unwrap_or_else(|| args_json.to_string());
-            format!("path={}", truncate_chars(&p, 50))
+            format!("path={}", truncate_chars(&p, 40)) // M7: 50→40
         }
         "Read" => {
             let p = extract_json_field(args_json, "path").unwrap_or_else(|| args_json.to_string());
-            format!("path={}", truncate_chars(&p, 50))
+            format!("path={}", truncate_chars(&p, 40)) // M7: 50→40
         }
         "MCP_Window_Use" => {
             // 2026-09-18 第 84 轮:窗口操控统一入口,突出 action + 定位要素
