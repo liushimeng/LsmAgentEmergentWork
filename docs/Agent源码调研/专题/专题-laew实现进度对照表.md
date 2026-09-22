@@ -806,3 +806,34 @@ ocr_with_info 在屏幕录制未授权时返回结构化「权限缺失」错误
 **未做（后续候选）**:JSONL 双后端/多设备同步（D14）/ 会话内全文搜索（LIKE on title 已有索引基础）/ 手动删除单个会话命令 / -p 单轮模式持久化。
 
 **累计**:第八轮 §7 P0/P1 ✅,第十七轮 P0「无会话恢复」✅。
+
+---
+
+## 第 111 轮（2026-09-22）— SSE 流工具调用 JSON 修复链增强与工具名清洗
+
+**主题**：D21 工具调用修复与流式防护（第二十轮 L2291-L2350）中 **对 laew 架构可直接落地的部分**——SSE 流 tool_call 参数解析插入 json_repair 语法修复环节 + 工具名伪标记清洗。
+
+| 编号 | gap | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|---------|---------|
+| L2291 | 无工具调用 JSON 修复链（SSE 流） | ✅ | `src/llm/sse.rs::parse_tool_call_arguments`（四级回退：完整 JSON → json_repair 语法修复 → partial_json 截断恢复 → _raw 兜底） | 2026-09-22 第 111 轮 |
+| L2292 | 无智能引号修复（tool_call 参数） | ✅ | 同上（`json_repair::repair_json` 含 `pass_smart_quotes`） | 同上 |
+| L2293 | 无全角标点修复（tool_call 参数） | ✅ | 同上（`pass_fullwidth_punct`） | 同上 |
+| L2294 | 无尾逗号修复（tool_call 参数） | ✅ | 同上（`pass_trailing_commas`） | 同上 |
+| L2295 | Python 常量修复（tool_call 参数） | ✅ | 同上（`pass_python_consts`） | 同上 |
+| L2301 | 伪标记清洗（工具名维度） | ✅ | `src/llm/sse.rs::sanitize_tool_name`（Harmony 通道标记 / 方括号标记 / XML-ish 标记 / 空白剥离） | 同上 |
+| L2311 | 流式工具_call 修复（SSE 流场景） | ✅ | `src/llm/sse.rs`（SSE 流即 laew 的流式场景） | 同上 |
+
+**设计要点**:
+- **四级回退链**:`parse_tool_call_arguments` 封装完整→修复→截断→兜底逻辑，`feed()` 和 `finish()` 共用
+- **修复后 partial**:`parse_partial_json_object` 在修复后的版本上执行（原始版本可能有语法错误导致 partial 也失败）
+- **工具名清洗保守策略**:仅剥离明确伪标记（Harmony/方括号/XML），合法工具名不变
+- **性能**:`repair_json` 仅在 `serde_json::from_str` 失败后调用，正常路径零开销
+- **向后兼容**:所有现有测试继续通过（1392 全过）
+
+**验证**:单元测试 28/28 sse 模块全过（新增 11 项：智能引号/全角标点/尾逗号/Python常量/修复+partial/兜底/Harmony标记/方括号标记/XML标记/合法名不变/feed 集成）;全量 1392 全过;e2e 188 PASS（与基线 186 PASS 相比无回退，tmux 栈测试环境相关失败与本轮无关）。
+
+**不在范围（D21 剩余 gap）**:L5 stream-normalizer（laew 用 Anthropic/OpenAI 结构化 tool_call 流，无需 token 流实时识别）/ L6 ProtectedRange（laew TUI 纯文本 cell-based，无 Markdown 渲染需求）/ L6 纯文本工具调用修复（CLI 场景小模型非主流）。
+
+**方案**:`tmpPlan/2026-09-22_01-工具调用JSON修复链增强与工具名清洗方案.md`
+
+**累计**:D21 落地 7/60 gap（L1 全 5 个子项 + L4 工具名维度 + L1 流式维度）。

@@ -175,6 +175,118 @@ impl Default for SseStream {
     }
 }
 
+/// 清洗工具名中的模型输出伪标记。
+///
+/// 部分模型（Harmony 格式、旧版微调模型）可能在 tool_name 外包裹伪标记，
+/// 导致工具 registry 匹配失败。本函数以保守策略剥离明确伪标记，
+/// 不改变合法工具名。
+///
+/// 清洗规则：
+/// 1. Harmony 通道标记: `<|call|>`, `<|end_call|>`, `<|channel|>...<|message|>`
+/// 2. 方括号标记: `[tool_call]`, `[/tool_call]`, `[END_TOOL_REQUEST]`
+/// 3. XML-ish 标记: `<function_calls>`, `</function_calls>`, `<function ...>`, `</function>`
+/// 4. 首尾空白/换行剥离
+pub(crate) fn sanitize_tool_name(name: &str) -> String {
+    let mut s: String = name.trim().to_string();
+
+    // 1. Harmony 通道标记: <|channel|>final<|message|>Bash → Bash
+    //    先处理成对的 <|channel|>...<|message|> 包裹(整个移除)
+    while let Some(start) = s.find("<|") {
+        if let Some(end) = s[start..].find("|>") {
+            let end_abs = start + end + 2;
+            let marker = &s[start..end_abs];
+            if marker == "<|channel|>" {
+                // <|channel|>...<|message|> 整体移除
+                if let Some(msg_end) = s[end_abs..].find("<|message|>") {
+                    let msg_abs = end_abs + msg_end + "<|message|>".len();
+                    s = format!("{}{}", &s[..start], &s[msg_abs..]).trim().to_string();
+                } else {
+                    // <|channel|> 无 <|message|> 配对,只移除 <|channel|>
+                    s = format!("{}{}", &s[..start], &s[end_abs..]).trim().to_string();
+                }
+            } else if marker == "<|message|>" {
+                // 单独的 <|message|> 移除
+                s = format!("{}{}", &s[..start], &s[end_abs..]).trim().to_string();
+            } else {
+                // 其他 <|...|> 标记(<|call|> / <|end_call|> 等)移除
+                s = format!("{}{}", &s[..start], &s[end_abs..]).trim().to_string();
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 2. 方括号标记: [tool_call]Bash[/tool_call] → Bash
+    //    匹配成对的 [xxx]...[/xxx] 或单个 [xxx]
+    let bracket_markers = ["[tool_call]", "[/tool_call]", "[END_TOOL_REQUEST]"];
+    for marker in &bracket_markers {
+        s = s.replace(marker, "");
+    }
+    // 通用方括号包裹: 移除 [anything] 形式的前缀/后缀
+    while s.starts_with('[') {
+        if let Some(end) = s.find(']') {
+            s = s[end + 1..].trim_start().to_string();
+        } else {
+            break;
+        }
+    }
+    while s.ends_with(']') {
+        // 找最后一个 '['
+        if let Some(start) = s.rfind('[') {
+            let candidate = &s[start..];
+            if candidate.starts_with('[') && candidate.ends_with(']') {
+                s = s[..start].trim_end().to_string();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 3. XML-ish 标记: <function_calls>Bash</function_calls> → Bash
+    let xml_markers = ["<function_calls>", "</function_calls>", "</function>"];
+    for marker in &xml_markers {
+        s = s.replace(marker, "");
+    }
+    // <function name="..."> 前缀
+    while s.starts_with("<function") {
+        if let Some(end) = s.find('>') {
+            s = s[end + 1..].trim_start().to_string();
+        } else {
+            break;
+        }
+    }
+
+    s.trim().to_string()
+}
+
+/// 解析 tool_call 参数 JSON,带四级回退链。
+///
+/// 1. `serde_json::from_str` — 完整合法 JSON(fast path)
+/// 2. `json_repair::repair_json` + `serde_json::from_str` — 语法修复(智能引号/全角/单引号/尾逗号/Python 常量)
+/// 3. `partial_json::parse_partial_json_object` (修复后) — 截断恢复
+/// 4. `json!({ "_raw": ... })` — 丢弃结构,原始文本兜底
+///
+/// D21 L1: 在 SSE 流 tool_call 参数解析中集成 json_repair 语法修复链。
+fn parse_tool_call_arguments(json_buf: &str) -> Value {
+    // 1. 完整 JSON fast path
+    if let Ok(v) = serde_json::from_str::<Value>(json_buf) {
+        return v;
+    }
+    // 2. 语法修复 + 重解
+    let repaired = crate::agent::json_repair::repair_json(json_buf);
+    if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+        return v;
+    }
+    // 3. 修复后仍截断 → partial 恢复(对修复后的版本做,因为原始版本可能有语法错误)
+    if let Some(v) = crate::agent::partial_json::parse_partial_json_object(&repaired) {
+        return v;
+    }
+    // 4. 兜底
+    json!({ "_raw": json_buf })
+}
+
 /// 协议无关的事件:协议 parser 把 `SseEvent` 翻译成 `DeltaEvent`,
 /// 再喂给 [`ParseSink`],由 sink 聚合出 [`Completion`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +371,8 @@ impl ParseSink {
             }
             DeltaEvent::TextDelta(s) => self.text.push_str(&s),
             DeltaEvent::ToolCallStart { id, name } => {
+                // D21 L4: 清洗工具名伪标记（Harmony / 方括号 / XML-ish）
+                let name = sanitize_tool_name(&name);
                 self.in_flight.push_back(InFlightToolCall {
                     id,
                     name,
@@ -272,14 +386,8 @@ impl ParseSink {
             }
             DeltaEvent::ToolCallEnd => {
                 if let Some(call) = self.in_flight.pop_back() {
-                    // 三级回退:完整 JSON → partial JSON(恢复截断字段) → _raw 兜底。
-                    let arguments: Value = serde_json::from_str(&call.json_buf)
-                        .ok()
-                        .or_else(|| {
-                            // 长 tool_call 参数被 max_tokens / 中断截断时,恢复已完成的字段。
-                            crate::agent::partial_json::parse_partial_json_object(&call.json_buf)
-                        })
-                        .unwrap_or_else(|| json!({ "_raw": call.json_buf }));
+                    // 四级回退:完整 JSON → json_repair 语法修复 → partial JSON(恢复截断字段) → _raw 兜底。
+                    let arguments: Value = parse_tool_call_arguments(&call.json_buf);
                     self.tool_calls.push(ToolCallReq {
                         id: call.id,
                         name: call.name,
@@ -309,11 +417,7 @@ impl ParseSink {
         // 也把 in_flight 残留的 tool_calls 尝试 parse 出来,避免丢调用。
         let mut tool_calls = self.tool_calls;
         for call in self.in_flight {
-            // 三级回退:完整 JSON → partial JSON(恢复截断字段) → _raw 兜底。
-            let arguments: Value = serde_json::from_str(&call.json_buf)
-                .ok()
-                .or_else(|| crate::agent::partial_json::parse_partial_json_object(&call.json_buf))
-                .unwrap_or_else(|| json!({ "_raw": call.json_buf }));
+            let arguments: Value = parse_tool_call_arguments(&call.json_buf);
             tool_calls.push(ToolCallReq {
                 id: call.id,
                 name: call.name,
@@ -600,5 +704,202 @@ mod tests {
         let m = c.tool_calls[0].arguments.as_object().unwrap();
         assert_eq!(m["command"], "ls");
         assert!(m.get(crate::agent::partial_json::TRUNCATED_KEY).is_none());
+    }
+
+    // ========== D21: 工具调用 JSON 修复链集成测试(L2291-L2350) ==========
+
+    #[test]
+    fn sink_tool_call_smart_quotes_repaired() {
+        // 智能引号: \u{201C}command\u{201D}:\u{201C}ls\u{201D} → 修复后应能解析
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\u{201C}command\u{201D}:\u{201C}ls\u{201D}}".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        let m = c.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(m["command"], "ls");
+        assert!(m.get(crate::agent::partial_json::TRUNCATED_KEY).is_none());
+    }
+
+    #[test]
+    fn sink_tool_call_fullwidth_punctuation_repaired() {
+        // 全角标点: "command"\u{FF1A}"ls" → 修复后应能解析
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\"\u{FF1A}\"ls\"}".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        let m = c.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(m["command"], "ls");
+    }
+
+    #[test]
+    fn sink_tool_call_trailing_comma_repaired() {
+        // 尾逗号: {"command":"ls",} → 修复后应能解析
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":\"ls\",}".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        let m = c.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(m["command"], "ls");
+    }
+
+    #[test]
+    fn sink_tool_call_python_constant_repaired() {
+        // Python 常量: {"enabled": True} → 修复后应能解析
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":\"ls\",\"enabled\":True}".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        let m = c.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(m["command"], "ls");
+        assert_eq!(m["enabled"], true);
+    }
+
+    #[test]
+    fn sink_tool_call_repair_then_partial() {
+        // 智能引号 + 截断 → 修复后走 partial 路径
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+        })
+        .unwrap();
+        // 智能引号 + 截断: {\u{201C}command\u{201D}:\u{201C}ls\u{201D},\u{201C}workdir\u{201D}:\u{201C}/ho
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\u{201C}command\u{201D}:\u{201C}ls\u{201D},\u{201C}workdir\u{201D}:\u{201C}/ho".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop {
+            stop_reason: Some("max_tokens".into()),
+        })
+        .unwrap();
+        let c = sink.finish().unwrap();
+        let m = c.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(m["command"], "ls");
+        assert_eq!(m["workdir"], "/ho");
+        assert_eq!(
+            m[crate::agent::partial_json::TRUNCATED_KEY],
+            true,
+            "修复后仍截断应走 partial 路径并标记"
+        );
+    }
+
+    #[test]
+    fn sink_tool_call_repair_fallback_to_raw() {
+        // 修复 + partial 均失败 → _raw 兜底
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "X".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("not json at all".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        let m = c.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(m["_raw"], "not json at all");
+    }
+
+    // ========== D21 L4: 工具名伪标记清洗测试 ==========
+
+    #[test]
+    fn sanitize_tool_name_harmony_marker() {
+        assert_eq!(sanitize_tool_name("<|call|>Bash"), "Bash");
+        assert_eq!(sanitize_tool_name("Bash<|end_call|>"), "Bash");
+        assert_eq!(sanitize_tool_name("<|channel|>final<|message|>Read"), "Read");
+        assert_eq!(sanitize_tool_name("<|call|>Write<|end_call|>"), "Write");
+    }
+
+    #[test]
+    fn sanitize_tool_name_bracket_marker() {
+        assert_eq!(sanitize_tool_name("[tool_call]Bash"), "Bash");
+        assert_eq!(sanitize_tool_name("Bash[/tool_call]"), "Bash");
+        assert_eq!(sanitize_tool_name("[tool_call]Read[/tool_call]"), "Read");
+        assert_eq!(sanitize_tool_name("[END_TOOL_REQUEST]Bash"), "Bash");
+    }
+
+    #[test]
+    fn sanitize_tool_name_xml_marker() {
+        assert_eq!(sanitize_tool_name("<function_calls>Bash"), "Bash");
+        assert_eq!(sanitize_tool_name("Bash</function_calls>"), "Bash");
+        assert_eq!(sanitize_tool_name("<function name=\"Write\">Write"), "Write");
+        assert_eq!(sanitize_tool_name("Write</function>"), "Write");
+        assert_eq!(
+            sanitize_tool_name("<function_calls><function name=\"Bash\">Bash</function></function_calls>"),
+            "Bash"
+        );
+    }
+
+    #[test]
+    fn sanitize_tool_name_unchanged_for_normal() {
+        assert_eq!(sanitize_tool_name("Bash"), "Bash");
+        assert_eq!(sanitize_tool_name("Read"), "Read");
+        assert_eq!(sanitize_tool_name("Write"), "Write");
+        assert_eq!(sanitize_tool_name("MCP_Window_Use"), "MCP_Window_Use");
+        assert_eq!(sanitize_tool_name("MCP_Web_Use"), "MCP_Web_Use");
+        // 首尾空白应被剥离
+        assert_eq!(sanitize_tool_name("  Bash  "), "Bash");
+        assert_eq!(sanitize_tool_name("\nRead\n"), "Read");
+    }
+
+    #[test]
+    fn sink_tool_call_name_harmony_marker_stripped() {
+        // Harmony 标记应在 feed 时被清洗
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "<|call|>Bash<|end_call|>".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"command\":\"ls\"}".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        assert_eq!(c.tool_calls[0].name, "Bash");
+    }
+
+    #[test]
+    fn sink_tool_call_name_xml_marker_stripped() {
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "<function_calls>Read</function_calls>".into(),
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::ToolCallJsonDelta("{\"path\":\"/a\"}".into()))
+            .unwrap();
+        sink.feed(DeltaEvent::ToolCallEnd).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        assert_eq!(c.tool_calls[0].name, "Read");
     }
 }
