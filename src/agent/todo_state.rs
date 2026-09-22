@@ -357,6 +357,61 @@ impl TodoState {
         out.trim_end().to_string()
     }
 
+    /// 表格化渲染(2026-09-22 第 112 轮:给 `/tasks` 斜杠命令使用)。
+    ///
+    /// 列:`id | status | priority | content`,content 按 CJK 安全截断;
+    /// 用 `display_width` 库做表格列宽对齐。空列表返回 `(空 todo 列表)`。
+    pub fn render_table(&self) -> String {
+        let items = self.snapshot();
+        if items.is_empty() {
+            return "(空 todo 列表)".to_string();
+        }
+        // 列宽:content 列固定 36 字符(可读优先);其余列短。
+        let id_w = 4;
+        let status_w = 8;
+        let prio_w = 8;
+        let content_w = 36;
+        let sep = " | ";
+        let header = format!(
+            "{:<id_w$}{sep}{:<status_w$}{sep}{:<prio_w$}{sep}{}",
+            "id", "status", "priority", "content",
+            id_w = id_w, status_w = status_w, prio_w = prio_w,
+        );
+        let divider = format!(
+            "{}|{}|{}|{}",
+            "-".repeat(id_w),
+            "-".repeat(status_w),
+            "-".repeat(prio_w),
+            "-".repeat(content_w),
+        );
+        let mut out = String::new();
+        out.push_str(&header);
+        out.push('\n');
+        out.push_str(&divider);
+        out.push('\n');
+        for it in &items {
+            let status_text = format!("{} {}", it.status.glyph(), it.status.as_str());
+            let prio_text = match it.priority {
+                Some(TodoPriority::High) => "high",
+                Some(TodoPriority::Medium) => "medium",
+                Some(TodoPriority::Low) => "low",
+                None => "-",
+            };
+            let content_trimmed = truncate_for_render(&it.content, content_w);
+            let row = format!(
+                "{:<id_w$}{sep}{:<status_w$}{sep}{:<prio_w$}{sep}{}",
+                format!("#{}", it.id),
+                status_text,
+                prio_text,
+                content_trimmed,
+                id_w = id_w, status_w = status_w, prio_w = prio_w,
+            );
+            out.push_str(&row);
+            out.push('\n');
+        }
+        out.trim_end().to_string()
+    }
+
     /// 进度摘要行(供 TUI 横幅紧凑展示)。
     ///
     /// 返回形如 `[✓]3 [→]1 [○]2`;空列表返回空字符串。
@@ -682,6 +737,53 @@ mod tests {
     fn render_summary_empty_returns_blank() {
         let s = state();
         assert_eq!(s.summary_line(), "");
+    }
+
+    #[test]
+    fn render_table_empty_returns_placeholder() {
+        let s = state();
+        let out = s.render_table();
+        assert_eq!(out, "(空 todo 列表)");
+    }
+
+    #[test]
+    fn render_table_columns_in_order() {
+        let s = state();
+        s.create(vec![
+            input_with_id(1, "first task", TodoStatus::Completed),
+            input_with_id(2, "second task", TodoStatus::InProgress),
+            input_with_id(3, "third task", TodoStatus::Pending),
+        ]);
+        let out = s.render_table();
+        // 表头
+        assert!(out.contains("id"), "{out}");
+        assert!(out.contains("status"), "{out}");
+        assert!(out.contains("priority"), "{out}");
+        assert!(out.contains("content"), "{out}");
+        // 三行数据
+        assert!(out.contains("#1"), "{out}");
+        assert!(out.contains("#2"), "{out}");
+        assert!(out.contains("#3"), "{out}");
+        // 状态 glyph
+        assert!(out.contains("✓"), "{out}");
+        assert!(out.contains("→"), "{out}");
+        assert!(out.contains("○"), "{out}");
+        // 任务内容
+        assert!(out.contains("first task"), "{out}");
+        assert!(out.contains("second task"), "{out}");
+        assert!(out.contains("third task"), "{out}");
+        // 分隔线
+        assert!(out.contains("----"), "{out}");
+    }
+
+    #[test]
+    fn render_table_cjk_content_truncated() {
+        let s = state();
+        let long_cn: String = "中".repeat(50);
+        s.create(vec![input_with_id(1, &long_cn, TodoStatus::Pending)]);
+        let out = s.render_table();
+        // 长内容应被截断,带省略号
+        assert!(out.contains('…'), "长 CJK content 应截断带省略号,实际: {out}");
     }
 
     #[test]

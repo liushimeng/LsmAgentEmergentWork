@@ -179,6 +179,11 @@ impl TuiSession {
             "cost" | "usage" => {
                 self.run_cost();
             }
+            // D19 TODO 任务列表查询(2026-09-22 第 112 轮):表格列出当前 session 的 TodoWrite 状态。
+            // 三别名 tasks / todo / todos,与 laew 多别名约定一致(/rewind + /undo)。
+            "tasks" | "todo" | "todos" => {
+                self.run_tasks();
+            }
             // D4 工作区感知(2026-09-13):查看/刷新工作区快照。
             "workspace" | "ws" => {
                 self.run_workspace(rest_args);
@@ -374,6 +379,25 @@ impl TuiSession {
     ///
     /// 展示内容与注入给 Agent 的 `<<<LAEW:WORKSPACE>>>` / PROJECT_CONTEXT 工作区段一致,
     /// 便于用户核对「模型看到的运行环境」。
+    /// D19 TODO 任务列表查询(2026-09-22 第 112 轮)。
+    ///
+    /// 输出当前 session 的 TodoWrite 清单(表格形式):
+    /// - id / status(glyph + 文案) / priority / content 四列
+    /// - 空列表时给「无任务」提示 + 引导语
+    /// - 顶部附 summary_line 计数行,首屏即可见进度
+    fn run_tasks(&self) {
+        let summary = self.todo_state.summary_line();
+        if summary.is_empty() {
+            println!("  当前 session 无任务清单。");
+            println!("  SubAgent / Main-Work 在多步任务中会通过 TodoWrite 工具自动建立清单,");
+            println!("    或在自定义斜杠命令中调用 TodoWrite create 显式规划。");
+            return;
+        }
+        println!("  任务清单(/tasks): {summary}");
+        println!();
+        println!("{}", self.todo_state.render_table());
+    }
+
     fn run_workspace(&self, arg: &str) {
         let arg = arg.trim().to_ascii_lowercase();
         let force = matches!(arg.as_str(), "refresh" | "rf" | "-f" | "--force");

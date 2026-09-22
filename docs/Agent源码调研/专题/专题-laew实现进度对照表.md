@@ -837,3 +837,35 @@ ocr_with_info 在屏幕录制未授权时返回结构化「权限缺失」错误
 **方案**:`tmpPlan/2026-09-22_01-工具调用JSON修复链增强与工具名清洗方案.md`
 
 **累计**:D21 落地 7/60 gap（L1 全 5 个子项 + L4 工具名维度 + L1 流式维度）。
+
+---
+
+## 第 112 轮（2026-09-22）— Bash 输出落盘 (D17) + /tasks 命令 + TODO 持久化 (D19)
+
+**主题**：第二十轮 L2051+ D17 大对象溢出与外部产物存储（deepseek `spill/` 2529 行 / claudecode `BashTool/utils.ts:101`）+ 第二十轮 L2171+ D19 TODO 任务清单增强（opencode `todo.ts` / claudecode `/tasks` 列表 / 跨 session 持久化）。
+
+| 编号 | gap | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|---------|---------|
+| L2051 | Bash 输出无 spill 机制（30K 字符硬截断,LLM 永久丢失大输出） | ✅ | `src/agent/tools/bash_spill.rs` 新建（`maybe_spill` / `format_stream_block` / `spill_root_dir` / `BashStream` 枚举）+ `src/agent/tools/bash.rs` execute 后接 spill 替换 truncate | 2026-09-22 第 112 轮 |
+| L2052 | spill 阈值不可配置 | ✅ | `LAEW_BASH_SPILL_THRESHOLD` 环境变量可覆盖（默认 30000）,`threshold_chars()` 解析失败回退默认 | 同上 |
+| L2053 | spill 失败无降级 | ✅ | `SpillOutcome::FailedFallback` 变体 + `[spill failed: <reason>]` 警告透传,原 truncate 行为兜底 | 同上 |
+| L2054 | spill 路径无并发防冲突 | ✅ | `random_hex6()` Splitmix64 混合 (pid × nanos × 原子计数器) 生成 6 位 hex 后缀 | 同上 |
+| L2055 | spill 无 CJK 安全切片 | ✅ | `head_chars` / `tail_chars` 按 `char_indices` 切而非按字节切,中文不切坏 | 同上 |
+| L2056 | spill 文件未隔离 | ✅ | `BashSpill/` 子目录 + `.gitignore` 登记,与 `CrashReport/` / `AuditTrail/` 同级 | 同上 |
+| L2171 | TODO 工具无列表命令（用户查不到当前 todo 详细） | ✅ | `src/agent/todo_state.rs::render_table()` 表格化（id / status glyph+str / priority / content 4 列,CJK 安全截断）+ `src/tui/slash.rs::run_tasks` + 三别名 `tasks / todo / todos` + `src/tui/completion.rs` 补全 + `src/tui/format.rs` 帮助行 | 同上 |
+| L2172 | TODO 状态未持久化到 session_memory（跨 session 看不到上次进度） | ✅ | `src/agent/session_context.rs::append_todo_snapshot_to_summary` / `extract_todo_snapshot_from_summary` / `strip_todo_snapshot_block` + 标记 `<<<LAEW:TODOS>>>` / `<<<LAEW:TODOS_END>>>` + `build_history_message` 自动提取最近 Summary 的 TODO 注入下次 Yolo 上下文 | 同上 |
+| L2173 | TODO 持久化易踩脏数据 | ✅ | `strip_todo_snapshot_block` 从主摘要正文剥除 TODO 标记块,避免双展示;`history` 注入时仅展示清洗后的摘要 + 独立「最近一次回复的 TODO 状态」块 | 同上 |
+
+**设计要点**:
+- **spill 头部 + 尾部 = 5K + 5K**:比单头部更友好,尾部通常含错误信息与最终结果
+- **路径相对化**:`BashSpill/bash_20260922_103045_a1b2c3.stdout.log` 形式,LLM 可用 Read 工具直接读
+- **跨 SubAgent 并发**:pid + nanos + atomic counter 三重混合 6 位 hex 后缀防覆盖
+- **零新 crate**:`std::fs` + `time` crate(已有依赖);`splitmix64` 自研
+- **TODO 标记隔离**:与 `<<<LAEW:ATTACHMENTS>>>` / `<<<LAEW:SESSION_HISTORY>>>` 风格一致,失败安全降级
+- **help / 补全**:三别名 + 完整提示,符合既有约定(`/rewind` + `/undo`)
+
+**验证**:单元测试 1419 全过（基线 1398 → 新增 21 项:bash_spill 14 + bash 集成 3 + todo_state render_table 3 + session_context 1 抽取 + 摘要含 TODO 1 + strip block 1）;新增功能 0 回退;cargo build OK。
+
+**方案**:`tmpPlan/2026-09-22_02-Bash输出落盘与TODO任务命令与持久化方案.md`
+
+**累计**:D17 落地 6/60 gap（D19 增强 3/60）。

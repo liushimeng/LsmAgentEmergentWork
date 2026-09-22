@@ -53,3 +53,6 @@ TestWorkSpace/
 
 # laew 运行期配置文件(含 api_key,不入库)
 /laew-config.json
+
+# BashSpill(Bash 大输出落盘产物,D17 大对象溢出,自动落盘不入库)
+BashSpill/

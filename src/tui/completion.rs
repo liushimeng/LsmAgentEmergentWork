@@ -131,6 +131,8 @@ impl CompletionEngine {
             SlashCommand::builtin("offline", &["status"], "查看连接状态与离线队列", "/offline"),
             // D8 会话成本(2026-09-17 第 76 轮):用量与成本估算面板
             SlashCommand::builtin("cost", &["usage"], "查看会话用量与成本估算", "/cost"),
+            // D19 TODO 任务列表(2026-09-22 第 112 轮):表格列出当前 session 的 TodoWrite 清单
+            SlashCommand::builtin("tasks", &["todo", "todos"], "查看当前 session 的 TODO 任务清单", "/tasks"),
             // D4 工作区感知(2026-09-13):环境快照查看
             SlashCommand::builtin(
                 "workspace",

@@ -12,6 +12,10 @@
 //! 设计参考:atomcode bash.rs:249-303(强制 setsid + killpg + kill_on_drop);
 //! claudecode timeouts.ts(DEFAULT_TIMEOUT_MS=120_000 / MAX_TIMEOUT_MS=600_000);
 //! openclaw bash-tools.exec-runtime.ts(KillProcessTree group-aware)。
+//!
+//! 2026-09-22 第 112 轮(D17 大对象溢出):大输出自动落盘
+//! `BashSpill/`(`bash_spill::maybe_spill`),返回头部+尾部+路径,
+//! LLM 可用 Read 工具回读完整内容。落盘失败时降级到阈值截断。
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -23,12 +27,16 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::agent::permissions;
+use crate::agent::tools::bash_spill::{self, BashStream};
 use crate::agent::tools::Tool;
 use crate::error::{AgentError, Result};
 
 /// 默认超时与上限
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+// 注:原 MAX_OUTPUT_CHARS 阈值由 bash_spill::DEFAULT_THRESHOLD 接管(D17 大对象溢出)。
+// 本常量保留仅为保留历史兼容位置;不再被本文件引用。
+#[allow(dead_code)]
 const MAX_OUTPUT_CHARS: usize = 30_000;
 /// SIGTERM → SIGKILL 升级等待时间,给进程清理时间(写文件 / flush buffer)
 const KILL_GRACE_MS: u64 = 5_000;
@@ -223,6 +231,10 @@ impl Tool for BashTool {
          - 一次调用执行一条命令;多条命令请用 && / ; 连接。\n\
          - 避免使用 cat/head/tail/sed/awk/echo 这类专用命令 — 请改用 Read / Write 等专用工具。\n\
          \n\
+         【大输出落盘(D17)】当 stdout 或 stderr 超过 30000 字符时,完整内容会\n\
+         自动写入根目录 BashSpill/bash_*.log,工具返回头部 5K + 完整路径 + 尾部 5K。\n\
+         LLM 可用 Read 工具打开该路径取回完整输出。\n\
+         \n\
          【安全提示】以下命令会被自动拦截:\n\
          - 危险命令:rm -rf /、rm -rf ~、dd 写磁盘、mkfs/fdisk、chmod 777、shutdown/reboot、sudo、curl|bash 等\n\
          - 敏感路径:~/.ssh、~/.aws、~/.gnupg、.env.production、/proc/self/environ 等\n\
@@ -341,30 +353,20 @@ impl Tool for BashTool {
                 let stdout = String::from_utf8_lossy(&o.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&o.stderr).to_string();
 
-                let stdout_trunc = truncate(&stdout, MAX_OUTPUT_CHARS);
-                let stderr_trunc = truncate(&stderr, MAX_OUTPUT_CHARS);
+                let root_dir = bash_spill::spill_root_dir();
+                let stdout_outcome = bash_spill::maybe_spill(BashStream::Stdout, &stdout, &root_dir);
+                let stderr_outcome = bash_spill::maybe_spill(BashStream::Stderr, &stderr, &root_dir);
+
+                let stdout_block = bash_spill::format_stream_block(BashStream::Stdout, &stdout_outcome);
+                let stderr_block = bash_spill::format_stream_block(BashStream::Stderr, &stderr_outcome);
 
                 let mut buf = String::new();
-                if !stdout_trunc.truncated.is_empty() {
-                    buf.push_str("<stdout>\n");
-                    buf.push_str(&stdout_trunc.text);
-                    if stdout_trunc.omitted > 0 {
-                        buf.push_str(&format!(
-                            "\n...[stdout 截断,省略 {} 字符]",
-                            stdout_trunc.omitted
-                        ));
-                    }
+                if !stdout_block.is_empty() {
+                    buf.push_str(&stdout_block);
                     buf.push('\n');
                 }
-                if !stderr_trunc.truncated.is_empty() {
-                    buf.push_str("<stderr>\n");
-                    buf.push_str(&stderr_trunc.text);
-                    if stderr_trunc.omitted > 0 {
-                        buf.push_str(&format!(
-                            "\n...[stderr 截断,省略 {} 字符]",
-                            stderr_trunc.omitted
-                        ));
-                    }
+                if !stderr_block.is_empty() {
+                    buf.push_str(&stderr_block);
                     buf.push('\n');
                 }
                 if buf.is_empty() {
@@ -426,30 +428,6 @@ fn kill_process_tree(pid: Option<u32>) {
 fn kill_process_tree(_pid: Option<u32>) {
     // Windows:本轮不实现,依赖 kill_on_drop + 直接 pid kill
     // (留作 P1:用 Job Object / taskkill /T)
-}
-
-struct Truncated {
-    text: String,
-    truncated: String,
-    omitted: usize,
-}
-
-fn truncate(s: &str, max: usize) -> Truncated {
-    if s.len() <= max {
-        Truncated {
-            text: s.to_string(),
-            truncated: s.to_string(),
-            omitted: 0,
-        }
-    } else {
-        // 防止按 char 边界切割出错,按 char 索引切
-        let cut = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
-        Truncated {
-            text: s[..cut].to_string(),
-            truncated: s[..cut].to_string(),
-            omitted: s.len() - cut,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -578,5 +556,78 @@ mod tests {
             .await
             .unwrap();
         assert!(off.contains("[]"), "默认不注入,实际: {off}");
+    }
+
+    /// 2026-09-22 第 112 轮:D17 大对象溢出。输出 > 30K 时应触发落盘,返回含
+    /// `BashSpill/bash_*.stdout.log` 路径;LLM 可据此读完整内容。
+    #[tokio::test]
+    async fn bash_large_stdout_spills_to_disk_and_reports_path() {
+        let _env = lock_env();
+        // 临时把阈值降到 2K 加快测试
+        let prev = std::env::var("LAEW_BASH_SPILL_THRESHOLD").ok();
+        std::env::set_var("LAEW_BASH_SPILL_THRESHOLD", "2048");
+        // 生成 5K 字节的输出,超过 2K 阈值
+        let out = BashTool
+            .execute(json!({
+                "command": "python3 -c \"import sys; sys.stdout.write('A' * 5000)\"",
+                "timeout_ms": 10000u64,
+            }))
+            .await
+            .unwrap();
+        match prev {
+            Some(v) => std::env::set_var("LAEW_BASH_SPILL_THRESHOLD", v),
+            None => std::env::remove_var("LAEW_BASH_SPILL_THRESHOLD"),
+        }
+        // 应包含 spill 路径提示
+        assert!(
+            out.contains("BashSpill/bash_") && out.contains(".stdout.log"),
+            "应包含 spill 路径,实际: {}",
+            &out[..out.len().min(200)]
+        );
+        assert!(out.contains("完整输出"), "应说明完整内容已落盘");
+        assert!(out.contains("省略"), "应给出省略字符数");
+        assert!(out.contains("<exit_code>0</exit_code>"), "正常退出");
+    }
+
+    /// 2026-09-22 第 112 轮:小输出(<= 30K)不应落盘,保持原 truncate 行为。
+    #[tokio::test]
+    async fn bash_small_stdout_keeps_inline() {
+        let out = BashTool
+            .execute(json!({
+                "command": "echo hello-spill-test",
+                "timeout_ms": 5000u64,
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("hello-spill-test"));
+        // 小输出应走 inline 路径,不出现 spill 提示
+        assert!(!out.contains("BashSpill/bash_"), "小输出不应触发 spill");
+        assert!(out.contains("<stdout>"), "应包含 <stdout> 标签");
+        assert!(out.contains("<exit_code>0</exit_code>"));
+    }
+
+    /// 2026-09-22 第 112 轮:stderr 大输出也应独立 spill。
+    #[tokio::test]
+    async fn bash_large_stderr_spills_to_stderr_log() {
+        let _env = lock_env();
+        let prev = std::env::var("LAEW_BASH_SPILL_THRESHOLD").ok();
+        std::env::set_var("LAEW_BASH_SPILL_THRESHOLD", "1024");
+        let out = BashTool
+            .execute(json!({
+                "command": "python3 -c \"import sys; sys.stderr.write('B' * 3000)\"",
+                "timeout_ms": 10000u64,
+            }))
+            .await
+            .unwrap();
+        match prev {
+            Some(v) => std::env::set_var("LAEW_BASH_SPILL_THRESHOLD", v),
+            None => std::env::remove_var("LAEW_BASH_SPILL_THRESHOLD"),
+        }
+        assert!(
+            out.contains(".stderr.log"),
+            "stderr 大输出应落盘到 stderr.log,实际: {}",
+            &out[..out.len().min(300)]
+        );
+        assert!(out.contains("<stderr>"), "应包含 <stderr> 标签");
     }
 }

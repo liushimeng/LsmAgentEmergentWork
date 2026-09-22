@@ -19,6 +19,14 @@ pub const HISTORY_MARKER_START: &str = "<<<LAEW:SESSION_HISTORY>>>";
 /// 历史注入结束标记。
 pub const HISTORY_MARKER_END: &str = "<<<LAEW:SESSION_HISTORY_END>>>";
 
+/// TODO 状态快照标记(2026-09-22 第 112 轮:D19 持久化增强)。
+///
+/// SessionContext 收口时,把当前 TodoWrite 快照 JSON 追加到 Summary 行 content 末尾,
+/// 标记隔离后下游 `build_history_message` / `/tasks` 等可选解析,
+/// 失败时降级为透传文本。
+pub const TODO_SNAPSHOT_MARKER: &str = "<<<LAEW:TODOS>>>";
+pub const TODO_SNAPSHOT_MARKER_END: &str = "<<<LAEW:TODOS_END>>>";
+
 /// 注入历史摘要的最大条数。
 pub const DEFAULT_HISTORY_LIMIT: usize = 3;
 
@@ -49,6 +57,7 @@ impl SessionContextRunner {
         session_id: &str,
         yolo_degraded: bool,
         task_level: &crate::agent::yolo::TaskLevel,
+        todo_snapshot: Option<&str>, // 2026-09-22 第 112 轮:D19 持久化增强
     ) -> Result<SessionSummary> {
         let workflow_line = if workflow_results.is_empty() {
             "(无 WorkFlow)".to_string()
@@ -96,6 +105,11 @@ impl SessionContextRunner {
 
         let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
 
+        // 2026-09-22 第 112 轮:D19 TODO 持久化。把当前 todo 快照 JSON 追加到
+        // Summary 行 content 末尾(标记隔离),下游 build_history_message 解析后
+        // 可注入到下次 Yolo 处理上下文,跨 session 跨任务保持 todo 进度可见。
+        let todo_appended = append_todo_snapshot_to_summary(&text, todo_snapshot);
+
         // 写入 session_memory(Summary 事件)
         let _ = self
             .db
@@ -103,7 +117,7 @@ impl SessionContextRunner {
                 session_id: session_id.to_string(),
                 role: AgentRole::SessionContext,
                 event_type: EventType::Summary,
-                content: text.clone(),
+                content: todo_appended.clone(),
                 usage_input: usage.input_tokens,
                 usage_output: usage.output_tokens,
             });
@@ -178,14 +192,34 @@ pub fn build_history_message(entries: &[crate::config::SessionMemoryRow]) -> Opt
     let mut text = format!("{HISTORY_MARKER_START}\n[SessionMemory 注入,非用户输入]\n");
     text.push_str("以下是本 Session 内最近的任务摘要,用于关联性参考;\n");
     text.push_str("不要把它本身当作用户请求,用户本轮请求以本消息之后的用户消息为准。\n");
+
+    // 2026-09-22 第 112 轮:D19 TODO 持久化增强 — 从最近 Summary 行提取 TODO 快照,
+    // 给下游 Yolo 提供上轮任务的 todo 进度上下文(若有,标"最近一次回复的 TODO")。
+    let mut last_todo_snapshot: Option<String> = None;
+    for e in entries.iter().rev() {
+        if last_todo_snapshot.is_none() {
+            if let Some(snap) = extract_todo_snapshot_from_summary(&e.content) {
+                if !snap.is_empty() && snap != "{}" {
+                    last_todo_snapshot = Some(snap);
+                }
+            }
+        }
+    }
+    if let Some(ref snap) = last_todo_snapshot {
+        text.push_str("\n--- 最近一次回复的 TODO 状态 (D19 持久化) ---\n");
+        text.push_str(snap);
+        text.push_str("\n--- TODO 结束 ---\n\n");
+    }
+
     text.push_str("--- 摘要开始 ---\n");
     for e in entries.iter().rev() {
-        // 旧 → 新 顺序
+        // 旧 → 新 顺序;摘要正文剥除 TODO 标记块(避免重复展示)
+        let cleaned = strip_todo_snapshot_block(&cleaned_content_for_history(&e.content));
         text.push_str(&format!(
             "- [seq={}, {}] {}\n",
             e.seq,
             e.created_at,
-            e.content
+            cleaned
                 .replace('\n', " ")
                 .chars()
                 .take(160)
@@ -195,6 +229,25 @@ pub fn build_history_message(entries: &[crate::config::SessionMemoryRow]) -> Opt
     text.push_str("--- 摘要结束 ---\n");
     text.push_str(HISTORY_MARKER_END);
     Some(ChatMessage::user(text))
+}
+
+/// 从 summary content 中剥除 TODO 快照块(避免正文摘要里混着 JSON)。
+fn strip_todo_snapshot_block(content: &str) -> String {
+    if let Some(start) = content.find(TODO_SNAPSHOT_MARKER) {
+        if let Some(end_rel) = content[start..].find(TODO_SNAPSHOT_MARKER_END) {
+            let end = start + end_rel + TODO_SNAPSHOT_MARKER_END.len();
+            let mut out = String::with_capacity(content.len());
+            out.push_str(&content[..start]);
+            out.push_str(&content[end..]);
+            return out;
+        }
+    }
+    content.to_string()
+}
+
+/// content 用于 history 注入展示的清洗(裁剪尾部空白等)。
+fn cleaned_content_for_history(content: &str) -> &str {
+    content.trim_end()
 }
 
 /// 上下文中是否已注入历史(幂等探测)。
@@ -222,6 +275,33 @@ pub fn inject_history_with_entries(
         }
         None => false,
     }
+}
+
+/// 把 TODO 快照 JSON 拼接到 Summary 文本末尾(2026-09-22 第 112 轮:D19 持久化增强)。
+///
+/// 2026-09-22 第 112 轮抽离:纯文本拼接,供 `summarize()` 与未来其它写入路径共用;
+/// 标记隔离 + 空快照降级 + 标记必成对存在。
+pub fn append_todo_snapshot_to_summary(text: &str, snapshot: Option<&str>) -> String {
+    match snapshot {
+        None => text.to_string(),
+        Some(s) if s.is_empty() || s == "{}" => text.to_string(),
+        Some(s) => format!(
+            "{text}\n\n{TODO_SNAPSHOT_MARKER}\n{s}\n{TODO_SNAPSHOT_MARKER_END}",
+        ),
+    }
+}
+
+/// 从 Summary content 提取 TODO 快照 JSON(下游可选解析)。
+///
+/// 解析失败返回 None,降级行为:下游继续按原文本处理。
+pub fn extract_todo_snapshot_from_summary(content: &str) -> Option<String> {
+    let start = content.find(TODO_SNAPSHOT_MARKER)?;
+    let end = content.find(TODO_SNAPSHOT_MARKER_END)?;
+    if end <= start {
+        return None;
+    }
+    let inner_start = start + TODO_SNAPSHOT_MARKER.len();
+    Some(content[inner_start..end].trim().to_string())
 }
 
 #[cfg(test)]
@@ -279,6 +359,93 @@ mod tests {
         assert!(is_history_injected(sess.context()));
         // 二次:幂等
         assert!(!inject_history_with_entries(&mut sess, &rows));
+    }
+
+    #[test]
+    fn append_todo_snapshot_with_none_returns_original() {
+        let text = "original summary text";
+        let out = append_todo_snapshot_to_summary(text, None);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn append_todo_snapshot_with_empty_returns_original() {
+        let text = "original";
+        let out = append_todo_snapshot_to_summary(text, Some(""));
+        assert_eq!(out, text);
+        let out = append_todo_snapshot_to_summary(text, Some("{}"));
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn append_todo_snapshot_with_json_appends_block() {
+        let text = "original summary";
+        let snap = r#"{"total":2,"completed":1}"#;
+        let out = append_todo_snapshot_to_summary(text, Some(snap));
+        assert!(out.starts_with(text));
+        assert!(out.contains(TODO_SNAPSHOT_MARKER));
+        assert!(out.contains(TODO_SNAPSHOT_MARKER_END));
+        assert!(out.contains(snap));
+    }
+
+    #[test]
+    fn extract_todo_snapshot_round_trip() {
+        let snap = r#"{"total":3,"items":[]}"#;
+        let summary = append_todo_snapshot_to_summary("summary body", Some(snap));
+        let extracted = extract_todo_snapshot_from_summary(&summary);
+        assert_eq!(extracted.as_deref(), Some(snap));
+    }
+
+    #[test]
+    fn extract_todo_snapshot_missing_returns_none() {
+        // 没有标记 → None
+        assert!(extract_todo_snapshot_from_summary("plain text").is_none());
+        // 只有开始标记 → None
+        let partial = format!("text{TODO_SNAPSHOT_MARKER}json");
+        assert!(extract_todo_snapshot_from_summary(&partial).is_none());
+    }
+
+    #[test]
+    fn build_history_message_includes_todo_snapshot() {
+        // 模拟 session_memory 中有一条带 TODO 标记的 Summary
+        let snap = r#"{"total":2,"completed":1,"in_progress":1}"#;
+        let content = append_todo_snapshot_to_summary("summary body", Some(snap));
+        let rows = vec![SessionMemoryRow {
+            id: 1,
+            session_id: "s-1".into(),
+            seq: 1,
+            role: AgentRole::SessionContext,
+            event_type: EventType::Summary,
+            content,
+            usage_input: 0,
+            usage_output: 0,
+            created_at: "2026-09-22 10:00:00".into(),
+        }];
+        let msg = build_history_message(&rows).expect("build");
+        // 标记不应出现在注入文本里(下游 Yolo 应能看到干净的 TODO JSON 块)
+        let text = match msg.content.first().unwrap() {
+            crate::llm::ContentBlock::Text { text } => text,
+            _ => panic!("expected text block"),
+        };
+        assert!(text.contains("最近一次回复的 TODO 状态"), "应包含 TODO 块标题: {text}");
+        assert!(text.contains(snap), "应包含 TODO 快照 JSON: {text}");
+        // 主摘要不应再包含原始 marker(避免双展示)
+        let snapshot_only = format!("{TODO_SNAPSHOT_MARKER}\n{snap}\n{TODO_SNAPSHOT_MARKER_END}");
+        let parts = text.matches(&snapshot_only).count();
+        assert_eq!(parts, 0, "stripped 后 marker 不应再出现: {text}");
+    }
+
+    #[test]
+    fn strip_todo_snapshot_block_basic() {
+        let inner_json = "{\"total\":1}";
+        let content = format!(
+            "summary text\n\n{TODO_SNAPSHOT_MARKER}\n{inner_json}\n{TODO_SNAPSHOT_MARKER_END}\nend"
+        );
+        let out = strip_todo_snapshot_block(&content);
+        assert!(!out.contains(TODO_SNAPSHOT_MARKER));
+        assert!(!out.contains(TODO_SNAPSHOT_MARKER_END));
+        assert!(out.contains("summary text"));
+        assert!(out.contains("end"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::error::{AgentError, Result};
 use crate::llm::ToolDef;
 
 pub mod bash;
+pub mod bash_spill;
 pub mod edit;
 pub mod emit;
 pub mod glob;

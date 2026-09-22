@@ -1341,6 +1341,7 @@ pub(crate) fn print_help() {
     println!("  │  /diff <old> <new> 并排 diff 两个文件(行级+字符级着色)    │");
     println!("  │  /theme [kind]     查看或切换主题(D12 a11y 配色)          │");
     println!("  │  /cost (usage)     查看会话用量与成本估算                 │");
+    println!("  │  /tasks (todos)    查看当前 session TODO 任务清单(D19)     │");
     println!("  │  /workspace [rf]   查看工作区快照(git/工程/最近改动)       │");
     println!("  │  /commands         列出自定义斜杠命令                      │");
     println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");

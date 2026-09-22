@@ -201,6 +201,11 @@ impl MultiAgentOrchestrator {
                 // 让用户/调试脚本区分「Yolo 直答」与「SubAgent 委派执行」两条路径。
                 emit_progress(progress, "[trace] subagent=skipped(direct_answer=true)");
                 let sc_started = std::time::Instant::now();
+                // 2026-09-22 第 112 轮:把 TodoWrite 当前快照传给 SessionContext,
+                // 写入 session_memory Summary 行末尾(下游可选解析)。
+                let todo_snapshot_str = crate::agent::todo_state::global()
+                    .map(|s| s.render_for_session_memory())
+                    .unwrap_or_else(|| "{}".to_string());
                 let summary = self
                     .session_context
                     .summarize(
@@ -212,6 +217,7 @@ impl MultiAgentOrchestrator {
                         session.id(),
                         classification.yolo_degraded,
                         &classification.task_level,
+                        Some(&todo_snapshot_str),
                     )
                     .await?;
                 let sc_elapsed_ms = sc_started.elapsed().as_millis() as u64;
@@ -325,6 +331,11 @@ impl MultiAgentOrchestrator {
                     // 导致写入 session_memory 的摘要用量系统性偏小。
                     let usage_for_summary = add_usage(yolo_usage, task_result.total_usage);
                     let sc_started = std::time::Instant::now();
+                    // 2026-09-22 第 112 轮:D19 TODO 持久化 — 把 TodoWrite 当前快照
+                    // 传给 SessionContext,写入 session_memory Summary 行末尾。
+                    let todo_snapshot_str = crate::agent::todo_state::global()
+                        .map(|s| s.render_for_session_memory())
+                        .unwrap_or_else(|| "{}".to_string());
                     let summary = self
                         .session_context
                         .summarize(
@@ -346,6 +357,7 @@ impl MultiAgentOrchestrator {
                             session.id(),
                             task_result.classification.yolo_degraded,
                             &task_result.classification.task_level,
+                            Some(&todo_snapshot_str),
                         )
                         .await?;
                     let sc_elapsed_ms = sc_started.elapsed().as_millis() as u64;
