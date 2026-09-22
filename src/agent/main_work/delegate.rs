@@ -251,6 +251,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -273,6 +274,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -291,6 +293,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), None);
     }
@@ -312,7 +315,7 @@ mod infer_tests {
                 acceptance: vec![format!("完成{step}")],
                 delegate_to: AgentRole::SubAgent,
                 // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
-                max_iterations: None, original_prompt: None,
+                max_iterations: None, original_prompt: None, pre_explore: false,
             }
         }
         let mut plan = WorkFlowPlan {
@@ -349,6 +352,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -372,6 +376,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -391,6 +396,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -419,6 +425,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -441,6 +448,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -464,6 +472,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -486,6 +495,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -506,6 +516,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), None);
     }
@@ -525,6 +536,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -548,6 +560,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }
@@ -574,6 +587,7 @@ mod infer_tests {
         
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+    pre_explore: false,
 };
         assert_eq!(infer_delegate_to(&spec), Some(AgentRole::SubAgent));
     }

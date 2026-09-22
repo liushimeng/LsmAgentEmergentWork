@@ -14,7 +14,7 @@
             delegate_to: AgentRole::SubAgent,
             // 2026-09-17 第 82+ 轮 P0-1:测试 fixture 默认无目标应用。
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底 fixture
-            max_iterations: None, original_prompt: None,
+            max_iterations: None, original_prompt: None, pre_explore: false,
         }
     }
 
@@ -543,3 +543,23 @@ mod dedup_tests {
         assert_eq!(plan.workflows[1].id, "wf-2");
     }
 }
+
+    /// 第 119 轮:pre_explore 字段 JSON 解析 + 默认 false
+    #[test]
+    fn pre_explore_field_parses_from_json() {
+        // 显式 true
+        let src = r#"{"workflows":[{"id":"wf-1","name":"打开网页","steps":["open"],"acceptance":["ok"],"delegate_to":"subagent","pre_explore":true}],"summary":"s"}"#;
+        let plan = parse_workflow_plan(src).unwrap();
+        assert_eq!(plan.workflows.len(), 1);
+        assert!(plan.workflows[0].pre_explore, "pre_explore=true 应被解析");
+
+        // 显式 false
+        let src = r#"{"workflows":[{"id":"wf-1","name":"本地任务","steps":["bash"],"acceptance":["ok"],"delegate_to":"subagent","pre_explore":false}],"summary":"s"}"#;
+        let plan = parse_workflow_plan(src).unwrap();
+        assert!(!plan.workflows[0].pre_explore, "pre_explore=false 应被解析");
+
+        // 省略 -> 默认 false
+        let src = r#"{"workflows":[{"id":"wf-1","name":"默认","steps":["x"],"acceptance":["y"],"delegate_to":"subagent"}],"summary":"s"}"#;
+        let plan = parse_workflow_plan(src).unwrap();
+        assert!(!plan.workflows[0].pre_explore, "省略 pre_explore 应默认 false");
+    }

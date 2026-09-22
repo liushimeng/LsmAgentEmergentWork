@@ -568,6 +568,7 @@ impl MultiAgentOrchestrator {
             // 2026-09-17 第 82+ 轮 P0-1:simple 档无目标应用自动启动(simple 任务通常无需)。
             // 2026-09-19 第 91 轮 P0-7/P0-8:
             retry_count: 0, retry_hint: String::new(), max_iterations: None,
+            pre_explore: false,
         };
         emit_progress(progress, format!("wf-1 {exec_label} 执行中…"));
         let retry_budget = self.cfg.unit_retry_budget;

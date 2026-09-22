@@ -51,6 +51,7 @@
             // 2026-09-17 第 82+ 轮 P0-1:测试 fixture 无目标应用。
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+            pre_explore: false,
         };
         let input = build_subflow_input(&wf, &std::collections::HashMap::new(), "");
         assert_eq!(input.id, "wf-1.step");
@@ -77,10 +78,55 @@
             // 2026-09-17 第 82+ 轮 P0-1:测试 fixture 无目标应用。
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
             max_iterations: None, original_prompt: None,
+            pre_explore: false,
         };
         let input = build_subflow_input(&wf, &deps, "");
         assert_eq!(input.depends_on_outputs.len(), 1);
         assert!(input.depends_on_outputs[0].contains("已读取 a.rs"));
+    }
+
+    /// 第 119 轮:pre_explore=true 时,description 内追加「批量优先」硬约束,
+    /// 且 SubFlowInput.pre_explore 透传为 true。
+    #[test]
+    fn build_subflow_input_propagates_pre_explore() {
+        let wf = WorkFlowSpec {
+            id: "wf-1".into(),
+            name: "打开云智眼并登录".into(),
+            steps: vec!["open 页面".into()],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec![],
+            acceptance: vec!["登录成功".into()],
+            delegate_to: AgentRole::SubAgent,
+            max_iterations: Some(24),
+            original_prompt: None,
+            pre_explore: true,
+        };
+        let input = build_subflow_input(&wf, &std::collections::HashMap::new(), "");
+        assert!(input.pre_explore, "pre_explore 应透传到 SubFlowInput");
+        assert!(
+            input.description.contains("批量优先"),
+            "description 应含批量优先硬约束: {}",
+            input.description
+        );
+        assert!(
+            input.description.contains("action=explore"),
+            "description 应含 explore 调用提示"
+        );
+        assert!(
+            input.description.contains("action=batch"),
+            "description 应含 batch 调用提示"
+        );
+
+        // pre_explore=false 时不注入提示(零副作用)
+        let mut wf2 = wf.clone();
+        wf2.pre_explore = false;
+        let input2 = build_subflow_input(&wf2, &std::collections::HashMap::new(), "");
+        assert!(!input2.pre_explore);
+        assert!(
+            !input2.description.contains("批量优先"),
+            "pre_explore=false 不应注入提示"
+        );
     }
 
     #[test]
@@ -303,6 +349,7 @@
             retry_count: 0,
             retry_hint: String::new(),
             max_iterations: None,
+            pre_explore: false,
         };
         apply_retry_hint_overlay(&mut input, "读文件失败: permission denied", 1);
         // 基础段保留(wf.name + 步骤)
@@ -347,6 +394,7 @@
             retry_count: 0,
             retry_hint: String::new(),
             max_iterations: None,
+            pre_explore: false,
         };
         apply_retry_hint_overlay(&mut input, "QC: 输出不含 EXPECTED", 2);
         assert!(
@@ -381,6 +429,7 @@
             retry_count: 2,
             retry_hint: "第 2 轮局部重试 hint".into(),
             max_iterations: Some(24),
+            pre_explore: false,
         };
         let json = serde_json::to_string(&input).unwrap();
         let back: SubFlowInput = serde_json::from_str(&json).unwrap();

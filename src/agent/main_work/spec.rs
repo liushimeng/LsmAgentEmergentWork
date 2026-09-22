@@ -36,6 +36,14 @@ pub struct WorkFlowSpec {
     /// 2026-09-19 第 91 轮 P0-8:Main-WorkRunner 在拆解 WorkFlowSpec 时填入(整段用户原始 prompt);SubAgentRunner 透传给 SubAgent,在 SubFlowInput.description 内原样保留.
     #[serde(default)]
     pub original_prompt: Option<String>,
+    /// 第 119 轮新增:「批量优先」提示。标记 true 的 WorkFlow 在 SubAgent 启动前,
+    /// Runner 会在系统提示词尾部注入一段「先 explore 后 batch」的强约束,让 LLM
+    /// 一次性收集页面状态、再一次性执行动作链,避免链式单步调用浪费时间。
+    ///
+    /// Main-Work 拆解时对「网页操作 / 浏览器任务」的 WorkFlow 应默认置 true;
+    /// 纯本地任务的 WorkFlow 保持 false(零副作用)。
+    #[serde(default)]
+    pub pre_explore: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,4 +219,3 @@ where
     };
     Ok(role)
 }
-

@@ -148,10 +148,16 @@ impl MainWorkRunner {
             "\n\n【重要:编排范式——请严格按下方结构输出】\n★ 例 1(★最重要★ 自绘 UI 任务:微信/钉钉/飞书/QQ/桌面聊天 等)\n当任务涉及上述自绘 UI 应用时,**禁止**生成「控件结构深度解析」「控件路径映射表」\n\"AX 路径枚举」等 wf 单元(自绘 UI 控件树为空,这些任务不可能完成,浪费迭代预算)。\n**正确模板(2~3 个 wf,不要 6 个)**:\n  wf-1:打开/激活目标应用 + explore 快照(一次拿全:capability + 控件树 + 屏幕坐标);\n  wf-2:执行核心任务(chat_loop 多轮聊天 / run_sequence 批量操作);\n  wf-3(可选):生成报告(读取 chat_log 落盘 Markdown)。\nwf-2 的 acceptance 锚定 chat_log_path 文件中的 [SEND]/[RECV]/[SUMMARY] 行数,\n不锚定控件路径(自绘 UI 无路径可引用)。\n\n例 2(常规 GUI 任务:VSCode / Notion / 浏览器 DevTools):3~4 个 wf,explore 后\nrun_sequence 连续执行 + 验证,详见下方说明。\n\n请严格按以下 JSON 结构输出(可包裹在 \x60\x60\x60json 代码块中):\n\
              {\"workflows\": [{\"id\": \"wf-1\", \"name\": \"流程名\", \"steps\": [\"步骤\"], \
              \"branches\": [\"条件: 动作\"], \"loops\": [\"条件: 遍历对象\"], \"depends_on\": [], \
-             \"acceptance\": [\"可验证的验收标准\"], \"delegate_to\": \"subagent\", \"max_iterations\": 24}], \"summary\": \"编排思路\"}\n\
+             \"acceptance\": [\"可验证的验收标准\"], \"delegate_to\": \"subagent\", \"max_iterations\": 24, \
+             \"pre_explore\": true}], \"summary\": \"编排思路\"}\n\
              约束:\n\
              - id/name/steps/acceptance/delegate_to 必填;branches/loops/depends_on/summary 可省略。\n\
              - max_iterations: 可选整数 4~32;长时多轮聊天(>5 分钟或 >10 轮)/ 长时保活 / 含 5+ 步骤的复杂单元建议显式设置(如 24 或 32),避免 SubAgent 跑满 16 次迭代上限半途而废。\n\
+             - pre_explore: 可选布尔;第 119 轮起支持。**凡是涉及网页/浏览器操作(MCP_Web_Use)\n\
+               的 WorkFlow 必须置 true**(登录、表单、进入子页面、抓取菜单/组织树等);\n\
+               Runner 会在 SubAgent 系统提示词尾部注入「先 explore 一次拿全页面状态,再 batch 一次\n\
+               提交全部 control + 验证步骤」的强约束,避免链式单步 round-trip。\n\
+               纯本地任务(Bash/Read/Write)保持省略即可。\n\
              - branches/loops 元素是字符串(形如 \"条件: 动作\")或对象({\"condition\":…,\"then\":…} / {\"condition\":…,\"over\":…})均可。\n\
              - delegate_to 唯一合法值:\"subagent\"(通用执行层 SubAgent-Work)。桌面窗口操控类任务\n\
                (枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本)由 SubAgent-Work 的\n\
@@ -284,6 +290,7 @@ impl MainWorkRunner {
                             delegate_to: AgentRole::SubAgent,
                             max_iterations: Some(8),
                             original_prompt: original_prompt.map(str::to_string),
+                            pre_explore: false, // 窗口探索任务用 MCP_Window_Use, 非 MCP_Web_Use
                         },
                         WorkFlowSpec {
                             id: "wf-2".into(),
@@ -302,6 +309,7 @@ impl MainWorkRunner {
                             delegate_to: AgentRole::SubAgent,
                             max_iterations: Some(24),
                             original_prompt: original_prompt.map(str::to_string),
+                            pre_explore: false, // 窗口操控任务用 MCP_Window_Use
                         },
                     ],
                     summary: "Main-Work 解析失败,自绘 UI 任务 2 wf 兜底模板(M8)".into(),
@@ -320,6 +328,7 @@ impl MainWorkRunner {
                         delegate_to: AgentRole::SubAgent,
                         // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
                         max_iterations: None, original_prompt: None,
+                        pre_explore: false,
                     }],
                     summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
                     degraded: true,

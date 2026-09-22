@@ -62,6 +62,10 @@ pub struct HumanAssistDisplay {
     /// 关联 page_id(展示用)。
     pub page_id: String,
     pub timeout_ms: u64,
+    /// 第 119 轮新增:输入提示符同行可视宽度(中文/全角算 2 列),
+    /// TUI 协程用它把倒计时右对齐到屏幕右侧(避免压在提示符上)。
+    /// 默认 0 走「整行重写」回退路径, 不参与右对齐。
+    pub prompt_visual_width: u16,
 }
 
 /// 工具侧等待结果(四态,对齐 deepseek approval outcome 审计语义)。
@@ -99,6 +103,10 @@ pub struct HumanAssistHub {
     state: Mutex<HubState>,
     /// 槽位从占用变为空闲时唤醒排队中的 request。
     slot_free: Notify,
+    /// 第 119 轮新增:hub 端超时后通知 TUI 协程, 让 TUI 立即清理
+    /// 视觉残留(蓝框 + 输入提示符 + 倒计时行)。
+    /// TUI 协程用 `now_or_never()` 非阻塞检查, 不破坏原有 250ms tick 节奏。
+    timeout_notify: Notify,
 }
 
 impl HumanAssistHub {
@@ -109,9 +117,15 @@ impl HumanAssistHub {
                 attached: AtomicBool::new(false),
                 state: Mutex::new(HubState::default()),
                 slot_free: Notify::new(),
+                timeout_notify: Notify::new(),
             })
         })
         .clone()
+    }
+
+    /// 第 119 轮新增:订阅超时事件(用于 TUI 协程非阻塞检查)。
+    pub fn timeout_notified(&self) -> &Notify {
+        &self.timeout_notify
     }
 
     /// TUI(TTY)启动时调用;非 TTY 模式不调用,request 将 fail-fast。
@@ -166,6 +180,7 @@ impl HumanAssistHub {
                             url: url.to_string(),
                             page_id: page_id.to_string(),
                             timeout_ms,
+                            prompt_visual_width: 0,
                         },
                         responder: tx,
                     });
@@ -204,6 +219,8 @@ impl HumanAssistHub {
                     }
                 }
                 self.slot_free.notify_waiters();
+                // 第 119 轮:通知 TUI 协程 hub 已超时, 让它立即清理视觉(避免卡死)。
+                self.timeout_notify.notify_waiters();
                 HumanAssistOutcome::Timeout
             }
         }
@@ -240,6 +257,8 @@ impl HumanAssistHub {
     pub fn cancel_pending(&self) {
         drop(lock_state(&self.state).current.take());
         self.slot_free.notify_waiters();
+        // 第 119 轮:任务收尾时也通知 TUI, 让它清理残留视觉。
+        self.timeout_notify.notify_waiters();
     }
 }
 
@@ -365,6 +384,48 @@ mod tests {
             .await;
         assert_eq!(out, HumanAssistOutcome::Timeout);
         assert!(hub.poll().is_none(), "超时后槽位应被清理");
+        hub.detach();
+    }
+
+    /// 第 119 轮:hub 端超时 / 任务收尾时必须通知 TUI 协程, 让 TUI 立即清理
+    /// 残留视觉(倒计时同行右对齐 + 输入提示符), 避免 TUI 卡死等用户输入。
+    ///
+    /// 用 `cancel_pending`(同一条 notify_waiters 通道)做确定性验证, 避免依赖
+    /// MIN_HUMAN_ASSIST_TIMEOUT_MS(10s 下限)导致测试挂 10 秒。
+    #[tokio::test]
+    async fn cancel_pending_notifies_tui_via_timeout_notify() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let hub = HumanAssistHub::global();
+        hub.attach();
+        // 入位一个长超时请求(不依赖真实超时)
+        let task = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.request("captcha", "x", vec![], "", "p_n", 60_000).await }
+        });
+        // 等 request 入位(poll 能看到)
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if hub.poll().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("poll 应拿到请求");
+        // 先注册通知守卫并 poll 一次(Notified 首次 poll 才注册到 waiter 列表)
+        let mut notified = Box::pin(hub.timeout_notified().notified());
+        tokio::select! {
+            _ = &mut notified => panic!("尚未触发超时, 不应收到通知"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        // 触发 notify_waiters(cancel_pending 同样走该通道)
+        hub.cancel_pending();
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("cancel_pending 后应收到 timeout_notified 通知");
+        // 工具侧应收敛为 Unavailable(responder drop)
+        assert_eq!(task.await.unwrap(), HumanAssistOutcome::Unavailable);
         hub.detach();
     }
 

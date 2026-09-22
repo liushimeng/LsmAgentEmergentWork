@@ -136,6 +136,9 @@ impl Agent {
         // 执行轨迹累计(2026-09-09 第 05 轮):每次循环同步填充 trace 字段,
         // 单元结束时由 ExecutionTrace::collect_failure_signals 统一打标。
         let mut trace = ExecutionTrace::default();
+        // 第 119 轮:记录本会话迭代预算, TUI / QC 可一眼区分「跑满上限」
+        // 与「提前收敛」(iter=12/32 vs iter=12/12)。
+        trace.max_iterations = self.max_iterations;
 
         // 关联报告: 2026-09-09_06 F-002 — 最近工具调用历史(用于无文本收敛短路时
         // 输出「叙事化摘要」,而非纯机械的次数统计;最多保留 RECENT_TOOL_HISTORY_LIMIT

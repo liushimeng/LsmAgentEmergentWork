@@ -548,3 +548,62 @@ async fn request_human_invalid_reason_returns_1001() {
         .unwrap();
     assert!(res.contains("\"code\":2000"), "page_id 不存在应为 2000: {res}");
 }
+
+// =================== explore / batch 参数校验(第 119 轮) ===================
+
+#[tokio::test]
+async fn explore_missing_page_id_returns_1001() {
+    let res = McpWebUseTool
+        .execute(json!({"action": "explore", "queries": [{"info": "elements"}]}))
+        .await
+        .unwrap();
+    assert!(res.contains("\"code\":1001"), "缺 page_id 应 1001: {res}");
+}
+
+#[tokio::test]
+async fn explore_empty_queries_returns_1001() {
+    let res = McpWebUseTool
+        .execute(json!({"action": "explore", "page_id": "p_x", "queries": []}))
+        .await
+        .unwrap();
+    assert!(res.contains("\"code\":1001"), "空 queries 应 1001: {res}");
+}
+
+#[tokio::test]
+async fn explore_too_many_queries_returns_1001() {
+    let queries: Vec<Value> = (0..9).map(|_| json!({"info": "elements"})).collect();
+    let res = McpWebUseTool
+        .execute(json!({"action": "explore", "page_id": "p_x", "queries": queries}))
+        .await
+        .unwrap();
+    assert!(
+        res.contains("\"code\":1001") && res.contains("最多 8 项"),
+        "超过 8 项应 1001: {res}"
+    );
+}
+
+#[tokio::test]
+async fn explore_unknown_page_returns_2000() {
+    let res = McpWebUseTool
+        .execute(json!({
+            "action": "explore",
+            "page_id": "p_nonexist0",
+            "queries": [{"info": "elements"}]
+        }))
+        .await
+        .unwrap();
+    assert!(res.contains("\"code\":2000"), "page_id 不存在应 2000: {res}");
+}
+
+#[tokio::test]
+async fn batch_missing_steps_returns_error() {
+    // batch 是 sequence 的语义别名;缺 steps 应确定性报错(1001)
+    let res = McpWebUseTool
+        .execute(json!({"action": "batch", "page_id": "p_nonexist0"}))
+        .await
+        .unwrap();
+    assert!(
+        res.contains("\"code\":1001") || res.contains("\"code\":2000"),
+        "batch 缺 steps 应确定性报错: {res}"
+    );
+}

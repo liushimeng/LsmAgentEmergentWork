@@ -158,7 +158,7 @@ impl MultiAgentOrchestrator {
                                     acceptance: vec![],
                                     delegate_to: AgentRole::SubAgent,
                                     // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
-                                    max_iterations: None, original_prompt: None,
+                                    max_iterations: None, original_prompt: None, pre_explore: false,
                                 },
                                 Err(QualityFailure {
                                     source: AgentRole::SubAgent,
@@ -713,6 +713,21 @@ pub(super) fn build_subflow_input(
             "\n\n⚠️ 上一轮本单元失败原因,必须改变策略\n{retry_hint}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。"
         ));
     }
+    // 第 119 轮:pre_explore 标记为 true 时, 在 description 内附加「批量优先」硬约束;
+    // 与 SubAgentRunner 注入的 system prompt hint 形成双保险(description 进 user 消息,
+    // system hint 进 system 字段, 两者都在 LLM 上下文中)。
+    if wf.pre_explore {
+        description.push_str(
+            "\n\n⚡ 批量优先(本单元硬约束,第 119 轮):\n\
+             ① 第一步用 MCP_Web_Use(action=explore, page_id=<页面 id>, queries=[\n\
+             {\"info\":\"elements\"}, {\"info\":\"dom\",\"params\":{\"selector\":\"form\"}}, {\"info\":\"screenshot\"}\n\
+             ]) 一次收集页面状态;\n\
+             ② 结构清晰后用 MCP_Web_Use(action=batch, steps=[input_text × N → click → wait → inspect 验证])\n\
+             一次提交全部写操作 + 验证;\n\
+             ❌ 禁止链式单步(inspect → click → inspect → screenshot → ...);\n\
+             ✅ 单次任务的 LLM round-trip 应 ≤ 6 次。",
+        );
+    }
     // 2026-09-19 第 91 轮 P0-8:wf.original_prompt 透传整段用户原始 prompt(兜底回退 wf.name)
     let original_prompt = wf.original_prompt.clone().or_else(|| Some(wf.name.clone()));
     SubFlowInput {
@@ -730,5 +745,6 @@ pub(super) fn build_subflow_input(
         retry_count: 0,
         retry_hint: retry_hint.to_string(),
         max_iterations: wf.max_iterations,
+        pre_explore: wf.pre_explore,
     }
 }

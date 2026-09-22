@@ -100,6 +100,10 @@ pub struct ExecutionTrace {
     /// 默认 false(serde 兼容旧 trace);见 src/agent/orchestrator/types.rs。
     #[serde(default)]
     pub explore_budget_exhausted: bool,
+    /// 第 119 轮新增:本会话的迭代预算上限(与 `iterations` 对比可一眼看出
+    /// 「跑满上限」还是「提前收敛」)。0 表示未记录(旧 trace 反序列化)。
+    #[serde(default)]
+    pub max_iterations: usize,
 }
 
 /// 单次工具调用摘要(2026-09-16 第 56 轮 + 第 57 轮)。
@@ -179,6 +183,7 @@ impl Default for ExecutionTrace {
             intended_role: None,
             permission_missing: Vec::new(),
             explore_budget_exhausted: false,
+            max_iterations: 0,
         }
     }
 }

@@ -163,7 +163,7 @@ mod tests {
             delegate_to: AgentRole::SubAgent,
             // 2026-09-17 第 82+ 轮 P0-1:默认无目标应用。
             // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
-            max_iterations: None, original_prompt: None,
+            max_iterations: None, original_prompt: None, pre_explore: false,
         }
     }
 

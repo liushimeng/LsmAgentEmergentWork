@@ -64,6 +64,12 @@ pub struct SubFlowInput {
     /// `None` 表示使用 Runner 默认值。
     #[serde(default)]
     pub max_iterations: Option<usize>,
+    /// 第 119 轮新增:「批量优先」约束(仅用于浏览器/网页类 WorkFlow)。
+    /// true 时 Runner 在 SubAgent 系统提示词尾部注入「先 explore 一次拿全,再 batch
+    /// 一次提交」的强约束,避免链式单步(每次调用消耗 LLM round-trip)。
+    /// 默认 false,不改变既有任务行为。
+    #[serde(default)]
+    pub pre_explore: bool,
 }
 
 impl SubFlowInput {
@@ -918,6 +924,7 @@ mod tests {
             retry_count: 0,
             retry_hint: String::new(),
             max_iterations: None,
+            pre_explore: false,
         };
 
         let outcome = runner
@@ -966,6 +973,7 @@ mod tests {
             retry_count: 0,
             retry_hint: String::new(),
             max_iterations: None,
+            pre_explore: false,
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("wf-1.step-1"));
@@ -996,6 +1004,7 @@ mod tests {
             retry_count: 0,
             retry_hint: String::new(),
             max_iterations: None,
+            pre_explore: false,
         };
         let prompt = input.to_user_prompt();
         assert!(prompt.contains("上游产物"));
@@ -1021,6 +1030,7 @@ mod tests {
             retry_count: 0,
             retry_hint: String::new(),
             max_iterations: None,
+            pre_explore: false,
         };
         let prompt = input.to_user_prompt();
         assert!(!prompt.contains("用户原始输入"));
@@ -1042,6 +1052,7 @@ mod tests {
             retry_count: 0,
             retry_hint: String::new(),
             max_iterations: None,
+            pre_explore: false,
         };
         let json = serde_json::to_string(&input).unwrap();
         // original_prompt 默认值是 null,确保 SubAgent 输入 JSON 兼容老实现

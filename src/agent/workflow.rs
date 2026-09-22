@@ -210,6 +210,7 @@ pub fn build_subflow_from_goal(goal: &Goal, subgoal: &Goal) -> SubFlowInput {
         // 2026-09-17 第 82+ 轮 P0-1:Goal 路径默认无目标应用自动启动,LLM 可显式指定。
         // 2026-09-19 第 91 轮 P0-7/P0-8:
         retry_count: 0, retry_hint: String::new(), max_iterations: None,
+        pre_explore: false,
     }
 }
 

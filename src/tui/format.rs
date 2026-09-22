@@ -252,9 +252,16 @@ pub fn format_task_result(
                     trace.permission_missing.join(", ")
                 ));
             }
+            // 第 119 轮:iter 一并显示预算上限(iter=12/32), 让「跑满上限」
+            // 与「提前收敛」一眼可辨;旧 trace(max_iterations=0)保持只显示实际值。
+            let iter_display = if trace.max_iterations > 0 {
+                format!("{}/{}", trace.iterations, trace.max_iterations)
+            } else {
+                trace.iterations.to_string()
+            };
             out.push_str(&format!(
                 "  [trace] iter={} tools={}(ok={},err={}) early_term={}\n",
-                trace.iterations,
+                iter_display,
                 trace.tool_calls,
                 trace.tool_calls_ok,
                 trace.tool_calls_err,
@@ -550,7 +557,12 @@ pub fn format_failed_detail(
             }
             out.push_str(&format!(
                 "  [trace] iter={} tools={}(ok={},err={}) early_term={}\n",
-                trace.iterations,
+                // 第 119 轮:失败路径同样显示预算上限(iter=12/32)
+                if trace.max_iterations > 0 {
+                    format!("{}/{}", trace.iterations, trace.max_iterations)
+                } else {
+                    trace.iterations.to_string()
+                },
                 trace.tool_calls,
                 trace.tool_calls_ok,
                 trace.tool_calls_err,

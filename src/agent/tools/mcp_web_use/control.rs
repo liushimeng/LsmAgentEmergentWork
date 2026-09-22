@@ -1430,9 +1430,12 @@ pub(super) async fn run_explore(args: Value) -> crate::error::Result<String> {
         let mut single = serde_json::Map::new();
         single.insert("action".into(), Value::String("inspect".into()));
         single.insert("page_id".into(), Value::String(id.to_string()));
-        if let Some(info) = q.get("info").cloned() {
-            single.insert("info".into(), info);
-        } else {
+        // 第 119 轮:记录 LLM 请求的 info(用于 results[].info 对齐)。
+        // 早前实现从 envelope data.info 反查,而 inspect 成功响应并不带该字段,
+        // 导致 explore 结果的 info 恒为 null、blockers 特判永不命中。
+        let requested_info = match q.get("info").cloned() {
+            Some(info) if info.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false) => info,
+            _ => {
             // 缺 info → 1001,跳过本次 query(不影响后续)
             results.push(json!({
                 "info": Value::Null,
@@ -1442,7 +1445,9 @@ pub(super) async fn run_explore(args: Value) -> crate::error::Result<String> {
             }));
             err_count += 1;
             continue;
-        }
+            }
+        };
+        single.insert("info".into(), requested_info.clone());
         if let Some(params) = q.get("params").cloned() {
             single.insert("params".into(), params);
         }
@@ -1453,11 +1458,8 @@ pub(super) async fn run_explore(args: Value) -> crate::error::Result<String> {
                 // envelope_str 是 JSON 字符串,parse 后嵌入 results
                 match serde_json::from_str::<Value>(&envelope_str) {
                     Ok(envelope_value) => {
-                        let info = envelope_value
-                            .get("data")
-                            .and_then(|d| d.get("info"))
-                            .cloned()
-                            .unwrap_or(Value::Null);
+                        // 第 119 轮:用 LLM 请求的 info 作为结果标识(不再反查 data.info)
+                        let info = requested_info.clone();
                         let code = envelope_value
                             .get("code")
                             .cloned()

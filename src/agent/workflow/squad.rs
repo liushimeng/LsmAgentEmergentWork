@@ -143,6 +143,7 @@ impl SquadDispatcher {
                 // 2026-09-17 第 82+ 轮 P0-1:Squad 成员默认无目标应用自动启动。
                 // 2026-09-19 第 91 轮 P0-7/P0-8:
                 retry_count: 0, retry_hint: String::new(), max_iterations: None,
+                pre_explore: false,
             };
             let permit = semaphore
                 .clone()
