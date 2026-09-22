@@ -51,8 +51,36 @@ impl Agent {
         self.run_session_cancellable(session, None).await
     }
 
-    /// 循环主体(`run_session` / `run_session_cancellable` 共用)。
+    /// 循环主体 + 动态子 Agent 作用域(2026-09-22 第 114 轮)。
+    ///
+    /// 支持动态启动的角色(见 `AgentProfile::spawn_policy`)在进入循环前建立
+    /// `tokio::task_local` 运行时作用域:作用域内 LLM 调用 `SubAgent` 工具时,
+    /// 工具经 `dynamic_subagent::current()` 取到 LLM 客户端 / 深度 / 预算 / 取消 token。
+    /// 不参与的角色(或 `LAEW_SELF_SPAWN=off`)返回 `None` → 原样直通,**零开销**。
+    ///
+    /// 注:原循环体一字未改,只是改名为 [`Self::run_session_body`] 并被本函数包裹。
     async fn run_session_inner(
+        &self,
+        session: &mut Session,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(String, Usage, ExecutionTrace)> {
+        match crate::agent::dynamic_subagent::runtime_for(
+            &self.profile.name,
+            &self.profile,
+            self.llm.clone(),
+            session.id(),
+            cancel,
+        ) {
+            Some(rt) => {
+                crate::agent::dynamic_subagent::scope(rt, self.run_session_body(session, cancel))
+                    .await
+            }
+            None => self.run_session_body(session, cancel).await,
+        }
+    }
+
+    /// 循环主体(`run_session` / `run_session_cancellable` 共用)。
+    async fn run_session_body(
         &self,
         session: &mut Session,
         cancel: Option<&CancelToken>,

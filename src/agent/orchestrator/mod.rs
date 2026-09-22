@@ -69,6 +69,56 @@ fn truncate_progress_text_default(s: &str, max_chars: usize) -> String {
     truncate_progress_text(s, max_chars)
 }
 
+/// 把动态子 Agent 用量并入编排结局(2026-09-22 第 114 轮)。
+///
+/// 只处理成功返回的三种结局;`Err` 路径(取消 / 硬错误)沿用既有语义不额外记账。
+fn merge_dynamic_usage(
+    outcome: Result<OrchestrationOutcome>,
+    extra: crate::llm::Usage,
+) -> Result<OrchestrationOutcome> {
+    if extra.input_tokens == 0
+        && extra.output_tokens == 0
+        && extra.cache_read_input_tokens == 0
+        && extra.cache_creation_input_tokens == 0
+    {
+        return outcome;
+    }
+    outcome.map(|o| match o {
+        OrchestrationOutcome::DirectAnswer {
+            text,
+            classification,
+            usage,
+        } => OrchestrationOutcome::DirectAnswer {
+            text,
+            classification,
+            usage: usage.merge(extra),
+        },
+        OrchestrationOutcome::Executed { mut result } => {
+            result.total_usage = result.total_usage.merge(extra);
+            OrchestrationOutcome::Executed { result }
+        }
+        OrchestrationOutcome::Failed {
+            classification,
+            reason,
+            suggestion,
+            usage,
+            last_trace,
+            stage_durations,
+            retry_log,
+            wallclock_ms,
+        } => OrchestrationOutcome::Failed {
+            classification,
+            reason,
+            suggestion,
+            usage: usage.merge(extra),
+            last_trace,
+            stage_durations,
+            retry_log,
+            wallclock_ms,
+        },
+    })
+}
+
 /// Orchestrator 行为参数
 
 // ===========================================================================
@@ -193,7 +243,15 @@ impl MultiAgentOrchestrator {
         progress: Option<ProgressTx>,
     ) -> Result<OrchestrationOutcome> {
         let _gate_guard = self.cancel_gate.guard(cancel.clone());
-        self.handle_inner(session, cancel, &progress).await
+        let outcome = self.handle_inner(session, cancel, &progress).await;
+        // 动态子 Agent 用量回收(2026-09-22 第 114 轮):任务边界把会话级台账
+        // 排空并计入本任务用量,保证 Yolo / Plan / Main-Work 等**非 SubAgent 角色**
+        // 发起的子 Agent 消耗同样进入 `/cost` 与 Debug 统计(SubAgent 单元内的
+        // 消耗已在 `SubAgentRunner` 单元边界先行回收,此处 drain 到的为 0,不会重复计数)。
+        merge_dynamic_usage(
+            outcome,
+            crate::agent::dynamic_subagent::drain_usage(session.id()),
+        )
     }
     /// 暴露 Yolo runner(测试用)
     pub fn yolo(&self) -> &YoloRunner {

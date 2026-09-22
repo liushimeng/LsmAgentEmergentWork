@@ -869,3 +869,50 @@ ocr_with_info 在屏幕录制未授权时返回结构化「权限缺失」错误
 **方案**:`tmpPlan/2026-09-22_02-Bash输出落盘与TODO任务命令与持久化方案.md`
 
 **累计**:D17 落地 6/60 gap（D19 增强 3/60）。
+
+---
+
+## 第 114 轮（2026-09-22）— 自感知 SubAgent 动态启动(用户提示词驱动的子 Agent 委派)
+
+**主题**：第六轮 SubAgent 调度专题的剩余缺口（§2.2 四条 + §11.3 后台 SubAgent + §11.4 嵌套 SubAgent）
++ 第十一轮「模型自主委派入口」（claudecode AgentTool / opencode TaskTool / openclaw Subagent Registry）
++ 第十九轮 L1704/L1705/L1740/L1746（注册/生命周期、并发控制、恢复、Swarm 并行）
++ `85-元编程与反射编程范式.md` CC03（ToolRegistry 自省 → Agent 自感知）。
+
+目标:让用户**通过自然语言提示词**（「启动 3 个 SubAgent 并行调研 A/B/C」）即可动态组建子 Agent 小队并汇总;
+同时补齐知识库里的调度治理（深度/并发/预算/取消/用量）。
+
+| 编号/出处 | gap | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|---------|---------|
+| 第六轮 §16 对比表「禁止(无 task 工具)」 | 无模型自主委派入口 | ✅ | `src/agent/tools/subagent.rs`（`SubAgent` 单工具 + 5 action：launch/batch/list/result/cancel） | 2026-09-22 第 114 轮 |
+| 第六轮 §11.4 / openclaw `MAX_SPAWN_DEPTH` | 嵌套 SubAgent 受控允许 | ✅ | `src/agent/dynamic_subagent.rs`（默认 1 层;**双重防御**=叶子不注册工具 + 运行时 2002）+ `LAEW_SUBAGENT_MAX_DEPTH` | 同上 |
+| 第六轮 §2.2 / atomcode `Semaphore(3)` | 动态启动无并发控制 | ✅ | `Governor.sem`（会话级 `Semaphore(3)`）+ batch `buffer_unordered`，`LAEW_SUBAGENT_MAX_PARALLEL` | 同上 |
+| L1705 无并发控制（Lane/Semaphore） | 多任务互相阻塞/失控 | ✅ | 同上（laew 取 Semaphore + 会话预算双闸） | 同上 |
+| 第六轮 §11.3 / claudecode `run_in_background` | 后台 SubAgent | ✅ | `launch_background` + 作业表 + `action="result"/"cancel"` | 同上 |
+| L1740 无 SubAgent 孤儿恢复（部分） | 父死后子丢失 | 🟡 部分 | 父 `CancelToken` → 子 `child_token()` 级联取消；**崩溃恢复仍缺**（P2，与 L1706 同批） | 同上 |
+| L1746 无 Swarm 并行调度（部分） | 无法多 Agent 并行执行 | 🟡 部分 | `batch` 批内并行 + 会话级信号量;**无跨任务 swarm 队列/Workboard** | 同上 |
+| L1704 无 SubAgent 注册/生命周期 | SubAgent 无状态、跨重启全丢 | 🟡 部分 | 进程内 `Governor`(作业表 + 事件环 64 + usage 台账)提供生命周期与可观测;**SQLite 持久化仍缺** | 同上 |
+| CC03 ToolRegistry 自省 | 提示词手写工具清单易漂移 | ✅ | `self_awareness::prompt_section`（工具清单由 `ToolRegistry::names()` 生成）+ `/agents` 面板 | 同上 |
+| opencode `deriveSubagentSessionPermission` | 子 Agent 权限继承 | ✅ | `SpawnPolicy` 三档（Disabled/ReadOnlyChildren/FullChildren）+ 工具**交集收窄** + `dropped_tools` 如实上报 | 同上 |
+| — 用户可见性 | 看不见「谁被启动/跑了多久/花了多少」 | ✅ | `tracing` 日志 + 事件环 + TUI `/agents`（名册/上限/最近作业表）+ 用量进 `/cost` | 同上 |
+
+**设计要点**:
+- **运行时注入用 `tokio::task_local!`**:工具实例被并行 WorkFlow 单元共享(`Arc<SubAgentRunner>`),不能挂可变状态;
+  task-local 随任务隔离,并行单元各自一份运行时;
+- **运行时继承 + 同名字复用**:子 Agent 复用父 `Governor`(预算/并发/台账一致),按 `parent_name` 判等复用作用域,
+  避免 depth 二次 +1(否则 `max_depth=2` 时子 Agent 会失去委派能力);
+- **三重上限**:会话预算 8 + 并发 3 + 深度 1(全部可用环境变量放宽),防 token 失控;
+- **提示词由注册表生成**(非手写常量),静态段只含会话内恒定内容 → 不破坏 prompt cache;
+- **失败语义隔离**:子 Agent 失败**不**触发 Yolo 失败回流,由父 Agent 就地补做/改派(父必须汇总成最终回答);
+- 零新增 crate、零 schema 变更、`LAEW_SELF_SPAWN=off` 严格向后兼容。
+
+**验证**:lib 单测 **1484 passed / 0 failed**(基线 1455,新增 ~30 项:self_awareness 12 + dynamic_subagent 13 +
+tools::subagent 6 + agent::tests 2 + profile 5 + 注册面 4);e2e §4n **16 项全 PASS**(含 wire 级
+`tools[]` 含 `SubAgent`、子 Agent 独立请求可辨识、叶子无自感知名册、off 模式工具面零扩大)+ §7 TUI 冒烟 4 项;
+`LAEW_SELF_SPAWN=off` 回归零回退。
+
+**方案**:`tmpPlan/2026-09-22_04-自感知SubAgent动态启动方案.md` · **设计**:`docs/自感知SubAgent动态启动/01-设计与解决方案.md`
+· **标记**:`专题-laew已实现功能标记-2026-09-22-自感知SubAgent动态启动.md`
+
+**累计**:第六轮 SubAgent 调度缺口落地 5/8(嵌套/并发/后台/权限/自省),剩余 3 项为持久化 resume、
+跨进程委派、Swarm 跨任务队列(均 P2/P3)。

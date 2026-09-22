@@ -347,6 +347,21 @@ pub struct Usage {
     pub cache_creation_input_tokens: u32,
 }
 
+impl Usage {
+    /// 合并两份用量(4 字段饱和加,2026-09-22 第 114 轮动态子 Agent 用量回收用)。
+    pub fn merge(mut self, other: Usage) -> Usage {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+        self
+    }
+}
+
 /// 一次工具调用请求(协议无关)
 #[derive(Debug, Clone)]
 pub struct ToolCallReq {

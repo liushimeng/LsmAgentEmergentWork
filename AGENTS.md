@@ -39,6 +39,12 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 | `LAEW_ALLOW_PRIVATE_ENDPOINT` | `1` | SSRF 防护放行私网/loopback endpoint（本地 Ollama / 局域网 / mock 测试 provider 用；默认拦截，见 `src/agent/safety/url_safety.rs`） |
 | `LAEW_BASH_UTF8` | `1`/`true`/`yes`/`on` | Bash 工具为子进程注入 UTF-8 环境（`PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8`/`LC_ALL=C.UTF-8`），消除 Windows 区域设置(GBK)导致的 python/coreutils 输出乱码；默认关闭。行尾(CRLF)不受影响，精确 diff 场景脚本仍需 `reconfigure(newline=...)`，见 `src/agent/tools/bash.rs`（2026-09-13 第 50 轮新增） |
 | `LAEW_AUDIT` | `off`/`0`/`false`/`no` | 关闭决策审计写入（默认开启）。开启时 5 个决策点（Yolo 分类 / Plan 规划 / Main-Work 拆解 / QC 判定 / Compact 压缩）各追加一条结构化 JSON 行到根目录 `AuditTrail/audit_{session_id}.jsonl`（已 gitignore），记录「输入上下文→决策结论→决策依据」三段式 + 耗时/token/扩展字段，全字段脱敏截断，fail-open 不影响主流程。见 `src/agent/decision_audit.rs`（2026-09-19 D9-8 新增） |
+| `LAEW_SELF_SPAWN` | `off`/`0`/`false`/`no` | 关闭**自感知动态子 Agent**（默认开启）。关闭时不注册 `SubAgent` 工具、不注入自感知提示词段、不建运行时（工具面/提示词/耗时与改造前完全一致）。见 `src/agent/self_awareness.rs`（2026-09-22 第 114 轮新增） |
+| `LAEW_SUBAGENT_MAX_DEPTH` | 0..=3 | 动态子 Agent 嵌套层数上限，默认 `1`（子 Agent 为叶子，不能再启动）。`0` = 完全禁止（等价关闭）。 |
+| `LAEW_SUBAGENT_MAX_PARALLEL` | 1..=8 | 会话级并发槽位，默认 `3`（对齐 atomcode `Semaphore(3)`）。 |
+| `LAEW_SUBAGENT_MAX_TOTAL` | 1..=64 | 会话级累计启动预算，默认 `8`（防 token 失控；耗尽返回信封 `2001`）。 |
+| `LAEW_SUBAGENT_MAX_ITERATIONS` | 4..=32 | 单个子 Agent 迭代上限，默认 `12`。 |
+| `LAEW_SUBAGENT_TIMEOUT_SECS` | 10..=3600 | 单个子 Agent 墙钟超时，默认 `300`（超时记 `status=timeout`）。 |
 
 ## 领域概念（改代码前必读）
 
@@ -60,6 +66,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
   - **MCP_Window_Use 工具**(当前架构,替代已删除的 WindowUse Agent):桌面窗口操控能力收敛为 Agent Tools 中的单一 MCP 风格工具,不再设独立 Agent 角色。单工具 + `action` 枚举分发(`open`/`list`/`find`/`inspect`/`control`/`ocr`/`screenshot`),支持控件树与视觉/物理输入双路线;平台门控为 macOS/Windows 注册、其它平台不定义;任务链路统一为 Main-Work→SubAgent-Work 多轮调用 MCP_Window_Use→QC/SessionContext 复用。设计见 `docs/MCP_Window_Use/01-设计与解决方案.md`。
   - **MCP_Web_Use 工具**(当前架构,替代已删除的 Chromium-WebUse Agent):浏览器操控能力收敛为 Agent Tools 中的单一 MCP 风格工具,不再设独立 Agent 角色。单工具 + `action` 枚举分发(`open`/`list`/`close`/`control`/`inspect`/`sequence`);`control_action` 39 个写操作覆盖鼠标左/右/双击、滚轮、拖拽、悬停、键盘、组合键、文本输入、上传、下载、新 Tab、导航、等待、eval_js、Cookie/Storage、视口、截图、事件分发、`set_window`/`sync_viewport`(窗口自适应,2026-09-20 第 100 轮)与 `set_highlight`/`request_human`(人工介入 HITL);`inspect` 的 `info` 16 个维度覆盖 Console、Network、Elements、DOM、localStorage、sessionStorage、Cookie、页面元信息、图片 URL、OCR 与 `blockers`(验证码/短信/扫码/登录墙人工阻断检测)。支持两种可混合模式:**单步执行**(一次一个动作,适合探索/调试/高风险操作)与**连续执行**(`sequence` + 最多 24 steps,批内用 `$page_id`/`$spawned_page_id` 占位并默认自动跟随派生新页)。`download` 基于 Browser 域下载事件返回真实绝对 `save_path` 与 `byte_size`。CDP 驱动(chromiumoxide)跨 Windows/macOS/Linux,Chrome→Edge→Chromium→Brave 自动探测,默认 hidden + 一次性 profile,也可 `connect_url` 接管已开浏览器;未安装返回 3001 安装引导。统一 JSON 信封 0/1001/2000/2001/2002/2003/3001/4001(人工介入超时或非交互)/4002(人工取消)。**人工介入 HITL**(2026-09-20 第 100 轮):滑块/短信验证码/扫码登录等无法自动跳过的流程经 `src/agent/human_assist.rs` 全局枢纽向 TUI 发起结构化选择,人工答复经 oneshot 回填继续任务;非 TUI 模式 fail-fast 4001。**窗口可视化**:headed 模式默认 1080p 窗口 + 页面四周蓝色选中边框与「LAEW Agent 控制中」徽标标识 Agent 窗口;浏览器进程级单实例复用(重复 open 不新启浏览器)。任务链路统一为 Yolo→Main-Work→SubAgent-Work 多轮调用 MCP_Web_Use→QC/SessionContext/Debug/取消/并行复用。设计见 `docs/MCP_Web_Use/01-设计与解决方案.md` 与 `02-人工介入与窗口可视化方案.md`(第 100 轮)。
   - 由 `MultiAgentOrchestrator` 总编排:用户输入 → 项目上下文注入 → Yolo 分类 → 简单档(SubAgent) / 中档(Main→SubAgent) / 高档(Plan→Main→SubAgent) → Quality-Check → SessionContext 收口。WorkFlow 执行时按 `depends_on` 自动 Kahn 分层(`main_work::topo_layers`),**同层无依赖的 SubAgent 自动并行**(tokio::spawn + Semaphore 上限 3,`OrchestratorConfig::max_parallel_workflows`),跨层严格串行、上游产物按层注入,失败语义与串行一致(fail-fast 回流 Yolo)。
+  - **自感知动态子 Agent(D114,2026-09-22 第 114 轮)**:在中央编排之上增加「模型自主委派」通道。Agent Tools 新增 `SubAgent` 单工具(action 枚举 `launch` / `batch` / `list` / `result` / `cancel`),**用户提示词显式要求**(「启动 SubAgent / 并行 / 分工 / 分别调研 / 多个 Agent」)或任务可分解为 2+ 独立子任务时,Agent 自动组建子 Agent 小队并汇总结果。子 Agent 6 类型(general-purpose / explore / researcher / plan / code-reviewer / operator),**独立上下文**(看不到父对话),工具面由 `SpawnPolicy` 三档 + **交集收窄**决定(Yolo 只能启动只读子 Agent;QC / SessionContext / Debug / Compact 不参与)。治理:默认 1 层嵌套(叶子**不注册**该工具 + 运行时 2002 双重防御)、会话级 `Semaphore(3)` + 预算 8 + 单子 Agent 12 轮 / 300s,父 `CancelToken` → `child_token()` 级联取消,用量经会话台账计入 `/cost`。**自感知三层**:① 系统提示词身份段(工具清单由 `ToolRegistry` 程序化生成,与真实工具面不漂移)② `SubAgent(action="list")` 运行时快照(深度/余额/运行中作业)③ 事件环 + TUI `/agents`。运行时经 `tokio::task_local!` 注入(并行单元各自隔离);子 Agent 失败**不**触发 Yolo 失败回流,由父就地补做/改派且必须汇总成最终回答。工具返回统一 JSON 信封(`0/1001/2000/2001/2002/2003/4001/4002/4003`)。实现 `src/agent/{self_awareness,dynamic_subagent}.rs` + `src/agent/tools/subagent.rs`,设计见 `docs/自感知SubAgent动态启动/01-设计与解决方案.md`。
 - **Agent-Context / Agent-Memory**：
   - **Agent-Context**：每个 Agent 独立的实时上下文(消息流 + 状态)，内存态，生命周期 = 当前单元。
   - **Agent-Memory**：每个 Agent 独立的记忆层(输入/输出/错误/产物摘要)，持久化到 SQLite `agent_memory` 表，跨单元/跨 Session 复用。
@@ -97,11 +104,14 @@ agent/
   runtime_hints.rs Agent 循环运行时辅助:runtime hint 拼装/截断判定/首迭代强制工具开关/稳定 JSON 序列化
   orchestrator/ MultiAgentOrchestrator 总编排器目录:mod.rs(结构体+入口+进度通道) / types.rs(共享类型) / pipeline.rs(handle_inner+三档链路) / workflows.rs(分层并行+run_wf_unit) / yolo_reflow.rs(Yolo 分类封装+失败回流) / usage.rs(用量累加) / tests.rs
   main_work/   Main-Work 流程层目录:mod.rs(MainWorkRunner) / spec.rs(WorkFlow 规格模型+宽松反序列化) / delegate.rs(委派推断 GUI 优先) / topo.rs(Kahn 分层+依赖治理) / parse.rs(JSON/Markdown 双通道解析) / tests.rs
-  profile.rs   AgentProfile(名称 / 系统提示词 / 工具集) + work_profile()/yolo_profile() + User-Agent
+  profile.rs   AgentProfile(名称 / 系统提示词 / 工具集 / spawn_policy) + work_profile()/yolo_profile()/dynamic_child() + User-Agent
+  self_awareness.rs 自感知层(D114):6 环境变量配置 / 6 类子 Agent 名册 / SpawnPolicy 三档 / 静态身份段渲染(工具清单由注册表生成)
+  dynamic_subagent.rs 动态子 Agent 运行时(D114):会话级 Governor(Semaphore/预算/台账/作业表/事件环) + tokio task_local 作用域 + 子 Agent 组装/运行/回收 + drain_usage
   system_prompt/mod.rs  SystemPrompt 组合与渲染(基础 + 工具说明 + 协议尾缀)
   tools/
     mod.rs     Tool trait + ToolRegistry(有序) + builtin_registry()/yolo_registry()
     bash.rs    BashTool
+    subagent.rs SubAgentTool(D114 自感知委派:launch/batch/list/result/cancel + 统一 JSON 信封)
     read.rs    ReadTool
     write.rs   WriteTool
     window/    窗口操控五工具目录:mod.rs(共享辅助:树预算剪枝/查询扩展/别名匹配/preflight/AX 权限) / matching.rs(WindowList+WindowFind+模糊打分) / open.rs(WindowOpen+应用启动) / inspect.rs(WindowInspect/WindowAction) / tests.rs
@@ -153,6 +163,7 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 | `/workspace` (`ws`) | 查看工作区快照(D4):git 分支/未提交变更/工程类型与工具链建议/顶层结构/6h 内最近改动;`/workspace refresh` 强制失效 TTL 缓存重采集 |
 | `/export [path]`  | 导出当前会话为 Markdown（`.json` 后缀导出 JSON）；默认落工作目录 `laew-export-{时间戳}.md`，同名冲突自动 `-1` 后缀，显式路径已存在拒绝覆盖 |
 | `/tasks` (`todo`, `todos`) | 列出当前 session 的 TODO 任务清单(D19,2026-09-22 第 112 轮),表格形式(id/status/priority/content) |
+| `/agents` (`subagents`) | 自感知动态子 Agent 面板(2026-09-22 第 114 轮):开关与上限(深度/并发/会话预算/迭代/超时)+ 6 类子 Agent 名册与默认工具面 + 本会话已启动数/运行中 + 最近 10 个动态子 Agent 作业表(run_id/类型/状态/深度/工具数/耗时/tokens) |
 | `/audit` (`audits`) | D9-8 决策审计可视化(2026-09-22 第 113 轮):当前 session 的 5 决策点事件表格/统计/校验/清理。子命令:`/audit` 表格(最近 10 条),`/audit last [N]` 详情(默认 5,上限 50),`/audit stats` 按 (decision, agent) 分组聚合,`/audit verify` JSONL 完整性校验,`/audit clean [--keep N]` 清理旧 session 审计文件(默认保留 10)。TUI bootstrap 自动 trim,`/cost` 末尾追加审计摘要 |
 | `/commands`       | 列出已加载的自定义斜杠命令与来源 |
 | `/provider`       | 管理接入记录（默认进入 list 屏） |
@@ -225,6 +236,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/浏览器CDP工具/` — chromiumoxide/CDP 底层技术参考:浏览器启动与接管、Target/Page/Runtime/DOM/Network/Browser 域、事件监听与跨平台实现
 - `docs/Context设置与自动压缩设计/` — ContextMaxSize 上下文上限(默认 800K,DB 迁移自动补全)+ Compact Agent(第 8 角色)三档自动压缩 设计与解决方案
 - `tmpPlan/2026-09-22_03-决策审计可视化与自动清理方案.md` — 第 113 轮 D9-8 决策审计可视化(/audit + /cost 集成 + 启动自动 trim)
+- `docs/自感知SubAgent动态启动/` — D114 自感知动态子 Agent:SubAgent 工具(action 枚举)+ 6 类子 Agent 名册 + SpawnPolicy 能力收窄 + 深度/并发/预算治理 + task-local 运行时 + TUI `/agents`(01-设计与解决方案)
 - `docs/工作区感知与运行时环境注入/` — D4 工作区感知:懒刷新快照(git 分支/变更计数/工程类型与工具链建议/顶层结构/最近改动)+ 8 角色 system brief + PROJECT_CONTEXT 工作区段 + TUI 横幅·`/workspace`·任务后变更对比
 - `docs/自签名证书TLS适配/` — IP + 自签名证书 HTTPS 网关适配:TLS 三级校验策略(IP 自动放宽 / LAEW_TLS_INSECURE 全局开关)、跨平台一致性(rustls)、真实端点集成验证(tests/tls_self_signed.rs)
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考

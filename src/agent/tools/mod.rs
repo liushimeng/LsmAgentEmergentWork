@@ -24,6 +24,7 @@ pub mod mcp_web_use;
 pub mod mcp_window_use;
 pub mod read;
 pub mod read_detect;
+pub mod subagent;
 pub mod write;
 pub mod todo;
 
@@ -87,6 +88,27 @@ impl ToolRegistry {
             .map(|t| t.def())
             .collect()
     }
+
+    /// 生成工具子集(2026-09-22 第 114 轮,动态子 Agent 工具收窄用)。
+    ///
+    /// - `keep` 非空 = 白名单(其余全部剔除);
+    /// - `drop` = 黑名单(优先级高于白名单,用于剔除 `SubAgent` 让子 Agent 成为叶子);
+    /// - 保持原注册顺序,保证子 Agent 的 tools 列表稳定。
+    pub fn subset(&self, keep: &[&str], drop: &[&str]) -> ToolRegistry {
+        let mut out = ToolRegistry::new();
+        for name in &self.order {
+            if drop.contains(&name.as_str()) {
+                continue;
+            }
+            if !keep.is_empty() && !keep.contains(&name.as_str()) {
+                continue;
+            }
+            if let Some(t) = self.tools.get(name) {
+                out = out.register(t.clone());
+            }
+        }
+        out
+    }
 }
 
 /// 构造沙箱配置。
@@ -101,6 +123,19 @@ fn sandbox_with(work_dir: PathBuf) -> SandboxConfig {
     SandboxConfig::new(work_dir)
 }
 
+/// 条件注册 `SubAgent` 工具(2026-09-22 第 114 轮)。
+///
+/// 关闭语义:`LAEW_SELF_SPAWN=off` 或 `LAEW_SUBAGENT_MAX_DEPTH=0` 时
+/// **不注册工具**,工具面与自感知提示词同时归零(严格向后兼容)。
+fn register_subagent(reg: ToolRegistry) -> ToolRegistry {
+    let cfg = crate::agent::self_awareness::config();
+    if cfg.enabled && cfg.max_depth > 0 {
+        reg.register(Arc::new(subagent::SubAgentTool))
+    } else {
+        reg
+    }
+}
+
 /// 默认注册表:内置 Bash / Read / Write / Edit / Glob / Grep(SubAgent-Work / 兼容别名)
 ///
 /// 写操作(Write / Edit)带有沙箱拦截,限制在工作目录与系统临时目录。
@@ -108,6 +143,8 @@ fn sandbox_with(work_dir: PathBuf) -> SandboxConfig {
 /// 平台门控见 [`mcp_window_use::mcp_window_use_available`])。
 /// 2026-09-18 第 89 轮:全平台追加 MCP_Web_Use(浏览器网页操控统一入口,
 /// CDP 三平台一致,未装浏览器返回结构化 3001 不崩溃,无需平台门控)。
+/// 2026-09-22 第 114 轮:追加 SubAgent(自感知动态启动子 Agent 工具,
+/// 运行时经 task-local 注入;总开关 `LAEW_SELF_SPAWN=off` 时不注册)。
 pub fn builtin_registry() -> ToolRegistry {
     let sandbox = default_sandbox();
     let mut reg = ToolRegistry::new()
@@ -119,6 +156,7 @@ pub fn builtin_registry() -> ToolRegistry {
         .register(Arc::new(grep::GrepTool))
         .register(Arc::new(todo::TodoWriteTool::shared()))
         .register(Arc::new(mcp_web_use::McpWebUseTool));
+    reg = register_subagent(reg);
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
     }
@@ -137,6 +175,7 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
         .register(Arc::new(grep::GrepTool))
         .register(Arc::new(todo::TodoWriteTool::shared()))
         .register(Arc::new(mcp_web_use::McpWebUseTool));
+    reg = register_subagent(reg);
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
     }
@@ -145,31 +184,40 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
 
 /// Yolo Agent 工具注册表:Read(理解上下文)+ 结构化输出通道
 /// `submit_task_classification`(2026-09-09 第 13 轮,L6/L19)
+/// + SubAgent(第 114 轮:只读子 Agent 侦察,策略 `ReadOnlyChildren`)。
 pub fn yolo_registry() -> ToolRegistry {
-    ToolRegistry::new()
-        .register(Arc::new(read::ReadTool))
-        .register(Arc::new(emit::SubmitTaskClassification))
+    register_subagent(
+        ToolRegistry::new()
+            .register(Arc::new(read::ReadTool))
+            .register(Arc::new(emit::SubmitTaskClassification)),
+    )
 }
 
 /// Plan Agent 工具注册表:Read + Write + Edit + Glob + Grep(规划与调研)
+/// + SubAgent(第 114 轮:并行方案调研,策略 `FullChildren`)。
 pub fn plan_registry() -> ToolRegistry {
     let sandbox = default_sandbox();
-    ToolRegistry::new()
-        .register(Arc::new(read::ReadTool))
-        .register(Arc::new(write::WriteTool::new(sandbox.clone())))
-        .register(Arc::new(edit::EditTool::new(sandbox)))
-        .register(Arc::new(glob::GlobTool))
-        .register(Arc::new(grep::GrepTool))
+    register_subagent(
+        ToolRegistry::new()
+            .register(Arc::new(read::ReadTool))
+            .register(Arc::new(write::WriteTool::new(sandbox.clone())))
+            .register(Arc::new(edit::EditTool::new(sandbox)))
+            .register(Arc::new(glob::GlobTool))
+            .register(Arc::new(grep::GrepTool)),
+    )
 }
 
 /// Main-Work Agent 工具注册表:Bash + Read + Glob + Grep(流程层可检索,不写文件)
+/// + SubAgent(第 114 轮:把独立 WorkFlow 交给并行子 Agent)。 
 pub fn main_work_registry() -> ToolRegistry {
-    ToolRegistry::new()
-        .register(Arc::new(bash::BashTool))
-        .register(Arc::new(read::ReadTool))
-        .register(Arc::new(glob::GlobTool))
-        .register(Arc::new(grep::GrepTool))
-        .register(Arc::new(todo::TodoWriteTool::shared()))
+    register_subagent(
+        ToolRegistry::new()
+            .register(Arc::new(bash::BashTool))
+            .register(Arc::new(read::ReadTool))
+            .register(Arc::new(glob::GlobTool))
+            .register(Arc::new(grep::GrepTool))
+            .register(Arc::new(todo::TodoWriteTool::shared())),
+    )
 }
 
 /// SubAgent-Work Agent 工具注册表:全套工具(执行层最小单元)
@@ -209,10 +257,83 @@ mod names_tests {
     #[test]
     fn yolo_registry_names_only_read_and_emit() {
         // F1(2026-09-14 第 51 轮):ToolNotFound 回填文本依赖 names() 列出
-        // 可用工具边界;Yolo 注册表必须恰好是 Read + submit_task_classification。
+        // 可用工具边界;Yolo 注册表必须恰好是 Read + submit_task_classification
+        // (+ 第 114 轮的自感知委派工具 SubAgent,Yolo 策略为 ReadOnlyChildren)。
         let reg = yolo_registry();
         let names = reg.names();
-        assert_eq!(names, vec!["Read", "submit_task_classification"]);
+        assert_eq!(names, vec!["Read", "submit_task_classification", "SubAgent"]);
+    }
+
+    // ========== 第 114 轮(2026-09-22):自感知 SubAgent 动态启动 注册面 ==========
+
+    #[test]
+    fn subagent_tool_registered_for_delegating_roles_only() {
+        // 可委派角色(入口 / 规划 / 流程 / 执行)持 SubAgent。
+        for (label, reg) in [
+            ("yolo", yolo_registry()),
+            ("plan", plan_registry()),
+            ("main_work", main_work_registry()),
+            ("sub_agent_work", sub_agent_work_registry()),
+            ("builtin_with_work_dir", builtin_registry_with_work_dir(PathBuf::from("."))),
+        ] {
+            assert!(
+                reg.names().contains(&"SubAgent"),
+                "{label} 应登记 SubAgent 工具: {:?}",
+                reg.names()
+            );
+        }
+        // 质检 / 会话 / 调试 / 压缩角色必须保持单线程语义:不得持委派工具。
+        for (label, reg) in [
+            ("quality", quality_registry()),
+            ("session_context", session_context_registry()),
+            ("debug", debug_registry()),
+            ("compact", compact_registry()),
+        ] {
+            assert!(
+                !reg.names().contains(&"SubAgent"),
+                "{label} 不应登记 SubAgent 工具: {:?}",
+                reg.names()
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_tool_schema_and_description_cover_all_actions() {
+        let reg = sub_agent_work_registry();
+        let tool = reg.get("SubAgent").expect("SubAgent 工具已注册");
+        let schema = tool.parameters();
+        let actions: Vec<&str> = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action.enum")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["launch", "batch", "list", "result", "cancel"],
+            "action 枚举应与实现一致"
+        );
+        assert_eq!(schema["required"][0], "action");
+        // description 必须把「何时不要启动」写清楚(防模型滥用)
+        let desc = tool.description();
+        for needle in ["何时启动", "何时不要启动", "batch", "4001", "自包含"] {
+            assert!(desc.contains(needle), "description 应含 `{needle}`");
+        }
+    }
+
+    #[test]
+    fn tool_registry_subset_narrows_and_drops() {
+        // subset 是动态子 Agent 工具收窄的核心原语:白名单 + 黑名单 + 顺序保持。
+        let reg = sub_agent_work_registry();
+        let narrowed = reg.subset(&["Read", "Grep"], &[]);
+        assert_eq!(narrowed.names(), vec!["Read", "Grep"], "白名单且保持注册顺序");
+        let dropped = reg.subset(&[], &["SubAgent"]);
+        assert!(!dropped.names().contains(&"SubAgent"), "黑名单应剔除 SubAgent");
+        assert!(dropped.names().contains(&"Bash"), "黑名单不应影响其它工具");
+        let both = reg.subset(&["SubAgent", "Read"], &["SubAgent"]);
+        assert_eq!(both.names(), vec!["Read"], "黑名单优先于白名单");
+        let empty_keep = reg.subset(&[], &[]);
+        assert_eq!(empty_keep.names(), reg.names(), "空白名单=全量");
     }
 
     #[test]

@@ -188,6 +188,10 @@ impl TuiSession {
             "audit" | "audits" => {
                 self.run_audit(rest_args);
             }
+            // 自感知动态子 Agent(2026-09-22 第 114 轮):名册 / 上限 / 最近作业。
+            "agents" | "subagents" => {
+                self.run_agents();
+            }
             // D4 工作区感知(2026-09-13):查看/刷新工作区快照。
             "workspace" | "ws" => {
                 self.run_workspace(rest_args);
@@ -415,6 +419,79 @@ impl TuiSession {
         println!("  任务清单(/tasks): {summary}");
         println!();
         println!("{}", self.todo_state.render_table());
+    }
+
+    /// `/agents [roster]`(自感知动态子 Agent,2026-09-22 第 114 轮)。
+    ///
+    /// 展示三层自感知里**用户可见**的两层:
+    /// 1. 静态名册 —— 6 种子 Agent 类型与默认工具面;
+    /// 2. 运行时作业 —— 本会话已启动数 / 上限 / 运行中 / 并发上限 + 最近作业表。
+    ///
+    /// 数据源:`dynamic_subagent` 的会话级 Governor(只读访问器,不产生副作用)。
+    fn run_agents(&self) {
+        use crate::agent::dynamic_subagent as dynsub;
+        use crate::agent::self_awareness as sa;
+
+        let cfg = dynsub::config();
+        println!("  自感知动态子 Agent(/agents,第 114 轮)");
+        println!(
+            "  开关: LAEW_SELF_SPAWN={}  深度上限: {} 层  并发上限: {}  单会话预算: {}  单子 Agent 迭代上限: {}  超时: {}s",
+            if cfg.enabled { "on" } else { "off" },
+            cfg.max_depth,
+            cfg.max_parallel,
+            cfg.max_total,
+            cfg.max_iterations,
+            cfg.timeout_secs
+        );
+        match dynsub::governor_view(&self.session.id) {
+            Some((used, max, in_flight, _)) => println!(
+                "  本会话: 已启动 {used}/{max}  运行中 {in_flight}"
+            ),
+            None => println!("  本会话: 尚未启动任何动态子 Agent(0/{} 预算可用)", cfg.max_total),
+        }
+        if !cfg.enabled || cfg.max_depth == 0 {
+            println!("  提示: 当前已关闭(LAEW_SELF_SPAWN=off 或 LAEW_SUBAGENT_MAX_DEPTH=0),");
+            println!("        LLM 侧不会注册 SubAgent 工具,提示词也不含自感知段。");
+        }
+
+        println!();
+        println!("  可启动类型名册:");
+        for t in sa::SubAgentType::ALL {
+            println!(
+                "    {:<16} {:<10} {}",
+                t.id(),
+                t.label(),
+                t.role_hint()
+            );
+            println!("      └ 默认工具: {}", t.default_tools().join(", "));
+        }
+
+        let events = dynsub::recent_events(&self.session.id, 10);
+        println!();
+        if events.is_empty() {
+            println!("  最近动态子 Agent: 无(提示词出现「启动 SubAgent / 并行 / 分工」时由 Agent 自动启动)");
+            return;
+        }
+        println!("  最近动态子 Agent({} 条):", events.len());
+        println!(
+            "    {:<14} {:<14} {:<10} {:<8} {:>6} {:>8} {:>12}",
+            "run_id", "type", "status", "depth", "tools", "ms", "tokens(in/out)"
+        );
+        for e in events {
+            println!(
+                "    {:<14} {:<14} {:<10} {:<8} {:>6} {:>8} {:>12}",
+                e.run_id,
+                e.agent_type,
+                e.status,
+                e.depth,
+                e.tool_calls,
+                e.wallclock_ms,
+                format!("{}/{}", e.usage.input_tokens, e.usage.output_tokens),
+            );
+            if !e.task_digest.is_empty() {
+                println!("      └ {} ← {}", e.task_digest, e.parent);
+            }
+        }
     }
 
     /// `/audit [subcmd]`(D9-8 决策审计可视化,2026-09-22 第 113 轮)。

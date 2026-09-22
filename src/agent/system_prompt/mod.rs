@@ -283,7 +283,11 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 - simple 且无需工具 → direct_answer 为字符串答案;decomposition_plan 为空数组。
 - 需委派执行 → direct_answer 必须为 JSON null(不是字符串 "null"/"None")。
 - decomposition_plan 是字符串数组;medium / hard 级别必须有详细步骤。
-- direct_answer 字符串 "null"(带引号)会被误判为直答并打印字面量 "null",严禁。"#;
+- direct_answer 字符串 "null"(带引号)会被误判为直答并打印字面量 "null",严禁。
+- **保留多 Agent 要求**(2026-09-22 第 114 轮):用户提示词若显式要求「启动 SubAgent /
+  并行 / 分工 / 分别调研 / 多个 Agent 协作」,必须在 decomposition_plan 中**原样保留**
+  该编排要求(写明「并行调研 A / B / C 后汇总」之类),不得压缩掉 —— 执行层
+  (Main-Work / SubAgent-Work)据此才会启动动态子 Agent。"#;
 
 /// Yolo Agent 工具说明(Read + 结构化输出通道)。
 fn yolo_tools_hint() -> &'static str {
@@ -295,7 +299,9 @@ fn yolo_tools_hint() -> &'static str {
      可用工具:\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号;offset/limit 用于分页。\n\
      - submit_task_classification(task_level, purpose, goal_summary, intent,\n\
-       decomposition_plan?, direct_answer?): 提交最终任务分类结果(一次即止)。"
+       decomposition_plan?, direct_answer?): 提交最终任务分类结果(一次即止)。\
+     - SubAgent(action, agent_type?, task?, tasks?, ...): 启动**只读**子 Agent 并行侦察\
+       (action=list 先看名册与额度;详见系统提示词「自感知」段)。"
 }
 
 /// Anthropic / OpenAI 协议下 Yolo 的额外提示。
@@ -402,7 +408,9 @@ fn plan_tools_hint() -> &'static str {
      - 不要调用 Bash。\n\n\
      可用工具:\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
-     - Write(file_path, content): 仅允许写入 plans/ 目录。"
+     - Write(file_path, content): 仅允许写入 plans/ 目录。\
+     - SubAgent(action, agent_type?, task?, tasks?, ...): 并行调研(方案调研/评审用;\
+       action=list 先看名册与额度;详见系统提示词「自感知」段)。"
 }
 
 const PLAN_ANTHROPIC_TAIL: &str = "Write 工具会自动创建父目录 plans/。";
@@ -471,7 +479,9 @@ fn main_work_tools_hint() -> &'static str {
      - 不要直接修改源代码(委派给 SubAgent-Work);不要使用 Write 写源代码。\n\n\
      可用工具:\n\
      - Bash(command, timeout_ms?, description?): 只读 / 检查类命令。\n\
-     - Read(file_path, offset?, limit?): 读取文本文件,带行号。"
+     - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
+     - SubAgent(action, agent_type?, task?, tasks?, ...): 把相互独立的 WorkFlow 并行\n\
+       委派给子 Agent(action=list 先看名册与额度;详见系统提示词「自感知」段)。"
 }
 
 const MAIN_WORK_ANTHROPIC_TAIL: &str = "确保 JSON 输出合法,workflows 数组不要有空元素。";
@@ -528,7 +538,9 @@ fn sub_agent_tools_hint() -> &'static str {
      可用工具:\n\
      - Bash(command, timeout_ms?, description?): 在工作目录下执行 bash 命令。\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
-     - Write(file_path, content): 覆盖写入(或新建)文件,自动创建父目录。"
+     - Write(file_path, content): 覆盖写入(或新建)文件,自动创建父目录。\
+     - SubAgent(action, agent_type?, task?, tasks?, ...): 把可并行的独立子任务委派给\
+       动态子 Agent(action=list 先看名册与额度;详见系统提示词「自感知」段)。"
 }
 
 const SUB_AGENT_ANTHROPIC_TAIL: &str = "尽可能并行调用无依赖的工具。";

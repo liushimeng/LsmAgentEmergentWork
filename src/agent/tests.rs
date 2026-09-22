@@ -996,3 +996,175 @@
         assert!(forced_tools_enabled_from(String::new()));
         assert!(forced_tools_enabled_from("on".into()));
     }
+
+    // ========== 第 114 轮(2026-09-22):自感知 SubAgent 动态启动 ==========
+
+    /// 取 tool 消息里的 tool_result 文本(content_text 只看 Text 块)。
+    fn tool_result_text(msg: &ChatMessage) -> String {
+        msg.content
+            .iter()
+            .filter_map(|b| match b {
+                crate::llm::ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 父 Agent 依次调用 `SubAgent(action="list")` → `action="launch"` → 终答;
+    /// 子 Agent(新上下文)直接返回文本。用于验证 Agent 循环里的 task-local 作用域注入。
+    struct SpawnCallingLlm {
+        parent_calls: std::sync::atomic::AtomicUsize,
+        child_calls: std::sync::atomic::AtomicUsize,
+        seen_child_system: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for SpawnCallingLlm {
+        async fn complete(
+            &self,
+            system: &str,
+            messages: &[ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            // 子 Agent 身份用**子 Agent 专属**标记识别(父提示词也会提到「子 Agent」,
+            // 因此必须用只在 SubAgentType::system_prompt 里出现的句子)
+            if system.contains("你只拿到**任务描述**这一个输入") {
+                self.child_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.seen_child_system
+                    .lock()
+                    .expect("child system")
+                    .push(system.to_string());
+                return Ok(Completion {
+                    text: "CHILD_REPORT:模块划分清单已产出".into(),
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: 21,
+                        output_tokens: 9,
+                        ..Usage::default()
+                    },
+                    stop_reason: None,
+                });
+            }
+            let n = self
+                .parent_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match n {
+                0 => Ok(Completion {
+                    text: String::new(),
+                    tool_calls: vec![crate::llm::ToolCallReq {
+                        id: "call-spawn-1".into(),
+                        name: "SubAgent".into(),
+                        arguments: serde_json::json!({"action": "list"}),
+                    }],
+                    usage: Usage::default(),
+                    stop_reason: None,
+                }),
+                1 => {
+                    // list 的结果必须已在上下文里(自感知快照)
+                    let has_snapshot = messages.iter().any(|m| tool_result_text(m).contains("can_spawn"));
+                    assert!(has_snapshot, "action=list 的 tool_result 应含自感知快照");
+                    Ok(Completion {
+                        text: String::new(),
+                        tool_calls: vec![crate::llm::ToolCallReq {
+                            id: "call-spawn-2".into(),
+                            name: "SubAgent".into(),
+                            arguments: serde_json::json!({
+                                "action": "launch",
+                                "task": "调研 src/agent 的模块划分,输出清单",
+                                "agent_type": "explore"
+                            }),
+                        }],
+                        usage: Usage::default(),
+                        stop_reason: None,
+                    })
+                }
+                _ => {
+                    let child_report = messages
+                        .iter()
+                        .map(tool_result_text)
+                        .find(|t| t.contains("CHILD_REPORT"))
+                        .unwrap_or_default();
+                    assert!(
+                        child_report.contains("CHILD_REPORT"),
+                        "子 Agent 结果应回填到父上下文: {child_report}"
+                    );
+                    Ok(Completion {
+                        text: "汇总:子 Agent 给出了 src/agent 模块划分清单。".into(),
+                        tool_calls: vec![],
+                        usage: Usage::default(),
+                        stop_reason: None,
+                    })
+                }
+            }
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_injects_runtime_and_runs_dynamic_child() {
+        let llm = std::sync::Arc::new(SpawnCallingLlm {
+            parent_calls: std::sync::atomic::AtomicUsize::new(0),
+            child_calls: std::sync::atomic::AtomicUsize::new(0),
+            seen_child_system: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(llm.clone(), AgentProfile::sub_agent_work_profile());
+        let mut session = Session::new();
+        session.context_mut().push(ChatMessage::user(
+            "启动 1 个 SubAgent 调研 src/agent 的模块划分",
+        ));
+        let (text, usage, trace) = agent.run_session(&mut session).await.unwrap();
+        assert!(text.contains("汇总"), "父 Agent 应汇总子 Agent 结果: {text}");
+        assert_eq!(
+            llm.child_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "子 Agent 应真实执行一次"
+        );
+        assert_eq!(trace.tool_calls, 2, "父 Agent 共 2 次工具调用(list + launch)");
+        assert_eq!(trace.tool_calls_err, 0, "两次工具调用都应成功");
+        // 子 Agent 用量进入会话台账(单元/任务边界由 Runner/Orchestrator 排空)
+        let drained =
+            crate::agent::dynamic_subagent::drain_usage(session.id());
+        assert_eq!(drained.input_tokens, 21, "子 Agent 用量应被记账");
+        assert_eq!(drained.output_tokens, 9);
+        // 父 Agent 自身的 usage 不因记账被污染(仍来自父轮次)
+        assert_eq!(usage.input_tokens, 0);
+        // 子 Agent 的系统提示词是叶子语义 + 类型身份
+        let child_system = llm.seen_child_system.lock().unwrap()[0].clone();
+        assert!(child_system.contains("不能再启动子 Agent"));
+        assert!(child_system.contains("只读侦察"));
+    }
+
+    /// 叶子 Agent 的注册表不含 `SubAgent` 工具:即使模型幻觉调用也应得到
+    /// ToolNotFound 的回填提示(而非无限递归)。
+    #[tokio::test]
+    async fn leaf_child_registry_excludes_subagent_tool() {
+        let llm = std::sync::Arc::new(super::tests::SpawnCallingLlm {
+            parent_calls: std::sync::atomic::AtomicUsize::new(0),
+            child_calls: std::sync::atomic::AtomicUsize::new(0),
+            seen_child_system: std::sync::Mutex::new(Vec::new()),
+        });
+        // 直接检查动态子 Agent 的工具面(不发起 LLM 调用)
+        let child_profile = AgentProfile::dynamic_child(
+            "leaf",
+            "prompt".into(),
+            crate::agent::tools::sub_agent_work_registry().subset(&[], &["SubAgent"]),
+            crate::agent::self_awareness::SpawnPolicy::Disabled,
+        );
+        assert!(
+            !child_profile.tools.names().contains(&"SubAgent"),
+            "叶子注册表不得含 SubAgent"
+        );
+        let rendered = child_profile
+            .system_prompt
+            .render(crate::config::Protocol::Anthropic);
+        assert!(
+            !rendered.contains("你可启动的子 Agent 类型"),
+            "叶子提示词不应含可启动名册"
+        );
+        drop(llm);
+    }

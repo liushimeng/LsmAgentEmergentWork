@@ -483,6 +483,11 @@ impl SubAgentRunner {
             }),
         );
 
+        // 动态子 Agent 用量回收(2026-09-22 第 114 轮):本单元内部经
+        // `SubAgent` 工具启动的子 Agent 消耗挂在会话级台账上,单元边界并入
+        // 本单元用量 → 随既有链路进 WorkflowResult.usage / `/cost` / Debug 统计。
+        let usage = usage.merge(crate::agent::dynamic_subagent::drain_usage(session_id));
+
         Ok(SubFlowOutcome {
             text,
             usage,

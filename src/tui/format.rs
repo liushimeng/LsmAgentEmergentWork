@@ -1343,6 +1343,7 @@ pub(crate) fn print_help() {
     println!("  │  /cost (usage)     查看会话用量与成本估算                 │");
     println!("  │  /tasks (todos)    查看当前 session TODO 任务清单(D19)     │");
     println!("  │  /audit (audits)   决策审计可视化(D9-8):表格/统计/校验/清理│");
+    println!("  │  /agents (subag)   动态子 Agent 名册与最近作业(自感知委派) │");
     println!("  │  /workspace [rf]   查看工作区快照(git/工程/最近改动)       │");
     println!("  │  /commands         列出自定义斜杠命令                      │");
     println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
