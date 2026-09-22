@@ -527,7 +527,7 @@ impl Governor {
     }
 
     /// 预扣 n 个预算(全有或全无;失败不改动计数)。
-    fn try_charge(&self, n: usize) -> bool {
+    pub(crate) fn try_charge(&self, n: usize) -> bool {
         let mut used = self.used.lock().expect("budget poisoned");
         if used.saturating_add(n) > self.cfg.max_total {
             return false;
@@ -537,7 +537,7 @@ impl Governor {
     }
 
     /// 归还预算(批量启动中途失败时回滚)。
-    fn refund(&self, n: usize) {
+    pub(crate) fn refund(&self, n: usize) {
         let mut used = self.used.lock().expect("budget poisoned");
         *used = used.saturating_sub(n);
     }
@@ -613,7 +613,7 @@ pub struct SubAgentRuntime {
     /// 父能力策略。
     policy: SpawnPolicy,
     cfg: SelfAwarenessConfig,
-    governor: Arc<Governor>,
+    pub(crate) governor: Arc<Governor>,
     /// 0 = 顶层 Agent;每深入一层 +1。
     depth: usize,
     work_dir: PathBuf,
@@ -701,6 +701,18 @@ impl SubAgentRuntime {
 
     pub fn can_spawn(&self) -> bool {
         self.cfg.can_spawn_at(self.depth)
+    }
+
+    /// 运行时治理配置(workflow 需要准确的会话预算/深度)。
+    pub fn cfg(&self) -> &SelfAwarenessConfig {
+        &self.cfg
+    }
+
+    /// 父任务取消 token 是否已触发;workflow 在层间检查以尽快停止派发。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
     }
 
     pub fn remaining(&self) -> usize {
@@ -901,6 +913,24 @@ impl SubAgentRuntime {
         reqs: Vec<SubAgentRequest>,
         max_concurrency: Option<usize>,
     ) -> Result<Vec<SubAgentReport>, SpawnError> {
+        self.batch_inner(reqs, max_concurrency, true).await
+    }
+
+    /// 已预扣整张 workflow 预算后的批内并行;第 116 轮 workflow 专用。
+    pub(crate) async fn batch_reserved(
+        self: &Arc<Self>,
+        reqs: Vec<SubAgentRequest>,
+        max_concurrency: Option<usize>,
+    ) -> Result<Vec<SubAgentReport>, SpawnError> {
+        self.batch_inner(reqs, max_concurrency, false).await
+    }
+
+    async fn batch_inner(
+        self: &Arc<Self>,
+        reqs: Vec<SubAgentRequest>,
+        max_concurrency: Option<usize>,
+        charge: bool,
+    ) -> Result<Vec<SubAgentReport>, SpawnError> {
         if reqs.is_empty() {
             return Err(SpawnError::InvalidArgs("tasks 不能为空".into()));
         }
@@ -912,51 +942,64 @@ impl SubAgentRuntime {
             )));
         }
         self.check_can_spawn()?;
-        if !self.governor.try_charge(reqs.len()) {
-            return Err(SpawnError::BudgetExhausted {
-                used: self.governor.used(),
-                max: self.cfg.max_total,
-            });
-        }
+        let charged = charge && {
+            if !self.governor.try_charge(reqs.len()) {
+                return Err(SpawnError::BudgetExhausted {
+                    used: self.governor.used(),
+                    max: self.cfg.max_total,
+                });
+            }
+            true
+        };
         let conc = max_concurrency
             .unwrap_or(self.cfg.max_parallel)
             .clamp(1, self.cfg.max_parallel.max(1));
         use futures::stream::StreamExt;
         let rt = self.clone_arc();
-        let reports: Vec<SubAgentReport> = futures::stream::iter(reqs.into_iter().map(move |req| {
-            let rt = rt.clone();
-            async move {
-                let permit = match rt.acquire_permit().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return SubAgentReport {
-                            run_id: String::new(),
-                            name: req.name.clone().unwrap_or_else(|| req.agent_type.id().to_string()),
-                            agent_type: req.agent_type.id().to_string(),
-                            status: "failed".into(),
-                            text: String::new(),
-                            error: Some(e.message()),
-                            tools: Vec::new(),
-                            dropped_tools: Vec::new(),
-                            iterations: 0,
-                            tool_calls: 0,
-                            wallclock_ms: 0,
-                            usage: UsageSnapshot::default(),
-                            origin: "batch".into(),
-                            resumed_from: req.prior.as_ref().map(|p| p.run_id.clone()),
-                        };
-                    }
-                };
-                let run_id = rt.governor.next_run_id();
-                let r = rt.run_child(&req, &run_id, "batch").await;
-                drop(permit);
-                r
-            }
-        }))
-        .buffer_unordered(conc)
-        .collect()
-        .await;
-        Ok(reports)
+        let reports: Vec<(usize, SubAgentReport)> =
+            futures::stream::iter(reqs.into_iter().enumerate().map(move |(idx, req)| {
+                let rt = rt.clone();
+                async move {
+                    let permit = match rt.acquire_permit().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if charged {
+                                rt.governor.refund(1);
+                            }
+                            return (idx, SubAgentReport {
+                                run_id: String::new(),
+                                name: req
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| req.agent_type.id().to_string()),
+                                agent_type: req.agent_type.id().to_string(),
+                                status: "failed".into(),
+                                text: String::new(),
+                                error: Some(e.message()),
+                                tools: Vec::new(),
+                                dropped_tools: Vec::new(),
+                                iterations: 0,
+                                tool_calls: 0,
+                                wallclock_ms: 0,
+                                usage: UsageSnapshot::default(),
+                                origin: if charged { "batch" } else { "workflow" }.into(),
+                                resumed_from: req.prior.as_ref().map(|p| p.run_id.clone()),
+                            });
+                        }
+                    };
+                    let run_id = rt.governor.next_run_id();
+                    let origin = if charged { "batch" } else { "workflow" };
+                    let r = rt.run_child(&req, &run_id, origin).await;
+                    drop(permit);
+                    (idx, r)
+                }
+            }))
+            .buffer_unordered(conc)
+            .collect()
+            .await;
+        let mut reports = reports;
+        reports.sort_by_key(|(idx, _)| *idx);
+        Ok(reports.into_iter().map(|(_, report)| report).collect())
     }
 
     /// 查询后台作业。

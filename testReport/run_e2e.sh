@@ -1789,8 +1789,8 @@ else
   else
     check 1 "tmux: Esc 关闭补全列表"
   fi
-  # 清理:Ctrl-C 中断当前输入
-  tkey C-c
+  # 清理:Ctrl-U 清空当前输入(空输入 Ctrl-C 会按当前 TUI 语义退出)
+  tkey C-u
   sleep 0.3
 
   # 13) /provider use 测试(先 add 一条记录用于测试)

@@ -44,6 +44,7 @@ pub mod sandbox_hook;
 pub mod self_awareness;
 pub mod session_context;
 pub mod session_fork;
+pub mod subagent_workflow;
 pub mod subagent;
 pub mod system_prompt;
 pub mod tool_schema_validator;

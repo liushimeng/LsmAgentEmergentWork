@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use crate::agent::custom_agents::{self as ca, ResolvedAgentType};
 use crate::agent::dynamic_subagent::{self, report_json, SpawnError, SubAgentRequest};
 use crate::agent::self_awareness as sa;
+use crate::agent::subagent_workflow::{self, WorkflowStep};
 use crate::agent::tools::Tool;
 use crate::error::Result;
 
@@ -155,12 +156,34 @@ impl Tool for SubAgentTool {
             },
             "required": ["task"]
         });
+        let mut workflow_item_schema = task_item_schema.clone();
+        if let Some(obj) = workflow_item_schema.as_object_mut() {
+            obj.insert(
+                "id".into(),
+                json!({
+                    "type": "string", "minLength": 1, "maxLength": 64,
+                    "description": "DAG 步骤唯一标识;其它步骤用 depends_on 引用它"
+                }),
+            );
+            if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+                props.insert(
+                    "depends_on".into(),
+                    json!({
+                        "type": "array", "items": { "type": "string" },
+                        "description": "直接上游步骤 id 数组;全部成功后才执行本步骤"
+                    }),
+                );
+            }
+            if let Some(req) = obj.get_mut("required").and_then(Value::as_array_mut) {
+                req.push(json!("id"));
+            }
+        }
         json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "history", "launch", "batch", "resume", "result", "cancel"],
+                    "enum": ["list", "history", "launch", "batch", "workflow", "resume", "result", "cancel"],
                     "description": "操作类型"
                 },
                 "task": { "type": "string", "description": "launch:子任务描述(必填);resume:追加任务(可选,缺省=基于前序结论继续)" },
@@ -179,6 +202,8 @@ impl Tool for SubAgentTool {
                                 "description": "launch:true=后台运行,立即返回 run_id(默认 false=同步等待结果)" },
                 "tasks": { "type": "array", "minItems": 1, "maxItems": 8, "items": task_item_schema,
                            "description": "batch:并行子任务数组(≤8)" },
+                "steps": { "type": "array", "minItems": 1, "maxItems": 8, "items": workflow_item_schema,
+                           "description": "workflow:有依赖 DAG 的步骤数组(≤8);id 唯一,depends_on 指向已声明 id" },
                 "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 8,
                                      "description": "batch:批内并发上限(默认会话上限 3)" },
                 "run_id": { "type": "string", "description": "result / cancel / resume:目标作业句柄" },
@@ -199,7 +224,7 @@ impl Tool for SubAgentTool {
             Some(a) => a.to_string(),
             None => {
                 return Ok(SpawnError::InvalidArgs(
-                    "缺少必填字段 `action`(launch / batch / list / result / cancel)".into(),
+                    "缺少必填字段 `action`(launch / batch / workflow / list / result / cancel)".into(),
                 )
                 .envelope())
             }
@@ -250,6 +275,9 @@ impl Tool for SubAgentTool {
 
             "batch" => self.run_batch(&rt, &args).await,
 
+            // ---------- 有依赖的多阶段 DAG ----------
+            "workflow" => self.run_workflow(&rt, &args).await,
+
             // ---------- 运行记录(history:跨任务工作板视图) ----------
             "history" => self.run_history(&rt, &args),
 
@@ -273,7 +301,7 @@ impl Tool for SubAgentTool {
             },
 
             other => Ok(SpawnError::InvalidArgs(format!(
-                "未知 action `{other}`;可选:list / history / launch / batch / resume / result / cancel"
+                "未知 action `{other}`;可选:list / history / launch / batch / workflow / resume / result / cancel"
             ))
             .envelope()),
         }
@@ -281,6 +309,80 @@ impl Tool for SubAgentTool {
 }
 
 impl SubAgentTool {
+    /// `workflow`:解析并执行一张小型 DAG。
+    async fn run_workflow(
+        &self,
+        rt: &std::sync::Arc<dynamic_subagent::SubAgentRuntime>,
+        args: &Value,
+    ) -> Result<String> {
+        let Some(raw_steps) = args.get("steps").and_then(Value::as_array) else {
+            return Ok(SpawnError::InvalidArgs(
+                "workflow 需要非空 `steps` 数组(每个步骤必须有 id 和自包含 task)".into(),
+            )
+            .envelope());
+        };
+        let mut steps = Vec::with_capacity(raw_steps.len());
+        for raw in raw_steps {
+            let Some(id) = str_arg(raw, "id").map(|s| s.to_string()) else {
+                return Ok(SpawnError::InvalidArgs(
+                    "workflow.steps[] 必须提供非空 `id`".into(),
+                )
+                .envelope());
+            };
+            let req = match parse_request(raw, true, rt.work_dir()) {
+                Ok(req) => req,
+                Err(e) => return Ok(e.envelope()),
+            };
+            let depends_on = raw
+                .get("depends_on")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            steps.push(WorkflowStep {
+                id,
+                task: req.task,
+                agent_type: req.agent_type,
+                name: req.name,
+                system_prompt: req.system_prompt,
+                tools: req.tools,
+                expected_output: req.expected_output,
+                max_iterations: req.max_iterations,
+                depends_on,
+            });
+        }
+        match subagent_workflow::run_workflow(rt, steps).await {
+            Ok(outcome) => {
+                let data = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+                if outcome.status == "cancelled" {
+                    return Ok(envelope(
+                        4002,
+                        "工作流在派发或执行前被取消;已完成部分见 data.steps。",
+                        data,
+                    ));
+                }
+                let msg = if outcome.status == "completed" {
+                    format!(
+                        "工作流完成:{} / {} 个步骤成功。",
+                        outcome.succeeded, outcome.total_steps
+                    )
+                } else {
+                    format!(
+                        "工作流部分完成:{} 成功 / {} 失败 / {} 跳过 / {} 阻断;请整合成功结论并如实说明未完成阶段。",
+                        outcome.succeeded, outcome.failed, outcome.skipped, outcome.blocked
+                    )
+                };
+                Ok(envelope(0, &msg, data))
+            }
+            Err(e) => Ok(e.envelope()),
+        }
+    }
+
     /// `history`:查询已落库的运行记录(零 LLM 成本)。
     ///
     /// 持久化关闭或数据库不可用时返回 **code 0 + persist:false + 空列表** ——
@@ -482,7 +584,9 @@ impl SubAgentTool {
 
 /// 描述文本中提到的动作名(供注册面单测与提示词一致性检查)。
 pub fn action_names() -> &'static [&'static str] {
-    &["list", "history", "launch", "batch", "resume", "result", "cancel"]
+    &[
+        "list", "history", "launch", "batch", "workflow", "resume", "result", "cancel",
+    ]
 }
 
 /// 供系统提示词渲染:一句话说明工具用途(避免各处硬编码)。
@@ -490,7 +594,8 @@ pub fn hint_line() -> &'static str {
     "- SubAgent(action, task?, agent_type?, name?, tools?, expected_output?, max_iterations?, \
      background?, tasks?, max_concurrency?, run_id?): 启动/管理动态子 Agent;\
      action=list 自感知(身份/名册/额度),history 查运行记录,resume 在前序结论上继续,\
-     batch 并行启动 ≤8 个;agent_type 支持 `.laew/agents/*.md` 自定义类型。"
+     batch 并行启动 ≤8 个,workflow 执行 ≤8 步依赖 DAG;agent_type 支持 \
+     `.laew/agents/*.md` 自定义类型。"
 }
 
 /// 运行记录行 -> JSON(工具 `history` 返回;文本按字符截断,避免撑爆上下文)。
@@ -842,5 +947,14 @@ mod tests {
         for key in ["limit", "all_sessions"] {
             assert!(schema["properties"][key].is_object(), "history 参数 {key} 应存在");
         }
+        // 第 116 轮:workflow 是同一工具里的轻量 DAG action
+        assert_eq!(schema["properties"]["steps"]["maxItems"], 8);
+        assert!(schema["properties"]["steps"]["items"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "id"));
+        assert!(schema["properties"]["steps"]["items"]["properties"]["depends_on"].is_object());
+        assert!(hint_line().contains("workflow"));
     }
 }
