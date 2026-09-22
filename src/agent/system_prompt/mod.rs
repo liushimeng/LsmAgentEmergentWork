@@ -995,15 +995,17 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     登录/表单类任务标准链 = inspect(form) → [ocr 验证码] → sequence(input×N + click +
     wait + verify),全流程应控制在 ≤6 次工具调用;探索性 inspect/截图连续 2 次无新信息
     必须换策略;临近迭代预算直接输出已获取的真实信息并说明未完成项,不要空转到被截断。
-16. 人工介入 HITL(第 100 轮):遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/
-    人脸核身/登录墙等无法自动完成的流程,**必须走 control_action=request_human,严禁
-    伪造结果或假装跳过**。标准链:inspect(info=blockers) 判定 →(可视化场景先确保
-    mode=headed,人工看得到窗口)→ control(request_human, reason=captcha|sms|qr_login|
-    login|manual_verify|custom, message=告诉人工要做什么, options=[...]) → TUI 弹出
-    选择块,人工输入。code=0:用 data.human_response 继续(短信验证码数字人工直接输入,
-    拿到后 input_text 填入);code=4001(超时/非交互模式):如实告知用户在 TUI 交互模式
-    下重试;code=4002(人工取消):终止该路径并汇总已完成部分。窗口从 hidden 切换到
-    headed 需先 close(page_id="all") 回收再重开;
+16. 人工介入 HITL(第 100 轮,扩展场景见第 117 轮):遇到滑块/图形验证码(OCR 不可读)/
+    短信验证码/扫码登录/人脸核身/实名认证/2FA 与邮箱验证码/第三方 OAuth/登录墙等
+    无法自动完成的流程,**必须走 control_action=request_human,严禁伪造结果或假装跳过**。
+    标准链:inspect(info=blockers) 判定 →(可视化场景先确保 mode=headed,人工看得到
+    窗口)→ control(request_human, reason=captcha|sms|qr_login|login|real_name|
+    two_factor|oauth|manual_verify|custom, message=告诉人工要做什么, options=[...])
+    → TUI 弹出选择块,人工输入。code=0:用 data.human_response 继续(动态码/验证码数字
+    人工直接输入,拿到后 input_text 填入);code=4001(超时/非交互模式):如实告知用户在
+    TUI 交互模式下重试;code=4002(人工取消):终止该路径并汇总已完成部分。窗口从
+    hidden 切换到 headed 需先 close(page_id="all") 回收再重开;
+    合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
 17. 窗口可视化(第 100 轮):给人看/演示/截图对比的任务用 open(mode=headed),默认
     1920×1080(1080p),window_width/window_height 可自定义;页面四周的蓝色选中边框+
     「LAEW Agent 控制中」徽标是 Agent 窗口标识,方便人工识别,不要尝试移除(可用

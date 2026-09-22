@@ -473,8 +473,63 @@ fn detect_blockers_matches_common_walls() {
     let login = inspect::detect_blockers("Please sign in to continue browsing");
     assert!(login.iter().any(|b| b["kind"] == "login"), "实际:{login:?}");
 
+    // 第 117 轮:扩展场景(实名/2FA/OAuth)的关键词必须被识别
+    let real_name = inspect::detect_blockers("根据监管要求,请先完成实名认证后再继续操作");
+    assert!(
+        real_name.iter().any(|b| b["kind"] == "real_name"),
+        "实际:{real_name:?}"
+    );
+
+    let face = inspect::detect_blockers("正在进行人脸核身,请正对屏幕");
+    assert!(face.iter().any(|b| b["kind"] == "real_name"), "实际:{face:?}");
+
+    let two_factor = inspect::detect_blockers("请输入邮箱验证码完成两步验证");
+    assert!(
+        two_factor.iter().any(|b| b["kind"] == "two_factor"),
+        "实际:{two_factor:?}"
+    );
+
+    let totp = inspect::detect_blockers("Open Google Authenticator and enter the TOTP code");
+    assert!(totp.iter().any(|b| b["kind"] == "two_factor"), "实际:{totp:?}");
+
+    let oauth = inspect::detect_blockers("请使用 GitHub 账号授权登录");
+    assert!(oauth.iter().any(|b| b["kind"] == "oauth"), "实际:{oauth:?}");
+
+    let sso = inspect::detect_blockers("通过 SSO 登录到企业工作台");
+    assert!(sso.iter().any(|b| b["kind"] == "oauth"), "实际:{sso:?}");
+
     let clean = inspect::detect_blockers("普通页面内容,无阻断");
     assert!(clean.is_empty(), "误报:{clean:?}");
+}
+
+#[test]
+fn human_assist_allowed_reasons_covers_extensions() {
+    // 第 117 轮:常量必须包含实名/2FA/OAuth 三种新 reason,且顺序符合推荐使用顺序。
+    use crate::agent::tools::mcp_web_use::control::HUMAN_ASSIST_ALLOWED_REASONS;
+    let names: Vec<&str> = HUMAN_ASSIST_ALLOWED_REASONS.to_vec();
+    for required in &[
+        "captcha", "sms", "qr_login", "login", "real_name", "two_factor", "oauth",
+        "manual_verify", "custom",
+    ] {
+        assert!(names.contains(required), "缺失合法 reason {required}");
+    }
+    // 顺序:captcha→sms→qr_login→login→real_name→two_factor→oauth→manual_verify→custom
+    assert_eq!(names[4], "real_name", "real_name 应在 manual_verify 前");
+    assert_eq!(names[5], "two_factor", "two_factor 应在 manual_verify 前");
+    assert_eq!(names[6], "oauth", "oauth 应在 manual_verify 前");
+}
+
+#[test]
+fn human_assist_reasons_doc_lists_all_variants() {
+    // 第 117 轮:human_assist_reasons_doc() 输出必须包含 9 个合法 reason,
+    // LLM 在错误消息中可直接复用此串构造修复请求。
+    use crate::agent::tools::mcp_web_use::control::{
+        human_assist_reasons_doc, HUMAN_ASSIST_ALLOWED_REASONS,
+    };
+    let doc = human_assist_reasons_doc();
+    for r in HUMAN_ASSIST_ALLOWED_REASONS {
+        assert!(doc.contains(r), "doc 缺失 {r}: {doc}");
+    }
 }
 
 #[tokio::test]

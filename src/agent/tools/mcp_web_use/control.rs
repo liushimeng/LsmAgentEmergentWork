@@ -1162,6 +1162,8 @@ async fn act_set_highlight(id: &str, p: &Value) -> std::result::Result<Value, St
 }
 
 /// request_human 的 reason → 默认文案与 TUI 标签。
+/// 完整合法 reason 列表见 [`HUMAN_ASSIST_ALLOWED_REASONS`];新增 reason 必须
+/// 同步更新此处 + 校验顺序 + 文档,保证 LLM / TUI / 阻断检测三处对齐。
 fn human_assist_defaults(reason: &str) -> (&'static str, &'static str) {
     // (TUI 展示标签, 默认说明文案)
     match reason {
@@ -1181,12 +1183,43 @@ fn human_assist_defaults(reason: &str) -> (&'static str, &'static str) {
             "账密登录",
             "页面要求账号密码登录。请人工在浏览器窗口完成登录后回到终端确认(不要把密码发给 Agent)。",
         ),
+        "real_name" => (
+            "实名认证/人脸核身",
+            "页面要求实名认证/上传身份证/人脸核身,Agent 无法代为核验。请人工在浏览器窗口完成验证(刷脸/上传证件)后回到终端继续。",
+        ),
+        "two_factor" => (
+            "二次验证/2FA",
+            "页面要求二次验证(2FA/TOTP/邮箱验证码)。请把手机 Authenticator 或邮箱里看到的动态码直接输入在下方。",
+        ),
+        "oauth" => (
+            "第三方授权",
+            "页面跳到第三方授权页(GitHub/微信/Google/SSO 等),Agent 无法跨设备授权。请人工在浏览器窗口完成授权后回到终端继续。",
+        ),
         "manual_verify" => (
             "人工核验",
             "页面流程需要人工核验/确认。请人工在浏览器窗口完成后回到终端继续。",
         ),
         _ => ("人工介入", "Agent 无法继续当前流程,需要人工处理。"),
     }
+}
+
+/// request_human 合法 reason 集合(用于参数校验与对外暴露给 LLM)。
+/// 顺序即为推荐使用顺序;新增 reason 必须同步更新此处 + TUI 标签 + 文档。
+pub const HUMAN_ASSIST_ALLOWED_REASONS: &[&str] = &[
+    "captcha",
+    "sms",
+    "qr_login",
+    "login",
+    "real_name",
+    "two_factor",
+    "oauth",
+    "manual_verify",
+    "custom",
+];
+
+/// 把 reason 列表渲染成斜杠分隔字符串(用于错误消息/工具 Schema 描述)。
+pub fn human_assist_reasons_doc() -> String {
+    HUMAN_ASSIST_ALLOWED_REASONS.join("/")
 }
 
 /// control_action=request_human:人工介入请求(HITL 闭环)。
@@ -1203,14 +1236,11 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
         return envelope(2000, "page_id 不存在", json!({"page_id": id}));
     }
     let reason = str_arg(p, "reason").unwrap_or("custom");
-    if !matches!(
-        reason,
-        "captcha" | "sms" | "qr_login" | "login" | "manual_verify" | "custom"
-    ) {
+    if !HUMAN_ASSIST_ALLOWED_REASONS.contains(&reason) {
         return envelope(
             1001,
-            "非法 reason(允许 captcha/sms/qr_login/login/manual_verify/custom)",
-            json!({"reason": reason}),
+            &format!("非法 reason(允许 {})", human_assist_reasons_doc()),
+            json!({"reason": reason, "allowed": HUMAN_ASSIST_ALLOWED_REASONS}),
         );
     }
     let (label, default_message) = human_assist_defaults(reason);

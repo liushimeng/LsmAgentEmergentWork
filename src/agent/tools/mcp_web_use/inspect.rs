@@ -33,6 +33,38 @@ const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
         &["请登录", "登录后查看", "立即登录", "sign in", "log in to continue", "账号登录"],
         "登录墙:用户已提供凭证则自动登录;否则 control(request_human, reason=login) 让人工在窗口登录",
     ),
+    (
+        "real_name",
+        &[
+            "实名认证", "实名验证", "身份认证", "身份验证", "人脸核身", "人脸识别",
+            "人脸验证", "上传身份证", "证件认证", "kyc", "real-name", "real name",
+        ],
+        "实名认证/人脸核身/上传身份证:Agent 无法代为核验,control(request_human, reason=real_name) 让用户在浏览器窗口完成验证后继续",
+    ),
+    (
+        "two_factor",
+        &[
+            "两步验证", "两步校验", "双重验证", "二次验证", "动态口令", "安全令牌",
+            "google authenticator", "2fa", "2-step", "邮箱验证码", "邮件验证码",
+            "邮箱校验码", "动态密码", "totp",
+        ],
+        "二次验证/2FA/TOTP/邮箱验证码:用户从手机/邮箱获取动态码,control(request_human, reason=two_factor) 让人工在 TUI 直接输入数字",
+    ),
+    (
+        "oauth",
+        &[
+            // 中国常见 OAuth 入口
+            "微信授权", "支付宝授权", "github 授权", "google 授权",
+            "github 账号", "google 账号", "微信 账号", "支付宝 账号",
+            // 「使用 X」/「continue with X」 引导语
+            "使用 github", "使用 google", "使用 微信", "使用 支付宝", "使用 qq",
+            "continue with", "sign in with",
+            // 授权/SSO 通用词
+            "授权登录", "第三方登录", "sso 登录", "single sign-on",
+            "oauth", "open in app", "应用授权",
+        ],
+        "第三方授权/SSO/OAuth:Agent 无法跨设备授权,control(request_human, reason=oauth) 让用户在浏览器窗口完成授权后继续",
+    ),
 ];
 
 /// 在页面文本中检测人工阻断(Rust 侧模式表,可单测)。
@@ -258,10 +290,15 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
             let blockers = detect_blockers(&text);
+            // 暴露合法 reason 列表:LLM 拿到 blockers 后可直接挑一个去 request_human,
+            // 不必反查工具 schema / 文档。新增 reason 时本列表自动跟随常量更新。
+            let allowed_reasons: Vec<&'static str> =
+                super::control::HUMAN_ASSIST_ALLOWED_REASONS.to_vec();
             Ok(json!({
                 "blockers": blockers,
                 "blocked": !blockers.is_empty(),
                 "suggested_action": if blockers.is_empty() { "continue" } else { "request_human" },
+                "available_reasons": allowed_reasons,
             }))
         }
         "page_meta" => {

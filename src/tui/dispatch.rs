@@ -1136,6 +1136,9 @@ fn human_assist_kind_label(kind: &str) -> &str {
         "sms" => "短信验证码",
         "qr_login" => "扫码登录",
         "login" => "账密登录",
+        "real_name" => "实名认证/人脸核身",
+        "two_factor" => "二次验证/2FA",
+        "oauth" => "第三方授权",
         "manual_verify" => "人工核验",
         _ => "人工介入",
     }
