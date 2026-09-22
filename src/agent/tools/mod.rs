@@ -182,13 +182,22 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
     reg
 }
 
-/// Yolo Agent 工具注册表:Read(理解上下文)+ 结构化输出通道
-/// `submit_task_classification`(2026-09-09 第 13 轮,L6/L19)
-/// + SubAgent(第 114 轮:只读子 Agent 侦察,策略 `ReadOnlyChildren`)。
+/// Yolo Agent 工具注册表(2026-09-22 ReAct 改造):
+/// - **信息收集型工具面**:Read / Glob / Grep / Bash(只读侦察)/ MCP_Web_Use(观察类 action);
+///   分类前按 ReAct(Thought→Action→Observation)循环自主收集信息。
+/// - **结构化输出通道** `submit_task_classification`(L6/L19);
+/// - **只读子 Agent**(第 114 轮:`ReadOnlyChildren`,只读侦察型)。
+///
+/// Yolo 仍不持 `Write / Edit / TodoWrite`(入口层不落盘、不管任务清单)。
+/// 详见 `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md`。
 pub fn yolo_registry() -> ToolRegistry {
     register_subagent(
         ToolRegistry::new()
             .register(Arc::new(read::ReadTool))
+            .register(Arc::new(glob::GlobTool))
+            .register(Arc::new(grep::GrepTool))
+            .register(Arc::new(bash::BashTool))
+            .register(Arc::new(mcp_web_use::McpWebUseTool))
             .register(Arc::new(emit::SubmitTaskClassification)),
     )
 }
@@ -255,13 +264,24 @@ mod names_tests {
     use super::*;
 
     #[test]
-    fn yolo_registry_names_only_read_and_emit() {
-        // F1(2026-09-14 第 51 轮):ToolNotFound 回填文本依赖 names() 列出
-        // 可用工具边界;Yolo 注册表必须恰好是 Read + submit_task_classification
-        // (+ 第 114 轮的自感知委派工具 SubAgent,Yolo 策略为 ReadOnlyChildren)。
+    fn yolo_registry_names_react_recon_surface() {
+        // 2026-09-22 ReAct 改造:Yolo 工具面 = 信息收集型 5 件 + 结构化 emit + SubAgent。
+        // F1(2026-09-14 第 51 轮):ToolNotFound 回填文本依赖 names() 列出可用工具边界,
+        // 因此该列表必须与 profile.tools 注册顺序严格一致。
         let reg = yolo_registry();
         let names = reg.names();
-        assert_eq!(names, vec!["Read", "submit_task_classification", "SubAgent"]);
+        assert_eq!(
+            names,
+            vec![
+                "Read",
+                "Glob",
+                "Grep",
+                "Bash",
+                "MCP_Web_Use",
+                "submit_task_classification",
+                "SubAgent",
+            ]
+        );
     }
 
     // ========== 第 114 轮(2026-09-22):自感知 SubAgent 动态启动 注册面 ==========
@@ -390,9 +410,11 @@ mod names_tests {
     }
 
     #[test]
-    fn yolo_and_main_work_registries_exclude_mcp_web_use() {
-        // 权限面不扩大:Yolo / Main-Work / Plan / QC 不持浏览器操控工具。
-        assert!(!yolo_registry().names().contains(&"MCP_Web_Use"));
+    fn main_work_plan_quality_exclude_mcp_web_use() {
+        // 2026-09-22 ReAct 改造:Yolo 工具面已扩展为含 MCP_Web_Use(用于意图判断所需的
+        // 网页信息收集:open/list/inspect/screenshot 观察类 action)。
+        // 其它入口/编排/质检角色仍不持浏览器操控工具(权限面不扩大)。
+        assert!(yolo_registry().names().contains(&"MCP_Web_Use"));
         assert!(!main_work_registry().names().contains(&"MCP_Web_Use"));
         assert!(!plan_registry().names().contains(&"MCP_Web_Use"));
         assert!(!quality_registry().names().contains(&"MCP_Web_Use"));

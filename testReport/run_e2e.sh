@@ -604,10 +604,11 @@ rm -f "$INJECT_MOCK_LOG"
 
 # --- 4j. 结构化输出强制通道端到端(L6/L19,2026-09-09 第 13 轮) ---
 # 方案见 tmpPlan/2026-09-09_13-结构化输出强制通道与forced-tool-choice方案.md
-# 4j-1: mock --forced-tool — Yolo/Quality 以 tool_use 返回结构化结果;
-#       断言 wire 上 tool_choice 指名(anthropic {"type":"tool"}) + 链路贯通。
-# 4j-2: mock --forced-tool --reject-tool-choice — 首次 forced 请求被 400 拒绝;
+# 4j-1: mock --forced-tool — Quality 每轮强制;Yolo ReAct 延迟强制(探索轮 tool_choice
+#       不指名,仅末轮强制 emit;mock 当轮自愿提交 → 1 轮终止),断言 wire 与工具面。
+# 4j-2: mock --forced-tool --reject-tool-choice — Quality 首次 forced 请求被 400 拒绝;
 #       断言 resilient.rs 自适应降级(第二次请求无 tool_choice)后链路仍贯通。
+#       Yolo round 1 无 forced → mock 不拒绝;QC 强制通道被拒后降级。
 section "4j. 结构化输出强制通道(L6/L19 forced tool_choice)"
 FT_MOCK_LOG="testReport/mock_requests-forced-$RUN_ID.jsonl"
 FT_MOCK_PORT=18904
@@ -644,14 +645,18 @@ def chk(cond, name):
     ok = ok and cond
 yolo = by_agent("LsmAgentEmergentWork-Yolo")
 quality = by_agent("LsmAgentEmergentWork-Quality-Check")
-chk(len(yolo) == 1, f"Yolo 请求恰好 1 次(emit 命中 1 轮终止,实际 {len(yolo)})")
+chk(len(yolo) == 1, f"Yolo 请求恰好 1 次(mock 当轮自愿提交 emit,实际 {len(yolo)})")
 if yolo:
     tc = yolo[0]["body"].get("tool_choice") or {}
-    chk(tc.get("type") == "tool", f"Yolo wire tool_choice.type=tool(实际 {tc.get('type')!r})")
-    chk(tc.get("name") == "submit_task_classification", f"Yolo wire 指名 submit_task_classification(实际 {tc.get('name')!r})")
-    chk(tc.get("disable_parallel_tool_use") is True, "Yolo wire 禁并行(disable_parallel_tool_use=true)")
+    # 2026-09-22 ReAct 延迟强制:Yolo 探索轮 tool_choice 不指名(model 可自由调用
+    # Read/Glob/Grep/Bash/MCP_Web_Use);仅最终轮强制 emit。mock 当轮自愿提交 → 探索轮
+    # wire 上 tool_choice 缺省/auto。
+    chk(tc.get("type") != "tool", f"Yolo 探索轮 tool_choice 不指名(实际 {tc.get('type')!r})")
     tools = [t.get("name") for t in yolo[0]["body"].get("tools", [])]
     chk("submit_task_classification" in tools, f"emit 工具在 tools 列表中(实际 {tools})")
+    # 2026-09-22 ReAct 改造:Yolo 信息收集型工具面 5 件必须都在 tools 中。
+    for t in ["Read", "Glob", "Grep", "Bash", "MCP_Web_Use"]:
+        chk(t in tools, f"Yolo 信息收集工具面含 {t}(实际 {tools})")
 if quality:
     tc = quality[0]["body"].get("tool_choice") or {}
     chk(tc.get("name") == "submit_quality_report", f"Quality wire 指名 submit_quality_report(实际 {tc.get('name')!r})")
@@ -1268,8 +1273,9 @@ if anth:
     ) if isinstance(_sys, list) else ""
     chk("LAEW:WORKSPACE" in _sys_text, "anthropic: system 含运行时工作区 brief(D4 全角色注入)")
     chk("cargo" in _sys_text, "anthropic: 工作区 brief 含工程工具链建议(cargo)")
-    # 双 Agent 架构:Yolo(入口层,仅 Read)+ Work(执行层,全套工具)
-    # 找 tools 中含 Bash 的请求(即 Work Agent 的请求),校验工具定义格式
+    # 双 Agent 架构:Yolo(入口层,信息收集型工具面)+ Work(执行层,全套工具)
+    # 2026-09-22:Yolo 与 SubAgent-Work 均含 Bash;取首个含 Bash 的请求校验 wire 格式,
+    # 取该请求的 tools 数组即可同时覆盖两边(均使用 input_schema 规范)。
     work_req = next((r for r in anth if any(
         t.get("name") == "Bash" for t in r["body"].get("tools", [])
     )), anth[-1])

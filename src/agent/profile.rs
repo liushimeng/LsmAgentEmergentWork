@@ -72,21 +72,36 @@ pub struct AgentProfile {
     /// 对应工具定义见 `tools/emit.rs`;Provider 不支持 forced 时由
     /// `llm/resilient.rs` 自动降级为 auto 重试(全程无需用户配置)。
     pub emit_tool: Option<String>,
+    /// 结构化输出强制通道时机(2026-09-22 Yolo ReAct 改造):
+    ///
+    /// `false`(默认;QC / Plan / Main-Work / SubAgent-Work / SessionContext / Debug / Compact
+    /// / WorkFlow / 动态子 Agent):每轮请求都注入 `forced_tool` —— 强制通道与多轮探索互斥,
+    /// 只能 1 轮直答。
+    ///
+    /// `true`(仅 Yolo):探索轮(`iter + 1 < max_iterations`)不注入 `forced_tool`,
+    /// 模型自由 ReAct —— 在多轮 Thought→Action→Observation 循环中自主调用信息收集工具;
+    /// 迭代预算最后一轮强制 emit 收口(保底结构化输出),倒数第二轮追加收口预告 hint 平滑
+    /// 交卷。详见 `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md`。
+    pub defer_emit_force: bool,
 }
 
 impl AgentProfile {
     /// Yolo Agent profile(入口层,任务识别 / 难度分级)。
     ///
-    /// 结构化输出通道:分类结果必须经 `submit_task_classification` 工具提交
-    /// (forced tool_choice,Provider 不支持时自动降级文本 JSON,见 resilient.rs)。
+    /// 结构化输出通道:分类结果必须经 `submit_task_classification` 工具提交。
+    /// 2026-09-22 ReAct 改造:开启 `defer_emit_force`,允许 Yolo 在分类前按
+    /// Thought→Action→Observation 循环自主调用 Read/Glob/Grep/Bash/MCP_Web_Use
+    /// 收集信息;仅迭代预算最后一轮强制 emit 收口。
     pub fn yolo_profile() -> Self {
-        Self::with_self_awareness(
+        let mut p = Self::with_self_awareness(
             YOLO_AGENT_NAME,
             SpawnPolicy::ReadOnlyChildren,
             SystemPrompt::yolo(),
             yolo_registry,
             Some(crate::agent::tools::emit::SUBMIT_TASK_CLASSIFICATION.to_string()),
-        )
+        );
+        p.defer_emit_force = true;
+        p
     }
 
     /// Plan Agent profile(规划层,hard 档任务)。
@@ -132,6 +147,7 @@ impl AgentProfile {
             tools: quality_registry(),
             emit_tool: Some(crate::agent::tools::emit::SUBMIT_QUALITY_REPORT.to_string()),
             spawn_policy: SpawnPolicy::Disabled,
+            defer_emit_force: false,
         }
     }
 
@@ -143,6 +159,7 @@ impl AgentProfile {
             tools: session_context_registry(),
             emit_tool: None,
             spawn_policy: SpawnPolicy::Disabled,
+            defer_emit_force: false,
         }
     }
 
@@ -154,6 +171,7 @@ impl AgentProfile {
             tools: debug_registry(),
             emit_tool: None,
             spawn_policy: SpawnPolicy::Disabled,
+            defer_emit_force: false,
         }
     }
 
@@ -165,6 +183,7 @@ impl AgentProfile {
             tools: compact_registry(),
             emit_tool: None,
             spawn_policy: SpawnPolicy::Disabled,
+            defer_emit_force: false,
         }
     }
 
@@ -198,6 +217,7 @@ impl AgentProfile {
             tools: builtin_registry(),
             emit_tool: None,
             spawn_policy: SpawnPolicy::FullChildren,
+            defer_emit_force: false,
         }
     }
 
@@ -213,6 +233,7 @@ impl AgentProfile {
             tools,
             emit_tool: None,
             spawn_policy: SpawnPolicy::FullChildren,
+            defer_emit_force: false,
         }
     }
 
@@ -234,6 +255,7 @@ impl AgentProfile {
             tools,
             emit_tool: None,
             spawn_policy,
+            defer_emit_force: false,
         }
     }
 
@@ -253,11 +275,12 @@ impl AgentProfile {
             tools,
             emit_tool,
             spawn_policy,
+            defer_emit_force: false,
         }
     }
 
     /// 基于当前 profile 构造新 profile,在系统提示词末尾追加环境上下文。
-    /// 结构化输出通道随原 profile 保留(emit_tool 克隆)。
+    /// 结构化输出通道随原 profile 保留(emit_tool 克隆 + defer_emit_force 沿用)。
     pub fn with_env_tail(&self, tail: &str) -> Self {
         Self {
             name: self.name.clone(),
@@ -265,6 +288,7 @@ impl AgentProfile {
             tools: self.tools.clone(),
             emit_tool: self.emit_tool.clone(),
             spawn_policy: self.spawn_policy,
+            defer_emit_force: self.defer_emit_force,
         }
     }
 
@@ -334,12 +358,36 @@ mod tests {
     }
 
     #[test]
-    fn yolo_profile_only_has_read() {
+    fn yolo_profile_has_react_recon_tool_surface() {
+        // 2026-09-22 ReAct 改造:Yolo 信息收集型工具面 5 件 + 结构化 emit + SubAgent;
+        // 仍不持 Write/Edit/TodoWrite(入口层不落盘、不管理任务清单)。
+        // defer_emit_force 仅 Yolo 开启,其余 profile 默认 false。
         let p = AgentProfile::yolo_profile();
         let names = tool_names(&p);
-        assert!(names.contains(&"Read".to_string()));
-        assert!(!names.iter().any(|n| n == "Bash"));
-        assert!(!names.iter().any(|n| n == "Write"));
+        for t in [
+            "Read",
+            "Glob",
+            "Grep",
+            "Bash",
+            "MCP_Web_Use",
+            "submit_task_classification",
+        ] {
+            assert!(names.contains(&t.to_string()), "Yolo 工具面应含 {t}: {names:?}");
+        }
+        for forbidden in ["Write", "Edit", "TodoWrite"] {
+            assert!(
+                !names.iter().any(|n| n == forbidden),
+                "Yolo 不应持 {forbidden}: {names:?}"
+            );
+        }
+        assert!(
+            p.defer_emit_force,
+            "Yolo 应开启 ReAct 延迟强制(defer_emit_force=true)"
+        );
+        assert!(!AgentProfile::quality_check_profile().defer_emit_force);
+        assert!(!AgentProfile::sub_agent_work_profile().defer_emit_force);
+        assert!(!AgentProfile::main_work_profile().defer_emit_force);
+        assert!(!AgentProfile::plan_profile().defer_emit_force);
     }
 
     // ========== 结构化输出通道(L6/L19,2026-09-09 第 13 轮) ==========

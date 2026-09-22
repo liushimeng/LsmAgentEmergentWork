@@ -853,8 +853,9 @@
     #[tokio::test]
     async fn emit_tool_short_circuits_loop() {
         // Yolo profile + 模型返回 submit_task_classification tool_use:
-        // 循环应 1 轮终止,最终文本含 ```json 块,trace.structured_emits = 1,
-        // 且 meta.forced_tool 已注入协议层。
+        // 循环应 1 轮终止,最终文本含 ```json 块,trace.structured_emits = 1。
+        // 2026-09-22 ReAct 延迟强制:Yolo 在默认 max_iterations(20) 下首轮为探索轮,
+        // 不注入 forced_tool —— 模型当轮自愿提交 emit 后 1 轮短路,从未到达强制轮。
         let llm = std::sync::Arc::new(EmitLlm {
             replies: std::sync::Mutex::new(vec![emit_completion(
                 vec![(
@@ -889,12 +890,11 @@
         assert_eq!(trace.iterations, 1);
         assert_eq!(trace.structured_emits, 1);
         assert_eq!(trace.tool_calls, 0, "emit 通道不计入工具执行计数");
-        // 协议层收到 forced 注入
+        // 协议层:探索轮未注入 forced(model 自愿提交 emit → 短路,从未触发强制逻辑)
         let seen = llm.seen_forced.lock().expect("seen_forced");
-        assert_eq!(
-            seen.first().and_then(|f| f.as_deref()),
-            Some("submit_task_classification"),
-            "meta.forced_tool 应注入 emit 工具名,实际: {seen:?}"
+        assert!(
+            seen.iter().all(|f| f.is_none()),
+            "Yolo 探索轮(非最终轮)不应注入 forced,实际: {seen:?}"
         );
     }
 
@@ -957,6 +957,76 @@
             })
             .any(|c| c.contains("已忽略"));
         assert!(ignored, "Read 的回填应标记「已忽略」");
+    }
+
+    // ========== 2026-09-22 Yolo ReAct 延迟强制 ==========
+
+    #[tokio::test]
+    async fn yolo_react_emits_force_only_on_final_round() {
+        // ReAct 延迟强制:探索轮 forced=None(模型自由调用 Bash 收集);
+        // 最后一轮 forced=emit(保证结构化收口)。
+        let llm = std::sync::Arc::new(EmitLlm {
+            replies: std::sync::Mutex::new(vec![
+                emit_completion(
+                    vec![("Bash", json!({"command": "echo react-probe"}))],
+                    "先收集信息。",
+                ),
+                emit_completion(
+                    vec![(
+                        "submit_task_classification",
+                        json!({
+                            "task_level": "simple",
+                            "goal_summary": "回显验证",
+                            "intent": "verify",
+                            "decomposition_plan": [],
+                            "direct_answer": null
+                        }),
+                    )],
+                    "信息已足够,提交分类。",
+                ),
+            ]),
+            seen_forced: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent =
+            Agent::new(llm.clone(), AgentProfile::yolo_profile()).with_max_iterations(2);
+        let (_text, _usage, trace) = agent.run_once("echo react-probe").await.unwrap();
+
+        let seen = llm.seen_forced.lock().expect("seen_forced");
+        let seen: Vec<Option<String>> = seen.iter().cloned().collect();
+        assert_eq!(
+            seen,
+            vec![None, Some("submit_task_classification".to_string())],
+            "探索轮不强制 / 最终轮强制 emit,实际: {seen:?}"
+        );
+        assert_eq!(trace.tool_calls, 1, "Bash 探索调用应真实执行");
+        assert_eq!(trace.structured_emits, 1);
+        assert_eq!(trace.iterations, 2);
+    }
+
+    #[tokio::test]
+    async fn quality_check_always_forces_emit() {
+        // 对照试验:Quality-Check 不开 defer_emit_force,每轮都强制。
+        let llm = std::sync::Arc::new(EmitLlm {
+            replies: std::sync::Mutex::new(vec![
+                emit_completion(
+                    vec![(
+                        "submit_quality_report",
+                        json!({"verdict": "pass", "source": "subagent", "retryable": false}),
+                    )],
+                    "",
+                ),
+            ]),
+            seen_forced: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(llm.clone(), AgentProfile::quality_check_profile())
+            .with_max_iterations(2);
+        let _ = agent.run_once("质检").await.unwrap();
+        let seen = llm.seen_forced.lock().expect("seen_forced");
+        let seen: Vec<_> = seen.iter().map(|f| f.as_deref().map(|s| s.to_string())).collect();
+        assert!(
+            seen.iter().all(|f| f.as_deref() == Some("submit_quality_report")),
+            "Quality-Check 每轮都应强制 submit_quality_report,实际: {seen:?}"
+        );
     }
 
     #[tokio::test]

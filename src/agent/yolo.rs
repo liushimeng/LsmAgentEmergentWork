@@ -5,11 +5,16 @@
 //! - `medium`(中等难度):多步流程,委派 Main-Work
 //! - `hard`(高等难度):需要书面方案,委派 Plan
 //!
-//! Yolo 仅持有 Read 工具(用于理解上下文),不持有 Bash/Write 等会改变系统状态的工具。
+//! 2026-09-22 ReAct 改造:Yolo 持有**信息收集型工具面**(Read / Glob / Grep / Bash
+//! 只读侦察 / MCP_Web_Use 观察类 action + SubAgent 只读子 Agent),分类前按
+//! Thought→Action→Observation 循环自主收集信息;结构化分类经
+//! `submit_task_classification` 提交,采用**延迟强制**(探索轮 auto、末轮强制
+//! 收口,见 `AgentProfile.defer_emit_force`)。
 //!
 //! 失败回流:Yolo 接收下游失败摘要后,可决定重试(修订 plan)或给出用户建议。
 //!
-//! 设计见 `docs/多Agent架构重构/01-设计与解决方案.md` §3。
+//! 设计见 `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md`
+//! 与 `docs/多Agent架构重构/01-设计与解决方案.md` §3。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -159,14 +164,24 @@ pub struct YoloRunner {
 
 impl YoloRunner {
     /// 构造 Yolo Runner(只持有 Yolo Agent)。
+    ///
+    /// 2026-09-22 ReAct 改造:迭代预算 4 → 8(信息收集需要多轮 Thought→Action→Observation);
+    /// 显式 `with_explore_budget(0)` 关闭第 118 轮的 explore 提示 —— 该提示文案面向
+    /// 浏览器/桌面操控(「禁止再开新 inspect / screenshot」),对 Yolo 的 MCP_Web_Use
+    /// 信息收集语义是误导。Yolo 的收口节奏由 `AgentProfile.defer_emit_force`
+    /// 与 `max_iterations` 协同保障(末轮强制 emit)。
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>) -> Self {
-        let yolo = Agent::new(llm, AgentProfile::yolo_profile()).with_max_iterations(4);
+        let yolo = Agent::new(llm, AgentProfile::yolo_profile())
+            .with_max_iterations(8)
+            .with_explore_budget(0);
         Self { yolo_agent: yolo }
     }
 
-    /// 用自定义 max_iterations 构造 Yolo。
+    /// 用自定义 max_iterations 构造 Yolo(仍关闭 explore 提示)。
     pub fn with_max_iterations(llm: Arc<dyn crate::llm::LlmClient>, max_iter: usize) -> Self {
-        let yolo = Agent::new(llm, AgentProfile::yolo_profile()).with_max_iterations(max_iter);
+        let yolo = Agent::new(llm, AgentProfile::yolo_profile())
+            .with_max_iterations(max_iter)
+            .with_explore_budget(0);
         Self { yolo_agent: yolo }
     }
 

@@ -51,7 +51,8 @@ pub const MAX_BATCH_TASKS: usize = 8;
 pub enum SpawnPolicy {
     /// 不注册 `SubAgent` 工具(QC / SessionContext / Debug / Compact / Compact 等)。
     Disabled,
-    /// 只能启动只读子 Agent(Yolo:入口层只持 Read,子 Agent 不得越权写盘)。
+    /// 只能启动只读子 Agent(Yolo:入口层信息收集型工具面 Read/Glob/Grep/Bash/MCP_Web_Use,
+    /// 子 Agent 仍只读侦察,不得越权写盘)。
     ReadOnlyChildren,
     /// 可启动完整执行层子 Agent(Plan / Main-Work / SubAgent-Work / WorkFlow:
     /// 这些角色本身就是「委派者」,其委派单元既有语义即为全套执行工具)。
@@ -374,7 +375,10 @@ impl Default for SelfAwarenessConfig {
             max_depth: 1,
             max_parallel: 3,
             max_total: 8,
-            max_iterations: 12,
+            // 第 119 轮: 与 OrchestratorConfig.subagent_max_iterations 对齐 32,
+            // 防止动态子 Agent 在验证码/登录链路上过早 max_iter 撞线
+            // (实测 max_iter=12 时子 Agent 刚启动就退出, 浪费调度与 round-trip)。
+            max_iterations: 32,
             timeout_secs: 300,
             persist: true,
             run_keep: 500,
@@ -582,7 +586,9 @@ mod tests {
         assert_eq!(c.max_depth, 1, "默认只允许一层子 Agent(对齐 openclaw)");
         assert_eq!(c.max_parallel, 3, "默认并发 3(对齐 atomcode)");
         assert_eq!(c.max_total, 8);
-        assert_eq!(c.max_iterations, 12);
+        // 第 119 轮:与 OrchestratorConfig.subagent_max_iterations(=32) 对齐,
+        // 验证码/登录链路实测需要 ≥20 iter, 12 撞线率极高
+        assert_eq!(c.max_iterations, 32);
         assert_eq!(c.timeout_secs, 300);
     }
 

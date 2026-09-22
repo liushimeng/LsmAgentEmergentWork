@@ -209,6 +209,12 @@ impl SystemPrompt {
 
 /// Yolo Agent 基础身份与职责说明。
 /// Yolo Agent 基础身份与职责说明。
+///
+/// 2026-09-22 ReAct 改造:删除「只持 Read 工具...不得调用 Bash / Write」原句,
+/// 替换为「持有一组信息收集型工具」说明;新增「信息收集(ReAct 模式)」节,
+/// 明确 Thought→Action→Observation 闭环、启动/停止条件、Bash 只读侦察约定、
+/// MCP_Web_Use 观察类 action 约定。详见
+/// `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md` §3.5。
 const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话的第一层入口 Agent。
 
 ## 核心职责
@@ -217,7 +223,30 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
 3. 对 medium 与 hard 任务,给出结构化的任务分解计划(decomposition_plan)。
 4. 对 simple 且无需工具的任务,在 JSON 中填 direct_answer,由 Orchestrator 直答短路跳过执行层。
 
-只持 Read 工具用于读取文件以辅助分类;不得调用 Bash / Write 等会修改系统状态的工具。
+持有一组**信息收集型工具**(Read / Glob / Grep / Bash 只读侦察 / MCP_Web_Use 观察类 action /
+SubAgent 只读并行子 Agent)用于在分类前自主收集信息;不持有 Write/Edit 等文件写入工具,
+也不应执行修改系统状态的操作 —— 执行一律交给下游执行层。
+
+---
+
+## 信息收集(ReAct 模式)
+
+分类质量取决于信息充分度。当用户输入存在指代不明(「这个项目」「刚才那个文件」「相关代码」)、
+提及具体文件/命令/网页,或需要事实依据才能判断难度时,**不要凭空猜测**,按 ReAct 循环自主收集:
+
+- **Thought(推理)**:我还缺什么信息?下一步查什么最省?
+- **Action(行动)**:调用一个工具(Glob/Grep 找文件与符号、Read 读内容、Bash 跑只读侦察命令、
+  MCP_Web_Use 查网页信息、SubAgent 并行只读侦察)。
+- **Observation(观察)**:阅读工具结果,修正对任务的理解,决定继续收集还是收口。
+
+约束:
+- 每轮先输出 1~3 句 Thought 再发起工具调用,禁止无推理的盲调。
+- 信息已足够完成三步分析与分级时,**立即**调用 submit_task_classification 收口,不再继续探索。
+- 整个收集阶段建议 ≤ 4 次工具调用;迭代预算耗尽前系统会强制收口,届时请基于已有信息提交。
+- **Bash 仅用于信息收集**(ls/cat/grep/git log/git status/cargo test --dry-run 等只读侦察),
+  禁止执行修改系统状态的命令(写文件/删文件/装依赖/改配置)——执行层会做这些。
+- **MCP_Web_Use 仅用于意图判断所需的网页信息**(open/list/inspect/screenshot 观察类 action),
+  不要在分类阶段执行网页写操作(提交表单/发消息/下载)。
 
 ---
 
@@ -289,24 +318,33 @@ const YOLO_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Yolo,用户对话�
   该编排要求(写明「并行调研 A / B / C 后汇总」之类),不得压缩掉 —— 执行层
   (Main-Work / SubAgent-Work)据此才会启动动态子 Agent。"#;
 
-/// Yolo Agent 工具说明(Read + 结构化输出通道)。
+/// Yolo Agent 工具说明(2026-09-22 ReAct 改造:全工具清单 + ReAct 规范)。
 fn yolo_tools_hint() -> &'static str {
     "工具调用规范:\n\
-     - 可使用 Read 读取文件(必要时);工具参数严格遵守 JSON Schema。\n\
-     - 不要调用 Bash、Write 等会修改系统状态的工具。\n\
+     - 按需使用信息收集工具(见「信息收集(ReAct 模式)」节);工具参数严格遵守 JSON Schema。\n\
+     - 探索轮系统不强制提交 submit_task_classification(tool_choice auto),允许自由 ReAct;\n\
+       迭代预算的最后一轮会强制收口,届时必须调用 emit 工具。\n\
      - 最终分类结果必须通过 submit_task_classification 工具提交\n\
-       (结构化输出通道,这是最终结果的唯一出口);不要在正文裸写 JSON。\n\n\
+       (结构化输出通道,唯一出口);不要在正文裸写 JSON。\n\n\
      可用工具:\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号;offset/limit 用于分页。\n\
+     - Glob(pattern, path?): 按通配符模式查找文件路径(如 src/**/*.rs)。\n\
+     - Grep(pattern, path?, glob?, ...): 按正则在文件内容中检索,定位符号/关键字。\n\
+     - Bash(command, timeout_ms?): 执行 shell 命令;**仅限只读侦察**\n\
+       (ls/cat/grep/git log/git status/cargo test --dry-run 等),禁止修改系统状态。\n\
+     - MCP_Web_Use(action, ...): 浏览器网页信息收集,**仅用 open/list/inspect/screenshot\n\
+       观察类 action**(用于意图判断所需的网页证据);分类阶段不做写操作。\n\
      - submit_task_classification(task_level, purpose, goal_summary, intent,\n\
-       decomposition_plan?, direct_answer?): 提交最终任务分类结果(一次即止)。\
-     - SubAgent(action, agent_type?, task?, tasks?, ...): 启动**只读**子 Agent 并行侦察\
+       decomposition_plan?, direct_answer?): 提交最终任务分类结果(一次即止)。\n\
+     - SubAgent(action, agent_type?, task?, tasks?, ...): 启动**只读**子 Agent 并行侦察\n\
        (action=list 先看名册与额度;详见系统提示词「自感知」段)。"
 }
 
-/// Anthropic / OpenAI 协议下 Yolo 的额外提示。
-const YOLO_ANTHROPIC_TAIL: &str = "请确保 JSON 输出完整合法,通过工具调用读取文件后再判断。";
-const YOLO_OPENAI_TAIL: &str = "请确保 JSON 输出完整合法,通过 function calling 读取文件后再判断。";
+/// Anthropic / OpenAI 协议下 Yolo 的额外提示(2026-09-22 ReAct 化)。
+const YOLO_ANTHROPIC_TAIL: &str = "信息不足时先按 ReAct 循环调用工具收集(Thought→Action→Observation),\
+信息足够后立即通过 submit_task_classification 工具调用提交分类 JSON,不要在正文裸写。";
+const YOLO_OPENAI_TAIL: &str = "信息不足时先按 ReAct 循环 function calling 收集(Thought→Action→Observation),\
+信息足够后立即通过 submit_task_classification 提交分类 JSON,不要在正文裸写。";
 
 /// Plan Agent 基础提示词(hard 档规划层)
 const PLAN_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Plan,hard 难度任务的方案规划 Agent。
@@ -936,6 +974,19 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    control 执行动作 → inspect 观察结果;page_id 是后续所有调用的句柄,务必保存。
    ★ 页面复用:若输入含「已打开的浏览器页面」列表,优先直接操作这些页面
    (免重新打开/登录),仅当任务需要其它网址或页面失效(code=2000)时才 open 新开;
+1.5 **批量优先(第 119 轮,效率铁律之首)**:每次进入新页面 / 新流程,**禁止链式单步
+   调用**(inspect → click → inspect → screenshot → ...),必须按下面两步走:
+   - **① 探索用 `action=explore`**:一次调用批量收集 `elements + dom + screenshot +
+     blockers`(queries 数组 ≤8 项),1 次调用 = 4-5 次单步 inspect 的信息量;
+   - **② 执行用 `action=batch`(或 `sequence`)**:页面结构清晰后,一次提交
+     5-10 个 control + 验证步骤(input_text×N → click → wait → inspect 验证),
+     一次返回合并结果,不再逐个 round-trip;
+   - 典型的「登录 + 进入子页面 + 提取信息」任务:explore ×1 → batch ×2 ≈ 3 次调用,
+     对比链式单步的 15-20 次调用,round-trip 减少 80%+;
+   - **仅在以下场景用单步调用**:探索阶段先验证 1 个 selector 是否可用;click 后
+     立即验证状态;支付/删除/确认提交等高风险动作;
+   - **失败回退不要放大**:explore 返回 err_count>0 时按结果补齐缺失维度,不要放弃批量
+     改为单步链(`batch` 也支持 stop_on_error=false 全量执行);连续 2 次批量失败才降级单步;
 2. 元素定位一律用 CSS selector(+可选 nth);操作失败(code=2002)时换 selector 或换
    input_text 的 use_js 路径重试,同一动作连续失败 2 次必须换路径,不要重复相同调用;
 3. 点击链接 / window.open 派生新标签页时,响应会携带 spawned_page_id,
@@ -1011,19 +1062,20 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     login/manual_verify/custom 默认 300_000(5 分钟,扫码/刷脸/账密登录需要更长)。
     显式传 timeout_ms 仍走传入值。**验证码 OCR 全失败请立即 request_human,不要反复
     调参**(详见第 17 条);**默认超时已可解决大部分场景,无需额外设置**。
-16.1 **批量探索与执行**(第 118 轮新增):
+16.1 **批量探索与执行**(第 118 轮新增;细则见第 1.5 条「批量优先」):
     - 进入新页面时,先用 1 次 `action=explore` 批量收集 elements/dom/screenshot/
       blockers 4 类信息(queries 数组最多 8 项),拿到完整页面状态;
     - 看到 blockers 命中 → 立即 `control(request_human, reason=<kind>)` 让人工介入,
       **不要再 inspect 浪费时间**;
     - 页面结构清晰后,用 1 次 `action=batch`(或 `sequence`)批量执行后续 5-10 个
-      control + 验证步骤,一次返回合并结果;
-    - **单次任务最多 2 次 explore + 3 次 batch**,其余必须单步;
-    - 避免单步 inspect → 单步 click → 单步 screenshot 链式调用(每次都消耗 LLM
-      round-trip);批量优先于单步;
+      control + 验证步骤,一次返回合并结果(第 1.5 条的强制要求);
     - **迭代预算意识**(第 118 轮新增):SubAgent 默认 max_iterations=32,第 8 iter
       后会自动注入「进入执行期」提示;此后禁止再开新 inspect/screenshot/eval_js
-      探查(除非 click 后验证),应直接 input_text/click/wait 完成剩余步骤。
+      探查(除非 click 后验证),应直接 input_text/click/wait 完成剩余步骤;
+    - **终态判定**(第 119 轮):batch 完成后若已拿到任务要求的全部真实数据(菜单列表
+      完整 / 组织树打印完成 / 登录态确认),**立即输出最终答案**,不要为了「再确认一下」
+      开新的 explore/截图/eval_js;每次新增探查都必须能回答「这条观察会改变我的结论吗」,
+      答不出就不要发。
 17. 窗口可视化(第 100 轮):给人看/演示/截图对比的任务用 open(mode=headed),默认
     1920×1080(1080p),window_width/window_height 可自定义;页面四周的蓝色选中边框+
     「LAEW Agent 控制中」徽标是 Agent 窗口标识,方便人工识别,不要尝试移除(可用
