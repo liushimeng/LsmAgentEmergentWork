@@ -165,62 +165,32 @@ fn valid_command_name(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
-/// 解析 frontmatter(手写 YAML 子集):首行 `---` 起,到下一个 `---` 止。
+/// 解析 frontmatter(手写 YAML 子集)。
+///
+/// 2026-09-22 第 115 轮:实现搬到 [`crate::frontmatter`] 共享(自定义子 Agent 类型
+/// 定义文件用**完全相同**的语义),本函数退化为「共享解析器 -> 本模块两个 key」的
+/// 适配层。行为与搬迁前逐字一致(下方单测即回归网)。
+///
 /// 返回 (frontmatter, 正文);无 frontmatter / 未闭合时返回 (默认, 原文)。
 fn parse_frontmatter(raw: &str) -> (Frontmatter, String) {
-    let mut lines = raw.split_inclusive('\n');
-    // 首行必须是裸 `---`
-    let first = lines.next().unwrap_or("");
-    if first.trim_end() != "---" {
-        return (Frontmatter::default(), raw.to_string());
+    let (map, body) = crate::frontmatter::parse(raw);
+    if map.is_empty() {
+        // 无 frontmatter / 未闭合:body == raw,不得半解析
+        return (Frontmatter::default(), body);
     }
     let mut fm = Frontmatter::default();
-    // 已消费字节偏移(split_inclusive 保留行尾 \n,累计即 raw 内偏移)
-    let mut consumed = first.len();
-    for line in lines.by_ref() {
-        consumed += line.len();
-        let t = line.trim_end();
-        if t == "---" {
-            return (fm, raw[consumed.min(raw.len())..].to_string());
-        }
-        if let Some((key, value)) = t.split_once(':') {
-            let key = key.trim();
-            let value = unquote(value.trim());
-            match key {
-                "description" => fm.description = Some(value),
-                "argument-hint" | "argument_hint" => fm.argument_hint = Some(value),
-                _ => {}
-            }
-        }
+    if let Some(v) = map.get("description") {
+        fm.description = Some(v.clone());
     }
-    // frontmatter 未闭合:按无 frontmatter 处理(全文当正文,不丢内容)
-    (Frontmatter::default(), raw.to_string())
-}
-
-/// 剥离成对的引号(`"..."` / `'...'`)。
-fn unquote(s: &str) -> String {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 {
-        let (f, l) = (bytes[0], bytes[bytes.len() - 1]);
-        if (f == b'"' && l == b'"') || (f == b'\'' && l == b'\'') {
-            return s[1..s.len() - 1].to_string();
-        }
+    if let Some(v) = map.get("argument-hint").or_else(|| map.get("argument_hint")) {
+        fm.argument_hint = Some(v.clone());
     }
-    s.to_string()
+    (fm, body)
 }
 
 /// description 兜底:正文首个非空行,按字符截 60(UTF-8 安全,对齐 openclaw)。
 fn fallback_description(body: &str) -> String {
-    let first = body
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    let mut out: String = first.chars().take(60).collect();
-    if first.chars().count() > 60 {
-        out.push('…');
-    }
-    out
+    crate::frontmatter::fallback_description(body, 60)
 }
 
 /// 渲染命令模板:占位符替换。

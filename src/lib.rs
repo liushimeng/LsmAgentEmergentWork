@@ -7,6 +7,7 @@
 //! - [`database`]: SQLite 数据库操作(路径解析 / Schema / Provider CRUD / 导入导出)
 //! - [`tui`]:   交互式 REPL
 //! - [`error`]: 统一错误类型
+//! - [`frontmatter`]: Markdown frontmatter 解析(自定义斜杠命令 / 自定义子 Agent 类型共用)
 
 // 2026-09-19 第 90 轮:MCP_Window_Use 的 input_batch steps 嵌套 Schema 使
 // serde_json::json! 宏展开超过默认递归上限(128),提升到 256。
@@ -17,6 +18,7 @@ pub mod config;
 pub mod crash;
 pub mod database;
 pub mod error;
+pub mod frontmatter;
 pub mod llm;
 pub mod logging;
 pub mod session;

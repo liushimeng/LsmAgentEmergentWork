@@ -889,9 +889,9 @@ ocr_with_info 在屏幕录制未授权时返回结构化「权限缺失」错误
 | 第六轮 §2.2 / atomcode `Semaphore(3)` | 动态启动无并发控制 | ✅ | `Governor.sem`（会话级 `Semaphore(3)`）+ batch `buffer_unordered`，`LAEW_SUBAGENT_MAX_PARALLEL` | 同上 |
 | L1705 无并发控制（Lane/Semaphore） | 多任务互相阻塞/失控 | ✅ | 同上（laew 取 Semaphore + 会话预算双闸） | 同上 |
 | 第六轮 §11.3 / claudecode `run_in_background` | 后台 SubAgent | ✅ | `launch_background` + 作业表 + `action="result"/"cancel"` | 同上 |
-| L1740 无 SubAgent 孤儿恢复（部分） | 父死后子丢失 | 🟡 部分 | 父 `CancelToken` → 子 `child_token()` 级联取消；**崩溃恢复仍缺**（P2，与 L1706 同批） | 同上 |
+| L1740 无 SubAgent 孤儿恢复（部分） | 父死后子丢失 | 🟡 → 🟢 大部分 | 父 `CancelToken` → 子 `child_token()` 级联取消（D114）+ **启动期孤儿标记**(非当前会话 `running` → `orphaned`)+ **血缘续跑** `resume` 复用孤儿结论（D115）;**真进程恢复仍缺**（P3） | 2026-09-22 第 114 → 115 轮 |
 | L1746 无 Swarm 并行调度（部分） | 无法多 Agent 并行执行 | 🟡 部分 | `batch` 批内并行 + 会话级信号量;**无跨任务 swarm 队列/Workboard** | 同上 |
-| L1704 无 SubAgent 注册/生命周期 | SubAgent 无状态、跨重启全丢 | 🟡 部分 | 进程内 `Governor`(作业表 + 事件环 64 + usage 台账)提供生命周期与可观测;**SQLite 持久化仍缺** | 同上 |
+| L1704 无 SubAgent 注册/生命周期 | SubAgent 无状态、跨重启全丢 | ✅(D115 补全) | 进程内 `Governor`(作业表 + 事件环 64 + usage 台账) + **SQLite `subagent_run` 持久化**(第 115 轮:insert running → update finish,`action="history"` 可查,`PERSIST=off` 可关) | 2026-09-22 第 114 → 115 轮 |
 | CC03 ToolRegistry 自省 | 提示词手写工具清单易漂移 | ✅ | `self_awareness::prompt_section`（工具清单由 `ToolRegistry::names()` 生成）+ `/agents` 面板 | 同上 |
 | opencode `deriveSubagentSessionPermission` | 子 Agent 权限继承 | ✅ | `SpawnPolicy` 三档（Disabled/ReadOnlyChildren/FullChildren）+ 工具**交集收窄** + `dropped_tools` 如实上报 | 同上 |
 | — 用户可见性 | 看不见「谁被启动/跑了多久/花了多少」 | ✅ | `tracing` 日志 + 事件环 + TUI `/agents`（名册/上限/最近作业表）+ 用量进 `/cost` | 同上 |
@@ -916,3 +916,55 @@ tools::subagent 6 + agent::tests 2 + profile 5 + 注册面 4);e2e §4n **16 项�
 
 **累计**:第六轮 SubAgent 调度缺口落地 5/8(嵌套/并发/后台/权限/自省),剩余 3 项为持久化 resume、
 跨进程委派、Swarm 跨任务队列(均 P2/P3)。
+
+---
+
+## 第 115 轮（2026-09-22）— 自感知 SubAgent 自定义类型 + 运行持久化/续跑
+
+**主题**：D114「已知边界」中两条 🟡 部分的收口（L1704 注册/生命周期 → SQLite 持久化；
+L1706 恢复机制 → 孤儿标记 + 血缘续跑）+ 第十八轮 claudecode `.claude/agents/*.md`
+与第三轮插件 `agents/` 目录的「**用户自定义 Agent 类型**」能力。
+
+目标：用户**只写一个 Markdown 文件**就能定义自己的子 Agent 类型（不改 Rust、不重编译），
+并在提示词里点名使用；每次子 Agent 运行落库，可跨任务查询（`history`）与续跑（`resume`）。
+
+| 编号/出处 | gap | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|---------|---------|
+| L1704 无 SubAgent 注册/生命周期 | SubAgent 无状态、跨重启全丢 | ✅ | `src/config/subagent_run.rs`（`subagent_run` 表 DAO）+ `src/database/schema.rs`（建表 + 2 索引）+ `dynamic_subagent::persist_start/persist_finish`（唯一运行入口落库，fail-open） | 2026-09-22 第 115 轮 |
+| L1706 无 SubAgent 恢复机制（部分） | 崩溃后 SubAgent 全部丢失 | 🟡 部分 | **孤儿标记**：启动期把非当前会话的 `running` 行改判 `orphaned`（`maintain_run_store`，TUI bootstrap + `-p` 双入口）+ **血缘续跑** `action="resume"`（前序任务/结论作为种子上下文，记 `resumed_from`）；**真·进程级恢复仍缺**（需子 Agent 状态机，P3） | 同上 |
+| L1740 无 SubAgent 孤儿恢复（部分 → 大部分） | 父死后子丢失 | 🟡 → 🟢 | 级联取消（D114）+ 启动期孤儿标记 + `resume` 让孤儿结论仍可被复用 | 同上 |
+| 第十八轮 §2.2.4 claudecode `.claude/agents/*.md` | 子 Agent 类型写死在源码 | ✅ | `src/agent/custom_agents.rs`（`.laew/agents/*.md` 两级发现 + frontmatter 6 字段 + `ResolvedAgentType::Custom`） | 同上 |
+| 第三轮 §6.5 插件目录 `agents/` | 无「定义即生效」的类型扩展点 | ✅ | 同上（与 D2 自定义斜杠命令同构：`.laew/commands` ↔ `.laew/agents`，共享 `src/frontmatter.rs`） | 同上 |
+| 第六轮 §4.2 工具集限制 | 类型工具面不可外部约束 | ✅ | 三重收窄：`tools` 白名单 ∩ `extends` 默认 ∩ `SpawnPolicy` 上限 ∩ 真实注册表；被剔除项进 `dropped_tools` | 同上 |
+| L1745 无 Workboard 多 Agent 工作板（部分） | 多 Agent 无法协作/复盘 | 🟡 部分 | `action="history"`（跨任务/跨会话查询运行记录）+ TUI `/agents history [N\|all]`；**无共享看板与任务认领** | 同上 |
+| — 类型可见性 | 模型不知道用户定义了哪些类型 | ✅ | 自感知三处同步：静态提示词段（`(自定义)` 标注）/ `action="list"` 的 `custom_roster` + `custom_skipped` / `/agents` 面板（含来源文件与被忽略原因） | 同上 |
+
+**设计要点**:
+- **定义文件即插件**：`.laew/agents/{id}.md`，frontmatter `label/description/extends/tools/readonly/name`;
+  正文 = 专属职责提示词;两级发现（项目级低优先 / 用户级高优先）;内置 id（含别名）不可被遮蔽,冲突项
+  在面板如实列出;
+- **去 enum 是硬前提**：`SubAgent` schema 里 `agent_type` 原为 JSON Schema `enum`,配合
+  `tool_schema_validator` 会**硬拒**任何自定义 id —— 改自由字符串,校验前移到 `resolve_in()`,
+  未命中给 `1001` + 「怎么自定义 / 怎么看清名册」的可执行提示;
+- **单一运行入口**：前台/后台/batch/resume 全部经 `run_child`,故落库钩子只写一处
+  (insert running → update finish),天然覆盖所有路径;
+- **run_id 唯一性修复**：D114 的 `sa-{pid}{会话内序号}` 在同一进程的两个 Session
+  (`/new` `/clear`)下会**重号**,落库后主键冲突互相覆盖 → 改 `sa-{pid}{进程级全局序号}-{会话内序号}`;
+- **prompt cache 保护**:自定义类型进静态提示词只放 id/label/描述/工具名,**不放**定义文件路径
+  (路径只在 `list` 快照与 `/agents` 面板),避免易变值破坏 cache 前缀;
+- **可关闭**:`LAEW_SUBAGENT_PERSIST=off` 零 DB 读写(工具面/提示词不变);
+  `LAEW_SUBAGENT_RUN_KEEP`(默认 500,`0`=不清理)启动期自动 trim;
+- 零新增 crate;`subagent_run` 为 `CREATE TABLE IF NOT EXISTS` 增量表,零迁移脚本。
+
+**验证**:lib 单测 **1529 全过**(基线 1484 → 新增 45 项:`frontmatter` 8 + `custom_agents` 17 +
+`self_awareness` 6 + `config::subagent_run` 6 + `dynamic_subagent` 6 + `tools::subagent` 2);
+e2e 新增 §4o **21 项全 PASS**(真实派发自定义类型 / 自定义身份与正文进子 Agent system /
+readonly 工具面收窄 / history 落库 / `resume` 血缘与种子上下文 / `PERSIST=off` 零新增落库),
+既有用例零回退。
+
+**方案**:`tmpPlan/2026-09-22_05-自感知SubAgent自定义类型与运行持久化方案.md`
+· **设计**:`docs/自感知SubAgent自定义类型与运行持久化/01-设计与解决方案.md`
+· **标记**:`专题-laew已实现功能标记-2026-09-22-自感知SubAgent自定义与持久化.md`
+
+**累计**:第六轮 SubAgent 调度缺口 5/8 → **6.5/8**(持久化+血缘续跑落地,真进程恢复仍为 P3);
+第十九轮 L1704 由 🟡 → ✅、L1706 由 ⏳ → 🟡(孤儿识别 + 血缘续跑)。

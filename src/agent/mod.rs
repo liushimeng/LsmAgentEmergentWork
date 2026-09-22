@@ -18,6 +18,7 @@ pub mod browser_watchdog;
 pub mod cancel;
 pub mod compact;
 pub mod context;
+pub mod custom_agents;
 pub mod debug;
 pub mod decision_audit;
 pub mod dynamic_subagent;

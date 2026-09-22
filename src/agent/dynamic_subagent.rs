@@ -12,7 +12,7 @@
 //! - **零开销**:未开启功能 / 非委派角色 → [`runtime_for`] 返回 `None`,链路原样直通。
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -23,12 +23,13 @@ use tracing::{info, warn};
 
 use crate::agent::cancel::CancelToken;
 use crate::agent::extrace::ExecutionTrace;
+use crate::agent::custom_agents::{self as ca, ResolvedAgentType};
 use crate::agent::self_awareness::{
-    self as sa, SelfAwarenessConfig, SpawnPolicy, SubAgentType, BATCH_MERGED_CHARS,
-    CHILD_REPORT_CHARS,
+    self as sa, SelfAwarenessConfig, SpawnPolicy, BATCH_MERGED_CHARS, CHILD_REPORT_CHARS,
 };
 use crate::agent::tools::{builtin_registry_with_work_dir, subagent::SubAgentTool};
 use crate::agent::{Agent, AgentProfile};
+use crate::config::{Db, Paths, RunQuery, SubAgentRunEntry, SubAgentRunRow};
 use crate::error::AgentError;
 use crate::llm::{ChatMessage, LlmClient, Usage};
 use crate::session::Session;
@@ -37,6 +38,9 @@ use crate::session::Session;
 const EVENT_RING_CAP: usize = 64;
 /// 单个子 Agent 等待并发槽位的最长时间(防嵌套死锁:超时返回 2003 而非永久等待)。
 const PERMIT_WAIT_SECS: u64 = 60;
+
+/// 进程级 run_id 全局序号(见 [`Governor::next_run_id`] 的唯一性说明)。
+static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ===========================================================================
 // 错误
@@ -110,13 +114,34 @@ impl SpawnError {
 // 请求 / 报告
 // ===========================================================================
 
+/// `resume` 的前序上下文(血缘续跑的种子)。
+///
+/// 第 115 轮:语义是「带着前序任务与结论**重新起一个**子 Agent」,不是恢复被冻结的
+/// future(工具执行中途状态不可序列化);血缘写入 `subagent_run.resumed_from`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PriorRun {
+    pub run_id: String,
+    pub agent_type: String,
+    pub status: String,
+    pub created_at: String,
+    pub task: String,
+    pub report: String,
+}
+
+/// 前序任务 / 结论在种子提示词里的截断上限(字符)。
+pub const PRIOR_TASK_CHARS: usize = 2000;
+/// 前序结论截断上限(字符)。
+pub const PRIOR_REPORT_CHARS: usize = 8000;
+
 /// 一次子 Agent 启动请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentRequest {
     /// 任务描述(必须自包含)。
     pub task: String,
-    /// 子 Agent 类型。
-    pub agent_type: SubAgentType,
+    /// 子 Agent 类型(内置 6 类之一,或 `.laew/agents/*.md` 自定义类型)。
+    ///
+    /// 第 115 轮从 `SubAgentType` 抬升为 [`ResolvedAgentType`];序列化为类型 id 字符串。
+    pub agent_type: ResolvedAgentType,
     /// 可选名称(默认由类型 + 序号派生)。
     #[serde(default)]
     pub name: Option<String>,
@@ -132,6 +157,9 @@ pub struct SubAgentRequest {
     /// per-子 Agent 迭代上限(4..=32)。
     #[serde(default)]
     pub max_iterations: Option<usize>,
+    /// 续跑种子(仅 `resume` 设置)。
+    #[serde(default)]
+    pub prior: Option<PriorRun>,
 }
 
 /// 子 Agent 运行报告。
@@ -160,6 +188,12 @@ pub struct SubAgentReport {
     pub wallclock_ms: u64,
     #[serde(default)]
     pub usage: UsageSnapshot,
+    /// 启动来源:`launch` / `background` / `batch` / `resume`(第 115 轮)。
+    #[serde(default)]
+    pub origin: String,
+    /// 血缘:续跑自哪个 `run_id`(第 115 轮)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<String>,
 }
 
 /// 用量快照(序列化用;`Usage` 本体不带 Serialize 派生)。
@@ -199,6 +233,9 @@ pub struct SubAgentEvent {
     pub wallclock_ms: u64,
     pub tool_calls: usize,
     pub usage: UsageSnapshot,
+    /// 启动来源(第 115 轮:`launch` / `background` / `batch` / `resume`)。
+    #[serde(default)]
+    pub origin: String,
 }
 
 // ===========================================================================
@@ -244,6 +281,8 @@ pub struct Governor {
     events: Mutex<VecDeque<SubAgentEvent>>,
     /// run_id 序号。
     seq: AtomicU64,
+    /// 运行记录落库句柄(第 115 轮;惰性打开,失败 = `None` 且只 warn 一次)。
+    db: OnceLock<Option<Arc<Db>>>,
 }
 
 static GOVERNORS: OnceLock<Mutex<HashMap<String, Arc<Governor>>>> = OnceLock::new();
@@ -266,6 +305,7 @@ pub fn governor_for(session_id: &str, cfg: &SelfAwarenessConfig) -> Arc<Governor
         jobs: Mutex::new(HashMap::new()),
         events: Mutex::new(VecDeque::new()),
         seq: AtomicU64::new(0),
+        db: OnceLock::new(),
     });
     table.insert(session_id.to_string(), g.clone());
     g
@@ -321,6 +361,144 @@ pub fn governor_view(session_id: &str) -> Option<(usize, usize, usize, usize)> {
     Some((g.used(), g.cfg.max_total, g.in_flight(), g.cfg.max_parallel))
 }
 
+// ===========================================================================
+// 持久化(第 115 轮,2026-09-22)
+// ===========================================================================
+
+/// 落库句柄(进程级缓存)。
+///
+/// `Paths::detect()` + `Db::open()` 带完整性检测,代价不低,但每个进程只需一次;
+/// 打开失败缓存 `None` 并 warn 一次 —— 持久化是**增强能力**,绝不能让任务失败。
+fn persist_db() -> Option<Arc<Db>> {
+    // 单测默认**不落盘**(否则会在 target/ 下建库):需要验证持久化的测试用
+    // [`set_test_db`] 显式注入临时库;`set_test_db(None)` 则模拟「数据库不可用」。
+    #[cfg(test)]
+    {
+        return test_db_override().flatten();
+    }
+    #[allow(unreachable_code)]
+    if let Some(over) = test_db_override() {
+        return over;
+    }
+    static CELL: OnceLock<Option<Arc<Db>>> = OnceLock::new();
+    CELL.get_or_init(|| match Paths::detect() {
+        Ok(paths) => match Db::open(&paths) {
+            Ok(db) => Some(Arc::new(db)),
+            Err(e) => {
+                warn!(error = %e, "子 Agent 运行记录持久化不可用(打开数据库失败),后续不再尝试");
+                None
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "子 Agent 运行记录持久化不可用(根目录解析失败)");
+            None
+        }
+    })
+    .clone()
+}
+
+/// 测试用落库句柄覆盖(`Some(None)` = 显式模拟「数据库不可用」)。
+#[cfg(test)]
+static TEST_DB_OVERRIDE: OnceLock<Mutex<Option<Option<Arc<Db>>>>> = OnceLock::new();
+
+/// 读取测试覆盖;未设置返回 `None`(生产路径恒为 `None`,零开销)。
+fn test_db_override() -> Option<Option<Arc<Db>>> {
+    #[cfg(test)]
+    {
+        let cell = TEST_DB_OVERRIDE.get_or_init(|| Mutex::new(None));
+        return cell.lock().expect("db override poisoned").clone();
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// 注入测试用数据库(单测专用;`None` = 模拟数据库不可用)。
+#[cfg(test)]
+pub fn set_test_db(db: Option<Arc<Db>>) {
+    let cell = TEST_DB_OVERRIDE.get_or_init(|| Mutex::new(None));
+    *cell.lock().expect("db override poisoned") = Some(db);
+}
+
+/// 清空测试覆盖(恢复「按真实根目录打开」语义)。
+#[cfg(test)]
+pub fn clear_test_db() {
+    let cell = TEST_DB_OVERRIDE.get_or_init(|| Mutex::new(None));
+    *cell.lock().expect("db override poisoned") = None;
+}
+
+/// 会话启动期的持久化维护:孤儿标记 + 自动 trim(失败 fail-open)。
+///
+/// 设计见 `docs/自感知SubAgent自定义类型与运行持久化/01-设计与解决方案.md` §5.3。
+pub fn maintain_run_store(current_session: &str, cfg: &SelfAwarenessConfig) {
+    if !cfg.enabled || !cfg.persist {
+        return;
+    }
+    let Some(db) = persist_db() else {
+        return;
+    };
+    match db.mark_subagent_orphans(current_session) {
+        Ok(n) if n > 0 => info!(orphaned = n, "启动期标记残留子 Agent 作业为 orphaned"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "孤儿作业标记失败(忽略)"),
+    }
+    match db.trim_subagent_runs(cfg.run_keep) {
+        Ok(n) if n > 0 => info!(trimmed = n, "子 Agent 运行记录自动清理"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "运行记录 trim 失败(忽略)"),
+    }
+}
+
+/// 查询运行记录(`action="history"` 与 TUI `/agents history` 共用)。
+///
+/// 返回 `None` 表示持久化不可用(未开启 / 数据库打不开)。
+pub fn query_runs(
+    session_id: Option<&str>,
+    agent_type: Option<&str>,
+    limit: usize,
+) -> Option<Vec<SubAgentRunRow>> {
+    if !sa::config().persist {
+        return None;
+    }
+    let db = persist_db()?;
+    let q = RunQuery {
+        session_id: session_id.map(str::to_string),
+        agent_type: agent_type.map(str::to_string),
+        limit,
+    };
+    match db.list_subagent_runs(&q) {
+        Ok(rows) => Some(rows),
+        Err(e) => {
+            warn!(error = %e, "子 Agent 运行记录查询失败");
+            None
+        }
+    }
+}
+
+/// 取单条运行记录(供 `resume` 解析前序)。
+pub fn get_run(run_id: &str) -> Option<SubAgentRunRow> {
+    if !sa::config().persist {
+        return None;
+    }
+    let db = persist_db()?;
+    match db.get_subagent_run(run_id) {
+        Ok(row) => row,
+        Err(e) => {
+            warn!(error = %e, run_id = %run_id, "子 Agent 运行记录读取失败");
+            None
+        }
+    }
+}
+
+/// 统计孤儿作业数(面板展示)。
+pub fn count_orphans(session_id: Option<&str>) -> usize {
+    if !sa::config().persist {
+        return 0;
+    }
+    persist_db()
+        .and_then(|db| db.count_subagent_orphans(session_id).ok())
+        .unwrap_or(0)
+}
+
 /// 当前配置(只读展示用)。
 pub fn config() -> &'static SelfAwarenessConfig {
     crate::agent::self_awareness::config()
@@ -365,9 +543,17 @@ impl Governor {
     }
 
     fn next_run_id(&self) -> String {
+        // 会话内序号(事件/展示顺序) + **进程级全局序号**(run_id 唯一性)。
+        //
+        // 2026-09-22 第 115 轮修复:D114 只用「会话内 seq + pid」,而 `/new` `/clear`
+        // 会产生新 Session(= 新 Governor,seq 从 1 重来)—— 同一进程内两个会话会
+        // 生成**相同的 run_id**。内存作业表各存各的看不出来,但落库后主键冲突会
+        // 让后写覆盖先写(实测:并行/跨会话测试互相覆盖)。改为全局自增后,
+        // 「同进程唯一 + 跨进程靠 pid 区分」成立。
         let n = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let g = RUN_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         let pid = std::process::id();
-        format!("sa-{pid:x}{n:04x}")
+        format!("sa-{pid:x}{g:04x}-{n:x}")
     }
 
     fn record_usage(&self, u: &Usage) {
@@ -503,6 +689,16 @@ impl SubAgentRuntime {
         &self.session_id
     }
 
+    /// 本次运行的工作目录(自定义 Agent 定义文件的发现基准;Bash/Read/Write 同基准)。
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
+    }
+
+    /// 本运行可见的自定义子 Agent 类型定义(按 `work_dir` 发现,定义即生效)。
+    pub fn defs(&self) -> Vec<ca::AgentDef> {
+        ca::discover_in(&self.work_dir).defs
+    }
+
     pub fn can_spawn(&self) -> bool {
         self.cfg.can_spawn_at(self.depth)
     }
@@ -513,7 +709,12 @@ impl SubAgentRuntime {
 
     /// `action="list"` 的运行时快照:自感知的动态部分。
     pub fn snapshot_json(&self) -> Value {
-        let roster: Vec<Value> = sa::roster(self.policy)
+        // 第 115 轮:名册 = 内置 + 用户/项目 `.laew/agents/*.md` 自定义类型;
+        // 被策略隐藏的自定义类型单列 skipped(可解释性:用户知道自己的定义为何不可用)
+        let disco = ca::discover_in(&self.work_dir);
+        let view = sa::roster_view(&disco.defs, self.policy);
+        let roster: Vec<Value> = view
+            .entries
             .into_iter()
             .map(|r| {
                 json!({
@@ -521,9 +722,23 @@ impl SubAgentRuntime {
                     "label": r.label,
                     "desc": r.desc,
                     "tools": r.tools,
+                    "custom": r.custom,
+                    "source": r.source,
                 })
             })
             .collect();
+        let mut skipped: Vec<Value> = view
+            .skipped
+            .into_iter()
+            .map(|s| json!({"id": s.id, "reason": s.reason, "source": s.source}))
+            .collect();
+        for ig in &disco.ignored {
+            skipped.push(json!({
+                "id": ig.id,
+                "reason": ig.reason,
+                "source": ig.source,
+            }));
+        }
         let running: Vec<Value> = self
             .governor
             .running_views()
@@ -569,8 +784,10 @@ impl SubAgentRuntime {
                 "in_flight": self.governor.in_flight(),
                 "max_iterations": self.cfg.max_iterations,
                 "timeout_secs": self.cfg.timeout_secs,
+                "persist": self.cfg.persist,
             },
             "roster": roster,
+            "custom_skipped": skipped,
             "running": running,
             "recent": recent,
             "session_id": self.session_id,
@@ -580,6 +797,15 @@ impl SubAgentRuntime {
 
     /// 前台启动单个子 Agent(治理校验 → 组装 → 运行 → 回收)。
     pub async fn launch(&self, req: SubAgentRequest) -> Result<SubAgentReport, SpawnError> {
+        self.launch_with_origin(req, "launch").await
+    }
+
+    /// 前台启动(可指定 `origin`:第 115 轮 `resume` 用它记录血缘来源)。
+    pub async fn launch_with_origin(
+        &self,
+        req: SubAgentRequest,
+        origin: &str,
+    ) -> Result<SubAgentReport, SpawnError> {
         self.check_can_spawn()?;
         if !self.governor.try_charge(1) {
             return Err(SpawnError::BudgetExhausted {
@@ -595,7 +821,7 @@ impl SubAgentRuntime {
             }
         };
         let run_id = self.governor.next_run_id();
-        let report = self.run_child(&req, &run_id).await;
+        let report = self.run_child(&req, &run_id, origin).await;
         drop(permit);
         Ok(report)
     }
@@ -620,7 +846,7 @@ impl SubAgentRuntime {
         let handle = tokio::spawn(async move {
             let report = match rt.acquire_permit().await {
                 Ok(permit) => {
-                    let r = rt.run_child(&req2, &run_id2).await;
+                    let r = rt.run_child(&req2, &run_id2, "background").await;
                     drop(permit);
                     r
                 }
@@ -640,6 +866,8 @@ impl SubAgentRuntime {
                     tool_calls: 0,
                     wallclock_ms: 0,
                     usage: UsageSnapshot::default(),
+                    origin: "background".into(),
+                    resumed_from: req2.prior.as_ref().map(|p| p.run_id.clone()),
                 },
             };
             *state2.lock().expect("job state poisoned") = JobState::Done(Box::new(report));
@@ -714,11 +942,13 @@ impl SubAgentRuntime {
                             tool_calls: 0,
                             wallclock_ms: 0,
                             usage: UsageSnapshot::default(),
+                            origin: "batch".into(),
+                            resumed_from: req.prior.as_ref().map(|p| p.run_id.clone()),
                         };
                     }
                 };
                 let run_id = rt.governor.next_run_id();
-                let r = rt.run_child(&req, &run_id).await;
+                let r = rt.run_child(&req, &run_id, "batch").await;
                 drop(permit);
                 r
             }
@@ -822,11 +1052,8 @@ impl SubAgentRuntime {
         let available: Vec<String> = base.names().iter().map(|s| s.to_string()).collect();
         let allowed: Vec<&str> = self.policy.allowed_tools().to_vec();
         let requested: Vec<String> = if req.tools.is_empty() {
-            req.agent_type
-                .default_tools()
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
+            // 第 115 轮:自定义类型用「声明工具面」(显式 tools 或继承 extends 默认)
+            req.agent_type.declared_tools()
         } else {
             req.tools
                 .iter()
@@ -888,7 +1115,15 @@ impl SubAgentRuntime {
         }
     }
 
-    async fn run_child(&self, req: &SubAgentRequest, run_id: &str) -> SubAgentReport {
+    /// 运行一个子 Agent(全仓**唯一**运行入口:前台 / 后台 / batch / resume 都经此)。
+    ///
+    /// `origin` 用于运行记录落库与事件(`launch` / `background` / `batch` / `resume`)。
+    async fn run_child(
+        &self,
+        req: &SubAgentRequest,
+        run_id: &str,
+        origin: &str,
+    ) -> SubAgentReport {
         let started = Instant::now();
         let assembled = self.assemble_child(req, run_id);
         let tools = assembled.tools;
@@ -896,9 +1131,24 @@ impl SubAgentRuntime {
         let child_policy = assembled.policy;
         let profile = assembled.profile;
         let name = profile.name.clone();
+        self.persist_start(&name, req, run_id, origin);
 
         let mut user_prompt = String::new();
         user_prompt.push_str(&format!("【任务】\n{}\n", req.task.trim()));
+        // 第 115 轮:resume 的种子上下文(前序任务 + 前序结论),让子 Agent 站在
+        // 既有结论上继续,而不是从零开始(子 Agent 本身仍看不到父对话)
+        if let Some(p) = req.prior.as_ref() {
+            user_prompt.push_str(&format!(
+                "\n【前序会话(继承自 {rid})】\n类型:{t}  状态:{s}  完成于:{at}\n\
+                 【前序任务】\n{task}\n【前序结论】\n{report}\n",
+                rid = p.run_id,
+                t = p.agent_type,
+                s = p.status,
+                at = p.created_at,
+                task = clip_chars(p.task.trim(), PRIOR_TASK_CHARS),
+                report = clip_chars(p.report.trim(), PRIOR_REPORT_CHARS),
+            ));
+        }
         if !req.expected_output.trim().is_empty() {
             user_prompt.push_str(&format!(
                 "\n【期望产出】\n{}\n",
@@ -1036,6 +1286,7 @@ impl SubAgentRuntime {
             wallclock_ms,
             tool_calls: trace.tool_calls,
             usage: UsageSnapshot::from_usage(&usage),
+            origin: origin.to_string(),
         });
         info!(
             run_id = %run_id,
@@ -1051,7 +1302,7 @@ impl SubAgentRuntime {
             warn!(run_id = %run_id, name = %name, status = %status, error = ?error, "动态子 Agent 未成功");
         }
 
-        SubAgentReport {
+        let report = SubAgentReport {
             run_id: run_id.to_string(),
             name,
             agent_type: req.agent_type.id().to_string(),
@@ -1064,6 +1315,63 @@ impl SubAgentRuntime {
             tool_calls: trace.tool_calls,
             wallclock_ms,
             usage: UsageSnapshot::from_usage(&usage),
+            origin: origin.to_string(),
+            resumed_from: req.prior.as_ref().map(|p| p.run_id.clone()),
+        };
+        self.persist_finish(&report);
+        report
+    }
+
+    /// 落库「开始」行(status=running);失败只 warn,绝不影响任务。
+    fn persist_start(&self, name: &str, req: &SubAgentRequest, run_id: &str, origin: &str) {
+        if !self.cfg.persist {
+            return;
+        }
+        let Some(db) = persist_db() else {
+            return;
+        };
+        let entry = SubAgentRunEntry {
+            run_id: run_id.to_string(),
+            session_id: self.session_id.clone(),
+            parent: self.parent_name.clone(),
+            name: name.to_string(),
+            agent_type: req.agent_type.id().to_string(),
+            depth: self.depth + 1,
+            status: crate::config::subagent_run::STATUS_RUNNING.to_string(),
+            task: clip_chars(req.task.trim(), PRIOR_TASK_CHARS * 4),
+            origin: origin.to_string(),
+            resumed_from: req.prior.as_ref().map(|p| p.run_id.clone()),
+            ..SubAgentRunEntry::default()
+        };
+        if let Err(e) = db.insert_subagent_run(&entry) {
+            warn!(error = %e, run_id = %run_id, "子 Agent 运行记录写入失败(忽略,不影响任务)");
+        }
+    }
+
+    /// 落库终态(状态 / 产物 / 用量 / 工具面);失败只 warn。
+    fn persist_finish(&self, report: &SubAgentReport) {
+        if !self.cfg.persist || report.run_id.is_empty() {
+            return;
+        }
+        let Some(db) = persist_db() else {
+            return;
+        };
+        let entry = SubAgentRunEntry {
+            run_id: report.run_id.clone(),
+            status: report.status.clone(),
+            report: report.text.clone(),
+            error: report.error.clone(),
+            tools: report.tools.clone(),
+            dropped_tools: report.dropped_tools.clone(),
+            iterations: report.iterations,
+            tool_calls: report.tool_calls,
+            wallclock_ms: report.wallclock_ms,
+            input_tokens: report.usage.input_tokens,
+            output_tokens: report.usage.output_tokens,
+            ..SubAgentRunEntry::default()
+        };
+        if let Err(e) = db.finish_subagent_run(&entry) {
+            warn!(error = %e, run_id = %report.run_id, "子 Agent 运行记录收尾失败(忽略)");
         }
     }
 }
@@ -1126,6 +1434,8 @@ pub fn report_json(r: &SubAgentReport) -> Value {
         "name": r.name,
         "agent_type": r.agent_type,
         "status": r.status,
+        "origin": r.origin,
+        "resumed_from": r.resumed_from,
         "text": r.text,
         "error": r.error,
         "tools": r.tools,
@@ -1146,6 +1456,25 @@ pub(crate) fn test_runtime(
     depth: usize,
     cfg: SelfAwarenessConfig,
 ) -> Arc<SubAgentRuntime> {
+    test_runtime_in(
+        llm,
+        session,
+        policy,
+        depth,
+        cfg,
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    )
+}
+
+/// 同 [`test_runtime`],但显式指定工作目录(自定义 Agent 定义文件的发现基准)。
+pub(crate) fn test_runtime_in(
+    llm: Arc<dyn LlmClient>,
+    session: &str,
+    policy: SpawnPolicy,
+    depth: usize,
+    cfg: SelfAwarenessConfig,
+    work_dir: PathBuf,
+) -> Arc<SubAgentRuntime> {
     Arc::new(SubAgentRuntime {
         llm,
         parent_name: "LsmAgentEmergentWork-SubAgent-Work".into(),
@@ -1154,7 +1483,7 @@ pub(crate) fn test_runtime(
         governor: governor_for(session, &cfg),
         cfg,
         depth,
-        work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        work_dir,
         cancel: None,
         session_id: session.to_string(),
     })
@@ -1163,7 +1492,9 @@ pub(crate) fn test_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::self_awareness::SubAgentType;
     use crate::agent::self_awareness::SelfAwarenessConfig;
+    use crate::agent::tools::Tool;
     use crate::config::Protocol;
     use crate::llm::{Completion, RequestMeta, ToolDef};
     use std::sync::atomic::AtomicUsize;
@@ -1254,13 +1585,316 @@ mod tests {
     fn req(task: &str, t: SubAgentType) -> SubAgentRequest {
         SubAgentRequest {
             task: task.into(),
-            agent_type: t,
+            agent_type: ResolvedAgentType::Builtin(t),
             name: None,
             system_prompt: None,
             tools: vec![],
             expected_output: String::new(),
             max_iterations: None,
+            prior: None,
         }
+    }
+
+    // ========== 第 115 轮(2026-09-22):自定义类型 / 持久化 / 续跑 ==========
+
+    /// 写一个自定义 Agent 定义文件并返回工作目录。
+    fn work_dir_with_agent(name: &str, content: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(ca::DIR).join(ca::SUBDIR);
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join(name), content).unwrap();
+        dir
+    }
+
+    /// 建一个临时库并注入为落库目标;返回的 TempDir 需在测试结束前持有。
+    ///
+    /// 落库目标通过**进程级覆盖**注入,并发测试间会互相看到 —— 因此所有触库断言
+    /// 都必须只针对「自己的 run_id / session_id」,且用 [`db_test_lock`] 串行化
+    /// 「注入 → 断言 → 清空」全过程。
+    fn inject_temp_db() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::for_test(dir.path());
+        set_test_db(Some(Arc::new(Db::open(&paths).unwrap())));
+        dir
+    }
+
+    /// 触库测试的串行化闸门(避免 A 的临时库被 B 覆盖时读到空结果)。
+    async fn db_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    #[tokio::test]
+    async fn custom_agent_type_uses_definition_body_and_tools() {
+        let dir = work_dir_with_agent(
+            "fe-reviewer.md",
+            "---\nlabel: 前端审查\ndescription: 前端专项\nextends: code-reviewer\n\
+             tools: Read, Glob, Grep, Bash\nreadonly: true\n---\n只给问题清单,不写文件。\n",
+        );
+        let llm = ScriptLlm::new();
+        let r = test_runtime_in(
+            llm.clone(),
+            &unique_session("custom"),
+            SpawnPolicy::FullChildren,
+            0,
+            SelfAwarenessConfig::default(),
+            dir.path().to_path_buf(),
+        );
+        let defs = r.defs();
+        assert_eq!(defs.len(), 1, "应发现自定义定义");
+        let t = ca::resolve_in("fe-reviewer", &defs).expect("自定义类型可解析");
+
+        let mut request = req("审查 src/tui 的最近改动,给 P0-P2 清单", SubAgentType::Explore);
+        request.agent_type = t;
+        let report = scope(r.clone(), r.launch(request)).await.unwrap();
+        assert_eq!(report.status, "ok");
+        assert_eq!(report.agent_type, "fe-reviewer", "报告应回传自定义类型 id");
+        assert_eq!(report.origin, "launch");
+        assert!(report.resumed_from.is_none());
+
+        // readonly 在**定义解析期**就收窄工具面(Bash 不进声明),运行期自然仍无 Bash
+        for t in ["Read", "Glob", "Grep"] {
+            assert!(report.tools.contains(&t.to_string()), "应含 {t}: {:?}", report.tools);
+        }
+        assert!(!report.tools.contains(&"Bash".to_string()), "readonly 不得带入 Bash");
+        // 子 Agent 提示词含定义文件正文与自定义身份
+        let sys = llm.systems.lock().unwrap().join("\n---\n");
+        assert!(sys.contains("类型:前端审查(fe-reviewer,自定义定义文件)"));
+        assert!(sys.contains("只给问题清单,不写文件。"));
+        assert!(sys.contains("只读**委派"));
+    }
+
+    #[tokio::test]
+    async fn custom_type_tools_are_narrowed_by_parent_policy_and_reported() {
+        let dir = work_dir_with_agent(
+            "patcher.md",
+            "---\nlabel: 打补丁\ntools: Read, Write\n---\n直接改文件。\n",
+        );
+        // 只读父策略:声明的 Write 必须被剔除并如实上报(即便名册本就不展示它)
+        let r = test_runtime_in(
+            ScriptLlm::new(),
+            &unique_session("narrow"),
+            SpawnPolicy::ReadOnlyChildren,
+            0,
+            SelfAwarenessConfig::default(),
+            dir.path().to_path_buf(),
+        );
+        let t = ca::resolve_in("patcher", &r.defs()).expect("自定义类型可解析");
+        let mut request = req("改一处小 bug", SubAgentType::Explore);
+        request.agent_type = t;
+        let report = scope(r.clone(), r.launch(request)).await.unwrap();
+        assert_eq!(report.status, "ok");
+        assert!(report.tools.contains(&"Read".to_string()));
+        assert!(!report.tools.contains(&"Write".to_string()));
+        assert!(
+            report
+                .dropped_tools
+                .iter()
+                .any(|d| d.contains("Write") && d.contains("超出父 Agent 能力上限")),
+            "越权工具须解释性上报: {:?}",
+            report.dropped_tools
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_writes_running_row_then_final_row() {
+        let _lock = db_test_lock().await;
+        let _guard = inject_temp_db();
+        let llm = ScriptLlm::new();
+        let (r, sid) = rt(llm, "persist", SpawnPolicy::FullChildren, 0, SelfAwarenessConfig::default());
+        let report = scope(r.clone(), r.launch(req("写一份结论", SubAgentType::Plan)))
+            .await
+            .unwrap();
+        assert_eq!(report.status, "ok");
+
+        let row = get_run(&report.run_id).expect("应已落库");
+        assert_eq!(row.session_id, sid);
+        assert_eq!(row.status, "ok");
+        assert_eq!(row.agent_type, "plan");
+        assert_eq!(row.origin, "launch");
+        assert!(row.report.contains("子 Agent"), "报告文本应落库");
+        assert!(row.input_tokens > 0, "用量应落库");
+        assert!(!row.created_at.is_empty());
+        // 终态行不得残留 running
+        let rows = query_runs(Some(&sid), None, 10).expect("查询应可用");
+        assert_eq!(rows.len(), 1);
+        assert!(rows.iter().all(|r| r.status != "running"));
+        clear_test_db();
+    }
+
+    #[tokio::test]
+    async fn persist_off_writes_nothing() {
+        let _lock = db_test_lock().await;
+        let _guard = inject_temp_db();
+        let mut cfg = SelfAwarenessConfig::default();
+        cfg.persist = false;
+        let (r, sid) = rt(ScriptLlm::new(), "no-persist", SpawnPolicy::FullChildren, 0, cfg);
+        let report = scope(r.clone(), r.launch(req("不落库", SubAgentType::Explore)))
+            .await
+            .unwrap();
+        assert_eq!(report.status, "ok");
+        assert!(get_run(&report.run_id).is_none(), "关闭持久化后不得落库");
+        // 注:`query_runs` / `get_run` 的开关取自**进程级** `sa::config()`(与
+        // `LAEW_SUBAGENT_PERSIST` 同级),本测试用运行时级 cfg 关闭,故只断言「没写」。
+        let rows = query_runs(Some(&sid), None, 10).expect("全局开关未关,查询应可用");
+        assert!(
+            rows.iter().all(|r| r.run_id != report.run_id),
+            "关闭运行时持久化后该 run 不得出现在库中"
+        );
+        clear_test_db();
+    }
+
+    #[tokio::test]
+    async fn resume_seeds_prior_context_and_records_lineage() {
+        let _lock = db_test_lock().await;
+        let _guard = inject_temp_db();
+        let llm = ScriptLlm::new();
+        let (r, sid) = rt(llm.clone(), "resume", SpawnPolicy::FullChildren, 0, SelfAwarenessConfig::default());
+        let first = scope(r.clone(), r.launch(req("先给出初步结论", SubAgentType::Explore)))
+            .await
+            .unwrap();
+        assert_eq!(first.status, "ok");
+
+        let prior_row = get_run(&first.run_id).expect("前序行应存在");
+        let mut again = req("把结论展开成可执行步骤", SubAgentType::Explore);
+        again.prior = Some(PriorRun {
+            run_id: prior_row.run_id.clone(),
+            agent_type: prior_row.agent_type.clone(),
+            status: prior_row.status.clone(),
+            created_at: prior_row.created_at.clone(),
+            task: prior_row.task.clone(),
+            report: prior_row.report.clone(),
+        });
+        let second = scope(r.clone(), r.launch_with_origin(again, "resume"))
+            .await
+            .unwrap();
+        assert_eq!(second.status, "ok");
+        assert_eq!(second.origin, "resume");
+        assert_eq!(second.resumed_from.as_deref(), Some(first.run_id.as_str()));
+
+        // 种子上下文必须真的进了子 Agent 的 user prompt
+        let users = llm.users.lock().unwrap().clone();
+        let resumed_prompt = users.last().expect("应有第二次调用").clone();
+        assert!(resumed_prompt.contains("【前序会话(继承自"));
+        assert!(resumed_prompt.contains("【前序任务】"));
+        assert!(resumed_prompt.contains("【前序结论】"));
+        assert!(resumed_prompt.contains("把结论展开成可执行步骤"));
+
+        // 落库:两条,第二条带血缘
+        let rows = query_runs(Some(&sid), None, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        let resumed_row = rows.iter().find(|r| r.run_id == second.run_id).unwrap();
+        assert_eq!(resumed_row.origin, "resume");
+        assert_eq!(resumed_row.resumed_from.as_deref(), Some(first.run_id.as_str()));
+        clear_test_db();
+    }
+
+    /// 工具层闭环:`launch` 落库 -> `history` 查到 -> `resume` 读前序并记血缘。
+    #[tokio::test]
+    async fn tool_history_and_resume_close_the_loop() {
+        let _lock = db_test_lock().await;
+        let _guard = inject_temp_db();
+        let llm = ScriptLlm::new();
+        let r = test_runtime_in(
+            llm.clone(),
+            &unique_session("tool-loop"),
+            SpawnPolicy::FullChildren,
+            0,
+            SelfAwarenessConfig::default(),
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
+        let tool = SubAgentTool;
+        let sid = r.session_id().to_string();
+        let out = scope(r.clone(), async {
+            let first = serde_json::from_str::<Value>(
+                &tool
+                    .execute(json!({
+                        "action": "launch",
+                        "task": "先给出初步结论",
+                        "agent_type": "explore",
+                        "name": "侦察-1"
+                    }))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(first["code"], 0);
+            let run_id = first["data"]["run_id"].as_str().unwrap().to_string();
+
+            let hist = serde_json::from_str::<Value>(
+                &tool.execute(json!({"action": "history"})).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(hist["code"], 0);
+            assert_eq!(hist["data"]["persist"], true);
+            let mine = hist["data"]["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["run_id"] == json!(run_id))
+                .expect("刚跑完的作业应出现在 history 里")
+                .clone();
+            assert_eq!(mine["status"], "ok");
+            assert_eq!(mine["origin"], "launch");
+
+            let resumed = serde_json::from_str::<Value>(
+                &tool
+                    .execute(json!({
+                        "action": "resume",
+                        "run_id": run_id,
+                        "task": "把结论展开成可执行步骤"
+                    }))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            (resumed, run_id)
+        })
+        .await;
+        let (resumed, prior_id) = out;
+        assert_eq!(resumed["code"], 0, "resume 应成功: {resumed}");
+        assert_eq!(resumed["data"]["origin"], "resume");
+        assert_eq!(resumed["data"]["resumed_from"], json!(prior_id));
+
+        // 子 Agent 的 user prompt 里必须真的带了前序上下文
+        let users = llm.users.lock().unwrap().clone();
+        let last = users.last().expect("应有续跑调用").clone();
+        assert!(last.contains("【前序会话(继承自"));
+        assert!(last.contains("【前序结论】"));
+        assert!(last.contains("把结论展开成可执行步骤"));
+
+        // 血缘落库
+        let rows = query_runs(Some(&sid), None, 10).unwrap();
+        let resumed_row = rows
+            .iter()
+            .find(|r| r.origin == "resume")
+            .expect("续跑行应落库");
+        assert_eq!(resumed_row.resumed_from.as_deref(), Some(prior_id.as_str()));
+        clear_test_db();
+    }
+
+    #[tokio::test]
+    async fn snapshot_exposes_custom_roster_and_skipped() {
+        let dir = work_dir_with_agent(
+            "patcher.md",
+            "---\nlabel: 打补丁\ndescription: 需要写盘\ntools: Read, Write\n---\n直接改文件。\n",
+        );
+        // Yolo 策略(只读子 Agent)下,可写的自定义类型应被隐藏并给出原因
+        let r = test_runtime_in(
+            ScriptLlm::new(),
+            &unique_session("snap"),
+            SpawnPolicy::ReadOnlyChildren,
+            0,
+            SelfAwarenessConfig::default(),
+            dir.path().to_path_buf(),
+        );
+        let snap = r.snapshot_json();
+        let skipped = snap["custom_skipped"].as_array().unwrap();
+        assert!(
+            skipped.iter().any(|s| s["id"] == "patcher"),
+            "只读父下可写自定义类型应被隐藏: {snap}"
+        );
+        assert!(snap["limits"]["persist"].as_bool().unwrap());
     }
 
     #[tokio::test]

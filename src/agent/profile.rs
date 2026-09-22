@@ -290,7 +290,16 @@ fn build_self_aware_prompt(
         .names()
         .contains(&crate::agent::tools::subagent::SUBAGENT_TOOL);
     let names = tools.names();
-    let section = sa::prompt_section(name, &names, spawn_policy, sa::config(), tool_registered);
+    // 第 115 轮:名册含用户/项目 `.laew/agents/*.md` 自定义类型(定义即生效,不缓存)
+    let defs = crate::agent::custom_agents::discover_process().defs;
+    let section = sa::prompt_section(
+        name,
+        &names,
+        spawn_policy,
+        sa::config(),
+        tool_registered,
+        &defs,
+    );
     if section.is_empty() {
         base
     } else {

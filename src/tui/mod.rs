@@ -135,6 +135,12 @@ impl TuiSession {
         let db = Arc::new(Mutex::new(db));
         let plans_dir = paths.root_dir.join("plans");
         let session = Session::new();
+        // 动态子 Agent 运行记录(2026-09-22 第 115 轮):启动期把上次进程残留的
+        // `running` 作业标记为 orphaned + 自动 trim(fail-open,不阻塞 TUI 启动)。
+        crate::agent::dynamic_subagent::maintain_run_store(
+            session.id(),
+            crate::agent::self_awareness::config(),
+        );
         let collector = debug.then(|| Arc::new(DebugCollector::new(session.id())));
         // D13 离线模式:创建连接状态跟踪器(TUI 侧持有,基于任务结果更新)。
         let connectivity = std::sync::Arc::new(ConnectivityTracker::new());

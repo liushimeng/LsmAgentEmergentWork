@@ -190,7 +190,7 @@ impl TuiSession {
             }
             // 自感知动态子 Agent(2026-09-22 第 114 轮):名册 / 上限 / 最近作业。
             "agents" | "subagents" => {
-                self.run_agents();
+                self.run_agents(rest_args);
             }
             // D4 工作区感知(2026-09-13):查看/刷新工作区快照。
             "workspace" | "ws" => {
@@ -421,19 +421,27 @@ impl TuiSession {
         println!("{}", self.todo_state.render_table());
     }
 
-    /// `/agents [roster]`(自感知动态子 Agent,2026-09-22 第 114 轮)。
+    /// `/agents [history [N|all]]`(自感知动态子 Agent,第 114 / 115 轮)。
     ///
     /// 展示三层自感知里**用户可见**的两层:
-    /// 1. 静态名册 —— 6 种子 Agent 类型与默认工具面;
-    /// 2. 运行时作业 —— 本会话已启动数 / 上限 / 运行中 / 并发上限 + 最近作业表。
+    /// 1. 静态名册 —— 6 种内置子 Agent 类型 + `.laew/agents/*.md` 自定义类型;
+    /// 2. 运行时作业 —— 本会话已启动数 / 上限 / 运行中 / 并发上限 + 最近作业表;
+    /// 3. 第 115 轮新增 `history` 子命令 —— SQLite 里跨任务/跨会话的运行记录(工作板视图)。
     ///
     /// 数据源:`dynamic_subagent` 的会话级 Governor(只读访问器,不产生副作用)。
-    fn run_agents(&self) {
+    fn run_agents(&self, args: &str) {
         use crate::agent::dynamic_subagent as dynsub;
         use crate::agent::self_awareness as sa;
 
+        let mut parts = args.split_whitespace();
+        if matches!(parts.next(), Some("history" | "runs" | "log")) {
+            let rest: Vec<&str> = parts.collect();
+            self.run_agents_history(&rest);
+            return;
+        }
+
         let cfg = dynsub::config();
-        println!("  自感知动态子 Agent(/agents,第 114 轮)");
+        println!("  自感知动态子 Agent(/agents,第 114 轮 + 第 115 轮自定义类型/运行记录)");
         println!(
             "  开关: LAEW_SELF_SPAWN={}  深度上限: {} 层  并发上限: {}  单会话预算: {}  单子 Agent 迭代上限: {}  超时: {}s",
             if cfg.enabled { "on" } else { "off" },
@@ -455,7 +463,7 @@ impl TuiSession {
         }
 
         println!();
-        println!("  可启动类型名册:");
+        println!("  内置类型名册:");
         for t in sa::SubAgentType::ALL {
             println!(
                 "    {:<16} {:<10} {}",
@@ -466,6 +474,70 @@ impl TuiSession {
             println!("      └ 默认工具: {}", t.default_tools().join(", "));
         }
 
+        // 第 115 轮:自定义类型(来自 `.laew/agents/*.md` / `~/.laew/agents/*.md`)
+        let disco = crate::agent::custom_agents::discover_process();
+        println!();
+        if disco.defs.is_empty() {
+            println!("  自定义类型: 无(在 {{工作目录}}/.laew/agents/ 或 ~/.laew/agents/ 放 `名字.md` 即可新增)");
+        } else {
+            println!("  自定义类型({} 个):", disco.defs.len());
+            for d in &disco.defs {
+                println!(
+                    "    {:<16} {:<10} {}",
+                    d.id,
+                    d.label,
+                    if d.read_only {
+                        format!("{} [只读]", d.description)
+                    } else {
+                        d.description.clone()
+                    }
+                );
+                println!(
+                    "      └ 工具: {};继承: {}{}",
+                    if d.declared_tools().is_empty() {
+                        "(空)".to_string()
+                    } else {
+                        d.declared_tools().join(", ")
+                    },
+                    d.extends.id(),
+                    if d.body.trim().is_empty() {
+                        ""
+                    } else {
+                        ";已定义专属指令"
+                    }
+                );
+                println!("      └ 来源: {}", d.source.display());
+            }
+        }
+        if !disco.ignored.is_empty() {
+            println!("  已忽略的定义({} 个):", disco.ignored.len());
+            for ig in &disco.ignored {
+                println!("    {:<16} {} ← {}", ig.id, ig.reason, ig.source);
+            }
+        }
+        // 运行记录持久化状态
+        println!();
+        println!(
+            "  运行记录: {} (LAEW_SUBAGENT_PERSIST={};保留最新 {} 行)",
+            if cfg.persist { "已开启" } else { "已关闭" },
+            if cfg.persist { "on" } else { "off" },
+            cfg.run_keep
+        );
+        if cfg.persist {
+            let orphans = dynsub::count_orphans(Some(&self.session.id));
+            match dynsub::query_runs(Some(&self.session.id), None, 1) {
+                Some(_) => println!(
+                    "  本会话已落库作业可查: /agents history [N|all]{}",
+                    if orphans > 0 {
+                        format!(";注意有 {orphans} 个孤儿作业(上次进程残留)")
+                    } else {
+                        String::new()
+                    }
+                ),
+                None => println!("  运行记录数据库暂不可用(history 将为空)"),
+            }
+        }
+
         let events = dynsub::recent_events(&self.session.id, 10);
         println!();
         if events.is_empty() {
@@ -474,16 +546,16 @@ impl TuiSession {
         }
         println!("  最近动态子 Agent({} 条):", events.len());
         println!(
-            "    {:<14} {:<14} {:<10} {:<8} {:>6} {:>8} {:>12}",
-            "run_id", "type", "status", "depth", "tools", "ms", "tokens(in/out)"
+            "    {:<16} {:<14} {:<10} {:<8} {:>6} {:>8} {:>12}",
+            "run_id", "type", "status", "origin", "tools", "ms", "tokens(in/out)"
         );
         for e in events {
             println!(
-                "    {:<14} {:<14} {:<10} {:<8} {:>6} {:>8} {:>12}",
+                "    {:<16} {:<14} {:<10} {:<8} {:>6} {:>8} {:>12}",
                 e.run_id,
                 e.agent_type,
                 e.status,
-                e.depth,
+                if e.origin.is_empty() { "-" } else { e.origin.as_str() },
                 e.tool_calls,
                 e.wallclock_ms,
                 format!("{}/{}", e.usage.input_tokens, e.usage.output_tokens),
@@ -492,6 +564,60 @@ impl TuiSession {
                 println!("      └ {} ← {}", e.task_digest, e.parent);
             }
         }
+    }
+
+    /// `/agents history [N|all]`(第 115 轮):SQLite 运行记录工作板视图。
+    fn run_agents_history(&self, args: &[&str]) {
+        use crate::agent::dynamic_subagent as dynsub;
+
+        let cfg = dynsub::config();
+        if !cfg.persist {
+            println!("  运行记录持久化已关闭(LAEW_SUBAGENT_PERSIST=off),无记录可查。");
+            return;
+        }
+        let all = args.iter().any(|a| matches!(*a, "all" | "--all"));
+        let limit = args
+            .iter()
+            .find_map(|a| a.parse::<usize>().ok())
+            .unwrap_or(10)
+            .clamp(1, 50);
+        let scope = if all { None } else { Some(self.session.id.as_str()) };
+        let Some(rows) = dynsub::query_runs(scope, None, limit) else {
+            println!("  运行记录数据库暂不可用(检查根目录 LsmAgentEmergentWork.db)。");
+            return;
+        };
+        println!(
+            "  子 Agent 运行记录(/agents history{})",
+            if all { " all" } else { "" }
+        );
+        if rows.is_empty() {
+            println!("  无记录(提示词出现「启动 SubAgent / 并行 / 分工」时会产生作业)");
+            return;
+        }
+        println!(
+            "    {:<16} {:<14} {:<10} {:<10} {:>7} {:>10} {:<19} {}",
+            "run_id", "type", "status", "origin", "ms", "tokens", "created_at", "task"
+        );
+        for r in &rows {
+            println!(
+                "    {:<16} {:<14} {:<10} {:<10} {:>7} {:>10} {:<19} {}",
+                r.run_id,
+                crate::tui::format::truncate_chars(&r.agent_type, 14),
+                r.status,
+                r.origin,
+                r.wallclock_ms,
+                format!("{}/{}", r.input_tokens, r.output_tokens),
+                r.created_at,
+                crate::tui::format::truncate_chars(r.task.trim(), 40),
+            );
+        }
+        let orphans = dynsub::count_orphans(scope);
+        if orphans > 0 {
+            println!("  孤儿作业: {orphans} 个(上次进程被终止时未完成;记录仍可 resume)");
+        }
+        println!(
+            "  提示:在提示词里说「续跑 <run_id>,把结论变成补丁」即可让 Agent 调 SubAgent(action=\"resume\")。"
+        );
     }
 
     /// `/audit [subcmd]`(D9-8 决策审计可视化,2026-09-22 第 113 轮)。

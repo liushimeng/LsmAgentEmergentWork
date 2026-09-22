@@ -27,6 +27,10 @@ pub const ENV_MAX_TOTAL: &str = "LAEW_SUBAGENT_MAX_TOTAL";
 pub const ENV_MAX_ITERATIONS: &str = "LAEW_SUBAGENT_MAX_ITERATIONS";
 /// 单子 Agent 超时环境变量(秒)。
 pub const ENV_TIMEOUT_SECS: &str = "LAEW_SUBAGENT_TIMEOUT_SECS";
+/// 运行记录持久化开关环境变量(第 115 轮)。
+pub const ENV_PERSIST: &str = "LAEW_SUBAGENT_PERSIST";
+/// 运行记录保留行数环境变量(第 115 轮;`0` = 不清理)。
+pub const ENV_RUN_KEEP: &str = "LAEW_SUBAGENT_RUN_KEEP";
 
 /// 单个子 Agent 报告文本的截断上限(字符),防止撑爆父上下文。
 pub const CHILD_REPORT_CHARS: usize = 8000;
@@ -203,40 +207,98 @@ impl SubAgentType {
         format!(
             "你是 laew 的动态子 Agent「{name}」,类型:{label}({id})。\n\n\
              ## 你的职责\n{hint}\n\n\
-             ## 工作方式\n\
-             1. 你只拿到**任务描述**这一个输入:它必须已经写明目标、输入路径、期望产物;\n\
-             2. 先用只读工具把事实摸清(必要时用 Bash 做只读检查),再动手改/写;\n\
-             3. 不要询问澄清问题 —— 信息不足时,选择最合理的解释并**在回答开头一句话说明你的假设**;\n\
-             4. 完成后用简洁中文回答,回答必须**直接包含**用户要的内容本身\n\
-                (禁止只给「已保存到 <路径>」这类占位描述,文件落盘只作为补充说明);\n\
-             5. 失败时如实说明失败点与已尝试的路径,不要伪造成功。\n\n\
-             ## 边界\n\
-             - 只做被委派的这一件事,不要扩大范围(不做规划、不做质检、不写会话摘要);\n\
-             - 你是叶子 Agent:**不能再启动子 Agent**,需要更多人力时在回答里说明建议。",
+             {rules}",
             name = name,
             label = self.label(),
             id = self.id(),
             hint = self.role_hint(),
+            // 只读判定与名册过滤同源:默认工具集 ⊆ 只读集
+            rules = common_rules_section(
+                self.default_tools()
+                    .iter()
+                    .all(|t| READ_ONLY_TOOLS.contains(t))
+            ),
         )
     }
 }
 
+/// 子 Agent 公共规则段(「工作方式 + 边界」)。
+///
+/// 内置 6 类与自定义类型(定义文件)**共用**本函数渲染,避免两处文案漂移;
+/// `read_only = true` 时在边界追加只读约束(自定义定义的 `readonly` 语义落地)。
+pub fn common_rules_section(read_only: bool) -> String {
+    let mut out = String::from(
+        "## 工作方式\n\
+         1. 你只拿到**任务描述**这一个输入:它必须已经写明目标、输入路径、期望产物;\n\
+         2. 先用只读工具把事实摸清(必要时用 Bash 做只读检查),再动手改/写;\n\
+         3. 不要询问澄清问题 —— 信息不足时,选择最合理的解释并**在回答开头一句话说明你的假设**;\n\
+         4. 完成后用简洁中文回答,回答必须**直接包含**用户要的内容本身\n\
+            (禁止只给「已保存到 <路径>」这类占位描述,文件落盘只作为补充说明);\n\
+         5. 失败时如实说明失败点与已尝试的路径,不要伪造成功。\n\n\
+         ## 边界\n\
+         - 只做被委派的这一件事,不要扩大范围(不做规划、不做质检、不写会话摘要);\n",
+    );
+    if read_only {
+        out.push_str("- 本类型为**只读**委派:不要写文件、不要改仓库、不要执行有副作用的命令。\n");
+    }
+    out.push_str("- 你是叶子 Agent:**不能再启动子 Agent**,需要更多人力时在回答里说明建议。");
+    out
+}
+
 /// 名册条目(名册渲染 + `list` 输出共用)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterEntry {
     pub id: String,
     pub label: String,
     pub desc: String,
     pub tools: Vec<String>,
+    /// 是否来自 `.laew/agents/*.md` 自定义定义(第 115 轮新增;增量字段)。
+    #[serde(default)]
+    pub custom: bool,
+    /// 自定义类型的定义文件路径(内置为 `None`)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// 被名册隐藏的类型及原因(可解释性:用户能知道「我写的定义为什么没生效」)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkippedEntry {
+    pub id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// 一次名册渲染的结果:可见条目 + 被隐藏的自定义类型。
+#[derive(Debug, Clone, Default)]
+pub struct RosterView {
+    pub entries: Vec<RosterEntry>,
+    pub skipped: Vec<SkippedEntry>,
 }
 
 /// 按父策略过滤后的名册(只读父 Agent 只看到「类型工具 ⊆ 只读集」的类型)。
+///
+/// 第 115 轮起,`defs` 传入自定义定义([`crate::agent::custom_agents`])后
+/// 名册 = 内置 + 自定义;传空切片即为 D114 原语义(既有调用点/单测零变化)。
 pub fn roster(policy: SpawnPolicy) -> Vec<RosterEntry> {
+    roster_with(&[], policy)
+}
+
+/// [`roster`] 的可测核心:显式传入自定义定义集合。
+pub fn roster_with(defs: &[crate::agent::custom_agents::AgentDef], policy: SpawnPolicy) -> Vec<RosterEntry> {
+    roster_view(defs, policy).entries
+}
+
+/// 名册视图(可见 + 被隐藏),供 `list` 快照与 `/agents` 面板复用。
+pub fn roster_view(
+    defs: &[crate::agent::custom_agents::AgentDef],
+    policy: SpawnPolicy,
+) -> RosterView {
     if policy == SpawnPolicy::Disabled {
-        return Vec::new();
+        return RosterView::default();
     }
     let allowed = policy.allowed_tools();
-    SubAgentType::ALL
+    let mut entries: Vec<RosterEntry> = SubAgentType::ALL
         .iter()
         .filter(|t| t.default_tools().iter().all(|tool| allowed.contains(tool)))
         .map(|t| RosterEntry {
@@ -244,8 +306,40 @@ pub fn roster(policy: SpawnPolicy) -> Vec<RosterEntry> {
             label: t.label().to_string(),
             desc: t.role_hint().to_string(),
             tools: t.default_tools().iter().map(|s| s.to_string()).collect(),
+            custom: false,
+            source: None,
         })
-        .collect()
+        .collect();
+
+    let mut skipped: Vec<SkippedEntry> = Vec::new();
+    for d in defs {
+        let declared = d.declared_tools();
+        if crate::agent::custom_agents::visible_under(&declared, policy) {
+            entries.push(RosterEntry {
+                id: d.id.clone(),
+                label: d.label.clone(),
+                desc: d.description.clone(),
+                tools: declared,
+                custom: true,
+                source: Some(d.source.display().to_string()),
+            });
+        } else {
+            skipped.push(SkippedEntry {
+                id: d.id.clone(),
+                reason: if declared.is_empty() {
+                    "定义未声明任何工具".to_string()
+                } else {
+                    format!(
+                        "需要 `{}`,超出现角色可授予范围(当前上限:{})",
+                        declared.join("/"),
+                        allowed.join("/")
+                    )
+                },
+                source: Some(d.source.display().to_string()),
+            });
+        }
+    }
+    RosterView { entries, skipped }
 }
 
 // ===========================================================================
@@ -267,6 +361,10 @@ pub struct SelfAwarenessConfig {
     pub max_iterations: usize,
     /// 单个子 Agent 墙钟超时(秒)。
     pub timeout_secs: u64,
+    /// 运行记录是否落 SQLite `subagent_run`(第 115 轮;关闭后零 DB 读写)。
+    pub persist: bool,
+    /// 启动期保留的最新运行记录条数(0 = 不清理)。
+    pub run_keep: usize,
 }
 
 impl Default for SelfAwarenessConfig {
@@ -278,6 +376,8 @@ impl Default for SelfAwarenessConfig {
             max_total: 8,
             max_iterations: 12,
             timeout_secs: 300,
+            persist: true,
+            run_keep: 500,
         }
     }
 }
@@ -318,6 +418,13 @@ impl SelfAwarenessConfig {
                 10,
                 3600,
             ) as u64,
+            persist: parse_on_off(std::env::var(ENV_PERSIST).ok().as_deref(), d.persist),
+            run_keep: parse_usize(
+                std::env::var(ENV_RUN_KEEP).ok().as_deref(),
+                d.run_keep,
+                0,
+                20_000,
+            ),
         }
     }
 
@@ -389,17 +496,22 @@ pub fn role_label_for(agent_name: &str) -> &'static str {
 ///
 /// 返回空串表示「本 Agent 不需要该段」:功能关闭 / 策略 Disabled / 深度已用尽 /
 /// 注册表里没有 `SubAgent` 工具(三重条件都满足才注入,确保关闭时提示词零变化)。
+///
+/// 第 115 轮起 `defs` 传入自定义子 Agent 定义(`.laew/agents/*.md`);
+/// **只渲染会话内恒定内容**(id/label/描述/工具名),不放定义文件路径与易变额度,
+/// 以保住 prompt cache 前缀(路径只在 `list` 快照与 `/agents` 面板出现)。
 pub fn prompt_section(
     agent_name: &str,
     tool_names: &[&str],
     policy: SpawnPolicy,
     cfg: &SelfAwarenessConfig,
     tool_registered: bool,
+    defs: &[crate::agent::custom_agents::AgentDef],
 ) -> String {
     if !tool_registered || !cfg.enabled || policy == SpawnPolicy::Disabled || cfg.max_depth == 0 {
         return String::new();
     }
-    let entries = roster(policy);
+    let entries = roster_with(defs, policy);
     if entries.is_empty() {
         return String::new();
     }
@@ -419,12 +531,19 @@ pub fn prompt_section(
     out.push_str("- 你可启动的子 Agent 类型:\n");
     for e in &entries {
         out.push_str(&format!(
-            "  - `{}`({}):{};默认工具 [{}]\n",
+            "  - `{}`({}{}):{};可用工具 [{}]\n",
             e.id,
             e.label,
+            if e.custom { ", 自定义" } else { "" },
             e.desc,
             e.tools.join(", ")
         ));
+    }
+    if entries.iter().any(|e| e.custom) {
+        out.push_str(
+            "(标注「自定义」的类型来自用户/项目 `.laew/agents/*.md` 定义文件;\
+             如需更细的工具面与适用场景,调用 `SubAgent(action=\"list\")` 查看实时名册。)\n",
+        );
     }
     out.push_str("\n### 启动规则(必须遵守)\n");
     out.push_str(
@@ -545,6 +664,7 @@ mod tests {
             SpawnPolicy::FullChildren,
             &cfg(),
             true,
+            &[],
         );
         assert!(s.contains("自感知"), "应含自感知标题");
         assert!(s.contains("LsmAgentEmergentWork-SubAgent-Work"));
@@ -562,7 +682,8 @@ mod tests {
             &tools,
             SpawnPolicy::Disabled,
             &cfg(),
-            true
+            true,
+            &[],
         )
         .is_empty());
         assert!(prompt_section(
@@ -570,7 +691,8 @@ mod tests {
             &tools,
             SpawnPolicy::ReadOnlyChildren,
             &cfg(),
-            false
+            false,
+            &[],
         )
         .is_empty());
         let mut off = cfg();
@@ -580,9 +702,109 @@ mod tests {
             &tools,
             SpawnPolicy::ReadOnlyChildren,
             &off,
-            true
+            true,
+            &[],
         )
         .is_empty());
+    }
+
+    // ========== 第 115 轮(2026-09-22):自定义子 Agent 类型名册 ==========
+
+    fn custom_def(id: &str, tools: Option<&str>, readonly: bool) -> crate::agent::custom_agents::AgentDef {
+        crate::agent::custom_agents::AgentDef {
+            id: id.to_string(),
+            label: format!("{id} 标签"),
+            description: format!("{id} 场景说明"),
+            extends: SubAgentType::GeneralPurpose,
+            tools: tools
+                .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
+            read_only: readonly,
+            body: "专属职责正文".to_string(),
+            source: std::path::PathBuf::from(format!("/tmp/{id}.md")),
+            scope: crate::agent::custom_agents::DefScope::Project,
+        }
+    }
+
+    #[test]
+    fn roster_without_defs_matches_builtin_only() {
+        for policy in [
+            SpawnPolicy::FullChildren,
+            SpawnPolicy::ReadOnlyChildren,
+            SpawnPolicy::Disabled,
+        ] {
+            assert_eq!(roster_with(&[], policy), roster(policy), "空定义集 = D114 语义");
+            assert!(roster(policy).iter().all(|e| !e.custom));
+        }
+    }
+
+    #[test]
+    fn roster_includes_custom_types_with_source() {
+        let defs = vec![custom_def("fe-reviewer", Some("Read, Glob, Grep"), true)];
+        let entries = roster_with(&defs, SpawnPolicy::FullChildren);
+        let custom = entries.iter().find(|e| e.custom).expect("自定义类型应入名册");
+        assert_eq!(custom.id, "fe-reviewer");
+        assert_eq!(custom.label, "fe-reviewer 标签");
+        assert_eq!(custom.tools, vec!["Read", "Glob", "Grep"]);
+        assert_eq!(custom.source.as_deref(), Some("/tmp/fe-reviewer.md"));
+    }
+
+    #[test]
+    fn roster_hides_custom_type_beyond_policy_and_reports_reason() {
+        let defs = vec![custom_def("patcher", Some("Read, Write"), false)];
+        let view = roster_view(&defs, SpawnPolicy::ReadOnlyChildren);
+        assert!(view.entries.iter().all(|e| e.id != "patcher"), "不得越权可见");
+        assert_eq!(view.skipped.len(), 1);
+        assert_eq!(view.skipped[0].id, "patcher");
+        assert!(view.skipped[0].reason.contains("Write"));
+        // 同一类型在完整策略下可见
+        let full = roster_view(&defs, SpawnPolicy::FullChildren);
+        assert!(full.entries.iter().any(|e| e.id == "patcher"));
+        assert!(full.skipped.is_empty());
+    }
+
+    #[test]
+    fn prompt_section_lists_custom_types_without_path() {
+        let defs = vec![custom_def("fe-reviewer", Some("Read, Glob, Grep"), true)];
+        let tools = vec!["Read", "SubAgent"];
+        let s = prompt_section(
+            "LsmAgentEmergentWork-Yolo",
+            &tools,
+            SpawnPolicy::ReadOnlyChildren,
+            &cfg(),
+            true,
+            &defs,
+        );
+        assert!(s.contains("`fe-reviewer`"), "自定义类型应进名册");
+        assert!(s.contains("自定义"), "应标注自定义来源");
+        assert!(
+            !s.contains("/tmp/fe-reviewer.md"),
+            "静态段不得含定义文件路径(保 prompt cache 前缀)"
+        );
+    }
+
+    #[test]
+    fn prompt_section_disabled_state_ignores_custom_defs() {
+        let defs = vec![custom_def("fe-reviewer", Some("Read"), true)];
+        let mut off = cfg();
+        off.enabled = false;
+        assert!(prompt_section(
+            "LsmAgentEmergentWork-Yolo",
+            &["Read", "SubAgent"],
+            SpawnPolicy::ReadOnlyChildren,
+            &off,
+            true,
+            &defs,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn common_rules_section_mentions_readonly_when_asked() {
+        assert!(!common_rules_section(false).contains("只读**委派"));
+        let ro = common_rules_section(true);
+        assert!(ro.contains("只读**委派"));
+        assert!(ro.contains("不能再启动子 Agent"));
     }
 
     #[test]

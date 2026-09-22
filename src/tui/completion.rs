@@ -140,12 +140,12 @@ impl CompletionEngine {
                 "决策审计可视化(表格/统计/校验/清理)",
                 "/audit [last N|stats|verify|clean]",
             ),
-            // 自感知动态子 Agent(2026-09-22 第 114 轮):名册 / 上限 / 最近作业
+            // 自感知动态子 Agent(第 114 轮 + 第 115 轮自定义类型/运行记录)
             SlashCommand::builtin(
                 "agents",
                 &["subagents"],
-                "查看动态子 Agent 名册与最近作业(自感知委派)",
-                "/agents",
+                "查看动态子 Agent 名册(含自定义类型)与运行记录",
+                "/agents [history [N|all]]",
             ),
             // D4 工作区感知(2026-09-13):环境快照查看
             SlashCommand::builtin(

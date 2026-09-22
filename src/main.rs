@@ -384,6 +384,12 @@ async fn run_one_shot(
 
     // -p 单轮模式每次生成独立 Session(debug 采集器以其 Session ID 命名归属)
     let mut session = Session::new();
+    // 动态子 Agent 运行记录(2026-09-22 第 115 轮):单轮模式同样做启动期维护
+    // (孤儿标记 + 自动 trim),fail-open 不影响任务。
+    lsm_agent::agent::dynamic_subagent::maintain_run_store(
+        session.id(),
+        lsm_agent::agent::self_awareness::config(),
+    );
     // D1 @ 提及展开(2026-09-10 第二十八轮,L1426):与 TUI dispatch_prompt 同一语义
     let expanded = lsm_agent::agent::attachments::expand_mentions(&prompt, &paths.work_dir);
     if expanded.attached > 0 {

@@ -49,6 +49,38 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_agent_memory_role
             ON agent_memory(agent_role, id);
 
+        -- ========== 动态子 Agent 运行记录(第 115 轮,2026-09-22) ==========
+        -- 设计见 docs/自感知SubAgent自定义类型与运行持久化/01-设计与解决方案.md §5.1:
+        -- Governor 的内存作业表进程退出即丢,本表让「谁干过什么/花了多少/结论是什么」
+        -- 跨任务与跨会话可查(action="history"),并支撑 action="resume" 的血缘续跑。
+        -- 全程 fail-open 写(LAEW_SUBAGENT_PERSIST=off 可整体关闭)。
+        CREATE TABLE IF NOT EXISTS subagent_run (
+            run_id        TEXT PRIMARY KEY,
+            session_id    TEXT NOT NULL,
+            parent        TEXT NOT NULL,
+            name          TEXT NOT NULL,
+            agent_type    TEXT NOT NULL,
+            depth         INTEGER NOT NULL DEFAULT 0,
+            status        TEXT NOT NULL,
+            task          TEXT NOT NULL,
+            report        TEXT NOT NULL DEFAULT '',
+            error         TEXT,
+            tools         TEXT NOT NULL DEFAULT '[]',
+            dropped_tools TEXT NOT NULL DEFAULT '[]',
+            iterations    INTEGER NOT NULL DEFAULT 0,
+            tool_calls    INTEGER NOT NULL DEFAULT 0,
+            wallclock_ms  INTEGER NOT NULL DEFAULT 0,
+            input_tokens  INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            origin        TEXT NOT NULL DEFAULT 'launch',
+            resumed_from  TEXT,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_subagent_run_session
+            ON subagent_run(session_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_subagent_run_type
+            ON subagent_run(agent_type, created_at DESC);
+
         -- ========== WorkFlow Agent(第 10 角色)新表 ==========
 
         -- Goal 状态机表

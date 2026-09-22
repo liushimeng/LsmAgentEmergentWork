@@ -308,17 +308,33 @@ mod names_tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
+        // 与实现常量逐字对齐(第 115 轮增 history / resume),避免手工维护清单漂移
         assert_eq!(
             actions,
-            vec!["launch", "batch", "list", "result", "cancel"],
+            crate::agent::tools::subagent::action_names().to_vec(),
             "action 枚举应与实现一致"
         );
         assert_eq!(schema["required"][0], "action");
         // description 必须把「何时不要启动」写清楚(防模型滥用)
         let desc = tool.description();
-        for needle in ["何时启动", "何时不要启动", "batch", "4001", "自包含"] {
+        for needle in [
+            "何时启动",
+            "何时不要启动",
+            "batch",
+            "4001",
+            "自包含",
+            // 第 115 轮:自定义类型必须在描述里可见(否则模型不知道能用)
+            ".laew/agents",
+            "resume",
+            "history",
+        ] {
             assert!(desc.contains(needle), "description 应含 `{needle}`");
         }
+        // agent_type 不得退回 enum(否则 tool_schema_validator 会硬拒自定义 id)
+        assert!(
+            schema["properties"]["agent_type"].get("enum").is_none(),
+            "agent_type 必须是自由字符串(自定义类型不可枚举)"
+        );
     }
 
     #[test]

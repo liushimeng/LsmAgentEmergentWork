@@ -9,6 +9,7 @@
 """
 import json
 import os
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -439,7 +440,38 @@ def _strip_unsupported_tool_args(tool_name, args):
     return {k: v for k, v in args.items() if k in allowed}
 
 
-def _route_subagent_tool(call_no, prompt_text, default_call, session_id=""):
+def _substitute_run_id_placeholders(args, hint_text):
+    """把 router 规则里的 `$LAST_RUN_ID` 占位符替换为最近一次 tool_result 里的 run_id。
+
+    2026-09-22 第 115 轮:动态子 Agent 的 `run_id` 由 laew 在运行期生成,无法写死在
+    路由表里;而 `resume` 端到端验证必须拿到它。ToolResult 回填内容(raw JSON 信封)
+    是唯一来源:调用方传入**未截断**的最后一条 tool_result 文本(截断版会把 run_id
+    切掉),取其中**第一个**匹配 —— 工具链按时间正序推进,最后一个 tool_result 里的
+    第一个 run_id 恰是「最近一次产生的作业」(history 的 runs[] 按时间倒序)。
+    未取到时**保持原样**(laew 侧返回 4003,测试自然会红)。
+    """
+    if not hint_text:
+        return args
+    found = re.findall(r'"run_id"\s*:\s*"(sa-[^"]+)"', hint_text)
+    if not found:
+        return args
+    run_id = found[0]
+
+    def walk(v):
+        if isinstance(v, str):
+            return v.replace("$LAST_RUN_ID", run_id)
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+
+    return walk(args)
+
+
+def _route_subagent_tool(
+    call_no, prompt_text, default_call, session_id="", tool_snippet="", run_id_hint=""
+):
     """按 prompt 关键词 + 实例内相对序号返回 (tool_name, args_json_str)。
 
     优先级:PROMPT_ROUTER 命中 > 现有 MODES(default_call 来自 first_tool_call)。
@@ -488,7 +520,10 @@ def _route_subagent_tool(call_no, prompt_text, default_call, session_id=""):
             if idx < len(tools):
                 t = tools[idx]
                 tool_name = t["tool"]
-                args = _strip_unsupported_tool_args(tool_name, t.get("args", {}))
+                args = _substitute_run_id_placeholders(
+                    t.get("args", {}), run_id_hint or tool_snippet
+                )
+                args = _strip_unsupported_tool_args(tool_name, args)
                 return tool_name, json.dumps(args, ensure_ascii=False)
             # 工具已耗尽:保持锁定在该规则内,不再扫后续规则
     # 兜底:返回 default_call(Bash echo / 现有 MODES 派生)
@@ -865,6 +900,36 @@ def _route_plan_markdown(corpus):
     return PLAN_MARKDOWN
 
 
+def system_text(body, key):
+    """展平请求里的 system 提示词文本(Anthropic 字符串 / 文本块数组;OpenAI system 消息)。
+
+    2026-09-22 第 115 轮:从 `detect_role` 里抽出共用(子 Agent 判定也需要它)。
+    """
+    if key == "oai":
+        for m in body.get("messages", []):
+            if m.get("role") != "system":
+                continue
+            content = m.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "\n".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            return ""
+        return ""
+    sys_field = body.get("system")
+    if isinstance(sys_field, str):
+        return sys_field
+    if isinstance(sys_field, list):
+        return "\n".join(
+            p.get("text", "") for p in sys_field
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return ""
+
+
 def detect_role(body, key):
     """按系统提示词中的 Agent 名识别角色(与 src/agent/system_prompt 各 BASE_PROMPT 对应)。
 
@@ -1008,7 +1073,9 @@ def first_tool_call(call_no, prompt_text, default_cmd, session_id=""):
     return _route_subagent_tool(call_no, prompt_text, default_call, session_id)
 
 
-def build_anthropic_stream(call_no, prompt_text="", tool_snippet="", session_id=""):
+def build_anthropic_stream(
+    call_no, prompt_text="", tool_snippet="", session_id="", run_id_hint=""
+):
     """构造 Anthropic 一次完整流的 SSE 字节。
 
     2026-09-11 第三十三轮:新增 prompt_text 参数,让 mock 在生成工具调用时
@@ -1071,7 +1138,7 @@ def build_anthropic_stream(call_no, prompt_text="", tool_snippet="", session_id=
     # 若 PROMPT_ROUTER 命中第 N 个工具,返回 tool_use;
     # 否则回退纯文本 end_turn,保持原行为。
     routed = _route_subagent_tool(
-        call_no, prompt_text, None, session_id
+        call_no, prompt_text, None, session_id, tool_snippet, run_id_hint
     )
     if routed is not None:
         tool_name, tool_args = routed
@@ -1162,7 +1229,9 @@ def build_anthropic_stream(call_no, prompt_text="", tool_snippet="", session_id=
     return make_anthropic_sse(events)
 
 
-def build_openai_stream(call_no, prompt_text="", tool_snippet="", session_id=""):
+def build_openai_stream(
+    call_no, prompt_text="", tool_snippet="", session_id="", run_id_hint=""
+):
     """构造 OpenAI 一次完整流的 SSE 字节。
 
     2026-09-11 第三十三轮:接收 prompt_text 用于 PROMPT_ROUTER 命中;
@@ -1234,7 +1303,9 @@ def build_openai_stream(call_no, prompt_text="", tool_snippet="", session_id="")
         # 多步工具链(Write→Write→…)在 OpenAI 协议 mock 下第二步起直接回终答,
         # 导致 D06Q1 第二个 Write 永不执行、后续轮次连锁失败);
         # 否则回退纯文本 end_turn,保持原行为。
-        routed = _route_subagent_tool(call_no, prompt_text, None, session_id)
+        routed = _route_subagent_tool(
+            call_no, prompt_text, None, session_id, tool_snippet, run_id_hint
+        )
         if routed is not None:
             tool_name, tool_args = routed
             chunks = [
@@ -1367,13 +1438,22 @@ class Handler(BaseHTTPRequestHandler):
         # 仍用全局 role_no 判定,行为不变。
         call_no_for_stream = role_no
         if role == "subagent":
+            # 2026-09-22 第 115 轮:PROMPT_ROUTER 的工具链按「实例内相对序号」推进,
+            # 而**动态子 Agent**(system 含「你是 laew 的动态子 Agent」)与发起它的
+            # SubAgent-Work 同属 role="subagent" —— 此前共用同一个实例计数器,子 Agent
+            # 每新起一个实例就把计数归零,父 Agent 后续步骤的索引被拉到 0/1/2 上,
+            # 多步链路(≥3 步 + 派生 ≥2 个子 Agent)必然错位。
+            # 修复:父/子各自独立计数(子 Agent 的步骤仍按子桶推进)。
+            _is_child_agent = "你是 laew 的动态子 Agent" in system_text(body, key)
+            _inst_bucket = "child" if _is_child_agent else "parent"
+            _inst_key = f"{key}:subagent:inst:{_inst_bucket}"
             _has_assistant = any(
                 m.get("role") == "assistant" for m in (body.get("messages") or [])
             )
             if not _has_assistant:
-                STATE[f"{key}:subagent:inst"] = 0
-            STATE[f"{key}:subagent:inst"] = STATE.get(f"{key}:subagent:inst", 0) + 1
-            call_no_for_stream = STATE[f"{key}:subagent:inst"]
+                STATE[_inst_key] = 0
+            STATE[_inst_key] = STATE.get(_inst_key, 0) + 1
+            call_no_for_stream = STATE[_inst_key]
 
         # --overflow-once 模式:subagent 第 2 次调用返回 HTTP 400 上下文溢出
         # (Anthropic 真实错误形态),用于端到端验证 src/agent/overflow.rs 的
@@ -1565,13 +1645,30 @@ class Handler(BaseHTTPRequestHandler):
                 # BUG-M4:终答附带最后工具输出摘录。
                 _sub_prompt = _extract_user_corpus(body)
                 _tool_snippet = _extract_last_tool_result(body)
+                # 未截断版(仅供 router 的 $LAST_RUN_ID 占位符替换使用;
+                # 截断到 600 字符的 _tool_snippet 会把 run_id 切掉)
+                _run_id_hint = _extract_last_tool_result(body, limit=200_000)
                 # 2026-09-15:透传 X-Session-Id 做 SubAgent 路由的会话级规则锁定
                 _sid = headers.get("x-session-id", "")
-                body_bytes = (
-                    build_openai_stream(call_no_for_stream, _sub_prompt, _tool_snippet, _sid)
-                    if key == "oai"
-                    else build_anthropic_stream(call_no_for_stream, _sub_prompt, _tool_snippet, _sid)
-                )
+                # 2026-09-22 第 115 轮:PROMPT_ROUTER 场景下,**动态子 Agent** 直接给
+                # 最终文本。理由:子 Agent 的工具面由 agent_type 决定(自定义只读类型
+                # 可能根本没有 Bash),而脚本化的「首调 Bash」会让它拿到不存在的工具
+                # 而判失败;端到端要验的是父 Agent 的自定义类型 / 运行记录 / 续跑,
+                # 子 Agent 的输出只需是一段可回填的文本(抓包仍可辨识其身份与工具面)。
+                if PROMPT_ROUTER and "你是 laew 的动态子 Agent" in system_text(body, key):
+                    body_bytes = role_reply(
+                        "MOCK_SUBAGENT_REPORT: 已完成委派任务(动态子 Agent)。"
+                    )
+                else:
+                    body_bytes = (
+                        build_openai_stream(
+                            call_no_for_stream, _sub_prompt, _tool_snippet, _sid, _run_id_hint
+                        )
+                        if key == "oai"
+                        else build_anthropic_stream(
+                            call_no_for_stream, _sub_prompt, _tool_snippet, _sid, _run_id_hint
+                        )
+                    )
         else:
             self.send_response(404)
             self.end_headers()
