@@ -1006,6 +1006,24 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     TUI 交互模式下重试;code=4002(人工取消):终止该路径并汇总已完成部分。窗口从
     hidden 切换到 headed 需先 close(page_id="all") 回收再重开;
     合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
+    **超时推荐**(第 118 轮):不传 timeout_ms 时由工具按 reason 分档默认超时——
+    captcha/sms/two_factor 默认 120_000(2 分钟,短文本回 TUI);qr_login/real_name/oauth/
+    login/manual_verify/custom 默认 300_000(5 分钟,扫码/刷脸/账密登录需要更长)。
+    显式传 timeout_ms 仍走传入值。**验证码 OCR 全失败请立即 request_human,不要反复
+    调参**(详见第 17 条);**默认超时已可解决大部分场景,无需额外设置**。
+16.1 **批量探索与执行**(第 118 轮新增):
+    - 进入新页面时,先用 1 次 `action=explore` 批量收集 elements/dom/screenshot/
+      blockers 4 类信息(queries 数组最多 8 项),拿到完整页面状态;
+    - 看到 blockers 命中 → 立即 `control(request_human, reason=<kind>)` 让人工介入,
+      **不要再 inspect 浪费时间**;
+    - 页面结构清晰后,用 1 次 `action=batch`(或 `sequence`)批量执行后续 5-10 个
+      control + 验证步骤,一次返回合并结果;
+    - **单次任务最多 2 次 explore + 3 次 batch**,其余必须单步;
+    - 避免单步 inspect → 单步 click → 单步 screenshot 链式调用(每次都消耗 LLM
+      round-trip);批量优先于单步;
+    - **迭代预算意识**(第 118 轮新增):SubAgent 默认 max_iterations=32,第 8 iter
+      后会自动注入「进入执行期」提示;此后禁止再开新 inspect/screenshot/eval_js
+      探查(除非 click 后验证),应直接 input_text/click/wait 完成剩余步骤。
 17. 窗口可视化(第 100 轮):给人看/演示/截图对比的任务用 open(mode=headed),默认
     1920×1080(1080p),window_width/window_height 可自定义;页面四周的蓝色选中边框+
     「LAEW Agent 控制中」徽标是 Agent 窗口标识,方便人工识别,不要尝试移除(可用

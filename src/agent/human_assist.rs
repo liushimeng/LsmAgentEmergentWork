@@ -25,8 +25,14 @@ use std::time::Duration;
 
 use tokio::sync::{oneshot, Notify};
 
-/// 人工介入请求的默认等待时长(5 分钟,短信验证码场景余量充足)。
-pub const DEFAULT_HUMAN_ASSIST_TIMEOUT_MS: u64 = 300_000;
+/// 人工介入请求的默认等待时长。
+///
+/// 第 118 轮(2026-09-22):从 300_000(5 分钟)降到 120_000(2 分钟),对齐
+/// claudecode 默认 120s / 上限 600s 的实践经验。验证码/短信/2FA 等
+/// 「短文本回 TUI」场景 120s 余量充足;扫码/人脸/账密登录场景由
+/// `act_request_human` 按 reason 分档默认 300_000 覆盖。LLM 仍可通过
+/// `timeout_ms` 参数显式覆盖。
+pub const DEFAULT_HUMAN_ASSIST_TIMEOUT_MS: u64 = 120_000;
 /// 上限 30 分钟(对齐 claudecode 600s 上限并放宽,适配扫码/人脸等慢流程)。
 pub const MAX_HUMAN_ASSIST_TIMEOUT_MS: u64 = 1_800_000;
 /// 下限 10 秒(防止误传 1ms 导致 TUI 来不及渲染)。

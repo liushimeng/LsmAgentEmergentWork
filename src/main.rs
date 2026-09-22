@@ -88,7 +88,10 @@ struct Cli {
     outprovider: Option<PathBuf>,
 
     /// 最大 Agent 迭代次数(防止工具循环)
-    #[arg(long, default_value_t = 16, global = true, help_heading = "运行调优")]
+    ///
+    /// 第 118 轮:默认 16 → 32,验证码/登录链路实测 20-30 iter 才能完成,
+    /// 配套 OrchestratorConfig.subagent_explore_budget = 8(分段机制)。
+    #[arg(long, default_value_t = 32, global = true, help_heading = "运行调优")]
     max_iterations: usize,
 
     /// 调试模式:采集各 Agent 输入/输出/性能/质量,任务结束后由 Debug Agent 评估,

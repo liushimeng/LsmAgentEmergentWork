@@ -94,6 +94,12 @@ pub struct ExecutionTrace {
     /// 供 QC / Debug 报告 / TUI 阶段打印快速识别权限类失败根因。
     #[serde(default)]
     pub permission_missing: Vec<String>,
+    /// 第 118 轮新增:探索预算耗尽标志。Agent 循环在 iter == explore_budget
+    /// 时通过 `build_runtime_hints` 注入「进入执行期」提示到 system 末尾,
+    /// 减少后续 inspect/screenshot/eval_js 等只读探查浪费迭代。
+    /// 默认 false(serde 兼容旧 trace);见 src/agent/orchestrator/types.rs。
+    #[serde(default)]
+    pub explore_budget_exhausted: bool,
 }
 
 /// 单次工具调用摘要(2026-09-16 第 56 轮 + 第 57 轮)。
@@ -172,6 +178,7 @@ impl Default for ExecutionTrace {
             runner_role: None,
             intended_role: None,
             permission_missing: Vec::new(),
+            explore_budget_exhausted: false,
         }
     }
 }

@@ -11,7 +11,18 @@ pub struct OrchestratorConfig {
     /// 历史注入条数
     pub history_limit: usize,
     /// SubAgent-Work 单次单元最大迭代
+    ///
+    /// 第 118 轮(2026-09-22):默认值 16 → 32。
+    /// 验证码 OCR + 登录链路实测需 20-30 iter,16 iter 撞线率极高;
+    /// 提到 32 配套「探索预算」分段(见 [`Self::subagent_explore_budget`])。
     pub subagent_max_iterations: usize,
+    /// 第 118 轮新增:SubAgent 探索阶段预算(iter < explore_budget 鼓励
+    /// inspect/screenshot/eval_js 等只读探查);超出后 Runner 通过 RuntimeHint
+    /// 注入「进入执行期」提示,要求 LLM 收敛到 input_text/click/wait。
+    ///
+    /// 默认 = `subagent_max_iterations / 4`(32 → 8)。
+    /// 设为 0 = 关闭该机制(等同旧行为)。
+    pub subagent_explore_budget: usize,
     /// 同层无依赖 WorkFlow 的最大并行数(信号量上限,对齐 atomcode Semaphore(3) 惯例)
     pub max_parallel_workflows: usize,
     /// ★2026-09-19 第 95 轮:执行单元级局部重试预算 —— 单单元 QC 判 retryable 后,
@@ -26,10 +37,14 @@ pub struct OrchestratorConfig {
 
 impl Default for OrchestratorConfig {
     fn default() -> Self {
+        // 第 118 轮:max_iter 16 → 32,同步加 explore_budget = max_iter / 4 = 8
+        let subagent_max_iterations = 32_usize;
+        let subagent_explore_budget = subagent_max_iterations / 4; // 8
         Self {
             max_retry_per_level: 3,
             history_limit: DEFAULT_HISTORY_LIMIT,
-            subagent_max_iterations: 16,
+            subagent_max_iterations,
+            subagent_explore_budget,
             max_parallel_workflows: 3,
             unit_retry_budget: 2,
             debug: None,

@@ -100,6 +100,10 @@ pub struct Agent {
     llm: Arc<dyn LlmClient>,
     profile: AgentProfile,
     max_iterations: usize,
+    /// 第 118 轮新增:探索阶段预算(iter < explore_budget 鼓励 inspect/screenshot/eval_js);
+    /// 0 = 关闭该机制(等同旧行为)。详见 [`crate::agent::runtime_hints::build_runtime_hints`]
+    /// 中 `explore_budget_exhausted` 触发逻辑。
+    explore_budget: usize,
     /// 最大截断续接次数(输出被 token 上限截断时自动续接的上限)。
     max_truncation_resume: usize,
     /// 最大上下文溢出恢复次数(排水/折叠重试的全会话预算)。
@@ -112,6 +116,9 @@ impl Agent {
             llm,
             profile,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            // 第 118 轮:默认 = max_iter / 4(DEFAULT_MAX_ITERATIONS / 4);
+            // 0 表示关闭该机制(走旧行为,无 explore_budget 提示)。
+            explore_budget: DEFAULT_MAX_ITERATIONS / 4,
             max_truncation_resume: DEFAULT_MAX_TRUNCATION_RESUME,
             max_overflow_recoveries: DEFAULT_MAX_OVERFLOW_RECOVERIES,
         }
@@ -119,12 +126,15 @@ impl Agent {
 
     pub fn with_max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
+        // 第 118 轮:同步按比例调整 explore_budget,保持「探索 1/4 + 执行 3/4」默认语义;
+        // Orchestrator 通过 SubAgentRunner::with_max_iterations 传入 max_iter 时一并更新。
+        self.explore_budget = n / 4;
         self
     }
 
-    /// 设置最大截断续接次数(测试 / 特殊场景用)。
-    pub fn with_max_truncation_resume(mut self, n: usize) -> Self {
-        self.max_truncation_resume = n;
+    /// 第 118 轮新增:显式设置探索预算。设为 0 = 关闭机制。
+    pub fn with_explore_budget(mut self, n: usize) -> Self {
+        self.explore_budget = n;
         self
     }
 

@@ -33,16 +33,17 @@ fn parse_modifiers_combo() {
     assert_eq!(control::parse_modifiers(&p), 2 | 8);
 }
 
-// =================== Schema 枚举完整性(第 89 轮单工具化) ===================
+// =================== Schema 枚举完整性(第 89 轮单工具化;第 118 轮加 explore/batch) ===================
 
 #[test]
 fn parameters_action_enum_is_six_values() {
     let p = McpWebUseTool.parameters();
     let enums = p["properties"]["action"]["enum"].as_array().expect("action enum 应为数组");
     let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
+    // 第 118 轮:action enum 由 6 个扩展为 8 个,新增 explore(批量观察) + batch(批量混合执行)
     assert_eq!(
         names,
-        vec!["open", "list", "close", "control", "inspect", "sequence"]
+        vec!["open", "list", "close", "control", "inspect", "sequence", "explore", "batch"]
     );
     assert_eq!(p["required"][0], "action", "action 必填");
 }

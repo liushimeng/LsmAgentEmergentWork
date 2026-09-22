@@ -171,6 +171,18 @@ impl Agent {
 
         for iter in 0..self.max_iterations {
             trace.iterations = iter + 1;
+            // 第 118 轮:探索预算耗尽时在 trace 上打标,build_runtime_hints 会在
+            // 后续 system 拼接时追加「进入执行期」提示到 LLM 上下文,引导 LLM 收敛
+            // 到 input_text/click/wait 等写操作,减少 inspect/screenshot/eval_js 重复探查。
+            // 预算 = 0 关闭该机制(等同旧行为,见 Agent::with_explore_budget)。
+            if self.explore_budget > 0 && iter == self.explore_budget {
+                trace.explore_budget_exhausted = true;
+                debug!(
+                    iteration = iter,
+                    explore_budget = self.explore_budget,
+                    "explore_budget 耗尽,进入执行期提示"
+                );
+            }
             // 迭代边界:取消检查(轻量 is_cancelled,热路径零 await 开销)
             if let Some(token) = cancel {
                 if token.is_cancelled() {

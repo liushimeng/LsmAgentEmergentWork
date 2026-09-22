@@ -311,8 +311,61 @@ impl TuiSession {
                                     waiting_line_on_screen = false;
                                 }
                                 initial_spinner_active = false;
-                                print_human_assist_block(&req);
-                                let answer = read_human_assist_answer().await;
+                                // 第 118 轮:先清理底部 InputHandler 固定面板残留(`>> <旧buffer>`),
+                                // 避免视觉歧义(用户以为底部 `>>` 是输入位置,实际是 HITL 蓝框下)
+                                if stdout_is_tty {
+                                    super::input::teardown_pinned();
+                                }
+                                // 第 118 轮:用强视觉锚点 + 倒计时替代原 print_human_assist_block
+                                let started_at = std::time::Instant::now();
+                                print_human_assist_prompt_with_cursor(&req, 0);
+
+                                // 第 118 轮:1s 倒计时心跳 + 行读 stdin 的 select! 嵌套,
+                                // 每秒重写倒计时行(精确擦除 + 重画,不污染滚动区其他行)
+                                let mut countdown = tokio::time::interval(std::time::Duration::from_secs(1));
+                                countdown.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                                let mut last_remaining = u64::MAX;
+                                let answer = loop {
+                                    tokio::select! {
+                                        _ = countdown.tick() => {
+                                            let elapsed = started_at.elapsed().as_millis() as u64;
+                                            let remaining_s = req.timeout_ms.saturating_sub(elapsed) / 1000;
+                                            if remaining_s != last_remaining && stdout_is_tty {
+                                                // 上移 2 行(倒计时行 + 蓝框前的换行) + 清行
+                                                // + 重新打印倒计时 + 强视觉输入提示符
+                                                print!("\x1b[2A\x1b[2K");
+                                                let timer_color = if remaining_s <= 10 {
+                                                    "\x1b[31m"
+                                                } else if remaining_s <= 30 {
+                                                    "\x1b[33m"
+                                                } else {
+                                                    "\x1b[90m"
+                                                };
+                                                print!(
+                                                    "  {timer_color}⏱ 剩余 {remaining_s}s (总 {}s)\x1b[0m\n",
+                                                    req.timeout_ms / 1000
+                                                );
+                                                // 重新打印蓝框 + 输入提示符(简化版,只保留锚点)
+                                                print!("\n  \x1b[36m┌─ 🔐 人工介入 ─\x1b[0m 仍等待您的输入\n");
+                                                let input_prompt = if req.options.is_empty() {
+                                                    "\n  \x1b[1;36m▶ 输入验证码/内容\x1b[0m\x1b[5;7m \x1b[0m\x1b[1;36m▏\x1b[0m(q=取消): "
+                                                } else {
+                                                    "\n  \x1b[1;36m▶ 输入选项编号(回车=1)或自由内容\x1b[0m\x1b[5;7m \x1b[0m\x1b[1;36m▏\x1b[0m(q=取消): "
+                                                };
+                                                print!("{input_prompt}");
+                                                let _ = std::io::stdout().flush();
+                                                last_remaining = remaining_s;
+                                            }
+                                        }
+                                        answer = read_human_assist_answer() => break answer,
+                                    }
+                                };
+                                // 收到回答:清除倒计时残留(2 行:倒计时 + 输入提示)
+                                if stdout_is_tty {
+                                    print!("\x1b[2A\x1b[2K\x1b[1B\x1b[2K\x1b[1A");
+                                    let _ = std::io::stdout().flush();
+                                }
+
                                 let mapped =
                                     map_human_assist_input(&answer, &req.options);
                                 let ok = crate::agent::human_assist::HumanAssistHub::global()
@@ -1144,7 +1197,81 @@ fn human_assist_kind_label(kind: &str) -> &str {
     }
 }
 
+/// 渲染人工介入请求块(蓝色框线 + 倒计时行 + 强视觉输入提示符)。
+///
+/// 第 118 轮改进:
+/// 1. 倒计时行(⏱ 剩余 Xs / 总 Ys),颜色随剩余时间从灰→黄→红渐变,
+///    用户随时知道还剩多少时间;
+/// 2. 强视觉输入提示符 `▶ 输入...`(Bold Cyan + Blink + Reverse),
+///    模仿 IDE 编辑框光标闪烁,用户一眼找到输入位置;
+/// 3. 蓝框 + 选项 + 说明保留原样。
+///
+/// 调用方应在渲染前先 `teardown_pinned()` 清理底部 InputHandler 固定面板残留的
+/// `>> <旧buffer>`,避免视觉歧义(用户误以为底部是输入位置)。
+fn print_human_assist_prompt_with_cursor(req: &HumanAssistDisplay, elapsed_ms: u64) {
+    use std::io::Write as _;
+    let remaining_s = req.timeout_ms.saturating_sub(elapsed_ms) / 1000;
+    // 倒计时颜色:>30s 灰,11-30s 黄,<=10s 红
+    let timer_color = if remaining_s <= 10 {
+        "\x1b[31m"
+    } else if remaining_s <= 30 {
+        "\x1b[33m"
+    } else {
+        "\x1b[90m"
+    };
+
+    let mut out = String::new();
+    // 1. 倒计时行(单独一行,后续 ANSI 擦除时只擦这一行)
+    out.push('\n');
+    out.push_str(&format!(
+        "  {timer_color}⏱ 剩余 {remaining_s}s (总 {}s){}\x1b[0m\n",
+        req.timeout_ms / 1000, ""
+    ));
+    // 2. 蓝框 + 类型/说明/选项(保留原 print_human_assist_block 风格)
+    out.push_str("\n  \x1b[36m┌─ 🔐 人工介入请求 ────────────────────────────────\x1b[0m\n");
+    out.push_str(&format!(
+        "  \x1b[36m│\x1b[0m 类型: \x1b[1m{}\x1b[0m",
+        human_assist_kind_label(&req.kind)
+    ));
+    if !req.url.is_empty() {
+        out.push_str(&format!(
+            "   页面: {}",
+            pathfmt::elide_middle(&req.url, 56)
+        ));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "  \x1b[36m│\x1b[0m 说明: {}\n",
+        req.message.replace('\n', " ")
+    ));
+    if !req.options.is_empty() {
+        out.push_str("  \x1b[36m│\x1b[0m 选项:\n");
+        for (i, opt) in req.options.iter().enumerate() {
+            out.push_str(&format!("  \x1b[36m│\x1b[0m   {}. {}\n", i + 1, opt));
+        }
+    }
+    out.push_str(&format!(
+        "  \x1b[36m│\x1b[0m 超时: {}s\n",
+        req.timeout_ms / 1000
+    ));
+    out.push_str("  \x1b[36m└──────────────────────────────────────────────\x1b[0m\n");
+    // 3. 强视觉输入提示符:\x1b[5m=Blink, \x1b[7m=Reverse(反白); 中间一个空格被反白闪烁,
+    //    形如 ▶ 输入验证码 [闪烁光标] (q=取消):  —— 用户一眼能看到该在哪一行输入
+    let input_prompt = if req.options.is_empty() {
+        "\n  \x1b[1;36m▶ 输入验证码/内容\x1b[0m\x1b[5;7m \x1b[0m\x1b[1;36m▏\x1b[0m(q=取消): "
+    } else {
+        "\n  \x1b[1;36m▶ 输入选项编号(回车=1)或自由内容\x1b[0m\x1b[5;7m \x1b[0m\x1b[1;36m▏\x1b[0m(q=取消): "
+    };
+    out.push_str(input_prompt);
+    print!("{out}");
+    let _ = std::io::stdout().flush();
+}
+
 /// 渲染人工介入请求块(蓝色框线,与浏览器窗口蓝框呼应)。
+///
+/// 第 118 轮起弃用,改用 [`print_human_assist_prompt_with_cursor`]
+/// (含倒计时 + 强视觉输入提示符)。保留本函数以兼容其它调用点/单测。
+#[allow(dead_code)]
 fn print_human_assist_block(req: &HumanAssistDisplay) {
     use std::io::Write as _;
     let mut out = String::new();

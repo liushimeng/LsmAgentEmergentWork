@@ -1264,7 +1264,17 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     if options.len() > 6 {
         options.truncate(6);
     }
-    let timeout_ms = p.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0);
+    let timeout_ms = p.get("timeout_ms").and_then(Value::as_u64).unwrap_or_else(|| {
+        // 第 118 轮:按 reason 分档默认超时(LLM 显式传 timeout_ms 仍走传入值)
+        // - captcha / sms / two_factor:120_000(2 分钟)
+        //   短文本回 TUI,人工可直接输入,无需更长等待;对齐 claudecode 实践
+        // - qr_login / real_name / oauth / login / manual_verify / custom:300_000(5 分钟)
+        //   扫码/刷脸/账密登录等需要人工在浏览器窗口操作的场景,留足余量
+        match reason {
+            "captcha" | "sms" | "two_factor" => 120_000,
+            _ => 300_000,
+        }
+    });
     let bring = p.get("bring_to_front").and_then(Value::as_bool).unwrap_or(true);
 
     // 先把窗口带到前台(headed 才有视觉效果;hidden 模式静默失败不阻断提问)
@@ -1364,4 +1374,180 @@ pub(super) async fn dispatch_mouse(
     }
     page.execute(params.build().map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// =================== 第 118 轮:explore / batch action ===================
+
+/// `action=explore`:批量观察。一次调用合并多个 inspect 维度(elements/dom/
+/// screenshot/blockers 等),返回合并结果,节省 LLM round-trip。
+///
+/// 入参形态:
+/// ```json
+/// {"action":"explore","page_id":"p_xxx",
+///  "queries":[
+///    {"info":"elements"},
+///    {"info":"dom","params":{"selector":"form"}},
+///    {"info":"screenshot","params":{"out":"login.png"}},
+///    {"info":"blockers"}
+///  ],
+///  "summary_hint":"登录页 DOM 结构"}
+/// ```
+///
+/// 返回:`{code:0, data:{page_id, results:[{info,code,message,data},...], summary_hint, total}}`。
+pub(super) async fn run_explore(args: Value) -> crate::error::Result<String> {
+    let Some(id) = str_arg(&args, "page_id") else {
+        return envelope(1001, "缺少 page_id", json!({}));
+    };
+    let queries = match args.get("queries").and_then(Value::as_array) {
+        Some(q) if !q.is_empty() => q,
+        Some(_) => return envelope(1001, "queries 不能为空", json!({})),
+        None => return envelope(1001, "缺少 queries", json!({})),
+    };
+    if queries.len() > 8 {
+        return envelope(
+            1001,
+            "queries 最多 8 项(超出请分批调用,避免单次返回过大)",
+            json!({"got": queries.len(), "max": 8}),
+        );
+    }
+    // 校验 page_id 有效性(2000 语义),所有 query 共用一次失败检查
+    if BrowserManager::global().page(id).await.is_none() {
+        return envelope(2000, "page_id 不存在", json!({"page_id": id}));
+    }
+
+    let summary_hint = args
+        .get("summary_hint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let mut results: Vec<Value> = Vec::with_capacity(queries.len());
+    let mut ok_count = 0usize;
+    let mut err_count = 0usize;
+
+    for q in queries {
+        // 构造单步 inspect 入参(action=inspect + info + params)
+        let mut single = serde_json::Map::new();
+        single.insert("action".into(), Value::String("inspect".into()));
+        single.insert("page_id".into(), Value::String(id.to_string()));
+        if let Some(info) = q.get("info").cloned() {
+            single.insert("info".into(), info);
+        } else {
+            // 缺 info → 1001,跳过本次 query(不影响后续)
+            results.push(json!({
+                "info": Value::Null,
+                "code": 1001,
+                "message": "query 缺少 info 字段",
+                "data": {},
+            }));
+            err_count += 1;
+            continue;
+        }
+        if let Some(params) = q.get("params").cloned() {
+            single.insert("params".into(), params);
+        }
+
+        // 调 inspect::run(已有)
+        match crate::agent::tools::mcp_web_use::inspect::run(Value::Object(single)).await {
+            Ok(envelope_str) => {
+                // envelope_str 是 JSON 字符串,parse 后嵌入 results
+                match serde_json::from_str::<Value>(&envelope_str) {
+                    Ok(envelope_value) => {
+                        let info = envelope_value
+                            .get("data")
+                            .and_then(|d| d.get("info"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let code = envelope_value
+                            .get("code")
+                            .cloned()
+                            .unwrap_or(json!(2002));
+                        let message = envelope_value
+                            .get("message")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let data = envelope_value
+                            .get("data")
+                            .cloned()
+                            .unwrap_or(json!({}));
+                        // blockers 命中提示附带 next_action hint
+                        let data = if info.as_str() == Some("blockers") {
+                            let blocked = data
+                                .get("blockers")
+                                .and_then(Value::as_array)
+                                .map(|a| !a.is_empty())
+                                .unwrap_or(false);
+                            if blocked {
+                                let mut d = data.as_object().cloned().unwrap_or_default();
+                                d.insert(
+                                    "next_action".into(),
+                                    json!("立即 control(request_human, reason=<kind>) 让人工介入,不要再 inspect 浪费时间"),
+                                );
+                                Value::Object(d)
+                            } else {
+                                data
+                            }
+                        } else {
+                            data
+                        };
+                        let code_num = code.as_i64().unwrap_or(2002);
+                        if code_num == 0 {
+                            ok_count += 1;
+                        } else {
+                            err_count += 1;
+                        }
+                        results.push(json!({
+                            "info": info,
+                            "code": code,
+                            "message": message,
+                            "data": data,
+                        }));
+                    }
+                    Err(_) => {
+                        // envelope 解析失败,降级保留原始字符串
+                        err_count += 1;
+                        results.push(json!({
+                            "info": Value::Null,
+                            "code": 2002,
+                            "message": "inspect 返回 envelope 解析失败",
+                            "data": {"raw": envelope_str},
+                        }));
+                    }
+                }
+            }
+            Err(e) => {
+                err_count += 1;
+                results.push(json!({
+                    "info": q.get("info").cloned().unwrap_or(Value::Null),
+                    "code": 2001,
+                    "message": format!("inspect 调用失败:{e}"),
+                    "data": {},
+                }));
+            }
+        }
+    }
+
+    envelope(
+        0,
+        "ok",
+        json!({
+            "page_id": id,
+            "results": results,
+            "summary_hint": summary_hint,
+            "ok_count": ok_count,
+            "err_count": err_count,
+            "total": queries.len(),
+        }),
+    )
+}
+
+/// `action=batch`:批量混合执行。复用 sequence 执行器逻辑(内部调用 `run_sequence`),
+/// 保留 batch 作为「允许任意 inspect + control 混合」的语义别名,提示 LLM
+/// 「探索后批量执行」的标准操作。
+///
+/// 与 sequence 区别:batch 在 Schema 描述中明示「用于 control + inspect 混合的
+/// 稳定流程」(登录/表单类场景),sequence 描述为「通用连续执行」。
+pub(super) async fn run_batch(args: Value) -> crate::error::Result<String> {
+    // batch = sequence 的语义别名;直接转发到 run_sequence
+    super::run_sequence(args).await
 }

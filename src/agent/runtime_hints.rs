@@ -41,6 +41,18 @@ pub(crate) fn build_runtime_hints(trace: &ExecutionTrace, consecutive_failures: 
             consecutive_failures
         ));
     }
+    // 第 118 轮:探索预算耗尽提示 —— 在 trace.iterations >= explore_budget 时触发,
+    // 提醒 LLM 「进入执行期」,减少重复 inspect/screenshot/eval_js 等只读探查。
+    // 调用方(agent_loop.rs)在 `iter == explore_budget` 时通过 trace.explore_budget_exhausted
+    // 标记触发本 hint,避免 trace 字段再次修改(向后兼容)。
+    if trace.explore_budget_exhausted {
+        hints.push(
+            "已进入执行期(explore_budget 耗尽)。剩余迭代请专注于 input_text / click / wait 等 \
+             写操作,禁止再开新 inspect / screenshot / eval_js 探查(除非 click 后验证)。\
+             验证码/阻断请立即 control(request_human, reason=...) 让人工介入。"
+                .to_string(),
+        );
+    }
     if hints.is_empty() {
         return String::new();
     }
