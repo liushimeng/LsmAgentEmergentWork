@@ -133,6 +133,13 @@ impl CompletionEngine {
             SlashCommand::builtin("cost", &["usage"], "查看会话用量与成本估算", "/cost"),
             // D19 TODO 任务列表(2026-09-22 第 112 轮):表格列出当前 session 的 TodoWrite 清单
             SlashCommand::builtin("tasks", &["todo", "todos"], "查看当前 session 的 TODO 任务清单", "/tasks"),
+            // D9-8 决策审计可视化(2026-09-22 第 113 轮):表格/统计/校验/清理
+            SlashCommand::builtin(
+                "audit",
+                &["audits"],
+                "决策审计可视化(表格/统计/校验/清理)",
+                "/audit [last N|stats|verify|clean]",
+            ),
             // D4 工作区感知(2026-09-13):环境快照查看
             SlashCommand::builtin(
                 "workspace",

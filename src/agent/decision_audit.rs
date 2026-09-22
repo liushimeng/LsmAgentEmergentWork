@@ -17,14 +17,19 @@
 //! - `LAEW_AUDIT=off|0|false|no` → 关闭审计写入(默认开启)。
 //! - 审计写入失败 fail-open:只 eprintln!,不中断主流程。
 //! - 全字段 `scrub_secrets` + 截断,防 API Key / 超长提示词入库。
+//!
+//! 2026-09-22 第 113 轮(D9-8 闭环):新增 `read_events` / `count_events` /
+//! `verify_events` / `file_size` / `pub audit_root_dir`,
+//! 为 TUI `/audit` 命令与 `/cost` 集成提供读取入口;`trim_audit_files` 由
+//! TUI bootstrap 自动调用清理。
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::context::AgentRole;
 use crate::agent::debug::scrub_secrets;
@@ -46,7 +51,7 @@ const AUDIT_DIR: &str = "AuditTrail";
 ///
 /// 每条事件是 3 段式:input_summary(输入上下文) → outcome(决策结论) → rationale(决策依据),
 /// 对标 claudecode 3 段式 40+ 字段审计 schema 的精简 Rust CLI 子集。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// ISO8601 本地时区时间戳。
     pub ts: String,
@@ -124,7 +129,10 @@ fn registry(
 /// 推导审计根目录(二进制所在目录,与 `Paths::detect().root_dir` 同义)。
 ///
 /// 审计模块独立推导,避免向 Orchestrator 注入 root_dir 字段(减少与并发任务的耦合)。
-fn audit_root_dir() -> Option<PathBuf> {
+///
+/// 2026-09-22 第 113 轮:由 `fn` 提升为 `pub fn`,供 TUI bootstrap / `/audit` 命令
+/// 自动定位审计目录,无需注入 root_dir 字段。
+pub fn audit_root_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
@@ -426,6 +434,163 @@ pub fn trim_audit_files(root_dir: &Path, keep: usize) -> Result<usize> {
     Ok(removed)
 }
 
+// =================== 读取与统计(2026-09-22 第 113 轮 D9-8 闭环)====================
+
+/// 推导指定 session 的审计文件路径(不创建文件)。
+///
+/// 复用 `AuditWriter::open` 的路径规则:`<root_dir>/AuditTrail/audit_{session_id}.jsonl`。
+/// 当 `root_dir` 为 `None` 时使用 `audit_root_dir()` 默认推导值。
+pub fn audit_file_path(session_id: &str, root_dir: Option<&Path>) -> Option<PathBuf> {
+    let root = root_dir
+        .map(|p| p.to_path_buf())
+        .or_else(audit_root_dir)?;
+    Some(root.join(AUDIT_DIR).join(format!("audit_{session_id}.jsonl")))
+}
+
+/// 读取指定 session 的所有审计事件(JSONL 容错解析)。
+///
+/// 损坏行(serde_json 解析失败 / 缺必填字段)会被跳过,不计入结果,但可通过
+/// [`VerifyResult`] 通道获取损坏详情。
+///
+/// - `session_id`:目标 session id
+/// - `root_dir`:审计根目录,`None` 时走 `audit_root_dir()`
+pub fn read_events(session_id: &str, root_dir: Option<&Path>) -> Vec<AuditEvent> {
+    let Some(path) = audit_file_path(session_id, root_dir) else {
+        return Vec::new();
+    };
+    let Ok(file) = File::open(&path) else {
+        return Vec::new();
+    };
+    let reader = BufReader::new(file);
+    let mut events: Vec<AuditEvent> = Vec::new();
+    for line in reader.lines().map_while(std::io::Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(ev) = serde_json::from_str::<AuditEvent>(trimmed) {
+            events.push(ev);
+        }
+    }
+    events
+}
+
+/// 统计指定 session 的审计事件条数(快速路径:仅 `BufReader::lines`,不解析)。
+///
+/// 性能:1k 行 < 5ms(SSD),可放心在 `/cost` / 横幅中调用。
+pub fn count_events(session_id: &str, root_dir: Option<&Path>) -> usize {
+    let Some(path) = audit_file_path(session_id, root_dir) else {
+        return 0;
+    };
+    let Ok(file) = File::open(&path) else {
+        return 0;
+    };
+    BufReader::new(file).lines().map_while(std::io::Result::ok).filter(|l| !l.trim().is_empty()).count()
+}
+
+/// 获取指定 session 审计文件大小(字节)。
+///
+/// 用于 `/cost` 末尾「落盘 KB」展示;返回 `None` 表示文件不存在。
+pub fn file_size(session_id: &str, root_dir: Option<&Path>) -> Option<u64> {
+    let path = audit_file_path(session_id, root_dir)?;
+    std::fs::metadata(&path).ok().map(|m| m.len())
+}
+
+// =================== 完整性校验(2026-09-22 第 113 轮)====================
+
+/// 单行校验结果。
+#[derive(Debug, Clone)]
+pub struct VerifyLine {
+    /// 行号(1-based,空行不计)。
+    pub line_no: usize,
+    /// 是否通过(true=有效,false=损坏)。
+    pub valid: bool,
+    /// 损坏原因(`None` 当 `valid=true`)。
+    pub error: Option<String>,
+    /// 该行的 decision(若可解析),用于错误展示。
+    pub decision: Option<String>,
+}
+
+/// 整体校验汇总。
+#[derive(Debug, Clone)]
+pub struct VerifyResult {
+    /// 总有效行数。
+    pub valid_count: usize,
+    /// 损坏行详情(已排序)。
+    pub invalid_lines: Vec<VerifyLine>,
+    /// 必填字段列表(用于展示「检查了哪些字段」)。
+    pub required_fields: &'static [&'static str],
+    /// 审计文件路径(用于展示)。
+    pub path: PathBuf,
+}
+
+/// 校验指定 session 的审计文件完整性。
+///
+/// 校验规则:
+/// 1. 每行必须是合法 JSON;
+/// 2. 必须含必填字段:`ts` / `session_id` / `agent` / `decision`;
+/// 3. 损坏行计入 `invalid_lines` 并附行号 + 原因。
+///
+/// 文件不存在 → 返回 `valid_count=0` 且 `invalid_lines=[]`,调用方按「无审计」处理。
+pub fn verify_events(session_id: &str, root_dir: Option<&Path>) -> VerifyResult {
+    const REQUIRED: &[&str] = &["ts", "session_id", "agent", "decision"];
+    let path = audit_file_path(session_id, root_dir)
+        .unwrap_or_else(|| PathBuf::from("<audit root not resolved>"));
+    let mut result = VerifyResult {
+        valid_count: 0,
+        invalid_lines: Vec::new(),
+        required_fields: REQUIRED,
+        path,
+    };
+    let Some(p) = audit_file_path(session_id, root_dir) else {
+        return result;
+    };
+    let Ok(file) = File::open(&p) else {
+        return result;
+    };
+    let reader = BufReader::new(file);
+    let mut line_no: usize = 0;
+    for line in reader.lines().map_while(std::io::Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        line_no += 1;
+        match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(v) => {
+                let mut missing: Vec<&str> = Vec::new();
+                for &f in REQUIRED {
+                    if v.get(f).is_none() || v.get(f).map(|x| x.is_null()).unwrap_or(false) {
+                        missing.push(f);
+                    }
+                }
+                if missing.is_empty() {
+                    result.valid_count += 1;
+                } else {
+                    result.invalid_lines.push(VerifyLine {
+                        line_no,
+                        valid: false,
+                        error: Some(format!("缺字段: {}", missing.join(","))),
+                        decision: v
+                            .get("decision")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string()),
+                    });
+                }
+            }
+            Err(e) => {
+                result.invalid_lines.push(VerifyLine {
+                    line_no,
+                    valid: false,
+                    error: Some(format!("JSON 解析失败: {e}")),
+                    decision: None,
+                });
+            }
+        }
+    }
+    result.invalid_lines.sort_by_key(|l| l.line_no);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +862,138 @@ mod tests {
         let content = std::fs::read_to_string(&jsonl_path).expect("read");
         assert!(content.contains("\"decision\":\"plan\""));
         assert!(content.contains("\"step_count\":5"));
+    }
+
+    // ===== 2026-09-22 第 113 轮 D9-8 闭环:读取/校验/统计测试 =====
+
+    #[test]
+    fn read_events_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let sid = "s_read";
+        let writer = session_writer(sid, root).expect("open writer");
+        for i in 0..3 {
+            let mut w = writer.lock().expect("lock");
+            let ev = AuditEvent::new(sid, "yolo", "classify", &format!("purpose=测试 {}", i), "level=simple", "goal=test", 100);
+            w.append(&ev).expect("append");
+        }
+        drop(writer);
+        let events = read_events(sid, Some(root));
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].decision, "classify");
+        assert_eq!(events[0].agent, "yolo");
+    }
+
+    #[test]
+    fn read_events_skips_corrupt_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let sid = "s_corrupt";
+        let audit_dir = root.join(AUDIT_DIR);
+        std::fs::create_dir_all(&audit_dir).expect("dir");
+        let path = audit_dir.join(format!("audit_{sid}.jsonl"));
+        std::fs::write(
+            &path,
+            "{not valid json}\n{\"ts\":\"t1\",\"session_id\":\"s\",\"agent\":\"yolo\",\"decision\":\"classify\",\"input_summary\":\"i\",\"outcome\":\"o\",\"rationale\":\"r\",\"duration_ms\":1}\n",
+        ).expect("write");
+        let events = read_events(sid, Some(root));
+        assert_eq!(events.len(), 1, "损坏行应被跳过");
+        assert_eq!(events[0].decision, "classify");
+    }
+
+    #[test]
+    fn read_events_returns_empty_for_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = read_events("s_nonexistent", Some(dir.path()));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn count_events_basic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let sid = "s_count";
+        let writer = session_writer(sid, root).expect("open writer");
+        for _ in 0..5 {
+            let mut w = writer.lock().expect("lock");
+            let ev = AuditEvent::new(sid, "yolo", "classify", "i", "o", "r", 0);
+            w.append(&ev).expect("append");
+        }
+        drop(writer);
+        assert_eq!(count_events(sid, Some(root)), 5);
+    }
+
+    #[test]
+    fn file_size_returns_none_for_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(file_size("nope", Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn file_size_tracks_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let sid = "s_size";
+        let writer = session_writer(sid, root).expect("open writer");
+        {
+            let mut w = writer.lock().expect("lock");
+            w.append(&AuditEvent::new(sid, "yolo", "classify", "i", "o", "r", 0)).expect("append");
+        }
+        let size = file_size(sid, Some(root)).expect("size");
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn verify_events_detects_corrupt_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let sid = "s_verify_corrupt";
+        let audit_dir = root.join(AUDIT_DIR);
+        std::fs::create_dir_all(&audit_dir).expect("dir");
+        let path = audit_dir.join(format!("audit_{sid}.jsonl"));
+        std::fs::write(&path, "{not valid}\n").expect("write");
+        let result = verify_events(sid, Some(root));
+        assert_eq!(result.valid_count, 0);
+        assert_eq!(result.invalid_lines.len(), 1);
+        assert!(result.invalid_lines[0].error.as_ref().unwrap().contains("JSON"));
+    }
+
+    #[test]
+    fn verify_events_detects_missing_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let sid = "s_verify_missing";
+        let audit_dir = root.join(AUDIT_DIR);
+        std::fs::create_dir_all(&audit_dir).expect("dir");
+        let path = audit_dir.join(format!("audit_{sid}.jsonl"));
+        std::fs::write(&path, "{\"ts\":\"t1\",\"session_id\":\"s\",\"input_summary\":\"i\",\"outcome\":\"o\",\"rationale\":\"r\",\"duration_ms\":1}\n").expect("write");
+        let result = verify_events(sid, Some(root));
+        assert_eq!(result.valid_count, 0);
+        assert_eq!(result.invalid_lines.len(), 1);
+        let err = result.invalid_lines[0].error.as_ref().unwrap();
+        assert!(err.contains("agent") && err.contains("decision"));
+    }
+
+    #[test]
+    fn verify_events_passes_valid_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let sid = "s_verify_ok";
+        let writer = session_writer(sid, root).expect("open writer");
+        for _ in 0..3 {
+            let mut w = writer.lock().expect("lock");
+            w.append(&AuditEvent::new(sid, "yolo", "classify", "i", "o", "r", 0)).expect("append");
+        }
+        drop(writer);
+        let result = verify_events(sid, Some(root));
+        assert_eq!(result.valid_count, 3);
+        assert!(result.invalid_lines.is_empty());
+    }
+
+    #[test]
+    fn audit_file_path_returns_expected_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = audit_file_path("abc", Some(dir.path())).expect("path");
+        assert_eq!(path, dir.path().join(AUDIT_DIR).join("audit_abc.jsonl"));
     }
 }

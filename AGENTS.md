@@ -152,6 +152,8 @@ build.rs         注入 LAEW_BUILD_TIME / LAEW_GIT_HASH(供 --version)
 | `/offline` (`status`)| 查看连接状态(Online/Degraded/Offline 三态)与离线队列深度;D13 离线模式 |
 | `/workspace` (`ws`) | 查看工作区快照(D4):git 分支/未提交变更/工程类型与工具链建议/顶层结构/6h 内最近改动;`/workspace refresh` 强制失效 TTL 缓存重采集 |
 | `/export [path]`  | 导出当前会话为 Markdown（`.json` 后缀导出 JSON）；默认落工作目录 `laew-export-{时间戳}.md`，同名冲突自动 `-1` 后缀，显式路径已存在拒绝覆盖 |
+| `/tasks` (`todo`, `todos`) | 列出当前 session 的 TODO 任务清单(D19,2026-09-22 第 112 轮),表格形式(id/status/priority/content) |
+| `/audit` (`audits`) | D9-8 决策审计可视化(2026-09-22 第 113 轮):当前 session 的 5 决策点事件表格/统计/校验/清理。子命令:`/audit` 表格(最近 10 条),`/audit last [N]` 详情(默认 5,上限 50),`/audit stats` 按 (decision, agent) 分组聚合,`/audit verify` JSONL 完整性校验,`/audit clean [--keep N]` 清理旧 session 审计文件(默认保留 10)。TUI bootstrap 自动 trim,`/cost` 末尾追加审计摘要 |
 | `/commands`       | 列出已加载的自定义斜杠命令与来源 |
 | `/provider`       | 管理接入记录（默认进入 list 屏） |
 
@@ -222,6 +224,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/MCP_Web_Use/` — MCP_Web_Use 浏览器操控工具唯一最新方案:单步/连续双模式 + 35 写操作 + 14 观察维度 + page_id 生命周期 + CDP 下载管理(01-设计与解决方案)
 - `docs/浏览器CDP工具/` — chromiumoxide/CDP 底层技术参考:浏览器启动与接管、Target/Page/Runtime/DOM/Network/Browser 域、事件监听与跨平台实现
 - `docs/Context设置与自动压缩设计/` — ContextMaxSize 上下文上限(默认 800K,DB 迁移自动补全)+ Compact Agent(第 8 角色)三档自动压缩 设计与解决方案
+- `tmpPlan/2026-09-22_03-决策审计可视化与自动清理方案.md` — 第 113 轮 D9-8 决策审计可视化(/audit + /cost 集成 + 启动自动 trim)
 - `docs/工作区感知与运行时环境注入/` — D4 工作区感知:懒刷新快照(git 分支/变更计数/工程类型与工具链建议/顶层结构/最近改动)+ 8 角色 system brief + PROJECT_CONTEXT 工作区段 + TUI 横幅·`/workspace`·任务后变更对比
 - `docs/自签名证书TLS适配/` — IP + 自签名证书 HTTPS 网关适配:TLS 三级校验策略(IP 自动放宽 / LAEW_TLS_INSECURE 全局开关)、跨平台一致性(rustls)、真实端点集成验证(tests/tls_self_signed.rs)
 - `docs/协议抓包/` — 各 Agent 真实 HTTP 抓包（RequestBody/ResponseBody）。**codex 走 responses 接口仅参考请求**，其余为主要参考

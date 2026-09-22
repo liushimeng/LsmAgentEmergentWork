@@ -28,6 +28,7 @@ use crate::config::{Db, Paths};
 use crate::llm::{client_from_record, ChatMessage, Connectivity, ConnectivityTracker};
 use crate::session::Session;
 
+pub mod audit_view;
 pub mod branches;
 pub mod commands;
 pub mod completion;
@@ -121,6 +122,15 @@ impl TuiSession {
     /// `launch` 携带横幅「启动时间」「日志文件」行数据(第 72 轮)。
     pub fn bootstrap_with_debug(debug: bool, launch: TuiLaunch) -> Result<Self> {
         let paths = Paths::detect().map_err(anyhow::Error::from)?;
+        // D9-8 决策审计自动清理(2026-09-22 第 113 轮):TUI bootstrap 末尾清理旧 session
+        // 审计文件,保留最近 10 个。fail-open:清理失败仅 eprintln! 不阻塞 TUI 启动。
+        // 对齐 openclaw cron-store-runtime 后台清理理念。
+        if let Err(e) = crate::agent::decision_audit::trim_audit_files(
+            &paths.root_dir,
+            crate::tui::audit_view::DEFAULT_KEEP_SESSIONS,
+        ) {
+            eprintln!("[laew] 启动时清理审计文件失败(忽略): {e}");
+        }
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
         let db = Arc::new(Mutex::new(db));
         let plans_dir = paths.root_dir.join("plans");

@@ -184,6 +184,10 @@ impl TuiSession {
             "tasks" | "todo" | "todos" => {
                 self.run_tasks();
             }
+            // D9-8 决策审计可视化(2026-09-22 第 113 轮):表格/统计/校验/清理 + 二级子命令。
+            "audit" | "audits" => {
+                self.run_audit(rest_args);
+            }
             // D4 工作区感知(2026-09-13):查看/刷新工作区快照。
             "workspace" | "ws" => {
                 self.run_workspace(rest_args);
@@ -370,6 +374,21 @@ impl TuiSession {
                 .unwrap_or("<未配置>");
             println!("    模型 {name} 无内置参考价,仅统计 token。");
         }
+        // D9-8 决策审计摘要(2026-09-22 第 113 轮):在 /cost 末尾追加 3 行,提示审计事件数 + 落盘路径。
+        // 复用 audit_view::count_events 的快速路径(<5ms),不影响 /cost 性能。
+        let sid = &self.session.id;
+        let root_dir = Some(self.paths.root_dir.as_path());
+        let event_count = super::audit_view::count_events(sid, root_dir);
+        let size_kb = super::audit_view::file_size(sid, root_dir)
+            .map(|n| n as f64 / 1024.0)
+            .unwrap_or(0.0);
+        println!("    ─── 决策审计(D9-8)───");
+        if event_count == 0 {
+            println!("    (本会话无决策审计事件;详见 /audit)");
+        } else {
+            println!("    事件总数: {} (5 决策点),落盘 {:.1} KB", event_count, size_kb);
+            println!("    路径: AuditTrail/audit_{}.jsonl(查看: /audit)", sid);
+        }
     }
 
     /// `/workspace [refresh|ws]`(D4,2026-09-13 第 01 轮):查看工作区快照。
@@ -396,6 +415,104 @@ impl TuiSession {
         println!("  任务清单(/tasks): {summary}");
         println!();
         println!("{}", self.todo_state.render_table());
+    }
+
+    /// `/audit [subcmd]`(D9-8 决策审计可视化,2026-09-22 第 113 轮)。
+    ///
+    /// 子命令:
+    /// - (无)            → 表格列出最近 10 条事件
+    /// - `last [N]`      → 最近 N 条详细(默认 5,上限 50)
+    /// - `stats`         → 按 (decision, agent) 分组聚合
+    /// - `verify`        → JSONL 完整性校验
+    /// - `clean [--keep N]` → 清理旧 session 审计文件(默认保留 10)
+    /// - `help`          → 子命令帮助
+    ///
+    /// 数据源:`<root_dir>/AuditTrail/audit_{session_id}.jsonl`
+    /// 由 `decision_audit` 模块在 5 个决策点(Yolo/Plan/Main/QC/Compact)
+    /// 自动追加写入,本命令只读不写,无副作用。
+    fn run_audit(&self, rest_args: &str) {
+        use super::audit_view::{
+            self, AuditSubcmd, DEFAULT_KEEP_SESSIONS, DEFAULT_TABLE_LIMIT,
+        };
+
+        let subcmd = AuditSubcmd::parse(rest_args);
+        let sid = &self.session.id;
+        let root_dir = Some(self.paths.root_dir.as_path());
+
+        match subcmd {
+            AuditSubcmd::Help => {
+                println!("  /audit 决策审计可视化(D9-8,2026-09-22 第 113 轮)");
+                println!();
+                println!("{}", audit_view::help_text());
+            }
+            AuditSubcmd::Table => {
+                let events = audit_view::load_events(sid, root_dir);
+                if events.is_empty() {
+                    println!("  (本会话无决策审计事件)");
+                    println!("  提示:Yolo / Plan / Main-Work / QC / Compact 在决策时会自动写入");
+                    println!("    {}/AuditTrail/audit_{}.jsonl",
+                        self.paths.root_dir.display(), sid);
+                    return;
+                }
+                let count = events.len();
+                let rows = audit_view::load_recent_rows(sid, root_dir, DEFAULT_TABLE_LIMIT);
+                let size_kb = audit_view::decision_audit::file_size(sid, root_dir)
+                    .map(|n| n as f64 / 1024.0)
+                    .unwrap_or(0.0);
+                println!("  决策审计(/audit):{} 事件,落盘 {:.1} KB (默认显示最近 {} 条)",
+                    count, size_kb, DEFAULT_TABLE_LIMIT);
+                println!("  数据源: AuditTrail/audit_{}.jsonl", sid);
+                println!();
+                print!("{}", audit_view::format_event_table(&rows));
+            }
+            AuditSubcmd::Last(n) => {
+                let events = audit_view::load_events(sid, root_dir);
+                if events.is_empty() {
+                    println!("  (本会话无决策审计事件)");
+                    return;
+                }
+                let take = n.min(events.len());
+                let start = events.len() - take;
+                println!("  决策审计详情(/audit last {}):", take);
+                println!();
+                for ev in &events[start..] {
+                    print!("{}", audit_view::format_event_detail(ev));
+                    println!();
+                }
+            }
+            AuditSubcmd::Stats => {
+                let events = audit_view::load_events(sid, root_dir);
+                if events.is_empty() {
+                    println!("  (本会话无决策审计事件)");
+                    return;
+                }
+                println!("  决策审计统计(/audit stats):{} 事件", events.len());
+                println!();
+                let stats = audit_view::aggregate_stats(&events);
+                print!("{}", audit_view::format_stats_table(&stats));
+            }
+            AuditSubcmd::Verify => {
+                let summary = audit_view::run_verify(sid, root_dir);
+                println!("  决策审计校验(/audit verify):");
+                println!();
+                print!("{}", audit_view::format_verify_summary(&summary));
+            }
+            AuditSubcmd::Clean(keep) => {
+                let (removed, kept) = audit_view::handle_clean(root_dir, keep);
+                if removed == 0 && kept == 0 {
+                    println!("  无法定位审计根目录");
+                    return;
+                }
+                println!("  决策审计清理(/audit clean):");
+                println!("    已清理 {} 个旧审计文件,保留 {} 个 session",
+                    removed, kept);
+                if keep != DEFAULT_KEEP_SESSIONS {
+                    println!("    (使用 --keep {} 覆盖默认 {})",
+                        keep, DEFAULT_KEEP_SESSIONS);
+                }
+                println!("    路径: {}", self.paths.root_dir.display());
+            }
+        }
     }
 
     fn run_workspace(&self, arg: &str) {
