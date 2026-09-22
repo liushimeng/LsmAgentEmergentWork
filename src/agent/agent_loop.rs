@@ -97,13 +97,16 @@ impl Agent {
         // UA 逐请求注入(2026-09-09 第 08 轮):让抓包层面 8 角色各自可辨识;
         // meta.user_agent 为空时协议层回退到客户端构造期默认 UA(见 RequestMeta::resolve_user_agent)。
         meta.user_agent = self.profile.user_agent();
-        // 结构化输出强制通道(L6/L19,2026-09-09 第 13 轮):profile 声明了 emit 工具时
-        // 注入 forced tool_choice(协议层指名调用),模型必须以 tool_use 返回结构化结果;
-        // `LAEW_FORCED_TOOLS=off` 可全局关闭(仅关 wire 注入,循环短路逻辑保留,
-        // 模型若仍主动调用 emit 工具也会被接住)。
-        if forced_tools_enabled() {
-            meta.forced_tool = self.profile.emit_tool.clone();
-        }
+        // 结构化输出强制通道(L6/L19 + 2026-09-22 Yolo ReAct 延迟强制):
+        // 默认(Quality-Check 等 defer_emit_force=false):每轮注入 forced tool_choice,
+        //   模型必须以 tool_use 返回结构化结果(单轮强制);
+        // Yolo(defer_emit_force=true):探索轮(非最后一轮)不强制 —— ReAct 循环需要
+        //   模型自由调用信息收集工具,强制指名 emit 会把多轮探索压成 1 轮直答;
+        //   仅最后一轮强制 emit 收口,保证迭代预算耗尽前必得结构化结果。
+        // 收口保底细节见 §3.3 of docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md。
+        // 实际强制注入在循环每轮开始时按 iter 决策(meta 在此 pre-loop 阶段不预置,
+        // 避免循环外只设一次与最后一轮策略分歧)。`LAEW_FORCED_TOOLS=off` 可全局关闭
+        // (仅关 wire 注入,循环短路逻辑保留)。
         let mut total_usage = Usage::default();
         let mut accumulated_text = String::new();
         let mut truncation_resumes: usize = 0;
@@ -194,6 +197,18 @@ impl Agent {
                 }
             }
             debug!(iteration = iter, "agent step");
+            // 2026-09-22 Yolo ReAct 延迟强制 —— 每轮决策 forced_tool:
+            // 探索轮(非最后一轮)留空(model 可自由 ReAct),末轮注入 emit(收口保底)。
+            meta.forced_tool = match self.profile.emit_tool.as_deref() {
+                Some(emit) if forced_tools_enabled() => {
+                    if self.profile.defer_emit_force && iter + 1 < self.max_iterations {
+                        None
+                    } else {
+                        Some(emit.to_string())
+                    }
+                }
+                _ => None,
+            };
             // runtime hints 拼接(2026-09-09 第 09 轮,联动 L771 失败计数预警):
             // 仅在对应计数器 > 0 时追加,全 0 时返回空串,不影响 LLM 上下文;
             // 拼到 system 末尾,不破坏 cache_control 缓存前缀。
@@ -205,10 +220,26 @@ impl Agent {
             // 空目录返回空串,不改变既有 system 语义。
             let workspace_hint = crate::agent::workspace::hint_block();
             let runtime_hints = build_runtime_hints(&trace, consecutive_failures);
-            let system = if workspace_hint.is_empty() && runtime_hints.is_empty() {
+            // 2026-09-22 Yolo ReAct 收口预告:倒数第二轮(Yolo defer 模式 + forced_tools 开)
+            // 提示模型下轮会被强制收口,给其主动平滑交卷的机会,避免被硬强制时缺字段。
+            let deadline_hint = if self.profile.defer_emit_force
+                && self.profile.emit_tool.is_some()
+                && forced_tools_enabled()
+                && iter + 2 == self.max_iterations
+            {
+                "\n\n【收口提示】迭代预算即将耗尽(下一轮为最终轮,系统将强制要求提交 \
+                 submit_task_classification)。请立即停止新的探索,基于已收集的信息直接调用 \
+                 submit_task_classification 提交分类结果。"
+            } else {
+                ""
+            };
+            let system = if workspace_hint.is_empty()
+                && runtime_hints.is_empty()
+                && deadline_hint.is_empty()
+            {
                 base_system
             } else {
-                format!("{base_system}{workspace_hint}{runtime_hints}")
+                format!("{base_system}{workspace_hint}{runtime_hints}{deadline_hint}")
             };
             // LLM 请求(2026-09-17 第 70 轮运行日志):--debug 级记录每轮请求元信息,
             // 排查「模型看到了什么」(消息条数/system 规模/强制工具/输出上限)。
