@@ -686,27 +686,36 @@ echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "4j-2 forced 被拒后降级
 python3 - "$FT2_MOCK_LOG" <<'PYEOF' 2>&1 | tee -a "$REPORT"
 import json, sys
 reqs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+def system_of(body):
+    s = body.get("system")
+    if isinstance(s, list):
+        s = "\n".join(p.get("text", "") for p in s if isinstance(p, dict))
+    return s if isinstance(s, str) else ""
+
+def all_bodies():
+    return [r["body"] for r in reqs]
+
 def yolo_reqs():
-    out = []
-    for r in reqs:
-        s = r["body"].get("system")
-        if isinstance(s, list):
-            s = "\n".join(p.get("text", "") for p in s if isinstance(p, dict))
-        elif not isinstance(s, str):
-            s = ""
-        if "LsmAgentEmergentWork-Yolo" in s:
-            out.append(r["body"])
-    return out
+    return [b for b in all_bodies() if "LsmAgentEmergentWork-Yolo" in system_of(b)]
 ok = True
 def chk(cond, name):
     global ok
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
     ok = ok and cond
 ys = yolo_reqs()
-chk(len(ys) == 2, f"Yolo 请求恰好 2 次(forced 拒绝 + 降级 auto 重试,实际 {len(ys)})")
-if len(ys) == 2:
-    chk((ys[0].get("tool_choice") or {}).get("type") == "tool", "第 1 次携带 forced tool_choice(被拒)")
-    chk("tool_choice" not in ys[1], f"第 2 次降级后不携带 tool_choice(实际 {ys[1].get('tool_choice')})")
+# 第 120 轮修正陈旧断言:第 119 轮 Yolo 改「延迟强制」后,Yolo **首轮本就不带** forced
+# tool_choice(探索轮 auto)→ mock 的 --reject-tool-choice 无从拒绝 → Yolo 恒 1 次请求。
+# 「forced 被拒 → resilient 降级 auto 重试」这条链路现在只有 **Quality-Check** 会走到
+# (QC 每轮强制指名 submit_quality_report)。原断言盯 Yolo 是自第 119 轮起的存量失败。
+chk(len(ys) == 1, f"Yolo 请求恰好 1 次(延迟强制:首轮无 forced,mock 不拒绝,实际 {len(ys)})")
+if ys:
+    chk("tool_choice" not in ys[0] or (ys[0].get("tool_choice") or {}).get("type") != "tool",
+        f"Yolo 探索轮不携带 forced tool_choice(实际 {ys[0].get('tool_choice')})")
+qcs = [b for b in all_bodies() if "LsmAgentEmergentWork-Quality-Check" in system_of(b)]
+chk(len(qcs) == 2, f"Quality 请求恰好 2 次(forced 被拒 + 降级 auto 重试,实际 {len(qcs)})")
+if len(qcs) == 2:
+    chk((qcs[0].get("tool_choice") or {}).get("type") == "tool", "QC 第 1 次携带 forced tool_choice(被拒)")
+    chk("tool_choice" not in qcs[1], f"QC 第 2 次降级后不携带 tool_choice(实际 {qcs[1].get('tool_choice')})")
 sys.exit(0 if ok else 1)
 PYEOF
 check $? "4j-2 wire 断言:第一次 forced 被拒 → 第二次降级无 tool_choice"
@@ -1180,6 +1189,173 @@ fi
 kill $CUSTOM_MOCK_PID 2>/dev/null
 rm -f "$CUSTOM_ROUTER"
 run "$LAEW" provider delete "$ID_CUSTOM" >/dev/null 2>&1
+run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
+
+
+# --- 4p. SubAgent-Work ReAct 强化与工具连续工作模式端到端(第 120 轮,2026-09-23) ---
+# 设计见 docs/SubAgentWork执行层ReAct与连续工作模式/01-设计与解决方案.md
+# 4p-1: mock 路由让 SubAgent 连续 5 轮发起**完全相同**的 Read(同参数 + 同文件内容)
+#       → LoopGuard 进展键(工具 + 参数稳定 JSON + 结果摘要)连续命中 →
+#       第 2 次软提醒 / 第 3 次宽限轮强提醒 / 第 4 次无进展止损,**不跑满 32 轮预算**。
+#       断言:SubAgent 请求恰好 4 次 + 第 3 次 system 含【无进展警告】+
+#             第 4 次 messages 含「宽限轮」强提醒(user 消息,保证送达 LLM)。
+# 4p-2: 断言 SubAgent wire system 含本轮新增的「执行循环(ReAct 模式)」与
+#       「连续工作模式」两节 —— 提示词真的送达 Provider,而非只写在源码里。
+# 4p-3: LAEW_REACT_GUARD=off 重跑同一 router → 不再无进展止损(开关可回退),
+#       SubAgent 请求数显著多于 4(改由 no_text_converge / max_iterations 兜底)。
+# 注:同批只读工具**并发执行**由单元测试覆盖(mock 每轮只发一个 tool_use 块,
+#     无法在 wire 层构造同批多调用):
+#     agent::react_tests::parallel_readonly_batch_preserves_order
+#     agent::tool_exec::tests::{readonly_run_of_two_or_more_forms_batch,
+#                               parallel_batch_returns_results_by_index}
+section "4p. SubAgent-Work ReAct 与连续工作模式端到端(第 120 轮)"
+REACT_ROUTER="testReport/router-react-$RUN_ID.json"
+cat > "$REACT_ROUTER" <<'JSON'
+{
+  "rules": [
+    {
+      "keywords": ["LAEW无进展止损验证"],
+      "tools": [
+        {"tool": "Read", "args": {"file_path": "Cargo.toml"}},
+        {"tool": "Read", "args": {"file_path": "Cargo.toml"}},
+        {"tool": "Read", "args": {"file_path": "Cargo.toml"}},
+        {"tool": "Read", "args": {"file_path": "Cargo.toml"}},
+        {"tool": "Read", "args": {"file_path": "Cargo.toml"}}
+      ],
+      "yolo": {
+        "task_level": "simple",
+        "goal_summary": "LAEW无进展止损验证:重复读取 Cargo.toml",
+        "purpose": "验证 ReAct 循环守卫的无进展止损",
+        "intent": "file_operation",
+        "agent_role": "subagent",
+        "decomposition_plan": ["重复读取 Cargo.toml"]
+      }
+    }
+  ]
+}
+JSON
+REACT_MOCK_LOG="testReport/mock_requests-react-$RUN_ID.jsonl"
+REACT_OFF_LOG="testReport/mock_requests-react-off-$RUN_ID.jsonl"
+REACT_MOCK_PORT=18907
+REACT_OFF_PORT=18908
+python3 scripts/mock_llm_server.py $REACT_MOCK_PORT "$REACT_MOCK_LOG" --prompt-router-file "$REACT_ROUTER" &>/dev/null &
+REACT_MOCK_PID=$!
+python3 scripts/mock_llm_server.py $REACT_OFF_PORT "$REACT_OFF_LOG" --prompt-router-file "$REACT_ROUTER" &>/dev/null &
+REACT_OFF_PID=$!
+sleep 0.8
+run "$LAEW" provider add --protocol anthropic --provider-name react-on --model-name m-react-on \
+  --end-point "http://127.0.0.1:$REACT_MOCK_PORT" --api-key sk-react-on >/dev/null 2>&1
+run "$LAEW" provider add --protocol anthropic --provider-name react-off --model-name m-react-off \
+  --end-point "http://127.0.0.1:$REACT_OFF_PORT" --api-key sk-react-off >/dev/null 2>&1
+ID_REACT_ON=$(run "$LAEW" provider list 2>/dev/null | grep react-on | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+ID_REACT_OFF=$(run "$LAEW" provider list 2>/dev/null | grep react-off | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
+
+# --- 4p-1 / 4p-2:守卫开启(默认) ---
+run "$LAEW" provider use "$ID_REACT_ON" >/dev/null 2>&1
+OUT=$(run "$LAEW" -p "LAEW无进展止损验证:反复读取 Cargo.toml 直到我让你停")
+echo "$OUT" | grep -qE "任务收口|outcome|用量"; check $? "4p-1 无进展止损后任务仍正常收口(不崩溃)"
+python3 - "$REACT_MOCK_LOG" <<'PYEOF' 2>&1 | tee -a "$REPORT"
+import json, sys
+reqs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+ok = True
+def chk(cond, name):
+    global ok
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+    ok = ok and cond
+
+def system_of(body):
+    s = body.get("system")
+    if isinstance(s, list):
+        s = "\n".join(p.get("text", "") for p in s if isinstance(p, dict))
+    return s if isinstance(s, str) else ""
+
+def all_text(body):
+    """请求体全文(system + messages),用于断言 user 消息里的宽限轮强提醒。"""
+    return system_of(body) + "\n" + json.dumps(body.get("messages", []), ensure_ascii=False)
+
+sub = [r["body"] for r in reqs if "LsmAgentEmergentWork-SubAgent-Work" in system_of(r["body"])]
+# 软提醒锚点必须取**运行时 hint 独有**的整句:提示词里也提到「无进展警告」四个字
+# (告知模型止损规则),用它做锚点会假阳性。
+NUDGE = "重复同一动作不会产生新信息"
+GRACE = "无进展止损宽限轮"
+# 4p-1:每次单元尝试的轮次结构固定为 4 轮 ——
+#   轮 1 Read(repeats=1 有进展) / 轮 2 Read(repeats=2 → 软提醒入队) /
+#   轮 3 system 带软提醒,Read(repeats=3 → 宽限轮强提醒推 user 消息) /
+#   轮 4 messages 带强提醒,Read(repeats=4 → 止损终止)。
+# 止损后 QC 判 Fail → 单元级局部重试 + 档位级重试会**重放整条链**,所以总数是
+# 4 × 尝试次数(实测 9 次尝试 = 36 次请求),不是 4。断言按「每 4 个一组」校验:
+# 若守卫失效,每次尝试会跑满 32 轮 → 组数与软提醒数对不上,且总数暴涨。
+groups, nudges = len(sub) // 4, sum(1 for b in sub if NUDGE in system_of(b))
+chk(len(sub) >= 4, f"SubAgent 至少跑完一次尝试(实际 {len(sub)} 次请求)")
+chk(len(sub) % 4 == 0, f"每次尝试恰好 4 轮止损(总请求数应为 4 的倍数,实际 {len(sub)})")
+chk(nudges == groups and groups > 0,
+    f"每次尝试都触发过 1 次软提醒(尝试 {groups} 组 / 软提醒 {nudges} 次;守卫失效则为 0)")
+chk(len(sub) <= 4 * 12, f"总请求数未暴涨(守卫失效会跑满 32 轮/尝试,实际 {len(sub)})")
+if len(sub) >= 4:
+    # 首次尝试的逐轮结构(提醒分级送达 + 配对安全)
+    chk(NUDGE not in system_of(sub[0]), "轮 1 不该有无进展软提醒(首次出现该动作)")
+    chk(NUDGE not in system_of(sub[1]), "轮 2 刚判定重复,提醒在**下一轮**才注入")
+    chk(NUDGE in system_of(sub[2]), "轮 3 system 含无进展软提醒(经 RUNTIME_HINTS 送达)")
+    chk("LAEW:RUNTIME_HINTS" in system_of(sub[2]),
+        "软提醒包裹在 <<<LAEW:RUNTIME_HINTS>>> 标记内(不破坏 cache 前缀)")
+    # 宽限轮强提醒必须作为 **user 消息**出现在轮 4(且只能在 tool_result 全部回填之后,
+    # 否则会破坏 assistant tool_use ↔ tool_result 配对被 Provider 400)
+    chk(GRACE in all_text(sub[3]), "轮 4 含宽限轮强提醒(user 消息,保证送达 LLM)")
+# 止损结论必须流到下游(QC / Yolo 回流)才形成闭环,而不是只在循环内部静默终止。
+# 锚点用 early_terminate_reason 的完整值 `doom_loop_no_progress`:弱信号 `doom_loop:Nx`
+# 在守卫关闭时**按设计仍会统计**(可观测性不丢),用它做锚点分不清「止损了」和「只是数了数」。
+chk(any("doom_loop_no_progress" in json.dumps(r["body"], ensure_ascii=False) for r in reqs),
+    "止损原因 doom_loop_no_progress 进入下游请求(QC 证据链 / 失败回流可见)")
+# 4p-2:ReAct 提示词真的送达 wire
+if sub:
+    s0 = system_of(sub[0])
+    chk("执行循环(ReAct 模式)" in s0, "SubAgent system 含「执行循环(ReAct 模式)」节")
+    chk("Thought(推理)" in s0 and "Observation(观察)" in s0,
+        "SubAgent system 含 Thought / Observation 三段规范")
+    chk("连续工作模式" in s0, "SubAgent system 含「连续工作模式」节")
+    chk("保序串行" in s0, "SubAgent system 说明有副作用调用保序串行(与运行时一致)")
+else:
+    chk(False, "未见 SubAgent-Work 请求")
+sys.exit(0 if ok else 1)
+PYEOF
+check $? "4p-1/4p-2 wire 断言:无进展止损 4 轮收口 + 提醒分级送达 + ReAct 提示词在 wire 上"
+
+# --- 4p-3:LAEW_REACT_GUARD=off 回退 ---
+run "$LAEW" provider use "$ID_REACT_OFF" >/dev/null 2>&1
+# 子壳内 export:`VAR=x run …`(函数前缀赋值)在 POSIX 下行为未定义,不可靠
+OUT=$(export LAEW_REACT_GUARD=off; run "$LAEW" -p "LAEW无进展止损验证:反复读取 Cargo.toml 直到我让你停")
+python3 - "$REACT_OFF_LOG" <<'PYEOF' 2>&1 | tee -a "$REPORT"
+import json, sys
+reqs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+ok = True
+def chk(cond, name):
+    global ok
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+    ok = ok and cond
+def system_of(body):
+    s = body.get("system")
+    if isinstance(s, list):
+        s = "\n".join(p.get("text", "") for p in s if isinstance(p, dict))
+    return s if isinstance(s, str) else ""
+sub = [r["body"] for r in reqs if "LsmAgentEmergentWork-SubAgent-Work" in system_of(r["body"])]
+NUDGE = "重复同一动作不会产生新信息"
+chk(len(sub) > 4, f"守卫关闭后不再 4 轮止损(实际 {len(sub)} 次,由 no_text_converge/max_iterations 兜底)")
+chk(all(NUDGE not in system_of(b) for b in sub),
+    "守卫关闭后 system 不再出现无进展软提醒(LAEW_REACT_GUARD=off 真的生效)")
+# 注:弱信号 `doom_loop:Nx` 仍会出现(守卫关闭只停「干预」,不停「统计」),
+# 所以这里断言的是**没有真的止损**(early_terminate_reason 不含 doom_loop_no_progress)。
+chk(not any("doom_loop_no_progress" in json.dumps(r["body"], ensure_ascii=False) for r in reqs),
+    "守卫关闭后不再真的止损(下游无 doom_loop_no_progress 早终止结论)")
+sys.exit(0 if ok else 1)
+PYEOF
+check $? "4p-3 wire 断言:LAEW_REACT_GUARD=off 可回退到第 119 轮行为"
+
+kill $REACT_MOCK_PID 2>/dev/null; wait $REACT_MOCK_PID 2>/dev/null
+kill $REACT_OFF_PID 2>/dev/null; wait $REACT_OFF_PID 2>/dev/null
+sleep 0.2
+rm -f "$REACT_ROUTER" "$REACT_MOCK_LOG" "$REACT_OFF_LOG"
+run "$LAEW" provider delete "$ID_REACT_ON" >/dev/null 2>&1
+run "$LAEW" provider delete "$ID_REACT_OFF" >/dev/null 2>&1
 run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 
 

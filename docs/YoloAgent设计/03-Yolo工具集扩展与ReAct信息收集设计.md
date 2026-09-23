@@ -284,8 +284,14 @@ let yolo = Agent::new(llm, AgentProfile::yolo_profile())
    适用 defer 模式可让 QC 在合规判定前先看产物。需在 Yolo 上验证稳态后推广。
 2. **`TaskClassification.evidence: Vec<String>`**:ReAct 收集到的关键事实下游可见,
    减少 Main-Work 重复收集;代价是 emit schema + 全量构造器字段扩展,本轮保守不动。
-3. **`build_runtime_hints` 角色化**:把 explore_budget 文案参数化,按 profile 选择
-   浏览器/桌面/Yolo 信息收集三种文案;现在用 `with_explore_budget(0)` 绕开。
+3. ~~**`build_runtime_hints` 角色化**:把 explore_budget 文案参数化,按 profile 选择
+   浏览器/桌面/Yolo 信息收集三种文案;现在用 `with_explore_budget(0)` 绕开。~~
+   **✅ 已于第 120 轮(2026-09-23)落地**:`runtime_hints.rs` 新增
+   `HintRole{Ui,Execute,Gather,Judge}` + `RuntimeHintCtx` + `build_runtime_hints_with`,
+   explore_budget 耗尽文案按角色分叉,角色由 `AgentProfile::hint_role(trace)` 派生
+   (Yolo → `Gather`)。Yolo 侧仍保留 `with_explore_budget(0)` —— 信息收集阶段本就不该
+   被「进入执行期」打断,角色化解决的是**执行层**收到浏览器文案的语义误导(D5)。
+   见 `docs/SubAgentWork执行层ReAct与连续工作模式/01-设计与解决方案.md` §3.4。
 4. **structured-output guarantee 防 degrade 后探索**:resilient `forced_tool_rejected`
    一旦置位后,后续全 auto。若模型当轮拒绝提交 emit,后续轮可能无限探索——可加
    per-session 的「once-rejected 显式提示」类补救。

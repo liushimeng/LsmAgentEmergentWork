@@ -25,6 +25,7 @@ pub mod dynamic_subagent;
 pub mod extrace;
 pub mod human_assist;
 pub mod json_repair;
+pub mod loop_guard;
 pub mod main_work;
 pub mod max_tokens_state;
 pub mod memory;
@@ -47,6 +48,7 @@ pub mod session_fork;
 pub mod subagent_workflow;
 pub mod subagent;
 pub mod system_prompt;
+pub mod tool_exec;
 pub mod tool_schema_validator;
 pub mod tools;
 pub mod window;
@@ -58,13 +60,24 @@ pub mod todo_state;
 
 #[cfg(test)]
 mod tests;
+// 第 120 轮:SubAgent-Work ReAct 强化与工具连续工作模式用例。
+// 放同级兄弟文件而非把 tests.rs 转成 tests/ 目录 —— `.gitignore` 的 `tests/` 规则
+// 匹配任意层级目录,会把 `src/agent/tests/` 静默排除出版本库(详见该文件模块文档)。
+#[cfg(test)]
+mod react_tests;
 
-// 运行时辅助项再导出:保持拆分前 `crate::agent::Xxx` 路径对外完全兼容
+// 运行时辅助项再导出:保持拆分前 `crate::agent::Xxx` 路径对外完全兼容。
+// 第 120 轮:两参薄封装只剩单测在用(生产路径走 `build_runtime_hints_with`),
+// 用 `cfg(test)` 限定,避免非测试构建报 unused import。
+#[cfg(test)]
 pub(crate) use runtime_hints::build_runtime_hints;
 // 原私有辅助:经本模块命名空间供 agent_loop / tests 子模块 `use super::*` 取用
 use runtime_hints::{
-    forced_tools_enabled, forced_tools_enabled_from, is_truncation_stop_reason, stable_json_string,
+    build_runtime_hints_with, forced_tools_enabled, forced_tools_enabled_from,
+    is_truncation_stop_reason, stable_json_string, RuntimeHintCtx,
 };
+// 第 120 轮 ReAct 循环守卫:无进展检测(doom_loop)+ 双阈值止损
+use loop_guard::{abort_fallback_text, LoopGuard, LoopVerdict};
 
 use std::sync::Arc;
 

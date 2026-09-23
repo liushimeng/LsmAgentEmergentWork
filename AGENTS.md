@@ -39,6 +39,9 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 | `LAEW_ALLOW_PRIVATE_ENDPOINT` | `1` | SSRF 防护放行私网/loopback endpoint（本地 Ollama / 局域网 / mock 测试 provider 用；默认拦截，见 `src/agent/safety/url_safety.rs`） |
 | `LAEW_BASH_UTF8` | `1`/`true`/`yes`/`on` | Bash 工具为子进程注入 UTF-8 环境（`PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8`/`LC_ALL=C.UTF-8`），消除 Windows 区域设置(GBK)导致的 python/coreutils 输出乱码；默认关闭。行尾(CRLF)不受影响，精确 diff 场景脚本仍需 `reconfigure(newline=...)`，见 `src/agent/tools/bash.rs`（2026-09-13 第 50 轮新增） |
 | `LAEW_AUDIT` | `off`/`0`/`false`/`no` | 关闭决策审计写入（默认开启）。开启时 5 个决策点（Yolo 分类 / Plan 规划 / Main-Work 拆解 / QC 判定 / Compact 压缩）各追加一条结构化 JSON 行到根目录 `AuditTrail/audit_{session_id}.jsonl`（已 gitignore），记录「输入上下文→决策结论→决策依据」三段式 + 耗时/token/扩展字段，全字段脱敏截断，fail-open 不影响主流程。见 `src/agent/decision_audit.rs`（2026-09-19 D9-8 新增） |
+| `LAEW_PARALLEL_TOOLS` | `off`/`0`/`false`/`no` | 关闭「同批只读工具并发执行」，回退到全串行（第 119 轮之前行为）。默认开启：同一 LLM 响应里**连续的** `parallel_safe` 调用（Read/Glob/Grep，段长 ≥2）并发执行，`tool_result` 仍按原序回填。见 `src/agent/tool_exec.rs`（2026-09-23 第 120 轮新增） |
+| `LAEW_MAX_PARALLEL_TOOLS` | 正整数（默认 `4`） | 单批并发上限；`0`/非法值回退默认。对齐 AtomCode `ATOMCODE_MAX_PARALLEL_TOOLS=4`（Claude Code 用 10，laew 单元迭代预算小取保守值）。见 `src/agent/tools/mod.rs::max_parallel_tools_from` |
+| `LAEW_REACT_GUARD` | `off`/`0`/`false`/`no` | 关闭 ReAct 循环守卫（无进展软提醒与 doom_loop 止损均不生效；`doom_loop_repeats` 仍统计，可观测性不丢）。默认开启：进展键 =「工具名 + 参数稳定 JSON + 结果摘要」三者全同即无进展，第 2 次软提醒 / 第 3 次宽限轮强提醒 / 第 4 次止损终止。见 `src/agent/loop_guard.rs`（2026-09-23 第 120 轮新增） |
 | `LAEW_SELF_SPAWN` | `off`/`0`/`false`/`no` | 关闭**自感知动态子 Agent**（默认开启）。关闭时不注册 `SubAgent` 工具、不注入自感知提示词段、不建运行时（工具面/提示词/耗时与改造前完全一致）。见 `src/agent/self_awareness.rs`（2026-09-22 第 114 轮新增） |
 | `LAEW_SUBAGENT_MAX_DEPTH` | 0..=3 | 动态子 Agent 嵌套层数上限，默认 `1`（子 Agent 为叶子，不能再启动）。`0` = 完全禁止（等价关闭）。 |
 | `LAEW_SUBAGENT_MAX_PARALLEL` | 1..=8 | 会话级并发槽位，默认 `3`（对齐 atomcode `Semaphore(3)`）。 |
@@ -61,6 +64,12 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
   - **Plan Agent**（`LsmAgentEmergentWork-Plan`）：规划层，仅在 hard 任务时启用；持 Read/Write 工具，输出 Markdown 方案到 `plans/{session_id}-{seq}.md`。
   - **Main-Work Agent**（`LsmAgentEmergentWork-Main-Work`）：流程层，接收 medium/hard 任务，拆 WorkFlow 列表；持 Bash/Read 工具。
   - **SubAgent-Work Agent**（`LsmAgentEmergentWork-SubAgent-Work`）：执行层最小单元，每个流程处理单元委派一个 SubAgent；持 Bash/Read/Write 全套工具。
+    **第 120 轮（2026-09-23）ReAct 强化 + 工具连续工作模式**：把第 119 轮做在入口层 Yolo 的 ReAct 补齐到执行层。
+    **(a) 提示词 ReAct 化**——`SUB_AGENT_BASE_PROMPT` 新增「## 执行循环(ReAct 模式)」节（Thought→Action→Observation 三段节奏 + 5 条硬性约束 + **明示无进展阈值**，模型不知道有止损机制时会以为可以无限重试），`sub_agent_tools_hint()` 新增「## 连续工作模式」节（把既有复合工具 `sequence`/`input_batch`/`batch`/`workflow`/`explore`/`TodoWrite` 与 ReAct 循环绑定），双协议 tail 改写。
+    **(b) 工具连续工作模式（执行侧真并发）**——`Tool::parallel_safe(args)` 参数感知分类（默认 `false` 零回归；只读三件套 Read/Glob/Grep 覆写 `true`，单测钉死防误开）+ `agent/tool_exec.rs` 把同一响应里**连续的** safe 段（≥2）用 `join_all` + `Semaphore(LAEW_MAX_PARALLEL_TOOLS，默认 4)` 并发跑完，**`tool_result` 仍按原序回填**（并发只改执行时序不改上下文时序，协议配对/orphan/emit 短路语义零变化）。根治「提示词承诺并行、运行时全串行」的契约不一致。
+    **(c) 无进展止损（doom_loop）**——`agent/loop_guard.rs` 进展键 = 工具名 + 参数稳定 JSON + **结果摘要**（is_error + 字节长度 + 头部 256 字符哈希）。与 opencode/DeepSeek/AtomCode 只用「工具+参数」的关键差异：**轮询等待类合法重复零误伤**（结果在变即判有进展）；`wait_like()` 让 wait/纯 sleep/`SubAgent(result|history)` 调用透明跳过（不计入也不打断链）。双阈值 `NUDGE_AT=2`（软提醒经 runtime hints 注入 system 末尾）/ `ABORT_AT=3`（宽限轮强提醒**作为 user 消息**推入，且必须延迟到本轮 tool_result 全部回填完，否则破坏配对被 Anthropic 400）/ 第 4 次止损。补齐既有三计数器的盲区（失败计数被成功重置、无文本计数要等第 8 轮）。
+    **(d) runtime hints 角色化**——`HintRole{Ui,Execute,Gather,Judge}` + `RuntimeHintCtx` + `build_runtime_hints_with`，根治「代码任务收到『去 click』的浏览器文案」；角色由 `AgentProfile::hint_role(trace)` 派生（**关键**：`builtin_registry()` 无条件含 `MCP_Web_Use`，静态看工具面会把所有代码单元判成 UI 任务，故 Ui/Execute 分叉改由「本单元**实际调用过**什么工具」决定）。新增三类 hint：迭代进度（预算过半）/ Thought 提醒（连续 2 轮静默，把原 8 轮阈值前移但**只提醒不终止**）/ **通用收口预告**（此前只有 Yolo 有，执行层闷头跑满预算被硬杀）。
+    **(e) 可观测**——`ExecutionTrace` 新增 `parallel_tool_batches`/`parallel_tool_calls`/`doom_loop_repeats`，`render_prompt()` 增 `- react: …` 行让 QC 一眼看出「连续工作模式用没用起来 / 有没有原地打转」，`collect_failure_signals` 增 `doom_loop:Nx` 弱信号。三开关 `LAEW_PARALLEL_TOOLS=off` / `LAEW_REACT_GUARD=off` / `LAEW_MAX_PARALLEL_TOOLS=N` 可即时回退。设计见 `docs/SubAgentWork执行层ReAct与连续工作模式/01-设计与解决方案.md`。
   - **Quality-Check Agent**（`LsmAgentEmergentWork-Quality-Check`）：质检层，每个执行单元完成后必经 QC；可选 Read 工具辅助。
   - **SessionContext Agent**（`LsmAgentEmergentWork-SessionContext`）：会话层，每次任务完成后汇总并写入 `session_memory` 表；无工具。
   - **Debug Agent**（`LsmAgentEmergentWork-Debug`）：调试层，仅在 `-debug` 调试模式下启用；任务结束后对采集的 trace（各 Agent LLM 调用输入输出 / Yolo 分类 / QC 结论 / 耗时与 token / 错误）做评估，产出「任务评估 / 质量报告 / 问题报告(P0-P2) / 优化建议」四章节；无工具。报告写入**根目录** `DebugReport/debug_report_{YYYYMMDD}_{HHMMSS}_{随机6位}.md`（已 gitignore，不入库）。设计见 `docs/Debug模式与DebugAgent设计/01-设计与解决方案.md`。
@@ -104,8 +113,10 @@ tui/
     provider_del.rs    /provider del  —— Picker + 二次确认
 agent/
   mod.rs       agent 域模块注册表 + Agent 结构体/构造器/访问器(协议无关循环的总装配)
-  agent_loop.rs Agent 核心循环实现:run_session(Session) → complete → tool_calls → 执行 → tool_result 回填 + 截断续接/溢出恢复
-  runtime_hints.rs Agent 循环运行时辅助:runtime hint 拼装/截断判定/首迭代强制工具开关/稳定 JSON 序列化
+  agent_loop.rs Agent 核心循环实现:run_session(Session) → complete → tool_calls → 分批并发执行 → tool_result **保序**回填 + 截断续接/溢出恢复 + ReAct 守卫接入/收口预告
+  tool_exec.rs 工具调用执行底座(第 120 轮):exec_tool_call 单条执行归一(Schema 预校验/取消竞争/错误归一) + plan_parallel_batches 连续 safe 段切批 + run_parallel_batches(join_all + Semaphore 限流)
+  loop_guard.rs ReAct 循环守卫(第 120 轮):无进展检测(doom_loop,进展键含 Observation 摘要) + NUDGE_AT=2/ABORT_AT=3 双阈值 + 宽限轮 + wait_like 等待类透明化
+  runtime_hints.rs Agent 循环运行时辅助:runtime hint 拼装(HintRole 角色化 + ReAct 进度/Thought/收口/无进展四类 hint)/截断判定/首迭代强制工具开关/稳定 JSON 序列化
   orchestrator/ MultiAgentOrchestrator 总编排器目录:mod.rs(结构体+入口+进度通道) / types.rs(共享类型) / pipeline.rs(handle_inner+三档链路) / workflows.rs(分层并行+run_wf_unit) / yolo_reflow.rs(Yolo 分类封装+失败回流) / usage.rs(用量累加) / tests.rs
   main_work/   Main-Work 流程层目录:mod.rs(MainWorkRunner) / spec.rs(WorkFlow 规格模型+宽松反序列化) / delegate.rs(委派推断 GUI 优先) / topo.rs(Kahn 分层+依赖治理) / parse.rs(JSON/Markdown 双通道解析) / tests.rs
   profile.rs   AgentProfile(名称 / 系统提示词 / 工具集 / spawn_policy) + work_profile()/yolo_profile()/dynamic_child() + User-Agent
@@ -234,6 +245,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/Agent身份与Session管理/` — AgentProfile / Session / 请求头 User-Agent·Authorization·X-Session-Id / Anthropic metadata.user_id 设计（01-设计与解决方案）
 - `docs/Agent系统提示词与工具架构重构/` — 系统提示词独立模块 + 工具迁移到 agent 域 设计文档
 - `docs/YoloAgent设计/` — 双 Agent 架构 / Yolo 入口层 / 任务四级分类 / 任务拆解 设计（01-设计与解决方案 / 02-系统提示词设计）
+- `docs/SubAgentWork执行层ReAct与连续工作模式/` — **第 120 轮(2026-09-23)**:执行层 ReAct 强化(Thought→Action→Observation 提示词化 + runtime hints 角色化 + 通用收口预告)+ 工具连续工作模式(`Tool::parallel_safe` 参数感知分类 + 分批并发 + 保序回填)+ 无进展止损(`loop_guard.rs` doom_loop,进展键含 Observation 摘要,轮询等待零误伤)+ 与 opencode/AtomCode/DeepSeek/Claude Code 的 gap 对应表与「决策不做」理由(01-设计与解决方案)
 - `docs/Yolo项目上下文注入/` — 项目说明文件五级链发现（CLAUDE.md→AGENTS.md→README.md→自动生成→空）+ 每会话首次注入 + 三步意图识别优化（01-设计与解决方案 / 02-技术实现文档）
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/自动化测试-提示词文件列表/` — 10 维度 × 100 组多轮对话测试脚本(知识问答/编码/代码理解/调试/文件处理/电脑使用/软件使用/界面设计/文档规划/laew 元任务),每条 3~5 轮追问,标注预期档位(simple/medium/hard),用于人工/自动化回归与 Yolo 分类验证
@@ -506,6 +518,7 @@ SCREEN=$(tmux capture-pane -p -t laew_e2e)
   - 单文件超线 → 转同名目录（`xxx.rs` → `xxx/mod.rs` + 职责子模块）；`mod.rs` 承载结构体定义 + 构造器/入口 + `pub use` 再导出，**外部 `crate::…::xxx::Yyy` 路径零改动**；
   - 原私有项搬入子模块标 `pub(super)`（可见域 = 本目录子树，与拆分前单文件作用域等价），由 `mod.rs` 私有 `use` 重导入供兄弟模块 `use super::*` 取用；
   - 代码**逐行机械搬移零改写**（不重构逻辑/注释），仅新增模块文档头与 `use super::*`；测试搬 `tests.rs`（mod.rs 声明 `#[cfg(test)] mod tests;`），拆分前后测试数必须对账一致；
+  - ⚠️ **`tests.rs` 不得转成 `tests/` 目录**：`.gitignore` 的 `tests/` 规则匹配**任意层级**的 tests 目录，`src/agent/tests/` 会被静默排除出版本库（本地编译通过、克隆后 `cargo test` 直接失败）。测试模块一律用 `xxx/tests.rs` **文件**；某个 `tests.rs` 自身超线时，把新用例放到**同级兄弟文件**（如 `src/agent/react_tests.rs` + `#[cfg(test)] mod react_tests;`），不要转目录（第 120 轮踩坑记录）；
   - 高速增长文件（近几轮每轮 +50 行以上）在破线前预防性拆分。已按此规范拆分：`src/tui/`（分层）、`src/agent/`（agent_loop + runtime_hints + tests 平铺拆分）、`agent/orchestrator/`、`agent/main_work/`、`agent/tools/window/`。
 - 新工具：在 `src/agent/tools/` 建同名模块实现 `Tool` trait，注册进 `builtin_registry()`（Work Agent）或相应 registry，Schema 参考 `docs/其他Agent工具定义/`。
 - 新协议：实现 `LlmClient` trait + `client_from_record()` 增加分支，不改动 agent 层。

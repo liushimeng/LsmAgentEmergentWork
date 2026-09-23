@@ -43,8 +43,67 @@ pub trait Tool: Send + Sync {
         ToolDef::new(self.name(), self.description(), self.parameters())
     }
 
+    /// 本次调用能否与**同一批**其它调用并发执行(第 120 轮「工具连续工作模式」)。
+    ///
+    /// 默认 `false` = 保序串行,与第 119 轮之前行为**逐字一致**(零回归基线)。
+    /// 仅「纯只读、无副作用、无跨调用共享状态」的工具覆写为 `true`
+    /// (当前:`Read` / `Glob` / `Grep`)。
+    ///
+    /// **参数感知**(对齐 AtomCode `parallel_safe(args)` / Claude Code
+    /// `isConcurrencySafe`):同一工具可按 `args` 决定能否并发。本轮所有
+    /// 有副作用或独占物理资源的工具一律 `false` —— Bash(子进程副作用 +
+    /// 命令间可能有隐式顺序)、Write/Edit(落盘)、TodoWrite(共享 Mutex 状态)、
+    /// SubAgent(内部已自带 `buffer_unordered` 并发)、MCP_Web_Use /
+    /// MCP_Window_Use(浏览器单实例 / 桌面单前台焦点,物理上不可并发)。
+    ///
+    /// 编排侧见 `agent_loop.rs` 的分批并发执行:只有**连续的** `true` 段且
+    /// 段长 ≥ 2 才进并发批,其余走原串行路径。
+    fn parallel_safe(&self, _args: &Value) -> bool {
+        false
+    }
+
     /// 执行工具
     async fn execute(&self, args: Value) -> Result<String>;
+}
+
+/// 同批只读工具并发执行总开关(第 120 轮「工具连续工作模式」)。
+///
+/// 环境变量 `LAEW_PARALLEL_TOOLS=off|0|false|no` 关闭并发,回退到第 119 轮的
+/// 全串行行为(对齐 `LAEW_FORCED_TOOLS` / `LAEW_INJECTION_GUARD` 惯例);默认开启。
+/// 关闭后 `Tool::parallel_safe` 仍被查询(可观测),但编排层不进并发批。
+pub fn parallel_tools_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("LAEW_PARALLEL_TOOLS")
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase()
+                .as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
+/// 单批并发上限(第 120 轮)。默认 **4**,对齐 AtomCode `ATOMCODE_MAX_PARALLEL_TOOLS=4`
+/// (Claude Code 用 10;laew 单元迭代预算只有 16 轮,取更保守值防止「一次发 20 个
+/// Read」打爆文件句柄与内存)。
+///
+/// 环境变量 `LAEW_MAX_PARALLEL_TOOLS` 取正整数覆盖;`0` / 非法值回退默认。
+pub fn max_parallel_tools() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        max_parallel_tools_from(std::env::var("LAEW_MAX_PARALLEL_TOOLS").unwrap_or_default())
+    })
+}
+
+/// 并发上限取值解析(独立出来便于单测)。
+pub fn max_parallel_tools_from(raw: String) -> usize {
+    const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => n,
+        _ => DEFAULT_MAX_PARALLEL_TOOLS,
+    }
 }
 
 /// 工具注册表(保持注册顺序,保证 tools 列表稳定)

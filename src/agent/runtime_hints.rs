@@ -15,6 +15,84 @@ use super::*;
 /// 与现有 `LAEW:PROJECT_CONTEXT` / `LAEW:SESSION_HISTORY` / `LAEW:COMPACTED_CONTEXT`
 /// 标记风格一致。
 pub(crate) fn build_runtime_hints(trace: &ExecutionTrace, consecutive_failures: usize) -> String {
+    let mut ctx = RuntimeHintCtx::default(trace);
+    ctx.consecutive_failures = consecutive_failures;
+    build_runtime_hints_with(&ctx)
+}
+
+/// Thought 显式化提醒阈值(第 120 轮 ReAct 强化)。
+///
+/// 连续 N 轮「仅 tool_use 无文本」即提醒模型补写 Thought —— 把既有
+/// `NO_TEXT_CONVERGE_THRESHOLD=8`(会**终止**循环)的干预点前移到 2 轮,
+/// 但**只提醒不终止**:单元预算只有 16 轮,等到第 8 轮才提醒为时已晚。
+pub(crate) const THOUGHT_NUDGE_AT: usize = 2;
+
+/// runtime hint 的角色分叉(第 120 轮:根治「代码任务被提示去 click」的语义误导)。
+///
+/// 此前 `explore_budget` 耗尽文案写死浏览器语义(`inspect/screenshot/eval_js` →
+/// `input_text/click/wait`),纯代码/文件类执行单元读到的是**错误指令**。
+/// 由 [`crate::agent::profile::AgentProfile::hint_role`] 派生 —— 注意它**不是**纯看
+/// 工具面:`builtin_registry()` 无条件含 `MCP_Web_Use`,静态判会把所有代码单元误判成
+/// UI 任务,故 `Ui` / `Execute` 的分叉看「本单元**实际调用过**什么工具」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HintRole {
+    /// 浏览器 / 桌面操控执行层(本单元实际调用过 MCP_Web_Use / MCP_Window_Use)。
+    #[default]
+    Ui,
+    /// 通用执行层(代码 / 文件 / 命令类单元)。
+    Execute,
+    /// 入口层信息收集(Yolo:延迟强制 + emit 通道)。
+    Gather,
+    /// 判定层(QC / Debug / Compact / SessionContext):无探索/执行阶段之分,不注入。
+    Judge,
+}
+
+/// [`build_runtime_hints_with`] 的入参集合(第 120 轮)。
+///
+/// 用结构体而非位置参数:hint 维度已从 2 个涨到 6 个,继续加位置参数会
+/// 让调用点变成一串裸 `0` / `None`,可读性与可维护性都塌。
+pub(crate) struct RuntimeHintCtx<'a> {
+    /// 本单元执行轨迹。
+    pub trace: &'a ExecutionTrace,
+    /// 连续相同失败次数(既有 L771 预警)。
+    pub consecutive_failures: usize,
+    /// 角色分叉(决定 explore_budget 耗尽文案)。
+    pub role: HintRole,
+    /// [`crate::agent::loop_guard::LoopGuard`] 的无进展软提醒(下一轮注入)。
+    pub loop_nudge: Option<&'a str>,
+    /// 连续「仅 tool_use 无文本」轮数(≥ [`THOUGHT_NUDGE_AT`] 触发 Thought 提醒)。
+    pub silent_rounds: usize,
+    /// 收口预告(由调用方按 `emit_tool` 有无选文案)。
+    pub deadline: Option<&'a str>,
+}
+
+impl<'a> RuntimeHintCtx<'a> {
+    /// 只带 trace 的默认上下文(等价第 119 轮行为:角色 = Ui,其余信号全空)。
+    pub fn default(trace: &'a ExecutionTrace) -> Self {
+        Self {
+            trace,
+            consecutive_failures: 0,
+            role: HintRole::Ui,
+            loop_nudge: None,
+            silent_rounds: 0,
+            deadline: None,
+        }
+    }
+}
+
+/// 拼装运行时 hint(第 120 轮扩展版:角色化 + ReAct 进度 / Thought / 收口)。
+///
+/// 全部 hint 仍拼在 system **末尾**并用 `<<<LAEW:RUNTIME_HINTS>>>` 包裹,
+/// 不破坏 `cache_control` 缓存前缀(第七轮 PromptCaching 专题约束)。
+pub(crate) fn build_runtime_hints_with(ctx: &RuntimeHintCtx<'_>) -> String {
+    let RuntimeHintCtx {
+        trace,
+        consecutive_failures,
+        role,
+        loop_nudge,
+        silent_rounds,
+        deadline,
+    } = ctx;
     let mut hints: Vec<String> = Vec::new();
     if trace.truncation_resumes > 0 {
         hints.push(format!(
@@ -35,23 +113,51 @@ pub(crate) fn build_runtime_hints(trace: &ExecutionTrace, consecutive_failures: 
             trace.max_tokens_upscalings * 8 // 8K 起,展示近似值即可
         ));
     }
-    if consecutive_failures >= 2 {
+    if *consecutive_failures >= 2 {
         hints.push(format!(
             "连续 {} 次工具调用失败,请先停下核对目标参数(路径/工具名/必填字段)再继续,避免在错误路径上重复打转。",
             consecutive_failures
         ));
     }
     // 第 118 轮:探索预算耗尽提示 —— 在 trace.iterations >= explore_budget 时触发,
-    // 提醒 LLM 「进入执行期」,减少重复 inspect/screenshot/eval_js 等只读探查。
+    // 提醒 LLM 「进入执行期」,减少重复只读探查。
     // 调用方(agent_loop.rs)在 `iter == explore_budget` 时通过 trace.explore_budget_exhausted
     // 标记触发本 hint,避免 trace 字段再次修改(向后兼容)。
+    // 第 120 轮:文案按角色分叉 —— 原文案写死浏览器语义(inspect/click),
+    // 纯代码/文件类执行单元读到的是错误指令(D5)。
     if trace.explore_budget_exhausted {
-        hints.push(
-            "已进入执行期(explore_budget 耗尽)。剩余迭代请专注于 input_text / click / wait 等 \
-             写操作,禁止再开新 inspect / screenshot / eval_js 探查(除非 click 后验证)。\
-             验证码/阻断请立即 control(request_human, reason=...) 让人工介入。"
-                .to_string(),
-        );
+        if let Some(text) = explore_exhausted_text(*role) {
+            hints.push(text.to_string());
+        }
+    }
+    // 第 120 轮 ReAct 强化 ①:无进展软提醒(LoopGuard 裁决为 Nudge 后的下一轮注入)。
+    if let Some(nudge) = loop_nudge {
+        hints.push((*nudge).to_string());
+    }
+    // 第 120 轮 ReAct 强化 ②:Thought 显式化提醒。
+    // 连续 silent_rounds 轮「仅 tool_use 无文本」→ 提醒先写推理再动手。
+    // 只提醒不终止(终止仍由 agent_loop 的 NO_TEXT_CONVERGE_THRESHOLD=8 负责)。
+    if *silent_rounds >= THOUGHT_NUDGE_AT {
+        hints.push(format!(
+            "已连续 {silent_rounds} 轮只发工具调用、没有输出任何推理文本。ReAct 要求每轮先用 \
+             1~3 句写出 Thought(已经确认了什么 / 还缺什么 / 下一步做哪一件事最省),\
+             再发起工具调用;请本轮补上,并显式判断上一步的 Observation 是否让任务向前推进了。"
+        ));
+    }
+    // 第 120 轮 ReAct 强化 ③:迭代进度自感知 —— 预算过半才注入(避免每轮噪音)。
+    // 看不见预算的模型不会主动收口(D6):此前只有 Yolo 有收口预告,执行层闷头跑满
+    // max_iterations 后被硬杀。
+    if trace.max_iterations > 0 && trace.iterations * 2 >= trace.max_iterations {
+        hints.push(format!(
+            "【进度】第 {}/{} 轮迭代,已调用工具 {} 次(成功 {} / 失败 {})。\
+             若已达成 expected_output 请立即收口输出终答,不要为「看起来更完整」继续探索。",
+            trace.iterations, trace.max_iterations, trace.tool_calls, trace.tool_calls_ok,
+            trace.tool_calls_err
+        ));
+    }
+    // 第 120 轮 ReAct 强化 ④:收口预告(倒数第二轮),文案由调用方按 emit_tool 有无选定。
+    if let Some(text) = deadline {
+        hints.push((*text).to_string());
     }
     if hints.is_empty() {
         return String::new();
@@ -60,6 +166,27 @@ pub(crate) fn build_runtime_hints(trace: &ExecutionTrace, consecutive_failures: 
         "\n\n<<<LAEW:RUNTIME_HINTS>>>\n{}\n<<<END>>>",
         hints.join("\n")
     )
+}
+
+/// 探索预算耗尽文案(第 120 轮角色化)。`Judge` 返回 `None` = 不注入。
+fn explore_exhausted_text(role: HintRole) -> Option<&'static str> {
+    match role {
+        HintRole::Ui => Some(
+            "已进入执行期(explore_budget 耗尽)。剩余迭代请专注于 input_text / click / wait 等 \
+             写操作,禁止再开新 inspect / screenshot / eval_js 探查(除非 click 后验证)。\
+             验证码/阻断请立即 control(request_human, reason=...) 让人工介入。",
+        ),
+        HintRole::Execute => Some(
+            "已进入执行期(explore_budget 耗尽)。剩余迭代请专注于**落地改动与验证**\
+             (Write / Edit / Bash 构建与测试),禁止再开新的只读探查(Read / Glob / Grep),\
+             除非是为了验证刚做的改动。已收集的信息足够动手了。",
+        ),
+        HintRole::Gather => Some(
+            "信息收集预算已耗尽(explore_budget 耗尽)。请立即停止新的探查,\
+             基于已收集的信息收口提交结论。",
+        ),
+        HintRole::Judge => None,
+    }
 }
 
 /// 判断 `stop_reason` 是否为截断(输出被 token 上限截断)。

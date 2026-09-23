@@ -143,6 +143,12 @@ impl Agent {
         // 与「提前收敛」(iter=12/32 vs iter=12/12)。
         trace.max_iterations = self.max_iterations;
 
+        // 第 120 轮 ReAct 强化:循环守卫(无进展检测 doom_loop + 双阈值止损)。
+        // 补齐既有三计数器的盲区 ——「工具调用**成功**、结果一字不变、模型却一轮轮
+        // 重复同一动作」(失败计数被成功重置,无文本计数要等到第 8 轮才响)。
+        // 进展键含 Observation 摘要,轮询等待类合法重复零误伤;`LAEW_REACT_GUARD=off` 可关。
+        let mut loop_guard = LoopGuard::new();
+
         // 关联报告: 2026-09-09_06 F-002 — 最近工具调用历史(用于无文本收敛短路时
         // 输出「叙事化摘要」,而非纯机械的次数统计;最多保留 RECENT_TOOL_HISTORY_LIMIT
         // 条避免无限增长)。
@@ -219,27 +225,50 @@ impl Agent {
             // 进程级 TTL 缓存(默认 5s),同任务内多次调用复用同一快照,开销可忽略;
             // 空目录返回空串,不改变既有 system 语义。
             let workspace_hint = crate::agent::workspace::hint_block();
-            let runtime_hints = build_runtime_hints(&trace, consecutive_failures);
-            // 2026-09-22 Yolo ReAct 收口预告:倒数第二轮(Yolo defer 模式 + forced_tools 开)
-            // 提示模型下轮会被强制收口,给其主动平滑交卷的机会,避免被硬强制时缺字段。
-            let deadline_hint = if self.profile.defer_emit_force
-                && self.profile.emit_tool.is_some()
-                && forced_tools_enabled()
-                && iter + 2 == self.max_iterations
-            {
-                "\n\n【收口提示】迭代预算即将耗尽(下一轮为最终轮,系统将强制要求提交 \
-                 submit_task_classification)。请立即停止新的探索,基于已收集的信息直接调用 \
-                 submit_task_classification 提交分类结果。"
+            // 2026-09-22 Yolo ReAct 收口预告 → 第 120 轮**通用化**:倒数第二轮一律预告。
+            // - 有 emit 通道且开了延迟强制(Yolo):提示下轮会被强制要求提交 emit;
+            // - 无 emit 通道(SubAgent-Work / Main-Work / Plan / WorkFlow):提示立即停止
+            //   新动作、基于已有 Observation 输出终答 —— 此前执行层闷头跑满
+            //   max_iterations 后被硬杀,模型全程不知道预算快没了(D6)。
+            let deadline_hint: Option<&'static str> = if iter + 2 == self.max_iterations {
+                if self.profile.defer_emit_force
+                    && self.profile.emit_tool.is_some()
+                    && forced_tools_enabled()
+                {
+                    Some(
+                        "【收口提示】迭代预算即将耗尽(下一轮为最终轮,系统将强制要求提交 \
+                         submit_task_classification)。请立即停止新的探索,基于已收集的信息直接调用 \
+                         submit_task_classification 提交分类结果。",
+                    )
+                } else if self.profile.emit_tool.is_none() {
+                    Some(
+                        "【收口提示】迭代预算即将耗尽(下一轮为最终轮)。请立即停止新动作,\
+                         基于已有 Observation 输出最终结果:完成情况 + 实际产出与 \
+                         expected_output 的对应关系 + 用到的关键工具调用;未完成的部分如实说明卡点。",
+                    )
+                } else {
+                    None
+                }
             } else {
-                ""
+                None
             };
-            let system = if workspace_hint.is_empty()
-                && runtime_hints.is_empty()
-                && deadline_hint.is_empty()
-            {
+            // runtime hints 拼接(2026-09-09 第 09 轮,联动 L771 失败计数预警;
+            // 第 120 轮扩展为角色化 + ReAct 进度 / Thought / 收口 / 无进展提醒):
+            // 仅在对应信号非零时追加,全空时返回空串,不影响 LLM 上下文;
+            // 拼到 system 末尾,不破坏 cache_control 缓存前缀。
+            let loop_nudge = loop_guard.take_nudge();
+            let runtime_hints = build_runtime_hints_with(&RuntimeHintCtx {
+                trace: &trace,
+                consecutive_failures,
+                role: self.profile.hint_role(&trace),
+                loop_nudge: loop_nudge.as_deref(),
+                silent_rounds: consecutive_no_text_rounds,
+                deadline: deadline_hint,
+            });
+            let system = if workspace_hint.is_empty() && runtime_hints.is_empty() {
                 base_system
             } else {
-                format!("{base_system}{workspace_hint}{runtime_hints}{deadline_hint}")
+                format!("{base_system}{workspace_hint}{runtime_hints}")
             };
             // LLM 请求(2026-09-17 第 70 轮运行日志):--debug 级记录每轮请求元信息,
             // 排查「模型看到了什么」(消息条数/system 规模/强制工具/输出上限)。
@@ -444,13 +473,72 @@ impl Agent {
             let this_round_text_empty = completion.text.trim().is_empty();
             let this_round_had_tool_calls = !completion.tool_calls.is_empty();
 
+            // ---- 第 120 轮「工具连续工作模式」:同批只读工具并发执行 ----
+            // 提示词一直要求「并行无依赖的工具调用一次性发出」,但运行时此前全部串行
+            // (D9:契约与实现不一致)。现在把同一响应里**连续的** parallel_safe 段
+            // (Read/Glob/Grep,段长 ≥2)用 join_all + Semaphore 并发跑完,结果按
+            // call index 缓存;主循环仍按**原序**做后处理与 tool_result 回填 ——
+            // 并发只改执行时序,不改上下文时序(协议配对 / orphan 语义零变化)。
+            // emit 短路点及其后的调用不进批(它们只回填不执行)。
+            let emit_limit = match self.profile.emit_tool.as_deref() {
+                Some(emit) => completion
+                    .tool_calls
+                    .iter()
+                    .position(|c| c.name == emit)
+                    .unwrap_or(completion.tool_calls.len()),
+                None => completion.tool_calls.len(),
+            };
+            let parallel_batches = self.plan_parallel_batches(&completion.tool_calls, emit_limit);
+            // 「工具调用」日志必须**先于**执行落盘:并发批是一次性跑完的,若沿用主循环里
+            // 的日志点,日志时间戳会晚于工具真实执行时刻,排查时误导(看起来像卡在前面)。
+            // 主循环对已进批的调用跳过该日志,避免重复打点。
+            for &(bs, be) in &parallel_batches {
+                for call in &completion.tool_calls[bs..be] {
+                    info!(
+                        agent = %self.profile.name,
+                        iter,
+                        tool = %call.name,
+                        args = %crate::logging::clip(&stable_json_string(&call.arguments)),
+                        parallel_batch = true,
+                        "工具调用"
+                    );
+                }
+            }
+            let (mut pre_executed, parallel_cancelled) = self
+                .run_parallel_batches(&completion.tool_calls, &parallel_batches, cancel)
+                .await;
+            if !parallel_batches.is_empty() {
+                let batched: usize = parallel_batches.iter().map(|(s, e)| e - s).sum();
+                trace.parallel_tool_batches += parallel_batches.len();
+                trace.parallel_tool_calls += batched;
+                debug!(
+                    agent = %self.profile.name,
+                    iter,
+                    batches = parallel_batches.len(),
+                    calls = batched,
+                    "同批只读工具并发执行(连续工作模式)"
+                );
+            }
+            if parallel_cancelled {
+                backfill_cancelled_tool_results(session.context_mut());
+                return Err(AgentError::Cancelled);
+            }
+
             // 逐个执行工具并把结果回填上下文(失败也作为 tool_result,is_error=true)
             let mut any_success_this_round = false;
             // 结构化输出通道命中标记(L6/L19,2026-09-09 第 13 轮):emit 工具的
             // tool_use 不执行,input 即最终结构化结果;本轮剩余调用只回填不执行
             // (防孤儿 tool_use,对齐第五轮「工具结果回填」专题)。
             let mut structured_output: Option<String> = None;
-            for call in completion.tool_calls {
+            // 第 120 轮 ReAct 循环守卫的两个跨调用状态:
+            // - `pending_grace`:止损宽限轮的强提醒文案。必须**延迟到本轮全部
+            //   tool_result 回填完**再作为 user 消息推入 —— 插在 tool_result 之间
+            //   会破坏 assistant tool_use ↔ tool_result 配对(Anthropic 直接 400)。
+            // - `doom_abort`:止损裁决。命中后本轮剩余调用只回填不执行(防孤儿),
+            //   与 emit 短路同款处理方式。
+            let mut pending_grace: Option<String> = None;
+            let mut doom_abort: Option<(String, usize)> = None;
+            for (call_idx, call) in completion.tool_calls.into_iter().enumerate() {
                 let name = call.name.clone();
                 let id = call.id.clone();
                 let args = call.arguments;
@@ -479,93 +567,55 @@ impl Agent {
                     ));
                     continue;
                 }
+                if doom_abort.is_some() {
+                    // 第 120 轮:已判无进展止损,本轮剩余调用不再执行,仅回填防孤儿
+                    pre_executed.remove(&call_idx);
+                    session.context_mut().push(ChatMessage::tool_result(
+                        id,
+                        "(已忽略:检测到无进展重复,本单元止损终止)",
+                        false,
+                    ));
+                    continue;
+                }
 
                 // 工具调用(2026-09-17 第 70 轮运行日志):名称 + 参数(截断)入日志,
                 // 所有角色所有工具(Bash/Read/Write/Window*/Browser*)统一经此记录。
-                info!(
-                    agent = %self.profile.name,
-                    iter,
-                    tool = %name,
-                    args = %crate::logging::clip(&stable_json_string(&args)),
-                    "工具调用"
-                );
+                // 第 120 轮:已进并发批的调用在批前统一打过点(带 parallel_batch=true),
+                // 这里跳过避免重复。
+                if !pre_executed.contains_key(&call_idx) {
+                    info!(
+                        agent = %self.profile.name,
+                        iter,
+                        tool = %name,
+                        args = %crate::logging::clip(&stable_json_string(&args)),
+                        "工具调用"
+                    );
+                }
 
-                // 工具执行取消:select 命中后工具 future 被 drop——Bash 工具的
-                // `kill_on_drop` 会随之 SIGKILL 子进程、setsid+killpg 清理整组
-                // (知识库第五轮 §6.1「取消必须级联到进程组」,bash.rs ef84cec 已就位)
+                // 工具执行(第 120 轮:统一走 `Agent::exec_tool_call` 底座)。
                 //
-                // ★ Schema 预校验(L16):工具执行前校验参数类型/必填/越界/多余字段,
-                // 校验失败直接返回结构化错误,避免浪费一次工具执行往返
+                // 底座内含:★ Schema 预校验(L16,校验失败直接返回结构化错误,
+                // 不浪费一次工具执行往返);★ 墙钟计时起点在 `execute()` **之前**
+                // (第 82 轮 P0-1:放错位置会让 elapsed_ms 恒为 0);★ 取消竞争
+                // (`select! biased` 命中后工具 future 被 drop —— Bash 的
+                // `kill_on_drop` 随之 SIGKILL 子进程、setsid+killpg 清理整组,
+                // 知识库第五轮 §6.1「取消必须级联到进程组」);★ 错误归一
+                // (F1 第 51 轮:`ToolNotFound` 回填可用工具边界,促模型立即改道)。
                 //
-                // ★ 第 82 轮 P0-1:工具调用墙钟计时 —— 必须放在 tool.execute() 之前,
-                // 否则 Instant::now() 在 future 已 await 完成后才被采样,elapsed_ms 永远为 0
-                // (原第 57 轮修复把计时器放错位置,实测所有工具耗时都显示 0ms,
-                //  见 tmpPlan/2026-09-17_13 §3.1)。改为在拿到 tool 句柄后立即采样。
-                let tool_call_started = std::time::Instant::now();
-                let executed = match self.profile.tools.get(&name) {
-                    Ok(tool) => {
-                        // Schema 预校验(校验失败 → 返回错误,不执行工具)
-                        if let Err(e) = crate::agent::tool_schema_validator::validate_tool_args(
-                            &name,
-                            &tool.parameters(),
-                            &args,
-                        ) {
-                            Some(Err(e))
-                        } else {
-                            match cancel {
-                                Some(token) => {
-                                    tokio::select! {
-                                        biased;
-                                        _ = token.cancelled() => None,
-                                        r = tool.execute(args.clone()) => Some(r),
-                                    }
-                                }
-                                None => Some(tool.execute(args.clone()).await),
-                            }
-                        }
-                    }
-                    Err(e) => Some(Err(e)),
+                // 并发批已在循环前跑完 → 直接取缓存结果;不在批内(段长 1 /
+                // 有副作用工具 / 开关关闭)→ 就地串行执行,路径与第 119 轮一致。
+                let exec = match pre_executed.remove(&call_idx) {
+                    Some(e) => e,
+                    None => self.exec_tool_call(&name, args.clone(), cancel).await,
                 };
-                // 2026-09-16 第 57 轮:工具调用墙钟计时 —— 从执行入口开始,
-                // 不论 Ok/Err/取消都走 elapsed.as_millis() 取时长,记入
-                // ExecutionTrace.tool_call_log.elapsed_ms,供 TUI 反推卡在哪一步。
-                // ★ 第 82 轮:Instant 已上移至 tool.execute 之前,这里只读 elapsed。
-                // (label `_ = tool_call_started` 仅用来压制 unused warning)
-                debug_assert!(tool_call_started.elapsed().as_nanos() > 0);
-                let (output, is_error, mut error_summary) = match executed {
-                    Some(Ok(out)) => (out, false, String::new()),
-                    Some(Err(e)) => {
-                        warn!(tool = %name, error = %e, "tool failed");
-                        // F1(2026-09-14 第 51 轮):工具不存在时,回填文本明示
-                        // 可用工具边界——auto tool_choice 降级后模型可能尝试
-                        // 越权工具(如 Yolo 调 Bash),裸错误「工具不存在」不足以
-                        // 让模型收敛,导致同一轮内反复试错浪费迭代。
-                        let brief = format!("{e}");
-                        let brief_short: String = brief.chars().take(120).collect();
-                        if matches!(e, AgentError::ToolNotFound(_)) {
-                            let avail = self.profile.tools.names().join(", ");
-                            (
-                                format!(
-                                    "[工具执行失败] {name}: {e}。你当前可用的工具仅有: [{avail}]。\
-                                     禁止再次调用 {name};请立即改用上述可用工具完成任务,或直接给出最终回答。"
-                                ),
-                                true,
-                                format!("ToolNotFound: {brief_short}"),
-                            )
-                        } else {
-                            (
-                                format!("[工具执行失败] {}: {}", name, e),
-                                true,
-                                format!("{name}: {brief_short}"),
-                            )
-                        }
-                    }
+                if exec.cancelled {
                     // 取消:本条 + 本轮剩余未执行的 tool_use 由 backfill 统一补全
-                    None => {
-                        backfill_cancelled_tool_results(session.context_mut());
-                        return Err(AgentError::Cancelled);
-                    }
-                };
+                    backfill_cancelled_tool_results(session.context_mut());
+                    return Err(AgentError::Cancelled);
+                }
+                let tool_call_elapsed_ms = exec.elapsed_ms;
+                let (output, is_error, mut error_summary) =
+                    (exec.output, exec.is_error, exec.error_summary);
                 // ★ 第 82 轮 P1-3(第 89 轮单工具化):浏览器失败学习 —— 同一 (tool, selector)
                 // 连续失败 ≥2 次时,在 error_summary 追加换姿势提示,避免 LLM 死磕同 selector。
                 // 适用工具:MCP_Web_Use(从 args.params.selector / args.selector 提 key);
@@ -618,7 +668,7 @@ impl Agent {
                     iter,
                     tool = %name,
                     is_error,
-                    elapsed_ms = tool_call_started.elapsed().as_millis() as u64,
+                    elapsed_ms = tool_call_elapsed_ms,
                     output = %crate::logging::clip(&output),
                     "工具结果"
                 );
@@ -667,7 +717,6 @@ impl Agent {
                 // QC 拿到真实调用证据);FIFO 上限 MAX_TOOL_CALL_LOG。
                 // 第 57 轮:补 elapsed_ms(墙钟耗时)与 error_summary(失败原因摘要),
                 // TUI 据此反推「哪个工具哪一步卡死 / 为何失败」。
-                let tool_call_elapsed_ms = tool_call_started.elapsed().as_millis() as u64;
                 trace.record_tool_call(
                     &name,
                     &stable_json_string(&args),
@@ -684,6 +733,45 @@ impl Agent {
                     let drop_n = recent_tool_history.len() - RECENT_TOOL_HISTORY_LIMIT;
                     recent_tool_history.drain(0..drop_n);
                 }
+                // ---- 第 120 轮 ReAct 循环守卫:无进展检测(doom_loop) ----
+                // 进展键 = 工具名 + 参数稳定 JSON + **结果摘要**(is_error + 字节长度 +
+                // 头部 256 字符哈希)。三者全同才算「原地打转」—— 轮询等待类调用
+                // (结果在变)天然判为有进展,零误伤;等待类动作(wait / sleep /
+                // SubAgent result|history)由 loop_guard::wait_like 透明跳过。
+                match loop_guard.observe(&name, &args, is_error, &output) {
+                    LoopVerdict::Progress => {}
+                    // 软提醒:文案已存入守卫,下一轮经 runtime hints 注入 system 末尾
+                    // (不污染上下文、不破坏 cache_control 缓存前缀)。
+                    LoopVerdict::Nudge(_) => {
+                        warn!(
+                            agent = %self.profile.name,
+                            tool = %name,
+                            repeats = loop_guard.max_repeats(),
+                            "ReAct 无进展软提醒(下一轮注入 system 后缀)"
+                        );
+                    }
+                    // 宽限轮强提醒:延迟到本轮 tool_result 全部回填后再推 user 消息
+                    LoopVerdict::Grace(text) => {
+                        warn!(
+                            agent = %self.profile.name,
+                            tool = %name,
+                            repeats = loop_guard.max_repeats(),
+                            "ReAct 无进展止损宽限轮(强提醒已排队,本轮结束后送达)"
+                        );
+                        pending_grace = Some(text);
+                    }
+                    // 止损:本轮剩余调用只回填不执行,循环结束后收尾
+                    LoopVerdict::Abort { tool, repeats } => {
+                        warn!(
+                            agent = %self.profile.name,
+                            tool = %tool,
+                            repeats,
+                            "ReAct 无进展止损(doom_loop):连续相同「动作 + 结果」,终止本单元"
+                        );
+                        doom_abort = Some((tool, repeats));
+                    }
+                }
+                trace.doom_loop_repeats = loop_guard.max_repeats();
                 // 2026-09-17 第 74 轮(第 89 轮单工具化):MCP_Web_Use post-open 引导
                 // (放在 push 之前,这样可以借用 output 不需要 clone)。action=open 成功
                 // 返回的 next_steps 是关键指引(4 步最常见动作),注入 LLM 上下文作为
@@ -749,6 +837,48 @@ impl Agent {
                 );
             }
 
+            // 第 120 轮 ReAct 循环守卫:止损宽限轮的强提醒。
+            // 本轮全部 tool_result 已回填完毕,此时推 user 消息不会破坏
+            // assistant tool_use ↔ tool_result 配对(对齐 F9「nudge 必须真的送达
+            // LLM 才有意义」的教训:第 25 轮之前 nudge 后立即 return,从未送达)。
+            if let Some(text) = pending_grace.take() {
+                session.context_mut().push(ChatMessage::user(text));
+            }
+
+            // 第 120 轮 ReAct 循环守卫:无进展止损。
+            // - **已有工具产出** → 优雅收尾交 QC(对齐第 70 轮 no_tool_use 的降级语义:
+            //   硬失败会把真实成果吞掉);
+            // - **全程零产出** → `Err(RepeatedToolFailure)`,走既有 Yolo 失败回流。
+            if let Some((tool, repeats)) = doom_abort {
+                let history_block = render_tool_history(&recent_tool_history);
+                let fallback = abort_fallback_text(&tool, repeats, &history_block);
+                trace.early_terminated = true;
+                trace.early_terminate_reason =
+                    format!("doom_loop_no_progress tool={tool} repeats={repeats}");
+                trace.doom_loop_repeats = loop_guard.max_repeats();
+                trace.collect_failure_signals(&accumulated_text);
+                if trace.tool_calls > 0 {
+                    let text = if accumulated_text.trim().is_empty() {
+                        fallback
+                    } else {
+                        format!("{accumulated_text}\n\n{fallback}")
+                    };
+                    return Self::finalize_logged(
+                        &self.profile.name,
+                        trace,
+                        &text,
+                        total_usage,
+                        max_tokens_state.as_ref(),
+                    );
+                }
+                return Err(AgentError::RepeatedToolFailure {
+                    tool,
+                    attempts: repeats,
+                    last_error: fallback,
+                    trace: Box::new(trace),
+                });
+            }
+
             // 关联报告: 2026-09-09_05 E-001 —— 无文本收敛计数
             // 本轮:有 tool_use 但 completion.text 为空(LLM 只输出工具调用指令没附文本)
             // → 增加计数;否则(有文本 / 无工具调用)归零
@@ -776,19 +906,9 @@ impl Agent {
             if consecutive_no_text_rounds >= NO_TEXT_CONVERGE_THRESHOLD {
                 // 关联报告: 2026-09-09_06 F-002 — 把「最近工具调用叙事化摘要」一并
                 // 注入,让 LLM 看到自己刚才做了什么(而非纯次数统计),下次任务能自我纠正。
-                let history_lines: Vec<String> = recent_tool_history
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (tool, args, err))| {
-                        let status = if *err { "失败" } else { "成功" };
-                        format!("  [{:>2}] {} {} → {}", i + 1, status, tool, args)
-                    })
-                    .collect();
-                let history_block = if history_lines.is_empty() {
-                    "  (无工具调用历史)".to_string()
-                } else {
-                    history_lines.join("\n")
-                };
+                // 第 120 轮:叙事化摘要构造抽为 `render_tool_history`,
+                // 与 doom_loop 止损分支共用(此前内联,无法复用)。
+                let history_block = render_tool_history(&recent_tool_history);
                 if !no_text_grace_used {
                     // F9 宽限轮:nudge 真正送达 LLM,工具调用照常执行一轮
                     no_text_grace_used = true;
@@ -1003,4 +1123,24 @@ impl Agent {
         );
         Self::finalize_with_max_tokens(trace, text, total_usage, max_tokens_state)
     }
+}
+
+/// 把「最近工具调用历史」渲染成叙事化摘要(关联报告 2026-09-09_06 F-002)。
+///
+/// 第 120 轮自 `no_text_converge` 分支抽为自由函数,与 ReAct 无进展止损分支共用 ——
+/// 让 LLM / QC / 用户看到的是「刚才做了哪几件事、各自成败」,而非纯次数统计。
+/// 入参元素为 `(工具名, 参数摘要, 是否失败)`。
+fn render_tool_history(history: &[(String, String, bool)]) -> String {
+    if history.is_empty() {
+        return "  (无工具调用历史)".to_string();
+    }
+    history
+        .iter()
+        .enumerate()
+        .map(|(i, (tool, args, err))| {
+            let status = if *err { "失败" } else { "成功" };
+            format!("  [{:>2}] {} {} → {}", i + 1, status, tool, args)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

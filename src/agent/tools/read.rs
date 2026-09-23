@@ -58,6 +58,12 @@ impl Tool for ReadTool {
         })
     }
 
+    /// 纯只读、无副作用、无跨调用共享状态 —— 同批多个 Read 可安全并发
+    /// (第 120 轮「工具连续工作模式」,见 `tools/mod.rs::Tool::parallel_safe`)。
+    fn parallel_safe(&self, _args: &Value) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value) -> Result<String> {
         let path_str = args
             .get("file_path")

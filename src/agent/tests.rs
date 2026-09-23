@@ -341,7 +341,11 @@
                 tool_calls: vec![crate::llm::ToolCallReq {
                     id: format!("call-{n}"),
                     name: "Bash".into(),
-                    arguments: json!({"command": "echo only-tool"}),
+                    // 第 120 轮:命令带轮次序号 —— 本用例专测「无文本收敛」(从不产出
+                    // 文本),必须让每轮动作**互不相同**,否则会被新增的 LoopGuard
+                    // (无进展检测)在第 4 轮先止损,测不到 no_text_converge 阈值 8。
+                    // 两个机制正交,各自用各自的 fixture 覆盖。
+                    arguments: json!({"command": format!("echo only-tool-{n}")}),
                 }],
                 usage: Usage::default(),
                 stop_reason: None,

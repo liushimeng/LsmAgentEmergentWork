@@ -48,6 +48,11 @@ impl Tool for GlobTool {
         })
     }
 
+    /// 纯只读路径匹配 —— 同批多个 Glob 可安全并发(第 120 轮「工具连续工作模式」)。
+    fn parallel_safe(&self, _args: &Value) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value) -> Result<String> {
         let pattern = args
             .get("pattern")

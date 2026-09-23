@@ -968,3 +968,84 @@ readonly 工具面收窄 / history 落库 / `resume` 血缘与种子上下文 / 
 
 **累计**:第六轮 SubAgent 调度缺口 5/8 → **6.5/8**(持久化+血缘续跑落地,真进程恢复仍为 P3);
 第十九轮 L1704 由 🟡 → ✅、L1706 由 ⏳ → 🟡(孤儿识别 + 血缘续跑)。
+
+## 第 120 轮（2026-09-23）— SubAgent-Work 执行层 ReAct 强化与工具连续工作模式
+
+**主题**：把第 119 轮做在**入口层 Yolo** 的 ReAct 改造，补齐到**执行层 SubAgent-Work**。
+Yolo 的 ReAct 解决「分类前信息收集」，本轮解决「执行中逐轮推进」——两者是同一个
+Thought→Action→Observation 闭环在不同层的落地。
+
+诊断出的 9 条现状（D1-D9，详见设计文档 §2）里最刺眼的两条：
+- 提示词承诺「并行无依赖的工具调用一次性发出」，运行时却**全部串行执行**（契约与实现不一致）；
+- 重复检测只覆盖「连续相同**失败**」，**成功但结果一字不变的原地打转**三个计数器全漏
+  （失败计数被成功重置 / 无文本计数要等到第 8 轮 / 无工具计数管不到有工具的场景），
+  典型结局是 16~32 轮预算烧光后被 `MaxIterationsExceeded` 硬杀，QC 拿到「跑满上限 + 零产物」。
+
+| 编号/出处 | gap | 状态 | 实现位置 | 完成轮次 |
+|------|-----|------|---------|---------|
+| opencode `processor.ts` doom_loop（P0） | 无「连续 N 次相同工具 + 相同输入」死循环安全阀 | ✅ **且判定更精确** | `src/agent/loop_guard.rs`（新增）：进展键 = 工具名 + `stable_json_string(args)` + **结果摘要**(is_error + 字节长度 + 头部 256 字符哈希)。opencode 只用 tool+input hash，会把「轮询等待页面变化」误判为死循环；laew 把 Observation 纳入键，同动作**结果在变**即判有进展 | 2026-09-23 第 120 轮 |
+| AtomCode `ToolLoopPolicy` / `REPEAT_NUDGE_AT=3`+`MAX_REPEAT_ROUNDS=6`（P1） | 无「nudge 警告 → 硬停」双阈值 | ✅ 按 laew 预算收紧 | `loop_guard.rs::NUDGE_AT=2`（软提醒）/ `ABORT_AT=3`（宽限轮强提醒）/ 第 4 次止损。外部工程预算 50~256 轮，laew 单元只有 16~32 轮，阈值必须更紧否则提醒还没生效预算就烧完 | 同上 |
+| L82 DeepSeek `guard/repeat-tool-reminder`（P2） | 无重复工具软提醒 / 无 canonicalize | ✅ | 软提醒经 `runtime_hints` 注入 system 末尾（不污染上下文、不破坏 cache 前缀）；canonicalize 直接复用既有 `stable_json_string`（对象 key 递归排序 = DeepSeek `deep key-sort JSON` 等价实现），LLM 调换参数顺序不误判为新动作 | 同上 |
+| AtomCode `parallel_safe(args)` / Claude Code `partitionToolCalls`+`isConcurrencySafe`（P1） | 同一响应内多 tool_calls 全部串行 | ✅ | `tools/mod.rs::Tool::parallel_safe(args)`（默认 `false`，只读三件套 `Read`/`Glob`/`Grep` 覆写 `true`）+ `agent/tool_exec.rs`（新增）：连续 safe 段 ≥2 切批 → `join_all` + `Semaphore` 限流 → **按 call index 缓存结果**，主循环仍按原序后处理与回填 | 同上 |
+| AtomCode `ATOMCODE_MAX_PARALLEL_TOOLS=4` / Claude Code `…MAX_TOOL_USE_CONCURRENCY=10` | 并发上限不可配 | ✅ | `LAEW_MAX_PARALLEL_TOOLS`（默认 4，取 AtomCode 保守值：laew 单元预算小）；`LAEW_PARALLEL_TOOLS=off` 一键回退全串行 | 同上 |
+| 第 119 轮 §7 未来方向 ③「`build_runtime_hints` 角色化」 | explore_budget 耗尽文案写死浏览器语义，代码任务收到「去 click」的错误指令 | ✅ | `runtime_hints.rs::HintRole{Ui,Execute,Gather,Judge}` + `RuntimeHintCtx` + `build_runtime_hints_with`；角色由 `AgentProfile::hint_role(trace)` 派生 —— **关键**：`builtin_registry()` 无条件含 `MCP_Web_Use`，静态看工具面会把所有代码单元判成 UI 任务，故 Ui/Execute 分叉改由「本单元**实际调用过**什么工具」决定 | 同上 |
+| 第 119 轮 §3.3 收口预告（仅 Yolo defer 模式） | 执行层跑满预算前零预警，模型不知道预算快没了 | ✅ 通用化 | `agent_loop.rs::deadline_hint` 两分支：有 emit → 原 Yolo 文案（指名强制提交）；无 emit → 执行层文案（停止新动作 + 输出「实际产出与 expected_output 的对应关系」） | 同上 |
+| Thought 显式化无早期机制（`NO_TEXT_CONVERGE_THRESHOLD=8` 才第一次提醒） | 提醒来得太晚（预算 16~32 轮，第 8 轮才响） | ✅ | `runtime_hints.rs::THOUGHT_NUDGE_AT=2`：连续 2 轮「仅 tool_use 无文本」即提醒补写 Thought，**只提醒不终止**（终止仍由 8 轮阈值负责） | 同上 |
+| 执行层提示词零 ReAct 表述（对比 Yolo 有完整「信息收集(ReAct 模式)」节） | 多轮行为全靠模型自发 | ✅ | `system_prompt/mod.rs`：`SUB_AGENT_BASE_PROMPT` 新增「## 执行循环(ReAct 模式)」节（三段节奏 + 5 条硬性约束 + 明示无进展阈值）；`sub_agent_tools_hint()` 新增「## 连续工作模式」节（把既有复合工具 `sequence`/`input_batch`/`batch`/`workflow`/`explore`/`TodoWrite` 与 ReAct 循环绑定 + 单工具批次规则）；双协议 tail 改写 | 同上 |
+| Claude Code `siblingAbortController`（Bash 失败级联取消兄弟，P1） | — | ⛔ 决策不做 | laew `BashTool` 每次调用是**独立子进程、无持久 shell 状态**，不存在 Claude Code 假设的「隐式依赖链」（其注释原文：Bash commands often have implicit dependency chains）；级联取消只会误伤合法的多命令批 | — |
+| DeepSeek `goal-round-driver` + `maxGoalRounds=256`（P0） | SubAgent 内部无目标续航状态机 | ⏳ 后续独立立项 | laew 的续航由外层 Orchestrator 拓扑分层 + 单元级局部重试（第 95 轮）承担，内层再加目标状态机与现有 WorkFlow 语义重叠 | — |
+| DeepSeek `tool-todo/` projection + invariant（P1） | TODO 无投影/不变式校验 | ⏳ 后续独立立项 | 第 112 轮已落 TodoWrite 状态机 + `/tasks` + 持久化；本轮只在提示词层把 TodoWrite 绑进 ReAct 进度自证 | — |
+| AtomCode `on_reasoning_delta` / Claude Code `thinking.budget_tokens`（P1） | 无 thinking / reasoning block 独立通道 | ⏳ 后续独立立项 | 属协议层能力（Anthropic `thinking` + OpenAI `reasoning_effort`），需两协议适配 + 签名回显 | — |
+
+**设计要点**：
+- **Observation 进进展键是本轮最关键的设计决策**：外部三家（opencode / DeepSeek / AtomCode）
+  都只用「工具 + 参数」判重复，于是「同一 inspect 等页面变化」「同一 curl 等服务起来」
+  这类**正确的轮询**会被判死循环。laew 把结果摘要一起纳入，「同动作 + 同结果」才算无进展；
+- **等待类调用透明化**：`wait_like()` 识别 `MCP_Web_Use/MCP_Window_Use` 的 `wait`、
+  纯 `sleep N` 的 Bash、`SubAgent(action=result|history)` 轮询 —— 这类调用**既不计入也不打断**
+  重复链，于是 `Read(x) → wait → Read(x) → wait → Read(x)` 仍正确判为 3 次无进展；
+- **宽限轮**：首次命中 `ABORT_AT` 不直接杀，先推 user 消息强提醒再给一轮机会 ——
+  沿用第 25 轮 F9 的教训（nudge 后立即 return，提醒从未送达 LLM，合法多步单元被硬杀）。
+  且 Grace 文案必须**延迟到本轮全部 tool_result 回填完**再推：插在 tool_result 之间会破坏
+  assistant `tool_use` ↔ `tool_result` 配对（Anthropic 直接 400）；
+- **并发只改执行时序，不改上下文时序**：`tool_result` 回填、`tool_call_log`、
+  `recent_tool_history` 叙事全部仍按 `tool_calls` 原序 —— 协议配对 / orphan 修复 / 
+  第 119 轮 emit 短路语义零变化。为此把「单条执行」抽成 `Agent::exec_tool_call` 底座，
+  并发批与串行路径共用同一实现（逐行机械抽取，判定分支一字未改）；
+- **止损分级**：已有工具产出 → 优雅收尾交 QC（对齐第 70 轮 `no_tool_use` 的降级语义：
+  硬失败会把真实成果吞掉）；全程零产出 → `Err(RepeatedToolFailure)` 走既有 Yolo 失败回流；
+- **可观测**：`ExecutionTrace` 新增 `parallel_tool_batches` / `parallel_tool_calls` /
+  `doom_loop_repeats`（均 `serde(default)` 兼容旧 trace），`render_prompt()` 增
+  `- react: parallel_batches=… parallel_calls=… no_progress_repeats=…` 行让 QC 一眼看出
+  「连续工作模式用没用起来 / 有没有原地打转」；`collect_failure_signals` 增 `doom_loop:Nx` 弱信号；
+- **三个回退开关**：`LAEW_PARALLEL_TOOLS=off` / `LAEW_REACT_GUARD=off` / `LAEW_MAX_PARALLEL_TOOLS=N`，
+  任一异常可即时降级到第 119 轮行为；`parallel_safe` 默认 `false` 使未覆写工具逐字不变；
+- **顺带修掉 3 处存量问题**（都不是本轮引入，但会让 `cargo test` 长期红/抖，掩盖真实回归）：
+  ① `src/shutdown.rs` 模块文档的用法示例标了 `no_run` 却含裸 `return Err(…)` 与 `.await`
+  （非合法函数体），doctest 阶段自第 108 轮起一直编译失败 → 改标 `text`；
+  ② `bash.rs::bash_small_stdout_keeps_inline` 是 spill 测试家族里**唯一**没拿 `lock_env()` 的用例
+  （兄弟用例改 `LAEW_BASH_SPILL_THRESHOLD`、其它模块用例改进程 cwd），全量并行跑偶发失败、
+  单跑恒过 → 补锁对齐；
+  ③ `run_e2e.sh` §4j-2 自第 119 轮起存量失败：Yolo 改「延迟强制」后首轮本就不带 forced
+  `tool_choice`，mock 的 `--reject-tool-choice` 无从拒绝 → Yolo 恒 1 次请求，而断言写死 2 次。
+  「forced 被拒 → resilient 降级重试」这条链路现在只有**每轮强制**的 Quality-Check 会走到，
+  断言目标改盯 QC。
+  `src/agent/tests.rs` 追加用例后达 1844 行超 1800 红线 → 按拆分规范转 `tests/` 目录
+  **改法修正**：原计划按拆分规范转 `tests/` 目录，但 `.gitignore` 的 `tests/` 规则匹配**任意层级**目录，`src/agent/tests/` 会被静默排除出版本库（本地编译通过、克隆后 `cargo test` 直接失败）→ 改为把新用例放**同级兄弟文件** `src/agent/react_tests.rs`，`tests.rs` 保持 1244 行不动。该陷阱已写进 CLAUDE.md/AGENTS.md 的拆分规范。
+
+**验证**：lib 单测 **1587 passed / 0 failed / 3 ignored**（基线 1551 passed → 净增 **36** 项：
+`agent::loop_guard` 14 + `agent::tool_exec` 11 + `agent::react_tests` 11；
+另修正 2 处既有 fixture 的断言锚点）；`cargo test` 全量（含 doctest）由**存量 1 failed → 0 failed**；
+e2e 新增 §4p **19 项 wire 断言全 PASS**（每次单元尝试恰好 4 轮止损：实测 9 次尝试 × 4 轮 = 36 次
+SubAgent 请求、每组恰好 1 次软提醒 / 轮 3 的 system 经 RUNTIME_HINTS 收到软提醒 / 轮 4 的 messages
+收到宽限轮强提醒 / `doom_loop_no_progress` 流入下游 QC 证据链 / ReAct 与连续工作模式两节真的在
+wire system 上 / `LAEW_REACT_GUARD=off` 可回退）。**e2e 总计 PASS=213 / FAIL=0**（基线 210/3，
+含修掉 §4j-2 自第 119 轮起的存量失败）。
+
+**方案**：`tmpPlan/2026-09-23_01-SubAgentWork执行层ReAct强化与工具连续工作模式方案.md`
+· **设计**：`docs/SubAgentWork执行层ReAct与连续工作模式/01-设计与解决方案.md`
+
+**累计**：多轮对话与循环架构专题的「死循环安全阀」维度由 ⏳ → ✅；工具调用专题的
+「并行执行」维度由 ⏳（全串行）→ ✅（参数感知分类 + 分批并发 + 保序回填）；
+第 119 轮 §7 未来方向 4 条中 ③（runtime hints 角色化）已落地，①（QC 同样延迟强制）
+②（`TaskClassification.evidence`）④（degrade 后探索防护）仍待后续。

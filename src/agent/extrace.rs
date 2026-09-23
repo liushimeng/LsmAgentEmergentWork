@@ -104,6 +104,25 @@ pub struct ExecutionTrace {
     /// 「跑满上限」还是「提前收敛」)。0 表示未记录(旧 trace 反序列化)。
     #[serde(default)]
     pub max_iterations: usize,
+    /// 第 120 轮新增(工具连续工作模式):发生过的**并发批**次数。
+    ///
+    /// 一批 = 同一 LLM 响应内连续的 `parallel_safe` 工具段(段长 ≥ 2)。
+    /// 0 表示本单元从未并发执行过工具(全串行 / 开关关闭 / 无只读批)。
+    #[serde(default)]
+    pub parallel_tool_batches: usize,
+    /// 第 120 轮新增(工具连续工作模式):经并发批执行的工具调用总数。
+    ///
+    /// 与 `tool_calls` 对比可得「并发覆盖率」;与 `parallel_tool_batches` 对比
+    /// 可得平均批大小。供 TUI / Debug Report / QC 对账「省了多少轮」。
+    #[serde(default)]
+    pub parallel_tool_calls: usize,
+    /// 第 120 轮新增(ReAct 循环守卫):本会话观测到的最大「同动作 + 同结果」重复次数。
+    ///
+    /// 由 [`crate::agent::loop_guard::LoopGuard::max_repeats`] 在 finalize 阶段注入。
+    /// ≥2 表示触发过无进展软提醒,≥4 表示触发过止损(见 `early_terminate_reason`)。
+    /// 即使 `LAEW_REACT_GUARD=off` 也统计(可观测性不丢)。
+    #[serde(default)]
+    pub doom_loop_repeats: usize,
 }
 
 /// 单次工具调用摘要(2026-09-16 第 56 轮 + 第 57 轮)。
@@ -184,6 +203,9 @@ impl Default for ExecutionTrace {
             permission_missing: Vec::new(),
             explore_budget_exhausted: false,
             max_iterations: 0,
+            parallel_tool_batches: 0,
+            parallel_tool_calls: 0,
+            doom_loop_repeats: 0,
         }
     }
 }
@@ -293,6 +315,15 @@ impl ExecutionTrace {
             }
         }
 
+        // 5.7) ReAct 无进展信号(第 120 轮):LoopGuard 观测到的最大「同动作 + 同结果」重复次数。
+        // 与 5.6 的差异:5.6 只看 tool_call_log 里「连续 3 次相同 (tool,args) 且**均失败**」;
+        // 本信号覆盖「调用**成功**但结果一字不变」的原地打转(进展键含 Observation 摘要)。
+        // 弱信号(不单独进 `is_failed()`):真触发止损时 `early_terminated` 已置位,
+        // 由 1) 的 `early_terminate:doom_loop_no_progress…` 承担强信号职责。
+        if self.doom_loop_repeats >= crate::agent::loop_guard::NUDGE_AT {
+            signals.push(format!("doom_loop:{}x", self.doom_loop_repeats));
+        }
+
         self.failure_signals = signals;
     }
 
@@ -388,6 +419,14 @@ impl ExecutionTrace {
         );
         if !self.artifacts.is_empty() {
             base.push_str(&format!("\n- artifacts=[{}]", self.artifacts.join("; ")));
+        }
+        // 第 120 轮:ReAct 循环质量证据 —— 并发批(连续工作模式是否被用起来)+
+        // 无进展重复次数(是否在原地打转)。QC 据此区分「高效收敛」与「烧光预算」。
+        if self.parallel_tool_batches > 0 || self.doom_loop_repeats > 0 {
+            base.push_str(&format!(
+                "\n- react: parallel_batches={} parallel_calls={} no_progress_repeats={}",
+                self.parallel_tool_batches, self.parallel_tool_calls, self.doom_loop_repeats
+            ));
         }
 
         // 2026-09-16 第 61 轮:QC 必须看到真实工具证据,避免最终文本与工具轨迹相悖。

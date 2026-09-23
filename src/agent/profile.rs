@@ -298,6 +298,54 @@ impl AgentProfile {
         let build_time = env!("LAEW_BUILD_TIME");
         format!("{}/{version} {build_time}", self.name)
     }
+
+    /// runtime hint 的角色分叉(第 120 轮:根治「代码任务被提示去 click」)。
+    ///
+    /// **为什么不能只看工具面**:`builtin_registry()` 无条件注册 `MCP_Web_Use`
+    /// (第 89 轮,CDP 三平台一致无需平台门控),所以 SubAgent-Work 的工具面**永远**
+    /// 含浏览器工具 —— 按 profile 静态派生会让所有代码/文件类单元都收到浏览器文案。
+    /// 因此 `Ui` / `Execute` 的分叉改由**本单元实际调用过什么工具**决定(`trace`):
+    /// 真的动过浏览器/桌面才算 UI 任务。
+    ///
+    /// 判定顺序(前者优先):
+    /// 1. 有 `emit_tool` → 结构化结论出口角色:`defer_emit_force` 开 = [`HintRole::Gather`]
+    ///    (Yolo 信息收集),否则 = [`HintRole::Judge`](Quality-Check 判定)
+    /// 2. 工具面为空 → [`HintRole::Judge`](SessionContext / Debug / Compact,纯文本生成)
+    /// 3. `trace.tool_call_log` 出现过 `MCP_Web_Use` / `MCP_Window_Use` → [`HintRole::Ui`]
+    /// 4. 其余 → [`HintRole::Execute`](Plan / Main-Work / SubAgent-Work / WorkFlow /
+    ///    动态子 Agent 的纯代码文件类单元)
+    ///
+    /// **为什么不用 `spawn_policy == Disabled` 判 Judge**:叶子动态子 Agent
+    /// (第 114 轮,`dynamic_child` 去掉 `SubAgent` 工具后策略为 `Disabled`)是**干实事的
+    /// 执行层**,按策略判会把它归到判定层、拿不到执行期提示。用「有没有结构化结论出口 /
+    /// 有没有工具」判角色才与职责对齐。
+    pub(crate) fn hint_role(
+        &self,
+        trace: &crate::agent::extrace::ExecutionTrace,
+    ) -> crate::agent::runtime_hints::HintRole {
+        use crate::agent::runtime_hints::HintRole;
+        use crate::agent::tools::{
+            mcp_web_use::MCP_WEB_USE_TOOL_NAME, mcp_window_use::MCP_WINDOW_USE_TOOL_NAME,
+        };
+        if self.emit_tool.is_some() {
+            return if self.defer_emit_force {
+                HintRole::Gather
+            } else {
+                HintRole::Judge
+            };
+        }
+        if self.tools.names().is_empty() {
+            return HintRole::Judge;
+        }
+        let used_ui = trace.tool_call_log.iter().any(|e| {
+            e.tool == MCP_WEB_USE_TOOL_NAME || e.tool == MCP_WINDOW_USE_TOOL_NAME
+        });
+        if used_ui {
+            HintRole::Ui
+        } else {
+            HintRole::Execute
+        }
+    }
 }
 
 /// 在系统提示词末尾注入自感知段(由**注册表**生成,保证与真实工具面不漂移)。
