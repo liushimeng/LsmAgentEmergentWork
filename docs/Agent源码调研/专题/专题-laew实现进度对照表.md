@@ -1049,3 +1049,32 @@ wire system 上 / `LAEW_REACT_GUARD=off` 可回退）。**e2e 总计 PASS=213 / 
 「并行执行」维度由 ⏳（全串行）→ ✅（参数感知分类 + 分批并发 + 保序回填）；
 第 119 轮 §7 未来方向 4 条中 ③（runtime hints 角色化）已落地，①（QC 同样延迟强制）
 ②（`TaskClassification.evidence`）④（degrade 后探索防护）仍待后续。
+
+---
+
+## 第 123 轮(2026-09-23):MCP_Use 通用 MCP 服务调用
+
+**需求**:给 Agent 添加通用性 MCP 服务调用工具定义以及相关功能(MCP client 连接外部
+server → 发现工具 → 调用工具 → 读取资源)。
+
+**实现**:
+- `src/mcp/` 协议客户端层(JSON-RPC 2.0 + `McpClient` trait + stdio NDJSON / Streamable HTTP
+  双传输 + 指数退避重连稳定性窗口 + `kill_on_drop`);分页折叠、ContentBlock 四类投影降级、
+  `Mcp-Session-Id`/`MCP-Protocol-Version` echo、TLS 三级策略复用 `build_http_client`、
+  SSRF 复用 `url_safety`。
+- `MCP_Use` 网关式工具(单工具 + 7 action:list_servers/connect/list_tools/call_tool/
+  list_resources/read_resource/close;信封 0/1001/3001/5001-5006),注册进
+  SubAgent-Work + Main-Work,`LAEW_MCP_ENABLED=off` 全关。
+- SQLite `mcp_servers` 表 + DAO(headers Vault 加密)+ `laew mcp add|list|del|test` CLI。
+- 提示词 `mcp_use_hint.rs` 独立段 + `tool_args_digest` MCP_Use 分支。
+
+**gap 对账**:知识库「laew 无 MCP 支持」(`专题-MCP架构深度分析.md` 横向对比表)→ ✅
+(最小闭环:双传输 + 工具/资源调用;展开式 `mcp__{server}__{tool}`/OAuth/Prompts→Skill
+按设计 §1.3 列为 P1);L1060(MCP session 过期 404+-32001)→ 🟡(HTTP 404 归 Connect
+触发重连,完整 needs-auth 状态机待 P1)。
+
+**验证**:lib 单测 1645 passed / 0 failed(净增 28:mcp 协议层 15 + mcp_use 16 + mcp_server DAO 5
++ 注册面 2,含退避稳定性窗口与投影降级钉死);e2e 新增 §11 **10 项全 PASS**(mock MCP server
+真实 stdio 握手 + tools/list + CRUD + 参数校验拒绝)。**e2e 总计 PASS=225 / FAIL=0**。
+
+**设计**:`docs/MCP_Use/01-设计与解决方案.md`

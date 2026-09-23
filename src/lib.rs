@@ -21,6 +21,7 @@ pub mod error;
 pub mod frontmatter;
 pub mod llm;
 pub mod logging;
+pub mod mcp;
 pub mod session;
 pub mod shutdown;
 #[cfg(test)]

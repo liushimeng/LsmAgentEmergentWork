@@ -207,6 +207,27 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         );
         CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, to_role, consumed);
+
+        -- ========== MCP server 配置表(2026-09-23 第 123 轮) ==========
+        -- 设计见 docs/MCP_Use/01-设计与解决方案.md §5:
+        -- 通用 MCP 服务调用(MCP_Use)的 server 接入记录,`laew mcp add` 维护。
+        -- transport='stdio' 时 command 必填;transport='http' 时 url 必填(DAO 写入校验)。
+        -- headers_enc 敏感请求头经 Vault(AES-256-GCM)加密存储(对齐 providers.api_key D9-4)。
+        CREATE TABLE IF NOT EXISTS mcp_servers (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT NOT NULL UNIQUE,
+            transport     TEXT NOT NULL CHECK(transport IN ('stdio','http')),
+            command       TEXT,
+            args          TEXT NOT NULL DEFAULT '[]',
+            env_json      TEXT NOT NULL DEFAULT '{}',
+            url           TEXT,
+            headers_enc   TEXT,
+            enabled       INTEGER NOT NULL DEFAULT 1,
+            timeout_ms    INTEGER NOT NULL DEFAULT 30000,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name);
         "#,
     )?;
     migrate(conn)?;

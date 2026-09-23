@@ -13,6 +13,7 @@ use rusqlite::Connection;
 use thiserror::Error;
 
 pub mod chat_store;
+pub mod mcp_server;
 pub mod models;
 pub mod paths;
 pub mod pragmas;
@@ -69,6 +70,10 @@ pub enum ConfigError {
     /// 序列化/反序列化错误(通用)。
     #[error("序列化错误: {0}")]
     Serialization(String),
+
+    /// 入参校验失败(通用,2026-09-23 第 123 轮:mcp_servers 写入校验复用)。
+    #[error("参数校验失败: {0}")]
+    Validation(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;

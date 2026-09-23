@@ -139,6 +139,10 @@ enum Cmd {
     #[command(subcommand)]
     Provider(ProviderCmd),
 
+    /// 管理 MCP server 接入记录(通用 MCP 服务调用,2026-09-23 第 123 轮)
+    #[command(subcommand)]
+    Mcp(McpCmd),
+
     /// 内部隐藏子命令：由 BrowserManager 在 launch 后创建，禁止手工调用。
     #[command(name = "__browser-watchdog", hide = true)]
     BrowserWatchdog {
@@ -219,6 +223,161 @@ fn parse_protocol(s: &str) -> std::result::Result<Protocol, String> {
 
 fn parse_context_size(s: &str) -> std::result::Result<u64, String> {
     lsm_agent::config::parse_context_size(s)
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCmd {
+    /// 新增一条 MCP server 接入记录
+    Add {
+        /// server 名称(MCP_Use 的 server 参数,唯一)
+        #[arg(long)]
+        name: String,
+        /// 传输类型: stdio(本地子进程)或 http(Streamable HTTP)
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// stdio:可执行文件(如 npx / python3 / node)
+        #[arg(long)]
+        command: Option<String>,
+        /// stdio:命令参数(JSON 数组字符串,如 '["-y","@mock/mcp"]')
+        #[arg(long, default_value = "[]")]
+        args: String,
+        /// stdio:子进程环境变量(JSON 对象字符串)
+        #[arg(long, default_value = "{}")]
+        env: String,
+        /// http:Streamable HTTP 端点 URL
+        #[arg(long)]
+        url: Option<String>,
+        /// http:自定义请求头(可重复,格式 "K: V";敏感值经 Vault 加密落库)
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// 单请求超时毫秒(默认 30000)
+        #[arg(long)]
+        timeout_ms: Option<i64>,
+    },
+    /// 列出全部 MCP server 接入记录
+    List,
+    /// 删除一条接入记录(id 或 name)
+    Del { target: String },
+    /// 连通性自检:initialize 握手 + tools/list 后断开(id 或 name)
+    Test { target: String },
+}
+
+fn parse_header_kv(s: &str) -> std::result::Result<(String, String), String> {
+    let (k, v) = s
+        .split_once(':')
+        .ok_or_else(|| format!("header 格式应为 `K: V`,got: {s}"))?;
+    let k = k.trim();
+    if k.is_empty() {
+        return Err("header 名不能为空".into());
+    }
+    Ok((k.to_string(), v.trim().to_string()))
+}
+
+async fn cmd_mcp(c: McpCmd) -> Result<()> {
+    use lsm_agent::database::mcp_server::McpServerEntry;
+    let (_paths, db) = open_db()?;
+    match c {
+        McpCmd::Add {
+            name,
+            transport,
+            command,
+            args,
+            env,
+            url,
+            headers,
+            timeout_ms,
+        } => {
+            let mut headers_map = serde_json::Map::new();
+            for h in &headers {
+                let (k, v) = parse_header_kv(h).map_err(anyhow::Error::msg)?;
+                headers_map.insert(k, serde_json::Value::String(v));
+            }
+            let headers_json = if headers_map.is_empty() {
+                "{}".to_string()
+            } else {
+                serde_json::Value::Object(headers_map).to_string()
+            };
+            let entry = McpServerEntry {
+                name: name.clone(),
+                transport: transport.trim().to_ascii_lowercase(),
+                command,
+                args,
+                env_json: env,
+                url,
+                headers_json,
+                timeout_ms,
+            };
+            let id = db.add_mcp_server(&entry).map_err(anyhow::Error::from)?;
+            println!("✓ 已新增 MCP server id={id} name={name} transport={}", entry.transport);
+        }
+        McpCmd::List => {
+            let records = db.list_mcp_servers().map_err(anyhow::Error::from)?;
+            if records.is_empty() {
+                println!("(空)尚未配置任何 MCP server。用 `laew mcp add` 添加。");
+                return Ok(());
+            }
+            for r in records {
+                let marker = if r.enabled { " " } else { "x" };
+                let endpoint = match r.transport.as_str() {
+                    "http" => r.url.clone().unwrap_or_default(),
+                    _ => {
+                        let mut s = r.command.clone().unwrap_or_default();
+                        if !r.args.trim().is_empty() && r.args.trim() != "[]" {
+                            s.push(' ');
+                            s.push_str(&r.args);
+                        }
+                        s
+                    }
+                };
+                println!(
+                    "{marker} id={:<3} [{:<4}] {:<20} @ {}  (timeout: {}ms)",
+                    r.id, r.transport, r.name, endpoint, r.timeout_ms
+                );
+            }
+        }
+        McpCmd::Del { target } => {
+            db.delete_mcp_server(&target).map_err(anyhow::Error::from)?;
+            println!("✓ 已删除 MCP server: {target}");
+        }
+        McpCmd::Test { target } => {
+            use lsm_agent::agent::tools::mcp_use::record_to_config;
+            let rec = db.get_mcp_server(&target).map_err(anyhow::Error::from)?;
+            if !rec.enabled {
+                println!("✗ server `{}` 已禁用(enabled=0),跳过测试", rec.name);
+                return Ok(());
+            }
+            let cfg = record_to_config(&rec);
+            let mgr = lsm_agent::mcp::manager::McpManager::global();
+            match mgr.connect(&cfg).await {
+                Ok(info) => {
+                    println!(
+                        "✓ 握手成功 protocol={} serverInfo={}",
+                        info.protocol_version,
+                        info.server_info
+                    );
+                    match mgr.list_tools(&cfg).await {
+                        Ok(tools) => {
+                            println!("✓ tools/list: {} 个工具", tools.len());
+                            for t in tools.iter().take(20) {
+                                let ro = if t.read_only { " [ro]" } else { "" };
+                                println!("    - {}{}", t.name, ro);
+                            }
+                            if tools.len() > 20 {
+                                println!("    …(共 {} 个)", tools.len());
+                            }
+                        }
+                        Err(e) => println!("✗ tools/list 失败: {e}"),
+                    }
+                    mgr.close(&cfg.name).await;
+                }
+                Err(e) => {
+                    println!("✗ 连接失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn open_db() -> Result<(Paths, Db)> {
@@ -979,6 +1138,7 @@ async fn main() -> Result<()> {
     } else {
         match cli.cmd {
             Some(Cmd::Provider(p)) => cmd_provider(p).await,
+            Some(Cmd::Mcp(c)) => cmd_mcp(c).await,
             // 已在 main 初始化前返回；此分支仅为穷尽性匹配。
             Some(Cmd::BrowserWatchdog { .. }) => unreachable!("watchdog returned before setup"),
             None => {

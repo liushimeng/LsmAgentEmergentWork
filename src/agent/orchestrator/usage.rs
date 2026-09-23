@@ -118,6 +118,36 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
             }
             truncate_progress_text(&parts.join(" "), 90)
         }
+        "MCP_Use" => {
+            // ★ 2026-09-23 第 123 轮:通用 MCP 服务调用差异化摘要。
+            // 只显示 action=X server=Y tool=Z / uri=U(值截 ≤30 字符),不回显 arguments
+            // (可能是大 JSON / 敏感数据)。
+            let g = |k: &str| {
+                obj.get(k)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let action = g("action").unwrap_or_default();
+            let mut parts = vec![format!("action={action}")];
+            if let Some(s) = g("server") {
+                parts.push(format!("server={}", truncate_progress_text(&s, 20)));
+            }
+            match action.as_str() {
+                "call_tool" => {
+                    if let Some(t) = g("tool") {
+                        parts.push(format!("tool={}", truncate_progress_text(&t, 30)));
+                    }
+                }
+                "read_resource" => {
+                    if let Some(u) = g("uri") {
+                        parts.push(format!("uri={}", truncate_progress_text(&u, 30)));
+                    }
+                }
+                _ => {}
+            }
+            truncate_progress_text(&parts.join(" "), 70)
+        }
         "Bash" => {
             // ★ 2026-09-17 第 78 轮 P1-1:大命令精简
             // ★ 第 99 轮:长命令不再倾倒正文前 80 字符 —— 实测 python base64 解码
