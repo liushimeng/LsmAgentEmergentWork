@@ -116,6 +116,10 @@ impl AgentProfile {
     }
 
     /// Main-Work Agent profile(流程层,WorkFlow 编排)。
+    ///
+    /// 2026-09-23 第 122 轮:工具面新增 MCP_Web_Use(编排层信息收集) + 编排提示词
+    /// ReAct 化 + 启用 LoopGuard(第 120 轮基础设施)。详见
+    /// `docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md`。
     pub fn main_work_profile() -> Self {
         Self::with_self_awareness(
             MAIN_WORK_AGENT_NAME,
@@ -501,6 +505,38 @@ mod tests {
         assert!(names.contains(&"Bash".to_string()));
         assert!(names.contains(&"Read".to_string()));
         assert!(!names.iter().any(|n| n == "Write"));
+    }
+
+    /// 2026-09-23 第 122 轮:Main-Work 编排层信息收集型工具面 5 件 + MCP_Web_Use +
+    /// SubAgent;仍不持 Write / Edit;`defer_emit_force=false`(对齐 SubAgent-Work)。
+    #[test]
+    fn main_work_profile_includes_react_tool_surface() {
+        let p = AgentProfile::main_work_profile();
+        let names = tool_names(&p);
+        for t in [
+            "Bash",
+            "Read",
+            "Glob",
+            "Grep",
+            "TodoWrite",
+            "MCP_Web_Use",
+            "SubAgent",
+        ] {
+            assert!(
+                names.contains(&t.to_string()),
+                "Main-Work 工具面应含 {t}: {names:?}"
+            );
+        }
+        for forbidden in ["Write", "Edit"] {
+            assert!(
+                !names.iter().any(|n| n == forbidden),
+                "Main-Work 不应持 {forbidden}: {names:?}"
+            );
+        }
+        assert!(
+            !p.defer_emit_force,
+            "Main-Work 不开 defer_emit_force(对齐 SubAgent-Work;无结构化 emit 通道)"
+        );
     }
 
     #[test]

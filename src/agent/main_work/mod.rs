@@ -48,7 +48,17 @@ pub struct MainWorkRunner {
 
 impl MainWorkRunner {
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>) -> Self {
-        let agent = Agent::new(llm, AgentProfile::main_work_profile());
+        // 2026-09-23 第 122 轮:Main-Work 编排层 ReAct 化 + 信息收集型工具面
+        // (MCP_Web_Use + Bash + Read + Glob + Grep + TodoWrite)。
+        // 编排本身是「思考轮」,8 轮 LLM 迭代足够覆盖
+        // TaskFocus(1 轮) + 前提验证(2~3 轮) + 拆解 + emit(1 轮)。
+        // explore_budget=2:第 1~2 轮属「TaskFocus + 首批前提验证」(探索期);
+        // 第 3 轮起进入「执行期」(verify + decompose + emit),
+        // 由 HintRole::Execute 角色化文案告知模型「禁止再开新的只读探查」。
+        // 详见 docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md §3.3。
+        let agent = Agent::new(llm, AgentProfile::main_work_profile())
+            .with_max_iterations(8)
+            .with_explore_budget(2);
         Self { agent, db }
     }
 

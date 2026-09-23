@@ -559,6 +559,52 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 
 ---
 
+## 编排循环(ReAct 模式,2026-09-23 第 122 轮新增)
+
+你是靠「反馈 → 执行 → 再反馈 → 再执行」逐轮推进的编排 Agent,不是脚本播放器。
+每一轮严格按三段走:
+
+- **Thought(推理)**:先用 1~3 句写出 —— 我已经确认了什么?还缺什么?
+  下一步做哪一件事最省(能一次拿到最多新信息)?
+- **Action(行动)**:发起工具调用。无依赖的只读调用**一次性并发发出**
+  (Read / Glob / Grep 可同批多条);有依赖或有副作用的才分轮。
+- **Observation(观察)**:读完工具结果,显式判断「这一步是否让任务向前推进了」。
+  推进了 → 继续下一步;没推进 → **立即换路径**,不要用相同参数再试一次。
+
+硬性约束:
+- **任务前提验证(2026-09-23 第 122 轮新规)**:拿到用户 prompt 第一轮不要直接出
+  JSON,先用 Bash / Read / Glob / Grep / MCP_Web_Use 验证任务前提(目标 URL 是否可
+  访问 / 目标文件是否存在 / 目标依赖是否已安装 / 目标网页入口与登录态)。
+  前提不成立 → 输出空 workflows,让上层叙述失败 + 排查建议,不要硬拆。
+- 禁止无 Thought 的盲调;禁止不读 Observation 就发下一批调用。
+- 同一工具 + 同一参数 + 同一结果**连续出现 2 次**,系统判定为无进展并警告;
+  出现 3 次进入止损宽限轮;第 4 次直接终止本单元。需要等待外部状态变化时,用带
+  wait / timeout 的调用(如 `MCP_Web_Use` sequence 的 wait 步骤),不要靠反复
+  轮询消耗预算。
+- 迭代预算过半时系统会提示进度;收到【收口提示】后**立即停止新动作**,基于已有
+  Observation 输出最终 JSON。
+- 已知充分、acceptance 可执行时即刻收口,不为「看起来更完整」而继续探查。
+
+**先 TaskFocus、再拆解**(2026-09-23 真实复盘最佳实践):
+- 第一轮:**TaskFocus** 阶段,让模型明确「我已经在拆哪一步了」。可用 TodoWrite
+  把整份编排计划列出(顶层 todo list,3~6 个 todo),每完成一项 update 标记。
+- 第二轮~倒数第二轮:**Verify + Decompose** 阶段,基于 todo 顺序逐项验证
+  (Bash / Read / MCP_Web_Use 探查) + 拆解。
+- 最后一轮:**Emit** 阶段,基于 todo 进度输出最终 JSON。
+
+---
+
+## 任务前提验证清单(编排前必查)
+
+- [ ] 目标 URL 是否可访问(`curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5`
+      或 `MCP_Web_Use(action=open)` 验证连通性;返回 404/超时则说明上层,不要硬拆)
+- [ ] 目标文件 / 目录是否存在(`Glob` / `ls`)
+- [ ] 目标依赖是否已安装(`cat package.json` / `cat Cargo.toml`)
+- [ ] 目标项目是否在 git 仓库(`git rev-parse --is-inside-work-tree`)
+- [ ] 桌面 GUI 任务(Main-Work 不持 MCP_Window_Use,跳过窗口列表探查)
+
+---
+
 ## 输入格式(由 Orchestrator 注入)
 - medium 任务:Yolo 分类结果 + decomposition_plan
 - hard 任务:Plan 文档路径 + Yolo 分类结果
@@ -605,17 +651,48 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 
 fn main_work_tools_hint() -> &'static str {
     "工具调用规范:\n\
-     - 使用 Read 读取文件;使用 Bash 执行只读类命令(ls / cat / grep / wc 等)。\n\
+     - 使用 Bash 执行只读类命令(ls / cat / grep / curl / git log / wc 等,禁写盘)。\n\
+     - 使用 Read 读取文件;使用 Glob / Grep 检索项目结构与符号。\n\
+     - 使用 MCP_Web_Use(action=open/list/inspect/screenshot,观察类)做网页信息收集;\n\
+       不要在编排阶段执行写操作(control/submit_form 等)。\n\
+     - 写文件优先用 TodoWrite 列编排清单(顶层 3~6 个 todo),每完成一项 update 标记。\n\
      - 不要直接修改源代码(委派给 SubAgent-Work);不要使用 Write 写源代码。\n\n\
+     ## 连续工作模式(一轮做完整批动作)\n\
+     优先用「一次调用编排多步」的复合能力,把 N 轮压成 1 轮:\n\
+     - MCP_Web_Use:action=sequence(≤24 步,批内用 $page_id 占位) / batch /\n\
+       explore(一次取多个 inspect 维度,信息收集阶段首选)。\n\
+     - SubAgent:action=batch(≤8 个独立子任务并行,适合相互独立的 WorkFlow 探查)。\n\
+     - TodoWrite:编排清单 ≥3 步时先 create 全量,每完成一步 update。\n\n\
+     单工具批次规则:\n\
+     - 同一轮里**无依赖**的只读调用(Read / Glob / Grep / MCP_Web_Use 的只读 action)\n\
+       一次全部发出,系统会并发执行(上限 4 条),比逐轮串行省 3~4 倍迭代预算。\n\
+     - 有副作用的调用(Bash 写盘 / Write)按依赖顺序分轮,不要指望它们与只读调用\n\
+       混在一批里并发 —— 它们会被保序串行执行。\n\n\
+     ## 任务前提验证清单(编排前必查)\n\
+     - [ ] 目标 URL 是否可访问(`curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5`\n\
+           或 `MCP_Web_Use(action=open)` 验证连通性)\n\
+     - [ ] 目标文件 / 目录是否存在(`Glob` / `ls`)\n\
+     - [ ] 目标依赖是否已安装(`cat package.json` / `cat Cargo.toml`)\n\
+     - [ ] 目标项目是否在 git 仓库(`git rev-parse --is-inside-work-tree`)\n\n\
      可用工具:\n\
      - Bash(command, timeout_ms?, description?): 只读 / 检查类命令。\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
+     - Glob(pattern) / Grep(pattern, path?): 项目结构与符号检索。\n\
+     - MCP_Web_Use(action, ...): 网页信息收集(open 拿页面 / inspect 探查 DOM /\n\
+       screenshot 视觉验证),只读观察类 action。\n\
+     - TodoWrite(action, ...): 编排清单顶层规划(≥3 步时先 create 全量)。\n\
      - SubAgent(action, agent_type?, task?, tasks?, ...): 把相互独立的 WorkFlow 并行\n\
        委派给子 Agent(action=list 先看名册与额度;详见系统提示词「自感知」段)。"
 }
 
-const MAIN_WORK_ANTHROPIC_TAIL: &str = "确保 JSON 输出合法,workflows 数组不要有空元素。";
-const MAIN_WORK_OPENAI_TAIL: &str = "确保 function calling 输出合法 JSON。";
+const MAIN_WORK_ANTHROPIC_TAIL: &str =
+    "按 ReAct 三段推进(Thought→Action→Observation);任务前提已用 Bash / Read / MCP_Web_Use\
+     验证后再出 JSON;无依赖的只读工具调用一次性并发发出;最终输出必须为合法 JSON,\
+     workflows 数组不要有空元素。";
+const MAIN_WORK_OPENAI_TAIL: &str =
+    "按 ReAct 三段推进(Thought→Action→Observation);任务前提已用 Bash / Read / MCP_Web_Use\
+     验证后再出 JSON;无依赖的只读工具调用一次性并发发出;最终输出必须为合法 JSON,\
+     workflows 数组不要有空元素。";
 /// SubAgent-Work Agent 基础提示词(执行层最小单元)
 const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work,执行层最小单元 Agent。
 

@@ -275,8 +275,16 @@ pub fn plan_registry() -> ToolRegistry {
     )
 }
 
-/// Main-Work Agent 工具注册表:Bash + Read + Glob + Grep(流程层可检索,不写文件)
-/// + SubAgent(第 114 轮:把独立 WorkFlow 交给并行子 Agent)。 
+/// Main-Work Agent 工具注册表(2026-09-23 第 122 轮:编排层信息收集型工具面):
+/// - **只读侦察**:Bash(只读)/ Read / Glob / Grep(项目结构与符号检索)
+/// - **网页信息收集**:`MCP_Web_Use`(新增,2026-09-23;编排前探查目标 URL /
+///   入口 / DOM 结构,避免盲拆)
+/// - **顶层规划**:`TodoWrite`(编排清单 ≥3 步时先 create 全量,每完成一项 update)
+/// - **并行委派**:SubAgent(第 114 轮:把独立 WorkFlow 交给并行子 Agent)
+///
+/// Main-Work 仍**不持** `Write / Edit`(流程层只编排不落源代码;SubAgent-Work 专用),
+/// 也**不持** `MCP_Window_Use`(桌面窗口操控归 SubAgent-Work,平台门控 + 单一焦点守卫)。
+/// 详见 `docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md` §3.1。
 pub fn main_work_registry() -> ToolRegistry {
     register_subagent(
         ToolRegistry::new()
@@ -284,7 +292,8 @@ pub fn main_work_registry() -> ToolRegistry {
             .register(Arc::new(read::ReadTool))
             .register(Arc::new(glob::GlobTool))
             .register(Arc::new(grep::GrepTool))
-            .register(Arc::new(todo::TodoWriteTool::shared())),
+            .register(Arc::new(todo::TodoWriteTool::shared()))
+            .register(Arc::new(mcp_web_use::McpWebUseTool)),
     )
 }
 
@@ -473,8 +482,11 @@ mod names_tests {
         // 2026-09-22 ReAct 改造:Yolo 工具面已扩展为含 MCP_Web_Use(用于意图判断所需的
         // 网页信息收集:open/list/inspect/screenshot 观察类 action)。
         // 其它入口/编排/质检角色仍不持浏览器操控工具(权限面不扩大)。
+        // 第 122 轮(2026-09-23)修订:Main-Work 也加入 MCP_Web_Use(编排层信息收集),
+        // 本断言拆分为 main_work_includes_mcp_web_use + plan_and_quality_exclude_mcp_web_use
+        // 见下方。保留本断言仅验证 Yolo 与 Plan/Quality 的相对位置。
         assert!(yolo_registry().names().contains(&"MCP_Web_Use"));
-        assert!(!main_work_registry().names().contains(&"MCP_Web_Use"));
+        // Plan / QC 仍不含 MCP_Web_Use(Main-Work 现已含,见 main_work_includes_mcp_web_use)
         assert!(!plan_registry().names().contains(&"MCP_Web_Use"));
         assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
     }
@@ -493,5 +505,45 @@ mod names_tests {
         assert!(!yolo_registry().names().contains(&"TodoWrite"));
         assert!(!plan_registry().names().contains(&"TodoWrite"));
         assert!(!quality_registry().names().contains(&"TodoWrite"));
+    }
+
+    // 第 122 轮(2026-09-23):Main-Work 注册面验证 —— 编排层信息收集型工具面
+    // 5 件(Bash / Read / Glob / Grep / TodoWrite) + MCP_Web_Use + SubAgent;
+    // 仍不持 Write / Edit(流程层只编排不落源代码);也不持 MCP_Window_Use
+    // (桌面窗口操控归 SubAgent-Work,平台门控 + 单一焦点守卫)。
+    #[test]
+    fn main_work_registry_includes_react_recon_surface() {
+        let registry = main_work_registry();
+        let names = registry.names();
+        // 必备工具面(Bash / Read / Glob / Grep / TodoWrite / SubAgent + 新增 MCP_Web_Use)
+        for t in ["Bash", "Read", "Glob", "Grep", "TodoWrite", "MCP_Web_Use", "SubAgent"] {
+            assert!(names.contains(&t), "Main-Work 应含 {t}: {names:?}");
+        }
+        // 仍不持 Write / Edit
+        for forbidden in ["Write", "Edit"] {
+            assert!(
+                !names.contains(&forbidden),
+                "Main-Work 不应持 {forbidden}: {names:?}"
+            );
+        }
+    }
+
+    // ==== 第 122 轮修订 ====:
+    // 把原来的 `main_work_plan_quality_exclude_mcp_web_use`(强制 Main-Work 不持
+    // MCP_Web_Use)拆分为两条独立断言:Main-Work 现含 MCP_Web_Use(第 122 轮新增),
+    // Plan / Quality 仍不含(粒度对齐:plan/quality 不参与网页信息收集)。
+    #[test]
+    fn main_work_includes_mcp_web_use() {
+        assert!(
+            main_work_registry().names().contains(&"MCP_Web_Use"),
+            "Main-Work 编排层应持 MCP_Web_Use(信息收集): {:?}",
+            main_work_registry().names()
+        );
+    }
+
+    #[test]
+    fn plan_and_quality_exclude_mcp_web_use() {
+        assert!(!plan_registry().names().contains(&"MCP_Web_Use"));
+        assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
     }
 }

@@ -59,7 +59,12 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **多 Agent 架构(6 角色)**：
   - **Yolo Agent**（`LsmAgentEmergentWork-Yolo`）：入口层，负责目标识别 / 意图识别（每条输入先做 目的→目标→意图 三步分析）/ 任务**三档分类**(simple/medium/hard)/ 失败回流与用户建议；持**信息收集型工具面**（`Read`/`Glob`/`Grep`/`Bash` 仅限只读侦察 / `MCP_Web_Use` 仅观察类 action + `SubAgent` 只读并行子 Agent），分类前按 **ReAct**（Thought→Action→Observation）循环自主收集信息；结构化分类经 `submit_task_classification` 提交，采用**延迟强制**（探索轮不注入 forced `tool_choice`、仅末轮强制收口；`AgentProfile.defer_emit_force`）。详见 `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md`。
   - **Plan Agent**（`LsmAgentEmergentWork-Plan`）：规划层，仅在 hard 任务时启用；持 Read/Write 工具，输出 Markdown 方案到 `plans/{session_id}-{seq}.md`。
-  - **Main-Work Agent**（`LsmAgentEmergentWork-Main-Work`）：流程层，接收 medium/hard 任务，拆 WorkFlow 列表；持 Bash/Read 工具。
+  - **Main-Work Agent**（`LsmAgentEmergentWork-Main-Work`）：流程层，接收 medium/hard 任务，拆 WorkFlow 列表。**第 122 轮（2026-09-23）工具集扩展与 ReAct 改造**：
+    **(a) 信息收集型工具面**——`main_work_registry` 新增 `MCP_Web_Use`（编排前探查目标 URL / 入口 / DOM 结构），同时保留 Bash/Read/Glob/Grep/TodoWrite/SubAgent；仍**不持** Write/Edit（流程层只编排不落源代码）+ MCP_Window_Use（桌面窗口操控归 SubAgent-Work 专用）。
+    **(b) 编排循环 ReAct 化**——`MAIN_WORK_BASE_PROMPT` 新增「## 编排循环(ReAct 模式)」节（Thought→Action→Observation 三段节奏 + 5 条硬性约束 + 任务前提验证硬性要求：拿到用户 prompt 第一轮不要直接出 JSON，先用 Bash/Read/Glob/Grep/MCP_Web_Use 验证目标 URL / 文件 / 依赖；前提不成立 → 输出空 workflows）+「## 任务前提验证清单」节 +「先 TaskFocus、再拆解」三段式节奏（TaskFocus → Verify+Decompose → Emit）；`main_work_tools_hint()` 新增「## 连续工作模式」节（与 SubAgent-Work 一致的复合工具批次规则）。
+    **(c) 复用第 120 轮 LoopGuard**——Main-WorkRunner 走 `Agent::run_session` 自动启用 `LoopGuard`（NUDGE_AT=2 / ABORT_AT=3 + 宽限轮），编排层原地打转同样止损。
+    **(d) 迭代预算与角色化 hint**——`MainWorkRunner::new` 设 `with_max_iterations(8).with_explore_budget(2)`（编排是「思考轮」，8 轮足够覆盖 TaskFocus+前提验证+拆解+emit）；`HintRole` 派生与 SubAgent-Work 共用一套，未用 MCP_Web_Use → `Execute`，真动过 → `Ui`。
+    设计见 `docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md`。
   - **SubAgent-Work Agent**（`LsmAgentEmergentWork-SubAgent-Work`）：执行层最小单元，每个流程处理单元委派一个 SubAgent；持 Bash/Read/Write 全套工具。
     **第 120 轮（2026-09-23）ReAct 强化 + 工具连续工作模式**：把第 119 轮做在入口层 Yolo 的 ReAct 补齐到执行层。
     **(a) 提示词 ReAct 化**——`SUB_AGENT_BASE_PROMPT` 新增「## 执行循环(ReAct 模式)」节（Thought→Action→Observation 三段节奏 + 5 条硬性约束 + **明示无进展阈值**，模型不知道有止损机制时会以为可以无限重试），`sub_agent_tools_hint()` 新增「## 连续工作模式」节（把既有复合工具 `sequence`/`input_batch`/`batch`/`workflow`/`explore`/`TodoWrite` 与 ReAct 循环绑定），双协议 tail 改写。
@@ -246,6 +251,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/Agent系统提示词与工具架构重构/` — 系统提示词独立模块 + 工具迁移到 agent 域 设计文档
 - `docs/YoloAgent设计/` — 双 Agent 架构 / Yolo 入口层 / 任务四级分类 / 任务拆解 设计（01-设计与解决方案 / 02-系统提示词设计 / **03-Yolo工具集扩展与ReAct信息收集设计**，2026-09-22 信息收集型工具面 + ReAct 延迟强制）
 - `docs/SubAgentWork执行层ReAct与连续工作模式/` — **第 120 轮(2026-09-23)**:执行层 ReAct 强化(Thought→Action→Observation 提示词化 + runtime hints 角色化 + 通用收口预告)+ 工具连续工作模式(`Tool::parallel_safe` 参数感知分类 + 分批并发 + 保序回填)+ 无进展止损(`loop_guard.rs` doom_loop,进展键含 Observation 摘要,轮询等待零误伤)+ 与 opencode/AtomCode/DeepSeek/Claude Code 的 gap 对应表与「决策不做」理由(01-设计与解决方案)
+- `docs/Main-Work工具扩展与ReAct改造/` — **第 122 轮(2026-09-23)**:编排层(Main-Work)补齐三档链路最后一块 ReAct 拼图 —— `main_work_registry` 新增 `MCP_Web_Use`(编排前探查 URL / DOM);`MAIN_WORK_BASE_PROMPT` 新增「编排循环(ReAct 模式)」+「任务前提验证清单」+「TaskFocus/Verify+Decompose/Emit」三段式;`MainWorkRunner::new` 配 `with_max_iterations(8).with_explore_budget(2)`;LoopGuard 自动接入编排层(01-设计与解决方案)
 - `docs/Yolo项目上下文注入/` — 项目说明文件五级链发现（CLAUDE.md→AGENTS.md→README.md→自动生成→空）+ 每会话首次注入 + 三步意图识别优化（01-设计与解决方案 / 02-技术实现文档）
 - `docs/TUI自动化测试/` — TUI 子屏自动化测试方案:**tmux control-mode** 真 PTY 渲染,命令速查、run_e2e.sh 封装、用例矩阵、断言策略
 - `docs/自动化测试-提示词文件列表/` — 10 维度 × 100 组多轮对话测试脚本(知识问答/编码/代码理解/调试/文件处理/电脑使用/软件使用/界面设计/文档规划/laew 元任务),每条 3~5 轮追问,标注预期档位(simple/medium/hard),用于人工/自动化回归与 Yolo 分类验证

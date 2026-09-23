@@ -563,3 +563,134 @@ mod dedup_tests {
         let plan = parse_workflow_plan(src).unwrap();
         assert!(!plan.workflows[0].pre_explore, "省略 pre_explore 应默认 false");
     }
+
+    // ======================== 第 122 轮(2026-09-23)新增测试 ========================
+    // 覆盖 Main-Work 编排层信息收集型工具面 + ReAct 编排循环 + LoopGuard 接入。
+    // 详见 docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md §6.1。
+
+    /// 第 122 轮:Main-Work 工具面含 MCP_Web_Use + 不持 Write/Edit。
+    /// 工具注册表的最终位置在 `tools/mod.rs::main_work_registry`,本断言作为
+    /// main_work 模块侧的双重校验。
+    #[test]
+    fn main_work_registry_includes_mcp_web_use() {
+        // 通过 AgentProfile 派生(运行时真实路径)
+        let names = AgentProfile::main_work_profile()
+            .tools
+            .names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&"MCP_Web_Use".to_string()),
+            "Main-Work 应持 MCP_Web_Use: {names:?}"
+        );
+        // 仍不持 Write / Edit
+        assert!(!names.contains(&"Write".to_string()));
+        assert!(!names.contains(&"Edit".to_string()));
+    }
+
+    /// 第 122 轮:Main-Work 提示词渲染含 ReAct 节 + 任务前提验证清单。
+    #[test]
+    fn main_work_prompt_has_react_and_precondition_section() {
+        let prompt = crate::agent::system_prompt::SystemPrompt::main_work()
+            .render(crate::config::Protocol::Anthropic);
+        assert!(
+            prompt.contains("编排循环(ReAct 模式"),
+            "Main-Work 提示词应含「编排循环(ReAct 模式)」节: 实际无"
+        );
+        assert!(
+            prompt.contains("任务前提验证"),
+            "Main-Work 提示词应含「任务前提验证」清单"
+        );
+        assert!(
+            prompt.contains("TaskFocus"),
+            "Main-Work 提示词应含「TaskFocus」编排节奏关键字"
+        );
+    }
+
+    /// 第 122 轮:Main-Work 工具说明含 MCP_Web_Use。
+    #[test]
+    fn main_work_tools_hint_mentions_mcp_web_use() {
+        let prompt = crate::agent::system_prompt::SystemPrompt::main_work()
+            .render(crate::config::Protocol::Anthropic);
+        assert!(
+            prompt.contains("MCP_Web_Use"),
+            "Main-Work tools_hint 应提及 MCP_Web_Use: 实际无"
+        );
+        assert!(
+            prompt.contains("连续工作模式"),
+            "Main-Work tools_hint 应含「连续工作模式」节"
+        );
+    }
+
+    /// 第 122 轮:MainWorkRunner::new 设 max_iterations=8 + explore_budget=2
+    /// (编排层 TaskFocus + Verify + Decompose + Emit 节奏所需)。
+    /// 验证策略:MainWorkRunner 字段私有,改用 Agent profile 路径直接验证
+    /// `with_max_iterations(8).with_explore_budget(2)` 配出的工具面与 max_iterations。
+    #[test]
+    fn main_work_runner_config() {
+        let agent = crate::agent::Agent::new(
+            std::sync::Arc::new(MainWorkRunnerConfigOnlyLlm),
+            AgentProfile::main_work_profile(),
+        );
+        let configured = agent.with_max_iterations(8).with_explore_budget(2);
+        assert_eq!(
+            configured.max_iterations, 8,
+            "Main-Work 应配 max_iterations=8"
+        );
+        // 工具面 sanity check
+        let names = configured.profile.tools.names();
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"MCP_Web_Use"));
+    }
+
+    /// 第 122 轮:MainWorkRunner 默认构造不抛错。
+    /// 用 Paths::for_test(tmp) 构造临时 Db,避免污染根目录数据库。
+    #[test]
+    fn main_work_runner_default_construction_ok() {
+        let tmp = tempdir();
+        let paths = crate::config::Paths::for_test(&tmp);
+        let db = std::sync::Arc::new(crate::config::Db::open(&paths).unwrap());
+        let llm = std::sync::Arc::new(MainWorkRunnerConfigOnlyLlm);
+        let runner = MainWorkRunner::new(llm, db);
+        // 构造成功(未 panic)即视为通过;字段私有,无需深入。
+        let _ = runner;
+    }
+
+    /// 跨平台安全 tempdir(测试环境无 tempfile crate 依赖时用 std::env::temp_dir())。
+    fn tempdir() -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        dir.push(format!("laew-mainwork-test-{pid}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("tempdir 创建失败");
+        dir
+    }
+
+    /// 用于本模块测试的占位 LLM:不真正驱动,仅满足 trait 装配。
+    /// 注:`max_tokens`/`protocol` 取默认实现;`complete` 返回错误(本测试不调用)。
+    struct MainWorkRunnerConfigOnlyLlm;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for MainWorkRunnerConfigOnlyLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[crate::llm::ChatMessage],
+            _tools: &[crate::llm::ToolDef],
+            _meta: &crate::llm::RequestMeta,
+        ) -> crate::error::Result<crate::llm::Completion> {
+            Err(crate::error::AgentError::Other(
+                "MainWorkRunnerConfigOnlyLlm is a placeholder for construction-only tests"
+                    .into(),
+            ))
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    // ============================================================================
