@@ -103,6 +103,12 @@ pub struct TuiSession {
     pub connectivity: std::sync::Arc<ConnectivityTracker>,
     /// D13 离线模式(2026-09-11):离线请求队列,LLM 不可达时暂存用户输入。
     pub offline_queue: OfflineQueue,
+    /// 第 126 轮 Skill 系统(渐进式披露):TUI 侧的 SkillRegistry 句柄,用于
+    /// `/skills` 列表 / `/skill <name> [args]` 命令调度;orchestrator 侧的
+    /// SkillRegistry 同源(BTreeMap 共享 Arc),目录发现零重复。
+    pub skill_registry: std::sync::Arc<crate::agent::skills::SkillRegistry>,
+    /// 第 126 轮 Skill 系统:TUI 调度 skill 时注入 user 消息的 session_id。
+    pub session_id: std::sync::Arc<String>,
     /// TODO 任务清单状态(第二十轮候选 5,2026-09-21):SubAgent 显式跟踪多步任务进度。
     /// 与 TodoWrite tool 共享同一全局实例(也允许直接在 TuiSession 中持有独立实例)。
     pub todo_state: std::sync::Arc<TodoState>,
@@ -152,6 +158,9 @@ impl TuiSession {
             collector.clone(),
             connectivity.clone(),
         )?;
+        // 第 126 轮 Skill 系统:与 orchestrator 共享同一 SkillRegistry(Arc 零拷贝)
+        let skill_registry = orchestrator.skill_registry();
+        let skill_session_id = orchestrator.skill_session_id();
         Ok(Self {
             paths,
             db,
@@ -167,6 +176,8 @@ impl TuiSession {
             task_started_at: None,
             connectivity,
             offline_queue: OfflineQueue::new(),
+            skill_registry,
+            session_id: skill_session_id,
             todo_state,
         })
     }

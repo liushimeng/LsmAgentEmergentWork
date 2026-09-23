@@ -1078,3 +1078,84 @@ server → 发现工具 → 调用工具 → 读取资源)。
 真实 stdio 握手 + tools/list + CRUD + 参数校验拒绝)。**e2e 总计 PASS=225 / FAIL=0**。
 
 **设计**:`docs/MCP_Use/01-设计与解决方案.md`
+
+---
+
+## 第 126 轮(2026-09-23)—— Skill 系统与渐进式披露(P0 落地)
+
+**需求**:加强「渐进式披露」能力 —— 启动仅预加载技能元信息(名称 + 短描述)到 system prompt,
+让模型判断是否启用;任务需要时再通过 `use_skill` 工具按需加载完整 body;复杂场景按需加载引用资料。
+降低 token 开销、提升缓存命中率;Agent 循环按需探查,平衡上下文窗口限制与信息完备度。
+
+**gap 对账**:知识库第六轮 Skill 专题「laew 完全无 Skill 系统」+ 第十六轮登记 L1051-L1065 段
+「权限/工具/压缩/记忆/MCP/Skill」中 Skill 部分 → **本轮 P0 全部落地** ✅。
+
+**实现**(新建 11 个文件 + 修改 12 个文件):
+
+1. **Skill 数据模型**(`src/agent/skills/skill.rs`):全字段 frontmatter(name/version/
+   license/compatibility/user-invocable/allowed-tools/source + 嵌套 metadata)+
+   `SkillMetadata{flat, nested, lists}` 结构 + 变量替换(`$ARGUMENTS`/`$1..$9`/
+   `${CLAUDE_SKILL_DIR}`/`!`cmd`` shell 注入)+ 无占位符时末尾追加 `ARGUMENTS:` 块
+   (对齐 atomcode)+ `validate_name` kebab-case 校验 + `fallback_description` 兜底。
+
+2. **SkillRegistry 3 源发现**(`src/agent/skills/registry.rs`):BTreeMap(字节稳定 →
+   prefix cache)+ Project/CrossAgent/User 三级目录发现(项目级 > 跨 agent > 用户级,
+   后赢覆盖)+ bundled `include_str!` 嵌入兜底 + 递归深度 ≤ 4 + gitignore 简化过滤 +
+   `SkillLoadDiagnostics{loaded, ignored}` 诊断不静默(对齐 pi)。
+
+3. **Catalog 渲染 8KB 预算**(`src/agent/skills/render.rs`):`CATALOG_BYTE_BUDGET=8000` +
+   `PER_SKILL_DESC_CAP=1024` + `CATALOG_HEADER` + GUIDANCE 强约束段(never invent
+   / must load before work / call list_skills when omitted)+ 超预算归入 omitted 注释。
+
+4. **UseSkill + ListSkills 工具**(`src/agent/skills/tools.rs`):`use_skill`(变量替换
+   走 `spawn_blocking` 防 shell 注入阻塞 + `<<<LAEW:SKILL_LOADED>>>` 输出信封 + 未知
+   skill 报可用列表 + 不要猜名字)+ `list_skills`(只读 parallel_safe=true)。
+
+5. **3 个内置 skill**(`src/agent/skills/bundled/{git-commit,code-review,test-runner}.md`):
+   Conventional Commits 规范起草 / 静态代码评审清单 / 项目测试自动运行与诊断,各带
+   完整嵌套 metadata(tags/category/os)。
+
+6. **工具挂载范围**(用户决策):SubAgent-Work + Main-Work + 动态子 Agent 类型;
+   Yolo/Plan/QC/SessionContext/Debug/Compact 不挂(污染 catalog)。`LAEW_SKILL_DISABLED`
+   开关门控,对齐 `register_mcp_use` 惯例。
+
+7. **Profile 装配**(`src/agent/profile.rs`):新增 `sub_agent_work_profile_with_skills`
+   + `main_work_profile_with_skills`(直接装配 AgentProfile,绕开 `with_self_awareness`
+   的 `fn() -> ToolRegistry` 无捕获限制);`SubAgentRunner::with_skills` /
+   `MainWorkRunner::new_with_skills` builder(零参 `new` 保留给动态子 Agent/单元测试)。
+
+8. **Orchestrator 单例**(`src/agent/orchestrator/mod.rs`):`with_config` 顶层构造
+   `SkillRegistry::load` 一次,`Arc` 共享给 sub_agent + main_work,`skill_registry()` /
+   `skill_session_id()` 暴露给 TUI。
+
+9. **TUI 集成**(`src/tui/slash.rs` + `completion.rs` + `commands.rs`):`/skills` 列出
+   全部可见 skill + 加载诊断;`/skill <name> [args]` 展开 SKILL body 并预览(不直接
+   触发 agent loop,避免误触发;真正加载由 SubAgent 主动调 `use_skill`)。builtin
+   slash 注册 + `BUILTIN_NAMES` 追加 `"skill"` `"skills"`(与 D2 自定义命令共用遮蔽检查)。
+
+10. **system_prompt 子模块**(`src/agent/system_prompt/skill_catalog.rs`):与
+    `mcp_use_hint` 同款独立子模块(`mod.rs` 已 1669 行接近 1800 上限),
+    `append_to()` 把 catalog 追加到 rules 段(第 3 段,带 cache_control),
+    跨 SubAgent/Main-Work 实例字节级稳定 → Anthropic prefix cache 复用最大化。
+
+**复用现有基础设施**:
+- `src/frontmatter.rs::parse` / `parse_bool` / `fallback_description`(第 115 轮抽出,
+  与 D2 命令 + D11 自定义子 Agent 共用)—— frontmatter 全套零新增。
+- `src/agent/tools/mod.rs::register_mcp_use` 开关模式 → `register_skill_tools`。
+- `src/agent/system_prompt/mod.rs::append_base` + `mcp_use_hint` 子模块模式。
+- `src/tui/commands.rs::BUILTIN_NAMES` 静态白名单 + `completion.rs::SlashCommand::builtin`。
+
+**测试**:
+- **单元测试 38 项全过**:`cargo test --lib` → **1728 passed / 0 failed / 3 ignored**
+  (基线 1693 + 新增 38 - 3 pre-existing ignore = 1728,零回归)。覆盖:
+  validate_name 非法 / frontmatter 全字段 + 嵌套 metadata / description 兜底 /
+  变量替换三类占位符 + atomcode ARGUMENTS 追加 + shell 注入 + 3 源发现后赢 +
+  诊断 ignored / 8KB 预算触发 omitted + 字节稳定 + use_skill 替换 + list_skills 空/非空。
+- **端到端 225 全过**:`bash testReport/run_e2e.sh` → **PASS=225 / FAIL=0**(零回归)。
+  §4m mock 真实 `use_skill` wire 级验证留后续轮次(mock 扩展)。
+
+**设计**:`docs/Skill系统与渐进式披露/01-设计与解决方案.md`(本文件)。
+
+**P1/P2 留后续**:skill-creator(分析 session 生成 SKILL.md)/ Skill 安全扫描器 /
+conditional paths / 远程 HTTPS discovery + atomic 切换 / 描述优化循环 /
+Skill 评测集 + Grader + Analyst / Workshop 自演化 / ClawHub 分发。

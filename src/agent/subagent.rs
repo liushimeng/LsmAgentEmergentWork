@@ -139,6 +139,12 @@ pub struct SubAgentRunner {
     agent: Agent,
     db: Arc<Db>,
     max_iterations: usize,
+    /// 挂载的 Skill registry(2026-09-23 第 126 轮,渐进式披露)
+    #[allow(dead_code)] // 暂未在 runner 内部读取,仅供 future use_skill trace / audit
+    skills: Option<Arc<crate::agent::skills::SkillRegistry>>,
+    /// 当前 session_id(2026-09-23 第 126 轮,Skill 系统上下文关联)
+    #[allow(dead_code)]
+    session_id: Option<Arc<String>>,
 }
 
 impl SubAgentRunner {
@@ -149,7 +155,32 @@ impl SubAgentRunner {
             agent,
             db,
             max_iterations,
+            skills: None,
+            session_id: None,
         }
+    }
+
+    /// 挂载 Skill 系统(2026-09-23 第 126 轮,渐进式披露)。
+    ///
+    /// 重建 `Agent` 使 profile 含 Skill 工具面(use_skill / list_skills)
+    /// + system prompt 拼装 Skill catalog 段(8KB 预算对齐 atomcode)。
+    /// `skills` 与 `session_id` 在 runner 生命周期内共享(Arc),后续 Agent
+    /// 实例直接复用同一 registry,**catalog 字节级一致 → Anthropic
+    /// prefix cache 跨 SubAgent 调用复用最大化**。
+    pub fn with_skills(
+        mut self,
+        skills: Arc<crate::agent::skills::SkillRegistry>,
+        session_id: Arc<String>,
+    ) -> Self {
+        let profile = AgentProfile::sub_agent_work_profile_with_skills(
+            skills.clone(),
+            Arc::clone(&session_id),
+        );
+        self.agent = Agent::new(self.agent.llm(), profile);
+        self.max_iterations = self.agent.max_iterations();
+        self.session_id = Some(session_id);
+        self.skills = Some(skills);
+        self
     }
 
     /// 2026-09-17 第 78 轮 P0-2:Runner 出口兜底 —— 提取 sub_session 中的「实质产物摘要」。

@@ -130,6 +130,33 @@ impl AgentProfile {
         )
     }
 
+    /// Main-Work profile with Skills(2026-09-23 第 126 轮,渐进式披露;用户决策 Main-Work 也挂)。
+    pub fn main_work_profile_with_skills(
+        skills: std::sync::Arc<crate::agent::skills::SkillRegistry>,
+        session_id: std::sync::Arc<String>,
+    ) -> Self {
+        let base_prompt = crate::agent::system_prompt::skill_catalog::append_to(
+            SystemPrompt::main_work(),
+            &skills,
+        );
+        let tools =
+            crate::agent::tools::main_work_registry_with(skills, session_id);
+        let prompt = build_self_aware_prompt(
+            MAIN_WORK_AGENT_NAME,
+            base_prompt,
+            &tools,
+            SpawnPolicy::FullChildren,
+        );
+        Self {
+            name: MAIN_WORK_AGENT_NAME.to_string(),
+            system_prompt: prompt,
+            tools,
+            emit_tool: None,
+            spawn_policy: SpawnPolicy::FullChildren,
+            defer_emit_force: false,
+        }
+    }
+
     /// SubAgent-Work Agent profile(执行层,最小单元)。
     pub fn sub_agent_work_profile() -> Self {
         Self::with_self_awareness(
@@ -139,6 +166,38 @@ impl AgentProfile {
             sub_agent_work_registry,
             None,
         )
+    }
+
+    /// SubAgent-Work profile with Skills(2026-09-23 第 126 轮,渐进式披露)。
+    ///
+    /// 拼装顺序:
+    /// 1. `SystemPrompt::sub_agent_work()` 基础 prompt
+    /// 2. `+ skill_catalog::append_to(...)` 追加 Skill catalog 段(8KB 预算)
+    /// 3. `sub_agent_work_registry_with(skills, sid)` 注册 UseSkill/ListSkills 工具
+    /// 4. `build_self_aware_prompt` 加自感知段(动态子 Agent 等)
+    ///
+    /// 与 `sub_agent_work_profile` 不同:此函数**直接装配** ToolRegistry 而非用
+    /// `with_self_awareness` 的 `fn() -> ToolRegistry` 指针(后者要求无捕获,
+    /// 而本函数必须捕获外部 registry 本地变量)。
+    pub fn sub_agent_work_profile_with_skills(
+        skills: std::sync::Arc<crate::agent::skills::SkillRegistry>,
+        session_id: std::sync::Arc<String>,
+    ) -> Self {
+        let base_prompt = crate::agent::system_prompt::skill_catalog::append_to(
+            SystemPrompt::sub_agent_work(),
+            &skills,
+        );
+        let tools =
+            crate::agent::tools::sub_agent_work_registry_with(skills, session_id);
+        let prompt = build_self_aware_prompt(SUB_AGENT_WORK_NAME, base_prompt, &tools, SpawnPolicy::FullChildren);
+        Self {
+            name: SUB_AGENT_WORK_NAME.to_string(),
+            system_prompt: prompt,
+            tools,
+            emit_tool: None,
+            spawn_policy: SpawnPolicy::FullChildren,
+            defer_emit_force: false,
+        }
     }
 
     /// Quality-Check Agent profile(质检层)。

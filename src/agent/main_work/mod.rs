@@ -48,15 +48,33 @@ pub struct MainWorkRunner {
 
 impl MainWorkRunner {
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>) -> Self {
+        Self::new_with_skills(llm, db, None, None)
+    }
+
+    /// 挂载 Skill 系统(2026-09-23 第 126 轮,渐进式披露;用户决策 Main-Work 也挂)。
+    ///
+    /// `skills=None` / `session_id=None` → 不挂 Skill(兼容动态子 Agent / 单元测试)。
+    pub fn new_with_skills(
+        llm: Arc<dyn crate::llm::LlmClient>,
+        db: Arc<Db>,
+        skills: Option<std::sync::Arc<crate::agent::skills::SkillRegistry>>,
+        session_id: Option<std::sync::Arc<String>>,
+    ) -> Self {
         // 2026-09-23 第 122 轮:Main-Work 编排层 ReAct 化 + 信息收集型工具面
-        // (MCP_Web_Use + Bash + Read + Glob + Grep + TodoWrite)。
+        // (MCP_Web_Use + Bash + Read / Glob / Grep + TodoWrite)。
         // 编排本身是「思考轮」,8 轮 LLM 迭代足够覆盖
         // TaskFocus(1 轮) + 前提验证(2~3 轮) + 拆解 + emit(1 轮)。
         // explore_budget=2:第 1~2 轮属「TaskFocus + 首批前提验证」(探索期);
         // 第 3 轮起进入「执行期」(verify + decompose + emit),
         // 由 HintRole::Execute 角色化文案告知模型「禁止再开新的只读探查」。
         // 详见 docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md §3.3。
-        let agent = Agent::new(llm, AgentProfile::main_work_profile())
+        let profile = match (&skills, &session_id) {
+            (Some(s), Some(sid)) => {
+                AgentProfile::main_work_profile_with_skills(s.clone(), sid.clone())
+            }
+            _ => AgentProfile::main_work_profile(),
+        };
+        let agent = Agent::new(llm, profile)
             .with_max_iterations(8)
             .with_explore_budget(2);
         Self { agent, db }

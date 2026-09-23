@@ -69,6 +69,8 @@ impl CompletionEngine {
             ),
             SlashCommand::builtin("commands", &[], "列出可用的自定义斜杠命令", "/commands"),
             SlashCommand::builtin("provider", &["p"], "管理大模型接入记录", "/provider <sub>"),
+            SlashCommand::builtin("skills", &[], "列出已加载的 Skill(渐进式披露)", "/skills"),
+            SlashCommand::builtin("skill", &[], "展开 SKILL body 预览", "/skill <name> [args]"),
             SlashCommand::builtin(
                 "provider list",
                 &["provider ls"],

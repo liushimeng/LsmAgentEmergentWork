@@ -167,6 +167,11 @@ pub struct MultiAgentOrchestrator {
     /// 每任务取消门:8 个角色的 LLM 客户端被 `CancellableLlmClient` 统一包裹,
     /// `handle_cancellable` 开始时注入 token、结束时(Drop guard)清除。
     cancel_gate: Arc<CancelGate>,
+    /// 第 126 轮 Skill 系统(渐进式披露):顶层装配的 SkillRegistry,
+    /// TUI 用 `skill_registry()` 拿到同一 Arc 调度 `/skill` / `/skills`。
+    skill_registry: Arc<crate::agent::skills::SkillRegistry>,
+    /// 第 126 轮 Skill 系统:TUI 调度 `/skill <name>` 时注入 user 消息的 session_id。
+    skill_session_id: Arc<String>,
 }
 
 impl MultiAgentOrchestrator {
@@ -187,9 +192,28 @@ impl MultiAgentOrchestrator {
             Arc::new(CancellableLlmClient::new(llm, cancel_gate.clone()));
         let yolo = YoloRunner::new(llm.clone());
         let plan = PlanRunner::new(llm.clone(), db.clone(), plans_dir);
-        let main_work = MainWorkRunner::new(llm.clone(), db.clone());
+        // Skill 系统(2026-09-23 第 126 轮,渐进式披露):
+        // - 顶层一次性构造 SkillRegistry(3 源发现 + bundled 嵌入)
+        // - 跨 SubAgent/Main-Work 共享(目录发现零重复)
+        // - catalog 字节级稳定 → Anthropic prefix cache 跨调用复用
+        let paths = crate::database::Paths::detect().unwrap_or_else(|_| {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            crate::database::Paths::for_test(&cwd)
+        });
+        let skill_registry = std::sync::Arc::new(
+            crate::agent::skills::SkillRegistry::load(&paths.root_dir, &paths.work_dir)
+        );
+        let session_id = std::sync::Arc::new(format!(
+            "orch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let main_work = MainWorkRunner::new_with_skills(llm.clone(), db.clone(), Some(skill_registry.clone()), Some(session_id.clone()));
         let sub_agent = Arc::new(
             SubAgentRunner::new(llm.clone(), db.clone())
+                .with_skills(skill_registry.clone(), session_id.clone())
                 .with_max_iterations(cfg.subagent_max_iterations),
         );
         let quality = Arc::new(QualityRunner::new(llm.clone(), db.clone()));
@@ -206,7 +230,19 @@ impl MultiAgentOrchestrator {
             db,
             cfg,
             cancel_gate,
+            skill_registry,
+            skill_session_id: session_id,
         }
+    }
+
+    /// 第 126 轮 Skill 系统:暴露 SkillRegistry 给 TUI 调度(共享同一 Arc)。
+    pub fn skill_registry(&self) -> Arc<crate::agent::skills::SkillRegistry> {
+        Arc::clone(&self.skill_registry)
+    }
+
+    /// 第 126 轮 Skill 系统:session_id 用于 `/skill` 命令注入 user 消息的标记。
+    pub fn skill_session_id(&self) -> Arc<String> {
+        Arc::clone(&self.skill_session_id)
     }
 
     /// 处理一次用户输入(不可取消;既有调用方 / 测试零改动)。

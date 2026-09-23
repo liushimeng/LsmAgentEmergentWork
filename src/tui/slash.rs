@@ -125,6 +125,14 @@ impl TuiSession {
             "commands" => {
                 self.print_custom_commands();
             }
+            // 第 126 轮 Skill 系统:列出已加载 skill(name + description + source)
+            "skills" => {
+                self.run_skills_list();
+            }
+            // 第 126 轮 Skill 系统:把 skill body 注入为当前 user 消息(走真实 agent loop)
+            "skill" => {
+                self.run_skill(rest_args);
+            }
             "diff" => {
                 // /diff <old_file> <new_file>:并排 diff 两个文件(行级+字符级着色)
                 let parts: Vec<&str> = rest_args.split_whitespace().collect();
@@ -1141,6 +1149,67 @@ impl TuiSession {
             println!("  /{}{hint}", c.name);
             println!("    {} — {}", c.description, src);
         }
+    }
+
+    /// 第 126 轮 Skill 系统:`/skills` —— 列出当前可见 skill(name + description + source)。
+    fn run_skills_list(&self) {
+        let skills = self.skill_registry.list();
+        if skills.is_empty() {
+            println!("  当前没有可用 skill。");
+            return;
+        }
+        println!("  Skills({}):", skills.len());
+        for (name, desc, source) in &skills {
+            if desc.is_empty() {
+                println!("  - {name}  [{source}]");
+            } else {
+                println!("  - {name}: {desc}  [{source}]");
+            }
+        }
+        // 加载诊断
+        let diag = self.skill_registry.diagnostics();
+        if !diag.ignored.is_empty() {
+            println!("  ⚠ 忽略 {} 个非法 skill(描述过长/命名非法等):", diag.ignored.len());
+            for (path, reason) in &diag.ignored {
+                println!("    {}: {}", path.display(), reason);
+            }
+        }
+    }
+
+    /// 第 126 轮 Skill 系统:`/skill <name> [args]` —— 展开 SKILL body 并预览。
+    ///
+    /// P0 范围:`/skill` 不直接触发 agent 循环,而是把展开结果作为「预览」打印,
+    /// 用户可手动复制粘贴进下一轮 prompt(避免误触发)。
+    /// 真正「加载 SKILL 让模型执行」由 SubAgent-Work 在系统内主动调 `use_skill`
+    /// 完成(对齐 atomcode 的设计 — Skill 是工具,不是用户手势)。
+    fn run_skill(&self, rest_args: &str) {
+        let rest = rest_args.trim();
+        if rest.is_empty() {
+            println!("  用法: /skill <name> [args]");
+            println!("  示例: /skill git-commit feat: 新增 Skill 系统");
+            println!("  列出全部: /skills");
+            return;
+        }
+        let (name, arguments) = match rest.find(char::is_whitespace) {
+            Some(idx) => (&rest[..idx], rest[idx + 1..].trim()),
+            None => (rest, ""),
+        };
+        let skill = match self.skill_registry.get(name) {
+            Some(s) => s,
+            None => {
+                println!("  [skill 错误] skill '{name}' 不存在。请 /skills 查看可用列表。");
+                return;
+            }
+        };
+        let sid = self.session_id.as_str();
+        let expanded = crate::agent::skills::skill::expand(&skill, arguments, sid);
+        println!(
+            "  === Skill: {} (来源:{}) ===",
+            skill.name(),
+            skill.source.as_str()
+        );
+        println!("{expanded}");
+        println!("  === /skill 预览结束(若要让模型按此 SKILL 执行,请复制正文到下一轮 prompt) ===");
     }
 }
 

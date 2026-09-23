@@ -51,6 +51,7 @@ struct Frontmatter {
 pub const BUILTIN_NAMES: &[&str] = &[
     "help", "h", "?", "exit", "quit", "q", "clear", "c", "new", "n", "model", "provider", "p",
     "export", "commands", "diff", "theme", "t", "rewind", "undo", "fork", "branches", "branch",
+    "skill", "skills",
     "switch",
 ];
 

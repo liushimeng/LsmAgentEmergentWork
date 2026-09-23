@@ -14,6 +14,9 @@ use crate::config::Protocol;
 /// MCP_Use 工具提示词段(2026-09-23 第 123 轮,独立子模块防 mod.rs 超 1800 行)。
 pub mod mcp_use_hint;
 
+/// Skill catalog 注入子模块(2026-09-23 第 126 轮,渐进式披露)。
+pub mod skill_catalog;
+
 /// 工具说明生成策略。
 #[derive(Clone)]
 pub enum ToolsHint {

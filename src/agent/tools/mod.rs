@@ -29,6 +29,8 @@ pub mod subagent;
 pub mod write;
 pub mod todo;
 
+pub use crate::agent::skills::tools::{ListSkillsTool, UseSkillTool};
+
 /// 工具需要实现的异步 trait
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -208,6 +210,65 @@ fn register_mcp_use(reg: ToolRegistry) -> ToolRegistry {
     }
 }
 
+/// 条件注册 Skill 工具(2026-09-23 第 126 轮:渐进式披露载体)。
+///
+/// 关闭语义:`LAEW_SKILL_DISABLED=on|1|true|yes` 时**不注册** UseSkill/ListSkills
+/// (与 `register_mcp_use` / `register_subagent` 同款开关模式)。
+/// 同时挂载到 `sub_agent_work_registry_with` / `main_work_registry_with` 路径,
+/// 静态目录(零参数版)不挂载(动态子 Agent 类型不感知 SkillRegistry)。
+pub fn skills_enabled() -> bool {
+    !matches!(
+        std::env::var("LAEW_SKILL_DISABLED")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("on" | "1" | "true" | "yes")
+    )
+}
+
+pub fn register_skill_tools(
+    reg: ToolRegistry,
+    skills: std::sync::Arc<crate::agent::skills::SkillRegistry>,
+    session_id: std::sync::Arc<String>,
+) -> ToolRegistry {
+    if !skills_enabled() {
+        return reg;
+    }
+    reg.register(Arc::new(UseSkillTool::new(skills.clone(), session_id)))
+        .register(Arc::new(ListSkillsTool::new(skills)))
+}
+
+/// SubAgent-Work + Skill 扩展(编排器装配的 Skill 可见)。
+///
+/// 静态目录(零参数版)不挂 Skill(动态子 Agent 类型等不感知 SkillRegistry 的场景)。
+pub fn sub_agent_work_registry_with(
+    skills: std::sync::Arc<crate::agent::skills::SkillRegistry>,
+    session_id: std::sync::Arc<String>,
+) -> ToolRegistry {
+    register_skill_tools(builtin_registry(), skills, session_id)
+}
+
+/// Main-Work + Skill 扩展(编排层也可调 Skill,用户决策)。
+pub fn main_work_registry_with(
+    skills: std::sync::Arc<crate::agent::skills::SkillRegistry>,
+    session_id: std::sync::Arc<String>,
+) -> ToolRegistry {
+    register_skill_tools(main_work_registry_inner(), skills, session_id)
+}
+
+/// Main-Work 静态目录(原 `main_work_registry` 拆内函数,保持零参 API 不变)。
+pub fn main_work_registry_inner() -> ToolRegistry {
+    register_mcp_use(register_subagent(
+        ToolRegistry::new()
+            .register(Arc::new(bash::BashTool::readonly()))
+            .register(Arc::new(read::ReadTool))
+            .register(Arc::new(glob::GlobTool))
+            .register(Arc::new(grep::GrepTool))
+            .register(Arc::new(todo::TodoWriteTool::shared()))
+            .register(Arc::new(mcp_web_use::McpWebUseTool)),
+    ))
+}
+
 /// 默认注册表:内置 Bash / Read / Write / Edit / Glob / Grep(SubAgent-Work / 兼容别名)
 ///
 /// 写操作(Write / Edit)带有沙箱拦截,限制在工作目录与系统临时目录。
@@ -317,15 +378,7 @@ pub fn plan_registry() -> ToolRegistry {
 /// 环境旁路 `LAEW_BASH_READONLY=off` 完全跳过 readonly 检查。
 /// 详见 `docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md` §3.1 + §B 章。
 pub fn main_work_registry() -> ToolRegistry {
-    register_mcp_use(register_subagent(
-        ToolRegistry::new()
-            .register(Arc::new(bash::BashTool::readonly()))
-            .register(Arc::new(read::ReadTool))
-            .register(Arc::new(glob::GlobTool))
-            .register(Arc::new(grep::GrepTool))
-            .register(Arc::new(todo::TodoWriteTool::shared()))
-            .register(Arc::new(mcp_web_use::McpWebUseTool)),
-    ))
+    main_work_registry_inner()
 }
 
 /// SubAgent-Work Agent 工具注册表:全套工具(执行层最小单元)

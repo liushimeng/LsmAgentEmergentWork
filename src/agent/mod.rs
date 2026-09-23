@@ -36,6 +36,7 @@ pub mod partial_json;
 pub mod permissions;
 pub mod plan;
 pub mod plan_validate;
+pub mod skills;
 pub mod profile;
 pub mod project_context;
 pub mod quality;
@@ -162,6 +163,11 @@ impl Agent {
     }
     pub fn profile(&self) -> &AgentProfile {
         &self.profile
+    }
+
+    /// 复制 profile 供动态装配(2026-09-23 第 126 轮 Skill 系统按 profile 复用)。
+    pub fn profile_clone(&self) -> AgentProfile {
+        self.profile.clone()
     }
     pub fn max_iterations(&self) -> usize {
         self.max_iterations
