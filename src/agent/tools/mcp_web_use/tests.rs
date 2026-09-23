@@ -442,6 +442,39 @@ fn parameters_has_window_and_highlight_properties() {
         );
     }
     assert_eq!(p["properties"]["highlight"]["default"], true);
+    // 第 125 轮:视口自适应开关进 schema
+    assert!(
+        p["properties"]["auto_expand_viewport"].is_object(),
+        "schema 应含 auto_expand_viewport 属性"
+    );
+    assert_eq!(p["properties"]["auto_expand_viewport"]["default"], true);
+    // 默认值文案统一 1080p(全模式),不得回退到 hidden=1440 旧口径
+    for key in ["window_width", "window_height"] {
+        let d = p["properties"][key]["description"].as_str().unwrap_or("");
+        assert!(d.contains("1920") || d.contains("1080"), "{key} 描述应说明 1080p 默认");
+        assert!(!d.contains("hidden=1440"), "{key} 描述残留旧 hidden=1440 口径");
+    }
+}
+
+// =================== 第 125 轮:视口基准 1080p 与 2K 自动扩展 ===================
+
+#[test]
+fn auto_expand_enabled_defaults_to_true() {
+    assert!(auto_expand_enabled(&json!({})), "缺省自动扩展视口开启");
+    assert!(auto_expand_enabled(&json!({"auto_expand_viewport": true})));
+    assert!(!auto_expand_enabled(&json!({"auto_expand_viewport": false})), "显式 false 才关");
+    assert!(auto_expand_enabled(&json!({"auto_expand_viewport": "yes"})), "非 bool 容错回默认开");
+}
+
+#[test]
+fn open_description_mentions_viewport_fit() {
+    // 工具描述是 LLM 的第一信息源:1080p 默认 + 2K 自动扩展必须写入
+    let d = McpWebUseTool.description();
+    assert!(d.contains("1920×1080") && d.contains("1080p"), "open 描述应说明全模式 1080p 默认");
+    assert!(
+        d.contains("auto_expand_viewport") && d.contains("2560×1440"),
+        "open 描述应说明自动扩展到 2K"
+    );
 }
 
 #[test]

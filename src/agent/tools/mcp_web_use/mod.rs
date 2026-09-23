@@ -173,6 +173,27 @@ fn parse_window_size(args: &Value) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+/// 第 125 轮:open 是否自动扩展视口(默认开;显式 false 才关)。
+/// 页面内容超出视口(横向裁切/可视高度不足)时,导航完成后自动把视口撑到
+/// 2K 上限(≤2560×1440),结果回 `data.viewport` 供 LLM 对账。
+fn auto_expand_enabled(args: &Value) -> bool {
+    args.get("auto_expand_viewport")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// 对页面执行视口自适应(fail-open:测量/扩展失败只记录,不影响 open 成功语义)。
+async fn fit_viewport(page_id: &str) -> Option<Value> {
+    BrowserManager::global()
+        .fit_viewport_to_content(
+            page_id,
+            crate::agent::browser::VIEWPORT_FIT_MAX_W,
+            crate::agent::browser::VIEWPORT_FIT_MAX_H,
+        )
+        .await
+        .ok()
+}
+
 // ===================== action=open(list/close 同级,轻量内联) =====================
 
 /// 启动/接管浏览器并打开一个页面(原 BrowserNew)。
@@ -226,19 +247,22 @@ async fn run_open(args: Value) -> Result<String> {
                         .ok()
                         .flatten()
                         .unwrap_or_else(|| url.to_string());
-                    return envelope(
-                        0,
-                        "ok",
-                        json!({
-                            "page_id": pid,
-                            "title": title,
-                            "final_url": final_url,
-                            "reused": true,
-                            "browser_reused": browser_reused,
-                            "mode": mode_label,
-                            "next_steps": open_next_steps(),
-                        }),
-                    );
+                    // 第 125 轮:复用路径同样做视口自适应(默认开,auto_expand_viewport=false 关)
+                    let mut payload = json!({
+                        "page_id": pid,
+                        "title": title,
+                        "final_url": final_url,
+                        "reused": true,
+                        "browser_reused": browser_reused,
+                        "mode": mode_label,
+                        "next_steps": open_next_steps(),
+                    });
+                    if auto_expand_enabled(&args) {
+                        if let Some(v) = fit_viewport(&pid).await {
+                            payload["viewport"] = v;
+                        }
+                    }
+                    return envelope(0, "ok", payload);
                 }
             }
         }
@@ -276,8 +300,9 @@ async fn run_open(args: Value) -> Result<String> {
         };
     let connect = str_arg(&args, "connect_url");
     let ua = str_arg(&args, "user_agent");
-    // 窗口尺寸(第 100 轮):显式参数 clamp 到安全区间,缺省由驱动层决定
-    // (headed=1920×1080 / hidden=1440×900)。
+    // 窗口尺寸(第 125 轮):显式参数 clamp 到安全区间;缺省由驱动层决定
+    // (全模式统一 1920×1080 = 1080p)。内容仍超视口时 open 后自动扩展
+    // 视口到 2K(auto_expand_viewport,默认开)。
     let window_size = parse_window_size(&args);
     let highlight = args.get("highlight").and_then(Value::as_bool).unwrap_or(true);
     match BrowserManager::global()
@@ -303,7 +328,8 @@ async fn run_open(args: Value) -> Result<String> {
                 "window": {
                     "width": window_size.map(|(w, _)| w),
                     "height": window_size.map(|(_, h)| h),
-                    "hint": "如需运行时调整:control(set_window);人工拖动窗口后:control(sync_viewport)",
+                    "default": [1920, 1080],
+                    "hint": "全模式默认 1080p;内容超视口时已自动扩展视口(见 data.viewport);运行时调整:control(set_window);人工拖动窗口后:control(sync_viewport)",
                 },
                 // next_steps —— 分步引导,降低 LLM 编排成本(第 74 轮):
                 // input_text → click → wait → elements 四步最常见动作链。
@@ -314,6 +340,17 @@ async fn run_open(args: Value) -> Result<String> {
             }
             if let Some(hint) = mode_hint {
                 data["mode_hint"] = json!(hint);
+            }
+            // 第 125 轮:视口自适应(默认开)——内容宽/高超出视口时自动扩展到
+            // 2K 上限,根治「hidden 视口太窄页面显示不全、元素不可见不可点」。
+            if auto_expand_enabled(&args) {
+                match fit_viewport(&page_id).await {
+                    Some(v) => data["viewport"] = v,
+                    None => {
+                        data["viewport"] =
+                            json!({"expanded": false, "note": "视口测量失败(不影响页面操作);需要时手动 control(set_viewport)"})
+                    }
+                }
             }
             envelope(0, "ok", data)
         }
@@ -552,11 +589,11 @@ pub struct McpWebUseTool;
 /// 作业规范部分精炼,全文见 SubAgent-Work 系统提示词的 MCP_Web_Use 段)。
 const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器操作网页(macOS / Windows / Linux,内存无头浏览器默认,也可接管已开浏览器;MCP 风格单工具多 action)。
 用 action 参数选择操作:
-- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, highlight?, timeout_ms?): 启动/接管 Chromium 并打开页面。默认纯 CDP 嵌入式无头浏览器(mode=hidden,无可见窗口,一次性临时 profile 不干扰日常浏览器);mode=headed 可见窗口(人工介入/可视化任务),默认 1920×1080(1080p),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。返回 {page_id,title,final_url,reused,mode,browser_reused,window,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
+- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, timeout_ms?): 启动/接管 Chromium 并打开页面。默认纯 CDP 嵌入式无头浏览器(mode=hidden,无可见窗口,一次性临时 profile 不干扰日常浏览器);mode=headed 可见窗口(人工介入/可视化任务);全模式启动窗口默认 1920×1080(1080p,第 125 轮起 hidden 不再用 1440×900 窄视口),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**视口自适应(第 125 轮,默认开)**:导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。返回 {page_id,title,final_url,reused,mode,browser_reused,window,viewport?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
 - list(): 列出当前存活页面 [{page_id,url,title,created_at}];返回前自动清理失效 entry。冷启动后多轮任务优先用它同步页面索引。
 - close(page_id*): 关闭指定页面;最后一个页面关闭时回收浏览器进程。page_id="all" 一键关闭全部页面并回收浏览器(任务收尾清场)。幂等;对话型页面(用户可能继续追问)可保留复用。
-- control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event/set_window/sync_viewport/set_highlight/request_human。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。screenshot 一律落盘返回 save_path(看图片文字用 params.ocr=true,文本模型无法消费 base64);eval_js 直接写表达式,支持 return 与多语句(失败自动 IIFE 重试),超长返回值自动落盘并以 saved_to 引用;download 支持 http(s) url 或 selector、save_dir、filename、timeout_ms,data: URL 直接解码落盘,完成后返回绝对 save_path 与 byte_size。set_window 运行时调整真实浏览器窗口(width/height/left/top/window_state=maximized|fullscreen|minimized|normal,CDP setWindowBounds,调整后自动清除视口覆盖保证渲染自适应不缺区域);sync_viewport 在人工拖动窗口大小后调用,清除 device metrics 覆盖使视口=窗口内容区;set_highlight(enabled) 运行时开关蓝色选中边框;request_human(reason=captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom, message?, options?, timeout_ms?=300000, bring_to_front?=true) 人工介入:滑块/短信验证码/扫码登录/实名认证/人脸核身/2FA 邮箱验证码/第三方 OAuth 等无法自动跳过的流程,先请求人工在 TUI 选择/输入(code=0,human_response 为人工回答),人工取消返回 code=4002,超时或非交互式 TUI 模式返回 code=4001(如实告知用户改用交互模式重试,严禁伪造结果)。
-- inspect(page_id*, info*, params?): 全部只读观察统一入口。info 枚举:console(控制台输出)/network(请求响应流)/elements(元素文本与矩形;params.selector 可选,缺失时默认返回 input/button/select/textarea/a/[role=button] 等全页交互元素)/dom(outerHTML 或节点树)/localstorage/sessionstorage/cookies/screenshot/page_meta/viewport/url/title/ping/image_urls/ocr(截图+OCR 识别图片文字,验证码/图表标签用;region 过滤词块)/blockers(启发式检测验证码/短信/扫码/登录墙等人工阻断,返回 blockers[]+suggested_action=request_human)。
+- control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event/set_window/sync_viewport/set_highlight/request_human。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。screenshot 一律落盘返回 save_path(看图片文字用 params.ocr=true,文本模型无法消费 base64);eval_js 直接写表达式,支持 return 与多语句(失败自动 IIFE 重试),超长返回值自动落盘并以 saved_to 引用;download 支持 http(s) url 或 selector、save_dir、filename、timeout_ms,data: URL 直接解码落盘,完成后返回绝对 save_path 与 byte_size。set_window 运行时调整真实浏览器窗口(width/height/left/top/window_state=maximized|fullscreen|minimized|normal,CDP setWindowBounds,调整后自动清除视口覆盖保证渲染自适应不缺区域);sync_viewport 在人工拖动窗口大小后调用,清除 device metrics 覆盖使视口=窗口内容区(会撤销 open 时的自动 2K 扩展);set_viewport(width,height,device_scale_factor?=1,mobile?=false) 手动设置布局视口(宽 320~7680/高 240~4320 自动 clamp;open 已默认自动扩展视口,仅当自动结果不理想时才手动指定);set_highlight(enabled) 运行时开关蓝色选中边框;request_human(reason=captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom, message?, options?, timeout_ms?=300000, bring_to_front?=true) 人工介入:滑块/短信验证码/扫码登录/实名认证/人脸核身/2FA 邮箱验证码/第三方 OAuth 等无法自动跳过的流程,先请求人工在 TUI 选择/输入(code=0,human_response 为人工回答),人工取消返回 code=4002,超时或非交互式 TUI 模式返回 code=4001(如实告知用户改用交互模式重试,严禁伪造结果)。
+- inspect(page_id*, info*, params?): 全部只读观察统一入口。info 枚举:console(控制台输出)/network(请求响应流)/elements(元素文本与矩形;params.selector 可选,缺失时默认返回 input/button/select/textarea/a/[role=button] 等全页交互元素)/dom(outerHTML 或节点树)/localstorage/sessionstorage/cookies/screenshot/page_meta/viewport(视口+内容尺寸与 overflow 溢出判定:横向溢出=页面显示不全需 set_viewport/重开 open 自动扩展,纵向溢出截图用 full_page=true)/url/title/ping/image_urls/ocr(截图+OCR 识别图片文字,验证码/图表标签用;region 过滤词块)/blockers(启发式检测验证码/短信/扫码/登录墙等人工阻断,返回 blockers[]+suggested_action=request_human)。
 - sequence(steps*, stop_on_error?): 连续执行模式。steps 最多 24 个,每项结构与单步调用相同(open/list/close/control/inspect),禁止嵌套 sequence;批内 page_id 用 "$page_id"/"${page_id}" 占位,点击派生新页可用 "$spawned_page_id"/"${spawned_page_id}",默认自动跟随 spawned_page_id,单步可 follow_spawned=false 保持原页。响应逐步返回 code/message/data,并给出最终 page_id。
 - explore(page_id*, queries*, summary_hint?)(第 118 轮):批量观察。一次调用合并多个 inspect 维度(elements/dom/screenshot/blockers 等),queries 数组最多 8 项,每项为单步 inspect 入参(如 {"info":"elements"} / {"info":"dom","params":{"selector":"form"}} / {"info":"screenshot"} / {"info":"blockers"});返回 {results:[{info,code,message,data},...], summary_hint, ok_count, err_count}。**进入新页面先用 1 次 explore 收集完整状态**(对比单步 inspect 节省 3-5 次 LLM round-trip);blockers 命中会附带 next_action hint 指引走 request_human。
 - batch(page_id*, steps*, stop_on_error?)(第 118 轮):批量混合执行,与 sequence 同语义但推荐用于「inspect + control 混合的稳定流程」(登录/表单类:inspect 验证 → input × N → click → wait → inspect 验证)。一次调用最多 24 步,允许任意 control + inspect 顺序。**对比 sequence 推荐用于批量执行场景**。
@@ -590,8 +627,9 @@ impl Tool for McpWebUseTool {
                 "url": { "type": "string", "description": "open 必填:目标网址" },
                 "reuse": { "type": "boolean", "default": true, "description": "open 可选:同 URL 已有存活页面时复用(导航刷新,page_id 不变,响应 reused:true);false 强制新开页面" },
                 "mode": { "type": "string", "enum": ["hidden", "new_headless", "headed"], "default": "hidden", "description": "open 可选:浏览器模式;hidden=纯 CDP 无窗口(默认,推荐),new_headless=旧 headless=true,headed=可见窗口(调试截图)" },
-                "window_width": { "type": "integer", "minimum": 320, "maximum": 7680, "description": "open 可选:浏览器窗口宽(px);缺省 headed=1920(1080p)/hidden=1440;与 window_height 成对使用;浏览器已存在时仅记录请求值(单实例复用)" },
-                "window_height": { "type": "integer", "minimum": 240, "maximum": 4320, "description": "open 可选:浏览器窗口高(px);缺省 headed=1080(1080p)/hidden=900;运行时调整用 control(set_window),人工拖动后用 control(sync_viewport) 自适应" },
+                "window_width": { "type": "integer", "minimum": 320, "maximum": 7680, "description": "open 可选:浏览器窗口宽(px);缺省全模式(hidden/headed)统一 1920(1080p);与 window_height 成对使用;浏览器已存在时仅记录请求值(单实例复用)" },
+                "window_height": { "type": "integer", "minimum": 240, "maximum": 4320, "description": "open 可选:浏览器窗口高(px);缺省全模式统一 1080(1080p);运行时调整用 control(set_window),人工拖动后用 control(sync_viewport) 自适应" },
+                "auto_expand_viewport": { "type": "boolean", "default": true, "description": "open 可选(默认 true):导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动用 device metrics 把视口扩展到 ≤2560×1440(2K),扩展结果回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;false 关闭;内容仍超 2K 上限时截图用 params.full_page=true 或 set_viewport 显式超限" },
                 "highlight": { "type": "boolean", "default": true, "description": "open 可选:headed 模式在页面四周注入一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标(标识 Agent 控制的窗口,人工介入用);pointer-events:none 不影响页面交互;可用 control(set_highlight, enabled=false) 运行时关闭" },
                 "timeout_ms": { "type": "integer", "description": "open 可选:页面加载超时(毫秒),默认 60000" },
                 "connect_url": { "type": "string", "description": "open 可选:接管已开浏览器,如 http://127.0.0.1:9222(需 --remote-debugging-port 启动)" },

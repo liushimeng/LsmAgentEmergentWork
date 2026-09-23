@@ -1327,13 +1327,21 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
       完整 / 组织树打印完成 / 登录态确认),**立即输出最终答案**,不要为了「再确认一下」
       开新的 explore/截图/eval_js;每次新增探查都必须能回答「这条观察会改变我的结论吗」,
       答不出就不要发。
-17. 窗口可视化(第 100 轮):给人看/演示/截图对比的任务用 open(mode=headed),默认
-    1920×1080(1080p),window_width/window_height 可自定义;页面四周的蓝色选中边框+
+17. 窗口可视化与视口自适应(第 100 轮,第 125 轮扩展):给人看/演示/截图对比的任务用
+    open(mode=headed),全模式(含 hidden 无头)启动窗口默认 1920×1080(1080p),
+    window_width/window_height 可自定义;页面四周的蓝色选中边框+
     「LAEW Agent 控制中」徽标是 Agent 窗口标识,方便人工识别,不要尝试移除(可用
     set_highlight 关闭)。人工手动拖动窗口大小后,control(sync_viewport) 让视口自适应
     窗口(渲染不缺区域);运行时调窗口用 control(set_window, width/height/window_state)。
     浏览器实例已存在时 open 永远复用同一进程(browser_reused:true),不要为换模式反复
     重建浏览器。
+    **视口显示不全对策(第 125 轮)**:open 导航完成后若页面内容超出视口(横向被裁/
+    可视高度不足)会自动把视口扩展到 ≤2560×1440(2K),结果见响应 data.viewport
+    (expanded/from/to/content/clamped);若 clamped=true 或截图响应带 content_overflow,
+    整页捕获用 screenshot params.full_page=true,或 set_viewport/更大 window_width 显式
+    超限;发现元素在视口外不可点时,先 inspect(info=viewport) 看 overflow.horizontal,
+    横向溢出必须先扩视口(重开 open 自动扩 / set_viewport 手动)再点击,不要对着
+    看不见的元素反复 click。auto_expand_viewport=false 可关自动扩展。
 18. 登录流程 sequence 模板(第 106 轮):登录/注册/表单提交类任务优先用 sequence 模式
     一次打包提交,减少迭代消耗。模板:
     {

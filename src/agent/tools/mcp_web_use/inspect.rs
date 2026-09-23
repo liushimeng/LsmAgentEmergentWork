@@ -316,9 +316,37 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                 .unwrap_or(Value::Null);
             Ok(json!({"page_id": id, "url": url, "title": title, "viewport": viewport, "user_agent": ua}))
         }
-        "viewport" => eval_js_string(&page,
-            "({width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio, scrollX: window.scrollX, scrollY: window.scrollY, scrollWidth: document.documentElement.scrollWidth, scrollHeight: document.documentElement.scrollHeight})"
-        ).await,
+        // 第 125 轮:视口观察增强 —— 内容尺寸取 documentElement/body 双源最大值,
+        // 附 overflow 溢出判定与 next_action 对策(横向裁切=显示不全根因)。
+        "viewport" => match eval_js_string(&page,
+            "({width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio, scrollX: window.scrollX, scrollY: window.scrollY, scrollWidth: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0), scrollHeight: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)})"
+        ).await {
+            Err(e) => Err(e),
+            Ok(mut v) => {
+                if let (Some(w), Some(h), Some(sw), Some(sh)) = (
+                    v.get("width").and_then(Value::as_f64),
+                    v.get("height").and_then(Value::as_f64),
+                    v.get("scrollWidth").and_then(Value::as_f64),
+                    v.get("scrollHeight").and_then(Value::as_f64),
+                ) {
+                    let horizontal = sw > w + 2.0;
+                    let vertical = sh > h + 2.0;
+                    v["overflow"] = json!({
+                        "horizontal": horizontal,
+                        "vertical": vertical,
+                        "content_larger_than_viewport": horizontal || vertical,
+                    });
+                    v["next_action"] = if horizontal {
+                        json!("内容横向被裁(页面显示不全/元素不可点的根因):重开 open(默认自动扩展视口到 2K)或 control(set_viewport, width=scrollWidth 对应值);仅截图看全内容用 screenshot params.full_page=true")
+                    } else if vertical {
+                        json!("纵向可滚动属正常:整页截图用 params.full_page=true;长文提取优先 inspect(elements/dom) 而非截图")
+                    } else {
+                        json!("continue")
+                    };
+                }
+                Ok(v)
+            }
+        },
         "url" => Ok(json!({"url": page.url().await.ok().flatten().unwrap_or_default()})),
         "title" => Ok(json!({"title": page.get_title().await.ok().flatten().unwrap_or_default()})),
         // image_urls(第 64 轮):一键提取页面图片 URL + canvas/svg 计数。

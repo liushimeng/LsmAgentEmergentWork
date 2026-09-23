@@ -926,14 +926,18 @@ async fn act_clear_storage(id: &str, p: &Value) -> std::result::Result<Value, St
 async fn act_set_viewport(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let w = p.get("width").and_then(Value::as_i64).ok_or_else(|| "缺 width".to_string())?;
     let h = p.get("height").and_then(Value::as_i64).ok_or_else(|| "缺 height".to_string())?;
-    let dsf = p.get("device_scale_factor").and_then(Value::as_f64).unwrap_or(1.0);
+    // 第 125 轮:与 open(window_width/height)同一安全区间,防极端值把渲染撑爆
+    let w = w.clamp(320, 7680);
+    let h = h.clamp(240, 4320);
+    let dsf = p.get("device_scale_factor").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.5, 4.0);
     let mobile = p.get("mobile").and_then(Value::as_bool).unwrap_or(false);
     let page = ensure_page(id).await?;
     let params = chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::builder()
         .width(w).height(h).device_scale_factor(dsf).mobile(mobile)
         .build().map_err(|e| e.to_string())?;
     page.execute(params).await.map_err(|e| e.to_string())?;
-    Ok(json!({"width": w, "height": h, "device_scale_factor": dsf, "mobile": mobile}))
+    Ok(json!({"width": w, "height": h, "device_scale_factor": dsf, "mobile": mobile,
+              "note": "device metrics 覆盖持续生效直到 sync_viewport/set_window 清除;还原用 sync_viewport"}))
 }
 
 /// 截图(control 与 inspect 的 screenshot 共用)。
@@ -973,6 +977,25 @@ pub(super) async fn act_screenshot(id: &str, p: &Value) -> std::result::Result<V
     }
     tokio::fs::write(&path, &bytes).await.map_err(|e| e.to_string())?;
     let mut out = json!({"save_path": path, "byte_size": bytes.len(), "format": format_str});
+    // 第 125 轮:非整页截图时检测内容是否超出视口(显示不全的直接信号),
+    // 溢出则附 content_overflow + 对策 hint;测量失败静默跳过(fail-open)。
+    if !full_page {
+        if let Ok(m) =
+            crate::agent::browser::page_viewport_metrics(&page).await
+        {
+            let g = |k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+            let (vw, vh, cw, ch) = (g("innerWidth"), g("innerHeight"), g("scrollWidth"), g("scrollHeight"));
+            if cw > vw + 2.0 || ch > vh + 2.0 {
+                out["content_overflow"] = json!({
+                    "viewport": {"width": vw, "height": vh},
+                    "content": {"width": cw, "height": ch},
+                    "horizontal": cw > vw + 2.0,
+                    "vertical": ch > vh + 2.0,
+                    "hint": "本截图仅覆盖视口区域,页面内容超出:整页捕获用 params.full_page=true;视口过窄可重开 open(默认自动扩展视口到 2K)或 control(set_viewport)",
+                });
+            }
+        }
+    }
     // OCR(默认关;验证码/图表标签等图片文字读取)
     if p.get("ocr").and_then(Value::as_bool).unwrap_or(false) {
         match ocr_png_text(std::path::Path::new(&path), parse_region(p)) {

@@ -372,4 +372,118 @@ async fn mcp_web_use_open_control_inspect_smoke() {
         .execute(json!({"action": "close", "page_id": "all"}))
         .await;
 
+    // 11) 第 125 轮:视口基准 1080p + 2K 自动扩展(hidden 宽页触发横向裁切)。
+    //     内容 2400px 宽 > 默认视口 1920 → open 后自动扩展,扩展后溢出消失、
+    //     视口外按钮可点击;auto_expand_viewport=false 关闭后溢出保留、
+    //     截图响应带 content_overflow hint。
+    let wide_url = "data:text/html,<html><head><title>wide</title></head>\
+<body style='width:2400px;height:1100px;margin:0'>\
+<button id='far' style='position:absolute;left:2300px;top:10px' \
+onclick='document.title=\"far-clicked\"'>F</button></body></html>";
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": wide_url}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "宽页 open 应成功: {out}");
+    let wide_page = v["data"]["page_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        v["data"]["viewport"]["expanded"],
+        true,
+        "内容 2400 > 视口 1920 应自动扩展视口: {out}"
+    );
+    let to_w = v["data"]["viewport"]["to"]["width"].as_f64().unwrap_or(0.0);
+    assert!(to_w >= 2400.0, "扩展后视口宽应 ≥2400(实际 {to_w}): {out}");
+    assert_eq!(
+        v["data"]["viewport"]["clamped"],
+        false,
+        "2400 ≤ 2K 上限不应截断: {out}"
+    );
+
+    // inspect(info=viewport):扩展后横向溢出消失
+    let out = McpWebUseTool
+        .execute(json!({"action": "inspect", "page_id": wide_page, "info": "viewport"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0);
+    assert_eq!(
+        v["data"]["overflow"]["horizontal"],
+        false,
+        "扩展后横向裁切应消失: {out}"
+    );
+
+    // 原视口外(left:2300)按钮在扩展后可真实点击生效
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": wide_page,
+            "control_action": "click", "params": {"selector": "#far"}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "扩展后视口外按钮 click 应成功: {out}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let out = McpWebUseTool
+        .execute(json!({"action": "inspect", "page_id": wide_page, "info": "title"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["data"]["title"], "far-clicked", "点击应真实命中按钮: {out}");
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+
+    // auto_expand_viewport=false:不扩展(全新 hidden 实例,视口保持 1920)
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "open", "url": wide_url, "auto_expand_viewport": false
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0);
+    assert!(
+        v["data"]["viewport"].is_null(),
+        "false 应关闭自动扩展且不回 viewport 字段: {out}"
+    );
+    let nofit_page = v["data"]["page_id"].as_str().unwrap().to_string();
+    let out = McpWebUseTool
+        .execute(json!({"action": "inspect", "page_id": nofit_page, "info": "viewport"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(
+        v["data"]["overflow"]["horizontal"],
+        true,
+        "关闭扩展后横向裁切应保留: {out}"
+    );
+
+    // 截图不带 full_page 时附 content_overflow hint
+    let clip_path = std::env::temp_dir().join(format!(
+        "laew_smoke_clip_{}.png",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": nofit_page,
+            "control_action": "screenshot",
+            "params": {"save_path": clip_path.to_str().unwrap()}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "screenshot 应成功: {out}");
+    assert_eq!(
+        v["data"]["content_overflow"]["horizontal"],
+        true,
+        "溢出截图应带 content_overflow 提示: {out}"
+    );
+    let _ = std::fs::remove_file(&clip_path);
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
 }

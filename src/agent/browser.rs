@@ -231,6 +231,88 @@ impl BrowserMode {
     }
 }
 
+// =================== 第 125 轮(2026-09-23):视口基准 1080p 与 2K 自动扩展 ===================
+
+/// 全模式默认启动窗口:1920×1080(1080p)。hidden 原 1440×900 视口过窄,
+/// 现代 Web 应用(min-width > 1440 的后台/SaaS)横向被裁 → 元素不可见不可点、
+/// 截图显示不全,本轮根治。
+pub const DEFAULT_WINDOW_W: u32 = 1920;
+/// 全模式默认启动窗口高(1080p)。
+pub const DEFAULT_WINDOW_H: u32 = 1080;
+/// 视口自动扩展上限宽(2K = 2560×1440):内容超此宽度仍溢出时保持滚动 +
+/// full_page 截图既有路径,不再无限撑大。
+pub const VIEWPORT_FIT_MAX_W: u32 = 2560;
+/// 视口自动扩展上限高(2K)。
+pub const VIEWPORT_FIT_MAX_H: u32 = 1440;
+/// 溢出判定容差(px):亚像素布局/阴影圆角/1px 边框误差不触发扩展。
+const VIEWPORT_FIT_TOL: f64 = 2.0;
+
+/// 默认启动窗口尺寸(第 125 轮:全模式统一 1080p)。
+pub fn default_window_size() -> (u32, u32) {
+    (DEFAULT_WINDOW_W, DEFAULT_WINDOW_H)
+}
+
+/// 单维度适配判定:内容维度 > 视口维度 + 容差 且仍有扩展空间时返回 Some(目标)。
+/// 只放大不缩小;当前已 ≥ cap 时维持原状(返回 None,交给滚动/full_page)。
+fn fit_dim(cur: f64, content: f64, cap: u32) -> Option<u32> {
+    if content <= cur + VIEWPORT_FIT_TOL {
+        return None;
+    }
+    let cur_i = cur.max(0.0).ceil() as u32;
+    if cur_i >= cap {
+        return None;
+    }
+    let target = content.ceil() as u32;
+    let target = target.clamp(cur_i + 1, cap);
+    if target > cur_i {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// 视口自动扩展决策(纯函数,可单测):输入当前视口 (iw,ih) 与内容滚动尺寸
+/// (sw,sh),需要扩展返回 Some((target_w,target_h)),否则 None。
+pub fn viewport_fit_plan(
+    iw: f64,
+    ih: f64,
+    sw: f64,
+    sh: f64,
+    max_w: u32,
+    max_h: u32,
+) -> Option<(u32, u32)> {
+    match (fit_dim(iw, sw, max_w), fit_dim(ih, sh, max_h)) {
+        (Some(w), Some(h)) => Some((w, h)),
+        (Some(w), None) => Some((w, ih.max(0.0).ceil() as u32)),
+        (None, Some(h)) => Some((iw.max(0.0).ceil() as u32, h)),
+        (None, None) => None,
+    }
+}
+
+/// 视口/内容尺寸测量 JS(fit 与截图溢出提示共用)。
+const VIEWPORT_METRICS_JS: &str = r#"(() => {
+    const de = document.documentElement, b = document.body;
+    const sw = Math.max(de ? de.scrollWidth : 0, b ? b.scrollWidth : 0);
+    const sh = Math.max(de ? de.scrollHeight : 0, b ? b.scrollHeight : 0);
+    return {
+        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+        scrollWidth: sw, scrollHeight: sh,
+        devicePixelRatio: window.devicePixelRatio || 1,
+    };
+})()"#;
+
+/// 读取页面视口 + 内容滚动尺寸(CDP evaluate,returnByValue)。
+pub(crate) async fn page_viewport_metrics(
+    page: &chromiumoxide::Page,
+) -> std::result::Result<Value, String> {
+    page.evaluate(VIEWPORT_METRICS_JS)
+        .await
+        .map_err(|e| format!("测量视口失败: {e}"))?
+        .value()
+        .cloned()
+        .ok_or_else(|| "测量视口失败: 返回为空".to_string())
+}
+
 /// 按平台优先级探测 Chrome / Edge / Chromium / Brave 可执行文件。
 ///
 /// 顺序:环境变量 `LAEW_BROWSER_PATH` → 平台候选路径 → chromiumoxide 自带检测
@@ -409,20 +491,22 @@ impl BrowserManager {
                         builder = builder.with_head();
                     }
                 }
-                // Hidden 模式下额外禁用 GPU 与 sandbox,降低嵌入式启动失败率
+                // Hidden 模式下额外禁用 GPU 与 sandbox,降低嵌入式启动失败率;
+                // --hide-scrollbars(第 125 轮):headless 截图滚动条不再遮挡内容,
+                // 且 innerWidth 不再被经典滚动条蚕食(推荐启动参数矩阵,
+                // 参考 docs/Agent源码调研/专题/专题-第十三轮-GUI自动化与浏览器控制深度对比.md §6.1)
                 if matches!(mode, BrowserMode::Hidden | BrowserMode::NewHeadless) {
                     builder = builder
                         .disable_default_args()
                         .arg("--disable-gpu")
                         .arg("--no-sandbox")
-                        .arg("--disable-dev-shm-usage");
+                        .arg("--disable-dev-shm-usage")
+                        .arg("--hide-scrollbars");
                 }
-                // 窗口尺寸(第 100 轮):显式参数优先;缺省 headed=1920×1080(1080p,
-                // 人工可视 + fullPage 截图基准),hidden=1440×900(既有默认,保持兼容)。
-                let (win_w, win_h) = window_size.unwrap_or(match mode {
-                    BrowserMode::Headed => (1920, 1080),
-                    _ => (1440, 900),
-                });
+                // 窗口尺寸(第 125 轮):显式参数优先;缺省**全模式 1920×1080(1080p)**
+                // ——hidden 原 1440×900 视口过窄,现代 Web 应用(min-width>1440 的管理后台/
+                // SaaS)横向被裁导致元素不可见、不可点,截图也显示不全。
+                let (win_w, win_h) = window_size.unwrap_or_else(default_window_size);
                 builder = builder.window_size(win_w, win_h);
                 // 一次性 user-data-dir:避免 chromiumoxide 默认固定目录的 SingletonLock 冲突
                 // (并行/上次异常退出后残留锁会导致 Chrome 拒启),同时与用户日常 profile 隔离。
@@ -710,6 +794,70 @@ impl BrowserManager {
             .await
             .map_err(|e| format!("读取视口失败:{e}"))?;
         Ok(viewport.value().cloned().unwrap_or(Value::Null))
+    }
+
+    /// 第 125 轮:页面内容超出视口时自动扩展视口(上限 2K)。
+    ///
+    /// open(新建 + 复用两条路径)导航完成后调用,`auto_expand_viewport=false`
+    /// 可关:
+    /// - 测量 innerWidth/Height 与 scrollWidth/Height,[`viewport_fit_plan`] 决策
+    ///   目标尺寸(横向裁切 = 元素不可见不可点的根因;纵向不足 = 截图缺区域);
+    /// - 需要扩展时走 `Emulation.setDeviceMetricsOverride`(保持当前 DPR,
+    ///   mobile=false)撑大布局视口 —— headless 视口控制的标准机制
+    ///   (Playwright/Puppeteer 同款),截图与输入坐标都按新视口映射;
+    /// - 覆盖对页面内后续导航持续生效,直到 `sync_viewport` / `set_window` 清除;
+    /// - 返回结构化结果供 open 响应 `data.viewport` 引用(供 LLM 对账)。
+    pub async fn fit_viewport_to_content(
+        &self,
+        page_id: &str,
+        max_w: u32,
+        max_h: u32,
+    ) -> std::result::Result<Value, String> {
+        let page = self
+            .page(page_id)
+            .await
+            .ok_or_else(|| "page_id 不存在".to_string())?;
+        let m = page_viewport_metrics(&page).await?;
+        let f = |k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let (iw, ih, sw, sh) = (f("innerWidth"), f("innerHeight"), f("scrollWidth"), f("scrollHeight"));
+        let dpr = m.get("devicePixelRatio").and_then(Value::as_f64).unwrap_or(1.0);
+        let content = json!({"width": sw, "height": sh});
+        let Some((tw, th)) = viewport_fit_plan(iw, ih, sw, sh, max_w, max_h) else {
+            return Ok(json!({
+                "expanded": false,
+                "viewport": {"width": iw, "height": ih},
+                "content": content,
+                "window_default": [DEFAULT_WINDOW_W, DEFAULT_WINDOW_H],
+            }));
+        };
+        let clamped =
+            sw > max_w as f64 + VIEWPORT_FIT_TOL || sh > max_h as f64 + VIEWPORT_FIT_TOL;
+        let params = chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::builder()
+            .width(tw as i64)
+            .height(th as i64)
+            .device_scale_factor(dpr.clamp(1.0, 4.0))
+            .mobile(false)
+            .build()
+            .map_err(|e| e.to_string())?;
+        page.execute(params)
+            .await
+            .map_err(|e| format!("视口扩展失败: {e}"))?;
+        // 布局重排是异步的,短暂等待后回读真实视口。
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let m2 = page_viewport_metrics(&page).await.unwrap_or(Value::Null);
+        let g = |k: &str, fb: u32| {
+            m2.get(k).and_then(Value::as_f64).unwrap_or(fb as f64)
+        };
+        Ok(json!({
+            "expanded": true,
+            "from": {"width": iw, "height": ih},
+            "to": {"width": g("innerWidth", tw), "height": g("innerHeight", th)},
+            "target": {"width": tw, "height": th},
+            "content": content,
+            "clamped": clamped,
+            "hint": clamped.then(|| "页面内容仍超 2K 上限:截图用 params.full_page=true 捕获整页;或 open 传更大 window_width/window_height / control(set_viewport) 显式超限"),
+            "note": "device metrics 覆盖对页面内导航持续生效;需还原用 control(sync_viewport)",
+        }))
     }
 
     /// 运行时开关 Agent 高亮蓝框(对当前页面文档立即生效;新文档由挂载脚本
@@ -1370,6 +1518,70 @@ mod tests {
         assert!(id.starts_with("p_"));
         assert_eq!(id.len(), 2 + 8);
         assert!(id[2..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ===== 第 125 轮:视口基准 1080p 与 2K 自动扩展决策 =====
+
+    #[test]
+    fn default_window_is_1080p() {
+        // 全模式(含 hidden)统一 1080p 起步,替代旧 hidden=1440×900
+        assert_eq!(default_window_size(), (1920, 1080));
+        assert_eq!((DEFAULT_WINDOW_W, DEFAULT_WINDOW_H), (1920, 1080));
+    }
+
+    #[test]
+    fn viewport_fit_plan_no_overflow() {
+        // 内容 == 视口 / 容差内(≤2px)不扩展
+        assert_eq!(viewport_fit_plan(1920.0, 1080.0, 1920.0, 1080.0, 2560, 1440), None);
+        assert_eq!(viewport_fit_plan(1920.0, 1080.0, 1922.0, 1082.0, 2560, 1440), None);
+    }
+
+    #[test]
+    fn viewport_fit_plan_horizontal_clipped() {
+        // 横向被裁(经典后台 min-width 2200):宽撑到内容宽,高保持
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 2200.0, 1080.0, 2560, 1440),
+            Some((2200, 1080))
+        );
+    }
+
+    #[test]
+    fn viewport_fit_plan_vertical_short_content() {
+        // 纵向内容略高于视口且在 2K 高内:一并撑高(截图不缺区域)
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 1920.0, 1200.0, 2560, 1440),
+            Some((1920, 1200))
+        );
+    }
+
+    #[test]
+    fn viewport_fit_plan_clamps_to_2k_cap() {
+        // 超 2K 内容截到上限并交由 clamped 提示(full_page / 手动 set_viewport)
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 4000.0, 5000.0, 2560, 1440),
+            Some((2560, 1440))
+        );
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 4000.0, 1080.0, 2560, 1440),
+            Some((2560, 1080))
+        );
+    }
+
+    #[test]
+    fn viewport_fit_plan_never_shrinks_or_exceeds_cap_when_larger() {
+        // 用户自定义超大窗口(3840 宽 ≥ cap):维持现状不缩也不报错
+        assert_eq!(viewport_fit_plan(3840.0, 1080.0, 4200.0, 1080.0, 2560, 1440), None);
+        // 亚像素内容尺寸向上取整,绝不小于当前
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 1925.6, 1080.0, 2560, 1440),
+            Some((1926, 1080))
+        );
+    }
+
+    #[test]
+    fn viewport_fit_plan_degenerate_zero() {
+        // 异常测量(0 值)不应恐慌性撑满
+        assert_eq!(viewport_fit_plan(0.0, 0.0, 0.0, 0.0, 2560, 1440), None);
     }
 
     #[cfg(unix)]
