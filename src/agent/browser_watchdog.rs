@@ -72,8 +72,13 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// 进程级终止(SIGTERM→轮询→SIGKILL / Windows TerminateProcess)。
+///
+/// `pub(crate)`:除 watchdog 外,`BrowserManager::cleanup_sync` 的同步清理路径
+/// (atexit / panic hook)同样复用 —— 该场景下 tokio TLS 可能已销毁,禁止创建
+/// runtime,只能用 std/libc 同步原语杀浏览器进程(2026-09-23 第 127 轮)。
 #[cfg(unix)]
-fn terminate_process(pid: u32) {
+pub(crate) fn terminate_process(pid: u32) {
     let Some(raw) = i32::try_from(pid).ok().filter(|v| *v > 0) else {
         return;
     };
@@ -92,7 +97,7 @@ fn terminate_process(pid: u32) {
 }
 
 #[cfg(windows)]
-fn terminate_process(pid: u32) {
+pub(crate) fn terminate_process(pid: u32) {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
     unsafe {
@@ -103,7 +108,9 @@ fn terminate_process(pid: u32) {
     }
 }
 
-fn remove_profile(dir: &Path) {
+/// 删除一次性浏览器 profile 目录(带重试,覆盖 Chrome 退出延迟持有的锁)。
+/// `pub(crate)` 同 `terminate_process`:供 `cleanup_sync` 同步清理路径复用。
+pub(crate) fn remove_profile(dir: &Path) {
     // Chrome 退出可能短暂持有 SingletonLock / cache fd，重试足够覆盖普通退出。
     for _ in 0..10 {
         match std::fs::remove_dir_all(dir) {

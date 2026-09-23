@@ -35,6 +35,23 @@ static REPORT_DIR: OnceLock<PathBuf> = OnceLock::new();
 static PREVIOUS_HOOK: OnceLock<Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>> =
     OnceLock::new();
 
+/// panic hook 重入守卫(第 127 轮,2026-09-23)。
+///
+/// hook 运行期间若再次发生 panic(如清理步骤内被 `catch_unwind` 捕获的 panic
+/// 也会再次进入 hook,或多线程同时 panic),守卫位为真时直接跳过 hook 体:
+/// - 杜绝「hook → 清理 panic → hook → …」递归放大;
+/// - 嵌套 panic 只保留第一现场的报告。
+static HOOK_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 守卫复位句柄:hook 体正常走完后允许下一次进入。
+struct HookActiveGuard;
+
+impl Drop for HookActiveGuard {
+    fn drop(&mut self) {
+        HOOK_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// 崩溃现场快照。独立成结构便于单元测试报告渲染与脱敏逻辑。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrashRecord {
@@ -56,6 +73,12 @@ pub struct CrashRecord {
 }
 
 /// 按显式报告目录安装全局 panic hook。
+///
+/// 第 127 轮(2026-09-23)加固:hook 体内**任何步骤都不允许 panic 外泄** ——
+/// std 对 panic-during-panic 无条件 abort(发生在展开之前,`catch_unwind` 无法
+/// 拦截),因此除了各步骤 `catch_unwind` 隔离外,重入守卫保证 hook 嵌套触发时
+/// 直接跳过。cleanup 步骤本身已去 tokio 化(browser.rs `cleanup_sync`),
+/// 不再有 TLS 销毁类 panic 源。
 pub fn install_panic_hook(report_dir: impl Into<PathBuf>) {
     INSTALL_ONCE.call_once(|| {
         let report_dir = report_dir.into();
@@ -64,20 +87,68 @@ pub fn install_panic_hook(report_dir: impl Into<PathBuf>) {
         let _ = PREVIOUS_HOOK.set(previous);
 
         panic::set_hook(Box::new(|info| {
+            // 重入守卫:hook 运行期间再次进入(嵌套 panic / 多线程并发 panic)
+            // 直接跳过,保留第一现场,杜绝递归放大。
+            if HOOK_ACTIVE
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                return;
+            }
+            let _guard = HookActiveGuard;
+
             // 第 108 轮:panic 时优先还原终端(alt screen / raw mode / 滚动区 / 光标),
             // 否则终端残留 alt screen + raw mode 会导致整个 Terminal 软件僵死。
             // sync 版本不依赖 tokio runtime(panic 时 runtime 状态不可靠)。
-            crate::shutdown::terminal_restore_sync();
+            // 步骤自身全部 `let _`,此层 catch_unwind 为纵深防御。
+            let _ = std::panic::catch_unwind(crate::shutdown::terminal_restore_sync);
 
             // 第 78 轮:panic 时优先清理浏览器子进程,防止孤儿 Chrome 进程泄漏。
-            // 使用 catch_unwind 防止清理过程中再次 panic 导致 abort。
+            // 第 127 轮起 cleanup_sync 为纯同步实现(零 tokio),此层 catch_unwind
+            // 同样为纵深防御(旧版这里会因 TLS 销毁 panic 升级为 abort)。
             let _ = std::panic::catch_unwind(|| {
                 crate::agent::browser::BrowserManager::cleanup_sync();
             });
 
             if let Some(dir) = REPORT_DIR.get() {
-                let record = capture_crash_record(info);
-                match write_crash_report(dir, &record) {
+                // 采集与写盘分别隔离:任何一步失败都不阻断后续步骤,
+                // 保证最末 `previous(info)`(原始 panic 信息打印)永远可达。
+                // AssertUnwindSafe:`info`/`record` 均为跨展开的借用读取,
+                // panic 中断不会留下半更新的共享状态。
+                let record = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    capture_crash_record(info)
+                }))
+                .unwrap_or_else(|_| CrashRecord {
+                        timestamp: "<capture failed>".to_string(),
+                        pid: std::process::id(),
+                        thread: std::thread::current()
+                            .name()
+                            .unwrap_or("<unnamed>")
+                            .to_string(),
+                        message: "crash record capture panicked".to_string(),
+                        location: "unknown".to_string(),
+                        backtrace: String::new(),
+                        executable: "unknown".to_string(),
+                        root_dir: "unknown".to_string(),
+                        work_dir: "unknown".to_string(),
+                        args: Vec::new(),
+                        rust_backtrace: None,
+                        os: std::env::consts::OS,
+                        arch: std::env::consts::ARCH,
+                        family: std::env::consts::FAMILY,
+                        version: VERSION_INFO,
+                    });
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        write_crash_report(dir, &record)
+                    }))
+                    .unwrap_or_else(|_| Err(io::Error::other("crash report write panicked")));
+                match result {
                     Ok(path) => {
                         eprintln!("[laew] Crash report 已写入: {}", path.display());
                     }
@@ -394,6 +465,31 @@ mod tests {
         assert!(
             content.contains("src/crash.rs") || content.contains("src\\crash.rs"),
             "CrashDump 应含 panic 位置: {content}"
+        );
+
+        // ===== 第 127 轮:重入守卫 —— hook 运行标志置位期间的 panic 直接跳过,
+        // 不产生新报告(嵌套 panic 只保留第一现场)。
+        let md_count = |d: &Path| -> usize {
+            std::fs::read_dir(d)
+                .expect("read report dir")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext == "md")
+                })
+                .count()
+        };
+        let before = md_count(dir.path());
+        HOOK_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::panic::catch_unwind(|| panic!("reentrancy should be skipped"));
+        HOOK_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            md_count(dir.path()),
+            before,
+            "重入期间不应产生新 CrashReport"
         );
     }
 }

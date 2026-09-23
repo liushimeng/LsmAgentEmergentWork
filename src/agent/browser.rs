@@ -435,6 +435,9 @@ impl BrowserManager {
         let mut inner = self.inner.lock().await;
         let mut launch_dir: Option<PathBuf> = None;
         let mut launch_watchdog: Option<std::process::Child> = None;
+        // launch 模式浏览器主进程 PID(第 127 轮):供 cleanup_registry 登记给
+        // cleanup_sync 同步清理路径使用;connect 模式保持 0(不拥有外部进程)。
+        let mut launch_pid: u32 = 0;
 
         // Browser 操作超时(2026-09-16 第 66 轮):launch/connect/goto 统一 30s,
         // 防止页面挂起/Chrome 启动失败导致无限等待(用户反馈浏览器任务卡住 58.8s)。
@@ -535,6 +538,7 @@ impl BrowserManager {
                 let browser_pid = browser
                     .get_mut_child()
                     .and_then(|child| child.as_mut_inner().id());
+                launch_pid = browser_pid.unwrap_or(0);
                 launch_watchdog = browser_pid.and_then(|pid| spawn_parent_watchdog(pid, &dir));
                 let task = tokio::spawn(async move {
                     while let Some(msg) = handler.next().await {
@@ -549,11 +553,18 @@ impl BrowserManager {
             inner.handler = Some(handler);
             inner.watchdog = launch_watchdog;
             inner.connect_mode = connect_mode;
-            inner.user_data_dir = launch_dir;
+            inner.user_data_dir = launch_dir.clone();
             inner.mode = mode;
             inner.highlight = highlight;
             // 第 78 轮:标记浏览器已启动,供 cleanup_sync() 快速判断避免无意义创建 Runtime。
             browser_started_flag::set_started();
+            // 第 127 轮:同步清理登记(仅 launch 模式 —— 拥有浏览器进程所有权才登记;
+            // connect 模式接管的外部浏览器与一次性 profile 都不属于本进程)。
+            if !connect_mode {
+                if let Some(dir) = launch_dir {
+                    cleanup_registry::register(launch_pid, dir);
+                }
+            }
         }
 
         let browser = inner.browser.as_ref().expect("browser initialized");
@@ -1169,6 +1180,9 @@ impl BrowserManager {
                 }
                 // 清理一次性 user-data-dir(Chrome 退出可能有几百 ms 延迟,重试几次)
                 if let Some(dir) = inner.user_data_dir.take() {
+                    // 第 127 轮:graceful 路径已回收,清除同步清理登记,
+                    // 防 atexit/panic 路径重复动作与 PID 复用误杀。
+                    cleanup_registry::clear();
                     spawn_tempdir_cleanup(dir);
                 }
             }
@@ -1219,6 +1233,9 @@ impl BrowserManager {
             }
             // 清理一次性 user-data-dir。
             if let Some(dir) = inner.user_data_dir.take() {
+                // 第 127 轮:graceful 路径已回收,清除同步清理登记,
+                // 防 atexit/panic 路径重复动作与 PID 复用误杀。
+                cleanup_registry::clear();
                 spawn_tempdir_cleanup(dir);
             }
         }
@@ -1235,38 +1252,39 @@ impl BrowserManager {
 
     /// 同步清理入口(供 atexit / panic hook / signal handler 调用)。
     ///
-    /// 内部创建独立 current-thread Runtime 执行异步 shutdown,避免依赖可能已销毁的
-    /// 主 Runtime(panic/atexit 场景主 Runtime 可能正在 teardown)。
-    /// 清理失败不 panic,避免 panic-in-panic 递归。
+    /// **第 127 轮(2026-09-23)根治:彻底去 tokio 化,零 runtime、零 block_on。**
     ///
-    /// 设计(第 78 轮,2026-09-17):多层防御的 L2/L3 兜底。
+    /// 旧实现「新建 current-thread Runtime + block_on(shutdown())」在 macOS 上
+    /// 必然崩溃:`exit()` 流程中主线程 TLS 析构(含 tokio CONTEXT thread-local)
+    /// 先于 atexit handler 执行,`Runtime::block_on → Handle::enter` 因 TLS 已销毁
+    /// panic(`THREAD_LOCAL_DESTROYED_ERROR`,tokio handle.rs:90:25);panic hook
+    /// 路径下该 panic 属于 panic-during-panic,std 无条件 abort(catch_unwind 形同
+    /// 虚设,abort 发生在展开之前),并连带 CrashReport 永远写不出来。本机最小复现
+    /// 见 `tmpPlan/2026-09-23_07-TUI任务卡住后退出panic双重崩溃根治方案.md` §2.1。
+    ///
+    /// 现实现:纯 std/libc 同步原语 —— 杀浏览器主进程 PID + 删一次性 profile。
+    /// 浏览器兜底回收仍由进程外 watchdog(pipe EOF 感知父死)覆盖,本函数只是
+    /// 进程内提前清理的冗余防线,无需优雅 CDP 关停。
     pub fn cleanup_sync() {
-        // 快速路径:通过全局静态 flag 判断是否曾启动浏览器,避免无意义创建 Runtime。
+        // 快速路径:未启动过浏览器直接返回,零开销。
         if !browser_started_flag::is_started() {
             return;
         }
-        // 清理过程中忽略任何 panic,防止 panic-in-panic。
-        let result = std::panic::catch_unwind(|| {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(_) => return,
-            };
-            rt.block_on(async {
-                let manager = Self::global();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
-                    manager.shutdown(),
-                )
-                .await;
-            });
-        });
-        if let Err(_) = result {
-            // cleanup 中 panic,静默忽略;此时进程即将终止,无影响。
-            #[cfg(debug_assertions)]
-            eprintln!("[laew] browser cleanup_sync panic suppressed");
+        // 防御兜底:清理过程绝不外抛 panic(atexit / panic hook 场景任何 panic
+        // 都可能升级为 panic-during-panic abort)。
+        let _ = std::panic::catch_unwind(Self::cleanup_sync_inner);
+    }
+
+    /// [`Self::cleanup_sync`] 的实际清理体(纯同步,禁止引入 tokio 依赖)。
+    fn cleanup_sync_inner() {
+        // 取后即清,防止进程内残留:一来幂等(重复调用变 no-op),
+        // 二来浏览器死后 PID 可能被 OS 复用,清零可避免误杀无关进程。
+        let pid = cleanup_registry::take_browser_pid();
+        if pid != 0 {
+            super::browser_watchdog::terminate_process(pid);
+        }
+        if let Some(dir) = cleanup_registry::take_user_data_dir() {
+            super::browser_watchdog::remove_profile(&dir);
         }
     }
 }
@@ -1284,6 +1302,58 @@ mod browser_started_flag {
     }
     pub fn is_started() -> bool {
         STARTED.load(Ordering::SeqCst)
+    }
+}
+
+/// 同步清理登记簿(第 127 轮,2026-09-23)。
+///
+/// 记录 launch 模式拥有的浏览器主进程 PID 与一次性 profile 目录,供
+/// `cleanup_sync()`(atexit / panic hook 路径)**在不创建任何 tokio runtime 的
+/// 前提下**完成同步回收。为什么不用 BrowserManager.inner(tokio Mutex)?
+/// - tokio Mutex 的 `lock()` 是 async,同步上下文拿不到;`blocking_lock()` 在
+///   锁被活跃任务持有时会永久阻塞退出路径 —— atexit 场景不可接受;
+/// - 无锁原子 + std Mutex(`try_lock` 失败即跳过)在 TLS 已销毁的线程上依然安全。
+///
+/// 登记时机:`launch()` 成功持有 browser 后;清除时机:graceful `shutdown()` /
+/// `close_page` 末页回收(异步路径已优雅关停,同步清理无需重复动作)/
+/// `cleanup_sync_inner` 取后即清。
+mod cleanup_registry {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    /// 浏览器主进程 PID(0 = 未登记)。launch 模式才拥有进程所有权,connect
+    /// 模式接管的外部浏览器永不登记。
+    static BROWSER_PID: AtomicU32 = AtomicU32::new(0);
+
+    /// 一次性 user-data-dir。std Mutex 允许在任意线程同步访问;poison 状态
+    /// (持有线程 panic)直接放弃目录清理 —— 退出路径宁留目录不可挂死/panic,
+    /// 且 watchdog 子进程仍会兜底删除。
+    static USER_DATA_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    pub fn register(pid: u32, dir: PathBuf) {
+        BROWSER_PID.store(pid, Ordering::SeqCst);
+        if let Ok(mut slot) = USER_DATA_DIR.lock() {
+            *slot = Some(dir);
+        }
+    }
+
+    /// 清除登记(graceful 关闭路径调用,防止同步清理重复动作/误杀 PID 复用)。
+    pub fn clear() {
+        BROWSER_PID.store(0, Ordering::SeqCst);
+        if let Ok(mut slot) = USER_DATA_DIR.lock() {
+            *slot = None;
+        }
+    }
+
+    /// 取出并清零浏览器 PID(0 = 无)。
+    pub fn take_browser_pid() -> u32 {
+        BROWSER_PID.swap(0, Ordering::SeqCst)
+    }
+
+    /// 取出 profile 目录(锁被占用 / 未登记 → None,跳过目录清理)。
+    pub fn take_user_data_dir() -> Option<PathBuf> {
+        USER_DATA_DIR.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
@@ -1518,6 +1588,71 @@ mod tests {
         assert!(id.starts_with("p_"));
         assert_eq!(id.len(), 2 + 8);
         assert!(id[2..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ===== 第 127 轮:cleanup_sync 去 tokio 化与同步清理登记簿 =====
+
+    /// 登记簿是进程级全局,并发用例会互相改写登记值 —— 串行化涉及用例。
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cleanup_registry_roundtrip() {
+        let _guard = REGISTRY_TEST_LOCK.lock().expect("lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).expect("create profile");
+
+        cleanup_registry::register(12345, profile.clone());
+        assert_eq!(cleanup_registry::take_browser_pid(), 12345);
+        // 取后即清:第二次读取为空(幂等,防 PID 复用误杀)。
+        assert_eq!(cleanup_registry::take_browser_pid(), 0);
+        assert_eq!(
+            cleanup_registry::take_user_data_dir(),
+            Some(profile.clone())
+        );
+        assert_eq!(cleanup_registry::take_user_data_dir(), None);
+        // 未登记时 clear() 安全无害。
+        cleanup_registry::clear();
+        assert_eq!(cleanup_registry::take_browser_pid(), 0);
+    }
+
+    #[test]
+    fn cleanup_sync_is_panic_free_and_removes_registered_profile() {
+        let _guard = REGISTRY_TEST_LOCK.lock().expect("lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path().join("laew_profile");
+        std::fs::create_dir_all(profile.join("Default")).expect("create profile");
+        std::fs::write(profile.join("marker"), "x").expect("write marker");
+
+        // 登记一个不可能存在的 PID(远超各平台 pid_max):terminate_process
+        // 对不存在进程是 ESRCH no-op,绝不误杀真实进程。
+        cleanup_registry::register(4_000_000_000, profile.clone());
+        browser_started_flag::set_started();
+
+        // 无 tokio runtime 的裸线程上执行(atexit / panic hook 同款环境),
+        // 断言零 panic 且登记的 profile 目录被同步删除。
+        let joined = std::thread::spawn(move || {
+            BrowserManager::cleanup_sync();
+            BrowserManager::cleanup_sync(); // 幂等:第二次为 no-op
+        })
+        .join();
+        assert!(joined.is_ok(), "cleanup_sync 在裸线程上不得 panic");
+        assert!(
+            !profile.exists(),
+            "登记的一次性 profile 应被同步清理删除"
+        );
+    }
+
+    #[test]
+    fn terminate_process_noop_on_impossible_pid() {
+        // pid=4_000_000_000 超出 Linux(默认 4194304)/macOS(99998)pid_max,
+        // 不可能存活:SIGTERM ESRCH → process_alive=false → 立即返回(无重试循环)。
+        let start = std::time::Instant::now();
+        super::super::browser_watchdog::terminate_process(4_000_000_000);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "对不存在 PID 不应进入 SIGTERM 重试轮询"
+        );
     }
 
     // ===== 第 125 轮:视口基准 1080p 与 2K 自动扩展决策 =====
