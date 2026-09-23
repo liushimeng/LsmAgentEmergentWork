@@ -253,7 +253,10 @@ fn match_shell_token(rest: &str) -> Option<&'static str> {
 }
 
 /// 剥除 `#` 后到行尾的注释(保留 quoted string 内的 `#`)
-fn strip_shell_comments(input: &str) -> String {
+/// 2026-09-23 Round 124:暴露给同级 `readonly.rs` 复用 —— Main-Work 只读模式的
+/// 检测流水线与危险命令拦截共用同一套字符串处理(`strip_quoted_strings`
+/// 避免 `echo "x > y"` 误判;`split_shell_segments` 切分 `&&` / `||` / `;` 等连接符)。
+pub(super) fn strip_shell_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut in_single = false;
@@ -303,7 +306,7 @@ fn strip_shell_comments(input: &str) -> String {
 ///
 /// 目的:避免 `echo "rm -rf /"` 这种字符串字面量被识别为真实命令。
 /// `\$` 转义会保留 `$` 但字符串仍然结束于下一个引号。
-fn strip_quoted_strings(input: &str) -> String {
+pub(super) fn strip_quoted_strings(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
@@ -342,7 +345,7 @@ fn strip_quoted_strings(input: &str) -> String {
 
 /// 按 shell 连接符切分(支持 `|`, `||`, `&&`, `&`, `;`, `\n`)
 /// quoted string 内不分隔。
-fn split_shell_segments(cmd: &str) -> Vec<&str> {
+pub(super) fn split_shell_segments(cmd: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut start = 0;
     let mut in_single = false;
@@ -417,7 +420,7 @@ fn split_shell_segments(cmd: &str) -> Vec<&str> {
 /// 返回最里层命令名 + 剩余参数。
 ///
 /// `sudo` / `su` 不在此处剥除 —— 它们本身是危险命令,需要直接命中规则。
-fn unwrap_wrappers(seg: &str) -> &str {
+pub(super) fn unwrap_wrappers(seg: &str) -> &str {
     const WRAPPERS: &[&str] = &["env", "time", "nice", "command", "exec", "nohup"];
     let mut current = seg;
     loop {

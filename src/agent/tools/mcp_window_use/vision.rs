@@ -289,8 +289,10 @@ pub(super) async fn run_screenshot(args: Value) -> Result<String> {
         }
 
         // 降级方案:走 BashTool 执行 screencapture / import
+        // Round 124:显式 `::new()` —— vision 降级路径需要写盘(screencapture 落盘),
+        // 保留 ReadWrite 模式。
         let command = default_screenshot_command(&output_path, region.as_ref());
-        let bash = crate::agent::tools::bash::BashTool;
+        let bash = crate::agent::tools::bash::BashTool::new();
         let bash_args = json!({
             "command": command,
             "timeout_ms": 30000

@@ -623,6 +623,20 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 
 ---
 
+## Bash 只读硬性约束(2026-09-23 Round 124 新增)
+
+Main-Work Bash **代码层只读**:运行时拦截 `>` / `>>` / `tee` / `sed -i` /
+`mv` / `rm` / `chmod` / `apt install` / `pip install` 等写盘行为,只放行
+`ls` / `cat` / `grep` / `git log` / `curl -sI` / `find` 等只读侦察命令。
+
+**禁止用 Bash 写源代码 / 写临时文件 / 改环境**(SubAgent-Work 专属能力);
+有写需求时通过 `SubAgent(action=task, delegate_to=...)` 委派执行层。
+
+环境旁路:`LAEW_BASH_READONLY=off` 时关闭只读拦截(诊断用),但 Main-Work
+**不应该**需要这个旁路 —— 如果你想写盘,先问自己是不是走错了层。
+
+---
+
 ## 输入格式(由 Orchestrator 注入)
 - medium 任务:Yolo 分类结果 + decomposition_plan
 - hard 任务:Plan 文档路径 + Yolo 分类结果
@@ -693,7 +707,10 @@ fn main_work_tools_hint() -> &'static str {
      - [ ] 目标依赖是否已安装(`cat package.json` / `cat Cargo.toml`)\n\
      - [ ] 目标项目是否在 git 仓库(`git rev-parse --is-inside-work-tree`)\n\n\
      可用工具:\n\
-     - Bash(command, timeout_ms?, description?): 只读 / 检查类命令。\n\
+     - Bash(command, timeout_ms?, description?): 【Round 124 readonly】代码层只读——\
+       放行 ls / cat / grep / git log / curl -sI / find 等只读侦察;拦截 `>` / `>>` /\
+       tee / sed -i / mv / rm / chmod / apt install / pip install 等写盘行为;\
+       `LAEW_BASH_READONLY=off` 可旁路。\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
      - Glob(pattern) / Grep(pattern, path?): 项目结构与符号检索。\n\
      - MCP_Web_Use(action, ...): 网页信息收集(open 拿页面 / inspect 探查 DOM /\n\

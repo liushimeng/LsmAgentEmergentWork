@@ -9,9 +9,11 @@
 //! 默认 fail-closed:命中任一规则即返回 [`AgentError::PermissionDenied`]。
 
 pub mod dangerous;
+pub mod readonly;
 pub mod sensitive;
 
 pub use dangerous::check_destructive_command;
+pub use readonly::{check_bash_readonly, readonly_bypass_enabled};
 pub use sensitive::references_sensitive_path;
 
 use crate::error::{AgentError, Result};

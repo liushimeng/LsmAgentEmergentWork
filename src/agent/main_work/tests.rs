@@ -694,3 +694,122 @@ mod dedup_tests {
     }
 
     // ============================================================================
+    // 2026-09-23 Round 124:BashTool readonly 模式集成测试
+    // I1: BashTool::readonly().mode() == BashMode::ReadOnly
+    // I2: BashTool::default().mode() == BashMode::ReadWrite(向后兼容)
+    // I3: BashTool::readonly().description() 含「只读」
+    // I4: SystemPrompt::main_work().render(Anthropic) 含「Bash 只读硬性约束」+ 「LAEW_BASH_READONLY=off」
+    // ============================================================================
+    mod readonly_tests {
+        use super::*;
+        use crate::agent::system_prompt::SystemPrompt;
+        use crate::agent::tools::bash::{BashMode, BashTool};
+        use crate::agent::tools::Tool;
+        use crate::config::Protocol as CfgProtocol2;
+
+        #[test]
+        fn main_work_bash_is_readonly_mode() {
+            // I1:BashTool::readonly() 标记为 ReadOnly
+            let tool = BashTool::readonly();
+            assert_eq!(tool.mode(), BashMode::ReadOnly);
+        }
+
+        #[test]
+        fn builtin_bash_is_readwrite_mode() {
+            // I2:默认 BashTool 是 ReadWrite(向后兼容;SubAgent-Work 仍可写)
+            let tool = BashTool::new();
+            assert_eq!(tool.mode(), BashMode::ReadWrite);
+            let default_tool = BashTool::default();
+            assert_eq!(default_tool.mode(), BashMode::ReadWrite);
+        }
+
+        #[test]
+        fn readonly_bash_description_mentions_readonly() {
+            // I3:readonly 模式的 description 红字提示「Round 124 readonly」+ 拦截清单
+            let binding = BashTool::readonly();
+            let desc = binding.description();
+            assert!(
+                desc.contains("Round 124 readonly"),
+                "description 应包含 readonly 红字: {desc}"
+            );
+            assert!(
+                desc.contains("只读") && desc.contains("拦截"),
+                "description 应描述只读/拦截: {desc}"
+            );
+            assert!(
+                desc.contains("LAEW_BASH_READONLY=off"),
+                "description 应提及 env 旁路: {desc}"
+            );
+        }
+
+        #[test]
+        fn readwrite_bash_description_unchanged() {
+            // I2':默认 BashTool 的 description 不含 readonly 红字(向后兼容)
+            let binding = BashTool::new();
+            let desc = binding.description();
+            assert!(
+                !desc.contains("Round 124 readonly"),
+                "ReadWrite description 不应含 readonly 红字"
+            );
+            assert!(
+                desc.contains("【大输出落盘(D17)】"),
+                "ReadWrite description 应保留 D17 spill 提示"
+            );
+        }
+
+        #[test]
+        fn main_work_registry_uses_readonly_bash() {
+            // I2':main_work_registry 的 Bash 是 readonly 实例
+            let reg = crate::agent::tools::main_work_registry();
+            let bash_arc = reg.get("Bash").expect("main_work 应持 Bash");
+            // 通过 description 推断(无法直接拿 BashMode 字段)
+            let desc = bash_arc.description();
+            assert!(
+                desc.contains("Round 124 readonly"),
+                "main_work_registry 的 Bash 应是 readonly: {desc}"
+            );
+        }
+
+        #[test]
+        fn builtin_registry_uses_readwrite_bash() {
+            // I2':builtin_registry 的 Bash 是 ReadWrite 实例
+            let reg = crate::agent::tools::builtin_registry();
+            let bash_arc = reg.get("Bash").expect("builtin 应持 Bash");
+            let desc = bash_arc.description();
+            assert!(
+                !desc.contains("Round 124 readonly"),
+                "builtin_registry 的 Bash 应是 ReadWrite: {desc}"
+            );
+        }
+
+        #[test]
+        fn main_work_prompt_renders_readonly_section() {
+            // I4:SystemPrompt::main_work().render(Anthropic) 含 readonly 硬性约束
+            let rendered = SystemPrompt::main_work().render(crate::config::Protocol::Anthropic);
+            assert!(
+                rendered.contains("Bash 只读硬性约束"),
+                "main_work 提示词应含「Bash 只读硬性约束」段: {rendered}"
+            );
+            assert!(
+                rendered.contains("LAEW_BASH_READONLY=off"),
+                "main_work 提示词应提及 env 旁路: {rendered}"
+            );
+            assert!(
+                rendered.contains("代码层只读"),
+                "main_work 提示词应强调代码层只读: {rendered}"
+            );
+        }
+
+        #[test]
+        fn main_work_tools_hint_mentions_readonly_red_label() {
+            // I4':main_work_tools_hint 渲染后 Bash 描述有 readonly 红字
+            //     直接用 render_with_protocol 检查(Anthropic)
+            let rendered = SystemPrompt::main_work().render(CfgProtocol2::Anthropic);
+            assert!(
+                rendered.contains("Round 124 readonly"),
+                "main_work_tools_hint 应渲染 Bash readonly 红字: {rendered}"
+            );
+        }
+    }
+
+    // ============================================================================

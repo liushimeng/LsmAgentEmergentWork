@@ -297,8 +297,9 @@ mod tests {
             "Grep 应可并发"
         );
         // 反例:Bash(子进程副作用)/ TodoWrite(共享状态)/ MCP_Web_Use(独占浏览器)
+        // Round 124:BashTool 加 BashMode 字段后需走实例方法,`::new()` 默认 ReadWrite。
         assert!(
-            !crate::agent::tools::bash::BashTool.parallel_safe(&arg),
+            !crate::agent::tools::bash::BashTool::new().parallel_safe(&arg),
             "Bash 不得并发"
         );
         assert!(

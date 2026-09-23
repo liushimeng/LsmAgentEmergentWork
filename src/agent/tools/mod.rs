@@ -218,10 +218,13 @@ fn register_mcp_use(reg: ToolRegistry) -> ToolRegistry {
 /// 2026-09-22 第 114 轮:追加 SubAgent(自感知动态启动子 Agent 工具,
 /// 运行时经 task-local 注入;总开关 `LAEW_SELF_SPAWN=off` 时不注册)。
 /// 2026-09-23 第 123 轮:追加 MCP_Use(通用 MCP 服务调用,`LAEW_MCP_ENABLED=off` 不注册)。
+///
+/// 2026-09-23 Round 124:`BashTool::new()` 显式标注 ReadWrite(SubAgent-Work 执行层
+/// 仍可写;默认行为零变化)。
 pub fn builtin_registry() -> ToolRegistry {
     let sandbox = default_sandbox();
     let mut reg = ToolRegistry::new()
-        .register(Arc::new(bash::BashTool))
+        .register(Arc::new(bash::BashTool::new()))
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(write::WriteTool::new(sandbox.clone())))
         .register(Arc::new(edit::EditTool::new(sandbox.clone())))
@@ -238,10 +241,12 @@ pub fn builtin_registry() -> ToolRegistry {
 }
 
 /// 带指定工作目录的沙箱注册表(供编排器使用)。
+///
+/// 2026-09-23 Round 124:`BashTool::new()` 显式标注 ReadWrite。
 pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
     let sandbox = sandbox_with(work_dir);
     let mut reg = ToolRegistry::new()
-        .register(Arc::new(bash::BashTool))
+        .register(Arc::new(bash::BashTool::new()))
         .register(Arc::new(read::ReadTool))
         .register(Arc::new(write::WriteTool::new(sandbox.clone())))
         .register(Arc::new(edit::EditTool::new(sandbox.clone())))
@@ -265,13 +270,17 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
 ///
 /// Yolo 仍不持 `Write / Edit / TodoWrite`(入口层不落盘、不管任务清单)。
 /// 详见 `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md`。
+///
+/// 2026-09-23 Round 124:Yolo Bash 维持 `BashTool::new()`(ReadWrite) ——
+/// Yolo 入口层仅靠提示词约束"只读侦察",本轮不加代码层强制(避免 Yolo 工作流
+/// 受到过大限制;P2 路线评估是否跟进)。
 pub fn yolo_registry() -> ToolRegistry {
     register_subagent(
         ToolRegistry::new()
             .register(Arc::new(read::ReadTool))
             .register(Arc::new(glob::GlobTool))
             .register(Arc::new(grep::GrepTool))
-            .register(Arc::new(bash::BashTool))
+            .register(Arc::new(bash::BashTool::new()))
             .register(Arc::new(mcp_web_use::McpWebUseTool))
             .register(Arc::new(emit::SubmitTaskClassification)),
     )
@@ -292,7 +301,8 @@ pub fn plan_registry() -> ToolRegistry {
 }
 
 /// Main-Work Agent 工具注册表(2026-09-23 第 122 轮:编排层信息收集型工具面):
-/// - **只读侦察**:Bash(只读)/ Read / Glob / Grep(项目结构与符号检索)
+/// - **只读侦察**:Bash(`BashTool::readonly()` Round 124 代码层只读)/ Read /
+///   Glob / Grep(项目结构与符号检索)
 /// - **网页信息收集**:`MCP_Web_Use`(新增,2026-09-23;编排前探查目标 URL /
 ///   入口 / DOM 结构,避免盲拆)
 /// - **顶层规划**:`TodoWrite`(编排清单 ≥3 步时先 create 全量,每完成一项 update)
@@ -300,11 +310,16 @@ pub fn plan_registry() -> ToolRegistry {
 ///
 /// Main-Work 仍**不持** `Write / Edit`(流程层只编排不落源代码;SubAgent-Work 专用),
 /// 也**不持** `MCP_Window_Use`(桌面窗口操控归 SubAgent-Work,平台门控 + 单一焦点守卫)。
-/// 详见 `docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md` §3.1。
+///
+/// **2026-09-23 Round 124 新增**:`BashTool::readonly()` 让 Main-Work Bash **代码层只读**,
+/// LLM 误用 `>` / `>>` / `tee` / `sed -i` / `mv` / `rm` 等写命令会被 PermissionDenied
+/// 拦截(放行 `ls` / `cat` / `grep` / `git log` / `curl -sI` 等只读侦察命令)。
+/// 环境旁路 `LAEW_BASH_READONLY=off` 完全跳过 readonly 检查。
+/// 详见 `docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md` §3.1 + §B 章。
 pub fn main_work_registry() -> ToolRegistry {
     register_mcp_use(register_subagent(
         ToolRegistry::new()
-            .register(Arc::new(bash::BashTool))
+            .register(Arc::new(bash::BashTool::readonly()))
             .register(Arc::new(read::ReadTool))
             .register(Arc::new(glob::GlobTool))
             .register(Arc::new(grep::GrepTool))

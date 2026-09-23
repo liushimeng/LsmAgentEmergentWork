@@ -217,7 +217,56 @@ fn is_real_bash(_path: &str) -> bool {
     true
 }
 
-pub struct BashTool;
+/// 2026-09-23 Round 124:BashTool 工作模式。
+///
+/// - `ReadWrite`(默认):维持现有行为,SubAgent / Yolo / SubAgent-Work 等
+///   持有 `BashTool::new()` 的执行层沿用。
+/// - `ReadOnly`:Main-Work 编排层专用 —— 禁止 `>` / `>>` / `tee` / `sed -i` /
+///   `mv` / `rm` 等写命令,只放行 `ls` / `cat` / `grep` / `git log` / `curl -sI`
+///   等只读侦察命令。配合 `permissions::check_bash_readonly` 强制拦截。
+///
+/// 设计参考:claudecode `isReadOnly(input)`(claudecode.md:332, 1302-1305);
+/// atomcode `read_only_hint()`(atomcode.md:725-735)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashMode {
+    /// 默认读写模式(危险命令 + 敏感路径仍由 `permissions::check_bash_command` 拦截)。
+    ReadWrite,
+    /// Main-Work 编排层专用只读模式(在 ReadWrite 拦截之上再加正向白名单)。
+    ReadOnly,
+}
+
+/// Bash 工具(单例逻辑;`mode` 字段决定是否进入 readonly 拦截)。
+///
+/// **变更历史**:
+/// - Round 122(2026-09-23):`pub struct BashTool;` 单例无字段,LLM 完全靠提示词自我约束。
+/// - Round 124(2026-09-23):加 `BashMode` 字段 + `readonly()` 构造器,代码层强制
+///   Main-Work 不落源代码(LLM 误用 `echo x > f` / `tee` / `sed -i` 等也会被 PermissionDenied)。
+pub struct BashTool {
+    mode: BashMode,
+}
+
+impl BashTool {
+    /// 默认 ReadWrite 模式(SubAgent / Yolo / SubAgent-Work 等执行层沿用)。
+    pub const fn new() -> Self {
+        Self { mode: BashMode::ReadWrite }
+    }
+
+    /// ReadOnly 模式(Main-Work 编排层专用)。
+    pub const fn readonly() -> Self {
+        Self { mode: BashMode::ReadOnly }
+    }
+
+    /// 取当前工作模式。
+    pub const fn mode(&self) -> BashMode {
+        self.mode
+    }
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -226,19 +275,38 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "在工作目录下执行 bash 命令,返回 stdout + stderr + 退出码。\n\
-         - 超时单位毫秒,默认 120000,最大 600000。\n\
-         - 一次调用执行一条命令;多条命令请用 && / ; 连接。\n\
-         - 避免使用 cat/head/tail/sed/awk/echo 这类专用命令 — 请改用 Read / Write 等专用工具。\n\
-         \n\
-         【大输出落盘(D17)】当 stdout 或 stderr 超过 30000 字符时,完整内容会\n\
-         自动写入根目录 BashSpill/bash_*.log,工具返回头部 5K + 完整路径 + 尾部 5K。\n\
-         LLM 可用 Read 工具打开该路径取回完整输出。\n\
-         \n\
-         【安全提示】以下命令会被自动拦截:\n\
-         - 危险命令:rm -rf /、rm -rf ~、dd 写磁盘、mkfs/fdisk、chmod 777、shutdown/reboot、sudo、curl|bash 等\n\
-         - 敏感路径:~/.ssh、~/.aws、~/.gnupg、.env.production、/proc/self/environ 等\n\
-         如需执行上述操作,请直接在终端运行(laew 之外)。"
+        // Round 124:ReadOnly 模式的 description 显式标注 readonly 红字,
+        // 配合 tools_hint 让 LLM 一开始就知道不能用 Bash 写盘。
+        if self.mode == BashMode::ReadOnly {
+            "【Round 124 readonly】只读侦察 Bash 命令(代码层强制只读)。\n\
+             在工作目录下执行 bash 命令,返回 stdout + stderr + 退出码。\n\
+             - 放行:ls / cat / grep / git log / git diff / git status / curl -sI / find 等\n\
+             - 拦截:`>` / `>>` / `tee` / `sed -i` / `awk -i` / `perl -i` / `mv` / `rm` /\n\
+               `cp` / `chmod` / `chown` / `touch` / `mkdir` / `ln` / `dd` / `kill -9` /\n\
+               `apt install` / `pip install` / `cargo install` / `brew install` 等\n\
+             - 旁路:设置 `LAEW_BASH_READONLY=off` 可临时关闭只读拦截(诊断用)\n\
+             \n\
+             超时默认 120000ms,最大 600000ms。**禁止写源代码 / 写临时文件**,\n\
+             有写需求时通过 SubAgent 委派。\n\n\
+             【大输出落盘(D17)】stdout/stderr 超 30000 字符自动落盘 BashSpill/bash_*.log,\n\
+             返回头部 5K + 完整路径 + 尾部 5K,可用 Read 回读。\n\n\
+             【安全提示】危险命令(rm -rf /、dd 写磁盘、sudo、curl|bash 等)\n\
+             和敏感路径(~/.ssh、~/.aws、.env.production 等)始终被拦截。"
+        } else {
+            "在工作目录下执行 bash 命令,返回 stdout + stderr + 退出码。\n\
+             - 超时单位毫秒,默认 120000,最大 600000。\n\
+             - 一次调用执行一条命令;多条命令请用 && / ; 连接。\n\
+             - 避免使用 cat/head/tail/sed/awk/echo 这类专用命令 — 请改用 Read / Write 等专用工具。\n\
+             \n\
+             【大输出落盘(D17)】当 stdout 或 stderr 超过 30000 字符时,完整内容会\n\
+             自动写入根目录 BashSpill/bash_*.log,工具返回头部 5K + 完整路径 + 尾部 5K。\n\
+             LLM 可用 Read 工具打开该路径取回完整输出。\n\
+             \n\
+             【安全提示】以下命令会被自动拦截:\n\
+             - 危险命令:rm -rf /、rm -rf ~、dd 写磁盘、mkfs/fdisk、chmod 777、shutdown/reboot、sudo、curl|bash 等\n\
+             - 敏感路径:~/.ssh、~/.aws、~/.gnupg、.env.production、/proc/self/environ 等\n\
+             如需执行上述操作,请直接在终端运行(laew 之外)。"
+        }
     }
 
     fn parameters(&self) -> Value {
@@ -277,6 +345,12 @@ impl Tool for BashTool {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .min(MAX_TIMEOUT_MS);
+
+        // Round 124:Main-Work Bash readonly 模式拦截(在 ReadWrite 危险/敏感路径
+        // 拦截之前;readonly 是更严的子集)。
+        if self.mode == BashMode::ReadOnly {
+            permissions::check_bash_readonly(&command)?;
+        }
 
         // P0:危险命令 + 敏感路径拦截(fail-closed)
         permissions::check_bash_command(&command)?;
@@ -443,7 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn echo_via_bash() {
-        let out = BashTool
+        let out = BashTool::new()
             .execute(json!({"command": "echo hello"}))
             .await
             .unwrap();
@@ -453,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_code_propagated() {
-        let out = BashTool
+        let out = BashTool::new()
             .execute(json!({"command": "exit 7"}))
             .await
             .unwrap();
@@ -462,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_command_argument_errors() {
-        let err = BashTool.execute(json!({})).await.unwrap_err();
+        let err = BashTool::new().execute(json!({})).await.unwrap_err();
         match err {
             AgentError::ToolExecution { reason, .. } => assert!(reason.contains("command")),
             other => panic!("unexpected error: {other:?}"),
@@ -472,7 +546,7 @@ mod tests {
     #[tokio::test]
     async fn dangerous_command_blocked() {
         // rm -rf / 应被拦截
-        let err = BashTool
+        let err = BashTool::new()
             .execute(json!({"command": "rm -rf /"}))
             .await
             .unwrap_err();
@@ -487,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn sudo_blocked() {
-        let err = BashTool
+        let err = BashTool::new()
             .execute(json!({"command": "sudo apt install foo"}))
             .await
             .unwrap_err();
@@ -496,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn sensitive_path_blocked() {
-        let err = BashTool
+        let err = BashTool::new()
             .execute(json!({"command": "cat ~/.ssh/id_rsa"}))
             .await
             .unwrap_err();
@@ -512,7 +586,7 @@ mod tests {
     async fn timeout_kills_subtree() {
         // sleep 30 + timeout 1s → 应被超时中断,且进程不再存在
         let start = std::time::Instant::now();
-        let err = BashTool
+        let err = BashTool::new()
             .execute(json!({"command": "sleep 30", "timeout_ms": 1000u64}))
             .await
             .unwrap_err();
@@ -530,7 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn short_sleep_completes() {
-        let out = BashTool
+        let out = BashTool::new()
             .execute(json!({"command": "sleep 0.2", "timeout_ms": 5000u64}))
             .await
             .unwrap();
@@ -542,7 +616,7 @@ mod tests {
         // 合并为单测试顺序执行:两个 #[test] 并行跑会因进程级 env 互相竞态
         let _env = lock_env();
         std::env::set_var("LAEW_BASH_UTF8", "1");
-        let on = BashTool
+        let on = BashTool::new()
             .execute(json!({"command": "echo \"$LC_ALL/$PYTHONUTF8/$PYTHONIOENCODING\""}))
             .await
             .unwrap();
@@ -551,7 +625,7 @@ mod tests {
             "子进程应注入 UTF-8 环境,实际: {on}"
         );
         std::env::remove_var("LAEW_BASH_UTF8");
-        let off = BashTool
+        let off = BashTool::new()
             .execute(json!({"command": "echo \"[$PYTHONUTF8]\""}))
             .await
             .unwrap();
@@ -567,7 +641,7 @@ mod tests {
         let prev = std::env::var("LAEW_BASH_SPILL_THRESHOLD").ok();
         std::env::set_var("LAEW_BASH_SPILL_THRESHOLD", "2048");
         // 生成 5K 字节的输出,超过 2K 阈值
-        let out = BashTool
+        let out = BashTool::new()
             .execute(json!({
                 "command": "python3 -c \"import sys; sys.stdout.write('A' * 5000)\"",
                 "timeout_ms": 10000u64,
@@ -597,7 +671,7 @@ mod tests {
         // (`GLOBAL_ENV_CWD_LOCK` 正是为此存在)。并行跑时环境变量/cwd 被并发改写,
         // 本用例会偶发失败(单跑恒过)。补锁与兄弟用例对齐。
         let _env = lock_env();
-        let out = BashTool
+        let out = BashTool::new()
             .execute(json!({
                 "command": "echo hello-spill-test",
                 "timeout_ms": 5000u64,
@@ -617,7 +691,7 @@ mod tests {
         let _env = lock_env();
         let prev = std::env::var("LAEW_BASH_SPILL_THRESHOLD").ok();
         std::env::set_var("LAEW_BASH_SPILL_THRESHOLD", "1024");
-        let out = BashTool
+        let out = BashTool::new()
             .execute(json!({
                 "command": "python3 -c \"import sys; sys.stderr.write('B' * 3000)\"",
                 "timeout_ms": 10000u64,
