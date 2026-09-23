@@ -12,6 +12,7 @@ use reqwest::header::{HeaderName, HeaderValue, ACCEPT};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::agent::system_prompt::PromptSegments;
 use crate::config::Protocol;
 use crate::error::{AgentError, Result};
 use crate::llm::sse::{DeltaEvent, ParseSink, SseStream};
@@ -168,13 +169,53 @@ fn convert_tools(tools: &[ToolDef]) -> Vec<Value> {
         .collect()
 }
 
-/// 把字符串 system 切分为单个文本块数组(Anthropic 同时支持字符串与数组形态,
-/// 数组形态才能携带 `cache_control` 断点 — L1047)。
+/// 把 Anthropic 三段式系统提示词转换为 wire blocks(第 121 轮,2026-09-23)。
 ///
-/// 空字符串返回空数组(`AnthropicRequest.system: None` 时整字段被 skip_serializing)。
-/// 非空则返回 `[{ "type": "text", "text": <原文> }]`,`apply_cache_policy`
-/// 在最后一个(也是唯一)文本块上打 cache_control。
-fn convert_system_blocks(system: &str) -> Vec<Value> {
+/// 三段结构(对齐 Claude Code 抓包 `x-anthropic-billing-header: …` 范式):
+/// 1. **billing 计费头** —— 单行 `x-anthropic-billing-header: cc_version=…; cc_entrypoint=cli; cc_is_subagent=true;`,
+///    不带 `cache_control`(Anthropic 内部字段,对模型行为零影响)
+/// 2. **identity 基础身份声明** —— 一句话身份,带 `cache_control: ephemeral`
+/// 3. **rules 核心行为规则** —— 工具说明 + 协议尾 + 完整指令集,带 `cache_control: ephemeral`。
+///    `rules` 来自调用方的 `system` 参数(runtime 已拼接 workspace + runtime hints),
+///    **不**使用 `segments.rules`(那是静态 base,不含每轮动态 hints)。
+///
+/// 缓存粒度:本函数**主动**给 identity + rules 末尾两块各打一份 `cache_control`,
+/// 配合 `apply_cache_policy` 的幂等跳过(见 `mark_last_system` 已含 cache 时 `bp.remaining += 1`)
+/// 总预算仍为 4:tools + system.identity + system.rules + user_message,刚好命中 cap。
+///
+/// 退化兼容:identity 空字符串时**省略** identity 段,只剩 billing + rules(2 块),
+/// rules 仍带 cache_control;`apply_cache_policy` 看到末尾已带 cache_control 时
+/// `try_consume → 已带 → remaining += 1`,不影响预算。
+fn convert_system_blocks_split(segments: &PromptSegments, rules: &str) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(3);
+    // 第 1 段 计费头(不带 cache_control)
+    if !segments.billing.trim().is_empty() {
+        out.push(json!({ "type": "text", "text": segments.billing }));
+    }
+    // 第 2 段 身份声明(带 cache_control: ephemeral)
+    if !segments.identity.trim().is_empty() {
+        out.push(json!({
+            "type": "text",
+            "text": segments.identity,
+            "cache_control": { "type": "ephemeral" }
+        }));
+    }
+    // 第 3 段 核心行为规则(带 cache_control: ephemeral);runtime hints 已拼到该字符串
+    if !rules.trim().is_empty() {
+        out.push(json!({
+            "type": "text",
+            "text": rules,
+            "cache_control": { "type": "ephemeral" }
+        }));
+    }
+    out
+}
+
+/// 旧路径回退:把字符串 system 切分为单个文本块数组,保持第 120 轮前行为。
+///
+/// 当 `meta.anthropic_segments == None`(测试 / 简化调用)时使用;`apply_cache_policy`
+/// 在末尾(也是唯一)文本块上打 `cache_control`,与原实现完全等价。
+fn convert_system_blocks_legacy(system: &str) -> Vec<Value> {
     if system.trim().is_empty() {
         Vec::new()
     } else {
@@ -187,38 +228,130 @@ mod cache_policy_tests {
     //! 验证 `convert_system_blocks` 与 `apply_cache_policy` 在 Anthropic 协议层的端到端集成。
 
     use super::*;
+    use crate::agent::system_prompt::PromptSegments;
     use crate::llm::{ChatMessage, ToolDef};
     use serde_json::json;
 
-    #[test]
-    fn convert_system_blocks_empty_returns_empty() {
-        assert!(convert_system_blocks("").is_empty());
-        assert!(convert_system_blocks("   ").is_empty());
-        assert!(convert_system_blocks("\n\t").is_empty());
+    /// 三段式 segments 工厂(测试用)。
+    fn segs(billing: &str, identity: &str, _rules: &str) -> PromptSegments {
+        PromptSegments {
+            billing: billing.to_string(),
+            identity: identity.to_string(),
+            rules: String::new(),
+        }
     }
 
+    /// 第 121 轮三段式:空 segments + 空 rules → emit 0 块。
     #[test]
-    fn convert_system_blocks_single_text_block() {
-        let blocks = convert_system_blocks("you are a helpful assistant");
+    fn convert_system_blocks_all_empty_returns_empty() {
+        let blocks = convert_system_blocks_split(&segs("", "", ""), "");
+        assert!(blocks.is_empty());
+    }
+
+    /// billing 非空但 identity / rules 全空白:仍 emit 1 块(仅 billing,不带 cache)。
+    #[test]
+    fn convert_system_blocks_billing_only_no_cache_control() {
+        let blocks = convert_system_blocks_split(
+            &segs(
+                "x-anthropic-billing-header: cc_version=0.1.0-abc; cc_entrypoint=cli; cc_is_subagent=true;",
+                "   ",
+                "",
+            ),
+            "",
+        );
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["text"], "you are a helpful assistant");
-        // 未应用 cache policy 时不带 cache_control
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header: "));
+        // billing 段不带 cache_control
         assert!(blocks[0].get("cache_control").is_none());
     }
 
+    /// identity + rules 三段齐备 → 3 块;identity / rules 都带 cache_control。
     #[test]
-    fn convert_system_blocks_plus_apply_marks_last_block() {
-        let blocks = convert_system_blocks("s");
-        let (out_sys, _, _, bp) = apply_cache_policy(
+    fn convert_system_blocks_three_segments_with_cache_on_identity_and_rules() {
+        let blocks = convert_system_blocks_split(
+            &segs(
+                "x-anthropic-billing-header: cc_version=0.1.0-abc; cc_entrypoint=cli; cc_is_subagent=true;",
+                "你是 LsmAgentEmergentWork-Yolo,入口 Agent。",
+                "",
+            ),
+            "完整规则集:工具 + 协议尾",
+        );
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[0].get("cache_control").is_none(), "billing 不打 cache");
+        assert_eq!(blocks[1]["type"], "text");
+        assert!(blocks[1].get("cache_control").is_some(), "identity 打 cache");
+        assert_eq!(blocks[2]["type"], "text");
+        assert!(blocks[2].get("cache_control").is_some(), "rules 打 cache");
+        assert_eq!(blocks[1]["text"], "你是 LsmAgentEmergentWork-Yolo,入口 Agent。");
+        assert_eq!(blocks[2]["text"], "完整规则集:工具 + 协议尾");
+    }
+
+    /// identity 为空字符串时省略该段,只剩 billing + rules(2 块)。
+    #[test]
+    fn convert_system_blocks_skips_empty_identity() {
+        let blocks = convert_system_blocks_split(
+            &segs("billing-here", "", ""),
+            "rules-here",
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "billing-here");
+        assert!(blocks[0].get("cache_control").is_none());
+        assert_eq!(blocks[1]["text"], "rules-here");
+        assert!(blocks[1].get("cache_control").is_some());
+    }
+
+    /// billing 头格式校验:对齐 Claude Code 抓包 `x-anthropic-billing-header: cc_version=…; cc_entrypoint=cli; cc_is_subagent=true;`。
+    #[test]
+    fn default_billing_header_matches_anthropic_format() {
+        // 重新构造 segments 走默认 billing 头
+        let sp = crate::agent::system_prompt::SystemPrompt::new("body").set_identity("id");
+        let segments = sp.prompt_segments();
+        assert!(
+            segments.billing.starts_with("x-anthropic-billing-header: "),
+            "billing 头必须以 x-anthropic-billing-header: 开头: got={}",
+            segments.billing
+        );
+        assert!(segments.billing.contains("cc_version="), "缺 cc_version");
+        assert!(segments.billing.contains("cc_entrypoint=cli"), "缺 cc_entrypoint=cli");
+        assert!(segments.billing.contains("cc_is_subagent=true"), "缺 cc_is_subagent=true");
+    }
+
+    /// `apply_cache_policy` 看到末尾 system 已带 cache_control 时幂等跳过,
+    /// 预算不浪费;只在 tools 与 user message 上打标 → 共 3 个 breakpoint。
+    #[test]
+    fn apply_cache_policy_after_three_segments_yields_three_breakpoints() {
+        let blocks = convert_system_blocks_split(
+            &segs("billing-here", "identity-here", ""),
+            "rules-here",
+        );
+        let (out_sys, out_tools, out_msgs, bp) = apply_cache_policy(
             DEFAULT_CACHE_POLICY,
             blocks,
-            vec![json!({"name":"T","description":"d","input_schema":{}})],
-            vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})],
+            vec![
+                json!({"name":"T1","description":"d","input_schema":{}}),
+                json!({"name":"T2","description":"d","input_schema":{}}),
+            ],
+            vec![
+                json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            ],
         );
-        assert_eq!(out_sys.len(), 1);
-        assert!(out_sys[0].get("cache_control").is_some());
+        // system: identity + rules 已有 cache_control,mark_last_system 跳过
+        assert!(out_sys[0].get("cache_control").is_none(), "billing 仍无 cache");
+        assert!(out_sys[1].get("cache_control").is_some(), "identity 已有 cache");
+        assert!(out_sys[2].get("cache_control").is_some(), "rules 已有 cache");
+        // tools: last tool 被打 cache
+        assert!(out_tools.last().unwrap().get("cache_control").is_some());
+        // user: latest user text 被打 cache
+        let user_content = out_msgs.last().unwrap()["content"].as_array().unwrap();
+        assert!(user_content.last().unwrap().get("cache_control").is_some());
+        // 总消费: tools 1 + user 1 = 2(system 0,因已标幂等);remaining = 4 - 2 = 2
         assert_eq!(bp.dropped, 0);
+        assert_eq!(bp.remaining, 2);
     }
 
     #[test]
@@ -240,10 +373,15 @@ mod cache_policy_tests {
         assert!(s.contains("\"cache_control\":{\"type\":\"ephemeral\"}"));
     }
 
+    /// 端到端三段式 wire:3 个 breakpoints(tool + system.identity + system.rules) + user
+    /// 都带 cache_control。billing 段不带。
     #[test]
-    fn end_to_end_request_body_has_cache_control_on_three_breakpoints() {
-        // 模拟一次完整 complete() 路径的请求体构造
-        let system = "you are x";
+    fn end_to_end_request_body_three_segment_system_cache_breakpoints() {
+        let segments = segs(
+            "x-anthropic-billing-header: cc_version=0.1.0-abc; cc_entrypoint=cli; cc_is_subagent=true;",
+            "你是 LsmAgentEmergentWork-Yolo,入口 Agent。",
+            "",
+        );
         let tools = vec![
             ToolDef::new("Read", "read file", json!({"type":"object"})),
             ToolDef::new("Write", "write file", json!({"type":"object"})),
@@ -254,17 +392,21 @@ mod cache_policy_tests {
             ChatMessage::user("second"),
         ];
 
-        let sys_blocks = convert_system_blocks(system);
+        let sys_blocks = convert_system_blocks_split(&segments, "完整规则集 + 动态 hints");
+        assert_eq!(sys_blocks.len(), 3);
         let tool_blocks = convert_tools(&tools);
         let msg_blocks = convert_messages(&messages);
         let (sys_blocks, tool_blocks, msg_blocks, _) =
             apply_cache_policy(DEFAULT_CACHE_POLICY, sys_blocks, tool_blocks, msg_blocks);
 
-        // 1) last tool
+        // 1) billing 不带 cache(已知机器字段)
+        assert!(sys_blocks[0].get("cache_control").is_none());
+        // 2) identity / rules 各带一份 cache_control
+        assert!(sys_blocks[1].get("cache_control").is_some());
+        assert!(sys_blocks[2].get("cache_control").is_some());
+        // 3) last tool
         assert!(tool_blocks.last().unwrap().get("cache_control").is_some());
-        // 2) last system
-        assert!(sys_blocks.last().unwrap().get("cache_control").is_some());
-        // 3) latest user message text block
+        // 4) latest user message text block
         let latest_user = msg_blocks.iter().rfind(|m| m["role"] == "user").unwrap();
         let content = latest_user["content"].as_array().unwrap();
         assert!(content.last().unwrap().get("cache_control").is_some());
@@ -412,10 +554,20 @@ impl LlmClient for AnthropicClient {
         // 空则回退构造期默认 —— 同一客户端上 8 角色请求在抓包层面各自可辨识。
         let user_agent = meta.resolve_user_agent(&self.user_agent);
         let agent_name = user_agent.split('/').next().unwrap_or_default();
-        // Prompt Caching(第十六轮 L1047):Anthropic 路径自动注入 cache_control 断点。
-        // OpenAI 协议忽略(走隐式 prefix caching),故无需在此处判断协议。
-        // 三元组顺序:tools → system → messages,与 opencode cache-policy.ts 一致。
-        let sys_blocks = convert_system_blocks(system);
+        // Anthropic 三段式 system(第 121 轮,2026-09-23):
+        // `meta.anthropic_segments` 由 Agent 层从 SystemPrompt 注入(billing / identity 静态,
+        // rules = base + tools + tail,与 `system: &str` 在不含动态 hints 时等价)。
+        // 优先 **拼接** 三段:
+        //   - billing(segments,无 cache)
+        //   - identity(segments,带 cache)
+        //   - `system: &str` 参数(运行时已叠加 workspace + runtime hints 的最终串,带 cache)
+        // 三段总和仍受 4 断点 cap 约束;`apply_cache_policy` 看到末尾 system 已带 cache
+        // → 跳过(`has_cache_control` 分支返回 + bp.remaining += 1,不影响总预算)。
+        // 回退路径:`meta.anthropic_segments == None` 时走旧 path(单字符串 + 末尾 cache)。
+        let sys_blocks = match meta.anthropic_segments.as_ref() {
+            Some(segs) => convert_system_blocks_split(segs, system),
+            None => convert_system_blocks_legacy(system),
+        };
         let tool_blocks = convert_tools(tools);
         let msg_blocks = convert_messages(messages);
         let (sys_blocks, tool_blocks, msg_blocks, _bp) =

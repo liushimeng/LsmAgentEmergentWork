@@ -184,6 +184,7 @@ impl Session {
             max_tokens_override: None,
             user_agent: String::new(),
             forced_tool: None,
+            anthropic_segments: None,
         }
     }
 }

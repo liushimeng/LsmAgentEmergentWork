@@ -89,6 +89,11 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **AgentProfile**：Agent 身份档案（名称 / 系统提示词 / 工具集），`work_profile()` / `yolo_profile()` 两个工厂函数。
 - **Session**：进程内会话，拥有独立 Session ID 与对话上下文（context）；TUI 启动或 `/new` `/clear` 时生成新 Session。**会话持久化（第 96 轮，2026-09-19）**：TUI 每轮任务收口把 transcript **整快照重写**（单事务 DELETE+INSERT，rewind/fork/switch/resume 全 mutation 路径自动一致）到根目录 SQLite `chat_sessions`（索引行：title/turn_count/model_name/updated_at）+ `chat_turns`（轮次：`response` 人类版与 `context_response` 上下文回填版分列）；失败仅告警不打断对话；自动保留最近 50 个会话（新会话落盘同事务淘汰超额）。恢复走 `/sessions` `/resume` / `--resume`（`-c`），重建后保持原 Session ID（session_memory 摘要链连续）、PROJECT_CONTEXT 幂等重注入。设计 `tmpPlan/2026-09-19_02-会话持久化与跨进程恢复方案.md`。
 - **请求头**：两协议统一携带 `User-Agent: {AgentName}/{版本} {编译时间}`、`Authorization: Bearer {api_key}`、`X-Session-Id`；Anthropic 请求体 additionally 携带 `metadata.user_id`（含 `device_id/account_uuid/session_id/agent`）。**User-Agent 按"发起请求的 Agent 角色"逐请求注入**（`Agent::run_session_inner` 从 profile 写入 `RequestMeta.user_agent`，8 角色各自携带自身名称，抓包层面可辨识；空值回退客户端构造期默认 UA）——见 `tmpPlan/2026-09-09_08` 方案。
+- **Anthropic 三段式系统提示词**(第 121 轮，2026-09-23)：8 角色 + WorkFlow 角色的 `system` 字段从单字符串重构为三段式，对齐 Claude Code CLI 抓包范式——
+  1. **billing 计费头**(无 cache_control)：单行 `x-anthropic-billing-header: cc_version={CARGO_PKG_VERSION}-{LAEW_GIT_HASH}; cc_entrypoint=cli; cc_is_subagent=true;`,Anthropic 内部计费/链路字段,对模型行为零影响
+  2. **identity 基础身份声明**(带 `cache_control: ephemeral`)：单行 Agent 身份 + 一句话职责,8 角色 + WorkFlow 各一份
+  3. **rules 核心行为规则**(带 `cache_control: ephemeral`)：base + tools_hint + protocol_tail + 运行时 workspace_hint + runtime_hints,等价于原 `render()` 单字符串内容
+  缓存复用:billing + identity 静态常量跨会话完全一致 → 100% 命中,显著节省输入 token;rules 因 runtime hints 注入每轮不同 → 每轮重算但仍带 cache 标记。4 断点 cap 约束下,billing 无 cache / identity + rules + last tool + latest user 各一份 cache,刚好命中 cap。OpenAI 协议不受影响,继续走 `system` 单字符串路径。实现 `src/agent/system_prompt/mod.rs::PromptSegments` + `src/llm/anthropic.rs::convert_system_blocks_split`,Agent 循环 `meta.anthropic_segments = Some(profile.system_prompt.prompt_segments())` 注入。设计 `docs/Anthropic协议系统提示词三段式/01-设计与解决方案.md`。
 
 ## 架构（src/）
 

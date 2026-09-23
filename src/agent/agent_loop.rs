@@ -97,6 +97,13 @@ impl Agent {
         // UA 逐请求注入(2026-09-09 第 08 轮):让抓包层面 8 角色各自可辨识;
         // meta.user_agent 为空时协议层回退到客户端构造期默认 UA(见 RequestMeta::resolve_user_agent)。
         meta.user_agent = self.profile.user_agent();
+        // Anthropic 三段式 segments(第 121 轮,2026-09-23):
+        // 把 SystemPrompt 拆为 billing + identity + rules 三段(billing/identity 静态常量,
+        // rules = base + tools + protocol_tail),wire 层在 system 字段拼装 3 个 text block,
+        // identity / rules 各带 cache_control: ephemeral —— billing 头变化概率极低,
+        // identity 身份声明每次会话固定,rules 可能因 runtime hints 拼接而逐轮变化。
+        // OpenAI 协议忽略该字段,继续用 `system: &str` 单字符串路径(零回归)。
+        meta.anthropic_segments = Some(self.profile.system_prompt.prompt_segments());
         // 结构化输出强制通道(L6/L19 + 2026-09-22 Yolo ReAct 延迟强制):
         // 默认(Quality-Check 等 defer_emit_force=false):每轮注入 forced tool_choice,
         //   模型必须以 tool_use 返回结构化结果(单轮强制);

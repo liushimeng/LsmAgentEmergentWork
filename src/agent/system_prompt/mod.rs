@@ -26,13 +26,34 @@ impl Default for ToolsHint {
     }
 }
 
-/// 系统提示词:基础文本 + 工具说明 + 协议特定后缀。
+/// Anthropic 三段式系统提示词的第 2 / 第 3 段(identity / rules,带 cache_control)。
+/// billing 计费头不带此结构,见 `prompt_segments`。
+#[derive(Clone, Debug)]
+pub struct PromptSegments {
+    /// 第 2 段 基础身份声明(单行,带 `cache_control: ephemeral`)。
+    pub identity: String,
+    /// 第 3 段 核心行为规则(工具说明 + 协议尾 + MCP 章节等,带 `cache_control: ephemeral`)。
+    pub rules: String,
+    /// 第 1 段 计费元数据头(不带 cache_control,Anthropic 内部字段,对模型行为零影响)。
+    /// 仅 Anthropic 协议路径使用。
+    pub billing: String,
+}
+
+/// 系统提示词:基础文本 + 工具说明 + 协议特定后缀 + (可选)身份声明 + (可选)计费头。
 #[derive(Clone)]
 pub struct SystemPrompt {
     base: String,
     tools_hint: ToolsHint,
     /// 协议特定后缀:在基础 + 工具说明之后追加。
     protocol_tail: HashMap<Protocol, String>,
+    /// 第 2 段 身份声明(第 121 轮三段式 Anthropic 协议)。
+    /// 默认 = base 首句 `你是 LsmAgentEmergentWork-{Name},{一句话职责}。`,
+    /// 用 `set_identity` 自定义。空字符串 = 不输出 identity 段(并入 rules)。
+    identity: String,
+    /// 第 1 段 计费元数据头(第 121 轮三段式 Anthropic 协议)。
+    /// 默认按 base/identity 内容自动生成 `x-anthropic-billing-header: …`。
+    /// 用 `set_billing_header` 自定义;`None` 表示不生成(协议层保留默认)。
+    billing_header: Option<String>,
 }
 
 impl SystemPrompt {
@@ -42,6 +63,8 @@ impl SystemPrompt {
             base: base.into(),
             tools_hint: ToolsHint::default(),
             protocol_tail: HashMap::new(),
+            identity: String::new(),
+            billing_header: None,
         }
     }
 
@@ -51,6 +74,8 @@ impl SystemPrompt {
             base: base.into(),
             tools_hint: ToolsHint::None,
             protocol_tail: HashMap::new(),
+            identity: String::new(),
+            billing_header: None,
         }
     }
 
@@ -66,7 +91,19 @@ impl SystemPrompt {
         self
     }
 
-    /// 按协议渲染最终系统提示词。
+    /// 设置身份声明(第 2 段)。空字符串 = 不输出 identity 段(并入 rules)。
+    pub fn set_identity(mut self, identity: impl Into<String>) -> Self {
+        self.identity = identity.into();
+        self
+    }
+
+    /// 设置计费元数据头(第 1 段)。`None` = 按默认规则生成。
+    pub fn set_billing_header(mut self, header: impl Into<String>) -> Self {
+        self.billing_header = Some(header.into());
+        self
+    }
+
+    /// 按协议渲染最终系统提示词(单字符串形态,OpenAI 协议 + Anthropic 默认路径)。
     pub fn render(&self, protocol: Protocol) -> String {
         let mut out = String::new();
         out.push_str(&self.base);
@@ -95,8 +132,41 @@ impl SystemPrompt {
             base: format!("{}{}", self.base, extra),
             tools_hint: self.tools_hint.clone(),
             protocol_tail: self.protocol_tail.clone(),
+            identity: self.identity.clone(),
+            billing_header: self.billing_header.clone(),
         }
     }
+
+    /// 生成 Anthropic 三段式 segments(第 121 轮,2026-09-23)。
+    ///
+    /// 拆分逻辑:
+    /// - **第 1 段 billing**(不带 cache_control):单行 `x-anthropic-billing-header: …`,
+    ///   携带 SDK 版本/调用入口/子代理标记,Anthropic 内部计费字段,对模型行为零影响。
+    /// - **第 2 段 identity**(带 cache_control):由 `set_identity` 显式指定,空则不输出
+    ///   identity 段(回退到「一整段单块 + rules」老路径,保证向后兼容)。
+    /// - **第 3 段 rules**(带 cache_control):`base + tools_hint + protocol_tail` 拼接,
+    ///   等价于原 `render()` 单字符串。
+    ///
+    /// OpenAI 协议不受影响,继续走 `render()` 单字符串路径。
+    pub fn prompt_segments(&self) -> PromptSegments {
+        let billing = self.billing_header.clone().unwrap_or_else(default_billing_header);
+        let rules = self.render(Protocol::Anthropic);
+        PromptSegments {
+            identity: self.identity.clone(),
+            rules,
+            billing,
+        }
+    }
+}
+
+/// 默认计费元数据头(第 121 轮)。字段顺序对齐 Claude Code 抓包:
+/// `cc_version` / `cc_entrypoint=cli` / `cc_is_subagent=true`。
+fn default_billing_header() -> String {
+    format!(
+        "x-anthropic-billing-header: cc_version={}-{}; cc_entrypoint=cli; cc_is_subagent=true;",
+        env!("CARGO_PKG_VERSION"),
+        env!("LAEW_GIT_HASH"),
+    )
 }
 
 impl Default for SystemPrompt {
@@ -135,6 +205,7 @@ impl SystemPrompt {
             .with_tools_hint(yolo_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, YOLO_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, YOLO_OPENAI_TAIL)
+            .set_identity(YOLO_IDENTITY)
     }
 
     /// 构造 Plan Agent 的系统提示词(规划层,hard 档任务,产出 Markdown 方案)。
@@ -143,6 +214,7 @@ impl SystemPrompt {
             .with_tools_hint(plan_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, PLAN_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, PLAN_OPENAI_TAIL)
+            .set_identity(PLAN_IDENTITY)
     }
 
     /// 构造 Main-Work Agent 的系统提示词(流程层,WorkFlow 编排)。
@@ -151,6 +223,7 @@ impl SystemPrompt {
             .with_tools_hint(main_work_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, MAIN_WORK_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, MAIN_WORK_OPENAI_TAIL)
+            .set_identity(MAIN_WORK_IDENTITY)
     }
 
     /// 构造 SubAgent-Work Agent 的系统提示词(执行层最小单元)。
@@ -164,6 +237,7 @@ impl SystemPrompt {
             .with_tools_hint(sub_agent_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, SUB_AGENT_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, SUB_AGENT_OPENAI_TAIL)
+            .set_identity(SUB_AGENT_IDENTITY)
             .append_base(MCP_WEB_USE_PROMPT_SECTION);
         if crate::agent::tools::mcp_window_use::mcp_window_use_available() {
             prompt.append_base(MCP_WINDOW_USE_PROMPT_SECTION)
@@ -178,6 +252,7 @@ impl SystemPrompt {
             .with_tools_hint(quality_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, QUALITY_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, QUALITY_OPENAI_TAIL)
+            .set_identity(QUALITY_IDENTITY)
     }
 
     /// 构造 SessionContext Agent 的系统提示词(会话层)。
@@ -186,16 +261,17 @@ impl SystemPrompt {
             .with_tools_hint(session_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, SESSION_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, SESSION_OPENAI_TAIL)
+            .set_identity(SESSION_IDENTITY)
     }
 
     /// 构造 Debug Agent 的系统提示词(调试层,trace 评估,无工具)。
     pub fn debug() -> Self {
-        Self::without_tools(DEBUG_BASE_PROMPT)
+        Self::without_tools(DEBUG_BASE_PROMPT).set_identity(DEBUG_IDENTITY)
     }
 
     /// 构造 Compact Agent 的系统提示词(压缩层,上下文摘要,无工具)。
     pub fn compact() -> Self {
-        Self::without_tools(COMPACT_BASE_PROMPT)
+        Self::without_tools(COMPACT_BASE_PROMPT).set_identity(COMPACT_IDENTITY)
     }
 
     /// 构造 WorkFlow Agent 的系统提示词(工作流编排层,第 10 角色)。
@@ -204,8 +280,24 @@ impl SystemPrompt {
             .with_tools_hint(work_flow_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, WORK_FLOW_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, WORK_FLOW_OPENAI_TAIL)
+            .set_identity(WORK_FLOW_IDENTITY)
     }
 }
+
+// =================== Identity 段常量(第 121 轮 Anthropic 三段式,第 2 段) ===================
+//
+// 每个 Agent 的第 2 段:一句话身份声明,带 cache_control: ephemeral,被 Anthropic 服务端
+// 按前缀缓存复用。**整段 ≤ 200 字符,只保身份 + 一句话职责,详细规则在第 3 段 rules**。
+
+const YOLO_IDENTITY: &str = "你是 LsmAgentEmergentWork-Yolo,用户对话的第一层入口 Agent,负责目的/目标/意图三步分析与简单/中/高三档难度分类。";
+const PLAN_IDENTITY: &str = "你是 LsmAgentEmergentWork-Plan,hard 难度任务的方案规划 Agent,产结构化 Markdown 方案。";
+const MAIN_WORK_IDENTITY: &str = "你是 LsmAgentEmergentWork-Main-Work,流程编排 Agent,接收任务后拆 WorkFlow 委派 SubAgent-Work 执行。";
+const SUB_AGENT_IDENTITY: &str = "你是 LsmAgentEmergentWork-SubAgent-Work,执行层最小单元 Agent,按 ReAct 模式完成单流程处理单元。";
+const QUALITY_IDENTITY: &str = "你是 LsmAgentEmergentWork-Quality-Check,质检层 Agent,校验 SubAgent/Main-Work/Plan 输出并提交结构化判定。";
+const SESSION_IDENTITY: &str = "你是 LsmAgentEmergentWork-SessionContext,会话层 Agent,任务收尾生成简洁 Markdown 摘要并落 session_memory。";
+const DEBUG_IDENTITY: &str = "你是 LsmAgentEmergentWork-Debug,调试层评估 Agent,基于 trace 产出四章节调试评估报告。";
+const COMPACT_IDENTITY: &str = "你是 LsmAgentEmergentWork-Compact,压缩层摘要 Agent,按档位目标压缩率产出多段式上下文摘要。";
+const WORK_FLOW_IDENTITY: &str = "你是 LsmAgentEmergentWork-WorkFlow,工作流编排层 Agent,负责超大型复杂任务的 Goal 树与 Squad 调度。";
 
 /// Yolo Agent 基础身份与职责说明。
 /// Yolo Agent 基础身份与职责说明。
@@ -1300,6 +1392,92 @@ mod tests {
         }
         // 原 Chromium-WebUse 专项提示词应彻底移除
         assert!(!rendered.contains("Chromium-WebUse"));
+    }
+
+    // ===== 第 121 轮:Anthropic 三段式 system prompt(billing + identity + rules) =====
+
+    /// 8 角色 + WorkFlow 角色:均产出非空 segments,billing 头格式对齐 Claude Code 抓包。
+    #[test]
+    fn all_prompts_yield_three_segments_with_billing_and_identity() {
+        let builders: [(&str, fn() -> SystemPrompt); 9] = [
+            ("Yolo", SystemPrompt::yolo),
+            ("Plan", SystemPrompt::plan),
+            ("Main-Work", SystemPrompt::main_work),
+            ("SubAgent-Work", SystemPrompt::sub_agent_work),
+            ("Quality-Check", SystemPrompt::quality_check),
+            ("SessionContext", SystemPrompt::session_context),
+            ("Debug", SystemPrompt::debug),
+            ("Compact", SystemPrompt::compact),
+            ("WorkFlow", SystemPrompt::work_flow),
+        ];
+        for (name, f) in builders {
+            let segs = f().prompt_segments();
+            assert!(!segs.billing.is_empty(), "{name}: billing 应非空");
+            assert!(
+                segs.billing.starts_with("x-anthropic-billing-header: "),
+                "{name}: billing 头格式: got={}",
+                segs.billing
+            );
+            assert!(segs.billing.contains("cc_version="), "{name}: billing 缺 cc_version");
+            assert!(
+                segs.billing.contains("cc_entrypoint=cli"),
+                "{name}: billing 缺 cc_entrypoint=cli"
+            );
+            assert!(
+                segs.billing.contains("cc_is_subagent=true"),
+                "{name}: billing 缺 cc_is_subagent=true"
+            );
+            // identity 段:每个角色都应有自己的 identity
+            assert!(!segs.identity.is_empty(), "{name}: identity 应非空");
+            assert!(
+                segs.identity.contains(name) || name == "WorkFlow",
+                "{name}: identity 应提及自身角色: got={}",
+                segs.identity
+            );
+            // rules 段:等价于 render() 单字符串(runtime hints 之外的内容)
+            assert!(!segs.rules.is_empty(), "{name}: rules 应非空");
+            assert_eq!(segs.rules, f().render(Protocol::Anthropic), "{name}: rules 应等价于 render()");
+        }
+    }
+
+    /// identity 段默认为空 → prompt_segments 返回空 identity。
+    #[test]
+    fn default_system_prompt_segments_identity_is_empty() {
+        let sp = default_system_prompt();
+        let segs = sp.prompt_segments();
+        assert!(segs.identity.is_empty(), "未 set_identity 的默认 prompt identity 应为空");
+        // billing 头仍生成(协议层可在 wire 拼接时决定是否注入)
+        assert!(segs.billing.starts_with("x-anthropic-billing-header: "));
+        // rules 等价于 render()
+        assert_eq!(segs.rules, sp.render(Protocol::Anthropic));
+    }
+
+    /// set_identity 显式设置 → identity 段非空,set_billing_header 可覆盖默认头。
+    #[test]
+    fn set_identity_and_set_billing_header_overrides() {
+        let sp = SystemPrompt::new("base").set_identity("我是 ID");
+        let segs = sp.prompt_segments();
+        assert_eq!(segs.identity, "我是 ID");
+        // 默认 billing 头仍由 default_billing_header 生成
+        assert!(segs.billing.contains("cc_version="));
+
+        let custom_billing = "x-anthropic-billing-header: cc_version=custom; cc_entrypoint=cli; cc_is_subagent=true;";
+        let sp2 = SystemPrompt::new("base").set_billing_header(custom_billing);
+        assert_eq!(sp2.prompt_segments().billing, custom_billing);
+    }
+
+    /// append_base 透传 identity 与 billing_header(避免被覆盖)。
+    #[test]
+    fn append_base_preserves_identity_and_billing() {
+        let sp = SystemPrompt::new("base")
+            .set_identity("我是 ID")
+            .set_billing_header("x-anthropic-billing-header: cc_version=1;");
+        let appended = sp.append_base("追加内容");
+        let segs = appended.prompt_segments();
+        assert_eq!(segs.identity, "我是 ID");
+        assert_eq!(segs.billing, "x-anthropic-billing-header: cc_version=1;");
+        assert!(segs.rules.contains("base"));
+        assert!(segs.rules.contains("追加内容"));
     }
 }
 

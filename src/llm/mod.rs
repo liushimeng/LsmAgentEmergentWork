@@ -134,6 +134,15 @@ pub struct RequestMeta {
     /// Provider 不支持时由 `resilient.rs` 自动去掉 forced 降级重试。
     /// `None` = 默认行为(Anthropic 不发 tool_choice / OpenAI 发 "auto")。
     pub forced_tool: Option<String>,
+    /// Anthropic 三段式系统提示词段(第 121 轮,2026-09-23):
+    ///
+    /// `Some(segs)` 时 Anthropic wire 层按 billing / identity / rules 三段拼装
+    /// system 字段,identity + rules 各带一份 `cache_control: ephemeral`;
+    /// `None` 时回退到单字符串 path(`system: &str` 当作整块,旧行为)。
+    ///
+    /// OpenAI 协议忽略该字段(继续走 `system` 单字符串)。`Agent::run_session_inner`
+    /// 从 `AgentProfile.system_prompt.prompt_segments()` 注入。
+    pub anthropic_segments: Option<crate::agent::system_prompt::PromptSegments>,
 }
 
 impl RequestMeta {
@@ -145,6 +154,7 @@ impl RequestMeta {
             max_tokens_override: None,
             user_agent: String::new(),
             forced_tool: None,
+            anthropic_segments: None,
         }
     }
 
@@ -160,6 +170,7 @@ impl RequestMeta {
             max_tokens_override: Some(max_tokens),
             user_agent: String::new(),
             forced_tool: None,
+            anthropic_segments: None,
         }
     }
 
@@ -486,6 +497,7 @@ mod tests {
             max_tokens_override: None,
             user_agent: String::new(),
             forced_tool: None,
+            anthropic_segments: None,
         };
         let headers = build_common_headers(
             "sk-xxx",
