@@ -592,6 +592,11 @@ mod tests {
     /// 2026-09-22 第 112 轮:小输出(<= 30K)不应落盘,保持原 truncate 行为。
     #[tokio::test]
     async fn bash_small_stdout_keeps_inline() {
+        // 第 120 轮修存量抖动:本用例是 spill 家族里**唯一**没拿 `lock_env()` 的一个,
+        // 而兄弟用例会改 `LAEW_BASH_SPILL_THRESHOLD`、其它模块的用例会改进程 cwd
+        // (`GLOBAL_ENV_CWD_LOCK` 正是为此存在)。并行跑时环境变量/cwd 被并发改写,
+        // 本用例会偶发失败(单跑恒过)。补锁与兄弟用例对齐。
+        let _env = lock_env();
         let out = BashTool
             .execute(json!({
                 "command": "echo hello-spill-test",

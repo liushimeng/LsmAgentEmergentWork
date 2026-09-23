@@ -17,7 +17,11 @@
 //!
 //! # 用法
 //!
-//! ```no_run
+//! 下面是**示意片段**(不是可编译的完整函数体:含裸 `return Err(…)` 与 `.await`),
+//! 因此用 `text` 而非 `no_run` 标注 —— 标 `no_run` 会被 rustdoc 当真代码编译,
+//! `cargo test` 的 doctest 阶段必败(第 120 轮修复的存量失败)。
+//!
+//! ```text
 //! // main 启动期:
 //! let sig = shutdown::global();
 //! shutdown::install_signal_handlers(sig.clone())?;
