@@ -82,6 +82,7 @@ pub(super) const DESKTOP_GUI_STRICT_KEYWORDS: &[&str] = &[
 ///
 /// 保留以供 LLM 进一步细粒度决策(例如纯「输入框填写 100」无 web/desktop 锚时,作次级辅助),
 /// 但**不**进入 `DESKTOP_GUI_STRICT_KEYWORDS`,不再压制 web_hit。
+#[allow(dead_code)] // 按设计保留:供 LLM 细粒度次级辅助,不进 STRICT 词表
 pub(super) const WEB_DOM_GUI_KEYWORDS: &[&str] = &[
     "输入框",
     "搜索框",

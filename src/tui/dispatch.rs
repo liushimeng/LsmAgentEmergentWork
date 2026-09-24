@@ -17,7 +17,7 @@ use super::pathfmt;
 use super::TuiSession;
 use crate::agent::debug::{finalize_report, DebugCollector, ReportMeta};
 use crate::agent::orchestrator::OrchestrationOutcome;
-use crate::agent::human_assist::{HumanAssistHub, HumanAssistOutcome};
+use crate::agent::human_assist::HumanAssistHub;
 use crate::llm::{ChatMessage, Usage};
 
 impl TuiSession {

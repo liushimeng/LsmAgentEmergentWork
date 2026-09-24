@@ -26,7 +26,7 @@ pub struct McpClient {
 impl McpClient {
     /// 建立传输 + `initialize` 握手 + `notifications/initialized`。
     pub async fn connect(cfg: &McpServerConfig) -> McpResult<Self> {
-        let mut transport = build_transport(cfg).await?;
+        let transport = build_transport(cfg).await?;
         let timeout_ms = if cfg.timeout_ms > 0 {
             cfg.timeout_ms
         } else {

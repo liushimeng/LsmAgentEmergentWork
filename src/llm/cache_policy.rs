@@ -402,8 +402,8 @@ mod tests {
     #[test]
     fn apply_cache_policy_one_hour_ttl() {
         let tools = vec![v_tool("Read"), v_tool("Write")];
-        let sys = vec![v_system("s")];
-        let msgs = vec![v_user_msg("hi")];
+        let _sys = vec![v_system("s")];
+        let _msgs = vec![v_user_msg("hi")];
         let hint = CacheHint::ephemeral_1h();
         let mut bp = CacheBreakpoints::new(ANTHROPIC_BREAKPOINT_CAP);
         let out = mark_last_tool(tools, hint, &mut bp);

@@ -809,6 +809,7 @@ fn print_usage(usage: &lsm_agent::llm::Usage, model: Option<&str>) {
     }
 }
 
+#[allow(dead_code)] // 预留:CLI 输出超长文本截断展示(当前调用方尚未接入)
 /// Yolo 三步分析等文本字段在 stdout 里截断显示,防止脚本解析时一行过长。
 /// CJK 字符按 1 个 char 计算(对应 1 列显示宽度);超过 limit 时末尾加 `…`。
 fn truncate_for_display(s: &str, limit: usize) -> String {

@@ -260,6 +260,7 @@ pub(super) async fn run_capability_probe(_args: Value) -> Result<String> {
 /// osascript 一次执行的结构化结果。
 /// 第 90 轮:去掉 macOS cfg 门控(非 macOS 存根同样引用本类型,否则 Windows 编译损坏)。
 #[derive(Debug, Clone)]
+#[cfg_attr(windows, allow(dead_code))] // exit_code/stdout/timed_out 由 macOS 执行链消费
 pub(super) struct OsascriptOutcome {
     /// 退出码为 0。
     pub ok: bool,
@@ -474,7 +475,7 @@ pub(super) async fn run_chat_send(args: Value) -> Result<String> {
     #[cfg(not(target_os = "windows"))]
     let effective_click_point: Option<(i64, i64)> = None;
     // 确定 route:visual_no_input + effective_click_point 有值 升级 visual
-    let mut route_owned: String = if route == "visual_no_input" && effective_click_point.is_some() {
+    let route_owned: String = if route == "visual_no_input" && effective_click_point.is_some() {
         "visual".to_string()
     } else {
         route.to_string()
@@ -760,6 +761,7 @@ pub(super) async fn ensure_frontmost(window_id: &str) -> Result<FrontmostState> 
 /// 主流 IM(微信/钉钉/飞书/QQ)主界面输入框的比例估算坐标:
 /// 右侧会话区下部 —— x = 左 + 72% 宽,y = 上 + 88% 高(微信 4.x 实测布局吻合)。
 /// 返回屏幕绝对坐标。
+#[cfg_attr(not(test), allow(dead_code))] // 生产路径走 estimate_input_point_for,本函数留给单测与回退
 pub(super) fn estimate_input_point(bounds: &Rect) -> (i64, i64) {
     (
         bounds.x + (bounds.width as f64 * 0.72) as i64,
@@ -1607,7 +1609,7 @@ fn clipboard_read_once(
     focus_point: Option<(i64, i64)>,
 ) -> Result<(String, String)> {
     let driver = current_driver();
-    let mut click_desc = String::new();
+    let click_desc;
     if do_click {
         // 点击消息区(focus_point 或默认估算:窗口 50% 宽 / 40% 高,避开底部
         // 输入框与顶部工具栏,落在消息列表中部)。

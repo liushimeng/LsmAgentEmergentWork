@@ -4,7 +4,6 @@
 //! 提供事务性任务生命周期管理。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -204,6 +203,8 @@ impl Goal {
 
 /// Goal 持久化存储。
 pub struct GoalStore {
+    /// 预留:save/load 落库实现接入后启用读取。
+    #[allow(dead_code)]
     db: Arc<crate::config::Db>,
 }
 

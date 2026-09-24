@@ -701,7 +701,6 @@ mod dedup_tests {
     // I4: SystemPrompt::main_work().render(Anthropic) 含「Bash 只读硬性约束」+ 「LAEW_BASH_READONLY=off」
     // ============================================================================
     mod readonly_tests {
-        use super::*;
         use crate::agent::system_prompt::SystemPrompt;
         use crate::agent::tools::bash::{BashMode, BashTool};
         use crate::agent::tools::Tool;

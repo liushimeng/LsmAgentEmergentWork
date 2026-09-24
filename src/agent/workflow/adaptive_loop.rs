@@ -49,9 +49,9 @@ impl AdaptiveLoop {
     pub async fn run(
         &self,
         goal: &mut Goal,
-        session_id: &str,
-        runner: &SubAgentRunner,
-        db: &Arc<Db>,
+        _session_id: &str,
+        _runner: &SubAgentRunner,
+        _db: &Arc<Db>,
         cancel: Option<&CancelToken>,
         result: &mut WorkflowResult,
     ) -> Result<()> {

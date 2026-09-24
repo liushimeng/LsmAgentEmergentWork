@@ -556,7 +556,8 @@ mod tests {
     }
 
     fn runtime(llm: Arc<dyn LlmClient>, session: &str) -> Arc<SubAgentRuntime> {
-        crate::agent::dynamic_subagent::reset_governors_for_test();
+        // 只清本用例的 session:全表 clear 会并行误伤其他测试的治理器台账。
+        crate::agent::dynamic_subagent::remove_governor_for_test(session);
         test_runtime(
             llm,
             session,
@@ -663,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_budget_is_all_or_nothing_before_any_step() {
-        crate::agent::dynamic_subagent::reset_governors_for_test();
+        crate::agent::dynamic_subagent::remove_governor_for_test("wf-budget");
         let cfg = SelfAwarenessConfig {
             max_total: 2,
             ..SelfAwarenessConfig::default()

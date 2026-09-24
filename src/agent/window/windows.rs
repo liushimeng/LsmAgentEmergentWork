@@ -403,6 +403,7 @@ unsafe fn uia_build_tree(
     let is_selected = el
         .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
         .and_then(|p| p.CurrentIsSelected())
+        .map(|b| b.as_bool())
         .unwrap_or(false);
 
     let mut node = ControlNode {
@@ -422,8 +423,10 @@ unsafe fn uia_build_tree(
     if depth < max_depth {
         // 第 98 轮 G9:ControlViewWalker 过滤装饰层;失败兜底 RawViewWalker。
         let walker_result = uia
-            .CreateTreeWalker(&uia.ControlViewCondition()?)
-            .or_else(|_| uia.RawViewWalker());
+            .ControlViewCondition()
+            .ok()
+            .and_then(|cond| uia.CreateTreeWalker(&cond).ok())
+            .map_or_else(|| uia.RawViewWalker(), Ok);
         if let Ok(walker) = walker_result {
             if let Ok(mut child) = walker.GetFirstChildElement(el) {
                 let mut idx = 0usize;
@@ -473,8 +476,11 @@ unsafe fn uia_element_at_path(
     if trimmed == "/" || trimmed.is_empty() {
         return Ok(root.clone());
     }
+    let cond = uia
+        .ControlViewCondition()
+        .map_err(|e| platform_err("windows", format!("UIA ControlViewCondition 获取失败: {e}")))?;
     let walker = uia
-        .CreateTreeWalker(&uia.ControlViewCondition()?)
+        .CreateTreeWalker(&cond)
         .or_else(|_| uia.RawViewWalker())
         .map_err(|e| platform_err("windows", format!("UIA TreeWalker 获取失败: {e}")))?;
     let mut cur = root.clone();
@@ -558,6 +564,11 @@ unsafe fn win32_build_tree(
             "click".into(),
             "set_text".into(),
         ],
+        // 第 98 轮 G7:Win32 路径无 UIA 辅助功能属性,取空/false(skip_serializing_if 不出现)。
+        help_text: String::new(),
+        access_key: String::new(),
+        accelerator_key: String::new(),
+        is_selected: false,
         children: Vec::new(),
     };
 
@@ -879,7 +890,7 @@ impl WindowDriver for WindowsDriver {
                             // ExpandCollapse/SelectionItem,语义化点击)→ T2 BM_CLICK
                             // (原生 Button 系 HWND)→ T3 元素中心物理点击(自绘 UI 兜底)。
                             // SAFETY:模式查询与调用均为 UIA COM;失败逐层降级。
-                            unsafe {
+                            {
                                 // T1a Invoke(按钮/链接)
                                 if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(
                                     UIA_InvokePatternId,
@@ -959,7 +970,7 @@ impl WindowDriver for WindowsDriver {
                             // 第 90 轮三层链:T1 ValuePattern → T2 WM_SETTEXT(原生 HWND)
                             // → T3 focus+SendInput 逐字键入(自绘输入框唯一可靠路径)。
                             // SAFETY:UIA/Win32 消息调用;失败逐层降级。
-                            unsafe {
+                            {
                                 // T1 UIA ValuePattern(语义级,不抢焦点)
                                 if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationValuePattern>(
                                     UIA_ValuePatternId,
@@ -1020,7 +1031,7 @@ impl WindowDriver for WindowsDriver {
                             }
                             // T1c TextPattern(第 98 轮 G5:只读文档区 route=text_pattern)
                             // SAFETY:UIA COM 指针;DocumentRange / GetText 返回 BSTR,空指针由 windows crate 包装成 Err。
-                            unsafe {
+                            {
                                 if let Ok(tp) = el
                                     .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
                                 {
@@ -1049,11 +1060,11 @@ impl WindowDriver for WindowsDriver {
                             }
                             // T1d SelectionPattern(第 98 轮 G6:ComboBox/List 当前选中项 route=selection_pattern)
                             // SAFETY:UIA COM 指针;失败时自动跳过,继续走 T2。
-                            unsafe {
+                            {
                                 if let Ok(sp) = el.GetCurrentPatternAs::<IUIAutomationSelectionPattern>(
                                     UIA_SelectionPatternId,
                                 ) {
-                                    if let Ok(sel) = sp.CurrentSelection() {
+                                    if let Ok(sel) = sp.GetCurrentSelection() {
                                         if let Ok(first) = sel.GetElement(0) {
                                             if let Ok(name) = first.CurrentName() {
                                                 let n = name.to_string();
@@ -1069,7 +1080,7 @@ impl WindowDriver for WindowsDriver {
                             }
                             // T2 WM_GETTEXT(原生 HWND 同步消息;第 90 轮补)
                             // SAFETY:标准 WM_GETTEXT 同步消息;缓冲区指针本栈有效。
-                            unsafe {
+                            {
                                 if let Some(nh) = uia_native_hwnd(&el) {
                                     let len = SendMessageW(
                                         nh,
@@ -1110,7 +1121,7 @@ impl WindowDriver for WindowsDriver {
                             // 第 90 轮两层链:T2 PostMessage 消息级按键(仅原生 HWND 控件,
                             // 不抢焦点)→ T3 物理 SendInput(Electron/自绘 UI 路径,第 67 轮保留)。
                             // SAFETY:消息投递目标为元素原生 HWND。
-                            unsafe {
+                            {
                                 if let Some(nh) = uia_native_hwnd(&el) {
                                     drop(el);
                                     post_message_keys(nh, spec)?;
@@ -1163,7 +1174,7 @@ impl WindowDriver for WindowsDriver {
                         ControlAction::Scroll { lines } => {
                             let lines = *lines;
                             // SAFETY:UIA Pattern 调用;失败逐层降级。
-                            unsafe {
+                            {
                                 // T1 ScrollPattern:Small 步进 × min(|lines|,3) 次(有界 IPC)
                                 if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationScrollPattern>(
                                     UIA_ScrollPatternId,

@@ -1394,7 +1394,8 @@ fn spawn_parent_watchdog(browser_pid: u32, user_data_dir: &Path) -> Option<std::
         command.process_group(0);
     }
     #[cfg(windows)]
-    unsafe {
+    {
+        use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }

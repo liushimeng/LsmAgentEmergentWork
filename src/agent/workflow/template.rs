@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use crate::agent::workflow::goal::Goal;
 use crate::agent::workflow::WorkflowConfig;
 use crate::config::Db;
-use crate::error::Result;
 
 /// 模板类别。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +38,8 @@ pub struct WorkflowTemplate {
 
 /// 模板库。
 pub struct TemplateLibrary {
+    /// 预留:模板持久化(load/save)接入后启用读取。
+    #[allow(dead_code)]
     db: Option<Arc<Db>>,
     templates: HashMap<String, WorkflowTemplate>,
 }

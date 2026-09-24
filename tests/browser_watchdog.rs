@@ -3,9 +3,6 @@
 //! 用 `sleep` 伪装 browser 主进程，验证 laew 被 SIGKILL（等价 stdin pipe 关闭）
 //! 后，watchdog 会在优雅退出超时后强制回收目标进程并清理 profile。
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 #[tokio::test]

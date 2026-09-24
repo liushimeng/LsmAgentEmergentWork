@@ -287,6 +287,7 @@ where
 /// JoinHandle 持有 handle,cancel 时调用 abort() 强制终结。
 ///
 /// 用法:`run_blocking_with_cancel(tool, cancel, move || { ... }).await`
+#[allow(dead_code)] // 预留:窗口驱动阻塞操作接入 cancel 的统一入口
 pub(crate) async fn run_blocking_with_cancel<F>(
     tool: &str,
     cancel: &crate::agent::cancel::CancelToken,

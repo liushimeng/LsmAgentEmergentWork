@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::agent::cancel::CancelToken;
-use crate::agent::subagent::{SubAgentRunner, SubFlowInput, SubFlowOutcome};
+use crate::agent::subagent::{SubAgentRunner, SubFlowInput};
 use crate::agent::workflow::WorkflowConfig;
 use crate::error::Result;
 
@@ -121,16 +121,16 @@ impl SquadDispatcher {
     pub async fn dispatch(
         &self,
         squad: &Squad,
-        runner: &SubAgentRunner,
-        session_id: &str,
-        cancel: Option<&CancelToken>,
+        _runner: &SubAgentRunner,
+        _session_id: &str,
+        _cancel: Option<&CancelToken>,
     ) -> Result<SquadDispatchResult> {
         let semaphore = Arc::new(Semaphore::new(squad.max_concurrent.min(5)));
         let mut set = JoinSet::new();
         let mut member_outputs: Vec<(String, bool)> = Vec::new();
 
         for member in &squad.members {
-            let input = SubFlowInput {
+            let _input = SubFlowInput {
                 id: member.member_id.clone(),
                 description: member.task.clone(),
                 expected_output: member.expected_output.clone(),

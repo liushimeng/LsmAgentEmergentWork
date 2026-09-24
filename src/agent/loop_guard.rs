@@ -224,9 +224,9 @@ fn args_brief(args: &Value) -> String {
 /// | `Bash` | 命令是纯 `sleep N`(可带 `&&` 前后空白的整条只有 sleep) |
 /// | `SubAgent` | `action == "result"` / `"history"`(轮询子 Agent 运行结果) |
 pub(crate) fn wait_like(tool: &str, args: &Value) -> bool {
-    /// 收集顶层 + 嵌套 `params` 里某个 key 的字符串取值(MCP_* 工具两种入参形状都吃)。
-    /// **不能用「找到第一个就返回」**:典型形状是 `{"action":"control","params":{"control_action":"wait"}}`
-    /// —— 顶层 `action` 先命中会掩盖嵌套里的 `wait`。
+    // 收集顶层 + 嵌套 `params` 里某个 key 的字符串取值(MCP_* 工具两种入参形状都吃)。
+    // **不能用「找到第一个就返回」**:典型形状是 `{"action":"control","params":{"control_action":"wait"}}`
+    // —— 顶层 `action` 先命中会掩盖嵌套里的 `wait`。
     let strs_at = |key: &str| -> Vec<String> {
         let mut out = Vec::new();
         if let Some(v) = args.get(key).and_then(|v| v.as_str()) {

@@ -14,6 +14,7 @@ use super::*;
 /// `<<<LAEW:RUNTIME_HINTS>>>` 标记保证幂等探测 + 与用户提示词严格隔离,
 /// 与现有 `LAEW:PROJECT_CONTEXT` / `LAEW:SESSION_HISTORY` / `LAEW:COMPACTED_CONTEXT`
 /// 标记风格一致。
+#[cfg_attr(not(test), allow(dead_code))] // 生产路径走 build_runtime_hints_with,两参封装留给单测
 pub(crate) fn build_runtime_hints(trace: &ExecutionTrace, consecutive_failures: usize) -> String {
     let mut ctx = RuntimeHintCtx::default(trace);
     ctx.consecutive_failures = consecutive_failures;
@@ -68,6 +69,7 @@ pub(crate) struct RuntimeHintCtx<'a> {
 
 impl<'a> RuntimeHintCtx<'a> {
     /// 只带 trace 的默认上下文(等价第 119 轮行为:角色 = Ui,其余信号全空)。
+    #[cfg_attr(not(test), allow(dead_code))] // 随 build_runtime_hints 仅测试引用
     pub fn default(trace: &'a ExecutionTrace) -> Self {
         Self {
             trace,

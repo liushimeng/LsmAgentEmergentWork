@@ -56,6 +56,7 @@ fn is_dangerous_control(c: char) -> bool {
     matches!(c, '\u{0000}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}')
 }
 
+#[allow(dead_code)] // 预留:未配对中文角括号计数(与 collapse 独立的诊断辅助)
 fn count_unbalanced_open(chars: &[char]) -> usize {
     let mut opens = 0usize;
     let mut closes = 0usize;

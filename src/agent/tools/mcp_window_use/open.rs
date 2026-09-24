@@ -223,6 +223,7 @@ fn launch_windows_app(app: &str, aliases: &[String]) -> std::result::Result<Stri
 //
 // 维护来源:Apple Stack Exchange / macadmins Slack / 各厂商官方下载页;
 // 版本变更时如 bundle id 改名,需同步更新本表;新增应用直接追加,无需改调用方。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // 仅 macOS open -b 启动链消费
 const KNOWN_BUNDLE_IDS: &[(&str, &str)] = &[
     // 微信(macOS 当前主版本 / 历史版本)
     ("微信", "com.tencent.xinWeChat"),
@@ -277,6 +278,7 @@ const KNOWN_BUNDLE_IDS: &[(&str, &str)] = &[
 ];
 
 /// 在已知 Bundle ID 表里查 query 命中(忽略大小写、全词子串)。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // 仅 macOS 启动链调用
 pub(super) fn lookup_known_bundle_id(query: &str) -> Option<&'static str> {
     let q = query.trim();
     if q.is_empty() {
@@ -348,7 +350,7 @@ fn mdfind_app_path_by_bundle_id(bundle_id: &str) -> Option<String> {
 
 fn launch_desktop_app(
     app: &str,
-    bundle_id: Option<&str>,
+    _bundle_id: Option<&str>,
 ) -> std::result::Result<Vec<String>, String> {
     // Windows 走 OS API 解析链(ShellExecuteW / 快捷方式 / 安装路径)
     #[cfg(windows)]
@@ -378,7 +380,7 @@ fn launch_desktop_app(
         }
 
         // 优先级 a:LLM 显式给了 bundle_id -> 直接 open -b(最高优先级,不走别名)
-        let explicit_bundle = bundle_id
+        let explicit_bundle = _bundle_id
             .filter(|s| safe_desktop_identifier(s))
             .map(str::to_string);
         // 真实安装包探测:硬编码 Bundle 表可能随厂商版本过期。先在常规
@@ -536,6 +538,7 @@ fn launch_desktop_app(
 
 /// macOS 实际安装包记录;非 macOS 仅作空 vector 的类型占位。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // 构造点均在 macOS 探测链
 struct InstalledMacApp {
     path: String,
     bundle_id: Option<String>,

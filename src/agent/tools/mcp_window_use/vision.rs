@@ -11,7 +11,7 @@
 
 use serde_json::{json, Value};
 
-use super::{get_str, require_str, run_blocking, tool_err, Tool, MCP_WINDOW_USE_TOOL_NAME};
+use super::{get_str, require_str, run_blocking, tool_err, MCP_WINDOW_USE_TOOL_NAME};
 use crate::agent::window::{current_driver, Rect};
 use crate::error::Result;
 

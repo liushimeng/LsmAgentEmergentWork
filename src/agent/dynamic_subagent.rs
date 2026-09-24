@@ -282,6 +282,8 @@ pub struct Governor {
     /// run_id 序号。
     seq: AtomicU64,
     /// 运行记录落库句柄(第 115 轮;惰性打开,失败 = `None` 且只 warn 一次)。
+    /// 写入侧 `set_test_db` 已接线,读取侧预留(非测试构建暂无消费方)。
+    #[allow(dead_code)]
     db: OnceLock<Option<Arc<Db>>>,
 }
 
@@ -311,7 +313,19 @@ pub fn governor_for(session_id: &str, cfg: &SelfAwarenessConfig) -> Arc<Governor
     g
 }
 
+/// 仅移除指定 session 的治理器(单测隔离用;**并行测试优先用本函数**,
+/// 全表 clear 会误伤其他并行用例正在使用的治理器)。
+pub fn remove_governor_for_test(session_id: &str) {
+    governor_table()
+        .lock()
+        .expect("Governor table poisoned")
+        .remove(session_id);
+}
+
 /// 清空全部治理器(单测隔离用;生产链路不调用)。
+///
+/// ⚠️ 并行测试下会误伤其他用例的治理器(台账/预算被连坐清空),
+/// 仅限确需全量重置的独占场景;常规隔离请用 [`remove_governor_for_test`]。
 pub fn reset_governors_for_test() {
     governor_table()
         .lock()
@@ -1510,6 +1524,7 @@ pub(crate) fn test_runtime(
 }
 
 /// 同 [`test_runtime`],但显式指定工作目录(自定义 Agent 定义文件的发现基准)。
+#[cfg(test)]
 pub(crate) fn test_runtime_in(
     llm: Arc<dyn LlmClient>,
     session: &str,

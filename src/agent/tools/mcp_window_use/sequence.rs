@@ -520,7 +520,7 @@ fn execute_sequence(window_id: &str, steps: &[Value], cfg: &SeqConfig) -> Result
             1
         };
 
-        let mut record = Value::Null;
+        let mut record;
         let mut attempt = 0u64;
         loop {
             attempt += 1;

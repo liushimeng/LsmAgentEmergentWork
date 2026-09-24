@@ -242,7 +242,7 @@ fn parse_full_frontmatter(raw: &str) -> SkillFrontmatter {
     }
     if let Some(nested_tags) = fm.metadata.nested.remove("tags") {
         for (k, v) in nested_tags {
-            let mut list = fm.metadata.lists.entry("tags".to_string()).or_default();
+            let list = fm.metadata.lists.entry("tags".to_string()).or_default();
             if !list.contains(&v) {
                 list.push(v.clone());
             }
@@ -430,7 +430,7 @@ fn find_unescaped_backtick(s: &str) -> Option<usize> {
 /// 同步 shell 注入(本轮单遍保证完整度**就地**完成,信任 Skill 作者)。
 /// 不走 BashTool(避免过度耦合);失败时返回 stderr 摘要,**不阻断**后续替换。
 fn run_shell_inline(cmd: &str) -> Result<String, String> {
-    let output = std::process::Command::new("bash")
+    let output = std::process::Command::new(resolve_bash())
         .arg("-c")
         .arg(cmd)
         .output()
@@ -443,6 +443,50 @@ fn run_shell_inline(cmd: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 解析可用的 bash 可执行文件(结果进程内缓存)。
+///
+/// Windows 专坑:CreateProcess 无路径程序名按「应用目录→当前目录→System32→
+/// Windows→PATH」搜索,`C:\Windows\System32ash.exe`(WSL 启动器)会**先于**
+/// PATH 命中,遮蔽 Git bash;且 WSL 处于损坏状态时 exit 1 + UTF-16 错误输出,
+/// `!`cmd`` 注入整段失败。修复:按 PATH 顺序构造完整路径逐个探测
+/// (`bash -c "exit 0"` 成功即采用),全部失败回退裸 `bash` 交由系统报错。
+fn resolve_bash() -> String {
+    static BASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BASH.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            use std::collections::HashSet;
+            let mut seen: HashSet<String> = HashSet::new();
+            if let Some(raw) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&raw) {
+                    let cand = dir.join("bash.exe");
+                    let key = cand.to_string_lossy().to_lowercase();
+                    if !seen.insert(key) || !cand.is_file() {
+                        continue;
+                    }
+                    let ok = std::process::Command::new(&cand)
+                        .arg("-c")
+                        .arg("exit 0")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if ok {
+                        return cand.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            "bash".to_string()
+        }
+        #[cfg(not(windows))]
+        {
+            "bash".to_string()
+        }
+    })
+    .clone()
 }
 
 #[cfg(test)]

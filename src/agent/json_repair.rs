@@ -307,6 +307,9 @@ fn deserialize_coerced<T: DeserializeOwned>(v: &serde_json::Value) -> Result<T, 
 
 /// 判断 serde_json::Error 是否呈现「截断」特征 —— `EOF while parsing ...`
 /// 或 `unexpected end of input`(serde_json 标准截断错误文案)。
+///
+/// 预留给溢出/截断恢复链接入(当前调用方尚未落地),暂不参与编译引用。
+#[allow(dead_code)]
 fn is_truncation_error(err: &serde_json::Error) -> bool {
     let s = err.to_string();
     s.contains("EOF while parsing")

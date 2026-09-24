@@ -456,6 +456,7 @@ fn random_snap_id() -> String {
 /// 返回 `(matched_cache, literal_path)`:matched_cache=true 表示本调用方应
 /// 跳过驱动调用,直接消费缓存(目前仅用于占位,实际 run_sequence/input_batch
 /// 仍按字面 path 走;本函数保留为后续优化入口)。
+#[cfg_attr(not(test), allow(dead_code))] // 按设计保留为后续优化入口,当前仅单测引用
 pub(super) fn resolve_explore_ref(path: &str) -> (bool, String) {
     const PREFIX: &str = "@explore_ref/";
     if !path.starts_with(PREFIX) {

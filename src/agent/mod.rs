@@ -72,9 +72,12 @@ mod react_tests;
 // 用 `cfg(test)` 限定,避免非测试构建报 unused import。
 #[cfg(test)]
 pub(crate) use runtime_hints::build_runtime_hints;
+// 单测经 `use super::*` 取用(开关解析用例);非测试构建无引用。
+#[cfg(test)]
+use runtime_hints::forced_tools_enabled_from;
 // 原私有辅助:经本模块命名空间供 agent_loop / tests 子模块 `use super::*` 取用
 use runtime_hints::{
-    build_runtime_hints_with, forced_tools_enabled, forced_tools_enabled_from,
+    build_runtime_hints_with, forced_tools_enabled,
     is_truncation_stop_reason, stable_json_string, RuntimeHintCtx,
 };
 // 第 120 轮 ReAct 循环守卫:无进展检测(doom_loop)+ 双阈值止损

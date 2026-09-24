@@ -30,6 +30,8 @@ pub struct PhaseExecutionResult {
 
 /// Phase 执行器。
 pub struct PhaseExecutor {
+    /// 预留:execute 全量走配置驱动后启用读取。
+    #[allow(dead_code)]
     config: WorkflowConfig,
 }
 

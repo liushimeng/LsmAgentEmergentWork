@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn parse_response_text_and_tool_use() {
         // 兼容旧测试:整段 JSON(非 SSE)路径已废弃,改用 parser 路径
-        let body = json!({
+        let _body = json!({
             "type": "message",
             "content": [
                 {"type": "text", "text": "hello "},

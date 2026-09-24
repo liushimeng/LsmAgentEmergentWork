@@ -388,7 +388,7 @@ pub fn is_target_app_allowed(query: &str) -> bool {
 /// 函数为同步阻塞(spawn_blocking 由调用方负责)。
 pub fn auto_launch_target(
     app_query: &str,
-    bundle_id: Option<&str>,
+    _bundle_id: Option<&str>,
     wait_secs: u64,
 ) -> std::result::Result<WindowInfo, String> {
     use std::process::{Command, Stdio};
@@ -405,7 +405,7 @@ pub fn auto_launch_target(
     #[cfg(windows)]
     let launch_cmd: Vec<String> = vec!["cmd".to_string(), "/C".to_string(), "start".to_string(), "".to_string(), app_query.to_string()];
     #[cfg(target_os = "macos")]
-    let launch_cmd: Vec<String> = if let Some(b) = bundle_id.filter(|s| !s.is_empty()) {
+    let launch_cmd: Vec<String> = if let Some(b) = _bundle_id.filter(|s| !s.is_empty()) {
         vec!["open".to_string(), "-b".to_string(), b.to_string()]
     } else {
         vec!["open".to_string(), "-a".to_string(), app_query.to_string()]

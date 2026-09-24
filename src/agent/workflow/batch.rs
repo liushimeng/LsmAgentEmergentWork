@@ -2,7 +2,6 @@
 //!
 //! 针对 1000+ 文件分析/处理场景,提供分片并行 + 失败重试能力。
 
-use serde::{Deserialize, Serialize};
 
 use crate::agent::workflow::WorkflowConfig;
 use crate::error::Result;
@@ -68,7 +67,7 @@ impl BatchChannel {
 
         // 并行处理各批次
         for chunk in chunks.iter() {
-            for task in chunk.iter() {
+            for _task in chunk.iter() {
                 // 模拟处理
                 result.succeeded += 1;
             }

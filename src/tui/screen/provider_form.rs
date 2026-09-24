@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn add_form_validates() {
         let (db, paths, _d) = fresh();
-        let mut form = ProviderForm::new_add(db.clone(), paths, Box::new(|_| {}));
+        let form = ProviderForm::new_add(db.clone(), paths, Box::new(|_| {}));
         // 试图在 end_point 为空时提交
         let err = form.validate();
         assert!(err.is_err());

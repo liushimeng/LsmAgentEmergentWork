@@ -143,9 +143,12 @@ pub use types::{
     LayerInfo, OrchestrationOutcome, OrchestratorConfig, RetryRecord, StageDuration, TaskResult,
     WorkflowResult,
 };
-use types::{default_wf_exec_role, QualityFailure};
+use types::QualityFailure;
 use usage::{add_usage, failure_usage, tool_args_digest};
-use workflows::{build_subflow_input, run_wf_unit};
+use workflows::run_wf_unit;
+// 单测经 `use super::*` 取用;非测试构建无引用。
+#[cfg(test)]
+use workflows::build_subflow_input;
 use yolo_reflow::{fallback_suggestion, is_placeholder_direct_answer};
 
 #[cfg(test)]

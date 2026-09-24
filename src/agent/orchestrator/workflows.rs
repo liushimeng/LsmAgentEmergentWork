@@ -503,7 +503,7 @@ pub(super) async fn run_wf_unit(
 
         // 2026-09-16 第 57 轮:QC LLM 调用单独计时。
         let qc_started = std::time::Instant::now();
-        let (mut qc, qc_usage) = quality
+        let (qc, qc_usage) = quality
             .check_subagent_with_source(
                 AgentRole::SubAgent,
                 &goal,

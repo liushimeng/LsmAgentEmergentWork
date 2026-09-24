@@ -7,7 +7,6 @@
 //!
 //! 设计见 `docs/WorkFlowAgent设计与实现/01-设计与解决方案.md`。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -35,9 +34,8 @@ use crate::agent::context::AgentRole;
 use crate::agent::memory;
 use crate::agent::subagent::{SubAgentRunner, SubFlowInput};
 use crate::config::Db;
-use crate::error::{AgentError, Result};
-use crate::llm::{ChatMessage, Usage};
-use crate::session;
+use crate::error::Result;
+use crate::llm::Usage;
 
 /// WorkFlow 执行配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
