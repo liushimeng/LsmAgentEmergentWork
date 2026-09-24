@@ -1,7 +1,7 @@
 ﻿# Debug Agent 激活范围强化与软件工程场景收敛 —— 设计与解决方案
 
 > 版本: v1.0 (2026-09-19, 新增设计文档, 与 01-设计与解决方案.md 互补)
-> 状态: 已实现 (第 92 轮)
+> 状态: 已实现 (2026-09-19)
 > 关联代码: src/agent/debug.rs / src/agent/yolo.rs / src/agent/profile.rs / src/agent/system_prompt/mod.rs / src/main.rs / src/tui/dispatch.rs
 
 ## 1. 背景与现状复盘

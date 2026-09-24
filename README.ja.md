@@ -43,11 +43,11 @@
 > ツールシステム、自動テスト、CI スクリプト、ドキュメント）はすべて AI Agent（Claude Code など）が
 > 自律的に記述・コンパイル・テスト・リファクタリング・デプロイしたものです。
 >
-> **⏱️ 14 ラウンドのディープリサーチ · 82+ ディメンション · 635 gap のナレッジベース** —— このリポジトリは
-> 「一回のセッションの産物」ではなく、14 ラウンドにわたる 82+ ディメンションの継続的なディープリサーチ、
-> 635 の laew gap を蓄積した「Agent プログラミング」能力の完全なデモンストレーションです。
-> 各ラウンドで Agent は前回の産出を読み取り、新しいディメンションを計画、専門レポートを作成、
-> ナレッジベースに書き込み、git commit します。
+> **⏱️ 継続的なディープリサーチ · 108+ ディメンション · 635+ gap のナレッジベース** —— このリポジトリは
+> 「一回のセッションの産物」ではなく、108+ ディメンションの継続的なディープリサーチと、
+> 635+ の laew gap を蓄積した「Agent プログラミング」能力の完全なデモンストレーションです。
+> ナレッジベースは `docs/Agent源码调研/` にリサーチバッチ別にアーカイブされ、各バッチで Agent は
+> 前回の産出を読み取り、新しいディメンションを計画、専門レポートを作成し、ナレッジベースに書き込み、git commit します。
 
 ---
 
@@ -262,7 +262,7 @@ LsmAgentEmergentWork/
 │       ├── completion.rs    # スラッシュコマンド補完エンジン
 │       ├── theme.rs         # ANSI カラー / mask_key マスキング
 │       └── screen/          # ProviderList / ProviderForm / ProviderDel サブスクリーン
-├── docs/                    # ナレッジベース: 14 ラウンドのディープリサーチ / 82+ ディメンション / 635 gap
+├── docs/                    # ナレッジベース: 15 プロジェクト / 108+ ディメンション / 635+ gap
 ├── testReport/              # 自動テストレポート + run_e2e.sh
 ├── tmpPlan/                 # コーディング中の一時計画（コミットなし）
 ├── scripts/                 # ヘルパースクリプト（mock_llm_server.py）
@@ -302,25 +302,15 @@ tmux kill-session -t laew_e2e
 
 ---
 
-## 📚 14 ラウンドのディープリサーチ —— Agent プログラミングのナレッジベース
+## 📚 Agent プログラミングの外部ナレッジベース
 
-`docs/` には **14 ラウンドのディープリサーチ** が蓄積され、**82+ ディメンション** をカバー、
-**635 の laew gap**（L1–L635）を累積、すべて Agent 産出：
+`docs/Agent源码调研/` には 15 の外部 Agent プロジェクト（atomcode / claudecode / deepseek-harness /
+openclaw / opencode / pi / undici など）の体系的ディープリサーチと深度分析が蓄積されており、
+合計 80+ ドキュメント / 約 168k 行、リサーチバッチ別に継続アーカイブされています。
+カバー範囲：**108+ ディメンション**、**635+ の laew gap**、すべて Agent 産出。
 
-| ラウンド | テーマ | 規模 |
-|------|------|------|
-| ラウンド 1–6 | アーキテクチャ / マルチターン / Context / ツール / メモリ / Workflow / Yolo / QC / MCP / Skill / Protocol wire / SubAgent / Goal / TUI / Hook | ~160k 行 |
-| ラウンド 7 | ファイル編集 / コード検索 / Git / Bash / マルチモーダル / PromptCaching / Schema / WebFetch | ~10k 行 |
-| ラウンド 8 | Telemetry / Session / Tool パーミッション / LSP / Hook / Skill / マルチテナント / TUI | ~13.5k 行 |
-| ラウンド 9 | CrashDump / WebUI / OAuth / i18n / Release / WebSocket / コンテナ / CRDT | ~9.4k 行 |
-| ラウンド 10 | 15 メインドキュメントに新章追加 | ~27k 行 |
-| ラウンド 11 | Agent 協力 / ストリーミング / エラーハンドリング / テスト / 設定 / プラグインエコシステム / プロトコル翻訳 / システムプロンプト | ~30k 行 |
-| ラウンド 12 | HTTP クライアント / セキュリティ防御 / モデルルーティング / データ移行 / パフォーマンス / ログ / CLI / 状態永続化 | ~17k 行 |
-| ラウンド 13 | ローカル推論 / KV cache / GUI 自動化 / OS / ベンチマーク / パラダイム比較 / DSL / WebAssembly | ~14.9k 行 |
-| ラウンド 14 | 8 つの新ディメンション + 200 の新 gap | ~9.4k 行 |
-
-> 専門コレクション索引：`docs/专题/专题-第十三轮深挖合集.md` など。
-> 実装進捗台帳：`docs/专题/专题-laew实现进度对照表.md`。
+> 実装進捗台帳：`docs/Agent源码调研/专题/专题-laew实现进度对照表.md`
+> クロスプロジェクト比較レポート：`docs/Agent架构对比与参考.md`
 
 ---
 
@@ -396,7 +386,7 @@ tmux kill-session -t laew_e2e
 | Gitee | `https://gitee.com/liushimeng109117198_admin/LsmAgentEmergentWork` |
 | GitCode | `https://gitcode.com/liusm109117198/LsmAgentEmergentWork` |
 
-> 💡 **14 ラウンドのディープリサーチ / 635 gap / 100% Agent 自動プログラミングのアプローチがあなたにインスピレーションを与えた場合は**、
+> 💡 **108+ ディメンションのリサーチ / 635+ gap / 100% Agent 自動プログラミングのアプローチがあなたにインスピレーションを与えた場合は**、
 > [Issues](https://gitee.com/liushimeng109117198_admin/LsmAgentEmergentWork/issues) であなたのチームの類似の実践を共有してください。
 > 一つの ⭐ は、この動きを前進させるために 10 のブログ記事よりも効果的です。
 

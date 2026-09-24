@@ -42,9 +42,9 @@
 > 整个项目（Rust 源码、多 Agent 架构、TUI 渲染引擎、工具系统、自动化测试、CI 脚本、文档）
 > 全部由 AI Agent（Claude Code 等）自主编写、编译、测试、重构、部署。
 >
-> **⏱️ 14 轮深度调研 · 82+ 维度 · 635 个 gap 知识库** —— 本仓库不是「一次性会话产物」，
-> 而是 Agent 持续深挖 14 轮、覆盖 82+ 维度、沉淀 635 个 laew gap 的「Agent 编程」能力完整展示。
-> 每一轮都由 Agent 自动读取上一轮产出、规划新维度、产出专题报告、写入知识库、git 提交。
+> **⏱️ 持续深挖 · 108+ 维度 · 635+ gap 知识库** —— 本仓库不是「一次性会话产物」，
+> 而是 Agent 持续深挖、覆盖 108+ 维度、沉淀 635+ laew gap 的「Agent 编程」能力完整展示。
+> 知识库按调研批次归档在 `docs/Agent源码调研/`，每一批次由 Agent 自动读取上一批产出、规划新维度、产出专题报告、写入知识库、git 提交。
 
 ---
 
@@ -227,52 +227,89 @@ cd LsmAgentEmergentWork
 ```
 LsmAgentEmergentWork/
 ├── src/
-│   ├── main.rs              # CLI 入口 (clap): TUI / -p / -f / provider 子命令
+│   ├── main.rs              # CLI 入口 (clap): TUI / -p / -f / provider / mcp 子命令
 │   ├── lib.rs               # 库导出
 │   ├── session.rs           # Session: 本机指纹 + Session ID + 独立对话上下文
 │   ├── error.rs             # 统一错误类型 (thiserror)
+│   ├── crash.rs             # CrashDump: panic hook + 信号恢复 + heap dump 自动触发
+│   ├── shutdown.rs          # graceful shutdown (TUI 退出时清浏览器子进程)
+│   ├── frontmatter.rs       # Markdown frontmatter 解析 (自定义斜杠命令 + 自定义子 Agent)
+│   ├── logging.rs           # tracing 双层订阅器 + 运行日志 (llaew_*.log)
+│   ├── test_support.rs      # 单元测试公共夹具
 │   ├── build.rs             # 注入 LAEW_BUILD_TIME / LAEW_GIT_HASH
-│   ├── config/              # 根目录/工作目录解析 + SQLite CRUD
-│   ├── database/            # schema / models / paths / provider
+│   ├── config/              # 全局配置: mod / agent_memory / agent_message / session_memory / subagent_run
+│   ├── database/            # SQLite 全栈: schema / pragmas (WAL) / paths / models / chat_store / provider / mcp_server
 │   ├── agent/
 │   │   ├── mod.rs           # 协议无关循环: run_session → complete → tool_calls
-│   │   ├── orchestrator.rs  # MultiAgentOrchestrator 总编排
+│   │   ├── agent_loop.rs    # Agent 核心循环 + 工具执行 + 截断续接
+│   │   ├── orchestrator/    # MultiAgentOrchestrator 总编排 (mod / types / pipeline / workflows / yolo_reflow / usage / tests)
 │   │   ├── yolo.rs          # YoloRunner 双 Agent 编排 + 三档分类
-│   │   ├── plan.rs          # Plan Agent
-│   │   ├── main_work.rs     # Main-Work Agent
-│   │   ├── subagent.rs      # SubAgent-Work Agent
-│   │   ├── quality.rs       # Quality-Check Agent
+│   │   ├── plan.rs / plan_validate.rs # Plan Agent + 校验
+│   │   ├── main_work/       # Main-Work 流程层 (mod / spec / delegate / topo / parse / tests)
+│   │   ├── subagent.rs / subagent_workflow.rs # 自感知 SubAgent 工具 + DAG 工作流
+│   │   ├── self_awareness.rs / custom_agents.rs / dynamic_subagent.rs # 自感知层 / 自定义类型 / 运行时
+│   │   ├── quality.rs       # Quality-Check Agent + 单元 retry 预算
 │   │   ├── session_context.rs # SessionContext Agent
-│   │   ├── profile.rs       # AgentProfile + work_profile() / yolo_profile()
+│   │   ├── debug.rs         # Debug Agent (-debug 模式 trace 评估)
+│   │   ├── compact.rs       # CompactRunner: token 估算 + 三档自动压缩
+│   │   ├── profile.rs       # AgentProfile + work_profile() / yolo_profile() / dynamic_child()
 │   │   ├── context.rs       # Agent-Context 独立实时上下文
-│   │   ├── memory.rs        # Agent-Memory 持久化记忆
-│   │   ├── json_repair.rs   # JSON 自动修复链
-│   │   ├── project_context.rs # 项目说明文件五级链发现 + 每会话首次注入
-│   │   ├── system_prompt/   # SystemPrompt 组合与渲染
-│   │   ├── permissions/     # 权限管控: dangerous / sensitive
-│   │   ├── sandbox_hook/    # 沙箱钩子
-│   │   └── tools/           # Tool trait + ToolRegistry + 6 个工具
+│   │   ├── memory.rs        # Agent-Memory SQLite 持久化
+│   │   ├── decision_audit.rs # 决策审计 (D9-8): 5 决策点 → AuditTrail/*.jsonl
+│   │   ├── human_assist.rs  # 人工介入 HITL (D100): oneshot + TUI 选择
+│   │   ├── todo_state.rs    # TODO 任务状态 (D19)
+│   │   ├── json_repair.rs / partial_json.rs # JSON 自动修复链 + partial JSON 解析
+│   │   ├── overflow.rs      # 上下文溢出检测 + 三级恢复 (排水/折叠/暴露)
+│   │   ├── project_context.rs # 项目说明文件五级链发现 + README 自动生成
+│   │   ├── session_fork.rs  # 对话 Rewind 轮次扫描 (D3)
+│   │   ├── workspace.rs     # 工作区感知 (D4): 懒刷新快照 + TTL 缓存
+│   │   ├── offline_queue.rs # 离线模式 (D13)
+│   │   ├── max_tokens_state.rs # max_tokens 三级恢复状态机
+│   │   ├── tool_exec.rs / loop_guard.rs / runtime_hints.rs # 工具执行底座 + ReAct 守卫 + runtime hints
+│   │   ├── cancel.rs / extrace.rs / react_tests.rs # 取消竞争 / 提取助手 / ReAct 单测
+│   │   ├── permissions/     # 权限管控 (mod / dangerous / readonly / sensitive)
+│   │   ├── safety/          # 安全防护 (mod / url_safety SSRF / prompt_injection / credentials 脱敏)
+│   │   ├── sandbox_hook/    # 沙箱钩子 (mod)
+│   │   ├── skills/          # Skill 系统 (mod / registry / render / tools / skill / bundled / bundled/*.md)
+│   │   ├── system_prompt/   # SystemPrompt 组合与渲染 (mod / mcp_use_hint / skill_catalog)
+│   │   ├── tools/           # Tool trait + ToolRegistry + bash/read/write/edit/glob/grep/emit/todo/subagent/read_detect/bash_spill
+│   │   ├── tools/mcp_window_use/ # MCP_Window_Use 工具目录 (mod / query / open / inspect / vision / chat / explore / sequence / input_batch / tests)
+│   │   ├── tools/mcp_web_use/    # MCP_Web_Use 工具目录 (mod / control / inspect / tests)
+│   │   ├── tools/mcp_use/        # MCP_Use 工具目录 (mod / tests)
+│   │   ├── window/          # 窗口操控平台驱动 (mod / windows / windows_input / windows_ocr / macos_axui / macos_vision_ocr / control_action / fallback / macos_legacy/)
+│   │   ├── browser.rs       # 浏览器 CDP 驱动层 (MCP_Web_Use 服务实现)
+│   │   ├── browser_watchdog.rs # Browser 子进程 watchdog (TUI 退出清理)
+│   │   ├── workflow/        # Goal 状态机 + Squad 调度 (mod / adaptive_loop / batch / goal / phase / quality_gate / squad / template)
+│   │   └── workflow_json_validate.rs # Workflow JSON 校验
 │   ├── llm/
-│   │   ├── mod.rs           # 统一消息模型 + LlmClient trait
-│   │   ├── anthropic.rs     # Anthropic wire 转换
+│   │   ├── mod.rs           # 统一消息模型 + LlmClient trait + TLS 三级策略
+│   │   ├── anthropic.rs     # Anthropic wire 转换 + 三段式 system blocks
 │   │   ├── openai.rs        # OpenAI wire 转换
-│   │   ├── sse.rs           # SSE 流式解析
-│   │   └── resilient.rs     # LLM 调用自动弹性层
+│   │   ├── sse.rs           # SSE 流式响应解析
+│   │   ├── cancellable.rs / resilient.rs / cache_policy.rs / offline.rs / pricing.rs
+│   ├── mcp/                 # 通用 MCP 客户端层 (MCP_Use 服务实现)
+│   │   ├── mod.rs / jsonrpc.rs / transport.rs / client.rs / manager.rs / tests.rs
 │   └── tui/
 │       ├── mod.rs           # REPL 主屏循环 + Screen 栈
+│       ├── dispatch.rs / slash.rs / provider_screen.rs / format.rs / format_brief.rs
+│       ├── audit_view.rs    # /audit 决策审计可视化面板
 │       ├── engine.rs        # CLI 渲染引擎: Screen trait + Frame
 │       ├── form.rs          # 通用 Tab 表单状态机
-│       ├── input.rs         # 单行输入 + 行内提示 + 补全
+│       ├── input.rs         # 单行输入 + D6 大粘贴防护
 │       ├── completion.rs    # 斜杠命令补全引擎
+│       ├── commands.rs      # 自定义斜杠命令 (D2)
+│       ├── export.rs        # 会话导出 (D8)
+│       ├── branches.rs      # 对话分支存储 (D3)
+│       ├── mention.rs / pathfmt.rs # @ 提及解析 + 路径格式化
 │       ├── theme.rs         # ANSI 颜色 / mask_key 脱敏
 │       └── screen/          # ProviderList / ProviderForm / ProviderDel 子屏
-├── docs/                    # 知识库: 14 轮深度调研 / 82+ 维度 / 635 gap
+├── docs/                    # 知识库: 15 工程调研 / 108+ 维度 / 635+ gap
 ├── testReport/              # 自动化测试报告 + run_e2e.sh
 ├── tmpPlan/                 # 编码过程中的临时计划（不入库）
 ├── scripts/                 # 辅助脚本（mock_llm_server.py）
 ├── rebuild_restart_app.sh   # 一键重编译
 ├── CLAUDE.md                # Agent 入口说明 + 海量教训
-└── AGENTS.md                # 工程入口说明（= CLAUDE.md）
+└── AGENTS.md                # 工程入口说明（与 CLAUDE.md 同步维护）
 ```
 
 完整设计见 `docs/` 下各专题文档。
@@ -306,25 +343,12 @@ tmux kill-session -t laew_e2e
 
 ---
 
-## 📚 14 轮深度调研 —— Agent 编程的知识库
+## 📚 Agent 编程的外部知识库
 
-本仓库的 `docs/` 下沉淀了 **14 轮深度调研**，覆盖 **82+ 维度**，累计 **635 个 laew gap**（L1–L635），
-全部由 Agent 自动产出：
+本仓库的 `docs/Agent源码调研/` 下沉淀了 15 个外部 Agent 项目（atomcode / claudecode / deepseek-harness / openclaw / opencode / pi / undici 等）的系统调研与深度分析，共 80+ 份文档 / 约 168k 行，按调研批次持续归档；累计覆盖 108+ 维度、登记 635+ laew gap。
 
-| 轮次 | 主题 | 规模 |
-|------|------|------|
-| 第 1–6 轮 | 架构 / 多轮对话 / Context / 工具 / 记忆 / Workflow / Yolo / 质检 / MCP / Skill / 协议 wire / SubAgent / Goal / TUI / Hook | ~160k 行 |
-| 第 7 轮 | 文件编辑 / 代码检索 / Git / Bash / 多模态 / PromptCaching / Schema / WebFetch | ~10k 行 |
-| 第 8 轮 | Telemetry / Session / Tool 权限 / LSP / Hook / Skill / 多租户 / TUI | ~13.5k 行 |
-| 第 9 轮 | CrashDump / WebUI / OAuth / i18n / Release / WebSocket / 容器 / CRDT | ~9.4k 行 |
-| 第 10 轮 | 15 主文档追加新章节 | ~27k 行 |
-| 第 11 轮 | Agent 协作 / 流式输出 / 错误处理 / 测试体系 / 配置系统 / 插件生态 / 协议翻译 / 系统提示词 | ~30k 行 |
-| 第 12 轮 | HTTP 客户端 / 安全防御 / 模型路由 / 数据迁移 / 性能优化 / 日志 / CLI / 状态持久化 | ~17k 行 |
-| 第 13 轮 | 本地推理 / KV cache / GUI 自动化 / 操作系统 / 评测基准 / 范式对比 / DSL / WebAssembly | ~14.9k 行 |
-| 第 14 轮 | 8 大新维度 + 200 个新 gap | ~9.4k 行 |
-
-> 专题合集见 `docs/专题/专题-第十三轮深挖合集.md` 等。
-> 实现进度中央账本见 `docs/专题/专题-laew实现进度对照表.md`。
+> 实现进度中央账本：`docs/Agent源码调研/专题/专题-laew实现进度对照表.md`
+> 跨项目横向对比报告：`docs/Agent架构对比与参考.md`
 
 ---
 
@@ -395,7 +419,7 @@ tmux kill-session -t laew_e2e
 | Gitee | `https://gitee.com/liushimeng109117198_admin/LsmAgentEmergentWork` |
 | GitCode | `https://gitcode.com/liusm109117198/LsmAgentEmergentWork` |
 
-> 💡 **如果 14 轮深度调研 / 635 个 gap / 100% Agent 自动编程的思路对你有启发**，欢迎在
+> 💡 **如果 108+ 维度调研 / 635 个 gap / 100% Agent 自动编程的思路对你有启发**，欢迎在
 > [Issues](https://gitee.com/liushimeng109117198_admin/LsmAgentEmergentWork/issues) 分享你团队里的类似实践。
 > 一个 ⭐ 比十篇博客更能推动这件事被更多人看见。
 

@@ -43,11 +43,12 @@
 > automated tests, CI scripts, documentation) was autonomously written, compiled, tested,
 > refactored, and deployed by AI Agents (Claude Code, etc.).
 >
-> **⏱️ 14 Rounds of Deep Research · 82+ Dimensions · 635 Gaps Knowledge Base** — This repo is not a
+> **⏱️ Continuous Deep Research · 108+ Dimensions · 635+ Gaps Knowledge Base** — This repo is not a
 > "one-shot session product", but a complete demonstration of "Agent programming" capability:
-> 14 consecutive rounds of deep research across 82+ dimensions, accumulating 635 laew gaps.
-> Each round the Agent auto-reads the previous output, plans new dimensions, produces
->专题 reports, writes to the knowledge base, and git-commits.
+> continuous deep research across 108+ dimensions, accumulating 635+ laew gaps.
+> The knowledge base is archived by research batch in `docs/Agent源码调研/`, and each batch
+> auto-reads the previous output, plans new dimensions, produces专题 reports, writes to the
+> knowledge base, and git-commits.
 
 ---
 
@@ -262,7 +263,7 @@ LsmAgentEmergentWork/
 │       ├── completion.rs    # Slash command completion engine
 │       ├── theme.rs         # ANSI colors / mask_key desensitization
 │       └── screen/          # ProviderList / ProviderForm / ProviderDel sub-screens
-├── docs/                    # Knowledge base: 14 rounds of deep research / 82+ dimensions / 635 gaps
+├── docs/                    # Knowledge base: 15 projects / 108+ dimensions / 635+ gaps
 ├── testReport/              # Automated test reports + run_e2e.sh
 ├── tmpPlan/                 # Temporary plans during coding (not committed)
 ├── scripts/                 # Helper scripts (mock_llm_server.py)
@@ -302,25 +303,15 @@ tmux kill-session -t laew_e2e
 
 ---
 
-## 📚 14 Rounds of Deep Research — The Knowledge Base of Agent Programming
+## 📚 External Knowledge Base for Agent Programming
 
-`docs/` holds **14 rounds of deep research**, covering **82+ dimensions**, accumulating
-**635 laew gaps** (L1–L635), all Agent-produced:
+`docs/Agent源码调研/` holds systematic deep-research on 15 external Agent projects
+(atomcode / claudecode / deepseek-harness / openclaw / opencode / pi / undici etc.),
+totaling 80+ documents / ~168k lines, archived by research batch. Coverage:
+**108+ dimensions** and **635+ laew gaps**, all Agent-produced.
 
-| Round | Theme | Scale |
-|------|------|------|
-| Rounds 1–6 | Architecture / Multi-turn / Context / Tools / Memory / Workflow / Yolo / QC / MCP / Skill / Protocol wire / SubAgent / Goal / TUI / Hook | ~160k lines |
-| Round 7 | File editing / Code retrieval / Git / Bash / Multimodal / PromptCaching / Schema / WebFetch | ~10k lines |
-| Round 8 | Telemetry / Session / Tool permissions / LSP / Hook / Skill / Multi-tenant / TUI | ~13.5k lines |
-| Round 9 | CrashDump / WebUI / OAuth / i18n / Release / WebSocket / Container / CRDT | ~9.4k lines |
-| Round 10 | 15 main docs with new chapters | ~27k lines |
-| Round 11 | Agent collaboration / Streaming / Error handling / Testing / Config / Plugin ecosystem / Protocol translation / System prompts | ~30k lines |
-| Round 12 | HTTP client / Security defense / Model routing / Data migration / Performance / Logging / CLI / State persistence | ~17k lines |
-| Round 13 | Local inference / KV cache / GUI automation / OS / Benchmarks / Paradigm comparison / DSL / WebAssembly | ~14.9k lines |
-| Round 14 | 8 new dimensions + 200 new gaps | ~9.4k lines |
-
-> Collection index: `docs/专题/专题-第十三轮深挖合集.md` etc.
-> Implementation progress ledger: `docs/专题/专题-laew实现进度对照表.md`.
+> Implementation progress ledger: `docs/Agent源码调研/专题/专题-laew实现进度对照表.md`
+> Cross-project comparison report: `docs/Agent架构对比与参考.md`
 
 ---
 
@@ -398,7 +389,7 @@ This repo is synced across two platforms:
 | Gitee | `https://gitee.com/liushimeng109117198_admin/LsmAgentEmergentWork` |
 | GitCode | `https://gitcode.com/liusm109117198/LsmAgentEmergentWork` |
 
-> 💡 **If the 14-round deep research / 635 gaps / 100% Agent auto-coding approach inspires you**,
+> 💡 **If the 108+ dimensions research / 635 gaps / 100% Agent auto-coding approach inspires you**,
 > feel free to share similar practices in your team via
 > [Issues](https://gitee.com/liushimeng109117198_admin/LsmAgentEmergentWork/issues).
 > A single ⭐ does more than ten blog posts to push this forward.

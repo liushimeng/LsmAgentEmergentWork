@@ -1,8 +1,8 @@
 # MCP_Window_Use 横向对比与 Agent 窗口操控能力映射
 
-> 2026-09-20 第 98 轮。本文是「MCP_Window_Use 与其他 Agent 项目的窗口操控能力横向对比」
+> 2026-09-20。本文是「MCP_Window_Use 与其他 Agent 项目的窗口操控能力横向对比」
 > +「laew 可借鉴方向」+「laew 已实现的对照」清单,供知识库回填 `专题-laew实现进度对照表`
-> 与后续 99+ 轮设计参考。
+> 与后续迭代设计参考。
 >
 > 前置阅读:
 > - `docs/Agent源码调研/` 下各 Agent 综合文档(atomcode/claudecode/openclaw/opencode/pi);
