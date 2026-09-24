@@ -273,6 +273,8 @@
                 yolo_degraded: false,
                 suggested_delegate: None,
                 debug_eligible: true,
+                target_status: None,
+                clarification_question: None,
             },
             plan_doc: None,
             workflows: vec![WorkflowResult {

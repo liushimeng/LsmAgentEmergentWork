@@ -63,6 +63,8 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 | `LAEW_REACT_GUARD` | `off`/`0`/`false`/`no` | 关闭 ReAct 循环守卫（无进展软提醒与 doom_loop 止损均不生效；`doom_loop_repeats` 仍统计，可观测性不丢）。默认开启：进展键 =「工具名 + 参数稳定 JSON + 结果摘要」三者全同即无进展，第 2 次软提醒 / 第 3 次宽限轮强提醒 / 第 4 次止损终止。见 `src/agent/loop_guard.rs` |
 | `LAEW_MCP_ENABLED` | `off`/`0`/`false`/`no` | 关闭通用 MCP 服务调用（`MCP_Use` 工具注册与提示词同时归零，严格向后兼容）。默认开启：Agent 可经 `MCP_Use` 调用 `laew mcp add` 配置的外部 MCP server 工具/资源。见 `src/agent/tools/mcp_use/mod.rs` |
 | `LAEW_SELF_SPAWN` | `off`/`0`/`false`/`no` | 关闭**自感知动态子 Agent**（默认开启）。关闭时不注册 `SubAgent` 工具、不注入自感知提示词段、不建运行时（工具面/提示词/耗时与改造前完全一致）。见 `src/agent/self_awareness.rs` |
+| `LAEW_TARGET_ANCHOR` | `off`/`0`/`false`/`no` | 关闭**任务锚点**全部四层（L1 澄清门 / L2 伪澄清单元阻断 / L3 工具门 6001 / L4 目标一致性 QC 门 + target_drift 信号）。严格回退到第 127 轮行为，与 `LAEW_MCP_ENABLED` / `LAEW_SELF_SPAWN` 同构。默认开启：实测 2026-09-24 事故（多行粘贴被截断后 Agent 自行改派到无关站点被判「✅ 成功」）的根治方案；见 `tmpPlan/2026-09-24_03-任务锚点与防目标漂移根治方案.md`、`src/agent/safety/target_anchor.rs` |
+| `LAEW_TARGET_ANCHOR_BLOCK` | `off`/`0`/`false`/`no` | 仅关闭 L3 工具级**阻断**（`MCP_Web_Use` 的 6001 不返回，仅记 warn），保留 L1 / L2 / L4 与信号打标（观察模式）。默认开启阻断。适合灰度期先观察不拦截 |
 | `LAEW_SUBAGENT_MAX_DEPTH` | 0..=3 | 动态子 Agent 嵌套层数上限，默认 `1`（子 Agent 为叶子，不能再启动）。`0` = 完全禁止（等价关闭）。 |
 | `LAEW_SUBAGENT_MAX_PARALLEL` | 1..=8 | 会话级并发槽位，默认 `3`（对齐 atomcode `Semaphore(3)`）。 |
 | `LAEW_SUBAGENT_MAX_TOTAL` | 1..=64 | 会话级累计启动预算，默认 `8`（防 token 失控；耗尽返回信封 `2001`）。 |
@@ -80,16 +82,17 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **接入点补全**：Anthropic → `{end_point}/v1/messages`；OpenAI → `{end_point}/chat/completions`；尾部 `/` 自动裁剪。
 - **运行日志文件（输出 log 文件）**：`--debug` / `--info`（含 `-debug` / `-info` 单横线与 `--DEBUG` 等大小写变体）在工作目录生成 `llaew_YYYYMMDD_HHMMSS.log`（时间戳 = laew 启动时刻，精确到秒，本地时区；已 gitignore）。`--debug` → DEBUG 级（含每轮 LLM 请求元信息/响应思考文本与工具意图全文），`--info` → INFO 级主干事件；实现复用 tracing 双层订阅器（原控制台层行为不变 + 文件层 `src/logging.rs`），埋点覆盖全部 8 角色的感知（任务输入/Agent 会话）/ 决策（Yolo 分类/Plan/Main-Work 拆解/QC 报告）/ 执行（WorkFlow 单元/Context 压缩/SessionContext 摘要/任务收口）/ 思考（LLM 响应文本与 tool_calls）与全部工具调用（名称/参数/结果/耗时，`agent_loop.rs` 中央埋点）。TUI 横幅追加「启动时间」行（常显）与「日志文件」行（仅 `--debug`/`--info` 时显示相对化路径 + 级别，`/clear` `/new` 重印横幅仍可见；启动时刻由 main 单点捕获，横幅显示与日志文件名时间戳严格同刻，`TuiLaunch` 传递）。
 - **工具定义协议差异**：Anthropic 用 `tools[].{name,description,input_schema}`；OpenAI 用 `tools[].{type:"function",function:{name,description,parameters}}`（function 风格）。
+- **任务锚点（TargetAnchor，第 128 轮）**：从用户原文机械抽取的目标硬约束（不经 LLM，不可幻觉、不可丢失），全局单例（`src/agent/safety/target_anchor.rs`，与 `BrowserManager::global()` / `HumanAssistHub::global()` 同构；进程内 `tokio::task_local!` 同样可以但本轮选全局槽）。跨五层设防：(L0) 输入保真粘贴窗口加宽 + `prompt_lines/prompt_chars` 提交留痕；(L1) 编排器澄清门 `OrchestrationOutcome::DirectAnswer`，Yolo 填 `target_status="unresolved"` 或机械通道命中「指代 + 零主机」时触发；(L2) Main-Work 提示词第六条约束 + `plan_validate.rs` 澄清单元阻断（伪门在 DAG 里无法暂停等待用户，拆了就被秒级打回）；(L3) `MCP_Web_Use action=open/navigate/new_tab` 显式 URL 动作越界返回 `code=6001`，新开 6xxx「范围约束」段，避开 5xxx（MCP_Use）和 4xxx（HITL）的语义冲突；存活浏览器页面提示按 anchor 二分渲染为「✓ 可复用 / ⚠ 禁止复用」组，切断上一轮失败页面被当本轮权威上下文的漂移洗白通道；(L4) QC 目标一致性硬门（与第 109 轮桌面目标保真同形态）+ `target_drift` 强信号（扫 `tool_call_log` 主机比 anchor，命中即 `is_failed()`）。决策审计新增第 6 决策点 `target_anchor`，阶段 `extract` / `clarify`。实测（`-p` 单轮）：事故精确复现输入下 `outcome="clarification_needed"`、27 秒、零 MCP_Web_Use 调用、零 WorkFlow 单元；对照事故 365 秒、4 个 wf 全在 `ithome.com`、记为「✅ 成功」。开关 `LAEW_TARGET_ANCHOR=off` 全关回退，`LAEW_TARGET_ANCHOR_BLOCK=off` 仅关 L3 阻断保留观察。
 
 ### 多 Agent 架构（8 角色）
 
 | 角色 | 身份 | 职责 | 工具面 |
 |------|------|------|--------|
-| **Yolo Agent** | `LsmAgentEmergentWork-Yolo` | 入口层：每条输入做 目的→目标→意图 三步分析；任务**三档分类**（simple/medium/hard）；失败回流与用户建议；分类前按 ReAct 自主收集信息（避免 Google 类目的）；延迟强制 `submit_task_classification`（探索轮不注入 forced `tool_choice`、仅末轮强制收口） | `Read`/`Glob`/`Grep`/`Bash`（只读侦察）/ `MCP_Web_Use`（观察类 action）/ `SubAgent`（只读并行子 Agent） |
+| **Yolo Agent** | `LsmAgentEmergentWork-Yolo` | 入口层：每条输入做 目的→目标→意图 三步分析；任务**三档分类**（simple/medium/hard）；失败回流与用户建议；分类前按 ReAct 自主收集信息（避免 Google 类目的）；延迟强制 `submit_task_classification`（探索轮不注入 forced `tool_choice`、仅末轮强制收口）；**目标可解析性判定**：第 128 轮填 `target_status`（`explicit`/`resolved`/`unresolved`），目标不可解析时编排器直接回问用户（澄清门）不进 WorkFlow，根除「目不明确就猜一个站点」的乱跑行为 | `Read`/`Glob`/`Grep`/`Bash`（只读侦察）/ `MCP_Web_Use`（观察类 action）/ `SubAgent`（只读并行子 Agent） |
 | **Plan Agent** | `LsmAgentEmergentWork-Plan` | 规划层：仅在 hard 任务时启用；输出 Markdown 方案到 `plans/{session_id}-{seq}.md` | `Read`/`Write` |
 | **Main-Work Agent** | `LsmAgentEmergentWork-Main-Work` | 流程层：接收 medium/hard 任务，拆 WorkFlow 列表（Kahn 分层 + 同层并行）；编排循环 ReAct 化（TaskFocus → Verify+Decompose → Emit 三段式 + 任务前提验证硬性要求）；复用 LoopGuard 编排层原地打转同样止损；迭代预算 `max_iterations(8)` + `explore_budget(2)` | `Bash`/`Read`/`Glob`/`Grep`/`MCP_Web_Use`（编排前探查）/ `TodoWrite`/`SubAgent`（**不持** `Write`/`Edit`，流程层只编排不落源代码；不持 `MCP_Window_Use`，桌面窗口操控归 SubAgent-Work 专用） |
 | **SubAgent-Work Agent** | `LsmAgentEmergentWork-SubAgent-Work` | 执行层最小单元，每个流程处理单元委派一个 SubAgent；提示词 ReAct 化（Thought→Action→Observation）+ 工具连续工作模式（同一响应里连续的 `parallel_safe` 工具 Read/Glob/Grep 用 `join_all` + `Semaphore(4)` 并发执行 + `tool_result` 保序回填）+ 无进展止损（`agent/loop_guard.rs` 进展键 = 工具名 + 参数稳定 JSON + 结果摘要，轮询等待类合法重复零误伤；`wait_like()` 让 wait/纯 sleep/`SubAgent(result|history)` 透明跳过；`NUDGE_AT=2`/`ABORT_AT=3` 双阈值 + 宽限轮强提醒作为 user 消息延迟到 tool_result 回填完再推入避免破坏 Anthropic 400 配对）；runtime hints 角色化（`HintRole{Ui,Execute,Gather,Judge}` 由实际调用过什么工具决定） | `Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep` + 平台门控注入 `MCP_Window_Use`（仅 macOS/Windows）+ `MCP_Web_Use` + `MCP_Use`（通用 MCP）+ `TodoWrite` |
-| **Quality-Check Agent** | `LsmAgentEmergentWork-Quality-Check` | 质检层：每个执行单元完成后必经 QC；QC LLM 错误与用户取消不消耗单元 retry 预算 | 可选 `Read` |
+| **Quality-Check Agent** | `LsmAgentEmergentWork-Quality-Check` | 质检层：每个执行单元完成后必经 QC；QC LLM 错误与用户取消不消耗单元 retry 预算；**目标一致性硬门**（第 128 轮）：用户指定 X、实际操作 Y（含改派到无关站点）一律判 Fail + `retryable=false`，retr y 不会让错位目标变成正确目标 | 可选 `Read` |
 | **SessionContext Agent** | `LsmAgentEmergentWork-SessionContext` | 会话层：每个用户任务完成后汇总并写入 `session_memory` 表；Yolo 下次处理时自动注入最近 N 条（默认 3）历史摘要 | 无工具 |
 | **Debug Agent** | `LsmAgentEmergentWork-Debug` | 调试层：仅在 `-debug` 调试模式下启用；任务结束后对采集的 trace（各 Agent LLM 调用输入输出 / Yolo 分类 / QC 结论 / 耗时与 token / 错误）做评估，产出「任务评估 / 质量报告 / 问题报告(P0-P2) / 优化建议」四章节；报告写入**根目录** `DebugReport/debug_report_{YYYYMMDD}_{HHMMSS}_{随机6位}.md`（已 gitignore，不入库） | 无工具 |
 | **Compact Agent** | `LsmAgentEmergentWork-Compact` | 压缩层：Session 主上下文估算 token（字符/4 +10%）达到当前 Provider `context_max_size` 的 80% 时由 Orchestrator 自动触发，按超出幅度自动选三档压缩率（Light ≤80% / Medium ≈50% / Aggressive ≤20%），LLM 摘要失败降级本地硬截断；保护带项目上下文/历史摘要/已压缩标记的消息与最近 4 条消息；**溢出兜底（reactive）**：真实溢出（Provider 返回 `prompt is too long` / `context_length_exceeded` 类 400）时由 Agent 循环自动三级恢复——排水（截短超长 tool_result）→ 折叠（历史合并为压缩摘要）→ 暴露（原错误上抛），见 `agent/overflow.rs`（一处包裹、8 角色全生效，全会话恢复预算 4 次） | 无工具 |
@@ -237,7 +240,7 @@ agent/
   subagent_workflow.rs SubAgent 工作流编排(同上)
 
   permissions/     权限管控:mod.rs / dangerous.rs / readonly.rs / sensitive.rs
-  safety/          安全防护:mod.rs / url_safety.rs(SSRF 拦截) / prompt_injection.rs(提示注入检测) / credentials.rs(凭证脱敏)
+  safety/          安全防护:mod.rs / url_safety.rs(SSRF 拦截) / prompt_injection.rs(提示注入检测) / credentials.rs(凭证脱敏) / target_anchor.rs(任务锚点,跨 5 层设防的唯一事实源)
   sandbox_hook/    沙箱钩子:mod.rs(单文件,接外部 sandbox)
   skills/          Skill 系统(渐进式披露):mod.rs / registry.rs / render.rs / tools.rs / skill.rs / bundled.rs / bundled/{code-review,git-commit,test-runner}.md
 

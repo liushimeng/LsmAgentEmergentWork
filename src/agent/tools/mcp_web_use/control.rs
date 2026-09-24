@@ -264,6 +264,19 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         return envelope(1001, "缺少 control_action", json!({}));
     };
     let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
+    // 第 128 轮:任务锚点守卫 —— `navigate` / `new_tab` 是显式带 URL 的「主动选择目标站点」
+    // 动作,与 `open` 同源(实测漂移发生点),必须同门把守。
+    // 需要特殊信封(6001),不走通用 2002 映射,否则 LLM 会把越界当成「换 selector 重试」类
+    // 可恢复动作继续尝试(2002 的既有对策语义),而不是停下报告失败。
+    // 点击导航不在此列:落地页无法预知,且从锚点站点出发的外链跳转是合法任务形态,
+    // 由 target_drift 信号 + QC 目标一致性门事后对账。
+    if matches!(action, "navigate" | "new_tab") {
+        if let Some(url) = str_arg(&params, "url") {
+            if let Some(blocked) = super::target_anchor_guard(url) {
+                return blocked;
+            }
+        }
+    }
     let result: std::result::Result<Value, String> = match action {
         "click" => act_click(id, &params, false).await,
         "human_click" => act_click(id, &params, true).await,

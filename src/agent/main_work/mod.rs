@@ -149,7 +149,7 @@ impl MainWorkRunner {
         // 2026-09-19 第93轮: 第(3)条修正 —— 长等待正确载体是 run_sequence(单步≤30s)/chat_loop,
         // input_batch wait ≤5s 仅限步骤间节奏(实测 SubAgent 按旧指引 input_batch 20×30s wait 第 1 步即败);
         // 新增第(4)条 —— 首响应直接输出 JSON,禁止先探索(实测浪费 36s 一次 LLM 往返)。
-        prompt.push_str(&format!("【Main-Work 任务编排 · 第107轮】五条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop / run_sequence wait(单步≤30s)编排节奏,严禁 Bash sleep 循环;input_batch wait ≤5s 仅限步骤间节奏微调;(4)首次响应直接输出 JSON 编排,禁止先调用 Read/Bash 探索——任务所需信息已全部在本提示中;(5)独立桌面软件目标(含豆包/Doubao)必须锚定 MCP_Window_Use,禁止改写为 MCP_Web_Use/网页任务。\n"));
+        prompt.push_str(&format!("【Main-Work 任务编排 · 第128轮】六条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop / run_sequence wait(单步≤30s)编排节奏,严禁 Bash sleep 循环;input_batch wait ≤5s 仅限步骤间节奏微调;(4)首次响应直接输出 JSON 编排,禁止先调用 Read/Bash 探索——任务所需信息已全部在本提示中;(5)独立桌面软件目标(含豆包/Doubao)必须锚定 MCP_Window_Use,禁止改写为 MCP_Web_Use/网页任务;(6)**禁止拆出「澄清/询问用户/等待用户回复/需用户确认」类流程单元** —— WorkFlow 单元在 DAG 里无法暂停等待用户输入,这类单元只会让执行层用 Bash echo 假装提问、QC 判通过、下游单元在没有目标的情况下继续乱跑(系统已对此做确定性阻断校验,拆了会被秒级打回重拆)。信息不足时:输出 0 个 workflows,在 summary 里写明「需用户澄清:<具体缺什么>」,由编排器回到用户;**目标站点/路径/应用名缺失时尤其不得让任何单元去「自行选一个」——可以失败,不可以乱跑**。(7)用户原始输入里显式给出的目标标识(URL/域名/文件路径/应用名)必须**逐字**进入对应 wf 的 steps 与 acceptance,不得抽象成「目标网站」「该文件」等指代——执行层拿不到原文时就只能猜。\n"));
         if let Some(orig) = original_prompt.filter(|s| !s.trim().is_empty()) {
             prompt.push_str(&format!("第一性事实 · 用户原始输入(必读):\n{orig}\n"));
         }

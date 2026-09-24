@@ -52,6 +52,30 @@ impl TuiSession {
     /// 普通输入与自定义命令都汇入此处,保证取消/调试/输出/transcript 记录单点收敛。
     pub(crate) async fn dispatch_prompt(&mut self, raw: &str, prompt: &str) -> Result<bool> {
         let turn_ts = format_current_time();
+        // 第 128 轮 · 输入保真留痕(不变量:用户输入不得静默消失)。
+        //
+        // 实测事故:用户发了 4 行 Markdown 提示词(第 2 行含目标 URL),
+        // 无 bracketed paste 的终端上首个 CR 把首行单独提交,其余 3 行丢失 ——
+        // 而当时的日志只记 prompt 文本,必须靠 `grep anthropic` 命中 0 次
+        // 才能反推出"少了什么"。显式记 lines/chars 让截断一眼可见:
+        // 用户以为发了 4 行、日志写着 prompt_lines=1,问题当场暴露。
+        //
+        // raw = 用户敲/粘的原文;prompt = 斜杠命令解析后的实际提示词,两者都记。
+        tracing::info!(
+            raw_lines = raw.lines().count(),
+            raw_chars = raw.chars().count(),
+            prompt_lines = prompt.lines().count(),
+            prompt_chars = prompt.chars().count(),
+            paste_markers = raw.matches("[粘贴 #").count(),
+            "用户输入提交(保真核对)"
+        );
+        if prompt.lines().count() <= 1 && prompt.chars().count() > 0 {
+            tracing::debug!(
+                prompt = %crate::logging::clip(prompt),
+                "本次提交为单行:若用户原本发的是多行提示词,说明终端未走 bracketed paste \
+                 且粘贴突发探测未命中(可用 laew -f 文件方式规避)"
+            );
+        }
         // D1 @ 提及展开(2026-09-10 第二十八轮,L1426):@路径/@"带空格"/@路径#L10-20
         // 命中真实文件时以 <<<LAEW:ATTACHMENTS>>> 附件块追加到送入上下文的消息;
         // transcript/导出仍记 raw 原文,不受影响。

@@ -118,6 +118,38 @@ pub struct TaskClassification {
     /// See docs/Debug模式与DebugAgent设计/02-DebugAgent激活范围强化与软件工程场景收敛.md
     #[serde(default = "default_debug_eligible")]
     pub debug_eligible: bool,
+    /// 第 128 轮(任务锚点):目标可解析性判定。
+    ///
+    /// - `"explicit"`:用户原文明确给出目标标识(URL / 域名 / 文件路径 / 应用名);
+    /// - `"resolved"`:原文用指代(「这个网站」),但可从会话上下文/历史摘要解析出先行词;
+    /// - `"unresolved"`:**不可猜测** —— 指代无先行词且全上下文找不到任何目标标识。
+    ///
+    /// `None`(旧 JSON / 模型未填)= 不作判定,由编排器的机械检测兜底。
+    ///
+    /// 设计依据(`docs/Agent源码调研/专题/专题-第三轮-系统提示词工程真实对比深度分析.md:605`,
+    /// pi system-prompt):「Resolve discoverable facts by inspection. Use ask_user_question
+    /// only for **user-owned choices** or material ambiguity that inspection cannot answer.」
+    /// —— 「用户指哪个网站」属 user-owned choice,不是可用侦察工具发现的 discoverable fact。
+    #[serde(default)]
+    pub target_status: Option<String>,
+    /// 第 128 轮:`target_status == "unresolved"` 时必填 —— 向用户提出的澄清问题。
+    ///
+    /// 编排器据此走澄清短路(`OrchestrationOutcome::DirectAnswer`),把问题原样回给用户,
+    /// **不进 WorkFlow**;为空时编排器用机械模板生成问题。
+    #[serde(default)]
+    pub clarification_question: Option<String>,
+}
+
+impl TaskClassification {
+    /// 目标是否不可解析(第 128 轮澄清门的 LLM 通道判据)。
+    ///
+    /// 只认 `"unresolved"` 一个字面值(大小写/空白容错);其余与 `None` 一律视为可执行。
+    pub fn target_unresolved(&self) -> bool {
+        self.target_status
+            .as_deref()
+            .map(|s| s.trim().eq_ignore_ascii_case("unresolved"))
+            .unwrap_or(false)
+    }
 }
 
 
@@ -388,6 +420,10 @@ fn degraded_classification(context: &[ChatMessage]) -> TaskClassification {
         yolo_degraded: true, // 关联报告: 2026-09-09_04 D-002
         suggested_delegate,
         debug_eligible: true,
+        // 第 128 轮:降级路径不判定目标可解析性 —— 解析已经失败,再叠加澄清门
+        // 会把「Yolo 输出格式问题」误报成「用户目标不明确」。留给机械检测兜底。
+        target_status: None,
+        clarification_question: None,
     }
 }
 
@@ -818,6 +854,8 @@ mod tests {
             yolo_degraded: false, // 关联报告: 2026-09-09_04 D-002(新字段)
             suggested_delegate: None,
             debug_eligible: true,
+            target_status: None,
+            clarification_question: None,
         };
         let prompt = build_work_prompt(&c);
         assert!(prompt.contains("验证"));
@@ -853,6 +891,8 @@ mod tests {
             yolo_degraded: true,
             suggested_delegate: None,
             debug_eligible: true,
+            target_status: None,
+            clarification_question: None,
         };
         let prompt = build_work_prompt(&c);
         assert!(
@@ -884,6 +924,8 @@ mod tests {
             yolo_degraded: false,
             suggested_delegate: None,
             debug_eligible: true,
+            target_status: None,
+            clarification_question: None,
         };
         let prompt = build_work_prompt(&c);
         assert!(

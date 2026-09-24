@@ -103,12 +103,21 @@ fn visible_window(s: &str, cursor: usize, avail: u16) -> (usize, u16) {
 // 人类击键间隔 ≫15ms,正常单击 Enter 队列恒空,零误伤;bracketed paste 生效的
 // 终端粘贴整体以 Event::Paste 送达,不经本路径。
 
+// 第 128 轮加宽:15/2/8(有效窗口 ≈31ms)→ 40/3/20(有效窗口 ≈100ms)。
+// 实测事故(llaew_20260924_151442.log):4 行 Markdown 提示词只有首行进入管线,
+// 含目标 URL 的 2、3 行整体丢失(全量日志 grep "anthropic" 命中 0 次),
+// 直接导致 Agent 无从知道目标站点、进而猜了个无关网站跑完整个任务。
+// Windows conhost 对含 CJK 的长行分块投递,块间隔可能超过 31ms → 探测落空 →
+// 首行的 CR 被当成用户提交意图。
+// 加宽后仍然安全:人类击键间隔 ≫100ms,单击 Enter 时队列恒空,首证据 40ms 内必返回 None,
+// 代价只是每次提交多等 ≤40ms(不可感知)。
+
 /// Enter 突发探测:首个排队事件的等待窗口(毫秒)。
-const PASTE_BURST_PROBE_MS: u64 = 15;
+const PASTE_BURST_PROBE_MS: u64 = 40;
 /// 队列排空后的宽限轮数(终端分块投递,每轮等 PASTE_BURST_GRACE_MS)。
-const PASTE_BURST_GRACE_ROUNDS: usize = 2;
+const PASTE_BURST_GRACE_ROUNDS: usize = 3;
 /// 宽限轮单轮等待(毫秒)。
-const PASTE_BURST_GRACE_MS: u64 = 8;
+const PASTE_BURST_GRACE_MS: u64 = 20;
 
 /// 把一串已排队事件折叠为粘贴文本(纯函数,可单测):
 /// - `Key(Press) Char(c)`(无 Ctrl)→ 收 `c`;

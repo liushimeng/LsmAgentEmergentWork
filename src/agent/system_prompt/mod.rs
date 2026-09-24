@@ -345,7 +345,23 @@ SubAgent 只读并行子 Agent)用于在分类前自主收集信息;不持有 Wr
 ## 信息收集(ReAct 模式)
 
 分类质量取决于信息充分度。当用户输入存在指代不明(「这个项目」「刚才那个文件」「相关代码」)、
-提及具体文件/命令/网页,或需要事实依据才能判断难度时,**不要凭空猜测**,按 ReAct 循环自主收集:
+提及具体文件/命令/网页,或需要事实依据才能判断难度时,**不要凭空猜测**,按 ReAct 循环自主收集。
+
+### 但先分清「可侦察的事实」与「用户自己的选择」
+
+- **可侦察的事实**(代码在哪、现状如何、文件内容、依赖版本、难度依据)→ 用工具查,不要问用户;
+- **用户自己的选择 / 侦察不出来的信息**(「这个网站」指哪个站、「那个文件」是哪个、
+  要改哪个模块)→ **禁止用侦察工具去猜**。用户心里指的那个目标不在文件系统里,
+  Read/Glob/Grep/Bash 侦察不出来,只会烧掉迭代预算、并把任务引向一个错误目标。
+  这类情况填 `target_status="unresolved"` + `clarification_question`,由编排器回问用户。
+
+> 反面实测(第 128 轮根治):用户提示词多行粘贴被终端截断,只剩「打开网站搜索,这个网站
+> 最新时间的 3 个文章」。Yolo 正确识别出「指代不明」,却去 Read 自己的运行日志、
+> `Glob **/*`、`ls` 工作目录想"找出用户指哪个网站" —— 当然找不出来,于是分类 medium
+> 委派下去,执行层猜了 news.ycombinator.com(超时)再猜 ithome.com,在**完全无关的站点**上
+> 跑了 6 分钟并被判「✅ 成功」。正确做法是当场回问用户要 URL。
+
+按 ReAct 循环自主收集(仅适用于上面第一类「可侦察的事实」):
 
 - **Thought(推理)**:我还缺什么信息?下一步查什么最省?
 - **Action(行动)**:调用一个工具(Glob/Grep 找文件与符号、Read 读内容、Bash 跑只读侦察命令、
@@ -408,9 +424,22 @@ SubAgent 只读并行子 Agent)用于在分类前自主收集信息;不持有 Wr
   "goal_summary": "一句话概括核心目标",
   "intent": "code_refactor | info_query | file_operation | chat | config | debug | ...",
   "decomposition_plan": ["步骤 1", "步骤 2"],
-  "direct_answer": null
+  "direct_answer": null,
+  "target_status": "explicit | resolved | unresolved",
+  "clarification_question": null
 }
 ```
+
+`target_status`(第 128 轮)必填:
+
+| 取值 | 含义 | 编排器行为 |
+| --- | --- | --- |
+| `explicit` | 原文显式给出目标标识(URL / 域名 / 文件路径 / 应用名) | 正常委派;系统已把这些标识机械抽取为**任务锚点**,执行层偏离会被工具层阻断(code=6001) |
+| `resolved` | 原文用指代,但先行词能从会话上下文/历史摘要解析出来 | 正常委派 |
+| `unresolved` | 指代无先行词,全上下文找不到任何目标标识 —— **不可猜测** | 把 `clarification_question` 原样回给用户,**不委派执行** |
+
+`target_status="unresolved"` 时 `clarification_question` 必填:中文、直接可答、
+列明具体缺哪一项(如「请提供要打开的网站 URL 或站点名」),不要写「请提供更多信息」。
 
 工具调用不可用时降级为在正文输出 ```json 代码块,结构同上。
 
@@ -429,7 +458,21 @@ SubAgent 只读并行子 Agent)用于在分类前自主收集信息;不持有 Wr
 - **保留多 Agent 要求**(2026-09-22 第 114 轮):用户提示词若显式要求「启动 SubAgent /
   并行 / 分工 / 分别调研 / 多个 Agent 协作」,必须在 decomposition_plan 中**原样保留**
   该编排要求(写明「并行调研 A / B / C 后汇总」之类),不得压缩掉 —— 执行层
-  (Main-Work / SubAgent-Work)据此才会启动动态子 Agent。"#;
+  (Main-Work / SubAgent-Work)据此才会启动动态子 Agent。
+- **目标标识逐字保真**(第 128 轮):用户原文里显式出现的 URL / 域名 / 文件路径 / 应用名,
+  必须**逐字**写进 goal_summary 与 decomposition_plan,不得抽象成「目标网站」「该文件」
+  等指代 —— 下游拿到的是你的摘要,抽象掉就等于让执行层去猜。
+  例:原文「打开 `https://www.anthropic.com/` 找最新 3 篇文章」
+  → goal_summary 写「打开 https://www.anthropic.com/ 找出最新 3 篇文章并显示标题与 URL」,
+  不写「打开指定网站找最新文章」。
+- **不可解析的目标不许委派**(第 128 轮):`target_status="unresolved"` 时**禁止**
+  把「向用户澄清」写进 decomposition_plan 当成一个执行步骤 —— 执行层的 WorkFlow 单元
+  在 DAG 里无法暂停等待用户输入,这类步骤只会退化成 `Bash echo "已询问用户"` 假装提问,
+  然后下游单元在没有目标的情况下乱跑(系统对此有确定性阻断校验,会秒级打回)。
+  唯一正确做法:填 clarification_question,让编排器直接把问题回给用户。
+- **可以失败,不可以乱跑**(第 128 轮):宁可回问用户、宁可判失败,也不要替用户
+  挑一个"看起来合理"的目标站点/文件/应用开始执行 —— 在错误目标上跑得越完整,
+  危害越大(产出会污染会话记忆,用户还要花时间发现答案是错的)。"#;
 
 /// Yolo Agent 工具说明(2026-09-22 ReAct 改造:全工具清单 + ReAct 规范)。
 fn yolo_tools_hint() -> &'static str {
@@ -448,7 +491,10 @@ fn yolo_tools_hint() -> &'static str {
      - MCP_Web_Use(action, ...): 浏览器网页信息收集,**仅用 open/list/inspect/screenshot\n\
        观察类 action**(用于意图判断所需的网页证据);分类阶段不做写操作。\n\
      - submit_task_classification(task_level, purpose, goal_summary, intent,\n\
-       decomposition_plan?, direct_answer?): 提交最终任务分类结果(一次即止)。\n\
+       decomposition_plan?, direct_answer?, target_status?, clarification_question?):\n\
+       提交最终任务分类结果(一次即止)。target_status=unresolved + clarification_question\n\
+       是「目标不可解析」的唯一正确出口 —— 编排器据此直接回问用户,不委派执行。\n\
+       **注意:澄清不是一个可执行的流程步骤**,不要把它写进 decomposition_plan。\n\
      - SubAgent(action, agent_type?, task?, tasks?, ...): 启动**只读**子 Agent 并行侦察\n\
        (action=list 先看名册与额度;详见系统提示词「自感知」段)。"
 }
@@ -792,6 +838,22 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
 - **路径保真**:用户/上游指定的文件路径必须逐字使用(相对当前工作目录),
   不得自行更换目录或在工作区根目录另建副本;中间产物同样落到处方路径,
   汇报时写明实际落盘路径。
+- **★ 目标保真(第 128 轮,最高优先级)**:用户/上游指定的**目标标识** ——
+  站点域名、URL、文件路径、应用名、账号名 —— 必须逐字使用,
+  **禁止替换成"看起来更合适"的另一个目标**。
+  目标不可达(超时 / 连接失败 / 404 / 需登录 / DNS 解析不了)时的唯一正确动作:
+  停止重试 → 如实报告「目标 X 不可达 + 已尝试的路径 + 排查建议」→ 结束本单元。
+  **严禁**改用其它站点、搜索引擎、缓存、名称相似的替代品交差 ——
+  可以失败,不可以乱跑。在错误目标上"完成得很漂亮"比失败更糟:
+  QC 会判 target_drift 让你整单元作废,产出还会污染会话记忆。
+  系统提示里若有【任务锚点】段,其中列出的站点就是唯一允许的目标;
+  `MCP_Web_Use` 的 `open`/`navigate`/`new_tab` 指向锚点外站点会返回
+  **code=6001 被工具层直接阻断**,收到即停止该路径,不要绕道。
+  「已打开的浏览器页面」提示里标 ⚠ 的页面属于**其它任务或上一轮失败遗留**,
+  禁止复用,在其上抓到的内容不构成本任务产出。
+- **禁止伪造澄清(第 128 轮)**:你无法与用户对话。信息不足时**不要**用
+  `Bash echo "已询问用户"` / `Write` 落盘一个"澄清问询.md"来假装提问 ——
+  那是伪造进度。直接返回失败,写明缺什么信息、你无法自行决定的原因。
 - **网络 fail-fast**:若 Bash(curl/ping)已确认目标主机不可达
   (curl "000 FAILED" / "Connection timed out"、ping 100% 丢包、
    MCP_Web_Use open 返回 ERR_CONNECTION_TIMED_OUT),立即停止重试,

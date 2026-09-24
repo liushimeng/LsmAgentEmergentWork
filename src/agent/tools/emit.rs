@@ -86,6 +86,15 @@ impl Tool for SubmitTaskClassification {
                 "user_suggestion_if_fail": {
                     "type": "string",
                     "description": "失败时给用户的备选建议(可空)"
+                },
+                "target_status": {
+                    "type": "string",
+                    "enum": ["explicit", "resolved", "unresolved"],
+                    "description": "目标可解析性(第 128 轮):explicit=用户原文明确给出目标标识(URL/域名/文件路径/应用名);resolved=原文用指代(「这个网站」)但可从会话上下文解析出先行词;unresolved=**不可猜测** —— 指代无先行词且全上下文找不到任何目标标识。判为 unresolved 时编排器会直接把 clarification_question 回给用户、不委派执行。注意:「用户指的是哪个网站/文件」属于用户自己的选择,不是能用 Read/Glob/Grep/Bash 侦察出来的事实 —— 侦察不出来,只会浪费预算并把任务引向错误目标"
+                },
+                "clarification_question": {
+                    "type": "string",
+                    "description": "target_status=unresolved 时必填:要回给用户的具体澄清问题(中文,直接可答,列明缺哪一项)。其余情况留空"
                 }
             },
             "required": ["task_level", "goal_summary", "intent"]

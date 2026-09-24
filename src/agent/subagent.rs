@@ -339,13 +339,22 @@ impl SubAgentRunner {
         // 「已打开的浏览器页面」提示块,免重新打开/登录;冷启动零开销不注入。
         let live_pages = crate::agent::browser::BrowserManager::global().list_pages().await;
         let mut prompt = input.to_user_prompt();
-        if let Some(hint) = build_existing_pages_hint(&live_pages) {
+        // 第 128 轮:锚点感知 —— 存活页面按「是否属于本任务目标站点」分组渲染,
+        // 切断「上一轮猜错站点留下的页面被当成本轮权威上下文复用」的漂移洗白通道。
+        let task_anchor = crate::agent::safety::current_target_anchor();
+        if let Some(hint) = build_existing_pages_hint_anchored(&live_pages, task_anchor.as_ref()) {
             prompt.push_str("\n\n");
             prompt.push_str(&hint);
             info!(
                 live_pages = live_pages.len(),
-                "SubAgent 注入已打开的浏览器页面提示(多轮复用)"
+                anchor_hosts = ?task_anchor.as_ref().map(|a| a.hosts.clone()).unwrap_or_default(),
+                "SubAgent 注入已打开的浏览器页面提示(多轮复用 + 锚点分组)"
             );
+        }
+        // 第 128 轮:任务锚点约束段(用户原文里显式给了站点/或指代未解析时才注入,空锚点零 token)
+        if let Some(section) = task_anchor.as_ref().and_then(|a| a.render_prompt_section()) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&section);
         }
         let mut sub_session = crate::session::Session::new();
         sub_session.context_mut().push(ChatMessage::user(&prompt));
@@ -669,22 +678,99 @@ fn looks_like_failure(text: &str) -> bool {
 ///
 /// 输入为 `BrowserManager::list_pages()` 的 `(page_id, url, title, created_at)` 列表;
 /// 空列表返回 None(冷启动,不注入)。纯函数,便于单测。
+///
+/// 无锚点形态 —— 文案与第 79 轮完全一致;任务级调用请走
+/// [`build_existing_pages_hint_anchored`]。
 pub fn build_existing_pages_hint(pages: &[(String, String, String, String)]) -> Option<String> {
+    build_existing_pages_hint_anchored(pages, None)
+}
+
+/// 任务锚点版页面提示(第 128 轮):把存活页面按「是否属于本任务目标站点」分组。
+///
+/// ## 为什么必须分组
+///
+/// 实测事故(日志 `llaew_20260924_151442.log`):wf-2 猜 `news.ycombinator.com` 超时后
+/// **自行改派** `ithome.com` 并成功 open;QC 判 fail 触发重试,但那个猜错留下的页面
+/// 仍在 `BrowserManager` 注册表里存活。重试轮本函数无条件把它渲染成
+/// 「已打开的浏览器页面(**可直接复用**,免重新打开/登录)」注入 ——
+/// SubAgent 于是原话照做:「因系统已注入 page_id=p_9a728be5 | IT之家,直接复用」,
+/// 并在错误站点上完整交付、QC 判 ✅。
+///
+/// 即:**旧文案把上一轮的漂移洗白成了本轮的权威上下文**。分组渲染切断该通道。
+///
+/// `anchor` 为 `None` 或空锚点(用户未指定站点)时退回旧文案,开放任务零影响。
+pub fn build_existing_pages_hint_anchored(
+    pages: &[(String, String, String, String)],
+    anchor: Option<&crate::agent::safety::TargetAnchor>,
+) -> Option<String> {
     if pages.is_empty() {
         return None;
     }
-    let mut out = String::from(
-        "【已打开的浏览器页面(可直接复用,免重新打开/登录)】\n",
-    );
-    for (id, url, title, _ts) in pages.iter().take(10) {
-        let title_disp = if title.trim().is_empty() { "(无标题)" } else { title.as_str() };
-        out.push_str(&format!("  - page_id={id} | 标题: {title_disp} | URL: {url}\n"));
+    // 上限 10 页(既有语义,分组前后都按整体截断)
+    let shown: Vec<&(String, String, String, String)> = pages.iter().take(10).collect();
+    // 无有效锚点 → 第 79 轮原文案,逐字不变
+    let effective_anchor = anchor.filter(|a| !a.is_empty());
+    let Some(anchor) = effective_anchor else {
+        let mut out = String::from("【已打开的浏览器页面(可直接复用,免重新打开/登录)】\n");
+        for (id, url, title, _ts) in &shown {
+            out.push_str(&format!("  - {}\n", format_page_line(id, url, title)));
+        }
+        out.push_str(
+            "网页类任务优先用 MCP_Web_Use 的 inspect/control 直接操作上述页面;\
+             仅当任务需要其它网址或页面已失效(code=2000)时才 action=open 新开。",
+        );
+        return Some(out);
+    };
+
+    // 有锚点 → 按「是否属于本任务目标站点」二分。
+    // URL 解析不出主机的页面归入可复用组(fail-open:防漂移机制不制造新的阻断)。
+    let mut reusable: Vec<&(String, String, String, String)> = Vec::new();
+    let mut off_target: Vec<&(String, String, String, String)> = Vec::new();
+    for page in shown {
+        let in_anchor = crate::agent::safety::parse_url_host(&page.1)
+            .map(|host| anchor.contains_host(&host))
+            .unwrap_or(true);
+        if in_anchor {
+            reusable.push(page);
+        } else {
+            off_target.push(page);
+        }
+    }
+
+    let mut out = String::from("【已打开的浏览器页面】\n");
+    out.push_str(&format!(
+        "本任务锚点站点: {}(系统从用户原文机械抽取,不可协商)\n",
+        anchor.hosts.join(" , ")
+    ));
+    if !reusable.is_empty() {
+        out.push_str("  ✓ 可复用(属于本任务目标站点,免重新打开/登录):\n");
+        for (id, url, title, _ts) in &reusable {
+            out.push_str(&format!("    - {}\n", format_page_line(id, url, title)));
+        }
+    }
+    if !off_target.is_empty() {
+        out.push_str("  ⚠ 非本任务目标站点 —— **禁止复用**,不得在其上执行本任务的任何抓取/操作:\n");
+        for (id, url, title, _ts) in &off_target {
+            out.push_str(&format!("    - {}\n", format_page_line(id, url, title)));
+        }
+        out.push_str(
+            "    (这些是其它任务或上一轮失败遗留的页面;在其上取到的任何内容\n\
+             都**不构成**本任务的有效产出,即使抓取成功也会被 QC 判目标漂移)\n",
+        );
     }
     out.push_str(
-        "网页类任务优先用 MCP_Web_Use 的 inspect/control 直接操作上述页面;\
-         仅当任务需要其它网址或页面已失效(code=2000)时才 action=open 新开。",
+        "网页类任务优先用 MCP_Web_Use 的 inspect/control 直接操作「✓」组页面;\
+         锚点站点没有存活页面时才 action=open 新开(且只能开锚点内的站点 —— \
+         开锚点外站点会返回 code=6001 被阻断)。目标站点不可达时如实报告失败,\
+         禁止改用其它站点替代。",
     );
     Some(out)
+}
+
+/// 单行页面描述(分组前后共用,保证格式一致)。
+fn format_page_line(id: &str, url: &str, title: &str) -> String {
+    let title_disp = if title.trim().is_empty() { "(无标题)" } else { title };
+    format!("page_id={id} | 标题: {title_disp} | URL: {url}")
 }
 
 /// 从 sub_session 中提取「真实从浏览器抓到的可读文本」(原 WebUseRunner
@@ -1307,6 +1393,126 @@ mod tests {
         let hint = build_existing_pages_hint(&pages).unwrap();
         assert!(hint.contains("p_00000009"), "前 10 个页面应列出");
         assert!(!hint.contains("p_0000000a"), "第 11 个起应截断");
+    }
+
+    // ========== 第 128 轮:任务锚点分组 ==========
+
+    /// 事故现场的页面组合:锚点是 anthropic.com,存活页面是上一轮猜错留下的 ithome.com。
+    fn incident_pages() -> Vec<(String, String, String, String)> {
+        vec![
+            (
+                "p_9a728be5".to_string(),
+                "https://www.ithome.com/".to_string(),
+                "IT之家".to_string(),
+                "1758100000000".to_string(),
+            ),
+            (
+                "p_ab12cd34".to_string(),
+                "https://www.anthropic.com/news".to_string(),
+                "Anthropic".to_string(),
+                "1758100000001".to_string(),
+            ),
+        ]
+    }
+
+    fn anchor_for(host: &str) -> crate::agent::safety::TargetAnchor {
+        crate::agent::safety::TargetAnchor {
+            hosts: vec![host.to_string()],
+            raw_urls: vec![format!("https://{host}/")],
+            unresolved_reference: false,
+            unresolved_evidence: String::new(),
+        }
+    }
+
+    #[test]
+    fn anchored_hint_splits_off_target_pages_into_forbidden_group() {
+        let hint = build_existing_pages_hint_anchored(&incident_pages(), Some(&anchor_for("anthropic.com")))
+            .expect("非空页面列表应返回提示");
+        // 锚点内页面进可复用组
+        assert!(hint.contains("✓ 可复用"), "应有可复用分组: {hint}");
+        assert!(hint.contains("p_ab12cd34"));
+        // 锚点外页面进禁止组,且明确禁止复用
+        assert!(hint.contains("⚠ 非本任务目标站点"), "应有禁止复用分组: {hint}");
+        assert!(hint.contains("p_9a728be5"));
+        assert!(hint.contains("禁止复用"));
+        assert!(hint.contains("不构成"), "应说明越界页面内容不构成有效产出");
+        assert!(hint.contains("anthropic.com"), "应回显锚点站点");
+    }
+
+    #[test]
+    fn anchored_hint_mentions_6001_so_llm_knows_why_blocked() {
+        let hint = build_existing_pages_hint_anchored(&incident_pages(), Some(&anchor_for("anthropic.com")))
+            .unwrap();
+        assert!(hint.contains("6001"), "应预告越界阻断码: {hint}");
+        assert!(hint.contains("禁止改用其它站点替代"));
+    }
+
+    #[test]
+    fn anchored_hint_empty_anchor_falls_back_to_legacy_text() {
+        // 空锚点(用户没指定站点)→ 逐字退回第 79 轮原文案,开放任务零影响
+        let pages = incident_pages();
+        let legacy = build_existing_pages_hint(&pages).unwrap();
+        let empty_anchor = crate::agent::safety::TargetAnchor::default();
+        let anchored = build_existing_pages_hint_anchored(&pages, Some(&empty_anchor)).unwrap();
+        assert_eq!(legacy, anchored, "空锚点必须与无锚点文案完全一致");
+        assert!(legacy.contains("可直接复用,免重新打开/登录"));
+        assert!(!legacy.contains("⚠"), "空锚点不得出现禁止分组");
+    }
+
+    #[test]
+    fn anchored_hint_none_anchor_falls_back_to_legacy_text() {
+        let pages = incident_pages();
+        assert_eq!(
+            build_existing_pages_hint_anchored(&pages, None).unwrap(),
+            build_existing_pages_hint(&pages).unwrap()
+        );
+    }
+
+    #[test]
+    fn anchored_hint_all_in_anchor_has_no_forbidden_group() {
+        let pages = vec![(
+            "p_ab12cd34".to_string(),
+            "https://news.anthropic.com/x".to_string(),
+            "News".to_string(),
+            "1".to_string(),
+        )];
+        let hint = build_existing_pages_hint_anchored(&pages, Some(&anchor_for("anthropic.com"))).unwrap();
+        assert!(hint.contains("✓ 可复用"));
+        assert!(!hint.contains("⚠"), "全部在锚点内时不应出现禁止分组: {hint}");
+    }
+
+    #[test]
+    fn anchored_hint_unparsable_url_fails_open_into_reusable() {
+        // URL 解析不出主机 → 归入可复用组(fail-open,防漂移机制不制造新阻断)
+        let pages = vec![(
+            "p_deadbeef".to_string(),
+            "about:blank".to_string(),
+            String::new(),
+            "1".to_string(),
+        )];
+        let hint = build_existing_pages_hint_anchored(&pages, Some(&anchor_for("anthropic.com"))).unwrap();
+        assert!(hint.contains("p_deadbeef"));
+        assert!(!hint.contains("⚠"), "解析不出主机的页面不得被判越界: {hint}");
+    }
+
+    #[test]
+    fn anchored_hint_still_caps_at_ten_pages() {
+        let pages: Vec<(String, String, String, String)> = (0..15)
+            .map(|i| (
+                format!("p_{i:08x}"),
+                format!("https://other{i}.com/"),
+                format!("标题{i}"),
+                "1".to_string(),
+            ))
+            .collect();
+        let hint = build_existing_pages_hint_anchored(&pages, Some(&anchor_for("anthropic.com"))).unwrap();
+        assert!(hint.contains("p_00000009"), "前 10 个页面应列出");
+        assert!(!hint.contains("p_0000000a"), "第 11 个起应截断");
+    }
+
+    #[test]
+    fn anchored_hint_empty_pages_returns_none() {
+        assert!(build_existing_pages_hint_anchored(&[], Some(&anchor_for("anthropic.com"))).is_none());
     }
 
     #[test]

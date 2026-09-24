@@ -1030,6 +1030,8 @@ mod tests {
             yolo_degraded: false, // 关联报告: 2026-09-09_04 D-002
             suggested_delegate: None,
             debug_eligible: true,
+            target_status: None,
+            clarification_question: None,
         });
         c.record_quality(&QualityReport::pass(AgentRole::SubAgent));
         c.record_task_end("executed", Usage::default());
@@ -1142,6 +1144,8 @@ mod tests {
             yolo_degraded: false,
             suggested_delegate: None,
             debug_eligible: false,
+            target_status: None,
+            clarification_question: None,
         };
         assert!(!should_invoke_debug_agent(&c), "should skip when debug_eligible=false");
         c.debug_eligible = true;

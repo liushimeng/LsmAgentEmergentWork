@@ -10,13 +10,14 @@
 //! - [`auto_repair_plan`]:解析后自动修复——`loops[].max_iterations` 从 condition/over
 //!   文本回填上界(「最多N次」「max_iterations=N」等),无界遍历/滚动兜底 10 次;
 //! - [`validate_plan_blocking`]:确定性阻断校验——workflows 空 / id 重复 / name、steps
-//!   为空 / depends_on 未知或成环(复用 `topo_layers`)。返回空 Vec = 通过。
+//!   为空 / depends_on 未知或成环(复用 `topo_layers`)/ **「澄清/询问用户」伪单元**
+//!   (第 128 轮:DAG 单元无法暂停等待用户,见 [`CLARIFY_UNIT_MARKERS`])。返回空 Vec = 通过。
 //!
 //! Orchestrator `run_medium` 流程:parse → auto_repair → validate;
 //! 校验失败直接 QualityFailure(精确原因、秒级重试,不烧 LLM QC);
 //! 校验通过跳过 LLM QC-main(对齐 degraded 路径,真实产物由每单元 QC 把守)。
 
-use crate::agent::main_work::{topo_layers, WorkFlowPlan};
+use crate::agent::main_work::{topo_layers, WorkFlowPlan, WorkFlowSpec};
 
 /// 默认循环上界:文本提到滚动/遍历但未给次数时兜底。
 const DEFAULT_LOOP_MAX_ITERATIONS: usize = 10;
@@ -116,6 +117,48 @@ fn mentions_unbounded_iteration(text: &str) -> bool {
     has_iter_verb && extract_max_iterations(text).is_none()
 }
 
+/// 「澄清/询问用户」类伪单元的文本标记(第 128 轮)。
+///
+/// 这类单元在 DAG 里**结构上不可能完成**:WorkFlow 单元运行在 Kahn 分层调度中,
+/// 没有暂停等待用户输入的语义;唯一能触达用户的 `HumanAssistHub` 只被
+/// `MCP_Web_Use control_action=request_human` 使用,reason 枚举是验证码/短信/扫码一类
+/// **页面阻断**,不含「目标不明确」。
+///
+/// 于是执行层只能用 `Bash echo "澄清问询已发出"` + `Write` 落盘假装提问,QC 按
+/// 「本单元职责 = 发出澄清」判 ✅ 通过,`wf-2 depends_on wf-1` 的依赖门形同虚设,
+/// 下游单元在没有目标的情况下继续乱跑 —— 实测事故(`llaew_20260924_151442.log`)
+/// 的 wf-1 正是这个形态。
+const CLARIFY_UNIT_MARKERS: &[&str] = &[
+    "澄清",
+    "询问用户",
+    "向用户确认",
+    "等待用户",
+    "需用户确认",
+    "请用户提供",
+    "让用户选择",
+    "ask the user",
+    "ask user",
+    "clarify with",
+];
+
+/// 单元是否是「澄清/询问用户」伪单元(纯函数,可单测)。
+///
+/// 扫 name + steps + acceptance 三处 —— 实测 LLM 会把澄清意图写在任意一处。
+fn is_clarification_unit(wf: &WorkFlowSpec) -> bool {
+    let mut haystack = wf.name.to_lowercase();
+    for s in &wf.steps {
+        haystack.push(' ');
+        haystack.push_str(&s.to_lowercase());
+    }
+    for a in &wf.acceptance {
+        haystack.push(' ');
+        haystack.push_str(&a.to_lowercase());
+    }
+    CLARIFY_UNIT_MARKERS
+        .iter()
+        .any(|m| haystack.contains(&m.to_lowercase()))
+}
+
 /// 确定性阻断校验:返回阻断问题列表(空 = 通过)。
 ///
 /// 只收录**程序可判定、LLM QC 误判率高**的硬问题;品相问题(acceptance 措辞、
@@ -136,6 +179,19 @@ pub fn validate_plan_blocking(plan: &WorkFlowPlan) -> Vec<String> {
         }
         if wf.steps.is_empty() {
             issues.push(format!("workflow {} 缺少 steps(执行步骤为空)", wf.id));
+        }
+        // 第 128 轮:澄清伪单元阻断(见 CLARIFY_UNIT_MARKERS 文档注释)。
+        // 判为阻断问题 → 走既有「秒级回流重拆」路径,retry_hint 会带上明确禁止语;
+        // 目标确实不可解析时,编排器的 L1 澄清门会先于拆解回到用户,不会走到这里。
+        if is_clarification_unit(wf) {
+            issues.push(format!(
+                "workflow {}({})是「澄清/询问用户」伪单元:WorkFlow 单元在 DAG 里无法暂停\
+                 等待用户输入,只会让执行层用 Bash echo 假装提问、QC 判通过、下游单元在没有\
+                 目标的情况下继续乱跑。信息不足时应输出 0 个 workflows 并在 summary 写明\
+                 「需用户澄清:<缺什么>」,由编排器回到用户",
+                wf.id,
+                wf.name
+            ));
         }
     }
     // 拓扑校验:未知依赖 / 循环依赖(复用 topo_layers 单一事实源)
@@ -173,6 +229,122 @@ mod tests {
             over: over.into(),
             max_iterations: None,
         }
+    }
+
+    // ========== 第 128 轮:澄清伪单元阻断 ==========
+
+    fn wf_named(id: &str, name: &str, steps: Vec<&str>, acceptance: Vec<&str>) -> WorkFlowSpec {
+        let mut spec = wf(id, steps, vec![]);
+        spec.name = name.to_string();
+        spec.acceptance = acceptance.into_iter().map(String::from).collect();
+        spec
+    }
+
+    fn plan_of(specs: Vec<WorkFlowSpec>) -> WorkFlowPlan {
+        WorkFlowPlan {
+            workflows: specs,
+            summary: String::new(),
+            degraded: false,
+        }
+    }
+
+    #[test]
+    fn clarify_unit_in_name_is_blocked() {
+        // 实测事故的 wf-1 原样:name 里带「澄清」
+        let plan = plan_of(vec![wf_named(
+            "wf-1",
+            "澄清目标网站(用户必须先指明 URL 或站点名)",
+            vec!["向用户发出澄清问询"],
+            vec!["澄清问题含关键词"],
+        )]);
+        let issues = validate_plan_blocking(&plan);
+        assert!(
+            issues.iter().any(|i| i.contains("伪单元")),
+            "应阻断澄清单元: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn clarify_unit_in_steps_is_blocked() {
+        // 意图藏在 steps 里也要抓到
+        let plan = plan_of(vec![wf_named(
+            "wf-1",
+            "前置准备",
+            vec!["等待用户回复目标 URL 后再继续"],
+            vec!["ok"],
+        )]);
+        assert!(validate_plan_blocking(&plan).iter().any(|i| i.contains("伪单元")));
+    }
+
+    #[test]
+    fn clarify_unit_in_acceptance_is_blocked() {
+        let plan = plan_of(vec![wf_named(
+            "wf-2",
+            "打开网站",
+            vec!["MCP_Web_Use(action=open)"],
+            vec!["需用户确认站点后才算完成"],
+        )]);
+        assert!(validate_plan_blocking(&plan).iter().any(|i| i.contains("伪单元")));
+    }
+
+    #[test]
+    fn clarify_marker_set_covers_common_phrasings() {
+        for name in [
+            "询问用户目标",
+            "向用户确认网站",
+            "请用户提供 URL",
+            "让用户选择站点",
+            "ask the user for the target",
+        ] {
+            let plan = plan_of(vec![wf_named("wf-1", name, vec!["s"], vec!["ok"])]);
+            assert!(
+                validate_plan_blocking(&plan).iter().any(|i| i.contains("伪单元")),
+                "应命中: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_web_units_are_not_false_flagged() {
+        // 正常单元(含事故里的 wf-2/3/4 形态)不得被误判
+        let plan = plan_of(vec![
+            wf_named(
+                "wf-2",
+                "打开目标网站 + explore 批量观察首页结构",
+                vec!["MCP_Web_Use(action=open, url=https://www.anthropic.com/)"],
+                vec!["final_url 主域 = anthropic.com"],
+            ),
+            wf_named(
+                "wf-3",
+                "提取按时间排序的最新 3 篇文章",
+                vec!["MCP_Web_Use(action=control, control_action=eval_js)"],
+                vec!["返回数组 length >= 3"],
+            ),
+            wf_named(
+                "wf-4",
+                "汇总并展示 3 篇文章信息",
+                vec!["整理标题+时间+摘要+链接"],
+                vec!["段数=3"],
+            ),
+        ]);
+        let issues = validate_plan_blocking(&plan);
+        assert!(
+            !issues.iter().any(|i| i.contains("伪单元")),
+            "正常单元不得误判: {issues:?}"
+        );
+        assert!(issues.is_empty(), "该计划应完全通过: {issues:?}");
+    }
+
+    #[test]
+    fn clarify_block_message_tells_llm_what_to_do_instead() {
+        let plan = plan_of(vec![wf_named("wf-1", "澄清目标", vec!["问用户"], vec!["ok"])]);
+        let msg = validate_plan_blocking(&plan)
+            .into_iter()
+            .find(|i| i.contains("伪单元"))
+            .expect("应有阻断信息");
+        // 必须给出替代做法,否则重拆仍会重蹈覆辙
+        assert!(msg.contains("0 个 workflows"), "{msg}");
+        assert!(msg.contains("需用户澄清"), "{msg}");
     }
 
     #[test]

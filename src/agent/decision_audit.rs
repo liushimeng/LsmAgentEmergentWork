@@ -206,6 +206,68 @@ pub fn record_classify(
     record(event);
 }
 
+/// 便捷函数:记录**任务锚点**决策(第 128 轮,第 6 个决策点)。
+///
+/// 与其它 5 个决策点的差异:锚点是**机械抽取**(正则,不经 LLM)的,
+/// 因此「决策依据」段记录的是抽取输入(用户原文里的 URL 与指代),
+/// 而不是模型的推理文本 —— 这恰恰是它的价值:可复现、可对账、不可幻觉。
+///
+/// 三段式对齐:
+/// - 输入上下文 = 抽到的锚点主机 + 原文 URL;
+/// - 决策结论   = 是否触发澄清门(目标指代未解析);
+/// - 决策依据   = 命中的指代片段(为什么判定为不可猜测)。
+/// `stage` 取值:
+/// - `"extract"`  —— 任务入口机械抽取完成(锚点是什么);
+/// - `"clarify"`  —— 澄清门实际触发(做了什么决策)。
+///
+/// 两条分开记是因为**抽取**与**门触发**不是同一个决策:LLM 通道
+/// (`target_status="unresolved"`)触发时机械抽取可能并未标记 unresolved,
+/// 只记一条会把"谁决定停下来问用户"这个关键事实丢掉。
+pub fn record_target_anchor(
+    session_id: &str,
+    anchor: &crate::agent::safety::TargetAnchor,
+    clarification_gate: bool,
+    stage: &str,
+) {
+    let meta = serde_json::json!({
+        "stage": stage,
+        "hosts": anchor.hosts,
+        "raw_urls": anchor.raw_urls,
+        "unresolved_reference": anchor.unresolved_reference,
+        "extraction": "mechanical_regex",
+    });
+    let event = AuditEvent::new(
+        session_id,
+        AgentRole::Yolo.as_str(),
+        "target_anchor",
+        format!(
+            "hosts={} urls={}",
+            if anchor.hosts.is_empty() {
+                "(无)".to_string()
+            } else {
+                anchor.hosts.join(",")
+            },
+            anchor.raw_urls.first().cloned().unwrap_or_else(|| "(无)".into())
+        ),
+        format!(
+            "clarification_gate={} anchor_empty={}",
+            clarification_gate,
+            anchor.is_empty()
+        ),
+        format!(
+            "unresolved_evidence={}",
+            if anchor.unresolved_evidence.is_empty() {
+                "(无指代)"
+            } else {
+                anchor.unresolved_evidence.as_str()
+            }
+        ),
+        0,
+    )
+    .with_meta(meta);
+    record(event);
+}
+
 /// 便捷函数:记录 Plan 规划决策。
 pub fn record_plan(
     session_id: &str,

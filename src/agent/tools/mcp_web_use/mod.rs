@@ -35,10 +35,48 @@ mod tests;
 /// 工具名(LLM 可见的唯一浏览器操控入口)。
 pub const MCP_WEB_USE_TOOL_NAME: &str = "MCP_Web_Use";
 
+/// 目标站点越界错误码(第 128 轮,任务锚点)。
+///
+/// 新开 **6xxx「范围约束」段**:1xxx 参数 / 2xxx 浏览器与页面 / 3xxx 环境缺失 /
+/// 4xxx 人工介入(「需要人帮忙完成」) / **6xxx 不允许做(「这件事本身越界」)**。
+/// 不用 5xxx —— 那一段已被 `MCP_Use`(server 配置与连接)占用,避免跨工具语义混淆。
+pub(super) const CODE_TARGET_ANCHOR_VIOLATION: i32 = 6001;
+
 // ===================== 共享辅助(自 tools/browser.rs 平移) =====================
 
 pub(super) fn envelope(code: i32, message: &str, data: Value) -> Result<String> {
     Ok(json!({"code": code, "message": message, "data": data}).to_string())
+}
+
+/// 任务锚点守卫(第 128 轮):目标 URL 越出用户原文指定的站点时返回 6001 信封。
+///
+/// 接入点是**显式带 URL 参数的动作**(`open` / `navigate` / `new_tab`)——
+/// 这三个是「Agent 主动选择目标站点」的动作,也正是实测漂移的发生点
+/// (`news.ycombinator.com` 超时后自行改开 `ithome.com`)。
+/// 点击导航的落地页无法预知,不在这里拦;由 `target_drift` 信号 + QC 目标一致性门事后对账。
+///
+/// `None` = 放行(开关关闭 / 无锚点 / 锚点为空 / host 在锚点内 / host 解析不出来)。
+/// 解析不出来时 fail-open:防漂移机制自身绝不能成为新的失败面。
+pub(super) fn target_anchor_guard(url: &str) -> Option<Result<String>> {
+    let violation = crate::agent::safety::check_open_against_target_anchor(url)?;
+    tracing::warn!(
+        requested_host = %violation.host,
+        allowed_hosts = ?violation.allowed_hosts,
+        anchor_evidence = %violation.evidence,
+        "MCP_Web_Use 目标站点越界已阻断(任务锚点,code=6001)"
+    );
+    Some(envelope(
+        CODE_TARGET_ANCHOR_VIOLATION,
+        "目标站点越界(任务锚点约束)",
+        json!({
+            "requested_url": url,
+            "requested_host": violation.host,
+            "allowed_hosts": violation.allowed_hosts,
+            "anchor_evidence": violation.evidence,
+            "required_action": "如实报告「目标站点不可达或未指定」并结束本单元;\
+                                禁止改用其它站点、搜索引擎或缓存替代 —— 可以失败,不可以乱跑。",
+        }),
+    ))
 }
 
 pub(super) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -213,6 +251,12 @@ async fn run_open(args: Value) -> Result<String> {
     let Some(url) = str_arg(&args, "url") else {
         return envelope(1001, "缺少 url", json!({}));
     };
+    // 第 128 轮:任务锚点越界阻断 —— 必须先于「同 URL 复用」探测,
+    // 否则越界 URL 若恰好命中某个存活页面会被静默复用,阻断形同虚设。
+    // 实测漂移正是发生在 open:news.ycombinator.com 超时后自行改开 ithome.com。
+    if let Some(blocked) = target_anchor_guard(url) {
+        return blocked;
+    }
     let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(true);
     // 第 103 轮:读取 timeout_ms 参数,控制页面加载超时(默认 60s)
     let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(60000);
@@ -600,7 +644,7 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 
 【两种工作模式】1) 单步执行模式:直接调用 open/control/inspect/list/close,一次一个动作,适合探索、调试和高风险操作;2) 连续执行模式:先用单步 inspect(elements/dom/console/network)探索结构,再 action=sequence 一次执行已明确动作链,适合流程稳定任务(登录/表单类:inspect(form) → ocr 验证码 → sequence(input×N + click + wait + verify) 一次打包)。两种模式可混合、可多次调用。
 【标准作业顺序】open 拿 page_id → inspect 探索真实 DOM → control 执行动作 → inspect 验证结果 → 任务完成后 close 释放(确定不再需要的页面;全部结束用 page_id="all" 清场)。
-【错误码对策】1001 修正参数;2000 page_id 失效→action=list 重新同步;2001 断连→重新 open;2002 换 selector 或 input_text 的 use_js 路径重试;3001 未安装浏览器→如实告知用户,不要编造结果。
+【错误码对策】1001 修正参数;2000 page_id 失效→action=list 重新同步;2001 断连→重新 open;2002 换 selector 或 input_text 的 use_js 路径重试;3001 未安装浏览器→如实告知用户,不要编造结果;**6001 目标站点越界(任务锚点)→ 立即停止该路径,如实报告「目标站点不可达或未指定」并结束本单元;严禁改用其它站点、搜索引擎、缓存或名称相似的替代品 —— 可以失败,不可以乱跑**。
 【人工介入(HITL)】遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/人脸核身等无法自动完成的流程:可视化场景先 open(mode=headed) 让人工看到窗口(蓝色边框标识),再 control(request_human, reason=..., message=说明要人工做什么, options=[...]) 在 TUI 发起人工选择;code=0 用 data.human_response 继续(短信验证码数字人工直接在 TUI 输入);4001=超时/非交互模式,如实报告;4002=人工取消,终止该路径。切 hidden→headed 需 close("all") 回收后重开。
 【作业要点】中文输入优先 params.use_js=true(React/Vue 受控组件兼容);复杂页面先 inspect(info=elements) 探测真实 DOM 再操作,不要硬猜 selector;AI 对话类网站回复等待用 control(wait, selector=[class*=response]..., timeout_ms=60000);看图片里的文字(验证码/图表标签)一律 screenshot(params.ocr=true) 或 inspect(info=ocr),禁止 Read 图片文件、禁止用 Bash/python/tesseract 解码图片(文本模型无视觉,纯浪费迭代);验证码读码后不要刷新页面或点击验证码图(刷新即换码),提交报验证码错误才点图刷新重读;DOM 提取注意 truncated 标记分段。
 【安全红线】支付/删除/确认提交/登出等不可逆或高风险动作禁止放进 sequence,必须单步执行并检查页面状态;登录凭证只填用户明确提供的账号密码,不要编造;OCR 不可用的平台上验证码类任务如实报告等待人工,禁止猜测验证码;只读优先——能 inspect 回答的问题不做任何写操作。"#;

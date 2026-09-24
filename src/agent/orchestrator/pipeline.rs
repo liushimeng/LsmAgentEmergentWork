@@ -20,16 +20,48 @@ impl MultiAgentOrchestrator {
 
         // 任务开始(2026-09-17 第 69 轮运行日志):感知输入 —— 用户原始 prompt
         // (注入项目上下文/历史摘要之前的原始形态)入日志。
+        // 第 128 轮:补记行数字符数 —— 实测多行提示词被终端截断成首行时,
+        // 旧日志只有 prompt 文本,必须靠 grep 目标关键词才能反推出"少了什么";
+        // 显式记 lines/chars 让截断一眼可见(不变量:用户输入不得静默消失)。
         {
             let prompt_desc = Self::original_user_prompt(session)
                 .unwrap_or_else(|| "(无用户文本输入)".to_string());
             info!(
                 session = %session.id(),
                 messages = session.context().len(),
+                prompt_lines = prompt_desc.lines().count(),
+                prompt_chars = prompt_desc.chars().count(),
                 prompt = %crate::logging::clip(&prompt_desc),
                 "任务开始(感知输入)"
             );
         }
+
+        // 0.-1) 任务锚点抽取与安装(第 128 轮,防目标漂移 L1/L3/L4 的唯一事实源)。
+        //
+        // **必须在项目上下文与历史摘要注入之前抽取**:注入段会带进 CLAUDE.md 里的
+        // 仓库 URL、以及过往任务摘要里的其它站点,那些都不是本轮用户指定的目标,
+        // 混进锚点会让 L3 工具门错误放行越界站点。
+        //
+        // **每个任务都无条件写入(含空锚点)**:TUI 多轮对话中任务 N 的锚点若残留到
+        // 任务 N+1,会用旧站点错误阻断新任务。空锚点 = 不做任何主机阻断。
+        let task_anchor = crate::agent::safety::TargetAnchor::extract_from_context(session.context());
+        // 守卫随 handle_inner 栈帧退出自动清空全局槽(含取消/panic 路径),
+        // 避免锚点跨任务残留污染下一轮 —— 见 TargetAnchorScopeGuard 文档注释。
+        let _target_anchor_guard =
+            crate::agent::safety::install_target_anchor(task_anchor.clone());
+        info!(
+            session = %session.id(),
+            anchor_hosts = ?task_anchor.hosts,
+            unresolved_reference = task_anchor.unresolved_reference,
+            unresolved_evidence = %task_anchor.unresolved_evidence,
+            "任务锚点已安装(机械抽取,不经 LLM)"
+        );
+        crate::agent::decision_audit::record_target_anchor(
+            session.id(),
+            &task_anchor,
+            task_anchor.unresolved_reference,
+            "extract",
+        );
 
         // 0) 项目上下文首次注入(幂等)
         if let Some(work_dir) = project_context::current_work_dir() {
@@ -169,6 +201,91 @@ impl MultiAgentOrchestrator {
         // 失败反馈直接注入各执行单元;计划级失败(解析/校验)→ 清缓存强制重拆。
         // 实测省 1-2 次 Main-Work 调用(30-120s/任务)。
         let mut medium_plan_cache: Option<WorkFlowPlan> = None;
+
+        // 1.15) 澄清门(第 128 轮 L1,防目标漂移):**目标不可解析 → 回问用户,不进 WorkFlow**。
+        //
+        // 位置刻意排在 direct_answer 短路之前 —— 目标都没确定时,任何"直接答案"都是编的。
+        //
+        // 双通道(任一命中即澄清):
+        // - **LLM 通道**:Yolo 自己填 `target_status="unresolved"`(它有完整上下文,判断更细);
+        // - **机械通道**:`task_anchor.unresolved_reference`(命中指代 + 全上下文零主机)。
+        //   这条专门兜本次事故:Yolo 的 thinking 明明写了「这是一个关键的指代不明问题」,
+        //   却仍然分类 medium 委派下去,让 Main-Work 拆出一个**无法真正等待用户**的
+        //   伪澄清单元(wf-1 用 `Bash echo` 假装提问 → QC 判 ✅ → wf-2 猜了个站继续跑)。
+        //
+        // 两条通道都只**减少**执行、不增加执行:误触发的代价是"多问用户一句",
+        // 漏触发的代价是"在错误目标上跑 6 分钟并记为成功"。取舍明确偏向前者。
+        let llm_says_unresolved = classification.target_unresolved();
+        let mechanical_says_unresolved = task_anchor.unresolved_reference;
+        if llm_says_unresolved || mechanical_says_unresolved {
+            if mechanical_says_unresolved && !llm_says_unresolved {
+                tracing::warn!(
+                    session = %session.id(),
+                    evidence = %task_anchor.unresolved_evidence,
+                    task_level = %classification.task_level.display_name(),
+                    "Yolo 判定与机械检测冲突(机械:目标指代未解析),以机械检测为准走澄清门"
+                );
+            }
+            Self::check_cancelled(cancel)?;
+            let user_prompt = Self::original_user_prompt(session).unwrap_or_default();
+            let question = crate::agent::safety::build_clarification_message(
+                &task_anchor,
+                &user_prompt,
+                classification.clarification_question.as_deref(),
+            );
+            emit_progress(progress, "Yolo 需要用户澄清目标(未委派执行 —— 防止目标漂移)");
+            info!(
+                session = %session.id(),
+                channel = if llm_says_unresolved { "llm" } else { "mechanical" },
+                evidence = %task_anchor.unresolved_evidence,
+                "澄清门触发(决策):目标不可解析,回到用户,不进 WorkFlow"
+            );
+            crate::agent::decision_audit::record_target_anchor(
+                session.id(),
+                &task_anchor,
+                true,
+                "clarify",
+            );
+            // 照常走 SessionContext 收口保住 session_memory 连续性,但目标文案明确写成
+            // 「等待用户澄清」—— 绝不能让摘要链里出现一条看起来像"成功"的记录,
+            // 否则下一轮 Yolo 注入历史摘要时会把"已澄清"当成既成事实。
+            let sc_started = std::time::Instant::now();
+            let summary = self
+                .session_context
+                .summarize(
+                    "等待用户澄清任务目标(本轮未执行任何操作)",
+                    &user_prompt,
+                    None,
+                    &[],
+                    &total_usage,
+                    session.id(),
+                    classification.yolo_degraded,
+                    &classification.task_level,
+                    None,
+                )
+                .await?;
+            stage_durations.push(StageDuration {
+                stage: "session_context".to_string(),
+                wf_id: None,
+                started_offset_ms: 0,
+                elapsed_ms: sc_started.elapsed().as_millis() as u64,
+            });
+            total_usage = add_usage(total_usage, summary.usage);
+            self.dbg_task_end("clarification_needed", total_usage);
+            info!(
+                session = %session.id(),
+                outcome = "clarification_needed",
+                usage_in = total_usage.input_tokens,
+                usage_out = total_usage.output_tokens,
+                wallclock_ms = task_started.elapsed().as_millis() as u64,
+                "任务收口"
+            );
+            return Ok(OrchestrationOutcome::DirectAnswer {
+                text: question,
+                classification,
+                usage: total_usage,
+            });
+        }
 
         // 1.2) simple + direct_answer 短路(2026-09-09 第 15 轮 AQ03 实测发现):
         // Yolo 已给出完整直接答案时,不再空转一轮 SubAgent+QC(实测多花 ~2.5 分钟

@@ -1504,6 +1504,8 @@ mod format_task_result_for_context_tests {
                 yolo_degraded: false,
                 suggested_delegate: None,
                 debug_eligible: true,
+                target_status: None,
+                clarification_question: None,
             },
             plan_doc: None,
             workflows,
@@ -1675,6 +1677,8 @@ mod format_task_result_cost_hint_tests_support {
                 yolo_degraded: false,
                 suggested_delegate: None,
                 debug_eligible: true,
+                target_status: None,
+                clarification_question: None,
             },
             plan_doc: None,
             workflows: vec![WorkflowResult {

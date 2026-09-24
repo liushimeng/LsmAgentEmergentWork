@@ -99,7 +99,20 @@ fn build_unit_qc_prompt(
          桌面目标保真(第 109 轮):用户原始输入指向独立桌面软件(豆包/微信/钉钉/飞书/QQ 等)\n\
          且未明确说「网页/Web 版」时 —— 执行轨迹全部落在 MCP_Web_Use 操作该软件的网页版\n\
          不构成等效完成(判 Fail 且 retryable=true,issues 指出工具错配,应改用 MCP_Window_Use);\n\
-         suggestion 中禁止推荐「改用网页版/Web 版替代桌面软件」。"
+         suggestion 中禁止推荐「改用网页版/Web 版替代桌面软件」。\n\
+         \n\
+         ★ 目标一致性(第 128 轮,最高优先级硬门):用户原始输入显式指定了目标标识\n\
+         (站点域名 / URL / 文件路径 / 应用名)时,执行轨迹的实际操作对象必须是**同一个**目标。\n\
+         若实际操作了另一个站点/路径/应用 —— 包括「原目标超时/不可达/需登录后自行改派到\n\
+         别的站点」—— 一律判 Fail 且 **retryable=false**(改派不是重试能修复的问题,重试只会\n\
+         在错误目标上把产出做得更完整)。issues 必须写成「用户指定 X,实际操作 Y」的对账句式;\n\
+         suggestion 中**严禁**推荐「改用其它站点/搜索引擎/缓存替代原目标」。\n\
+         判定依据(任一即 Fail):① 轨迹出现 code=6001(目标站点越界被工具层阻断);\n\
+         ② failure_signals 含 target_drift;③ 工具调用参数/最终 URL 的主机与用户指定域名不同;\n\
+         ④ 产物内容全部来自另一个站点。**在错误目标上「完成得很漂亮」仍是 Fail** —— \n\
+         这类产出会污染 session_memory,比直接失败危害更大。\n\
+         例外:用户原始输入**没有**指定任何目标标识(如「搜一下最新 Rust 新闻」)时,\n\
+         执行层自主选择站点属正常行为,不适用本门。"
             .to_string()
     };
     format!(
@@ -647,6 +660,55 @@ mod tests {
         // suggestion 层面禁止推荐网页版
         assert!(p.contains("禁止推荐「改用网页版"), "{p}");
         assert!(p.contains("MCP_Web_Use"), "{p}");
+    }
+
+    // ========== 第 128 轮:目标一致性硬门(禁止改派目标站点) ==========
+
+    #[test]
+    fn qc_prompt_target_consistency_gate_present() {
+        let p = build_unit_qc_prompt(
+            "抓取 anthropic.com 最新 3 篇文章",
+            "打开目标网站并 explore 首页结构",
+            "final_url 主域 = anthropic.com",
+            "已在 ithome.com 抓到 3 篇文章",
+            "iter=4 tools=5 target_drift:ithome.com",
+            Some("打开 https://www.anthropic.com/ ,找出最新的 3 篇文章,显示标题和 URL"),
+        );
+        assert!(p.contains("目标一致性"), "{p}");
+        assert!(p.contains("最高优先级硬门"), "{p}");
+        // 改派必须判不可重试(重试只会在错误目标上把产出做得更完整)
+        assert!(p.contains("retryable=false"), "{p}");
+        // 对账句式 + 禁止推荐替代品
+        assert!(p.contains("用户指定 X,实际操作 Y"), "{p}");
+        assert!(p.contains("严禁」推荐") || p.contains("严禁**推荐") || p.contains("严禁"), "{p}");
+        assert!(p.contains("搜索引擎"), "{p}");
+        // 机械判据必须写进提示词,QC 才能引用
+        assert!(p.contains("6001"), "{p}");
+        assert!(p.contains("target_drift"), "{p}");
+        // 漂亮地完成错误目标仍是 Fail
+        assert!(p.contains("完成得很漂亮"), "{p}");
+        assert!(p.contains("session_memory"), "{p}");
+    }
+
+    #[test]
+    fn qc_prompt_target_consistency_has_open_task_exception() {
+        // 用户没指定站点时不得套用目标一致性门,否则合法开放任务会被误判
+        let p = build_unit_qc_prompt(
+            "搜索最新 Rust 新闻",
+            "打开站点并抓取",
+            "3 条标题+链接",
+            "已在 ithome.com 抓到",
+            "iter=3 tools=4",
+            Some("搜一下最新的 Rust 语言新闻,给我 3 条标题和链接"),
+        );
+        assert!(p.contains("例外"), "{p}");
+        assert!(p.contains("自主选择站点属正常行为"), "{p}");
+    }
+
+    #[test]
+    fn qc_prompt_target_consistency_absent_without_original_prompt() {
+        let p = build_unit_qc_prompt("g", "scope", "exp", "act", "trace", None);
+        assert!(!p.contains("目标一致性"), "无原始输入时不得注入该门: {p}");
     }
 
     #[test]

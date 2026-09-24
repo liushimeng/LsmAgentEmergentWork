@@ -213,7 +213,20 @@ impl Default for ExecutionTrace {
 impl ExecutionTrace {
     /// 计算失败模式标签:基于当前指标 + 最终文本启发式。
     /// 文本失败措辞部分沿用 `subagent::looks_like_failure` 的中英双语关键词。
+    ///
+    /// 任务锚点从全局槽读取(编排器在任务入口写入);单测请用
+    /// [`ExecutionTrace::collect_failure_signals_with_anchor`] 显式传锚点,避免并发测试踩全局。
     pub fn collect_failure_signals(&mut self, text: &str) {
+        let anchor = crate::agent::safety::current_target_anchor();
+        self.collect_failure_signals_with_anchor(text, anchor.as_ref());
+    }
+
+    /// [`collect_failure_signals`] 的锚点显式传入版(纯函数化,可单测)。
+    pub fn collect_failure_signals_with_anchor(
+        &mut self,
+        text: &str,
+        anchor: Option<&crate::agent::safety::TargetAnchor>,
+    ) {
         let mut signals = Vec::new();
 
         // 1) 早终止强信号
@@ -269,6 +282,27 @@ impl ExecutionTrace {
                 "bash_exit_nonzero:{}x",
                 self.bash_exit_nonzero_count
             ));
+        }
+
+        // 4.6) 目标漂移信号(第 128 轮,任务锚点):**强信号**,进入 `is_failed()`。
+        // 扫 tool_call_log 的 args_json 提取实际操作主机,与任务锚点比对。
+        // 实测事故:用户指定 anthropic.com,SubAgent 在目标超时后自行改派 ithome.com
+        // 并"成功"交付,QC 全绿 —— 既有 9 类信号无一能识别"做的是另一个任务"。
+        // 锚点为空(用户未指定站点)时恒不触发,开放任务零影响。
+        if let Some(anchor) = anchor.filter(|a| !a.is_empty()) {
+            let calls: Vec<(String, String)> = self
+                .tool_call_log
+                .iter()
+                .map(|e| (e.tool.clone(), e.args_json.clone()))
+                .collect();
+            let drifted = crate::agent::safety::detect_target_drift(&calls, anchor);
+            if !drifted.is_empty() {
+                signals.push(format!(
+                    "target_drift:{}(anchor={})",
+                    drifted.join(","),
+                    anchor.hosts.join(",")
+                ));
+            }
         }
 
         // 5) 没有命中任何失败信号时记 "ok" 占位,便于下游聚合
@@ -389,10 +423,15 @@ impl ExecutionTrace {
     }
 
     /// 综合失败判定:任一强信号即视为失败。
+    ///
+    /// 第 128 轮:`target_drift` 升为强信号 —— 在错误目标上"成功"交付比失败更糟
+    /// (实测事故:漂移产出被 QC 判 ✅、被 SessionContext 记「✅ 成功」写入长期记忆,
+    /// 污染后续会话),必须让执行层判定为失败并回流。
     pub fn is_failed(&self) -> bool {
         self.failure_signals.iter().any(|s| {
             s.starts_with("early_terminate:")
                 || s.starts_with("high_error_rate:")
+                || s.starts_with("target_drift:")
                 || s == "text_failure_phrase"
         })
     }
@@ -606,6 +645,115 @@ mod tests {
         t.collect_failure_signals("正常输出");
         assert_eq!(t.failure_signals, vec!["ok"]);
         assert!(!t.is_failed());
+    }
+
+    // ========== 第 128 轮:目标漂移(target_drift)强信号 ==========
+
+    fn web_trace_with_url(url: &str) -> ExecutionTrace {
+        let mut t = ExecutionTrace::default();
+        t.tool_call_log.push(ToolCallLogEntry {
+            tool: "MCP_Web_Use".to_string(),
+            args_json: format!(r#"{{"action":"open","url":"{url}"}}"#),
+            ok: true,
+            output_bytes: 200,
+            elapsed_ms: 900,
+            error_summary: String::new(),
+            output_summary: String::new(),
+        });
+        t.tool_calls = 1;
+        t.tool_calls_ok = 1;
+        t
+    }
+
+    fn anchor_on(host: &str) -> crate::agent::safety::TargetAnchor {
+        crate::agent::safety::TargetAnchor {
+            hosts: vec![host.to_string()],
+            raw_urls: vec![format!("https://{host}/")],
+            unresolved_reference: false,
+            unresolved_evidence: String::new(),
+        }
+    }
+
+    #[test]
+    fn target_drift_flags_off_anchor_navigation() {
+        // 事故复现:锚点 anthropic.com,实际开了 ithome.com
+        let mut t = web_trace_with_url("https://www.ithome.com/");
+        t.collect_failure_signals_with_anchor("抓取完成", Some(&anchor_on("anthropic.com")));
+        let drift = t
+            .failure_signals
+            .iter()
+            .find(|s| s.starts_with("target_drift:"))
+            .unwrap_or_else(|| panic!("应打 target_drift 标: {:?}", t.failure_signals));
+        assert!(drift.contains("ithome.com"), "应写出漂移到的主机: {drift}");
+        assert!(drift.contains("anthropic.com"), "应写出锚点便于对账: {drift}");
+    }
+
+    #[test]
+    fn target_drift_is_strong_signal_and_fails_trace() {
+        // 在错误目标上"成功"交付必须判失败(否则会被 QC/SessionContext 记为成功)
+        let mut t = web_trace_with_url("https://www.ithome.com/");
+        t.collect_failure_signals_with_anchor("抓取完成", Some(&anchor_on("anthropic.com")));
+        assert!(t.is_failed(), "target_drift 必须是强信号");
+        assert!(
+            !t.failure_signals.iter().any(|s| s == "ok"),
+            "有漂移时不得出现 ok 占位: {:?}",
+            t.failure_signals
+        );
+    }
+
+    #[test]
+    fn target_drift_silent_when_host_in_anchor() {
+        let mut t = web_trace_with_url("https://news.anthropic.com/x");
+        t.collect_failure_signals_with_anchor("抓取完成", Some(&anchor_on("anthropic.com")));
+        assert!(
+            !t.failure_signals.iter().any(|s| s.starts_with("target_drift:")),
+            "锚点内子域不得误判漂移: {:?}",
+            t.failure_signals
+        );
+        assert!(!t.is_failed());
+    }
+
+    #[test]
+    fn target_drift_never_fires_without_anchor() {
+        // 开放任务(用户没指定站点)→ 自主选择站点不判漂移
+        let mut t = web_trace_with_url("https://www.ithome.com/");
+        t.collect_failure_signals_with_anchor("抓取完成", None);
+        assert!(
+            !t.failure_signals.iter().any(|s| s.starts_with("target_drift:")),
+            "无锚点不得打标: {:?}",
+            t.failure_signals
+        );
+        let mut t2 = web_trace_with_url("https://www.ithome.com/");
+        t2.collect_failure_signals_with_anchor(
+            "抓取完成",
+            Some(&crate::agent::safety::TargetAnchor::default()),
+        );
+        assert!(
+            !t2.failure_signals.iter().any(|s| s.starts_with("target_drift:")),
+            "空锚点不得打标: {:?}",
+            t2.failure_signals
+        );
+    }
+
+    #[test]
+    fn target_drift_ignores_non_web_tools() {
+        // Bash 里的 curl 探测(常见于连通性预检)不应被判成漂移
+        let mut t = ExecutionTrace::default();
+        t.tool_call_log.push(ToolCallLogEntry {
+            tool: "Bash".to_string(),
+            args_json: r#"{"command":"curl -sI https://www.ithome.com/"}"#.to_string(),
+            ok: true,
+            output_bytes: 50,
+            elapsed_ms: 300,
+            error_summary: String::new(),
+            output_summary: String::new(),
+        });
+        t.collect_failure_signals_with_anchor("完成", Some(&anchor_on("anthropic.com")));
+        assert!(
+            !t.failure_signals.iter().any(|s| s.starts_with("target_drift:")),
+            "非浏览器工具不参与主机比对: {:?}",
+            t.failure_signals
+        );
     }
 
     /// 第 106 轮:重复工具调用序列检测
