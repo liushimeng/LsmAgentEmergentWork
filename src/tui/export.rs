@@ -31,8 +31,8 @@ fn local_datetime(fmt: &str) -> String {
         .expect("fmt")
 }
 
-/// 当前本地时间 HH:MM:SS(transcript 轮次时间戳)。
-pub fn now_clock() -> String {
+/// 格式化当前本地时间为 `HH:MM:SS`(transcript 轮次时间戳;旧名 `now_clock`)。
+pub fn format_current_time() -> String {
     local_datetime("[hour]:[minute]:[second]")
 }
 
@@ -510,8 +510,8 @@ mod tests {
 
     #[test]
     fn time_helpers_shapes() {
-        assert_eq!(now_clock().len(), 8); // HH:MM:SS
-        assert!(now_clock().matches(':').count() == 2);
+        assert_eq!(format_current_time().len(), 8); // HH:MM:SS
+        assert!(format_current_time().matches(':').count() == 2);
         assert_eq!(now_export_stamp().len(), 15); // YYYYMMDD-HHMMSS
         assert_eq!(now_export_human().len(), 19); // YYYY-MM-DD HH:MM:SS
     }

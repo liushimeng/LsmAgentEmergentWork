@@ -610,13 +610,13 @@ impl TuiSession {
             println!(
                 "    {:<16} {:<14} {:<10} {:<10} {:>7} {:>10} {:<19} {}",
                 r.run_id,
-                crate::tui::format::truncate_chars(&r.agent_type, 14),
+                crate::tui::format::clip_cols(&r.agent_type, 14),
                 r.status,
                 r.origin,
                 r.wallclock_ms,
                 format!("{}/{}", r.input_tokens, r.output_tokens),
                 r.created_at,
-                crate::tui::format::truncate_chars(r.task.trim(), 40),
+                crate::tui::format::clip_cols(r.task.trim(), 40),
             );
         }
         let orphans = dynsub::count_orphans(scope);

@@ -10,6 +10,8 @@
 //! - 退出路径(Ctrl-D / `/exit` → teardown_pinned)还原滚动区并清空面板,不留残迹。
 use crate::tui::completion::{CompletionEngine, CompletionItem};
 use crate::tui::mention::{mention_token_at, FileSuggester};
+use crate::tui::paste;
+use crate::tui::textfit;
 use crate::tui::theme;
 use crossterm::{
     cursor::MoveTo,
@@ -40,31 +42,21 @@ fn prev_char_boundary(s: &str, cursor: usize) -> usize {
     i
 }
 
-/// 单字符近似显示宽度(列数):CJK / 全角 / 谚文按 2 列,其余按 1 列。
+/// 单字符近似显示宽度(列数)—— 转发 [`textfit::char_width`]。
+///
+/// 2026-09-24:宽度表唯一真源下移到 `textfit`(盒线渲染与输入行光标列号换算必须
+/// 用同一套度量,否则横幅按 A 算、输入行按 B 算,同一字符两处错位)。
+/// `LAEW_AMBIGUOUS_WIDE=1` 的歧义宽度策略因此对**输入行**同样生效。
 pub fn char_width(c: char) -> u16 {
-    let cp = c as u32;
-    if (0x1100..=0x115F).contains(&cp)       // 谚文 Jamo
-        || (0x2E80..=0xA4CF).contains(&cp)    // CJK 部首 ~ 彝文(含 4E00-9FFF 统一汉字)
-        || (0xAC00..=0xD7A3).contains(&cp)    // 谚文音节
-        || (0xF900..=0xFAFF).contains(&cp)    // CJK 兼容表意
-        || (0xFE30..=0xFE4F).contains(&cp)    // CJK 兼容形式
-        || (0xFF00..=0xFF60).contains(&cp)    // 全角 ASCII / 假名
-        || (0xFFE0..=0xFFE6).contains(&cp)
-    {
-        2
-    } else {
-        1
-    }
+    textfit::char_width(c)
 }
 
-/// 近似显示宽度(列数):CJK / 全角 / 谚文按 2 列,其余按 1 列。
+/// 近似显示宽度(列数),饱和到 `u16::MAX` 避免超长输入溢出。
 ///
-/// 不引入 `unicode-width` 依赖的轻量近似,仅用于光标列号换算;
-/// 覆盖常用 CJK 区段,边缘字符(组合符等)按 1 列处理,可接受。
-/// 饱和到 u16::MAX,避免超长输入溢出。
+/// 不引入 `unicode-width` 依赖的轻量近似:覆盖常用 CJK 区段,
+/// 边缘字符(组合符等)按 1 列处理,可接受。
 pub fn display_width(s: &str) -> u16 {
-    let w: u32 = s.chars().map(|c| char_width(c) as u32).sum();
-    w.min(u16::MAX as u32) as u16
+    textfit::width(s).min(u16::MAX as usize) as u16
 }
 
 /// 从头截取不超过 `max` 显示列的子串(不在双宽字符中间截断)。
@@ -98,146 +90,6 @@ fn visible_window(s: &str, cursor: usize, avail: u16) -> (usize, u16) {
     (start, display_width(&s[start..cursor]))
 }
 
-// ========== D6 大粘贴防护(2026-09-10 第二十二轮) ==========
-//
-// 方案:`tmpPlan/2026-09-10_02-D6大粘贴防护与快速输入批量合并方案.md`
-// 参考:pi editor.ts handlePaste(>10 行或 >1000 字符 → marker,提交注入原文,L1573)
-//      + claudecode inputPaste.ts(TRUNCATION_THRESHOLD=10000,首 500+尾 500 截断,L1448)
-
-/// 粘贴转 marker 阈值:超过此行数(对齐 pi handlePaste)。
-const PASTE_MARKER_MAX_LINES: usize = 10;
-/// 粘贴转 marker 阈值:超过此字符数(对齐 pi handlePaste)。
-const PASTE_MARKER_MAX_CHARS: usize = 1000;
-/// 提交注入截断阈值:单份粘贴超过此字符数时截断注入(对齐 claudecode TRUNCATION_THRESHOLD)。
-const PASTE_TRUNCATE_CHARS: usize = 10000;
-/// 截断注入保留首/尾字符数(对齐 claudecode PREVIEW_LENGTH/2)。
-const PASTE_KEEP_HEAD_CHARS: usize = 500;
-const PASTE_KEEP_TAIL_CHARS: usize = 500;
-
-/// 从头截取不超过 `n` 个字符的子串(char 边界安全,不在多字节字符中间截断)。
-fn head_chars(s: &str, n: usize) -> &str {
-    match s.char_indices().nth(n) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}
-
-/// 从尾截取不超过 `n` 个字符的子串(char 边界安全)。
-fn tail_chars(s: &str, n: usize) -> &str {
-    let total = s.chars().count();
-    if total <= n {
-        return s;
-    }
-    match s.char_indices().nth(total - n) {
-        Some((idx, _)) => &s[idx..],
-        None => s,
-    }
-}
-
-/// 粘贴登记簿:生命周期 = 单次 read_line 调用,提交即展开。
-///
-/// 大粘贴不进输入行(避免 1000 行淹没编辑器 + 逐帧 O(N) 宽度换算卡顿),
-/// 输入行只显示 `[粘贴 #N +M 行]` / `[粘贴 #N M 字符]` marker;
-/// 提交时精确匹配 marker 展开还原原文(pi paste ID 校验思想:
-/// 被用户编辑损坏的 marker 不匹配、原样保留)。
-struct PasteRegistry {
-    counter: usize,
-    /// (marker, 完整原文)
-    entries: Vec<(String, String)>,
-}
-
-impl PasteRegistry {
-    fn new() -> Self {
-        Self {
-            counter: 0,
-            entries: Vec::new(),
-        }
-    }
-
-    /// 过滤粘贴文本:先做换行归一化(CRLF/CR → LF),再剔除其余控制字符(保留 \n 与 \t)。
-    ///
-    /// 换行归一化的必要性(2026-09-10 第 23 轮实测):tmux 的 bracketed paste 把
-    /// 粘贴内容按按键语义回放,LF 全部转为 CR(LF=0/CR=N,探针 hex 取证);桌面终端
-    /// 则保留 LF/CRLF。若不归一化,CR 会在下方控制字符过滤中被剔除,换行信息全丢 →
-    /// 大粘贴行数判定恒为 1 行、marker 永不触发,小粘贴「换行转空格」归一也失效,
-    /// 内容被拼成一行(D6 防护在 tmux 下完全失效)。
-    fn filter(text: &str) -> String {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        normalized
-            .chars()
-            .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
-            .collect()
-    }
-
-    /// 判定是否为大粘贴(>10 行或 >1000 字符,对齐 pi handlePaste)。
-    fn is_large(filtered: &str) -> bool {
-        filtered.matches('\n').count() + 1 > PASTE_MARKER_MAX_LINES
-            || filtered.chars().count() > PASTE_MARKER_MAX_CHARS
-    }
-
-    /// 登记大粘贴,返回输入行用 marker。
-    fn register(&mut self, content: String) -> String {
-        self.counter += 1;
-        let lines = content.matches('\n').count() + 1;
-        let marker = if lines > PASTE_MARKER_MAX_LINES {
-            format!("[粘贴 #{} +{} 行]", self.counter, lines)
-        } else {
-            format!("[粘贴 #{} {} 字符]", self.counter, content.chars().count())
-        };
-        self.entries.push((marker.clone(), content));
-        marker
-    }
-
-    /// 提交时展开:精确匹配 marker → 原文;单份 >10000 字符截断为
-    /// 首 500 + 省略标注 + 尾 500(claudecode inputPaste 语义,防超大粘贴打爆上下文)。
-    /// marker 被编辑损坏/编号未知则不展开,原样保留。
-    fn expand(&self, buffer: &str) -> String {
-        let mut out = buffer.to_string();
-        for (marker, content) in &self.entries {
-            if !out.contains(marker.as_str()) {
-                continue;
-            }
-            let inject = Self::truncate_for_inject(content);
-            out = out.replace(marker.as_str(), &inject);
-        }
-        out
-    }
-
-    /// 截断注入:超过阈值保留首尾各 500 字符,中间以省略标注替换。
-    fn truncate_for_inject(content: &str) -> String {
-        let total = content.chars().count();
-        if total <= PASTE_TRUNCATE_CHARS {
-            return content.to_string();
-        }
-        let omitted = total - PASTE_KEEP_HEAD_CHARS - PASTE_KEEP_TAIL_CHARS;
-        format!(
-            "{}\n[...中间省略 {} 字符...]\n{}",
-            head_chars(content, PASTE_KEEP_HEAD_CHARS),
-            omitted,
-            tail_chars(content, PASTE_KEEP_TAIL_CHARS),
-        )
-    }
-}
-
-/// 粘贴入缓冲区的结果。
-enum PasteInsert {
-    /// 小粘贴:归一化文本直接插入(\n/\t 已转空格,单行输入语义)。
-    Inline(String),
-    /// 大粘贴:已登记,插入 marker。
-    Marker(String),
-}
-
-/// 粘贴统一入口:过滤 → 大小判定 → 归一化插入或登记 marker。
-fn handle_paste_text(text: &str, registry: &mut PasteRegistry) -> PasteInsert {
-    let filtered = PasteRegistry::filter(text);
-    if PasteRegistry::is_large(&filtered) {
-        PasteInsert::Marker(registry.register(filtered))
-    } else {
-        // 单行输入语义:\n/\t 归一为空格,避免换行被渲染成乱码
-        PasteInsert::Inline(filtered.replace(['\n', '\t'], " "))
-    }
-}
-
 // ========== 第 93 轮:无 bracketed paste 终端的 Enter 粘贴突发探测 ==========
 //
 // 背景(实测 llaew_20260919_121348.log):Windows conhost / 不支持 bracketed paste
@@ -246,7 +98,7 @@ fn handle_paste_text(text: &str, registry: &mut PasteRegistry) -> PasteInsert {
 // 逐条提交(微信聊天任务被截成「打开窗口保持10分钟」的主根因)。
 // 本探测在 Enter 提交前检查输入队列:粘贴的后续行此刻必然已排在终端输入缓冲里,
 // Enter 之后还有排队事件 → 判定为粘贴突发,Enter 按换行处理不提交,整段经 D6
-// 粘贴管线进 buffer(小粘贴归一化 / 大粘贴 [粘贴 #N] marker),最后一次 Enter
+// 粘贴管线进 buffer(小粘贴直插 / 多粘贴 [粘贴 #N] marker),最后一次 Enter
 // (队列已空)或用户复查后再按 Enter 才提交完整提示词。
 // 人类击键间隔 ≫15ms,正常单击 Enter 队列恒空,零误伤;bracketed paste 生效的
 // 终端粘贴整体以 Event::Paste 送达,不经本路径。
@@ -598,8 +450,8 @@ impl InputHandler {
         let mut overlay_lines: u16 = 0;
         // @ 提及补全状态(D1):token 起点 + 懒加载文件建议器
         let mut mention = MentionCompletion::new();
-        // 粘贴登记簿:本次行编辑期间的大粘贴原文(D6,提交时 marker 展开)
-        let mut pastes = PasteRegistry::new();
+        // 粘贴登记簿:本次行编辑期间的多行/超长粘贴原文(提交时 marker 展开为原文)
+        let mut pastes = paste::PasteRegistry::new();
         // 批量合并排空时暂存的非字符事件(crossterm 无 pushback,不能丢)
         let mut pending: Option<Event> = None;
 
@@ -629,12 +481,25 @@ impl InputHandler {
             match ev {
                 // bracketed paste:终端粘贴整体送达(D6/L1573)
                 Event::Paste(text) => {
-                    match handle_paste_text(&text, &mut pastes) {
-                        PasteInsert::Inline(s) | PasteInsert::Marker(s) => {
+                    let preview = match paste::handle_paste_text(&text, &mut pastes) {
+                        paste::PasteInsert::Inline(s) => {
                             buffer.insert_str(cursor, &s);
                             cursor += s.len();
+                            None
                         }
-                    }
+                        paste::PasteInsert::Marker(s) => {
+                            buffer.insert_str(cursor, &s);
+                            cursor += s.len();
+                            // 多行/超长粘贴:输入行只放 marker,但用户必须看得见自己粘了什么
+                            // (修 R5 可见性半边)—— 立刻在滚动区回显原文前几行预览。
+                            let content = pastes.last_content();
+                            Some(paste::plan_paste_preview(
+                                &s,
+                                &content,
+                                textfit::term_width_for_render(),
+                            ))
+                        }
+                    };
                     overlay_lines = self.update_completion(
                         &mut stdout,
                         &layout,
@@ -648,6 +513,11 @@ impl InputHandler {
                         engine,
                         &mut mention,
                     )?;
+                    if let Some(lines) = &preview {
+                        self.print_in_scroll_region(&mut stdout, &layout, lines)?;
+                        // 预览动过滚动区底行,重绘输入行确保光标列号与 buffer 一致
+                        self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
+                    }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
@@ -786,7 +656,7 @@ impl InputHandler {
                         // 不支持 bracketed paste 的旧终端逐键粘贴、用户手按 Ctrl-J
                         // 都会到达这里;落入下方 Char(c) 兜底会把字母 j 插入输入缓冲,
                         // 污染多行提示词(实测「slow.py:\n用」回显成「slow.py:j用」)。
-                        // 语义与 PasteInsert::Inline 的单行归一(\n → 空格)对齐。
+                        // 语义与 paste::PasteInsert::Inline 的单行归一(\n → 空格)对齐。
                         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             buffer.insert(cursor, ' ');
                             cursor += 1;
@@ -942,12 +812,26 @@ impl InputHandler {
                                                 );
                                             }
                                             let paste_text = format!("\n{burst}");
-                                            match handle_paste_text(&paste_text, &mut pastes) {
-                                                PasteInsert::Inline(s) | PasteInsert::Marker(s) => {
-                                                    buffer.insert_str(cursor, &s);
-                                                    cursor += s.len();
-                                                }
-                                            }
+                                            let preview =
+                                                match paste::handle_paste_text(&paste_text, &mut pastes) {
+                                                    paste::PasteInsert::Inline(s) => {
+                                                        buffer.insert_str(cursor, &s);
+                                                        cursor += s.len();
+                                                        None
+                                                    }
+                                                    paste::PasteInsert::Marker(s) => {
+                                                        buffer.insert_str(cursor, &s);
+                                                        cursor += s.len();
+                                                        // 同 bracketed paste 路径:整段原文已保真,
+                                                        // 立刻回显预览,不让用户对着一个 marker 猜
+                                                        let content = pastes.last_content();
+                                                        Some(paste::plan_paste_preview(
+                                                            &s,
+                                                            &content,
+                                                            textfit::term_width_for_render(),
+                                                        ))
+                                                    }
+                                                };
                                             overlay_lines = self.update_completion(
                                                 &mut stdout,
                                                 &layout,
@@ -961,6 +845,20 @@ impl InputHandler {
                                                 engine,
                                                 &mut mention,
                                             )?;
+                                            if let Some(lines) = &preview {
+                                                self.print_in_scroll_region(
+                                                    &mut stdout,
+                                                    &layout,
+                                                    lines,
+                                                )?;
+                                                self.redraw_line(
+                                                    &mut stdout,
+                                                    &layout,
+                                                    prompt,
+                                                    &buffer,
+                                                    cursor,
+                                                )?;
+                                            }
                                             continue;
                                         }
                                     }
@@ -1228,10 +1126,37 @@ impl InputHandler {
         Ok(())
     }
 
+    /// 在**滚动区底行**逐行输出:每行 `MoveTo(0, 底行)` + 清行 + `Print` + 换行,
+    /// 靠 DECSTBM 滚动区把旧内容往上推,底部输入面板不受影响。
+    ///
+    /// 粘贴预览与提交回显共用(D6 修 R5 的「可见性」半边)。
+    fn print_in_scroll_region(
+        &self,
+        stdout: &mut impl Write,
+        layout: &Layout,
+        lines: &[String],
+    ) -> io::Result<()> {
+        execute!(stdout, ResetColor, SetForegroundColor(theme::DIM))?;
+        for line in lines {
+            execute!(
+                stdout,
+                MoveTo(0, layout.scroll_last_row()),
+                Clear(ClearType::CurrentLine),
+                Print(line.as_str()),
+                Print("\r\n")
+            )?;
+        }
+        execute!(stdout, ResetColor)?;
+        stdout.flush()
+    }
+
     /// 提交:清浮层 → 滚动区底行回显已提交内容 → 清空面板输入行 → 光标锚定滚动区底行。
     ///
-    /// 回显用 **marker 版** buffer(大粘贴不刷屏),返回的 `Submitted` 为
-    /// **展开还原版**(marker → 原文,超大粘贴截断注入,见 PasteRegistry::expand)。
+    /// 2026-09-24 修 R5:回显改用 **展开版**逐行打印(首行 `>> `、续行 `.. `、
+    /// 折行悬挂缩进,超 `SUBMIT_ECHO_MAX_LINES` 折叠并标注「内容已完整发送」)——
+    /// 旧实现回显的是 marker 版单行 buffer,用户粘贴的多行提示词在屏幕上只剩一行,
+    /// 与「送进模型的到底是什麼」完全对不上。返回的 `Submitted` 仍是展开还原版
+    /// (marker → 原文,超大粘贴截断注入,见 `PasteRegistry::expand`)。
     #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
@@ -1240,27 +1165,20 @@ impl InputHandler {
         prompt: &str,
         buffer: String,
         overlay_lines: u16,
-        pastes: &PasteRegistry,
+        pastes: &paste::PasteRegistry,
     ) -> io::Result<InputResult> {
         self.clear_overlay(stdout, layout, overlay_lines)?;
-        // 回显到滚动区底行(保留用户输入痕迹,随历史输出一起滚动;
-        // 大粘贴只回显 marker,避免 1000 行原文淹没对话区)
-        execute!(
-            stdout,
-            MoveTo(0, layout.scroll_last_row()),
-            ResetColor,
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme::DIM),
-            Print(format!("{prompt}{buffer}")),
-            Print("\r\n"),
-            ResetColor,
-        )?;
+        // 回显到滚动区底行(保留用户输入痕迹,随历史输出一起滚动):
+        // 展开版逐行回显,多行提示词在屏幕上完整可读,不再只剩首行。
+        let expanded = pastes.expand(&buffer);
+        let echo = paste::plan_submit_echo(prompt, &expanded, textfit::term_width_for_render());
+        self.print_in_scroll_region(stdout, layout, &echo)?;
         // 面板输入行清空(组件常显)
         self.redraw_line(stdout, layout, prompt, "", 0)?;
         // 输出光标锚定滚动区底行,后续 println! 任务输出在滚动区内滚动
         execute!(stdout, MoveTo(0, layout.scroll_last_row()))?;
         stdout.flush()?;
-        Ok(InputResult::Submitted(pastes.expand(&buffer)))
+        Ok(InputResult::Submitted(expanded))
     }
 
     /// 绘制补全浮层(面板上方,向上排布),返回占用行数。
@@ -1414,6 +1332,8 @@ impl Default for InputHandler {
 
 #[cfg(test)]
 mod tests {
+    // 粘贴层已拆到 paste.rs(D6 修 R5 后 input.rs 超 1800 行);突发管线用例仍留本文件,按需引入
+    use crate::tui::paste::{PasteInsert, PasteRegistry, handle_paste_text};
     use super::*;
 
     #[test]
@@ -1544,89 +1464,35 @@ mod tests {
 
     // ========== D6 大粘贴防护(2026-09-10 第二十二轮,L1573+L1448) ==========
 
-    #[test]
-    fn paste_filter_strips_control_chars_keeps_newline() {
-        assert_eq!(PasteRegistry::filter("a\x07b\x01c\nd"), "abc\nd");
-        assert_eq!(PasteRegistry::filter("\x1b[31m红\x1b[0m"), "[31m红[0m");
-        assert_eq!(PasteRegistry::filter("正常文本"), "正常文本");
-    }
+
+
+
+
+
+
+
+
+
 
     #[test]
-    fn paste_filter_normalizes_cr_and_crlf_to_lf() {
-        // tmux bracketed paste 把 LF 转为 CR 按键语义回放(第 23 轮探针取证 LF=0/CR=N):
-        // CR 必须归一为 LF,否则行数判定恒 1、marker 永不触发,内容拼成一行。
-        assert_eq!(PasteRegistry::filter("a\r\nb\rc"), "a\nb\nc");
-        // 纯 CR 多行 → 大粘贴行数判定依据
-        let tmux_paste: String = (1..=15).map(|i| format!("第{i}行\r")).collect();
-        assert_eq!(PasteRegistry::filter(&tmux_paste).matches('\n').count(), 15);
-    }
-
-    #[test]
-    fn large_paste_with_tmux_cr_newlines_gets_marker() {
-        // 复现本轮 Bug:15 行粘贴以 CR 分隔(tmux 实际形态)必须触发 marker
-        let mut reg = PasteRegistry::new();
-        let tmux_text: String = (1..=15)
-            .map(|i| format!("第{i}行:大粘贴防护测试内容-{i}"))
-            .collect::<Vec<_>>()
-            .join("\r");
-        match handle_paste_text(&tmux_text, &mut reg) {
-            PasteInsert::Marker(m) => assert_eq!(m, "[粘贴 #1 +15 行]"),
-            PasteInsert::Inline(_) => panic!("tmux CR 形态 15 行粘贴应转 marker"),
+    fn 输入行与横幅共用同一宽度真源() {
+        // char_width 已下移到 textfit:两处必须给出同样的列数,否则横幅按 A 算、
+        // 输入行按 B 算,同一字符在两个位置错位。
+        for s in ["Online ✓", "取消任务确认", "llaew_20260924_123508.log", "中文 abc"] {
+            assert_eq!(display_width(s) as usize, textfit::width(s), "度量分叉: {s}");
         }
-        // 展开注入的原文应含 LF 归一化后的完整行
-        let expanded = reg.expand("[粘贴 #1 +15 行]");
-        assert_eq!(expanded.matches('\n').count(), 14);
-    }
-
-    #[test]
-    fn small_paste_inline_newline_tab_become_space() {
-        let mut reg = PasteRegistry::new();
-        match handle_paste_text("第一行\n第二列\tend", &mut reg) {
-            PasteInsert::Inline(s) => assert_eq!(s, "第一行 第二列 end"),
-            PasteInsert::Marker(_) => panic!("小粘贴不应转 marker"),
-        }
-        assert!(reg.entries.is_empty());
-    }
-
-    #[test]
-    fn large_paste_by_lines_gets_marker() {
-        let mut reg = PasteRegistry::new();
-        let text = (1..=11)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        match handle_paste_text(&text, &mut reg) {
-            PasteInsert::Marker(m) => assert_eq!(m, "[粘贴 #1 +11 行]"),
-            PasteInsert::Inline(_) => panic!("11 行应转 marker"),
-        }
-        assert_eq!(reg.entries.len(), 1);
-    }
-
-    #[test]
-    fn large_paste_by_chars_gets_marker() {
-        let mut reg = PasteRegistry::new();
-        let text = "a".repeat(1001); // 单行超 1000 字符
-        match handle_paste_text(&text, &mut reg) {
-            PasteInsert::Marker(m) => assert_eq!(m, "[粘贴 #1 1001 字符]"),
-            PasteInsert::Inline(_) => panic!("1001 字符应转 marker"),
+        assert_eq!(char_width('中'), 2);
+        assert_eq!(char_width('a'), 1);
+        // 歧义字符:默认 1 列(与改造前逐字节一致);LAEW_AMBIGUOUS_WIDE=1 时 2 列
+        if textfit::ambiguous_wide() {
+            assert_eq!(textfit::width("✓"), 2, "歧义开关未生效");
+        } else {
+            assert_eq!(textfit::width("Online ✓"), 8);
         }
     }
 
-    #[test]
-    fn paste_counter_increments() {
-        let mut reg = PasteRegistry::new();
-        let text = "a".repeat(2000);
-        let m1 = match handle_paste_text(&text, &mut reg) {
-            PasteInsert::Marker(m) => m,
-            _ => panic!(),
-        };
-        let m2 = match handle_paste_text(&text, &mut reg) {
-            PasteInsert::Marker(m) => m,
-            _ => panic!(),
-        };
-        assert!(m1.contains("#1"));
-        assert!(m2.contains("#2"));
-    }
+
+
 
     // ========== Tab/Enter + 补全菜单决策(2026-09-10 第 24 轮 Enter 吞键修复) ==========
 
@@ -1711,68 +1577,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn expand_restores_marker_to_original() {
-        let mut reg = PasteRegistry::new();
-        let text = "x".repeat(2000);
-        let marker = reg.register(text.clone());
-        let buf = format!("帮我分析 {marker} 谢谢");
-        let expanded = reg.expand(&buf);
-        assert_eq!(expanded, format!("帮我分析 {text} 谢谢"));
-    }
 
-    #[test]
-    fn expand_truncates_oversized_paste() {
-        let mut reg = PasteRegistry::new();
-        let text = "0123456789".repeat(1200); // 12000 字符 > 10000 阈值
-        let marker = reg.register(text.clone());
-        let expanded = reg.expand(&format!("数据:{marker}"));
-        assert!(expanded.contains("[...中间省略 11000 字符...]"));
-        assert!(expanded.starts_with("数据:0123456789"));
-        // 尾 500 字符保留
-        assert!(expanded.ends_with("0123456789"));
-        // 总长 ≈ 前缀 + 500 + 标注 + 500,远小于原文
-        assert!(expanded.chars().count() < 1200);
-    }
 
-    #[test]
-    fn expand_keeps_damaged_or_unknown_marker_as_is() {
-        let mut reg = PasteRegistry::new();
-        let marker = reg.register("y".repeat(2000));
-        // 用户删了 marker 尾括号 → 不匹配,原样保留
-        let damaged = marker.trim_end_matches(']').to_string();
-        let buf = format!("看 {damaged}");
-        assert_eq!(reg.expand(&buf), buf);
-        // 未知编号 → 原样保留
-        let buf2 = "看 [粘贴 #99 +5 行]".to_string();
-        assert_eq!(reg.expand(&buf2), buf2);
-    }
 
-    #[test]
-    fn expand_marker_removed_by_user_no_residue() {
-        let mut reg = PasteRegistry::new();
-        let _marker = reg.register("z".repeat(2000));
-        // 用户把 marker 整段删了再提交 → 展开为空串,registry 内容不泄漏
-        assert_eq!(reg.expand(""), "");
-    }
 
-    #[test]
-    fn head_tail_chars_char_boundary_safe() {
-        let s = "中文测试abcdef";
-        assert_eq!(head_chars(s, 2), "中文");
-        assert_eq!(tail_chars(s, 3), "def");
-        assert_eq!(head_chars(s, 100), s);
-        assert_eq!(tail_chars(s, 100), s);
-        assert_eq!(head_chars("", 5), "");
-    }
 
-    #[test]
-    fn truncate_for_inject_below_threshold_passthrough() {
-        let s = "短文本";
-        assert_eq!(PasteRegistry::truncate_for_inject(s), s);
-        let exact = "a".repeat(PASTE_TRUNCATE_CHARS);
-        assert_eq!(PasteRegistry::truncate_for_inject(&exact), exact);
-    }
 
     // ========== 第 93 轮:Enter 粘贴突发探测(burst_events_to_text 纯函数) ==========
 
@@ -1894,24 +1703,26 @@ mod tests {
         assert!(matches!(decide("  "), CtrlCDecision::Interrupt)); // 有内容(空格)也中断
     }
 
-    /// 端到端语义:突发文本经 D6 管线,>10 行 → marker / 小粘贴归一 → 空格。
+    /// 端到端语义:突发文本经 D6 管线 —— 多行 → marker 保真;
+    /// 单行突发(段首那个代表 Enter 的换行)→ 直插,不套噪声 marker。
     #[test]
     fn burst_text_feeds_paste_pipeline() {
         let mut reg = PasteRegistry::new();
-        // 12 行任务书突发(首行已在 buffer,突发含 11 次行间换行)> 10 行阈值 → marker
+        // 12 行任务书突发(每段前带一个行间换行)→ marker 且登记原文
         let burst: String = (1..=12)
             .map(|i| format!("\n{i}. 任务步骤{i}"))
             .collect();
         match handle_paste_text(&burst, &mut reg) {
             PasteInsert::Inline(s) => panic!("12 行应转 marker,实际 Inline: {s}"),
             PasteInsert::Marker(m) => {
-                assert!(m.starts_with("[粘贴 #1 +"), "marker 应带行数: {m}")
+                assert_eq!(m, "[粘贴 #1 +12 行]", "marker 应带行数")
             }
         }
-        // 小突发(1 个换行)→ 归一为空格直接插入
+        assert_eq!(reg.expand("[粘贴 #1 +12 行]").lines().count(), 12, "突发原文行数应保真");
+        // 单行突发:前导换行是「刚按下的 Enter」,剔除后按单行直插
         match handle_paste_text("\n第二行", &mut reg) {
-            PasteInsert::Inline(s) => assert_eq!(s, " 第二行"),
-            PasteInsert::Marker(m) => panic!("小粘贴不应转 marker: {m}"),
+            PasteInsert::Inline(s) => assert_eq!(s, "第二行", "前导换行不应进入 buffer: {s:?}"),
+            PasteInsert::Marker(m) => panic!("单行突发不应转 marker: {m}"),
         }
     }
 }

@@ -25,10 +25,11 @@ use crate::agent::offline_queue::OfflineQueue;
 use crate::agent::orchestrator::MultiAgentOrchestrator;
 use crate::agent::todo_state::{TodoState, global_or_init};
 use crate::config::{Db, Paths};
-use crate::llm::{client_from_record, ChatMessage, Connectivity, ConnectivityTracker};
+use crate::llm::{client_from_record, ChatMessage, ConnectivityTracker};
 use crate::session::Session;
 
 pub mod audit_view;
+pub mod banner;
 pub mod branches;
 pub mod commands;
 pub mod completion;
@@ -36,9 +37,11 @@ pub mod engine;
 pub mod export;
 pub mod form;
 pub mod mention;
+pub mod paste;
 pub mod pathfmt;
 pub mod render;
 pub mod screen;
+pub mod textfit;
 pub mod theme;
 
 mod dispatch;
@@ -52,7 +55,7 @@ mod slash;
 use branches::BranchStore;
 use completion::CompletionEngine;
 use export::TranscriptEntry;
-use format::{fit_display, print_record, read_line_prompt};
+use format::{print_record, read_line_prompt};
 use input::{InputHandler, InputResult};
 
 /// TUI 启动参数(第 72 轮,2026-09-17):横幅「启动时间」「日志文件」行的数据源。
@@ -197,6 +200,13 @@ impl TuiSession {
         Ok(())
     }
 
+    /// 打印启动横幅(首屏状态盒)。
+    ///
+    /// 2026-09-24 改造:本函数只负责**采集状态**,排版交给 `banner::render` ——
+    /// 盒宽按 `min(内容自然宽, 终端可用宽)` 自适应,所有行严格等宽,超长值折行续排
+    /// 而非砍尾(旧实现边框写死 58 内宽 + 每行 45/46 独立预算,行宽 59~61 参差且
+    /// 宽终端上照样截断 endpoint/长路径)。方案见
+    /// `tmpPlan/2026-09-24_02-TUI显示信息完整化与宽度自适应方案.md`。
     pub fn print_banner(&self) {
         let active = self
             .db
@@ -205,189 +215,81 @@ impl TuiSession {
             .get_active_or_env()
             .ok()
             .flatten();
-        println!("╔══════════════════════════════════════════════════════════╗");
-        println!(
-            "║  LsmAgentEmergentWork  ·  laew  TUI  ·  v{}           ║",
-            env!("CARGO_PKG_VERSION")
-        );
-        println!(
-            "║  编译时间: {}                          ║",
-            env!("LAEW_BUILD_TIME")
-        );
-        // 第 72 轮(2026-09-17):启动时刻行 —— main 最早期捕获,与日志文件名时间戳同刻;
-        // humanize_compact 把 YYYYMMDD-HHMMSS 转为 YYYY-MM-DD HH:MM:SS(与编译时间同宽)。
-        println!(
-            "║  启动时间: {}                          ║",
-            export::humanize_compact(&self.startup_ts)
-        );
-        println!("╠══════════════════════════════════════════════════════════╣");
-        println!(
-            "║  根目录 : {} ║",
-            fit_display(&self.paths.root_dir.display().to_string(), 46)
-        );
-        println!(
-            "║  工作目录: {} ║",
-            fit_display(&self.paths.work_dir.display().to_string(), 45)
-        );
-        // 项目说明文件状态(纯探测,不触发生成;发现规则见 docs/Yolo项目上下文注入/)
-        let doc_source = crate::agent::project_context::probe(&self.paths.work_dir);
-        println!("║  项目说明: {} ║", fit_display(doc_source.as_str(), 45));
-        // 工作区感知(D4,2026-09-13):工程类型 + git 分支/变更,与注入给模型的一致
-        let ws = crate::agent::workspace::snapshot(&self.paths.work_dir);
-        println!(
-            "║  工作区 : {} ║",
-            fit_display(&Self::workspace_status_line(&ws), 45)
-        );
-        // 第 71 轮:未配置状态复用给下方连接行(见 conn_line 注释)
+        // 第 71 轮:未配置状态复用给连接行(见 connectivity 字段注释)
         let has_active = active.is_some();
-        match &active {
-            Some(r) => println!(
-                "║  当前模型: {} ║",
-                fit_display(
-                    &format!(
-                        "[{}] {}/{} @ {}",
-                        r.protocol.as_str(),
-                        r.provider_name,
-                        r.model_name,
-                        r.end_point
-                    ),
-                    45,
-                )
+        let model_line = match &active {
+            Some(r) => format!(
+                "[{}] {}/{} @ {}",
+                r.protocol.as_str(),
+                r.provider_name,
+                r.model_name,
+                r.end_point
             ),
-            None => println!(
-                "║  当前模型: {} ║",
-                fit_display("<未配置, 使用 /provider add 添加>", 45)
-            ),
-        }
-        // 第 73 轮:私网探测提示 —— 当 current provider 指向 loopback/私网且
-        // allow_private_endpoint=false 时,在 Session 行前插入可执行的 escape hatch,
-        // 避免用户提交任务后才在 `URL 不安全` 报错里第一次知道有这个问题。
-        if let Some(r) = &active {
-            if !r.allow_private_endpoint
-                && crate::agent::safety::url_safety::probe_is_private(&r.end_point)
-            {
-                let warn = format!(
-                    "{}  ← SSRF 拦截将在任务时触发",
-                    r.end_point
-                );
-                let unlock = format!(
-                    "laew provider allow-private {}  (然后重启 laew)",
-                    r.id
-                );
-                println!("║  ⚠ 私网 : {} ║", fit_display(&warn, 45));
-                println!("║  解  锁 : {} ║", fit_display(&unlock, 45));
-            }
-        }
-        println!("║  Session: {} ║", fit_display(&self.session.id, 46));
-        // D12 主题提示行(2026-09-10 第二十三轮):告知用户当前主题与切换方式
-        let active_theme = crate::tui::theme::active_kind();
-        println!(
-            "║  主  题 : {} ║",
-            fit_display(
-                &format!("{}  (切换 /theme [kind])", active_theme.as_str()),
-                46
-            )
-        );
-        // D13 离线模式(2026-09-11):连接状态行。
-        // 2026-09-17 第 71 轮:未配置接入记录时,ConnectivityTracker 的「Online ✓」
-        // 只反映网络不反映配置,会误导用户以为链路可用;此时连接行直接呈现未配置
-        // 状态与操作指引,让横幅自身就能解释「为什么任务不执行」。
-        let conn_line = if has_active {
-            Self::connectivity_status_line(&self.connectivity, &self.offline_queue)
-        } else {
-            "未配置(先 /provider add)".to_string()
+            None => "<未配置, 使用 /provider add 添加>".to_string(),
         };
-        println!("║  连  接 : {} ║", fit_display(&conn_line, 45));
-        // TODO 任务清单进度(2026-09-21 第二十轮候选 5):仅在有 todo 时显示,
-        // 空列表时静默(避免横幅噪声)。形如 `[✓]3 [→]1 [○]2 · last "xxx"`。
-        let todo_summary = self.todo_state.summary_line();
-        if !todo_summary.is_empty() {
-            println!(
-                "║  任  务 : {} ║",
-                fit_display(&todo_summary, 45)
-            );
-        }
-        // 第 72 轮(2026-09-17):`--debug`/`--info` 启动时展示运行日志文件落点,
-        // /clear /new 重印横幅仍可见(会话内随时能找到日志);未开启时不显示该行。
-        if let Some(log) = &self.agent_log {
-            println!(
-                "║  日志文件: {} ║",
-                fit_display(&Self::log_banner_text(&self.paths, log), 45)
-            );
-        }
-        println!("╚══════════════════════════════════════════════════════════╝");
-        println!("  输入提示词开始对话, 输入 / 查看可用命令。");
-        println!("  快捷键: ↑↓ 选择补全  Enter 提交  Esc 关闭补全  Ctrl-D 退出  Ctrl-C 清行/退出");
-        println!();
-    }
-
-    /// D4 工作区感知:生成工作区状态行文本(供横幅显示)。
-    ///
-    /// 形如 `[Rust] git:main · 3 未提交` / `[Node] 非 git` / `空目录`。
-    fn workspace_status_line(ws: &crate::agent::workspace::WorkspaceSnapshot) -> String {
-        if ws.is_trivial() {
-            return "空目录(不注入环境信息)".to_string();
-        }
-        let mut s = format!("[{}]", ws.project_label());
-        if ws.is_git {
-            let branch = ws.branch.as_deref().unwrap_or("?");
-            let dirty_text = if ws.dirty() == 0 {
-                "干净".to_string()
-            } else {
-                format!("{} 未提交", ws.dirty())
-            };
-            s.push_str(&format!(" git:{branch} · {dirty_text}"));
-        } else {
-            s.push_str(" 非 git");
-        }
-        s
-    }
-
-    /// 第 72 轮:横幅「日志文件」行内容(纯函数,便于测试)。
-    ///
-    /// 路径经 `display_path` 相对化(日志文件必在工作目录下,横幅已标注工作目录,
-    /// 相对化后 `llaew_YYYYMMDD_HHMMSS.log` 一行放得下),再拼级别后缀。
-    fn log_banner_text(paths: &Paths, log: &crate::logging::AgentLogInfo) -> String {
-        format!(
-            "{} (级别: {})",
-            pathfmt::display_path(paths, &log.path),
-            log.level
-        )
-    }
-
-    /// D13 离线模式:生成连接状态行文本(供横幅显示)。
-    fn connectivity_status_line(
-        connectivity: &std::sync::Arc<ConnectivityTracker>,
-        queue: &OfflineQueue,
-    ) -> String {
-        let snap = connectivity.snapshot();
-        match snap.state {
-            Connectivity::Online => {
-                if queue.is_empty() {
-                    "Online ✓".to_string()
-                } else {
-                    format!("Online ✓ (队列残留 {} 条)", queue.len())
-                }
-            }
-            Connectivity::Degraded => {
-                let kind = snap
-                    .last_network_error_kind
-                    .as_deref()
-                    .unwrap_or("网络不稳");
-                format!(
-                    "Degraded ⚠ ({kind}, {} 次)",
-                    snap.consecutive_network_errors
+        // 第 73 轮:私网探测提示 —— 当 current provider 指向 loopback/私网且
+        // allow_private_endpoint=false 时,插入可执行的 escape hatch,
+        // 避免用户提交任务后才在 `URL 不安全` 报错里第一次知道有这个问题。
+        let (private_warn, private_unlock) = match &active {
+            Some(r)
+                if !r.allow_private_endpoint
+                    && crate::agent::safety::url_safety::probe_is_private(&r.end_point) =>
+            {
+                (
+                    Some(format!("{}  ← SSRF 拦截将在任务时触发", r.end_point)),
+                    Some(format!(
+                        "laew provider allow-private {}  (然后重启 laew)",
+                        r.id
+                    )),
                 )
             }
-            Connectivity::Offline => {
-                let queued = queue.len();
-                if queued > 0 {
-                    format!("Offline ✗ (已排队 {queued} 条)")
-                } else {
-                    "Offline ✗".to_string()
-                }
-            }
+            _ => (None, None),
+        };
+        let data = banner::BannerData {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build_time: env!("LAEW_BUILD_TIME").to_string(),
+            // 第 72 轮(2026-09-17):启动时刻行 —— main 最早期捕获,与日志文件名时间戳同刻;
+            // humanize_compact 把 YYYYMMDD-HHMMSS 转为 YYYY-MM-DD HH:MM:SS(与编译时间同宽)。
+            startup_time: export::humanize_compact(&self.startup_ts),
+            root_dir: self.paths.root_dir.display().to_string(),
+            work_dir: self.paths.work_dir.display().to_string(),
+            // 项目说明文件状态(纯探测,不触发生成;发现规则见 docs/Yolo项目上下文注入/)
+            project_doc: crate::agent::project_context::probe(&self.paths.work_dir)
+                .as_str()
+                .to_string(),
+            // 工作区感知(D4,2026-09-13):工程类型 + git 分支/变更,与注入给模型的一致
+            workspace: banner::workspace_status_line(&crate::agent::workspace::snapshot(
+                &self.paths.work_dir,
+            )),
+            model: model_line,
+            private_endpoint: private_warn,
+            private_endpoint_unlock: private_unlock,
+            session_id: self.session.id.clone(),
+            // D12 主题提示行(2026-09-10 第二十三轮):告知用户当前主题与切换方式
+            theme: format!("{}  (切换 /theme [kind])", crate::tui::theme::active_kind().as_str()),
+            // D13 离线模式(2026-09-11):连接状态行。未配置接入记录时,ConnectivityTracker
+            // 的「Online ✓」只反映网络不反映配置,会误导用户以为链路可用;此时直接呈现
+            // 未配置状态与操作指引,让横幅自身就能解释「为什么任务不执行」。
+            connectivity: if has_active {
+                banner::connectivity_status_line(&self.connectivity, &self.offline_queue)
+            } else {
+                "未配置(先 /provider add)".to_string()
+            },
+            // TODO 任务清单进度(2026-09-21 第二十轮候选 5):空列表由渲染层静默(避免横幅噪声)
+            todo_summary: Some(self.todo_state.summary_line()),
+            // 第 72 轮:`--debug`/`--info` 启动时展示运行日志文件落点(/clear /new 重印仍可见)
+            log_file: self
+                .agent_log
+                .as_ref()
+                .map(|log| banner::log_file_line(&self.paths, log)),
+        };
+        for line in banner::render(&data, 0, textfit::term_width_for_render()) {
+            println!("{line}");
         }
+        for line in banner::footer_lines() {
+            println!("{line}");
+        }
+        println!();
     }
 
     /// 切换当前 provider(根据 id),并重新构造 MultiAgentOrchestrator
@@ -437,7 +339,7 @@ impl TuiSession {
             &self.session,
             &self.transcript,
             self.session_usage,
-            export::now_clock(),
+            export::format_current_time(),
         ))
     }
 
@@ -729,46 +631,12 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn paths(root: &str, work: &str) -> Paths {
-        Paths {
-            root_dir: std::path::PathBuf::from(root),
-            work_dir: std::path::PathBuf::from(work),
-            db_path: std::path::PathBuf::from("/tmp/x.db"),
-        }
-    }
-
     #[test]
     fn tui_launch_now_形态与默认无日志() {
         let l = TuiLaunch::now();
         assert!(l.agent_log.is_none(), "兜底构造不带日志文件");
         assert_eq!(l.startup_ts.len(), 15, "YYYYMMDD-HHMMSS 形态(15 字符)");
         assert!(l.startup_ts.as_bytes()[8] == b'-', "日期与时间以 '-' 分隔");
-    }
-
-    #[test]
-    fn log_banner_text_工作目录内相对化并带级别() {
-        let p = paths("/opt/laew", "/home/u/work");
-        let info = crate::logging::AgentLogInfo {
-            path: std::path::PathBuf::from("/home/u/work/llaew_20260917_150412.log"),
-            level: "DEBUG",
-        };
-        assert_eq!(
-            TuiSession::log_banner_text(&p, &info),
-            "llaew_20260917_150412.log (级别: DEBUG)"
-        );
-    }
-
-    #[test]
-    fn log_banner_text_目录外回退绝对路径() {
-        let p = paths("/opt/laew", "/home/u/work");
-        let info = crate::logging::AgentLogInfo {
-            path: std::path::PathBuf::from("/var/tmp/llaew_20260917_150412.log"),
-            level: "INFO",
-        };
-        assert_eq!(
-            TuiSession::log_banner_text(&p, &info),
-            "/var/tmp/llaew_20260917_150412.log (级别: INFO)"
-        );
     }
 
     #[test]

@@ -11,7 +11,6 @@ use super::export;
 use super::format_brief::browser_output_brief;
 use super::pathfmt;
 use crate::config::{Paths, ProviderRecord};
-use crate::tui::input::display_width;
 
 /// 格式化任务执行结果为多行文本(D8:屏幕打印与导出同源,避免两处漂移)。
 ///
@@ -73,8 +72,8 @@ pub fn format_task_result(
     // TUI 也补一行 Yolo 三步分析摘要,让用户看到 Yolo 怎么理解任务
     // (与 main.rs OrchestrationOutcome::Executed 分支对齐)
     let c = &result.classification;
-    let purpose_short = truncate_chars(&c.purpose, 40);
-    let goal_short = truncate_chars(&c.goal_summary, 40);
+    let purpose_short = clip_cols(&c.purpose, 40);
+    let goal_short = clip_cols(&c.goal_summary, 40);
     // 2026-09-16 第 57 轮:Yolo 行后补 Yolo 阶段耗时(供一眼看出分类调用多慢)。
     let yolo_elapsed_ms = result
         .stage_durations
@@ -171,9 +170,9 @@ pub fn format_task_result(
                 r.retry_count,
                 r.elapsed_ms as f64 / 1000.0,
                 if styled {
-                    sv(&truncate_chars(&r.retry_hint, 100))
+                    sv(&clip_cols(&r.retry_hint, 100))
                 } else {
-                    truncate_chars(&r.retry_hint, 100)
+                    clip_cols(&r.retry_hint, 100)
                 }
             ));
         }
@@ -295,7 +294,7 @@ pub fn format_task_result(
                 extract_json_field(&tc.args_json, "action").unwrap_or_default().as_str(),
                 &tc.output_summary,
             )
-                                    .unwrap_or_else(|| truncate_chars(&tc.output_summary, 80)),
+                                    .unwrap_or_else(|| clip_cols(&tc.output_summary, 80)),
                             )
                         } else {
                             None
@@ -306,7 +305,7 @@ pub fn format_task_result(
                         }
                     } else {
                         // 失败时附错误摘要(供一眼看出"为什么失败")
-                        let err_short = truncate_chars(&tc.error_summary, 80);
+                        let err_short = clip_cols(&tc.error_summary, 80);
                         format!(" ← {}", if styled { sv(&err_short) } else { err_short })
                     };
                     // 2026-09-17 第 77 轮 P1-1:按工具类型差异化精简参数展示
@@ -448,8 +447,8 @@ pub fn format_failed_detail(
     let sv = |s: &str| sanitize_terminal_controls(s);
     let mut out = String::new();
     let c = &result.classification;
-    let purpose_short = truncate_chars(&c.purpose, 40);
-    let goal_short = truncate_chars(&c.goal_summary, 40);
+    let purpose_short = clip_cols(&c.purpose, 40);
+    let goal_short = clip_cols(&c.goal_summary, 40);
     let yolo_elapsed_ms = result
         .stage_durations
         .iter()
@@ -541,7 +540,7 @@ pub fn format_failed_detail(
                 "  [retry] 第 {} 轮重试(累计 {:.2}s)  上一轮失败原因: {}\n",
                 r.retry_count,
                 r.elapsed_ms as f64 / 1000.0,
-                sv(&truncate_chars(&r.retry_hint, 100))
+                sv(&clip_cols(&r.retry_hint, 100))
             ));
         }
     }
@@ -592,7 +591,7 @@ pub fn format_failed_detail(
                 extract_json_field(&tc.args_json, "action").unwrap_or_default().as_str(),
                 &tc.output_summary,
             )
-                                    .unwrap_or_else(|| truncate_chars(&tc.output_summary, 80)),
+                                    .unwrap_or_else(|| clip_cols(&tc.output_summary, 80)),
                             )
                         } else {
                             None
@@ -602,7 +601,7 @@ pub fn format_failed_detail(
                             None => String::new(),
                         }
                     } else {
-                        let err_short = truncate_chars(&tc.error_summary, 80);
+                        let err_short = clip_cols(&tc.error_summary, 80);
                         format!(" ← {}", sv(&err_short))
                     };
                     // 2026-09-17 第 77 轮 P1-1:差异化精简(同 format_task_result 段)
@@ -652,7 +651,7 @@ pub fn format_failed_detail(
     if !reason.is_empty() {
         out.push_str(&format!(
             "  [qc] reason={}\n",
-            sv(&truncate_chars(reason, 200))
+            sv(&clip_cols(reason, 200))
         ));
     }
     // 用量 + 总耗时
@@ -811,14 +810,16 @@ pub(crate) fn merge_usage(a: crate::llm::Usage, b: crate::llm::Usage) -> crate::
     }
 }
 
-/// 当前本地时间 HH:MM:SS(transcript 轮次时间戳;实现在 export.rs)。
-pub(crate) fn now_clock() -> String {
-    export::now_clock()
+/// 格式化当前本地时间为 `HH:MM:SS`(转发 `export::format_current_time`,dispatch 侧统一入口)。
+pub(crate) fn format_current_time() -> String {
+    export::format_current_time()
 }
 
 /// waiting 心跳行文案(纯函数,便于单测;2026-09-10 第 28 轮 B09/B10 抽取):
 /// - `Some(stage)`:阶段内等待,`  [waiting] {stage}  {frame}  ({elapsed}s){slow_warn}`
-/// - `None`:初始 spinner(首阶段消息未到),`  [waiting] {frame}  ({elapsed}s){slow_warn}`
+/// - `None`:初始 spinner(首阶段消息未到)。**2026-09-24 修 R6**:旧版这一支只有
+///   `  [waiting] ⠦  (17s)`,转点 + 秒数不带任何语义,Yolo 分类 + 首个 LLM 往返期间
+///   (实测 17s+)用户完全看不出在等什么;现补「等待模型响应(首字节)」标签。
 /// - elapsed ≥ 60s 追加「等待超过 1 分钟」提示;≥ 30s 追加「响应较慢」。
 /// 初始 spinner 同样启用 30s/60s 慢提示 —— 修复前固定 `(0s)`,真实慢 LLM
 /// (首字节 >30s)场景下用户既看不到计时也看不到慢提示。
@@ -832,20 +833,21 @@ pub(crate) fn waiting_line_text(stage: Option<&str>, frame: char, elapsed_secs: 
     };
     match stage {
         Some(stage) => format!("  [waiting] {stage}  {frame}  ({elapsed_secs}s){slow_warn}"),
-        None => format!("  [waiting] {frame}  ({elapsed_secs}s){slow_warn}"),
+        None => {
+            format!("  [waiting] 等待模型响应(首字节)  {frame}  ({elapsed_secs}s){slow_warn}")
+        }
     }
 }
 
-/// 把字符串按 char 截断(避免 split_at 在 CJK 多字节上切断),
-/// 超长末尾加 `…`。TUI 渲染宽度计算依赖完整 char 边界。
-pub(crate) fn truncate_chars(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(limit.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
+/// 截断到 `limit` **显示列**(CJK 安全,双宽字符不切半,省略号计入预算)。
+///
+/// 2026-09-24 修 R4:旧版(名 `truncate_chars`)按 **char 数**截,40 个汉字 = 80 列,
+/// 在 80 列终端上必然折行 —— [yolo] / [tool] / [stage] 行一旦折行,
+/// [waiting] 心跳的「回车回到列 0 + ESC[K 清到行尾」原地重写纪律就被打断
+/// (下一次回车回到的是物理行首而非屏幕行首),屏幕残留残影、看似「显示不全」。
+/// 改名并改语义:纯 ASCII 行为与旧版逐字节一致,只有 CJK 内容会真的变窄到预算内。
+pub(crate) fn clip_cols(s: &str, limit: usize) -> String {
+    crate::tui::textfit::clip(s, limit)
 }
 
 /// 2026-09-17 第 77 轮 P1-1:工具调用参数差异化精简。
@@ -872,7 +874,7 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
         .filter(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
         .is_some()
     {
-        return truncate_chars(args_json, 80);
+        return clip_cols(args_json, 80);
     }
 
     match tool {
@@ -880,16 +882,16 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
             // 提取 command 字段(尝试简单解析;失败回退到原文)
             let cmd =
                 extract_json_field(args_json, "command").unwrap_or_else(|| args_json.to_string());
-            let short = truncate_chars(&cmd, 30); // M7: 44→30
+            let short = clip_cols(&cmd, 30); // M7: 44→30
             format!("cmd={short}")
         }
         "Write" | "Edit" => {
             let p = extract_json_field(args_json, "path").unwrap_or_else(|| args_json.to_string());
-            format!("path={}", truncate_chars(&p, 40)) // M7: 50→40
+            format!("path={}", clip_cols(&p, 40)) // M7: 50→40
         }
         "Read" => {
             let p = extract_json_field(args_json, "path").unwrap_or_else(|| args_json.to_string());
-            format!("path={}", truncate_chars(&p, 40)) // M7: 50→40
+            format!("path={}", clip_cols(&p, 40)) // M7: 50→40
         }
         "MCP_Window_Use" => {
             // 2026-09-18 第 84 轮:窗口操控统一入口,突出 action + 定位要素
@@ -897,28 +899,28 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
             let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
             let wid = extract_json_field(args_json, "window_id").unwrap_or_default();
             let query = extract_json_field(args_json, "query").unwrap_or_default();
-            let mut brief = format!("action={}", truncate_chars(&action, 16));
+            let mut brief = format!("action={}", clip_cols(&action, 16));
             if !wid.is_empty() {
-                brief.push_str(&format!(" wid={}", truncate_chars(&wid, 16)));
+                brief.push_str(&format!(" wid={}", clip_cols(&wid, 16)));
             }
             if !query.is_empty() {
-                brief.push_str(&format!(" query={}", truncate_chars(&query, 24)));
+                brief.push_str(&format!(" query={}", clip_cols(&query, 24)));
             }
             if action == "control" {
                 let path = extract_json_field(args_json, "path").unwrap_or_default();
                 let cact =
                     extract_json_field(args_json, "control_action").unwrap_or_default();
                 if !cact.is_empty() {
-                    brief.push_str(&format!(" act={}", truncate_chars(&cact, 16)));
+                    brief.push_str(&format!(" act={}", clip_cols(&cact, 16)));
                 }
                 if !path.is_empty() && path != "/" {
-                    brief.push_str(&format!(" path={}", truncate_chars(&path, 12)));
+                    brief.push_str(&format!(" path={}", clip_cols(&path, 12)));
                 }
             }
             match action.as_str() {
                 "chat_send" => {
                     if let Some(text) = extract_json_field(args_json, "text") {
-                        brief.push_str(&format!(" text=\"{}\"", truncate_chars(&text, 20)));
+                        brief.push_str(&format!(" text=\"{}\"", clip_cols(&text, 20)));
                     }
                 }
                 "chat_loop" => {
@@ -933,7 +935,7 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
                 "osascript_run" => {
                     if let Some(script) = extract_json_field(args_json, "osascript_script") {
                         let first = script.lines().next().unwrap_or("");
-                        brief.push_str(&format!(" script=\"{}\"", truncate_chars(first, 28)));
+                        brief.push_str(&format!(" script=\"{}\"", clip_cols(first, 28)));
                     }
                 }
                 _ => {}
@@ -945,35 +947,35 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
         "MCP_Web_Use" => {
             let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
             let pid = extract_json_field(args_json, "page_id").unwrap_or_default();
-            let mut brief = format!("action={}", truncate_chars(&action, 16));
+            let mut brief = format!("action={}", clip_cols(&action, 16));
             if !pid.is_empty() {
-                brief.push_str(&format!(" page={}", truncate_chars(&pid, 12)));
+                brief.push_str(&format!(" page={}", clip_cols(&pid, 12)));
             }
             match action.as_str() {
                 "open" => {
                     let url = extract_json_field(args_json, "url").unwrap_or_default();
                     if !url.is_empty() {
-                        brief.push_str(&format!(" url={}", truncate_chars(&url, 40)));
+                        brief.push_str(&format!(" url={}", clip_cols(&url, 40)));
                     }
                 }
                 "control" => {
                     let cact =
                         extract_json_field(args_json, "control_action").unwrap_or_default();
                     if !cact.is_empty() {
-                        brief.push_str(&format!(" act={}", truncate_chars(&cact, 16)));
+                        brief.push_str(&format!(" act={}", clip_cols(&cact, 16)));
                     }
                 }
                 "inspect" => {
                     let info = extract_json_field(args_json, "info").unwrap_or_default();
                     if !info.is_empty() {
-                        brief.push_str(&format!(" info={}", truncate_chars(&info, 16)));
+                        brief.push_str(&format!(" info={}", clip_cols(&info, 16)));
                     }
                 }
                 _ => {}
             }
             brief
         }
-        _ => truncate_chars(args_json, 80),
+        _ => clip_cols(args_json, 80),
     }
 }
 
@@ -1262,35 +1264,16 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev_row[b_len]
 }
 
-/// 截断到 max 显示宽度后按显示宽度右侧补空格(CJK 安全),保证 banner 行等宽。
-/// 修复 2026-09-10 第 18 轮 P1/P2:「当前模型」行 provider/model 不截断溢出右边框、
-/// `{: <N}` 按字符数填充导致含 CJK 内容(如「自动生成(根目录 Markdown)」)时右边界错位。
-pub(crate) fn fit_display(s: &str, max: usize) -> String {
-    let t = truncate(s, max);
-    let w = crate::tui::input::display_width(&t) as usize;
-    format!("{}{}", t, " ".repeat(max.saturating_sub(w)))
-}
-
-/// 截断字符串到指定显示宽度（简化版，按字符数）。
-
+/// 截断到 `max` **显示列**(CJK 安全,省略号计入预算)。
+///
+/// 2026-09-24 修 R2:旧实现在截到 `max` 列之后**再追加** `…`,返回值宽度 = `max + 1`,
+/// 于是任何被截断的横幅行都比盒宽多 1 列、顶穿右边框(用户看到「当前模型」行的 `…`
+/// 溢出边框即此)。现委托 [`textfit::clip`],宽度严格 `≤ max`。
+///
+/// 注:原 `fit_display`(截断 + 补空格)已随横幅排版下沉到 `textfit::InfoBox` 而删除
+/// —— 盒行等宽由渲染器统一保证,不再依赖每行手调预算(那正是旧版参差的根因)。
 fn truncate(s: &str, max_len: usize) -> String {
-    let w = display_width(s);
-    if w as usize <= max_len {
-        s.to_string()
-    } else {
-        // 按显示宽度截断,不在双宽字符中间截断
-        let mut out = String::new();
-        let mut w = 0u16;
-        for c in s.chars() {
-            let cw = crate::tui::input::char_width(c);
-            if w + cw > max_len as u16 {
-                break;
-            }
-            out.push(c);
-            w += cw;
-        }
-        out + "…"
-    }
+    crate::tui::textfit::clip(s, max_len)
 }
 
 /// 取首行非空内容并压缩空白,截断到 `max` 显示宽度(D3 轮次/分支列表预览用)。
@@ -1330,43 +1313,56 @@ pub(crate) fn print_record(r: &ProviderRecord) {
     );
 }
 
+/// `/help` 命令表(命令, 说明)。排版交给 [`print_help`] 的信息盒,不再手写边框。
+const HELP_COMMANDS: &[(&str, &str)] = &[
+    ("/help (h, ?)", "显示本帮助"),
+    ("/exit (quit, q)", "退出 TUI"),
+    ("/clear (c)", "清空对话历史并开启新会话"),
+    ("/new (n)", "开启新会话(同 /clear)"),
+    ("/model", "显示当前模型"),
+    ("/rewind [N]", "列出轮次或回退到第 N 轮之前(自动存分支)"),
+    ("/undo", "撤销最后一轮对话"),
+    ("/fork", "从当前对话分叉出新会话"),
+    ("/branches", "列出已存分支(/rewind /fork /clear 自动存)"),
+    ("/switch <name>", "切换到指定分支"),
+    ("/sessions (hist)", "列出可跨进程恢复的历史会话(自动持久化)"),
+    ("/resume [N|id]", "恢复历史会话(原对话自动存分支)"),
+    ("/export [path]", "导出当前会话(Markdown, .json 后缀 JSON)"),
+    ("/diff <old> <new>", "并排 diff 两个文件(行级+字符级着色)"),
+    ("/theme [kind]", "查看或切换主题(D12 a11y 配色)"),
+    ("/cost (usage)", "查看会话用量与成本估算"),
+    ("/tasks (todos)", "查看当前 session TODO 任务清单(D19)"),
+    ("/audit (audits)", "决策审计可视化(D9-8):表格/统计/校验/清理"),
+    ("/agents (subag)", "动态子 Agent 名册(含自定义类型)+运行记录"),
+    ("/agents history", "子 Agent 运行记录(N=条数,all=跨会话)"),
+    ("/workspace [rf]", "查看工作区快照(git/工程/最近改动)"),
+    ("/commands", "列出自定义斜杠命令"),
+    ("/provider", "管理大模型接入记录(默认进入 list 屏)"),
+    ("/provider list", "列出所有接入记录"),
+    ("/provider add", "交互式新增接入记录"),
+    ("/provider use <id>", "切换当前模型"),
+    ("/provider del <id>", "删除接入记录"),
+];
+
+/// 打印 `/help` 命令指南。
+///
+/// 2026-09-24 改造:原先 30 行手写 `│ … │` 且每行按空格数手调宽度,实测行宽在
+/// 62~65 列之间来回跳(右边框参差);现交给 [`textfit::InfoBox`] —— 命令 = 标签列、
+/// 说明 = 值列,盒宽取「内容自然宽」与「终端可用宽」的小者,任意终端下所有行严格等宽。
 pub(crate) fn print_help() {
     println!();
-    println!("  ┌──────────────────────────────────────────────────────────┐");
-    println!("  │                    laew 可用命令                         │");
-    println!("  ├──────────────────────────────────────────────────────────┤");
-    println!("  │  命令              说明                                  │");
-    println!("  ├──────────────────────────────────────────────────────────┤");
-    println!("  │  /help (h, ?)      显示本帮助                            │");
-    println!("  │  /exit (quit, q)   退出 TUI                              │");
-    println!("  │  /clear (c)        清空对话历史并开启新会话                 │");
-    println!("  │  /new (n)          开启新会话(同 /clear)                   │");
-    println!("  │  /model            显示当前模型                           │");
-    println!("  │  /rewind [N]       列出轮次或回退到第 N 轮之前(自动存分支) │");
-    println!("  │  /undo             撤销最后一轮对话                        │");
-    println!("  │  /fork             从当前对话分叉出新会话                  │");
-    println!("  │  /branches         列出已存分支(/rewind /fork /clear 自动存)│");
-    println!("  │  /switch <name>    切换到指定分支                          │");
-    println!("  │  /sessions (hist)  列出可跨进程恢复的历史会话(自动持久化)  │");
-    println!("  │  /resume [N|id]    恢复历史会话(原对话自动存分支)          │");
-    println!("  │  /export [path]    导出当前会话(Markdown, .json 后缀 JSON) │");
-    println!("  │  /diff <old> <new> 并排 diff 两个文件(行级+字符级着色)    │");
-    println!("  │  /theme [kind]     查看或切换主题(D12 a11y 配色)          │");
-    println!("  │  /cost (usage)     查看会话用量与成本估算                 │");
-    println!("  │  /tasks (todos)    查看当前 session TODO 任务清单(D19)     │");
-    println!("  │  /audit (audits)   决策审计可视化(D9-8):表格/统计/校验/清理│");
-    println!("  │  /agents (subag)   动态子 Agent 名册(含自定义类型)+运行记录│");
-    println!("  │  /agents history   子 Agent 运行记录(N=条数,all=跨会话)   │");
-    println!("  │  /workspace [rf]   查看工作区快照(git/工程/最近改动)       │");
-    println!("  │  /commands         列出自定义斜杠命令                      │");
-    println!("  │  /provider         管理大模型接入记录(默认进入 list 屏)    │");
-    println!("  │  /provider list    列出所有接入记录                       │");
-    println!("  │  /provider add     交互式新增接入记录                     │");
-    println!("  │  /provider use <id>  切换当前模型                        │");
-    println!("  │  /provider del <id>  删除接入记录                        │");
-    println!("  ├──────────────────────────────────────────────────────────┤");
-    println!("  │  其他输入           作为提示词进入多轮对话                │");
-    println!("  └──────────────────────────────────────────────────────────┘");
+    let mut b = crate::tui::textfit::InfoBox::new(crate::tui::textfit::BoxStyle::Light)
+        .span_center("laew 可用命令")
+        .sep()
+        .cols("命令", "说明")
+        .sep();
+    for (cmd, desc) in HELP_COMMANDS {
+        b = b.cols(*cmd, *desc);
+    }
+    b = b.sep().cols("其他输入", "作为提示词进入多轮对话");
+    for line in b.render(2, crate::tui::textfit::term_width_for_render()) {
+        println!("{line}");
+    }
     println!();
     println!("  @ 文件提及(D1):");
     println!("    @路径            引用文件内容(如 @src/main.rs)");
@@ -1394,8 +1390,13 @@ mod waiting_line_text_tests {
     fn initial_spinner_counts_real_elapsed() {
         // 第 28 轮 B09/B10 修复:初始 spinner 的秒数来自 spinner_started_at,
         // 不再固定 (0s) —— 否则首字节 >30s 的真实慢链路下用户以为卡死在 0s。
-        assert_eq!(waiting_line_text(None, '⠋', 0), "  [waiting] ⠋  (0s)");
-        assert_eq!(waiting_line_text(None, '⠹', 5), "  [waiting] ⠹  (5s)");
+        assert_eq!(
+            waiting_line_text(None, '⠋', 0),
+            "  [waiting] 等待模型响应(首字节)  ⠋  (0s)"
+        );
+        assert!(waiting_line_text(None, '⠹', 5).contains("(5s)"));
+        // R6:无阶段时也必须给出「在等什么」,不能只剩转点与秒数
+        assert!(waiting_line_text(None, '⠹', 5).contains("等待模型响应"));
     }
 
     #[test]

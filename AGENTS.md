@@ -57,6 +57,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 | | 未设置（默认） | 自动模式：endpoint 主机为 IP（IPv4/IPv6）时自动跳过证书校验，域名主机仍严格校验。适配 IP + 自签名证书的内网/自建 HTTPS 网关；仅跳过校验，TLS 加密不降级；rustls 纯 Rust 实现，Windows/macOS/CentOS/Ubuntu 行为一致。设计见 `docs/自签名证书TLS适配/01-设计与解决方案.md` |
 | `LAEW_ALLOW_PRIVATE_ENDPOINT` | `1` | SSRF 防护放行私网/loopback endpoint（本地 Ollama / 局域网 / mock 测试 provider 用；默认拦截，见 `src/agent/safety/url_safety.rs`） |
 | `LAEW_BASH_UTF8` | `1`/`true`/`yes`/`on` | Bash 工具为子进程注入 UTF-8 环境（`PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8`/`LC_ALL=C.UTF-8`），消除 Windows 区域设置(GBK)导致的 python/coreutils 输出乱码；默认关闭。行尾(CRLF)不受影响，精确 diff 场景脚本仍需 `reconfigure(newline=...)`，见 `src/agent/tools/bash.rs` |
+| `LAEW_AMBIGUOUS_WIDE` | `1`/`true`/`yes`/`on` | 歧义宽度字符（`✓ · … → ║` 等 East Asian Ambiguous）按 **2 列**参与宽度计算（默认关闭=按 1 列）。只改计算不改渲染，供把盒线渲染成双宽的老终端（部分 Windows conhost 中文字体 / xterm `-ctwidth`）校正对齐；见 `src/tui/textfit.rs::ambiguous_wide` |
 | `LAEW_LOG_CLIP` | 正整数（默认 `4000`） | `--debug`/`--info` 运行日志文件中单字段（LLM 思考文本/工具参数/结果等）的截断长度（字符数）；`0`/非法值回退默认。见 `src/logging.rs` |
 | `LAEW_AUDIT` | `off`/`0`/`false`/`no` | 关闭决策审计写入（默认开启）。开启时 5 个决策点（Yolo 分类 / Plan 规划 / Main-Work 拆解 / QC 判定 / Compact 压缩）各追加一条结构化 JSON 行到根目录 `AuditTrail/audit_{session_id}.jsonl`（已 gitignore），记录「输入上下文→决策结论→决策依据」三段式 + 耗时/token/扩展字段，全字段脱敏截断，fail-open 不影响主流程。见 `src/agent/decision_audit.rs` |
 | `LAEW_PARALLEL_TOOLS` | `off`/`0`/`false`/`no` | 关闭「同批只读工具并发执行」，回退到全串行。默认开启：同一 LLM 响应里**连续的** `parallel_safe` 调用（Read/Glob/Grep，段长 ≥2）并发执行，`tool_result` 仍按原序回填。见 `src/agent/tool_exec.rs` |
@@ -172,18 +173,21 @@ tui/
   dispatch.rs      输入分发与任务输出:handle_user_input / dispatch_prompt(@提及展开 + 阶段进度协程 + SIGINT 取消)/ emit_debug_report / print_* 家族
   slash.rs         斜杠命令路由:handle_slash + run_theme/run_rewind/run_undo/run_fork/run_branches/run_switch/run_export + print_custom_commands
   provider_screen.rs  /provider 子屏桥接:list/add/del 三屏接入 + run_screen_loop(通用 Screen 栈循环,非 TTY 回退 print)
-  format.rs        纯函数格式化:任务结果双版本(人类版 format_task_result / LLM 回填版 for_context)/ merge_usage / waiting_line_text / CJK 截断系 / print_help / print_record
+  format.rs        纯函数格式化:任务结果双版本(人类版 format_task_result / LLM 回填版 for_context)/ merge_usage / waiting_line_text / clip_cols(显示列截断)/ print_help(信息盒)/ print_record
   format_brief.rs  [tool]/[laew] 行关键字段摘要(MCP_Window_Use 焦点守卫/route/verified 等)
   audit_view.rs    /audit 决策审计可视化面板
+  banner.rs        启动横幅:声明式行集(BannerData)+ textfit 自适应渲染 / 工作区·连接·日志行文本纯函数
   engine.rs        CLI 渲染引擎 —— Screen trait + Frame + 全量重绘 present
   form.rs          通用 Tab 表单状态机(被 ProviderForm 屏复用)
-  input.rs         单行输入(主屏用):含行内提示 + 补全 + D6 大粘贴防护(crossterm 原始模式)
+  input.rs         单行输入(主屏用):行编辑 + 行内提示 + 补全 + 固定底部面板(DECSTBM 滚动区)
+  paste.rs         粘贴保真层(从 input.rs 拆出):PasteRegistry 登记簿 / handle_paste_text / 粘贴预览与提交完整回显(纯函数)
   completion.rs    斜杠命令补全引擎(内置 + 自定义命令动态注册)
   commands.rs      自定义斜杠命令(D2):两级目录发现/frontmatter/占位符渲染
   export.rs        会话导出(D8):transcript 记录 + Markdown/JSON 落盘
   branches.rs      对话分支存储(D3):rewind/fork/switch/clear 前自动快照(内存态上限 10)
   mention.rs       @ 文件提及解析 + 实时路径补全 + 目录钻取
   pathfmt.rs       路径格式化辅助(相对路径展示/工作目录锚定)
+  textfit.rs       显示宽度唯一真源:char_width/width/clip/clip_mid/wrap/pad + InfoBox 自适应信息盒(横幅与 /help 共用)
   theme.rs         ANSI 颜色 / mask_key 脱敏 / attrs·bg·color→ANSI 转换 集中管理
   screen/
     provider_list.rs   /provider list —— Tab 化展示 + 操作按钮
@@ -287,7 +291,7 @@ config/            全局配置:mod.rs / agent_memory.rs(agent_memory DAO) / age
 
 ### 屏幕拓扑
 
-- **REPL 主屏**：保留 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。**大粘贴防护**：bracketed paste 整体接收 + 大粘贴（>10 行或 >1000 字符）转 `[粘贴 #N]` marker、提交时展开还原（单份 >10000 字符截断为首尾各 500 + 省略标注）+ 快速输入批量合并（IME/旧终端粘贴逐字重绘优化）+ Enter 提交前 15ms 粘贴突发探测（无 bracketed paste 的 Windows 终端多行提示词被逐行拆成多次提交 — 见 `tui/input.rs::drain_paste_burst`）。
+- **REPL 主屏**：保留 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。**粘贴保真**：bracketed paste 整体接收；**≥2 行粘贴一律转 `[粘贴 #N +M 行]` marker 保真**（原文含换行入登记表，不再把换行压成空格——旧「>10 行才转」规则会让 3~8 行 Markdown 提示词在屏幕上只剩一行、送进模型也丢掉列表结构），注册后立刻在滚动区回显原文预览（前 4 行 + 「其余 N 行未显示」），提交时按**展开版**逐行完整回显（首行 `>> `、续行 `.. `、超 20 视觉行折叠并标注「内容已完整发送」）；单份 >10000 字符截断为首尾各 500 + 省略标注+ 快速输入批量合并（IME/旧终端粘贴逐字重绘优化）+ Enter 提交前 15ms 粘贴突发探测（无 bracketed paste 的 Windows 终端多行提示词被逐行拆成多次提交 — 见 `tui/input.rs::drain_paste_burst`）。
 - **子屏（Modal）**：`engine.rs` 的 Screen 栈接管 `/provider *` 系列，进入 alternate screen + 原始模式，Esc 退回主屏。
 - **非 TTY 回退**：stdin 不是终端时（管道 / e2e），子屏与主屏都回退到 print 输出，保证 `run_e2e.sh` 兼容。
 
@@ -364,6 +368,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 ### 关键约定
 
 - 新增子屏：实现 `engine::Screen` trait，在 `mod.rs::handle_slash` 中路由。
+- 新增**盒线/信息块**（横幅、`/help`、状态面板等）：一律走 `tui::textfit::InfoBox`，禁止硬编码边框长度或逐行手调填充空格（旧实现正是这样导致行宽参差）；宽度度量只允许 `textfit::width`/`char_width`（`input::display_width` 已转发至此），截断只用 `textfit::clip`（省略号计入预算）与 `clip_mid`（路径/URL 保尾）。
 - 不引入新 crate（crossterm 已满足）。
 - 子屏不直接写 stdout；通过 `Frame` → `engine::present` 统一绘制。
 

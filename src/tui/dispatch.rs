@@ -11,9 +11,10 @@ use anyhow::Result;
 
 use super::export::{OutcomeKind, TranscriptEntry};
 use super::format::{
-    format_task_result, format_task_result_for_context, merge_usage, now_clock, waiting_line_text,
+    format_task_result, format_task_result_for_context, merge_usage, format_current_time, waiting_line_text,
 };
 use super::pathfmt;
+use super::textfit;
 use super::TuiSession;
 use crate::agent::debug::{finalize_report, DebugCollector, ReportMeta};
 use crate::agent::orchestrator::OrchestrationOutcome;
@@ -50,7 +51,7 @@ impl TuiSession {
     ///
     /// 普通输入与自定义命令都汇入此处,保证取消/调试/输出/transcript 记录单点收敛。
     pub(crate) async fn dispatch_prompt(&mut self, raw: &str, prompt: &str) -> Result<bool> {
-        let turn_ts = now_clock();
+        let turn_ts = format_current_time();
         // D1 @ 提及展开(2026-09-10 第二十八轮,L1426):@路径/@"带空格"/@路径#L10-20
         // 命中真实文件时以 <<<LAEW:ATTACHMENTS>>> 附件块追加到送入上下文的消息;
         // transcript/导出仍记 raw 原文,不受影响。
@@ -240,7 +241,7 @@ impl TuiSession {
                                     } else {
                                         String::new()
                                     };
-                                    println!("  [stage] {pending}{timing}");
+                                    println!("{}", stage_line_text(&pending, &timing));
                                     last_stage_at = Some(std::time::Instant::now());
                                     // 2026-09-18 第 88 轮:即时冲刷分支也要推进 current_stage,
                                     // 否则 waiting 心跳一直显示更早的旧阶段名
@@ -260,7 +261,7 @@ impl TuiSession {
                                 } else {
                                     String::new()
                                 };
-                                println!("  [stage] {line}{timing}");
+                                println!("{}", stage_line_text(&line, &timing));
                                 let _ = std::io::stdout().flush();
                                 last_stage_at = Some(std::time::Instant::now());
                                 idle.as_mut().reset(tokio::time::Instant::now() + tick);
@@ -291,7 +292,7 @@ impl TuiSession {
                                     } else {
                                         String::new()
                                     };
-                                    println!("  [stage] {pending}{timing}");
+                                    println!("{}", stage_line_text(&pending, &timing));
                                     let _ = std::io::stdout().flush();
                                 }
                             }
@@ -466,7 +467,7 @@ impl TuiSession {
                             } else {
                                 String::new()
                             };
-                            println!("  [stage] {line}{timing}");
+                            println!("{}", stage_line_text(&line, &timing));
                             let _ = std::io::stdout().flush();
                             last_stage_at = Some(std::time::Instant::now());
                             // 2026-09-16 第 62 轮:current_stage 只保留短标题,
@@ -630,7 +631,7 @@ impl TuiSession {
                 println!(
                     "  [task failed: difficulty={}, reason={}, 总耗时 {:.2}s]",
                     classification.task_level.display_name(),
-                    crate::tui::format::truncate_chars(&reason_short, 240),
+                    crate::tui::format::clip_cols(&reason_short, 240),
                     *wallclock_ms as f64 / 1000.0,
                 );
                 // 2026-09-16 第 64 轮(第 89 轮更新):浏览器类任务失败时额外打印诊断。
@@ -1193,22 +1194,43 @@ impl TuiSession {
     }
 }
 
-/// 2026-09-16 第 63 轮(升级):把 stage 文本压成短标题,waiting 心跳不再复读超长文本。
-/// - 长描述(单元详情 / QC 详情)走 `[laew]` 前缀立即冲刷,不进入 waiting 流;
-/// - 短标题(单元 ID + 执行者)进入 stage 流 + waiting 心跳,每 1s 原地重写时只刷新 spinner。
-/// 2026-09-16 第 63 轮:从 60 → 40 字符,避免 waiting 行过长导致重复感。
+/// waiting 心跳用的短标题:按**显示列**收敛(预算随终端宽度收缩)。
+///
+/// 2026-09-24 修 R4:旧版按 **char 数**截 40 —— 40 个汉字 = 80 列,加上
+/// `  [waiting] ` 前缀与 `  ⠦  (17s)` 后缀必然超出 80 列终端 → 自动折行。而 waiting
+/// 行是靠「回车回列 0 + `ESC[K` 清到行尾」**原地重写**的(第 28 轮 B09/B10 ANSI 纪律),
+/// 一旦折行,下一次回车回到的是物理行首而非屏幕行首,屏幕上留下半行残影、心跳看着
+/// 「显示不全/卡住」。现在按显示列截,并预留前缀/转点/计时/慢提示的固定开销。
 fn short_stage_label(line: &str) -> String {
-    const MAX_CHARS: usize = 40;
+    // 固定开销:2 缩进 + "[waiting] " 10 + 转点 1 + 双空格 2 + "(123s)" 6 + 慢提示余量
+    let budget = textfit::term_width_for_render().saturating_sub(30).clamp(12, 40);
+    short_stage_label_with(line, budget)
+}
+
+/// [`short_stage_label`] 的纯函数内核(显式列预算,便于单测)。
+fn short_stage_label_with(line: &str, max_cols: usize) -> String {
     let clean = line.replace(['\n', '\r'], " ");
-    if clean.chars().count() <= MAX_CHARS {
-        clean
-    } else {
-        clean
-            .chars()
-            .take(MAX_CHARS.saturating_sub(1))
-            .chain(['…'])
-            .collect()
+    textfit::clip(&clean, max_cols)
+}
+
+/// `[stage]` 行完整文本(纯函数内核,显式终端宽度):`  [stage] {line}{timing}`。
+///
+/// 2026-09-24 修 R4/G7:整行必须在一行内放完 —— 折行会打断 waiting 心跳的原地重写
+/// 纪律,也会让后续 `println!` 落在行中部。超宽时**只收 stage 正文**,
+/// 前缀与耗时标注始终保留(时序信息比中间描述重要)。
+fn stage_line_text_with_width(line: &str, timing: &str, term_w: usize) -> String {
+    const PREFIX: &str = "  [stage] ";
+    let full = format!("{PREFIX}{line}{timing}");
+    if term_w == 0 || textfit::width(&full) <= term_w {
+        return full;
     }
+    let keep = term_w.saturating_sub(textfit::width(PREFIX) + textfit::width(timing));
+    format!("{PREFIX}{}{timing}", textfit::clip(line, keep))
+}
+
+/// [`stage_line_text_with_width`] 的终端宽度自动版。
+fn stage_line_text(line: &str, timing: &str) -> String {
+    stage_line_text_with_width(line, timing, textfit::term_width_for_render())
 }
 
 #[cfg(test)]
@@ -1221,6 +1243,29 @@ mod tests {
         let label = short_stage_label(long);
         assert!(label.chars().count() <= 40, "短标题应 ≤ 40 字符:{} 字符", label.chars().count());
         assert!(label.ends_with('…'), "超长应加 …");
+    }
+
+    #[test]
+    fn short_stage_label_按显示列收敛_汉字不翻倍() {
+        // 修 R4:旧版 40 字符预算放过 40 个汉字 = 80 列;现在 40 列预算只放 20 个汉字
+        let cjk = "阶段详情".repeat(30); // 120 字符 / 240 列
+        let label = short_stage_label_with(&cjk, 40);
+        assert!(textfit::width(&label) <= 40, "短标题显示宽 {} > 40", textfit::width(&label));
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn stage_行整行不超终端宽_且前缀与耗时保留() {
+        let long = "wf-1.step SubAgent 执行中 | 职责: 微信通讯录查找用户并发送AI消息 | 期望: 微信进程存在且窗口可访问; 通讯录界面成功打开";
+        for term_w in [40usize, 60, 80, 100, 120] {
+            let l = stage_line_text_with_width(long, " +1.2s", term_w);
+            assert!(textfit::width(&l) <= term_w, "{term_w} 列下折行风险: 宽 {}", textfit::width(&l));
+            assert!(l.starts_with("  [stage] "), "前缀必须保留: {l}");
+            assert!(l.ends_with(" +1.2s"), "耗时标注必须保留: {l}");
+        }
+        // 放得下时原样输出(不引入省略号)
+        let keep = stage_line_text_with_width("Yolo 分类中", "", 200);
+        assert_eq!(keep, "  [stage] Yolo 分类中");
     }
 
     #[test]

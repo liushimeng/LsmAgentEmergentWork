@@ -5,7 +5,7 @@
 //! 既有 `browser_output_brief` / `tool_args_brief` 仍在 format.rs(未机械搬移,
 //! 后续轮次如需继续增长可整体迁入)。
 
-use super::format::truncate_chars;
+use super::format::clip_cols;
 
 /// MCP_Web_Use `{code,message,data}` 信封的精简摘要。
 ///
@@ -27,13 +27,13 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
     let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
     let mut parts: Vec<String> = vec![format!("code={code}")];
     if !message.is_empty() {
-        parts.push(truncate_chars(message, 24));
+        parts.push(clip_cols(message, 24));
     }
     if let Some(d) = data.as_object() {
         for key in ["page_id", "url", "title", "spawned_page_id"] {
             if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
                 if !s.is_empty() {
-                    parts.push(format!("{key}={}", truncate_chars(s, 30)));
+                    parts.push(format!("{key}={}", clip_cols(s, 30)));
                 }
             }
         }
@@ -85,7 +85,7 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
                 .file_name()
                 .and_then(|x| x.to_str())
                 .unwrap_or(s);
-            parts.push(format!("out={}", truncate_chars(name, 24)));
+            parts.push(format!("out={}", clip_cols(name, 24)));
         }
         if let Some(n) = d.get("byte_size").and_then(|x| x.as_i64()) {
             parts.push(format!("bytes={n}"));
@@ -102,12 +102,12 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
             }
         }
         if let Some(s) = d.get("ocr_error").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
-            parts.push(format!("ocr_err={}", truncate_chars(s, 30)));
+            parts.push(format!("ocr_err={}", clip_cols(s, 30)));
         }
         match d.get("result") {
             Some(serde_json::Value::String(s)) => {
                 // 第 106 轮:eval_js 结果显示前 40 字符(足够看到关键返回值)
-                parts.push(format!("result={}", truncate_chars(s, 40)));
+                parts.push(format!("result={}", clip_cols(s, 40)));
             }
             Some(other @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => {
                 parts.push(format!("result={other}"));
@@ -130,7 +130,7 @@ pub(crate) fn browser_output_brief(output_summary: &str) -> Option<String> {
         if let Some(s) = d.get("text").and_then(|x| x.as_str()) {
             let t = s.trim();
             if !t.is_empty() {
-                parts.push(format!("el_text={}", truncate_chars(t, 30)));
+                parts.push(format!("el_text={}", clip_cols(t, 30)));
             }
         }
     }
@@ -170,7 +170,7 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
         // route 截断至 12 字符,避免总输出超 80 字符被截断
         if let Some(route) = v.get("recommended_route").and_then(|x| x.as_str()) {
             if !route.is_empty() && route != "none" {
-                parts.push(format!("route={}", truncate_chars(route, 12)));
+                parts.push(format!("route={}", clip_cols(route, 12)));
             }
         }
         if let Some(sp) = Some(get_s("snapshot_path")).filter(|s| !s.is_empty()) {
@@ -179,7 +179,7 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
                 .and_then(|x| x.to_str())
                 .unwrap_or(sp);
             // filename 截断至 16 字符,避免总输出超 80 字符
-            parts.push(format!("snapshot={}", truncate_chars(name, 16)));
+            parts.push(format!("snapshot={}", clip_cols(name, 16)));
         }
         // actionable_count 从 tree_summary 提取(explore 返回结构)
         let actionable_count = v.get("tree_summary")
@@ -214,7 +214,7 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
     if get_s("action") == "read_text" || v.get("chars").is_some() {
         let strategy = get_s("strategy");
         if !strategy.is_empty() {
-            parts.push(format!("strategy={}", truncate_chars(strategy, 10)));
+            parts.push(format!("strategy={}", clip_cols(strategy, 10)));
         }
         if let Some(n) = get_n("chars") {
             parts.push(format!("chars={n}"));
@@ -272,7 +272,7 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
         if code != 0 {
             let err_first = get_s("stderr").lines().next().unwrap_or("");
             if !err_first.is_empty() {
-                parts.push(format!("err=\"{}\"", truncate_chars(err_first, 36)));
+                parts.push(format!("err=\"{}\"", clip_cols(err_first, 36)));
             }
         }
     }
@@ -284,12 +284,12 @@ pub(crate) fn window_use_output_brief(_action: &str, output_summary: &str) -> Op
         parts.push(format!("wid={wid}"));
     }
     if let Some(err) = Some(get_s("error")).filter(|s| !s.is_empty()) {
-        parts.push(format!("err=\"{}\"", truncate_chars(err, 40)));
+        parts.push(format!("err=\"{}\"", clip_cols(err, 40)));
     }
     if parts.is_empty() {
         return None;
     }
-    Some(truncate_chars(&parts.join(" "), 80))
+    Some(clip_cols(&parts.join(" "), 80))
 }
 
 #[cfg(test)]

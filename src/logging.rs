@@ -52,7 +52,11 @@ pub fn startup_log_path_at(work_dir: &Path, ts: &str) -> PathBuf {
 pub struct AgentLogInfo {
     /// 日志文件完整路径(工作目录下 `llaew_YYYYMMDD_HHMMSS.log`)
     pub path: PathBuf,
-    /// 日志级别:"DEBUG"(`--debug`) / "INFO"(`--info`)
+    /// 日志级别字符串:"DEBUG"(`--debug`) / "INFO"(`--info`)。
+    ///
+    /// 注意:这是**级别名**,不是显示宽度,也不是同文件里
+    /// `LAEW_LOG_CLIP`(`log_clip_limit()`,日志超长字段的**字符**截断长度)那一套。
+    /// 本值只用于横幅展示日志级别;TUI 侧的显示列宽计算一律走 `tui::textfit`。
     pub level: &'static str,
 }
 

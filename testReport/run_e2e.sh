@@ -1664,6 +1664,40 @@ echo "$OUT" | grep -q "工作目录"; check $? "TUI 横幅显示工作目录"
 echo "$OUT" | grep -q "项目说明"; check $? "TUI 横幅显示项目说明状态"
 echo "$OUT" | grep -q "当前模型"; check $? "TUI 横幅显示当前模型"
 echo "$OUT" | grep -q "Session"; check $? "TUI 横幅显示 Session ID"
+# 2026-09-24 TUI 显示完整化:横幅所有行必须**严格等宽**。
+# 旧实现边框写死 58 内宽 + 每行 45/46 独立填充预算,实测行宽在 59~61 之间跳动
+# (右边框参差、被截断的行顶穿边框);现由 textfit::InfoBox 统一按
+# min(内容自然宽, 终端可用宽) 排版。
+if command -v python3 >/dev/null 2>&1; then
+  # PYTHONIOENCODING=utf-8:Windows 控制台默认 GBK,打印含 ✓/║ 的失败面板会先抛
+  # UnicodeEncodeError 把真实断言结果盖掉(实测本机踩到);报告也保持 ASCII 友好。
+  PYTHONIOENCODING=utf-8 python3 - "$OUT" <<'PYEOF'
+import sys, unicodedata
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+def w(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+rows = [l.rstrip("\n") for l in sys.argv[1].splitlines()]
+try:
+    top = next(i for i, l in enumerate(rows) if l.startswith("╔"))
+    bot = next(i for i, l in enumerate(rows[top:], top) if l.startswith("╚"))
+except StopIteration:
+    print("  banner box (╔..╚) not found"); sys.exit(1)
+box = rows[top:bot + 1]
+widths = sorted({w(l) for l in box})
+if len(widths) != 1:
+    print(f"  banner rows NOT equal width: {widths}")
+    for l in box:
+        print(f"    {w(l):>3} |{l}")
+    sys.exit(1)
+if not (40 <= widths[0] <= 200):
+    print(f"  banner box width out of range: {widths[0]}"); sys.exit(1)
+print(f"  banner {len(box)} rows all {widths[0]} columns OK")
+PYEOF
+  check $? "TUI 横幅所有行严格等宽"
+else
+  echo "  [SKIP] python3 不可用,跳过横幅等宽校验"
+fi
 echo "$OUT" | grep -q "provider add"; check $? "/help 输出命令指南"
 echo "$OUT" | grep -q "开启新会话\|已开启新会话"; check $? "/new 命令生效"
 # 第 114 轮:/agents 自感知面板(名册 / 上限 / 最近作业;无需 LLM,离线可查)
@@ -2203,6 +2237,16 @@ else
   tsend "$(printf '\x1b[200~%s\x1b[201~' "$PASTE12")"
   sleep 0.6
   texpect "[粘贴 #1 +12 行]" "tmux: 大粘贴转 marker(输入行不被 12 行原文淹没)"
+  tkey C-u; sleep 0.3
+
+  # 14d) 多行粘贴保真(2026-09-24 修 R5):3 行 Markdown 提示词过去被判「小粘贴」→
+  #      换行全替换成空格,屏幕上只剩一行、送进模型也丢了列表结构。现在 ≥2 行即转
+  #      marker 保真,并立刻在滚动区回显原文预览。
+  PASTE3=$(printf '### 标题行\n1. 步骤一\n2. 步骤二')
+  tsend "$(printf '\x1b[200~%s\x1b[201~' "$PASTE3")"
+  sleep 0.6
+  texpect "[粘贴 #1 +3 行]" "tmux: 多行粘贴转 marker(换行不再被压成空格)"
+  texpect "原文已保留(3 行" "tmux: 粘贴后即时回显原文预览"
   tkey C-u; sleep 0.3
 
   # 15) /exit 退出 TUI(tmux 检测到子进程结束自动销毁会话)
