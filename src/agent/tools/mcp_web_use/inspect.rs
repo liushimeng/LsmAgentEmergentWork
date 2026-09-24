@@ -1,7 +1,8 @@
 //! MCP_Web_Use action=inspect:全部只读观察统一入口(自 tools/browser.rs 平移)。
 //!
-//! `info` 枚举(14 个)覆盖 Console / Network / Elements / DOM / localStorage /
-//! sessionStorage / Cookies / 截图 / 页面元信息 / 视口 / URL / 标题 / ping / 图片 URL。
+//! `info` 枚举(17 个)覆盖 Console / Network / Elements / DOM / localStorage /
+//! sessionStorage / Cookies / 截图 / 页面元信息 / 视口 / URL / 标题 / ping /
+//! 图片 URL / OCR / 人工阻断检测 / 链接批量提取。
 
 use serde_json::{json, Value};
 
@@ -374,6 +375,66 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                     }};
                 }})()"#,
                 max_n = max_n,
+            );
+            eval_js_string(&page, &js).await
+        }
+        // 第 N 轮:链接批量提取 —— 一键提取页面所有链接(href + 文本 + 上下文),
+        // 用于「自动遍历子页面、找文章/新闻列表、按时间排序」等场景。
+        // 替代此前 LLM 需要多次 inspect(elements, nth=0/1/2...) 逐条提取的低效方式。
+        "extract_links" => {
+            let sel = str_arg(&params, "selector").unwrap_or("a");
+            let max_n = params.get("max_links").and_then(Value::as_u64).unwrap_or(200).min(500) as usize;
+            let include_context = params.get("include_context").and_then(Value::as_bool).unwrap_or(true);
+            let ctx_len = params.get("context_length").and_then(Value::as_u64).unwrap_or(200).min(500) as usize;
+            let host = eval_js_string(&page, "window.location.hostname")
+                .await
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let js = format!(
+                r#"(() => {{
+                    const SEL = {sel}, MAX = {max_n}, CTX = {ctx_len}, INC = {inc};
+                    const HOST = {host};
+                    const links = [];
+                    const seen = new Set();
+                    const nodes = document.querySelectorAll(SEL);
+                    for (const a of nodes) {{
+                        if (links.length >= MAX) break;
+                        if (a.closest && a.closest('[data-laew-agent]')) continue;
+                        const href = (a.href || '').trim();
+                        if (!href || href.startsWith('javascript:') || href.startsWith('#')) continue;
+                        const text = ((a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim()).slice(0, 200);
+                        if (!text) continue;
+                        const key = href + '||' + text;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        let context = '';
+                        if (INC) {{
+                            const container = a.closest('article, .post, .news, .blog, section, li, div[class*="article"], div[class*="post"], div[class*="news"], div[class*="item"]');
+                            if (container) {{
+                                context = (container.innerText || '').replace(/\s+/g, ' ').trim().slice(0, CTX);
+                            }}
+                        }}
+                        links.push({{
+                            href: href,
+                            text: text,
+                            context: context,
+                            is_external: !href.includes(HOST)
+                        }});
+                    }}
+                    return {{
+                        links: links,
+                        total: links.length,
+                        truncated: nodes.length > MAX,
+                        scanned: nodes.length,
+                        hostname: HOST
+                    }};
+                }})()"#,
+                sel = js_str(sel),
+                max_n = max_n,
+                ctx_len = ctx_len,
+                inc = include_context,
+                host = js_str(&host),
             );
             eval_js_string(&page, &js).await
         }

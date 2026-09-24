@@ -149,9 +149,11 @@ pub(crate) enum PasteInsert {
 
 /// 粘贴统一入口:过滤 → 保真判定 → 直插(仅单行)或登记 marker(多行/超长)。
 ///
-/// 判定前先剔除首尾换行:逐键粘贴突发路径会在段首补一个 `\n`(代表刚按下的 Enter,
-/// 见第 93 轮 `drain_paste_burst`),不剔就会把「一次 Enter + 一行内容」误判成多行粘贴、
-/// 给短输入套上噪声 marker。
+/// 判定前剔除首尾换行:bracketed paste 路径可能在段首尾带一个代表 Enter 的换行,
+/// 不剔就会把「一次 Enter + 一行内容」误判成多行粘贴、给短输入套上噪声 marker。
+/// burst 路径(逐键粘贴突发)的 text 由 drain_paste_burst 拼接而来,内部已含原始
+/// 换行(\n),由调用方保证首尾不含多余换行——handle_paste_text 统一 trim 后不影响
+/// burst 路径的多行判定(内部 \n 仍在)。
 pub(crate) fn handle_paste_text(text: &str, registry: &mut PasteRegistry) -> PasteInsert {
     let filtered = PasteRegistry::filter(text);
     let probe = filtered.trim_matches(|c| c == '\n' || c == '\r');

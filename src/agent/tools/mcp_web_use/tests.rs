@@ -78,11 +78,11 @@ fn parameters_info_enum_complete() {
     for required in &[
         "console", "network", "elements", "dom", "localstorage", "sessionstorage",
         "cookies", "screenshot", "page_meta", "viewport", "url", "title", "image_urls",
-        "blockers",
+        "blockers", "extract_links",
     ] {
         assert!(names.contains(required), "info 枚举缺失 {required}");
     }
-    assert_eq!(names.len(), 16, "info 应为 16 个,实际 {names:?}");
+    assert_eq!(names.len(), 17, "info 应为 17 个,实际 {names:?}");
 }
 
 #[test]
@@ -415,8 +415,9 @@ fn parameters_info_enum_contains_ocr() {
     let p = McpWebUseTool.parameters();
     let enums = p["properties"]["info"]["enum"].as_array().expect("info enum 应为数组");
     let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(names.len(), 16, "info 应有 16 个枚举值: {names:?}");
+    assert_eq!(names.len(), 17, "info 应有 17 个枚举值: {names:?}");
     assert!(names.contains(&"ocr"), "info 枚举应含 ocr: {names:?}");
+    assert!(names.contains(&"extract_links"), "info 枚举应含 extract_links: {names:?}");
 }
 
 #[test]

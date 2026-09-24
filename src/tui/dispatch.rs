@@ -721,7 +721,9 @@ impl TuiSession {
             }
             Err(e) if matches!(e, crate::error::AgentError::Cancelled) => {
                 println!();
-                println!("  ✓ 本次任务已取消,可继续输入新指令。");
+                // 修正:当前架构下 Ctrl+C 触发全局 shutdown 后 TUI 整体退出,
+                // 不存在「取消任务继续会话」路径。「可继续输入新指令」是误导性文案。
+                println!("  ✓ 本次任务已取消。");
                 Some((
                     OutcomeKind::Cancelled,
                     "(任务已取消)".to_string(),

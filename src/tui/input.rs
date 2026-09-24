@@ -811,27 +811,32 @@ impl InputHandler {
                                                     &pastes,
                                                 );
                                             }
-                                            let paste_text = format!("\n{burst}");
-                                            let preview =
-                                                match paste::handle_paste_text(&paste_text, &mut pastes) {
-                                                    paste::PasteInsert::Inline(s) => {
-                                                        buffer.insert_str(cursor, &s);
-                                                        cursor += s.len();
-                                                        None
-                                                    }
-                                                    paste::PasteInsert::Marker(s) => {
-                                                        buffer.insert_str(cursor, &s);
-                                                        cursor += s.len();
-                                                        // 同 bracketed paste 路径:整段原文已保真,
-                                                        // 立刻回显预览,不让用户对着一个 marker 猜
-                                                        let content = pastes.last_content();
-                                                        Some(paste::plan_paste_preview(
-                                                            &s,
-                                                            &content,
-                                                            textfit::term_width_for_render(),
-                                                        ))
-                                                    }
-                                                };
+                                            // 第 N 轮修复:非 bracketed paste 终端的多行粘贴。
+                                            // burst 已包含原始换行(\n),来自 burst_events_to_text
+                                            // 的 Enter 分支。不再用 format!("\n{burst}") 包裹
+                                            // ——前导 \n 会被 handle_paste_text 的 trim_matches 剔除,
+                                            // 且首行字符在 buffer 中已存在,直接拼接 burst 即可。
+                                            // burst 自身含 \n,满足 is_large(含\n)条件,走 marker 保真。
+                                            let preview = match paste::handle_paste_text(
+                                                &burst,
+                                                &mut pastes,
+                                            ) {
+                                                paste::PasteInsert::Inline(s) => {
+                                                    buffer.insert_str(cursor, &s);
+                                                    cursor += s.len();
+                                                    None
+                                                }
+                                                paste::PasteInsert::Marker(s) => {
+                                                    buffer.insert_str(cursor, &s);
+                                                    cursor += s.len();
+                                                    let content = pastes.last_content();
+                                                    Some(paste::plan_paste_preview(
+                                                        &s,
+                                                        &content,
+                                                        textfit::term_width_for_render(),
+                                                    ))
+                                                }
+                                            };
                                             overlay_lines = self.update_completion(
                                                 &mut stdout,
                                                 &layout,

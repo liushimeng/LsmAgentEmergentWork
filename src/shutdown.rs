@@ -251,19 +251,42 @@ mod unix {
 mod windows {
     use super::*;
 
-    /// Windows:简化实现 —— Windows console 下 Ctrl+C 走 GenerateConsoleCtrlEvent,
-    /// 但完整的 Win32 API 需要 windows-sys crate,本项目当前未引入。
+    /// Windows:Ctrl+C 信号处理器。
     ///
-    /// 当前策略是 Windows 下让 ctrl_c 通过 tokio::signal::ctrl_c() 处理,
-    /// SIGTSTP 在 Windows 下没有等价物,ConsoleSuspend 模式靠 OS 自身。
+    /// **问题背景**: Windows 任务运行期终端处于 cooked mode,默认 Ctrl+C 行为是
+    /// 直接终止进程(无任何清理:终端滚动区残留、bash 子进程变孤儿、无 graceful 收口)。
+    /// 此前 install() 为空实现,依赖"tokio::signal::ctrl_c() 在 dispatch.rs 中已使用"
+    /// 的假设——但实际并不存在该调用。
     ///
-    /// 已知限制:
-    /// - Ctrl+C 双触发(crossterm 字符层 + SIGINT)行为与 Unix 略有差异;
-    /// - 但 Windows console 默认会消费 Ctrl+C 在输入层,所以重复触发概率低于 Unix。
-    pub fn install(_sig: Arc<ShutdownSignal>) -> io::Result<()> {
-        // Windows 信号处理留作后续接入 SetConsoleCtrlHandler。
-        // 本轮不引入 windows-sys 依赖以保持构建轻量。
-        // 兜底:tokio::signal::ctrl_c() 在 main.rs / dispatch.rs 中已使用。
+    /// **本轮修复**:install() 启动后台 task,使用 tokio::signal::ctrl_c() 监听
+    /// Ctrl+C 事件。任务运行期(dispatch_prompt)由 dispatch.rs 单独 spawn 监听
+    /// (因为任务期不处于 raw mode,tokio::signal::ctrl_c 只在 raw mode 或独立
+    /// ConsoleCtrlHandler 下才可靠);install() 主要负责 TUI 空闲期(阻塞在 read_line)
+    /// 的 Ctrl+C 捕获。
+    pub fn install(sig: Arc<ShutdownSignal>) -> io::Result<()> {
+        // tokio::signal::ctrl_c() 在 Windows 平台可用,但仅在进程拥有控制台且
+        // 未禁用 CTRL_C_EVENT 时有效。read_line 期间终端处于 raw mode,crossterm
+        // 会消费 Ctrl+C 作为字符事件(不产生 CTRL_C_EVENT),所以该 handler 主要
+        // 覆盖「进程空闲等待但未进 raw mode」的窗口。
+        //
+        // 任务运行期的 Ctrl+C 由 dispatch.rs 中的独立 task 处理(dispatch 期间
+        // 短暂启用 raw mode 监听 Ctrl+C 字符,或依赖 crossterm 事件流)。
+        let sig_clone = sig.clone();
+        tokio::spawn(async move {
+            loop {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        tracing::info!("[shutdown] Ctrl+C received (Windows), triggering shutdown");
+                        sig_clone.trigger(ShutdownReason::UserInterrupt);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("[shutdown] Windows ctrl_c listener error: {e}, exiting watcher");
+                        break;
+                    }
+                }
+            }
+        });
         Ok(())
     }
 }

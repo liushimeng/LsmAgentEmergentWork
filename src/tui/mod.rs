@@ -545,6 +545,11 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
                 eprintln!();
                 eprintln!("  [laew] 收到 shutdown 信号({:?}),退出 TUI。",
                     shutdown_sig.current_reason());
+                // 统一退出清理:拆除固定底部输入组件 + 重置滚动区,
+                // 避免底部输入面板和快捷键提示行残留终端。
+                crate::agent::human_assist::HumanAssistHub::global().detach();
+                input::teardown_pinned();
+                let _ = terminal::disable_raw_mode();
                 break;
             }
 
@@ -554,10 +559,19 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
                 InputResult::Submitted(l) => l,
                 InputResult::Exit => {
                     println!("  再见。");
+                    // 统一退出清理:拆除固定底部输入组件 + 重置滚动区,
+                    // 避免底部输入面板和快捷键提示行残留终端。
+                    crate::agent::human_assist::HumanAssistHub::global().detach();
+                    input::teardown_pinned();
+                    let _ = terminal::disable_raw_mode();
                     break;
                 }
                 InputResult::Interrupted => {
-                    println!("  (中断) 输入 /exit 或 Ctrl-D 退出。");
+                    // 修正(第 N 轮):当前 Ctrl-C 语义是触发全局 shutdown 后 TUI
+                    // 整体退出(由主循环开头 is_triggered 判定 break),不存在
+                    // 「中断后继续会话」路径。「输入 /exit 或 Ctrl-D 退出」是误导性文案。
+                    // 仅做视觉提示,下一轮循环即退出。
+                    println!("  (中断) 正在退出...");
                     continue;
                 }
             };
