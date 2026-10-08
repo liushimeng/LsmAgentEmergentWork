@@ -348,6 +348,14 @@ impl MainWorkRunner {
                     degraded: true,
                 }
             } else {
+                // 第 135 轮:网页类任务的降级兜底必须 `pre_explore = true`。
+                // Main-Work 提示词明写「凡是涉及网页/浏览器操作的 WorkFlow 必须置
+                // true」,而 `orchestrator/workflows.rs` 的批量优先硬约束**只在该位
+                // 为 true 时注入**。旧实现在此无条件写 false,把网页抓取任务最关键的
+                // 效率约束整条关掉 —— 实测事故(`llaew_20261008_173357.log`)正是
+                // 解析失败降级后的单 WorkFlow 把「先 explore 一次拿全页面状态,再
+                // batch 一次提交」退化成了链式单步,24 次迭代打满上限。
+                let web_task = is_web_task(original_prompt, &decomposition);
                 WorkFlowPlan {
                     workflows: vec![WorkFlowSpec {
                         id: "wf-1".into(),
@@ -360,9 +368,14 @@ impl MainWorkRunner {
                         delegate_to: AgentRole::SubAgent,
                         // 2026-09-19 第 91 轮 P0-6/P0-8:新字段兜底默认值
                         max_iterations: None, original_prompt: None,
-                        pre_explore: false,
+                        pre_explore: web_task,
                     }],
-                    summary: "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into(),
+                    summary: if web_task {
+                        "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底(网页任务,已开启批量优先)"
+                            .into()
+                    } else {
+                        "Main-Work JSON 解析失败,已使用单 WorkFlow 兜底".into()
+                    },
                     degraded: true,
                 }
             }
@@ -464,8 +477,24 @@ impl MainWorkRunner {
 /// 实测 Main-Work 常把「打开微信 → 搜索联系人 → 打开会话 → 输入 → 发送」拆成
 /// 5 个串行单元。每个单元都有独立 Agent 上下文,真实焦点 / 搜索框状态无法传递。
 /// 合并保留真实窗口连续性。
-fn coalesce_same_app_window_workflows(plan: &mut WorkFlowPlan) {
-    /// app 家族关键词(小写匹配)。
+/// 任务是否属于「网页/浏览器操作」类(决定降级兜底要不要开 `pre_explore`)。
+///
+/// 纯函数,可单测。判据取自用户原文与 Yolo 分解步骤:显式 `http(s)://` URL、
+/// `MCP_Web_Use` 工具名、或一批网页语义关键词。刻意**不**用「出现 www」这类
+/// 弱信号,避免把本地任务误判成网页任务而多注入一段无关提示词。
+pub(crate) fn is_web_task(original_prompt: Option<&str>, decomposition: &[String]) -> bool {
+    const WEB_KEYWORDS: &[&str] = &[
+        "mcp_web_use", "网页", "网站", "浏览器", "网址", "链接", "首页", "抓取",
+        "爬取", "采集", "页面", "html", "http://", "https://", ".com", ".cn", ".net",
+    ];
+    let hit = |s: &str| {
+        let low = s.to_lowercase();
+        WEB_KEYWORDS.iter().any(|kw| low.contains(kw))
+    };
+    original_prompt.is_some_and(hit) || decomposition.iter().any(|s| hit(s))
+}
+
+fn coalesce_same_app_window_workflows(plan: &mut WorkFlowPlan) {    /// app 家族关键词(小写匹配)。
     const APP_FAMILIES: &[(&str, &[&str])] = &[
         ("微信", &["微信", "wechat", "weixin"]),
         ("QQ", &["qq"]),

@@ -512,8 +512,14 @@ pub struct DebugRunner {
 
 impl DebugRunner {
     pub fn new(llm: Arc<dyn LlmClient>) -> Self {
-        // Debug Agent 只做一次性文本评估,限制迭代次数防跑偏
-        let agent = Agent::new(llm, AgentProfile::debug_profile()).with_max_iterations(2);
+        // Debug Agent 只做一次性文本评估,限制迭代次数防跑偏。
+        // 第 135 轮:max_tokens 起跳提到 16K —— 实测(`llaew_20261008_173357.log`)
+        // 一次评估要产出四章节 Markdown,8K 起跳被 `stop_reason=max_tokens` 打满,
+        // 静默升 16K 后又跑满 2 次迭代,单是报告就烧掉 248.7s / 18208 output token,
+        // 而产物只是一份没人读的 Markdown。
+        let agent = Agent::new(llm, AgentProfile::debug_profile())
+            .with_max_iterations(2)
+            .with_max_tokens_seed(16_384);
         Self { agent }
     }
 

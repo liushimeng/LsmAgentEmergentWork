@@ -39,9 +39,23 @@ struct MaxTokensInner {
 impl MaxTokensState {
     /// 新建状态机,起始 `MAX_TOKENS_FLOOR`(8K)。
     pub fn new() -> Self {
+        Self::with_floor(MAX_TOKENS_FLOOR)
+    }
+
+    /// 第 135 轮新增:以指定值起跳的状态机(封顶仍是 [`MAX_TOKENS_CEIL`] 翻倍)。
+    ///
+    /// 用于**输出天然很长**的角色(Debug Agent 一次要产出「任务评估 / 质量报告 /
+    /// 问题报告 / 优化建议」四章节):8K 起跳在实测里被 `stop_reason=max_tokens`
+    /// 打满,静默升 16K 后又跑满 2 次迭代,单是报告就烧掉 248.7s / 18208 output
+    /// token,而产物只是一份没人读的 Markdown。
+    ///
+    /// **刻意不抬高全局 `MAX_TOKENS_FLOOR`**:8K 是 Anthropic 协议默认值,不少
+    /// 自建 / OpenAI 兼容网关按 8192 硬校验 `max_tokens`,全局抬高会让这些接入点
+    /// 直接 400。只给需要的角色单独起跳,其余角色行为一字不变。
+    pub fn with_floor(floor: u32) -> Self {
         Self {
             inner: Mutex::new(MaxTokensInner {
-                current: MAX_TOKENS_FLOOR,
+                current: floor.clamp(1024, MAX_TOKENS_CEIL),
                 upscalings: 0,
             }),
         }

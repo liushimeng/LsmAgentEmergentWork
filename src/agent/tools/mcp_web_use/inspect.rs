@@ -1,8 +1,9 @@
 //! MCP_Web_Use action=inspect:全部只读观察统一入口(自 tools/browser.rs 平移)。
 //!
-//! `info` 枚举(17 个)覆盖 Console / Network / Elements / DOM / localStorage /
+//! `info` 枚举(19 个)覆盖 Console / Network / Elements / DOM / localStorage /
 //! sessionStorage / Cookies / 截图 / 页面元信息 / 视口 / URL / 标题 / ping /
-//! 图片 URL / OCR / 人工阻断检测 / 链接批量提取。
+//! 图片 URL / OCR / 人工阻断检测 / 链接批量提取 / 结构化列表抽取(`extract`,
+//! 见 `extract.rs`) / 页面 SSR 注水数据直读(`page_state`,见 `page_state.rs`)。
 
 use serde_json::{json, Value};
 
@@ -457,6 +458,12 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             );
             eval_js_string(&page, &js).await
         }
+        // 第 135 轮:结构化列表 / 表格抽取(见 extract.rs)—— 替代「手写 eval_js +
+        // 猜字段层级 + 大对象 dump」的三连坑;probe=true 时只做选择器侦查。
+        "extract" => extract::run(&page, &params).await,
+        // 第 135 轮:页面内 SSR 注水数据直读(见 page_state.rs)—— 让模型不必
+        // 猜 `window.__NEXT_DATA__` 之类的全局变量名。
+        "page_state" => page_state::run(&page, &params).await,
         other => return envelope(1001, "未知 info", json!({"info": other})),
     };
     match res {

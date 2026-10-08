@@ -1,6 +1,7 @@
 //! MCP_Web_Use 工具单元测试(自 tools/browser.rs 测试平移 + 单工具化改造)。
 
 use super::*;
+use super::{control, extract, page_state};
 use base64::Engine as _;
 
 #[test]
@@ -78,11 +79,11 @@ fn parameters_info_enum_complete() {
     for required in &[
         "console", "network", "elements", "dom", "localstorage", "sessionstorage",
         "cookies", "screenshot", "page_meta", "viewport", "url", "title", "image_urls",
-        "blockers", "extract_links",
+        "blockers", "extract_links", "extract", "page_state",
     ] {
         assert!(names.contains(required), "info 枚举缺失 {required}");
     }
-    assert_eq!(names.len(), 17, "info 应为 17 个,实际 {names:?}");
+    assert_eq!(names.len(), 19, "info 应为 19 个,实际 {names:?}");
 }
 
 #[test]
@@ -415,9 +416,220 @@ fn parameters_info_enum_contains_ocr() {
     let p = McpWebUseTool.parameters();
     let enums = p["properties"]["info"]["enum"].as_array().expect("info enum 应为数组");
     let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(names.len(), 17, "info 应有 17 个枚举值: {names:?}");
+    assert_eq!(names.len(), 19, "info 应有 19 个枚举值: {names:?}");
     assert!(names.contains(&"ocr"), "info 枚举应含 ocr: {names:?}");
     assert!(names.contains(&"extract_links"), "info 枚举应含 extract_links: {names:?}");
+}
+
+// =================== 第 135 轮:extract / page_state / eval_js 体积闸门 ===================
+
+#[test]
+fn extract_requires_item_selector() {
+    let f = extract::parse_fields(None);
+    assert_eq!(f.len(), 1, "fields 缺省应给通用投影");
+    assert_eq!(f[0].name, "text");
+    assert!(f[0].selector.is_none(), "通用投影不假设选择器");
+}
+
+#[test]
+fn extract_parses_field_specs() {
+    let params = json!({
+        "fields": {
+            "title":   {"selector": "h3 a", "required": true},
+            "time":    {"selector": "time", "attr": "datetime"},
+            "summary": {"selector": ".descript", "max_chars": 30}
+        }
+    });
+    let mut f = extract::parse_fields(params.get("fields"));
+    f.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(f.len(), 3);
+    let t = f.iter().find(|x| x.name == "title").unwrap();
+    assert_eq!(t.selector.as_deref(), Some("h3 a"));
+    assert!(t.required);
+    let tm = f.iter().find(|x| x.name == "time").unwrap();
+    assert_eq!(tm.attr.as_deref(), Some("datetime"));
+    let s = f.iter().find(|x| x.name == "summary").unwrap();
+    assert_eq!(s.max_chars, 30);
+    assert!(!s.required, "required 缺省应为 false");
+}
+
+#[test]
+fn extract_parses_filter_spec() {
+    let params = json!({"filter": {
+        "keywords": ["AI", " 大模型 ", ""],
+        "match_all": true,
+        "time_field": "time",
+        "since": "2026-10-07 05:33",
+        "sort": "time:desc",
+        "limit_after_filter": 20
+    }});
+    let f = extract::parse_filter(params.get("filter"));
+    // 空白项被剔除,保留 2 个
+    assert_eq!(f.keywords, vec!["AI".to_string(), "大模型".to_string()]);
+    assert!(f.match_all);
+    assert_eq!(f.time_field.as_deref(), Some("time"));
+    assert_eq!(f.sort.as_deref(), Some("time:desc"));
+    assert_eq!(f.limit_after_filter, Some(20));
+}
+
+#[test]
+fn extract_filter_defaults_are_permissive() {
+    let f = extract::parse_filter(None);
+    assert!(f.keywords.is_empty());
+    assert!(!f.match_all, "match_all 缺省应为任一命中");
+    assert!(f.time_field.is_none());
+    assert!(f.since.is_none() && f.until.is_none());
+}
+
+/// 时间边界解析(纯函数):日期类返回日历分量(由页面按本地时区换算),
+/// Unix 时间戳类返回绝对毫秒。
+#[test]
+fn extract_parses_time_bounds() {
+    assert_eq!(
+        extract::parse_bound("2026-10-08"),
+        Some(extract::Bound::Parts { y: 2026, mo: 10, d: 8, hh: 0, mm: 0, ss: 0 })
+    );
+    assert_eq!(
+        extract::parse_bound("2026-10-08 17:02"),
+        Some(extract::Bound::Parts { y: 2026, mo: 10, d: 8, hh: 17, mm: 2, ss: 0 })
+    );
+    assert_eq!(
+        extract::parse_bound("2026-10-08T17:02:33"),
+        Some(extract::Bound::Parts { y: 2026, mo: 10, d: 8, hh: 17, mm: 2, ss: 33 })
+    );
+    assert_eq!(
+        extract::parse_bound("2026/10/08 17:02"),
+        Some(extract::Bound::Parts { y: 2026, mo: 10, d: 8, hh: 17, mm: 2, ss: 0 }),
+        "斜杠写法应与连字符等价"
+    );
+    // Unix 秒 / 毫秒 → 绝对值
+    assert_eq!(extract::parse_bound("1791417600"), Some(extract::Bound::Ms(1_791_417_600_000)));
+    assert_eq!(extract::parse_bound("1791417600000"), Some(extract::Bound::Ms(1_791_417_600_000)));
+    // 非法输入返回 None(fail-open:JS 侧跳过该侧约束并回报 unparsed)
+    assert_eq!(extract::parse_bound("36小时前"), None);
+    assert_eq!(extract::parse_bound("2026-13-40"), None);
+    assert_eq!(extract::parse_bound("2026-10-08 99:00"), None);
+    assert_eq!(extract::parse_bound(""), None);
+}
+
+/// 生成脚本必须把过滤放在页面内(否则又回到「19KB 大对象直灌」的旧坑)。
+#[test]
+fn extract_builds_in_page_filtering_js() {
+    let fields = extract::parse_fields(Some(&json!({
+        "title": {"selector": "h3 a"},
+        "time":  {"selector": "time", "attr": "datetime"}
+    })));
+    let filter = extract::parse_filter(Some(&json!({
+        "keywords": ["AI"],
+        "time_field": "time",
+        "since": "2026-10-07 05:33",
+        "sort": "time:desc"
+    })));
+    let js = extract::build_js(".item", "a", &fields, &filter, 1000, 200);
+
+    // 选择器与字段名都被安全嵌入
+    assert!(js.contains("const ITEM_SEL = \".item\""), "{js}");
+    assert!(js.contains("\"name\":\"title\""), "{js}");
+    assert!(js.contains("\"name\":\"time\""), "{js}");
+    // 关键词小写化后嵌入
+    assert!(js.contains("\"ai\""), "{js}");
+    // 时间窗两侧都以**日历分量**注入,由页面按本地时区换算(避免 UTC 偏移 8 小时)
+    assert!(js.contains("SINCE_RAW = [2026,10,7,5,33,0]"), "{js}");
+    assert!(js.contains("UNTIL_RAW = null"), "{js}");
+    assert!(js.contains("const toMs = (b) =>"), "{js}");
+    // 中文相对时间解析在脚本内
+    assert!(js.contains("小时前"), "{js}");
+    assert!(js.contains("SORT = \"time:desc\""), "{js}");
+    // 关键:过滤与截断都在页面内完成
+    assert!(js.contains("items.slice(0, CAP)"), "{js}");
+    // 自诊断字段
+    assert!(js.contains("unparsed_time_fields"), "{js}");
+}
+
+/// page_state:三闸裁剪 + dropped_paths + 探测 window 全局键。
+#[test]
+fn page_state_builds_guarded_js() {
+    let js = page_state::build_js(
+        &["__NEXT_DATA__".to_string()],
+        true,
+        20_000,
+        8,
+        200,
+    );
+    assert!(js.contains("MAX_BYTES = 20000"), "{js}");
+    assert!(js.contains("MAX_DEPTH = 8"), "{js}");
+    assert!(js.contains("MAX_ITEMS = 200"), "{js}");
+    assert!(js.contains("const PROBE = true"), "{js}");
+    assert!(js.contains("dropped"), "必须回报被裁路径:{js}");
+    assert!(js.contains("__NEXT_DATA__"));
+    // JSON-LD 顺带提取
+    assert!(js.contains("application/ld+json"), "{js}");
+}
+
+/// eval_js 复合值体积闸门(第 135 轮)。
+#[test]
+fn sanitize_eval_result_passes_small_structures_through() {
+    let small = json!([{"title": "A", "url": "https://36kr.com/p/1"}]);
+    assert_eq!(control::sanitize_eval_result(small.clone()), small);
+}
+
+#[test]
+fn sanitize_eval_result_shrinks_huge_arrays() {
+    // 800 个元素,每个约 300 字节 → 远超 20KB 闸门
+    let big: Vec<Value> = (0..800)
+        .map(|i| json!({"id": i, "title": "x".repeat(200), "url": format!("https://36kr.com/p/{i}")}))
+        .collect();
+    let out = control::sanitize_eval_result(Value::Array(big));
+    // 裁剪后应远小于原始大小
+    let out_len = serde_json::to_string(&out).unwrap().len();
+    assert!(out_len < 60_000, "裁剪后仍应显著变小,实际 {out_len}");
+    assert!(
+        out.to_string().contains("__skipped__") || out.to_string().contains("__truncated__"),
+        "应显式标注裁剪:{out}"
+    );
+}
+
+#[test]
+fn sanitize_eval_result_spills_oversized_objects_to_file() {
+    // 单个超大字符串字段的对象:裁剪后仍超限 → 落盘
+    let big: Vec<Value> = (0..200)
+        .map(|i| json!({"id": i, "body": "y".repeat(2000)}))
+        .collect();
+    let out = control::sanitize_eval_result(json!({ "items": big }));
+    assert_eq!(out["result_truncated"], json!(true));
+    assert_eq!(out["value_kind"], json!("object"));
+    assert!(out["saved_to"].is_string(), "应落盘并返回 saved_to");
+    assert!(out["hint"].is_string());
+    // 落盘内容应是**完整**原始数据,不是裁剪后的
+    let path = out["saved_to"].as_str().unwrap();
+    let on_disk = std::fs::read_to_string(path).expect("落盘文件应可读");
+    assert!(
+        on_disk.len() > 400_000,
+        "落盘应是完整原始数据,实际 {} 字节",
+        on_disk.len()
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// 同毫秒并发落盘不得互相覆盖(第 135 轮修)。
+#[test]
+fn eval_spill_filenames_do_not_collide() {
+    let a = format!("{}_{}", 1_789_516_800_000u128, 0);
+    let b = format!("{}_{}", 1_789_516_800_000u128, 1);
+    assert_ne!(a, b);
+}
+
+/// eval_js 匿名函数形态识别(第 135 轮:实测事故里 `function(){…}` 被误判为
+/// 「已是函数形态」而跳过包裹,抛 SyntaxError 还凭空派生一个野页面)。
+#[test]
+fn eval_js_detects_anonymous_function_decl() {
+    assert!(control::is_anonymous_function_decl("function(){ return 1; }"));
+    assert!(control::is_anonymous_function_decl("  function (){ return 1 }"));
+    assert!(control::is_anonymous_function_decl("function*(){}"));
+    // 有名字 → 不是匿名函数语句
+    assert!(!control::is_anonymous_function_decl("function foo(){ return 1; }"));
+    assert!(!control::is_anonymous_function_decl("(() => 1)()"));
+    assert!(!control::is_anonymous_function_decl("var x = 1; return x;"));
 }
 
 #[test]
@@ -724,4 +936,39 @@ fn merge_hint_不覆盖已有字段() {
     super::merge_hint(&mut out, hint);
     assert_eq!(out["next_action"], "keep_me", "已有字段不应被覆盖");
     assert_eq!(out["human_assist"]["reason"], "captcha");
+}
+
+/// 内建 SSR 注水点候选:非空且互不重复(顺序即优先级)。
+#[test]
+fn page_state_builtin_candidates_are_unique() {
+    let c = page_state::builtin_candidates();
+    assert!(c.len() >= 6, "候选过少: {c:?}");
+    let mut sorted: Vec<&str> = c.to_vec();
+    sorted.sort_unstable();
+    let before = sorted.len();
+    sorted.dedup();
+    assert_eq!(sorted.len(), before, "候选有重复: {c:?}");
+    assert!(c.contains(&"__NEXT_DATA__"));
+    assert!(c.contains(&"initialState"));
+}
+
+/// 把生成的页面内脚本写到临时文件,供 `node --check` 做语法校验
+/// (运行:`cargo test --lib dump_generated_js -- --ignored --nocapture`)。
+#[test]
+#[ignore]
+fn dump_generated_js() {
+    use std::io::Write;
+    let fields = extract::parse_fields(Some(&json!({
+        "title": {"selector": "h3 a", "required": true},
+        "time":  {"selector": "time", "attr": "datetime"}
+    })));
+    let filter = extract::parse_filter(Some(&json!({
+        "keywords": ["AI", "大模型"], "time_field": "time",
+        "since": "2026-10-07 05:33", "sort": "time:desc"
+    })));
+    let mut f = std::fs::File::create("/tmp/laew_extract_gen.js").unwrap();
+    writeln!(f, "{}", extract::build_js(".item", "a", &fields, &filter, 1000, 200)).unwrap();
+    let mut f2 = std::fs::File::create("/tmp/laew_page_state_gen.js").unwrap();
+    writeln!(f2, "{}", page_state::build_js(&["__NEXT_DATA__".into()], true, 20000, 8, 200)).unwrap();
+    eprintln!("written");
 }

@@ -21,6 +21,11 @@ pub mod skill_catalog;
 /// 运行时兜底见 `crate::agent::safety::web_evidence`。
 pub mod web_evidence;
 
+/// 网页内容提取纪律提示词段(2026-10-08 第 135 轮,独立子模块防 mod.rs 超 1800 行)。
+/// 配套工具面:`inspect(info=extract)` / `inspect(info=page_state)`,见
+/// `src/agent/tools/mcp_web_use/{extract,page_state}.rs`。
+pub mod web_extract;
+
 /// 工具说明生成策略。
 #[derive(Clone)]
 pub enum ToolsHint {
@@ -260,7 +265,8 @@ impl SystemPrompt {
             .set_protocol_tail(crate::config::Protocol::OpenAi, SUB_AGENT_OPENAI_TAIL)
             .set_identity(SUB_AGENT_IDENTITY)
             .append_base(MCP_WEB_USE_PROMPT_SECTION)
-            .append_base(web_evidence::WEB_EVIDENCE_PROMPT_SECTION);
+            .append_base(web_evidence::WEB_EVIDENCE_PROMPT_SECTION)
+            .append_base(web_extract::WEB_EXTRACT_PROMPT_SECTION);
         let prompt = if crate::agent::tools::mcp_use::mcp_use_enabled() {
             prompt.append_base(mcp_use_hint::MCP_USE_PROMPT_SECTION)
         } else {
@@ -759,8 +765,8 @@ fn main_work_tools_hint() -> &'static str {
      - 有副作用的调用(Bash 写盘 / Write)按依赖顺序分轮,不要指望它们与只读调用\n\
        混在一批里并发 —— 它们会被保序串行执行。\n\n\
      ## 任务前提验证清单(编排前必查)\n\
-     - [ ] 目标 URL 是否可访问(`curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5`\n\
-           或 `MCP_Web_Use(action=open)` 验证连通性)\n\
+     - [ ] 目标 URL 是否可访问(目标站点的连通性**只能用** `MCP_Web_Use(action=open)`\n\
+           验证;用 Bash curl/ping 探任务目标站点会被网页取证纪律硬闸门直接拒绝)\n\
      - [ ] 目标文件 / 目录是否存在(`Glob` / `ls`)\n\
      - [ ] 目标依赖是否已安装(`cat package.json` / `cat Cargo.toml`)\n\
      - [ ] 目标项目是否在 git 仓库(`git rev-parse --is-inside-work-tree`)\n\n\
@@ -863,13 +869,14 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
 - **禁止伪造澄清(第 128 轮)**:你无法与用户对话。信息不足时**不要**用
   `Bash echo "已询问用户"` / `Write` 落盘一个"澄清问询.md"来假装提问 ——
   那是伪造进度。直接返回失败,写明缺什么信息、你无法自行决定的原因。
-- **网络 fail-fast**:若 Bash(curl/ping)已确认目标主机不可达
-  (curl "000 FAILED" / "Connection timed out"、ping 100% 丢包、
-   MCP_Web_Use open 返回 ERR_CONNECTION_TIMED_OUT),立即停止重试,
-  直接返回失败原因 + 排查建议(VPN?服务器运行?端口开放?);
-  不要在不可达目标上反复重试 MCP_Web_Use open,只会浪费迭代预算。
-  网络探测优先:`curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5`。
-- **迭代预算**:上限 16 次;无新信息连续 2 次立即换路径或换路线(系统会同步
+- **网络 fail-fast**:若 `MCP_Web_Use(action=open)` 已确认目标主机不可达
+  (ERR_CONNECTION_TIMED_OUT / ERR_CONNECTION_RESET / code=3001 未装浏览器),
+  立即停止重试,直接返回失败原因 + 排查建议(VPN?服务器运行?端口开放?);
+  不要在不可达目标上反复重试 open,只会浪费迭代预算。
+  目标站点的连通性**只能用** `MCP_Web_Use(action=open)` 验证 —— 用 Bash 的
+  curl / ping / nc 探测任务目标站点会被网页取证纪律硬闸门直接拒绝(第 20 条)。
+- **迭代预算**:默认上限 20 次(Main-Work 可按单元复杂度下发 4~32,实际值以本单元
+  的 max_iterations 为准);无新信息连续 2 次立即换路径或换路线(系统会同步
   发出无进展警告,第 4 次相同「动作 + 结果」直接止损终止)。
 - 完成后简洁回答,不需要 markdown 标题。"#;
 
@@ -1394,7 +1401,8 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
       **不要再 inspect 浪费时间**;
     - 页面结构清晰后,用 1 次 `action=batch`(或 `sequence`)批量执行后续 5-10 个
       control + 验证步骤,一次返回合并结果(第 1.5 条的强制要求);
-    - **迭代预算意识**(第 118 轮新增):SubAgent 默认 max_iterations=32,第 8 iter
+    - **迭代预算意识**(第 118 轮新增):SubAgent 默认 max_iterations=20(Main-Work 可
+      下发 4~32,实际值以本单元的 max_iterations 为准),第 8 iter
       后会自动注入「进入执行期」提示;此后禁止再开新 inspect/screenshot/eval_js
       探查(除非 click 后验证),应直接 input_text/click/wait 完成剩余步骤;
     - **终态判定**(第 119 轮):batch 完成后若已拿到任务要求的全部真实数据(菜单列表

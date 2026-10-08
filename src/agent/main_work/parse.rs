@@ -17,8 +17,16 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         // P0-A:先 sanitize 再进 json_repair 修复链(关联:workflow_json_validate.rs)
         let sanitized = crate::agent::workflow_json_validate::sanitize_workflow_text(json_str);
         // Main-Work 路径:启用 Tier-2 截断补全(关联报告: 2026-09-09_04 D-001)。
-        let mut plan = crate::agent::json_repair::try_parse_lenient(&sanitized)
+        let mut plan: WorkFlowPlan = crate::agent::json_repair::try_parse_lenient(&sanitized)
             .map_err(AgentError::WorkflowParse)?;
+        // 第 135 轮:`workflows` 是 `#[serde(default)]`,空数组会「解析成功但产出零单元」,
+        // 让 `execute_workflows` 零单元收口 —— 与 `plan_validate.rs:168` 的空检查
+        // 不一致(该检查只在 Plan 路径)。统一按解析失败处理,交给既有兜底分支。
+        if plan.workflows.is_empty() {
+            return Err(AgentError::WorkflowParse(
+                "WorkFlow JSON 解析成功但 workflows 为空".into(),
+            ));
+        }
         dedup_workflow_ids(&mut plan);
         // 2026-09-16 F2:归一化 depends_on(剥离 LLM 附加的变量透传注释)
         sanitize_depends_on(&mut plan);
@@ -30,15 +38,33 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
     if let Some(json_str) = extract_standalone_json(text) {
         // P0-A:同上,sanitize 后再解析
         let sanitized = crate::agent::workflow_json_validate::sanitize_workflow_text(json_str);
-        let mut plan = crate::agent::json_repair::try_parse_lenient(&sanitized)
+        let mut plan: WorkFlowPlan = crate::agent::json_repair::try_parse_lenient(&sanitized)
             .map_err(AgentError::WorkflowParse)?;
+        if plan.workflows.is_empty() {
+            return Err(AgentError::WorkflowParse(
+                "WorkFlow JSON 解析成功但 workflows 为空".into(),
+            ));
+        }
         dedup_workflow_ids(&mut plan);
         sanitize_depends_on(&mut plan);
         infer_delegate_to_for_plan(&mut plan);
         return Ok(plan);
     }
+    // 第 135 轮:第三通道 —— Markdown 表格 / `### WorkFlow N:` 变体。
+    // 实测事故(`llaew_20261008_173357.log`):Main-Work 输出了表格而非 JSON,
+    // 上面两条 JSON 通道同时落空,`parse_workflow_plan` 零重试直接返回
+    // 「未找到合法的 WorkFlow JSON」,编排层退化成单 WorkFlow、wf-2 整个丢失。
+    // 而完全同构的表格解析器 `parse_plan_markdown` 早已存在,只是没接到这条路径上。
+    if let Ok(mut plan) = parse_plan_markdown(text) {
+        if !plan.workflows.is_empty() {
+            dedup_workflow_ids(&mut plan);
+            sanitize_depends_on(&mut plan);
+            infer_delegate_to_for_plan(&mut plan);
+            return Ok(plan);
+        }
+    }
     Err(AgentError::WorkflowParse(
-        "未找到合法的 WorkFlow JSON".into(),
+        "未找到合法的 WorkFlow JSON(或可识别的 Markdown 编排表)".into(),
     ))
 }
 

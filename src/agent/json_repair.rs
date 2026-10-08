@@ -322,16 +322,51 @@ fn is_truncation_error(err: &serde_json::Error) -> bool {
 /// 规则顺序:先统一引号类(智能引号 → 全角标点 → 单引号),再字符串内控制字符,
 /// 最后结构类(尾逗号 → Python 常量)。后面的规则假定前面的规则已把定界符
 /// 统一为 ASCII 引号。
-pub fn repair_json(input: &str) -> String {
-    if input.len() > MAX_REPAIR_BYTES {
-        return input.to_string();
-    }
+fn repair_json_once(input: &str) -> String {
     let s = pass_smart_quotes(input);
     let s = pass_fullwidth_punct(&s);
     let s = pass_single_quotes(&s);
     let s = pass_control_chars(&s);
     let s = pass_trailing_commas(&s);
     pass_python_consts(&s)
+}
+
+/// Tier-1 修复入口:**最多跑两遍,直到结果能解析为合法 JSON**(第 135 轮)。
+///
+/// ## 为什么需要第二遍
+///
+/// 所有 pass 共享同一个「在双引号串内 / 外」的状态机。模型在 JSON 字符串里写了
+/// **未转义的英文双引号**(中文内容里直接用 `"` 引一句话,实测 Main-Work 的
+/// `steps[].description` 高频出现)时,状态机会在这里提前闭合字符串,于是后面
+/// `pass_control_chars` 认为「已在串外」,把同一个字符串里真正的**裸换行**原样放过 ——
+///
+/// ```text
+/// 输入:{"summary":"含 don't 的句子","steps":[{"description":"第一行含 " 裸双引号\n第二行"}]}
+/// 一遍修复后仍是:... " 第一行含 " 裸双引号\n第二行 ..."   ← 裸换行原样保留
+/// ```
+///
+/// 结果就是 `try_parse_lenient` 报「原始: control character found while parsing a
+/// string …; 截断补全后仍失败」,Main-Work 解析失败**零重试**降级成单 WorkFlow
+/// (实测事故 `llaew_20261008_173357.log`,wf-2 整个丢失)。
+///
+/// 第二遍在「一遍修复后仍非合法 JSON」时执行:此时字符串边界已被上一遍重新对齐,
+/// 状态机能正确识别串内区间并完成控制字符转义。只在确实非法时才跑第二遍,
+/// 合法输入零额外开销。
+pub fn repair_json(input: &str) -> String {
+    if input.len() > MAX_REPAIR_BYTES {
+        return input.to_string();
+    }
+    let once = repair_json_once(input);
+    if serde_json::from_str::<serde_json::Value>(&once).is_ok() {
+        return once;
+    }
+    let twice = repair_json_once(&once);
+    if serde_json::from_str::<serde_json::Value>(&twice).is_ok() {
+        tracing::debug!("JSON Tier-1 修复第二遍收敛");
+        return twice;
+    }
+    // 两遍都不合法:返回第一遍的结果(诊断信息与既有行为保持一致)
+    once
 }
 
 /// 扫描状态:不在字符串 / 在双引号串 / 在单引号串(待修复的串)。
@@ -1109,5 +1144,43 @@ mod tests {
         let parsed: FakeClassification = try_parse_lenient(src).unwrap();
         assert_eq!(parsed.task_level, "medium");
         assert_eq!(parsed.decomposition_plan, vec!["a", "b"]);
+    }
+    /// 第 135 轮回归:Main-Work 输出的 JSON 在某个 steps[].description 字符串里
+    /// 嵌了**裸换行**(实测事故 `llaew_20261008_173357.log`),Tier-1 必须能修回来。
+    #[test]
+    fn bare_newline_inside_string_is_repaired() {
+        let raw = concat!(
+            r#"{"workflows":[{"id":"wf-1","steps":[{"id":"s4","description":"eval_js 优先读结构化数据:window.initialState"#,
+            "\n",
+            r#".homeData.data.homeFlow.data.itemList;initialState 不可用时退回 DOM 解析"}]}]}"#
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(raw).is_err(),
+            "含裸换行的 JSON 必须先是非法的"
+        );
+        let fixed = repair_json(raw);
+        let v: serde_json::Value =
+            serde_json::from_str(&fixed).unwrap_or_else(|e| panic!("修复后仍非法: {e}\n{fixed}"));
+        let d = v["workflows"][0]["steps"][0]["description"].as_str().unwrap();
+        assert!(d.contains('\n'), "裸换行应被转义回真实换行: {d}");
+        assert!(d.contains("itemList"));
+    }
+
+    /// 二次修复:首轮 `repair_json` 输出仍不是合法 JSON 时再跑一遍
+    /// (引号类 pass 把状态机带偏时,第二遍通常能收敛)。
+    #[test]
+    fn repair_json_second_pass_converges() {
+        // 连续两个独立问题:未转义双引号 + 裸换行 + 全角引号混排
+        let raw = concat!(
+            r#"{"summary":"他说 “你好” 然后走了","steps":[{"description":"A 行 “q” B"#,
+            "\n",
+            r#"C 行 \"引号\" D"}]}"#
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(raw).is_err());
+        let once = repair_json(raw);
+        let twice = repair_json(&once);
+        let ok = serde_json::from_str::<serde_json::Value>(&once)
+            .or_else(|_| serde_json::from_str::<serde_json::Value>(&twice));
+        assert!(ok.is_ok(), "两遍修复后应合法\nonce={once}\ntwice={twice}");
     }
 }

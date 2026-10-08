@@ -290,10 +290,10 @@ impl ExecutionTrace {
         // 并"成功"交付,QC 全绿 —— 既有 9 类信号无一能识别"做的是另一个任务"。
         // 锚点为空(用户未指定站点)时恒不触发,开放任务零影响。
         if let Some(anchor) = anchor.filter(|a| !a.is_empty()) {
-            let calls: Vec<(String, String)> = self
+            let calls: Vec<(String, String, bool)> = self
                 .tool_call_log
                 .iter()
-                .map(|e| (e.tool.clone(), e.args_json.clone()))
+                .map(|e| (e.tool.clone(), e.args_json.clone(), e.ok))
                 .collect();
             let drifted = crate::agent::safety::detect_target_drift(&calls, anchor);
             if !drifted.is_empty() {

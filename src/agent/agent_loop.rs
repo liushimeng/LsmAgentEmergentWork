@@ -89,7 +89,12 @@ impl Agent {
         // 会话级 max_tokens 升级状态机(2026-09-09 第 09 轮,实现 L1037)。
         // 起始 8K,被 max_tokens 截断时翻倍,封顶 64K;每会话重置,
         // 避免「上次会话把 max 撑满,下次新会话也按 64K 起跳」的浪费。
-        let max_tokens_state = Arc::new(MaxTokensState::new());
+        // 第 135 轮:角色可用 with_max_tokens_seed 提高起跳值(默认仍为全局 8K 底线,
+        // 不影响按 8192 硬校验的自建网关)。
+        let max_tokens_state = Arc::new(match self.max_tokens_seed() {
+            Some(seed) => MaxTokensState::with_floor(seed),
+            None => MaxTokensState::new(),
+        });
         // 每次迭代注入 override 的可变 meta:从 session.meta() 复制后改写。
         // 注:session.meta() 本身不可变拿 ID,这里手工重建 RequestMeta 以避免改 Session API。
         let mut meta: RequestMeta = session.meta();

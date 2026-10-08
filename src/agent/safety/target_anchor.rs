@@ -31,6 +31,7 @@ use std::sync::{Mutex, OnceLock};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde_json::Value;
 
 use crate::llm::{ChatMessage, Role};
 
@@ -242,6 +243,18 @@ pub fn extract_hosts_from_text(text: &str) -> Vec<String> {
     }
     for cap in RE_BARE_HOST.captures_iter(text) {
         let Some(raw) = cap.get(1) else { continue };
+        // 第 135 轮:拒识「标识符续接」片段。正则只吃到 `[a-z]{2,}` 就收尾,遇到
+        // `-` / `_` / `.` 会提前停下 —— 典型误判是 CSS 类名 `div.kr-loading-more-button`
+        // 被截成主机 `div.kr`(实测 36 氪任务里 `kr` 命中 TLD 白名单,直接产出一条
+        // `target_drift` 强信号把合法单元判死)。判据:紧跟匹配结尾的字符若是标识符
+        // 续接符,说明后面还有更长标识词,这不是一个独立主机。
+        if text[cap.get(0).unwrap().end()..]
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '-' | '_' | '.'))
+        {
+            continue;
+        }
         let candidate = raw.as_str().trim().to_lowercase();
         if candidate.is_empty() || !bare_host_looks_real(&candidate) {
             continue;
@@ -486,28 +499,134 @@ pub fn check_open_against_anchor(url: &str, anchor: Option<&TargetAnchor>) -> Op
 
 /// 从工具调用日志里检测**目标漂移**(L4 验收门的机械判据,纯函数)。
 ///
-/// 扫描 `tool_call_log` 各条 `args_json` 中出现的 URL 主机,返回锚点外的主机列表
-/// (去重、按首次出现顺序)。锚点为空时恒返回空 —— 开放任务不判漂移。
+/// 第 135 轮重构:**只扫「Agent 主动导航的目标 URL」**,不再对整段 `args_json` 做
+/// 全文主机扫描。实测事故(`llaew_20261008_173357.log` 36 氪任务):全文扫描会把
+/// 一次 `batch` 点击的 CSS 选择器 `div.kr-loading-more-button` 里的 `div.kr`
+/// 当成主机,产出一条 `target_drift:div.kr` **强信号**,进 `is_failed()` 后把
+/// 本质上已抓到数据的合法单元判死;同一通道还会把页面里读到的图片/埋点/CDN 地址
+/// 一并误判。两类误报都会让「防漂移」变成新的失败面。
 ///
-/// 只看显式带 URL 的参数(`open` / `navigate` / `new_tab` / `download`),
-/// 点击导航的落地页无法从参数预知,由 QC 结合 `final_url` 事后对账。
-pub fn detect_target_drift(tool_call_args: &[(String, String)], anchor: &TargetAnchor) -> Vec<String> {
+/// 现口径:
+/// - 工具名需含 `Web` / `web`(与原实现一致);
+/// - 只取**导航位 URL 字段**:`open` 的顶层 `url`、`control` 里
+///   `navigate` / `new_tab` / `download` 的 `params.url`、以及 `sequence` / `batch`
+///   的 `steps[].params.url`(对应 `control_action` 命中同组);
+/// - 这些字段只走 **scheme 通道**(`RE_SCHEME_URL`),不走裸主机副通道 ——
+///   导航目标一定是完整 URL,裸主机副通道是为用户原文/命令行设计的,在这里只会误伤;
+/// - **跳过 `ok == false` 的条目**:被 L3 工具层 6001 拦下的越界尝试已经阻断,
+///   再计一条强信号既重复又让单元不可恢复;真实漂移仍由 6001 信封 + QC 依据①覆盖。
+///
+/// 点击/中键/window.open 派生的落地页无法从参数预知,由 QC 结合 `final_url` 事后对账。
+///
+/// 入参 `(工具名, 参数稳定 JSON, 调用是否成功)`。
+pub fn detect_target_drift(
+    tool_call_args: &[(String, String, bool)],
+    anchor: &TargetAnchor,
+) -> Vec<String> {
     if anchor.is_empty() {
         return Vec::new();
     }
     let mut drifted: Vec<String> = Vec::new();
-    for (tool, args_json) in tool_call_args {
+    for (tool, args_json, ok) in tool_call_args {
         // 只对浏览器工具做主机比对,避免 Bash 命令行里的无关 URL 误伤
         if !tool.contains("Web") && !tool.contains("web") {
             continue;
         }
-        for host in extract_hosts_from_text(args_json) {
-            if !anchor.contains_host(&host) && !drifted.contains(&host) {
-                drifted.push(host);
+        // 第 135 轮:被工具层拒绝的调用不计入漂移(见函数文档)
+        if !ok {
+            continue;
+        }
+        for url in navigation_target_urls(args_json) {
+            for host in hosts_from_scheme_urls(&url) {
+                if !anchor.contains_host(&host) && !drifted.contains(&host) {
+                    drifted.push(host);
+                }
             }
         }
     }
     drifted
+}
+
+/// `control_action` 中带显式 `params.url` 且语义为「去某个站点」的取值。
+const NAV_CONTROL_ACTIONS: &[&str] = &["navigate", "new_tab", "download"];
+
+/// 从一次工具调用的参数 JSON 里,精确取出**导航位 URL 字符串**(纯函数,可单测)。
+///
+/// 返回原文片段(不做 URL 解析,主机抽取交给 [`hosts_from_scheme_urls`]),
+/// 便于调用方对账。无法解析为 JSON 时退化为空 —— 宁可漏判也不误判:
+/// 防漂移机制自身绝不能成为新的失败面。
+fn navigation_target_urls(args_json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(args_json) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let action = v.get("action").and_then(Value::as_str).unwrap_or("");
+
+    // ① action=open:顶层 url
+    if action == "open" {
+        push_url(&mut out, v.get("url"));
+    }
+
+    // ② action=control:control_action ∈ NAV_CONTROL_ACTIONS 的 params.url
+    if action == "control" {
+        if let Some(ca) = v.get("control_action").and_then(Value::as_str) {
+            if NAV_CONTROL_ACTIONS.contains(&ca) {
+                push_url(&mut out, v.get("params").and_then(|p| p.get("url")));
+            }
+        }
+    }
+
+    // ③ action=sequence / batch:steps[] 里每一步的同类字段
+    if action == "sequence" || action == "batch" {
+        if let Some(steps) = v.get("steps").and_then(Value::as_array) {
+            for step in steps {
+                let sa = step.get("action").and_then(Value::as_str).unwrap_or("");
+                if sa == "open" {
+                    push_url(&mut out, step.get("url"));
+                }
+                let sp = step.get("params");
+                if sa == "control" {
+                    if let Some(ca) = step.get("control_action").and_then(Value::as_str) {
+                        if NAV_CONTROL_ACTIONS.contains(&ca) {
+                            push_url(&mut out, sp.and_then(|p| p.get("url")));
+                        }
+                    }
+                }
+                // 嵌套 control:steps[] 里直接带 control_action(不带 action 包装)
+                if step.get("action").is_none() {
+                    if let Some(ca) = step.get("control_action").and_then(Value::as_str) {
+                        if NAV_CONTROL_ACTIONS.contains(&ca) {
+                            push_url(&mut out, sp.and_then(|p| p.get("url")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 收集 `url` 字段的非空字符串值(去重保序)。
+fn push_url(out: &mut Vec<String>, v: Option<&Value>) {
+    if let Some(s) = v.and_then(Value::as_str) {
+        let s = s.trim();
+        if !s.is_empty() && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    }
+}
+
+/// 只走 scheme 通道的主机抽取(导航目标一定是完整 URL,不需要裸主机兜底)。
+fn hosts_from_scheme_urls(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in RE_SCHEME_URL.find_iter(text) {
+        if let Some(d) = registrable_domain_of_url(m.as_str()) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
 }
 
 // =================== 任务级全局槽 ===================
@@ -928,13 +1047,19 @@ mod tests {
         assert_eq!(check_open_against_anchor("https://www.ithome.com/", Some(&empty)), None);
     }
 
-    // ========== detect_target_drift ==========
+    // ========== detect_target_drift(第 135 轮:只认显式导航目标 URL)==========
+
+    /// 构造一条「调用成功」的工具调用三元组。
+    fn call(tool: &str, args: &str) -> (String, String, bool) {
+        (tool.to_string(), args.to_string(), true)
+    }
 
     #[test]
     fn target_drift_flags_off_anchor_web_tool_call() {
-        let calls = vec![
-            ("MCP_Web_Use".to_string(), r#"{"action":"open","url":"https://www.ithome.com/"}"#.to_string()),
-        ];
+        let calls = vec![call(
+            "MCP_Web_Use",
+            r#"{"action":"open","url":"https://www.ithome.com/"}"#,
+        )];
         assert_eq!(
             detect_target_drift(&calls, &anchored("anthropic.com")),
             vec!["ithome.com".to_string()]
@@ -944,8 +1069,8 @@ mod tests {
     #[test]
     fn target_drift_ignores_anchor_host_calls() {
         let calls = vec![
-            ("MCP_Web_Use".to_string(), r#"{"action":"open","url":"https://www.anthropic.com/"}"#.to_string()),
-            ("MCP_Web_Use".to_string(), r#"{"action":"inspect","page_id":"p_1"}"#.to_string()),
+            call("MCP_Web_Use", r#"{"action":"open","url":"https://www.anthropic.com/"}"#),
+            call("MCP_Web_Use", r#"{"action":"inspect","page_id":"p_1"}"#),
         ];
         assert!(detect_target_drift(&calls, &anchored("anthropic.com")).is_empty());
     }
@@ -953,30 +1078,107 @@ mod tests {
     #[test]
     fn target_drift_skips_non_web_tools() {
         // Bash 命令行里的无关 URL 不应误判为漂移
-        let calls = vec![
-            ("Bash".to_string(), r#"{"command":"curl https://example.com/health"}"#.to_string()),
-        ];
+        let calls = vec![call("Bash", r#"{"command":"curl https://example.com/health"}"#)];
         assert!(detect_target_drift(&calls, &anchored("anthropic.com")).is_empty());
     }
 
     #[test]
     fn target_drift_never_fires_with_empty_anchor() {
-        let calls = vec![
-            ("MCP_Web_Use".to_string(), r#"{"action":"open","url":"https://www.ithome.com/"}"#.to_string()),
-        ];
+        let calls = vec![call(
+            "MCP_Web_Use",
+            r#"{"action":"open","url":"https://www.ithome.com/"}"#,
+        )];
         assert!(detect_target_drift(&calls, &TargetAnchor::default()).is_empty());
     }
 
     #[test]
     fn target_drift_dedupes_multiple_off_anchor_calls() {
         let calls = vec![
-            ("MCP_Web_Use".to_string(), r#"{"url":"https://www.ithome.com/a"}"#.to_string()),
-            ("MCP_Web_Use".to_string(), r#"{"url":"https://ithome.com/b"}"#.to_string()),
+            call("MCP_Web_Use", r#"{"action":"open","url":"https://www.ithome.com/a"}"#),
+            call("MCP_Web_Use", r#"{"action":"navigate","page_id":"p_1","control_action":"navigate","params":{"url":"https://ithome.com/b"}}"#),
         ];
         assert_eq!(
             detect_target_drift(&calls, &anchored("anthropic.com")),
             vec!["ithome.com".to_string()]
         );
+    }
+
+    #[test]
+    fn target_drift_skips_failed_calls() {
+        // 第 135 轮:被 L3 工具层 6001 拦下的越界尝试不再重复计强信号
+        let calls = vec![(
+            "MCP_Web_Use".to_string(),
+            r#"{"action":"open","url":"https://www.ithome.com/"}"#.to_string(),
+            false,
+        )];
+        assert!(detect_target_drift(&calls, &anchored("anthropic.com")).is_empty());
+    }
+
+    /// 实测事故回归(llaew_20261008_173357.log):一次 `batch` 点击的 CSS 选择器
+    /// `div.kr-loading-more-button` 曾被裸主机通道截成 `div.kr`,产出 `target_drift`
+    /// 强信号把合法单元判死。修复后不得再产生任何漂移。
+    #[test]
+    fn target_drift_ignores_css_selector_lookalikes() {
+        let calls = vec![call(
+            "MCP_Web_Use",
+            r#"{"action":"batch","steps":[{"action":"control","control_action":"click","params":{"selector":"div.kr-loading-more-button"}}]}"#,
+        )];
+        assert!(
+            detect_target_drift(&calls, &anchored("36kr.com")).is_empty(),
+            "CSS 类名不是域名,不得判漂移"
+        );
+    }
+
+    /// 页面里读到的第三方图片 / 埋点 / CDN 地址写在非导航字段里,不构成目标漂移。
+    #[test]
+    fn target_drift_ignores_non_navigation_url_fields() {
+        let calls = vec![
+            call(
+                "MCP_Web_Use",
+                r#"{"action":"control","control_action":"eval_js","params":{"expression":"Array.from(document.querySelectorAll('img')).map(i=>i.src)"}}"#,
+            ),
+            call(
+                "MCP_Web_Use",
+                r#"{"action":"open","url":"https://36kr.com/"}"#,
+            ),
+        ];
+        assert!(detect_target_drift(&calls, &anchored("36kr.com")).is_empty());
+    }
+
+    /// 导航位字段里的真实漂移仍必须被抓到(第 128 轮事故形态不削弱)。
+    #[test]
+    fn target_drift_still_catches_navigate_and_sequence_steps() {
+        let calls = vec![
+            call(
+                "MCP_Web_Use",
+                r#"{"action":"control","control_action":"navigate","page_id":"p_1","params":{"url":"https://www.ithome.com/0/"}}"#,
+            ),
+        ];
+        assert_eq!(
+            detect_target_drift(&calls, &anchored("anthropic.com")),
+            vec!["ithome.com".to_string()]
+        );
+
+        let seq = vec![call(
+            "MCP_Web_Use",
+            r#"{"action":"sequence","page_id":"p_1","steps":[{"action":"control","control_action":"new_tab","params":{"url":"https://news.ycombinator.com/"}}]}"#,
+        )];
+        assert_eq!(
+            detect_target_drift(&seq, &anchored("anthropic.com")),
+            vec!["ycombinator.com".to_string()]
+        );
+    }
+
+    /// 裸主机通道:标识符续接片段拒识,真主机不受影响。
+    #[test]
+    fn bare_host_rejects_identifier_continuation() {
+        let hosts = |s: &str| extract_hosts_from_text(s);
+        assert!(!hosts(r#"{"selector":"div.kr-loading-more-button"}"#).contains(&"div.kr".to_string()));
+        assert!(!hosts("a.img.kr-cover").contains(&"img.kr".to_string()));
+        // 真主机仍然命中
+        assert!(hosts("请看 https://36kr.com/p/123").contains(&"36kr.com".to_string()));
+        assert!(hosts("访问 example-site.com 即可").contains(&"example-site.com".to_string()));
+        assert!(hosts("裸主机 foo.com.cn 也算").contains(&"foo.com.cn".to_string()));
     }
 
     // ========== build_clarification_message ==========

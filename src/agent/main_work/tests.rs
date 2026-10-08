@@ -812,3 +812,61 @@ mod dedup_tests {
     }
 
     // ============================================================================
+
+// ============================================================================
+// 第 135 轮:Main-Work 解析兜底(空 workflows / Markdown 第三通道 / 网页 pre_explore)
+// ============================================================================
+
+/// `workflows: []` 解析成功但产出零单元 —— 必须按解析失败处理,交给既有兜底分支。
+///
+/// `spec.rs` 里 `workflows` 是 `#[serde(default)]`,所以空数组会「解析成功」;
+/// 若直接放行,`execute_workflows` 会零单元收口并判成功(与 `plan_validate.rs`
+/// 的空检查不一致 —— 那个检查只在 Plan 路径)。
+#[test]
+fn parse_workflow_plan_rejects_empty_workflows() {
+    let err = parse_workflow_plan(r#"{"workflows":[],"summary":"空的"}"#).unwrap_err();
+    assert!(
+        err.to_string().contains("workflows 为空"),
+        "空 workflows 应报解析失败,实际: {err}"
+    );
+}
+
+/// 第三通道:Main-Work 输出 Markdown 表格而非 JSON 时,复用 `parse_plan_markdown`。
+///
+/// 实测事故(`llaew_20261008_173357.log`):两条 JSON 通道同时落空,零重试直接返回
+/// 「未找到合法的 WorkFlow JSON」,编排层退化成单 WorkFlow,wf-2 整个丢失。
+#[test]
+fn parse_workflow_plan_accepts_markdown_table() {
+    let md = "## WorkFlow 拆解\n\n\
+              | id | name | steps | depends_on |\n\
+              | --- | --- | --- | --- |\n\
+              | wf-1 | 打开页面并抓取 | MCP_Web_Use(action=open) + inspect | 无 |\n\
+              | wf-2 | 渲染表格并落盘 | Bash 写 Markdown | wf-1 |\n";
+    let plan = parse_workflow_plan(md).expect("Markdown 编排表应能被解析");
+    assert_eq!(plan.workflows.len(), 2, "应还原出 2 个单元: {plan:?}");
+    assert_eq!(plan.workflows[0].id, "wf-1");
+    assert_eq!(plan.workflows[1].depends_on, vec!["wf-1".to_string()]);
+}
+
+/// 两条 JSON 通道 + Markdown 通道全灭时,错误文案要同时点出两种形态。
+#[test]
+fn parse_workflow_plan_error_mentions_both_shapes() {
+    let err = parse_workflow_plan("随便一段散文,既没有 JSON 也没有编排表。").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("JSON"), "{msg}");
+    assert!(msg.contains("Markdown"), "{msg}");
+}
+
+/// 网页任务判定(决定降级兜底要不要开 `pre_explore`)。
+#[test]
+fn is_web_task_detects_web_and_local_tasks() {
+    use crate::agent::main_work::is_web_task;
+    // 网页:显式 URL / 工具名 / 关键词
+    assert!(is_web_task(Some("抓取 https://36kr.com/ 的最新文章"), &[]));
+    assert!(is_web_task(Some("用 MCP_Web_Use 打开页面"), &[]));
+    assert!(is_web_task(None, &["浏览网页并保存内容".to_string()]));
+    // 本地任务不应误判
+    assert!(!is_web_task(Some("重构 src/agent/mod.rs 并跑 cargo test"), &[]));
+    assert!(!is_web_task(None, &["读取文件并生成报告".to_string()]));
+    assert!(!is_web_task(None, &[]));
+}

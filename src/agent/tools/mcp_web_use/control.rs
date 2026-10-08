@@ -7,6 +7,13 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use super::*;
+// 第 135 轮:返回值净化与 data: URL 落盘已独立到 eval_sanitize.rs(复合值体积闸门),
+// 这里再导出一次保持既有 `control::fn` 引用路径不变(测试与兄弟模块都在用)。
+#[allow(unused_imports)]
+pub(super) use super::eval_sanitize::{
+    data_ext_from_mime, data_mime, decode_data_url, percent_decode, sanitize_eval_result,
+    EVAL_INLINE_CHAR_LIMIT,
+};
 
 // =================== 第 99 轮:eval_js / screenshot / download 效能与健壮性辅助 ===================
 
@@ -17,6 +24,28 @@ pub(super) fn looks_like_function(expr: &str) -> bool {
     t.starts_with('(') || t.starts_with("async") || t.starts_with("function")
 }
 
+/// 表达式是否为**匿名函数声明**(第 135 轮)。
+///
+/// `function(){ … }` 在 JS 里是「函数语句」,必须有函数名才能作为语句出现,
+/// 直接交给 `Runtime.evaluate` 必然报
+/// `SyntaxError: Function statements require a function name`。
+///
+/// 实测事故(`llaew_20261008_173357.log` 36 氪任务 L363):模型写了
+/// `function(){ var d = window.initialState && … }`,旧实现在 `looks_like_function`
+/// 命中 `function` 前缀而**跳过自动包裹**,直接上抛 SyntaxError,并顺带
+/// **凭空 spawn 了一个野页面** `p_89de574e`(全程 0 次引用,最后被 `close(all)`
+/// 顺手清掉)。这类形态应当包成 `(fn)()` 调用,而不是当成已成型函数。
+pub(super) fn is_anonymous_function_decl(expr: &str) -> bool {
+    let t = expr.trim_start();
+    let Some(rest) = t.strip_prefix("function") else {
+        return false;
+    };
+    // `function name(...)` 是有名字的函数声明/表达式,不是匿名语句形态;
+    // `function*` / `function (` / `function{` 才是匿名函数。
+    let next = rest.trim_start().chars().next();
+    !matches!(next, Some(c) if c.is_alphanumeric() || c == '_' || c == '$')
+}
+
 /// eval_js 单行错误摘要(原始错误常带多行 stack,只留首行截断)。
 fn err_head(e: &str) -> String {
     let first = e.lines().next().unwrap_or(e);
@@ -25,122 +54,6 @@ fn err_head(e: &str) -> String {
         out.push('…');
     }
     out
-}
-
-/// eval_js 返回值净化(第 99 轮,根治 data-url/超长字符串灌爆上下文):
-/// - `data:` URL(base64 或百分号编码载荷)→ 解码落盘,只回 head + 路径;
-/// - 普通字符串 > [`EVAL_INLINE_CHAR_LIMIT`] 字符 → 原文落盘,只回 head;
-/// - 其余原样返回。
-pub(super) const EVAL_INLINE_CHAR_LIMIT: usize = 2000;
-
-pub(super) fn sanitize_eval_result(val: Value) -> Value {
-    let s = match &val {
-        Value::String(s) => s,
-        _ => return val,
-    };
-    let is_data = s.starts_with("data:");
-    if !is_data && s.chars().count() <= EVAL_INLINE_CHAR_LIMIT {
-        return val;
-    }
-    let (byte_size, saved_to) = match decode_data_url(s) {
-        Some(bytes) => {
-            let path = std::env::temp_dir().join(format!(
-                "laew_web_result_{}.{}",
-                now_millis_safe(),
-                data_ext_from_mime(data_mime(s))
-            ));
-            match std::fs::write(&path, &bytes) {
-                Ok(_) => (bytes.len(), Some(path.display().to_string())),
-                Err(_) => (bytes.len(), None),
-            }
-        }
-        None => {
-            let path = std::env::temp_dir().join(format!(
-                "laew_web_result_{}.txt",
-                now_millis_safe()
-            ));
-            match std::fs::write(&path, s) {
-                Ok(_) => (s.len(), Some(path.display().to_string())),
-                Err(_) => (s.len(), None),
-            }
-        }
-    };
-    let head: String = s.chars().take(160).collect();
-    let total = s.chars().count();
-    let mut out = json!({
-        "result_truncated": true,
-        "result_head": head,
-        "result_len": total,
-        "byte_size": byte_size,
-        "hint": "返回值过大(或为 data: URL),已自动落盘;需要内容时用 Read 工具读 saved_to 路径,不要把原始数据塞进后续工具参数",
-    });
-    if let Some(p) = saved_to {
-        out["saved_to"] = json!(p);
-    }
-    out
-}
-
-/// data: URL 的 mime 段(如 `data:image/png;base64,` → `image/png`)。
-fn data_mime(s: &str) -> &str {
-    s.strip_prefix("data:")
-        .and_then(|rest| rest.split(';').next())
-        .unwrap_or("")
-}
-
-/// mime → 落盘扩展名。
-fn data_ext_from_mime(mime: &str) -> &str {
-    match mime {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/svg+xml" => "svg",
-        "text/plain" => "txt",
-        "text/html" => "html",
-        "application/json" => "json",
-        "application/pdf" => "pdf",
-        _ => "bin",
-    }
-}
-
-/// 解码 data: URL 载荷(base64 或百分号编码);非 data: 前缀返回 None。
-pub(super) fn decode_data_url(s: &str) -> Option<Vec<u8>> {
-    let rest = s.strip_prefix("data:")?;
-    let (meta, payload) = rest.split_once(',')?;
-    if meta.contains(";base64") {
-        base64::engine::general_purpose::STANDARD
-            .decode(payload.trim())
-            .ok()
-    } else {
-        percent_decode(payload).map(String::into_bytes)
-    }
-}
-
-/// 百分号解码(URL 编码),`+` 视为空格;非法序列返回 None。
-pub(super) fn percent_decode(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' => {
-                let hex = bytes.get(i + 1..i + 3)?;
-                let hex_str = std::str::from_utf8(hex).ok()?;
-                let v = u8::from_str_radix(hex_str, 16).ok()?;
-                out.push(v);
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
 }
 
 /// 把 data: URL 内容直接落盘(download 快速路径,不走 CDP 下载事件 ——
@@ -829,6 +742,15 @@ async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> 
     };
     // 第 99 轮:return / 多语句容错 —— 首次按原样评估;失败且表达式不是函数形态时
     // 自动包 IIFE(async 语境包 async IIFE)重试一次;仍失败则双错误上抛。
+    //
+    // 第 135 轮:匿名 `function(){…}` 语句先就地转成 `(function(){…})()` 调用再评估 ——
+    // 该形态必然 SyntaxError,旧实现误判为「已是函数形态」而跳过包裹,白烧一轮迭代
+    // 还凭空派生一个野页面。
+    let expr = if is_anonymous_function_decl(&expr) {
+        format!("(\n{expr}\n)()")
+    } else {
+        expr
+    };
     let first = evaluate(expr.clone());
     let (built, wrapped, first_err) = match first {
         Ok(params) => (params, false, None),

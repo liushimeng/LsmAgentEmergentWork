@@ -126,6 +126,11 @@ pub struct Agent {
     max_truncation_resume: usize,
     /// 最大上下文溢出恢复次数(排水/折叠重试的全会话预算)。
     max_overflow_recoveries: usize,
+    /// 第 135 轮:本 Agent 的 max_tokens 起跳值;`None` = 用全局
+    /// [`MAX_TOKENS_FLOOR`](crate::agent::max_tokens_state::MAX_TOKENS_FLOOR)。
+    /// 只给「输出天然很长」的角色设(Debug Agent),避免抬全局底线打断按 8192
+    /// 硬校验的自建网关。
+    max_tokens_seed: Option<u32>,
 }
 
 impl Agent {
@@ -139,6 +144,7 @@ impl Agent {
             explore_budget: DEFAULT_MAX_ITERATIONS / 4,
             max_truncation_resume: DEFAULT_MAX_TRUNCATION_RESUME,
             max_overflow_recoveries: DEFAULT_MAX_OVERFLOW_RECOVERIES,
+            max_tokens_seed: None,
         }
     }
 
@@ -154,6 +160,17 @@ impl Agent {
     pub fn with_explore_budget(mut self, n: usize) -> Self {
         self.explore_budget = n;
         self
+    }
+
+    /// 第 135 轮:设置本 Agent 的 max_tokens 起跳值(见 [`Self::max_tokens_seed`] 字段)。
+    pub fn with_max_tokens_seed(mut self, v: u32) -> Self {
+        self.max_tokens_seed = Some(v);
+        self
+    }
+
+    /// 读 max_tokens 起跳值;`None` 表示用全局底线。
+    pub fn max_tokens_seed(&self) -> Option<u32> {
+        self.max_tokens_seed
     }
 
     /// 设置最大上下文溢出恢复次数(测试 / 特殊场景用)。
