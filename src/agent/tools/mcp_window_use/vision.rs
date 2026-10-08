@@ -12,6 +12,11 @@
 use serde_json::{json, Value};
 
 use super::{get_str, require_str, run_blocking, tool_err, MCP_WINDOW_USE_TOOL_NAME};
+// `Tool` 只在下方 `#[cfg(not(windows))]` 的 BashTool 降级路径上调用
+// (`bash.execute(...)`)。Windows 构建看不到该调用点,曾被 cargo fix 当
+// unused import 删除,导致 macOS/Linux 构建 E0599;此处按同一 cfg 引入。
+#[cfg(not(windows))]
+use super::Tool;
 use crate::agent::window::{current_driver, Rect};
 use crate::error::Result;
 

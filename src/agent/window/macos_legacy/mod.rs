@@ -412,8 +412,8 @@ fn enrich_titles_with_ax(windows: &mut [WindowInfo]) {
     if !MacOsDriver::is_trusted() {
         return; // AX 未授权:安静跳过,list 本身不需要该权限
     }
-    // TTL 缓存命中 → 直接回填
-    if let Ok(mut cached) = title_enrich_cache().lock() {
+    // TTL 缓存命中 → 直接回填(只读 as_ref,无需 mut;写回在函数尾部另一处)
+    if let Ok(cached) = title_enrich_cache().lock() {
         match cached.as_ref() {
             Some((at, map)) if at.elapsed().as_secs() < 2 => {
                 for w in windows.iter_mut() {

@@ -213,6 +213,8 @@ fn is_real_bash(path: &str) -> bool {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)] // 调用点在上方 #[cfg(windows)] 探测块内;非 Windows 无消费方,
+                    // 保留存根以对称表达「Unix 上 bash 探测恒真」语义
 fn is_real_bash(_path: &str) -> bool {
     true
 }

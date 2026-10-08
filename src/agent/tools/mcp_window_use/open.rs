@@ -572,7 +572,7 @@ fn discover_installed_mac_apps(candidates: &[String]) -> Vec<InstalledMacApp> {
         Some(PathBuf::from("/System/Applications")),
     ];
     let mut out: Vec<InstalledMacApp> = Vec::new();
-    let mut push_app = |path: String, out: &mut Vec<InstalledMacApp>| {
+    let push_app = |path: String, out: &mut Vec<InstalledMacApp>| {
         if !safe_desktop_identifier(&path) || !std::path::Path::new(&path).exists() {
             return;
         }

@@ -4,6 +4,15 @@
 //! 后，watchdog 会在优雅退出超时后强制回收目标进程并清理 profile。
 
 
+// 导入仅被下方 #[cfg(unix)] 测试体使用 —— Windows 上 cargo fix 曾按 unused 误删,
+// 导致 macOS/Linux 测试目标 E0433;此处与测试体同 cfg 门控。
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
 #[cfg(unix)]
 #[tokio::test]
 async fn watchdog_kills_target_after_parent_pipe_closes() {

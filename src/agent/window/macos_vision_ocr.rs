@@ -15,7 +15,7 @@
 use std::ffi::c_void;
 use std::path::Path;
 
-use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
+use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex};
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use core_foundation::dictionary::{CFDictionaryGetValue, CFDictionaryRef};
 use core_foundation::number::{CFNumberGetValue, CFNumberRef};
@@ -37,6 +37,8 @@ pub struct VisionOcrBlock {
     pub y: i64,
     pub width: i64,
     pub height: i64,
+    /// 与 Windows OCR 后端对齐保留(置信度);生产链路暂无消费方,仅单测读取。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub confidence: f32,
 }
 
@@ -136,6 +138,8 @@ pub fn screenshot_window(
 }
 
 /// 全屏截图(无需窗口 ID)。
+#[allow(dead_code)] // 按设计保留:驱动层当前走 screenshot_window(按窗口/region 截取),
+                    // 全屏入口留给后续 MCP_Window_Use 全屏 region 场景接入
 pub fn screenshot_fullscreen(region: Option<(i64, i64, i64, i64)>, output_path: &Path) -> Result<()> {
     let cg_image = capture_fullscreen_image(region)?;
     save_cgimage_as_png(&cg_image, output_path)
@@ -187,6 +191,7 @@ fn capture_window_image(
 }
 
 /// 全屏截图。
+#[allow(dead_code)] // 仅被 screenshot_fullscreen(同为预留入口)引用
 fn capture_fullscreen_image(region: Option<(i64, i64, i64, i64)>) -> Result<CGImage> {
     let rect = match region {
         Some((x, y, w, h)) => CGRect::new(
