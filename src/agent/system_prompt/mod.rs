@@ -1369,8 +1369,8 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     窗口)→ control(request_human, reason=captcha|sms|qr_login|login|real_name|
     two_factor|oauth|manual_verify|custom, message=告诉人工要做什么, options=[...])
     → TUI 弹出选择块,人工输入。code=0:用 data.human_response 继续(动态码/验证码数字
-    人工直接输入,拿到后 input_text 填入);code=4001(超时/非交互模式):如实告知用户在
-    TUI 交互模式下重试;code=4002(人工取消):终止该路径并汇总已完成部分。窗口从
+    人工直接输入,拿到后 input_text 填入);code=4001(超时/弹窗与 TUI 均不可用):如实告知用户在
+    交互模式(TUI 或桌面弹窗)下重试;code=4002(人工取消):终止该路径并汇总已完成部分。窗口从
     hidden 切换到 headed 需先 close(page_id="all") 回收再重开;
     合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
     **超时推荐**(第 118 轮):不传 timeout_ms 时由工具按 reason 分档默认超时——

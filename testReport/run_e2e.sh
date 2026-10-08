@@ -2245,7 +2245,8 @@ else
   PASTE3=$(printf '### 标题行\n1. 步骤一\n2. 步骤二')
   tsend "$(printf '\x1b[200~%s\x1b[201~' "$PASTE3")"
   sleep 0.6
-  texpect "[粘贴 #1 +3 行]" "tmux: 多行粘贴转 marker(换行不再被压成空格)"
+  # 断言不钉死粘贴编号(#N 会话内单调递增,前序用例已占号),只锁行数保真
+  texpect "+3 行]" "tmux: 多行粘贴转 marker(换行不再被压成空格)"
   texpect "原文已保留(3 行" "tmux: 粘贴后即时回显原文预览"
   tkey C-u; sleep 0.3
 

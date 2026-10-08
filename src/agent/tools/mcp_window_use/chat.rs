@@ -1202,7 +1202,7 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
                 )
                 .await;
             match last_choice {
-                crate::agent::human_assist::HumanAssistOutcome::Answered(answer)
+                crate::agent::human_assist::HumanAssistOutcome::Answered { text: answer, .. }
                     if answer.contains("继续") =>
                 {
                     consecutive_focus_fail = 0;
@@ -1215,7 +1215,7 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
                         ),
                     );
                 }
-                crate::agent::human_assist::HumanAssistOutcome::Answered(answer)
+                crate::agent::human_assist::HumanAssistOutcome::Answered { text: answer, .. }
                     if answer.contains("暂停") =>
                 {
                     // 暂停 = 阻塞等待 60s 后再试一次焦点守卫

@@ -24,6 +24,7 @@ pub mod decision_audit;
 pub mod dynamic_subagent;
 pub mod extrace;
 pub mod human_assist;
+pub mod human_ui;
 pub mod json_repair;
 pub mod loop_guard;
 pub mod main_work;

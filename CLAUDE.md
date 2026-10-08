@@ -109,7 +109,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 | 工具 | 替代 | 能力 | 平台门控 | 设计文档 |
 |------|------|------|----------|----------|
 | **MCP_Window_Use** | 原 WindowUse Agent | 桌面窗口操控：单工具 `action` 枚举分发（`open`/`list`/`find`/`inspect`/`control`/`ocr`/`screenshot`）；**双路线**（Windows UIA Pattern 优先 + Win32 消息 + 物理鼠标键盘兜底；macOS AX 控件树 + 物理输入；Linux wmctrl/xdotool 物理层）；操作优先级链 T1 UIA Pattern → T2 Win32 消息 → T3 物理输入（返回 `route=uia/win32_msg/physical` 标注供 QC/Debug 对账）；修饰键+鼠标/中键同时操作；复合 `input_batch` 一次编排 ≤40 步；视口/OCR 自适应 | **仅 macOS/Windows** 运行时注册进 `builtin_registry()`；Linux 走物理层兜底 | `docs/MCP_Window_Use/01-设计与解决方案.md` |
-| **MCP_Web_Use** | 原 Chromium-WebUse Agent | 浏览器操控：单工具 `action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 39 个写操作（鼠标/键盘/拖拽/上传/下载/eval_js/Cookie/视口/截图等）；`inspect` 16 个观察维度（含 Console/Network/Elements/DOM/localStorage/Cookie/页面元信息/OCR/`blockers` 人工阻断检测）；单步 + 连续（`sequence` ≤24 steps，批内 `$page_id`/`$spawned_page_id` 占位自动跟随派生新页）；视口基准 1080p + 2K 自动扩展（Playwright/Puppeteer 同款机制，CDP 坐标恒 CSS 像素无 DPR 换算）；验证码 OCR（macOS Vision）+ eval_js 容错与结果净化（自动 IIFE 重试 + 大结果/data-url 落盘）+ CDP 下载管理（`data:` 直存/`about:/blob:/javascript:` 快速失败）；headed 模式默认 1080p 窗口 + 蓝色选中边框与「LAEW Agent 控制中」徽标；**人工介入 HITL**（`src/agent/human_assist.rs` 全局枢纽，滑块/短信/扫码登录等不可自动跳过流程向 TUI 发起结构化选择，人工答复经 oneshot 回填；非 TUI 模式 fail-fast 4001/4002） | 跨 Windows/macOS/Linux；Chrome→Edge→Chromium→Brave 自动探测 | `docs/MCP_Web_Use/01-设计与解决方案.md` |
+| **MCP_Web_Use** | 原 Chromium-WebUse Agent | 浏览器操控：单工具 `action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 39 个写操作（鼠标/键盘/拖拽/上传/下载/eval_js/Cookie/视口/截图等）；`inspect` 16 个观察维度（含 Console/Network/Elements/DOM/localStorage/Cookie/页面元信息/OCR/`blockers` 人工阻断检测）；单步 + 连续（`sequence` ≤24 steps，批内 `$page_id`/`$spawned_page_id` 占位自动跟随派生新页）；视口基准 1080p + 2K 自动扩展（Playwright/Puppeteer 同款机制，CDP 坐标恒 CSS 像素无 DPR 换算）；验证码 OCR（macOS Vision）+ eval_js 容错与结果净化（自动 IIFE 重试 + 大结果/data-url 落盘）+ CDP 下载管理（`data:` 直存/`about:/blob:/javascript:` 快速失败）；headed 模式默认 1080p 窗口 + 蓝色选中边框与「LAEW Agent 控制中」徽标；**人工介入 HITL**（`src/agent/human_assist.rs` 全局枢纽，滑块/短信/扫码登录等不可自动跳过流程结构化提问，人工答复经 oneshot 回填；**呈现端双通道第 130 轮**：macOS/Windows 桌面**弹窗 UI 优先**（`src/agent/human_ui/` 动态加载平台脚本，持续置顶+倒计时+时间轴，`-p` 模式同样可弹），TUI 兜底行读，弹窗失败自动降级；二者均不可用 fail-fast 4001/4002） | 跨 Windows/macOS/Linux；Chrome→Edge→Chromium→Brave 自动探测 | `docs/MCP_Web_Use/01-设计与解决方案.md` |
 | **MCP_Use** | 新增（通用 MCP 协议调用） | 通用 MCP（Model Context Protocol）服务调用统一入口：真 MCP 协议客户端（JSON-RPC 2.0），连接外部 MCP server（stdio 子进程 / Streamable HTTP）；单工具 `action` 枚举分发（`list_servers`/`connect`/`list_tools`/`call_tool`/`list_resources`/`read_resource`/`close`）；server 接入记录在 SQLite `mcp_servers`（`laew mcp add|list|del|test` 维护，headers 经 Vault 加密），**LLM 不可新增 server**；懒连接 + 指数退避重连稳定性窗口 + `kill_on_drop` 防子进程泄漏；ContentBlock 四类投影降级永不丢弃；统一 JSON 信封 0/1001/3001/5001-5006；注册进 SubAgent-Work + Main-Work（编排探查），Yolo/Plan/QC 不持 | 跨平台（由外部 MCP server 决定能力） | `docs/MCP_Use/01-设计与解决方案.md` |
 
 ### 自感知动态子 Agent（Self-Awareness SubAgent）
@@ -180,6 +180,7 @@ tui/
   banner.rs        启动横幅:声明式行集(BannerData)+ textfit 自适应渲染 / 工作区·连接·日志行文本纯函数
   engine.rs        CLI 渲染引擎 —— Screen trait + Frame + 全量重绘 present
   form.rs          通用 Tab 表单状态机(被 ProviderForm 屏复用)
+  hitl_view.rs     人工介入(HITL)TUI 呈现视图(第 130 轮自 dispatch.rs 拆出):请求块渲染/倒计时同行右对齐/行读映射/弹窗接管通知行与事件打印
   input.rs         单行输入(主屏用):行编辑 + 行内提示 + 补全 + 固定底部面板(DECSTBM 滚动区)
   paste.rs         粘贴保真层(从 input.rs 拆出):PasteRegistry 登记簿 / handle_paste_text / 粘贴预览与提交完整回显(纯函数)
   completion.rs    斜杠命令补全引擎(内置 + 自定义命令动态注册)
@@ -215,7 +216,8 @@ agent/
   subagent.rs      SubAgent 主逻辑(D114):launch/batch/list/result/cancel/history/resume 单工具入口
   subagent_workflow.rs SubAgent 工作流编排(D116):≤8 步 DAG + Kahn 分层 + 原子预扣预算
   decision_audit.rs 决策审计(D9-8):5 决策点 → AuditTrail/*.jsonl 三段式结构化记录
-  human_assist.rs  人工介入 HITL(D100):oneshot 通道 + TUI 选择 + 非 TUI 模式 fail-fast
+  human_assist.rs  人工介入 HITL 枢纽(D100/第 130 轮):pending 槽位 + oneshot + kind 标签/默认文案单一事实源 + 弹窗呈现接线(via=gui/mark_gui_failed/事件环);弹窗与 TUI 均不可用才 fail-fast
+  human_ui/        人工介入弹窗 UI 呈现层(第 130 轮):mod.rs(门面/能力探测/payload/结果解析)+ script.rs(脚本动态加载:env→工作目录→根目录→~/.laew/human_ui→内置)+ macos.rs(osascript JXA)+ windows.rs(PowerShell WinForms)+ scripts/(内置弹窗脚本)
   todo_state.rs    TODO 任务状态(D19):`/tasks` 数据底座
   memory.rs        Agent-Memory SQLite 持久化
   max_tokens_state.rs max_tokens 三级恢复状态机
@@ -397,7 +399,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 
 **三个 MCP 风格工具**（按工具）：
 - `docs/MCP_Window_Use/` — 桌面窗口操控（01 主设计 + 02 鼠标键盘优先级链 + 03 连续工作模式 + 04 中键修饰键 + 05 macos_legacy 拆分 + 06 横向对比 + MacOS/Window 平台技术文档）
-- `docs/MCP_Web_Use/` — 浏览器操控（01 主设计 + 02 人工介入与窗口可视化）
+- `docs/MCP_Web_Use/` — 浏览器操控（01 主设计 + 02 人工介入与窗口可视化 + 03 人工介入弹窗UI动态加载）
 - `docs/MCP_Use/` — 通用 MCP 服务调用
 - `docs/浏览器CDP工具/` — CDP 技术参考（chromiumoxide 选型 / launch vs connect / BrowserManager 单例）
 

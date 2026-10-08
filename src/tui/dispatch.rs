@@ -18,7 +18,12 @@ use super::textfit;
 use super::TuiSession;
 use crate::agent::debug::{finalize_report, DebugCollector, ReportMeta};
 use crate::agent::orchestrator::OrchestrationOutcome;
-use crate::agent::human_assist::HumanAssistHub;
+use crate::agent::human_assist::{AssistEvent, AssistVia, HumanAssistHub};
+use super::hitl_view::{
+    human_assist_prompt_visual_width, map_human_assist_input, print_assist_event,
+    print_human_assist_gui_notice, print_human_assist_prompt_with_cursor, read_human_assist_answer,
+    render_countdown_inplace,
+};
 use crate::llm::{ChatMessage, Usage};
 
 impl TuiSession {
@@ -224,14 +229,17 @@ impl TuiSession {
                 let _ = std::io::stdout().write_all(b"\r  [waiting] \xe2\xa0\x8b  (0s)\x1b[K");
                 let _ = std::io::stdout().flush();
             }
-            // 第 100 轮(HITL):人工介入轮询 —— MCP_Web_Use request_human 时,
-            // HumanAssistHub 槽位出现待答请求,本协程渲染请求块并阻塞读 stdin。
-            // 任务执行期终端处于 cooked mode(InputHandler 未占用),行读即回显;
-            // 空回车=选项1,数字=对应选项,q/取消=取消(→工具 4002),其余原文返回。
+            // 第 100 轮(HITL):人工介入轮询 —— request_human 时 HumanAssistHub 槽位
+            // 出现待答请求。第 130 轮起呈现端双通道:**弹窗优先**(macOS/Windows 桌面,
+            // via=gui,本协程只打通知行 + 事件结果行,不读 stdin),弹窗失败降级
+            // **TUI 行读**(via=tui:渲染请求块并阻塞读 stdin;任务执行期终端处于
+            // cooked mode,行读即回显;空回车=选项1,数字=对应选项,q/取消=取消
+            // (→工具 4002),其余原文返回)。
             let mut assist_interval =
                 tokio::time::interval(std::time::Duration::from_millis(250));
             assist_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut handled_assist_id: Option<u64> = None;
+            let mut handled_via_gui = false;
 
             loop {
                 tokio::select! {
@@ -327,10 +335,65 @@ impl TuiSession {
                         }
                     },
                     _ = assist_interval.tick() => {
-                        if let Some(req) =
-                            crate::agent::human_assist::HumanAssistHub::global().poll()
+                        let hub = HumanAssistHub::global();
+                        // 第 130 轮:弹窗前端事件 → 通知行/结果行(弹出/降级/应答/取消/超时)
+                        for ev in hub.take_events() {
+                            let ev_id = match &ev {
+                                AssistEvent::GuiLaunched { id }
+                                | AssistEvent::GuiFailed { id }
+                                | AssistEvent::GuiCancelled { id }
+                                | AssistEvent::GuiTimeout { id } => Some(*id),
+                                AssistEvent::GuiAnswered { id, .. } => Some(*id),
+                            };
+                            match &ev {
+                                AssistEvent::GuiLaunched { id } => {
+                                    if let Some(areq) = hub.poll().filter(|r| r.id == *id) {
+                                        if waiting_line_on_screen {
+                                            clear_waiting_line(stdout_is_tty);
+                                            waiting_line_on_screen = false;
+                                        }
+                                        initial_spinner_active = false;
+                                        if stdout_is_tty {
+                                            super::input::teardown_pinned();
+                                        }
+                                        print_human_assist_gui_notice(
+                                            &areq,
+                                            crate::agent::human_ui::platform_name(),
+                                        );
+                                        handled_assist_id = Some(*id);
+                                        handled_via_gui = true;
+                                    }
+                                }
+                                AssistEvent::GuiFailed { id } => {
+                                    print_assist_event(&ev);
+                                    // 降级:同 id 由下方行读分支无缝接管(条件含 handled_via_gui)
+                                    handled_assist_id = Some(*id);
+                                    handled_via_gui = true;
+                                }
+                                _ => {
+                                    print_assist_event(&ev);
+                                    if let Some(id) = ev_id {
+                                        if handled_assist_id == Some(id) {
+                                            handled_assist_id = None;
+                                            handled_via_gui = false;
+                                        }
+                                    }
+                                    // 恢复 spinner 计时,避免把弹窗等待算进阶段耗时
+                                    spinner_started_at = std::time::Instant::now();
+                                }
+                            }
+                        }
+                        if let Some(req) = hub.poll()
                         {
-                            if handled_assist_id != Some(req.id) {
+                            let via_gui = hub.is_gui_presenting(req.id);
+                            if via_gui {
+                                // 弹窗接管:只打通知行(事件驱动),不读 stdin
+                                if handled_assist_id != Some(req.id) {
+                                    handled_assist_id = Some(req.id);
+                                    handled_via_gui = true;
+                                }
+                            } else if handled_assist_id != Some(req.id) || handled_via_gui {
+                                handled_via_gui = false;
                                 handled_assist_id = Some(req.id);
                                 if waiting_line_on_screen {
                                     clear_waiting_line(stdout_is_tty);
@@ -414,7 +477,7 @@ impl TuiSession {
                                         }
                                         println!("  [laew] HITL 已超时自动取消(req.id={})", req.id);
                                         // 自动 respond(None) -> 工具侧 Cancelled(4002)
-                                        let _ = hub.respond(req.id, None);
+                                        let _ = hub.respond(req.id, None, AssistVia::Tui);
                                         handled_assist_id = Some(req.id);
                                         "\x00-TIMEOUT".to_string()
                                     }
@@ -429,7 +492,7 @@ impl TuiSession {
                                             let _ = std::io::stdout().flush();
                                         }
                                         println!("  [laew] HITL 等待超时自动取消(req.id={})", req.id);
-                                        let _ = hub.respond(req.id, None);
+                                        let _ = hub.respond(req.id, None, AssistVia::Tui);
                                         handled_assist_id = Some(req.id);
                                         "\x00-TIMEOUT".to_string()
                                     }
@@ -449,7 +512,7 @@ impl TuiSession {
                                     let mapped =
                                         map_human_assist_input(&effective_answer, &req.options);
                                     let ok = crate::agent::human_assist::HumanAssistHub::global()
-                                        .respond(req.id, mapped.clone());
+                                        .respond(req.id, mapped.clone(), AssistVia::Tui);
                                     if ok {
                                         match mapped {
                                             Some(a) => {
@@ -1308,358 +1371,9 @@ mod tests {
     }
 }
 
-// =================== 第 100 轮:人工介入(HITL)TUI 渲染与输入 ===================
-
-use crate::agent::human_assist::HumanAssistDisplay;
-
-/// kind 展示标签(request_human 的 reason 映射;与工具侧 human_assist_defaults 对齐)。
-fn human_assist_kind_label(kind: &str) -> &str {
-    match kind {
-        "captcha" => "图形/滑块验证码",
-        "sms" => "短信验证码",
-        "qr_login" => "扫码登录",
-        "login" => "账密登录",
-        "real_name" => "实名认证/人脸核身",
-        "two_factor" => "二次验证/2FA",
-        "oauth" => "第三方授权",
-        "manual_verify" => "人工核验",
-        _ => "人工介入",
-    }
-}
-
-/// 渲染人工介入请求块(蓝色框线 + 强视觉输入提示符;倒计时**不画在框内**,
-/// 由内层 tick 用 `\r` + 同行右对齐原地重写,避免堆叠)。
-///
-/// 第 119 轮改进:
-/// 1. 静态内容(蓝框 + 类型 + 说明 + 选项 + 输入提示符)**只画一次**;之前
-///    每秒 tick 都把整个框重新打印一次,导致屏幕堆叠 119/118/117... 行;
-/// 2. 倒计时通过 [`render_countdown_inplace`] 在**输入提示符同行右侧**
-///    用 `\r\x1b[2K\x1b[999C\x1b[ND` 原地重写, 只占一格, 屏幕不再被淹没;
-/// 3. 强视觉输入提示符 `▶ 输入...`(Bold Cyan + Blink + Reverse)保留,
-///    用户一眼找到输入位置;
-/// 4. 调用方应在渲染前先 `teardown_pinned()` 清理底部 InputHandler 固定面板
-///    残留的 `>> <旧buffer>`,避免视觉歧义。
-fn print_human_assist_prompt_with_cursor(req: &HumanAssistDisplay, elapsed_ms: u64) {
-    use std::io::Write as _;
-    let _ = elapsed_ms; // 第 119 轮:倒计时由 render_countdown_inplace 按需重写, 不在静态阶段渲染
-
-    let mut out = String::new();
-    // 1. 蓝框 + 类型/说明/选项(保留 print_human_assist_block 风格, 但**不画倒计时行**)
-    out.push_str("\n  \x1b[36m┌─ 🔐 人工介入请求 ────────────────────────────────\x1b[0m\n");
-    out.push_str(&format!(
-        "  \x1b[36m│\x1b[0m 类型: \x1b[1m{}\x1b[0m",
-        human_assist_kind_label(&req.kind)
-    ));
-    if !req.url.is_empty() {
-        out.push_str(&format!(
-            "   页面: {}",
-            pathfmt::elide_middle(&req.url, 56)
-        ));
-    }
-    out.push('\n');
-    out.push_str(&format!(
-        "  \x1b[36m│\x1b[0m 说明: {}\n",
-        req.message.replace('\n', " ")
-    ));
-    if !req.options.is_empty() {
-        out.push_str("  \x1b[36m│\x1b[0m 选项:\n");
-        for (i, opt) in req.options.iter().enumerate() {
-            out.push_str(&format!("  \x1b[36m│\x1b[0m   {}. {}\n", i + 1, opt));
-        }
-    }
-    out.push_str(&format!(
-        "  \x1b[36m│\x1b[0m 超时: {}s\n",
-        req.timeout_ms / 1000
-    ));
-    out.push_str("  \x1b[36m└──────────────────────────────────────────────\x1b[0m\n");
-    // 2. 强视觉输入提示符:\\x1b[5m=Blink, \\x1b[7m=Reverse(反白); 中间一个空格被反白闪烁,
-    //    形如 ▶ 输入验证码 [闪烁光标] (q=取消):  —— 用户一眼能看到该在哪一行输入
-    //    注意: 不再 print 顶部的 \n, 因为 render_countdown_inplace 用 \r 同行覆盖
-    //    倒计时区域, 输入提示符位置必须在同一行才能精确对齐。
-    let input_prompt = if req.options.is_empty() {
-        "  \x1b[1;36m▶ 输入验证码/内容\x1b[0m\x1b[5;7m \x1b[0m\x1b[1;36m▏\x1b[0m(q=取消): "
-    } else {
-        "  \x1b[1;36m▶ 输入选项编号(回车=1)或自由内容\x1b[0m\x1b[5;7m \x1b[0m\x1b[1;36m▏\x1b[0m(q=取消): "
-    };
-    out.push_str(input_prompt);
-    print!("{out}");
-    let _ = std::io::stdout().flush();
-}
-
-/// 输入提示符同行右侧的倒计时渲染(第 119 轮新增):
-/// 用 `\r` 回本行首, 清行(`\x1b[2K`), 跳到 prompt_w 列, 打印倒计时文本, 还原光标。
-///
-/// 不再额外占用新行, 避免屏幕堆叠 119/118/... 行。TTY 非交互管道场景
-/// 不需要倒计时(工具侧已自带 timeout), 直接返回空串, 走静默路径。
-fn render_countdown_inplace(req: &HumanAssistDisplay, remaining_s: u64) -> String {
-    let color = if remaining_s <= 10 {
-        "\x1b[31m"  // 红
-    } else if remaining_s <= 30 {
-        "\x1b[33m"  // 黄
-    } else {
-        "\x1b[90m"  // 灰
-    };
-    let total_s = req.timeout_ms / 1000;
-    let prompt_w = req.prompt_visual_width as usize;
-    if prompt_w == 0 {
-        // 无 prompt_w 兜底: 直接在行尾打印, ANSI 引擎自动截断
-        return format!(
-            "\r\x1b[2K\x1b[999C\x1b[{n}D{0}⏱ 剩余 {1}s (总 {2}s){3}",
-            color,
-            remaining_s,
-            total_s,
-            "\x1b[0m",
-            n = 32,
-        );
-    }
-    // prompt_w > 0: 同 prompt 行右侧对齐
-    format!(
-        "\r\x1b[2K\x1b[{n}C{0}⏱ 剩余 {1}s (总 {2}s){3}",
-        color,
-        remaining_s,
-        total_s,
-        "\x1b[0m",
-        n = prompt_w,
-    )
-}
-
-/// 计算当前输入提示符的可视列宽(中文/全角按 2 计)。第 119 轮新增。
-/// 调用方: render_countdown_inplace 之前。
-fn human_assist_prompt_visual_width(req: &HumanAssistDisplay) -> u16 {
-    use crate::tui::input::display_width;
-    let label = if req.options.is_empty() {
-        "▶ 输入验证码/内容 ▏(q=取消): "
-    } else {
-        "▶ 输入选项编号(回车=1)或自由内容 ▏(q=取消): "
-    };
-    // 2 个前导空格 + label; 闪烁反白符在视觉上是普通空格, 算 1 列
-    let full = format!("  {label}");
-    // display_width 已返回 u16, 不会溢出; 直接返回
-    display_width(&full)
-}
-
-/// 渲染人工介入请求块(蓝色框线,与浏览器窗口蓝框呼应)。
-///
-/// 第 118 轮起弃用,改用 [`print_human_assist_prompt_with_cursor`]
-/// (含倒计时 + 强视觉输入提示符)。保留本函数以兼容其它调用点/单测。
-#[allow(dead_code)]
-fn print_human_assist_block(req: &HumanAssistDisplay) {
-    use std::io::Write as _;
-    let mut out = String::new();
-    out.push_str("\n  \x1b[36m┌─ 🔐 人工介入请求 ────────────────────────────────\x1b[0m\n");
-    out.push_str(&format!(
-        "  \x1b[36m│\x1b[0m 类型: \x1b[1m{}\x1b[0m",
-        human_assist_kind_label(&req.kind)
-    ));
-    if !req.url.is_empty() {
-        out.push_str(&format!("   页面: {}", pathfmt::elide_middle(&req.url, 56)));
-    }
-    out.push('\n');
-    out.push_str(&format!(
-        "  \x1b[36m│\x1b[0m 说明: {}\n",
-        req.message.replace('\n', " ")
-    ));
-    if !req.options.is_empty() {
-        out.push_str("  \x1b[36m│\x1b[0m 选项:\n");
-        for (i, opt) in req.options.iter().enumerate() {
-            out.push_str(&format!("  \x1b[36m│\x1b[0m   {}. {}\n", i + 1, opt));
-        }
-    }
-    out.push_str(&format!(
-        "  \x1b[36m│\x1b[0m 超时: {}s\n",
-        req.timeout_ms / 1000
-    ));
-    out.push_str("  \x1b[36m└──────────────────────────────────────────────\x1b[0m\n");
-    let prompt_line = if req.options.is_empty() {
-        "  请输入内容后回车(q=取消): "
-    } else {
-        "  请输入选项编号或直接输入内容(回车=1,q=取消): "
-    };
-    out.push_str(prompt_line);
-    print!("{out}");
-    let _ = std::io::stdout().flush();
-}
-
-/// 阻塞读一行 stdin(spawn_blocking 防 tokio 协程阻塞;cooked mode 自带回显)。
-/// EOF / 读取失败 → 空串(按默认选项 1 处理,避免 e2e 管道场景挂死)。
-async fn read_human_assist_answer() -> String {
-    tokio::task::spawn_blocking(|| {
-        let mut buf = String::new();
-        match std::io::stdin().read_line(&mut buf) {
-            Ok(0) | Err(_) => String::new(),
-            Ok(_) => buf.trim_end_matches(['\n', '\r']).to_string(),
-        }
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// 人工输入映射:空回车 → 选项 1;数字 → 对应选项;q/取消/cancel → None(取消);
-/// 其余原文返回(短信验证码数字即自由文本路径)。
-fn map_human_assist_input(input: &str, options: &[String]) -> Option<String> {
-    let t = input.trim();
-    if t.is_empty() {
-        return options.first().map(|o| format!("1. {o}"));
-    }
-    let lower = t.to_lowercase();
-    if matches!(lower.as_str(), "q" | "quit" | "取消" | "cancel" | "exit") {
-        return None;
-    }
-    if let Ok(n) = t.parse::<usize>() {
-        if (1..=options.len()).contains(&n) {
-            return Some(format!("{n}. {}", options[n - 1]));
-        }
-    }
-    Some(t.to_string())
-}
-
-#[cfg(test)]
-mod human_assist_tui_tests {
-    use super::*;
-
-    #[test]
-    fn maps_empty_input_to_first_option() {
-        let opts = vec!["已完成".to_string(), "取消".to_string()];
-        assert_eq!(
-            map_human_assist_input("", &opts),
-            Some("1. 已完成".to_string())
-        );
-        assert_eq!(
-            map_human_assist_input("  \n", &opts),
-            Some("1. 已完成".into())
-        );
-    }
-
-    #[test]
-    fn maps_numeric_choice() {
-        let opts = vec!["继续".to_string(), "跳过".to_string()];
-        assert_eq!(map_human_assist_input("2", &opts), Some("2. 跳过".into()));
-        assert_eq!(map_human_assist_input("99", &opts), Some("99".to_string()));
-    }
-
-    #[test]
-    fn maps_cancel_keywords_to_none() {
-        let opts = vec!["继续".to_string()];
-        for kw in ["q", "Q", "取消", "cancel", "exit"] {
-            assert_eq!(map_human_assist_input(kw, &opts), None, "kw={kw}");
-        }
-    }
-
-    #[test]
-    fn maps_free_text_verbatim() {
-        let opts = vec!["已完成".to_string()];
-        assert_eq!(
-            map_human_assist_input("482913", &opts),
-            Some("482913".to_string())
-        );
-    }
-
-    /// 第 119 轮:render_countdown_inplace 必须用 `\r\x1b[2K` 原地重写,
-    /// 避免每 tick 打印新行导致屏幕堆叠 119/118/117...
-    #[test]
-    fn countdown_inplace_uses_carriage_return_clear() {
-        let req = HumanAssistDisplay {
-            id: 1,
-            kind: "captcha".into(),
-            message: "test".into(),
-            options: vec![],
-            url: String::new(),
-            page_id: "p_1".into(),
-            timeout_ms: 120_000,
-            prompt_visual_width: 84,
-        };
-        let out = render_countdown_inplace(&req, 119);
-        // 必须以 \r + \x1b[2K 开头(回行首 + 清行),不产生新行
-        assert!(out.starts_with("\r\x1b[2K"), "must start with \\r + clear: {out:?}");
-        assert!(!out.starts_with('\n'), "must not begin with newline");
-        // 含倒计时秒数 与 总秒数
-        assert!(out.contains("⏱ 剩余 119s"), "must show remaining: {out:?}");
-        assert!(out.contains("总 120s"), "must show total: {out:?}");
-        // 不含换行符(同行重写)
-        assert!(!out.contains('\n'), "must not contain newline: {out:?}");
-    }
-
-    /// 第 119 轮:颜色随时间灰→黄→红渐变
-    #[test]
-    fn countdown_inplace_color_gradient() {
-        let mk = |ms: u64| HumanAssistDisplay {
-            id: 1,
-            kind: "captcha".into(),
-            message: "t".into(),
-            options: vec![],
-            url: String::new(),
-            page_id: "p_1".into(),
-            timeout_ms: ms,
-            prompt_visual_width: 60,
-        };
-        // >30s: 灰(\x1b[90m)
-        let far = render_countdown_inplace(&mk(120_000), 60);
-        assert!(far.contains("\x1b[90m"), ">30s should be gray: {far:?}");
-        // 11-30s: 黄(\x1b[33m)
-        let mid = render_countdown_inplace(&mk(120_000), 20);
-        assert!(mid.contains("\x1b[33m"), "11-30s should be yellow: {mid:?}");
-        // <=10s: 红(\x1b[31m)
-        let near = render_countdown_inplace(&mk(120_000), 5);
-        assert!(near.contains("\x1b[31m"), "<=10s should be red: {near:?}");
-    }
-
-    /// 第 119 轮:prompt_visual_width=0 走行尾回退路径, 也有 \r 清行
-    #[test]
-    fn countdown_inplace_zero_width_falls_back() {
-        let req = HumanAssistDisplay {
-            id: 1,
-            kind: "captcha".into(),
-            message: "t".into(),
-            options: vec![],
-            url: String::new(),
-            page_id: "p_1".into(),
-            timeout_ms: 60_000,
-            prompt_visual_width: 0,
-        };
-        let out = render_countdown_inplace(&req, 30);
-        assert!(out.starts_with("\r\x1b[2K"), "must begin with \\r + clear");
-        assert!(out.contains("⏱ 剩余 30s"));
-    }
-
-    /// 第 119 轮:提示符可视宽度计算:中文全角计 2 列
-    #[test]
-    fn prompt_visual_width_counts_cjk_double() {
-        let with_opts = HumanAssistDisplay {
-            id: 1,
-            kind: "captcha".into(),
-            message: "t".into(),
-            options: vec!["继续".into()],
-            url: String::new(),
-            page_id: "p_1".into(),
-            timeout_ms: 60_000,
-            prompt_visual_width: 0,
-        };
-        let dry = HumanAssistDisplay {
-            options: vec![],
-            ..with_opts.clone()
-        };
-        let w_with = human_assist_prompt_visual_width(&with_opts);
-        let w_dry = human_assist_prompt_visual_width(&dry);
-        // 选项版提示符更长(「输入选项编号(回车=1)或自由内容」比「输入验证码/内容」长)
-        assert!(
-            w_with > w_dry,
-            "option prompt should be wider: {w_with} vs {w_dry}"
-        );
-        // 都应是合理值(>20 且 < 200)
-        assert!(w_with > 20 && w_with < 200, "unexpected width {w_with}");
-        assert!(w_dry > 20 && w_dry < 200, "unexpected width {w_dry}");
-    }
-
-    /// 第 119 轮:内部 cancel sentinel 与正常答案区分
-    #[test]
-    fn internal_cancel_sentinel_is_not_a_real_answer() {
-        // 正常文本不会是 sentinel
-        assert_ne!("\x00-TIMEOUT", "482913");
-        assert_ne!("\x00-TIMEOUT", "");
-        // 用户输入 null 字符 + TIMEOUT 文本也不等(sentinel 以 \x00 开头)
-        assert_ne!("\x00-TIMEOUT", "\x00");
-    }
-}
+// =================== 人工介入(HITL)TUI 渲染与输入 ===================
+// 第 130 轮(2026-10-08):本段渲染/行读/映射逻辑拆分至 `tui/hitl_view.rs`
+// (dispatch.rs 逼近 1700 行临界,新增弹窗通知行代码落在职责子模块)。
 
 /// 判断编排层失败原因是否网络类(用于 D13 连接状态更新)。
 fn looks_like_network_failure(reason: &str) -> bool {

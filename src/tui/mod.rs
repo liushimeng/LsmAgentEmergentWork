@@ -36,6 +36,7 @@ pub mod completion;
 pub mod engine;
 pub mod export;
 pub mod form;
+pub mod hitl_view;
 pub mod mention;
 pub mod paste;
 pub mod pathfmt;

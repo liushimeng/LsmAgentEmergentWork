@@ -1197,46 +1197,15 @@ async fn act_set_highlight(id: &str, p: &Value) -> std::result::Result<Value, St
         .await
 }
 
-/// request_human 的 reason → 默认文案与 TUI 标签。
-/// 完整合法 reason 列表见 [`HUMAN_ASSIST_ALLOWED_REASONS`];新增 reason 必须
-/// 同步更新此处 + 校验顺序 + 文档,保证 LLM / TUI / 阻断检测三处对齐。
+/// request_human 的 reason → 默认文案与展示标签。
+/// 第 130 轮收口到 `human_assist::{kind_label, default_message}` 单一事实源
+/// (弹窗 / TUI / 工具侧三处共用);完整合法 reason 列表见
+/// [`HUMAN_ASSIST_ALLOWED_REASONS`],新增 reason 同步更新那边 + 校验顺序 + 文档。
 fn human_assist_defaults(reason: &str) -> (&'static str, &'static str) {
-    // (TUI 展示标签, 默认说明文案)
-    match reason {
-        "captcha" => (
-            "图形/滑块验证码",
-            "页面出现验证码/滑块,Agent 无法自动完成。请人工在浏览器窗口完成验证后回到终端确认;若是短信/文字验证码也可直接在下方输入。",
-        ),
-        "sms" => (
-            "短信验证码",
-            "页面要求短信验证码,Agent 无法获取。请把手机收到的验证码数字直接输入在下方。",
-        ),
-        "qr_login" => (
-            "扫码登录",
-            "页面要求扫码登录。请人工用手机完成扫码/确认后回到终端继续。",
-        ),
-        "login" => (
-            "账密登录",
-            "页面要求账号密码登录。请人工在浏览器窗口完成登录后回到终端确认(不要把密码发给 Agent)。",
-        ),
-        "real_name" => (
-            "实名认证/人脸核身",
-            "页面要求实名认证/上传身份证/人脸核身,Agent 无法代为核验。请人工在浏览器窗口完成验证(刷脸/上传证件)后回到终端继续。",
-        ),
-        "two_factor" => (
-            "二次验证/2FA",
-            "页面要求二次验证(2FA/TOTP/邮箱验证码)。请把手机 Authenticator 或邮箱里看到的动态码直接输入在下方。",
-        ),
-        "oauth" => (
-            "第三方授权",
-            "页面跳到第三方授权页(GitHub/微信/Google/SSO 等),Agent 无法跨设备授权。请人工在浏览器窗口完成授权后回到终端继续。",
-        ),
-        "manual_verify" => (
-            "人工核验",
-            "页面流程需要人工核验/确认。请人工在浏览器窗口完成后回到终端继续。",
-        ),
-        _ => ("人工介入", "Agent 无法继续当前流程,需要人工处理。"),
-    }
+    (
+        crate::agent::human_assist::kind_label(reason),
+        crate::agent::human_assist::default_message(reason),
+    )
 }
 
 /// request_human 合法 reason 集合(用于参数校验与对外暴露给 LLM)。
@@ -1261,11 +1230,13 @@ pub fn human_assist_reasons_doc() -> String {
 /// control_action=request_human:人工介入请求(HITL 闭环)。
 ///
 /// 流程:可选 `bring_to_front`(默认 true)把浏览器窗口带到前台 → 经
-/// HumanAssistHub 向 TUI 发起结构化提问(标题/说明/选项)→ TUI 行读人工输入 →
-/// oneshot 回填。返回专用信封:
-/// - code=0:`data.human_response` 为人工输入(选项文本或自由文本);
-/// - code=4001:超时 / 非 TUI 交互模式(-p 单轮、管道);
-/// - code=4002:人工明确取消(TUI 输入 q/取消)。
+/// HumanAssistHub 发起结构化提问(macOS/Windows 桌面**弹窗优先**(第 130 轮,
+/// 持续置顶+倒计时+时间轴,`-p` 模式同样可弹),TUI 兜底行读)→ oneshot 回填。
+/// 返回专用信封:
+/// - code=0:`data.human_response` 为人工输入(选项文本或自由文本),
+///   `data.assist_channel` 标注应答通道(gui/tui);
+/// - code=4001:超时 / 弹窗与 TUI 均不可用;
+/// - code=4002:人工明确取消(弹窗取消/Esc/关窗,或 TUI 输入 q/取消)。
 async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> {
     // page_id 有效性前置校验(2000 语义与其它动作一致)
     if BrowserManager::global().page(id).await.is_none() {
@@ -1325,8 +1296,9 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     let outcome = crate::agent::human_assist::HumanAssistHub::global()
         .request(reason, &message, options.clone(), &url, id, timeout_ms)
         .await;
+    use crate::agent::human_assist::{AssistVia, HumanAssistOutcome};
     match outcome {
-        crate::agent::human_assist::HumanAssistOutcome::Answered(answer) => {
+        HumanAssistOutcome::Answered { text: answer, via } => {
             envelope(
                 0,
                 "人工已响应",
@@ -1334,38 +1306,42 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                     "reason": reason,
                     "kind_label": label,
                     "human_response": answer,
+                    "assist_channel": via.as_str(),
                     "next_hint": match reason {
-                        "sms" => "把 human_response 中的验证码用 input_text 填入验证码输入框后继续流程",
-                        _ => "人工已在浏览器窗口完成操作,请 inspect 验证页面状态后继续流程",
+                        "sms" | "two_factor" => "把 human_response 中的验证码/动态码用 input_text 填入对应输入框后继续流程",
+                        _ => "人工已完成操作,请 inspect 验证页面状态后继续流程",
                     },
                 }),
             )
         }
-        crate::agent::human_assist::HumanAssistOutcome::Timeout => envelope(
+        HumanAssistOutcome::Timeout { via } => envelope(
             4001,
             "人工介入等待超时",
             json!({
                 "reason": reason,
                 "kind_label": label,
+                "assist_channel": via.as_str(),
                 "hint": "等待人工响应超时。可再次 request_human 重试,或如实向用户报告需要人工配合后结束",
             }),
         ),
-        crate::agent::human_assist::HumanAssistOutcome::Cancelled => envelope(
+        HumanAssistOutcome::Cancelled { via } => envelope(
             4002,
             "人工已取消介入",
             json!({
                 "reason": reason,
                 "kind_label": label,
+                "assist_channel": via.as_str(),
                 "hint": "人工选择取消。终止当前浏览器流程,汇总已完成部分向用户报告,不要继续重试",
             }),
         ),
-        crate::agent::human_assist::HumanAssistOutcome::Unavailable => envelope(
+        HumanAssistOutcome::Unavailable => envelope(
             4001,
-            "人工介入不可用(非交互式 TUI 模式)",
+            "人工介入不可用(弹窗与 TUI 均不可用)",
             json!({
                 "reason": reason,
                 "kind_label": label,
-                "hint": "当前为非交互模式(-p 单轮/管道),无法弹出人工选择。如实告知用户:请在 laew TUI 交互模式下重新执行该任务",
+                "assist_channel": AssistVia::Tui.as_str(),
+                "hint": "当前环境既无桌面弹窗(macOS/Windows 会话)也无 TUI 交互。如实告知用户:请在 laew TUI 交互模式或桌面会话下重新执行该任务",
             }),
         ),
     }
