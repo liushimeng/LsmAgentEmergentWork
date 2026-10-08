@@ -53,6 +53,14 @@ pub(super) fn print_human_assist_prompt_with_cursor(req: &HumanAssistDisplay, el
         "  \x1b[36m│\x1b[0m 说明: {}\n",
         req.message.replace('\n', " ")
     ));
+    // 第 132 轮:验证码现场截图路径(弹窗/GUI 内直接展示;TUI 兜底打印路径,
+    // macOS `open <path>` / Windows `start <path>` 可查看原图)
+    if !req.image_path.is_empty() {
+        out.push_str(&format!(
+            "  \x1b[36m│\x1b[0m 🖼 验证码图片: {}\n",
+            pathfmt::elide_middle(&req.image_path, 56)
+        ));
+    }
     if !req.options.is_empty() {
         out.push_str("  \x1b[36m│\x1b[0m 选项:\n");
         for (i, opt) in req.options.iter().enumerate() {
@@ -268,6 +276,13 @@ pub fn print_human_assist_gui_notice(
             pathfmt::elide_middle(&req.url, 72)
         ));
     }
+    // 第 132 轮:弹窗内已展示验证码图片时,同步把路径摆到台面(可 `open` 查看放大图)
+    if !req.image_path.is_empty() {
+        out.write_line(&format!(
+            "  [laew]   🖼 验证码图片: {}",
+            pathfmt::elide_middle(&req.image_path, 72)
+        ));
+    }
     out.write_line(
         "  [laew]   (弹窗被遮挡会自动置顶拉焦;异常时可等自动降级为终端作答,或设 LAEW_HUMAN_UI=off)",
     );
@@ -305,6 +320,7 @@ mod human_assist_tui_tests {
             options: vec![],
             url: String::new(),
             page_id: "p_1".into(),
+            image_path: String::new(),
             timeout_ms: 120_000,
             prompt_visual_width: 84,
             created_at_ms: 0,

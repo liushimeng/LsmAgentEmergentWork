@@ -700,6 +700,9 @@ async fn run_one_shot(
             stop_assist();
             let _ = assist_printer.await;
             let _ = stage_printer.await;
+            // 第 132 轮:错误路径同样回收挂起的人工介入请求(与 TUI dispatch 收尾对齐),
+            // 防止 pending 槽位与弹窗子进程跨任务泄漏。
+            lsm_agent::agent::human_assist::HumanAssistHub::global().cancel_pending();
             return Err(anyhow::Error::from(e));
         }
     };
@@ -734,6 +737,8 @@ async fn run_one_shot(
                 active.end_point
             ),
             classification,
+            // 单轮模式取消路径直接 exit(130) 不会走到这里;报告恒为完整 LLM 评估。
+            interrupted: false,
         };
         let report_dir = paths.root_dir.join("DebugReport");
         match lsm_agent::agent::debug::finalize_report(&collector, llm.clone(), &report_dir, &meta)

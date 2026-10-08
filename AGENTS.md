@@ -110,6 +110,12 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **人工介入可见性**：`request_human` 的「该走人工」下沉到工具返回层——OCR 报错/空文本与 `inspect(info=blockers)` 命中阻断时，响应附 `next_action="request_human"` + 完整 `human_assist` 载荷；`4001` 附 `human_ui_diagnostics` 供排障；`-p`/`-f` 单轮模式新增 HITL 事件轮询协程与弹窗通知行（此前弹窗照弹但终端零输出）。见 `docs/MCP_Web_Use/02` §5.0/§5.1.1/§5.3。
 - **TUI 粘贴只显示一遍**：多行粘贴在粘贴瞬间已回显前 4 行预览，提交时不再全量重复原文，改为回显 marker 形态 + 一行「已按原文完整发送 N 行 / M 字」；纯键盘输入路径不变。见 `src/tui/paste.rs::plan_submit_echo_with_paste`。
 
+### 第 132 轮：人工介入弹窗可用性四问题修复 + Ctrl-C 取消链路根治
+
+- **macOS 弹窗重写（NSAlert+runModal → 自绘 NSWindow + `NSApp.run()`）**：文案可鼠标选中/⌘C 复制（NSTextView selectable）；输入框显式 first responder，键盘/输入法可正常输入；连点输入框不再误关（无关闭按钮 + 按钮只响应自身点击）；倒计时每秒真实刷新 + 超时自灭（modal 下 default-mode NSTimer 不 fire 的老问题一并根治）；置顶保留浮动层级，取消周期抢焦（人工在浏览器操作时不再被反复拉焦）。
+- **验证码图片展示**：`request_human` 附图——显式 `params.image_path` 优先，`reason=captcha` 自动 CDP 视口截图（浏览器进程内截图，不受宿主录屏 TCC 权限影响）；payload 新增 `image_path`（空串=无图，旧脚本忽略），macOS NSImageView / Windows PictureBox 弹窗内直接渲染，TUI 打印路径；信封携带 `image_source` 对账。
+- **Ctrl-C 取消收口**：取消后 Debug 报告跳过 LLM 评估（`ReportMeta.interrupted` → 本地骨架秒级落盘；实测原评估同步阻塞 4 分钟且零反馈，TUI 假死在「正在取消当前任务...」）；stage 打印协程与 HITL 行读接入取消 token，`stage_printer.await` 不再等 stdin。见 `docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md` §11。
+
 ### 三个 MCP 风格工具（替代已删除的独立 Agent 角色）
 
 | 工具 | 替代 | 能力 | 平台门控 | 设计文档 |

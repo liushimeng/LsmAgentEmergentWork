@@ -1199,6 +1199,7 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
                     "",
                     "",
                     30000, // 30s 超时,超时 = 「立即中止」(保守兜底)
+                    "",   // 第 132 轮:附图路径(manual_verify 无图)
                 )
                 .await;
             match last_choice {

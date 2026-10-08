@@ -538,6 +538,42 @@ fn detect_blockers_matches_common_walls() {
 }
 
 #[test]
+fn hitl_image_plan_priority_and_sources() {
+    // 第 132 轮:附图解析优先级 —— 显式路径(存在)> captcha 自动截图 > 无图
+    use crate::agent::tools::mcp_web_use::control::{hitl_image_plan, HitlImagePlan};
+
+    // 显式 + 文件存在 → Explicit / explicit
+    let tmp = std::env::temp_dir().join("laew_hitl_plan_probe.png");
+    std::fs::write(&tmp, b"png").unwrap();
+    let f = tmp.display().to_string();
+    let (plan, src) = hitl_image_plan("captcha", Some(f.as_str()));
+    assert_eq!(plan, HitlImagePlan::Explicit(f.clone()));
+    assert_eq!(src, "explicit");
+    // 显式给图对非 captcha reason 同样生效(人工指定即权威)
+    let (plan2, _) = hitl_image_plan("sms", Some(f.as_str()));
+    assert!(matches!(plan2, HitlImagePlan::Explicit(_)));
+    let _ = std::fs::remove_file(&tmp);
+
+    // 显式但文件不存在 → 无图 / explicit_missing(fail-open)
+    let (plan, src) = hitl_image_plan("captcha", Some("/no/such/file.png"));
+    assert_eq!(plan, HitlImagePlan::None);
+    assert_eq!(src, "explicit_missing");
+
+    // 无显式 + captcha → 自动截图
+    let (plan, src) = hitl_image_plan("captcha", None);
+    assert_eq!(plan, HitlImagePlan::Auto);
+    assert_eq!(src, "auto");
+
+    // 无显式 + 非 captcha → 无图
+    let (plan, src) = hitl_image_plan("sms", None);
+    assert_eq!(plan, HitlImagePlan::None);
+    assert_eq!(src, "none");
+    // 空串显式等同未给(自动路径仍可命中)
+    let (plan, _) = hitl_image_plan("captcha", Some("  "));
+    assert_eq!(plan, HitlImagePlan::Auto);
+}
+
+#[test]
 fn human_assist_allowed_reasons_covers_extensions() {
     // 第 117 轮:常量必须包含实名/2FA/OAuth 三种新 reason,且顺序符合推荐使用顺序。
     use crate::agent::tools::mcp_web_use::control::HUMAN_ASSIST_ALLOWED_REASONS;

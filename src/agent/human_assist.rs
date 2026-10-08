@@ -98,6 +98,11 @@ pub struct HumanAssistDisplay {
     pub url: String,
     /// 关联 page_id(展示用)。
     pub page_id: String,
+    /// 第 132 轮:验证码等阻断现场的截图路径(空 = 无图)。
+    /// 由 `act_request_human` 解析(显式 `params.image_path` 优先,`reason=captcha`
+    /// 自动 CDP 视口截图),弹窗前端把它直接渲染出来 —— 人工不必切去浏览器找图,
+    /// 在弹窗里即可读码;TUI 兜底行读时打印路径供 `open` 查看。
+    pub image_path: String,
     pub timeout_ms: u64,
     /// 第 119 轮新增:输入提示符同行可视宽度(中文/全角算 2 列),
     /// TUI 协程用它把倒计时右对齐到屏幕右侧(避免压在提示符上)。
@@ -248,6 +253,7 @@ impl HumanAssistHub {
         url: &str,
         page_id: &str,
         timeout_ms: u64,
+        image_path: &str,
     ) -> HumanAssistOutcome {
         // 第 130 轮:桌面弹窗可用时即使非 TTY(-p/管道)也放行 —— 只有
         // 「弹窗与 TUI 均不可用」才 fail-fast。
@@ -272,6 +278,7 @@ impl HumanAssistHub {
                         options,
                         url: url.to_string(),
                         page_id: page_id.to_string(),
+                        image_path: image_path.to_string(),
                         timeout_ms,
                         prompt_visual_width: 0,
                         created_at_ms: now_unix_ms(),
@@ -546,7 +553,7 @@ mod tests {
         let was = hub.is_attached();
         hub.detach();
         let out = hub
-            .request("captcha", "x", vec![], "https://a", "p_1", 1000)
+            .request("captcha", "x", vec![], "https://a", "p_1", 1000, "")
             .await;
         assert_eq!(out, HumanAssistOutcome::Unavailable);
         if was {
@@ -570,6 +577,7 @@ mod tests {
                     "https://b",
                     "p_2",
                     60_000,
+                    "/tmp/laew_hitl_captcha_demo.png",
                 )
                 .await
             }
@@ -587,6 +595,11 @@ mod tests {
         .expect("poll 应拿到请求");
         assert_eq!(display.kind, "sms");
         assert_eq!(display.options, vec!["已完成".to_string()]);
+        // 第 132 轮:验证码截图路径应原样投影到弹窗/TUI 侧的展示形态
+        assert_eq!(
+            display.image_path, "/tmp/laew_hitl_captcha_demo.png",
+            "image_path 应随请求透传"
+        );
         assert!(display.created_at_ms > 0, "created_at_ms 应记录提出时刻");
         assert!(hub.respond(display.id, Some("123456".into()), AssistVia::Tui));
         assert_eq!(
@@ -608,7 +621,7 @@ mod tests {
         hub.attach();
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("custom", "取消我", vec![], "", "p_3", 60_000).await }
+            async move { hub.request("custom", "取消我", vec![], "", "p_3", 60_000, "").await }
         });
         let display = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -637,7 +650,7 @@ mod tests {
         let hub = HumanAssistHub::global();
         hub.attach();
         let out = hub
-            .request("captcha", "x", vec![], "", "p_4", MIN_HUMAN_ASSIST_TIMEOUT_MS)
+            .request("captcha", "x", vec![], "", "p_4", MIN_HUMAN_ASSIST_TIMEOUT_MS, "")
             .await;
         assert_eq!(
             out,
@@ -663,7 +676,7 @@ mod tests {
         // 入位一个长超时请求(不依赖真实超时)
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "x", vec![], "", "p_n", 60_000).await }
+            async move { hub.request("captcha", "x", vec![], "", "p_n", 60_000, "").await }
         });
         // 等 request 入位(poll 能看到)
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -700,7 +713,7 @@ mod tests {
         hub.attach();
         let first = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "first", vec![], "", "p_5", 60_000).await }
+            async move { hub.request("captcha", "first", vec![], "", "p_5", 60_000, "").await }
         });
         let d1 = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -715,7 +728,7 @@ mod tests {
         // 第二个请求应排队而非覆盖
         let second = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("sms", "second", vec![], "", "p_6", 60_000).await }
+            async move { hub.request("sms", "second", vec![], "", "p_6", 60_000, "").await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let polled = hub.poll().expect("槽位仍应是第一个请求");
@@ -766,7 +779,7 @@ mod tests {
         let was = hub.is_attached();
         hub.detach(); // 纯弹窗路径(模拟 -p 桌面模式)
         let out = hub
-            .request("sms", "验证码", vec![], "https://c", "p_g", 60_000)
+            .request("sms", "验证码", vec![], "https://c", "p_g", 60_000, "")
             .await;
         assert_eq!(
             out,
@@ -809,7 +822,7 @@ mod tests {
         hub.attach();
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "x", vec![], "", "p_gf", 60_000).await }
+            async move { hub.request("captcha", "x", vec![], "", "p_gf", 60_000, "").await }
         });
         // 等弹窗失败降级(GuiFailed 事件 + gui 标记清除)
         let display = tokio::time::timeout(Duration::from_secs(3), async {
@@ -852,7 +865,7 @@ mod tests {
         hub.detach();
         let out = tokio::time::timeout(
             Duration::from_secs(3),
-            hub.request("custom", "x", vec![], "", "p_gu", 60_000),
+            hub.request("custom", "x", vec![], "", "p_gu", 60_000, ""),
         )
         .await
         .expect("应立即收口,不等 60s");

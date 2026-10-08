@@ -175,6 +175,9 @@ fn interpreter_available() -> bool {
 // ---------- payload 构建(纯函数,可单测) ----------
 
 /// display → 弹窗 payload(两平台脚本共用同一契约,见设计文档 §4.3)。
+///
+/// 第 132 轮新增 `image_path`(验证码等阻断现场的截图;空串 = 无图,脚本端
+/// 对空串/缺省字段按无图处理,向后兼容旧自定义脚本)。
 pub fn build_payload(display: &HumanAssistDisplay) -> Value {
     let now_ms = display.created_at_ms;
     json!({
@@ -185,6 +188,7 @@ pub fn build_payload(display: &HumanAssistDisplay) -> Value {
         "options": display.options,
         "url": display.url,
         "page_id": display.page_id,
+        "image_path": display.image_path,
         "started_at": fmt_local_ms(now_ms),
         "started_at_ms": now_ms,
         "timeout_ms": display.timeout_ms,

@@ -556,6 +556,14 @@ pub struct ReportMeta {
     pub model: String,
     /// Round 92: Yolo classification for Debug Agent activation control.
     pub classification: Option<crate::agent::yolo::TaskClassification>,
+    /// 第 132 轮:任务是否被用户中断(Ctrl-C / SIGINT)。
+    ///
+    /// 实测事故(2026-10-08):用户取消后 Debug Agent 的 LLM 评估仍同步执行,
+    /// 真实网关上两轮调用共耗时 **4 分钟**且不可取消、TUI 零反馈,表现为
+    /// 「收到中断信号...」后假死。`interrupted=true` 时跳过 LLM 评估,改用
+    /// [`render_interrupted_evaluation`] 本地骨架秒级落盘(统计总览与原始
+    /// Trace 附录照常保留),保证取消后数秒内交还终端。
+    pub interrupted: bool,
 }
 
 /// Round 92: 判断本次任务是否应激活 Debug Agent 做 trace 语义评估。
@@ -708,30 +716,40 @@ pub async fn finalize_report(
     // 关联报告: 2026-09-09_07 F-007-2
     // session_id 取自采集器(第 08 轮):Debug 请求与被评估任务同 X-Session-Id
     // Round 92: 选择是否调用 Debug Agent
-    let (evaluation, degraded, skipped_reason) = match meta
-        .classification
-        .as_ref()
-        .map(should_invoke_debug_agent)
-        .unwrap_or(true)
-    {
-        true => match DebugRunner::new(llm)
-            .evaluate(&collector.session_id(), &trace, &stats)
-            .await
+    // 第 132 轮:用户中断(Ctrl-C)→ 跳过 LLM 评估,本地骨架秒级落盘
+    //(评估两轮 LLM 实测 4 分钟且不可取消,取消语义必须秒级交还终端)。
+    let (evaluation, degraded, skipped_reason) = if meta.interrupted {
+        (
+            render_interrupted_evaluation(collector),
+            false,
+            None,
+        )
+    } else {
+        match meta
+            .classification
+            .as_ref()
+            .map(should_invoke_debug_agent)
+            .unwrap_or(true)
         {
-            Ok(text) => (text, false, None),
-            Err(e) => (
-                render_degraded_evaluation(&anyhow::Error::from(e), collector),
-                true,
-                None,
-            ),
-        },
-        false => {
-            let reason = meta
-                .classification
-                .as_ref()
-                .map(format_skip_reason)
-                .unwrap_or_else(|| "任务未提供分类信息".to_string());
-            (render_skipped_evaluation(&reason, collector), false, Some(reason))
+            true => match DebugRunner::new(llm)
+                .evaluate(&collector.session_id(), &trace, &stats)
+                .await
+            {
+                Ok(text) => (text, false, None),
+                Err(e) => (
+                    render_degraded_evaluation(&anyhow::Error::from(e), collector),
+                    true,
+                    None,
+                ),
+            },
+            false => {
+                let reason = meta
+                    .classification
+                    .as_ref()
+                    .map(format_skip_reason)
+                    .unwrap_or_else(|| "任务未提供分类信息".to_string());
+                (render_skipped_evaluation(&reason, collector), false, Some(reason))
+            }
         }
     };
 
@@ -758,6 +776,15 @@ pub async fn finalize_report(
         String::new()
     };
 
+    // 第 132 轮:用户中断横幅 —— 说明评估章节是本地骨架而非 LLM 语义评估
+    let interrupted_banner = if meta.interrupted {
+        "\n> ⛔ **任务被用户中断(Ctrl-C / SIGINT)** —— 已跳过 Debug Agent 的 LLM 评估\n\
+         > (评估需 1~4 分钟且不可取消,会拖住取消后的终端收口)。下方评估章节为基于\n\
+         > trace 指标的本地骨架;统计总览与原始 Trace 附录完整保留,可据此人工复盘。\n"
+    } else {
+        ""
+    };
+
     let banner = if degraded {
         "\n> ⚠️ **Debug Agent 评估失败,已降级到基于 trace 的自检骨架** — 下方「任务评估 / 质量报告 / 问题报告 / 优化建议」\
          章节由 `src/agent/debug.rs::render_degraded_evaluation` 根据 trace 指标自动归类,\
@@ -771,7 +798,7 @@ pub async fn finalize_report(
     let task_one_line = truncate_chars(&meta.task, 500).replace('\n', " ⏎ ");
     let content = format!(
         "# laew Debug 报告\n\n\
-         - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n{}{}{}\n\n\
+         - 生成时间: {}\n- Session ID: `{}`\n- 运行模式: {}\n- 当前模型: {}\n- 任务: {}\n{}{}{}{}\n\n\
          ## 一、统计总览\n\n{}\n\n\
          ## 二、Debug Agent 评估\n\n{}\n\n\
          ## 三、原始 Trace 附录\n\n{}\n",
@@ -782,6 +809,7 @@ pub async fn finalize_report(
         task_one_line,
         banner,
         skipped_banner,
+        interrupted_banner,
         mock_notice,
         stats,
         evaluation,
@@ -791,6 +819,70 @@ pub async fn finalize_report(
     let path = report_dir.join(report_file_name());
     std::fs::write(&path, scrub_secrets(&content))?;
     Ok(path)
+}
+
+/// 第 132 轮:任务被用户中断时的评估骨架(零 LLM 调用,秒级落盘)。
+///
+/// 结构与 Debug Agent 的四章节保持一致,内容从 trace 指标机械归纳:
+/// 用户要的是「快速拿回终端 + 报告仍有留档价值」,不是取消后等 4 分钟的语义评估。
+pub fn render_interrupted_evaluation(collector: &Arc<DebugCollector>) -> String {
+    use DebugEvent as E;
+    let events = collector.events();
+    let llm_calls = events
+        .iter()
+        .filter(|e| matches!(e, E::LlmCall { .. }))
+        .count();
+    let llm_errors = events
+        .iter()
+        .filter(|e| matches!(e, E::LlmCall { error: Some(_), .. }))
+        .count();
+    let qc_total = events
+        .iter()
+        .filter(|e| matches!(e, E::QualityCheck { .. }))
+        .count();
+    let qc_pass = events
+        .iter()
+        .filter(|e| matches!(e, E::QualityCheck { verdict: Verdict::Pass, .. }))
+        .count();
+    let agents: Vec<String> = {
+        let mut names: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                E::LlmCall { agent, .. } => Some(agent.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let agents_line = if agents.is_empty() {
+        "<无 LLM 调用>".to_string()
+    } else {
+        agents.join(", ")
+    };
+    format!(
+        "## 任务评估
+
+- 结局:**用户中断(Ctrl-C / SIGINT)** —— 任务未按自然路径收口,本章节为本地指标归纳,非 LLM 语义评估。
+- 参与角色:{agents_line} 共 {llm_calls} 次 LLM 调用(失败 {llm_errors} 次)。
+- 质检链:QC {qc_total} 次,通过 {qc_pass} 次。
+
+## 质量报告
+
+- 中断场景下的正确行为:各角色 LLM 调用被即时取消、编排器以 Cancelled(而非失败重试)回流。
+- 需人工关注的点:中断前最后一个执行单元的现场见下方原始 Trace 附录(工具调用/错误摘要/QC 结论均已留存)。
+
+## 问题报告
+
+- 本报告不区分 P0-P2(语义评估被跳过);如需完整评估,请在不受干扰的环境重跑任务。
+
+## 优化建议
+
+- 若中断原因是验证码/人工介入等待过久:弹窗已支持展示验证码截图(第 132 轮),可直接读码回填。
+- 若中断原因是阶段耗时过长:结合统计总览定位慢调用,再决定是否拆分任务或调整 provider。
+"
+    )
 }
 
 /// Debug Agent 评估失败时的降级骨架 —— 基于 trace 指标做最朴素的归类,
@@ -1177,5 +1269,72 @@ mod tests {
         let json = r#"{"task_level":"simple","goal_summary":"g","intent":"i"}"#;
         let c: TaskClassification = serde_json::from_str(json).expect("parse");
         assert!(c.debug_eligible, "default debug_eligible must be true for backward compat");
+    }
+
+    // =================== 第 132 轮:用户中断 → 跳过 LLM 评估 ===================
+
+    /// 被调即置位的 LLM 探针:interrupted=true 的报告路径若发起任何 LLM 调用,
+    /// 标志位会变成 true(测试据此断言「零 LLM 调用」)。
+    struct LlmProbe {
+        called: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for LlmProbe {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDef],
+            _meta: &RequestMeta,
+        ) -> Result<Completion> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Completion {
+                text: "不该被调用".into(),
+                tool_calls: vec![],
+                usage: Default::default(),
+                stop_reason: None,
+            })
+        }
+        fn protocol(&self) -> crate::config::Protocol {
+            crate::config::Protocol::Anthropic
+        }
+    }
+
+    /// 第 132 轮:实测事故 —— 用户 Ctrl-C 后 Debug Agent LLM 评估同步阻塞 4 分钟,
+    /// TUI 停在「正在取消当前任务...」。interrupted=true 必须满足:
+    /// 1) 零 LLM 调用;2) 报告秒级落盘;3) 头部有中断横幅 + 中断骨架章节。
+    #[tokio::test]
+    async fn interrupted_report_skips_llm_and_lands_fast() {
+        let collector = Arc::new(DebugCollector::new("sess-interrupt-test"));
+        collector.record_quality(&QualityReport::pass(AgentRole::SubAgent));
+        let probe = Arc::new(LlmProbe {
+            called: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dir = std::env::temp_dir().join("laew_debug_interrupt_test");
+        let meta = ReportMeta {
+            mode: "TUI 多轮".into(),
+            task: "测试中断报告".into(),
+            model: "[anthropic] probe/model @ https://probe".into(),
+            classification: None,
+            interrupted: true,
+        };
+        let started = std::time::Instant::now();
+        let path = finalize_report(&collector, probe.clone(), &dir, &meta)
+            .await
+            .expect("中断报告应落盘成功");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "跳过 LLM 评估的报告应秒级完成,实际 {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !probe.called.load(std::sync::atomic::Ordering::SeqCst),
+            "interrupted=true 时不得发起任何 LLM 调用"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("任务被用户中断"), "头部应有中断横幅");
+        assert!(content.contains("用户中断(Ctrl-C / SIGINT)"), "评估章节应为中断骨架");
+        assert!(content.contains("统计总览"), "统计总览照常保留");
+        let _ = std::fs::remove_file(&path);
     }
 }

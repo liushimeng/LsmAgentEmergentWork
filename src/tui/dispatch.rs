@@ -171,6 +171,11 @@ impl TuiSession {
         //   真实 LLM 慢场景下用户不再感觉「卡了」。
         let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+        // 第 132 轮:取消 token 先于打印协程创建并注入 —— HITL 行读 inner 与协程
+        // 主循环都能 select 取消,Ctrl-C 后 `stage_printer.await` 不再因等 stdin 挂住。
+        let stage_cancel = crate::agent::cancel::CancelToken::new();
+        let printer_cancel = stage_cancel.clone();
+        let cancel = stage_cancel;
         let stage_printer = tokio::spawn(async move {
             use std::io::Write as _;
             let hold = std::time::Duration::from_millis(1500);
@@ -243,6 +248,16 @@ impl TuiSession {
 
             loop {
                 tokio::select! {
+                    // 第 132 轮:Ctrl-C 取消 → 立即清掉 waiting 行退出协程。
+                    // 此前无此分支:HITL 行读挂在内层时整个协程卡在 stdin,
+                    // dispatch 尾部 `stage_printer.await` 无限等待,TUI 表现为
+                    // 「收到中断信号...」假死(实测与 Debug 报告阻塞叠加成 4 分钟)。
+                    _ = printer_cancel.cancelled() => {
+                        if waiting_line_on_screen {
+                            clear_waiting_line(stdout_is_tty);
+                        }
+                        break;
+                    }
                     maybe = stage_rx.recv() => match maybe {
                         Some(line) => {
                             // 不在此处清除 waiting 行:清除统一延迟到 idle flush,
@@ -460,6 +475,12 @@ impl TuiSession {
                                                 // 不再阻塞 read_line, 返回错误路径
                                                 return Err(anyhow::anyhow!("hub_timeout"));
                                             }
+                                            // 第 132 轮:任务被 Ctrl-C 取消 —— 不再等
+                                            // stdin 回车,清视觉 + 回填取消,让
+                                            // `stage_printer.await` 立即返回。
+                                            _ = printer_cancel.cancelled() => {
+                                                return Err(anyhow::anyhow!("task_cancelled"));
+                                            }
                                         }
                                     }
                                 };
@@ -478,6 +499,18 @@ impl TuiSession {
                                         }
                                         println!("  [laew] HITL 已超时自动取消(req.id={})", req.id);
                                         // 自动 respond(None) -> 工具侧 Cancelled(4002)
+                                        let _ = hub.respond(req.id, None, AssistVia::Tui);
+                                        handled_assist_id = Some(req.id);
+                                        "\x00-TIMEOUT".to_string()
+                                    }
+                                    // 第 132 轮:任务取消(Ctrl-C)—— 与 hub 超时同款收口:
+                                    // 清倒计时残留 + respond(None),协程随即被外层
+                                    // printer_cancel 分支带走。
+                                    Ok(Err(e)) if e.to_string() == "task_cancelled" => {
+                                        if stdout_is_tty {
+                                            print!("\r\x1b[2K");
+                                            let _ = std::io::stdout().flush();
+                                        }
                                         let _ = hub.respond(req.id, None, AssistVia::Tui);
                                         handled_assist_id = Some(req.id);
                                         "\x00-TIMEOUT".to_string()
@@ -622,7 +655,7 @@ impl TuiSession {
                 }
             }
         });
-        let cancel = crate::agent::cancel::CancelToken::new();
+        // 第 132 轮:cancel token 已在 stage_printer 之前创建(见上),此处复用;
         // 第 108 轮:统一走 shutdown 协调器,不再各自 std::process::exit。
         // 全局 signal handler 已安装(SIGINT/SIGTERM/SIGHUP 转 trigger shutdown);
         // 这里把 cancel token 绑到 shutdown:任一信号触发 → cancel 当前任务 →
@@ -655,8 +688,27 @@ impl TuiSession {
         crate::agent::human_assist::HumanAssistHub::global().cancel_pending();
         // debug 模式:任务结束(无论成败)后生成 Debug 报告
         if let (Some(collector), Some(raw_llm)) = (&self.debug, &self.debug_llm_raw) {
-            self.emit_debug_report(collector, raw_llm.clone(), effective_prompt, &handle_result)
-                .await;
+            // 第 132 轮:Debug Agent 的 LLM 评估在真实网关上可达数分钟,必须先打
+            // 进度提示再生成,消除「任务已结束但终端静默」的假死观感;用户中断
+            // (Ctrl-C)时进一步跳过 LLM 评估,改本地骨架秒级落盘 —— 实测事故:
+            // 取消后评估阻塞 4 分钟且不可取消,TUI 一直停在「正在取消当前任务...」。
+            let interrupted = matches!(
+                &handle_result,
+                Err(crate::error::AgentError::Cancelled)
+            ) || shutdown_sig.is_triggered();
+            if interrupted {
+                println!("  [debug] 任务被用户中断,生成快速调试报告(跳过 LLM 评估)...");
+            } else {
+                println!("  [debug] 任务结束,正在生成调试报告(LLM 评估,可能需要 1-2 分钟)...");
+            }
+            self.emit_debug_report(
+                collector,
+                raw_llm.clone(),
+                effective_prompt,
+                &handle_result,
+                interrupted,
+            )
+            .await;
         }
         // D13:任务结束更新连接状态(基于最终结果)。
         self.update_connectivity_from_result(&handle_result, is_flush);
@@ -940,12 +992,14 @@ impl TuiSession {
     }
 
     /// debug 模式:任务结束后调用 Debug Agent 评估并落盘报告(失败仅打印,不影响主流程)。
+    /// `interrupted=true`(第 132 轮)时跳过 LLM 评估,本地骨架秒级落盘。
     async fn emit_debug_report(
         &self,
         collector: &Arc<DebugCollector>,
         raw_llm: Arc<dyn crate::llm::LlmClient>,
         task: &str,
         handle_result: &std::result::Result<OrchestrationOutcome, crate::error::AgentError>,
+        interrupted: bool,
     ) {
         // handle 路径异常(orchestrator 内部错误)时补记终态事件,保证报告完整
         if let Err(e) = handle_result {
@@ -977,6 +1031,7 @@ impl TuiSession {
             task: task.to_string(),
             model,
             classification,
+            interrupted,
         };
         let report_dir = self.paths.root_dir.join("DebugReport");
         match finalize_report(collector, raw_llm, &report_dir, &meta).await {

@@ -15,6 +15,7 @@ fn sample_display() -> HumanAssistDisplay {
         options: vec!["我已完成人工操作,继续".into(), "取消任务".into()],
         url: "https://example.com/login".into(),
         page_id: "p_ab12cd34".into(),
+        image_path: String::new(),
         timeout_ms: 120_000,
         prompt_visual_width: 0,
         created_at_ms: 1_759_991_525_000,
@@ -37,6 +38,18 @@ fn payload_json_roundtrip() {
     assert!(started.len() >= 19, "started_at 应为 YYYY-MM-DD HH:MM:SS: {started}");
     assert!(deadline.len() >= 19, "deadline_at 同形: {deadline}");
     assert_ne!(started, deadline, "截止时刻应晚于提出时刻");
+}
+
+#[test]
+fn payload_image_path_roundtrip_and_empty_default() {
+    // 第 132 轮:image_path 透传到弹窗 payload(空串 = 无图,旧脚本忽略该字段)
+    let mut d = sample_display();
+    d.image_path = "/tmp/laew_hitl_captcha_1.png".into();
+    let p = build_payload(&d);
+    assert_eq!(p["image_path"], "/tmp/laew_hitl_captcha_1.png");
+    // 默认空串也必须是字符串字段(而非 null),JXA/PowerShell 端按 falsy 处理
+    let empty = build_payload(&sample_display());
+    assert_eq!(empty["image_path"], "");
 }
 
 #[test]
@@ -139,8 +152,10 @@ fn script_falls_back_to_embedded_when_no_override() {
     match &r.origin {
         ScriptOrigin::Embedded => {
             // 内置脚本必须包含结果契约关键字
+            // 第 132 轮:macOS 弹窗已由 NSAlert+runModal 重写为自绘 NSWindow
+            //(可选中复制 / first responder / 定时器 / 验证码图片),断言同步更新。
             #[cfg(target_os = "macos")]
-            assert!(r.body.contains("NSAlert"), "内置 JXA 应含 NSAlert");
+            assert!(r.body.contains("NSWindow"), "内置 JXA 应含自绘 NSWindow");
             #[cfg(target_os = "windows")]
             assert!(r.body.contains("Windows.Forms"), "内置 PS 应含 WinForms");
         }
@@ -226,6 +241,7 @@ async fn smoke_real_dialog_popup() {
                 "https://example.com/login",
                 "p_smoke",
                 60_000,
+                "",
             )
             .await
         }
