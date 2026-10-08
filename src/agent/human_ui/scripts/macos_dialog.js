@@ -1,8 +1,15 @@
-// laew 人工介入弹窗 —— macOS 默认脚本(JXA + AppKit 自绘 NSWindow,第 132 轮重写)
+// laew 人工介入弹窗 —— macOS 默认脚本(JXA + AppKit 自绘 NSWindow,第 133 轮布局重写)
 // 用法: osascript -l JavaScript <本脚本> <payload.json>
 // 动态加载: {工作目录|根目录|~}/.laew/human_ui/macos.js 可整体替换本脚本(每次呈现重读,改完即生效)
 // stdout 输出结果 JSON: {"status":"answer|cancel|timeout|error","text":"..."}
-// 设计见 docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md(第 132 轮重写章节)
+// 设计见 docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md(第 132/133 轮章节)
+//
+// ===== 第 133 轮(验证码可读性根治,实测云智眼登录整页截图缩到 460px 弹窗后无法读码) =====
+// - 窗口 460→560,图区上限 200→300px;新增「⛶ 最大化/还原」(铺满主屏可视区,布局整体
+//   重排,验证码放大到满屏可读)与「查看原图」(NSWorkspace 打开 PNG,系统查看器随意缩放);
+// - 布局函数化:创建视图与 doLayout(w,h,msgH,imgH) 分离,最大化/还原只是换参重排,
+//   杜绝逐控件手改 frame 漂移;图片区下方标注原图像素尺寸;
+// - 点击图片本身也可打开原图(NSClickGestureRecognizer,失败静默降级,不影响主流程)。
 //
 // ===== 第 132 轮为什么弃用 NSAlert+runModal(实测四宗罪) =====
 // 1. informativeText 是静态标签,鼠标无法选中/复制;
@@ -28,7 +35,22 @@ function fmtDur(ms) {
   return m > 0 ? (m + ' 分 ' + pad2(r) + ' 秒') : (r + ' 秒');
 }
 
-// 控制器:选项按钮 / 输入框回车提交 / 取消 / 超时统一走这里收口。
+// NSRect 桥接值兼容读取(部分 JXA 版本返回 {origin,size},部分直接 {x,y,width,height})。
+function rectVals(r) {
+  if (!r) return { x: 0, y: 0, w: 0, h: 0 };
+  if (r.size) {
+    return {
+      x: Number(r.origin.x) || 0, y: Number(r.origin.y) || 0,
+      w: Number(r.size.width) || 0, h: Number(r.size.height) || 0,
+    };
+  }
+  return {
+    x: Number(r.x) || 0, y: Number(r.y) || 0,
+    w: Number(r.width) || 0, h: Number(r.height) || 0,
+  };
+}
+
+// 控制器:选项按钮 / 输入框回车提交 / 取消 / 放大缩小 / 查看原图 / 超时统一走这里收口。
 // 注:本机 osascript 的 registerSubclass 返回 undefined(实测),类需经
 // `$.LaewHitlController`(即 ObjC.classes)取用 —— 两步分开,兼容两种实现。
 ObjC.registerSubclass({
@@ -48,20 +70,36 @@ ObjC.registerSubclass({
         finish('cancel', sender);
       },
     },
+    // ⛶ 最大化/还原
+    'toggleZoom:': {
+      types: ['void', ['id']],
+      implementation: function () {
+        try { if (g.toggleZoom) g.toggleZoom(); } catch (e) {}
+      },
+    },
+    // 查看原图(按钮 + 图片双击/单击手势共用)
+    'openOrig:': {
+      types: ['void', ['id']],
+      implementation: function () {
+        try { if (g.openOrig) g.openOrig(); } catch (e) {}
+      },
+    },
   },
 });
 var LaewHitl = $.LaewHitlController;
 
 // ---- 供控制器闭包访问的可变状态(run() 内赋值) ----
 var g = {
-  input: null,      // NSTextField
+  input: null,        // NSTextField
   options: [],
-  result: null,     // {status, text}
+  result: null,       // {status, text}
   done: false,
   timeoutMs: 120000,
   startedAt: new Date(),
   tickTimer: null,
   countdownLabel: null,
+  toggleZoom: null,   // 第 133 轮:最大化/还原(布局函数闭包)
+  openOrig: null,     // 第 133 轮:系统查看器打开原图
 };
 
 // 收口:把用户动作映射为结果 JSON 语义,停 run loop。
@@ -126,147 +164,235 @@ function run(argv) {
     g.startedAt = new Date();
     var deadline = new Date(g.startedAt.getTime() + g.timeoutMs);
 
-    // ===== 布局常量(自上而下堆叠,窗高随图片有无自适应) =====
-    var W = 460, PAD = 14;
-    var textW = W - PAD * 2;
+    // ===== 布局常量(第 133 轮:窗口加宽 + 布局函数化) =====
+    var W = 560, PAD = 16;
+    var titleH = 22;
+    var lineH = 18;   // 时间轴/提示单行高
+    var inputH = 28;
+    var btnH = 30;
+    var gap = 8;
+    var optCount = options.length;
 
     var info = String(p.message || '').replace(/\s+$/, '');
     if (p.url) info += '\n\n页面: ' + String(p.url).slice(0, 200);
     if (p.page_id) info += '\n页面ID: ' + p.page_id;
 
-    // ===== 验证码图片(第 132 轮):CDP 截图路径,人工在弹窗里直接读码 =====
-    var imgView = null;
-    var imgH = 0;
-    if (p.image_path && String(p.image_path).length > 0) {
-      try {
-        var nsimg = $.NSImage.alloc.initWithContentsOfFile($(String(p.image_path)));
-        if (nsimg && nsimg.isValid) {
-          var sz = nsimg.size;
-          var iw = Number(sz.width) || 1, ih = Number(sz.height) || 1;
-          imgH = Math.max(60, Math.min(200, Math.round(textW * ih / iw)));
-          imgView = $.NSImageView.alloc.initWithFrame($.NSMakeRect(PAD, 0, textW, imgH));
-          imgView.image = nsimg;
-          imgView.imageScaling = $.NSImageScaleProportionallyDown;
-          imgView.imageAlignment = $.NSImageAlignCenter;
-        }
-      } catch (eImg) { imgView = null; imgH = 0; }
-    }
+    // ===== 视图引用(先创建,doLayout 统一排布;最大化/还原 = 换参重排) =====
+    var refs = {};    // {title,msgScroll,img,imgHint,t1,t2,input,optBtns[],cancel,submit,zoom,orig}
 
-    var msgH = 84;    // 说明区(NSTextView,约 4 行,可滚动)
-    var titleH = 22;
-    var lineH = 18;   // 时间轴单行高
-    var inputH = 26;
-    var btnH = 30;
-    var gap = 8;
-    var optCount = options.length;
+    var title = $.NSTextField.alloc.initWithFrame($.NSMakeRect(0, 0, 10, 10));
+    title.editable = false; title.bezeled = false; title.drawsBackground = false;
+    title.font = $.NSFont.boldSystemFontOfSize(13);
+    refs.title = title;
 
-    // 自上而下逐段累计(与下方 y -= 递减严格对应),避免窗高算错导致底部按钮被裁
-    var consumed = titleH + gap + msgH + gap;
-    if (imgH > 0) consumed += imgH + gap;
-    consumed += (lineH + gap) * 2;                  // 提出时间 + 倒计时两行
-    consumed += inputH + gap;
-    consumed += optCount * (btnH + 6) - 6 + gap;    // 选项按钮纵排(尾距还原为 gap)
-    consumed += btnH;
-    var contentH = consumed + PAD;
-
-    // ===== 窗口:Titled(无关闭/缩放按钮 → 杜绝误关),浮动置顶 =====
-    var rect = $.NSMakeRect(0, 0, W, contentH);
-    var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(
-      rect, $.NSWindowStyleMaskTitled, $.NSBackingStoreBuffered, false);
-    win.title = $('🔐 人工介入 · ' + (p.kind_label || p.kind || '人工介入'));
-    win.level = $.NSFloatingWindowLevel; // 视觉永远置顶;不再周期抢键盘焦点
-    win.center;
-
-    var ctrl = LaewHitl.alloc.init;
-    var y = contentH - titleH; // AppKit 坐标系:y 自顶向下递减(先算顶边)
-
-    function addLabel(h, text, font, color) {
-      var l = $.NSTextField.alloc.initWithFrame($.NSMakeRect(PAD, y - h, textW, h));
-      l.editable = false;
-      l.bezeled = false;
-      l.drawsBackground = false;
-      l.stringValue = $(text);
-      l.font = font || $.NSFont.systemFontOfSize(11);
-      if (color) l.textColor = color;
-      win.contentView.addSubview(l);
-      y -= h + gap;
-      return l;
-    }
-
-    addLabel(titleH, '🔐 ' + (p.kind_label || p.kind || '人工介入') + ' —— 请人工处理',
-      $.NSFont.boldSystemFontOfSize(13));
-
-    // 说明区:NSTextView(selectable)→ 鼠标拖选 + ⌘C 复制(第 132 轮用户诉求①)
-    var scroll = $.NSScrollView.alloc.initWithFrame($.NSMakeRect(PAD, y - msgH, textW, msgH));
+    var scroll = $.NSScrollView.alloc.initWithFrame($.NSMakeRect(0, 0, 10, 10));
     scroll.hasVerticalScroller = true;
     scroll.borderType = $.NSBezelBorder;
     scroll.drawsBackground = false;
-    var tv = $.NSTextView.alloc.initWithFrame($.NSMakeRect(0, 0, textW - 4, msgH));
+    var tv = $.NSTextView.alloc.initWithFrame($.NSMakeRect(0, 0, 10, 10));
     tv.editable = false;
-    tv.selectable = true;      // ★ 可选中复制的关键
+    tv.selectable = true;      // ★ 可选中复制的关键(第 132 轮)
     tv.richText = false;
     tv.drawsBackground = false;
     tv.font = $.NSFont.systemFontOfSize(12);
     tv.string = $(info);
     scroll.documentView = tv;
-    win.contentView.addSubview(scroll);
-    y -= msgH + gap;
+    refs.msgScroll = scroll;
 
-    if (imgView) {
-      imgView.frame = $.NSMakeRect(PAD, y - imgH, textW, imgH);
-      win.contentView.addSubview(imgView);
-      y -= imgH + gap;
+    // ===== 验证码图片(第 132/133 轮):元素裁剪图优先,人工在弹窗里直接读码 =====
+    var nsimg = null, imgRatio = 0, imgNatW = 0, imgNatH = 0;
+    if (p.image_path && String(p.image_path).length > 0) {
+      try {
+        var tmp = $.NSImage.alloc.initWithContentsOfFile($(String(p.image_path)));
+        if (tmp && tmp.isValid) {
+          nsimg = tmp;
+          var sz = tmp.size;
+          imgNatW = Number(sz.width) || 1;
+          imgNatH = Number(sz.height) || 1;
+          imgRatio = imgNatH / imgNatW;
+        }
+      } catch (eImg) { nsimg = null; }
     }
+    var img = null;
+    if (nsimg) {
+      img = $.NSImageView.alloc.initWithFrame($.NSMakeRect(0, 0, 10, 10));
+      img.image = nsimg;
+      img.imageScaling = $.NSImageScaleProportionallyDown;
+      img.imageAlignment = $.NSImageAlignCenter;
+      // 点击图片打开原图(手势失败静默降级,纯附加能力)
+      try {
+        var gesture = $.NSClickGestureRecognizer.alloc.initWithTargetAction(
+          LaewHitl.alloc.init, 'openOrig:');
+        img.addGestureRecognizer(gesture);
+      } catch (eGest) {}
+    }
+    refs.img = img;
 
-    addLabel(lineH, '提出时间: ' + fmtClock(g.startedAt) + '   超时截止: ' + fmtClock(deadline));
-    var countdown = addLabel(lineH, '已等待: 0 秒   超时剩余: ' + fmtDur(g.timeoutMs));
-    g.countdownLabel = countdown;
+    var imgHint = $.NSTextField.alloc.initWithFrame($.NSMakeRect(0, 0, 10, 10));
+    imgHint.editable = false; imgHint.bezeled = false; imgHint.drawsBackground = false;
+    imgHint.font = $.NSFont.systemFontOfSize(10);
+    imgHint.textColor = $.NSColor.secondaryLabelColor;
+    imgHint.stringValue = $('原图 ' + imgNatW + '×' + imgNatH + ' px · 点击图片或「查看原图」可放大细读');
+    refs.imgHint = nsimg ? imgHint : null;
 
-    // 输入框:显式 first responder + 回车即提交(诉求②:键盘/输入法可正常输入)
-    var input = $.NSTextField.alloc.initWithFrame($.NSMakeRect(PAD, y - inputH, textW, inputH));
+    function mkLine() {
+      var l = $.NSTextField.alloc.initWithFrame($.NSMakeRect(0, 0, 10, 10));
+      l.editable = false; l.bezeled = false; l.drawsBackground = false;
+      l.font = $.NSFont.systemFontOfSize(11);
+      return l;
+    }
+    refs.t1 = mkLine();
+    refs.t2 = mkLine();
+
+    var input = $.NSTextField.alloc.initWithFrame($.NSMakeRect(0, 0, 10, 10));
     input.placeholderString = $('可输入验证码/动态码/说明;留空点选项或提交');
     input.font = $.NSFont.systemFontOfSize(13);
-    input.target = ctrl;
+    input.target = LaewHitl.alloc.init;
     input.action = 'submit:';
     input.tag = -1; // 输入框回车:有字=文本答案,无字=选项 1
-    win.contentView.addSubview(input);
+    refs.input = input;
     g.input = input;
-    y -= inputH + gap;
 
-    // 选项按钮(纵向全宽;点击即提交,输入框有字时文本优先)
+    refs.optBtns = [];
     for (var oi = 0; oi < optCount; oi++) {
       var ob = $.NSButton.alloc.init;
       ob.title = $(options[oi]);
-      ob.frame = $.NSMakeRect(PAD, y - btnH, textW, btnH);
       ob.bezelStyle = $.NSRoundedBezelStyle;
       ob.tag = oi;
-      ob.target = ctrl;
+      ob.target = LaewHitl.alloc.init;
       ob.action = 'submit:';
-      win.contentView.addSubview(ob);
-      y -= btnH + 6;
+      refs.optBtns.push(ob);
     }
-    y += 6 - gap; // 尾按钮的 +6 间距还原为标准 gap(与 consumed 公式一致)
 
-    // 底部:提交(⌅)+ 取消(⎋)
-    var cancelW = 96, submitW = 96;
-    var cancelBtn = $.NSButton.alloc.init;
-    cancelBtn.title = $('取消');
-    cancelBtn.frame = $.NSMakeRect(PAD, y - btnH, cancelW, btnH);
-    cancelBtn.bezelStyle = $.NSRoundedBezelStyle;
-    cancelBtn.keyEquivalent = $('\u001b'); // Esc = 取消
-    cancelBtn.target = ctrl;
-    cancelBtn.action = 'cancel:';
-    win.contentView.addSubview(cancelBtn);
+    function mkBtn(titleText, keyEq, action, tag) {
+      var b = $.NSButton.alloc.init;
+      b.title = $(titleText);
+      b.bezelStyle = $.NSRoundedBezelStyle;
+      if (keyEq) b.keyEquivalent = $(keyEq);
+      if (tag !== undefined) b.tag = tag;
+      b.target = LaewHitl.alloc.init;
+      b.action = action;
+      return b;
+    }
+    refs.cancel = mkBtn('取消', '\u001b', 'cancel:');
+    refs.submit = mkBtn('提交', '\r', 'submit:', -1);
+    refs.zoom = mkBtn('⛶ 最大化', null, 'toggleZoom:');
+    refs.orig = mkBtn('查看原图', null, 'openOrig:');
 
-    var submitBtn = $.NSButton.alloc.init;
-    submitBtn.title = $('提交');
-    submitBtn.frame = $.NSMakeRect(PAD + cancelW + 10, y - btnH, submitW, btnH);
-    submitBtn.bezelStyle = $.NSRoundedBezelStyle;
-    submitBtn.keyEquivalent = $('\r'); // ⌅ = 提交
-    submitBtn.tag = -1;
-    submitBtn.target = ctrl;
-    submitBtn.action = 'submit:';
-    win.contentView.addSubview(submitBtn);
+    // 全部挂到 contentView(创建顺序即 z 序,均不重叠)
+    var cv = null; // run() 内拿到 win 后统一添加
+
+    // ===== 布局函数:给定窗宽/窗高/说明区高/图区高,自上而下重排全部子视图 =====
+    // AppKit 坐标系:y 自顶向下递减。consumed 公式与窗高计算严格对应,防底部按钮被裁。
+    function doLayout(cw, ch, msgH, imgH) {
+      var textW = cw - PAD * 2;
+      var y = ch - titleH;
+      function place(v, h) {
+        v.frame = $.NSMakeRect(PAD, y - h, textW, h);
+        y -= h + gap;
+      }
+      place(refs.title, titleH);
+      place(refs.msgScroll, msgH);
+      if (refs.img && imgH > 0) {
+        place(refs.img, imgH);
+        place(refs.imgHint, 14);
+      }
+      place(refs.t1, lineH);
+      place(refs.t2, lineH);
+      place(refs.input, inputH);
+      for (var bi = 0; bi < refs.optBtns.length; bi++) place(refs.optBtns[bi], btnH);
+      // 底部按钮行:左 取消/提交,右 查看原图/⛶ 最大化(place 已留标准 gap,无需修正)
+      // 底部按钮行:左 取消/提交,右 查看原图/⛶ 最大化
+      var bw = 84, ow = 110, zw = 110, inner = 8;
+      var rightX = cw - PAD - zw;
+      var origX = rightX - inner - ow;
+      refs.zoom.frame = $.NSMakeRect(rightX, y - btnH, zw, btnH);
+      refs.orig.frame = $.NSMakeRect(origX, y - btnH, ow, btnH);
+      refs.cancel.frame = $.NSMakeRect(PAD, y - btnH, bw, btnH);
+      refs.submit.frame = $.NSMakeRect(PAD + bw + inner, y - btnH, bw, btnH);
+    }
+
+    // 由内容推出窗高(与 doLayout 的 place 序列逐项对应)
+    function contentHeight(msgH, imgH) {
+      var consumed = titleH + gap + msgH + gap;
+      if (imgH > 0) consumed += imgH + gap + 14 + gap;
+      consumed += (lineH + gap) * 2;
+      consumed += inputH + gap;
+      consumed += optCount * (btnH + gap);          // 选项按钮纵排(place 逐项对应)
+      consumed += btnH;
+      return consumed + PAD;
+    }
+
+    // 图区高:按图片纵横比适配文本宽,夹在 [60, cap] 之间
+    function imgHeightFor(textW, cap) {
+      if (!imgRatio) return 0;
+      return Math.max(60, Math.min(cap, Math.round(textW * imgRatio)));
+    }
+
+    var normalMsgH = 90;
+    var normalImgH = imgHeightFor(W - PAD * 2, 300);
+    var normalH = contentHeight(normalMsgH, normalImgH);
+
+    // ===== 窗口:Titled(无关闭/缩放按钮 → 杜绝误关),浮动置顶 =====
+    var rect = $.NSMakeRect(0, 0, W, normalH);
+    var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(
+      rect, $.NSWindowStyleMaskTitled, $.NSBackingStoreBuffered, false);
+    win.title = $('🔐 人工介入 · ' + (p.kind_label || p.kind || '人工介入'));
+    win.level = $.NSFloatingWindowLevel; // 视觉永远置顶;不再周期抢键盘焦点
+
+    cv = win.contentView;
+    cv.addSubview(refs.title);
+    cv.addSubview(refs.msgScroll);
+    if (refs.img) { cv.addSubview(refs.img); cv.addSubview(refs.imgHint); }
+    cv.addSubview(refs.t1);
+    cv.addSubview(refs.t2);
+    cv.addSubview(refs.input);
+    for (var ai = 0; ai < refs.optBtns.length; ai++) cv.addSubview(refs.optBtns[ai]);
+    cv.addSubview(refs.cancel);
+    cv.addSubview(refs.submit);
+    cv.addSubview(refs.zoom);
+    cv.addSubview(refs.orig);
+
+    refs.t1.stringValue = $('提出时间: ' + fmtClock(g.startedAt) + '   超时截止: ' + fmtClock(deadline));
+    refs.t2.stringValue = $('已等待: 0 秒   超时剩余: ' + fmtDur(g.timeoutMs));
+    g.countdownLabel = refs.t2;
+
+    doLayout(W, normalH, normalMsgH, normalImgH);
+    win.center;
+
+    // ===== 第 133 轮:最大化/还原(铺满主屏可视区,布局整体重排) =====
+    var zoomed = false;
+    var normalFrame = rectVals(win.frame);
+    g.toggleZoom = function () {
+      try {
+        if (!zoomed) {
+          var vf = rectVals($.NSScreen.mainScreen.visibleFrame);
+          var zw = Math.max(W, vf.w - 40), zh = Math.max(normalH, vf.h - 40);
+          var zMsgH = Math.min(240, Math.max(90, Math.round(zh * 0.22)));
+          var zImgH = imgHeightFor(zw - PAD * 2, Math.min(900, Math.round(zh * 0.55)));
+          var zH = Math.max(zh, contentHeight(zMsgH, zImgH));
+          win.setFrameDisplay($.NSMakeRect(vf.x + 20, vf.y + 20, zw, zH), true);
+          doLayout(zw, zH, zMsgH, zImgH);
+          refs.zoom.title = $('⛶ 还原');
+          zoomed = true;
+        } else {
+          win.setFrameDisplay($.NSMakeRect(
+            normalFrame.x, normalFrame.y, normalFrame.w, normalFrame.h), true);
+          doLayout(normalFrame.w, normalFrame.h, normalMsgH, normalImgH);
+          refs.zoom.title = $('⛶ 最大化');
+          zoomed = false;
+        }
+        try { win.makeFirstResponder(input); } catch (eF) {}
+      } catch (eZ) {}
+    };
+
+    // ===== 第 133 轮:查看原图(系统查看器打开 PNG,可随意缩放/全屏) =====
+    var imagePath = (p.image_path && nsimg) ? String(p.image_path) : '';
+    g.openOrig = function () {
+      try {
+        if (imagePath) $.NSWorkspace.sharedWorkspace.openFile($(imagePath));
+      } catch (eO) {}
+    };
 
     // ===== 焦点与激活:Regular 策略 + 启动激活一次 + 双保险 first responder =====
     $.NSApp.setActivationPolicy($.NSApplicationActivationPolicyRegular);

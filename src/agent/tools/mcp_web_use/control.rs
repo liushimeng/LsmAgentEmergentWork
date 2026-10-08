@@ -1227,54 +1227,9 @@ pub const HUMAN_ASSIST_ALLOWED_REASONS: &[&str] = &[
     "custom",
 ];
 
-/// 第 132 轮:人工介入弹窗附带截图的解析决策(纯函数,可单测)。
-///
-/// 优先级:显式 `params.image_path`(文件存在才用)> `reason=captcha` 自动 CDP
-/// 视口截图 > 无图。返回 `(计划, 来源标签)`;来源标签回传信封供对账:
-/// `explicit` / `explicit_missing` / `auto` / `none`(`auto_failed` 由执行层标注)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HitlImagePlan {
-    /// 使用显式路径(已确认文件存在)。
-    Explicit(String),
-    /// reason=captcha 且未显式给图 → 自动截取当前视口。
-    Auto,
-    /// 不附图。
-    None,
-}
-
-pub fn hitl_image_plan(reason: &str, explicit: Option<&str>) -> (HitlImagePlan, &'static str) {
-    match explicit {
-        Some(path) if !path.trim().is_empty() => {
-            if std::path::Path::new(path.trim()).is_file() {
-                (HitlImagePlan::Explicit(path.trim().to_string()), "explicit")
-            } else {
-                // 显式指定但文件不存在:忽略并标注,fail-open 不阻断提问
-                (HitlImagePlan::None, "explicit_missing")
-            }
-        }
-        _ if reason == "captcha" => (HitlImagePlan::Auto, "auto"),
-        _ => (HitlImagePlan::None, "none"),
-    }
-}
-
-/// 第 132 轮:自动截取当前视口为人工介入弹窗附图(验证码读码场景)。
-///
-/// CDP `CaptureScreenshot` 在浏览器进程内完成,**不受宿主录屏权限(TCC)影响**
-/// —— 与 macOS Vision OCR 的权限路径不同,本机实测 OCR 因录屏权限不可用时,
-/// 截图通道依然可用。失败返回 Err(调用方 fail-open 为无图,不阻断提问)。
-async fn capture_hitl_screenshot(id: &str) -> std::result::Result<String, String> {
-    let page = ensure_page(id).await?;
-    let bytes = page
-        .screenshot(chromiumoxide::page::ScreenshotParams::builder().build())
-        .await
-        .map_err(|e| e.to_string())?;
-    let path = std::env::temp_dir()
-        .join(format!("laew_hitl_captcha_{}.png", now_millis_safe()));
-    tokio::fs::write(&path, &bytes)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(path.display().to_string())
-}
+/// 第 133 轮:附图决策与采集迁入 `captcha_crop` 子模块(验证码元素裁剪优先，
+/// 视口兜底);此处再导出保持 `control::hitl_image_plan` 外部路径零改动。
+pub use super::captcha_crop::{hitl_image_plan, HitlImagePlan};
 
 /// 把 reason 列表渲染成斜杠分隔字符串(用于错误消息/工具 Schema 描述)。
 pub fn human_assist_reasons_doc() -> String {
@@ -1349,18 +1304,23 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
         None => String::new(),
     };
 
-    // 第 132 轮:验证码现场截图 —— 显式 params.image_path 优先,reason=captcha
-    // 自动截取视口;弹窗直接展示图片,人工不必切去浏览器找图。fail-open:
-    // 截图失败按无图继续,绝不阻断提问本身。
-    let (image_path, image_source) = {
+    // 第 133 轮:验证码现场截图 —— 显式 params.image_path 优先;reason=captcha
+    // 自动采集(验证码元素裁剪优先,整视口兜底,见 captcha_crop);弹窗直接展示
+    // 图片,人工不必切去浏览器找图。fail-open:截图失败按无图继续,绝不阻断提问。
+    let (image_path, image_source, image_mode, image_clip) = {
         let (plan, source) = hitl_image_plan(reason, str_arg(p, "image_path"));
         match plan {
-            HitlImagePlan::Explicit(path) => (path, source),
-            HitlImagePlan::Auto => match capture_hitl_screenshot(id).await {
-                Ok(path) => (path, source),
-                Err(_) => (String::new(), "auto_failed"),
+            HitlImagePlan::Explicit(path) => (path, source, "explicit", Value::Null),
+            HitlImagePlan::Auto => match super::captcha_crop::capture_hitl_screenshot(id).await {
+                Ok((path, mode, clip)) => (
+                    path,
+                    mode,
+                    "auto",
+                    clip.map(|c| c.to_json()).unwrap_or(Value::Null),
+                ),
+                Err(_) => (String::new(), "auto_failed", "none", Value::Null),
             },
-            HitlImagePlan::None => (String::new(), source),
+            HitlImagePlan::None => (String::new(), source, "none", Value::Null),
         }
     };
 
@@ -1378,9 +1338,11 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                     "kind_label": label,
                     "human_response": answer,
                     "assist_channel": via.as_str(),
-                    // 第 132 轮:附图对账(人工读的是哪张图 / 是否自动截取)
+                    // 第 132/133 轮:附图对账(人工读的是哪张图 / 元素裁剪 or 整视口)
                     "image_path": image_path,
                     "image_source": image_source,
+                    "image_mode": image_mode,
+                    "image_clip": image_clip,
                     "next_hint": match reason {
                         "sms" | "two_factor" => "把 human_response 中的验证码/动态码用 input_text 填入对应输入框后继续流程",
                         _ => "人工已完成操作,请 inspect 验证页面状态后继续流程",

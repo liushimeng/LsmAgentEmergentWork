@@ -26,6 +26,7 @@ use super::Tool;
 use crate::agent::browser::{BrowserManager, NO_BROWSER_SENTINEL};
 use crate::error::Result;
 
+mod captcha_crop;
 mod control;
 mod inspect;
 
