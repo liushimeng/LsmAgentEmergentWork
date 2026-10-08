@@ -81,6 +81,9 @@ pub enum AssistEvent {
     GuiCancelled { id: u64 },
     /// 弹窗倒计时归零(与 hub 超时收口汇合)。
     GuiTimeout { id: u64 },
+    /// 第 134 轮:弹窗接管期间,用户在终端用 `/hitl <应答>` 应急通道作答
+    /// (`text=None` 即 `/hitl cancel`)。TUI 事件循环据此打印结果行。
+    TuiEscapeAnswered { id: u64, text: Option<String> },
 }
 
 /// TUI 侧轮询拿到的展示形态(工具侧请求的只读投影,不含 responder)。
@@ -443,6 +446,27 @@ impl HumanAssistHub {
             }
             None => false,
         }
+    }
+
+    /// 第 134 轮:终端 `/hitl <应答>` 应急通道回填(`answer=None` 即取消)。
+    ///
+    /// 弹窗接管期间 TUI 默认不读 stdin(避免与弹窗抢应答),但弹窗端一旦失联
+    /// (屏外 / 被遮挡 / 进程卡住)就等价于 120s 死等。本方法让 TUI 能并联一条
+    /// **只认 `/hitl` 前缀** 的行读并把应答送进同一个 hub 通道 —— 谁先应答谁生效,
+    /// 另一侧回填时 `respond` 返回 false 自然作废。
+    pub fn respond_via_tui_escape(&self, id: u64, answer: Option<String>) -> bool {
+        let ok = self.respond(id, answer.clone(), AssistVia::Tui);
+        if ok {
+            let mut state = lock_state(&self.state);
+            push_event(
+                &mut state,
+                AssistEvent::TuiEscapeAnswered {
+                    id,
+                    text: answer,
+                },
+            );
+        }
+        ok
     }
 
     /// 丢弃指定请求(responder drop → 工具侧 Unavailable)。弹窗失败且无 TUI 兜底时用。

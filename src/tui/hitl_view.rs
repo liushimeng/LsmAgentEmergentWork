@@ -193,6 +193,49 @@ pub(super) async fn read_human_assist_answer() -> String {
     .unwrap_or_default()
 }
 
+/// 第 134 轮:`/hitl` 应急应答前缀(弹窗无响应时的终端逃生门)。
+pub const HITL_ESCAPE_PREFIX: &str = "/hitl";
+
+/// 第 134 轮:弹窗接管期间的**前缀行读** —— 只认 `/hitl <应答>`,其余输入行丢弃并提示。
+///
+/// 为什么不直接复用 [`read_human_assist_answer`]:弹窗正在接管时终端处于「不该抢应答」状态,
+/// 用户随手敲一行就取消任务是明显退步。限定前缀后,终端在平时完全静默,
+/// 只有显式 `/hitl` 才回填,零副作用地保住逃生门(实测事故:弹窗屏外/被裁时
+/// TUI 完全不读 stdin → 人工只能干等满 120s 超时)。
+///
+/// 语义:`/hitl 2t6x` → 文本 `2t6x`;`/hitl 3` → 选项 3;`/hitl cancel` → 取消;
+/// 单独 `/hitl` → 空行(等价「选项 1」,与既有映射一致)。返回 `None` = EOF/取消读取,
+/// 调用方应当放弃本次应急应答(不能再等第二轮)。
+pub(super) async fn read_hitl_escape_answer() -> Option<String> {
+    loop {
+        let line = tokio::task::spawn_blocking(|| {
+            let mut buf = String::new();
+            match std::io::stdin().read_line(&mut buf) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(buf.trim_end_matches(['\n', '\r']).to_string()),
+            }
+        })
+        .await
+        .ok()
+        .flatten()?;
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix(HITL_ESCAPE_PREFIX) {
+            return Some(rest.trim().to_string());
+        }
+        // 非前缀行:丢弃 + 提示,绝不当作应答(不与弹窗抢)。
+        if t.is_empty() {
+            println!(
+                "  [laew] 已忽略空行;弹窗无响应时在终端输入 `{HITL_ESCAPE_PREFIX} <应答>`(如 `{HITL_ESCAPE_PREFIX} 2t6x`)"
+            );
+        } else {
+            println!(
+                "  [laew] 已忽略该行输入;弹窗无响应时在终端输入 `{HITL_ESCAPE_PREFIX} <应答>`(如 `{HITL_ESCAPE_PREFIX} 2t6x`)"
+            );
+        }
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// 人工输入映射:空回车 → 选项 1;数字 → 对应选项;q/取消/cancel → None(取消);
 /// 其余原文返回(短信验证码数字即自由文本路径)。
 pub(super) fn map_human_assist_input(input: &str, options: &[String]) -> Option<String> {
@@ -283,9 +326,9 @@ pub fn print_human_assist_gui_notice(
             pathfmt::elide_middle(&req.image_path, 72)
         ));
     }
-    out.write_line(
-        "  [laew]   (弹窗被遮挡会自动置顶拉焦;异常时可等自动降级为终端作答,或设 LAEW_HUMAN_UI=off)",
-    );
+    out.write_line(&format!(
+        "  [laew]   (弹窗无响应?终端输入 `{HITL_ESCAPE_PREFIX} <应答>` 应急作答,如 `{HITL_ESCAPE_PREFIX} 2t6x`;Ctrl-C 可直接取消任务)"
+    ));
 }
 
 /// 弹窗生命周期事件 → 通知行(结果反馈;弹窗应答/取消/降级/超时)。
@@ -304,6 +347,12 @@ pub fn print_assist_event(ev: &AssistEvent, out: AssistOut) {
         AssistEvent::GuiTimeout { .. } => {
             "  [laew] 人工介入弹窗等待超时,任务按超时路径继续".to_string()
         }
+        AssistEvent::TuiEscapeAnswered { id, text } => match text {
+            Some(t) => format!("  [laew] 已收到人工输入(终端 {HITL_ESCAPE_PREFIX}):{t}"),
+            None => format!(
+                "  [laew] 人工已在终端({HITL_ESCAPE_PREFIX})取消介入,任务按取消路径继续(req.id={id})"
+            ),
+        },
     };
     out.write_line(&line);
 }
@@ -325,6 +374,29 @@ mod human_assist_tui_tests {
             prompt_visual_width: 84,
             created_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn hitl_escape_prefix_maps_answers_like_line_reader() {
+        // 第 134 轮:`/hitl <应答>` 应急通道的语义与既有行读映射完全一致
+        let opts = vec!["我已完成人工操作,继续".to_string(), "跳过".to_string()];
+        // 文本应答(验证码)
+        assert_eq!(
+            map_human_assist_input("2t6x", &opts),
+            Some("2t6x".to_string())
+        );
+        // 选项序号
+        assert_eq!(
+            map_human_assist_input("2", &opts),
+            Some("2. 跳过".to_string())
+        );
+        // 空 = 选项 1
+        assert_eq!(
+            map_human_assist_input("", &opts),
+            Some(format!("1. {}", opts[0]))
+        );
+        // 取消
+        assert_eq!(map_human_assist_input("cancel", &opts), None);
     }
 
     #[test]

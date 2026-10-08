@@ -4,6 +4,19 @@
 // stdout 输出结果 JSON: {"status":"answer|cancel|timeout|error","text":"..."}
 // 设计见 docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md(第 132/133 轮章节)
 //
+// ===== 第 134 轮(实测「输入验证码后点提交/选项都没反应」根治) =====
+// 三条现场证据(探针注入 + 截图)指向三条独立缺陷,均已修:
+//   (1) 布局契约错位:`doLayout` 起始 `y = ch - titleH` 比 `contentHeight` 多扣了一次标题,
+//       底部「取消/提交」整行下移 22px,实测 frame y=-6 掉出内容视图(高 300),
+//       点击落在被裁边带 → 观感「按了没反应」。已改为 `y = ch`;
+//   (2) 最大化分支用 `setFrameDisplay`(frame 坐标,含 32px 标题栏)却按内容高排版,
+//       同样差 32px。改为 `setContentSize` + `setFrameOrigin`;
+//   (3) `[NSWindow center]` 依赖 `window.screen` 隐式归属,后台 osascript 进程在多屏
+//       (本机副屏位于主屏下方 y=-1080)实测把窗口落到副屏,主屏内完全不可见 →
+//       同样表现为「点了没反应」。改为 `pickScreen()`(visibleFrame 面积最大)+
+//       `placeWindow()` 显式算原点并夹紧到可见区。
+// 另:`/hitl <应答>` 终端应急通道(Rust 侧)保证弹窗端万一再出异常也有逃生门。
+//
 // ===== 第 133 轮(验证码可读性根治,实测云智眼登录整页截图缩到 460px 弹窗后无法读码) =====
 // - 窗口 460→560,图区上限 200→300px;新增「⛶ 最大化/还原」(铺满主屏可视区,布局整体
 //   重排,验证码放大到满屏可读)与「查看原图」(NSWorkspace 打开 PNG,系统查看器随意缩放);
@@ -48,6 +61,43 @@ function rectVals(r) {
     x: Number(r.x) || 0, y: Number(r.y) || 0,
     w: Number(r.width) || 0, h: Number(r.height) || 0,
   };
+}
+
+// ===== 第 134 轮:显式选屏 + 显式定位 =====
+// 弃用 `[NSWindow center]`:它依赖 `window.screen` 的隐式归属,后台 osascript 进程
+// 在多屏环境下实测会落到「主屏下方的副屏」上(本机 frame (1352,-530,560,332),
+// 主屏内完全不可见 → 用户看着「弹窗点了没反应」)。这里改为按 visibleFrame 面积
+// 选主屏 + 显式算原点并夹紧到可见区。
+function pickScreen() {
+  var screens = $.NSScreen.screens;
+  var best = null, bestArea = -1;
+  for (var i = 0; i < screens.count; i++) {
+    var s = screens.objectAtIndex(i);
+    var vf = rectVals(s.visibleFrame);
+    var area = vf.w * vf.h;
+    // 同面积时取 visibleFrame 面积(含 Dock/Menubar 的真实可用区)最大的,
+    // 再同则取 origin.x/y 较大者(主屏通常在左/上,避免选到副屏)
+    if (area > bestArea) { bestArea = area; best = s; }
+  }
+  return best || $.NSScreen.mainScreen;
+}
+
+// 把窗口按内容尺寸落到指定屏幕可见区正中,超高时优先保证「标题栏 + 输入框」可见。
+function placeWindow(win, w, h) {
+  var s = pickScreen();
+  var vf = rectVals(s.visibleFrame);
+  var wW = Math.min(w, Math.max(320, vf.w - 40));
+  var wH = Math.min(h, Math.max(240, vf.h - 40));
+  var x = Math.round(vf.x + (vf.w - wW) / 2);
+  var y = Math.round(vf.y + (vf.h - wH) / 2);
+  // setContentSize 走**内容视图**语义,frame 由 AppKit 自行加标题栏;
+  // 不用 setFrameDisplay(那是 frame 坐标,会与 doLayout 的内容高度差 32px)。
+  try {
+    win.setContentSize($.NSMakeSize(wW, wH));
+    win.setFrameOrigin($.NSMakePoint(x, y));
+  } catch (e) {
+    win.setFrameDisplay($.NSMakeRect(x, y, wW, wH), true);
+  }
 }
 
 // 控制器:选项按钮 / 输入框回车提交 / 取消 / 放大缩小 / 查看原图 / 超时统一走这里收口。
@@ -282,11 +332,15 @@ function run(argv) {
     // 全部挂到 contentView(创建顺序即 z 序,均不重叠)
     var cv = null; // run() 内拿到 win 后统一添加
 
-    // ===== 布局函数:给定窗宽/窗高/说明区高/图区高,自上而下重排全部子视图 =====
-    // AppKit 坐标系:y 自顶向下递减。consumed 公式与窗高计算严格对应,防底部按钮被裁。
+    // ===== 布局函数:给定**内容视图**宽/高、说明区高、图区高,自上而下重排全部子视图 =====
+    // AppKit 坐标系:y 自顶向下递减。
+    // 第 134 轮修正:起始 y 必须从 ch 起算(contentHeight 逐项累加 place 序列时,标题只占
+    // 一次 titleH)。此前写成 `ch - titleH` 又把整摞控件下推一行,而 contentHeight 没有
+    // 为此留预算 → 底部「取消/提交」整行下移 22px,y=-6 掉出内容视图(实测),点击落在被裁
+    // 的边带上,用户观感为「点了没反应」。
     function doLayout(cw, ch, msgH, imgH) {
       var textW = cw - PAD * 2;
-      var y = ch - titleH;
+      var y = ch;
       function place(v, h) {
         v.frame = $.NSMakeRect(PAD, y - h, textW, h);
         y -= h + gap;
@@ -302,7 +356,6 @@ function run(argv) {
       place(refs.input, inputH);
       for (var bi = 0; bi < refs.optBtns.length; bi++) place(refs.optBtns[bi], btnH);
       // 底部按钮行:左 取消/提交,右 查看原图/⛶ 最大化(place 已留标准 gap,无需修正)
-      // 底部按钮行:左 取消/提交,右 查看原图/⛶ 最大化
       var bw = 84, ow = 110, zw = 110, inner = 8;
       var rightX = cw - PAD - zw;
       var origX = rightX - inner - ow;
@@ -358,27 +411,25 @@ function run(argv) {
     g.countdownLabel = refs.t2;
 
     doLayout(W, normalH, normalMsgH, normalImgH);
-    win.center;
+    placeWindow(win, W, normalH);
 
     // ===== 第 133 轮:最大化/还原(铺满主屏可视区,布局整体重排) =====
     var zoomed = false;
-    var normalFrame = rectVals(win.frame);
     g.toggleZoom = function () {
       try {
         if (!zoomed) {
-          var vf = rectVals($.NSScreen.mainScreen.visibleFrame);
+          var vf = rectVals(pickScreen().visibleFrame);
           var zw = Math.max(W, vf.w - 40), zh = Math.max(normalH, vf.h - 40);
           var zMsgH = Math.min(240, Math.max(90, Math.round(zh * 0.22)));
           var zImgH = imgHeightFor(zw - PAD * 2, Math.min(900, Math.round(zh * 0.55)));
           var zH = Math.max(zh, contentHeight(zMsgH, zImgH));
-          win.setFrameDisplay($.NSMakeRect(vf.x + 20, vf.y + 20, zw, zH), true);
-          doLayout(zw, zH, zMsgH, zImgH);
+          placeWindow(win, zw, zH);
+          doLayout(zw, rectVals(win.contentView.frame).h, zMsgH, zImgH);
           refs.zoom.title = $('⛶ 还原');
           zoomed = true;
         } else {
-          win.setFrameDisplay($.NSMakeRect(
-            normalFrame.x, normalFrame.y, normalFrame.w, normalFrame.h), true);
-          doLayout(normalFrame.w, normalFrame.h, normalMsgH, normalImgH);
+          placeWindow(win, W, normalH);
+          doLayout(W, rectVals(win.contentView.frame).h, normalMsgH, normalImgH);
           refs.zoom.title = $('⛶ 最大化');
           zoomed = false;
         }

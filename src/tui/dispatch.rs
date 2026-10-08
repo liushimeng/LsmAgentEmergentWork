@@ -245,6 +245,21 @@ impl TuiSession {
             assist_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut handled_assist_id: Option<u64> = None;
             let mut handled_via_gui = false;
+            // 第 134 轮:弹窗接管期间并联一条 `/hitl` 前缀应急行读(只认前缀,平时静默)。
+            // 弹窗端失联(屏外/被裁/被遮挡/进程卡住)时它就是唯一的逃生门 —— 此前弹窗
+            // 接管期间 TUI 完全不读 stdin,实测等价于干等满 120s 超时。
+            // 同一 id 只 spawn 一次,避免每次 250ms 轮询叠加阻塞读。
+            let mut gui_escape_spawned_for: Option<u64> = None;
+            let spawn_gui_escape = |id: u64, options: Vec<String>| {
+                tokio::spawn(async move {
+                    let Some(raw) = super::hitl_view::read_hitl_escape_answer().await else {
+                        return; // EOF / 读取失败:放弃应急应答
+                    };
+                    let hub = HumanAssistHub::global();
+                    let mapped = super::hitl_view::map_human_assist_input(&raw, &options);
+                    hub.respond_via_tui_escape(id, mapped);
+                });
+            };
 
             loop {
                 tokio::select! {
@@ -358,7 +373,8 @@ impl TuiSession {
                                 | AssistEvent::GuiFailed { id }
                                 | AssistEvent::GuiCancelled { id }
                                 | AssistEvent::GuiTimeout { id } => Some(*id),
-                                AssistEvent::GuiAnswered { id, .. } => Some(*id),
+                                AssistEvent::GuiAnswered { id, .. }
+                                | AssistEvent::TuiEscapeAnswered { id, .. } => Some(*id),
                             };
                             match &ev {
                                 AssistEvent::GuiLaunched { id } => {
@@ -403,10 +419,17 @@ impl TuiSession {
                         {
                             let via_gui = hub.is_gui_presenting(req.id);
                             if via_gui {
-                                // 弹窗接管:只打通知行(事件驱动),不读 stdin
+                                // 弹窗接管:只打通知行(事件驱动),不读 stdin;
+                                // 但并联一条 `/hitl` 前缀应急行读(见 spawn_gui_escape)。
                                 if handled_assist_id != Some(req.id) {
                                     handled_assist_id = Some(req.id);
                                     handled_via_gui = true;
+                                }
+                                if gui_escape_spawned_for != Some(req.id) {
+                                    gui_escape_spawned_for = Some(req.id);
+                                    if stdout_is_tty {
+                                        spawn_gui_escape(req.id, req.options.clone());
+                                    }
                                 }
                             } else if handled_assist_id != Some(req.id) || handled_via_gui {
                                 handled_via_gui = false;

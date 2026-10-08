@@ -186,7 +186,7 @@ tui/
   engine.rs        CLI 渲染引擎 —— Screen trait + Frame + 全量重绘 present
   form.rs          通用 Tab 表单状态机(被 ProviderForm 屏复用)
   hitl_view.rs     人工介入(HITL)TUI 呈现视图(第 130 轮自 dispatch.rs 拆出):请求块渲染/倒计时同行右对齐/行读映射/弹窗接管通知行与事件打印
-  input.rs         单行输入(主屏用):行编辑 + 行内提示 + 补全 + 固定底部面板(DECSTBM 滚动区)
+  input.rs         单行输入(主屏用):行编辑 + 行内提示 + 补全 + **自适应底部面板**(DECSTBM 滚动区;面板顶行紧跟光标,不留白,查不到光标行时回退吸底 —— 第 134 轮)
   paste.rs         粘贴保真层(从 input.rs 拆出):PasteRegistry 登记簿 / handle_paste_text / 粘贴预览与提交完整回显(纯函数)
   completion.rs    斜杠命令补全引擎(内置 + 自定义命令动态注册)
   commands.rs      自定义斜杠命令(D2):两级目录发现/frontmatter/占位符渲染
@@ -301,6 +301,9 @@ config/            全局配置:mod.rs / agent_memory.rs(agent_memory DAO) / age
 
 ### 屏幕拓扑
 
+- **自适应底部面板（第 134 轮）**：输入面板不再恒定吸屏幕底部，而是**顶行紧跟当前光标行**（`Layout::panel_top_for` 纯函数决策，`enter_pinned` 落地）。启动横幅这类「短输出 + 大终端」场景实测原会固定留 16 行空白（观感像一串空回车），现输出与面板之间**恒不留空行**；内容接近屏底时自动吸底，行为与旧版一致。滚动区底行改为 `panel_top`（`scroll_bottom()`），输出填满时游标正好停在面板正上方。**坑**：查光标行必须**在 `ESC[r`(DECRST)之前**发 `ESC[6n` —— 本机 tmux 实测 `ESC[r` 会让紧随其后的 DSR 回包变成 `1;1`（shell 复现：无 `ESC[r` 回 `21;1`，加 `ESC[r` 无回包），据此定位会把面板顶到第 2 行并抹掉启动横幅。`crossterm::cursor::position()` 本机恒返回 `Ok((0,0))`，不可用，改用自实现 `query_cursor_row()`（`libc::poll` 限时 + 先排空 stdin 陈旧字节，失败返回 `None` → 保持吸底，不猜）。面板顶行经 `LAST_PANEL_TOP` 静态量传递，供 `teardown_pinned()` 精确清除。
+- **人工介入 `/hitl` 应急通道（第 134 轮）**：弹窗接管期间 TUI 此前**完全不读 stdin**，弹窗一旦屏外/被遮挡/进程卡住就是 120s 死等。现并联一条**只认 `/hitl` 前缀**的行读（`tui/hitl_view.rs::read_hitl_escape_answer` + `HumanAssistHub::respond_via_tui_escape` + 事件 `AssistEvent::TuiEscapeAnswered`）：`/hitl 2t6x` 文本应答、`/hitl 3` 选项 3、`/hitl cancel` 取消，映射规则与既有行读完全一致；**其它任意输入行丢弃并提示**，绝不与弹窗抢应答。
+- **人工介入弹窗「点击无响应」根治（第 134 轮）**：三条经探针+截图复现的独立缺陷已修 —— ① `macos_dialog.js` 的 `doLayout` 起始 `y = ch - titleH` 比 `contentHeight` 多扣一次标题，底部「取消/提交」整行下移 22px（实测 frame `y=-6`，内容视图高 300）被裁，改为 `y = ch`；② 最大化分支用 `setFrameDisplay`（frame 坐标，含 32px 标题栏）却按内容高排版，改用 `setContentSize` + `setFrameOrigin`；③ 弃用 `[NSWindow center]`（依赖 `window.screen` 隐式归属，后台 osascript 在多屏下实测落到主屏下方的副屏 `win.frame=(1352,-530,…)`，主屏内完全不可见），改为 `pickScreen()`（visibleFrame 面积最大）+ `placeWindow()` 显式落位。详见 `docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md` §13。
 - **REPL 主屏**：保留 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。**粘贴保真**：bracketed paste 整体接收；**≥2 行粘贴一律转 `[粘贴 #N +M 行]` marker 保真**（原文含换行入登记表，不再把换行压成空格——旧「>10 行才转」规则会让 3~8 行 Markdown 提示词在屏幕上只剩一行、送进模型也丢掉列表结构），注册后立刻在滚动区回显原文预览（前 4 行 + 「其余 N 行未显示」），提交时按**展开版**逐行完整回显（首行 `>> `、续行 `.. `、超 20 视觉行折叠并标注「内容已完整发送」）；单份 >10000 字符截断为首尾各 500 + 省略标注+ 快速输入批量合并（IME/旧终端粘贴逐字重绘优化）+ Enter 提交前 15ms 粘贴突发探测（无 bracketed paste 的 Windows 终端多行提示词被逐行拆成多次提交 — 见 `tui/input.rs::drain_paste_burst`）。
 - **子屏（Modal）**：`engine.rs` 的 Screen 栈接管 `/provider *` 系列，进入 alternate screen + 原始模式，Esc 退回主屏。
 - **非 TTY 回退**：stdin 不是终端时（管道 / e2e），子屏与主屏都回退到 print 输出，保证 `run_e2e.sh` 兼容。
