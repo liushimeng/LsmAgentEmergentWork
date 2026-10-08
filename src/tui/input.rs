@@ -502,11 +502,14 @@ impl InputHandler {
                             // 多行/超长粘贴:输入行只放 marker,但用户必须看得见自己粘了什么
                             // (修 R5 可见性半边)—— 立刻在滚动区回显原文前几行预览。
                             let content = pastes.last_content();
-                            Some(paste::plan_paste_preview(
+                            let preview = paste::plan_paste_preview(
                                 &s,
                                 &content,
                                 textfit::term_width_for_render(),
-                            ))
+                            );
+                            // 第 131 轮:预览已打印 → 提交时不再全量重复回显同一段原文
+                            pastes.mark_previewed();
+                            Some(preview)
                         }
                     };
                     overlay_lines = self.update_completion(
@@ -839,11 +842,14 @@ impl InputHandler {
                                                     buffer.insert_str(cursor, &s);
                                                     cursor += s.len();
                                                     let content = pastes.last_content();
-                                                    Some(paste::plan_paste_preview(
+                                                    let preview = paste::plan_paste_preview(
                                                         &s,
                                                         &content,
                                                         textfit::term_width_for_render(),
-                                                    ))
+                                                    );
+                                                    // 第 131 轮:预览已打印 → 提交时不重复全量回显
+                                                    pastes.mark_previewed();
+                                                    Some(preview)
                                                 }
                                             };
                                             overlay_lines = self.update_completion(
@@ -1171,6 +1177,11 @@ impl InputHandler {
     /// 旧实现回显的是 marker 版单行 buffer,用户粘贴的多行提示词在屏幕上只剩一行,
     /// 与「送进模型的到底是什麼」完全对不上。返回的 `Submitted` 仍是展开还原版
     /// (marker → 原文,超大粘贴截断注入,见 `PasteRegistry::expand`)。
+    ///
+    /// 第 131 轮「粘贴只显示一遍」:粘贴路径的原文在**粘贴瞬间**已经打印过
+    /// [`paste::plan_paste_preview`] 预览,此处若再全量回显等于同一段文字连着出现两次
+    /// (实测 8 行提示词观感像「粘了两遍」)。故含已预览粘贴时改为回显输入行 marker
+    /// 形态 + 一行「已按原文完整发送 N 行 / M 字」;纯键盘输入路径不变。
     #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
@@ -1185,7 +1196,13 @@ impl InputHandler {
         // 回显到滚动区底行(保留用户输入痕迹,随历史输出一起滚动):
         // 展开版逐行回显,多行提示词在屏幕上完整可读,不再只剩首行。
         let expanded = pastes.expand(&buffer);
-        let echo = paste::plan_submit_echo(prompt, &expanded, textfit::term_width_for_render());
+        let echo = paste::plan_submit_echo_with_paste(
+            prompt,
+            &buffer,
+            &expanded,
+            textfit::term_width_for_render(),
+            pastes.expands_previewed_paste(&buffer),
+        );
         self.print_in_scroll_region(stdout, layout, &echo)?;
         // 面板输入行清空(组件常显)
         self.redraw_line(stdout, layout, prompt, "", 0)?;

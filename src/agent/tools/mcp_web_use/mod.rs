@@ -200,6 +200,66 @@ fn open_next_steps() -> Value {
     ])
 }
 
+/// 「这一步走不通」的确定性下一步提示(第 131 轮,纯函数,可单测)。
+///
+/// 背景:人工介入(HITL)长期只写在**系统提示词**里(`MCP_WEB_USE_PROMPT_SECTION`
+/// 第 13/16 条),工具响应层从不携带。实测中模型看到 `ocr_error` 后自由发挥 —— 反复
+/// 调参 OCR、换 region、猜验证码,而不是去 `request_human`,把迭代预算烧光。
+///
+/// 本函数把「下一步该做什么」从提示词层下沉到**工具返回层**:凡是判定为
+/// 「自动路径已走到尽头」的分支(OCR 不可用 / blockers 命中)都在响应里附
+/// `next_action` + `human_assist` 载荷,LLM 不查文档即可照着构造
+/// `control_action=request_human` 的参数。
+pub(crate) fn human_assist_hint(reason: &str, message: &str, options: &[&str]) -> Value {
+    json!({
+        "next_action": "request_human",
+        "human_assist": {
+            "ready": true,
+            "reason": reason,
+            "message": message,
+            "options": options,
+            "call": format!(
+                "MCP_Web_Use(action=\"control\", control_action=\"request_human\", \
+                 params={{\"reason\":\"{reason}\",\"message\":\"…\",\"options\":[…]}})"
+            ),
+            "rule": "严禁伪造/猜测验证码或跳过人工验证;人工应答后用 data.human_response 继续",
+        }
+    })
+}
+
+/// OCR 结果里是否已带可读文字(纯函数)。
+fn ocr_has_text(out: &Value) -> bool {
+    out.get("ocr_text")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// 「OCR 没能拿到验证码」判定(纯函数,可单测):报错了,或者返回了空文本。
+///
+/// 空文本与 `ocr_error` 同等对待 —— 验证码区域是纯噪声图时 OCR 常常返回空串,
+/// 模型此时最容易误以为「再调一次参数也许能出来」而反复重试。
+pub(crate) fn ocr_unavailable_hint(out: &Value) -> Option<Value> {
+    let failed = out.get("ocr_error").is_some() || !ocr_has_text(out);
+    if !failed {
+        return None;
+    }
+    Some(human_assist_hint(
+        "captcha",
+        "页面验证码 OCR 不可用(或返回空文本),请人工在弹窗中识别并输入验证码后继续",
+        &["我已完成验证,继续", "取消任务"],
+    ))
+}
+
+/// 把提示字段并入响应对象(纯函数;已存在则不覆盖)。
+pub(crate) fn merge_hint(out: &mut Value, hint: Value) {
+    if let (Some(dst), Some(src)) = (out.as_object_mut(), hint.as_object()) {
+        for (k, v) in src {
+            dst.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+}
+
 /// 解析 open 的 `window_width`/`window_height`(第 100 轮):
 /// 任一缺失返回 None(由驱动层按 mode 给默认);均存在时 clamp 到安全区间
 /// (320~7680 / 240~4320,覆盖 1080p/2K/4K 与最小可读尺寸)。

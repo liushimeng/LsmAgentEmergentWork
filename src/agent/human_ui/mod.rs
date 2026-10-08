@@ -118,6 +118,37 @@ fn platform_supported() -> bool {
     cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
+/// 弹窗不可用时的原因(纯函数,可单测)。
+///
+/// [`enabled`] 是布尔的 fail-open 判定,出问题时对用户是黑盒:信封只说「弹窗与 TUI
+/// 均不可用」,用户既不知道是没弹、还是弹了没反应、还是压根没请求过。本函数把判定链
+/// 逐条摊开,随 4001 信封回传给 Agent / 日志,供排障。
+fn disabled_reason() -> &'static str {
+    if cfg!(test) {
+        return "测试构建(cfg(test))下默认关闭弹窗";
+    }
+    if matches!(
+        std::env::var("LAEW_HUMAN_UI").unwrap_or_default().trim().to_lowercase().as_str(),
+        "off" | "0" | "false" | "no" | "tty"
+    ) {
+        return "LAEW_HUMAN_UI 开关已关闭(off/0/false/no/tty)";
+    }
+    if !platform_supported() {
+        return "当前平台不支持桌面弹窗(仅 macOS / Windows)";
+    }
+    "弹窗解释器缺失(macOS: /usr/bin/osascript;Windows: powershell.exe)"
+}
+
+/// 弹窗能力诊断(第 131 轮):随 `request_human` 的 4001 信封回传,便于排障。
+pub fn diagnostics() -> Value {
+    json!({
+        "gui_enabled": enabled(),
+        "platform": platform_name(),
+        "reason_hint": if enabled() { "弹窗可用" } else { disabled_reason() },
+        "env_switch": "LAEW_HUMAN_UI=off 关闭弹窗强制走终端;LAEW_HUMAN_UI_SCRIPT=<path> 自定义脚本",
+    })
+}
+
 /// 平台脚本解释器是否就位(macOS osascript / Windows powershell)。
 /// 探测失败按「就位」保守处理 —— 真启动失败会走降级链,不会比禁用更糟。
 fn interpreter_available() -> bool {

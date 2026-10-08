@@ -65,6 +65,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 | `LAEW_REACT_GUARD` | `off`/`0`/`false`/`no` | 关闭 ReAct 循环守卫（无进展软提醒与 doom_loop 止损均不生效；`doom_loop_repeats` 仍统计，可观测性不丢）。默认开启：进展键 =「工具名 + 参数稳定 JSON + 结果摘要」三者全同即无进展，第 2 次软提醒 / 第 3 次宽限轮强提醒 / 第 4 次止损终止。见 `src/agent/loop_guard.rs` |
 | `LAEW_MCP_ENABLED` | `off`/`0`/`false`/`no` | 关闭通用 MCP 服务调用（`MCP_Use` 工具注册与提示词同时归零，严格向后兼容）。默认开启：Agent 可经 `MCP_Use` 调用 `laew mcp add` 配置的外部 MCP server 工具/资源。见 `src/agent/tools/mcp_use/mod.rs` |
 | `LAEW_SELF_SPAWN` | `off`/`0`/`false`/`no` | 关闭**自感知动态子 Agent**（默认开启）。关闭时不注册 `SubAgent` 工具、不注入自感知提示词段、不建运行时（工具面/提示词/耗时与改造前完全一致）。见 `src/agent/self_awareness.rs` |
+| `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭**网页取证纪律**硬闸门（默认开启）。命中「Bash 网络取证命令 + 命令中的 host 落在任务锚点域内 + 工具面含 MCP_Web_Use」时直接拒绝并推回 MCP_Web_Use；`curl localhost:8080` 等非任务目标一律放行。见 `src/agent/safety/web_evidence.rs`、`docs/MCP_Web_Use/04-网页取证纪律.md` |
 | `LAEW_SUBAGENT_MAX_DEPTH` | 0..=3 | 动态子 Agent 嵌套层数上限，默认 `1`（子 Agent 为叶子，不能再启动）。`0` = 完全禁止（等价关闭）。 |
 | `LAEW_SUBAGENT_MAX_PARALLEL` | 1..=8 | 会话级并发槽位，默认 `3`（对齐 atomcode `Semaphore(3)`）。 |
 | `LAEW_SUBAGENT_MAX_TOTAL` | 1..=64 | 会话级累计启动预算，默认 `8`（防 token 失控；耗尽返回信封 `2001`）。 |
@@ -102,6 +103,12 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 
 - WorkFlow 执行时按 `depends_on` 自动 Kahn 分层（`main_work::topo_layers`），**同层无依赖的 SubAgent 自动并行**（tokio::spawn + Semaphore 上限 3，`OrchestratorConfig::max_parallel_workflows`），跨层严格串行、上游产物按层注入，失败语义与串行一致（fail-fast 回流 Yolo）
 - **执行-验证-修订闭环**：WorkFlow 单元 QC 判 `retryable=true` 时先在**单元级局部重试**（仅该单元，注入本单元 QC 结论，不连坐同层姊妹单元），`OrchestratorConfig::unit_retry_budget` 默认 2（单单元最多 3 次尝试，`0` = 关闭旧行为）；预算耗尽才升级到档位级重试（`max_retry_per_level=3`，`retray_hint` 回灌 Main-Work）→ Yolo 回流（`[PREVIOUS_FAILURE]` + `failure_signals`）→ Failed outcome。retry_hint 分层：attempt=0 用档位级 hint / attempt≥1 用本单元 QC issues+suggestion 覆盖 description hint 段（`apply_retry_hint_overlay`）
+
+### 第 131 轮：网页取证纪律 / 人工介入可见性 / 粘贴只显示一遍
+
+- **网页取证纪律**：网页任务的证据只能来自 `MCP_Web_Use`。`open` 返 `2001`/`3001` 时**如实报告不可达并停止**，禁止改用 `curl/ping/nc` 等 Bash 网络命令探测任务目标站点（Bash 抓的内容 QC 无法与浏览器轨迹对账，与伪造同质）。三层：提示词 `src/agent/system_prompt/web_evidence.rs` 第 20 条（并修正 Main-Work「任务前提验证」原本鼓励 `curl` 的三处表述）；运行时硬闸门 `src/agent/safety/web_evidence.rs`（五条件全中才拦，host 抽取含**裸 IP 字面量**通道）；`LAEW_WEB_EVIDENCE=off` 回退。见 `docs/MCP_Web_Use/04-网页取证纪律.md`。
+- **人工介入可见性**：`request_human` 的「该走人工」下沉到工具返回层——OCR 报错/空文本与 `inspect(info=blockers)` 命中阻断时，响应附 `next_action="request_human"` + 完整 `human_assist` 载荷；`4001` 附 `human_ui_diagnostics` 供排障；`-p`/`-f` 单轮模式新增 HITL 事件轮询协程与弹窗通知行（此前弹窗照弹但终端零输出）。见 `docs/MCP_Web_Use/02` §5.0/§5.1.1/§5.3。
+- **TUI 粘贴只显示一遍**：多行粘贴在粘贴瞬间已回显前 4 行预览，提交时不再全量重复原文，改为回显 marker 形态 + 一行「已按原文完整发送 N 行 / M 字」；纯键盘输入路径不变。见 `src/tui/paste.rs::plan_submit_echo_with_paste`。
 
 ### 三个 MCP 风格工具（替代已删除的独立 Agent 角色）
 
@@ -262,6 +269,7 @@ agent/
     mcp_use/         MCP_Use 工具目录(通用 MCP 服务调用):mod.rs(门面+七 action 分发+JSON 信封 0/1001/3001/5001-5006) / tests.rs
 
   window/          窗口操控平台驱动层(MCP_Window_Use 服务实现):mod.rs(模型+WindowDriver trait+工厂) / windows.rs(UIA+Win32) / windows_input.rs / windows_ocr.rs / macos_axui.rs(AX) / macos_vision_ocr.rs(Vision OCR) / control_action.rs / fallback.rs(wmctrl/xdotool) / macos_legacy/(mod.rs FFI+Driver入口 / ax_attrs.rs / cg_event.rs CGEvent 输入底座 / inspect.rs AX 控件树遍历 / act.rs / tests.rs)
+  safety/web_evidence.rs  网页取证纪律(第 131 轮):Bash 网络取证命令识别 / 命令行 host 抽取(含裸 IP)/ 任务锚点比对 / 拒绝文案
   browser.rs       浏览器 CDP 驱动层(MCP_Web_Use 服务实现):BrowserManager 单例(page_id 注册表 + 跨平台浏览器检测 + Console/Network 缓冲 + 下载事件管理 + 生命周期回收) + 全模式 1080p 启动基线与 viewport_fit_plan/fit_viewport_to_content 2K 自动扩展
   browser_watchdog.rs Browser 子进程 watchdog:TUI 退出时清理 + 防止 panic-in-panic
   workflow/        Goal 状态机 + Squad 调度工作流层:mod.rs / adaptive_loop.rs / batch.rs / goal.rs / phase.rs / quality_gate.rs / squad.rs / template.rs
@@ -395,7 +403,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 
 **三个 MCP 风格工具**（按工具）：
 - `docs/MCP_Window_Use/` — 桌面窗口操控（01 主设计 + 02 鼠标键盘优先级链 + 03 连续工作模式 + 04 中键修饰键 + 05 macos_legacy 拆分 + 06 横向对比 + MacOS/Window 平台技术文档）
-- `docs/MCP_Web_Use/` — 浏览器操控（01 主设计 + 02 人工介入与窗口可视化）
+- `docs/MCP_Web_Use/` — 浏览器操控（01 主设计 + 02 人工介入与窗口可视化 + 03 人工介入弹窗 UI 动态加载 + **04 网页取证纪律**）
 - `docs/MCP_Use/` — 通用 MCP 服务调用
 - `docs/浏览器CDP工具/` — CDP 技术参考（chromiumoxide 选型 / launch vs connect / BrowserManager 单例）
 

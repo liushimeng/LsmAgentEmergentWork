@@ -12,10 +12,15 @@ pub mod credentials;
 pub mod prompt_injection;
 pub mod target_anchor;
 pub mod url_safety;
+pub mod web_evidence;
 
 pub use credentials::{Vault, CREDENTIAL_PREFIX};
 pub use prompt_injection::{
     scan_and_wrap, InjectionSource, InjectionVerdict, MatchHit, Severity, INJECTION_BOUNDARY,
+};
+pub use web_evidence::{
+    check_bash_against_web_evidence, denial_text as web_evidence_denial_text,
+    detect_network_evidence_command, hosts_in_command, web_evidence_enabled, EvidenceViolation,
 };
 pub use target_anchor::{
     build_clarification_message, check_open_against_anchor, check_open_against_target_anchor,

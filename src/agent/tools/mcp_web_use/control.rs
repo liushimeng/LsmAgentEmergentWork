@@ -1018,6 +1018,11 @@ pub(super) async fn act_screenshot(id: &str, p: &Value) -> std::result::Result<V
             }
             Err(e) => {
                 out["ocr_error"] = json!(e);
+                // 第 131 轮:OCR 走到尽头 → 工具返回层直接给出人工介入的下一步,
+                // 不再依赖模型自己从系统提示词第 13/16 条里回忆规则。
+                if let Some(hint) = super::ocr_unavailable_hint(&out) {
+                    super::merge_hint(&mut out, hint);
+                }
             }
         }
     }
@@ -1341,6 +1346,9 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                 "reason": reason,
                 "kind_label": label,
                 "assist_channel": AssistVia::Tui.as_str(),
+                // 第 131 轮:原信封只说「不可用」,用户无从判断是没弹、弹失败、
+                // 还是压根没走到这一步。附本机能力诊断以便排障。
+                "human_ui_diagnostics": crate::agent::human_ui::diagnostics(),
                 "hint": "当前环境既无桌面弹窗(macOS/Windows 会话)也无 TUI 交互。如实告知用户:请在 laew TUI 交互模式或桌面会话下重新执行该任务",
             }),
         ),

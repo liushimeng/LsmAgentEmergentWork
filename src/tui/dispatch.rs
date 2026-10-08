@@ -22,7 +22,7 @@ use crate::agent::human_assist::{AssistEvent, AssistVia, HumanAssistHub};
 use super::hitl_view::{
     human_assist_prompt_visual_width, map_human_assist_input, print_assist_event,
     print_human_assist_gui_notice, print_human_assist_prompt_with_cursor, read_human_assist_answer,
-    render_countdown_inplace,
+    render_countdown_inplace, AssistOut,
 };
 use crate::llm::{ChatMessage, Usage};
 
@@ -359,19 +359,20 @@ impl TuiSession {
                                         print_human_assist_gui_notice(
                                             &areq,
                                             crate::agent::human_ui::platform_name(),
+                                            AssistOut::Stdout,
                                         );
                                         handled_assist_id = Some(*id);
                                         handled_via_gui = true;
                                     }
                                 }
                                 AssistEvent::GuiFailed { id } => {
-                                    print_assist_event(&ev);
+                                    print_assist_event(&ev, AssistOut::Stdout);
                                     // 降级:同 id 由下方行读分支无缝接管(条件含 handled_via_gui)
                                     handled_assist_id = Some(*id);
                                     handled_via_gui = true;
                                 }
                                 _ => {
-                                    print_assist_event(&ev);
+                                    print_assist_event(&ev, AssistOut::Stdout);
                                     if let Some(id) = ev_id {
                                         if handled_assist_id == Some(id) {
                                             handled_assist_id = None;

@@ -619,12 +619,67 @@ async fn run_one_shot(
             eprintln!("[stage] {line}");
         }
     });
+    // 第 131 轮:人工介入(HITL)在单轮模式的可见性。
+    //
+    // 修复前的实测缺口:`-p` / `-f` 全程不碰 HumanAssistHub,于是 macOS/Windows 上
+    // `MCP_Web_Use(control_action=request_human)` 会**照常弹出桌面弹窗**并把应答回填给
+    // 工具(任务正常完成),但终端一个字都不打印 —— 用户盯着 stdout 只看到「卡住了」,
+    // 完全不知道有个人工介入请求在等他。
+    //
+    // 这里补一个 250ms 轮询协程,与 TUI `dispatch_prompt` 的分支同款:排空弹窗事件、
+    // 打「已弹出弹窗」通知行。单轮模式**不读 stdin**(弹窗已是唯一应答通道;弹窗不可用
+    // 时工具侧仍按既有语义返回 4001),通知行走 stderr 以保持 stdout「只含答案与用量」。
+    let (assist_stop_tx, assist_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let assist_stop_tx = std::sync::Mutex::new(Some(assist_stop_tx));
+    let assist_printer = tokio::spawn(async move {
+        use lsm_agent::agent::human_assist::HumanAssistHub;
+        use lsm_agent::tui::hitl_view::{print_assist_event, print_human_assist_gui_notice, AssistOut};
+        let hub = HumanAssistHub::global();
+        // oneshot Receiver 只能被消费一次,pin 到循环外由 select! 反复轮询
+        let mut assist_stop_rx = std::pin::pin!(assist_stop_rx);
+        let mut notified: Option<u64> = None;
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    for ev in hub.take_events() {
+                        print_assist_event(&ev, AssistOut::Stderr);
+                    }
+                    if let Some(req) = hub.poll() {
+                        if notified != Some(req.id) && hub.is_gui_presenting(req.id) {
+                            notified = Some(req.id);
+                            print_human_assist_gui_notice(
+                                &req,
+                                lsm_agent::agent::human_ui::platform_name(),
+                                AssistOut::Stderr,
+                            );
+                        }
+                    }
+                }
+                // 任务主流程收尾时 fire oneshot,协程随之退出
+                _ = &mut assist_stop_rx => break,
+            }
+        }
+    });
+    // 停止协程 + 回收挂起的人工介入请求(与 TUI `dispatch_prompt` 收尾同款兜底)
+    let stop_assist = move || {
+        if let Some(tx) = assist_stop_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = tx.send(());
+        }
+    };
     let outcome = match orchestrator
         .handle_cancellable_with_progress(&mut session, &cancel, Some(stage_tx))
         .await
     {
         Ok(o) => o,
         Err(e) if matches!(e, lsm_agent::error::AgentError::Cancelled) => {
+            stop_assist();
+            let _ = assist_printer.await;
             let _ = stage_printer.await;
             // 第 108 轮:不再"裸" std::process::exit (会跳过 Drop 链 + 终端还原)。
             // 先:
@@ -642,10 +697,16 @@ async fn run_one_shot(
             std::process::exit(130);
         }
         Err(e) => {
+            stop_assist();
+            let _ = assist_printer.await;
             let _ = stage_printer.await;
             return Err(anyhow::Error::from(e));
         }
     };
+    stop_assist();
+    let _ = assist_printer.await;
+    lsm_agent::agent::human_assist::HumanAssistHub::global().cancel_pending();
+
     let _ = stage_printer.await;
     // 第 78 轮:任务正常完成后,清理浏览器子进程(避免长驻会话浏览器泄漏)。
     lsm_agent::agent::browser::BrowserManager::global().shutdown().await;

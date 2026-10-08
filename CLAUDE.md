@@ -65,6 +65,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 | `LAEW_SELF_SPAWN` | `off`/`0`/`false`/`no` | 关闭**自感知动态子 Agent**（默认开启）。关闭时不注册 `SubAgent` 工具、不注入自感知提示词段、不建运行时（工具面/提示词/耗时与改造前完全一致）。见 `src/agent/self_awareness.rs` |
 | `LAEW_TARGET_ANCHOR` | `off`/`0`/`false`/`no` | 关闭**任务锚点**全部四层（L1 澄清门 / L2 伪澄清单元阻断 / L3 工具门 6001 / L4 目标一致性 QC 门 + target_drift 信号）。严格回退到第 127 轮行为，与 `LAEW_MCP_ENABLED` / `LAEW_SELF_SPAWN` 同构。默认开启：实测 2026-09-24 事故（多行粘贴被截断后 Agent 自行改派到无关站点被判「✅ 成功」）的根治方案；见 `tmpPlan/2026-09-24_03-任务锚点与防目标漂移根治方案.md`、`src/agent/safety/target_anchor.rs` |
 | `LAEW_TARGET_ANCHOR_BLOCK` | `off`/`0`/`false`/`no` | 仅关闭 L3 工具级**阻断**（`MCP_Web_Use` 的 6001 不返回，仅记 warn），保留 L1 / L2 / L4 与信号打标（观察模式）。默认开启阻断。适合灰度期先观察不拦截 |
+| `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭**网页取证纪律**硬闸门（默认开启）。命中「Bash 网络取证命令 + 命令中的 host 落在任务锚点域内 + 工具面含 MCP_Web_Use」时直接拒绝并推回 MCP_Web_Use；`curl localhost:8080` 等非任务目标一律放行。见 `src/agent/safety/web_evidence.rs`、`docs/MCP_Web_Use/04-网页取证纪律.md` |
 | `LAEW_SUBAGENT_MAX_DEPTH` | 0..=3 | 动态子 Agent 嵌套层数上限，默认 `1`（子 Agent 为叶子，不能再启动）。`0` = 完全禁止（等价关闭）。 |
 | `LAEW_SUBAGENT_MAX_PARALLEL` | 1..=8 | 会话级并发槽位，默认 `3`（对齐 atomcode `Semaphore(3)`）。 |
 | `LAEW_SUBAGENT_MAX_TOTAL` | 1..=64 | 会话级累计启动预算，默认 `8`（防 token 失控；耗尽返回信封 `2001`）。 |
@@ -82,6 +83,9 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **接入点补全**：Anthropic → `{end_point}/v1/messages`；OpenAI → `{end_point}/chat/completions`；尾部 `/` 自动裁剪。
 - **运行日志文件（输出 log 文件）**：`--debug` / `--info`（含 `-debug` / `-info` 单横线与 `--DEBUG` 等大小写变体）在工作目录生成 `llaew_YYYYMMDD_HHMMSS.log`（时间戳 = laew 启动时刻，精确到秒，本地时区；已 gitignore）。`--debug` → DEBUG 级（含每轮 LLM 请求元信息/响应思考文本与工具意图全文），`--info` → INFO 级主干事件；实现复用 tracing 双层订阅器（原控制台层行为不变 + 文件层 `src/logging.rs`），埋点覆盖全部 8 角色的感知（任务输入/Agent 会话）/ 决策（Yolo 分类/Plan/Main-Work 拆解/QC 报告）/ 执行（WorkFlow 单元/Context 压缩/SessionContext 摘要/任务收口）/ 思考（LLM 响应文本与 tool_calls）与全部工具调用（名称/参数/结果/耗时，`agent_loop.rs` 中央埋点）。TUI 横幅追加「启动时间」行（常显）与「日志文件」行（仅 `--debug`/`--info` 时显示相对化路径 + 级别，`/clear` `/new` 重印横幅仍可见；启动时刻由 main 单点捕获，横幅显示与日志文件名时间戳严格同刻，`TuiLaunch` 传递）。
 - **工具定义协议差异**：Anthropic 用 `tools[].{name,description,input_schema}`；OpenAI 用 `tools[].{type:"function",function:{name,description,parameters}}`（function 风格）。
+- **网页取证纪律（第 131 轮）**：网页任务的证据只能来自 `MCP_Web_Use`——`MCP_Web_Use(action=open)` 返 `2001`/`3001` 时**如实报告不可达并停止**，禁止改用 `curl/ping/nc` 等 Bash 网络命令探测任务目标站点（实测事故：28 次 Bash 对 8 次 MCP_Web_Use，Bash 抓的内容 QC 无法与浏览器轨迹对账，与伪造同质）。三层设防：(1) 提示词 `src/agent/system_prompt/web_evidence.rs` 第 20 条（仅注入持 MCP_Web_Use 的 SubAgent-Work，并修正了 Main-Work「任务前提验证」原本鼓励 `curl` 验证 URL 的三处表述）；(2) 运行时硬闸门 `src/agent/safety/web_evidence.rs`（五条件全中才拦：开关未关 + 是 Bash + 工具面含 MCP_Web_Use + 命令命中网络取证程序 + 命令里的 host 落在任务锚点域内；host 抽取含**裸 IP 字面量**通道，`nc -z 10.255.159.58 20122` 这类无 scheme 的内网诊断才拦得住）；(3) `LAEW_WEB_EVIDENCE=off` 全关回退。设计见 `docs/MCP_Web_Use/04-网页取证纪律.md`。
+- **人工介入可见性（第 131 轮）**：`request_human` 的「该走人工」不再只写在提示词里，OCR 报错/空文本（`control(screenshot,ocr=true)` 与 `inspect(info=ocr)`）与 `inspect(info=blockers)` 命中阻断时，响应附 `next_action="request_human"` + 完整 `human_assist` 载荷（ready/reason/message/options/可复制的 call/反伪造 rule）；`4001 Unavailable` 附 `human_ui_diagnostics{gui_enabled,platform,reason_hint,env_switch}` 供排障「为什么没弹窗」；`-p`/`-f` 单轮模式新增 250ms 轮询协程排空 `AssistEvent` 并打弹窗通知行（此前弹窗照弹、应答照回填，但终端零输出）。见 `docs/MCP_Web_Use/02-人工介入与窗口可视化方案.md` §5.0/§5.1.1/§5.3。
+- **TUI 粘贴只显示一遍（第 131 轮）**：多行/超长粘贴在**粘贴瞬间**已回显前 4 行预览，提交时不再全量重复回显原文，改为回显输入行 marker 形态 + 一行「已按原文完整发送 N 行 / M 字」；纯键盘输入路径完全不变。见 `src/tui/paste.rs::plan_submit_echo_with_paste`。
 - **任务锚点（TargetAnchor，第 128 轮）**：从用户原文机械抽取的目标硬约束（不经 LLM，不可幻觉、不可丢失），全局单例（`src/agent/safety/target_anchor.rs`，与 `BrowserManager::global()` / `HumanAssistHub::global()` 同构；进程内 `tokio::task_local!` 同样可以但本轮选全局槽）。跨五层设防：(L0) 输入保真粘贴窗口加宽 + `prompt_lines/prompt_chars` 提交留痕；(L1) 编排器澄清门 `OrchestrationOutcome::DirectAnswer`，Yolo 填 `target_status="unresolved"` 或机械通道命中「指代 + 零主机」时触发；(L2) Main-Work 提示词第六条约束 + `plan_validate.rs` 澄清单元阻断（伪门在 DAG 里无法暂停等待用户，拆了就被秒级打回）；(L3) `MCP_Web_Use action=open/navigate/new_tab` 显式 URL 动作越界返回 `code=6001`，新开 6xxx「范围约束」段，避开 5xxx（MCP_Use）和 4xxx（HITL）的语义冲突；存活浏览器页面提示按 anchor 二分渲染为「✓ 可复用 / ⚠ 禁止复用」组，切断上一轮失败页面被当本轮权威上下文的漂移洗白通道；(L4) QC 目标一致性硬门（与第 109 轮桌面目标保真同形态）+ `target_drift` 强信号（扫 `tool_call_log` 主机比 anchor，命中即 `is_failed()`）。决策审计新增第 6 决策点 `target_anchor`，阶段 `extract` / `clarify`。实测（`-p` 单轮）：事故精确复现输入下 `outcome="clarification_needed"`、27 秒、零 MCP_Web_Use 调用、零 WorkFlow 单元；对照事故 365 秒、4 个 wf 全在 `ithome.com`、记为「✅ 成功」。开关 `LAEW_TARGET_ANCHOR=off` 全关回退，`LAEW_TARGET_ANCHOR_BLOCK=off` 仅关 L3 阻断保留观察。
 
 ### 多 Agent 架构（8 角色）
@@ -266,6 +270,7 @@ agent/
     mcp_use/         MCP_Use 工具目录(通用 MCP 服务调用):mod.rs(门面+七 action 分发+JSON 信封 0/1001/3001/5001-5006) / tests.rs
 
   window/          窗口操控平台驱动层(MCP_Window_Use 服务实现):mod.rs(模型+WindowDriver trait+工厂) / windows.rs(UIA+Win32) / windows_input.rs / windows_ocr.rs / macos_axui.rs(AX) / macos_vision_ocr.rs(Vision OCR) / control_action.rs / fallback.rs(wmctrl/xdotool) / macos_legacy/(mod.rs FFI+Driver入口 / ax_attrs.rs / cg_event.rs CGEvent 输入底座 / inspect.rs AX 控件树遍历 / act.rs / tests.rs)
+  safety/web_evidence.rs  网页取证纪律(第 131 轮):Bash 网络取证命令识别 / 命令行 host 抽取(含裸 IP 字面量)/ 任务锚点比对 / 拒绝文案
   browser.rs       浏览器 CDP 驱动层(MCP_Web_Use 服务实现):BrowserManager 单例(page_id 注册表 + 跨平台浏览器检测 + Console/Network 缓冲 + 下载事件管理 + 生命周期回收) + 全模式 1080p 启动基线与 viewport_fit_plan/fit_viewport_to_content 2K 自动扩展
   browser_watchdog.rs Browser 子进程 watchdog:TUI 退出时清理 + 防止 panic-in-panic
   workflow/        Goal 状态机 + Squad 调度工作流层:mod.rs / adaptive_loop.rs / batch.rs / goal.rs / phase.rs / quality_gate.rs / squad.rs / template.rs
@@ -399,7 +404,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 
 **三个 MCP 风格工具**（按工具）：
 - `docs/MCP_Window_Use/` — 桌面窗口操控（01 主设计 + 02 鼠标键盘优先级链 + 03 连续工作模式 + 04 中键修饰键 + 05 macos_legacy 拆分 + 06 横向对比 + MacOS/Window 平台技术文档）
-- `docs/MCP_Web_Use/` — 浏览器操控（01 主设计 + 02 人工介入与窗口可视化 + 03 人工介入弹窗UI动态加载）
+- `docs/MCP_Web_Use/` — 浏览器操控（01 主设计 + 02 人工介入与窗口可视化 + 03 人工介入弹窗UI动态加载 + **04 网页取证纪律**）
 - `docs/MCP_Use/` — 通用 MCP 服务调用
 - `docs/浏览器CDP工具/` — CDP 技术参考（chromiumoxide 选型 / launch vs connect / BrowserManager 单例）
 

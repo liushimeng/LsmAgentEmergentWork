@@ -17,6 +17,10 @@ pub mod mcp_use_hint;
 /// Skill catalog 注入子模块(2026-09-23 第 126 轮,渐进式披露)。
 pub mod skill_catalog;
 
+/// 网页取证纪律提示词段(2026-10-08 第 131 轮,独立子模块防 mod.rs 超 1800 行)。
+/// 运行时兜底见 `crate::agent::safety::web_evidence`。
+pub mod web_evidence;
+
 /// 工具说明生成策略。
 #[derive(Clone)]
 pub enum ToolsHint {
@@ -248,13 +252,15 @@ impl SystemPrompt {
     /// CDP 三平台一致,无平台门控)。
     /// 2026-09-23 第 123 轮:追加 MCP_Use 使用说明(通用 MCP 服务调用,
     /// `LAEW_MCP_ENABLED=off` 时与工具注册同时归零)。
+    /// 2026-10-08 第 131 轮:追加网页取证纪律(禁止 Bash 顶替 MCP_Web_Use 探测任务目标站点)。
     pub fn sub_agent_work() -> Self {
         let prompt = Self::new(SUB_AGENT_BASE_PROMPT)
             .with_tools_hint(sub_agent_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, SUB_AGENT_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, SUB_AGENT_OPENAI_TAIL)
             .set_identity(SUB_AGENT_IDENTITY)
-            .append_base(MCP_WEB_USE_PROMPT_SECTION);
+            .append_base(MCP_WEB_USE_PROMPT_SECTION)
+            .append_base(web_evidence::WEB_EVIDENCE_PROMPT_SECTION);
         let prompt = if crate::agent::tools::mcp_use::mcp_use_enabled() {
             prompt.append_base(mcp_use_hint::MCP_USE_PROMPT_SECTION)
         } else {
@@ -640,9 +646,11 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 
 硬性约束:
 - **任务前提验证(2026-09-23 第 122 轮新规)**:拿到用户 prompt 第一轮不要直接出
-  JSON,先用 Bash / Read / Glob / Grep / MCP_Web_Use 验证任务前提(目标 URL 是否可
+  JSON,先用 Read / Glob / Grep / Bash(本地工程) / MCP_Web_Use 验证任务前提(目标 URL 是否可
   访问 / 目标文件是否存在 / 目标依赖是否已安装 / 目标网页入口与登录态)。
   前提不成立 → 输出空 workflows,让上层叙述失败 + 排查建议,不要硬拆。
+  ⚠️ 第 131 轮:**目标 URL 的连通性只能用 `MCP_Web_Use(action=open)` 验证**,
+  禁止用 `curl / ping / nc` 等 Bash 网络命令探测(会被网页取证纪律闸门直接拒绝)。
 - 禁止无 Thought 的盲调;禁止不读 Observation 就发下一批调用。
 - 同一工具 + 同一参数 + 同一结果**连续出现 2 次**,系统判定为无进展并警告;
   出现 3 次进入止损宽限轮;第 4 次直接终止本单元。需要等待外部状态变化时,用带
@@ -656,15 +664,16 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 - 第一轮:**TaskFocus** 阶段,让模型明确「我已经在拆哪一步了」。可用 TodoWrite
   把整份编排计划列出(顶层 todo list,3~6 个 todo),每完成一项 update 标记。
 - 第二轮~倒数第二轮:**Verify + Decompose** 阶段,基于 todo 顺序逐项验证
-  (Bash / Read / MCP_Web_Use 探查) + 拆解。
+  (Read / Glob / Bash 本地工程探查 / MCP_Web_Use 网页探查) + 拆解。
 - 最后一轮:**Emit** 阶段,基于 todo 进度输出最终 JSON。
 
 ---
 
 ## 任务前提验证清单(编排前必查)
 
-- [ ] 目标 URL 是否可访问(`curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5`
-      或 `MCP_Web_Use(action=open)` 验证连通性;返回 404/超时则说明上层,不要硬拆)
+- [ ] 目标 URL 是否可访问(**只用 `MCP_Web_Use(action=open)` 验证连通性**;第 131 轮起
+      禁止 `curl / ping / nc` 等 Bash 网络命令探测任务目标站点,会被硬闸门拒绝;
+      返回 404/超时则说明上层,不要硬拆,也不要换站点替代)
 - [ ] 目标文件 / 目录是否存在(`Glob` / `ls`)
 - [ ] 目标依赖是否已安装(`cat package.json` / `cat Cargo.toml`)
 - [ ] 目标项目是否在 git 仓库(`git rev-parse --is-inside-work-tree`)

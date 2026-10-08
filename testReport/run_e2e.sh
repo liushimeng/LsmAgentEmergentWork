@@ -2250,6 +2250,28 @@ else
   texpect "原文已保留(3 行" "tmux: 粘贴后即时回显原文预览"
   tkey C-u; sleep 0.3
 
+  # 14e) 粘贴内容「只显示一遍」(2026-10-08 第 131 轮):粘贴瞬间已回显前 4 行预览,
+  #      提交时若再全量回显一遍,8 行提示词在屏幕上连着出现两次,观感像「粘了两遍」。
+  #      现在提交只回显输入行 marker 形态 + 一行「已按原文完整发送 N 行 / M 字」。
+  #      mock LLM 不会真跑(该轮只验输入层回显),故用 /help 走一次提交即可。
+  PASTE_ONCE=$(printf 'ZZ标记第一行\nZZ标记第二行\nZZ标记第三行')
+  tsend "$(printf '\x1b[200~%s\x1b[201~' "$PASTE_ONCE")"
+  sleep 0.6
+  texpect "原文已保留(3 行" "tmux(131): 粘贴预览出现"
+  tkey Enter
+  sleep 0.8
+  texpect "已按原文完整发送 3 行" "tmux(131): 提交时标注完整发送行数"
+  # 关键断言:预览之外,提交回显不得再出现原文 —— 整个面板里每行原文只应出现 1 次
+  ONCE_OK=1
+  for i in 1 2 3; do
+    n=$(tscreen | grep -F -c -- "ZZ标记第${i}行" || true)
+    [ "${n:-0}" -le 1 ] || ONCE_OK=0
+  done
+  [ "$ONCE_OK" -eq 1 ] \
+    && check 0 "tmux(131): 粘贴原文全程只显示一遍(提交不重复回显)" \
+    || { check 1 "tmux(131): 粘贴原文全程只显示一遍(提交不重复回显)"; tscreen | sed 's/^/    | /'; }
+  tkey C-u; sleep 0.3
+
   # 15) /exit 退出 TUI(tmux 检测到子进程结束自动销毁会话)
   tsubmit "/exit"
   deadline=$((SECONDS + 5))

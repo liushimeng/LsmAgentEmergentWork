@@ -206,9 +206,35 @@ pub(super) fn map_human_assist_input(input: &str, options: &[String]) -> Option<
 
 // =================== 第 130 轮:弹窗前端通知行 / 事件打印 ===================
 
+/// 人工介入通知行的输出流(第 131 轮)。
+///
+/// TUI 交互模式走 stdout(滚动区);`-p` / `-f` 单轮模式的 **stdout 只含答案与用量**
+/// (见 `main.rs::run_one_shot` 的 stderr/stdout 分流约定),通知行必须走 stderr,
+/// 否则会把「等待人工介入」的噪声混进机器可读输出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistOut {
+    Stdout,
+    Stderr,
+}
+
+impl AssistOut {
+    fn write_line(self, s: &str) {
+        match self {
+            AssistOut::Stdout => println!("{s}"),
+            AssistOut::Stderr => eprintln!("{s}"),
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
 /// 弹窗接管通知行(第 130 轮):告诉用户「作答在弹窗,不在终端」,
 /// 并把时间轴三要素(提出/超时截止/剩余)摆到台面。**不读 stdin**。
-pub(super) fn print_human_assist_gui_notice(req: &HumanAssistDisplay, platform: &str) {
+pub fn print_human_assist_gui_notice(
+    req: &HumanAssistDisplay,
+    platform: &str,
+    out: AssistOut,
+) {
     use crate::agent::human_ui::fmt_local_ms;
     let started = if req.created_at_ms > 0 {
         // 只取时刻部分(去掉日期前缀,省列宽)
@@ -223,32 +249,32 @@ pub(super) fn print_human_assist_gui_notice(req: &HumanAssistDisplay, platform: 
     } else {
         "-".to_string()
     };
-    let mut out = String::new();
-    out.push_str(&format!(
-        "\n  [laew] 🖥 已弹出人工介入弹窗({platform}),请在弹窗中作答(点选项/输入文本/取消)\n"
+    if matches!(out, AssistOut::Stdout) {
+        println!();
+    }
+    out.write_line(&format!(
+        "  [laew] 🖥 已弹出人工介入弹窗({platform}),请在弹窗中作答(点选项/输入文本/取消)"
     ));
-    out.push_str(&format!(
-        "  [laew]   类型: {} | 提出 {} | 超时 {}(剩余 {}s)\n",
+    out.write_line(&format!(
+        "  [laew]   类型: {} | 提出 {} | 超时 {}(剩余 {}s)",
         human_assist_kind_label(&req.kind),
         started,
         deadline,
         req.timeout_ms / 1000
     ));
     if !req.url.is_empty() {
-        out.push_str(&format!(
-            "  [laew]   页面: {}\n",
+        out.write_line(&format!(
+            "  [laew]   页面: {}",
             pathfmt::elide_middle(&req.url, 72)
         ));
     }
-    out.push_str(
-        "  [laew]   (弹窗被遮挡会自动置顶拉焦;异常时可等自动降级为终端作答,或设 LAEW_HUMAN_UI=off)\n",
+    out.write_line(
+        "  [laew]   (弹窗被遮挡会自动置顶拉焦;异常时可等自动降级为终端作答,或设 LAEW_HUMAN_UI=off)",
     );
-    print!("{out}");
-    let _ = std::io::stdout().flush();
 }
 
 /// 弹窗生命周期事件 → 通知行(结果反馈;弹窗应答/取消/降级/超时)。
-pub(super) fn print_assist_event(ev: &AssistEvent) {
+pub fn print_assist_event(ev: &AssistEvent, out: AssistOut) {
     let line = match ev {
         AssistEvent::GuiLaunched { .. } => return, // 通知行由 print_human_assist_gui_notice 打
         AssistEvent::GuiFailed { id } => format!(
@@ -264,8 +290,7 @@ pub(super) fn print_assist_event(ev: &AssistEvent) {
             "  [laew] 人工介入弹窗等待超时,任务按超时路径继续".to_string()
         }
     };
-    println!("{line}");
-    let _ = std::io::stdout().flush();
+    out.write_line(&line);
 }
 
 #[cfg(test)]

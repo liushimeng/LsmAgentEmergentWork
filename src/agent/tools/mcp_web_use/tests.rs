@@ -641,3 +641,51 @@ async fn batch_missing_steps_returns_error() {
         "batch 缺 steps 应确定性报错: {res}"
     );
 }
+
+// =================== 第 131 轮:人工介入提示下沉到工具返回层 ===================
+
+#[test]
+fn human_assist_hint_字段完整且自描述() {
+    let h = super::human_assist_hint("captcha", "请人工输入验证码", &["继续", "取消"]);
+    assert_eq!(h["next_action"], "request_human");
+    let a = &h["human_assist"];
+    assert_eq!(a["ready"], true);
+    assert_eq!(a["reason"], "captcha");
+    assert_eq!(a["message"], "请人工输入验证码");
+    assert_eq!(a["options"][0], "继续");
+    // call 字段直接给出可复制的 MCP_Web_Use 调用形态,模型不必反查 schema
+    let call = a["call"].as_str().unwrap();
+    assert!(call.contains("control_action"), "{call}");
+    assert!(call.contains("request_human"), "{call}");
+    assert!(a["rule"].as_str().unwrap().contains("严禁伪造"));
+}
+
+#[test]
+fn ocr_报错时给出人工介入提示() {
+    let out = json!({"ocr_error": "OCR 失败:权限不足"});
+    let hint = super::ocr_unavailable_hint(&out).expect("ocr_error 应触发提示");
+    assert_eq!(hint["next_action"], "request_human");
+    assert_eq!(hint["human_assist"]["reason"], "captcha");
+}
+
+#[test]
+fn ocr_空文本同样视为不可用() {
+    // 验证码区域是噪声图时 OCR 常常返回空串,模型最容易在这时反复调参重试
+    let out = json!({"ocr_text": "   "});
+    assert!(super::ocr_unavailable_hint(&out).is_some(), "空文本应触发提示");
+}
+
+#[test]
+fn ocr_拿到文本时不打扰() {
+    let out = json!({"ocr_text": "8F3K", "ocr_block_count": 1});
+    assert!(super::ocr_unavailable_hint(&out).is_none(), "OCR 成功不应附 HITL 提示");
+}
+
+#[test]
+fn merge_hint_不覆盖已有字段() {
+    let mut out = json!({"ocr_error": "x", "next_action": "keep_me"});
+    let hint = super::human_assist_hint("captcha", "m", &["a"]);
+    super::merge_hint(&mut out, hint);
+    assert_eq!(out["next_action"], "keep_me", "已有字段不应被覆盖");
+    assert_eq!(out["human_assist"]["reason"], "captcha");
+}

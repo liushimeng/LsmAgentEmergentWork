@@ -295,12 +295,31 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             // 不必反查工具 schema / 文档。新增 reason 时本列表自动跟随常量更新。
             let allowed_reasons: Vec<&'static str> =
                 super::control::HUMAN_ASSIST_ALLOWED_REASONS.to_vec();
-            Ok(json!({
+            let mut out = json!({
                 "blockers": blockers,
                 "blocked": !blockers.is_empty(),
                 "suggested_action": if blockers.is_empty() { "continue" } else { "request_human" },
                 "available_reasons": allowed_reasons,
-            }))
+            });
+            // 第 131 轮:命中阻断时,把「下一步=request_human」的完整载荷(推荐 reason /
+            // message / options)一并挂上 —— 原先只有 `suggested_action` 一个裸字符串,
+            // 模型仍要自己去猜 reason 与提示文案。
+            if out["blocked"].as_bool() == Some(true) {
+                let kind = blockers
+                    .first()
+                    .and_then(|b| b.get("kind"))
+                    .and_then(Value::as_str)
+                    .filter(|k| super::control::HUMAN_ASSIST_ALLOWED_REASONS.contains(k))
+                    .unwrap_or("manual_verify")
+                    .to_string();
+                let hint = super::human_assist_hint(
+                    &kind,
+                    "页面存在人工阻断(见 data.blockers),请人工完成该步骤后继续",
+                    &["我已完成人工操作,继续", "取消任务"],
+                );
+                super::merge_hint(&mut out, hint);
+            }
+            Ok(out)
         }
         "page_meta" => {
             let url = page.url().await.ok().flatten().unwrap_or_default();

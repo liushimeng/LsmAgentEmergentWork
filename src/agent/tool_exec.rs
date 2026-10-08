@@ -72,6 +72,18 @@ impl Agent {
     ) -> ToolExec {
         // ★ 计时起点必须在 tool.execute() 之前(第 82 轮 P0-1)。
         let tool_call_started = std::time::Instant::now();
+        // 第 131 轮网页取证纪律:Bash 不得顶替 MCP_Web_Use 去探/抓任务目标站点。
+        // 放在 Schema 预校验之后、tool.execute() 之前(与 ToolNotFound 同层级的前置闸门)。
+        if let Some(denial) = self.check_web_evidence(name, &args) {
+            let elapsed_ms = tool_call_started.elapsed().as_millis() as u64;
+            return ToolExec {
+                output: denial,
+                is_error: true,
+                error_summary: "WebEvidence:禁止用 Bash 探测任务目标站点".to_string(),
+                elapsed_ms,
+                cancelled: false,
+            };
+        }
         let executed = match self.profile.tools.get(name) {
             Ok(tool) => {
                 // Schema 预校验(校验失败 → 返回错误,不执行工具)
@@ -138,6 +150,33 @@ impl Agent {
             // 取消:本条 + 本轮剩余未执行的 tool_use 由调用方 backfill 统一补全
             None => ToolExec::cancelled(elapsed_ms),
         }
+    }
+
+    /// 网页取证纪律前置闸门(第 131 轮,纯判定 + 无 IO)。
+    ///
+    /// 仅对 `Bash` 生效,且必须同时满足:开关未关 / 当前工具面含 `MCP_Web_Use`(有替代
+    /// 路径才拦)/ 命令命中网络取证模式 / 命令里的 host 落在任务锚点域内。命中返回拒绝
+    /// 文案(直接把模型推回 MCP_Web_Use),否则 `None` 放行。详见
+    /// `src/agent/safety/web_evidence.rs`。
+    fn check_web_evidence(&self, name: &str, args: &serde_json::Value) -> Option<String> {
+        if name != "Bash" || !crate::agent::safety::web_evidence::web_evidence_enabled() {
+            return None;
+        }
+        let cmd = args.get("command")?.as_str()?;
+        let has_web_use = self.profile.tools.names().iter().any(|n| *n == "MCP_Web_Use");
+        let anchor = crate::agent::safety::target_anchor::current_target_anchor();
+        let violation = crate::agent::safety::web_evidence::check_bash_against_web_evidence(
+            cmd,
+            anchor.as_ref(),
+            has_web_use,
+        )?;
+        warn!(
+            tool = name,
+            host = %violation.host,
+            command = %violation.command,
+            "网页取证纪律:拦截 Bash 对任务目标站点的网络探测"
+        );
+        Some(crate::agent::safety::web_evidence::denial_text(&violation))
     }
 
     /// 规划本轮 `tool_calls` 的并发批(第 120 轮)。

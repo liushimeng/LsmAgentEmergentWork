@@ -3,7 +3,7 @@
 //! 从 `src/tui/input.rs` 拆出的职责子模块(单文件 ≤1800 行规范,input.rs 达 2100+):
 //! - [`PasteRegistry`] —— 单次行编辑期间的粘贴登记簿(原文含换行完整保留,提交时展开);
 //! - [`handle_paste_text`] —— 粘贴统一入口:过滤 → 保真判定 → 直插(单行)或 marker;
-//! - [`plan_paste_preview`] / [`plan_submit_echo`] —— 纯函数回显排版(可单测,零 IO)。
+//! - [`plan_paste_preview`] / [`plan_submit_echo`] / [`plan_submit_echo_with_paste`] —— 纯函数回显排版(可单测,零 IO)。
 //!
 //! 参考:pi editor.ts handlePaste(>10 行或 >1000 字符转 marker,提交注入原文,L1573)
 //!      + claudecode inputPaste.ts(TRUNCATION_THRESHOLD=10000,首尾各 500 截断,L1448)
@@ -49,6 +49,12 @@ pub(crate) struct PasteRegistry {
     counter: usize,
     /// (marker, 完整原文)
     entries: Vec<(String, String)>,
+    /// 已登记但**未在滚动区回显过预览**的 marker 集合(第 131 轮)。
+    ///
+    /// 当前两个登记调用点(`input.rs` bracketed paste 与粘贴突发)都在登记后立刻打印
+    /// [`plan_paste_preview`],故正常路径下登记即预览;保留本字段是为「将来允许静默登记
+    /// (不打印预览)」留位,提交回显据此判断能否跳过全量重复。
+    unpreviewed: Vec<String>,
 }
 
 impl PasteRegistry {
@@ -56,6 +62,7 @@ impl PasteRegistry {
         Self {
             counter: 0,
             entries: Vec::new(),
+            unpreviewed: Vec::new(),
         }
     }
 
@@ -100,12 +107,32 @@ impl PasteRegistry {
             format!("[粘贴 #{} {} 字符]", self.counter, content.chars().count())
         };
         self.entries.push((marker.clone(), content));
+        // 先记为「未预览」,由调用点在打印预览后调 [`Self::mark_previewed`] 销去。
+        self.unpreviewed.push(marker.clone());
         marker
     }
 
     /// 最近一份登记的粘贴原文(供「粘贴即预览」回显用;不外露 `entries` 字段)。
     pub(crate) fn last_content(&self) -> String {
         self.entries.last().map(|(_, c)| c.clone()).unwrap_or_default()
+    }
+
+    /// 标记最近一份登记已回显过预览(登记调用点在打印 [`plan_paste_preview`] 后调用)。
+    pub(crate) fn mark_previewed(&mut self) {
+        if let Some((marker, _)) = self.entries.last() {
+            self.unpreviewed.retain(|m| m != marker);
+        }
+    }
+
+    /// 本次提交里是否发生过「已预览粘贴的展开」——
+    /// 决定提交回显是走**输入行 marker 版**(不重复全文,只打一行说明)
+    /// 还是走展开版全量回显(第 131 轮「粘贴只显示一遍」)。
+    pub(crate) fn expands_previewed_paste(&self, buffer: &str) -> bool {
+        self.entries.iter().any(|(marker, content)| {
+            buffer.contains(marker.as_str())
+                && !self.unpreviewed.iter().any(|m| m == marker)
+                && !content.is_empty()
+        })
     }
 
     /// 提交时展开:精确匹配 marker → 原文;单份 >10000 字符截断为
@@ -196,15 +223,12 @@ pub(crate) fn plan_paste_preview(marker: &str, content: &str, term_w: usize) -> 
     out
 }
 
-/// 提交回显行(纯函数,便于单测):首行 `prompt`(如 `>> `)前缀,其余源行 `.. ` 前缀,
-/// 按终端宽度折行(悬挂缩进 3 空格),视觉行超 [`SUBMIT_ECHO_MAX_LINES`] 时折叠并标注。
-///
-/// 关键:传入的是 **marker 展开版**(送进模型的原文),所以屏幕上看到的即模型看到的。
-/// 旧实现回显的是已把换行压成空格的 marker 版 buffer,多行提示词只剩一行。
-pub(crate) fn plan_submit_echo(prompt: &str, expanded: &str, term_w: usize) -> Vec<String> {
+/// 提交回显排版内核(纯函数):把 `text` 的每个源行按 `>> `/`.. ` 前缀 + 悬挂缩进折行,
+/// 视觉行超 [`SUBMIT_ECHO_MAX_LINES`] 时折叠并标注省略了多少**源行**。
+fn layout_submit_lines(prompt: &str, text: &str, term_w: usize) -> Vec<String> {
     let pfx_w = textfit::width(prompt).max(3);
     let inner = term_w.saturating_sub(pfx_w).max(12);
-    let src: Vec<&str> = expanded.split('\n').collect();
+    let src: Vec<&str> = text.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
     for (idx, line) in src.iter().enumerate() {
         let head = if idx == 0 { prompt.to_string() } else { ".. ".to_string() };
@@ -229,6 +253,42 @@ pub(crate) fn plan_submit_echo(prompt: &str, expanded: &str, term_w: usize) -> V
             src.len()
         ));
     }
+    out
+}
+
+/// 提交回显行(纯函数,便于单测):首行 `prompt`(如 `>> `)前缀,其余源行 `.. ` 前缀,
+/// 按终端宽度折行(悬挂缩进 3 空格),视觉行超 [`SUBMIT_ECHO_MAX_LINES`] 时折叠并标注。
+///
+/// 关键:传入的是 **marker 展开版**(送进模型的原文),所以屏幕上看到的即模型看到的。
+/// 旧实现回显的是已把换行压成空格的 marker 版 buffer,多行提示词只剩一行。
+pub(crate) fn plan_submit_echo(prompt: &str, expanded: &str, term_w: usize) -> Vec<String> {
+    layout_submit_lines(prompt, expanded, term_w)
+}
+
+/// 提交回显行(第 131 轮「粘贴只显示一遍」版)。
+///
+/// 粘贴保真路径上同一段原文会被打印两遍:粘贴瞬间的 [`plan_paste_preview`] 前 4 行预览
+/// + 提交时的全量展开回显。实测 8 行提示词在屏幕上连着出现两次,观感像「粘了两遍」。
+///
+/// 决策:**保留粘贴时的预览**(它是「我粘对了没」的即时反馈),提交时改为回显**输入行原样**
+/// (marker 形态)+ 一行「已按原文完整发送 N 行 / M 字」说明,不再重复全文。
+/// 纯键盘输入(无 marker 展开)路径完全不变,仍走 [`plan_submit_echo`] 全量回显。
+pub(crate) fn plan_submit_echo_with_paste(
+    prompt: &str,
+    buffer: &str,
+    expanded: &str,
+    term_w: usize,
+    skip_full_echo: bool,
+) -> Vec<String> {
+    if !skip_full_echo {
+        return plan_submit_echo(prompt, expanded, term_w);
+    }
+    let mut out = layout_submit_lines(prompt, buffer, term_w);
+    let src_lines = expanded.split('\n').count();
+    out.push(format!(
+        "   [粘贴原文已在粘贴时预览,此处不重复回显;已按原文完整发送 {src_lines} 行 / {} 字]",
+        expanded.chars().count()
+    ));
     out
 }
 
@@ -453,5 +513,97 @@ mod tests {
         assert_eq!(PasteRegistry::truncate_for_inject(s), s);
         let exact = "a".repeat(PASTE_TRUNCATE_CHARS);
         assert_eq!(PasteRegistry::truncate_for_inject(&exact), exact);
+    }
+
+    // ===== 第 131 轮:粘贴内容「只显示一遍」 =====
+
+    /// 复刻用户实测形态:8 行 Markdown 提示词粘贴 → 提交时不得再全量回显一遍。
+    #[test]
+    fn 粘贴预览后提交不重复回显原文() {
+        let mut reg = PasteRegistry::new();
+        let text = (1..=8).map(|i| format!("第{i}行内容")).collect::<Vec<_>>().join("\n");
+        let marker = match handle_paste_text(&text, &mut reg) {
+            PasteInsert::Marker(m) => m,
+            PasteInsert::Inline(_) => panic!("8 行粘贴应转 marker"),
+        };
+        reg.mark_previewed(); // 调用点打印预览后登记
+        let expanded = reg.expand(&marker);
+        let skip = reg.expands_previewed_paste(&marker);
+
+        let out = plan_submit_echo_with_paste(">> ", &marker, &expanded, 80, skip);
+        // 输入行 marker 形态照常回显,让用户看见提交的是什么
+        assert_eq!(out[0], format!(">> {marker}"));
+        // 8 行原文一个都不再出现
+        for i in 1..=8 {
+            assert!(
+                !out.iter().any(|l| l.contains(&format!("第{i}行内容"))),
+                "第{i}行不应在提交回显里重复出现:\n{out:?}"
+            );
+        }
+        // 末尾一行说明「已完整发送」,标明行数/字数
+        let tail = out.last().unwrap();
+        assert!(tail.contains("已按原文完整发送 8 行"), "{tail}");
+        assert!(tail.contains("/ 47 字"), "{tail}");
+    }
+
+    #[test]
+    fn 纯键盘输入提交仍全量回显() {
+        // 无粘贴 → skip_full_echo=false → 与 plan_submit_echo 逐行一致
+        let text = "第一行\n第二行\n第三行";
+        let out = plan_submit_echo_with_paste(">> ", text, text, 80, false);
+        assert_eq!(out, plan_submit_echo(">> ", text, 80));
+        assert_eq!(out[0], ">> 第一行");
+        assert_eq!(out[2], ".. 第三行");
+        assert!(!out.iter().any(|l| l.contains("已按原文完整发送")));
+    }
+
+    #[test]
+    fn 粘贴加手写文字时手写部分照常回显() {
+        let mut reg = PasteRegistry::new();
+        let text = "第一行\n第二行";
+        let marker = match handle_paste_text(text, &mut reg) {
+            PasteInsert::Marker(m) => m,
+            PasteInsert::Inline(_) => panic!("应转 marker"),
+        };
+        reg.mark_previewed();
+        let buffer = format!("帮我看看 {marker} 谢谢");
+        let expanded = reg.expand(&buffer);
+        let skip = reg.expands_previewed_paste(&buffer);
+        assert!(skip, "buffer 含已预览 marker → 应跳过全量回显");
+
+        let out = plan_submit_echo_with_paste(">> ", &buffer, &expanded, 80, skip);
+        let joined = out.join("\n");
+        assert!(joined.contains("帮我看看"), "手写前半段应保留:{joined}");
+        assert!(joined.contains("谢谢"), "手写后半段应保留:{joined}");
+        assert!(!joined.contains("第一行"), "粘贴原文不重复:{joined}");
+    }
+
+    #[test]
+    fn 未预览的登记仍走全量回显() {
+        // 登记后未调用 mark_previewed(为将来的静默登记路径留的兜底)
+        let mut reg = PasteRegistry::new();
+        let marker = reg.register("x\ny".to_string());
+        let buffer = marker.clone();
+        let expanded = reg.expand(&buffer);
+        assert!(!reg.expands_previewed_paste(&buffer), "未预览不应跳过");
+        let out = plan_submit_echo_with_paste(">> ", &buffer, &expanded, 80, false);
+        assert_eq!(out, plan_submit_echo(">> ", &expanded, 80));
+        assert!(out.iter().any(|l| l.contains("x")));
+    }
+
+    #[test]
+    fn 粘贴回显仍受视觉行上限约束() {
+        let mut reg = PasteRegistry::new();
+        let text = (1..=40).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let marker = match handle_paste_text(&text, &mut reg) {
+            PasteInsert::Marker(m) => m,
+            PasteInsert::Inline(_) => panic!("应转 marker"),
+        };
+        reg.mark_previewed();
+        let expanded = reg.expand(&marker);
+        let out = plan_submit_echo_with_paste(">> ", &marker, &expanded, 100, true);
+        // 1 行 marker 回显 + 1 行说明,marker 版 buffer 本身很短,不应触发折叠
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out.iter().all(|l| textfit::width(l) <= 100));
     }
 }
