@@ -52,6 +52,10 @@ url = "2.5"
 chromiumoxide = "0.9"
 futures = "0.3"
 
+# 人工介入弹窗(第 137 轮):Windows 侧 PNG 解码重采样(macos 下另有 Vision OCR 用途);
+# 自 macos-only 依赖提升为全平台
+image = "0.25"
+
 # build.rs 跨平台时间格式化(第 90 轮:修复 Windows 上 Command::new("date") 失败
 # 导致 LAEW_BUILD_TIME 退化为 unix:xxx 的问题)。time 已在本 crate 出现,
 # 在 [build-dependencies] 复用同一 crate,不增加新下载。
@@ -80,6 +84,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_GdiPlus",
     "Win32_Storage_FileSystem",
     "Win32_System_WindowsProgramming",
+    # 第 137 轮:人工介入弹窗(Win32 原生)取模块句柄
+    "Win32_System_LibraryLoader",
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage",
@@ -96,7 +102,6 @@ windows = { version = "0.58", features = [
 core-foundation = "0.9"
 # 2026-09-17 第 74 轮:macOS Vision OCR + CGWindow 原生截图
 core-graphics = "0.23"
-image = "0.25"
 foreign-types = "0.5"
 axuielement = { version = "0.9", optional = true }
 

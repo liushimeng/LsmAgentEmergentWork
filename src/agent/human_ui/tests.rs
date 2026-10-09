@@ -1,5 +1,5 @@
-//! human_ui 纯函数与脚本查找序单测(不触达真实弹窗进程/Hub)。
-//! 设计见 docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md §9。
+//! human_ui 纯函数与弹窗子进程链路单测(不触达真实弹窗窗口/Hub)。
+//! 设计见 `docs/MCP_Web_Use/03-人工介入弹窗原生UI方案.md` §10。
 
 use super::*;
 use crate::agent::human_assist::HumanAssistDisplay;
@@ -32,7 +32,7 @@ fn payload_json_roundtrip() {
     assert_eq!(p["timeout_ms"], 120_000);
     assert_eq!(p["started_at_ms"], 1_759_991_525_000i64);
     assert_eq!(p["options"][0], "我已完成人工操作,继续");
-    // 时间轴三要素齐备:提出时间 / 超时截止(已等待与剩余由脚本动态刷新)
+    // 时间轴三要素齐备:提出时间 / 超时截止(已等待与剩余由弹窗动态刷新)
     let started = p["started_at"].as_str().expect("started_at");
     let deadline = p["deadline_at"].as_str().expect("deadline_at");
     assert!(started.len() >= 19, "started_at 应为 YYYY-MM-DD HH:MM:SS: {started}");
@@ -42,12 +42,12 @@ fn payload_json_roundtrip() {
 
 #[test]
 fn payload_image_path_roundtrip_and_empty_default() {
-    // 第 132 轮:image_path 透传到弹窗 payload(空串 = 无图,旧脚本忽略该字段)
+    // 第 132 轮:image_path 透传到弹窗 payload(空串 = 无图)
     let mut d = sample_display();
     d.image_path = "/tmp/laew_hitl_captcha_1.png".into();
     let p = build_payload(&d);
     assert_eq!(p["image_path"], "/tmp/laew_hitl_captcha_1.png");
-    // 默认空串也必须是字符串字段(而非 null),JXA/PowerShell 端按 falsy 处理
+    // 默认空串也必须是字符串字段(而非 null),弹窗端按无图处理
     let empty = build_payload(&sample_display());
     assert_eq!(empty["image_path"], "");
 }
@@ -80,8 +80,8 @@ fn parse_result_answer_cancel_timeout_error() {
     assert_eq!(parse_result("{\"status\":\"cancel\"}"), UiResult::Cancelled);
     assert_eq!(parse_result("{\"status\":\"timeout\",\"text\":\"\"}"), UiResult::Timeout);
     assert_eq!(
-        parse_result("{\"status\":\"error\",\"text\":\"脚本坏了\"}"),
-        UiResult::Error("脚本坏了".into())
+        parse_result("{\"status\":\"error\",\"text\":\"弹窗坏了\"}"),
+        UiResult::Error("弹窗坏了".into())
     );
     // 空应答视为错误(不静默变成「已完成」)
     assert_eq!(
@@ -92,7 +92,7 @@ fn parse_result_answer_cancel_timeout_error() {
 
 #[test]
 fn parse_result_tolerates_noise_and_unknown() {
-    // 前面有 osascript 噪声行,取最后一个合法 JSON
+    // 前面有噪声行,取最后一个合法 JSON
     let noisy = "2026-10-08 12:00:00 notice\n{\"status\":\"answer\",\"text\":\"ok\"}\n";
     assert_eq!(parse_result(noisy), UiResult::Answered("ok".into()));
     // 完全无法解析 → Error(降级 TUI,不 panic)
@@ -119,67 +119,6 @@ fn enabled_test_override_and_env_off() {
 }
 
 #[test]
-fn script_env_override_missing_file_is_strict_error() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    std::env::set_var("LAEW_HUMAN_UI_SCRIPT", "/nonexistent/laew_ui.js");
-    let r = resolve_script();
-    std::env::remove_var("LAEW_HUMAN_UI_SCRIPT");
-    assert!(r.is_err(), "显式脚本缺失应报错(不静默回落内置)");
-}
-
-#[test]
-fn script_env_override_takes_precedence() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let dir = std::env::temp_dir().join(format!("laew_ui_test_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("custom.js");
-    std::fs::write(&file, "// custom\nfunction run(a){ return '{}'; }").unwrap();
-    std::env::set_var("LAEW_HUMAN_UI_SCRIPT", &file);
-    let r = resolve_script().expect("应加载显式脚本");
-    std::env::remove_var("LAEW_HUMAN_UI_SCRIPT");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.origin, ScriptOrigin::Path(file));
-    assert!(r.body.contains("custom"));
-}
-
-#[test]
-fn script_falls_back_to_embedded_when_no_override() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    std::env::remove_var("LAEW_HUMAN_UI_SCRIPT");
-    let r = resolve_script().expect("内置兜底必成功");
-    // 本机可能存在用户覆盖文件,故只断言「有正文 + 来源合法」
-    assert!(!r.body.is_empty(), "脚本正文不应为空");
-    match &r.origin {
-        ScriptOrigin::Embedded => {
-            // 内置脚本必须包含结果契约关键字
-            // 第 132 轮:macOS 弹窗已由 NSAlert+runModal 重写为自绘 NSWindow
-            //(可选中复制 / first responder / 定时器 / 验证码图片),断言同步更新。
-            #[cfg(target_os = "macos")]
-            assert!(r.body.contains("NSWindow"), "内置 JXA 应含自绘 NSWindow");
-            #[cfg(target_os = "windows")]
-            assert!(r.body.contains("Windows.Forms"), "内置 PS 应含 WinForms");
-        }
-        ScriptOrigin::Path(p) => assert!(p.is_file()),
-    }
-}
-
-#[test]
-fn materialize_embedded_writes_and_cleans_temp() {
-    let resolved = ResolvedScript {
-        origin: ScriptOrigin::Embedded,
-        body: "// test".into(),
-    };
-    let path;
-    {
-        let m = resolved.materialize().expect("落盘成功");
-        assert!(m.path.is_file());
-        path = m.path.clone();
-        assert!(m.owned);
-    }
-    assert!(!path.exists(), "Drop 后临时脚本应清理");
-}
-
-#[test]
 fn test_backend_is_used_by_present() {
     // 全局钩子:串行
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -195,34 +134,59 @@ fn test_backend_is_used_by_present() {
     assert_eq!(out, UiResult::Answered("1. stub".into()));
 }
 
-/// 真实子进程链路(stub 脚本经 LAEW_HUMAN_UI_SCRIPT 动态加载,不起真弹窗):
-/// 覆盖「脚本查找序 env 优先 + 进程 spawn + stdout JSON 解析」全链。
-#[cfg(target_os = "macos")]
+/// 真实子进程链路(第 137 轮:`LAEW_HITL_DIALOG_EXE` 指向打印结果 JSON 的假
+/// 可执行文件,不起真弹窗):覆盖「exe 定位 + spawn + stdout JSON 解析」全链。
+#[cfg(unix)]
 #[test]
-fn present_runs_env_script_stub_process() {
+fn present_spawns_dialog_process_with_env_exe() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_test_backend(None);
     let dir = std::env::temp_dir().join(format!("laew_ui_proc_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let script = dir.join("stub.js");
-    std::fs::write(&script, "function run(a){ return '{\"status\":\"answer\",\"text\":\"654321\"}'; }")
-        .unwrap();
-    std::env::set_var("LAEW_HUMAN_UI_SCRIPT", &script);
+    let exe = dir.join("fake-dialog.sh");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\n# 假弹窗:忽略参数,打印结果 JSON\necho '{\"status\":\"answer\",\"text\":\"654321\"}'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("LAEW_HITL_DIALOG_EXE", &exe);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let out = rt.block_on(present(&sample_display()));
-    std::env::remove_var("LAEW_HUMAN_UI_SCRIPT");
+    std::env::remove_var("LAEW_HITL_DIALOG_EXE");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(out, UiResult::Answered("654321".into()));
 }
 
-/// 真弹窗冒烟(需 macOS 桌面会话;人工/半自动验证):弹窗真实弹出 4 秒后由
-/// 代码 respond 收口(弹窗进程被回收)。默认跳过,显式 `-- --ignored` 运行。
-#[cfg(target_os = "macos")]
+/// `LAEW_HITL_DIALOG_EXE` 指向不存在的文件:严格报错(不静默回落,便于排障)。
+#[test]
+fn env_exe_missing_is_strict_error() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_test_backend(None);
+    std::env::set_var("LAEW_HITL_DIALOG_EXE", "/nonexistent/laew-dialog");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let out = rt.block_on(present(&sample_display()));
+    std::env::remove_var("LAEW_HITL_DIALOG_EXE");
+    assert!(
+        matches!(out, UiResult::Error(ref e) if e.contains("LAEW_HITL_DIALOG_EXE")),
+        "unexpected: {out:?}"
+    );
+}
+
+/// 真弹窗冒烟(需 macOS/Windows 桌面会话;人工/半自动验证):弹窗真实弹出 4 秒后由
+/// 代码 respond 收口(弹窗子进程被 kill_on_drop 回收)。默认跳过,显式 `-- --ignored` 运行。
+/// 注意:经 `cargo test` 运行时 `current_exe()` 是 test harness,需先
+/// `LAEW_HITL_DIALOG_EXE=$PWD/laew ./rebuild_restart_app.sh` 后带 env 跑本用例。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[tokio::test]
-#[ignore = "需桌面会话,手动冒烟: cargo test --lib smoke_real_dialog -- --ignored"]
+#[ignore = "需桌面会话,手动冒烟: LAEW_HITL_DIALOG_EXE=./laew cargo test --lib smoke_real_dialog -- --ignored"]
 async fn smoke_real_dialog_popup() {
     use crate::agent::human_assist::{AssistVia, HumanAssistHub};
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());

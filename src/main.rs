@@ -151,6 +151,14 @@ enum Cmd {
         /// launch 模式的一次性 user-data-dir。
         user_data_dir: std::path::PathBuf,
     },
+
+    /// 内部隐藏子命令：人工介入(HITL)原生弹窗子进程（第 137 轮），由 human_ui
+    /// 在桌面会话 spawn；macOS AppKit FFI / Windows Win32。禁止手工调用。
+    #[command(name = "__hitl-dialog", hide = true)]
+    HitlDialog {
+        /// payload JSON 临时文件路径。
+        payload: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1106,6 +1114,13 @@ async fn main() -> Result<()> {
         return lsm_agent::agent::browser_watchdog::run(*browser_pid, user_data_dir).await;
     }
 
+    // 弹窗子进程同样走最小启动路径（第 137 轮）：读 payload → 原生弹窗 → stdout
+    // 打印结果 JSON 后退出。同步阻塞（AppKit/Win32 事件循环）,不走 tokio。
+    if let Some(Cmd::HitlDialog { payload }) = &cli.cmd {
+        let code = lsm_agent::agent::human_ui::dialog_main::run(payload);
+        std::process::exit(code);
+    }
+
     // TUI 模式下 INFO 级日志会与对话内容交错打印,造成视觉混乱 + 闪烁。
     // 单轮 / -debug / provider 子命令场景不受影响,沿用 RUST_LOG 默认行为。
     // 关联报告: 2026-09-09_07 F-007-1
@@ -1217,6 +1232,7 @@ async fn main() -> Result<()> {
             Some(Cmd::Mcp(c)) => cmd_mcp(c).await,
             // 已在 main 初始化前返回；此分支仅为穷尽性匹配。
             Some(Cmd::BrowserWatchdog { .. }) => unreachable!("watchdog returned before setup"),
+            Some(Cmd::HitlDialog { .. }) => unreachable!("hitl-dialog returned before setup"),
             None => {
                 // 纯函数斜杠命令前置检测(/diff 等不依赖 LLM 的命令在 -p 模式也可直接执行)
                 if let Some(prompt) = &cli.prompt {

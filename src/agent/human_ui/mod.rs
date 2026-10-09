@@ -1,19 +1,29 @@
 //! 人工介入(HITL)桌面弹窗 UI 呈现层 —— macOS/Windows 弹窗优先,TUI 兜底。
 //!
-//! 设计见 `docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md`(2026-10-08 第 130 轮)。
+//! 设计见 `docs/MCP_Web_Use/03-人工介入弹窗原生UI方案.md`(2026-10-09 第 137 轮全量重构)。
 //!
 //! 职责边界:本模块只负责「把 [`HumanAssistDisplay`] 呈现给人 + 把人的应答收敛为
 //! [`UiResult`]」,pending 槽位 / oneshot / 超时 / 四态结局全部仍在
 //! [`crate::agent::human_assist::HumanAssistHub`] —— 弹窗与 TUI 是两个可互换的前端。
 //!
+//! 原生实现(第 137 轮):弹窗本体是 **`laew __hitl-dialog <payload.json>` 子进程**
+//! (与 `__browser-watchdog` 隐藏子命令同构),macOS 走 AppKit FFI(`macos_dialog.rs`)、
+//! Windows 走 Win32(`windows_dialog.rs`),js/ps1 脚本层已删除。子进程隔离的理由:
+//! AppKit 要求事件循环在进程主线程(laew 主线程被 tokio/TUI 占用)、FFI 崩溃只死弹窗、
+//! `kill_on_drop` 杀进程即关窗(回收语义与脚本时代完全一致)。
+//!
 //! 三层降级链(fail-open,任何一级失败都不阻断任务主流程):
-//! 1. 平台弹窗(macOS JXA / Windows PowerShell WinForms,脚本运行时动态加载);
+//! 1. 平台原生弹窗(`laew __hitl-dialog` 子进程,kill_on_drop);
 //! 2. TUI 行读(`human_assist::mark_gui_failed` 后由 dispatch 协程接管);
 //! 3. 均不可用 → 既有 4001 Unavailable 语义。
 //!
 //! 环境变量:
 //! - `LAEW_HUMAN_UI`:`off/0/false/no/tty` 关闭弹窗(强制 TUI);缺省自动;
-//! - `LAEW_HUMAN_UI_SCRIPT`:显式指定弹窗脚本路径(企业定制/调试)。
+//! - `LAEW_HITL_DIALOG_EXE`:覆盖弹窗子进程可执行文件(测试/特殊部署,
+//!   对齐 `LAEW_BROWSER_WATCHDOG_EXE`)。
+//!
+//! 历史口径:第 130~134 轮的脚本动态加载机制(`LAEW_HUMAN_UI_SCRIPT`、
+//! `.laew/human_ui/` 两级覆盖)已废止,设置不再生效也不报错(详见 03 文档 §8)。
 
 use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::Mutex;
@@ -22,14 +32,15 @@ use serde_json::{json, Value};
 
 use super::human_assist::{kind_label, HumanAssistDisplay};
 
-mod script;
-#[cfg(test)]
-pub(crate) use script::{resolve_script, ResolvedScript, ScriptOrigin};
+/// 隐藏子命令名:原生弹窗进程入口(`laew __hitl-dialog <payload.json>`)。
+pub const HITL_DIALOG_COMMAND: &str = "__hitl-dialog";
+
+pub mod dialog_main;
 
 #[cfg(target_os = "macos")]
-mod macos;
+mod macos_dialog;
 #[cfg(target_os = "windows")]
-mod windows;
+mod windows_dialog;
 
 #[cfg(test)]
 mod tests;
@@ -43,7 +54,7 @@ pub enum UiResult {
     Cancelled,
     /// 弹窗倒计时归零自灭。
     Timeout,
-    /// 脚本/进程级失败(调用方降级 TUI)。
+    /// 弹窗进程级失败(调用方降级 TUI)。
     Error(String),
 }
 
@@ -92,7 +103,11 @@ fn lock_backend() -> std::sync::MutexGuard<'static, Option<fn(&HumanAssistDispla
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 弹窗呈现是否可用(桌面平台 + 解释器存在 + 总开关未关)。
+/// 弹窗呈现是否可用(桌面平台 + 总开关未关)。
+///
+/// 第 137 轮:不再探测外部解释器(osascript/powershell)—— 弹窗是 `laew` 自身的
+/// 原生子进程,可执行文件必然存在;真正「无桌面会话」(SSH 等)场景由子进程启动
+/// 失败 → Error → 降级链兜底。
 ///
 /// 单测构建(`cfg(test)`)下默认关闭,避免单测误弹真窗;需要弹窗路径的测试
 /// 用 [`set_test_override`] / [`set_test_backend`] 显式打开。
@@ -111,7 +126,7 @@ pub fn enabled() -> bool {
     ) {
         return false;
     }
-    platform_supported() && interpreter_available()
+    platform_supported()
 }
 
 fn platform_supported() -> bool {
@@ -136,7 +151,7 @@ fn disabled_reason() -> &'static str {
     if !platform_supported() {
         return "当前平台不支持桌面弹窗(仅 macOS / Windows)";
     }
-    "弹窗解释器缺失(macOS: /usr/bin/osascript;Windows: powershell.exe)"
+    "弹窗子进程启动失败(可能是无桌面会话,如 SSH);失败会自动降级终端作答"
 }
 
 /// 弹窗能力诊断(第 131 轮):随 `request_human` 的 4001 信封回传,便于排障。
@@ -145,39 +160,16 @@ pub fn diagnostics() -> Value {
         "gui_enabled": enabled(),
         "platform": platform_name(),
         "reason_hint": if enabled() { "弹窗可用" } else { disabled_reason() },
-        "env_switch": "LAEW_HUMAN_UI=off 关闭弹窗强制走终端;LAEW_HUMAN_UI_SCRIPT=<path> 自定义脚本",
-    })
-}
-
-/// 平台脚本解释器是否就位(macOS osascript / Windows powershell)。
-/// 探测失败按「就位」保守处理 —— 真启动失败会走降级链,不会比禁用更糟。
-fn interpreter_available() -> bool {
-    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OK.get_or_init(|| {
-        #[cfg(target_os = "macos")]
-        {
-            std::path::Path::new("/usr/bin/osascript").exists()
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-            let ps = std::path::PathBuf::from(sys_root)
-                .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-            ps.exists()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            false
-        }
+        "env_switch": "LAEW_HUMAN_UI=off 关闭弹窗强制走终端;第 137 轮起弹窗为原生实现,旧脚本覆盖(LAEW_HUMAN_UI_SCRIPT/.laew/human_ui)已废止",
     })
 }
 
 // ---------- payload 构建(纯函数,可单测) ----------
 
-/// display → 弹窗 payload(两平台脚本共用同一契约,见设计文档 §4.3)。
+/// display → 弹窗 payload(弹窗子进程契约,见 03 文档 §5)。
 ///
-/// 第 132 轮新增 `image_path`(验证码等阻断现场的截图;空串 = 无图,脚本端
-/// 对空串/缺省字段按无图处理,向后兼容旧自定义脚本)。
+/// 第 132 轮新增 `image_path`(验证码等阻断现场的截图;空串 = 无图,弹窗端
+/// 对空串/缺省字段按无图处理)。
 pub fn build_payload(display: &HumanAssistDisplay) -> Value {
     let now_ms = display.created_at_ms;
     json!({
@@ -219,7 +211,7 @@ pub fn fmt_local_ms(ms: u64) -> String {
 
 // ---------- 弹窗结果解析(纯函数,可单测) ----------
 
-/// 弹窗脚本 stdout → [`UiResult`](容错:取最后一个含 `status` 的 JSON 行)。
+/// 弹窗子进程 stdout → [`UiResult`](容错:取最后一个含 `status` 的 JSON 行)。
 pub fn parse_result(stdout: &str) -> UiResult {
     for line in stdout.lines().rev() {
         let t = line.trim();
@@ -244,7 +236,7 @@ pub fn parse_result(stdout: &str) -> UiResult {
             "cancel" => UiResult::Cancelled,
             "timeout" => UiResult::Timeout,
             "error" => UiResult::Error(if text.is_empty() {
-                "弹窗脚本报错".into()
+                "弹窗进程报错".into()
             } else {
                 text
             }),
@@ -257,41 +249,26 @@ pub fn parse_result(stdout: &str) -> UiResult {
 
 // ---------- 呈现入口 ----------
 
-/// 弹出人工介入弹窗并等待应答(进程化;未来可被 drop → kill_on_drop 回收)。
+/// 弹出人工介入弹窗并等待应答(原生子进程;drop 即 kill,窗口随之回收)。
 ///
-/// 测试构建下若设置了 [`set_test_backend`] 则走 stub;否则走平台后端。
+/// 测试构建下若设置了 [`set_test_backend`] 则走 stub;否则 spawn
+/// `laew __hitl-dialog <payload.json>`(第 137 轮:macOS AppKit FFI / Windows Win32)。
 /// 任何失败以 [`UiResult::Error`] 返回,调用方降级 TUI,不 panic。
 pub async fn present(display: &HumanAssistDisplay) -> UiResult {
     if let Some(backend) = *lock_backend() {
         return backend(display);
     }
     let payload = build_payload(display);
-    let resolved = match script::resolve_script() {
-        Ok(r) => r,
-        Err(e) => return UiResult::Error(e),
-    };
-    let payload_path = match script::write_payload(&payload, display.id) {
+    let payload_path = match write_payload(&payload, display.id) {
         Ok(p) => p,
         Err(e) => return UiResult::Error(e),
     };
-    // 第 136 轮:payload 临时文件改用 RAII 守卫清理(与 `MaterializedScript` 同构)。
-    //
-    // 原实现是「`run_platform(...).await` 之后才 remove_file」。而 `present_via_gui`
-    // 在超时/取消路径上会**直接 drop 整个 future**,`await` 之后的代码根本不执行 ——
-    // 每弹一次超时或取消,`/tmp/laew_human_ui_payload_{pid}_{id}.json` 就漏一个,
-    // 长跑会持续堆积(用户反馈「好多进程没关」的同类观感问题)。
-    // Drop 守卫在**任何**退出路径(正常 / 提前 drop / panic unwind)都会清理。
+    // payload 临时文件 RAII 守卫(第 136 轮):`present_via_gui` 在超时/取消路径上
+    // 会直接 drop 整个 future,`await` 之后的清理代码不执行 —— Drop 守卫在任何
+    // 退出路径(正常 / 提前 drop / panic unwind)都会清理。
     let payload_guard = PayloadFileGuard(Some(payload_path.clone()));
-    let materialized = match resolved.materialize() {
-        Ok(m) => m,
-        Err(e) => {
-            drop(payload_guard);
-            return UiResult::Error(e);
-        }
-    };
-    let res = run_platform(&materialized.path, &payload_path).await;
+    let res = run_dialog_process(&payload_path).await;
     drop(payload_guard);
-    drop(materialized); // 内置脚本的临时文件在此清理
     res
 }
 
@@ -306,30 +283,29 @@ impl Drop for PayloadFileGuard {
     }
 }
 
-/// 平台分发:macOS osascript(JXA)/ Windows powershell(WinForms)。
-#[allow(unused_variables)]
-async fn run_platform(script_path: &std::path::Path, payload_path: &std::path::Path) -> UiResult {
-    #[cfg(target_os = "macos")]
-    {
-        macos::run(script_path, payload_path).await
+/// 弹窗子进程可执行文件:测试钩子 `LAEW_HITL_DIALOG_EXE` 优先,缺省 `current_exe()`。
+fn dialog_exe() -> Result<std::path::PathBuf, String> {
+    if let Some(explicit) = std::env::var_os("LAEW_HITL_DIALOG_EXE") {
+        let p = std::path::PathBuf::from(explicit);
+        if p.is_file() {
+            return Ok(p);
+        }
+        return Err(format!("LAEW_HITL_DIALOG_EXE 指向的文件不存在: {}", p.display()));
     }
-    #[cfg(target_os = "windows")]
-    {
-        windows::run(script_path, payload_path).await
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = (script_path, payload_path);
-        UiResult::Error("当前平台不支持桌面弹窗".into())
-    }
+    std::env::current_exe().map_err(|e| format!("定位 laew 可执行文件失败: {e}"))
 }
 
-/// 通用子进程等待:进程化执行脚本并收集 stdout(kill_on_drop 保证被 drop 即回收)。
-pub(super) async fn run_script_process(
-    program: &str,
-    args: &[std::ffi::OsString],
-) -> UiResult {
-    match tokio::process::Command::new(program)
+/// 启动原生弹窗子进程并等待应答(kill_on_drop 保证被 drop 即回收,窗口消失)。
+async fn run_dialog_process(payload_path: &std::path::Path) -> UiResult {
+    let exe = match dialog_exe() {
+        Ok(p) => p,
+        Err(e) => return UiResult::Error(e),
+    };
+    let args: Vec<std::ffi::OsString> = vec![
+        HITL_DIALOG_COMMAND.into(),
+        payload_path.as_os_str().to_owned(),
+    ];
+    match tokio::process::Command::new(exe)
         .args(args)
         .kill_on_drop(true)
         .output()
@@ -339,10 +315,22 @@ pub(super) async fn run_script_process(
         Ok(out) => {
             let stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
             UiResult::Error(format!(
-                "弹窗脚本退出码 {}: {stderr}",
+                "弹窗子进程退出码 {}: {stderr}",
                 out.status.code().unwrap_or(-1)
             ))
         }
-        Err(e) => UiResult::Error(format!("弹窗进程启动失败: {e}")),
+        Err(e) => UiResult::Error(format!("弹窗子进程启动失败: {e}")),
     }
+}
+
+/// payload JSON 落盘到临时文件(弹窗子进程入参;调用方负责删除)。
+pub fn write_payload(payload: &Value, id: u64) -> Result<std::path::PathBuf, String> {
+    let path = std::env::temp_dir().join(format!(
+        "laew_human_ui_payload_{}_{}.json",
+        std::process::id(),
+        id
+    ));
+    let body = serde_json::to_string(payload).map_err(|e| format!("payload 序列化失败: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("payload 落盘失败 {}: {e}", path.display()))?;
+    Ok(path)
 }
