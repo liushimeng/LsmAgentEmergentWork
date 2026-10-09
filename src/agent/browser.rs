@@ -115,6 +115,8 @@ struct BrowserInner {
     mode: BrowserMode,
     /// Agent 高亮蓝框是否启用(headed 可视化场景标识 Agent 控制的窗口)。
     highlight: bool,
+    /// 可视化蒙层是否启用(第 141 轮:headed 下人工可看不可点,防交叉操作)。
+    overlay: bool,
 }
 
 /// 浏览器会话管理器(进程内单例)。
@@ -296,6 +298,7 @@ impl BrowserManager {
                         user_data_dir: None,
                         mode: BrowserMode::Hidden,
                         highlight: true,
+                        overlay: super::browser_overlay::overlay_default_from_env(),
                     }),
                 })
             })
@@ -320,6 +323,7 @@ impl BrowserManager {
     /// 嵌入式模式,默认无可见窗口,解决"误开 macOS 系统默认浏览器"问题。
     /// 2026-09-20 第 100 轮:`window_size` 支持自定义启动窗口(headed 默认 1920×1080
     /// 1080p);`highlight` 控制 Agent 高亮蓝框注入(headed 可视化标识)。
+    /// 2026-10-09 第 141 轮:`overlay` 控制可视化蒙层注入(headed 下人工可看不可点)。
     #[allow(clippy::too_many_arguments)]
     pub async fn new_page(
         &self,
@@ -329,6 +333,7 @@ impl BrowserManager {
         user_agent: Option<&str>,
         window_size: Option<(u32, u32)>,
         highlight: bool,
+        overlay: bool,
     ) -> chromiumoxide::error::Result<(String, String, String)> {
         let mut inner = self.inner.lock().await;
         let mut launch_dir: Option<PathBuf> = None;
@@ -454,6 +459,9 @@ impl BrowserManager {
             inner.user_data_dir = launch_dir.clone();
             inner.mode = mode;
             inner.highlight = highlight;
+            // 第 141 轮:蒙层期望态(仅 headed 生效;hidden 无窗口无人工,注入无意义
+            // 且污染 DOM,跳过 —— 与高亮蓝框同款门控)。
+            inner.overlay = overlay;
             // 第 78 轮:标记浏览器已启动,供 cleanup_sync() 快速判断避免无意义创建 Runtime。
             browser_started_flag::set_started();
             // 第 127 轮:同步清理登记(仅 launch 模式 —— 拥有浏览器进程所有权才登记;
@@ -501,6 +509,12 @@ impl BrowserManager {
             inner.highlight && matches!(inner.mode, BrowserMode::Headed);
         if want_highlight {
             inject_agent_highlight(&page).await;
+        }
+        // 第 141 轮:可视化蒙层 + 输入拦截(headed 才生效;两层见 browser_overlay 模块)。
+        // 注意与高亮相互独立:highlight=false 也能带蒙层,overlay=false 也能带蓝框。
+        if inner.overlay && matches!(inner.mode, BrowserMode::Headed) {
+            super::browser_overlay::inject_agent_overlay(&page, true).await;
+            let _ = super::browser_overlay::apply_page_overlay(&page, true).await;
         }
 
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
@@ -862,6 +876,39 @@ impl BrowserManager {
         }))
     }
 
+    /// 蒙层是否处于激活态(第 141 轮):实例期望态开启 **且** 浏览器为 headed。
+    ///
+    /// 供 control 层决定「输入动作先解后锁 / 截图避让 / request_human 解锁」是否
+    /// 需要动 CDP;未激活时这些路径零开销(不多发任何 CDP 往返)。
+    pub async fn overlay_active(&self) -> bool {
+        let inner = self.inner.lock().await;
+        inner.overlay && matches!(inner.mode, BrowserMode::Headed)
+    }
+
+    /// 运行时开关可视化蒙层(第 141 轮,镜像 `set_highlight` 语义):
+    /// 更新实例期望态 + 对指定 page 应用(CDP 输入拦截 + JS 视觉蒙层双层同开同关)。
+    pub async fn set_overlay(
+        &self,
+        page_id: &str,
+        enabled: bool,
+    ) -> std::result::Result<Value, String> {
+        let page = self
+            .page(page_id)
+            .await
+            .ok_or_else(|| "page_id 不存在".to_string())?;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.overlay = enabled;
+        }
+        let applied = super::browser_overlay::apply_page_overlay(&page, enabled).await?;
+        Ok(json!({
+            "enabled": enabled,
+            "input_locked": applied["input_locked"],
+            "visual_mask": applied["visual_mask"],
+            "note": "双层开关:输入拦截(CDP setIgnoreInputEvents)+ 视觉蒙层(JS);仅 headed 生效",
+        }))
+    }
+
     /// 通过页面触发一次下载,并等待 Browser 域事件给出最终落盘路径。
     ///
     /// 设计要点:
@@ -1108,6 +1155,11 @@ impl BrowserManager {
             if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
                 inject_agent_highlight(&page).await;
             }
+            // 第 141 轮:蒙层同理,派生新标签页按实例期望态注入 + 加锁。
+            if inner.overlay && matches!(inner.mode, BrowserMode::Headed) {
+                super::browser_overlay::inject_agent_overlay(&page, true).await;
+                let _ = super::browser_overlay::apply_page_overlay(&page, true).await;
+            }
             let id = new_page_id();
             inner.pages.insert(
                 id.clone(),
@@ -1211,6 +1263,7 @@ impl BrowserManager {
         inner.connect_mode = false;
         inner.mode = BrowserMode::Hidden;
         inner.highlight = true;
+        inner.overlay = super::browser_overlay::overlay_default_from_env();
     }
 
     /// 同步清理入口(供 atexit / panic hook / signal handler 调用)。

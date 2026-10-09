@@ -167,6 +167,22 @@ pub async fn capture_hitl_screenshot(
 ) -> std::result::Result<(String, &'static str, Option<ClipRect>), String> {
     let page = ensure_page(id).await?;
 
+    // 第 141 轮:蒙层避让 —— HITL 附图不能带 22% 遮罩与提示条(人工读验证码
+    // 会被干扰)。request_human(unlock_page=true)路径此时已解锁隐藏,这里是
+    // unlock_page=false 时该通道仍干净的兜底;只动视觉层,不动输入锁。
+    let mask_hidden = crate::agent::browser::BrowserManager::global().overlay_active().await
+        && crate::agent::browser_overlay::mask_set_visible(&page, false).await;
+    let r = capture_hitl_screenshot_inner(&page).await;
+    if mask_hidden {
+        let _ = crate::agent::browser_overlay::mask_set_visible(&page, true).await;
+    }
+    r
+}
+
+/// 实际采集(元素裁剪优先,视口兜底)。
+async fn capture_hitl_screenshot_inner(
+    page: &chromiumoxide::Page,
+) -> std::result::Result<(String, &'static str, Option<ClipRect>), String> {
     // ① 元素裁剪通道：探测 bbox → clip 截图
     let viewport = eval_js_string(
         &page,

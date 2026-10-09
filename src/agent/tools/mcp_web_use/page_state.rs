@@ -147,7 +147,7 @@ pub(super) fn build_js(
     // 探测:扫出 window 上所有 __ 前缀键名 + 一层结构,让模型不必先猜名字
     let window_globals = [];
     if (PROBE) {{
-      const names = Object.getOwnPropertyNames(window).filter(n => /^__|^initialState$|^_app/i.test(n));
+      const names = Object.getOwnPropertyNames(window).filter(n => /^__|^initialState$|^_app/i.test(n) && !/^__laew/.test(n));
       for (const n of names.slice(0, 40)) {{
         let shape = null;
         try {{

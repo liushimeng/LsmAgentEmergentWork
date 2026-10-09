@@ -149,11 +149,12 @@ fn parameters_control_action_enum_complete() {
         "set_cookie", "delete_cookie", "set_storage", "clear_storage", "set_viewport",
         "screenshot", "heartbeat",
         "drag", "focus", "blur", "mouse_move", "dispatch_event",
-        "set_window", "sync_viewport", "set_highlight", "request_human",
+        "set_window", "sync_viewport", "set_highlight", "set_overlay", "request_human",
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
-    assert_eq!(names.len(), 39, "control_action 应为 39 个,实际 {names:?}");
+    // 第 141 轮:set_overlay(蒙层运行时开关)使枚举 39 → 40
+    assert_eq!(names.len(), 40, "control_action 应为 40 个,实际 {names:?}");
 }
 
 #[test]
@@ -1067,4 +1068,55 @@ fn dump_generated_js() {
     let mut f2 = std::fs::File::create("/tmp/laew_page_state_gen.js").unwrap();
     writeln!(f2, "{}", page_state::build_js(&["__NEXT_DATA__".into()], true, 20000, 8, 200)).unwrap();
     eprintln!("written");
+}
+
+// =================== 第 141 轮:蒙层全链路真浏览器验证(#[ignore],本地 --ignored 跑) ===================
+//
+// 与 browser_overlay.rs 的集成测试互补:那条验证「驱动层双层原语」,本条验证
+// 「工具层完整链路」—— open(默认 overlay=on,本机 Aqua 会话 → headed)注入蒙层
+// 并加锁后,control(click) 必须经「先解后锁」包装照常生效(而非被 setIgnoreInputEvents
+// 吃掉),且响应回报 overlay.enabled=true。
+// 跑法:`cargo test --lib real_browser_tool_overlay -- --ignored --nocapture`(需本机 Chrome)。
+#[tokio::test]
+#[ignore = "需要本机真实 Chrome(会弹有头窗口);本地手动跑"]
+async fn real_browser_tool_overlay_end_to_end() {
+    let url = "data:text/html,<button id='b' onclick='this.dataset.c=(+this.dataset.c||0)+1' \
+               style='position:fixed;left:0;top:0;width:200px;height:100px'>x</button>";
+    // ① open:不传 overlay → 缺省随 LAEW_WEB_OVERLAY(默认开)+ 本机 GUI → headed
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url, "window_width": 800, "window_height": 600}))
+        .await
+        .expect("open 失败(本机是否装有 Chrome?)");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], 0, "open 应成功:{out}");
+    assert_eq!(v["data"]["mode"], "headed", "本机 GUI 会话应为 headed:{out}");
+    assert_eq!(v["data"]["overlay"]["enabled"], true, "蒙层应默认开启:{out}");
+    let pid = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    // ② 蒙层锁定下 control(click) 应照常生效(先解后锁包装)
+    let click = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "click",
+                        "params": {"selector": "#b"}}))
+        .await
+        .unwrap();
+    let c: Value = serde_json::from_str(&click).unwrap();
+    assert_eq!(c["code"], 0, "蒙层锁定下 click 应经先解后锁照常生效:{click}");
+
+    // ③ 点击真实生效(计数=1)且蒙层元素仍在(锁定未被误关)
+    let check = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "eval_js",
+                        "params": {"expression":
+                            "JSON.stringify({c:+document.getElementById('b').dataset.c||0, m:!!document.getElementById('__laew_overlay__')})"}}))
+        .await
+        .unwrap();
+    let e: Value = serde_json::from_str(&check).unwrap();
+    let payload: Value =
+        serde_json::from_str(e["data"]["result"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+    assert_eq!(payload["c"], 1, "点击应真实生效:{check}");
+    assert_eq!(payload["m"], true, "蒙层元素应仍存在(复锁不误删):{check}");
+
+    // ④ 收口:关闭全部页面回收浏览器(全局单例,防污染其它测试)
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
 }

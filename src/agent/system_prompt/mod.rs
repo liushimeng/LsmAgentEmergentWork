@@ -1391,6 +1391,10 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,另有「📋 复制」一键复制全部信息。当前实例
     是无头而任务需要可视化时,需先 close(page_id="all") 回收再以 mode=headed 重开;
     合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
+    **提问期间页面自动解锁(第 141 轮)**:headed+蒙层激活时 request_human 默认
+    unlock_page=true —— 提问前自动解除页面锁定(蒙层隐藏),人工可直接在页面上
+    拖滑块/扫码/填表;应答/超时/取消后自动复锁。纯问答场景(如「确认继续?」)
+    可传 unlock_page=false 保持锁定。
     **超时推荐**(第 118 轮):不传 timeout_ms 时由工具按 reason 分档默认超时——
     captcha/sms/two_factor 默认 120_000(2 分钟,短文本回 TUI);qr_login/real_name/oauth/
     login/manual_verify/custom 默认 300_000(5 分钟,扫码/刷脸/账密登录需要更长)。
@@ -1417,7 +1421,15 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     hidden,响应 data.mode 是真实值,以它为准)。启动窗口默认 1920×1080(1080p),
     window_width/window_height 可自定义;页面四周的蓝色选中边框+
     「LAEW Agent 控制中」徽标是 Agent 窗口标识,方便人工识别,不要尝试移除(可用
-    set_highlight 关闭)。人工手动拖动窗口大小后,control(sync_viewport) 让视口自适应
+    set_highlight 关闭)。**页面蒙层与人工操作拦截(第 141 轮)**:headed 下页面默认
+    覆盖半透明蒙层(左下角「🔒 页面已锁定(仅观看)」提示条)并锁定人工输入——人工
+    可实时观看页面变化但不可点击/操作,防人工与 Agent 交叉操作;这是设计行为,
+    不是页面故障,不要尝试移除蒙层;Agent 自己的 click/input 等输入动作会自动
+    「先解后锁」,无须关心;截图/OCR 自动隐藏蒙层,证据不受影响;需要人工直接操作
+    页面(拖滑块/扫码/登录)时走 request_human(默认 unlock_page=true:提问期间自动
+    解锁页面,人工应答/超时/取消后自动复锁;纯问答可传 unlock_page=false);运行时
+    开关 control(set_overlay, enabled);仅 headed 生效,hidden 无蒙层。
+    人工手动拖动窗口大小后,control(sync_viewport) 让视口自适应
     窗口(渲染不缺区域);运行时调窗口用 control(set_window, width/height/window_state)。
     浏览器实例已存在时 open 永远复用同一进程(browser_reused:true),不要为换模式反复
     重建浏览器。
