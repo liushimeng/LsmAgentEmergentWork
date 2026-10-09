@@ -1285,7 +1285,7 @@ GRACE = "无进展止损宽限轮"
 # 止损后 QC 判 Fail → 单元级局部重试 + 档位级重试会**重放整条链**,所以总数是
 # 4 × 尝试次数(实测 9 次尝试 = 36 次请求),不是 4。断言按「每 4 个一组」校验:
 # 若守卫失效,每次尝试会跑满 32 轮 → 组数与软提醒数对不上,且总数暴涨。
-groups, nudges = len(sub) // 4, sum(1 for b in sub if NUDGE in system_of(b))
+groups, nudges = len(sub) // 4, sum(1 for b in sub if NUDGE in all_text(b))
 chk(len(sub) >= 4, f"SubAgent 至少跑完一次尝试(实际 {len(sub)} 次请求)")
 chk(len(sub) % 4 == 0, f"每次尝试恰好 4 轮止损(总请求数应为 4 的倍数,实际 {len(sub)})")
 chk(nudges == groups and groups > 0,
@@ -1293,11 +1293,13 @@ chk(nudges == groups and groups > 0,
 chk(len(sub) <= 4 * 12, f"总请求数未暴涨(守卫失效会跑满 32 轮/尝试,实际 {len(sub)})")
 if len(sub) >= 4:
     # 首次尝试的逐轮结构(提醒分级送达 + 配对安全)
-    chk(NUDGE not in system_of(sub[0]), "轮 1 不该有无进展软提醒(首次出现该动作)")
-    chk(NUDGE not in system_of(sub[1]), "轮 2 刚判定重复,提醒在**下一轮**才注入")
-    chk(NUDGE in system_of(sub[2]), "轮 3 system 含无进展软提醒(经 RUNTIME_HINTS 送达)")
-    chk("LAEW:RUNTIME_HINTS" in system_of(sub[2]),
-        "软提醒包裹在 <<<LAEW:RUNTIME_HINTS>>> 标记内(不破坏 cache 前缀)")
+    # 第 140 轮:runtime hints 改走消息流末尾尾注(meta.runtime_tail)保 prompt cache
+    # 前缀稳定,断言从 system 改查全量 wire 文本(system + messages)。
+    chk(NUDGE not in all_text(sub[0]), "轮 1 不该有无进展软提醒(首次出现该动作)")
+    chk(NUDGE not in all_text(sub[1]), "轮 2 刚判定重复,提醒在**下一轮**才注入")
+    chk(NUDGE in all_text(sub[2]), "轮 3 请求含无进展软提醒(经 RUNTIME_HINTS 尾注送达)")
+    chk("LAEW:RUNTIME_HINTS" in all_text(sub[2]),
+        "软提醒包裹在 <<<LAEW:RUNTIME_HINTS>>> 标记内(与用户提示词严格隔离)")
     # 宽限轮强提醒必须作为 **user 消息**出现在轮 4(且只能在 tool_result 全部回填之后,
     # 否则会破坏 assistant tool_use ↔ tool_result 配对被 Provider 400)
     chk(GRACE in all_text(sub[3]), "轮 4 含宽限轮强提醒(user 消息,保证送达 LLM)")
@@ -1339,9 +1341,12 @@ def system_of(body):
     return s if isinstance(s, str) else ""
 sub = [r["body"] for r in reqs if "LsmAgentEmergentWork-SubAgent-Work" in system_of(r["body"])]
 NUDGE = "重复同一动作不会产生新信息"
+def all_text(body):
+    """请求体全文(system + messages)——第 140 轮 hints 走消息尾注,查全量。"""
+    return system_of(body) + "\n" + json.dumps(body.get("messages", []), ensure_ascii=False)
 chk(len(sub) > 4, f"守卫关闭后不再 4 轮止损(实际 {len(sub)} 次,由 no_text_converge/max_iterations 兜底)")
-chk(all(NUDGE not in system_of(b) for b in sub),
-    "守卫关闭后 system 不再出现无进展软提醒(LAEW_REACT_GUARD=off 真的生效)")
+chk(all(NUDGE not in all_text(b) for b in sub),
+    "守卫关闭后请求不再出现无进展软提醒(LAEW_REACT_GUARD=off 真的生效)")
 # 注:弱信号 `doom_loop:Nx` 仍会出现(守卫关闭只停「干预」,不停「统计」),
 # 所以这里断言的是**没有真的止损**(early_terminate_reason 不含 doom_loop_no_progress)。
 chk(not any("doom_loop_no_progress" in json.dumps(r["body"], ensure_ascii=False) for r in reqs),

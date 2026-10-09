@@ -286,11 +286,13 @@ async fn doom_loop_stops_before_burning_budget() {
     );
 }
 
-/// 前 N 轮返回互不相同的 Bash 调用(避开 doom_loop)、之后返回终答,并捕获每轮 system。
+/// 前 N 轮返回互不相同的 Bash 调用(避开 doom_loop)、之后返回终答,并捕获每轮
+/// system 与 `meta.runtime_tail`(第 140 轮:hints 移到尾注,system 应逐轮稳定)。
 struct SystemCaptureLlm {
     calls: std::sync::atomic::AtomicUsize,
     tool_rounds: usize,
     seen_system: std::sync::Mutex<Vec<String>>,
+    seen_tail: std::sync::Mutex<Vec<Option<String>>>,
 }
 #[async_trait::async_trait]
 impl crate::llm::LlmClient for SystemCaptureLlm {
@@ -299,13 +301,17 @@ impl crate::llm::LlmClient for SystemCaptureLlm {
         system: &str,
         _messages: &[ChatMessage],
         _tools: &[crate::llm::ToolDef],
-        _meta: &RequestMeta,
+        meta: &RequestMeta,
     ) -> Result<Completion> {
         let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.seen_system
             .lock()
             .expect("system capture")
             .push(system.to_string());
+        self.seen_tail
+            .lock()
+            .expect("tail capture")
+            .push(meta.runtime_tail.clone());
         if n < self.tool_rounds {
             Ok(Completion {
                 text: String::new(),
@@ -338,6 +344,7 @@ async fn subagent_system_gets_progress_thought_and_deadline_hints() {
         calls: std::sync::atomic::AtomicUsize::new(0),
         tool_rounds: 3,
         seen_system: std::sync::Mutex::new(Vec::new()),
+        seen_tail: std::sync::Mutex::new(Vec::new()),
     });
     let agent = Agent::new(cap.clone(), AgentProfile::sub_agent_work_profile())
         .with_max_iterations(4);
@@ -346,58 +353,93 @@ async fn subagent_system_gets_progress_thought_and_deadline_hints() {
     agent.run_session(&mut session).await.unwrap();
 
     let seen = cap.seen_system.lock().expect("system capture");
+    let tails = cap.seen_tail.lock().expect("tail capture");
     assert!(seen.len() >= 3, "应至少 3 轮 LLM 调用,实际 {}", seen.len());
+
+    // ④ 第 140 轮缓存修复的回归锁:system 必须逐轮逐字节稳定(hints 全部走 runtime_tail),
+    //    否则 prompt cache 前缀每轮断链(实测 cache_read 塌到 188)。
+    assert!(
+        seen.iter().all(|s| s == &seen[0]),
+        "system 应逐轮稳定(易变 hints 已移 runtime_tail),实际出现变化"
+    );
 
     // ① 第 1 轮(iter=0):预算未过半、无静默轮、非倒数第二轮 → 三类 hint 都不该出现。
     // 注:收口预告的断言锚点用「迭代预算即将耗尽」而非「【收口提示】」—— 后者也出现在
     // SubAgent-Work 基础提示词的 ReAct 节里(向模型解释该标记的含义),会假阳性。
-    assert!(!seen[0].contains("【进度】"), "首轮不该有进度 hint");
-    assert!(
-        !seen[0].contains("迭代预算即将耗尽"),
-        "首轮不该有收口预告"
-    );
-    assert!(
-        !seen[0].contains("只发工具调用"),
-        "首轮不该有 Thought 提醒"
-    );
+    let tail0 = tails[0].clone().unwrap_or_default();
+    assert!(!tail0.contains("【进度】"), "首轮不该有进度 hint");
+    assert!(!tail0.contains("迭代预算即将耗尽"), "首轮不该有收口预告");
+    assert!(!tail0.contains("只发工具调用"), "首轮不该有 Thought 提醒");
 
-    // ② iter=1:预算过半(iterations=2,max=4)→ 进度 hint 出现
+    // ② iter=1:预算过半(iterations=2,max=4)→ 进度 hint 出现(在尾注里)
+    let tail1 = tails[1].clone().unwrap_or_default();
     assert!(
-        seen[1].contains("【进度】"),
-        "预算过半应注入进度 hint,实际 system 尾部: {}",
-        &seen[1][seen[1].len().saturating_sub(400)..]
+        tail1.contains("【进度】"),
+        "预算过半应注入进度 hint,实际尾注: {tail1}"
     );
 
     // ③ iter=2:连续 2 轮「仅 tool_use 无文本」→ Thought 提醒;
     //    且 iter+2==max → 通用收口预告(此前只有 Yolo 有)
+    let tail2 = tails[2].clone().unwrap_or_default();
     assert!(
-        seen[2].contains("只发工具调用"),
+        tail2.contains("只发工具调用"),
         "连续 2 轮静默应提醒补写 Thought"
     );
-    assert!(
-        seen[2].contains("Thought"),
-        "Thought 提醒应点名 ReAct 三段"
-    );
+    assert!(tail2.contains("Thought"), "Thought 提醒应点名 ReAct 三段");
     // 锚点取收口预告独有的整句(「expected_output」也出现在基础提示词的输出格式节,
     // 单独断言它会假阳性)。
     assert!(
-        seen[2].contains("迭代预算即将耗尽(下一轮为最终轮)。请立即停止新动作"),
-        "无 emit 通道的执行层也应收到收口预告,实际尾部: {}",
-        &seen[2][seen[2].len().saturating_sub(500)..]
+        tail2.contains("迭代预算即将耗尽(下一轮为最终轮)。请立即停止新动作"),
+        "无 emit 通道的执行层也应收到收口预告,实际尾注: {tail2}"
     );
     assert!(
-        seen[2].contains("实际产出与 expected_output 的对应关系"),
+        tail2.contains("实际产出与 expected_output 的对应关系"),
         "执行层收口预告应要求对齐 expected_output"
     );
     assert!(
-        !seen[2].contains("submit_task_classification"),
+        !tail2.contains("submit_task_classification"),
         "执行层无 emit 通道,收口预告不得提 Yolo 的提交工具"
     );
-    // hint 必须落在 system 末尾的 RUNTIME_HINTS 标记块内(不破坏 cache 前缀)
+    // hint 必须落在尾注的 RUNTIME_HINTS 标记块内(与用户提示词严格隔离)
     assert!(
-        seen[2].contains("<<<LAEW:RUNTIME_HINTS>>>"),
+        tail2.contains("<<<LAEW:RUNTIME_HINTS>>>"),
         "hint 应包裹在 RUNTIME_HINTS 标记内"
     );
+    // hints 不得泄漏回 system
+    assert!(
+        !seen[2].contains("<<<LAEW:RUNTIME_HINTS>>>"),
+        "hints 不应出现在 system 里(会破坏缓存前缀)"
+    );
+}
+
+#[tokio::test]
+async fn budget_urge_hint_fires_from_75_percent() {
+    // 第 140 轮:75% 预算起每 2 轮注入轻量收口提醒(max=8 → iter=5 满足
+    // (iter+1)*4>=max*3 且 (iter+1)%2==0),对 24~32 轮长预算提前收口。
+    let cap = std::sync::Arc::new(SystemCaptureLlm {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        tool_rounds: 6,
+        seen_system: std::sync::Mutex::new(Vec::new()),
+        seen_tail: std::sync::Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(cap.clone(), AgentProfile::sub_agent_work_profile())
+        .with_max_iterations(8);
+    let mut session = Session::new();
+    session.context_mut().push(ChatMessage::user("跑"));
+    let _ = agent.run_session(&mut session).await;
+    let tails = cap.seen_tail.lock().expect("tail capture");
+    assert!(tails.len() >= 6, "应至少 6 轮,实际 {}", tails.len());
+    // iter=5(第 6 轮):75% 档轻量提醒
+    let t5 = tails[5].clone().unwrap_or_default();
+    assert!(
+        t5.contains("【预算提醒】"),
+        "iter=5(max=8)应注入 75% 预算提醒,实际尾注: {t5}"
+    );
+    // iter=4 尚未到 75% 的偶数轮((4+1)%2=1),不该有
+    let t4 = tails[4].clone().unwrap_or_default();
+    assert!(!t4.contains("【预算提醒】"), "iter=4 不该触发 75% 提醒");
+    // iter=0 附近零噪音
+    assert!(!tails[0].clone().unwrap_or_default().contains("【预算提醒】"));
 }
 
 #[tokio::test]
@@ -407,22 +449,26 @@ async fn yolo_deadline_hint_still_names_emit_tool() {
         calls: std::sync::atomic::AtomicUsize::new(0),
         tool_rounds: 3,
         seen_system: std::sync::Mutex::new(Vec::new()),
+        seen_tail: std::sync::Mutex::new(Vec::new()),
     });
     let agent = Agent::new(cap.clone(), AgentProfile::yolo_profile()).with_max_iterations(4);
     let mut session = Session::new();
     session.context_mut().push(ChatMessage::user("分类"));
     let _ = agent.run_session(&mut session).await;
     let seen = cap.seen_system.lock().expect("system capture");
+    let tails = cap.seen_tail.lock().expect("tail capture");
     assert!(seen.len() >= 3);
+    // system 逐轮稳定(hints 已走 runtime_tail,见 subagent 测试④)
+    assert!(seen.iter().all(|s| s == &seen[0]), "system 应逐轮稳定");
+    let tail2 = tails[2].clone().unwrap_or_default();
     // 锚点取 Yolo 版收口预告独有的整句:Yolo 基础提示词本身就多处提到
     // submit_task_classification,单独断言工具名会假阳性。
     assert!(
-        seen[2].contains("迭代预算即将耗尽(下一轮为最终轮,系统将强制要求提交"),
-        "Yolo 收口预告应保持第 119 轮文案(指名强制提交 emit),实际尾部: {}",
-        &seen[2][seen[2].len().saturating_sub(500)..]
+        tail2.contains("迭代预算即将耗尽(下一轮为最终轮,系统将强制要求提交"),
+        "Yolo 收口预告应保持第 119 轮文案(指名强制提交 emit),实际尾注: {tail2}"
     );
     assert!(
-        !seen[2].contains("实际产出与 expected_output 的对应关系"),
+        !tail2.contains("实际产出与 expected_output 的对应关系"),
         "Yolo 不应收到执行层版收口文案"
     );
 }

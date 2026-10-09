@@ -467,7 +467,49 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         other => return envelope(1001, "未知 info", json!({"info": other})),
     };
     match res {
-        Ok(data) => envelope(0, "ok", data),
+        Ok(data) => envelope(0, "ok", gate_payload(data)),
         Err(e) => envelope(2002, &e, json!({})),
+    }
+}
+
+/// inspect 返回体体积闸门(第 140 轮提速优化)。
+///
+/// `eval_sanitize` 的 20KB 闸门只作用于 `control(eval_js)`,inspect 各维度
+/// (`dom(selector)` 的 outerHTML / storage / cookies 等)在此前直接把超大返回体
+/// 灌进 LLM 上下文 —— 实测任务 avg_in=39K/次的输入膨胀来源之一,拖慢每一次
+/// 后续 LLM 往返。两段闸门:先逐字符串裁剪,整体仍超限则降级为摘要。
+const INSPECT_BYTE_LIMIT: usize = 24 * 1024;
+const INSPECT_STR_LIMIT: usize = 8 * 1024;
+
+pub(super) fn gate_payload(v: Value) -> Value {
+    let mut v = v;
+    cap_strings(&mut v, INSPECT_STR_LIMIT);
+    let bytes = serde_json::to_vec(&v).map(|b| b.len()).unwrap_or(0);
+    if bytes <= INSPECT_BYTE_LIMIT {
+        return v;
+    }
+    // 整体降级:保留可辨识摘要,显式告知被裁(模型可换 selector / extract 重取)
+    let preview = crate::logging::clip_for_log(&v.to_string(), 2000);
+    json!({
+        "truncated": true,
+        "original_bytes": bytes,
+        "hint": "inspect 返回体超过 24KB 已裁剪;请缩小 selector 范围 / 用 max_depth、limit 分段,或改用 inspect(info=extract) 结构化抽取",
+        "preview": preview,
+    })
+}
+
+/// 递归裁剪超长字符串(标记原长,保留头 8K)。
+pub(super) fn cap_strings(v: &mut Value, max_chars: usize) {
+    match v {
+        Value::String(s) => {
+            if s.chars().count() > max_chars {
+                let total = s.chars().count();
+                let head: String = s.chars().take(max_chars).collect();
+                *s = format!("{head}…(截断,共 {total} 字符)");
+            }
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(|x| cap_strings(x, max_chars)),
+        Value::Object(map) => map.values_mut().for_each(|x| cap_strings(x, max_chars)),
+        _ => {}
     }
 }

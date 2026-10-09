@@ -105,8 +105,9 @@ impl Agent {
         // Anthropic 三段式 segments(第 121 轮,2026-09-23):
         // 把 SystemPrompt 拆为 billing + identity + rules 三段(billing/identity 静态常量,
         // rules = base + tools + protocol_tail),wire 层在 system 字段拼装 3 个 text block,
-        // identity / rules 各带 cache_control: ephemeral —— billing 头变化概率极低,
-        // identity 身份声明每次会话固定,rules 可能因 runtime hints 拼接而逐轮变化。
+        // identity / rules 各带 cache_control: ephemeral —— 三段全部静态常量。
+        // ★第 140 轮:runtime hints 移出 system(走 meta.runtime_tail 消息尾注),
+        // rules 块逐字节稳定,prompt cache 前缀不再被逐轮变化摧毁。
         // OpenAI 协议忽略该字段,继续用 `system: &str` 单字符串路径(零回归)。
         meta.anthropic_segments = Some(self.profile.system_prompt.prompt_segments());
         // 结构化输出强制通道(L6/L19 + 2026-09-22 Yolo ReAct 延迟强制):
@@ -228,8 +229,13 @@ impl Agent {
                 _ => None,
             };
             // runtime hints 拼接(2026-09-09 第 09 轮,联动 L771 失败计数预警):
-            // 仅在对应计数器 > 0 时追加,全 0 时返回空串,不影响 LLM 上下文;
-            // 拼到 system 末尾,不破坏 cache_control 缓存前缀。
+            // 仅在对应计数器 > 0 时追加,全 0 时返回空串,不影响 LLM 上下文。
+            // ★第 140 轮:runtime hints 不再拼进 system —— system 块是 cache_control
+            // 缓存断点,块内逐轮变化会摧毁 identity 之后的全部缓存前缀(rules/tools/
+            // 消息历史,实测 46/172 次 cache_read 仅 188)。易变 hints 改走
+            // `meta.runtime_tail`,由 wire 层拼到消息流末尾,system 前缀逐字节稳定。
+            // workspace_hint 是准静态 brief(进程级 TTL 缓存,任务内鲜变)仍留 system,
+            // 保持 D4「8 角色 system brief」既有 wire 契约。
             let base_system = self.profile.system_prompt.render(self.llm.protocol());
             // 工作区运行时快照(2026-09-13 第 01 轮,D4):让**执行层** Agent
             // (SubAgent-Work / Main-Work / Plan)也拿到工程类型、工具链、git 状态、
@@ -242,6 +248,9 @@ impl Agent {
             // - 无 emit 通道(SubAgent-Work / Main-Work / Plan / WorkFlow):提示立即停止
             //   新动作、基于已有 Observation 输出终答 —— 此前执行层闷头跑满
             //   max_iterations 后被硬杀,模型全程不知道预算快没了(D6)。
+            // ★第 140 轮:预告提前 —— 75% 预算起每 2 轮注入一次轻量收口提醒,
+            // 与倒数第二轮的强预告形成两档。实测 wf-7 跑满 32 轮被硬杀 + 局部重试
+            // 又花 110s:一次性预告对 24~32 轮预算来得太晚,模型收不住手。
             let deadline_hint: Option<&'static str> = if iter + 2 == self.max_iterations {
                 if self.profile.defer_emit_force
                     && self.profile.emit_tool.is_some()
@@ -261,13 +270,24 @@ impl Agent {
                 } else {
                     None
                 }
+            } else if self.max_iterations >= 4
+                && (iter + 1) * 4 >= self.max_iterations * 3
+                && (iter + 1) % 2 == 0
+            {
+                Some(
+                    "【预算提醒】迭代预算已消耗 3/4 以上。若 expected_output 的关键部分已有着落,\
+                     请优先收口输出终答;仅当仍有硬性缺口时才继续,且下一步只做最关键的一件事。",
+                )
             } else {
                 None
             };
             // runtime hints 拼接(2026-09-09 第 09 轮,联动 L771 失败计数预警;
             // 第 120 轮扩展为角色化 + ReAct 进度 / Thought / 收口 / 无进展提醒):
-            // 仅在对应信号非零时追加,全空时返回空串,不影响 LLM 上下文;
-            // 拼到 system 末尾,不破坏 cache_control 缓存前缀。
+            // 仅在对应信号非零时追加,全空时返回空串,不影响 LLM 上下文。
+            // ★第 140 轮:runtime_hints 逐轮变化,走 `meta.runtime_tail`(wire 层拼到
+            // 消息流末尾)而非 system —— system 块内逐轮变化会摧毁 prompt cache 前缀
+            // (实测 hints 拼 system 时 cache_read 塌到 188)。workspace_hint 准静态,
+            // 仍拼 system 末尾(D4 wire 契约不变)。
             let loop_nudge = loop_guard.take_nudge();
             let runtime_hints = build_runtime_hints_with(&RuntimeHintCtx {
                 trace: &trace,
@@ -277,10 +297,15 @@ impl Agent {
                 silent_rounds: consecutive_no_text_rounds,
                 deadline: deadline_hint,
             });
-            let system = if workspace_hint.is_empty() && runtime_hints.is_empty() {
+            meta.runtime_tail = if runtime_hints.trim().is_empty() {
+                None
+            } else {
+                Some(runtime_hints)
+            };
+            let system = if workspace_hint.is_empty() {
                 base_system
             } else {
-                format!("{base_system}{workspace_hint}{runtime_hints}")
+                format!("{base_system}{workspace_hint}")
             };
             // LLM 请求(2026-09-17 第 70 轮运行日志):--debug 级记录每轮请求元信息,
             // 排查「模型看到了什么」(消息条数/system 规模/强制工具/输出上限)。

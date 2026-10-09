@@ -63,6 +63,22 @@ impl QualityReport {
     }
 }
 
+/// QC 输入裁剪(第 140 轮提速优化):保头 [`QC_CLIP_HEAD`] + 尾 [`QC_CLIP_TAIL`] 字符,
+/// 中间省略并标注原长。QC 判定只需「职责 + 期望 + 关键证据」,全量正文灌入会把
+/// 单次 QC 推到 60s+(实测 wf-6 QC 64.9s 与 actual_output 规模正相关)。
+/// 保留尾部是为了不丢「终答结论 / 收口段」——判定最重要的一段通常在结尾。
+pub(crate) fn clip_qc_input(s: &str) -> String {
+    const QC_CLIP_HEAD: usize = 6000;
+    const QC_CLIP_TAIL: usize = 2000;
+    let total = s.chars().count();
+    if total <= QC_CLIP_HEAD + QC_CLIP_TAIL {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(QC_CLIP_HEAD).collect();
+    let tail: String = s.chars().skip(total - QC_CLIP_TAIL).collect();
+    format!("{head}\n…(中段省略 {} 字符,原文 {total} 字符)…\n{tail}", total - QC_CLIP_HEAD - QC_CLIP_TAIL)
+}
+
 /// 组装 SubAgent 单元 QC 提示词(纯函数,2026-09-19 第 93 轮抽出便于单测)。
 ///
 /// F10(2026-09-10 第 25 轮):判定基准是「本单元职责」,整体目标仅作背景。
@@ -121,7 +137,7 @@ fn build_unit_qc_prompt(
          整体目标(仅作背景,不作为本单元判定依据): {goal}\n\
          本单元职责(判定依据): {unit_scope}\n\
          本单元期望输出: {expected_output}\n\
-         实际输出: {actual_output}\n\
+         实际输出: {}\n\
          \n\
          【执行轨迹】\n{trace_summary}\n\
          \n\
@@ -129,6 +145,7 @@ fn build_unit_qc_prompt(
          (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
          判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。\n\
          若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。{degradation_rule}{QC_JSON_SHAPE_HINT}",
+        clip_qc_input(actual_output),
     )
 }
 
@@ -216,7 +233,8 @@ impl QualityRunner {
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
         let prompt = format!(
-            "【Quality-Check: Main-Work 单元】\n目标: {goal}\nWorkFlow JSON: {workflow_json}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。{QC_JSON_SHAPE_HINT}",
+            "【Quality-Check: Main-Work 单元】\n目标: {goal}\nWorkFlow JSON: {}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。{QC_JSON_SHAPE_HINT}",
+            clip_qc_input(workflow_json),
         );
         self.run_check(prompt, AgentRole::MainWork, workflow_json, session_id, None)
             .await
@@ -229,7 +247,8 @@ impl QualityRunner {
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
         let prompt = format!(
-            "【Quality-Check: Plan 单元】\nPlan Markdown:\n{plan_markdown}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。{QC_JSON_SHAPE_HINT}",
+            "【Quality-Check: Plan 单元】\nPlan Markdown:\n{}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。{QC_JSON_SHAPE_HINT}",
+            clip_qc_input(plan_markdown),
         );
         self.run_check(prompt, AgentRole::Plan, plan_markdown, session_id, None)
             .await
@@ -598,6 +617,28 @@ fn extract_standalone_json(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== 第 140 轮:QC 输入裁剪 ====================
+
+    #[test]
+    fn clip_qc_input_short_is_identity() {
+        let s = "短输入原样返回";
+        assert_eq!(clip_qc_input(s), s);
+    }
+
+    #[test]
+    fn clip_qc_input_long_keeps_head_and_tail_with_marker() {
+        let head: String = std::iter::repeat('H').take(6000).collect();
+        let mid: String = std::iter::repeat('M').take(5000).collect();
+        let tail: String = std::iter::repeat('T').take(2000).collect();
+        let s = format!("{head}{mid}{tail}");
+        let out = clip_qc_input(&s);
+        assert!(out.starts_with(&head), "头部 6000 字符应保留");
+        assert!(out.ends_with(&tail), "尾部 2000 字符应保留");
+        assert!(out.contains("中段省略 5000 字符"), "应标注省略量,实际: {}", &out[6000..6100]);
+        assert!(out.contains("原文 13000 字符"), "应标注原文总长");
+        assert!(out.len() < s.len(), "裁剪后应更短");
+    }
 
     #[test]
     fn quality_report_pass_default() {

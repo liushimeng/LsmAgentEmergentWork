@@ -427,7 +427,9 @@ async fn run_open(args: Value) -> Result<String> {
     {
         Ok((page_id, title, final_url)) => {
             if str_arg(&args, "wait_until") == Some("networkidle") {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                // 第 140 轮:兜底 1500ms→700ms —— Chrome 的 networkidle 判定已含
+                // 500ms 静默窗,额外 700ms 足够让迟到的渲染提交完成。
+                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             }
             let mut data = json!({
                 "page_id": page_id,

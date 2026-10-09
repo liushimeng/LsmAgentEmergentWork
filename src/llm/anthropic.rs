@@ -130,6 +130,42 @@ fn convert_messages(messages: &[ChatMessage]) -> Vec<Value> {
     merge_adjacent_same_role(raw)
 }
 
+/// 把易变尾注(`meta.runtime_tail`)拼到消息流末尾(第 140 轮提速优化)。
+///
+/// 为什么不放 system:Anthropic prompt cache 按请求前缀逐字节匹配,system 块内
+/// 逐轮变化的文本(workspace 快照 / runtime hints)会让 identity 之后的全部缓存断点
+/// (rules / tools / 消息历史)一起失效。拼到消息末尾后:system 前缀稳定命中,
+/// 历史消息前缀逐字节复用,只有尾注本身按新 token 处理(几百 token 级)。
+///
+/// 形态:作为 text block 追加到**最后一条 user/tool 消息**的 content 尾部
+/// (content 本就是数组,合法;不触碰 tool_use/tool_result 配对)。末条不是
+/// user(异常形态,如空列表或 assistant)时退化为一条独立 user 消息 ——
+/// 绝不写进 assistant 消息(那是伪造模型输出)。`None`/空串 = 原样返回,
+/// 与未启用该字段逐字节一致。
+fn append_runtime_tail(msgs: Vec<Value>, tail: Option<&str>) -> Vec<Value> {
+    let Some(t) = tail.filter(|s| !s.trim().is_empty()) else {
+        return msgs;
+    };
+    let mut msgs = msgs;
+    let block = json!({ "type": "text", "text": t });
+    let last_is_user = msgs
+        .last()
+        .map(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .unwrap_or(false);
+    if last_is_user {
+        if let Some(arr) = msgs
+            .last_mut()
+            .and_then(|m| m.get_mut("content"))
+            .and_then(|c| c.as_array_mut())
+        {
+            arr.push(block);
+            return msgs;
+        }
+    }
+    msgs.push(json!({ "role": "user", "content": [block] }));
+    msgs
+}
+
 /// 出站前合并相邻同角色消息(2026-09-10 第 28 轮 B09/B10 修复)。
 ///
 /// laew 的上下文构造会产生连续多条 role=user —— 典型序列:
@@ -200,7 +236,9 @@ fn convert_system_blocks_split(segments: &PromptSegments, rules: &str) -> Vec<Va
             "cache_control": { "type": "ephemeral" }
         }));
     }
-    // 第 3 段 核心行为规则(带 cache_control: ephemeral);runtime hints 已拼到该字符串
+    // 第 3 段 核心行为规则(带 cache_control: ephemeral)。
+    // 第 140 轮:runtime hints 不再拼进本块(块内逐轮变化会摧毁缓存前缀),
+    // 易变文本改走 `append_runtime_tail` 拼到消息流末尾。
     if !rules.trim().is_empty() {
         out.push(json!({
             "type": "text",
@@ -411,6 +449,58 @@ mod cache_policy_tests {
         let content = latest_user["content"].as_array().unwrap();
         assert!(content.last().unwrap().get("cache_control").is_some());
     }
+
+    // ==================== 第 140 轮:runtime_tail 尾注 ====================
+
+    /// 空尾注(None / 空白串)→ 消息数组逐字节不变。
+    #[test]
+    fn append_runtime_tail_none_or_blank_is_identity() {
+        let msgs = vec![json!({"role":"user","content":[
+            {"type":"text","text":"hi"}
+        ]})];
+        for tail in [None, Some(""), Some("   \n")] {
+            let out = append_runtime_tail(msgs.clone(), tail);
+            assert_eq!(out, msgs, "tail={tail:?} 应原样返回");
+        }
+    }
+
+    /// 尾注追加到最后一条消息 content 数组尾部(不动既有 block)。
+    #[test]
+    fn append_runtime_tail_appends_text_block_to_last_message() {
+        let msgs = vec![
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t2","content":"ok2"}
+            ]}),
+        ];
+        let out = append_runtime_tail(msgs, Some("\n\n[系统注入] 运行提示"));
+        assert_eq!(out.len(), 2, "不应新增消息");
+        let content = out[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "\n\n[系统注入] 运行提示");
+    }
+
+    /// 消息列表为空 → 退化为一条独立 user 消息。
+    #[test]
+    fn append_runtime_tail_empty_messages_creates_user_message() {
+        let out = append_runtime_tail(vec![], Some("tail-here"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "user");
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "tail-here");
+    }
+
+    /// 末条消息 content 非数组(异常形态)→ 追加一条独立 user 消息兜底。
+    #[test]
+    fn append_runtime_tail_last_not_array_falls_back_to_user_message() {
+        let msgs = vec![json!({"role":"user","content":"plain-string-content"})];
+        let out = append_runtime_tail(msgs, Some("t"));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"][0]["text"], "t");
+    }
 }
 
 /// 协议 parser:把 Anthropic SSE 事件喂给 [`ParseSink`]。
@@ -560,7 +650,7 @@ impl LlmClient for AnthropicClient {
         // 优先 **拼接** 三段:
         //   - billing(segments,无 cache)
         //   - identity(segments,带 cache)
-        //   - `system: &str` 参数(运行时已叠加 workspace + runtime hints 的最终串,带 cache)
+        //   - `system: &str` 参数(静态 rules,带 cache;第 140 轮起不再拼 runtime hints)
         // 三段总和仍受 4 断点 cap 约束;`apply_cache_policy` 看到末尾 system 已带 cache
         // → 跳过(`has_cache_control` 分支返回 + bp.remaining += 1,不影响总预算)。
         // 回退路径:`meta.anthropic_segments == None` 时走旧 path(单字符串 + 末尾 cache)。
@@ -569,7 +659,10 @@ impl LlmClient for AnthropicClient {
             None => convert_system_blocks_legacy(system),
         };
         let tool_blocks = convert_tools(tools);
-        let msg_blocks = convert_messages(messages);
+        // 第 140 轮:易变尾注(workspace hint + runtime hints)拼到消息流末尾,
+        // 而不是 system —— system 块内逐轮变化会摧毁 prompt cache 的整段前缀。
+        // 尾注按每请求重算、不持久化:历史消息前缀逐字节稳定可复用。
+        let msg_blocks = append_runtime_tail(convert_messages(messages), meta.runtime_tail.as_deref());
         let (sys_blocks, tool_blocks, msg_blocks, _bp) =
             apply_cache_policy(DEFAULT_CACHE_POLICY, sys_blocks, tool_blocks, msg_blocks);
 

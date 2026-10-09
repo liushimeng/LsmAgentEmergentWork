@@ -689,15 +689,37 @@ fn extract_failed_methods(qc_hint: &str) -> Vec<String> {
         .collect()
 }
 
+/// 上游产物注入截断(第 140 轮):头 1500 + 尾 500 字符,中间省略标注。
+/// 与 `quality::clip_qc_input` 同思路,预算更紧(下游 prompt 里 deps 只是背景材料)。
+fn clip_dep_output(s: &str) -> String {
+    const DEP_CLIP_HEAD: usize = 1500;
+    const DEP_CLIP_TAIL: usize = 500;
+    let total = s.chars().count();
+    if total <= DEP_CLIP_HEAD + DEP_CLIP_TAIL {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(DEP_CLIP_HEAD).collect();
+    let tail: String = s.chars().skip(total - DEP_CLIP_TAIL).collect();
+    format!(
+        "{head}\n…(上游产物中段省略 {} 字符,原文 {total} 字符)…\n{tail}",
+        total - DEP_CLIP_HEAD - DEP_CLIP_TAIL
+    )
+}
+
 pub(super) fn build_subflow_input(
     wf: &WorkFlowSpec,
     dep_outputs: &std::collections::HashMap<String, String>,
     retry_hint: &str,
 ) -> SubFlowInput {
+    // 第 140 轮提速优化:上游产物注入下游 prompt 时截断(头 1500 + 尾 500 字符)。
+    // 链式依赖下 wf-N 的输入会携带 wf-1..N-1 全部输出,输入 token 逐单元膨胀
+    // (实测 avg_in=23K/次);产物全文本就留在 WorkflowResult 与 artifacts/,下游
+    // 需要细节可自行 Read,不靠 prompt 灌全文。
     let deps: Vec<String> = wf
         .depends_on
         .iter()
-        .filter_map(|id| dep_outputs.get(id).cloned())
+        .filter_map(|id| dep_outputs.get(id))
+        .map(|s| clip_dep_output(s))
         .collect();
     // 2026-09-11 第三十三轮:#P-A 修复 — medium/hard 路径同样需要把用户原始
     // prompt 透传给 SubAgent。由于 MainWork/Plan 拆解时已隐含用户原始需求

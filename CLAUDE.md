@@ -181,8 +181,8 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **Anthropic 三段式系统提示词**：8 角色 + WorkFlow 角色的 `system` 字段从单字符串重构为三段式，对齐 Claude Code CLI 抓包范式——
   1. **billing 计费头**（无 `cache_control`）：单行 `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cc_is_subagent=true;`，Anthropic 内部计费/链路字段，对模型行为零影响
   2. **identity 基础身份声明**（带 `cache_control: ephemeral`）：单行 Agent 身份 + 一句话职责，8 角色 + WorkFlow 各一份
-  3. **rules 核心行为规则**（带 `cache_control: ephemeral`）：base + tools_hint + protocol_tail + 运行时 workspace_hint + runtime_hints，等价于原 `render()` 单字符串内容
-  缓存复用：billing + identity 静态常量跨会话完全一致 → 100% 命中；rules 因 runtime hints 注入每轮不同 → 每轮重算但仍带 cache 标记。4 断点 cap 约束下，billing 无 cache / identity + rules + last tool + latest user 各一份 cache，刚好命中 cap。OpenAI 协议不受影响，继续走 `system` 单字符串路径。实现 `src/agent/system_prompt/mod.rs::PromptSegments` + `src/llm/anthropic.rs::convert_system_blocks_split`，Agent 循环 `meta.anthropic_segments = Some(profile.system_prompt.prompt_segments())` 注入。
+  3. **rules 核心行为规则**（带 `cache_control: ephemeral`）：base + tools_hint + protocol_tail + 准静态 workspace_hint，等价于原 `render()` 单字符串内容
+  缓存复用：三段全部静态/准静态 → 缓存断点逐轮命中。**runtime hints 不进 system**（第 140 轮）：逐轮变化的进度/收口/无进展提醒经 `RequestMeta.runtime_tail` 由 wire 层拼到消息流末尾尾注（`llm/anthropic.rs::append_runtime_tail` 追加到最后一条 user/tool 消息 content 尾部，不持久化 session context），否则会摧毁 rules 块 cache_control 断点之后的全部缓存前缀（实测 46/172 次 cache_read 仅 188）。4 断点 cap 约束下，billing 无 cache / identity + rules + last tool + latest user 各一份 cache，刚好命中 cap。OpenAI 协议走 `system` 单字符串 + 同一尾注注入位。实现 `src/agent/system_prompt/mod.rs::PromptSegments` + `src/llm/anthropic.rs::convert_system_blocks_split`，Agent 循环 `meta.anthropic_segments = Some(profile.system_prompt.prompt_segments())` 注入。
 
 ## 架构（src/）
 

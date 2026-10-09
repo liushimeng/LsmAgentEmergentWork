@@ -330,7 +330,13 @@ impl LlmClient for OpenAiClient {
         tools: &[ToolDef],
         meta: &RequestMeta,
     ) -> Result<Completion> {
-        let converted = convert_messages(system, messages);
+        let mut converted = convert_messages(system, messages);
+        // 第 140 轮:易变尾注(workspace hint + runtime hints)拼为消息流末尾的
+        // user 消息(不持久化、每请求重算)——OpenAI 协议无 cache_control,但统一
+        // 与 Anthropic 路径同一注入位,避免两协议模型所见上下文结构漂移。
+        if let Some(t) = meta.runtime_tail.as_deref().filter(|s| !s.trim().is_empty()) {
+            converted.push(json!({ "role": "user", "content": t }));
+        }
         let req = OpenAiRequest {
             model: &self.model,
             messages: converted,

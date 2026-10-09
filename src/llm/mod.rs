@@ -143,6 +143,18 @@ pub struct RequestMeta {
     /// OpenAI 协议忽略该字段(继续走 `system` 单字符串)。`Agent::run_session_inner`
     /// 从 `AgentProfile.system_prompt.prompt_segments()` 注入。
     pub anthropic_segments: Option<crate::agent::system_prompt::PromptSegments>,
+    /// 易变尾注(第 140 轮提速优化):workspace 快照 + runtime hints 等**逐轮变化**的
+    /// 辅助文本,由 Agent 循环每轮写入,wire 层拼到消息流**末尾**而非 system。
+    ///
+    /// 为什么不能拼进 system:Anthropic prompt cache 是请求前缀逐字节匹配,system
+    /// 块内任意变化都会让 identity 之后的全部缓存断点(rules / tools / 消息历史)失效
+    /// (实测 46/172 次调用 cache_read 仅 188,规则段全量重算)。尾注放消息末尾后
+    /// system 前缀逐轮稳定,历史消息前缀同样逐字节可复用,只有尾注本身按新 token 处理。
+    ///
+    /// 不持久化进 session context(每轮重算,wire 层拼接);`None`/空串 = 不注入,
+    /// wire 输出与未启用该字段时逐字节一致。Anthropic 拼到最后一条消息 content 尾部,
+    /// OpenAI 拼为末尾一条 user 消息。
+    pub runtime_tail: Option<String>,
 }
 
 impl RequestMeta {
@@ -155,6 +167,7 @@ impl RequestMeta {
             user_agent: String::new(),
             forced_tool: None,
             anthropic_segments: None,
+            runtime_tail: None,
         }
     }
 
@@ -171,6 +184,7 @@ impl RequestMeta {
             user_agent: String::new(),
             forced_tool: None,
             anthropic_segments: None,
+            runtime_tail: None,
         }
     }
 
@@ -498,6 +512,7 @@ mod tests {
             user_agent: String::new(),
             forced_tool: None,
             anthropic_segments: None,
+            runtime_tail: None,
         };
         let headers = build_common_headers(
             "sk-xxx",

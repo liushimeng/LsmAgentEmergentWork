@@ -1,7 +1,7 @@
 //! MCP_Web_Use 工具单元测试(自 tools/browser.rs 测试平移 + 单工具化改造)。
 
 use super::*;
-use super::{control, extract, page_state};
+use super::{control, extract, inspect, page_state};
 use base64::Engine as _;
 
 #[test]
@@ -10,6 +10,91 @@ fn envelope_codes() {
     assert!(s.contains("\"code\":0"));
     assert!(s.contains("\"message\":\"ok\""));
     assert!(s.contains("\"x\":1"));
+}
+
+// ==================== 第 140 轮:inspect 体积闸门 ====================
+
+#[test]
+fn gate_payload_small_is_identity() {
+    let v = json!({"ok": true, "selector": "form", "outer_html": "<form></form>"});
+    assert_eq!(inspect::gate_payload(v.clone()), v);
+}
+
+#[test]
+fn cap_strings_clips_long_string_with_marker() {
+    let mut v = json!({"html": "X".repeat(20000), "ok": true});
+    inspect::cap_strings(&mut v, 100);
+    let s = v["html"].as_str().unwrap();
+    assert!(s.starts_with(&"X".repeat(100)));
+    assert!(s.contains("截断,共 20000 字符"));
+    assert_eq!(v["ok"], json!(true), "短字段不受影响");
+}
+
+#[test]
+fn gate_payload_huge_object_degrades_to_preview() {
+    // 单字符串已裁到 8K,但 5 个 8K 字段合计仍超 24KB → 整体降级为摘要
+    let big = "Y".repeat(20000);
+    let v = json!({
+        "a": big, "b": big, "c": big, "d": big, "e": big,
+    });
+    let out = inspect::gate_payload(v);
+    assert_eq!(out["truncated"], json!(true));
+    assert!(out["original_bytes"].as_u64().unwrap() > 24 * 1024);
+    assert!(out["preview"].as_str().unwrap().contains("截断"));
+    assert!(out["hint"].as_str().unwrap().contains("extract"));
+}
+
+// ==================== 第 140 轮:adopt_spawned_pages 按需化 ====================
+
+#[test]
+fn action_may_spawn_page_whitelist() {
+    // 可能开新页的动作:巡检保留
+    for a in [
+        "click",
+        "human_click",
+        "right_click",
+        "double_click",
+        "key_press",
+        "press_sequence",
+        "navigate",
+        "new_tab",
+        "back",
+        "forward",
+        "reload",
+        "select_option",
+        "upload_file",
+        "download",
+        "dispatch_event",
+        "eval_js",
+    ] {
+        assert!(control::action_may_spawn_page(a), "{a} 应巡检派生页");
+    }
+    // 观察/状态类动作:跳过巡检
+    for a in [
+        "wait",
+        "input_text",
+        "human_input",
+        "clear_input",
+        "screenshot",
+        "set_cookie",
+        "delete_cookie",
+        "set_storage",
+        "clear_storage",
+        "set_viewport",
+        "set_window",
+        "sync_viewport",
+        "set_highlight",
+        "heartbeat",
+        "hover",
+        "scroll",
+        "scroll_to",
+        "drag",
+        "focus",
+        "blur",
+        "mouse_move",
+    ] {
+        assert!(!control::action_may_spawn_page(a), "{a} 不应巡检派生页");
+    }
 }
 
 #[test]

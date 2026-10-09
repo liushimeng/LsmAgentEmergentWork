@@ -85,6 +85,36 @@
         assert!(input.depends_on_outputs[0].contains("已读取 a.rs"));
     }
 
+    /// 第 140 轮:上游产物超长时截断(头 1500 + 尾 500),短产物原样透传。
+    #[test]
+    fn build_subflow_input_clips_long_dep_output() {
+        let long = format!(
+            "{}{}{}",
+            "H".repeat(1500),
+            "M".repeat(3000),
+            "T".repeat(500)
+        );
+        let mut deps = std::collections::HashMap::new();
+        deps.insert("wf-1".into(), long);
+        let wf = WorkFlowSpec {
+            id: "wf-2".into(),
+            name: "修改".into(),
+            steps: vec!["改 a.rs".into()],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec!["wf-1".into()],
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent,
+            max_iterations: None, original_prompt: None,
+            pre_explore: false,
+        };
+        let input = build_subflow_input(&wf, &deps, "");
+        let dep = &input.depends_on_outputs[0];
+        assert!(dep.starts_with(&"H".repeat(1500)));
+        assert!(dep.ends_with(&"T".repeat(500)));
+        assert!(dep.contains("中段省略 3000 字符"));
+    }
+
     /// 第 119 轮:pre_explore=true 时,description 内追加「批量优先」硬约束,
     /// 且 SubFlowInput.pre_explore 透传为 true。
     #[test]

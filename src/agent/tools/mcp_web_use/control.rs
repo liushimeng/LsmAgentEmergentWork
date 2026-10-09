@@ -234,7 +234,16 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "request_human" => return act_request_human(id, &params).await,
         other => return envelope(1001, "未知 control_action", json!({"control_action": other})),
     };
-    let spawned = crate::agent::browser::BrowserManager::global().adopt_spawned_pages().await;
+    // 第 140 轮提速:仅「可能派生新标签页」的动作才做浏览器级 pages() 巡检
+    // (每次巡检 = 一次浏览器级 CDP 往返 + 全局锁)。wait/input_text/screenshot/
+    // eval_js(纯读)/set_* 等动作不会开新页,批量 sequence 一次可省 N 次巡检。
+    // 名单按「动作可能触发浏览器开新 tab/window」保守圈定:点击(链接/target=_blank)、
+    // 键盘(Enter 提交表单跳转)、导航类、select/upload(表单提交)、dispatch_event(自定义事件)。
+    let spawned = if action_may_spawn_page(action) {
+        crate::agent::browser::BrowserManager::global().adopt_spawned_pages().await
+    } else {
+        Vec::new()
+    };
     match result {
         Ok(mut data) => {
             if let Some(new_id) = spawned.first() {
@@ -256,6 +265,34 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
 
 // =================== control_action 实现(逐行平移自 tools/browser.rs) ===================
 
+/// 该 control_action 是否可能派生新标签页/窗口(第 140 轮)。
+///
+/// 用途:决定动作收尾是否跑 `adopt_spawned_pages()`(浏览器级 `Target.getTargets`
+/// CDP 往返 + 全局锁)。保守圈定「点击 / 键盘 / 导航 / 表单提交 / 自定义事件」——
+/// 这些可能经 `<a target=_blank>`、`window.open`、表单跳转开新页;观察类与纯
+/// 状态设置类动作(wait/screenshot/eval_js/set_*)不会开页,跳过巡检零风险。
+pub(super) fn action_may_spawn_page(action: &str) -> bool {
+    matches!(
+        action,
+        "click"
+            | "human_click"
+            | "right_click"
+            | "double_click"
+            | "key_press"
+            | "press_sequence"
+            | "navigate"
+            | "new_tab"
+            | "back"
+            | "forward"
+            | "reload"
+            | "select_option"
+            | "upload_file"
+            | "download"
+            | "dispatch_event"
+            | "eval_js"
+    )
+}
+
 async fn act_click(id: &str, p: &Value, human: bool) -> std::result::Result<Value, String> {
     let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
     let nth = p.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -270,10 +307,12 @@ async fn act_click(id: &str, p: &Value, human: bool) -> std::result::Result<Valu
     let y = find["y"].as_f64().unwrap_or_default();
     if human {
         dispatch_mouse(&page, "mouseMoved", x, y, "left", 0, 0, 0).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     }
     dispatch_mouse(&page, "mousePressed", x, y, "left", 1, 0, 0).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    // 第 140 轮:按下→抬起 40ms→15ms(合成事件无须拟人停顿,页面 JS 的
+    // mousedown/up 处理在同帧内完成,15ms 足够事件队列排空)。
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     dispatch_mouse(&page, "mouseReleased", x, y, "left", 1, 0, 0).await?;
     Ok(json!({"clicked": sel, "x": x, "y": y, "mode": if human {"human"} else {"cdp"}}))
 }
@@ -659,7 +698,9 @@ async fn act_history(id: &str, back: bool) -> std::result::Result<Value, String>
     let page = ensure_page(id).await?;
     let js = if back { "history.back()" } else { "history.forward()" };
     eval_js_string(&page, js).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // 第 140 轮:300ms→120ms —— history API 异步生效但 popstate 在 100ms 内
+    // 必达,后续 inspect 的等待语义由调用方自行保证。
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     Ok(json!({"nav": if back {"back"} else {"forward"}}))
 }
 
@@ -994,15 +1035,16 @@ async fn act_drag(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let dy = dst["y"].as_f64().unwrap_or_default();
     // mousePressed → 多次 mouseMoved(平滑)→ mouseReleased
     dispatch_mouse(&page, "mouseMoved", sx, sy, "left", 0, 0, 0).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     dispatch_mouse(&page, "mousePressed", sx, sy, "left", 1, 0, 0).await?;
-    // 8 步插值,每步 15ms
+    // 8 步插值,每步 8ms(第 140 轮 15ms→8ms:滑块轨迹形状保留,总时长减半;
+    // 轨迹形态是防检测要素,步数与插值曲线不动)
     for step in 1..=8 {
         let t = step as f64 / 8.0;
         let mx = sx + (dx - sx) * t;
         let my = sy + (dy - sy) * t;
         dispatch_mouse(&page, "mouseMoved", mx, my, "left", 0, 0, 0).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
     }
     dispatch_mouse(&page, "mouseReleased", dx, dy, "left", 1, 0, 0).await?;
     Ok(json!({"dragged_from":[sx, sy], "to":[dx, dy]}))
@@ -1030,19 +1072,20 @@ async fn act_focus_or_blur(id: &str, p: &Value, focus: bool) -> std::result::Res
 /// 鼠标纯移动(不点击):用于悬停菜单、tooltip 触发、长按场景。
 async fn act_mouse_move(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let page = ensure_page(id).await?;
-    let x = if let Some(sel) = str_arg(p, "selector") {
+    // 第 140 轮:selector 命中时一次性取中心点坐标(x/y 各探测一次是纯浪费,
+    // 每次探测 = 一次 JS eval)。
+    let (x, y) = if let Some(sel) = str_arg(p, "selector") {
         let nth = p.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
         let find = eval_find_center(&page, sel, nth).await?;
-        find["x"].as_f64().unwrap_or_default()
+        (
+            find["x"].as_f64().unwrap_or_default(),
+            find["y"].as_f64().unwrap_or_default(),
+        )
     } else {
-        p.get("x").and_then(Value::as_f64).unwrap_or_default()
-    };
-    let y = if let Some(sel) = str_arg(p, "selector") {
-        let nth = p.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let find = eval_find_center(&page, sel, nth).await?;
-        find["y"].as_f64().unwrap_or_default()
-    } else {
-        p.get("y").and_then(Value::as_f64).unwrap_or_default()
+        (
+            p.get("x").and_then(Value::as_f64).unwrap_or_default(),
+            p.get("y").and_then(Value::as_f64).unwrap_or_default(),
+        )
     };
     dispatch_mouse(&page, "mouseMoved", x, y, "left", 0, 0, 0).await?;
     Ok(json!({"x": x, "y": y}))

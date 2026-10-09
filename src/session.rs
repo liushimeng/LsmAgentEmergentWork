@@ -185,6 +185,7 @@ impl Session {
             user_agent: String::new(),
             forced_tool: None,
             anthropic_segments: None,
+            runtime_tail: None,
         }
     }
 }
