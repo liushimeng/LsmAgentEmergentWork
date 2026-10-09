@@ -252,8 +252,9 @@ impl TuiSession {
             let mut gui_escape_spawned_for: Option<u64> = None;
             let spawn_gui_escape = |id: u64, options: Vec<String>| {
                 tokio::spawn(async move {
-                    let Some(raw) = super::hitl_view::read_hitl_escape_answer().await else {
-                        return; // EOF / 读取失败:放弃应急应答
+                    // 第 138 轮:id 传入应急通道,弹窗失败降级时自动退出让位行读。
+                    let Some(raw) = super::hitl_view::read_hitl_escape_answer(id).await else {
+                        return; // EOF / 读取失败 / 弹窗已降级:放弃应急应答
                     };
                     let hub = HumanAssistHub::global();
                     let mapped = super::hitl_view::map_human_assist_input(&raw, &options);

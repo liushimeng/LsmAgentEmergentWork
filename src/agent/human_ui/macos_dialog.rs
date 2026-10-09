@@ -89,6 +89,7 @@ macro_rules! msg {
 }
 
 msg!(send_id, () -> Id);
+msg!(send_id_id, (arg: Id) -> Id);
 msg!(send_id_cstr, (arg: *const c_char) -> Id);
 msg!(send_id_usize, (arg: usize) -> Id);
 msg!(send_id_rect, (rect: NSRect) -> Id);
@@ -953,10 +954,14 @@ unsafe fn load_image(p: &DialogPayload) -> (Option<Id>, Option<Id>, f64, Option<
     if p.image_path.is_empty() {
         return (None, None, 0.0, None);
     }
-    let img = send_id_cstr(
+    // initWithContentsOfFile: 的参数是 NSString *(不是 char *)—— 直接传 C 字符串
+    // 指针会被 ObjC 当作 NSString 对象访问(首字节当 isa 指针)→ SIGSEGV。必须先
+    // 经 ns_str 转成 NSString 对象再传(第 138 轮实测崩溃根因)。
+    let path_ns = ns_str(&p.image_path);
+    let img = send_id_id(
         send_id(cls(b"NSImage\0"), sel(b"alloc\0")),
         sel(b"initWithContentsOfFile:\0"),
-        CString::new(p.image_path.as_str()).unwrap_or_default().as_ptr(),
+        path_ns,
     );
     if img.is_null() || !send_bool(img, sel(b"isValid\0")) {
         return (None, None, 0.0, None);

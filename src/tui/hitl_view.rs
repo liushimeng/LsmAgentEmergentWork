@@ -11,7 +11,7 @@
 
 use std::io::Write as _;
 
-use crate::agent::human_assist::{AssistEvent, HumanAssistDisplay};
+use crate::agent::human_assist::{AssistEvent, HumanAssistDisplay, HumanAssistHub};
 
 use super::pathfmt;
 
@@ -206,8 +206,16 @@ pub const HITL_ESCAPE_PREFIX: &str = "/hitl";
 /// 语义:`/hitl 2t6x` → 文本 `2t6x`;`/hitl 3` → 选项 3;`/hitl cancel` → 取消;
 /// 单独 `/hitl` → 空行(等价「选项 1」,与既有映射一致)。返回 `None` = EOF/取消读取,
 /// 调用方应当放弃本次应急应答(不能再等第二轮)。
-pub(super) async fn read_hitl_escape_answer() -> Option<String> {
+///
+/// 第 138 轮:弹窗失败降级后(`is_gui_presenting` 转 false)自动退出,把 stdin 让给
+/// 行读分支 —— 此前两者同时读 stdin 会瓜分用户输入(实测:用户输入验证码文本
+/// 被应急通道当非前缀行丢弃,行读永远收不到 → 120s 超时)。
+pub(super) async fn read_hitl_escape_answer(id: u64) -> Option<String> {
     loop {
+        // 弹窗已失败/超时/取消:应急通道让位,避免与行读分支抢 stdin(第 138 轮)。
+        if !HumanAssistHub::global().is_gui_presenting(id) {
+            return None;
+        }
         let line = tokio::task::spawn_blocking(|| {
             let mut buf = String::new();
             match std::io::stdin().read_line(&mut buf) {

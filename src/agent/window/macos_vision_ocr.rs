@@ -321,7 +321,14 @@ fn call_vision_ocr_helper(
     })?;
 
     // 编译并执行
+    // 第 138 轮修复:脚本使用 NSImage(AppKit)与 VNRequestRecognitionLevel(Vision),
+    // `swift` 脚本模式默认不链接这两个框架,必须显式 `-framework` 否则编译报
+    // "cannot find 'NSImage'/'accurate' in scope"(实测事故根因)。
     let output = std::process::Command::new("swift")
+        .arg("-framework")
+        .arg("Vision")
+        .arg("-framework")
+        .arg("AppKit")
         .arg(&script_path)
         .output()
         .map_err(|e| {
@@ -375,6 +382,7 @@ fn generate_ocr_swift_script(input_path: &Path, output_path: &Path, cfg: &Vision
 
     format!(
         r#"import Foundation
+import AppKit
 import Vision
 
 // 读取输入图片
@@ -456,7 +464,7 @@ do {{
     exit(1)
 }}
 "#,
-        recognition_level = if cfg.recognition_level == 1 { "accurate" } else { "fast" },
+        recognition_level = if cfg.recognition_level == 1 { ".accurate" } else { ".fast" },
         language_correction = if cfg.language_correction { "true" } else { "false" },
     )
 }
