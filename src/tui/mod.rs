@@ -42,6 +42,7 @@ pub mod paste;
 pub mod pathfmt;
 pub mod render;
 pub mod screen;
+pub mod term_guard;
 pub mod textfit;
 pub mod theme;
 
@@ -514,6 +515,20 @@ pub async fn run() -> Result<()> {
     run_with_debug(false, TuiLaunch::now()).await
 }
 
+/// TUI 退出的统一终端清理(第 136 轮)。
+///
+/// 拆成独立函数的原因:主循环里有两条**提前 `return Err`** 路径(`read_line`
+/// 出错、`handle_user_input` 出错),它们不会走到循环末尾的
+/// `terminal_restore()`,于是 DECSTBM 滚动区 / alt screen / 光标可见性 /
+/// 自适应底部面板全部残留在终端上 —— 表现为「关掉 laew 之后终端下半屏还是坏的」。
+/// 这两条路径改调本函数,保证与正常退出路径同等收口。
+fn tui_terminal_cleanup() {
+    crate::agent::human_assist::HumanAssistHub::global().detach();
+    input::teardown_pinned();
+    let _ = terminal::disable_raw_mode();
+    crate::shutdown::terminal_restore_sync();
+}
+
 /// 启动 TUI 交互式 REPL;`debug=true` 时开启调试模式(对应 `laew -debug`),
 /// 每个用户任务结束后生成 Debug 报告到根目录 `DebugReport/`。
 /// `launch` 携带启动时刻与运行日志文件元信息(横幅展示,第 72 轮)。
@@ -556,24 +571,34 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
 
             // 每行输入前重扫自定义命令目录(D2):命令文件增删即时生效,无需重启
             completion_engine.reload_custom(&session.paths.work_dir);
-            let line = match input_handler.read_line(">> ", &completion_engine)? {
-                InputResult::Submitted(l) => l,
-                InputResult::Exit => {
+            // 第 136 轮:原先这里是 `read_line(...)?`,一旦 read_line 返回 Err
+            // (终端断开 / 事件源错误)会**直接 return Err**,跳过主循环末尾的
+            // `terminal_restore()` —— DECSTBM 滚动区、alt screen、光标状态全部
+            // 残留终端(第 134 轮自适应底部面板最明显:面板行会一直挂在屏幕底部)。
+            // 改成显式 match,错误路径同样走统一清理。
+            let line = match input_handler.read_line(">> ", &completion_engine) {
+                Ok(InputResult::Submitted(l)) => l,
+                Ok(InputResult::Exit) => {
                     println!("  再见。");
                     // 统一退出清理:拆除固定底部输入组件 + 重置滚动区,
                     // 避免底部输入面板和快捷键提示行残留终端。
-                    crate::agent::human_assist::HumanAssistHub::global().detach();
-                    input::teardown_pinned();
-                    let _ = terminal::disable_raw_mode();
+                    tui_terminal_cleanup();
                     break;
                 }
-                InputResult::Interrupted => {
+                Ok(InputResult::Interrupted) => {
                     // 修正(第 N 轮):当前 Ctrl-C 语义是触发全局 shutdown 后 TUI
                     // 整体退出(由主循环开头 is_triggered 判定 break),不存在
                     // 「中断后继续会话」路径。「输入 /exit 或 Ctrl-D 退出」是误导性文案。
                     // 仅做视觉提示,下一轮循环即退出。
                     println!("  (中断) 正在退出...");
                     continue;
+                }
+                // 第 136 轮:原先这里是 `read_line(...)?`,错误会直接上抛并跳过
+                // 主循环末尾的 `terminal_restore()` —— DECSTBM 滚动区 / alt screen /
+                // 光标 / 自适应底部面板全部残留在终端上。改为显式收口。
+                Err(e) => {
+                    tui_terminal_cleanup();
+                    return Err(anyhow::Error::new(e));
                 }
             };
 
@@ -593,9 +618,9 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
                 Err(e) => {
                     // 第 103 轮:错误路径同样拆除固定输入区 + 重置滚动区 + 还原光标,
                     // 避免异常返回后终端残留 pinned 布局(焦点丢失)。
-                    crate::agent::human_assist::HumanAssistHub::global().detach();
-                    input::teardown_pinned();
-                    let _ = terminal::disable_raw_mode();
+                    // 第 136 轮:补上 `terminal_restore_sync()` —— 本条是提前
+                    // `return Err`,不会走到主循环末尾的 `terminal_restore()`。
+                    tui_terminal_cleanup();
                     return Err(e);
                 }
             }
@@ -639,6 +664,16 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
     // 第 108 轮:TUI 主循环退出 → 统一终端还原(任何退出路径都执行,
     // 包括 Ctrl+C / Ctrl-D / Ctrl+Z 被拦截后 / 正常 /exit / shutdown 信号触发)。
     crate::shutdown::terminal_restore().await;
+    // 第 136 轮:显式回收浏览器子进程。
+    //
+    // 此前 TUI 的所有退出路径(Ctrl-D / Ctrl-C / /exit / 子屏 Esc / stdin EOF)
+    // **都没有**调用 `BrowserManager::shutdown()`,浏览器回收完全依赖
+    // `main.rs` 注册的 `libc::atexit` + `cleanup_sync`。两点问题:
+    // - `BrowserManager` 是 `OnceLock` 单例且**没有 Drop**,atexit 不跑就不会析构;
+    // - `atexit` 守卫是 `#[cfg(unix)]`,**Windows 上既无 atexit 也无 Drop**,
+    //   TUI 退出后 Chrome 会直接留在后台。
+    // 显式收口与 `-p` 单轮模式(main.rs 的同名调用)对齐,三平台行为一致。
+    crate::agent::browser::BrowserManager::global().shutdown().await;
     Ok(())
 }
 

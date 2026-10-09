@@ -1039,6 +1039,15 @@ async fn main() -> Result<()> {
     // 覆盖正常 exit / main 返回路径;覆盖 panic 路径(crash.rs panic_hook 中也清理)。
     install_browser_cleanup_guard();
 
+    // 第 136 轮:终端守卫看门狗(必须在 Tokio runtime 内安装 —— 需要 Handle 回收
+    //   浏览器子进程)。
+    //   实测事故:macOS 活动监视器里 14 个 laew 残留、每个吃掉 60~70% CPU。根因是
+    //   「终端消失 → pty read() 恒 EOF → crossterm 0.27 的 event::read() 内部死转」,
+    //   而 SIGHUP/SIGTERM 的 handler 只置标志位、主线程却卡在 read() 里回不到检查
+    //   点,导致进程既不退出、`kill` 也无效。详见 `src/tui/term_guard.rs`。
+    //   非 TTY(管道 / CI / e2e)自动跳过。
+    lsm_agent::tui::term_guard::install_watchdog(tokio::runtime::Handle::current());
+
     // 崩溃取证必须先于 CLI 解析 / TUI 初始化 / Tokio worker 创建安装。
     // 报告目录沿用 laew 根目录约定，不依赖数据库配置，用户零配置。
     {

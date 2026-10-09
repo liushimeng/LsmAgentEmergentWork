@@ -228,9 +228,18 @@ impl MacOsDriver {
         // `open` 命令无崩溃风险,用户操作路径等价(勾选终端 → 授权生效),
         // 授权状态变化由 is_ax_trusted_with_retry 的静默轮询感知。
         // 非 GUI 会话(SSH/CI)下 open 可能失败,忽略错误静默降级。
+        //
+        // 第 136 轮:`spawn()` 的返回值必须 `wait()` 回收。原来直接丢弃
+        // `Child`,句柄立刻 Drop 但子进程仍在运行 → 每次调用(AX 未授权时这条
+        // 路径会被反复走到)**泄漏一个 zombie 进程**,长期运行会耗尽 pid /
+        // 占住进程表槽位。改用 `.status()`(等价于 spawn + wait)并显式忽略结果:
+        // `open` 自身很快返回,同步等待不会拖慢交互;万一卡住也不会影响主流程
+        // ——外层调用方本就只关心「有没有把系统设置打开」,而返回值仍是 `false`。
         let _ = std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .spawn();
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         false
     }
 

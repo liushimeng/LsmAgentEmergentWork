@@ -87,6 +87,25 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **人工介入可见性（第 131 轮）**：`request_human` 的「该走人工」不再只写在提示词里，OCR 报错/空文本（`control(screenshot,ocr=true)` 与 `inspect(info=ocr)`）与 `inspect(info=blockers)` 命中阻断时，响应附 `next_action="request_human"` + 完整 `human_assist` 载荷（ready/reason/message/options/可复制的 call/反伪造 rule）；`4001 Unavailable` 附 `human_ui_diagnostics{gui_enabled,platform,reason_hint,env_switch}` 供排障「为什么没弹窗」；`-p`/`-f` 单轮模式新增 250ms 轮询协程排空 `AssistEvent` 并打弹窗通知行（此前弹窗照弹、应答照回填，但终端零输出）。见 `docs/MCP_Web_Use/02-人工介入与窗口可视化方案.md` §5.0/§5.1.1/§5.3。
 - **人工介入弹窗可用性与取消收口（第 132 轮）**：macOS 弹窗由 NSAlert+runModal **重写为自绘 NSWindow**（`NSApp.run()` 常规事件循环），根治实测四问题——文案可鼠标选中/⌘C 复制（NSTextView）、输入框 first responder + 输入法可正常输入、连点输入框不再误关弹窗、倒计时每秒真实刷新 + 超时自灭；**验证码图片展示**：`request_human` 附图（显式 `params.image_path` 优先，`reason=captcha` 自动 CDP 视口截图，不受宿主录屏权限影响），payload 新增 `image_path`，弹窗内直接渲染、TUI 打印路径，Windows ps1 同步（ReadOnly TextBox + PictureBox）；**Ctrl-C 取消收口**：取消后 Debug 报告跳过 LLM 评估（`ReportMeta.interrupted` → 本地骨架秒级落盘，实测原评估阻塞 4 分钟且零反馈），stage 打印协程与 HITL 行读接入取消 token（TUI 不再卡「正在取消当前任务...」）。见 `docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md` §11、`tmpPlan/2026-10-08_02-*.md`。
 - **TUI 粘贴只显示一遍（第 131 轮）**：多行/超长粘贴在**粘贴瞬间**已回显前 4 行预览，提交时不再全量重复回显原文，改为回显输入行 marker 形态 + 一行「已按原文完整发送 N 行 / M 字」；纯键盘输入路径完全不变。见 `src/tui/paste.rs::plan_submit_echo_with_paste`。
+- **终端守卫（第 136 轮）**：`src/tui/term_guard.rs`。macOS 实测事故——终端窗口/标签被关后
+  pty master 关闭，slave 的 `read()` 恒返回 EOF，而 crossterm 0.27 的 `event::poll(timeout)`
+  与 `event::read()` 在该状态下**都会永久 hang**（`mio.rs:95-120` 内层循环不检查超时、
+  `Ok(0)` 不 break），表现为 100% CPU 空转；又因 `shutdown.rs` 为 SIGHUP/SIGTERM 注册的
+  handler 只写标志位不触发退出（注册 handler 还会抑制内核默认终止动作），主线程卡在
+  `read()` 里回不到 `tui/mod.rs` 的检查点，导致**进程永不退出且 `kill` 无效**（只有 `kill -9`
+  能杀）。修复三层：(1) 独立 `std::thread` 看门狗轮询 fd 0 的 `POLLHUP`（实测 master 关闭后
+  立即触发、只订阅 `POLLHUP` 即够），命中即清理退出；shutdown 已触发超 10s 宽限也强制退出，
+  让 `kill` 真正有效。(2) 收口**不能**用 `shutdown::terminal_restore_sync()`——它抢 Rust stdio
+  全局互斥锁，主线程卡死时永不释放，守卫线程会一起卡死（日志已打「强制退出」但进程仍活着），
+  改用 `libc::write(2)` 直写 fd 1/2 的 `force_terminal_restore()`，并加 3s 无条件退出的保险丝
+  线程。(3) 全部 4 个读事件入口（`read_line_inner` 主循环 / 快速输入排空 / `drain_paste_burst` /
+  `engine.rs::read_key` 即 `/provider *` 子屏）补「进 `event::read()` 前先做 0 超时挂断探测」。
+  `isatty(0)` 门控，非 TTY（管道 / CI / e2e）一律跳过，零误杀（实测健康 TUI 连续 45s 不被杀）。
+  同轮顺带修：两条提前 `return Err` 路径跳过 `terminal_restore()`（关掉后终端滚动区/底部面板残留）、
+  TUI 退出不调 `BrowserManager::shutdown()`（Windows 无 atexit 又无 Drop，Chrome 留后台）、
+  `macos_legacy` 的 `open().spawn()` 泄漏 zombie、`human_ui` payload 临时文件改 RAII 清理。
+  详见 `docs/TUI输入处理常见陷阱与修复记录.md` §N 与
+  `tmpPlan/2026-10-09_终端消失后进程空转不退根治.md`。
 - **任务锚点（TargetAnchor，第 128 轮）**：从用户原文机械抽取的目标硬约束（不经 LLM，不可幻觉、不可丢失），全局单例（`src/agent/safety/target_anchor.rs`，与 `BrowserManager::global()` / `HumanAssistHub::global()` 同构；进程内 `tokio::task_local!` 同样可以但本轮选全局槽）。跨五层设防：(L0) 输入保真粘贴窗口加宽 + `prompt_lines/prompt_chars` 提交留痕；(L1) 编排器澄清门 `OrchestrationOutcome::DirectAnswer`，Yolo 填 `target_status="unresolved"` 或机械通道命中「指代 + 零主机」时触发；(L2) Main-Work 提示词第六条约束 + `plan_validate.rs` 澄清单元阻断（伪门在 DAG 里无法暂停等待用户，拆了就被秒级打回）；(L3) `MCP_Web_Use action=open/navigate/new_tab` 显式 URL 动作越界返回 `code=6001`，新开 6xxx「范围约束」段，避开 5xxx（MCP_Use）和 4xxx（HITL）的语义冲突；存活浏览器页面提示按 anchor 二分渲染为「✓ 可复用 / ⚠ 禁止复用」组，切断上一轮失败页面被当本轮权威上下文的漂移洗白通道；(L4) QC 目标一致性硬门（与第 109 轮桌面目标保真同形态）+ `target_drift` 强信号（命中即 `is_failed()`）。**第 135 轮收窄**：`detect_target_drift` 不再对整段 `args_json` 跑全文主机扫描，改为解析参数 JSON 后**只取显式导航位 URL**（`open` 顶层 `url`；`control` 里 `navigate`/`new_tab`/`download` 的 `params.url`；`sequence`/`batch` 的 `steps[].params.url`），这些字段只走 scheme 通道，且**跳过 `ok=false`**（被 6001 拦下的尝试不重复计强信号）；裸主机通道同时拒识「标识符续接」片段（紧跟 `-`/`_`/`.` 说明是 CSS 类名 / JS 标识符而非域名）。根因：实测 `div.kr-loading-more-button` 这个 CSS 类名被截成主机 `div.kr`，产出 `target_drift` **误报**强信号，经 `is_failed()` 把 QC 的 pass 强制降级为 Fail，合法单元不可恢复。决策审计新增第 6 决策点 `target_anchor`，阶段 `extract` / `clarify`。实测（`-p` 单轮）：事故精确复现输入下 `outcome="clarification_needed"`、27 秒、零 MCP_Web_Use 调用、零 WorkFlow 单元；对照事故 365 秒、4 个 wf 全在 `ithome.com`、记为「✅ 成功」。开关 `LAEW_TARGET_ANCHOR=off` 全关回退，`LAEW_TARGET_ANCHOR_BLOCK=off` 仅关 L3 阻断保留观察。
 
 ### 多 Agent 架构（8 角色）
@@ -196,6 +215,7 @@ tui/
   pathfmt.rs       路径格式化辅助(相对路径展示/工作目录锚定)
   textfit.rs       显示宽度唯一真源:char_width/width/clip/clip_mid/wrap/pad + InfoBox 自适应信息盒(横幅与 /help 共用)
   theme.rs         ANSI 颜色 / mask_key 脱敏 / attrs·bg·color→ANSI 转换 集中管理
+  term_guard.rs    终端守卫(第 136 轮):看门狗线程 + POLLHUP 挂断探测 + 无锁终端还原
   screen/
     provider_list.rs   /provider list —— Tab 化展示 + 操作按钮
     provider_form.rs   /provider add —— 5+1 Tab 表单

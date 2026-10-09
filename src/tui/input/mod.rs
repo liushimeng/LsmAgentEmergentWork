@@ -169,6 +169,11 @@ fn drain_paste_burst(pending: &mut Option<Event>) -> Option<String> {
     let mut events = Vec::new();
     let mut grace_left = PASTE_BURST_GRACE_ROUNDS;
     loop {
+        // 第 136 轮:终端挂断时 `event::poll` 会**恒返回 true**(POLLIN 一直就绪),
+        // 紧接着的 `event::read()` 就进了 crossterm 的内部死转。这里提前收口。
+        if crate::tui::term_guard::stdin_hangup() {
+            break;
+        }
         match event::poll(Duration::ZERO) {
             Ok(true) => {
                 if let Ok(ev) = event::read() {
@@ -410,6 +415,16 @@ impl InputHandler {
         self.redraw_line(&mut stdout, &layout, prompt, &buffer, cursor)?;
 
         loop {
+            // 第 136 轮:进 `event::read()` 之前先做一次 0 超时的终端挂断探测。
+            // crossterm 0.27 的 `event::read()` 在「fd 可读却读不到字节」(pty master
+            // 关闭 → `read()` 恒返回 EOF)时会在 `try_read` 里**无限重试**,既不返回
+            // 事件也不返回错误 —— 外部表现为 100% CPU 空转且进程永不退出。
+            // 这里提前判定并退出,把它挡在门外(纵深防御:主修复是 term_guard 看门狗,
+            // 它负责「已经卡在 read() 里」的场景)。
+            if crate::tui::term_guard::stdin_hangup() {
+                break;
+            }
+
             // 读取事件(优先取批量合并时暂存的 pending)
             let ev = match pending.take() {
                 Some(e) => e,
@@ -948,6 +963,12 @@ impl InputHandler {
                             // 同类事件一次性插入,最后统一一次重绘,避免逐字重绘卡顿。
                             // 非字符事件存入 pending,下轮循环优先处理(不丢事件)。
                             loop {
+                                // 第 136 轮:同 read_line_inner 主循环,排空快速输入前
+                                // 先确认终端没消失 —— 终端挂断时 `poll` 恒返回 true,
+                                // 下面的 `event::read()` 会陷入 crossterm 内部死转。
+                                if crate::tui::term_guard::stdin_hangup() {
+                                    break;
+                                }
                                 match event::poll(Duration::ZERO) {
                                     Ok(true) => match event::read() {
                                         Ok(Event::Key(k2))

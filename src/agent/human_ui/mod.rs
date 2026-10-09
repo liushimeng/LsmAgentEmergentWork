@@ -274,17 +274,36 @@ pub async fn present(display: &HumanAssistDisplay) -> UiResult {
         Ok(p) => p,
         Err(e) => return UiResult::Error(e),
     };
+    // 第 136 轮:payload 临时文件改用 RAII 守卫清理(与 `MaterializedScript` 同构)。
+    //
+    // 原实现是「`run_platform(...).await` 之后才 remove_file」。而 `present_via_gui`
+    // 在超时/取消路径上会**直接 drop 整个 future**,`await` 之后的代码根本不执行 ——
+    // 每弹一次超时或取消,`/tmp/laew_human_ui_payload_{pid}_{id}.json` 就漏一个,
+    // 长跑会持续堆积(用户反馈「好多进程没关」的同类观感问题)。
+    // Drop 守卫在**任何**退出路径(正常 / 提前 drop / panic unwind)都会清理。
+    let payload_guard = PayloadFileGuard(Some(payload_path.clone()));
     let materialized = match resolved.materialize() {
         Ok(m) => m,
         Err(e) => {
-            let _ = std::fs::remove_file(&payload_path);
+            drop(payload_guard);
             return UiResult::Error(e);
         }
     };
     let res = run_platform(&materialized.path, &payload_path).await;
-    let _ = std::fs::remove_file(&payload_path);
+    drop(payload_guard);
     drop(materialized); // 内置脚本的临时文件在此清理
     res
+}
+
+/// `/tmp` payload 临时文件的 RAII 清理守卫(第 136 轮)。
+struct PayloadFileGuard(Option<std::path::PathBuf>);
+
+impl Drop for PayloadFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// 平台分发:macOS osascript(JXA)/ Windows powershell(WinForms)。

@@ -358,8 +358,23 @@ pub fn present(frame: &Frame) -> io::Result<()> {
 }
 
 /// 读取一个 Key 事件(只读 Press 事件,过滤 Release/Repeat)。
+///
+/// 第 136 轮:每轮循环前做一次 0 超时的终端挂断探测。crossterm 0.27 的
+/// `event::read()` 在「fd 可读却读不到字节」(pty master 关闭 → `read()` 恒返回
+/// EOF/非 WouldBlock 错误)时会在内部 `loop` 里**无限重试**且不检查超时 —— 既不
+/// 返回事件也不返回错误,外部表现为 100% CPU 空转。
+///
+/// 本函数是 `/provider list|add|del` 等**子屏**的按键入口,与主屏 `read_line`
+/// 同源同病:终端在子屏打开期间被关掉,同样会挂死。命中挂断时返回 `Interrupted`
+/// —— 子屏拿到这个 io::ErrorKind 会走既有的退出路径,不留残屏。
 pub fn read_key() -> io::Result<KeyEvent> {
     loop {
+        if crate::tui::term_guard::stdin_hangup() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "终端已断开",
+            ));
+        }
         if let crossterm::event::Event::Key(k) = crossterm::event::read()? {
             if k.kind == KeyEventKind::Press {
                 return Ok(k);
