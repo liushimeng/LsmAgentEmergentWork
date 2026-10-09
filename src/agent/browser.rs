@@ -198,120 +198,18 @@ async fn inject_agent_highlight(page: &Page) {
 /// 未安装浏览器哨兵:BrowserNew 据此返回错误码 3001。
 pub const NO_BROWSER_SENTINEL: &str = "NO_BROWSER";
 
-/// 2026-09-17 第 74 轮:浏览器启动模式三档枚举。
-///
-/// - `Hidden`:纯 CDP 嵌入式无头(`--headless=new`,系统级无窗口),推荐默认;
-/// - `NewHeadless`:`--headless=new` 老式(headless=true 路径),保留兼容;
-/// - `Headed`:有窗口浏览器(用户调试/截图场景),默认禁止。
-///
-/// 工具面 `BrowserNew` 默认 `hidden`,仅当用户显式 `mode=headed` 才出窗口。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrowserMode {
-    Hidden,
-    NewHeadless,
-    Headed,
-}
-
-impl BrowserMode {
-    pub fn from_env_or_default() -> Self {
-        // 显式环境变量优先(供调试/QA/截图场景)。
-        if let Ok(v) = std::env::var("LAEW_BROWSER_MODE") {
-            match v.to_ascii_lowercase().as_str() {
-                "headed" | "head" | "with_head" | "false" | "0" => return Self::Headed,
-                "new_headless" | "old_headless" | "true" | "1" => return Self::NewHeadless,
-                "hidden" | "inprocess" | "cdp_only" => return Self::Hidden,
-                _ => {}
-            }
-        }
-        // 兼容旧 bool 开关。
-        match std::env::var("LAEW_BROWSER_HEADLESS").ok().as_deref() {
-            Some("0") | Some("false") | Some("no") | Some("off") => Self::Headed,
-            _ => Self::Hidden, // 默认无窗口,与 74 轮修复目标一致
-        }
-    }
-}
-
-// =================== 第 125 轮(2026-09-23):视口基准 1080p 与 2K 自动扩展 ===================
-
-/// 全模式默认启动窗口:1920×1080(1080p)。hidden 原 1440×900 视口过窄,
-/// 现代 Web 应用(min-width > 1440 的后台/SaaS)横向被裁 → 元素不可见不可点、
-/// 截图显示不全,本轮根治。
-pub const DEFAULT_WINDOW_W: u32 = 1920;
-/// 全模式默认启动窗口高(1080p)。
-pub const DEFAULT_WINDOW_H: u32 = 1080;
-/// 视口自动扩展上限宽(2K = 2560×1440):内容超此宽度仍溢出时保持滚动 +
-/// full_page 截图既有路径,不再无限撑大。
-pub const VIEWPORT_FIT_MAX_W: u32 = 2560;
-/// 视口自动扩展上限高(2K)。
-pub const VIEWPORT_FIT_MAX_H: u32 = 1440;
-/// 溢出判定容差(px):亚像素布局/阴影圆角/1px 边框误差不触发扩展。
-const VIEWPORT_FIT_TOL: f64 = 2.0;
-
-/// 默认启动窗口尺寸(第 125 轮:全模式统一 1080p)。
-pub fn default_window_size() -> (u32, u32) {
-    (DEFAULT_WINDOW_W, DEFAULT_WINDOW_H)
-}
-
-/// 单维度适配判定:内容维度 > 视口维度 + 容差 且仍有扩展空间时返回 Some(目标)。
-/// 只放大不缩小;当前已 ≥ cap 时维持原状(返回 None,交给滚动/full_page)。
-fn fit_dim(cur: f64, content: f64, cap: u32) -> Option<u32> {
-    if content <= cur + VIEWPORT_FIT_TOL {
-        return None;
-    }
-    let cur_i = cur.max(0.0).ceil() as u32;
-    if cur_i >= cap {
-        return None;
-    }
-    let target = content.ceil() as u32;
-    let target = target.clamp(cur_i + 1, cap);
-    if target > cur_i {
-        Some(target)
-    } else {
-        None
-    }
-}
-
-/// 视口自动扩展决策(纯函数,可单测):输入当前视口 (iw,ih) 与内容滚动尺寸
-/// (sw,sh),需要扩展返回 Some((target_w,target_h)),否则 None。
-pub fn viewport_fit_plan(
-    iw: f64,
-    ih: f64,
-    sw: f64,
-    sh: f64,
-    max_w: u32,
-    max_h: u32,
-) -> Option<(u32, u32)> {
-    match (fit_dim(iw, sw, max_w), fit_dim(ih, sh, max_h)) {
-        (Some(w), Some(h)) => Some((w, h)),
-        (Some(w), None) => Some((w, ih.max(0.0).ceil() as u32)),
-        (None, Some(h)) => Some((iw.max(0.0).ceil() as u32, h)),
-        (None, None) => None,
-    }
-}
-
-/// 视口/内容尺寸测量 JS(fit 与截图溢出提示共用)。
-const VIEWPORT_METRICS_JS: &str = r#"(() => {
-    const de = document.documentElement, b = document.body;
-    const sw = Math.max(de ? de.scrollWidth : 0, b ? b.scrollWidth : 0);
-    const sh = Math.max(de ? de.scrollHeight : 0, b ? b.scrollHeight : 0);
-    return {
-        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
-        scrollWidth: sw, scrollHeight: sh,
-        devicePixelRatio: window.devicePixelRatio || 1,
-    };
-})()"#;
-
-/// 读取页面视口 + 内容滚动尺寸(CDP evaluate,returnByValue)。
-pub(crate) async fn page_viewport_metrics(
-    page: &chromiumoxide::Page,
-) -> std::result::Result<Value, String> {
-    page.evaluate(VIEWPORT_METRICS_JS)
-        .await
-        .map_err(|e| format!("测量视口失败: {e}"))?
-        .value()
-        .cloned()
-        .ok_or_else(|| "测量视口失败: 返回为空".to_string())
-}
+// 第 139 轮:模式决策搬到 `super::browser_mode`,窗口/视口尺寸决策搬到
+// `super::browser_viewport`。此处 `pub use` 再导出,保证所有
+// `crate::agent::browser::XXX` 外部引用路径零改动。
+pub use super::browser_mode::BrowserMode;
+pub use super::browser_viewport::{
+    default_window_size, headed_window_plan, viewport_fit_plan, DEFAULT_WINDOW_H,
+    DEFAULT_WINDOW_W, HEADED_SCREEN_MARGIN, MIN_VIEWPORT_H, MIN_VIEWPORT_W, VIEWPORT_FIT_MAX_H,
+    VIEWPORT_FIT_MAX_W,
+};
+pub(crate) use super::browser_viewport::{
+    headed_window_metrics, page_viewport_metrics, VIEWPORT_FIT_TOL,
+};
 
 /// 按平台优先级探测 Chrome / Edge / Chromium / Brave 可执行文件。
 ///
@@ -805,6 +703,71 @@ impl BrowserManager {
             .await
             .map_err(|e| format!("读取视口失败:{e}"))?;
         Ok(viewport.value().cloned().unwrap_or(Value::Null))
+    }
+
+    /// 第 139 轮:有头模式窗口收边 —— 保证「窗口完整落在屏幕内 + 视口 ≥ 720p」。
+    ///
+    /// 背景(实测 2026-10-09):窗口固定 `--window-size=1920,1080`,在
+    /// 1440×900 / 1512×982 之类的小屏笔记本上右侧与底部被挤出屏幕外,用户看到的
+    /// 就是「显示不全」。本方法在导航完成后实测 `window.screen.avail*`(工作区,
+    /// 已扣 Dock)与 `outer*/inner*`(外框与 chrome 高度),交
+    /// [`headed_window_plan`] 决策,必要时走 `Browser.setWindowBounds` 收边。
+    ///
+    /// 契约:
+    /// - 仅对有头模式有意义(无头没有可见窗口,收边只会白折腾),故内部自判;
+    /// - **必须早于** [`BrowserManager::fit_viewport_to_content`] 调用 ——
+    ///   `set_window_bounds` 会清除 `Emulation.setDeviceMetricsOverride`,晚一步
+    ///   会把刚设的视口覆盖抹掉;
+    /// - fail-open:测量或调整失败只回 `adjusted:false` + 原因,不影响 open 语义。
+    pub async fn fit_headed_window(
+        &self,
+        page_id: &str,
+    ) -> std::result::Result<Value, String> {
+        let inner_mode = self.inner.lock().await.mode;
+        let base = json!({
+            "mode": inner_mode.as_str(),
+            "min_viewport": [super::browser_viewport::MIN_VIEWPORT_W, super::browser_viewport::MIN_VIEWPORT_H],
+        });
+        if !inner_mode.is_headed() {
+            return Ok(json!({ "adjusted": false, "reason": "非有头模式,无需收边", "base": base }));
+        }
+        let page = self
+            .page(page_id)
+            .await
+            .ok_or_else(|| "page_id 不存在".to_string())?;
+        let m = headed_window_metrics(&page).await?;
+        let f = |k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let (ow, oh) = (f("outerWidth"), f("outerHeight"));
+        let (iw, ih) = (f("innerWidth"), f("innerHeight"));
+        let chrome = oh - ih;
+        let (aw, ah) = (f("availWidth"), f("availHeight"));
+        let measured = json!({
+            "screen": {"avail_width": aw, "avail_height": ah},
+            "outer": {"width": ow, "height": oh},
+            "inner": {"width": iw, "height": ih},
+            "chrome_height": chrome,
+        });
+        let Some((tw, th)) = headed_window_plan(ow, oh, aw, ah, chrome) else {
+            return Ok(json!({
+                "adjusted": false,
+                "reason": "窗口已完整落在屏幕内且视口不低于下限",
+                "measured": measured,
+                "base": base,
+            }));
+        };
+        // 只传 width/height,不动 left/top —— 保持用户/Chrome 已有的窗口位置。
+        let applied = self
+            .set_window_bounds(page_id, Some(tw as i64), Some(th as i64), None, None, None)
+            .await?;
+        Ok(json!({
+            "adjusted": true,
+            "from": {"width": ow, "height": oh},
+            "target": {"width": tw, "height": th},
+            "measured": measured,
+            "applied": applied.get("window").cloned().unwrap_or(Value::Null),
+            "note": "有头模式窗口已按屏幕工作区收边,保证完整可见;页面视口下限 720p、默认 1080p",
+            "base": base,
+        }))
     }
 
     /// 第 125 轮:页面内容超出视口时自动扩展视口(上限 2K)。
@@ -1763,53 +1726,6 @@ mod tests {
     }
 
     // 2026-09-17 第 74 轮:BrowserMode 三档枚举测试。
-    // ★ 2026-09-17 第 79 轮:环境变量类测试用互斥锁串行 —— 4 个测试并行跑时
-    // set_var/remove_var 互相踩(default 测试读到 env_overrides 设置的 headed),
-    // 全量 `cargo test` 偶发失败(存量 flaky,与功能无关)。
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    #[test]
-    fn browser_mode_default_is_hidden() {
-        let _g = env_lock();
-        unsafe { std::env::remove_var("LAEW_BROWSER_MODE") };
-        unsafe { std::env::remove_var("LAEW_BROWSER_HEADLESS") };
-        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Hidden);
-    }
-
-    #[test]
-    fn browser_mode_env_overrides() {
-        let _g = env_lock();
-        unsafe { std::env::set_var("LAEW_BROWSER_MODE", "headed") };
-        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Headed);
-        unsafe { std::env::set_var("LAEW_BROWSER_MODE", "new_headless") };
-        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::NewHeadless);
-        unsafe { std::env::set_var("LAEW_BROWSER_MODE", "hidden") };
-        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Hidden);
-        unsafe { std::env::remove_var("LAEW_BROWSER_MODE") };
-    }
-
-    #[test]
-    fn browser_mode_legacy_headless_env() {
-        let _g = env_lock();
-        unsafe { std::env::set_var("LAEW_BROWSER_HEADLESS", "0") };
-        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Headed);
-        unsafe { std::env::set_var("LAEW_BROWSER_HEADLESS", "false") };
-        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Headed);
-        unsafe { std::env::remove_var("LAEW_BROWSER_HEADLESS") };
-        assert_eq!(BrowserMode::from_env_or_default(), BrowserMode::Hidden);
-    }
-
-    #[test]
-    fn browser_mode_invalid_env_does_not_panic() {
-        let _g = env_lock();
-        unsafe { std::env::set_var("LAEW_BROWSER_MODE", "garbage") };
-        unsafe { std::env::remove_var("LAEW_BROWSER_HEADLESS") };
-        // 只确保不 panic;非法值走默认 fallback
-        let _ = BrowserMode::from_env_or_default();
-        unsafe { std::env::remove_var("LAEW_BROWSER_MODE") };
-    }
+    // ★ 2026-10-09 第 139 轮:模式决策与 env 解析整体搬到 `super::browser_mode`,
+    // 对应单测同步搬到 `browser_mode::tests`(默认语义也改为「可见模式」)。
 }

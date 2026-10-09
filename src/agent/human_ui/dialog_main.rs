@@ -80,6 +80,28 @@ impl DialogPayload {
         info
     }
 
+    /// 「📋 复制」写入剪贴板的完整文本(第 139 轮;macOS/Windows 共用)。
+    ///
+    /// 比 `info_text` 多带:类型标签、提出/截止时刻、候选选项列表 —— 人工要把
+    /// 这些信息粘到工单/聊天窗口时,不必逐行从屏幕上捞(倒计时行每秒刷新,
+    /// 拖选会被重绘冲掉)。
+    pub(super) fn copy_text(&self) -> String {
+        let mut s = format!("【人工介入 · {}】\n", self.kind_label);
+        s.push_str(&self.info_text());
+        s.push_str(&format!(
+            "\n提出时间: {}   超时截止: {}",
+            self.started_clock(),
+            self.deadline_clock()
+        ));
+        if !self.options.is_empty() {
+            s.push_str("\n候选选项:");
+            for (i, o) in self.options.iter().enumerate() {
+                s.push_str(&format!("\n{}. {}", i + 1, o));
+            }
+        }
+        s
+    }
+
     /// 提出时刻 `HH:MM:SS`(时间轴第一行;started_at_ms 未记录时由子进程自证)。
     pub(super) fn started_clock(&self) -> String {
         let ms = if self.started_at_ms > 0 {

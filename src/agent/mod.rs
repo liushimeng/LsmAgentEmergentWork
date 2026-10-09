@@ -14,6 +14,8 @@ pub mod agent_loop;
 pub mod agent_message;
 pub mod attachments;
 pub mod browser;
+pub mod browser_mode;
+pub mod browser_viewport;
 pub mod browser_watchdog;
 pub mod cancel;
 pub mod compact;

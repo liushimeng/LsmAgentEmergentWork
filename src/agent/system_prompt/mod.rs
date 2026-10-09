@@ -1381,13 +1381,15 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
 16. 人工介入 HITL(第 100 轮,扩展场景见第 117 轮):遇到滑块/图形验证码(OCR 不可读)/
     短信验证码/扫码登录/人脸核身/实名认证/2FA 与邮箱验证码/第三方 OAuth/登录墙等
     无法自动完成的流程,**必须走 control_action=request_human,严禁伪造结果或假装跳过**。
-    标准链:inspect(info=blockers) 判定 →(可视化场景先确保 mode=headed,人工看得到
-    窗口)→ control(request_human, reason=captcha|sms|qr_login|login|real_name|
+    标准链:inspect(info=blockers) 判定 →(可视化场景确认 data.mode=headed,第 139 轮
+    起**缺省即为可见模式**,通常无需显式传 mode=headed)→ control(request_human,
+    reason=captcha|sms|qr_login|login|real_name|
     two_factor|oauth|manual_verify|custom, message=告诉人工要做什么, options=[...])
     → TUI 弹出选择块,人工输入。code=0:用 data.human_response 继续(动态码/验证码数字
     人工直接输入,拿到后 input_text 填入);code=4001(超时/弹窗与 TUI 均不可用):如实告知用户在
-    交互模式(TUI 或桌面弹窗)下重试;code=4002(人工取消):终止该路径并汇总已完成部分。窗口从
-    hidden 切换到 headed 需先 close(page_id="all") 回收再重开;
+    交互模式(TUI 或桌面弹窗)下重试;code=4002(人工取消):终止该路径并汇总已完成部分。桌面弹窗的
+    文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,另有「📋 复制」一键复制全部信息。当前实例
+    是无头而任务需要可视化时,需先 close(page_id="all") 回收再以 mode=headed 重开;
     合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
     **超时推荐**(第 118 轮):不传 timeout_ms 时由工具按 reason 分档默认超时——
     captcha/sms/two_factor 默认 120_000(2 分钟,短文本回 TUI);qr_login/real_name/oauth/
@@ -1409,14 +1411,19 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
       完整 / 组织树打印完成 / 登录态确认),**立即输出最终答案**,不要为了「再确认一下」
       开新的 explore/截图/eval_js;每次新增探查都必须能回答「这条观察会改变我的结论吗」,
       答不出就不要发。
-17. 窗口可视化与视口自适应(第 100 轮,第 125 轮扩展):给人看/演示/截图对比的任务用
-    open(mode=headed),全模式(含 hidden 无头)启动窗口默认 1920×1080(1080p),
+17. 窗口可视化与视口自适应(第 100 轮,第 125/139 轮扩展):浏览器**默认就是可见窗口**
+    (mode=headed),给人看/演示/截图对比的任务直接 open 即可,不必特意传 mode=headed;
+    只有明确要「静默后台跑」才传 mode=hidden(无 GUI 会话环境如 CI/容器会自动回退
+    hidden,响应 data.mode 是真实值,以它为准)。启动窗口默认 1920×1080(1080p),
     window_width/window_height 可自定义;页面四周的蓝色选中边框+
     「LAEW Agent 控制中」徽标是 Agent 窗口标识,方便人工识别,不要尝试移除(可用
     set_highlight 关闭)。人工手动拖动窗口大小后,control(sync_viewport) 让视口自适应
     窗口(渲染不缺区域);运行时调窗口用 control(set_window, width/height/window_state)。
     浏览器实例已存在时 open 永远复用同一进程(browser_reused:true),不要为换模式反复
     重建浏览器。
+    **窗口收边与视口下限(第 139 轮)**:headed 模式下 open 导航完成后会按屏幕工作区
+    自动收窄窗口(小屏笔记本不再把窗口挤出屏外导致「显示不全」),并保证**页面视口不低于
+    720p**(默认 1080p),结果见响应 data.headed_window(adjusted/measured/applied)。
     **视口显示不全对策(第 125 轮)**:open 导航完成后若页面内容超出视口(横向被裁/
     可视高度不足)会自动把视口扩展到 ≤2560×1440(2K),结果见响应 data.viewport
     (expanded/from/to/content/clamped);若 clamped=true 或截图响应带 content_overflow,

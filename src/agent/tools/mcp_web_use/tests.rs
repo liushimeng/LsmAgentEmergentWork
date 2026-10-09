@@ -87,11 +87,19 @@ fn parameters_info_enum_complete() {
 }
 
 #[test]
-fn parameters_mode_defaults_hidden() {
+fn parameters_mode_defaults_headed() {
+    // 第 139 轮:缺省可见模式(与 `BrowserMode::DEFAULT` 一致)。
     let p = McpWebUseTool.parameters();
     let mode = p["properties"]["mode"].clone();
     assert!(mode.is_object(), "mode 字段应为对象");
-    assert_eq!(mode["default"], "hidden", "默认 mode 应为 hidden");
+    assert_eq!(
+        mode["default"], "headed",
+        "默认 mode 应为 headed(可见模式)"
+    );
+    assert_eq!(
+        mode["default"], crate::agent::browser::BrowserMode::DEFAULT.as_str(),
+        "schema default 必须与 BrowserMode::DEFAULT 同源,不允许两处各写一份"
+    );
 }
 
 // =================== 参数校验(无需真实浏览器) ===================
@@ -211,15 +219,18 @@ async fn list_always_returns_ok() {
 async fn open_no_browser_or_succeeds() {
     // 无 Chrome 时返回 3001 + 安装提示;有 Chrome 时返回 0 + page_id + next_steps。
     // 运行环境可能安装了 Chrome,兼容两种路径。
+    // ★ 第 139 轮:显式传 mode=hidden —— 缺省已是可见模式,不显式关掉的话
+    // 开发者本机跑 `cargo test` 会被弹出一个真实 Chrome 窗口。
     let res = McpWebUseTool
-        .execute(json!({"action": "open", "url": "https://example.com"}))
+        .execute(json!({"action": "open", "url": "https://example.com", "mode": "hidden"}))
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).expect("响应应为合法 JSON");
     let code = v["code"].as_i64().unwrap_or(-1);
     if code == 0 {
-        // 成功路径:验证 mode=hidden + page_id + next_steps 非空
-        assert_eq!(v["data"]["mode"], "hidden", "默认 mode 应为 hidden");
+        // 成功路径:验证显式 mode 覆盖生效 + page_id + next_steps 非空
+        assert_eq!(v["data"]["mode"], "hidden", "显式 mode=hidden 应被尊重");
+        assert!(v["data"]["page_id"].as_str().unwrap_or("").starts_with("p_"));
         assert!(v["data"]["page_id"].as_str().unwrap_or("").starts_with("p_"));
         let steps = v["data"]["next_steps"].as_array()
             .expect("成功响应必须包含 next_steps 数组");

@@ -90,6 +90,8 @@ macro_rules! msg {
 
 msg!(send_id, () -> Id);
 msg!(send_id_id, (arg: Id) -> Id);
+msg!(send_id_id_id_id, (a: Id, b: Id, c: Id) -> Id);
+msg!(send_bool_id_id, (a: Id, b: Id) -> bool);
 msg!(send_id_cstr, (arg: *const c_char) -> Id);
 msg!(send_id_usize, (arg: usize) -> Id);
 msg!(send_id_rect, (rect: NSRect) -> Id);
@@ -163,10 +165,17 @@ const BTN_H: f64 = 30.0;
 const GAP: f64 = 8.0;
 const CANCEL_W: f64 = 84.0;
 const SUBMIT_W: f64 = 84.0;
+const COPY_W: f64 = 92.0;
 const ORIG_W: f64 = 110.0;
-const ZOOM_W: f64 = 110.0;
+const ZOOM_W: f64 = 104.0;
 const INNER: f64 = 8.0;
 const IMG_HINT_H: f64 = 14.0;
+
+/// 复制按钮的两个标题(第 139 轮:一键复制全部信息,免去在倒计时行里拖选)。
+const COPY_BTN_TITLE: &str = "📋 复制";
+const COPY_BTN_DONE: &str = "✓ 已复制";
+/// 「✓ 已复制」保持时长(秒);由既有 1s 倒计时 tick 负责回滚。
+const COPY_FEEDBACK_SECS: u64 = 2;
 
 /// 一组布局参数(说明区高 / 图区高;img_h = 0 表示无图)。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -188,6 +197,7 @@ struct Frames {
     opts: Vec<NSRect>,
     cancel: NSRect,
     submit: NSRect,
+    copy: NSRect,
     orig: NSRect,
     zoom: NSRect,
 }
@@ -236,6 +246,7 @@ fn layout_frames(cw: f64, ch: f64, geo: Geometry, opt_count: usize) -> Frames {
         opts,
         cancel: ns_rect(PAD, row_y, CANCEL_W, BTN_H),
         submit: ns_rect(PAD + CANCEL_W + INNER, row_y, SUBMIT_W, BTN_H),
+        copy: ns_rect(cw - PAD - ZOOM_W - INNER - ORIG_W - INNER - COPY_W, row_y, COPY_W, BTN_H),
         orig: ns_rect(cw - PAD - ZOOM_W - INNER - ORIG_W, row_y, ORIG_W, BTN_H),
         zoom: ns_rect(cw - PAD - ZOOM_W, row_y, ZOOM_W, BTN_H),
     }
@@ -277,6 +288,7 @@ struct Views {
     opts: Vec<Id>,
     cancel: Id,
     submit: Id,
+    copy: Id,
     orig: Id,
     zoom: Id,
 }
@@ -285,6 +297,10 @@ struct MacState {
     views: Views,
     options: Vec<String>,
     image_open_path: Option<String>,
+    /// 「📋 复制」写入剪贴板的文本(第 139 轮:一键复制全部信息)。
+    copy_payload: String,
+    /// 「✓ 已复制」反馈的回滚时刻(由 `on_tick` 消费)。
+    copied_at: Option<Instant>,
     /// 正常态布局(还原用)。
     normal_geo: Geometry,
     normal_content: (f64, f64),
@@ -345,18 +361,27 @@ extern "C" fn on_open_image(_self: Id, _cmd: Sel, _sender: Id) {
 
 extern "C" fn on_tick(_self: Id, _cmd: Sel, _sender: Id) {
     // 单次锁定取出所需;**必须先解锁再 finish**(finish 会再次锁定 STATE)。
-    let (label, text, timed_out) = {
-        let guard = state();
-        let Some(st) = guard.as_ref() else { return };
+    let (label, text, timed_out, rollback_copy) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
         if st.done {
             return;
         }
         let elapsed = st.started.elapsed().as_millis() as u64;
         let remain = st.timeout_ms.saturating_sub(elapsed);
+        // 第 139 轮:「✓ 已复制」反馈到期回滚标题(不额外起定时器,复用 1s tick)。
+        let rollback = match st.copied_at {
+            Some(at) if at.elapsed().as_secs() >= COPY_FEEDBACK_SECS => {
+                st.copied_at = None;
+                Some(st.views.copy)
+            }
+            _ => None,
+        };
         (
             st.views.t2,
             countdown_text(elapsed, remain),
             remain == 0,
+            rollback,
         )
     };
     if !label.is_null() {
@@ -364,8 +389,53 @@ extern "C" fn on_tick(_self: Id, _cmd: Sel, _sender: Id) {
             send_void_id(label, sel(b"setStringValue:\0"), ns_str(&text));
         }
     }
+    if let Some(btn) = rollback_copy {
+        unsafe {
+            if !btn.is_null() {
+                send_void_id(btn, sel(b"setTitle:\0"), ns_str(COPY_BTN_TITLE));
+            }
+        }
+    }
     if timed_out {
         finish("timeout", -1);
+    }
+}
+
+/// 第 139 轮:「📋 复制」—— 把说明 + 页面 URL + 页面 ID 一次性写入系统剪贴板。
+///
+/// 为什么不让用户自己在倒计时行里拖选:那一行每秒刷新,拖选过程中就被重绘冲掉;
+/// 一键复制是确定性最高的路径,顺带把「页面 URL」「验证码提示」一起带走。
+unsafe fn copy_to_pasteboard(text: &str) -> bool {
+    let pb = send_id(cls(b"NSPasteboard\0"), sel(b"generalPasteboard\0"));
+    if pb.is_null() {
+        return false;
+    }
+    send_void(pb, sel(b"clearContents\0"));
+    // NSPasteboardTypeString = "public.utf8-plain-text"(SDK 常量,勿改)。
+    send_bool_id_id(
+        pb,
+        sel(b"setString:forType:\0").cast_mut(),
+        ns_str(text),
+        ns_str("public.utf8-plain-text"),
+    )
+}
+
+extern "C" fn on_copy(_self: Id, _cmd: Sel, _sender: Id) {
+    let (payload, btn) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
+        if st.done {
+            return;
+        }
+        st.copied_at = Some(Instant::now());
+        (st.copy_payload.clone(), st.views.copy)
+    };
+    let ok = unsafe { copy_to_pasteboard(&payload) };
+    unsafe {
+        if !btn.is_null() {
+            let title = if ok { COPY_BTN_DONE } else { "⚠ 复制失败" };
+            send_void_id(btn, sel(b"setTitle:\0"), ns_str(title));
+        }
     }
 }
 
@@ -405,6 +475,7 @@ fn controller_class() -> Id {
             & ok(on_cancel, b"cancel:\0")
             & ok(on_zoom, b"zoom:\0")
             & ok(on_open_image, b"openImage:\0")
+            & ok(on_copy, b"copyInfo:\0")
             & ok(on_tick, b"tick:\0")
             & ok(on_focus_once, b"focusOnce:\0")
             & ok(on_window_will_close, b"windowWillClose:\0");
@@ -552,6 +623,7 @@ struct ViewsSnapshot {
     opts: Vec<Id>,
     cancel: Id,
     submit: Id,
+    copy: Id,
     orig: Id,
     zoom: Id,
 }
@@ -569,6 +641,7 @@ impl ViewsSnapshot {
             opts: v.opts.clone(),
             cancel: v.cancel,
             submit: v.submit,
+            copy: v.copy,
             orig: v.orig,
             zoom: v.zoom,
         }
@@ -601,6 +674,7 @@ unsafe fn apply_frames(v: &ViewsSnapshot, f: &Frames, geo: Geometry) {
     }
     set(v.cancel, f.cancel);
     set(v.submit, f.submit);
+    set(v.copy, f.copy);
     set(v.orig, f.orig);
     set(v.zoom, f.zoom);
 }
@@ -687,6 +761,9 @@ unsafe fn run_appkit(p: &DialogPayload) -> (String, String) {
 }
 
 unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
+    // ---- 主菜单(第 139 轮):必须在建任何控件之前装,保证 ⌘C/⌘V/⌘A 随时可用 ----
+    install_main_menu("人工介入");
+
     // ---- 控制器 ----
     let ctrl_cls = controller_class();
     if ctrl_cls.is_null() {
@@ -729,6 +806,8 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     let input = send_id(send_id(cls(b"NSTextField\0"), sel(b"alloc\0")), sel(b"init\0"));
     send_void_bool(input, sel(b"setBezeled:\0"), true);
     send_void_bool(input, sel(b"setEditable:\0"), true);
+    // 第 139 轮:显式声明可选中,不再依赖 editable 隐式带出的 field editor 行为。
+    send_void_bool(input, sel(b"setSelectable:\0"), true);
     send_void_id(input, sel(b"setFont:\0"), font(13.0, false));
     send_void_id(input, sel(b"setPlaceholderString:\0"), ns_str("可输入验证码/动态码/说明;留空点选项或提交"));
     send_void_id(input, sel(b"setTarget:\0"), ctrl);
@@ -744,6 +823,8 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     let submit = make_button("提交", Some("\r"), ctrl, b"submit:\0", -1);
     let zoom = make_button("⛶ 最大化", None, ctrl, b"zoom:\0", -1);
     let orig = make_button("查看原图", None, ctrl, b"openImage:\0", -1);
+    // 第 139 轮:一键复制全部信息(说明 + 页面 URL + 页面 ID + 候选选项)。
+    let copy_btn = make_button(COPY_BTN_TITLE, None, ctrl, b"copyInfo:\0", -1);
 
     // 图片尺寸标注(有图才有)
     let img_hint = img_hint_label;
@@ -772,6 +853,7 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     add(content, submit);
     add(content, zoom);
     add(content, orig);
+    add(content, copy_btn);
 
     send_void_id(
         t1,
@@ -797,6 +879,7 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         opts: opt_buttons,
         cancel,
         submit,
+        copy: copy_btn,
         orig,
         zoom,
     };
@@ -837,6 +920,8 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         views,
         options: p.options.clone(),
         image_open_path,
+        copy_payload: p.copy_text(),
+        copied_at: None,
         normal_geo: geo,
         normal_content: (fw, fh),
         img_ratio,
@@ -864,6 +949,84 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
 
 unsafe fn nsapp_ptr() -> Id {
     send_id(cls(b"NSApplication\0"), sel(b"sharedApplication\0"))
+}
+
+// ---------- 主菜单(第 139 轮:文本选择与复制) ----------
+
+/// 菜单项定义(纯数据,可单测)。`action` 为标准 responder action —— 系统把它沿
+/// responder chain 派发给 first responder,因此输入框(NSTextField)与说明区
+/// (NSTextView)同时生效,无需各自接线。
+const EDIT_MENU_ITEMS: &[MenuItem] = &[
+    MenuItem { title: "剪切", action: b"cut:\0", key: "x" },
+    MenuItem { title: "复制", action: b"copy:\0", key: "c" },
+    MenuItem { title: "粘贴", action: b"paste:\0", key: "v" },
+    MenuItem { title: "全选", action: b"selectAll:\0", key: "a" },
+];
+
+#[derive(Clone, Copy)]
+struct MenuItem {
+    title: &'static str,
+    action: &'static [u8],
+    /// 无修饰键时 AppKit 默认按 ⌘ 解析,故单写字母即可。
+    key: &'static str,
+}
+
+/// 构建一个 NSMenu:返回 (顶层菜单项, 子菜单)。
+///
+/// 顶层菜单项本身是空 NSMenuItem,真正的菜单项挂在它的 submenu 上 —— 这是
+/// NSMenuItem 作为子菜单容器时的标准用法。
+unsafe fn build_menu(title: &str, items: &[MenuItem]) -> (Id, Id) {
+    let sub = send_id_id(
+        send_id(cls(b"NSMenu\0"), sel(b"alloc\0")),
+        sel(b"initWithTitle:\0"),
+        ns_str(title),
+    );
+    for it in items {
+        let item = send_id_id_id_id(
+            send_id(cls(b"NSMenuItem\0"), sel(b"alloc\0")),
+            sel(b"initWithTitle:action:keyEquivalent:\0"),
+            ns_str(it.title),
+            sel(it.action).cast_mut(),
+            ns_str(it.key),
+        );
+        send_void_id(sub, sel(b"addItem:\0"), item);
+    }
+    let parent = send_id_id_id_id(
+        send_id(cls(b"NSMenuItem\0"), sel(b"alloc\0")),
+        sel(b"initWithTitle:action:keyEquivalent:\0"),
+        ns_str(title),
+        std::ptr::null_mut(),
+        ns_str(""),
+    );
+    send_void_id(parent, sel(b"setSubmenu:\0"), sub);
+    (parent, sub)
+}
+
+/// 装主菜单(第 139 轮)。
+///
+/// 此前本弹窗**完全没有 NSMenu**:输入框的 ⌘C/⌘V 全靠 NSTextField 自己在
+/// responder chain 上接住 `copy:`/`paste:`,无菜单条、无右键菜单,行为不可预期;
+/// 标签控件更是 `selectable=NO`,一个字都复制不出来。这里补一条标准 Edit 菜单,
+/// 让「菜单项 → responder chain → first responder」这条系统路径显式可用。
+unsafe fn install_main_menu(app_name: &str) {
+    let menu = send_id_id(
+        send_id(cls(b"NSMenu\0"), sel(b"alloc\0")),
+        sel(b"initWithTitle:\0"),
+        ns_str("MainMenu"),
+    );
+    // 应用菜单(窗口只带 Titled,没有系统按钮,应用菜单给出 ⌘Q 之外的退出路径,
+    // 也让菜单栏首项符合 macOS 惯例)。
+    let (app_item, _app_sub) = build_menu(
+        app_name,
+        &[MenuItem { title: "关于本弹窗", action: b"orderFrontStandardAboutPanel:\0", key: "" }],
+    );
+    send_void_id(menu, sel(b"addItem:\0"), app_item);
+    let (edit_item, _edit_sub) = build_menu("编辑", EDIT_MENU_ITEMS);
+    send_void_id(menu, sel(b"addItem:\0"), edit_item);
+    let app = nsapp_ptr();
+    if !app.is_null() {
+        send_void_id(app, sel(b"setMainMenu:\0"), menu);
+    }
 }
 
 /// 装载 Foundation + AppKit(失败 = 无桌面会话或系统异常)。
@@ -899,6 +1062,9 @@ unsafe fn make_message_view(text: &str) -> (Id, Id) {
     );
     send_void_bool(tv, sel(b"setEditable:\0"), false);
     send_void_bool(tv, sel(b"setSelectable:\0"), true);
+    // 第 139 轮:文档视图必须可垂直伸缩,长说明才能在 NSScrollView 里真滚起来 ——
+    // 滚不起来就等于「看不到尾部」,自然也选不中尾部文本。
+    send_void_bool(tv, sel(b"setVerticallyResizable:\0"), true);
     send_void_bool(tv, sel(b"setRichText:\0"), false);
     send_void_bool(tv, sel(b"setDrawsBackground:\0"), false);
     send_void_id(tv, sel(b"setFont:\0"), font(12.0, false));
@@ -916,7 +1082,8 @@ unsafe fn font(size: f64, bold: bool) -> Id {
     send_id_f64(cls(b"NSFont\0"), name, size)
 }
 
-/// 单行不可编辑标签。
+/// 单行只读标签(第 139 轮:`selectable=YES` + `editable=NO` = 标准只读可选文本,
+/// 鼠标可拖选、⌘C 可复制 —— 标题/时间轴/倒计时/图片提示全靠这一行变成可复制)。
 unsafe fn make_label(size: f64, bold: bool) -> Id {
     let l = send_id_rect(
         send_id(cls(b"NSTextField\0"), sel(b"alloc\0")),
@@ -924,6 +1091,7 @@ unsafe fn make_label(size: f64, bold: bool) -> Id {
         ns_rect(0.0, 0.0, 10.0, 10.0),
     );
     send_void_bool(l, sel(b"setEditable:\0"), false);
+    send_void_bool(l, sel(b"setSelectable:\0"), true);
     send_void_bool(l, sel(b"setBezeled:\0"), false);
     send_void_bool(l, sel(b"setDrawsBackground:\0"), false);
     send_void_id(l, sel(b"setFont:\0"), font(size, bold));
@@ -979,7 +1147,6 @@ unsafe fn load_image(p: &DialogPayload) -> (Option<Id>, Option<Id>, f64, Option<
     send_void_id(iv, sel(b"setImage:\0"), img);
     send_void_i64(iv, sel(b"setImageScaling:\0"), NS_IMAGE_SCALE_PROPORTIONALLY_DOWN);
     let hint = make_label(10.0, false);
-    send_void_bool(hint, sel(b"setSelectable:\0"), false);
     let color = send_id(cls(b"NSColor\0"), sel(b"secondaryLabelColor\0"));
     if !color.is_null() {
         send_void_id(hint, sel(b"setTextColor:\0"), color);
@@ -1011,6 +1178,7 @@ mod tests {
             ("input", f.input),
             ("cancel", f.cancel),
             ("submit", f.submit),
+            ("copy", f.copy),
             ("orig", f.orig),
             ("zoom", f.zoom),
         ];
@@ -1038,8 +1206,27 @@ mod tests {
         // 底部按钮行同行对齐
         let row = f.cancel.origin.y;
         assert_eq!(f.submit.origin.y, row);
+        assert_eq!(f.copy.origin.y, row);
         assert_eq!(f.orig.origin.y, row);
         assert_eq!(f.zoom.origin.y, row);
+        // 底部按钮行不重叠(第 139 轮新增「📋 复制」后的回归护栏)
+        let mut row_rects = [
+            ("submit", f.submit),
+            ("copy", f.copy),
+            ("orig", f.orig),
+            ("zoom", f.zoom),
+        ];
+        row_rects.sort_by(|a, b| a.1.origin.x.total_cmp(&b.1.origin.x));
+        for w in row_rects.windows(2) {
+            let (an, a) = w[0];
+            let (bn, b) = w[1];
+            let a_right = a.origin.x + a.size.width;
+            assert!(
+                a_right <= b.origin.x + 0.01,
+                "底部按钮重叠:{an} 右缘 {a_right} > {bn} 左缘 {}",
+                b.origin.x
+            );
+        }
     }
 
     #[test]
@@ -1080,5 +1267,42 @@ mod tests {
         assert_eq!(image_height_for(0.01, 528.0, 300.0), 60.0); // 下限
         assert_eq!(image_height_for(1.0, 528.0, 300.0), 300.0); // 上限
         assert!((image_height_for(0.5, 528.0, 300.0) - 264.0).abs() <= 0.5);
+    }
+
+    /// 第 139 轮:「📋 复制」按钮的文案常量必须成对(标题 + 反馈 + 回滚目标),
+    /// 少一个都会导致按钮停在错误标题上。
+    #[test]
+    fn copy_button_titles_are_paired() {
+        assert_eq!(COPY_BTN_TITLE, "📋 复制");
+        assert_eq!(COPY_BTN_DONE, "✓ 已复制");
+        assert!(COPY_BTN_TITLE != COPY_BTN_DONE);
+        assert!(COPY_FEEDBACK_SECS >= 1, "反馈至少显示 1s,否则肉眼看不到");
+    }
+
+    /// 第 139 轮:Edit 菜单必须覆盖剪切/复制/粘贴/全选,且每项都有单字母快捷键
+    /// (AppKit 默认按 ⌘ 解析 keyEquivalent),否则 ⌘C/⌘V 依然走不通。
+    #[test]
+    fn edit_menu_covers_clipboard_shortcuts() {
+        let actions: Vec<&[u8]> = EDIT_MENU_ITEMS.iter().map(|i| i.action).collect();
+        for want in [b"cut:\0".as_slice(), b"copy:\0", b"paste:\0", b"selectAll:\0"] {
+            assert!(actions.contains(&want), "Edit 菜单缺少 action {:?}", want);
+        }
+        let keys: Vec<&str> = EDIT_MENU_ITEMS.iter().map(|i| i.key).collect();
+        for want in ["x", "c", "v", "a"] {
+            assert!(keys.contains(&want), "Edit 菜单缺少快捷键 ⌘{want}");
+        }
+    }
+
+    /// 第 139 轮:最窄内容宽下底部按钮行仍不重叠(`layout_budget_matches_placement`
+    /// 里的 1400 是大窗,这里专门盯默认窄窗 560)。
+    #[test]
+    fn bottom_row_fits_narrow_window() {
+        let geo = Geometry { msg_h: 90.0, img_h: 0.0 };
+        let h = content_height(geo, 3);
+        let f = layout_frames(W, h, geo, 3);
+        assert_frames_in_bounds(W, h, geo, 3);
+        assert!(f.submit.origin.x + f.submit.size.width <= f.copy.origin.x + 0.01);
+        assert!(f.copy.origin.x + f.copy.size.width <= f.orig.origin.x + 0.01);
+        assert!(f.orig.origin.x + f.orig.size.width <= f.zoom.origin.x + 0.01);
     }
 }

@@ -22,6 +22,10 @@ use windows::Win32::Graphics::Gdi::{
     HFONT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -49,8 +53,9 @@ const BTN_H: i32 = 30;
 const GAP: i32 = 8;
 const CANCEL_W: i32 = 84;
 const SUBMIT_W: i32 = 84;
+const COPY_W: i32 = 92;
 const ORIG_W: i32 = 110;
-const ZOOM_W: i32 = 110;
+const ZOOM_W: i32 = 104;
 const INNER: i32 = 8;
 const IMG_HINT_H: i32 = 14;
 
@@ -75,6 +80,12 @@ const IDCANCEL_ID: i32 = 2;
 const IDC_OPT_BASE: i32 = 100;
 const IDC_ZOOM: i32 = 106;
 const IDC_ORIG: i32 = 107;
+/// 第 139 轮:「📋 复制」一键把完整信息写入剪贴板。
+const IDC_COPY: i32 = 108;
+/// 「✓ 已复制」反馈保持时长(秒);由既有 1s 定时器回滚。
+const COPY_FEEDBACK_SECS: u64 = 2;
+const COPY_BTN_TITLE: &str = "📋 复制";
+const COPY_BTN_DONE: &str = "✓ 已复制";
 const TIMER_ID: usize = 1;
 
 const CLASS_NAME: &str = "LAEWHITLDIALOG";
@@ -101,6 +112,7 @@ struct Frames {
     opts: Vec<RECT>,
     cancel: RECT,
     submit: RECT,
+    copy: RECT,
     orig: RECT,
     zoom: RECT,
 }
@@ -149,6 +161,7 @@ fn layout_frames(cw: i32, ch: i32, geo: Geometry, opt_count: usize) -> Frames {
         opts,
         cancel: rect(PAD, row_y, CANCEL_W, BTN_H),
         submit: rect(PAD + CANCEL_W + INNER, row_y, SUBMIT_W, BTN_H),
+        copy: rect(cw - PAD - ZOOM_W - INNER - ORIG_W - INNER - COPY_W, row_y, COPY_W, BTN_H),
         orig: rect(cw - PAD - ZOOM_W - INNER - ORIG_W, row_y, ORIG_W, BTN_H),
         zoom: rect(cw - PAD - ZOOM_W, row_y, ZOOM_W, BTN_H),
     }
@@ -181,10 +194,15 @@ struct WinState {
     opts: Vec<HWND>,
     cancel: HWND,
     submit: HWND,
+    copy: HWND,
     orig: HWND,
     zoom: HWND,
     options: Vec<String>,
     image_open_path: Option<String>,
+    /// 「📋 复制」写入剪贴板的文本(第 139 轮)。
+    copy_payload: String,
+    /// 「✓ 已复制」反馈的回滚时刻(由 on_tick 消费)。
+    copied_at: Option<Instant>,
     /// 图片显示高(像素;0 = 无图)。
     img_h: i32,
     /// 图片位图(收尾 DeleteObject)。
@@ -222,6 +240,7 @@ struct Controls {
     opts: Vec<HWND>,
     cancel: HWND,
     submit: HWND,
+    copy: HWND,
     orig: HWND,
     zoom: HWND,
 }
@@ -239,6 +258,7 @@ impl Controls {
             opts: st.opts.clone(),
             cancel: st.cancel,
             submit: st.submit,
+            copy: st.copy,
             orig: st.orig,
             zoom: st.zoom,
         }
@@ -332,23 +352,85 @@ unsafe fn apply_frames(c: &Controls, f: &Frames, geo: Geometry) {
 
 fn on_tick() {
     // 先锁定取出所需并解锁,再触碰 UI(finish 会再次锁定 STATE)。
-    let (t2, text, timed_out) = {
-        let guard = state();
-        let Some(st) = guard.as_ref() else { return };
+    let (t2, text, timed_out, rollback_copy) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
         if st.done {
             return;
         }
         let elapsed = st.started.elapsed().as_millis() as u64;
         let remain = st.timeout_ms.saturating_sub(elapsed);
-        (st.t2, countdown_text(elapsed, remain), remain == 0)
+        // 第 139 轮:「✓ 已复制」反馈到期回滚标题(不额外起定时器,复用 1s tick)。
+        let rollback = match st.copied_at {
+            Some(at) if at.elapsed().as_secs() >= COPY_FEEDBACK_SECS => {
+                st.copied_at = None;
+                Some(st.copy)
+            }
+            _ => None,
+        };
+        (st.t2, countdown_text(elapsed, remain), remain == 0, rollback)
     };
     let wide = to_wide(&text);
     unsafe {
         SendMessageW(t2, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
     }
+    if let Some(btn) = rollback_copy {
+        let wide = to_wide(COPY_BTN_TITLE);
+        unsafe {
+            SendMessageW(btn, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
+        }
+    }
     if timed_out {
         finish("timeout", -1);
     }
+}
+
+/// 第 139 轮:「📋 复制」—— 完整信息写入系统剪贴板。
+///
+/// 说明区虽是 `ES_READONLY` 的 EDIT(可 Ctrl-A/Ctrl-C),但标题/时间轴/倒计时都是
+/// `STATIC`(不可选中),倒计时行每秒刷新又会冲掉拖选 —— 一键复制是确定性最高的路径。
+fn copy_info() {
+    let (payload, btn) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
+        if st.done {
+            return;
+        }
+        st.copied_at = Some(Instant::now());
+        (st.copy_payload.clone(), st.copy)
+    };
+    let ok = unsafe { set_clipboard_text(&payload) };
+    let wide = to_wide(if ok { COPY_BTN_DONE } else { "⚠ 复制失败" });
+    unsafe {
+        SendMessageW(btn, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
+    }
+}
+
+/// `CF_UNICODETEXT` = 13(数值来自 SDK 头文件 windows.h,勿改);只为一个常量
+/// 多开 `Win32_System_Ole` feature 不值,故用字面量。
+const CF_UNICODETEXT: u16 = 13;
+
+/// UTF-16 文本 → 系统剪贴板(fail-open:失败只反映在按钮标题上)。
+unsafe fn set_clipboard_text(text: &str) -> bool {
+    if OpenClipboard(HWND::default()).is_err() {
+        return false;
+    }
+    let mut ok = false;
+    if EmptyClipboard().is_ok() {
+        let wide = text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let bytes = wide.len() * std::mem::size_of::<u16>();
+        // GMEM_MOVEABLE:剪贴板接管内存所有权,LocalFree 由系统负责。
+        if let Ok(handle) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
+            let p = GlobalLock(handle);
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), p.cast::<u8>(), bytes);
+                let _ = GlobalUnlock(handle);
+                ok = SetClipboardData(CF_UNICODETEXT as u32, HANDLE(handle.0)).is_ok();
+            }
+        }
+    }
+    let _ = CloseClipboard();
+    ok
 }
 
 fn on_command(id: i32) {
@@ -357,6 +439,7 @@ fn on_command(id: i32) {
         IDCANCEL_ID => finish("cancel", -1), // 取消按钮 / Esc
         IDC_ZOOM => toggle_zoom(),
         IDC_ORIG => open_image(),
+        IDC_COPY => copy_info(),
         _ if id >= IDC_OPT_BASE => finish("answer", (id - IDC_OPT_BASE) as i64),
         _ => {}
     }
@@ -552,6 +635,8 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     let submit = create_control(hwnd, hinst, "BUTTON", "提交", style_button(true), IDOK_ID, font_normal);
     let zoom = create_control(hwnd, hinst, "BUTTON", "⛶ 最大化", style_button(false), IDC_ZOOM, font_normal);
     let orig = create_control(hwnd, hinst, "BUTTON", "查看原图", style_button(false), IDC_ORIG, font_normal);
+    // 第 139 轮:一键复制(STATIC 标签天生不可选中,拖选复制不可靠)
+    let copy = create_control(hwnd, hinst, "BUTTON", COPY_BTN_TITLE, style_button(false), IDC_COPY, font_normal);
 
     // ---- 状态入位 + 显示 + 初始布局 ----
     *state() = Some(WinState {
@@ -566,10 +651,13 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         opts,
         cancel,
         submit,
+        copy,
         orig,
         zoom,
         options: p.options.clone(),
         image_open_path,
+        copy_payload: p.copy_text(),
+        copied_at: None,
         img_h: img_disp_h,
         image_bitmap: bitmap_keep,
         zoomed: false,
@@ -771,14 +859,19 @@ mod tests {
                 // 底部按钮行钉在底边
                 let row = f.cancel.top;
                 assert_eq!(f.submit.top, row);
+                assert_eq!(f.copy.top, row);
                 assert_eq!(f.orig.top, row);
                 assert_eq!(f.zoom.top, row);
                 assert_eq!(f.cancel.bottom, ch - PAD);
+                // 第 139 轮:新增「📋 复制」后底部按钮行不得重叠
+                assert!(f.submit.right <= f.copy.left, "submit 与 copy 重叠");
+                assert!(f.copy.right <= f.orig.left, "copy 与 orig 重叠");
+                assert!(f.orig.right <= f.zoom.left, "orig 与 zoom 重叠");
                 // 全控件在界内
                 let mut all = vec![
                     ("title", f.title), ("msg", f.msg), ("t1", f.t1), ("t2", f.t2),
                     ("input", f.input), ("cancel", f.cancel), ("submit", f.submit),
-                    ("orig", f.orig), ("zoom", f.zoom),
+                    ("copy", f.copy), ("orig", f.orig), ("zoom", f.zoom),
                 ];
                 for (i, r) in f.opts.iter().enumerate() {
                     all.push((Box::leak(format!("opt{i}").into_boxed_str()) as &str, *r));

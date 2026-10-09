@@ -86,6 +86,9 @@ windows = { version = "0.58", features = [
     "Win32_System_WindowsProgramming",
     # 第 137 轮:人工介入弹窗(Win32 原生)取模块句柄
     "Win32_System_LibraryLoader",
+    # 第 139 轮:人工介入弹窗「📋 复制」一键写系统剪贴板
+    "Win32_System_Memory",
+    "Win32_System_DataExchange",
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage",

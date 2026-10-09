@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::Tool;
-use crate::agent::browser::{BrowserManager, NO_BROWSER_SENTINEL};
+use crate::agent::browser::{BrowserManager, BrowserMode, NO_BROWSER_SENTINEL};
 use crate::error::Result;
 
 mod captcha_crop;
@@ -296,6 +296,25 @@ async fn fit_viewport(page_id: &str) -> Option<Value> {
         .ok()
 }
 
+/// 第 139 轮:有头模式窗口收边(fail-open;见 `BrowserManager::fit_headed_window`)。
+///
+/// **必须先于 [`fit_viewport`] 调用** —— 收边走 `Browser.setWindowBounds`,会清除
+/// `Emulation.setDeviceMetricsOverride`;晚一步会把刚扩好的视口覆盖抹掉。
+async fn fit_headed_window(page_id: &str) -> Option<Value> {
+    BrowserManager::global().fit_headed_window(page_id).await.ok()
+}
+
+/// 缺省浏览器模式(第 139 轮:可见模式)。
+///
+/// 调用方未显式传 `mode` 时走这里;此前是硬编码 `Hidden`,导致
+/// `LAEW_BROWSER_MODE` 开关形同虚设、「是否弹窗」全看 LLM 这轮传不传
+/// `mode=headed`(实测同一程序在 Terminal 不弹窗、VS Code 弹窗的根因)。
+fn resolve_requested_mode(args: &Value) -> BrowserMode {
+    str_arg(args, "mode")
+        .and_then(|v| BrowserMode::from_arg(&v))
+        .unwrap_or_else(BrowserMode::from_env_or_default)
+}
+
 // ===================== action=open(list/close 同级,轻量内联) =====================
 
 /// 启动/接管浏览器并打开一个页面(原 BrowserNew)。
@@ -339,14 +358,7 @@ async fn run_open(args: Value) -> Result<String> {
                     let (browser_reused, mode_label) = {
                         let mgr = BrowserManager::global();
                         let m = mgr.current_mode().await;
-                        (
-                            mgr.has_browser().await,
-                            match m.unwrap_or(crate::agent::browser::BrowserMode::Hidden) {
-                                crate::agent::browser::BrowserMode::Hidden => "hidden",
-                                crate::agent::browser::BrowserMode::NewHeadless => "new_headless",
-                                crate::agent::browser::BrowserMode::Headed => "headed",
-                            },
-                        )
+                        (mgr.has_browser().await, m.unwrap_or(BrowserMode::DEFAULT).as_str())
                     };
                     let title = page.get_title().await.ok().flatten().unwrap_or_default();
                     let final_url = page
@@ -365,6 +377,12 @@ async fn run_open(args: Value) -> Result<String> {
                         "mode": mode_label,
                         "next_steps": open_next_steps(),
                     });
+                    // 第 139 轮:人工拖过窗口后,复用路径同样按屏幕工作区收边(有头才动)。
+                    if mode_label == BrowserMode::Headed.as_str() {
+                        if let Some(v) = fit_headed_window(&pid).await {
+                            payload["headed_window"] = v;
+                        }
+                    }
                     if auto_expand_enabled(&args) {
                         if let Some(v) = fit_viewport(&pid).await {
                             payload["viewport"] = v;
@@ -375,12 +393,9 @@ async fn run_open(args: Value) -> Result<String> {
             }
         }
     }
-    // 三档 mode(第 74 轮):默认 hidden(纯 CDP 无窗口),解决"误开系统默认浏览器"。
-    let requested_mode = match str_arg(&args, "mode") {
-        Some("headed") | Some("head") => crate::agent::browser::BrowserMode::Headed,
-        Some("new_headless") | Some("old_headless") => crate::agent::browser::BrowserMode::NewHeadless,
-        _ => crate::agent::browser::BrowserMode::Hidden,
-    };
+    // 三档 mode(第 74 轮):缺省可见;第 139 轮起缺省走 `BrowserMode::from_env_or_default`
+    // (默认 headed,CI/无 GUI 会话自动回退 hidden),`LAEW_BROWSER_MODE` 真正生效。
+    let requested_mode = resolve_requested_mode(&args);
     // 单浏览器实例语义(第 100 轮):实例已存在时永远复用,绝不因 mode/参数差异
     // 新启第二个浏览器进程;请求 mode 与实例不一致时回真实 mode + mode_hint。
     let (browser_reused, effective_mode, mode_hint) =
@@ -389,15 +404,8 @@ async fn run_open(args: Value) -> Result<String> {
                 let hint = if existing != requested_mode {
                     Some(format!(
                         "已复用现有浏览器实例(实际 mode={});如需 {} 可视化,先 close(page_id=\"all\") 回收后以该 mode 重开",
-                        match existing {
-                            crate::agent::browser::BrowserMode::Hidden => "hidden",
-                            crate::agent::browser::BrowserMode::NewHeadless => "new_headless",
-                            crate::agent::browser::BrowserMode::Headed => "headed",
-                        },
-                        match requested_mode {
-                            crate::agent::browser::BrowserMode::Headed => "headed",
-                            _ => "hidden",
-                        },
+                        existing.as_str(),
+                        requested_mode.as_str(),
                     ))
                 } else {
                     None
@@ -426,18 +434,14 @@ async fn run_open(args: Value) -> Result<String> {
                 "title": title,
                 "final_url": final_url,
                 "reused": false,
-                "mode": match effective_mode {
-                    crate::agent::browser::BrowserMode::Hidden => "hidden",
-                    crate::agent::browser::BrowserMode::NewHeadless => "new_headless",
-                    crate::agent::browser::BrowserMode::Headed => "headed",
-                },
+                "mode": effective_mode.as_str(),
                 "browser_reused": browser_reused,
-                "highlight": highlight && matches!(effective_mode, crate::agent::browser::BrowserMode::Headed),
+                "highlight": highlight && effective_mode.is_headed(),
                 "window": {
-                    "width": window_size.map(|(w, _)| w),
-                    "height": window_size.map(|(_, h)| h),
+                    "requested": window_size.map(|(w, h)| [w, h]),
                     "default": [1920, 1080],
-                    "hint": "全模式默认 1080p;内容超视口时已自动扩展视口(见 data.viewport);运行时调整:control(set_window);人工拖动窗口后:control(sync_viewport)",
+                    "min_viewport": [1280, 720],
+                    "hint": "默认 1080p;小屏自动按屏幕工作区收边保证完整可见,页面视口不低于 720p(见 data.headed_window);内容超视口时已自动扩展视口(见 data.viewport);运行时调整:control(set_window);人工拖动窗口后:control(sync_viewport)",
                 },
                 // next_steps —— 分步引导,降低 LLM 编排成本(第 74 轮):
                 // input_text → click → wait → elements 四步最常见动作链。
@@ -449,8 +453,15 @@ async fn run_open(args: Value) -> Result<String> {
             if let Some(hint) = mode_hint {
                 data["mode_hint"] = json!(hint);
             }
+            // 第 139 轮:有头模式窗口收边(必须先于视口自适应 —— setWindowBounds
+            // 会清除 device metrics 覆盖,晚一步会把刚扩好的视口抹掉)。
+            if effective_mode.is_headed() {
+                if let Some(v) = fit_headed_window(&page_id).await {
+                    data["headed_window"] = v;
+                }
+            }
             // 第 125 轮:视口自适应(默认开)——内容宽/高超出视口时自动扩展到
-            // 2K 上限,根治「hidden 视口太窄页面显示不全、元素不可见不可点」。
+            // 2K 上限,根治「视口太窄页面显示不全、元素不可见不可点」。
             if auto_expand_enabled(&args) {
                 match fit_viewport(&page_id).await {
                     Some(v) => data["viewport"] = v,
@@ -697,7 +708,7 @@ pub struct McpWebUseTool;
 /// 作业规范部分精炼,全文见 SubAgent-Work 系统提示词的 MCP_Web_Use 段)。
 const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器操作网页(macOS / Windows / Linux,内存无头浏览器默认,也可接管已开浏览器;MCP 风格单工具多 action)。
 用 action 参数选择操作:
-- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, timeout_ms?): 启动/接管 Chromium 并打开页面。默认纯 CDP 嵌入式无头浏览器(mode=hidden,无可见窗口,一次性临时 profile 不干扰日常浏览器);mode=headed 可见窗口(人工介入/可视化任务);全模式启动窗口默认 1920×1080(1080p,第 125 轮起 hidden 不再用 1440×900 窄视口),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**视口自适应(第 125 轮,默认开)**:导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。返回 {page_id,title,final_url,reused,mode,browser_reused,window,viewport?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
+- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, timeout_ms?): 启动/接管 Chromium 并打开页面。**默认可见窗口(mode=headed,第 139 轮)**——不要为了「省资源」主动传 hidden,除非任务明确要求静默后台跑;无 GUI 会话(CI/容器/SSH)会自动回退 hidden,可用 LAEW_BROWSER_MODE 强制。使用一次性临时 profile,不干扰用户日常浏览器;全模式启动窗口默认 1920×1080(1080p),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**窗口收边(第 139 轮,默认开)**:headed 模式下导航完成后按屏幕工作区自动收窄窗口(小屏笔记本不再把窗口挤出屏外「显示不全」),并保证页面视口不低于 720p,结果回 data.headed_window。**视口自适应(第 125 轮,默认开)**:导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。返回 {page_id,title,final_url,reused,mode,browser_reused,window,headed_window?,viewport?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
 - list(): 列出当前存活页面 [{page_id,url,title,created_at}];返回前自动清理失效 entry。冷启动后多轮任务优先用它同步页面索引。
 - close(page_id*): 关闭指定页面;最后一个页面关闭时回收浏览器进程。page_id="all" 一键关闭全部页面并回收浏览器(任务收尾清场)。幂等;对话型页面(用户可能继续追问)可保留复用。
 - control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event/set_window/sync_viewport/set_highlight/request_human。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。screenshot 一律落盘返回 save_path(看图片文字用 params.ocr=true,文本模型无法消费 base64);eval_js 直接写表达式,支持 return 与多语句(失败自动 IIFE 重试),超长返回值自动落盘并以 saved_to 引用;download 支持 http(s) url 或 selector、save_dir、filename、timeout_ms,data: URL 直接解码落盘,完成后返回绝对 save_path 与 byte_size。set_window 运行时调整真实浏览器窗口(width/height/left/top/window_state=maximized|fullscreen|minimized|normal,CDP setWindowBounds,调整后自动清除视口覆盖保证渲染自适应不缺区域);sync_viewport 在人工拖动窗口大小后调用,清除 device metrics 覆盖使视口=窗口内容区(会撤销 open 时的自动 2K 扩展);set_viewport(width,height,device_scale_factor?=1,mobile?=false) 手动设置布局视口(宽 320~7680/高 240~4320 自动 clamp;open 已默认自动扩展视口,仅当自动结果不理想时才手动指定);set_highlight(enabled) 运行时开关蓝色选中边框;request_human(reason=captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom, message?, options?, timeout_ms? 缺省按 reason 分档 captcha/sms/two_factor=120s 其余 300s, bring_to_front?=true, image_path? 指定已有截图文件) 人工介入:滑块/短信验证码/扫码登录/实名认证/人脸核身/2FA 邮箱验证码/第三方 OAuth 等无法自动跳过的流程。reason=captcha 时会自动截取当前视口(或用 image_path 指定已保存的截图),弹窗内直接展示验证码图片,人工读码后填入输入框即可,不必切换窗口。macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时+时间轴,文案可鼠标选中复制,人工在弹窗点选项/输入文本/取消,-p 模式同样可弹;TUI 兜底行读),code=0 时 human_response 为人工回答(assist_channel 标注 gui/tui),人工取消返回 code=4002,超时或弹窗与 TUI 均不可用返回 code=4001(如实告知用户改用交互模式重试,严禁伪造结果)。
@@ -711,7 +722,7 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 【两种工作模式】1) 单步执行模式:直接调用 open/control/inspect/list/close,一次一个动作,适合探索、调试和高风险操作;2) 连续执行模式:先用单步 inspect(elements/dom/console/network)探索结构,再 action=sequence 一次执行已明确动作链,适合流程稳定任务(登录/表单类:inspect(form) → ocr 验证码 → sequence(input×N + click + wait + verify) 一次打包)。两种模式可混合、可多次调用。
 【标准作业顺序】open 拿 page_id → inspect 探索真实 DOM → control 执行动作 → inspect 验证结果 → 任务完成后 close 释放(确定不再需要的页面;全部结束用 page_id="all" 清场)。
 【错误码对策】1001 修正参数;2000 page_id 失效→action=list 重新同步;2001 断连→重新 open;2002 换 selector 或 input_text 的 use_js 路径重试;3001 未安装浏览器→如实告知用户,不要编造结果;**6001 目标站点越界(任务锚点)→ 立即停止该路径,如实报告「目标站点不可达或未指定」并结束本单元;严禁改用其它站点、搜索引擎、缓存或名称相似的替代品 —— 可以失败,不可以乱跑**。
-【人工介入(HITL)】遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/人脸核身等无法自动完成的流程:可视化场景先 open(mode=headed) 让人工看到窗口(蓝色边框标识),再 control(request_human, reason=..., message=说明要人工做什么, options=[...]);macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时,人工在弹窗点选项/输入验证码),Linux 或弹窗不可用时 TUI 选择块行读;code=0 用 data.human_response 继续(短信/2FA 动态码人工直接输入,拿到后 input_text 填入);4001=超时/弹窗与 TUI 均不可用,如实报告;4002=人工取消(弹窗取消/Esc/关窗),终止该路径。切 hidden→headed 需 close("all") 回收后重开。
+【人工介入(HITL)】遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/人脸核身等无法自动完成的流程:可视化场景确认 data.mode=headed(缺省即是,无需显式传 mode=headed),让人工看到窗口(蓝色边框标识),再 control(request_human, reason=..., message=说明要人工做什么, options=[...]);macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时,人工在弹窗点选项/输入验证码;弹窗文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,也有「📋 复制」一键复制全部信息),Linux 或弹窗不可用时 TUI 选择块行读;code=0 用 data.human_response 继续(短信/2FA 动态码人工直接输入,拿到后 input_text 填入);4001=超时/弹窗与 TUI 均不可用,如实报告;4002=人工取消(弹窗取消/Esc/关窗),终止该路径。当前实例是无头而任务需要可视化时,先 close("all") 回收再以 mode=headed 重开。
 【作业要点】中文输入优先 params.use_js=true(React/Vue 受控组件兼容);复杂页面先 inspect(info=elements) 探测真实 DOM 再操作,不要硬猜 selector;AI 对话类网站回复等待用 control(wait, selector=[class*=response]..., timeout_ms=60000);看图片里的文字(验证码/图表标签)一律 screenshot(params.ocr=true) 或 inspect(info=ocr),禁止 Read 图片文件、禁止用 Bash/python/tesseract 解码图片(文本模型无视觉,纯浪费迭代);验证码读码后不要刷新页面或点击验证码图(刷新即换码),提交报验证码错误才点图刷新重读;DOM 提取注意 truncated 标记分段。
 【安全红线】支付/删除/确认提交/登出等不可逆或高风险动作禁止放进 sequence,必须单步执行并检查页面状态;登录凭证只填用户明确提供的账号密码,不要编造;OCR 不可用的平台上验证码类任务如实报告等待人工,禁止猜测验证码;只读优先——能 inspect 回答的问题不做任何写操作。"#;
 
@@ -736,8 +747,8 @@ impl Tool for McpWebUseTool {
                 },
                 "url": { "type": "string", "description": "open 必填:目标网址" },
                 "reuse": { "type": "boolean", "default": true, "description": "open 可选:同 URL 已有存活页面时复用(导航刷新,page_id 不变,响应 reused:true);false 强制新开页面" },
-                "mode": { "type": "string", "enum": ["hidden", "new_headless", "headed"], "default": "hidden", "description": "open 可选:浏览器模式;hidden=纯 CDP 无窗口(默认,推荐),new_headless=旧 headless=true,headed=可见窗口(调试截图)" },
-                "window_width": { "type": "integer", "minimum": 320, "maximum": 7680, "description": "open 可选:浏览器窗口宽(px);缺省全模式(hidden/headed)统一 1920(1080p);与 window_height 成对使用;浏览器已存在时仅记录请求值(单实例复用)" },
+                "mode": { "type": "string", "enum": ["headed", "hidden", "new_headless"], "default": "headed", "description": "open 可选:浏览器模式;headed=可见窗口(默认,第 139 轮),hidden=纯 CDP 无窗口,new_headless=旧 headless=true。缺省由 LAEW_BROWSER_MODE 与 GUI 会话探测决定:无 GUI 会话(CI/容器/SSH)自动回退 hidden" },
+                "window_width": { "type": "integer", "minimum": 320, "maximum": 7680, "description": "open 可选:浏览器窗口宽(px);缺省全模式统一 1920(1080p),小屏按屏幕工作区自动收边;与 window_height 成对使用;浏览器已存在时仅记录请求值(单实例复用)" },
                 "window_height": { "type": "integer", "minimum": 240, "maximum": 4320, "description": "open 可选:浏览器窗口高(px);缺省全模式统一 1080(1080p);运行时调整用 control(set_window),人工拖动后用 control(sync_viewport) 自适应" },
                 "auto_expand_viewport": { "type": "boolean", "default": true, "description": "open 可选(默认 true):导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动用 device metrics 把视口扩展到 ≤2560×1440(2K),扩展结果回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;false 关闭;内容仍超 2K 上限时截图用 params.full_page=true 或 set_viewport 显式超限" },
                 "highlight": { "type": "boolean", "default": true, "description": "open 可选:headed 模式在页面四周注入一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标(标识 Agent 控制的窗口,人工介入用);pointer-events:none 不影响页面交互;可用 control(set_highlight, enabled=false) 运行时关闭" },
