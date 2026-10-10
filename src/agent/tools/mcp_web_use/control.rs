@@ -14,6 +14,11 @@ pub(super) use super::eval_sanitize::{
     data_ext_from_mime, data_mime, decode_data_url, percent_decode, sanitize_eval_result,
     EVAL_INLINE_CHAR_LIMIT,
 };
+// 第 143 轮:页面管控 control_action(让路辅助 + set_overlay/set_guard)拆分至
+// guard_ctl.rs(control.rs 逼近 1800 行硬线),机械搬移零改写。
+use super::guard_ctl::{
+    act_set_guard, act_set_overlay, guard_lift_for_input, guard_restore_after_input,
+};
 
 // =================== 第 99 轮:eval_js / screenshot / download 效能与健壮性辅助 ===================
 
@@ -193,9 +198,11 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     // 第 141 轮:蒙层输入锁「先解后锁」—— 输入类动作(经 CDP Input.dispatch*
     // 或 chromiumoxide Element click/type)在蒙层激活时会被 setIgnoreInputEvents
     // 一并吃掉(实测,见 browser_overlay 模块文档),动作前解锁、动作后复锁。
-    // 窗口为毫秒级;蒙层未激活时零开销(不多发任何 CDP 往返)。
-    let overlay_lift = if crate::agent::browser_overlay::action_dispatches_input(&action) {
-        overlay_lift_for_input(id).await
+    // 第 143 轮扩展:partial 档下同类动作会被 DOM 盾罩吃掉(hit-test 层 CDP 合成
+    // 输入与真实输入不可区分),改为「先隐盾后复盾」。窗口为毫秒级;管控未激活
+    // 或 open 档时零开销(不多发任何 CDP/JS 往返)。
+    let guard_lift = if crate::agent::browser_overlay::action_dispatches_input(&action) {
+        guard_lift_for_input(id).await
     } else {
         None
     };
@@ -239,26 +246,29 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "set_window" => act_set_window(id, &params).await,
         "sync_viewport" => act_sync_viewport(id, &params).await,
         "set_highlight" => act_set_highlight(id, &params).await,
-        // 第 141 轮:可视化蒙层运行时开关
+        // 第 141 轮:可视化蒙层运行时开关(legacy,委托 set_guard)
         "set_overlay" => act_set_overlay(id, &params).await,
+        // 第 143 轮:页面管控三档运行时切换
+        "set_guard" => return act_set_guard(id, &params).await,
         // request_human 需要特殊信封(4001/4002),不走通用 2002 映射
         "request_human" => return act_request_human(id, &params).await,
         other => return envelope(1001, "未知 control_action", json!({"control_action": other})),
     };
-    // 动作收尾:复锁输入(仅刚才解过锁的页面)
-    if let Some(page) = &overlay_lift {
-        overlay_restore_after_input(page).await;
+    // 动作收尾:复锁输入 / 复盾(仅刚才让路过路的页面)
+    if let Some((page, kind)) = guard_lift {
+        guard_restore_after_input(&page, kind).await;
     }
-    // 第 141 轮:导航类动作产生新文档 —— CDP 输入拦截实测跨导航持久,JS 蒙层按
-    // 注入时烘焙态重建;运行期 set_overlay(false) 后再导航,蒙层会以旧态回归。
-    // 用实例期望态 re-assert,保证两层收敛(仅在成功导航后,蒙层激活时)。
+    // 第 143 轮:导航类动作产生新文档 —— CDP 输入拦截实测跨导航持久,管控 JS 按
+    // 注入时烘焙的配置重建;运行期 set_guard 改档后再导航,脚本会以旧档回归。
+    // 用实例期望态 re-assert,保证各层收敛(仅在成功导航后,headed 非 connect)。
     if result.is_ok()
         && crate::agent::browser_overlay::action_needs_overlay_reassert(&action)
-        && crate::agent::browser::BrowserManager::global().overlay_active().await
+        && crate::agent::browser::BrowserManager::global().guard_visuals_active().await
     {
-        if let Some(page) = crate::agent::browser::BrowserManager::global().page(id).await {
-            let _ =
-                crate::agent::browser_overlay::apply_page_overlay(&page, true).await;
+        let mgr = crate::agent::browser::BrowserManager::global();
+        let cfg = mgr.current_guard().await;
+        if let Some(page) = mgr.page(id).await {
+            let _ = crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
         }
     }
     // 第 140 轮提速:仅「可能派生新标签页」的动作才做浏览器级 pages() 巡检
@@ -320,32 +330,8 @@ pub(super) fn action_may_spawn_page(action: &str) -> bool {
     )
 }
 
-// =================== 第 141 轮:蒙层输入锁「先解后锁」辅助 ===================
-
-/// 输入类动作前的解锁:蒙层激活(headed+期望态开)时把该页的
-/// `Input.setIgnoreInputEvents` 置 false,返回页面句柄供动作后复锁。
-///
-/// 蒙层未激活 / page_id 失效 → None(零开销;后者由动作自身报 2000)。
-/// fail-open:解锁失败也不阻断动作(等同蒙层未激活,动作照常执行)。
-async fn overlay_lift_for_input(id: &str) -> Option<chromiumoxide::Page> {
-    let mgr = crate::agent::browser::BrowserManager::global();
-    if !mgr.overlay_active().await {
-        return None;
-    }
-    let page = mgr.page(id).await?;
-    use chromiumoxide::cdp::browser_protocol::input::SetIgnoreInputEventsParams;
-    let _ = page.execute(SetIgnoreInputEventsParams::new(false)).await;
-    Some(page)
-}
-
-/// 输入类动作后的复锁(fail-open:失败只记日志,不影响动作结果语义;
-/// 下一个输入动作的「先解」会自愈残余状态)。
-async fn overlay_restore_after_input(page: &chromiumoxide::Page) {
-    use chromiumoxide::cdp::browser_protocol::input::SetIgnoreInputEventsParams;
-    if let Err(e) = page.execute(SetIgnoreInputEventsParams::new(true)).await {
-        tracing::warn!("蒙层输入复锁失败(fail-open):{e}");
-    }
-}
+// =================== 第 141/143 轮:管控让路辅助已拆分至 guard_ctl.rs ===================
+// (control.rs 逼近 1800 行硬线,按拆分规范机械搬移;此处仅保留引用)
 
 async fn act_click(id: &str, p: &Value, human: bool) -> std::result::Result<Value, String> {
     let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
@@ -980,10 +966,13 @@ async fn act_set_viewport(id: &str, p: &Value) -> std::result::Result<Value, Str
 ///   `region{x,y,width,height}` 过滤词块(只影响 OCR 输出,落盘仍为整帧)。
 pub(super) async fn act_screenshot(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let page = ensure_page(id).await?;
-    // 第 141 轮:截图避让 —— 蒙层激活时拍前隐藏、拍完恢复(蒙层不进证据链,
-    // OCR/看图/HITL 附图不受 22% 遮罩与提示条干扰)。只动视觉层,不动输入锁。
-    let mask_hidden = crate::agent::browser::BrowserManager::global().overlay_active().await
-        && crate::agent::browser_overlay::mask_set_visible(&page, false).await;
+    // 第 143 轮:截图避让升级 —— headed 非 connect(注入了管控脚本)时拍前挂起、
+    // 拍完恢复全部管控视觉(蒙层+盾区+状态条,均不进证据链,OCR/看图/HITL 附图
+    // 不受遮罩与提示条干扰)。只动视觉层,不动 CDP 输入锁。
+    let visuals_hidden = crate::agent::browser::BrowserManager::global()
+        .guard_visuals_active()
+        .await
+        && crate::agent::browser_overlay::guard_suspend_visuals(&page, true).await;
     let mut b = chromiumoxide::page::ScreenshotParams::builder();
     let full_page = p.get("full_page").and_then(Value::as_bool).unwrap_or(false);
     if full_page {
@@ -995,9 +984,9 @@ pub(super) async fn act_screenshot(id: &str, p: &Value) -> std::result::Result<V
         b = b.format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Jpeg).quality(q);
     }
     let shot = page.screenshot(b.build()).await;
-    if mask_hidden {
-        // 失败路径也要恢复(遮罩残留会污染后续所有截图)
-        let _ = crate::agent::browser_overlay::mask_set_visible(&page, true).await;
+    if visuals_hidden {
+        // 失败路径也要恢复(视觉残留会污染后续所有截图)
+        let _ = crate::agent::browser_overlay::guard_suspend_visuals(&page, false).await;
     }
     let bytes = shot.map_err(|e| e.to_string())?;
     let path = match p.get("save_path").and_then(Value::as_str).filter(|s| !s.is_empty()) {
@@ -1230,15 +1219,6 @@ async fn act_set_highlight(id: &str, p: &Value) -> std::result::Result<Value, St
         .await
 }
 
-/// control_action=set_overlay(第 141 轮):运行时开关可视化蒙层(双层:
-/// CDP 输入拦截 + JS 视觉蒙层)。镜像 set_highlight 语义。
-async fn act_set_overlay(id: &str, p: &Value) -> std::result::Result<Value, String> {
-    let enabled = p.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-    crate::agent::browser::BrowserManager::global()
-        .set_overlay(id, enabled)
-        .await
-}
-
 /// request_human 的 reason → 默认文案与展示标签。
 /// 第 130 轮收口到 `human_assist::{kind_label, default_message}` 单一事实源
 /// (弹窗 / TUI / 工具侧三处共用);完整合法 reason 列表见
@@ -1332,12 +1312,16 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     });
     let bring = p.get("bring_to_front").and_then(Value::as_bool).unwrap_or(true);
 
-    // 第 141 轮:人工介入期间默认解锁页面(unlock_page=true)—— HITL 正是「该人工
-    // 操作」的时刻(拖滑块/扫码页/登录表单),保持蒙层锁定会让介入形同虚设;
-    // 应答/超时/取消后自动复锁。纯问答场景(确认继续?)可传 unlock_page=false。
+    // 第 143 轮:人工介入期间默认解锁页面(unlock_page=true)—— HITL 正是「该人工
+    // 操作」的时刻(拖滑块/扫码页/登录表单),保持管控会让介入形同虚设。
+    // locked/partial 下**临时切 open**(CDP 放行 + 蒙层/盾区/状态条全撤,状态条变
+    // 「🔓 页面开放」如实告知人工),应答/超时/取消后按实例期望态恢复原档;
+    // open 档本就开放,无需动作。纯问答场景(确认继续?)可传 unlock_page=false。
     let unlock_page = p.get("unlock_page").and_then(Value::as_bool).unwrap_or(true);
     let unlock_applied = unlock_page
-        && crate::agent::browser::BrowserManager::global().overlay_active().await
+        && crate::agent::browser::BrowserManager::global().guard_visuals_active().await
+        && crate::agent::browser::BrowserManager::global().current_guard().await.mode
+            != crate::agent::browser_overlay::PageGuardMode::Open
         && match crate::agent::browser::BrowserManager::global().page(id).await {
             Some(page) => {
                 crate::agent::browser_overlay::apply_page_overlay(&page, false)
@@ -1379,12 +1363,13 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     let outcome = crate::agent::human_assist::HumanAssistHub::global()
         .request(reason, &message, options.clone(), &url, id, timeout_ms, &image_path)
         .await;
-    // 第 141 轮:人工介入收口(应答/超时/取消/不可用)后复锁页面 —— 无论何种
-    // 结局,「人工可操作窗口」都必须关闭,fail-open(复锁失败不阻断信封返回,
-    // 下一个输入动作的「先解后锁」会自愈)。
+    // 第 143 轮:人工介入收口(应答/超时/取消/不可用)后按实例期望态恢复管控
+    // —— 无论何种结局,「人工可操作窗口」都必须关闭,fail-open(恢复失败不阻断
+    // 信封返回,下一个输入动作的「先解/先隐」与导航 re-assert 会自愈)。
     if unlock_applied {
         if let Some(page) = crate::agent::browser::BrowserManager::global().page(id).await {
-            let _ = crate::agent::browser_overlay::apply_page_overlay(&page, true).await;
+            let cfg = crate::agent::browser::BrowserManager::global().current_guard().await;
+            let _ = crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
         }
     }
     use crate::agent::human_assist::{AssistVia, HumanAssistOutcome};

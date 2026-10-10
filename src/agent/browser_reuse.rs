@@ -721,7 +721,8 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                // 第 143 轮:new_page 第 7 参改为管控配置(connect 模式会强制 open)
+                crate::agent::browser_overlay::PageGuardConfig::open(),
             )
             .await
             .expect("connect 接管应成功");

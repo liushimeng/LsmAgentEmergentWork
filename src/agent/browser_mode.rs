@@ -295,6 +295,9 @@ mod tests {
 
     #[test]
     fn ci_env_forces_no_gui() {
+        // 必须持锁:LAEW_FORCE_HEADLESS 与 has_gui_session() 竞态会让并行的
+        // env_fallback_follows_gui_session 断言左右两侧读到不同环境(存量 flaky)。
+        let _g = env_lock();
         // 单测进程通常没有 CI;显式设置后必须判为无 GUI(CI 不弹窗)。
         std::env::set_var("LAEW_TEST_CI_MARKER", "1");
         // 不直接改 CI(会污染同进程其它断言),改为验证 truthy 语义一致的

@@ -149,12 +149,12 @@ fn parameters_control_action_enum_complete() {
         "set_cookie", "delete_cookie", "set_storage", "clear_storage", "set_viewport",
         "screenshot", "heartbeat",
         "drag", "focus", "blur", "mouse_move", "dispatch_event",
-        "set_window", "sync_viewport", "set_highlight", "set_overlay", "request_human",
+        "set_window", "sync_viewport", "set_highlight", "set_overlay", "set_guard", "request_human",
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
-    // 第 141 轮:set_overlay(蒙层运行时开关)使枚举 39 → 40
-    assert_eq!(names.len(), 40, "control_action 应为 40 个,实际 {names:?}");
+    // 第 143 轮:set_guard(页面管控三档切换)使枚举 40 → 41
+    assert_eq!(names.len(), 41, "control_action 应为 41 个,实际 {names:?}");
 }
 
 #[test]
@@ -189,6 +189,50 @@ fn parameters_mode_defaults_headed() {
 }
 
 // =================== 参数校验(无需真实浏览器) ===================
+
+/// 第 143 轮:parse_open_guard 级联与校验(纯函数,无需浏览器)。
+#[test]
+fn parse_open_guard_cascade_and_validation() {
+    use crate::agent::browser_overlay::PageGuardMode;
+    use super::parse_open_guard;
+    // ① 显式 guard 完整解析(含选择器与 note)
+    let cfg = parse_open_guard(&json!({
+        "guard": "partial",
+        "block_selectors": ["#pay", ".danger-btn"],
+        "guard_note": "  支付区已锁定  "
+    }))
+    .expect("partial + block 应合法");
+    assert_eq!(cfg.mode, PageGuardMode::Partial);
+    assert_eq!(cfg.block_selectors.len(), 2);
+    assert_eq!(cfg.note.as_deref(), Some("支付区已锁定"), "note 应被 trim");
+    // ② legacy overlay 布尔映射(true=locked/false=open)
+    assert_eq!(
+        parse_open_guard(&json!({"overlay": false})).unwrap().mode,
+        PageGuardMode::Open
+    );
+    assert_eq!(
+        parse_open_guard(&json!({"overlay": true})).unwrap().mode,
+        PageGuardMode::Locked
+    );
+    // ③ guard 优先于 overlay
+    assert_eq!(
+        parse_open_guard(&json!({"guard": "open", "overlay": true})).unwrap().mode,
+        PageGuardMode::Open
+    );
+    // ④ 非法档位
+    assert!(parse_open_guard(&json!({"guard": "whatever"})).is_err());
+    // ⑤ partial 缺选择器
+    assert!(parse_open_guard(&json!({"guard": "partial"})).is_err());
+    // ⑥ allow + block 互斥
+    assert!(parse_open_guard(&json!({
+        "guard": "partial", "allow_selectors": ["a"], "block_selectors": ["b"]
+    }))
+    .is_err());
+    // ⑦ locked 不收选择器
+    assert!(parse_open_guard(&json!({"guard": "locked", "allow_selectors": ["a"]})).is_err());
+    // ⑧ open 带白名单选择器 + note 合法(note 三档通用)
+    assert!(parse_open_guard(&json!({"guard": "open", "guard_note": "请登录"})).is_ok());
+}
 
 #[tokio::test]
 async fn missing_action_returns_1001() {
@@ -1187,6 +1231,97 @@ async fn real_browser_tool_overlay_end_to_end() {
     assert_eq!(payload["m"], true, "蒙层元素应仍存在(复锁不误删):{check}");
 
     // ④ 收口:关闭全部页面回收浏览器(全局单例,防污染其它测试)
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}
+
+// =================== 第 143 轮:页面管控三档工具层真浏览器验证(#[ignore]) ===================
+//
+// 验证「工具 JSON 面 → parse_open_guard → new_page → 响应字段 → set_guard 切档 →
+// partial 黑名单盾下 Agent click(先隐盾后复盾)」完整链路:
+// open(guard="open") 应回报 data.guard.mode=open 且 CDP 未锁(click 无须让路);
+// set_guard(partial, block=#b) 后 click 应照常生效(隐盾包装)且盾区存在;
+// 参数错误(partial 缺选择器)应回 1001。
+// 跑法:`cargo test --lib real_browser_tool_guard -- --ignored --nocapture`(需本机 Chrome)。
+#[tokio::test]
+#[ignore = "需要本机真实 Chrome(会弹有头窗口);本地手动跑"]
+async fn real_browser_tool_guard_modes_end_to_end() {
+    let url = "data:text/html,<button id='b' onclick='this.dataset.c=(+this.dataset.c||0)+1' \
+               style='position:fixed;left:0;top:0;width:200px;height:100px'>x</button>";
+    // ① open(guard=open):响应应回报 guard.mode=open(状态条「页面开放」在页面上)
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url, "guard": "open",
+                        "guard_note": "请登录后应答弹窗", "window_width": 800, "window_height": 600}))
+        .await
+        .expect("open 失败(本机是否装有 Chrome?)");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], 0, "open(guard=open) 应成功:{out}");
+    assert_eq!(v["data"]["guard"]["mode"], "open", "guard 档应为 open:{out}");
+    assert_eq!(v["data"]["overlay"]["enabled"], false, "legacy overlay 应派生为关:{out}");
+    let pid = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    // ② open 档 click 无须让路也应生效(没有 CDP 输入锁/盾区)
+    let click = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "click",
+                        "params": {"selector": "#b"}}))
+        .await
+        .unwrap();
+    let c: Value = serde_json::from_str(&click).unwrap();
+    assert_eq!(c["code"], 0, "open 档 click 应生效:{click}");
+
+    // ③ set_guard 切 partial(黑名单罩住按钮):click 经「先隐盾后复盾」照常生效,
+    //    盾区容器内应有盾罩,状态条文案切换为「部分锁定」。
+    let sg = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "set_guard",
+                        "params": {"mode": "partial", "block_selectors": ["#b"], "note": "支付区已锁定"}}))
+        .await
+        .unwrap();
+    let g: Value = serde_json::from_str(&sg).unwrap();
+    assert_eq!(g["code"], 0, "set_guard(partial) 应成功:{sg}");
+    assert_eq!(g["data"]["mode"], "partial", "响应应回报 partial:{sg}");
+    let click2 = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "click",
+                        "params": {"selector": "#b"}}))
+        .await
+        .unwrap();
+    let c2: Value = serde_json::from_str(&click2).unwrap();
+    assert_eq!(c2["code"], 0, "partial 黑名单盾下 click 应经隐盾照常生效:{click2}");
+    let check = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "eval_js",
+                        "params": {"expression":
+                            "JSON.stringify({c:+document.getElementById('b').dataset.c||0, \
+                             sc:document.getElementById('__laew_guard_shields__').childElementCount, \
+                             chip:(document.querySelector('.__laew_guard_hint_title__')||{}).textContent||''})"}}))
+        .await
+        .unwrap();
+    let e: Value = serde_json::from_str(&check).unwrap();
+    let payload: Value =
+        serde_json::from_str(e["data"]["result"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+    assert_eq!(payload["c"], 2, "两次 click 都应真实生效:{check}");
+    assert_eq!(payload["sc"], 1, "黑名单应生成 1 个盾罩:{check}");
+    assert!(payload["chip"].as_str().unwrap_or("").contains("部分锁定"), "状态条应切换文案:{check}");
+
+    // ④ set_guard 切回 locked:输入锁恢复 + 蒙层回归。
+    let sg2 = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "set_guard",
+                        "params": {"mode": "locked"}}))
+        .await
+        .unwrap();
+    let g2: Value = serde_json::from_str(&sg2).unwrap();
+    assert_eq!(g2["code"], 0, "set_guard(locked) 应成功:{sg2}");
+    assert_eq!(g2["data"]["input_locked"], true, "locked 档应回报输入锁:{sg2}");
+
+    // ⑤ 参数错误:partial 缺选择器 → 1001(不是 2002,便于 LLM 机械修正)。
+    let bad = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "set_guard",
+                        "params": {"mode": "partial"}}))
+        .await
+        .unwrap();
+    let b: Value = serde_json::from_str(&bad).unwrap();
+    assert_eq!(b["code"], 1001, "partial 缺选择器应回 1001:{bad}");
+
+    // ⑥ 收口:关闭全部页面回收浏览器(全局单例,防污染其它测试)
     let _ = McpWebUseTool
         .execute(json!({"action": "close", "page_id": "all"}))
         .await;

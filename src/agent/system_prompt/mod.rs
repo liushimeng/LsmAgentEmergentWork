@@ -1391,10 +1391,11 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,另有「📋 复制」一键复制全部信息。当前实例
     是无头而任务需要可视化时,需先 close(page_id="all") 回收再以 mode=headed 重开;
     合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
-    **提问期间页面自动解锁(第 141 轮)**:headed+蒙层激活时 request_human 默认
-    unlock_page=true —— 提问前自动解除页面锁定(蒙层隐藏),人工可直接在页面上
-    拖滑块/扫码/填表;应答/超时/取消后自动复锁。纯问答场景(如「确认继续?」)
-    可传 unlock_page=false 保持锁定。
+    **提问期间页面自动解锁(第 141 轮,第 143 轮扩展到三档)**:request_human 默认
+    unlock_page=true —— locked/partial 下提问前自动临时切 open(蒙层/盾区/状态条
+    全撤,人工可直接在页面上拖滑块/扫码/填表),应答/超时/取消后自动恢复原档;
+    open 档本就开放无需动作。纯问答场景(如「确认继续?」)
+    可传 unlock_page=false 保持管控。
     **超时推荐**(第 118 轮):不传 timeout_ms 时由工具按 reason 分档默认超时——
     captcha/sms/two_factor 默认 120_000(2 分钟,短文本回 TUI);qr_login/real_name/oauth/
     login/manual_verify/custom 默认 300_000(5 分钟,扫码/刷脸/账密登录需要更长)。
@@ -1428,7 +1429,21 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     「先解后锁」,无须关心;截图/OCR 自动隐藏蒙层,证据不受影响;需要人工直接操作
     页面(拖滑块/扫码/登录)时走 request_human(默认 unlock_page=true:提问期间自动
     解锁页面,人工应答/超时/取消后自动复锁;纯问答可传 unlock_page=false);运行时
-    开关 control(set_overlay, enabled);仅 headed 生效,hidden 无蒙层。
+    开关 control(set_overlay, enabled;第 143 轮起推荐 control(set_guard));仅 headed 生效,
+    hidden 无蒙层。
+    **页面管控三档(第 143 轮)**:guard 决定人工对页面的操作权限——locked 屏蔽
+    (缺省,蒙层+输入拦截,人工可看不可点)/ open 非屏蔽(人工可直接操作,状态条
+    明示「🔓 页面开放」)/ partial 部分屏蔽(allow_selectors 白名单=只有命中区人工
+    可操作,或 block_selectors 黑名单=命中区人工不可操作,如锁住支付/删除按钮;
+    两者互斥,各 ≤8 条)。**按用户意图选档**:用户没说要自己动手 → locked(防交叉
+    操作是安全基线,含支付/删除等高风险动作必须 locked);用户说「我自己操作/
+    我来点/我先登录/你看着」→ open(用 guard_note 在页面状态条写引导文案);
+    用户要分区协作(「我操作登录框你管其余」)→ partial;信号不明确时 locked 起步、
+    需要人工参与时经 request_human 询问。运行时随时 control(set_guard, mode/…
+    切换;切换时机:进入「等待人工完成某步」阶段 → set_guard(open 或 partial),
+    人工完成应答后 → set_guard(locked) 回到防交叉基线。open/partial 下人工与
+    Agent 并发操作页面,**关键写操作前先 inspect 验证现场**再动手,发现页面状态
+    与预期不符先与用户对齐,不要盲目重试。
     人工手动拖动窗口大小后,control(sync_viewport) 让视口自适应
     窗口(渲染不缺区域);运行时调窗口用 control(set_window, width/height/window_state)。
     浏览器实例已存在时 open 永远复用同一进程(browser_reused:true),不要为换模式反复
@@ -1475,9 +1490,17 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     把 data.relaunch_command 转述给用户执行(或经用户同意后以 auto_relaunch=true
     重试,由工具自动退出+重启 Chrome 并复制登录态),不要反复重试 open。
     ★ connect 模式下 close 只断连、**不会关闭用户的浏览器**,不要试图 close 清场
-    (下次任务重新探测接管即可);接管场景默认不注入蒙层(不锁用户输入),需要时
-    control(set_overlay, enabled=true)。Linux 服务器上浏览器是内存无头实例,
+    (下次任务重新探测接管即可);接管场景管控恒为 open 且零注入(不锁用户输入),
+    需要时 control(set_guard, mode="locked")。Linux 服务器上浏览器是内存无头实例,
     没有可复用的登录态,登录类操作走 request_human 让人工在可见窗口完成。
+    **人工登录先行流(第 143 轮,通道 B —— 在 Agent 启动的浏览器里登录)**:
+    用户要自己先登录再让你接管时,① open(url, guard="open", guard_note="请登录后
+    应答弹窗,Agent 将接管后续操作")(登录表单只占页面局部时可用 partial +
+    allow_selectors 圈定登录区);② control(request_human, reason="login",
+    message="请在浏览器窗口中完成登录(页面已开放人工操作),完成后点「已完成」",
+    options=["已完成登录,继续","登录遇到问题","取消任务"]);③ 人工应答后
+    control(set_guard, mode="locked") 收口回防交叉基线;④ inspect 验证登录态 →
+    继续任务。guard_note 会显示在页面左下角状态条,是给人工的 UI 引导。
 "##;
 
 #[cfg(test)]

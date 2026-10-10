@@ -167,14 +167,17 @@ pub async fn capture_hitl_screenshot(
 ) -> std::result::Result<(String, &'static str, Option<ClipRect>), String> {
     let page = ensure_page(id).await?;
 
-    // 第 141 轮:蒙层避让 —— HITL 附图不能带 22% 遮罩与提示条(人工读验证码
-    // 会被干扰)。request_human(unlock_page=true)路径此时已解锁隐藏,这里是
-    // unlock_page=false 时该通道仍干净的兜底;只动视觉层,不动输入锁。
-    let mask_hidden = crate::agent::browser::BrowserManager::global().overlay_active().await
-        && crate::agent::browser_overlay::mask_set_visible(&page, false).await;
+    // 第 143 轮:管控视觉避让 —— HITL 附图不能带蒙层遮罩/盾区/状态条(人工读
+    // 验证码会被干扰)。request_human(unlock_page=true)路径此时已临时切 open,
+    // 这里是 unlock_page=false 或 open 档下该通道仍干净的兜底;只动视觉层,
+    // 不动 CDP 输入锁。
+    let visuals_hidden = crate::agent::browser::BrowserManager::global()
+        .guard_visuals_active()
+        .await
+        && crate::agent::browser_overlay::guard_suspend_visuals(&page, true).await;
     let r = capture_hitl_screenshot_inner(&page).await;
-    if mask_hidden {
-        let _ = crate::agent::browser_overlay::mask_set_visible(&page, true).await;
+    if visuals_hidden {
+        let _ = crate::agent::browser_overlay::guard_suspend_visuals(&page, false).await;
     }
     r
 }
