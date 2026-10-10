@@ -90,19 +90,8 @@ impl Tool for ReadTool {
         let path = resolve_path(path_str);
         let metadata = fs::metadata(&path).map_err(|e| {
             let attempted = resolve_path_with_candidates(path_str);
-            let reason_msg = match attempted {
-                ResolveCandidates::Single(p) => {
-                    format!("stat 失败: {e} (tried: {})", p.display())
-                }
-                ResolveCandidates::WorkAndRoot { work, root } => {
-                    format!(
-                        "stat 失败: {e} (tried [work]: {}, [root]: {})\n{}",
-                        work.display(),
-                        root.display(),
-                        format_path_diagnostic(path_str, &work, &root),
-                    )
-                }
-            };
+            let hint = format_path_diagnostic(path_str, &attempted.tried, &program_dir());
+            let reason_msg = format!("stat 失败: {e} (tried: {})\n{}", attempted.tried.display(), hint);
             AgentError::ToolExecution {
                 tool: self.name().into(),
                 reason: reason_msg,
@@ -388,42 +377,35 @@ fn wrap_base64_lines(b64: &str, width: usize) -> String {
     out
 }
 
-/// 把工具入参里的相对路径解析为绝对路径(关联报告: 2026-09-09_05 E-002)。
+/// 把工具入参里的相对路径解析为绝对路径。
 ///
-/// 解析顺序(关联报告: 2026-09-09_04 D-003 + 2026-09-09_05 E-002):
+/// 解析规则(第 152 轮收口):
 /// 1. 已是绝对路径 → 原样返回;
-/// 2. **工作目录**(env::current_dir())拼接;
-/// 3. 若 2 不存在,**根目录**(laew 二进制所在目录,与 CLAUDE.md "根目录" 约定一致)拼接;
-/// 4. 兜底返回 2 路径(让上层 stat 给出明确报错信息,而不是默默返回错路径)。
+/// 2. 相对路径 → **工作目录**(`env::current_dir()`)拼接。
+///
+/// 第 152 轮移除了「根目录(二进制所在目录)回退」:该回退让 `Read("plans/x.md")`
+/// 在工作目录找不到时会静默去读 `/opt/homebrew/bin/plans/x.md` —— 一次跨目录的
+/// 「幽灵命中」,既让 Agent 读到用户看不见的产物,也让排障时对不上账(实测事故:
+/// Plan 落在根目录、Read 却"读到了",用户在工作目录里怎么都找不到)。
+/// 现在解析口径单一:**相对路径就是相对工作目录**,不存在就如实报错。
 fn resolve_path(p: &str) -> PathBuf {
     resolve_path_with_candidates(p).into_path()
 }
 
-/// 路径解析的「候选路径」: 用于错误消息同时列出多个尝试路径。
-///
-/// 关联报告: 2026-09-09_05 E-002。
+/// 路径解析的「候选路径」: 用于错误消息列出尝试过的路径。
 #[derive(Debug)]
-pub(crate) enum ResolveCandidates {
-    /// 仅一个候选路径(绝对路径且无根目录回退 / 工作目录直接命中)
-    Single(PathBuf),
-    /// 两个候选路径: 工作目录拼接 + 根目录拼接(均已尝试)
-    WorkAndRoot { work: PathBuf, root: PathBuf },
+pub(crate) struct ResolveCandidates {
+    /// 实际尝试的路径
+    pub tried: PathBuf,
+    /// 是否原本就是绝对路径(影响错误文案)
+    #[allow(dead_code)]
+    pub was_absolute: bool,
 }
 
 impl ResolveCandidates {
     /// 取出最终选定的路径(用于实际 stat / read)。
     pub fn into_path(self) -> PathBuf {
-        match self {
-            ResolveCandidates::Single(p) => p,
-            ResolveCandidates::WorkAndRoot { work, root } => {
-                // 优先选实际存在的(供 caller 使用);理论上两者都不存在时返回 work
-                if root.exists() {
-                    root
-                } else {
-                    work
-                }
-            }
-        }
+        self.tried
     }
 }
 
@@ -431,79 +413,32 @@ fn resolve_path_with_candidates(p: &str) -> ResolveCandidates {
     let path = Path::new(p);
     if path.is_absolute() {
         tracing::debug!(path = %path.display(), "resolve_path: 绝对路径");
-        // 关联报告: 2026-09-09_04 D-003 —— 若 LLM 把「项目相对路径」误拼成「工作目录绝对路径」,
-        // 而真实文件在根目录,做一次根目录替换重试。
-        let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        if let Ok(rel) = path.strip_prefix(&work) {
-            // 该路径在工作目录下,但 stat 失败;尝试「根目录 + 相对路径」
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(root) = exe.parent() {
-                    let root_path = root.join(rel);
-                    if root_path.exists() && !path.exists() {
-                        tracing::debug!(
-                            orig = %path.display(),
-                            tried = %root_path.display(),
-                            "resolve_path 工作目录绝对路径 → 根目录回退"
-                        );
-                        return ResolveCandidates::WorkAndRoot {
-                            work: path.to_path_buf(),
-                            root: root_path,
-                        };
-                    }
-                }
-            }
-        }
-        return ResolveCandidates::Single(path.to_path_buf());
+        return ResolveCandidates {
+            tried: path.to_path_buf(),
+            was_absolute: true,
+        };
     }
     let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let work_path = work.join(path);
-    let work_exists = work_path.exists();
     tracing::debug!(
         rel = %p,
         work = %work.display(),
         work_path = %work_path.display(),
-        work_exists = %work_exists,
         "resolve_path 工作目录尝试"
     );
-    if work_exists {
-        return ResolveCandidates::Single(work_path);
+    ResolveCandidates {
+        tried: work_path,
+        was_absolute: false,
     }
-    // 根目录回退:从 current_exe() 父目录推导
-    match std::env::current_exe() {
-        Ok(exe) => {
-            tracing::debug!(exe = %exe.display(), "resolve_path current_exe 成功");
-            match exe.parent() {
-                Some(root) => {
-                    let root_path = root.join(path);
-                    let root_exists = root_path.exists();
-                    tracing::debug!(
-                        rel = %p,
-                        root = %root.display(),
-                        root_path = %root_path.display(),
-                        root_exists = %root_exists,
-                        "resolve_path 根目录回退判断"
-                    );
-                    if root_exists {
-                        return ResolveCandidates::Single(root_path);
-                    }
-                    // 关联报告: 2026-09-09_05 E-002 —— 工作目录与根目录均不存在,
-                    // 返回两个候选路径以便错误消息同时列出。
-                    return ResolveCandidates::WorkAndRoot {
-                        work: work_path,
-                        root: root_path,
-                    };
-                }
-                None => {
-                    tracing::debug!(exe = %exe.display(), "resolve_path current_exe 无父目录");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::debug!(err = %e, "resolve_path current_exe 失败");
-        }
-    }
-    tracing::debug!(rel = %p, fallback = %work_path.display(), "resolve_path 兜底返回 work_path");
-    ResolveCandidates::Single(work_path)
+}
+
+/// laew 程序目录(二进制所在目录)—— 仅用于错误文案里的「源码在哪」提示,
+/// 第 152 轮起**不参与**任何路径解析(解析口径单一:工作目录)。
+fn program_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// 在 Read 工具 stat 失败时为错误消息追加「路径诊断」提示。
@@ -616,40 +551,27 @@ mod tests {
     // ========== 错误信息双路径(第 05 轮 E-002,方案 tmpPlan/2026-09-09_05) ==========
 
     #[test]
-    fn missing_rel_path_reports_work_and_root_attempts() {
-        // 相对路径,工作目录与根目录拼接后都不存在 → 错误应同时显示两个尝试路径
+    fn missing_rel_path_resolves_against_work_dir_only() {
+        // 第 152 轮:相对路径只按工作目录解析(根目录回退已移除,避免跨目录幽灵命中)
         let work = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        // 构造一个绝对不会存在的相对路径
         let rel = "definitely_not_exists_e2e_test_12345/file.txt";
         let candidates = resolve_path_with_candidates(rel);
-        match candidates {
-            ResolveCandidates::WorkAndRoot { work: w, root: r } => {
-                assert_eq!(w, work.join(rel), "工作目录路径应拼接正确");
-                // 根路径由 current_exe().parent() 推导,在此仅校验非空
-                assert!(!r.as_os_str().is_empty(), "根目录路径应存在");
-            }
-            other => panic!("应返回 WorkAndRoot(两个路径均不存在),实际 {other:?}"),
-        }
+        assert!(!candidates.was_absolute);
+        assert_eq!(candidates.tried, work.join(rel), "应按工作目录拼接");
     }
 
     #[test]
-    fn single_resolve_when_work_dir_exists() {
-        // 工作目录命中时,应返回 Single 而非 WorkAndRoot
-        // 用绝对路径模拟「路径存在」(strip_prefix 不会命中,走 Single 分支)
+    fn absolute_path_kept_as_is() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let p = tmp.path().to_str().unwrap();
         let candidates = resolve_path_with_candidates(p);
-        match candidates {
-            ResolveCandidates::Single(rp) => {
-                assert_eq!(rp, std::path::PathBuf::from(p));
-            }
-            other => panic!("绝对路径应返回 Single,实际 {other:?}"),
-        }
+        assert!(candidates.was_absolute);
+        assert_eq!(candidates.tried, std::path::PathBuf::from(p));
     }
 
     #[tokio::test]
-    async fn read_error_message_contains_both_attempts_for_missing_rel_path() {
-        // 验证 Read 工具在「相对路径均不存在」时,错误消息同时显示 work 与 root 路径
+    async fn read_error_message_shows_tried_path() {
+        // 验证 Read 工具在「相对路径不存在」时,错误消息给出实际尝试过的路径
         let rel = "definitely_not_exists_e2e_test_12345/file.txt";
         let err = ReadTool
             .execute(json!({"file_path": rel}))
@@ -658,12 +580,12 @@ mod tests {
         match err {
             AgentError::ToolExecution { reason, .. } => {
                 assert!(
-                    reason.contains("[work]"),
-                    "错误消息应标注 [work] 路径,实际: {reason}"
+                    reason.contains("tried:"),
+                    "错误消息应给出 tried 路径,实际: {reason}"
                 );
                 assert!(
-                    reason.contains("[root]"),
-                    "错误消息应标注 [root] 路径,实际: {reason}"
+                    reason.contains(rel),
+                    "错误消息应回显相对路径,实际: {reason}"
                 );
             }
             other => panic!("预期 ToolExecution 错误,实际 {other:?}"),
@@ -726,9 +648,9 @@ mod tests {
             .unwrap_err();
         match err {
             AgentError::ToolExecution { reason, .. } => {
-                // 双路径一定存在
-                assert!(reason.contains("[work]"), "应含 [work],实际: {reason}");
-                assert!(reason.contains("[root]"), "应含 [root],实际: {reason}");
+                // 第 152 轮:解析口径单一(只按工作目录),错误消息给出 tried 路径
+                assert!(reason.contains("tried:"), "应含 tried,实际: {reason}");
+                assert!(reason.contains(rel), "应回显相对路径,实际: {reason}");
                 // 当前工作目录若是 laew 子目录(典型 TestWorkSpace),应有诊断
                 let work_dir = std::env::current_dir().unwrap_or_default();
                 let work_name = work_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");

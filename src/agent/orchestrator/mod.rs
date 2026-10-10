@@ -205,9 +205,17 @@ impl MultiAgentOrchestrator {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             crate::database::Paths::for_test(&cwd)
         });
-        let skill_registry = std::sync::Arc::new(
-            crate::agent::skills::SkillRegistry::load(&paths.root_dir, &paths.work_dir)
-        );
+        // 第 152 轮修正:用户级 skill 目录是 `~/.laew/skills`,原代码把 `root_dir`
+        // (二进制所在目录)当 home 传,导致用户级 skill 永远在 /opt/homebrew/bin 下找。
+        let skill_home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| paths.work_dir.clone());
+        let skill_registry =
+            std::sync::Arc::new(crate::agent::skills::SkillRegistry::load(
+                &skill_home,
+                &paths.work_dir,
+            ));
         let session_id = std::sync::Arc::new(format!(
             "orch-{}",
             std::time::SystemTime::now()

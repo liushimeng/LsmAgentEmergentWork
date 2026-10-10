@@ -249,6 +249,14 @@ impl HumanAssistHub {
         self.attached.load(Ordering::SeqCst)
     }
 
+    /// 当前是否有待答的人工介入请求(第 152 轮:浏览器工具的输入挂起闸读它)。
+    ///
+    /// 提问期间页面所有权归人工,Agent 的输入类动作必须挂起 —— 否则其收尾的
+    /// 「先解后锁」会把人工正在操作的页面重新锁死。
+    pub fn is_pending(&self) -> bool {
+        lock_state(&self.state).current.is_some()
+    }
+
     /// 工具侧:注册人工介入请求并等待回答。
     ///
     /// - 弹窗与 TUI 均不可用 → 立即 [`HumanAssistOutcome::Unavailable`];

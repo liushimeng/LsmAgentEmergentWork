@@ -27,7 +27,6 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW,
@@ -91,6 +90,10 @@ const IDC_EXTEND: i32 = 109;
 const COPY_FEEDBACK_SECS: u64 = 2;
 const COPY_BTN_TITLE: &str = "📋 复制";
 const COPY_BTN_DONE: &str = "✓ 已复制";
+/// 「🔍 放大」点击后的反馈标题(实际动作 = 复制图片路径,见 open_image)。
+const ORIG_BTN_DONE: &str = "✓ 路径已复制";
+/// 「🔍 放大」常态标题(与 ORIG_BTN_DONE 互为回滚对)。
+const ORIG_BTN_TITLE: &str = "🔍 放大";
 const TIMER_ID: usize = 1;
 
 const CLASS_NAME: &str = "LAEWHITLDIALOG";
@@ -211,6 +214,8 @@ struct WinState {
     copy_payload: String,
     /// 「✓ 已复制」反馈的回滚时刻(由 on_tick 消费)。
     copied_at: Option<Instant>,
+    /// 第 152 轮:本次「已复制」反馈落在哪个按钮上(copy / orig),None = copy。
+    copied_btn: Option<HWND>,
     /// 第 145 轮:请求 id / 提出时刻毫秒 —— extend 中间行携带 id;「超时截止」
     /// 时间轴行随延长重写。
     payload_id: u64,
@@ -369,7 +374,7 @@ unsafe fn apply_frames(c: &Controls, f: &Frames, geo: Geometry) {
 
 fn on_tick() {
     // 先锁定取出所需并解锁,再触碰 UI(finish 会再次锁定 STATE)。
-    let (t2, text, timed_out, rollback_copy) = {
+    let (t2, text, timed_out, rollback_copy, rollback_orig_btn) = {
         let mut guard = state();
         let Some(st) = guard.as_mut() else { return };
         if st.done {
@@ -378,21 +383,35 @@ fn on_tick() {
         let elapsed = st.started.elapsed().as_millis() as u64;
         let remain = st.timeout_ms.saturating_sub(elapsed);
         // 第 139 轮:「✓ 已复制」反馈到期回滚标题(不额外起定时器,复用 1s tick)。
+        // 第 152 轮:同一 tick 也回滚「🔍 放大」→(复制路径后)「✓ 路径已复制」。
         let rollback = match st.copied_at {
             Some(at) if at.elapsed().as_secs() >= COPY_FEEDBACK_SECS => {
                 st.copied_at = None;
-                Some(st.copy)
+                match st.copied_btn {
+                    Some(btn) => Some(btn),
+                    None => Some(st.copy),
+                }
             }
             _ => None,
         };
-        (st.t2, countdown_text(elapsed, remain), remain == 0, rollback)
+        (
+            st.t2,
+            countdown_text(elapsed, remain),
+            remain == 0,
+            rollback,
+            st.orig,
+        )
     };
     let wide = to_wide(&text);
     unsafe {
         SendMessageW(t2, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
     }
     if let Some(btn) = rollback_copy {
-        let wide = to_wide(COPY_BTN_TITLE);
+        let wide = to_wide(if btn == rollback_orig_btn {
+            ORIG_BTN_TITLE
+        } else {
+            COPY_BTN_TITLE
+        });
         unsafe {
             SendMessageW(btn, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
         }
@@ -414,6 +433,7 @@ fn copy_info() {
             return;
         }
         st.copied_at = Some(Instant::now());
+        st.copied_btn = None;
         (st.copy_payload.clone(), st.copy)
     };
     let ok = unsafe { set_clipboard_text(&payload) };
@@ -528,24 +548,32 @@ fn toggle_zoom() {
     }
 }
 
+/// 「🔍 放大」—— 第 152 轮:改为**把验证码图绝对路径复制到剪贴板**。
+///
+/// 旧实现调 `ShellExecuteW("open")` 交给系统默认应用,用户的 `.png` 默认处理器
+/// 是浏览器时每点一次就新开一个标签/窗口;截图原落系统临时目录,被清理后浏览器
+/// 只显示空白 —— 与 macOS 侧同源的实测事故(HITL 期间冒出大量空/乱验证码标签页)。
+/// 流程中途唤起外部应用属于交叉操作,与第 141~143 轮「人工只读」管控语义冲突。
+///
+/// 现改为零外部进程:复制路径 → 人工自行决定是否用看图工具打开(主动行为);
+/// 看不清细节时用「⛶ 最大化」放大弹窗即可。SS_BITMAP 是静态位图控件、无缩放
+/// 能力,故不做 1:1 切换(macOS 侧 NSImageView 可切,两平台行为差异在此说明)。
 fn open_image() {
-    let path = {
-        let guard = state();
-        guard.as_ref().and_then(|st| st.image_open_path.clone())
+    let (path, btn) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
+        if st.done {
+            return;
+        }
+        let Some(p) = st.image_open_path.clone() else { return };
+        st.copied_at = Some(Instant::now());
+        st.copied_btn = Some(st.orig);
+        (p, st.orig)
     };
-    let Some(path) = path else { return };
-    // 系统默认查看器打开;失败静默(纯附加能力)
-    let verb = to_wide("open");
-    let file = to_wide(&path);
+    let ok = unsafe { set_clipboard_text(&path) };
+    let wide = to_wide(if ok { ORIG_BTN_DONE } else { "⚠ 复制失败" });
     unsafe {
-        let _ = ShellExecuteW(
-            HWND::default(),
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(file.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOW,
-        );
+        SendMessageW(btn, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
     }
 }
 
@@ -702,7 +730,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     // 第 145 轮:「⏱ +2分钟」延长等待。
     let extend = create_control(hwnd, hinst, "BUTTON", super::dialog_main::EXTEND_BTN_TITLE, style_button(false), IDC_EXTEND, font_normal);
     let zoom = create_control(hwnd, hinst, "BUTTON", "⛶ 最大化", style_button(false), IDC_ZOOM, font_normal);
-    let orig = create_control(hwnd, hinst, "BUTTON", "查看原图", style_button(false), IDC_ORIG, font_normal);
+    let orig = create_control(hwnd, hinst, "BUTTON", "🔍 放大", style_button(false), IDC_ORIG, font_normal);
     // 第 139 轮:一键复制(STATIC 标签天生不可选中,拖选复制不可靠)
     let copy = create_control(hwnd, hinst, "BUTTON", COPY_BTN_TITLE, style_button(false), IDC_COPY, font_normal);
 
@@ -727,6 +755,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         image_open_path,
         copy_payload: p.copy_text(),
         copied_at: None,
+        copied_btn: None,
         payload_id: p.id,
         started_at_ms: p.started_at_ms,
         extend_count: 0,

@@ -53,7 +53,7 @@ const DELTA_FILE_CAP: usize = 200;
 const DEFAULT_TTL_SECS: u64 = 5;
 
 /// 扫描时跳过的目录名(构建产物 / 依赖 / 版本库元数据)。
-const IGNORED_DIRS: [&str; 16] = [
+const IGNORED_DIRS: [&str; 23] = [
     ".git",
     "target",
     "node_modules",
@@ -70,6 +70,19 @@ const IGNORED_DIRS: [&str; 16] = [
     ".vscode",
     ".cache",
     ".tox",
+    // 第 152 轮:laew 自身的产物目录。第 152 轮起产物统一落「工作目录」,若不在这里
+    // 排除,laew 一跑起来就会在自己的工作目录里写出 `AuditTrail/`,于是
+    // `WorkspaceSnapshot::is_trivial()` 判否 —— 一个**空目录**用户跑 laew 之后
+    // 突然「有内容了」,项目上下文注入(<<<LAEW:PROJECT_CONTEXT>>>)凭空出现,
+    // 工作区快照还会把审计 jsonl 当成「用户最近改动的文件」报告给模型。
+    // 语义上 laew 的产物不属于用户工作区内容,必须排除。
+    "AuditTrail",
+    "DebugReport",
+    "BashSpill",
+    "EvalSpill",
+    "WebShots",
+    "CrashReport",
+    ".laew",
 ];
 
 /// 工程类型探测表:(名称, 标记文件, 构建命令, 测试命令)。
@@ -575,6 +588,10 @@ fn collect_top_entries(snap: &mut WorkspaceSnapshot, work_dir: &Path) {
         if name == ".git" {
             continue;
         }
+        // 第 152 轮:laew 自身产物目录不算用户工作区内容(见 IGNORED_DIRS 注释)
+        if IGNORED_DIRS.contains(&name.as_str()) {
+            continue;
+        }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
             dirs.push(format!("{name}/"));
@@ -770,6 +787,42 @@ fn truncate_chars(s: String, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 第 152 轮:laew 产物目录必须被工作区快照排除 —— 否则空目录跑一次 laew
+    /// 就会凭空长出 `AuditTrail/`,项目上下文注入与「最近改动」都被污染。
+    #[test]
+    fn artifact_dirs_excluded_from_snapshot() {
+        for d in [
+            "AuditTrail",
+            "DebugReport",
+            "BashSpill",
+            "EvalSpill",
+            "WebShots",
+            "CrashReport",
+            ".laew",
+        ] {
+            assert!(IGNORED_DIRS.contains(&d), "产物目录 {d} 未进 IGNORED_DIRS");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("AuditTrail")).unwrap();
+        std::fs::write(dir.path().join("AuditTrail/audit_x.jsonl"), "{}").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn main(){}").unwrap();
+        let snap = snapshot(dir.path());
+        assert!(
+            !snap.dirs.iter().any(|d| d.starts_with("AuditTrail")),
+            "产物目录不应出现在顶层结构:{:?}",
+            snap.dirs
+        );
+        assert!(
+            snap.recent_files
+                .iter()
+                .all(|f| !f.path.contains("AuditTrail")),
+            "产物文件不应进最近改动:{:?}",
+            snap.recent_files
+        );
+        assert!(snap.dirs.iter().any(|d| d == "src/"));
+    }
+
     use super::*;
     use std::fs;
 

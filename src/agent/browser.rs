@@ -118,6 +118,9 @@ struct BrowserInner {
     /// 页面管控期望态(第 143 轮:locked 屏蔽/open 开放/partial 部分屏蔽;
     /// 第 141 轮的 `overlay: bool` 升级而来,locked 档语义与蒙层完全一致)。
     guard: super::browser_overlay::PageGuardConfig,
+    /// 自动跟随最新内容期望态(第 152 轮,默认开):导航后新文档按它重挂跟随器,
+    /// 与 guard 的期望态 re-assert 同构。connect 模式恒 false(不干预用户浏览器)。
+    auto_follow: bool,
 }
 
 /// 浏览器会话管理器(进程内单例)。
@@ -300,6 +303,9 @@ impl BrowserManager {
                         mode: BrowserMode::Hidden,
                         highlight: true,
                         guard: super::browser_overlay::PageGuardConfig::from_env_default(),
+                        // 第 152 轮:默认开启跟随 —— 人工在 locked 档无法滚动,
+                        // 页面必须自己停在最新,否则多轮对话只有第一屏可见。
+                        auto_follow: true,
                     }),
                 })
             })
@@ -901,6 +907,33 @@ impl BrowserManager {
         }))
     }
 
+    /// 第 152 轮:设置自动跟随期望态并立即应用到当前文档;导航后新文档自动重挂。
+    pub async fn set_auto_follow(&self, page_id: &str, enabled: bool) -> bool {
+        let Some(page) = self.page(page_id).await else {
+            return false;
+        };
+        {
+            let mut inner = self.inner.lock().await;
+            inner.auto_follow = enabled;
+        }
+        super::browser_follow::set(&page, enabled).await
+    }
+
+    /// 导航/派生页后的跟随态 re-assert(与 guard 的 re-assert 同构;fail-open)。
+    pub(crate) async fn reassert_auto_follow(&self, page: &chromiumoxide::Page) {
+        let enabled = {
+            let inner = self.inner.lock().await;
+            if inner.connect_mode {
+                false
+            } else {
+                inner.auto_follow
+            }
+        };
+        if enabled {
+            super::browser_follow::set(page, true).await;
+        }
+    }
+
     /// 蒙层是否处于激活态(第 141 轮,第 143 轮语义不变):locked 档 **且** headed。
     ///
     /// 供 control 层决定「输入动作先解后锁 / request_human 解锁」是否需要动 CDP;
@@ -1202,24 +1235,86 @@ impl BrowserManager {
         }))
     }
 
+    /// 页面标题(fail-open:取不到按空串处理,等价于「可能噪声」的最保守侧)。
+    async fn page_title(page: &chromiumoxide::Page) -> String {
+        page.evaluate("document.title")
+            .await
+            .ok()
+            .and_then(|r| r.value().cloned())
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
     /// 动作后 adopt 派生标签页:diff browser.pages() 与注册表,
     /// 未登记的 page target 注册为新 page_id 返回。
+    ///
+    /// 第 152 轮两处加固(实测:headed 模式下 HITL 收口后前台冒出一批空白/乱码标签页):
+    ///
+    /// 1. **噪声页直接关掉,不进注册表**(判定见 [`super::browser_noise`])。
+    ///    原实现对未知 target 一律收编,收编 ≠ 关闭 —— 页面自己开的
+    ///    `about:blank`、风控脚本 `window.open('')` 的空窗、下载导航残留
+    ///    全部滞留在前台,越积越多。关闭前先 `sleep(250ms)` 复查一次 URL:
+    ///    `target=_blank` 刚打开的窗口 URL 短暂就是 `about:blank`,不给这点
+    ///    导航时间会把真页面误杀。
+    /// 2. **connect 模式(`open(reuse_existing=true)`)完全不收编**。此时
+    ///    `browser.pages()` 返回的是**用户浏览器里的全部标签页**,注册表只装了
+    ///    laew 自己开的那几个;照旧逻辑会把用户的私人标签页一次性收编并注入
+    ///    管控脚本,`spawned_page_id` 还会指向用户的私人页面。
     pub async fn adopt_spawned_pages(&self) -> Vec<String> {
         let mut inner = self.inner.lock().await;
         let Some(browser) = inner.browser.as_ref() else {
             return Vec::new();
         };
+        if inner.connect_mode {
+            // 接管模式:浏览器归用户所有,laew 不认领也不关闭任何未知页面。
+            return Vec::new();
+        }
         let Ok(pages) = browser.pages().await else {
             return Vec::new();
         };
         let known: std::collections::HashSet<String> =
             inner.pages.values().map(|e| e.target_id.clone()).collect();
         let mut adopted = Vec::new();
+        let mut candidates: Vec<chromiumoxide::Page> = Vec::new();
+        let mut noise: Vec<chromiumoxide::Page> = Vec::new();
         for page in pages {
             let tid: String = page.target_id().clone().into();
             if known.contains(&tid) {
                 continue;
             }
+            // 噪声判定:URL + 标题;标题非空即豁免(见 is_noise_page)
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            let title = Self::page_title(&page).await;
+            if super::browser_noise::is_noise_page(&url, &title) {
+                noise.push(page);
+            } else {
+                candidates.push(page);
+            }
+        }
+        // 给刚打开的窗口一次导航时间再复查,避免误杀 `target=_blank` 真页面
+        if !noise.is_empty() && !candidates.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let mut still_noise = Vec::new();
+            for page in noise {
+                let url = page.url().await.ok().flatten().unwrap_or_default();
+                let title = Self::page_title(&page).await;
+                if super::browser_noise::is_noise_page(&url, &title) {
+                    still_noise.push(page);
+                } else {
+                    candidates.push(page);
+                }
+            }
+            noise = still_noise;
+        }
+        if !noise.is_empty() {
+            let n = noise.len();
+            for page in noise {
+                let _ = page.close().await;
+            }
+            tracing::info!(closed = n, "MCP_Web_Use 关闭空白/内部噪声标签页(不收编)");
+        }
+        for page in candidates {
+            let tid: String = page.target_id().clone().into();
             let events = EventBuffer::default();
             let _ = page
                 .execute(chromiumoxide::cdp::js_protocol::runtime::EnableParams::default())
@@ -1237,6 +1332,11 @@ impl BrowserManager {
                 let cfg = inner.guard.clone();
                 super::browser_overlay::inject_agent_guard(&page, &cfg).await;
                 let _ = super::browser_overlay::apply_page_guard(&page, &cfg).await;
+            }
+            // 第 152 轮:派生页同样按实例期望态挂上跟随器(否则新标签页不跟随)
+            if !inner.connect_mode && inner.auto_follow {
+                super::browser_follow::install(&page, true).await;
+                let _ = super::browser_follow::set(&page, true).await;
             }
             let id = new_page_id();
             inner.pages.insert(

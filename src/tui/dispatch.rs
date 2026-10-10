@@ -1066,7 +1066,7 @@ impl TuiSession {
             classification,
             interrupted,
         };
-        let report_dir = self.paths.root_dir.join("DebugReport");
+        let report_dir = crate::artifact_root::artifact_dir("DebugReport");
         match finalize_report(collector, raw_llm, &report_dir, &meta).await {
             Ok(path) => println!(
                 "{}",

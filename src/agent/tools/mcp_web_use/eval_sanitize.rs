@@ -156,11 +156,22 @@ fn annotate_truncated(v: Value, of: usize, original_bytes: usize, depth_capped: 
     Value::Object(obj)
 }
 
+/// eval_js 大结果落盘目录(第 152 轮:产物根下的 `EvalSpill/`,不再落系统临时目录)。
+///
+/// 落 temp 目录的痛点:用户在任务里拿到 `saved_to` 绝对路径却发现文件"不见了"
+/// (系统临时目录会被清理、且与工作目录不在一起);统一落工作目录后,产物与 Plan /
+/// 报告同处一地,`ls` 一下就能看到。
+fn spill_path(file_name: &str) -> std::path::PathBuf {
+    let dir = crate::artifact_root::artifact_dir("EvalSpill");
+    let _ = std::fs::create_dir_all(&dir);
+    crate::artifact_root::safe_join(&dir, file_name)
+}
+
 /// 字符串分支:落盘 + 只回 head + 路径(第 99 轮行为原样保留)。
 fn spill_string_result(s: &str) -> Value {
     let (byte_size, saved_to) = match decode_data_url(s) {
         Some(bytes) => {
-            let path = std::env::temp_dir().join(format!(
+            let path = spill_path(&format!(
                 "{}.{}",
                 spill_stem(),
                 data_ext_from_mime(data_mime(s))
@@ -171,7 +182,7 @@ fn spill_string_result(s: &str) -> Value {
             }
         }
         None => {
-            let path = std::env::temp_dir().join(format!("{}.txt", spill_stem()));
+            let path = spill_path(&format!("{}.txt", spill_stem()));
             match std::fs::write(&path, s) {
                 Ok(_) => (s.len(), Some(path.display().to_string())),
                 Err(_) => (s.len(), None),
@@ -196,7 +207,7 @@ fn spill_string_result(s: &str) -> Value {
 /// 复合值落盘分支(裁剪后仍超限时):与字符串分支**同一套信封形状**,
 /// 模型已经学会读 `saved_to`,不需要学第二种格式。
 fn spill_json_result(shrunk: &Value, original_text: &str) -> Value {
-    let path = std::env::temp_dir().join(format!("{}.json", spill_stem()));
+    let path = spill_path(&format!("{}.json", spill_stem()));
     let saved_to = std::fs::write(&path, original_text)
         .ok()
         .map(|_| path.display().to_string());

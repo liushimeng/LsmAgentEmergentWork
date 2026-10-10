@@ -141,6 +141,29 @@ pub(super) const CREDENTIAL_ZONE_PROBE_JS: &str = r#"(() => {
         if (r.width * r.height > innerWidth * innerHeight * 0.4) return;
         push(el, 'captcha-zone');
     });
+    // ⑤ 人工核验挑战弹层(第 152 轮)—— 与 blocker_probe 的弹层选取同构:
+    // 「高 z-index + 固定/绝对定位 + 面积够大」,不看类名(现代前端多用 BEM/哈希
+    // 类名,关键词通道必然落空)。这一条直接对应实测事故:豆包的**拖拽拼图**弹层
+    // 类名不含 captcha/verify,①②③④ 全部探测不到 → 回退整页 open;而一旦页面
+    // 上恰好有个含 zone 关键词的容器命中了 ④,就会走 partial 挖洞路径,盾罩把
+    // 整块挑战弹层(拖拽区、九宫格)罩住 —— 人工看得见弹窗却拖不动。整层放行是
+    // 唯一正确解:挑战弹层内部的每一个像素都是人工必操作区。
+    // 面积上限放宽到 60% 视口(挑战弹层通常比登录表单大)。
+    let bestLayer = null;
+    const cand = 'dialog[open], [role="dialog"], [aria-modal="true"], body div, body section, body main';
+    Array.prototype.forEach.call(document.querySelectorAll(cand), (el) => {
+        if (el.closest('[data-laew-agent]')) return;
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return;
+        if (cs.position !== 'fixed' && cs.position !== 'absolute') return;
+        const r = el.getBoundingClientRect();
+        if (r.width < 200 || r.height < 120) return;
+        const area = r.width * r.height;
+        if (area > innerWidth * innerHeight * 0.6) return;
+        const z = parseInt(cs.zIndex, 10) || 0;
+        if (!bestLayer || z > bestLayer.z) bestLayer = { el: el, z: z };
+    });
+    if (bestLayer) push(bestLayer.el, 'challenge-overlay');
     return out.slice(0, 8);
 })()"#;
 
@@ -317,6 +340,10 @@ mod tests {
         assert!(js.contains("querySelectorAll(s).length"));
         assert!(js.contains("s.length > 150"));
         assert!(js.contains("slice(0, 8)"));
+        // ⑤ 挑战弹层整层放行(不看类名,只看几何与 z-index)
+        assert!(js.contains("challenge-overlay"));
+        assert!(js.contains("bestLayer"));
+        assert!(js.contains("innerHeight * 0.6"));
         // 无裸控制字节风险锚点:转义走标准 JS 字面量
         assert!(js.contains("CSS.escape"));
     }

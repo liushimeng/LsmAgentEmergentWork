@@ -74,7 +74,14 @@ async fn save_data_url_file(s: &str, p: &Value) -> std::result::Result<Value, St
                 .map_err(|e| format!("创建下载目录失败({}):{e}", d.display()))?;
             d
         }
-        None => std::env::temp_dir(),
+        // 第 152 轮:缺省落工作目录的 WebShots/(原 temp 目录),与其它产物同处一地
+        None => {
+            let d = crate::artifact_root::artifact_dir("WebShots");
+            tokio::fs::create_dir_all(&d)
+                .await
+                .map_err(|e| format!("创建下载目录失败({}):{e}", d.display()))?;
+            d
+        }
     };
     let filename = str_arg(p, "filename").map(str::to_string).unwrap_or_else(|| {
         format!(
@@ -197,6 +204,10 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     }
     // 第 151 轮:人工核验弹窗输入前置硬闸(条件/实现见 blocker_probe::input_gate;弹窗在场时输入只会灌黑洞,命中即 6002 拦截;须在 guard_lift 之前)
     if let Some(gated) = super::blocker_probe::input_gate(id, &action, &params).await { return gated; }
+    // 第 152 轮:人工介入期间的输入挂起闸(4003)。必须排在 6002 硬闸**之后**、
+    // guard_lift **之前**:提问期间页面所有权已移交人工,Agent 的输入动作会把
+    // 人工正在进行的拖拽/点选重新锁死(实测「弹窗阻碍人工输入」的直接机制)。
+    if let Some(pending) = super::hitl_guard::gate(&action, &params).await { return pending; }
     // 第 141 轮:蒙层输入锁「先解后锁」—— 输入类动作(经 CDP Input.dispatch*
     // 或 chromiumoxide Element click/type)在蒙层激活时会被 setIgnoreInputEvents
     // 一并吃掉(实测,见 browser_overlay 模块文档),动作前解锁、动作后复锁。
@@ -252,6 +263,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "set_overlay" => act_set_overlay(id, &params).await,
         // 第 143 轮:页面管控三档运行时切换
         "set_guard" => return act_set_guard(id, &params).await,
+        // 第 152 轮:自动跟随滚动(多轮对话时把页面停在最新,人工在 locked 档也能看到)
+        "auto_follow" => act_auto_follow(id, &params).await,
         // request_human 需要特殊信封(4001/4002),不走通用 2002 映射
         "request_human" => return act_request_human(id, &params).await,
         other => return envelope(1001, "未知 control_action", json!({"control_action": other})),
@@ -273,12 +286,20 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             let _ = crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
         }
     }
+    // 第 152 轮:导航后自动跟随同样按实例期望态 re-assert(跟随器随导航丢失)
+    if result.is_ok() && crate::agent::browser_overlay::action_needs_overlay_reassert(&action) {
+        let mgr = crate::agent::browser::BrowserManager::global();
+        if let Some(page) = mgr.page(id).await {
+            mgr.reassert_auto_follow(&page).await;
+        }
+    }
     // 第 140 轮提速:仅「可能派生新标签页」的动作才做浏览器级 pages() 巡检
     // (每次巡检 = 一次浏览器级 CDP 往返 + 全局锁)。wait/input_text/screenshot/
     // eval_js(纯读)/set_* 等动作不会开新页,批量 sequence 一次可省 N 次巡检。
     // 名单按「动作可能触发浏览器开新 tab/window」保守圈定:点击(链接/target=_blank)、
-    // 键盘(Enter 提交表单跳转)、导航类、select/upload(表单提交)、dispatch_event(自定义事件)。
-    let spawned = if action_may_spawn_page(action) {
+    // 键盘(Enter 提交表单跳转)、导航类、select/upload(表单提交)、dispatch_event(自定义事件);
+    // eval_js 按表达式是否可变更动态判定(见 action_may_spawn_page 注释)。
+    let spawned = if action_may_spawn_page(&action, &params) {
         crate::agent::browser::BrowserManager::global().adopt_spawned_pages().await
     } else {
         Vec::new()
@@ -325,14 +346,22 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
 
 // =================== control_action 实现(逐行平移自 tools/browser.rs) ===================
 
-/// 该 control_action 是否可能派生新标签页/窗口(第 140 轮)。
+/// 该 control_action 是否可能派生新标签页/窗口(第 140 轮;第 152 轮收口)。
 ///
 /// 用途:决定动作收尾是否跑 `adopt_spawned_pages()`(浏览器级 `Target.getTargets`
 /// CDP 往返 + 全局锁)。保守圈定「点击 / 键盘 / 导航 / 表单提交 / 自定义事件」——
 /// 这些可能经 `<a target=_blank>`、`window.open`、表单跳转开新页;观察类与纯
-/// 状态设置类动作(wait/screenshot/eval_js/set_*)不会开页,跳过巡检零风险。
-pub(super) fn action_may_spawn_page(action: &str) -> bool {
-    matches!(
+/// 状态设置类动作(wait/screenshot/set_*)不会开页,跳过巡检零风险。
+///
+/// 第 152 轮修正:`eval_js` 原被无条件圈进来,与其上方注释「eval_js(纯读)不会开新页」
+/// 自相矛盾。实测后果有两个:① 每个 eval 都白付一次浏览器级往返 + 全局锁;
+/// ② 只读 eval 附近恰好有页面自己开的新标签时,响应被塞进一个与本次动作
+/// 无关的 `spawned_page_id`,LLM 只能困惑地记一句「更像误报」(见实测日志
+/// `llaew_20261010_173332.log` iter=5 思考)。现在改为**按表达式判定**:
+/// 只读 eval 不巡检,可变更 eval(命中 `eval_expression_mutates`)才巡检 —— 既
+/// 保住「LLM 用 eval 开页」的合法能力,又消掉噪声与开销。
+pub(super) fn action_may_spawn_page(action: &str, params: &Value) -> bool {
+    if matches!(
         action,
         "click"
             | "human_click"
@@ -349,8 +378,15 @@ pub(super) fn action_may_spawn_page(action: &str) -> bool {
             | "upload_file"
             | "download"
             | "dispatch_event"
-            | "eval_js"
-    )
+    ) {
+        return true;
+    }
+    action == "eval_js"
+        && params
+            .get("expression")
+            .and_then(Value::as_str)
+            .map(super::blocker_probe::eval_expression_mutates)
+            .unwrap_or(false)
 }
 
 // =================== 第 141/143 轮:管控让路辅助已拆分至 guard_ctl.rs ===================
@@ -1058,14 +1094,21 @@ pub(super) async fn act_screenshot(id: &str, p: &Value) -> std::result::Result<V
     let bytes = shot.map_err(|e| e.to_string())?;
     let path = match p.get("save_path").and_then(Value::as_str).filter(|s| !s.is_empty()) {
         Some(custom) => custom.to_string(),
-        None => std::env::temp_dir()
-            .join(format!(
-                "laew_web_{}.{}",
-                now_millis_safe(),
-                if format_str.eq_ignore_ascii_case("jpeg") || format_str.eq_ignore_ascii_case("jpg") { "jpg" } else { "png" }
-            ))
+        // 第 152 轮:缺省落工作目录的 WebShots/(原 temp 目录)
+        None => {
+            let dir = crate::artifact_root::artifact_dir("WebShots");
+            let _ = tokio::fs::create_dir_all(&dir).await;
+            crate::artifact_root::safe_join(
+                &dir,
+                &format!(
+                    "laew_web_{}.{}",
+                    now_millis_safe(),
+                    if format_str.eq_ignore_ascii_case("jpeg") || format_str.eq_ignore_ascii_case("jpg") { "jpg" } else { "png" }
+                ),
+            )
             .display()
-            .to_string(),
+            .to_string()
+        }
     };
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -1279,6 +1322,46 @@ async fn act_sync_viewport(id: &str, _: &Value) -> std::result::Result<Value, St
 }
 
 /// control_action=set_highlight:运行时开关 Agent 高亮蓝框。
+/// 第 152 轮:`control(auto_follow)` —— 开关「自动跟随最新内容」。
+///
+/// 实测事故:豆包多轮对话时消息栈不断变长,Agent 读得到全部内容、人工在浏览器
+/// 窗口只看得到第一屏;而 locked 档的 CDP 输入拦截连滚轮一起拦,人工也滚不动。
+/// 跟随器只在**用户本来就在底部**时吸底(见 [`browser_follow::should_follow`]),
+/// 人工往上翻历史时不会被拽走。
+///
+/// `params.scroll_to_bottom=true` 表示「不改变开关状态,立刻吸底一次」。
+async fn act_auto_follow(id: &str, p: &Value) -> std::result::Result<Value, String> {
+    use crate::agent::browser_follow;
+    if BrowserManager::global().page(id).await.is_none() {
+        return Err("page_id 不存在".into());
+    }
+    let just_scroll = p
+        .get("scroll_to_bottom")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(page) = BrowserManager::global().page(id).await else {
+        return Err("page_id 不存在".into());
+    };
+    if just_scroll {
+        let ok = browser_follow::scroll_to_bottom(&page).await;
+        let vis = browser_follow::visibility(&page).await;
+        return Ok(json!({
+            "scrolled_to_bottom": ok,
+            "visibility": vis,
+            "note": browser_follow::visibility_note(&vis),
+        }));
+    }
+    let enabled = p.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let applied = browser_follow::set(&page, enabled).await;
+    let vis = browser_follow::visibility(&page).await;
+    Ok(json!({
+        "auto_follow": enabled,
+        "applied": applied,
+        "visibility": vis,
+        "note": browser_follow::visibility_note(&vis),
+    }))
+}
+
 async fn act_set_highlight(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let enabled = p.get("enabled").and_then(Value::as_bool).unwrap_or(true);
     crate::agent::browser::BrowserManager::global()
@@ -1417,6 +1500,9 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     // 多步人工流程 —— spawn 导航重放协程持续维持临时放行态,收口时回收。
     // 纯问答场景(确认继续?)可传 unlock_page=false。
     let unlock_page = p.get("unlock_page").and_then(Value::as_bool).unwrap_or(true);
+    // 第 152 轮:人工介入是「页面状态已被人改变」的新事实 —— 清掉本页的告警指纹,
+    // 否则「弹窗还在 → 但上次已告警过 → 不再提醒」会造成漏报。
+    super::blocker_probe::forget_fingerprints(id);
     let explicit_allow = {
         let raw: Vec<String> = p
             .get("allow_selectors")
@@ -1476,6 +1562,13 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
         None => String::new(),
     };
 
+    // 第 152 轮:提问前先把验证弹层滚进视口中央。验证弹窗落在下半屏/视口外时,
+    // 下面那张自动附图截到的是空白区域,人工看不出要做什么;而 locked 档
+    // `Input.setIgnoreInputEvents` 连滚轮一起拦,人工也滚不过去。fail-open。
+    let challenge_scrolled = match BrowserManager::global().page(id).await {
+        Some(pg) => super::blocker_probe::scroll_challenge_into_view(&pg).await,
+        None => None,
+    };
     // 第 133 轮:验证码现场截图 —— 显式 params.image_path 优先;reason=captcha
     // 自动采集(验证码元素裁剪优先,整视口兜底,见 captcha_crop);弹窗直接展示
     // 图片,人工不必切去浏览器找图。fail-open:截图失败按无图继续,绝不阻断提问。
@@ -1538,6 +1631,8 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                     "image_source": image_source,
                     "image_mode": image_mode,
                     "image_clip": image_clip,
+                    // 第 152 轮:提问前是否把验证弹层滚进了视口(人工能否看到)
+                    "challenge_scrolled": challenge_scrolled,
                     // 第 145 轮:按「输码 vs 已完成」分流 —— 自由文本(验证码)+ captcha/
                     // sms/two_factor → 立即 input_text 填码提交;选项应答 → inspect 验证。
                     "next_hint": super::hitl_hint::hitl_answer_hint(reason, &answer),

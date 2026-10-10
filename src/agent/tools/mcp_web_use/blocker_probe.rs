@@ -64,9 +64,22 @@ const EVAL_MUTATION_MARKERS: &[&str] = &[
     ".click(",
     ".focus(",
     ".submit(",
+    "requestsubmit(",
     "location.href",
     "location.assign",
     "location.replace",
+    // 第 152 轮补:原表只认 `location.href` 一种赋值形态,`location = url` /
+    // `window.location = url` / `self.location=` / `top.location=` 全部漏网,
+    // 而这几形态与 `location.href` 的副作用完全等价(都是离开当前页)。
+    "location=",
+    "location =",
+    "window.location",
+    "self.location",
+    "top.location",
+    "parent.location",
+    // 第 152 轮补:单页应用路由跳转 / Worker 动态导入同样改变页面状态。
+    "pushstate(",
+    "replacestate(",
     "window.open",
     "document.write",
 ];
@@ -104,6 +117,141 @@ const CHALLENGE_THRESHOLD: i32 = 3;
 fn contains_any_lower(haystack: &str, words: &[&str]) -> bool {
     let lower = haystack.to_lowercase();
     words.iter().any(|w| lower.contains(&w.to_lowercase()))
+}
+
+/// 人工核验挑战的子类(第 152 轮)。
+///
+/// 第 151 轮之前 [`detect_challenge`] 对任何形态一律写死 `"kind": "captcha"`,
+/// 于是豆包的**拖拽拼图**被贴上「图形/滑块验证码」标签:弹窗标题错、人工按
+/// 验证码思路去找输入框(根本没有)、`hitl_answer_hint` 还提示「立即 input_text
+/// 填码」把人引向不存在的动作。子类判定让 reason / 文案 / 后续动作三处对齐。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChallengeType {
+    /// 拖拽拼图:把碎片拖进缺口 / 把图拖到指定位置
+    DragPuzzle,
+    /// 滑块验证:按住滑块拖到最右
+    Slider,
+    /// 九宫格点选:按题面点选符合条件的图片
+    ImageSelect,
+    /// 文字验证码:输入框里填图形/文字码
+    TextCaptcha,
+    /// 跨域 iframe 内嵌的第三方验证码(geetest / 极验 / 顶象…)
+    EmbeddedCaptcha,
+    /// 结构判定为挑战但形态不明
+    Unknown,
+}
+
+impl ChallengeType {
+    /// 稳定标识(进 JSON,便于日志对账与单测锁死)。
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            ChallengeType::DragPuzzle => "drag_puzzle",
+            ChallengeType::Slider => "slider",
+            ChallengeType::ImageSelect => "image_select",
+            ChallengeType::TextCaptcha => "text_captcha",
+            ChallengeType::EmbeddedCaptcha => "embedded_captcha",
+            ChallengeType::Unknown => "unknown",
+        }
+    }
+
+    /// 人工完成该挑战所需的**交互方式**(进 HITL 弹窗文案,直接告诉人工怎么操作)。
+    pub(super) fn interaction(self) -> &'static str {
+        match self {
+            ChallengeType::DragPuzzle => "鼠标按住图片拖到指定位置",
+            ChallengeType::Slider => "按住滑块一路拖到最右",
+            ChallengeType::ImageSelect => "按题面点选符合条件的图片",
+            ChallengeType::TextCaptcha => "读出图片里的字符并在输入框填入",
+            ChallengeType::EmbeddedCaptcha => "在页面内嵌的验证框中完成(第三方验证码)",
+            ChallengeType::Unknown => "在浏览器窗口内完成页面上的验证",
+        }
+    }
+
+    /// 映射到 `request_human` 的 reason。
+    ///
+    /// 只有**真能填码**的形态才叫 `captcha`(会触发自动截图 + 「立即 input_text
+    /// 填码」的 next_hint);拖拽/滑块/点选一律 `manual_verify`(「人工核验」),
+    /// 标签与文案不再误导。
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            ChallengeType::TextCaptcha | ChallengeType::EmbeddedCaptcha => "captcha",
+            _ => "manual_verify",
+        }
+    }
+
+    /// 该子类是否需要**人工在浏览器窗口里动手**(false = 只需读码/输码)。
+    /// 决定 HITL 弹窗该强调「去浏览器操作」还是「把码填进弹窗」。
+    pub(super) fn needs_browser_action(self) -> bool {
+        !matches!(self, ChallengeType::TextCaptcha)
+    }
+}
+
+impl ChallengeType {
+    /// 由 `as_str` 反查(供工具层从 JSON 回读,避免重复匹配表)。
+    pub(super) fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "drag_puzzle" => ChallengeType::DragPuzzle,
+            "slider" => ChallengeType::Slider,
+            "image_select" => ChallengeType::ImageSelect,
+            "text_captcha" => ChallengeType::TextCaptcha,
+            "embedded_captcha" => ChallengeType::EmbeddedCaptcha,
+            "unknown" => ChallengeType::Unknown,
+            _ => return None,
+        })
+    }
+}
+
+/// 拖拽类词(与点选/滑块/填码区分开)。
+const CHALLENGE_DRAG_WORDS: &[&str] = &["拖动", "拖拽", "拖到", "拖至", "拼图", "拼合", "移入", "移动到"];
+/// 滑块类词。
+const CHALLENGE_SLIDER_WORDS: &[&str] = &["滑块", "滑动", "拖动滑块", "向右", "最右", "最右侧"];
+
+/// 按结构 + 文案判定挑战子类(纯函数,可单测)。
+///
+/// 判据优先级(从「最具体的形态」往回退):
+/// 1. 文字码:弹层内有可见输入框 + 命中强验证词 → 唯一能填码的形态;
+/// 2. 跨域 iframe:验证码尺寸 iframe → 主文档读不到内部结构,只能按 iframe 判;
+/// 3. 滑块:探针采到的窄长条「滑杆」元素(宽 30~120px、高 20~90px)+ 滑块类文案;
+/// 4. 拖拽拼图:canvas + 拖拽类文案(豆包实测形态:主文档 canvas 上渲染);
+/// 5. 点选:九宫格 / CSS 背景图网格 ≥4;
+/// 6. 其余 → Unknown。
+pub(super) fn classify_challenge(overlay: &Value) -> ChallengeType {
+    let text = overlay.get("text").and_then(Value::as_str).unwrap_or("");
+    let buttons = overlay
+        .get("buttons")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let hay = format!("{text} {buttons}");
+    let grid = overlay.get("grid_imgs").and_then(Value::as_i64).unwrap_or(0)
+        + overlay.get("bg_imgs").and_then(Value::as_i64).unwrap_or(0);
+    let canvas = overlay.get("canvas_count").and_then(Value::as_i64).unwrap_or(0);
+    let iframe_like = overlay.get("iframe_like").and_then(Value::as_bool) == Some(true);
+    let inputs = overlay.get("input_count").and_then(Value::as_i64).unwrap_or(0);
+    let slider_like = overlay.get("slider_like").and_then(Value::as_bool) == Some(true);
+    let strong = contains_any_lower(&hay, CHALLENGE_STRONG_WORDS);
+    let drag_word = contains_any_lower(&hay, CHALLENGE_DRAG_WORDS);
+    let slider_word = contains_any_lower(&hay, CHALLENGE_SLIDER_WORDS);
+
+    if inputs >= 1 && strong {
+        return ChallengeType::TextCaptcha;
+    }
+    if iframe_like && canvas == 0 && grid < 4 && !(slider_like || drag_word) {
+        return ChallengeType::EmbeddedCaptcha;
+    }
+    if slider_like || (slider_word && canvas == 0 && grid < 4) {
+        return ChallengeType::Slider;
+    }
+    if canvas >= 1 && drag_word {
+        return ChallengeType::DragPuzzle;
+    }
+    if canvas >= 1 && !slider_word && grid < 4 && !drag_word {
+        // 无文案的 canvas 挑战:九成是滑块/拖拽,归 Unknown 而非 captcha 更安全
+        return ChallengeType::Unknown;
+    }
+    if grid >= 4 {
+        return ChallengeType::ImageSelect;
+    }
+    ChallengeType::Unknown
 }
 
 /// 弹层元数据是否构成语义挑战;命中返回 blocker 条目(含结构证据)。
@@ -159,16 +307,24 @@ pub(super) fn detect_challenge(overlay: &Value) -> Option<Value> {
         return None;
     }
     let snippet: String = text.chars().take(120).collect();
+    // 第 152 轮:子类决定 kind —— 拖拽/滑块/点选不再被叫「验证码」。
+    let ctype = classify_challenge(overlay);
     Some(json!({
-        "kind": "captcha",
+        "kind": ctype.reason(),
         "matched": "challenge_overlay",
         "snippet": snippet,
+        "challenge_type": ctype.as_str(),
+        "interaction": ctype.interaction(),
+        "needs_browser_action": ctype.needs_browser_action(),
         "evidence": {
             "score": score,
             "grid_imgs": grid_imgs,
             "bg_imgs": bg_imgs,
             "canvas_count": canvas_count,
             "iframe_like": iframe_like,
+            "slider_like": overlay.get("slider_like").cloned().unwrap_or(Value::Null),
+            "input_count": overlay.get("input_count").and_then(Value::as_i64).unwrap_or(0),
+            "challenge_selector": overlay.get("selector").cloned().unwrap_or(Value::Null),
             "buttons": buttons,
             "area_ratio": overlay.get("area_ratio").cloned().unwrap_or(Value::Null),
         },
@@ -200,23 +356,63 @@ const PROBE_JS: &str = r#"(() => {
     clone.querySelectorAll('[data-laew-agent]').forEach(e => e.remove());
     const text = (clone.innerText || '').slice(0, 20000);
     const vw = window.innerWidth, vh = window.innerHeight;
+    // 词表候选:命中 modal/dialog/captcha/verify 等**语义类名**的模态。
     const SEL = 'dialog[open], [role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i], [class*="popup" i], [class*="mask" i], [class*="overlay" i], [class*="captcha" i], [class*="verify" i], [class*="challenge" i]';
+    // 第 152 轮:通用候选 —— 现代前端大量使用 BEM / 哈希类名(如 `.css-1x2y3z`),
+    // 词表一条都命中不了,整层弹窗直接漏检。这里补一条「不看类名、只看几何与
+    // 层叠」的兜底通道:凡是 fixed/absolute 且面积够大的容器都进候选池,再走
+    // 与词表候选完全相同的可见性/面积/层级筛选。为控制开销,只取前 600 个。
+    const SEL_GENERIC = 'body div, body section, body main, body aside, body form';
     let best = null;
-    for (const el of document.querySelectorAll(SEL)) {
-      if (el.closest('[data-laew-agent]')) continue;
+    const consider = (el) => {
+      if (!el || el.closest('[data-laew-agent]')) return;
       const cs = window.getComputedStyle(el);
-      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) continue;
-      if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return;
+      if (cs.position !== 'fixed' && cs.position !== 'absolute') return;
       const r = el.getBoundingClientRect();
-      if (r.width < 200 || r.height < 120) continue;
-      if ((r.width * r.height) / (vw * vh) < 0.06) continue;
+      if (r.width < 200 || r.height < 120) return;
+      if ((r.width * r.height) / (vw * vh) < 0.06) return;
       const z = parseInt(cs.zIndex, 10) || 0;
       let depth = 0, n = el;
       while (n.parentElement) { depth++; n = n.parentElement; }
       if (!best || z > best.z || (z === best.z && depth > best.depth)) best = {el, z, depth};
+    };
+    document.querySelectorAll(SEL).forEach(consider);
+    if (!best) {
+      let seen = 0;
+      for (const el of document.querySelectorAll(SEL_GENERIC)) {
+        if (++seen > 600) break;
+        consider(el);
+      }
     }
     if (!best) return {text: text, overlay: null};
     const el = best.el, r = el.getBoundingClientRect();
+    // 第 152 轮:挑战层选择器(供 HITL 放行白名单与「滚动到验证弹窗」复用)
+    const selOf = (node) => {
+      const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([^\w-])/g, '\\$1');
+      if (node.id) return '#' + esc(node.id);
+      const cls = (node.getAttribute('class') || '').trim().split(/\s+/).filter(Boolean)
+        .filter(c => /^[A-Za-z_][\w-]*$/.test(c)).slice(0, 2);
+      if (cls.length) {
+        const s = cls.map(c => '.' + esc(c)).join('');
+        try { if (document.querySelectorAll(s).length === 1) return s; } catch (e) {}
+      }
+      const parts = [];
+      let cur = node;
+      for (let d = 0; cur && cur.nodeType === 1 && d < 4; d++) {
+        let part = cur.tagName.toLowerCase();
+        if (cur.id) { parts.unshift('#' + esc(cur.id)); break; }
+        const parent = cur.parentElement;
+        if (parent) {
+          const same = Array.prototype.filter.call(parent.children, (c) => c.tagName === cur.tagName);
+          if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')';
+        }
+        parts.unshift(part);
+        cur = parent;
+      }
+      const s = parts.join(' > ');
+      try { return document.querySelectorAll(s).length >= 1 ? s.slice(0, 150) : ''; } catch (e) { return ''; }
+    };
     let img_count = 0, grid_imgs = 0, canvas_count = 0, iframe_count = 0,
         iframe_like = false, input_count = 0, bg_imgs = 0;
     for (const img of el.querySelectorAll('img')) {
@@ -239,10 +435,28 @@ const PROBE_JS: &str = r#"(() => {
     }
     canvas_count = el.querySelectorAll('canvas').length;
     input_count = el.querySelectorAll('input, textarea').length;
+    // 第 152 轮:滑杆信号 —— 滑块验证的把手是「窄长条」:宽 30~120px、高 20~90px。
+    // 只看文案会漏掉无文案的滑块(豆包部分风控组件只有图形提示)。
+    let slider_like = false;
+    for (const node of el.querySelectorAll('div,span,button,i')) {
+      const nb = node.getBoundingClientRect();
+      if (nb.width < 30 || nb.width > 120 || nb.height < 20 || nb.height > 90) continue;
+      const sb = window.getComputedStyle(node);
+      if (sb.display === 'none' || sb.visibility === 'hidden') continue;
+      const bg = sb.backgroundColor + ' ' + sb.backgroundImage + ' ' + sb.borderRadius;
+      if (bg.includes('gradient') || bg.includes('url(')) { slider_like = true; break; }
+    }
+    // 第 152 轮:跨域 iframe 内部读不到(不同源),把 iframe 自身的 class/id/src/
+    // title 拼进文本参与关键词判定 —— 第三方验证码组件的 src/name 几乎必然
+    // 带 captcha/geetest/verify 之类标识,这是主文档侧唯一能拿到的强信号。
+    let frame_meta = '';
     for (const f of el.querySelectorAll('iframe')) {
       const fr = f.getBoundingClientRect();
       if (fr.width <= 0 || fr.height <= 0) continue;
       iframe_count++;
+      frame_meta += ' ' + (f.getAttribute('src') || '') + ' ' + (f.getAttribute('title') || '')
+        + ' ' + (f.getAttribute('class') || '') + ' ' + (f.getAttribute('id') || '')
+        + ' ' + (f.getAttribute('name') || '');
       const ratio = fr.width / fr.height;
       if (fr.width >= 160 && fr.width <= 480 && fr.height >= 120 && fr.height <= 640
           && ratio >= 0.5 && ratio <= 1.9) iframe_like = true;
@@ -254,10 +468,12 @@ const PROBE_JS: &str = r#"(() => {
       text: text,
       overlay: {
         found: true,
-        text: (el.innerText || '').replace(/\s+/g, ' ').slice(0, 600),
+        text: ((el.innerText || '') + frame_meta).replace(/\s+/g, ' ').slice(0, 600),
         img_count: img_count, grid_imgs: grid_imgs, canvas_count: canvas_count,
         iframe_count: iframe_count, iframe_like: iframe_like, input_count: input_count,
         bg_imgs: bg_imgs,
+        slider_like: slider_like,
+        selector: selOf(el),
         buttons: buttons,
         rect: {w: Math.round(r.width), h: Math.round(r.height)},
         viewport: {w: vw, h: vh},
@@ -279,12 +495,113 @@ pub(super) async fn collect_for_inspect(page: &chromiumoxide::Page) -> Value {
     }
 }
 
+/// 把人工核验挑战弹层滚动到视口中央,返回命中的选择器(无挑战层 → `None`)。
+///
+/// 实测事故:验证弹窗出现在页面**下半屏或视口之外**时,HITL 弹窗里那张自动附图
+/// 截到的是空白/无关区域,人工看不出「到底要我做什么」;而页面本身又被
+/// locked 档的 `Input.setIgnoreInputEvents` 拦着滚轮,人工想自己滚过去也不行。
+/// 提问前先把挑战层滚进视野,是让附图与页面同时「说人话」的最短路径。
+///
+/// fail-open:探针超时 / 无挑战层 / JS 异常一律 `None`,绝不阻断提问。
+pub(super) async fn scroll_challenge_into_view(page: &chromiumoxide::Page) -> Option<String> {
+    let probe = collect_for_inspect(page).await;
+    let overlay = probe.get("overlay")?;
+    if overlay.get("found").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let selector = overlay
+        .get("selector")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let js = format!(
+        "(function(){{ try {{ var el = document.querySelector({sel}); \
+         if (!el) return false; el.scrollIntoView({{block:'center', inline:'nearest'}}); \
+         return true; }} catch (e) {{ return false; }} }})()",
+        sel = serde_json::to_string(&selector).unwrap_or_else(|_| "\"\"".into())
+    );
+    match eval_js_string(page, &js).await {
+        Ok(v) if v.as_bool() == Some(true) => Some(selector),
+        _ => None,
+    }
+}
+
 // ===================== 响应附加(推送式) =====================
 
+// ===================== 同指纹告警去重(第 152 轮) =====================
+
+/// 进程内告警指纹表:`page_id -> (指纹, 连续命中次数)`。
+///
+/// 实测事故(2026-10-10 豆包):同一个误报(`2fa` 命中 CDN 图片 URL)在 iter
+/// 7/9/11/12/14/15/17 连续播报 7 次,每次都拖一份 1~2 万 token 的
+/// `human_assist` 载荷进上下文 —— 「狼来了」把 `next_action=request_human`
+/// 训练成了噪声,既烧 token 又钝化模型的真实响应。
+///
+/// 去重口径:**只压重复的载荷,不压重复的事实**。同一指纹再次命中时仍返回
+/// `blocker_alert`(带 `repeat`/`repeat_count`),只是不再重复 `human_assist`
+/// 与 `next_action` —— Agent 已经知道该怎么做了,不必每次重读一遍长文案。
+///
+/// 硬闸 [`challenge_gate`] **不走**本表:拦截语义要持续生效,去重只针对播报。
+fn fingerprint_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, u32)>> {
+    static STORE: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, u32)>>,
+    > = std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    });
+    &STORE
+}
+
+/// 告警指纹(纯函数,可单测):`(kind, matched, snippet 前 40 字)`。
+///
+/// 只取稳定成分 —— 弹层每轮渲染出的**按钮文案/时间戳**会变,若纳入指纹则
+/// 每次都算「新告警」,去重形同虚设(实测:豆包验证弹窗的按钮与倒计时逐轮变化)。
+pub(super) fn fingerprint_of(alert: &Value) -> String {
+    let kind = alert.get("kind").and_then(Value::as_str).unwrap_or("");
+    let matched = alert.get("matched").and_then(Value::as_str).unwrap_or("");
+    let snippet: String = alert
+        .get("snippet")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(40)
+        .collect();
+    format!("{kind}|{matched}|{snippet}")
+}
+
+/// 登记一次告警指纹,返回是否为**重复**(纯逻辑收在闭包里便于单测)。
+fn register_fingerprint(page_id: &str, fp: &str) -> Option<u32> {
+    let mut guard = fingerprint_store().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.entry(page_id.to_string()).or_insert_with(|| (fp.to_string(), 0));
+    if entry.0 == fp {
+        entry.1 += 1;
+        Some(entry.1)
+    } else {
+        // 指纹变了(弹窗换了题面/换了形态)→ 重新计数
+        *entry = (fp.to_string(), 1);
+        None
+    }
+}
+
+/// 清除某页的指纹记忆(人工介入发起 / 页面关闭 / guard 切换时调用)。
+///
+/// 人工介入是「页面状态已被人改变」的新事实 —— 之后出现的阻断应当重新完整播报,
+/// 否则会出现「弹窗还在,但 Agent 因为上次已告警过而不再提醒」的漏报。
+pub(super) fn forget_fingerprints(page_id: &str) {
+    fingerprint_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(page_id);
+}
+
 /// blocker_alert 的人类可读处置提示。
-const ALERT_HINT: &str = "页面疑似弹出人工验证挑战(图片选择/语义题/滑块等,无法自动完成);\
-立即停止继续输入或重试;按 human_assist 载荷发起 request_human(reason=captcha) 让人工完成验证,\
+const ALERT_HINT: &str = "页面弹出人工验证挑战(拖拽拼图/滑块/图片点选/文字码等,无法自动完成);\
+立即停止继续输入或重试;按 data.challenge_type 选 reason 发起 request_human 让人工完成验证\
+(拖拽/滑块/点选用 manual_verify,文字码用 captcha),\
 不确定弹窗内容时可先 control(screenshot, params.ocr=true) 确认";
+
+/// 挑战类 HITL 的选项文案(P11 对齐:与 `act_request_human` 的缺省 options
+/// 保持一致,避免同一个「继续」在两处叫不同名字)。
+pub(super) const HITL_CHALLENGE_OPTIONS: [&str; 2] = ["我已完成人工操作,继续", "取消任务"];
 
 /// 探测并生成告警载荷(命中才 Some):`{blocker_alert, next_action, human_assist}` 三键,
 /// 供调用方并入响应 data(Ok 路走 [`attach_if_blocked`],wait 超时 Err 路由调用方手插)。
@@ -302,8 +619,14 @@ pub(super) async fn probe_alert(page_id: &str) -> Option<Value> {
         .filter(|k| super::control::HUMAN_ASSIST_ALLOWED_REASONS.contains(k))
         .unwrap_or("manual_verify")
         .to_string();
+    // 第 152 轮:同类告警连续命中时只回事实、不重复长载荷(见 fingerprint_store 注释)
+    let repeat_count = register_fingerprint(page_id, &fingerprint_of(first));
     let mut alert = first.clone();
-    if let Some(obj) = alert.as_object_mut() {
+    if let (Some(obj), Some(n)) = (alert.as_object_mut(), repeat_count) {
+        obj.insert("hint".into(), json!(ALERT_HINT));
+        obj.insert("repeat".into(), json!(true));
+        obj.insert("repeat_count".into(), json!(n));
+    } else if let Some(obj) = alert.as_object_mut() {
         obj.insert("hint".into(), json!(ALERT_HINT));
     }
     // 第 151 轮:message 带题面 snippet(≤60 字)—— 人工在 HITL 弹窗直接看到
@@ -320,12 +643,25 @@ pub(super) async fn probe_alert(page_id: &str) -> Option<Value> {
     } else {
         format!("页面弹出人工验证挑战「{snippet}」;请在浏览器窗口完成验证,完成后回弹窗点「提交 / 继续」(也可在输入框输入文字与 Agent 交互)")
     };
-    let hint = super::human_assist_hint(&kind, &message, &["我已完成验证,继续", "取消任务"]);
-    Some(json!({
+    // 第 152 轮:重复告警不再重复长载荷 —— Agent 已经知道该干什么,只回事实
+    if repeat_count.is_some() {
+        return Some(json!({"blocker_alert": alert}));
+    }
+    let hint = super::human_assist_hint(&kind, &message, &HITL_CHALLENGE_OPTIONS);
+    let mut out = json!({
         "blocker_alert": alert,
         "next_action": hint.get("next_action").cloned().unwrap_or(json!("request_human")),
         "human_assist": hint.get("human_assist").cloned().unwrap_or(Value::Null),
-    }))
+    });
+    // 第 152 轮:子类信息顶层也带一份,Agent 无需解析 evidence 即可决定动作
+    if let (Some(dst), Some(src)) = (out.as_object_mut(), first.as_object()) {
+        for k in ["challenge_type", "interaction", "needs_browser_action"] {
+            if let Some(v) = src.get(k) {
+                dst.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    Some(out)
 }
 
 /// 动作成功后把告警并入响应 data(干净时零改动;已有 next_action 不覆盖,`merge_hint` 惯例)。
@@ -398,6 +734,12 @@ pub(super) async fn challenge_gate(
         .chars()
         .take(60)
         .collect();
+    // 第 152 轮:子类推出的 reason(拖拽 → manual_verify),不再一律 captcha
+    let ctype = challenge
+        .get("challenge_type")
+        .and_then(Value::as_str)
+        .and_then(ChallengeType::from_str)
+        .unwrap_or(ChallengeType::Unknown);
     let mut alert = challenge;
     if let Some(obj) = alert.as_object_mut() {
         obj.insert("hint".into(), json!(GATE_HINT));
@@ -407,7 +749,7 @@ pub(super) async fn challenge_gate(
     } else {
         format!("页面弹出人工验证挑战「{snippet}」,输入动作已被拦截;请人工在浏览器窗口完成验证,完成后回弹窗点「提交 / 继续」")
     };
-    let hint = super::human_assist_hint("captcha", &message, &["我已完成验证,继续", "取消任务"]);
+    let hint = super::human_assist_hint(ctype.reason(), &message, &HITL_CHALLENGE_OPTIONS);
     let mut data = json!({
         "blocker_alert": alert,
         "force_hint": "确认页面无真实验证弹窗(结构误判)时,可在 params 加 force=true 跳过硬闸强制执行",

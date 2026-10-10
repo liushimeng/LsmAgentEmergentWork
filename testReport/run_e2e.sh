@@ -1478,7 +1478,9 @@ run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 
 
 section "5d. Debug 模式端到端(Debug Agent)"
-DBG_REAL_DIR="/tmp/laew-e2e-root/DebugReport"   # 报告落 current_exe 父目录(根目录)
+# 第 152 轮:DebugReport 落**产物根**(默认 = 启动时工作目录),不再落二进制所在目录。
+# 本节 laew 从仓库根启动,工作目录即仓库根 → 报告落在 <repo>/DebugReport/。
+DBG_REAL_DIR="$(pwd)/DebugReport"
 DBG_MARKER=$(mktemp)
 OUT=$(run "$LAEW" -p "请帮我执行一个测试命令" -debug)
 echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "-debug 任务链路贯通(输出含 MOCK_FINAL_ANSWER)"
@@ -1664,8 +1666,9 @@ check $? "协议 wire 格式校验"
 # --- 7. TUI 冒烟(管道喂命令,非 TTY 回退路径) ---
 section "7. TUI 冒烟测试"
 OUT=$(printf '/help\n/model\n/provider list\n/new\n/exit\n' | run "$LAEW")
-echo "$OUT" | grep -q "根目录"; check $? "TUI 横幅显示根目录"
+echo "$OUT" | grep -q "程序目录"; check $? "TUI 横幅显示程序目录(第 152 轮:根目录改名)"
 echo "$OUT" | grep -q "工作目录"; check $? "TUI 横幅显示工作目录"
+echo "$OUT" | grep -q "产物目录"; check $? "TUI 横幅显示产物目录(第 152 轮)"
 echo "$OUT" | grep -q "项目说明"; check $? "TUI 横幅显示项目说明状态"
 echo "$OUT" | grep -q "当前模型"; check $? "TUI 横幅显示当前模型"
 echo "$OUT" | grep -q "Session"; check $? "TUI 横幅显示 Session ID"
@@ -1973,8 +1976,9 @@ else
   tnew
 
   # 1) 横幅
-  texpect "根目录" "tmux: 横幅显示根目录"
+  texpect "程序目录" "tmux: 横幅显示程序目录(第 152 轮:根目录改名)"
   texpect "工作目录" "tmux: 横幅显示工作目录"
+  texpect "产物目录" "tmux: 横幅显示产物目录(第 152 轮)"
   texpect "项目说明" "tmux: 横幅显示项目说明状态"
   texpect "Session" "tmux: 横幅显示 Session ID"
   texpect "当前模型" "tmux: 横幅显示当前模型"

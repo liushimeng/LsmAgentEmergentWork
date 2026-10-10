@@ -215,8 +215,11 @@ async fn capture_hitl_screenshot_inner(
         .screenshot(chromiumoxide::page::ScreenshotParams::builder().build())
         .await
         .map_err(|e| e.to_string())?;
-    let path = std::env::temp_dir()
-        .join(format!("laew_hitl_captcha_{}.png", now_millis_safe()));
+    // 第 152 轮:HITL 附图落工作目录 WebShots/(原 temp 目录),与其它产物同处一地
+    let dir = crate::artifact_root::artifact_dir("WebShots");
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let path =
+        crate::artifact_root::safe_join(&dir, &format!("laew_hitl_captcha_{}.png", now_millis_safe()));
     tokio::fs::write(&path, &bytes)
         .await
         .map_err(|e| e.to_string())?;

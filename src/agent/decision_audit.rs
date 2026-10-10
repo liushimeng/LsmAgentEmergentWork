@@ -126,19 +126,23 @@ fn registry(
     AUDIT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 推导审计根目录(二进制所在目录,与 `Paths::detect().root_dir` 同义)。
+/// 推导审计根目录(第 152 轮:产物根 = 启动时工作目录)。
 ///
 /// 审计模块独立推导,避免向 Orchestrator 注入 root_dir 字段(减少与并发任务的耦合)。
 ///
 /// 2026-09-22 第 113 轮:由 `fn` 提升为 `pub fn`,供 TUI bootstrap / `/audit` 命令
 /// 自动定位审计目录,无需注入 root_dir 字段。
+///
+/// 第 152 轮:原实现取 `current_exe().parent()`,实测经软链启动时会落到
+/// `/opt/homebrew/bin/AuditTrail`(用户在工作目录里根本找不到);改走
+/// [`crate::artifact_root`] 单一真源。
 pub fn audit_root_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    Some(crate::artifact_root::artifact_root().to_path_buf())
 }
 
 /// 获取(或创建)当前会话的审计写入器。
 ///
-/// 文件路径:`<root_dir>/AuditTrail/audit_{session_id}.jsonl`。
+/// 文件路径:`<产物根>/AuditTrail/audit_{session_id}.jsonl`。
 /// 写入器跨任务复用(同一 Session 的多轮任务追加同一文件)。
 pub fn session_writer(
     session_id: &str,

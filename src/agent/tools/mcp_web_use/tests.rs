@@ -65,10 +65,27 @@ fn action_may_spawn_page_whitelist() {
         "upload_file",
         "download",
         "dispatch_event",
-        "eval_js",
     ] {
-        assert!(control::action_may_spawn_page(a), "{a} 应巡检派生页");
+        assert!(
+            control::action_may_spawn_page(a, &serde_json::json!({})),
+            "{a} 应巡检派生页"
+        );
     }
+    // 第 152 轮:eval_js 改为按表达式判定 —— 只读不巡检,可变更才巡检
+    assert!(
+        !control::action_may_spawn_page(
+            "eval_js",
+            &serde_json::json!({"expression": "document.querySelectorAll('p').length"})
+        ),
+        "只读 eval_js 不应巡检(省一次浏览器级往返,且避免无关 spawned_page_id)"
+    );
+    assert!(
+        control::action_may_spawn_page(
+            "eval_js",
+            &serde_json::json!({"expression": "window.open('https://x.test','_blank')"})
+        ),
+        "可变更 eval_js 应巡检(LLM 用 eval 开页是合法形态)"
+    );
     // 观察/状态类动作:跳过巡检
     for a in [
         "wait",
@@ -93,7 +110,10 @@ fn action_may_spawn_page_whitelist() {
         "blur",
         "mouse_move",
     ] {
-        assert!(!control::action_may_spawn_page(a), "{a} 不应巡检派生页");
+        assert!(
+            !control::action_may_spawn_page(a, &serde_json::json!({})),
+            "{a} 不应巡检派生页"
+        );
     }
 }
 
@@ -149,12 +169,14 @@ fn parameters_control_action_enum_complete() {
         "set_cookie", "delete_cookie", "set_storage", "clear_storage", "set_viewport",
         "screenshot", "heartbeat",
         "drag", "focus", "blur", "mouse_move", "dispatch_event",
-        "set_window", "sync_viewport", "set_highlight", "set_overlay", "set_guard", "request_human",
+        "set_window", "sync_viewport", "set_highlight", "set_overlay", "set_guard",
+        // 第 152 轮:auto_follow(自动跟随最新内容)
+        "auto_follow", "request_human",
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
-    // 第 143 轮:set_guard(页面管控三档切换)使枚举 40 → 41
-    assert_eq!(names.len(), 41, "control_action 应为 41 个,实际 {names:?}");
+    // 第 143 轮 set_guard 使枚举 40 → 41;第 152 轮 auto_follow 使 41 → 42
+    assert_eq!(names.len(), 42, "control_action 应为 42 个,实际 {names:?}");
 }
 
 #[test]
@@ -166,10 +188,13 @@ fn parameters_info_enum_complete() {
         "console", "network", "elements", "dom", "localstorage", "sessionstorage",
         "cookies", "screenshot", "page_meta", "viewport", "url", "title", "image_urls",
         "blockers", "extract_links", "extract", "page_state",
+        // 第 152 轮:visibility(可视性诊断)
+        "visibility",
     ] {
         assert!(names.contains(required), "info 枚举缺失 {required}");
     }
-    assert_eq!(names.len(), 20, "info 应为 20 个,实际 {names:?}");
+    // 第 152 轮:visibility 使枚举 20 → 21
+    assert_eq!(names.len(), 21, "info 应为 21 个,实际 {names:?}");
 }
 
 #[test]
@@ -628,10 +653,11 @@ fn parameters_info_enum_contains_ocr() {
     let p = McpWebUseTool.parameters();
     let enums = p["properties"]["info"]["enum"].as_array().expect("info enum 应为数组");
     let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(names.len(), 20, "info 应有 20 个枚举值: {names:?}");
+    assert_eq!(names.len(), 21, "info 应有 21 个枚举值: {names:?}");
     assert!(names.contains(&"ocr"), "info 枚举应含 ocr: {names:?}");
     assert!(names.contains(&"extract_links"), "info 枚举应含 extract_links: {names:?}");
     assert!(names.contains(&"coverage"), "info 枚举应含 coverage(第 146 轮): {names:?}");
+    assert!(names.contains(&"visibility"), "info 枚举应含 visibility(第 152 轮): {names:?}");
 }
 
 // =================== 第 135 轮:extract / page_state / eval_js 体积闸门 ===================
@@ -1815,15 +1841,21 @@ fn analyze_merges_keyword_and_challenge_with_dedupe() {
 
 #[test]
 fn analyze_keeps_different_kinds() {
-    // 全文命中 login + 弹层命中 captcha → 两条并存
+    // 全文命中 login + 弹层命中挑战 → 两条并存
+    // 第 152 轮:九宫格点选挑战的 kind 由硬编码 captcha 改为子类推出的 manual_verify
+    // (只有真能「填码」的形态才叫 captcha),断言同步更新。
     let probe = json!({
         "text": "登录后查看更多内容",
         "overlay": probe_overlay("请选出图中包含的物品", 9, false, json!(["刷新"])),
     });
     let out = blocker_probe::analyze(&probe);
     let kinds: Vec<&str> = out.iter().filter_map(|b| b["kind"].as_str()).collect();
-    assert!(kinds.contains(&"captcha"), "实际:{kinds:?}");
+    assert!(kinds.contains(&"manual_verify"), "实际:{kinds:?}");
     assert!(kinds.contains(&"login"), "实际:{kinds:?}");
+    // 子类信息必须带出来(供 LLM 选 reason / 人工看操作说明)
+    let challenge = out.iter().find(|b| b["matched"] == "challenge_overlay").unwrap();
+    assert_eq!(challenge["challenge_type"], "image_select");
+    assert!(challenge["interaction"].as_str().unwrap().contains("点选"));
 }
 
 #[test]

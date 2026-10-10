@@ -26,10 +26,12 @@ pub struct BannerData {
     pub build_time: String,
     /// 启动时刻(已转 `YYYY-MM-DD HH:MM:SS`)
     pub startup_time: String,
-    /// 根目录(二进制所在目录)
+    /// 程序目录(二进制所在目录;第 152 轮起仅用于定位程序自带资源,不再是产物落点)
     pub root_dir: String,
     /// 工作目录(启动命令所在目录)
     pub work_dir: String,
+    /// 产物目录(第 152 轮:plans/DebugReport/AuditTrail/BashSpill/logs 等统一落点)
+    pub artifact_dir: String,
     /// 项目说明文件探测结果
     pub project_doc: String,
     /// 工作区状态行
@@ -63,8 +65,9 @@ pub fn render(data: &BannerData, indent: usize, term_w: usize) -> Vec<String> {
         .kv("启动时间", data.startup_time.clone())
         .sep()
         // 路径类:拆开就不可复制 → 单行 + 中间省略保尾
-        .kv_keep_tail("根目录", data.root_dir.clone())
+        .kv_keep_tail("程序目录", data.root_dir.clone())
         .kv_keep_tail("工作目录", data.work_dir.clone())
+        .kv_keep_tail("产物目录", data.artifact_dir.clone())
         .kv("项目说明", data.project_doc.clone())
         .kv("工作区", data.workspace.clone())
         // 模型行是最长也最不能砍的一行(endpoint 决定连的是谁)→ 折行保完整
@@ -172,6 +175,7 @@ mod tests {
             startup_time: "2026-09-24 12:35:08".into(),
             root_dir: "D:/MyLocalGit/LsmAgentEmergentWork".into(),
             work_dir: "D:/MyLocalGit/LsmAgentEmergentWork/TestWorkSpace".into(),
+            artifact_dir: "D:/MyLocalGit/LsmAgentEmergentWork/TestWorkSpace".into(),
             project_doc: "未找到".into(),
             workspace: "[通用] 非 git".into(),
             model: "[anthropic] liusm191-laew-model/liusm191-laew-model @ https://gw.example.com/v1/messages".into(),
@@ -253,7 +257,15 @@ mod tests {
             let lead = after.len() - after.trim_start().len();
             textfit::width(&l[..i + 1]) + lead
         };
-        let cols: Vec<usize> = ["根目录:", "工作目录:", "项目说明:", "工作区:", "Session:", "连接:"]
+        let cols: Vec<usize> = [
+            "程序目录:",
+            "工作目录:",
+            "产物目录:",
+            "项目说明:",
+            "工作区:",
+            "Session:",
+            "连接:",
+        ]
             .iter()
             .map(|k| value_col(k))
             .collect();

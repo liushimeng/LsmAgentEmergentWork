@@ -137,14 +137,15 @@ impl TuiSession {
         // 审计文件,保留最近 10 个。fail-open:清理失败仅 eprintln! 不阻塞 TUI 启动。
         // 对齐 openclaw cron-store-runtime 后台清理理念。
         if let Err(e) = crate::agent::decision_audit::trim_audit_files(
-            &paths.root_dir,
+            crate::artifact_root::artifact_root(),
             crate::tui::audit_view::DEFAULT_KEEP_SESSIONS,
         ) {
             eprintln!("[laew] 启动时清理审计文件失败(忽略): {e}");
         }
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
         let db = Arc::new(Mutex::new(db));
-        let plans_dir = paths.root_dir.join("plans");
+        // 第 152 轮:产物统一落工作目录(不再逃逸到二进制所在目录)
+        let plans_dir = crate::artifact_root::artifact_dir("plans");
         let session = Session::new();
         // 动态子 Agent 运行记录(2026-09-22 第 115 轮):启动期把上次进程残留的
         // `running` 作业标记为 orphaned + 自动 trim(fail-open,不阻塞 TUI 启动)。
@@ -190,7 +191,7 @@ impl TuiSession {
     /// 按当前 active provider 重建 orchestrator(debug 模式同时刷新原始 LLM 引用)。
     /// D13:复用已有 ConnectivityTracker,避免重建后丢失连接状态。
     fn rebuild_orchestrator(&mut self) -> Result<()> {
-        let plans_dir = self.paths.root_dir.join("plans");
+        let plans_dir = crate::artifact_root::artifact_dir("plans");
         let (orch, raw) = build_orchestrator_with_active_shared(
             &self.db,
             plans_dir,
@@ -255,6 +256,8 @@ impl TuiSession {
             startup_time: export::humanize_compact(&self.startup_ts),
             root_dir: self.paths.root_dir.display().to_string(),
             work_dir: self.paths.work_dir.display().to_string(),
+            // 第 152 轮:产物目录独立成行 —— 计划/报告/审计/大输出都落在这里
+            artifact_dir: crate::artifact_root::artifact_root().display().to_string(),
             // 项目说明文件状态(纯探测,不触发生成;发现规则见 docs/Yolo项目上下文注入/)
             project_doc: crate::agent::project_context::probe(&self.paths.work_dir)
                 .as_str()
@@ -500,12 +503,9 @@ pub fn tui_log_writer() -> impl for<'s> tracing_subscriber::fmt::MakeWriter<'s> 
     TuiLogWriter
 }
 
-/// TUI 日志文件路径:`{根目录}/logs/laew-tui.log`(根目录 = 二进制所在目录)。
+/// TUI 日志文件路径:`{产物根}/logs/laew-tui.log`(第 152 轮:产物根 = 启动时工作目录)。
 fn tui_log_path() -> std::path::PathBuf {
-    let root = crate::database::paths::Paths::detect()
-        .map(|p| p.root_dir)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
-    let dir = root.join("logs");
+    let dir = crate::artifact_root::artifact_dir("logs");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("laew-tui.log")
 }
@@ -540,7 +540,10 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
     let mut session = TuiSession::bootstrap_with_debug(debug, launch)?;
     session.print_banner();
     if session.debug.is_some() {
-        println!("  [debug] 调试模式已开启,报告将写入根目录 DebugReport/");
+        println!(
+            "  [debug] 调试模式已开启,报告将写入 {}",
+            crate::artifact_root::artifact_dir("DebugReport").display()
+        );
         println!();
     }
 

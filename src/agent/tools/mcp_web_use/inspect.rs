@@ -377,9 +377,18 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                 let hint = super::human_assist_hint(
                     &kind,
                     "页面存在人工阻断(见 data.blockers),请人工完成该步骤后继续",
-                    &["我已完成人工操作,继续", "取消任务"],
+                    &super::blocker_probe::HITL_CHALLENGE_OPTIONS,
                 );
                 super::merge_hint(&mut out, hint);
+                // 第 152 轮:挑战子类(拖拽/滑块/点选/文字码)顶层带一份,
+                // LLM 无需解析 evidence 就能挑对 request_human 的 reason。
+                if let Some(first) = blockers.first().and_then(|b| b.as_object()) {
+                    for k in ["challenge_type", "interaction", "needs_browser_action"] {
+                        if let Some(v) = first.get(k) {
+                            out[k.to_string()] = v.clone();
+                        }
+                    }
+                }
                 // 第 144 轮:顺带探测凭证输入区(账号/密码/验证码),把选择器挂进
                 // 响应与人机载荷 —— LLM 可直接把 allow_selectors 传给 request_human
                 // 精准放行(自动档探测不命中时的人工兜底通道);fail-open,探测为空
@@ -391,6 +400,21 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                         ha.insert("allow_selectors".into(), json!(zones));
                     }
                 }
+            }
+            Ok(out)
+        }
+        // 第 152 轮:可视性诊断 —— 「Agent 看得到、人工看不到」的可测量口径。
+        // 多轮对话把消息栈越堆越高,Agent 读 DOM 全量拿到,人工在浏览器窗口只看
+        // 到第一屏;而 locked 档的 CDP 输入拦截连滚轮一起拦,人工也滚不动。本维度
+        // 直接回答「人工此刻能看到多少」并给出 Agent 可立即执行的处置动作。
+        "visibility" => {
+            let vis = crate::agent::browser_follow::visibility(&page).await;
+            let mut out = json!({"visibility": vis.clone()});
+            if let Some(note) = crate::agent::browser_follow::visibility_note(&vis) {
+                out["note"] = json!(note);
+                out["required_action"] = json!(
+                    "control(scroll_to, params={position:'bottom'}) 或 control(auto_follow, params={enabled:true})"
+                );
             }
             Ok(out)
         }

@@ -545,7 +545,8 @@ async fn run_one_shot(
     );
 
     // 构造 MultiAgentOrchestrator(6 角色);debug 模式下包装饰器并注入采集器
-    let plans_dir = paths.root_dir.join("plans");
+    // 第 152 轮:产物统一落工作目录(不再逃逸到二进制所在目录)
+    let plans_dir = lsm_agent::artifact_root::artifact_dir("plans");
     let db_arc = Arc::new(db);
     let cfg = lsm_agent::agent::orchestrator::OrchestratorConfig {
         subagent_max_iterations: max_iterations,
@@ -748,7 +749,7 @@ async fn run_one_shot(
             // 单轮模式取消路径直接 exit(130) 不会走到这里;报告恒为完整 LLM 评估。
             interrupted: false,
         };
-        let report_dir = paths.root_dir.join("DebugReport");
+        let report_dir = lsm_agent::artifact_root::artifact_dir("DebugReport");
         match lsm_agent::agent::debug::finalize_report(&collector, llm.clone(), &report_dir, &meta)
             .await
         {
@@ -1057,15 +1058,10 @@ async fn main() -> Result<()> {
     lsm_agent::tui::term_guard::install_watchdog(tokio::runtime::Handle::current());
 
     // 崩溃取证必须先于 CLI 解析 / TUI 初始化 / Tokio worker 创建安装。
-    // 报告目录沿用 laew 根目录约定，不依赖数据库配置，用户零配置。
-    {
-        let root_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        lsm_agent::crash::install_panic_hook_from_root(&root_dir);
-    }
+    // 第 152 轮:报告落「产物根」(默认 = 启动时工作目录),不再写进二进制所在目录
+    // (实测经 /opt/homebrew/bin 软链启动时,崩溃报告会落到包管理目录里找不到)。
+    // 不依赖数据库配置，用户零配置。
+    lsm_agent::crash::install_panic_hook_from_root(lsm_agent::artifact_root::artifact_root());
 
     // 进程启动时刻(第 72 轮,2026-09-17):只在此处捕获一次,日志文件命名
     // (`--debug`/`--info` 的 llaew_YYYYMMDD_HHMMSS.log)与 TUI 横幅「启动时间」行

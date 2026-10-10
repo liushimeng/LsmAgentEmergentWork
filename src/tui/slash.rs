@@ -389,7 +389,7 @@ impl TuiSession {
         // D9-8 决策审计摘要(2026-09-22 第 113 轮):在 /cost 末尾追加 3 行,提示审计事件数 + 落盘路径。
         // 复用 audit_view::count_events 的快速路径(<5ms),不影响 /cost 性能。
         let sid = &self.session.id;
-        let root_dir = Some(self.paths.root_dir.as_path());
+        let root_dir = Some(crate::artifact_root::artifact_root());
         let event_count = super::audit_view::count_events(sid, root_dir);
         let size_kb = super::audit_view::file_size(sid, root_dir)
             .map(|n| n as f64 / 1024.0)
@@ -638,7 +638,7 @@ impl TuiSession {
     /// - `clean [--keep N]` → 清理旧 session 审计文件(默认保留 10)
     /// - `help`          → 子命令帮助
     ///
-    /// 数据源:`<root_dir>/AuditTrail/audit_{session_id}.jsonl`
+    /// 数据源:`<产物根>/AuditTrail/audit_{session_id}.jsonl`(第 152 轮:产物根 = 工作目录)
     /// 由 `decision_audit` 模块在 5 个决策点(Yolo/Plan/Main/QC/Compact)
     /// 自动追加写入,本命令只读不写,无副作用。
     fn run_audit(&self, rest_args: &str) {
@@ -648,7 +648,7 @@ impl TuiSession {
 
         let subcmd = AuditSubcmd::parse(rest_args);
         let sid = &self.session.id;
-        let root_dir = Some(self.paths.root_dir.as_path());
+        let root_dir = Some(crate::artifact_root::artifact_root());
 
         match subcmd {
             AuditSubcmd::Help => {
@@ -662,7 +662,7 @@ impl TuiSession {
                     println!("  (本会话无决策审计事件)");
                     println!("  提示:Yolo / Plan / Main-Work / QC / Compact 在决策时会自动写入");
                     println!("    {}/AuditTrail/audit_{}.jsonl",
-                        self.paths.root_dir.display(), sid);
+                        crate::artifact_root::artifact_root().display(), sid);
                     return;
                 }
                 let count = events.len();
@@ -721,7 +721,7 @@ impl TuiSession {
                     println!("    (使用 --keep {} 覆盖默认 {})",
                         keep, DEFAULT_KEEP_SESSIONS);
                 }
-                println!("    路径: {}", self.paths.root_dir.display());
+                println!("    路径: {}", crate::artifact_root::artifact_root().display());
             }
         }
     }

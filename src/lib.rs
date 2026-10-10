@@ -2,6 +2,7 @@
 //!
 //! 模块划分:
 //! - [`agent`]: Agent 核心循环(规划 -> 工具调用 -> 观察 -> 回答),含 system_prompt 与 tools 子模块
+//! - [`artifact_root`]: 产物根目录唯一真源(第 152 轮,plans/DebugReport/AuditTrail 等统一落工作目录)
 //! - [`llm`]:   大模型客户端抽象与 Anthropic/OpenAI 双协议实现
 //! - [`config`]: 配置层兼容模块(重导出 database 的核心类型,保留 session/agent memory)
 //! - [`database`]: SQLite 数据库操作(路径解析 / Schema / Provider CRUD / 导入导出)
@@ -14,6 +15,7 @@
 #![recursion_limit = "256"]
 
 pub mod agent;
+pub mod artifact_root;
 pub mod config;
 pub mod crash;
 pub mod database;

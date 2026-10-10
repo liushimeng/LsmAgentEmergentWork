@@ -74,6 +74,8 @@ const NS_FLOATING_WINDOW_LEVEL: i64 = 3; // kCGFloatingWindowLevel
 const NS_BEZEL_BORDER: u64 = 2;
 const NS_ROUNDED_BEZEL_STYLE: i64 = 1;
 const NS_IMAGE_SCALE_PROPORTIONALLY_DOWN: i64 = 3;
+/// NSImageScaling:按原始像素 1:1(过大时不缩小)—— 第 152 轮「🔍 放大」用。
+const NS_IMAGE_SCALE_PROPORTIONALLY_UP_OR_DOWN: i64 = 0;
 const NS_EVENT_TYPE_APPLICATION_DEFINED: i64 = 15;
 
 /// `objc_msgSend` 按具体签名逐形状包装(见模块文档)。
@@ -305,7 +307,10 @@ struct Views {
 struct MacState {
     views: Views,
     options: Vec<String>,
-    image_open_path: Option<String>,
+    /// 第 152 轮:原图尺寸(px)。「🔍 放大」按钮用它算 1:1 需要的滚动区提示。
+    image_px: Option<(i64, i64)>,
+    /// 第 152 轮:1:1 放大态(按钮切换,初始 false = 缩放适应)。
+    image_zoomed: bool,
     /// 「📋 复制」写入剪贴板的文本(第 139 轮:一键复制全部信息)。
     copy_payload: String,
     /// 「✓ 已复制」反馈的回滚时刻(由 `on_tick` 消费)。
@@ -410,19 +415,49 @@ extern "C" fn on_extend(_self: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
-extern "C" fn on_open_image(_self: Id, _cmd: Sel, _sender: Id) {
-    let path = {
+/// 「🔍 放大」—— 在**当前弹窗内**把验证码图切到 1:1 并可来回切换。
+///
+/// 第 152 轮行为变更(实测事故):旧实现调 `NSWorkspace.openFile:` 把验证码 PNG
+/// 交给**系统默认应用**打开。用户的 `.png` 默认处理器是浏览器时,每点一次就新开
+/// 一个 Chrome 标签/窗口;而验证码截图原写系统临时目录,被清理后浏览器只显示空白
+/// —— 实测表现为「HITL 成功后冒出一堆空的、乱码的验证码标签页」,且弹窗反复弹出
+/// 时点一次冒一批。流程中途唤起外部应用本就属于交叉操作,与第 141~143 轮
+/// 「人工只读、Agent 独占」的管控语义冲突。
+///
+/// 现在改为窗口内 1:1 放大(`NSImageScalesProportionallyUpOrDown`,超出部分由
+/// 最大化窗口 + 说明区滚动查看),零外部进程、零标签页。需要另存/用看图工具打开
+/// 的用户走既有「📋 复制」拿绝对路径自行打开 —— 那是**用户主动**行为。
+extern "C" fn on_zoom_image(_self: Id, _cmd: Sel, _sender: Id) {
+    let (view, hint, px, zoomed) = {
         let guard = state();
-        guard
-            .as_ref()
-            .and_then(|st| st.image_open_path.clone())
+        let Some(st) = guard.as_ref() else { return };
+        (st.views.image, st.views.img_hint, st.image_px, st.image_zoomed)
     };
-    let Some(path) = path else { return };
+    let Some(view) = view else { return };
+    let next = !zoomed;
     unsafe {
-        let ws = send_id(cls(b"NSWorkspace\0"), sel(b"sharedWorkspace\0"));
-        if !ws.is_null() {
-            send_bool_id(ws, sel(b"openFile:\0"), ns_str(&path));
+        // 放大态 = 按原始像素 1:1 显示(超出控件部分被裁切,靠最大化窗口查看);
+        // 非放大态 = 比例缩放适应(NSImageScalesProportionallyDown)。
+        let mode = if next {
+            NS_IMAGE_SCALE_PROPORTIONALLY_UP_OR_DOWN
+        } else {
+            NS_IMAGE_SCALE_PROPORTIONALLY_DOWN
+        };
+        send_void_i64(view, sel(b"setImageScaling:\0"), mode);
+        if let Some(h) = hint {
+            if let Some((w, h_px)) = px {
+                let text = if next {
+                    format!("1:1 放大中({w}×{h_px} px)· 再点一次恢复缩放适应 · ⛶ 最大化可看全")
+                } else {
+                    format!("原图 {w}×{h_px} px · 点「🔍 放大」按 1:1 查看细节")
+                };
+                send_void_id(h, sel(b"setStringValue:\0"), ns_str(&text));
+            }
         }
+    }
+    let mut guard = state();
+    if let Some(st) = guard.as_mut() {
+        st.image_zoomed = next;
     }
 }
 
@@ -542,7 +577,7 @@ fn controller_class() -> Id {
             & ok(on_cancel, b"cancel:\0")
             & ok(on_zoom, b"zoom:\0")
             & ok(on_extend, b"extend:\0")
-            & ok(on_open_image, b"openImage:\0")
+            & ok(on_zoom_image, b"openImage:\0")
             & ok(on_copy, b"copyInfo:\0")
             & ok(on_tick, b"tick:\0")
             & ok(on_focus_once, b"focusOnce:\0")
@@ -844,7 +879,7 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
 
     // ---- 说明与几何 ----
     let text_w = W - PAD * 2.0;
-    let (image_view, img_hint_label, img_ratio, image_open_path) = load_image(p);
+    let (image_view, img_hint_label, img_ratio, image_px) = load_image(p);
     let geo = Geometry {
         msg_h: 90.0,
         img_h: image_height_for(img_ratio, text_w, 300.0),
@@ -898,7 +933,7 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     // 超时的根治;stdout extend 中间行 → 父进程 hub 延长)。
     let extend = make_button(super::dialog_main::EXTEND_BTN_TITLE, None, ctrl, b"extend:\0", -1);
     let zoom = make_button("⛶ 最大化", None, ctrl, b"zoom:\0", -1);
-    let orig = make_button("查看原图", None, ctrl, b"openImage:\0", -1);
+    let orig = make_button("🔍 放大", None, ctrl, b"openImage:\0", -1);
     // 第 139 轮:一键复制全部信息(说明 + 页面 URL + 页面 ID + 候选选项)。
     let copy_btn = make_button(COPY_BTN_TITLE, None, ctrl, b"copyInfo:\0", -1);
 
@@ -997,7 +1032,8 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     *state() = Some(MacState {
         views,
         options: p.options.clone(),
-        image_open_path,
+        image_px,
+        image_zoomed: false,
         copy_payload: p.copy_text(),
         copied_at: None,
         payload_id: p.id,
@@ -1199,7 +1235,7 @@ unsafe fn make_button(
 }
 
 /// 载入验证码图片(NSImage;失败静默降级为无图,fail-open)。
-unsafe fn load_image(p: &DialogPayload) -> (Option<Id>, Option<Id>, f64, Option<String>) {
+unsafe fn load_image(p: &DialogPayload) -> (Option<Id>, Option<Id>, f64, Option<(i64, i64)>) {
     if p.image_path.is_empty() {
         return (None, None, 0.0, None);
     }
@@ -1236,11 +1272,11 @@ unsafe fn load_image(p: &DialogPayload) -> (Option<Id>, Option<Id>, f64, Option<
         hint,
         sel(b"setStringValue:\0"),
         ns_str(&format!(
-            "原图 {}×{} px · 「查看原图」可用系统查看器放大细读",
+            "原图 {}×{} px · 点「🔍 放大」按 1:1 查看细节",
             w as i64, h as i64
         )),
     );
-    (Some(iv), Some(hint), h / w, Some(p.image_path.clone()))
+    (Some(iv), Some(hint), h / w, Some((w as i64, h as i64)))
 }
 
 // ---------- 布局单测(纯函数,不触达 AppKit) ----------

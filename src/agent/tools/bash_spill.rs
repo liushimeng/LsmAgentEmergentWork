@@ -190,15 +190,15 @@ pub fn format_stream_block(stream: BashStream, outcome: &SpillOutcome) -> String
     }
 }
 
-/// 当前进程的 spill 根目录(与 `Paths::detect().root_dir` 同义)。
+/// 当前进程的 spill 根目录(第 152 轮:产物根 = 启动时工作目录)。
 ///
 /// 独立推导,避免向 BashTool 注入 root_dir 字段(参考 decision_audit.rs::audit_root_dir 模式)。
-/// 推导失败(无 current_exe 父目录)时回退到工作目录。
+///
+/// 第 152 轮:原实现取 `current_exe().parent()`,实测经 `/opt/homebrew/bin` 软链启动时
+/// Bash 大输出落进包管理目录,用户在工作目录里找不到;改走 [`crate::artifact_root`]
+/// 单一真源(`LAEW_ARTIFACT_DIR` 可覆盖)。
 pub fn spill_root_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    crate::artifact_root::artifact_root().to_path_buf()
 }
 
 // ---------- 私有辅助 ----------
