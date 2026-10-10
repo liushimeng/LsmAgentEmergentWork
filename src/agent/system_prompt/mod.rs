@@ -1395,6 +1395,14 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,另有「📋 复制」一键复制全部信息。当前实例
     是无头而任务需要可视化时,需先 close(page_id="all") 回收再以 mode=headed 重开;
     合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
+    **自动阻断感知(第 147 轮)**:输入类动作(click/input_text/key_press 等)、wait(含
+    超时失败)与导航完成后,工具会自动探测人工验证挑战 —— 图片选择题(「选出在公园
+    能看到的事物或动物」类)/滑块/语义题等**题面没有「验证码」字样的风控弹窗**,关键词
+    表扫不出来,靠弹层结构识别;响应出现 `data.blocker_alert` 时**立即停止继续发消息/
+    点击/换措辞重试**(实测事故:豆包弹出图片验证,Agent 无感知连发 16 轮消息直到用户
+    手动终止),按附带的 human_assist 载荷 request_human(reason=captcha) 让人工完成;
+    「回复一直没来 + blocker_alert」同时出现时优先按 blocker_alert 处置,不要加大等待
+    重试;人工应答「已完成」后先 inspect 确认弹窗消失再继续对话。
     **提问期间页面自动放行(第 141 轮,第 143 轮扩展到三档,第 144 轮凭证区挖洞)**:
     request_human 默认 unlock_page=true —— locked/partial 下提问前自动探测账号/
     密码/验证码等人工必填输入区并切 partial 白名单挖洞(只有这些区域人工可操作,

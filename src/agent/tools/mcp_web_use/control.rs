@@ -206,7 +206,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     } else {
         None
     };
-    let result: std::result::Result<Value, String> = match action {
+    let mut result: std::result::Result<Value, String> = match action {
         "click" => act_click(id, &params, false).await,
         "human_click" => act_click(id, &params, true).await,
         "right_click" => act_simple_click(id, &params, "right").await,
@@ -281,6 +281,20 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     } else {
         Vec::new()
     };
+    // 第 147 轮:推送式自动阻断感知 —— 输入类/wait/导航类动作收尾后探测人工验证
+    // 挑战(图片选择/语义题等关键词扫不出的形态,见 blocker_probe),命中才把
+    // blocker_alert + human_assist 载荷附进响应;wait 失败(多为等待超时)恰是
+    // 「回复没来 + 弹窗在场」的复合信号,Err 路同样探测。干净零附加,fail-open。
+    let mut err_alert: Option<Value> = None;
+    if super::blocker_probe::action_needs_probe(&action) {
+        if result.is_ok() {
+            if let Ok(data) = result.as_mut() {
+                super::blocker_probe::attach_if_blocked(id, data).await;
+            }
+        } else if action == "wait" {
+            err_alert = super::blocker_probe::probe_alert(id).await;
+        }
+    }
     match result {
         Ok(mut data) => {
             if let Some(new_id) = spawned.first() {
@@ -294,6 +308,13 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             let mut data = json!({});
             if let Some(new_id) = spawned.first() {
                 data["spawned_page_id"] = json!(new_id);
+            }
+            if let Some(alert) = err_alert {
+                if let (Some(dst), Some(src)) = (data.as_object_mut(), alert.as_object()) {
+                    for (k, v) in src {
+                        dst.insert(k.clone(), v.clone());
+                    }
+                }
             }
             envelope(2002, &e, data)
         }
@@ -798,9 +819,22 @@ async fn act_wait(id: &str, p: &Value) -> std::result::Result<Value, String> {
         }
         return Err(format!("wait 超时({timeout_ms}ms): {sel} 未满足 {state}"));
     }
-    let ms = p.get("duration_ms").and_then(Value::as_u64).unwrap_or(500).min(10000);
+    // 第 147 轮:`ms` 别名 —— 实测豆包任务 LLM 全程传 `{"ms":12000}`(第 99/135 轮
+    // 「参数别名容错」哲学),旧实现只读 duration_ms → 每次「等 12 秒」实际只睡 500ms,
+    // AI 回复/验证弹窗都没来得及渲染就被读取,整个交互循环失真。
+    // 单次上限同步放宽 10s→30s(AI 类网站回复 30-60s 常见,第 82 轮;selector 等待
+    // 本就允许 120s,纯睡眠不该更短);返回 slept_ms 如实回报实际时长。
+    let ms = wait_sleep_ms(p);
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     Ok(json!({"slept_ms": ms}))
+}
+
+/// wait 纯睡眠时长解析(纯函数,可单测):`duration_ms` 与别名 `ms` 取较大者,
+/// 缺省 500ms,上限 30000ms。
+pub(super) fn wait_sleep_ms(p: &Value) -> u64 {
+    let a = p.get("duration_ms").and_then(Value::as_u64);
+    let b = p.get("ms").and_then(Value::as_u64);
+    a.max(b).unwrap_or(500).min(30_000)
 }
 
 async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> {

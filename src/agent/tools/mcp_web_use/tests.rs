@@ -1540,3 +1540,205 @@ fn visit_note_ignores_query_and_fragment() {
     visit_ledger::record_visit("p", "http://a.com/p#again", "", visit_ledger::VisitSource::Navigate);
     assert!(visit_ledger::visit_note("http://a.com/p?y=2").is_some(), "3 次应触发");
 }
+
+// ==================== 第 147 轮:自动阻断感知(语义挑战检测) ====================
+
+/// 构造探针 JS 同构的 overlay 元数据(纯函数 detect_challenge 的输入)。
+fn probe_overlay(text: &str, grid_imgs: i64, iframe_like: bool, buttons: Value) -> Value {
+    json!({
+        "found": true, "text": text,
+        "img_count": grid_imgs, "grid_imgs": grid_imgs,
+        "canvas_count": 0,
+        "iframe_count": if iframe_like { 1 } else { 0 },
+        "iframe_like": iframe_like, "input_count": 0,
+        "buttons": buttons,
+        "rect": {"w": 360, "h": 420}, "viewport": {"w": 1280, "h": 800},
+        "area_ratio": 0.23, "z_index": 9999,
+    })
+}
+
+#[test]
+fn detect_challenge_doubao_iframe_with_strong_word() {
+    // 豆包形态:题面在跨域 iframe 内主文档读不到,壳层「安全验证」强词 + 验证码尺寸 iframe
+    let o = probe_overlay("安全验证 请完成下方验证", 0, true, json!(["刷新", "换一张"]));
+    let hit = blocker_probe::detect_challenge(&o).expect("iframe_like(2)+强词(4) 应命中");
+    assert_eq!(hit["kind"], "captcha");
+    assert_eq!(hit["matched"], "challenge_overlay");
+    assert!(hit["evidence"]["iframe_like"].as_bool().unwrap());
+}
+
+#[test]
+fn detect_challenge_image_grid_with_weak_word() {
+    // 九宫格渲染在主文档 + 题面动词「选出」:2+1=3 过阈值(豆包无 iframe 变体)
+    let o = probe_overlay("选出在公园能看到的事物或动物", 9, false, json!(["确认"]));
+    let hit = blocker_probe::detect_challenge(&o).expect("九宫格(2)+弱指令词(1) 应命中");
+    assert_eq!(hit["evidence"]["grid_imgs"], 9);
+    assert!(hit["snippet"].as_str().unwrap().contains("公园"));
+}
+
+#[test]
+fn detect_challenge_strong_word_alone_hits() {
+    // 弹层只有验证文案、无图无 iframe(短信/滑块文案形态):强词单独触发
+    let o = probe_overlay("请完成人机验证后继续操作", 0, false, json!([]));
+    assert!(blocker_probe::detect_challenge(&o).is_some());
+}
+
+#[test]
+fn detect_challenge_structural_signal_alone_not_enough() {
+    // 防误报:纯 iframe 形态(无任何文案,如视频/组件嵌入)与纯九宫格(图库弹窗)不报
+    let iframe_only = probe_overlay("", 0, true, json!([]));
+    assert!(blocker_probe::detect_challenge(&iframe_only).is_none(), "iframe 单独 2 分不过阈值");
+    let grid_only = probe_overlay("精选图集", 9, false, json!(["关闭"]));
+    assert!(blocker_probe::detect_challenge(&grid_only).is_none(), "九宫格单独 2 分不过阈值");
+}
+
+#[test]
+fn detect_challenge_ad_overlay_suppressed() {
+    // 广告弹窗:iframe_like 但文案/按钮命中广告负信号 → 压制
+    let o = probe_overlay("限时优惠 广告", 0, true, json!(["跳过广告", "了解更多"]));
+    assert!(blocker_probe::detect_challenge(&o).is_none(), "广告负信号应压制");
+}
+
+#[test]
+fn detect_challenge_clean_overlay_and_null() {
+    let clean = probe_overlay("新品上线通知", 1, false, json!(["知道了"]));
+    assert!(blocker_probe::detect_challenge(&clean).is_none());
+    assert!(blocker_probe::detect_challenge(&Value::Null).is_none());
+    assert!(blocker_probe::detect_challenge(&json!({"found": false})).is_none());
+}
+
+#[test]
+fn analyze_merges_keyword_and_challenge_with_dedupe() {
+    // 关键词通道(captcha)+ 弹层挑战同 kind → 去重保留带 evidence 的挑战条目
+    let probe = json!({
+        "text": "请完成安全验证 拖动滑块",
+        "overlay": probe_overlay("安全验证", 0, true, json!(["刷新"])),
+    });
+    let out = blocker_probe::analyze(&probe);
+    assert_eq!(out.len(), 1, "同 kind 去重,实际:{out:?}");
+    assert_eq!(out[0]["matched"], "challenge_overlay");
+    assert!(out[0]["evidence"].is_object(), "保留带结构证据的挑战版本");
+}
+
+#[test]
+fn analyze_keeps_different_kinds() {
+    // 全文命中 login + 弹层命中 captcha → 两条并存
+    let probe = json!({
+        "text": "登录后查看更多内容",
+        "overlay": probe_overlay("请选出图中包含的物品", 9, false, json!(["刷新"])),
+    });
+    let out = blocker_probe::analyze(&probe);
+    let kinds: Vec<&str> = out.iter().filter_map(|b| b["kind"].as_str()).collect();
+    assert!(kinds.contains(&"captcha"), "实际:{kinds:?}");
+    assert!(kinds.contains(&"login"), "实际:{kinds:?}");
+}
+
+#[test]
+fn analyze_challenge_overlays_keyword_only_path() {
+    // 无弹层(overlay null)时退化为纯关键词(开关回退路径共用同一 analyze)
+    let probe = json!({"text": "微信扫码登录", "overlay": null});
+    let out = blocker_probe::analyze(&probe);
+    assert!(out.iter().any(|b| b["kind"] == "qr_login"));
+    let clean = blocker_probe::analyze(&json!({"text": "普通内容", "overlay": null}));
+    assert!(clean.is_empty());
+}
+
+#[test]
+fn action_needs_probe_covers_input_wait_nav() {
+    for a in ["click", "input_text", "key_press", "drag", "human_click", "select_option"] {
+        assert!(blocker_probe::action_needs_probe(a), "{a} 应探测");
+    }
+    for a in ["wait", "navigate", "back", "forward", "reload"] {
+        assert!(blocker_probe::action_needs_probe(a), "{a} 应探测");
+    }
+    // 高频只读/状态类不探测(eval_js/screenshot/set_* / request_human)
+    for a in ["eval_js", "screenshot", "set_guard", "set_viewport", "request_human", "heartbeat"] {
+        assert!(!blocker_probe::action_needs_probe(a), "{a} 不应探测");
+    }
+}
+
+#[test]
+fn wait_sleep_ms_accepts_alias_and_caps() {
+    // 第 147 轮:ms 别名(实测豆包任务 LLM 全程传 ms=12000 只睡了 500ms 的根治)
+    assert_eq!(control::wait_sleep_ms(&json!({"ms": 12000})), 12000);
+    assert_eq!(control::wait_sleep_ms(&json!({"duration_ms": 8000})), 8000);
+    // 两参并存取较大者
+    assert_eq!(
+        control::wait_sleep_ms(&json!({"duration_ms": 3000, "ms": 7000})),
+        7000
+    );
+    // 缺省 500 / 上限 30000(AI 回复长尾 30-60s,第 82 轮)
+    assert_eq!(control::wait_sleep_ms(&json!({})), 500);
+    assert_eq!(control::wait_sleep_ms(&json!({"ms": 999999})), 30000);
+}
+
+#[test]
+fn infer_step_action_from_fields() {
+    // 第 147 轮:sequence 步骤缺 action 时按字段推断(实测 steps 常漏 action:"control")
+    assert_eq!(infer_step_action(&json!({"control_action": "wait", "params": {"ms": 100}})), Some("control"));
+    assert_eq!(infer_step_action(&json!({"info": "elements"})), Some("inspect"));
+    assert_eq!(infer_step_action(&json!({"url": "https://a.com"})), None);
+    // control_action 优先于 info
+    assert_eq!(
+        infer_step_action(&json!({"control_action": "click", "info": "elements"})),
+        Some("control")
+    );
+}
+
+/// 第 147 轮真浏览器集成验证(#[ignore],本地 `--ignored` 跑):
+/// 构造豆包风控形态弹层(z-index 9999 全屏遮罩 + 居中弹窗 + 9 宫格小图 + 题面 +
+/// 刷新按钮),探针采集 → 打分应命中 captcha;干净页面应零命中。
+/// 与 browser_overlay 真浏览器用例同构(需本机 Chrome,会弹有头窗口);
+/// DOM 经 about:blank + body.innerHTML 注入(长 data: URL 含 % 会被当百分号编码,
+/// 实测 goto 超时)。
+#[tokio::test]
+#[ignore = "需要本机真实 Chrome(会弹有头窗口);本地手动跑"]
+async fn real_browser_blocker_probe_detects_challenge_modal() {
+    use crate::agent::browser::{BrowserManager, BrowserMode};
+    let (pid, _, _) = BrowserManager::global()
+        .new_page("about:blank", BrowserMode::Headed, None, None, Some((1280, 800)), true, Default::default())
+        .await
+        .expect("启动浏览器失败(本机是否装有 Chrome?)");
+    let page = BrowserManager::global().page(&pid).await.expect("page 句柄");
+    // 9 宫格小图(64×64,近方形)+ 题面「选出在公园能看到的事物或动物」+ 刷新按钮
+    let inject = r#"(() => {
+      const tiles = Array.from({length: 9}, (_, i) =>
+        `<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" style="width:64px;height:64px" alt="t${i}">`).join('');
+      document.body.innerHTML = `<div>普通内容</div>
+        <div style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999" class="c-mask">
+          <div class="c-dialog" role="dialog" style="position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:360px;height:420px;background:#fff;z-index:10000;padding:16px">
+            <h3>安全验证</h3>
+            <p>选出在公园能看到的事物或动物</p>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr)">${tiles}</div>
+            <button>刷新</button><button>换一张</button>
+          </div></div>`;
+      return document.querySelectorAll('img').length;
+    })()"#;
+    let n = eval_js_string(&page, inject).await.unwrap();
+    assert_eq!(n, 9, "9 宫格注入失败");
+    let probe = blocker_probe::collect_for_inspect(&page).await;
+    let alerts = blocker_probe::analyze(&probe);
+    assert!(
+        alerts.iter().any(|b| b["kind"] == "captcha" && b["matched"] == "challenge_overlay"),
+        "豆包形态弹层应命中,probe:{probe:?} alerts:{alerts:?}"
+    );
+    // 全链路:control(input_text) 在弹窗在场时执行,响应信封应自动携带 blocker_alert
+    // (推送式感知接线,第 147 轮 control.rs::run 收尾)
+    eval_js_string(&page, r#"document.body.insertAdjacentHTML('beforeend', '<input id="q" style="width:200px;height:20px">')"#).await.unwrap();
+    let out = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "input_text",
+                        "params": {"selector": "#q", "text": "hi"}}))
+        .await
+        .unwrap();
+    let env: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(env["code"], 0, "input_text 本身应成功:{env}");
+    assert!(env["data"]["blocker_alert"]["kind"] == "captcha", "信封应带 blocker_alert:{env}");
+    assert_eq!(env["data"]["next_action"], "request_human");
+    assert!(env["data"]["human_assist"]["ready"].as_bool().unwrap(), "human_assist 载荷应就绪");
+    // 干净页面(移除弹层)零命中
+    eval_js_string(&page, "document.querySelector('.c-mask').remove()").await.unwrap();
+    let probe2 = blocker_probe::collect_for_inspect(&page).await;
+    let alerts2 = blocker_probe::analyze(&probe2);
+    assert!(alerts2.is_empty(), "干净页面误报:{alerts2:?}");
+    BrowserManager::global().shutdown().await;
+}

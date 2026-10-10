@@ -69,6 +69,27 @@ const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
     ),
 ];
 
+/// 读页面可见全文(克隆 body 并剥离 `[data-laew-agent]` 子树再读 innerText):
+/// Agent 高亮徽标文本(「LAEW Agent 控制中」)不应参与阻断判定。
+/// 第 147 轮自 blockers 分支抽出,`blocker_probe` 旧路径回退时共用。
+pub(super) async fn body_text_without_agent_nodes(
+    page: &chromiumoxide::Page,
+) -> String {
+    eval_js_string(
+        page,
+        r#"(() => { try {
+            if (!document.body) return '';
+            const clone = document.body.cloneNode(true);
+            clone.querySelectorAll('[data-laew-agent]').forEach(e => e.remove());
+            return clone.innerText.slice(0, 20000);
+        } catch(e) { return ''; } })()"#,
+    )
+    .await
+    .ok()
+    .and_then(|v| v.as_str().map(str::to_string))
+    .unwrap_or_default()
+}
+
 /// 在页面文本中检测人工阻断(Rust 侧模式表,可单测)。
 /// 返回命中列表 [{kind, snippet}](每种 kind 最多 1 条,避免重复刷屏)。
 pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
@@ -280,23 +301,16 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         }
         // 第 100 轮:人工阻断检测 —— 验证码/短信/扫码/登录墙的确定性启发式,
         // 作为 SubAgent「无法自动跳过 → request_human」的判定依据。
+        // 第 147 轮:升级为「全文关键词 ∪ 弹层语义挑战」双通道(豆包「选出在公园
+        // 能看到的事物」类图片选择题题面无任何关键词,靠弹层结构识别,见 blocker_probe);
+        // LAEW_WEB_BLOCKER_PROBE=off 时严格回退第 100 轮纯关键词行为。
         "blockers" => {
-            let text = eval_js_string(
-                &page,
-                // 克隆 body 并剥离 [data-laew-agent] 子树再读 innerText:
-                // Agent 高亮徽标文本(「LAEW Agent 控制中」)不应参与阻断判定。
-                r#"(() => { try {
-                    if (!document.body) return '';
-                    const clone = document.body.cloneNode(true);
-                    clone.querySelectorAll('[data-laew-agent]').forEach(e => e.remove());
-                    return clone.innerText.slice(0, 20000);
-                } catch(e) { return ''; } })()"#,
-            )
-            .await
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default();
-            let blockers = detect_blockers(&text);
+            let probe = if super::blocker_probe::enabled() {
+                super::blocker_probe::collect_for_inspect(&page).await
+            } else {
+                json!({"text": body_text_without_agent_nodes(&page).await, "overlay": null})
+            };
+            let blockers = super::blocker_probe::analyze(&probe);
             // 暴露合法 reason 列表:LLM 拿到 blockers 后可直接挑一个去 request_human,
             // 不必反查工具 schema / 文档。新增 reason 时本列表自动跟随常量更新。
             let allowed_reasons: Vec<&'static str> =
