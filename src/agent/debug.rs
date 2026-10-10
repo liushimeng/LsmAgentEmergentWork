@@ -1168,7 +1168,6 @@ mod tests {
             debug_eligible: true,
             target_status: None,
             clarification_question: None,
-            refuses_task: false,
         });
         c.record_quality(&QualityReport::pass(AgentRole::SubAgent));
         c.record_task_end("executed", "", "", Usage::default());
@@ -1283,7 +1282,6 @@ mod tests {
             debug_eligible: false,
             target_status: None,
             clarification_question: None,
-            refuses_task: false,
         };
         assert!(!should_invoke_debug_agent(&c), "should skip when debug_eligible=false");
         c.debug_eligible = true;

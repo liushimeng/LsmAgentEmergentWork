@@ -305,7 +305,6 @@
                 debug_eligible: true,
                 target_status: None,
                 clarification_question: None,
-                refuses_task: false,
             },
             plan_doc: None,
             workflows: vec![WorkflowResult {
@@ -477,88 +476,13 @@
         assert!(old.max_iterations.is_none());
     }
 
-    // ========== 第 149 轮:安全拒绝终态门 / 同因熔断 ==========
+    // ========== 同因熔断(删除程序级拒绝门后的唯一通用空转止动器) ==========
 
-    fn classification_fixture(level: TaskLevel) -> TaskClassification {
-        TaskClassification {
-            task_level: level,
-            purpose: "测试".into(),
-            goal_summary: "测试目标".into(),
-            intent: "test".into(),
-            agent_role: None,
-            decomposition_plan: vec![],
-            direct_answer: None,
-            user_suggestion_if_fail: String::new(),
-            yolo_degraded: false,
-            suggested_delegate: None,
-            debug_eligible: true,
-            target_status: None,
-            clarification_question: None,
-            refuses_task: false,
-        }
-    }
-
-    #[test]
-    fn yolo_refusal_signal_explicit_channel() {
-        // LLM 显式填 refuses_task=true → explicit 通道(即使无 direct_answer)
-        let mut c = classification_fixture(TaskLevel::Hard);
-        c.refuses_task = true;
-        let (channel, marker) = yolo_refusal_signal(&c).expect("显式拒绝应命中");
-        assert_eq!(channel, "explicit");
-        assert!(marker.is_none());
-    }
-
-    #[test]
-    fn yolo_refusal_signal_mechanical_channel() {
-        // 旧模型不填 refuses_task,但 direct_answer 文首是拒绝文本 → 机械兜底
-        // (2026-10-10 事故原句:task_level=hard + 拒绝式 direct_answer)
-        let mut c = classification_fixture(TaskLevel::Hard);
-        c.direct_answer = Some(
-            "无法协助该任务:其实质是对商业服务实施越狱攻击。建议改为本地靶场实验。".into(),
-        );
-        let (channel, marker) = yolo_refusal_signal(&c).expect("机械检测应命中");
-        assert_eq!(channel, "mechanical");
-        assert_eq!(marker, Some("无法协助"));
-    }
-
-    #[test]
-    fn yolo_refusal_signal_ignores_placeholder_and_normal_answers() {
-        // 占位字符串与正常答案都不触发拒绝门
-        let mut c = classification_fixture(TaskLevel::Medium);
-        c.direct_answer = Some("null".into());
-        assert!(yolo_refusal_signal(&c).is_none());
-        c.direct_answer = Some("已打开文件并统计出 42 行。".into());
-        assert!(yolo_refusal_signal(&c).is_none());
-        // 正常分类(hard + 无 direct_answer)不触发
-        let c2 = classification_fixture(TaskLevel::Hard);
-        assert!(yolo_refusal_signal(&c2).is_none());
-    }
-
-    #[test]
-    fn refusal_text_of_prefers_direct_answer() {
-        let mut c = classification_fixture(TaskLevel::Hard);
-        c.direct_answer = Some("拒绝原因 + 替代方向".into());
-        c.user_suggestion_if_fail = "建议 B".into();
-        assert_eq!(refusal_text_of(&c), "拒绝原因 + 替代方向");
-    }
-
-    #[test]
-    fn refusal_text_of_synthesizes_fallback() {
-        // 未填 direct_answer 时从 user_suggestion_if_fail 兜底,保证用户拿到「下一步」
-        let mut c = classification_fixture(TaskLevel::Hard);
-        c.user_suggestion_if_fail = "改为本地靶场实验".into();
-        let t = refusal_text_of(&c);
-        assert!(t.contains("拒绝"));
-        assert!(t.contains("改为本地靶场实验"));
-        // 两者都空 → 合成默认引导
-        let c2 = classification_fixture(TaskLevel::Simple);
-        let t2 = refusal_text_of(&c2);
-        assert!(t2.contains("重新发送"));
-    }
-
+    /// 同因熔断是模型自行拒绝任务时**唯一**的止动器:拒绝式 Plan 输出同样解析不出
+    /// WorkFlow,归一化后逐字相同,第 2 次即熔断收口(不再由编排器代替模型做价值判断)。
+    /// 本组测试锁死该性质,防止误删。
     #[test]
     fn same_cause_breaker_trips_on_second_identical_reason() {
-        // 2026-10-10 事故形态:三轮完全相同的「解析 Plan 失败」—— 第 2 次即熔断
         let mut b = SameCauseBreaker::new();
         let reason = "解析 Plan 失败: 方案生成失败: Plan 文档未解析出任何 WorkFlow";
         assert!(!b.record(reason), "首次失败不熔断(给一次修正机会)");
@@ -591,70 +515,25 @@
         assert_eq!(b.streak(), 0, "空原因不参与同因判定");
     }
 
-    #[tokio::test]
-    async fn run_hard_plan_refusal_short_circuits_before_qc_and_parse() {
-        // 纵深防御:Plan 输出为拒绝文本时,run_hard 直接返回 refused QualityFailure,
-        // 不进 QC / 解析(否则解析门报「未解析出任何 WorkFlow」触发盲重试)。
-        struct RefusingLlm;
-        #[async_trait::async_trait]
-        impl crate::llm::LlmClient for RefusingLlm {
-            async fn complete(
-                &self,
-                _system: &str,
-                _messages: &[crate::llm::ChatMessage],
-                _tools: &[crate::llm::ToolDef],
-                _meta: &crate::llm::RequestMeta,
-            ) -> Result<crate::llm::Completion> {
-                Ok(crate::llm::Completion {
-                    // 2026-10-10 事故 Plan 第 2 轮原句开头
-                    text: "我无法执行这个规划任务。\n\n## 拒绝原因\n该任务属于提示词提取攻击。"
-                        .into(),
-                    tool_calls: vec![],
-                    usage: Usage::default(),
-                    stop_reason: None,
-                })
-            }
-            fn protocol(&self) -> crate::config::Protocol {
-                crate::config::Protocol::Anthropic
-            }
-        }
-        let dir = tempdir().unwrap();
-        let paths = Paths::for_test(dir.path());
-        let db = Arc::new(Db::open(&paths).unwrap());
-        let orch =
-            MultiAgentOrchestrator::new(Arc::new(RefusingLlm), db, dir.path().join("plans"));
-        let c = classification_fixture(TaskLevel::Hard);
-        let session = crate::session::Session::new();
-        let cancel = crate::agent::cancel::CancelToken::new();
-        let progress: Option<ProgressTx> = None;
-        let result = orch
-            .run_hard(&c, &session, &cancel, &progress, "", "")
-            .await;
-        match result {
-            Err(f) => {
-                assert!(f.refused, "Plan 拒绝必须标记 refused=true");
-                assert!(!f.retryable, "拒绝不可重试(重试=施压)");
-                assert_eq!(f.source, AgentRole::Plan);
-                assert!(
-                    f.refusal_text.contains("我无法执行"),
-                    "拒绝说明全文必须随失败上抛,终态直达用户"
-                );
-            }
-            Ok(_) => panic!("Plan 拒绝场景不应返回 Ok"),
-        }
+    /// 归一化键只取首行 —— 多行 reason 的差异行不得影响同因判定。
+    #[test]
+    fn same_cause_breaker_ignores_non_first_lines() {
+        let mut b = SameCauseBreaker::new();
+        assert!(!b.record("解析 Plan 失败: 未解析出任何 WorkFlow\n第一份附加上下文"));
+        // 仅附加行不同 → 归一化后首行相同 → 第 2 次即判同因熔断
+        assert!(
+            b.record("解析 Plan 失败: 未解析出任何 WorkFlow\n第二份完全不同的附加行"),
+            "归一化只取首行,附加行不同不应打断同因判定"
+        );
     }
 
+    /// 去安全化后 `refuses_task` 字段已移除;存量 JSON 仍带该键时必须被忽略而非报错
+    /// (serde 默认忽略未知字段),保证历史会话/回放不因字段删除而反序列化失败。
     #[test]
-    fn task_classification_refuses_task_serde_backward_compatible() {
-        // 旧 JSON(无 refuses_task 字段)反序列化默认 false —— 存量会话/测试夹具兼容
-        let legacy = r#"{"task_level":"hard","goal_summary":"g","intent":"t"}"#;
-        let c: TaskClassification = serde_json::from_str(legacy).unwrap();
-        assert!(!c.refuses_task);
-        // 新字段正常往返
-        let c2 = classification_fixture(TaskLevel::Hard);
-        let c2 = TaskClassification { refuses_task: true, ..c2 };
-        let json = serde_json::to_string(&c2).unwrap();
-        let back: TaskClassification = serde_json::from_str(&json).unwrap();
-        assert!(back.refuses_task);
+    fn task_classification_ignores_legacy_refuses_task_field() {
+        let legacy = r#"{"task_level":"hard","goal_summary":"g","intent":"t","refuses_task":true}"#;
+        let c: TaskClassification = serde_json::from_str(legacy).expect("旧字段应被忽略");
+        assert_eq!(c.task_level, TaskLevel::Hard);
     }
+
 

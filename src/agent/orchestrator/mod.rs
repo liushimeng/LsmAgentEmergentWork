@@ -149,9 +149,7 @@ use workflows::run_wf_unit;
 // 单测经 `use super::*` 取用;非测试构建无引用。
 #[cfg(test)]
 use workflows::build_subflow_input;
-use yolo_reflow::{
-    fallback_suggestion, is_placeholder_direct_answer, refusal_text_of, yolo_refusal_signal,
-};
+use yolo_reflow::{fallback_suggestion, is_placeholder_direct_answer};
 
 #[cfg(test)]
 mod tests;

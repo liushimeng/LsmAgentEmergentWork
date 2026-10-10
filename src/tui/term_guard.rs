@@ -271,6 +271,7 @@ fn finish(rt: tokio::runtime::Handle, reason: &str, code: i32) {
 /// `terminal_restore_sync()` 的 `Stderr::lock()` 上 —— 主线程卡死时持有 stdio
 /// 全局互斥锁且永不释放,`process::exit` 根本执行不到,于是「修复进程不退出」
 /// 的代码自己变成了又一个杀不掉的进程。
+#[cfg(unix)]
 fn force_terminal_restore() {
     const SEQ: &[&[u8]] = &[
         b"\x1b[?25h",     // 显示光标
@@ -292,10 +293,20 @@ fn force_terminal_restore() {
     let _ = crossterm::terminal::disable_raw_mode();
 }
 
+/// 非 Unix 平台没有 `libc::write` 这条无锁直写路径(该路径专为 unix 的
+/// 「主线程卡死时 stdio 互斥锁永不释放」而设);Windows 上退回 crossterm 的
+/// 同步还原(此时主线程未必卡死,拿得到 stdio 锁)。
+#[cfg(not(unix))]
+fn force_terminal_restore() {
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // 以下两个用例直接依赖 `std::os::unix::io::AsRawFd`,unix 专属。
+    #[cfg(unix)]
     #[test]
     fn stdin_hangup_on_regular_fd_is_false() {
         // 非 TTY 的 fd(普通文件)永远不该被判为挂断,否则管道/e2e 会被误杀
@@ -305,6 +316,7 @@ mod tests {
         let _ = std::fs::remove_file("/tmp/laew_term_guard_probe.txt");
     }
 
+    #[cfg(unix)]
     #[test]
     fn fd_hangup_on_live_pipe_is_false() {
         // 管道两端都在,不应判挂断

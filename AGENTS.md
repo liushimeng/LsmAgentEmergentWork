@@ -130,7 +130,7 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 
 | 角色 | 身份 | 职责 | 工具面 |
 |------|------|------|--------|
-| **Yolo Agent** | `LsmAgentEmergentWork-Yolo` | 入口层：每条输入做 目的→目标→意图 三步分析；任务**三档分类**（simple/medium/hard）；失败回流与用户建议；分类前按 ReAct 自主收集信息（避免 Google 类目的）；延迟强制 `submit_task_classification`（探索轮不注入 forced `tool_choice`、仅末轮强制收口）；**目标可解析性判定**：第 128 轮填 `target_status`（`explicit`/`resolved`/`unresolved`），目标不可解析时编排器直接回问用户（澄清门）不进 WorkFlow，根除「目不明确就猜一个站点」的乱跑行为 | `Read`/`Glob`/`Grep`/`Bash`（只读侦察）/ `MCP_Web_Use`（观察类 action）/ `SubAgent`（只读并行子 Agent） |
+| **Yolo Agent** | `LsmAgentEmergentWork-Yolo` | 入口层：每条输入做 目的→目标→意图 三步分析；任务**三档分类**（simple/medium/hard）；失败回流与用户建议；分类前按 ReAct 自主收集信息（避免 Google 类目的）；延迟强制 `submit_task_classification`（探索轮不注入 forced `tool_choice`、仅末轮强制收口）；**目标可解析性判定**：第 128 轮填 `target_status`（`explicit`/`resolved`/`unresolved`），目标不可解析时编排器直接回问用户（澄清门）不进 WorkFlow，根除「目不明确就猜一个站点」的乱跑行为；**任务该不该接由模型自行判断**，编排器无任何政策性拒绝门（判断不适合接时结论写 `direct_answer`，编排器原样返回用户） | `Read`/`Glob`/`Grep`/`Bash`（只读侦察）/ `MCP_Web_Use`（观察类 action）/ `SubAgent`（只读并行子 Agent） |
 | **Plan Agent** | `LsmAgentEmergentWork-Plan` | 规划层：仅在 hard 任务时启用；输出 Markdown 方案到 `plans/{session_id}-{seq}.md` | `Read`/`Write` |
 | **Main-Work Agent** | `LsmAgentEmergentWork-Main-Work` | 流程层：接收 medium/hard 任务，拆 WorkFlow 列表（Kahn 分层 + 同层并行）；编排循环 ReAct 化（TaskFocus → Verify+Decompose → Emit 三段式 + 任务前提验证硬性要求）；复用 LoopGuard 编排层原地打转同样止损；迭代预算 `max_iterations(8)` + `explore_budget(2)` | `Bash`/`Read`/`Glob`/`Grep`/`MCP_Web_Use`（编排前探查）/ `TodoWrite`/`SubAgent`（**不持** `Write`/`Edit`，流程层只编排不落源代码；不持 `MCP_Window_Use`，桌面窗口操控归 SubAgent-Work 专用） |
 | **SubAgent-Work Agent** | `LsmAgentEmergentWork-SubAgent-Work` | 执行层最小单元，每个流程处理单元委派一个 SubAgent；提示词 ReAct 化（Thought→Action→Observation）+ 工具连续工作模式（同一响应里连续的 `parallel_safe` 工具 Read/Glob/Grep 用 `join_all` + `Semaphore(4)` 并发执行 + `tool_result` 保序回填）+ 无进展止损（`agent/loop_guard.rs` 进展键 = 工具名 + 参数稳定 JSON + 结果摘要，轮询等待类合法重复零误伤；`wait_like()` 让 wait/纯 sleep/`SubAgent(result|history)` 透明跳过；`NUDGE_AT=2`/`ABORT_AT=3` 双阈值 + 宽限轮强提醒作为 user 消息延迟到 tool_result 回填完再推入避免破坏 Anthropic 400 配对）；runtime hints 角色化（`HintRole{Ui,Execute,Gather,Judge}` 由实际调用过什么工具决定） | `Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep` + 平台门控注入 `MCP_Window_Use`（仅 macOS/Windows）+ `MCP_Web_Use` + `MCP_Use`（通用 MCP）+ `TodoWrite` |
@@ -141,10 +141,10 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 
 #### 跨角色编排（`MultiAgentOrchestrator`）
 
-用户输入 → 项目上下文注入 → Yolo 分类 →（澄清门 / 安全拒绝门）→ 简单档（SubAgent）/ 中档（Main→SubAgent）/ 高档（Plan→Main→SubAgent）→ Quality-Check → SessionContext 收口。
+用户输入 → 项目上下文注入 → Yolo 分类 →（澄清门）→ 简单档（SubAgent）/ 中档（Main→SubAgent）/ 高档（Plan→Main→SubAgent）→ Quality-Check → SessionContext 收口。
 
-- **安全拒绝终态门（第 149 轮）**：Yolo 判定任务不应执行（攻击/越权/违规/危害）时——显式 `refuses_task=true` 或 direct_answer 文首命中机械拒绝检测（`safety::refusal.rs::detect_refusal`，扫前 3 非空行）——**任何档位都不委派**，拒绝说明 + 替代方向经 `DirectAnswer` 终态直达用户；失败回流重分类后同样复查（门 B）。纵深防御：`run_hard` 对 Plan 输出先做拒绝检测，命中即 `QualityFailure{refused}` 上抛 → 拒绝终态，不进 QC/解析（根治 2026-10-10 实测：拒绝式 Plan 三轮进解析门报「未解析出任何 WorkFlow」→ 盲重试 528s，构成对模型「换格式补齐被拒内容」的施压）。拒绝不是失败：不回流、不重试、SessionContext 摘要明确写「拒绝」
-- **同因熔断（第 149 轮）**：重试环内失败原因归一化（首行截 120 字符，`normalize_failure_reason`）连续 2 次相同即提前终止重试（`types::SameCauseBreaker`），不再烧满 `max_retry_per_level`；Yolo 回流后计数复位
+- **无程序级拒绝门**：**「这个任务该不该接」完全由模型自行判断**，编排器不做任何检测、拦截或改写。若 Yolo 判断某个任务不适合接，把结论与替代方向写进 `direct_answer`（`decomposition_plan` 留空、`task_level=simple`），编排器原样返回用户；若判断可以接，照常分级委派。提示词与 `submit_task_classification` 的 JSON Schema 中均**不含**任何政策性拒绝字段/条款（此前存在的 `refuses_task` 字段 + `safety/refusal.rs::detect_refusal` 机械短语检测 + 编排器拒绝终态门 A/B + Plan 拒绝短路已整体移除）。详见 `docs/YoloAgent设计/01-设计与解决方案.md` §2
+- **同因熔断（`types::SameCauseBreaker`）**：重试环内失败原因归一化（首行截 120 字符，`normalize_failure_reason`）连续 2 次相同即提前终止重试，不再烧满 `max_retry_per_level`；Yolo 回流后计数复位。**这是删除程序级拒绝门后唯一的通用空转止动器** —— 模型自行拒绝任务时其 Plan 输出同样解析不出 WorkFlow，归一化后逐字相同，第 2 次即熔断收口（不再由编排器代替模型做价值判断）
 - WorkFlow 执行时按 `depends_on` 自动 Kahn 分层（`main_work::topo_layers`），**同层无依赖的 SubAgent 自动并行**（tokio::spawn + Semaphore 上限 3，`OrchestratorConfig::max_parallel_workflows`），跨层严格串行、上游产物按层注入，失败语义与串行一致（fail-fast 回流 Yolo）
 - **执行-验证-修订闭环**：WorkFlow 单元 QC 判 `retryable=true` 时先在**单元级局部重试**（仅该单元，注入本单元 QC 结论，不连坐同层姊妹单元），`OrchestratorConfig::unit_retry_budget` 默认 2（单单元最多 3 次尝试，`0` = 关闭旧行为）；预算耗尽才升级到档位级重试（`max_retry_per_level=3`，`retray_hint` 回灌 Main-Work）→ Yolo 回流（`[PREVIOUS_FAILURE]` + `failure_signals`）→ Failed outcome。retry_hint 分层：attempt=0 用档位级 hint / attempt≥1 用本单元 QC issues+suggestion 覆盖 description hint 段（`apply_retry_hint_overlay`）。失败路径用量保全（第 149 轮）：`from_agent_error` 站点改为手工构造 QualityFailure 携带已发生 usage，终态用量与逐事件累加对齐
 
@@ -194,6 +194,13 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 - **Session**：进程内会话，拥有独立 Session ID 与对话上下文（context）；TUI 启动或 `/new` `/clear` 时生成新 Session
 - **会话持久化**：TUI 每轮任务收口把 transcript **整快照重写**（单事务 DELETE+INSERT）到根目录 SQLite `chat_sessions`（索引行：title/turn_count/model_name/updated_at）+ `chat_turns`（轮次：`response` 人类版与 `context_response` 上下文回填版分列）；失败仅告警不打断对话；自动保留最近 50 个会话。恢复走 `/sessions` `/resume` / `--resume`（`-c`），重建后保持原 Session ID（`session_memory` 摘要链连续）、PROJECT_CONTEXT 幂等重注入
 - **请求头**：两协议统一携带 `User-Agent: {AgentName}/{版本} {编译时间}`、`Authorization: Bearer {api_key}`、`X-Session-Id`；Anthropic 请求体 additionally 携带 `metadata.user_id`（含 `device_id/account_uuid/session_id/agent`）。**User-Agent 按"发起请求的 Agent 角色"逐请求注入**（`Agent::run_session_inner` 从 profile 写入 `RequestMeta.user_agent`，8 角色各自携带自身名称，抓包层面可辨识）
+- **系统提示词编写原则（9 角色统一）**：所有角色提示词按两类约束切分，**改提示词前先判断某条属于哪类**——
+  | 类别 | 定义 | 处置 |
+  |------|------|------|
+  | **政策性约束** | 约束「该不该接这个任务」（按攻击/越权/违法/违反服务条款/危害他人等性质决定拒绝） | **不写进提示词，程序也不拦截** —— 判断权完全交给模型。写成关键词清单既占 token 又与模型自身判断打架，且关键词在正常工程语境里高频出现会误伤合法任务 |
+  | **运行正确性约束** | 约束「怎么把任务做对」（目标保真、证据不伪造、路径保真、能力边界、澄清门、schema） | 保留。这些各有运行时闸门配套（`target_anchor` code=6001、`web_evidence` 五条件闸门、QC 对账），删提示词即回退已根治的事故 |
+  **刚性三档**：硬（必须：字段类型/schema/目标保真/证据不伪造）/ 中（默认如此，例外需理由：批量优先、ReAct 三段、迭代预算）/ 软（建议、一般、通常：收集轮次上限、拆解数量对齐）。**不要把软约束写成「禁止/必须/严禁/红线」** —— 那会让模型在边界情况不敢变通。
+  **两条硬规矩**：① 提示词正文不写「第 N 轮」沿革标注（对模型零价值，只增噪声与 token；沿革归 `docs/` 与 git，`prompts_have_no_round_annotations` 单测锁死）；② 入口层角色（Yolo）的分层约定写成「默认如此 + 例外需理由」而非禁令（如「Bash 主要做只读侦察，写盘命令一般留给执行层 —— 你若判断确实需要现在动手，直接做即可」）。单测：`system_prompt/mod.rs::prompts_have_no_policy_refusal_wording` / `prompts_keep_correctness_constraints` / `prompts_have_no_round_annotations`。
 - **Anthropic 三段式系统提示词**：8 角色 + WorkFlow 角色的 `system` 字段从单字符串重构为三段式，对齐 Claude Code CLI 抓包范式——
   1. **billing 计费头**（无 `cache_control`）：单行 `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cc_is_subagent=true;`，Anthropic 内部计费/链路字段，对模型行为零影响
   2. **identity 基础身份声明**（带 `cache_control: ephemeral`）：单行 Agent 身份 + 一句话职责，8 角色 + WorkFlow 各一份
@@ -280,7 +287,7 @@ agent/
   plan_validate.rs Plan 输出校验
   yolo.rs          YoloRunner 双 Agent 编排器 + TaskLevel + TaskClassification + JSON 解析
   main_work/       Main-Work 流程层目录:mod.rs(MainWorkRunner) / spec.rs(WorkFlow 规格模型+宽松反序列化) / delegate.rs(委派推断 GUI 优先) / topo.rs(Kahn 分层+依赖治理) / parse.rs(JSON/Markdown 双通道解析) / tests.rs
-  orchestrator/    MultiAgentOrchestrator 总编排器目录:mod.rs(结构体+入口+进度通道) / types.rs(共享类型+QualityFailure+SameCauseBreaker 同因熔断,第 149 轮) / pipeline.rs(handle_inner+三档链路+安全拒绝终态门 A/B+Plan 拒绝短路+失败路径用量保全,第 149 轮) / workflows.rs(分层并行+run_wf_unit) / yolo_reflow.rs(Yolo 分类封装+失败回流+拒绝信号判定) / usage.rs(用量累加) / tests.rs
+  orchestrator/    MultiAgentOrchestrator 总编排器目录:mod.rs(结构体+入口+进度通道) / types.rs(共享类型+QualityFailure+SameCauseBreaker 同因熔断) / pipeline.rs(handle_inner+三档链路+同因熔断止损+失败路径用量保全) / workflows.rs(分层并行+run_wf_unit) / yolo_reflow.rs(Yolo 分类封装+失败回流) / usage.rs(用量累加) / tests.rs
 
   quality.rs       Quality-Check Agent + 单元 QC 提示词构建 + retry 预算
   debug.rs         Debug Agent(-debug 模式):trace 评估 + 四章节报告生成
@@ -288,7 +295,7 @@ agent/
   subagent_workflow.rs SubAgent 工作流编排(同上)
 
   permissions/     权限管控:mod.rs / dangerous.rs / readonly.rs / sensitive.rs
-  safety/          安全防护:mod.rs / url_safety.rs(SSRF 拦截) / prompt_injection.rs(提示注入检测) / credentials.rs(凭证脱敏) / target_anchor.rs(任务锚点,跨 5 层设防的唯一事实源) / refusal.rs(安全拒绝机械检测+同因归一化,第 149 轮) / web_evidence.rs(网页取证纪律)
+  safety/          工具层防护:mod.rs / url_safety.rs(SSRF 拦截) / prompt_injection.rs(提示注入告警,advisory 不阻断) / credentials.rs(凭证静态加密 AES-GCM) / target_anchor.rs(任务锚点,跨 5 层设防的唯一事实源) / web_evidence.rs(网页取证纪律)  —— 注意:safety/ 只做**工具层与数据层**防护,不含任何"该不该接任务"的政策性拦截(该判断归模型)
   sandbox_hook/    沙箱钩子:mod.rs(单文件,接外部 sandbox)
   skills/          Skill 系统(渐进式披露):mod.rs / registry.rs / render.rs / tools.rs / skill.rs / bundled.rs / bundled/{code-review,git-commit,test-runner}.md
 
@@ -442,7 +449,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/TUIMarkdown富文本渲染/` — TUI Markdown 渲染设计
 
 **Agent 设计**：
-- `docs/YoloAgent设计/` — 双 Agent 架构 / Yolo 入口层 / 任务三档分类 / 任务拆解 设计（01 / 02 / 03 信息收集型工具面 + ReAct 延迟强制）
+- `docs/YoloAgent设计/` — Yolo 入口层设计（01，**唯一现行文档**：三档分类 / ReAct 信息收集 / 目标锚点三态 / 提示词编写原则与「无程序级拒绝门」说明）
 - `docs/PlanAgent` / `docs/Main-Work工具扩展与ReAct改造/` — Main-Work 流程层 ReAct 化与工具扩展
 - `docs/SubAgentWork执行层ReAct与连续工作模式/` — 执行层 ReAct 强化 + 工具连续工作模式 + 无进展止损
 - `docs/Quality-Check Agent` / `docs/SessionContext Agent` / `docs/Debug模式与DebugAgent设计/` — 各角色设计

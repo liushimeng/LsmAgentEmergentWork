@@ -13,7 +13,7 @@
 //!
 //! 失败回流:Yolo 接收下游失败摘要后,可决定重试(修订 plan)或给出用户建议。
 //!
-//! 设计见 `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md`
+//! 设计见 `docs/YoloAgent设计/01-设计与解决方案.md`
 //! 与 `docs/多Agent架构重构/01-设计与解决方案.md` §3。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -138,16 +138,6 @@ pub struct TaskClassification {
     /// **不进 WorkFlow**;为空时编排器用机械模板生成问题。
     #[serde(default)]
     pub clarification_question: Option<String>,
-    /// 第 149 轮:安全拒绝 —— Yolo 判定任务**不应执行**(攻击/越权/违反目标服务
-    /// 条款/违法/明显危害)时填 true,并在 `direct_answer` 写拒绝原因与替代方向。
-    ///
-    /// 编排器据此走**拒绝终态门**(任何档位):直接把拒绝文本回给用户,不进
-    /// Plan / Main-Work / 执行层 —— 拒绝不是可重试失败,重试只会形成
-    /// 「解析失败 → 施压重出」的循环(2026-10-10 实测 528s / 8 次调用)。
-    /// 机械兜底:`direct_answer` 文首命中 `safety::refusal::detect_refusal`
-    /// 时同样触发(旧模型不填本字段)。
-    #[serde(default)]
-    pub refuses_task: bool,
 }
 
 impl TaskClassification {
@@ -435,7 +425,6 @@ fn degraded_classification(context: &[ChatMessage]) -> TaskClassification {
         target_status: None,
         clarification_question: None,
         // 第 149 轮:降级路径不做安全拒绝判定(解析已失败,拒绝语义无从谈起)。
-        refuses_task: false,
     }
 }
 
@@ -868,7 +857,6 @@ mod tests {
             debug_eligible: true,
             target_status: None,
             clarification_question: None,
-            refuses_task: false,
         };
         let prompt = build_work_prompt(&c);
         assert!(prompt.contains("验证"));
@@ -906,7 +894,6 @@ mod tests {
             debug_eligible: true,
             target_status: None,
             clarification_question: None,
-            refuses_task: false,
         };
         let prompt = build_work_prompt(&c);
         assert!(
@@ -940,7 +927,6 @@ mod tests {
             debug_eligible: true,
             target_status: None,
             clarification_question: None,
-            refuses_task: false,
         };
         let prompt = build_work_prompt(&c);
         assert!(

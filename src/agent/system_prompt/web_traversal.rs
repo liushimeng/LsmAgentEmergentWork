@@ -16,7 +16,7 @@ pub(crate) const WEB_TRAVERSAL_PROMPT_SECTION: &str = r##"
 
 ---
 
-【遍历覆盖纪律】(第 146 轮,工具层访问台账配套)
+【遍历覆盖纪律】
 
 22. **遍历/走查类任务(「遍历所有页面/所有控件/全面走查」)开工先对账覆盖台账**:
     `MCP_Web_Use(action=inspect, info="coverage")` 返回工具层自动记账的

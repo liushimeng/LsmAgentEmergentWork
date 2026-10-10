@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateDIBSection, CreateFontW, DeleteObject, GetSysColorBrush, HGDIOBJ, BITMAPINFO,
     BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DIB_RGB_COLORS,

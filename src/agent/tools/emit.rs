@@ -95,10 +95,6 @@ impl Tool for SubmitTaskClassification {
                 "clarification_question": {
                     "type": "string",
                     "description": "target_status=unresolved 时必填:要回给用户的具体澄清问题(中文,直接可答,列明缺哪一项)。其余情况留空"
-                },
-                "refuses_task": {
-                    "type": "boolean",
-                    "description": "安全拒绝(第 149 轮):三步分析判定任务不应执行(攻击/越权/违反目标服务条款/违法/明显危害)时填 true,并在 direct_answer 写明拒绝原因与可操作的替代方向 —— 这是唯一会展示给用户的字段。填 true 后编排器直接终态返回,不委派 Plan/Main-Work/执行层;decomposition_plan 留空数组。默认 false"
                 }
             },
             "required": ["task_level", "goal_summary", "intent"]
@@ -204,5 +200,22 @@ mod tests {
         assert!(out1.contains("submit_task_classification"));
         let out2 = SubmitQualityReport.execute(json!({})).await.unwrap();
         assert!(out2.contains("submit_quality_report"));
+    }
+
+    /// 去安全化:`submit_task_classification` 的 Schema 不得再暴露 `refuses_task`。
+    ///
+    /// 该字段是程序级「安全拒绝终态门」的 LLM 侧入口;字段整体移除后,任务该不该接
+    /// 完全由模型自行判断(结论写进 `direct_answer`),Schema 里也不应再诱导模型填。
+    #[test]
+    fn task_classification_schema_has_no_refuses_task() {
+        let schema = SubmitTaskClassification.parameters();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(
+            !props.contains_key("refuses_task"),
+            "Schema 不应再含 refuses_task"
+        );
+        // 澄清门字段仍在(目标保真纪律不受去安全化影响)
+        assert!(props.contains_key("target_status"));
+        assert!(props.contains_key("clarification_question"));
     }
 }

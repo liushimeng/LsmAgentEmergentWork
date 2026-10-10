@@ -19,7 +19,7 @@ pub(crate) const WEB_EXTRACT_PROMPT_SECTION: &str = r##"
 
 ---
 
-【网页内容提取纪律】(第 135 轮,与第 14 条 eval_js 用法、第 20 条取证纪律配套)
+【网页内容提取纪律】
 
 21. **抓列表 / 表格 / 批量数据,优先用 `inspect(info=extract)`,不要手写 eval_js。**
     `extract` 一次调用就把列表页压成结构化条目,并可在**页面内**完成关键词过滤、

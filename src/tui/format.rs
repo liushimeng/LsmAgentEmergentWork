@@ -1506,7 +1506,6 @@ mod format_task_result_for_context_tests {
                 debug_eligible: true,
                 target_status: None,
                 clarification_question: None,
-                refuses_task: false,
             },
             plan_doc: None,
             workflows,
@@ -1680,7 +1679,6 @@ mod format_task_result_cost_hint_tests_support {
                 debug_eligible: true,
                 target_status: None,
                 clarification_question: None,
-                refuses_task: false,
             },
             plan_doc: None,
             workflows: vec![WorkflowResult {

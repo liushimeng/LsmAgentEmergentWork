@@ -212,52 +212,6 @@ pub(super) fn is_placeholder_direct_answer(s: &str) -> bool {
         || t.eq_ignore_ascii_case("nil")
 }
 
-/// 第 149 轮:Yolo 分类的安全拒绝信号(拒绝门 A/B 共用判定)。
-///
-/// 双通道(任一命中即为拒绝):
-/// - **explicit**:LLM 显式填 `refuses_task=true`(主通道,语义最准);
-/// - **mechanical**:`direct_answer` 非空非占位,且文首命中
-///   `safety::refusal::detect_refusal` 机械检测(兜底,旧模型/网关不透传新字段)。
-///
-/// 返回 `(channel, marker)`:marker 为机械检测命中的具体拒绝短语(日志/审计用),
-/// explicit 通道为 `None`。非拒绝返回 `None`。
-pub(super) fn yolo_refusal_signal(
-    c: &TaskClassification,
-) -> Option<(&'static str, Option<&'static str>)> {
-    if c.refuses_task {
-        return Some(("explicit", None));
-    }
-    if let Some(answer) = c.direct_answer.as_ref() {
-        if !is_placeholder_direct_answer(answer) {
-            if let Some(marker) = crate::agent::safety::detect_refusal(answer) {
-                return Some(("mechanical", Some(marker)));
-            }
-        }
-    }
-    None
-}
-
-/// 第 149 轮:拒绝终态展示文本 —— direct_answer 优先(LLM 写的拒绝原因 +
-/// 替代方向);未填时从 `user_suggestion_if_fail` 兜底合成,保证用户拿到的
-/// 拒绝回复永远带「下一步能做什么」。
-pub(super) fn refusal_text_of(c: &TaskClassification) -> String {
-    if let Some(a) = c
-        .direct_answer
-        .as_ref()
-        .filter(|a| !is_placeholder_direct_answer(a))
-    {
-        return a.clone();
-    }
-    let mut text = String::from("任务被入口层拒绝执行(安全/合规原因)。");
-    if !c.user_suggestion_if_fail.is_empty() {
-        text.push_str("\n");
-        text.push_str(&c.user_suggestion_if_fail);
-    } else {
-        text.push_str("\n如需继续,请调整任务目标(改为合法、合规且不损害他人的表述)后重新发送。");
-    }
-    text
-}
-
 /// 当 Yolo 没有给出 user_suggestion 时,根据累计 usage 给出 actionable 兜底建议。
 ///
 /// 关联报告: 2026-09-09_05 E-003。当前仅按 output token(代表 LLM 实际产出)

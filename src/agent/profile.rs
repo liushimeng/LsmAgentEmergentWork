@@ -81,7 +81,7 @@ pub struct AgentProfile {
     /// `true`(仅 Yolo):探索轮(`iter + 1 < max_iterations`)不注入 `forced_tool`,
     /// 模型自由 ReAct —— 在多轮 Thought→Action→Observation 循环中自主调用信息收集工具;
     /// 迭代预算最后一轮强制 emit 收口(保底结构化输出),倒数第二轮追加收口预告 hint 平滑
-    /// 交卷。详见 `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md`。
+    /// 交卷。详见 `docs/YoloAgent设计/01-设计与解决方案.md`。
     pub defer_emit_force: bool,
 }
 

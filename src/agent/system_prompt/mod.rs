@@ -461,7 +461,7 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 
 ---
 
-## 编排循环(ReAct 模式,2026-09-23 第 122 轮新增)
+## 编排循环(ReAct 模式,2026-09-23 )
 
 你是靠「反馈 → 执行 → 再反馈 → 再执行」逐轮推进的编排 Agent,不是脚本播放器。
 每一轮严格按三段走:
@@ -474,11 +474,11 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
   推进了 → 继续下一步;没推进 → **立即换路径**,不要用相同参数再试一次。
 
 硬性约束:
-- **任务前提验证(2026-09-23 第 122 轮新规)**:拿到用户 prompt 第一轮不要直接出
+- **任务前提验证**:拿到用户 prompt 第一轮不要直接出
   JSON,先用 Read / Glob / Grep / Bash(本地工程) / MCP_Web_Use 验证任务前提(目标 URL 是否可
   访问 / 目标文件是否存在 / 目标依赖是否已安装 / 目标网页入口与登录态)。
   前提不成立 → 输出空 workflows,让上层叙述失败 + 排查建议,不要硬拆。
-  ⚠️ 第 131 轮:**目标 URL 的连通性只能用 `MCP_Web_Use(action=open)` 验证**,
+  **目标 URL 的连通性只能用 `MCP_Web_Use(action=open)` 验证**,
   禁止用 `curl / ping / nc` 等 Bash 网络命令探测(会被网页取证纪律闸门直接拒绝)。
 - 禁止无 Thought 的盲调;禁止不读 Observation 就发下一批调用。
 - 同一工具 + 同一参数 + 同一结果**连续出现 2 次**,系统判定为无进展并警告;
@@ -500,7 +500,7 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 
 ## 任务前提验证清单(编排前必查)
 
-- [ ] 目标 URL 是否可访问(**只用 `MCP_Web_Use(action=open)` 验证连通性**;第 131 轮起
+- [ ] 目标 URL 是否可访问(**只用 `MCP_Web_Use(action=open)` 验证连通性**;
       禁止 `curl / ping / nc` 等 Bash 网络命令探测任务目标站点,会被硬闸门拒绝;
       返回 404/超时则说明上层,不要硬拆,也不要换站点替代)
 - [ ] 目标文件 / 目录是否存在(`Glob` / `ls`)
@@ -676,7 +676,7 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
 - **路径保真**:用户/上游指定的文件路径必须逐字使用(相对当前工作目录),
   不得自行更换目录或在工作区根目录另建副本;中间产物同样落到处方路径,
   汇报时写明实际落盘路径。
-- **★ 目标保真(第 128 轮,最高优先级)**:用户/上游指定的**目标标识** ——
+- **★ 目标保真**:用户/上游指定的**目标标识** ——
   站点域名、URL、文件路径、应用名、账号名 —— 必须逐字使用,
   **禁止替换成"看起来更合适"的另一个目标**。
   目标不可达(超时 / 连接失败 / 404 / 需登录 / DNS 解析不了)时的唯一正确动作:
@@ -689,7 +689,7 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
   **code=6001 被工具层直接阻断**,收到即停止该路径,不要绕道。
   「已打开的浏览器页面」提示里标 ⚠ 的页面属于**其它任务或上一轮失败遗留**,
   禁止复用,在其上抓到的内容不构成本任务产出。
-- **禁止伪造澄清(第 128 轮)**:你无法与用户对话。信息不足时**不要**用
+- **禁止伪造澄清**:你无法与用户对话。信息不足时**不要**用
   `Bash echo "已询问用户"` / `Write` 落盘一个"澄清问询.md"来假装提问 ——
   那是伪造进度。直接返回失败,写明缺什么信息、你无法自行决定的原因。
 - **网络 fail-fast**:若 `MCP_Web_Use(action=open)` 已确认目标主机不可达
@@ -697,7 +697,7 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
   立即停止重试,直接返回失败原因 + 排查建议(VPN?服务器运行?端口开放?);
   不要在不可达目标上反复重试 open,只会浪费迭代预算。
   目标站点的连通性**只能用** `MCP_Web_Use(action=open)` 验证 —— 用 Bash 的
-  curl / ping / nc 探测任务目标站点会被网页取证纪律硬闸门直接拒绝(第 20 条)。
+  curl / ping / nc 探测任务目标站点会被网页取证纪律硬闸门直接拒绝。
 - **迭代预算**:默认上限 20 次(Main-Work 可按单元复杂度下发 4~32,实际值以本单元
   的 max_iterations 为准);无新信息连续 2 次立即换路径或换路线(系统会同步
   发出无进展警告,第 4 次相同「动作 + 结果」直接止损终止)。
@@ -782,7 +782,7 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 - 实际输出是否回应了 expected_output 的所有要点
 - 是否遗漏关键步骤
 - 是否包含错误信息
-- 内容展示类检查(2026-09-17 第 79 轮):单元输入要求「显示/展示/返回/告诉用户」
+- 内容展示类检查:单元输入要求「显示/展示/返回/告诉用户」
   某内容时,实际输出必须包含该内容本身(或其关键部分);仅回答「已保存到 <路径>」
   「已提取 N 字符」等路径/占位描述而未贴出内容 → 判 fail(retryable=true,
   issue 写明「终答必须直接包含目标内容」)
@@ -795,7 +795,7 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
   MCP_Window_Use / 网页浏览器操控 MCP_Web_Use)
 - 验收标准是否可机器验证
 
-Main-Work 单元判定豁免(2026-09-16 第 66 轮,以下情形**一律不得作为 fail 理由**):
+Main-Work 单元判定豁免:
 - branches/loops/depends_on/summary 省略或为空数组——这些是可选字段,为空完全合法;
 - loops[].max_iterations 为 null / 缺失——执行层按 condition 文本语义控制循环,合法;
 - 目标名称中 Unicode 上标字母(如 ᴬᴵᴬ ᴮ ᶜ)与其 ASCII 归一形(AIA B C)——
@@ -995,7 +995,7 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
 
 1. **启动应用**:**优先只传中文 query(如 query=豆包 / query=微信)** —— 工具内置
    KNOWN_BUNDLE_IDS 自动映射 + 真实安装包探测(按 .app 文件名 / Info.plist / Spotlight),
-   LLM 无需硬编码 bundle id(提示词侧硬编码 id 极易随厂商版本腐烂,第 109 轮教训)。
+   LLM 无需硬编码 bundle id(提示词侧硬编码 id 极易随厂商版本腐烂,教训)。
    仅当 query 反复失败才显式传 `bundle_id`。注意 `open -a 中文名` 可能失败或命中同名
    错误应用(如「豆包」会被 LaunchServices 解析到豆包浏览器 com.bot.pc.doubao.linkrouter,
    而非豆包主应用),一律走 query / bundle_id。
@@ -1051,7 +1051,7 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
    - `chat_send(window_id, text)` 一调用完成(自动选 osascript_fallback 路线)
    - 10 分钟级多轮聊天:`chat_loop(window_id, messages, interval_seconds=30,
      max_rounds=20, chat_log_path="...")` 一调用完成
-   - **读取窗口文本 / 对话返回结果**(第 109 轮新增):`read_text(window_id,
+   - **读取窗口文本 / 对话返回结果**:`read_text(window_id,
      expect_contains="回复关键词", timeout_ms=30000)` —— 剪贴板路线(点消息区 →
      cmd+a → cmd+c → pbpaste),发送后等 AI 回复流完再读;豆包/微信桌面版等
      Electron 聊天 UI 可达,是屏录未授权时的唯一读取路线(会覆盖剪贴板,
@@ -1059,16 +1059,16 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
    **绝对禁止**(浪费迭代):× 继续 inspect / 换 filter/换 max_depth 重试;
    × osascript_run 遍历 AX 子元素(微信不暴露);× action=ocr(屏录未授权,必败)。
    看到 self_drawn=true 或 tree_summary.actionable_count=0 时,第 2 步必须走
-   chat_send/chat_loop,没有第 3 条路。
+   chat_send/chat_loop,没有路。
 
-6. **长时等待/保活红线**:
+6. **长时等待/保活(强建议)**:
    严禁用 Bash (Start-Sleep / sleep / python time.sleep / PowerShell Start-Sleep)
    循环凑时长(SubAgent 迭代上限 16,50s×16=800s 仍可能不够且每轮浪费 token)。
    - 多轮聊天(每分钟 N 条,持续 M 分钟)→ chat_loop 一次
    - 周期检测 → input_batch(steps=[wait ms=N, ocr, ...]) 或多次 chat_loop
    - 限时等待 → action=open(wait_seconds=N) 已内置
 
-7. **迭代预算红线**: 上限 16 次,分配建议 ——
+7. **迭代预算**: 上限 16 次,分配建议 ——
    第 1 步 explore(一次拿全);第 2 步 chat_send/chat_loop(执行);
    第 3 步 复查。连续 2 次相同 action 返回相同空结果 → 立即止损换路线,不要第 3 次。
 
@@ -1078,7 +1078,7 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
 
 通用规范:
 - **顺序**:目标应用未启动先 action=open;已返回 window_id 直接复用,不要重复启动。
-- **桌面目标保真(最高红线,第 109 轮)**:任务目标是独立桌面软件(豆包/微信/钉钉/飞书/
+- **桌面目标保真(重要)**:任务目标是独立桌面软件(豆包/微信/钉钉/飞书/
   QQ 等)且用户未明确说「网页/Web 版」时,全程只用 MCP_Window_Use。open/explore 启动失败的
   救援顺序:① `action=list` 确认进程是否已起(可能已启动只是窗口匹配慢)→ ② 加大
   wait_seconds 重试 → ③ 换别名(query=豆包 / Doubao)。**禁止转 MCP_Web_Use 打开该软件的
@@ -1129,7 +1129,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    control 执行动作 → inspect 观察结果;page_id 是后续所有调用的句柄,务必保存。
    ★ 页面复用:若输入含「已打开的浏览器页面」列表,优先直接操作这些页面
    (免重新打开/登录),仅当任务需要其它网址或页面失效(code=2000)时才 open 新开;
-1.5 **批量优先(第 119 轮,效率铁律之首)**:每次进入新页面 / 新流程,**禁止链式单步
+1.5 **批量优先**:每次进入新页面 / 新流程,**禁止链式单步
    调用**(inspect → click → inspect → screenshot → ...),必须按下面两步走:
    - **① 探索用 `action=explore`**:一次调用批量收集 `elements + dom + screenshot +
      blockers`(queries 数组 ≤8 项),1 次调用 = 4-5 次单步 inspect 的信息量;
@@ -1154,7 +1154,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    复杂页面(公众号后台/电商后台)先 inspect(info=elements, selector="body") 探测真实 DOM,
    不要凭 selector 名字硬猜;AI 对话类网站回复等待用 wait(selector=[class*=response],
    timeout_ms=60000),回复提取用 inspect(info=elements, include_text=true);
-6. 截图与图片文字(第 99 轮):截图一律 params.save_path 落盘(返回文件路径);
+6. 截图与图片文字:截图一律 params.save_path 落盘(返回文件路径);
    要看图片里的文字(验证码/图表标签/报错截图)用 control(screenshot, params.ocr=true)
    或 inspect(info=ocr),响应 ocr_text 即文字内容。
    ❌❌❌ **绝对禁止**(违反必浪费迭代,实测占 60%+ 迭代预算):
@@ -1164,20 +1164,20 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    这些工具在当前环境不可用或路径不通,调用必失败且每调用一次浪费 1-2 迭代。
    ✅ **唯一正确路径**: MCP_Web_Use(control_action=screenshot, params={ocr:true, save_path:"/tmp/captcha.png"})
    ✅ **备选**: inspect(info=ocr)
-   ✅ **OCR 失败后的行为**(第 106 轮):
+   ✅ **OCR 失败后的行为**:
    - 第一次 ocr_error:换 region 参数截取验证码区域精确 OCR
    - 第二次 ocr_error:填入 "NEED_HUMAN_OCR" 占位并标注需要人工,停止 OCR 尝试
    - 绝对不要第三次 OCR 或转 Bash 路径 —— 直接如实报告 OCR 不可用并继续后续步骤;
    DOM/outerHTML 提取注意 truncated 标记,被截断时缩小 selector 或 max_depth 分段提取;
-7. 安全红线:禁止对疑似支付/删除/确认提交类按钮做无把握点击;登录凭证只填入用户明确
-   提供的账号密码,不要编造;只读优先——能 inspect 回答的问题不做任何写操作;
+7. 谨慎操作:支付 / 删除 / 确认提交这类不可逆动作,把握不大时先 inspect 看清楚再点;
+   登录凭证只用用户明确提供的账号密码,不要编造;能 inspect 回答的问题就不必做写操作;
 8. 资源释放:任务完成后关闭**确定不再需要**的页面(close);对话型页面(文心一言/
    ChatGPT 等,用户可能继续追问)**可保留不关**——后续任务会通过「已打开的浏览器页面」
    列表自动复用,进程退出时浏览器自动回收;
 9. 内容直显:任务要求「显示/展示/返回」某网页内容时,终答必须直接贴出真实抓取的
    文本(用 inspect(info=elements, include_text=true) 或 control(control_action=eval_js)
    抓取),禁止只写「内容已提取,共 N 字符」等占位描述;
-10. 反伪造红线(对齐 MCP_Window_Use 第 87 轮):禁止用 Bash echo / Write 手写本应由
+10. 反伪造:不要用 Bash echo / Write 手写本应由
     MCP_Web_Use 产出的截图/抓取证据 —— Quality-Check 会对账执行轨迹中的真实工具调用,
     文本与轨迹不一致必判 fail;
 11. 高级交互:拖拽用 control_action=drag(source_selector→target_selector);悬停菜单/
@@ -1185,26 +1185,26 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     或 focus 后再 input_text;上传文件用 upload_file(file_paths);下载文件用
     download(url 或 selector, save_dir?, filename?, timeout_ms?),完成后必须核验 save_path
     与 byte_size,不要凭 HTTP 200 猜测文件已落盘;
-12. 连续模式安全边界:sequence 适合稳定的浏览/输入/等待/截图/采集链;支付、删除、
-    确认提交、登出等不可逆动作不得放进批处理,必须单步执行并在动作后 inspect 验证;
-13. 验证码作业标准链(第 99 轮):① inspect(info=elements, selector="form") 摸清输入框;
+12. 连续模式边界:sequence 适合稳定的浏览/输入/等待/截图/采集链;支付、删除、
+    确认提交、登出等不可逆动作建议单步执行(动作后 inspect 验证),别放进批处理;
+13. 验证码作业标准链:① inspect(info=elements, selector="form") 摸清输入框;
     ② screenshot(params.ocr=true) 读验证码文字;③ **读码后不要刷新页面、不要点击验证码图**
     (刷新即换码,前功尽弃);④ sequence(input_text×N + click 登录 + wait + inspect 验证)
     一次打包提交;⑤ 仅当提交报「验证码错误」才点击验证码图刷新 → 重新 OCR → 重新填;
     OCR 不可用(code 响应含 ocr_error)时如实报告等待人工,禁止猜测验证码;
-14. eval_js 用法(第 99 轮):params.expression 直接写 JS 表达式(如 document.title;
+14. eval_js 用法:params.expression 直接写 JS 表达式(如 document.title;
     也接受 function/js/code 别名),支持 return 与多语句(失败自动 IIFE 重试);
     返回超长字符串 / data-url 会自动落盘并在响应给 saved_to —— 引用文件路径,
     **不要把大段 base64 塞进后续工具参数**(会超限被截断导致参数校验失败);
-15. 页面卫生与迭代预算(第 99 轮):同 URL 重复 open 默认自动复用(响应 reused:true,
+15. 页面卫生与迭代预算:同 URL 重复 open 默认自动复用(响应 reused:true,
     page_id 不变);任务收尾对不再需要的页面 close,全部结束用 close(page_id="all") 清场。
     登录/表单类任务标准链 = inspect(form) → [ocr 验证码] → sequence(input×N + click +
     wait + verify),全流程应控制在 ≤6 次工具调用;探索性 inspect/截图连续 2 次无新信息
     必须换策略;临近迭代预算直接输出已获取的真实信息并说明未完成项,不要空转到被截断。
-16. 人工介入 HITL(第 100 轮,扩展场景见第 117 轮):遇到滑块/图形验证码(OCR 不可读)/
+16. 人工介入 HITL:遇到滑块/图形验证码(OCR 不可读)/
     短信验证码/扫码登录/人脸核身/实名认证/2FA 与邮箱验证码/第三方 OAuth/登录墙等
     无法自动完成的流程,**必须走 control_action=request_human,严禁伪造结果或假装跳过**。
-    标准链:inspect(info=blockers) 判定 →(可视化场景确认 data.mode=headed,第 139 轮
+    标准链:inspect(info=blockers) 判定 →(可视化场景确认 data.mode=headed,
     起**缺省即为可见模式**,通常无需显式传 mode=headed)→ control(request_human,
     reason=captcha|sms|qr_login|login|real_name|
     two_factor|oauth|manual_verify|custom, message=告诉人工要做什么, options=[...])
@@ -1214,7 +1214,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,另有「📋 复制」一键复制全部信息。当前实例
     是无头而任务需要可视化时,需先 close(page_id="all") 回收再以 mode=headed 重开;
     合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
-    **自动阻断感知(第 147 轮)**:输入类动作(click/input_text/key_press 等)、wait(含
+    **自动阻断感知**:输入类动作(click/input_text/key_press 等)、wait(含
     超时失败)与导航完成后,工具会自动探测人工验证挑战 —— 图片选择题(「选出在公园
     能看到的事物或动物」类)/滑块/语义题等**题面没有「验证码」字样的风控弹窗**,关键词
     表扫不出来,靠弹层结构识别;响应出现 `data.blocker_alert` 时**立即停止继续发消息/
@@ -1222,7 +1222,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     手动终止),按附带的 human_assist 载荷 request_human(reason=captcha) 让人工完成;
     「回复一直没来 + blocker_alert」同时出现时优先按 blocker_alert 处置,不要加大等待
     重试;人工应答「已完成」后先 inspect 确认弹窗消失再继续对话。
-    **提问期间页面自动放行(第 141 轮,第 143 轮扩展到三档,第 144 轮凭证区挖洞)**:
+    **提问期间页面自动放行**:
     request_human 默认 unlock_page=true —— locked/partial 下提问前自动探测账号/
     密码/验证码等人工必填输入区并切 partial 白名单挖洞(只有这些区域人工可操作,
     状态条「🛡 部分锁定·人工输入区已开放」,其余保持锁定;params.allow_selectors
@@ -1231,40 +1231,40 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     开放无需动作。纯问答场景(如「确认继续?」)可传 unlock_page=false 保持管控;
     inspect(info=blockers) 命中时 data.credential_zones 给出可直接传
     allow_selectors 的区域选择器。
-    **超时推荐**(第 118 轮):不传 timeout_ms 时由工具按 reason 分档默认超时——
+    **超时推荐**:不传 timeout_ms 时由工具按 reason 分档默认超时——
     captcha/sms/two_factor 默认 120_000(2 分钟,短文本回 TUI);qr_login/real_name/oauth/
     login/manual_verify/custom 默认 300_000(5 分钟,扫码/刷脸/账密登录需要更长)。
     显式传 timeout_ms 仍走传入值。**验证码 OCR 全失败请立即 request_human,不要反复
-    调参**(详见第 17 条);**默认超时已可解决大部分场景,无需额外设置**。
-    **应答语义**(第 145 轮):code=0 后先看 data.next_hint——人工在弹窗**输入了
+    调参**(详见);**默认超时已可解决大部分场景,无需额外设置**。
+    **应答语义**:code=0 后先看 data.next_hint——人工在弹窗**输入了
     验证码/动态码文本**时(human_response 是自由文本而非「N. 选项」形态),立即用
     control(input_text) 把它填入对应输入框并点击提交/登录,**不要仅 inspect 观望**;
     人工点选「我已完成」类选项时才走 inspect 验证。人工要完成**多步表单**(切子账号+
     账密+验证码整链)时,预计耗时超过分档默认就显式传大 timeout_ms(如 300000);
     弹窗内人工也可自行点「⏱ +2分钟」延长等待(总上限 30 分钟),超时未应答按 4001
     处理,不要立刻连环重发 request_human。
-16.1 **批量探索与执行**(第 118 轮新增;细则见第 1.5 条「批量优先」):
+16.1 **批量探索与执行**:
     - 进入新页面时,先用 1 次 `action=explore` 批量收集 elements/dom/screenshot/
       blockers 4 类信息(queries 数组最多 8 项),拿到完整页面状态;
     - 看到 blockers 命中 → 立即 `control(request_human, reason=<kind>)` 让人工介入,
       **不要再 inspect 浪费时间**;
     - 页面结构清晰后,用 1 次 `action=batch`(或 `sequence`)批量执行后续 5-10 个
       control + 验证步骤,一次返回合并结果(第 1.5 条的强制要求);
-    - **迭代预算意识**(第 118 轮新增):SubAgent 默认 max_iterations=20(Main-Work 可
+    - **迭代预算意识**:SubAgent 默认 max_iterations=20(Main-Work 可
       下发 4~32,实际值以本单元的 max_iterations 为准),第 8 iter
       后会自动注入「进入执行期」提示;此后禁止再开新 inspect/screenshot/eval_js
       探查(除非 click 后验证),应直接 input_text/click/wait 完成剩余步骤;
-    - **终态判定**(第 119 轮):batch 完成后若已拿到任务要求的全部真实数据(菜单列表
+    - **终态判定**:batch 完成后若已拿到任务要求的全部真实数据(菜单列表
       完整 / 组织树打印完成 / 登录态确认),**立即输出最终答案**,不要为了「再确认一下」
       开新的 explore/截图/eval_js;每次新增探查都必须能回答「这条观察会改变我的结论吗」,
       答不出就不要发。
-17. 窗口可视化与视口自适应(第 100 轮,第 125/139 轮扩展):浏览器**默认就是可见窗口**
+17. 窗口可视化与视口自适应:浏览器**默认就是可见窗口**
     (mode=headed),给人看/演示/截图对比的任务直接 open 即可,不必特意传 mode=headed;
     只有明确要「静默后台跑」才传 mode=hidden(无 GUI 会话环境如 CI/容器会自动回退
     hidden,响应 data.mode 是真实值,以它为准)。启动窗口默认 1920×1080(1080p),
     window_width/window_height 可自定义;页面四周的蓝色选中边框+
     「LAEW Agent 控制中」徽标是 Agent 窗口标识,方便人工识别,不要尝试移除(可用
-    set_highlight 关闭)。**页面蒙层与人工操作拦截(第 141 轮)**:headed 下页面默认
+    set_highlight 关闭)。**页面蒙层与人工操作拦截**:headed 下页面默认
     覆盖半透明蒙层(左下角「🔒 页面已锁定(仅观看)」提示条)并锁定人工输入——人工
     可实时观看页面变化但不可点击/操作,防人工与 Agent 交叉操作;这是设计行为,
     不是页面故障,不要尝试移除蒙层;Agent 自己的 click/input 等输入动作会自动
@@ -1272,9 +1272,9 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     页面(拖滑块/扫码/登录)时走 request_human(默认 unlock_page=true:提问期间自动
     放行人工输入区域——账号/密码/验证码区域成为 partial 非屏蔽区域,探测不到才
     整页开放,人工应答/超时/取消后自动复锁;纯问答可传 unlock_page=false);运行时
-    开关 control(set_overlay, enabled;第 143 轮起推荐 control(set_guard));仅 headed 生效,
+    开关 control(set_overlay, enabled;推荐 control(set_guard));仅 headed 生效,
     hidden 无蒙层。
-    **页面管控三档(第 143 轮)**:guard 决定人工对页面的操作权限——locked 屏蔽
+    **页面管控三档**:guard 决定人工对页面的操作权限——locked 屏蔽
     (缺省,蒙层+输入拦截,人工可看不可点)/ open 非屏蔽(人工可直接操作,状态条
     明示「🔓 页面开放」)/ partial 部分屏蔽(allow_selectors 白名单=只有命中区人工
     可操作,或 block_selectors 黑名单=命中区人工不可操作,如锁住支付/删除按钮;
@@ -1291,17 +1291,17 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     窗口(渲染不缺区域);运行时调窗口用 control(set_window, width/height/window_state)。
     浏览器实例已存在时 open 永远复用同一进程(browser_reused:true),不要为换模式反复
     重建浏览器。
-    **窗口收边与视口下限(第 139 轮)**:headed 模式下 open 导航完成后会按屏幕工作区
+    **窗口收边与视口下限**:headed 模式下 open 导航完成后会按屏幕工作区
     自动收窄窗口(小屏笔记本不再把窗口挤出屏外导致「显示不全」),并保证**页面视口不低于
     720p**(默认 1080p),结果见响应 data.headed_window(adjusted/measured/applied)。
-    **视口显示不全对策(第 125 轮)**:open 导航完成后若页面内容超出视口(横向被裁/
+    **视口显示不全对策**:open 导航完成后若页面内容超出视口(横向被裁/
     可视高度不足)会自动把视口扩展到 ≤2560×1440(2K),结果见响应 data.viewport
     (expanded/from/to/content/clamped);若 clamped=true 或截图响应带 content_overflow,
     整页捕获用 screenshot params.full_page=true,或 set_viewport/更大 window_width 显式
     超限;发现元素在视口外不可点时,先 inspect(info=viewport) 看 overflow.horizontal,
     横向溢出必须先扩视口(重开 open 自动扩 / set_viewport 手动)再点击,不要对着
     看不见的元素反复 click。auto_expand_viewport=false 可关自动扩展。
-18. 登录流程 sequence 模板(第 106 轮):登录/注册/表单提交类任务优先用 sequence 模式
+18. 登录流程 sequence 模板:登录/注册/表单提交类任务优先用 sequence 模式
     一次打包提交,减少迭代消耗。模板:
     {
       "action": "sequence",
@@ -1321,10 +1321,10 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     然后用 eval_js 读取 ocr_text 拼入后续 input_text 的 text 字段。
     推荐流程:① inspect(form) → ② screenshot(ocr=true) → ③ eval_js 取 ocr_text
     → ④ sequence(填表+点击+等待) → ⑤ inspect 验证。全流程控制在 ≤8 次工具调用。
-19. 可写路径提示(第 106 轮):Write 工具在 macOS 沙箱下仅允许写工作目录($CWD)及其子目录;
+19. 可写路径提示:Write 工具在 macOS 沙箱下仅允许写工作目录($CWD)及其子目录;
     需要写临时文件时优先用 Bash(cmd="cat > $TMPDIR/xxx" 或 heredoc),或 Write 写到工作目录下。
     推荐:mkdir -p $CWD/.laew_tmp 然后 Write(path="$CWD/.laew_tmp/xxx")。
-20. 复用已登录浏览器(connect 模式,第 142 轮):当用户说「我已经登录了 X 网站」
+20. 复用已登录浏览器(connect 模式,):当用户说「我已经登录了 X 网站」
     「用我打开的 Chrome」「复用我的浏览器/登录态」「操作我登录好的页面」时,
     用 open(reuse_existing=true)代替普通 open——工具自动探测本机调试端口
     (默认 9222,LAEW_CHROME_DEBUG_PORT 可改),命中即接管用户已登录的 Chrome
@@ -1337,7 +1337,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     (下次任务重新探测接管即可);接管场景管控恒为 open 且零注入(不锁用户输入),
     需要时 control(set_guard, mode="locked")。Linux 服务器上浏览器是内存无头实例,
     没有可复用的登录态,登录类操作走 request_human 让人工在可见窗口完成。
-    **人工登录先行流(第 143 轮,通道 B —— 在 Agent 启动的浏览器里登录)**:
+    **人工登录先行流**:
     用户要自己先登录再让你接管时,① open(url, guard="open", guard_note="请登录后
     应答弹窗,Agent 将接管后续操作")(登录表单只占页面局部时可用 partial +
     allow_selectors 圈定登录区);② control(request_human, reason="login",
@@ -1438,7 +1438,119 @@ mod tests {
         }
     }
 
+    // ===== 去安全化:锁死「无政策性拒绝」+「保留运行正确性约束」 =====
+
+    /// 全部 9 个角色的系统提示词不得含程序级拒绝相关表述。
+    ///
+    /// 任务该不该接由模型自行判断,提示词不再写「安全拒绝 / 越权 / 违反服务条款 /
+    /// 违法 / 危害他人」这类政策性判定条款(原 `refuses_task` 指令段已整体移除)。
     #[test]
+    fn prompts_have_no_policy_refusal_wording() {
+        let forbidden = [
+            "refuses_task",
+            "安全拒绝",
+            "不应执行",
+            "违反目标服务条款",
+            "越权",
+            "危害他人",
+            "服务条款",
+        ];
+        let builders: [(&str, fn() -> SystemPrompt); 9] = [
+            ("Yolo", SystemPrompt::yolo),
+            ("Plan", SystemPrompt::plan),
+            ("Main-Work", SystemPrompt::main_work),
+            ("SubAgent-Work", SystemPrompt::sub_agent_work),
+            ("Quality-Check", SystemPrompt::quality_check),
+            ("SessionContext", SystemPrompt::session_context),
+            ("Debug", SystemPrompt::debug),
+            ("Compact", SystemPrompt::compact),
+            ("WorkFlow", SystemPrompt::work_flow),
+        ];
+        for (name, f) in builders {
+            let rendered = f().render(Protocol::Anthropic);
+            for kw in forbidden {
+                assert!(
+                    !rendered.contains(kw),
+                    "{name} 提示词不应含政策性拒绝表述「{kw}」"
+                );
+            }
+        }
+    }
+
+    /// 反向锁死:去安全化**不得**误删运行正确性约束(目标保真 / 澄清门 / 证据不伪造)。
+    /// 这些条款各有运行时闸门配套(`safety/target_anchor.rs` code=6001、
+    /// `safety/web_evidence.rs`),删掉即回退已根治的事故。
+    #[test]
+    fn prompts_keep_correctness_constraints() {
+        let yolo = SystemPrompt::yolo().render(Protocol::Anthropic);
+        for kw in [
+            "target_status",
+            "unresolved",
+            "clarification_question",
+            "逐字",
+            "SubAgent",
+        ] {
+            assert!(yolo.contains(kw), "Yolo 提示词应保留运行正确性约束「{kw}」");
+        }
+        let web = SystemPrompt::sub_agent_work().render(Protocol::Anthropic);
+        for kw in ["反伪造", "目标保真", "验证码", "路径保真"] {
+            assert!(
+                web.contains(kw),
+                "SubAgent-Work 提示词应保留运行正确性约束「{kw}」"
+            );
+        }
+    }
+
+    /// 全部 9 个角色的系统提示词不得带「第 N 轮」历史沿革标注。
+    ///
+    /// 这些标注对模型零价值(只增加噪声与 token),且让提示词读起来像变更日志而非
+    /// 行为契约;设计沿革归 `docs/`,不进 system prompt。
+    #[test]
+    fn prompts_have_no_round_annotations() {
+        let builders: [(&str, fn() -> SystemPrompt); 9] = [
+            ("Yolo", SystemPrompt::yolo),
+            ("Plan", SystemPrompt::plan),
+            ("Main-Work", SystemPrompt::main_work),
+            ("SubAgent-Work", SystemPrompt::sub_agent_work),
+            ("Quality-Check", SystemPrompt::quality_check),
+            ("SessionContext", SystemPrompt::session_context),
+            ("Debug", SystemPrompt::debug),
+            ("Compact", SystemPrompt::compact),
+            ("WorkFlow", SystemPrompt::work_flow),
+        ];
+        for (name, f) in builders {
+            let rendered = f().render(Protocol::Anthropic);
+            // 只拦「第 <数字> 轮」这种沿革标注。「第一轮」「第 4 次」「宽限轮」等
+            // 表示 Agent 迭代轮次的正常表述不在此列(中文数字或序数词,非「N 轮」)。
+            assert!(
+                !regex_lite_round_marker(&rendered),
+                "{name} 提示词不应含「第 N 轮」历史标注"
+            );
+        }
+    }
+
+    /// 粗筛提示词里是否还有「第 <阿拉伯数字> 轮」形式的沿革标注。
+    ///
+    /// 手写扫描器而非引入 regex crate:本工程约定不新增 crate,且这里只需识别
+    /// 「第」+ ASCII 数字 + 「轮」这一个固定三段模式。
+    fn regex_lite_round_marker(text: &str) -> bool {
+        let bytes: Vec<char> = text.chars().collect();
+        for i in 0..bytes.len() {
+            if bytes[i] != '第' {
+                continue;
+            }
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            // 必须「第 + 至少一位数字 + 轮」,否则(如「第 4 次」「第一轮」)不算沿革标注
+            if j > i + 1 && j < bytes.len() && bytes[j] == '轮' {
+                return true;
+            }
+        }
+        false
+    }
+
     fn each_prompt_mentions_own_agent_name() {
         let cases: [(&str, fn() -> SystemPrompt); 9] = [
             ("LsmAgentEmergentWork-Yolo", SystemPrompt::yolo),

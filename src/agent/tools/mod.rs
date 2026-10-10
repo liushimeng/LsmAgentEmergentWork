@@ -330,7 +330,7 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
 /// - **只读子 Agent**(第 114 轮:`ReadOnlyChildren`,只读侦察型)。
 ///
 /// Yolo 仍不持 `Write / Edit / TodoWrite`(入口层不落盘、不管任务清单)。
-/// 详见 `docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md`。
+/// 详见 `docs/YoloAgent设计/01-设计与解决方案.md`。
 ///
 /// 2026-09-23 Round 124:Yolo Bash 维持 `BashTool::new()`(ReadWrite) ——
 /// Yolo 入口层仅靠提示词约束"只读侦察",本轮不加代码层强制(避免 Yolo 工作流

@@ -193,29 +193,33 @@ pub(super) struct QualityFailure {
     /// (实测 v2 轮重跑了 v1 已通过的登录与建档单元);本字段随失败上抛,由
     /// pipeline 跨轮累计后注入 Plan/Main-Work 提示词,实现「只规划剩余部分」。
     pub(super) completed_digest: String,
-    /// 第 149 轮:下游 Agent(当前为 Plan)对任务本身的**安全拒绝** ——
-    /// 输出是拒绝说明而非可执行方案。这不是失败:不可重试、不回流 Yolo,
-    /// 由 pipeline 以 `OrchestrationOutcome::DirectAnswer` 终态把 `refusal_text`
-    /// (拒绝原因 + 替代方向)直接回给用户。
-    /// 背景(2026-10-10 实测):拒绝式 Plan 输出进解析门报「未解析出任何
-    /// WorkFlow」→ 盲重试 3 轮 528s,构成对模型「换格式补齐被拒内容」的施压。
-    pub(super) refused: bool,
-    /// `refused=true` 时的拒绝说明全文(含替代方向),终态直达用户。
-    pub(super) refusal_text: String,
 }
 
-/// 第 149 轮:同因熔断器 —— 连续 N 轮失败原因完全相同即熔断,提前终止重试。
+/// 同因熔断器 —— 连续 N 轮失败原因完全相同即熔断,提前终止重试。
 ///
 /// 背景(2026-10-10 实测):Plan 解析失败三轮完全同因(「未解析出任何
 /// WorkFlow」),retry_hint 已注入仍原样失败,每轮照烧 Plan+QC ~107s。
 /// 同因第 3 次重试的先验成功率极低,熔断把浪费上界从 max_retry_per_level
-/// 收紧到 2 轮。归一化键 = `safety::refusal::normalize_failure_reason`
-/// (trim → 首行 → 截 120 字符)。
+/// 收紧到 2 轮。
+///
+/// 这也是删除程序级「安全拒绝终态门」后**唯一**的通用空转止动器:模型自行
+/// 拒绝任务时,其 Plan 输出同样解析不出 WorkFlow,归一化后三轮逐字相同,
+/// 第 2 次即熔断收口(不再由编排器代替模型做价值判断)。
 pub(super) struct SameCauseBreaker {
     last_norm: Option<String>,
     streak: usize,
     /// 连续相同原因达到该次数即熔断(默认 2:首次失败 + 一次修正机会)。
     threshold: usize,
+}
+
+/// 归一化失败原因(同因熔断的比对键)。
+///
+/// 口径:trim → 取首行(多行 reason 只比第一行)→ 截 120 字符。
+/// 「解析 Plan 失败: 方案生成失败: Plan 文档未解析出任何 WorkFlow」这类
+/// 稳定重复的 reason 三轮完全一致;而带时间戳/UUID 的 reason 首行也稳定。
+fn normalize_failure_reason(reason: &str) -> String {
+    let first_line = reason.trim().lines().next().unwrap_or("").trim();
+    first_line.chars().take(120).collect()
 }
 
 impl SameCauseBreaker {
@@ -229,7 +233,7 @@ impl SameCauseBreaker {
 
     /// 记录一次失败原因;返回 `true` 表示熔断触发(应停止重试)。
     pub(super) fn record(&mut self, reason: &str) -> bool {
-        let norm = crate::agent::safety::normalize_failure_reason(reason);
+        let norm = normalize_failure_reason(reason);
         if norm.is_empty() {
             // 空原因不参与同因判定(无法归因的失败交给 max_retry 兜底)
             return false;
@@ -279,8 +283,6 @@ impl QualityFailure {
             trace: None,
             usage: Usage::default(),
             completed_digest: String::new(),
-            refused: false,
-            refusal_text: String::new(),
         }
     }
 }

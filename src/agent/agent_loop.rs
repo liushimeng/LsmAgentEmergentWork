@@ -116,7 +116,7 @@ impl Agent {
         // Yolo(defer_emit_force=true):探索轮(非最后一轮)不强制 —— ReAct 循环需要
         //   模型自由调用信息收集工具,强制指名 emit 会把多轮探索压成 1 轮直答;
         //   仅最后一轮强制 emit 收口,保证迭代预算耗尽前必得结构化结果。
-        // 收口保底细节见 §3.3 of docs/YoloAgent设计/03-Yolo工具集扩展与ReAct信息收集设计.md。
+        // 收口保底细节见 §3.3 of docs/YoloAgent设计/01-设计与解决方案.md。
         // 实际强制注入在循环每轮开始时按 iter 决策(meta 在此 pre-loop 阶段不预置,
         // 避免循环外只设一次与最后一轮策略分歧)。`LAEW_FORCED_TOOLS=off` 可全局关闭
         // (仅关 wire 注入,循环短路逻辑保留)。

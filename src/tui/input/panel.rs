@@ -88,6 +88,8 @@ impl Layout {
 /// (连查三次一致),拿它定位会把自适应面板顶到第 2 行,反把刚打印的启动横幅抹掉。
 /// 这里自己发 DSR、用 `libc::poll` 限时读 stdin:最多等 ~300ms,失败即回退吸底,
 /// 绝不挂起 TUI;解析只认 `ESC [ <row> ; <col> R` 这一段,误读到的杂字节会被忽略。
+/// unix 实现:用 `libc::poll` + `libc::read` 直读 fd 0(见函数文档)。
+#[cfg(unix)]
 pub(super) fn query_cursor_row() -> Option<u16> {
     // ★ 先把 stdin 里**已存在的陈旧字节**排空再问:实测本机 tmux 下首次查询会读到一条
     //   来路不明的 `[1;1R`(不是本次 DSR 的回包),据此定位会把面板顶到第 2 行,
@@ -156,6 +158,15 @@ pub(super) fn query_cursor_row() -> Option<u16> {
             }
         }
     }
+    None
+}
+
+/// 非 unix 平台无 `libc::poll`/`libc::read` 这条限时读路径,返回 `None`。
+///
+/// 调用方(`input/mod.rs` 的 `Layout::panel_top_for`)对 `None` 的处理是
+/// **回退吸底**,与「查询失败/超时」同款 —— 这是既有安全默认,不会猜错位置。
+#[cfg(not(unix))]
+pub(super) fn query_cursor_row() -> Option<u16> {
     None
 }
 

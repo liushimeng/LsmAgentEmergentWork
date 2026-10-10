@@ -17,7 +17,7 @@ pub(crate) const WEB_EVIDENCE_PROMPT_SECTION: &str = r##"
 
 ---
 
-【网页取证纪律】(第 131 轮,与第 10 条反伪造红线互补)
+【网页取证纪律】
 
 20. **任务目标站点的一切证据只能来自 MCP_Web_Use**。凡涉及「网页/浏览器操作」的
     任务,以下内容**禁止**用 Bash 获取,必须走 MCP_Web_Use:
