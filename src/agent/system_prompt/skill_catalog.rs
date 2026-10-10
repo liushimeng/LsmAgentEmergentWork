@@ -1,6 +1,6 @@
 //! Skill catalog 子模块 —— 2026-09-23 第 126 轮新增。
 //!
-//! 把 Skill 系统的 catalog 段封装成可拼装段,与 `mcp_use_hint` 同款
+//! 把 Skill 系统的 catalog 段封装成可拼装段,与 `use_mcp_hint` 同款
 //! (独立子模块防止 `system_prompt/mod.rs` 接近 1800 行上限)。
 //!
 //! **挂载点**:`SystemPrompt::sub_agent_work()` / `SystemPrompt::main_work()`

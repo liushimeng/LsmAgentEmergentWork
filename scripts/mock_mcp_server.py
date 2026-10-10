@@ -8,12 +8,23 @@
 - resources/list / resources/read(mock://greeting 资源)
 
 协议约束:每条 JSON-RPC 消息一行(NDJSON),消息内不含裸换行 —— 与
-`src/mcp/transport.rs::StdioTransport` 对齐。设计见 docs/MCP_Use/01-设计与解决方案.md。
+`src/mcp/transport.rs::StdioTransport` 对齐。设计见 docs/Use_MCP/01-设计与解决方案.md。
+
+编码契约:MCP stdio 传输是 UTF-8 NDJSON。Windows GBK 区域设置下 Python 默认把
+stdout 编成 GBK(中文 description 直接触发 laew 侧 `stream did not contain valid UTF-8`),
+故启动即 reconfigure 为 UTF-8(对齐 `LAEW_BASH_UTF8` 解决的同类问题)。
 
 用法:python3 scripts/mock_mcp_server.py  (stdin/stdout 挂管道即可)
 """
 import json
 import sys
+
+# 强制 UTF-8 帧(见模块 docstring「编码契约」;老版本 Python 无 reconfigure 时静默跳过)。
+for _stream in (sys.stdout, sys.stdin, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
 
 
 def reply(id_, result=None, error=None):

@@ -50,7 +50,7 @@ pub const MCP_WEB_USE_TOOL_NAME: &str = "MCP_Web_Use";
 ///
 /// 新开 **6xxx「范围约束」段**:1xxx 参数 / 2xxx 浏览器与页面 / 3xxx 环境缺失 /
 /// 4xxx 人工介入(「需要人帮忙完成」) / **6xxx 不允许做(「这件事本身越界」)**。
-/// 不用 5xxx —— 那一段已被 `MCP_Use`(server 配置与连接)占用,避免跨工具语义混淆。
+/// 不用 5xxx —— 那一段已被 `Use_MCP`(server 配置与连接)占用,避免跨工具语义混淆。
 pub(super) const CODE_TARGET_ANCHOR_VIOLATION: i32 = 6001;
 
 /// 人工核验弹窗输入硬闸错误码(第 151 轮)。

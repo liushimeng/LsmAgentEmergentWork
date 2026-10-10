@@ -1,8 +1,8 @@
-//! MCP server 接入记录 DAO(2026-09-23 第 123 轮)。
+//! MCP server 接入记录 DAO。
 //!
-//! SQLite `mcp_servers` 表 CRUD:`laew mcp add|list|del|test` 与 `MCP_Use` 工具共用。
+//! SQLite `mcp_servers` 表 CRUD:`laew mcp add|list|del|test` 与 `Use_MCP` 工具共用。
 //! 敏感请求头(headers)经 `Vault`(AES-256-GCM)加密落 `headers_enc`(对齐 providers.api_key
-//! 的 D9-4 先例)。设计见 `docs/MCP_Use/01-设计与解决方案.md` §5。
+//! 的 D9-4 先例)。设计见 `docs/Use_MCP/01-设计与解决方案.md` §5。
 //!
 //! 表 DDL 见 [`crate::database::schema`] 的 `mcp_servers` 建表段。
 
@@ -160,7 +160,7 @@ impl Db {
         })
     }
 
-    /// 按 name 查找(工具门面 `MCP_Use` 用;不存在返回 `None`)。
+    /// 按 name 查找(工具门面 `Use_MCP` 用;不存在返回 `None`)。
     pub fn get_mcp_server_by_name(&self, name: &str) -> Result<Option<McpServerRecord>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn

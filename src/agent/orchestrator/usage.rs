@@ -118,8 +118,8 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
             }
             truncate_progress_text(&parts.join(" "), 90)
         }
-        "MCP_Use" => {
-            // ★ 2026-09-23 第 123 轮:通用 MCP 服务调用差异化摘要。
+        "Use_MCP" => {
+            // ★ 通用 MCP 服务调用差异化摘要。
             // 只显示 action=X server=Y tool=Z / uri=U(值截 ≤30 字符),不回显 arguments
             // (可能是大 JSON / 敏感数据)。
             let g = |k: &str| {

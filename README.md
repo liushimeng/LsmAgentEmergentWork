@@ -271,11 +271,11 @@ LsmAgentEmergentWork/
 │   │   ├── safety/          # 安全防护 (mod / url_safety SSRF / prompt_injection / credentials 脱敏)
 │   │   ├── sandbox_hook/    # 沙箱钩子 (mod)
 │   │   ├── skills/          # Skill 系统 (mod / registry / render / tools / skill / bundled / bundled/*.md)
-│   │   ├── system_prompt/   # SystemPrompt 组合与渲染 (mod / mcp_use_hint / skill_catalog)
+│   │   ├── system_prompt/   # SystemPrompt 组合与渲染 (mod / use_mcp_hint / skill_catalog)
 │   │   ├── tools/           # Tool trait + ToolRegistry + bash/read/write/edit/glob/grep/emit/todo/subagent/read_detect/bash_spill
 │   │   ├── tools/mcp_window_use/ # MCP_Window_Use 工具目录 (mod / query / open / inspect / vision / chat / explore / sequence / input_batch / tests)
 │   │   ├── tools/mcp_web_use/    # MCP_Web_Use 工具目录 (mod / control / inspect / tests)
-│   │   ├── tools/mcp_use/        # MCP_Use 工具目录 (mod / tests)
+│   │   ├── tools/use_mcp/        # Use_MCP 工具目录 (通用 MCP 服务调用, mod / tests)
 │   │   ├── window/          # 窗口操控平台驱动 (mod / windows / windows_input / windows_ocr / macos_axui / macos_vision_ocr / control_action / fallback / macos_legacy/)
 │   │   ├── browser.rs       # 浏览器 CDP 驱动层 (MCP_Web_Use 服务实现)
 │   │   ├── browser_watchdog.rs # Browser 子进程 watchdog (TUI 退出清理)
@@ -287,7 +287,7 @@ LsmAgentEmergentWork/
 │   │   ├── openai.rs        # OpenAI wire 转换
 │   │   ├── sse.rs           # SSE 流式响应解析
 │   │   ├── cancellable.rs / resilient.rs / cache_policy.rs / offline.rs / pricing.rs
-│   ├── mcp/                 # 通用 MCP 客户端层 (MCP_Use 服务实现)
+│   ├── mcp/                 # 通用 MCP 客户端层 (Use_MCP 服务实现)
 │   │   ├── mod.rs / jsonrpc.rs / transport.rs / client.rs / manager.rs / tests.rs
 │   └── tui/
 │       ├── mod.rs           # REPL 主屏循环 + Screen 栈

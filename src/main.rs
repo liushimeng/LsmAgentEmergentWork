@@ -139,7 +139,7 @@ enum Cmd {
     #[command(subcommand)]
     Provider(ProviderCmd),
 
-    /// 管理 MCP server 接入记录(通用 MCP 服务调用,2026-09-23 第 123 轮)
+    /// 管理 MCP server 接入记录(通用 MCP 服务调用 `Use_MCP` 工具的后端配置)
     #[command(subcommand)]
     Mcp(McpCmd),
 
@@ -237,7 +237,7 @@ fn parse_context_size(s: &str) -> std::result::Result<u64, String> {
 enum McpCmd {
     /// 新增一条 MCP server 接入记录
     Add {
-        /// server 名称(MCP_Use 的 server 参数,唯一)
+        /// server 名称(Use_MCP 的 server 参数,唯一)
         #[arg(long)]
         name: String,
         /// 传输类型: stdio(本地子进程)或 http(Streamable HTTP)
@@ -348,7 +348,7 @@ async fn cmd_mcp(c: McpCmd) -> Result<()> {
             println!("✓ 已删除 MCP server: {target}");
         }
         McpCmd::Test { target } => {
-            use lsm_agent::agent::tools::mcp_use::record_to_config;
+            use lsm_agent::agent::tools::use_mcp::record_to_config;
             let rec = db.get_mcp_server(&target).map_err(anyhow::Error::from)?;
             if !rec.enabled {
                 println!("✗ server `{}` 已禁用(enabled=0),跳过测试", rec.name);

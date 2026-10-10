@@ -20,12 +20,12 @@ pub mod edit;
 pub mod emit;
 pub mod glob;
 pub mod grep;
-pub mod mcp_use;
 pub mod mcp_web_use;
 pub mod mcp_window_use;
 pub mod read;
 pub mod read_detect;
 pub mod subagent;
+pub mod use_mcp;
 pub mod write;
 pub mod todo;
 
@@ -198,13 +198,13 @@ fn register_subagent(reg: ToolRegistry) -> ToolRegistry {
     }
 }
 
-/// 条件注册 `MCP_Use` 工具(2026-09-23 第 123 轮:通用 MCP 服务调用)。
+/// 条件注册 `Use_MCP` 工具(通用 MCP 服务调用)。
 ///
 /// 关闭语义:`LAEW_MCP_ENABLED=off` 时**不注册工具**,与提示词注入同时归零
 /// (对齐 `register_subagent` / `mcp_window_use_available` 惯例)。
-fn register_mcp_use(reg: ToolRegistry) -> ToolRegistry {
-    if mcp_use::mcp_use_enabled() {
-        reg.register(Arc::new(mcp_use::McpUseTool))
+fn register_use_mcp(reg: ToolRegistry) -> ToolRegistry {
+    if use_mcp::use_mcp_enabled() {
+        reg.register(Arc::new(use_mcp::UseMcpTool))
     } else {
         reg
     }
@@ -213,7 +213,7 @@ fn register_mcp_use(reg: ToolRegistry) -> ToolRegistry {
 /// 条件注册 Skill 工具(2026-09-23 第 126 轮:渐进式披露载体)。
 ///
 /// 关闭语义:`LAEW_SKILL_DISABLED=on|1|true|yes` 时**不注册** UseSkill/ListSkills
-/// (与 `register_mcp_use` / `register_subagent` 同款开关模式)。
+/// (与 `register_use_mcp` / `register_subagent` 同款开关模式)。
 /// 同时挂载到 `sub_agent_work_registry_with` / `main_work_registry_with` 路径,
 /// 静态目录(零参数版)不挂载(动态子 Agent 类型不感知 SkillRegistry)。
 pub fn skills_enabled() -> bool {
@@ -258,7 +258,7 @@ pub fn main_work_registry_with(
 
 /// Main-Work 静态目录(原 `main_work_registry` 拆内函数,保持零参 API 不变)。
 pub fn main_work_registry_inner() -> ToolRegistry {
-    register_mcp_use(register_subagent(
+    register_use_mcp(register_subagent(
         ToolRegistry::new()
             .register(Arc::new(bash::BashTool::readonly()))
             .register(Arc::new(read::ReadTool))
@@ -278,7 +278,7 @@ pub fn main_work_registry_inner() -> ToolRegistry {
 /// CDP 三平台一致,未装浏览器返回结构化 3001 不崩溃,无需平台门控)。
 /// 2026-09-22 第 114 轮:追加 SubAgent(自感知动态启动子 Agent 工具,
 /// 运行时经 task-local 注入;总开关 `LAEW_SELF_SPAWN=off` 时不注册)。
-/// 2026-09-23 第 123 轮:追加 MCP_Use(通用 MCP 服务调用,`LAEW_MCP_ENABLED=off` 不注册)。
+/// 追加 Use_MCP(通用 MCP 服务调用,`LAEW_MCP_ENABLED=off` 不注册)。
 ///
 /// 2026-09-23 Round 124:`BashTool::new()` 显式标注 ReadWrite(SubAgent-Work 执行层
 /// 仍可写;默认行为零变化)。
@@ -293,7 +293,7 @@ pub fn builtin_registry() -> ToolRegistry {
         .register(Arc::new(grep::GrepTool))
         .register(Arc::new(todo::TodoWriteTool::shared()))
         .register(Arc::new(mcp_web_use::McpWebUseTool));
-    reg = register_mcp_use(reg);
+    reg = register_use_mcp(reg);
     reg = register_subagent(reg);
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
@@ -315,7 +315,7 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
         .register(Arc::new(grep::GrepTool))
         .register(Arc::new(todo::TodoWriteTool::shared()))
         .register(Arc::new(mcp_web_use::McpWebUseTool));
-    reg = register_mcp_use(reg);
+    reg = register_use_mcp(reg);
     reg = register_subagent(reg);
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
@@ -631,19 +631,19 @@ mod names_tests {
         assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
     }
 
-    // ==== 第 123 轮(2026-09-23):MCP_Use 通用 MCP 服务调用 注册面 ====
+    // ==== Use_MCP 通用 MCP 服务调用 注册面 ====
     // SubAgent-Work(执行层)与 Main-Work(编排探查)持;Yolo / Plan / QC 不持
-    // (权限面不扩大,设计 docs/MCP_Use/01-设计与解决方案.md §3.2)。
+    // (权限面不扩大,设计 docs/Use_MCP/01-设计与解决方案.md §3.2)。
     #[test]
-    fn mcp_use_registered_in_subagent_and_main_work_only() {
-        if !crate::agent::tools::mcp_use::mcp_use_enabled() {
+    fn use_mcp_registered_in_subagent_and_main_work_only() {
+        if !crate::agent::tools::use_mcp::use_mcp_enabled() {
             // 总开关关闭时注册面归零(LAEW_MCP_ENABLED=off)。
             for reg in [
                 builtin_registry(),
                 builtin_registry_with_work_dir(PathBuf::from(".")),
                 main_work_registry(),
             ] {
-                assert!(!reg.names().contains(&"MCP_Use"));
+                assert!(!reg.names().contains(&"Use_MCP"));
             }
             return;
         }
@@ -654,8 +654,8 @@ mod names_tests {
             ("sub_agent_work", sub_agent_work_registry()),
         ] {
             assert!(
-                reg.names().contains(&"MCP_Use"),
-                "{label} 应持 MCP_Use: {:?}",
+                reg.names().contains(&"Use_MCP"),
+                "{label} 应持 Use_MCP: {:?}",
                 reg.names()
             );
         }
@@ -668,20 +668,20 @@ mod names_tests {
             ("compact", compact_registry()),
         ] {
             assert!(
-                !reg.names().contains(&"MCP_Use"),
-                "{label} 不应持 MCP_Use: {:?}",
+                !reg.names().contains(&"Use_MCP"),
+                "{label} 不应持 Use_MCP: {:?}",
                 reg.names()
             );
         }
     }
 
     #[test]
-    fn mcp_use_schema_and_description_contract() {
-        if !crate::agent::tools::mcp_use::mcp_use_enabled() {
+    fn use_mcp_schema_and_description_contract() {
+        if !crate::agent::tools::use_mcp::use_mcp_enabled() {
             return;
         }
         let reg = builtin_registry();
-        let tool = reg.get("MCP_Use").expect("MCP_Use 工具已注册");
+        let tool = reg.get("Use_MCP").expect("Use_MCP 工具已注册");
         let schema = tool.parameters();
         let actions: Vec<&str> = schema["properties"]["action"]["enum"]
             .as_array()
@@ -691,7 +691,7 @@ mod names_tests {
             .collect();
         assert_eq!(
             actions,
-            crate::agent::tools::mcp_use::action_names().to_vec(),
+            crate::agent::tools::use_mcp::action_names().to_vec(),
             "action 枚举应与实现一致"
         );
         assert_eq!(schema["required"][0], "action");

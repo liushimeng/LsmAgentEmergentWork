@@ -18,7 +18,7 @@
 //! - 数据模型 + 加载器:`skill.rs` / `registry.rs`
 //! - catalog 渲染:`render.rs`(挂载到 `system_prompt/skill_catalog.rs`)
 //! - 工具:`tools.rs` 的 `UseSkillTool` + `ListSkillsTool`
-//! - 注册器:`tools/mod.rs::register_skill_tools`(对齐 `register_mcp_use` 开关模式)
+//! - 注册器:`tools/mod.rs::register_skill_tools`(对齐 `register_use_mcp` 开关模式)
 //! - 注入:`SubAgentRunner::with_skills` / `MainWorkRunner::with_skills` builder
 //! - TUI:`/skill` / `/skills` builtin slash 命令
 //!

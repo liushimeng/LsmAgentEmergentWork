@@ -208,9 +208,9 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, to_role, consumed);
 
-        -- ========== MCP server 配置表(2026-09-23 第 123 轮) ==========
-        -- 设计见 docs/MCP_Use/01-设计与解决方案.md §5:
-        -- 通用 MCP 服务调用(MCP_Use)的 server 接入记录,`laew mcp add` 维护。
+        -- ========== MCP server 配置表 ==========
+        -- 设计见 docs/Use_MCP/01-设计与解决方案.md §5:
+        -- 通用 MCP 服务调用(Use_MCP)的 server 接入记录,`laew mcp add` 维护。
         -- transport='stdio' 时 command 必填;transport='http' 时 url 必填(DAO 写入校验)。
         -- headers_enc 敏感请求头经 Vault(AES-256-GCM)加密存储(对齐 providers.api_key D9-4)。
         CREATE TABLE IF NOT EXISTS mcp_servers (

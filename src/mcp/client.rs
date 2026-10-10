@@ -1,6 +1,6 @@
 //! MCP 客户端:握手 / 工具发现 / 工具调用 / 资源读取(协议编排)。
 //!
-//! 只做 JSON-RPC 方法编排与结果解析,不接触工具信封(那是 `MCP_Use` 门面的事);
+//! 只做 JSON-RPC 方法编排与结果解析,不接触工具信封(那是 `Use_MCP` 门面的事);
 //! 传输细节见 [`super::transport`]。
 
 use std::time::Instant;

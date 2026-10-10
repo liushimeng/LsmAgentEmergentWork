@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use crate::config::Protocol;
 
-/// MCP_Use 工具提示词段(2026-09-23 第 123 轮,独立子模块防 mod.rs 超 1800 行)。
-pub mod mcp_use_hint;
+/// Use_MCP 工具提示词段(独立子模块防 mod.rs 超 1800 行)。
+pub mod use_mcp_hint;
 
 /// Skill catalog 注入子模块(2026-09-23 第 126 轮,渐进式披露)。
 pub mod skill_catalog;
@@ -236,16 +236,15 @@ impl SystemPrompt {
 
     /// 构造 Main-Work Agent 的系统提示词(流程层,WorkFlow 编排)。
     ///
-    /// 2026-09-23 第 123 轮:追加 MCP_Use 使用说明(编排层可探查外部 MCP 工具形态,
-    /// 与工具注册同步门控)。
+    /// 追加 Use_MCP 使用说明(编排层可探查外部 MCP 工具形态,与工具注册同步门控)。
     pub fn main_work() -> Self {
         let prompt = Self::new(MAIN_WORK_BASE_PROMPT)
             .with_tools_hint(main_work_tools_hint())
             .set_protocol_tail(crate::config::Protocol::Anthropic, MAIN_WORK_ANTHROPIC_TAIL)
             .set_protocol_tail(crate::config::Protocol::OpenAi, MAIN_WORK_OPENAI_TAIL)
             .set_identity(MAIN_WORK_IDENTITY);
-        if crate::agent::tools::mcp_use::mcp_use_enabled() {
-            prompt.append_base(mcp_use_hint::MCP_USE_PROMPT_SECTION)
+        if crate::agent::tools::use_mcp::use_mcp_enabled() {
+            prompt.append_base(use_mcp_hint::USE_MCP_PROMPT_SECTION)
         } else {
             prompt
         }
@@ -257,7 +256,7 @@ impl SystemPrompt {
     /// (桌面窗口操控统一工具,平台门控与工具注册一致)。
     /// 2026-09-18 第 89 轮:全平台追加 MCP_Web_Use 使用说明(浏览器操控统一工具,
     /// CDP 三平台一致,无平台门控)。
-    /// 2026-09-23 第 123 轮:追加 MCP_Use 使用说明(通用 MCP 服务调用,
+    /// 追加 Use_MCP 使用说明(通用 MCP 服务调用,
     /// `LAEW_MCP_ENABLED=off` 时与工具注册同时归零)。
     /// 2026-10-08 第 131 轮:追加网页取证纪律(禁止 Bash 顶替 MCP_Web_Use 探测任务目标站点)。
     pub fn sub_agent_work() -> Self {
@@ -271,8 +270,8 @@ impl SystemPrompt {
             .append_base(web_extract::WEB_EXTRACT_PROMPT_SECTION)
             // 第 146 轮:遍历覆盖纪律(工具层访问台账 inspect(info=coverage) 配套)。
             .append_base(web_traversal::WEB_TRAVERSAL_PROMPT_SECTION);
-        let prompt = if crate::agent::tools::mcp_use::mcp_use_enabled() {
-            prompt.append_base(mcp_use_hint::MCP_USE_PROMPT_SECTION)
+        let prompt = if crate::agent::tools::use_mcp::use_mcp_enabled() {
+            prompt.append_base(use_mcp_hint::USE_MCP_PROMPT_SECTION)
         } else {
             prompt
         };
@@ -602,7 +601,7 @@ fn main_work_tools_hint() -> &'static str {
      - Glob(pattern) / Grep(pattern, path?): 项目结构与符号检索。\n\
      - MCP_Web_Use(action, ...): 网页信息收集(open 拿页面 / inspect 探查 DOM /\n\
        screenshot 视觉验证),只读观察类 action。\n\
-     - MCP_Use(action, ...): 通用 MCP 服务调用(list_servers/list_tools 探查外部\n\
+     - Use_MCP(action, ...): 通用 MCP 服务调用(list_servers/list_tools 探查外部\n\
        服务能力,call_tool 调用;详见「通用 MCP 服务调用」段)。\n\
      - TodoWrite(action, ...): 编排清单顶层规划(≥3 步时先 create 全量)。\n\
      - SubAgent(action, agent_type?, task?, tasks?, ...): 把相互独立的 WorkFlow 并行\n\
@@ -726,7 +725,7 @@ fn sub_agent_tools_hint() -> &'static str {
      - Bash(command, timeout_ms?, description?): 在工作目录下执行 bash 命令。\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
      - Write(file_path, content): 覆盖写入(或新建)文件,自动创建父目录。\
-     - MCP_Use(action, ...): 通用 MCP 服务调用(list_servers/list_tools/call_tool/\n\
+     - Use_MCP(action, ...): 通用 MCP 服务调用(list_servers/list_tools/call_tool/\n\
        list_resources/read_resource,详见「通用 MCP 服务调用」段)。\
      - SubAgent(action, agent_type?, task?, tasks?, ...): 把可并行的独立子任务委派给\
        动态子 Agent(action=list 先看名册与额度;详见系统提示词「自感知」段)。"

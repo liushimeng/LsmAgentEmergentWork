@@ -2,7 +2,7 @@
 //!
 //! 进程级缓存(`McpManager::global()`),每个 server 一个 [`ConnEntry`]:
 //! - **懒连接**:`list_tools` / `call_tool` 等在无连接时自动 connect(对模型透明);
-//! - **请求锁**:每连接一把锁串行化调用(MCP_Use `parallel_safe=false` + 单锁,
+//! - **请求锁**:每连接一把锁串行化调用(Use_MCP `parallel_safe=false` + 单锁,
 //!   AtomCode 三锁的 laew 简化,见设计 §6.1);
 //! - **退避**:失败后 `delay = min(30s, 500ms * 2^(n-1))`;连接存活 ≥ 稳定性窗口
 //!   (30s)后失败计数归零(DeepSeek 稳定性窗口,防长期稳定后的偶发断连被累积放弃);

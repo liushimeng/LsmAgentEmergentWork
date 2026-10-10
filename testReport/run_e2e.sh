@@ -2352,8 +2352,8 @@ run "$LAEW" provider delete "$ID_CAN" >/dev/null 2>&1
 run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 rm -f "$CANCEL_MOCK_LOG" "$CANCEL_OUT"
 
-# --- 11. MCP server 配置 CRUD + mock MCP 连通性(2026-09-23 第 123 轮) ---
-# 设计见 docs/MCP_Use/01-设计与解决方案.md。用 scripts/mock_mcp_server.py
+# --- 11. MCP server 配置 CRUD + mock MCP 连通性 ---
+# 设计见 docs/Use_MCP/01-设计与解决方案.md。用 scripts/mock_mcp_server.py
 # (NDJSON stdio 最小 MCP server)验证 `laew mcp add/list/test/del` 全链路:
 # initialize 握手 → tools/list(2 工具)→ 断开。
 section "11. laew mcp CRUD + mock MCP server 连通性"

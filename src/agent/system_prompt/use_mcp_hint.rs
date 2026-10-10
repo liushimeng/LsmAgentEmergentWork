@@ -1,13 +1,13 @@
-//! `MCP_Use` 工具系统提示词段(2026-09-23 第 123 轮)。
+//! `Use_MCP` 工具系统提示词段(通用 MCP 服务调用)。
 //!
 //! 独立子模块:`system_prompt/mod.rs` 已近 1800 行上限,新提示词段落优先落职责子模块。
 //! 挂载点:`SystemPrompt::sub_agent_work()` / `SystemPrompt::main_work()` 的
-//! `append_base(MCP_USE_PROMPT_SECTION)`(`LAEW_MCP_ENABLED=off` 时同时归零)。
+//! `append_base(USE_MCP_PROMPT_SECTION)`(`LAEW_MCP_ENABLED=off` 时同时归零)。
 
-/// `MCP_Use` 作业规范(通用 MCP 服务调用)。
-pub const MCP_USE_PROMPT_SECTION: &str = r#"# 通用 MCP 服务调用(MCP_Use)
+/// `Use_MCP` 作业规范(通用 MCP 服务调用)。
+pub const USE_MCP_PROMPT_SECTION: &str = r#"# 通用 MCP 服务调用(Use_MCP)
 
-你可以通过 MCP_Use 调用外部 MCP server 提供的工具与资源(server 由用户 `laew mcp add` 配置,
+你可以通过 Use_MCP 调用外部 MCP server 提供的工具与资源(server 由用户 `laew mcp add` 配置,
 你不能新增 server)。协议为 JSON-RPC,底层支持本地子进程(stdio)与远程 HTTP 两种传输,
 对你透明 —— 你只面对下面的 action。
 

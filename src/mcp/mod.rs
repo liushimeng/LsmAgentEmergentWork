@@ -1,8 +1,8 @@
-//! 通用 MCP(Model Context Protocol)客户端层(2026-09-23 第 123 轮)。
+//! 通用 MCP(Model Context Protocol)客户端层。
 //!
 //! 由 MCP 客户端连接外部 MCP server(stdio 子进程 / Streamable HTTP),完成
 //! `initialize` 握手 → `tools/list`(分页折叠)→ `tools/call` → `resources/list` /
-//! `resources/read` 最小闭环,把外部服务能力接入 laew 工具面(`MCP_Use`)。
+//! `resources/read` 最小闭环,把外部服务能力接入 laew 工具面(`Use_MCP`)。
 //!
 //! - 协议消息 = JSON-RPC 2.0 帧([`jsonrpc`]);
 //! - 传输层双实现([`transport`]):stdio **NDJSON 行帧**(不是 LSP 的 Content-Length 帧)
@@ -12,7 +12,7 @@
 //!   懒连接 / 请求超时 / 指数退避重连(稳定性窗口)/ 冷却;
 //! - 本层是**可选能力层**,封闭在 `src/mcp/`,不侵入 `agent_loop.rs` 核心循环。
 //!
-//! 设计见 `docs/MCP_Use/01-设计与解决方案.md`(唯一最新版)。
+//! 设计见 `docs/Use_MCP/01-设计与解决方案.md`(唯一最新版)。
 //! 调研基础:`docs/Agent源码调研/专题/专题-MCP架构深度分析.md`。
 
 pub mod client;

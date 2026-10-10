@@ -1052,7 +1052,7 @@ wire system 上 / `LAEW_REACT_GUARD=off` 可回退）。**e2e 总计 PASS=213 / 
 
 ---
 
-## 第 123 轮(2026-09-23):MCP_Use 通用 MCP 服务调用
+## 第 123 轮(2026-09-23):MCP_Use 通用 MCP 服务调用(现名 Use_MCP,后续轮更名对齐)
 
 **需求**:给 Agent 添加通用性 MCP 服务调用工具定义以及相关功能(MCP client 连接外部
 server → 发现工具 → 调用工具 → 读取资源)。
@@ -1066,7 +1066,7 @@ server → 发现工具 → 调用工具 → 读取资源)。
   list_resources/read_resource/close;信封 0/1001/3001/5001-5006),注册进
   SubAgent-Work + Main-Work,`LAEW_MCP_ENABLED=off` 全关。
 - SQLite `mcp_servers` 表 + DAO(headers Vault 加密)+ `laew mcp add|list|del|test` CLI。
-- 提示词 `mcp_use_hint.rs` 独立段 + `tool_args_digest` MCP_Use 分支。
+- 提示词独立段(现 `use_mcp_hint.rs`)+ `tool_args_digest` Use_MCP 分支。
 
 **gap 对账**:知识库「laew 无 MCP 支持」(`专题-MCP架构深度分析.md` 横向对比表)→ ✅
 (最小闭环:双传输 + 工具/资源调用;展开式 `mcp__{server}__{tool}`/OAuth/Prompts→Skill
@@ -1077,7 +1077,7 @@ server → 发现工具 → 调用工具 → 读取资源)。
 + 注册面 2,含退避稳定性窗口与投影降级钉死);e2e 新增 §11 **10 项全 PASS**(mock MCP server
 真实 stdio 握手 + tools/list + CRUD + 参数校验拒绝)。**e2e 总计 PASS=225 / FAIL=0**。
 
-**设计**:`docs/MCP_Use/01-设计与解决方案.md`
+**设计**:`docs/Use_MCP/01-设计与解决方案.md`
 
 ---
 
@@ -1117,7 +1117,7 @@ server → 发现工具 → 调用工具 → 读取资源)。
 
 6. **工具挂载范围**(用户决策):SubAgent-Work + Main-Work + 动态子 Agent 类型;
    Yolo/Plan/QC/SessionContext/Debug/Compact 不挂(污染 catalog)。`LAEW_SKILL_DISABLED`
-   开关门控,对齐 `register_mcp_use` 惯例。
+   开关门控,对齐 `register_use_mcp` 惯例。
 
 7. **Profile 装配**(`src/agent/profile.rs`):新增 `sub_agent_work_profile_with_skills`
    + `main_work_profile_with_skills`(直接装配 AgentProfile,绕开 `with_self_awareness`
@@ -1134,15 +1134,15 @@ server → 发现工具 → 调用工具 → 读取资源)。
    slash 注册 + `BUILTIN_NAMES` 追加 `"skill"` `"skills"`(与 D2 自定义命令共用遮蔽检查)。
 
 10. **system_prompt 子模块**(`src/agent/system_prompt/skill_catalog.rs`):与
-    `mcp_use_hint` 同款独立子模块(`mod.rs` 已 1669 行接近 1800 上限),
+    `use_mcp_hint` 同款独立子模块(`mod.rs` 已 1669 行接近 1800 上限),
     `append_to()` 把 catalog 追加到 rules 段(第 3 段,带 cache_control),
     跨 SubAgent/Main-Work 实例字节级稳定 → Anthropic prefix cache 复用最大化。
 
 **复用现有基础设施**:
 - `src/frontmatter.rs::parse` / `parse_bool` / `fallback_description`(第 115 轮抽出,
   与 D2 命令 + D11 自定义子 Agent 共用)—— frontmatter 全套零新增。
-- `src/agent/tools/mod.rs::register_mcp_use` 开关模式 → `register_skill_tools`。
-- `src/agent/system_prompt/mod.rs::append_base` + `mcp_use_hint` 子模块模式。
+- `src/agent/tools/mod.rs::register_use_mcp` 开关模式 → `register_skill_tools`。
+- `src/agent/system_prompt/mod.rs::append_base` + `use_mcp_hint` 子模块模式。
 - `src/tui/commands.rs::BUILTIN_NAMES` 静态白名单 + `completion.rs::SlashCommand::builtin`。
 
 **测试**:
