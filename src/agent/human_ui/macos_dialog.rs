@@ -156,7 +156,10 @@ unsafe fn ns_str(s: &str) -> Id {
 
 // ---------- 布局单一真源 ----------
 
-const W: f64 = 560.0;
+// 第 145 轮:W 560→680 —— 底行从五按钮扩为六按钮(新增「⏱ +2分钟」延长等待),
+// 左组 取消/提交·继续/⏱+2分钟 = 300pt,右组 复制/查看原图/最大化 = 322pt,
+// 560 内容宽装不下;680 下两组间距 42pt,小屏(1280 宽)仍远小于工作区。
+const W: f64 = 680.0;
 const PAD: f64 = 16.0;
 const TITLE_H: f64 = 22.0;
 const LINE_H: f64 = 18.0;
@@ -164,7 +167,10 @@ const INPUT_H: f64 = 28.0;
 const BTN_H: f64 = 30.0;
 const GAP: f64 = 8.0;
 const CANCEL_W: f64 = 84.0;
-const SUBMIT_W: f64 = 84.0;
+/// 第 145 轮:84→96,容纳双语义标题「提交 / 继续」(空输入=选项1「我已完成,
+/// Agent 接管」;有输入=提交验证码/动态码文本 —— 人机交互收口动作显性化)。
+const SUBMIT_W: f64 = 96.0;
+const EXTEND_W: f64 = 88.0;
 const COPY_W: f64 = 92.0;
 const ORIG_W: f64 = 110.0;
 const ZOOM_W: f64 = 104.0;
@@ -197,6 +203,7 @@ struct Frames {
     opts: Vec<NSRect>,
     cancel: NSRect,
     submit: NSRect,
+    extend: NSRect,
     copy: NSRect,
     orig: NSRect,
     zoom: NSRect,
@@ -246,6 +253,7 @@ fn layout_frames(cw: f64, ch: f64, geo: Geometry, opt_count: usize) -> Frames {
         opts,
         cancel: ns_rect(PAD, row_y, CANCEL_W, BTN_H),
         submit: ns_rect(PAD + CANCEL_W + INNER, row_y, SUBMIT_W, BTN_H),
+        extend: ns_rect(PAD + CANCEL_W + INNER + SUBMIT_W + INNER, row_y, EXTEND_W, BTN_H),
         copy: ns_rect(cw - PAD - ZOOM_W - INNER - ORIG_W - INNER - COPY_W, row_y, COPY_W, BTN_H),
         orig: ns_rect(cw - PAD - ZOOM_W - INNER - ORIG_W, row_y, ORIG_W, BTN_H),
         zoom: ns_rect(cw - PAD - ZOOM_W, row_y, ZOOM_W, BTN_H),
@@ -288,6 +296,7 @@ struct Views {
     opts: Vec<Id>,
     cancel: Id,
     submit: Id,
+    extend: Id,
     copy: Id,
     orig: Id,
     zoom: Id,
@@ -301,6 +310,12 @@ struct MacState {
     copy_payload: String,
     /// 「✓ 已复制」反馈的回滚时刻(由 `on_tick` 消费)。
     copied_at: Option<Instant>,
+    /// 第 145 轮:请求 id / 提出时刻毫秒 —— 「⏱ +2分钟」延长中间行携带 id,
+    /// 时间轴第一行的「超时截止」随延长重写。
+    payload_id: u64,
+    started_at_ms: u64,
+    /// 已点「⏱ +2分钟」次数(按钮标题 ×N 反馈,无回滚需求)。
+    extend_count: u32,
     /// 正常态布局(还原用)。
     normal_geo: Geometry,
     normal_content: (f64, f64),
@@ -341,6 +356,58 @@ extern "C" fn on_cancel(_self: Id, _cmd: Sel, _sender: Id) {
 
 extern "C" fn on_zoom(_self: Id, _cmd: Sel, _sender: Id) {
     unsafe { toggle_zoom() };
+}
+
+/// 第 145 轮:「⏱ +2分钟」延长等待 —— 本地 `timeout_ms += EXTEND_STEP_MS`
+/// (总等待封顶 MAX_TOTAL_WAIT_MS,倒计时与「超时截止」行立即受益),同时向
+/// stdout 打 extend **中间行**(进程不退出;Stdout 行缓冲,println! 即时 flush),
+/// 父进程逐行读并接线 `HumanAssistHub::extend_timeout` 推迟 hub 侧截止时刻。
+/// 根治实测:人工在浏览器完成整条登录链超过 120s 分档超时 → 弹窗自灭 →
+/// QC 单元重试 → 二次弹窗(浪费 36s 且验证码已刷新)。
+extern "C" fn on_extend(_self: Id, _cmd: Sel, _sender: Id) {
+    let (line, title, extend_btn, t1, timeline) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
+        if st.done {
+            return;
+        }
+        let cap = super::dialog_main::MAX_TOTAL_WAIT_MS.saturating_sub(st.timeout_ms);
+        let add = super::dialog_main::EXTEND_STEP_MS.min(cap);
+        if add == 0 {
+            return; // 已达 30 分钟总上限:不再累计、不打印中间行
+        }
+        st.timeout_ms += add;
+        st.extend_count += 1;
+        let clock = |ms: u64| {
+            super::fmt_local_ms(ms).split(' ').nth(1).unwrap_or("").to_string()
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let base = if st.started_at_ms > 0 { st.started_at_ms } else { now_ms };
+        let timeline = format!(
+            "提出时间: {}   超时截止: {}",
+            clock(base),
+            clock(base.saturating_add(st.timeout_ms))
+        );
+        (
+            super::dialog_main::extend_line(st.payload_id, add),
+            format!("{} ×{}", super::dialog_main::EXTEND_BTN_TITLE, st.extend_count),
+            st.views.extend,
+            st.views.t1,
+            timeline,
+        )
+    };
+    println!("{line}");
+    unsafe {
+        if !extend_btn.is_null() {
+            send_void_id(extend_btn, sel(b"setTitle:\0"), ns_str(&title));
+        }
+        if !t1.is_null() {
+            send_void_id(t1, sel(b"setStringValue:\0"), ns_str(&timeline));
+        }
+    }
 }
 
 extern "C" fn on_open_image(_self: Id, _cmd: Sel, _sender: Id) {
@@ -474,6 +541,7 @@ fn controller_class() -> Id {
         let all = ok(on_submit, b"submit:\0")
             & ok(on_cancel, b"cancel:\0")
             & ok(on_zoom, b"zoom:\0")
+            & ok(on_extend, b"extend:\0")
             & ok(on_open_image, b"openImage:\0")
             & ok(on_copy, b"copyInfo:\0")
             & ok(on_tick, b"tick:\0")
@@ -623,6 +691,7 @@ struct ViewsSnapshot {
     opts: Vec<Id>,
     cancel: Id,
     submit: Id,
+    extend: Id,
     copy: Id,
     orig: Id,
     zoom: Id,
@@ -641,6 +710,7 @@ impl ViewsSnapshot {
             opts: v.opts.clone(),
             cancel: v.cancel,
             submit: v.submit,
+            extend: v.extend,
             copy: v.copy,
             orig: v.orig,
             zoom: v.zoom,
@@ -674,6 +744,7 @@ unsafe fn apply_frames(v: &ViewsSnapshot, f: &Frames, geo: Geometry) {
     }
     set(v.cancel, f.cancel);
     set(v.submit, f.submit);
+    set(v.extend, f.extend);
     set(v.copy, f.copy);
     set(v.orig, f.orig);
     set(v.zoom, f.zoom);
@@ -820,7 +891,12 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         opt_buttons.push(b);
     }
     let cancel = make_button("取消", Some("\x1b"), ctrl, b"cancel:\0", -1);
-    let submit = make_button("提交", Some("\r"), ctrl, b"submit:\0", -1);
+    // 第 145 轮:双语义主按钮 —— 有输入=提交验证码/动态码文本;空输入=选项 1
+    // (缺省「我已完成人工操作,继续」),人工在浏览器完成操作后的「交棒」动作。
+    let submit = make_button("提交 / 继续", Some("\r"), ctrl, b"submit:\0", -1);
+    // 第 145 轮:「⏱ +2分钟」延长等待(人工在浏览器完成整条登录链超 120s 分档
+    // 超时的根治;stdout extend 中间行 → 父进程 hub 延长)。
+    let extend = make_button(super::dialog_main::EXTEND_BTN_TITLE, None, ctrl, b"extend:\0", -1);
     let zoom = make_button("⛶ 最大化", None, ctrl, b"zoom:\0", -1);
     let orig = make_button("查看原图", None, ctrl, b"openImage:\0", -1);
     // 第 139 轮:一键复制全部信息(说明 + 页面 URL + 页面 ID + 候选选项)。
@@ -851,6 +927,7 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     }
     add(content, cancel);
     add(content, submit);
+    add(content, extend);
     add(content, zoom);
     add(content, orig);
     add(content, copy_btn);
@@ -879,6 +956,7 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         opts: opt_buttons,
         cancel,
         submit,
+        extend,
         copy: copy_btn,
         orig,
         zoom,
@@ -922,6 +1000,9 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         image_open_path,
         copy_payload: p.copy_text(),
         copied_at: None,
+        payload_id: p.id,
+        started_at_ms: p.started_at_ms,
+        extend_count: 0,
         normal_geo: geo,
         normal_content: (fw, fh),
         img_ratio,
@@ -1178,6 +1259,7 @@ mod tests {
             ("input", f.input),
             ("cancel", f.cancel),
             ("submit", f.submit),
+            ("extend", f.extend),
             ("copy", f.copy),
             ("orig", f.orig),
             ("zoom", f.zoom),
@@ -1206,12 +1288,14 @@ mod tests {
         // 底部按钮行同行对齐
         let row = f.cancel.origin.y;
         assert_eq!(f.submit.origin.y, row);
+        assert_eq!(f.extend.origin.y, row);
         assert_eq!(f.copy.origin.y, row);
         assert_eq!(f.orig.origin.y, row);
         assert_eq!(f.zoom.origin.y, row);
-        // 底部按钮行不重叠(第 139 轮新增「📋 复制」后的回归护栏)
+        // 底部按钮行不重叠(第 145 轮新增「⏱ +2分钟」后的回归护栏)
         let mut row_rects = [
             ("submit", f.submit),
+            ("extend", f.extend),
             ("copy", f.copy),
             ("orig", f.orig),
             ("zoom", f.zoom),
@@ -1294,14 +1378,15 @@ mod tests {
     }
 
     /// 第 139 轮:最窄内容宽下底部按钮行仍不重叠(`layout_budget_matches_placement`
-    /// 里的 1400 是大窗,这里专门盯默认窄窗 560)。
+    /// 里的 1400 是大窗,这里专门盯默认窄窗;第 145 轮加宽到 680 并插入「⏱ +2分钟」)。
     #[test]
     fn bottom_row_fits_narrow_window() {
         let geo = Geometry { msg_h: 90.0, img_h: 0.0 };
         let h = content_height(geo, 3);
         let f = layout_frames(W, h, geo, 3);
         assert_frames_in_bounds(W, h, geo, 3);
-        assert!(f.submit.origin.x + f.submit.size.width <= f.copy.origin.x + 0.01);
+        assert!(f.submit.origin.x + f.submit.size.width <= f.extend.origin.x + 0.01);
+        assert!(f.extend.origin.x + f.extend.size.width <= f.copy.origin.x + 0.01);
         assert!(f.copy.origin.x + f.copy.size.width <= f.orig.origin.x + 0.01);
         assert!(f.orig.origin.x + f.orig.size.width <= f.zoom.origin.x + 0.01);
     }

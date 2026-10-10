@@ -373,7 +373,8 @@ impl TuiSession {
                                 AssistEvent::GuiLaunched { id }
                                 | AssistEvent::GuiFailed { id }
                                 | AssistEvent::GuiCancelled { id }
-                                | AssistEvent::GuiTimeout { id } => Some(*id),
+                                | AssistEvent::GuiTimeout { id }
+                                | AssistEvent::GuiExtended { id, .. } => Some(*id),
                                 AssistEvent::GuiAnswered { id, .. }
                                 | AssistEvent::TuiEscapeAnswered { id, .. } => Some(*id),
                             };
@@ -402,6 +403,14 @@ impl TuiSession {
                                     // 降级:同 id 由下方行读分支无缝接管(条件含 handled_via_gui)
                                     handled_assist_id = Some(*id);
                                     handled_via_gui = true;
+                                }
+                                AssistEvent::GuiExtended { .. } => {
+                                    // 第 145 轮:「⏱ +2分钟」延长等待**不收口请求**——
+                                    // 只打通知行,弹窗继续接管;绝不能清 handled_via_gui
+                                    // (否则 TUI 误起行读,与仍在等待的弹窗抢 stdin)。
+                                    print_assist_event(&ev, AssistOut::Stdout);
+                                    // 人工还在操作:恢复 spinner 计时,不把延长等待算进阶段耗时
+                                    spinner_started_at = std::time::Instant::now();
                                 }
                                 _ => {
                                     print_assist_event(&ev, AssistOut::Stdout);

@@ -43,8 +43,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::dialog_main::{countdown_text, DialogPayload};
 
 // ---------- 布局常量(与 macos_dialog.rs 保持同值;两平台观感一致) ----------
+// 第 145 轮:W 560→680(底行扩为六按钮,新增「⏱ +2分钟」),SUBMIT_W 84→96
+// (双语义标题「提交 / 继续」)。
 
-const W: i32 = 560;
+const W: i32 = 680;
 const PAD: i32 = 16;
 const TITLE_H: i32 = 22;
 const LINE_H: i32 = 18;
@@ -52,7 +54,8 @@ const INPUT_H: i32 = 28;
 const BTN_H: i32 = 30;
 const GAP: i32 = 8;
 const CANCEL_W: i32 = 84;
-const SUBMIT_W: i32 = 84;
+const SUBMIT_W: i32 = 96;
+const EXTEND_W: i32 = 88;
 const COPY_W: i32 = 92;
 const ORIG_W: i32 = 110;
 const ZOOM_W: i32 = 104;
@@ -61,7 +64,7 @@ const IMG_HINT_H: i32 = 14;
 
 const MSG_H_MIN: f64 = 90.0;
 const MSG_H_MAX: f64 = 240.0;
-const IMG_MAX_W: u32 = 528;
+const IMG_MAX_W: u32 = 648;
 const IMG_MAX_H: u32 = 300;
 
 /// SS_BITMAP(值 14;位于未启用的 SystemServices feature,裸值等价,避免开 feature)。
@@ -82,6 +85,8 @@ const IDC_ZOOM: i32 = 106;
 const IDC_ORIG: i32 = 107;
 /// 第 139 轮:「📋 复制」一键把完整信息写入剪贴板。
 const IDC_COPY: i32 = 108;
+/// 第 145 轮:「⏱ +2分钟」延长等待(stdout extend 中间行 → 父进程 hub 延长)。
+const IDC_EXTEND: i32 = 109;
 /// 「✓ 已复制」反馈保持时长(秒);由既有 1s 定时器回滚。
 const COPY_FEEDBACK_SECS: u64 = 2;
 const COPY_BTN_TITLE: &str = "📋 复制";
@@ -112,6 +117,7 @@ struct Frames {
     opts: Vec<RECT>,
     cancel: RECT,
     submit: RECT,
+    extend: RECT,
     copy: RECT,
     orig: RECT,
     zoom: RECT,
@@ -161,6 +167,7 @@ fn layout_frames(cw: i32, ch: i32, geo: Geometry, opt_count: usize) -> Frames {
         opts,
         cancel: rect(PAD, row_y, CANCEL_W, BTN_H),
         submit: rect(PAD + CANCEL_W + INNER, row_y, SUBMIT_W, BTN_H),
+        extend: rect(PAD + CANCEL_W + INNER + SUBMIT_W + INNER, row_y, EXTEND_W, BTN_H),
         copy: rect(cw - PAD - ZOOM_W - INNER - ORIG_W - INNER - COPY_W, row_y, COPY_W, BTN_H),
         orig: rect(cw - PAD - ZOOM_W - INNER - ORIG_W, row_y, ORIG_W, BTN_H),
         zoom: rect(cw - PAD - ZOOM_W, row_y, ZOOM_W, BTN_H),
@@ -194,6 +201,7 @@ struct WinState {
     opts: Vec<HWND>,
     cancel: HWND,
     submit: HWND,
+    extend: HWND,
     copy: HWND,
     orig: HWND,
     zoom: HWND,
@@ -203,6 +211,12 @@ struct WinState {
     copy_payload: String,
     /// 「✓ 已复制」反馈的回滚时刻(由 on_tick 消费)。
     copied_at: Option<Instant>,
+    /// 第 145 轮:请求 id / 提出时刻毫秒 —— extend 中间行携带 id;「超时截止」
+    /// 时间轴行随延长重写。
+    payload_id: u64,
+    started_at_ms: u64,
+    /// 已点「⏱ +2分钟」次数(按钮标题 ×N 反馈)。
+    extend_count: u32,
     /// 图片显示高(像素;0 = 无图)。
     img_h: i32,
     /// 图片位图(收尾 DeleteObject)。
@@ -240,6 +254,7 @@ struct Controls {
     opts: Vec<HWND>,
     cancel: HWND,
     submit: HWND,
+    extend: HWND,
     copy: HWND,
     orig: HWND,
     zoom: HWND,
@@ -258,6 +273,7 @@ impl Controls {
             opts: st.opts.clone(),
             cancel: st.cancel,
             submit: st.submit,
+            extend: st.extend,
             copy: st.copy,
             orig: st.orig,
             zoom: st.zoom,
@@ -344,6 +360,7 @@ unsafe fn apply_frames(c: &Controls, f: &Frames, geo: Geometry) {
     }
     mv(c.cancel, f.cancel);
     mv(c.submit, f.submit);
+    mv(c.extend, f.extend);
     mv(c.orig, f.orig);
     mv(c.zoom, f.zoom);
 }
@@ -438,10 +455,58 @@ fn on_command(id: i32) {
         IDOK_ID => finish("answer", -1),     // 提交按钮 / Enter(默认按钮)
         IDCANCEL_ID => finish("cancel", -1), // 取消按钮 / Esc
         IDC_ZOOM => toggle_zoom(),
+        IDC_EXTEND => extend_wait(),
         IDC_ORIG => open_image(),
         IDC_COPY => copy_info(),
         _ if id >= IDC_OPT_BASE => finish("answer", (id - IDC_OPT_BASE) as i64),
         _ => {}
+    }
+}
+
+/// 第 145 轮:「⏱ +2分钟」延长等待 —— 本地 `timeout_ms += EXTEND_STEP_MS`(总等待
+/// 封顶 MAX_TOTAL_WAIT_MS,倒计时与「超时截止」行立即受益),同时向 stdout 打
+/// extend **中间行**(进程不退出),父进程逐行读并接线 hub 推迟截止时刻。
+fn extend_wait() {
+    let (line, title, extend, t1, timeline) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
+        if st.done {
+            return;
+        }
+        let cap = super::dialog_main::MAX_TOTAL_WAIT_MS.saturating_sub(st.timeout_ms);
+        let add = super::dialog_main::EXTEND_STEP_MS.min(cap);
+        if add == 0 {
+            return; // 已达 30 分钟总上限:不再累计、不打印中间行
+        }
+        st.timeout_ms += add;
+        st.extend_count += 1;
+        let clock = |ms: u64| {
+            super::fmt_local_ms(ms).split(' ').nth(1).unwrap_or("").to_string()
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let base = if st.started_at_ms > 0 { st.started_at_ms } else { now_ms };
+        let timeline = format!(
+            "提出时间: {}   超时截止: {}",
+            clock(base),
+            clock(base.saturating_add(st.timeout_ms))
+        );
+        (
+            super::dialog_main::extend_line(st.payload_id, add),
+            format!("{} ×{}", super::dialog_main::EXTEND_BTN_TITLE, st.extend_count),
+            st.extend,
+            st.t1,
+            timeline,
+        )
+    };
+    println!("{line}"); // Stdout 行缓冲:换行即 flush,父进程逐行读
+    let title_w = to_wide(&title);
+    let timeline_w = to_wide(&timeline);
+    unsafe {
+        SendMessageW(extend, WM_SETTEXT, WPARAM(0), LPARAM(title_w.as_ptr() as isize));
+        SendMessageW(t1, WM_SETTEXT, WPARAM(0), LPARAM(timeline_w.as_ptr() as isize));
     }
 }
 
@@ -632,7 +697,10 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         ));
     }
     let cancel = create_control(hwnd, hinst, "BUTTON", "取消", style_button(false), IDCANCEL_ID, font_normal);
-    let submit = create_control(hwnd, hinst, "BUTTON", "提交", style_button(true), IDOK_ID, font_normal);
+    // 第 145 轮:双语义主按钮「提交 / 继续」(空输入=选项1「我已完成」,有输入=提交文本)。
+    let submit = create_control(hwnd, hinst, "BUTTON", "提交 / 继续", style_button(true), IDOK_ID, font_normal);
+    // 第 145 轮:「⏱ +2分钟」延长等待。
+    let extend = create_control(hwnd, hinst, "BUTTON", super::dialog_main::EXTEND_BTN_TITLE, style_button(false), IDC_EXTEND, font_normal);
     let zoom = create_control(hwnd, hinst, "BUTTON", "⛶ 最大化", style_button(false), IDC_ZOOM, font_normal);
     let orig = create_control(hwnd, hinst, "BUTTON", "查看原图", style_button(false), IDC_ORIG, font_normal);
     // 第 139 轮:一键复制(STATIC 标签天生不可选中,拖选复制不可靠)
@@ -651,6 +719,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         opts,
         cancel,
         submit,
+        extend,
         copy,
         orig,
         zoom,
@@ -658,6 +727,9 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         image_open_path,
         copy_payload: p.copy_text(),
         copied_at: None,
+        payload_id: p.id,
+        started_at_ms: p.started_at_ms,
+        extend_count: 0,
         img_h: img_disp_h,
         image_bitmap: bitmap_keep,
         zoomed: false,
@@ -859,19 +931,21 @@ mod tests {
                 // 底部按钮行钉在底边
                 let row = f.cancel.top;
                 assert_eq!(f.submit.top, row);
+                assert_eq!(f.extend.top, row);
                 assert_eq!(f.copy.top, row);
                 assert_eq!(f.orig.top, row);
                 assert_eq!(f.zoom.top, row);
                 assert_eq!(f.cancel.bottom, ch - PAD);
-                // 第 139 轮:新增「📋 复制」后底部按钮行不得重叠
-                assert!(f.submit.right <= f.copy.left, "submit 与 copy 重叠");
+                // 第 145 轮:新增「⏱ +2分钟」后底部按钮行不得重叠
+                assert!(f.submit.right <= f.extend.left, "submit 与 extend 重叠");
+                assert!(f.extend.right <= f.copy.left, "extend 与 copy 重叠");
                 assert!(f.copy.right <= f.orig.left, "copy 与 orig 重叠");
                 assert!(f.orig.right <= f.zoom.left, "orig 与 zoom 重叠");
                 // 全控件在界内
                 let mut all = vec![
                     ("title", f.title), ("msg", f.msg), ("t1", f.t1), ("t2", f.t2),
                     ("input", f.input), ("cancel", f.cancel), ("submit", f.submit),
-                    ("copy", f.copy), ("orig", f.orig), ("zoom", f.zoom),
+                    ("extend", f.extend), ("copy", f.copy), ("orig", f.orig), ("zoom", f.zoom),
                 ];
                 for (i, r) in f.opts.iter().enumerate() {
                     all.push((Box::leak(format!("opt{i}").into_boxed_str()) as &str, *r));

@@ -81,6 +81,9 @@ pub enum AssistEvent {
     GuiCancelled { id: u64 },
     /// 弹窗倒计时归零(与 hub 超时收口汇合)。
     GuiTimeout { id: u64 },
+    /// 第 145 轮:人工在弹窗点「⏱ +2 分钟」延长等待(累计延长量随事件透出,
+    /// TUI 打「已延长等待」通知行;到达上限后 added_ms=0 仍上报但不生效)。
+    GuiExtended { id: u64, added_ms: u64 },
     /// 第 134 轮:弹窗接管期间,用户在终端用 `/hitl <应答>` 应急通道作答
     /// (`text=None` 即 `/hitl cancel`)。TUI 事件循环据此打印结果行。
     TuiEscapeAnswered { id: u64, text: Option<String> },
@@ -144,6 +147,9 @@ struct HubState {
     gui_id: Option<u64>,
     /// 呈现事件环(上限 32,防 -p 模式无人消费时无界增长)。
     events: VecDeque<AssistEvent>,
+    /// 第 145 轮:当前请求经弹窗「⏱ +2 分钟」累计延长的毫秒数(仅 id 匹配当前
+    /// 槽位时有效;等待循环每轮重读,实现「动态截止时刻」)。槽位收口时清空。
+    extend_ms: Option<(u64, u64)>,
 }
 
 // ---------- kind 单一事实源(第 130 轮自 control.rs / tui/dispatch.rs 收口迁入) ----------
@@ -166,26 +172,29 @@ pub fn kind_label(kind: &str) -> &'static str {
 }
 
 /// reason → 默认说明文案(LLM 未传 message 时使用)。
+/// 第 145 轮:收口动作统一引导到弹窗「提交 / 继续」按钮(旧文案的「回到终端确认」
+/// 是 TUI 时代口径;桌面弹窗优先的当下,人工的收工动作就是回弹窗点『提交 / 继续』,
+/// 把「交棒给 Agent」这个语义显性化)。
 pub fn default_message(kind: &str) -> &'static str {
     match kind {
         "captcha" => {
-            "页面出现验证码/滑块,Agent 无法自动完成。请人工在浏览器窗口完成验证后回到终端确认;若是短信/文字验证码也可直接在下方输入。"
+            "页面出现验证码/滑块,Agent 无法自动完成。请人工在浏览器窗口完成验证后回到弹窗点『提交 / 继续』;若是图形/文字验证码,也可直接在弹窗输入框填入后点『提交 / 继续』。"
         }
-        "sms" => "页面要求短信验证码,Agent 无法获取。请把手机收到的验证码数字直接输入在下方。",
-        "qr_login" => "页面要求扫码登录。请人工用手机完成扫码/确认后回到终端继续。",
+        "sms" => "页面要求短信验证码,Agent 无法获取。请把手机收到的验证码数字直接输入在弹窗输入框,点『提交 / 继续』。",
+        "qr_login" => "页面要求扫码登录。请人工用手机完成扫码/确认后回到弹窗点『提交 / 继续』。",
         "login" => {
-            "页面要求账号密码登录。请人工在浏览器窗口完成登录后回到终端确认(不要把密码发给 Agent)。"
+            "页面要求账号密码登录。请人工在浏览器窗口完成登录后回到弹窗点『提交 / 继续』(不要把密码发给 Agent)。"
         }
         "real_name" => {
-            "页面要求实名认证/上传身份证/人脸核身,Agent 无法代为核验。请人工在浏览器窗口完成验证(刷脸/上传证件)后回到终端继续。"
+            "页面要求实名认证/上传身份证/人脸核身,Agent 无法代为核验。请人工在浏览器窗口完成验证(刷脸/上传证件)后回到弹窗点『提交 / 继续』。"
         }
         "two_factor" => {
-            "页面要求二次验证(2FA/TOTP/邮箱验证码)。请把手机 Authenticator 或邮箱里看到的动态码直接输入在下方。"
+            "页面要求二次验证(2FA/TOTP/邮箱验证码)。请把手机 Authenticator 或邮箱里看到的动态码直接输入在弹窗输入框,点『提交 / 继续』。"
         }
         "oauth" => {
-            "页面跳到第三方授权页(GitHub/微信/Google/SSO 等),Agent 无法跨设备授权。请人工在浏览器窗口完成授权后回到终端继续。"
+            "页面跳到第三方授权页(GitHub/微信/Google/SSO 等),Agent 无法跨设备授权。请人工在浏览器窗口完成授权后回到弹窗点『提交 / 继续』。"
         }
-        "manual_verify" => "页面流程需要人工核验/确认。请人工在浏览器窗口完成后回到终端继续。",
+        "manual_verify" => "页面流程需要人工核验/确认。请人工在浏览器窗口完成后回到弹窗点『提交 / 继续』。",
         _ => "Agent 无法继续当前流程,需要人工处理。",
     }
 }
@@ -299,6 +308,8 @@ impl HumanAssistHub {
         };
 
         // 第 130 轮:桌面弹窗前端(独立任务;槽位释放即 drop → kill_on_drop 回收弹窗进程)。
+        // 第 145 轮:display 已 move 进弹窗任务,循环内用自己的 id 副本(动态截止收口用)。
+        let request_id = display.id;
         if gui {
             {
                 let mut state = lock_state(&self.state);
@@ -310,50 +321,115 @@ impl HumanAssistHub {
             });
         }
 
-        match tokio::time::timeout(Duration::from_millis(timeout_ms), receiver).await {
-            // 通道正常收到回答
-            Ok(Ok((Some(answer), via))) => {
+        // 第 145 轮:等待循环改为「动态截止时刻」——弹窗「⏱ +2 分钟」按钮经
+        // [`HumanAssistHub::extend_timeout`] 累计延长量,每轮重算 remaining。
+        let mut receiver = receiver;
+        let base_deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let deadline =
+                base_deadline + Duration::from_millis(self.extension_of(request_id));
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                // 已过截止(理论上首轮不会走到;延长后重入时可能):按超时收口。
+                return self.finish_timeout(request_id);
+            };
+            let answered = tokio::select! {
+                res = &mut receiver => Some(res),
+                _ = tokio::time::sleep(remaining) => None,
+            };
+            if let Some(res) = answered {
                 self.slot_free.notify_waiters();
-                HumanAssistOutcome::Answered { text: answer, via }
-            }
-            // respond(None):人工取消
-            Ok(Ok((None, via))) => {
-                self.slot_free.notify_waiters();
-                HumanAssistOutcome::Cancelled { via }
-            }
-            // responder 被 drop(cancel_pending / 进程收尾):视为不可用
-            Ok(Err(_)) => {
-                self.slot_free.notify_waiters();
-                HumanAssistOutcome::Unavailable
-            }
-            // 超时:若槽位仍是本请求则清掉
-            Err(_) => {
-                let via = {
-                    let mut state = lock_state(&self.state);
-                    // seq 单调递增且只有入位才自增:current.id == seq 即本请求;
-                    // 若期间已被 respond 清槽(current=None),同样无需处理。
-                    let seq = state.seq;
-                    let mine = state.current.as_ref().map(|c| c.display.id) == Some(seq);
-                    let was_gui = state.gui_id == Some(seq);
-                    if mine {
-                        state.current = None;
-                        state.gui_id = None;
-                        if was_gui {
-                            push_event(&mut state, AssistEvent::GuiTimeout { id: seq });
-                        }
-                    }
-                    if was_gui {
-                        AssistVia::Gui
-                    } else {
-                        AssistVia::Tui
-                    }
+                return match res {
+                    // 通道正常收到回答
+                    Ok((Some(answer), via)) => HumanAssistOutcome::Answered { text: answer, via },
+                    // respond(None):人工取消
+                    Ok((None, via)) => HumanAssistOutcome::Cancelled { via },
+                    // responder 被 drop(cancel_pending / 进程收尾):视为不可用
+                    Err(_) => HumanAssistOutcome::Unavailable,
                 };
-                self.slot_free.notify_waiters();
-                // 第 119 轮:通知 TUI 协程 hub 已超时, 让它立即清理视觉(避免卡死)。
-                self.timeout_notify.notify_waiters();
-                HumanAssistOutcome::Timeout { via }
             }
+            // 超时臂醒来,两步竞态宽容(顺序不可换):
+            // ① respond 可能恰与截止同时到达 —— 先非阻塞收一次应答。不能只靠
+            //    下面的延长量复核判定:respond 会清空 extend_ms,刚批准的延长会
+            //    「隐身」,把已作答的请求误收成 Timeout(单测锁死该竞态)。
+            if let Ok(v) = receiver.try_recv() {
+                self.slot_free.notify_waiters();
+                return match v {
+                    (Some(answer), via) => HumanAssistOutcome::Answered { text: answer, via },
+                    (None, via) => HumanAssistOutcome::Cancelled { via },
+                };
+            }
+            // ② 截止瞬间恰有延长到达(尚未被 respond 清空)→ 按新截止继续等。
+            let extended =
+                base_deadline + Duration::from_millis(self.extension_of(request_id));
+            if extended > tokio::time::Instant::now() {
+                continue;
+            }
+            return self.finish_timeout(request_id);
         }
+    }
+
+    /// 超时收口(原 request 内联逻辑,第 145 轮抽出供动态截止循环复用):
+    /// 若槽位仍是本请求则清掉,通知 TUI 协程清理视觉,返回 Timeout。
+    fn finish_timeout(&self, id: u64) -> HumanAssistOutcome {
+        let via = {
+            let mut state = lock_state(&self.state);
+            // seq 单调递增且只有入位才自增:current.id == id 即本请求;
+            // 若期间已被 respond 清槽(current=None),同样无需处理。
+            let mine = state.current.as_ref().map(|c| c.display.id) == Some(id);
+            let was_gui = state.gui_id == Some(id);
+            if mine {
+                state.current = None;
+                state.gui_id = None;
+                state.extend_ms = None;
+                if was_gui {
+                    push_event(&mut state, AssistEvent::GuiTimeout { id });
+                }
+            }
+            if was_gui {
+                AssistVia::Gui
+            } else {
+                AssistVia::Tui
+            }
+        };
+        self.slot_free.notify_waiters();
+        // 第 119 轮:通知 TUI 协程 hub 已超时, 让它立即清理视觉(避免卡死)。
+        self.timeout_notify.notify_waiters();
+        HumanAssistOutcome::Timeout { via }
+    }
+
+    /// 第 145 轮:读取指定请求的累计延长毫秒数(等待循环每轮重读)。
+    fn extension_of(&self, id: u64) -> u64 {
+        lock_state(&self.state)
+            .extend_ms
+            .filter(|(eid, _)| *eid == id)
+            .map(|(_, ms)| ms)
+            .unwrap_or(0)
+    }
+
+    /// 第 145 轮:延长当前请求的等待时限(弹窗「⏱ +2 分钟」按钮 → 子进程 stdout
+    /// `{"status":"extend"}` 中间行 → `human_ui::run_dialog_process` 调用)。
+    ///
+    /// - 仅当 `id` 仍是当前槽位请求时生效(弹窗延迟到达的 extend 行不复活旧请求);
+    /// - 累计延长后**总等待时长**封顶 [`MAX_HUMAN_ASSIST_TIMEOUT_MS`](原始 timeout_ms
+    ///   + 累计延长 ≤ 30 分钟,与 clamp 语义同源);
+    /// - 生效时入 `GuiExtended` 事件(TUI 打「已延长等待」通知行)。
+    pub fn extend_timeout(&self, id: u64, ms: u64) -> bool {
+        let mut state = lock_state(&self.state);
+        if state.current.as_ref().map(|c| c.display.id) != Some(id) {
+            return false;
+        }
+        let base = state
+            .current
+            .as_ref()
+            .map(|c| c.display.timeout_ms)
+            .unwrap_or(0);
+        let cap = MAX_HUMAN_ASSIST_TIMEOUT_MS.saturating_sub(base);
+        let acc = state.extend_ms.filter(|(eid, _)| *eid == id).map(|(_, m)| m).unwrap_or(0);
+        let added = ms.min(cap.saturating_sub(acc));
+        state.extend_ms = Some((id, acc + added));
+        push_event(&mut state, AssistEvent::GuiExtended { id, added_ms: added });
+        true
     }
 
     /// 弹窗前端呈现任务:应答经 respond 回填;失败降级 TUI;槽位提前释放即丢弃
@@ -434,8 +510,11 @@ impl HumanAssistHub {
                 Some(cur) if cur == id => state.current.take(),
                 _ => None,
             };
-            if taken.is_some() && state.gui_id == Some(id) {
-                state.gui_id = None;
+            if taken.is_some() {
+                state.extend_ms = None;
+                if state.gui_id == Some(id) {
+                    state.gui_id = None;
+                }
             }
             taken
         };
@@ -481,6 +560,7 @@ impl HumanAssistHub {
         drop(taken);
         {
             let mut state = lock_state(&self.state);
+            state.extend_ms = None;
             if state.gui_id == Some(id) {
                 state.gui_id = None;
             }
@@ -491,7 +571,11 @@ impl HumanAssistHub {
 
     /// 任务收尾兜底:丢弃未答请求(responder drop → 工具侧 Unavailable)。
     pub fn cancel_pending(&self) {
-        drop(lock_state(&self.state).current.take());
+        {
+            let mut state = lock_state(&self.state);
+            drop(state.current.take());
+            state.extend_ms = None;
+        }
         self.slot_free.notify_waiters();
         // 第 119 轮:任务收尾时也通知 TUI, 让它清理残留视觉。
         self.timeout_notify.notify_waiters();
@@ -871,6 +955,101 @@ mod tests {
             }
         );
         reset_ui_hooks();
+        hub.detach();
+    }
+
+    /// 第 145 轮:「⏱ +2 分钟」延长等待 —— 过原始截止时刻槽位仍存活、应答路径
+    /// 不受影响、收口后对旧 id 的延长请求失效。
+    #[tokio::test(start_paused = true)]
+    async fn extend_timeout_pushes_deadline_and_expires_with_slot() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_ui_hooks();
+        let hub = HumanAssistHub::global();
+        hub.attach();
+        let task = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.request("captcha", "x", vec![], "", "p_x", MIN_HUMAN_ASSIST_TIMEOUT_MS, "")
+                    .await
+            }
+        });
+        let display = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(d) = hub.poll() {
+                    break d;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("poll 应拿到请求");
+        // 原始截止前延长 +10s(总等待 20s)
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(hub.extend_timeout(display.id, 10_000), "槽位匹配的延长应生效");
+        // 过原始 10s 截止:槽位仍存活
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(hub.poll().is_some(), "延长后不应在原截止时刻被清槽");
+        // 应答照常回填
+        assert!(hub.respond(display.id, Some("z7z2".into()), AssistVia::Tui));
+        assert_eq!(
+            task.await.unwrap(),
+            HumanAssistOutcome::Answered {
+                text: "z7z2".into(),
+                via: AssistVia::Tui
+            }
+        );
+        // 收口后对旧 id 的延长不再生效
+        assert!(!hub.extend_timeout(display.id, 10_000));
+        hub.detach();
+    }
+
+    /// 第 145 轮:延长只推迟不取消超时 —— 延长量耗尽后仍按 Timeout 收口;
+    /// 累计延长封顶 = MAX_HUMAN_ASSIST_TIMEOUT_MS - 原始 timeout_ms。
+    #[tokio::test(start_paused = true)]
+    async fn timeout_still_fires_after_extension_expires() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_ui_hooks();
+        let hub = HumanAssistHub::global();
+        hub.attach();
+        let task = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.request("captcha", "x", vec![], "", "p_x2", MIN_HUMAN_ASSIST_TIMEOUT_MS, "")
+                    .await
+            }
+        });
+        let display = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(d) = hub.poll() {
+                    break d;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("poll 应拿到请求");
+        // 延长到总等待上限(10s 原始 + 1790s = 1800s):单次给超大值应被 cap 收敛
+        assert!(hub.extend_timeout(display.id, u64::MAX));
+        assert_eq!(
+            hub.extension_of(display.id),
+            MAX_HUMAN_ASSIST_TIMEOUT_MS - MIN_HUMAN_ASSIST_TIMEOUT_MS,
+            "累计延长应封顶在 MAX - 原始 timeout"
+        );
+        // id 仍匹配 → 受理返回 true,但累计量不再增长
+        assert!(hub.extend_timeout(display.id, 10_000));
+        assert_eq!(
+            hub.extension_of(display.id),
+            MAX_HUMAN_ASSIST_TIMEOUT_MS - MIN_HUMAN_ASSIST_TIMEOUT_MS,
+            "到达上限后延长不再累计"
+        );
+        tokio::time::advance(Duration::from_secs(1_900)).await;
+        assert_eq!(
+            task.await.unwrap(),
+            HumanAssistOutcome::Timeout {
+                via: AssistVia::Tui
+            }
+        );
+        assert!(hub.poll().is_none(), "超时后槽位应被清理");
         hub.detach();
     }
 

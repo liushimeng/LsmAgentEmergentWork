@@ -212,6 +212,9 @@ pub fn fmt_local_ms(ms: u64) -> String {
 // ---------- 弹窗结果解析(纯函数,可单测) ----------
 
 /// 弹窗子进程 stdout → [`UiResult`](容错:取最后一个含 `status` 的 JSON 行)。
+///
+/// 第 145 轮:`extend` 是**中间行**(「⏱ +2 分钟」按钮的延长通知,进程不退出、
+/// 结果仍在最后),解析时显式跳过,不落入「未知弹窗结果」。
 pub fn parse_result(stdout: &str) -> UiResult {
     for line in stdout.lines().rev() {
         let t = line.trim();
@@ -231,6 +234,7 @@ pub fn parse_result(stdout: &str) -> UiResult {
             .trim()
             .to_string();
         return match status {
+            "extend" => continue, // 中间行:继续往前找真正的收口行
             "answer" if !text.is_empty() => UiResult::Answered(text),
             "answer" => UiResult::Error("弹窗返回空应答".into()),
             "cancel" => UiResult::Cancelled,
@@ -245,6 +249,23 @@ pub fn parse_result(stdout: &str) -> UiResult {
     }
     let head: String = stdout.trim().chars().take(120).collect();
     UiResult::Error(format!("弹窗输出无法解析: {head}"))
+}
+
+/// 第 145 轮:解析弹窗子进程的 `extend` **中间行**
+/// `{"status":"extend","id":<请求id>,"ms":<延长毫秒>}`(「⏱ +2 分钟」按钮)。
+/// 非延长行 / 字段缺失 / ms=0 一律返回 None(容错,绝不因瑕疵 panic)。
+pub fn parse_extend_line(line: &str) -> Option<(u64, u64)> {
+    let t = line.trim();
+    if t.is_empty() || !t.starts_with('{') {
+        return None;
+    }
+    let v = serde_json::from_str::<Value>(t).ok()?;
+    if v.get("status").and_then(|s| s.as_str())? != "extend" {
+        return None;
+    }
+    let id = v.get("id").and_then(Value::as_u64)?;
+    let ms = v.get("ms").and_then(Value::as_u64).filter(|ms| *ms > 0)?;
+    Some((id, ms))
 }
 
 // ---------- 呈现入口 ----------
@@ -296,7 +317,15 @@ fn dialog_exe() -> Result<std::path::PathBuf, String> {
 }
 
 /// 启动原生弹窗子进程并等待应答(kill_on_drop 保证被 drop 即回收,窗口消失)。
+///
+/// 第 145 轮:stdout 从「整体 `.output()`」改为 **piped 逐行流式读** —— 弹窗内
+/// 「⏱ +2 分钟」按钮会随时输出 `{"status":"extend",...}` 中间行(进程不退出),
+/// 父进程必须即时把它接线到 `HumanAssistHub::extend_timeout` 才能真正推迟 hub 侧
+/// 截止时刻;其余行留存到进程退出后交 [`parse_result`] 收口解析。stderr 并联排空
+/// (防子进程写满 pipe 缓冲阻塞),失败路径语义与旧 `.output()` 版本一致。
 async fn run_dialog_process(payload_path: &std::path::Path) -> UiResult {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
     let exe = match dialog_exe() {
         Ok(p) => p,
         Err(e) => return UiResult::Error(e),
@@ -305,21 +334,60 @@ async fn run_dialog_process(payload_path: &std::path::Path) -> UiResult {
         HITL_DIALOG_COMMAND.into(),
         payload_path.as_os_str().to_owned(),
     ];
-    match tokio::process::Command::new(exe)
+    let mut child = match tokio::process::Command::new(exe)
         .args(args)
         .kill_on_drop(true)
-        .output()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
     {
-        Ok(out) if out.status.success() => parse_result(&String::from_utf8_lossy(&out.stdout)),
-        Ok(out) => {
-            let stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
+        Ok(c) => c,
+        Err(e) => return UiResult::Error(format!("弹窗子进程启动失败: {e}")),
+    };
+    let mut stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return UiResult::Error("弹窗子进程 stdout 未接管".into()),
+    };
+    let mut stderr_pipe = match child.stderr.take() {
+        Some(s) => s,
+        None => return UiResult::Error("弹窗子进程 stderr 未接管".into()),
+    };
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf).await;
+        buf
+    });
+    // 逐行读:extend 中间行即时接线 hub,其余行留存供收口解析。
+    let mut kept: Vec<String> = Vec::new();
+    let mut lines = BufReader::new(&mut stdout).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let t = line.trim().to_string();
+                if t.is_empty() {
+                    continue;
+                }
+                if let Some((id, ms)) = parse_extend_line(&t) {
+                    crate::agent::human_assist::HumanAssistHub::global().extend_timeout(id, ms);
+                } else {
+                    kept.push(t);
+                }
+            }
+            _ => break,
+        }
+    }
+    let status = child.wait().await;
+    let stderr = stderr_task.await.unwrap_or_default();
+    match status {
+        Ok(st) if st.success() => parse_result(&kept.join("\n")),
+        Ok(st) => {
+            let s: String = stderr.chars().take(200).collect();
             UiResult::Error(format!(
-                "弹窗子进程退出码 {}: {stderr}",
-                out.status.code().unwrap_or(-1)
+                "弹窗子进程退出码 {}: {s}",
+                st.code().unwrap_or(-1)
             ))
         }
-        Err(e) => UiResult::Error(format!("弹窗子进程启动失败: {e}")),
+        Err(e) => UiResult::Error(format!("弹窗子进程等待失败: {e}")),
     }
 }
 

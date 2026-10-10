@@ -1,7 +1,7 @@
 //! MCP_Web_Use 工具单元测试(自 tools/browser.rs 测试平移 + 单工具化改造)。
 
 use super::*;
-use super::{control, extract, inspect, page_state};
+use super::{control, extract, hitl_hint, inspect, page_state};
 use base64::Engine as _;
 
 #[test]
@@ -1437,4 +1437,38 @@ async fn real_credential_zone_probe_and_subframe_fail_open() {
     let _ = McpWebUseTool
         .execute(json!({"action": "close", "page_id": "all"}))
         .await;
+}
+
+// ==================== 第 145 轮:HITL 应答 next_hint 分流(输码 vs 已完成) ====================
+
+/// 人工在弹窗输入验证码文本(实测 z7z2 场景)→ 必须指引立即 input_text 填码提交;
+/// 点选选项(「N. 选项」形态)→ 才走 inspect 验证;其它 reason 自由文本 → 通用提示。
+#[test]
+fn hitl_answer_hint_splits_typed_code_vs_option_pick() {
+    // 自由文本验证码(captcha 实测形态)
+    let h = hitl_hint::hitl_answer_hint("captcha", "z7z2");
+    assert!(h.contains("input_text"), "captcha 自由文本应指引填码: {h}");
+    assert!(!h.contains("inspect 验证页面当前状态"), "不应再让 Agent 只观望: {h}");
+    // sms / two_factor 同款
+    assert!(hitl_hint::hitl_answer_hint("sms", "482913").contains("input_text"));
+    assert!(hitl_hint::hitl_answer_hint("two_factor", "993 041").contains("input_text"));
+    // 选项应答(弹窗选项 / TUI 数字映射共用「N. 选项」形态)
+    let h = hitl_hint::hitl_answer_hint("captcha", "1. 我已完成人工操作,继续");
+    assert!(h.contains("inspect"), "选项应答应走 inspect 验证: {h}");
+    assert!(hitl_hint::hitl_answer_hint("login", "2. 我已登录完成").contains("inspect"));
+    // 其它 reason 自由文本:通用提示,不误指填码
+    let h = hitl_hint::hitl_answer_hint("custom", "跳过这个站点");
+    assert!(h.contains("human_response"), "{h}");
+    assert!(!h.contains("input_text"), "非验证码 reason 不应指引填码: {h}");
+}
+
+/// 「N. 选项」形态判定:数字前缀 + ". " 分隔;纯数字验证码/含点文本不误判。
+#[test]
+fn option_pick_answer_shape_detection() {
+    for s in ["1. 我已完成人工操作,继续", "12. 某选项", " 3. 带空格前缀"] {
+        assert!(hitl_hint::is_option_pick_answer(s), "「{s}」应识别为选项应答");
+    }
+    for s in ["z7z2", "482913", "993 041", "3.14 是圆周率吗", "选项一", ""] {
+        assert!(!hitl_hint::is_option_pick_answer(s), "「{s}」不应识别为选项应答");
+    }
 }

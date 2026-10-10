@@ -10,6 +10,9 @@ use std::path::Path;
 /// 弹窗侧实际需要的 payload 投影(容错反序列化:字段缺失/类型不符一律回退默认,
 /// 绝不因 payload 瑕疵 panic —— 失败语义统一走 `error` 结果 JSON)。
 pub(super) struct DialogPayload {
+    /// 请求 id(第 145 轮):「⏱ +2 分钟」延长中间行要携带它,父进程据此对号入座
+    /// 到 hub 当前槽位。
+    pub id: u64,
     pub kind_label: String,
     pub message: String,
     pub url: String,
@@ -50,6 +53,7 @@ impl DialogPayload {
             }
         };
         DialogPayload {
+            id: v.get("id").and_then(|x| x.as_u64()).unwrap_or(0),
             kind_label,
             message: str_field("message"),
             url: str_field("url"),
@@ -150,6 +154,23 @@ pub(super) fn countdown_text(elapsed_ms: u64, remain_ms: u64) -> String {
     )
 }
 
+// ---------- 第 145 轮:「⏱ +2 分钟」延长等待(两平台共用) ----------
+
+/// 每次延长按钮增加的等待毫秒数。
+pub(super) const EXTEND_STEP_MS: u64 = 120_000;
+/// 延长按钮标题(点击后标题追加 ×N 计数,见两平台实现)。
+pub(super) const EXTEND_BTN_TITLE: &str = "⏱ +2分钟";
+/// 总等待(原始 timeout_ms + 累计延长)封顶,与父进程
+/// `human_assist::MAX_HUMAN_ASSIST_TIMEOUT_MS` 同源(同 binary,无版本漂移)。
+pub(super) const MAX_TOTAL_WAIT_MS: u64 = crate::agent::human_assist::MAX_HUMAN_ASSIST_TIMEOUT_MS;
+
+/// 延长中间行:`{"status":"extend","id":<请求id>,"ms":<实际延长毫秒>}`。
+/// 子进程**不退出**,println! 即时flush(Stdout 行缓冲),父进程逐行读并接线
+/// `HumanAssistHub::extend_timeout`。
+pub(super) fn extend_line(id: u64, ms: u64) -> String {
+    serde_json::json!({"status": "extend", "id": id, "ms": ms}).to_string()
+}
+
 /// 子进程主入口:返回进程退出码(0 = 正常收口,含 timeout/error JSON)。
 pub fn run(payload_path: &Path) -> i32 {
     let (status, text) = match read_payload(payload_path) {
@@ -203,18 +224,33 @@ mod tests {
     #[test]
     fn payload_projection_keeps_fields() {
         let v = serde_json::json!({
-            "kind": "sms", "kind_label": "短信验证码",
+            "id": 7, "kind": "sms", "kind_label": "短信验证码",
             "message": "请输入验证码", "options": ["继续", "取消任务"],
             "url": "https://example.com/login", "page_id": "p_1",
             "image_path": "/tmp/x.png", "timeout_ms": 300000,
             "started_at_ms": 1759991525000u64
         });
         let p = DialogPayload::from_json(&v);
+        assert_eq!(p.id, 7);
         assert_eq!(p.kind_label, "短信验证码");
         assert_eq!(p.options.len(), 2);
         assert_eq!(p.timeout_ms, 300_000);
         assert!(p.info_text().contains("页面: https://example.com/login"));
         assert!(p.info_text().contains("页面ID: p_1"));
+    }
+
+    /// 第 145 轮:延长中间行必须是父进程 `parse_extend_line` 认识的形状。
+    #[test]
+    fn extend_line_roundtrips_with_parent_parser() {
+        let line = extend_line(42, 120_000);
+        assert_eq!(
+            crate::agent::human_ui::parse_extend_line(&line),
+            Some((42, 120_000))
+        );
+        // 常量成对:按钮标题 / 步长 / 总上限
+        assert_eq!(EXTEND_BTN_TITLE, "⏱ +2分钟");
+        assert_eq!(EXTEND_STEP_MS, 120_000);
+        assert_eq!(MAX_TOTAL_WAIT_MS, 1_800_000);
     }
 
     #[test]

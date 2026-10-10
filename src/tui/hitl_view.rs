@@ -312,7 +312,7 @@ pub fn print_human_assist_gui_notice(
         println!();
     }
     out.write_line(&format!(
-        "  [laew] 🖥 已弹出人工介入弹窗({platform}),请在弹窗中作答(点选项/输入文本/取消)"
+        "  [laew] 🖥 已弹出人工介入弹窗({platform}),请在弹窗中作答(输入文本/点选项;在浏览器完成操作后点『提交 / 继续』让 Agent 接管)"
     ));
     out.write_line(&format!(
         "  [laew]   类型: {} | 提出 {} | 超时 {}(剩余 {}s)",
@@ -335,7 +335,7 @@ pub fn print_human_assist_gui_notice(
         ));
     }
     out.write_line(&format!(
-        "  [laew]   (弹窗无响应?终端输入 `{HITL_ESCAPE_PREFIX} <应答>` 应急作答,如 `{HITL_ESCAPE_PREFIX} 2t6x`;Ctrl-C 可直接取消任务)"
+        "  [laew]   (弹窗内可点『⏱ +2分钟』延长等待;弹窗无响应?终端输入 `{HITL_ESCAPE_PREFIX} <应答>` 应急作答,如 `{HITL_ESCAPE_PREFIX} 2t6x`;Ctrl-C 可直接取消任务)"
     ));
 }
 
@@ -354,6 +354,13 @@ pub fn print_assist_event(ev: &AssistEvent, out: AssistOut) {
         }
         AssistEvent::GuiTimeout { .. } => {
             "  [laew] 人工介入弹窗等待超时,任务按超时路径继续".to_string()
+        }
+        AssistEvent::GuiExtended { id: _, added_ms } => {
+            if *added_ms == 0 {
+                "  [laew] 人工已在弹窗请求延长等待,但已到达总上限(30 分钟),不再延长".to_string()
+            } else {
+                format!("  [laew] 人工已在弹窗延长等待 +{} 秒", added_ms / 1000)
+            }
         }
         AssistEvent::TuiEscapeAnswered { id, text } => match text {
             Some(t) => format!("  [laew] 已收到人工输入(终端 {HITL_ESCAPE_PREFIX}):{t}"),

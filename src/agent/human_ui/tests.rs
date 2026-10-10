@@ -100,6 +100,66 @@ fn parse_result_tolerates_noise_and_unknown() {
     assert!(matches!(parse_result(""), UiResult::Error(_)));
 }
 
+/// 第 145 轮:extend 是**中间行**(「⏱ +2 分钟」延长通知,进程不退出),收口
+/// 解析必须跳过它取真正的结果行;只有 extend 行时不得误当结果。
+#[test]
+fn parse_result_skips_extend_intermediate_lines() {
+    let out = "{\"status\":\"extend\",\"id\":7,\"ms\":120000}\n{\"status\":\"answer\",\"text\":\"z7z2\"}\n";
+    assert_eq!(parse_result(out), UiResult::Answered("z7z2".into()));
+    assert!(matches!(
+        parse_result("{\"status\":\"extend\",\"id\":7,\"ms\":120000}"),
+        UiResult::Error(_)
+    ));
+}
+
+/// 第 145 轮:extend 中间行解析(与 `dialog_main::extend_line` 互为往返)。
+#[test]
+fn parse_extend_line_shapes() {
+    assert_eq!(
+        parse_extend_line("{\"status\":\"extend\",\"id\":42,\"ms\":120000}"),
+        Some((42, 120_000))
+    );
+    assert_eq!(
+        parse_extend_line(&dialog_main::extend_line(9, 60_000)),
+        Some((9, 60_000))
+    );
+    // 非延长行 / 缺 id / ms=0 / 非 JSON → None(容错,不 panic)
+    assert_eq!(parse_extend_line("{\"status\":\"answer\",\"text\":\"ok\"}"), None);
+    assert_eq!(parse_extend_line("{\"status\":\"extend\",\"ms\":1000}"), None);
+    assert_eq!(parse_extend_line("{\"status\":\"extend\",\"id\":1,\"ms\":0}"), None);
+    assert_eq!(parse_extend_line("garbage"), None);
+    assert_eq!(parse_extend_line(""), None);
+}
+
+/// 第 145 轮:子进程链路对 extend 中间行的容错 —— 假弹窗先打延长行(此时无 hub
+/// 槽位对应,延长不生效也不 panic)再打结果行,`present` 仍正确解析为应答,
+/// 证明 stdout 已切换为逐行流式读。
+#[cfg(unix)]
+#[test]
+fn present_tolerates_extend_lines_from_dialog_process() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_test_backend(None);
+    let dir = std::env::temp_dir().join(format!("laew_ui_ext_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("fake-dialog-extend.sh");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\n# 假弹窗:先打 extend 中间行再打结果 JSON\necho '{\"status\":\"extend\",\"id\":7,\"ms\":120000}'\nsleep 0.2\necho '{\"status\":\"answer\",\"text\":\"654321\"}'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("LAEW_HITL_DIALOG_EXE", &exe);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let out = rt.block_on(present(&sample_display()));
+    std::env::remove_var("LAEW_HITL_DIALOG_EXE");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out, UiResult::Answered("654321".into()));
+}
+
 #[test]
 fn enabled_test_override_and_env_off() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());

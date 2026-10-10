@@ -1259,6 +1259,11 @@ pub fn human_assist_reasons_doc() -> String {
 ///   非屏蔽区域,其余保持 Agent 管控,最小权限;状态条第三行引导人工);
 /// - `allow` 为空:整页 open(第 143 轮行为,探测不到凭证区的回退档)。
 ///
+/// 第 145 轮:两档的引导 note 都指明收口动作「回到弹窗点『提交 / 继续』」——
+/// 管控三档(locked/open/partial)只在 Agent 全面操作时生效;HITL 期间是临时放行态,
+/// 人工完成操作后的交棒动作必须显性可见(实测反馈:整页 open 回退档只有通用
+/// 「页面开放」状态条,人工不知道做完要去弹窗点继续)。
+///
 /// 成功返回导航重放协程句柄(提问期间人工提交登录触发导航时重放临时态);
 /// 应用失败返回 None(等同未解锁,提问照常进行,fail-open)。
 async fn apply_hitl_unlock(
@@ -1267,10 +1272,12 @@ async fn apply_hitl_unlock(
 ) -> Option<tokio::task::JoinHandle<()>> {
     use crate::agent::browser_overlay::{apply_page_guard, PageGuardConfig};
     let cfg = if allow.is_empty() {
-        PageGuardConfig::open()
+        let mut c = PageGuardConfig::open();
+        c.note = Some("人工介入中·页面临时开放,完成后回弹窗点『提交 / 继续』".to_string());
+        c
     } else {
         let mut c = PageGuardConfig::partial(allow.to_vec(), vec![]);
-        c.note = Some("人工输入区已开放(部分锁定),完成后应答弹窗".to_string());
+        c.note = Some("人工输入区已开放(部分锁定),完成后回弹窗点『提交 / 继续』".to_string());
         c
     };
     apply_page_guard(page, &cfg).await.ok()?;
@@ -1464,10 +1471,9 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                     "image_source": image_source,
                     "image_mode": image_mode,
                     "image_clip": image_clip,
-                    "next_hint": match reason {
-                        "sms" | "two_factor" => "把 human_response 中的验证码/动态码用 input_text 填入对应输入框后继续流程",
-                        _ => "人工已完成操作,请 inspect 验证页面状态后继续流程",
-                    },
+                    // 第 145 轮:按「输码 vs 已完成」分流 —— 自由文本(验证码)+ captcha/
+                    // sms/two_factor → 立即 input_text 填码提交;选项应答 → inspect 验证。
+                    "next_hint": super::hitl_hint::hitl_answer_hint(reason, &answer),
                 }),
             )
         }
