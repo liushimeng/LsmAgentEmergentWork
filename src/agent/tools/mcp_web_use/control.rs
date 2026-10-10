@@ -1253,6 +1253,30 @@ pub fn human_assist_reasons_doc() -> String {
     HUMAN_ASSIST_ALLOWED_REASONS.join("/")
 }
 
+/// 应用 HITL 提问期间的临时放行态(第 144 轮,纯应用不落期望态)。
+///
+/// - `allow` 非空:**partial + 白名单挖洞**(账号/密码/验证码等人工必填区域成为
+///   非屏蔽区域,其余保持 Agent 管控,最小权限;状态条第三行引导人工);
+/// - `allow` 为空:整页 open(第 143 轮行为,探测不到凭证区的回退档)。
+///
+/// 成功返回导航重放协程句柄(提问期间人工提交登录触发导航时重放临时态);
+/// 应用失败返回 None(等同未解锁,提问照常进行,fail-open)。
+async fn apply_hitl_unlock(
+    page: &chromiumoxide::Page,
+    allow: &[String],
+) -> Option<tokio::task::JoinHandle<()>> {
+    use crate::agent::browser_overlay::{apply_page_guard, PageGuardConfig};
+    let cfg = if allow.is_empty() {
+        PageGuardConfig::open()
+    } else {
+        let mut c = PageGuardConfig::partial(allow.to_vec(), vec![]);
+        c.note = Some("人工输入区已开放(部分锁定),完成后应答弹窗".to_string());
+        c
+    };
+    apply_page_guard(page, &cfg).await.ok()?;
+    Some(super::unlock_zone::spawn_unlock_reassert(page.clone(), cfg))
+}
+
 /// control_action=request_human:人工介入请求(HITL 闭环)。
 ///
 /// 流程:可选 `bring_to_front`(默认 true)把浏览器窗口带到前台 → 第 132 轮:
@@ -1312,21 +1336,59 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     });
     let bring = p.get("bring_to_front").and_then(Value::as_bool).unwrap_or(true);
 
-    // 第 143 轮:人工介入期间默认解锁页面(unlock_page=true)—— HITL 正是「该人工
-    // 操作」的时刻(拖滑块/扫码页/登录表单),保持管控会让介入形同虚设。
-    // locked/partial 下**临时切 open**(CDP 放行 + 蒙层/盾区/状态条全撤,状态条变
-    // 「🔓 页面开放」如实告知人工),应答/超时/取消后按实例期望态恢复原档;
-    // open 档本就开放,无需动作。纯问答场景(确认继续?)可传 unlock_page=false。
+    // 第 144 轮:HITL 凭证区域部分放行 —— unlock_page=true(默认)时优先
+    // **partial + allow_selectors 白名单挖洞**(显式传参 > 自动探测账号/密码/验证码
+    // 等人工必填区域,见 unlock_zone),探测不到才回退整页 open(第 143 轮行为)。
+    // 提问期间人工可能提交表单触发导航(登录→2FA),新文档按烘焙态回锁会打断
+    // 多步人工流程 —— spawn 导航重放协程持续维持临时放行态,收口时回收。
+    // 纯问答场景(确认继续?)可传 unlock_page=false。
     let unlock_page = p.get("unlock_page").and_then(Value::as_bool).unwrap_or(true);
+    let explicit_allow = {
+        let raw: Vec<String> = p
+            .get("allow_selectors")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        super::unlock_zone::sanitize_selector_list(&raw)
+    };
+    let mut unlock_source: &str = "none";
+    let mut unlock_allow: Vec<String> = Vec::new();
+    let mut unlock_reassert: Option<tokio::task::JoinHandle<()>> = None;
     let unlock_applied = unlock_page
         && crate::agent::browser::BrowserManager::global().guard_visuals_active().await
         && crate::agent::browser::BrowserManager::global().current_guard().await.mode
             != crate::agent::browser_overlay::PageGuardMode::Open
         && match crate::agent::browser::BrowserManager::global().page(id).await {
             Some(page) => {
-                crate::agent::browser_overlay::apply_page_overlay(&page, false)
-                    .await
-                    .is_ok()
+                let zones = if !explicit_allow.is_empty() {
+                    unlock_source = "explicit";
+                    explicit_allow.clone()
+                } else {
+                    let z = super::unlock_zone::probe_credential_zones(&page).await;
+                    if !z.is_empty() {
+                        unlock_source = "auto";
+                    }
+                    z
+                };
+                if zones.is_empty() {
+                    unlock_source = "fallback_open";
+                }
+                unlock_allow = zones.clone();
+                match apply_hitl_unlock(&page, &zones).await {
+                    Some(handle) => {
+                        unlock_reassert = Some(handle);
+                        true
+                    }
+                    None => {
+                        unlock_source = "none";
+                        unlock_allow.clear();
+                        false
+                    }
+                }
             }
             None => false,
         };
@@ -1363,10 +1425,14 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     let outcome = crate::agent::human_assist::HumanAssistHub::global()
         .request(reason, &message, options.clone(), &url, id, timeout_ms, &image_path)
         .await;
-    // 第 143 轮:人工介入收口(应答/超时/取消/不可用)后按实例期望态恢复管控
-    // —— 无论何种结局,「人工可操作窗口」都必须关闭,fail-open(恢复失败不阻断
-    // 信封返回,下一个输入动作的「先解/先隐」与导航 re-assert 会自愈)。
+    // 第 143/144 轮:人工介入收口(应答/超时/取消/不可用)后按实例期望态恢复管控
+    // —— 无论何种结局,「人工可操作窗口」都必须关闭:先回收导航重放协程(防恢复后
+    // 又被重放覆盖),再恢复原档;fail-open(恢复失败不阻断信封返回,下一个输入动作
+    // 的「先解/先隐」与导航 re-assert 会自愈)。
     if unlock_applied {
+        if let Some(handle) = unlock_reassert.take() {
+            handle.abort();
+        }
         if let Some(page) = crate::agent::browser::BrowserManager::global().page(id).await {
             let cfg = crate::agent::browser::BrowserManager::global().current_guard().await;
             let _ = crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
@@ -1383,6 +1449,16 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                     "kind_label": label,
                     "human_response": answer,
                     "assist_channel": via.as_str(),
+                    // 第 144 轮:提问期间页面放行方式对账(partial=凭证区挖洞 /
+                    // open=整页回退 / none=未放行;source: explicit|auto|fallback_open|none)。
+                    "page_unlock": json!({
+                        "applied": unlock_applied,
+                        "mode": if !unlock_applied { "none" }
+                            else if unlock_allow.is_empty() { "open" }
+                            else { "partial" },
+                        "allow_selectors": unlock_allow,
+                        "source": unlock_source,
+                    }),
                     // 第 132/133 轮:附图对账(人工读的是哪张图 / 元素裁剪 or 整视口)
                     "image_path": image_path,
                     "image_source": image_source,

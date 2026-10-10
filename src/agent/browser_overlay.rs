@@ -23,6 +23,9 @@
 //!   盾罩吞掉人工输入;黑名单 = 每命中元素一个红调盾罩,白名单 = 允许区并集在视口
 //!   内做「垂直条带分解」求补集(深色调盾罩拼出整屏罩+洞的效果,纯矩形零兼容性
 //!   依赖 —— 实测 `clip-path: path(evenodd,…)` 会被部分 Chrome 版本拒绝,不采纳)。
+//!   第 144 轮:白名单在**子 frame 零命中时不加盾**(fail-open)—— 白名单语义定义
+//!   在主文档坐标空间,跨域验证码 iframe 内部必须放行,整 frame 加盾会把主文档
+//!   挖好的洞从内部锁死;洞外区域由主文档条带盾照拦,安全性不降。
 //!   盾罩同样会吞 Agent 的 CDP 点击(hit-test 层不可区分),partial 下 Agent 输入
 //!   动作「先隐盾后复盾」(`__laewGuardSuspend`,见 `control::guard_lift_for_input`)。
 //!
@@ -360,6 +363,13 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
                         if (x2 - x1 > 0 && y2 - y1 > 0) rects.push([x1, y1, x2, y2]);
                     }
                 } catch (e) {}
+            }
+            if (!rects.length && window.top !== window) {
+                // 第 144 轮:子 frame 白名单零命中 → 本 frame 不加盾(fail-open)。
+                // 白名单语义定义在主文档坐标空间(条带分解已管住整屏可点区域,
+                // iframe 只能落在主文档矩形内,洞外区域主文档盾照拦);跨域验证码
+                // iframe 内部必须放行,整 frame 加盾会把主文档挖好的洞从内部锁死。
+                return;
             }
             const xs = [0, vw];
             for (const [x1, , x2] of rects) { xs.push(x1, x2); }
@@ -791,6 +801,12 @@ mod tests {
         // 盾区技术要点:白名单垂直条带分解求补集(纯矩形,零 clip-path 依赖)+
         // 黑名单红调盾罩 + 标签预算
         assert!(js.contains("垂直条带分解"));
+        // 第 144 轮:子 frame 白名单零命中 fail-open(跨域验证码 iframe 内部放行)
+        assert!(
+            js.contains("window.top !== window"),
+            "子 frame 白名单零命中应跳过加盾"
+        );
+        assert!(js.contains("fail-open"));
         assert!(!js.contains("clipPath"), "不依赖 clip-path(部分 Chrome 拒绝 evenodd path)");
         assert!(js.contains("rgba(185,28,28,0.18)"), "黑名单红调盾罩");
         assert!(js.contains("rgba(15,23,42,0.30)"), "白名单深色盾罩");

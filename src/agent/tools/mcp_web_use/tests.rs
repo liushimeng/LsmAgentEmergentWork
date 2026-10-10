@@ -1326,3 +1326,115 @@ async fn real_browser_tool_guard_modes_end_to_end() {
         .execute(json!({"action": "close", "page_id": "all"}))
         .await;
 }
+
+// =================== 第 144 轮:凭证区域探测 + partial 白名单子 frame fail-open 真浏览器验证(#[ignore]) ===================
+//
+// 覆盖两条关键链路(详案 docs/MCP_Web_Use/08 §4):
+// 1. probe_credential_zones:密码框 → form 容器 + 验证码语义容器,产出主文档选择器;
+// 2. partial 白名单挖洞:洞内(密码框)elementFromPoint 命中本体、洞外命中盾罩;
+//    白名单选择器在子 frame(srcdoc,同源可访问)零命中 → 不加盾(fail-open,
+//    跨域验证码 iframe 内部必须放行);黑名单在子 frame照常加盾。
+// 需要本机安装 Chrome;跑 `cargo test --lib real_credential_zone -- --ignored --nocapture`。
+#[tokio::test]
+#[ignore = "需要本机真实 Chrome(会弹有头窗口);本地手动跑"]
+async fn real_credential_zone_probe_and_subframe_fail_open() {
+    use crate::agent::browser::BrowserManager;
+    let url = "data:text/html,<html><body><form id='login'><input type='text' name='user' placeholder='账号'>\
+               <input type='password' name='pwd'><button type='submit'>go</button></form>\
+               <div class='captcha-box'><iframe srcdoc='<input id=\"inner\">' style='width:160px;height:60px'></iframe></div>\
+               </body></html>";
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url, "window_width": 800, "window_height": 600}))
+        .await
+        .expect("open 失败(本机是否装有 Chrome?)");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], 0, "open 应成功:{out}");
+    let pid = v["data"]["page_id"].as_str().unwrap().to_string();
+    let page = BrowserManager::global().page(&pid).await.expect("page 句柄");
+
+    // ① 凭证区域探测:form(#login)优先 + 验证码语义容器(≥2 条)
+    let zones = super::unlock_zone::probe_credential_zones(&page).await;
+    assert!(!zones.is_empty(), "登录页应探测到凭证区域");
+    assert_eq!(zones[0], "#login", "密码框应容器化到 form#login:{zones:?}");
+    assert!(zones.len() >= 2, "验证码语义容器也应命中:{zones:?}");
+    // 选择器真实命中元素(生成即自验)
+    let hit_check = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "eval_js",
+                        "params": {"expression": format!(
+                            "[{}].map(s => document.querySelectorAll(s).length)",
+                            zones.iter().map(|z| format!("'{z}'")).collect::<Vec<_>>().join(","))}}))
+        .await
+        .unwrap();
+    let hc: Value = serde_json::from_str(&hit_check).unwrap();
+    let counts: Vec<i64> = serde_json::from_str(
+        hc["data"]["result"].as_str().unwrap_or("[]"),
+    )
+    .unwrap_or_default();
+    assert!(
+        counts.iter().all(|c| *c >= 1),
+        "每条探测选择器都应命中 ≥1 元素:{zones:?} → {counts:?}"
+    );
+
+    // ② set_guard 切 partial 白名单(探测到的 zones)→ 洞内可点、洞外被盾吞
+    let sg = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "set_guard",
+                        "params": {"mode": "partial", "allow_selectors": zones.clone(),
+                                   "note": "测试放行"}}))
+        .await
+        .unwrap();
+    let g: Value = serde_json::from_str(&sg).unwrap();
+    assert_eq!(g["code"], 0, "set_guard(partial) 应成功:{sg}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let probe = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "eval_js",
+                        "params": {"expression":
+                            "JSON.stringify((function(){ \
+                             const p = document.querySelector('#login input[type=password]'); \
+                             const r = p.getBoundingClientRect(); \
+                             const inHole = document.elementFromPoint(r.x + r.width/2, r.y + r.height/2); \
+                             const outside = document.elementFromPoint(innerWidth - 5, innerHeight - 5); \
+                             return { inHole: inHole ? inHole.tagName : 'none', \
+                                      outsideShield: !!(outside && outside.closest && outside.closest('#__laew_guard_shields__')) }; })())"}}))
+        .await
+        .unwrap();
+    let p: Value = serde_json::from_str(&probe).unwrap();
+    let payload: Value =
+        serde_json::from_str(p["data"]["result"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+    assert_eq!(payload["inHole"], "INPUT", "洞内(密码框)应命中输入框本体:{probe}");
+    assert_eq!(payload["outsideShield"], true, "洞外应命中盾罩:{probe}");
+
+    // ③ 子 frame fail-open:把管控脚本注入 srcdoc iframe(同源可访问),
+    //    白名单(主文档选择器)在 iframe 零命中 → 0 盾;黑名单命中 → 1 盾。
+    let iframe_cfg = crate::agent::browser_overlay::PageGuardConfig::partial(
+        vec!["#login".to_string()],
+        vec![],
+    );
+    let script_js = crate::agent::browser_overlay::guard_script(&iframe_cfg);
+    let iframe_expr = format!(
+        "(function() {{ \
+          const f = document.querySelector('iframe'); \
+          const w = f && f.contentWindow; \
+          if (!w) return 'no-window'; \
+          w.eval({}); \
+          w.__laewGuardSet('partial', ['#login'], [], null); \
+          const sc = w.document.getElementById('__laew_guard_shields__'); \
+          const allowCount = sc ? sc.childElementCount : -1; \
+          w.__laewGuardSet('partial', [], ['#inner'], null); \
+          const blockCount = sc ? sc.childElementCount : -2; \
+          return allowCount + '/' + blockCount; }})()",
+        super::js_str(&script_js)
+    );
+    let ifr = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "eval_js",
+                        "params": {"expression": iframe_expr}}))
+        .await
+        .unwrap();
+    let iv: Value = serde_json::from_str(&ifr).unwrap();
+    let r = iv["data"]["result"].as_str().unwrap_or("");
+    assert_eq!(r, "0/1", "子 frame 白名单零命中应 0 盾(fail-open),黑名单应 1 盾:{ifr}");
+
+    // ④ 收口:关闭全部页面回收浏览器(全局单例,防污染其它测试)
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}

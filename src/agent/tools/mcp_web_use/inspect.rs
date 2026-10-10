@@ -319,6 +319,17 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                     &["我已完成人工操作,继续", "取消任务"],
                 );
                 super::merge_hint(&mut out, hint);
+                // 第 144 轮:顺带探测凭证输入区(账号/密码/验证码),把选择器挂进
+                // 响应与人机载荷 —— LLM 可直接把 allow_selectors 传给 request_human
+                // 精准放行(自动档探测不命中时的人工兜底通道);fail-open,探测为空
+                // 不加字段(request_human 自动档还有一次机会)。
+                let zones = super::unlock_zone::probe_credential_zones(&page).await;
+                if !zones.is_empty() {
+                    out["credential_zones"] = json!(zones.clone());
+                    if let Some(ha) = out.get_mut("human_assist").and_then(Value::as_object_mut) {
+                        ha.insert("allow_selectors".into(), json!(zones));
+                    }
+                }
             }
             Ok(out)
         }

@@ -1391,11 +1391,15 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,另有「📋 复制」一键复制全部信息。当前实例
     是无头而任务需要可视化时,需先 close(page_id="all") 回收再以 mode=headed 重开;
     合法 reason 列表也可直接读 inspect(info=blockers).available_reasons,避免硬编码。
-    **提问期间页面自动解锁(第 141 轮,第 143 轮扩展到三档)**:request_human 默认
-    unlock_page=true —— locked/partial 下提问前自动临时切 open(蒙层/盾区/状态条
-    全撤,人工可直接在页面上拖滑块/扫码/填表),应答/超时/取消后自动恢复原档;
-    open 档本就开放无需动作。纯问答场景(如「确认继续?」)
-    可传 unlock_page=false 保持管控。
+    **提问期间页面自动放行(第 141 轮,第 143 轮扩展到三档,第 144 轮凭证区挖洞)**:
+    request_human 默认 unlock_page=true —— locked/partial 下提问前自动探测账号/
+    密码/验证码等人工必填输入区并切 partial 白名单挖洞(只有这些区域人工可操作,
+    状态条「🛡 部分锁定·人工输入区已开放」,其余保持锁定;params.allow_selectors
+    可显式指定区域;探测不到凭证区才整页切 open),应答/超时/取消后自动恢复原档;
+    提问期间人工提交表单触发导航会自动重放放行态(登录→2FA 不断链);open 档本就
+    开放无需动作。纯问答场景(如「确认继续?」)可传 unlock_page=false 保持管控;
+    inspect(info=blockers) 命中时 data.credential_zones 给出可直接传
+    allow_selectors 的区域选择器。
     **超时推荐**(第 118 轮):不传 timeout_ms 时由工具按 reason 分档默认超时——
     captcha/sms/two_factor 默认 120_000(2 分钟,短文本回 TUI);qr_login/real_name/oauth/
     login/manual_verify/custom 默认 300_000(5 分钟,扫码/刷脸/账密登录需要更长)。
@@ -1428,7 +1432,8 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     不是页面故障,不要尝试移除蒙层;Agent 自己的 click/input 等输入动作会自动
     「先解后锁」,无须关心;截图/OCR 自动隐藏蒙层,证据不受影响;需要人工直接操作
     页面(拖滑块/扫码/登录)时走 request_human(默认 unlock_page=true:提问期间自动
-    解锁页面,人工应答/超时/取消后自动复锁;纯问答可传 unlock_page=false);运行时
+    放行人工输入区域——账号/密码/验证码区域成为 partial 非屏蔽区域,探测不到才
+    整页开放,人工应答/超时/取消后自动复锁;纯问答可传 unlock_page=false);运行时
     开关 control(set_overlay, enabled;第 143 轮起推荐 control(set_guard));仅 headed 生效,
     hidden 无蒙层。
     **页面管控三档(第 143 轮)**:guard 决定人工对页面的操作权限——locked 屏蔽
@@ -1487,8 +1492,9 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     (默认 9222,LAEW_CHROME_DEBUG_PORT 可改),命中即接管用户已登录的 Chrome
     (保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port
     + data.browser_version + data.connect_mode=true。探测失败返回 code=3002:
-    把 data.relaunch_command 转述给用户执行(或经用户同意后以 auto_relaunch=true
-    重试,由工具自动退出+重启 Chrome 并复制登录态),不要反复重试 open。
+    把 data.relaunch_command 转述给用户执行(或以 auto_relaunch=true 重试,由工具
+    自动复制登录态并另启独立调试实例 —— **不退出、不影响用户已打开的浏览器**),
+    不要反复重试 open。
     ★ connect 模式下 close 只断连、**不会关闭用户的浏览器**,不要试图 close 清场
     (下次任务重新探测接管即可);接管场景管控恒为 open 且零注入(不锁用户输入),
     需要时 control(set_guard, mode="locked")。Linux 服务器上浏览器是内存无头实例,

@@ -9,12 +9,16 @@
 //! 1. **自动探测**:`open(reuse_existing=true)` 探测本机调试端口
 //!    (默认 9222,`LAEW_CHROME_DEBUG_PORT` 可覆盖),命中即接管;
 //! 2. **结构化引导**:探测失败返回 3002 信封 + 平台相关重启命令;
-//! 3. **自动重启接管**:`auto_relaunch=true` 时退出用户 Chrome → 复制
-//!    登录态关键文件到独立调试 profile → 以调试参数重启 → 等端口就绪。
+//! 3. **自动重启接管**:`auto_relaunch=true` 时复制默认 profile 登录态关键文件到
+//!    独立调试 profile → 以调试参数**另启独立 Chrome 实例**(与用户正在运行的
+//!    浏览器并存)→ 等端口就绪。**第 144 轮起绝不退出用户 Chrome**(原实现
+//!    `pkill`/`taskkill` 按进程名误杀用户浏览器,见
+//!    `docs/MCP_Web_Use/08-浏览器进程保护与凭证区域部分放行.md`)。
 //!
 //! 关键约束(Chrome 136+):调试端口在默认 profile 上会被忽略,必须用
 //! 独立 `--user-data-dir`;独立 profile 无登录态,故 auto_relaunch 先复制
-//! 默认 profile 的 Cookies/Local Storage/Session Storage 等关键文件。
+//! 默认 profile 的 Cookies/Local Storage/Session Storage 等关键文件
+//! (用户 Chrome 运行中直接复制,best-effort,单条失败跳过并回报计数)。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,12 +37,6 @@ const RELAUNCH_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 等端口就绪轮询间隔。
 const RELAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
-
-/// 等用户 Chrome 进程退出超时。
-const QUIT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 等用户 Chrome 进程退出轮询间隔。
-const QUIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// 探测成功的调试端点信息。
 #[derive(Debug, Clone)]
@@ -137,7 +135,7 @@ async fn wait_for_debug_port_with_timeout(
     }
 }
 
-// ===================== Chromium 系浏览器进程检测与退出 =====================
+// ===================== Chromium 系浏览器进程检测(第 144 轮:只检测,不退出) =====================
 
 /// Chromium 系浏览器进程名(按平台)。
 pub fn chromium_process_names() -> &'static [&'static str] {
@@ -220,35 +218,6 @@ fn proc_name_from_proc(name: &str) -> bool {
     })
 }
 
-/// 退出用户 Chromium 系浏览器(逐个进程名发退出信号,best-effort)。
-pub fn quit_chrome() {
-    for name in chromium_process_names() {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .arg("/IM")
-                .arg(name)
-                .arg("/F")
-                .output();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = std::process::Command::new("pkill").arg("-x").arg(name).output();
-        }
-    }
-}
-
-/// 轮询等 Chromium 系浏览器进程全部退出(≤5s)。
-pub fn wait_for_chrome_gone() {
-    let deadline = std::time::Instant::now() + QUIT_WAIT_TIMEOUT;
-    while chromium_running() {
-        if std::time::Instant::now() >= deadline {
-            return;
-        }
-        std::thread::sleep(QUIT_POLL_INTERVAL);
-    }
-}
-
 // ===================== 调试 profile 与登录态复制 =====================
 
 /// 调试 profile 目录:`~/.laew/chrome_debug_profile(跨平台)。
@@ -291,21 +260,26 @@ fn home_dir() -> PathBuf {
 /// 登录态复制清单(相对路径;文件/目录由运行时 `is_dir()` 判断)。
 ///
 /// 只复制登录态核心文件,不复制整个 profile(几百 MB 且含缓存/历史等
-/// 与登录态无关内容)。单个文件失败跳过(best-effort)。
+/// 与登录态无关内容)。单个文件失败跳过(best-effort)。第 144 轮起用户
+/// Chrome **运行中**直接复制(不再为一致性退出用户浏览器),补 `-wal` 变体
+/// 降低 WAL 模式撕裂读概率(缺失即跳过,零成本)。
 const SECRET_COPIES: &[&str] = &[
     "Default/Cookies",
     "Default/Cookies-journal",
+    "Default/Cookies-wal",
     "Default/Local Storage",
     "Default/Session Storage",
     "Default/Login Data",
     "Default/Login Data-journal",
+    "Default/Login Data-wal",
     "Default/Web Data",
     "Local State",
 ];
 
 /// 复制默认 profile 的登录态关键文件到调试 profile(先清空目标)。
 ///
-/// 前置条件:Chrome 已完全退出(文件锁 + WAL 一致性)。返回
+/// 第 144 轮:不再要求 Chrome 退出 —— 用户浏览器运行中直接复制(best-effort,
+/// 单条失败跳过;登录态可能略旧,详见 doc 08 §3.3)。返回
 /// (成功复制数, 跳过数);源目录不存在返回 (0, 0),不 panic。
 pub fn copy_profile_secrets(src: &Path, dst: &Path) -> (usize, usize) {
     if !src.is_dir() {
@@ -437,27 +411,50 @@ pub fn launch_debug_browser(
     cmd.spawn().ok()
 }
 
-/// auto_relaunch 全流程:退出用户 Chrome → 复制登录态 → 调试重启 → 等端口就绪。
+/// auto_relaunch 结果(第 144 轮):端点信息 + 登录态复制计数(供响应回报对账)。
+#[derive(Debug, Clone)]
+pub struct RelaunchOutcome {
+    pub info: DebugEndpointInfo,
+    /// 成功复制的登录态条目数(仅桌面平台;Linux 恒 0)。
+    pub login_state_copied: usize,
+    /// 跳过的登录态条目数(源缺失/复制失败)。
+    pub login_state_skipped: usize,
+}
+
+/// auto_relaunch 全流程(第 144 轮起**不退出用户 Chrome**):
+/// 复制登录态(运行中 best-effort)→ 独立调试 profile 另启实例 → 等端口就绪。
 ///
+/// 多实例并存机制:新实例用独立 `--user-data-dir`(Chrome 多实例官方隔离方式),
+/// 与用户正在运行的浏览器互不干扰 —— 这是删除旧「退出用户 Chrome」步骤后的
+/// 正确替代(旧 `pkill`/`taskkill` 按进程名杀掉用户全部浏览器窗口,实测事故)。
 /// 每步 fail-open:任一步失败返回 None(工具层回落 3002 + 原因)。
 /// 仅桌面平台(macOS/Windows)复制登录态;Linux 服务器跳过复制。
-pub async fn relaunch_and_wait(port: u16) -> Option<DebugEndpointInfo> {
+pub async fn relaunch_and_wait(port: u16) -> Option<RelaunchOutcome> {
     let profile = debug_profile_dir();
-    // 1. 退出用户 Chrome(若在跑),等进程消失再复制(文件锁 + WAL)。
-    if chromium_running() {
-        quit_chrome();
-        wait_for_chrome_gone();
-    }
-    // 2. 复制登录态(仅桌面平台;default_profile_dir 在 Linux 返回 None)。
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if let Some(default) = default_profile_dir() {
-        copy_profile_secrets(&default, &profile);
-    }
-    // 3. 以调试参数启动 Chrome(无 GUI 会话 → 无头)。
+    // 1. 复制登录态(仅桌面平台;default_profile_dir 在 Linux 返回 None)。
+    //    用户 Chrome 运行中直接读复制(best-effort),绝不退出用户浏览器。
+    let (copied, skipped) = {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            default_profile_dir()
+                .map(|d| copy_profile_secrets(&d, &profile))
+                .unwrap_or((0, 0))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            (0, 0)
+        }
+    };
+    // 2. 以调试参数另启独立 Chrome 实例(无 GUI 会话 → 无头)。
     let headless = !crate::agent::browser_mode::has_gui_session();
     launch_debug_browser(port, &profile, headless)?;
-    // 4. 等端口就绪。
-    wait_for_debug_port(port).await
+    // 3. 等端口就绪。
+    let info = wait_for_debug_port(port).await?;
+    Some(RelaunchOutcome {
+        info,
+        login_state_copied: copied,
+        login_state_skipped: skipped,
+    })
 }
 
 #[cfg(test)]
@@ -734,5 +731,90 @@ mod tests {
             !mgr.is_connect_mode().await,
             "close 末页后单例应复位(不影响用户 Chrome 进程)"
         );
+    }
+
+    /// Chromium 系进程 PID 快照(unix:pgrep;Windows 恒空,断言退化为只看端口)。
+    fn chromium_pids() -> Vec<u32> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut out = Vec::new();
+            for name in chromium_process_names() {
+                if let Ok(o) = std::process::Command::new("pgrep").arg("-x").arg(name).output() {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        if let Ok(pid) = line.trim().parse::<u32>() {
+                            out.push(pid);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Vec::new()
+        }
+    }
+
+    /// 真机集成(第 144 轮 #[ignore]):auto_relaunch 全链路**不退出用户 Chrome**。
+    ///
+    /// 断言:① 另启独立调试实例后端口就绪;② 启动前已存在的全部 Chromium 系
+    /// 进程(用户浏览器)仍然存活(核心验收);③ 登录态复制计数 ≥1(桌面平台);
+    /// ④ 收尾对调试实例发 CDP Browser.close 优雅回收(只关我们另启的实例)。
+    /// 跑 `cargo test --lib relaunch_never_kills -- --ignored --nocapture`。
+    #[tokio::test]
+    #[ignore = "真机 Chrome 冒烟:复制用户登录态 + 弹独立调试 Chrome 窗口约 15s"]
+    async fn relaunch_never_kills_user_chrome() {
+        // 用 9333 避开默认 9222(用户可能真开着调试 Chrome);端口已占用则 skip。
+        let port = 9333u16;
+        if probe_debug_endpoint(port).await.is_some() {
+            eprintln!("skip: 端口 {port} 已有服务,另选端口重跑");
+            return;
+        }
+        let before = chromium_pids();
+        let out = relaunch_and_wait(port)
+            .await
+            .expect("复制登录态 + 另启调试实例应成功(本机是否装有 Chrome?)");
+        let after = chromium_pids();
+        // ① 核心验收:用户既有进程必须全部存活
+        for pid in &before {
+            assert!(after.contains(pid), "用户浏览器进程 {pid} 被误杀(第 144 轮红线)");
+        }
+        // ② 调试实例确实新起(进程数只增不减)
+        assert!(after.len() > before.len(), "应另启独立调试实例:{before:?} → {after:?}");
+        // ③ 登录态复制计数(桌面平台清单非空)
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert!(
+            out.login_state_copied + out.login_state_skipped >= 1,
+            "复制清单至少统计到条目:copied={} skipped={}",
+            out.login_state_copied,
+            out.login_state_skipped
+        );
+        eprintln!(
+            "[smoke] login_state copied={} skipped={}",
+            out.login_state_copied, out.login_state_skipped
+        );
+        // ④ 优雅回收调试实例(CDP Browser.close;只影响我们另启的实例)
+        {
+            use chromiumoxide::browser::Browser;
+            use futures::StreamExt;
+            if let Ok((mut browser, mut handler)) = Browser::connect(out.info.connect_url.clone()).await {
+                let driver = tokio::spawn(async move {
+                    while let Some(msg) = handler.next().await {
+                        if msg.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let _ = browser.close().await;
+                drop(browser);
+                let _ = driver.await;
+            }
+        }
+        // 等调试实例退出后,用户进程仍全部存活
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let final_pids = chromium_pids();
+        for pid in &before {
+            assert!(final_pids.contains(pid), "回收调试实例后用户进程 {pid} 仍应存活");
+        }
     }
 }
