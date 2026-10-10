@@ -195,6 +195,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             }
         }
     }
+    // 第 151 轮:人工核验弹窗输入前置硬闸(条件/实现见 blocker_probe::input_gate;弹窗在场时输入只会灌黑洞,命中即 6002 拦截;须在 guard_lift 之前)
+    if let Some(gated) = super::blocker_probe::input_gate(id, &action, &params).await { return gated; }
     // 第 141 轮:蒙层输入锁「先解后锁」—— 输入类动作(经 CDP Input.dispatch*
     // 或 chromiumoxide Element click/type)在蒙层激活时会被 setIgnoreInputEvents
     // 一并吃掉(实测,见 browser_overlay 模块文档),动作前解锁、动作后复锁。

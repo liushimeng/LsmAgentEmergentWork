@@ -30,18 +30,49 @@ pub(super) fn enabled() -> bool {
     )
 }
 
-/// 该 control_action 完成后是否自动探测人工阻断(第 147 轮)。
+/// 该 control_action 完成后是否自动探测人工阻断(第 147 轮;第 151 轮补 eval_js)。
 ///
 /// - 输入类动作(复用 [`crate::agent::browser_overlay::action_dispatches_input` 白名单]):
 ///   验证弹窗**出现后持续存在**,循环里下一个输入动作必然探测命中;
 /// - `wait`:等待结束(含超时失败)恰是「页面该响应而没响应」的检查点 —— 验证弹窗
 ///   挡住回复时 wait 超时 + 探测命中是最强复合信号;
-/// - 导航类:登录墙/验证墙常在导航落地页出现。
-/// 观察类与纯状态设置类(screenshot/eval_js/set_*)不探测 —— eval_js 是高频只读通道,
-/// 逐次探测只会翻倍 CDP 往返而不增信号。
+/// - 导航类:登录墙/验证墙常在导航落地页出现;
+/// - `eval_js`(第 151 轮):实测 LLM 在 input_text 路径碰壁后会把**全部输入行为迁移到
+///   eval_js**(execCommand insertText + 合成 KeyboardEvent Enter + 自己 btn.click()),
+///   「只读通道」假设不成立;且 await_promise 长轮询(45~55s)恰是「发出消息 → 风控
+///   弹窗」的时序窗口,eval 返回时刻就是最该探测的检查点。成本 = 一次 eval 往返
+///   (健康页面 ~10-50ms,fail-open 2s 超时语义不变)。
+/// 观察类与纯状态设置类(screenshot/set_*)仍不探测。
 pub(super) fn action_needs_probe(action: &str) -> bool {
     crate::agent::browser_overlay::action_dispatches_input(action)
-        || matches!(action, "wait" | "navigate" | "back" | "forward" | "reload")
+        || matches!(
+            action,
+            "wait" | "navigate" | "back" | "forward" | "reload" | "eval_js"
+        )
+}
+
+/// eval_js 表达式是否可能变更页面状态(第 151 轮,纯函数可单测)。
+///
+/// 供输入硬闸(`challenge_gate`)判定「可变更 eval」是否需要执行前探针 —— 真实事故中
+/// LLM 正是用这些 API 对着验证弹窗继续发消息。标记词按小写包含匹配。
+const EVAL_MUTATION_MARKERS: &[&str] = &[
+    "execcommand",
+    "inserttext",
+    "dispatchevent",
+    "keyboardevent",
+    "mouseevent",
+    ".click(",
+    ".focus(",
+    ".submit(",
+    "location.href",
+    "location.assign",
+    "location.replace",
+    "window.open",
+    "document.write",
+];
+pub(super) fn eval_expression_mutates(expr: &str) -> bool {
+    let lower = expr.to_lowercase();
+    EVAL_MUTATION_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 // ===================== 弹层语义挑战检测(纯函数,可单测) =====================
@@ -53,9 +84,10 @@ const CHALLENGE_STRONG_WORDS: &[&str] = &[
     "human verification", "captcha",
 ];
 /// 弹层文本弱指令词:合计命中 +1(图片选择/语义题的题面动词,需与结构信号叠加)。
+/// 第 151 轮补「翻转」「找出」「图标」(点选翻转/找出类语义题的常见题面动词/名词)。
 const CHALLENGE_WEAK_WORDS: &[&str] = &[
     "点击", "选择", "选出", "按顺序", "依次", "包含", "拖动", "拖拽", "滑动", "拼图",
-    "图片", "图中", "下方图片", "符合", "哪一个", "哪个",
+    "图片", "图中", "下方图片", "符合", "哪一个", "哪个", "翻转", "找出", "图标",
 ];
 /// 刷新类按钮/文案词:合计命中 +1(验证码组件的标配控件)。
 const CHALLENGE_REFRESH_WORDS: &[&str] = &["换一张", "刷新", "看不清", "click to refresh"];
@@ -89,10 +121,13 @@ pub(super) fn detect_challenge(overlay: &Value) -> Option<Value> {
         .unwrap_or_default();
     let buttons_text = buttons.join(" ");
     let grid_imgs = overlay.get("grid_imgs").and_then(Value::as_i64).unwrap_or(0);
+    // 第 151 轮:CSS 背景图九宫格信号 —— 部分挑战格不用 <img> 而用 background-image
+    // 渲染(实测豆包风控组件形态之一),只数 img 会漏检。
+    let bg_imgs = overlay.get("bg_imgs").and_then(Value::as_i64).unwrap_or(0);
     let iframe_like = overlay.get("iframe_like").and_then(Value::as_bool) == Some(true);
 
     let mut score: i32 = 0;
-    if grid_imgs >= 4 {
+    if grid_imgs + bg_imgs >= 4 {
         score += 2;
     }
     // 第 150 轮:canvas 结构信号(拖拽拼图/滑块类验证常以 canvas 渲染在主文档,
@@ -131,6 +166,7 @@ pub(super) fn detect_challenge(overlay: &Value) -> Option<Value> {
         "evidence": {
             "score": score,
             "grid_imgs": grid_imgs,
+            "bg_imgs": bg_imgs,
             "canvas_count": canvas_count,
             "iframe_like": iframe_like,
             "buttons": buttons,
@@ -182,13 +218,24 @@ const PROBE_JS: &str = r#"(() => {
     if (!best) return {text: text, overlay: null};
     const el = best.el, r = el.getBoundingClientRect();
     let img_count = 0, grid_imgs = 0, canvas_count = 0, iframe_count = 0,
-        iframe_like = false, input_count = 0;
+        iframe_like = false, input_count = 0, bg_imgs = 0;
     for (const img of el.querySelectorAll('img')) {
       const ir = img.getBoundingClientRect();
       if (ir.width <= 0 || ir.height <= 0) continue;
       img_count++;
       const ratio = ir.width / ir.height;
       if (ir.width >= 48 && ir.width <= 240 && ratio >= 0.5 && ratio <= 1.6) grid_imgs++;
+    }
+    // 第 151 轮:CSS 背景图渲染的挑战格(background-image 而非 <img>),按九宫格同尺寸判据计数
+    for (const node of el.querySelectorAll('*')) {
+      if (bg_imgs >= 36) break;
+      const nb = node.getBoundingClientRect();
+      if (nb.width <= 0 || nb.height <= 0) continue;
+      if (nb.width > 240) continue;
+      const bs = window.getComputedStyle(node);
+      if (!bs.backgroundImage || bs.backgroundImage === 'none') continue;
+      const ratio = nb.width / nb.height;
+      if (nb.width >= 48 && ratio >= 0.5 && ratio <= 1.6) bg_imgs++;
     }
     canvas_count = el.querySelectorAll('canvas').length;
     input_count = el.querySelectorAll('input, textarea').length;
@@ -210,6 +257,7 @@ const PROBE_JS: &str = r#"(() => {
         text: (el.innerText || '').replace(/\s+/g, ' ').slice(0, 600),
         img_count: img_count, grid_imgs: grid_imgs, canvas_count: canvas_count,
         iframe_count: iframe_count, iframe_like: iframe_like, input_count: input_count,
+        bg_imgs: bg_imgs,
         buttons: buttons,
         rect: {w: Math.round(r.width), h: Math.round(r.height)},
         viewport: {w: vw, h: vh},
@@ -258,11 +306,21 @@ pub(super) async fn probe_alert(page_id: &str) -> Option<Value> {
     if let Some(obj) = alert.as_object_mut() {
         obj.insert("hint".into(), json!(ALERT_HINT));
     }
-    let hint = super::human_assist_hint(
-        &kind,
-        "页面出现人工验证挑战(见 data.blocker_alert),请人工完成验证后继续",
-        &["我已完成验证,继续", "取消任务"],
-    );
+    // 第 151 轮:message 带题面 snippet(≤60 字)—— 人工在 HITL 弹窗直接看到
+    // 「要验证什么」,不用猜;空 snippet(关键词命中无上下文)回退通用文案。
+    let snippet: String = alert
+        .get("snippet")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(60)
+        .collect();
+    let message = if snippet.is_empty() {
+        "页面出现人工验证挑战(见 data.blocker_alert),请人工完成验证后继续".to_string()
+    } else {
+        format!("页面弹出人工验证挑战「{snippet}」;请在浏览器窗口完成验证,完成后回弹窗点「提交 / 继续」(也可在输入框输入文字与 Agent 交互)")
+    };
+    let hint = super::human_assist_hint(&kind, &message, &["我已完成验证,继续", "取消任务"]);
     Some(json!({
         "blocker_alert": alert,
         "next_action": hint.get("next_action").cloned().unwrap_or(json!("request_human")),
@@ -279,4 +337,89 @@ pub(super) async fn attach_if_blocked(page_id: &str, data: &mut Value) {
             }
         }
     }
+}
+
+// ===================== 输入前置硬闸(第 151 轮) =====================
+
+/// 输入前置硬闸接线(control::run 在 guard_lift 之前调用,条件判断收在本模块
+/// —— control.rs 已处 1800 行临界,新增代码按约定落职责子模块)。
+///
+/// 覆盖动作面:输入类 20 动作 + **可变更 eval_js**(实测 LLM 在 input_text 碰壁后
+/// 把输入行为迁移到 execCommand insertText / 合成 KeyboardEvent 绕过探针);
+/// `params.force=true` 逃生口跳过本次硬闸。`Some` = 6002 拦截信封(动作不执行)。
+pub(super) async fn input_gate(
+    page_id: &str,
+    action: &str,
+    params: &Value,
+) -> Option<crate::error::Result<String>> {
+    if !enabled()
+        || params.get("force").and_then(Value::as_bool).unwrap_or(false)
+        || !(crate::agent::browser_overlay::action_dispatches_input(action)
+            || (action == "eval_js"
+                && params
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .map(eval_expression_mutates)
+                    .unwrap_or(false)))
+    {
+        return None;
+    }
+    challenge_gate(page_id).await
+}
+
+/// 硬闸拦截的人类可读处置提示(附在 blocker_alert.hint)。
+const GATE_HINT: &str = "输入动作已拦截:页面存在结构判定的人工验证挑战弹窗(图片选择/滑块/\
+拖拽/语义题),继续输入只会把消息灌进弹窗后面的黑洞;按 human_assist 载荷发起 \
+request_human(reason=captcha) 让人工完成验证,应答后再继续;确认是误判时可加 \
+params.force=true 强制执行本动作";
+
+/// 输入前置硬闸:输入类动作 / 可变更 eval_js 执行**前**探测**结构判定**的验证挑战。
+///
+/// 与推送式告警(`probe_alert`)的两点关键差异:
+/// 1. **只认 [`detect_challenge`] 的弹层结构证据,不认关键词通道** —— 关键词命中
+///    (如页面常驻的「请登录」文案)可能长期在场,作硬闸会把输入永久锁死;
+/// 2. **命中即不执行动作**,返回 6002 信封(附 blocker_alert + human_assist 载荷 +
+///    force 逃生口说明),从工具层根治「LLM 无视 next_action 继续对着弹窗输入」
+///    (实测事故:Agent 对着豆包验证弹窗连发 2 条消息零送达)。
+/// 干净/开关关闭/探针失败一律 None(照常执行,fail-open 不误伤)。
+pub(super) async fn challenge_gate(
+    page_id: &str,
+) -> Option<crate::error::Result<String>> {
+    if !enabled() {
+        return None;
+    }
+    let page = BrowserManager::global().page(page_id).await?;
+    let probe = collect_for_inspect(&page).await;
+    let challenge = detect_challenge(probe.get("overlay").unwrap_or(&Value::Null))?;
+    let snippet: String = challenge
+        .get("snippet")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(60)
+        .collect();
+    let mut alert = challenge;
+    if let Some(obj) = alert.as_object_mut() {
+        obj.insert("hint".into(), json!(GATE_HINT));
+    }
+    let message = if snippet.is_empty() {
+        "页面弹出人工验证挑战,输入动作已被拦截;请在浏览器窗口完成验证".to_string()
+    } else {
+        format!("页面弹出人工验证挑战「{snippet}」,输入动作已被拦截;请人工在浏览器窗口完成验证,完成后回弹窗点「提交 / 继续」")
+    };
+    let hint = super::human_assist_hint("captcha", &message, &["我已完成验证,继续", "取消任务"]);
+    let mut data = json!({
+        "blocker_alert": alert,
+        "force_hint": "确认页面无真实验证弹窗(结构误判)时,可在 params 加 force=true 跳过硬闸强制执行",
+    });
+    if let (Some(dst), Some(src)) = (data.as_object_mut(), hint.as_object()) {
+        for (k, v) in src {
+            dst.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    Some(super::envelope(
+        super::CODE_BLOCKER_INPUT_GATE,
+        "页面存在人工验证挑战,输入动作已拦截(见 data.blocker_alert;发起 request_human 让人工完成,误判可 params.force=true)",
+        data,
+    ))
 }

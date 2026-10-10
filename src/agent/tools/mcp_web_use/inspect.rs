@@ -90,6 +90,36 @@ pub(super) async fn body_text_without_agent_nodes(
     .unwrap_or_default()
 }
 
+/// 纯 ASCII 关键词的整词边界匹配:返回首个「前后都不是字母数字」的命中位置。
+///
+/// 第 151 轮误报根治:豆包页面把 SSR 数据以字面 JSON 转义 URL 文本渲染进可见 DOM,
+/// `…/ae6146b6…` 中的 `2Fa` 让关键词 `"2fa"` 以子串形态命中 `two_factor`,
+/// 页面干净期连续 4 次假告警把 `next_action=request_human` 训练成噪声(狼来了),
+/// 真验证弹窗出现后 LLM 已免疫。同类风险:`sms`/`kyc`/`oauth` 嵌进十六进制哈希、
+/// 转义序列、URL 路径的任意子串。含 CJK 的关键词不收边界(中文词不会以 URL
+/// 子串形态出现),只有纯 ASCII 关键词要求整词命中。
+fn ascii_keyword_boundary_find(lower: &str, kw_lower: &str) -> Option<usize> {
+    debug_assert!(!kw_lower.is_empty());
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(kw_lower) {
+        let pos = from + rel;
+        let end = pos + kw_lower.len();
+        let before_ok = lower[..pos]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !c.is_ascii_alphanumeric());
+        let after_ok = lower[end..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_ascii_alphanumeric());
+        if before_ok && after_ok {
+            return Some(pos);
+        }
+        from = pos + kw_lower.len();
+    }
+    None
+}
+
 /// 在页面文本中检测人工阻断(Rust 侧模式表,可单测)。
 /// 返回命中列表 [{kind, snippet}](每种 kind 最多 1 条,避免重复刷屏)。
 pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
@@ -98,10 +128,22 @@ pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
     for (kind, keywords, _) in BLOCKER_PATTERNS {
         if let Some(kw) = keywords
             .iter()
-            .find(|kw| lower.contains(&kw.to_lowercase()))
+            .find(|kw| {
+                let k = kw.to_lowercase();
+                if k.chars().all(|c| c.is_ascii()) {
+                    ascii_keyword_boundary_find(&lower, &k).is_some()
+                } else {
+                    lower.contains(&k)
+                }
+            })
         {
+            let k = kw.to_lowercase();
             // 截取关键词上下文片段(前 12 后 40 字符),便于 LLM 确认
-            if let Some(pos) = lower.find(&kw.to_lowercase()) {
+            if let Some(pos) = if k.chars().all(|c| c.is_ascii()) {
+                ascii_keyword_boundary_find(&lower, &k)
+            } else {
+                lower.find(&k)
+            } {
                 let start = pos.saturating_sub(12).min(text.len());
                 // 对齐 char 边界,防中文截断 panic
                 let start = text

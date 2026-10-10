@@ -962,6 +962,57 @@ fn detect_blockers_matches_common_walls() {
     assert!(clean.is_empty(), "误报:{clean:?}");
 }
 
+// ==================== 第 151 轮:关键词通道整词边界(误报根治) ====================
+
+#[test]
+fn detect_blockers_rejects_embedded_ascii_noise() {
+    // 实测反例(豆包 2026-10-10):页面把 SSR 数据以字面 JSON 转义 URL 文本渲染进可见 DOM,
+    // `/ae6146b6…` 中的 `2Fa` 让 "2fa" 以子串形态命中 two_factor,连续 4 次假告警。
+    let doubao_noise = "002Ficon\\u002Fae6146b6e7f7487ebf3e1331d6e9166f~tplv-a9r";
+    let hits = inspect::detect_blockers(doubao_noise);
+    assert!(
+        hits.iter().all(|b| b["kind"] != "two_factor"),
+        "转义 URL 子串不应命中 two_factor,实际:{hits:?}"
+    );
+
+    // 同类:十六进制哈希/标识符里嵌 sms/kyc/oauth/totp/captcha
+    let hash_noise = "resource id=verify_mv26aqhm hash sms4kd93jf kyc7xx oauth9ab totp3zz";
+    let hits = inspect::detect_blockers(hash_noise);
+    assert!(
+        hits.iter().all(|b| !matches!(
+            b["kind"].as_str(),
+            Some("sms") | Some("real_name") | Some("oauth") | Some("two_factor")
+        )),
+        "字母数字包围的子串不应命中,实际:{hits:?}"
+    );
+}
+
+#[test]
+fn detect_blockers_ascii_word_boundary_positives() {
+    // 整词命中(前后是空格/中文/行首尾)必须保持 —— 这是真阻断文案的正常形态
+    let cases: &[(&str, &str)] = &[
+        ("请开启 2FA 验证后继续", "two_factor"),
+        ("Enter the TOTP code from your app", "two_factor"),
+        ("Sign in to continue", "login"),
+        ("请拖动滑块完成 Captcha 验证", "captcha"),
+        ("Use 2-step verification", "two_factor"),
+    ];
+    for (text, kind) in cases {
+        let hits = inspect::detect_blockers(text);
+        assert!(
+            hits.iter().any(|b| b["kind"] == *kind),
+            "「{text}」应命中 {kind},实际:{hits:?}"
+        );
+    }
+}
+
+#[test]
+fn detect_blockers_cjk_keywords_keep_substring_semantics() {
+    // 含 CJK 的关键词不收边界(中文词不会以 URL 子串形态出现)
+    let hits = inspect::detect_blockers("登录后查看完整报告");
+    assert!(hits.iter().any(|b| b["kind"] == "login"), "实际:{hits:?}");
+}
+
 #[test]
 fn hitl_image_plan_priority_and_sources() {
     // 第 132 轮:附图解析优先级 —— 显式路径(存在)> captcha 自动截图 > 无图
@@ -1637,6 +1688,83 @@ fn detect_challenge_canvas_ad_suppressed() {
     assert!(blocker_probe::detect_challenge(&o).is_none(), "canvas 广告负信号应压制");
 }
 
+// ==================== 第 151 轮:bg-image 九宫格 + eval 变更判定 + 输入硬闸 ====================
+
+/// CSS 背景图九宫格形态 overlay(挑战格用 background-image 而非 <img> 渲染)。
+fn probe_overlay_bg(text: &str, bg_imgs: i64, grid_imgs: i64, buttons: Value) -> Value {
+    json!({
+        "found": true, "text": text,
+        "img_count": grid_imgs, "grid_imgs": grid_imgs, "bg_imgs": bg_imgs,
+        "canvas_count": 0,
+        "iframe_count": 0, "iframe_like": false, "input_count": 0,
+        "buttons": buttons,
+        "rect": {"w": 360, "h": 420}, "viewport": {"w": 1280, "h": 800},
+        "area_ratio": 0.23, "z_index": 9999,
+    })
+}
+
+#[test]
+fn detect_challenge_bg_image_grid_with_weak_word() {
+    // 背景图九宫格(grid=0/bg=9)+题面动词「选出」:2+1=3 命中
+    let o = probe_overlay_bg("选出下列图片中的卧室家具", 9, 0, json!(["确认"]));
+    let hit = blocker_probe::detect_challenge(&o).expect("bg 九宫格(2)+弱词(1) 应命中");
+    assert_eq!(hit["evidence"]["bg_imgs"], 9);
+    assert_eq!(hit["evidence"]["grid_imgs"], 0);
+}
+
+#[test]
+fn detect_challenge_bg_grid_mixed_counts_combined() {
+    // <img> 与背景图混合:grid=2 + bg=3 合计 ≥4 计一次结构分
+    let o = probe_overlay_bg("请点击包含文字的图标", 3, 2, json!([]));
+    assert!(
+        blocker_probe::detect_challenge(&o).is_some(),
+        "grid(2)+bg(3) 合计应过结构阈值"
+    );
+}
+
+#[test]
+fn detect_challenge_bg_grid_alone_not_enough() {
+    // 防误报:纯背景图网格(相册/商品墙弹窗,无指令文案)不过阈值
+    let o = probe_overlay_bg("精选图集", 12, 0, json!(["关闭"]));
+    assert!(
+        blocker_probe::detect_challenge(&o).is_none(),
+        "背景图网格单独 2 分不过阈值"
+    );
+}
+
+#[test]
+fn eval_expression_mutates_classification() {
+    // 实测事故形态:execCommand insertText / 合成 KeyboardEvent / 自己 click —— 判定为可变更
+    assert!(blocker_probe::eval_expression_mutates(
+        "document.execCommand('insertText', false, q)"
+    ));
+    assert!(blocker_probe::eval_expression_mutates(
+        "el.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter'}))"
+    ));
+    assert!(blocker_probe::eval_expression_mutates("btn.click();"));
+    assert!(blocker_probe::eval_expression_mutates(
+        "location.href = 'https://example.com'"
+    ));
+    assert!(blocker_probe::eval_expression_mutates(
+        "window.open('/next')"
+    ));
+    // 纯读取(大小写混合)不判变更
+    assert!(!blocker_probe::eval_expression_mutates(
+        "JSON.stringify(window.__NEXT_DATA__.props.pageProps.list.slice(0,20))"
+    ));
+    assert!(!blocker_probe::eval_expression_mutates(
+        "document.querySelectorAll('button').length"
+    ));
+    assert!(!blocker_probe::eval_expression_mutates(""));
+}
+
+#[test]
+fn blocker_input_gate_code_is_6002() {
+    // 硬闸信封码独立于 6001(任务锚点),归 6xxx 约束段
+    assert_eq!(super::CODE_BLOCKER_INPUT_GATE, 6002);
+    assert_eq!(super::CODE_TARGET_ANCHOR_VIOLATION, 6001);
+}
+
 #[test]
 fn eval_timeout_from_parsing() {
     // 纯函数:正整数生效;缺省/0/非法回退默认 30s
@@ -1716,8 +1844,11 @@ fn action_needs_probe_covers_input_wait_nav() {
     for a in ["wait", "navigate", "back", "forward", "reload"] {
         assert!(blocker_probe::action_needs_probe(a), "{a} 应探测");
     }
-    // 高频只读/状态类不探测(eval_js/screenshot/set_* / request_human)
-    for a in ["eval_js", "screenshot", "set_guard", "set_viewport", "request_human", "heartbeat"] {
+    // 第 151 轮:eval_js 纳入收尾探测(实测 LLM 把输入行为迁移到 execCommand/
+    // 合成事件后,「只读通道」假设不成立;长轮询返回恰是弹窗出现后的检查点)
+    assert!(blocker_probe::action_needs_probe("eval_js"), "eval_js 应探测(第 151 轮)");
+    // 观察类/状态设置类仍不探测
+    for a in ["screenshot", "set_guard", "set_viewport", "request_human", "heartbeat"] {
         assert!(!blocker_probe::action_needs_probe(a), "{a} 不应探测");
     }
 }
@@ -1787,8 +1918,8 @@ async fn real_browser_blocker_probe_detects_challenge_modal() {
         alerts.iter().any(|b| b["kind"] == "captcha" && b["matched"] == "challenge_overlay"),
         "豆包形态弹层应命中,probe:{probe:?} alerts:{alerts:?}"
     );
-    // 全链路:control(input_text) 在弹窗在场时执行,响应信封应自动携带 blocker_alert
-    // (推送式感知接线,第 147 轮 control.rs::run 收尾)
+    // 全链路(第 151 轮起):弹窗在场时 input_text 先过**输入硬闸** → 6002 拦截且不执行;
+    // force=true 逃生口执行动作,收尾推送探针仍附 blocker_alert(第 147 轮语义保持)
     eval_js_string(&page, r#"document.body.insertAdjacentHTML('beforeend', '<input id="q" style="width:200px;height:20px">')"#).await.unwrap();
     let out = McpWebUseTool
         .execute(json!({"action": "control", "page_id": pid, "control_action": "input_text",
@@ -1796,14 +1927,99 @@ async fn real_browser_blocker_probe_detects_challenge_modal() {
         .await
         .unwrap();
     let env: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(env["code"], 0, "input_text 本身应成功:{env}");
+    assert_eq!(env["code"], 6002, "弹窗在场 input_text 应被硬闸拦截:{env}");
     assert!(env["data"]["blocker_alert"]["kind"] == "captcha", "信封应带 blocker_alert:{env}");
     assert_eq!(env["data"]["next_action"], "request_human");
     assert!(env["data"]["human_assist"]["ready"].as_bool().unwrap(), "human_assist 载荷应就绪");
+    let typed = eval_js_string(&page, "document.getElementById('q').value").await.unwrap();
+    assert_eq!(typed, "", "被硬闸拦截的动作不应写入输入框");
+    // force 逃生口:动作执行 + 收尾推送探针仍附告警
+    let forced = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "input_text",
+                        "params": {"selector": "#q", "text": "hi", "force": true}}))
+        .await
+        .unwrap();
+    let fenv: Value = serde_json::from_str(&forced).unwrap();
+    assert_eq!(fenv["code"], 0, "force 后动作应执行:{fenv}");
+    assert!(fenv["data"]["blocker_alert"]["kind"] == "captcha", "收尾探针仍应附 blocker_alert:{fenv}");
+    let typed2 = eval_js_string(&page, "document.getElementById('q').value").await.unwrap();
+    assert_eq!(typed2, "hi", "force 后文本应写入");
     // 干净页面(移除弹层)零命中
     eval_js_string(&page, "document.querySelector('.c-mask').remove()").await.unwrap();
     let probe2 = blocker_probe::collect_for_inspect(&page).await;
     let alerts2 = blocker_probe::analyze(&probe2);
     assert!(alerts2.is_empty(), "干净页面误报:{alerts2:?}");
+    BrowserManager::global().shutdown().await;
+}
+
+/// 第 151 轮真浏览器集成验证(#[ignore],本地 `--ignored` 跑):
+/// ① CSS 背景图九宫格(无 `<img>`)挑战形态识别;② 可变更 eval_js 被 6002 硬闸
+/// 拦截、纯读取 eval_js 放行;③ 移除弹窗后硬闸自动放行(非解锁制)。
+#[tokio::test]
+#[ignore = "需要本机真实 Chrome(会弹有头窗口);本地手动跑"]
+async fn real_browser_input_gate_bg_image_challenge() {
+    use crate::agent::browser::{BrowserManager, BrowserMode};
+    let (pid, _, _) = BrowserManager::global()
+        .new_page("about:blank", BrowserMode::Headed, None, None, Some((1280, 800)), true, Default::default())
+        .await
+        .expect("启动浏览器失败(本机是否装有 Chrome?)");
+    let page = BrowserManager::global().page(&pid).await.expect("page 句柄");
+    // 「选出卧室家具」型:背景图九宫格(120×120 div,无 img)+ 题面弱词
+    let inject = r#"(() => {
+      const tiles = Array.from({length: 9}, () =>
+        `<div style="display:inline-block;width:120px;height:120px;background-image:url(data:image/gif;base64,R0lGODlhAQABAAAAACw=)"></div>`).join('');
+      document.body.innerHTML = `<input id="chat" style="position:fixed;left:0;top:0;width:200px;height:30px">
+        <div class="verify-modal" style="position:fixed;left:200px;top:80px;width:480px;height:420px;background:#fff;z-index:99999;padding:12px">
+          <p>选出下列图片中的卧室家具</p><div>${tiles}</div><button>确认</button></div>`;
+      return document.querySelectorAll('.verify-modal > div > div').length;
+    })()"#;
+    let n = eval_js_string(&page, inject).await.unwrap();
+    assert_eq!(n, 9, "背景图九宫格注入失败");
+    let probe = blocker_probe::collect_for_inspect(&page).await;
+    assert!(
+        blocker_probe::analyze(&probe)
+            .iter()
+            .any(|b| b["kind"] == "captcha" && b["matched"] == "challenge_overlay"),
+        "背景图九宫格形态应命中,probe:{probe:?}"
+    );
+
+    // 可变更 eval_js(execCommand)在弹窗在场时被 6002 硬闸拦截,不执行
+    let gated = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "eval_js",
+                        "params": {"expression": "(() => { const q = document.getElementById('chat'); q.focus(); q.value = 'blocked'; document.execCommand('insertText', false, 'x'); return q.value; })()"}}))
+        .await
+        .unwrap();
+    let genv: Value = serde_json::from_str(&gated).unwrap();
+    assert_eq!(genv["code"], 6002, "可变更 eval_js 应被硬闸拦截:{genv}");
+    assert!(genv["data"].get("blocker_alert").is_some(), "拦截信封应带 blocker_alert");
+    let v = eval_js_string(&page, "document.getElementById('chat').value").await.unwrap();
+    assert_eq!(v, "", "被拦截的 eval 不应产生副作用");
+
+    // 纯读取 eval_js 放行(不硬闸;干净响应无告警)
+    let read = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "eval_js",
+                        "params": {"expression": "document.querySelectorAll('div').length"}}))
+        .await
+        .unwrap();
+    let renv: Value = serde_json::from_str(&read).unwrap();
+    assert_eq!(renv["code"], 0, "纯读取 eval 应放行:{renv}");
+    // 第 151 轮:eval_js 纳入收尾推送探针 —— 弹窗在场时纯读取 eval 也附告警
+    // (长轮询返回恰是弹窗出现后的检查点,本轮事故的闭环点),但不拦截执行
+    assert!(
+        renv["data"].get("blocker_alert").is_some(),
+        "收尾探针应附 blocker_alert(不拦截):{renv}"
+    );
+
+    // 移除弹窗 → 硬闸自动放行(非解锁制,页面干净即恢复)
+    eval_js_string(&page, "document.querySelector('.verify-modal').remove()").await.unwrap();
+    let pass = McpWebUseTool
+        .execute(json!({"action": "control", "page_id": pid, "control_action": "input_text",
+                        "params": {"selector": "#chat", "text": "ok"}}))
+        .await
+        .unwrap();
+    let penv: Value = serde_json::from_str(&pass).unwrap();
+    assert_eq!(penv["code"], 0, "弹窗移除后应自动放行:{penv}");
+    let v2 = eval_js_string(&page, "document.getElementById('chat').value").await.unwrap();
+    assert_eq!(v2, "ok", "放行后动作应执行");
     BrowserManager::global().shutdown().await;
 }
