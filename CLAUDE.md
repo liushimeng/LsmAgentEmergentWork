@@ -529,3 +529,20 @@ SCREEN=$(tmux capture-pane -p -t laew_e2e)
 - 新 Agent 类型：实现 `AgentProfile`（独立名称/系统提示词/工具集），在 `YoloRunner` 或相应编排器中接入。
 - 测试报告输出到 `testReport/`（命名 `e2e-<时间戳>.txt` / `验证报告-<日期>.md`）；临时计划放 `tmpPlan/`（已 gitignore）。
 - `laew`、`*.db`、`tmpPlan/`、`target/` 均不入库（见 .gitignore）。
+
+## Git 提交规范
+
+**格式**：`<type>(<scope>): <中文业务描述>`，沿用仓库既有风格（可选轮次后缀，如 `feat(web): 可视化模式页面蒙层与人工操作拦截(第141轮)`）。
+`type` 取 `feat` / `fix` / `perf` / `refactor` / `test` / `docs` / `chore`；`scope` 用模块名（`web` / `tui` / `llm` / `qc` 等）。描述只写**做了什么业务改动**，不写过程与情绪。
+
+**硬性禁止（生成 commit message 时一律不得出现）**：
+
+1. 禁止添加任何 `Co-Authored-By: Claude Code <noreply@anthropic.com>` 行（以及其它形式的 AI 联合作者署名）。
+2. 禁止追加 `Generated with Claude Code` 这类 AI 署名/生成声明文本（以及 `🤖 Generated with …` 等变体）。
+3. commit message **只保留业务描述**，末尾不追加任何 AI 相关的 attribution 尾部注释（不写「本提交由 AI 生成」「由 Claude Code 协助」等）。
+
+**其它约定**：
+
+- 默认**不主动提交**：改完代码先向用户汇报 diff 摘要，等明确指示再 `git commit`。
+- 需要提交时先确认在 `main` 之外的分支（默认分支上先建分支）。
+- 提交前确保 `cargo build` 通过；改动范围大时同步跑 `cargo test`。
