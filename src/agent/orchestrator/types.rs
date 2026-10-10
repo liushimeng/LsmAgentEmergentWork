@@ -188,6 +188,11 @@ pub(super) struct QualityFailure {
     /// 失败路径原先只累加 Yolo 用量,终端 Failed 用量与 Debug Collector
     /// 统计严重不一致;SubAgent + QC 用量必须在 QC fail 时随失败一起回传。
     pub(super) usage: Usage,
+    /// 第 146 轮:失败升级时**已完成且 QC 通过**的单元摘要(每单元一行:
+    /// id + 职责截断 + 产物要点)。档位级重试/Hard 重规划此前只能从零重拆全量重跑
+    /// (实测 v2 轮重跑了 v1 已通过的登录与建档单元);本字段随失败上抛,由
+    /// pipeline 跨轮累计后注入 Plan/Main-Work 提示词,实现「只规划剩余部分」。
+    pub(super) completed_digest: String,
 }
 
 impl QualityFailure {
@@ -207,6 +212,7 @@ impl QualityFailure {
             cancelled,
             trace: None,
             usage: Usage::default(),
+            completed_digest: String::new(),
         }
     }
 }

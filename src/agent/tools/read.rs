@@ -2,6 +2,9 @@
 //!
 //! 第 77 轮增强:支持图片文件(base64 + media_type 标记)、UTF-16 编码转码、
 //! PDF 友好提示、其他二进制兜底提示,避免 UTF-8 解码失败直接报错。
+//! 第 146 轮:图片分支默认改为**存根**(元信息 + base64 指纹前缀)—— wire 层从未
+//! 把标记块转成协议级 image block,整段 base64 纯文本注入只是 token 负资产
+//! (实测 QC 单会话 80 万 input token);`LAEW_READ_IMAGE_B64=on` 恢复全文。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,8 +42,9 @@ impl Tool for ReadTool {
          - file_path 必须为绝对路径或可解析的相对路径(相对于工作目录)。\n\
          - 文本文件:返回带行号的内容(UTF-8 / UTF-16 自动探测);offset/limit 用于分页,\n\
            limit 默认 2000 行,最大 4000;单行超长截断到 4000 字符并标注。\n\
-         - 图片文件(PNG/JPEG/GIF/WebP/BMP,≤5MB):返回 base64 + media_type 标记块,\n\
-           供模型直接感知图片内容。\n\
+         - 图片文件(PNG/JPEG/GIF/WebP/BMP,≤5MB):返回元信息标记块(路径/类型/大小/\n\
+           base64 指纹前缀)。**模型无法经 Read 获得图像视觉内容** —— 视觉判读请用\n\
+           MCP_Web_Use 的 screenshot(ocr=true) 或 inspect(info=ocr)(第 146 轮)。\n\
          - PDF 文件(≤10MB):返回元信息 + 抽取提示(可用 Bash 调用 pdftotext)。\n\
          - 其他二进制:给出友好提示而非崩溃。"
     }
@@ -146,7 +150,28 @@ impl Tool for ReadTool {
     }
 }
 
-/// 读取图片文件:大小校验 → base64 编码 → 标记块。
+/// 第 146 轮:`LAEW_READ_IMAGE_B64=on` 恢复图片 base64 全文返回(兜底特殊后端)。
+///
+/// 背景:第 77 轮设计「base64 标记块供模型感知图片」,但 wire 层从未把该标记块
+/// 转成协议级 image content block —— base64 一直以**纯文本**进上下文,模型看不见图,
+/// 却付出巨额 prefill(实测 QC 一次 Read 两张截图 → 单会话 80 万 input token、106s 延迟)。
+fn image_b64_full_enabled() -> bool {
+    std::env::var("LAEW_READ_IMAGE_B64")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+/// 图片指纹长度(base64 前缀,供对账「读的是哪个文件」而非视觉判读)。
+const IMAGE_B64_FINGERPRINT_CHARS: usize = 96;
+
+/// 读取图片文件:大小校验 → 标记块。
+///
+/// 第 146 轮起默认返回**存根**(元信息 + base64 指纹前缀 + 视觉判读指引),
+/// 不再整段注入 base64 文本;`LAEW_READ_IMAGE_B64=on` 恢复旧行为。
 fn read_image(path: &Path, file_size: usize, class: read_detect::FileClass) -> Result<String> {
     if file_size > MAX_IMAGE_BYTES {
         return Err(AgentError::ToolExecution {
@@ -163,16 +188,28 @@ fn read_image(path: &Path, file_size: usize, class: read_detect::FileClass) -> R
     })?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let media = class.media_type().unwrap_or("image/unknown");
-    let b64_wrapped = wrap_base64_lines(&b64, 76);
-    Ok(format!(
-        "<<<LAEW:FILE path=\"{}\" media_type=\"{}\" bytes={} base64_bytes={}>>>\n\
-         {}\n\
-         <<<END_LAEW:FILE>>>",
+    let header = format!(
+        "<<<LAEW:FILE path=\"{}\" media_type=\"{}\" bytes={} base64_bytes={}>>>",
         path.display(),
         media,
         file_size,
-        b64.len(),
-        b64_wrapped
+        b64.len()
+    );
+    if image_b64_full_enabled() {
+        let b64_wrapped = wrap_base64_lines(&b64, 76);
+        return Ok(format!(
+            "{header}\n{}\n<<<END_LAEW:FILE>>>",
+            b64_wrapped
+        ));
+    }
+    let fingerprint: String = b64.chars().take(IMAGE_B64_FINGERPRINT_CHARS).collect();
+    Ok(format!(
+        "{header}\n\
+         (图片内容不注入文本上下文 —— Read 通道无法让模型获得图像视觉内容,\n\
+         base64 仅保留指纹前缀 {IMAGE_B64_FINGERPRINT_CHARS} 字符供文件对账:{fingerprint}…)\n\
+         视觉判读请改用:MCP_Web_Use control(screenshot, ocr=true) / inspect(info=ocr);\n\
+         截图证据的核验以落盘台账/DOM 文本为准。\n\
+         <<<END_LAEW:FILE>>>"
     ))
 }
 
@@ -729,6 +766,20 @@ mod tests {
         assert!(
             out.contains("<<<END_LAEW:FILE>>>"),
             "应包含 END_LAEW:FILE 标记尾,实际: {out}"
+        );
+        // 第 146 轮:默认存根化 —— 不再整段注入 base64,保留指纹前缀 + 视觉判读指引
+        assert!(
+            out.contains("指纹前缀"),
+            "默认应返回存根(含指纹前缀说明),实际: {out}"
+        );
+        assert!(
+            out.contains("MCP_Web_Use"),
+            "存根应指引改用 MCP_Web_Use 视觉通道,实际: {out}"
+        );
+        assert!(
+            out.chars().count() < 1500,
+            "存根总长应远小于 base64 全文(1500 字符内),实际 {} 字符",
+            out.chars().count()
         );
     }
 

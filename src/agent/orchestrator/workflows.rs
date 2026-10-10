@@ -28,6 +28,7 @@ impl MultiAgentOrchestrator {
             cancelled: false,
             trace: None,
             usage: Usage::default(),
+            completed_digest: String::new(),
         })?;
 
         let mut results = Vec::new();
@@ -168,6 +169,7 @@ impl MultiAgentOrchestrator {
                                     cancelled: false,
                                     trace: None,
                                     usage: Usage::default(),
+                                    completed_digest: String::new(),
                                 }),
                             ));
                         }
@@ -189,7 +191,14 @@ impl MultiAgentOrchestrator {
                     }
                 }
             }
-            if let Some(f) = first_failure {
+            if let Some(mut f) = first_failure {
+                // 第 146 轮:失败升级时携带**已完成且 QC 通过**的单元摘要 ——
+                // 档位级重试/Hard 重规划拿到它后只规划剩余部分,不再从零重跑
+                // (实测 v2 轮把 v1 已通过的登录/建档单元整个重跑了一遍)。
+                f.completed_digest = build_completed_digest(
+                    &results,
+                    ok_units.iter().map(|(wf, ok)| (wf.id.clone(), wf.name.clone(), ok.outcome_text.as_str())),
+                );
                 return Err(f);
             }
 
@@ -336,6 +345,7 @@ pub(super) async fn run_wf_unit(
             cancelled: false,
             trace: None,
             usage: Usage::default(),
+            completed_digest: String::new(),
         })?),
         None => None,
     };
@@ -394,6 +404,9 @@ pub(super) async fn run_wf_unit(
         // 2026-09-16 第 57 轮:执行器墙钟计时 ——
         // 用于 TaskResult.wallclock_ms / TUI 时间线展示。
         let sub_started = std::time::Instant::now();
+        // 第 146 轮:访问台账快照(本单元本 attempt 的导航足迹起点;
+        // QC 用 footprint delta 做覆盖类期望的机械对账,零 LLM 成本)。
+        let nav_seq0 = crate::agent::tools::mcp_web_use::visit_ledger::seq();
         let outcome = sub_agent
             .run_unit_with_cancel(&input, &session_id, &cancel)
             .await
@@ -503,13 +516,21 @@ pub(super) async fn run_wf_unit(
 
         // 2026-09-16 第 57 轮:QC LLM 调用单独计时。
         let qc_started = std::time::Instant::now();
+        // 第 146 轮:实际输出尾部拼【机械导航足迹】(open/navigate/new_tab 的
+        // 工具层增量统计)—— clip_qc_input 保尾 2000 字符,天然存活到 QC 眼前;
+        // 覆盖类期望(「遍历 P1~P4」)从此有机械对账依据,漏页/打转一眼可见。
+        let actual_for_qc = format!(
+            "{}\n\n【机械导航足迹(工具层统计,零幻觉)】{}",
+            outcome.text,
+            crate::agent::tools::mcp_web_use::visit_ledger::footprint_since(nav_seq0),
+        );
         let (qc, qc_usage) = quality
             .check_subagent_with_source(
                 AgentRole::SubAgent,
                 &goal,
                 &input.description,
                 &input.expected_output,
-                &outcome.text,
+                &actual_for_qc,
                 &outcome.trace,
                 &session_id,
                 // 2026-09-19 第 93 轮:QC 透传用户原始输入(第一性事实),
@@ -621,6 +642,9 @@ pub(super) async fn run_wf_unit(
                 cancelled: false,
                 trace: Some(Arc::new(outcome.trace)),
                 usage: acc_usage,
+                // 第 146 轮:同层姊妹单元的完成摘要由 run_wf_units 汇总回填
+                //(本函数看不到兄弟单元结果)。
+                completed_digest: String::new(),
             });
         }
 
@@ -731,8 +755,11 @@ pub(super) fn build_subflow_input(
     // 2026-09-19 第 91 轮 P0-7:retry_hint 真正接入 description 避免子单元重复撞同样墙(连续 3 轮 retry 都撞 max_iter 失败)
     let mut description = format!("{}\n\n步骤:\n{}", wf.name, wf.steps.join("\n"));
     if !retry_hint.trim().is_empty() {
+        // 第 146 轮措辞修正:档位级 retry_hint 描述的是**任务级**失败(失败单元未必
+        // 是本单元)。旧文案「上一轮本单元失败原因」会让上一轮已通过的单元误以为
+        // 自己失败而换策略重做(实测 v2 轮 wf-1/wf-2 被误导后把已验证页面又遍历一遍)。
         description.push_str(&format!(
-            "\n\n⚠️ 上一轮本单元失败原因,必须改变策略\n{retry_hint}\n❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。"
+            "\n\n⚠️ 上一轮**任务**失败原因(失败单元未必是本单元;若与你的职责无关,按原步骤执行即可,勿重做已完成的工作):\n{retry_hint}\n若本单元正是失败单元:❌ 禁止完全重复上一轮工具调用序列;必须分析失败根因并调整(更换 action / 改变参数 / 拆细步骤 / 换环境/换账号等)。"
         ));
     }
     // 第 119 轮:pre_explore 标记为 true 时, 在 description 内附加「批量优先」硬约束;
@@ -768,5 +795,169 @@ pub(super) fn build_subflow_input(
         retry_hint: retry_hint.to_string(),
         max_iterations: wf.max_iterations,
         pre_explore: wf.pre_explore,
+    }
+}
+
+// ===================== 第 146 轮:完成单元摘要(断点续跑) =====================
+
+/// 摘要总长上限(字符)—— 注入 Plan/Main-Work 提示词须保持紧凑。
+const COMPLETED_DIGEST_MAX_CHARS: usize = 1400;
+/// 每单元产物要点截断(字符)。
+const DIGEST_OUTCOME_CLIP: usize = 150;
+
+/// 生成「已完成且 QC 通过单元」摘要(每单元一行),供档位级重试/Hard 重规划
+/// 注入 Plan/Main-Work,实现**只规划剩余部分**而非从零重跑。
+///
+/// `results` = 本轮此前各层已完成单元;`current` = 失败层中通过的姊妹单元。
+/// 末行附工具层访问台账的覆盖度口径,重规划可直接对账「哪些页面已经去过」。
+pub(super) fn build_completed_digest<'a>(
+    results: &[WorkflowResult],
+    current: impl Iterator<Item = (String, String, &'a str)>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for r in results {
+        let line = format!(
+            "- {}({}): QC=pass, 产物要点: {}",
+            r.id,
+            r.name,
+            clip_chars(&r.subflow_outcome, DIGEST_OUTCOME_CLIP),
+        );
+        out.push_str(&line);
+        out.push('\n');
+    }
+    for (id, name, outcome) in current {
+        let line = format!(
+            "- {}({}): QC=pass, 产物要点: {}",
+            id,
+            name,
+            clip_chars(outcome, DIGEST_OUTCOME_CLIP),
+        );
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        return String::new();
+    }
+    // 末行附访问台账覆盖度口径(第 146 轮):重规划时页面级「去过哪」直接可对账。
+    let cov = crate::agent::tools::mcp_web_use::visit_ledger::coverage_payload();
+    let s = &cov["summary"];
+    let _ = writeln!(
+        out,
+        "(工具层访问台账: distinct_pages={}, total_visits={};重规划前可经 inspect(info=coverage) 取完整清单)",
+        s["distinct_pages"], s["total_visits"],
+    );
+    clip_chars(&out, COMPLETED_DIGEST_MAX_CHARS)
+}
+
+/// 按字符裁剪(保头,尾加省略标注)。`crate::logging::clip` 是日志字段用的
+/// 字节口径,这里提示词注入用字符口径防中文截断 panic。
+fn clip_chars(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let head: String = chars[..max.saturating_sub(1)].iter().collect();
+    format!("{head}…(截断)")
+}
+
+/// 合并两份完成单元摘要(第 146 轮):按单元 id 去重,同 id 保留**最近一轮**
+/// (重跑过的单元以最新产物为准);台账 footer 行只保留最新一条;总量封顶 2600 字符。
+pub(super) fn merge_completed_digest(acc: &mut String, incoming: &str) {
+    const MERGE_MAX_CHARS: usize = 2600;
+    let unit_id_of = |line: &str| -> Option<String> {
+        let body = line.strip_prefix("- ")?;
+        Some(
+            body.split(['(', ':', ' '])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        )
+        .filter(|id| !id.is_empty())
+    };
+    let mut unit_lines: Vec<String> = Vec::new();
+    let mut footer = String::new();
+    // 先放存量,再用 incoming 覆盖同 id 行。
+    for src in [acc.as_str(), incoming] {
+        for line in src.lines() {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('(') {
+                footer = line.to_string();
+                continue;
+            }
+            if let Some(id) = unit_id_of(line) {
+                unit_lines.retain(|existing| unit_id_of(existing).as_deref() != Some(id.as_str()));
+            }
+            unit_lines.push(line.to_string());
+        }
+    }
+    let mut merged = unit_lines.join("\n");
+    if !footer.is_empty() {
+        merged.push('\n');
+        merged.push_str(&footer);
+    }
+    *acc = if merged.chars().count() > MERGE_MAX_CHARS {
+        format!("{}…(截断)", merged.chars().take(MERGE_MAX_CHARS).collect::<String>())
+    } else {
+        merged
+    };
+}
+
+#[cfg(test)]
+mod completed_digest_tests {
+    use super::*;
+
+    fn wf_result(id: &str, name: &str, outcome: &str) -> WorkflowResult {
+        WorkflowResult {
+            id: id.into(),
+            name: name.into(),
+            subflow_outcome: outcome.into(),
+            quality_report: crate::agent::quality::QualityReport {
+                verdict: crate::agent::quality::Verdict::Pass,
+                source: AgentRole::QualityCheck,
+                issues: vec![],
+                suggestion: String::new(),
+                retryable: true,
+                evidence: String::new(),
+            },
+            usage: Usage::default(),
+            subflow_trace: None,
+            exec_role: AgentRole::SubAgent,
+            wallclock_ms: 0,
+            qc_wallclock_ms: 0,
+        }
+    }
+
+    #[test]
+    fn digest_lists_completed_units_with_coverage_footer() {
+        let results = vec![
+            wf_result("wf-1", "登录", "已登录,page_id=p_x"),
+            wf_result("wf-2", "建档", "9 页菜单清单已落盘 evidence/inventory.md"),
+        ];
+        let digest = build_completed_digest(&results, std::iter::empty());
+        assert!(digest.contains("- wf-1(登录): QC=pass"), "{digest}");
+        assert!(digest.contains("distinct_pages="), "应带台账 footer: {digest}");
+    }
+
+    #[test]
+    fn digest_empty_when_nothing_completed() {
+        assert!(build_completed_digest(&[], std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn merge_dedupes_by_unit_id_keeping_latest() {
+        let mut acc = String::from("- wf-1(登录): QC=pass, 产物要点: 旧结论\n");
+        merge_completed_digest(
+            &mut acc,
+            "- wf-1(登录): QC=pass, 产物要点: 新结论\n- wf-2(建档): QC=pass, 产物要点: 清单\n(工具层访问台账: distinct_pages=9, total_visits=20;重规划前可经 inspect(info=coverage) 取完整清单)\n",
+        );
+        assert!(acc.matches("wf-1").count() == 1, "同 id 应去重: {acc}");
+        assert!(acc.contains("新结论"), "同 id 保留最新: {acc}");
+        assert!(acc.contains("wf-2"), "新增单元保留: {acc}");
+        assert!(acc.contains("distinct_pages=9"), "footer 保留: {acc}");
     }
 }

@@ -47,7 +47,7 @@ impl PlanRunner {
         decomposition: &[String],
         session_id: &str,
     ) -> Result<(PlanOutput, Usage)> {
-        self.generate_with_retry_hint(goal, purpose, intent, decomposition, session_id, "")
+        self.generate_with_retry_hint(goal, purpose, intent, decomposition, session_id, "", "")
             .await
     }
 
@@ -63,6 +63,7 @@ impl PlanRunner {
         decomposition: &[String],
         session_id: &str,
         retry_hint: &str,
+        completed_digest: &str,
     ) -> Result<(PlanOutput, Usage)> {
         // 确保 plans/ 存在
         std::fs::create_dir_all(&self.plans_dir)
@@ -76,13 +77,24 @@ impl PlanRunner {
                 retry_hint.trim()
             )
         };
+        // 第 146 轮:断点续跑 —— 已完成单元清单注入,Plan 只规划剩余部分,
+        // 不再从零重写全量方案(实测 v2 全量重写 365s 且把已通过单元重跑了一遍)。
+        let completed_block = if completed_digest.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n【上一轮已完成且 QC 通过的单元(产物已留存,本次方案禁止重复规划)】\n{}\n\
+                 只规划剩余目标;需要引用已完成单元结论的步骤,写「复用上轮产物:<要点>」。\n",
+                completed_digest.trim()
+            )
+        };
         let prompt = format!(
             "【Plan 任务】\n\
              Session: {session_id}\n\
              目的: {purpose}\n\
              目标: {goal}\n\
              意图: {intent}\n\
-             分解步骤:\n{decomp}\n{retry_block}\n\
+             分解步骤:\n{decomp}\n{retry_block}{completed_block}\n\
              请按系统提示词中的 Markdown 模板输出方案(完整五段)。",
             decomp = decomposition
                 .iter()

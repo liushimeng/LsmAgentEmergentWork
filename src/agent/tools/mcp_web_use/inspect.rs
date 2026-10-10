@@ -123,6 +123,11 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         let ms = now_millis_safe();
         return envelope(0, "ok", json!({"ok": true, "page_id": id, "latency_ms": 0, "ts": ms}));
     }
+    // 第 146 轮:覆盖台账查询是**进程级全局事实**,不依赖任何存活页面 ——
+    // 提前于 page_id 解析分发(全部页面已 close 时也能对账)。
+    if kind == "coverage" {
+        return envelope(0, "ok", super::visit_ledger::coverage_payload());
+    }
     let page = match crate::agent::browser::BrowserManager::global().page(id).await {
         Some(p) => p,
         None => return envelope(2000, "page_id 不存在", json!({"page_id": id})),

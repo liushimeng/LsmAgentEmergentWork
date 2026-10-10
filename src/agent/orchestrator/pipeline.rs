@@ -201,6 +201,11 @@ impl MultiAgentOrchestrator {
         // 失败反馈直接注入各执行单元;计划级失败(解析/校验)→ 清缓存强制重拆。
         // 实测省 1-2 次 Main-Work 调用(30-120s/任务)。
         let mut medium_plan_cache: Option<WorkFlowPlan> = None;
+        // 第 146 轮:完成单元摘要(断点续跑)—— 失败升级时 execute_workflows 把
+        // 本轮「已完成且 QC 通过」的单元摘要放进 failure.completed_digest,这里跨轮
+        // 累计并注入 Plan/Main-Work 提示词,重试轮只规划/执行剩余部分,
+        // 根治「档位重试从 wf-1 全量重跑、同批页面反复遍历」。
+        let mut completed_digest = String::new();
 
         // 1.15) 澄清门(第 128 轮 L1,防目标漂移):**目标不可解析 → 回问用户,不进 WorkFlow**。
         //
@@ -428,13 +433,21 @@ impl MultiAgentOrchestrator {
                         cancel,
                         progress,
                         &retry_hint,
+                        &completed_digest,
                         &mut medium_plan_cache,
                     )
                     .await
                 }
                 TaskLevel::Hard => {
-                    self.run_hard(&classification, session, cancel, progress, &retry_hint)
-                        .await
+                    self.run_hard(
+                        &classification,
+                        session,
+                        cancel,
+                        progress,
+                        &retry_hint,
+                        &completed_digest,
+                    )
+                    .await
                 }
             };
 
@@ -538,6 +551,15 @@ impl MultiAgentOrchestrator {
                         elapsed_ms: retry_elapsed_ms,
                     });
                     // 升级或重试
+                    // 第 146 轮:累计「已完成且 QC 通过」单元摘要(断点续跑)——
+                    // 各轮摘要按单元 id 去重合并(同 id 以最近一轮为准),供下一轮
+                    // Plan/Main-Work 只规划剩余部分。
+                    if !failure.completed_digest.trim().is_empty() {
+                        super::workflows::merge_completed_digest(
+                            &mut completed_digest,
+                            &failure.completed_digest,
+                        );
+                    }
                     // 运行日志(第 69 轮):执行失败,回流/重试决策
                     info!(
                         session = %session.id(),
@@ -794,6 +816,7 @@ impl MultiAgentOrchestrator {
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
         retry_hint: &str,
+        completed_digest: &str,
         plan_cache: &mut Option<WorkFlowPlan>,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 0) 2026-09-16 第 67 轮:计划复用(效率优化)。
@@ -846,6 +869,7 @@ impl MultiAgentOrchestrator {
                 retry_hint,
                 original_prompt.as_deref(),
                 suggested_delegate,
+                completed_digest,
             ),
         )
         .await
@@ -858,6 +882,7 @@ impl MultiAgentOrchestrator {
                 cancelled: false,
                 trace: None,
                 usage: Usage::default(),
+                completed_digest: String::new(),
             }
         })?
         .map_err(|e| {
@@ -888,6 +913,7 @@ impl MultiAgentOrchestrator {
                 cancelled: false,
                 trace: None,
                 usage: mainwork_usage,
+                completed_digest: String::new(),
             });
         }
 
@@ -987,6 +1013,7 @@ impl MultiAgentOrchestrator {
                 cancelled: false,
                 trace: None,
                 usage: add_usage(mainwork_usage, qc_usage),
+                completed_digest: String::new(),
             });
         }
 
@@ -1024,10 +1051,12 @@ impl MultiAgentOrchestrator {
         cancel: &CancelToken,
         progress: &Option<ProgressTx>,
         retry_hint: &str,
+        completed_digest: &str,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Plan 生成(2026-09-09 第 14 轮:带回 LLM Usage 用于累加)
         // I3(2026-09-14 第 51 轮):重试轮回灌上一轮 QC 拒绝理由,
         // Plan 针对性修复而非盲重生成(此前 hard 档重试链路唯一无反馈环)。
+        // 第 146 轮:再回灌「已完成单元清单」—— 断点续跑,只规划剩余部分。
         emit_progress(progress, "Plan 规划中…");
         let plan_started = std::time::Instant::now();
         let (plan_output, plan_usage) = self
@@ -1039,6 +1068,7 @@ impl MultiAgentOrchestrator {
                 &c.decomposition_plan,
                 session.id(),
                 retry_hint,
+                completed_digest,
             )
             .await
             .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;
@@ -1083,6 +1113,7 @@ impl MultiAgentOrchestrator {
                 cancelled: false,
                 trace: None,
                 usage: add_usage(plan_usage, qc_plan_usage),
+                completed_digest: String::new(),
             });
         }
 
@@ -1118,6 +1149,7 @@ impl MultiAgentOrchestrator {
                 cancelled: false,
                 trace: None,
                 usage: add_usage(add_usage(plan_usage, qc_plan_usage), qc_main_usage),
+                completed_digest: String::new(),
             });
         }
 

@@ -144,6 +144,10 @@ fn build_unit_qc_prompt(
          请基于「本单元职责 + 期望输出 + 实际输出 + 执行轨迹」判定本单元是否完成,**不要用整体目标苛求本单元**\
          (整体目标的其余部分由后续 WorkFlow 单元负责)。按 JSON 输出 verdict/source/issues/suggestion/retryable/evidence。\n\
          判定提示:若轨迹包含 early_terminate / high_error_rate / text_failure_phrase 信号,通常应判 Fail 并把对应信号写入 issues。\n\
+         遍历/覆盖类期望(「遍历 P1~P4」「覆盖清单: …」)以实际输出尾部的【机械导航足迹】对账 —— \
+         它由工具层统计(open/navigate/new_tab 导航记账,零幻觉):distinct_pages 不足或 top_repeats 异常集中\
+         (同一页 ≥4 次)即覆盖未达成,issues 引用足迹原文;足迹达标的子项不要凭想象判 Fail。\n\
+         截图证据不作视觉判读依据(Read 读图片只回元信息存根),以文本台账/DOM 片段/操作前后状态为准。\n\
          若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。{degradation_rule}{QC_JSON_SHAPE_HINT}",
         clip_qc_input(actual_output),
     )

@@ -708,7 +708,13 @@ async fn act_new_tab(id: &str, p: &Value) -> std::result::Result<Value, String> 
     let page = ensure_page(id).await?;
     let js = format!("window.open({url}, '_blank')", url = js_str(url));
     let _ = eval_js_string(&page, &js).await;
-    Ok(json!({"opened": url}))
+    // 第 146 轮:访问台账记账 + 重复访问警示(新标签页 page_id 由 adopt 机制另行回传)
+    super::visit_ledger::record_visit(id, url, "", super::visit_ledger::VisitSource::NewTab);
+    let mut out = json!({"opened": url});
+    if let Some(note) = super::visit_ledger::visit_note(url) {
+        out["visit_note"] = note;
+    }
+    Ok(out)
 }
 
 async fn act_close_tab(id: &str) -> std::result::Result<Value, String> {
@@ -731,7 +737,14 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
     if let Some(ms) = p.get("wait_ms").and_then(Value::as_u64) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
-    Ok(json!({"url": url}))
+    // 第 146 轮:访问台账记账(记**目标 URL**而非跳转后 URL —— 覆盖度关心
+    // 「去了哪个路由」,登录重定向不稀释覆盖)+ 重复访问警示
+    super::visit_ledger::record_visit(id, url, "", super::visit_ledger::VisitSource::Navigate);
+    let mut out = json!({"url": url});
+    if let Some(note) = super::visit_ledger::visit_note(url) {
+        out["visit_note"] = note;
+    }
+    Ok(out)
 }
 
 async fn act_history(id: &str, back: bool) -> std::result::Result<Value, String> {

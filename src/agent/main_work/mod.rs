@@ -100,6 +100,7 @@ impl MainWorkRunner {
         session_id: &str,
         retry_hint: &str,
         original_prompt: Option<&str>,
+        completed_digest: &str,
     ) -> Result<(WorkFlowPlan, Usage)> {
         Self::plan_workflows_inner(
             self,
@@ -109,11 +110,13 @@ impl MainWorkRunner {
             retry_hint,
             original_prompt,
             None,
+            completed_digest,
         )
         .await
     }
 
     /// 2026-09-16 第 59 轮:带 suggested_delegate 的重载,供 Orchestrator 传入 Yolo 推断结果。
+    /// 第 146 轮:增 `completed_digest` —— 上一轮已完成且 QC 通过的单元摘要(断点续跑)。
     pub async fn plan_workflows_with_delegate(
         &self,
         goal: &str,
@@ -122,6 +125,7 @@ impl MainWorkRunner {
         retry_hint: &str,
         original_prompt: Option<&str>,
         suggested_delegate: Option<&str>,
+        completed_digest: &str,
     ) -> Result<(WorkFlowPlan, Usage)> {
         Self::plan_workflows_inner(
             self,
@@ -131,6 +135,7 @@ impl MainWorkRunner {
             retry_hint,
             original_prompt,
             suggested_delegate,
+            completed_digest,
         )
         .await
     }
@@ -143,6 +148,7 @@ impl MainWorkRunner {
         retry_hint: &str,
         original_prompt: Option<&str>,
         suggested_delegate: Option<&str>,
+        completed_digest: &str,
     ) -> Result<(WorkFlowPlan, Usage)> {
         let mut prompt = String::new();
         // 2026-09-19 第91轮 P0-1 改动1: 三条绝对关键约束 + 第一性事实优先 + 输出前自检清单
@@ -173,6 +179,28 @@ impl MainWorkRunner {
                  请在本轮拆解中针对上述原因调整编排(补充前置检查 / 拆细步骤 / 明确验收命令)。\n"
             ));
         }
+        // 第 146 轮:断点续跑 —— 上一轮已完成且 QC 通过的单元清单。本轮拆解
+        // **禁止重复规划**这些职责(重跑已通过单元纯属浪费迭代预算),只拆剩余部分;
+        // 下游单元需要其结论时在 steps 里写「复用上轮产物:<要点>」即可。
+        if !completed_digest.trim().is_empty() {
+            prompt.push_str(&format!(
+                "\n【重要】上一轮已完成且 QC 通过的单元(产物已留存,**禁止重复规划/重跑**):\n{completed_digest}\n\
+                 本轮只拆解**剩余**目标;依赖已完成单元结论的步骤,直接引用其产物要点,不要再执行。\n"
+            ));
+        }
+        // 第 146 轮:遍历类任务拆解纪律 —— 「网页任务 2~3 个 wf」对全站走查是
+        // 错误模板(实测 9 页站点被压进巨型单元,32 轮迭代跑不完 → QC 以覆盖不全
+        // 打回 → 档位重试又从零重跑,77 分钟未完成)。按页面分批 + acceptance 带
+        // 页面覆盖清单,QC 才能用 inspect(info=coverage) 的机械台账对账漏页。
+        prompt.push_str(
+            "\n遍历/走查/巡检类网页任务(用户要求「遍历所有页面/所有控件/全面走查/找 N 个 bug」)拆解纪律(第 146 轮):\n\
+             - 按页面分批拆单元:**每单元 ≤4 个页面,4~8 个 wf 合法**,不受「网页任务 2~3 个 wf」约束;\n\
+             - 每个遍历单元的 acceptance **必须**含一条「页面覆盖清单」(列出本单元应访问的路由,如\n\
+               「覆盖清单: /sysOverview,/videoPreview,/gis」),供执行层与 QC 用 inspect(info=coverage) 机械对账;\n\
+             - 单元职责只覆盖**本批页面**的交互一致性(点击/下拉/拖拽/tab 抽样),整体目标由后续单元负责;\n\
+             - 首个单元可含「导航结构建档」职责(extract_links 建全站页面清单),后续单元按清单分批;\n\
+             - 汇总/报告类单元放最后,depends_on 引用各批单元,引用「覆盖台账」而非重新遍历。\n",
+        );
         prompt.push_str(&format!("输出前自检清单(必填):原始每条编号是否都映射到某 wf 的 steps+acceptance? 核心动作动词(聊天/发送/保存报告/截图/...)是否完整保留? 时长/数量/频率是否在 acceptance 出现? 长时任务是否走 chat_loop/run_sequence wait 而非 Bash sleep 或 input_batch 长 wait? 交互类任务 acceptance 是否锚定 UI 动作产物而非「保活/进程存活/时间差」?\n"));
         // F8:补全 branches/loops 的 schema 示例并注明可省略 —— 此前提示词只列了
         // 六个必填字段,LLM 自行发明 branches 字符串形态导致类型失配(F1 的源头)。

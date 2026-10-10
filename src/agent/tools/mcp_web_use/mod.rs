@@ -35,6 +35,8 @@ mod hitl_hint;
 mod inspect;
 mod page_state;
 mod unlock_zone;
+/// 遍历访问台账(第 146 轮):`pub(crate)` 供编排层(QC 机械足迹)取 seq/footprint。
+pub(crate) mod visit_ledger;
 
 #[cfg(test)]
 mod tests;
@@ -173,16 +175,67 @@ pub(super) fn normalize_web_url(u: &str) -> String {
     s
 }
 
-/// 在已存活页面中找同 URL 页面(第 99 轮:open 复用,根治重试/重复 open
-/// 导致的页面泄漏)。基于 `list_pages()` 公共 API(自带失效 entry 清理)。
-async fn find_reusable_page_id(url: &str) -> Option<String> {
+/// 提取 `scheme://host[:port]` origin(第 146 轮:origin 级页面复用兜底)。
+/// 仅 http/https 返回 Some;chrome://、about:、devtools://、file://、裸串一律 None
+/// (这些页面永不参与 origin 兜底,避免把工具页/空白页导航走)。
+pub(super) fn url_origin(u: &str) -> Option<String> {
+    let parsed = url::Url::parse(u.trim()).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => Some(parsed.origin().ascii_serialization()),
+        _ => None,
+    }
+}
+
+/// 页面复用匹配级别(响应 `reuse_match` 字段,审计可对账)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReuseMatch {
+    /// 第 99 轮行为:URL 精确匹配(归一化后)。
+    Exact,
+    /// 第 146 轮兜底:同 origin(scheme+host+port)匹配 —— 长遍历任务里存活页
+    /// 停在别的路由时,精确匹配落空会新开标签页(实测 14:08 `open(OrganManagement)`
+    /// 又开了 p_fdfb9239),兜底改为在最早打开的同站页面上原地导航,保住登录态与
+    /// 页面上下文,不再分叉页面句柄。
+    Origin,
+}
+
+impl ReuseMatch {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReuseMatch::Exact => "exact",
+            ReuseMatch::Origin => "origin",
+        }
+    }
+}
+
+/// 在已存活页面中找可复用页面(第 99 轮:同 URL 精确匹配,根治重试/重复 open
+/// 导致的页面泄漏;第 146 轮:精确未命中时按同 origin 兜底)。
+/// 基于 `list_pages()` 公共 API(自带失效 entry 清理)。
+///
+/// origin 兜底规则:仅 http(s) 页面参与;多候选取 `created_at` 最早(主工作页,
+/// 通常是登录页,登录态最全);`origin_fallback=false`(connect 模式接管用户浏览器)
+/// 时禁用 —— 绝不导航用户自己打开的标签页。
+async fn find_reusable_page(
+    url: &str,
+    origin_fallback: bool,
+) -> Option<(String, ReuseMatch, String)> {
+    let pages = BrowserManager::global().list_pages().await;
     let want = normalize_web_url(url);
-    BrowserManager::global()
-        .list_pages()
-        .await
-        .into_iter()
-        .find(|(_, u, _, _)| normalize_web_url(u) == want)
-        .map(|(id, _, _, _)| id)
+    // ① 精确匹配(第 99 轮原行为,优先)
+    if let Some((id, u, _, _)) = pages.iter().find(|(_, u, _, _)| normalize_web_url(u) == want) {
+        return Some((id.clone(), ReuseMatch::Exact, u.clone()));
+    }
+    // ② 同 origin 兜底(第 146 轮)
+    if !origin_fallback {
+        return None;
+    }
+    let Some(want_origin) = url_origin(url) else {
+        return None;
+    };
+    pages
+        .iter()
+        .filter(|(_, u, _, _)| url_origin(u) == Some(want_origin.clone()))
+        .min_by_key(|(_, _, _, created_at)| created_at.clone())
+        .map(|(id, u, _, _)| (id.clone(), ReuseMatch::Origin, u.clone()))
 }
 
 /// open 成功响应的四步引导(新建与复用两条路径共用)。
@@ -551,8 +604,13 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
     let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(true);
     // 第 103 轮:读取 timeout_ms 参数,控制页面加载超时(默认 60s)
     let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(60000);
+    // 第 146 轮:connect 模式(接管用户浏览器)禁用 origin 级兜底 ——
+    // 不导航用户自己打开的标签页;精确匹配(第 99 轮语义)不受影响。
+    let connect_mode = BrowserManager::global().is_connect_mode().await;
     if reuse {
-        if let Some(pid) = find_reusable_page_id(url).await {
+        if let Some((pid, match_kind, previous_url)) =
+            find_reusable_page(url, !connect_mode).await
+        {
             // 复用路径:在同一页面上导航刷新(新验证码/新会话态),page_id 不变;
             // 导航失败(页面挂死/断连)时落回新建路径。
             if let Some(page) = BrowserManager::global().page(&pid).await {
@@ -581,16 +639,30 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                         .ok()
                         .flatten()
                         .unwrap_or_else(|| url.to_string());
+                    // 第 146 轮:访问台账记账(导航成功后;重复访问警示随响应附带)
+                    visit_ledger::record_visit(
+                        &pid,
+                        &final_url,
+                        &title,
+                        visit_ledger::VisitSource::Open,
+                    );
                     // 第 125 轮:复用路径同样做视口自适应(默认开,auto_expand_viewport=false 关)
                     let mut payload = json!({
                         "page_id": pid,
                         "title": title,
                         "final_url": final_url,
                         "reused": true,
+                        // 第 146 轮:复用匹配级别与复用前 URL(exact=URL 精确命中,
+                        // origin=同站最早页面兜底命中),供 QC/审计对账页面句柄不分裂。
+                        "reuse_match": match_kind.as_str(),
+                        "previous_url": previous_url,
                         "browser_reused": browser_reused,
                         "mode": mode_label,
                         "next_steps": open_next_steps(),
                     });
+                    if let Some(note) = visit_ledger::visit_note(&final_url) {
+                        payload["visit_note"] = note;
+                    }
                     // 第 139 轮:人工拖过窗口后,复用路径同样按屏幕工作区收边(有头才动)。
                     if mode_label == BrowserMode::Headed.as_str() {
                         if let Some(v) = fit_headed_window(&pid).await {
@@ -672,7 +744,7 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             }
             // 第 142 轮:connect 模式(接管外部浏览器)判定,供 guard/overlay 字段分路提示。
-            let connect_mode = BrowserManager::global().is_connect_mode().await;
+            // (第 146 轮:connect_mode 已在函数开头取过 —— origin 复用兜底也要用)
             // 第 143 轮:管控状态双字段(读实例真实期望态,理由见 guard_response_fields)。
             let (guard_field, overlay_field) =
                 guard_response_fields(effective_mode, connect_mode).await;
@@ -723,6 +795,16 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                             json!({"expanded": false, "note": "视口测量失败(不影响页面操作);需要时手动 control(set_viewport)"})
                     }
                 }
+            }
+            // 第 146 轮:访问台账记账(新建页面导航成功后;重复访问警示随响应附带)
+            visit_ledger::record_visit(
+                &page_id,
+                &final_url,
+                &title,
+                visit_ledger::VisitSource::Open,
+            );
+            if let Some(note) = visit_ledger::visit_note(&final_url) {
+                data["visit_note"] = note;
             }
             envelope(0, "ok", data)
         }
@@ -961,11 +1043,11 @@ pub struct McpWebUseTool;
 /// 作业规范部分精炼,全文见 SubAgent-Work 系统提示词的 MCP_Web_Use 段)。
 const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器操作网页(macOS / Windows / Linux,内存无头浏览器默认,也可接管已开浏览器;MCP 风格单工具多 action)。
 用 action 参数选择操作:
-- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, guard?, allow_selectors?, block_selectors?, guard_note?, overlay?, timeout_ms?, reuse_existing?, auto_relaunch?): 启动/接管 Chromium 并打开页面。**默认可见窗口(mode=headed,第 139 轮)**——不要为了「省资源」主动传 hidden,除非任务明确要求静默后台跑;无 GUI 会话(CI/容器/SSH)会自动回退 hidden,可用 LAEW_BROWSER_MODE 强制。使用一次性临时 profile,不干扰用户日常浏览器;全模式启动窗口默认 1920×1080(1080p),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;**页面管控三档(第 143 轮,guard 参数,缺省 locked)**:locked=屏蔽模式(半透明蒙层+锁定人工输入,人工可实时观看不可点击,防交叉操作;Agent 输入动作自动「先解后锁」不受影响,人工交互一律走 request_human 默认自动解锁)/ open=非屏蔽模式(人工可直接操作页面,状态条明示「🔓 页面开放」,用于人工亲自操作、人工登录先行流)/ partial=部分屏蔽模式(须同时给 allow_selectors 白名单「只有命中区人工可操作」或 block_selectors 黑名单「命中区人工不可操作」之一,互斥,各 ≤8 条;盾区内人工不可操作、盾区外放行,Agent 动作自动「先隐盾后复盾」);guard_note(≤60 字符)写进页面状态条第三行引导人工(如「请登录后应答弹窗,Agent 将接管后续操作」);缺省随 LAEW_WEB_GUARD;仅 headed 生效;运行时切换 control(set_guard);legacy overlay 布尔参数保留(true≡locked/false≡open,显式传 guard 时被忽略);timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。**复用已登录浏览器(第 142 轮)**:reuse_existing=true 自动探测本机调试端口(默认 9222,LAEW_CHROME_DEBUG_PORT 可覆盖;依次尝试 localhost/[::1]/127.0.0.1 —— Chrome 154+ 的 DevTools HTTP 端点只服务 IPv6 loopback 连接,IPv4 返回 404)并接管用户已登录的 Chrome(保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port + data.browser_version + data.connect_mode=true;探测失败返回 code=3002 + data.relaunch_command(平台相关重启命令,转述用户执行,或 auto_relaunch=true 重试,由工具自动复制登录态并另启独立调试 Chrome 实例,不退出、不影响用户已打开的浏览器);connect 模式 close 只断连不关用户浏览器,默认不锁人工输入(管控恒为 open 且零注入,需要时 set_guard 手动开)。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**窗口收边(第 139 轮,默认开)**:headed 模式下导航完成后按屏幕工作区自动收窄窗口(小屏笔记本不再把窗口挤出屏外「显示不全」),并保证页面视口不低于 720p,结果回 data.headed_window。**视口自适应(第 125 轮,默认开)**:导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。返回 {page_id,title,final_url,reused,mode,browser_reused,connect_mode,window,guard,overlay(legacy),headed_window?,viewport?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
+- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, guard?, allow_selectors?, block_selectors?, guard_note?, overlay?, timeout_ms?, reuse_existing?, auto_relaunch?): 启动/接管 Chromium 并打开页面。**默认可见窗口(mode=headed,第 139 轮)**——不要为了「省资源」主动传 hidden,除非任务明确要求静默后台跑;无 GUI 会话(CI/容器/SSH)会自动回退 hidden,可用 LAEW_BROWSER_MODE 强制。使用一次性临时 profile,不干扰用户日常浏览器;全模式启动窗口默认 1920×1080(1080p),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;**页面管控三档(第 143 轮,guard 参数,缺省 locked)**:locked=屏蔽模式(半透明蒙层+锁定人工输入,人工可实时观看不可点击,防交叉操作;Agent 输入动作自动「先解后锁」不受影响,人工交互一律走 request_human 默认自动解锁)/ open=非屏蔽模式(人工可直接操作页面,状态条明示「🔓 页面开放」,用于人工亲自操作、人工登录先行流)/ partial=部分屏蔽模式(须同时给 allow_selectors 白名单「只有命中区人工可操作」或 block_selectors 黑名单「命中区人工不可操作」之一,互斥,各 ≤8 条;盾区内人工不可操作、盾区外放行,Agent 动作自动「先隐盾后复盾」);guard_note(≤60 字符)写进页面状态条第三行引导人工(如「请登录后应答弹窗,Agent 将接管后续操作」);缺省随 LAEW_WEB_GUARD;仅 headed 生效;运行时切换 control(set_guard);legacy overlay 布尔参数保留(true≡locked/false≡open,显式传 guard 时被忽略);timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。**复用已登录浏览器(第 142 轮)**:reuse_existing=true 自动探测本机调试端口(默认 9222,LAEW_CHROME_DEBUG_PORT 可覆盖;依次尝试 localhost/[::1]/127.0.0.1 —— Chrome 154+ 的 DevTools HTTP 端点只服务 IPv6 loopback 连接,IPv4 返回 404)并接管用户已登录的 Chrome(保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port + data.browser_version + data.connect_mode=true;探测失败返回 code=3002 + data.relaunch_command(平台相关重启命令,转述用户执行,或 auto_relaunch=true 重试,由工具自动复制登录态并另启独立调试 Chrome 实例,不退出、不影响用户已打开的浏览器);connect 模式 close 只断连不关用户浏览器,默认不锁人工输入(管控恒为 open 且零注入,需要时 set_guard 手动开)。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);**同 origin 兜底复用(第 146 轮)**:精确未命中但存在同 scheme+host+port 的存活页面(取最早打开的主工作页)时,在该页面上原地导航复用(响应 reuse_match=origin + previous_url),长遍历任务不再因路由不同新开冗余标签页、登录态与页面上下文不丢失;connect 模式(接管用户浏览器)不做 origin 兜底,绝不导航用户自己的标签页;浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**窗口收边(第 139 轮,默认开)**:headed 模式下导航完成后按屏幕工作区自动收窄窗口(小屏笔记本不再把窗口挤出屏外「显示不全」),并保证页面视口不低于 720p,结果回 data.headed_window。**视口自适应(第 125 轮,默认开)**:导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。返回 {page_id,title,final_url,reused,mode,browser_reused,connect_mode,window,guard,overlay(legacy),headed_window?,viewport?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
 - list(): 列出当前存活页面 [{page_id,url,title,created_at}];返回前自动清理失效 entry。冷启动后多轮任务优先用它同步页面索引。
 - close(page_id*): 关闭指定页面;最后一个页面关闭时回收浏览器进程。page_id="all" 一键关闭全部页面并回收浏览器(任务收尾清场)。幂等;对话型页面(用户可能继续追问)可保留复用。
 - control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event/set_window/sync_viewport/set_highlight/set_overlay/set_guard/request_human。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。screenshot 一律落盘返回 save_path(看图片文字用 params.ocr=true,文本模型无法消费 base64);eval_js 直接写表达式,支持 return 与多语句(失败自动 IIFE 重试),超长返回值自动落盘并以 saved_to 引用;download 支持 http(s) url 或 selector、save_dir、filename、timeout_ms,data: URL 直接解码落盘,完成后返回绝对 save_path 与 byte_size。set_window 运行时调整真实浏览器窗口(width/height/left/top/window_state=maximized|fullscreen|minimized|normal,CDP setWindowBounds,调整后自动清除视口覆盖保证渲染自适应不缺区域);sync_viewport 在人工拖动窗口大小后调用,清除 device metrics 覆盖使视口=窗口内容区(会撤销 open 时的自动 2K 扩展);set_viewport(width,height,device_scale_factor?=1,mobile?=false) 手动设置布局视口(宽 320~7680/高 240~4320 自动 clamp;open 已默认自动扩展视口,仅当自动结果不理想时才手动指定);set_highlight(enabled) 运行时开关蓝色选中边框;set_guard(mode?="locked"|"open"|"partial", allow_selectors?, block_selectors?, note?) 运行时切换页面管控三档(第 143 轮,推荐;字段缺省=保持现值,空数组/空串=清除;partial 校验同 open);set_overlay(enabled) 蒙层开关 legacy 别名(true=set_guard(locked),false=set_guard(open),仅 headed 生效);request_human(reason=captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom, message?, options?, timeout_ms? 缺省按 reason 分档 captcha/sms/two_factor=120s 其余 300s, bring_to_front?=true, image_path? 指定已有截图文件, unlock_page?=true 提问期间自动放行页面供人工直接操作(第 144 轮:优先 partial 白名单挖洞,只放行账号/密码/验证码等人工必填输入区域——自动探测,或 allow_selectors? 显式指定 ≤8 条;探测不到才整页切 open;应答/超时/取消后自动恢复原档;open 下无需动作;纯问答场景传 false;提问期间人工提交表单触发导航会自动重放放行态,多步登录不断链)) 人工介入:滑块/短信验证码/扫码登录/实名认证/人脸核身/2FA 邮箱验证码/第三方 OAuth 等无法自动跳过的流程。reason=captcha 时会自动截取当前视口(或用 image_path 指定已保存的截图),弹窗内直接展示验证码图片,人工读码后填入输入框即可,不必切换窗口。macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时+时间轴,文案可鼠标选中复制,人工在弹窗点选项/输入文本/取消,-p 模式同样可弹;第 145 轮:主按钮为「提交 / 继续」双语义——有输入=提交验证码/动态码文本,空输入=选项 1(人工在浏览器完成操作后的交棒动作);另有「⏱ +2分钟」按钮延长等待,总上限 30 分钟;TUI 兜底行读),code=0 时 human_response 为人工回答(assist_channel 标注 gui/tui;next_hint 按「输码 vs 已完成」分流——自由文本验证码立即 input_text 填入提交,选项应答才 inspect 验证),人工取消返回 code=4002,超时或弹窗与 TUI 均不可用返回 code=4001(如实告知用户改用交互模式重试,严禁伪造结果)。
-- inspect(page_id*, info*, params?): 全部只读观察统一入口。info 枚举:console(控制台输出)/network(请求响应流)/elements(元素文本与矩形;params.selector 可选,缺失时默认返回 input/button/select/textarea/a/[role=button] 等全页交互元素)/dom(outerHTML 或节点树)/localstorage/sessionstorage/cookies/screenshot/page_meta/viewport(视口+内容尺寸与 overflow 溢出判定:横向溢出=页面显示不全需 set_viewport/重开 open 自动扩展,纵向溢出截图用 full_page=true)/url/title/ping/image_urls/ocr(截图+OCR 识别图片文字,验证码/图表标签用;region 过滤词块)/blockers(启发式检测验证码/短信/扫码/登录墙等人工阻断,返回 blockers[]+suggested_action=request_human)/extract_links(批量提取页面所有链接,返回 links[{href,text,context,is_external}]+total+truncated+scanned+hostname;params.selector 默认 "a" 可选,params.max_links 默认 200 上限 500,params.include_context 默认 true 含文章前后文供时间推断)/extract(【第 135 轮,列表/表格抓取首选】一次调用把列表页压成结构化条目并可在页面内完成过滤,只回精简字段)/page_state(【第 135 轮】读取页面 SSR 注水数据与 JSON-LD,列表数据藏在全局变量时先读它)。
+- inspect(page_id*, info*, params?): 全部只读观察统一入口。info 枚举:console(控制台输出)/network(请求响应流)/elements(元素文本与矩形;params.selector 可选,缺失时默认返回 input/button/select/textarea/a/[role=button] 等全页交互元素)/dom(outerHTML 或节点树)/localstorage/sessionstorage/cookies/screenshot/page_meta/viewport(视口+内容尺寸与 overflow 溢出判定:横向溢出=页面显示不全需 set_viewport/重开 open 自动扩展,纵向溢出截图用 full_page=true)/url/title/ping/image_urls/ocr(截图+OCR 识别图片文字,验证码/图表标签用;region 过滤词块)/blockers(启发式检测验证码/短信/扫码/登录墙等人工阻断,返回 blockers[]+suggested_action=request_human)/extract_links(批量提取页面所有链接,返回 links[{href,text,context,is_external}]+total+truncated+scanned+hostname;params.selector 默认 "a" 可选,params.max_links 默认 200 上限 500,params.include_context 默认 true 含文章前后文供时间推断)/extract(【第 135 轮,列表/表格抓取首选】一次调用把列表页压成结构化条目并可在页面内完成过滤,只回精简字段)/page_state(【第 135 轮】读取页面 SSR 注水数据与 JSON-LD,列表数据藏在全局变量时先读它)/coverage(【第 146 轮】遍历覆盖台账:工具层自动记录 open/navigate/new_tab 的全部导航,返回 summary{distinct_pages,total_visits}+top_repeats+pages 清单;**遍历类任务开工/收口必查,未访问页面优先,防同页打转**;进程级全局事实,不依赖存活页面)。
 【extract 详解(抓文章列表/新闻流/商品列表优先用它,不要手写 eval_js 猜字段)】params:item_selector*(列表项根节点 CSS 选择器,不知填什么先 probe=true)、fields(字段投影,形如 {"title":{"selector":"h3 a","required":true},"time":{"selector":"time","attr":"datetime"},"summary":{"selector":".descript","max_chars":300}},省略则只回通用 text+__url)、url_from(取链接的选择器,默认 "a",结果落在 __url)、limit(默认 200 上限 1000)、scan_cap(内部扫描上限,默认 1000)、filter{keywords[],match_all,fields[],time_field,since,until,sort("time:desc"),limit_after_filter}。返回 {items,total,returned,scanned,truncated,dropped_required,matched_before_filter,unparsed_time_fields,time_range,field_names,hostname,hint}。**时间字段支持中文相对时间**("3小时前"/"昨天")、ISO、"YYYY-MM-DD HH:mm" 与 Unix 秒;since/until 是闭区间。probe=true 时不抽数据,只返回 {repeated_classes,likely_item_classes,common_selectors} 供你选 item_selector,免去盲试选择器。过滤在页面内完成,返回值天然精简,不会撑爆上下文。
 【page_state 详解】params:keys?(候选全局变量名,默认 __NEXT_DATA__/__NUXT__/__INITIAL_STATE__/__APOLLO_STATE__/__PRELOADED_STATE__/__remixContext/initialState/__INITIAL_DATA__)、probe_window?(默认 true,扫出 window 上所有 __ 前缀键名+一层结构,让你不必先猜名字)、max_bytes?(默认 20000)、max_depth?(默认 8)、max_array_items?(默认 200)。返回 {found,globals,window_globals,jsonld,dropped_paths,truncated,hostname,hint}。**被裁掉的内容会列进 dropped_paths** —— 别误以为数据就这么多;按 globals 的结构选定路径后,用 eval_js 取精确子集(如 JSON.stringify(window.__NEXT_DATA__.props.pageProps.list.slice(0,20)))。
 - sequence(steps*, stop_on_error?): 连续执行模式。steps 最多 24 个,每项结构与单步调用相同(open/list/close/control/inspect),禁止嵌套 sequence;批内 page_id 用 "$page_id"/"${page_id}" 占位,点击派生新页可用 "$spawned_page_id"/"${spawned_page_id}",默认自动跟随 spawned_page_id,单步可 follow_spawned=false 保持原页。响应逐步返回 code/message/data,并给出最终 page_id。
@@ -1000,7 +1082,7 @@ impl Tool for McpWebUseTool {
                     "description": "要执行的浏览器操作:open(启动/接管浏览器并打开页面) / list(列出存活页面) / close(关闭页面) / control(写操作统一入口) / inspect(只读观察统一入口) / sequence(连续执行一批操作) / explore(批量观察:一次调用多个 inspect info 维度,合并返回) / batch(批量混合执行:同 sequence 但推荐用于 control + inspect 混合场景,允许任意步骤顺序)"
                 },
                 "url": { "type": "string", "description": "open 必填:目标网址" },
-                "reuse": { "type": "boolean", "default": true, "description": "open 可选:同 URL 已有存活页面时复用(导航刷新,page_id 不变,响应 reused:true);false 强制新开页面" },
+                "reuse": { "type": "boolean", "default": true, "description": "open 可选:同 URL 已有存活页面时复用(导航刷新,page_id 不变,响应 reused:true);精确未命中时同 origin 存活页面兜底复用(reuse_match=origin,第 146 轮);false 强制新开页面" },
                 "mode": { "type": "string", "enum": ["headed", "hidden", "new_headless"], "default": "headed", "description": "open 可选:浏览器模式;headed=可见窗口(默认,第 139 轮),hidden=纯 CDP 无窗口,new_headless=旧 headless=true。缺省由 LAEW_BROWSER_MODE 与 GUI 会话探测决定:无 GUI 会话(CI/容器/SSH)自动回退 hidden" },
                 "window_width": { "type": "integer", "minimum": 320, "maximum": 7680, "description": "open 可选:浏览器窗口宽(px);缺省全模式统一 1920(1080p),小屏按屏幕工作区自动收边;与 window_height 成对使用;浏览器已存在时仅记录请求值(单实例复用)" },
                 "window_height": { "type": "integer", "minimum": 240, "maximum": 4320, "description": "open 可选:浏览器窗口高(px);缺省全模式统一 1080(1080p);运行时调整用 control(set_window),人工拖动后用 control(sync_viewport) 自适应" },
@@ -1044,9 +1126,9 @@ impl Tool for McpWebUseTool {
                         "localstorage", "sessionstorage", "cookies",
                         "screenshot", "page_meta", "viewport",
                         "url", "title", "ping", "image_urls", "ocr", "blockers",
-                        "extract_links", "extract", "page_state"
+                        "extract_links", "extract", "page_state", "coverage"
                     ],
-                    "description": "inspect 必填:观察维度(Console 输出 / Network 流 / Elements 元素 / DOM / localStorage 等 19 个);ocr=截图+OCR 识别图片文字(验证码/图表标签,region 过滤词块);blockers=检测验证码/短信/扫码/登录墙等人工阻断;extract_links=批量提取页面所有链接(href+文本+上下文);extract=【列表/表格抓取首选】一次把列表页压成结构化条目并可按关键词+时间窗+排序过滤(抓文章列表、新闻流、商品列表优先用它,别手写 eval_js);page_state=读取页面 SSR 注水数据(window.__NEXT_DATA__/initialState 等)+ JSON-LD,列表数据藏在全局变量时先读它"
+                    "description": "inspect 必填:观察维度(Console 输出 / Network 流 / Elements 元素 / DOM / localStorage 等 20 个);ocr=截图+OCR 识别图片文字(验证码/图表标签,region 过滤词块);blockers=检测验证码/短信/扫码/登录墙等人工阻断;extract_links=批量提取页面所有链接(href+文本+上下文);extract=【列表/表格抓取首选】一次把列表页压成结构化条目并可按关键词+时间窗+排序过滤(抓文章列表、新闻流、商品列表优先用它,别手写 eval_js);page_state=读取页面 SSR 注水数据(window.__NEXT_DATA__/initialState 等)+ JSON-LD,列表数据藏在全局变量时先读它;coverage=【第 146 轮】遍历覆盖台账(distinct 页面/每页访问次数/top 重复),遍历任务开工与收口必查、未访问页面优先"
                 },
                 "params": { "type": "object", "description": "control/inspect 可选:动作参数对象(selector/text/key/keys/timeout_ms/url/x/y/file_paths/save_dir/filename 等按 control_action/info 各异)。screenshot/ocr 支持 save_path(落盘路径)、ocr=true(返回 OCR 文字)、region{x,y,width,height}(OCR 词块过滤)、return_base64=true(显式内联 base64,默认不返回)、full_page/format/quality" },
                 "execution_mode": {

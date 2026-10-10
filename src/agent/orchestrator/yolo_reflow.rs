@@ -108,8 +108,18 @@ impl MultiAgentOrchestrator {
             .as_ref()
             .map(|t| t.failure_signals.join(","))
             .unwrap_or_default();
+        // 第 146 轮:已完成单元清单随失败回流 —— Yolo 重新评估/重分类时知道
+        // 「哪些已经做完」,不再把任务当成从零开始(断点续跑)。
+        let completed_block = if failure.completed_digest.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n已完成且 QC 通过的单元(产物已留存):\n{}\n",
+                failure.completed_digest.trim()
+            )
+        };
         let failure_msg = format!(
-            "[PREVIOUS_FAILURE]\n源: {}\n任务级别: {}\n原目标: {}\n失败原因: {}\n失败信号: {}\n建议: {}\n请重新评估:可重试 → 修订 decomposition_plan 重发;不可重试 → 填 user_suggestion_if_fail 并给出 direct_answer 告知用户。",
+            "[PREVIOUS_FAILURE]\n源: {}\n任务级别: {}\n原目标: {}\n失败原因: {}\n失败信号: {}\n建议: {}\n{completed_block}请重新评估:可重试 → 修订 decomposition_plan 重发(只规划剩余部分,勿重复已完成单元);不可重试 → 填 user_suggestion_if_fail 并给出 direct_answer 告知用户。",
             failure.source.as_str(),
             prev.task_level.as_str(),
             prev.goal_summary,

@@ -1,7 +1,7 @@
 //! MCP_Web_Use 工具单元测试(自 tools/browser.rs 测试平移 + 单工具化改造)。
 
 use super::*;
-use super::{control, extract, hitl_hint, inspect, page_state};
+use super::{control, extract, hitl_hint, inspect, page_state, visit_ledger};
 use base64::Engine as _;
 
 #[test]
@@ -169,7 +169,7 @@ fn parameters_info_enum_complete() {
     ] {
         assert!(names.contains(required), "info 枚举缺失 {required}");
     }
-    assert_eq!(names.len(), 19, "info 应为 19 个,实际 {names:?}");
+    assert_eq!(names.len(), 20, "info 应为 20 个,实际 {names:?}");
 }
 
 #[test]
@@ -628,9 +628,10 @@ fn parameters_info_enum_contains_ocr() {
     let p = McpWebUseTool.parameters();
     let enums = p["properties"]["info"]["enum"].as_array().expect("info enum 应为数组");
     let names: Vec<&str> = enums.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(names.len(), 19, "info 应有 19 个枚举值: {names:?}");
+    assert_eq!(names.len(), 20, "info 应有 20 个枚举值: {names:?}");
     assert!(names.contains(&"ocr"), "info 枚举应含 ocr: {names:?}");
     assert!(names.contains(&"extract_links"), "info 枚举应含 extract_links: {names:?}");
+    assert!(names.contains(&"coverage"), "info 枚举应含 coverage(第 146 轮): {names:?}");
 }
 
 // =================== 第 135 轮:extract / page_state / eval_js 体积闸门 ===================
@@ -1471,4 +1472,71 @@ fn option_pick_answer_shape_detection() {
     for s in ["z7z2", "482913", "993 041", "3.14 是圆周率吗", "选项一", ""] {
         assert!(!hitl_hint::is_option_pick_answer(s), "「{s}」不应识别为选项应答");
     }
+}
+
+// ===================== 第 146 轮:origin 复用 / 访问台账 =====================
+
+/// origin 提取:仅 http(s) 参与,chrome:// 等特殊页永不兜底复用。
+#[test]
+fn url_origin_extracts_and_rejects_special_schemes() {
+    assert_eq!(
+        url_origin("http://10.255.159.58:20122/OrganManagement").as_deref(),
+        Some("http://10.255.159.58:20122")
+    );
+    assert_eq!(url_origin("https://a.com/x?y=1").as_deref(), Some("https://a.com"));
+    // 默认端口归一(url crate 语义:80/443 省略)
+    assert_eq!(
+        url_origin("http://a.com:80/x").as_deref(),
+        url_origin("http://a.com/x").as_deref()
+    );
+    assert_eq!(url_origin("chrome://new-tab-page/"), None);
+    assert_eq!(url_origin("about:blank"), None);
+    assert_eq!(url_origin("devtools://devtools/bundled/inspector.html"), None);
+    assert_eq!(url_origin("file:///tmp/a.html"), None);
+    assert_eq!(url_origin("not a url"), None);
+}
+
+/// origin 复用兜底:URL 精确未命中、同 origin 存活页应被选中(取最早创建的)。
+/// 不起真浏览器 —— `find_reusable_page` 依赖全局 BrowserManager,这里只锁纯函数层;
+/// 端到端行为由 #[ignore] 真浏览器用例与实测日志验证。
+#[test]
+fn reuse_match_kind_strs() {
+    use super::ReuseMatch;
+    assert_eq!(ReuseMatch::Exact.as_str(), "exact");
+    assert_eq!(ReuseMatch::Origin.as_str(), "origin");
+}
+
+/// inspect(info=coverage):进程级全局事实,不依赖存活页面(page_id 随便给)。
+#[tokio::test]
+async fn inspect_coverage_returns_ledger_without_live_page() {
+    let _g = visit_ledger::test_lock().lock().unwrap();
+    visit_ledger::reset_for_test();
+    visit_ledger::record_visit("p_x", "http://a.com/login", "登录", visit_ledger::VisitSource::Open);
+    visit_ledger::record_visit("p_x", "http://a.com/home", "首页", visit_ledger::VisitSource::Navigate);
+    visit_ledger::record_visit("p_x", "http://a.com/home", "首页", visit_ledger::VisitSource::Navigate);
+    visit_ledger::record_visit("p_y", "http://a.com/home", "首页", visit_ledger::VisitSource::NewTab);
+    let out = inspect::run(serde_json::json!({"page_id": "nonexistent", "info": "coverage"}))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], 0, "coverage 不应因 page_id 失效被拒: {out}");
+    assert_eq!(v["data"]["summary"]["distinct_pages"], 2);
+    assert_eq!(v["data"]["summary"]["total_visits"], 4);
+    // /home 3 次 → 重复警示
+    assert_eq!(visit_ledger::visit_note("http://a.com/home").unwrap()["visits"], 3);
+    assert!(visit_ledger::visit_note("http://a.com/login").is_none());
+}
+
+/// navigate 响应附带 visit_note(≥3 次时):经 act_navigate 需要 live page,
+/// 这里锁纯函数口径(visit_note 已在上例覆盖),补 key 归一化兜底。
+#[test]
+fn visit_note_ignores_query_and_fragment() {
+    let _g = visit_ledger::test_lock().lock().unwrap();
+    visit_ledger::reset_for_test();
+    visit_ledger::record_visit("p", "http://a.com/p", "", visit_ledger::VisitSource::Navigate);
+    visit_ledger::record_visit("p", "http://a.com/p?x=1", "", visit_ledger::VisitSource::Navigate);
+    let note = visit_ledger::visit_note("http://a.com/p#frag");
+    assert!(note.is_none(), "2 次(含 query 折叠)未到阈值 3");
+    visit_ledger::record_visit("p", "http://a.com/p#again", "", visit_ledger::VisitSource::Navigate);
+    assert!(visit_ledger::visit_note("http://a.com/p?y=2").is_some(), "3 次应触发");
 }

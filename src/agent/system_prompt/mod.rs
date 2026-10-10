@@ -20,6 +20,8 @@ pub mod skill_catalog;
 /// 网页取证纪律提示词段(2026-10-08 第 131 轮,独立子模块防 mod.rs 超 1800 行)。
 /// 运行时兜底见 `crate::agent::safety::web_evidence`。
 pub mod web_evidence;
+/// 遍历覆盖纪律提示词段(第 146 轮)。
+pub mod web_traversal;
 
 /// 网页内容提取纪律提示词段(2026-10-08 第 135 轮,独立子模块防 mod.rs 超 1800 行)。
 /// 配套工具面:`inspect(info=extract)` / `inspect(info=page_state)`,见
@@ -266,7 +268,9 @@ impl SystemPrompt {
             .set_identity(SUB_AGENT_IDENTITY)
             .append_base(MCP_WEB_USE_PROMPT_SECTION)
             .append_base(web_evidence::WEB_EVIDENCE_PROMPT_SECTION)
-            .append_base(web_extract::WEB_EXTRACT_PROMPT_SECTION);
+            .append_base(web_extract::WEB_EXTRACT_PROMPT_SECTION)
+            // 第 146 轮:遍历覆盖纪律(工具层访问台账 inspect(info=coverage) 配套)。
+            .append_base(web_traversal::WEB_TRAVERSAL_PROMPT_SECTION);
         let prompt = if crate::agent::tools::mcp_use::mcp_use_enabled() {
             prompt.append_base(mcp_use_hint::MCP_USE_PROMPT_SECTION)
         } else {
