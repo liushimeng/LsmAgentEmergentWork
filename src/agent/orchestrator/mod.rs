@@ -143,13 +143,15 @@ pub use types::{
     LayerInfo, OrchestrationOutcome, OrchestratorConfig, RetryRecord, StageDuration, TaskResult,
     WorkflowResult,
 };
-use types::QualityFailure;
+use types::{QualityFailure, SameCauseBreaker};
 use usage::{add_usage, failure_usage, tool_args_digest};
 use workflows::run_wf_unit;
 // 单测经 `use super::*` 取用;非测试构建无引用。
 #[cfg(test)]
 use workflows::build_subflow_input;
-use yolo_reflow::{fallback_suggestion, is_placeholder_direct_answer};
+use yolo_reflow::{
+    fallback_suggestion, is_placeholder_direct_answer, refusal_text_of, yolo_refusal_signal,
+};
 
 #[cfg(test)]
 mod tests;

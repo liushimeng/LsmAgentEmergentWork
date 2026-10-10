@@ -141,10 +141,12 @@ bash testReport/run_e2e.sh   # 端到端(mock LLM,无需真实 Key;含 TUI 子�
 
 #### 跨角色编排（`MultiAgentOrchestrator`）
 
-用户输入 → 项目上下文注入 → Yolo 分类 → 简单档（SubAgent）/ 中档（Main→SubAgent）/ 高档（Plan→Main→SubAgent）→ Quality-Check → SessionContext 收口。
+用户输入 → 项目上下文注入 → Yolo 分类 →（澄清门 / 安全拒绝门）→ 简单档（SubAgent）/ 中档（Main→SubAgent）/ 高档（Plan→Main→SubAgent）→ Quality-Check → SessionContext 收口。
 
+- **安全拒绝终态门（第 149 轮）**：Yolo 判定任务不应执行（攻击/越权/违规/危害）时——显式 `refuses_task=true` 或 direct_answer 文首命中机械拒绝检测（`safety::refusal.rs::detect_refusal`，扫前 3 非空行）——**任何档位都不委派**，拒绝说明 + 替代方向经 `DirectAnswer` 终态直达用户；失败回流重分类后同样复查（门 B）。纵深防御：`run_hard` 对 Plan 输出先做拒绝检测，命中即 `QualityFailure{refused}` 上抛 → 拒绝终态，不进 QC/解析（根治 2026-10-10 实测：拒绝式 Plan 三轮进解析门报「未解析出任何 WorkFlow」→ 盲重试 528s，构成对模型「换格式补齐被拒内容」的施压）。拒绝不是失败：不回流、不重试、SessionContext 摘要明确写「拒绝」
+- **同因熔断（第 149 轮）**：重试环内失败原因归一化（首行截 120 字符，`normalize_failure_reason`）连续 2 次相同即提前终止重试（`types::SameCauseBreaker`），不再烧满 `max_retry_per_level`；Yolo 回流后计数复位
 - WorkFlow 执行时按 `depends_on` 自动 Kahn 分层（`main_work::topo_layers`），**同层无依赖的 SubAgent 自动并行**（tokio::spawn + Semaphore 上限 3，`OrchestratorConfig::max_parallel_workflows`），跨层严格串行、上游产物按层注入，失败语义与串行一致（fail-fast 回流 Yolo）
-- **执行-验证-修订闭环**：WorkFlow 单元 QC 判 `retryable=true` 时先在**单元级局部重试**（仅该单元，注入本单元 QC 结论，不连坐同层姊妹单元），`OrchestratorConfig::unit_retry_budget` 默认 2（单单元最多 3 次尝试，`0` = 关闭旧行为）；预算耗尽才升级到档位级重试（`max_retry_per_level=3`，`retray_hint` 回灌 Main-Work）→ Yolo 回流（`[PREVIOUS_FAILURE]` + `failure_signals`）→ Failed outcome。retry_hint 分层：attempt=0 用档位级 hint / attempt≥1 用本单元 QC issues+suggestion 覆盖 description hint 段（`apply_retry_hint_overlay`）
+- **执行-验证-修订闭环**：WorkFlow 单元 QC 判 `retryable=true` 时先在**单元级局部重试**（仅该单元，注入本单元 QC 结论，不连坐同层姊妹单元），`OrchestratorConfig::unit_retry_budget` 默认 2（单单元最多 3 次尝试，`0` = 关闭旧行为）；预算耗尽才升级到档位级重试（`max_retry_per_level=3`，`retray_hint` 回灌 Main-Work）→ Yolo 回流（`[PREVIOUS_FAILURE]` + `failure_signals`）→ Failed outcome。retry_hint 分层：attempt=0 用档位级 hint / attempt≥1 用本单元 QC issues+suggestion 覆盖 description hint 段（`apply_retry_hint_overlay`）。失败路径用量保全（第 149 轮）：`from_agent_error` 站点改为手工构造 QualityFailure 携带已发生 usage，终态用量与逐事件累加对齐
 
 ### 三个 MCP 风格工具（替代已删除的独立 Agent 角色）
 
@@ -277,7 +279,7 @@ agent/
   plan_validate.rs Plan 输出校验
   yolo.rs          YoloRunner 双 Agent 编排器 + TaskLevel + TaskClassification + JSON 解析
   main_work/       Main-Work 流程层目录:mod.rs(MainWorkRunner) / spec.rs(WorkFlow 规格模型+宽松反序列化) / delegate.rs(委派推断 GUI 优先) / topo.rs(Kahn 分层+依赖治理) / parse.rs(JSON/Markdown 双通道解析) / tests.rs
-  orchestrator/    MultiAgentOrchestrator 总编排器目录:mod.rs(结构体+入口+进度通道) / types.rs(共享类型) / pipeline.rs(handle_inner+三档链路) / workflows.rs(分层并行+run_wf_unit) / yolo_reflow.rs(Yolo 分类封装+失败回流) / usage.rs(用量累加) / tests.rs
+  orchestrator/    MultiAgentOrchestrator 总编排器目录:mod.rs(结构体+入口+进度通道) / types.rs(共享类型+QualityFailure+SameCauseBreaker 同因熔断,第 149 轮) / pipeline.rs(handle_inner+三档链路+安全拒绝终态门 A/B+Plan 拒绝短路+失败路径用量保全,第 149 轮) / workflows.rs(分层并行+run_wf_unit) / yolo_reflow.rs(Yolo 分类封装+失败回流+拒绝信号判定) / usage.rs(用量累加) / tests.rs
 
   quality.rs       Quality-Check Agent + 单元 QC 提示词构建 + retry 预算
   debug.rs         Debug Agent(-debug 模式):trace 评估 + 四章节报告生成
@@ -285,11 +287,11 @@ agent/
   subagent_workflow.rs SubAgent 工作流编排(同上)
 
   permissions/     权限管控:mod.rs / dangerous.rs / readonly.rs / sensitive.rs
-  safety/          安全防护:mod.rs / url_safety.rs(SSRF 拦截) / prompt_injection.rs(提示注入检测) / credentials.rs(凭证脱敏) / target_anchor.rs(任务锚点,跨 5 层设防的唯一事实源)
+  safety/          安全防护:mod.rs / url_safety.rs(SSRF 拦截) / prompt_injection.rs(提示注入检测) / credentials.rs(凭证脱敏) / target_anchor.rs(任务锚点,跨 5 层设防的唯一事实源) / refusal.rs(安全拒绝机械检测+同因归一化,第 149 轮) / web_evidence.rs(网页取证纪律)
   sandbox_hook/    沙箱钩子:mod.rs(单文件,接外部 sandbox)
   skills/          Skill 系统(渐进式披露):mod.rs / registry.rs / render.rs / tools.rs / skill.rs / bundled.rs / bundled/{code-review,git-commit,test-runner}.md
 
-  system_prompt/   SystemPrompt 组合与渲染:mod.rs / mcp_use_hint.rs / web_evidence.rs(网页取证纪律第 131 轮) / web_extract.rs(网页内容提取纪律第 135 轮) / skill_catalog.rs
+  system_prompt/   SystemPrompt 组合与渲染:mod.rs / yolo_prompt.rs(Yolo 提示词块,第 149 轮拆出) / mcp_use_hint.rs / web_evidence.rs(网页取证纪律第 131 轮) / web_extract.rs(网页内容提取纪律第 135 轮) / skill_catalog.rs
   tools/
     mod.rs         Tool trait + ToolRegistry(有序) + builtin_registry()/yolo_registry() + max_parallel_tools_from
     bash.rs        BashTool(UTF-8 环境注入 + CRLF 感知 + 30K/150K 截断 + 落盘回灌)

@@ -10,11 +10,13 @@
 
 pub mod credentials;
 pub mod prompt_injection;
+pub mod refusal;
 pub mod target_anchor;
 pub mod url_safety;
 pub mod web_evidence;
 
 pub use credentials::{Vault, CREDENTIAL_PREFIX};
+pub use refusal::{detect_refusal, normalize_failure_reason};
 pub use prompt_injection::{
     scan_and_wrap, InjectionSource, InjectionVerdict, MatchHit, Severity, INJECTION_BOUNDARY,
 };

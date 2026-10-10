@@ -260,7 +260,10 @@ fn finish(rt: tokio::runtime::Handle, reason: &str, code: i32) {
 ///
 /// 序列与 [`crate::shutdown::terminal_restore_sync`] 完全一致
 /// (`?25h` 光标 / `?1049l` 退 alt screen / `r` 重置滚动区 / `?7h` 自动换行 /
-/// `m` 重置 SGR / `c` 全终端 reset),区别只在**不经过 Rust stdio 的全局锁**。
+/// `m` 重置 SGR),区别只在**不经过 Rust stdio 的全局锁**。
+/// 第 149 轮:与 terminal_restore_sync 同步删除 `\x1bc`(RIS)—— 它会清空
+/// 用户屏幕(「终端像崩溃重启」观感的根因),且 shutdown 卡死场景下用户终端
+/// 仍存活,抹掉它同样有害;laew 用过的全部模式已由上述序列逐一还原。
 ///
 /// # 为什么必须绕开 stdio
 ///
@@ -275,7 +278,6 @@ fn force_terminal_restore() {
         b"\x1b[r",        // 重置滚动区(全屏)
         b"\x1b[?7h",      // 启用自动换行
         b"\x1b[m",        // 重置 SGR 属性
-        b"\x1bc",         // 全终端 reset
     ];
     for seq in SEQ {
         for fd in [1i32, 2i32] {

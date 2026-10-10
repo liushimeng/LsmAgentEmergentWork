@@ -95,6 +95,10 @@ impl Tool for SubmitTaskClassification {
                 "clarification_question": {
                     "type": "string",
                     "description": "target_status=unresolved 时必填:要回给用户的具体澄清问题(中文,直接可答,列明缺哪一项)。其余情况留空"
+                },
+                "refuses_task": {
+                    "type": "boolean",
+                    "description": "安全拒绝(第 149 轮):三步分析判定任务不应执行(攻击/越权/违反目标服务条款/违法/明显危害)时填 true,并在 direct_answer 写明拒绝原因与可操作的替代方向 —— 这是唯一会展示给用户的字段。填 true 后编排器直接终态返回,不委派 Plan/Main-Work/执行层;decomposition_plan 留空数组。默认 false"
                 }
             },
             "required": ["task_level", "goal_summary", "intent"]

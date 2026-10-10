@@ -80,6 +80,10 @@ pub enum DebugEvent {
     /// 任务终态
     TaskEnd {
         outcome: String,
+        /// 第 149 轮:终态原因(失败原因 / 拒绝说明头部),独立字段不再与建议拼接
+        reason: String,
+        /// 第 149 轮:给用户的建议(替代方向等),独立字段
+        suggestion: String,
         total_usage: Usage,
         total_duration_ms: u128,
     },
@@ -173,9 +177,21 @@ impl DebugCollector {
     }
 
     /// 记录任务终态。
-    pub fn record_task_end(&self, outcome: impl Into<String>, total_usage: Usage) {
+    ///
+    /// 第 149 轮:reason / suggestion 独立参数(此前 pipeline 把
+    /// `"failed: {suggestion}"` 拼进单字段,失败原因与建议混杂,上游无法程序化
+    /// 处理;实测 2026-10-10 事故 Debug 报告终态行只显示建议、真实原因被淹没)。
+    pub fn record_task_end(
+        &self,
+        outcome: &str,
+        reason: &str,
+        suggestion: &str,
+        total_usage: Usage,
+    ) {
         self.push(DebugEvent::TaskEnd {
-            outcome: outcome.into(),
+            outcome: outcome.to_string(),
+            reason: reason.to_string(),
+            suggestion: suggestion.to_string(),
             total_usage,
             total_duration_ms: self.elapsed_ms(),
         });
@@ -324,14 +340,24 @@ impl DebugCollector {
                 }
                 DebugEvent::TaskEnd {
                     outcome,
+                    reason,
+                    suggestion,
                     total_usage,
                     total_duration_ms,
                 } => {
                     out.push_str(&format!(
                         "- 类型: 任务终态\n- 结果: {outcome}\n- 总耗时: {total_duration_ms} ms\n\
-                         - 总 token: input={} output={}\n\n",
+                         - 总 token: input={} output={}\n",
                         total_usage.input_tokens, total_usage.output_tokens,
                     ));
+                    // 第 149 轮:原因与建议独立成行,不再拼接进「结果」字段
+                    if !reason.is_empty() {
+                        out.push_str(&format!("- 原因: {reason}\n"));
+                    }
+                    if !suggestion.is_empty() {
+                        out.push_str(&format!("- 建议: {suggestion}\n"));
+                    }
+                    out.push('\n');
                 }
             }
         }
@@ -387,16 +413,28 @@ fn summarize_output(c: &Completion) -> String {
         out.push_str(&truncate_chars(&c.text, MAX_FIELD_CHARS));
     }
     for call in &c.tool_calls {
+        // 第 149 轮:emit 工具(submit_task_classification / submit_quality_report)
+        // 的参数就是**最终结构化结论**本身 —— 500 字符会把关键判定截在
+        // intent / evidence 字段中间(实测 2026-10-10 事故:分类 JSON 在
+        // `prompt_extraction_…` 处腰斩,审计无法核对意图判定)。
+        // emit 参数放宽到 2400;普通工具保持 500。
+        let args_budget = if is_emit_tool(&call.name) { 2400 } else { 500 };
         out.push_str(&format!(
             "\n[tool_call] {}({})",
             call.name,
-            truncate_chars(&call.arguments.to_string(), 500)
+            truncate_chars(&call.arguments.to_string(), args_budget)
         ));
     }
     if out.is_empty() {
         out.push_str("(空输出)");
     }
     out
+}
+
+/// 判断是否为结构化输出(emit)工具 —— 其参数是最终结论,截断预算放宽。
+fn is_emit_tool(name: &str) -> bool {
+    name == crate::agent::tools::emit::SUBMIT_TASK_CLASSIFICATION
+        || name == crate::agent::tools::emit::SUBMIT_QUALITY_REPORT
 }
 
 /// 按字符数截断(防溢出)。
@@ -1130,9 +1168,10 @@ mod tests {
             debug_eligible: true,
             target_status: None,
             clarification_question: None,
+            refuses_task: false,
         });
         c.record_quality(&QualityReport::pass(AgentRole::SubAgent));
-        c.record_task_end("executed", Usage::default());
+        c.record_task_end("executed", "", "", Usage::default());
         let events = c.events();
         assert_eq!(events.len(), 3);
         let trace = c.render_trace();
@@ -1244,6 +1283,7 @@ mod tests {
             debug_eligible: false,
             target_status: None,
             clarification_question: None,
+            refuses_task: false,
         };
         assert!(!should_invoke_debug_agent(&c), "should skip when debug_eligible=false");
         c.debug_eligible = true;
@@ -1256,7 +1296,7 @@ mod tests {
     #[test]
     fn render_skipped_evaluation_has_four_sections() {
         let c = Arc::new(DebugCollector::new("sess-r92-skip"));
-        c.record_task_end("executed", Usage::default());
+        c.record_task_end("executed", "", "", Usage::default());
         let reason = "Task not classified as software engineering (intent=chat)";
         let md = render_skipped_evaluation(reason, &c);
         assert!(md.contains("## Task Assessment"), "missing task assessment section: {md}");

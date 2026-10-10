@@ -1036,7 +1036,7 @@ impl TuiSession {
     ) {
         // handle 路径异常(orchestrator 内部错误)时补记终态事件,保证报告完整
         if let Err(e) = handle_result {
-            collector.record_task_end(format!("error: {e}"), crate::llm::Usage::default());
+            collector.record_task_end("error", &e.to_string(), "", crate::llm::Usage::default());
         }
         let model = match self.db.lock().expect("db").get_active_or_env() {
             Ok(Some(r)) => format!(

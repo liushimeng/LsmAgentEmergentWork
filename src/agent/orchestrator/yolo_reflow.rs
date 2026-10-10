@@ -72,12 +72,15 @@ impl MultiAgentOrchestrator {
         }
     }
 
+    /// 失败回流重分类。第 149 轮:返回值补上 Yolo 回流调用的用量 —— 此前
+    /// `let _ = yolo_usage;` 直接丢弃,注释声称「由 handle_inner 的 outer loop
+    /// 处理」但 outer loop 根本拿不到(签名只返回分类),回流轮 token 全部漏记。
     pub(super) async fn run_yolo_with_failure(
         &self,
         prev: &TaskClassification,
         failure: &QualityFailure,
         session: &mut Session,
-    ) -> Result<TaskClassification> {
+    ) -> Result<(TaskClassification, Usage)> {
         // 2026-09-16 第 54 轮补丁 E:在失败原因末尾追加平台级 fallback 提示
         // (限制 200 字符以内,避免撑爆 token)
         let platform_hint = self.platform_fallback_hint(failure);
@@ -133,10 +136,9 @@ impl MultiAgentOrchestrator {
 
         // 2026-09-09 第 14 轮:Yolo 失败回流时,Yolo 自身的 LLM 用量需要累加到
         // total_usage(原本被丢弃,导致失败回流的 token 也未计入)。
+        // 第 149 轮:真正透传给调用方(handle_inner 累加进 total_usage)。
         let (c, yolo_usage) = self.run_yolo_classification(session).await?;
-        // 透传:调用方负责把 yolo_usage 合并进 total_usage
-        let _ = yolo_usage; // 失败回流场景的累加由 handle_inner 的 outer loop 处理
-        Ok(c)
+        Ok((c, yolo_usage))
     }
 
     // ========== Debug 采集钩子(未开启时零开销) ==========
@@ -153,9 +155,16 @@ impl MultiAgentOrchestrator {
         }
     }
 
-    pub(super) fn dbg_task_end(&self, outcome: &str, usage: Usage) {
+    /// 第 149 轮:reason / suggestion 独立传参(终态原因与建议不再拼接单字段)。
+    pub(super) fn dbg_task_end(
+        &self,
+        outcome: &str,
+        reason: &str,
+        suggestion: &str,
+        usage: Usage,
+    ) {
         if let Some(d) = &self.cfg.debug {
-            d.record_task_end(outcome, usage);
+            d.record_task_end(outcome, reason, suggestion, usage);
         }
     }
 
@@ -201,6 +210,52 @@ pub(super) fn is_placeholder_direct_answer(s: &str) -> bool {
         || t.eq_ignore_ascii_case("null")
         || t.eq_ignore_ascii_case("none")
         || t.eq_ignore_ascii_case("nil")
+}
+
+/// 第 149 轮:Yolo 分类的安全拒绝信号(拒绝门 A/B 共用判定)。
+///
+/// 双通道(任一命中即为拒绝):
+/// - **explicit**:LLM 显式填 `refuses_task=true`(主通道,语义最准);
+/// - **mechanical**:`direct_answer` 非空非占位,且文首命中
+///   `safety::refusal::detect_refusal` 机械检测(兜底,旧模型/网关不透传新字段)。
+///
+/// 返回 `(channel, marker)`:marker 为机械检测命中的具体拒绝短语(日志/审计用),
+/// explicit 通道为 `None`。非拒绝返回 `None`。
+pub(super) fn yolo_refusal_signal(
+    c: &TaskClassification,
+) -> Option<(&'static str, Option<&'static str>)> {
+    if c.refuses_task {
+        return Some(("explicit", None));
+    }
+    if let Some(answer) = c.direct_answer.as_ref() {
+        if !is_placeholder_direct_answer(answer) {
+            if let Some(marker) = crate::agent::safety::detect_refusal(answer) {
+                return Some(("mechanical", Some(marker)));
+            }
+        }
+    }
+    None
+}
+
+/// 第 149 轮:拒绝终态展示文本 —— direct_answer 优先(LLM 写的拒绝原因 +
+/// 替代方向);未填时从 `user_suggestion_if_fail` 兜底合成,保证用户拿到的
+/// 拒绝回复永远带「下一步能做什么」。
+pub(super) fn refusal_text_of(c: &TaskClassification) -> String {
+    if let Some(a) = c
+        .direct_answer
+        .as_ref()
+        .filter(|a| !is_placeholder_direct_answer(a))
+    {
+        return a.clone();
+    }
+    let mut text = String::from("任务被入口层拒绝执行(安全/合规原因)。");
+    if !c.user_suggestion_if_fail.is_empty() {
+        text.push_str("\n");
+        text.push_str(&c.user_suggestion_if_fail);
+    } else {
+        text.push_str("\n如需继续,请调整任务目标(改为合法、合规且不损害他人的表述)后重新发送。");
+    }
+    text
 }
 
 /// 当 Yolo 没有给出 user_suggestion 时,根据累计 usage 给出 actionable 兜底建议。

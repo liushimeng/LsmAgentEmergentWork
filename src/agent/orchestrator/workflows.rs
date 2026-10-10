@@ -29,6 +29,8 @@ impl MultiAgentOrchestrator {
             trace: None,
             usage: Usage::default(),
             completed_digest: String::new(),
+            refused: false,
+            refusal_text: String::new(),
         })?;
 
         let mut results = Vec::new();
@@ -170,6 +172,8 @@ impl MultiAgentOrchestrator {
                                     trace: None,
                                     usage: Usage::default(),
                                     completed_digest: String::new(),
+                                    refused: false,
+                                    refusal_text: String::new(),
                                 }),
                             ));
                         }
@@ -346,6 +350,8 @@ pub(super) async fn run_wf_unit(
             trace: None,
             usage: Usage::default(),
             completed_digest: String::new(),
+            refused: false,
+            refusal_text: String::new(),
         })?),
         None => None,
     };
@@ -645,6 +651,8 @@ pub(super) async fn run_wf_unit(
                 // 第 146 轮:同层姊妹单元的完成摘要由 run_wf_units 汇总回填
                 //(本函数看不到兄弟单元结果)。
                 completed_digest: String::new(),
+                refused: false,
+                refusal_text: String::new(),
             });
         }
 

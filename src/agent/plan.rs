@@ -72,8 +72,15 @@ impl PlanRunner {
         let retry_block = if retry_hint.trim().is_empty() {
             String::new()
         } else {
+            // 第 149 轮文案纠偏:旧版固定写「上一轮 Quality-Check 拒绝理由」——
+            // 但 retry_hint 的真实来源可能是解析校验失败(QC 实际判 pass),
+            // 失实归因 + 「必须修复」措辞会构成对模型的施压(实测 2026-10-10:
+            // QC 三次 pass,解析门三次以「QC 拒绝」名义要求重出,Plan 明确抗议
+            // 「换格式重试只是把同一份方案写得更可解析」)。改为中性、如实表述。
             format!(
-                "\n【上一轮 Quality-Check 拒绝理由,本次方案必须针对性修复】\n{}\n",
+                "\n【上一轮失败反馈(可能来自 Quality-Check 或解析校验,如实标注于下)】\n{}\n\
+                 若该反馈属于格式/结构问题,请针对性调整输出模板;若属于任务本身无法执行,\
+                 请如实说明原因,不要为通过校验而改变结论。\n",
                 retry_hint.trim()
             )
         };

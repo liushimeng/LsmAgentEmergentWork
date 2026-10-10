@@ -318,7 +318,15 @@ pub async fn terminal_restore() {
 /// - `\x1b[?1049l`   退出 alt screen
 /// - `\x1b[r`        重置滚动区(全屏)
 /// - `\x1b[?7h`      启用自动换行
-/// - `\x1bc`         全终端 reset(终极兜底,某些状态机退出手段)
+/// - `\x1b[m`        重置 SGR 属性
+///
+/// 第 149 轮:**删除 `\x1bc`(RIS 全终端复位)**。RIS 会清空屏幕(部分终端
+/// 连回滚缓冲一起清),用户 Ctrl+C 退出 laew 后终端呈现「刚打开」状态 ——
+/// 实测(2026-10-10)被用户误判为「终端崩溃重启、TUI 内容全部丢失」。
+/// laew 设置的全部终端状态都有对应还原:raw mode(ioctl)、bracketed paste
+/// (read_line 出口无条件关,panic 走 catch_unwind 外层)、alt screen / 滚动区 /
+/// 光标 / 换行 / SGR(上述序列),RIS 的额外作用只剩破坏用户会话历史。
+/// 行业惯例(Claude Code / vim / htop)退出均不清屏。
 pub fn terminal_restore_sync() {
     use std::io::Write;
 
@@ -332,7 +340,6 @@ pub fn terminal_restore_sync() {
         let _ = handle.write_all(b"\x1b[r");          // 重置滚动区
         let _ = handle.write_all(b"\x1b[?7h");        // 自动换行
         let _ = handle.write_all(b"\x1b[m");           // 重置 SGR 属性
-        let _ = handle.write_all(b"\x1bc");            // 全终端 reset(终极兜底)
         let _ = handle.flush();
     }
 

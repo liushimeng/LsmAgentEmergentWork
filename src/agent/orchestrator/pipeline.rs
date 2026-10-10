@@ -206,6 +206,10 @@ impl MultiAgentOrchestrator {
         // 累计并注入 Plan/Main-Work 提示词,重试轮只规划/执行剩余部分,
         // 根治「档位重试从 wf-1 全量重跑、同批页面反复遍历」。
         let mut completed_digest = String::new();
+        // 第 149 轮同因熔断:连续 2 轮失败原因相同 → force_fail,loop 顶部与
+        // 「超 max_retry」共用失败收口(实现与单测见 types::SameCauseBreaker)。
+        let mut same_cause = SameCauseBreaker::new();
+        let mut force_fail = false;
 
         // 1.15) 澄清门(第 128 轮 L1,防目标漂移):**目标不可解析 → 回问用户,不进 WorkFlow**。
         //
@@ -276,7 +280,7 @@ impl MultiAgentOrchestrator {
                 elapsed_ms: sc_started.elapsed().as_millis() as u64,
             });
             total_usage = add_usage(total_usage, summary.usage);
-            self.dbg_task_end("clarification_needed", total_usage);
+            self.dbg_task_end("clarification_needed", "目标不可解析,已回问用户澄清", "", total_usage);
             info!(
                 session = %session.id(),
                 outcome = "clarification_needed",
@@ -290,6 +294,39 @@ impl MultiAgentOrchestrator {
                 classification,
                 usage: total_usage,
             });
+        }
+
+        // 1.18) 安全拒绝终态门 A(第 149 轮 P0-1):Yolo 判定任务**不应执行**时,
+        // 拒绝是终态而非可重试失败 —— 任何档位都不再委派 Plan/Main-Work/执行层。
+        //
+        // 实测事故(2026-10-10,`llaew_20261010_152433.log`):Yolo 判
+        // `intent=prompt_extraction_attack` 并在 direct_answer 写了完整拒绝文本 +
+        // 4 个替代方向,但 task_level=hard —— direct_answer 短路只对 Simple 生效,
+        // 拒绝被忽略、原任务原文下发 Plan,Plan 三次拒绝、解析门三次报
+        // 「未解析出任何 WorkFlow」,528s / 8 次调用收口为误导性 failed。
+        // 双通道:显式 `refuses_task`(LLM 填)∪ 机械检测(direct_answer 文首
+        // 命中 `safety::refusal::detect_refusal`,旧模型不填新字段时兜底)。
+        if let Some((channel, marker)) = yolo_refusal_signal(&classification) {
+            Self::check_cancelled(cancel)?;
+            let refusal_text = refusal_text_of(&classification);
+            info!(
+                session = %session.id(),
+                channel,
+                marker = marker.unwrap_or(""),
+                refusal_chars = refusal_text.chars().count(),
+                "安全拒绝门触发(决策):拒绝终态,不委派执行"
+            );
+            return Ok(self
+                .refusal_terminal(
+                    session,
+                    classification,
+                    refusal_text,
+                    "yolo",
+                    total_usage,
+                    progress,
+                    task_started,
+                )
+                .await?);
         }
 
         // 1.2) simple + direct_answer 短路(2026-09-09 第 15 轮 AQ03 实测发现):
@@ -350,7 +387,7 @@ impl MultiAgentOrchestrator {
                     elapsed_ms: sc_elapsed_ms,
                 });
                 total_usage = add_usage(total_usage, summary.usage);
-                self.dbg_task_end("direct_answer", total_usage);
+                self.dbg_task_end("direct_answer", "", "", total_usage);
                 // 运行日志(第 69 轮):任务收口 —— 直答结局
                 info!(
                     session = %session.id(),
@@ -374,7 +411,20 @@ impl MultiAgentOrchestrator {
             retry_count += 1;
             // 2026-09-16 第 57 轮:本轮入口计时(用于 retry_log.elapsed_ms)。
             let retry_started = std::time::Instant::now();
-            if retry_count > self.cfg.max_retry_per_level {
+            // 第 149 轮同因熔断:连续 2 轮失败原因完全相同 → 提前终止(不再烧满
+            // max_retry_per_level)。同因第 3 次重试的先验成功率极低 —— retry_hint
+            // 已注入下游仍原样失败,说明该原因不因反馈而改变(实测 2026-10-10
+            // 事故:Plan 解析失败三轮完全同因,每轮 ~107s 纯浪费)。
+            if retry_count > self.cfg.max_retry_per_level || force_fail {
+                if force_fail {
+                    // 运行日志(第 149 轮):同因熔断触发,与「重试预算耗尽」区分
+                    info!(
+                        session = %session.id(),
+                        streak = same_cause.streak(),
+                        reason = %crate::logging::clip(&retry_hint),
+                        "同因熔断触发(决策):连续多轮失败原因相同,提前终止重试"
+                    );
+                }
                 // 超过最大重试,输出失败 / 建议
                 // 关联报告: 2026-09-09_05 E-003 —— 当 Yolo 没提供 user_suggestion 时,
                 // 给出 actionable 化的兜底建议(根据 trace 推测失败原因)。
@@ -384,12 +434,13 @@ impl MultiAgentOrchestrator {
                     classification.user_suggestion_if_fail.clone()
                 };
                 self.record_failure_event(session.id(), &classification, &suggestion);
-                self.dbg_task_end(&format!("failed: {suggestion}"), total_usage);
+                self.dbg_task_end("failed", &retry_hint, &suggestion, total_usage);
                 // 运行日志(第 69 轮):重试预算耗尽,任务最终失败
                 info!(
                     session = %session.id(),
                     outcome = "failed",
                     attempts = retry_count,
+                    breaker = force_fail,
                     reason = %crate::logging::clip(&retry_hint),
                     suggestion = %crate::logging::clip(&suggestion),
                     usage_in = total_usage.input_tokens,
@@ -512,7 +563,7 @@ impl MultiAgentOrchestrator {
                     task_result.stage_durations.extend(stage_durations);
                     task_result.retry_log = retry_log;
                     task_result.wallclock_ms = task_started.elapsed().as_millis() as u64;
-                    self.dbg_task_end("executed", task_result.total_usage);
+                    self.dbg_task_end("executed", "", "", task_result.total_usage);
                     // 运行日志(第 69 轮):任务收口 —— 执行成功结局
                     info!(
                         session = %session.id(),
@@ -531,8 +582,31 @@ impl MultiAgentOrchestrator {
                 Err(failure) => {
                     // 用户取消:短路退出整个任务,不回流不重试(H9 语义)
                     if failure.cancelled {
-                        self.dbg_task_end("cancelled", total_usage);
+                        self.dbg_task_end("cancelled", "", "", total_usage);
                         return Err(AgentError::Cancelled);
+                    }
+                    // 第 149 轮 P0-2:下游安全拒绝(当前为 Plan 层)→ 拒绝终态,
+                    // 不回流不重试 —— 拒绝文本(原因 + 替代方向)直达用户。
+                    // 此路径下重试/回流只会形成「解析失败 → 施压重出」的循环。
+                    if failure.refused {
+                        total_usage = add_usage(total_usage, failure_usage(&failure));
+                        let refusal_text = failure.refusal_text;
+                        info!(
+                            session = %session.id(),
+                            source_role = %failure.source.as_str(),
+                            "下游 Agent 拒绝执行(决策):拒绝终态,不回流不重试"
+                        );
+                        return Ok(self
+                            .refusal_terminal(
+                                session,
+                                classification,
+                                refusal_text,
+                                "plan",
+                                total_usage,
+                                progress,
+                                task_started,
+                            )
+                            .await?);
                     }
                     total_usage = add_usage(total_usage, failure_usage(&failure));
                     // 2026-09-16 第 58 轮 P0-C:捕获最近一次失败的 ExecutionTrace,
@@ -576,7 +650,10 @@ impl MultiAgentOrchestrator {
                             .run_yolo_with_failure(&classification, &failure, session)
                             .await
                         {
-                            Ok(new_c) => {
+                            Ok((new_c, reflow_usage)) => {
+                                // 第 149 轮:回流 Yolo 用量并入 total_usage
+                                //(此前签名只返回分类,用量被丢弃漏记)
+                                total_usage = add_usage(total_usage, reflow_usage);
                                 classification = new_c;
                                 self.dbg_classify(&classification);
                                 // 运行日志(第 69 轮):失败回流 Yolo 后的新分类
@@ -590,6 +667,32 @@ impl MultiAgentOrchestrator {
                                 // 分类可能变化 → 计划缓存一并作废(第 67 轮)
                                 retry_hint.clear();
                                 medium_plan_cache = None;
+                                // 第 149 轮:回流后失败上下文已变,同因计数复位
+                                same_cause.reset();
+                                // 第 149 轮 P0-1 门 B:Yolo 回流重分类后若改判
+                                // 安全拒绝 → 拒绝终态(防止回流轮的拒绝仍被继续委派)
+                                if let Some((channel, marker)) =
+                                    yolo_refusal_signal(&classification)
+                                {
+                                    let refusal_text = refusal_text_of(&classification);
+                                    info!(
+                                        session = %session.id(),
+                                        channel,
+                                        marker = marker.unwrap_or(""),
+                                        "安全拒绝门触发(回流轮,决策):拒绝终态,不委派执行"
+                                    );
+                                    return Ok(self
+                                        .refusal_terminal(
+                                            session,
+                                            classification,
+                                            refusal_text,
+                                            "yolo",
+                                            total_usage,
+                                            progress,
+                                            task_started,
+                                        )
+                                        .await?);
+                                }
                                 continue;
                             }
                             Err(e) => {
@@ -607,6 +710,15 @@ impl MultiAgentOrchestrator {
                     // retryable=true 留在当前档位继续重跑
                     // F3:记录失败原因,下一轮回灌 Main-Work / 供 Failed 呈现
                     retry_hint = failure.reason.clone();
+                    // 第 149 轮同因熔断:连续 2 次相同归一化原因 → force_fail,
+                    // loop 顶部提前终止(见上方收口块)。
+                    if same_cause.record(&failure.reason) {
+                        force_fail = true;
+                        emit_progress(
+                            progress,
+                            format!("连续 {} 轮失败原因相同,熔断终止重试…", same_cause.streak()),
+                        );
+                    }
                     emit_progress(
                         progress,
                         if is_exec_level_failure && medium_plan_cache.is_some() {
@@ -619,6 +731,93 @@ impl MultiAgentOrchestrator {
                 }
             }
         }
+    }
+
+    // ========== 安全拒绝终态(第 149 轮) ==========
+
+    /// 拒绝终态收口:拒绝说明直达用户,不委派、不回流、不重试。
+    ///
+    /// 门 A(分类后)/ 门 B(失败回流重分类后)/ Plan 拒绝短路 三处共用。
+    /// 语义:拒绝**不是失败** —— SessionContext 照常收口保住 session_memory
+    /// 连续性,但摘要目标明确写「拒绝」,绝不让摘要链里出现看起来像成功的记录
+    /// (与澄清门同款纪律);终态走 `DirectAnswer`,拒绝文本(原因 + 替代方向)
+    /// 由 TUI / `-p` 模式按既有路径展示给用户。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn refusal_terminal(
+        &self,
+        session: &mut Session,
+        classification: TaskClassification,
+        refusal_text: String,
+        origin: &str,
+        total_usage: Usage,
+        progress: &Option<ProgressTx>,
+        task_started: std::time::Instant,
+    ) -> Result<OrchestrationOutcome> {
+        let label = if origin == "plan" {
+            "Plan 层"
+        } else {
+            "入口层(Yolo)"
+        };
+        emit_progress(
+            progress,
+            format!("{label} 拒绝执行该任务(原因与替代方向已返回,未委派执行)"),
+        );
+        info!(
+            session = %session.id(),
+            origin,
+            refusal_chars = refusal_text.chars().count(),
+            "安全拒绝终态(决策):拒绝说明直达用户,不委派不重试"
+        );
+        // SessionContext 收口(拒绝不是失败,摘要不得记成"成功")。
+        // fail-open(第 149 轮):摘要失败只降级为 warn —— 拒绝文本必须送达用户,
+        // 不能因为收口摘要的 LLM 调用失败,把已经拿到的拒绝说明变成一条 error
+        //(与决策审计 / Agent-Memory 的 fail-open 纪律一致)。
+        let summary_usage = match self
+            .session_context
+            .summarize(
+                &format!("任务被{label}拒绝执行(安全/合规),本轮未执行任何操作"),
+                "(用户原始输入已记录)",
+                None,
+                &[],
+                &total_usage,
+                session.id(),
+                classification.yolo_degraded,
+                &classification.task_level,
+                None,
+            )
+            .await
+        {
+            Ok(summary) => summary.usage,
+            Err(e) if matches!(e, AgentError::Cancelled) => return Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "拒绝终态的 SessionContext 收口失败(不影响拒绝文本返回用户)"
+                );
+                Usage::default()
+            }
+        };
+        let total_usage = add_usage(total_usage, summary_usage);
+        self.dbg_task_end(
+            "refused",
+            &crate::logging::clip(&refusal_text),
+            "",
+            total_usage,
+        );
+        info!(
+            session = %session.id(),
+            outcome = "refused",
+            origin,
+            usage_in = total_usage.input_tokens,
+            usage_out = total_usage.output_tokens,
+            wallclock_ms = task_started.elapsed().as_millis() as u64,
+            "任务收口"
+        );
+        Ok(OrchestrationOutcome::DirectAnswer {
+            text: refusal_text,
+            classification,
+            usage: total_usage,
+        })
     }
 
     // ========== 简单档 ==========
@@ -883,6 +1082,8 @@ impl MultiAgentOrchestrator {
                 trace: None,
                 usage: Usage::default(),
                 completed_digest: String::new(),
+                refused: false,
+                refusal_text: String::new(),
             }
         })?
         .map_err(|e| {
@@ -914,6 +1115,8 @@ impl MultiAgentOrchestrator {
                 trace: None,
                 usage: mainwork_usage,
                 completed_digest: String::new(),
+                refused: false,
+                refusal_text: String::new(),
             });
         }
 
@@ -995,7 +1198,20 @@ impl MultiAgentOrchestrator {
             .check_main(&c.goal_summary, &wf_json, session.id())
             .await
             .map_err(|e| {
-                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+                // 第 149 轮 P2-1:QC 调用失败带上 Main-Work 已发生的用量
+                let cancelled = matches!(e, AgentError::Cancelled);
+                QualityFailure {
+                    source: AgentRole::QualityCheck,
+                    reason: format!("Quality 调用失败: {e}"),
+                    retryable: !cancelled,
+                    suggestion: "重试".into(),
+                    cancelled,
+                    trace: None,
+                    usage: mainwork_usage,
+                    completed_digest: String::new(),
+                    refused: false,
+                    refusal_text: String::new(),
+                }
             })?;
         let qc_main_elapsed_ms = qc_started.elapsed().as_millis() as u64;
         self.dbg_qc(&qc_main);
@@ -1014,6 +1230,8 @@ impl MultiAgentOrchestrator {
                 trace: None,
                 usage: add_usage(mainwork_usage, qc_usage),
                 completed_digest: String::new(),
+                refused: false,
+                refusal_text: String::new(),
             });
         }
 
@@ -1093,6 +1311,35 @@ impl MultiAgentOrchestrator {
             plan_usage,
         );
 
+        // 1.5) 第 149 轮 P0-2:安全拒绝检测(纵深防御)—— Plan 输出为拒绝说明
+        // 而非可执行方案时,**不进 QC、不进解析**,直接以拒绝终态收口。
+        //
+        // 实测事故(2026-10-10):拒绝式 Plan 文本进解析门必然报「未解析出任何
+        // WorkFlow」→ retryable=true → 盲重试,且重试注入文案失实地写成
+        // 「上一轮 Quality-Check 拒绝理由…必须针对性修复」,构成对模型
+        // 「换格式补齐被拒内容」的施压(QC 三次都判 pass,解析门三次推翻)。
+        // 拒绝不是失败:refused=true 上抛,handle_inner 以 DirectAnswer 终态
+        // 把拒绝说明(原因 + 替代方向)直达用户。
+        if let Some(marker) = crate::agent::safety::detect_refusal(&plan_output.markdown) {
+            info!(
+                session = %session.id(),
+                marker,
+                "Plan 输出为安全拒绝(决策):跳过 QC/解析,拒绝终态收口"
+            );
+            return Err(QualityFailure {
+                source: AgentRole::Plan,
+                reason: "Plan Agent 拒绝执行该任务(安全/合规),不再重试".into(),
+                retryable: false,
+                suggestion: "请参考拒绝说明中的替代方向,调整任务目标后重新描述".into(),
+                cancelled: false,
+                trace: None,
+                usage: plan_usage,
+                completed_digest: String::new(),
+                refused: true,
+                refusal_text: plan_output.markdown.clone(),
+            });
+        }
+
         // 2) Quality 校验 Plan
         let qc_plan_started = std::time::Instant::now();
         let (qc_plan, qc_plan_usage) = self
@@ -1100,7 +1347,22 @@ impl MultiAgentOrchestrator {
             .check_plan(&plan_output.markdown, session.id())
             .await
             .map_err(|e| {
-                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+                // 第 149 轮 P2-1:QC 调用失败也要带上 Plan 已发生的用量
+                //(此前 from_agent_error 恒 usage=0,失败轮 token 全部丢失,
+                //  实测终态 17459 vs 逐事件 37690 input)。
+                let cancelled = matches!(e, AgentError::Cancelled);
+                QualityFailure {
+                    source: AgentRole::QualityCheck,
+                    reason: format!("Quality 调用失败: {e}"),
+                    retryable: !cancelled,
+                    suggestion: "重试".into(),
+                    cancelled,
+                    trace: None,
+                    usage: plan_usage,
+                    completed_digest: String::new(),
+                    refused: false,
+                    refusal_text: String::new(),
+                }
             })?;
         let qc_plan_elapsed_ms = qc_plan_started.elapsed().as_millis() as u64;
         self.dbg_qc(&qc_plan);
@@ -1114,12 +1376,29 @@ impl MultiAgentOrchestrator {
                 trace: None,
                 usage: add_usage(plan_usage, qc_plan_usage),
                 completed_digest: String::new(),
+                refused: false,
+                refusal_text: String::new(),
             });
         }
 
         // 3) Main-Work 解析 Plan → WorkFlow
+        // 第 149 轮 P2-1:解析失败也要带上 Plan + QC-Plan 已发生的用量
+        //(此前 from_agent_error 恒 usage=0;实测 2026-10-10 事故三轮解析失败
+        //  各丢 ~8.6k input token,终态用量严重失真)。
+        let plan_qc_usage = add_usage(plan_usage, qc_plan_usage);
         let plan = self.main_work.parse_plan(&plan_output.path).map_err(|e| {
-            QualityFailure::from_agent_error(AgentRole::MainWork, "解析 Plan 失败", &e)
+            QualityFailure {
+                source: AgentRole::MainWork,
+                reason: format!("解析 Plan 失败: {e}"),
+                retryable: true,
+                suggestion: "重试".into(),
+                cancelled: false,
+                trace: None,
+                usage: plan_qc_usage,
+                completed_digest: String::new(),
+                refused: false,
+                refusal_text: String::new(),
+            }
         })?;
 
         let qc_main_started = std::time::Instant::now();
@@ -1132,7 +1411,20 @@ impl MultiAgentOrchestrator {
             )
             .await
             .map_err(|e| {
-                QualityFailure::from_agent_error(AgentRole::QualityCheck, "Quality 调用失败", &e)
+                // 第 149 轮 P2-1:同上,带上三轮已发生用量
+                let cancelled = matches!(e, AgentError::Cancelled);
+                QualityFailure {
+                    source: AgentRole::QualityCheck,
+                    reason: format!("Quality 调用失败: {e}"),
+                    retryable: !cancelled,
+                    suggestion: "重试".into(),
+                    cancelled,
+                    trace: None,
+                    usage: plan_qc_usage,
+                    completed_digest: String::new(),
+                    refused: false,
+                    refusal_text: String::new(),
+                }
             })?;
         let qc_main_elapsed_ms = qc_main_started.elapsed().as_millis() as u64;
         self.dbg_qc(&qc_main);
@@ -1150,6 +1442,8 @@ impl MultiAgentOrchestrator {
                 trace: None,
                 usage: add_usage(add_usage(plan_usage, qc_plan_usage), qc_main_usage),
                 completed_digest: String::new(),
+                refused: false,
+                refusal_text: String::new(),
             });
         }
 
