@@ -30,6 +30,12 @@ pub struct ExecutionTrace {
     pub early_terminate_reason: String,
     /// 截断续接次数(>0 表示 LLM 输出被 max_tokens 截断并自动续接过)
     pub truncation_resumes: usize,
+    /// 截断工具调用拦截次数(第 148 轮):工具参数 JSON 在流中被 max_tokens
+    /// 截断(`__truncated__` 标记)而未执行、改由合成错误结果引导重试的次数。
+    /// >0 表示本单元发生过「巨型工具调用撞输出上限」事件,QC / Debug 据此
+    /// 识别输出预算不足的单元。
+    #[serde(default)]
+    pub truncated_tool_calls: usize,
     /// 上下文溢出自动恢复次数(L1038/L1044:排水/折叠后重试成功;
     /// >0 表示发生过 prompt-too-long 类溢出并本地恢复)
     pub overflow_recoveries: usize,
@@ -188,6 +194,7 @@ impl Default for ExecutionTrace {
             early_terminated: false,
             early_terminate_reason: String::new(),
             truncation_resumes: 0,
+            truncated_tool_calls: 0,
             overflow_recoveries: 0,
             max_tokens_upscalings: 0,
             max_tokens_history: Vec::new(),

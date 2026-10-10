@@ -505,6 +505,25 @@ impl Agent {
             // (必须在工具执行前重置,因为工具执行中可能因取消/失败提前退出)
             consecutive_no_tool_rounds = 0;
 
+            // 第 148 轮:工具响应同样可能撞 max_tokens(巨型参数在流中截断,
+            // sse sink 抢救字段并打 `__truncated__` 标记)。此前 `note_truncated`
+            // 只在纯文本截断分支触发,工具截断后输出上限永不升级,同一堵墙反复撞
+            // (实测蓝湖任务 max_tokens 恒定 8192、连续截断 5 次、Write 死循环重试)。
+            // 这里无论是否带 tool_calls 统一升级,升级幂等(封顶 64K 不再变化),
+            // 与文本分支共享同一状态机,绝不重复计费式升级。
+            if is_truncation_stop_reason(completion.stop_reason.as_deref()) {
+                let old_max = max_tokens_state.current();
+                let new_max = max_tokens_state.note_truncated();
+                if new_max != old_max {
+                    info!(
+                        old = old_max,
+                        new = new_max,
+                        "max_tokens 工具响应截断,静默升级(下一轮 LLM 调用注入)"
+                    );
+                }
+                meta.max_tokens_override = Some(new_max);
+            }
+
             // 关联报告: 2026-09-09_05 E-001 —— 快照本轮文本/工具状态供后续短路判断使用
             // (completion.text 与 completion.tool_calls 在下面的循环会被 move)
             let this_round_text_empty = completion.text.trim().is_empty();
@@ -579,6 +598,45 @@ impl Agent {
                 let name = call.name.clone();
                 let id = call.id.clone();
                 let args = call.arguments;
+
+                // ---- 第 148 轮:截断工具调用拦截(先于 emit/doom 等一切短路分支) ----
+                // 巨型工具参数(如 30KB 文档的 Write)在流中被 max_tokens 截断时,
+                // sse sink 用 partial_json 抢救已流出字段并打 `__truncated__` 标记。
+                // 若照常执行:残缺参数必撞 Schema 必填校验,且报错只说「缺 file_path」
+                // 不解释根因,模型原样重发同一巨型参数 → 同样截断 → 同样失败
+                // (实测死循环 5 次烧 ~10 分钟,用户感知「任务卡住」)。这里整体拦截:
+                // 不执行,合成「根因 + 缺字段清单 + 缩小输出规模指引」的 tool_result,
+                // 配合循环入口的 max_tokens 静默升级打破「同一堵墙反复撞」。
+                if crate::agent::partial_json::is_truncated_args(&args) {
+                    let missing = self.missing_required_fields(&name, &args);
+                    let cur_max = max_tokens_state.current();
+                    let missing_desc = if missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!("对比 Schema 缺少必填字段: {}。", missing.join(", "))
+                    };
+                    let msg = format!(
+                        "[工具参数截断] 本次 {name} 调用的参数 JSON 因输出长度上限在流中被截断,仅恢复出部分字段,本次调用未执行。{missing_desc}已自动将后续请求的输出上限提升至 {cur_max} tokens。请缩小单次输出规模后重发该调用:大文档不要单次 Write 全量 —— 先 Write 首段、后续用 Bash heredoc(>>)追加,或分段写入多个片段文件后用 Bash cat 合并;单段 content 建议 ≤8000 字符。"
+                    );
+                    warn!(tool = %name, iter, "工具参数截断,拦截执行并合成错误结果(第 148 轮)");
+                    // 回填 tool_result 保持 assistant tool_use ↔ tool_result 配对
+                    session
+                        .context_mut()
+                        .push(ChatMessage::tool_result(id, msg.clone(), true));
+                    trace.truncated_tool_calls += 1;
+                    trace.tool_calls += 1;
+                    trace.tool_calls_err += 1;
+                    trace.record_tool_call(
+                        &name,
+                        &stable_json_string(&args),
+                        false,
+                        msg.len(),
+                        0,
+                        "TruncatedToolArgs",
+                        "",
+                    );
+                    continue;
+                }
 
                 // ---- 结构化输出通道短路(先于 schema 预校验与执行) ----
                 if self.profile.emit_tool.as_deref() == Some(name.as_str()) {

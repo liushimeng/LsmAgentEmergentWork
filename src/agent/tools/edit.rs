@@ -51,6 +51,8 @@ impl Tool for EditTool {
            或设置 replace_all=true 一次性替换所有匹配。\n\
          - new_string 必须与 old_string 不同。\n\
          - 编辑前建议先 Read 该文件以确认内容。\n\
+         - [输出预算] new_string 过大(如整章重写)时优先分多次小编辑,\
+           单次巨型替换的参数会被输出 token 上限截断导致失败。\n\
          - [沙箱] 仅可在工作目录或系统临时目录内修改文件。"
     }
 

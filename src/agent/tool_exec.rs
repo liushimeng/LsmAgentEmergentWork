@@ -63,6 +63,29 @@ fn flush_batch(start: &mut Option<usize>, end: usize, out: &mut Vec<(usize, usiz
 }
 
 impl Agent {
+    /// 对比工具 Schema 的 `required` 列表,返回 args 中缺失的必填字段名(第 148 轮)。
+    ///
+    /// 用于截断工具调用拦截的合成错误结果:精确告知模型「缺什么」,而不是
+    /// 让它从整段残缺参数里自己猜(实测缺失清单能把模型的重试收敛到
+    /// 「缩小输出规模重发」而不是「原样重发」)。
+    pub(crate) fn missing_required_fields(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Vec<String> {
+        self.profile
+            .tools
+            .get(name)
+            .ok()
+            .map(|t| t.parameters())
+            .and_then(|schema| schema.get("required").and_then(|r| r.as_array()).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| f.as_str().map(str::to_string))
+            .filter(|f| args.get(f).is_none())
+            .collect()
+    }
+
     /// 执行单条工具调用(第 120 轮自 agent_loop 主循环机械抽取,语义零变化)。
     pub(crate) async fn exec_tool_call(
         &self,
@@ -205,12 +228,16 @@ impl Agent {
             }
             // 工具不在注册表里(`ToolNotFound` 路径)→ 不可并行,交给串行路径
             // 生成带「可用工具边界」的归一错误文本。
-            let safe = self
-                .profile
-                .tools
-                .get(&call.name)
-                .map(|t| t.parallel_safe(&call.arguments))
-                .unwrap_or(false);
+            // 第 148 轮:截断恢复的参数(`__truncated__` 标记)同样不可并行 ——
+            // 残缺参数必须落到主循环的截断拦截分支(合成错误结果 + 输出上限升级),
+            // 杜绝 Read/Glob/Grep 理论截断时被预执行。
+            let safe = !crate::agent::partial_json::is_truncated_args(&call.arguments)
+                && self
+                    .profile
+                    .tools
+                    .get(&call.name)
+                    .map(|t| t.parallel_safe(&call.arguments))
+                    .unwrap_or(false);
             if safe {
                 if start.is_none() {
                     start = Some(i);

@@ -26,6 +26,16 @@ const MAX_PARTIAL_BYTES: usize = 512 * 1024;
 /// 截断标记 key,插入到恢复出的对象中,让下游知道参数可能不完整。
 pub const TRUNCATED_KEY: &str = "__truncated__";
 
+/// 判定工具参数是否来自截断恢复(含 `TRUNCATED_KEY: true` 标记)。
+///
+/// 第 148 轮:agent_loop 据此拦截「参数残缺的工具调用」——直接执行必然
+/// 撞 Schema 必填校验且不解释根因(实测:30KB content 的 Write 被 max_tokens
+/// 截断,缺 file_path 死循环重试 5 次)。返回 true 的调用应改走合成错误结果 +
+/// 输出上限升级路径,见 `agent_loop.rs`。
+pub fn is_truncated_args(args: &Value) -> bool {
+    args.get(TRUNCATED_KEY).and_then(Value::as_bool).unwrap_or(false)
+}
+
 /// 尝试把残缺 JSON 对象解析为尽可能完整的 `Value::Object`。
 ///
 /// - 完整合法 JSON → 等价 `serde_json::from_str`(不标截断);
@@ -359,6 +369,15 @@ impl<'a> Scanner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_truncated_args_detects_marker() {
+        assert!(is_truncated_args(&json!({"content": "x", TRUNCATED_KEY: true})));
+        assert!(!is_truncated_args(&json!({"content": "x"})));
+        assert!(!is_truncated_args(&json!({"content": "x", TRUNCATED_KEY: false})));
+        assert!(!is_truncated_args(&json!({"content": "x", TRUNCATED_KEY: "yes"})));
+        assert!(!is_truncated_args(&json!(["not", "object"])));
+    }
 
     #[test]
     fn complete_object_untouched() {

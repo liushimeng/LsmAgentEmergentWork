@@ -1242,3 +1242,134 @@
         );
         drop(llm);
     }
+
+// ========== 第 148 轮:截断工具调用拦截(蓝湖任务 Write 死循环事故) ==========
+
+/// 第 1 次响应返回「max_tokens 截断的 Write 工具调用」(`__truncated__` 标记 +
+/// 缺 file_path),第 2 次起返回最终文本;同时逐请求捕获 meta 供断言升级注入。
+struct TruncatedWriteLlm {
+    calls: std::sync::atomic::AtomicUsize,
+    seen_meta: std::sync::Mutex<Vec<RequestMeta>>,
+}
+
+#[async_trait::async_trait]
+impl crate::llm::LlmClient for TruncatedWriteLlm {
+    async fn complete(
+        &self,
+        _system: &str,
+        _messages: &[ChatMessage],
+        _tools: &[crate::llm::ToolDef],
+        meta: &RequestMeta,
+    ) -> Result<Completion> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen_meta
+            .lock()
+            .expect("seen meta")
+            .push(meta.clone());
+        if n == 0 {
+            // 模拟 sse sink 的截断恢复:巨型 content 抢救成功,但 file_path
+            // 未流出,带 `__truncated__` 标记,stop_reason=max_tokens。
+            Ok(Completion {
+                text: String::new(),
+                tool_calls: vec![crate::llm::ToolCallReq {
+                    id: "call-trunc-1".into(),
+                    name: "Write".into(),
+                    arguments: json!({
+                        "content": "# 部分文档内容(被截断)",
+                        crate::agent::partial_json::TRUNCATED_KEY: true,
+                    }),
+                }],
+                usage: Usage::default(),
+                stop_reason: Some("max_tokens".into()),
+            })
+        } else {
+            Ok(Completion {
+                text: "done".into(),
+                tool_calls: vec![],
+                usage: Usage::default(),
+                stop_reason: None,
+            })
+        }
+    }
+    fn protocol(&self) -> crate::config::Protocol {
+        crate::config::Protocol::Anthropic
+    }
+}
+
+/// 截断工具调用的完整处置链:不执行(无落盘) + 合成错误结果(含缺字段清单) +
+/// max_tokens 静默升级注入下一轮请求 + trace 计数。
+#[tokio::test]
+async fn truncated_tool_call_is_intercepted_and_max_tokens_upscaled() {
+    let llm = std::sync::Arc::new(TruncatedWriteLlm {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        seen_meta: std::sync::Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(llm.clone(), AgentProfile::sub_agent_work_profile());
+    let mut session = Session::new();
+    session.context_mut().push(ChatMessage::user("写文档"));
+    let (text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
+    assert_eq!(text, "done");
+
+    // 1) 工具未执行:trace 有拦截计数,无 Write 产物
+    assert_eq!(
+        trace.truncated_tool_calls, 1,
+        "截断调用应被拦截一次,实际 {}",
+        trace.truncated_tool_calls
+    );
+    assert!(
+        trace.artifacts.is_empty(),
+        "截断 Write 不得产生落盘产物"
+    );
+    // 目标文件不得存在(双保险:即便沙箱放行也不该写)
+    let leaked = std::path::Path::new("truncated_write_should_not_exist_148.md");
+    assert!(!leaked.exists(), "截断 Write 绝不可落盘");
+
+    // 2) 合成 tool_result 含根因 + 缺字段清单 + 重试指引
+    let ctx = session.context();
+    let result_msg = ctx
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            crate::llm::ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .find(|c| c.contains("[工具参数截断]"))
+        .expect("应有截断合成的 tool_result");
+    assert!(
+        result_msg.contains("file_path"),
+        "合成结果应点明缺失的必填字段 file_path: {result_msg}"
+    );
+    assert!(
+        result_msg.contains("8000 字符"),
+        "合成结果应给出分段写入指引: {result_msg}"
+    );
+
+    // 3) max_tokens 静默升级注入下一轮请求(8K → 16K)
+    let seen = llm.seen_meta.lock().expect("seen meta");
+    assert_eq!(seen.len(), 2, "应恰好两轮 LLM 调用");
+    assert_eq!(
+        seen[1].max_tokens_override,
+        Some(crate::agent::max_tokens_state::MAX_TOKENS_FLOOR * 2),
+        "截断后下一轮请求应注入升级后的 max_tokens,实际 {:?}",
+        seen[1].max_tokens_override
+    );
+}
+
+/// 健康工具调用(无 `__truncated__` 标记)不受影响:照常执行。
+#[tokio::test]
+async fn healthy_tool_call_unaffected_by_truncation_interception() {
+    let agent = Agent::new(
+        std::sync::Arc::new(OneOkToolLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        AgentProfile::sub_agent_work_profile(),
+    );
+    let mut session = Session::new();
+    session.context_mut().push(ChatMessage::user("跑命令"));
+    let (_text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
+    assert_eq!(
+        trace.truncated_tool_calls, 0,
+        "健康调用不应触发截断拦截"
+    );
+    assert!(trace.tool_calls_ok >= 1, "健康 Bash 调用应成功执行");
+}
