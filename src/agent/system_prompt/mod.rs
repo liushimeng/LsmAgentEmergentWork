@@ -1466,6 +1466,18 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
 19. 可写路径提示(第 106 轮):Write 工具在 macOS 沙箱下仅允许写工作目录($CWD)及其子目录;
     需要写临时文件时优先用 Bash(cmd="cat > $TMPDIR/xxx" 或 heredoc),或 Write 写到工作目录下。
     推荐:mkdir -p $CWD/.laew_tmp 然后 Write(path="$CWD/.laew_tmp/xxx")。
+20. 复用已登录浏览器(connect 模式,第 142 轮):当用户说「我已经登录了 X 网站」
+    「用我打开的 Chrome」「复用我的浏览器/登录态」「操作我登录好的页面」时,
+    用 open(reuse_existing=true)代替普通 open——工具自动探测本机调试端口
+    (默认 9222,LAEW_CHROME_DEBUG_PORT 可改),命中即接管用户已登录的 Chrome
+    (保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port
+    + data.browser_version + data.connect_mode=true。探测失败返回 code=3002:
+    把 data.relaunch_command 转述给用户执行(或经用户同意后以 auto_relaunch=true
+    重试,由工具自动退出+重启 Chrome 并复制登录态),不要反复重试 open。
+    ★ connect 模式下 close 只断连、**不会关闭用户的浏览器**,不要试图 close 清场
+    (下次任务重新探测接管即可);接管场景默认不注入蒙层(不锁用户输入),需要时
+    control(set_overlay, enabled=true)。Linux 服务器上浏览器是内存无头实例,
+    没有可复用的登录态,登录类操作走 request_human 让人工在可见窗口完成。
 "##;
 
 #[cfg(test)]
@@ -1602,6 +1614,7 @@ mod tests {
 
     /// 2026-09-18 第 89 轮:MCP_Web_Use 使用说明全平台注入 SubAgent-Work 提示词
     /// (CDP 三平台一致,无平台门控)。
+    /// ★ 2026-10-10 第 142 轮:复用已登录浏览器(connect 模式增强)接线断言。
     #[test]
     fn sub_agent_prompt_mcp_web_use_all_platforms() {
         let rendered = SystemPrompt::sub_agent_work().render(Protocol::Anthropic);
@@ -1617,6 +1630,19 @@ mod tests {
         }
         // 原 Chromium-WebUse 专项提示词应彻底移除
         assert!(!rendered.contains("Chromium-WebUse"));
+        // 第 142 轮:复用已登录浏览器(connect 模式增强)
+        for kw in [
+            "reuse_existing",
+            "auto_relaunch",
+            "3002",
+            "relaunch_command",
+            "connect 模式",
+        ] {
+            assert!(
+                rendered.contains(kw),
+                "MCP_Web_Use 使用说明应提及复用已登录浏览器关键字 {kw}"
+            );
+        }
     }
 
     // ===== 第 121 轮:Anthropic 三段式 system prompt(billing + identity + rules) =====

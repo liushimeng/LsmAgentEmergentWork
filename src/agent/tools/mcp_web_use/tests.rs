@@ -339,6 +339,77 @@ async fn open_no_browser_or_succeeds() {
     }
 }
 
+// =================== 第 142 轮:复用已登录浏览器(connect 模式增强) ===================
+
+#[test]
+fn inject_reuse_metadata_merges_fields() {
+    let res = r#"{"code":0,"message":"ok","data":{"page_id":"p_a1b2c3d4","mode":"headed"}}"#;
+    let out = inject_reuse_metadata(
+        res,
+        &json!({"reuse_existing_chrome": true, "debug_port": 9222, "browser_version": "Chrome/131.0.0.0"}),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("注入后仍为合法 JSON");
+    assert_eq!(v["code"], 0);
+    assert_eq!(v["data"]["page_id"], "p_a1b2c3d4", "原字段不丢");
+    assert_eq!(v["data"]["reuse_existing_chrome"], true);
+    assert_eq!(v["data"]["debug_port"], 9222);
+    assert_eq!(v["data"]["browser_version"], "Chrome/131.0.0.0");
+}
+
+#[test]
+fn inject_reuse_metadata_invalid_json_passthrough() {
+    let raw = "not json at all";
+    assert_eq!(inject_reuse_metadata(raw, &json!({"a": 1})), raw);
+}
+
+#[tokio::test]
+async fn open_reuse_existing_returns_3002_or_succeeds() {
+    // 环境自适应:本机无调试端口(9222 无监听)→ 3002 + relaunch_command;
+    // 本机恰好有调试模式 Chrome → 0 + reuse_existing_chrome。
+    let res = McpWebUseTool
+        .execute(json!({"action": "open", "url": "https://example.com", "reuse_existing": true}))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).expect("响应应为合法 JSON");
+    let code = v["code"].as_i64().unwrap_or(-1);
+    if code == 0 {
+        assert_eq!(v["data"]["reuse_existing_chrome"], true);
+        assert_eq!(v["data"]["connect_mode"], true);
+        // 成功打开的页面顺手关闭,不留脏状态
+        let pid = v["data"]["page_id"].as_str().unwrap().to_string();
+        let closed = McpWebUseTool.execute(json!({"action": "close", "page_id": pid})).await.unwrap();
+        assert!(closed.contains("\"code\":0"));
+    } else {
+        assert_eq!(code, 3002, "无调试端口时应返回 3002,实际: {res}");
+        let data = &v["data"];
+        let cmd = data["relaunch_command"].as_str().unwrap_or_default();
+        assert!(
+            cmd.contains("--remote-debugging-port"),
+            "3002 信封应含带调试端口的重启命令: {cmd}"
+        );
+        assert!(data["chrome_running"].is_boolean());
+        assert!(data["debug_port"].is_number());
+    }
+}
+
+#[tokio::test]
+async fn open_reuse_existing_skipped_when_connect_url_given() {
+    // 显式 connect_url 优先,跳过探测:指向一个无监听端口,应走 connect 失败路径
+    // (2001),而不是 3002 引导。
+    let res = McpWebUseTool
+        .execute(json!({
+            "action": "open",
+            "url": "https://example.com",
+            "reuse_existing": true,
+            "connect_url": "http://127.0.0.1:1",
+        }))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).expect("响应应为合法 JSON");
+    let code = v["code"].as_i64().unwrap_or(-1);
+    assert_ne!(code, 3002, "显式 connect_url 不应走探测引导: {res}");
+}
+
 // =================== page_id 提取(供 agent_loop 引导钩子) ===================
 
 #[test]

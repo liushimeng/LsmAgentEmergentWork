@@ -316,6 +316,14 @@ impl BrowserManager {
         inner.browser.as_ref().map(|_| inner.mode)
     }
 
+    /// 当前实例是否为 connect 模式(接管外部浏览器,第 142 轮)。
+    ///
+    /// connect 模式不拥有浏览器进程:close 只断连、不关用户浏览器;工具层据此在
+    /// open 响应里回 `connect_mode` 字段供 LLM 对账。
+    pub async fn is_connect_mode(&self) -> bool {
+        self.inner.lock().await.connect_mode
+    }
+
     /// 新建页面;必要时先启动或接管浏览器。
     ///
     /// 返回 `(page_id, title, final_url)`;未检测到浏览器返回含 NO_BROWSER 哨兵的错误。
@@ -457,11 +465,18 @@ impl BrowserManager {
             inner.watchdog = launch_watchdog;
             inner.connect_mode = connect_mode;
             inner.user_data_dir = launch_dir.clone();
-            inner.mode = mode;
+            // 第 142 轮(复用已登录浏览器):connect 接管用户已启动的浏览器,请求
+            // mode 只影响注入判断 —— 按有头处理;蒙层强制 false(不锁用户自己
+            // 正在使用的浏览器输入,需要时 control(set_overlay) 手动开)。
+            inner.mode = if connect_mode {
+                BrowserMode::Headed
+            } else {
+                mode
+            };
             inner.highlight = highlight;
             // 第 141 轮:蒙层期望态(仅 headed 生效;hidden 无窗口无人工,注入无意义
             // 且污染 DOM,跳过 —— 与高亮蓝框同款门控)。
-            inner.overlay = overlay;
+            inner.overlay = if connect_mode { false } else { overlay };
             // 第 78 轮:标记浏览器已启动,供 cleanup_sync() 快速判断避免无意义创建 Runtime。
             browser_started_flag::set_started();
             // 第 127 轮:同步清理登记(仅 launch 模式 —— 拥有浏览器进程所有权才登记;

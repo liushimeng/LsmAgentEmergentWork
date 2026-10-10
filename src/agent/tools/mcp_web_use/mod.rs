@@ -315,6 +315,113 @@ fn resolve_requested_mode(args: &Value) -> BrowserMode {
         .unwrap_or_else(BrowserMode::from_env_or_default)
 }
 
+// ===================== 第 142 轮:复用已登录浏览器(connect 模式增强) =====================
+
+/// 复用浏览器不可用错误码(第 142 轮):调试端口未开启,无法接管用户已登录浏览器。
+///
+/// 3xxx 段 = 环境缺失:3001 未安装浏览器 / **3002 不可复用(调试端口未开)**。
+/// 确定性失败:Agent 按 data.relaunch_command 引导用户,不要反复重试 open。
+pub(super) const CODE_REUSE_UNAVAILABLE: i32 = 3002;
+
+/// open 成功响应注入复用元数据(纯函数,便于单测)。
+///
+/// 探测接管成功后,在 run_open 响应 JSON 的 **data 对象**内附加
+/// reuse_existing_chrome / debug_port / browser_version / auto_relaunch
+/// 字段(与 page_id 同级,LLM 从 data 读取);解析失败原样返回。
+pub(super) fn inject_reuse_metadata(response: &str, meta: &Value) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(response) else {
+        return response.to_string();
+    };
+    if let (Some(dst), Some(src)) = (v.get_mut("data").and_then(Value::as_object_mut), meta.as_object())
+    {
+        for (k, val) in src {
+            dst.entry(k.clone()).or_insert_with(|| val.clone());
+        }
+    }
+    v.to_string()
+}
+
+/// 复用已登录浏览器入口:自动探测调试端口 → 接管;失败 → 3002 引导 /
+/// auto_relaunch 自动重启接管。
+///
+/// 三档能力与设计见 `docs/MCP_Web_Use/06-复用已登录浏览器会话.md`。
+async fn run_open_reuse(args: &Value, url: &str) -> Result<String> {
+    let port = crate::agent::browser_reuse::debug_port();
+    let auto_relaunch = args
+        .get("auto_relaunch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // 档位一:自动探测接管。
+    if let Some(info) = crate::agent::browser_reuse::probe_debug_endpoint(port).await {
+        return open_via_connect(
+            args,
+            url,
+            &info.connect_url,
+            json!({
+                "reuse_existing_chrome": true,
+                "debug_port": info.port,
+                "browser_version": info.browser_version,
+            }),
+        )
+        .await;
+    }
+    // 档位三:自动重启接管(显式 opt-in)。
+    if auto_relaunch {
+        return match crate::agent::browser_reuse::relaunch_and_wait(port).await {
+            Some(info) => {
+                open_via_connect(
+                    args,
+                    url,
+                    &info.connect_url,
+                    json!({
+                        "reuse_existing_chrome": true,
+                        "auto_relaunch": true,
+                        "debug_port": info.port,
+                        "browser_version": info.browser_version,
+                    }),
+                )
+                .await
+            }
+            None => envelope(
+                CODE_REUSE_UNAVAILABLE,
+                "自动重启浏览器后调试端口仍未就绪",
+                json!({
+                    "debug_port": port,
+                    "chrome_running": crate::agent::browser_reuse::chromium_running(),
+                    "relaunch_command": crate::agent::browser_reuse::relaunch_command_string(
+                        port,
+                        &crate::agent::browser_reuse::debug_profile_dir(),
+                    ),
+                    "hint": "自动重启失败(浏览器未安装/启动超时);可把 relaunch_command 转述给用户执行后重试",
+                }),
+            ),
+        };
+    }
+    // 档位二:结构化引导。
+    envelope(
+        CODE_REUSE_UNAVAILABLE,
+        "未检测到可复用的浏览器(调试端口未开启)",
+        json!({
+            "debug_port": port,
+            "chrome_running": crate::agent::browser_reuse::chromium_running(),
+            "relaunch_command": crate::agent::browser_reuse::relaunch_command_string(
+                port,
+                &crate::agent::browser_reuse::debug_profile_dir(),
+            ),
+            "auto_relaunch": true,
+            "hint": "把 relaunch_command 转述给用户执行(或经用户同意后以 auto_relaunch=true 重试,由工具自动退出+重启 Chrome 并复制登录态);Chrome 136+ 默认 profile 上调试端口会被忽略,必须用独立 --user-data-dir",
+        }),
+    )
+}
+
+/// 以 connect_url 走 run_open_inner 既有流程(注入 connect_url),响应附加复用元数据。
+async fn open_via_connect(args: &Value, url: &str, connect_url: &str, meta: Value) -> Result<String> {
+    let mut args2 = args.clone();
+    args2["connect_url"] = json!(connect_url);
+    let res = run_open_inner(&args2, url).await?;
+    Ok(inject_reuse_metadata(&res, &meta))
+}
+
 // ===================== action=open(list/close 同级,轻量内联) =====================
 
 /// 启动/接管浏览器并打开一个页面(原 BrowserNew)。
@@ -340,6 +447,22 @@ async fn run_open(args: Value) -> Result<String> {
     if let Some(blocked) = target_anchor_guard(url) {
         return blocked;
     }
+    // 第 142 轮:复用已登录浏览器 —— 显式 connect_url 优先(跳过探测)。
+    let reuse_existing = args
+        .get("reuse_existing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if reuse_existing && str_arg(&args, "connect_url").is_none() {
+        return run_open_reuse(&args, url).await;
+    }
+    run_open_inner(&args, url).await
+}
+
+/// run_open 主体(url 已提取、锚点守卫已过、复用分支已判定)。
+///
+/// 第 142 轮拆出:复用路径(open_via_connect)直接调本函数,避免
+/// run_open ↔ run_open_reuse ↔ open_via_connect 递归 async fn 循环。
+async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
     let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(true);
     // 第 103 轮:读取 timeout_ms 参数,控制页面加载超时(默认 60s)
     let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(60000);
@@ -405,7 +528,7 @@ async fn run_open(args: Value) -> Result<String> {
                             None => json!({"enabled": false}),
                         };
                     }
-                    if auto_expand_enabled(&args) {
+                    if auto_expand_enabled(args) {
                         if let Some(v) = fit_viewport(&pid).await {
                             payload["viewport"] = v;
                         }
@@ -436,12 +559,12 @@ async fn run_open(args: Value) -> Result<String> {
             }
             None => (false, requested_mode, None),
         };
-    let connect = str_arg(&args, "connect_url");
-    let ua = str_arg(&args, "user_agent");
+    let connect = str_arg(args, "connect_url");
+    let ua = str_arg(args, "user_agent");
     // 窗口尺寸(第 125 轮):显式参数 clamp 到安全区间;缺省由驱动层决定
     // (全模式统一 1920×1080 = 1080p)。内容仍超视口时 open 后自动扩展
     // 视口到 2K(auto_expand_viewport,默认开)。
-    let window_size = parse_window_size(&args);
+    let window_size = parse_window_size(args);
     let highlight = args.get("highlight").and_then(Value::as_bool).unwrap_or(true);
     // 第 141 轮:可视化蒙层(默认随 LAEW_WEB_OVERLAY,仅最终 mode=headed 生效)。
     let overlay = args
@@ -453,11 +576,13 @@ async fn run_open(args: Value) -> Result<String> {
         .await
     {
         Ok((page_id, title, final_url)) => {
-            if str_arg(&args, "wait_until") == Some("networkidle") {
+            if str_arg(args, "wait_until") == Some("networkidle") {
                 // 第 140 轮:兜底 1500ms→700ms —— Chrome 的 networkidle 判定已含
                 // 500ms 静默窗,额外 700ms 足够让迟到的渲染提交完成。
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             }
+            // 第 142 轮:connect 模式(接管外部浏览器)判定,供 overlay 字段分路提示。
+            let connect_mode = BrowserManager::global().is_connect_mode().await;
             let mut data = json!({
                 "page_id": page_id,
                 "title": title,
@@ -466,10 +591,19 @@ async fn run_open(args: Value) -> Result<String> {
                 "mode": effective_mode.as_str(),
                 "browser_reused": browser_reused,
                 "highlight": highlight && effective_mode.is_headed(),
+                // 第 142 轮:connect 模式 = 接管用户外部浏览器,close 只断连不关浏览器。
+                "connect_mode": connect_mode,
                 // 第 141 轮:蒙层状态。读**实例真实期望态**(overlay_active = 期望态
                 // 开 && headed)而非本次请求值 —— 单实例复用时 `new_page` 不会用
                 // 本次参数覆盖既有实例的蒙层期望态,回报请求值会与实际不符。
-                "overlay": if effective_mode.is_headed() {
+                // 第 142 轮:connect 模式强制不锁用户输入(见 browser.rs connect 分支)。
+                "overlay": if connect_mode {
+                    json!({
+                        "enabled": false,
+                        "hint": "接管外部浏览器(connect 模式)默认不锁人工输入(不干扰用户当前使用);\
+                                 需要时 control(set_overlay, enabled=true) 手动开",
+                    })
+                } else if effective_mode.is_headed() {
                     let on = BrowserManager::global().overlay_active().await;
                     json!({
                         "enabled": on,
@@ -506,7 +640,7 @@ async fn run_open(args: Value) -> Result<String> {
             }
             // 第 125 轮:视口自适应(默认开)——内容宽/高超出视口时自动扩展到
             // 2K 上限,根治「视口太窄页面显示不全、元素不可见不可点」。
-            if auto_expand_enabled(&args) {
+            if auto_expand_enabled(args) {
                 match fit_viewport(&page_id).await {
                     Some(v) => data["viewport"] = v,
                     None => {
@@ -752,7 +886,7 @@ pub struct McpWebUseTool;
 /// 作业规范部分精炼,全文见 SubAgent-Work 系统提示词的 MCP_Web_Use 段)。
 const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器操作网页(macOS / Windows / Linux,内存无头浏览器默认,也可接管已开浏览器;MCP 风格单工具多 action)。
 用 action 参数选择操作:
-- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, overlay?, timeout_ms?): 启动/接管 Chromium 并打开页面。**默认可见窗口(mode=headed,第 139 轮)**——不要为了「省资源」主动传 hidden,除非任务明确要求静默后台跑;无 GUI 会话(CI/容器/SSH)会自动回退 hidden,可用 LAEW_BROWSER_MODE 强制。使用一次性临时 profile,不干扰用户日常浏览器;全模式启动窗口默认 1920×1080(1080p),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;**overlay=true(默认,第 141 轮)时 headed 页面覆盖半透明蒙层并锁定人工输入**——人工可实时观看页面变化但不可点击/操作(防人工与 Agent 交叉操作),Agent 自己的输入动作自动「先解后锁」不受影响,人工交互一律走 request_human(默认自动解锁页面),运行时开关 control(set_overlay);timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**窗口收边(第 139 轮,默认开)**:headed 模式下导航完成后按屏幕工作区自动收窄窗口(小屏笔记本不再把窗口挤出屏外「显示不全」),并保证页面视口不低于 720p,结果回 data.headed_window。**视口自适应(第 125 轮,默认开)**:导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。返回 {page_id,title,final_url,reused,mode,browser_reused,window,overlay,headed_window?,viewport?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
+- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, overlay?, timeout_ms?, reuse_existing?, auto_relaunch?): 启动/接管 Chromium 并打开页面。**默认可见窗口(mode=headed,第 139 轮)**——不要为了「省资源」主动传 hidden,除非任务明确要求静默后台跑;无 GUI 会话(CI/容器/SSH)会自动回退 hidden,可用 LAEW_BROWSER_MODE 强制。使用一次性临时 profile,不干扰用户日常浏览器;全模式启动窗口默认 1920×1080(1080p),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;**overlay=true(默认,第 141 轮)时 headed 页面覆盖半透明蒙层并锁定人工输入**——人工可实时观看页面变化但不可点击/操作(防人工与 Agent 交叉操作),Agent 自己的输入动作自动「先解后锁」不受影响,人工交互一律走 request_human(默认自动解锁页面),运行时开关 control(set_overlay);timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。**复用已登录浏览器(第 142 轮)**:reuse_existing=true 自动探测本机调试端口(默认 9222,LAEW_CHROME_DEBUG_PORT 可覆盖;依次尝试 localhost/[::1]/127.0.0.1 —— Chrome 154+ 的 DevTools HTTP 端点只服务 IPv6 loopback 连接,IPv4 返回 404)并接管用户已登录的 Chrome(保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port + data.browser_version + data.connect_mode=true;探测失败返回 code=3002 + data.relaunch_command(平台相关重启命令,转述用户执行或经同意后 auto_relaunch=true 重试,由工具自动退出+重启 Chrome 并复制登录态);connect 模式 close 只断连不关用户浏览器,默认不锁人工输入。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**窗口收边(第 139 轮,默认开)**:headed 模式下导航完成后按屏幕工作区自动收窄窗口(小屏笔记本不再把窗口挤出屏外「显示不全」),并保证页面视口不低于 720p,结果回 data.headed_window。**视口自适应(第 125 轮,默认开)**:导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。返回 {page_id,title,final_url,reused,mode,browser_reused,connect_mode,window,overlay,headed_window?,viewport?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
 - list(): 列出当前存活页面 [{page_id,url,title,created_at}];返回前自动清理失效 entry。冷启动后多轮任务优先用它同步页面索引。
 - close(page_id*): 关闭指定页面;最后一个页面关闭时回收浏览器进程。page_id="all" 一键关闭全部页面并回收浏览器(任务收尾清场)。幂等;对话型页面(用户可能继续追问)可保留复用。
 - control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event/set_window/sync_viewport/set_highlight/set_overlay/request_human。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。screenshot 一律落盘返回 save_path(看图片文字用 params.ocr=true,文本模型无法消费 base64);eval_js 直接写表达式,支持 return 与多语句(失败自动 IIFE 重试),超长返回值自动落盘并以 saved_to 引用;download 支持 http(s) url 或 selector、save_dir、filename、timeout_ms,data: URL 直接解码落盘,完成后返回绝对 save_path 与 byte_size。set_window 运行时调整真实浏览器窗口(width/height/left/top/window_state=maximized|fullscreen|minimized|normal,CDP setWindowBounds,调整后自动清除视口覆盖保证渲染自适应不缺区域);sync_viewport 在人工拖动窗口大小后调用,清除 device metrics 覆盖使视口=窗口内容区(会撤销 open 时的自动 2K 扩展);set_viewport(width,height,device_scale_factor?=1,mobile?=false) 手动设置布局视口(宽 320~7680/高 240~4320 自动 clamp;open 已默认自动扩展视口,仅当自动结果不理想时才手动指定);set_highlight(enabled) 运行时开关蓝色选中边框;set_overlay(enabled) 运行时开关可视化蒙层(第 141 轮:输入拦截+视觉蒙层双层同开同关,仅 headed 生效);request_human(reason=captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom, message?, options?, timeout_ms? 缺省按 reason 分档 captcha/sms/two_factor=120s 其余 300s, bring_to_front?=true, image_path? 指定已有截图文件, unlock_page?=true 提问期间自动解锁页面供人工直接操作,应答/超时/取消后自动复锁;纯问答场景传 false) 人工介入:滑块/短信验证码/扫码登录/实名认证/人脸核身/2FA 邮箱验证码/第三方 OAuth 等无法自动跳过的流程。reason=captcha 时会自动截取当前视口(或用 image_path 指定已保存的截图),弹窗内直接展示验证码图片,人工读码后填入输入框即可,不必切换窗口。macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时+时间轴,文案可鼠标选中复制,人工在弹窗点选项/输入文本/取消,-p 模式同样可弹;TUI 兜底行读),code=0 时 human_response 为人工回答(assist_channel 标注 gui/tui),人工取消返回 code=4002,超时或弹窗与 TUI 均不可用返回 code=4001(如实告知用户改用交互模式重试,严禁伪造结果)。
@@ -765,7 +899,7 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 
 【两种工作模式】1) 单步执行模式:直接调用 open/control/inspect/list/close,一次一个动作,适合探索、调试和高风险操作;2) 连续执行模式:先用单步 inspect(elements/dom/console/network)探索结构,再 action=sequence 一次执行已明确动作链,适合流程稳定任务(登录/表单类:inspect(form) → ocr 验证码 → sequence(input×N + click + wait + verify) 一次打包)。两种模式可混合、可多次调用。
 【标准作业顺序】open 拿 page_id → inspect 探索真实 DOM → control 执行动作 → inspect 验证结果 → 任务完成后 close 释放(确定不再需要的页面;全部结束用 page_id="all" 清场)。
-【错误码对策】1001 修正参数;2000 page_id 失效→action=list 重新同步;2001 断连→重新 open;2002 换 selector 或 input_text 的 use_js 路径重试;3001 未安装浏览器→如实告知用户,不要编造结果;**6001 目标站点越界(任务锚点)→ 立即停止该路径,如实报告「目标站点不可达或未指定」并结束本单元;严禁改用其它站点、搜索引擎、缓存或名称相似的替代品 —— 可以失败,不可以乱跑**。
+【错误码对策】1001 修正参数;2000 page_id 失效→action=list 重新同步;2001 断连→重新 open;2002 换 selector 或 input_text 的 use_js 路径重试;3001 未安装浏览器→如实告知用户,不要编造结果;**3002 复用浏览器不可用(调试端口未开启)→ 把 data.relaunch_command 转述用户执行,或经用户同意以 auto_relaunch=true 重试(自动退出+重启 Chrome 并复制登录态);不要反复重试 open**;**6001 目标站点越界(任务锚点)→ 立即停止该路径,如实报告「目标站点不可达或未指定」并结束本单元;严禁改用其它站点、搜索引擎、缓存或名称相似的替代品 —— 可以失败,不可以乱跑**。
 【人工介入(HITL)】遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/人脸核身等无法自动完成的流程:可视化场景确认 data.mode=headed(缺省即是,无需显式传 mode=headed),让人工看到窗口(蓝色边框标识,页面默认有半透明蒙层锁定人工输入——这是设计行为不是页面故障),再 control(request_human, reason=..., message=说明要人工做什么, options=[...]);**提问期间页面自动解锁(unlock_page 默认 true),人工可直接在页面上拖滑块/扫码/填表,应答/超时/取消后自动复锁**;macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时,人工在弹窗点选项/输入验证码;弹窗文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,也有「📋 复制」一键复制全部信息),Linux 或弹窗不可用时 TUI 选择块行读;code=0 用 data.human_response 继续(短信/2FA 动态码人工直接输入,拿到后 input_text 填入);4001=超时/弹窗与 TUI 均不可用,如实报告;4002=人工取消(弹窗取消/Esc/关窗),终止该路径。当前实例是无头而任务需要可视化时,先 close("all") 回收再以 mode=headed 重开。
 【作业要点】中文输入优先 params.use_js=true(React/Vue 受控组件兼容);复杂页面先 inspect(info=elements) 探测真实 DOM 再操作,不要硬猜 selector;AI 对话类网站回复等待用 control(wait, selector=[class*=response]..., timeout_ms=60000);看图片里的文字(验证码/图表标签)一律 screenshot(params.ocr=true) 或 inspect(info=ocr),禁止 Read 图片文件、禁止用 Bash/python/tesseract 解码图片(文本模型无视觉,纯浪费迭代);验证码读码后不要刷新页面或点击验证码图(刷新即换码),提交报验证码错误才点图刷新重读;DOM 提取注意 truncated 标记分段。
 【安全红线】支付/删除/确认提交/登出等不可逆或高风险动作禁止放进 sequence,必须单步执行并检查页面状态;登录凭证只填用户明确提供的账号密码,不要编造;OCR 不可用的平台上验证码类任务如实报告等待人工,禁止猜测验证码;只读优先——能 inspect 回答的问题不做任何写操作。"#;
@@ -798,7 +932,9 @@ impl Tool for McpWebUseTool {
                 "highlight": { "type": "boolean", "default": true, "description": "open 可选:headed 模式在页面四周注入一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标(标识 Agent 控制的窗口,人工介入用);pointer-events:none 不影响页面交互;可用 control(set_highlight, enabled=false) 运行时关闭" },
                 "overlay": { "type": "boolean", "default": true, "description": "open 可选(第 141 轮,默认 true,缺省随 LAEW_WEB_OVERLAY):headed 模式页面覆盖半透明蒙层+锁定人工输入(人工可实时观看但不可点击/操作,防交叉操作;Agent 输入动作自动先解后锁不受影响;人工交互走 request_human,默认自动解锁);仅 headed 生效;可用 control(set_overlay, enabled=false) 运行时关闭" },
                 "timeout_ms": { "type": "integer", "description": "open 可选:页面加载超时(毫秒),默认 60000" },
-                "connect_url": { "type": "string", "description": "open 可选:接管已开浏览器,如 http://127.0.0.1:9222(需 --remote-debugging-port 启动)" },
+                "connect_url": { "type": "string", "description": "open 可选:接管已开浏览器,如 http://localhost:9222(需 --remote-debugging-port 启动;Chrome 154+ 只接受 localhost/IPv6 连接,不建议用 127.0.0.1);reuse_existing=true 会自动探测默认端口,无需显式传本参数" },
+                "reuse_existing": { "type": "boolean", "default": false, "description": "open 可选(第 142 轮):true=复用用户已登录浏览器——自动探测本机 CDP 调试端口(默认 9222,LAEW_CHROME_DEBUG_PORT 可覆盖)并接管,保留登录态;探测失败返回 code=3002 + data.relaunch_command(平台相关重启命令);与 connect_url 并存时 connect_url 优先" },
+                "auto_relaunch": { "type": "boolean", "default": false, "description": "open 可选(第 142 轮):reuse_existing=true 且探测失败时,自动执行「退出用户 Chrome → 复制登录态 → 以调试参数重启 → 接管」;显式 opt-in(会退出用户当前 Chrome),不默认开启" },
                 "user_agent": { "type": "string", "description": "open 可选:覆盖 User-Agent" },
                 "wait_until": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"], "description": "open 可选:打开后额外等待(networkidle 额外等 1.5s)" },
                 "block_resources": { "type": "array", "items": { "type": "string" }, "description": "open 可选:拦截资源类型(image/stylesheet/font/media/script),当前仅记录提示" },
