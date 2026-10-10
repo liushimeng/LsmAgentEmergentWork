@@ -1599,6 +1599,71 @@ fn detect_challenge_ad_overlay_suppressed() {
     assert!(blocker_probe::detect_challenge(&o).is_none(), "广告负信号应压制");
 }
 
+// ==================== 第 150 轮:canvas 拖拽验证识别 + 执行超时兜底 ====================
+
+/// canvas 形态 overlay(主文档渲染的拖拽拼图/滑块验证,无九宫格 img/验证码 iframe)。
+fn probe_overlay_canvas(text: &str, canvas_count: i64, buttons: Value) -> Value {
+    json!({
+        "found": true, "text": text,
+        "img_count": 0, "grid_imgs": 0,
+        "canvas_count": canvas_count,
+        "iframe_count": 0, "iframe_like": false, "input_count": 0,
+        "buttons": buttons,
+        "rect": {"w": 400, "h": 360}, "viewport": {"w": 1280, "h": 800},
+        "area_ratio": 0.14, "z_index": 9999,
+    })
+}
+
+#[test]
+fn detect_challenge_canvas_drag_with_weak_word() {
+    // 豆包「拖拽图片到框中」主文档 canvas 形态:canvas(2)+弱词「拖拽/图片」(1)=3 命中
+    let o = probe_overlay_canvas("请拖拽图片到对应位置完成验证", 1, json!(["刷新"]));
+    let hit = blocker_probe::detect_challenge(&o).expect("canvas(2)+弱词(1) 应命中");
+    assert_eq!(hit["evidence"]["canvas_count"], 1);
+    assert!(hit["snippet"].as_str().unwrap().contains("拖拽"));
+}
+
+#[test]
+fn detect_challenge_canvas_alone_not_enough() {
+    // 防误报:普通 canvas 图表/游戏(无验证文案)2 分不过阈值
+    let o = probe_overlay_canvas("数据报表", 2, json!(["导出"]));
+    assert!(blocker_probe::detect_challenge(&o).is_none(), "canvas 单独 2 分不过阈值");
+}
+
+#[test]
+fn detect_challenge_canvas_ad_suppressed() {
+    // canvas 广告(抽奖转盘):结构 2 分 + 负信号 −3 → 压制
+    let o = probe_overlay_canvas("幸运抽奖 广告", 1, json!(["跳过"]));
+    assert!(blocker_probe::detect_challenge(&o).is_none(), "canvas 广告负信号应压制");
+}
+
+#[test]
+fn eval_timeout_from_parsing() {
+    // 纯函数:正整数生效;缺省/0/非法回退默认 30s
+    assert_eq!(
+        super::eval_timeout_from(Some("5000".into())),
+        5000
+    );
+    assert_eq!(super::eval_timeout_from(None), super::EVAL_DEFAULT_TIMEOUT_MS);
+    assert_eq!(
+        super::eval_timeout_from(Some("0".into())),
+        super::EVAL_DEFAULT_TIMEOUT_MS
+    );
+    assert_eq!(
+        super::eval_timeout_from(Some("abc".into())),
+        super::EVAL_DEFAULT_TIMEOUT_MS
+    );
+}
+
+#[test]
+fn step_has_blocker_alert_detection() {
+    // 第 150 轮:sequence 中断判定 —— 步骤数据携带 blocker_alert 即中断整批
+    assert!(super::step_has_blocker_alert(&json!({"blocker_alert": {"kind": "captcha"}})));
+    assert!(super::step_has_blocker_alert(&json!({"blocker_alert": null})));
+    assert!(!super::step_has_blocker_alert(&json!({"slept_ms": 500})));
+    assert!(!super::step_has_blocker_alert(&json!({})));
+}
+
 #[test]
 fn detect_challenge_clean_overlay_and_null() {
     let clean = probe_overlay("新品上线通知", 1, false, json!(["知道了"]));

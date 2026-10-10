@@ -105,7 +105,32 @@ pub(super) fn now_millis_safe() -> u128 {
         .unwrap_or_default()
 }
 
-/// 调 JS 并以 returnByValue 提取结果。
+// ===================== 第 150 轮:eval 执行超时兜底 =====================
+
+/// eval 默认超时(ms):实测豆包拖拽验证落地后页面主线程被拖住,
+/// `Runtime.evaluate` 响应永不返回,裸 await 把整个 sequence 卡死 56s 直到用户
+/// Ctrl-C(`tmpPlan/2026-10-10_01-验证弹窗处置闭环与执行超时兜底.md`)。
+/// 页面主线程对一次 evaluate 的正常响应是毫秒级,30s 是极宽松上限。
+pub(super) const EVAL_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// 环境变量取值解析(纯函数,可单测):正整数生效,缺省/0/非法回退默认。
+pub(super) fn eval_timeout_from(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(EVAL_DEFAULT_TIMEOUT_MS)
+}
+
+/// 环境变量覆盖(0/非法回退默认)。
+pub(super) fn eval_timeout_from_env() -> u64 {
+    eval_timeout_from(std::env::var("LAEW_WEB_EVAL_TIMEOUT_MS").ok())
+}
+
+/// 超时错误的统一处置指引(附在错误文案尾部,把模型推回感知-人工闭环)。
+pub(super) const EVAL_TIMEOUT_HINT: &str = "页面主线程可能卡死或弹出人工验证;\
+建议 inspect(blockers) 或 control(screenshot, params={\"ocr\":true}) 确认页面状态;\
+若确认是验证弹窗,立即 request_human(reason=\"captcha\") 请人工完成验证后再继续";
+
+/// 调 JS 并以 returnByValue 提取结果(带超时兜底,第 150 轮)。
 pub(super) async fn eval_js_string(
     page: &chromiumoxide::Page,
     js: &str,
@@ -116,7 +141,14 @@ pub(super) async fn eval_js_string(
         .return_by_value(true)
         .build()
         .map_err(|e| e.to_string())?;
-    let v = page.evaluate(params).await.map_err(|e| e.to_string())?;
+    // 超时竞争:命中即返回错误(带处置指引),不再无限等 CDP 响应。
+    let v = tokio::time::timeout(
+        std::time::Duration::from_millis(eval_timeout_from_env()),
+        page.evaluate(params),
+    )
+    .await
+    .map_err(|_| format!("eval_js 执行超时({}ms): {EVAL_TIMEOUT_HINT}", eval_timeout_from_env()))?
+    .map_err(|e| e.to_string())?;
     Ok(v.value().cloned().unwrap_or(Value::Null))
 }
 
@@ -859,6 +891,17 @@ async fn run_close(args: Value) -> Result<String> {
 /// 连续模式单批步骤上限:兼顾长任务编排与单次 tool_result 输出预算。
 const MAX_SEQUENCE_STEPS: usize = 24;
 
+/// 单步时长预算(第 150 轮,最后防线):任一步(浏览器启动/下载/eval 等)卡死
+/// 不得超过该时长;`request_human` 步豁免(人工介入合法长等待,本身有 30 分钟上限)。
+/// 实测事故:eval 无超时 + 验证弹窗卡死主线程 → 整批 56s 无返回直到用户 Ctrl-C。
+const STEP_CAP_SECS: u64 = 150;
+
+/// 步骤数据是否携带 blocker_alert(第 150 轮,纯判定可单测):
+/// 命中即中断整批 —— 继续执行只会把后续输入灌进验证弹窗后面的黑洞。
+pub(super) fn step_has_blocker_alert(data: &Value) -> bool {
+    data.get("blocker_alert").is_some()
+}
+
 /// 递归替换步骤里的 page_id 占位符。
 fn resolve_page_placeholders(value: &mut Value, current: Option<&str>, spawned: Option<&str>) {
     match value {
@@ -926,8 +969,16 @@ async fn run_sequence(args: Value) -> Result<String> {
     let mut results: Vec<Value> = Vec::with_capacity(steps.len());
     let mut failed_at: Option<usize> = None;
     let mut first_error: Option<(i32, String)> = None;
+    // 第 150 轮:blocker_alert 命中即中断整批(优先级高于 stop_on_error);
+    // shutdown 触发即取消整批(SIGINT 止血,不等外层 drop)。
+    let mut interrupted_by: Option<&'static str> = None;
 
     for (index, raw_step) in steps.iter().enumerate() {
+        // 步间取消探测:同步零成本;命中即中断,已完成步骤照常带回。
+        if crate::shutdown::global().is_triggered() {
+            interrupted_by = Some("shutdown");
+            break;
+        }
         if !raw_step.is_object() {
             failed_at = Some(index);
             first_error = Some((1001, "step 必须是对象".into()));
@@ -982,10 +1033,34 @@ async fn run_sequence(args: Value) -> Result<String> {
             .to_string();
         let step_page_id = str_arg(&step, "page_id").map(str::to_string);
 
-        let output = McpWebUseTool.execute(step).await?;
-        let parsed: Value = serde_json::from_str(&output).unwrap_or_else(
-            |_| json!({"code": 2002, "message": "步骤返回非法 JSON", "data": {"raw": output}}),
-        );
+        // 第 150 轮:单步时长预算(最后防线);request_human 步豁免(人工介入
+        // 合法长等待,HITL 自身有 30 分钟总上限)。
+        let parsed: Value = if control_action == "request_human" {
+            let output = McpWebUseTool.execute(step).await?;
+            serde_json::from_str(&output).unwrap_or_else(
+                |_| json!({"code": 2002, "message": "步骤返回非法 JSON", "data": {"raw": output}}),
+            )
+        } else {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(STEP_CAP_SECS),
+                McpWebUseTool.execute(step),
+            )
+            .await
+            {
+                Ok(Ok(output)) => serde_json::from_str(&output).unwrap_or_else(
+                    |_| json!({"code": 2002, "message": "步骤返回非法 JSON", "data": {"raw": output}}),
+                ),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => json!({
+                    "code": 2002,
+                    "message": format!(
+                        "步骤执行超时(>{STEP_CAP_SECS}s):页面可能无响应或弹出人工验证;\
+                         建议 inspect(blockers) 确认,必要时 request_human(reason=\"captcha\")"
+                    ),
+                    "data": {},
+                }),
+            }
+        };
         let code = parsed.get("code").and_then(Value::as_i64).unwrap_or(2002) as i32;
         let message = parsed
             .get("message")
@@ -1024,6 +1099,13 @@ async fn run_sequence(args: Value) -> Result<String> {
             "message": message,
             "data": data,
         }));
+        // 第 150 轮:blocker_alert 命中立即中断整批(优先级高于 stop_on_error):
+        // 验证弹窗在场时继续执行只会把后续输入灌进黑洞;告警随顶层 data 透出,
+        // LLM 当轮即见 human_assist 载荷并发起 request_human。
+        if step_has_blocker_alert(&data) {
+            interrupted_by = Some("blocker_alert");
+            break;
+        }
         if code != 0 {
             failed_at = Some(index);
             first_error = Some((code, message));
@@ -1033,7 +1115,7 @@ async fn run_sequence(args: Value) -> Result<String> {
         }
     }
 
-    let completed = failed_at.is_none();
+    let completed = failed_at.is_none() && interrupted_by.is_none();
     let mut data = json!({
         "mode": "continuous",
         "steps": results,
@@ -1041,6 +1123,33 @@ async fn run_sequence(args: Value) -> Result<String> {
         "completed": completed,
         "stop_on_error": stop_on_error,
     });
+    if let Some(reason) = interrupted_by {
+        data["interrupted_by"] = json!(reason);
+        // blocker 告警提升到顶层,LLM 无需翻 steps 数组即见处置载荷。
+        if reason == "blocker_alert" {
+            if let Some(alert) = results
+                .iter()
+                .rev()
+                .find_map(|r| r.get("data").and_then(|d| d.get("blocker_alert")).cloned())
+            {
+                data["blocker_alert"] = alert;
+            }
+            if let Some(ha) = results
+                .iter()
+                .rev()
+                .find_map(|r| r.get("data").and_then(|d| d.get("human_assist")).cloned())
+            {
+                data["human_assist"] = ha;
+            }
+            if let Some(na) = results
+                .iter()
+                .rev()
+                .find_map(|r| r.get("data").and_then(|d| d.get("next_action")).cloned())
+            {
+                data["next_action"] = na;
+            }
+        }
+    }
     if let Some(index) = failed_at {
         data["failed_at"] = json!(index + 1);
     }
@@ -1051,6 +1160,11 @@ async fn run_sequence(args: Value) -> Result<String> {
         data["spawned_page_id"] = json!(id);
     }
 
+    // 第 150 轮:shutdown 中断走独立取消码(外层 exec 的取消竞争会兜底 drop,
+    // 这里是「不依赖 drop 也立即止血」的同步路径)。
+    if interrupted_by == Some("shutdown") {
+        return envelope(4999, "sequence 已取消(进程关闭信号)", data);
+    }
     match first_error {
         Some((code, message)) if !completed => {
             envelope(code, &format!("sequence 未完成:{message}"), data)
@@ -1071,11 +1185,11 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 - open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, guard?, allow_selectors?, block_selectors?, guard_note?, overlay?, timeout_ms?, reuse_existing?, auto_relaunch?): 启动/接管 Chromium 并打开页面。**默认可见窗口(mode=headed,第 139 轮)**——不要为了「省资源」主动传 hidden,除非任务明确要求静默后台跑;无 GUI 会话(CI/容器/SSH)会自动回退 hidden,可用 LAEW_BROWSER_MODE 强制。使用一次性临时 profile,不干扰用户日常浏览器;全模式启动窗口默认 1920×1080(1080p),可用 window_width/window_height 自定义;highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;**页面管控三档(第 143 轮,guard 参数,缺省 locked)**:locked=屏蔽模式(半透明蒙层+锁定人工输入,人工可实时观看不可点击,防交叉操作;Agent 输入动作自动「先解后锁」不受影响,人工交互一律走 request_human 默认自动解锁)/ open=非屏蔽模式(人工可直接操作页面,状态条明示「🔓 页面开放」,用于人工亲自操作、人工登录先行流)/ partial=部分屏蔽模式(须同时给 allow_selectors 白名单「只有命中区人工可操作」或 block_selectors 黑名单「命中区人工不可操作」之一,互斥,各 ≤8 条;盾区内人工不可操作、盾区外放行,Agent 动作自动「先隐盾后复盾」);guard_note(≤60 字符)写进页面状态条第三行引导人工(如「请登录后应答弹窗,Agent 将接管后续操作」);缺省随 LAEW_WEB_GUARD;仅 headed 生效;运行时切换 control(set_guard);legacy overlay 布尔参数保留(true≡locked/false≡open,显式传 guard 时被忽略);timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。**复用已登录浏览器(第 142 轮)**:reuse_existing=true 自动探测本机调试端口(默认 9222,LAEW_CHROME_DEBUG_PORT 可覆盖;依次尝试 localhost/[::1]/127.0.0.1 —— Chrome 154+ 的 DevTools HTTP 端点只服务 IPv6 loopback 连接,IPv4 返回 404)并接管用户已登录的 Chrome(保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port + data.browser_version + data.connect_mode=true;探测失败返回 code=3002 + data.relaunch_command(平台相关重启命令,转述用户执行,或 auto_relaunch=true 重试,由工具自动复制登录态并另启独立调试 Chrome 实例,不退出、不影响用户已打开的浏览器);connect 模式 close 只断连不关用户浏览器,默认不锁人工输入(管控恒为 open 且零注入,需要时 set_guard 手动开)。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);**同 origin 兜底复用(第 146 轮)**:精确未命中但存在同 scheme+host+port 的存活页面(取最早打开的主工作页)时,在该页面上原地导航复用(响应 reuse_match=origin + previous_url),长遍历任务不再因路由不同新开冗余标签页、登录态与页面上下文不丢失;connect 模式(接管用户浏览器)不做 origin 兜底,绝不导航用户自己的标签页;浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**窗口收边(第 139 轮,默认开)**:headed 模式下导航完成后按屏幕工作区自动收窄窗口(小屏笔记本不再把窗口挤出屏外「显示不全」),并保证页面视口不低于 720p,结果回 data.headed_window。**视口自适应(第 125 轮,默认开)**:导航完成后若页面内容超出视口(横向被裁/可视高度不足),自动把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。返回 {page_id,title,final_url,reused,mode,browser_reused,connect_mode,window,guard,overlay(legacy),headed_window?,viewport?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
 - list(): 列出当前存活页面 [{page_id,url,title,created_at}];返回前自动清理失效 entry。冷启动后多轮任务优先用它同步页面索引。
 - close(page_id*): 关闭指定页面;最后一个页面关闭时回收浏览器进程。page_id="all" 一键关闭全部页面并回收浏览器(任务收尾清场)。幂等;对话型页面(用户可能继续追问)可保留复用。
-- control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event/set_window/sync_viewport/set_highlight/set_overlay/set_guard/request_human。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。screenshot 一律落盘返回 save_path(看图片文字用 params.ocr=true,文本模型无法消费 base64);eval_js 直接写表达式,支持 return 与多语句(失败自动 IIFE 重试),超长返回值自动落盘并以 saved_to 引用;download 支持 http(s) url 或 selector、save_dir、filename、timeout_ms,data: URL 直接解码落盘,完成后返回绝对 save_path 与 byte_size。set_window 运行时调整真实浏览器窗口(width/height/left/top/window_state=maximized|fullscreen|minimized|normal,CDP setWindowBounds,调整后自动清除视口覆盖保证渲染自适应不缺区域);sync_viewport 在人工拖动窗口大小后调用,清除 device metrics 覆盖使视口=窗口内容区(会撤销 open 时的自动 2K 扩展);set_viewport(width,height,device_scale_factor?=1,mobile?=false) 手动设置布局视口(宽 320~7680/高 240~4320 自动 clamp;open 已默认自动扩展视口,仅当自动结果不理想时才手动指定);set_highlight(enabled) 运行时开关蓝色选中边框;set_guard(mode?="locked"|"open"|"partial", allow_selectors?, block_selectors?, note?) 运行时切换页面管控三档(第 143 轮,推荐;字段缺省=保持现值,空数组/空串=清除;partial 校验同 open);set_overlay(enabled) 蒙层开关 legacy 别名(true=set_guard(locked),false=set_guard(open),仅 headed 生效);request_human(reason=captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom, message?, options?, timeout_ms? 缺省按 reason 分档 captcha/sms/two_factor=120s 其余 300s, bring_to_front?=true, image_path? 指定已有截图文件, unlock_page?=true 提问期间自动放行页面供人工直接操作(第 144 轮:优先 partial 白名单挖洞,只放行账号/密码/验证码等人工必填输入区域——自动探测,或 allow_selectors? 显式指定 ≤8 条;探测不到才整页切 open;应答/超时/取消后自动恢复原档;open 下无需动作;纯问答场景传 false;提问期间人工提交表单触发导航会自动重放放行态,多步登录不断链)) 人工介入:滑块/短信验证码/扫码登录/实名认证/人脸核身/2FA 邮箱验证码/第三方 OAuth 等无法自动跳过的流程。reason=captcha 时会自动截取当前视口(或用 image_path 指定已保存的截图),弹窗内直接展示验证码图片,人工读码后填入输入框即可,不必切换窗口。macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时+时间轴,文案可鼠标选中复制,人工在弹窗点选项/输入文本/取消,-p 模式同样可弹;第 145 轮:主按钮为「提交 / 继续」双语义——有输入=提交验证码/动态码文本,空输入=选项 1(人工在浏览器完成操作后的交棒动作);另有「⏱ +2分钟」按钮延长等待,总上限 30 分钟;TUI 兜底行读),code=0 时 human_response 为人工回答(assist_channel 标注 gui/tui;next_hint 按「输码 vs 已完成」分流——自由文本验证码立即 input_text 填入提交,选项应答才 inspect 验证),人工取消返回 code=4002,超时或弹窗与 TUI 均不可用返回 code=4001(如实告知用户改用交互模式重试,严禁伪造结果)。
+- control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/upload_file/select_option/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event/set_window/sync_viewport/set_highlight/set_overlay/set_guard/request_human。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。screenshot 一律落盘返回 save_path(看图片文字用 params.ocr=true,文本模型无法消费 base64);eval_js 直接写表达式,支持 return 与多语句(失败自动 IIFE 重试),超长返回值自动落盘并以 saved_to 引用;单次执行有超时兜底(默认 30s,await_promise=true 时 60s,可用 params.timeout_ms 指定、上限 120s——页内 Promise 轮询等合法长等待必须显式传 timeout_ms),超时返回 2002 并附「页面可能弹出人工验证」的处置指引;download 支持 http(s) url 或 selector、save_dir、filename、timeout_ms,data: URL 直接解码落盘,完成后返回绝对 save_path 与 byte_size。set_window 运行时调整真实浏览器窗口(width/height/left/top/window_state=maximized|fullscreen|minimized|normal,CDP setWindowBounds,调整后自动清除视口覆盖保证渲染自适应不缺区域);sync_viewport 在人工拖动窗口大小后调用,清除 device metrics 覆盖使视口=窗口内容区(会撤销 open 时的自动 2K 扩展);set_viewport(width,height,device_scale_factor?=1,mobile?=false) 手动设置布局视口(宽 320~7680/高 240~4320 自动 clamp;open 已默认自动扩展视口,仅当自动结果不理想时才手动指定);set_highlight(enabled) 运行时开关蓝色选中边框;set_guard(mode?="locked"|"open"|"partial", allow_selectors?, block_selectors?, note?) 运行时切换页面管控三档(第 143 轮,推荐;字段缺省=保持现值,空数组/空串=清除;partial 校验同 open);set_overlay(enabled) 蒙层开关 legacy 别名(true=set_guard(locked),false=set_guard(open),仅 headed 生效);request_human(reason=captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom, message?, options?, timeout_ms? 缺省按 reason 分档 captcha/sms/two_factor=120s 其余 300s, bring_to_front?=true, image_path? 指定已有截图文件, unlock_page?=true 提问期间自动放行页面供人工直接操作(第 144 轮:优先 partial 白名单挖洞,只放行账号/密码/验证码等人工必填输入区域——自动探测,或 allow_selectors? 显式指定 ≤8 条;探测不到才整页切 open;应答/超时/取消后自动恢复原档;open 下无需动作;纯问答场景传 false;提问期间人工提交表单触发导航会自动重放放行态,多步登录不断链)) 人工介入:滑块/短信验证码/扫码登录/实名认证/人脸核身/2FA 邮箱验证码/第三方 OAuth 等无法自动跳过的流程。reason=captcha 时会自动截取当前视口(或用 image_path 指定已保存的截图),弹窗内直接展示验证码图片,人工读码后填入输入框即可,不必切换窗口。macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时+时间轴,文案可鼠标选中复制,人工在弹窗点选项/输入文本/取消,-p 模式同样可弹;第 145 轮:主按钮为「提交 / 继续」双语义——有输入=提交验证码/动态码文本,空输入=选项 1(人工在浏览器完成操作后的交棒动作);另有「⏱ +2分钟」按钮延长等待,总上限 30 分钟;TUI 兜底行读),code=0 时 human_response 为人工回答(assist_channel 标注 gui/tui;next_hint 按「输码 vs 已完成」分流——自由文本验证码立即 input_text 填入提交,选项应答才 inspect 验证),人工取消返回 code=4002,超时或弹窗与 TUI 均不可用返回 code=4001(如实告知用户改用交互模式重试,严禁伪造结果)。
 - inspect(page_id*, info*, params?): 全部只读观察统一入口。info 枚举:console(控制台输出)/network(请求响应流)/elements(元素文本与矩形;params.selector 可选,缺失时默认返回 input/button/select/textarea/a/[role=button] 等全页交互元素)/dom(outerHTML 或节点树)/localstorage/sessionstorage/cookies/screenshot/page_meta/viewport(视口+内容尺寸与 overflow 溢出判定:横向溢出=页面显示不全需 set_viewport/重开 open 自动扩展,纵向溢出截图用 full_page=true)/url/title/ping/image_urls/ocr(截图+OCR 识别图片文字,验证码/图表标签用;region 过滤词块)/blockers(启发式检测验证码/短信/扫码/登录墙等人工阻断,**含弹层语义挑战检测(第 147 轮)**:图片选择「选出在公园能看到的事物」/滑块/语义题等题面无验证码关键词的形态靠弹层结构+文案识别,返回 blockers[]+suggested_action=request_human)/extract_links(批量提取页面所有链接,返回 links[{href,text,context,is_external}]+total+truncated+scanned+hostname;params.selector 默认 "a" 可选,params.max_links 默认 200 上限 500,params.include_context 默认 true 含文章前后文供时间推断)/extract(【第 135 轮,列表/表格抓取首选】一次调用把列表页压成结构化条目并可在页面内完成过滤,只回精简字段)/page_state(【第 135 轮】读取页面 SSR 注水数据与 JSON-LD,列表数据藏在全局变量时先读它)/coverage(【第 146 轮】遍历覆盖台账:工具层自动记录 open/navigate/new_tab 的全部导航,返回 summary{distinct_pages,total_visits}+top_repeats+pages 清单;**遍历类任务开工/收口必查,未访问页面优先,防同页打转**;进程级全局事实,不依赖存活页面)。
 【extract 详解(抓文章列表/新闻流/商品列表优先用它,不要手写 eval_js 猜字段)】params:item_selector*(列表项根节点 CSS 选择器,不知填什么先 probe=true)、fields(字段投影,形如 {"title":{"selector":"h3 a","required":true},"time":{"selector":"time","attr":"datetime"},"summary":{"selector":".descript","max_chars":300}},省略则只回通用 text+__url)、url_from(取链接的选择器,默认 "a",结果落在 __url)、limit(默认 200 上限 1000)、scan_cap(内部扫描上限,默认 1000)、filter{keywords[],match_all,fields[],time_field,since,until,sort("time:desc"),limit_after_filter}。返回 {items,total,returned,scanned,truncated,dropped_required,matched_before_filter,unparsed_time_fields,time_range,field_names,hostname,hint}。**时间字段支持中文相对时间**("3小时前"/"昨天")、ISO、"YYYY-MM-DD HH:mm" 与 Unix 秒;since/until 是闭区间。probe=true 时不抽数据,只返回 {repeated_classes,likely_item_classes,common_selectors} 供你选 item_selector,免去盲试选择器。过滤在页面内完成,返回值天然精简,不会撑爆上下文。
 【page_state 详解】params:keys?(候选全局变量名,默认 __NEXT_DATA__/__NUXT__/__INITIAL_STATE__/__APOLLO_STATE__/__PRELOADED_STATE__/__remixContext/initialState/__INITIAL_DATA__)、probe_window?(默认 true,扫出 window 上所有 __ 前缀键名+一层结构,让你不必先猜名字)、max_bytes?(默认 20000)、max_depth?(默认 8)、max_array_items?(默认 200)。返回 {found,globals,window_globals,jsonld,dropped_paths,truncated,hostname,hint}。**被裁掉的内容会列进 dropped_paths** —— 别误以为数据就这么多;按 globals 的结构选定路径后,用 eval_js 取精确子集(如 JSON.stringify(window.__NEXT_DATA__.props.pageProps.list.slice(0,20)))。
-- sequence(steps*, stop_on_error?): 连续执行模式。steps 最多 24 个,每项结构与单步调用相同(open/list/close/control/inspect),**action 可省略**(第 147 轮:含 control_action 默认 control、含 info 默认 inspect),禁止嵌套 sequence;批内 page_id 用 "$page_id"/"${page_id}" 占位,点击派生新页可用 "$spawned_page_id"/"${spawned_page_id}",默认自动跟随 spawned_page_id,单步可 follow_spawned=false 保持原页。响应逐步返回 code/message/data,并给出最终 page_id。
+- sequence(steps*, stop_on_error?): 连续执行模式。steps 最多 24 个,每项结构与单步调用相同(open/list/close/control/inspect),**action 可省略**(第 147 轮:含 control_action 默认 control、含 info 默认 inspect),禁止嵌套 sequence;批内 page_id 用 "$page_id"/"${page_id}" 占位,点击派生新页可用 "$spawned_page_id"/"${spawned_page_id}",默认自动跟随 spawned_page_id,单步可 follow_spawned=false 保持原页。响应逐步返回 code/message/data,并给出最终 page_id。**第 150 轮步级防护**:任一步数据带 blocker_alert(验证弹窗命中)立即中断整批并顶层透出 blocker_alert/human_assist/next_action —— 收到后必须停止继续输入,立即 request_human 让人工完成验证、交棒后再续跑剩余步骤;单步超 150s 按步骤错误处理(request_human 步豁免);等待 AI 站点回复请用 control(wait),不要把多轮提问无超时地堆进同一批。
 - explore(page_id*, queries*, summary_hint?)(第 118 轮):批量观察。一次调用合并多个 inspect 维度(elements/dom/screenshot/blockers 等),queries 数组最多 8 项,每项为单步 inspect 入参(如 {"info":"elements"} / {"info":"dom","params":{"selector":"form"}} / {"info":"screenshot"} / {"info":"blockers"});返回 {results:[{info,code,message,data},...], summary_hint, ok_count, err_count}。**进入新页面先用 1 次 explore 收集完整状态**(对比单步 inspect 节省 3-5 次 LLM round-trip);blockers 命中会附带 next_action hint 指引走 request_human。
 - batch(page_id*, steps*, stop_on_error?)(第 118 轮):批量混合执行,与 sequence 同语义但推荐用于「inspect + control 混合的稳定流程」(登录/表单类:inspect 验证 → input × N → click → wait → inspect 验证)。一次调用最多 24 步,允许任意 control + inspect 顺序。**对比 sequence 推荐用于批量执行场景**。
 

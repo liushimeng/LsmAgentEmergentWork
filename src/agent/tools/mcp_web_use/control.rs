@@ -903,7 +903,25 @@ async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> 
             }
         }
     };
-    let v = page.evaluate(built).await.map_err(|e| e.to_string())?;
+    // 第 150 轮:evaluate 超时兜底(实测豆包验证弹窗卡死主线程 → 裸 await 卡 56s)。
+    // 显式 params.timeout_ms 优先(上限 120s,对齐 wait 的 120s 上限,供页内
+    // Promise 轮询等合法长等待);缺省按 await_promise 分档(false=env 默认 30s /
+    // true=60s)。超时错误带处置指引,把模型推回 感知-人工 闭环。
+    let timeout_ms = p
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .map(|v| v.clamp(1, 120_000))
+        .unwrap_or_else(|| {
+            if await_promise {
+                60_000
+            } else {
+                super::eval_timeout_from_env()
+            }
+        });
+    let v = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), page.evaluate(built))
+        .await
+        .map_err(|_| format!("eval_js 执行超时({timeout_ms}ms): {}", super::EVAL_TIMEOUT_HINT))?
+        .map_err(|e| e.to_string())?;
     let raw = v.value().cloned().unwrap_or(Value::Null);
     // 第 99 轮:大结果 / data: URL 自动落盘,防上下文爆炸(实测 140KB 验证码
     // data-url 直灌上下文,还诱发后续工具参数超限被截断)。

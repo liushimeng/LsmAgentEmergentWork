@@ -54,7 +54,7 @@ const CHALLENGE_STRONG_WORDS: &[&str] = &[
 ];
 /// 弹层文本弱指令词:合计命中 +1(图片选择/语义题的题面动词,需与结构信号叠加)。
 const CHALLENGE_WEAK_WORDS: &[&str] = &[
-    "点击", "选择", "选出", "按顺序", "依次", "包含", "拖动", "滑动", "拼图",
+    "点击", "选择", "选出", "按顺序", "依次", "包含", "拖动", "拖拽", "滑动", "拼图",
     "图片", "图中", "下方图片", "符合", "哪一个", "哪个",
 ];
 /// 刷新类按钮/文案词:合计命中 +1(验证码组件的标配控件)。
@@ -95,6 +95,12 @@ pub(super) fn detect_challenge(overlay: &Value) -> Option<Value> {
     if grid_imgs >= 4 {
         score += 2;
     }
+    // 第 150 轮:canvas 结构信号(拖拽拼图/滑块类验证常以 canvas 渲染在主文档,
+    // 既无九宫格 img 也无验证码尺寸 iframe,旧打分制漏检豆包「拖拽图片到框中」)。
+    let canvas_count = overlay.get("canvas_count").and_then(Value::as_i64).unwrap_or(0);
+    if canvas_count >= 1 {
+        score += 2;
+    }
     if iframe_like {
         score += 2;
     }
@@ -125,6 +131,7 @@ pub(super) fn detect_challenge(overlay: &Value) -> Option<Value> {
         "evidence": {
             "score": score,
             "grid_imgs": grid_imgs,
+            "canvas_count": canvas_count,
             "iframe_like": iframe_like,
             "buttons": buttons,
             "area_ratio": overlay.get("area_ratio").cloned().unwrap_or(Value::Null),
