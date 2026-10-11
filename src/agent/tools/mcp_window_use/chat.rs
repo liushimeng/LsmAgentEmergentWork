@@ -1337,14 +1337,38 @@ fn parse_messages(v: Option<&Value>) -> Result<Vec<String>> {
 }
 
 /// 检测窗口右侧对话显示框是否有"上次未见过的"新文字(即对方回复)。
+///
+/// 第 154 轮(2026-10-10 Windows 实测崩溃根治):旧实现用**旧快照的字节长度**直接切
+/// **新快照** —— 两次 OCR 结果没有前缀关系(识别抖动/滚动/空白 join 差异),字节下标
+/// 落进 CJK 多字节字符中间即 panic(实测 CrashReport:`start byte index 28 is not a
+/// char boundary; it is inside '案' (bytes 27..30 of string)` at chat.rs:1345)。
+/// 改走 [`ocr_snapshot_grew`] 纯字符级差分。
 async fn detect_new_reply(window_id: &str, last_known: &str) -> Result<bool> {
     let joined = ocr_right_panel(window_id).await?;
-    if joined.len() <= last_known.len() {
-        return Ok(false);
+    Ok(ocr_snapshot_grew(last_known, &joined))
+}
+
+/// 新 OCR 快照相对旧快照是否长出了实质新内容(≥3 个非边缘空白字符)。
+///
+/// 纯函数、字符级安全、绝不按字节下标切(可单测):
+/// - 新快照未变长(字节长度持平/缩短)→ 无新回复(旧语义:OCR 收缩视作无新增);
+/// - 先按**字符**求公共前缀,再取新串尾部(`char_indices().nth(common)` 落在字符
+///   边界),trim 后 ≥3 字符才算回复 —— 与旧实现 `new_part.trim().chars().count()>=3`
+///   语义一致,只是把「字节前缀假设」换成「字符前缀实测」。
+fn ocr_snapshot_grew(prev: &str, next: &str) -> bool {
+    if next.len() <= prev.len() {
+        return false;
     }
-    let new_part = &joined[last_known.len()..];
-    let trimmed = new_part.trim();
-    Ok(trimmed.chars().count() >= 3)
+    let common = prev
+        .chars()
+        .zip(next.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let new_part = match next.char_indices().nth(common) {
+        Some((idx, _)) => &next[idx..],
+        None => "",
+    };
+    new_part.trim().chars().count() >= 3
 }
 
 /// 提取窗口右侧对话显示框的最后一屏文字。
@@ -1768,5 +1792,39 @@ mod read_text_tests {
         let (same, truncated2) = tail_truncate("短文本".to_string(), 100);
         assert_eq!(same, "短文本");
         assert!(!truncated2);
+    }
+
+    // ===== 第 154 轮:OCR 快照差分字符级安全(2026-10-10 崩溃形态回归) =====
+
+    /// 精确复现实测崩溃形态:旧快照 28 字节,新快照第 28 字节落在『案』(3 字节 CJK)
+    /// 中间 —— 旧实现 `&joined[last_known.len()..]` 直接 panic,新实现必须返回判定。
+    #[test]
+    fn ocr_grow_never_panics_on_cjk_byte_boundary_crash_shape() {
+        let prev = "a".repeat(27) + "b"; // 28 字节
+        let next = "a".repeat(27) + "方案已经确定,执行即可"; // 第 28 字节起是『方』,『案』跨 27..30 形态
+        // 旧实现在此形状 panic(start byte index 28 inside '案' 的同族形态)
+        let grew = ocr_snapshot_grew(&prev, &next);
+        assert!(grew, "公共前缀 27 字符后新增 ≥3 字符,应判有新内容");
+        // 直接命中 CrashReport 原始形状:prev 长度切进 next 的『案』内部
+        let next2 = "a".repeat(25) + "上方方案已经确定";
+        let prev2 = "a".repeat(27) + "b";
+        let _ = ocr_snapshot_grew(&prev2, &next2); // 不得 panic(结果不论)
+    }
+
+    #[test]
+    fn ocr_grow_semantics_matrix() {
+        // 前缀稳定 + 实质新增 → true
+        assert!(ocr_snapshot_grew("旧内容", "旧内容新回复到这里"));
+        // 未变长 / 变短 → false
+        assert!(!ocr_snapshot_grew("旧内容比较长", "短"));
+        assert!(!ocr_snapshot_grew("一样长", "一样长"));
+        // 新增不足 3 字符 → false
+        assert!(!ocr_snapshot_grew("旧内容", "旧内容ab"));
+        // 新增全空白 → false(对齐旧 trim 判空语义)
+        assert!(!ocr_snapshot_grew("旧内容", "旧内容   \t "));
+        // 公共前缀极短(OCR 整体漂移)但新串长得多 → true(有新内容)
+        assert!(ocr_snapshot_grew("完全不同的旧文本", "全新的识别结果出现在这里,内容更多"));
+        // 空 prev + 长 next → true
+        assert!(ocr_snapshot_grew("", "对方回复出现了"));
     }
 }

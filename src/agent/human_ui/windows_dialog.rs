@@ -29,11 +29,12 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW,
-    LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetTimer, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, HMENU,
-    IDC_ARROW, STM_SETIMAGE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HWND_TOPMOST,
+    IsDialogMessageW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON,
+    BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
+    ES_MULTILINE, ES_READONLY, HMENU, IDC_ARROW, STM_SETIMAGE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WM_SETTEXT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
     WS_CHILD, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_SYSMENU,
     WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
@@ -366,6 +367,7 @@ unsafe fn apply_frames(c: &Controls, f: &Frames, geo: Geometry) {
     mv(c.cancel, f.cancel);
     mv(c.submit, f.submit);
     mv(c.extend, f.extend);
+    mv(c.copy, f.copy);
     mv(c.orig, f.orig);
     mv(c.zoom, f.zoom);
 }
@@ -771,6 +773,21 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
 
     SetTimer(hwnd, TIMER_ID, 1000, None);
     let _ = ShowWindow(hwnd, SW_SHOW);
+    // 第 154 轮:强制置 WS_VISIBLE 位。若本进程被以 STARTF_USESHOWWINDOW + SW_HIDE
+    // 启动(实测 PowerShell `Start-Process -WindowStyle Hidden` / 部分 agent harness
+    // 调度形态),**首次** ShowWindow(SW_SHOW) 会被 STARTUPINFO 的 wShowWindow 压制,
+    // 窗口创建成功却不可见(本机探针复现:IsWindowVisible=False)。SWP_SHOWWINDOW
+    // 直接改窗口样式位、不经首次 ShowWindow 通道,不受启动参数影响;TOPMOST 重申
+    // 置顶(创建时已 WS_EX_TOPMOST,此处幂等)。
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+    );
     let _ = SetForegroundWindow(hwnd);
     let _ = SetFocus(input); // 输入框初始焦点
 

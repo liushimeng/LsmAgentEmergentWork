@@ -6,6 +6,7 @@
     use crate::tui::paste::{PasteInsert, PasteRegistry, handle_paste_text};
     use super::*;
 use super::panel::panel_top_for;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_input_handler_creation() {
@@ -381,6 +382,82 @@ use super::panel::panel_top_for;
         let burst = "\n  \n".to_string();
         let all_blank = burst.chars().all(|c| c.is_whitespace() || c.is_control());
         assert!(all_blank, "全空白/换行文本应被判定为非有效突发");
+    }
+
+    // ========== 第 154 轮:击键节奏武装(粘贴第二信号,纯函数) ==========
+
+    /// 尾部 300ms 窗口内 ≥8 个字符到达 → 武装(粘贴级速率)。
+    #[test]
+    fn burst_armed_when_8_chars_within_cadence_window() {
+        let now = Instant::now();
+        // 8 个到达全部挤在尾部 300ms 窗口内(粘贴/批量排空形态)
+        let arrivals: std::collections::VecDeque<Instant> =
+            (0..8).map(|i| now - Duration::from_millis(i * 10)).collect();
+        assert!(char_burst_armed(&arrivals, now), "8 字符/300ms 应武装");
+        // 7 个不武装(阈值边界)
+        let seven: std::collections::VecDeque<Instant> =
+            (0..7).map(|i| now - Duration::from_millis(i * 10)).collect();
+        assert!(!char_burst_armed(&seven, now), "7 字符不武装");
+    }
+
+    /// 人类击键速率(≥10~12 字/秒,即字符间隔 ≥80ms)永不武装。
+    #[test]
+    fn burst_not_armed_for_human_typing_speed() {
+        let now = Instant::now();
+        // 12 字/秒连打 1.2 秒:任意 300ms 窗口内最多 4 个到达
+        let arrivals: std::collections::VecDeque<Instant> = (0..14)
+            .map(|i| now - Duration::from_millis(1200 - i * 85))
+            .collect();
+        assert!(
+            !char_burst_armed(&arrivals, now),
+            "85ms 间隔连打(≈12 字/秒)不应武装"
+        );
+    }
+
+    /// 输入静默超过窗口后武装自然解除(单行长粘贴粘完再手动 Enter 不受影响)。
+    #[test]
+    fn burst_armed_expires_after_silence() {
+        let now = Instant::now();
+        // 8 个字符确实在 300ms 内到达过,但已是 500ms 前 → 判定时刻已滑出窗口
+        let arrivals: std::collections::VecDeque<Instant> =
+            (0..8).map(|i| now - Duration::from_millis(500 + i * 5)).collect();
+        assert!(!char_burst_armed(&arrivals, now), "静默 500ms 后应解除武装");
+        // 早期到达已超 1.2s 保留期 + 最近只有零星字符:同样不武装
+        let mixed: std::collections::VecDeque<Instant> = vec![
+            now - Duration::from_millis(1100),
+            now - Duration::from_millis(1090),
+            now - Duration::from_millis(200),
+            now - Duration::from_millis(100),
+        ]
+        .into_iter()
+        .collect();
+        assert!(!char_burst_armed(&mixed, now));
+    }
+
+    /// CJK 逐字粘贴形态:每字一个到达事件,300ms 内 8 字(典型 ConPTY 分块)→ 武装。
+    #[test]
+    fn burst_armed_for_cjk_chunked_paste() {
+        let now = Instant::now();
+        // 9 行提示词首行 20 个汉字分 5 块投递,每块 4 字同刻到达
+        let arrivals: std::collections::VecDeque<Instant> = (0..5)
+            .flat_map(|chunk| {
+                (0..4).map(move |_| now - Duration::from_millis(200 - chunk * 40))
+            })
+            .collect();
+        assert_eq!(arrivals.len(), 20);
+        assert!(char_burst_armed(&arrivals, now), "分块粘贴应武装");
+    }
+
+    /// note_char_arrival 的保留期修剪:只保留最近 1.2s,队列不无限增长。
+    #[test]
+    fn note_char_arrival_prunes_old_entries() {
+        let mut q = std::collections::VecDeque::new();
+        for _ in 0..100 {
+            note_char_arrival(&mut q);
+        }
+        assert!(q.len() <= 100);
+        // 同刻记录 100 次,修剪后仍在(全部落在保留期内)
+        assert_eq!(q.len(), 100);
     }
 
     // ========== 第 94 轮:Ctrl-C 双语义验证 ==========

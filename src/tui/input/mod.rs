@@ -24,8 +24,9 @@ use crossterm::{
     style::{Print, ResetColor},
     terminal,
 };
+use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 返回 `cursor`(字节偏移,须在字符边界)前一个字符的起始字节偏移。
 ///
@@ -112,13 +113,68 @@ fn visible_window(s: &str, cursor: usize, avail: u16) -> (usize, u16) {
 // 首行的 CR 被当成用户提交意图。
 // 加宽后仍然安全:人类击键间隔 ≫100ms,单击 Enter 时队列恒空,首证据 40ms 内必返回 None,
 // 代价只是每次提交多等 ≤40ms(不可感知)。
+//
+// ★ 第 154 轮(2026-10-10 第三次同因实测事故,llaew_20261010_223313.log):
+// 40/3/20 的纯时序探测**仍会落空** —— ConPTY 分块投递的块间隔可超 100ms 有效窗口;
+// 且粘贴在任务运行期间到达时,主循环阻塞在 handle_user_input,残余行堆积 tty,
+// 任务结束后逐个行间 CR 又被当成提交,最终只活下来 1 行(实测 9 行只剩 2 行,
+// 含目标 URL 的第 3 行起整体丢失 → Agent 改派豆包桌面应用,浏览器/人工介入全程未触发)。
+// 本轮在时序探测之外补第二信号「击键节奏武装」,见 [`char_burst_armed`] 与
+// Enter 三级判定(使用点在 CompletionDecision::Submit 分支):
+//   ① 40ms 队列探测命中 → 粘贴换行(余行已在缓冲,backlog 形态);
+//   ② 未命中但武装态 → 延长观望 300ms(50ms×6 步),期间任意事件到达即判粘贴换行
+//     (ConPTY 分块滞后形态);静默则提交(人类快速连打 / tmux send-keys 两条命令
+//     的 e2e 形态,代价仅武装态提交多等 ≤300ms);
+//   ③ 均无 → 正常提交(零额外延迟)。
 
 /// Enter 突发探测:首个排队事件的等待窗口(毫秒)。
 const PASTE_BURST_PROBE_MS: u64 = 40;
-/// 队列排空后的宽限轮数(终端分块投递,每轮等 PASTE_BURST_GRACE_MS)。
-const PASTE_BURST_GRACE_ROUNDS: usize = 3;
-/// 宽限轮单轮等待(毫秒)。
-const PASTE_BURST_GRACE_MS: u64 = 20;
+/// 粘贴尾部积累:队列静默多少毫秒即收口(分块投递的块间隔兜底)。
+const PASTE_TAIL_QUIET_MS: u64 = 600;
+/// 粘贴尾部积累:总时长上限(毫秒),防异常终端无限滴流。
+const PASTE_TAIL_MAX_MS: u64 = 10_000;
+/// 粘贴尾部积累:字节上限,防超长粘贴拖垮积累循环(超过部分原样留在队列)。
+const PASTE_TAIL_MAX_BYTES: usize = 64 * 1024;
+/// 武装态 Enter 延长观望:步长(毫秒)× 步数(合计 300ms)。
+const BURST_ARMED_WATCH_STEP_MS: u64 = 50;
+const BURST_ARMED_WATCH_STEPS: usize = 6;
+
+// =================== 第 154 轮:击键节奏武装(粘贴第二信号) ===================
+
+/// 节奏武装窗口(毫秒):尾部窗口内到达 ≥ [`BURST_CADENCE_MIN_CHARS`] 个字符即武装。
+const BURST_CADENCE_WINDOW_MS: u64 = 300;
+/// 节奏武装最少字符数:300ms 内 8 字 ≈ 27 字/秒 —— 人类连击极限 ≈10~12 字/秒,
+/// IME 整词上屏 ≤6 字/短语,均不误伤;无 bracketed paste 终端的粘贴(逐键或整块)
+/// 远超此速率。
+const BURST_CADENCE_MIN_CHARS: usize = 8;
+/// 节奏记录保留时长(毫秒):超过即丢弃,武装态在输入静默 300ms 后自然解除
+/// (单行长粘贴粘完再手动按 Enter 的场景不受影响)。
+const BURST_ARRIVAL_KEEP_MS: u64 = 1_200;
+
+/// 记录一次字符到达时刻并修剪过期记录(保留最近 BURST_ARRIVAL_KEEP_MS)。
+fn note_char_arrival(arrivals: &mut VecDeque<Instant>) {
+    let now = Instant::now();
+    arrivals.push_back(now);
+    while let Some(front) = arrivals.front() {
+        if now.duration_since(*front) > Duration::from_millis(BURST_ARRIVAL_KEEP_MS) {
+            arrivals.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// 击键节奏武装判定(纯函数,可单测):尾部 [`BURST_CADENCE_WINDOW_MS`] 窗口内
+/// 到达的字符数 ≥ [`BURST_CADENCE_MIN_CHARS`] → 判定「正在粘贴」。
+fn char_burst_armed(arrivals: &VecDeque<Instant>, now: Instant) -> bool {
+    let window = Duration::from_millis(BURST_CADENCE_WINDOW_MS);
+    arrivals
+        .iter()
+        .rev()
+        .take_while(|t| now.duration_since(**t) <= window)
+        .count()
+        >= BURST_CADENCE_MIN_CHARS
+}
 
 /// 把一串已排队事件折叠为粘贴文本(纯函数,可单测):
 /// - `Key(Press) Char(c)`(无 Ctrl)→ 收 `c`;
@@ -152,26 +208,36 @@ fn burst_events_to_text(events: Vec<Event>) -> (String, Option<Event>) {
     (text, spill)
 }
 
-/// Enter 提交前探测粘贴突发:队列有后续事件 → Some(突发文本),无 → None(正常提交)。
+/// 收集粘贴突发事件(参数化窗口,`drain_paste_burst` / `watch_armed_paste_tail` 共用):
+/// - `probe_ms`:首证据等待窗口(人类单击 Enter 时队列恒空,直接 None,零感知延迟);
+/// - `quiet_ms`:队列排空后静默多少毫秒即收口(捕捉分块投递的尾部);
+/// - `max_ms`:总时长上限(自首证据起算),异常终端滴流时强制收口。
 ///
-/// 非文本事件(Ctrl 组合 / Resize 等)存入 `pending` 回吐,主循环下轮优先处理。
-///
-/// 第 94 轮修复:空文本返回 None(而非 Some(""))——避免外层代码因 `Some("")`
-/// 进入 burst 插入路径后 `continue`,既不提交也不反馈,表现为「卡死」。
-fn drain_paste_burst(pending: &mut Option<Event>) -> Option<String> {
-    // 首证据:短暂等待(人类单击 Enter 时队列恒空,直接 None,零感知延迟)
+/// 收集循环内逐次检查终端挂断(第 136 轮:`event::poll` 在 pty 关闭后恒返回 true,
+/// `event::read()` 会陷入 crossterm 内部死转);字节上限触发即收口,剩余事件留给
+/// 主循环按普通按键处理。非文本事件(Ctrl 组合 / Resize 等)存入 `pending` 回吐。
+fn drain_paste_events(
+    pending: &mut Option<Event>,
+    probe_ms: u64,
+    quiet_ms: u64,
+    max_ms: u64,
+) -> Option<String> {
+    // 首证据:短暂等待
     if !matches!(
-        event::poll(Duration::from_millis(PASTE_BURST_PROBE_MS)),
+        event::poll(Duration::from_millis(probe_ms)),
         Ok(true)
     ) {
         return None;
     }
+    let started = Instant::now();
     let mut events = Vec::new();
-    let mut grace_left = PASTE_BURST_GRACE_ROUNDS;
     loop {
         // 第 136 轮:终端挂断时 `event::poll` 会**恒返回 true**(POLLIN 一直就绪),
         // 紧接着的 `event::read()` 就进了 crossterm 的内部死转。这里提前收口。
         if crate::tui::term_guard::stdin_hangup() {
+            break;
+        }
+        if started.elapsed() > Duration::from_millis(max_ms) {
             break;
         }
         match event::poll(Duration::ZERO) {
@@ -181,13 +247,9 @@ fn drain_paste_burst(pending: &mut Option<Event>) -> Option<String> {
                 }
             }
             _ => {
-                // 队列空:宽限几轮捕捉终端分块投递的尾部
-                if grace_left == 0 {
-                    break;
-                }
-                grace_left -= 1;
+                // 队列空:静默 quiet_ms 仍无事件 → 粘贴结束
                 if !matches!(
-                    event::poll(Duration::from_millis(PASTE_BURST_GRACE_MS)),
+                    event::poll(Duration::from_millis(quiet_ms)),
                     Ok(true)
                 ) {
                     break;
@@ -195,16 +257,59 @@ fn drain_paste_burst(pending: &mut Option<Event>) -> Option<String> {
             }
         }
     }
-    let (text, spill) = burst_events_to_text(events);
+    let (mut text, spill) = burst_events_to_text(events);
     if let Some(ev) = spill {
         *pending = Some(ev);
     }
-    // ★ 第 94 轮修复:空文本(纯空白/控制字符/无文本)返回 None,触发正常提交
+    // 字节上限:回落到 ≤ 上限的最近字符边界再截(CJK 多字节安全,truncate 不落字符中间)
+    if text.len() > PASTE_TAIL_MAX_BYTES {
+        let mut idx = PASTE_TAIL_MAX_BYTES;
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        text.truncate(idx);
+    }
+    // ★ 第 94 轮修复(语义保留):空文本返回 None(而非 Some("")),避免外层因
+    // `Some("")` 进入 burst 插入路径后 `continue`,既不提交也不反馈,表现为「卡死」。
     if text.is_empty() {
         None
     } else {
         Some(text)
     }
+}
+
+/// Enter 提交前探测粘贴突发:队列有后续事件 → Some(突发文本),无 → None(正常提交)。
+///
+/// 第 154 轮:探测命中后改用**长窗口尾部积累**(600ms 静默 × 10s 上限)—— 旧实现
+/// ~100ms 宽限对 ConPTY 分块滞后会截出半份粘贴,余行再被当成普通输入污染编辑器。
+fn drain_paste_burst(pending: &mut Option<Event>) -> Option<String> {
+    drain_paste_events(
+        pending,
+        PASTE_BURST_PROBE_MS,
+        PASTE_TAIL_QUIET_MS,
+        PASTE_TAIL_MAX_MS,
+    )
+}
+
+/// 武装态 Enter 的延长观望(第 154 轮三级判定第 ② 级):首证据未在 40ms 内出现时,
+/// 按 50ms×N 步继续观望;期间任意事件到达即转入长窗口收集。全程静默 → None(提交)。
+///
+/// 与一次性 poll(300ms) 的差别:只在**有事件到达**时才转入收集,静默路径逐步提前
+/// 退出,普通快速连打后的 Enter 最多多等一个步长。
+fn watch_armed_paste_tail(pending: &mut Option<Event>) -> Option<String> {
+    for _ in 0..BURST_ARMED_WATCH_STEPS {
+        if crate::tui::term_guard::stdin_hangup() {
+            return None;
+        }
+        if matches!(
+            event::poll(Duration::from_millis(BURST_ARMED_WATCH_STEP_MS)),
+            Ok(true)
+        ) {
+            // 事件已就绪(未消费):probe=0 立即取到,转入长窗口尾部积累
+            return drain_paste_events(pending, 0, PASTE_TAIL_QUIET_MS, PASTE_TAIL_MAX_MS);
+        }
+    }
+    None
 }
 
 /// 补全菜单 + Tab/Enter 行为的决策结果(2026-09-10 第 24 轮 Enter 吞键修复)。
@@ -392,6 +497,10 @@ impl InputHandler {
         let mut mention = MentionCompletion::new();
         // 粘贴登记簿:本次行编辑期间的多行/超长粘贴原文(提交时 marker 展开为原文)
         let mut pastes = paste::PasteRegistry::new();
+        // 第 154 轮:字符到达时刻登记(击键节奏武装的第二信号数据源,见
+        // [`char_burst_armed`])—— 无 bracketed paste 终端的粘贴以超人类速率到达,
+        // 是「Enter = 粘贴换行 vs 用户提交」最可靠的判据(纯时序探测第三次实测落空)。
+        let mut char_arrivals: VecDeque<Instant> = VecDeque::new();
         // 批量合并排空时暂存的非字符事件(crossterm 无 pushback,不能丢)
         let mut pending: Option<Event> = None;
 
@@ -749,17 +858,30 @@ impl InputHandler {
                                 completion_index,
                             ) {
                                 CompletionDecision::Submit(text) => {
-                                    // 第 93 轮:无 bracketed paste 终端的多行粘贴突发 ——
-                                    // Enter 之后已有排队事件,说明本次 Enter 是粘贴的行间
-                                    // 换行而非用户提交意图;整段并入粘贴管线,不提交。
+                                    // 第 93/94/128/154 轮:无 bracketed paste 终端的多行
+                                    // 粘贴突发 —— Enter 是粘贴的行间换行而非用户提交意图
+                                    // 时,整段并入粘贴管线,不提交。
                                     //
-                                    // 第 94 轮修复:burst 无实质内容时直接提交,避免
-                                    // 「既不提交也不反馈」的卡死状态。
+                                    // 第 154 轮三级判定(纯时序探测第三次实测落空后补第二信号):
+                                    //   ① 40ms 队列探测(余行已在终端缓冲,backlog 形态);
+                                    //   ② 击键节奏武装态延长观望 300ms(ConPTY 分块滞后形态);
+                                    //   ③ 均无 → 正常提交(人类单击 Enter 队列恒空,零额外延迟)。
                                     if key.code == KeyCode::Enter {
-                                        if let Some(burst) = drain_paste_burst(&mut pending) {
-                                            // ★ 修复:burst 仅含空白/控制字符时不视为有效突发,
-                                            // 直接进入提交,避免死循环
-                                            if burst.chars().all(|c| c.is_whitespace() || c.is_control())
+                                        let armed =
+                                            char_burst_armed(&char_arrivals, Instant::now());
+                                        let burst = match drain_paste_burst(&mut pending) {
+                                            Some(b) => Some(b),
+                                            None if armed => {
+                                                watch_armed_paste_tail(&mut pending)
+                                            }
+                                            None => None,
+                                        };
+                                        if let Some(burst) = burst {
+                                            // ★ 第 94 轮修复(语义保留):burst 仅含空白/
+                                            // 控制字符时不视为有效突发,直接提交,避免死循环。
+                                            if burst
+                                                .chars()
+                                                .all(|c| c.is_whitespace() || c.is_control())
                                             {
                                                 return self.submit(
                                                     &mut stdout,
@@ -770,35 +892,42 @@ impl InputHandler {
                                                     &pastes,
                                                 );
                                             }
-                                            // 第 N 轮修复:非 bracketed paste 终端的多行粘贴。
-                                            // burst 已包含原始换行(\n),来自 burst_events_to_text
-                                            // 的 Enter 分支。不再用 format!("\n{burst}") 包裹
-                                            // ——前导 \n 会被 handle_paste_text 的 trim_matches 剔除,
-                                            // 且首行字符在 buffer 中已存在,直接拼接 burst 即可。
-                                            // burst 自身含 \n,满足 is_large(含\n)条件,走 marker 保真。
-                                            let preview = match paste::handle_paste_text(
-                                                &burst,
-                                                &mut pastes,
-                                            ) {
-                                                paste::PasteInsert::Inline(s) => {
-                                                    buffer.insert_str(cursor, &s);
-                                                    cursor += s.len();
-                                                    None
-                                                }
-                                                paste::PasteInsert::Marker(s) => {
-                                                    buffer.insert_str(cursor, &s);
-                                                    cursor += s.len();
-                                                    let content = pastes.last_content();
-                                                    let preview = paste::plan_paste_preview(
-                                                        &s,
-                                                        &content,
-                                                        textfit::term_width_for_render(),
-                                                    );
-                                                    // 第 131 轮:预览已打印 → 提交时不重复全量回显
-                                                    pastes.mark_previewed();
-                                                    Some(preview)
-                                                }
+                                            // 第 154 轮:整段 marker 化 —— 触发 Enter 前的
+                                            // buffer 作为首行前缀,与尾部全文拼成完整粘贴走
+                                            // D6 管线。旧实现只登记 burst(余行),marker 展开后
+                                            // 首行与第二行被拼成一行(分隔符随触发 Enter 一起
+                                            // 被消费);前缀拼接后 buffer 只放 marker,UX 与
+                                            // bracketed paste 路径完全一致。
+                                            let prefix = buffer.clone();
+                                            let full = if prefix.trim().is_empty() {
+                                                burst
+                                            } else {
+                                                format!("{prefix}\n{burst}")
                                             };
+                                            buffer.clear();
+                                            cursor = 0;
+                                            let preview =
+                                                match paste::handle_paste_text(&full, &mut pastes)
+                                                {
+                                                    paste::PasteInsert::Inline(s) => {
+                                                        buffer.insert_str(cursor, &s);
+                                                        cursor += s.len();
+                                                        None
+                                                    }
+                                                    paste::PasteInsert::Marker(s) => {
+                                                        buffer.insert_str(cursor, &s);
+                                                        cursor += s.len();
+                                                        let content = pastes.last_content();
+                                                        let preview = paste::plan_paste_preview(
+                                                            &s,
+                                                            &content,
+                                                            textfit::term_width_for_render(),
+                                                        );
+                                                        // 第 131 轮:预览已打印 → 提交时不重复全量回显
+                                                        pastes.mark_previewed();
+                                                        Some(preview)
+                                                    }
+                                                };
                                             overlay_lines = self.update_completion(
                                                 &mut stdout,
                                                 &layout,
@@ -958,6 +1087,7 @@ impl InputHandler {
                             // 增量按 len_utf8 推进——修复中文输入第 2 字符 panic)
                             buffer.insert(cursor, c);
                             cursor += c.len_utf8();
+                            note_char_arrival(&mut char_arrivals);
                             // D6 快速输入批量合并:IME 一次上屏多字 / 无 bracketed paste
                             // 的旧终端粘贴,会以极快的连续 Char 事件到达;排空已到达的
                             // 同类事件一次性插入,最后统一一次重绘,避免逐字重绘卡顿。
@@ -980,6 +1110,9 @@ impl InputHandler {
                                             if let KeyCode::Char(c2) = k2.code {
                                                 buffer.insert(cursor, c2);
                                                 cursor += c2.len_utf8();
+                                                // 同批排空的字符与首字符同窗口到达,
+                                                // 节奏登记一次即代表本批(粘贴整块到达)。
+                                                note_char_arrival(&mut char_arrivals);
                                             }
                                         }
                                         Ok(other) => {

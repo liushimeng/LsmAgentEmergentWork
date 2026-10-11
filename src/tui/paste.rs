@@ -95,11 +95,15 @@ impl PasteRegistry {
 
     /// 登记保真粘贴,返回输入行用 marker。
     ///
-    /// 首尾换行剔除(逐键粘贴突发会补一个前导 `\n`,提交侧本就要 trim,提前归一
-    /// 让 marker / 预览 / 回显三者与最终送进模型的文本完全一致)。
+    /// 尾部换行剔除(提交侧本就要 trim,提前归一让 marker / 预览 / 回显三者与最终
+    /// 送进模型的文本完全一致)。第 154 轮起**只 trim 尾部**:bracketed 路径的
+    /// 首部 trim 职责上移到 [`handle_paste_text`](它一直持有 trim 后的 probe),
+    /// 逐键突发路径由调用方以「首行前缀 \n 尾部全文」拼好再进来 —— register 不再
+    /// 有机会吃掉语义上有意义的首部换行(旧实现正是据此把突发路径的首行分隔符
+    /// 一并 trim 掉,展开后两行被拼成一行)。
     fn register(&mut self, content: String) -> String {
         self.counter += 1;
-        let content = content.trim_matches(['\n', '\r']).to_string();
+        let content = content.trim_end_matches(['\n', '\r']).to_string();
         let lines = content.matches('\n').count() + 1;
         let marker = if lines > 1 {
             format!("[粘贴 #{} +{} 行]", self.counter, lines)
@@ -178,14 +182,14 @@ pub(crate) enum PasteInsert {
 ///
 /// 判定前剔除首尾换行:bracketed paste 路径可能在段首尾带一个代表 Enter 的换行,
 /// 不剔就会把「一次 Enter + 一行内容」误判成多行粘贴、给短输入套上噪声 marker。
-/// burst 路径(逐键粘贴突发)的 text 由 drain_paste_burst 拼接而来,内部已含原始
-/// 换行(\n),由调用方保证首尾不含多余换行——handle_paste_text 统一 trim 后不影响
-/// burst 路径的多行判定(内部 \n 仍在)。
+/// 逐键突发路径(第 154 轮起)的 text 由调用方以「首行前缀 \n 尾部全文」拼好,
+/// 首部即用户已输入的首行、不是噪声 —— 但首行本身不含换行,统一 trim 首尾不影响
+/// 其多行判定(内部 \n 仍在)。
 pub(crate) fn handle_paste_text(text: &str, registry: &mut PasteRegistry) -> PasteInsert {
     let filtered = PasteRegistry::filter(text);
     let probe = filtered.trim_matches(|c| c == '\n' || c == '\r');
     if PasteRegistry::is_large(probe) {
-        PasteInsert::Marker(registry.register(filtered))
+        PasteInsert::Marker(registry.register(probe.to_string()))
     } else {
         // 走到这里必然不含换行(is_large 已把多行分流);制表符归一为空格 ——
         // 单行输入行的光标列号按空格换算,tab 会让列号错位。
@@ -367,6 +371,32 @@ mod tests {
             PasteInsert::Inline(s) => panic!("应转 marker,实得直插 {s}"),
         }
         assert_eq!(reg.expand("[粘贴 #1 +2 行]"), "第一行\n第二行");
+    }
+
+    /// 第 154 轮:突发路径调用方以「首行前缀 \n 尾部全文」拼接整段再进管线 ——
+    /// 展开后逐行与用户粘贴原文一致,首行与第二行之间必须有换行分隔。
+    /// (旧实现只登记尾部 burst,marker 展开后首行与第二行被拼成一行。)
+    #[test]
+    fn 突发整段拼接保留首行与后续行的分隔() {
+        let mut reg = PasteRegistry::new();
+        // 复现 2026-10-10 实测形态:9 行提示词首行在 buffer,余行在突发尾部
+        let full = "## 注意这是软件的功能测试\n#### 打开豆包官网地址\n1. 找到对话框\n2. 多轮对话";
+        let marker = match handle_paste_text(full, &mut reg) {
+            PasteInsert::Marker(m) => m,
+            PasteInsert::Inline(_) => panic!("4 行应转 marker"),
+        };
+        assert!(marker.contains("+4 行"), "marker 应标出 4 行:{marker}");
+        assert_eq!(reg.expand(&marker), full, "展开必须逐字节还原(含行分隔)");
+    }
+
+    /// 第 154 轮:register 只 trim 尾部 —— 首部换行由调用方语义负责,
+    /// 直接 register(不经 handle_paste_text)的形态不再被吃掉首部分隔。
+    #[test]
+    fn register_only_trims_trailing_newlines() {
+        let mut reg = PasteRegistry::new();
+        let marker = reg.register("首行\n第二行\n\n".to_string());
+        assert!(marker.contains("+2 行"), "{marker}");
+        assert_eq!(reg.expand(&marker), "首行\n第二行");
     }
 
     #[test]
