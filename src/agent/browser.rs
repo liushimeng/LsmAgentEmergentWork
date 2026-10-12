@@ -1,4 +1,4 @@
-//! MCP_Web_Use 工具的 CDP 浏览器驱动层(2026-09-18 第 89 轮起,
+﻿//! MCP_Web_Use 工具的 CDP 浏览器驱动层(2026-09-18 第 89 轮起,
 //! 原 Chromium-WebUse Agent 的「MCP 服务」实现,Agent 删除后由
 //! SubAgent-Work 的 MCP_Web_Use 工具调用,能力零改写保留)。
 //!
@@ -978,7 +978,15 @@ impl BrowserManager {
             .ok()
             .and_then(|v| v.value().cloned())
             .unwrap_or(Value::Null);
+        // 第 165 轮(2026-10-12 Windows 实测):CDP `setWindowBounds` 在 Windows 上
+        // **不保证**几何精确回环 —— `--device-scale-factor=1.25` 下 DIP↔物理像素
+        // 取整叠加窗口边框,实测请求 1100×700 稳定回读 1102×702(999×777 → 1001×778)。
+        // 故响应同时回 `requested` 与 `window`(实际 bounds),供 Agent/QC 对账;
+        // 判断「窗口尺寸是否到位」应以 `requested` vs `window` 的容差比较为准,
+        // 不能假设二者逐像素相等(macOS 上通常相等,Windows 上通常差 1~2px)。
         Ok(json!({
+            "requested": {"width": width, "height": height, "left": left, "top": top,
+                          "window_state": window_state},
             "window": {
                 "left": after.bounds.left,
                 "top": after.bounds.top,
@@ -1379,6 +1387,11 @@ impl BrowserManager {
         let base = tokio::fs::canonicalize(&base)
             .await
             .map_err(|e| format!("解析下载目录失败({}):{e}", base.display()))?;
+        // 第 165 轮(2026-10-12 Windows 实测):canonicalize 在 Windows 返回 verbatim
+        // 形态(`\\?\C:\...`),直接交给 Chrome `setDownloadBehavior(downloadPath=)`
+        // 会让下载**必然** `state=Canceled, received=0` —— Chrome 建不出目标文件。
+        // 交给外部进程的路径先剥离该前缀;进程内 Path 运算保持 verbatim 不受影响。
+        let base = crate::agent::tools::strip_windows_verbatim(&base);
 
         // 在同一个临界区内完成:查找页面、配置下载行为、注册全局 Browser 事件流。
         // EventStream 与 Page 都是克隆句柄,离开临界区后仍可使用;触发动作前锁已释放。

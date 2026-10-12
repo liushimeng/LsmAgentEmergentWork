@@ -58,6 +58,11 @@ impl SessionContextRunner {
         yolo_degraded: bool,
         task_level: &crate::agent::yolo::TaskLevel,
         todo_snapshot: Option<&str>, // 2026-09-22 第 112 轮:D19 持久化增强
+        // 第 165 轮(2026-10-12 实测):本次任务**结构性**终态(不含措辞判定)。
+        // 此前 prompt 只给「成功/失败」两态,模型在 Yolo 直答/拒绝时仍照抄
+        // 「✅ 成功」并把原任务目标的产物写成已交付 —— 摘要链里出现假成功,
+        // 下一轮 Yolo 注入历史摘要会把它当成既成事实。
+        terminal: &str,
     ) -> Result<SessionSummary> {
         let workflow_line = if workflow_results.is_empty() {
             "(无 WorkFlow)".to_string()
@@ -74,6 +79,7 @@ impl SessionContextRunner {
              目标: {goal}\n\
              用户输入: {user_prompt}\n\
              当前时间: {now}\n\
+             本次任务终态: {terminal}\n\
              任务档位: {level}\n\
              Plan 文档: {plan}\n\
              WorkFlow: {wf}\n\
@@ -82,6 +88,9 @@ impl SessionContextRunner {
              Yolo 降级(本进程累计): {yolo_fallback} 次\n\n\
              请按系统提示词中的 Markdown 模板输出 200 字以内的简洁摘要。\
              摘要中的「时间」与「难度」**必须**原样使用上方给定的当前时间与任务档位,禁止自行推测。\
+             **状态行必须如实反映上方「本次任务终态」**:终态是「未进入执行层」类\
+             (直接作答 / 目标待澄清)时写 `⏸ 未执行`,**禁止**写 `✅ 成功`,\
+             也不得把原任务目标的产物写成已交付;只有 WorkFlow 真正执行且全绿才写 `✅ 成功`。\n\
              若 Yolo 本次降级 = true,** 必须** 按以下规则处理标题与状态行:\n\
              - 标题不要写成「目标解析失败(已降级)」 —— 这是上游 LLM 输出格式问题,不是任务失败;\n\
              - 若 WorkFlow 全部成功:标题用原始 goal 摘要,状态行标记为「Yolo 降级 + 执行成功」;\n\
@@ -90,6 +99,7 @@ impl SessionContextRunner {
             goal = goal,
             user_prompt = user_prompt,
             now = session::now_readable(),
+            terminal = terminal,
             level = task_level.as_str(),
             plan = plan_doc.map(|p| p.display().to_string()).unwrap_or_else(|| "无".into()),
             wf = workflow_line,

@@ -184,7 +184,13 @@ async fn bash_危险命令_被拒绝且不落副作用() {
     let client = scripted(vec![
         tool_step(
             "Bash",
-            json!({"command": format!("rm -rf {}", dir.path().to_string_lossy())}),
+            // 第 165 轮:命令形态改为**跨平台必然命中**危险规则的写法。
+            // 旧写法 `rm -rf <tempdir>` 只在 macOS 上因临时目录落在 `/var/folders/...`
+            // 被 `rm ... /var` 前缀规则误打正着地拦下;Windows 临时目录是
+            // `C:\Users\...\Temp\...`,不在任何受保护目标内 → 命令被放行、金丝雀被删,
+            // 测试失败(实测 Windows 必现)。`--no-preserve-root` 本身就在拦截规则里,
+            // 且万一放行也只删一次性临时目录,副作用可控。
+            json!({"command": format!("rm -rf --no-preserve-root {}", dir.path().to_string_lossy())}),
         ),
         text_step("危险命令被拒绝,我停下了"),
     ]);

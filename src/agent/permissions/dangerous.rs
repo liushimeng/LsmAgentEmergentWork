@@ -120,6 +120,45 @@ const DESTRUCTIVE_PATTERNS_SRC: &[(&str, &str)] = &[
     // ───── fork 炸弹 ─────
     (r":\(\)\s*\{", "fork 炸弹 shell 函数"),
     (r"\bfork\(\)\s*\{", "fork 炸弹 shell 函数"),
+    // ───── Windows 破坏性命令(2026-10-12 第 165 轮 Windows 实测缺口)─────
+    // 此前规则集只有 Unix 形态,Windows 上 `rd /s /q`、`del /s`、`format` 等
+    // **零覆盖**(实测 `tests/agent_loop.rs::bash_危险命令` 在 Windows 直接放行)。
+    // 这里补齐 Windows 原生破坏性命令与 Windows 盘符/系统目录目标。
+    (r"(?i)\b(rd|rmdir)\s+(?:/[sS]\b|/[sS]\s|/[qQ]\s+/[sS]\b)", "rd /s 递归删除目录树"),
+    (r"(?i)\bdel\b[^&|;\n]*/[sS]\b", "del /s 递归删除文件树"),
+    (r"(?i)\bformat\s+[a-z]:", "format 格式化磁盘分区"),
+    (r"(?i)\bdiskpart\b", "diskpart 磁盘分区工具(可毁掉分区表)"),
+    (
+        r"(?i)\bRemove-Item\b[^&|;\n]*-(?:Recurse|ru)\b",
+        "Remove-Item -Recurse 递归删除",
+    ),
+    (
+        r"(?i)\bRemove-Item\b[^&|;\n]*-[rR]\b[^&|;\n]*-[fF]\b",
+        "Remove-Item -r -f 递归强制删除",
+    ),
+    (r"(?i)\breg\s+delete\b", "reg delete 删除注册表项"),
+    (
+        r"(?i)\btaskkill\b[^&|;\n]*/[fF]\b[^&|;\n]*/[iI][mM]\b",
+        "taskkill /f /im 强杀进程",
+    ),
+    (
+        r"(?i)\brm\s+(?:-[rRfF]+\s+|-[rRfF]+\s+-[rRfF]+\s+|--recursive\s+|--force\s+)*[a-z]:[\\/]*\s*$",
+        "rm 指向 Windows 盘符根目录,可能毁掉整个分区",
+    ),
+    (
+        r"(?i)\brm\s+(?:-[rRfF]+\s+)*%USERPROFILE%",
+        "rm %USERPROFILE% 用户主目录",
+    ),
+    (r"(?i)\brm\s+(?:-[rRfF]+\s+)*%WINDIR%", "rm %WINDIR% Windows 系统目录"),
+    (r"(?i)\brm\s+(?:-[rRfF]+\s+)*%SystemRoot%", "rm %SystemRoot% Windows 系统目录"),
+    (
+        r"(?i)\brm\s+(?:-[rRfF]+\s+)*[a-z]:[\\/]+windows\b",
+        "rm \\Windows 系统目录",
+    ),
+    (
+        r"(?i)\brm\s+(?:-[rRfF]+\s+)*[a-z]:[\\/]+program\s+files",
+        "rm \\Program Files 系统程序目录",
+    ),
 ];
 
 /// 编译后的正则表(懒加载,首次调用时编译一次)
@@ -542,6 +581,64 @@ mod tests {
         assert!(check_destructive_command("sudo apt install xxx").is_some());
         assert!(check_destructive_command("su root").is_some());
         assert!(check_destructive_command("su -").is_some());
+    }
+
+    #[test]
+    fn blocks_windows_destructive_commands() {
+        // 第 165 轮 Windows 实测缺口:此前规则集零覆盖,这些命令直接放行。
+        for cmd in [
+            r"rd /s /q C:\Users\me\AppData\Local\Temp\.tmpX",
+            r"rmdir /s C:\build",
+            r"del /f /s /q C:\data",
+            r"format D:",
+            r"diskpart /s script.txt",
+            r"Remove-Item -Recurse -Force C:\cache",
+            r"Remove-Item -r -f C:\cache",
+            r"reg delete HKLM\Software\Foo /f",
+            r"taskkill /f /im chrome.exe",
+        ] {
+            assert!(
+                check_destructive_command(cmd).is_some(),
+                "Windows 破坏性命令必须拦截: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_rm_windows_system_targets() {
+        // 与 Unix 侧「rm 根目录 / /etc / ~」对等的 Windows 目标。
+        for cmd in [
+            r"rm -rf C:\",
+            r"rm -rf C:/",
+            r"rm -rf C:",
+            r"rm -rf %USERPROFILE%",
+            r"rm -rf %WINDIR%",
+            r"rm -rf C:\Windows\System32",
+            r"rm -rf C:\Program Files\App",
+            r"rm -rf --no-preserve-root C:\Users\me\AppData\Local\Temp\.tmpX",
+        ] {
+            assert!(
+                check_destructive_command(cmd).is_some(),
+                "rm Windows 系统目标必须拦截: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_safe_windows_commands() {
+        for cmd in [
+            r"dir C:\work",
+            r"cd C:\work && dir",
+            r"Remove-Item C:\work\out.log",
+            r"del C:\work\out.log",
+            r"rd C:\work\empty_dir",
+            r"echo done",
+        ] {
+            assert!(
+                check_destructive_command(cmd).is_none(),
+                "普通 Windows 命令不得误拦: {cmd}"
+            );
+        }
     }
 
     #[test]

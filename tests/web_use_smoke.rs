@@ -347,7 +347,22 @@ async fn mcp_web_use_open_control_inspect_smoke() {
         .unwrap();
     let v = data_of(&out);
     assert_eq!(v["code"], 0, "set_window 应成功: {out}");
-    assert_eq!(v["data"]["window"]["width"], 1100, "回读窗口宽: {out}");
+    // 第 165 轮:Windows 实测 CDP setWindowBounds 不保证几何精确回环 ——
+    // device-scale-factor=1.25 下 DIP↔物理取整 + 窗口边框,请求 1100×700 稳定
+    // 回读 1102×702(999×777 → 1001×778)。断言改为容差比较并校验 requested 回显,
+    // 不假设逐像素相等(macOS 通常相等,Windows 通常差 1~2px)。
+    assert_eq!(
+        v["data"]["requested"]["width"], 1100,
+        "requested 应回显请求宽: {out}"
+    );
+    assert_eq!(
+        v["data"]["requested"]["height"], 700,
+        "requested 应回显请求高: {out}"
+    );
+    let gw = v["data"]["window"]["width"].as_i64().unwrap_or(0);
+    let gh = v["data"]["window"]["height"].as_i64().unwrap_or(0);
+    assert!((gw - 1100).abs() <= 4, "回读窗口宽偏差过大: {gw} (req 1100) {out}");
+    assert!((gh - 700).abs() <= 4, "回读窗口高偏差过大: {gh} (req 700) {out}");
 
     // sync_viewport:视口=窗口内容区(自适应渲染)
     let out = McpWebUseTool

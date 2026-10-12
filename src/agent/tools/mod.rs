@@ -139,6 +139,27 @@ pub(crate) fn normalize_windows_drive_path(p: &str) -> std::borrow::Cow<'_, str>
     std::borrow::Cow::Borrowed(p)
 }
 
+/// Windows canonicalize 产生的 verbatim 前缀剥离(`\\?\C:\...` → `C:\...`、
+/// `\\?\UNC\srv\share` → `\\srv\share`);其他平台恒等返回。
+///
+/// 背景(2026-10-12 Windows 实测):`tokio::fs::canonicalize` 在 Windows 上返回
+/// verbatim 形态,直接喂给 Chrome `Browser.setDownloadBehavior(downloadPath=)`
+/// 会让下载**必然** `state=Canceled, received=0`(Chrome 建不出目标文件,实测
+/// `tests/web_use_smoke.rs` 真浏览器冒烟整步失败)。凡是要交给**外部进程 / 浏览器
+/// API** 的路径都必须先剥离该前缀;反之留在本进程内做 `Path` 运算的路径保持
+/// verbatim 反而更安全(不受 cwd 变化影响),故不做强制全局剥离。
+pub(crate) fn strip_windows_verbatim(p: &std::path::Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        return p.to_path_buf();
+    };
+    std::path::PathBuf::from(stripped)
+}
+
 /// 工具注册表(保持注册顺序,保证 tools 列表稳定)
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
@@ -531,6 +552,29 @@ mod names_tests {
                 normalize_windows_drive_path(unchanged).as_ref(),
                 unchanged,
                 "非盘符形态不得改写: {unchanged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_windows_verbatim_removes_canonicalize_prefix() {
+        // Windows 实测事故:canonicalize 的 verbatim 路径喂给 Chrome downloadPath,
+        // 下载必然 state=Canceled/ received=0(Chrome 建不出目标文件)。
+        let cases = [
+            (r"\\?\C:\Users\me\dl", r"C:\Users\me\dl"),
+            (r"\\?\UNC\srv\share\dl", r"\\srv\share\dl"),
+            (r"\\?\D:", r"D:"),
+            (r"C:\Users\me\dl", r"C:\Users\me\dl"),
+            (r"\\srv\share\dl", r"\\srv\share\dl"),
+            ("/home/me/dl", "/home/me/dl"),
+            ("rel/dl", "rel/dl"),
+        ];
+        for (input, expected) in cases {
+            let got = strip_windows_verbatim(std::path::Path::new(input));
+            assert_eq!(
+                got.to_string_lossy().as_ref(),
+                expected,
+                "输入 {input:?}"
             );
         }
     }

@@ -271,6 +271,8 @@ impl MultiAgentOrchestrator {
                     classification.yolo_degraded,
                     &classification.task_level,
                     None,
+                    // 第 165 轮:终态如实回传,防止摘要把「待澄清」写成「✅ 成功」。
+                    "目标待澄清(未执行任何操作,已回问用户)",
                 )
                 .await?;
             stage_durations.push(StageDuration {
@@ -349,6 +351,9 @@ impl MultiAgentOrchestrator {
                         classification.yolo_degraded,
                         &classification.task_level,
                         Some(&todo_snapshot_str),
+                        // 第 165 轮:直答/拒绝走的就是本分支 —— 终态必须写「未进入
+                        // 执行层」,否则 SessionContext 会把原目标的产物写成已交付。
+                        "未进入执行层(Yolo 直接作答,未执行任何 WorkFlow)",
                     )
                     .await?;
                 let sc_elapsed_ms = sc_started.elapsed().as_millis() as u64;
@@ -536,6 +541,19 @@ impl MultiAgentOrchestrator {
                     let todo_snapshot_str = crate::agent::todo_state::global()
                         .map(|s| s.render_for_session_memory())
                         .unwrap_or_else(|| "{}".to_string());
+                    // 第 165 轮:终态如实回传(执行链路 —— 按 WorkFlow 判定结果给三态)。
+                    let wf_all_ok = !task_result.workflows.is_empty()
+                        && task_result
+                            .workflows
+                            .iter()
+                            .all(|w| w.quality_report.verdict == Verdict::Pass);
+                    let terminal = if task_result.workflows.is_empty() {
+                        "未进入执行层(零单元计划,未执行任何 WorkFlow)"
+                    } else if wf_all_ok {
+                        "执行完成(WorkFlow 全部成功)"
+                    } else {
+                        "执行失败(存在未通过的 WorkFlow)"
+                    };
                     let summary = self
                         .session_context
                         .summarize(
@@ -558,6 +576,7 @@ impl MultiAgentOrchestrator {
                             task_result.classification.yolo_degraded,
                             &task_result.classification.task_level,
                             Some(&todo_snapshot_str),
+                            terminal,
                         )
                         .await?;
                     let sc_elapsed_ms = sc_started.elapsed().as_millis() as u64;
