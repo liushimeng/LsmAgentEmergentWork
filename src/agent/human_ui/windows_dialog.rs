@@ -76,6 +76,23 @@ const IDC_MSG: i32 = 11;
 const IDC_T1: i32 = 13;
 const IDC_T2: i32 = 14;
 const IDC_INPUT: i32 = 15;
+
+/// 2026-10-12:输入框提示语。**绝不能**作为 EDIT 控件的初始窗口文本 —— 那样
+/// `GetWindowText` 会把提示语读成人工答复(见 [`read_input`] 与 submit 分支)。
+///
+/// 实测事故(`llaew_20261012_215443.log`,文心一言登录 HITL):本框此前以提示语
+/// 预填,导致输入框**永远不为空** → 无输入提交时
+/// `if !typed.is_empty()` 恒命中 → 把提示语原文当 `human_response` 回填 →
+/// SubAgent 读成「人工已完成登录操作,页面已解锁」,**凭一句 UI 提示编造了登录事实**。
+/// 注释里写明的「空输入 = 选项1『我已完成』」双语义在 Windows 上根本不可达。
+///
+/// 改用 Win10+ 原生 `EM_SETCUEBANNER`(真占位,不属于控件文本,`GetWindowText` 读不到)。
+/// macOS 侧本就用的 `setPlaceholderString:`(真占位),不受影响 —— 本条是 Windows 独有缺陷。
+const INPUT_CUE_BANNER: &str = "可输入验证码/动态码/说明;留空点选项或提交";
+
+/// `EM_SETCUEBANNER`(Win10 1809+)。置位 wParam=TRUE 显示占位符,
+/// lParam = 指向宽字符串的指针;FALSE 则清除。
+const EM_SETCUEBANNER: u32 = 0x1501;
 /// 提交按钮 / Enter(IsDialogMessage 路由)。windows crate 的 IDOK 是
 /// MESSAGEBOX_RESULT 类型,控件 ID 需 i32,取裸值。
 const IDOK_ID: i32 = 1;
@@ -615,6 +632,21 @@ fn finish(kind: &str, tag: i64) {
     }
 }
 
+/// 给 EDIT 控件设置原生占位提示(Win10 1809+)。
+///
+/// 用 `EM_SETCUEBANNER` 而非预填控件文本 —— 后者会被 `GetWindowText` 读回,
+/// 把提示语当成人工答复(2026-10-12 实测事故)。宽字符串需在调用期间保持有效,
+/// 故在此栈上持有。
+unsafe fn set_cue_banner(edit: HWND, text: &str) {
+    let wide = to_wide(text);
+    SendMessageW(
+        edit,
+        EM_SETCUEBANNER,
+        windows::Win32::Foundation::WPARAM(1),
+        windows::Win32::Foundation::LPARAM(wide.as_ptr() as isize),
+    );
+}
+
 unsafe fn read_input(input: HWND) -> String {
     let len = GetWindowTextLengthW(input);
     if len <= 0 {
@@ -622,7 +654,16 @@ unsafe fn read_input(input: HWND) -> String {
     }
     let mut buf = vec![0u16; len as usize + 1];
     let n = GetWindowTextW(input, &mut buf);
-    String::from_utf16_lossy(&buf[..n.max(0) as usize]).trim().to_string()
+    let typed = String::from_utf16_lossy(&buf[..n.max(0) as usize])
+        .trim()
+        .to_string();
+    // 2026-10-12 防御性剥离:老系统(<Win10 1809)不支持 EM_SETCUEBANNER 时,
+    // 占位符不可用(框为空) —— 不会产生误判;而若将来任何路径又把提示语写进
+    // 控件文本,这里兜底保证提示语绝不会作为人工答复外泄。
+    if typed == INPUT_CUE_BANNER {
+        return String::new();
+    }
+    typed
 }
 
 // ---------- 主流程 ----------
@@ -715,10 +756,14 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         hwnd, hinst, "STATIC", &countdown_text(0, p.timeout_ms),
         style_static(), IDC_T2, font_normal,
     );
+    // 2026-10-12:输入框以**空文本**创建,提示语走原生 EM_SETCUEBANNER。
+    // 此前把提示语预填为控件文本,导致无输入提交会把提示语当人工答复回填
+    // (详见 INPUT_CUE_BANNER 文档与 read_input 的防御性剥离)。
     let input = create_control(
-        hwnd, hinst, "EDIT", "可输入验证码/动态码/说明;留空点选项或提交",
+        hwnd, hinst, "EDIT", "",
         style_input_edit(), IDC_INPUT, font_normal,
     );
+    unsafe { set_cue_banner(input, INPUT_CUE_BANNER) };
     let mut opts = Vec::new();
     for (i, opt) in p.options.iter().enumerate() {
         opts.push(create_control(

@@ -759,33 +759,54 @@ impl BrowserManager {
     /// CDP 会话掉线(`Session with given id not found` 类)后旧实现无自愈路径,
     /// 所有 control/inspect 动作永久 2002。这里先探活(一次 target 信息往返,
     /// 不经过页面主线程),失效则按 target_id 重建句柄(见 [`Self::heal_page`])。
-    pub async fn ensure_page_alive(&self, page_id: &str) -> Option<Page> {
+    ///
+    /// 2026-10-12 返回值改为 `Result`:见 [`Self::heal_page`] 关于「页签被关」
+    /// 与「CDP 连接已死」两种失败的区分 —— 后者必须把可行动的处置指引
+    /// (重新 `open`)传上去,而不是谎称 page_id 不存在。
+    pub async fn ensure_page_alive(&self, page_id: &str) -> Result<Option<Page>, String> {
         let cached = {
             let inner = self.inner.lock().await;
             match inner.pages.get(page_id) {
                 Some(e) => e.page.clone(),
-                None => return None,
+                None => return Ok(None),
             }
         };
         if cached.url().await.is_ok() {
-            return Some(cached);
+            return Ok(Some(cached));
         }
         self.heal_page(page_id).await
     }
 
     /// 按 target_id 重建页面句柄:重开 Runtime/Network 域 + 事件监听,
     /// 高亮/管控/跟随器按实例期望态重注入(人工导航产生的新文档没有旧脚本)。
-    /// target 已不存在(标签页被关)返回 None,沿用「page_id 不存在」语义。
-    pub async fn heal_page(&self, page_id: &str) -> Option<Page> {
+    ///
+    /// 2026-10-12 返回值语义细化 —— 区分两种完全不同的失败:
+    /// - `Ok(None)`  = 标签页真的被关掉了(page_id 确实不再存在);
+    /// - `Err(reason)` = **浏览器 CDP 连接已死**(handler 已终止,命令发不出去),
+    ///   页签可能还在。这两种情况原先都被 `?` 吞成 `None`,上层一律回
+    ///   「page_id 不存在」—— 那是**假事实**,会把模型引向「页面没了」的错误结论。
+    pub async fn heal_page(&self, page_id: &str) -> Result<Option<Page>, String> {
         let mut inner = self.inner.lock().await;
-        let browser = inner.browser.as_ref()?;
-        let entry = inner.pages.get(page_id)?;
-        let target_id = entry.target_id.clone();
-        let pages = browser.pages().await.ok()?;
-        let found = pages.into_iter().find(|p| {
-            let t: String = p.target_id().clone().into();
-            t == target_id
+        let browser = inner.browser.as_ref().ok_or_else(|| {
+            "浏览器未启动(无 CDP 连接),请重新 open 目标 URL".to_string()
         })?;
+        let entry = inner.pages.get(page_id).ok_or("page_id 不存在")?;
+        let target_id = entry.target_id.clone();
+        // `browser.pages()` 失败 = CDP 连接已死(chromiumoxide 的 handler 终止后,
+        // 命令走 oneshot 会报 "send failed because receiver is gone")。
+        let pages = browser.pages().await.map_err(|e| {
+            format!(
+                "浏览器 CDP 连接已断开({e});页签可能仍在,请对该 URL 重新 `open`(可带 reuse=true)恢复会话"
+            )
+        })?;
+        // 页签确实不在了 —— 那是「page_id 不存在」,不是连接问题。
+        let found = pages
+            .into_iter()
+            .find(|p| {
+                let t: String = p.target_id().clone().into();
+                t == target_id
+            })
+            .ok_or("page_id 不存在(标签页已关闭)")?;
         let events = EventBuffer::default();
         let _ = found
             .execute(chromiumoxide::cdp::js_protocol::runtime::EnableParams::default())
@@ -811,7 +832,7 @@ impl BrowserManager {
             e.events = events;
         }
         tracing::info!(page_id, target_id, "MCP_Web_Use 页面句柄自愈成功(重建会话与管控)");
-        Some(found)
+        Ok(Some(found))
     }
 
     /// 获取页面事件缓冲(console/network 观察用)。

@@ -186,10 +186,13 @@ pub(super) async fn eval_find_center(
 pub(super) async fn ensure_page(id: &str) -> std::result::Result<chromiumoxide::Page, String> {
     // 第 159 轮:走 ensure_page_alive —— 人工地址栏导航等导致 CDP 会话掉线时,
     // 按 target_id 自愈重建句柄,而不是让后续所有动作永久失败。
-    BrowserManager::global()
-        .ensure_page_alive(id)
-        .await
-        .ok_or_else(|| "page_id 不存在".into())
+    // 2026-12:区分「标签页真被关」与「浏览器 CDP 连接已死」—— 后者要把
+    // 「重新 open 恢复会话」的处置指引如实上报,不能谎称 page_id 不存在。
+    match BrowserManager::global().ensure_page_alive(id).await {
+        Ok(Some(p)) => Ok(p),
+        Ok(None) => Err("page_id 不存在(标签页已关闭)".to_string()),
+        Err(reason) => Err(reason),
+    }
 }
 
 /// 从工具输出文本中提取 page_id(2026-09-16 第 64 轮起持续使用)。
