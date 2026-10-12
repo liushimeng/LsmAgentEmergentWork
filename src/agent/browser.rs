@@ -551,6 +551,18 @@ impl BrowserManager {
 
         let browser = inner.browser.as_ref().expect("browser initialized");
         let page = browser.new_page(url.to_string()).await?;
+        // 第 159 轮:先开域挂监听、再 goto —— 主文档的请求/响应/失败才会进
+        // Network 环形缓冲。旧顺序 goto 完成才 enable,首个文档的加载证据
+        // (状态码/blocked_reason)全部丢失,空白页只能靠猜(云智眼实测 network
+        // 事件里只有 favicon,主文档完全不可见)。
+        let events = EventBuffer::default();
+        let _ = page
+            .execute(chromiumoxide::cdp::js_protocol::runtime::EnableParams::default())
+            .await;
+        let _ = page
+            .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
+            .await;
+        spawn_event_listeners(&page, events.clone()).await;
         tokio::time::timeout(browser_timeout, page.goto(url.to_string()))
             .await
             .map_err(|_| {
@@ -569,15 +581,6 @@ impl BrowserManager {
             let _ = page.execute(params).await;
         }
 
-        // 开启 Runtime / Network 域,挂 Console / Network 事件监听(环形缓冲)
-        let events = EventBuffer::default();
-        let _ = page
-            .execute(chromiumoxide::cdp::js_protocol::runtime::EnableParams::default())
-            .await;
-        let _ = page
-            .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
-            .await;
-        spawn_event_listeners(&page, events.clone()).await;
         // 第 100 轮:headed 可视化模式注入 Agent 高亮蓝框(hidden 无窗口,注入无意义
         // 且污染 DOM 提取,跳过)。注意:浏览器已存在时以实例真实 mode 为准
         // (inner.mode),而非本次 open 请求的 mode —— 单实例复用,不新启浏览器。
@@ -618,9 +621,15 @@ impl BrowserManager {
         // ① 用户看到「先空页签后目标页签」两个页签;② 残留页后续会被
         // adopt_spawned_pages 误认领(reload 触发巡检时被收编成伪 spawned_page_id,
         // 实测 142751 日志 line 123/131)。connect 模式绝不碰用户自己的标签页。
+        //
+        // 判定用 is_noise_url(**不看标题**):刚 launch 的浏览器归 laew 全权所有,
+        // 注册表之外只可能是 Chrome 启动残留;初始标签页加载早期 URL 可能还是
+        // about:blank、标题已非空,走 is_noise_page 的标题豁免会漏杀(实测首启
+        // 双页签正是它)。真实站点 URL 永远不会命中 is_noise_url,无误伤面。
         if just_launched && !inner.connect_mode {
             if let Some(browser) = inner.browser.as_ref() {
                 if let Ok(pages) = browser.pages().await {
+                    let pages_len = pages.len();
                     let known: std::collections::HashSet<String> =
                         inner.pages.values().map(|e| e.target_id.clone()).collect();
                     let mut closed = 0usize;
@@ -630,8 +639,7 @@ impl BrowserManager {
                             continue;
                         }
                         let purl = p.url().await.ok().flatten().unwrap_or_default();
-                        let ptitle = Self::page_title(&p).await;
-                        if super::browser_noise::is_noise_page(&purl, &ptitle) {
+                        if super::browser_noise::is_noise_url(&purl) {
                             if p.close().await.is_ok() {
                                 closed += 1;
                             }
@@ -641,6 +649,12 @@ impl BrowserManager {
                         tracing::info!(
                             closed,
                             "MCP_Web_Use 首启清扫浏览器初始空标签页(只留 Agent 打开的目标页)"
+                        );
+                    } else {
+                        // 可观测性:清扫未命中也留痕,便于对账「首启是否残留多余页签」。
+                        tracing::info!(
+                            target_count = pages_len,
+                            "MCP_Web_Use 首启清扫完成(无残留初始标签页)"
                         );
                     }
                 }

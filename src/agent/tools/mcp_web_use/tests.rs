@@ -2385,3 +2385,25 @@ fn dom_tree_js_no_stray_semicolon_in_literal() {
     assert!(js.contains("NODE_LIMIT=2000"));
     assert!(js.contains("walk(document, 0)"));
 }
+
+/// inspect(dom) 根节点必须能下钻(第 160 轮):遍历起点是 document(nodeType 9),
+/// 旧模板只在 `nodeType===1`(Element)时递归 childNodes —— Document 不是 Element,
+/// 任何页面都只返回裸 #document + node_count:1,整棵树观察功能从未生效。
+#[test]
+fn dom_tree_js_document_root_descends_children() {
+    let js = super::inspect::dom_tree_js(4, 500);
+    // 下钻条件必须覆盖 Document(9) 与 DocumentFragment(11),不能只认 Element(1)
+    assert!(
+        js.contains("n.nodeType===1 || n.nodeType===9 || n.nodeType===11"),
+        "childNode 下钻条件必须含 Document/DocumentFragment,实际:\n{js}"
+    );
+    // attributes 采集仍仅限 Element(Document.attributes 为 undefined,for-of 会抛 TypeError)
+    let attr_loop = js
+        .find("if (n.nodeType===1) {")
+        .expect("应存在 Element 专属 attributes 采集分支");
+    let segment = &js[attr_loop..attr_loop + 160];
+    assert!(
+        segment.contains("n.attributes") && !segment.contains("childNodes"),
+        "attributes 采集分支不应混入 childNodes 遍历"
+    );
+}

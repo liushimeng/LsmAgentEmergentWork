@@ -592,6 +592,11 @@ pub(super) fn cap_strings(v: &mut Value, max_chars: usize) {
 /// 第 159 轮:模板里对象字面量曾写成 `attributes: {{}};` —— 字面量内出现 `;`
 /// 恒返 SyntaxError: Unexpected token ';',inspect(dom) 全量树从未成功返回过
 /// (云智眼实测 142149 日志 iter=2)。
+/// 第 160 轮:递归进 childNodes 的条件此前是 `nodeType===1`(仅 Element),而遍历起点
+/// 是 `document`(nodeType 9) —— Document 不是 Element,子树永不展开,任何页面都只
+/// 返回裸 #document + node_count:1(example.com 实测:querySelectorAll 能找到 `<a>`
+/// 而 dom 树 node_count=1)。改为 Element/Document/DocumentFragment 三类都下钻;
+/// attributes 采集仍仅限 Element(Document.attributes 是 undefined,不能进 for-of)。
 pub(super) fn dom_tree_js(max_depth: i64, node_limit: u64) -> String {
     format!(
         r#"(() => {{
@@ -609,6 +614,10 @@ pub(super) fn dom_tree_js(max_depth: i64, node_limit: u64) -> String {
                 nodes++;
                 if (n.nodeType===1) {{
                     for (const a of n.attributes) obj.attributes[a.name]=a.value;
+                }}
+                // 第 160 轮:Document(9)/DocumentFragment(11) 与 Element(1) 一样持有
+                // childNodes,都必须下钻,否则整棵树从根上就是空的。
+                if (n.nodeType===1 || n.nodeType===9 || n.nodeType===11) {{
                     const children=[];
                     for (const c of n.childNodes) {{
                         const r=walk(c, d+1); if (r) children.push(r);
