@@ -215,9 +215,9 @@ pub const NO_BROWSER_SENTINEL: &str = "NO_BROWSER";
 // `crate::agent::browser::XXX` 外部引用路径零改动。
 pub use super::browser_mode::BrowserMode;
 pub use super::browser_viewport::{
-    default_window_size, headed_window_plan, viewport_fit_plan, DEFAULT_WINDOW_H,
+    default_window_size, fill_ratio, headed_window_plan, viewport_fit_plan, DEFAULT_WINDOW_H,
     DEFAULT_WINDOW_W, HEADED_SCREEN_MARGIN, MIN_VIEWPORT_H, MIN_VIEWPORT_W, VIEWPORT_FIT_MAX_H,
-    VIEWPORT_FIT_MAX_W,
+    VIEWPORT_FIT_MAX_W, FILL_RATIO_MIN,
 };
 pub(crate) use super::browser_viewport::{
     headed_window_metrics, page_viewport_metrics, VIEWPORT_FIT_TOL,
@@ -817,8 +817,12 @@ impl BrowserManager {
             super::browser_viewport::plausible_chrome_height(ow, oh, iw, ih);
         let chrome_measured = oh - ih;
         let (aw, ah) = (f("availWidth"), f("availHeight"));
+        // 工作区原点:多屏 / 副屏左置时 availLeft/availTop 非 0,铺满时必须以它为基准。
+        let (ax, ay) = (f("availLeft"), f("availTop"));
+        let fill = !explicit_window;
         let measured = json!({
-            "screen": {"avail_width": aw, "avail_height": ah},
+            "screen": {"avail_width": aw, "avail_height": ah,
+                       "avail_left": ax, "avail_top": ay},
             "outer": {"width": ow, "height": oh},
             "inner": {"width": iw, "height": ih},
             "chrome_height": chrome,
@@ -826,6 +830,7 @@ impl BrowserManager {
             // 供 Agent / QC 判断窗口尺寸决策建立在真值还是估计值之上。
             "chrome_height_raw": chrome_measured,
             "chrome_height_fallback": (chrome - chrome_measured).abs() > 0.5,
+            "fill_ratio_before": fill_ratio(ow, oh, aw, ah),
         });
         // 第 156 轮 F2:headed 启动后把窗口带到前台。
         // 实测痛点:headed 确实拉起了 Chrome(code:0 + title 都拿到了),但项目从不
@@ -834,11 +839,11 @@ impl BrowserManager {
         // 结果 Chrome 弹在终端/编辑器后面,用户看到的就是「Agent 没启动浏览器」。
         // 纯 CDP `Page.bringToFront`,跨平台一致、零新依赖;fail-open 不影响语义。
         let activated = super::browser_window::activate_headed_window(self, page_id).await;
-        let Some((tw, th)) = headed_window_plan(ow, oh, aw, ah, chrome, !explicit_window) else {
+        let Some((tw, th)) = headed_window_plan(ow, oh, aw, ah, chrome, fill) else {
             return Ok(json!({
                 "adjusted": false,
                 "activated": activated,
-                "fill": !explicit_window,
+                "fill": fill,
                 "reason": if explicit_window {
                     "已显式指定窗口尺寸且完整落在屏幕内,保持不变"
                 } else {
@@ -848,22 +853,80 @@ impl BrowserManager {
                 "base": base,
             }));
         };
-        // 只传 width/height,不动 left/top —— 保持用户/Chrome 已有的窗口位置。
+        // 铺满时**同时给 left/top**:只改尺寸不动位置,Chrome 的初始位置(left=22,
+        // top=31 之类)会让 cap 尺寸的窗口右侧/底部越出工作区 —— 实测 3184 宽的窗口
+        // 落在 left=22 上时右缘到 3206 已超出 3200 的工作区,底部同理。用户看到的就是
+        // 「窗口没铺满」。显式指定尺寸的路径保持原位置不动(尊重调用方意图)。
+        let margin = super::browser_viewport::HEADED_SCREEN_MARGIN as i64;
+        let (tl, tt) = if fill {
+            (Some(ax.round() as i64 + margin), Some(ay.round() as i64 + margin))
+        } else {
+            (None, None)
+        };
         let applied = self
-            .set_window_bounds(page_id, Some(tw as i64), Some(th as i64), None, None, None)
+            .set_window_bounds(page_id, Some(tw as i64), Some(th as i64), tl, tt, None)
             .await?;
         // 调整尺寸后 Chrome 可能重新压回 z 序底层,复激活一次保证「调完仍然可见」。
         let activated =
             super::browser_window::activate_headed_window(self, page_id).await || activated;
+        // 复核:Chrome 可能自行 clamp(setWindowBounds 目标 1784 实际落 1769),也可能因
+        // 窗口管理器最小化等原因没吃满。回读真实外框算铺满率,低于阈值时按真实值重试
+        // 一次 —— 「铺满」是可见承诺,不能只信「已下发 setWindowBounds」。
+        let (mut ratio, mut verify) = (0.0, Value::Null);
+        if fill {
+            if let Ok(m2) = headed_window_metrics(&page).await {
+                let g = |k: &str| m2.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                let (ow2, oh2) = (g("outerWidth"), g("outerHeight"));
+                let (aw2, ah2) = (g("availWidth"), g("availHeight"));
+                let (ax2, ay2) = (g("availLeft"), g("availTop"));
+                ratio = fill_ratio(ow2, oh2, aw2, ah2);
+                verify = json!({
+                    "outer": {"width": ow2, "height": oh2},
+                    "avail": {"width": aw2, "height": ah2},
+                    "fill_ratio": ratio,
+                });
+                if ratio < FILL_RATIO_MIN {
+                    let cap_w = (aw2 - margin as f64 * 2.0).floor().max(1.0) as i64;
+                    let cap_h = (ah2 - margin as f64 * 2.0).floor().max(1.0) as i64;
+                    if ow2 < cap_w as f64 || oh2 < cap_h as f64 {
+                        let _ = self
+                            .set_window_bounds(
+                                page_id,
+                                Some(cap_w),
+                                Some(cap_h),
+                                Some(ax2.round() as i64 + margin),
+                                Some(ay2.round() as i64 + margin),
+                                None,
+                            )
+                            .await;
+                        if let Ok(m3) = headed_window_metrics(&page).await {
+                            let h = |k: &str| m3.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                            ratio = fill_ratio(h("outerWidth"), h("outerHeight"), h("availWidth"), h("availHeight"));
+                            verify["refilled"] = json!(true);
+                            verify["fill_ratio"] = json!(ratio);
+                            verify["outer"] =
+                                json!({"width": h("outerWidth"), "height": h("outerHeight")});
+                        }
+                    }
+                }
+            }
+        }
         Ok(json!({
             "adjusted": true,
             "activated": activated,
-            "fill": !explicit_window,
+            "fill": fill,
             "from": {"width": ow, "height": oh},
             "target": {"width": tw, "height": th},
+            "positioned": tl.is_some(),
             "measured": measured,
             "applied": applied.get("window").cloned().unwrap_or(Value::Null),
-            "note": "有头模式窗口已按屏幕工作区收边,保证完整可见;页面视口下限 720p、默认 1080p",
+            "fill_ratio": ratio,
+            "fill_verify": verify,
+            "note": if fill {
+                "有头模式窗口已铺满屏幕工作区并置前;页面视口随窗口自适应(下限 720p)"
+            } else {
+                "有头模式窗口已按屏幕工作区收边,保证完整可见;页面视口下限 720p"
+            },
             "base": base,
         }))
     }

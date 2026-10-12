@@ -215,6 +215,21 @@ pub fn headed_window_plan(
     }
 }
 
+/// 铺满率阈值:窗口外框占屏幕工作区的最小比例(取宽高较小者)。
+///
+/// 「铺满」是给用户的**可见承诺**,只下发 `setWindowBounds` 不等于真铺满 ——
+/// Chrome 可能自行 clamp(实测目标 1784 落 1769),也可能被窗口管理器约束。
+/// 低于此值即按回读的真实尺寸重试一次。0.97 留出工作区留边与取整余量。
+pub const FILL_RATIO_MIN: f64 = 0.97;
+
+/// 铺满率 = `min(outer_w/avail_w, outer_h/avail_h)`;任一维探测失败返回 0。
+pub fn fill_ratio(outer_w: f64, outer_h: f64, avail_w: f64, avail_h: f64) -> f64 {
+    if !(outer_w > 0.0) || !(outer_h > 0.0) || !(avail_w > 0.0) || !(avail_h > 0.0) {
+        return 0.0;
+    }
+    (outer_w / avail_w).min(outer_h / avail_h)
+}
+
 // =================== 测量(CDP evaluate,returnByValue) ===================
 
 /// 视口/内容尺寸测量 JS(fit 与截图溢出提示共用)。
@@ -235,6 +250,7 @@ pub(crate) const VIEWPORT_METRICS_JS: &str = r#"(() => {
 /// `outerWidth/outerHeight` = 窗口外框;与 inner 的差即浏览器 chrome。
 pub(crate) const HEADED_WINDOW_METRICS_JS: &str = r#"(() => ({
     availWidth: window.screen.availWidth, availHeight: window.screen.availHeight,
+    availLeft: window.screen.availLeft, availTop: window.screen.availTop,
     outerWidth: window.outerWidth, outerHeight: window.outerHeight,
     innerWidth: window.innerWidth, innerHeight: window.innerHeight,
     devicePixelRatio: window.devicePixelRatio || 1,
@@ -468,5 +484,32 @@ mod tests {
             plausible_chrome_height(1920.0, 500.0, 1920.0, 900.0),
             HEADED_CHROME_FALLBACK_H as f64
         );
+    }
+
+    // =================== 铺满率复核 ===================
+
+    /// 铺满率取宽高中较小者(短板决定观感)。
+    #[test]
+    fn fill_ratio_takes_the_weaker_axis() {
+        // 探针实测:3184×1753 窗口落在 3200×1769 工作区
+        let r = fill_ratio(3184.0, 1753.0, 3200.0, 1769.0);
+        assert!((r - 1753.0 / 1769.0).abs() < 1e-9, "应取高度比例,实际 {r}");
+        assert!(r > FILL_RATIO_MIN, "铺满率 {r} 应高于阈值");
+    }
+
+    /// 任一维探测失败 → 0(不得当成「已铺满」放行复核重试的判断依据)。
+    #[test]
+    fn fill_ratio_zero_on_failed_probe() {
+        assert_eq!(fill_ratio(0.0, 1753.0, 3200.0, 1769.0), 0.0);
+        assert_eq!(fill_ratio(3184.0, 1753.0, 0.0, 1769.0), 0.0);
+        assert_eq!(fill_ratio(-1.0, 1753.0, 3200.0, 1769.0), 0.0);
+    }
+
+    /// 用户报障形态:窗口停在启动默认 1920×1080,大屏上只占约 60% —— 必须判为未铺满,
+    /// 触发复核重试。锁死「铺满」不是只下发 setWindowBounds 就完事。
+    #[test]
+    fn fill_ratio_detects_the_reported_symptom() {
+        let r = fill_ratio(1920.0, 1080.0, 3200.0, 1800.0);
+        assert!(r < FILL_RATIO_MIN, "1920×1080 在 3200×1800 上应判未铺满,实际 {r}");
     }
 }

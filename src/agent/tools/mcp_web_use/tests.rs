@@ -1015,10 +1015,13 @@ fn parameters_has_window_and_highlight_properties() {
         "schema 应含 auto_expand_viewport 属性"
     );
     assert_eq!(p["properties"]["auto_expand_viewport"]["default"], true);
-    // 默认值文案统一 1080p(全模式),不得回退到 hidden=1440 旧口径
+    // 缺省口径已从「全模式统一 1920×1080」改为「headed 自动铺满屏幕工作区」。
+    // 锁死两点:① 不得再宣称 1080p 是缺省;② 必须写明显式传参会关闭铺满
+    // (LLM 常见误操作是照着旧文案主动传 window_width/height,结果窗口不铺满)。
     for key in ["window_width", "window_height"] {
         let d = p["properties"][key]["description"].as_str().unwrap_or("");
-        assert!(d.contains("1920") || d.contains("1080"), "{key} 描述应说明 1080p 默认");
+        assert!(d.contains("铺满"), "{key} 描述应说明缺省铺满屏幕工作区");
+        assert!(d.contains("关闭铺满"), "{key} 描述应警告显式传参会关闭铺满");
         assert!(!d.contains("hidden=1440"), "{key} 描述残留旧 hidden=1440 口径");
     }
 }
@@ -1035,9 +1038,16 @@ fn auto_expand_enabled_defaults_to_true() {
 
 #[test]
 fn open_description_mentions_viewport_fit() {
-    // 工具描述是 LLM 的第一信息源:1080p 默认 + 2K 自动扩展必须写入
+    // 工具描述是 LLM 的第一信息源:窗口铺满 + 视口自适应必须写入
     let d = McpWebUseTool.description();
-    assert!(d.contains("1920×1080") && d.contains("1080p"), "open 描述应说明全模式 1080p 默认");
+    assert!(
+        d.contains("铺满") && d.contains("fill_ratio"),
+        "open 描述应说明缺省铺满屏幕工作区并回报 fill_ratio"
+    );
+    assert!(
+        d.contains("不要") && d.contains("window_width"),
+        "open 描述应劝阻 LLM 自行传 window_width/height(会关闭铺满)"
+    );
     assert!(
         d.contains("auto_expand_viewport") && d.contains("2560×1440"),
         "open 描述应说明自动扩展到 2K"
