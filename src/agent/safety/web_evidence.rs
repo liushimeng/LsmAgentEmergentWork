@@ -82,7 +82,7 @@ pub fn detect_network_evidence_command(cmd: &str) -> bool {
 /// 双通道,与任务锚点口径对齐但更全:
 /// - 复用 [`extract_hosts_from_text`](crate::agent::safety::target_anchor::extract_hosts_from_text)
 ///   的 URL / 裸域名抽取(带 TLD 白名单);
-/// - 额外补 **IP 字面量**通道 —— `nc -z 10.255.159.58 20122`、`ping 172.27.173.6`
+/// - 额外补 **IP 字面量**通道 —— `nc -z 10.0.0.9 8080`、`ping 172.27.0.9`
 ///   这类内网诊断**不带 scheme**,裸主机通道因无 TLD 不会命中,而它们恰恰是实测事故里
 ///   Agent 用的主力命令,漏掉等于门形同虚设。
 pub fn hosts_in_command(cmd: &str) -> Vec<String> {
@@ -249,13 +249,13 @@ mod tests {
     #[test]
     fn 识别常见网络取证命令() {
         for cmd in [
-            "curl -s http://10.255.159.58:20122/",
+            "curl -s http://10.0.0.9:8080/",
             "wget https://ithome.com",
-            "nc -z -w 5 10.255.159.58 20122",
-            "ping -c 3 10.255.159.58",
-            "traceroute 10.255.159.58",
-            "curl -sk https://172.27.173.6:20518/x | head -30",
-            "echo x && nc -z 10.255.159.58 20122",
+            "nc -z -w 5 10.0.0.9 8080",
+            "ping -c 3 10.0.0.9",
+            "traceroute 10.0.0.9",
+            "curl -sk https://172.27.0.9:20518/x | head -30",
+            "echo x && nc -z 10.0.0.9 8080",
         ] {
             assert!(detect_network_evidence_command(cmd), "应识别为取证命令: {cmd}");
         }
@@ -282,12 +282,12 @@ mod tests {
     #[test]
     fn 命令行host抽取覆盖裸IP与URL() {
         // 带 scheme 的 URL
-        let hosts = hosts_in_command("curl -s -o /dev/null http://10.255.159.58:20122/");
-        assert!(hosts.contains(&"10.255.159.58".to_string()), "{hosts:?}");
+        let hosts = hosts_in_command("curl -s -o /dev/null http://10.0.0.9:8080/");
+        assert!(hosts.contains(&"10.0.0.9".to_string()), "{hosts:?}");
         // 实测事故主力形态:不带 scheme 的裸 IP(ping / nc)
-        let bare = hosts_in_command("ping -c 3 8.8.8.8 ; nc -z -w 5 172.27.173.6 20518");
+        let bare = hosts_in_command("ping -c 3 8.8.8.8 ; nc -z -w 5 172.27.0.9 20518");
         assert!(bare.contains(&"8.8.8.8".to_string()), "{bare:?}");
-        assert!(bare.contains(&"172.27.173.6".to_string()), "{bare:?}");
+        assert!(bare.contains(&"172.27.0.9".to_string()), "{bare:?}");
         // 非法 IP 片段不得被当成 host
         let bogus = hosts_in_command("curl http://1.2.3.4.5/x ; tar v1.2.3 ; echo 999.1.1.1");
         assert!(bogus.is_empty(), "{bogus:?}");
@@ -295,33 +295,33 @@ mod tests {
 
     #[test]
     fn 裸IP取证命令被拦_覆盖实测事故形态() {
-        let a = anchored(&["172.27.173.6"]);
+        let a = anchored(&["172.27.0.9"]);
         let v = check_bash_against_web_evidence(
-            "ping -c 2 -t 3 172.27.173.6 2>&1 | tail -3; nc -z -w 5 172.27.173.6 20518",
+            "ping -c 2 -t 3 172.27.0.9 2>&1 | tail -3; nc -z -w 5 172.27.0.9 20518",
             Some(&a),
             true,
         )
         .expect("裸 IP 探测应被拦");
-        assert_eq!(v.host, "172.27.173.6");
+        assert_eq!(v.host, "172.27.0.9");
     }
 
     #[test]
     fn 锚点内host的取证命令被拦() {
-        let a = anchored(&["10.255.159.58"]);
+        let a = anchored(&["10.0.0.9"]);
         let v = check_bash_against_web_evidence(
-            "curl -s -o /dev/null -w \"HTTP:%{http_code}\" http://10.255.159.58:20122/",
+            "curl -s -o /dev/null -w \"HTTP:%{http_code}\" http://10.0.0.9:8080/",
             Some(&a),
             true,
         )
         .expect("应被拦");
-        assert_eq!(v.host, "10.255.159.58");
-        assert_eq!(v.allowed_hosts, vec!["10.255.159.58".to_string()]);
+        assert_eq!(v.host, "10.0.0.9");
+        assert_eq!(v.allowed_hosts, vec!["10.0.0.9".to_string()]);
         assert!(denial_text(&v).contains("MCP_Web_Use"));
     }
 
     #[test]
     fn 锚点外host放行_开发调试不受影响() {
-        let a = anchored(&["10.255.159.58"]);
+        let a = anchored(&["10.0.0.9"]);
         // 用户任务目标是内网站点,顺手 curl 一下自己的本地服务 —— 放行
         assert!(
             check_bash_against_web_evidence("curl -s http://localhost:8080/health", Some(&a), true)
@@ -336,15 +336,15 @@ mod tests {
 
     #[test]
     fn 无锚点或无Web工具或非取证命令一律放行() {
-        let a = anchored(&["10.255.159.58"]);
+        let a = anchored(&["10.0.0.9"]);
         // 无锚点(开放任务)
         assert!(
-            check_bash_against_web_evidence("curl http://10.255.159.58:20122/", None, true)
+            check_bash_against_web_evidence("curl http://10.0.0.9:8080/", None, true)
                 .is_none()
         );
         // 无 MCP_Web_Use(没有替代路径,拦了就是死路)
         assert!(
-            check_bash_against_web_evidence("curl http://10.255.159.58:20122/", Some(&a), false)
+            check_bash_against_web_evidence("curl http://10.0.0.9:8080/", Some(&a), false)
                 .is_none()
         );
         // 非取证命令
@@ -368,9 +368,9 @@ mod tests {
 
     #[test]
     fn 超长命令截断防刷屏() {
-        let a = anchored(&["10.255.159.58"]);
+        let a = anchored(&["10.0.0.9"]);
         let long = format!(
-            "curl http://10.255.159.58:20122/ {}",
+            "curl http://10.0.0.9:8080/ {}",
             "x".repeat(500)
         );
         let v = check_bash_against_web_evidence(&long, Some(&a), true).expect("应被拦");

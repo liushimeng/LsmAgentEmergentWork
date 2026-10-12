@@ -591,7 +591,7 @@ pub(super) fn cap_strings(v: &mut Value, max_chars: usize) {
 /// inspect(dom) 全量树遍历脚本(纯函数,可单测)。
 /// 第 159 轮:模板里对象字面量曾写成 `attributes: {{}};` —— 字面量内出现 `;`
 /// 恒返 SyntaxError: Unexpected token ';',inspect(dom) 全量树从未成功返回过
-/// (云智眼实测 142149 日志 iter=2)。
+/// (内网站点实测 142149 日志 iter=2)。
 /// 第 160 轮:递归进 childNodes 的条件此前是 `nodeType===1`(仅 Element),而遍历起点
 /// 是 `document`(nodeType 9) —— Document 不是 Element,子树永不展开,任何页面都只
 /// 返回裸 #document + node_count:1(example.com 实测:querySelectorAll 能找到 `<a>`

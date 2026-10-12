@@ -409,7 +409,7 @@ async fn fit_headed_window(page_id: &str) -> Option<Value> {
 
 /// 第 161 轮:open 响应主文档健康诊断(fail-open;不命中不带字段,零噪声)。
 ///
-/// 背景(云智眼实测 llaew_20261012_160035 日志):主文档被 WAF 返回 HTTP 400 空
+/// 背景(内网站点实测 llaew_20261012_160035 日志):主文档被 WAF 返回 HTTP 400 空
 /// HTML,页面白屏;第 159 轮虽已把 Network 证据(含 loadingFailed)收进环形缓冲,
 /// 但 Agent 要自己想到 `inspect(network)` 才看得到,实测盲试 reload/wait/fetch
 /// 5 轮约 3 分钟才确认不可达。open 返回时主文档状态码已在缓冲里,当场透出
@@ -440,7 +440,7 @@ async fn page_health_field(page_id: &str, final_url: &str) -> Option<Value> {
     // 判定只看结构证据:排除 `[data-laew-agent]` 注入层(高亮框/徽标/蒙层/状态条)
     // 后仅剩 html/head/body(real ≤3)即无真实内容。**不**叠加 body.innerText
     // 文本门槛 —— 注入层文案(「LAEW Agent 控制中」等约 50 字)恒计入 innerText,
-    // 叠加会把真空页误判为非空(云智眼 400 空文档实测如此)。
+    // 叠加会把真空页误判为非空(内网站点 400 空文档实测如此)。
     let dom: Option<Value> = async {
         let page = BrowserManager::global().page(page_id).await?;
         let v = eval_js_string(

@@ -121,7 +121,7 @@
     fn build_subflow_input_propagates_pre_explore() {
         let wf = WorkFlowSpec {
             id: "wf-1".into(),
-            name: "打开云智眼并登录".into(),
+            name: "打开内网站点并登录".into(),
             steps: vec!["open 页面".into()],
             branches: vec![],
             loops: vec![],

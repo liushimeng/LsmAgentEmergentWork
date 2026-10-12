@@ -845,7 +845,7 @@ async fn act_wait(id: &str, p: &Value) -> std::result::Result<Value, String> {
             .min(120_000);
         let state = str_arg(p, "state").unwrap_or("visible");
         // 第 159 轮:箭头函数块体后紧跟 `()` 是 JS 语法错误(`async () => {{…}}()`
-        // 恒返 SyntaxError: Unexpected token '(' —— 云智眼实测 wait(selector) 从未
+        // 恒返 SyntaxError: Unexpected token '(' —— 内网站点实测 wait(selector) 从未
         // 成功过一次),必须整体括号包裹成 `(async () => {{…}})()`。
         let js = wait_selector_js(sel, timeout_ms, state);
         let found = eval_js_string(&page, &js).await?;

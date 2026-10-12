@@ -517,7 +517,7 @@ fn parse_quality_report_text_fallback(text: &str, source: AgentRole) -> Option<Q
 /// 第 99 轮:verdict / source / retryable 缺失的语义修复(serde 反序列化前的兜底,
 /// 语法修复链管不到「字段缺失」这类语义级残缺)。
 ///
-/// 实测场景(云智眼登录任务,2026-09-20):QC LLM 输出合法 JSON 但漏掉 `verdict`
+/// 实测场景(内网站点登录任务,2026-09-20):QC LLM 输出合法 JSON 但漏掉 `verdict`
 /// 字段 → `missing field 'verdict'` 反序列化失败 → fail-closed 判 Fail 白白消耗
 /// 一次局部重试预算。推断优先级:
 /// 1. `pass`(bool)→ pass/fail;

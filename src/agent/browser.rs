@@ -413,7 +413,7 @@ impl BrowserManager {
                 let builder = BrowserConfig::builder().chrome_executable(exe);
                 // 第 159 轮:全模式统一 disable_default_args + 自选参数集。
                 // chromiumoxide 的 DEFAULT_ARGS(puppeteer 同源)携带 `--enable-automation`,
-                // navigator.webdriver=true 会被 WAF 反爬(云智眼 vcm.cucloud.cn:20233 实测
+                // navigator.webdriver=true 会被 WAF 反爬(内网站点 vcm.example.com:8443 实测
                 // 瑞数形态 cookie 已种上但文档恒空:head:""/scripts:0/readyState:complete)
                 // 直接判为机器人返回空 HTML —— 剔除该旗标并叠加反检测参数。
                 // 同时固化三类实测刚需:
@@ -478,7 +478,7 @@ impl BrowserManager {
                 // `viewport: Some(Viewport::default()=800×600)`,每个 page target
                 // 初始化都会发 `Emulation.setDeviceMetricsOverride(800,600)` 把页面
                 // 视口钉死;`hide()`(老式 headless)会清掉默认视口,但我们用的
-                // `with_head()`/`new_headless_mode()` 不清 —— 实测云智眼任务 headed
+                // `with_head()`/`new_headless_mode()` 不清 —— 实测内网站点任务 headed
                 // 窗口外框 1920×1080、页面只渲染左上 800×600,右侧/下方大片空白
                 // (用户看到「白屏且显示区域没有铺满浏览器」);第 156 轮「macOS 上
                 // inner 恒 800×600 是布局时序」实为该覆盖钉死(Windows 同样中招),
@@ -581,7 +581,7 @@ impl BrowserManager {
         let page = browser.new_page(url.to_string()).await?;
         // 第 159 轮:先开域挂监听、再 goto —— 主文档的请求/响应/失败才会进
         // Network 环形缓冲。旧顺序 goto 完成才 enable,首个文档的加载证据
-        // (状态码/blocked_reason)全部丢失,空白页只能靠猜(云智眼实测 network
+        // (状态码/blocked_reason)全部丢失,空白页只能靠猜(内网站点实测 network
         // 事件里只有 favicon,主文档完全不可见)。
         let events = EventBuffer::default();
         let _ = page
@@ -729,7 +729,7 @@ impl BrowserManager {
 
     /// 获取页面(带失效自愈,第 159 轮)。
     ///
-    /// 实测事故(2026-10-12 云智眼):人工在地址栏回车导航后,Agent 对该页面的
+    /// 实测事故(2026-10-12 内网站点):人工在地址栏回车导航后,Agent 对该页面的
     /// 后续操作全面失效 —— 注册表里的 `PageEntry.page` 是一次性握手时拿到的句柄,
     /// CDP 会话掉线(`Session with given id not found` 类)后旧实现无自愈路径,
     /// 所有 control/inspect 动作永久 2002。这里先探活(一次 target 信息往返,

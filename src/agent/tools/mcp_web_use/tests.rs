@@ -621,8 +621,8 @@ fn extract_page_id_handles_non_json() {
 #[test]
 fn normalize_web_url_trims_trailing_slash_and_fragment() {
     assert_eq!(
-        normalize_web_url("http://10.255.159.58:20122/"),
-        "http://10.255.159.58:20122"
+        normalize_web_url("http://10.0.0.9:8080/"),
+        "http://10.0.0.9:8080"
     );
     assert_eq!(
         normalize_web_url("http://a.com/page#top"),
@@ -1708,8 +1708,8 @@ fn option_pick_answer_shape_detection() {
 #[test]
 fn url_origin_extracts_and_rejects_special_schemes() {
     assert_eq!(
-        url_origin("http://10.255.159.58:20122/OrganManagement").as_deref(),
-        Some("http://10.255.159.58:20122")
+        url_origin("http://10.0.0.9:8080/OrganManagement").as_deref(),
+        Some("http://10.0.0.9:8080")
     );
     assert_eq!(url_origin("https://a.com/x?y=1").as_deref(), Some("https://a.com"));
     // 默认端口归一(url crate 语义:80/443 省略)
@@ -2357,7 +2357,7 @@ fn select_dropdown_in_spawn_page_whitelist() {
 
 /// wait(selector) 脚本必须整体 `(async () => …)()` 包裹。
 /// 旧模板 `async () => {…}()` 是 JS 语法错误(箭头函数块体后紧跟调用括号),
-/// 云智眼实测每次 wait(selector) 都 2002 SyntaxError: Unexpected token '('。
+/// 内网站点实测每次 wait(selector) 都 2002 SyntaxError: Unexpected token '('。
 #[test]
 fn wait_selector_js_is_wrapped_arrow_call() {
     let js = super::control::wait_selector_js("input[type=text]", 30_000, "visible");
@@ -2483,17 +2483,20 @@ async fn real_browser_viewport_fills_window() {
     mgr.shutdown().await;
 }
 
-/// 云智眼真站点回归:视口铺满 + page_health 与页面真实状态自洽。
+/// 真站点回归:视口铺满 + page_health 与页面真实状态自洽。
 /// 服务器行为可能变化(某天放行 200),故断言写成条件式:页面空白 ⇒ 必须报
 /// page_health(reason ∈ {main_doc_error, empty_dom});页面有真实内容 ⇒ 不带该字段。
+/// 目标 URL **不写死在仓库里**(内网/客户站点属敏感信息),由环境变量
+/// `LAEW_REAL_SITE_URL` 提供;未设置时退回公网 example.com(仅验证视口铺满)。
 #[tokio::test]
 #[ignore = "需要网络 + 本机真实 Chrome(headed 会弹窗口);本地手动跑"]
-async fn real_browser_yunzhiyan_viewport_and_page_health() {
+async fn real_browser_site_viewport_and_page_health() {
     let mgr = BrowserManager::global();
-    let url = "https://vcm.cucloud.cn:20233/yunzhiyan-manager/login";
+    let url = std::env::var("LAEW_REAL_SITE_URL")
+        .unwrap_or_else(|_| "https://example.com/".to_string());
     let (pid, _, final_url) = mgr
         .new_page(
-            url,
+            &url,
             BrowserMode::Headed,
             None,
             None,
@@ -2502,7 +2505,7 @@ async fn real_browser_yunzhiyan_viewport_and_page_health() {
             crate::agent::browser_overlay::PageGuardConfig::open(),
         )
         .await
-        .expect("打开云智眼登录页失败(网络不可达?)");
+        .expect("打开内网站点登录页失败(网络不可达?)");
     let page = mgr.page(&pid).await.expect("page 句柄");
     // 视口铺满断言(与服务器是否放行无关)。
     let v = page
@@ -2513,10 +2516,10 @@ async fn real_browser_yunzhiyan_viewport_and_page_health() {
         .cloned()
         .expect("测量结果为空");
     let (w, h) = (v["w"].as_f64().unwrap_or(0.0), v["h"].as_f64().unwrap_or(0.0));
-    println!("云智眼页面视口 {w}×{h}");
+    println!("内网站点页面视口 {w}×{h}");
     assert!(
         w >= 1600.0 && h >= 800.0,
-        "云智眼页面视口应铺满窗口内容区,实测 {w}×{h}"
+        "内网站点页面视口应铺满窗口内容区,实测 {w}×{h}"
     );
     // page_health 自洽性断言:排除注入层后的真实 DOM 元素数决定期望。
     let real = page
