@@ -63,8 +63,7 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 信号已触发后的强制退出宽限期。
 ///
-/// 实测正常 Ctrl-C 取消到进程退出约 2s(`testReport/run_e2e.sh` 第 10 节:
-/// 「总耗时 2s < 6s」),10s 是它的 5 倍余量,既能容忍慢速任务收尾,
+/// 实测正常 Ctrl-C 取消到进程退出约 2s,10s 是它的 5 倍余量,既能容忍慢速任务收尾,
 /// 又能让 `kill` 在可感知的短时间内真正生效。
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
@@ -333,7 +332,7 @@ mod tests {
 
     #[test]
     fn shutdown_grace_is_longer_than_observed_cancel_latency() {
-        // 实测 Ctrl-C 取消到退出约 2s(run_e2e.sh 第 10 节),宽限期必须显著大于它,
+        // 实测 Ctrl-C 取消到退出约 2s,宽限期必须显著大于它,
         // 否则会截断正常任务的收口
         assert!(
             SHUTDOWN_GRACE > Duration::from_secs(2) * 2,

@@ -11,7 +11,7 @@ rem   rebuild_restart_app.bat --debug --force
 rem
 rem Output:
 rem   laew.exe                 binary (overwrite; old one renamed first to bypass run-lock)
-rem   testReport\build.log     build log (UTF-8)
+rem   logs\build.log            build log (UTF-8)
 rem
 rem Implementation rules (hard-won, read before editing):
 rem   * Keep this file PURE ASCII + CRLF. cmd.exe mis-parses batch files that
@@ -49,8 +49,8 @@ echo [rebuild] root dir : %ROOT_DIR%
 echo [rebuild] profile  : %PROFILE%
 if "%FORCE%"=="1" echo [rebuild] force    : --force - touch build.rs to defeat cargo cache
 
-if not exist "testReport" mkdir "testReport"
-set "LOG_FILE=testReport\build.log"
+if not exist "logs" mkdir "logs"
+set "LOG_FILE=logs\build.log"
 
 rem ---------- 1) --force: touch build.rs to defeat cargo incremental cache ----------
 if "%FORCE%"=="1" (

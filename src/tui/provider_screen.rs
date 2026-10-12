@@ -2,7 +2,8 @@
 //!
 //! 职责:把 /provider list|add|del 命令接入 engine 的 Screen 栈
 //! (alternate screen + raw mode),Toast 在 leave_alt 之后回主屏输出;
-//! 非 TTY(管道 / e2e)回退 print 输出,保证 run_e2e.sh 兼容。
+//! 非 TTY(管道 / 重定向)回退 print 输出。副作用:子屏行为无法用 `cargo test` 覆盖,
+//! 需人工或 tmux 验证(见 CLAUDE.md「自动化测试 · TUI 子屏仍需 tmux」)。
 
 use anyhow::Result;
 

@@ -60,7 +60,7 @@ All code in this repository is auto-written by AI Agents:
 
 - **No hand-coding**: No human programmer wrote a single line of Rust / TOML / Shell / Markdown.
 - **Agent collaboration**: Split into multiple SubAgent responsibility lines (architecture, TUI, tools, protocols, testing, docs), each working independently and auto-committing.
-- **Self-testing & self-fixing**: Agents auto-run `cargo test` and `bash testReport/run_e2e.sh`, then locate, fix, and regression-test bugs.
+- **Self-testing & self-fixing**: Agents auto-run `cargo test` (unit + integration), then locate, fix, and regression-test bugs.
 - **Self-deployment**: `rebuild_restart_app.sh` is Agent-written — one command for `cargo build --release` → copy `./laew` → restart.
 - **Continuous iteration**: `CLAUDE.md` records massive Agent lessons, each auto-written after an Agent stumbles — future Agents auto-load them to avoid repeating mistakes.
 - **Knowledge base**: 80+ research documents / ~160k lines under `docs/`, all Agent-produced.
@@ -137,7 +137,7 @@ Yolo ──→ Classify: simple / medium / hard
 | 💾 Database | rusqlite (SQLite, `LsmAgentEmergentWork.db`) |
 | 🌐 HTTP | reqwest (Anthropic / OpenAI dual-protocol clients) |
 | 📡 Protocol | Anthropic Messages + OpenAI Chat Completions (unified message model `llm/mod.rs`) |
-| 🧪 Testing | `cargo test` unit + `testReport/run_e2e.sh` e2e (mock LLM + tmux sub-screen automation) |
+| 🧪 Testing | `cargo test` unit + integration (in-process mock LLM + real CLI / real binary) |
 
 ---
 
@@ -264,9 +264,9 @@ LsmAgentEmergentWork/
 │       ├── theme.rs         # ANSI colors / mask_key desensitization
 │       └── screen/          # ProviderList / ProviderForm / ProviderDel sub-screens
 ├── docs/                    # Knowledge base: 15 projects / 108+ dimensions / 635+ gaps
-├── testReport/              # Automated test reports + run_e2e.sh
+├── tests/                   # Cargo integration tests (support fixtures + feature tests)
 ├── tmpPlan/                 # Temporary plans during coding (not committed)
-├── scripts/                 # Helper scripts (mock_llm_server.py)
+├── scripts/                 # Helper scripts (mock_mcp_server.py)
 ├── rebuild_restart_app.sh   # One-command rebuild
 ├── CLAUDE.md                # Agent entry docs + massive lessons
 └── AGENTS.md                # Engineering entry docs (= CLAUDE.md)
@@ -282,21 +282,25 @@ Two testing layers:
 
 | Layer | Entry | Purpose |
 |-------|------|------|
-| Unit tests | `cargo test` | Rust function-level coverage (modules, parsing, conversion, tools) |
-| E2E (CLI) | `bash testReport/run_e2e.sh` | mock LLM, runs `-p` / `provider` / protocol wire / project context injection / TUI sub-screen tmux automation |
+| Unit tests | `cargo test --lib` | Rust function-level coverage (modules, parsing, conversion, tools) |
+| Integration tests | `cargo test --test <name>` | Dual-protocol wire / Agent main loop / real CLI / five-level project context chain |
 
-### TUI Sub-Screen Automation (tmux control-mode)
+Integration tests live in `tests/`: `support/mod.rs` provides an in-process mock LLM server (real HTTP + SSE, OS-assigned port), with `protocol_wire.rs` / `agent_loop.rs` / `cli_provider.rs` / `project_context.rs` as feature tests.
+
+### TUI Sub-Screen Verification (tmux control-mode, manual)
+
+`cargo test` cannot cover sub-screens — under non-TTY they fall back to print output rather than real rendering. Verify manually with tmux:
 
 ```bash
 # Start background session with TUI, fixed 100x30
-tmux new-session -d -s laew_e2e -x 100 -y 30 ./laew
+tmux new-session -d -s laew -x 100 -y 30 ./laew
 # Send keys
-tmux send-keys -t laew_e2e -l "/provider list"
-tmux send-keys -t laew_e2e Enter
+tmux send-keys -t laew -l "/provider list"
+tmux send-keys -t laew Enter
 # Capture pane for assertion
-tmux capture-pane -p -t laew_e2e | grep -F "/provider list"
+tmux capture-pane -p -t laew | grep -F "/provider list"
 # Cleanup
-tmux kill-session -t laew_e2e
+tmux kill-session -t laew
 ```
 
 > See `docs/TUI自动化测试/` for details.

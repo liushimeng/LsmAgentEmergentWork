@@ -8,7 +8,7 @@
 #   近 10 天变更感知 → 知识库随机选条(10~100 条,优先 bash/编程) → TestWorkSpace/
 #   下 laew -debug 实测 Agent 能力 → 问题汇总落盘 tmpPlan/ 方案 → 按方案修码
 #   → cargo test + rebuild + e2e 回归 → git 中文提交推送(冲突自解) → 清理
-#   中间产物」全流程闭环；不再产出 testReport/ 问题报告，全程 bypass 权限。
+#   中间产物」全流程闭环；不再产出问题报告，全程 bypass 权限。
 #
 # 与旧脚本的关系（2026-09-12 重构合并，旧脚本已删除）：
 #   AutoTestAndSaveReport —— 只测不改产报告   ─┐

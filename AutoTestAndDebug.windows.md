@@ -16,11 +16,10 @@
   - Python 命令为 `python`（无 `python3`）；临时目录用 `%TEMP%` 而非 `/tmp`。
 - **产物路径**（时间戳 `YYYY-MM-DD` 或 `YYYYMMDD_HHMMSS`）:
   - 测试与优化方案: `tmpPlan/YYYY-MM-DD_NN-<主题>测试与优化方案.md`（文件名自定义，含日期；本轮核心交付物）
-  - e2e 原始输出: `testReport/e2e-<时间戳>.txt`（run_e2e.sh 自产，不入库）
+  - 测试原始输出: `cargo test` 终端输出（不入库）
   - 调试报告: `DebugReport/debug_report_*.md`（laew -debug 自产，不入库）
-- **不再生成问题报告**: 本流程**不产出** `testReport/自动化测试报告_*.md`；测试发现的问题
-  一律进入 `tmpPlan/` 方案文档（`tmpPlan/`、`testReport/`、`DebugReport/`、`TestWorkSpace/`
-  均被 `.gitignore` 忽略，产物仅留本地，不污染 git 工程）。
+- **不再生成问题报告**: 测试发现的问题一律进入 `tmpPlan/` 方案文档（`tmpPlan/`、`logs/`、
+  `DebugReport/`、`TestWorkSpace/` 均被 `.gitignore` 忽略，产物仅留本地，不污染 git 工程）。
 
 ---
 
@@ -135,10 +134,11 @@
      优化建议）是否完整合理；
    - 日志信息、输出信息中的异常（错误堆栈、乱码、重复刷屏）。
 4. **TUI 界面观察**：**Windows 无 tmux，本项 SKIP**（在测试矩阵中记 SKIP 即可，
-   **SKIP 条目不得标 ✅**）；tmux 自动化用例（run_e2e.sh 第 8 节）同样自动 SKIP，不影响其余节。
+   **SKIP 条目不得标 ✅**）。子屏自动化已无 e2e 承载，需人工 tmux 验证（见 CLAUDE.md
+   「自动化测试 · TUI 子屏仍需 tmux」）。
 5. **Provider 依赖与降级**：实测依赖根目录 DB 的激活 provider（真实 LLM 网关）。
-   - provider/网络不可用 → 可降级本地 mock（`python scripts/mock_llm_server.py <空闲端口>`，
-     **避开 18899/18990**，用后清理），或该条记「环境问题 SKIP」——**SKIP 条目不得标 ✅**；
+   - provider/网络不可用 → 该条记「环境问题 SKIP」——**SKIP 条目不得标 ✅**。
+     （自动化测试已不依赖外部 mock：集成测试自带进程内 mock LLM，端口由 OS 分配。）
    - 每条执行加 `timeout` 兜底（见上），防 laew 卡死拖垮整轮。
 
 ## §4 问题汇总与方案落盘（≤ 5 min）
@@ -169,14 +169,12 @@
    ```bash
    cargo test 2>&1 | tail -30
    ./rebuild_restart_app.bat            # 必须走脚本重编译输出根目录 laew.exe
-   bash testReport/run_e2e.sh 2>&1 | tail -40
    ```
    - `rebuild_restart_app.bat` 为 Windows 版编译脚本（`--debug` 可选 debug 构建）；若在
      Git Bash 内调用，写法 `cmd //c rebuild_restart_app.bat` 或直接执行同名 `.sh`；
-   - e2e 经 Git Bash 执行（`bash testReport/run_e2e.sh`）：mock LLM 监听 **18899 端口**，
-     **tmux 第 8 节在 Windows 自动 SKIP，不影响其余节通过**；
-   - e2e 独占资源：跑前 `netstat -ano | findstr 18899` 查残留，**有则等其退出，
-     不得 kill 他人进程**；
+   - 无独占资源：集成测试的 mock LLM 跑在测试进程内、端口由 OS 分配；
+   - 注意 `tests/cli_provider.rs` 需 `std::os::unix` 之外的分支同样可用（脚本已处理执行位），
+     Windows 上临时目录由 `tempfile` 分配；
    - 失败回修直至通过（计入本阶段时间盒）；修不动则方案文档标注「待人工」，不得谎报通过；
    - 未改 `src/` 只改测试基建时，rebuild 仍须跑通。
 4. **修复后复测**：把 §3 中因该问题 FAIL 的条目重跑 1 次，确认转 PASS。
@@ -226,6 +224,6 @@
 - **报告自包含**：结论、数据、证据写全——方案文档是唯一交付物，读者不会回放你的会话；
   引用输出摘录关键行即可。
 - **客观性**：一切结论基于命令真实输出，禁止臆断；`cargo build` 失败不终止整轮，降级静态分析。
-- **资源独占**：18899 端口不可与其它进程共享；他人 mock 进程只等不 kill。
+- **资源**：集成测试端口由 OS 分配，无需独占；他人进程绝不 kill。
 - **git 只提交自己的变更**：并行会话常态存在，别人的文件/暂存绝不操作。
 - 方案文档确认落盘、git 提交推送完成后，本轮任务即完成，直接结束会话，无需执行任何其它脚本。

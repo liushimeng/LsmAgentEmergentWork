@@ -29,11 +29,10 @@ TUI 支持：
 ```bash
 ./rebuild_restart_app.sh      # cargo build --release → 拷贝 ./laew 到根目录(改代码后必跑);支持 --debug
 cargo build                  # 快速编译检查
-cargo test                   # 单元测试
-bash testReport/run_e2e.sh               # 端到端全量(mock LLM,无需真实 Key;231 断言 ~65s,含 TUI 子屏 tmux 自动化)
-bash testReport/run_e2e.sh --list        # 列出 41 个小节(脚本已按小节拆分,见「自动化测试」)
-bash testReport/run_e2e.sh --only '4q|8' # 只跑匹配小节(前缀正则;收尾自动打印最慢 Top10 耗时)
-bash testReport/run_e2e.sh --skip '8'    # 跳过匹配小节(§8 tmux 占全量 39s,日常改后端可跳过)
+cargo test                               # 单元 + 集成测试全量
+cargo test --lib                         # 只跑单元测试
+cargo test --test protocol_wire          # 只跑某个集成测试文件
+cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 ./laew --version             # 版本 + 编译时间 + git hash
 ./laew --help                # CLI 指南
 ./laew                       # TUI 交互模式
@@ -365,7 +364,7 @@ config/            全局配置:mod.rs / agent_memory.rs(agent_memory DAO) / age
 - **人工介入 `/hitl` 应急通道**：弹窗接管期间 TUI 此前**完全不读 stdin**，弹窗一旦屏外/被遮挡/进程卡住就是 120s 死等。现并联一条**只认 `/hitl` 前缀**的行读（`tui/hitl_view.rs::read_hitl_escape_answer` + `HumanAssistHub::respond_via_tui_escape` + 事件 `AssistEvent::TuiEscapeAnswered`）：`/hitl 2t6x` 文本应答、`/hitl 3` 选项 3、`/hitl cancel` 取消，映射规则与既有行读完全一致；**其它任意输入行丢弃并提示**，绝不与弹窗抢应答。
 - **REPL 主屏**：保留 `InputHandler` 单行输入 + 斜杠命令补全 + 多轮对话。**粘贴保真**：bracketed paste 整体接收；**≥2 行粘贴一律转 `[粘贴 #N +M 行]` marker 保真**（原文含换行入登记表，不再把换行压成空格——旧「>10 行才转」规则会让 3~8 行 Markdown 提示词在屏幕上只剩一行、送进模型也丢掉列表结构），注册后立刻在滚动区回显原文预览（前 4 行 + 「其余 N 行未显示」），提交时按**展开版**逐行完整回显（首行 `>> `、续行 `.. `、超 20 视觉行折叠并标注「内容已完整发送」）；单份 >10000 字符截断为首尾各 500 + 省略标注+ 快速输入批量合并（IME/旧终端粘贴逐字重绘优化）+ Enter 提交前**三级粘贴判定**（：40ms 队列探测 → 击键节奏武装态延长观望 300ms → 正常提交；无 bracketed paste 的 Windows 终端多行提示词被逐行拆成多次提交的根治 — 见 `tui/input/mod.rs::drain_paste_burst` 与「无 bracketed paste 终端多行粘贴三缺陷根治」条目）。
 - **子屏（Modal）**：`engine.rs` 的 Screen 栈接管 `/provider *` 系列，进入 alternate screen + 原始模式，Esc 退回主屏。
-- **非 TTY 回退**：stdin 不是终端时（管道 / e2e），子屏与主屏都回退到 print 输出，保证 `run_e2e.sh` 兼容。
+- **非 TTY 回退**：stdin 不是终端时（管道 / 重定向），子屏与主屏都回退到 print 输出。副作用是**子屏行为无法用 `cargo test` 覆盖**（见「自动化测试 · TUI 子屏仍需 tmux」）。
 
 ### 斜杠命令
 
@@ -451,7 +450,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/TUI界面与CLI渲染引擎/` — 独立 CLI 渲染引擎 + Tab 表单 + `/provider` 系列交互（01-产品设计 / 02-技术设计 / 03-Tab表单与Provider操作设计）
 - `docs/TUI交互优化与-f命令设计.md` — TUI 自动补全与 `-f` 文件参数的产品和技术设计
 - `docs/TUI输入处理常见陷阱与修复记录.md` — 大粘贴防护 / 焦点守卫 / 多行提交等
-- `docs/TUI自动化测试/` — TUI 子屏自动化测试方案：**tmux control-mode** 真 PTY 渲染
+- `docs/TUI自动化测试/` — TUI 子屏**人工**验证手法（tmux control-mode 真 PTY）；自动化载体已删，文首有作废抬头
 - `docs/TUIMarkdown富文本渲染/` — TUI Markdown 渲染设计
 
 **Agent 设计**：
@@ -504,92 +503,62 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 
 ## 自动化测试
 
-测试分三层，放在 `testReport/` 下：
+**全部测试都是 Rust 代码级测试，统一用 `cargo test` 跑。** 原 shell 端到端脚本
+(`testReport/run_e2e.sh` + `scripts/mock_llm_server.py`) 已整体删除。
 
-| 层             | 入口                            | 用途                                                                             |
-| -------------- | ------------------------------- | -------------------------------------------------------------------------------- |
-| 单元测试       | `cargo test`                    | Rust 函数级覆盖（模块、解析、转换、工具）                                          |
-| 端到端(CLI)    | `bash testReport/run_e2e.sh`（支持 `--list`/`--only`/`--skip`/`--timing`/`--keep-artifacts`） | mock LLM，跑 `-p` / `provider add·list·use·delete` / 协议 wire 校验 / **项目上下文注入(说明文件五级链,5b 节)** / TUI 管道冒烟 / **TUI 子屏 tmux 自动化** |
-| TUI 子屏自动化 | `testReport/run_e2e.sh` 第 8 节 | tmux control-mode 真 PTY 渲染，验证 alternate screen + raw mode + Screen::title |
+| 层 | 入口 | 用途 |
+| --- | ---- | ---- |
+| 单元测试 | `cargo test --lib` | Rust 函数级覆盖（模块、解析、转换、工具） |
+| 集成测试 | `cargo test --test <name>` | 跨模块的功能测试，见下表 |
 
-### e2e 选节工作流（改什么跑什么）
+### 集成测试布局（`tests/`）
 
-全量 231 断言约 65s，其中 §8 TUI 子屏自动化（tmux）独占 ~39s。改后端 / 改提示词时
-没必要等它：
-
-```bash
-bash testReport/run_e2e.sh --list              # 先看有哪些小节
-bash testReport/run_e2e.sh --only '4q|5e'      # 只跑 Main-Work 编排层 + 浏览器链路
-bash testReport/run_e2e.sh --skip '8'          # 跳过 tmux 段（改 Rust 逻辑时）
-bash testReport/run_e2e.sh --timing            # 额外打印逐小节耗时表
-bash testReport/run_e2e.sh --keep-artifacts    # 保留 mock 抓包 jsonl 供事后对账
-```
-
-小节以 `# --- N. 标题 ---` 注释行分隔，`--only/--skip` 是**前缀正则**（`4` 会同时命中
-`4b`~`4q`，要精确请写 `'4q'`）。默认收尾即打印最慢 Top10，用它决定下次跑哪几节。
-注意过滤会跳过小节正文，跨小节共享的变量（§3 建的 `ID_A`/`ID_O`、§8 依赖的 `mockA`
-记录）可能缺失 —— 只跑单节时确认前置依赖已就位。产物默认自动清理（全通过即删本轮
-抓包 jsonl，开工前只留最近 3 轮，`LAEW_E2E_KEEP_RUNS` 可调），`--keep-artifacts`
-或出现 FAIL 时保留并在汇总打出路径。
-
-### e2e 脚本结构（按小节拆分）
-
-`run_e2e.sh` 由 2500+ 行单文件按小节拆成四层，新增用例**只加 `lib/sections/` 下的一个文件**，
-不要往入口脚本里堆：
-
-| 文件 | 职责 |
+| 文件 | 覆盖 |
 | ---- | ---- |
-| `testReport/run_e2e.sh` | 入口：参数解析 + `--list` + 小节筛选调度 + 收尾（约 80 行） |
-| `testReport/lib/harness.sh` | 前奏：产物路径 / 并发锁 / mock 端口探测 / 计时与断言 helper / 沙箱引导 |
-| `testReport/lib/summary.sh` | 收尾：汇总 + 耗时表 + 产物清理 + 退出码 |
-| `testReport/lib/sections/NNN-<id>.sh` | 41 个小节，文件名 = **执行序号-小节 id**（`ls \| sort` 即执行顺序） |
+| `tests/support/mod.rs` | **公共夹具**：进程内 mock LLM 服务（真实 HTTP/SSE，按协议出帧）、抓包模型、断言助手。取代原 `mock_llm_server.py` |
+| `tests/protocol_wire.rs` | 双协议 wire 契约：端点补全、认证头、body 形态、tools schema 差异、`metadata.user_id`、`cache_control` 断点、逐角色 User-Agent |
+| `tests/agent_loop.rs` | Agent 主循环功能：工具调用闭环、结果保序回填、Bash 危险命令 fail-closed、提示注入告警、ReAct 无进展止损、角色工具面收窄 |
+| `tests/cli_provider.rs` | 真实二进制 CLI：`provider` / `mcp` 增删列切、导入导出、空库引导 |
+| `tests/project_context.rs` | 项目说明文件五级发现链 + 注入幂等 |
+| `tests/web_use_smoke.rs` | MCP_Web_Use 真浏览器冒烟（默认 `#[ignore]`，需本机装 Chrome） |
+| `tests/macos_ax_smoke.rs` | macOS Accessibility 冒烟（依赖宿主 TCC 授权） |
+| `tests/browser_watchdog.rs` | 浏览器子进程回收 |
 
-每个小节文件首行保留 `# --- N. 标题 ---` 标记，`--list` / `--only` / `--skip` 的 id 与标题
-都从这里解析（前缀正则，`--only` 优先于 `--skip`，与拆分前的 awk 自改写过滤语义一致）。
+### 写集成测试的规矩
 
-**两个坑**：
+1. **不打桩生产类型**。`protocol_wire.rs` 跑真实协议客户端打真实 HTTP，`agent_loop.rs`
+   跑真实 `Agent` 循环与真实工具 —— mock 只决定「模型这一轮说什么」。
+   打桩 `LlmClient` 只在**纯循环语义**（回填顺序、止损轮数）时才用。
+2. **一律用绝对路径**。进程 cwd 是全局量，集成测试默认并行，依赖它会与 Bash 工具
+   子进程的 `current_dir` 抢出竞态（同 `src/agent/` 单测里的 `GLOBAL_ENV_CWD_LOCK`）。
+3. **CLI 用例先复制二进制到 `tempfile` 临时目录**再执行：二进制 SQLite 落在「程序目录」，
+   复制即换库，天然隔离且不碰用户真实接入点。
+4. **mock 端口交 OS 分配**（`127.0.0.1:0`），禁止固定端口 —— 原脚本 18901~18913 靠串行
+   加 `kill;wait` 才没撞车。
+5. **中文测试函数名**，与本仓库单测风格一致；`#![allow(dead_code)]` 只加在夹具模块顶部。
+6. **断言失败要能自解释**：抓包类断言走 `support::dump_requests` / `assert_some_request`，
+   失败时打印全部请求的 path / UA / 工具面。
 
-1. **小节正文不得出现顶层 `trap ... RETURN`** —— 小节是被 `source` 进来的独立文件，
-   source 一结束就触发 RETURN，会在小节开头把状态杀掉（§8 的 tmux 会话就是这么炸的）。
-   跨小节的进程级清理由 `harness.sh` 的 EXIT trap 兜底，小节收尾自己显式清理。
-2. **heredoc 内的 `# --- ` 不是小节边界** —— §6 的 python heredoc（`<<'PYEOF'`）中间夹着
-   「请求头校验」「Agent 身份逐请求注入」两道注释，它们是 **Python 注释**，属于 §6 同一段
-   断言。拆小节时 heredoc 未闭合前不得切分，否则 `--only 6` 会把 `PYEOF` 切丢而语法崩。
+### 单测与集成测试的分工
 
-`.gitignore` 的 `testReport/` 规则会静默忽略新增文件，**新增/修改小节文件必须 `git add -f`**。
+能在函数级判定的（解析、校验、纯函数、状态机）写 `src/**` 内的 `#[cfg(test)] mod tests`；
+只有「跨模块串起来才有意义」的（wire 出参、Agent 循环、真实 CLI、真实文件系统布局）
+才写 `tests/`。**不要为了覆盖率把函数级断言搬进集成测试**。
 
-### TUI 自动化：**优先使用 tmux control-mode**
+### TUI 子屏仍需 tmux（当前无自动化）
 
-`src/tui/mod.rs::run` 对 `atty` 做了分流：
-
-- **TTY**（包括 tmux 内）→ `InputHandler` 全交互（原始模式 + alternate screen + 子屏栈）。
-- **非 TTY**（管道 / 重定向）→ 行读取回退，**子屏走 print 输出，不是真实渲染**。
-
-> 因此：`/provider list`、`/provider add`、`/provider del` 等**子屏行为必须用 tmux**。
-> 管道冒烟仅适合主屏纯文本命令（`/help` `/model` `/new` `/exit`）。
-
-核心命令速查（完整封装见 `run_e2e.sh` 第 8 节，设计见 `docs/TUI自动化测试/`）：
+`src/tui/mod.rs::run` 按 `atty` 分流：TTY 走全交互，**非 TTY 子屏只 print 输出、不是真实渲染**。
+因此 `/provider list` 等子屏行为**无法用 `cargo test` 覆盖**，需人工或临时 tmux 验证：
 
 ```bash
-# 1) 起后台会话并启动 TUI，固定 100x30
-tmux new-session -d -s laew_e2e -x 100 -y 30 "$LAEW"
-# 2) 发送按键（整串字面量必须 -l）
-tmux send-keys -t laew_e2e -l "/provider list"
-tmux send-keys -t laew_e2e Enter        # 回车
-tmux send-keys -t laew_e2e Escape       # Esc 退子屏
-# 3) 抓取面板到 stdout（不带 -e 剥离 ANSI，便于 grep）
-SCREEN=$(tmux capture-pane -p -t laew_e2e)
-# 4) 断言:echo "$SCREEN" | grep -F -q "/provider list"
-# 5) 调试:tmux attach -t laew_e2e  可肉眼回放
-# 6) 收尾:tmux kill-session -t laew_e2e
+tmux new-session -d -s laew -x 100 -y 30 "./laew"
+tmux send-keys -t laew -l "/provider list"; tmux send-keys -t laew Enter
+SCREEN=$(tmux capture-pane -p -t laew); echo "$SCREEN" | grep -F "/provider list"
+tmux kill-session -t laew
 ```
 
-扩展指引（新增子屏断言）：
-
-1. 在 `src/tui/screen/*` 找到 `fn title -> &str`，title 字符串本身就是断言锚点。
-2. 在 `run_e2e.sh` 第 8 节 `texpect "<title>" "..."` 即可。
-3. 若断言失败，报告自动 dump 当前面板（带 `|` 前缀），便于排查。
-4. CI 环境需 `apt-get install -y tmux`；缺 tmux 时整节 SKIP，不影响其它 9 节通过。
+纯文本命令（`/help` `/model` `/new` `/exit`）可管道冒烟；横幅等宽、Markdown 渲染等
+**纯渲染逻辑**应写成对 `tui::textfit` 等纯函数的单测，而不是靠抓屏比对。
 
 ## 约定
 
@@ -598,12 +567,12 @@ SCREEN=$(tmux capture-pane -p -t laew_e2e)
   - 单文件超线 → 转同名目录（`xxx.rs` → `xxx/mod.rs` + 职责子模块）；`mod.rs` 承载结构体定义 + 构造器/入口 + `pub use` 再导出，**外部 `crate::…::xxx::Yyy` 路径零改动**；
   - 原私有项搬入子模块标 `pub(super)`（可见域 = 本目录子树，与拆分前单文件作用域等价），由 `mod.rs` 私有 `use` 重导入供兄弟模块 `use super::*` 取用；
   - 代码**逐行机械搬移零改写**（不重构逻辑/注释），仅新增模块文档头与 `use super::*`；测试搬 `tests.rs`（mod.rs 声明 `#[cfg(test)] mod tests;`），拆分前后测试数必须对账一致；
-  - ⚠️ **`tests.rs` 不得转成 `tests/` 目录**：`.gitignore` 的 `tests/` 规则匹配**任意层级**的 tests 目录，`src/agent/tests/` 会被静默排除出版本库（本地编译通过、克隆后 `cargo test` 直接失败）。测试模块一律用 `xxx/tests.rs` **文件**；某个 `tests.rs` 自身超线时，把新用例放到**同级兄弟文件**（如 `src/agent/react_tests.rs` + `#[cfg(test)] mod react_tests;`），不要转目录；
+  - 测试模块一律用 `xxx/tests.rs` **文件**（`mod tests;` 解析到文件）；某个 `tests.rs` 自身超线时，把新用例放到**同级兄弟文件**（如 `src/agent/react_tests.rs` + `#[cfg(test)] mod react_tests;`），不要转目录。注意与**包根 `tests/`（Cargo 集成测试目录）**区分：那里放跨模块集成测试，与本条的模块内单测是两回事；
   - 高速增长文件（近几轮每轮 +50 行以上）在破线前预防性拆分。已按此规范拆分：`src/tui/`（分层）、`src/agent/`（agent_loop + runtime_hints + tests 平铺拆分）、`agent/orchestrator/`、`agent/main_work/`、`agent/tools/window/`。
 - 新工具：在 `src/agent/tools/` 建同名模块实现 `Tool` trait，注册进 `builtin_registry`（Work Agent）或相应 registry，Schema 参考 `docs/其他Agent工具定义/`。
 - 新协议：实现 `LlmClient` trait + `client_from_record` 增加分支，不改动 agent 层。
 - 新 Agent 类型：实现 `AgentProfile`（独立名称/系统提示词/工具集），在 `YoloRunner` 或相应编排器中接入。
-- 测试报告输出到 `testReport/`（命名 `e2e-<时间戳>.txt` / `验证报告-<日期>.md`）；临时计划放 `tmpPlan/`（已 gitignore）。
+- 临时计划放 `tmpPlan/`（已 gitignore）。测试产物（编译日志 `logs/build.log`、运行日志、调试报告等）同样不入库。
 - `laew`、`*.db`、`tmpPlan/`、`target/` 均不入库（见 .gitignore）。
 
 ## Git 提交规范

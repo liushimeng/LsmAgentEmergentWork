@@ -56,7 +56,7 @@
 
 - **无手工编码**：没有人类程序员手写任何一行 Rust / TOML / Shell / Markdown。
 - **Agent 协作**：按职责拆分为多条 SubAgent 职责线（架构、TUI、工具、协议、测试、文档），各自独立工作、自动提交。
-- **自测自修**：Agent 自动运行 `cargo test`、`bash testReport/run_e2e.sh`，发现 Bug 后自动定位、修复、回归验证。
+- **自测自修**：Agent 自动运行 `cargo test`（单元 + 集成），发现 Bug 后自动定位、修复、回归验证。
 - **自部署**：`rebuild_restart_app.sh` 由 Agent 编写，一键 `cargo build --release` → 拷贝 `./laew` → 重启。
 - **持续迭代**：`CLAUDE.md` 中记录了海量 Agent 教训，每条都是 Agent 踩坑后自动写入的「经验记忆」，后续 Agent 自动加载避免重犯。
 - **知识库沉淀**：`docs/` 下 80+ 份调研文档 / 约 160k 行，全部由 Agent 自动产出。
@@ -134,7 +134,7 @@ Yolo ──→ 分类: simple / medium / hard
 | 💾 数据库 | rusqlite（SQLite，`LsmAgentEmergentWork.db`） |
 | 🌐 HTTP | reqwest（Anthropic / OpenAI 双协议客户端） |
 | 📡 协议 | Anthropic Messages + OpenAI Chat Completions（统一消息模型 `llm/mod.rs`） |
-| 🧪 测试 | `cargo test` 单元 + `testReport/run_e2e.sh` 端到端（mock LLM + tmux 子屏自动化） |
+| 🧪 测试 | `cargo test` 单元 + 集成（进程内 mock LLM + 真实 CLI / 真实二进制） |
 
 ---
 
@@ -304,9 +304,9 @@ LsmAgentEmergentWork/
 │       ├── theme.rs         # ANSI 颜色 / mask_key 脱敏
 │       └── screen/          # ProviderList / ProviderForm / ProviderDel 子屏
 ├── docs/                    # 知识库: 15 工程调研 / 108+ 维度 / 635+ gap
-├── testReport/              # 自动化测试报告 + run_e2e.sh
+├── tests/                   # Cargo 集成测试（support 夹具 + 功能测试）
 ├── tmpPlan/                 # 编码过程中的临时计划（不入库）
-├── scripts/                 # 辅助脚本（mock_llm_server.py）
+├── scripts/                 # 辅助脚本（mock_mcp_server.py）
 ├── rebuild_restart_app.sh   # 一键重编译
 ├── CLAUDE.md                # Agent 入口说明 + 海量教训
 └── AGENTS.md                # 工程入口说明（与 CLAUDE.md 同步维护）
@@ -318,14 +318,32 @@ LsmAgentEmergentWork/
 
 ## 🧪 自动化测试 —— Agent 自检终端
 
-项目使用两层测试：
+项目使用两层测试，均为 Rust 代码级测试，统一用 `cargo test` 跑：
 
 | 层 | 入口 | 用途 |
 |----|------|------|
-| 单元测试 | `cargo test` | Rust 函数级覆盖（模块、解析、转换、工具） |
-| 端到端(CLI) | `bash testReport/run_e2e.sh` | mock LLM，跑 `-p` / `provider` / 协议 wire / 项目上下文注入 / TUI 子屏 tmux 自动化 |
+| 单元测试 | `cargo test --lib` | Rust 函数级覆盖（模块、解析、转换、工具） |
+| 集成测试 | `cargo test --test <name>` | 双协议 wire / Agent 主循环 / 真实 CLI / 项目上下文五级链 |
 
-### TUI 子屏自动化（tmux control-mode）
+集成测试布局见 `tests/`：`support/mod.rs` 提供进程内 mock LLM 服务（真实 HTTP + SSE，
+端口交 OS 分配），`protocol_wire.rs` / `agent_loop.rs` / `cli_provider.rs` /
+`project_context.rs` 为功能测试。
+
+### TUI 子屏验证（tmux control-mode，人工）
+
+`cargo test` 覆盖不到子屏 —— 非 TTY 下子屏只走 print 回退、不是真实渲染。需人工用 tmux 验证：
+
+```bash
+# 起后台会话并启动 TUI，固定 100x30
+tmux new-session -d -s laew -x 100 -y 30 ./laew
+# 发送按键
+tmux send-keys -t laew -l "/provider list"
+tmux send-keys -t laew Enter
+# 抓取面板断言
+tmux capture-pane -p -t laew | grep -F "/provider list"
+# 收尾
+tmux kill-session -t laew
+```
 
 ```bash
 # 起后台会话并启动 TUI，固定 100x30

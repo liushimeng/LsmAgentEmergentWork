@@ -1,7 +1,10 @@
 //! Use_MCP 工具单测:Schema/description 契约 + 参数校验信封 + 配置降级路径。
 //!
-//! 纯参数路径不碰真实网络/子进程;真实 stdio 连通由 `testReport/run_e2e.sh` 的
-//! `scripts/mock_mcp_server.py` 用例覆盖。
+//! 纯参数路径不碰真实网络/子进程。
+//!
+//! ⚠️ 覆盖缺口:真实 stdio 子进程连通(握手 / tools/list / 投影降级)目前**没有**
+//! 自动化用例 —— 原先由已删除的 shell e2e 承担。需要时手工起
+//! `python3 scripts/mock_mcp_server.py` 验证。
 
 use serde_json::json;
 

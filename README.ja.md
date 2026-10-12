@@ -59,7 +59,7 @@
 
 - **手作業コーディングなし**：人間のプログラマが Rust / TOML / Shell / Markdown を一行も書いていません。
 - **Agent 協力**：複数のサブエージェント責任ライン（アーキテクチャ、TUI、ツール、プロトコル、テスト、ドキュメント）に分割し、それぞれが独立して作業し、自動コミット。
-- **自己テスト・自己修正**：Agent が `cargo test` と `bash testReport/run_e2e.sh` を自動実行し、バグの発見→特定→修正→回帰検証を自律的に行います。
+- **自己テスト・自己修正**：Agent が `cargo test`（ユニット + 統合）を自動実行し、バグの発見→特定→修正→回帰検証を自律的に行います。
 - **自己デプロイ**：`rebuild_restart_app.sh` は Agent が記述。`cargo build --release` → `./laew` コピー → 再起動を一コマンドで。
 - **継続的イテレーション**：`CLAUDE.md` に膨大な Agent 教訓が記録されており、それぞれは Agent がつまずいた後に自動記述。将来の Agent が自動読み込みして再犯を防止。
 - **ナレッジベース**：`docs/` 下に 80+ のリサーチドキュメント / 約 160k 行、すべて Agent 産出。
@@ -136,7 +136,7 @@ Yolo ──→ 分類: simple / medium / hard
 | 💾 データベース | rusqlite（SQLite、`LsmAgentEmergentWork.db`） |
 | 🌐 HTTP | reqwest（Anthropic / OpenAI デュアルプロトコルクライアント） |
 | 📡 プロトコル | Anthropic Messages + OpenAI Chat Completions（統一メッセージモデル `llm/mod.rs`） |
-| 🧪 テスト | `cargo test` ユニット + `testReport/run_e2e.sh` E2E（mock LLM + tmux サブスクリーン自動化） |
+| 🧪 テスト | `cargo test` ユニット + 統合（プロセス内 mock LLM + 実 CLI / 実バイナリ） |
 
 ---
 
@@ -263,9 +263,9 @@ LsmAgentEmergentWork/
 │       ├── theme.rs         # ANSI カラー / mask_key マスキング
 │       └── screen/          # ProviderList / ProviderForm / ProviderDel サブスクリーン
 ├── docs/                    # ナレッジベース: 15 プロジェクト / 108+ ディメンション / 635+ gap
-├── testReport/              # 自動テストレポート + run_e2e.sh
+├── tests/                   # Cargo 統合テスト（support フィクスチャ + 機能テスト）
 ├── tmpPlan/                 # コーディング中の一時計画（コミットなし）
-├── scripts/                 # ヘルパースクリプト（mock_llm_server.py）
+├── scripts/                 # ヘルパースクリプト（mock_mcp_server.py）
 ├── rebuild_restart_app.sh   # ワンコマンドリビルド
 ├── CLAUDE.md                # Agent エントリドキュメント + 膨大な教訓
 └── AGENTS.md                # エンジニアリングエントリドキュメント（= CLAUDE.md）
@@ -281,21 +281,25 @@ LsmAgentEmergentWork/
 
 | レイヤー | エントリ | 用途 |
 |-------|------|------|
-| ユニットテスト | `cargo test` | Rust 関数レベルカバレッジ（モジュール、解析、変換、ツール） |
-| E2E (CLI) | `bash testReport/run_e2e.sh` | mock LLM、`-p` / `provider` / protocol wire / プロジェクトコンテキスト注入 / TUI サブスクリーン tmux 自動化 を実行 |
+| ユニットテスト | `cargo test --lib` | Rust 関数レベルカバレッジ（モジュール、解析、変換、ツール） |
+| 統合テスト | `cargo test --test <name>` | 両プロトコル wire / Agent 主ループ / 実 CLI / プロジェクトコンテキスト五段チェーン |
 
-### TUI サブスクリーン自動化（tmux control-mode）
+統合テストは `tests/` に配置しています：`support/mod.rs` がプロセス内 mock LLM サーバ（実 HTTP + SSE、ポートは OS 割当）を提供し、`protocol_wire.rs` / `agent_loop.rs` / `cli_provider.rs` / `project_context.rs` が機能テストです。
+
+### TUI サブスクリーン検証（tmux control-mode、手動）
+
+`cargo test` ではサブスクリーンをカバーできません（非 TTY では print 出力にフォールバックし、実レンダリングにならないため）。tmux で手動検証してください：
 
 ```bash
 # バックグラウンドセッションで TUI を起動、100x30 に固定
-tmux new-session -d -s laew_e2e -x 100 -y 30 ./laew
+tmux new-session -d -s laew -x 100 -y 30 ./laew
 # キー送信
-tmux send-keys -t laew_e2e -l "/provider list"
-tmux send-keys -t laew_e2e Enter
+tmux send-keys -t laew -l "/provider list"
+tmux send-keys -t laew Enter
 # パネルのキャプチャとアサーション
-tmux capture-pane -p -t laew_e2e | grep -F "/provider list"
+tmux capture-pane -p -t laew | grep -F "/provider list"
 # クリーンアップ
-tmux kill-session -t laew_e2e
+tmux kill-session -t laew
 ```
 
 > 詳細は `docs/TUI自動化テスト/` を参照。

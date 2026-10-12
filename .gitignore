@@ -28,9 +28,9 @@ plans/
 *.swp
 .DS_Store
 
-# testReport:保留报告与脚本,仅忽略大体量原始产物
+# 自动化测试已全面改为 Rust 代码级测试(tests/ 为 Cargo 集成测试目录,须入库)。
+# 历史 shell 端到端脚本目录 testReport/ 已删除,仅忽略遗留产物。
 testReport/
-tests/
 
 # DebugReport(laew -debug 调试报告,自动落盘,不入库)
 DebugReport/

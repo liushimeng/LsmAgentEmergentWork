@@ -9,7 +9,7 @@
 #
 # 输出:
 #   ./laew                      # 二进制(覆盖已存在)
-#   ./testReport/build.log      # 编译日志
+#   ./logs/build.log            # 编译日志
 #
 # 设计要点(2026-09-10 第 26 轮加固):
 #   * 解决「跨机器 git pull 后 ./rebuild_restart_app.sh 输出旧 laew」的陷阱:
@@ -43,8 +43,8 @@ echo "[rebuild] 根目录: $ROOT_DIR"
 echo "[rebuild] 配置  : $PROFILE"
 [[ "$FORCE" -eq 1 ]] && echo "[rebuild] 强制   : --force(touch build.rs 穿透 cargo 增量缓存)"
 
-mkdir -p testReport
-LOG_FILE="testReport/build.log"
+mkdir -p logs
+LOG_FILE="logs/build.log"
 
 # 拷贝产物到根目录。
 # 覆盖前告警:检测正在运行的 laew 进程(2026-09-10 第 20 轮)。

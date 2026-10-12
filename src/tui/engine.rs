@@ -63,7 +63,7 @@ pub struct Cell {
     /// true = 该 cell 是某个 wide char 的"第二半占位",present() 必须跳过
     /// (详见 tmpPlan/2026-09-09_15-TUI宽字符二次占位与tmux捕获渲染方案.md)。
     /// 这样 tmux capture-pane 拿到的就是原始 CJK 字符而不是"记 录"带空格,
-    /// `testReport/run_e2e.sh::texpect` 的 `grep -F` 字符串断言可正常命中。
+    /// 任何按字符串比对屏幕内容的断言（含人工 tmux 验证）才能正常命中。
     pub skip: bool,
 }
 
