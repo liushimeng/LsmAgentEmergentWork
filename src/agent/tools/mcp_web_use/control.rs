@@ -232,11 +232,11 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "hover" => act_hover(id, &params).await,
         "scroll" => act_scroll(id, &params).await,
         "scroll_to" => act_scroll_to(id, &params).await,
-        "key_press" => act_key_press(id, &params).await,
-        "press_sequence" => act_press_sequence(id, &params).await,
-        "input_text" => act_input_text(id, &params).await,
-        "human_input" => act_human_input(id, &params).await,
-        "clear_input" => act_clear_input(id, &params).await,
+        "key_press" => super::input_ctl::act_key_press(id, &params).await,
+        "press_sequence" => super::input_ctl::act_press_sequence(id, &params).await,
+        "input_text" => super::input_ctl::act_input_text(id, &params).await,
+        "human_input" => super::input_ctl::act_human_input(id, &params).await,
+        "clear_input" => super::input_ctl::act_clear_input(id, &params).await,
         "upload_file" => act_upload_file(id, &params).await,
         "select_option" => act_select_option(id, &params).await,
         "download" => act_download(id, &params).await,
@@ -397,7 +397,7 @@ pub(super) fn action_may_spawn_page(action: &str, params: &Value) -> bool {
 // =================== 第 141/143 轮:管控让路辅助已拆分至 guard_ctl.rs ===================
 // (control.rs 逼近 1800 行硬线,按拆分规范机械搬移;此处仅保留引用)
 
-async fn act_click(id: &str, p: &Value, human: bool) -> std::result::Result<Value, String> {
+pub(super) async fn act_click(id: &str, p: &Value, human: bool) -> std::result::Result<Value, String> {
     let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
     let nth = p.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
     let page = ensure_page(id).await?;
@@ -466,140 +466,6 @@ pub(super) fn parse_modifiers(p: &Value) -> i64 {
         }
     }
     bit
-}
-
-/// 单字符表:键名 → (CDP `key`, `code`, windowsVirtualKeyCode)。
-pub(super) fn key_code_tuple(name: &str) -> Option<(&'static str, &'static str, i64)> {
-    Some(match name {
-        "Enter" | "Return" => ("Enter", "Enter", 13),
-        "Tab" => ("Tab", "Tab", 9),
-        "Escape" | "Esc" => ("Escape", "Escape", 27),
-        "Backspace" => ("Backspace", "Backspace", 8),
-        "Delete" | "Del" => ("Delete", "Delete", 46),
-        "ArrowLeft" | "Left" => ("ArrowLeft", "ArrowLeft", 37),
-        "ArrowUp" | "Up" => ("ArrowUp", "ArrowUp", 38),
-        "ArrowRight" | "Right" => ("ArrowRight", "ArrowRight", 39),
-        "ArrowDown" | "Down" => ("ArrowDown", "ArrowDown", 40),
-        "Home" => ("Home", "Home", 36),
-        "End"  => ("End", "End", 35),
-        "PageUp" => ("PageUp", "PageUp", 33),
-        "PageDown" => ("PageDown", "PageDown", 34),
-        "Space" => (" ", "Space", 32),
-        "F1" => ("F1", "F1", 112), "F2" => ("F2", "F2", 113), "F3" => ("F3", "F3", 114),
-        "F4" => ("F4", "F4", 115), "F5" => ("F5", "F5", 116), "F6" => ("F6", "F6", 117),
-        "F7" => ("F7", "F7", 118), "F8" => ("F8", "F8", 119), "F9" => ("F9", "F9", 120),
-        "F10" => ("F10", "F10", 121), "F11" => ("F11", "F11", 122), "F12" => ("F12", "F12", 123),
-        _ => return None,
-    })
-}
-
-async fn act_key_press(id: &str, p: &Value) -> std::result::Result<Value, String> {
-    let Some(k) = str_arg(p, "key") else { return Err("缺少 key".into()); };
-    let mods = parse_modifiers(p);
-    let page = ensure_page(id).await?;
-    if let Some((key, code, vk)) = key_code_tuple(k) {
-        let params = chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventParams::builder()
-            .r#type(chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventType::KeyDown)
-            .key(key).code(code)
-            .windows_virtual_key_code(vk).native_virtual_key_code(vk)
-            .modifiers(mods).build().map_err(|e| e.to_string())?;
-        page.execute(params).await.map_err(|e| e.to_string())?;
-        let params = chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventParams::builder()
-            .r#type(chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventType::KeyUp)
-            .key(key).code(code)
-            .windows_virtual_key_code(vk).native_virtual_key_code(vk)
-            .modifiers(mods).build().map_err(|e| e.to_string())?;
-        page.execute(params).await.map_err(|e| e.to_string())?;
-        Ok(json!({"key": key, "modifiers": mods, "mode":"keyevent"}))
-    } else {
-        let params = chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventParams::builder()
-            .r#type(chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventType::Char)
-            .text(k).key(k).modifiers(mods).build().map_err(|e| e.to_string())?;
-        page.execute(params).await.map_err(|e| e.to_string())?;
-        Ok(json!({"key": k, "modifiers": mods, "mode":"char"}))
-    }
-}
-
-async fn act_press_sequence(id: &str, p: &Value) -> std::result::Result<Value, String> {
-    let keys_str = if let Some(arr) = p.get("keys").and_then(Value::as_array) {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        str_arg(p, "keys").unwrap_or("").to_string()
-    };
-    for token in keys_str.split_whitespace() {
-        let (mods_part, key_part) = if let Some((m, k)) = token.split_once('+') {
-            (m, k)
-        } else { ("", token) };
-        let mut sub = json!({"key": key_part});
-        if !mods_part.is_empty() { sub["modifiers"] = json!(mods_part); }
-        act_key_press(id, &sub).await?;
-    }
-    Ok(json!({"pressed": keys_str}))
-}
-
-async fn act_input_text(id: &str, p: &Value) -> std::result::Result<Value, String> {
-    let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
-    let Some(text) = str_arg(p, "text") else { return Err("缺少 text".into()); };
-    let use_js = p.get("use_js").and_then(Value::as_bool).unwrap_or(true);
-    let page = ensure_page(id).await?;
-    if use_js {
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector({sel});
-                if (!el) return false;
-                const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
-                    || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value');
-                desc.set.call(el, {txt});
-                el.dispatchEvent(new Event('input', {{bubbles:true}}));
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
-                return true;
-            }})()"#,
-            sel = js_str(sel), txt = js_str(text)
-        );
-        let ok = eval_js_string(&page, &js).await?;
-        Ok(json!({"selector": sel, "text": text, "mode":"js", "applied": ok}))
-    } else {
-        let el = page.find_element(sel.to_string()).await.map_err(|e| e.to_string())?;
-        el.click().await.map_err(|e| e.to_string())?;
-        el.type_str(text.to_string()).await.map_err(|e| e.to_string())?;
-        Ok(json!({"selector": sel, "text": text, "mode":"sendkeys"}))
-    }
-}
-
-async fn act_human_input(id: &str, p: &Value) -> std::result::Result<Value, String> {
-    let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
-    let text = p.get("text").and_then(Value::as_str).unwrap_or("");
-    let page = ensure_page(id).await?;
-    if let Ok(el) = page.find_element(sel.to_string()).await {
-        let _ = el.click().await;
-    }
-    for ch in text.chars() {
-        let s = ch.to_string();
-        let params = chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventParams::builder()
-            .r#type(chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventType::Char)
-            .text(s.clone()).key(s.clone()).build().map_err(|e| e.to_string())?;
-        let _ = page.execute(params).await;
-        let delay = 50 + (ch as u32 % 150);
-        tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
-    }
-    Ok(json!({"selector": sel, "text": text, "mode":"human"}))
-}
-
-async fn act_clear_input(id: &str, p: &Value) -> std::result::Result<Value, String> {
-    let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
-    let page = ensure_page(id).await?;
-    let js = format!(
-        r#"(() => {{ const el = document.querySelector({sel}); if(!el) return false;
-        const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
-              || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value');
-        d.set.call(el,''); el.dispatchEvent(new Event('input',{{bubbles:true}})); return true; }})()"#,
-        sel = js_str(sel)
-    );
-    let ok = eval_js_string(&page, &js).await?;
-    Ok(json!({"cleared": ok, "selector": sel}))
 }
 
 async fn act_upload_file(id: &str, p: &Value) -> std::result::Result<Value, String> {

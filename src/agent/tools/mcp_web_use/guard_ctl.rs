@@ -151,8 +151,20 @@ pub(super) async fn act_set_guard(id: &str, p: &Value) -> crate::error::Result<S
             }),
         );
     }
-    match mgr.set_guard(id, cfg).await {
-        Ok(v) => envelope(0, "ok", v),
+    match mgr.set_guard(id, cfg.clone()).await {
+        Ok(mut v) => {
+            // 第 157 轮:open 档响应附收口提示 —— 实测文心任务 Agent 因输入链路
+            // 报错误判「锁定拦截输入」自行开档后未收口,人工看到页面可编辑且
+            // 无任何提示。提示 Agent 人工操作完成后恢复 locked,减少观感落差。
+            if cfg.mode == PageGuardMode::Open {
+                if let Value::Object(ref mut m) = v {
+                    m.insert("note".into(), Value::String(
+                        "页面已对人工开放(人工可直接操作)。人工操作完成后建议 set_guard(mode=\"locked\") 恢复管控;如仅为排查输入失败,注意 locked 档不会拦截 Agent 输入(输入动作执行期自动挂闸)".to_string(),
+                    ));
+                }
+            }
+            envelope(0, "ok", v)
+        }
         Err(e) => envelope(2002, &e, json!({})),
     }
 }

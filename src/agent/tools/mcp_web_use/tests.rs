@@ -126,9 +126,124 @@ fn js_str_escapes() {
 
 #[test]
 fn key_code_tuple_lookup() {
-    assert_eq!(control::key_code_tuple("Enter"), Some(("Enter", "Enter", 13)));
-    assert_eq!(control::key_code_tuple("F12"), Some(("F12", "F12", 123)));
-    assert!(control::key_code_tuple("未知键").is_none());
+    assert_eq!(input_ctl::key_code_tuple("Enter"), Some(("Enter", "Enter", 13)));
+    assert_eq!(input_ctl::key_code_tuple("F12"), Some(("F12", "F12", 123)));
+    assert!(input_ctl::key_code_tuple("未知键").is_none());
+}
+
+/// 第 157 轮:键名大小写不敏感 + 别名层(实测小写 enter 落 Char 分支触发 CDP
+/// "Invalid 'text' parameter" 黑话错误)。
+#[test]
+fn key_code_tuple_case_insensitive_aliases() {
+    for (input, expect) in [
+        ("enter", ("Enter", "Enter", 13)),
+        ("ENTER", ("Enter", "Enter", 13)),
+        ("return", ("Enter", "Enter", 13)),
+        ("esc", ("Escape", "Escape", 27)),
+        ("ESC", ("Escape", "Escape", 27)),
+        ("space", (" ", "Space", 32)),
+        ("del", ("Delete", "Delete", 46)),
+        ("ins", ("Insert", "Insert", 45)),
+        ("pgup", ("PageUp", "PageUp", 33)),
+        ("pgdn", ("PageDown", "PageDown", 34)),
+        ("up", ("ArrowUp", "ArrowUp", 38)),
+        ("left", ("ArrowLeft", "ArrowLeft", 37)),
+        ("f5", ("F5", "F5", 116)),
+    ] {
+        assert_eq!(input_ctl::key_code_tuple(input), Some(expect), "{input}");
+    }
+    // 多字符非常见键仍返回 None(走报错提示,不透传 CDP 黑话)
+    assert!(input_ctl::key_code_tuple("foobar").is_none());
+}
+
+/// 第 157 轮:组合键拆分 —— ctrl+a / cmd+shift+p 归一,字面加号与 C++ 不误拆。
+#[test]
+fn split_combined_key_cases() {
+    use super::input_ctl::split_combined_key;
+    assert_eq!(split_combined_key("a"), (String::new(), "a".to_string()));
+    assert_eq!(split_combined_key("ctrl+a"), ("ctrl".to_string(), "a".to_string()));
+    assert_eq!(
+        split_combined_key("cmd+shift+p"),
+        ("cmd+shift".to_string(), "p".to_string())
+    );
+    assert_eq!(split_combined_key("enter"), (String::new(), "enter".to_string()));
+    // 特殊键别名作主键也可拆
+    assert_eq!(
+        split_combined_key("ctrl+enter"),
+        ("ctrl".to_string(), "enter".to_string())
+    );
+    // shift+= :拆出 shift 修饰 + '=' 主键(Shift+= 即加号,语义正确)
+    assert_eq!(split_combined_key("shift+="), ("shift".to_string(), "=".to_string()));
+    // 真·尾部加号("ctrl+") = 字面
+    assert_eq!(split_combined_key("ctrl+"), (String::new(), "ctrl+".to_string()));
+    assert_eq!(split_combined_key("+"), (String::new(), "+".to_string()));
+    // 后半不是单字符/已知键 → 整体字面(C++ 不误拆 ctrl+C+","之类)
+    assert_eq!(split_combined_key("C++"), (String::new(), "C++".to_string()));
+}
+
+/// 第 157 轮:原生赋值脚本沿原型链查 value 访问器(根治 textarea 误用
+/// HTMLInputElement setter 的 Illegal invocation),contenteditable 走 textContent。
+#[test]
+fn native_set_js_walks_prototype_chain() {
+    let js = input_ctl::native_set_js("#t", "\"你好\"");
+    assert!(js.contains("Object.getPrototypeOf"), "{js}");
+    assert!(js.contains("getOwnPropertyDescriptor"), "{js}");
+    assert!(js.contains("isContentEditable"), "{js}");
+    assert!(js.contains("textContent"), "{js}");
+    assert!(js.contains("d.set.call(el"), "{js}");
+    // 不再硬编码 HTMLInputElement 短路
+    assert!(!js.contains("HTMLInputElement.prototype,'value')\n"), "{js}");
+    assert!(!js.contains(r"|| Object.getOwnPropertyDescriptor"), "{js}");
+    // selector 以 JS 字面量安全嵌入
+    assert!(js.contains("document.querySelector(\"#t\")"), "{js}");
+    assert!(js.contains("'你好'") || js.contains("你好"), "{js}");
+    // 回读脚本:页内比对,只回 len/match/head
+    let rb = input_ctl::readback_js("#t", "\"你好\"");
+    assert!(rb.contains("match"), "{rb}");
+    assert!(rb.contains("slice(0, 100)"), "{rb}");
+}
+
+#[test]
+fn clip_step_message_budgets() {
+    let ok_long = "x".repeat(500);
+    let clipped = clip_step_message(0, &ok_long);
+    assert!(clipped.contains("截断"), "{clipped}");
+    assert!(clipped.chars().count() < 400, "{clipped}");
+    // 失败步预算更宽
+    let err_long = "y".repeat(5000);
+    let clipped_err = clip_step_message(2002, &err_long);
+    assert!(clipped_err.contains("截断"), "{clipped_err}");
+    assert!(clipped_err.chars().count() > 1500, "{clipped_err}");
+    // 预算内原样返回
+    assert_eq!(clip_step_message(0, "ok"), "ok");
+}
+
+/// 第 157 轮:guard 脚本版本化重装 —— REV 单调递增烘焙、卸载钩子在场、
+/// 占位符全烘焙(与 browser_overlay 内既有单测同锚点补充)。
+#[test]
+fn guard_script_rev_monotonic_and_off_hook() {
+    let a = crate::agent::browser_overlay::guard_script(
+        &crate::agent::browser_overlay::PageGuardConfig::locked(),
+    );
+    let b = crate::agent::browser_overlay::guard_script(
+        &crate::agent::browser_overlay::PageGuardConfig::locked(),
+    );
+    let rev_a = a
+        .split("const REV = ")
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .expect("REV 应烘焙为数字");
+    let rev_b = b
+        .split("const REV = ")
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .expect("REV 应烘焙为数字");
+    assert!(rev_b > rev_a, "两次生成 REV 应单调递增:{rev_a} vs {rev_b}");
+    assert!(a.contains("window.__laewGuardOff = () =>"), "卸载钩子缺失");
+    assert!(a.contains("window.__laewGuardRev >= REV"), "版本比较缺失");
+    assert!(!a.contains("{REV}"), "REV 占位符未烘焙");
 }
 
 #[test]
@@ -2080,4 +2195,94 @@ async fn real_browser_input_gate_bg_image_challenge() {
     let v2 = eval_js_string(&page, "document.getElementById('chat').value").await.unwrap();
     assert_eq!(v2, "ok", "放行后动作应执行");
     BrowserManager::global().shutdown().await;
+}
+
+// =================== 第 157 轮:输入阶梯真浏览器冒烟(#[ignore],本地 --ignored 跑) ===================
+
+/// 覆盖输入链路根治(tmpPlan/2026-10-12_MCP_Web_Use输入链路根治与批量效率升级方案.md):
+/// 1. input_text 默认 auto:JS 原生赋值 + 回读校验(textarea 是最易触发旧
+///    Illegal invocation 的形态 —— 原型链 setter 根治的回归锁);
+/// 2. 普通 input 与 contenteditable 同样生效;
+/// 3. selector 未命中 → 明确报错(带 inspect 提示);
+/// 4. key_press 小写别名(enter)与组合写法(ctrl+a)不再触发 CDP 黑话;
+/// 5. 多字符未知键 → 明确报错;
+/// 6. press_sequence 带 selector 先聚焦(focused=true);
+/// 7. clear_input 清空 + 回读。
+/// 跑 `cargo test --lib input_text_ladder -- --ignored --nocapture`。
+#[tokio::test]
+#[ignore = "需要本机真实 Chrome(会弹有头窗口);本地手动跑"]
+async fn real_browser_input_text_ladder() {
+    use crate::agent::browser::{BrowserManager, BrowserMode};
+    use crate::agent::browser_overlay::PageGuardConfig;
+    let mgr = BrowserManager::global();
+    // textarea 监听 input 事件后回写自身 value,模拟 React 受控组件的拦截面。
+    let url = "data:text/html,<textarea id='t'></textarea><input id='i'>\
+               <div id='ce' contenteditable='true'></div>\
+               <script>document.getElementById('t').addEventListener('input',function(e){\
+               this.value=this.value;});</script>";
+    let (pid, _, _) = mgr
+        .new_page(url, BrowserMode::Headed, None, None, Some((800, 600)), true, PageGuardConfig::locked())
+        .await
+        .expect("启动有头浏览器失败(本机是否装有 Chrome?)");
+    let id = pid.as_str();
+
+    // 1. textarea:JS 路径 + 回读校验(旧实现此处必炸 Illegal invocation)
+    let out = input_ctl::act_input_text(id, &json!({"selector": "#t", "text": "hello world"}))
+        .await
+        .expect("textarea 输入应成功");
+    assert_eq!(out["applied"], true, "{out}");
+    assert_eq!(out["value_after"]["matched"], true, "{out}");
+
+    // 2. 普通 input
+    let out = input_ctl::act_input_text(id, &json!({"selector": "#i", "text": "abc123"}))
+        .await
+        .expect("input 输入应成功");
+    assert_eq!(out["value_after"]["matched"], true, "{out}");
+
+    // 3. contenteditable
+    let out = input_ctl::act_input_text(id, &json!({"selector": "#ce", "text": "rich text"}))
+        .await
+        .expect("contenteditable 输入应成功");
+    assert_eq!(out["applied"], true, "{out}");
+
+    // 4. selector 未命中 → 明确报错(自动阶梯全部尝试后仍给可执行提示)
+    let err = input_ctl::act_input_text(id, &json!({"selector": "#nope", "text": "x"}))
+        .await
+        .expect_err("不存在的 selector 应报错");
+    assert!(err.contains("inspect"), "{err}");
+
+    // 5. key_press 小写别名 + 组合写法
+    let out = input_ctl::act_key_press(id, &json!({"key": "enter"}))
+        .await
+        .expect("小写 enter 应归一");
+    assert_eq!(out["key"], "Enter", "{out}");
+    let out = input_ctl::act_key_press(id, &json!({"key": "ctrl+a"}))
+        .await
+        .expect("组合写法 ctrl+a 应可用");
+    assert_eq!(out["modifiers"], 2, "{out}");
+
+    // 6. 多字符未知键 → 明确报错,不透传 CDP "Invalid 'text' parameter" 黑话
+    let err = input_ctl::act_key_press(id, &json!({"key": "foobar"}))
+        .await
+        .expect_err("多字符未知键应报错");
+    assert!(err.contains("无法识别"), "{err}");
+
+    // 7. press_sequence 带 selector 先聚焦(含整句中文 token 自动逐字)
+    let out = input_ctl::act_press_sequence(id, &json!({"selector": "#t", "keys": "x y enter"}))
+        .await
+        .expect("press_sequence 应成功");
+    assert_eq!(out["focused"], true, "{out}");
+    assert_eq!(out["pressed"], 3, "{out}");
+    let out = input_ctl::act_press_sequence(id, &json!({"selector": "#t", "keys": "hi 你好"}))
+        .await
+        .expect("多字符文本 token 应逐字发送");
+    assert_eq!(out["pressed"], 2 + "你好".chars().count(), "{out}");
+
+    // 8. clear_input 清空 + 回读
+    let out = input_ctl::act_clear_input(id, &json!({"selector": "#t"}))
+        .await
+        .expect("clear_input 应成功");
+    assert_eq!(out["cleared"], true, "{out}");
+
+    mgr.shutdown().await;
 }

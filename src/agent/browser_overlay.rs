@@ -258,7 +258,15 @@ impl PageGuardConfig {
 ///   `[data-laew-agent]` 自身节点的变更(防自激循环);
 /// - `document.body` 未就绪(极早期文档)时挂 documentElement,DOMContentLoaded 补挂。
 pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
-    if (window.__laewGuardInstalled) return;
+    const REV = {REV};
+    // 第 157 轮:版本化重装 —— 同一页面多次注册脚本(重复 open / rearm 重注入)后,
+    // 「先注册的脚本抢先安装、后注册的脚本被 early-return」会让旧档在导航后复活
+    // (实测观感:页面屏蔽失效、可编辑且无提示)。现在低版本直接退出;高版本先
+    // 卸载旧实例(输入闸监听器 + 滚动/resize 调度 + 观察器 + 视觉元素)再重装,
+    // 保证「最新期望档必赢」。
+    if (window.__laewGuardRev >= REV) return;
+    window.__laewGuardRev = REV;
+    try { if (window.__laewGuardOff) window.__laewGuardOff(); } catch (e) {}
     window.__laewGuardInstalled = true;
     window.__laewGuardMode = {MODE};
     window.__laewGuardAllow = {ALLOW};
@@ -272,16 +280,18 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     window.__laewGuardScrollWatch = {SCROLLWATCH};
     window.__laewGuardInputSuspended = false;
     window.__laewGuardGateReady = false;
+    // 第 157 轮:GATE_EVTS/gate 提升到闸块外定义 —— 版本化重装时
+    // __laewGuardOff 需要引用它们卸载旧监听器。
+    const GATE_EVTS = ['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick',
+        'contextmenu', 'pointerdown', 'pointerup', 'dragstart', 'drop',
+        'keydown', 'keyup', 'keypress', 'touchstart', 'touchend'];
+    const gate = (e) => {
+        try { if (!e.isTrusted) return; } catch (ex) { return; }
+        if (window.__laewGuardMode !== 'locked') return;
+        if (window.__laewGuardInputSuspended) return;
+        try { e.stopImmediatePropagation(); e.preventDefault(); } catch (ex) {}
+    };
     if (window.__laewGuardScrollWatch) {
-        const GATE_EVTS = ['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick',
-            'contextmenu', 'pointerdown', 'pointerup', 'dragstart', 'drop',
-            'keydown', 'keyup', 'keypress', 'touchstart', 'touchend'];
-        const gate = (e) => {
-            try { if (!e.isTrusted) return; } catch (ex) { return; }
-            if (window.__laewGuardMode !== 'locked') return;
-            if (window.__laewGuardInputSuspended) return;
-            try { e.stopImmediatePropagation(); e.preventDefault(); } catch (ex) {}
-        };
         for (const t of GATE_EVTS) window.addEventListener(t, gate, true);
         window.__laewGuardInputSuspend = (s) => {
             window.__laewGuardInputSuspended = !!s;
@@ -491,13 +501,15 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     window.addEventListener('scroll', schedule, { passive: true, capture: true });
     window.addEventListener('resize', schedule, { passive: true });
     try {
-        new MutationObserver((muts) => {
+        // 第 157 轮:句柄挂 window —— 版本化重装时 disconnect 旧观察器。
+        window.__laewGuardMO = new MutationObserver((muts) => {
             for (const mu of muts) {
                 const t = mu.target;
                 if (t && t.closest && t.closest('[data-laew-agent]')) continue;
                 return schedule();
             }
-        }).observe(document.documentElement, {
+        });
+        window.__laewGuardMO.observe(document.documentElement, {
             childList: true, subtree: true,
             attributes: true, attributeFilter: ['class', 'style'],
         });
@@ -506,12 +518,29 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', () => refresh(), { once: true });
     }
+    // 第 157 轮:卸载钩子 —— 高版本重装前移除旧实例的输入闸监听器、调度监听、
+    // 观察器与蒙层/状态条/盾区视觉元素,防监听器与视觉泄漏。
+    window.__laewGuardOff = () => {
+        try { for (const t of GATE_EVTS) window.removeEventListener(t, gate, true); } catch (e) {}
+        try { window.removeEventListener('scroll', schedule, true); } catch (e) {}
+        try { window.removeEventListener('resize', schedule); } catch (e) {}
+        try { if (window.__laewGuardMO) window.__laewGuardMO.disconnect(); } catch (e) {}
+        for (const id of [MASK_ID, HINT_ID, SHIELDS_ID]) {
+            const n = document.getElementById(id);
+            if (n) n.remove();
+        }
+    };
 })()"#;
 
 /// 按实例期望态生成注入脚本(烘焙初始配置;选择器/note 以 JSON 字面量嵌入,
 /// 滚动观看开关按 [`locked_scroll_watch_enabled`] 烘焙 —— 环境变量进程级不变,
 /// 烘焙即终态)。
+///
+/// 第 157 轮:每次生成单调递增版本号(REV)烘焙进脚本 —— 版本化重装的依据,
+/// 保证同一页面多次注册时「最新期望档必赢」(防旧档脚本导航后抢先安装)。
 pub fn guard_script(cfg: &PageGuardConfig) -> String {
+    static GUARD_SCRIPT_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let rev = GUARD_SCRIPT_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let cfg = cfg.normalized();
     let mode = serde_json::to_string(cfg.mode.as_str()).unwrap_or_else(|_| "\"locked\"".into());
     let allow = serde_json::to_string(&cfg.allow_selectors).unwrap_or_else(|_| "[]".into());
@@ -519,6 +548,7 @@ pub fn guard_script(cfg: &PageGuardConfig) -> String {
     let note = serde_json::to_string(&cfg.note).unwrap_or_else(|_| "null".into());
     let scroll_watch = if locked_scroll_watch_enabled() { "true" } else { "false" };
     AGENT_GUARD_JS_TEMPLATE
+        .replace("{REV}", &rev.to_string())
         .replace("{MODE}", &mode)
         .replace("{ALLOW}", &allow)
         .replace("{BLOCK}", &block)
@@ -622,6 +652,23 @@ pub async fn apply_page_guard(
         .execute(SetIgnoreInputEventsParams::new(want_cdp_block))
         .await
         .is_ok();
+    // 第 157 轮:档位复核 rearm —— 应用后探测页面实际档位,与期望不符(陈旧
+    // 脚本抢先安装 / 执行上下文漂移,实测观感「屏蔽失效、页面可编辑且无提示」)
+    // 时重注入最新版本脚本并再应用一次;重注入经版本化重装安全(新档必赢)。
+    // eval 级开销,fail-open(探测失败不阻断)。
+    let mut rearmed = false;
+    if locked {
+        let actual = page
+            .evaluate("window.__laewGuardMode || null")
+            .await
+            .ok()
+            .and_then(|r| r.value().cloned());
+        if actual.as_ref().and_then(Value::as_str) != Some("locked") {
+            inject_agent_guard(page, &cfg).await;
+            let _ = page.evaluate(js.as_str()).await;
+            rearmed = true;
+        }
+    }
     Ok(json!({
         "mode": cfg.mode.as_str(),
         "input_locked": want_cdp_block && input_lock_applied,
@@ -630,6 +677,7 @@ pub async fn apply_page_guard(
         "scroll_watch": use_dom_gate,
         "visual_mask": locked && js_applied,
         "shields_active": cfg.mode == PageGuardMode::Partial && js_applied,
+        "rearmed": rearmed,
     }))
 }
 
@@ -868,7 +916,7 @@ mod tests {
         // 第 155 轮:滚动观看开关烘焙(缺省开启)
         assert!(js.contains("window.__laewGuardScrollWatch = true;"), "{js}");
         // 占位符全部被烘焙
-        for ph in ["{MODE}", "{ALLOW}", "{BLOCK}", "{NOTE}", "{SCROLLWATCH}"] {
+        for ph in ["{MODE}", "{ALLOW}", "{BLOCK}", "{NOTE}", "{SCROLLWATCH}", "{REV}"] {
             assert!(!js.contains(ph), "占位符 {ph} 未烘焙");
         }
         // locked 缺省烘焙
