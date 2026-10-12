@@ -844,20 +844,10 @@ async fn act_wait(id: &str, p: &Value) -> std::result::Result<Value, String> {
             .unwrap_or(30_000)
             .min(120_000);
         let state = str_arg(p, "state").unwrap_or("visible");
-        let js = format!(
-            r#"async () => {{
-                const sel = {sel}; const end = Date.now() + {timeout_ms};
-                while (Date.now() < end) {{
-                    const el = document.querySelector(sel);
-                    if (el && ('{state}'==='attached' || ('{state}'==='visible' && el.offsetWidth>0) || ('{state}'==='hidden' && !el.offsetWidth))) {{
-                        return true;
-                    }}
-                    await new Promise(r => setTimeout(r, 100));
-                }}
-                return false;
-            }}()"#,
-            sel = js_str(sel), timeout_ms = timeout_ms, state = state
-        );
+        // 第 159 轮:箭头函数块体后紧跟 `()` 是 JS 语法错误(`async () => {{…}}()`
+        // 恒返 SyntaxError: Unexpected token '(' —— 云智眼实测 wait(selector) 从未
+        // 成功过一次),必须整体括号包裹成 `(async () => {{…}})()`。
+        let js = wait_selector_js(sel, timeout_ms, state);
         let found = eval_js_string(&page, &js).await?;
         if found.as_bool() == Some(true) {
             return Ok(json!({"waited_for": sel, "state": state}));
@@ -872,6 +862,28 @@ async fn act_wait(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let ms = wait_sleep_ms(p);
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     Ok(json!({"slept_ms": ms}))
+}
+
+/// wait(selector) 轮询脚本(纯函数,可单测):整体 `(async () => {{…}})()` 包裹。
+/// 第 159 轮前模板是裸 `async () => {{…}}()`——JS 箭头函数块体后紧跟调用括号
+/// 属于语法错误,每次 wait(selector) 都返回 2002 SyntaxError。
+pub(super) fn wait_selector_js(sel: &str, timeout_ms: u64, state: &str) -> String {
+    format!(
+        r#"(async () => {{
+            const sel = {sel}; const end = Date.now() + {timeout_ms};
+            while (Date.now() < end) {{
+                const el = document.querySelector(sel);
+                if (el && ('{state}'==='attached' || ('{state}'==='visible' && el.offsetWidth>0) || ('{state}'==='hidden' && !el.offsetWidth))) {{
+                    return true;
+                }}
+                await new Promise(r => setTimeout(r, 100));
+            }}
+            return false;
+        }})()"#,
+        sel = js_str(sel),
+        timeout_ms = timeout_ms,
+        state = state
+    )
 }
 
 /// wait 纯睡眠时长解析(纯函数,可单测):`duration_ms` 与别名 `ms` 取较大者,

@@ -270,36 +270,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             } else {
                 let max_depth = params.get("max_depth").and_then(Value::as_i64).unwrap_or(3).clamp(1, 10);
                 let node_limit = params.get("node_count_limit").and_then(Value::as_u64).unwrap_or(2000).min(5000);
-                let js = format!(
-                    r#"(() => {{
-                        const MAX_DEPTH={max_depth}, NODE_LIMIT={node_limit};
-                        let nodes=0, truncated=false;
-                        function walk(n, d) {{
-                            if (nodes>=NODE_LIMIT) {{ truncated=true; return null; }}
-                            if (d>MAX_DEPTH) return null;
-                            // Agent 高亮 overlay 子树不进入节点树(真实页面结构观察)
-                            if (n.nodeType===1 && n.closest && n.closest('[data-laew-agent]')) return null;
-                            const obj={{
-                                node_type: n.nodeType, node_name: n.nodeName,
-                                node_value: n.nodeValue, attributes: {{}};
-                            }};
-                            nodes++;
-                            if (n.nodeType===1) {{
-                                for (const a of n.attributes) obj.attributes[a.name]=a.value;
-                                const children=[];
-                                for (const c of n.childNodes) {{
-                                    const r=walk(c, d+1); if (r) children.push(r);
-                                    if (truncated) break;
-                                }}
-                                if (children.length) obj.children=children;
-                            }}
-                            return obj;
-                        }}
-                        const tree=walk(document, 0);
-                        return {{document: tree, node_count:nodes, truncated, max_depth:MAX_DEPTH}};
-                    }})()"#,
-                    max_depth = max_depth, node_limit = node_limit
-                );
+                let js = dom_tree_js(max_depth, node_limit);
                 eval_js_string(&page, &js).await
             }
         }
@@ -615,4 +586,42 @@ pub(super) fn cap_strings(v: &mut Value, max_chars: usize) {
         Value::Object(map) => map.values_mut().for_each(|x| cap_strings(x, max_chars)),
         _ => {}
     }
+}
+
+/// inspect(dom) 全量树遍历脚本(纯函数,可单测)。
+/// 第 159 轮:模板里对象字面量曾写成 `attributes: {{}};` —— 字面量内出现 `;`
+/// 恒返 SyntaxError: Unexpected token ';',inspect(dom) 全量树从未成功返回过
+/// (云智眼实测 142149 日志 iter=2)。
+pub(super) fn dom_tree_js(max_depth: i64, node_limit: u64) -> String {
+    format!(
+        r#"(() => {{
+            const MAX_DEPTH={max_depth}, NODE_LIMIT={node_limit};
+            let nodes=0, truncated=false;
+            function walk(n, d) {{
+                if (nodes>=NODE_LIMIT) {{ truncated=true; return null; }}
+                if (d>MAX_DEPTH) return null;
+                // Agent 高亮 overlay 子树不进入节点树(真实页面结构观察)
+                if (n.nodeType===1 && n.closest && n.closest('[data-laew-agent]')) return null;
+                const obj={{
+                    node_type: n.nodeType, node_name: n.nodeName,
+                    node_value: n.nodeValue, attributes: {{}}
+                }};
+                nodes++;
+                if (n.nodeType===1) {{
+                    for (const a of n.attributes) obj.attributes[a.name]=a.value;
+                    const children=[];
+                    for (const c of n.childNodes) {{
+                        const r=walk(c, d+1); if (r) children.push(r);
+                        if (truncated) break;
+                    }}
+                    if (children.length) obj.children=children;
+                }}
+                return obj;
+            }}
+            const tree=walk(document, 0);
+            return {{document: tree, node_count:nodes, truncated, max_depth:MAX_DEPTH}};
+        }})()"#,
+        max_depth = max_depth,
+        node_limit = node_limit
+    )
 }

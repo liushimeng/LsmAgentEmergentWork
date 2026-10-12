@@ -184,7 +184,12 @@ pub(super) async fn eval_find_center(
 }
 
 pub(super) async fn ensure_page(id: &str) -> std::result::Result<chromiumoxide::Page, String> {
-    BrowserManager::global().page(id).await.ok_or_else(|| "page_id 不存在".into())
+    // 第 159 轮:走 ensure_page_alive —— 人工地址栏导航等导致 CDP 会话掉线时,
+    // 按 target_id 自愈重建句柄,而不是让后续所有动作永久失败。
+    BrowserManager::global()
+        .ensure_page_alive(id)
+        .await
+        .ok_or_else(|| "page_id 不存在".into())
 }
 
 /// 从工具输出文本中提取 page_id(2026-09-16 第 64 轮起持续使用)。

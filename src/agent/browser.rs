@@ -365,6 +365,10 @@ impl BrowserManager {
         // launch 模式浏览器主进程 PID(第 127 轮):供 cleanup_registry 登记给
         // cleanup_sync 同步清理路径使用;connect 模式保持 0(不拥有外部进程)。
         let mut launch_pid: u32 = 0;
+        // 第 159 轮:本次调用是否首次拉起浏览器 —— 决定注册完本页后是否清扫
+        // Chrome 启动自带的初始空标签页(launch 不带初始 URL,Chrome 必开一个
+        // about:blank / new-tab-page,实测「先弹空页签再弹目标页签」即它)。
+        let just_launched = inner.browser.is_none();
 
         // Browser 操作超时(2026-09-16 第 66 轮):launch/connect/goto 统一 30s,
         // 防止页面挂起/Chrome 启动失败导致无限等待(用户反馈浏览器任务卡住 58.8s)。
@@ -406,7 +410,40 @@ impl BrowserManager {
                          或设置环境变量 LAEW_BROWSER_PATH 指向浏览器可执行文件"
                     ))
                 })?;
-                let mut builder = BrowserConfig::builder().chrome_executable(exe);
+                let builder = BrowserConfig::builder().chrome_executable(exe);
+                // 第 159 轮:全模式统一 disable_default_args + 自选参数集。
+                // chromiumoxide 的 DEFAULT_ARGS(puppeteer 同源)携带 `--enable-automation`,
+                // navigator.webdriver=true 会被 WAF 反爬(云智眼 vcm.cucloud.cn:20233 实测
+                // 瑞数形态 cookie 已种上但文档恒空:head:""/scripts:0/readyState:complete)
+                // 直接判为机器人返回空 HTML —— 剔除该旗标并叠加反检测参数。
+                // 同时固化三类实测刚需:
+                // ① `--ignore-certificate-errors`:自签名证书/自定义域名内网网关直达,
+                //    消除证书 interstitial 类整页不可用(与 LAEW_TLS_INSECURE 的 HTTP 客户端
+                //    自动策略对齐,浏览器侧同等宽松);
+                // ② `--disable-features` 一并禁 Local Network Access / Private Network
+                //    Access 系列(Chrome 154 LNA 对「公网域名→私网 IP」子资源按
+                //    PermissionBlock 静默拦截,WAF 挑战脚本跑不完 → 永远空白页)与
+                //    HttpsUpgrades(自定义端口 https 站点不被静默降级/升级试探);
+                // ③ `--disable-blink-features=AutomationControlled`:压掉 webdriver 指纹。
+                let mut builder = builder
+                    .disable_default_args()
+                    .arg("--no-first-run")
+                    .arg("--no-default-browser-check")
+                    .arg("--disable-background-networking")
+                    .arg("--disable-background-timer-throttling")
+                    .arg("--disable-backgrounding-occluded-windows")
+                    .arg("--disable-component-extensions-with-background-pages")
+                    .arg("--disable-default-apps")
+                    .arg("--disable-hang-monitor")
+                    .arg("--disable-ipc-flooding-protection")
+                    .arg("--disable-prompt-on-repost")
+                    .arg("--disable-renderer-backgrounding")
+                    .arg("--disable-sync")
+                    .arg("--disable-popup-blocking")
+                    .arg("--metrics-recording-only")
+                    .arg("--ignore-certificate-errors")
+                    .arg("--disable-blink-features=AutomationControlled")
+                    .arg("--disable-features=LocalNetworkAccess,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessRestrictions,BlockLocalNetworkByDefault,PrivateNetworkAccessRespectPreflightResults,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,TranslateUI");
                 // 2026-09-17 第 74 轮:三档 mode 控制浏览器启动形态。
                 // 默认 Hidden(纯 CDP headless=new,系统级无窗口),
                 // 解决"误开 macOS 系统默认浏览器"问题。
@@ -427,7 +464,6 @@ impl BrowserManager {
                 // 参考 docs/Agent源码调研/专题/专题-第十三轮-GUI自动化与浏览器控制深度对比.md §6.1)
                 if matches!(mode, BrowserMode::Hidden | BrowserMode::NewHeadless) {
                     builder = builder
-                        .disable_default_args()
                         .arg("--disable-gpu")
                         .arg("--no-sandbox")
                         .arg("--disable-dev-shm-usage")
@@ -577,6 +613,39 @@ impl BrowserManager {
                 events,
             },
         );
+        // 第 159 轮:首次 launch 后清扫浏览器自带的初始空标签页 —— launch 不带
+        // 初始 URL,Chrome 必开一个 about:blank / chrome://new-tab-page;不关掉的话
+        // ① 用户看到「先空页签后目标页签」两个页签;② 残留页后续会被
+        // adopt_spawned_pages 误认领(reload 触发巡检时被收编成伪 spawned_page_id,
+        // 实测 142751 日志 line 123/131)。connect 模式绝不碰用户自己的标签页。
+        if just_launched && !inner.connect_mode {
+            if let Some(browser) = inner.browser.as_ref() {
+                if let Ok(pages) = browser.pages().await {
+                    let known: std::collections::HashSet<String> =
+                        inner.pages.values().map(|e| e.target_id.clone()).collect();
+                    let mut closed = 0usize;
+                    for p in pages {
+                        let tid: String = p.target_id().clone().into();
+                        if known.contains(&tid) {
+                            continue;
+                        }
+                        let purl = p.url().await.ok().flatten().unwrap_or_default();
+                        let ptitle = Self::page_title(&p).await;
+                        if super::browser_noise::is_noise_page(&purl, &ptitle) {
+                            if p.close().await.is_ok() {
+                                closed += 1;
+                            }
+                        }
+                    }
+                    if closed > 0 {
+                        tracing::info!(
+                            closed,
+                            "MCP_Web_Use 首启清扫浏览器初始空标签页(只留 Agent 打开的目标页)"
+                        );
+                    }
+                }
+            }
+        }
         Ok((id, title, final_url))
     }
 
@@ -614,6 +683,68 @@ impl BrowserManager {
             .pages
             .get(page_id)
             .map(|e| e.page.clone())
+    }
+
+    /// 获取页面(带失效自愈,第 159 轮)。
+    ///
+    /// 实测事故(2026-10-12 云智眼):人工在地址栏回车导航后,Agent 对该页面的
+    /// 后续操作全面失效 —— 注册表里的 `PageEntry.page` 是一次性握手时拿到的句柄,
+    /// CDP 会话掉线(`Session with given id not found` 类)后旧实现无自愈路径,
+    /// 所有 control/inspect 动作永久 2002。这里先探活(一次 target 信息往返,
+    /// 不经过页面主线程),失效则按 target_id 重建句柄(见 [`Self::heal_page`])。
+    pub async fn ensure_page_alive(&self, page_id: &str) -> Option<Page> {
+        let cached = {
+            let inner = self.inner.lock().await;
+            match inner.pages.get(page_id) {
+                Some(e) => e.page.clone(),
+                None => return None,
+            }
+        };
+        if cached.url().await.is_ok() {
+            return Some(cached);
+        }
+        self.heal_page(page_id).await
+    }
+
+    /// 按 target_id 重建页面句柄:重开 Runtime/Network 域 + 事件监听,
+    /// 高亮/管控/跟随器按实例期望态重注入(人工导航产生的新文档没有旧脚本)。
+    /// target 已不存在(标签页被关)返回 None,沿用「page_id 不存在」语义。
+    pub async fn heal_page(&self, page_id: &str) -> Option<Page> {
+        let mut inner = self.inner.lock().await;
+        let browser = inner.browser.as_ref()?;
+        let entry = inner.pages.get(page_id)?;
+        let target_id = entry.target_id.clone();
+        let pages = browser.pages().await.ok()?;
+        let found = pages.into_iter().find(|p| {
+            let t: String = p.target_id().clone().into();
+            t == target_id
+        })?;
+        let events = EventBuffer::default();
+        let _ = found
+            .execute(chromiumoxide::cdp::js_protocol::runtime::EnableParams::default())
+            .await;
+        let _ = found
+            .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
+            .await;
+        spawn_event_listeners(&found, events.clone()).await;
+        if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
+            inject_agent_highlight(&found).await;
+        }
+        if !inner.connect_mode && matches!(inner.mode, BrowserMode::Headed) {
+            let cfg = inner.guard.clone();
+            super::browser_overlay::inject_agent_guard(&found, &cfg).await;
+            let _ = super::browser_overlay::apply_page_guard(&found, &cfg).await;
+        }
+        if !inner.connect_mode && inner.auto_follow {
+            super::browser_follow::install(&found, true).await;
+            let _ = super::browser_follow::set(&found, true).await;
+        }
+        if let Some(e) = inner.pages.get_mut(page_id) {
+            e.page = found.clone();
+            e.events = events;
+        }
+        tracing::info!(page_id, target_id, "MCP_Web_Use 页面句柄自愈成功(重建会话与管控)");
+        Some(found)
     }
 
     /// 获取页面事件缓冲(console/network 观察用)。
@@ -847,18 +978,17 @@ impl BrowserManager {
                 "reason": if explicit_window {
                     "已显式指定窗口尺寸且完整落在屏幕内,保持不变"
                 } else {
-                    "窗口已铺满屏幕工作区且视口不低于下限"
+                    "窗口尺寸保持当前值(不铺满)且视口不低于下限"
                 },
                 "measured": measured,
                 "base": base,
             }));
         };
-        // 铺满时**同时给 left/top**:只改尺寸不动位置,Chrome 的初始位置(left=22,
-        // top=31 之类)会让 cap 尺寸的窗口右侧/底部越出工作区 —— 实测 3184 宽的窗口
-        // 落在 left=22 上时右缘到 3206 已超出 3200 的工作区,底部同理。用户看到的就是
-        // 「窗口没铺满」。显式指定尺寸的路径保持原位置不动(尊重调用方意图)。
+        // 第 158 轮:不再铺满,positioned 仅在**收边**(窗口超出屏幕)时设置 left/top
+        // 保证完整可见;抬升(窗口低于视口下限)保持原位置不动,尊重用户手动调整的窗口位置。
         let margin = super::browser_viewport::HEADED_SCREEN_MARGIN as i64;
-        let (tl, tt) = if fill {
+        let is_shrink = (tw as f64) <= ow + 1.0 && (th as f64) <= oh + 1.0 && ((tw as f64) < ow || (th as f64) < oh);
+        let (tl, tt) = if is_shrink {
             (Some(ax.round() as i64 + margin), Some(ay.round() as i64 + margin))
         } else {
             (None, None)
@@ -869,48 +999,6 @@ impl BrowserManager {
         // 调整尺寸后 Chrome 可能重新压回 z 序底层,复激活一次保证「调完仍然可见」。
         let activated =
             super::browser_window::activate_headed_window(self, page_id).await || activated;
-        // 复核:Chrome 可能自行 clamp(setWindowBounds 目标 1784 实际落 1769),也可能因
-        // 窗口管理器最小化等原因没吃满。回读真实外框算铺满率,低于阈值时按真实值重试
-        // 一次 —— 「铺满」是可见承诺,不能只信「已下发 setWindowBounds」。
-        let (mut ratio, mut verify) = (0.0, Value::Null);
-        if fill {
-            if let Ok(m2) = headed_window_metrics(&page).await {
-                let g = |k: &str| m2.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-                let (ow2, oh2) = (g("outerWidth"), g("outerHeight"));
-                let (aw2, ah2) = (g("availWidth"), g("availHeight"));
-                let (ax2, ay2) = (g("availLeft"), g("availTop"));
-                ratio = fill_ratio(ow2, oh2, aw2, ah2);
-                verify = json!({
-                    "outer": {"width": ow2, "height": oh2},
-                    "avail": {"width": aw2, "height": ah2},
-                    "fill_ratio": ratio,
-                });
-                if ratio < FILL_RATIO_MIN {
-                    let cap_w = (aw2 - margin as f64 * 2.0).floor().max(1.0) as i64;
-                    let cap_h = (ah2 - margin as f64 * 2.0).floor().max(1.0) as i64;
-                    if ow2 < cap_w as f64 || oh2 < cap_h as f64 {
-                        let _ = self
-                            .set_window_bounds(
-                                page_id,
-                                Some(cap_w),
-                                Some(cap_h),
-                                Some(ax2.round() as i64 + margin),
-                                Some(ay2.round() as i64 + margin),
-                                None,
-                            )
-                            .await;
-                        if let Ok(m3) = headed_window_metrics(&page).await {
-                            let h = |k: &str| m3.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-                            ratio = fill_ratio(h("outerWidth"), h("outerHeight"), h("availWidth"), h("availHeight"));
-                            verify["refilled"] = json!(true);
-                            verify["fill_ratio"] = json!(ratio);
-                            verify["outer"] =
-                                json!({"width": h("outerWidth"), "height": h("outerHeight")});
-                        }
-                    }
-                }
-            }
-        }
         Ok(json!({
             "adjusted": true,
             "activated": activated,
@@ -920,12 +1008,10 @@ impl BrowserManager {
             "positioned": tl.is_some(),
             "measured": measured,
             "applied": applied.get("window").cloned().unwrap_or(Value::Null),
-            "fill_ratio": ratio,
-            "fill_verify": verify,
-            "note": if fill {
-                "有头模式窗口已铺满屏幕工作区并置前;页面视口随窗口自适应(下限 720p)"
+            "note": if is_shrink {
+                "有头模式窗口已收边到屏幕工作区内,保证完整可见;页面视口下限 720p"
             } else {
-                "有头模式窗口已按屏幕工作区收边,保证完整可见;页面视口下限 720p"
+                "有头模式窗口已抬升到视口下限 720p,保持原位置;不铺满"
             },
             "base": base,
         }))
@@ -1409,9 +1495,13 @@ impl BrowserManager {
                 candidates.push(page);
             }
         }
-        // 给刚打开的窗口一次导航时间再复查,避免误杀 `target=_blank` 真页面
-        if !noise.is_empty() && !candidates.is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // 给刚打开的窗口一次导航时间再复查,避免误杀 `target=_blank` 真页面。
+        // 2026-10-12 闲鱼实测修正:原条件 `!candidates.is_empty()` 导致「只有新标签页
+        // 一个候选」时不等待 —— 而点击商品链接打开的新 tab 初始正是新标签页,
+        // 等它导航到真实 URL 后才是该 adopt 的页面。改为**只要有噪声页就等**,
+        // 500ms 兜底慢导航;复查后仍是噪声才关闭。
+        if !noise.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let mut still_noise = Vec::new();
             for page in noise {
                 let url = page.url().await.ok().flatten().unwrap_or_default();
@@ -1430,6 +1520,24 @@ impl BrowserManager {
                 let _ = page.close().await;
             }
             tracing::info!(closed = n, "MCP_Web_Use 关闭空白/内部噪声标签页(不收编)");
+        }
+        // 2026-10-12:多候选时 http/https 优先 —— `spawned.first()` 取第一个,
+        // 若候选里混着 about:blank 等内部页,可能回传错误 page_id(实测「点击按钮
+        // 打开新页面后 Agent 失去控制」的次生形态)。按 URL _scheme 排序,真实页面在前。
+        if candidates.len() > 1 {
+            let mut scored: Vec<(bool, chromiumoxide::Page)> = Vec::with_capacity(candidates.len());
+            for page in candidates {
+                let is_http = page
+                    .url()
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|u| u.starts_with("http://") || u.starts_with("https://"))
+                    .unwrap_or(false);
+                scored.push((is_http, page));
+            }
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            candidates = scored.into_iter().map(|(_, p)| p).collect();
         }
         for page in candidates {
             let tid: String = page.target_id().clone().into();
@@ -1877,7 +1985,7 @@ async fn spawn_event_listeners(page: &Page, events: EventBuffer) {
         .event_listener::<network::EventResponseReceived>()
         .await
     {
-        let ev = events;
+        let ev = events.clone();
         tokio::spawn(async move {
             while let Some(event) = stream.next().await {
                 ev.push_network(json!({
@@ -1885,6 +1993,33 @@ async fn spawn_event_listeners(page: &Page, events: EventBuffer) {
                     "url": event.response.url,
                     "status": event.response.status,
                     "mime_type": event.response.mime_type,
+                }));
+            }
+        });
+    }
+
+    // 第 159 轮:loadingFailed 采集 —— 空白页诊断的关键证据。
+    // Chrome 154 Local Network Access 拦「公网域名→私网 IP」子资源时只发
+    // loadingFailed(blocked_reason=local-network-access),不发 response;
+    // 旧实现只采 request/response,Agent 面对 WAF 空白页只能猜「服务端返回空」。
+    if let Ok(mut stream) = page
+        .event_listener::<network::EventLoadingFailed>()
+        .await
+    {
+        let ev = events;
+        tokio::spawn(async move {
+            while let Some(event) = stream.next().await {
+                ev.push_network(json!({
+                    "phase": "loading_failed",
+                    "request_id": event.request_id,
+                    "type": format!("{:?}", event.r#type),
+                    "error_text": event.error_text,
+                    "blocked_reason": event
+                        .blocked_reason
+                        .clone()
+                        .map(|b| format!("{b:?}"))
+                        .unwrap_or_default(),
+                    "canceled": event.canceled.unwrap_or(false),
                 }));
             }
         });

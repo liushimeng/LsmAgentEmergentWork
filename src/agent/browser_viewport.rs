@@ -166,7 +166,7 @@ pub fn headed_window_plan(
     avail_w: f64,
     avail_h: f64,
     chrome_h: f64,
-    fill: bool,
+    _fill: bool,
 ) -> Option<(u32, u32)> {
     if !(avail_w > 0.0) || !(avail_h > 0.0) {
         return None;
@@ -188,17 +188,17 @@ pub fn headed_window_plan(
     let lo_w = floor_w.min(cap_w);
     let lo_h = floor_h.min(cap_h);
 
-    // 目标:fill 时铺满屏幕工作区;否则保持请求尺寸(缺省 1080p)。
-    let want_w = if fill {
-        cap_w
-    } else if cur_w > 0.0 {
+    // 目标:保持当前窗口尺寸(不铺满)。fill 参数保留用于语义标注,行为已一致。
+    // 第 158 轮(2026-10-12):fill=true 时不再铺满到 cap,改为保持当前窗口尺寸。
+    // 根因:用户实测 Agent 打开新页面总是尝试全屏(铺满),而用户可能手动调整过
+    // 窗口大小,铺满会覆盖用户偏好。保持 cur 让首次打开用默认 1080p,手动调整后
+    // 以用户尺寸为准。仍保留「不溢出」收边与「视口下限 720p」保障。
+    let want_w = if cur_w > 0.0 {
         cur_w
     } else {
         DEFAULT_WINDOW_W as f64
     };
-    let want_h = if fill {
-        cap_h
-    } else if cur_h > 0.0 {
+    let want_h = if cur_h > 0.0 {
         cur_h
     } else {
         DEFAULT_WINDOW_H as f64
@@ -409,34 +409,34 @@ mod tests {
         assert_eq!(headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, chrome, false), None);
     }
 
-    // =================== 第 156 轮:大屏铺满(fill) ===================
+    // =================== 第 158 轮:保持当前窗口尺寸(不铺满) ===================
 
-    /// 回归实测(本机 macOS,主屏 U2790B `UI Looks like 3200×1800`):
-    /// 窗口硬编码 1920×1080,在 3200×1800 工作区上只占 60%×60%,
-    /// 用户看到的正是「网页没有铺满 Chrome 窗口」。`fill=true` 时涨到工作区。
+    /// 第 158 轮(2026-10-12):fill=true 时保持当前窗口尺寸,不再铺满到 cap。
+    /// 根因:用户实测 Agent 打开新页面总是尝试全屏,覆盖用户手动调整的窗口大小。
+    /// 保持 cur 让首次打开用默认 1080p,手动调整后以用户尺寸为准。
     #[test]
-    fn headed_plan_fills_large_screen() {
-        let (w, h) = headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, 140.0, true)
-            .expect("大屏应铺满");
-        let m = HEADED_SCREEN_MARGIN as f64;
-        assert_eq!(w as f64, 3200.0 - m * 2.0);
-        assert_eq!(h as f64, 1800.0 - m * 2.0);
-        // 铺满后视口仍须 ≥ 720p。
-        assert!(h as f64 - 140.0 >= MIN_VIEWPORT_H as f64);
+    fn headed_plan_keeps_current_size_on_large_screen() {
+        // 3200×1800 大屏上,1920×1080 窗口保持不变(不铺满)
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, 140.0, true), None);
     }
 
-    /// 铺满后幂等:已是工作区尺寸则不再重复 setWindowBounds。
+    /// 用户手动调整过的窗口大小被保持(以用户尺寸为准)。
     #[test]
-    fn headed_plan_fill_is_idempotent() {
-        let (w, h) = headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, 140.0, true).unwrap();
-        assert_eq!(
-            headed_window_plan(w as f64, h as f64, 3200.0, 1800.0, 140.0, true),
-            None
-        );
+    fn headed_plan_resizes_to_user_window_size() {
+        // 用户把窗口调到 1600×900,应保持该尺寸而非铺满或拉回 1080p
+        assert_eq!(headed_window_plan(1600.0, 900.0, 3200.0, 1800.0, 140.0, true), None);
+        assert_eq!(headed_window_plan(1600.0, 900.0, 3200.0, 1800.0, 140.0, false), None);
     }
 
-    /// 显式指定窗口尺寸时**不铺满**:保持请求尺寸,只做「不溢出屏幕」收边。
-    /// 这是 `explicit_window` 标志存在的意义 —— 覆盖调用方意图。
+    /// fill 参数保留用于语义标注,行为已一致(都保持当前尺寸)。
+    /// 第 158 轮:fill=true 时 1920×1080 在 3200×1800 屏幕上保持不变(返回 None)。
+    #[test]
+    fn headed_plan_fill_param_is_idempotent() {
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, 140.0, true), None);
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, 140.0, false), None);
+    }
+
+    /// 显式指定窗口尺寸时保持请求尺寸,只做「不溢出屏幕」收边。
     #[test]
     fn headed_plan_respects_explicit_window_size() {
         assert_eq!(headed_window_plan(1400.0, 900.0, 3200.0, 1800.0, 140.0, false), None);
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(h as f64, 900.0 - m * 2.0);
     }
 
-    /// 铺满在小屏方向不改变既有行为:屏幕给不出时如实退让到 cap。
+    /// 小屏方向不改变既有行为:窗口超出屏幕时如实收边到 cap。
     #[test]
     fn headed_plan_fill_still_respects_small_screen() {
         let (w, h) = headed_window_plan(1920.0, 1080.0, 1280.0, 720.0, 140.0, true).unwrap();

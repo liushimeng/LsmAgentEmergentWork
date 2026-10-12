@@ -2352,3 +2352,36 @@ fn select_dropdown_in_spawn_page_whitelist() {
         "select_dropdown 应在派生页白名单中"
     );
 }
+
+// =================== 第 159 轮:注入 JS 语法缺陷回归测试 ===================
+
+/// wait(selector) 脚本必须整体 `(async () => …)()` 包裹。
+/// 旧模板 `async () => {…}()` 是 JS 语法错误(箭头函数块体后紧跟调用括号),
+/// 云智眼实测每次 wait(selector) 都 2002 SyntaxError: Unexpected token '('。
+#[test]
+fn wait_selector_js_is_wrapped_arrow_call() {
+    let js = super::control::wait_selector_js("input[type=text]", 30_000, "visible");
+    assert!(
+        js.trim_start().starts_with("(async () =>"),
+        "wait 脚本应以 (async () => 开头整体包裹,当前开头: {:?}",
+        js.chars().take(24).collect::<String>()
+    );
+    assert!(js.trim_end().ends_with("})()"), "wait 脚本应以 }})() 收尾");
+    assert!(js.contains("type=text"));
+    assert!(js.contains("30000"));
+}
+
+/// inspect(dom) 全量树脚本:对象字面量内不得再出现 `attributes: {};` 形态
+/// (旧模板多一个分号,恒 SyntaxError: Unexpected token ';')。
+#[test]
+fn dom_tree_js_no_stray_semicolon_in_literal() {
+    let js = super::inspect::dom_tree_js(3, 2000);
+    assert!(js.contains("attributes: {}"), "渲染后应含 attributes: {{}} 字面量");
+    assert!(
+        !js.contains("attributes: {};"),
+        "对象字面量内不得出现多余分号(第 159 轮前的缺陷形态)"
+    );
+    assert!(js.contains("MAX_DEPTH=3"));
+    assert!(js.contains("NODE_LIMIT=2000"));
+    assert!(js.contains("walk(document, 0)"));
+}
