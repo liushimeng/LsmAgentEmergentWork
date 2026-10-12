@@ -27,6 +27,8 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use super::browser_perm::{self, GeoMode};
+
 /// Console / Network 事件环形缓冲容量(每页)。
 const EVENT_RING_CAP: usize = 500;
 
@@ -444,6 +446,14 @@ impl BrowserManager {
                     .arg("--ignore-certificate-errors")
                     .arg("--disable-blink-features=AutomationControlled")
                     .arg("--disable-features=LocalNetworkAccess,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessRestrictions,BlockLocalNetworkByDefault,PrivateNetworkAccessRespectPreflightResults,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,TranslateUI");
+                // 第 162 轮:`--deny-permission-prompts` 兜底拒掉原生权限弹窗
+                // (通知/摄像头等)——此类弹窗是浏览器 UI 层,blocker_probe/HITL
+                // 均不可见,会把 Agent 工具链拖死;地理位置由 browser_perm 按
+                // LAEW_WEB_GEO 预授权处置,与本兜底不冲突。
+                // LAEW_WEB_GEO=prompt(原生行为档)时不加,保持完全未干预语义。
+                if browser_perm::geo_mode_from_env() != GeoMode::Prompt {
+                    builder = builder.arg("--deny-permission-prompts");
+                }
                 // 2026-09-17 第 74 轮:三档 mode 控制浏览器启动形态。
                 // 默认 Hidden(纯 CDP headless=new,系统级无窗口),
                 // 解决"误开 macOS 系统默认浏览器"问题。
@@ -812,6 +822,38 @@ impl BrowserManager {
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    /// 第 162 轮:地理位置原生权限弹窗自动处置(详见 `browser_perm` 模块头)。
+    /// 取页面当前 URL 的 origin,按 `LAEW_WEB_GEO` 档位 CDP 预授权;
+    /// 全程 fail-open(仅 warn 日志),绝不因权限处置失败阻断导航主流程。
+    /// 返回处置结果 JSON,供 open/control 响应 `data.permissions` 透出。
+    pub async fn auto_geo_permission(&self, page_id: &str) -> Option<Value> {
+        let mode = browser_perm::geo_mode_from_env();
+        let page = self.page(page_id).await?;
+        let url = page.url().await.ok().flatten().unwrap_or_default();
+        let origin = match browser_perm::origin_of(&url) {
+            Some(o) => o,
+            None => return Some(browser_perm::geo_outcome_json(mode, None, None)),
+        };
+        let inner = self.inner.lock().await;
+        let browser = match inner.browser.as_ref() {
+            Some(b) => b,
+            None => return Some(browser_perm::geo_outcome_json(mode, Some(&origin), None)),
+        };
+        let applied = match browser_perm::apply_geo_permission(browser, &origin, mode).await {
+            Ok(setting) => Some(setting.as_ref().to_string()),
+            Err(e) => {
+                tracing::warn!("地理位置权限预授权失败(fail-open):{e} origin={origin}");
+                None
+            }
+        };
+        drop(inner);
+        Some(browser_perm::geo_outcome_json(
+            mode,
+            Some(&origin),
+            applied.as_deref(),
+        ))
     }
 
     /// 运行时调整浏览器窗口位置/尺寸/状态(CDP `Browser.setWindowBounds`)。

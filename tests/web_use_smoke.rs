@@ -46,6 +46,47 @@ async fn spawn_download_server() -> String {
     format!("http://{addr}/download")
 }
 
+/// 第 162 轮:地理位置权限冒烟 —— 启动本地 HTTP 服务返回探测页,
+/// 页面把 `navigator.permissions.query({name:'geolocation'})` 的状态写进标题。
+async fn spawn_geo_server() -> String {
+    let html = "<html><head><title>geo:pending</title><script>navigator.permissions.query({name:'geolocation'}).then(r => { document.title = 'geo:' + r.state; }).catch(() => { document.title = 'geo:error'; });</script></head><body>geo</body></html>";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    tokio::spawn(async move {
+                        let mut buf = vec![0_u8; 4096];
+                        let mut read = 0;
+                        loop {
+                            match socket.read(&mut buf[read..]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    read += n;
+                                    if buf[..read].windows(4).any(|w| w == b"\r\n\r\n")
+                                        || read == buf.len()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            html.len(),
+                            html
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    format!("http://{addr}/")
+}
+
 async fn serve_download_once(socket: &mut TcpStream) -> std::io::Result<()> {
     let mut buf = vec![0_u8; 4096];
     let mut read = 0;
@@ -285,8 +326,13 @@ async fn mcp_web_use_open_control_inspect_smoke() {
     assert_eq!(v["data"]["mode"], "headed", "实际 mode 应为 headed: {out}");
     assert_eq!(v["data"]["browser_reused"], false, "全新浏览器不应标记复用: {out}");
     assert_eq!(v["data"]["highlight"], true, "headed 默认注入高亮: {out}");
-    assert_eq!(v["data"]["window"]["width"], 1280, "窗口宽应回显请求值: {out}");
-    assert_eq!(v["data"]["window"]["height"], 800, "窗口高应回显请求值: {out}");
+    // window 字段形状(第 161 轮后):{requested, default, min_viewport, hint},
+    // 请求尺寸回显在 requested 数组。
+    assert_eq!(
+        v["data"]["window"]["requested"],
+        serde_json::json!([1280, 800]),
+        "窗口尺寸应回显请求值: {out}"
+    );
     let headed_page = v["data"]["page_id"].as_str().unwrap().to_string();
 
     // set_window 运行时调窗(headed 冒烟用小尺寸,避免打扰桌面)
@@ -483,6 +529,69 @@ onclick='document.title=\"far-clicked\"'>F</button></body></html>";
         "溢出截图应带 content_overflow 提示: {out}"
     );
     let _ = std::fs::remove_file(&clip_path);
+
+    std::env::remove_var("LAEW_WEB_GEO"); // 默认 grant 档
+
+    // 12) 第 162 轮:地理位置权限自动处置 —— open http origin 页面 → data.permissions.geolocation 应为 granted
+    let url = spawn_geo_server().await;
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "open 应成功: {out}");
+    assert_eq!(
+        v["data"]["permissions"]["geolocation"], "granted",
+        "open 应自动预授权地理位置: {out}"
+    );
+    let page_id = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 13) 页面内 Permissions API 实时回读应为 granted(预授权真实生效;
+    //    标题是页面加载瞬间的一次性快照,setPermission 在后,须重新查询)
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id, "control_action": "eval_js",
+            "params": {"expression":
+                "navigator.permissions.query({name:'geolocation'}).then(r => r.state)",
+                "await_promise": true}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(
+        v["data"]["result"], "granted",
+        "页面内 Permissions API 应读到 granted(原生弹窗不会再出现): {out}"
+    );
+
+    // 14) control(navigate) 同 origin 重放授权(navigate 路径同样生效)
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id, "control_action": "navigate",
+            "params": {"url": url}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "navigate 应成功: {out}");
+    assert_eq!(
+        v["data"]["permissions"]["geolocation"], "granted",
+        "navigate 后应重放地理位置预授权: {out}"
+    );
+
+    // 15) data:/about: 页面 origin 抽取应为 skipped(不报错不授权)
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": "data:text/html,<title>g2</title>", "reuse": false}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "open data: 应成功: {out}");
+    assert_eq!(
+        v["data"]["permissions"]["geolocation"], "skipped",
+        "非 http(s) origin 应跳过授权: {out}"
+    );
+
+
     let _ = McpWebUseTool
         .execute(json!({"action": "close", "page_id": "all"}))
         .await;

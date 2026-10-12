@@ -812,6 +812,14 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     if let Some(v) = page_health_field(&pid, &final_url).await {
                         payload["page_health"] = v;
                     }
+                    // 第 162 轮:地理位置原生权限弹窗自动处置(复用路径同样执行;
+                    // connect 模式接管用户浏览器,不干预其权限设置)。
+                    if !connect_mode {
+                        if let Some(v) = BrowserManager::global().auto_geo_permission(&pid).await
+                        {
+                            payload["permissions"] = v;
+                        }
+                    }
                     return envelope(0, "ok", payload);
                 }
             }
@@ -871,11 +879,15 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                 // 500ms 静默窗,额外 700ms 足够让迟到的渲染提交完成。
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             }
+            // 第 162 轮:首次接管用户浏览器时,函数开头读到的 connect_mode 还是
+            // false(尚未连接),必须以 new_page 完成后的真实状态回报,否则
+            // connect 模式首开的响应 connect_mode 误报 false(实测 9222 有调试
+            // Chrome 时单测 open_reuse_existing_returns_3002_or_succeeds 命中)。
+            let connected_now = BrowserManager::global().is_connect_mode().await;
             // 第 142 轮:connect 模式(接管外部浏览器)判定,供 guard/overlay 字段分路提示。
-            // (第 146 轮:connect_mode 已在函数开头取过 —— origin 复用兜底也要用)
             // 第 143 轮:管控状态双字段(读实例真实期望态,理由见 guard_response_fields)。
             let (guard_field, overlay_field) =
-                guard_response_fields(effective_mode, connect_mode).await;
+                guard_response_fields(effective_mode, connected_now).await;
             let mut data = json!({
                 "page_id": page_id,
                 "title": title,
@@ -885,7 +897,7 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                 "browser_reused": browser_reused,
                 "highlight": highlight && effective_mode.is_headed(),
                 // 第 142 轮:connect 模式 = 接管用户外部浏览器,close 只断连不关浏览器。
-                "connect_mode": connect_mode,
+                "connect_mode": connected_now,
                 // 第 143 轮:页面管控三档状态(locked/open/partial)。
                 "guard": guard_field,
                 // 第 141 轮 legacy 字段(enabled ≡ guard.mode==locked),派生保留。
@@ -928,6 +940,14 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
             // 透出证据与处置,Agent 不必再盲试 reload 才发现不可达。
             if let Some(v) = page_health_field(&page_id, &final_url).await {
                 data["page_health"] = v;
+            }
+            // 第 162 轮:地理位置原生权限弹窗自动处置 —— 导航完成后对页面 origin
+            // CDP 预授权,弹窗永不出现(connected_now 覆盖首次接管场景,不干预
+            // 用户浏览器的权限设置)。
+            if !connected_now {
+                if let Some(v) = BrowserManager::global().auto_geo_permission(&page_id).await {
+                    data["permissions"] = v;
+                }
             }
             // 第 146 轮:访问台账记账(新建页面导航成功后;重复访问警示随响应附带)
             visit_ledger::record_visit(
@@ -1306,7 +1326,7 @@ pub struct McpWebUseTool;
 /// 作业规范部分精炼,全文见 SubAgent-Work 系统提示词的 MCP_Web_Use 段)。
 const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器操作网页(macOS / Windows / Linux,内存无头浏览器默认,也可接管已开浏览器;MCP 风格单工具多 action)。
 用 action 参数选择操作:
-- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, guard?, allow_selectors?, block_selectors?, guard_note?, overlay?, timeout_ms?, reuse_existing?, auto_relaunch?): 启动/接管 Chromium 并打开页面。**默认可见窗口(mode=headed,第 139 轮)**——不要为了「省资源」主动传 hidden,除非任务明确要求静默后台跑;无 GUI 会话(CI/容器/SSH)会自动回退 hidden,可用 LAEW_BROWSER_MODE 强制。使用一次性临时 profile,不干扰用户日常浏览器;**headed 缺省把窗口铺满屏幕工作区并置前**(响应 data.headed_window.fill_ratio 回报实际铺满率,勿再自行传 window_width/window_height —— 显式指定会关闭铺满、改为只做「不溢出」收边);highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;**页面管控三档(第 143 轮,guard 参数,缺省 locked)**:locked=屏蔽模式(半透明蒙层+锁定人工输入,人工可实时观看不可点击,防交叉操作;Agent 输入动作自动「先解后锁」不受影响,人工交互一律走 request_human 默认自动解锁)/ open=非屏蔽模式(人工可直接操作页面,状态条明示「🔓 页面开放」,用于人工亲自操作、人工登录先行流)/ partial=部分屏蔽模式(须同时给 allow_selectors 白名单「只有命中区人工可操作」或 block_selectors 黑名单「命中区人工不可操作」之一,互斥,各 ≤8 条;盾区内人工不可操作、盾区外放行,Agent 动作自动「先隐盾后复盾」);guard_note(≤60 字符)写进页面状态条第三行引导人工(如「请登录后应答弹窗,Agent 将接管后续操作」);缺省随 LAEW_WEB_GUARD;仅 headed 生效;运行时切换 control(set_guard);legacy overlay 布尔参数保留(true≡locked/false≡open,显式传 guard 时被忽略);timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。**复用已登录浏览器(第 142 轮)**:reuse_existing=true 自动探测本机调试端口(默认 9222,LAEW_CHROME_DEBUG_PORT 可覆盖;依次尝试 localhost/[::1]/127.0.0.1 —— Chrome 154+ 的 DevTools HTTP 端点只服务 IPv6 loopback 连接,IPv4 返回 404)并接管用户已登录的 Chrome(保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port + data.browser_version + data.connect_mode=true;探测失败返回 code=3002 + data.relaunch_command(平台相关重启命令,转述用户执行,或 auto_relaunch=true 重试,由工具自动复制登录态并另启独立调试 Chrome 实例,不退出、不影响用户已打开的浏览器);connect 模式 close 只断连不关用户浏览器,默认不锁人工输入(管控恒为 open 且零注入,需要时 set_guard 手动开)。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);**同 origin 兜底复用(第 146 轮)**:精确未命中但存在同 scheme+host+port 的存活页面(取最早打开的主工作页)时,在该页面上原地导航复用(响应 reuse_match=origin + previous_url),长遍历任务不再因路由不同新开冗余标签页、登录态与页面上下文不丢失;connect 模式(接管用户浏览器)不做 origin 兜底,绝不导航用户自己的标签页;浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**窗口收边(第 139 轮,默认开)**:headed 模式下导航完成后按屏幕工作区自动收窄窗口(小屏笔记本不再把窗口挤出屏外「显示不全」),并保证页面视口不低于 720p,结果回 data.headed_window。**视口自适应(默认开)**:窗口铺满后页面视口即随窗口自适应(下限 720p);若页面内容仍超出视口(横向被裁/可视高度不足),再把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。**主文档健康诊断 data.page_health(第 161 轮)**:页面空白(主文档状态 ≥400 或空 DOM)时响应附带 {blank, reason=main_doc_error|empty_dom, main_doc_status, note, next_action}——main_doc_error 表示服务器/WAF 拒绝(reload 无效),按 next_action 改道 open(reuse_existing=true) 复用已登录浏览器或 request_human,不要反复 reload;页面正常时不带该字段。返回 {page_id,title,final_url,reused,mode,browser_reused,connect_mode,window,guard,overlay(legacy),headed_window?,viewport?,page_health?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
+- open(url*, mode?, reuse?, connect_url?, user_agent?, wait_until?, window_width?, window_height?, auto_expand_viewport?, highlight?, guard?, allow_selectors?, block_selectors?, guard_note?, overlay?, timeout_ms?, reuse_existing?, auto_relaunch?): 启动/接管 Chromium 并打开页面。**默认可见窗口(mode=headed,第 139 轮)**——不要为了「省资源」主动传 hidden,除非任务明确要求静默后台跑;无 GUI 会话(CI/容器/SSH)会自动回退 hidden,可用 LAEW_BROWSER_MODE 强制。使用一次性临时 profile,不干扰用户日常浏览器;**headed 缺省把窗口铺满屏幕工作区并置前**(响应 data.headed_window.fill_ratio 回报实际铺满率,勿再自行传 window_width/window_height —— 显式指定会关闭铺满、改为只做「不溢出」收边);highlight=true(默认)时 headed 窗口页面四周显示一圈蓝色选中边框+右上角「LAEW Agent 控制中」徽标,人工可一眼识别 Agent 控制的窗口;**页面管控三档(第 143 轮,guard 参数,缺省 locked)**:locked=屏蔽模式(半透明蒙层+锁定人工输入,人工可实时观看不可点击,防交叉操作;Agent 输入动作自动「先解后锁」不受影响,人工交互一律走 request_human 默认自动解锁)/ open=非屏蔽模式(人工可直接操作页面,状态条明示「🔓 页面开放」,用于人工亲自操作、人工登录先行流)/ partial=部分屏蔽模式(须同时给 allow_selectors 白名单「只有命中区人工可操作」或 block_selectors 黑名单「命中区人工不可操作」之一,互斥,各 ≤8 条;盾区内人工不可操作、盾区外放行,Agent 动作自动「先隐盾后复盾」);guard_note(≤60 字符)写进页面状态条第三行引导人工(如「请登录后应答弹窗,Agent 将接管后续操作」);缺省随 LAEW_WEB_GUARD;仅 headed 生效;运行时切换 control(set_guard);legacy overlay 布尔参数保留(true≡locked/false≡open,显式传 guard 时被忽略);timeout_ms 控制页面加载超时(毫秒,默认 60000,内网慢速网站可加大)。connect_url 接管已用 --remote-debugging-port 启动的浏览器。**复用已登录浏览器(第 142 轮)**:reuse_existing=true 自动探测本机调试端口(默认 9222,LAEW_CHROME_DEBUG_PORT 可覆盖;依次尝试 localhost/[::1]/127.0.0.1 —— Chrome 154+ 的 DevTools HTTP 端点只服务 IPv6 loopback 连接,IPv4 返回 404)并接管用户已登录的 Chrome(保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port + data.browser_version + data.connect_mode=true;探测失败返回 code=3002 + data.relaunch_command(平台相关重启命令,转述用户执行,或 auto_relaunch=true 重试,由工具自动复制登录态并另启独立调试 Chrome 实例,不退出、不影响用户已打开的浏览器);connect 模式 close 只断连不关用户浏览器,默认不锁人工输入(管控恒为 open 且零注入,需要时 set_guard 手动开)。同 URL 已有存活页面时默认复用(导航刷新,响应 reused:true 且 page_id 不变;reuse=false 强制新开);**同 origin 兜底复用(第 146 轮)**:精确未命中但存在同 scheme+host+port 的存活页面(取最早打开的主工作页)时,在该页面上原地导航复用(响应 reuse_match=origin + previous_url),长遍历任务不再因路由不同新开冗余标签页、登录态与页面上下文不丢失;connect 模式(接管用户浏览器)不做 origin 兜底,绝不导航用户自己的标签页;浏览器实例已存在时永远复用同一进程(响应 browser_reused:true + 真实 mode),不重复打开多个浏览器。**窗口收边(第 139 轮,默认开)**:headed 模式下导航完成后按屏幕工作区自动收窄窗口(小屏笔记本不再把窗口挤出屏外「显示不全」),并保证页面视口不低于 720p,结果回 data.headed_window。**视口自适应(默认开)**:窗口铺满后页面视口即随窗口自适应(下限 720p);若页面内容仍超出视口(横向被裁/可视高度不足),再把视口扩展到 ≤2560×1440(2K)并回 data.viewport(expanded/from/to/content/clamped/hint)——根治「视口太窄页面显示不全、元素不可见不可点」;auto_expand_viewport=false 可关;内容仍超 2K 上限时按 hint 走 full_page 截图或 set_viewport 显式超限。**主文档健康诊断 data.page_health(第 161 轮)**:页面空白(主文档状态 ≥400 或空 DOM)时响应附带 {blank, reason=main_doc_error|empty_dom, main_doc_status, note, next_action}——main_doc_error 表示服务器/WAF 拒绝(reload 无效),按 next_action 改道 open(reuse_existing=true) 复用已登录浏览器或 request_human,不要反复 reload;页面正常时不带该字段。**地理位置授权自动处置 data.permissions(第 162 轮)**:open/navigate 导航完成后对页面 origin 自动预授权,Chrome 原生地理位置弹窗不再出现(不再拖住任务等人工点选);响应附带 {geolocation: granted|denied|skipped, mode, origin},缺省 grant,可用 LAEW_WEB_GEO=deny/prompt 改档,connect 模式(接管用户浏览器)不干预。返回 {page_id,title,final_url,reused,mode,browser_reused,connect_mode,window,guard,overlay(legacy),headed_window?,viewport?,page_health?,next_steps}。未检测到浏览器返回 code=3001(确定性失败,如实告知用户安装引导,不要重试)。
 - list(): 列出当前存活页面 [{page_id,url,title,created_at}];返回前自动清理失效 entry。冷启动后多轮任务优先用它同步页面索引。
 - close(page_id*): 关闭指定页面;最后一个页面关闭时回收浏览器进程。page_id="all" 一键关闭全部页面并回收浏览器(任务收尾清场)。幂等;对话型页面(用户可能继续追问)可保留复用。
 - control(page_id*, control_action*, params?): 全部写操作统一入口。control_action 枚举:click/human_click/right_click/double_click/hover/scroll/scroll_to/key_press/press_sequence/input_text/human_input/clear_input/select_option/select_dropdown/upload_file/download/new_tab/close_tab/navigate/back/forward/reload/wait/eval_js/set_cookie/delete_cookie/set_storage/clear_storage/set_viewport/screenshot/heartbeat/drag/focus/blur/mouse_move/dispatch_event/set_window/sync_viewport/set_highlight/set_overlay/set_guard/auto_follow/request_human。点击链接/new_tab 派生的新标签页经响应 spawned_page_id 回传,后续操作新页面必须用新 page_id。screenshot 一律落盘返回 save_path(看图片文字用 params.ocr=true,文本模型无法消费 base64);eval_js 直接写表达式,支持 return 与多语句(失败自动 IIFE 重试),超长返回值自动落盘并以 saved_to 引用;单次执行有超时兜底(默认 30s,await_promise=true 时 60s,可用 params.timeout_ms 指定、上限 120s——页内 Promise 轮询等合法长等待必须显式传 timeout_ms),超时返回 2002 并附「页面可能弹出人工验证」的处置指引;download 支持 http(s) url 或 selector、save_dir、filename、timeout_ms,data: URL 直接解码落盘,完成后返回绝对 save_path 与 byte_size。set_window 运行时调整真实浏览器窗口(width/height/left/top/window_state=maximized|fullscreen|minimized|normal,CDP setWindowBounds,调整后自动清除视口覆盖保证渲染自适应不缺区域);sync_viewport 在人工拖动窗口大小后调用,清除 device metrics 覆盖使视口=窗口内容区(会撤销 open 时的自动 2K 扩展);set_viewport(width,height,device_scale_factor?=1,mobile?=false) 手动设置布局视口(宽 320~7680/高 240~4320 自动 clamp;open 已默认自动扩展视口,仅当自动结果不理想时才手动指定);set_highlight(enabled) 运行时开关蓝色选中边框;auto_follow(enabled?=true | scroll_to_bottom?=true) 第 152 轮新增的「自动跟随最新内容」开关——多轮对话站(聊天/论坛/工单)消息栈不断变长时,人工在 locked 档**无法自行滚动**(CDP Input.setIgnoreInputEvents 连滚轮一并拦),必须由页面自己停在最新;跟随器仅在「用户本来就在底部」时吸底,人工往上翻历史不会被拽回;scroll_to_bottom=true 表示不改开关、立刻吸底一次;导航后按期望态自动重挂;set_guard(mode?="locked"|"open"|"partial", allow_selectors?, block_selectors?, note?) 运行时切换页面管控三档(第 143 轮,推荐;字段缺省=保持现值,空数组/空串=清除;partial 校验同 open);set_overlay(enabled) 蒙层开关 legacy 别名(true=set_guard(locked),false=set_guard(open),仅 headed 生效);request_human(reason=captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom, message?, options?, timeout_ms? 缺省按 reason 分档 captcha/sms/two_factor=120s 其余 300s, bring_to_front?=true, image_path? 指定已有截图文件, unlock_page?=true 提问期间自动放行页面供人工直接操作(第 144 轮:优先 partial 白名单挖洞,只放行账号/密码/验证码等人工必填输入区域——自动探测,或 allow_selectors? 显式指定 ≤8 条;探测不到才整页切 open;应答/超时/取消后自动恢复原档;open 下无需动作;纯问答场景传 false;提问期间人工提交表单触发导航会自动重放放行态,多步登录不断链)) 人工介入:滑块/短信验证码/扫码登录/实名认证/人脸核身/2FA 邮箱验证码/第三方 OAuth 等无法自动跳过的流程。reason=captcha 时会自动截取当前视口(或用 image_path 指定已保存的截图),弹窗内直接展示验证码图片,人工读码后填入输入框即可,不必切换窗口。macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时+时间轴,文案可鼠标选中复制,人工在弹窗点选项/输入文本/取消,-p 模式同样可弹;第 145 轮:主按钮为「提交 / 继续」双语义——有输入=提交验证码/动态码文本,空输入=选项 1(人工在浏览器完成操作后的交棒动作);另有「⏱ +2分钟」按钮延长等待,总上限 30 分钟;TUI 兜底行读),code=0 时 human_response 为人工回答(assist_channel 标注 gui/tui;next_hint 按「输码 vs 已完成」分流——自由文本验证码立即 input_text 填入提交,选项应答才 inspect 验证),人工取消返回 code=4002,超时或弹窗与 TUI 均不可用返回 code=4001(如实告知用户改用交互模式重试,严禁伪造结果),**4003=人工介入进行中**(提问未结束时页面归人工所有,输入类动作与可变更 eval_js 会被挂起,人工应答后重试即可,确认无并发人工操作可加 params.force=true)。

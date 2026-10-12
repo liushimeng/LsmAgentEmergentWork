@@ -810,6 +810,20 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
     if let Some(note) = super::visit_ledger::visit_note(url) {
         out["visit_note"] = note;
     }
+    // 第 162 轮:跨 origin 导航后重放地理位置预授权(新 origin 弹窗不再卡流程;
+    // connect 模式接管用户浏览器不干预;fail-open)。new_tab 派生页的跨站
+    // 场景由 `--deny-permission-prompts` 兜底瞬时拒绝,不会挂起。
+    if !crate::agent::browser::BrowserManager::global()
+        .is_connect_mode()
+        .await
+    {
+        if let Some(v) = crate::agent::browser::BrowserManager::global()
+            .auto_geo_permission(id)
+            .await
+        {
+            out["permissions"] = v;
+        }
+    }
     Ok(out)
 }
 
