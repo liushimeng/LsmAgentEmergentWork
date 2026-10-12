@@ -2407,3 +2407,145 @@ fn dom_tree_js_document_root_descends_children() {
         "attributes 采集分支不应混入 childNodes 遍历"
     );
 }
+
+// =================== 第 161 轮:视口铺满 + 主文档健康诊断(#[ignore] 真浏览器) ===================
+//
+// 根治对象:chromiumoxide BrowserConfig 默认 viewport=Some(800×600) 把三模式页面
+// 视口钉死(headed 窗口 1920×1080 内容只渲染左上 800×600,其余空白)。修复后:
+// - headed:viewport(None) → 页面视口 = 窗口内容区(≈1920×940);
+// - hidden/new_headless:显式 viewport=窗口尺寸 → 恒 1920×1080。
+// 跑法:`cargo test --lib mcp_web_use -- --ignored --nocapture`(需本机 Chrome)。
+
+/// 相位 1(headed)+ 相位 2(hidden):两相位共用进程内单例,相位间 shutdown 重启。
+#[tokio::test]
+#[ignore = "需要本机真实 Chrome(headed 会弹窗口);本地手动跑"]
+async fn real_browser_viewport_fills_window() {
+    let mgr = BrowserManager::global();
+
+    // —— 相位 1:headed 默认窗口(1920×1080 外框),视口应铺满内容区 ——
+    let (pid, _, _) = mgr
+        .new_page(
+            "about:blank",
+            BrowserMode::Headed,
+            None,
+            None,
+            None,
+            false,
+            crate::agent::browser_overlay::PageGuardConfig::open(),
+        )
+        .await
+        .expect("启动有头浏览器失败(本机是否装有 Chrome?)");
+    let page = mgr.page(&pid).await.expect("page 句柄");
+    let v = page
+        .evaluate("({w: window.innerWidth, h: window.innerHeight, ow: window.outerWidth, oh: window.outerHeight})")
+        .await
+        .expect("测量视口失败")
+        .value()
+        .cloned()
+        .expect("测量结果为空");
+    let (w, h) = (v["w"].as_f64().unwrap_or(0.0), v["h"].as_f64().unwrap_or(0.0));
+    let (ow, oh) = (v["ow"].as_f64().unwrap_or(0.0), v["oh"].as_f64().unwrap_or(0.0));
+    println!("headed 视口 {w}×{h},窗口外框 {ow}×{oh}");
+    assert!(ow >= 1900.0, "默认窗口外框应 1920×1080,实测 {ow}×{oh}");
+    assert!(
+        w >= 1600.0 && h >= 800.0,
+        "headed 视口应铺满窗口内容区(修复前钉死 800×600),实测 {w}×{h}(窗口 {ow}×{oh})"
+    );
+    mgr.shutdown().await;
+
+    // —— 相位 2:hidden 显式视口 = 窗口尺寸 1920×1080(不再依赖内容超限才扩展) ——
+    let (pid2, _, _) = mgr
+        .new_page(
+            "about:blank",
+            BrowserMode::Hidden,
+            None,
+            None,
+            None,
+            false,
+            crate::agent::browser_overlay::PageGuardConfig::open(),
+        )
+        .await
+        .expect("重启无头浏览器失败");
+    let page2 = mgr.page(&pid2).await.expect("page 句柄");
+    let v2 = page2
+        .evaluate("({w: window.innerWidth, h: window.innerHeight})")
+        .await
+        .expect("测量视口失败")
+        .value()
+        .cloned()
+        .expect("测量结果为空");
+    let (w2, h2) = (v2["w"].as_f64().unwrap_or(0.0), v2["h"].as_f64().unwrap_or(0.0));
+    println!("hidden 视口 {w2}×{h2}");
+    assert!(
+        (w2 - 1920.0).abs() <= 2.0 && (h2 - 1080.0).abs() <= 2.0,
+        "hidden 视口应恒 1920×1080(修复前钉死 800×600),实测 {w2}×{h2}"
+    );
+    mgr.shutdown().await;
+}
+
+/// 云智眼真站点回归:视口铺满 + page_health 与页面真实状态自洽。
+/// 服务器行为可能变化(某天放行 200),故断言写成条件式:页面空白 ⇒ 必须报
+/// page_health(reason ∈ {main_doc_error, empty_dom});页面有真实内容 ⇒ 不带该字段。
+#[tokio::test]
+#[ignore = "需要网络 + 本机真实 Chrome(headed 会弹窗口);本地手动跑"]
+async fn real_browser_yunzhiyan_viewport_and_page_health() {
+    let mgr = BrowserManager::global();
+    let url = "https://vcm.cucloud.cn:20233/yunzhiyan-manager/login";
+    let (pid, _, final_url) = mgr
+        .new_page(
+            url,
+            BrowserMode::Headed,
+            None,
+            None,
+            None,
+            false,
+            crate::agent::browser_overlay::PageGuardConfig::open(),
+        )
+        .await
+        .expect("打开云智眼登录页失败(网络不可达?)");
+    let page = mgr.page(&pid).await.expect("page 句柄");
+    // 视口铺满断言(与服务器是否放行无关)。
+    let v = page
+        .evaluate("({w: window.innerWidth, h: window.innerHeight})")
+        .await
+        .expect("测量视口失败")
+        .value()
+        .cloned()
+        .expect("测量结果为空");
+    let (w, h) = (v["w"].as_f64().unwrap_or(0.0), v["h"].as_f64().unwrap_or(0.0));
+    println!("云智眼页面视口 {w}×{h}");
+    assert!(
+        w >= 1600.0 && h >= 800.0,
+        "云智眼页面视口应铺满窗口内容区,实测 {w}×{h}"
+    );
+    // page_health 自洽性断言:排除注入层后的真实 DOM 元素数决定期望。
+    let real = page
+        .evaluate("document.querySelectorAll('*:not([data-laew-agent])').length")
+        .await
+        .expect("统计 DOM 失败")
+        .value()
+        .and_then(|x| x.as_f64())
+        .unwrap_or(-1.0) as i64;
+    let health = page_health_field(&pid, &final_url).await;
+    println!("真实元素数 {real},page_health = {health:?}");
+    if real <= 3 {
+        let h = health.expect("空白页必须透出 page_health(不再让 Agent 盲试 reload)");
+        let reason = h["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason == "main_doc_error" || reason == "empty_dom",
+            "reason 应为结构性判定,实测 {reason}"
+        );
+        if reason == "main_doc_error" {
+            assert!(
+                h["main_doc_status"].as_i64().unwrap_or(0) >= 400,
+                "main_doc_error 必须携带 ≥400 的状态码"
+            );
+        }
+    } else {
+        assert!(
+            health.is_none(),
+            "页面有真实内容({real} 个元素)时不应误报 page_health:{health:?}"
+        );
+    }
+    mgr.shutdown().await;
+}

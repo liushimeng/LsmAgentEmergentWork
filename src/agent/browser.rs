@@ -474,6 +474,34 @@ impl BrowserManager {
                 // SaaS)横向被裁导致元素不可见、不可点,截图也显示不全。
                 let (win_w, win_h) = window_size.unwrap_or_else(default_window_size);
                 builder = builder.window_size(win_w, win_h);
+                // 第 161 轮:视口策略根治 —— chromiumoxide BrowserConfig 默认
+                // `viewport: Some(Viewport::default()=800×600)`,每个 page target
+                // 初始化都会发 `Emulation.setDeviceMetricsOverride(800,600)` 把页面
+                // 视口钉死;`hide()`(老式 headless)会清掉默认视口,但我们用的
+                // `with_head()`/`new_headless_mode()` 不清 —— 实测云智眼任务 headed
+                // 窗口外框 1920×1080、页面只渲染左上 800×600,右侧/下方大片空白
+                // (用户看到「白屏且显示区域没有铺满浏览器」);第 156 轮「macOS 上
+                // inner 恒 800×600 是布局时序」实为该覆盖钉死(Windows 同样中招),
+                // `chrome_height_raw=480` 失真同源;hidden 同被钉死,仅因内容超视口
+                // 时 fit_viewport_to_content 自动扩展而被掩盖。策略:headed 禁用视口
+                // 仿真(Playwright `viewport:null` 同款,页面视口=窗口内容区,天然
+                // 铺满,人工拖动窗口后自适应);两档 headless 显式 viewport=窗口尺寸
+                // (headless 窗口即视口,确定性 1920×1080)。connect 模式不受影响
+                // (`Browser::connect` 走 HandlerConfig::default(),viewport 本就 None)。
+                builder = match mode {
+                    BrowserMode::Headed => builder
+                        .viewport(None::<chromiumoxide::handler::viewport::Viewport>),
+                    BrowserMode::Hidden | BrowserMode::NewHeadless => {
+                        builder.viewport(chromiumoxide::handler::viewport::Viewport {
+                            width: win_w,
+                            height: win_h,
+                            device_scale_factor: None,
+                            emulating_mobile: false,
+                            is_landscape: false,
+                            has_touch: false,
+                        })
+                    }
+                };
                 // 一次性 user-data-dir:避免 chromiumoxide 默认固定目录的 SingletonLock 冲突
                 // (并行/上次异常退出后残留锁会导致 Chrome 拒启),同时与用户日常 profile 隔离。
                 let dir = std::env::temp_dir().join(format!("laew_browser_{}", {
