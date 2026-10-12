@@ -95,6 +95,22 @@ pub enum AgentError {
     #[error("WorkFlow 解析失败: {0}")]
     WorkflowParse(String),
 
+    /// Main-Work **主动弃权**(第 156 轮):JSON 解析成功且 `workflows` 为空,
+    /// 但 `summary` 带实质说明 —— 这是模型交付的一个**合法零单元计划**
+    /// (「不予编排,需回到用户澄清/改题」),不是解析失败。
+    ///
+    /// 此前两者被混为一谈:解析层一律转 [`AgentError::WorkflowParse`],
+    /// `main_work/mod.rs` 的兜底分支接住后构造了一个「照原任务执行」的通用
+    /// WorkFlow,把模型明确拒绝执行的任务又执行了一遍。实测(`llaew_20261012_102053.log`)
+    /// 白烧 **156.89s / 12.4 万 input token**,终态还记为「✅ 成功」。
+    ///
+    /// **设计边界**:本变体只承载「模型已作出决定」这一事实,**不做任何拒绝判定** ——
+    /// 判断权始终在模型手里(与「编排器无政策性拒绝门」原则一致)。
+    /// 判据是**结构性**的(零单元 + 非空 summary),不涉及任何措辞/关键词匹配,
+    /// 因此不复活已整体移除的 `safety/refusal.rs::detect_refusal` 机械短语检测。
+    #[error("Main-Work 主动弃权(零 WorkFlow 计划): {summary}")]
+    WorkflowAbstain { summary: String },
+
     #[error("WorkFlow 拓扑错误: {0}")]
     WorkflowTopology(String),
 

@@ -195,8 +195,29 @@ pub(super) struct QualityFailure {
     pub(super) completed_digest: String,
 }
 
-/// 同因熔断器 —— 连续 N 轮失败原因完全相同即熔断,提前终止重试。
+/// 执行层(`run_medium`)的非质量失败出口(第 156 轮)。
 ///
+/// 与 [`QualityFailure`] 分开建模,是因为两者的**收口语义完全不同**:
+/// - [`ExecFailure::Quality`] —— 失败,进重试/回流 Yolo 链路(既有行为不变);
+/// - [`ExecFailure::Abstain`] —— Main-Work **主动弃权**(零 WorkFlow 计划),
+///   不是失败,是「模型已决定不做」。应如实转达 `text` 给用户并直接收口,
+///   绝不能重试、也绝不能退回兜底 WorkFlow 继续执行。
+///
+/// 为什么不复用 `QualityFailure`:该结构有 15 处字面量构造点,加字段要全量机械改;
+/// 独立枚举把改动收敛在 `run_medium` 一个函数内,`QualityFailure` 零改动。
+#[derive(Debug)]
+pub(super) enum ExecFailure {
+    Quality(QualityFailure),
+    Abstain { text: String, usage: Usage },
+}
+
+impl From<QualityFailure> for ExecFailure {
+    fn from(q: QualityFailure) -> Self {
+        ExecFailure::Quality(q)
+    }
+}
+
+/// 同因熔断器 —— 连续 N 轮失败原因完全相同即熔断,提前终止重试。///
 /// 背景(2026-10-10 实测):Plan 解析失败三轮完全同因(「未解析出任何
 /// WorkFlow」),retry_hint 已注入仍原样失败,每轮照烧 Plan+QC ~107s。
 /// 同因第 3 次重试的先验成功率极低,熔断把浪费上界从 max_retry_per_level

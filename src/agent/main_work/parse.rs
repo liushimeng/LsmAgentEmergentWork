@@ -12,6 +12,9 @@ use super::*;
 /// 智能引号 / 嵌套中文角括号 / 中文字符串内层 ASCII `"` / Unicode Modifier Letter
 /// 块(`ᴬᴵᴬ` 等)/ 控制字符 5 类错误模式归一化,根因修复上一轮「Main-Work 反复重拆」
 /// 死循环。`extract_json_block` 已经切出 JSON 段,sanitize 不会破坏外层 LLM 解释文字。
+///
+/// 第 156 轮:零单元计划改走 [`check_zero_unit_plan`] 分流 —— 「模型主动弃权」
+/// (`WorkflowAbstain`)与「真解析失败」(`WorkflowParse`)自此不再混为一谈。
 pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
     if let Some(json_str) = extract_json_block(text) {
         // P0-A:先 sanitize 再进 json_repair 修复链(关联:workflow_json_validate.rs)
@@ -22,11 +25,7 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         // 第 135 轮:`workflows` 是 `#[serde(default)]`,空数组会「解析成功但产出零单元」,
         // 让 `execute_workflows` 零单元收口 —— 与 `plan_validate.rs:168` 的空检查
         // 不一致(该检查只在 Plan 路径)。统一按解析失败处理,交给既有兜底分支。
-        if plan.workflows.is_empty() {
-            return Err(AgentError::WorkflowParse(
-                "WorkFlow JSON 解析成功但 workflows 为空".into(),
-            ));
-        }
+        check_zero_unit_plan(&plan)?;
         dedup_workflow_ids(&mut plan);
         // 2026-09-16 F2:归一化 depends_on(剥离 LLM 附加的变量透传注释)
         sanitize_depends_on(&mut plan);
@@ -40,11 +39,7 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         let sanitized = crate::agent::workflow_json_validate::sanitize_workflow_text(json_str);
         let mut plan: WorkFlowPlan = crate::agent::json_repair::try_parse_lenient(&sanitized)
             .map_err(AgentError::WorkflowParse)?;
-        if plan.workflows.is_empty() {
-            return Err(AgentError::WorkflowParse(
-                "WorkFlow JSON 解析成功但 workflows 为空".into(),
-            ));
-        }
+        check_zero_unit_plan(&plan)?;
         dedup_workflow_ids(&mut plan);
         sanitize_depends_on(&mut plan);
         infer_delegate_to_for_plan(&mut plan);
@@ -66,6 +61,32 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
     Err(AgentError::WorkflowParse(
         "未找到合法的 WorkFlow JSON(或可识别的 Markdown 编排表)".into(),
     ))
+}
+
+/// 零单元计划分流(第 156 轮):把「解析成功但 workflows 为空」拆成两种语义。
+///
+/// - `summary` **非空** → 模型交付了一个带实质说明的零单元计划(典型形态:
+///   「不予编排,需回到用户澄清/改题」)。这是模型的**主动弃权**,返回
+///   [`AgentError::WorkflowAbstain`] 上抛,由编排层如实转达给用户,
+///   **不再**退回「照原任务执行」的兜底 WorkFlow。
+/// - `summary` **为空** → 没有说明可转达,等同于什么都没产出出来,
+///   维持第 135 轮行为按 [`AgentError::WorkflowParse`] 交给既有兜底分支。
+///
+/// 判据是纯**结构性**的(零单元 + 非空 summary),不含任何措辞/关键词匹配,
+/// 因此不引入政策性拒绝判定,判断权始终在模型手里。
+fn check_zero_unit_plan(plan: &WorkFlowPlan) -> Result<()> {
+    if !plan.workflows.is_empty() {
+        return Ok(());
+    }
+    let summary = plan.summary.trim();
+    if summary.is_empty() {
+        return Err(AgentError::WorkflowParse(
+            "WorkFlow JSON 解析成功但 workflows 为空".into(),
+        ));
+    }
+    Err(AgentError::WorkflowAbstain {
+        summary: summary.to_string(),
+    })
 }
 
 fn extract_json_block(text: &str) -> Option<&str> {

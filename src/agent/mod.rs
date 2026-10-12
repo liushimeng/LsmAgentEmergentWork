@@ -20,6 +20,7 @@ pub mod browser_noise;
 pub mod browser_overlay;
 pub mod browser_reuse;
 pub mod browser_viewport;
+pub mod browser_window;
 pub mod browser_watchdog;
 pub mod cancel;
 pub mod compact;

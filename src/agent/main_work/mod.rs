@@ -317,7 +317,21 @@ impl MainWorkRunner {
             || decomposition.iter().any(|d| self_drawn_keywords.iter()
                 .any(|kw| d.to_lowercase().contains(&kw.to_lowercase())));
 
-        let mut plan = parse_workflow_plan(&text).unwrap_or_else(|e| {
+        // 第 156 轮:「模型主动弃权」不是解析失败,必须原样上抛,**不进兜底分支**。
+        // 此前两者被混为一谈,兜底构造的通用 WorkFlow 会把模型明确拒绝执行的任务
+        // 再执行一遍(实测白烧 156.89s / 12.4 万 input token,终态还记「✅ 成功」)。
+        // 判据结构性(零单元 + 非空 summary),不含措辞匹配,判断权始终在模型手里。
+        let parsed = parse_workflow_plan(&text);
+        if let Err(AgentError::WorkflowAbstain { summary }) = &parsed {
+            tracing::warn!(
+                "Main-Work 主动弃权(零 WorkFlow 计划),不执行并如实转达用户: {}",
+                summary.chars().take(200).collect::<String>()
+            );
+            return Err(AgentError::WorkflowAbstain {
+                summary: summary.clone(),
+            });
+        }
+        let mut plan = parsed.unwrap_or_else(|e| {
             tracing::warn!("Main-Work 解析失败,使用兜底 WorkFlow: {}", e);
             // F2:兜底 acceptance 继承 Yolo 分解步骤(可验证清单),不再退化「完成目标」;
             // degraded=true 供 run_medium 跳过 QC-main,消除必败重试循环。

@@ -439,11 +439,15 @@ impl MultiAgentOrchestrator {
                 retry_count,
                 "进入执行链路"
             );
-            let exec_result = match classification.task_level {
-                TaskLevel::Simple => {
-                    self.run_simple(&classification, session, cancel, progress, &retry_hint)
-                        .await
-                }
+            // 第 156 轮:统一收敛到 `ExecFailure` 出口 —— Simple/Hard 的质量失败
+            // 原样包进 `Quality`(既有重试/回流语义零变化),Medium 额外多出
+            // 「Main-Work 主动弃权」这一非失败出口。
+            let exec_result: std::result::Result<TaskResult, ExecFailure> =
+                match classification.task_level {
+                TaskLevel::Simple => self
+                    .run_simple(&classification, session, cancel, progress, &retry_hint)
+                    .await
+                    .map_err(ExecFailure::Quality),
                 TaskLevel::Medium => {
                     self.run_medium(
                         &classification,
@@ -456,8 +460,8 @@ impl MultiAgentOrchestrator {
                     )
                     .await
                 }
-                TaskLevel::Hard => {
-                    self.run_hard(
+                TaskLevel::Hard => self
+                    .run_hard(
                         &classification,
                         session,
                         cancel,
@@ -466,7 +470,47 @@ impl MultiAgentOrchestrator {
                         &completed_digest,
                     )
                     .await
+                    .map_err(ExecFailure::Quality),
+            };
+
+            // Main-Work 主动弃权(零 WorkFlow 计划)—— 模型已决定不执行,这是
+            // **决定**而非**失败**:不重试、不回流 Yolo、不退回兜底 WorkFlow,
+            // 而是如实把模型的说明转达用户后直接收口。与既有 `clarification_needed`
+            // 与 Yolo 直答短路两条分支同构。
+            // 实测收益(`llaew_20261012_102053.log`):原链路 156.89s / 12.4 万
+            // input token 且终态谎报「✅ 成功」→ 此处秒级收口 + 如实输出。
+            let exec_result = match exec_result {
+                Err(ExecFailure::Abstain { text, usage }) => {
+                    let total_usage = add_usage(yolo_usage, usage);
+                    Self::check_cancelled(cancel)?;
+                    emit_progress(progress, "Main-Work 主动弃权(零流程计划),如实转达不执行");
+                    info!(
+                        session = %session.id(),
+                        outcome = "main_work_abstain",
+                        reason_chars = text.chars().count(),
+                        usage_in = total_usage.input_tokens,
+                        usage_out = total_usage.output_tokens,
+                        wallclock_ms = task_started.elapsed().as_millis() as u64,
+                        "任务收口"
+                    );
+                    self.dbg_task_end(
+                        "main_work_abstain",
+                        "Main-Work 主动弃权,未编排任何流程",
+                        "",
+                        total_usage,
+                    );
+                    return Ok(OrchestrationOutcome::DirectAnswer {
+                        text,
+                        classification,
+                        usage: total_usage,
+                    });
                 }
+                // 其余出口降回 QualityFailure,既有重试/回流链路语义零变化。
+                other => other.map_err(|e| match e {
+                    ExecFailure::Quality(q) => q,
+                    // 弃权分支已在本 match 臂内 return,不可达。
+                    ExecFailure::Abstain { .. } => unreachable!("弃权分支已在上方臂处理"),
+                }),
             };
 
             match exec_result {
@@ -841,6 +885,30 @@ impl MultiAgentOrchestrator {
 
     // ========== 中等档 ==========
 
+    /// Main-Work 拆解错误的出口分流(第 156 轮,纯函数可单测)。
+    ///
+    /// 根因:「Main-Work 主动弃权(零 WorkFlow 计划)」此前与「真·拆解失败」同路,
+    /// 两者都被 `main_work/mod.rs` 的兜底分支接住并构造了一个「照原任务执行」的
+    /// 通用 WorkFlow,把模型明确拒绝执行的任务又执行了一遍。实测
+    /// (`llaew_20261012_102053.log`)白烧 **156.89s / 12.4 万 input token**,
+    /// 终态还记「✅ 成功」—— 用户要求的事一件没做成。
+    ///
+    /// 分流后:弃权 → [`ExecFailure::Abstain`],如实转达用户并收口;
+    /// 其余 → [`ExecFailure::Quality`],重试/回流语义**完全不变**。
+    pub(super) fn classify_main_work_error(e: crate::error::AgentError) -> ExecFailure {
+        match e {
+            crate::error::AgentError::WorkflowAbstain { summary } => ExecFailure::Abstain {
+                text: summary,
+                usage: Usage::default(),
+            },
+            other => ExecFailure::Quality(QualityFailure::from_agent_error(
+                AgentRole::MainWork,
+                "Main-Work 拆解失败",
+                &other,
+            )),
+        }
+    }
+
     pub(super) async fn run_medium(
         &self,
         c: &TaskClassification,
@@ -850,7 +918,7 @@ impl MultiAgentOrchestrator {
         retry_hint: &str,
         completed_digest: &str,
         plan_cache: &mut Option<WorkFlowPlan>,
-    ) -> std::result::Result<TaskResult, QualityFailure> {
+    ) -> std::result::Result<TaskResult, ExecFailure> {
         // 0) 2026-09-16 第 67 轮:计划复用(效率优化)。
         //    上一轮执行层失败(wf 单元 QC 拒)→ 计划本身没问题 → 跳过 Main-Work LLM 重拆,
         //    失败反馈注入每个执行单元的 description。失败单元也会因 retry_hint 调整策略。
@@ -917,9 +985,7 @@ impl MultiAgentOrchestrator {
                 completed_digest: String::new(),
             }
         })?
-        .map_err(|e| {
-            QualityFailure::from_agent_error(AgentRole::MainWork, "Main-Work 拆解失败", &e)
-        })?;
+        .map_err(Self::classify_main_work_error)?;
         let mainwork_elapsed_ms = mainwork_started.elapsed().as_millis() as u64;
 
         // 1.2) 2026-09-16 第 66 轮 P0-1/P0-2:确定性自动修复 + 阻断校验,先于一切 LLM QC。
@@ -946,7 +1012,8 @@ impl MultiAgentOrchestrator {
                 trace: None,
                 usage: mainwork_usage,
                 completed_digest: String::new(),
-            });
+            }
+            .into());
         }
 
         // 1.5) F2(2026-09-10 第 25 轮):兜底计划跳过 QC-main 直接执行。
@@ -1057,7 +1124,8 @@ impl MultiAgentOrchestrator {
                 trace: None,
                 usage: add_usage(mainwork_usage, qc_usage),
                 completed_digest: String::new(),
-            });
+            }
+            .into());
         }
 
         // 2026-09-09 第 14 轮:累加 Main-Work + Quality-Main 调用的 LLM 用量,

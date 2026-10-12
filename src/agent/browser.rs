@@ -121,6 +121,12 @@ struct BrowserInner {
     /// 自动跟随最新内容期望态(第 152 轮,默认开):导航后新文档按它重挂跟随器,
     /// 与 guard 的期望态 re-assert 同构。connect 模式恒 false(不干预用户浏览器)。
     auto_follow: bool,
+    /// 调用方是否**显式**指定了窗口尺寸(第 156 轮)。
+    ///
+    /// `false`(缺省)= 由驱动层给 1920×1080,此时 headed 收边按屏幕工作区**铺满**;
+    /// `true` = 用户/Agent 明确给了 `window` 参数,只做「不溢出屏幕」收边,不覆盖意图。
+    /// connect 模式恒 false 且不参与决策(整路跳过)。
+    explicit_window: bool,
 }
 
 /// 浏览器会话管理器(进程内单例)。
@@ -306,6 +312,7 @@ impl BrowserManager {
                         // 第 152 轮:默认开启跟随 —— 人工在 locked 档无法滚动,
                         // 页面必须自己停在最新,否则多轮对话只有第一屏可见。
                         auto_follow: true,
+                        explicit_window: false,
                     }),
                 })
             })
@@ -484,6 +491,10 @@ impl BrowserManager {
                 mode
             };
             inner.highlight = highlight;
+            // 第 156 轮:记录窗口尺寸是否由调用方显式指定 —— 决定 headed 收边
+            // 是「按屏幕铺满」还是「保持请求尺寸只做不溢出收边」。
+            // connect 模式恒 false(且 fit_headed_window 对 connect 整路跳过)。
+            inner.explicit_window = !connect_mode && window_size.is_some();
             // 第 143 轮:页面管控期望态(connect 模式强制 open;hidden 下无意义,
             // 注入由下方 headed && 非 connect 门控跳过)。
             inner.guard = if connect_mode {
@@ -768,13 +779,28 @@ impl BrowserManager {
         &self,
         page_id: &str,
     ) -> std::result::Result<Value, String> {
-        let inner_mode = self.inner.lock().await.mode;
+        let (inner_mode, connect_mode, explicit_window) = {
+            let g = self.inner.lock().await;
+            (g.mode, g.connect_mode, g.explicit_window)
+        };
         let base = json!({
             "mode": inner_mode.as_str(),
             "min_viewport": [super::browser_viewport::MIN_VIEWPORT_W, super::browser_viewport::MIN_VIEWPORT_H],
         });
         if !inner_mode.is_headed() {
             return Ok(json!({ "adjusted": false, "reason": "非有头模式,无需收边", "base": base }));
+        }
+        // 第 156 轮:connect 模式(第 142/144 轮「复用已登录浏览器」)接管的是**用户
+        // 自己的** Chrome —— 调整它的窗口尺寸/把它抢到前台都是对用户窗口的 intrusive
+        // 操作,违反「connect 模式零注入、不干预用户浏览器」原则(该原则此前只覆盖
+        // guard 蒙层与输入锁定,窗口几何这一路漏了)。此处整体跳过。
+        if connect_mode {
+            return Ok(json!({
+                "adjusted": false,
+                "activated": false,
+                "reason": "connect 模式不干预用户浏览器窗口(不调尺寸、不抢前台)",
+                "base": base,
+            }));
         }
         let page = self
             .page(page_id)
@@ -784,18 +810,40 @@ impl BrowserManager {
         let f = |k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
         let (ow, oh) = (f("outerWidth"), f("outerHeight"));
         let (iw, ih) = (f("innerWidth"), f("innerHeight"));
-        let chrome = oh - ih;
+        // 第 156 轮:裸减法在 macOS 上确定性失真(inner 报布局实现前的默认值 800×600,
+        // 而 outer 已是 --window-size 的 1920×1080),chrome 被算成 480(真值约 143),
+        // 窗口每次 headed open 都被反向撑大。改走可信性判定 + 兜底常量。
+        let chrome =
+            super::browser_viewport::plausible_chrome_height(ow, oh, iw, ih);
+        let chrome_measured = oh - ih;
         let (aw, ah) = (f("availWidth"), f("availHeight"));
         let measured = json!({
             "screen": {"avail_width": aw, "avail_height": ah},
             "outer": {"width": ow, "height": oh},
             "inner": {"width": iw, "height": ih},
             "chrome_height": chrome,
+            // 第 156 轮:实测原值与失真回退对账。两者不等即说明本次走了兜底常量,
+            // 供 Agent / QC 判断窗口尺寸决策建立在真值还是估计值之上。
+            "chrome_height_raw": chrome_measured,
+            "chrome_height_fallback": (chrome - chrome_measured).abs() > 0.5,
         });
-        let Some((tw, th)) = headed_window_plan(ow, oh, aw, ah, chrome) else {
+        // 第 156 轮 F2:headed 启动后把窗口带到前台。
+        // 实测痛点:headed 确实拉起了 Chrome(code:0 + title 都拿到了),但项目从不
+        // 激活窗口 —— `bring_page_to_front` 此前只在 `request_human` 前调用一次,
+        // open 路径零调用;也不设 `--window-position` / `--start-maximized`。
+        // 结果 Chrome 弹在终端/编辑器后面,用户看到的就是「Agent 没启动浏览器」。
+        // 纯 CDP `Page.bringToFront`,跨平台一致、零新依赖;fail-open 不影响语义。
+        let activated = super::browser_window::activate_headed_window(self, page_id).await;
+        let Some((tw, th)) = headed_window_plan(ow, oh, aw, ah, chrome, !explicit_window) else {
             return Ok(json!({
                 "adjusted": false,
-                "reason": "窗口已完整落在屏幕内且视口不低于下限",
+                "activated": activated,
+                "fill": !explicit_window,
+                "reason": if explicit_window {
+                    "已显式指定窗口尺寸且完整落在屏幕内,保持不变"
+                } else {
+                    "窗口已铺满屏幕工作区且视口不低于下限"
+                },
                 "measured": measured,
                 "base": base,
             }));
@@ -804,8 +852,13 @@ impl BrowserManager {
         let applied = self
             .set_window_bounds(page_id, Some(tw as i64), Some(th as i64), None, None, None)
             .await?;
+        // 调整尺寸后 Chrome 可能重新压回 z 序底层,复激活一次保证「调完仍然可见」。
+        let activated =
+            super::browser_window::activate_headed_window(self, page_id).await || activated;
         Ok(json!({
             "adjusted": true,
+            "activated": activated,
+            "fill": !explicit_window,
             "from": {"width": ow, "height": oh},
             "target": {"width": tw, "height": th},
             "measured": measured,

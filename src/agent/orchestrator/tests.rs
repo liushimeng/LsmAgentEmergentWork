@@ -537,3 +537,44 @@
     }
 
 
+
+    // =================== 第 156 轮:Main-Work 弃权出口分流 ===================
+
+    /// 回归实测(`llaew_20261012_102053.log`):Main-Work 输出
+    /// `{"workflows":[],"summary":"不予编排,需回到用户澄清/改题…"}`,
+    /// 此前与真拆解失败同路 → 兜底分支构造通用 WorkFlow → 把模型已拒绝的任务
+    /// 又执行一遍,白烧 156.89s / 12.4 万 input token 且终态谎报「✅ 成功」。
+    ///
+    /// 弃权必须走 `Abstain` 出口(如实转达 + 直接收口),不得退化成可重试的质量失败。
+    #[test]
+    fn main_work_abstention_is_not_a_quality_failure() {
+        let f = MultiAgentOrchestrator::classify_main_work_error(
+            crate::error::AgentError::WorkflowAbstain {
+                summary: "不予编排,需回到用户澄清/改题。".into(),
+            },
+        );
+        match f {
+            ExecFailure::Abstain { text, .. } => {
+                assert_eq!(text, "不予编排,需回到用户澄清/改题。");
+            }
+            ExecFailure::Quality(q) => panic!(
+                "弃权不得退化成可重试的质量失败(会白重拆 3 轮): retryable={} reason={}",
+                q.retryable, q.reason
+            ),
+        }
+    }
+
+    /// 反向回归:真·拆解失败必须仍是可重试的质量失败,既有回流语义零变化。
+    #[test]
+    fn genuine_main_work_failure_stays_quality() {
+        let f = MultiAgentOrchestrator::classify_main_work_error(
+            crate::error::AgentError::WorkflowParse("未找到合法的 WorkFlow JSON".into()),
+        );
+        match f {
+            ExecFailure::Quality(q) => {
+                assert_eq!(q.source, AgentRole::MainWork);
+                assert!(q.retryable, "真拆解失败仍应可重试");
+            }
+            ExecFailure::Abstain { .. } => panic!("真拆解失败不得被误判为弃权"),
+        }
+    }

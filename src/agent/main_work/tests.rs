@@ -817,18 +817,62 @@ mod dedup_tests {
 // 第 135 轮:Main-Work 解析兜底(空 workflows / Markdown 第三通道 / 网页 pre_explore)
 // ============================================================================
 
-/// `workflows: []` 解析成功但产出零单元 —— 必须按解析失败处理,交给既有兜底分支。
+/// `workflows: []` **且 `summary` 为空** —— 没有任何可转达的内容,等同于
+/// 什么都没产出,维持第 135 轮行为按解析失败交给既有兜底分支。
 ///
 /// `spec.rs` 里 `workflows` 是 `#[serde(default)]`,所以空数组会「解析成功」;
 /// 若直接放行,`execute_workflows` 会零单元收口并判成功(与 `plan_validate.rs`
 /// 的空检查不一致 —— 那个检查只在 Plan 路径)。
 #[test]
 fn parse_workflow_plan_rejects_empty_workflows() {
-    let err = parse_workflow_plan(r#"{"workflows":[],"summary":"空的"}"#).unwrap_err();
+    let err = parse_workflow_plan(r#"{"workflows":[],"summary":""}"#).unwrap_err();
     assert!(
         err.to_string().contains("workflows 为空"),
-        "空 workflows 应报解析失败,实际: {err}"
+        "空 workflows 且无 summary 应报解析失败,实际: {err}"
     );
+}
+
+/// 第 156 轮:`workflows: []` **但 `summary` 带实质说明** —— 这是模型交付的
+/// 一个**合法零单元计划**(典型形态「不予编排,需回到用户澄清/改题」),
+/// 属**主动弃权**而非解析失败,必须原样上抛,绝不能退回「照原任务执行」的兜底。
+///
+/// 回归实测(`llaew_20261012_102053.log`):两者混为一谈导致白烧
+/// **156.89s / 12.4 万 input token**,终态还记「✅ 成功」——用户要求打开
+/// 豆包并提取系统提示词,实际一件没做成。
+#[test]
+fn parse_workflow_plan_surfaces_model_abstention() {
+    let err = parse_workflow_plan(
+        r#"{"workflows":[],"summary":"不予编排,需回到用户澄清/改题。原因:目标不可执行。"}"#,
+    )
+    .unwrap_err();
+    match err {
+        crate::error::AgentError::WorkflowAbstain { summary } => {
+            assert!(summary.contains("不予编排"), "弃权说明应原样保留,实际: {summary}");
+        }
+        other => panic!("零单元 + 非空 summary 应判为主动弃权,实际: {other}"),
+    }
+}
+
+/// 第 156 轮回归:纯空白 summary 等价于「无说明」,仍走解析失败兜底,
+/// 避免把噪声当弃权理由转达给用户。
+#[test]
+fn parse_workflow_plan_blank_summary_still_parse_failure() {
+    let err = parse_workflow_plan(r#"{"workflows":[],"summary":"   \n  "}"#).unwrap_err();
+    assert!(
+        err.to_string().contains("workflows 为空"),
+        "空白 summary 应报解析失败,实际: {err}"
+    );
+}
+
+/// 第 156 轮:正常非空计划不受零单元分流影响(防误伤回归)。
+#[test]
+fn parse_workflow_plan_accepts_nonempty_plan() {
+    let plan = parse_workflow_plan(
+        r#"{"workflows":[{"id":"wf-1","name":"执行","steps":["做一件事"],"acceptance":["产物存在"]}],"summary":"已拆解"}"#,
+    )
+    .expect("非空计划应解析成功");
+    assert_eq!(plan.workflows.len(), 1);
+    assert_eq!(plan.summary, "已拆解");
 }
 
 /// 第三通道:Main-Work 输出 Markdown 表格而非 JSON 时,复用 `parse_plan_markdown`。
