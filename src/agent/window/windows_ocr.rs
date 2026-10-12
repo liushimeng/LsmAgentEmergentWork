@@ -233,8 +233,29 @@ pub fn ocr_window(hwnd: HWND, region: Option<Rect>, lang: Option<&str>) -> Resul
     }
     let _guard = Cleanup(&png);
 
+    // 词框坐标 = 图像相对坐标 + (采集原点 - 窗口原点)的屏幕偏移
+    recognize_png(&png, lang, cap.x - win.x, cap.y - win.y)
+}
+
+/// PNG 文件直识(CDP 截图字节落盘后的 OCR,2026-10-12 新增):
+/// MCP_Web_Use `control(screenshot, ocr=true)` 的 Windows 实现入口,
+/// 与 [`ocr_window`] 共用同一识别核心,坐标为图像相对(偏移 0,0)。
+pub fn ocr_png_file(path: &std::path::Path, lang: Option<&str>) -> Result<Vec<OcrBlock>> {
+    recognize_png(path, lang, 0, 0)
+}
+
+/// 识别核心:`OcrEngine` 构造 → PNG 解码 → Bgra8 转换 → `RecognizeAsync`
+/// → 按 **Line 聚合**词块(中文逐字切词,词级输出无法直接检索短语)。
+/// `off_x/off_y` 为词框坐标的额外偏移(窗口截图传采集-窗口原点差值,
+/// 文件直识传 0)。
+fn recognize_png(
+    png: &std::path::Path,
+    lang: Option<&str>,
+    off_x: i64,
+    off_y: i64,
+) -> Result<Vec<OcrBlock>> {
     let engine = build_ocr_engine(lang)?;
-    let soft = decode_png_to_software_bitmap(&png)?;
+    let soft = decode_png_to_software_bitmap(png)?;
 
     // OCR 引擎要求 Bgra8 / Gray8;PNG 常见解出 Rgba8 → 必要时转换
     let target = if soft.BitmapPixelFormat().map(|f| f == BitmapPixelFormat::Bgra8).unwrap_or(false)
@@ -280,8 +301,8 @@ pub fn ocr_window(hwnd: HWND, region: Option<Rect>, lang: Option<&str>) -> Resul
             let r: WinRtRect = word.BoundingRect().unwrap_or_default();
             any = true;
             text.push_str(&t);
-            let wx = (cap.x - win.x) + r.X as i64;
-            let wy = (cap.y - win.y) + r.Y as i64;
+            let wx = off_x + r.X as i64;
+            let wy = off_y + r.Y as i64;
             x0 = x0.min(wx);
             y0 = y0.min(wy);
             x1 = x1.max(wx + r.Width.max(0.0) as i64);

@@ -410,6 +410,10 @@ impl ResolveCandidates {
 }
 
 fn resolve_path_with_candidates(p: &str) -> ResolveCandidates {
+    // Windows 实测:LLM 沿用 Git Bash 风格传 `/d/...`,必须先规范化回 `D:/...`,
+    // 否则会落进相对路径拼接分支被拼成 `D:/d/...` 幽灵路径(见 tools::mod 文档)。
+    let normalized = super::normalize_windows_drive_path(p);
+    let p = normalized.as_ref();
     let path = Path::new(p);
     if path.is_absolute() {
         tracing::debug!(path = %path.display(), "resolve_path: 绝对路径");

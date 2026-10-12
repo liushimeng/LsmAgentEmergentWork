@@ -69,8 +69,10 @@ impl Tool for GlobTool {
             });
         }
 
+        // Windows 实测:LLM 沿用 Git Bash 风格传 `/d/...`,先规范化回 `D:/...`,
+        // 否则 base_dir 判定直接「不是有效目录」(tools::mod 文档说明根因)。
         let base_dir = match args.get("path").and_then(Value::as_str) {
-            Some(p) => PathBuf::from(p),
+            Some(p) => PathBuf::from(super::normalize_windows_drive_path(p).as_ref()),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
         if !base_dir.is_dir() {

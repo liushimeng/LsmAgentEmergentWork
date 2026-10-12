@@ -179,7 +179,10 @@ impl Tool for EditTool {
 }
 
 fn resolve_path(p: &str) -> PathBuf {
-    let path = Path::new(p);
+    // Windows 实测:LLM 沿用 Git Bash 风格传 `/d/...`,必须先规范化回 `D:/...`
+    // (tools::mod::normalize_windows_drive_path 文档说明根因)。
+    let normalized = super::normalize_windows_drive_path(p);
+    let path = Path::new(normalized.as_ref());
     if path.is_absolute() {
         path.to_path_buf()
     } else {

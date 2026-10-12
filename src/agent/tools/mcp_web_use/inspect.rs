@@ -69,20 +69,50 @@ const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
     ),
 ];
 
-/// 读页面可见全文(克隆 body 并剥离 `[data-laew-agent]` 子树再读 innerText):
-/// Agent 高亮徽标文本(「LAEW Agent 控制中」)不应参与阻断判定。
+/// 可见全文采集函数源码(JS 函数声明,不含调用括号;`blocker_probe::probe_js`
+/// 经 `format!` 复用本片段,全文口径单一事实源)。
+///
+/// 实现:**临时摘除 `[data-laew-agent]` 子树(记录原位)→ 对活 body 读
+/// `innerText` → 原位放回**。不能用 `cloneNode` 后读克隆的 `innerText` ——
+/// 克隆节点不在文档树、无布局,浏览器对 detached 节点的 `innerText` 退化为
+/// textContent 语义,`display:none` 的隐藏文案照收(2026-10-12 Windows 实测:
+/// 登录成功后隐藏登录弹窗残留的「账号发送验证码没收到短信」持续误命中
+/// 「验证码」关键词,`blocker_alert{captcha}` 误报 18 次把对话链路打断到
+/// QC 判 fail)。活 body 的 `innerText` 由浏览器按渲染结果过滤,隐藏子树
+/// 自动排除;摘除/放回在同一同步任务内完成,页面无渲染间隙,节点事件与
+/// 相对顺序全部保留(先正序摘除、后逆序放回,兄弟节点原位引用不失效)。
+pub(super) const VISIBLE_TEXT_FN_JS: &str = r#"function __laewBodyVisibleText() {
+    if (!document.body) return '';
+    const stripped = [];
+    for (const e of Array.from(document.body.querySelectorAll('[data-laew-agent]'))) {
+        if (e.parentNode) stripped.push([e.parentNode, e.nextSibling, e]);
+    }
+    for (const [parent, , e] of stripped) parent.removeChild(e);
+    let text = '';
+    try {
+        text = (document.body.innerText || '').slice(0, 20000);
+    } finally {
+        for (let i = stripped.length - 1; i >= 0; i--) {
+            const [parent, next, e] = stripped[i];
+            parent.insertBefore(e, next);
+        }
+    }
+    return text;
+}"#;
+
+/// 读页面可见全文:Agent 高亮徽标文本(「LAEW Agent 控制中」)不参与阻断判定,
+/// 同时**只收可见文本**(隐藏 DOM 残留文案不进来,见 [`VISIBLE_TEXT_FN_JS`])。
 /// 第 147 轮自 blockers 分支抽出,`blocker_probe` 旧路径回退时共用。
 pub(super) async fn body_text_without_agent_nodes(
     page: &chromiumoxide::Page,
 ) -> String {
     eval_js_string(
         page,
-        r#"(() => { try {
-            if (!document.body) return '';
-            const clone = document.body.cloneNode(true);
-            clone.querySelectorAll('[data-laew-agent]').forEach(e => e.remove());
-            return clone.innerText.slice(0, 20000);
-        } catch(e) { return ''; } })()"#,
+        &format!(
+            "{}{}",
+            VISIBLE_TEXT_FN_JS,
+            r#"(() => { try { return __laewBodyVisibleText(); } catch(e) { return ''; } })()"#
+        ),
     )
     .await
     .ok()

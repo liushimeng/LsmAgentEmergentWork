@@ -131,7 +131,10 @@ impl Tool for WriteTool {
 /// 只会把本应写进工作目录的相对路径错误改道到根目录再报错。Read 场景的根目录
 /// 回退由 read.rs 自带的路径诊断承担,不受影响。
 fn resolve_path(p: &str) -> PathBuf {
-    let path = Path::new(p);
+    // Windows 实测:LLM 沿用 Git Bash 风格传 `/d/...`,必须先规范化回 `D:/...`
+    // (tools::mod::normalize_windows_drive_path 文档说明根因)。
+    let normalized = super::normalize_windows_drive_path(p);
+    let path = Path::new(normalized.as_ref());
     if path.is_absolute() {
         path.to_path_buf()
     } else {

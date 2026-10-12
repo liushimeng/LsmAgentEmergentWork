@@ -134,13 +134,48 @@ fn ocr_png_text(
                 format!("OCR 失败:({err_str})。已无更多 OCR 路径,请停止 OCR 尝试,直接标注需要人工输入验证码")
             }
         })?;
-    let kept: Vec<_> = blocks
+    Ok(filter_region_join_blocks(
+        blocks
+            .into_iter()
+            .map(|b| (b.x, b.y, b.width, b.height, b.text))
+            .collect(),
+        region,
+    ))
+}
+
+/// Windows:同一能力的 Windows.Media.Ocr 实现(2026-10-12 新增,与 macOS 路径
+/// 行为对齐:行聚合词块 + region 中心点过滤 + 换行拼接)。无 OCR 语言包等失败
+/// 按既有结构化 ocr_error 上报,LLM 如实转人工。
+#[cfg(target_os = "windows")]
+fn ocr_png_text(
+    path: &std::path::Path,
+    region: Option<(i64, i64, i64, i64)>,
+) -> std::result::Result<(String, usize), String> {
+    let blocks = crate::agent::window::windows_ocr::ocr_png_file(path, None)
+        .map_err(|e| format!("OCR 失败:({e})。请停止 OCR 尝试,直接标注需要人工输入验证码"))?;
+    Ok(filter_region_join_blocks(
+        blocks
+            .into_iter()
+            .map(|b| (b.x, b.y, b.width, b.height, b.text))
+            .collect(),
+        region,
+    ))
+}
+
+/// region 过滤 + 文本拼接(两平台共用):词块中心点落入 region 才保留,
+/// 块文本按换行拼接,返回 (text, 块数)。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn filter_region_join_blocks(
+    blocks: Vec<(i64, i64, i64, i64, String)>,
+    region: Option<(i64, i64, i64, i64)>,
+) -> (String, usize) {
+    let kept: Vec<(i64, i64, i64, i64, String)> = blocks
         .into_iter()
-        .filter(|b| match region {
-            Some((x, y, w, h)) => {
-                let cx = b.x + b.width / 2;
-                let cy = b.y + b.height / 2;
-                cx >= x && cx < x + w && cy >= y && cy < y + h
+        .filter(|(x, y, w, h, _)| match region {
+            Some((rx, ry, rw, rh)) => {
+                let cx = x + w / 2;
+                let cy = y + h / 2;
+                cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh
             }
             None => true,
         })
@@ -148,21 +183,21 @@ fn ocr_png_text(
     let n = kept.len();
     let text = kept
         .iter()
-        .map(|b| b.text.trim().to_string())
+        .map(|(_, _, _, _, t)| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    Ok((text, n))
+    (text, n)
 }
 
-/// 非 macOS 平台:OCR 暂不可用的结构化提示(保持动作面一致,LLM 据此如实上报)。
-#[cfg(not(target_os = "macos"))]
+/// 非 macOS / Windows 平台:OCR 暂不可用的结构化提示(保持动作面一致,LLM 据此如实上报)。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn ocr_png_text(
     _path: &std::path::Path,
     _region: Option<(i64, i64, i64, i64)>,
 ) -> std::result::Result<(String, usize), String> {
     Err(
-        "OCR 当前仅 macOS 支持(Vision 框架);验证码等图片文字请改在 macOS 环境执行,或人工提供文字内容,不要猜测".to_string(),
+        "OCR 当前仅 macOS / Windows 支持;验证码等图片文字请在 macOS / Windows 环境执行,或人工提供文字内容,不要猜测".to_string(),
     )
 }
 

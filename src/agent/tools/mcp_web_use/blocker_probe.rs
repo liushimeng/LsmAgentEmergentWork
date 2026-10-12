@@ -256,7 +256,7 @@ pub(super) fn classify_challenge(overlay: &Value) -> ChallengeType {
 
 /// 弹层元数据是否构成语义挑战;命中返回 blocker 条目(含结构证据)。
 ///
-/// 入参是探针 JS 产出的 `overlay` 对象(见 [`PROBE_JS`]);`None` = 无弹层或分数不足。
+/// 入参是探针 JS 产出的 `overlay` 对象(见 [`probe_js`]);`None` = 无弹层或分数不足。
 pub(super) fn detect_challenge(overlay: &Value) -> Option<Value> {
     if overlay.get("found").and_then(Value::as_bool) != Some(true) {
         return None;
@@ -347,14 +347,18 @@ pub(super) fn analyze(probe: &Value) -> Vec<Value> {
 
 // ===================== 探针 JS 与采集 =====================
 
-/// 一次 eval 采集:全文(body 克隆剥离 `[data-laew-agent]`,Agent 蒙层/徽标不参与判定)
-/// + 最高层弹层候选的结构元数据。字符串常量(不经 format!),花括号安全。
-const PROBE_JS: &str = r#"(() => {
+/// 一次 eval 采集:全文(活 DOM 可见文本,函数体与 inspect.rs 共用
+/// [`super::inspect::VISIBLE_TEXT_FN_JS`],隐藏 DOM 残留文案不参与关键词判定)
+/// + 最高层弹层候选的结构元数据。花括号安全。
+/// `concat!` 只收字面量,跨模块共享片段用 `format!` 在运行时拼接。
+fn probe_js() -> String {
+    format!(
+        "{}{}",
+        super::inspect::VISIBLE_TEXT_FN_JS,
+        r#"(() => {
   try {
     if (!document.body) return {text: '', overlay: null};
-    const clone = document.body.cloneNode(true);
-    clone.querySelectorAll('[data-laew-agent]').forEach(e => e.remove());
-    const text = (clone.innerText || '').slice(0, 20000);
+    const text = __laewBodyVisibleText();
     const vw = window.innerWidth, vh = window.innerHeight;
     // 词表候选:命中 modal/dialog/captcha/verify 等**语义类名**的模态。
     const SEL = 'dialog[open], [role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i], [class*="popup" i], [class*="mask" i], [class*="overlay" i], [class*="captcha" i], [class*="verify" i], [class*="challenge" i]';
@@ -482,12 +486,14 @@ const PROBE_JS: &str = r#"(() => {
       },
     };
   } catch (e) { return {text: '', overlay: null, error: String(e)}; }
-})()"#;
+})()"#
+    )
+}
 
 /// 跑探针采集(fail-open:2s 超时 / 页面失效 / JS 异常一律返回空探针 = 干净)。
 /// `inspect(info=blockers)` 与推送式探测(`probe_alert`)共用同一探针,判定口径一致。
 pub(super) async fn collect_for_inspect(page: &chromiumoxide::Page) -> Value {
-    match tokio::time::timeout(std::time::Duration::from_secs(2), eval_js_string(page, PROBE_JS))
+    match tokio::time::timeout(std::time::Duration::from_secs(2), eval_js_string(page, &probe_js()))
         .await
     {
         Ok(Ok(v)) if v.is_object() => v,

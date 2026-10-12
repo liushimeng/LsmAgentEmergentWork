@@ -109,6 +109,36 @@ pub fn max_parallel_tools_from(raw: String) -> usize {
     }
 }
 
+/// Git Bash / MSYS 风格盘符路径规范化(Windows;其他平台恒等返回)。
+///
+/// 背景(2026-10-12 Windows 文心站点实测):Bash 工具在 Windows 上跑 Git Bash,
+/// LLM 沿用其路径风格把 `D:\...` 写成 `/d/...`;而 `Path::new("/d/...")`
+/// 在 Windows 上 `is_absolute()=false`(有根组件、无盘符前缀),落进
+/// 「相对工作目录拼接」分支后 `PathBuf::push` 对有根无前缀路径会**替换盘符后的
+/// 全部内容**,拼出 `D:/d/...` 幽灵路径,Read/Write/Edit/Glob/Grep 全部 stat 失败。
+/// 这里在工具路径解析入口统一把 `/x[/...]` 形态规范化回 `X:[/...]`;
+/// 其余形态(普通相对路径、UNC、Unix 风格多段路径)原样放行。
+pub(crate) fn normalize_windows_drive_path(p: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        let b = p.as_bytes();
+        if b.len() >= 2
+            && b[0] == b'/'
+            && b[1].is_ascii_alphabetic()
+            && (b.len() == 2 || b[2] == b'/')
+        {
+            let mut s = String::with_capacity(p.len() + 1);
+            s.push((b[1] as char).to_ascii_uppercase());
+            s.push(':');
+            s.push_str(&p[2..]);
+            return std::borrow::Cow::Owned(s);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = p;
+    std::borrow::Cow::Borrowed(p)
+}
+
 /// 工具注册表(保持注册顺序,保证 tools 列表稳定)
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
@@ -465,6 +495,42 @@ mod names_tests {
                 !reg.names().contains(&"SubAgent"),
                 "{label} 不应登记 SubAgent 工具: {:?}",
                 reg.names()
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_windows_drive_path_msys_form() {
+        // Windows 实测事故:LLM 沿用 Git Bash 风格写 /d/...,被拼成 D:/d/... 幽灵路径。
+        // 规范化后必须回到标准盘符形态;非 Windows 平台编译进本测试时为恒等(见下条)。
+        let cases = [
+            ("/d/MyLocalGit/x.md", "D:/MyLocalGit/x.md"),
+            ("/C/Program Files/app", "C:/Program Files/app"),
+            ("/d", "D:"),
+        ];
+        for (input, expected) in cases {
+            let got = normalize_windows_drive_path(input);
+            if cfg!(windows) {
+                assert_eq!(got.as_ref(), expected, "输入 {input:?}");
+            } else {
+                assert_eq!(got.as_ref(), input, "非 Windows 平台必须恒等: {input:?}");
+            }
+        }
+        // 非盘符形态一律原样放行(相对路径 / Unix 多段路径 / 双斜杠 UNC 前缀)。
+        for unchanged in [
+            "/dd/foo",
+            "/docs/readme.md",
+            "/etc/passwd",
+            "D:/x/y.md",
+            "src/main.rs",
+            "//server/share/x.md",
+            "/",
+            "",
+        ] {
+            assert_eq!(
+                normalize_windows_drive_path(unchanged).as_ref(),
+                unchanged,
+                "非盘符形态不得改写: {unchanged:?}"
             );
         }
     }
