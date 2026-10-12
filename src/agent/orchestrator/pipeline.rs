@@ -326,6 +326,11 @@ impl MultiAgentOrchestrator {
                 // 2026-09-11 第三十三轮:#P-C 修复 — 显式输出 trace 行,
                 // 让用户/调试脚本区分「Yolo 直答」与「SubAgent 委派执行」两条路径。
                 emit_progress(progress, "[trace] subagent=skipped(direct_answer=true)");
+                // 第 160 轮:直答后 SessionContext 摘要是一次无工具 LLM 调用,慢网关
+                // 实测 60~90s(llaew_20261012_143803.log 直答 14:38:37 → 收口 14:39:50),
+                // 期间 TUI 零输出、阶段看门狗把 30s/60s 告警挂在已结束的 [trace] 标签上,
+                // 用户观感「任务执行很长时间没动静」。发一条阶段行让空窗有正确归属。
+                emit_progress(progress, "会话记忆归档(SessionContext 摘要)...");
                 let sc_started = std::time::Instant::now();
                 // 2026-09-22 第 112 轮:把 TodoWrite 当前快照传给 SessionContext,
                 // 写入 session_memory Summary 行末尾(下游可选解析)。
@@ -522,6 +527,9 @@ impl MultiAgentOrchestrator {
                     // 此前直接传 task_result.total_usage(仅执行层),漏记 Yolo 分类调用,
                     // 导致写入 session_memory 的摘要用量系统性偏小。
                     let usage_for_summary = add_usage(yolo_usage, task_result.total_usage);
+                    // 第 160 轮:同直答分支 —— SessionContext 摘要是收口前最后一次
+                    // 无工具 LLM 调用,慢网关可达分钟级,发阶段行消除静默空窗。
+                    emit_progress(progress, "会话记忆归档(SessionContext 摘要)...");
                     let sc_started = std::time::Instant::now();
                     // 2026-09-22 第 112 轮:D19 TODO 持久化 — 把 TodoWrite 当前快照
                     // 传给 SessionContext,写入 session_memory Summary 行末尾。
@@ -954,12 +962,17 @@ impl MultiAgentOrchestrator {
         let mainwork_started = std::time::Instant::now();
         // 2026-09-16 第 59 轮:透传 Yolo 推断的 suggested_delegate,引导 Main-Work 正确委派窗口操控类任务
         let suggested_delegate = c.suggested_delegate.as_deref();
-        // 2026-09-16 第 66 轮:Main-Work LLM 调用超时(默认 120s,环境变量 LAEW_MAINWORK_TIMEOUT),
+        // 2026-09-16 第 66 轮:Main-Work LLM 调用超时(环境变量 LAEW_MAINWORK_TIMEOUT),
         // 防止 LLM 响应慢/挂起导致无限等待(用户反馈 WebUse 任务卡住 58.8s)。
+        // 第 160 轮:默认 120s → 300s。该超时包住的是 Main-Work 整个 ReAct 多轮会话,
+        // 慢网关(llaew_20261012_151604.log)单次 LLM 调用实测 60~201s,重试轮上下文
+        // 更大,120s 连续两轮必超时 → 同因熔断收口成 failed(浏览器明明已能打开)。
+        // 挂起风险由同因熔断(连续 2 次同因止动)与 LLM 弹性层兜底,不再靠小超时值。
         let mainwork_timeout = std::env::var("LAEW_MAINWORK_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120);
+            .filter(|t| *t > 0)
+            .unwrap_or(300);
         let (mut plan, mainwork_usage) = tokio::time::timeout(
             std::time::Duration::from_secs(mainwork_timeout),
             self.main_work.plan_workflows_with_delegate(
@@ -978,7 +991,9 @@ impl MultiAgentOrchestrator {
                 source: AgentRole::MainWork,
                 reason: format!("Main-Work 拆解超时({}s)", mainwork_timeout),
                 retryable: true,
-                suggestion: "重试".into(),
+                suggestion: format!(
+                    "重试;慢网关可调大 LAEW_MAINWORK_TIMEOUT(当前 {mainwork_timeout}s)"
+                ),
                 cancelled: false,
                 trace: None,
                 usage: Usage::default(),

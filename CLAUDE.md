@@ -65,6 +65,7 @@ bash testReport/run_e2e.sh --skip '8'    # 跳过匹配小节(§8 tmux 占全量
 | `LAEW_PARALLEL_TOOLS` | `off`/`0`/`false`/`no` | 关闭「同批只读工具并发执行」，回退到全串行。默认开启：同一 LLM 响应里**连续的** `parallel_safe` 调用（Read/Glob/Grep，段长 ≥2）并发执行，`tool_result` 仍按原序回填。见 `src/agent/tool_exec.rs` |
 | `LAEW_MAX_PARALLEL_TOOLS` | 正整数（默认 `4`） | 单批并发上限；`0`/非法值回退默认。对齐 AtomCode `ATOMCODE_MAX_PARALLEL_TOOLS=4`（Claude Code 用 10，laew 单元迭代预算小取保守值）。见 `src/agent/tools/mod.rs::max_parallel_tools_from` |
 | `LAEW_REACT_GUARD` | `off`/`0`/`false`/`no` | 关闭 ReAct 循环守卫（无进展软提醒与 doom_loop 止损均不生效；`doom_loop_repeats` 仍统计，可观测性不丢）。默认开启：进展键 =「工具名 + 参数稳定 JSON + 结果摘要」三者全同即无进展，第 2 次软提醒 / 第 3 次宽限轮强提醒 / 第 4 次止损终止。见 `src/agent/loop_guard.rs` |
+| `LAEW_MAINWORK_TIMEOUT` | 正整数(秒,默认 `300`) | Main-Work 拆解(整个 ReAct 多轮会话)的墙钟超时;超时按 retryable 回流重试。第 160 轮由 120s 提到 300s:慢网关单次 LLM 调用实测 60~201s,120s 连续误伤导致同因熔断收 failed。挂起兜底靠同因熔断与 LLM 弹性层。见 `src/agent/orchestrator/pipeline.rs` |
 | `LAEW_MCP_ENABLED` | `off`/`0`/`false`/`no` | 关闭通用 MCP 服务调用（`Use_MCP` 工具注册与提示词同时归零，严格向后兼容）。默认开启：Agent 可经 `Use_MCP` 调用 `laew mcp add` 配置的外部 MCP server 工具/资源。见 `src/agent/tools/use_mcp/mod.rs` |
 | `LAEW_SELF_SPAWN` | `off`/`0`/`false`/`no` | 关闭**自感知动态子 Agent**（默认开启）。关闭时不注册 `SubAgent` 工具、不注入自感知提示词段、不建运行时（工具面/提示词/耗时与改造前完全一致）。见 `src/agent/self_awareness.rs` |
 | `LAEW_TARGET_ANCHOR` | `off`/`0`/`false`/`no` | 关闭**任务锚点**全部四层（L1 澄清门 / L2 伪澄清单元阻断 / L3 工具门 6001 / L4 目标一致性 QC 门 + `target_drift` 信号）。默认开启，根治「多行粘贴被截断后 Agent 自行改派到无关站点仍判成功」事故。详见「领域概念 · 任务锚点」 |

@@ -112,50 +112,145 @@ pub(super) fn normalize_dep_id(raw: &str) -> Option<String> {
         return None;
     }
     // 取第一个「中文全角括号 / 半角括号 / 中文冒号 / 空白」之前的 token 作为 id;
-    // 同时去掉首尾可能残留的引号 / 方括号。
+    // 同时去掉首尾可能残留的引号 / 方括号。第 160 轮扩充噪声集:Markdown 粗体
+    // (`**wf-1**`)、代码反引号、成对/残留括号与句读(`**不声明跨项引用**)` 实测形态)。
     let end = trimmed
         .find(|c: char| matches!(c, '（' | '(' | '：' | ':' | ' ' | '\t'))
         .unwrap_or(trimmed.len());
-    let token =
-        trimmed[..end].trim_matches(|c: char| matches!(c, '"' | '\'' | '[' | ']' | ',' | '、'));
+    let token = trimmed[..end].trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '[' | ']' | ',' | '、' | '*' | '`' | ')' | '）' | '。' | '，' | '.'
+                | ';' | '；'
+        )
+    });
     if token.is_empty() {
         return None;
     }
     Some(token.to_string())
 }
 
+/// 「无依赖」占位符判定(第 160 轮)。LLM 常把空依赖写成中文占位词或英文 null 族,
+/// 实测形态(`llaew_20261012_143803.log`):`depends_on: ["无"]` —— 这类条目
+/// 不是任何 wf id 的拼写错误,是「没有依赖」的语义,应直接丢弃而非报拓扑错。
+fn is_no_dep_placeholder(token: &str) -> bool {
+    let l = token.trim().to_lowercase();
+    matches!(
+        l.as_str(),
+        "无" | "没有" | "无依赖" | "不依赖" | "无前置" | "无前置依赖" | "空" | "none" | "null"
+            | "nil" | "n/a" | "na" | "-" | "—" | "0"
+    )
+}
+
+/// id 形状判定:纯 ASCII 标识符(`wf-9` / `step_2`)。形状像 id 但不在已知集合里 →
+/// 大概率是真 id 的拼写错误,保留给 `topo_layers` 报精准错误(不吞);含 CJK/空格的
+/// 散文碎片则走 [`extract_known_ids`] 抽取。
+fn looks_like_wf_id(token: &str) -> bool {
+    let mut chars = token.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 从散文条目里抽取全部已知 wf id(第 160 轮)。
+///
+/// 长度降序匹配防前缀吞并(`wf-10` 先于 `wf-1`);ASCII 词边界检查防 `mywf-1` 误命中;
+/// 已消费跨度不再重叠。例:`"先完成 wf-1 与 wf-2"` → `[wf-1, wf-2]`。
+fn extract_known_ids(raw: &str, known_sorted: &[&str]) -> Vec<String> {
+    let mut consumed: Vec<(usize, usize)> = Vec::new();
+    let mut found: Vec<String> = Vec::new();
+    for k in known_sorted {
+        let mut search_from = 0usize;
+        while let Some(pos) = raw[search_from..].find(&**k) {
+            let start = search_from + pos;
+            let end = start + k.len();
+            let boundary_ok = |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            let ok_left = raw[..start].chars().next_back().map_or(true, boundary_ok);
+            let ok_right = raw[end..].chars().next().map_or(true, boundary_ok);
+            let overlaps = consumed.iter().any(|(a, b)| start < *b && *a < end);
+            if ok_left && ok_right && !overlaps {
+                consumed.push((start, end));
+                if !found.iter().any(|f| f == *k) {
+                    found.push((*k).to_string());
+                }
+            }
+            search_from = end;
+        }
+    }
+    found
+}
+
 /// 归一化整份计划的 `depends_on` 列表:剥离注释、去空、去自环、去重。
 /// 在两个解析入口(Main-Work JSON / Plan 文档)都调用,确保 `topo_layers` 拿到干净的 id 集合。
+///
+/// 第 160 轮(实测事故 `llaew_20261012_143803.log`):Main-Work/Plan 把空依赖写成
+/// `["无"]` / `["无","与"]` / `["无","**不声明跨项引用**)"]` 这类中文占位与散文碎片,
+/// 旧策略「未知条目一律保留给 topo 报错」让拓扑层反复整批失败 → 档位重试全链路
+/// 重跑(Plan→QC→Main→QC 一轮 3~7 分钟),22 分钟零单元执行后被用户 Ctrl-C。
+/// 新策略按条目形态分流:
+/// - 占位符(无/none/null/…) → 静默丢弃(语义即「无依赖」);
+/// - 已知 id → 保留;
+/// - **id 形状但未知**(`wf-9`) → 保留,`topo_layers` 报精准错误(防真拼写错误被吞);
+/// - 散文碎片 → 从原文抽取全部已知 id(`"先完成 wf-1 与 wf-2"` → 两条边);
+///   抽不到任何 id 的纯散文 → 丢弃并 warn(可观测,不再阻断)。
 pub fn sanitize_depends_on(plan: &mut WorkFlowPlan) {
     let ids: std::collections::HashSet<String> =
         plan.workflows.iter().map(|w| w.id.clone()).collect();
+    // 长度降序的已知 id 表,供散文抽取防前缀吞并(wf-10 先于 wf-1);
+    // 等长时按字典序,保证抽取结果顺序确定(HashSet 收集序不确定)
+    let mut known_sorted: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    known_sorted.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
     let mut changed = false;
     for w in plan.workflows.iter_mut() {
         let original = w.depends_on.clone();
-        let mut cleaned: Vec<String> = original
-            .iter()
-            .filter_map(|d| normalize_dep_id(d))
-            .filter(|d| {
-                if d == &w.id {
-                    // 自环无意义,丢弃
-                    return false;
+        let mut cleaned: Vec<String> = Vec::new();
+        for raw in &original {
+            let Some(token) = normalize_dep_id(raw) else {
+                continue;
+            };
+            if is_no_dep_placeholder(&token) {
+                continue;
+            }
+            if token == w.id {
+                // 自环无意义,丢弃
+                continue;
+            }
+            if ids.contains(&token) {
+                cleaned.push(token);
+                continue;
+            }
+            if looks_like_wf_id(&token) {
+                // id 形状但未知 → 保留,让 topo_layers 给出精准报错(拼写错误通道)
+                cleaned.push(token);
+                continue;
+            }
+            // 散文碎片:从原始条目抽取已知 id;抽不到则丢弃(warn 可观测)
+            let extracted = extract_known_ids(raw, &known_sorted);
+            if extracted.is_empty() {
+                tracing::warn!(
+                    "[depends_on 净化] wf={} 丢弃无法解析的散文条目 {:?}",
+                    w.id,
+                    raw
+                );
+                continue;
+            }
+            for d in extracted {
+                if d != w.id {
+                    cleaned.push(d);
                 }
-                if !ids.contains(d) {
-                    // 注释剥离后仍不是已知 wf id → 保留但 topo_layers 会报错;
-                    // 这里仅做归一化,不在解析层吞错,让拓扑层给出精准提示
-                    return true;
-                }
-                true
-            })
-            .collect();
-        cleaned.dedup();
+            }
+        }
+        // 去重(保序;散文抽取可能引入与显式声明重复的边)
+        let mut seen = std::collections::HashSet::new();
+        cleaned.retain(|d| seen.insert(d.clone()));
         if cleaned != original {
             changed = true;
             w.depends_on = cleaned;
         }
     }
     if changed {
-        tracing::info!("[2026-09-16 F2] depends_on 已归一化(剥离变量透传注释 / 去自环 / 去重)");
+        tracing::info!(
+            "[depends_on 净化] 已归一化(剥离注释 / 占位符丢弃 / 散文抽 id / 去自环 / 去重)"
+        );
     }
 }
 

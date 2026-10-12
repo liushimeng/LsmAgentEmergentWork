@@ -84,6 +84,126 @@
     }
 
     #[test]
+    fn sanitize_depends_on_drops_placeholder_prose() {
+        // 第 160 轮实测事故(llaew_20261012_143803.log):Main-Work/Plan 把空依赖写成
+        // 中文占位与散文碎片,旧策略保留给 topo 报错 → 整批拓扑失败 → 重试环空转
+        // 22 分钟零单元执行。这些条目应被净化为「无依赖」,拓扑照常分层。
+        let mut plan = WorkFlowPlan {
+            workflows: vec![
+                wf("wf-1", &[]),
+                wf("wf-2", &["无"]),
+                wf("wf-3", &["无", "与"]),
+                wf("wf-4", &["无", "**不声明跨项引用**)"]),
+            ],
+            summary: "test".into(),
+            degraded: false,
+        };
+        sanitize_depends_on(&mut plan);
+        for w in &plan.workflows {
+            assert!(
+                w.depends_on.is_empty(),
+                "wf={} 应净化为无依赖,实际 {:?}",
+                w.id,
+                w.depends_on
+            );
+        }
+        // 全部无依赖 → 同层并行,拓扑必须成功(修复前这里报「依赖未知 wf=无」)
+        let layers = topo_layers(&plan.workflows).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].len(), 4);
+    }
+
+    #[test]
+    fn sanitize_depends_on_placeholder_family() {
+        let mut plan = WorkFlowPlan {
+            workflows: vec![
+                wf("wf-1", &["none"]),
+                wf("wf-2", &["NULL"]),
+                wf("wf-3", &["n/a"]),
+                wf("wf-4", &["-"]),
+                wf("wf-5", &["没有"]),
+                wf("wf-6", &["null"]),
+            ],
+            summary: "test".into(),
+            degraded: false,
+        };
+        sanitize_depends_on(&mut plan);
+        for w in &plan.workflows {
+            assert!(w.depends_on.is_empty(), "wf={} 占位符应丢弃", w.id);
+        }
+    }
+
+    #[test]
+    fn sanitize_depends_on_extracts_ids_from_prose() {
+        // 散文条目内嵌真实 id:抽取而非丢弃
+        let mut plan = WorkFlowPlan {
+            workflows: vec![
+                wf("wf-1", &[]),
+                wf("wf-2", &[]),
+                wf("wf-3", &["先完成 wf-1 与 wf-2"]),
+                wf("wf-4", &["wf-1、wf-2 的产物"]),
+            ],
+            summary: "test".into(),
+            degraded: false,
+        };
+        sanitize_depends_on(&mut plan);
+        assert_eq!(
+            plan.workflows[2].depends_on,
+            vec!["wf-1".to_string(), "wf-2".to_string()]
+        );
+        assert_eq!(
+            plan.workflows[3].depends_on,
+            vec!["wf-1".to_string(), "wf-2".to_string()]
+        );
+        assert!(topo_sort(&plan.workflows).is_ok());
+    }
+
+    #[test]
+    fn sanitize_depends_on_prose_extraction_prefers_longer_ids() {
+        // wf-10 与 wf-1 并存时,散文抽取不得让 wf-1 抢 wf-10 的子串
+        let mut plan = WorkFlowPlan {
+            workflows: vec![
+                wf("wf-1", &[]),
+                wf("wf-10", &[]),
+                wf("wf-11", &["依赖 wf-10 完成后执行"]),
+            ],
+            summary: "test".into(),
+            degraded: false,
+        };
+        sanitize_depends_on(&mut plan);
+        assert_eq!(plan.workflows[2].depends_on, vec!["wf-10".to_string()]);
+    }
+
+    #[test]
+    fn sanitize_depends_on_keeps_id_shaped_typo_for_topo_error() {
+        // id 形状但未声明(wf-9)→ 保留,让 topo_layers 报精准错误(真拼写错误通道不吞)
+        let mut plan = WorkFlowPlan {
+            workflows: vec![wf("wf-1", &[]), wf("wf-2", &["wf-9"])],
+            summary: "test".into(),
+            degraded: false,
+        };
+        sanitize_depends_on(&mut plan);
+        assert_eq!(plan.workflows[1].depends_on, vec!["wf-9".to_string()]);
+        let err = topo_sort(&plan.workflows).unwrap_err();
+        assert!(format!("{err}").contains("wf-9"), "应报未知 wf-9,实际 {err}");
+    }
+
+    #[test]
+    fn sanitize_depends_on_concurrent_note_is_not_a_dependency() {
+        // 「无(与 wf-1 并发启动)」语义 = 无依赖(括号内是并行说明,非依赖边);
+        // 首括号切分得占位符「无」→ 整条丢弃,wf-2 保持与 wf-1 同层并行
+        let mut plan = WorkFlowPlan {
+            workflows: vec![wf("wf-1", &[]), wf("wf-2", &["无(与 wf-1 并发启动)"])],
+            summary: "test".into(),
+            degraded: false,
+        };
+        sanitize_depends_on(&mut plan);
+        assert!(plan.workflows[1].depends_on.is_empty());
+        let layers = topo_layers(&plan.workflows).unwrap();
+        assert_eq!(layers.len(), 1, "wf-1/wf-2 应同层并行");
+    }
+
+    #[test]
     fn topo_sort_simple_chain() {
         let workflows = vec![
             wf("wf-1", &[]),
