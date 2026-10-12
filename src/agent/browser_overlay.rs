@@ -34,6 +34,17 @@
 //! 吃掉;且「挂起标志」跨域 iframe 读不到,Agent 点跨域 iframe 区域会被误拦且无法
 //! 解除。整页拦截用 CDP 层,只有 partial 的**分区**拦截才用 DOM 盾区(区域粒度
 //! CDP 做不到,盾区脚本运行在各 frame 自己的文档里,跨域 iframe 同样罩得住)。
+//!
+//! **第 155 轮:locked 档「可滚动观看」**。CDP `setIgnoreInputEvents` 是页面级
+//! 一刀切 —— 连滚轮一起拦,人工在 locked 档连「自己往上翻历史」都做不到(豆包
+//! 多轮对话实测:页面靠 auto_follow 停在最新,人工一翻就断)。该论证只否定
+//! pointer-events 蒙层;**事件监听器 + `isTrusted` 判据**没有那个缺陷:真实人工
+//! 输入与 CDP 合成输入 `isTrusted=true`(拦),页面自合成事件(`el.click()` /
+//! `dispatchEvent`,eval_js 驱动)`isTrusted=false`(放行 —— CDP 拦截下本就不进
+//! 输入管线,能力面等价)。因此 locked 档缺省改用 **DOM 选择性输入闸**:拦
+//! 点击/键盘/拖拽/触摸,放行滚轮/滚动/鼠标移动;杀开关 `LAEW_WEB_LOCKED_SCROLL=off`
+//! 或闸注入失败时 fail-closed 回退 CDP 全量拦截。设计详案
+//! `docs/MCP_Web_Use/13-locked档可滚动观看与人工应答语义.md`。
 
 use chromiumoxide::cdp::browser_protocol::input::SetIgnoreInputEventsParams;
 use chromiumoxide::Page;
@@ -230,9 +241,9 @@ impl PageGuardConfig {
 
 // ===================== 管控 JS(蒙层 + 状态条 + 盾区三件套) =====================
 
-/// 管控 JS 模板:`{MODE}`/`{ALLOW}`/`{BLOCK}`/`{NOTE}` 占位符由 [`guard_script`]
-/// 烘焙为初始配置,使运行期 `set_guard` 后发生的导航按「期望态」重建
-/// (配合导航类动作收尾的 re-assert,与第 141 轮同构)。
+/// 管控 JS 模板:`{MODE}`/`{ALLOW}`/`{BLOCK}`/`{NOTE}`/`{SCROLLWATCH}` 占位符由
+/// [`guard_script`] 烘焙为初始配置,使运行期 `set_guard` 后发生的导航按「期望态」
+/// 重建(配合导航类动作收尾的 re-assert,与第 141 轮同构)。
 ///
 /// 设计要点:
 /// - 蒙层 `pointer-events:none`(纯视觉,零 hit-test 参与)与状态条
@@ -254,12 +265,39 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     window.__laewGuardBlock = {BLOCK};
     window.__laewGuardNote = {NOTE};
     window.__laewGuardSuspended = false;
+    // 第 155 轮:locked 档 DOM 选择性输入闸(可滚动观看)。
+    // 只拦 isTrusted 事件(真实人工输入 + CDP 合成输入);页面自合成事件
+    // (eval_js 驱动的 el.click()/dispatchEvent)isTrusted=false 不拦 —— 与
+    // CDP 拦截下的 Agent 能力面等价。滚轮/滚动/鼠标移动不拦,人工可自由翻阅观看。
+    window.__laewGuardScrollWatch = {SCROLLWATCH};
+    window.__laewGuardInputSuspended = false;
+    window.__laewGuardGateReady = false;
+    if (window.__laewGuardScrollWatch) {
+        const GATE_EVTS = ['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick',
+            'contextmenu', 'pointerdown', 'pointerup', 'dragstart', 'drop',
+            'keydown', 'keyup', 'keypress', 'touchstart', 'touchend'];
+        const gate = (e) => {
+            try { if (!e.isTrusted) return; } catch (ex) { return; }
+            if (window.__laewGuardMode !== 'locked') return;
+            if (window.__laewGuardInputSuspended) return;
+            try { e.stopImmediatePropagation(); e.preventDefault(); } catch (ex) {}
+        };
+        for (const t of GATE_EVTS) window.addEventListener(t, gate, true);
+        window.__laewGuardInputSuspend = (s) => {
+            window.__laewGuardInputSuspended = !!s;
+            return true;
+        };
+        window.__laewGuardGateReady = true;
+    }
     const MASK_ID = '__laew_overlay__';
     const HINT_ID = '__laew_overlay_hint__';
     const SHIELDS_ID = '__laew_guard_shields__';
     const CHIP_TEXT = {
-        locked: ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看)',
-                 '人工操作已拦截;如需介入请应答「人工介入」弹窗'],
+        locked: window.__laewGuardScrollWatch
+            ? ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看·可滚动)',
+               '人工可滚动浏览;点击/键盘已拦截,如需操作请应答「人工介入」弹窗']
+            : ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看)',
+               '人工操作已拦截;如需介入请应答「人工介入」弹窗'],
         open:   ['🔓 页面开放 · 人工可直接操作',
                  'Agent 协同中;人工完成操作后应答「人工介入」弹窗告知'],
         partial:['🛡 部分锁定 · 盾区不可操作',
@@ -470,18 +508,36 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     }
 })()"#;
 
-/// 按实例期望态生成注入脚本(烘焙初始配置;选择器/note 以 JSON 字面量嵌入)。
+/// 按实例期望态生成注入脚本(烘焙初始配置;选择器/note 以 JSON 字面量嵌入,
+/// 滚动观看开关按 [`locked_scroll_watch_enabled`] 烘焙 —— 环境变量进程级不变,
+/// 烘焙即终态)。
 pub fn guard_script(cfg: &PageGuardConfig) -> String {
     let cfg = cfg.normalized();
     let mode = serde_json::to_string(cfg.mode.as_str()).unwrap_or_else(|_| "\"locked\"".into());
     let allow = serde_json::to_string(&cfg.allow_selectors).unwrap_or_else(|_| "[]".into());
     let block = serde_json::to_string(&cfg.block_selectors).unwrap_or_else(|_| "[]".into());
     let note = serde_json::to_string(&cfg.note).unwrap_or_else(|_| "null".into());
+    let scroll_watch = if locked_scroll_watch_enabled() { "true" } else { "false" };
     AGENT_GUARD_JS_TEMPLATE
         .replace("{MODE}", &mode)
         .replace("{ALLOW}", &allow)
         .replace("{BLOCK}", &block)
         .replace("{NOTE}", &note)
+        .replace("{SCROLLWATCH}", scroll_watch)
+}
+
+/// `LAEW_WEB_LOCKED_SCROLL`(第 155 轮):`off/0/false/no` → 关闭 locked 档
+/// 「可滚动观看」DOM 输入闸,回退第 141 轮 CDP 全量输入拦截(连滚轮一起拦)。
+/// 默认开启。与 `LAEW_WEB_OVERLAY` / `LAEW_WEB_GUARD` 同款只认 off 系。
+pub fn locked_scroll_watch_enabled() -> bool {
+    !matches!(
+        std::env::var("LAEW_WEB_LOCKED_SCROLL")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
+    )
 }
 
 /// `LAEW_WEB_OVERLAY` 缺省开关(第 141 轮 legacy,第 143 轮起作为 guard 级联的
@@ -514,9 +570,13 @@ pub async fn inject_agent_guard(page: &Page, cfg: &PageGuardConfig) {
         .await;
 }
 
-/// 应用页面管控三档(L1 CDP 输入拦截按档 + JS 全量设置)。
+/// 应用页面管控三档(L1 输入拦截按档 + JS 全量设置)。
 ///
-/// - locked:`setIgnoreInputEvents(true)` + `__laewGuardSet('locked',…)`(蒙层+锁定状态条);
+/// - locked(第 155 轮起缺省):**DOM 选择性输入闸**(滚动观看)—— JS 先设置,
+///   探测闸在场(`__laewGuardGateReady`)→ CDP 显式放行(`setIgnoreInputEvents(false)`
+///   清残留),人工滚轮可滚、点击/键盘被闸拦;
+/// - locked(闸不在场:`LAEW_WEB_LOCKED_SCROLL=off` / hidden / 注入失败):
+///   fail-closed 回退第 141 轮 CDP 全量拦截 `setIgnoreInputEvents(true)`;
 /// - open:`setIgnoreInputEvents(false)` + `__laewGuardSet('open',…)`(放行+开放状态条);
 /// - partial:`setIgnoreInputEvents(false)` + `__laewGuardSet('partial',…)`(盾区+状态条)。
 ///
@@ -527,13 +587,8 @@ pub async fn apply_page_guard(
     cfg: &PageGuardConfig,
 ) -> std::result::Result<Value, String> {
     let cfg = cfg.normalized();
-    let input_locked = cfg.mode == PageGuardMode::Locked;
-    // L1:CDP 输入拦截(实测同时拦 CDP 合成输入 → locked 下输入动作须先解后锁)
-    let input_lock_applied = page
-        .execute(SetIgnoreInputEventsParams::new(input_locked))
-        .await
-        .is_ok();
-    // L2/L3:JS 蒙层 + 状态条 + 盾区(未注入脚本的页面返回 null → applied=false)
+    let locked = cfg.mode == PageGuardMode::Locked;
+    // L2/L3(+locked 的 DOM 输入闸):JS 先行 —— CDP 是否回退拦截取决于闸是否在场。
     let allow = serde_json::to_string(&cfg.allow_selectors).unwrap_or_else(|_| "[]".into());
     let block = serde_json::to_string(&cfg.block_selectors).unwrap_or_else(|_| "[]".into());
     let note = serde_json::to_string(&cfg.note).unwrap_or_else(|_| "null".into());
@@ -546,13 +601,50 @@ pub async fn apply_page_guard(
         .await
         .map_err(|e| format!("应用页面管控失败:{e}"))?;
     let js_applied = !r.value().map(|v| v.is_null()).unwrap_or(true);
+    // 闸在场性探测(第 155 轮):只有「locked + 滚动观看开启 + 脚本已注入且闸已装」
+    // 才走 DOM 闸;任何一环缺失都回退 CDP 全量拦截(fail-closed)。
+    let gate_ready = if locked && locked_scroll_watch_enabled() && js_applied {
+        page
+            .evaluate("!!window.__laewGuardGateReady")
+            .await
+            .ok()
+            .and_then(|r| r.value().cloned())
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let use_dom_gate = locked && gate_ready;
+    // L1:CDP 输入拦截 —— 仅在「locked 且 DOM 闸不在场」时启用;其余档(含闸接管的
+    // locked)显式 false,顺带清掉此前回退态可能残留的 CDP 锁(标志跨导航持久)。
+    let want_cdp_block = locked && !use_dom_gate;
+    let input_lock_applied = page
+        .execute(SetIgnoreInputEventsParams::new(want_cdp_block))
+        .await
+        .is_ok();
     Ok(json!({
         "mode": cfg.mode.as_str(),
-        "input_locked": input_locked && input_lock_applied,
+        "input_locked": want_cdp_block && input_lock_applied,
         "input_lock_applied": input_lock_applied,
-        "visual_mask": cfg.mode == PageGuardMode::Locked && js_applied,
+        "input_gate": if use_dom_gate { "dom_scrollable" } else if locked { "cdp" } else { "none" },
+        "scroll_watch": use_dom_gate,
+        "visual_mask": locked && js_applied,
         "shields_active": cfg.mode == PageGuardMode::Partial && js_applied,
     }))
+}
+
+/// 挂起/恢复 locked 档 DOM 输入闸(第 155 轮,Agent 输入动作「先解后锁」的闸版)。
+///
+/// 闸不在场(未注入 / 杀开关关闭 / `__laewGuardGateReady` 未置位)返回 false,
+/// 调用方(`guard_ctl::guard_lift_for_input`)据此回退 CDP 解锁路径。
+pub async fn gate_suspend_input(page: &Page, suspend: bool) -> bool {
+    let js = format!(
+        "window.__laewGuardGateReady ? window.__laewGuardInputSuspend({suspend}) : null"
+    );
+    match page.evaluate(js.as_str()).await {
+        Ok(r) => !r.value().map(|v| v.is_null()).unwrap_or(true),
+        Err(_) => false,
+    }
 }
 
 /// 挂起/恢复全部管控视觉(蒙层 + 状态条 + 盾区;不动 CDP 输入拦截)。
@@ -759,6 +851,10 @@ mod tests {
 
     #[test]
     fn guard_script_bakes_initial_config() {
+        let _g = env_lock();
+        unsafe {
+            std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
+        }
         let mut cfg = PageGuardConfig::partial(vec![".login-box".into()], vec![]);
         cfg.note = Some("请登录后应答弹窗".into());
         let js = guard_script(&cfg);
@@ -769,8 +865,10 @@ mod tests {
             js.contains("window.__laewGuardNote = \"请登录后应答弹窗\";"),
             "{js}"
         );
+        // 第 155 轮:滚动观看开关烘焙(缺省开启)
+        assert!(js.contains("window.__laewGuardScrollWatch = true;"), "{js}");
         // 占位符全部被烘焙
-        for ph in ["{MODE}", "{ALLOW}", "{BLOCK}", "{NOTE}"] {
+        for ph in ["{MODE}", "{ALLOW}", "{BLOCK}", "{NOTE}", "{SCROLLWATCH}"] {
             assert!(!js.contains(ph), "占位符 {ph} 未烘焙");
         }
         // locked 缺省烘焙
@@ -779,10 +877,90 @@ mod tests {
         assert!(js2.contains("window.__laewGuardNote = null;"));
     }
 
+    // =================== 第 155 轮:locked 档 DOM 输入闸(可滚动观看) ===================
+
+    #[test]
+    fn locked_scroll_watch_env_default_and_off() {
+        let _g = env_lock();
+        unsafe {
+            std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
+        }
+        assert!(locked_scroll_watch_enabled(), "缺省应开启可滚动观看");
+        for v in ["off", "0", "false", "no", "OFF", " No "] {
+            unsafe { std::env::set_var("LAEW_WEB_LOCKED_SCROLL", v) };
+            assert!(!locked_scroll_watch_enabled(), "{v} 应视为关闭");
+        }
+        // 非关闭语义的值不误杀(与 LAEW_WEB_OVERLAY 同款只认 off 系)
+        for v in ["on", "1", "true", "garbage"] {
+            unsafe { std::env::set_var("LAEW_WEB_LOCKED_SCROLL", v) };
+            assert!(locked_scroll_watch_enabled(), "{v} 应视为开启");
+        }
+        unsafe {
+            std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
+        }
+    }
+
+    /// 杀开关关闭时:闸不安装、状态条回退旧文案;开启时:闸标记齐全且拦截清单
+    /// **不含** wheel/scroll/mousemove(人工滚动通路的回归锁)。
+    #[test]
+    fn guard_script_gate_install_and_kill_switch() {
+        let _g = env_lock();
+        unsafe {
+            std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
+        }
+        let on = guard_script(&PageGuardConfig::locked());
+        assert!(on.contains("window.__laewGuardScrollWatch = true;"), "{on}");
+        assert!(on.contains("window.__laewGuardGateReady = true;"), "{on}");
+        assert!(on.contains("window.__laewGuardInputSuspend"), "{on}");
+        // isTrusted 判据:页面自合成事件(isTrusted=false)必须放行
+        assert!(on.contains("if (!e.isTrusted) return;"), "{on}");
+        // 拦截清单含交互事件,不含滚动/移动通路(断言收窄到 GATE_EVTS 数组段,
+        // 不与既有 partial 盾区的 'scroll' 重算监听混淆)
+        let gate_list = on
+            .split("const GATE_EVTS = [")
+            .nth(1)
+            .unwrap_or_default()
+            .split("];")
+            .next()
+            .unwrap_or_default();
+        assert!(!gate_list.is_empty(), "GATE_EVTS 数组段缺失:{on}");
+        for evt in ["'mousedown'", "'click'", "'keydown'", "'touchstart'", "'dragstart'"] {
+            assert!(gate_list.contains(evt), "拦截清单应含 {evt}:{gate_list}");
+        }
+        for evt in ["'wheel'", "'scroll'", "'mousemove'", "'pointermove'", "'touchmove'"] {
+            assert!(!gate_list.contains(evt), "拦截清单不得含 {evt}(人工滚动通路):{gate_list}");
+        }
+        // 可滚动状态条文案
+        assert!(on.contains("仅观看·可滚动"), "{on}");
+        assert!(on.contains("人工可滚动浏览"), "{on}");
+
+        unsafe { std::env::set_var("LAEW_WEB_LOCKED_SCROLL", "off") };
+        let off = guard_script(&PageGuardConfig::locked());
+        // 杀开关关闭:烘焙 false → 闸安装 if 块为死代码(运行时不注册监听,
+        // __laewGuardGateReady 保持 false → apply_page_guard 探测失败回退 CDP)。
+        // 模板是静态文本,if 块源码仍在,只能断言烘焙结果本身。
+        assert!(off.contains("window.__laewGuardScrollWatch = false;"), "{off}");
+        assert!(
+            off.contains("if (window.__laewGuardScrollWatch) {"),
+            "闸安装必须以烘焙开关为门(不得无条件安装):{off}"
+        );
+        assert!(
+            off.contains("window.__laewGuardScrollWatch\n            ? ["),
+            "locked 状态条文案必须按开关分流(可滚动/不可滚动两态):{off}"
+        );
+        unsafe {
+            std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
+        }
+    }
+
     /// 管控脚本关键标记锁死:三件套元素 id / 提取过滤(data-laew-agent)/
     /// 三档状态条文案 / 挖洞 clip-path / 挂载函数 / pointer-events 语义。
     #[test]
     fn guard_script_markers_locked() {
+        let _g = env_lock();
+        unsafe {
+            std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
+        }
         let js = guard_script(&PageGuardConfig::locked());
         assert!(js.contains(OVERLAY_ELEMENT_ID), "蒙层元素 id 应出现在脚本中");
         assert!(js.contains(OVERLAY_HINT_ID), "状态条 id 应出现在脚本中");
@@ -794,8 +972,8 @@ mod tests {
         assert!(js.contains("window.__laewGuardSuspend"));
         assert!(js.contains("window.__laewOverlaySet"), "第 141 轮 legacy 别名保留");
         assert!(js.contains("window.top === window"), "状态条仅主文档");
-        // 三档状态条文案
-        assert!(js.contains("页面已锁定(仅观看)"));
+        // 三档状态条文案(第 155 轮:locked 缺省可滚动观看)
+        assert!(js.contains("页面已锁定(仅观看·可滚动)"));
         assert!(js.contains("页面开放 · 人工可直接操作"));
         assert!(js.contains("盾区不可操作"));
         // 盾区技术要点:白名单垂直条带分解求补集(纯矩形,零 clip-path 依赖)+
@@ -945,6 +1123,51 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(count(&page).await, 1, "复锁后 CDP 点击应再次被拦");
 
+        // ②b 第 155 轮:locked 档 DOM 选择性输入闸(可滚动观看)。闸在场时
+        //     CDP 合成点击(isTrusted=true)被闸拦;闸挂起(先解)后通过;
+        //     页面自合成点击(isTrusted=false,eval_js 驱动)始终放行(Agent
+        //     能力面与 CDP 拦截等价);wheel 不在拦截清单(人工滚动通路)。
+        let gate_probe = page
+            .evaluate("!!window.__laewGuardGateReady && !!window.__laewGuardInputSuspend")
+            .await
+            .ok()
+            .and_then(|r| r.value().cloned())
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(gate_probe, "可滚动观看闸未安装(测试环境应缺省开启)");
+        cdp_click(&page).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(count(&page).await, 1, "闸激活时 CDP 合成点击应被拦");
+        assert!(gate_suspend_input(&page, true).await, "闸挂起应实际应用");
+        cdp_click(&page).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(count(&page).await, 2, "闸挂起后 CDP 点击应通过(先解后锁)");
+        assert!(gate_suspend_input(&page, false).await);
+        let synth = page
+            .evaluate(
+                "(function(){document.getElementById('b').click(); \
+                 return (+document.getElementById('b').dataset.c||0);})()",
+            )
+            .await
+            .ok()
+            .and_then(|r| r.value().cloned())
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        assert_eq!(synth, 3, "页面自合成点击(isTrusted=false)应放行:{synth}");
+        let wheel = page
+            .evaluate(
+                "(function(){var got=false; var f=function(){got=true;}; \
+                 window.addEventListener('wheel', f, {passive:true}); \
+                 window.dispatchEvent(new WheelEvent('wheel')); \
+                 window.removeEventListener('wheel', f); return got;})()",
+            )
+            .await
+            .ok()
+            .and_then(|r| r.value().cloned())
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(wheel, "wheel 事件应放行(人工滚动通路)");
+
         // ③ 蒙层隐藏/恢复(截图避让通道)
         assert!(mask_set_visible(&page, false).await, "蒙层隐藏应实际应用");
         let hidden = page
@@ -976,15 +1199,15 @@ mod tests {
         assert_eq!(shields, "/1", "partial 黑名单应生成 1 个盾罩:{shields}");
         cdp_click(&page).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(count(&page).await, 1, "盾区应吞掉(合成)人工点击");
+        assert_eq!(count(&page).await, 3, "盾区应吞掉(合成)人工点击");
         assert!(guard_suspend_visuals(&page, true).await, "隐盾应实际应用");
         cdp_click(&page).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(count(&page).await, 2, "隐盾后 CDP 点击应穿透生效");
+        assert_eq!(count(&page).await, 4, "隐盾后 CDP 点击应穿透生效");
         assert!(guard_suspend_visuals(&page, false).await);
         cdp_click(&page).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(count(&page).await, 2, "复盾后点击应再次被吞");
+        assert_eq!(count(&page).await, 4, "复盾后点击应再次被吞");
 
         // ⑤ 第 143 轮:白名单挖洞(只允许 200x100 按钮区,垂直条带分解求补集)
         //    → 区内可点、按钮外(400,300)的命中目标应是盾罩本身。

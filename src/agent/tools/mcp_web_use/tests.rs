@@ -1540,6 +1540,32 @@ fn hitl_answer_hint_splits_typed_code_vs_option_pick() {
     assert!(!h.contains("input_text"), "非验证码 reason 不应指引填码: {h}");
 }
 
+/// 第 155 轮:captcha/sms/two_factor 的自由文本**不像码**(整句指示/中文)时,
+/// 不得指引 input_text 填码 —— 人工经弹窗输入的是给 Agent 的指示。
+#[test]
+fn hitl_answer_hint_directive_text_not_treated_as_code() {
+    // 整句指示(中文):按指示处理,不填入页面
+    let h = hitl_hint::hitl_answer_hint("captcha", "先别提交,我想让你改查北京天气");
+    assert!(h.contains("文字指示"), "{h}");
+    assert!(!h.contains("input_text"), "整句指示不应指引填码: {h}");
+    // 长英文句子(>16 字符)同理
+    let h = hitl_hint::hitl_answer_hint("sms", "please wait for my next message");
+    assert!(h.contains("文字指示"), "{h}");
+    // 边界:像码的形态仍然填码(回归锁)
+    for code in ["z7z2", "482913", "993 041", "ab-12_34"] {
+        assert!(
+            hitl_hint::hitl_answer_hint("captcha", code).contains("input_text"),
+            "「{code}」应按验证码处理"
+        );
+    }
+    // 判据本身:空/超长/含中文/含句读 → 不是码
+    assert!(hitl_hint::looks_like_code_text("z7z2"));
+    assert!(!hitl_hint::looks_like_code_text(""));
+    assert!(!hitl_hint::looks_like_code_text("先别提交"));
+    assert!(!hitl_hint::looks_like_code_text("a b c d e f g h i j k l m n o p q"));
+    assert!(!hitl_hint::looks_like_code_text("wait, ok"));
+}
+
 /// 「N. 选项」形态判定:数字前缀 + ". " 分隔;纯数字验证码/含点文本不误判。
 #[test]
 fn option_pick_answer_shape_detection() {

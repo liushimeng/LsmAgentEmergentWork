@@ -957,9 +957,10 @@ impl BrowserManager {
         !inner.connect_mode && matches!(inner.mode, BrowserMode::Headed)
     }
 
-    /// 运行时切换页面管控三档(第 143 轮,镜像 `set_highlight` 语义):
+    /// 运行时切换页面管控三档(第 143 轮,镜像 `set_highlight` 语义;第 155 轮起
+    /// locked 档缺省 DOM 输入闸「可滚动观看」):
     /// 校验 + 归一化 → 更新实例期望态 → 立即对指定 page 应用
-    /// (CDP 输入拦截按档 + JS 蒙层/状态条/盾区)。
+    /// (输入拦截按档:locked 优先 DOM 闸、不在场回退 CDP;JS 蒙层/状态条/盾区)。
     pub async fn set_guard(
         &self,
         page_id: &str,
@@ -993,9 +994,10 @@ impl BrowserManager {
             "note": cfg.note,
             "visuals_applied": visuals,
             "input_locked": applied["input_locked"],
+            "scroll_watch": applied["scroll_watch"],
             "visual_mask": applied["visual_mask"],
             "shields_active": applied["shields_active"],
-            "hint": "页面管控三档(第 143 轮):locked=屏蔽(蒙层+输入拦截,缺省)/ open=非屏蔽(人工可直接操作)/ partial=部分屏蔽(盾区外人工可操作);运行时随时切换",
+            "hint": "页面管控三档(第 143 轮):locked=屏蔽(蒙层+输入拦截,缺省;第 155 轮起人工可滚动观看,点击/键盘仍拦)/ open=非屏蔽(人工可直接操作)/ partial=部分屏蔽(盾区外人工可操作);运行时随时切换",
         }))
     }
 

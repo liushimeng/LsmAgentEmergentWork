@@ -31,6 +31,7 @@ mod captcha_crop;
 mod control;
 mod eval_sanitize;
 mod extract;
+mod follow_ctl;
 mod guard_ctl;
 mod hitl_guard;
 mod hitl_hint;

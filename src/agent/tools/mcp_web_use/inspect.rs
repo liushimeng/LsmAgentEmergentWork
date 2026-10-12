@@ -409,8 +409,13 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         // 直接回答「人工此刻能看到多少」并给出 Agent 可立即执行的处置动作。
         "visibility" => {
             let vis = crate::agent::browser_follow::visibility(&page).await;
+            // 第 155 轮:locked 档缺省「可滚动观看」—— 诊断提示按人工是否可自行滚动分流
+            let human_scrollable = BrowserManager::global().overlay_active().await
+                && crate::agent::browser_overlay::locked_scroll_watch_enabled();
             let mut out = json!({"visibility": vis.clone()});
-            if let Some(note) = crate::agent::browser_follow::visibility_note(&vis) {
+            if let Some(note) =
+                crate::agent::browser_follow::visibility_note(&vis, human_scrollable)
+            {
                 out["note"] = json!(note);
                 out["required_action"] = json!(
                     "control(scroll_to, params={position:'bottom'}) 或 control(auto_follow, params={enabled:true})"

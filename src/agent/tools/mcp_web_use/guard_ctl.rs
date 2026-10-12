@@ -12,15 +12,20 @@ use super::*;
 /// 输入类动作前的让路方式。
 #[derive(Debug, Clone, Copy)]
 pub(super) enum GuardLiftKind {
-    /// locked 档:CDP 输入解锁(`setIgnoreInputEvents=false`),动作后复锁。
+    /// locked 档(第 155 轮缺省):DOM 输入闸挂起(合成输入通过),动作后复位。
+    GateSuspend,
+    /// locked 档(闸不在场:杀开关/注入失败):CDP 输入解锁
+    /// (`setIgnoreInputEvents=false`),动作后复锁(第 141 轮路径)。
     InputUnlock,
     /// partial 档:盾区挂起(隐藏盾罩,Agent 的 CDP 点击不被吞),动作后复盾。
     ShieldsSuspend,
 }
 
-/// 输入类动作前的让路:按当前管控档分流(第 141 轮解锁,第 143 轮隐盾)。
+/// 输入类动作前的让路:按当前管控档分流(第 141 轮解锁,第 143 轮隐盾,
+/// 第 155 轮 locked 优先 DOM 闸挂起、闸不在场回退 CDP 解锁)。
 ///
-/// - locked(headed):`Input.setIgnoreInputEvents=false`,返回页面句柄供动作后复锁;
+/// - locked(headed):`__laewGuardInputSuspend(true)` 挂起输入闸;闸不在场
+///   (杀开关关闭/脚本未注入)才走 `Input.setIgnoreInputEvents=false` 回退路径;
 /// - partial(headed 非 connect):`__laewGuardSuspend(true)` 隐藏盾罩;
 /// - open / hidden / connect / page_id 失效 → None(零开销;后者由动作自身报 2000)。
 /// fail-open:让路失败也不阻断动作(等同未激活,动作照常执行)。
@@ -33,9 +38,14 @@ pub(super) async fn guard_lift_for_input(
     let page = mgr.page(id).await?;
     match mode {
         PageGuardMode::Locked if mgr.overlay_active().await => {
-            use chromiumoxide::cdp::browser_protocol::input::SetIgnoreInputEventsParams;
-            let _ = page.execute(SetIgnoreInputEventsParams::new(false)).await;
-            Some((page, GuardLiftKind::InputUnlock))
+            if crate::agent::browser_overlay::gate_suspend_input(&page, true).await {
+                Some((page, GuardLiftKind::GateSuspend))
+            } else {
+                // DOM 闸不在场(杀开关/注入失败)→ 第 141 轮 CDP 解锁回退路径
+                use chromiumoxide::cdp::browser_protocol::input::SetIgnoreInputEventsParams;
+                let _ = page.execute(SetIgnoreInputEventsParams::new(false)).await;
+                Some((page, GuardLiftKind::InputUnlock))
+            }
         }
         PageGuardMode::Partial if mgr.guard_visuals_active().await => {
             if crate::agent::browser_overlay::guard_suspend_visuals(&page, true).await {
@@ -55,6 +65,11 @@ pub(super) async fn guard_restore_after_input(
     kind: GuardLiftKind,
 ) {
     match kind {
+        GuardLiftKind::GateSuspend => {
+            if !crate::agent::browser_overlay::gate_suspend_input(page, false).await {
+                tracing::warn!("输入闸复位失败(fail-open;下一动作先解时自愈)");
+            }
+        }
         GuardLiftKind::InputUnlock => {
             use chromiumoxide::cdp::browser_protocol::input::SetIgnoreInputEventsParams;
             if let Err(e) = page.execute(SetIgnoreInputEventsParams::new(true)).await {

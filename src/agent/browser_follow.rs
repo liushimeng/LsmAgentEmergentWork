@@ -204,7 +204,11 @@ pub async fn visibility(page: &chromiumoxide::Page) -> Value {
 /// 关键点:诊断出「人工看不到」时,**给的是 Agent 能立即执行的动作**
 /// (`scroll_to` / `auto_follow`),而不是一句「建议用户滚动」—— locked 档下
 /// 用户滚不了,那句话等于把问题原样退回给用户。
-pub fn visibility_note(v: &Value) -> Option<String> {
+///
+/// 第 155 轮起 locked 档缺省为「可滚动观看」(`human_scrollable=true`,DOM 输入闸
+/// 放行滚轮):不在底部不再是缺陷,人工**可能正在上翻阅读历史**,提示语改为
+/// 「人工可自行滚动;强制吸底前先确认」;仅回退档(CDP 全量拦截)才保留旧文案。
+pub fn visibility_note(v: &Value, human_scrollable: bool) -> Option<String> {
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
     }
@@ -215,6 +219,14 @@ pub fn visibility_note(v: &Value) -> Option<String> {
         return Some("已停在最新位置,人工可见全部最新内容".into());
     }
     let below = v.get("below_fold_px").and_then(Value::as_i64).unwrap_or(0);
+    if human_scrollable {
+        return Some(format!(
+            "最新内容在视口下方约 {below}px。当前为可滚动观看模式,人工可自行滚动查看;\
+             人工可能正在上翻阅读历史,不要强制吸底。若需把页面带回最新供人工核对,可 \
+             control(scroll_to, params={{position:'bottom'}}) 或 \
+             control(auto_follow, params={{enabled:true}})"
+        ));
+    }
     Some(format!(
         "最新内容在视口下方约 {below}px 处,人工在 locked 档无法自行滚动(CDP 输入拦截 \
          连滚轮一并拦)。请先 control(scroll_to, params={{position:'bottom'}}) 或 \
@@ -237,23 +249,39 @@ mod tests {
     #[test]
     fn visibility_note_cases() {
         // 未成功诊断 → 不给提示(fail-open,零噪声)
-        assert_eq!(visibility_note(&json!({"ok": false})), None);
+        assert_eq!(visibility_note(&json!({"ok": false}), true), None);
         // 不可滚动 → 明确「无需滚动」
-        assert!(visibility_note(&json!({"ok": true, "scrollable": false}))
+        assert!(visibility_note(&json!({"ok": true, "scrollable": false}), true)
             .unwrap()
             .contains("无需滚动"));
         // 已在底部 → 明确「人工可见」
-        assert!(visibility_note(&json!({"ok": true, "scrollable": true, "at_bottom": true}))
+        assert!(visibility_note(&json!({"ok": true, "scrollable": true, "at_bottom": true}), true)
             .unwrap()
             .contains("已停在最新"));
-        // 有隐藏内容 → 必须给出 Agent 可执行动作,且不得让用户自己滚
-        let n = visibility_note(&json!({
-            "ok": true, "scrollable": true, "at_bottom": false, "below_fold_px": 2145
-        }))
+        // 有隐藏内容 + 回退档(人工滚不了)→ 必须给出 Agent 可执行动作,且不得让用户自己滚
+        let n = visibility_note(
+            &json!({
+                "ok": true, "scrollable": true, "at_bottom": false, "below_fold_px": 2145
+            }),
+            false,
+        )
         .unwrap();
         assert!(n.contains("2145"));
+        assert!(n.contains("无法自行滚动"));
         assert!(n.contains("scroll_to"));
         assert!(n.contains("auto_follow"));
+        // 有隐藏内容 + 可滚动观看(第 155 轮缺省)→ 人工可自行滚动,不得强制吸底
+        let s = visibility_note(
+            &json!({
+                "ok": true, "scrollable": true, "at_bottom": false, "below_fold_px": 2145
+            }),
+            true,
+        )
+        .unwrap();
+        assert!(s.contains("2145"));
+        assert!(s.contains("可自行滚动"));
+        assert!(s.contains("不要强制吸底"));
+        assert!(s.contains("scroll_to"), "仍应给出 Agent 可执行的带回最新动作");
     }
 
     #[test]
