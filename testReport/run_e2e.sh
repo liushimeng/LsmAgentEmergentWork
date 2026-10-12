@@ -1,10 +1,75 @@
 #!/usr/bin/env bash
 # run_e2e.sh: laew 端到端自动化验证(不依赖真实 LLM,使用本地 mock 服务)
 # 输出: testReport/e2e-<时间戳>.txt
+#
+# 用法:
+#   bash testReport/run_e2e.sh                  # 全量(231 断言,约 90s)
+#   bash testReport/run_e2e.sh --list           # 列出全部小节名
+#   bash testReport/run_e2e.sh --only '4q|8'    # 只跑匹配小节(前缀正则)
+#   bash testReport/run_e2e.sh --skip '8|4b'    # 跳过匹配小节(前缀正则)
+#   bash testReport/run_e2e.sh --keep-artifacts # 保留 mock 抓包 jsonl(默认全通过即清)
+#   bash testReport/run_e2e.sh --timing         # 额外打印逐小节耗时表
+#
+# 注意:--only/--skip 会跳过小节正文,跨小节共享的变量(如 §3 建的 ID_A/ID_O、
+# §8 tmux 依赖的 mockA 记录)可能因此缺失;只跑单小节时先确认其前置依赖已就位。
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+
+# ---- CLI 参数 ----
+# --keep-artifacts / --timing 经环境变量传给过滤子进程(子进程本身不带参数)
+E2E_ONLY=""; E2E_SKIP=""; E2E_LIST=0
+E2E_KEEP_ARTIFACTS="${LAEW_E2E_KEEP_ARTIFACTS:-0}"
+E2E_TIMING="${LAEW_E2E_TIMING:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --only)          E2E_ONLY="${2:-}"; shift 2 ;;
+    --only=*)        E2E_ONLY="${1#*=}"; shift ;;
+    --skip)          E2E_SKIP="${2:-}"; shift 2 ;;
+    --skip=*)        E2E_SKIP="${1#*=}"; shift ;;
+    --list)          E2E_LIST=1; shift ;;
+    --keep-artifacts) E2E_KEEP_ARTIFACTS=1; shift ;;
+    --timing)        E2E_TIMING=1; shift ;;
+    -h|--help)       sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "未知参数: $1(用 --help 查看用法)" >&2; exit 2 ;;
+  esac
+done
+export LAEW_E2E_KEEP_ARTIFACTS="$E2E_KEEP_ARTIFACTS"
+export LAEW_E2E_TIMING=$([ -n "$E2E_TIMING" ] && echo all || echo top)
+
+if [ "$E2E_LIST" -eq 1 ]; then
+  grep '^# --- ' "$0" | sed -E 's/^# --- //; s/ ---$//'
+  exit 0
+fi
+
+# ---- 小节过滤:把未选中的小节正文从脚本里剔除,再执行副本 ----
+# 小节以 `# --- N. 标题 ---` 注释行开头(全文件 44 处,一一对应),前奏(本段之前)
+# 与收尾(汇总行之后)始终保留,所以统计/清理/退出码逻辑不受过滤影响。
+if [ -n "$E2E_ONLY$E2E_SKIP" ] && [ -z "${LAEW_E2E_FILTERED:-}" ]; then
+  FILTERED="$ROOT_DIR/testReport/.e2e-filtered-$$.sh"
+  awk -v only="$E2E_ONLY" -v skip="$E2E_SKIP" '
+    BEGIN { inpre = 1; keep = 1; buf = "" }
+    /^# --- / {
+      if (buf != "") { if (keep) printf "%s", buf; buf = "" }
+      inpre = 0; keep = 1
+      if (skip != "" && $0 ~ ("^# --- " skip)) keep = 0
+      if (only != "" && $0 ~ ("^# --- " only))  keep = 1
+      if (only != "" && $0 !~ ("^# --- " only)) keep = 0
+      buf = $0 "\n"; next
+    }
+    /^SUM_PASS=/ { if (buf != "") { if (keep) printf "%s", buf; buf = "" } inpost = 1; print; next }
+    inpre  { print; next }
+    inpost { print; next }
+    { buf = buf $0 "\n" }
+    END { if (buf != "") { if (keep) printf "%s", buf } }
+  ' "$0" > "$FILTERED"
+  echo "小节过滤: only='${E2E_ONLY}' skip='${E2E_SKIP}' → $(grep -c '^# --- ' "$FILTERED") 个小节"
+  LAEW_E2E_FILTERED=1 bash "$FILTERED"
+  _rc=$?
+  rm -f "$FILTERED"
+  exit $_rc
+fi
 
 TS=$(date +%Y%m%d-%H%M%S)
 RUN_ID="${TS}-$$"
@@ -43,7 +108,66 @@ export LAEW_ALLOW_PRIVATE_ENDPOINT=1
 mkdir -p testReport
 : > "$REPORT"
 
-section() { echo "" | tee -a "$REPORT"; echo "==== $1 ====" | tee -a "$REPORT"; }
+# ---- 产物清理 ----
+# 单次全量跑会产生 ~25MB mock 抓包 jsonl + ~1MB 报告;不清理的话 testReport/
+# 几天就膨胀到几百 MB,后续「读一下 testReport/*」排查故障的人(和 Agent)会被
+# 淹没在历史产物里。策略:开工前只留最近 KEEP_RUNS 轮;收尾时全部通过则删本轮
+# 抓包(报告保留),有失败则保留并在汇总里打出路径。
+KEEP_RUNS="${LAEW_E2E_KEEP_RUNS:-3}"
+prune_old_artifacts() {
+  # 旧报告:按 mtime 倒序,保留最近 KEEP_RUNS 份
+  ls -t testReport/e2e-*.txt 2>/dev/null | tail -n +$((KEEP_RUNS + 1)) | while read -r f; do
+    rm -f "$f"
+  done
+  # 旧抓包:mock_requests-*.jsonl
+  ls -t testReport/mock_requests-*.jsonl 2>/dev/null | tail -n +$((KEEP_RUNS + 1)) | while read -r f; do
+    rm -f "$f"
+  done
+  # tmux 运行残留 + 脚本备份
+  rm -f testReport/tmux-laew_e2e_*.log testReport/.e2e-filtered-*.sh
+}
+prune_old_artifacts
+
+# ---- mock 端口就绪探测 ----
+# 原先每个 mock 服务起来后固定 sleep 0.6(全量 25 处 ≈ 15s 纯等待),既慢又不
+# 稳(机器繁忙时 0.6s 不够、且端口占用时报错被 sleep 掩盖)。改为轮询探测:
+# 端口可连接即返回,典型 <30ms。
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3<&- 3>&-; }
+wait_port() {  # $1=端口 $2=mock 进程 pid(可选,用于进程已死时提前退出)
+  local port="$1" pid="${2:-}" i
+  for ((i = 0; i < 300; i++)); do
+    if port_open "$port"; then return 0; fi
+    [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && return 1
+    sleep 0.02
+  done
+  return 1
+}
+start_mock() {  # $1=端口 $2=pid变量名 其余=mock_llm_server.py 参数
+  local port="$1" pidvar="$2"; shift 2
+  python3 scripts/mock_llm_server.py "$@" &>/dev/null &
+  local pid=$!
+  if ! wait_port "$port" "$pid"; then
+    echo "  [WARN] mock 端口 $port 未在 6s 内就绪(继续,后续断言会失败)" | tee -a "$REPORT"
+  fi
+  printf -v "$pidvar" '%s' "$pid" 2>/dev/null || eval "$pidvar=$pid"
+}
+
+# ---- 逐小节耗时 ----
+# section() 顺手记账,收尾打印「最慢 Top10」+ 总耗时;--timing 额外打全表。
+# 用于回答「改哪个模块该跑哪几节」——先看表,再用 --only 定向跑。
+E2E_T0=$SECONDS
+SEC_NAMES=(); SEC_ELAPSED=(); SEC_IDX=0; SEC_T0=$SECONDS
+section() {
+  local now=$SECONDS
+  if [ "$SEC_IDX" -gt 0 ]; then
+    SEC_ELAPSED[$((SEC_IDX - 1))]=$(( now - SEC_T0 ))
+  fi
+  SEC_NAMES[$SEC_IDX]="$1"
+  SEC_T0=$now
+  SEC_IDX=$((SEC_IDX + 1))
+  echo "" | tee -a "$REPORT"; echo "==== $1 ====" | tee -a "$REPORT"
+}
+close_last_section() { SEC_ELAPSED[$((SEC_IDX - 1))]=$(( SECONDS - SEC_T0 )); }
 check() {
   if [ "$1" -eq 0 ]; then PASS=$((PASS+1)); echo "  [PASS] $2" | tee -a "$REPORT"
   else FAIL=$((FAIL+1)); echo "  [FAIL] $2" | tee -a "$REPORT"; fi
@@ -76,7 +200,9 @@ fi
 echo "laew e2e 验证 @ $(date)" | tee "$REPORT"
 echo "根目录: $ROOT_DIR" | tee -a "$REPORT"
 
-# --- 准备:独立数据库(避免污染真实配置) ---
+# 准备:独立数据库(避免污染真实配置) —— 注意:小节分隔注释统一用 `# --- ` 前缀,
+# 本行刻意不带,以便被 --only/--skip 过滤时始终留在前奏里(前奏含 run/check/
+# section/wait_port 等全部 helper 定义,丢掉就没有可执行骨架了)。
 # 2026-09-10 第二十八轮修复:rm -f 对目录无效,残留旧 DB 会让 §2「未配置模型」
 # 与 §3 provider add(UNIQUE 冲突)级联失败;必须 rm -rf 保证干净起点。
 rm -rf /tmp/laew-e2e-root; mkdir -p /tmp/laew-e2e-root
@@ -214,7 +340,7 @@ rm -f "$PROV_OLD" "$PROV_EXPORT2"
 # --- 4. mock LLM + OpenAI 协议端到端 ---
 section "4. OpenAI 协议端到端(工具调用循环)"
 python3 scripts/mock_llm_server.py $MOCK_PORT "$MOCK_LOG" &>/dev/null &
-MOCK_PID=$!; sleep 0.6
+MOCK_PID=$!; wait_port $MOCK_PORT $MOCK_PID || echo "  [WARN] mock 未就绪($MOCK_PORT)" | tee -a "$REPORT"
 OUT=$(run "$LAEW" -p "请帮我执行一个测试命令"); echo "$OUT" | grep -q "MOCK_FINAL_ANSWER"; check $? "返回最终文本"
 run "$LAEW" provider use "$ID_A" >/dev/null 2>&1
 
@@ -227,7 +353,7 @@ section "4b. Bash 危险命令 fail-closed 端到端"
 BASH_MOCK_LOG="testReport/mock_requests-bash-$RUN_ID.jsonl"
 BASH_MOCK_PORT=18900
 python3 scripts/mock_llm_server.py $BASH_MOCK_PORT "$BASH_MOCK_LOG" --bash-block &>/dev/null &
-BASH_MOCK_PID=$!; sleep 0.6
+BASH_MOCK_PID=$!; wait_port $BASH_MOCK_PORT $BASH_MOCK_PID || echo "  [WARN] mock 未就绪($BASH_MOCK_PORT)" | tee -a "$REPORT"
 # 加一个本节专用 provider,端点指向 BASH_MOCK_PORT
 run "$LAEW" provider add --protocol anthropic --provider-name bash-guard --model-name claude-bash-guard \
   --end-point "http://127.0.0.1:$BASH_MOCK_PORT" --api-key sk-bash-guard >/dev/null 2>&1
@@ -260,7 +386,7 @@ section "4c. JSON 自动修复链端到端(半坏 JSON 模式)"
 FLAKY_MOCK_LOG="testReport/mock_requests-flaky-$RUN_ID.jsonl"
 FLAKY_MOCK_PORT=18901
 python3 scripts/mock_llm_server.py $FLAKY_MOCK_PORT "$FLAKY_MOCK_LOG" --flaky &>/dev/null &
-FLAKY_MOCK_PID=$!; sleep 0.6
+FLAKY_MOCK_PID=$!; wait_port $FLAKY_MOCK_PORT $FLAKY_MOCK_PID || echo "  [WARN] mock 未就绪($FLAKY_MOCK_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name flaky --model-name claude-flaky \
   --end-point "http://127.0.0.1:$FLAKY_MOCK_PORT" --api-key sk-flaky >/dev/null 2>&1
 ID_FLAKY=$(run "$LAEW" provider list 2>/dev/null | grep flaky | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -285,7 +411,7 @@ section "4d. Quality fail-closed 端到端(非 JSON 模式)"
 BQ_MOCK_LOG="testReport/mock_requests-bq-$RUN_ID.jsonl"
 BQ_MOCK_PORT=18902
 python3 scripts/mock_llm_server.py $BQ_MOCK_PORT "$BQ_MOCK_LOG" --broken-quality &>/dev/null &
-BQ_MOCK_PID=$!; sleep 0.6
+BQ_MOCK_PID=$!; wait_port $BQ_MOCK_PORT $BQ_MOCK_PID || echo "  [WARN] mock 未就绪($BQ_MOCK_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name bq --model-name claude-bq \
   --end-point "http://127.0.0.1:$BQ_MOCK_PORT" --api-key sk-bq >/dev/null 2>&1
 # 注意:必须按 provider_name 而非「当前 active」抓 id,避免被 ID_A 抢占
@@ -312,7 +438,7 @@ section "4e. WorkFlow 同层并行调度端到端(--parallel-wfs 模式)"
 PAR_MOCK_LOG="testReport/mock_requests-par-$RUN_ID.jsonl"
 PAR_MOCK_PORT=18903
 python3 scripts/mock_llm_server.py $PAR_MOCK_PORT "$PAR_MOCK_LOG" --parallel-wfs &>/dev/null &
-PAR_MOCK_PID=$!; sleep 0.6
+PAR_MOCK_PID=$!; wait_port $PAR_MOCK_PORT $PAR_MOCK_PID || echo "  [WARN] mock 未就绪($PAR_MOCK_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name parwfs --model-name claude-par \
   --end-point "http://127.0.0.1:$PAR_MOCK_PORT" --api-key sk-par >/dev/null 2>&1
 ID_PAR=$(run "$LAEW" provider list 2>/dev/null | grep parwfs | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -338,7 +464,7 @@ section "4f. 上下文溢出自动恢复端到端(--overflow-once 模式)"
 OVF_MOCK_LOG="testReport/mock_requests-ovf-$RUN_ID.jsonl"
 OVF_MOCK_PORT=18904
 python3 scripts/mock_llm_server.py $OVF_MOCK_PORT "$OVF_MOCK_LOG" --overflow-once &>/dev/null &
-OVF_MOCK_PID=$!; sleep 0.6
+OVF_MOCK_PID=$!; wait_port $OVF_MOCK_PORT $OVF_MOCK_PID || echo "  [WARN] mock 未就绪($OVF_MOCK_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name ovf --model-name claude-ovf \
   --end-point "http://127.0.0.1:$OVF_MOCK_PORT" --api-key sk-ovf >/dev/null 2>&1
 ID_OVF=$(run "$LAEW" provider list 2>/dev/null | grep ovf | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -372,7 +498,7 @@ rm -f "$SBX_CANARY"
 SBX_OUT_LOG="testReport/mock_requests-sbx-out-$RUN_ID.jsonl"
 SBX_OUT_PORT=18905
 python3 scripts/mock_llm_server.py $SBX_OUT_PORT "$SBX_OUT_LOG" --write-outside &>/dev/null &
-SBX_OUT_PID=$!; sleep 0.6
+SBX_OUT_PID=$!; wait_port $SBX_OUT_PORT $SBX_OUT_PID || echo "  [WARN] mock 未就绪($SBX_OUT_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name sbx-out --model-name claude-sbx-out \
   --end-point "http://127.0.0.1:$SBX_OUT_PORT" --api-key sk-sbx-out >/dev/null 2>&1
 ID_SBXO=$(run "$LAEW" provider list 2>/dev/null | grep sbx-out | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -390,7 +516,7 @@ rm -f "$SBX_OUT_LOG"; rm -rf "$SBX_OUT_DIR"
 SBX_IN_LOG="testReport/mock_requests-sbx-in-$RUN_ID.jsonl"
 SBX_IN_PORT=18906
 python3 scripts/mock_llm_server.py $SBX_IN_PORT "$SBX_IN_LOG" --write-inside &>/dev/null &
-SBX_IN_PID=$!; sleep 0.6
+SBX_IN_PID=$!; wait_port $SBX_IN_PORT $SBX_IN_PID || echo "  [WARN] mock 未就绪($SBX_IN_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name sbx-in --model-name claude-sbx-in \
   --end-point "http://127.0.0.1:$SBX_IN_PORT" --api-key sk-sbx-in >/dev/null 2>&1
 ID_SBXI=$(run "$LAEW" provider list 2>/dev/null | grep sbx-in | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -547,7 +673,7 @@ section "4h. Anthropic Prompt Caching 自动注入(L1047)"
 CACHE_MOCK_LOG="testReport/mock_requests-cache-$RUN_ID.jsonl"
 CACHE_MOCK_PORT=18902
 python3 scripts/mock_llm_server.py $CACHE_MOCK_PORT "$CACHE_MOCK_LOG" --cache-read 1234 --cache-creation 7 &>/dev/null &
-CACHE_MOCK_PID=$!; sleep 0.6
+CACHE_MOCK_PID=$!; wait_port $CACHE_MOCK_PORT $CACHE_MOCK_PID || echo "  [WARN] mock 未就绪($CACHE_MOCK_PORT)" | tee -a "$REPORT"
 # 本节专用 provider,端点指向 CACHE_MOCK_PORT
 run "$LAEW" provider add --protocol anthropic --provider-name cache-test --model-name claude-cache-test   --end-point "http://127.0.0.1:$CACHE_MOCK_PORT" --api-key sk-cache-test >/dev/null 2>&1
 ID_CA=$(run "$LAEW" provider list 2>/dev/null | grep cache-test | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -582,7 +708,7 @@ section "4i. Prompt 注入防护端到端(L1208)"
 INJECT_MOCK_LOG="testReport/mock_requests-inject-$RUN_ID.jsonl"
 INJECT_MOCK_PORT=18903
 python3 scripts/mock_llm_server.py "$INJECT_MOCK_PORT" "$INJECT_MOCK_LOG" --inject-bash &>/dev/null &
-INJECT_MOCK_PID=$!; sleep 0.6
+INJECT_MOCK_PID=$!; wait_port "$INJECT_MOCK_PORT" $INJECT_MOCK_PID || echo "  [WARN] mock 未就绪("$INJECT_MOCK_PORT")" | tee -a "$REPORT"
 # 本节专用 provider
 run "$LAEW" provider add --protocol anthropic --provider-name inject-test --model-name claude-inject-test \
   --end-point "http://127.0.0.1:$INJECT_MOCK_PORT" --api-key sk-inject-test >/dev/null 2>&1
@@ -613,7 +739,7 @@ section "4j. 结构化输出强制通道(L6/L19 forced tool_choice)"
 FT_MOCK_LOG="testReport/mock_requests-forced-$RUN_ID.jsonl"
 FT_MOCK_PORT=18904
 python3 scripts/mock_llm_server.py $FT_MOCK_PORT "$FT_MOCK_LOG" --forced-tool &>/dev/null &
-FT_MOCK_PID=$!; sleep 0.6
+FT_MOCK_PID=$!; wait_port $FT_MOCK_PORT $FT_MOCK_PID || echo "  [WARN] mock 未就绪($FT_MOCK_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name forced-test --model-name claude-forced-test \
   --end-point "http://127.0.0.1:$FT_MOCK_PORT" --api-key sk-forced-test >/dev/null 2>&1
 ID_FT=$(run "$LAEW" provider list 2>/dev/null | grep forced-test | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -676,7 +802,7 @@ rm -f "$FT_MOCK_LOG"
 FT2_MOCK_LOG="testReport/mock_requests-forced-reject-$RUN_ID.jsonl"
 FT2_MOCK_PORT=18905
 python3 scripts/mock_llm_server.py $FT2_MOCK_PORT "$FT2_MOCK_LOG" --forced-tool --reject-tool-choice &>/dev/null &
-FT2_MOCK_PID=$!; sleep 0.6
+FT2_MOCK_PID=$!; wait_port $FT2_MOCK_PORT $FT2_MOCK_PID || echo "  [WARN] mock 未就绪($FT2_MOCK_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name forced-reject --model-name claude-forced-reject \
   --end-point "http://127.0.0.1:$FT2_MOCK_PORT" --api-key sk-forced-reject >/dev/null 2>&1
 ID_FR=$(run "$LAEW" provider list 2>/dev/null | grep forced-reject | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -871,7 +997,7 @@ python3 scripts/mock_llm_server.py $SELF_MOCK_PORT "$SELF_MOCK_LOG" --prompt-rou
 SELF_MOCK_PID=$!
 python3 scripts/mock_llm_server.py $SELF_MOCK_OFF_PORT "$SELF_MOCK_OFF_LOG" --prompt-router-file "$SELF_ROUTER" &>/dev/null &
 SELF_MOCK_OFF_PID=$!
-sleep 0.8
+wait_port $SELF_MOCK_PORT $SELF_MOCK_PID wait_port $SELF_MOCK_OFF_PORT $SELF_MOCK_OFF_PID || echo "  [WARN] mock 未就绪" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name selfspawn-on --model-name m-self-on \
   --end-point "http://127.0.0.1:$SELF_MOCK_PORT" --api-key sk-self-on >/dev/null 2>&1
 run "$LAEW" provider add --protocol anthropic --provider-name selfspawn-off --model-name m-self-off \
@@ -1055,7 +1181,7 @@ CUSTOM_MOCK_LOG="testReport/mock_requests-customagent-$RUN_ID.jsonl"
 CUSTOM_MOCK_PORT=18903
 python3 scripts/mock_llm_server.py $CUSTOM_MOCK_PORT "$CUSTOM_MOCK_LOG" --prompt-router-file "$CUSTOM_ROUTER" &>/dev/null &
 CUSTOM_MOCK_PID=$!
-sleep 0.8
+wait_port $CUSTOM_MOCK_PORT $CUSTOM_MOCK_PID || echo "  [WARN] mock 未就绪" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name customagent --model-name m-custom \
   --end-point "http://127.0.0.1:$CUSTOM_MOCK_PORT" --api-key sk-custom >/dev/null 2>&1
 ID_CUSTOM=$(run "$LAEW" provider list 2>/dev/null | grep customagent | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -1242,7 +1368,7 @@ python3 scripts/mock_llm_server.py $REACT_MOCK_PORT "$REACT_MOCK_LOG" --prompt-r
 REACT_MOCK_PID=$!
 python3 scripts/mock_llm_server.py $REACT_OFF_PORT "$REACT_OFF_LOG" --prompt-router-file "$REACT_ROUTER" &>/dev/null &
 REACT_OFF_PID=$!
-sleep 0.8
+wait_port $REACT_MOCK_PORT $REACT_MOCK_PID wait_port $REACT_OFF_PORT $REACT_OFF_PID || echo "  [WARN] mock 未就绪" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name react-on --model-name m-react-on \
   --end-point "http://127.0.0.1:$REACT_MOCK_PORT" --api-key sk-react-on >/dev/null 2>&1
 run "$LAEW" provider add --protocol anthropic --provider-name react-off --model-name m-react-off \
@@ -1406,7 +1532,7 @@ MAIN_WORK_MOCK_LOG="testReport/mock_requests-mainwork-$RUN_ID.jsonl"
 MAIN_WORK_MOCK_PORT=18909
 python3 scripts/mock_llm_server.py $MAIN_WORK_MOCK_PORT "$MAIN_WORK_MOCK_LOG" --prompt-router-file "$MAIN_WORK_ROUTER" &>/dev/null &
 MAIN_WORK_MOCK_PID=$!
-sleep 0.8
+wait_port $MAIN_WORK_MOCK_PORT $MAIN_WORK_MOCK_PID || echo "  [WARN] mock 未就绪" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name mainwork-on --model-name m-mainwork \
   --end-point "http://127.0.0.1:$MAIN_WORK_MOCK_PORT" --api-key sk-mainwork >/dev/null 2>&1
 ID_MAIN_WORK=$(run "$LAEW" provider list 2>/dev/null | grep mainwork-on | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -1521,7 +1647,7 @@ cat > "$WEBUSE_ROUTER" <<'JSONEOF'
 }
 JSONEOF
 python3 scripts/mock_llm_server.py $WEBUSE_MOCK_PORT "$WEBUSE_MOCK_LOG" --prompt-router-file "$WEBUSE_ROUTER" &>/dev/null &
-WEBUSE_MOCK_PID=$!; sleep 0.6
+WEBUSE_MOCK_PID=$!; wait_port $WEBUSE_MOCK_PORT $WEBUSE_MOCK_PID || echo "  [WARN] mock 未就绪($WEBUSE_MOCK_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name mockW --model-name mock-webuse \
     --end-point "http://127.0.0.1:$WEBUSE_MOCK_PORT" --api-key sk-webuse-e2e
 LIST_WEBUSE=$(run "$LAEW" provider list 2>&1)
@@ -1721,7 +1847,7 @@ section "7b. 自定义斜杠命令与会话导出"
 # dispatch 依赖 mock 编排 —— 此前静默降级为 [agent error],断言只覆盖本地
 # 输出仍在通过,真实编排链路从未被测到。本节独立拉起 mock 复用 18899 端口。
 python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7b-$RUN_ID.jsonl" &>/dev/null &
-MOCK7B_PID=$!; sleep 0.6
+MOCK7B_PID=$!; wait_port $MOCK_PORT $MOCK7B_PID || echo "  [WARN] mock 未就绪($MOCK_PORT)" | tee -a "$REPORT"
 # 2026-09-17 第 71 轮:§5e delete 掉 active 记录后主库处于无 provider 状态,
 # TUI dispatch 守门会拦截 /e2e-hello(不再走 NoopLlm 空转)。本节 dispatch 前
 # 显式切回 mockA(端点=本节 mock 端口),恢复真实编排链路覆盖。
@@ -1771,7 +1897,7 @@ mkdir -p /tmp/laew-e2e-rw-root /tmp/laew-e2e-rw-work
 cp laew /tmp/laew-e2e-rw-root/laew
 # §7b 的 mock 已 kill,18899 端口空闲;本节独立拉起专用 mock
 python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7c-$RUN_ID.jsonl" &>/dev/null &
-MOCK7C_PID=$!; sleep 0.6
+MOCK7C_PID=$!; wait_port $MOCK_PORT $MOCK7C_PID || echo "  [WARN] mock 未就绪($MOCK_PORT)" | tee -a "$REPORT"
 run /tmp/laew-e2e-rw-root/laew provider add --protocol anthropic --provider-name rw --model-name claude-rw --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-rw >/dev/null 2>&1
 OUT=$(cd /tmp/laew-e2e-rw-work && printf '第一轮问题\n第二轮问题\n/rewind\n/rewind 99\n/rewind 2\n/branches\n/switch rewind-1\n/undo\n/fork\n/clear\n/rewind\n/exit\n' | run timeout 90 /tmp/laew-e2e-rw-root/laew)
 echo "$OUT" | grep -q "可回退的对话轮次(共 2 轮"; check $? "/rewind 列出 2 轮"
@@ -1811,7 +1937,7 @@ cat > "$MD_ROUTER" <<'JSONEOF'
 ]}
 JSONEOF
 python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7d-$RUN_ID.jsonl" --prompt-router-file "$MD_ROUTER" &>/dev/null &
-MOCK7D_PID=$!; sleep 0.6
+MOCK7D_PID=$!; wait_port $MOCK_PORT $MOCK7D_PID || echo "  [WARN] mock 未就绪($MOCK_PORT)" | tee -a "$REPORT"
 # 2026-09-16 第 61 轮 5e 补加的 provider use 可能改写当前记录 → 7d 跑到这里时
 # provider 已切到 mockW,任务链路会走 mockW(mockA 上的 router 已无意义)。
 # 切回 mockA 保持 7d 既有行为(MockA 是默认 mock,Yolo/SubAgent 都可达)。
@@ -1852,7 +1978,7 @@ rm -rf /tmp/laew-e2e-cost-root /tmp/laew-e2e-cost-work
 mkdir -p /tmp/laew-e2e-cost-root /tmp/laew-e2e-cost-work
 cp laew /tmp/laew-e2e-cost-root/laew
 python3 scripts/mock_llm_server.py $MOCK_PORT "$ROOT_DIR/testReport/mock_requests-7e-$RUN_ID.jsonl" &>/dev/null &
-MOCK7E_PID=$!; sleep 0.6
+MOCK7E_PID=$!; wait_port $MOCK_PORT $MOCK7E_PID || echo "  [WARN] mock 未就绪($MOCK_PORT)" | tee -a "$REPORT"
 COSTBIN=/tmp/laew-e2e-cost-root/laew
 run "$COSTBIN" provider add --protocol anthropic --provider-name costA --model-name gpt-4o-mini --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-cost-a >/dev/null 2>&1
 run "$COSTBIN" provider add --protocol anthropic --provider-name costB --model-name claude-mock --end-point http://127.0.0.1:$MOCK_PORT --api-key sk-cost-b >/dev/null 2>&1
@@ -1883,7 +2009,7 @@ rm -rf /tmp/laew-e2e-hist-root /tmp/laew-e2e-hist-work
 mkdir -p /tmp/laew-e2e-hist-root /tmp/laew-e2e-hist-work
 cp laew /tmp/laew-e2e-hist-root/laew
 python3 scripts/mock_llm_server.py 18913 "$ROOT_DIR/testReport/mock_requests-7f-$TS.jsonl" &>/dev/null &
-HIST_MOCK_PID=$!; sleep 0.6
+HIST_MOCK_PID=$!; wait_port 18913 $HIST_MOCK_PID || echo "  [WARN] mock 未就绪(18913)" | tee -a "$REPORT"
 HISTBIN=/tmp/laew-e2e-hist-root/laew
 run "$HISTBIN" provider add --protocol anthropic --provider-name histA --model-name claude-mock --end-point http://127.0.0.1:18913 --api-key sk-hist >/dev/null 2>&1
 # 1) 进程 1:两轮任务 → 每轮收口自动整快照落盘
@@ -1935,8 +2061,14 @@ else
     # 隔离库中的 127.0.0.1 provider 会在 TUI bootstrap 时被 SSRF 守卫拦截致秒退,
     # 全部 tmux 用例空捕获(实测 32 FAIL)。
     tmux new-session -d -s "$TSESS" -x 100 -y 30 "env LAEW_ALLOW_PRIVATE_ENDPOINT=1 $LAEW" 2>>"$TMUX_LOG"
-    # 等待 bootstrap(banner 是首屏内容,出现即说明已就绪)
-    sleep 0.5
+    # 等待 bootstrap(banner 是首屏内容,出现即说明已就绪)。轮询而非固定 sleep:
+    # 机器繁忙时 0.5s 不够会漏掉横幅断言,空闲时又白等 —— 轮询两头都快。
+    local i
+    for ((i = 0; i < 100; i++)); do
+      tscreen | grep -q "程序目录" && return 0
+      sleep 0.05
+    done
+    return 0
   }
   tsend() { tmux send-keys -t "$TSESS" -l "$1" 2>>"$TMUX_LOG"; }
   tkey()  { tmux send-keys -t "$TSESS" "$1" 2>>"$TMUX_LOG"; }
@@ -2310,7 +2442,7 @@ section "10. 取消传播(SIGINT 优雅中断)"
 CANCEL_MOCK_LOG="testReport/mock_requests-cancel-$RUN_ID.jsonl"
 CANCEL_MOCK_PORT=18904
 python3 scripts/mock_llm_server.py $CANCEL_MOCK_PORT "$CANCEL_MOCK_LOG" --delay-ms 4000 &>/dev/null &
-CANCEL_MOCK_PID=$!; sleep 0.6
+CANCEL_MOCK_PID=$!; wait_port $CANCEL_MOCK_PORT $CANCEL_MOCK_PID || echo "  [WARN] mock 未就绪($CANCEL_MOCK_PORT)" | tee -a "$REPORT"
 run "$LAEW" provider add --protocol anthropic --provider-name canceltest --model-name claude-cancel \
   --end-point "http://127.0.0.1:$CANCEL_MOCK_PORT" --api-key sk-cancel >/dev/null 2>&1
 ID_CAN=$(run "$LAEW" provider list 2>/dev/null | grep canceltest | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)
@@ -2376,10 +2508,50 @@ else
   check 0 "stdio 缺 command 应拒绝"
 fi
 
+close_last_section
 echo "" | tee -a "$REPORT"
 # 汇总行:用变量拼接避开 grep "FAIL" 字面量误判(关联报告: 20260908_203854 D-004)
 SUM_PASS="P""ASS=$PASS"
 SUM_FAIL="F""AIL=$FAIL"
-echo "==== 汇总: $SUM_PASS $SUM_FAIL ====" | tee -a "$REPORT"
+TOTAL_ELAPSED=$(( SECONDS - E2E_T0 ))
+echo "==== 汇总: $SUM_PASS $SUM_FAIL  总耗时 ${TOTAL_ELAPSED}s ====" | tee -a "$REPORT"
+
+# ---- 耗时统计:最慢 Top10(选节依据:慢的通常是 tmux 与多 mock 的链路小节) ----
+print_timing() {
+  local n=$SEC_IDX i j top
+  echo "---- 小节耗时(共 $n 节) ----" | tee -a "$REPORT"
+  if [ "${1:-top}" = "all" ]; then
+    for ((i = 0; i < n; i++)); do
+      printf '  %4ss  %s\n' "${SEC_ELAPSED[$i]:-0}" "${SEC_NAMES[$i]:-?}" | tee -a "$REPORT"
+    done
+  else
+    # 插入排序取最慢 10(节数 ~44,无需更优算法)
+    for ((i = 0; i < n; i++)); do
+      top=-1
+      for ((j = 0; j < n; j++)); do
+        case "${SEC_DONE[$j]:-0}" in 1) continue ;; esac
+        if [ "$top" -lt 0 ] || [ "${SEC_ELAPSED[$j]:-0}" -gt "${SEC_ELAPSED[$top]:-0}" ]; then top=$j; fi
+      done
+      [ "$top" -lt 0 ] && break
+      SEC_DONE[$top]=1
+      printf '  %4ss  %s\n' "${SEC_ELAPSED[$top]:-0}" "${SEC_NAMES[$top]:-?}" | tee -a "$REPORT"
+      [ $i -ge 9 ] && break
+    done
+  fi
+}
+SEC_DONE=()
+print_timing "${LAEW_E2E_TIMING:-top}"
+
+# ---- 产物清理:全通过删本轮抓包,有失败保留并打出路径 ----
+MOCK_ARTIFACTS=$(ls testReport/mock_requests-*-"$RUN_ID".jsonl testReport/mock_requests-*-"$TS".jsonl 2>/dev/null)
+if [ "$FAIL" -eq 0 ] && [ "${LAEW_E2E_KEEP_ARTIFACTS:-0}" != "1" ]; then
+  # shellcheck disable=SC2086
+  [ -n "$MOCK_ARTIFACTS" ] && rm -f $MOCK_ARTIFACTS
+  echo "抓包 jsonl 已清理(--keep-artifacts 可保留)" | tee -a "$REPORT"
+else
+  echo "抓包 jsonl 保留(有失败或 --keep-artifacts):" | tee -a "$REPORT"
+  echo "$MOCK_ARTIFACTS" | grep . | sed 's/^/  /' | tee -a "$REPORT"
+fi
+echo "报告: $REPORT" | tee -a "$REPORT"
 rm -rf /tmp/laew-e2e-root
 [ "$FAIL" -eq 0 ]
