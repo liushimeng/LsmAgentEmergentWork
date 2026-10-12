@@ -232,11 +232,13 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         }
         "elements" => {
             // 第 103 轮:selector 可选,缺失时默认返回全页交互元素列表
-            // (input/button/select/textarea/a/[role=button]/[contenteditable=true]),
+            // (input/button/select/textarea/a/[role=button]/[role=link]/[contenteditable=true]),
             // 消除 LLM 因 Schema additionalProperties:false 无法在顶层传入 selector
             // 而反复试错浪费迭代的低频错误。
+            // 第 158 轮:追加自定义下拉控件选择器([role=combobox]/[aria-haspopup]/[class*=select]/[class*=dropdown]/[class*=cascader]),
+            // 覆盖 Ant Design / Element UI / 自研组件库的级联选择器与下拉菜单。
             let sel = str_arg(&params, "selector")
-                .unwrap_or("input,button,select,textarea,a,[role=button],[role=link],[contenteditable=true]");
+                .unwrap_or("input,button,select,textarea,a,[role=button],[role=link],[contenteditable=true],[role=combobox],[aria-haspopup=listbox],[class*=select],[class*=Select],[class*=dropdown],[class*=Dropdown],[class*=cascader],[class*=Cascader]");
             let nth = params.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
             let include_text = params.get("include_text").and_then(Value::as_bool).unwrap_or(true);
             let include_outer = params.get("include_outer_html").and_then(Value::as_bool).unwrap_or(false);

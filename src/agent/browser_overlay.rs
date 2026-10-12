@@ -756,6 +756,7 @@ pub fn action_dispatches_input(action: &str) -> bool {
             | "clear_input"
             | "upload_file"
             | "select_option"
+            | "select_dropdown"
             | "download"
             | "drag"
             | "focus"
@@ -1058,7 +1059,7 @@ mod tests {
         for a in [
             "click", "human_click", "right_click", "double_click", "hover", "scroll",
             "scroll_to", "key_press", "press_sequence", "input_text", "human_input",
-            "clear_input", "upload_file", "select_option", "download", "drag", "focus",
+            "clear_input", "upload_file", "select_option", "select_dropdown", "download", "drag", "focus",
             "blur", "mouse_move", "dispatch_event",
         ] {
             assert!(action_dispatches_input(a), "{a} 应让路");

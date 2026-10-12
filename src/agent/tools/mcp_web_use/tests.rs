@@ -290,8 +290,8 @@ fn parameters_control_action_enum_complete() {
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
-    // 第 143 轮 set_guard 使枚举 40 → 41;第 152 轮 auto_follow 使 41 → 42
-    assert_eq!(names.len(), 42, "control_action 应为 42 个,实际 {names:?}");
+    // 第 143 轮 set_guard 使枚举 40 → 41;第 152 轮 auto_follow 使 41 → 42;第 158 轮 select_dropdown 使 42 → 43
+    assert_eq!(names.len(), 43, "control_action 应为 43 个,实际 {names:?}");
 }
 
 #[test]
@@ -2295,4 +2295,60 @@ async fn real_browser_input_text_ladder() {
     assert_eq!(out["cleared"], true, "{out}");
 
     mgr.shutdown().await;
+}
+
+// =================== 第 158 轮:select_dropdown 单元测试 ===================
+
+#[test]
+fn pick_element_js_exact_match() {
+    let js = super::control::pick_element_js("北京", Some("div.areaWrap"), false);
+    assert!(js.contains("\"北京\""), "JS 应包含目标文本");
+    assert!(js.contains("div.areaWrap"), "JS 应包含 scope 选择器");
+    assert!(js.contains("querySelectorAll"), "JS 应遍历子元素");
+    assert!(js.contains("scrollIntoView"), "JS 应滚动到可见");
+    assert!(js.contains("click()"), "JS 应点击");
+    assert!(js.contains("=== target"), "JS 应精确匹配");
+    assert!(js.contains("&& false"), "非模糊模式应包含 && false");
+}
+
+#[test]
+fn pick_element_js_fuzzy_match() {
+    let js = super::control::pick_element_js("北京", None, true);
+    assert!(js.contains("&& true"), "模糊模式应包含 && true");
+    assert!(js.contains("document.body"), "无 scope 时应回退到 body");
+}
+
+#[test]
+fn pick_element_js_no_scope() {
+    let js = super::control::pick_element_js("全北京", None, false);
+    assert!(js.contains("document.body"), "无 scope 时应回退到 body");
+    assert!(js.contains("=== target"), "精确匹配");
+}
+
+#[test]
+fn select_dropdown_in_schema_enum() {
+    let params = super::McpWebUseTool.parameters();
+    let enum_vals = params["properties"]["control_action"]["enum"]
+        .as_array()
+        .expect("control_action 应有 enum");
+    let has = enum_vals
+        .iter()
+        .any(|v| v.as_str() == Some("select_dropdown"));
+    assert!(has, "Schema enum 应包含 select_dropdown");
+}
+
+#[test]
+fn select_dropdown_in_input_whitelist() {
+    assert!(
+        crate::agent::browser_overlay::action_dispatches_input("select_dropdown"),
+        "select_dropdown 应在输入动作白名单中"
+    );
+}
+
+#[test]
+fn select_dropdown_in_spawn_page_whitelist() {
+    assert!(
+        super::control::action_may_spawn_page("select_dropdown", &json!({})),
+        "select_dropdown 应在派生页白名单中"
+    );
 }
