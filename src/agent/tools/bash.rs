@@ -219,6 +219,103 @@ fn is_real_bash(_path: &str) -> bool {
     true
 }
 
+/// 2026-10-12 实机事故:从已解析出的 bash 路径反推 Git for Windows 的工具目录。
+///
+/// **背景**:本机 Git 装在 `D:\Program Files\Git`,而 Windows 用户 PATH 里只有
+/// `Git\cmd`,没有 `Git\usr\bin`。`resolve_bash_binary()` 能正确解析到
+/// `…\Git\usr\bin\bash.exe`,但 Git Bash **非交互**(`bash -c`)启动时不读
+/// `/etc/profile`,不会把自身 `usr/bin` 补进 PATH —— 它只认继承来的那份。
+/// 于是 `ls` / `head` / `cat` / `wc` 等 coreutils 全部 `command not found`
+/// (退出码 127),而 Bash 工具当时**照常判成功**,Yolo 把「命令全失败 + stdout 为空」
+/// 误读成「目录是空的」,白白多烧 2 轮 LLM 才改用 Glob 纠正。
+///
+/// **修复**:由 bash 二进制所在位置反推安装根目录,产出工具目录清单,
+/// 由 [`prepend_bash_tool_dirs`] 前置进子进程 PATH(与交互式 Git Bash 行为一致)。
+///
+/// 返回 `(root/usr/bin, root/mingw64/bin, root/cmd)` 中**存在**的那些。
+/// 不做存在性探测以外的过滤 —— 调用方 [`prepend_bash_tool_dirs`] 再统一过滤一次,
+/// 保证纯函数可测(不依赖真实文件系统)。
+#[cfg(windows)]
+fn git_tool_dirs_from_bash(bash_bin: &str) -> Vec<PathBuf> {
+    let p = PathBuf::from(bash_bin);
+    let Some(bin_dir) = p.parent() else {
+        return Vec::new();
+    };
+    let root = match git_root_from_bin_dir(bin_dir) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    ["usr", "bin"]
+        .into_iter()
+        .map(|a| {
+            let mut d = root.clone();
+            d.push(a);
+            d.push("bin");
+            d
+        })
+        .chain({
+            let mut d = root.clone();
+            d.push("mingw64");
+            d.push("bin");
+            std::iter::once(d)
+        })
+        .chain({
+            let mut d = root.clone();
+            d.push("cmd");
+            std::iter::once(d)
+        })
+        .collect()
+}
+
+/// 由 bash 所在的 `bin` 目录反推 Git 安装根目录。
+///
+/// - `<root>/usr/bin/bash.exe` → `<root>`
+/// - `<root>/bin/bash.exe`（部分分发/便携版）→ `<root>`
+///
+/// 只按目录名组件判定，不做路径字符串拼接 —— 避免混用 `/` 与 `\`
+/// 拼出 `<root>/usr/usr/bin` 这类垃圾路径（首版实现的 bug，由单测锁死）。
+#[cfg(windows)]
+fn git_root_from_bin_dir(bin_dir: &std::path::Path) -> Option<PathBuf> {
+    let is_bin = bin_dir.file_name().and_then(|s| s.to_str()) == Some("bin");
+    if !is_bin {
+        return None;
+    }
+    let parent = bin_dir.parent()?;
+    match parent.file_name().and_then(|s| s.to_str()) {
+        // <root>/usr/bin → <root>
+        Some("usr") => parent.parent().map(|p| p.to_path_buf()),
+        // <root>/bin → <root>
+        _ => Some(parent.to_path_buf()),
+    }
+}
+
+/// 把 [`git_tool_dirs_from_bash`] 产出的目录中**真实存在**的前置到 `PATH`。
+///
+/// - 只加存在的目录,不存在的一律跳过(便携版/Git LFS 缺 `mingw64\bin` 是常态);
+/// - 前置而非追加:Git 自带工具优先于系统同名程序,与交互式 Git Bash 一致;
+/// - 原 PATH 条目**全部保留**(Windows 分号 / Unix 冒号),不覆盖用户环境。
+#[cfg(windows)]
+fn prepend_bash_tool_dirs(bash_bin: &str, path_env: Option<&str>) -> Option<std::ffi::OsString> {
+    let dirs: Vec<PathBuf> = git_tool_dirs_from_bash(bash_bin)
+        .into_iter()
+        .filter(|d| d.is_dir())
+        .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+    if let Some(p) = path_env {
+        for seg in p.split(';') {
+            let seg = seg.trim();
+            if !seg.is_empty() {
+                parts.push(seg.to_string());
+            }
+        }
+    }
+    std::env::join_paths(parts).ok()
+}
+
 /// 2026-09-23 Round 124:BashTool 工作模式。
 ///
 /// - `ReadWrite`(默认):维持现有行为,SubAgent / Yolo / SubAgent-Work 等
@@ -377,6 +474,15 @@ impl Tool for BashTool {
         // -c 单条命令直接执行
         cmd.arg("-c").arg(&command);
         cmd.current_dir(current_work_dir());
+        // 2026-10-12:Windows 下修正子进程 PATH —— Git Bash 非交互启动不读
+        // /etc/profile,只认继承值;而很多机器的 Windows PATH 只有 `Git\cmd`
+        // 没有 `Git\usr\bin`,导致 ls/head/cat 全部 command not found(127)。
+        // 由 bash 路径反推工具目录并前置,详见 git_tool_dirs_from_bash 文档。
+        #[cfg(windows)]
+        if let Some(p) = prepend_bash_tool_dirs(&bash_bin, std::env::var("PATH").ok().as_deref())
+        {
+            cmd.env("PATH", p);
+        }
         // 可选 UTF-8 子进程环境(见 utf8_env_enabled 文档)
         if utf8_env_enabled() {
             cmd.env("PYTHONUTF8", "1");
@@ -449,6 +555,45 @@ impl Tool for BashTool {
                     buf.push_str("<stdout>\n(无输出)\n");
                 }
                 buf.push_str(&format!("\n<exit_code>{code}</exit_code>"));
+
+                // 2026-10-12:命令压根没跑起来(126/127)必须判is_error。
+                //
+                // 背景:此前只要子进程 spawn 成功就一律 Ok,exit_code 只拼进文本
+                // 供展示,完全不影响 is_error —— 127 与 0 在下游被同等对待。
+                // 后果是下游 Agent 把「命令全部失败 + stdout 为空」误读为
+                // 「目录是空的」这一**错误事实**(实机事故:Yolo 首轮 ls 127,
+                // 误判 AI-Skill 目录为空,多烧 2 轮才改用 Glob 纠正)。
+                //
+                // 只认 126/127 而非全部非零:grep 无匹配的 1、[ -f x ] 为假的 1
+                // 是 shell 脚本的**正常语义**,全量判错会造成大量误伤与重试风暴。
+                if matches!(code, 126 | 127) {
+                    return Err(AgentError::ToolExecution {
+                        tool: self.name().into(),
+                        reason: format!(
+                            "[Bash] 命令不存在或不可执行(退出码 {code})。\
+                             这不是「没有输出」,而是**命令压根没跑起来** —— \
+                             禁止把空 stdout 当成「目录为空/查询无结果」的证据。\
+                             若 stderr 出现 `command not found`,多半是本机 shell 的 PATH \
+                             缺少 coreutils(如 Git Bash 非交互启动不读 /etc/profile)。\
+                             请改用不依赖该命令的方案(Read/Glob/Grep 工具),不要重复调用同一命令。\
+                             stderr 原文: {}",
+                            if stderr.trim().is_empty() {
+                                "(空)"
+                            } else {
+                                stderr.trim()
+                            }
+                        ),
+                    });
+                }
+
+                // 其余非零退出码维持 Ok(语义性),但补一行显式失败标注,
+                // 杜绝「空 stdout 被误读为空目录」。
+                if code != 0 {
+                    buf.push_str(&format!(
+                        "\n<status>命令以非零退出码 {code} 结束 —— 这是**失败**结果,\
+                         上面若 stdout 为空,不得据此推断「目录为空 / 查询无结果」。</status>"
+                    ));
+                }
                 // L1208:bash 输出是「外部内容」,扫描 prompt injection 后返回
                 Ok(crate::agent::safety::scan_and_wrap(
                     &buf,
@@ -534,6 +679,106 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("<exit_code>7</exit_code>"));
+        // 2026-10-12:非零退出码必须带显式失败标注,杜绝「空 stdout 被误读为空目录」
+        assert!(
+            out.contains("<status>") && out.contains("非零退出码 7"),
+            "非零退出码应附显式失败标注,实际输出: {out}"
+        );
+    }
+
+    /// 2026-10-12 实机事故回归:命令不存在(127)必须判 `is_error`,
+    /// 否则下游 Agent 会把「命令全失败 + stdout 为空」误读为「目录是空的」。
+    #[tokio::test]
+    async fn command_not_found_is_error_not_silent_success() {
+        let err = BashTool::new()
+            .execute(json!({"command": "definitely_not_a_real_cmd_xyz_987"}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("命令不存在或不可执行"),
+            "127 应判为工具错误并给出可行动指引,实际: {msg}"
+        );
+        assert!(
+            msg.contains("禁止把空 stdout") && msg.contains("目录为空"),
+            "错误文案须明确禁止把空 stdout 当成空目录的证据,实际: {msg}"
+        );
+    }
+
+    /// 2026-10-12:语义性非零退出码(`grep` 无匹配的 1)不得判错 ——
+    /// 全量判错会造成大量误伤与重试风暴。
+    #[tokio::test]
+    async fn semantic_nonzero_exit_is_not_error() {
+        let out = BashTool::new()
+            .execute(json!({"command": "grep -q __no_such_token__ /dev/null"}))
+            .await
+            .expect("grep 无匹配的退出码 1 属正常语义,不应判工具错误");
+        assert!(out.contains("<exit_code>1</exit_code>"));
+    }
+
+    /// 2026-10-12 根因回归:受限 PATH(只有 `Git\cmd`、没有 `Git\usr\bin`)下,
+    /// `ls` 必须可用 —— 这正是实机事故里 `ls: command not found`(127) 的场景。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn coreutils_available_under_restricted_path() {
+        // 用本机真实解析出的 bash(可能装在 D 盘等任意位置),反推工具目录
+        let bash = resolve_bash_binary().expect("应能解析到 bash");
+        let tool_dirs = git_tool_dirs_from_bash(&bash);
+        let tool_paths: Vec<String> = tool_dirs.iter().map(|d| d.display().to_string()).collect();
+        assert!(
+            !tool_paths.is_empty(),
+            "应能从 {bash} 反推出 Git 工具目录"
+        );
+
+        let mut cmd = std::process::Command::new(&bash);
+        cmd.arg("-c").arg("ls --version | head -1");
+        // 只给工具目录,完全不给父进程 PATH —— 模拟事故机器的受限环境
+        cmd.env("PATH", std::env::join_paths(tool_paths.clone()).unwrap());
+        let out = cmd.output().expect("执行 bash 失败");
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            s.to_lowercase().contains("ls"),
+            "仅注入 Git 工具目录({tool_paths:?})后 ls 即可运行,实际输出: {s} / stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 2026-10-12:从 `usr\\bin\\bash.exe` 反推 Git 安装根目录。
+    #[cfg(windows)]
+    #[test]
+    fn git_tool_dirs_derived_from_bash_path() {
+        let dirs = git_tool_dirs_from_bash(r"D:\Program Files\Git\usr\bin\bash.exe");
+        let joined: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        assert!(
+            joined.iter().any(|d| d == r"D:\Program Files\Git\usr\bin"),
+            "应含 usr\\bin,实际: {joined:?}"
+        );
+        assert!(
+            joined.iter().any(|d| d == r"D:\Program Files\Git\cmd"),
+            "应含 cmd,实际: {joined:?}"
+        );
+        // `bin\\bash.exe` 形态也要能反推出根目录
+        let dirs2 = git_tool_dirs_from_bash(r"D:\Program Files\Git\bin\bash.exe");
+        assert!(
+            dirs2.iter().any(|d| d.display().to_string() == r"D:\Program Files\Git\usr\bin"),
+            "bin\\bash.exe 形态应反推出 usr\\bin,实际: {:?}",
+            dirs2.iter().map(|d| d.display().to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 2026-10-12:前置 PATH 时保留用户原有条目,不覆盖。
+    #[cfg(windows)]
+    #[test]
+    fn prepend_bash_tool_dirs_keeps_original_path() {
+        let original = r"C:\Windows\system32;D:\some\user\dir";
+        let bash = resolve_bash_binary().expect("应能解析到 bash");
+        let merged = prepend_bash_tool_dirs(&bash, Some(original))
+            .expect("应产出合并后的 PATH");
+        let s = merged.to_string_lossy().to_string();
+        assert!(
+            s.contains(r"C:\Windows\system32") && s.contains(r"D:\some\user\dir"),
+            "原 PATH 条目必须保留,实际: {s}"
+        );
     }
 
     #[tokio::test]
