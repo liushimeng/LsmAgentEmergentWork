@@ -29,6 +29,9 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         dedup_workflow_ids(&mut plan);
         // 2026-09-16 F2:归一化 depends_on(剥离 LLM 附加的变量透传注释)
         sanitize_depends_on(&mut plan);
+        // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
+        // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)
+        infer_depends_on(&mut plan);
         // 2026-09-16 第 54 轮补丁 B:基于步骤关键词自动纠正 delegate_to
         // (解决 osascript 步骤被错委派的问题)
         infer_delegate_to_for_plan(&mut plan);
@@ -42,6 +45,9 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         check_zero_unit_plan(&plan)?;
         dedup_workflow_ids(&mut plan);
         sanitize_depends_on(&mut plan);
+        // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
+        // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)
+        infer_depends_on(&mut plan);
         infer_delegate_to_for_plan(&mut plan);
         return Ok(plan);
     }
@@ -54,6 +60,9 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         if !plan.workflows.is_empty() {
             dedup_workflow_ids(&mut plan);
             sanitize_depends_on(&mut plan);
+            // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
+            // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)
+            infer_depends_on(&mut plan);
             infer_delegate_to_for_plan(&mut plan);
             return Ok(plan);
         }
@@ -387,6 +396,9 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
     // 2026-09-16 F2/F3:Plan 文档路径同样做 depends_on 归一化 + delegate_to 自动纠正
     // (修复「检视 Chrome 窗口」hard 任务拓扑失败 + 委派纠正的问题)
     sanitize_depends_on(&mut plan);
+    // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
+    // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)
+    infer_depends_on(&mut plan);
     infer_delegate_to_for_plan(&mut plan);
     Ok(plan)
 }

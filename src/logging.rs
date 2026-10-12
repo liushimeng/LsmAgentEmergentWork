@@ -158,7 +158,60 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     }
 }
 
-/// 构造日志文件 fmt 层:ANSI 关闭 + 无 target + 本地时间戳 + 按级别过滤。
+/// 第三方 CDP 驱动的逐消息噪声 target(第 163 轮,实测 `llaew_20261012_175823.log`)。
+///
+/// chromiumoxide 0.9.1 的类型化 `Message` 枚举不认识 Chrome 新增的
+/// `Network.requestWillBeSentExtraInfo` 等事件,每收一条就:
+/// - 在 `conn.rs` 以 `target="chromiumoxide::conn::raw_ws::parse_errors"` 打
+///   **DEBUG**,并把**完整原始 CDP 报文**整条挂进字段;
+/// - 在 `handler/mod.rs` 再打一条 `WARN "WS Invalid message"`。
+///
+/// 实测一次闲鱼全品类遍历任务:7161 条原始报文 = **29.4 MB**,占整份运行日志
+/// 97.3%,把真正有诊断价值的 ~1.2 MB 完全淹没,并连带拖慢 Agent 自身
+/// `grep` 日志(实测单条 Bash 因此耗时 75s)。控制台层同样被刷(7161/8896 行),
+/// TUI 之外的 `--debug/-f` 运行几乎看不到有效信息。
+const CDP_NOISE_TARGETS: &[&str] = &["chromiumoxide::conn::raw_ws::parse_errors"];
+
+/// CDP WS 解析失败告警所在模块 target。该模块只有两条宏:
+/// `WARN "WS Invalid message"`(逐消息噪声)与 `ERROR "WS Connection error"`
+/// (连接断开,**必须保留**),故按级别精确区分而非整 target 静音。
+const CDP_WS_HANDLER_TARGET: &str = "chromiumoxide::handler";
+
+/// 该事件是否属于应静音的第三方噪声(文件层按级别判定时用)。
+pub fn is_third_party_noise(meta: &tracing::Metadata<'_>) -> bool {
+    let target = meta.target();
+    if CDP_NOISE_TARGETS.iter().any(|t| target.starts_with(t)) {
+        return true;
+    }
+    target == CDP_WS_HANDLER_TARGET && *meta.level() == tracing::Level::WARN
+}
+
+/// 控制台层用:给 `EnvFilter` 追加 CDP 噪声抑制 directive。
+///
+/// - `chromiumoxide::handler=error` —— 该模块只有两条宏(`WARN "WS Invalid message"`
+///   逐消息噪声 / `ERROR "WS Connection error"` 连接断开),降到 error 即静音前者、
+///   **保留后者**;
+/// - `chromiumoxide::conn::raw_ws::parse_errors=off` —— 原始 CDP 报文 dump,
+///   实测占运行日志 97.3% / 单次 29.4MB,诊断价值已由 `inspect(info=network)`
+///   与 `page_health` 结构化字段覆盖。
+pub fn silence_cdp_noise(
+    mut f: tracing_subscriber::EnvFilter,
+) -> tracing_subscriber::EnvFilter {
+    for d in ["chromiumoxide::handler=error", "chromiumoxide::conn::raw_ws::parse_errors=off"] {
+        let dir: tracing_subscriber::filter::Directive = match d.parse() {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!("CDP 噪声抑制指令解析失败({d}): {e}");
+                continue;
+            }
+        };
+        f = f.add_directive(dir);
+    }
+    f
+}
+
+/// 构造日志文件 fmt 层:ANSI 关闭 + 无 target + 本地时间戳 + 按级别过滤
+/// + 屏蔽第三方逐消息噪声。
 ///
 /// 级别由调用方传入(`--debug` → DEBUG,`--info` → INFO),确定性输出,
 /// 不受 `RUST_LOG` 影响。泛型 `S` 使本层可叠加在任意 registry/Layered 栈上。
@@ -174,7 +227,11 @@ where
         .with_target(false)
         .with_timer(LocalTimer)
         .with_writer(maker)
-        .with_filter(level)
+        .with_filter(tracing_subscriber::filter::filter_fn(
+            move |meta: &tracing::Metadata<'_>| {
+                level >= *meta.level() && !is_third_party_noise(meta)
+            },
+        ))
 }
 
 #[cfg(test)]

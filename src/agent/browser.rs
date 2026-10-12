@@ -166,9 +166,17 @@ fn new_page_id() -> String {
 /// - `data-laew-agent="1"` 标记,MCP_Web_Use 的 elements/dom 提取自动过滤该子树;
 /// - 通过 `Page.addScriptToEvaluateOnNewDocument` 挂载,导航/派生新页自动重注入。
 pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
-    if (window.__laewAgentHighlightInstalled) return;
+    // 第 163 轮:早退门加 DOM 校验 —— 旧写法只在**抛异常之前**置
+    // `__laewAgentHighlightInstalled = true`,而 document-start 时 body/documentElement
+    // 可能都 null,ensure() 抛异常后标志却是「已装」,后续任何补挂重试都被这道门挡住,
+    // 蓝框与徽标永久缺失。改成「标志已置但元素不在」时允许重新装配,让半成品实例自愈。
+    if (window.__laewAgentHighlightInstalled
+        && document.getElementById('__laew_agent_frame__')) return;
     window.__laewAgentHighlightInstalled = true;
     const ensure = () => {
+        // 与 guard 同病:document-start 时两者皆 null,`documentElement` 先存在。
+        const root = document.documentElement || document.body;
+        if (!root) return;
         let frame = document.getElementById('__laew_agent_frame__');
         if (!frame) {
             frame = document.createElement('div');
@@ -181,7 +189,7 @@ pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
             badge.style.cssText = 'position:absolute;top:8px;right:8px;padding:2px 10px;background:#1a73e8;color:#fff;font:600 12px/1.6 system-ui,sans-serif;border-radius:10px;box-shadow:0 1px 4px rgba(26,115,232,.45);';
             badge.textContent = 'LAEW Agent 控制中';
             frame.appendChild(badge);
-            (document.body || document.documentElement).appendChild(frame);
+            root.appendChild(frame);
         }
         frame.style.display = window.__laewAgentHighlight === false ? 'none' : '';
     };
@@ -192,7 +200,14 @@ pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
         if (f) f.style.display = enabled ? '' : 'none';
         return !!enabled;
     };
-    ensure();
+    // 第 163 轮:就绪重试 —— 注册在首次 ensure() **之前**,旧代码根本没有补挂,
+    // 导航后蓝框永久消失。DOMContentLoaded + load 双保险。
+    const boot = () => { try { ensure(); } catch (e) {} };
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot, { once: true });
+        window.addEventListener('load', boot, { once: true });
+    }
+    boot();
 })()"#;
 
 /// 给页面注入 Agent 高亮蓝框(新文档自动重挂 + 当前文档立即执行)。
@@ -1876,7 +1891,10 @@ fn spawn_tempdir_cleanup(dir: PathBuf) {
 
 /// 把 Browser 主进程 PID 交给进程外 watchdog。stdin pipe 保持打开；
 /// laew 消失后 pipe EOF 是 kill -9 也无法绕过的退出事实。
-fn spawn_parent_watchdog(browser_pid: u32, user_data_dir: &Path) -> Option<std::process::Child> {
+pub(crate) fn spawn_parent_watchdog(
+    browser_pid: u32,
+    user_data_dir: &Path,
+) -> Option<std::process::Child> {
     // 正式进程是 laew 本体；集成测试运行在 test harness 里，通过 env 指向 laew
     // binary，保证 BrowserManager 的真实生命周期路径也能被自动化验证。
     let exe = std::env::var_os("LAEW_BROWSER_WATCHDOG_EXE")

@@ -35,7 +35,9 @@ mod topo;
 pub use delegate::{infer_delegate_to, infer_delegate_to_for_plan};
 pub use parse::{parse_plan_markdown, parse_workflow_plan};
 pub use spec::{BranchSpec, LoopSpec, WorkFlowPlan, WorkFlowSpec};
-pub use topo::{dedup_workflow_ids, sanitize_depends_on, topo_layers, topo_sort};
+pub use topo::{
+    dedup_workflow_ids, infer_depends_on, sanitize_depends_on, topo_layers, topo_sort,
+};
 // 原私有项:供本模块 impl 与测试经 `use super::*` 取用(可见域与拆分前等价)
 use delegate::{gather_spec_text, text_contains_any_ci, DESKTOP_GUI_STRICT_KEYWORDS};
 // 测试专用经 `use super::*` 取用;非测试构建无引用,门控避免 unused 警告。

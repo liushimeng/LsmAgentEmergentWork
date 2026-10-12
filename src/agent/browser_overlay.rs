@@ -314,8 +314,19 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
                  '其余区域人工可直接操作;需要调整范围请告知 Agent'],
     };
     const el = (id) => document.getElementById(id);
-    const root = () => document.body || document.documentElement;
+    // 第 163 轮:document-start 时 `document.documentElement` 与 `document.body`
+    // **都可能是 null**(`readyState === 'loading'`)。旧写法 `document.body ||
+    // document.documentElement` 在此二者皆 null → `root().appendChild()` 抛
+    // TypeError,视觉层(蒙层/状态条/盾区)一个都没建。实测后果:此后任何一次
+    // navigate / 复用 open 的 goto 都继承空 DOM,蒙层与徽标**永久消失**,
+    // 而 `__laewGuardSet` 已定义且返回非 null,`apply_page_guard` 照样回报
+    // `visual_mask: true` —— 输入锁真锁了,屏幕上一丝视觉都没有,且系统自称成功。
+    // `documentElement` 在 document-start 即存在,放前面即可。
+    const root = () => document.documentElement || document.body;
+    // 就绪门:两者都没有时直接返回,由下面的 DOMContentLoaded / load 重试补建。
+    const ready = () => !!(document.documentElement || document.body);
     const ensure = () => {
+        if (!ready()) return;
         if (!el(MASK_ID)) {
             const m = document.createElement('div');
             m.id = MASK_ID;
@@ -500,24 +511,42 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     };
     window.addEventListener('scroll', schedule, { passive: true, capture: true });
     window.addEventListener('resize', schedule, { passive: true });
-    try {
-        // 第 157 轮:句柄挂 window —— 版本化重装时 disconnect 旧观察器。
-        window.__laewGuardMO = new MutationObserver((muts) => {
-            for (const mu of muts) {
-                const t = mu.target;
-                if (t && t.closest && t.closest('[data-laew-agent]')) continue;
-                return schedule();
-            }
-        });
-        window.__laewGuardMO.observe(document.documentElement, {
-            childList: true, subtree: true,
-            attributes: true, attributeFilter: ['class', 'style'],
-        });
-    } catch (e) {}
-    refresh();
+    // 第 163 轮:MutationObserver 装配独立成函数,由 bootRetry 与首次调用各调一次。
+    // observe 的 target 必须非 null,否则抛错被外层 catch 吞掉 → 观察器永不安装,
+    // DOM 变化后无人重建视觉元素。
+    const armObserver = () => {
+        const target = document.documentElement || document.body;
+        if (!target) return;
+        if (window.__laewGuardMO) { try { window.__laewGuardMO.disconnect(); } catch (e) {} }
+        try {
+            window.__laewGuardMO = new MutationObserver((muts) => {
+                for (const mu of muts) {
+                    const t = mu.target;
+                    if (t && t.closest && t.closest('[data-laew-agent]')) continue;
+                    return schedule();
+                }
+            });
+            window.__laewGuardMO.observe(target, {
+                childList: true, subtree: true,
+                attributes: true, attributeFilter: ['class', 'style'],
+            });
+        } catch (e) {}
+    };
+    // 第 163 轮:**重试注册必须在首次 refresh() 之前**。
+    // 旧顺序是 `refresh(); if (loading) addEventListener(DOMContentLoaded, refresh)`;
+    // 但 document-start 时 refresh() 会因 root() 为 null 抛 TypeError,
+    // 异常直接吞掉后面整段 —— DOMContentLoaded 补挂**永远不会被注册**,
+    // 视觉层就此永久缺失(实测:首开正常,首次 navigate 后蒙层与徽标全部消失)。
+    // `__laewGuardOff` 同样定义在 refresh() 之后,抛异常后未定义,
+    // 第 157 轮版本化重装一并哑火。
+    const bootRetry = () => { try { armObserver(); refresh(); } catch (e) {} };
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => refresh(), { once: true });
+        document.addEventListener('DOMContentLoaded', bootRetry, { once: true });
+        // 双保险:部分文档 DOMContentLoaded 后仍无 body(load 前),load 再兜一次。
+        window.addEventListener('load', bootRetry, { once: true });
     }
+    armObserver();
+    refresh();
     // 第 157 轮:卸载钩子 —— 高版本重装前移除旧实例的输入闸监听器、调度监听、
     // 观察器与蒙层/状态条/盾区视觉元素,防监听器与视觉泄漏。
     window.__laewGuardOff = () => {
@@ -631,6 +660,26 @@ pub async fn apply_page_guard(
         .await
         .map_err(|e| format!("应用页面管控失败:{e}"))?;
     let js_applied = !r.value().map(|v| v.is_null()).unwrap_or(true);
+    // 第 163 轮:`__laewGuardSet` 返回非 null **不代表视觉层真的建起来了** ——
+    // document-start 注入时它已定义,但建元素的代码因 root() 为 null 抛异常,
+    // 于是「函数可用」与「屏幕上看得见」被混为一谈,`visual_mask` 恒真。
+    // 这里独立校验视觉元素是否真实存在于 DOM,让回报字段不再「嘴上说成功」。
+    let visual_present = page
+        .evaluate(
+            "!!(document.getElementById('__laew_overlay__') \
+             || document.getElementById('__laew_overlay_hint__') \
+             || document.getElementById('__laew_guard_shields__'))",
+        )
+        .await
+        .ok()
+        .and_then(|v| v.value().and_then(|val| val.as_bool()))
+        .unwrap_or(false);
+    if locked && js_applied && !visual_present {
+        tracing::warn!(
+            "页面管控脚本已注入但视觉元素缺失(输入闸可能已生效而蒙层/徽标未渲染);\
+             多为 document-start 就绪时序问题,应重跑本轮根元素门与 DOMContentLoaded 补挂"
+        );
+    }
     // 闸在场性探测(第 155 轮):只有「locked + 滚动观看开启 + 脚本已注入且闸已装」
     // 才走 DOM 闸;任何一环缺失都回退 CDP 全量拦截(fail-closed)。
     let gate_ready = if locked && locked_scroll_watch_enabled() && js_applied {
@@ -1053,6 +1102,69 @@ mod tests {
         );
     }
 
+    /// 第 163 轮回归锁死:document-start 注入时的就绪门与**重试注册顺序**。
+    ///
+    /// 实测事故(`llaew_20261012_175823.log` + 真机 Chrome 复现):首开正常,
+    /// 首次 navigate 后蒙层 / 徽标 / 盾区**永久消失**,而 `apply_page_guard`
+    /// 仍回报 `visual_mask: true`。根因是 `root()` 写成 `document.body ||
+    /// document.documentElement`(document-start 时两者皆 null → appendChild 抛
+    /// TypeError),且 `refresh()` 排在 `DOMContentLoaded` 补挂注册**之前** ——
+    /// 异常把整段注册吃掉,视觉层再无重建机会。
+    #[test]
+    fn guard_js_uses_ready_root_and_registers_retry_before_first_refresh() {
+        let js = super::AGENT_GUARD_JS_TEMPLATE;
+        // ① 就绪门:documentElement 优先(document-start 即存在)
+        assert!(
+            js.contains("document.documentElement || document.body"),
+            "root 必须以 documentElement 为先,否则 document-start 时为 null"
+        );
+        assert!(
+            !js.contains("document.body || document.documentElement"),
+            "旧写法 document-start 时两者皆 null,已移除"
+        );
+        // ② 重试注册必须早于首次 refresh()
+        let retry = js
+            .find("addEventListener('DOMContentLoaded'")
+            .unwrap_or_else(|| panic!("应注册 DOMContentLoaded 补挂"));
+        let first_refresh = js
+            .find("    armObserver();\n    refresh();")
+            .or_else(|| js.find("\n    refresh();"))
+            .unwrap_or_else(|| panic!("应存在首次 refresh() 调用"));
+        assert!(
+            retry < first_refresh,
+            "重试注册({retry})必须排在首次 refresh()({first_refresh})之前,\
+             否则 refresh() 抛异常会吃掉整段注册"
+        );
+        // ③ 双保险:load 事件也要补挂一次
+        assert!(
+            js.contains("addEventListener('load', bootRetry"),
+            "应有 load 兜底补挂(部分文档 DOMContentLoaded 后仍无 body)"
+        );
+        // ④ 观察器 observe 目标必须先判空
+        assert!(
+            js.contains("if (!target) return;"),
+            "MutationObserver.observe 目标为 null 会抛错被吞,必须先判空"
+        );
+    }
+
+    #[test]
+    fn highlight_js_has_ready_retry_and_self_healing_early_return() {
+        let js = crate::agent::browser::AGENT_HIGHLIGHT_JS;
+        assert!(
+            js.contains("document.documentElement || document.body"),
+            "蓝框 root 同病:document-start 时 body/documentElement 皆可能为 null"
+        );
+        // 半成品实例可自愈:标志已置但元素不在时不得早退
+        assert!(
+            js.contains("__laewAgentHighlightInstalled\n        && document.getElementById"),
+            "早退门必须校验 DOM 元素真实存在,否则首装抛异常后永久无法补装"
+        );
+        assert!(
+            js.contains("addEventListener('DOMContentLoaded', boot"),
+            "蓝框也需 DOMContentLoaded 补挂"
+        );
+    }
+
     #[test]
     fn input_action_whitelist() {
         // 注入输入的动作必须让路(含 chromiumoxide Element click/type 路径)
@@ -1153,6 +1265,12 @@ mod tests {
             .await
             .ok()
             .and_then(|r| r.value().cloned())
+            // 第 163 轮回归锁死:真实浏览器下也必须验「**导航之后**视觉层仍在」。
+            // 旧用例只在 new_page 之后断言(load 后的安全窗口),从不 navigate ——
+            // 于是 document-start 注入时就绪门缺失这个 P0 缺陷一直绿灯:
+            // 首开正常,首次 navigate 后蒙层/徽标/蓝色边框永久消失,
+            // 而 apply_page_guard 仍回报 visual_mask:true(谎报成功)。
+            // 用 data: URL 再导航一次,document-start 时机与真实站点一致。
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         assert!(mask_probe, "蒙层/状态条/盾区容器未注入");
@@ -1285,6 +1403,34 @@ mod tests {
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
         assert_eq!(hit2, "shield", "允许区外应命中盾罩(人工点击被吞):{hit2}");
+
+        // ④ 第 163 轮回归锁死:**导航之后**视觉层必须仍在。
+        //     这是本次 P0 的判别点 —— document-start 注入时 root() 为 null 抛异常,
+        //     若 `DOMContentLoaded` 重试注册排在首次 `refresh()` 之后就会被整段吃掉,
+        //     表现为「首开正常,首次 navigate 后蒙层/徽标/蓝色边框永久消失」,
+        //     而 `apply_page_guard` 仍回报 `visual_mask: true`(谎报成功)。
+        //     放在收尾前:导航会重置页面内计数器,不能插在计数类断言中间。
+        page.goto(url).await.expect("第 163 轮回归:再导航一次应成功");
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let after_nav = page
+            .evaluate(
+                "JSON.stringify({mask: !!document.getElementById('__laew_overlay__'), \
+                 hint: !!document.getElementById('__laew_overlay_hint__'), \
+                 frame: !!document.getElementById('__laew_agent_frame__'), \
+                 shields: !!document.getElementById('__laew_guard_shields__')})",
+            )
+            .await
+            .ok()
+            .and_then(|r| r.value().cloned())
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            after_nav.contains("\"mask\":true")
+                && after_nav.contains("\"hint\":true")
+                && after_nav.contains("\"frame\":true")
+                && after_nav.contains("\"shields\":true"),
+            "第 163 轮回归:导航后蒙层/状态条/蓝色边框/盾区丢失(实际 {after_nav})"
+        );
 
         // 收尾:回收浏览器(全局单例,必须清干净防污染其它测试)
         mgr.shutdown().await;

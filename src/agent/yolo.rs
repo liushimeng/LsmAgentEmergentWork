@@ -150,6 +150,22 @@ impl TaskClassification {
             .map(|s| s.trim().eq_ignore_ascii_case("unresolved"))
             .unwrap_or(false)
     }
+
+    /// 有效直答文本;占位符/空串一律视为「没有直答」(第 163 轮)。
+    ///
+    /// 模型常照抄 schema 示例把 `direct_answer` 写成**字符串** `"null"` /
+    /// `"None"` / `"nil"`(而非 JSON `null`)。serde 会把它老实反序列化成
+    /// `Some("null")`,若直接 `.is_some()` 判定直答,用户就会收到字面量
+    /// `null` 当答案。此处与编排器 `is_placeholder_direct_answer` 保持同一口径。
+    pub fn effective_direct_answer(&self) -> Option<&str> {
+        self.direct_answer.as_deref().filter(|s| {
+            let t = s.trim();
+            !t.is_empty()
+                && !t.eq_ignore_ascii_case("null")
+                && !t.eq_ignore_ascii_case("none")
+                && !t.eq_ignore_ascii_case("nil")
+        })
+    }
 }
 
 
@@ -310,19 +326,27 @@ pub async fn run_yolo(yolo_agent: &Agent, context: &[ChatMessage]) -> Result<Yol
             degraded_classification(context)
         }
     };
-    if classification.task_level == TaskLevel::Simple && classification.direct_answer.is_some() {
-        Ok(YoloOutcome::DirectAnswer {
-            text: classification.direct_answer.clone().unwrap_or(text),
-            classification,
-            usage,
-        })
-    } else {
-        Ok(YoloOutcome::Delegate {
-            classification,
-            yolo_text: text,
-            usage,
-        })
+    if classification.task_level == TaskLevel::Simple {
+        // 第 163 轮:直答判定必须过「占位符闸」。
+        // 提示词(`yolo_prompt.rs`)早已写明「direct_answer 必须为 JSON null,
+        // 不是字符串 "null"/"None"」,且编排器的 user_suggestion 路径也早就用
+        // `is_placeholder_direct_answer` 过滤过 —— 但**本条直答路由**一直只判
+        // `.is_some()`。实测 `llaew_20261012_175823.log`:模型确实照着 schema 示例
+        // 写了字符串 `"direct_answer":"null"`,判定日志记成 `direct_answer=true`;
+        // 一旦同一响应被归为 simple,用户就会直接收到字面量 `null` 当答案。
+        if let Some(answer) = classification.effective_direct_answer() {
+            return Ok(YoloOutcome::DirectAnswer {
+                text: answer.to_string(),
+                classification,
+                usage,
+            });
+        }
     }
+    Ok(YoloOutcome::Delegate {
+        classification,
+        yolo_text: text,
+        usage,
+    })
 }
 
 /// 降级时从上下文提取最近一条 user 消息文本,作为 goal_summary 兜底。

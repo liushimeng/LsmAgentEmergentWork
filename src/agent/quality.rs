@@ -61,6 +61,45 @@ impl QualityReport {
             evidence: String::new(),
         }
     }
+
+    /// 第 163 轮:机械消解「`verdict=pass` 却列了 issues」的自相矛盾。
+    ///
+    /// 输出 schema(`QC_JSON_SHAPE_HINT`)明确写着 `issues: ["仅失败时列出问题"]`,
+    /// 因此「通过 + 非空 issues」不是一种合法状态,而是模型自相矛盾的输出。
+    /// 本方法只做**一致性消解**(让结论与它自己列出的问题对齐),不引入任何
+    /// 新的价值判断:`retryable` 仍完全采信模型 —— 模型认为不可重试就不可重试。
+    ///
+    /// 背景(实测 `llaew_20261012_175823.log`,闲鱼遍历任务):Plan 的 QC 报告
+    /// verdict=pass / retryable=false,issues 却有 623 字,原文点名:
+    /// 「wf-2~wf-5 存在明确的数据流依赖……但 depends_on 全部为空,未声明链式依赖
+    /// ……并行调度时可能乱序执行」。这个**已被点名的硬缺陷**原样进入执行层,
+    /// Kahn 把 5 个单元判成同层并发,消费方轮询等不到上游文件(实测约 195s 纯空等),
+    /// 连带把产出最终交付物的 wf-5 挤到队尾饿死。
+    fn reconcile_verdict(mut self) -> Self {
+        if self.verdict == Verdict::Pass && !self.issues.is_empty() {
+            tracing::warn!(
+                source = ?self.source,
+                issues = self.issues.len(),
+                "Quality 报告自相矛盾(verdict=pass 但列出了 issues,违反输出 schema \
+                 的「issues 仅失败时列出」),机械消解为 Fail;retryable 仍采信模型判定"
+            );
+            self.verdict = Verdict::Fail;
+            // 消解必须留痕:实测事故的教训正是「QC 判 pass 却列了硬缺陷」被无声吞掉,
+            // 缺陷原样进了执行层并在 AuditTrail 留下不可回溯的记录。
+            let note = format!(
+                "[第 163 轮一致性消解] 模型 verdict=pass 但列出 {} 条 issues,\
+                 违反输出 schema(issues 仅失败时列出),已按 issues 消解为 Fail。issues: {}",
+                self.issues.len(),
+                self.issues.join(" | ")
+            );
+            self.evidence = if self.evidence.trim().is_empty() {
+                note
+            } else {
+                format!("{}\n{note}", self.evidence.trim())
+            };
+        }
+        self
+    }
 }
 
 /// QC 输入裁剪(第 140 轮提速优化):保头 [`QC_CLIP_HEAD`] + 尾 [`QC_CLIP_TAIL`] 字符,
@@ -416,13 +455,23 @@ fn gate_report_on_trace(
 /// `{"$text":...}` 缺 verdict)时不再立即 Err —— 记录诊断后继续尝试独立 JSON
 /// 与文本关键词降级,全部失败才返回合并诊断。实测场景:QC 正文 suggestion 里
 /// 明确含「失败」信号,却因顶层 JSON 畸形被浪费,触发无谓回流。
+/// 解析 QC 报告(对外唯一入口)。第 163 轮的**一致性消解**只作用于模型
+/// 真正输出 JSON 的两条路径(`verdict=pass` 且 issues 非空时消解为 Fail)。
+///
+/// 文本关键词降级路径**不参与**消解:那条路径的 `issues` 装的是「JSON 解析失败」
+/// 这类**降级说明**(见 `parse_quality_report_text_fallback`),不是模型列出的缺陷,
+/// 拿它去否定降级出来的 Pass 会把整条降级链废掉。
 pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityReport> {
+    parse_quality_report_raw(text, source)
+}
+
+fn parse_quality_report_raw(text: &str, source: AgentRole) -> Result<QualityReport> {
     let mut last_diag: Option<String> = None;
     if let Some(json_str) = extract_json_block(text) {
         // 第 99 轮:先做 verdict/source/retryable 缺失的语义修复,再走语法修复链
         let prepared = repair_quality_json(json_str, source).unwrap_or_else(|| json_str.to_string());
         match crate::agent::json_repair::try_parse::<QualityReport>(&prepared) {
-            Ok(r) => return Ok(r),
+            Ok(r) => return Ok(r.reconcile_verdict()),
             Err(diag) => {
                 tracing::warn!(diag = %diag, "Quality ```json 块解析失败,继续降级链");
                 last_diag = Some(diag);
@@ -436,7 +485,7 @@ pub fn parse_quality_report(text: &str, source: AgentRole) -> Result<QualityRepo
                 if r.source != source {
                     r.source = source;
                 }
-                return Ok(r);
+                return Ok(r.reconcile_verdict());
             }
             Err(diag) => {
                 tracing::warn!(diag = %diag, "Quality 独立 JSON 解析失败,继续降级链");
@@ -849,6 +898,44 @@ mod tests {
         let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
         assert_eq!(r.verdict, Verdict::Fail);
         assert!(r.retryable);
+    }
+
+    // ========== 第 163 轮:verdict/issues 一致性消解 ==========
+
+    #[test]
+    fn qc_pass_with_issues_is_reconciled_to_fail() {
+        // 实测事故形态:Plan 的 QC verdict=pass / retryable=false,issues 却点名
+        // 「depends_on 全部为空,未声明链式依赖」—— 已被点名的硬缺陷原样进了执行层。
+        let text = r#"```json
+{"verdict":"pass","source":"plan","issues":["wf-2~wf-5 存在数据流依赖,但 depends_on 全部为空,未声明链式依赖,并行调度时可能乱序执行"],"suggestion":"","retryable":false,"evidence":"5 个 WorkFlow 已落盘"}
+```"#;
+        let r = parse_quality_report(text, AgentRole::Plan).unwrap();
+        assert_eq!(r.verdict, Verdict::Fail, "pass + 非空 issues 必须消解为 Fail");
+        // retryable 仍采信模型判定(不引入新的价值判断)
+        assert!(!r.retryable);
+        assert_eq!(r.issues.len(), 1);
+        assert!(r.evidence.contains("一致性消解"), "消解必须留痕: {}", r.evidence);
+        // 模型原有证据不被覆盖
+        assert!(r.evidence.contains("5 个 WorkFlow 已落盘"));
+    }
+
+    #[test]
+    fn qc_pass_without_issues_is_untouched() {
+        let text = r#"{"verdict":"pass","source":"subagent","issues":[],"suggestion":"","retryable":false,"evidence":"产物齐全"}"#;
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert!(!r.evidence.contains("一致性消解"), "正常 Pass 不该被加证据串");
+        assert_eq!(r.evidence, "产物齐全", "模型证据原样保留");
+    }
+
+    #[test]
+    fn qc_text_fallback_pass_is_not_reconciled() {
+        // 降级路径的 issues 装的是「JSON 解析失败」这类降级说明,不是缺陷,
+        // 不能拿它否定降级出来的 Pass。
+        let text = "经过核查,本单元所有子任务均完成,验收材料齐全,结论:通过";
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert!(r.issues[0].contains("JSON 解析失败"));
     }
 
     #[test]

@@ -120,6 +120,37 @@ fn ascii_keyword_boundary_find(lower: &str, kw_lower: &str) -> Option<usize> {
     None
 }
 
+/// 商品文案噪声词(kind → 命中窗口内出现这些词即判定为「在描述商品/功能,不是
+/// 在请求人工核验」,丢弃该命中)。
+///
+/// 第 163 轮(实测 `llaew_20261012_175823.log`,闲鱼商品列表页):`real_name`
+/// 关键词表含「人脸识别」,而二手交易页面的**商品描述**天然高频出现该词
+/// (实测命中片段「过原屏,人脸识别灵敏,价不高,需要的私刚刚」),导致:
+/// - `inspect(info=blockers)` 把商品文案当成实名认证墙;
+/// - 推送式探针连发 `blocker_alert`,实测 15 处命中里 11 处是 `real_name`,
+///   `repeat_count` 一路涨到 5;
+/// - Agent 被反复引去 `request_human` 探不存在的弹窗,白白消耗迭代。
+///
+/// 这里只针对「功能描述型」词汇设噪声词(灵敏 / 解锁 / 面容 / 指纹 / 拍照 …),
+/// 真实实名认证墙的文案(「请完成实名认证」「需实名认证后继续」)不含这些词,
+/// 不受影响。真正的硬闸 6002 只认弹层结构证据,本来就不依赖本通道。
+const BLOCKER_NOISE_CONTEXT: &[(&str, &[&str])] = &[(
+    "real_name",
+    &[
+        "灵敏", "解锁", "面容", "指纹", "拍照", "识别方式", "解锁方式", "面容id", "face id",
+        "拍脸", "功能正常", "已开启",
+    ],
+)];
+
+/// 该命中是否落在商品文案噪声窗口里(命中即视为误报)。
+fn is_noise_context(kind: &str, snippet: &str) -> bool {
+    let Some((_, markers)) = BLOCKER_NOISE_CONTEXT.iter().find(|(k, _)| *k == kind) else {
+        return false;
+    };
+    let lower = snippet.to_lowercase();
+    markers.iter().any(|m| lower.contains(&m.to_lowercase()))
+}
+
 /// 在页面文本中检测人工阻断(Rust 侧模式表,可单测)。
 /// 返回命中列表 [{kind, snippet}](每种 kind 最多 1 条,避免重复刷屏)。
 pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
@@ -162,6 +193,10 @@ pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
                     .get(start..end)
                     .map(|s| s.replace(['\n', '\r', '\t'], " "))
                     .unwrap_or_default();
+                // 第 163 轮:商品文案噪声过滤(功能描述 ≠ 人工核验墙)
+                if is_noise_context(kind, &snippet) {
+                    continue;
+                }
                 out.push(json!({
                     "kind": kind,
                     "matched": kw,

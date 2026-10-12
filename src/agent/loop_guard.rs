@@ -158,8 +158,16 @@ impl LoopGuard {
         if self.repeats >= ABORT_AT {
             if !self.abort_grace_used {
                 self.abort_grace_used = true;
+                tracing::warn!(
+                    tool, repeats = self.repeats,
+                    "LoopGuard 命中宽限轮:同动作 + 同结果连续重复,再重复即止损终止"
+                );
                 return LoopVerdict::Grace(grace_text(tool, &args_brief, self.repeats));
             }
+            tracing::warn!(
+                tool, repeats = self.repeats,
+                "LoopGuard 止损终止:连续无进展达 ABORT_AT"
+            );
             return LoopVerdict::Abort {
                 tool: tool.to_string(),
                 repeats: self.repeats,
@@ -167,6 +175,10 @@ impl LoopGuard {
         }
         if self.repeats >= NUDGE_AT && !self.nudged {
             self.nudged = true;
+            tracing::info!(
+                tool, repeats = self.repeats,
+                "LoopGuard 无进展软提醒:同动作 + 同结果连续重复(不终止)"
+            );
             let text = nudge_text(tool, &args_brief, self.repeats);
             self.pending_nudge = Some(text.clone());
             return LoopVerdict::Nudge(text);

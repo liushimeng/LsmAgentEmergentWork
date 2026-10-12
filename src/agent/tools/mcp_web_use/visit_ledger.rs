@@ -74,20 +74,74 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 记录 key 归一化:去 `#fragment`、去尾 `/`;query 折叠(同 path 不同 query 视为
-/// 同一页面 —— 遍历任务里 `?page=2` 这类翻页参数不应稀释覆盖度)。
+/// 翻页 / 游标类 query 参数名(小写比较):这类参数**只改变同一页面的取数窗口**,
+/// 不构成新页面,覆盖度里应折叠为同一个 key(第 146 轮的原意)。
+///
+/// 其余 query 参数**决定页面身份**,必须原样保留。
+const PAGINATION_PARAMS: &[&str] = &[
+    "page", "pageno", "pagenumber", "pagenum", "pageindex", "page_index", "p", "pn", "pi",
+    "offset", "from", "start", "cursor", "sp", "scroll", "scrolltop", "pageno_", "s",
+];
+
+/// 该 query 参数是否为翻页/游标参数(可折叠)。
+fn is_pagination_param(key: &str) -> bool {
+    let k = key.trim().to_ascii_lowercase();
+    PAGINATION_PARAMS.contains(&k.as_str())
+}
+
+/// 记录 key 归一化:去 `#fragment`、去尾 `/`,并**按翻页参数**折叠 query。
+///
+/// 第 163 轮修正(实测 `llaew_20261012_175823.log`):旧实现直接在 `?` 处截断,
+/// 把**全部** query 折叠掉 —— 而搜索/分类驱动站点(闲鱼 `?q=`、电商 `?cat=`、
+/// 论坛 `?t=`…)的页面身份**恰恰在 query 里**。闲鱼全场 37 个真实品类搜索页被
+/// 塌缩成 3 个 key,`inspect(info=coverage)` 报 `distinct_pages=3`、
+/// `total_navs=40`,而 QC 提示词明确要求「distinct_pages 不足即覆盖未达成」
+/// (`agent/quality.rs`)—— 于是 QC 据此对真实遍历过的单元做出**错误指控**
+/// (「全程仅访问 3 个不同页面 / 涉嫌编造」),并写进 AuditTrail 决策审计。
+/// 反向副作用同样致命:同一批搜索页共享一个 key,`visit_note` 在 Agent 连续遍历
+/// 时反复弹出「确认不是重复打转」(实测 38 次、计数涨到 49),台账自相矛盾。
+///
+/// 现改为**只折叠翻页类参数**,保留决定页面身份的全部参数;剩余参数按字典序排序
+/// 使 key 与参数书写顺序无关。`?page=2` 与 `?q=手机` 仍是两个不同 key —— 前者只是
+/// 同一页的第 2 页,后者是另一个品类的搜索结果页。
 pub(super) fn visit_key(url: &str) -> String {
-    let mut s = url.trim().to_string();
-    if let Some(i) = s.find('#') {
-        s.truncate(i);
+    let trimmed = url.trim();
+    // 先去 fragment(fragment 自身可能含 `?`,不先切会误判为 query)。
+    let s = match trimmed.find('#') {
+        Some(i) => &trimmed[..i],
+        None => trimmed,
+    };
+    let (base, query) = match s.find('?') {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let mut key = base.trim_end_matches('/').to_string();
+    let Some(query) = query else { return key };
+    // 保留决定页面身份的参数(翻页/游标参数折叠),排序后拼接保证 key 稳定。
+    let mut kept: Vec<(String, String)> = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = match pair.find('=') {
+            Some(i) => (&pair[..i], &pair[i + 1..]),
+            None => (pair, ""),
+        };
+        if k.trim().is_empty() || is_pagination_param(k) {
+            continue;
+        }
+        kept.push((k.to_string(), v.to_string()));
     }
-    if let Some(i) = s.find('?') {
-        s.truncate(i);
+    if kept.is_empty() {
+        return key;
     }
-    while s.ends_with('/') {
-        s.pop();
-    }
-    s
+    kept.sort();
+    key.push('?');
+    key.push_str(
+        &kept
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&"),
+    );
+    key
 }
 
 /// 导航来源标签。
@@ -343,13 +397,58 @@ mod tests {
         assert_eq!(visit_key(" http://a.com/ "), "http://a.com");
     }
 
+    /// 第 163 轮:页面身份在 query 里的站点(搜索/分类驱动)不得塌缩成 1 个 key。
+    /// 这是 P0 回归的锁死用例 —— 旧实现在 `?` 处截断,闲鱼 37 个品类搜索页被
+    /// 压成 3 个,QC 据此做出错误指控。
+    #[test]
+    fn visit_key_keeps_identity_query_collapses_pagination() {
+        // 不同搜索词 = 不同页面(必须区分)
+        assert_ne!(
+            visit_key("https://www.goofish.com/search?q=手机"),
+            visit_key("https://www.goofish.com/search?q=家电")
+        );
+        // 不同类目 / 城市同样区分
+        assert_ne!(
+            visit_key("https://x.com/list?cat=book"),
+            visit_key("https://x.com/list?cat=phone")
+        );
+        assert_ne!(
+            visit_key("https://x.com/list?q=a&city=北京"),
+            visit_key("https://x.com/list?q=a&city=上海")
+        );
+        // 翻页参数折叠(同一页的第 N 页不算新页面)
+        assert_eq!(
+            visit_key("https://x.com/list?q=a&page=3"),
+            visit_key("https://x.com/list?q=a")
+        );
+        assert_eq!(
+            visit_key("https://x.com/list?q=a&offset=40"),
+            visit_key("https://x.com/list?q=a")
+        );
+        // 语义参数 + 翻页参数混合:语义部分必须完整保留
+        assert_eq!(
+            visit_key("https://x.com/list?q=a&cat=b&page=2"),
+            "https://x.com/list?cat=b&q=a"
+        );
+        // key 与参数书写顺序无关
+        assert_eq!(
+            visit_key("https://x.com/list?cat=b&q=a"),
+            visit_key("https://x.com/list?q=a&cat=b")
+        );
+        // 纯翻页 URL 归一到裸 path,不残留 '?'
+        assert_eq!(visit_key("https://x.com/list?page=2&offset=20"), "https://x.com/list");
+        // fragment 先于 query 切:fragment 里的 '?' 不得被当成 query
+        assert_eq!(visit_key("https://x.com/list?cat=b#frag?x=1"), "https://x.com/list?cat=b");
+    }
+
     #[test]
     fn record_and_coverage_and_note() {
         let _g = test_lock().lock().unwrap();
         reset_for_test();
         record_visit("p1", "http://a.com/login", "登录", VisitSource::Open);
         record_visit("p1", "http://a.com/home", "首页", VisitSource::Navigate);
-        record_visit("p1", "http://a.com/home?tab=2", "首页", VisitSource::Navigate);
+        // 翻页参数折叠 → 与 /home 同一个 key
+        record_visit("p1", "http://a.com/home?page=2", "首页", VisitSource::Navigate);
         record_visit("p2", "http://a.com/home", "首页", VisitSource::NewTab);
         let cov = coverage_payload();
         let s = &cov["summary"];
@@ -368,6 +467,55 @@ mod tests {
             .clone();
         assert_eq!(home["visits"], 3);
         assert!(home["via"].as_str().unwrap().contains("navigate=2"));
+    }
+
+    /// 第 163 轮回归锁死:遍历多个品类搜索页时,distinct_pages 必须随品类增长,
+    /// 且不对每个搜索页误报「重复打转」。
+    #[test]
+    fn search_遍历不塌缩且不误报打转() {
+        let _g = test_lock().lock().unwrap();
+        reset_for_test();
+        for (i, cat) in ["手机", "家电", "图书", "潮玩", "母婴"].iter().enumerate() {
+            record_visit(
+                "p1",
+                &format!("https://www.goofish.com/search?q={cat}"),
+                "搜索结果",
+                VisitSource::Navigate,
+            );
+            // 每类再翻两页,这些不该增加 distinct,但总导航数应累加
+            for p in 1..=2 {
+                record_visit(
+                    "p1",
+                    &format!("https://www.goofish.com/search?q={cat}&page={p}"),
+                    "搜索结果",
+                    VisitSource::Navigate,
+                );
+            }
+            let _ = i;
+        }
+        let s = coverage_payload();
+        let summary = &s["summary"];
+        assert_eq!(
+            summary["distinct_pages"], 5,
+            "5 个品类搜索页必须计 5 个页面: {}",
+            s
+        );
+        assert_eq!(summary["total_visits"], 15);
+        // 关键回归点:每个搜索页只累计**自己的** 3 次访问(1 次基址 + 2 次翻页)。
+        // 旧实现下 5 个品类共享一个 key,这里会报 15 —— 那正是实测日志里
+        // `visit_note` 计数一路涨到 49、反复劝 Agent「确认不是重复打转」的根因。
+        let note = visit_note("https://www.goofish.com/search?q=手机")
+            .expect("该搜索页自身已达 3 次阈值,应给出重复提示");
+        assert_eq!(
+            note["visits"], 3,
+            "重复次数必须只计本搜索页,不得把其它品类累加进来"
+        );
+        // 另一品类同样独立
+        assert_eq!(
+            visit_note("https://www.goofish.com/search?q=家电").unwrap()["visits"],
+            3,
+            "各品类搜索页计数互相独立"
+        );
     }
 
     #[test]

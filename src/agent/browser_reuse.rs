@@ -395,6 +395,14 @@ pub fn default_browser_command_name() -> &'static str {
 /// 以调试参数启动 Chrome(auto_relaunch 第 3 步)。
 ///
 /// 返回 spawn 的 Child(调用方持有,进程独立运行);失败返回 None。
+///
+/// 第 163 轮:为该 Chrome 挂进程外 watchdog(与 BrowserManager launch 路径同构)。
+/// 此前这条路径**只 spawn 不守护**,而 connect 模式语义上 `close` 只断连不杀浏览器,
+/// 于是 laew 退出后这个独立 profile 的 Chrome 变成孤儿进程,跨多次运行持续累积
+/// (实测残留 `~/.laew/chrome_debug_profile*` 实例与仍在跑的 Chrome 主进程)。
+/// 挂 watchdog 后:laew 进程消失(哪怕 `kill -9`)→ pipe EOF → watchdog 回收
+/// Chromium 主进程并清理一次性 profile。**不触碰用户自己打开的 Chrome** ——
+/// 守护范围仅限这里 spawn 出来的、profile 在 `~/.laew/` 下的实例。
 pub fn launch_debug_browser(
     port: u16,
     profile_dir: &Path,
@@ -408,7 +416,33 @@ pub fn launch_debug_browser(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    cmd.spawn().ok()
+    let child = cmd.spawn().ok()?;
+    // 守护进程持 stdin's 写端,laew 存活期间不读到 EOF。
+    hold_relaunch_watchdog(child.id(), profile_dir);
+    Some(child)
+}
+
+/// auto_relaunch Chrome 的 watchdog 句柄槽(进程级,防 Child 被 drop)。
+///
+/// watchdog 的存活完全依赖**父进程 stdin 管的写端**:laew 退出(含 `kill -9`)→
+/// 管道 EOF → watchdog 回收 Chromium 主进程。若这里 spawn 完就把 `Child` 丢掉,
+/// 写端立刻关闭 → watchdog 马上读到 EOF → **反过来把刚拉起的浏览器杀掉**。
+/// 故必须进程级保活,交由 OS 在 laew 退出时关闭管道来触发回收。
+static RELAUNCH_WATCHDOG: std::sync::OnceLock<std::sync::Mutex<Vec<std::process::Child>>> =
+    std::sync::OnceLock::new();
+
+fn relaunch_watchdog_slot() -> &'static std::sync::Mutex<Vec<std::process::Child>> {
+    RELAUNCH_WATCHDOG.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn hold_relaunch_watchdog(browser_pid: u32, profile_dir: &Path) {
+    let Some(child) = crate::agent::browser::spawn_parent_watchdog(browser_pid, profile_dir) else {
+        tracing::warn!("auto_relaunch Chrome 的 watchdog 启动失败,该实例将在 laew 退出后残留");
+        return;
+    };
+    if let Ok(mut slot) = relaunch_watchdog_slot().lock() {
+        slot.push(child);
+    }
 }
 
 /// auto_relaunch 结果(第 144 轮):端点信息 + 登录态复制计数(供响应回报对账)。

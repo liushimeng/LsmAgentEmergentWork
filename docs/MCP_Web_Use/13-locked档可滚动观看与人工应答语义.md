@@ -421,3 +421,38 @@ window 探测排除 `__laew*` 前缀(既有卫生规则,新键天然覆盖)。
   约束),工具层无法完全消除竞态——这是「人工可操作」需求的固有代价;
 - **hidden / connect 模式不注入管控脚本**:无窗口 / 用户自己的浏览器,任何视觉与
   输入拦截都不适用(connect 档位强制 open 且零注入)。
+
+---
+
+## 注入时序与就绪门（第 163 轮修正）
+
+「导航自动重注入」指 JS API 层（`Page.addScriptToEvaluateOnNewDocument`）确实生效，
+**但 API 重注入 ≠ 视觉层恢复**：脚本在新文档的最早期执行，此时
+`readyState === "loading"`，`document.documentElement` 与 `document.body`
+**可能都是 null**。实测首开（`run_immediately` 落在 load 之后）视觉正常，
+此后任何一次 `control(navigate)` / `open` 复用路径的导航都可能让视觉层**永久缺失**。
+
+三处必须同时成立，缺一即退化为「输入锁生效、屏幕无视觉」：
+
+1. **根元素顺序**：`root()` 取 `document.documentElement || document.body`
+   （`documentElement` 在 document-start 即存在）。反向写法在早期两者皆 null。
+2. **就绪门 + 补挂**：`ensure()` 先判空返回；`DOMContentLoaded` 与 `load`
+   **双保险**补挂一次建元素。
+3. **注册顺序**：补挂注册必须排在首次 `refresh()` **之前**。若 `refresh()` 先跑并抛
+   异常，其后整段（含补挂注册与 `__laewGuardOff` 卸载钩子）都不会执行，视觉层再无
+   重建机会，`MutationObserver` 也永不安装。
+
+**回报字段不再「嘴上说成功」**：`apply_page_guard` 除检查 `__laewGuardSet`
+返回非 null 外，另行校验 `__laew_overlay__` / `__laew_overlay_hint__` /
+`__laew_guard_shields__` 是否真实存在于 DOM，缺失时打 `warn`。
+`__laewGuardSet` 已定义但视觉元素没建成时，`visual_mask` 过去恒为 `true`。
+
+**蓝色边框 / 「LAEW Agent 控制中」徽标同病**（`browser.rs::AGENT_HIGHLIGHT_JS`）：
+同样加就绪重试，且早退门从 `if (installed) return;` 改为
+`if (installed && getElementById('__laew_agent_frame__')) return;` ——
+旧写法在**抛异常之前**就置了标志位，半成品实例会被这道门永久挡住。
+
+**测试**：纯字符串单测 `guard_js_uses_ready_root_and_registers_retry_before_first_refresh`
+断言补挂注册的字符下标**小于**首次 `refresh()`（顺序回归立刻红）；
+真浏览器用例 `real_browser_overlay_lock_and_mask` 补「导航后再断言视觉元素仍在」——
+旧用例只在 `new_page` 之后断言、从不导航，正是它让这个缺陷长期绿灯。

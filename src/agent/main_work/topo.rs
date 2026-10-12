@@ -254,3 +254,197 @@ pub fn sanitize_depends_on(plan: &mut WorkFlowPlan) {
     }
 }
 
+/// 「产出该文件」的动词(用于判定某 WorkFlow **生产**某产物)。
+const PRODUCE_VERBS: &[&str] = &[
+    "写入", "写到", "写为", "保存到", "保存为", "存到", "存为", "生成", "落盘", "产出", "输出到", "导出",
+];
+
+/// 「消费该文件」的动词(用于判定某 WorkFlow **读取**某产物)。
+const CONSUME_VERBS: &[&str] = &[
+    "读取", "读入", "基于", "根据", "输入为", "引用", "依据", "结合", "参照", "见上", "如上",
+];
+
+/// 动词与文件名的最大字符间距:超过则认为该动词与文件无关(宁可漏边也不误加边)。
+const DEP_PROXIMITY_CHARS: usize = 24;
+
+/// 切出「类文件名」记号并返回其在原文中的**字节起点**(用于就近回溯动词)。
+///
+/// 记号判定:含 `.`、不以 `.` 结尾、长度 ≥4、扩展名 1~8 位 ASCII 字母数字。
+fn file_token_starts(text: &str) -> Vec<(usize, String)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/') {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take() {
+            spans.push((s, i));
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, text.len()));
+    }
+    spans
+        .into_iter()
+        .filter_map(|(s, e)| {
+            let tok = &text[s..e];
+            if !tok.contains('.') || tok.ends_with('.') || tok.len() < 4 {
+                return None;
+            }
+            let ext = tok.rsplit('.').next().unwrap_or("");
+            if ext.is_empty() || ext.len() > 8 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return None;
+            }
+            Some((s, tok.to_string()))
+        })
+        .collect()
+}
+
+/// 该文件记号前 `DEP_PROXIMITY_CHARS` 字符内是否出现过任一 `verbs`。
+fn verb_near(text: &str, token_start: usize, verbs: &[&str]) -> bool {
+    let head = &text[..token_start];
+    // 按字符回溯窗口(中文 1 字符 = 3 字节,按字节截会切坏 UTF-8)。
+    let window: String = head
+        .chars()
+        .rev()
+        .take(DEP_PROXIMITY_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    verbs.iter().any(|v| window.contains(v))
+}
+
+/// 单元对某文件的读写角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactRole {
+    produces: bool,
+    consumes: bool,
+}
+
+/// 扫描单个 WorkFlow 的 name + steps,得出「本单元产出哪些文件 / 消费哪些文件」。
+fn artifact_roles(w: &WorkFlowSpec) -> std::collections::HashMap<String, ArtifactRole> {
+    let mut map: std::collections::HashMap<String, ArtifactRole> = std::collections::HashMap::new();
+    for text in std::iter::once(w.name.as_str()).chain(w.steps.iter().map(|s| s.as_str())) {
+        for (start, tok) in file_token_starts(text) {
+            let entry = map
+                .entry(tok.clone())
+                .or_insert(ArtifactRole { produces: false, consumes: false });
+            entry.produces |= verb_near(text, start, PRODUCE_VERBS);
+            entry.consumes |= verb_near(text, start, CONSUME_VERBS);
+        }
+    }
+    map
+}
+
+/// 是否存在 `from → ... → to` 的路径(加边前的成环预检)。
+fn has_path(edges: &[(String, String)], from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut stack = vec![from.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        for (a, b) in edges {
+            if a == &cur {
+                if b == to {
+                    return true;
+                }
+                stack.push(b.clone());
+            }
+        }
+    }
+    false
+}
+
+/// 从**产物引用**反推并补齐 `depends_on` 缺边(第 163 轮)。
+///
+/// 背景(实测 `llaew_20261012_175823.log`,闲鱼全品类遍历任务):Main-Work 拆出的
+/// 5 个 WorkFlow 里 wf-3/wf-4/wf-5 依次读取上一阶段的产物文件,但
+/// **`depends_on` 全部为空**,Kahn 分层因此把 5 个单元判成**同一层并发执行**。
+/// wf-3 在 18:06:04 就启动读 `闲鱼-物品类型列表.md`,而该文件直到 18:16:14 才由
+/// wf-2 落盘 —— wf-3 只能轮询等待:实测 `for i in 1..6; do sleep 20; ...` 单条
+/// Bash **120088ms** 空等 + `sleep 75` 75032ms,合计约 **195 秒纯浪费**,
+/// 并最终以 Read 失败告终;wf-2 写盘时又撞上 Write 参数截断(第 148 轮)写失败。
+///
+/// 关键在于:QC **已经点名**了这个问题却仍判 `pass` —— 其 issues 原文写着
+/// 「wf-2~wf-5 存在明确的数据流依赖……但 depends_on 全部为空,未声明链式依赖
+/// ……并行调度时可能乱序执行」,verdict 却是 pass(retryable=false),
+/// 于是这个已被点名的缺陷原样进入执行层。
+///
+/// 本函数做**确定性**补边(不涉及任何价值判断):某单元的文本里消费了另一样本
+/// 单元产出的同名文件 → 补一条 `生产者 → 消费者` 边。逐条加边前做成环预检,
+/// 宁可漏边也不制造环(环会让 `topo_layers` 整批报错、计划作废)。
+pub fn infer_depends_on(plan: &mut WorkFlowPlan) {
+    if plan.workflows.len() < 2 {
+        return;
+    }
+    let roles: Vec<std::collections::HashMap<String, ArtifactRole>> =
+        plan.workflows.iter().map(artifact_roles).collect();
+    // 候选边(生产者 → 消费者),按 (生产者, 消费者) 字典序保证确定性。
+    let mut candidates: Vec<(String, String, String)> = Vec::new();
+    for (ci, consumer) in plan.workflows.iter().enumerate() {
+        for (file, role) in &roles[ci] {
+            if !role.consumes {
+                continue;
+            }
+            for (pi, producer) in plan.workflows.iter().enumerate() {
+                if pi == ci || !roles[pi].get(file).map(|r| r.produces).unwrap_or(false) {
+                    continue;
+                }
+                // 消费者自己也产出同名文件 → 同单元内闭环,不加边
+                if role.produces {
+                    continue;
+                }
+                candidates.push((producer.id.clone(), consumer.id.clone(), file.clone()));
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let mut edges: Vec<(String, String)> = plan
+        .workflows
+        .iter()
+        .flat_map(|w| w.depends_on.iter().map(move |d| (d.clone(), w.id.clone())))
+        .collect();
+    let mut added: Vec<(String, String)> = Vec::new();
+    for (producer, consumer, file) in candidates {
+        if consumer == producer {
+            continue;
+        }
+        let target = plan
+            .workflows
+            .iter_mut()
+            .find(|w| w.id == consumer)
+            .expect("consumer 来自同一 workflows");
+        if target.depends_on.iter().any(|d| *d == producer) {
+            continue;
+        }
+        // 成环预检:补边 producer → consumer 后,consumer 不得已能到达 producer
+        if has_path(&edges, &consumer, &producer) {
+            tracing::warn!(
+                "[depends_on 推断] 跳过成环候选边 {} → {}(产物 {};补边会形成环,宁可漏边)",
+                producer,
+                consumer,
+                file
+            );
+            continue;
+        }
+        target.depends_on.push(producer.clone());
+        edges.push((producer.clone(), consumer.clone()));
+        added.push((producer, consumer));
+    }
+    if !added.is_empty() {
+        tracing::info!(
+            "[depends_on 推断] 从产物引用补齐 {} 条缺边(避免有数据依赖的单元被并发调度): {:?}",
+            added.len(),
+            added
+        );
+    }
+}
+

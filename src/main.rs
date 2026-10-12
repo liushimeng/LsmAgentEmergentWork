@@ -1129,6 +1129,10 @@ async fn main() -> Result<()> {
     let default_level = if is_tui { "warn" } else { "info" };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_level.into());
+    // 第 163 轮:屏蔽第三方 CDP 驱动的逐消息噪声(实测 --debug/-f 控制台 8896 行里
+    // 7161 行是同一句 "WS Invalid message")。用 EnvFilter 原生 directive:
+    // handler 模块降到 error(保留 "WS Connection error"),原始报文 dump 直接 off。
+    let env_filter = lsm_agent::logging::silence_cdp_noise(env_filter);
     // Agent 运行日志文件(2026-09-17 第 69 轮):`--debug` / `--info`(含单横线与
     // 大小写变体)时在工作目录生成 `llaew_{YYYYMMDD_HHMMSS}.log`(启动时刻命名),
     // `--debug` → DEBUG 级,`--info` → INFO 级;文件创建失败静默降级不影响主流程。
@@ -1193,7 +1197,7 @@ async fn main() -> Result<()> {
         let console = tracing_subscriber::fmt::layer()
             .with_target(false)
             .with_writer(lsm_agent::tui::tui_log_writer())
-            .with_filter(env_filter);
+            .with_filter(env_filter.clone());
         match agent_log {
             Some((level, maker, _)) => tracing_subscriber::registry()
                 .with(console)
@@ -1205,7 +1209,7 @@ async fn main() -> Result<()> {
         let console = tracing_subscriber::fmt::layer()
             .with_target(false)
             .with_writer(std::io::stderr)
-            .with_filter(env_filter);
+            .with_filter(env_filter.clone());
         match agent_log {
             Some((level, maker, _)) => tracing_subscriber::registry()
                 .with(console)

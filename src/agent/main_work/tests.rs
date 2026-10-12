@@ -1034,3 +1034,116 @@ fn is_web_task_detects_web_and_local_tasks() {
     assert!(!is_web_task(None, &["读取文件并生成报告".to_string()]));
     assert!(!is_web_task(None, &[]));
 }
+
+// ==================== 第 163 轮:depends_on 缺边推断 ====================
+
+/// 造一个带 steps 的 WorkFlow(供产物引用推断用)。
+fn wf_with_steps(id: &str, steps: &[&str]) -> WorkFlowSpec {
+    let mut w = wf(id, &[]);
+    w.steps = steps.iter().map(|s| s.to_string()).collect();
+    w
+}
+
+#[test]
+fn infer_depends_on_links_consumer_to_producer() {
+    // 实测事故形态:wf-3 读取 wf-2 的产物文件,但 depends_on 全空 →
+    // Kahn 把两者判成同层并发,消费方只能轮询等文件(约 195s 纯空等)。
+    let mut plan = WorkFlowPlan {
+        workflows: vec![
+            wf_with_steps(
+                "wf-1",
+                &["打开 goofish.com,设定交易地区为北京,写入 地区确认.md"],
+            ),
+            wf_with_steps(
+                "wf-2",
+                &["读取 地区确认.md,遍历全品类,采集结果写入 闲鱼-物品类型列表.md"],
+            ),
+            wf_with_steps(
+                "wf-3",
+                &["读取 闲鱼-物品类型列表.md,筛选 800-1000 元品类,生成 成本可控.md"],
+            ),
+            wf_with_steps(
+                "wf-4",
+                &["根据 成本可控.md 筛出最适合倒卖的品类,生成 最适合.md"],
+            ),
+            wf_with_steps(
+                "wf-5",
+                &["基于 最适合.md 锁定 3 个目标物品,写入 目标物品.md"],
+            ),
+        ],
+        summary: "test".into(),
+        degraded: false,
+    };
+    infer_depends_on(&mut plan);
+    let deps = |id: &str| {
+        plan.workflows
+            .iter()
+            .find(|w| w.id == id)
+            .unwrap()
+            .depends_on
+            .clone()
+    };
+    assert_eq!(deps("wf-2"), vec!["wf-1".to_string()]);
+    assert_eq!(deps("wf-3"), vec!["wf-2".to_string()]);
+    assert_eq!(deps("wf-4"), vec!["wf-3".to_string()]);
+    assert_eq!(deps("wf-5"), vec!["wf-4".to_string()]);
+    assert!(deps("wf-1").is_empty(), "无上游依赖");
+    // 链式依赖必须分 5 层串行,不得再同层并发
+    assert_eq!(topo_layers(&plan.workflows).unwrap().len(), 5);
+}
+
+#[test]
+fn infer_depends_on_ignores_self_produced_and_consumed() {
+    // 同一单元既读又写同名文件 → 单元内闭环,不得自环
+    let mut plan = WorkFlowPlan {
+        workflows: vec![
+            wf_with_steps("wf-1", &["采集数据写入 data.md"]),
+            wf_with_steps("wf-2", &["读取 data.md,处理后写入 data.md"]),
+        ],
+        summary: "test".into(),
+        degraded: false,
+    };
+    infer_depends_on(&mut plan);
+    assert!(plan.workflows[1].depends_on.is_empty());
+    assert_eq!(topo_layers(&plan.workflows).unwrap().len(), 1);
+}
+
+#[test]
+fn infer_depends_on_respects_existing_edges_and_avoids_cycles() {
+    // 显式边 wf-3 → wf-2 已存在时,推断不得重复添加;反向候选边若会成环必须跳过。
+    let mut plan = WorkFlowPlan {
+        workflows: vec![
+            wf_with_steps("wf-1", &["产出 a.md"]),
+            wf_with_steps("wf-2", &["读取 a.md,产出 b.md"]),
+            wf_with_steps("wf-3", &["读取 a.md,读取 b.md,产出 c.md"]),
+        ],
+        summary: "test".into(),
+        degraded: false,
+    };
+    plan.workflows[2].depends_on = vec!["wf-2".to_string()];
+    infer_depends_on(&mut plan);
+    let deps3 = &plan.workflows[2].depends_on;
+    assert!(deps3.contains(&"wf-1".to_string()), "wf-3 读 a.md → 应依赖 wf-1");
+    assert_eq!(
+        deps3.iter().filter(|d| *d == "wf-2").count(),
+        1,
+        "显式边不得重复添加"
+    );
+    // 补边后拓扑必须仍可解(无环)
+    assert!(topo_layers(&plan.workflows).is_ok());
+}
+
+#[test]
+fn infer_depends_on_no_false_edge_without_produce_verb() {
+    // 只提到文件名但没有产出动词,不得凭空造边
+    let mut plan = WorkFlowPlan {
+        workflows: vec![
+            wf_with_steps("wf-1", &["执行浏览器遍历,记录 www.goofish.com 页面情况"]),
+            wf_with_steps("wf-2", &["读取 首页截图.png 的内容并汇总"]),
+        ],
+        summary: "test".into(),
+        degraded: false,
+    };
+    infer_depends_on(&mut plan);
+    assert!(plan.workflows[1].depends_on.is_empty());
+}

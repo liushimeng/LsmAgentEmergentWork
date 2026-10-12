@@ -1769,16 +1769,29 @@ async fn inspect_coverage_returns_ledger_without_live_page() {
 
 /// navigate 响应附带 visit_note(≥3 次时):经 act_navigate 需要 live page,
 /// 这里锁纯函数口径(visit_note 已在上例覆盖),补 key 归一化兜底。
+/// 第 163 轮修正:口径由「忽略全部 query」改为「忽略 fragment 与翻页参数,
+/// 保留决定页面身份的 query」—— 旧口径把不同页面的访问次数混算,既误报打转
+/// 又漏报真实重复。
 #[test]
-fn visit_note_ignores_query_and_fragment() {
+fn visit_note_ignores_fragment_and_pagination_but_keeps_identity() {
     let _g = visit_ledger::test_lock().lock().unwrap();
     visit_ledger::reset_for_test();
+    // fragment 与翻页参数折叠进同一个 key;/p?x=1 是**另一个**页面。
     visit_ledger::record_visit("p", "http://a.com/p", "", visit_ledger::VisitSource::Navigate);
-    visit_ledger::record_visit("p", "http://a.com/p?x=1", "", visit_ledger::VisitSource::Navigate);
+    visit_ledger::record_visit("p", "http://a.com/p?page=1", "", visit_ledger::VisitSource::Navigate);
     let note = visit_ledger::visit_note("http://a.com/p#frag");
-    assert!(note.is_none(), "2 次(含 query 折叠)未到阈值 3");
+    assert!(note.is_none(), "2 次(fragment + 翻页折叠)未到阈值 3");
     visit_ledger::record_visit("p", "http://a.com/p#again", "", visit_ledger::VisitSource::Navigate);
-    assert!(visit_ledger::visit_note("http://a.com/p?y=2").is_some(), "3 次应触发");
+    assert!(
+        visit_ledger::visit_note("http://a.com/p?page=9").is_some(),
+        "3 次应触发"
+    );
+    // 身份型 query 独立计数:只访问过一次,不因邻近页面的 3 次而被误报
+    visit_ledger::record_visit("p", "http://a.com/p?x=1", "", visit_ledger::VisitSource::Navigate);
+    assert!(
+        visit_ledger::visit_note("http://a.com/p?x=1").is_none(),
+        "身份型 query 页面独立计数,不得受 /p 的重复次数牵连"
+    );
 }
 
 // ==================== 第 147 轮:自动阻断感知(语义挑战检测) ====================
