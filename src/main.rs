@@ -820,6 +820,7 @@ async fn run_one_shot(
                         quality_report: lsm_agent::agent::quality::QualityReport {
                             verdict: lsm_agent::agent::quality::Verdict::Fail,
                             issues: vec![reason.clone()],
+                            notes: Vec::new(),
                             suggestion: suggestion.clone(),
                             retryable: false,
                             source: lsm_agent::agent::context::AgentRole::SubAgent,

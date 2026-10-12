@@ -920,6 +920,7 @@ mod completed_digest_tests {
                 verdict: crate::agent::quality::Verdict::Pass,
                 source: AgentRole::QualityCheck,
                 issues: vec![],
+                notes: vec![],
                 suggestion: String::new(),
                 retryable: true,
                 evidence: String::new(),

@@ -1475,6 +1475,7 @@ mod format_task_result_for_context_tests {
                     Verdict::Fail
                 },
                 issues: issues.into_iter().map(|s| s.to_string()).collect(),
+                notes: vec![],
                 suggestion: String::new(),
                 retryable: false,
                 source: crate::agent::context::AgentRole::SubAgent,
@@ -1688,6 +1689,7 @@ mod format_task_result_cost_hint_tests_support {
                 quality_report: QualityReport {
                     verdict: Verdict::Pass,
                     issues: vec![],
+                    notes: vec![],
                     suggestion: String::new(),
                     retryable: false,
                     source: crate::agent::context::AgentRole::SubAgent,

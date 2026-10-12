@@ -844,6 +844,7 @@ impl TuiSession {
                             quality_report: crate::agent::quality::QualityReport {
                                 verdict: crate::agent::quality::Verdict::Fail,
                                 issues: vec![reason.clone()],
+                                notes: Vec::new(),
                                 suggestion: suggestion.clone(),
                                 retryable: false,
                                 source: crate::agent::context::AgentRole::SubAgent,

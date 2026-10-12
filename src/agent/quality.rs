@@ -15,7 +15,7 @@ use crate::session;
 
 /// 第 99 轮:QC 输出 JSON 形状硬性提示(三个 QC 提示词共用;实测 LLM 偶发漏掉
 /// verdict 字段导致反序列化失败白耗局部重试预算,提示词 + 解析端修复双保险)。
-const QC_JSON_SHAPE_HINT: &str = "\n\n【输出格式硬性要求】只输出一个合法 JSON 对象,第一个字段必须是 verdict(缺 verdict 视为无效输出,会被 fail-closed 拒收):\n{\"verdict\":\"pass\",\"source\":\"subagent\",\"issues\":[\"仅失败时列出问题\"],\"suggestion\":\"失败时给出可执行修改建议,通过时留空\",\"retryable\":false,\"evidence\":\"关键证据摘录\"}";
+const QC_JSON_SHAPE_HINT: &str = "\n\n【输出格式硬性要求】只输出一个合法 JSON 对象,第一个字段必须是 verdict(缺 verdict 视为无效输出,会被 fail-closed 拒收):\n{\"verdict\":\"pass\",\"source\":\"subagent\",\"issues\":[\"仅列**阻断性**缺陷;非阻断的观察放 notes\"],\"notes\":[\"非阻断观察(不影响通过判定)\"],\"suggestion\":\"失败时给出可执行修改建议,通过时留空\",\"retryable\":false,\"evidence\":\"关键证据摘录\"}\n【issues 与 notes 的区别(2026-10-12 起强制)】\n- `issues` = **阻断性缺陷**:不修就无法进入下一阶段 / 会让产物错误 / 让任务目标无法达成。issues 非空即判 Fail。\n- `notes` = **非阻断观察**:建议改进、口径提醒、措辞弹性、但产物仍可用的意见。notes 非空**不**影响 verdict。\n- 判 pass 时把观察写进 `notes`(**不要**塞进 issues);判 fail 时 issues 必填 blocking 缺陷,notes 可留空。\n- 判据:「这条问题是否会让上游拿到一份**错误的**产物?」会 → issues;不会 → notes。";
 
 /// 质检结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,8 +30,13 @@ pub enum Verdict {
 pub struct QualityReport {
     pub verdict: Verdict,
     pub source: AgentRole,
+    /// **阻断性缺陷**列表。非空即意味 Fail(见 [`QualityReport::reconcile_verdict`]）。
     #[serde(default)]
     pub issues: Vec<String>,
+    /// **非阻断观察**(2026-10-12 新增):模型对措辞弹性/口径/改进建议的备注。
+    /// 不参与 verdict 判定,仅如实留痕供 Debug/人工回看。
+    #[serde(default)]
+    pub notes: Vec<String>,
     #[serde(default)]
     pub suggestion: String,
     pub retryable: bool,
@@ -45,6 +50,7 @@ impl QualityReport {
             verdict: Verdict::Pass,
             source,
             issues: Vec::new(),
+            notes: Vec::new(),
             suggestion: String::new(),
             retryable: false,
             evidence: String::new(),
@@ -56,6 +62,7 @@ impl QualityReport {
             verdict: Verdict::Fail,
             source,
             issues,
+            notes: Vec::new(),
             suggestion: suggestion.into(),
             retryable,
             evidence: String::new(),
@@ -64,8 +71,9 @@ impl QualityReport {
 
     /// 第 163 轮:机械消解「`verdict=pass` 却列了 issues」的自相矛盾。
     ///
-    /// 输出 schema(`QC_JSON_SHAPE_HINT`)明确写着 `issues: ["仅失败时列出问题"]`,
-    /// 因此「通过 + 非空 issues」不是一种合法状态,而是模型自相矛盾的输出。
+    /// 输出 schema(`QC_JSON_SHAPE_HINT`)明确写着 `issues` 只列**阻断性缺陷**,
+    /// 因此「通过 + 非空 issues」不是一种合法状态 —— 模型要么把真缺陷藏进了 pass,
+    /// 要么把非阻断观察错塞进了 `issues`。后者曾被本规则误杀(见下)。
     /// 本方法只做**一致性消解**(让结论与它自己列出的问题对齐),不引入任何
     /// 新的价值判断:`retryable` 仍完全采信模型 —— 模型认为不可重试就不可重试。
     ///
@@ -75,23 +83,62 @@ impl QualityReport {
     /// ……并行调度时可能乱序执行」。这个**已被点名的硬缺陷**原样进入执行层,
     /// Kahn 把 5 个单元判成同层并发,消费方轮询等不到上游文件(实测约 195s 纯空等),
     /// 连带把产出最终交付物的 wf-5 挤到队尾饿死。
+    /// **2026-10-12 反向消解(实测 `llaew_20261012_212828.log`,文心一言任务)**:
+    /// 本方法原本只认一个方向(pass+issues→Fail),而模型大量存在
+    /// 「verdict=pass + issues 里写一堆**自称非阻断**的备注」的稳定习惯 ——
+    /// 4 次 QC 有 3 次如此。其中第 4 次 QC 自己确认「依赖无环、字段齐全、33 项检查
+    /// 通过」,5 条 issues 每条都以「非阻断」二字开头,却被升成 Fail,又因模型给了
+    /// `retryable=false` 而**直接把一份 9 WorkFlow 的合格方案判死**,任务以
+    /// `outcome=failed` 收口,340s / 19 万 input token、零执行单元产出。
+    /// 代价远大于收益:消解规则从「拦硬缺陷」变成了「按措辞杀方案」。
+    ///
+    /// 因此改为**按阻断性数量机械判定**,两个方向都纠:
+    /// 1. `pass + issues 非空` → Fail(保留原方向:真缺陷不许藏进 pass);
+    /// 2. `fail + issues 为空` → Pass(新增反向:判失败却没给出任何阻断缺陷,
+    ///    说明它要表达的是「有观察但不通过」,应作为 notes 放行,不能杀方案)。
+    ///
+    /// 两个方向都不引入新的价值判断 —— 唯一判据是「`issues` 里有没有模型
+    /// 自己认定的阻断缺陷」,与它把 verdict 写成什么无关。
     fn reconcile_verdict(mut self) -> Self {
         if self.verdict == Verdict::Pass && !self.issues.is_empty() {
             tracing::warn!(
                 source = ?self.source,
                 issues = self.issues.len(),
-                "Quality 报告自相矛盾(verdict=pass 但列出了 issues,违反输出 schema \
-                 的「issues 仅失败时列出」),机械消解为 Fail;retryable 仍采信模型判定"
+                "Quality 报告自相矛盾(verdict=pass 但列出了阻断性 issues),机械消解为 Fail;\
+                 retryable 仍采信模型判定"
             );
             self.verdict = Verdict::Fail;
             // 消解必须留痕:实测事故的教训正是「QC 判 pass 却列了硬缺陷」被无声吞掉,
             // 缺陷原样进了执行层并在 AuditTrail 留下不可回溯的记录。
             let note = format!(
-                "[第 163 轮一致性消解] 模型 verdict=pass 但列出 {} 条 issues,\
-                 违反输出 schema(issues 仅失败时列出),已按 issues 消解为 Fail。issues: {}",
+                "[第 163 轮一致性消解] 模型 verdict=pass 但列出 {} 条阻断性 issues,\
+                 已按 issues 消解为 Fail。issues: {}",
                 self.issues.len(),
                 self.issues.join(" | ")
             );
+            self.evidence = if self.evidence.trim().is_empty() {
+                note
+            } else {
+                format!("{}\n{note}", self.evidence.trim())
+            };
+        } else if self.verdict == Verdict::Fail && self.issues.is_empty() {
+            tracing::warn!(
+                source = ?self.source,
+                notes = self.notes.len(),
+                "Quality 报告 verdict=fail 但未给出任何阻断性 issues(观察应写进 notes),\
+                 机械消解为 Pass;retryable 仍采信模型判定"
+            );
+            let note = format!(
+                "[2026-10-12 反向一致性消解] 模型 verdict=fail 但 issues 为空 \
+                 (仅给出 {n} 条 notes),已消解为 Pass —— 非阻断观察不构成失败依据。notes: {s}",
+                n = self.notes.len(),
+                s = if self.notes.is_empty() {
+                    "(无)".to_string()
+                } else {
+                    self.notes.join(" | ")
+                }
+            );
+            self.verdict = Verdict::Pass;
             self.evidence = if self.evidence.trim().is_empty() {
                 note
             } else {
@@ -557,6 +604,7 @@ fn parse_quality_report_text_fallback(text: &str, source: AgentRole) -> Option<Q
         verdict,
         source: source_inferred,
         issues: vec![format!("JSON 解析失败,文本降级;evidence={evidence}")],
+        notes: Vec::new(),
         suggestion: String::new(),
         retryable,
         evidence,
@@ -936,6 +984,83 @@ mod tests {
         let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
         assert_eq!(r.verdict, Verdict::Pass);
         assert!(r.issues[0].contains("JSON 解析失败"));
+    }
+
+    // ===== 2026-10-12:反向一致性消解(实测 llaew_20261012_212828.log 文心一言任务) =====
+
+    /// 实测事故形态:QC 判 `fail` 但一条阻断缺陷都没给,issues 里装的是它自己
+    /// 都标了「非阻断」的观察,模型还给了 `retryable=false` —— 旧规则只认
+    /// pass+issues→Fail 一个方向,这份被"按措辞判死"的合格方案一路放行到
+    /// 任务以 `outcome=failed` 收口(340s / 19 万 input token、零执行单元)。
+    /// 新增反向消解:判失败却无阻断缺陷 → 按 notes 放行。
+    #[test]
+    fn qc_fail_without_blocking_issues_is_reconciled_to_pass() {
+        let text = r#"```json
+{"verdict":"fail","source":"main","issues":[],"notes":["非阻断-范围越界:建议把素材研读移出关键路径","非阻断-依赖链风险:素材目录不可读会导致对话链停摆"],"suggestion":"","retryable":false,"evidence":"三项阻断条件均不成立"}
+```"#;
+        let r = parse_quality_report(text, AgentRole::MainWork).unwrap();
+        assert_eq!(
+            r.verdict,
+            Verdict::Pass,
+            "fail + 空 issues(仅 notes)应反向消解为 Pass,不能按措辞杀方案"
+        );
+        assert!(r.evidence.contains("反向一致性消解"), "消解必须留痕: {}", r.evidence);
+        assert!(r.evidence.contains("范围越界"), "notes 原文应留痕供回看");
+        // 模型原有证据不被覆盖
+        assert!(r.evidence.contains("三项阻断条件均不成立"));
+        // retryable 仍完全采信模型
+        assert!(!r.retryable);
+    }
+
+    /// 反向消解的边界:`fail` + 非空 issues =模型确实认定了阻断缺陷,保持 Fail。
+    #[test]
+    fn qc_fail_with_blocking_issues_stays_fail() {
+        let text = r#"{"verdict":"fail","source":"main","issues":["wf-3 素材路径写成裸文件名,Read 必然 FileNotFound"],"notes":["措辞口径可再统一"],"suggestion":"改用绝对路径","retryable":true,"evidence":"已回读方案文件"}"#;
+        let r = parse_quality_report(text, AgentRole::MainWork).unwrap();
+        assert_eq!(r.verdict, Verdict::Fail, "有阻断缺陷时保持 Fail");
+        assert!(
+            !r.evidence.contains("一致性消解"),
+            "本来就没有矛盾,不该加消解痕迹: {}",
+            r.evidence
+        );
+        assert!(r.retryable);
+    }
+
+    /// 新旧两个方向互不干扰:pass+issues(有阻断缺陷)→ Fail;
+    /// fail+空 issues → Pass;pass+空 issues → 原样 Pass。
+    #[test]
+    fn qc_reconcile_both_directions_are_covered() {
+        let pass_clean = r#"{"verdict":"pass","source":"plan","issues":[],"notes":["建议补充阈值"],"retryable":false,"evidence":"结构齐全"}"#;
+        assert_eq!(
+            parse_quality_report(pass_clean, AgentRole::Plan).unwrap().verdict,
+            Verdict::Pass
+        );
+
+        let pass_with_blocking = r#"{"verdict":"pass","source":"plan","issues":["depends_on 全部为空,存在硬缺陷"],"retryable":false,"evidence":"已落盘"}"#;
+        assert_eq!(
+            parse_quality_report(pass_with_blocking, AgentRole::Plan).unwrap().verdict,
+            Verdict::Fail
+        );
+
+        let fail_without_blocking = r#"{"verdict":"fail","source":"plan","issues":[],"notes":["非阻断观察"],"retryable":false,"evidence":"已落盘"}"#;
+        assert_eq!(
+            parse_quality_report(fail_without_blocking, AgentRole::Plan).unwrap().verdict,
+            Verdict::Pass
+        );
+    }
+
+    /// QC 提示词必须说清 issues(阻断)与 notes(非阻断)的区别,
+    /// 否则模型仍会沿用"pass + 观察写进 issues"的旧习惯(第 163 轮规则的误杀源)。
+    #[test]
+    fn qc_prompt_distinguishes_blocking_issues_from_notes() {
+        assert!(
+            QC_JSON_SHAPE_HINT.contains("\"notes\""),
+            "schema 提示必须给出 notes 字段"
+        );
+        assert!(
+            QC_JSON_SHAPE_HINT.contains("阻断性") && QC_JSON_SHAPE_HINT.contains("非阻断"),
+            "schema 提示必须区分阻断/非阻断"
+        );
     }
 
     #[test]

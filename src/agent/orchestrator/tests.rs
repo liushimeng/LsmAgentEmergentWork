@@ -314,6 +314,7 @@
                 quality_report: QualityReport {
                     verdict: Verdict::Pass,
                     issues: vec![],
+                    notes: vec![],
                     suggestion: String::new(),
                     retryable: false,
                     source: AgentRole::SubAgent,
