@@ -248,6 +248,14 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     // guard_lift **之前**:提问期间页面所有权已移交人工,Agent 的输入动作会把
     // 人工正在进行的拖拽/点选重新锁死(实测「弹窗阻碍人工输入」的直接机制)。
     if let Some(pending) = super::hitl_guard::gate(&action, &params).await { return pending; }
+    // 多标签页后台挂起闸:视觉证据类动作(screenshot)在后台标签页必然失真,6003
+    // 拦截(params.focus=true 自动前台化后执行 / force=true 强制);其余动作放行
+    // 但响应附 page_background 提示(DOM/CDP 输入在后台页仍正确,仅渲染类被节流)。
+    // 排在 6002/4003 之后:人工核验与页面所有权优先于前后台事实;探测 fail-open。
+    let background_note = match super::page_activity::gate_visual_action(id, &action, &params).await {
+        super::page_activity::GateOutcome::Block(envelope) => return envelope,
+        super::page_activity::GateOutcome::Allow(note) => note,
+    };
     // 第 141 轮:蒙层输入锁「先解后锁」—— 输入类动作(经 CDP Input.dispatch*
     // 或 chromiumoxide Element click/type)在蒙层激活时会被 setIgnoreInputEvents
     // 一并吃掉(实测,见 browser_overlay 模块文档),动作前解锁、动作后复锁。
@@ -294,6 +302,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "drag" => act_drag(id, &params).await,
         "focus" => act_focus_or_blur(id, &params, true).await,
         "blur" => act_focus_or_blur(id, &params, false).await,
+        // 标签页前台化(与元素级 focus 区分:激活浏览器标签页;6003 闸的解法本身)
+        "bring_to_front" => super::page_activity::act_bring_to_front(id).await,
         "mouse_move" => act_mouse_move(id, &params).await,
         "dispatch_event" => act_dispatch_event(id, &params).await,
         // 第 100 轮:窗口可视化 + 人工介入(HITL)
@@ -345,6 +355,13 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     } else {
         Vec::new()
     };
+    // 派生新标签页通常会抢走前台:有派生且闸门未附标注时,探测本页是否已转后台
+    // (仍前台/探测失败/开关关闭均返回 None 零噪声),让 Agent 当轮即知
+    // 「原页面转入后台,后续操作先 bring_to_front」。
+    let mut bg_note = background_note;
+    if !spawned.is_empty() && bg_note.is_none() {
+        bg_note = super::page_activity::note_if_backgrounded(id).await;
+    }
     // 第 147 轮:推送式自动阻断感知 —— 输入类/wait/导航类动作收尾后探测人工验证
     // 挑战(图片选择/语义题等关键词扫不出的形态,见 blocker_probe),命中才把
     // blocker_alert + human_assist 载荷附进响应;wait 失败(多为等待超时)恰是
@@ -366,12 +383,19 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                     m.insert("spawned_page_id".into(), Value::String(new_id.clone()));
                 }
             }
+            if let Some(note) = bg_note {
+                data["page_background"] = note;
+            }
             envelope(0, "ok", data)
         }
         Err(e) => {
             let mut data = json!({});
             if let Some(new_id) = spawned.first() {
                 data["spawned_page_id"] = json!(new_id);
+            }
+            // 失败路径同样附后台标注:动作失败 + 页面在后台是「为何失败」的直接诊断。
+            if let Some(note) = bg_note {
+                data["page_background"] = note;
             }
             if let Some(alert) = err_alert {
                 if let (Some(dst), Some(src)) = (data.as_object_mut(), alert.as_object()) {

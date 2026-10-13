@@ -260,6 +260,17 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         Some(p) => p,
         None => return envelope(2000, "page_id 不存在", json!({"page_id": id})),
     };
+    // 多标签页后台挂起闸(与 control 共用同一闸门,见 page_activity):视觉证据
+    // 维度(screenshot/ocr)在后台标签页必然失真,6003 拦截;params.focus=true
+    // 自动前台化后放行。其余维度是 DOM/事件缓冲区读取,后台页仍准确,不探测零开销。
+    let background_note = if super::page_activity::info_needs_foreground(&kind) {
+        match super::page_activity::gate_visual_action(id, &kind, &params).await {
+            super::page_activity::GateOutcome::Block(envelope) => return envelope,
+            super::page_activity::GateOutcome::Allow(note) => note,
+        }
+    } else {
+        None
+    };
     let res: std::result::Result<Value, String> = match kind {
         "console" => {
             let buf = crate::agent::browser::BrowserManager::global().events(id).await;
@@ -606,7 +617,14 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         other => return envelope(1001, "未知 info", json!({"info": other})),
     };
     match res {
-        Ok(data) => envelope(0, "ok", gate_payload(data)),
+        Ok(data) => {
+            let mut data = gate_payload(data);
+            // 后台页提示经 params.focus 前台化或 force 放行时,如实标注页面状态。
+            if let Some(note) = background_note {
+                data["page_background"] = note;
+            }
+            envelope(0, "ok", data)
+        }
         Err(e) => envelope(2002, &e, json!({})),
     }
 }

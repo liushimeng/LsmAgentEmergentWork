@@ -287,11 +287,14 @@ fn parameters_control_action_enum_complete() {
         "set_window", "sync_viewport", "set_highlight", "set_overlay", "set_guard",
         // 第 152 轮:auto_follow(自动跟随最新内容)
         "auto_follow", "request_human",
+        // 多标签页治理:bring_to_front(标签页前台化)
+        "bring_to_front",
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
-    // 第 143 轮 set_guard 使枚举 40 → 41;第 152 轮 auto_follow 使 41 → 42;第 158 轮 select_dropdown 使 42 → 43
-    assert_eq!(names.len(), 43, "control_action 应为 43 个,实际 {names:?}");
+    // 第 143 轮 set_guard 使枚举 40 → 41;第 152 轮 auto_follow 使 41 → 42;第 158 轮 select_dropdown 使 42 → 43;
+    // 多标签页治理 bring_to_front 使 43 → 44
+    assert_eq!(names.len(), 44, "control_action 应为 44 个,实际 {names:?}");
 }
 
 #[test]
