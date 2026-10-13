@@ -429,7 +429,14 @@ pub(super) fn split_shell_segments(cmd: &str) -> Vec<&str> {
                 }
             }
             '&' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+                // `>&` / `&>` 是 fd 复制 / 双路重定向算子的一部分,**不是**后台执行符,
+                // 不可在此切断 —— 否则 `cmd 2>&1 | head` 会被切成 `… 2>` + `1`,
+                // 前段留下一个无目标的 `>` 被 readonly 误判为写盘(2026-10-13 实测)。
+                let prev_is_redirect = i > start && bytes[i - 1] == b'>';
+                let next_is_redirect = i + 1 < bytes.len() && bytes[i + 1] == b'>';
+                if prev_is_redirect || next_is_redirect {
+                    None
+                } else if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
                     Some(2)
                 } else {
                     Some(1)

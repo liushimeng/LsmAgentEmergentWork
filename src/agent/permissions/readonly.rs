@@ -110,12 +110,25 @@ fn stripped_segments(command: &str) -> Vec<String> {
 }
 
 // 2. 重定向拦截(quoted 已被 strip;`>` `>>` `<>` `<<<` 均拦)
+//
+// **空设备 / fd 复制放行**(2026-10-13):`2>/dev/null`、`2>&1`、`&>/dev/null` 是只读侦察
+// 命令的高频惯用写法(`ls x 2>/dev/null`、`curl -sI u 2>&1 | head`),它们**不落任何盘**。
+// 旧实现对剥壳后的段做裸 `contains(">")`,把这一整类命令判成「写盘」并拦下,逼 Plan /
+// Main-Work 绕道 SubAgent 纯为做一次目录列举(实测 Plan 一次 `ls -la … 2>/dev/null` 即被拒)。
+// 现改为逐个定位重定向算子并**检查其目标**:目标是空设备或 fd 复制即放行,其余仍拦。
 fn check_write_redirects(command: &str) -> Option<String> {
     let segments = stripped_segments(command);
-    let redirects = ["<<<", ">>", ">", "<>"];
+    // 长算子优先,避免 `>>` 被拆成两个 `>` 导致目标提取错位
+    let redirects = ["<<<", "<>", ">>", ">"];
     for seg in &segments {
         for r in redirects {
-            if seg.contains(r) {
+            let mut from = 0usize;
+            while let Some(rel) = seg[from..].find(r) {
+                let at = from + rel;
+                if redirect_target_is_benign(&seg[at + r.len()..]) {
+                    from = at + r.len();
+                    continue;
+                }
                 return Some(format!(
                     "检测到重定向 `{r}`(只读模式禁止写盘)。如确需写盘,用 SubAgent 委派执行层。"
                 ));
@@ -123,6 +136,34 @@ fn check_write_redirects(command: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 重定向目标是「空设备」或「fd 复制」时判为**不写盘**,放行。
+///
+/// 放行白名单(逐条对应实测误伤):
+/// - `/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/fd/N` —— 丢弃/回环,不落盘;
+/// - `&1` / `&2` / `&N` —— stdout/stderr 复制,只换 fd 不落盘;`&-` 关闭 fd 同理。
+///
+/// 取目标 = 算子后首个 token(遇空白或段分隔符止)。**切分集刻意不含 `&`** —— fd 复制目标
+/// `&1` 本身以 `&` 开头,一旦按 `&` 切会先切出空串而被误判为「非豁免」。
+/// **空目标一律不豁免**:引号内容已被 `strip_quoted_strings` 抹除,`> "$OUT"` 会退化成
+/// 空目标 → 仍拦(保守,不因本轮放宽而漏放真写盘)。
+fn redirect_target_is_benign(rest: &str) -> bool {
+    let target = rest
+        .trim_start_matches([' ', '\t'])
+        .split(|c: char| c.is_whitespace() || c == '|' || c == ';')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(',');
+    if target.is_empty() {
+        return false;
+    }
+    matches!(target, "/dev/null" | "/dev/stdout" | "/dev/stderr" | "&-")
+        || target.starts_with("/dev/fd/")
+        // `&1` / `&2` / `&12`:单字符 `&` + 纯数字,长度 ≥2 以排除裸 `&`(后台执行符)
+        || (target.len() >= 2
+            && target.starts_with('&')
+            && target[1..].chars().all(|c| c.is_ascii_digit()))
 }
 
 // 1.5. pipe-to-shell 拦截:`curl ... | bash` / `wget ... | sh` / `... | node` / `... | python` 等
@@ -364,6 +405,34 @@ mod tests {
         let _g = lock_env();
         std::env::remove_var("LAEW_BASH_READONLY");
         assert!(check_bash_readonly("echo x | tee /tmp/foo").is_err());
+    }
+
+    // 空设备 / fd 复制不写盘,只读侦察高频写法必须放行(2026-10-13)
+    #[test]
+    fn readonly_allows_null_device_and_fd_dup() {
+        let _g = lock_env();
+        std::env::remove_var("LAEW_BASH_READONLY");
+        // 实测被误伤的形态:Plan 一次目录列举即被拦,逼其绕道 SubAgent
+        assert!(check_bash_readonly("ls -la /tmp && echo ---plans--- && ls -la /tmp/plans 2>/dev/null").is_ok());
+        assert!(check_bash_readonly("curl -sI https://example.com 2>&1 | head -5").is_ok());
+        assert!(check_bash_readonly("cat /tmp/x &>/dev/null").is_ok());
+        assert!(check_bash_readonly("cat /tmp/x >/dev/stdout").is_ok());
+        assert!(check_bash_readonly("cat /tmp/x 2> /dev/null").is_ok());
+        assert!(check_bash_readonly("cat /tmp/x >/dev/fd/3").is_ok());
+    }
+
+    // 放宽不得漏放真写盘:文件目标 / 追加 / 空目标 / 相似前缀仍拦
+    #[test]
+    fn readonly_still_blocks_real_file_targets() {
+        let _g = lock_env();
+        std::env::remove_var("LAEW_BASH_READONLY");
+        assert!(check_bash_readonly("echo x > /tmp/null").is_err());
+        assert!(check_bash_readonly("echo x >> /dev/null").is_err(), ">> 追加语义仍属写操作");
+        assert!(check_bash_readonly("echo x > /tmp/nullfile").is_err());
+        assert!(check_bash_readonly("echo x > /tmp/real.txt").is_err());
+        assert!(check_bash_readonly("echo x > \"/tmp/$VAR.txt\"").is_err(), "引号内容被抹除 → 空目标仍拦");
+        assert!(check_bash_readonly("cat /tmp/x &>/tmp/out").is_err(), "&> 后跟真实文件仍拦");
+        assert!(check_bash_readonly("echo x > &x").is_err(), "非数字 & 不是 fd 复制");
     }
 
     #[test]
