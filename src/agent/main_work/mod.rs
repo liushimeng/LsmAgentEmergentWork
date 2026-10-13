@@ -36,7 +36,8 @@ pub use delegate::{infer_delegate_to, infer_delegate_to_for_plan};
 pub use parse::{parse_plan_markdown, parse_workflow_plan};
 pub use spec::{BranchSpec, LoopSpec, WorkFlowPlan, WorkFlowSpec};
 pub use topo::{
-    dedup_workflow_ids, infer_depends_on, sanitize_depends_on, topo_layers, topo_sort,
+    dedup_workflow_ids, fallback_serial_chain, infer_depends_on, sanitize_depends_on,
+    serial_chain_applies, topo_layers, topo_sort,
 };
 // 原私有项:供本模块 impl 与测试经 `use super::*` 取用(可见域与拆分前等价)
 use delegate::{gather_spec_text, text_contains_any_ci, DESKTOP_GUI_STRICT_KEYWORDS};
@@ -464,24 +465,7 @@ impl MainWorkRunner {
 
         // 运行日志(2026-09-17 第 69 轮):Main-Work 拆解完成(决策)—— 逐单元
         // id/name/delegate/depends_on,排查「任务被拆成了什么、委派给了谁」。
-        let units_desc = plan
-            .workflows
-            .iter()
-            .map(|w| {
-                format!(
-                    "{}[{}]→{}(deps:{})",
-                    w.id,
-                    crate::logging::clip_for_log(&w.name, 60),
-                    w.delegate_to.as_str(),
-                    if w.depends_on.is_empty() {
-                        "-".to_string()
-                    } else {
-                        w.depends_on.join("+")
-                    }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ; ");
+        let units_desc = plan_units_desc(&plan);
         tracing::info!(
             agent = "LsmAgentEmergentWork-Main-Work",
             session = session_id,
@@ -502,14 +486,38 @@ impl MainWorkRunner {
         let plan = parse_plan_markdown(&content)?;
         // 运行日志(2026-09-17 第 69 轮):hard 档 Main-Work 从 Plan 文档解析出的
         // WorkFlow(非 LLM 拆解路径,与 plan_workflows_inner 的拆解事件对偶)。
+        // 第 165 轮:补 units(deps 详情)—— 事故复盘发现本路径缺失逐单元依赖日志,
+        // depends_on 被全角冒号解析缺陷清空时排障无从看起。
         tracing::info!(
             agent = "LsmAgentEmergentWork-Main-Work",
             plan_path = %plan_path.display(),
             workflows = plan.workflows.len(),
+            units = %plan_units_desc(&plan),
             "Main-Work 解析 Plan 完成(决策)"
         );
         Ok(plan)
     }
+}
+
+/// 逐单元摘要串(`wf-1[名称]→subagent(deps:wf-…)`),供拆解/解析决策日志共用。
+fn plan_units_desc(plan: &WorkFlowPlan) -> String {
+    plan.workflows
+        .iter()
+        .map(|w| {
+            format!(
+                "{}[{}]→{}(deps:{})",
+                w.id,
+                crate::logging::clip_for_log(&w.name, 60),
+                w.delegate_to.as_str(),
+                if w.depends_on.is_empty() {
+                    "-".to_string()
+                } else {
+                    w.depends_on.join("+")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ")
 }
 
 /// 2026-09-16 第 61 轮:把同一微信 UI 链的多个桌面窗口操控单元自动合并。

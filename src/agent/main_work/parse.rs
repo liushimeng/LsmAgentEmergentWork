@@ -32,6 +32,9 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
         // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)
         infer_depends_on(&mut plan);
+        // 第 165 轮:仍全空 → 串行链兜底(浏览器交互链无文件产物可推,全空并发
+        // 曾致乱序互踩重试风暴,见 tmpPlan/2026-10-13_WorkFlow依赖解析全角标点丢失与串行兜底方案.md)
+        fallback_serial_chain(&mut plan);
         // 2026-09-16 第 54 轮补丁 B:基于步骤关键词自动纠正 delegate_to
         // (解决 osascript 步骤被错委派的问题)
         infer_delegate_to_for_plan(&mut plan);
@@ -48,6 +51,8 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
         // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
         // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)
         infer_depends_on(&mut plan);
+        // 第 165 轮:同上,串行链兜底
+        fallback_serial_chain(&mut plan);
         infer_delegate_to_for_plan(&mut plan);
         return Ok(plan);
     }
@@ -63,6 +68,8 @@ pub fn parse_workflow_plan(text: &str) -> Result<WorkFlowPlan> {
             // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
             // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)
             infer_depends_on(&mut plan);
+            // 第 165 轮:同上,串行链兜底
+            fallback_serial_chain(&mut plan);
             infer_delegate_to_for_plan(&mut plan);
             return Ok(plan);
         }
@@ -198,9 +205,9 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
             if let Some(w) = current.take() {
                 workflows.push(w);
             }
-            // 提取 id 与 name(形如 "1: 名称" 或 "1 名称")
+            // 提取 id 与 name(形如 "1: 名称" / "1：名称" / "1 名称";第 165 轮兼容全角冒号)
             let after_id = rest
-                .trim_start_matches(|c: char| c.is_ascii_digit() || c == ':' || c == ' ')
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == ':' || c == '：' || c == ' ')
                 .to_string();
             // 提取纯数字 id
             let id_num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -211,7 +218,10 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
             };
             current = Some(WorkFlowSpec {
                 id,
-                name: after_id.trim_start_matches(':').trim().to_string(),
+                name: after_id
+                    .trim_start_matches(|c: char| c == ':' || c == '：')
+                    .trim()
+                    .to_string(),
                 steps: Vec::new(),
                 branches: Vec::new(),
                 loops: Vec::new(),
@@ -255,11 +265,11 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                         }
                     })
                     .unwrap_or_default();
-                // 依赖列:逗号/顿号分隔,忽略「无」与空
+                // 依赖列:逗号(半角/全角)/顿号分隔,忽略「无」与空
                 let depends_on: Vec<String> = cells
                     .get(3)
                     .map(|d| {
-                        d.split(|c| c == ',' || c == '、' || c == ';')
+                        d.split(|c: char| matches!(c, ',' | '，' | '、' | ';'))
                             .map(|p| p.trim())
                             .filter(|p| !p.is_empty() && *p != "无" && *p != "-" && *p != "—")
                             .map(|p| p.to_string())
@@ -332,27 +342,40 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
             }
         }
         if let Some(w) = current.as_mut() {
-            if t.starts_with("- 依赖:") || t.starts_with("依赖:") {
-                // 提取冒号之后的内容
-                let after_colon = if let Some(idx) = t.find(':') {
-                    t[idx + 1..].trim()
-                } else {
-                    ""
+            // 第 165 轮:全角标点兼容 —— Plan Agent 输出中文全角标点是常态
+            // (实测 `plans/…-2.md` 70 处全角 `：` vs 2 处半角),旧解析只认半角冒号,
+            // `- 依赖：wf-1` 整行静默丢弃 → depends_on 全空 → 多单元同层并发互踩
+            // (详见 tmpPlan/2026-10-13_WorkFlow依赖解析全角标点丢失与串行兜底方案.md)。
+            if t.starts_with("- 依赖:") || t.starts_with("依赖:")
+                || t.starts_with("- 依赖：") || t.starts_with("依赖：")
+            {
+                // 提取冒号(全角/半角取先出现者;全角 `：` 是 3 字节,按 char 长度跳过)之后的内容
+                let after_colon = match t.find([':', '：']) {
+                    Some(idx) => {
+                        let colon_len = t[idx..].chars().next().map_or(1, char::len_utf8);
+                        t[idx + colon_len..].trim()
+                    }
+                    None => "",
                 };
                 if after_colon == "无" || after_colon.is_empty() {
                     continue;
                 }
-                for part in after_colon.split(',') {
+                // 分隔符同时认半角/全角逗号与顿号(与表格变体路径对齐)
+                for part in after_colon.split(|c: char| matches!(c, ',' | '，' | '、' | ';')) {
                     let s = part.trim();
                     if !s.is_empty() {
                         w.depends_on.push(s.to_string());
                     }
                 }
-            } else if t.starts_with("- 验收标准:") || t.starts_with("验收标准:") {
-                let after_colon = if let Some(idx) = t.find(':') {
-                    t[idx + 1..].trim().to_string()
-                } else {
-                    String::new()
+            } else if t.starts_with("- 验收标准:") || t.starts_with("验收标准:")
+                || t.starts_with("- 验收标准：") || t.starts_with("验收标准：")
+            {
+                let after_colon = match t.find([':', '：']) {
+                    Some(idx) => {
+                        let colon_len = t[idx..].chars().next().map_or(1, char::len_utf8);
+                        t[idx + colon_len..].trim().to_string()
+                    }
+                    None => String::new(),
                 };
                 w.acceptance.push(after_colon);
             } else if t.starts_with("- [ ]") || t.starts_with("  - [ ]") {
@@ -399,6 +422,9 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
     // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
     // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)
     infer_depends_on(&mut plan);
+    // 第 165 轮:全角冒号兼容后仍可能全空(如 JSON 通道或无依赖声明的 Plan)
+    // → 串行链兜底,防多单元同层并发互踩
+    fallback_serial_chain(&mut plan);
     infer_delegate_to_for_plan(&mut plan);
     Ok(plan)
 }

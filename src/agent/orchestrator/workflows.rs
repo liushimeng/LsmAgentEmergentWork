@@ -30,6 +30,17 @@ impl MultiAgentOrchestrator {
             usage: Usage::default(),
             completed_digest: String::new(),
         })?;
+        // 第 165 轮:全并行退化警示 —— 多单元落同一层意味着零依赖边,执行顺序完全
+        // 由 Semaphore 槽位释放顺序决定(实测乱序互踩重试风暴,详见 tmpPlan/2026-10-13
+        // _WorkFlow依赖解析全角标点丢失与串行兜底方案.md)。正常应已被串行链兜底
+        // (`fallback_serial_chain`)拦截,到达这里通常意味着杀开关被关闭,留观测点。
+        if layers.len() == 1 && plan.workflows.len() >= 2 {
+            tracing::warn!(
+                units = plan.workflows.len(),
+                "[拓扑退化] {} 个 WorkFlow 全部同层并行(零依赖边):执行顺序不受控,存在乱序互踩风险",
+                plan.workflows.len()
+            );
+        }
 
         let mut results = Vec::new();
         let mut dep_outputs: std::collections::HashMap<String, String> =

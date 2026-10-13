@@ -361,6 +361,60 @@ fn has_path(edges: &[(String, String)], from: &str, to: &str) -> bool {
     false
 }
 
+/// 串行链兜底开关(第 165 轮):`LAEW_WF_SERIAL_FALLBACK=off|0|false|no` 关闭,
+/// 默认开启(对齐 `LAEW_PARALLEL_TOOLS` / `LAEW_REACT_GUARD` 惯例)。
+fn serial_fallback_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("LAEW_WF_SERIAL_FALLBACK")
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase()
+                .as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
+/// 零依赖多单元计划的**串行链兜底**(第 165 轮)。
+///
+/// 背景(实测 `llaew_20261013_102358.log`,百度地图公交路线任务):Plan 文档明确声明
+/// 依赖链 wf-1→wf-2→{wf-3,wf-4}→wf-5,但行级解析对全角冒号失明使 `depends_on`
+/// 全部丢失;[`infer_depends_on`] 只能从文件产物推边,浏览器交互链(无文件)推不出
+/// → 5 单元全部落同一层并发,Semaphore 槽位释放顺序取代逻辑依赖:wf-5(生成文档)
+/// 早于 wf-4(提取数据)执行,产出凭常识编造的内容;上游失败局部重试又与在飞单元
+/// **并发互踩同一浏览器页面**(一方 reload 摧毁另一方等待的 DOM)→ 重试风暴 17 分钟
+/// 直到人工取消 —— 用户观察即「产物已生成后 Agent 又自己重新执行」。
+///
+/// 确定性兜底(纯结构性判定,不涉及价值判断):**所有**单元 `depends_on` 全空且
+/// 单元数 ≥2 时,按数组顺序补 `wf[i] depends_on wf[i-1]`。全空 = 无任何「可并行」
+/// 证据;LLM 拆解顺序即逻辑顺序;并行是猜测,串行是安全默认(第 163 轮文件依赖
+/// 事故与本轮页面状态依赖事故同构:乱序并发的代价远大于串行耗时)。杀开关
+/// `LAEW_WF_SERIAL_FALLBACK=off` 可退回旧行为(真独立单元可并行的场景)。
+pub fn fallback_serial_chain(plan: &mut WorkFlowPlan) {
+    if !serial_fallback_enabled() {
+        return;
+    }
+    if !serial_chain_applies(&plan.workflows) {
+        // 单单元 / 任一单元有显式或推断依赖边 → 已有拓扑证据,不兜底
+        return;
+    }
+    for i in 1..plan.workflows.len() {
+        let prev = plan.workflows[i - 1].id.clone();
+        plan.workflows[i].depends_on.push(prev);
+    }
+    tracing::warn!(
+        units = plan.workflows.len(),
+        "[串行链兜底] 所有 WorkFlow 的 depends_on 均为空:按声明顺序串行执行(全空=无并行证据,乱序互踩风险 > 并行收益;LAEW_WF_SERIAL_FALLBACK=off 可关闭)"
+    );
+}
+
+/// 串行兜底判定(独立出来便于单测,不含环境开关)。
+pub fn serial_chain_applies(workflows: &[WorkFlowSpec]) -> bool {
+    workflows.len() >= 2 && workflows.iter().all(|w| w.depends_on.is_empty())
+}
+
 /// 从**产物引用**反推并补齐 `depends_on` 缺边(第 163 轮)。
 ///
 /// 背景(实测 `llaew_20261012_175823.log`,闲鱼全品类遍历任务):Main-Work 拆出的

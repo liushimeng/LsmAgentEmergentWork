@@ -527,6 +527,196 @@
         assert_eq!(plan.workflows[0].steps.len(), 1);
     }
 
+    /// 第 165 轮事故复现(`llaew_20261013_102358.log` 百度地图任务):Plan Agent 输出
+    /// 全角冒号(实测 70 处全角 `：` vs 2 处半角),旧解析只认半角 → `- 依赖：wf-1`
+    /// 整行静默丢弃 → depends_on/acceptance 全空 → 5 单元同层并发乱序互踩。
+    /// 全角冒号兼容后依赖链与验收标准必须完整解析,name 头部不得残留 `：`。
+    #[test]
+    fn 解析plan文档_全角冒号_依赖与验收标准不丢() {
+        let md = r#"
+# 任务方案：公交路线规划
+
+## 一、目标
+目标内容
+
+## 二、WorkFlow 拆解
+### WorkFlow 1：进入路线规划模式并输入起终点
+- 步骤：
+  - [ ] 点击路线规划按钮
+  - [ ] 在起点输入框中输入「民院小区」
+- 委派 Agent：SubAgent-Work
+- 依赖：无
+- 验收标准：路线规划面板展开
+
+### WorkFlow 2：选择公共交通模式并搜索路线
+- 步骤：
+  - [ ] 点击「公共交通出行」
+- 委派 Agent：SubAgent-Work
+- 依赖：wf-1
+- 验收标准：页面显示至少一条公共交通路线方案
+
+### WorkFlow 3：截取地图全景截图
+- 步骤：
+  - [ ] 使用 screenshot 截图
+- 委派 Agent：SubAgent-Work
+- 依赖：wf-2
+- 验收标准：截图文件成功生成
+
+### WorkFlow 4：提取路线规划关键信息
+- 步骤：
+  - [ ] 提取预计总时长
+- 委派 Agent：SubAgent-Work
+- 依赖：wf-2
+- 验收标准：成功提取完整的路线规划信息
+
+### WorkFlow 5：生成出行计划文档
+- 步骤：
+  - [ ] 创建文件 出行计划-01.md
+- 委派 Agent：SubAgent-Work
+- 依赖：wf-3, wf-4
+- 验收标准：出行计划-01.md 文件生成成功
+
+## 三、关键决策
+决策
+"#;
+        let plan = parse_plan_markdown(md).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(plan.workflows.len(), 5, "应解析出 5 个 WorkFlow");
+        assert_eq!(plan.workflows[1].depends_on, vec!["wf-1"], "全角冒号依赖必须解析");
+        assert_eq!(plan.workflows[2].depends_on, vec!["wf-2"]);
+        assert_eq!(plan.workflows[3].depends_on, vec!["wf-2"]);
+        assert_eq!(
+            plan.workflows[4].depends_on,
+            vec!["wf-3", "wf-4"],
+            "半角逗号 + 全角冒号混合分隔依赖: {:?}",
+            plan.workflows[4].depends_on
+        );
+        assert_eq!(
+            plan.workflows[0].name, "进入路线规划模式并输入起终点",
+            "name 头部不得残留全角冒号: {:?}",
+            plan.workflows[0].name
+        );
+        assert!(
+            plan.workflows.iter().all(|w| !w.acceptance.is_empty()),
+            "全角冒号验收标准必须解析: {:?}",
+            plan.workflows.iter().map(|w| &w.acceptance).collect::<Vec<_>>()
+        );
+        // 依赖完整后拓扑应为 4 层:[wf-1] → [wf-2] → [wf-3,wf-4] → [wf-5],
+        // 而非事故中的 1 层 5 单元全并行
+        let layers = topo_layers(&plan.workflows).expect("拓扑合法");
+        assert_eq!(layers.len(), 4, "依赖链解析后应分 4 层: {layers:?}");
+        assert_eq!(layers[0].len(), 1);
+        assert_eq!(layers[2].len(), 2, "wf-3/wf-4 同层: {layers:?}");
+        assert_eq!(layers[3][0].id, "wf-5");
+    }
+
+    /// 全角逗号分隔的多依赖形态(`- 依赖：wf-3，wf-4`)也必须完整解析。
+    #[test]
+    fn 解析plan文档_全角逗号分隔依赖() {
+        let md = r#"
+## 二、WorkFlow 拆解
+### WorkFlow 1：准备
+- 步骤：
+  - [ ] 初始化
+- 依赖：无
+- 验收标准：完成
+
+### WorkFlow 2：准备二
+- 步骤：
+  - [ ] 初始化二
+- 依赖：无
+- 验收标准：完成
+
+### WorkFlow 3：汇总
+- 步骤：
+  - [ ] 汇总
+- 依赖：wf-1，wf-2
+- 验收标准：完成
+"#;
+        let plan = parse_plan_markdown(md).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(
+            plan.workflows[2].depends_on,
+            vec!["wf-1", "wf-2"],
+            "全角逗号分隔依赖: {:?}",
+            plan.workflows[2].depends_on
+        );
+    }
+
+    /// 第 165 轮:零依赖多单元计划的串行链兜底 —— 依赖全空时按声明顺序补
+    /// wf[i]→wf[i-1],拓扑退化的「1 层全并行」不再出现(乱序互踩重试风暴根治)。
+    #[test]
+    fn 依赖全空_多单元_串行链兜底() {
+        let md = r#"
+## 二、WorkFlow 拆解
+### WorkFlow 1: 打开页面
+- 步骤:
+  - [ ] open
+- 依赖: 无
+- 验收标准: 页面打开
+
+### WorkFlow 2: 输入起终点
+- 步骤:
+  - [ ] input
+- 依赖: 无
+- 验收标准: 输入完成
+
+### WorkFlow 3: 截图
+- 步骤:
+  - [ ] screenshot
+- 依赖: 无
+- 验收标准: 截图生成
+"#;
+        let plan = parse_plan_markdown(md).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(plan.workflows.len(), 3);
+        assert_eq!(plan.workflows[0].depends_on, Vec::<String>::new(), "首单元无前置");
+        assert_eq!(plan.workflows[1].depends_on, vec!["wf-1"], "全空应串行链兜底");
+        assert_eq!(plan.workflows[2].depends_on, vec!["wf-2"]);
+        let layers = topo_layers(&plan.workflows).expect("兜底后拓扑合法");
+        assert_eq!(
+            layers.len(),
+            3,
+            "兜底后应 3 层单元素串行,而非 1 层全并行: {layers:?}"
+        );
+    }
+
+    /// 串行链兜底判定:单单元 / 任一单元有依赖(显式或推断)时不得触发。
+    #[test]
+    fn 兜底判定_单单元或有依赖不触发() {
+        let spec = |id: &str, deps: Vec<&str>| WorkFlowSpec {
+            id: id.into(),
+            name: id.into(),
+            steps: vec!["step".into()],
+            branches: vec![],
+            loops: vec![],
+            depends_on: deps.into_iter().map(String::from).collect(),
+            acceptance: vec![],
+            delegate_to: AgentRole::SubAgent,
+            max_iterations: None,
+            original_prompt: None,
+            pre_explore: false,
+        };
+        // 单单元:不触发
+        assert!(!serial_chain_applies(&[spec("wf-1", vec![])]));
+        // 全空多单元:触发
+        assert!(serial_chain_applies(&[spec("wf-1", vec![]), spec("wf-2", vec![])]));
+        // 任一单元有依赖:不触发(已有拓扑证据)
+        assert!(!serial_chain_applies(&[spec("wf-1", vec![]), spec("wf-2", vec!["wf-1"])]));
+        // 幂等:已兜底过的计划再跑一次不重复加边
+        let mut plan = WorkFlowPlan {
+            workflows: vec![spec("wf-1", vec![]), spec("wf-2", vec![])],
+            summary: String::new(),
+            degraded: false,
+        };
+        fallback_serial_chain(&mut plan);
+        assert_eq!(plan.workflows[1].depends_on, vec!["wf-1"]);
+        fallback_serial_chain(&mut plan);
+        assert_eq!(
+            plan.workflows[1].depends_on,
+            vec!["wf-1"],
+            "二次兜底不得重复加边: {:?}",
+            plan.workflows[1].depends_on
+        );
+    }
+
     /// F1(2026-09-10 第 25 轮):真实 LLM(D06 实测 MiniMax-M3 3/3)把 branches
     /// 写成字符串数组,宽松反序列化必须解析成功而非丢弃整份计划。
     #[test]
