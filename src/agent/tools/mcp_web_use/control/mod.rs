@@ -1363,6 +1363,10 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
         };
 
     // 先把窗口带到前台(headed 才有视觉效果;hidden 模式静默失败不阻断提问)
+    // 第 166 轮:焦点租约 —— 置前/弹窗都会抢 OS 键盘焦点;提问期间焦点归人工,
+    // 收口(应答/超时/取消)后 keep 档(缺省)把键盘焦点归还给提问前的前台应用,
+    // 用户正在其它窗口打字不被打断(见 browser_focus 模块头)。
+    let focus_lease = crate::agent::browser_focus::FocusLease::capture();
     if bring {
         let _ = BrowserManager::global().bring_page_to_front(id).await;
     }
@@ -1414,6 +1418,8 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
             let _ = crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
         }
     }
+    // 焦点租约收口:人工介入结束,键盘焦点归还提问前的前台应用(fail-open)。
+    focus_lease.release();
     use crate::agent::human_assist::{AssistVia, HumanAssistOutcome};
     match outcome {
         HumanAssistOutcome::Answered { text: answer, via } => {

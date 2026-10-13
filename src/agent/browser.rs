@@ -1904,10 +1904,23 @@ mod cleanup_registry {
         BROWSER_PID.swap(0, Ordering::SeqCst)
     }
 
+    /// 窥视浏览器 PID(0 = 未登记)。不消费登记 —— 焦点治理「抬升不抢焦」
+    /// 只读定位 Chrome 主窗口用。connect 模式恒未登记(接管外部浏览器)。
+    pub fn peek_browser_pid() -> u32 {
+        BROWSER_PID.load(Ordering::SeqCst)
+    }
+
     /// 取出 profile 目录(锁被占用 / 未登记 → None,跳过目录清理)。
     pub fn take_user_data_dir() -> Option<PathBuf> {
         USER_DATA_DIR.lock().ok().and_then(|mut slot| slot.take())
     }
+}
+
+/// 窥视 launch 模式浏览器主进程 PID(0 = 未登记/connect 模式)。
+/// 焦点治理「抬升不抢焦」(`browser_focus::raise_window_no_activate`)定位
+/// Chrome 主窗口用;不消费登记,不影响 shutdown 清理路径。
+pub fn peek_browser_pid() -> u32 {
+    cleanup_registry::peek_browser_pid()
 }
 
 /// 生成 user-data-dir 清理辅助:spawn 异步任务重试删除。

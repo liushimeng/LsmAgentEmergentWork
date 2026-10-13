@@ -716,10 +716,17 @@ async fn run_open(args: Value) -> Result<String> {
         .get("reuse_existing")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if reuse_existing && str_arg(&args, "connect_url").is_none() {
-        return run_open_reuse(&args, url).await;
-    }
-    run_open_inner(&args, url).await
+    // 第 166 轮:焦点租约 —— Chrome 启动/窗口置前会抢走 OS 键盘焦点,
+    // keep 档(缺省)在本次 open 全链收口后把焦点归还给调用前的前台应用,
+    // 用户正在其它窗口打字不被打断(见 browser_focus 模块头)。
+    let focus_lease = crate::agent::browser_focus::FocusLease::capture();
+    let res = if reuse_existing && str_arg(&args, "connect_url").is_none() {
+        run_open_reuse(&args, url).await
+    } else {
+        run_open_inner(&args, url).await
+    };
+    focus_lease.release();
+    res
 }
 
 /// run_open 主体(url 已提取、锚点守卫已过、复用分支已判定)。
@@ -1380,6 +1387,7 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 【两种工作模式】1) 单步执行模式:直接调用 open/control/inspect/list/close,一次一个动作,适合探索、调试和高风险操作;2) 连续执行模式:先用单步 inspect(elements/dom/console/network)探索结构,再 action=sequence 一次执行已明确动作链,适合流程稳定任务(登录/表单类:inspect(form) → ocr 验证码 → sequence(input×N + click + wait + verify) 一次打包)。两种模式可混合、可多次调用。
 【标准作业顺序】open 拿 page_id → inspect 探索真实 DOM → control 执行动作 → inspect 验证结果 → 任务完成后 close 释放(确定不再需要的页面;全部结束用 page_id="all" 清场)。
 【多标签页与后台挂起】Chrome 一个窗口只有一个激活标签页,其余全部转后台挂起(渲染暂停/rAF 停摆/懒加载不触发/定时器节流),页面会因 open/new_tab、点击或 JS window.open 派生新页、人工手动切页而不断增多或换前台:① 前后台状态看 list 的 foreground 标记(人工可能随时手动切页,以最新探测为准);② 对后台页 screenshot / inspect(ocr) 返回 6003(后台截图=最后一次前台渲染的旧帧,证据必然失真)——重试加 params.focus=true 自动前台化后执行,或先 control(bring_to_front);其余动作(DOM 读写/CDP 输入/滚动)在后台页照常正确,响应附 page_background 提示;③ 标签页及时收口:单页任务完成即 close(page_id),后台页批量清理 close(page_id="background"),全部结束 close(page_id="all"),页数多时 list 附 tabs_hint;④ 切换前台会改变人工当前看到的页面,人工正在操作(open/partial 档)时避免来回切换;单页能完成的任务不要新开标签页。
+【焦点与操作节奏】CDP 操作(点击/输入/滚动/截图/读 DOM)全部不需要 Chrome 有键盘焦点,日常操作不要调用 bring_to_front;键盘焦点占用只发生在 open 启动浏览器、request_human 人工介入、6003 后台页取证这三处,且系统在动作收口后会把焦点自动归还给用户原先的应用(缺省行为,响应附 focus_restored 对账;用户要全程盯屏观看时可设 LAEW_WEB_FOCUS=always)。置前与人工介入是用户注意力被占用的时刻:动手前先用 explore/inspect 把现场与步骤规划好,再用 sequence/batch 一次打包做完,避免逐步置前、逐步试错来回打断人工;人工正在其它窗口打字时,更要避免触发置前类动作。
 【错误码对策】1001 修正参数(含 guard 档位类:partial 缺 allow_selectors/block_selectors 之一、两者互斥、locked/open 不收选择器);2000 page_id 失效→action=list 重新同步;2001 断连→重新 open;2002 换 selector 重试;input 类失败先看响应里的 value_after/fallbacks 判断卡在哪一级(input_text 已自动尝试 JS 赋值/CDP 逐键/慢速逐字三级阶梯);press_sequence 带 selector 会先聚焦再按键;key_press 键名大小写不敏感(enter/esc/space/del/方向键等),多字符按键名不是合法按键;3001 未安装浏览器→如实告知用户,不要编造结果;**3002 复用浏览器不可用(调试端口未开启)→ 把 data.relaunch_command 转述用户执行,或以 auto_relaunch=true 重试(自动复制登录态并另启独立调试实例,不退出用户已打开的浏览器);不要反复重试 open**;**6001 目标站点越界(任务锚点)→ 立即停止该路径,如实报告「目标站点不可达或未指定」并结束本单元;严禁改用其它站点、搜索引擎、缓存或名称相似的替代品 —— 可以失败,不可以乱跑**;**6002 人工核验弹窗在场,输入动作已拦截 → 不要重试、不要换 eval_js 绕过(可变更 eval 同样被拦);立即按 data.human_assist 载荷 request_human(reason=captcha) 让人工完成验证,应答后页面干净再继续;确认是结构误判才可 params.force=true 强制执行**;**6003 页面后台挂起 → 截图/OCR 在后台标签页必然失真,严禁拿旧截图当证据;按 data.required_action 三选一(params.focus=true 重试自动前台化 / 先 control(bring_to_front) / 该页不再需要则 close 收口),确认后台截图可用才 params.force=true**。
 【页面管控三档(第 143 轮,仅 headed 可视化模式)】guard 决定人工对页面的操作权限,按用户意图选档:**用户没说要自己动手/缺省 → locked**(防交叉操作是安全基线,含支付/删除等高风险动作的任务必须 locked);**用户说「我自己操作/我来点/我先登录/你看着」→ open(guard_note 写清引导)**;**用户要分区协作(「我操作登录框,你管其余/锁住支付按钮」)→ partial + allow_selectors(白名单)或 block_selectors(黑名单)**;信号不明确时 locked 起步、需要人工参与时经 request_human 询问。open/partial 下人工与 Agent 并发操作页面,**关键写操作前先 inspect 验证现场**再动手。人工登录先行流:open(guard="open", guard_note="请登录后应答弹窗…") → request_human(reason="login", message=…) → 人工在页面完成登录并应答 → set_guard(mode="locked") 回到防交叉基线 → 继续任务。运行时随时 set_guard 切换;蒙层/盾区/状态条是设计行为不是页面故障,不要试图用 eval_js 移除。
 【人工介入(HITL)】遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/人脸核身等无法自动完成的流程:可视化场景确认 data.mode=headed(缺省即是,无需显式传 mode=headed),让人工看到窗口(蓝色边框标识,页面默认有半透明蒙层锁定人工输入——这是设计行为不是页面故障),再 control(request_human, reason=..., message=说明要人工做什么, options=[...]);**提问期间自动放行人工输入区域(unlock_page 默认 true;第 144 轮:账号/密码/验证码等人工必填区域自动成为 partial 部分屏蔽的非屏蔽区域——状态条显示「🛡 部分锁定·人工输入区已开放」,人工只能在放行区域内拖滑块/扫码/填表,其余页面保持 Agent 管控;探测不到凭证区才整页开放(第 145 轮:两档状态条均注明「完成后回弹窗点『提交 / 继续』」);应答/超时/取消后自动复锁;inspect(info=blockers) 命中时 data.credential_zones 给出可传 allow_selectors 的区域选择器)**;macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时,人工在弹窗点选项/输入验证码;第 145 轮:主按钮「提交 / 继续」双语义,人工在浏览器完成操作后空输入点击即交棒 Agent 接管;「⏱ +2分钟」可延长等待,总上限 30 分钟,实测人工整链登录超 120s 分档超时的根治;弹窗文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,也有「📋 复制」一键复制全部信息),Linux 或弹窗不可用时 TUI 选择块行读;code=0 用 data.human_response 继续——**先看 next_hint 分流**(第 145 轮:human_response 是自由文本验证码/动态码 → 立即 input_text 填入并提交表单;是「N. 选项」形态(如「我已完成」)→ inspect 验证页面状态后继续),data.page_unlock 回报本次放行方式对账;4001=超时/弹窗与 TUI 均不可用,如实报告;4002=人工取消(弹窗取消/Esc/关窗),终止该路径。当前实例是无头而任务需要可视化时,先 close("all") 回收再以 mode=headed 重开。

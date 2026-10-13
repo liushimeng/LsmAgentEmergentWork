@@ -246,6 +246,29 @@ fn guard_script_rev_monotonic_and_off_hook() {
     assert!(!a.contains("{REV}"), "REV 占位符未烘焙");
 }
 
+/// 第 166 轮:屏蔽完整性(锁定态 CSS 层 + selectstart 闸)与焦点纪律提示词锚点。
+#[test]
+fn 屏蔽完整性与焦点纪律锚点() {
+    // ① 管控 JS:悬停 ⃠ 光标 / 禁选 / selectstart 事件闸(与 browser_overlay
+    // 内单测同锚点补充,防止外围误删)
+    let js = crate::agent::browser_overlay::guard_script(
+        &crate::agent::browser_overlay::PageGuardConfig::locked(),
+    );
+    assert!(js.contains("cursor:not-allowed !important"), "锁定态光标反馈缺失");
+    assert!(js.contains("user-select:none !important"), "锁定态禁选缺失");
+    assert!(js.contains("'selectstart'"), "selectstart 事件闸缺失");
+    // ② 工具描述:焦点与操作节奏段(先规划后批量 + 借焦速还对账字段)
+    let desc = super::MCP_WEB_USE_DESCRIPTION;
+    assert!(desc.contains("焦点与操作节奏"), "工具描述缺焦点纪律段");
+    assert!(desc.contains("focus_restored"), "工具描述缺归还对账字段");
+    assert!(desc.contains("sequence/batch"), "工具描述缺批量速决指引");
+    // ③ 系统提示词:焦点纪律条(SubAgent-Work 渲染含 MCP_Web_Use 段)
+    let web = crate::agent::system_prompt::SystemPrompt::sub_agent_work()
+        .render(crate::database::Protocol::Anthropic);
+    assert!(web.contains("焦点纪律"), "系统提示词缺焦点纪律条");
+    assert!(web.contains("LAEW_WEB_FOCUS=keep"), "系统提示词缺焦点档位指引");
+}
+
 #[test]
 fn parse_modifiers_combo() {
     let p = json!({"modifiers": ["ctrl", "shift"]});

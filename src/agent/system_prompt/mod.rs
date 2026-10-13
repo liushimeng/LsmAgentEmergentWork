@@ -1248,6 +1248,14 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     options=["已完成登录,继续","登录遇到问题","取消任务"]);③ 人工应答后
     control(set_guard, mode="locked") 收口回防交叉基线;④ inspect 验证登录态 →
     继续任务。guard_note 会显示在页面左下角状态条,是给人工的 UI 引导。
+21. 焦点纪律:置前类动作(open 启动浏览器、request_human、bring_to_front、
+    6003 focus=true)会占用用户的键盘焦点 —— 系统已在动作收口后自动归还给用户
+    原先的应用(LAEW_WEB_FOCUS=keep 缺省),但人工正在其它窗口打字时被短暂抢焦
+    仍会打断输入。默认如此:动手前先用 explore/inspect 把现场与步骤规划好,
+    再用 sequence/batch 一次打包做完,把置前与人工介入的次数压到最少;日常
+    点击/输入/滚动/截图不需要 Chrome 有键盘焦点,不需要为此 bring_to_front。
+    要给人工看页面或要人工操作时优先走 request_human(弹窗引导 + 收口归还焦点),
+    例外(如人工明确要求「把窗口调过来我要看」)可直接置前。
 "##;
 
 #[cfg(test)]

@@ -283,7 +283,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // 第 157 轮:GATE_EVTS/gate 提升到闸块外定义 —— 版本化重装时
     // __laewGuardOff 需要引用它们卸载旧监听器。
     const GATE_EVTS = ['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick',
-        'contextmenu', 'pointerdown', 'pointerup', 'dragstart', 'drop',
+        'contextmenu', 'pointerdown', 'pointerup', 'dragstart', 'drop', 'selectstart',
         'keydown', 'keyup', 'keypress', 'touchstart', 'touchend'];
     const gate = (e) => {
         try { if (!e.isTrusted) return; } catch (ex) { return; }
@@ -295,6 +295,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         for (const t of GATE_EVTS) window.addEventListener(t, gate, true);
         window.__laewGuardInputSuspend = (s) => {
             window.__laewGuardInputSuspended = !!s;
+            try { applyLockCss(); } catch (ex) {}
             return true;
         };
         window.__laewGuardGateReady = true;
@@ -302,12 +303,13 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     const MASK_ID = '__laew_overlay__';
     const HINT_ID = '__laew_overlay_hint__';
     const SHIELDS_ID = '__laew_guard_shields__';
+    const STYLE_ID = '__laew_guard_style__';
     const CHIP_TEXT = {
         locked: window.__laewGuardScrollWatch
             ? ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看·可滚动)',
-               '人工可滚动浏览;点击/键盘已拦截,如需操作请应答「人工介入」弹窗']
+               '人工可滚动浏览;点击/键盘/选中已拦截,如需操作请应答「人工介入」弹窗']
             : ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看)',
-               '人工操作已拦截;如需介入请应答「人工介入」弹窗'],
+               '人工点击/键盘/选中已拦截;如需介入请应答「人工介入」弹窗'],
         open:   ['🔓 页面开放 · 人工可直接操作',
                  'Agent 协同中;人工完成操作后应答「人工介入」弹窗告知'],
         partial:['🛡 部分锁定 · 盾区不可操作',
@@ -366,6 +368,31 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
             root().appendChild(sc);
         }
     };
+    // 锁定态 CSS 层:悬停任何组件光标 ⃠(「不可点击」视觉态)+ 全页禁选
+    // (user-select 硬底;selectstart 闸是事件层双保险)。class 与 style 随
+    // 「locked 且未挂起」共用一个判据 —— Agent 输入动作「先解后锁」期间
+    // (__laewGuardInputSuspend / __laewGuardSuspend)CSS 锁同步放开,收口复锁。
+    // open/partial 不上全局锁(partial 盾罩自带 cursor:not-allowed)。
+    const applyLockCss = () => {
+        const on = window.__laewGuardMode === 'locked'
+            && !window.__laewGuardSuspended && !window.__laewGuardInputSuspended;
+        const r = root();
+        if (!r) return;
+        r.classList.toggle('__laew_locked__', on);
+        let st = el(STYLE_ID);
+        if (on) {
+            if (!st) {
+                st = document.createElement('style');
+                st.id = STYLE_ID;
+                st.setAttribute('data-laew-agent', '1');
+                r.appendChild(st);
+            }
+            st.textContent = 'html.__laew_locked__ *{cursor:not-allowed !important;'
+                + 'user-select:none !important;-webkit-user-select:none !important;}';
+        } else if (st) {
+            st.remove();
+        }
+    };
     const setChip = (mode, note) => {
         const c = el(HINT_ID);
         if (!c) return;
@@ -390,7 +417,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
             const sh = document.createElement('div');
             sh.setAttribute('data-laew-agent', '1');
             sh.style.cssText = 'position:fixed;left:' + x + 'px;top:' + y + 'px;width:' + w
-                + 'px;height:' + h + 'px;pointer-events:auto;z-index:2147483645;'
+                + 'px;height:' + h + 'px;pointer-events:auto;z-index:2147483645;cursor:not-allowed;'
                 + (dark
                     ? 'background:rgba(15,23,42,0.30);'
                     : 'background:rgba(185,28,28,0.18);border:1.5px dashed rgba(185,28,28,0.8);')
@@ -484,6 +511,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         const mode = window.__laewGuardMode;
         const susp = !!window.__laewGuardSuspended;
         ensure();
+        applyLockCss();
         const m = el(MASK_ID);
         if (m) m.style.display = (mode === 'locked' && !susp) ? '' : 'none';
         const c = el(HINT_ID);
@@ -580,10 +608,11 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         try { window.removeEventListener('scroll', schedule, true); } catch (e) {}
         try { window.removeEventListener('resize', schedule); } catch (e) {}
         try { if (window.__laewGuardMO) window.__laewGuardMO.disconnect(); } catch (e) {}
-        for (const id of [MASK_ID, HINT_ID, SHIELDS_ID]) {
+        for (const id of [MASK_ID, HINT_ID, SHIELDS_ID, STYLE_ID]) {
             const n = document.getElementById(id);
             if (n) n.remove();
         }
+        try { if (root()) root().classList.remove('__laew_locked__'); } catch (e) {}
     };
 })()"#;
 
@@ -1048,7 +1077,7 @@ mod tests {
             .next()
             .unwrap_or_default();
         assert!(!gate_list.is_empty(), "GATE_EVTS 数组段缺失:{on}");
-        for evt in ["'mousedown'", "'click'", "'keydown'", "'touchstart'", "'dragstart'"] {
+        for evt in ["'mousedown'", "'click'", "'keydown'", "'touchstart'", "'dragstart'", "'selectstart'"] {
             assert!(gate_list.contains(evt), "拦截清单应含 {evt}:{gate_list}");
         }
         for evt in ["'wheel'", "'scroll'", "'mousemove'", "'pointermove'", "'touchmove'"] {
@@ -1114,6 +1143,47 @@ mod tests {
         assert!(js.contains("rgba(15,23,42,0.30)"), "白名单深色盾罩");
         assert!(js.contains("已锁定(仅 Agent)"));
         assert!(js.contains("tagBudget"), "盾罩标签应有数量预算");
+        // 第 166 轮:屏蔽完整性 —— 锁定态 CSS 层(悬停 ⃠ 光标 + 全页禁选)+
+        // selectstart 事件闸双保险 + 盾罩 not-allowed 光标。
+        assert!(js.contains("cursor:not-allowed !important"), "锁定态应有 not-allowed 光标");
+        assert!(js.contains("user-select:none !important"), "锁定态应禁选");
+        assert!(js.contains("-webkit-user-select:none !important"), "WebKit 前缀禁选");
+        assert!(js.contains("__laew_locked__"), "锁定 class 标记");
+        assert!(js.contains("STYLE_ID = '__laew_guard_style__'"), "锁定样式元素 id");
+        assert!(js.contains("applyLockCss"), "CSS 锁应有统一应用函数");
+        // CSS 锁与输入闸挂起联动(Agent 输入动作期间同步放开,需求 2)
+        let suspend_seg = js
+            .split("window.__laewGuardInputSuspend = (s) =>")
+            .nth(1)
+            .unwrap_or_default()
+            .split("return true;")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            suspend_seg.contains("applyLockCss"),
+            "输入闸挂起必须联动 CSS 锁(先解后锁的 CSS 侧):{suspend_seg}"
+        );
+        // selectstart 闸(事件层)+ CSS(user-select)双保险
+        let gate_list = js
+            .split("const GATE_EVTS = [")
+            .nth(1)
+            .unwrap_or_default()
+            .split("];")
+            .next()
+            .unwrap_or_default();
+        assert!(gate_list.contains("'selectstart'"), "拦截清单应含 selectstart:{gate_list}");
+        // 盾罩(partial)自身光标 not-allowed(z-index 2147483645 段唯一定位盾罩样式行)
+        assert!(
+            js.contains("z-index:2147483645;cursor:not-allowed;"),
+            "盾罩应有 not-allowed 光标"
+        );
+        // 卸载钩子清理 CSS 锁(防旧 class/style 泄漏到新实例)
+        let off_seg = js
+            .split("window.__laewGuardOff = () =>")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(off_seg.contains("STYLE_ID"), "卸载应移除锁定样式:{off_seg}");
+        assert!(off_seg.contains("__laew_locked__"), "卸载应移除锁定 class:{off_seg}");
         // 蒙层纯视觉:蒙层本身 pointer-events:none;盾罩 pointer-events:auto
         let mask_seg = js
             .split("if (!el(MASK_ID))")

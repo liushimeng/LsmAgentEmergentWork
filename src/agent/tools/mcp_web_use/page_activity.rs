@@ -165,11 +165,19 @@ pub(super) async fn gate_visual_action(id: &str, action: &str, params: &Value) -
     }
     // 显式前台化逃生口:先把标签页带到前台再执行本动作。
     if params.get("focus").and_then(Value::as_bool).unwrap_or(false) {
+        // 第 166 轮:焦点租约 —— 前台化会抢 OS 键盘焦点,keep 档(缺省)借完
+        // 即还(随后的截图/OCR 不需要焦点);响应附 focus_restored 对账。
+        let lease = crate::agent::browser_focus::FocusLease::capture();
         let brought = crate::agent::browser::BrowserManager::global()
             .bring_page_to_front(id)
             .await
             .is_ok();
-        return GateOutcome::Allow(Some(background_note(&act, brought.then_some(true), None)));
+        let focus_restored = lease.release();
+        let mut note = background_note(&act, brought.then_some(true), None);
+        if let Some(obj) = note.as_object_mut() {
+            obj.insert("focus_restored".into(), json!(focus_restored));
+        }
+        return GateOutcome::Allow(Some(note));
     }
     let needs_fg = action_needs_foreground(action) || info_needs_foreground(action);
     if needs_fg && !params.get("force").and_then(Value::as_bool).unwrap_or(false) {
@@ -305,7 +313,23 @@ pub(super) async fn close_background_pages() -> std::result::Result<Vec<String>,
 
 /// `control(bring_to_front)`:把指定标签页带到前台(`Page.bringToFront`)并
 /// 复核可见性。与元素级 `focus` 区分:那是聚焦页内输入元素,这是激活标签页。
+///
+/// 第 166 轮:焦点租约包壳 —— `Page.bringToFront` 会连带激活窗口抢键盘焦点,
+/// keep 档(缺省)在本次动作收口归还给调用前的前台应用(响应附
+/// `focus_restored` 对账);错误路径同样归还,不泄漏借焦。
 pub(super) async fn act_bring_to_front(id: &str) -> std::result::Result<Value, String> {
+    let lease = crate::agent::browser_focus::FocusLease::capture();
+    let result = bring_to_front_core(id).await;
+    let focus_restored = lease.release();
+    result.map(|mut v| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("focus_restored".to_string(), json!(focus_restored));
+        }
+        v
+    })
+}
+
+async fn bring_to_front_core(id: &str) -> std::result::Result<Value, String> {
     crate::agent::browser::BrowserManager::global()
         .bring_page_to_front(id)
         .await?;
