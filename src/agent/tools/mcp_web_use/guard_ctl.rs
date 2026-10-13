@@ -34,8 +34,16 @@ pub(super) async fn guard_lift_for_input(
 ) -> Option<(chromiumoxide::Page, GuardLiftKind)> {
     use crate::agent::browser_overlay::PageGuardMode;
     let mgr = crate::agent::browser::BrowserManager::global();
-    let mode = mgr.current_guard().await.mode;
     let page = mgr.page(id).await?;
+    // **按页面实际态**决定要不要让路(2026-10-13),不用实例级全局 `current_guard()`。
+    // 全局 `inner.guard` 只有一份,`set_guard` 改的是「最后一次调用」的页:多窗口并行下,
+    // A 页为 HITL 置 open 后,真正 locked 的 B 页会读到全局 open → 判定「无需让路」→
+    // 不挂闸 → B 页 DOM 输入闸照常拦截 → Agent 侧表现为「输入三级阶梯均未生效」。
+    // 页面未装 guard(connect / 视觉层未注入 / eval 失败)→ 回退全局期望态,保持旧语义。
+    let mode = match super::unlock_zone::page_guard_snapshot(&page).await {
+        Some(cfg) => cfg.mode,
+        None => mgr.current_guard().await.mode,
+    };
     match mode {
         PageGuardMode::Locked if mgr.overlay_active().await => {
             if crate::agent::browser_overlay::gate_suspend_input(&page, true).await {
