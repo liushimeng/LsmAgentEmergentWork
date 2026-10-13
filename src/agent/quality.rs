@@ -661,6 +661,60 @@ fn repair_quality_json(json_str: &str, source: AgentRole) -> Option<String> {
         let is_fail = obj.get("verdict").and_then(serde_json::Value::as_str) == Some("fail");
         obj.insert("retryable".into(), serde_json::Value::Bool(is_fail));
     }
+    // 字段形状归一化(实测 2026-10-13 闲鱼任务):模型把 notes/issues 输出成
+    // 「内嵌 JSON 数组的字符串」("[\"...\", \"...\"]"),严格 Vec<String> 反序列化
+    // 报 invalid type: string, expected a sequence → 整条 JSON 通道作废 →
+    // fail-closed 判 Fail,一份自评 pass 的合格方案被杀、62 分钟任务零后段产出。
+    // 归一化对 verdict/retryable 语义零影响,只修输入形状。
+    for key in ["issues", "notes"] {
+        if let Some(val) = obj.get(key) {
+            match val {
+                serde_json::Value::String(s) => {
+                    let normalized = serde_json::from_str::<Vec<String>>(s)
+                        .map(|items| {
+                            serde_json::Value::Array(
+                                items.into_iter().map(serde_json::Value::String).collect(),
+                            )
+                        })
+                        .unwrap_or_else(|_| serde_json::json!([s]));
+                    obj.insert(key.to_string(), normalized);
+                }
+                // null 对 Vec<String> 不是缺省(#[serde(default)] 只管缺失不管 null),
+                // 必须移除键走缺省空数组。
+                serde_json::Value::Null => {
+                    obj.remove(key);
+                }
+                _ => {}
+            }
+        }
+    }
+    // suggestion/evidence 的反向形状问题(数组/数字/null)一并兜底:
+    // 数组 join、标量转字符串、null 移除键走缺省空串。
+    for key in ["suggestion", "evidence"] {
+        if let Some(val) = obj.get(key) {
+            match val {
+                serde_json::Value::Array(_) => {
+                    let joined = val
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default();
+                    obj.insert(key.to_string(), serde_json::Value::String(joined));
+                }
+                serde_json::Value::Null => {
+                    obj.remove(key);
+                }
+                serde_json::Value::String(_) => {}
+                other => {
+                    obj.insert(key.to_string(), serde_json::Value::String(other.to_string()));
+                }
+            }
+        }
+    }
     Some(v.to_string())
 }
 
@@ -1067,9 +1121,53 @@ mod tests {
         );
     }
 
+    /// 实测故障(2026-10-13 闲鱼任务,llaew_20261013_084832.log 09:51:26):
+    /// 模型把 notes 输出成「内嵌 JSON 数组的字符串」,严格反序列化失败 →
+    /// fail-closed 判 Fail → 合格方案被杀、任务以 failed 收口。
+    /// 归一化后必须按数组展开,verdict/retryable 语义不受影响。
     #[test]
-    fn parse_quality_report_text_fallback_no_strong_signal_fails_closed() {
-        // 无强信号关键词 → 仍 fail-closed(避免误判)
+    fn qc_notes_as_embedded_json_array_string_is_normalized() {
+        let text = r#"{"verdict":"pass","source":"main","issues":[],"notes":"[\"wf-1 占位\",\"wf-3 放宽口径未量化\"]","suggestion":"","retryable":false,"evidence":"结构齐全"}"#;
+        let r = parse_quality_report(text, AgentRole::MainWork).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass, "notes 形状修复后不得 fail-closed");
+        assert_eq!(r.notes.len(), 2, "内嵌 JSON 数组字符串应展开为 2 条 notes");
+        assert!(r.notes[0].contains("占位"));
+        assert!(!r.retryable);
+    }
+
+    /// 同上形态的 issues 字符串化也要容错(阻断缺陷不能因为形状问题丢失)。
+    #[test]
+    fn qc_issues_as_plain_string_is_wrapped() {
+        let text = r#"{"verdict":"fail","source":"subagent","issues":"产物文件不存在","notes":"无","suggestion":"重新生成","retryable":true,"evidence":"Read 失败"}"#;
+        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.issues, vec!["产物文件不存在".to_string()]);
+        assert_eq!(r.notes, vec!["无".to_string()]);
+        assert!(r.retryable);
+    }
+
+    /// suggestion/evidence 输出成数组或数字时同样兜底,不再整条作废。
+    #[test]
+    fn qc_suggestion_and_evidence_shape_normalized() {
+        let text = r#"{"verdict":"pass","source":"plan","issues":[],"notes":[],"suggestion":["改用绝对路径","补充验收"],"retryable":false,"evidence":123}"#;
+        let r = parse_quality_report(text, AgentRole::Plan).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.suggestion, "改用绝对路径 补充验收");
+        assert_eq!(r.evidence, "123");
+    }
+
+    /// null 形状归一化为缺省空数组,不阻断解析。
+    #[test]
+    fn qc_null_array_fields_default_to_empty() {
+        let text = r#"{"verdict":"pass","source":"plan","issues":null,"notes":null,"suggestion":null,"retryable":false,"evidence":null}"#;
+        let r = parse_quality_report(text, AgentRole::Plan).unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert!(r.issues.is_empty() && r.notes.is_empty());
+        assert!(r.suggestion.is_empty() && r.evidence.is_empty());
+    }
+
+    #[test]
+    fn parse_quality_report_text_fallback_no_strong_signal_fails_closed() {        // 无强信号关键词 → 仍 fail-closed(避免误判)
         let text = "今天天气很好,适合出门散步";
         let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
         assert!(format!("{err}").contains("JSON"));

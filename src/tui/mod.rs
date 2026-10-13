@@ -117,6 +117,12 @@ pub struct TuiSession {
     /// TODO 任务清单状态(第二十轮候选 5,2026-09-21):SubAgent 显式跟踪多步任务进度。
     /// 与 TodoWrite tool 共享同一全局实例(也允许直接在 TuiSession 中持有独立实例)。
     pub todo_state: std::sync::Arc<TodoState>,
+    /// 后台调试报告接收槽(第 164 轮):--debug 模式下 Debug Agent 的 LLM 评估
+    /// 真实网关可达数分钟,同步阻塞输入循环曾造成「任务结束后 TUI 数分钟无响应」
+    /// (实测 155s/194s)。改为 tokio::spawn 后台执行,完成经 oneshot 回传,
+    /// 主循环每轮 read_line 前 drain 打印结果;退出时有界等待(20s,
+    /// `LAEW_DEBUG_SYNC=1` 恢复旧同步行为)。
+    pub pending_debug: Vec<tokio::sync::oneshot::Receiver<Result<std::path::PathBuf, String>>>,
 }
 
 /// 清理外部工具/模型输出中的终端控制序列,供 `-p` 与 TUI 共用。
@@ -185,6 +191,7 @@ impl TuiSession {
             skill_registry,
             session_id: skill_session_id,
             todo_state,
+            pending_debug: Vec::new(),
         })
     }
 
@@ -572,6 +579,10 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
                 break;
             }
 
+            // 第 164 轮:收割已完成的后台调试报告。此刻上一轮 dispatch 已结束、
+            // 新一轮输入面板尚未建立(read_line 内部 enter_pinned),println 安全。
+            session.drain_finished_debug();
+
             // 每行输入前重扫自定义命令目录(D2):命令文件增删即时生效,无需重启
             completion_engine.reload_custom(&session.paths.work_dir);
             // 第 136 轮:原先这里是 `read_line(...)?`,一旦 read_line 返回 Err
@@ -642,6 +653,8 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
         let stdin = io::stdin();
         let mut handle = stdin.lock();
         loop {
+            // 第 164 轮:非 TTY 路径同样收割后台调试报告(与 TTY 主循环同口径)。
+            session.drain_finished_debug();
             let mut buf: Vec<u8> = Vec::new();
             match handle.read_until(b'\n', &mut buf) {
                 Ok(0) => break, // EOF
@@ -666,6 +679,9 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
     }
     // 第 108 轮:TUI 主循环退出 → 统一终端还原(任何退出路径都执行,
     // 包括 Ctrl+C / Ctrl-D / Ctrl+Z 被拦截后 / 正常 /exit / shutdown 信号触发)。
+    // 第 164 轮:先对有界等待后台调试报告(≤20s,LAEW_DEBUG_SYNC=1 时为同步
+    // 路径、此处无待收报告),再还原终端 —— 报告落盘信息必须在终端还原前打印。
+    session.finish_pending_debug_on_exit().await;
     crate::shutdown::terminal_restore().await;
     // 第 136 轮:显式回收浏览器子进程。
     //

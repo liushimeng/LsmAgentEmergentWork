@@ -32,6 +32,9 @@ use form_ctl::{act_select_dropdown, act_select_option};
 // 仅测试与兄弟模块经 control::pick_element_js 路径引用,非 test 构建下 mod.rs 自身不用。
 #[allow(unused_imports)]
 pub(super) use form_ctl::pick_element_js;
+// 第 164 轮:probe_element_js / confirm_panel_js 同口径再导出(测试与序列/action 分发引用)。
+#[allow(unused_imports)]
+pub(super) use form_ctl::{confirm_panel_js, probe_element_js};
 
 // =================== 第 99 轮:eval_js / screenshot / download 效能与健壮性辅助 ===================
 

@@ -5,7 +5,6 @@
 //! debug 报告 / 终态打印 / transcript 记录),以及结果渲染 `print_*` 家族。
 
 use std::io::Write;
-use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -725,17 +724,16 @@ impl TuiSession {
             // 进度提示再生成,消除「任务已结束但终端静默」的假死观感;用户中断
             // (Ctrl-C)时进一步跳过 LLM 评估,改本地骨架秒级落盘 —— 实测事故:
             // 取消后评估阻塞 4 分钟且不可取消,TUI 一直停在「正在取消当前任务...」。
+            // 第 164 轮:同步等待本身即「TUI 数分钟无响应」的根源(实测 155s/194s,
+            // 期间输入循环整体冻结,第二次输入与 /exit 严重卡顿)。默认改为后台
+            // tokio::spawn,完成经 oneshot 回传、主循环 read_line 前收割打印;
+            // 退出时有界等待 20s;`LAEW_DEBUG_SYNC=1` 恢复旧同步行为。
             let interrupted = matches!(
                 &handle_result,
                 Err(crate::error::AgentError::Cancelled)
             ) || shutdown_sig.is_triggered();
-            if interrupted {
-                println!("  [debug] 任务被用户中断,生成快速调试报告(跳过 LLM 评估)...");
-            } else {
-                println!("  [debug] 任务结束,正在生成调试报告(LLM 评估,可能需要 1-2 分钟)...");
-            }
-            self.emit_debug_report(
-                collector,
+            self.spawn_debug_report(
+                collector.clone(),
                 raw_llm.clone(),
                 effective_prompt,
                 &handle_result,
@@ -1027,10 +1025,16 @@ impl TuiSession {
 
     /// debug 模式:任务结束后调用 Debug Agent 评估并落盘报告(失败仅打印,不影响主流程)。
     /// `interrupted=true`(第 132 轮)时跳过 LLM 评估,本地骨架秒级落盘。
-    async fn emit_debug_report(
-        &self,
-        collector: &Arc<DebugCollector>,
-        raw_llm: Arc<dyn crate::llm::LlmClient>,
+    /// 第 164 轮:Debug 报告生成入口 —— 默认后台化,`LAEW_DEBUG_SYNC=1` 恢复同步。
+    ///
+    /// 拆分原则:`record_task_end` + meta 组装是微秒级同步动作,留在调用线程;
+    /// `finalize_report`(Debug Agent LLM 评估,真实网关分钟级)tokio::spawn
+    /// 后台执行。完成经 oneshot 回传 `Result<PathBuf,String>`,由主循环
+    /// `drain_finished_debug` 收割打印(此刻输入面板未建立,println 安全)。
+    async fn spawn_debug_report(
+        &mut self,
+        collector: std::sync::Arc<DebugCollector>,
+        raw_llm: std::sync::Arc<dyn crate::llm::LlmClient>,
         task: &str,
         handle_result: &std::result::Result<OrchestrationOutcome, crate::error::AgentError>,
         interrupted: bool,
@@ -1068,16 +1072,115 @@ impl TuiSession {
             interrupted,
         };
         let report_dir = crate::artifact_root::artifact_dir("DebugReport");
-        match finalize_report(collector, raw_llm, &report_dir, &meta).await {
-            Ok(path) => println!(
-                "{}",
-                pathfmt::fit_line(
-                    "  [debug] 报告已生成: ",
-                    &pathfmt::display_path(&self.paths, &path),
-                    ""
-                )
-            ),
-            Err(e) => eprintln!("  [debug] 报告生成失败: {e}"),
+
+        // `LAEW_DEBUG_SYNC=1`:恢复第 132 轮同步行为(测试/确定性场景逃生口)。
+        let sync_env = matches!(
+            std::env::var("LAEW_DEBUG_SYNC").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        );
+        if sync_env {
+            if interrupted {
+                println!("  [debug] 任务被用户中断,生成快速调试报告(跳过 LLM 评估)...");
+            } else {
+                println!("  [debug] 任务结束,正在生成调试报告(LLM 评估,可能需要 1-2 分钟)...");
+            }
+            match finalize_report(&collector, raw_llm, &report_dir, &meta).await {
+                Ok(path) => println!(
+                    "{}",
+                    pathfmt::fit_line(
+                        "  [debug] 报告已生成: ",
+                        &pathfmt::display_path(&self.paths, &path),
+                        ""
+                    )
+                ),
+                Err(e) => eprintln!("  [debug] 报告生成失败: {e}"),
+            }
+            return;
+        }
+
+        // 后台路径:同步动作已做完,LLM 评估进后台任务。
+        if interrupted {
+            println!("  [debug] 任务被用户中断,后台生成快速调试报告(跳过 LLM 评估)...");
+        } else {
+            println!("  [debug] 任务结束,调试报告后台生成中(Debug Agent LLM 评估约 1-3 分钟,完成后于下次交互时提示;退出时最多等待 20s)...");
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let res = finalize_report(&collector, raw_llm, &report_dir, &meta)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+        self.pending_debug.push(rx);
+    }
+
+    /// 收割已完成的后台调试报告(第 164 轮)。由主循环每轮 read_line 前调用 —
+    /// 此刻上一轮 dispatch 已结束、新一轮输入面板尚未建立,println 安全。
+    pub(crate) fn drain_finished_debug(&mut self) {
+        if self.pending_debug.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_debug);
+        for mut rx in pending {
+            match rx.try_recv() {
+                Ok(Ok(path)) => println!(
+                    "{}",
+                    pathfmt::fit_line(
+                        "  [debug] 报告已生成: ",
+                        &pathfmt::display_path(&self.paths, &path),
+                        ""
+                    )
+                ),
+                Ok(Err(e)) => eprintln!("  [debug] 报告生成失败: {e}"),
+                // 任务异常终止(sender 已 drop 且未发值):提示但不阻塞。
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    eprintln!("  [debug] 报告生成任务异常终止(trace 已采集)");
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    self.pending_debug.push(rx);
+                }
+            }
+        }
+    }
+
+    /// 退出时的有界等待(第 164 轮):后台报告整体 20s 超时;超时如实告知并放弃
+    /// (trace 已采集,需要完整报告可用 LAEW_DEBUG_SYNC=1 重跑)。
+    pub(crate) async fn finish_pending_debug_on_exit(&mut self) {
+        if self.pending_debug.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_debug);
+        eprintln!("  [debug] 等待后台调试报告完成(最长 20 秒)...");
+        let wait = async move {
+            let mut results = Vec::new();
+            for rx in pending {
+                results.push(rx.await);
+            }
+            results
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(20), wait).await {
+            Ok(results) => {
+                for r in results {
+                    match r {
+                        Ok(Ok(path)) => println!(
+                            "{}",
+                            pathfmt::fit_line(
+                                "  [debug] 报告已生成: ",
+                                &pathfmt::display_path(&self.paths, &path),
+                                ""
+                            )
+                        ),
+                        Ok(Err(e)) => eprintln!("  [debug] 报告生成失败: {e}"),
+                        Err(_) => eprintln!("  [debug] 报告生成任务异常终止(trace 已采集)"),
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "  [debug] 等待超时(20s),调试报告未写完即退出(trace 已采集;\
+                     需要完整报告请用 LAEW_DEBUG_SYNC=1 恢复同步生成)"
+                );
+            }
         }
     }
 

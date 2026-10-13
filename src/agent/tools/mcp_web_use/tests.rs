@@ -2438,6 +2438,34 @@ fn select_dropdown_in_spawn_page_whitelist() {
     );
 }
 
+// =================== 第 164 轮:probe_element_js / confirm_panel_js ===================
+
+#[test]
+fn probe_element_js_is_find_only() {
+    // 第 164 轮选项优先通道:probe 只做查找,绝不允许点击/滚动副作用,
+    // 否则「先探测再决策」会把选项误点掉(组件库 toggle 语义)。
+    let js = super::control::probe_element_js("北京", Some("div.areaWrap"), true);
+    assert!(!js.contains(".click()"), "probe 不得包含点击副作用");
+    assert!(!js.contains("scrollIntoView"), "probe 不得滚动页面");
+    assert!(js.contains("found: false"), "probe 应返回 found 标记");
+    assert!(js.contains("found: true"), "probe 命中分支应返回 found 标记");
+    assert!(js.contains("matched_but_hidden"), "probe 复用同一套诊断语义");
+    assert!(js.contains("querySelector(\"div.areaWrap\")"), "probe 应尊重 scope 限定");
+}
+
+#[test]
+fn confirm_panel_js_guards_unscoped_click() {
+    // 无显式 scope 时必须要求「面板状」容器祖先,防止误点页面级提交按钮
+    let js = super::control::confirm_panel_js(None);
+    assert!(js.contains("确定") && js.contains("完成"), "确认词表应含常见文案");
+    assert!(js.contains("position === 'fixed'"), "应识别 fixed 定位面板");
+    assert!(js.contains("role"), "应识别 role=dialog/listbox 面板");
+    // 有显式 scope 时信任范围,不再要求面板状祖先
+    let scoped = super::control::confirm_panel_js(Some("div.panel"));
+    assert!(scoped.contains("const scoped = true"), "显式 scope 应走信任路径");
+    assert!(scoped.contains("querySelector(\"div.panel\")"), "scope 应注入脚本");
+}
+
 // =================== 第 159 轮:注入 JS 语法缺陷回归测试 ===================
 
 /// wait(selector) 脚本必须整体 `(async () => …)()` 包裹。
