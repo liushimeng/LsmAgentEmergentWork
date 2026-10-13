@@ -53,11 +53,11 @@ pub(super) fn print_human_assist_prompt_with_cursor(req: &HumanAssistDisplay, el
         "  \x1b[36m│\x1b[0m 说明: {}\n",
         req.message.replace('\n', " ")
     ));
-    // 第 132 轮:验证码现场截图路径(弹窗/GUI 内直接展示;TUI 兜底打印路径,
+    // 2026-10-13:显式附图路径(弹窗不再渲染图片;TUI 兜底打印路径,
     // macOS `open <path>` / Windows `start <path>` 可查看原图)
     if !req.image_path.is_empty() {
         out.push_str(&format!(
-            "  \x1b[36m│\x1b[0m 🖼 验证码图片: {}\n",
+            "  \x1b[36m│\x1b[0m 🖼 附图: {}\n",
             pathfmt::elide_middle(&req.image_path, 56)
         ));
     }
@@ -327,10 +327,10 @@ pub fn print_human_assist_gui_notice(
             pathfmt::elide_middle(&req.url, 72)
         ));
     }
-    // 第 132 轮:弹窗内已展示验证码图片时,同步把路径摆到台面(可 `open` 查看放大图)
+    // 2026-10-13:显式附图路径摆到台面(可 `open` 查看原图;弹窗不再渲染图片)
     if !req.image_path.is_empty() {
         out.write_line(&format!(
-            "  [laew]   🖼 验证码图片: {}",
+            "  [laew]   🖼 附图: {}",
             pathfmt::elide_middle(&req.image_path, 72)
         ));
     }
@@ -362,6 +362,13 @@ pub fn print_assist_event(ev: &AssistEvent, out: AssistOut) {
                 format!("  [laew] 人工已在弹窗延长等待 +{} 秒", added_ms / 1000)
             }
         }
+        AssistEvent::GuiGuardToggled { id: _, unlock } => {
+            if *unlock {
+                "  [laew] 人工已在弹窗解除页面屏蔽(整页开放)".to_string()
+            } else {
+                "  [laew] 人工已在弹窗恢复页面屏蔽".to_string()
+            }
+        }
         AssistEvent::TuiEscapeAnswered { id, text } => match text {
             Some(t) => format!("  [laew] 已收到人工输入(终端 {HITL_ESCAPE_PREFIX}):{t}"),
             None => format!(
@@ -385,6 +392,7 @@ mod human_assist_tui_tests {
             url: String::new(),
             page_id: "p_1".into(),
             image_path: String::new(),
+            guard_unlocked: false,
             timeout_ms: 120_000,
             prompt_visual_width: 84,
             created_at_ms: 0,

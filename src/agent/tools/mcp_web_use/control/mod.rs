@@ -1212,9 +1212,35 @@ pub const HUMAN_ASSIST_ALLOWED_REASONS: &[&str] = &[
     "custom",
 ];
 
-/// 第 133 轮:附图决策与采集迁入 `captcha_crop` 子模块(验证码元素裁剪优先，
-/// 视口兜底);此处再导出保持 `control::hitl_image_plan` 外部路径零改动。
-pub use super::captcha_crop::{hitl_image_plan, HitlImagePlan};
+/// 2026-10-13:人工介入附图决策(原 `captcha_crop` 子模块的 `HitlImagePlan`/
+/// `hitl_image_plan`,随弹窗验证码功能移除一并收口到此处)。
+///
+/// 弹窗已不渲染图片,自动截图采集链整链删除;仅保留**显式** `params.image_path`
+/// 透传(TUI 兜底打印路径供 `open` 查看)。返回 `(计划, 来源标签)` 供信封对账。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HitlImagePlan {
+    /// 使用显式路径(已确认文件存在)。
+    Explicit(String),
+    /// 不附图。
+    None,
+}
+
+pub fn hitl_image_plan(reason: &str, explicit: Option<&str>) -> (HitlImagePlan, &'static str) {
+    match explicit {
+        Some(path) if !path.trim().is_empty() => {
+            if std::path::Path::new(path.trim()).is_file() {
+                (HitlImagePlan::Explicit(path.trim().to_string()), "explicit")
+            } else {
+                // 显式指定但文件不存在:忽略并标注,fail-open 不阻断提问
+                (HitlImagePlan::None, "explicit_missing")
+            }
+        }
+        _ => {
+            let _ = reason; // 历史形参保留(调用点契约零改动);reason 不再影响附图
+            (HitlImagePlan::None, "none")
+        }
+    }
+}
 
 /// 把 reason 列表渲染成斜杠分隔字符串(用于错误消息/工具 Schema 描述)。
 pub fn human_assist_reasons_doc() -> String {
@@ -1254,13 +1280,47 @@ async fn apply_hitl_unlock(
     Some(super::unlock_zone::spawn_unlock_reassert(page.clone(), cfg))
 }
 
+/// HITL 解锁判定 + 页面实际态快照(2026-10-13 抽出,供解锁决策与弹窗「解除屏蔽/
+/// 恢复屏蔽」切换按钮初始标题共用,避免对同一页重复 eval)。
+///
+/// 返回 (是否需要解锁, 页面实际态快照):locked/partial → 需要;open/未装 JS →
+/// 不需要。JS 态缺失(guard 脚本注入完全失败)时 CDP 输入锁 fail-closed 兜底
+/// 可能仍在场 —— 退回全局期望态判断(此情形下页面没有独立态可读)。
+async fn hitl_unlock_need_and_snapshot(
+    id: &str,
+) -> (
+    bool,
+    Option<crate::agent::browser_overlay::PageGuardConfig>,
+) {
+    use crate::agent::browser_overlay::PageGuardMode;
+    match crate::agent::browser::BrowserManager::global().page(id).await {
+        Some(page) => {
+            let snap = super::unlock_zone::page_guard_snapshot(&page).await;
+            let needs = match snap.as_ref() {
+                Some(c) => {
+                    matches!(c.mode, PageGuardMode::Locked | PageGuardMode::Partial)
+                }
+                None => {
+                    crate::agent::browser::BrowserManager::global()
+                        .current_guard()
+                        .await
+                        .mode
+                        != PageGuardMode::Open
+                }
+            };
+            (needs, snap)
+        }
+        None => (false, None),
+    }
+}
+
 /// control_action=request_human:人工介入请求(HITL 闭环)。
 ///
-/// 流程:可选 `bring_to_front`(默认 true)把浏览器窗口带到前台 → 第 132 轮:
-/// 解析附图(显式 `params.image_path` 优先,`reason=captcha` 自动 CDP 视口截图,
-/// 弹窗内直接展示验证码图片)→ 经 HumanAssistHub 发起结构化提问
-/// (macOS/Windows 桌面**弹窗优先**(第 130 轮,置顶+倒计时+时间轴+可选中复制,
-/// `-p` 模式同样可弹),TUI 兜底行读)→ oneshot 回填。
+/// 流程:可选 `bring_to_front`(默认 true)把浏览器窗口带到前台 → 附图仅显式
+/// `params.image_path` 透传(2026-10-13 起弹窗不再渲染图片,自动验证码截图链已删)
+/// → 经 HumanAssistHub 发起结构化提问
+/// (macOS/Windows 桌面**弹窗优先**(第 130 轮,置顶+倒计时+时间轴+可选中复制+
+/// 「解除屏蔽/恢复屏蔽」互切按钮),TUI 兜底行读)→ oneshot 回填。
 /// 返回专用信封:
 /// - code=0:`data.human_response` 为人工输入(选项文本或自由文本),
 ///   `data.assist_channel` 标注应答通道(gui/tui);
@@ -1356,26 +1416,21 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     let mut unlock_verify: &str = "none";
     let mut unlock_reassert: Option<tokio::task::JoinHandle<()>> = None;
     let mut unlock_snapshot: Option<crate::agent::browser_overlay::PageGuardConfig> = None;
+    // 2026-10-13:解锁判定 + 页面实际态快照一次评估,供解锁决策与弹窗「解除屏蔽/
+    // 恢复屏蔽」切换按钮初始标题共用(避免对同一页重复 eval)。
+    let unlock_need = if unlock_page {
+        hitl_unlock_need_and_snapshot(id).await
+    } else {
+        (false, None)
+    };
     let unlock_applied = unlock_page
         && crate::agent::browser::BrowserManager::global().guard_visuals_active().await
         && match crate::agent::browser::BrowserManager::global().page(id).await {
             Some(page) => {
-                let snap = super::unlock_zone::page_guard_snapshot(&page).await;
+                let (needs_unlock, snap) = unlock_need.clone();
                 // 页面实际态优先:locked/partial 才放行,已是 open/未装 JS → 无需。
                 // JS 态缺失(guard 脚本注入完全失败)时 CDP 输入锁 fail-closed 兜底
                 // 可能仍在场 —— 退回全局期望态判断(此情形下页面没有独立态可读)。
-                let needs_unlock = match snap.as_ref() {
-                    Some(c) => matches!(
-                        c.mode,
-                        crate::agent::browser_overlay::PageGuardMode::Locked
-                            | crate::agent::browser_overlay::PageGuardMode::Partial
-                    ),
-                    None => crate::agent::browser::BrowserManager::global()
-                        .current_guard()
-                        .await
-                        .mode
-                        != crate::agent::browser_overlay::PageGuardMode::Open,
-                };
                 if !needs_unlock {
                     false
                 } else {
@@ -1448,29 +1503,90 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     // 下面那张自动附图截到的是空白区域,人工看不出要做什么;而 locked 档
     // `Input.setIgnoreInputEvents` 连滚轮一起拦,人工也滚不过去。fail-open。
     let challenge_scrolled = challenge_selector.clone();
-    // 第 133 轮:验证码现场截图 —— 显式 params.image_path 优先;reason=captcha
-    // 自动采集(验证码元素裁剪优先,整视口兜底,见 captcha_crop);弹窗直接展示
-    // 图片,人工不必切去浏览器找图。fail-open:截图失败按无图继续,绝不阻断提问。
+    // 2026-10-13:弹窗验证码相关功能移除 —— 不再自动采集验证码截图(自动采集链已删);
+    // 显式 `params.image_path` 仍透传(TUI 兜底打印路径供 `open`)。
     let (image_path, image_source, image_mode, image_clip) = {
         let (plan, source) = hitl_image_plan(reason, str_arg(p, "image_path"));
         match plan {
             HitlImagePlan::Explicit(path) => (path, source, "explicit", Value::Null),
-            HitlImagePlan::Auto => match super::captcha_crop::capture_hitl_screenshot(id).await {
-                Ok((path, mode, clip)) => (
-                    path,
-                    mode,
-                    "auto",
-                    clip.map(|c| c.to_json()).unwrap_or(Value::Null),
-                ),
-                Err(_) => (String::new(), "auto_failed", "none", Value::Null),
-            },
             HitlImagePlan::None => (String::new(), source, "none", Value::Null),
         }
     };
 
+    // 2026-10-13:弹窗「解除屏蔽/恢复屏蔽」互切按钮的页面管控执行器。人工在弹窗
+    // 点切换按钮 → 子进程 stdout guard 中间行 → hub.guard_toggle_from_ui → 本
+    // handler(同步闭包,内部 tokio::spawn 落页):
+    // - unlock=true → 整页 open(apply_hitl_unlock 内含导航重放协程,句柄存入
+    //   manual_reassert,收口时必须 abort,否则会把恢复 locked 的页重新顶开);
+    // - unlock=false → abort 手动重放 + 按本页解锁前快照恢复(缺失回退全局配置)。
+    let manual_reassert: std::sync::Arc<
+        std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let page_id_g = id.to_string();
+        let snapshot_g = unlock_snapshot.clone();
+        let manual_reassert_g = manual_reassert.clone();
+        let hub = crate::agent::human_assist::HumanAssistHub::global();
+        hub.set_guard_toggle_handler(Some(std::sync::Arc::new(move |unlock| {
+            let page_id = page_id_g.clone();
+            let snap = snapshot_g.clone();
+            let manual_reassert = manual_reassert_g.clone();
+            tokio::spawn(async move {
+                let mgr = crate::agent::browser::BrowserManager::global();
+                let Some(page) = mgr.page(&page_id).await else { return };
+                if unlock {
+                    if let Some(handle) = apply_hitl_unlock(&page, &[]).await {
+                        let mut slot =
+                            manual_reassert.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(old) = slot.replace(handle) {
+                            old.abort();
+                        }
+                    }
+                } else {
+                    if let Some(old) =
+                        manual_reassert.lock().unwrap_or_else(|p| p.into_inner()).take()
+                    {
+                        old.abort();
+                    }
+                    let cfg = match snap {
+                        Some(c) => c,
+                        None => mgr.current_guard().await,
+                    };
+                    let _ =
+                        crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
+                }
+            });
+        })));
+    }
+
+    // 2026-10-13:弹窗切换按钮初始标题依据 —— 页面本就已放行(open/无管控)则显示
+    // 「🔒 恢复屏蔽」,locked/partial 显示「🔓 解除屏蔽」。
+    let guard_unlocked = !unlock_need.0;
+
     let outcome = crate::agent::human_assist::HumanAssistHub::global()
-        .request(reason, &message, options.clone(), &url, id, timeout_ms, &image_path)
+        .request(
+            reason,
+            &message,
+            options.clone(),
+            &url,
+            id,
+            timeout_ms,
+            &image_path,
+            guard_unlocked,
+        )
         .await;
+    // 2026-10-13:收口即清除弹窗切换 handler(防陈旧 handler 泄漏到下一请求;
+    // hub 清槽路径另有防御性清除,双保险)。
+    crate::agent::human_assist::HumanAssistHub::global().set_guard_toggle_handler(None);
+    // 2026-10-13:人工手动解锁触发的导航重放协程一并收口(否则会把下面的恢复动作
+    // 重新顶开)。
+    if let Some(handle) = manual_reassert
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    {
+        handle.abort();
+    }
     // 第 143/144/167 轮:人工介入收口(应答/超时/取消/不可用)后恢复管控
     // —— 无论何种结局,「人工可操作窗口」都必须关闭:先回收导航重放协程(防恢复后
     // 又被重放覆盖),再恢复原档。第 167 轮:恢复态取**本页解锁前实际态快照**
@@ -1519,7 +1635,8 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                         "verify": unlock_verify,
                         "challenge": challenge_selector,
                     }),
-                    // 第 132/133 轮:附图对账(人工读的是哪张图 / 元素裁剪 or 整视口)
+                    // 2026-10-13:附图对账(仅显式 image_path 透传;弹窗不再渲染图片,
+                    // 自动采集链已删,TUI 兜底打印路径供 open)
                     "image_path": image_path,
                     "image_source": image_source,
                     "image_mode": image_mode,

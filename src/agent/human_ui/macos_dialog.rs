@@ -73,9 +73,6 @@ const NS_BACKING_STORE_BUFFERED: i64 = 2;
 const NS_FLOATING_WINDOW_LEVEL: i64 = 3; // kCGFloatingWindowLevel
 const NS_BEZEL_BORDER: u64 = 2;
 const NS_ROUNDED_BEZEL_STYLE: i64 = 1;
-const NS_IMAGE_SCALE_PROPORTIONALLY_DOWN: i64 = 3;
-/// NSImageScaling:按原始像素 1:1(过大时不缩小)—— 第 152 轮「🔍 放大」用。
-const NS_IMAGE_SCALE_PROPORTIONALLY_UP_OR_DOWN: i64 = 0;
 const NS_EVENT_TYPE_APPLICATION_DEFINED: i64 = 15;
 
 /// `objc_msgSend` 按具体签名逐形状包装(见模块文档)。
@@ -102,11 +99,9 @@ msg!(send_id_f64_id_sel_id_bool, (t: f64, tgt: Id, act: Sel, info: Id, repeats: 
 msg!(send_id_i64_point_u64_f64_i64_id_i16_i64_i64, (
     ty: i64, loc: NSPoint, flags: u64, ts: f64, win: i64, ctx: Id, sub: i16, d1: i64, d2: i64
 ) -> Id);
-msg!(send_bool, () -> bool);
 msg!(send_bool_id, (arg: Id) -> bool);
 msg!(send_i64, () -> i64);
 msg!(send_usize, () -> usize);
-msg!(send_size, () -> NSSize);
 msg!(send_cstr, () -> *const c_char);
 msg!(send_void, () -> ());
 msg!(send_void_id, (arg: Id) -> ());
@@ -158,9 +153,9 @@ unsafe fn ns_str(s: &str) -> Id {
 
 // ---------- 布局单一真源 ----------
 
-// 第 145 轮:W 560→680 —— 底行从五按钮扩为六按钮(新增「⏱ +2分钟」延长等待),
-// 左组 取消/提交·继续/⏱+2分钟 = 300pt,右组 复制/查看原图/最大化 = 322pt,
-// 560 内容宽装不下;680 下两组间距 42pt,小屏(1280 宽)仍远小于工作区。
+// 2026-10-13:底行七键位从左到右 = 取消/继续/⏱+2分钟/解除屏蔽·恢复屏蔽(互切)
+// ‖ 📋复制/⛶最大化(右组)。验证码图片区与「🔍 放大」已随验证码功能移除。
+// 左组 16+84+8+96+8+88+8+96 = 404,右组 92+8+104 = 204 起始 460,间距 56。
 const W: f64 = 680.0;
 const PAD: f64 = 16.0;
 const TITLE_H: f64 = 22.0;
@@ -169,15 +164,14 @@ const INPUT_H: f64 = 28.0;
 const BTN_H: f64 = 30.0;
 const GAP: f64 = 8.0;
 const CANCEL_W: f64 = 84.0;
-/// 第 145 轮:84→96,容纳双语义标题「提交 / 继续」(空输入=选项1「我已完成,
-/// Agent 接管」;有输入=提交验证码/动态码文本 —— 人机交互收口动作显性化)。
+/// 主按钮「继续」(空输入=选项1交棒;有输入=把补充说明交给 Agent)。
 const SUBMIT_W: f64 = 96.0;
 const EXTEND_W: f64 = 88.0;
+/// 2026-10-13:「解除屏蔽/恢复屏蔽」互切按钮。
+const GUARD_W: f64 = 96.0;
 const COPY_W: f64 = 92.0;
-const ORIG_W: f64 = 110.0;
 const ZOOM_W: f64 = 104.0;
 const INNER: f64 = 8.0;
-const IMG_HINT_H: f64 = 14.0;
 
 /// 复制按钮的两个标题(第 139 轮:一键复制全部信息,免去在倒计时行里拖选)。
 const COPY_BTN_TITLE: &str = "📋 复制";
@@ -185,11 +179,10 @@ const COPY_BTN_DONE: &str = "✓ 已复制";
 /// 「✓ 已复制」保持时长(秒);由既有 1s 倒计时 tick 负责回滚。
 const COPY_FEEDBACK_SECS: u64 = 2;
 
-/// 一组布局参数(说明区高 / 图区高;img_h = 0 表示无图)。
+/// 一组布局参数(说明区高)。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Geometry {
     msg_h: f64,
-    img_h: f64,
 }
 
 /// 各控件的目标 frame(自顶向下排布;AppKit y 轴自底向上,存的是最终坐标)。
@@ -197,8 +190,6 @@ struct Geometry {
 struct Frames {
     title: NSRect,
     msg: NSRect,
-    image: Option<NSRect>,
-    img_hint: Option<NSRect>,
     t1: NSRect,
     t2: NSRect,
     input: NSRect,
@@ -206,8 +197,8 @@ struct Frames {
     cancel: NSRect,
     submit: NSRect,
     extend: NSRect,
+    guard: NSRect,
     copy: NSRect,
-    orig: NSRect,
     zoom: NSRect,
 }
 
@@ -226,16 +217,6 @@ fn layout_frames(cw: f64, ch: f64, geo: Geometry, opt_count: usize) -> Frames {
     };
     let title_y = place(TITLE_H);
     let msg_y = place(geo.msg_h);
-    let (image, img_hint) = if geo.img_h > 0.0 {
-        let iy = place(geo.img_h);
-        let hy = place(IMG_HINT_H);
-        (
-            Some(ns_rect(PAD, iy, text_w, geo.img_h)),
-            Some(ns_rect(PAD, hy, text_w, IMG_HINT_H)),
-        )
-    } else {
-        (None, None)
-    };
     let t1_y = place(LINE_H);
     let t2_y = place(LINE_H);
     let input_y = place(INPUT_H);
@@ -247,8 +228,6 @@ fn layout_frames(cw: f64, ch: f64, geo: Geometry, opt_count: usize) -> Frames {
     Frames {
         title: ns_rect(PAD, title_y, text_w, TITLE_H),
         msg: ns_rect(PAD, msg_y, text_w, geo.msg_h),
-        image,
-        img_hint,
         t1: ns_rect(PAD, t1_y, text_w, LINE_H),
         t2: ns_rect(PAD, t2_y, text_w, LINE_H),
         input: ns_rect(PAD, input_y, text_w, INPUT_H),
@@ -256,8 +235,13 @@ fn layout_frames(cw: f64, ch: f64, geo: Geometry, opt_count: usize) -> Frames {
         cancel: ns_rect(PAD, row_y, CANCEL_W, BTN_H),
         submit: ns_rect(PAD + CANCEL_W + INNER, row_y, SUBMIT_W, BTN_H),
         extend: ns_rect(PAD + CANCEL_W + INNER + SUBMIT_W + INNER, row_y, EXTEND_W, BTN_H),
-        copy: ns_rect(cw - PAD - ZOOM_W - INNER - ORIG_W - INNER - COPY_W, row_y, COPY_W, BTN_H),
-        orig: ns_rect(cw - PAD - ZOOM_W - INNER - ORIG_W, row_y, ORIG_W, BTN_H),
+        guard: ns_rect(
+            PAD + CANCEL_W + INNER + SUBMIT_W + INNER + EXTEND_W + INNER,
+            row_y,
+            GUARD_W,
+            BTN_H,
+        ),
+        copy: ns_rect(cw - PAD - ZOOM_W - INNER - COPY_W, row_y, COPY_W, BTN_H),
         zoom: ns_rect(cw - PAD - ZOOM_W, row_y, ZOOM_W, BTN_H),
     }
 }
@@ -265,23 +249,11 @@ fn layout_frames(cw: f64, ch: f64, geo: Geometry, opt_count: usize) -> Frames {
 /// 预算纯函数:由内容推出所需内容视图高(与 [`layout_frames`] 的消费序列逐项对应)。
 fn content_height(geo: Geometry, opt_count: usize) -> f64 {
     let mut consumed = TITLE_H + GAP + geo.msg_h + GAP;
-    if geo.img_h > 0.0 {
-        consumed += geo.img_h + GAP + IMG_HINT_H + GAP;
-    }
     consumed += (LINE_H + GAP) * 2.0;
     consumed += INPUT_H + GAP;
     consumed += opt_count as f64 * (BTN_H + GAP);
     consumed += BTN_H; // 底部按钮行(place 不再扣 GAP)
     consumed + PAD
-}
-
-/// 图区高:按图片纵横比适配文本宽,夹在 [60, cap]。
-fn image_height_for(ratio: f64, text_w: f64, cap: f64) -> f64 {
-    if ratio <= 0.0 {
-        0.0
-    } else {
-        (text_w * ratio).round().clamp(60.0, cap)
-    }
 }
 
 // ---------- 运行时状态(单弹窗进程,UI 线程独占) ----------
@@ -290,8 +262,6 @@ struct Views {
     window: Id,
     title: Id,
     msg_scroll: Id,
-    image: Option<Id>,
-    img_hint: Option<Id>,
     t1: Id,
     t2: Id,
     input: Id,
@@ -299,18 +269,14 @@ struct Views {
     cancel: Id,
     submit: Id,
     extend: Id,
+    guard: Id,
     copy: Id,
-    orig: Id,
     zoom: Id,
 }
 
 struct MacState {
     views: Views,
     options: Vec<String>,
-    /// 第 152 轮:原图尺寸(px)。「🔍 放大」按钮用它算 1:1 需要的滚动区提示。
-    image_px: Option<(i64, i64)>,
-    /// 第 152 轮:1:1 放大态(按钮切换,初始 false = 缩放适应)。
-    image_zoomed: bool,
     /// 「📋 复制」写入剪贴板的文本(第 139 轮:一键复制全部信息)。
     copy_payload: String,
     /// 「✓ 已复制」反馈的回滚时刻(由 `on_tick` 消费)。
@@ -321,10 +287,12 @@ struct MacState {
     started_at_ms: u64,
     /// 已点「⏱ +2分钟」次数(按钮标题 ×N 反馈,无回滚需求)。
     extend_count: u32,
+    /// 2026-10-13:页面当前是否处于放行态 —— 「解除屏蔽/恢复屏蔽」互切按钮的
+    /// 当前标题侧(false=标题「🔓 解除屏蔽」,true=「🔒 恢复屏蔽」)。
+    guard_unblocked: bool,
     /// 正常态布局(还原用)。
     normal_geo: Geometry,
     normal_content: (f64, f64),
-    img_ratio: f64,
     zoomed: bool,
     timer: Id,
     started: Instant,
@@ -415,49 +383,35 @@ extern "C" fn on_extend(_self: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
-/// 「🔍 放大」—— 在**当前弹窗内**把验证码图切到 1:1 并可来回切换。
-///
-/// 第 152 轮行为变更(实测事故):旧实现调 `NSWorkspace.openFile:` 把验证码 PNG
-/// 交给**系统默认应用**打开。用户的 `.png` 默认处理器是浏览器时,每点一次就新开
-/// 一个 Chrome 标签/窗口;而验证码截图原写系统临时目录,被清理后浏览器只显示空白
-/// —— 实测表现为「HITL 成功后冒出一堆空的、乱码的验证码标签页」,且弹窗反复弹出
-/// 时点一次冒一批。流程中途唤起外部应用本就属于交叉操作,与第 141~143 轮
-/// 「人工只读、Agent 独占」的管控语义冲突。
-///
-/// 现在改为窗口内 1:1 放大(`NSImageScalesProportionallyUpOrDown`,超出部分由
-/// 最大化窗口 + 说明区滚动查看),零外部进程、零标签页。需要另存/用看图工具打开
-/// 的用户走既有「📋 复制」拿绝对路径自行打开 —— 那是**用户主动**行为。
-extern "C" fn on_zoom_image(_self: Id, _cmd: Sel, _sender: Id) {
-    let (view, hint, px, zoomed) = {
-        let guard = state();
-        let Some(st) = guard.as_ref() else { return };
-        (st.views.image, st.views.img_hint, st.image_px, st.image_zoomed)
-    };
-    let Some(view) = view else { return };
-    let next = !zoomed;
-    unsafe {
-        // 放大态 = 按原始像素 1:1 显示(超出控件部分被裁切,靠最大化窗口查看);
-        // 非放大态 = 比例缩放适应(NSImageScalesProportionallyDown)。
-        let mode = if next {
-            NS_IMAGE_SCALE_PROPORTIONALLY_UP_OR_DOWN
-        } else {
-            NS_IMAGE_SCALE_PROPORTIONALLY_DOWN
-        };
-        send_void_i64(view, sel(b"setImageScaling:\0"), mode);
-        if let Some(h) = hint {
-            if let Some((w, h_px)) = px {
-                let text = if next {
-                    format!("1:1 放大中({w}×{h_px} px)· 再点一次恢复缩放适应 · ⛶ 最大化可看全")
-                } else {
-                    format!("原图 {w}×{h_px} px · 点「🔍 放大」按 1:1 查看细节")
-                };
-                send_void_id(h, sel(b"setStringValue:\0"), ns_str(&text));
-            }
+/// 2026-10-13:「解除屏蔽/恢复屏蔽」互切 —— 人工在弹窗直接掌控页面管控,
+/// 不必再打字请 Agent 解锁(实测「登录界面,不能点击,优化一下」事故的根治)。
+/// 点击即翻转本地态 + 向 stdout 打 guard **中间行**(进程不退出;父进程逐行读
+/// 并接线 `HumanAssistHub::guard_toggle_from_ui` → 对关联 page_id 应用整页 open /
+/// 恢复解锁前快照),按钮标题同步切换。
+extern "C" fn on_guard_toggle(_self: Id, _cmd: Sel, _sender: Id) {
+    let (line, title, btn) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
+        if st.done {
+            return;
         }
-    }
-    let mut guard = state();
-    if let Some(st) = guard.as_mut() {
-        st.image_zoomed = next;
+        let next = !st.guard_unblocked;
+        st.guard_unblocked = next;
+        (
+            super::dialog_main::guard_line(st.payload_id, next),
+            if next {
+                super::dialog_main::GUARD_BTN_LOCK_TITLE
+            } else {
+                super::dialog_main::GUARD_BTN_UNLOCK_TITLE
+            },
+            st.views.guard,
+        )
+    };
+    println!("{line}"); // Stdout 行缓冲:换行即 flush,父进程逐行读
+    unsafe {
+        if !btn.is_null() {
+            send_void_id(btn, sel(b"setTitle:\0"), ns_str(title));
+        }
     }
 }
 
@@ -577,7 +531,7 @@ fn controller_class() -> Id {
             & ok(on_cancel, b"cancel:\0")
             & ok(on_zoom, b"zoom:\0")
             & ok(on_extend, b"extend:\0")
-            & ok(on_zoom_image, b"openImage:\0")
+            & ok(on_guard_toggle, b"guardToggle:\0")
             & ok(on_copy, b"copyInfo:\0")
             & ok(on_tick, b"tick:\0")
             & ok(on_focus_once, b"focusOnce:\0")
@@ -691,9 +645,7 @@ unsafe fn toggle_zoom() {
             let zw = (vf.size.width - 40.0).max(W);
             let zh = (vf.size.height - 40.0).max(st.normal_content.1);
             let msg_h = (zh * 0.22).round().clamp(90.0, 240.0);
-            let cap = (zh * 0.55).round().clamp(60.0, 900.0);
-            let img_h = image_height_for(st.img_ratio, zw - PAD * 2.0, cap);
-            let g = Geometry { msg_h, img_h };
+            let g = Geometry { msg_h };
             (zw, zh.max(content_height(g, st.options.len())), g, st.options.len())
         }
     };
@@ -718,8 +670,6 @@ unsafe fn toggle_zoom() {
 struct ViewsSnapshot {
     title: Id,
     msg_scroll: Id,
-    image: Option<Id>,
-    img_hint: Option<Id>,
     t1: Id,
     t2: Id,
     input: Id,
@@ -727,8 +677,8 @@ struct ViewsSnapshot {
     cancel: Id,
     submit: Id,
     extend: Id,
+    guard: Id,
     copy: Id,
-    orig: Id,
     zoom: Id,
 }
 
@@ -737,8 +687,6 @@ impl ViewsSnapshot {
         Self {
             title: v.title,
             msg_scroll: v.msg_scroll,
-            image: v.image,
-            img_hint: v.img_hint,
             t1: v.t1,
             t2: v.t2,
             input: v.input,
@@ -746,16 +694,16 @@ impl ViewsSnapshot {
             cancel: v.cancel,
             submit: v.submit,
             extend: v.extend,
+            guard: v.guard,
             copy: v.copy,
-            orig: v.orig,
             zoom: v.zoom,
         }
     }
 
 }
 
-/// 把布局结果落到控件(ImageView 只在尺寸变化时 setFrame 亦可,统一全量设置)。
-unsafe fn apply_frames(v: &ViewsSnapshot, f: &Frames, geo: Geometry) {
+/// 把布局结果落到控件(统一全量设置)。
+unsafe fn apply_frames(v: &ViewsSnapshot, f: &Frames, _geo: Geometry) {
     let set = |view: Id, rect: NSRect| {
         if !view.is_null() {
             send_void_rect(view, sel(b"setFrame:\0"), rect);
@@ -763,14 +711,6 @@ unsafe fn apply_frames(v: &ViewsSnapshot, f: &Frames, geo: Geometry) {
     };
     set(v.title, f.title);
     set(v.msg_scroll, f.msg);
-    if geo.img_h > 0.0 {
-        if let (Some(view), Some(rect)) = (v.image, f.image) {
-            set(view, rect);
-        }
-        if let (Some(view), Some(rect)) = (v.img_hint, f.img_hint) {
-            set(view, rect);
-        }
-    }
     set(v.t1, f.t1);
     set(v.t2, f.t2);
     set(v.input, f.input);
@@ -780,8 +720,8 @@ unsafe fn apply_frames(v: &ViewsSnapshot, f: &Frames, geo: Geometry) {
     set(v.cancel, f.cancel);
     set(v.submit, f.submit);
     set(v.extend, f.extend);
+    set(v.guard, f.guard);
     set(v.copy, f.copy);
-    set(v.orig, f.orig);
     set(v.zoom, f.zoom);
 }
 
@@ -878,12 +818,7 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     let ctrl = send_id(send_id(ctrl_cls, sel(b"alloc\0")), sel(b"init\0"));
 
     // ---- 说明与几何 ----
-    let text_w = W - PAD * 2.0;
-    let (image_view, img_hint_label, img_ratio, image_px) = load_image(p);
-    let geo = Geometry {
-        msg_h: 90.0,
-        img_h: image_height_for(img_ratio, text_w, 300.0),
-    };
+    let geo = Geometry { msg_h: 90.0 };
     let normal_h = content_height(geo, p.options.len());
 
     // ---- 窗口:Titled(无关闭/缩放按钮 → 杜绝误关;resize 只走自家 ⛶ 按钮)----
@@ -915,7 +850,8 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     // 第 139 轮:显式声明可选中,不再依赖 editable 隐式带出的 field editor 行为。
     send_void_bool(input, sel(b"setSelectable:\0"), true);
     send_void_id(input, sel(b"setFont:\0"), font(13.0, false));
-    send_void_id(input, sel(b"setPlaceholderString:\0"), ns_str("可输入验证码/动态码/说明;留空点选项或提交"));
+    // 2026-10-13:通用补充说明语义(验证码专属功能已移除);留空点「继续」= 交棒。
+    send_void_id(input, sel(b"setPlaceholderString:\0"), ns_str("可选:给 Agent 的补充说明;留空点『继续』交还控制"));
     send_void_id(input, sel(b"setTarget:\0"), ctrl);
     send_void_sel(input, sel(b"setAction:\0"), sel(b"submit:\0"));
     send_void_i64(input, sel(b"setTag:\0"), -1); // 输入框回车:有字=文本,无字=选项 1
@@ -926,19 +862,27 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         opt_buttons.push(b);
     }
     let cancel = make_button("取消", Some("\x1b"), ctrl, b"cancel:\0", -1);
-    // 第 145 轮:双语义主按钮 —— 有输入=提交验证码/动态码文本;空输入=选项 1
-    // (缺省「我已完成人工操作,继续」),人工在浏览器完成操作后的「交棒」动作。
-    let submit = make_button("提交 / 继续", Some("\r"), ctrl, b"submit:\0", -1);
+    // 2026-10-13:主按钮「继续」 —— 人工操作完成后点击,把流程与控制权交还 Agent
+    // (有输入=把补充说明交给 Agent;空输入=选项 1「我已完成人工操作,继续」)。
+    let submit = make_button("继续", Some("\r"), ctrl, b"submit:\0", -1);
     // 第 145 轮:「⏱ +2分钟」延长等待(人工在浏览器完成整条登录链超 120s 分档
     // 超时的根治;stdout extend 中间行 → 父进程 hub 延长)。
     let extend = make_button(super::dialog_main::EXTEND_BTN_TITLE, None, ctrl, b"extend:\0", -1);
+    // 2026-10-13:「解除屏蔽/恢复屏蔽」互切(初始标题按页面实际放行态)。
+    let guard = make_button(
+        if p.guard_unlocked {
+            super::dialog_main::GUARD_BTN_LOCK_TITLE
+        } else {
+            super::dialog_main::GUARD_BTN_UNLOCK_TITLE
+        },
+        None,
+        ctrl,
+        b"guardToggle:\0",
+        -1,
+    );
     let zoom = make_button("⛶ 最大化", None, ctrl, b"zoom:\0", -1);
-    let orig = make_button("🔍 放大", None, ctrl, b"openImage:\0", -1);
     // 第 139 轮:一键复制全部信息(说明 + 页面 URL + 页面 ID + 候选选项)。
     let copy_btn = make_button(COPY_BTN_TITLE, None, ctrl, b"copyInfo:\0", -1);
-
-    // 图片尺寸标注(有图才有)
-    let img_hint = img_hint_label;
 
     // ---- 装配 ----
     let add = |parent: Id, child: Id| {
@@ -948,12 +892,6 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     };
     add(content, title);
     add(content, msg_scroll);
-    if let Some(iv) = image_view {
-        add(content, iv);
-        if let Some(hint) = img_hint {
-            add(content, hint);
-        }
-    }
     add(content, t1);
     add(content, t2);
     add(content, input);
@@ -963,8 +901,8 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     add(content, cancel);
     add(content, submit);
     add(content, extend);
+    add(content, guard);
     add(content, zoom);
-    add(content, orig);
     add(content, copy_btn);
 
     send_void_id(
@@ -983,8 +921,6 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         window,
         title,
         msg_scroll,
-        image: image_view,
-        img_hint,
         t1,
         t2,
         input,
@@ -992,8 +928,8 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         cancel,
         submit,
         extend,
+        guard,
         copy: copy_btn,
-        orig,
         zoom,
     };
     let snapshot = ViewsSnapshot::from(&views);
@@ -1032,16 +968,14 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     *state() = Some(MacState {
         views,
         options: p.options.clone(),
-        image_px,
-        image_zoomed: false,
         copy_payload: p.copy_text(),
         copied_at: None,
         payload_id: p.id,
         started_at_ms: p.started_at_ms,
         extend_count: 0,
+        guard_unblocked: p.guard_unlocked,
         normal_geo: geo,
         normal_content: (fw, fh),
-        img_ratio,
         zoomed: false,
         timer: tick,
         started: Instant::now(),
@@ -1234,51 +1168,6 @@ unsafe fn make_button(
     b
 }
 
-/// 载入验证码图片(NSImage;失败静默降级为无图,fail-open)。
-unsafe fn load_image(p: &DialogPayload) -> (Option<Id>, Option<Id>, f64, Option<(i64, i64)>) {
-    if p.image_path.is_empty() {
-        return (None, None, 0.0, None);
-    }
-    // initWithContentsOfFile: 的参数是 NSString *(不是 char *)—— 直接传 C 字符串
-    // 指针会被 ObjC 当作 NSString 对象访问(首字节当 isa 指针)→ SIGSEGV。必须先
-    // 经 ns_str 转成 NSString 对象再传(第 138 轮实测崩溃根因)。
-    let path_ns = ns_str(&p.image_path);
-    let img = send_id_id(
-        send_id(cls(b"NSImage\0"), sel(b"alloc\0")),
-        sel(b"initWithContentsOfFile:\0"),
-        path_ns,
-    );
-    if img.is_null() || !send_bool(img, sel(b"isValid\0")) {
-        return (None, None, 0.0, None);
-    }
-    let size = send_size(img, sel(b"size\0"));
-    let (w, h) = (size.width, size.height);
-    if w <= 0.0 || h <= 0.0 {
-        return (None, None, 0.0, None);
-    }
-    let iv = send_id_rect(
-        send_id(cls(b"NSImageView\0"), sel(b"alloc\0")),
-        sel(b"initWithFrame:\0"),
-        ns_rect(0.0, 0.0, 10.0, 10.0),
-    );
-    send_void_id(iv, sel(b"setImage:\0"), img);
-    send_void_i64(iv, sel(b"setImageScaling:\0"), NS_IMAGE_SCALE_PROPORTIONALLY_DOWN);
-    let hint = make_label(10.0, false);
-    let color = send_id(cls(b"NSColor\0"), sel(b"secondaryLabelColor\0"));
-    if !color.is_null() {
-        send_void_id(hint, sel(b"setTextColor:\0"), color);
-    }
-    send_void_id(
-        hint,
-        sel(b"setStringValue:\0"),
-        ns_str(&format!(
-            "原图 {}×{} px · 点「🔍 放大」按 1:1 查看细节",
-            w as i64, h as i64
-        )),
-    );
-    (Some(iv), Some(hint), h / w, Some((w as i64, h as i64)))
-}
-
 // ---------- 布局单测(纯函数,不触达 AppKit) ----------
 
 #[cfg(test)]
@@ -1296,16 +1185,12 @@ mod tests {
             ("cancel", f.cancel),
             ("submit", f.submit),
             ("extend", f.extend),
+            ("guard", f.guard),
             ("copy", f.copy),
-            ("orig", f.orig),
             ("zoom", f.zoom),
         ];
         for (i, r) in f.opts.iter().enumerate() {
             rects.push((Box::leak(format!("opt{i}").into_boxed_str()) as &str, *r));
-        }
-        if geo.img_h > 0.0 {
-            rects.push(("image", f.image.unwrap()));
-            rects.push(("img_hint", f.img_hint.unwrap()));
         }
         for (name, r) in rects {
             assert!(r.origin.x >= 0.0, "{name} x={}", r.origin.x);
@@ -1325,15 +1210,15 @@ mod tests {
         let row = f.cancel.origin.y;
         assert_eq!(f.submit.origin.y, row);
         assert_eq!(f.extend.origin.y, row);
+        assert_eq!(f.guard.origin.y, row);
         assert_eq!(f.copy.origin.y, row);
-        assert_eq!(f.orig.origin.y, row);
         assert_eq!(f.zoom.origin.y, row);
-        // 底部按钮行不重叠(第 145 轮新增「⏱ +2分钟」后的回归护栏)
+        // 底部按钮行不重叠(2026-10-13:七键位 = 取消/继续/+2分钟/管控切换/复制/最大化)
         let mut row_rects = [
             ("submit", f.submit),
             ("extend", f.extend),
+            ("guard", f.guard),
             ("copy", f.copy),
-            ("orig", f.orig),
             ("zoom", f.zoom),
         ];
         row_rects.sort_by(|a, b| a.1.origin.x.total_cmp(&b.1.origin.x));
@@ -1353,10 +1238,9 @@ mod tests {
     fn layout_budget_matches_placement() {
         for opt_count in [1usize, 2, 6] {
             for geo in [
-                Geometry { msg_h: 90.0, img_h: 0.0 },
-                Geometry { msg_h: 90.0, img_h: 60.0 },
-                Geometry { msg_h: 240.0, img_h: 300.0 },
-                Geometry { msg_h: 133.0, img_h: 217.5 },
+                Geometry { msg_h: 90.0 },
+                Geometry { msg_h: 240.0 },
+                Geometry { msg_h: 133.0 },
             ] {
                 // 精确预算:底行钉在底边距 PAD
                 let h = content_height(geo, opt_count);
@@ -1381,12 +1265,14 @@ mod tests {
         }
     }
 
+    /// 2026-10-13:「解除屏蔽/恢复屏蔽」切换按钮的两个标题必须互异且与
+    /// dialog_main 常量同源(少一个都会导致按钮停在错误标题上)。
     #[test]
-    fn image_height_clamps() {
-        assert_eq!(image_height_for(0.0, 528.0, 300.0), 0.0);
-        assert_eq!(image_height_for(0.01, 528.0, 300.0), 60.0); // 下限
-        assert_eq!(image_height_for(1.0, 528.0, 300.0), 300.0); // 上限
-        assert!((image_height_for(0.5, 528.0, 300.0) - 264.0).abs() <= 0.5);
+    fn guard_button_titles_are_paired() {
+        use super::super::dialog_main::{GUARD_BTN_LOCK_TITLE, GUARD_BTN_UNLOCK_TITLE};
+        assert_eq!(GUARD_BTN_UNLOCK_TITLE, "🔓 解除屏蔽");
+        assert_eq!(GUARD_BTN_LOCK_TITLE, "🔒 恢复屏蔽");
+        assert_ne!(GUARD_BTN_UNLOCK_TITLE, GUARD_BTN_LOCK_TITLE);
     }
 
     /// 第 139 轮:「📋 复制」按钮的文案常量必须成对(标题 + 反馈 + 回滚目标),
@@ -1413,17 +1299,17 @@ mod tests {
         }
     }
 
-    /// 第 139 轮:最窄内容宽下底部按钮行仍不重叠(`layout_budget_matches_placement`
-    /// 里的 1400 是大窗,这里专门盯默认窄窗;第 145 轮加宽到 680 并插入「⏱ +2分钟」)。
+    /// 最窄内容宽下底部按钮行仍不重叠(`layout_budget_matches_placement`
+    /// 里的 1400 是大窗,这里专门盯默认窄窗;2026-10-13 插入「解除屏蔽/恢复屏蔽」)。
     #[test]
     fn bottom_row_fits_narrow_window() {
-        let geo = Geometry { msg_h: 90.0, img_h: 0.0 };
+        let geo = Geometry { msg_h: 90.0 };
         let h = content_height(geo, 3);
         let f = layout_frames(W, h, geo, 3);
         assert_frames_in_bounds(W, h, geo, 3);
         assert!(f.submit.origin.x + f.submit.size.width <= f.extend.origin.x + 0.01);
-        assert!(f.extend.origin.x + f.extend.size.width <= f.copy.origin.x + 0.01);
-        assert!(f.copy.origin.x + f.copy.size.width <= f.orig.origin.x + 0.01);
-        assert!(f.orig.origin.x + f.orig.size.width <= f.zoom.origin.x + 0.01);
+        assert!(f.extend.origin.x + f.extend.size.width <= f.guard.origin.x + 0.01);
+        assert!(f.guard.origin.x + f.guard.size.width <= f.copy.origin.x + 0.01);
+        assert!(f.copy.origin.x + f.copy.size.width <= f.zoom.origin.x + 0.01);
     }
 }

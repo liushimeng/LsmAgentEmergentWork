@@ -87,6 +87,9 @@ pub enum AssistEvent {
     /// 第 134 轮:弹窗接管期间,用户在终端用 `/hitl <应答>` 应急通道作答
     /// (`text=None` 即 `/hitl cancel`)。TUI 事件循环据此打印结果行。
     TuiEscapeAnswered { id: u64, text: Option<String> },
+    /// 2026-10-13:人工在弹窗点「解除屏蔽/恢复屏蔽」互切按钮(unlock=true 解除/
+    /// false 恢复),TUI 打通知行供对账。
+    GuiGuardToggled { id: u64, unlock: bool },
 }
 
 /// TUI 侧轮询拿到的展示形态(工具侧请求的只读投影,不含 responder)。
@@ -104,11 +107,13 @@ pub struct HumanAssistDisplay {
     pub url: String,
     /// 关联 page_id(展示用)。
     pub page_id: String,
-    /// 第 132 轮:验证码等阻断现场的截图路径(空 = 无图)。
-    /// 由 `act_request_human` 解析(显式 `params.image_path` 优先,`reason=captcha`
-    /// 自动 CDP 视口截图),弹窗前端把它直接渲染出来 —— 人工不必切去浏览器找图,
-    /// 在弹窗里即可读码;TUI 兜底行读时打印路径供 `open` 查看。
+    /// 第 132 轮:阻断现场的截图路径(空 = 无图)。
+    /// 由 `act_request_human` 解析(显式 `params.image_path` 优先);2026-10-13 起
+    /// 弹窗不再渲染图片,该字段仅供 TUI 兜底打印路径供 `open` 查看。
     pub image_path: String,
+    /// 2026-10-13:页面当前是否已处于放行(open/无管控)态 —— 弹窗「解除屏蔽/
+    /// 恢复屏蔽」切换按钮的初始标题依据(false=「🔓 解除屏蔽」,true=「🔒 恢复屏蔽」)。
+    pub guard_unlocked: bool,
     pub timeout_ms: u64,
     /// 第 119 轮新增:输入提示符同行可视宽度(中文/全角算 2 列),
     /// TUI 协程用它把倒计时右对齐到屏幕右侧(避免压在提示符上)。
@@ -150,6 +155,11 @@ struct HubState {
     /// 第 145 轮:当前请求经弹窗「⏱ +2 分钟」累计延长的毫秒数(仅 id 匹配当前
     /// 槽位时有效;等待循环每轮重读,实现「动态截止时刻」)。槽位收口时清空。
     extend_ms: Option<(u64, u64)>,
+    /// 2026-10-13:弹窗「解除屏蔽/恢复屏蔽」互切按钮的页面管控执行器,由
+    /// `act_request_human` 在 `.request().await` 前安装、收口后清除;清槽路径
+    /// 防御性清除(防陈旧 handler 泄漏到下一请求)。同步闭包,内部自行
+    /// `tokio::spawn` 异步落页(unlock=true 整页 open / false 恢复解锁前快照)。
+    guard_toggle: Option<std::sync::Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
 // ---------- kind 单一事实源(第 130 轮自 control.rs / tui/dispatch.rs 收口迁入) ----------
@@ -274,6 +284,7 @@ impl HumanAssistHub {
         page_id: &str,
         timeout_ms: u64,
         image_path: &str,
+        guard_unlocked: bool,
     ) -> HumanAssistOutcome {
         // 第 130 轮:桌面弹窗可用时即使非 TTY(-p/管道)也放行 —— 只有
         // 「弹窗与 TUI 均不可用」才 fail-fast。
@@ -299,6 +310,7 @@ impl HumanAssistHub {
                         url: url.to_string(),
                         page_id: page_id.to_string(),
                         image_path: image_path.to_string(),
+                        guard_unlocked,
                         timeout_ms,
                         prompt_visual_width: 0,
                         created_at_ms: now_unix_ms(),
@@ -390,6 +402,7 @@ impl HumanAssistHub {
                 state.current = None;
                 state.gui_id = None;
                 state.extend_ms = None;
+                state.guard_toggle = None; // 2026-10-13:防陈旧 handler 泄漏
                 if was_gui {
                     push_event(&mut state, AssistEvent::GuiTimeout { id });
                 }
@@ -437,6 +450,39 @@ impl HumanAssistHub {
         let added = ms.min(cap.saturating_sub(acc));
         state.extend_ms = Some((id, acc + added));
         push_event(&mut state, AssistEvent::GuiExtended { id, added_ms: added });
+        true
+    }
+
+    /// 2026-10-13:安装/清除弹窗「解除屏蔽/恢复屏蔽」互切按钮的页面管控执行器。
+    /// 由 `act_request_human` 在 `.request().await` 前安装(闭包捕获 page_id 与
+    /// 解锁前快照)、收口后清除;任何清槽路径(respond/timeout/cancel)也防御性
+    /// 清除,防陈旧 handler 泄漏到下一请求。
+    pub fn set_guard_toggle_handler(
+        &self,
+        handler: Option<std::sync::Arc<dyn Fn(bool) + Send + Sync>>,
+    ) {
+        lock_state(&self.state).guard_toggle = handler;
+    }
+
+    /// 2026-10-13:弹窗「解除屏蔽/恢复屏蔽」互切中间行的入口
+    /// (`human_ui::run_dialog_process` 逐行读时调用)。仅当 `id` 仍是当前槽位
+    /// 请求时执行 handler(迟到的 guard 行不作用到新请求);执行成功入
+    /// `GuiGuardToggled` 事件(TUI 打通知行对账)。
+    pub fn guard_toggle_from_ui(&self, id: u64, unlock: bool) -> bool {
+        let handler = {
+            let mut state = lock_state(&self.state);
+            if state.current.as_ref().map(|c| c.display.id) != Some(id) {
+                return false;
+            }
+            match state.guard_toggle.clone() {
+                Some(h) => {
+                    push_event(&mut state, AssistEvent::GuiGuardToggled { id, unlock });
+                    h
+                }
+                None => return false,
+            }
+        };
+        handler(unlock);
         true
     }
 
@@ -520,6 +566,7 @@ impl HumanAssistHub {
             };
             if taken.is_some() {
                 state.extend_ms = None;
+                state.guard_toggle = None; // 2026-10-13:防陈旧 handler 泄漏
                 if state.gui_id == Some(id) {
                     state.gui_id = None;
                 }
@@ -569,6 +616,7 @@ impl HumanAssistHub {
         {
             let mut state = lock_state(&self.state);
             state.extend_ms = None;
+            state.guard_toggle = None; // 2026-10-13:防陈旧 handler 泄漏
             if state.gui_id == Some(id) {
                 state.gui_id = None;
             }
@@ -583,6 +631,7 @@ impl HumanAssistHub {
             let mut state = lock_state(&self.state);
             drop(state.current.take());
             state.extend_ms = None;
+            state.guard_toggle = None; // 2026-10-13:防陈旧 handler 泄漏
         }
         self.slot_free.notify_waiters();
         // 第 119 轮:任务收尾时也通知 TUI, 让它清理残留视觉。
@@ -669,7 +718,7 @@ mod tests {
         let was = hub.is_attached();
         hub.detach();
         let out = hub
-            .request("captcha", "x", vec![], "https://a", "p_1", 1000, "")
+            .request("captcha", "x", vec![], "https://a", "p_1", 1000, "", false)
             .await;
         assert_eq!(out, HumanAssistOutcome::Unavailable);
         if was {
@@ -694,6 +743,7 @@ mod tests {
                     "p_2",
                     60_000,
                     "/tmp/laew_hitl_captcha_demo.png",
+                    false,
                 )
                 .await
             }
@@ -711,6 +761,8 @@ mod tests {
         .expect("poll 应拿到请求");
         assert_eq!(display.kind, "sms");
         assert_eq!(display.options, vec!["已完成".to_string()]);
+        // 2026-10-13:页面放行态随请求透传(弹窗切换按钮初始标题依据)
+        assert!(!display.guard_unlocked);
         // 第 132 轮:验证码截图路径应原样投影到弹窗/TUI 侧的展示形态
         assert_eq!(
             display.image_path, "/tmp/laew_hitl_captcha_demo.png",
@@ -737,7 +789,7 @@ mod tests {
         hub.attach();
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("custom", "取消我", vec![], "", "p_3", 60_000, "").await }
+            async move { hub.request("custom", "取消我", vec![], "", "p_3", 60_000, "", false).await }
         });
         let display = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -766,7 +818,7 @@ mod tests {
         let hub = HumanAssistHub::global();
         hub.attach();
         let out = hub
-            .request("captcha", "x", vec![], "", "p_4", MIN_HUMAN_ASSIST_TIMEOUT_MS, "")
+            .request("captcha", "x", vec![], "", "p_4", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false)
             .await;
         assert_eq!(
             out,
@@ -792,7 +844,7 @@ mod tests {
         // 入位一个长超时请求(不依赖真实超时)
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "x", vec![], "", "p_n", 60_000, "").await }
+            async move { hub.request("captcha", "x", vec![], "", "p_n", 60_000, "", false).await }
         });
         // 等 request 入位(poll 能看到)
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -829,7 +881,7 @@ mod tests {
         hub.attach();
         let first = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "first", vec![], "", "p_5", 60_000, "").await }
+            async move { hub.request("captcha", "first", vec![], "", "p_5", 60_000, "", false).await }
         });
         let d1 = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -844,7 +896,7 @@ mod tests {
         // 第二个请求应排队而非覆盖
         let second = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("sms", "second", vec![], "", "p_6", 60_000, "").await }
+            async move { hub.request("sms", "second", vec![], "", "p_6", 60_000, "", false).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let polled = hub.poll().expect("槽位仍应是第一个请求");
@@ -895,7 +947,7 @@ mod tests {
         let was = hub.is_attached();
         hub.detach(); // 纯弹窗路径(模拟 -p 桌面模式)
         let out = hub
-            .request("sms", "验证码", vec![], "https://c", "p_g", 60_000, "")
+            .request("sms", "验证码", vec![], "https://c", "p_g", 60_000, "", true)
             .await;
         assert_eq!(
             out,
@@ -938,7 +990,7 @@ mod tests {
         hub.attach();
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "x", vec![], "", "p_gf", 60_000, "").await }
+            async move { hub.request("captcha", "x", vec![], "", "p_gf", 60_000, "", false).await }
         });
         // 等弹窗失败降级(GuiFailed 事件 + gui 标记清除)
         let display = tokio::time::timeout(Duration::from_secs(3), async {
@@ -977,7 +1029,7 @@ mod tests {
         let task = tokio::spawn({
             let hub = hub.clone();
             async move {
-                hub.request("captcha", "x", vec![], "", "p_x", MIN_HUMAN_ASSIST_TIMEOUT_MS, "")
+                hub.request("captcha", "x", vec![], "", "p_x", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false)
                     .await
             }
         });
@@ -1022,7 +1074,7 @@ mod tests {
         let task = tokio::spawn({
             let hub = hub.clone();
             async move {
-                hub.request("captcha", "x", vec![], "", "p_x2", MIN_HUMAN_ASSIST_TIMEOUT_MS, "")
+                hub.request("captcha", "x", vec![], "", "p_x2", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false)
                     .await
             }
         });
@@ -1061,10 +1113,64 @@ mod tests {
         hub.detach();
     }
 
+    /// 2026-10-13:弹窗「解除屏蔽/恢复屏蔽」互切 —— handler 由 act_request_human 安装;
+    /// id 匹配当前槽位时执行并入事件环;id 不匹配/未安装/收口后一律拒绝。
+    #[tokio::test]
+    async fn guard_toggle_from_ui_invokes_handler_only_for_current_slot() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_ui_hooks();
+        let hub = HumanAssistHub::global();
+        hub.attach();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let task = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.request("login", "x", vec![], "", "p_gt", 60_000, "", false).await }
+        });
+        let display = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(d) = hub.poll() {
+                    break d;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("poll 应拿到请求");
+        // 未安装 handler:拒绝
+        assert!(!hub.guard_toggle_from_ui(display.id, true));
+        // 安装 handler:匹配 id → 执行 + 事件
+        {
+            let calls = calls.clone();
+            hub.set_guard_toggle_handler(Some(std::sync::Arc::new(move |unlock| {
+                calls.lock().unwrap_or_else(|p| p.into_inner()).push(unlock);
+            })));
+        }
+        assert!(hub.guard_toggle_from_ui(display.id, true));
+        assert!(hub.guard_toggle_from_ui(display.id, false));
+        assert!(hub.take_events().iter().any(
+            |e| matches!(e, AssistEvent::GuiGuardToggled { unlock: true, .. })
+        ));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_slice(),
+            &[true, false]
+        );
+        // id 不匹配 → 拒绝且不执行
+        assert!(!hub.guard_toggle_from_ui(display.id + 999, true));
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 2);
+        // 清槽(respond)后 handler 被防御性清除 → 拒绝
+        assert!(hub.respond(display.id, Some("ok".into()), AssistVia::Tui));
+        let _ = task.await;
+        assert!(!hub.guard_toggle_from_ui(display.id, true));
+        hub.set_guard_toggle_handler(None);
+        hub.detach();
+    }
+
     /// 弹窗失败且无 TUI 兜底(-p 无桌面 UI 兜底):立即 Unavailable,不空等超时。
     #[tokio::test]
-    async fn gui_failure_without_tui_unavailable_immediately() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    async fn gui_failure_without_tui_unavailable_immediately() {        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_ui_hooks();
         fn stub_err(_: &crate::agent::human_assist::HumanAssistDisplay) -> human_ui::UiResult {
             human_ui::UiResult::Error("解释器缺失".into())
@@ -1076,7 +1182,7 @@ mod tests {
         hub.detach();
         let out = tokio::time::timeout(
             Duration::from_secs(3),
-            hub.request("custom", "x", vec![], "", "p_gu", 60_000, ""),
+            hub.request("custom", "x", vec![], "", "p_gu", 60_000, "", false),
         )
         .await
         .expect("应立即收口,不等 60s");

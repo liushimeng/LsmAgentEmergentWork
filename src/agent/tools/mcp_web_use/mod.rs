@@ -27,7 +27,6 @@ use crate::agent::browser::{BrowserManager, BrowserMode, NO_BROWSER_SENTINEL};
 use crate::error::Result;
 
 mod blocker_probe;
-mod captcha_crop;
 mod control;
 mod eval_sanitize;
 mod extract;

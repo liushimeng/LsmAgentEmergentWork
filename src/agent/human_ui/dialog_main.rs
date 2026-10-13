@@ -18,7 +18,9 @@ pub(super) struct DialogPayload {
     pub url: String,
     pub page_id: String,
     pub options: Vec<String>,
-    pub image_path: String,
+    /// 2026-10-13:页面当前是否已处于放行(open/无管控)态 —— 决定「解除屏蔽/恢复屏蔽」
+    /// 切换按钮的初始标题(false=显示「🔓 解除屏蔽」,true=显示「🔒 恢复屏蔽」)。
+    pub guard_unlocked: bool,
     pub timeout_ms: u64,
     pub started_at_ms: u64,
 }
@@ -59,7 +61,12 @@ impl DialogPayload {
             url: str_field("url"),
             page_id: str_field("page_id"),
             options,
-            image_path: str_field("image_path"),
+            // 2026-10-13:payload 中的 image_path 不再投影 —— 弹窗验证码图片功能
+            // 已移除,未知字段按容错缺省忽略。
+            guard_unlocked: v
+                .get("guard_unlocked")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             timeout_ms: v
                 .get("timeout_ms")
                 .and_then(|x| x.as_u64())
@@ -171,6 +178,19 @@ pub(super) fn extend_line(id: u64, ms: u64) -> String {
     serde_json::json!({"status": "extend", "id": id, "ms": ms}).to_string()
 }
 
+// ---------- 2026-10-13:弹窗「解除屏蔽/恢复屏蔽」互切按钮(两平台共用) ----------
+
+/// 管控切换按钮常态标题(页面处于 locked/partial 时):点击 → 整页 open 放行。
+pub(super) const GUARD_BTN_UNLOCK_TITLE: &str = "🔓 解除屏蔽";
+/// 管控切换按钮反态标题(页面已 open 时):点击 → 恢复本页解锁前管控快照。
+pub(super) const GUARD_BTN_LOCK_TITLE: &str = "🔒 恢复屏蔽";
+/// 管控切换中间行:`{"status":"guard","id":<请求id>,"unlock":<bool>}`。
+/// 子进程**不退出**,父进程逐行读并接线 `HumanAssistHub::guard_toggle_from_ui`
+/// → 对关联 page_id 应用整页 open(unlock=true)/恢复快照(unlock=false)。
+pub(super) fn guard_line(id: u64, unlock: bool) -> String {
+    serde_json::json!({"status": "guard", "id": id, "unlock": unlock}).to_string()
+}
+
 /// 子进程主入口:返回进程退出码(0 = 正常收口,含 timeout/error JSON)。
 pub fn run(payload_path: &Path) -> i32 {
     let (status, text) = match read_payload(payload_path) {
@@ -251,6 +271,21 @@ mod tests {
         assert_eq!(EXTEND_BTN_TITLE, "⏱ +2分钟");
         assert_eq!(EXTEND_STEP_MS, 120_000);
         assert_eq!(MAX_TOTAL_WAIT_MS, 1_800_000);
+    }
+
+    /// 2026-10-13:管控切换中间行与父进程 `parse_guard_line` 互为往返;
+    /// 按钮两个标题互异且与语义对应。
+    #[test]
+    fn guard_line_roundtrips_with_parent_parser() {
+        assert_eq!(
+            crate::agent::human_ui::parse_guard_line(&guard_line(7, true)),
+            Some((7, true))
+        );
+        assert_eq!(
+            crate::agent::human_ui::parse_guard_line(&guard_line(7, false)),
+            Some((7, false))
+        );
+        assert_ne!(GUARD_BTN_UNLOCK_TITLE, GUARD_BTN_LOCK_TITLE);
     }
 
     #[test]

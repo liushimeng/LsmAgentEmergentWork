@@ -16,6 +16,7 @@ fn sample_display() -> HumanAssistDisplay {
         url: "https://example.com/login".into(),
         page_id: "p_ab12cd34".into(),
         image_path: String::new(),
+        guard_unlocked: false,
         timeout_ms: 120_000,
         prompt_visual_width: 0,
         created_at_ms: 1_759_991_525_000,
@@ -42,7 +43,8 @@ fn payload_json_roundtrip() {
 
 #[test]
 fn payload_image_path_roundtrip_and_empty_default() {
-    // 第 132 轮:image_path 透传到弹窗 payload(空串 = 无图)
+    // 第 132 轮:image_path 透传到弹窗 payload(空串 = 无图;2026-10-13 起弹窗
+    // 不再渲染图片,该字段仅供 TUI 兜底打印路径)
     let mut d = sample_display();
     d.image_path = "/tmp/laew_hitl_captcha_1.png".into();
     let p = build_payload(&d);
@@ -50,6 +52,16 @@ fn payload_image_path_roundtrip_and_empty_default() {
     // 默认空串也必须是字符串字段(而非 null),弹窗端按无图处理
     let empty = build_payload(&sample_display());
     assert_eq!(empty["image_path"], "");
+}
+
+/// 2026-10-13:guard_unlocked(页面放行态)透传 —— 弹窗「解除屏蔽/恢复屏蔽」
+/// 切换按钮的初始标题依据。
+#[test]
+fn payload_guard_unlocked_roundtrip() {
+    let mut d = sample_display();
+    d.guard_unlocked = true;
+    assert_eq!(build_payload(&d)["guard_unlocked"], true);
+    assert_eq!(build_payload(&sample_display())["guard_unlocked"], false);
 }
 
 #[test]
@@ -131,9 +143,40 @@ fn parse_extend_line_shapes() {
     assert_eq!(parse_extend_line(""), None);
 }
 
+/// 2026-10-13:guard 是**中间行**(「解除屏蔽/恢复屏蔽」互切通知,进程不退出),
+/// 收口解析必须跳过它取真正的结果行;只有 guard 行时不得误当结果。
+#[test]
+fn parse_result_skips_guard_intermediate_lines() {
+    let out = "{\"status\":\"guard\",\"id\":7,\"unlock\":true}\n{\"status\":\"answer\",\"text\":\"z7z2\"}\n";
+    assert_eq!(parse_result(out), UiResult::Answered("z7z2".into()));
+    assert!(matches!(
+        parse_result("{\"status\":\"guard\",\"id\":7,\"unlock\":false}"),
+        UiResult::Error(_)
+    ));
+}
+
+/// 2026-10-13:guard 中间行解析(与 `dialog_main::guard_line` 互为往返)。
+#[test]
+fn parse_guard_line_shapes() {
+    assert_eq!(
+        parse_guard_line("{\"status\":\"guard\",\"id\":42,\"unlock\":true}"),
+        Some((42, true))
+    );
+    assert_eq!(
+        parse_guard_line(&dialog_main::guard_line(9, false)),
+        Some((9, false))
+    );
+    // 非管控行 / 缺 id / 缺 unlock / 非 JSON → None(容错,不 panic)
+    assert_eq!(parse_guard_line("{\"status\":\"extend\",\"id\":1,\"ms\":1000}"), None);
+    assert_eq!(parse_guard_line("{\"status\":\"guard\",\"unlock\":true}"), None);
+    assert_eq!(parse_guard_line("{\"status\":\"guard\",\"id\":1}"), None);
+    assert_eq!(parse_guard_line("garbage"), None);
+    assert_eq!(parse_guard_line(""), None);
+}
+
 /// 第 145 轮:子进程链路对 extend 中间行的容错 —— 假弹窗先打延长行(此时无 hub
 /// 槽位对应,延长不生效也不 panic)再打结果行,`present` 仍正确解析为应答,
-/// 证明 stdout 已切换为逐行流式读。
+/// 证明 stdout 已切换为逐行流式读。2026-10-13:顺带覆盖 guard 中间行。
 #[cfg(unix)]
 #[test]
 fn present_tolerates_extend_lines_from_dialog_process() {
@@ -144,7 +187,7 @@ fn present_tolerates_extend_lines_from_dialog_process() {
     let exe = dir.join("fake-dialog-extend.sh");
     std::fs::write(
         &exe,
-        "#!/bin/sh\n# 假弹窗:先打 extend 中间行再打结果 JSON\necho '{\"status\":\"extend\",\"id\":7,\"ms\":120000}'\nsleep 0.2\necho '{\"status\":\"answer\",\"text\":\"654321\"}'\n",
+        "#!/bin/sh\n# 假弹窗:先打 extend/guard 中间行再打结果 JSON\necho '{\"status\":\"extend\",\"id\":7,\"ms\":120000}'\necho '{\"status\":\"guard\",\"id\":7,\"unlock\":true}'\nsleep 0.2\necho '{\"status\":\"answer\",\"text\":\"654321\"}'\n",
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -266,6 +309,7 @@ async fn smoke_real_dialog_popup() {
                 "p_smoke",
                 60_000,
                 "",
+                false,
             )
             .await
         }

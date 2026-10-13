@@ -168,8 +168,10 @@ pub fn diagnostics() -> Value {
 
 /// display → 弹窗 payload(弹窗子进程契约,见 03 文档 §5)。
 ///
-/// 第 132 轮新增 `image_path`(验证码等阻断现场的截图;空串 = 无图,弹窗端
-/// 对空串/缺省字段按无图处理)。
+/// 第 132 轮新增 `image_path`(阻断现场的截图;空串 = 无图;2026-10-13 起弹窗
+/// 不再渲染图片,该字段仅供 TUI 兜底打印路径)。
+/// 2026-10-13 新增 `guard_unlocked`(页面是否已放行)——弹窗「解除屏蔽/恢复屏蔽」
+/// 切换按钮的初始标题依据。
 pub fn build_payload(display: &HumanAssistDisplay) -> Value {
     let now_ms = display.created_at_ms;
     json!({
@@ -181,6 +183,7 @@ pub fn build_payload(display: &HumanAssistDisplay) -> Value {
         "url": display.url,
         "page_id": display.page_id,
         "image_path": display.image_path,
+        "guard_unlocked": display.guard_unlocked,
         "started_at": fmt_local_ms(now_ms),
         "started_at_ms": now_ms,
         "timeout_ms": display.timeout_ms,
@@ -234,7 +237,7 @@ pub fn parse_result(stdout: &str) -> UiResult {
             .trim()
             .to_string();
         return match status {
-            "extend" => continue, // 中间行:继续往前找真正的收口行
+            "extend" | "guard" => continue, // 中间行:继续往前找真正的收口行
             "answer" if !text.is_empty() => UiResult::Answered(text),
             "answer" => UiResult::Error("弹窗返回空应答".into()),
             "cancel" => UiResult::Cancelled,
@@ -266,6 +269,23 @@ pub fn parse_extend_line(line: &str) -> Option<(u64, u64)> {
     let id = v.get("id").and_then(Value::as_u64)?;
     let ms = v.get("ms").and_then(Value::as_u64).filter(|ms| *ms > 0)?;
     Some((id, ms))
+}
+
+/// 2026-10-13:解析弹窗子进程的 `guard` **中间行**
+/// `{"status":"guard","id":<请求id>,"unlock":<bool>}`(「解除屏蔽/恢复屏蔽」
+/// 互切按钮)。返回 (请求id, 是否解除屏蔽);非管控行 / 字段缺失一律 None。
+pub fn parse_guard_line(line: &str) -> Option<(u64, bool)> {
+    let t = line.trim();
+    if t.is_empty() || !t.starts_with('{') {
+        return None;
+    }
+    let v = serde_json::from_str::<Value>(t).ok()?;
+    if v.get("status").and_then(|s| s.as_str())? != "guard" {
+        return None;
+    }
+    let id = v.get("id").and_then(Value::as_u64)?;
+    let unlock = v.get("unlock").and_then(Value::as_bool)?;
+    Some((id, unlock))
 }
 
 // ---------- 呈现入口 ----------
@@ -357,7 +377,7 @@ async fn run_dialog_process(payload_path: &std::path::Path) -> UiResult {
         let _ = stderr_pipe.read_to_string(&mut buf).await;
         buf
     });
-    // 逐行读:extend 中间行即时接线 hub,其余行留存供收口解析。
+    // 逐行读:extend/guard 中间行即时接线 hub,其余行留存供收口解析。
     let mut kept: Vec<String> = Vec::new();
     let mut lines = BufReader::new(&mut stdout).lines();
     loop {
@@ -369,6 +389,12 @@ async fn run_dialog_process(payload_path: &std::path::Path) -> UiResult {
                 }
                 if let Some((id, ms)) = parse_extend_line(&t) {
                     crate::agent::human_assist::HumanAssistHub::global().extend_timeout(id, ms);
+                } else if let Some((id, unlock)) = parse_guard_line(&t) {
+                    // 2026-10-13:弹窗「解除屏蔽/恢复屏蔽」互切 → 对关联页面应用
+                    // 整页 open / 恢复解锁前快照(hub 转交 act_request_human 安装的
+                    // handler;id 不匹配当前槽位则静默丢弃,与 extend 同构)。
+                    crate::agent::human_assist::HumanAssistHub::global()
+                        .guard_toggle_from_ui(id, unlock);
                 } else {
                     kept.push(t);
                 }

@@ -1206,7 +1206,8 @@ fn detect_blockers_cjk_keywords_keep_substring_semantics() {
 
 #[test]
 fn hitl_image_plan_priority_and_sources() {
-    // 第 132 轮:附图解析优先级 —— 显式路径(存在)> captcha 自动截图 > 无图
+    // 2026-10-13:附图优先级 —— 显式路径(存在)> 无图;自动截图链已随弹窗
+    // 验证码功能移除,captcha reason 不再触发任何自动采集。
     use crate::agent::tools::mcp_web_use::control::{hitl_image_plan, HitlImagePlan};
 
     // 显式 + 文件存在 → Explicit / explicit
@@ -1226,18 +1227,18 @@ fn hitl_image_plan_priority_and_sources() {
     assert_eq!(plan, HitlImagePlan::None);
     assert_eq!(src, "explicit_missing");
 
-    // 无显式 + captcha → 自动截图
+    // 无显式 + captcha → 无图(自动采集已删,2026-10-13 行为变更)
     let (plan, src) = hitl_image_plan("captcha", None);
-    assert_eq!(plan, HitlImagePlan::Auto);
-    assert_eq!(src, "auto");
+    assert_eq!(plan, HitlImagePlan::None);
+    assert_eq!(src, "none");
 
     // 无显式 + 非 captcha → 无图
     let (plan, src) = hitl_image_plan("sms", None);
     assert_eq!(plan, HitlImagePlan::None);
     assert_eq!(src, "none");
-    // 空串显式等同未给(自动路径仍可命中)
+    // 空串显式等同未给
     let (plan, _) = hitl_image_plan("captcha", Some("  "));
-    assert_eq!(plan, HitlImagePlan::Auto);
+    assert_eq!(plan, HitlImagePlan::None);
 }
 
 #[test]
