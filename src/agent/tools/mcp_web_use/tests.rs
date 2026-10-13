@@ -241,8 +241,11 @@ fn guard_script_rev_monotonic_and_off_hook() {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .expect("REV 应烘焙为数字");
     assert!(rev_b > rev_a, "两次生成 REV 应单调递增:{rev_a} vs {rev_b}");
-    assert!(a.contains("window.__laewGuardOff = () =>"), "卸载钩子缺失");
-    assert!(a.contains("window.__laewGuardRev >= REV"), "版本比较缺失");
+    // 第 168 轮:全局名随进程级命名空间(见 browser_ns.rs),断言用真实渲染名。
+    let off = format!("window.{}GuardOff = () =>", crate::agent::browser_ns::ns_global(""));
+    let rev = format!("window.{}GuardRev >= REV", crate::agent::browser_ns::ns_global(""));
+    assert!(a.contains(&off), "卸载钩子缺失");
+    assert!(a.contains(&rev), "版本比较缺失");
     assert!(!a.contains("{REV}"), "REV 占位符未烘焙");
 }
 

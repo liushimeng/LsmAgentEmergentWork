@@ -1202,6 +1202,7 @@ pub(super) async fn run_chat_loop(args: Value) -> Result<String> {
                     "",   // 第 132 轮:附图路径(manual_verify 无图)
                     false, // 2026-10-13:窗口操控场景无页面管控态,按未放行缺省
                     false, // 2026-10-13:选项单选(弹窗按钮组)
+                    None,  // 2026-10-13(二):侵入式中继映射区(窗口操控场景无页面)
                 )
                 .await;
             match last_choice {

@@ -374,7 +374,8 @@ impl TuiSession {
                                 | AssistEvent::GuiCancelled { id }
                                 | AssistEvent::GuiTimeout { id }
                                 | AssistEvent::GuiExtended { id, .. }
-                                | AssistEvent::GuiGuardToggled { id, .. } => Some(*id),
+                                | AssistEvent::GuiGuardToggled { id, .. }
+                                | AssistEvent::GuiRelayForwarded { id, .. } => Some(*id),
                                 AssistEvent::GuiAnswered { id, .. }
                                 | AssistEvent::TuiEscapeAnswered { id, .. } => Some(*id),
                             };
@@ -415,6 +416,11 @@ impl TuiSession {
                                 AssistEvent::GuiGuardToggled { .. } => {
                                     // 2026-10-13:「解除屏蔽/恢复屏蔽」互切**不收口请求**——
                                     // 与 GuiExtended 同语义:只打通知行,弹窗继续接管。
+                                    print_assist_event(&ev, AssistOut::Stdout);
+                                }
+                                AssistEvent::GuiRelayForwarded { .. } => {
+                                    // 2026-10-13(二):侵入式触控板 relay 行**不收口请求**——
+                                    // 只打通知行(会话起止行),弹窗继续接管。
                                     print_assist_event(&ev, AssistOut::Stdout);
                                 }
                                 _ => {

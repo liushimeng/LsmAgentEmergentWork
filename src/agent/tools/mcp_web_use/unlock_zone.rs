@@ -168,7 +168,7 @@ pub(super) const CREDENTIAL_ZONE_PROBE_JS: &str = r#"(() => {
     let bestLayer = null;
     const cand = 'dialog[open], [role="dialog"], [aria-modal="true"], body div, body section, body main';
     Array.prototype.forEach.call(document.querySelectorAll(cand), (el) => {
-        if (el.closest('[data-laew-agent]')) return;
+        if (el.closest('[data-%NS%agent]')) return;
         const cs = getComputedStyle(el);
         if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return;
         if (cs.position !== 'fixed' && cs.position !== 'absolute') return;
@@ -237,7 +237,9 @@ pub(super) async fn probe_credential_zones_kinds(
     if !hitl_scope_enabled() {
         return Vec::new();
     }
-    match super::eval_js_string(page, CREDENTIAL_ZONE_PROBE_JS).await {
+    // 第 168 轮:%NS% 占位符 → 进程级随机命名空间（隐身，见 browser_ns.rs）。
+    let js = crate::agent::browser_ns::render_ns(CREDENTIAL_ZONE_PROBE_JS);
+    match super::eval_js_string(page, &js).await {
         Ok(v) => {
             let Some(arr) = v.as_array() else {
                 return Vec::new();
@@ -411,7 +413,7 @@ fn merge_holes_into_allowlist(
 /// 临时放行态(partial 挖洞或 open),与 Agent 导航动作收尾的 re-assert 同构;
 /// 调用方在 HITL 收口(应答/超时/取消/不可用)时 `abort()`。
 ///
-/// 容错:新文档执行上下文就绪有竞态,`__laewGuardSet` 未就绪时间隔 400ms 重试
+/// 容错:新文档执行上下文就绪有竞态,`%NS%GuardSet` 未就绪时间隔 400ms 重试
 /// (≤3 次);页面关闭 → 事件流结束,协程自然退出。
 pub(super) fn spawn_unlock_reassert(
     page: chromiumoxide::Page,
@@ -433,7 +435,10 @@ pub(super) fn spawn_unlock_reassert(
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 }
                 let installed = page
-                    .evaluate("!!(window.__laewGuardSet)")
+                    .evaluate(format!(
+                        "!!(window.{})",
+                        crate::agent::browser_ns::ns_global("GuardSet")
+                    ))
                     .await
                     .ok()
                     .and_then(|r| r.value().cloned())
@@ -449,7 +454,7 @@ pub(super) fn spawn_unlock_reassert(
     })
 }
 
-/// 读**页面实际**管控态快照(eval `__laewGuard*` 运行时变量,非全局配置)。
+/// 读**页面实际**管控态快照(eval `%NS%Guard*` 运行时变量,非全局配置)。
 ///
 /// 用途(第 167 轮):
 /// - HITL 解锁判定:页面未装 guard(返回 `None`)/ 已是 open → 无需解锁;
@@ -461,19 +466,21 @@ pub(super) fn spawn_unlock_reassert(
 pub(super) async fn page_guard_snapshot(
     page: &chromiumoxide::Page,
 ) -> Option<crate::agent::browser_overlay::PageGuardConfig> {
-    const JS: &str = r#"(() => {
+    const JS_TEMPLATE: &str = r#"(() => {
   try {
-    const m = window.__laewGuardMode;
+    const m = window.%NS%GuardMode;
     if (typeof m !== 'string' || !m) return null;
     return JSON.stringify({
       mode: m,
-      allow: Array.isArray(window.__laewGuardAllow) ? window.__laewGuardAllow : [],
-      block: Array.isArray(window.__laewGuardBlock) ? window.__laewGuardBlock : [],
-      note: (typeof window.__laewGuardNote === 'string') ? window.__laewGuardNote : null,
+      allow: Array.isArray(window.%NS%GuardAllow) ? window.%NS%GuardAllow : [],
+      block: Array.isArray(window.%NS%GuardBlock) ? window.%NS%GuardBlock : [],
+      note: (typeof window.%NS%GuardNote === 'string') ? window.%NS%GuardNote : null,
     });
   } catch (e) { return null; }
 })()"#;
-    let v = super::eval_js_string(page, JS).await.ok()?;
+    // 第 168 轮:%NS% 占位符 → 进程级随机命名空间（隐身，见 browser_ns.rs）。
+    let js = crate::agent::browser_ns::render_ns(JS_TEMPLATE);
+    let v = super::eval_js_string(page, &js).await.ok()?;
     let s = v.as_str()?;
     let parsed: serde_json::Value = serde_json::from_str(s).ok()?;
     parse_guard_snapshot(&parsed)

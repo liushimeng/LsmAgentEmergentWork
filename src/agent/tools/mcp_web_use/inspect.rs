@@ -13,6 +13,17 @@ use super::control::act_screenshot;
 /// 阻断模式表:(kind, 关键词列表, 处置建议)。
 const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
     (
+        "manual_verify",
+        &[
+            // 第 168 轮:站点风控拦截页(实测京东 `.jd-main-risk-fallback`,
+            // 「当前页面异常/请刷新或切换账户试试」,人工扫码登录后触发;
+            // 天猫/淘宝系风控同源)。整页形态,非弹层。
+            "当前页面异常", "请刷新或切换账户", "内容太火爆了",
+            "访问过于频繁", "操作过于频繁",
+        ],
+        "站点风控拦截页(登录后常见,自动 reload/点刷新均无效):control(request_human, reason=manual_verify) 请人工在窗口处理(刷新/滑块/切换账号);根治建议 open(reuse_existing=true) 复用日常浏览器(真实指纹+登录态,connect 模式零注入)",
+    ),
+    (
         "captcha",
         &[
             "captcha", "验证码", "滑动验证", "拖动滑块", "拼图验证", "recaptcha",
@@ -72,7 +83,7 @@ const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
 /// 可见全文采集函数源码(JS 函数声明,不含调用括号;`blocker_probe::probe_js`
 /// 经 `format!` 复用本片段,全文口径单一事实源)。
 ///
-/// 实现:**临时摘除 `[data-laew-agent]` 子树(记录原位)→ 对活 body 读
+/// 实现:**临时摘除 `[data-%NS%agent]` 子树(记录原位)→ 对活 body 读
 /// `innerText` → 原位放回**。不能用 `cloneNode` 后读克隆的 `innerText` ——
 /// 克隆节点不在文档树、无布局,浏览器对 detached 节点的 `innerText` 退化为
 /// textContent 语义,`display:none` 的隐藏文案照收(2026-10-12 Windows 实测:
@@ -81,10 +92,10 @@ const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
 /// QC 判 fail)。活 body 的 `innerText` 由浏览器按渲染结果过滤,隐藏子树
 /// 自动排除;摘除/放回在同一同步任务内完成,页面无渲染间隙,节点事件与
 /// 相对顺序全部保留(先正序摘除、后逆序放回,兄弟节点原位引用不失效)。
-pub(super) const VISIBLE_TEXT_FN_JS: &str = r#"function __laewBodyVisibleText() {
+pub(super) const VISIBLE_TEXT_FN_JS: &str = r#"function %NS%BodyVisibleText() {
     if (!document.body) return '';
     const stripped = [];
-    for (const e of Array.from(document.body.querySelectorAll('[data-laew-agent]'))) {
+    for (const e of Array.from(document.body.querySelectorAll('[data-%NS%agent]'))) {
         if (e.parentNode) stripped.push([e.parentNode, e.nextSibling, e]);
     }
     for (const [parent, , e] of stripped) parent.removeChild(e);
@@ -111,7 +122,7 @@ pub(super) async fn body_text_without_agent_nodes(
         &format!(
             "{}{}",
             VISIBLE_TEXT_FN_JS,
-            r#"(() => { try { return __laewBodyVisibleText(); } catch(e) { return ''; } })()"#
+            r#"(() => { try { return %NS%BodyVisibleText(); } catch(e) { return ''; } })()"#
         ),
     )
     .await
@@ -319,8 +330,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             let include_text = params.get("include_text").and_then(Value::as_bool).unwrap_or(true);
             let include_outer = params.get("include_outer_html").and_then(Value::as_bool).unwrap_or(false);
             let js = format!(
-                // 过滤 [data-laew-agent] 子树:Agent 高亮蓝框 overlay 不参与元素观察
-                r#"(() => {{ const els=[...document.querySelectorAll({sel})].filter(e=>!e.closest('[data-laew-agent]')); const el=els[{nth}];
+                // 过滤 [data-%NS%agent] 子树:Agent 高亮蓝框 overlay 不参与元素观察
+                r#"(() => {{ const els=[...document.querySelectorAll({sel})].filter(e=>!e.closest('[data-%NS%agent]')); const el=els[{nth}];
                 if(!el) return {{ok:false, count: els.length, index:{nth}}};
                 const r=el.getBoundingClientRect();
                 return {{ok:true, tag:el.tagName.toLowerCase(), count:els.length, index:{nth},
@@ -336,8 +347,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             let sel = str_arg(&params, "selector").unwrap_or("html");
             if sel != "html" {
                 let js = format!(
-                    // 过滤 Agent 高亮 overlay(#[data-laew-agent] 不属于页面真实 DOM)
-                    r#"(() => {{ const el=[...document.querySelectorAll({sel})].find(e=>!e.closest('[data-laew-agent]'));
+                    // 过滤 Agent 高亮 overlay(#[data-%NS%agent] 不属于页面真实 DOM)
+                    r#"(() => {{ const el=[...document.querySelectorAll({sel})].find(e=>!e.closest('[data-%NS%agent]'));
                     if(!el) return {{ok:false, selector:{sel}}};
                     return {{ok:true, selector:{sel}, outer_html:el.outerHTML}}; }})()"#,
                     sel = js_str(sel)
@@ -574,7 +585,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                     const nodes = document.querySelectorAll(SEL);
                     for (const a of nodes) {{
                         if (links.length >= MAX) break;
-                        if (a.closest && a.closest('[data-laew-agent]')) continue;
+                        if (a.closest && a.closest('[data-%NS%agent]')) continue;
                         const href = (a.href || '').trim();
                         if (!href || href.startsWith('javascript:') || href.startsWith('#')) continue;
                         const text = ((a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim()).slice(0, 200);
@@ -693,7 +704,7 @@ pub(super) fn dom_tree_js(max_depth: i64, node_limit: u64) -> String {
                 if (nodes>=NODE_LIMIT) {{ truncated=true; return null; }}
                 if (d>MAX_DEPTH) return null;
                 // Agent 高亮 overlay 子树不进入节点树(真实页面结构观察)
-                if (n.nodeType===1 && n.closest && n.closest('[data-laew-agent]')) return null;
+                if (n.nodeType===1 && n.closest && n.closest('[data-%NS%agent]')) return null;
                 const obj={{
                     node_type: n.nodeType, node_name: n.nodeName,
                     node_value: n.nodeValue, attributes: {{}}

@@ -17,7 +17,7 @@
 //!   Agent 自己的输入类动作必须「先解后锁」([`action_dispatches_input`] 白名单,
 //!   `mcp_web_use::control::run` 统一包裹);open/partial 不设此闸门。
 //! - **L2 视觉蒙层(locked,JS 纯视觉)**:全屏半透明遮罩,`pointer-events:none`
-//!   不参与 hit-test,`data-laew-agent="1"`(blockers/elements/dom 提取过滤),
+//!   不参与 hit-test,`data-%NS%agent="1"`(blockers/elements/dom 提取过滤),
 //!   `Page.addScriptToEvaluateOnNewDocument` 挂载(导航自动重注入,全 frame 生效)。
 //! - **L3 盾区(partial,DOM 级)**:受保护区域覆盖 `pointer-events:auto` 的半透明
 //!   盾罩吞掉人工输入;黑名单 = 每命中元素一个红调盾罩,白名单 = 允许区并集在视口
@@ -27,7 +27,7 @@
 //!   在主文档坐标空间,跨域验证码 iframe 内部必须放行,整 frame 加盾会把主文档
 //!   挖好的洞从内部锁死;洞外区域由主文档条带盾照拦,安全性不降。
 //!   盾罩同样会吞 Agent 的 CDP 点击(hit-test 层不可区分),partial 下 Agent 输入
-//!   动作「先隐盾后复盾」(`__laewGuardSuspend`,见 `control::guard_lift_for_input`)。
+//!   动作「先隐盾后复盾」(`%NS%GuardSuspend`,见 `control::guard_lift_for_input`)。
 //!
 //! 为什么不用 DOM 蒙层(`pointer-events:auto`)拦**整页**输入:CDP 合成输入与真实
 //! 输入在 hit-test 层不可区分(`isTrusted` 均为 true),会把 Agent 自己的点击一并
@@ -51,15 +51,22 @@ use chromiumoxide::Page;
 use serde_json::{json, Value};
 
 /// 蒙层遮罩元素 id(locked 档视觉层;测试断言锚点;`inspect(elements/dom)` 经
-/// data-laew-agent 过滤)。
-pub const OVERLAY_ELEMENT_ID: &str = "__laew_overlay__";
+/// `data-<ns>agent` 过滤)。第 168 轮:id 前缀随进程级随机命名空间(隐身,见
+/// `browser_ns`),由模板 `%NS%` 渲染 —— 故为函数而非常量。
+pub fn overlay_element_id() -> String {
+    format!("{}overlay__", crate::agent::browser_ns::inject_ns())
+}
 
 /// 状态条 id(三档共用,仅主文档注入,第 143 轮从蒙层子元素改为独立元素:
 /// 蒙层只在 locked 显示,而「人工可操作」的提示在 open/partial 也要在)。
-pub const OVERLAY_HINT_ID: &str = "__laew_overlay_hint__";
+pub fn overlay_hint_id() -> String {
+    format!("{}overlay_hint__", crate::agent::browser_ns::inject_ns())
+}
 
 /// 盾区容器 id(partial 档,黑名单盾罩/白名单整屏挖洞盾的父节点)。
-pub const SHIELDS_ELEMENT_ID: &str = "__laew_guard_shields__";
+pub fn shields_element_id() -> String {
+    format!("{}guard_shields__", crate::agent::browser_ns::inject_ns())
+}
 
 /// 单侧选择器(allow/block)数量上限。
 pub const MAX_GUARD_SELECTORS: usize = 8;
@@ -250,12 +257,12 @@ impl PageGuardConfig {
 ///   `pointer-events:none`(三档都只是「告知」,不挡点击);
 /// - 盾罩 `pointer-events:auto`(真拦截,只出现在 partial);
 /// - z-index 序:高亮蓝框 2147483647 > 蒙层/状态条 2147483646 > 盾区 2147483645;
-/// - `data-laew-agent="1"`:与高亮蓝框同款标记,`blockers` 正文扫描
-///   (克隆 body 后剥 `[data-laew-agent]`)与 elements/dom 提取天然排除;
+/// - `data-%NS%agent="1"`:与高亮蓝框同款标记,`blockers` 正文扫描
+///   (克隆 body 后剥 `[data-%NS%agent]`)与 elements/dom 提取天然排除;
 /// - 白名单 = 允许区并集的「垂直条带分解」补集矩形盾(x 去重分条带 → 条带内
 ///   y 区间合并求补),纯矩形 + pointer-events,零兼容性依赖(不用 clip-path);
 /// - 盾罩矩形随滚动/缩放/DOM 变化 rAF 节流重算;MutationObserver 忽略
-///   `[data-laew-agent]` 自身节点的变更(防自激循环);
+///   `[data-%NS%agent]` 自身节点的变更(防自激循环);
 /// - `document.body` 未就绪(极早期文档)时挂 documentElement,DOMContentLoaded 补挂。
 pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     const REV = {REV};
@@ -264,48 +271,48 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // (实测观感:页面屏蔽失效、可编辑且无提示)。现在低版本直接退出;高版本先
     // 卸载旧实例(输入闸监听器 + 滚动/resize 调度 + 观察器 + 视觉元素)再重装,
     // 保证「最新期望档必赢」。
-    if (window.__laewGuardRev >= REV) return;
-    window.__laewGuardRev = REV;
-    try { if (window.__laewGuardOff) window.__laewGuardOff(); } catch (e) {}
-    window.__laewGuardInstalled = true;
-    window.__laewGuardMode = {MODE};
-    window.__laewGuardAllow = {ALLOW};
-    window.__laewGuardBlock = {BLOCK};
-    window.__laewGuardNote = {NOTE};
-    window.__laewGuardSuspended = false;
+    if (window.%NS%GuardRev >= REV) return;
+    window.%NS%GuardRev = REV;
+    try { if (window.%NS%GuardOff) window.%NS%GuardOff(); } catch (e) {}
+    window.%NS%GuardInstalled = true;
+    window.%NS%GuardMode = {MODE};
+    window.%NS%GuardAllow = {ALLOW};
+    window.%NS%GuardBlock = {BLOCK};
+    window.%NS%GuardNote = {NOTE};
+    window.%NS%GuardSuspended = false;
     // 第 155 轮:locked 档 DOM 选择性输入闸(可滚动观看)。
     // 只拦 isTrusted 事件(真实人工输入 + CDP 合成输入);页面自合成事件
     // (eval_js 驱动的 el.click()/dispatchEvent)isTrusted=false 不拦 —— 与
     // CDP 拦截下的 Agent 能力面等价。滚轮/滚动/鼠标移动不拦,人工可自由翻阅观看。
-    window.__laewGuardScrollWatch = {SCROLLWATCH};
-    window.__laewGuardInputSuspended = false;
-    window.__laewGuardGateReady = false;
+    window.%NS%GuardScrollWatch = {SCROLLWATCH};
+    window.%NS%GuardInputSuspended = false;
+    window.%NS%GuardGateReady = false;
     // 第 157 轮:GATE_EVTS/gate 提升到闸块外定义 —— 版本化重装时
-    // __laewGuardOff 需要引用它们卸载旧监听器。
+    // %NS%GuardOff 需要引用它们卸载旧监听器。
     const GATE_EVTS = ['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick',
         'contextmenu', 'pointerdown', 'pointerup', 'dragstart', 'drop', 'selectstart',
         'keydown', 'keyup', 'keypress', 'touchstart', 'touchend'];
     const gate = (e) => {
         try { if (!e.isTrusted) return; } catch (ex) { return; }
-        if (window.__laewGuardMode !== 'locked') return;
-        if (window.__laewGuardInputSuspended) return;
+        if (window.%NS%GuardMode !== 'locked') return;
+        if (window.%NS%GuardInputSuspended) return;
         try { e.stopImmediatePropagation(); e.preventDefault(); } catch (ex) {}
     };
-    if (window.__laewGuardScrollWatch) {
+    if (window.%NS%GuardScrollWatch) {
         for (const t of GATE_EVTS) window.addEventListener(t, gate, true);
-        window.__laewGuardInputSuspend = (s) => {
-            window.__laewGuardInputSuspended = !!s;
+        window.%NS%GuardInputSuspend = (s) => {
+            window.%NS%GuardInputSuspended = !!s;
             try { applyLockCss(); } catch (ex) {}
             return true;
         };
-        window.__laewGuardGateReady = true;
+        window.%NS%GuardGateReady = true;
     }
-    const MASK_ID = '__laew_overlay__';
-    const HINT_ID = '__laew_overlay_hint__';
-    const SHIELDS_ID = '__laew_guard_shields__';
-    const STYLE_ID = '__laew_guard_style__';
+    const MASK_ID = '%NS%overlay__';
+    const HINT_ID = '%NS%overlay_hint__';
+    const SHIELDS_ID = '%NS%guard_shields__';
+    const STYLE_ID = '%NS%guard_style__';
     const CHIP_TEXT = {
-        locked: window.__laewGuardScrollWatch
+        locked: window.%NS%GuardScrollWatch
             ? ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看·可滚动)',
                '人工可滚动浏览;点击/键盘/选中已拦截,如需操作请应答「人工介入」弹窗']
             : ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看)',
@@ -321,7 +328,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // document.documentElement` 在此二者皆 null → `root().appendChild()` 抛
     // TypeError,视觉层(蒙层/状态条/盾区)一个都没建。实测后果:此后任何一次
     // navigate / 复用 open 的 goto 都继承空 DOM,蒙层与徽标**永久消失**,
-    // 而 `__laewGuardSet` 已定义且返回非 null,`apply_page_guard` 照样回报
+    // 而 `%NS%GuardSet` 已定义且返回非 null,`apply_page_guard` 照样回报
     // `visual_mask: true` —— 输入锁真锁了,屏幕上一丝视觉都没有,且系统自称成功。
     // `documentElement` 在 document-start 即存在,放前面即可。
     const root = () => document.documentElement || document.body;
@@ -332,7 +339,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         if (!el(MASK_ID)) {
             const m = document.createElement('div');
             m.id = MASK_ID;
-            m.setAttribute('data-laew-agent', '1');
+            m.setAttribute('data-%NS%agent', '1');
             m.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483646;'
                 + 'background:rgba(15,23,42,0.22);';
             root().appendChild(m);
@@ -340,22 +347,22 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         if (window.top === window && !el(HINT_ID)) {
             const c = document.createElement('div');
             c.id = HINT_ID;
-            c.setAttribute('data-laew-agent', '1');
+            c.setAttribute('data-%NS%agent', '1');
             c.style.cssText = 'position:fixed;left:18px;bottom:18px;margin:0;padding:8px 14px;'
                 + 'background:rgba(15,23,42,0.85);color:#e2e8f0;'
                 + 'font:600 13px/1.7 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;'
                 + 'border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.35);max-width:72%;'
                 + 'pointer-events:none;z-index:2147483646;';
             const t = document.createElement('div');
-            t.setAttribute('data-laew-agent', '1');
-            t.className = '__laew_guard_hint_title__';
+            t.setAttribute('data-%NS%agent', '1');
+            t.className = '%NS%guard_hint_title__';
             const s = document.createElement('div');
-            s.setAttribute('data-laew-agent', '1');
-            s.className = '__laew_guard_hint_sub__';
+            s.setAttribute('data-%NS%agent', '1');
+            s.className = '%NS%guard_hint_sub__';
             s.style.cssText = 'font-weight:400;color:#94a3b8;font-size:12px;';
             const n = document.createElement('div');
-            n.setAttribute('data-laew-agent', '1');
-            n.className = '__laew_guard_hint_note__';
+            n.setAttribute('data-%NS%agent', '1');
+            n.className = '%NS%guard_hint_note__';
             n.style.cssText = 'font-weight:400;color:#cbd5e1;font-size:12px;margin-top:2px;';
             c.appendChild(t); c.appendChild(s); c.appendChild(n);
             root().appendChild(c);
@@ -363,7 +370,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         if (!el(SHIELDS_ID)) {
             const sc = document.createElement('div');
             sc.id = SHIELDS_ID;
-            sc.setAttribute('data-laew-agent', '1');
+            sc.setAttribute('data-%NS%agent', '1');
             sc.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483645;';
             root().appendChild(sc);
         }
@@ -371,23 +378,23 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // 锁定态 CSS 层:悬停任何组件光标 ⃠(「不可点击」视觉态)+ 全页禁选
     // (user-select 硬底;selectstart 闸是事件层双保险)。class 与 style 随
     // 「locked 且未挂起」共用一个判据 —— Agent 输入动作「先解后锁」期间
-    // (__laewGuardInputSuspend / __laewGuardSuspend)CSS 锁同步放开,收口复锁。
+    // (%NS%GuardInputSuspend / %NS%GuardSuspend)CSS 锁同步放开,收口复锁。
     // open/partial 不上全局锁(partial 盾罩自带 cursor:not-allowed)。
     const applyLockCss = () => {
-        const on = window.__laewGuardMode === 'locked'
-            && !window.__laewGuardSuspended && !window.__laewGuardInputSuspended;
+        const on = window.%NS%GuardMode === 'locked'
+            && !window.%NS%GuardSuspended && !window.%NS%GuardInputSuspended;
         const r = root();
         if (!r) return;
-        r.classList.toggle('__laew_locked__', on);
+        r.classList.toggle('%NS%locked__', on);
         let st = el(STYLE_ID);
         if (on) {
             if (!st) {
                 st = document.createElement('style');
                 st.id = STYLE_ID;
-                st.setAttribute('data-laew-agent', '1');
+                st.setAttribute('data-%NS%agent', '1');
                 r.appendChild(st);
             }
-            st.textContent = 'html.__laew_locked__ *{cursor:not-allowed !important;'
+            st.textContent = 'html.%NS%locked__ *{cursor:not-allowed !important;'
                 + 'user-select:none !important;-webkit-user-select:none !important;}';
         } else if (st) {
             st.remove();
@@ -397,9 +404,9 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         const c = el(HINT_ID);
         if (!c) return;
         const pair = CHIP_TEXT[mode] || CHIP_TEXT.locked;
-        const t = c.querySelector('.__laew_guard_hint_title__');
-        const s = c.querySelector('.__laew_guard_hint_sub__');
-        const n = c.querySelector('.__laew_guard_hint_note__');
+        const t = c.querySelector('.%NS%guard_hint_title__');
+        const s = c.querySelector('.%NS%guard_hint_sub__');
+        const n = c.querySelector('.%NS%guard_hint_note__');
         if (t) t.textContent = pair[0];
         if (s) s.textContent = pair[1];
         if (n) { n.textContent = note || ''; n.style.display = note ? '' : 'none'; }
@@ -408,14 +415,14 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         const sc = el(SHIELDS_ID);
         if (!sc) return;
         while (sc.firstChild) sc.removeChild(sc.firstChild);
-        const allow = Array.isArray(window.__laewGuardAllow) ? window.__laewGuardAllow : [];
-        const block = Array.isArray(window.__laewGuardBlock) ? window.__laewGuardBlock : [];
+        const allow = Array.isArray(window.%NS%GuardAllow) ? window.%NS%GuardAllow : [];
+        const block = Array.isArray(window.%NS%GuardBlock) ? window.%NS%GuardBlock : [];
         const vw = window.innerWidth, vh = window.innerHeight;
         // 盾罩标签预算(选择器命中很多元素时避免满屏小标签)
         let tagBudget = 6;
         const addShield = (x, y, w, h, dark) => {
             const sh = document.createElement('div');
-            sh.setAttribute('data-laew-agent', '1');
+            sh.setAttribute('data-%NS%agent', '1');
             sh.style.cssText = 'position:fixed;left:' + x + 'px;top:' + y + 'px;width:' + w
                 + 'px;height:' + h + 'px;pointer-events:auto;z-index:2147483645;cursor:not-allowed;'
                 + (dark
@@ -425,7 +432,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
             if (tagBudget > 0) {
                 tagBudget--;
                 const tag = document.createElement('div');
-                tag.setAttribute('data-laew-agent', '1');
+                tag.setAttribute('data-%NS%agent', '1');
                 tag.style.cssText = 'position:absolute;right:0;bottom:100%;padding:2px 8px;'
                     + 'background:rgba(127,29,29,0.95);color:#fecaca;'
                     + 'font:600 11px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;'
@@ -508,8 +515,8 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         }
     };
     const refresh = () => {
-        const mode = window.__laewGuardMode;
-        const susp = !!window.__laewGuardSuspended;
+        const mode = window.%NS%GuardMode;
+        const susp = !!window.%NS%GuardSuspended;
         ensure();
         applyLockCss();
         const m = el(MASK_ID);
@@ -517,7 +524,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         const c = el(HINT_ID);
         if (c) {
             c.style.display = susp ? 'none' : '';
-            if (!susp) setChip(mode, window.__laewGuardNote);
+            if (!susp) setChip(mode, window.%NS%GuardNote);
         }
         const sc = el(SHIELDS_ID);
         if (sc) {
@@ -530,26 +537,26 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
             }
         }
     };
-    window.__laewGuardSet = (mode, allow, block, note) => {
-        window.__laewGuardMode = String(mode || 'locked');
-        window.__laewGuardAllow = Array.isArray(allow) ? allow : [];
-        window.__laewGuardBlock = Array.isArray(block) ? block : [];
-        window.__laewGuardNote = (typeof note === 'string' && note) ? note : null;
+    window.%NS%GuardSet = (mode, allow, block, note) => {
+        window.%NS%GuardMode = String(mode || 'locked');
+        window.%NS%GuardAllow = Array.isArray(allow) ? allow : [];
+        window.%NS%GuardBlock = Array.isArray(block) ? block : [];
+        window.%NS%GuardNote = (typeof note === 'string' && note) ? note : null;
         refresh();
-        return window.__laewGuardMode;
+        return window.%NS%GuardMode;
     };
-    window.__laewGuardSuspend = (s) => {
-        window.__laewGuardSuspended = !!s;
+    window.%NS%GuardSuspend = (s) => {
+        window.%NS%GuardSuspended = !!s;
         refresh();
         return true;
     };
     // 第 141 轮 legacy 兼容:蒙层布尔开关(set_overlay 旧路径/单测锚点);
     // true=切屏蔽模式,false=切开放模式(模式级开关,非可见性开关)。
-    window.__laewOverlaySet = (on) =>
-        window.__laewGuardSet(on ? 'locked' : 'open', [], [], null);
+    window.%NS%OverlaySet = (on) =>
+        window.%NS%GuardSet(on ? 'locked' : 'open', [], [], null);
     let raf = 0;
     const schedule = () => {
-        if (window.__laewGuardMode !== 'partial' || window.__laewGuardSuspended) return;
+        if (window.%NS%GuardMode !== 'partial' || window.%NS%GuardSuspended) return;
         if (!raf) raf = window.requestAnimationFrame(() => { raf = 0; refresh(); });
     };
     window.addEventListener('scroll', schedule, { passive: true, capture: true });
@@ -559,10 +566,10 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // 与文档级 ResizeObserver 补上这一重建触发源。
     window.addEventListener('load', schedule, { passive: true });
     try {
-        if (window.ResizeObserver && !window.__laewGuardRO) {
-            window.__laewGuardRO = new ResizeObserver(() => schedule());
+        if (window.ResizeObserver && !window.%NS%GuardRO) {
+            window.%NS%GuardRO = new ResizeObserver(() => schedule());
             const roTarget = document.documentElement || document.body;
-            if (roTarget) window.__laewGuardRO.observe(roTarget);
+            if (roTarget) window.%NS%GuardRO.observe(roTarget);
         }
     } catch (e) {}
     // 第 163 轮:MutationObserver 装配独立成函数,由 bootRetry 与首次调用各调一次。
@@ -571,16 +578,16 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     const armObserver = () => {
         const target = document.documentElement || document.body;
         if (!target) return;
-        if (window.__laewGuardMO) { try { window.__laewGuardMO.disconnect(); } catch (e) {} }
+        if (window.%NS%GuardMO) { try { window.%NS%GuardMO.disconnect(); } catch (e) {} }
         try {
-            window.__laewGuardMO = new MutationObserver((muts) => {
+            window.%NS%GuardMO = new MutationObserver((muts) => {
                 for (const mu of muts) {
                     const t = mu.target;
-                    if (t && t.closest && t.closest('[data-laew-agent]')) continue;
+                    if (t && t.closest && t.closest('[data-%NS%agent]')) continue;
                     return schedule();
                 }
             });
-            window.__laewGuardMO.observe(target, {
+            window.%NS%GuardMO.observe(target, {
                 childList: true, subtree: true,
                 attributes: true, attributeFilter: ['class', 'style'],
             });
@@ -591,7 +598,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // 但 document-start 时 refresh() 会因 root() 为 null 抛 TypeError,
     // 异常直接吞掉后面整段 —— DOMContentLoaded 补挂**永远不会被注册**,
     // 视觉层就此永久缺失(实测:首开正常,首次 navigate 后蒙层与徽标全部消失)。
-    // `__laewGuardOff` 同样定义在 refresh() 之后,抛异常后未定义,
+    // `%NS%GuardOff` 同样定义在 refresh() 之后,抛异常后未定义,
     // 第 157 轮版本化重装一并哑火。
     const bootRetry = () => { try { armObserver(); refresh(); } catch (e) {} };
     if (document.readyState === 'loading') {
@@ -603,17 +610,33 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     refresh();
     // 第 157 轮:卸载钩子 —— 高版本重装前移除旧实例的输入闸监听器、调度监听、
     // 观察器与蒙层/状态条/盾区视觉元素,防监听器与视觉泄漏。
-    window.__laewGuardOff = () => {
+    window.%NS%GuardOff = () => {
         try { for (const t of GATE_EVTS) window.removeEventListener(t, gate, true); } catch (e) {}
         try { window.removeEventListener('scroll', schedule, true); } catch (e) {}
         try { window.removeEventListener('resize', schedule); } catch (e) {}
-        try { if (window.__laewGuardMO) window.__laewGuardMO.disconnect(); } catch (e) {}
+        try { if (window.%NS%GuardMO) window.%NS%GuardMO.disconnect(); } catch (e) {}
         for (const id of [MASK_ID, HINT_ID, SHIELDS_ID, STYLE_ID]) {
             const n = document.getElementById(id);
             if (n) n.remove();
         }
-        try { if (root()) root().classList.remove('__laew_locked__'); } catch (e) {}
+        try { if (root()) root().classList.remove('%NS%locked__'); } catch (e) {}
     };
+    // 第 168 轮:隐身收敛 —— API 入口全部改成不可枚举(for…in / Object.keys 不可见)。
+    // 实测京东人工扫码登录后返回 .jd-main-risk-fallback 风控页(「当前页面异常」),
+    // 根因之一是风控 JS 枚举 window 拿到 __laew* 固定签名;不可枚举后与装了
+    // 用户脚本的正常浏览器同水位(puppeteer-extra-stealth 同款策略)。fail-open:
+    // defineProperty 失败仅损失隐身,不影响管控功能。
+    try {
+        ['%NS%GuardRev', '%NS%GuardInstalled', '%NS%GuardMode', '%NS%GuardAllow',
+         '%NS%GuardBlock', '%NS%GuardNote', '%NS%GuardSuspended', '%NS%GuardScrollWatch',
+         '%NS%GuardInputSuspended', '%NS%GuardGateReady', '%NS%GuardInputSuspend',
+         '%NS%GuardOff', '%NS%GuardSet', '%NS%GuardSuspend', '%NS%GuardMO', '%NS%GuardRO',
+         '%NS%OverlaySet']
+            .forEach((k) => {
+                Object.defineProperty(window, k,
+                    { enumerable: false, configurable: true, writable: true, value: window[k] });
+            });
+    } catch (e) {}
 })()"#;
 
 /// 按实例期望态生成注入脚本(烘焙初始配置;选择器/note 以 JSON 字面量嵌入,
@@ -638,6 +661,8 @@ pub fn guard_script(cfg: &PageGuardConfig) -> String {
         .replace("{BLOCK}", &block)
         .replace("{NOTE}", &note)
         .replace("{SCROLLWATCH}", scroll_watch)
+        // 第 168 轮：%NS% 占位符 → 进程级随机命名空间（隐身，见 browser_ns.rs）。
+        .replace(crate::agent::browser_ns::NS_TOKEN, crate::agent::browser_ns::inject_ns())
 }
 
 /// `LAEW_WEB_LOCKED_SCROLL`(第 155 轮):`off/0/false/no` → 关闭 locked 档
@@ -687,12 +712,12 @@ pub async fn inject_agent_guard(page: &Page, cfg: &PageGuardConfig) {
 /// 应用页面管控三档(L1 输入拦截按档 + JS 全量设置)。
 ///
 /// - locked(第 155 轮起缺省):**DOM 选择性输入闸**(滚动观看)—— JS 先设置,
-///   探测闸在场(`__laewGuardGateReady`)→ CDP 显式放行(`setIgnoreInputEvents(false)`
+///   探测闸在场(`%NS%GuardGateReady`)→ CDP 显式放行(`setIgnoreInputEvents(false)`
 ///   清残留),人工滚轮可滚、点击/键盘被闸拦;
 /// - locked(闸不在场:`LAEW_WEB_LOCKED_SCROLL=off` / hidden / 注入失败):
 ///   fail-closed 回退第 141 轮 CDP 全量拦截 `setIgnoreInputEvents(true)`;
-/// - open:`setIgnoreInputEvents(false)` + `__laewGuardSet('open',…)`(放行+开放状态条);
-/// - partial:`setIgnoreInputEvents(false)` + `__laewGuardSet('partial',…)`(盾区+状态条)。
+/// - open:`setIgnoreInputEvents(false)` + `%NS%GuardSet('open',…)`(放行+开放状态条);
+/// - partial:`setIgnoreInputEvents(false)` + `%NS%GuardSet('partial',…)`(盾区+状态条)。
 ///
 /// 返回应用结果(fail-open:单层失败不阻断另一层,如实回报);
 /// 未注入脚本的页面(hidden/connect/注入失败)JS 侧返回 null → applied=false。
@@ -707,24 +732,26 @@ pub async fn apply_page_guard(
     let block = serde_json::to_string(&cfg.block_selectors).unwrap_or_else(|_| "[]".into());
     let note = serde_json::to_string(&cfg.note).unwrap_or_else(|_| "null".into());
     let mode = serde_json::to_string(cfg.mode.as_str()).unwrap_or_else(|_| "\"locked\"".into());
-    let js = format!(
-        "window.__laewGuardSet ? window.__laewGuardSet({mode}, {allow}, {block}, {note}) : null"
-    );
+    let ns_set = crate::agent::browser_ns::ns_global("GuardSet");
+    let js = format!("window.{ns_set} ? window.{ns_set}({mode}, {allow}, {block}, {note}) : null");
     let r = page
         .evaluate(js.as_str())
         .await
         .map_err(|e| format!("应用页面管控失败:{e}"))?;
     let js_applied = !r.value().map(|v| v.is_null()).unwrap_or(true);
-    // 第 163 轮:`__laewGuardSet` 返回非 null **不代表视觉层真的建起来了** ——
+    // 第 163 轮:`%NS%GuardSet` 返回非 null **不代表视觉层真的建起来了** ——
     // document-start 注入时它已定义,但建元素的代码因 root() 为 null 抛异常,
     // 于是「函数可用」与「屏幕上看得见」被混为一谈,`visual_mask` 恒真。
     // 这里独立校验视觉元素是否真实存在于 DOM,让回报字段不再「嘴上说成功」。
     let visual_present = page
-        .evaluate(
-            "!!(document.getElementById('__laew_overlay__') \
-             || document.getElementById('__laew_overlay_hint__') \
-             || document.getElementById('__laew_guard_shields__'))",
-        )
+        .evaluate(format!(
+            "!!(document.getElementById('{}') \
+             || document.getElementById('{}') \
+             || document.getElementById('{}'))",
+            overlay_element_id(),
+            overlay_hint_id(),
+            shields_element_id()
+        ))
         .await
         .ok()
         .and_then(|v| v.value().and_then(|val| val.as_bool()))
@@ -739,7 +766,10 @@ pub async fn apply_page_guard(
     // 才走 DOM 闸;任何一环缺失都回退 CDP 全量拦截(fail-closed)。
     let gate_ready = if locked && locked_scroll_watch_enabled() && js_applied {
         page
-            .evaluate("!!window.__laewGuardGateReady")
+            .evaluate(format!(
+                "!!window.{}",
+                crate::agent::browser_ns::ns_global("GuardGateReady")
+            ))
             .await
             .ok()
             .and_then(|r| r.value().cloned())
@@ -763,7 +793,10 @@ pub async fn apply_page_guard(
     let mut rearmed = false;
     if locked {
         let actual = page
-            .evaluate("window.__laewGuardMode || null")
+            .evaluate(format!(
+                "window.{} || null",
+                crate::agent::browser_ns::ns_global("GuardMode")
+            ))
             .await
             .ok()
             .and_then(|r| r.value().cloned());
@@ -787,12 +820,12 @@ pub async fn apply_page_guard(
 
 /// 挂起/恢复 locked 档 DOM 输入闸(第 155 轮,Agent 输入动作「先解后锁」的闸版)。
 ///
-/// 闸不在场(未注入 / 杀开关关闭 / `__laewGuardGateReady` 未置位)返回 false,
+/// 闸不在场(未注入 / 杀开关关闭 / `%NS%GuardGateReady` 未置位)返回 false,
 /// 调用方(`guard_ctl::guard_lift_for_input`)据此回退 CDP 解锁路径。
 pub async fn gate_suspend_input(page: &Page, suspend: bool) -> bool {
-    let js = format!(
-        "window.__laewGuardGateReady ? window.__laewGuardInputSuspend({suspend}) : null"
-    );
+    let ready = crate::agent::browser_ns::ns_global("GuardGateReady");
+    let suspend_fn = crate::agent::browser_ns::ns_global("GuardInputSuspend");
+    let js = format!("window.{ready} ? window.{suspend_fn}({suspend}) : null");
     match page.evaluate(js.as_str()).await {
         Ok(r) => !r.value().map(|v| v.is_null()).unwrap_or(true),
         Err(_) => false,
@@ -805,7 +838,8 @@ pub async fn gate_suspend_input(page: &Page, suspend: bool) -> bool {
 /// partial 下 Agent 输入动作「先隐盾后复盾」;不关心 CDP 的纯视觉场景。
 /// 返回是否实际应用(未注入脚本 = false)。
 pub async fn guard_suspend_visuals(page: &Page, hide: bool) -> bool {
-    let js = format!("window.__laewGuardSuspend ? window.__laewGuardSuspend({hide}) : null");
+    let ns_suspend = crate::agent::browser_ns::ns_global("GuardSuspend");
+    let js = format!("window.{ns_suspend} ? window.{ns_suspend}({hide}) : null");
     match page.evaluate(js.as_str()).await {
         Ok(r) => !r.value().map(|v| v.is_null()).unwrap_or(true),
         Err(_) => false,
@@ -882,6 +916,7 @@ pub fn action_needs_overlay_reassert(action: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::browser_ns::inject_ns;
 
     /// 环境变量类测试互斥(browser_mode.rs 同款,防并行 set_var 互踩)。
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1011,23 +1046,23 @@ mod tests {
         let mut cfg = PageGuardConfig::partial(vec![".login-box".into()], vec![]);
         cfg.note = Some("请登录后应答弹窗".into());
         let js = guard_script(&cfg);
-        assert!(js.contains("window.__laewGuardMode = \"partial\";"), "{js}");
-        assert!(js.contains("window.__laewGuardAllow = [\".login-box\"];"), "{js}");
-        assert!(js.contains("window.__laewGuardBlock = [];"), "{js}");
+        assert!(js.contains(&format!("window.{}GuardMode = \"partial\";", inject_ns())), "{js}");
+        assert!(js.contains(&format!("window.{}GuardAllow = [\".login-box\"];", inject_ns())), "{js}");
+        assert!(js.contains(&format!("window.{}GuardBlock = [];", inject_ns())), "{js}");
         assert!(
-            js.contains("window.__laewGuardNote = \"请登录后应答弹窗\";"),
+            js.contains(&format!("window.{}GuardNote = \"请登录后应答弹窗\";", inject_ns())),
             "{js}"
         );
         // 第 155 轮:滚动观看开关烘焙(缺省开启)
-        assert!(js.contains("window.__laewGuardScrollWatch = true;"), "{js}");
+        assert!(js.contains(&format!("window.{}GuardScrollWatch = true;", inject_ns())), "{js}");
         // 占位符全部被烘焙
         for ph in ["{MODE}", "{ALLOW}", "{BLOCK}", "{NOTE}", "{SCROLLWATCH}", "{REV}"] {
             assert!(!js.contains(ph), "占位符 {ph} 未烘焙");
         }
         // locked 缺省烘焙
         let js2 = guard_script(&PageGuardConfig::locked());
-        assert!(js2.contains("window.__laewGuardMode = \"locked\";"));
-        assert!(js2.contains("window.__laewGuardNote = null;"));
+        assert!(js2.contains(&format!("window.{}GuardMode = \"locked\";", inject_ns())));
+        assert!(js2.contains(&format!("window.{}GuardNote = null;", inject_ns())));
     }
 
     // =================== 第 155 轮:locked 档 DOM 输入闸(可滚动观看) ===================
@@ -1062,9 +1097,9 @@ mod tests {
             std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
         }
         let on = guard_script(&PageGuardConfig::locked());
-        assert!(on.contains("window.__laewGuardScrollWatch = true;"), "{on}");
-        assert!(on.contains("window.__laewGuardGateReady = true;"), "{on}");
-        assert!(on.contains("window.__laewGuardInputSuspend"), "{on}");
+        assert!(on.contains(&format!("window.{}GuardScrollWatch = true;", inject_ns())), "{on}");
+        assert!(on.contains(&format!("window.{}GuardGateReady = true;", inject_ns())), "{on}");
+        assert!(on.contains(&format!("window.{}GuardInputSuspend", inject_ns())), "{on}");
         // isTrusted 判据:页面自合成事件(isTrusted=false)必须放行
         assert!(on.contains("if (!e.isTrusted) return;"), "{on}");
         // 拦截清单含交互事件,不含滚动/移动通路(断言收窄到 GATE_EVTS 数组段,
@@ -1090,15 +1125,15 @@ mod tests {
         unsafe { std::env::set_var("LAEW_WEB_LOCKED_SCROLL", "off") };
         let off = guard_script(&PageGuardConfig::locked());
         // 杀开关关闭:烘焙 false → 闸安装 if 块为死代码(运行时不注册监听,
-        // __laewGuardGateReady 保持 false → apply_page_guard 探测失败回退 CDP)。
+        // %NS%GuardGateReady 保持 false → apply_page_guard 探测失败回退 CDP)。
         // 模板是静态文本,if 块源码仍在,只能断言烘焙结果本身。
-        assert!(off.contains("window.__laewGuardScrollWatch = false;"), "{off}");
+        assert!(off.contains(&format!("window.{}GuardScrollWatch = false;", inject_ns())), "{off}");
         assert!(
-            off.contains("if (window.__laewGuardScrollWatch) {"),
+            off.contains(&format!("if (window.{}GuardScrollWatch) {{", inject_ns())),
             "闸安装必须以烘焙开关为门(不得无条件安装):{off}"
         );
         assert!(
-            off.contains("window.__laewGuardScrollWatch\n            ? ["),
+            off.contains(&format!("window.{}GuardScrollWatch\n            ? [", inject_ns())),
             "locked 状态条文案必须按开关分流(可滚动/不可滚动两态):{off}"
         );
         unsafe {
@@ -1106,7 +1141,7 @@ mod tests {
         }
     }
 
-    /// 管控脚本关键标记锁死:三件套元素 id / 提取过滤(data-laew-agent)/
+    /// 管控脚本关键标记锁死:三件套元素 id / 提取过滤(data-%NS%agent)/
     /// 三档状态条文案 / 挖洞 clip-path / 挂载函数 / pointer-events 语义。
     #[test]
     fn guard_script_markers_locked() {
@@ -1115,15 +1150,15 @@ mod tests {
             std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
         }
         let js = guard_script(&PageGuardConfig::locked());
-        assert!(js.contains(OVERLAY_ELEMENT_ID), "蒙层元素 id 应出现在脚本中");
-        assert!(js.contains(OVERLAY_HINT_ID), "状态条 id 应出现在脚本中");
-        assert!(js.contains(SHIELDS_ELEMENT_ID), "盾区容器 id 应出现在脚本中");
-        assert!(js.contains("data-laew-agent"));
+        assert!(js.contains(&overlay_element_id()), "蒙层元素 id 应出现在脚本中");
+        assert!(js.contains(&overlay_hint_id()), "状态条 id 应出现在脚本中");
+        assert!(js.contains(&shields_element_id()), "盾区容器 id 应出现在脚本中");
+        assert!(js.contains(&format!("data-{}agent", inject_ns())));
         assert!(js.contains("z-index:2147483646"), "蒙层/状态条 z-index");
         assert!(js.contains("z-index:2147483645"), "盾区 z-index 恰低一档");
-        assert!(js.contains("window.__laewGuardSet"));
-        assert!(js.contains("window.__laewGuardSuspend"));
-        assert!(js.contains("window.__laewOverlaySet"), "第 141 轮 legacy 别名保留");
+        assert!(js.contains(&format!("window.{}GuardSet", inject_ns())));
+        assert!(js.contains(&format!("window.{}GuardSuspend", inject_ns())));
+        assert!(js.contains(&format!("window.{}OverlaySet", inject_ns())), "第 141 轮 legacy 别名保留");
         assert!(js.contains("window.top === window"), "状态条仅主文档");
         // 三档状态条文案(第 155 轮:locked 缺省可滚动观看)
         assert!(js.contains("页面已锁定(仅观看·可滚动)"));
@@ -1148,12 +1183,12 @@ mod tests {
         assert!(js.contains("cursor:not-allowed !important"), "锁定态应有 not-allowed 光标");
         assert!(js.contains("user-select:none !important"), "锁定态应禁选");
         assert!(js.contains("-webkit-user-select:none !important"), "WebKit 前缀禁选");
-        assert!(js.contains("__laew_locked__"), "锁定 class 标记");
-        assert!(js.contains("STYLE_ID = '__laew_guard_style__'"), "锁定样式元素 id");
+        assert!(js.contains(&format!("{}locked__", inject_ns())), "锁定 class 标记");
+        assert!(js.contains(&format!("STYLE_ID = '{}guard_style__'", inject_ns())), "锁定样式元素 id");
         assert!(js.contains("applyLockCss"), "CSS 锁应有统一应用函数");
         // CSS 锁与输入闸挂起联动(Agent 输入动作期间同步放开,需求 2)
         let suspend_seg = js
-            .split("window.__laewGuardInputSuspend = (s) =>")
+            .split(&format!("window.{}GuardInputSuspend = (s) =>", inject_ns()))
             .nth(1)
             .unwrap_or_default()
             .split("return true;")
@@ -1179,11 +1214,11 @@ mod tests {
         );
         // 卸载钩子清理 CSS 锁(防旧 class/style 泄漏到新实例)
         let off_seg = js
-            .split("window.__laewGuardOff = () =>")
+            .split(&format!("window.{}GuardOff = () =>", inject_ns()))
             .nth(1)
             .unwrap_or_default();
         assert!(off_seg.contains("STYLE_ID"), "卸载应移除锁定样式:{off_seg}");
-        assert!(off_seg.contains("__laew_locked__"), "卸载应移除锁定 class:{off_seg}");
+        assert!(off_seg.contains(&format!("{}locked__", inject_ns())), "卸载应移除锁定 class:{off_seg}");
         // 蒙层纯视觉:蒙层本身 pointer-events:none;盾罩 pointer-events:auto
         let mask_seg = js
             .split("if (!el(MASK_ID))")
@@ -1282,7 +1317,7 @@ mod tests {
         );
         // 半成品实例可自愈:标志已置但元素不在时不得早退
         assert!(
-            js.contains("__laewAgentHighlightInstalled\n        && document.getElementById"),
+            js.contains("%NS%AgentHighlightInstalled\n        && document.getElementById"),
             "早退门必须校验 DOM 元素真实存在,否则首装抛异常后永久无法补装"
         );
         assert!(
@@ -1385,8 +1420,10 @@ mod tests {
         // ① 管控元素存在(蒙层/状态条在主文档,盾区容器在)
         let mask_probe = page
             .evaluate(
-                "!!document.getElementById('__laew_overlay__') && !!document.getElementById('__laew_overlay_hint__') \
-                 && !!document.getElementById('__laew_guard_shields__')",
+                crate::agent::browser_ns::render_ns(
+                    "!!document.getElementById('%NS%overlay__') && !!document.getElementById('%NS%overlay_hint__') \
+                 && !!document.getElementById('%NS%guard_shields__')",
+                ),
             )
             .await
             .ok()
@@ -1421,7 +1458,7 @@ mod tests {
         //     页面自合成点击(isTrusted=false,eval_js 驱动)始终放行(Agent
         //     能力面与 CDP 拦截等价);wheel 不在拦截清单(人工滚动通路)。
         let gate_probe = page
-            .evaluate("!!window.__laewGuardGateReady && !!window.__laewGuardInputSuspend")
+            .evaluate(crate::agent::browser_ns::render_ns("!!window.%NS%GuardGateReady && !!window.%NS%GuardInputSuspend"))
             .await
             .ok()
             .and_then(|r| r.value().cloned())
@@ -1464,7 +1501,7 @@ mod tests {
         // ③ 蒙层隐藏/恢复(截图避让通道)
         assert!(mask_set_visible(&page, false).await, "蒙层隐藏应实际应用");
         let hidden = page
-            .evaluate("getComputedStyle(document.getElementById('__laew_overlay__')).display")
+            .evaluate(crate::agent::browser_ns::render_ns("getComputedStyle(document.getElementById('%NS%overlay__')).display"))
             .await
             .ok()
             .and_then(|r| r.value().cloned())
@@ -1481,8 +1518,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let shields = page
             .evaluate(
-                "(function(){const sc=document.getElementById('__laew_guard_shields__'); \
+                crate::agent::browser_ns::render_ns(
+                    "(function(){const sc=document.getElementById('%NS%guard_shields__'); \
                  return sc ? sc.style.display + '/' + sc.childElementCount : 'missing';})()",
+                ),
             )
             .await
             .ok()
@@ -1540,10 +1579,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         let after_nav = page
             .evaluate(
-                "JSON.stringify({mask: !!document.getElementById('__laew_overlay__'), \
-                 hint: !!document.getElementById('__laew_overlay_hint__'), \
-                 frame: !!document.getElementById('__laew_agent_frame__'), \
-                 shields: !!document.getElementById('__laew_guard_shields__')})",
+                crate::agent::browser_ns::render_ns(
+                    "JSON.stringify({mask: !!document.getElementById('%NS%overlay__'), \
+                 hint: !!document.getElementById('%NS%overlay_hint__'), \
+                 frame: !!document.getElementById('%NS%agent_frame__'), \
+                 shields: !!document.getElementById('%NS%guard_shields__')})",
+                ),
             )
             .await
             .ok()

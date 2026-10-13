@@ -136,6 +136,69 @@ pub struct BrowserManager {
     inner: Mutex<BrowserInner>,
 }
 
+/// 侵入式中继拖拽状态(每页:是否按下 + 上次物理坐标,供轨迹插值)。
+#[derive(Default)]
+struct RelayDragState {
+    down: bool,
+    last: Option<(f64, f64)>,
+}
+
+/// 进程级中继状态表(侵入式会话专用;收口由 [`BrowserManager::relay_reset`] 清理)。
+fn relay_state() -> &'static std::sync::Mutex<HashMap<String, RelayDragState>> {
+    static ST: std::sync::OnceLock<std::sync::Mutex<HashMap<String, RelayDragState>>> =
+        std::sync::OnceLock::new();
+    ST.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 侵入式映射区自动探测(无显式 `relay_rect` 时的兜底):页面上「fixed/absolute
+/// + 面积 ≥140×90 + 含挑战证据(slider/canvas/iframe/验证类文案)」的最高 z-index
+/// 最深层容器 → 视口矩形。找不到返回 None(调用方回退全视口映射)。
+/// 与 blocker_probe 的挑战弹层打分同构的极简版:只求「滑块/验证弹层在哪」。
+pub async fn relay_rect_probe(page: &Page) -> Option<(f64, f64, f64, f64)> {
+    use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+    let expr = r#"JSON.stringify((() => {
+        try {
+            const KW = ['滑块', '拖动', '验证', 'captcha', 'verify', '请按住', 'slide'];
+            const vw = window.innerWidth, vh = window.innerHeight;
+            let best = null;
+            for (const el of document.querySelectorAll('div,section,form,iframe')) {
+                const cs = getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) continue;
+                if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 140 || r.height < 90) continue;
+                if (r.width * r.height > vw * vh * 0.98) continue;
+                const txt = (el.innerText || '').slice(0, 300);
+                const cls = String(el.className || '') + ' ' + (el.id || '');
+                const hit = KW.some((k) => (txt + ' ' + cls).indexOf(k) >= 0);
+                const hasMedia = !!el.querySelector('canvas, iframe, img');
+                if (!(hit || hasMedia)) continue;
+                const z = parseInt(cs.zIndex, 10) || 0;
+                if (!best || z > best.z || (z === best.z && r.width * r.height > best.a)) {
+                    best = {z, a: r.width * r.height, r};
+                }
+            }
+            if (!best) return null;
+            return {x: best.r.x, y: best.r.y, width: best.r.width, height: best.r.height};
+        } catch (e) { return null; }
+    })())"#;
+    let params = EvaluateParams::builder()
+        .expression(expr)
+        .return_by_value(true)
+        .build()
+        .ok()?;
+    let v = page.evaluate(params).await.ok()?;
+    let s = v.value().and_then(|x| x.as_str().map(str::to_string))?;
+    let p: Value = serde_json::from_str(&s).ok()?;
+    let f = |k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    let (x, y, w, h) = (f("x"), f("y"), f("width"), f("height"));
+    if w > 0.0 && h > 0.0 {
+        Some((x, y, w, h))
+    } else {
+        None
+    }
+}
+
 fn now_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -163,40 +226,40 @@ fn new_page_id() -> String {
 /// 识别「哪个窗口被 Agent 控制」。本脚本在页面四周渲染一圈 Chrome 品牌蓝
 /// (#1a73e8)选中效果 + 右上角「LAEW Agent 控制中」徽标:
 /// - `pointer-events:none` 不拦截任何鼠标/键盘事件,渲染与普通浏览器一致;
-/// - `data-laew-agent="1"` 标记,MCP_Web_Use 的 elements/dom 提取自动过滤该子树;
+/// - `data-%NS%agent="1"` 标记,MCP_Web_Use 的 elements/dom 提取自动过滤该子树;
 /// - 通过 `Page.addScriptToEvaluateOnNewDocument` 挂载,导航/派生新页自动重注入。
 pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
     // 第 163 轮:早退门加 DOM 校验 —— 旧写法只在**抛异常之前**置
-    // `__laewAgentHighlightInstalled = true`,而 document-start 时 body/documentElement
+    // `%NS%AgentHighlightInstalled = true`,而 document-start 时 body/documentElement
     // 可能都 null,ensure() 抛异常后标志却是「已装」,后续任何补挂重试都被这道门挡住,
     // 蓝框与徽标永久缺失。改成「标志已置但元素不在」时允许重新装配,让半成品实例自愈。
-    if (window.__laewAgentHighlightInstalled
-        && document.getElementById('__laew_agent_frame__')) return;
-    window.__laewAgentHighlightInstalled = true;
+    if (window.%NS%AgentHighlightInstalled
+        && document.getElementById('%NS%agent_frame__')) return;
+    window.%NS%AgentHighlightInstalled = true;
     const ensure = () => {
         // 与 guard 同病:document-start 时两者皆 null,`documentElement` 先存在。
         const root = document.documentElement || document.body;
         if (!root) return;
-        let frame = document.getElementById('__laew_agent_frame__');
+        let frame = document.getElementById('%NS%agent_frame__');
         if (!frame) {
             frame = document.createElement('div');
-            frame.id = '__laew_agent_frame__';
-            frame.setAttribute('data-laew-agent', '1');
+            frame.id = '%NS%agent_frame__';
+            frame.setAttribute('data-%NS%agent', '1');
             frame.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;box-shadow:inset 0 0 0 3px #1a73e8;';
             const badge = document.createElement('div');
-            badge.id = '__laew_agent_badge__';
-            badge.setAttribute('data-laew-agent', '1');
+            badge.id = '%NS%agent_badge__';
+            badge.setAttribute('data-%NS%agent', '1');
             badge.style.cssText = 'position:absolute;top:8px;right:8px;padding:2px 10px;background:#1a73e8;color:#fff;font:600 12px/1.6 system-ui,sans-serif;border-radius:10px;box-shadow:0 1px 4px rgba(26,115,232,.45);';
             badge.textContent = 'LAEW Agent 控制中';
             frame.appendChild(badge);
             root.appendChild(frame);
         }
-        frame.style.display = window.__laewAgentHighlight === false ? 'none' : '';
+        frame.style.display = window.%NS%AgentHighlight === false ? 'none' : '';
     };
-    window.__laewAgentApplyHighlight = (enabled) => {
-        window.__laewAgentHighlight = !!enabled;
+    window.%NS%AgentApplyHighlight = (enabled) => {
+        window.%NS%AgentHighlight = !!enabled;
         ensure();
-        const f = document.getElementById('__laew_agent_frame__');
+        const f = document.getElementById('%NS%agent_frame__');
         if (f) f.style.display = enabled ? '' : 'none';
         return !!enabled;
     };
@@ -208,6 +271,14 @@ pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
         window.addEventListener('load', boot, { once: true });
     }
     boot();
+    // 第 168 轮:隐身收敛 —— 高亮 API 入口不可枚举(与 guard 同款,见 browser_ns.rs)。
+    try {
+        ['%NS%AgentHighlightInstalled', '%NS%AgentHighlight', '%NS%AgentApplyHighlight']
+            .forEach((k) => {
+                Object.defineProperty(window, k,
+                    { enumerable: false, configurable: true, writable: true, value: window[k] });
+            });
+    } catch (e) {}
 })()"#;
 
 /// 给页面注入 Agent 高亮蓝框(新文档自动重挂 + 当前文档立即执行)。
@@ -215,7 +286,8 @@ async fn inject_agent_highlight(page: &Page) {
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
     let _ = page
         .execute(AddScriptToEvaluateOnNewDocumentParams {
-            source: AGENT_HIGHLIGHT_JS.to_string(),
+            // 第 168 轮:%NS% 占位符 → 进程级随机命名空间（隐身，见 browser_ns.rs）。
+            source: super::browser_ns::render_ns(AGENT_HIGHLIGHT_JS),
             world_name: None,
             include_command_line_api: None,
             // 立即在已存在的执行上下文运行(等效旧 evaluate 路径)
@@ -778,6 +850,32 @@ impl BrowserManager {
                     }
                 }
             }
+            // 第 168 轮:隐身自检(仅 launch 首启一次,fail-open 只进日志)——
+            // 反检测启动参数被未来 Chrome 版本抹掉时第一时间可见;命名空间泄漏
+            // (固定 laew 签名残留)同理。探测页面即刚注册的 Agent 页。
+            if let Some(entry) = inner.pages.get(&id) {
+                let probe_js = r#"JSON.stringify({wd: navigator.webdriver === true, leaked: Object.keys(window).filter((k) => k.toLowerCase().indexOf('laew') >= 0)})"#;
+                if let Ok(v) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    entry.page.evaluate(probe_js),
+                )
+                .await
+                {
+                    if let Ok(r) = v {
+                        let issue = r
+                            .value()
+                            .cloned()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s.as_str().unwrap_or("")).ok())
+                            .and_then(|p| super::browser_ns::stealth_probe_issue(&p));
+                        match issue {
+                            Some(msg) => tracing::warn!(
+                                "MCP_Web_Use 隐身自检未通过: {msg} (天猫/京东系风控可能因此拦截,见 browser_ns.rs)"
+                            ),
+                            None => tracing::info!("MCP_Web_Use 隐身自检通过(navigator.webdriver=false,无 laew 残留键)"),
+                        }
+                    }
+                }
+            }
         }
         Ok((id, title, final_url))
     }
@@ -1276,7 +1374,7 @@ impl BrowserManager {
     }
 
     /// 运行时开关 Agent 高亮蓝框(对当前页面文档立即生效;新文档由挂载脚本
-    /// 依据 `window.__laewAgentHighlight` 延续)。
+    /// 依据高亮期望态全局名延续(第 168 轮起随进程级随机命名空间,见 browser_ns.rs))。
     pub async fn set_highlight(
         &self,
         page_id: &str,
@@ -1290,9 +1388,8 @@ impl BrowserManager {
             let mut inner = self.inner.lock().await;
             inner.highlight = enabled;
         }
-        let js = format!(
-            "window.__laewAgentApplyHighlight ? window.__laewAgentApplyHighlight({enabled}) : null"
-        );
+        let ns = super::browser_ns::ns_global("AgentApplyHighlight");
+        let js = format!("window.{ns} ? window.{ns}({enabled}) : null");
         let r = page
             .evaluate(js)
             .await
@@ -1301,6 +1398,197 @@ impl BrowserManager {
             "enabled": enabled,
             "applied": !r.value().map(|v| v.is_null()).unwrap_or(true),
         }))
+    }
+
+    // ===================== 2026-10-13(二):侵入式物理输入中继 =====================
+    //
+    // 弹窗「侵入式」触控板上的人工手势 → 本层映射到页面视口坐标 → CDP
+    // `Input.dispatchMouseEvent` / `dispatchKeyEvent` 回放。价值:
+    // ① 事件是 `isTrusted=true` 的**真物理输入**(页面 JS 无法与真手区分);
+    // ② 坐标级派发天然穿透跨域 iframe(天猫/淘宝滑块「请按住滑块」在跨域 iframe 内,
+    //    DOM 级挖洞与页面自身闸一律够不着,坐标级 CDP 不受影响);
+    // ③ 不依赖浏览器窗口焦点(实测人工在弹窗操作时 Chrome 窗口可能失焦,
+    //    真实鼠标按下被窗口激活语义吞掉,滑块拖不动)。
+    // 前提:调用方(session_start)已放行本页管控 —— locked 档的自有输入闸只拦
+    // `isTrusted=true`,不放行会把我们自己的回放也拦掉。
+
+    /// 中继鼠标事件(kind = down/move/up/tap;nx/ny = 0..1 归一化坐标)。
+    /// `rect` = 映射区(视口坐标;None = 映射整个视口)。拖拽中的 move 按
+    /// ~10px 步长插值补点(滑块类挑战的轨迹校验需要连续密集采样)。
+    pub async fn relay_mouse(
+        &self,
+        page_id: &str,
+        kind: &str,
+        nx: f64,
+        ny: f64,
+        rect: Option<(f64, f64, f64, f64)>,
+    ) -> std::result::Result<Value, String> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+        };
+        let page = self.page(page_id).await.ok_or_else(|| "page_id 不存在".to_string())?;
+        let (vw, vh) = self.viewport_size(&page).await;
+        let (px, py) = match rect {
+            Some((rx, ry, rw, rh)) => (rx + nx.clamp(0.0, 1.0) * rw, ry + ny.clamp(0.0, 1.0) * rh),
+            None => (nx.clamp(0.0, 1.0) * vw, ny.clamp(0.0, 1.0) * vh),
+        };
+        let (down_before, last) = {
+            let st = relay_state();
+            let mut guard = st.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = guard.entry(page_id.to_string()).or_default();
+            (entry.down, entry.last)
+        };
+        let dispatch = |t: DispatchMouseEventType, x: f64, y: f64, buttons: Option<i64>| {
+            let p = page.clone();
+            async move {
+                let mut b = DispatchMouseEventParams::builder()
+                    .r#type(t)
+                    .x(x)
+                    .y(y)
+                    .button(MouseButton::Left)
+                    .click_count(1);
+                if let Some(n) = buttons {
+                    b = b.buttons(n);
+                }
+                let params = b.build().map_err(|e| e.to_string())?;
+                p.execute(params).await.map_err(|e| e.to_string())?;
+                Ok::<(), String>(())
+            }
+        };
+        match kind {
+            "down" => {
+                dispatch(DispatchMouseEventType::MousePressed, px, py, Some(1)).await?;
+            }
+            "move" => {
+                // 拖拽中:先按步长插值补点(最多 20 步),再落到目标点。
+                if down_before {
+                    if let Some((lx, ly)) = last {
+                        let (dx, dy) = (px - lx, py - ly);
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        let steps = ((dist / 10.0).ceil() as i64).clamp(1, 20);
+                        for i in 1..steps {
+                            let f = i as f64 / steps as f64;
+                            dispatch(
+                                DispatchMouseEventType::MouseMoved,
+                                lx + dx * f,
+                                ly + dy * f,
+                                Some(1),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                dispatch(
+                    DispatchMouseEventType::MouseMoved,
+                    px,
+                    py,
+                    if down_before { Some(1) } else { None },
+                )
+                .await?;
+            }
+            "up" => {
+                dispatch(DispatchMouseEventType::MouseReleased, px, py, None).await?;
+            }
+            "tap" => {
+                dispatch(DispatchMouseEventType::MousePressed, px, py, Some(1)).await?;
+                dispatch(DispatchMouseEventType::MouseReleased, px, py, None).await?;
+            }
+            other => return Err(format!("未知中继鼠标事件: {other}")),
+        }
+        {
+            let st = relay_state();
+            let mut guard = st.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = guard.entry(page_id.to_string()).or_default();
+            match kind {
+                "down" => entry.down = true,
+                "up" | "tap" => entry.down = false, // tap 已即时抬起
+                "move" => entry.down = down_before,
+                _ => {}
+            }
+            entry.last = Some((px, py));
+        }
+        Ok(json!({"x": px, "y": py, "kind": kind}))
+    }
+
+    /// 中继键盘事件(key = enter/esc/tab/space/backspace/delete/left/right/up/down)。
+    pub async fn relay_key(
+        &self,
+        page_id: &str,
+        key: &str,
+    ) -> std::result::Result<Value, String> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+        let (name, code, vk, text): (&str, &str, i64, &str) = match key.to_ascii_lowercase().as_str()
+        {
+            "enter" | "return" => ("Enter", "Enter", 13, "\r"),
+            "esc" | "escape" => ("Escape", "Escape", 27, ""),
+            "tab" => ("Tab", "Tab", 9, ""),
+            "space" => (" ", "Space", 32, " "),
+            "backspace" => ("Backspace", "Backspace", 8, ""),
+            "delete" => ("Delete", "Delete", 46, ""),
+            "left" => ("ArrowLeft", "ArrowLeft", 37, ""),
+            "up" => ("ArrowUp", "ArrowUp", 38, ""),
+            "right" => ("ArrowRight", "ArrowRight", 39, ""),
+            "down" => ("ArrowDown", "ArrowDown", 40, ""),
+            other => return Err(format!("未知中继按键: {other}")),
+        };
+        let page = self.page(page_id).await.ok_or_else(|| "page_id 不存在".to_string())?;
+        let mut down = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyDown)
+            .key(name)
+            .code(code)
+            .windows_virtual_key_code(vk)
+            .native_virtual_key_code(vk);
+        if !text.is_empty() {
+            down = down.text(text);
+        }
+        page.execute(down.build().map_err(|e| e.to_string())?)
+            .await
+            .map_err(|e| e.to_string())?;
+        let up = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyUp)
+            .key(name)
+            .code(code)
+            .windows_virtual_key_code(vk)
+            .native_virtual_key_code(vk)
+            .build()
+            .map_err(|e| e.to_string())?;
+        page.execute(up).await.map_err(|e| e.to_string())?;
+        Ok(json!({"key": name}))
+    }
+
+    /// 侵入式会话收口:清本页拖拽中继状态(防陈旧 down 态跨会话泄漏)。
+    pub fn relay_reset(&self, page_id: &str) {
+        let st = relay_state();
+        st.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(page_id);
+    }
+
+    /// 页面视口尺寸(CDP 中继坐标基准);失败回退 1920×1080。
+    async fn viewport_size(&self, page: &Page) -> (f64, f64) {
+        use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+        let expr = "JSON.stringify({w: window.innerWidth, h: window.innerHeight})";
+        if let Ok(params) = EvaluateParams::builder()
+            .expression(expr)
+            .return_by_value(true)
+            .build()
+        {
+            if let Ok(v) = page.evaluate(params).await {
+                let s = v.value().and_then(|x| x.as_str().map(str::to_string));
+                if let Some(s) = s {
+                    if let Ok(p) = serde_json::from_str::<Value>(&s) {
+                        let w = p.get("w").and_then(Value::as_f64).unwrap_or(0.0);
+                        let h = p.get("h").and_then(Value::as_f64).unwrap_or(0.0);
+                        if w > 0.0 && h > 0.0 {
+                            return (w, h);
+                        }
+                    }
+                }
+            }
+        }
+        (1920.0, 1080.0)
     }
 
     /// 第 152 轮:设置自动跟随期望态并立即应用到当前文档;导航后新文档自动重挂。

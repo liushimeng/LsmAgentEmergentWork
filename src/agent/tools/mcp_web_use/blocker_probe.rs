@@ -370,7 +370,7 @@ fn probe_js() -> String {
         r#"(() => {
   try {
     if (!document.body) return {text: '', overlay: null};
-    const text = __laewBodyVisibleText();
+    const text = %NS%BodyVisibleText();
     const vw = window.innerWidth, vh = window.innerHeight;
     // 词表候选:命中 modal/dialog/captcha/verify 等**语义类名**的模态。
     const SEL = 'dialog[open], [role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i], [class*="popup" i], [class*="mask" i], [class*="overlay" i], [class*="captcha" i], [class*="verify" i], [class*="challenge" i]';
@@ -381,7 +381,7 @@ fn probe_js() -> String {
     const SEL_GENERIC = 'body div, body section, body main, body aside, body form';
     let best = null;
     const consider = (el) => {
-      if (!el || el.closest('[data-laew-agent]')) return;
+      if (!el || el.closest('[data-%NS%agent]')) return;
       const cs = window.getComputedStyle(el);
       if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return;
       if (cs.position !== 'fixed' && cs.position !== 'absolute') return;

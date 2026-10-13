@@ -18,6 +18,7 @@ fn sample_display() -> HumanAssistDisplay {
         page_id: "p_ab12cd34".into(),
         image_path: String::new(),
         guard_unlocked: false,
+        relay_rect: None,
         timeout_ms: 120_000,
         prompt_visual_width: 0,
         created_at_ms: 1_759_991_525_000,
@@ -322,6 +323,7 @@ async fn smoke_real_dialog_popup() {
                 "",
                 false,
                 false,
+                None,
             )
             .await
         }
@@ -361,4 +363,26 @@ async fn smoke_real_dialog_popup() {
     if was {
         hub.attach();
     }
+}
+
+/// 2026-10-13(二):侵入式 relay 中间行解析(弹窗子进程 → 父进程的契约)。
+#[test]
+fn parse_relay_line_shapes() {
+    let down = crate::agent::human_ui::parse_relay_line(
+        r#"{"status":"relay","id":42,"kind":"down","x":0.5,"y":0.25,"key":""}"#,
+    );
+    let (id, ev) = down.expect("应可解析");
+    assert_eq!(id, 42);
+    assert_eq!(ev["kind"], "down");
+    assert_eq!(ev["x"], 0.5);
+    // 非 relay 行 / 缺 kind / 非 JSON 一律 None
+    assert!(crate::agent::human_ui::parse_relay_line(
+        r#"{"status":"extend","id":1,"ms":100}"#
+    )
+    .is_none());
+    assert!(crate::agent::human_ui::parse_relay_line(
+        r#"{"status":"relay","id":1}"#
+    )
+    .is_none());
+    assert!(crate::agent::human_ui::parse_relay_line("garbage").is_none());
 }

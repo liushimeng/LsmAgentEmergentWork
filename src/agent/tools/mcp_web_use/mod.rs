@@ -188,8 +188,12 @@ pub(super) async fn eval_js_string(
     js: &str,
 ) -> std::result::Result<Value, String> {
     use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+    // 第 168 轮:模板内 `%NS%` 占位符 → 进程级随机命名空间(隐身,见 browser_ns.rs)。
+    // 集中在本网关替换,probe/inspect/page_health 等全部内部模板自动生效;
+    // LLM 用户表达式含字面 %NS% 的概率可忽略,误替换也无害。
+    let js = crate::agent::browser_ns::render_ns(js);
     let params = EvaluateParams::builder()
-        .expression(js.to_string())
+        .expression(js)
         .return_by_value(true)
         .build()
         .map_err(|e| e.to_string())?;
@@ -463,7 +467,7 @@ async fn fit_headed_window(page_id: &str) -> Option<Value> {
 /// request_human,不再空烧。判定只认结构证据(状态码 ≥400 / 排除注入层后 DOM 为空),
 /// 不做关键词猜测:
 /// - `main_doc_error`:主文档响应状态 ≥400(服务器/WAF 拒绝,reload 通常无效);
-/// - `empty_dom`:排除 `[data-laew-agent]` 注入层后仅剩 html/head/body 且无文本
+/// - `empty_dom`:排除 `[data-%NS%agent]` 注入层后仅剩 html/head/body 且无文本
 ///   (SPA 首帧未跑完也会短暂如此,文案相应更软,引导先 wait 复查)。
 async fn page_health_field(page_id: &str, final_url: &str) -> Option<Value> {
     // ① 主文档状态:扫 Network 环形缓冲里 url 命中 final_url 的 response 条目
@@ -483,18 +487,25 @@ async fn page_health_field(page_id: &str, final_url: &str) -> Option<Value> {
             })
         });
     // ② 空文档判定(只读 evaluate,不改 DOM;connect 模式同样只读不注入)。
-    // 判定只看结构证据:排除 `[data-laew-agent]` 注入层(高亮框/徽标/蒙层/状态条)
+    // 判定只看结构证据:排除 `[data-<ns>agent]` 注入层(高亮框/徽标/蒙层/状态条)
     // 后仅剩 html/head/body(real ≤3)即无真实内容。**不**叠加 body.innerText
     // 文本门槛 —— 注入层文案(「LAEW Agent 控制中」等约 50 字)恒计入 innerText,
     // 叠加会把真空页误判为非空(内网站点 400 空文档实测如此)。
+    // 第 168 轮:同探空文本前置匹配**风控页签名**(实测京东 `.jd-main-risk-fallback`
+    // 「当前页面异常/请刷新或切换账户试试」,登录后风控复核触发,自动 reload 无效)。
     let dom: Option<Value> = async {
         let page = BrowserManager::global().page(page_id).await?;
         let v = eval_js_string(
             &page,
             r#"JSON.stringify((()=>{
                 try {
-                    return {real: document.querySelectorAll('*:not([data-laew-agent])').length};
-                } catch (e) { return {real: -1}; }
+                    const real = document.querySelectorAll('*:not([data-%NS%agent])').length;
+                    const t = (document.body && (document.body.innerText || '').slice(0, 600)) || '';
+                    const risk = t.indexOf('当前页面异常') >= 0
+                        || t.indexOf('请刷新或切换账户') >= 0
+                        || t.indexOf('内容太火爆了') >= 0;
+                    return {real, risk};
+                } catch (e) { return {real: -1, risk: false}; }
             })())"#,
         )
         .await
@@ -506,6 +517,21 @@ async fn page_health_field(page_id: &str, final_url: &str) -> Option<Value> {
     let dom_blank = dom
         .as_ref()
         .map(|d| d.get("real").and_then(Value::as_i64).unwrap_or(-1) <= 3);
+    // 风控拦截页优先于 empty_dom 报告(页面 DOM 并不空 —— 有风控 fallback 容器,
+    // 但 reload 空转是负收益,必须第一时间给出正确处置路径)。
+    if dom
+        .as_ref()
+        .map(|d| d.get("risk").and_then(Value::as_bool).unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return Some(json!({
+            "blank": false,
+            "reason": "risk_page",
+            "main_doc_status": main_status,
+            "note": "站点风控拦截页(登录后常见,实测 .jd-main-risk-fallback):自动 reload/点页面「刷新」均无效",
+            "next_action": "control(request_human, reason=manual_verify) 请人工在窗口处理(刷新/滑块/切换账号);根治建议 open(reuse_existing=true) 复用日常浏览器(真实指纹+登录态,connect 模式零注入)",
+        }));
+    }
     if let Some(status) = main_status.filter(|s| *s >= 400) {
         return Some(json!({
             "blank": dom_blank.unwrap_or(true),

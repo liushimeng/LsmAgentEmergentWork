@@ -24,9 +24,9 @@ pub(super) enum GuardLiftKind {
 /// 输入类动作前的让路:按当前管控档分流(第 141 轮解锁,第 143 轮隐盾,
 /// 第 155 轮 locked 优先 DOM 闸挂起、闸不在场回退 CDP 解锁)。
 ///
-/// - locked(headed):`__laewGuardInputSuspend(true)` 挂起输入闸;闸不在场
+/// - locked(headed):`%NS%GuardInputSuspend(true)` 挂起输入闸;闸不在场
 ///   (杀开关关闭/脚本未注入)才走 `Input.setIgnoreInputEvents=false` 回退路径;
-/// - partial(headed 非 connect):`__laewGuardSuspend(true)` 隐藏盾罩;
+/// - partial(headed 非 connect):`%NS%GuardSuspend(true)` 隐藏盾罩;
 /// - open / hidden / connect / page_id 失效 → None(零开销;后者由动作自身报 2000)。
 /// fail-open:让路失败也不阻断动作(等同未激活,动作照常执行)。
 pub(super) async fn guard_lift_for_input(

@@ -186,6 +186,8 @@ pub fn build_payload(display: &HumanAssistDisplay) -> Value {
         "page_id": display.page_id,
         "image_path": display.image_path,
         "guard_unlocked": display.guard_unlocked,
+        // 2026-10-13(二):侵入式中继映射区(缺省 null = 映射整个视口)。
+        "relay_rect": display.relay_rect,
         "started_at": fmt_local_ms(now_ms),
         "started_at_ms": now_ms,
         "timeout_ms": display.timeout_ms,
@@ -271,6 +273,23 @@ pub fn parse_extend_line(line: &str) -> Option<(u64, u64)> {
     let id = v.get("id").and_then(Value::as_u64)?;
     let ms = v.get("ms").and_then(Value::as_u64).filter(|ms| *ms > 0)?;
     Some((id, ms))
+}
+
+/// 2026-10-13(二):解析弹窗子进程的 `relay` **中间行**
+/// `{"status":"relay","id":<请求id>,"kind":<...>,"x":..,"y":..,"key":..}`(侵入式
+/// 触控板手势)。返回 (请求id, 事件载荷);非 relay 行返回 None。
+pub fn parse_relay_line(line: &str) -> Option<(u64, Value)> {
+    let t = line.trim();
+    if t.is_empty() || !t.starts_with('{') {
+        return None;
+    }
+    let v = serde_json::from_str::<Value>(t).ok()?;
+    if v.get("status").and_then(|s| s.as_str())? != "relay" {
+        return None;
+    }
+    let id = v.get("id").and_then(Value::as_u64)?;
+    v.get("kind").and_then(|k| k.as_str())?;
+    Some((id, v))
 }
 
 /// 2026-10-13:解析弹窗子进程的 `guard` **中间行**
@@ -397,6 +416,11 @@ async fn run_dialog_process(payload_path: &std::path::Path) -> UiResult {
                     // handler;id 不匹配当前槽位则静默丢弃,与 extend 同构)。
                     crate::agent::human_assist::HumanAssistHub::global()
                         .guard_toggle_from_ui(id, unlock);
+                } else if let Some((id, event)) = parse_relay_line(&t) {
+                    // 2026-10-13(二):弹窗「侵入式」触控板手势/会话行 → hub 转交
+                    // act_request_human 安装的中继 handler(CDP 可信物理输入回放)。
+                    crate::agent::human_assist::HumanAssistHub::global()
+                        .relay_from_ui(id, event);
                 } else {
                     kept.push(t);
                 }

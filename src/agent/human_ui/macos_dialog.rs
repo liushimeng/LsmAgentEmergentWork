@@ -116,6 +116,9 @@ msg!(send_void_size, (size: NSSize) -> ());
 msg!(send_void_id_bool, (ev: Id, at_start: bool) -> ());
 msg!(send_void_sel, (arg: Sel) -> ());
 msg!(send_id_f64, (size: f64) -> Id);
+msg!(send_void_f64, (arg: f64) -> ());
+msg!(send_point, () -> NSPoint);
+msg!(send_id_f64_f64_f64_f64, (r: f64, g: f64, b: f64, a: f64) -> Id);
 
 /// 结构体返回(NSRect,32 字节):x86_64 必须走 `objc_msgSend_stret`(隐藏 sret
 /// 指针作首参),arm64 统一 `objc_msgSend`。
@@ -172,7 +175,11 @@ const CANCEL_W: f64 = 84.0;
 const SUBMIT_W: f64 = 96.0;
 const EXTEND_W: f64 = 88.0;
 /// 2026-10-13:「解除屏蔽/恢复屏蔽」互切按钮。
+/// 2026-10-13(二):按钮语义重命名 —— 「🖐 非侵入式」= 整页开放人工直接操作
+/// (原「解除屏蔽」),反态标题沿用「🔒 恢复屏蔽」。
 const GUARD_W: f64 = 96.0;
+/// 2026-10-13(二):「🎮 侵入式」互切按钮(弹窗触控板 → CDP 可信物理输入回放)。
+const INTRUSIVE_W: f64 = 88.0;
 const COPY_W: f64 = 92.0;
 const INNER: f64 = 8.0;
 
@@ -201,6 +208,7 @@ struct Frames {
     submit: NSRect,
     extend: NSRect,
     guard: NSRect,
+    intrusive: NSRect,
     copy: NSRect,
 }
 
@@ -243,8 +251,34 @@ fn layout_frames(cw: f64, ch: f64, geo: Geometry, opt_count: usize) -> Frames {
             GUARD_W,
             BTN_H,
         ),
+        intrusive: ns_rect(
+            PAD + CANCEL_W + INNER + SUBMIT_W + INNER + EXTEND_W + INNER + GUARD_W + INNER,
+            row_y,
+            INTRUSIVE_W,
+            BTN_H,
+        ),
         copy: ns_rect(cw - PAD - COPY_W, row_y, COPY_W, BTN_H),
     }
+}
+
+/// 2026-10-13(二):侵入式触控板矩形(纯函数,由 [`Frames`] 派生)——
+/// 覆盖说明区 + 候选选项区(msg 之下到最后一个选项底边),与
+/// [`layout_frames`] 同源参数,不回读窗口/控件 frame。
+fn pad_frame(f: &Frames, opt_count: usize) -> NSRect {
+    let mut bottom = f.msg.origin.y;
+    let mut top = f.msg.origin.y + f.msg.size.height;
+    if opt_count > 0 {
+        let first = f.opts[0];
+        let last = f.opts[opt_count - 1];
+        top = (first.origin.y + first.size.height).max(top);
+        bottom = bottom.min(last.origin.y);
+    }
+    ns_rect(
+        f.msg.origin.x,
+        bottom,
+        f.msg.size.width,
+        (top - bottom).max(f.msg.size.height),
+    )
 }
 
 /// 预算纯函数:由内容推出所需内容视图高(与 [`layout_frames`] 的消费序列逐项对应)。
@@ -271,6 +305,10 @@ struct Views {
     submit: Id,
     extend: Id,
     guard: Id,
+    /// 2026-10-13(二):「🎮 侵入式」互切按钮。
+    intrusive: Id,
+    /// 2026-10-13(二):侵入式触控板(动态子类 LAEWRelayPad,缺省隐藏)。
+    pad: Id,
     copy: Id,
 }
 
@@ -292,6 +330,14 @@ struct MacState {
     guard_unblocked: bool,
     /// 2026-10-13:选项是否多选(复选框组);收口时收集全部勾选。
     multi_select: bool,
+    /// 2026-10-13(二):是否处于「侵入式」触控板模式(弹窗内拖动/按键 → 回放)。
+    intrusive: bool,
+    /// 2026-10-13(二):触控板矩形(进入侵入式时由 [`pad_frame`] 落位;归一化基准)。
+    pad_rect: NSRect,
+    /// 2026-10-13(二):布局结果(退出侵入式时全量还原;与 [layout_frames] 同源)。
+    frames: Frames,
+    /// 2026-10-13(二):布局几何(还原用)。
+    geo: Geometry,
     timer: Id,
     started: Instant,
     timeout_ms: u64,
@@ -533,6 +579,7 @@ fn controller_class() -> Id {
             & ok(on_opt_toggle, b"optToggle:\0")
             & ok(on_extend, b"extend:\0")
             & ok(on_guard_toggle, b"guardToggle:\0")
+            & ok(on_relay_toggle, b"relayToggle:\0")
             & ok(on_copy, b"copyInfo:\0")
             & ok(on_tick, b"tick:\0")
             & ok(on_focus_once, b"focusOnce:\0")
@@ -546,6 +593,222 @@ fn controller_class() -> Id {
     ptr as Id
 }
 
+// ---------- 2026-10-13(二):侵入式触控板(NSView 动态子类 + 事件 IMP) ----------
+
+/// 触控板事件 → relay 中间行(归一化坐标 0..1,页面 y 轴向下;AppKit y 轴向上
+/// 故 y 取反)。`state` 非侵入式/收口后一律丢弃(迟到的鼠标事件不作用)。
+fn pad_relay(event: Id, kind: &str) {
+    let (id, rect) = {
+        let guard = state();
+        match guard.as_ref() {
+            Some(st) if st.intrusive && !st.done => (st.payload_id, st.pad_rect),
+            _ => return,
+        }
+    };
+    let p = unsafe { send_point(event, sel(b"locationInWindow\0")) };
+    let w = rect.size.width.max(1.0);
+    let h = rect.size.height.max(1.0);
+    let nx = ((p.x - rect.origin.x) / w).clamp(0.0, 1.0);
+    let ny = (1.0 - (p.y - rect.origin.y) / h).clamp(0.0, 1.0);
+    println!(
+        "{}",
+        super::dialog_main::relay_line(id, kind, nx, ny, "")
+    );
+}
+
+extern "C" fn on_pad_down(_self: Id, _cmd: Sel, event: Id) {
+    pad_relay(event, "down");
+}
+extern "C" fn on_pad_drag(_self: Id, _cmd: Sel, event: Id) {
+    pad_relay(event, "move");
+}
+extern "C" fn on_pad_up(_self: Id, _cmd: Sel, event: Id) {
+    pad_relay(event, "up");
+}
+
+/// 触控板按键 → relay key 行(AppKit keyCode → 语义名;回车/空格可直接提交挑战)。
+extern "C" fn on_pad_key(_self: Id, _cmd: Sel, event: Id) {
+    let code = unsafe { send_i64(event, sel(b"keyCode\0")) };
+    let name = match code {
+        36 | 76 => "enter",
+        53 => "esc",
+        48 => "tab",
+        49 => "space",
+        51 => "backspace",
+        117 => "delete",
+        123 => "left",
+        124 => "right",
+        125 => "down",
+        126 => "up",
+        _ => return,
+    };
+    let id = {
+        let guard = state();
+        match guard.as_ref() {
+            Some(st) if st.intrusive && !st.done => st.payload_id,
+            _ => return,
+        }
+    };
+    println!("{}", super::dialog_main::relay_line(id, "key", 0.0, 0.0, name));
+}
+
+/// 触控板必须能成为第一响应者才能收到 keyDown:(YES = 1 的 BOOL)。
+extern "C" fn pad_accepts_first_responder(_self: Id, _cmd: Sel) -> i8 {
+    1
+}
+
+/// 动态注册 LAEWRelayPad : NSView(进程内一次)。
+fn relay_pad_class() -> Id {
+    static PAD_CLASS: OnceLock<usize> = OnceLock::new();
+    let ptr = *PAD_CLASS.get_or_init(|| unsafe {
+        let superclass = cls(b"NSView\0");
+        if superclass.is_null() {
+            return 0;
+        }
+        let c = objc_allocateClassPair(superclass, b"LaewRelayPad\0".as_ptr().cast(), 0);
+        if c.is_null() {
+            return 0;
+        }
+        let ok = |m: extern "C" fn(Id, Sel, Id), name: &'static [u8]| {
+            class_addMethod(c, sel(name), m, b"v@:@\0".as_ptr().cast()) != 0
+        };
+        let all = ok(on_pad_down, b"mouseDown:\0")
+            & ok(on_pad_drag, b"mouseDragged:\0")
+            & ok(on_pad_up, b"mouseUp:\0")
+            & ok(on_pad_key, b"keyDown:\0")
+            & {
+                // 返回 BOOL 的 IMP:objc 只传 (self, _cmd),第三个参数位是无关位,
+                // 按 class_addMethod 声明的三元签名做同尺寸函数指针转换(ARM64/x86_64
+                // 调用约定下参数位多余不影响返回寄存器)。
+                #[allow(clippy::missing_transmute_annotations)]
+                let fpr: extern "C" fn(Id, Sel, Id) =
+                    std::mem::transmute(pad_accepts_first_responder as extern "C" fn(Id, Sel) -> i8);
+                class_addMethod(
+                    c,
+                    sel(b"acceptsFirstResponder\0"),
+                    fpr,
+                    b"c@:\0".as_ptr().cast(),
+                ) != 0
+            };
+        if !all {
+            return 0;
+        }
+        objc_registerClassPair(c);
+        c as usize
+    });
+    ptr as Id
+}
+
+/// 建触控板视图(深色底 + 虚线提示文字;缺省隐藏)。
+unsafe fn make_relay_pad() -> Id {
+    let c = relay_pad_class();
+    if c.is_null() {
+        return std::ptr::null_mut();
+    }
+    let pad = send_id_rect(
+        send_id(c, sel(b"alloc\0")),
+        sel(b"initWithFrame:\0"),
+        ns_rect(0.0, 0.0, 10.0, 10.0),
+    );
+    send_void_bool(pad, sel(b"setWantsLayer:\0"), true);
+    let color = send_id_f64_f64_f64_f64(
+        cls(b"NSColor\0"),
+        sel(b"colorWithCalibratedRed:green:blue:alpha:\0"),
+        0.09,
+        0.13,
+        0.21,
+        1.0,
+    );
+    let layer = send_id(pad, sel(b"layer\0"));
+    if !layer.is_null() {
+        send_void_id(layer, sel(b"setBackgroundColor:\0"), send_id(color, sel(b"CGColor\0")));
+        send_void_f64(layer, sel(b"setCornerRadius:\0"), 8.0);
+    }
+    // 提示文字(可选中复制;居中偏上,不挡操作)。
+    let hint = make_label(11.0, false);
+    send_void_id(hint, sel(b"setTextColor:\0"), send_id_f64_f64_f64_f64(
+        cls(b"NSColor\0"),
+        sel(b"colorWithCalibratedRed:green:blue:alpha:\0"),
+        0.85,
+        0.89,
+        0.96,
+        1.0,
+    ));
+    send_void_id(hint, sel(b"setStringValue:\0"), ns_str(super::dialog_main::RELAY_PAD_HINT));
+    send_void_rect(hint, sel(b"setFrame:\0"), ns_rect(10.0, 8.0, 600.0, 34.0));
+    send_void_id(pad, sel(b"addSubview:\0"), hint);
+    send_void_bool(pad, sel(b"setHidden:\0"), true);
+    pad
+}
+
+/// 2026-10-13(二):「🎮 侵入式」互切 —— 进入时隐藏说明区/选项区、显示触控板并
+/// 打 `session_start` 中间行(父进程放行页面 + 解析映射区 + 置前窗口);退出时
+/// 还原布局并打 `session_end`。
+extern "C" fn on_relay_toggle(_self: Id, _cmd: Sel, _sender: Id) {
+    let (line, title, pad, msg_scroll, opts, input, btn, snap, frames, geo, now_on, pad_rect) = {
+        let mut guard = state();
+        let Some(st) = guard.as_mut() else { return };
+        if st.done {
+            return;
+        }
+        st.intrusive = !st.intrusive;
+        let pad_rect = pad_frame(&st.frames, st.views.opts.len());
+        if st.intrusive {
+            st.pad_rect = pad_rect;
+        }
+        let line = if st.intrusive {
+            super::dialog_main::relay_line(st.payload_id, "session_start", 0.0, 0.0, "")
+        } else {
+            super::dialog_main::relay_line(st.payload_id, "session_end", 0.0, 0.0, "")
+        };
+        let title = if st.intrusive {
+            super::dialog_main::INTRUSIVE_BTN_EXIT_TITLE
+        } else {
+            super::dialog_main::INTRUSIVE_BTN_TITLE
+        };
+        (
+            line,
+            title,
+            st.views.pad,
+            st.views.msg_scroll,
+            st.views.opts.clone(),
+            st.views.input,
+            st.views.intrusive,
+            ViewsSnapshot::from(&st.views),
+            st.frames.clone(),
+            st.geo,
+            st.intrusive,
+            pad_rect,
+        )
+    };
+    println!("{line}");
+    unsafe {
+        send_void_bool(msg_scroll, sel(b"setHidden:\0"), now_on);
+        for o in &opts {
+            send_void_bool(*o, sel(b"setHidden:\0"), now_on);
+        }
+        send_void_bool(input, sel(b"setHidden:\0"), now_on);
+        if !pad.is_null() {
+            send_void_bool(pad, sel(b"setHidden:\0"), !now_on);
+            if now_on {
+                send_void_rect(pad, sel(b"setFrame:\0"), pad_rect);
+                // 触控板成为第一响应者,接收键盘(Enter/Space 直接提交滑块验证)。
+                let window = send_id(pad, sel(b"window\0"));
+                if !window.is_null() {
+                    send_void_id(window, sel(b"makeFirstResponder:\0"), pad);
+                }
+            } else {
+                apply_frames(&snap, &frames, geo);
+            }
+        } else if !now_on {
+            apply_frames(&snap, &frames, geo);
+        }
+        if !btn.is_null() {
+            send_void_id(btn, sel(b"setTitle:\0"), ns_str(title));
+        }
+    }
+}
+
 // ---------- 收口 ----------
 
 /// 收口(只在 UI 线程调用):结果映射 → 停定时器 → 停 run loop。
@@ -555,6 +818,7 @@ fn controller_class() -> Id {
 /// - 无字 + tag<0(提交按钮/输入框回车)→ answer(选项 1,对齐「空回车=选项1」);
 /// - cancel / timeout 直传。
 fn finish(kind: &str, tag: i64) {
+    let mut was_intrusive = false;
     {
         let mut guard = state();
         let Some(st) = guard.as_mut() else { return };
@@ -591,6 +855,21 @@ fn finish(kind: &str, tag: i64) {
             }
         };
         st.result = Some(result);
+        // 2026-10-13(二):侵入式会话随收口一并结束(父进程据此恢复页面管控;
+        // 收口路径本身也会恢复,幂等双保险)。
+        was_intrusive = st.intrusive;
+    }
+    if was_intrusive {
+        let id = {
+            let guard = state();
+            guard.as_ref().map(|st| st.payload_id).unwrap_or(0)
+        };
+        if id > 0 {
+            println!(
+                "{}",
+                super::dialog_main::relay_line(id, "session_end", 0.0, 0.0, "")
+            );
+        }
     }
     unsafe { stop_run_loop() };
 }
@@ -660,6 +939,8 @@ struct ViewsSnapshot {
     submit: Id,
     extend: Id,
     guard: Id,
+    intrusive: Id,
+    pad: Id,
     copy: Id,
 }
 
@@ -676,6 +957,8 @@ impl ViewsSnapshot {
             submit: v.submit,
             extend: v.extend,
             guard: v.guard,
+            intrusive: v.intrusive,
+            pad: v.pad,
             copy: v.copy,
         }
     }
@@ -700,6 +983,7 @@ unsafe fn apply_frames(v: &ViewsSnapshot, f: &Frames, _geo: Geometry) {
     set(v.submit, f.submit);
     set(v.extend, f.extend);
     set(v.guard, f.guard);
+    set(v.intrusive, f.intrusive);
     set(v.copy, f.copy);
 }
 
@@ -857,13 +1141,24 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         if p.guard_unlocked {
             super::dialog_main::GUARD_BTN_LOCK_TITLE
         } else {
-            super::dialog_main::GUARD_BTN_UNLOCK_TITLE
+            // 2026-10-13(二):「🖐 非侵入式」= 原「解除屏蔽」(整页开放,人工直接操作)。
+            super::dialog_main::NONINTRUSIVE_BTN_TITLE
         },
         None,
         ctrl,
         b"guardToggle:\0",
         -1,
     );
+    // 2026-10-13(二):「🎮 侵入式」互切按钮 + 触控板(弹窗内拖动/按键 → CDP 可信
+    // 物理输入回放;根治实测「登录后滑块弹窗人工无论如何都操作不了」)。
+    let intrusive_btn = make_button(
+        super::dialog_main::INTRUSIVE_BTN_TITLE,
+        None,
+        ctrl,
+        b"relayToggle:\0",
+        -1,
+    );
+    let pad = make_relay_pad();
     // 第 139 轮:一键复制全部信息(说明 + 页面 URL + 页面 ID + 候选选项)。
     let copy_btn = make_button(COPY_BTN_TITLE, None, ctrl, b"copyInfo:\0", -1);
 
@@ -885,6 +1180,8 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     add(content, submit);
     add(content, extend);
     add(content, guard);
+    add(content, intrusive_btn);
+    add(content, pad);
     add(content, copy_btn);
 
     send_void_id(
@@ -911,13 +1208,16 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         submit,
         extend,
         guard,
+        intrusive: intrusive_btn,
+        pad,
         copy: copy_btn,
     };
     let snapshot = ViewsSnapshot::from(&views);
 
     // ---- 定位 + 排版(用 place_window 的返回值,不回读)----
     let (fw, fh) = place_window(window, W, normal_h);
-    apply_frames(&snapshot, &layout_frames(fw, fh, geo, p.options.len()), geo);
+    let frames = layout_frames(fw, fh, geo, p.options.len());
+    apply_frames(&snapshot, &frames, geo);
 
     // ---- 焦点与激活 ----
     send_void_id(window, sel(b"makeKeyAndOrderFront:\0"), std::ptr::null_mut());
@@ -956,6 +1256,10 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         extend_count: 0,
         guard_unblocked: p.guard_unlocked,
         multi_select: p.multi_select,
+        intrusive: false,
+        pad_rect: ns_rect(0.0, 0.0, 1.0, 1.0),
+        frames,
+        geo,
         timer: tick,
         started: Instant::now(),
         timeout_ms: p.timeout_ms,
@@ -1178,6 +1482,7 @@ mod tests {
             ("submit", f.submit),
             ("extend", f.extend),
             ("guard", f.guard),
+            ("intrusive", f.intrusive),
             ("copy", f.copy),
         ];
         for (i, r) in f.opts.iter().enumerate() {
@@ -1208,6 +1513,7 @@ mod tests {
             ("submit", f.submit),
             ("extend", f.extend),
             ("guard", f.guard),
+            ("intrusive", f.intrusive),
             ("copy", f.copy),
         ];
         row_rects.sort_by(|a, b| a.1.origin.x.total_cmp(&b.1.origin.x));
@@ -1298,6 +1604,47 @@ mod tests {
         assert_frames_in_bounds(W, h, geo, 3);
         assert!(f.submit.origin.x + f.submit.size.width <= f.extend.origin.x + 0.01);
         assert!(f.extend.origin.x + f.extend.size.width <= f.guard.origin.x + 0.01);
-        assert!(f.guard.origin.x + f.guard.size.width <= f.copy.origin.x + 0.01);
+        assert!(f.guard.origin.x + f.guard.size.width <= f.intrusive.origin.x + 0.01);
+        assert!(f.intrusive.origin.x + f.intrusive.size.width <= f.copy.origin.x + 0.01);
+    }
+
+    /// 2026-10-13(二):侵入式触控板矩形 = 说明区 + 候选选项区(与布局同源派生,
+    /// 不回读窗口/控件 frame)。
+    #[test]
+    fn pad_frame_covers_msg_and_opts() {
+        let geo = Geometry { msg_h: 90.0 };
+        let h = content_height(geo, 3);
+        let f = layout_frames(W, h, geo, 3);
+        let pf = pad_frame(&f, 3);
+        assert_eq!(pf.origin.x, f.msg.origin.x);
+        assert_eq!(pf.size.width, f.msg.size.width);
+        // AppKit y 轴自底向上:触控板顶 = msg 顶,底 = 最后一个选项底
+        assert!(
+            (pf.origin.y + pf.size.height - (f.msg.origin.y + f.msg.size.height)).abs() < 0.01,
+            "触控板顶缘应等于 msg 顶缘:{pf:?} vs {:?}",
+            f.msg
+        );
+        let last = f.opts[2];
+        assert!(
+            (pf.origin.y - last.origin.y).abs() < 0.01,
+            "触控板底缘应等于最后一个选项底缘:{pf:?} vs {last:?}"
+        );
+        // 无选项时 = 说明区
+        let f0 = layout_frames(W, h, geo, 0);
+        let pf0 = pad_frame(&f0, 0);
+        assert_eq!(pf0.origin.y, f0.msg.origin.y);
+        assert_eq!(pf0.size.height, f0.msg.size.height);
+    }
+
+    /// 2026-10-13(二):侵入式按钮标题对(进入/退出)与 dialog_main 常量同源。
+    #[test]
+    fn intrusive_button_titles_are_paired() {
+        use super::super::dialog_main::{
+            INTRUSIVE_BTN_EXIT_TITLE, INTRUSIVE_BTN_TITLE, NONINTRUSIVE_BTN_TITLE,
+        };
+        assert_eq!(INTRUSIVE_BTN_TITLE, "🎮 侵入式");
+        assert_eq!(INTRUSIVE_BTN_EXIT_TITLE, "⏹ 退出侵入式");
+        assert_eq!(NONINTRUSIVE_BTN_TITLE, "🖐 非侵入式");
+        assert_ne!(INTRUSIVE_BTN_TITLE, INTRUSIVE_BTN_EXIT_TITLE);
     }
 }

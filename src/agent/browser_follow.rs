@@ -35,7 +35,7 @@ pub const AT_BOTTOM_TOLERANCE_PX: f64 = 96.0;
 /// 元素,退化到 `document.scrollingElement`。
 pub const AUTO_FOLLOW_JS: &str = r#"(() => {
   try {
-    if (window.__laewAutoFollow) { return true; }
+    if (window.%NS%AutoFollow) { return true; }
     const TOL = 96;
     const state = { on: false, timer: null, lastH: -1, lastAtBottom: true };
     const scroller = () => {
@@ -62,7 +62,7 @@ pub const AUTO_FOLLOW_JS: &str = r#"(() => {
       if (state.lastAtBottom) { el.scrollTop = el.scrollHeight; }
       state.lastH = el.scrollHeight;
     };
-    window.__laewAutoFollowStatus = () => {
+    window.%NS%AutoFollowStatus = () => {
       const el = scroller();
       if (!el) return { ready: false };
       return {
@@ -74,7 +74,7 @@ pub const AUTO_FOLLOW_JS: &str = r#"(() => {
         at_bottom: state.lastAtBottom,
       };
     };
-    window.__laewAutoFollow = function (on, intervalMs) {
+    window.%NS%AutoFollow = function (on, intervalMs) {
       state.on = !!on;
       if (state.timer) { clearInterval(state.timer); state.timer = null; }
       if (state.on) {
@@ -146,9 +146,12 @@ pub fn should_follow(enabled: bool, at_bottom: bool) -> bool {
 /// 给导航后的新文档执行跟随设置(配合 `addScriptToEvaluateOnNewDocument`)。
 pub async fn install(page: &chromiumoxide::Page, enabled: bool) {
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+    // 第 168 轮:%NS% 占位符 → 进程级随机命名空间（隐身，见 browser_ns.rs）。
+    let ns = crate::agent::browser_ns::inject_ns();
+    let js = crate::agent::browser_ns::render_ns(AUTO_FOLLOW_JS);
     let _ = page
         .execute(AddScriptToEvaluateOnNewDocumentParams {
-            source: format!("{AUTO_FOLLOW_JS}\nwindow.__laewAutoFollow && window.__laewAutoFollow({enabled}, {FOLLOW_INTERVAL_MS});"),
+            source: format!("{js}\nwindow.{ns}AutoFollow && window.{ns}AutoFollow({enabled}, {FOLLOW_INTERVAL_MS});"),
             world_name: None,
             include_command_line_api: None,
             run_immediately: Some(true),
@@ -158,9 +161,10 @@ pub async fn install(page: &chromiumoxide::Page, enabled: bool) {
 
 /// 在当前文档上开关跟随(导航后新文档按 [`install`] 的期望态自动重挂)。
 pub async fn set(page: &chromiumoxide::Page, enabled: bool) -> bool {
+    let ns = crate::agent::browser_ns::ns_global("AutoFollow");
     match page
         .evaluate(format!(
-            "window.__laewAutoFollow ? window.__laewAutoFollow({enabled}, {FOLLOW_INTERVAL_MS}) : null"
+            "window.{ns} ? window.{ns}({enabled}, {FOLLOW_INTERVAL_MS}) : null"
         ))
         .await
     {
@@ -237,6 +241,7 @@ pub fn visibility_note(v: &Value, human_scrollable: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::browser_ns::inject_ns;
 
     #[test]
     fn follow_only_when_user_already_at_bottom() {
@@ -287,8 +292,12 @@ mod tests {
     #[test]
     fn js_anchors_locked() {
         // 跟随器幂等重挂 + 状态查询 + 容差常量
-        assert!(AUTO_FOLLOW_JS.contains("__laewAutoFollow"));
-        assert!(AUTO_FOLLOW_JS.contains("__laewAutoFollowStatus"));
+        // 模板态断言(%NS% 占位符由 render_ns 渲染为进程级随机名)。
+        assert!(AUTO_FOLLOW_JS.contains("%NS%AutoFollow"));
+        assert!(AUTO_FOLLOW_JS.contains("%NS%AutoFollowStatus"));
+        let rendered = crate::agent::browser_ns::render_ns(AUTO_FOLLOW_JS);
+        assert!(rendered.contains(&format!("{}AutoFollow", inject_ns())));
+        assert!(!rendered.contains("laew"), "渲染后不得残留固定签名");
         assert!(AUTO_FOLLOW_JS.contains("const TOL = 96"));
         assert!(AUTO_FOLLOW_JS.contains("atBottom(el)"));
         assert!(AUTO_FOLLOW_JS.contains("el.scrollTop = el.scrollHeight"));

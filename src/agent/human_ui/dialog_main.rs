@@ -24,6 +24,10 @@ pub(super) struct DialogPayload {
     /// 2026-10-13:页面当前是否已处于放行(open/无管控)态 —— 决定「解除屏蔽/恢复屏蔽」
     /// 切换按钮的初始标题(false=显示「🔓 解除屏蔽」,true=显示「🔒 恢复屏蔽」)。
     pub guard_unlocked: bool,
+    /// 2026-10-13(二):侵入式中继映射区(视口坐标 `{x,y,width,height}`)。
+    /// 有值 = 弹窗触控板映射到页面的该矩形(滑块/挑战层);None = 映射整个视口。
+    /// 由父进程在 session_start 时尽力解析(显式 relay_rect 参数 > 挑战层自动探测)。
+    pub relay_rect: Option<(f64, f64, f64, f64)>,
     pub timeout_ms: u64,
     pub started_at_ms: u64,
 }
@@ -74,6 +78,16 @@ impl DialogPayload {
                 .get("guard_unlocked")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
+            // 2026-10-13(二):侵入式中继映射区(容错缺省 None = 全视口映射)。
+            relay_rect: v.get("relay_rect").and_then(|r| {
+                let f = |k: &str| r.get(k).and_then(|n| n.as_f64()).unwrap_or(0.0);
+                let (x, y, w, h) = (f("x"), f("y"), f("width"), f("height"));
+                if w > 0.0 && h > 0.0 {
+                    Some((x, y, w, h))
+                } else {
+                    None
+                }
+            }),
             timeout_ms: v
                 .get("timeout_ms")
                 .and_then(|x| x.as_u64())
@@ -196,6 +210,31 @@ pub(super) const GUARD_BTN_LOCK_TITLE: &str = "🔒 恢复屏蔽";
 /// → 对关联 page_id 应用整页 open(unlock=true)/恢复快照(unlock=false)。
 pub(super) fn guard_line(id: u64, unlock: bool) -> String {
     serde_json::json!({"status": "guard", "id": id, "unlock": unlock}).to_string()
+}
+
+// ---------- 2026-10-13(二):侵入式物理输入中继(两平台共用) ----------
+
+/// 「非侵入式」按钮标题 —— 整页 open 放行,人工直接在浏览器窗口操作(既有
+/// 「解除屏蔽」语义的本轮命名;反态标题沿用 [`GUARD_BTN_LOCK_TITLE`])。
+pub(super) const NONINTRUSIVE_BTN_TITLE: &str = "🖐 非侵入式";
+/// 「侵入式」按钮标题 —— 弹窗切换为触控板:人工在弹窗内拖动/按键,事件经
+/// CDP `Input.dispatchMouseEvent` 以**可信物理输入**回放到页面(不受页面
+/// 自身 JS 闸/跨域 iframe/浏览器焦点影响,根治实测天猫滑块「人工无法操作」)。
+pub(super) const INTRUSIVE_BTN_TITLE: &str = "🎮 侵入式";
+/// 侵入式激活态按钮标题(点击退出中继模式)。
+pub(super) const INTRUSIVE_BTN_EXIT_TITLE: &str = "⏹ 退出侵入式";
+/// 侵入式触控板提示文案(渲染在触控板区域内)。
+pub(super) const RELAY_PAD_HINT: &str =
+    "在此拖动/点按 = 在浏览器页面对应位置执行(可信物理输入,无需浏览器焦点；跨 iframe 滑块可用）";
+
+/// 中继中间行:`{"status":"relay","id":<请求id>,"kind":<...>,"x":<0..1>,"y":<0..1>,"key":<...>}`。
+/// kind: `session_start`/`session_end`(进入/退出侵入式,父进程据此放行/恢复页面管控
+/// 并解析映射区) | `down`/`move`/`up`(x/y = 触控板归一化坐标,映射到 relay_rect) |
+/// `tap`(等价 down+up) | `key`(key = enter/esc/tab/space/left/right/up/down)。
+/// 子进程**不退出**,父进程逐行读并接线 `HumanAssistHub::relay_from_ui`。
+pub(super) fn relay_line(id: u64, kind: &str, x: f64, y: f64, key: &str) -> String {
+    serde_json::json!({"status": "relay", "id": id, "kind": kind, "x": x, "y": y, "key": key})
+        .to_string()
 }
 
 // ---------- 2026-10-13:多选应答编码(两平台共用) ----------
@@ -331,6 +370,38 @@ mod tests {
             Some((7, false))
         );
         assert_ne!(GUARD_BTN_UNLOCK_TITLE, GUARD_BTN_LOCK_TITLE);
+    }
+
+    /// 2026-10-13(二):侵入式映射区 relay_rect 的容错投影(缺省/非法 → None)。
+    #[test]
+    fn relay_rect_projection_is_fail_open() {
+        let p = DialogPayload::from_json(&serde_json::json!({}));
+        assert_eq!(p.relay_rect, None);
+        let bad = DialogPayload::from_json(&serde_json::json!({
+            "relay_rect": {"x": 1.0, "y": 2.0, "width": 0.0, "height": 10.0}
+        }));
+        assert_eq!(bad.relay_rect, None, "宽高非正 → None");
+        let ok = DialogPayload::from_json(&serde_json::json!({
+            "relay_rect": {"x": 10.0, "y": 20.0, "width": 300.0, "height": 120.0}
+        }));
+        assert_eq!(ok.relay_rect, Some((10.0, 20.0, 300.0, 120.0)));
+    }
+
+    /// 2026-10-13(二):relay 中间行必须是父进程 `parse_relay_line` 认识的形状。
+    #[test]
+    fn relay_line_roundtrips_with_parent_parser() {
+        let down = relay_line(42, "down", 0.5, 0.25, "");
+        assert_eq!(
+            crate::agent::human_ui::parse_relay_line(&down).map(|(id, ev)| (id, ev["kind"].clone())),
+            Some((42, serde_json::json!("down")))
+        );
+        let key = relay_line(7, "key", 0.0, 0.0, "enter");
+        let parsed = crate::agent::human_ui::parse_relay_line(&key).expect("应可解析");
+        assert_eq!(parsed.0, 7);
+        assert_eq!(parsed.1["kind"], "key");
+        assert_eq!(parsed.1["key"], "enter");
+        // 非 relay 行返回 None(extend/guard 行不落入中继通道)
+        assert!(crate::agent::human_ui::parse_relay_line("not json").is_none());
     }
 
     #[test]

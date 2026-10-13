@@ -18,6 +18,7 @@ pub mod browser_focus;
 pub mod browser_mode;
 pub mod browser_follow;
 pub mod browser_noise;
+pub mod browser_ns;
 pub mod browser_overlay;
 pub mod browser_perm;
 pub mod browser_reuse;

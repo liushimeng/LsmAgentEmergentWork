@@ -169,6 +169,9 @@ pub(super) struct HitlSpec {
     pub allow_selectors: Vec<String>,
     /// 显式附图路径(空 → 无图;弹窗不渲染,仅供 TUI 兜底打印)。
     pub image_path: Option<String>,
+    /// 2026-10-13(二):侵入式中继映射区(视口坐标 {x,y,width,height};None =
+    /// 会话开始时自动探测挑战层/回退全视口)。弹窗「侵入式」触控板落点映射依据。
+    pub relay_rect: Option<Value>,
     /// 发起来源(LLM 显式 / 工具层自动)。
     pub origin: HitlOrigin,
 }
@@ -208,6 +211,19 @@ impl HitlStatus {
             HitlStatus::Timeout => "timeout",
             HitlStatus::Unavailable => "unavailable",
         }
+    }
+}
+
+/// 解析 `relay_rect` 参数(视口坐标 `{x,y,width,height}`;宽高非正 → None)。
+/// 纯函数,可单测。
+pub(super) fn parse_relay_rect(v: &Option<Value>) -> Option<(f64, f64, f64, f64)> {
+    let obj = v.as_ref()?;
+    let f = |k: &str| obj.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    let (x, y, w, h) = (f("x"), f("y"), f("width"), f("height"));
+    if w > 0.0 && h > 0.0 {
+        Some((x, y, w, h))
+    } else {
+        None
     }
 }
 
@@ -419,6 +435,85 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
             });
         })));
     }
+    // 2026-10-13(二):弹窗「侵入式」触控板 → CDP 可信物理输入回放处理器。
+    // - session_start:放行本页(复用与 guard 切换同一套解锁路径)+ 解析映射区
+    //   (显式 relay_rect > 挑战层自动探测 > 全视口)+ 窗口置前(人工在浏览器里看着
+    //   自己的手势被回放,视觉闭环);
+    // - down/move/up/tap/key:落页回放(坐标归一化 → 映射区/视口像素);
+    // - session_end:清中继状态;管控恢复统一走收口路径(下方)与 guard 切换(不重复)。
+    {
+        let page_id_r = id.to_string();
+        let relay_rect_r = spec.relay_rect.clone();
+        let snapshot_r = unlock_snapshot.clone();
+        let manual_reassert_r = manual_reassert.clone();
+        let rect_slot: std::sync::Arc<
+            std::sync::Mutex<Option<(f64, f64, f64, f64)>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let hub = crate::agent::human_assist::HumanAssistHub::global();
+        hub.set_relay_handler(Some(std::sync::Arc::new(move |ev| {
+            let page_id = page_id_r.clone();
+            let explicit = relay_rect_r.clone();
+            let snap = snapshot_r.clone();
+            let manual_reassert = manual_reassert_r.clone();
+            let rect_slot = rect_slot.clone();
+            let kind = ev.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+            let nx = ev.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+            let ny = ev.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+            let key = ev.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+            tokio::spawn(async move {
+                let mgr = crate::agent::browser::BrowserManager::global();
+                match kind.as_str() {
+                    "session_start" => {
+                        let Some(page) = mgr.page(&page_id).await else { return };
+                        // ① 放行页面:locked 档自有输入闸只拦 isTrusted=true,
+                        //    不放行会把我们自己的物理回放一起拦掉。
+                        if let Some(handle) = apply_hitl_unlock(&page, &[]).await {
+                            let mut slot =
+                                manual_reassert.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some(old) = slot.replace(handle) {
+                                old.abort();
+                            }
+                        }
+                        // ② 映射区解析(显式 > 自动探测挑战层 > None=全视口)。
+                        let rect = match parse_relay_rect(&explicit) {
+                            Some(r) => Some(r),
+                            None => crate::agent::browser::relay_rect_probe(&page).await,
+                        };
+                        *rect_slot.lock().unwrap_or_else(|p| p.into_inner()) = rect;
+                        // ③ 窗口置前(人工看着回放发生;失败不阻断)。
+                        let _ = mgr.bring_page_to_front(&page_id).await;
+                    }
+                    "session_end" => {
+                        mgr.relay_reset(&page_id);
+                        *rect_slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                        // 恢复解锁前管控快照(与 guard 切换的 relock 同构;
+                        // 收口路径还会再恢复一次,幂等)。
+                        if let Some(old) =
+                            manual_reassert.lock().unwrap_or_else(|p| p.into_inner()).take()
+                        {
+                            old.abort();
+                        }
+                        let Some(page) = mgr.page(&page_id).await else { return };
+                        let cfg = match snap {
+                            Some(c) => c,
+                            None => mgr.current_guard().await,
+                        };
+                        let _ =
+                            crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
+                    }
+                    "down" | "move" | "up" | "tap" => {
+                        let rect =
+                            *rect_slot.lock().unwrap_or_else(|p| p.into_inner());
+                        let _ = mgr.relay_mouse(&page_id, &kind, nx, ny, rect).await;
+                    }
+                    "key" => {
+                        let _ = mgr.relay_key(&page_id, &key).await;
+                    }
+                    _ => {}
+                }
+            });
+        })));
+    }
 
     // 2026-10-13:弹窗切换按钮初始标题依据 —— 页面本就已放行(open/无管控)则显示
     // 「🔒 恢复屏蔽」,locked/partial 显示「🔓 解除屏蔽」。
@@ -435,11 +530,14 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
             &image_path,
             guard_unlocked,
             spec.multi_select,
+            spec.relay_rect.clone(),
         )
         .await;
     // 2026-10-13:收口即清除弹窗切换 handler(防陈旧 handler 泄漏到下一请求;
     // hub 清槽路径另有防御性清除,双保险)。
     crate::agent::human_assist::HumanAssistHub::global().set_guard_toggle_handler(None);
+    // 2026-10-13(二):侵入式中继 handler 同步清除(双保险,防陈旧 handler 泄漏)。
+    crate::agent::human_assist::HumanAssistHub::global().set_relay_handler(None);
     // 2026-10-13:人工手动解锁触发的导航重放协程一并收口(否则会把下面的恢复动作
     // 重新顶开)。
     if let Some(handle) = manual_reassert
@@ -612,6 +710,11 @@ pub(super) async fn act_request_human(
         unlock_page: p.get("unlock_page").and_then(Value::as_bool).unwrap_or(true),
         allow_selectors,
         image_path: str_arg(p, "image_path").map(str::to_string),
+        // 2026-10-13(二):侵入式映射区(可选;数值字段缺失/非法 → None 走自动探测)。
+        relay_rect: p
+            .get("relay_rect")
+            .filter(|v| v.is_object())
+            .cloned(),
         origin: HitlOrigin::Llm,
     };
     // 第 152 轮:人工介入是「页面状态已被人改变」的新事实 —— 清掉本页的告警指纹,
@@ -668,6 +771,9 @@ pub(in crate::agent::tools::mcp_web_use) async fn auto_hitl(
         unlock_page: true,
         allow_selectors: Vec::new(),
         image_path: None,
+        // auto 路径不预置映射区:session_start 时自动探测挑战层(输入硬闸/收尾探针
+        // 命中的挑战弹层正是侵入式要操作的目标)。
+        relay_rect: None,
         origin: HitlOrigin::Auto { trigger },
     };
     let mut report = request_human_core(page_id, &spec).await;
@@ -680,4 +786,30 @@ pub(in crate::agent::tools::mcp_web_use) async fn auto_hitl(
         dst.insert("auto_hitl".to_string(), auto);
     }
     Some(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-10-13(二):侵入式映射区解析(显式 relay_rect 的容错通道)。
+    #[test]
+    fn parse_relay_rect_is_fail_open() {
+        assert_eq!(parse_relay_rect(&None), None);
+        assert_eq!(
+            parse_relay_rect(&Some(serde_json::json!({
+                "x": 1.0, "y": 2.0, "width": 0.0, "height": 10.0
+            }))),
+            None,
+            "宽高非正 → None"
+        );
+        assert_eq!(
+            parse_relay_rect(&Some(serde_json::json!({
+                "x": 10.0, "y": 20.0, "width": 300.0, "height": 120.0
+            }))),
+            Some((10.0, 20.0, 300.0, 120.0))
+        );
+        // 非对象 → None
+        assert_eq!(parse_relay_rect(&Some(serde_json::json!("x"))), None);
+    }
 }

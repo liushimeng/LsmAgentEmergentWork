@@ -369,6 +369,14 @@ pub fn print_assist_event(ev: &AssistEvent, out: AssistOut) {
                 "  [laew] 人工已在弹窗恢复页面屏蔽".to_string()
             }
         }
+        // 2026-10-13(二):侵入式触控板会话起止通知(单步手势不逐条打,防刷屏)。
+        AssistEvent::GuiRelayForwarded { id: _, kind } => match kind.as_str() {
+            "session_start" => {
+                "  [laew] 人工已在弹窗进入『侵入式』:手势正以可信物理输入回放到页面".to_string()
+            }
+            "session_end" => "  [laew] 人工已在弹窗退出『侵入式』".to_string(),
+            _ => return, // 单步 down/move/up/tap/key 不打行
+        },
         AssistEvent::TuiEscapeAnswered { id, text } => match text {
             Some(t) => format!("  [laew] 已收到人工输入(终端 {HITL_ESCAPE_PREFIX}):{t}"),
             None => format!(
@@ -394,6 +402,7 @@ mod human_assist_tui_tests {
             page_id: "p_1".into(),
             image_path: String::new(),
             guard_unlocked: false,
+            relay_rect: None,
             timeout_ms: 120_000,
             prompt_visual_width: 84,
             created_at_ms: 0,
