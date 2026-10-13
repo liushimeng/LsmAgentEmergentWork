@@ -174,12 +174,12 @@ const CANCEL_W: f64 = 84.0;
 /// 主按钮「继续」(空输入=选项1交棒;有输入=把补充说明交给 Agent;多选时收集勾选)。
 const SUBMIT_W: f64 = 96.0;
 const EXTEND_W: f64 = 88.0;
-/// 2026-10-13:「解除屏蔽/恢复屏蔽」互切按钮。
-/// 2026-10-13(二):按钮语义重命名 —— 「🖐 非侵入式」= 整页开放人工直接操作
-/// (原「解除屏蔽」),反态标题沿用「🔒 恢复屏蔽」。
+/// 2026-10-13:「解除屏蔽/恢复屏蔽」互切按钮(= 侵入式语境的「非侵入式」入口,
+/// 2026-10-13(三)起文案保持原文案不变)。
 const GUARD_W: f64 = 96.0;
 /// 2026-10-13(二):「🎮 侵入式」互切按钮(弹窗触控板 → CDP 可信物理输入回放)。
-const INTRUSIVE_W: f64 = 88.0;
+/// (三)88→100:退出态标题「⏹ 退出侵入式」更长,防截断。
+const INTRUSIVE_W: f64 = 100.0;
 const COPY_W: f64 = 92.0;
 const INNER: f64 = 8.0;
 
@@ -1141,8 +1141,9 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         if p.guard_unlocked {
             super::dialog_main::GUARD_BTN_LOCK_TITLE
         } else {
-            // 2026-10-13(二):「🖐 非侵入式」= 原「解除屏蔽」(整页开放,人工直接操作)。
-            super::dialog_main::NONINTRUSIVE_BTN_TITLE
+            // (三)文案保持原文案:「🔓 解除屏蔽」即侵入式语境的「非侵入式」入口
+            // (整页开放,人工直接操作;实测改名会造成「文案跑到按钮位置上」的错位观感)。
+            super::dialog_main::GUARD_BTN_UNLOCK_TITLE
         },
         None,
         ctrl,
@@ -1640,11 +1641,12 @@ mod tests {
     #[test]
     fn intrusive_button_titles_are_paired() {
         use super::super::dialog_main::{
-            INTRUSIVE_BTN_EXIT_TITLE, INTRUSIVE_BTN_TITLE, NONINTRUSIVE_BTN_TITLE,
+            GUARD_BTN_UNLOCK_TITLE, INTRUSIVE_BTN_EXIT_TITLE, INTRUSIVE_BTN_TITLE,
         };
         assert_eq!(INTRUSIVE_BTN_TITLE, "🎮 侵入式");
         assert_eq!(INTRUSIVE_BTN_EXIT_TITLE, "⏹ 退出侵入式");
-        assert_eq!(NONINTRUSIVE_BTN_TITLE, "🖐 非侵入式");
         assert_ne!(INTRUSIVE_BTN_TITLE, INTRUSIVE_BTN_EXIT_TITLE);
+        // (三)「非侵入式」入口 = 既有解除屏蔽按钮,文案保持原文案不变
+        assert_eq!(GUARD_BTN_UNLOCK_TITLE, "🔓 解除屏蔽");
     }
 }

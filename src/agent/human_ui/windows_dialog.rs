@@ -65,8 +65,8 @@ const SUBMIT_W: i32 = 96;
 const EXTEND_W: i32 = 88;
 /// 2026-10-13:「解除屏蔽/恢复屏蔽」互切按钮。
 const GUARD_W: i32 = 96;
-/// 2026-10-13(二):「🎮 侵入式」互切按钮(与 macOS 侧同值)。
-const INTRUSIVE_W: i32 = 88;
+/// 2026-10-13(二):「🎮 侵入式」互切按钮(与 macOS 侧同值;(三)88→100 防退出态标题截断)。
+const INTRUSIVE_W: i32 = 100;
 const COPY_W: i32 = 92;
 const INNER: i32 = 8;
 
@@ -943,8 +943,9 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         if p.guard_unlocked {
             super::dialog_main::GUARD_BTN_LOCK_TITLE
         } else {
-            // 2026-10-13(二):「🖐 非侵入式」= 原「解除屏蔽」(整页开放,人工直接操作)。
-            super::dialog_main::NONINTRUSIVE_BTN_TITLE
+            // (三)文案保持原文案:「🔓 解除屏蔽」即侵入式语境的「非侵入式」入口
+            // (整页开放,人工直接操作;实测改名会造成「文案跑到按钮位置上」的错位观感)。
+            super::dialog_main::GUARD_BTN_UNLOCK_TITLE
         },
         style_button(false),
         IDC_GUARD,
