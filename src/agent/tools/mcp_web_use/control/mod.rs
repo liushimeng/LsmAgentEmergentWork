@@ -246,12 +246,26 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     // 可恢复动作继续尝试(2002 的既有对策语义),而不是停下报告失败。
     // 点击导航不在此列:落地页无法预知,且从锚点站点出发的外链跳转是合法任务形态,
     // 由 target_drift 信号 + QC 目标一致性门事后对账。
-    if matches!(action, "navigate" | "new_tab") {
+    if matches!(action, "navigate" | "new_tab" | "new_window") {
         if let Some(url) = str_arg(&params, "url") {
             if let Some(blocked) = super::target_anchor_guard(url) {
                 return blocked;
             }
         }
+    }
+    // 多窗口并行:`new_window` 在**独立新窗口**打开 params.url 并直接返回新
+    // page_id(完整 open 语义)。它完全不操作当前页 —— 输入硬闸(6002)/HITL
+    // 挂起闸(4003)/后台闸(6003)/guard 先解后锁对「开新窗口」均无意义,
+    // 故在全部闸门之前早退,返回 open 信封。
+    if action == "new_window" {
+        let Some(url) = str_arg(&params, "url") else {
+            return envelope(1001, "缺少 url", json!({"control_action": "new_window"}));
+        };
+        let mut open_args = params.clone();
+        open_args["url"] = json!(url);
+        open_args["new_window"] = json!(true);
+        open_args["reuse"] = json!(false);
+        return super::run_open_inner(&open_args, url).await;
     }
     // 第 151 轮:人工核验弹窗输入前置硬闸(条件/实现见 blocker_probe::input_gate;弹窗在场时输入只会灌黑洞,命中即 6002 拦截;须在 guard_lift 之前)
     if let Some(gated) = super::blocker_probe::input_gate(id, &action, &params).await { return gated; }

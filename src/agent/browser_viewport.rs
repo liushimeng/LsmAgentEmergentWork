@@ -222,6 +222,38 @@ pub fn headed_window_plan(
 /// 低于此值即按回读的真实尺寸重试一次。0.97 留出工作区留边与取整余量。
 pub const FILL_RATIO_MIN: f64 = 0.97;
 
+/// 多窗口横向平铺计划(纯函数):给定屏幕工作区与 Agent 窗口数 n(≥2),
+/// 返回每窗口 `(left, top, width, height)` 的横向等分排布。
+///
+/// 背景(多窗口并行,双站同时工作):Chrome 的 occlusion tracking 会把被完全
+/// 遮挡的窗口标记 occluded 并对其渲染节流 —— 两个 1920×1080 窗口默认重叠
+/// 打开,后者实际停摆,与「多 Tab 后台挂起」同病。平铺让各窗口互不遮挡,
+/// 每窗口的激活页都保持 `visibilityState=visible`,真正同时活跃。
+/// 各窗口宽度按工作区等分(窗口数多时单窗视口会低于 `MIN_VIEWPORT_W`,
+/// 「同时工作」优先于「单窗 720p」,如实退让);纵向占满工作区。
+pub fn tile_window_plan(
+    avail_w: f64,
+    avail_h: f64,
+    avail_left: f64,
+    avail_top: f64,
+    count: usize,
+) -> Option<Vec<(i64, i64, i64, i64)>> {
+    if !(avail_w > 0.0) || !(avail_h > 0.0) || count < 2 {
+        return None;
+    }
+    let m = HEADED_SCREEN_MARGIN as f64;
+    let gap_total = m * (count as f64 + 1.0);
+    let w = ((avail_w - gap_total) / count as f64).floor().max(320.0);
+    let h = (avail_h - m * 2.0).floor().max(240.0);
+    let top = (avail_top + m).round() as i64;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let left = (avail_left + m + (w + m) * i as f64).round() as i64;
+        out.push((left, top, w.round() as i64, h.round() as i64));
+    }
+    Some(out)
+}
+
 /// 铺满率 = `min(outer_w/avail_w, outer_h/avail_h)`;任一维探测失败返回 0。
 pub fn fill_ratio(outer_w: f64, outer_h: f64, avail_w: f64, avail_h: f64) -> f64 {
     if !(outer_w > 0.0) || !(outer_h > 0.0) || !(avail_w > 0.0) || !(avail_h > 0.0) {
@@ -511,5 +543,57 @@ mod tests {
     fn fill_ratio_detects_the_reported_symptom() {
         let r = fill_ratio(1920.0, 1080.0, 3200.0, 1800.0);
         assert!(r < FILL_RATIO_MIN, "1920×1080 在 3200×1800 上应判未铺满,实际 {r}");
+    }
+
+    // =================== 多窗口并行:横向平铺计划 ===================
+
+    /// 双窗口在 1920 工作区横向等分:互不遮挡、均在屏内、留边一致。
+    #[test]
+    fn tile_plan_two_windows_split_horizontally() {
+        let plan = tile_window_plan(1920.0, 1080.0, 0.0, 0.0, 2).expect("双窗应给出平铺计划");
+        assert_eq!(plan.len(), 2);
+        let m = HEADED_SCREEN_MARGIN as i64;
+        let (l1, t1, w1, h1) = plan[0];
+        let (l2, _t2, w2, _h2) = plan[1];
+        assert_eq!(l1, m);
+        assert_eq!(t1, m);
+        assert!(w1 > 0 && w2 > 0);
+        // 窗口等宽且第 2 窗紧挨第 1 窗右侧(留一条边距)。
+        assert_eq!(w1, w2);
+        assert_eq!(l2, l1 + w1 + m);
+        // 不超出工作区右缘。
+        assert!(l2 + w2 <= 1920 - m + 1, "第二窗溢出工作区:{l2}+{w2}");
+        // 纵向占满工作区(上下各留一条边距)。
+        assert_eq!(h1, 1080 - 2 * m);
+    }
+
+    /// 工作区原点非 0(副屏/多屏)时平铺以 availLeft/availTop 为基准。
+    #[test]
+    fn tile_plan_respects_workspace_origin() {
+        let plan = tile_window_plan(1440.0, 900.0, -1440.0, 100.0, 2).expect("应给出计划");
+        let m = HEADED_SCREEN_MARGIN as i64;
+        assert_eq!(plan[0].0, -1440 + m);
+        assert_eq!(plan[0].1, 100 + m);
+        assert!(plan[1].0 > plan[0].0);
+    }
+
+    /// 窗口数 <2 或工作区非法 → 不平铺(None),调用方保持现状。
+    #[test]
+    fn tile_plan_noop_on_single_window_or_bad_metrics() {
+        assert_eq!(tile_window_plan(1920.0, 1080.0, 0.0, 0.0, 1), None);
+        assert_eq!(tile_window_plan(1920.0, 1080.0, 0.0, 0.0, 0), None);
+        assert_eq!(tile_window_plan(0.0, 1080.0, 0.0, 0.0, 2), None);
+        assert_eq!(tile_window_plan(1920.0, -1.0, 0.0, 0.0, 2), None);
+    }
+
+    /// 极端挤迫(窗口数多到单窗逼近 320 下限)也不产出非法几何。
+    #[test]
+    fn tile_plan_degrades_gracefully_when_crowded() {
+        let plan = tile_window_plan(1280.0, 720.0, 0.0, 0.0, 3).expect("应给出计划");
+        assert_eq!(plan.len(), 3);
+        for (i, (l, t, w, h)) in plan.iter().enumerate() {
+            assert!(*w >= 320 && *h >= 240, "第 {i} 窗几何非法:{w}x{h}");
+            assert!(*l >= 0 && *t >= 0, "第 {i} 窗坐标非法:{l},{t}");
+        }
     }
 }

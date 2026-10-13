@@ -312,12 +312,14 @@ fn parameters_control_action_enum_complete() {
         "auto_follow", "request_human",
         // 多标签页治理:bring_to_front(标签页前台化)
         "bring_to_front",
+        // 多窗口并行(双站同时工作):new_window(独立新窗口打开)
+        "new_window",
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
     // 第 143 轮 set_guard 使枚举 40 → 41;第 152 轮 auto_follow 使 41 → 42;第 158 轮 select_dropdown 使 42 → 43;
-    // 多标签页治理 bring_to_front 使 43 → 44
-    assert_eq!(names.len(), 44, "control_action 应为 44 个,实际 {names:?}");
+    // 多标签页治理 bring_to_front 使 43 → 44;多窗口并行 new_window 使 44 → 45
+    assert_eq!(names.len(), 45, "control_action 应为 45 个,实际 {names:?}");
 }
 
 #[test]
@@ -2012,6 +2014,48 @@ fn eval_timeout_from_parsing() {
     assert_eq!(
         super::eval_timeout_from(Some("abc".into())),
         super::EVAL_DEFAULT_TIMEOUT_MS
+    );
+}
+
+#[test]
+fn max_windows_from_parsing() {
+    // 纯函数:正整数生效;缺省/0/非法回退默认 4(按去重窗口计的上限)
+    assert_eq!(super::max_windows_from(Some("2".into())), 2);
+    assert_eq!(super::max_windows_from(Some("8".into())), 8);
+    assert_eq!(super::max_windows_from(None), super::MAX_WINDOWS_DEFAULT);
+    assert_eq!(
+        super::max_windows_from(Some("0".into())),
+        super::MAX_WINDOWS_DEFAULT
+    );
+    assert_eq!(
+        super::max_windows_from(Some("-1".into())),
+        super::MAX_WINDOWS_DEFAULT
+    );
+    assert_eq!(
+        super::max_windows_from(Some("abc".into())),
+        super::MAX_WINDOWS_DEFAULT
+    );
+}
+
+#[test]
+fn open_schema_exposes_new_window_param() {
+    // 多窗口并行:open 的 schema 必须暴露 new_window 开关,
+    // 否则模型不知道可以「独立新窗口」打开页面(双站同时工作的入口)。
+    let p = McpWebUseTool.parameters();
+    let nw = p["properties"]["new_window"].clone();
+    assert!(!nw.is_null(), "schema 缺少 new_window 参数");
+    assert_eq!(nw["type"], "boolean");
+    assert_eq!(nw["default"], false);
+}
+
+#[test]
+fn control_action_enum_includes_new_window() {
+    // control_action 枚举必须包含 new_window(独立新窗口打开,多站点同时工作)
+    let p = McpWebUseTool.parameters();
+    let actions = p["properties"]["control_action"]["enum"].clone();
+    assert!(
+        actions.as_array().is_some_and(|a| a.iter().any(|v| v == "new_window")),
+        "control_action 枚举缺少 new_window:{actions:?}"
     );
 }
 

@@ -12,6 +12,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 // data: URL 中属性一律单引号(未编码双引号会被 Chrome 截断解析)
+/// BrowserManager 是进程内单例,同二进制内的多个真浏览器冒烟测试必须串行,
+/// 否则并行运行会互相回收对方的浏览器/页面。
+static SMOKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const PAGE: &str = "data:text/html,<html><head><title>laew-smoke</title></head>\
 <body><input id='q' value=''><button id='go' onclick='document.title=\"clicked\"'>Go</button>\
 <h1 id='h'>hello laew</h1></body></html>";
@@ -113,6 +117,7 @@ async fn serve_download_once(socket: &mut TcpStream) -> std::io::Result<()> {
 #[tokio::test]
 #[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
 async fn mcp_web_use_open_control_inspect_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // BrowserManager 的 watchdog 需要调用 laew 隐藏子命令；测试 harness 自身的
     // current_exe 不能解析该 CLI，这里显式指向编译产物。
     std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
@@ -606,6 +611,109 @@ onclick='document.title=\"far-clicked\"'>F</button></body></html>";
         "非 http(s) origin 应跳过授权: {out}"
     );
 
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
+async fn mcp_web_use_multi_window_parallel_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 多窗口并行(双站同时工作):open(new_window=true) 必须真起一个独立可见窗口 ——
+    // 两页面 visibilityState 均 visible(互不挂起)、window_id 不同、窗口被自动平铺。
+    if detect_browser().is_none() {
+        eprintln!("未检测到浏览器,跳过");
+        return;
+    }
+
+    // 1) 主窗口打开第一个页面
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": PAGE, "reuse": false}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "首个 open 应成功: {out}");
+    let page1 = v["data"]["page_id"].as_str().unwrap_or_default().to_string();
+    assert!(!page1.is_empty());
+    assert!(
+        v["data"].get("new_window").is_none() || v["data"]["new_window"] == false,
+        "普通 open 不应带 new_window 语义: {out}"
+    );
+
+    // 2) 第二个站点:独立新窗口打开
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": PAGE, "new_window": true}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "new_window open 应成功: {out}");
+    assert_eq!(v["data"]["new_window"], true, "响应应标注 new_window: {out}");
+    let page2 = v["data"]["page_id"].as_str().unwrap_or("").to_string();
+    assert!(!page2.is_empty());
+    assert_ne!(page1, page2, "新窗口必须分配新 page_id");
+
+    // 3) 两窗口自动平铺报告(互不遮挡,防 occlusion 节流)
+    assert!(
+        v["data"]["windows"]["tiled"] == true,
+        "第二个窗口打开后应触发平铺: {out}"
+    );
+    let detail = v["data"]["windows"]["detail"].as_array().cloned().unwrap_or_default();
+    assert!(detail.len() >= 2, "平铺报告应覆盖 ≥2 窗口: {out}");
+
+    // 4) list:两页面 window_id 不同、均有 foreground 探测能力
+    let out = McpWebUseTool
+        .execute(json!({"action": "list"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0);
+    assert!(v["data"]["windows"].as_u64().unwrap_or(0) >= 2, "list 应报 ≥2 窗口: {out}");
+    let pages = v["data"]["pages"].as_array().cloned().unwrap_or_default();
+    let w1 = pages
+        .iter()
+        .find(|p| p["page_id"] == page1)
+        .and_then(|p| p["window_id"].as_i64());
+    let w2 = pages
+        .iter()
+        .find(|p| p["page_id"] == page2)
+        .and_then(|p| p["window_id"].as_i64());
+    assert!(w1.is_some() && w2.is_some(), "list 每页应有 window_id: {out}");
+    assert_ne!(w1, w2, "两页面必须分属不同窗口: {out}");
+
+    // 5) 两个窗口的页面同时活跃:visibilityState 均为 visible(互不挂起的核心证据)。
+    // list 的 foreground 即「visibilityState=='visible'」的即时探测(人工切页实时反映)。
+    let fg: std::collections::HashMap<String, bool> = pages
+        .iter()
+        .filter_map(|p| {
+            Some((
+                p["page_id"].as_str()?.to_string(),
+                p["foreground"].as_bool()?,
+            ))
+        })
+        .collect();
+    for pid in [&page1, &page2] {
+        assert_eq!(
+            fg.get(pid.as_str()).copied(),
+            Some(true),
+            "两窗口页面应同时 visible(互不挂起),实际 foreground 表: {fg:?};list: {out}"
+        );
+    }
+
+    // 6) control(new_window):在独立新窗口打开第三个页面并直接回 page_id
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page1, "control_action": "new_window",
+            "params": {"url": PAGE}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "control(new_window) 应成功: {out}");
+    assert_eq!(v["data"]["new_window"], true);
+    let page3 = v["data"]["page_id"].as_str().unwrap_or("").to_string();
+    assert!(!page3.is_empty() && page3 != page1 && page3 != page2);
 
     let _ = McpWebUseTool
         .execute(json!({"action": "close", "page_id": "all"}))

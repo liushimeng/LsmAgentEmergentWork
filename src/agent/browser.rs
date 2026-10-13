@@ -376,6 +376,59 @@ impl BrowserManager {
         highlight: bool,
         guard: super::browser_overlay::PageGuardConfig,
     ) -> chromiumoxide::error::Result<(String, String, String)> {
+        self.new_page_impl(
+            url,
+            mode,
+            connect_url,
+            user_agent,
+            window_size,
+            highlight,
+            guard,
+            false,
+        )
+        .await
+    }
+
+    /// 多窗口并行(双站同时工作):在**独立新窗口**(而非同窗口新 Tab)打开页面。
+    ///
+    /// CDP `Target.createTarget(newWindow:true)`,单浏览器进程多窗口 —— 各窗口
+    /// 独立前台可见、互不遮挡时页面均不被节流,天猫/京东双站可同时活跃工作。
+    /// 仅 headed 有意义(headless shell 不支持 newWindow);connect 模式不支持
+    /// (不干预用户浏览器)。其余 launch/注入/清扫逻辑与 [`new_page`] 逐行共用。
+    pub async fn new_page_in_new_window(
+        &self,
+        url: &str,
+        mode: BrowserMode,
+        user_agent: Option<&str>,
+        window_size: Option<(u32, u32)>,
+        highlight: bool,
+        guard: super::browser_overlay::PageGuardConfig,
+    ) -> chromiumoxide::error::Result<(String, String, String)> {
+        self.new_page_impl(
+            url,
+            mode,
+            None,
+            user_agent,
+            window_size,
+            highlight,
+            guard,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn new_page_impl(
+        &self,
+        url: &str,
+        mode: BrowserMode,
+        connect_url: Option<&str>,
+        user_agent: Option<&str>,
+        window_size: Option<(u32, u32)>,
+        highlight: bool,
+        guard: super::browser_overlay::PageGuardConfig,
+        new_window: bool,
+    ) -> chromiumoxide::error::Result<(String, String, String)> {
         let mut inner = self.inner.lock().await;
         let mut launch_dir: Option<PathBuf> = None;
         let mut launch_watchdog: Option<std::process::Child> = None;
@@ -603,7 +656,20 @@ impl BrowserManager {
         }
 
         let browser = inner.browser.as_ref().expect("browser initialized");
-        let page = browser.new_page(url.to_string()).await?;
+        // 多窗口并行:new_window=true 走 CDP `Target.createTarget(newWindow:true)`
+        // 起独立可见窗口(单浏览器进程多窗口,profile/登录态/HITL 全复用);
+        // false 保持同窗口新 Tab 形态。
+        let page = if new_window {
+            use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
+            let params = CreateTargetParams::builder()
+                .url(url.to_string())
+                .new_window(true)
+                .build()
+                .map_err(chromiumoxide::error::CdpError::msg)?;
+            browser.new_page(params).await?
+        } else {
+            browser.new_page(url.to_string()).await?
+        };
         // 第 159 轮:先开域挂监听、再 goto —— 主文档的请求/响应/失败才会进
         // Network 环形缓冲。旧顺序 goto 完成才 enable,首个文档的加载证据
         // (状态码/blocked_reason)全部丢失,空白页只能靠猜(内网站点实测 network

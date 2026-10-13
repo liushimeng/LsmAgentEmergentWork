@@ -70,3 +70,128 @@ pub(super) async fn activate_headed_window(mgr: &BrowserManager, page_id: &str) 
         FocusPolicy::Never => false,
     }
 }
+
+// ===================== 多窗口并行(双站同时工作) =====================
+//
+// `open(new_window=true)` / `control(new_window)` 经 CDP `Target.createTarget
+// (newWindow:true)` 在**单浏览器进程**里起多个独立可见窗口 —— 各窗口互不遮挡时
+// 页面同时活跃、互不挂起(同窗口后台 Tab 会被 Chrome 挂起,见 mcp_web_use 的
+// 后台挂起治理)。本模块提供窗口维度的查询与几何治理:
+// - [`BrowserManager::page_window_id`]:页面 → CDP windowId(list 分组展示);
+// - [`BrowserManager::count_windows`]:去重窗口数(`LAEW_WEB_MAX_WINDOWS` 上限闸);
+// - [`BrowserManager::tile_agent_windows`]:窗口横向平铺(防互相遮挡被 occlusion
+//   节流 —— Chrome 会把被完全遮挡的窗口标记 occluded 并停渲染,与后台 Tab 同病)。
+//
+// 按工程约定「browser.rs 超线,新增代码落职责子模块」,本组能力放这里,
+// 只用 BrowserManager 公共 API,不触碰其私有字段。
+
+use chromiumoxide::cdp::browser_protocol::browser::GetWindowForTargetParams;
+use serde_json::{json, Value};
+
+impl BrowserManager {
+    /// 页面所属 CDP 窗口 id(多窗口并行:list 按窗口分组展示用;fail-open None)。
+    pub async fn page_window_id(&self, page_id: &str) -> Option<i64> {
+        let page = self.page(page_id).await?;
+        page.execute(GetWindowForTargetParams::default())
+            .await
+            .ok()
+            .map(|w| *w.window_id.inner())
+    }
+
+    /// 当前 Agent 窗口数(CDP windowId 去重;浏览器未启动 = 0)。
+    ///
+    /// 多窗口并行的上限闸(`LAEW_WEB_MAX_WINDOWS`)计数依据 —— 上限按**窗口**
+    /// 计而非按页签计,同窗口多 Tab 不占新窗口额度。
+    pub async fn count_windows(&self) -> usize {
+        let ids: Vec<i64> = {
+            let pages: Vec<chromiumoxide::Page> = {
+                let mut ids_probe = Vec::new();
+                // list_pages 顺手清理失效 entry;这里只需要 id 列表。
+                for (id, _, _, _) in self.list_pages().await {
+                    if let Some(p) = self.page(&id).await {
+                        ids_probe.push(p);
+                    }
+                }
+                ids_probe
+            };
+            let mut ids = Vec::new();
+            for p in pages {
+                if let Ok(w) = p.execute(GetWindowForTargetParams::default()).await {
+                    ids.push(*w.window_id.inner());
+                }
+            }
+            ids
+        };
+        let mut ids = ids;
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    }
+
+    /// 多窗口并行:把所有 Agent 窗口横向平铺进屏幕工作区(互不遮挡)。
+    ///
+    /// 仅在 headed && 非 connect && 去重窗口数 ≥2 时执行;fail-open(测量/调整
+    /// 失败只跳过),不影响 open 语义。返回平铺报告供 open 响应 `data.windows`
+    /// 引用。各窗口宽度按工作区等分 —— 窗口数多时单窗视口会低于 720p 下限,
+    /// 「同时工作」优先于「单窗大屏」,如实退让。
+    pub async fn tile_agent_windows(&self) -> Option<Value> {
+        // headed && 非 connect 才有可见窗口几何可言(与 fit_headed_window 同判据)。
+        let mode = self.current_mode().await;
+        if !mode.is_some_and(|m| m.is_headed()) || self.is_connect_mode().await {
+            return None;
+        }
+        // 每窗口取一个代表页(windowId 去重)。
+        let mut per_window: Vec<(i64, String)> = Vec::new();
+        let mut first_page: Option<chromiumoxide::Page> = None;
+        for (id, _, _, _) in self.list_pages().await {
+            let Some(page) = self.page(&id).await else { continue };
+            if let Ok(w) = page.execute(GetWindowForTargetParams::default()).await {
+                let wid = *w.window_id.inner();
+                if first_page.is_none() {
+                    first_page = Some(page.clone());
+                }
+                if !per_window.iter().any(|(w2, _)| *w2 == wid) {
+                    per_window.push((wid, id));
+                }
+            }
+        }
+        if per_window.len() < 2 {
+            return None;
+        }
+        // 屏幕工作区:用任一代表页实测(availLeft/availTop 覆盖副屏/多屏原点)。
+        let page = first_page?;
+        let m = super::browser::headed_window_metrics(&page).await.ok()?;
+        let f = |k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let plan = super::browser_viewport::tile_window_plan(
+            f("availWidth"),
+            f("availHeight"),
+            f("availLeft"),
+            f("availTop"),
+            per_window.len(),
+        )?;
+        let mut detail = Vec::new();
+        for ((wid, pid), (l, t, w, h)) in per_window.iter().zip(plan.iter()) {
+            match self
+                .set_window_bounds(pid, Some(*w), Some(*h), Some(*l), Some(*t), None)
+                .await
+            {
+                Ok(v) => detail.push(json!({
+                    "window_id": wid,
+                    "page_id": pid,
+                    "bounds": v.get("window").cloned().unwrap_or(Value::Null),
+                })),
+                Err(e) => detail.push(json!({
+                    "window_id": wid,
+                    "page_id": pid,
+                    "error": e,
+                })),
+            }
+        }
+        Some(json!({
+            "tiled": true,
+            "window_count": per_window.len(),
+            "detail": detail,
+            "note": "多个 Agent 窗口已横向平铺进屏幕工作区(互不遮挡,各窗口页面同时活跃渲染);窗口可人工拖动调整,后续新窗口打开时重新平铺",
+        }))
+    }
+}
