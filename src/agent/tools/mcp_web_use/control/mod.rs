@@ -1227,10 +1227,11 @@ pub fn human_assist_reasons_doc() -> String {
 ///   非屏蔽区域,其余保持 Agent 管控,最小权限;状态条第三行引导人工);
 /// - `allow` 为空:整页 open(第 143 轮行为,探测不到凭证区的回退档)。
 ///
-/// 第 145 轮:两档的引导 note 都指明收口动作「回到弹窗点『提交 / 继续』」——
+/// 第 145/167 轮:两档的引导 note 都指明收口动作「回到弹窗点『提交 / 继续』」——
 /// 管控三档(locked/open/partial)只在 Agent 全面操作时生效;HITL 期间是临时放行态,
 /// 人工完成操作后的交棒动作必须显性可见(实测反馈:整页 open 回退档只有通用
-/// 「页面开放」状态条,人工不知道做完要去弹窗点继续)。
+/// 「页面开放」状态条,人工不知道做完要去弹窗点继续)。第 167 轮起缺省档即
+/// 整页 open(安全全面解锁),note 明示「可自由操作」。
 ///
 /// 成功返回导航重放协程句柄(提问期间人工提交登录触发导航时重放临时态);
 /// 应用失败返回 None(等同未解锁,提问照常进行,fail-open)。
@@ -1241,7 +1242,8 @@ async fn apply_hitl_unlock(
     use crate::agent::browser_overlay::{apply_page_guard, PageGuardConfig};
     let cfg = if allow.is_empty() {
         let mut c = PageGuardConfig::open();
-        c.note = Some("人工介入中·页面临时开放,完成后回弹窗点『提交 / 继续』".to_string());
+        c.note =
+            Some("人工介入中·页面已全面解锁,可自由操作;完成后回弹窗点『提交 / 继续』".to_string());
         c
     } else {
         let mut c = PageGuardConfig::partial(allow.to_vec(), vec![]);
@@ -1311,16 +1313,32 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     });
     let bring = p.get("bring_to_front").and_then(Value::as_bool).unwrap_or(true);
 
-    // 第 144 轮:HITL 凭证区域部分放行 —— unlock_page=true(默认)时优先
-    // **partial + allow_selectors 白名单挖洞**(显式传参 > 自动探测账号/密码/验证码
-    // 等人工必填区域,见 unlock_zone),探测不到才回退整页 open(第 143 轮行为)。
-    // 提问期间人工可能提交表单触发导航(登录→2FA),新文档按烘焙态回锁会打断
-    // 多步人工流程 —— spawn 导航重放协程持续维持临时放行态,收口时回收。
+    // 第 167 轮:HITL 解锁语义重构 —— 缺省**安全全面解锁**(整页 open)。
+    // 背景(实测 2026-10-13 双站比价,tmpPlan/20261013_134500):
+    // - 第 144 轮自动探测 partial 的白名单是 `:nth-of-type` 位置型选择器,
+    //   React SPA 上漂移后洞消失,天猫滑块被盾罩盖死(人工被迫在弹窗打字反馈);
+    // - 解锁判定读全局 `current_guard()`,多窗口并行下被另一页的 set_guard(open)
+    //   改写,京东页 locked 态从未解除,人工登录页点不了。
+    // 新语义:
+    // - 判定改读**页面实际态**(unlock_zone::page_guard_snapshot),每页独立;
+    // - 未显式传 allow_selectors → 整页 open:人工介入窗口 = 全面解除屏蔽,
+    //   人工自由操作,完成后回弹窗点「提交 / 继续」交还控制权;
+    // - 显式 allow_selectors → partial 保留 + 两道安全网:挑战层选择器并洞
+    //   (blocker_probe 的类名/id 选择器,稳定)+ 应用前覆盖验证,洞没罩住
+    //   挑战即回退整页 open(fail-open);
+    // - 收口恢复按**本页解锁前实际态快照**重放(不再拿全局配置灌页面)。
+    // 提问期间人工提交表单触发导航(登录→2FA)由导航重放协程维持放行态。
     // 纯问答场景(确认继续?)可传 unlock_page=false。
     let unlock_page = p.get("unlock_page").and_then(Value::as_bool).unwrap_or(true);
     // 第 152 轮:人工介入是「页面状态已被人改变」的新事实 —— 清掉本页的告警指纹,
     // 否则「弹窗还在 → 但上次已告警过 → 不再提醒」会造成漏报。
     super::blocker_probe::forget_fingerprints(id);
+    // 第 167 轮:挑战层探测提前到解锁决策之前 —— 返回的类名/id 选择器供显式
+    // partial 并洞(安全网),顺带把弹层滚进视口(附图可读,原顺序在解锁之后)。
+    let challenge_selector = match crate::agent::browser::BrowserManager::global().page(id).await {
+        Some(pg) => super::blocker_probe::scroll_challenge_into_view(&pg).await,
+        None => None,
+    };
     let explicit_allow = {
         let raw: Vec<String> = p
             .get("allow_selectors")
@@ -1335,41 +1353,77 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     };
     let mut unlock_source: &str = "none";
     let mut unlock_allow: Vec<String> = Vec::new();
+    let mut unlock_verify: &str = "none";
     let mut unlock_reassert: Option<tokio::task::JoinHandle<()>> = None;
+    let mut unlock_snapshot: Option<crate::agent::browser_overlay::PageGuardConfig> = None;
     let unlock_applied = unlock_page
         && crate::agent::browser::BrowserManager::global().guard_visuals_active().await
-        && crate::agent::browser::BrowserManager::global().current_guard().await.mode
-            != crate::agent::browser_overlay::PageGuardMode::Open
         && match crate::agent::browser::BrowserManager::global().page(id).await {
             Some(page) => {
-                let zones = if !explicit_allow.is_empty() {
-                    unlock_source = "explicit";
-                    explicit_allow.clone()
-                } else {
-                    let probed = super::unlock_zone::probe_credential_zones_kinds(&page).await;
-                    // 跨 frame 精化:登录凭证常在跨域 iframe 内,主文档探测按 iframe
-                    // 外框挖洞位置/尺寸不对;CDP DOM pierce 取输入框主文档坐标
-                    // 生成 @rect 精确洞,有洞时丢弃整外框选择器(fail-open)。
-                    let z =
-                        super::unlock_zone::enrich_allowlist_with_frame_holes(&page, probed).await;
-                    if !z.is_empty() {
-                        unlock_source = "auto";
-                    }
-                    z
+                let snap = super::unlock_zone::page_guard_snapshot(&page).await;
+                // 页面实际态优先:locked/partial 才放行,已是 open/未装 JS → 无需。
+                // JS 态缺失(guard 脚本注入完全失败)时 CDP 输入锁 fail-closed 兜底
+                // 可能仍在场 —— 退回全局期望态判断(此情形下页面没有独立态可读)。
+                let needs_unlock = match snap.as_ref() {
+                    Some(c) => matches!(
+                        c.mode,
+                        crate::agent::browser_overlay::PageGuardMode::Locked
+                            | crate::agent::browser_overlay::PageGuardMode::Partial
+                    ),
+                    None => crate::agent::browser::BrowserManager::global()
+                        .current_guard()
+                        .await
+                        .mode
+                        != crate::agent::browser_overlay::PageGuardMode::Open,
                 };
-                if zones.is_empty() {
-                    unlock_source = "fallback_open";
-                }
-                unlock_allow = zones.clone();
-                match apply_hitl_unlock(&page, &zones).await {
-                    Some(handle) => {
-                        unlock_reassert = Some(handle);
-                        true
+                if !needs_unlock {
+                    false
+                } else {
+                    unlock_snapshot = snap;
+                    // 放行配置选择:显式 partial(安全网)或缺省安全全面解锁。
+                    let mut allow: Vec<String> = Vec::new();
+                    if !explicit_allow.is_empty() {
+                        let merged = super::unlock_zone::merge_challenge_selector(
+                            &explicit_allow,
+                            challenge_selector.as_deref(),
+                        );
+                        let coverage = match challenge_selector.as_deref() {
+                            Some(ch) => {
+                                super::unlock_zone::challenge_covered_by_allow(&page, &merged, ch)
+                                    .await
+                            }
+                            // 无挑战层在场:无从验证,尊重显式选择维持 partial。
+                            None => super::unlock_zone::ChallengeCoverage::NoChallenge,
+                        };
+                        unlock_verify = match coverage {
+                            super::unlock_zone::ChallengeCoverage::Covered => "covered",
+                            super::unlock_zone::ChallengeCoverage::NoChallenge => "no-challenge",
+                            super::unlock_zone::ChallengeCoverage::Uncovered => "uncovered",
+                        };
+                        if matches!(
+                            coverage,
+                            super::unlock_zone::ChallengeCoverage::Uncovered
+                        ) {
+                            // 安全网:洞没罩住挑战层 → 回退整页 open(fail-open)。
+                            unlock_source = "explicit_open_uncovered";
+                        } else {
+                            allow = merged;
+                            unlock_source = "explicit";
+                        }
+                    } else {
+                        unlock_source = "safe_open";
                     }
-                    None => {
-                        unlock_source = "none";
-                        unlock_allow.clear();
-                        false
+                    unlock_allow = allow.clone();
+                    match apply_hitl_unlock(&page, &allow).await {
+                        Some(handle) => {
+                            unlock_reassert = Some(handle);
+                            true
+                        }
+                        None => {
+                            unlock_source = "none";
+                            unlock_allow.clear();
+                            false
+                        }
                     }
                 }
             }
@@ -1389,13 +1443,11 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
         None => String::new(),
     };
 
-    // 第 152 轮:提问前先把验证弹层滚进视口中央。验证弹窗落在下半屏/视口外时,
+    // 第 152 轮:提问前先把验证弹层滚进视口中央(第 167 轮提前到解锁决策之前,
+    // challenge_selector 同时供显式 partial 并洞)。验证弹窗落在下半屏/视口外时,
     // 下面那张自动附图截到的是空白区域,人工看不出要做什么;而 locked 档
     // `Input.setIgnoreInputEvents` 连滚轮一起拦,人工也滚不过去。fail-open。
-    let challenge_scrolled = match BrowserManager::global().page(id).await {
-        Some(pg) => super::blocker_probe::scroll_challenge_into_view(&pg).await,
-        None => None,
-    };
+    let challenge_scrolled = challenge_selector.clone();
     // 第 133 轮:验证码现场截图 —— 显式 params.image_path 优先;reason=captcha
     // 自动采集(验证码元素裁剪优先,整视口兜底,见 captcha_crop);弹窗直接展示
     // 图片,人工不必切去浏览器找图。fail-open:截图失败按无图继续,绝不阻断提问。
@@ -1419,16 +1471,24 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
     let outcome = crate::agent::human_assist::HumanAssistHub::global()
         .request(reason, &message, options.clone(), &url, id, timeout_ms, &image_path)
         .await;
-    // 第 143/144 轮:人工介入收口(应答/超时/取消/不可用)后按实例期望态恢复管控
+    // 第 143/144/167 轮:人工介入收口(应答/超时/取消/不可用)后恢复管控
     // —— 无论何种结局,「人工可操作窗口」都必须关闭:先回收导航重放协程(防恢复后
-    // 又被重放覆盖),再恢复原档;fail-open(恢复失败不阻断信封返回,下一个输入动作
-    // 的「先解/先隐」与导航 re-assert 会自愈)。
+    // 又被重放覆盖),再恢复原档。第 167 轮:恢复态取**本页解锁前实际态快照**
+    // (多窗口并行下各页 guard 独立,全局 current_guard() 会被其它页的 set_guard
+    // 改写,拿它灌页面会把 A 页的档错装到 B 页);快照缺失时回退全局配置。
+    // fail-open(恢复失败不阻断信封返回,下一个输入动作的「先解/先隐」与导航
+    // re-assert 会自愈)。
     if unlock_applied {
         if let Some(handle) = unlock_reassert.take() {
             handle.abort();
         }
         if let Some(page) = crate::agent::browser::BrowserManager::global().page(id).await {
-            let cfg = crate::agent::browser::BrowserManager::global().current_guard().await;
+            let cfg = match unlock_snapshot.take() {
+                Some(c) => c,
+                // 解锁成功应用过则快照必然在场;此分支仅防御(如页面在解锁后
+                // 被关闭重开,guard 状态已随新文档重置)。
+                None => crate::agent::browser::BrowserManager::global().current_guard().await,
+            };
             let _ = crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
         }
     }
@@ -1445,8 +1505,10 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                     "kind_label": label,
                     "human_response": answer,
                     "assist_channel": via.as_str(),
-                    // 第 144 轮:提问期间页面放行方式对账(partial=凭证区挖洞 /
-                    // open=整页回退 / none=未放行;source: explicit|auto|fallback_open|none)。
+                    // 第 144/167 轮:提问期间页面放行方式对账(open=安全全面解锁(缺省)/
+                    // partial=显式 allow_selectors 挖洞 / none=未放行(页面本就 open 或
+                    // 未装管控);source: safe_open|explicit|explicit_open_uncovered|none;
+                    // verify: 显式 partial 的覆盖验证结论,challenge: 并洞的挑战层选择器)。
                     "page_unlock": json!({
                         "applied": unlock_applied,
                         "mode": if !unlock_applied { "none" }
@@ -1454,6 +1516,8 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                             else { "partial" },
                         "allow_selectors": unlock_allow,
                         "source": unlock_source,
+                        "verify": unlock_verify,
+                        "challenge": challenge_selector,
                     }),
                     // 第 132/133 轮:附图对账(人工读的是哪张图 / 元素裁剪 or 整视口)
                     "image_path": image_path,

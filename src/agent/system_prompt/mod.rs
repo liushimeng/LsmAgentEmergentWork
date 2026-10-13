@@ -1125,15 +1125,19 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     手动终止),按附带的 human_assist 载荷 request_human(reason=captcha) 让人工完成;
     「回复一直没来 + blocker_alert」同时出现时优先按 blocker_alert 处置,不要加大等待
     重试;人工应答「已完成」后先 inspect 确认弹窗消失再继续对话。
-    **提问期间页面自动放行**:
-    request_human 默认 unlock_page=true —— locked/partial 下提问前自动探测账号/
-    密码/验证码等人工必填输入区并切 partial 白名单挖洞(只有这些区域人工可操作,
-    状态条「🛡 部分锁定·人工输入区已开放」,其余保持锁定;params.allow_selectors
-    可显式指定区域;探测不到凭证区才整页切 open),应答/超时/取消后自动恢复原档;
+    **提问期间安全全面解除屏蔽**:
+    request_human 默认 unlock_page=true —— locked/partial 页面提问前自动**整页
+    open**(人工介入窗口=全面解除屏蔽,人工可自由拖滑块/扫码/登录/填表,状态条
+    「🔓 人工介入中·页面已全面解锁,可自由操作;完成后回弹窗点『提交 / 继续』」,
+    点『提交 / 继续』即交还控制权),应答/超时/取消后自动恢复该页解锁前管控档;
+    需要精细控制时显式传 params.allow_selectors(≤8 条)才走 partial 白名单挖洞
+    (自动并入挑战层选择器并做覆盖验证,洞没罩住挑战自动回退整页 open);
     提问期间人工提交表单触发导航会自动重放放行态(登录→2FA 不断链);open 档本就
     开放无需动作。纯问答场景(如「确认继续?」)可传 unlock_page=false 保持管控;
     inspect(info=blockers) 命中时 data.credential_zones 给出可直接传
-    allow_selectors 的区域选择器。
+    allow_selectors 的区域选择器。人工验证通过后**优先用站内搜索框继续**
+    (input_text+click),不要整页 navigate 重发同款 URL —— 实测会重新触发风控
+    滑块/限流,人工被迫反复验证。
     **超时推荐**:不传 timeout_ms 时由工具按 reason 分档默认超时——
     captcha/sms/two_factor 默认 120_000(2 分钟,短文本回 TUI);qr_login/real_name/oauth/
     login/manual_verify/custom 默认 300_000(5 分钟,扫码/刷脸/账密登录需要更长)。

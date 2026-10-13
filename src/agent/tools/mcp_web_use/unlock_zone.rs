@@ -1,16 +1,27 @@
-//! HITL 凭证区域探测与临时放行(第 144 轮)。
+//! HITL 页面放行与安全网(第 144 轮 partial 挖洞;第 167 轮默认改安全全面解锁)。
 //!
-//! 需求:Agent 用 MCP_Web_Use 发现网站需要输入**账号/密码/验证码**等必须人工
-//! 输入的信息时,相关区域应是 partial 部分屏蔽模式的**非屏蔽区域**(白名单挖洞),
-//! 而不是整页放行。本模块提供三件事:
+//! 需求:Agent 用 MCP_Web_Use 发现网站需要**人工介入**(滑块/验证码/登录/扫码等)
+//! 时,提问期间页面必须让**人工可自由操作**。第 167 轮起缺省 = **整页 open**
+//! (安全全面解除屏蔽,人工完成后回弹窗点「提交 / 继续」交还控制权);
+//! 显式 `allow_selectors` 才走 partial 挖洞,并带两道安全网(挑战层选择器并洞 +
+//! 覆盖验证,未罩住挑战即回退整页 open)。本模块提供:
 //!
 //! 1. [`CREDENTIAL_ZONE_PROBE_JS`]:页面内一次 eval_js 探测凭证输入区,产出主文档
-//!    CSS 选择器(partial `allow_selectors` 直接可用);规则与优先级见 doc 08 §4.2;
+//!    CSS 选择器(`inspect(info=blockers)` 的 `credential_zones` 在用;HITL 默认
+//!    路径第 167 轮起不再调用 —— partial 位置型选择器在 React SPA 上漂移,
+//!    实测把天猫滑块/京东登录锁死,见 tmpPlan/20261013_134500);
 //! 2. [`spawn_unlock_reassert`]:提问期间的导航重放协程 —— 人工提交登录后页面导航
 //!    (登录→2FA),新文档按 `new_page` 烘焙态回锁会打断多步人工流程,协程订阅
 //!    主 frame 导航持续重放临时放行态,收口时 abort;
 //! 3. [`hitl_scope_enabled`]:杀开关 `LAEW_WEB_HITL_SCOPE=off` 跳过探测回退整页
-//!    open(第 143 轮行为),与 `LAEW_WEB_OVERLAY` 等开关同构。
+//!    open(第 143 轮行为),与 `LAEW_WEB_OVERLAY` 等开关同构;
+//! 4. [`page_guard_snapshot`]:读**页面实际**管控态(非全局配置)—— 多窗口并行下
+//!    各页 guard 各自独立,全局 `current_guard()` 会被另一页的 set_guard 改写
+//!    (实测:A 页 set_guard(open) 后 B 页 HITL 解锁条件短路误判「无需解锁」,
+//!    B 页 locked 态从未解除,人工被锁死);
+//! 5. [`merge_challenge_selector`]/[`challenge_covered_by_allow`]:显式 partial 的
+//!    两道安全网 —— 挑战层选择器(类名/id 优先,稳定)并入白名单首位;应用后
+//!    采样验证挑战层(或其内部 iframe/canvas)被洞并集覆盖 ≥80%,否则回退 open。
 //!
 //! 设计:`docs/MCP_Web_Use/08-浏览器进程保护与凭证区域部分放行.md` §4。
 
@@ -438,6 +449,158 @@ pub(super) fn spawn_unlock_reassert(
     })
 }
 
+/// 读**页面实际**管控态快照(eval `__laewGuard*` 运行时变量,非全局配置)。
+///
+/// 用途(第 167 轮):
+/// - HITL 解锁判定:页面未装 guard(返回 `None`)/ 已是 open → 无需解锁;
+///   locked/partial → 需要解锁。替代读 `current_guard()`(实例级全局单份,
+///   多窗口下被其它页的 set_guard 改写,实测把京东页 HITL 解锁条件短路误判);
+/// - HITL 收口恢复:按本页解锁前的实际态重放(每页各回各的,不再拿全局配置灌)。
+///
+/// fail-open:eval 失败/变量缺失返回 `None`(视为无管控,无需解锁)。
+pub(super) async fn page_guard_snapshot(
+    page: &chromiumoxide::Page,
+) -> Option<crate::agent::browser_overlay::PageGuardConfig> {
+    const JS: &str = r#"(() => {
+  try {
+    const m = window.__laewGuardMode;
+    if (typeof m !== 'string' || !m) return null;
+    return JSON.stringify({
+      mode: m,
+      allow: Array.isArray(window.__laewGuardAllow) ? window.__laewGuardAllow : [],
+      block: Array.isArray(window.__laewGuardBlock) ? window.__laewGuardBlock : [],
+      note: (typeof window.__laewGuardNote === 'string') ? window.__laewGuardNote : null,
+    });
+  } catch (e) { return null; }
+})()"#;
+    let v = super::eval_js_string(page, JS).await.ok()?;
+    let s = v.as_str()?;
+    let parsed: serde_json::Value = serde_json::from_str(s).ok()?;
+    parse_guard_snapshot(&parsed)
+}
+
+/// 快照 JSON → `PageGuardConfig` 的纯解析(单测锁定;页面态非法时 `None`)。
+fn parse_guard_snapshot(parsed: &Value) -> Option<crate::agent::browser_overlay::PageGuardConfig> {
+    let mode = crate::agent::browser_overlay::PageGuardMode::from_arg(
+        parsed.get("mode").and_then(Value::as_str).unwrap_or("locked"),
+    )?;
+    let list = |key: &str| -> Vec<String> {
+        parsed
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut cfg = crate::agent::browser_overlay::PageGuardConfig::partial(list("allow"), list("block"));
+    cfg.mode = mode;
+    cfg.note = parsed
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(cfg)
+}
+
+/// 把挑战层选择器并入 partial 白名单首位(纯函数)。
+///
+/// 挑战层选择器来自 `blocker_probe` 的弹层探测(`selOf` 优先 `#id`/类名,比
+/// 凭证探测的 `:nth-of-type` 位置路径稳定),是人工必操作区的最强指认;
+/// 并入首位保证它在 8 条上限裁剪中最不易被挤掉。空/超限条目由净化兜底。
+pub(super) fn merge_challenge_selector(
+    allow: &[String],
+    challenge: Option<&str>,
+) -> Vec<String> {
+    let mut raw: Vec<String> = Vec::with_capacity(allow.len() + 1);
+    if let Some(ch) = challenge.map(str::trim).filter(|s| !s.is_empty()) {
+        raw.push(ch.to_string());
+    }
+    raw.extend(allow.iter().cloned());
+    sanitize_selector_list(&raw)
+}
+
+/// 覆盖验证结论:显式 partial **应用前**,挑战层是否会被白名单洞罩住。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChallengeCoverage {
+    /// 挑战层(或其内部 iframe/canvas 目标)≥80% 面积落在洞并集内 → partial 有效
+    Covered,
+    /// 挑战层在场但洞没罩住(选择器漂移/洞错位)→ 必须回退整页 open
+    Uncovered,
+    /// 页面上已无挑战层(人工已过/弹层已收)→ 无从验证,维持 partial
+    NoChallenge,
+}
+
+/// 验证 partial 白名单洞确实罩住挑战层(第 167 轮安全网,fail-open 判 Uncovered)。
+///
+/// 判定目标:挑战层自身矩形 + 其内部 ≥80×60 的可见 iframe/canvas(跨域滑块的
+/// 真实操作面在 iframe 元素矩形内,主文档可量);任一目标被洞并集覆盖 ≥80%
+/// (8×8 网格采样)即算 Covered。洞矩形语义与盾罩 `rebuildShields` 完全一致:
+/// 选择器 → `getBoundingClientRect()`,`@rect:x,y,w,h` → 固定视口矩形。
+pub(super) async fn challenge_covered_by_allow(
+    page: &chromiumoxide::Page,
+    allow: &[String],
+    challenge_sel: &str,
+) -> ChallengeCoverage {
+    let js = format!(
+        r#"(() => {{
+  try {{
+    const ch = document.querySelector({ch_sel});
+    if (!ch) return 'no-challenge';
+    const cr = ch.getBoundingClientRect();
+    if (cr.width <= 0 || cr.height <= 0) return 'no-challenge';
+    const allow = {allow_json};
+    const rects = [];
+    for (const s of allow) {{
+      if (s.indexOf('@rect:') === 0) {{
+        const p = s.slice(6).split(',').map(Number);
+        if (p.length === 4 && p.every((n) => isFinite(n)))
+          rects.push([p[0], p[1], p[0] + p[2], p[1] + p[3]]);
+      }} else {{
+        try {{
+          for (const n of document.querySelectorAll(s)) {{
+            const r = n.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) rects.push([r.left, r.top, r.right, r.bottom]);
+          }}
+        }} catch (e) {{}}
+      }}
+    }}
+    if (!rects.length) return 'uncovered';
+    const targets = [cr];
+    for (const n of ch.querySelectorAll('iframe, canvas')) {{
+      const r = n.getBoundingClientRect();
+      if (r.width >= 80 && r.height >= 60) targets.push(r);
+    }}
+    const cover = (t) => {{
+      let inside = 0, total = 0;
+      for (let gy = 0; gy < 8; gy++) for (let gx = 0; gx < 8; gx++) {{
+        const px = t.left + (gx + 0.5) * t.width / 8;
+        const py = t.top + (gy + 0.5) * t.height / 8;
+        total++;
+        for (const [a, b, c, d] of rects) {{
+          if (px >= a && px < c && py >= b && py < d) {{ inside++; break; }}
+        }}
+      }}
+      return inside / total;
+    }};
+    for (const t of targets) if (cover(t) >= 0.8) return 'covered';
+    return 'uncovered';
+  }} catch (e) {{ return 'uncovered'; }}
+}})()"#,
+        ch_sel = serde_json::to_string(challenge_sel).unwrap_or_else(|_| "\"\"".into()),
+        allow_json = serde_json::to_string(allow).unwrap_or_else(|_| "[]".into()),
+    );
+    match super::eval_js_string(page, &js).await {
+        Ok(v) => match v.as_str() {
+            Some("covered") => ChallengeCoverage::Covered,
+            Some("no-challenge") => ChallengeCoverage::NoChallenge,
+            _ => ChallengeCoverage::Uncovered,
+        },
+        Err(_) => ChallengeCoverage::Uncovered,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +735,156 @@ mod tests {
         let out = merge_holes_into_allowlist(many, vec!["@rect:1,2,3,4".to_string()]);
         assert_eq!(out.len(), 8, "总数不超上限");
         assert!(!out.iter().any(|s| s.starts_with("@rect:")), "选择器优先,洞被上限截掉");
+    }
+
+    /// 第 167 轮:挑战层选择器并洞 —— 首位并入/去重/净化/空挑战透传。
+    #[test]
+    fn challenge_selector_merge() {
+        let allow = vec!["#login-form".to_string(), "#J_SiteNav".to_string()];
+        // 挑战选择器并入首位
+        let out = merge_challenge_selector(&allow, Some(".J_MIDDLEWARE_FRAME_WIDGET"));
+        assert_eq!(out.first().map(String::as_str), Some(".J_MIDDLEWARE_FRAME_WIDGET"));
+        assert!(out.iter().any(|s| s == "#login-form"));
+        // 去重:挑战选择器已在白名单中不重复
+        let out = merge_challenge_selector(&["#a".into(), "#b".into()], Some("#a"));
+        assert_eq!(out.iter().filter(|s| *s == "#a").count(), 1);
+        // 空挑战:原样透传(净化后)
+        let out = merge_challenge_selector(&allow, None);
+        assert_eq!(out, allow);
+        // 空白挑战字符串视为无
+        let out = merge_challenge_selector(&allow, Some("   "));
+        assert_eq!(out, allow);
+        // 超长/空条目被净化剔除,挑战仍在首位
+        let out = merge_challenge_selector(&["".to_string(), " #x ".to_string()], Some("#ch"));
+        assert_eq!(out, vec!["#ch".to_string(), "#x".to_string()]);
+    }
+
+    /// 第 167 轮:页面实际态快照解析 —— mode/allow/block/note 四字段与非法态。
+    #[test]
+    fn guard_snapshot_parse() {
+        let v: Value = serde_json::json!({
+            "mode": "partial",
+            "allow": ["#a", "#b"],
+            "block": [],
+            "note": "京东已登录,页面已锁定待后续比价"
+        });
+        let cfg = parse_guard_snapshot(&v).expect("合法 partial 快照应可解析");
+        assert_eq!(cfg.mode, crate::agent::browser_overlay::PageGuardMode::Partial);
+        assert_eq!(cfg.allow_selectors, vec!["#a", "#b"]);
+        assert_eq!(cfg.note.as_deref(), Some("京东已登录,页面已锁定待后续比价"));
+        // locked 快照(多窗口下 A 页 open 后 B 页仍 locked 的实际场景)
+        let v: Value = serde_json::json!({"mode": "locked", "allow": [], "block": []});
+        let cfg = parse_guard_snapshot(&v).expect("locked 快照应可解析");
+        assert_eq!(cfg.mode, crate::agent::browser_overlay::PageGuardMode::Locked);
+        // open 快照(调用方据此跳过解锁)
+        let v: Value = serde_json::json!({"mode": "open", "allow": [], "block": []});
+        let cfg = parse_guard_snapshot(&v).expect("open 快照应可解析");
+        assert_eq!(cfg.mode, crate::agent::browser_overlay::PageGuardMode::Open);
+        // 非法 mode → None(视为无管控)
+        let v: Value = serde_json::json!({"mode": "???yolo", "allow": [], "block": []});
+        assert!(parse_guard_snapshot(&v).is_none());
+        // 缺省字段容错
+        let v: Value = serde_json::json!({"mode": "locked"});
+        let cfg = parse_guard_snapshot(&v).expect("缺字段按缺省");
+        assert!(cfg.allow_selectors.is_empty());
+        assert!(cfg.note.is_none());
+    }
+
+    /// 第 167 轮真浏览器冒烟(#[ignore],本地 --ignored 跑):HITL 解锁新原语。
+    /// ① 页面实际态快照与全局配置**解耦** —— B 页 set_guard(open) 改写全局后,
+    ///    A 页快照仍读出 locked(京东误屏蔽事故的根治原语);
+    /// ② 覆盖验证 —— 挑战层选择器在白名单内 → Covered;洞在别处 → Uncovered;
+    /// ③ 快照可作收口恢复态(重放回 locked)。
+    /// 需要本机 Chrome;`cargo test --lib unlock_zone -- --ignored --nocapture`。
+    #[tokio::test]
+    #[ignore = "需要本机真实 Chrome(会弹有头窗口);本地手动跑"]
+    async fn real_browser_hitl_unlock_primitives() {
+        use crate::agent::browser::{BrowserManager, BrowserMode};
+        let mgr = BrowserManager::global();
+        let (pid_a, _, _) = mgr
+            .new_page(
+                "about:blank",
+                BrowserMode::Headed,
+                None,
+                None,
+                Some((800, 600)),
+                true,
+                crate::agent::browser_overlay::PageGuardConfig::locked(),
+            )
+            .await
+            .expect("启动有头浏览器失败(本机是否装有 Chrome?)");
+        let page_a = mgr.page(&pid_a).await.expect("page 句柄");
+        // 注入伪挑战层(fixed 定位 + 内嵌 iframe,几何与滑块弹层同构)。
+        super::super::eval_js_string(
+            &page_a,
+            r#"(() => {
+  const ch = document.createElement('div');
+  ch.id = 'challenge';
+  ch.style.cssText = 'position:fixed;left:200px;top:150px;width:300px;height:200px;z-index:9999';
+  const fr = document.createElement('iframe');
+  fr.style.cssText = 'width:280px;height:180px;border:0';
+  fr.src = 'about:blank';
+  ch.appendChild(fr);
+  const far = document.createElement('div');
+  far.id = 'faraway';
+  far.style.cssText = 'position:fixed;left:0;top:0;width:40px;height:40px';
+  document.body.appendChild(ch);
+  document.body.appendChild(far);
+  return true;
+})()"#,
+        )
+        .await
+        .expect("注入伪挑战层失败");
+
+        // ① A 页实际态 = locked(带 note 快照透传)
+        let snap = page_guard_snapshot(&page_a).await.expect("A 页应有管控态");
+        assert_eq!(snap.mode, crate::agent::browser_overlay::PageGuardMode::Locked);
+        // ② B 页 set_guard(open) 改写全局期望态后,A 页快照**不变**(旧全局读法在此误判)。
+        let (pid_b, _, _) = mgr
+            .new_page(
+                "about:blank",
+                BrowserMode::Headed,
+                None,
+                None,
+                Some((800, 600)),
+                true,
+                crate::agent::browser_overlay::PageGuardConfig::open(),
+            )
+            .await
+            .expect("B 页打开失败");
+        // 与实测事故同路径:Agent 对 B 页 set_guard(open) → 全局期望态被改写。
+        mgr.set_guard(&pid_b, crate::agent::browser_overlay::PageGuardConfig::open())
+            .await
+            .expect("B 页 set_guard(open) 失败");
+        assert!(
+            mgr.current_guard().await.mode == crate::agent::browser_overlay::PageGuardMode::Open,
+            "全局期望态应已被 B 页改写为 open"
+        );
+        let snap2 = page_guard_snapshot(&page_a).await.expect("A 页快照仍应可读");
+        assert_eq!(
+            snap2.mode,
+            crate::agent::browser_overlay::PageGuardMode::Locked,
+            "A 页实际态必须与全局配置解耦(京东误屏蔽根治原语)"
+        );
+        // ③ 覆盖验证:洞=挑战层自身 → Covered;洞在别处 → Uncovered(回退 open 的触发器)。
+        let allow = merge_challenge_selector(&["#faraway".to_string()], Some("#challenge"));
+        assert_eq!(allow.first().map(String::as_str), Some("#challenge"), "挑战选择器应并入首位");
+        assert_eq!(
+            challenge_covered_by_allow(&page_a, &allow, "#challenge").await,
+            ChallengeCoverage::Covered,
+            "挑战层在白名单内应判 Covered(含其内部 iframe 目标)"
+        );
+        assert_eq!(
+            challenge_covered_by_allow(&page_a, &["#faraway".to_string()], "#challenge").await,
+            ChallengeCoverage::Uncovered,
+            "洞没罩住挑战层应判 Uncovered(触发回退整页 open)"
+        );
+        // ④ 快照作恢复态:重放回 locked 并复读。
+        let _ = crate::agent::browser_overlay::apply_page_guard(&page_a, &snap2).await;
+        let snap3 = page_guard_snapshot(&page_a).await.expect("恢复后快照应可读");
+        assert_eq!(snap3.mode, crate::agent::browser_overlay::PageGuardMode::Locked);
+        // 清理。
+        let _ = mgr.close_page(&pid_a).await;
+        let _ = mgr.close_page(&pid_b).await;
     }
 }
