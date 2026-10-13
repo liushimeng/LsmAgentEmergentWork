@@ -88,6 +88,8 @@ windows = { version = "0.58", features = [
     "Win32_System_LibraryLoader",
     # 第 139 轮:人工介入弹窗「📋 复制」一键写系统剪贴板
     "Win32_System_Memory",
+    # 2026-10-13:人工介入弹窗多选收口(选项复选框勾选态读取)
+    "Win32_UI_Controls",
     "Win32_System_DataExchange",
     "Media_Ocr",
     "Graphics_Imaging",

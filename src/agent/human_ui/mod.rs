@@ -171,7 +171,8 @@ pub fn diagnostics() -> Value {
 /// 第 132 轮新增 `image_path`(阻断现场的截图;空串 = 无图;2026-10-13 起弹窗
 /// 不再渲染图片,该字段仅供 TUI 兜底打印路径)。
 /// 2026-10-13 新增 `guard_unlocked`(页面是否已放行)——弹窗「解除屏蔽/恢复屏蔽」
-/// 切换按钮的初始标题依据。
+/// 切换按钮的初始标题依据;新增 `multi_select`(选项多选)——弹窗选项渲染为
+/// 复选框组的依据(缺省单选按钮组)。
 pub fn build_payload(display: &HumanAssistDisplay) -> Value {
     let now_ms = display.created_at_ms;
     json!({
@@ -180,6 +181,7 @@ pub fn build_payload(display: &HumanAssistDisplay) -> Value {
         "kind_label": kind_label(&display.kind),
         "message": display.message,
         "options": display.options,
+        "multi_select": display.multi_select,
         "url": display.url,
         "page_id": display.page_id,
         "image_path": display.image_path,

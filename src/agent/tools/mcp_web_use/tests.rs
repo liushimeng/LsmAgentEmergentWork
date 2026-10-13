@@ -2000,6 +2000,59 @@ fn blocker_input_gate_code_is_6002() {
     assert_eq!(super::CODE_TARGET_ANCHOR_VIOLATION, 6001);
 }
 
+// ==================== 2026-10-13:auto-HITL(自动弹出人工介入) ====================
+
+/// auto-HITL 总开关解析:off 系值关闭,其余(含未设置)开启。
+/// (env 是全局态,本用例串行独占 ENV_LOCK 语义 —— tests.rs 无并发 env 用例。)
+#[test]
+fn hitl_auto_env_switch() {
+    let key = "LAEW_HITL_AUTO";
+    let restore = std::env::var(key).ok();
+    // 缺省开
+    std::env::remove_var(key);
+    assert!(crate::agent::tools::mcp_web_use::blocker_probe::hitl_auto_enabled());
+    // off 系值关
+    for v in ["off", "0", "false", "no"] {
+        std::env::set_var(key, v);
+        assert!(
+            !crate::agent::tools::mcp_web_use::blocker_probe::hitl_auto_enabled(),
+            "LAEW_HITL_AUTO={v} 应关闭"
+        );
+    }
+    // 其它值与任意大小写变体保持开
+    std::env::set_var(key, "on");
+    assert!(crate::agent::tools::mcp_web_use::blocker_probe::hitl_auto_enabled());
+    match restore {
+        Some(v) => std::env::set_var(key, v),
+        None => std::env::remove_var(key),
+    }
+}
+
+/// 多选应答编码(`1. a；3. c`)必须被 hitl_hint 归类为**选项应答**
+/// (而不是自由文本 → 验证码填码分流),多选语义闭环的关键一环。
+#[test]
+fn hitl_hint_classifies_multi_answer_as_option_pick() {
+    let multi = "1. 我已完成人工操作,继续；3. 换个思路";
+    assert!(hitl_hint::is_option_pick_answer(multi), "多选编码应归选项应答");
+    // 单选形态不受影响
+    assert!(hitl_hint::is_option_pick_answer("2. 取消任务"));
+    // 自由文本(验证码)仍不是选项应答
+    assert!(!hitl_hint::is_option_pick_answer("z7z2"));
+}
+
+/// sequence 上下文标记:批内步骤执行时 auto-HITL 守卫应判定「在批内」,
+/// 批外(单步动作)为 false;task_local 未进入 scope 时 fail-open 为 false。
+#[tokio::test]
+async fn in_sequence_ctx_marks_sequence_steps() {
+    use crate::agent::tools::mcp_web_use::in_sequence_ctx;
+    assert!(!in_sequence_ctx(), "批外默认 false");
+    let inside = crate::agent::tools::mcp_web_use::run_in_sequence_scope_for_test(true, async {
+        in_sequence_ctx()
+    })
+    .await;
+    assert!(inside, "批内应为 true");
+}
+
 #[test]
 fn eval_timeout_from_parsing() {
     // 纯函数:正整数生效;缺省/0/非法回退默认 30s

@@ -394,7 +394,7 @@ window 探测排除 `__laew*` 前缀(既有卫生规则,新键天然覆盖)。
 | `src/agent/browser.rs` | `BrowserInner.overlay:bool` → `guard:PageGuardConfig`;`new_page` 第 7 参改类型;headed && 非 connect 注入管控脚本并按档应用(含 open 档状态条);`adopt_spawned_pages` 同步;`overlay_active()`(=locked&&headed,语义不变)+ `current_guard()`/`guard_visuals_active()`/`set_guard()`;`set_overlay` legacy 委托;`shutdown` 复位 |
 | `src/agent/tools/mcp_web_use/mod.rs` | `parse_open_guard`(guard>overlay>env 级联 + 校验 1001);`run_open_inner` 传 guard;复用路径 re-assert 与响应 `data.guard`/`data.overlay` 双字段;description/schema 增补 |
 | `src/agent/tools/mcp_web_use/control.rs` | `overlay_lift_for_input` → `guard_lift_for_input`(locked 解锁 / partial 隐盾双态);导航 re-assert 按期望态;`act_screenshot` 避让升级(蒙层+盾区+状态条);`act_request_human` 解锁/恢复按期望态;+ `act_set_guard`;`act_set_overlay` 保留 |
-| `src/agent/tools/mcp_web_use/captcha_crop.rs` | HITL 附图采集避让改走 `guard_suspend_visuals` |
+| `src/agent/tools/mcp_web_use/captcha_crop.rs` | HITL 附图采集避让改走 `guard_suspend_visuals`(2026-10-13:该模块已随验证码功能整体删除) |
 | `src/agent/system_prompt/mod.rs` | §17 三档判定表 + §20 通道 B 登录模板 |
 | `CLAUDE.md` / `AGENTS.md` | 环境变量表 + `LAEW_WEB_GUARD` 行;概念段与工具表更新;文档地图 + 07 |
 

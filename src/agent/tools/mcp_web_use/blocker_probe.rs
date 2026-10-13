@@ -30,6 +30,18 @@ pub(super) fn enabled() -> bool {
     )
 }
 
+/// 2026-10-13:**auto-HITL(自动弹出人工介入)总开关**(默认开;
+/// `LAEW_HITL_AUTO=off/0/false/no` 关闭)。
+///
+/// 关闭后两处自动升级(输入硬闸 6002 / 收尾探针首次命中)回退「提示载荷 →
+/// LLM 显式 request_human」的既有语义,行为与升级前完全一致。
+pub(super) fn hitl_auto_enabled() -> bool {
+    !matches!(
+        std::env::var("LAEW_HITL_AUTO").ok().as_deref(),
+        Some("off") | Some("0") | Some("false") | Some("no")
+    )
+}
+
 /// 该 control_action 完成后是否自动探测人工阻断(第 147 轮;第 151 轮补 eval_js)。
 ///
 /// - 输入类动作(复用 [`crate::agent::browser_overlay::action_dispatches_input` 白名单]):
@@ -653,6 +665,19 @@ pub(super) async fn probe_alert(page_id: &str) -> Option<Value> {
     if repeat_count.is_some() {
         return Some(json!({"blocker_alert": alert}));
     }
+    // 2026-10-13:**自动弹出(auto-HITL)** —— 首次命中且守卫放行(开关开 / 非
+    // sequence 上下文 / hub 无 pending)时直接弹人工介入并等待应答,动作本体已
+    // 成功(code=0 不变),应答结果并入 data.auto_hitl 驱动下一步;守卫拒绝(批内
+    // / 已有 pending / 开关关)则落到下面的提示载荷现状。
+    if let Some(report) = super::control::auto_hitl(page_id, &kind, &message, "blocker_probe").await {
+        let mut out = json!({"blocker_alert": alert});
+        if let (Some(dst), Some(src)) = (out.as_object_mut(), report.data.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        return Some(out);
+    }
     let hint = super::human_assist_hint(&kind, &message, &HITL_CHALLENGE_OPTIONS);
     let mut out = json!({
         "blocker_alert": alert,
@@ -755,6 +780,34 @@ pub(super) async fn challenge_gate(
     } else {
         format!("页面弹出人工验证挑战「{snippet}」,输入动作已被拦截;请人工在浏览器窗口完成验证,完成后回弹窗点「提交 / 继续」")
     };
+    // 2026-10-13:**自动弹出(auto-HITL)** —— 硬闸命中且守卫放行(开关开 / 非
+    // sequence 上下文 / hub 无 pending,见 `hitl_ctl::auto_hitl` 文档)时直接弹
+    // 人工介入并等待应答,省一轮 LLM 往返,根治「无视 6002 提示继续对着弹窗输入」。
+    // 信封码恒 6002:输入动作**仍未执行**,人工应答后由 LLM 重试本动作(不伪造成功)。
+    if let Some(report) = super::control::auto_hitl(page_id, ctype.reason(), &message, "input_gate").await {
+        let (msg, mut data) = match report.status {
+            super::control::HitlStatus::Answered => (
+                "输入动作已拦截:人工验证挑战在场,已自动弹出人工介入并获人工应答;请重试本动作(页面已由人工处理)",
+                report.data,
+            ),
+            super::control::HitlStatus::Cancelled => (
+                "输入动作已拦截:人工验证挑战在场,人工已在自动弹出的人工介入中取消;终止当前流程并汇总报告",
+                report.data,
+            ),
+            _ => (
+                "页面存在人工验证挑战,输入动作已拦截;自动弹出的人工介入未获应答(超时/不可用),可显式 request_human 重试,误判可 params.force=true",
+                report.data,
+            ),
+        };
+        if let (Some(dst), Some(src)) = (data.as_object_mut(), alert.as_object()) {
+            dst.insert("blocker_alert".to_string(), Value::Object(src.clone()));
+            dst.insert(
+                "force_hint".to_string(),
+                json!("确认页面无真实验证弹窗(结构误判)时,可在 params 加 force=true 跳过硬闸强制执行"),
+            );
+        }
+        return Some(super::envelope(super::CODE_BLOCKER_INPUT_GATE, msg, data));
+    }
     let hint = super::human_assist_hint(ctype.reason(), &message, &HITL_CHALLENGE_OPTIONS);
     let mut data = json!({
         "blocker_alert": alert,

@@ -6,10 +6,11 @@
 //! - `objc_msgSend` 按具体参数形状逐个包装(tauri/tao 验证过的做法),x86_64 的
 //!   结构体返回走 `objc_msgSend_stret`,arm64 统一走 `objc_msgSend`;
 //! - **布局单一真源**:`layout_frames`(排布)与 `content_height`(预算)由同一组
-//!   常量/参数推导(第 134 轮事故的根治);最大化/还原只重排,**不回读**窗口 frame
-//!   (第 137 轮事故的根治);
-//! - 窗口 styleMask 仅 `Titled`(无系统关闭/缩放按钮),resize 唯一路径 = 自家
-//!   「⛶ 最大化/还原」按钮 → 确定性重排。
+//!   常量/参数推导(第 134 轮事故的根治);窗口按内容定尺寸、`place_window` 落位,
+//!   **永不回读**窗口 frame(第 137 轮事故的根治);
+//! - 窗口 styleMask 仅 `Titled`(无系统关闭/缩放按钮),长说明在 NSScrollView 里
+//!   滚动阅读(2026-10-13:「⛶ 最大化」按钮随验证码功能移除 —— 它是验证码图片
+//!   放大时代的遗物,通用弹窗不需要)。
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Mutex, OnceLock};
@@ -74,6 +75,8 @@ const NS_FLOATING_WINDOW_LEVEL: i64 = 3; // kCGFloatingWindowLevel
 const NS_BEZEL_BORDER: u64 = 2;
 const NS_ROUNDED_BEZEL_STYLE: i64 = 1;
 const NS_EVENT_TYPE_APPLICATION_DEFINED: i64 = 15;
+/// NSButtonType NSSwitchButton = 3:标准复选框外观,点击自动翻转 state。
+const NS_SWITCH_BUTTON: i64 = 3;
 
 /// `objc_msgSend` 按具体签名逐形状包装(见模块文档)。
 macro_rules! msg {
@@ -153,9 +156,10 @@ unsafe fn ns_str(s: &str) -> Id {
 
 // ---------- 布局单一真源 ----------
 
-// 2026-10-13:底行七键位从左到右 = 取消/继续/⏱+2分钟/解除屏蔽·恢复屏蔽(互切)
-// ‖ 📋复制/⛶最大化(右组)。验证码图片区与「🔍 放大」已随验证码功能移除。
-// 左组 16+84+8+96+8+88+8+96 = 404,右组 92+8+104 = 204 起始 460,间距 56。
+// 2026-10-13:底行六键位从左到右 = 取消/继续/⏱+2分钟/解除屏蔽·恢复屏蔽(互切)
+// ‖ 📋复制(右组)。「⛶ 最大化」按钮随验证码功能移除(说明区可滚动,放大是
+// 验证码图片时代的遗物)。左组 16+84+8+96+8+88+8+96 = 404,右组 92 起始 572,
+// 间距 168。
 const W: f64 = 680.0;
 const PAD: f64 = 16.0;
 const TITLE_H: f64 = 22.0;
@@ -164,13 +168,12 @@ const INPUT_H: f64 = 28.0;
 const BTN_H: f64 = 30.0;
 const GAP: f64 = 8.0;
 const CANCEL_W: f64 = 84.0;
-/// 主按钮「继续」(空输入=选项1交棒;有输入=把补充说明交给 Agent)。
+/// 主按钮「继续」(空输入=选项1交棒;有输入=把补充说明交给 Agent;多选时收集勾选)。
 const SUBMIT_W: f64 = 96.0;
 const EXTEND_W: f64 = 88.0;
 /// 2026-10-13:「解除屏蔽/恢复屏蔽」互切按钮。
 const GUARD_W: f64 = 96.0;
 const COPY_W: f64 = 92.0;
-const ZOOM_W: f64 = 104.0;
 const INNER: f64 = 8.0;
 
 /// 复制按钮的两个标题(第 139 轮:一键复制全部信息,免去在倒计时行里拖选)。
@@ -199,7 +202,6 @@ struct Frames {
     extend: NSRect,
     guard: NSRect,
     copy: NSRect,
-    zoom: NSRect,
 }
 
 /// 排布纯函数:给定内容视图尺寸与几何参数,产出全部控件 frame。
@@ -241,8 +243,7 @@ fn layout_frames(cw: f64, ch: f64, geo: Geometry, opt_count: usize) -> Frames {
             GUARD_W,
             BTN_H,
         ),
-        copy: ns_rect(cw - PAD - ZOOM_W - INNER - COPY_W, row_y, COPY_W, BTN_H),
-        zoom: ns_rect(cw - PAD - ZOOM_W, row_y, ZOOM_W, BTN_H),
+        copy: ns_rect(cw - PAD - COPY_W, row_y, COPY_W, BTN_H),
     }
 }
 
@@ -271,7 +272,6 @@ struct Views {
     extend: Id,
     guard: Id,
     copy: Id,
-    zoom: Id,
 }
 
 struct MacState {
@@ -290,10 +290,8 @@ struct MacState {
     /// 2026-10-13:页面当前是否处于放行态 —— 「解除屏蔽/恢复屏蔽」互切按钮的
     /// 当前标题侧(false=标题「🔓 解除屏蔽」,true=「🔒 恢复屏蔽」)。
     guard_unblocked: bool,
-    /// 正常态布局(还原用)。
-    normal_geo: Geometry,
-    normal_content: (f64, f64),
-    zoomed: bool,
+    /// 2026-10-13:选项是否多选(复选框组);收口时收集全部勾选。
+    multi_select: bool,
     timer: Id,
     started: Instant,
     timeout_ms: u64,
@@ -327,8 +325,11 @@ extern "C" fn on_cancel(_self: Id, _cmd: Sel, _sender: Id) {
     finish("cancel", -1);
 }
 
-extern "C" fn on_zoom(_self: Id, _cmd: Sel, _sender: Id) {
-    unsafe { toggle_zoom() };
+/// 2026-10-13:多选模式选项复选框的 action —— NSSwitchButton 点击时 AppKit 已自动
+/// 翻转 state,这里**只观察不收口**(多选的收口动作是「继续」按钮收集勾选);
+/// 单选模式的选项仍是 push button,走 `submit:` 立即应答,不经过本 IMP。
+extern "C" fn on_opt_toggle(_self: Id, _cmd: Sel, _sender: Id) {
+    // 观察 no-op:保留 target/action 接线是为了点击有标准键盘焦点行为。
 }
 
 /// 第 145 轮:「⏱ +2分钟」延长等待 —— 本地 `timeout_ms += EXTEND_STEP_MS`
@@ -529,7 +530,7 @@ fn controller_class() -> Id {
         };
         let all = ok(on_submit, b"submit:\0")
             & ok(on_cancel, b"cancel:\0")
-            & ok(on_zoom, b"zoom:\0")
+            & ok(on_opt_toggle, b"optToggle:\0")
             & ok(on_extend, b"extend:\0")
             & ok(on_guard_toggle, b"guardToggle:\0")
             & ok(on_copy, b"copyInfo:\0")
@@ -548,8 +549,10 @@ fn controller_class() -> Id {
 // ---------- 收口 ----------
 
 /// 收口(只在 UI 线程调用):结果映射 → 停定时器 → 停 run loop。
-/// - answer + 输入框有字 → answer(文本);无字 + tag>=0 → answer(选项 N);
-///   无字 + tag<0(提交按钮/输入框回车)→ answer(选项 1,对齐「空回车=选项1」);
+/// - answer + 输入框有字 → answer(文本);
+/// - 无字 + 多选 → 收集全部勾选(`join_multi_answer`);空勾选回退选项 1(交棒);
+/// - 无字 + tag>=0 → answer(选项 N,单选按钮点击);
+/// - 无字 + tag<0(提交按钮/输入框回车)→ answer(选项 1,对齐「空回车=选项1」);
 /// - cancel / timeout 直传。
 fn finish(kind: &str, tag: i64) {
     {
@@ -570,6 +573,13 @@ fn finish(kind: &str, tag: i64) {
             let typed = unsafe { read_input(st.views.input) };
             if !typed.is_empty() {
                 ("answer".to_string(), typed)
+            } else if st.multi_select {
+                let picked = collect_checked(&st.views.opts);
+                let joined = super::dialog_main::join_multi_answer(&st.options, &picked);
+                (
+                    "answer".to_string(),
+                    joined.unwrap_or_else(|| format!("1. {}", st.options[0])),
+                )
             } else if tag >= 0 && (tag as usize) < st.options.len() {
                 (
                     "answer".to_string(),
@@ -583,6 +593,17 @@ fn finish(kind: &str, tag: i64) {
         st.result = Some(result);
     }
     unsafe { stop_run_loop() };
+}
+
+/// 多选模式:读取全部选项复选框的勾选态(NSState 0=off/1=on),返回勾选下标(0 基)。
+fn collect_checked(opts: &[Id]) -> Vec<usize> {
+    let mut picked = Vec::with_capacity(opts.len());
+    for (i, b) in opts.iter().enumerate() {
+        if !b.is_null() && unsafe { send_i64(*b, sel(b"state\0")) } == 1 {
+            picked.push(i);
+        }
+    }
+    picked
 }
 
 unsafe fn read_input(input: Id) -> String {
@@ -625,46 +646,7 @@ unsafe fn stop_run_loop() {
     }
 }
 
-// ---------- 最大化/还原(第 137 轮事故根治:确定性重排,不回读 frame) ----------
-
-unsafe fn toggle_zoom() {
-    // 目标几何:确定性推导(最大化 = 主屏可视区 - 40px,布局参数按屏高重推),
-    // 排版高度 = 我们传入的值,**永不回读**窗口 frame。
-    let (w, h, geo, opt_count) = {
-        let guard = state();
-        let Some(st) = guard.as_ref() else { return };
-        if st.zoomed {
-            (
-                st.normal_content.0,
-                st.normal_content.1,
-                st.normal_geo,
-                st.options.len(),
-            )
-        } else {
-            let vf = pick_screen_visible();
-            let zw = (vf.size.width - 40.0).max(W);
-            let zh = (vf.size.height - 40.0).max(st.normal_content.1);
-            let msg_h = (zh * 0.22).round().clamp(90.0, 240.0);
-            let g = Geometry { msg_h };
-            (zw, zh.max(content_height(g, st.options.len())), g, st.options.len())
-        }
-    };
-    let (views, window, input) = {
-        let mut guard = state();
-        let Some(st) = guard.as_mut() else { return };
-        st.zoomed = !st.zoomed;
-        let title = if st.zoomed { "⛶ 还原" } else { "⛶ 最大化" };
-        send_void_id(st.views.zoom, sel(b"setTitle:\0"), ns_str(title));
-        (
-            ViewsSnapshot::from(&st.views),
-            st.views.window,
-            st.views.input,
-        )
-    };
-    let (fw, fh) = place_window(window, w, h);
-    apply_frames(&views, &layout_frames(fw, fh, geo, opt_count), geo);
-    send_bool_id(window, sel(b"makeFirstResponder:\0"), input);
-}
+// ---------- 排版落位 ----------
 
 /// IMP 与主流程之间传递的控件快照(裸指针拷贝;子进程 UI 线程内恒有效)。
 struct ViewsSnapshot {
@@ -679,7 +661,6 @@ struct ViewsSnapshot {
     extend: Id,
     guard: Id,
     copy: Id,
-    zoom: Id,
 }
 
 impl ViewsSnapshot {
@@ -696,10 +677,8 @@ impl ViewsSnapshot {
             extend: v.extend,
             guard: v.guard,
             copy: v.copy,
-            zoom: v.zoom,
         }
     }
-
 }
 
 /// 把布局结果落到控件(统一全量设置)。
@@ -722,7 +701,6 @@ unsafe fn apply_frames(v: &ViewsSnapshot, f: &Frames, _geo: Geometry) {
     set(v.extend, f.extend);
     set(v.guard, f.guard);
     set(v.copy, f.copy);
-    set(v.zoom, f.zoom);
 }
 
 // ---------- 选屏与定位(第 134 轮结论延续) ----------
@@ -858,12 +836,18 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
 
     let mut opt_buttons = Vec::new();
     for (i, opt) in p.options.iter().enumerate() {
-        let b = make_button(opt, None, ctrl, b"submit:\0", i as i64);
+        // 2026-10-13:多选 = NSSwitchButton 复选框(optToggle: 只观察不收口,
+        // 收口动作是「继续」收集勾选);单选 = push button 点击即应答(现状)。
+        let b = if p.multi_select {
+            make_check_option(opt, ctrl, i as i64)
+        } else {
+            make_button(opt, None, ctrl, b"submit:\0", i as i64)
+        };
         opt_buttons.push(b);
     }
     let cancel = make_button("取消", Some("\x1b"), ctrl, b"cancel:\0", -1);
     // 2026-10-13:主按钮「继续」 —— 人工操作完成后点击,把流程与控制权交还 Agent
-    // (有输入=把补充说明交给 Agent;空输入=选项 1「我已完成人工操作,继续」)。
+    // (有输入=把补充说明交给 Agent;多选=收集勾选;空输入=选项 1「我已完成人工操作,继续」)。
     let submit = make_button("继续", Some("\r"), ctrl, b"submit:\0", -1);
     // 第 145 轮:「⏱ +2分钟」延长等待(人工在浏览器完成整条登录链超 120s 分档
     // 超时的根治;stdout extend 中间行 → 父进程 hub 延长)。
@@ -880,7 +864,6 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         b"guardToggle:\0",
         -1,
     );
-    let zoom = make_button("⛶ 最大化", None, ctrl, b"zoom:\0", -1);
     // 第 139 轮:一键复制全部信息(说明 + 页面 URL + 页面 ID + 候选选项)。
     let copy_btn = make_button(COPY_BTN_TITLE, None, ctrl, b"copyInfo:\0", -1);
 
@@ -902,7 +885,6 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     add(content, submit);
     add(content, extend);
     add(content, guard);
-    add(content, zoom);
     add(content, copy_btn);
 
     send_void_id(
@@ -930,7 +912,6 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         extend,
         guard,
         copy: copy_btn,
-        zoom,
     };
     let snapshot = ViewsSnapshot::from(&views);
 
@@ -974,9 +955,7 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         started_at_ms: p.started_at_ms,
         extend_count: 0,
         guard_unblocked: p.guard_unlocked,
-        normal_geo: geo,
-        normal_content: (fw, fh),
-        zoomed: false,
+        multi_select: p.multi_select,
         timer: tick,
         started: Instant::now(),
         timeout_ms: p.timeout_ms,
@@ -1168,6 +1147,19 @@ unsafe fn make_button(
     b
 }
 
+/// 2026-10-13:多选模式的选项复选框(NSSwitchButton)—— 标题即选项文本,点击由
+/// AppKit 自动翻转勾选态(action `optToggle:` 只观察不收口);与 `make_button`
+/// 的差异:无 bezel(标准复选框外观)、无快捷键。
+unsafe fn make_check_option(text: &str, target: Id, tag: i64) -> Id {
+    let b = send_id(send_id(cls(b"NSButton\0"), sel(b"alloc\0")), sel(b"init\0"));
+    send_void_id(b, sel(b"setTitle:\0"), ns_str(text));
+    send_void_i64(b, sel(b"setButtonType:\0"), NS_SWITCH_BUTTON);
+    send_void_i64(b, sel(b"setTag:\0"), tag);
+    send_void_id(b, sel(b"setTarget:\0"), target);
+    send_void_sel(b, sel(b"setAction:\0"), sel(b"optToggle:\0"));
+    b
+}
+
 // ---------- 布局单测(纯函数,不触达 AppKit) ----------
 
 #[cfg(test)]
@@ -1187,7 +1179,6 @@ mod tests {
             ("extend", f.extend),
             ("guard", f.guard),
             ("copy", f.copy),
-            ("zoom", f.zoom),
         ];
         for (i, r) in f.opts.iter().enumerate() {
             rects.push((Box::leak(format!("opt{i}").into_boxed_str()) as &str, *r));
@@ -1212,14 +1203,12 @@ mod tests {
         assert_eq!(f.extend.origin.y, row);
         assert_eq!(f.guard.origin.y, row);
         assert_eq!(f.copy.origin.y, row);
-        assert_eq!(f.zoom.origin.y, row);
-        // 底部按钮行不重叠(2026-10-13:七键位 = 取消/继续/+2分钟/管控切换/复制/最大化)
+        // 底部按钮行不重叠(2026-10-13:六键位 = 取消/继续/+2分钟/管控切换/复制)
         let mut row_rects = [
             ("submit", f.submit),
             ("extend", f.extend),
             ("guard", f.guard),
             ("copy", f.copy),
-            ("zoom", f.zoom),
         ];
         row_rects.sort_by(|a, b| a.1.origin.x.total_cmp(&b.1.origin.x));
         for w in row_rects.windows(2) {
@@ -1300,7 +1289,7 @@ mod tests {
     }
 
     /// 最窄内容宽下底部按钮行仍不重叠(`layout_budget_matches_placement`
-    /// 里的 1400 是大窗,这里专门盯默认窄窗;2026-10-13 插入「解除屏蔽/恢复屏蔽」)。
+    /// 里的 1400 是大窗,这里专门盯默认窄窗;2026-10-13 六键位(移除「⛶ 最大化」)。
     #[test]
     fn bottom_row_fits_narrow_window() {
         let geo = Geometry { msg_h: 90.0 };
@@ -1310,6 +1299,5 @@ mod tests {
         assert!(f.submit.origin.x + f.submit.size.width <= f.extend.origin.x + 0.01);
         assert!(f.extend.origin.x + f.extend.size.width <= f.guard.origin.x + 0.01);
         assert!(f.guard.origin.x + f.guard.size.width <= f.copy.origin.x + 0.01);
-        assert!(f.copy.origin.x + f.copy.size.width <= f.zoom.origin.x + 0.01);
     }
 }

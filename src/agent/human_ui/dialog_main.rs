@@ -18,6 +18,9 @@ pub(super) struct DialogPayload {
     pub url: String,
     pub page_id: String,
     pub options: Vec<String>,
+    /// 2026-10-13:选项是否多选(true = 复选框组,点「继续」收集勾选;false = 单选
+    /// 按钮组,点击即应答)。
+    pub multi_select: bool,
     /// 2026-10-13:页面当前是否已处于放行(open/无管控)态 —— 决定「解除屏蔽/恢复屏蔽」
     /// 切换按钮的初始标题(false=显示「🔓 解除屏蔽」,true=显示「🔒 恢复屏蔽」)。
     pub guard_unlocked: bool,
@@ -61,6 +64,10 @@ impl DialogPayload {
             url: str_field("url"),
             page_id: str_field("page_id"),
             options,
+            multi_select: v
+                .get("multi_select")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             // 2026-10-13:payload 中的 image_path 不再投影 —— 弹窗验证码图片功能
             // 已移除,未知字段按容错缺省忽略。
             guard_unlocked: v
@@ -191,6 +198,25 @@ pub(super) fn guard_line(id: u64, unlock: bool) -> String {
     serde_json::json!({"status": "guard", "id": id, "unlock": unlock}).to_string()
 }
 
+// ---------- 2026-10-13:多选应答编码(两平台共用) ----------
+
+/// 把多选弹窗勾选的选项下标(0 基,升序)编码为应答文本:`1. aaa；3. ccc`
+/// (全角分号连接)。空选 / 下标越界返回 None(调用方回退「选项 1 交棒」语义,
+/// 与单选空输入点继续完全一致)。
+///
+/// 形状与单选 `N. label` 同构 —— `hitl_hint::is_option_pick_answer` 的数字前缀
+/// 判定天然兼容,多选应答自动归入「选项应答」分流(不做填码处理)。
+pub(super) fn join_multi_answer(options: &[String], picked: &[usize]) -> Option<String> {
+    if picked.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(picked.len());
+    for &i in picked {
+        parts.push(format!("{}. {}", i + 1, options.get(i)?));
+    }
+    Some(parts.join("；"))
+}
+
 /// 子进程主入口:返回进程退出码(0 = 正常收口,含 timeout/error JSON)。
 pub fn run(payload_path: &Path) -> i32 {
     let (status, text) = match read_payload(payload_path) {
@@ -248,6 +274,7 @@ mod tests {
             "message": "请输入验证码", "options": ["继续", "取消任务"],
             "url": "https://example.com/login", "page_id": "p_1",
             "image_path": "/tmp/x.png", "timeout_ms": 300000,
+            "multi_select": true,
             "started_at_ms": 1759991525000u64
         });
         let p = DialogPayload::from_json(&v);
@@ -255,8 +282,26 @@ mod tests {
         assert_eq!(p.kind_label, "短信验证码");
         assert_eq!(p.options.len(), 2);
         assert_eq!(p.timeout_ms, 300_000);
+        assert!(p.multi_select);
         assert!(p.info_text().contains("页面: https://example.com/login"));
         assert!(p.info_text().contains("页面ID: p_1"));
+        // 缺省投影:multi_select 缺失 = 单选
+        let dft = DialogPayload::from_json(&serde_json::json!({}));
+        assert!(!dft.multi_select);
+    }
+
+    /// 2026-10-13:多选应答编码形状(两平台收口共用)。
+    #[test]
+    fn join_multi_answer_shapes() {
+        let opts = vec!["选项甲".to_string(), "选项乙".to_string(), "选项丙".to_string()];
+        // 常规多选:全角分号连接,编号 1 基
+        assert_eq!(join_multi_answer(&opts, &[0, 2]).as_deref(), Some("1. 选项甲；3. 选项丙"));
+        // 单个勾选退化为单选形态
+        assert_eq!(join_multi_answer(&opts, &[1]).as_deref(), Some("2. 选项乙"));
+        // 空选 = None(调用方回退选项 1 交棒语义)
+        assert_eq!(join_multi_answer(&opts, &[]), None);
+        // 下标越界 = None(防御,不 panic)
+        assert_eq!(join_multi_answer(&opts, &[9]), None);
     }
 
     /// 第 145 轮:延长中间行必须是父进程 `parse_extend_line` 认识的形状。

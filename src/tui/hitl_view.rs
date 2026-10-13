@@ -389,6 +389,7 @@ mod human_assist_tui_tests {
             kind: "captcha".into(),
             message: "test".into(),
             options: vec![],
+            multi_select: false,
             url: String::new(),
             page_id: "p_1".into(),
             image_path: String::new(),

@@ -13,6 +13,7 @@ fn sample_display() -> HumanAssistDisplay {
         kind: "sms".into(),
         message: "页面要求短信验证码,请输入后继续".into(),
         options: vec!["我已完成人工操作,继续".into(), "取消任务".into()],
+        multi_select: false,
         url: "https://example.com/login".into(),
         page_id: "p_ab12cd34".into(),
         image_path: String::new(),
@@ -62,6 +63,16 @@ fn payload_guard_unlocked_roundtrip() {
     d.guard_unlocked = true;
     assert_eq!(build_payload(&d)["guard_unlocked"], true);
     assert_eq!(build_payload(&sample_display())["guard_unlocked"], false);
+}
+
+/// 2026-10-13:multi_select(选项多选)透传 —— 弹窗选项渲染为复选框组的依据;
+/// 缺省 false = 单选按钮组(点击即应答)。
+#[test]
+fn payload_multi_select_roundtrip() {
+    let mut d = sample_display();
+    d.multi_select = true;
+    assert_eq!(build_payload(&d)["multi_select"], true);
+    assert_eq!(build_payload(&sample_display())["multi_select"], false);
 }
 
 #[test]
@@ -309,6 +320,7 @@ async fn smoke_real_dialog_popup() {
                 "p_smoke",
                 60_000,
                 "",
+                false,
                 false,
             )
             .await

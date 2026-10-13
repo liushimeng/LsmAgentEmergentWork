@@ -7,7 +7,8 @@
 //!   从「当前客户区尺寸」推导),这是 Windows 侧「最大化后无响应」的根治点
 //!   (旧 ps1 靠 WinForms Anchor,不重算);
 //! - 2026-10-13:验证码图片区随弹窗验证码功能移除(SS_BITMAP/STM_SETIMAGE/
-//!   image crate 解码链整链删除,零外部进程路径保持);
+//!   image crate 解码链整链删除,零外部进程路径保持);「⛶ 最大化」按钮同步移除
+//!   (系统标题栏保留 WS_MAXIMIZEBOX,WM_SIZE 全量重排天然覆盖);
 //! - DPI:保持系统默认虚拟化(布局常量与 macOS 侧同值,见 macos_dialog.rs)。
 
 use std::sync::Mutex;
@@ -25,24 +26,25 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
+use windows::Win32::UI::Controls::{IsDlgButtonChecked, BST_CHECKED};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HWND_TOPMOST,
     IsDialogMessageW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON,
-    BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
-    ES_MULTILINE, ES_READONLY, HMENU, IDC_ARROW, SW_MAXIMIZE, SW_RESTORE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WM_SETTEXT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_CHILD, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_SYSMENU,
-    WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, BS_AUTOCHECKBOX,
+    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL,
+    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, HMENU, IDC_ARROW, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_SETFONT, WM_SETTEXT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_TOPMOST,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use super::dialog_main::{countdown_text, DialogPayload};
 
 // ---------- 布局常量(与 macos_dialog.rs 保持同值;两平台观感一致) ----------
-// 2026-10-13:底行七键位 = 取消/继续/⏱+2分钟/解除屏蔽·恢复屏蔽(互切)‖ 复制/最大化。
+// 2026-10-13:底行六键位 = 取消/继续/⏱+2分钟/解除屏蔽·恢复屏蔽(互切)‖ 复制。
 
 const W: i32 = 680;
 const PAD: i32 = 16;
@@ -58,7 +60,6 @@ const EXTEND_W: i32 = 88;
 /// 2026-10-13:「解除屏蔽/恢复屏蔽」互切按钮。
 const GUARD_W: i32 = 96;
 const COPY_W: i32 = 92;
-const ZOOM_W: i32 = 104;
 const INNER: i32 = 8;
 
 const MSG_H_MIN: f64 = 90.0;
@@ -93,7 +94,6 @@ const EM_SETCUEBANNER: u32 = 0x1501;
 const IDOK_ID: i32 = 1;
 const IDCANCEL_ID: i32 = 2;
 const IDC_OPT_BASE: i32 = 100;
-const IDC_ZOOM: i32 = 106;
 /// 第 139 轮:「📋 复制」一键把完整信息写入剪贴板。
 const IDC_COPY: i32 = 108;
 /// 第 145 轮:「⏱ +2分钟」延长等待(stdout extend 中间行 → 父进程 hub 延长)。
@@ -129,7 +129,6 @@ struct Frames {
     extend: RECT,
     guard: RECT,
     copy: RECT,
-    zoom: RECT,
 }
 
 fn rect(x: i32, y: i32, w: i32, h: i32) -> RECT {
@@ -156,7 +155,7 @@ fn layout_frames(cw: i32, ch: i32, geo: Geometry, opt_count: usize) -> Frames {
     let t2_y = place(LINE_H);
     let input_y = place(INPUT_H);
     let opts = (0..opt_count).map(|_| rect(PAD, place(BTN_H), text_w, BTN_H)).collect();
-    // 底部按钮行:左 取消/继续/⏱+2分钟/管控切换,右 复制/⛶ 最大化;钉在底边
+    // 底部按钮行:左 取消/继续/⏱+2分钟/管控切换,右 复制;钉在底边
     // (任何 WM_SIZE 后重算)
     let row_y = (ch - PAD - BTN_H).max(y);
     Frames {
@@ -175,8 +174,7 @@ fn layout_frames(cw: i32, ch: i32, geo: Geometry, opt_count: usize) -> Frames {
             GUARD_W,
             BTN_H,
         ),
-        copy: rect(cw - PAD - ZOOM_W - INNER - COPY_W, row_y, COPY_W, BTN_H),
-        zoom: rect(cw - PAD - ZOOM_W, row_y, ZOOM_W, BTN_H),
+        copy: rect(cw - PAD - COPY_W, row_y, COPY_W, BTN_H),
     }
 }
 
@@ -205,7 +203,6 @@ struct WinState {
     extend: HWND,
     guard: HWND,
     copy: HWND,
-    zoom: HWND,
     options: Vec<String>,
     /// 「📋 复制」写入剪贴板的文本(第 139 轮)。
     copy_payload: String,
@@ -220,7 +217,8 @@ struct WinState {
     /// 2026-10-13:页面当前是否处于放行态 —— 「解除屏蔽/恢复屏蔽」互切按钮的
     /// 当前标题侧(false=「🔓 解除屏蔽」,true=「🔒 恢复屏蔽」)。
     guard_unblocked: bool,
-    zoomed: bool,
+    /// 2026-10-13:选项是否多选(BS_AUTOCHECKBOX 复选框组);收口时收集勾选。
+    multi_select: bool,
     started: Instant,
     timeout_ms: u64,
     done: bool,
@@ -254,7 +252,6 @@ struct Controls {
     extend: HWND,
     guard: HWND,
     copy: HWND,
-    zoom: HWND,
 }
 
 impl Controls {
@@ -271,7 +268,6 @@ impl Controls {
             extend: st.extend,
             guard: st.guard,
             copy: st.copy,
-            zoom: st.zoom,
         }
     }
 }
@@ -345,7 +341,6 @@ unsafe fn apply_frames(c: &Controls, f: &Frames) {
     mv(c.extend, f.extend);
     mv(c.guard, f.guard);
     mv(c.copy, f.copy);
-    mv(c.zoom, f.zoom);
 }
 
 // ---------- 事件处理 ----------
@@ -442,11 +437,20 @@ fn on_command(id: i32) {
     match id {
         IDOK_ID => finish("answer", -1),     // 继续按钮 / Enter(默认按钮)
         IDCANCEL_ID => finish("cancel", -1), // 取消按钮 / Esc
-        IDC_ZOOM => toggle_zoom(),
         IDC_EXTEND => extend_wait(),
         IDC_GUARD => guard_toggle(),
         IDC_COPY => copy_info(),
-        _ if id >= IDC_OPT_BASE => finish("answer", (id - IDC_OPT_BASE) as i64),
+        // 2026-10-13:多选模式选项是 BS_AUTOCHECKBOX(点击系统自翻转,不收口,
+        // 收口动作 = 「继续」收集勾选);单选保持 push button 点击即应答。
+        _ if id >= IDC_OPT_BASE => {
+            let multi = {
+                let guard = state();
+                guard.as_ref().map(|st| st.multi_select).unwrap_or(false)
+            };
+            if !multi {
+                finish("answer", (id - IDC_OPT_BASE) as i64);
+            }
+        }
         _ => {}
     }
 }
@@ -498,24 +502,6 @@ fn extend_wait() {
     }
 }
 
-fn toggle_zoom() {
-    let (hwnd, zoomed) = {
-        let mut guard = state();
-        let Some(st) = guard.as_mut() else { return };
-        st.zoomed = !st.zoomed;
-        let title = if st.zoomed { "⛶ 还原" } else { "⛶ 最大化" };
-        let wide = to_wide(title);
-        unsafe {
-            SendMessageW(st.zoom, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
-        }
-        (st.hwnd, st.zoomed)
-    };
-    unsafe {
-        // ShowWindow 触发 WM_SIZE → relayout(全量重排)
-        let _ = ShowWindow(hwnd, if zoomed { SW_MAXIMIZE } else { SW_RESTORE });
-    }
-}
-
 /// 2026-10-13:「解除屏蔽/恢复屏蔽」互切 —— 与 macOS 侧 `on_guard_toggle` 同构:
 /// 点击即翻转本地态 + 向 stdout 打 guard **中间行**(进程不退出;父进程逐行读并
 /// 接线 `HumanAssistHub::guard_toggle_from_ui` → 对关联 page_id 应用整页 open /
@@ -564,6 +550,19 @@ fn finish(kind: &str, tag: i64) {
             let typed = unsafe { read_input(st.input) };
             if !typed.is_empty() {
                 ("answer".to_string(), typed)
+            } else if st.multi_select {
+                // 2026-10-13:多选收口 —— 按控件 ID 收集全部勾选(空勾选回退选项 1 交棒)。
+                let picked: Vec<usize> = (0..st.opts.len() as i32)
+                    .filter(|&i| unsafe {
+                        IsDlgButtonChecked(st.hwnd, IDC_OPT_BASE + i) == BST_CHECKED.0
+                    })
+                    .map(|i| i as usize)
+                    .collect();
+                let joined = super::dialog_main::join_multi_answer(&st.options, &picked);
+                (
+                    "answer".to_string(),
+                    joined.unwrap_or_else(|| format!("1. {}", st.options[0])),
+                )
             } else if tag >= 0 && (tag as usize) < st.options.len() {
                 (
                     "answer".to_string(),
@@ -697,9 +696,16 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     unsafe { set_cue_banner(input, INPUT_CUE_BANNER) };
     let mut opts = Vec::new();
     for (i, opt) in p.options.iter().enumerate() {
+        // 2026-10-13:多选 = BS_AUTOCHECKBOX 复选框(点击系统自翻转,收口动作是
+        // 「继续」收集勾选);单选 = push button 点击即应答(现状)。
+        let style = if p.multi_select {
+            style_check_option()
+        } else {
+            style_button(false)
+        };
         opts.push(create_control(
             hwnd, hinst, "BUTTON", opt,
-            style_button(false), IDC_OPT_BASE + i as i32, font_normal,
+            style, IDC_OPT_BASE + i as i32, font_normal,
         ));
     }
     let cancel = create_control(hwnd, hinst, "BUTTON", "取消", style_button(false), IDCANCEL_ID, font_normal);
@@ -722,7 +728,6 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         IDC_GUARD,
         font_normal,
     );
-    let zoom = create_control(hwnd, hinst, "BUTTON", "⛶ 最大化", style_button(false), IDC_ZOOM, font_normal);
     // 第 139 轮:一键复制(STATIC 标签天生不可选中,拖选复制不可靠)
     let copy = create_control(hwnd, hinst, "BUTTON", COPY_BTN_TITLE, style_button(false), IDC_COPY, font_normal);
 
@@ -740,7 +745,6 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         extend,
         guard,
         copy,
-        zoom,
         options: p.options.clone(),
         copy_payload: p.copy_text(),
         copied_at: None,
@@ -748,7 +752,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         started_at_ms: p.started_at_ms,
         extend_count: 0,
         guard_unblocked: p.guard_unlocked,
-        zoomed: false,
+        multi_select: p.multi_select,
         started: Instant::now(),
         timeout_ms: p.timeout_ms,
         done: false,
@@ -820,6 +824,11 @@ fn style_button(default: bool) -> WINDOW_STYLE {
     } else {
         base
     }
+}
+
+/// 2026-10-13:多选模式选项复选框(BS_AUTOCHECKBOX,系统自动翻转勾选态)。
+fn style_check_option() -> WINDOW_STYLE {
+    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32)
 }
 
 unsafe fn create_control(
@@ -895,18 +904,16 @@ mod tests {
                 assert_eq!(f.extend.top, row);
                 assert_eq!(f.guard.top, row);
                 assert_eq!(f.copy.top, row);
-                assert_eq!(f.zoom.top, row);
                 assert_eq!(f.cancel.bottom, ch - PAD);
-                // 2026-10-13:新增「解除屏蔽/恢复屏蔽」后底部按钮行不得重叠
+                // 2026-10-13:六键位(移除「⛶ 最大化」)后底部按钮行不得重叠
                 assert!(f.submit.right <= f.extend.left, "submit 与 extend 重叠");
                 assert!(f.extend.right <= f.guard.left, "extend 与 guard 重叠");
                 assert!(f.guard.right <= f.copy.left, "guard 与 copy 重叠");
-                assert!(f.copy.right <= f.zoom.left, "copy 与 zoom 重叠");
                 // 全控件在界内
                 let mut all = vec![
                     ("title", f.title), ("msg", f.msg), ("t1", f.t1), ("t2", f.t2),
                     ("input", f.input), ("cancel", f.cancel), ("submit", f.submit),
-                    ("extend", f.extend), ("guard", f.guard), ("copy", f.copy), ("zoom", f.zoom),
+                    ("extend", f.extend), ("guard", f.guard), ("copy", f.copy),
                 ];
                 for (i, r) in f.opts.iter().enumerate() {
                     all.push((Box::leak(format!("opt{i}").into_boxed_str()) as &str, *r));
@@ -919,8 +926,8 @@ mod tests {
                 let big_geo = Geometry { msg_h: msg_h_for(1200) };
                 let big = layout_frames(1400, 1200, big_geo, opt_count);
                 assert_eq!(big.cancel.bottom, 1200 - PAD);
-                assert!(big.zoom.right <= 1400);
-                assert!(big.zoom.left > big.submit.right, "右组与左组不应重叠");
+                assert!(big.copy.right <= 1400);
+                assert!(big.copy.left > big.submit.right, "右组与左组不应重叠");
             }
         }
     }

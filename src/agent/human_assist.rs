@@ -103,6 +103,11 @@ pub struct HumanAssistDisplay {
     pub message: String,
     /// 编号选项(1~6 个,可为空 —— 空则 TUI 直接读自由文本)。
     pub options: Vec<String>,
+    /// 2026-10-13:选项是否**多选**(弹窗渲染为复选框组,点「继续」收集全部勾选;
+    /// 缺省单选 = 选项按钮点击即应答)。应答编码见 `human_ui::dialog_main::
+    /// join_multi_answer`(`1. a；3. c`,数字前缀与 `hitl_hint::is_option_pick_answer`
+    /// 兼容)。
+    pub multi_select: bool,
     /// 关联页面 URL(展示用)。
     pub url: String,
     /// 关联 page_id(展示用)。
@@ -285,6 +290,7 @@ impl HumanAssistHub {
         timeout_ms: u64,
         image_path: &str,
         guard_unlocked: bool,
+        multi_select: bool,
     ) -> HumanAssistOutcome {
         // 第 130 轮:桌面弹窗可用时即使非 TTY(-p/管道)也放行 —— 只有
         // 「弹窗与 TUI 均不可用」才 fail-fast。
@@ -307,6 +313,7 @@ impl HumanAssistHub {
                         kind: kind.to_string(),
                         message: message.to_string(),
                         options,
+                        multi_select,
                         url: url.to_string(),
                         page_id: page_id.to_string(),
                         image_path: image_path.to_string(),
@@ -718,7 +725,7 @@ mod tests {
         let was = hub.is_attached();
         hub.detach();
         let out = hub
-            .request("captcha", "x", vec![], "https://a", "p_1", 1000, "", false)
+            .request("captcha", "x", vec![], "https://a", "p_1", 1000, "", false, false)
             .await;
         assert_eq!(out, HumanAssistOutcome::Unavailable);
         if was {
@@ -743,6 +750,7 @@ mod tests {
                     "p_2",
                     60_000,
                     "/tmp/laew_hitl_captcha_demo.png",
+                    false,
                     false,
                 )
                 .await
@@ -789,7 +797,7 @@ mod tests {
         hub.attach();
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("custom", "取消我", vec![], "", "p_3", 60_000, "", false).await }
+            async move { hub.request("custom", "取消我", vec![], "", "p_3", 60_000, "", false, false).await }
         });
         let display = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -818,7 +826,7 @@ mod tests {
         let hub = HumanAssistHub::global();
         hub.attach();
         let out = hub
-            .request("captcha", "x", vec![], "", "p_4", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false)
+            .request("captcha", "x", vec![], "", "p_4", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false, false)
             .await;
         assert_eq!(
             out,
@@ -844,7 +852,7 @@ mod tests {
         // 入位一个长超时请求(不依赖真实超时)
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "x", vec![], "", "p_n", 60_000, "", false).await }
+            async move { hub.request("captcha", "x", vec![], "", "p_n", 60_000, "", false, false).await }
         });
         // 等 request 入位(poll 能看到)
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -881,7 +889,7 @@ mod tests {
         hub.attach();
         let first = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "first", vec![], "", "p_5", 60_000, "", false).await }
+            async move { hub.request("captcha", "first", vec![], "", "p_5", 60_000, "", false, false).await }
         });
         let d1 = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -896,7 +904,7 @@ mod tests {
         // 第二个请求应排队而非覆盖
         let second = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("sms", "second", vec![], "", "p_6", 60_000, "", false).await }
+            async move { hub.request("sms", "second", vec![], "", "p_6", 60_000, "", false, false).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let polled = hub.poll().expect("槽位仍应是第一个请求");
@@ -947,7 +955,7 @@ mod tests {
         let was = hub.is_attached();
         hub.detach(); // 纯弹窗路径(模拟 -p 桌面模式)
         let out = hub
-            .request("sms", "验证码", vec![], "https://c", "p_g", 60_000, "", true)
+            .request("sms", "验证码", vec![], "https://c", "p_g", 60_000, "", true, false)
             .await;
         assert_eq!(
             out,
@@ -990,7 +998,7 @@ mod tests {
         hub.attach();
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("captcha", "x", vec![], "", "p_gf", 60_000, "", false).await }
+            async move { hub.request("captcha", "x", vec![], "", "p_gf", 60_000, "", false, false).await }
         });
         // 等弹窗失败降级(GuiFailed 事件 + gui 标记清除)
         let display = tokio::time::timeout(Duration::from_secs(3), async {
@@ -1029,7 +1037,7 @@ mod tests {
         let task = tokio::spawn({
             let hub = hub.clone();
             async move {
-                hub.request("captcha", "x", vec![], "", "p_x", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false)
+                hub.request("captcha", "x", vec![], "", "p_x", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false, false)
                     .await
             }
         });
@@ -1074,7 +1082,7 @@ mod tests {
         let task = tokio::spawn({
             let hub = hub.clone();
             async move {
-                hub.request("captcha", "x", vec![], "", "p_x2", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false)
+                hub.request("captcha", "x", vec![], "", "p_x2", MIN_HUMAN_ASSIST_TIMEOUT_MS, "", false, false)
                     .await
             }
         });
@@ -1124,7 +1132,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
         let task = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.request("login", "x", vec![], "", "p_gt", 60_000, "", false).await }
+            async move { hub.request("login", "x", vec![], "", "p_gt", 60_000, "", false, false).await }
         });
         let display = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -1182,7 +1190,7 @@ mod tests {
         hub.detach();
         let out = tokio::time::timeout(
             Duration::from_secs(3),
-            hub.request("custom", "x", vec![], "", "p_gu", 60_000, "", false),
+            hub.request("custom", "x", vec![], "", "p_gu", 60_000, "", false, false),
         )
         .await
         .expect("应立即收口,不等 60s");
