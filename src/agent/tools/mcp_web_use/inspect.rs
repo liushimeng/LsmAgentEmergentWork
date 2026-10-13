@@ -442,7 +442,11 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                 // 响应与人机载荷 —— LLM 可直接把 allow_selectors 传给 request_human
                 // 精准放行(自动档探测不命中时的人工兜底通道);fail-open,探测为空
                 // 不加字段(request_human 自动档还有一次机会)。
-                let zones = super::unlock_zone::probe_credential_zones(&page).await;
+                // 与 request_human 同享跨 frame 精化(跨域 iframe 内输入框的
+                // @rect 精确洞),保证此处给出的清单与自动放行实际生效的一致。
+                let probed = super::unlock_zone::probe_credential_zones_kinds(&page).await;
+                let zones =
+                    super::unlock_zone::enrich_allowlist_with_frame_holes(&page, probed).await;
                 if !zones.is_empty() {
                     out["credential_zones"] = json!(zones.clone());
                     if let Some(ha) = out.get_mut("human_assist").and_then(Value::as_object_mut) {

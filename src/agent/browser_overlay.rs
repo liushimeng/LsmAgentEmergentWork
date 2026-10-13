@@ -409,11 +409,28 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
             sc.appendChild(sh);
         };
         if (allow.length) {
+            // 白名单语义定义在主文档坐标空间(条带分解挖洞的 rect 均为主文档
+            // viewport 坐标):子 frame 一律不加盾(fail-open)——否则漂移选择器
+            // 可能在子 frame 自身坐标系命中元素,按错误位置罩盾,把主文档挖好的
+            // 洞从内部锁死。
+            if (window.top !== window) return;
             // 白名单:整屏深色罩挖洞 —— 对允许矩形并集在视口内做「垂直条带分解」
             // 求补集(若干互不重叠的矩形盾)。纯矩形 + pointer-events,零兼容性依赖
             //(实测 clip-path: path(evenodd,…) 会被部分 Chrome 版本拒绝,不采纳)。
             const rects = [];
             for (const sel of allow) {
+                // @rect:x,y,w,h —— 绝对视口挖洞(CDP DOM pierce 跨 frame 穿透
+                // 生成的凭证输入框矩形),不经选择器解析,直接入洞;随
+                // scroll/resize/布局变化由既有 schedule 重算裁剪
+                if (sel.indexOf('@rect:') === 0) {
+                    const p = sel.slice(6).split(',').map(Number);
+                    if (p.length === 4 && p.every((n) => isFinite(n))) {
+                        const x1 = Math.max(0, p[0]), y1 = Math.max(0, p[1]);
+                        const x2 = Math.min(vw, p[0] + p[2]), y2 = Math.min(vh, p[1] + p[3]);
+                        if (x2 - x1 > 0 && y2 - y1 > 0) rects.push([x1, y1, x2, y2]);
+                    }
+                    continue;
+                }
                 try {
                     for (const node of document.querySelectorAll(sel)) {
                         const r = node.getBoundingClientRect();
@@ -423,11 +440,9 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
                     }
                 } catch (e) {}
             }
-            if (!rects.length && window.top !== window) {
-                // 第 144 轮:子 frame 白名单零命中 → 本 frame 不加盾(fail-open)。
-                // 白名单语义定义在主文档坐标空间(条带分解已管住整屏可点区域,
-                // iframe 只能落在主文档矩形内,洞外区域主文档盾照拦);跨域验证码
-                // iframe 内部必须放行,整 frame 加盾会把主文档挖好的洞从内部锁死。
+            if (!rects.length) {
+                // 白名单全部未命中(选择器漂移/元素消失)→ 本帧不加盾(fail-open),
+                // 人工操作优先于管控保留。
                 return;
             }
             const xs = [0, vw];
@@ -511,6 +526,17 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     };
     window.addEventListener('scroll', schedule, { passive: true, capture: true });
     window.addEventListener('resize', schedule, { passive: true });
+    // 布局位移兜底:图片/字体加载、同域 iframe 内容撑高等纯布局变化不触发
+    // MutationObserver 的有效观察属性,但会移动白名单元素的矩形 —— load 事件
+    // 与文档级 ResizeObserver 补上这一重建触发源。
+    window.addEventListener('load', schedule, { passive: true });
+    try {
+        if (window.ResizeObserver && !window.__laewGuardRO) {
+            window.__laewGuardRO = new ResizeObserver(() => schedule());
+            const roTarget = document.documentElement || document.body;
+            if (roTarget) window.__laewGuardRO.observe(roTarget);
+        }
+    } catch (e) {}
     // 第 163 轮:MutationObserver 装配独立成函数,由 bootRetry 与首次调用各调一次。
     // observe 的 target 必须非 null,否则抛错被外层 catch 吞掉 → 观察器永不安装,
     // DOM 变化后无人重建视觉元素。
@@ -1102,6 +1128,37 @@ mod tests {
         );
     }
 
+    /// HITL 盾区精化回归锁死:`@rect:` 绝对挖洞 / 子 frame 一律不加盾 /
+    /// 布局位移(load + ResizeObserver)重建触发源。
+    #[test]
+    fn guard_js_supports_rect_holes_and_layout_triggers() {
+        let js = super::AGENT_GUARD_JS_TEMPLATE;
+        assert!(js.contains("@rect:"), "白名单应支持 @rect 绝对视口挖洞");
+        assert!(
+            js.contains("p.every((n) => isFinite(n))"),
+            "@rect 参数应做有限性校验"
+        );
+        assert!(
+            js.contains("if (window.top !== window) return;"),
+            "子 frame 应在 allow 分支顶部直接不加盾(fail-open)"
+        );
+        assert!(
+            js.contains("addEventListener('load', schedule"),
+            "load 事件应触发盾区重建(图片/字体加载位移)"
+        );
+        assert!(
+            js.contains("ResizeObserver"),
+            "文档级 ResizeObserver 应触发盾区重建(布局撑高)"
+        );
+        // @rect 分支必须先于选择器解析 continue,避免绝对洞被 querySelectorAll 吞掉
+        let rect_branch = js.find("indexOf('@rect:')").unwrap_or_default();
+        let sel_loop = js.find("querySelectorAll(sel)").unwrap_or_default();
+        assert!(
+            rect_branch < sel_loop && rect_branch > 0,
+            "@rect 解析应位于选择器循环内且先于选择器解析"
+        );
+    }
+
     /// 第 163 轮回归锁死:document-start 注入时的就绪门与**重试注册顺序**。
     ///
     /// 实测事故(`llaew_20261012_175823.log` + 真机 Chrome 复现):首开正常,
@@ -1111,8 +1168,7 @@ mod tests {
     /// TypeError),且 `refresh()` 排在 `DOMContentLoaded` 补挂注册**之前** ——
     /// 异常把整段注册吃掉,视觉层再无重建机会。
     #[test]
-    fn guard_js_uses_ready_root_and_registers_retry_before_first_refresh() {
-        let js = super::AGENT_GUARD_JS_TEMPLATE;
+    fn guard_js_uses_ready_root_and_registers_retry_before_first_refresh() {        let js = super::AGENT_GUARD_JS_TEMPLATE;
         // ① 就绪门:documentElement 优先(document-start 即存在)
         assert!(
             js.contains("document.documentElement || document.body"),

@@ -398,18 +398,26 @@ pub fn yolo_registry() -> ToolRegistry {
     )
 }
 
-/// Plan Agent 工具注册表:Read + Write + Edit + Glob + Grep(规划与调研)
+/// Plan Agent 工具注册表:Read + Write + Glob + Grep(规划与调研)
+/// + Bash 只读侦察(`BashTool::readonly()`,与 Main-Work 同款代码层强制)
+/// + MCP_Web_Use / MCP_Window_Use(观察类探索:规划前摸清页面/窗口结构;
+///   Window 工具平台门控,仅 macOS/Windows 注册)
 /// + SubAgent(第 114 轮:并行方案调研,策略 `FullChildren`)。
+///
+/// 不持 Edit:规划层不修改源代码(提示词与注册表一致)。
 pub fn plan_registry() -> ToolRegistry {
     let sandbox = default_sandbox();
-    register_subagent(
-        ToolRegistry::new()
-            .register(Arc::new(read::ReadTool))
-            .register(Arc::new(write::WriteTool::new(sandbox.clone())))
-            .register(Arc::new(edit::EditTool::new(sandbox)))
-            .register(Arc::new(glob::GlobTool))
-            .register(Arc::new(grep::GrepTool)),
-    )
+    let mut reg = ToolRegistry::new()
+        .register(Arc::new(read::ReadTool))
+        .register(Arc::new(write::WriteTool::new(sandbox)))
+        .register(Arc::new(glob::GlobTool))
+        .register(Arc::new(grep::GrepTool))
+        .register(Arc::new(bash::BashTool::readonly()))
+        .register(Arc::new(mcp_web_use::McpWebUseTool));
+    if mcp_window_use::mcp_window_use_available() {
+        reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
+    }
+    register_subagent(reg)
 }
 
 /// Main-Work Agent 工具注册表(2026-09-23 第 122 轮:编排层信息收集型工具面):
@@ -679,9 +687,10 @@ mod names_tests {
         // 第 122 轮(2026-09-23)修订:Main-Work 也加入 MCP_Web_Use(编排层信息收集),
         // 本断言拆分为 main_work_includes_mcp_web_use + plan_and_quality_exclude_mcp_web_use
         // 见下方。保留本断言仅验证 Yolo 与 Plan/Quality 的相对位置。
+        // 本轮修订:Plan 亦加入 MCP_Web_Use(规划前观察页面结构,提示词约束观察类
+        // action 优先)——仅 QC 维持不含。
         assert!(yolo_registry().names().contains(&"MCP_Web_Use"));
-        // Plan / QC 仍不含 MCP_Web_Use(Main-Work 现已含,见 main_work_includes_mcp_web_use)
-        assert!(!plan_registry().names().contains(&"MCP_Web_Use"));
+        assert!(plan_registry().names().contains(&"MCP_Web_Use"));
         assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
     }
 
@@ -726,6 +735,7 @@ mod names_tests {
     // 把原来的 `main_work_plan_quality_exclude_mcp_web_use`(强制 Main-Work 不持
     // MCP_Web_Use)拆分为两条独立断言:Main-Work 现含 MCP_Web_Use(第 122 轮新增),
     // Plan / Quality 仍不含(粒度对齐:plan/quality 不参与网页信息收集)。
+    // 本轮修订:Plan 加入 MCP_Web_Use(规划前探索页面结构),仅 QC 维持不含。
     #[test]
     fn main_work_includes_mcp_web_use() {
         assert!(
@@ -736,9 +746,31 @@ mod names_tests {
     }
 
     #[test]
-    fn plan_and_quality_exclude_mcp_web_use() {
-        assert!(!plan_registry().names().contains(&"MCP_Web_Use"));
+    fn plan_includes_mcp_web_use_quality_excludes() {
+        assert!(
+            plan_registry().names().contains(&"MCP_Web_Use"),
+            "Plan 规划层应持 MCP_Web_Use(规划前观察页面结构)"
+        );
         assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
+    }
+
+    /// Plan 工具面:观察类探索 + 只读侦察 + plans/ 写入;不持 Edit(不修改源代码)。
+    #[test]
+    fn plan_registry_explore_surface() {
+        let reg = plan_registry();
+        let names = reg.names();
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Write"));
+        assert!(names.contains(&"Glob"));
+        assert!(names.contains(&"Grep"));
+        assert!(names.contains(&"Bash"), "Plan 应持只读 Bash 侦察");
+        assert!(!names.contains(&"Edit"), "Plan 不应持 Edit(不修改源代码)");
+        if mcp_window_use::mcp_window_use_available() {
+            assert!(
+                names.contains(&"MCP_Window_Use"),
+                "macOS/Windows 上 Plan 应持 MCP_Window_Use(规划前观察窗口结构)"
+            );
+        }
     }
 
     // ==== Use_MCP 通用 MCP 服务调用 注册面 ====

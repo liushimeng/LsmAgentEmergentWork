@@ -548,13 +548,16 @@ mod tests {
         );
     }
 
+    /// Plan 工具面:Read/Write(方案落盘)+ Glob/Grep + Bash(只读侦察)
+    /// + MCP_Web_Use/MCP_Window_Use(规划前观察页面/窗口结构);不持 Edit。
     #[test]
     fn plan_profile_has_read_and_write() {
         let p = AgentProfile::plan_profile();
         let names = tool_names(&p);
         assert!(names.contains(&"Read".to_string()));
         assert!(names.contains(&"Write".to_string()));
-        assert!(!names.iter().any(|n| n == "Bash"));
+        assert!(names.contains(&"Bash".to_string()), "Plan 应持只读 Bash 侦察");
+        assert!(!names.iter().any(|n| n == "Edit"));
     }
 
     #[test]

@@ -25,6 +25,14 @@ use super::follow_ctl::{
     act_auto_follow, act_scroll, act_scroll_to, act_set_viewport, act_sync_viewport,
 };
 
+// 第 164 轮:select_option / select_dropdown / pick_element_js 拆分至 form_ctl.rs
+// (control.rs 超 1800 行规范),机械搬移零改写。
+mod form_ctl;
+use form_ctl::{act_select_dropdown, act_select_option};
+// 仅测试与兄弟模块经 control::pick_element_js 路径引用,非 test 构建下 mod.rs 自身不用。
+#[allow(unused_imports)]
+pub(super) use form_ctl::pick_element_js;
+
 // =================== 第 99 轮:eval_js / screenshot / download 效能与健壮性辅助 ===================
 
 /// eval_js 表达式是否已是函数形态(IIFE / 箭头函数 / function 声明)——
@@ -549,241 +557,6 @@ async fn act_upload_file(id: &str, p: &Value) -> std::result::Result<Value, Stri
     params.node_id = Some(target_id);
     page.execute(params).await.map_err(|e| e.to_string())?;
     Ok(json!({"files": files, "count": files.len()}))
-}
-
-async fn act_select_option(id: &str, p: &Value) -> std::result::Result<Value, String> {
-    let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
-    let page = ensure_page(id).await?;
-
-    // 第 158 轮:自定义控件回退 —— selector 指向的不是原生 <select> 时,自动走文本匹配路径。
-    // 检测方式:元素不存在 el.options 即为自定义控件(Ant Design / Element UI / 自研组件库)。
-    let detect_js = format!(
-        r#"(() => {{
-            const el = document.querySelector({sel});
-            if (!el) return 'not_found';
-            if (el.tagName === 'SELECT' && el.options) return 'native';
-            return 'custom';
-        }})()"#,
-        sel = js_str(sel),
-    );
-    let detect: Value = eval_js_string(&page, &detect_js).await?;
-    let detect_str = detect.as_str().unwrap_or("not_found");
-    if detect_str == "not_found" {
-        return Err(format!("select_option: selector「{sel}」未命中任何元素"));
-    }
-    if detect_str == "custom" {
-        // 自定义控件回退:用 text 参数走文本匹配;无 text 则报错引导使用 select_dropdown
-        let text = str_arg(p, "text");
-        let Some(t) = text else {
-            return Err(format!(
-                "select_option: selector「{sel}」指向非原生 select 元素(自定义控件),\
-                 请改用 select_dropdown(action='select_dropdown', params={{'option_text':'...'}})"
-            ));
-        };
-        let js = pick_element_js(t, Some(sel), true);
-        let result: Value = eval_js_string(&page, &js).await?;
-        let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        if !ok {
-            return Err(format!(
-                "select_option: 在「{sel}」范围内未找到文本匹配「{t}」的可见叶子节点"
-            ));
-        }
-        return Ok(json!({"selected": ok, "selector": sel, "mode": "custom_fallback", "text": t}));
-    }
-
-    // 四种选择方式(value/values/text/index)归一化为 JS 字面量(第 76 轮重写)。
-    let value_js: String = if let Some(v) = p.get("value").and_then(Value::as_str) {
-        js_str(v)
-    } else if let Some(arr) = p.get("values").and_then(Value::as_array) {
-        let parts: Vec<String> = arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| js_str(s)))
-            .collect();
-        format!("[{}]", parts.join(","))
-    } else if let Some(t) = p.get("text").and_then(Value::as_str) {
-        // 文本选择:在 JS 端遍历 <option>,找到 text 匹配的 index 后赋 value
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector({sel});
-                if (!el) return false;
-                const target = {txt};
-                let found = -1;
-                for (let i = 0; i < el.options.length; i++) {{
-                    if (el.options[i].text === target) {{ found = i; break; }}
-                }}
-                if (found < 0) return false;
-                el.selectedIndex = found;
-                el.dispatchEvent(new Event('change',{{bubbles:true}}));
-                return true;
-            }})()"#,
-            sel = js_str(sel),
-            txt = js_str(t),
-        );
-        let ok = eval_js_string(&page, &js).await?;
-        return Ok(json!({"selected": ok, "selector": sel, "mode": "text"}));
-    } else if let Some(i) = p.get("index").and_then(Value::as_i64) {
-        // 索引选择:在 JS 端直接设 selectedIndex
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector({sel});
-                if (!el) return false;
-                if ({i} < 0 || {i} >= el.options.length) return false;
-                el.selectedIndex = {i};
-                el.dispatchEvent(new Event('change',{{bubbles:true}}));
-                return true;
-            }})()"#,
-            sel = js_str(sel),
-            i = i,
-        );
-        let ok = eval_js_string(&page, &js).await?;
-        return Ok(json!({"selected": ok, "selector": sel, "mode": "index", "index": i}));
-    } else {
-        return Err("缺 value/values/text/index 之一".into());
-    };
-    let js = format!(
-        r#"(() => {{
-            const el = document.querySelector({sel});
-            if (!el) return false;
-            el.value = {v};
-            el.dispatchEvent(new Event('change',{{bubbles:true}}));
-            return true;
-        }})()"#,
-        sel = js_str(sel), v = value_js
-    );
-    let ok = eval_js_string(&page, &js).await?;
-    Ok(json!({"selected": ok, "selector": sel, "mode": "value"}))
-}
-
-// =================== 第 158 轮:自定义下拉/级联选择器(select_dropdown) ===================
-
-/// 在页面中查找文本匹配的可见叶子节点并点击，返回结果 JSON 字符串。
-///
-/// 查找范围优先 `scope_sel`，否则全局；精确匹配优先，`fuzzy=true` 时兜底子串匹配。
-/// 点击前 `scrollIntoView({block:'center'})` 确保元素可见。
-pub(super) fn pick_element_js(target: &str, scope_sel: Option<&str>, fuzzy: bool) -> String {
-    let scope = match scope_sel {
-        Some(s) => format!("document.querySelector({})", js_str(s)),
-        None => "document.body".to_string(),
-    };
-    format!(
-        r#"(() => {{
-            const vis = e => {{ const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }};
-            const target = {target};
-            const scope = {scope} || document.body;
-            const candidates = [...scope.querySelectorAll('span,div,a,li,label,button,i,p')]
-                .filter(e => e.children.length === 0 && vis(e));
-            let el = candidates.find(e => (e.innerText || e.textContent || '').trim() === target);
-            if (!el && {fuzzy}) {{
-                el = candidates.find(e => (e.innerText || e.textContent || '').trim().includes(target));
-            }}
-            if (!el) return JSON.stringify({{ ok: false, found: candidates.length }});
-            el.scrollIntoView({{ block: 'center' }});
-            el.click();
-            return JSON.stringify({{ ok: true, tag: el.tagName, text: (el.innerText || '').trim() }});
-        }})()"#,
-        target = js_str(target),
-        scope = scope,
-        fuzzy = if fuzzy { "true" } else { "false" },
-    )
-}
-
-/// 自定义下拉/级联选择器操作。
-///
-/// 解决 Ant Design / Element UI / 自研组件库的非原生 `<select>` 控件无法用
-/// `select_option` 操作的痛点（实测闲鱼城市选择器卡 263s / 24 轮迭代）。
-///
-/// 参数：
-/// - `option_text`（必填）：第一级选项文本（如"北京"）
-/// - `trigger_text`（可选）：触发器文本（如"区域"），点击展开面板
-/// - `cascader_text`（可选）：级联第二级选项文本（如"全北京"）
-/// - `wait_ms`（可选）：等待面板出现的时间，默认 800ms
-/// - `selector`（可选）：面板容器选择器，用于限定查找范围
-async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Result<Value, String> {
-    let Some(option_text) = str_arg(p, "option_text") else {
-        return Err("缺少 option_text".into());
-    };
-    let page = ensure_page(id).await?;
-    let trigger_text = str_arg(p, "trigger_text");
-    let cascader_text = str_arg(p, "cascader_text");
-    let scope_sel = str_arg(p, "selector");
-    let wait_ms = p
-        .get("wait_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(800);
-
-    let mut trigger_clicked = false;
-    let mut clicked_texts: Vec<String> = Vec::new();
-
-    if let Some(tt) = trigger_text {
-        let js = pick_element_js(tt, None, false);
-        let result: Value = eval_js_string(&page, &js).await?;
-        trigger_clicked = result
-            .get("ok")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !trigger_clicked {
-            return Err(format!(
-                "select_dropdown: 触发器「{tt}」未找到可见元素"
-            ));
-        }
-        clicked_texts.push(tt.to_string());
-        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-    }
-
-    let js = pick_element_js(option_text, scope_sel, true);
-    let result: Value = eval_js_string(&page, &js).await?;
-    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    if !ok {
-        return Err(format!(
-            "select_dropdown: 选项「{option_text}」未找到可见元素（scope={scope_sel:?}）"
-        ));
-    }
-    clicked_texts.push(option_text.to_string());
-    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-
-    if let Some(ct) = cascader_text {
-        let js = pick_element_js(ct, scope_sel, true);
-        let result: Value = eval_js_string(&page, &js).await?;
-        let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        if !ok {
-            return Err(format!(
-                "select_dropdown: 级联选项「{ct}」未找到可见元素（scope={scope_sel:?}）"
-            ));
-        }
-        clicked_texts.push(ct.to_string());
-        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-    }
-
-    let readback_js = {
-        let scope = match scope_sel {
-            Some(s) => format!("document.querySelector({})", js_str(s)),
-            None => "document.body".to_string(),
-        };
-        format!(
-            r#"(() => {{
-                const scope = {scope} || document.body;
-                const txt = (scope.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200);
-                return JSON.stringify({{ text: txt }});
-            }})()"#,
-            scope = scope,
-        )
-    };
-    let readback: Value = eval_js_string(&page, &readback_js).await?;
-    let value_after = readback
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    Ok(json!({
-        "selected": true,
-        "option_text": option_text,
-        "cascader_text": cascader_text,
-        "trigger_clicked": trigger_clicked,
-        "clicked_texts": clicked_texts,
-        "value_after": value_after,
-        "mode": "custom_dropdown",
-    }))
 }
 
 /// 下载文件:支持直接 URL 或点击页面上的下载链接/按钮。
@@ -1556,7 +1329,12 @@ async fn act_request_human(id: &str, p: &Value) -> crate::error::Result<String> 
                     unlock_source = "explicit";
                     explicit_allow.clone()
                 } else {
-                    let z = super::unlock_zone::probe_credential_zones(&page).await;
+                    let probed = super::unlock_zone::probe_credential_zones_kinds(&page).await;
+                    // 跨 frame 精化:登录凭证常在跨域 iframe 内,主文档探测按 iframe
+                    // 外框挖洞位置/尺寸不对;CDP DOM pierce 取输入框主文档坐标
+                    // 生成 @rect 精确洞,有洞时丢弃整外框选择器(fail-open)。
+                    let z =
+                        super::unlock_zone::enrich_allowlist_with_frame_holes(&page, probed).await;
                     if !z.is_empty() {
                         unlock_source = "auto";
                     }

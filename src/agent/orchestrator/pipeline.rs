@@ -750,6 +750,25 @@ impl MultiAgentOrchestrator {
             .filter(|s| !s.trim().is_empty())
     }
 
+    /// 取任务级用户提示词:跳过合成注入消息(项目上下文 / 失败回流包装),
+    /// 供 Plan 规划时对照 Yolo 摘要看原文细节。
+    pub(super) fn task_user_prompt(session: &Session) -> Option<String> {
+        session
+            .context()
+            .iter()
+            .rev()
+            .find(|m| {
+                matches!(m.role, crate::llm::Role::User) && {
+                    let t = m.content_text();
+                    let t = t.trim();
+                    !t.is_empty()
+                        && !t.starts_with("<<<LAEW:")
+                        && !t.starts_with("[PREVIOUS_FAILURE]")
+                }
+            })
+            .map(|m| m.content_text())
+    }
+
     /// 为 simple 档重试回灌上一轮失败原因,避免 SubAgent 每轮看到完全相同输入。
     pub(super) fn prompt_with_retry_hint(original_prompt: Option<String>, retry_hint: &str) -> Option<String> {
         let hint = retry_hint.trim();
@@ -1214,6 +1233,7 @@ impl MultiAgentOrchestrator {
                 session.id(),
                 retry_hint,
                 completed_digest,
+                &Self::task_user_prompt(session).unwrap_or_default(),
             )
             .await
             .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;

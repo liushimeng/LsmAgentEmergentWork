@@ -337,7 +337,11 @@ impl QualityRunner {
         session_id: &str,
     ) -> Result<(QualityReport, Usage)> {
         let prompt = format!(
-            "【Quality-Check: Plan 单元】\nPlan Markdown:\n{}\n\n请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。{QC_JSON_SHAPE_HINT}",
+            "【Quality-Check: Plan 单元】\nPlan Markdown:\n{}\n\n\
+             请按 JSON 格式输出 verdict/source/issues/suggestion/retryable/evidence。\
+             除结构完整性外,请核对「一、目标」段是否含探索依据(实际读过/观察过的文件、\
+             页面或窗口结构要点):代码/网页/桌面操控类任务完全没有任何探索证据的凭空规划\
+             属缺陷(视情节给 retryable,建议文案要求先探索后重出)。{QC_JSON_SHAPE_HINT}",
             clip_qc_input(plan_markdown),
         );
         self.run_check(prompt, AgentRole::Plan, plan_markdown, session_id, None)

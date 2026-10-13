@@ -1571,7 +1571,11 @@ async fn real_credential_zone_probe_and_subframe_fail_open() {
     let page = BrowserManager::global().page(&pid).await.expect("page 句柄");
 
     // ① 凭证区域探测:form(#login)优先 + 验证码语义容器(≥2 条)
-    let zones = super::unlock_zone::probe_credential_zones(&page).await;
+    let zones: Vec<String> = super::unlock_zone::probe_credential_zones_kinds(&page)
+        .await
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
     assert!(!zones.is_empty(), "登录页应探测到凭证区域");
     assert_eq!(zones[0], "#login", "密码框应容器化到 form#login:{zones:?}");
     assert!(zones.len() >= 2, "验证码语义容器也应命中:{zones:?}");
@@ -2351,6 +2355,59 @@ fn pick_element_js_no_scope() {
     let js = super::control::pick_element_js("全北京", None, false);
     assert!(js.contains("document.body"), "无 scope 时应回退到 body");
     assert!(js.contains("=== target"), "精确匹配");
+}
+
+#[test]
+fn pick_element_js_visibility_uses_computed_style() {
+    // 可见性判定必须含计算样式:组件库收起的面板保留 visibility:hidden 挂载副本,
+    // 其 getBoundingClientRect 仍为正,单看几何尺寸会误判可见
+    let js = super::control::pick_element_js("北京", None, false);
+    assert!(
+        js.contains("getComputedStyle"),
+        "可见性判定应使用 getComputedStyle"
+    );
+    assert!(
+        js.contains("visibility"),
+        "应检查 visibility 计算样式"
+    );
+    assert!(
+        js.contains("textContent"),
+        "文本匹配应取 textContent(确定性)而非 innerText(渲染态会为空)"
+    );
+}
+
+#[test]
+fn pick_element_js_non_leaf_own_text() {
+    // 「文本+图标」非叶子控件(如 <span>区域<img></span>)应经自身直接文本命中
+    let js = super::control::pick_element_js("区域", None, false);
+    assert!(
+        js.contains("childNodes"),
+        "应遍历 childNodes 计算自身直接文本"
+    );
+    assert!(
+        js.contains("nodeType === 3"),
+        "应只统计文本节点"
+    );
+}
+
+#[test]
+fn pick_element_js_failure_diagnostic() {
+    // 失败时应返回诊断字段,供调用方给出可行动的错误信息
+    let js = super::control::pick_element_js("北京", None, true);
+    assert!(js.contains("matched_but_hidden"), "应区分「命中但隐藏」");
+    assert!(js.contains("no_text_match"), "应区分「无文本命中」");
+    assert!(js.contains("matched: pool.length"), "应返回命中计数");
+    assert!(js.contains("visible: 0"), "应返回可见计数");
+}
+
+#[test]
+fn pick_element_js_smallest_candidate_wins() {
+    // 多候选时应按面积取最小者(最深/最贴近文本节点)
+    let js = super::control::pick_element_js("北京", None, true);
+    assert!(
+        js.contains("ra.width * ra.height"),
+        "应按面积排序取最小候选"
+    );
 }
 
 #[test]

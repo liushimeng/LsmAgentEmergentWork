@@ -1,6 +1,8 @@
 //! Plan Agent:规划层,为 hard 档任务生成 Markdown 方案。
 //!
-//! Plan 仅持有 Read / Write 工具,且 Write 仅允许写入 plans/ 目录。
+//! Plan 持有 Read / Glob / Grep / Bash(只读侦察)/ MCP_Web_Use / MCP_Window_Use
+//! 观察类工具 —— 规划前先探索(代码类任务读相关文件,网页/桌面类任务观察界面结构),
+//! 有充足事实依据后再成文;Write 仅允许写入 plans/ 目录,不修改源代码。
 //! 单元完成后,Markdown 落盘到 `plans/{session_id}-{seq}.md`。
 
 use std::path::{Path, PathBuf};
@@ -30,7 +32,9 @@ pub struct PlanRunner {
 
 impl PlanRunner {
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>, db: Arc<Db>, plans_dir: PathBuf) -> Self {
-        let agent = Agent::new(llm, AgentProfile::plan_profile());
+        // explore_budget(0):runtime hints 的「进入执行期禁止再只读探查」提示
+        // 是为执行层设计的,对 Plan 是反向指令(规划本来就靠先探索后成文)。
+        let agent = Agent::new(llm, AgentProfile::plan_profile()).with_explore_budget(0);
         Self {
             agent,
             db,
@@ -46,9 +50,19 @@ impl PlanRunner {
         intent: &str,
         decomposition: &[String],
         session_id: &str,
+        user_prompt: &str,
     ) -> Result<(PlanOutput, Usage)> {
-        self.generate_with_retry_hint(goal, purpose, intent, decomposition, session_id, "", "")
-            .await
+        self.generate_with_retry_hint(
+            goal,
+            purpose,
+            intent,
+            decomposition,
+            session_id,
+            "",
+            "",
+            user_prompt,
+        )
+        .await
     }
 
     /// I3(2026-09-14 第 51 轮):带上一轮失败反馈生成 Plan。
@@ -64,6 +78,7 @@ impl PlanRunner {
         session_id: &str,
         retry_hint: &str,
         completed_digest: &str,
+        user_prompt: &str,
     ) -> Result<(PlanOutput, Usage)> {
         // 确保 plans/ 存在
         std::fs::create_dir_all(&self.plans_dir)
@@ -95,14 +110,22 @@ impl PlanRunner {
                 completed_digest.trim()
             )
         };
+        let user_block = if user_prompt.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n【用户原始提示词(与上面 Yolo 摘要互为补充,细节以原文为准)】\n{}\n",
+                user_prompt.trim()
+            )
+        };
         let prompt = format!(
             "【Plan 任务】\n\
              Session: {session_id}\n\
              目的: {purpose}\n\
              目标: {goal}\n\
              意图: {intent}\n\
-             分解步骤:\n{decomp}\n{retry_block}{completed_block}\n\
-             请按系统提示词中的 Markdown 模板输出方案(完整五段)。",
+             分解步骤:\n{decomp}\n{retry_block}{completed_block}{user_block}\n\
+             请先按系统提示词「探索阶段」收集足够事实,再按 Markdown 模板输出方案(完整五段)。",
             decomp = decomposition
                 .iter()
                 .enumerate()

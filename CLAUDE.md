@@ -309,7 +309,7 @@ agent/
   sandbox_hook/    沙箱钩子:mod.rs(单文件,接外部 sandbox)
   skills/          Skill 系统(渐进式披露):mod.rs / registry.rs / render.rs / tools.rs / skill.rs / bundled.rs / bundled/{code-review,git-commit,test-runner}.md
 
-  system_prompt/   SystemPrompt 组合与渲染:mod.rs / yolo_prompt.rs(Yolo 提示词块,拆出) / use_mcp_hint.rs(Use_MCP 提示词段) / web_evidence.rs(网页取证纪律) / web_extract.rs(网页内容提取纪律) / skill_catalog.rs
+  system_prompt/   SystemPrompt 组合与渲染:mod.rs / yolo_prompt.rs(Yolo 提示词块,拆出) / plan_prompt.rs(Plan 提示词块+探索阶段引导,拆出) / use_mcp_hint.rs(Use_MCP 提示词段) / web_evidence.rs(网页取证纪律) / web_extract.rs(网页内容提取纪律) / skill_catalog.rs
   tools/
     mod.rs         Tool trait + ToolRegistry(有序) + builtin_registry/yolo_registry + max_parallel_tools_from
     bash.rs        BashTool(UTF-8 环境注入 + CRLF 感知 + 30K/150K 截断 + 落盘回灌)
@@ -325,7 +325,7 @@ agent/
     read_detect.rs ReadTool 二进制/编码自动探测
 
     mcp_window_use/  MCP_Window_Use 工具目录(仅 macOS/Windows 注册):mod.rs(门面+共享辅助) / query.rs(action=list/find+模糊打分) / open.rs(action=open+应用启动) / inspect.rs(action=inspect/control) / vision.rs(action=ocr/screenshot) / chat.rs(微信/豆包等 IM chat_send + read_text + 焦点守卫 + 回复检测字符级差分,根治 OCR 快照字节切片 panic) / explore.rs(action=explore 树预算剪枝) / sequence.rs(run_sequence assert_text/wait_for_text OCR 兜底) / input_batch.rs(复合 action ≤40 步) / tests.rs
-    mcp_web_use/     MCP_Web_Use 工具目录:mod.rs(门面+八 action 分发+视口接线+guard 级联+sequence 步级防护/超时兜底/6002 硬闸) / control.rs(41 个写操作) / control 拆分三子模块:input_ctl.rs(输入动作:原型链原生赋值+三级阶梯回读+键名别名/组合键/press_sequence 聚焦) / guard_ctl.rs(页面管控:先解后锁/先隐盾后复盾/先挂闸后复位+set_guard) / follow_ctl.rs(滚动/视口/自动跟随一族) / hitl_guard.rs(HITL 期间输入挂起闸 4003) / blocker_probe.rs(推送式探针+弹层语义打分+输入前置硬闸) / inspect.rs(20 个只读观察分发 + coverage 台账 + blockers 整词边界) / extract.rs(结构化列表抽取+页面内过滤) / page_state.rs(SSR 注水 + JSON-LD 直读) / eval_sanitize.rs(返回值净化+复合值体积闸门) / unlock_zone.rs(HITL 凭证区探测+导航重放) / hitl_hint.rs(应答语义分流纯函数) / visit_ledger.rs(遍历访问台账:key 只折叠翻页/游标参数,保留 `?q=`/`?cat=`/`?city=` 等身份 query) / tests.rs
+    mcp_web_use/     MCP_Web_Use 工具目录:mod.rs(门面+八 action 分发+视口接线+guard 级联+sequence 步级防护/超时兜底/6002 硬闸) / control/(41+ 个写操作:mod.rs 门面分发 + 拆分子模块)input_ctl.rs(输入动作:原型链原生赋值+三级阶梯回读+键名别名/组合键/press_sequence 聚焦) / guard_ctl.rs(页面管控:先解后锁/先隐盾后复盾/先挂闸后复位+set_guard) / follow_ctl.rs(滚动/视口/自动跟随一族) / form_ctl.rs(select_option/select_dropdown/pick_element_js:自定义下拉命中三件套可见性+自愈重试+诊断) / hitl_guard.rs(HITL 期间输入挂起闸 4003) / blocker_probe.rs(推送式探针+弹层语义打分+输入前置硬闸) / inspect.rs(20 个只读观察分发 + coverage 台账 + blockers 整词边界) / extract.rs(结构化列表抽取+页面内过滤) / page_state.rs(SSR 注水 + JSON-LD 直读) / eval_sanitize.rs(返回值净化+复合值体积闸门) / unlock_zone.rs(HITL 凭证区探测+导航重放+CDP DOM pierce 跨 frame 输入框精确挖洞 @rect) / hitl_hint.rs(应答语义分流纯函数) / visit_ledger.rs(遍历访问台账:key 只折叠翻页/游标参数,保留 `?q=`/`?cat=`/`?city=` 等身份 query) / tests.rs
     use_mcp/         Use_MCP 工具目录(通用 MCP 服务调用,真 MCP 协议客户端):mod.rs(门面+七 action 分发+JSON 信封 0/1001/3001/5001-5006) / tests.rs
 
   window/          窗口操控平台驱动层(MCP_Window_Use 服务实现):mod.rs(模型+WindowDriver trait+工厂) / windows.rs(UIA+Win32) / windows_input.rs / windows_ocr.rs / macos_axui.rs(AX) / macos_vision_ocr.rs(Vision OCR) / control_action.rs / fallback.rs(wmctrl/xdotool) / macos_legacy/(mod.rs FFI+Driver入口 / ax_attrs.rs / cg_event.rs CGEvent 输入底座 / inspect.rs AX 控件树遍历 / act.rs / tests.rs)
@@ -470,7 +470,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 
 **三个 MCP 风格工具**（按工具）：
 - `docs/MCP_Window_Use/` — 桌面窗口操控（01 主设计 + 02 鼠标键盘优先级链 + 03 连续工作模式 + 04 中键修饰键 + 05 macos_legacy 拆分 + 06 横向对比 + MacOS/Window 平台技术文档）
-- `docs/MCP_Web_Use/` — 浏览器操控（01 主设计 + 02 人工介入与窗口可视化 + 03 人工介入弹窗原生UI + **04 网页取证纪律** + **06 复用已登录浏览器会话** + **08 浏览器进程保护与凭证区域部分放行** + **09 自动阻断感知** + **10 验证弹窗处置闭环与执行超时兜底** + **11 人工核验弹窗输入硬闸与误报根治** + **12 产物锚定与人工核验闭环** + **13 页面管控三档 + locked 可滚动观看（guard 唯一最新版，已并入 05/07）** + **14 窗口铺满置前与弃权如实转达** + **15 输入链路根治与批量效率升级** + 16 内网站点实测缺陷修复（首启空标签页/空白页诊断/句柄自愈）+ **17 headed 视口铺满根治与主文档健康诊断** + **18 多标签页感知与后台挂起治理**）。**05/07 已并入 13，文首有取代抬头，改 guard 相关代码只读 13；窗口/视口几何最新结论看 17。**
+- `docs/MCP_Web_Use/` — 浏览器操控（01 主设计 + 02 人工介入与窗口可视化 + 03 人工介入弹窗原生UI + **04 网页取证纪律** + **06 复用已登录浏览器会话** + **08 浏览器进程保护与凭证区域部分放行** + **09 自动阻断感知** + **10 验证弹窗处置闭环与执行超时兜底** + **11 人工核验弹窗输入硬闸与误报根治** + **12 产物锚定与人工核验闭环** + **13 页面管控三档 + locked 可滚动观看（guard 唯一最新版，已并入 05/07）** + **14 窗口铺满置前与弃权如实转达** + **15 输入链路根治与批量效率升级** + 16 内网站点实测缺陷修复（首启空标签页/空白页诊断/句柄自愈）+ **17 headed 视口铺满根治与主文档健康诊断** + **18 多标签页感知与后台挂起治理** + **19 select_dropdown 命中鲁棒性与 HITL 盾区几何精化(跨域 iframe @rect 精确挖洞/选择器唯一性自验/挑战弹层收窄)**)。**05/07 已并入 13，文首有取代抬头，改 guard 相关代码只读 13；窗口/视口几何最新结论看 17。**
 - `docs/Use_MCP/` — 通用 MCP 服务调用（Use_MCP，真 MCP 协议客户端）
 - `docs/浏览器CDP工具/` — CDP 技术参考（chromiumoxide 选型 / launch vs connect / BrowserManager 单例）
 
