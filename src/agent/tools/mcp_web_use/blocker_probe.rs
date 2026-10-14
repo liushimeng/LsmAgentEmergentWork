@@ -639,13 +639,22 @@ pub(super) async fn probe_alert(page_id: &str) -> Option<Value> {
         .to_string();
     // 第 152 轮:同类告警连续命中时只回事实、不重复长载荷(见 fingerprint_store 注释)
     let repeat_count = register_fingerprint(page_id, &fingerprint_of(first));
+    // 第 169 轮:关键词通道命中用**模式表专属处置建议**(`advice`)做 hint ——
+    // 此前统一用 ALERT_HINT(「人工验证挑战(拖拽拼图/滑块)…」),风控墙拿到的
+    // 是错位指引(页面上根本没有滑块);弹层语义挑战仍用通用 ALERT_HINT。
+    let hint_text = first
+        .get("advice")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| ALERT_HINT.to_string());
     let mut alert = first.clone();
     if let (Some(obj), Some(n)) = (alert.as_object_mut(), repeat_count) {
-        obj.insert("hint".into(), json!(ALERT_HINT));
+        obj.insert("hint".into(), json!(hint_text));
         obj.insert("repeat".into(), json!(true));
         obj.insert("repeat_count".into(), json!(n));
     } else if let Some(obj) = alert.as_object_mut() {
-        obj.insert("hint".into(), json!(ALERT_HINT));
+        obj.insert("hint".into(), json!(hint_text));
     }
     // 第 151 轮:message 带题面 snippet(≤60 字)—— 人工在 HITL 弹窗直接看到
     // 「要验证什么」,不用猜;空 snippet(关键词命中无上下文)回退通用文案。

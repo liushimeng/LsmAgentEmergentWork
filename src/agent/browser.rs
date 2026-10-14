@@ -246,12 +246,17 @@ pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
             frame.id = '%NS%agent_frame__';
             frame.setAttribute('data-%NS%agent', '1');
             frame.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;box-shadow:inset 0 0 0 3px #1a73e8;';
+            // 第 169 轮:徽标文本挂 closed Shadow DOM —— 人工截图/肉眼可见不变,
+            // 但页面 JS 的 innerText/textContent/DOM 枚举/innerHTML 序列化都读不到
+            // 「LAEW Agent 控制中」品牌签名(实测京东风控 JS 采 innerText 命中该
+            // 文案把设备判为自动化,见 browser_ns.rs STEALTH_JS 注释)。
+            // attachShadow 不可用时 fail-open 回退 light DOM(只损隐身不损功能)。
+            let sr = null;
+            try { sr = frame.attachShadow ? frame.attachShadow({ mode: 'closed' }) : null; } catch (e) {}
             const badge = document.createElement('div');
-            badge.id = '%NS%agent_badge__';
-            badge.setAttribute('data-%NS%agent', '1');
             badge.style.cssText = 'position:absolute;top:8px;right:8px;padding:2px 10px;background:#1a73e8;color:#fff;font:600 12px/1.6 system-ui,sans-serif;border-radius:10px;box-shadow:0 1px 4px rgba(26,115,232,.45);';
             badge.textContent = 'LAEW Agent 控制中';
-            frame.appendChild(badge);
+            (sr || frame).appendChild(badge);
             root.appendChild(frame);
         }
         frame.style.display = window.%NS%AgentHighlight === false ? 'none' : '';
@@ -772,6 +777,11 @@ impl BrowserManager {
             let _ = page.execute(params).await;
         }
 
+        // 第 169 轮:隐身覆写最先注入(document-start 执行序 = 注册序,先于高亮/管控),
+        // 压掉 navigator.webdriver 指纹;connect 模式零注入契约不变(真实浏览器无此指纹)。
+        if !inner.connect_mode {
+            super::browser_ns::inject_stealth(&page).await;
+        }
         // 第 100 轮:headed 可视化模式注入 Agent 高亮蓝框(hidden 无窗口,注入无意义
         // 且污染 DOM 提取,跳过)。注意:浏览器已存在时以实例真实 mode 为准
         // (inner.mode),而非本次 open 请求的 mode —— 单实例复用,不新启浏览器。
@@ -851,10 +861,11 @@ impl BrowserManager {
                 }
             }
             // 第 168 轮:隐身自检(仅 launch 首启一次,fail-open 只进日志)——
-            // 反检测启动参数被未来 Chrome 版本抹掉时第一时间可见;命名空间泄漏
-            // (固定 laew 签名残留)同理。探测页面即刚注册的 Agent 页。
+            // 反检测被未来 Chrome 版本抹掉时第一时间可见;命名空间泄漏
+            // (固定 laew 签名残留)与品牌文本泄漏(注入 UI 未 shadow 化)同理。
+            // 探测页面即刚注册的 Agent 页。
             if let Some(entry) = inner.pages.get(&id) {
-                let probe_js = r#"JSON.stringify({wd: navigator.webdriver === true, leaked: Object.keys(window).filter((k) => k.toLowerCase().indexOf('laew') >= 0)})"#;
+                let probe_js = r#"JSON.stringify({wd: navigator.webdriver === true, brand: (document.body && (document.body.innerText || '').indexOf('LAEW Agent') >= 0), leaked: Object.keys(window).filter((k) => k.toLowerCase().indexOf('laew') >= 0)})"#;
                 if let Ok(v) = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     entry.page.evaluate(probe_js),
@@ -871,7 +882,7 @@ impl BrowserManager {
                             Some(msg) => tracing::warn!(
                                 "MCP_Web_Use 隐身自检未通过: {msg} (天猫/京东系风控可能因此拦截,见 browser_ns.rs)"
                             ),
-                            None => tracing::info!("MCP_Web_Use 隐身自检通过(navigator.webdriver=false,无 laew 残留键)"),
+                            None => tracing::info!("MCP_Web_Use 隐身自检通过(webdriver=false,无品牌文本,无 laew 残留键)"),
                         }
                     }
                 }
@@ -979,6 +990,11 @@ impl BrowserManager {
             .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
             .await;
         spawn_event_listeners(&found, events.clone()).await;
+        // 第 169 轮:自愈重建句柄的页面重挂隐身覆写(CDP 会话掉线重连后新文档
+        // 上下文需要重新挂载;connect 零注入不变)。
+        if !inner.connect_mode {
+            super::browser_ns::inject_stealth(&found).await;
+        }
         if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
             inject_agent_highlight(&found).await;
         }
@@ -2036,6 +2052,10 @@ impl BrowserManager {
                 .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
                 .await;
             spawn_event_listeners(&page, events.clone()).await;
+            // 第 169 轮:派生/adopt 新标签页同样装隐身覆写(connect 零注入不变)。
+            if !inner.connect_mode {
+                super::browser_ns::inject_stealth(&page).await;
+            }
             // 第 100 轮:headed + highlight 时,派生/adopt 的新标签页同样注入蓝框。
             if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
                 inject_agent_highlight(&page).await;

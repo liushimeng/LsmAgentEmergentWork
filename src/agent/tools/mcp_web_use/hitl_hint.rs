@@ -48,7 +48,7 @@ pub(super) fn looks_like_code_text(answer: &str) -> bool {
 /// - 其它 reason 自由文本 → 按 human_response 内容继续。
 pub(super) fn hitl_answer_hint(reason: &str, answer: &str) -> String {
     if is_option_pick_answer(answer) {
-        "人工点选了选项(如「我已完成人工操作,继续」)。请 inspect 验证页面当前状态后继续流程,不要重复 request_human".to_string()
+        "人工点选了选项(如「我已完成人工操作,继续」)。请 inspect 验证页面当前状态后继续流程,不要重复 request_human;登录/人工操作完成后核实状态用 inspect,不要 reload —— 风控敏感站点(京东/天猫系)登录后 reload 会触发风控复核弹「当前页面异常」风控墙".to_string()
     } else if matches!(reason, "captcha" | "sms" | "two_factor") {
         if looks_like_code_text(answer) {
             "人工在弹窗输入了验证码/动态码文本(human_response)。请立即用 control(input_text) 把它填入对应输入框并点击提交/登录按钮完成表单,不要仅 inspect 观望".to_string()
@@ -56,6 +56,6 @@ pub(super) fn hitl_answer_hint(reason: &str, answer: &str) -> String {
             "人工在弹窗输入的是一段文字指示而非验证码(human_response)。请按其内容调整流程后再继续,不要把这段文本当作验证码填入页面输入框".to_string()
         }
     } else {
-        "人工回复了自由文本(human_response),按其内容继续流程".to_string()
+        "人工回复了自由文本(human_response),按其内容继续流程;核实页面状态用 inspect,不要 reload(风控敏感站点登录后 reload 会触发「当前页面异常」风控墙)".to_string()
     }
 }

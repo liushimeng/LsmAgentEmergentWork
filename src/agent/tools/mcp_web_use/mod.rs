@@ -487,10 +487,11 @@ async fn page_health_field(page_id: &str, final_url: &str) -> Option<Value> {
             })
         });
     // ② 空文档判定(只读 evaluate,不改 DOM;connect 模式同样只读不注入)。
-    // 判定只看结构证据:排除 `[data-<ns>agent]` 注入层(高亮框/徽标/蒙层/状态条)
-    // 后仅剩 html/head/body(real ≤3)即无真实内容。**不**叠加 body.innerText
-    // 文本门槛 —— 注入层文案(「LAEW Agent 控制中」等约 50 字)恒计入 innerText,
-    // 叠加会把真空页误判为非空(内网站点 400 空文档实测如此)。
+    // 判定只看结构证据:排除 `[data-<ns>agent]` 注入层(高亮框/蒙层/状态条/盾区
+    // 的 light DOM host)后仅剩 html/head/body(real ≤3)即无真实内容。**不**叠加
+    // body.innerText 文本门槛 —— 注入层文案(第 169 轮起住 closed Shadow DOM,
+    // 不再进 innerText;此前恒计入约 50 字)在历史版本会把真空页误判为非空
+    // (内网站点 400 空文档实测如此),文本门槛对结构判定无增益。
     // 第 168 轮:同探空文本前置匹配**风控页签名**(实测京东 `.jd-main-risk-fallback`
     // 「当前页面异常/请刷新或切换账户试试」,登录后风控复核触发,自动 reload 无效)。
     let dom: Option<Value> = async {

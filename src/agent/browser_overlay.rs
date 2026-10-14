@@ -68,6 +68,13 @@ pub fn shields_element_id() -> String {
     format!("{}guard_shields__", crate::agent::browser_ns::inject_ns())
 }
 
+/// 注入 UI 的 closed Shadow DOM host id(第 169 轮)。蒙层/状态条/盾区整体住在
+/// 该 host 的影子树里(页面 JS 不可读,防风控采 innerText 拿到品牌签名),
+/// light DOM 只留这个无文本 host —— 故「视觉元素是否在场」的主文档探针查它。
+pub fn guard_ui_host_id() -> String {
+    format!("{}guard_ui__", crate::agent::browser_ns::inject_ns())
+}
+
 /// 单侧选择器(allow/block)数量上限。
 pub const MAX_GUARD_SELECTORS: usize = 8;
 
@@ -311,6 +318,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     const HINT_ID = '%NS%overlay_hint__';
     const SHIELDS_ID = '%NS%guard_shields__';
     const STYLE_ID = '%NS%guard_style__';
+    const HOST_ID = '%NS%guard_ui__';
     const CHIP_TEXT = {
         locked: window.%NS%GuardScrollWatch
             ? ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看·可滚动)',
@@ -322,7 +330,17 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         partial:['🛡 部分锁定 · 盾区不可操作',
                  '其余区域人工可直接操作;需要调整范围请告知 Agent'],
     };
-    const el = (id) => document.getElementById(id);
+    // 第 169 轮:注入 UI 挂 closed Shadow DOM —— 状态条(「LAEW Agent 控制中」)/
+    // 盾区标签(「🔒 已锁定(仅 Agent)」)等文本若留在 light DOM,页面 JS 一行
+    // `document.body.innerText` 即可枚举到自动化框架品牌签名(实测京东风控 JS
+    // 采集该文本把设备判为自动化,`.jd-main-risk-fallback`「当前页面异常」)。
+    // 挂 closed shadow 后人工截图/肉眼可见不变,hit-testing 穿 shadow 边界
+    // (盾区 pointer-events:auto 照常拦截),页面 innerText/textContent/DOM 枚举/
+    // innerHTML 序列化均读不到影子树内容。attachShadow 不可用时 fail-open 回退
+    // light DOM(只损隐身不损管控功能)。
+    let SH = null;
+    const el = (id) => (SH && SH.getElementById(id)) || document.getElementById(id);
+    const mount = (node) => (SH || root()).appendChild(node);
     // 第 163 轮:document-start 时 `document.documentElement` 与 `document.body`
     // **都可能是 null**(`readyState === 'loading'`)。旧写法 `document.body ||
     // document.documentElement` 在此二者皆 null → `root().appendChild()` 抛
@@ -336,13 +354,26 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     const ready = () => !!(document.documentElement || document.body);
     const ensure = () => {
         if (!ready()) return;
+        // shadow host 装配(每文档一次):SPA 整树替换把 host 冲掉时按 id 重找重建,
+        // attachShadow 抛错(重复挂载/老引擎)fail-open 回退 light DOM。
+        if (!document.getElementById(HOST_ID) || !SH) {
+            let h = document.getElementById(HOST_ID);
+            if (!h) {
+                h = document.createElement('div');
+                h.id = HOST_ID;
+                h.setAttribute('data-%NS%agent', '1');
+                h.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;';
+                root().appendChild(h);
+            }
+            try { SH = h.attachShadow ? h.attachShadow({ mode: 'closed' }) : null; } catch (ex) { SH = null; }
+        }
         if (!el(MASK_ID)) {
             const m = document.createElement('div');
             m.id = MASK_ID;
             m.setAttribute('data-%NS%agent', '1');
             m.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483646;'
                 + 'background:rgba(15,23,42,0.22);';
-            root().appendChild(m);
+            mount(m);
         }
         if (window.top === window && !el(HINT_ID)) {
             const c = document.createElement('div');
@@ -365,14 +396,14 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
             n.className = '%NS%guard_hint_note__';
             n.style.cssText = 'font-weight:400;color:#cbd5e1;font-size:12px;margin-top:2px;';
             c.appendChild(t); c.appendChild(s); c.appendChild(n);
-            root().appendChild(c);
+            mount(c);
         }
         if (!el(SHIELDS_ID)) {
             const sc = document.createElement('div');
             sc.id = SHIELDS_ID;
             sc.setAttribute('data-%NS%agent', '1');
             sc.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483645;';
-            root().appendChild(sc);
+            mount(sc);
         }
     };
     // 锁定态 CSS 层:悬停任何组件光标 ⃠(「不可点击」视觉态)+ 全页禁选
@@ -380,6 +411,8 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // 「locked 且未挂起」共用一个判据 —— Agent 输入动作「先解后锁」期间
     // (%NS%GuardInputSuspend / %NS%GuardSuspend)CSS 锁同步放开,收口复锁。
     // open/partial 不上全局锁(partial 盾罩自带 cursor:not-allowed)。
+    // 注:本样式必须留在**主文档**(作用对象是页面元素,影子树样式打不到
+    // 页面节点);其选择器类名已 ns 随机化,不构成固定签名。
     const applyLockCss = () => {
         const on = window.%NS%GuardMode === 'locked'
             && !window.%NS%GuardSuspended && !window.%NS%GuardInputSuspended;
@@ -554,6 +587,17 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // true=切屏蔽模式,false=切开放模式(模式级开关,非可见性开关)。
     window.%NS%OverlaySet = (on) =>
         window.%NS%GuardSet(on ? 'locked' : 'open', [], [], null);
+    // 第 169 轮:影子树自探(非枚举)—— closed shadow 对页面/Rust evaluate 都不可读,
+    // 视觉层校验(visual_mask)与真浏览器回归测试经此读 UI 在场性/显示态。
+    window.%NS%GuardUiProbe = () => ({
+        host: !!document.getElementById(HOST_ID),
+        mask: !!el(MASK_ID),
+        mask_display: el(MASK_ID) ? (el(MASK_ID).style.display || '') : 'missing',
+        hint: !!el(HINT_ID),
+        shields: !!el(SHIELDS_ID),
+        shields_count: el(SHIELDS_ID) ? el(SHIELDS_ID).childElementCount : -1,
+        shields_display: el(SHIELDS_ID) ? (el(SHIELDS_ID).style.display || '') : 'missing',
+    });
     let raf = 0;
     const schedule = () => {
         if (window.%NS%GuardMode !== 'partial' || window.%NS%GuardSuspended) return;
@@ -615,10 +659,13 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         try { window.removeEventListener('scroll', schedule, true); } catch (e) {}
         try { window.removeEventListener('resize', schedule); } catch (e) {}
         try { if (window.%NS%GuardMO) window.%NS%GuardMO.disconnect(); } catch (e) {}
-        for (const id of [MASK_ID, HINT_ID, SHIELDS_ID, STYLE_ID]) {
+        // 第 169 轮:注入 UI 整体住在 shadow host 里,拆 host 即清空影子树
+        // (锁定样式 STYLE_ID 在主文档,单独移除)。
+        for (const id of [HOST_ID, STYLE_ID]) {
             const n = document.getElementById(id);
             if (n) n.remove();
         }
+        SH = null;
         try { if (root()) root().classList.remove('%NS%locked__'); } catch (e) {}
     };
     // 第 168 轮:隐身收敛 —— API 入口全部改成不可枚举(for…in / Object.keys 不可见)。
@@ -631,7 +678,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
          '%NS%GuardBlock', '%NS%GuardNote', '%NS%GuardSuspended', '%NS%GuardScrollWatch',
          '%NS%GuardInputSuspended', '%NS%GuardGateReady', '%NS%GuardInputSuspend',
          '%NS%GuardOff', '%NS%GuardSet', '%NS%GuardSuspend', '%NS%GuardMO', '%NS%GuardRO',
-         '%NS%OverlaySet']
+         '%NS%GuardUiProbe', '%NS%OverlaySet']
             .forEach((k) => {
                 Object.defineProperty(window, k,
                     { enumerable: false, configurable: true, writable: true, value: window[k] });
@@ -743,11 +790,15 @@ pub async fn apply_page_guard(
     // document-start 注入时它已定义,但建元素的代码因 root() 为 null 抛异常,
     // 于是「函数可用」与「屏幕上看得见」被混为一谈,`visual_mask` 恒真。
     // 这里独立校验视觉元素是否真实存在于 DOM,让回报字段不再「嘴上说成功」。
+    // 第 169 轮:视觉元素住进 closed Shadow DOM,主文档只剩无文本 host,
+    // 探针改为「host 在场(影子树同建)或 fallback light DOM 三件套任一在场」。
     let visual_present = page
         .evaluate(format!(
             "!!(document.getElementById('{}') \
              || document.getElementById('{}') \
+             || document.getElementById('{}') \
              || document.getElementById('{}'))",
+            guard_ui_host_id(),
             overlay_element_id(),
             overlay_hint_id(),
             shields_element_id()
@@ -1417,12 +1468,13 @@ mod tests {
             }
         };
 
-        // ① 管控元素存在(蒙层/状态条在主文档,盾区容器在)
+        // ① 管控元素存在(第 169 轮:蒙层/状态条/盾区住 closed Shadow DOM,
+        //    主文档探针读不到,经影子树自探 API 校验在场性)
         let mask_probe = page
             .evaluate(
                 crate::agent::browser_ns::render_ns(
-                    "!!document.getElementById('%NS%overlay__') && !!document.getElementById('%NS%overlay_hint__') \
-                 && !!document.getElementById('%NS%guard_shields__')",
+                    "(function(){const p = window.%NS%GuardUiProbe && window.%NS%GuardUiProbe(); \
+                 return !!(p && p.mask && p.hint && p.shields);})()",
                 ),
             )
             .await
@@ -1501,7 +1553,7 @@ mod tests {
         // ③ 蒙层隐藏/恢复(截图避让通道)
         assert!(mask_set_visible(&page, false).await, "蒙层隐藏应实际应用");
         let hidden = page
-            .evaluate(crate::agent::browser_ns::render_ns("getComputedStyle(document.getElementById('%NS%overlay__')).display"))
+            .evaluate(crate::agent::browser_ns::render_ns("(window.%NS%GuardUiProbe()||{}).mask_display"))
             .await
             .ok()
             .and_then(|r| r.value().cloned())
@@ -1519,8 +1571,8 @@ mod tests {
         let shields = page
             .evaluate(
                 crate::agent::browser_ns::render_ns(
-                    "(function(){const sc=document.getElementById('%NS%guard_shields__'); \
-                 return sc ? sc.style.display + '/' + sc.childElementCount : 'missing';})()",
+                    "(function(){const p = window.%NS%GuardUiProbe && window.%NS%GuardUiProbe(); \
+                 return p ? p.shields_display + '/' + p.shields_count : 'missing';})()",
                 ),
             )
             .await
@@ -1559,8 +1611,12 @@ mod tests {
         assert_eq!(hit, "b", "允许区内 elementFromPoint 应命中按钮本体:{hit}");
         let hit2 = page
             .evaluate(
-                "(function(){const el=document.elementFromPoint(400,300); \
-                 return el && el.id ? el.id : (el ? 'shield' : 'none');})()",
+                crate::agent::browser_ns::render_ns(
+                    "(function(){const el=document.elementFromPoint(400,300); \
+                 if (!el) return 'none'; \
+                 if (el.id === '%NS%guard_ui__') return 'shield'; \
+                 return el.id ? el.id : (el ? 'shield' : 'none');})()",
+                ),
             )
             .await
             .ok()
@@ -1580,10 +1636,10 @@ mod tests {
         let after_nav = page
             .evaluate(
                 crate::agent::browser_ns::render_ns(
-                    "JSON.stringify({mask: !!document.getElementById('%NS%overlay__'), \
-                 hint: !!document.getElementById('%NS%overlay_hint__'), \
+                    "JSON.stringify((function(){const p = window.%NS%GuardUiProbe && window.%NS%GuardUiProbe(); \
+                 return {mask: !!(p && p.mask), hint: !!(p && p.hint), \
                  frame: !!document.getElementById('%NS%agent_frame__'), \
-                 shields: !!document.getElementById('%NS%guard_shields__')})",
+                 shields: !!(p && p.shields)};})())",
                 ),
             )
             .await

@@ -1156,6 +1156,30 @@ fn detect_blockers_matches_common_walls() {
     assert!(clean.is_empty(), "误报:{clean:?}");
 }
 
+/// 第 169 轮:模式表**处置建议**必须进告警载荷(advice 字段)——
+/// 风控墙命中要拿到「不要 reload / request_human 点刷新切换账号 / reuse_existing」
+/// 的专属指引,而不是通用「人工验证挑战(拖拽拼图/滑块)」错位文案(实测京东
+/// `.jd-main-risk-fallback` 场景)。
+#[test]
+fn detect_blockers_carries_pattern_advice() {
+    let risk = inspect::detect_blockers("当前页面异常\n请刷新或切换账户试试");
+    let hit = risk
+        .iter()
+        .find(|b| b["kind"] == "manual_verify")
+        .unwrap_or_else(|| panic!("应命中风控墙:{risk:?}"));
+    let advice = hit["advice"].as_str().unwrap_or_default();
+    assert!(advice.contains("不要 reload"), "风控墙建议应禁止 reload:{advice}");
+    assert!(advice.contains("reuse_existing"), "风控墙建议应给根治路径:{advice}");
+    // 其它模式同样带建议(sms 场景抽样)
+    let sms = inspect::detect_blockers("短信验证码已发送至 138****0000,请输入");
+    let s = sms.iter().find(|b| b["kind"] == "sms").expect("应命中 sms");
+    assert!(
+        s["advice"].as_str().unwrap_or_default().contains("request_human"),
+        "sms 建议应指引 request_human:{:?}",
+        s
+    );
+}
+
 // ==================== 第 151 轮:关键词通道整词边界(误报根治) ====================
 
 #[test]
@@ -1711,6 +1735,20 @@ fn hitl_answer_hint_splits_typed_code_vs_option_pick() {
     let h = hitl_hint::hitl_answer_hint("custom", "跳过这个站点");
     assert!(h.contains("human_response"), "{h}");
     assert!(!h.contains("input_text"), "非验证码 reason 不应指引填码: {h}");
+}
+
+/// 第 169 轮:人工完成操作/自由文本指示的 next_hint 必须带「勿 reload」防呆 ——
+/// 实测京东任务 SubAgent 在人工登录成功后第一动作 control(reload),直接触发
+/// 风控复核弹「当前页面异常」风控墙。
+#[test]
+fn hitl_answer_hint_warns_no_reload_after_human() {
+    let h = hitl_hint::hitl_answer_hint("login", "1. 我已完成人工操作,继续");
+    assert!(h.contains("不要 reload"), "选项应答应带勿 reload 防呆:{h}");
+    let h = hitl_hint::hitl_answer_hint("manual_verify", "登录好了");
+    assert!(h.contains("不要 reload"), "自由文本应答应带勿 reload 防呆:{h}");
+    // 填码分支是「立即提交」语义,不掺 reload 防呆(避免稀释主指令)
+    let h = hitl_hint::hitl_answer_hint("captcha", "z7z2");
+    assert!(!h.contains("reload"), "填码分支不应掺 reload 提示:{h}");
 }
 
 /// 第 155 轮:captcha/sms/two_factor 的自由文本**不像码**(整句指示/中文)时,

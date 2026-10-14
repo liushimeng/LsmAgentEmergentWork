@@ -21,7 +21,7 @@ const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
             "当前页面异常", "请刷新或切换账户", "内容太火爆了",
             "访问过于频繁", "操作过于频繁",
         ],
-        "站点风控拦截页(登录后常见,自动 reload/点刷新均无效):control(request_human, reason=manual_verify) 请人工在窗口处理(刷新/滑块/切换账号);根治建议 open(reuse_existing=true) 复用日常浏览器(真实指纹+登录态,connect 模式零注入)",
+        "站点风控拦截页(非可交互验证弹窗):不要 reload/重复提交(会再触发风控复核,实测 reload 后立即再弹);control(request_human, reason=manual_verify) 请人工点页面「刷新/切换账号」恢复,或改 open(reuse_existing=true) 复用日常浏览器(真实指纹+登录态,connect 模式零注入)后再继续",
     ),
     (
         "captcha",
@@ -197,7 +197,7 @@ fn is_noise_context(kind: &str, snippet: &str) -> bool {
 pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
     let lower = text.to_lowercase();
     let mut out: Vec<Value> = Vec::new();
-    for (kind, keywords, _) in BLOCKER_PATTERNS {
+    for (kind, keywords, advice) in BLOCKER_PATTERNS {
         if let Some(kw) = keywords
             .iter()
             .find(|kw| {
@@ -242,6 +242,10 @@ pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
                     "kind": kind,
                     "matched": kw,
                     "snippet": snippet,
+                    // 第 169 轮:模式表第三列**处置建议**进告警载荷(此前被 `_` 丢弃,
+                    // blocker_alert 统一用通用 hint —— 风控墙拿到的是「人工完成验证
+                    // (拖拽/滑块)」的错位指引)。
+                    "advice": advice,
                 }));
             }
         }

@@ -719,3 +719,76 @@ async fn mcp_web_use_multi_window_parallel_smoke() {
         .execute(json!({"action": "close", "page_id": "all"}))
         .await;
 }
+
+/// 第 169 轮:隐身自检冒烟(京东风控墙根治回归锁)——
+/// 实测 Chrome 155 下即使剔除 `--enable-automation` 且传
+/// `--disable-blink-features=AutomationControlled`,页面 `navigator.webdriver`
+/// 仍为 `true`;且注入 UI 文本(「LAEW Agent 控制中」)暴露在 `document.body.innerText`
+/// ——两者被天猫/京东系风控 JS 采集后判为自动化环境(登录风控复核返回
+/// `.jd-main-risk-fallback`「当前页面异常」,jsonpLogin/pc_home_feed 403)。
+/// 本用例经 McpWebUseTool 真实启动浏览器验证:webdriver 覆写生效、注入 UI
+/// 文本页面不可读(closed Shadow DOM)、window 无 laew 残留键、管控视觉层在场。
+#[tokio::test]
+#[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
+async fn stealth_selfcheck_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": PAGE, "guard": "locked"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    if v["code"] == 3001 {
+        // 本机未安装浏览器:信封验证即完成
+        return;
+    }
+    assert_eq!(v["code"], 0, "open 应成功: {out}");
+    let page_id = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    let eval = |expr: String| {
+        let pid = page_id.clone();
+        async move {
+            let out = McpWebUseTool
+                .execute(json!({
+                    "action": "control", "page_id": pid, "control_action": "eval_js",
+                    "params": {"expression": expr}
+                }))
+                .await
+                .unwrap();
+            let v = data_of(&out);
+            assert_eq!(v["code"], 0, "eval_js 应成功: {out}");
+            v["data"]["result"].as_str().unwrap_or_default().to_string()
+        }
+    };
+
+    // ① navigator.webdriver 覆写生效(返回 false,与真实 Chrome 语义一致)
+    let wd = eval("String(navigator.webdriver)".into()).await;
+    assert_eq!(wd, "false", "navigator.webdriver 覆写应生效(风控指纹①)");
+
+    // ② 注入 UI 文本页面不可读(徽标/状态条在 closed Shadow DOM)
+    let text = eval("document.body.innerText + '|' + document.body.textContent".into()).await;
+    assert!(
+        !text.contains("LAEW Agent"),
+        "页面文本面不得残留品牌签名(风控指纹②):{text}"
+    );
+
+    // ③ window 无可枚举 laew 残留键
+    let leaked = eval(
+        "String(Object.keys(window).filter((k) => k.toLowerCase().indexOf('laew') >= 0).length)".into(),
+    )
+    .await;
+    assert_eq!(leaked, "0", "window 不应有可枚举 laew 键");
+
+    // ④ 管控视觉层在影子树里真实存在(隐身不牺牲管控功能)
+    let probe = eval(
+        "JSON.stringify((window.%NS%GuardUiProbe && window.%NS%GuardUiProbe()) || null)".replace("%NS%", lsm_agent::agent::browser_ns::inject_ns()),
+    )
+    .await;
+    let p: Value = serde_json::from_str(&probe).unwrap_or(Value::Null);
+    assert_eq!(p["mask"], json!(true), "蒙层应在场:{probe}");
+    assert_eq!(p["hint"], json!(true), "状态条应在场:{probe}");
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": page_id}))
+        .await;
+}
