@@ -272,6 +272,9 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             if let Some(gated) = crate::agent::browser_pace::guard_navigation(
                 url,
                 params.get("force").and_then(Value::as_bool).unwrap_or(false),
+                // navigate 无 connect_url 参数:身份看当前浏览器实例(connect 模式
+                // 且非 laew relaunch 实例 = 用户日常 Chrome;launch 模式 = laew 身份)。
+                super::open_laew_identity(None).await,
             )
             .await
             {
@@ -689,19 +692,31 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
     // 文档时附 data.page_health{blank, reason, main_doc_status, next_action}
     // (命中才带字段,健康页零噪声), Agent 可第一时间如实判定「目标站对本环境
     // 返回空文档」而不是盲试。
-    let landed = page
+    let mut landed = page
         .url()
         .await
         .ok()
         .flatten()
         .unwrap_or_else(|| url.to_string());
-    // 2026-10-14:整页抹除记账(navigate 落 about:blank;非 connect 才记 —— 接管
-    // 用户浏览器时落地行为归用户,不进熔断账本防误伤)。连续 ≥2 次同域自动冷却(6004)。
-    let wipe_outcome = if !BrowserManager::global().is_connect_mode().await {
+    // 2026-10-14:整页抹除记账(navigate 落 about:blank;launch 实例与 laew
+    // relaunch 调试实例记账 —— 用户日常 Chrome 落地行为归用户,不进熔断账本
+    // 防误伤)。连续 ≥2 次同域自动冷却(6004);总账 ≥ 阈值对 laew 身份持久熔断。
+    let count_wipes = !BrowserManager::global().is_connect_mode().await
+        || BrowserManager::global().connect_is_laew_relaunch().await;
+    let mut wipe_outcome = if count_wipes {
         crate::agent::browser_pace::WebPace::global().note_navigation_outcome(url, &landed)
     } else {
         None
     };
+    // 2026-10-14 第二轮:延迟抹除复查 —— 结算时页面健康、数秒后才被抹除的形态
+    // (猎聘实测)。有抹除史的域等 3.5s 复读落地 URL;当场已落 blank 的不重复复查。
+    if !landed.trim().eq_ignore_ascii_case("about:blank") {
+        if let Some((late_landed, late)) = super::deferred_wipe_check(&page, url, count_wipes).await
+        {
+            landed = late_landed;
+            wipe_outcome = super::merge_wipe_outcome(wipe_outcome, late);
+        }
+    }
     if let Some(v) = super::site_wipe_field(wipe_outcome) {
         out["landed_url"] = json!(landed);
         out["site_wipe"] = v;

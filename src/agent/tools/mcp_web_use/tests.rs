@@ -2992,3 +2992,89 @@ fn 步内open参数合并_无非效params零变化() {
     merge_open_params(&mut bad);
     assert_eq!(bad["params"], "not-object");
 }
+
+// ==================== 第 172 轮:厂商验证容器指纹 + 风控挑战域级冷却 ====================
+
+/// baxia 实测形态探针(滑块本体在跨域 iframe 内,外层结构信号残缺):
+/// score 仅 4、slider_like=false、iframe_like=false → 旧分类掉到 Unknown。
+/// 弹层带「安全验证」强词(实测壳层文案)使 detect_challenge 先命中,验证
+/// 「已有挑战 + 厂商指纹 → 升级子类」的合并路径。
+fn probe_baxia_like() -> Value {
+    json!({
+        "text": "安全验证",
+        "vendors": [{"name": "baxia", "hits": 1}],
+        "overlay": {
+            "found": true, "text": "安全验证",
+            "img_count": 0, "grid_imgs": 0, "bg_imgs": 0,
+            "canvas_count": 0, "iframe_count": 0,
+            "iframe_like": false, "input_count": 0, "slider_like": false,
+            "buttons": [],
+            "selector": ".baxia-dialog.auto",
+            "rect": {"w": 1920, "h": 940}, "viewport": {"w": 1920, "h": 940},
+            "area_ratio": 0.982, "z_index": 999999,
+        },
+    })
+}
+
+#[test]
+fn 厂商指纹_baxia残缺证据升级为滑块() {
+    let blockers = blocker_probe::analyze(&probe_baxia_like());
+    let first = blockers.first().expect("厂商指纹在场必须产出挑战条目");
+    assert_eq!(first["challenge_type"], "slider", "Unknown 应按厂商指纹升级为 slider");
+    assert_eq!(first["kind"], "manual_verify");
+    assert_eq!(first["matched"], "challenge_overlay");
+    assert_eq!(first["evidence"]["score"], 6);
+    assert_eq!(first["evidence"]["vendors"][0]["name"], "baxia");
+    let advice = first["advice"].as_str().unwrap_or("");
+    assert!(advice.contains("滑块"), "advice 应给滑块处置指引");
+    assert!(advice.contains("反复重试"), "advice 应警示重试加剧风控");
+    assert!(blocker_probe::punish_vendor_hit(first));
+}
+
+#[test]
+fn 厂商指纹_弹层缺失时直接合成挑战条目() {
+    // iframe 未加载完/弹层挑错:baxia 容器仍在,不能漏报
+    let probe = json!({
+        "text": "",
+        "vendors": [{"name": "baxia", "hits": 1}],
+        "overlay": null,
+    });
+    let blockers = blocker_probe::analyze(&probe);
+    let first = blockers.first().expect("无弹层但厂商指纹在场也应产出条目");
+    assert_eq!(first["matched"], "vendor_fingerprint");
+    assert_eq!(first["challenge_type"], "slider");
+    assert_eq!(first["snippet"], "阿里 baxia 风控滑块");
+    assert!(blocker_probe::punish_vendor_hit(first));
+}
+
+#[test]
+fn 厂商指纹_nc与geetest识别但不触发风控冷却() {
+    let nc = json!({"text": "", "vendors": [{"name": "nc", "hits": 1}], "overlay": null});
+    let first = blocker_probe::analyze(&nc).remove(0);
+    assert_eq!(first["challenge_type"], "slider");
+    assert!(!blocker_probe::punish_vendor_hit(&first), "nc 是正常验证组件,不触发冷却");
+
+    let geetest = json!({"text": "", "vendors": [{"name": "geetest", "hits": 1}], "overlay": null});
+    let first = blocker_probe::analyze(&geetest).remove(0);
+    assert_eq!(first["challenge_type"], "slider");
+    assert!(!blocker_probe::punish_vendor_hit(&first));
+}
+
+#[test]
+fn 厂商指纹_无厂商时行为与旧版一致() {
+    let plain = json!({"text": "", "vendors": [], "overlay": null});
+    assert!(blocker_probe::analyze(&plain).is_empty());
+    // 无 vendors 键(旧探针形态/开关回退)也不报错
+    let legacy = json!({"text": "", "overlay": null});
+    assert!(blocker_probe::analyze(&legacy).is_empty());
+}
+
+#[test]
+fn probe_js包含厂商容器选择器() {
+    let js = blocker_probe::probe_js_for_test();
+    assert!(js.contains("baxia-dialog"), "baxia 容器选择器必须在探针 JS 里");
+    assert!(js.contains("nc-container"), "noCaptcha 容器选择器必须在探针 JS 里");
+    assert!(js.contains("geetest"), "geetest 容器选择器必须在探针 JS 里");
+    assert!(js.contains("yidun"), "易盾容器选择器必须在探针 JS 里");
+    assert!(js.contains("vendors"), "探针必须输出 vendors 字段");
+}

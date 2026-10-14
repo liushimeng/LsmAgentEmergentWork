@@ -444,6 +444,30 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                     crate::agent::browser_pace::WebPace::global().mark_rate_limited(&host);
                 }
             }
+            // 第 172 轮:baxia 滑块 punish(会话/指纹级风控打标)命中即标记同域
+            // 风控挑战冷却(与推送探针同源;人工完成验证后由 request_human_core
+            // 收口解除)。冷却信息在 out 构建后挂进响应,LLM 不必等 6004 才
+            // 发现被拦。
+            let risk_marked = blockers
+                .iter()
+                .any(|b| super::blocker_probe::punish_vendor_hit(b));
+            let risk_host_rem = if risk_marked {
+                page.url()
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|u| crate::agent::browser_pace::host_of(&u))
+                    .map(|host| {
+                        crate::agent::browser_pace::WebPace::global().mark_risk_challenge(&host);
+                        let rem = crate::agent::browser_pace::WebPace::global()
+                            .cooldown_remaining_for(&host)
+                            .map(|d| d.as_secs().max(1))
+                            .unwrap_or(1);
+                        (host, rem)
+                    })
+            } else {
+                None
+            };
             // 暴露合法 reason 列表:LLM 拿到 blockers 后可直接挑一个去 request_human,
             // 不必反查工具 schema / 文档。新增 reason 时本列表自动跟随常量更新。
             let allowed_reasons: Vec<&'static str> =
@@ -460,6 +484,16 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                 },
                 "available_reasons": allowed_reasons,
             });
+            // 第 172 轮:风控挑战冷却事实(payload 版;导航层 6004 按 cause 分流)。
+            if let Some((host, rem)) = &risk_host_rem {
+                out["risk_cooldown"] = json!({
+                    "host": host,
+                    "remaining_secs": rem,
+                    "advice": "该域已进入风控挑战冷却:冷却期内同域导航会被 6004 拦截;\
+人工完成验证后冷却自动解除;若人工放弃/超时,不要立即重试搜索(会加剧风控),\
+等冷却结束或换身份(close(page_id=\"all\") / reuse_existing)",
+                });
+            }
             // 第 131 轮:命中阻断时,把「下一步=request_human」的完整载荷(推荐 reason /
             // message / options)一并挂上 —— 原先只有 `suggested_action` 一个裸字符串,
             // 模型仍要自己去猜 reason 与提示文案。

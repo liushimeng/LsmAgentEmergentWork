@@ -266,6 +266,57 @@ pub(super) fn classify_challenge(overlay: &Value) -> ChallengeType {
     ChallengeType::Unknown
 }
 
+/// 第 172 轮:厂商验证容器指纹 → 挑战子类映射(纯函数,可单测)。
+/// baxia/nc/geetest/yidun 的主流形态都是滑块(或滑块/点选混合),统一按
+/// Slider 给「按住滑块拖到最右」的交互指引(reason 仍落 manual_verify)。
+fn vendor_challenge_type(name: &str) -> Option<ChallengeType> {
+    Some(match name {
+        "baxia" | "nc" | "geetest" | "yidun" => ChallengeType::Slider,
+        _ => return None,
+    })
+}
+
+/// 厂商指纹的专属处置建议(advice 字段,probe_alert/inspect 的 hint 路由直接消费)。
+fn vendor_advice(name: &str) -> &'static str {
+    match name {
+        "baxia" => "阿里 baxia 风控滑块(会话/指纹级打标):人工在浏览器窗口按住滑块拖到最右\
+(HITL 弹窗可切「🎮 侵入式」用触控板拖,坐标级输入可穿透跨域 iframe),完成后回弹窗点继续。\
+切忌反复重试搜索——会升级为会话级风控,连首页都被打标;若人工放弃,该域已入风控冷却,\
+等冷却或换身份(close(page_id=\"all\") / reuse_existing)",
+        "nc" => "阿里 noCaptcha 滑块:人工在浏览器窗口按住滑块拖到最右\
+(HITL 弹窗可切「🎮 侵入式」用触控板拖),完成后回弹窗点继续",
+        "geetest" => "极验验证:人工在浏览器窗口按题面完成(滑块按住拖到最右/按提示点选),\
+完成后回弹窗点继续",
+        _ => "网易易盾验证:人工在浏览器窗口按题面完成(滑块按住拖到最右/按提示点选),\
+完成后回弹窗点继续",
+    }
+}
+
+/// 厂商指纹的短标签(进 snippet/HITL message,人工一眼知道面对什么)。
+fn vendor_label(name: &str) -> &'static str {
+    match name {
+        "baxia" => "阿里 baxia 风控滑块",
+        "nc" => "阿里 noCaptcha 滑块",
+        "geetest" => "极验验证",
+        _ => "网易易盾验证",
+    }
+}
+
+/// 命中条目是否需要域级风控冷却:仅 baxia punish 容器(会话/指纹级打标)。
+/// nc 是登录/验证流程的正常组件、geetest/yidun 是普通第三方验证,命中≠被惩罚,
+/// 不冷却(冷却会把正常登录后的导航也拦住)。
+pub(super) fn punish_vendor_hit(alert: &Value) -> bool {
+    alert
+        .get("evidence")
+        .and_then(|e| e.get("vendors"))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .any(|v| v.get("name").and_then(Value::as_str) == Some("baxia"))
+        })
+        .unwrap_or(false)
+}
+
 /// 弹层元数据是否构成语义挑战;命中返回 blocker 条目(含结构证据)。
 ///
 /// 入参是探针 JS 产出的 `overlay` 对象(见 [`probe_js`]);`None` = 无弹层或分数不足。
@@ -344,12 +395,74 @@ pub(super) fn detect_challenge(overlay: &Value) -> Option<Value> {
 }
 
 /// 综合分析探针数据:全文关键词(第 100 轮语义,复用 [`super::inspect::detect_blockers`])
-/// ∪ 弹层语义挑战;同 kind 去重,挑战条目优先(带结构证据)。
+/// ∪ 弹层语义挑战 ∪ 厂商验证容器指纹(第 172 轮);同 kind 去重,挑战条目优先
+/// (带结构证据)。
 pub(super) fn analyze(probe: &Value) -> Vec<Value> {
     let mut out = super::inspect::detect_blockers(
         probe.get("text").and_then(Value::as_str).unwrap_or(""),
     );
-    if let Some(challenge) = detect_challenge(probe.get("overlay").unwrap_or(&Value::Null)) {
+    let vendors: Vec<Value> = probe
+        .get("vendors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut challenge = detect_challenge(probe.get("overlay").unwrap_or(&Value::Null));
+    if !vendors.is_empty() {
+        // 第 172 轮:厂商容器指纹(挑战本体在跨域 iframe 内时弹层结构信号残缺,
+        // 天猫 baxia 实测 score 仅 4 且 slider_like/iframe_like 均 false → Unknown)。
+        let first_vendor = vendors
+            .first()
+            .and_then(|v| v.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        match challenge.as_mut() {
+            Some(c) => {
+                // 已有弹层挑战:厂商指纹并入证据;子类 Unknown 时按厂商升级
+                // (拿到「按住滑块拖到最右」的准确指引而不是笼统的「完成验证」)。
+                let upgrade = c.get("challenge_type").and_then(Value::as_str) == Some("unknown");
+                if upgrade {
+                    if let Some(ct) = vendor_challenge_type(&first_vendor) {
+                        if let Some(obj) = c.as_object_mut() {
+                            obj.insert("challenge_type".into(), json!(ct.as_str()));
+                            obj.insert("interaction".into(), json!(ct.interaction()));
+                            obj.insert(
+                                "needs_browser_action".into(),
+                                json!(ct.needs_browser_action()),
+                            );
+                        }
+                    }
+                }
+                if let Some(obj) = c.as_object_mut() {
+                    obj.insert("advice".into(), json!(vendor_advice(&first_vendor)));
+                    if let Some(ev) = obj.get_mut("evidence").and_then(Value::as_object_mut) {
+                        ev.insert("vendors".into(), json!(vendors));
+                        ev.insert("score".into(), json!(6));
+                    }
+                }
+            }
+            None => {
+                // 弹层未命中(未加载完/挑错层)但厂商容器在场:直接合成挑战条目,
+                // 不再依赖 overlay 结构信号。
+                let ct = vendor_challenge_type(&first_vendor).unwrap_or(ChallengeType::Unknown);
+                challenge = Some(json!({
+                    "kind": ct.reason(),
+                    "matched": "vendor_fingerprint",
+                    "snippet": vendor_label(&first_vendor),
+                    "advice": vendor_advice(&first_vendor),
+                    "challenge_type": ct.as_str(),
+                    "interaction": ct.interaction(),
+                    "needs_browser_action": ct.needs_browser_action(),
+                    "evidence": {
+                        "score": 6,
+                        "vendors": vendors,
+                        "challenge_selector": Value::Null,
+                    },
+                }));
+            }
+        }
+    }
+    if let Some(challenge) = challenge {
         // 关键词通道可能已产出同 kind 条目(captcha),保留带 evidence 的挑战版本
         out.retain(|b| b.get("kind").and_then(Value::as_str) != Some("captcha"));
         out.insert(0, challenge);
@@ -369,9 +482,30 @@ fn probe_js() -> String {
         super::inspect::VISIBLE_TEXT_FN_JS,
         r#"(() => {
   try {
-    if (!document.body) return {text: '', overlay: null};
+    if (!document.body) return {text: '', overlay: null, vendors: []};
     const text = %NS%BodyVisibleText();
     const vw = window.innerWidth, vh = window.innerHeight;
+    // 第 172 轮:已知第三方验证容器指纹全文档扫描。挑战本体常在跨域 iframe 内,
+    // 外层 innerText 读不到滑块文案,overlay 结构信号(iframe 尺寸/按钮/画布)也
+    // 常因加载时机/形态不满足判据(天猫 baxia 实测:score 仅 4、slider_like=false、
+    // iframe_like=false → 掉到 Unknown)。容器 class/id/src 是主文档侧稳定可见的
+    // 强证据,与弹层挑选解耦:弹层挑错/iframe 未加载完也能命中。只计可见元素。
+    const VENDOR_SELS = [
+      ['baxia', '#baxia-dialog, .baxia-dialog, [class*="baxia-dialog"], [id^="baxia-"], iframe[src*="punish"]'],
+      ['nc', '.nc-container, .nc_wrapper, [class*="nc_scale"], .nc-lang-cnt, [class*="btn_slide"]'],
+      ['geetest', '.geetest_panel, .geetest_box, [class*="geetest_box"], [id^="geetest_"]'],
+      ['yidun', '[class*="yidun_popup"], [class*="yidun_panel"], [id^="yidun_"]'],
+    ];
+    const vendors = [];
+    for (const pair of VENDOR_SELS) {
+      let vhits = 0;
+      document.querySelectorAll(pair[1]).forEach((vel) => {
+        const vcs = window.getComputedStyle(vel);
+        if (vcs.display === 'none' || vcs.visibility === 'hidden' || parseFloat(vcs.opacity) < 0.05) return;
+        vhits++;
+      });
+      if (vhits > 0) vendors.push({name: pair[0], hits: vhits});
+    }
     // 词表候选:命中 modal/dialog/captcha/verify 等**语义类名**的模态。
     const SEL = 'dialog[open], [role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i], [class*="popup" i], [class*="mask" i], [class*="overlay" i], [class*="captcha" i], [class*="verify" i], [class*="challenge" i]';
     // 第 152 轮:通用候选 —— 现代前端大量使用 BEM / 哈希类名(如 `.css-1x2y3z`),
@@ -401,7 +535,7 @@ fn probe_js() -> String {
         consider(el);
       }
     }
-    if (!best) return {text: text, overlay: null};
+    if (!best) return {text: text, overlay: null, vendors: vendors};
     const el = best.el, r = el.getBoundingClientRect();
     // 第 152 轮:挑战层选择器(供 HITL 放行白名单与「滚动到验证弹窗」复用)
     const selOf = (node) => {
@@ -482,6 +616,7 @@ fn probe_js() -> String {
       .filter(Boolean).slice(0, 6);
     return {
       text: text,
+      vendors: vendors,
       overlay: {
         found: true,
         text: ((el.innerText || '') + frame_meta).replace(/\s+/g, ' ').slice(0, 600),
@@ -509,8 +644,13 @@ pub(super) async fn collect_for_inspect(page: &chromiumoxide::Page) -> Value {
         .await
     {
         Ok(Ok(v)) if v.is_object() => v,
-        _ => json!({"text": "", "overlay": null}),
+        _ => json!({"text": "", "overlay": null, "vendors": []}),
     }
+}
+
+#[cfg(test)]
+pub(super) fn probe_js_for_test() -> String {
+    probe_js()
 }
 
 /// 把人工核验挑战弹层滚动到视口中央,返回命中的选择器(无挑战层 → `None`)。
@@ -716,6 +856,28 @@ async fn probe_alert_impl(page_id: &str) -> Option<Value> {
             return Some(out);
         }
     }
+    // 第 172 轮:baxia 滑块 punish(会话/指纹级风控打标)命中即标记同域风险冷却 —
+    // 天猫实测:挑战后立刻重试搜索会把风控升级为会话级(连首页都被打标),人工
+    // 取消/超时后需要工具层止动。人工在 HITL 完成验证后由 request_human_core
+    // 收口解除(Answered → clear_risk_challenge)。
+    let risk_cooldown = if alerts.iter().any(punish_vendor_hit) {
+        if let Some(h) = &page_host {
+            crate::agent::browser_pace::WebPace::global().mark_risk_challenge(h);
+            crate::agent::browser_pace::WebPace::global()
+                .cooldown_remaining_for(h)
+                .map(|rem| json!({
+                    "host": h,
+                    "remaining_secs": rem.as_secs().max(1),
+                    "advice": "该域已进入风控挑战冷却:冷却期内同域导航会被 6004 拦截;\
+人工完成验证后冷却自动解除;若人工放弃/超时,不要立即重试搜索(会加剧风控),\
+等冷却结束或换身份(close(page_id=\"all\") / reuse_existing)",
+                }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let kind = first
         .get("kind")
         .and_then(Value::as_str)
@@ -783,6 +945,9 @@ async fn probe_alert_impl(page_id: &str) -> Option<Value> {
                 dst.insert(k.clone(), v.clone());
             }
         }
+        if let (Some(dst), Some(rc)) = (out.as_object_mut(), &risk_cooldown) {
+            dst.insert("risk_cooldown".into(), rc.clone());
+        }
         return Some(out);
     }
     let hint = super::human_assist_hint(&kind, &message, &HITL_CHALLENGE_OPTIONS);
@@ -791,6 +956,9 @@ async fn probe_alert_impl(page_id: &str) -> Option<Value> {
         "next_action": hint.get("next_action").cloned().unwrap_or(json!("request_human")),
         "human_assist": hint.get("human_assist").cloned().unwrap_or(Value::Null),
     });
+    if let (Some(dst), Some(rc)) = (out.as_object_mut(), &risk_cooldown) {
+        dst.insert("risk_cooldown".into(), rc.clone());
+    }
     // 第 152 轮:子类信息顶层也带一份,Agent 无需解析 evidence 即可决定动作
     if let (Some(dst), Some(src)) = (out.as_object_mut(), first.as_object()) {
         for k in ["challenge_type", "interaction", "needs_browser_action"] {

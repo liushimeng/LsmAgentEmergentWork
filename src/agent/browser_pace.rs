@@ -23,6 +23,18 @@
 //!    次触发 `cause=site_wipe` 冷却(短于频控——目的不是等时间而是强制换策略:
 //!    close(all) 回收浏览器换全新 profile / reuse_existing 接管日常浏览器)。
 //!
+//! 4. **整页抹除总账与 laew 身份持久熔断**(2026-10-14 第二轮,猎聘实测
+//!    `llaew_20261014_140053.log`):第 3 条里的连击/冷却可被
+//!    `close(page_id="all") → clear_all()` 一键清零逃逸 —— 猎聘类站点对
+//!    **CDP 拉起的 Chrome 环境本身**做指纹级打标,换全新 profile 照样被抹,
+//!    LLM 按 6004 建议「close(all) 换全新 profile」反而每轮多弹一台 Chrome
+//!    再被抹除(实测 9 分钟拉起 8 次浏览器的风暴)。[`PaceState::wipe_total`]
+//!    是**跨浏览器实例的总账**(`clear_all` 不清),同域累计抹除 ≥
+//!    [`wipe_total_threshold`] 次后对 **laew 身份**导航(launch 模式 /
+//!    auto_relaunch 调试实例)持久返 6004 —— 与用户真实 Chrome 接管
+//!    (真实指纹,通常不被指纹级打标)区分开,只剩 reuse_existing /
+//!    request_human 两条出路,`force=true` 保留逃生口。
+//!
 //! 杀开关 `LAEW_WEB_PACE=off/0/false/no` 整体关闭(严格向后兼容)。
 //!
 //! 注意:只统计**显式导航**(open/navigate/new_window/connect 复用),点击链接派生
@@ -45,6 +57,23 @@ pub const CODE_SITE_PACE_COOLDOWN: i32 = 6004;
 /// 流程连击两次才熔断(第一次靠 page_health{site_wipe} 证据引导 LLM 自行改道,
 /// 第二次仍硬闯则强制冷却止损)。
 pub const WIPE_STREAK_THRESHOLD: u32 = 2;
+
+/// 整页抹除总账阈值(默认 3,`0`/非法值回退默认;`LAEW_WEB_WIPE_TOTAL_THRESHOLD`)。
+///
+/// 同注册域**跨浏览器实例**累计抹除 ≥ N 次后,对 laew 身份(launch 模式 /
+/// auto_relaunch 调试实例)的该域导航**持久熔断**(6004,`close(all)` 逃逸无效)。
+/// 取 3:给「会话级打标换全新 profile 即可恢复」的站点留 1~2 次试错空间,
+/// 第 3 次仍被抹除即可判定为指纹级打标(换新实例无意义,只会反复弹 Chrome)。
+pub const WIPE_TOTAL_THRESHOLD_DEFAULT: u32 = 3;
+
+/// 整页抹除总账阈值(env 覆盖;`0`/非法值回退默认)。
+pub fn wipe_total_threshold() -> u32 {
+    std::env::var("LAEW_WEB_WIPE_TOTAL_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(WIPE_TOTAL_THRESHOLD_DEFAULT)
+}
 
 /// 总开关(默认开;`LAEW_WEB_PACE=off/0/false/no` 关闭)。
 pub fn enabled() -> bool {
@@ -71,9 +100,20 @@ pub fn wipe_cooldown_secs() -> u64 {
     env_secs("LAEW_WEB_WIPE_COOLDOWN_SECS", 90)
 }
 
+/// 风控挑战冷却时长(秒;默认 300,`0`/非法值回退默认;`LAEW_WEB_RISK_COOLDOWN_SECS`)。
+/// 第 172 轮:人工验证挑战(baxia 滑块 punish 实测)是会话/指纹级打标,与抹除同属
+/// 「换策略」族 —— 等待收益低,目的是**停止重试加剧风控**;人工完成验证即解除
+/// (`WebPace::clear_risk_challenge`),不拦后续正常工作。
+pub fn risk_cooldown_secs() -> u64 {
+    env_secs("LAEW_WEB_RISK_COOLDOWN_SECS", 300)
+}
+
 /// 冷却成因(信封 `data.cause` 与文案分流;频控靠等,抹除靠换身份)。
 pub const CAUSE_RATE_LIMITED: &str = "rate_limited";
 pub const CAUSE_SITE_WIPE: &str = "site_wipe";
+/// 第 172 轮:人工验证挑战/风控打标(baxia 滑块 punish 实测形态)。与会话级打标
+/// 的 site_wipe 同属「换策略」族:等待收益低,目的是停止重试加剧风控。
+pub const CAUSE_RISK_CHALLENGE: &str = "risk_challenge";
 
 /// 自动等待上限(秒;冷却剩余 ≤ 此值时透明等待后放行;默认 45,`0` 关闭自动等待
 /// 一律走 6004 拦截)。
@@ -181,6 +221,11 @@ pub struct PaceState {
     cooldown_cause: HashMap<String, &'static str>,
     /// 每注册域「显式导航落 about:blank」连击计数(落地非 blank 即清零)
     wipe_streak: HashMap<String, u32>,
+    /// 每注册域**跨浏览器实例**的累计抹除次数(总账;`clear_all` 不清,
+    /// 落地非 blank 才清零)。同域累计 ≥ 阈值后对 laew 身份导航持久熔断 —
+    /// 根治「close(all) 清连击 → 换全新 profile 再被抹」的 Chrome 拉起风暴
+    /// (猎聘对 CDP 拉起环境做指纹级打标,换新实例无效,2026-10-14 实测)。
+    wipe_total: HashMap<String, u32>,
 }
 
 impl Default for PaceState {
@@ -190,6 +235,7 @@ impl Default for PaceState {
             cooldown_until: HashMap::new(),
             cooldown_cause: HashMap::new(),
             wipe_streak: HashMap::new(),
+            wipe_total: HashMap::new(),
         }
     }
 }
@@ -221,7 +267,10 @@ impl WebPace {
         let until = Instant::now() + secs;
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.cooldown_until.entry(host.to_string()).or_insert(until);
-        if until > *entry {
+        // `>=` 而非 `>`:全新域首记时 or_insert 返回与 until 相等的既有值,
+        // `>` 会跳过成因写入 —— 成因缺失的裸冷却只能落回频控默认文案(第 172 轮
+        // 修:mark_risk_challenge_for 同款隐患由单测锁死)。
+        if until >= *entry {
             *entry = until;
             guard
                 .cooldown_cause
@@ -234,11 +283,45 @@ impl WebPace {
         self.mark_rate_limited_for(host, Duration::from_secs(rate_cooldown_secs()));
     }
 
+    /// 标记某域进入**风控挑战冷却**(baxia 滑块 punish 实测形态;第 172 轮)。
+    /// 幂等取更晚截止时刻;成因跟随实际生效的标记。语义与频控冷却共用一张表,
+    /// 6004 按成因分流文案 —— 频控靠等,挑战/抹除靠换策略。
+    pub fn mark_risk_challenge_for(&self, host: &str, secs: Duration) {
+        let until = Instant::now() + secs;
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.cooldown_until.entry(host.to_string()).or_insert(until);
+        // `>=`:全新域首记时必须写入成因,否则裸冷却落回频控默认文案(见
+        // mark_rate_limited_for 同款注释)。
+        if until >= *entry {
+            *entry = until;
+            guard
+                .cooldown_cause
+                .insert(host.to_string(), CAUSE_RISK_CHALLENGE);
+        }
+    }
+
+    /// 按环境默认冷却时长标记风控挑战冷却。
+    pub fn mark_risk_challenge(&self, host: &str) {
+        self.mark_risk_challenge_for(host, Duration::from_secs(risk_cooldown_secs()));
+    }
+
+    /// 解除某域的风控挑战冷却(`request_human` 收口人工已完成验证时调用)。
+    /// 只清 `risk_challenge` 成因的条目,不动 rate_limited / site_wipe。
+    pub fn clear_risk_challenge(&self, host: &str) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.cooldown_cause.get(host) == Some(&CAUSE_RISK_CHALLENGE) {
+            guard.cooldown_cause.remove(host);
+            guard.cooldown_until.remove(host);
+        }
+    }
+
     /// 显式导航落地记账(整页抹除连击;2026-10-14 猎聘实测形态,见模块头 3.)。
     ///
-    /// - 落地 `about:blank` → 该域连击 +1;连击 ≥ [`WIPE_STREAK_THRESHOLD`] 触发
-    ///   `cause=site_wipe` 冷却(幂等取更晚;未过阈值不拦截,靠 page_health 证据引导);
-    /// - 落地非 blank → 连击清零(瞬态首击/恢复均走这里);
+    /// - 落地 `about:blank` → 该域连击 +1、**总账 +1**(`wipe_total` 跨实例累计,
+    ///   达 [`wipe_total_threshold`] 后对 laew 身份持久熔断);连击 ≥
+    ///   [`WIPE_STREAK_THRESHOLD`] 触发 `cause=site_wipe` 冷却(幂等取更晚;
+    ///   未过阈值不拦截,靠 page_health 证据引导);
+    /// - 落地非 blank → 连击与总账一并清零(瞬态首击/恢复均走这里);
     /// - 请求 URL 不可解析 host / 落地为空 → 不记账。
     ///
     /// 返回 `Some` 仅当本次落地被计为抹除连击(调用方据此在响应里附 `site_wipe` 段)。
@@ -252,14 +335,14 @@ impl WebPace {
         }
         let host = host_of(requested_url)?;
         if !landed_url.trim().eq_ignore_ascii_case("about:blank") {
-            self.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .wipe_streak
-                .remove(&host);
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.wipe_streak.remove(&host);
+            // 恢复证据:该域能正常落地 → 总账清零(laew 身份不再熔断)。
+            guard.wipe_total.remove(&host);
             return None;
         }
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        *guard.wipe_total.entry(host.clone()).or_insert(0) += 1;
         let streak = guard.wipe_streak.entry(host.clone()).or_insert(0);
         *streak += 1;
         let streak = *streak;
@@ -280,6 +363,22 @@ impl WebPace {
         })
     }
 
+    /// 该域跨实例累计抹除次数(总账;无记录返回 0)。
+    pub fn wipe_total_for(&self, host: &str) -> u32 {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wipe_total
+            .get(host)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 该域是否已达 laew 身份持久熔断(总账 ≥ 阈值)。
+    pub fn wipe_exhausted(&self, host: &str) -> bool {
+        self.wipe_total_for(host) >= wipe_total_threshold()
+    }
+
     /// 冷却成因(`rate_limited` / `site_wipe`);无有效冷却返回 `None`。
     pub fn cooldown_cause_for(&self, host: &str) -> Option<&'static str> {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -291,10 +390,16 @@ impl WebPace {
         guard.cooldown_cause.get(host).copied()
     }
 
-    /// 清空全部冷却与抹除连击(close(page_id="all") 回收浏览器时调用)。
+    /// 清空冷却与抹除连击(close(page_id="all") 回收浏览器时调用)。
     ///
-    /// 全新 profile = 全新会话身份(新 cookie/新指纹),原会话的频控/抹除标记
+    /// 全新 profile = 全新会话身份(新 cookie/新指纹),原会话的频控/抹除**连击**
     /// 不再适用;不清 `last_nav`(最小间隔节奏与身份无关)。
+    ///
+    /// **不清 `wipe_total` 总账**(2026-10-14 第二轮):指纹级打标站点(猎聘实测)
+    /// 对 CDP 拉起环境本身打标,close(all)+全新 profile 照样被抹 —— 总账若随
+    /// clear_all 清零,LLM 每 close 一次就重置熔断,形成「拉起 Chrome → 被抹 →
+    /// close → 再拉起」的风暴(实测 9 分钟 8 台)。总账只在「该域落地非 blank」
+    /// (`note_navigation_outcome` 恢复路径)时清零。
     pub fn clear_all(&self) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.cooldown_until.clear();
@@ -330,34 +435,71 @@ impl WebPace {
 ///
 /// 返回 `Some` = 拦截信封(6004,动作不执行);`None` = 放行(透明等待已在内部完成,
 /// 导航账本已登记)。`force=true` 逃生口跳过全部节奏约束。
+///
+/// `laew_identity` = 本次导航的目标浏览器是否是 **laew 自起身份**(launch 模式
+/// 全新实例 / auto_relaunch 调试实例)。指纹级打标站点(猎聘实测)对 CDP 拉起
+/// 环境本身打标,`false`(接管用户日常 Chrome,真实指纹)通常不受此熔断影响。
+///
 /// 拦截文案按冷却成因分流:频控靠等(冷却后低频重试),抹除靠换身份(全新 profile
 /// / 接管日常浏览器)——建议错位会把 LLM 引向无效等待(猎聘实测硬闯 25+ 次的教训)。
-pub async fn guard_navigation(url: &str, force: bool) -> Option<crate::error::Result<String>> {
+/// **持久熔断档**(总账 ≥ 阈值且 laew 身份):不再建议「close(all) 换全新
+/// profile」—— 那正是 Chrome 拉起风暴的源头;只剩接管用户日常浏览器或人工。
+pub async fn guard_navigation(
+    url: &str,
+    force: bool,
+    laew_identity: bool,
+) -> Option<crate::error::Result<String>> {
     if !enabled() || force {
         return None;
     }
     let host = host_of(url)?;
+    // 持久熔断(2026-10-14 第二轮):总账达阈值且目标是 laew 自起身份 ——
+    // 换全新 profile/新实例对该域已被实测无效,不再放行(close(all) 逃逸无效)。
+    if laew_identity && WebPace::global().wipe_exhausted(&host) {
+        return persistent_wipe_envelope(
+            &host,
+            WebPace::global().wipe_total_for(&host),
+            wipe_total_threshold(),
+        )
+        .map(Ok);
+    }
     match WebPace::global().decide(&host) {
         PaceDecision::Block { remaining } => {
             let secs = remaining.as_secs().max(1);
             let cause = WebPace::global()
                 .cooldown_cause_for(&host)
                 .unwrap_or(CAUSE_RATE_LIMITED);
-            let (cooldown, advice, msg) = if cause == CAUSE_SITE_WIPE {
-                (
+            let (cooldown, advice, msg) = match cause {
+                CAUSE_SITE_WIPE => (
                     wipe_cooldown_secs(),
-                    "站点整页抹除(反爬,会话/指纹级打标):本会话内继续导航/重试均无效。\
-处置:① close(page_id=\"all\") 回收浏览器换全新 profile(冷却自动解除)后重新 open;\
-② open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态);\
-③ 人工在场可 request_human 协助;已采集数据先落盘",
+                    "站点整页抹除(反爬,会话/指纹级打标)。**先别急着 close(all) 重开** —— \
+每试一次多弹一台 Chrome 窗口,若该域是指纹级打标(对 CDP 拉起环境本身打标)换新 profile 照样被抹。\
+可先试 1 次 close(page_id=\"all\") 回收浏览器换全新 profile(冷却自动解除)后重新 open;\
+若再被抹除即判定指纹级打标,改用 open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态),\
+或 request_human 人工协助;已采集数据先落盘",
                     format!(
-                        "站点整页抹除冷却中({host}):剩余 {secs}s;同会话重试无效,\
-建议 close(page_id=\"all\") 回收浏览器(自动解除冷却)或 reuse_existing 接管日常浏览器;\
+                        "站点整页抹除冷却中({host}):剩余 {secs}s;建议 close(page_id=\"all\") 回收浏览器换全新 profile 试 1 次(冷却自动解除);\
+若再被抹除则换 open(reuse_existing=true) 接管日常浏览器或 request_human(指纹级打标时换新实例无效);\
 确需原会话立即重试可 params.force=true",
                     ),
-                )
-            } else {
-                (
+                ),
+                // 第 172 轮:人工验证挑战/风控打标(baxia 滑块 punish 实测)——
+                // 冷却期内对该域继续搜索/导航只会加剧风控(实测升级为会话级,
+                // 连首页都被打标);人工完成验证后冷却已自动解除,走不到这里。
+                CAUSE_RISK_CHALLENGE => (
+                    risk_cooldown_secs(),
+                    "站点人工验证挑战/风控打标(滑块 punish):冷却期内对该域继续搜索/导航\
+只会加剧风控(实测升级后会话级打标,连首页都被拦截)。处置:① 等待冷却后低频重试;\
+② request_human 让人工在浏览器完成验证(HITL 弹窗可切「🎮 侵入式」用触控板拖滑块),\
+完成后冷却自动解除;③ 已采集数据先落盘;④ 换身份:close(page_id=\"all\") 回收浏览器\
+(冷却自动解除)或 open(reuse_existing=true) 接管日常浏览器",
+                    format!(
+                        "站点风控挑战冷却中({host}):剩余 {secs}s;冷却期内不要对同域继续搜索/导航(会加剧风控);\
+可 request_human 让人工完成验证(收口自动解除冷却)或等冷却后低频重试;\
+确需立即导航可 params.force=true",
+                    ),
+                ),
+                _ => (
                     rate_cooldown_secs(),
                     "站点频控/限流:不要对该站点继续连续导航/搜索(高频只会延长封锁);\
 先做本地整理或其它页面/站点工作,冷却后低频重试;已采集数据先落盘。\
@@ -366,7 +508,7 @@ pub async fn guard_navigation(url: &str, force: bool) -> Option<crate::error::Re
                         "站点频控冷却中({host}):剩余 {secs}s 后放行;冷却期内不要对同站点连续导航/搜索;\
 确需立即导航可 params.force=true",
                     ),
-                )
+                ),
             };
             let data = json!({
                 "host": host,
@@ -396,6 +538,36 @@ pub async fn guard_navigation(url: &str, force: bool) -> Option<crate::error::Re
             None
         }
     }
+}
+
+/// 持久熔断信封(纯函数,便于单测):`total >= threshold` 才构造,否则 `None`。
+fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<String> {
+    if total < threshold {
+        return None;
+    }
+    let msg = format!(
+        "站点整页抹除持久熔断({host}):已对 laew 拉起环境累计抹除 {total} 次(≥{threshold}),\
+判定为指纹级打标 —— close(all) 换全新 profile/调试实例重试均被实测无效且每试一次多弹一台 Chrome。\
+只剩两条出路:① open(reuse_existing=true) 接管**用户日常 Chrome**(真实指纹+登录态,不受此熔断);\
+② request_human 如实交还现场由人工处理;已采集数据先落盘。确需硬闯可 params.force=true"
+    );
+    let data = json!({
+        "host": host,
+        "cause": CAUSE_SITE_WIPE,
+        "persistent": true,
+        "wipe_total": total,
+        "wipe_total_threshold": threshold,
+        "advice": "该域已对 laew 拉起的浏览器环境(含全新 profile 与 auto_relaunch 调试实例)做指纹级打标,\
+继续重试只会反复弹 Chrome 窗口并再次被抹除。处置:① open(reuse_existing=true) 接管用户日常 Chrome(真实指纹+登录态);\
+② request_human 人工协助;已采集数据先落盘。确需立即导航可 params.force=true",
+        "force_hint": "确认必须立即导航时,可在 params 加 force=true 跳过节奏闸强制执行",
+    });
+    serde_json::to_string(&json!({
+        "code": CODE_SITE_PACE_COOLDOWN,
+        "message": msg,
+        "data": data,
+    }))
+    .ok()
 }
 
 #[cfg(test)]
@@ -645,19 +817,95 @@ mod tests {
     }
 
     #[test]
-    fn 整页抹除_clear_all清空冷却与连击_保留间隔账本() {
+    fn 整页抹除_clear_all清冷却与连击_但总账保留() {
         let p = pace();
         p.note_nav_for("liepin.com");
         p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
         p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
         assert!(p.cooldown_remaining_for("liepin.com").is_some());
-        // close(all) 回收浏览器:全新 profile = 全新身份
+        assert_eq!(p.wipe_total_for("liepin.com"), 2);
+        // close(all) 回收浏览器:冷却/连击清零(新身份的当次 blank 不再直接熔断),
+        // 但跨实例总账保留 —— 根治「close(all) 逃逸熔断再拉一台 Chrome」的风暴。
         p.clear_all();
         assert_eq!(p.cooldown_remaining_for("liepin.com"), None);
         assert_eq!(p.cooldown_cause_for("liepin.com"), None);
-        // 连击同样清零:新身份单次 blank 不再直接熔断
+        assert_eq!(p.wipe_total_for("liepin.com"), 2, "总账不被 clear_all 清除");
         let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
         assert_eq!(o.map(|x| (x.streak, x.cooldown_triggered)), Some((1, false)));
+        assert_eq!(p.wipe_total_for("liepin.com"), 3);
+    }
+
+    #[test]
+    fn 整页抹除_总账达阈值后laew身份持久熔断_用户身份不受影响() {
+        let p = pace();
+        for _ in 0..wipe_total_threshold() {
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        }
+        assert!(p.wipe_exhausted("liepin.com"));
+        // 持久熔断信封:laew 身份被拦(6004,cause=site_wipe,persistent=true)
+        let env = persistent_wipe_envelope(
+            "liepin.com",
+            p.wipe_total_for("liepin.com"),
+            wipe_total_threshold(),
+        )
+        .expect("达阈值应构造持久熔断信封");
+        let v: serde_json::Value = serde_json::from_str(&env).unwrap();
+        assert_eq!(v["code"], CODE_SITE_PACE_COOLDOWN);
+        assert_eq!(v["data"]["cause"], CAUSE_SITE_WIPE);
+        assert_eq!(v["data"]["persistent"], true);
+        // 未达阈值不构造信封
+        assert!(persistent_wipe_envelope("liepin.com", 1, wipe_total_threshold()).is_none());
+    }
+
+    #[test]
+    fn 整页抹除_落地正常后总账清零恢复() {
+        let p = pace();
+        for _ in 0..wipe_total_threshold() {
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        }
+        assert!(p.wipe_exhausted("liepin.com"));
+        // 恢复证据(如接管用户日常 Chrome 后成功落地):总账清零
+        assert_eq!(
+            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/"),
+            None
+        );
+        assert!(!p.wipe_exhausted("liepin.com"));
+        assert_eq!(p.wipe_total_for("liepin.com"), 0);
+    }
+
+    #[test]
+    fn 整页抹除_总账跨不同浏览器实例累计() {
+        let p = pace();
+        // 实例 1 被抹 2 次 → close(all) → 实例 2 再被抹:总账连续累计
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.clear_all();
+        p.note_navigation_outcome("https://www.liepin.com/zhaopin/", "about:blank");
+        assert_eq!(p.wipe_total_for("liepin.com"), 3);
+        assert!(p.wipe_exhausted("liepin.com"));
+        // 其它域的总账互不影响
+        assert_eq!(p.wipe_total_for("jd.com"), 0);
+    }
+
+    #[test]
+    fn 整页抹除_总账阈值env解析与回退() {
+        let _g = env_lock();
+        unsafe { std::env::remove_var("LAEW_WEB_WIPE_TOTAL_THRESHOLD") };
+        assert_eq!(wipe_total_threshold(), WIPE_TOTAL_THRESHOLD_DEFAULT);
+        unsafe { std::env::set_var("LAEW_WEB_WIPE_TOTAL_THRESHOLD", "5") };
+        assert_eq!(wipe_total_threshold(), 5);
+        unsafe { std::env::set_var("LAEW_WEB_WIPE_TOTAL_THRESHOLD", "0") };
+        assert_eq!(wipe_total_threshold(), WIPE_TOTAL_THRESHOLD_DEFAULT, "0 回退默认");
+        unsafe { std::env::set_var("LAEW_WEB_WIPE_TOTAL_THRESHOLD", "bad") };
+        assert_eq!(wipe_total_threshold(), WIPE_TOTAL_THRESHOLD_DEFAULT, "非法回退默认");
+        unsafe { std::env::remove_var("LAEW_WEB_WIPE_TOTAL_THRESHOLD") };
+    }
+
+    /// 环境变量类测试用互斥锁串行(对齐 browser_reuse.rs 既有模式):
+    /// 多个测试并行跑时 set_var/remove_var 互相踩,全量 cargo test 偶发失败。
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -669,5 +917,76 @@ mod tests {
         // 频控横幅标记时长更长(240s > 90s)→ 成因随实际生效的标记切换
         p.mark_rate_limited_for("liepin.com", Duration::from_secs(240));
         assert_eq!(p.cooldown_cause_for("liepin.com"), Some(CAUSE_RATE_LIMITED));
+    }
+
+    // 第 172 轮:风控挑战(baxia 滑块 punish)域级冷却 —— 天猫实测:挑战后立刻
+    // 重试搜索会把风控升级为会话级(连首页都被打标),需要工具层止动。
+    #[test]
+    fn 风控挑战_标记后同域导航被拦_成因正确() {
+        let p = pace();
+        p.mark_risk_challenge_for("taobao.com", Duration::from_secs(300));
+        assert_eq!(p.cooldown_cause_for("taobao.com"), Some(CAUSE_RISK_CHALLENGE));
+        assert!(
+            matches!(p.decide("taobao.com"), PaceDecision::Block { .. }),
+            "风险冷却期内同域导航应被拦"
+        );
+        assert!(
+            matches!(p.decide("jd.com"), PaceDecision::Allow),
+            "冷却按注册域隔离,不连坐其它站点"
+        );
+    }
+
+    #[test]
+    fn 风控挑战_解除只清risk成因_不动频控与抹除() {
+        let p = pace();
+        // 频控成因:解除 risk 不得动它
+        p.mark_rate_limited_for("jd.com", Duration::from_secs(240));
+        p.clear_risk_challenge("jd.com");
+        assert_eq!(p.cooldown_cause_for("jd.com"), Some(CAUSE_RATE_LIMITED));
+        // risk 成因:解除后立即放行
+        p.mark_risk_challenge_for("taobao.com", Duration::from_secs(300));
+        p.clear_risk_challenge("taobao.com");
+        assert_eq!(p.cooldown_cause_for("taobao.com"), None);
+        assert!(
+            matches!(p.decide("taobao.com"), PaceDecision::Allow),
+            "解除后同域导航立即恢复"
+        );
+    }
+
+    #[test]
+    fn 风控挑战_晚到的频控标记覆盖risk成因() {
+        let p = pace();
+        p.mark_risk_challenge_for("taobao.com", Duration::from_secs(300));
+        // 更晚截止的频控标记(240s < 300s 不会覆盖;用更长的显式时长模拟)
+        p.mark_rate_limited_for("taobao.com", Duration::from_secs(600));
+        assert_eq!(p.cooldown_cause_for("taobao.com"), Some(CAUSE_RATE_LIMITED));
+        // 反向:risk 标记比既有频控短也不覆盖
+        let q = pace();
+        q.mark_rate_limited_for("taobao.com", Duration::from_secs(600));
+        q.mark_risk_challenge_for("taobao.com", Duration::from_secs(300));
+        assert_eq!(q.cooldown_cause_for("taobao.com"), Some(CAUSE_RATE_LIMITED));
+    }
+
+    #[test]
+    fn 风控挑战_clear_all同样解除() {
+        // close(all) 换全新身份 = 风险标记不再适用(与频控/抹除连击同语义)
+        let p = pace();
+        p.mark_risk_challenge_for("taobao.com", Duration::from_secs(300));
+        p.clear_all();
+        assert_eq!(p.cooldown_cause_for("taobao.com"), None);
+    }
+
+    #[test]
+    fn 风控挑战_冷却时长环境变量可配() {
+        let _g = env_lock();
+        unsafe { std::env::remove_var("LAEW_WEB_RISK_COOLDOWN_SECS") };
+        assert_eq!(risk_cooldown_secs(), 300, "缺省 300s");
+        unsafe { std::env::set_var("LAEW_WEB_RISK_COOLDOWN_SECS", "60") };
+        assert_eq!(risk_cooldown_secs(), 60);
+        unsafe { std::env::set_var("LAEW_WEB_RISK_COOLDOWN_SECS", "0") };
+        assert_eq!(risk_cooldown_secs(), 300, "0 回退默认");
+        unsafe { std::env::set_var("LAEW_WEB_RISK_COOLDOWN_SECS", "bad") };
+        assert_eq!(risk_cooldown_secs(), 300, "非法回退默认");
+        unsafe { std::env::remove_var("LAEW_WEB_RISK_COOLDOWN_SECS") };
     }
 }

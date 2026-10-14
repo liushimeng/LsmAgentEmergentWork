@@ -514,17 +514,83 @@ pub(super) fn wipe_evidence_from_events(
 }
 
 /// 整页抹除连击记账 → 响应字段(2026-10-14)。治理状态本体在 `browser_pace`
-/// (连击计数/冷却),这里只把本次结果与处置建议透给 LLM。
+/// (连击计数/冷却/总账),这里只把本次结果与处置建议透给 LLM。
 pub(super) fn site_wipe_field(outcome: Option<crate::agent::browser_pace::WipeOutcome>) -> Option<Value> {
     let o = outcome?;
     Some(json!({
         "streak": o.streak,
         "cooldown_triggered": o.cooldown_triggered,
         "note": "本次导航最终落地 about:blank(整页抹除连击记账):站点侧脚本在页面加载后清空了文档,原会话内重试无效",
-        "advice": "处置:① close(page_id=\"all\") 回收浏览器换全新 profile(冷却自动解除)后重新 open;\
-② open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态);\
-③ 连续多次抹除后同域导航自动冷却(6004);人工在场可 request_human 协助登录",
+        "advice": "处置:可试 1 次 close(page_id=\"all\") 回收浏览器换全新 profile 后重新 open(每试一次多弹一台 Chrome);\
+若再被抹除即是指纹级打标(换新实例无效),改用 open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态)或 request_human;\
+同域累计抹除达到阈值后工具层对该域 laew 身份持久熔断(6004),不再放行重试",
     }))
+}
+
+/// open 导航的浏览器身份判定(2026-10-14 第二轮,纯逻辑部分便于单测):
+/// `true` = laew 自起身份(launch 全新实例 / auto_relaunch 调试实例),
+/// `false` = 接管用户日常 Chrome(真实指纹)。持久熔断只拦 laew 身份。
+async fn open_laew_identity(connect_url: Option<&str>) -> bool {
+    if let Some(c) = connect_url {
+        // 本次显式 connect:看目标端口是否是 laew 登记的 relaunch 实例。
+        // 解析失败按用户身份处理(保守:不误拦)。
+        return c
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
+            .map(crate::agent::browser_reuse::is_laew_relaunch_port)
+            .unwrap_or(false);
+    }
+    if BrowserManager::global().is_connect_mode().await {
+        // 复用既有 connect 实例:只有 laew relaunch 实例才算 laew 身份。
+        return BrowserManager::global().connect_is_laew_relaunch().await;
+    }
+    // launch 模式(全新实例)= laew 身份。
+    true
+}
+
+/// 合并两次抹除记账:延迟复查(late)优先于 open 结算时的当场结果。
+fn merge_wipe_outcome(
+    first: Option<crate::agent::browser_pace::WipeOutcome>,
+    late: Option<crate::agent::browser_pace::WipeOutcome>,
+) -> Option<crate::agent::browser_pace::WipeOutcome> {
+    late.or(first)
+}
+
+/// 延迟抹除复查(2026-10-14 第二轮,猎聘实测 `llaew_20261014_140053.log`):
+/// open/navigate 返回时页面健康(标题/URL 正常),但指纹级打标站点会在**数秒后**
+/// (实测 4~10s)才 `location→about:blank`,open 结算时的 page_health 看不到,
+/// LLM 下一轮读到空白页无结构化信号、瞎猜后 close(all)+重开 → Chrome 拉起风暴。
+/// 该域有抹除史(`wipe_total>0`)时,等 [`WIPE_RECHECK_DELAY`] 复读落地 URL:
+/// 已变 about:blank → 记账并返回证据,调用方据此改写响应。无史站点零延迟零开销。
+const WIPE_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(3500);
+
+/// 返回 `Some((landed_url, late_outcome))` = 命中延迟抹除;`None` = 健康或无史。
+/// `count` = 是否计入熔断账本(launch / laew relaunch 实例=true,用户日常 Chrome=false)。
+pub(super) async fn deferred_wipe_check(
+    page: &chromiumoxide::Page,
+    requested_url: &str,
+    count: bool,
+) -> Option<(String, Option<crate::agent::browser_pace::WipeOutcome>)> {
+    let host = crate::agent::browser_pace::host_of(requested_url)?;
+    if crate::agent::browser_pace::WebPace::global().wipe_total_for(&host) == 0 {
+        return None;
+    }
+    tokio::time::sleep(WIPE_RECHECK_DELAY).await;
+    let landed = page.url().await.ok().flatten().unwrap_or_default();
+    if !landed.trim().eq_ignore_ascii_case("about:blank") {
+        return None;
+    }
+    let outcome = if count {
+        crate::agent::browser_pace::WebPace::global()
+            .note_navigation_outcome(requested_url, &landed)
+    } else {
+        None
+    };
+    tracing::warn!(
+        requested_url,
+        "延迟抹除复查命中:open 返回后页面被站点脚本重定向到 about:blank"
+    );
+    Some((landed, outcome))
 }
 
 /// 第 161 轮:open 响应主文档健康诊断(fail-open;不命中不带字段,零噪声)。
@@ -566,7 +632,9 @@ async fn page_health_field(page_id: &str, final_url: &str, requested_url: &str) 
                 "subresources": ev.subresources,
                 "requested_url": requested_url,
                 "note": "页面已完整加载后被站点侧脚本整体重定向到 about:blank(会话/指纹级反爬整页抹除,猎聘实测):主文档/子资源均有响应,非网络故障;原会话内重试无效",
-                "next_action": "不要在原会话继续导航重试。处置:① close(page_id=\"all\") 回收浏览器换全新 profile 后重新 open;② open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态);连续多次抹除后工具层自动冷却(6004);人工在场可 request_human 协助登录",
+                "next_action": "不要在原会话继续导航重试。处置:可试 1 次 close(page_id=\"all\") 回收浏览器换全新 profile 后重新 open(每试一次多弹一台 Chrome);\
+若再被抹除即指纹级打标(换新实例无效),改用 open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态)或 request_human;\
+同域累计抹除达阈值后工具层对该域 laew 身份持久熔断(6004);人工在场可 request_human 协助登录",
             }));
         }
     }
@@ -995,9 +1063,13 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
     // 第 171 轮:站点导航节奏闸 —— 频控冷却中同域导航返 6004(动作不执行,附剩余
     // 秒数与处置建议),间隔不足透明补齐;open/new_window/connect 复用全路径共用
     // 本入口(京东频控实测:命中频控后继续硬闯只会延长封锁,见 browser_pace 模块头)。
+    // 2026-10-14 第二轮:第三参 laew_identity —— 持久熔断(总账 ≥ 阈值)只拦
+    // laew 自起身份(launch 全新实例 / auto_relaunch 调试实例),不拦用户日常
+    // Chrome(真实指纹,指纹级打标站点通常不抹)。
     if let Some(gated) = crate::agent::browser_pace::guard_navigation(
         url,
         args.get("force").and_then(Value::as_bool).unwrap_or(false),
+        open_laew_identity(str_arg(args, "connect_url")).await,
     )
     .await
     {
@@ -1076,14 +1148,29 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                                 .unwrap_or(final_url);
                         }
                     }
-                    // 2026-10-14:整页抹除记账(非 connect;落地含内部重导航后的最终
-                    // 结果)。连续 ≥2 次自动进 site_wipe 冷却(6004),详见 browser_pace。
-                    let wipe_outcome = if !connect_mode {
+                    // 2026-10-14:整页抹除记账(launch 与 laew relaunch 调试实例记账;
+                    // 用户日常 Chrome 不记 —— 落地行为归用户,防误伤)。连续 ≥2 次
+                    // 自动进 site_wipe 冷却(6004),详见 browser_pace。
+                    let count_wipes = !connect_mode
+                        || BrowserManager::global().connect_is_laew_relaunch().await;
+                    let mut wipe_outcome = if count_wipes {
                         crate::agent::browser_pace::WebPace::global()
                             .note_navigation_outcome(url, &final_url)
                     } else {
                         None
                     };
+                    // 2026-10-14 第二轮:延迟抹除复查 —— 结算时页面健康、数秒后
+                    // 才被抹除的形态(猎聘实测)。有抹除史的域等 3.5s 复读落地
+                    // URL;当场已落 blank 的不重复复查(避免同一次导航双记账)。
+                    if !final_url.trim().eq_ignore_ascii_case("about:blank") {
+                        if let Some((landed, late)) =
+                            deferred_wipe_check(&page, url, count_wipes).await
+                        {
+                            final_url = landed;
+                            title = page.get_title().await.ok().flatten().unwrap_or_default();
+                            wipe_outcome = merge_wipe_outcome(wipe_outcome, late);
+                        }
+                    }
                     // 第 146 轮:访问台账记账(导航成功后;重复访问警示随响应附带)
                     visit_ledger::record_visit(
                         &pid,
@@ -1211,14 +1298,33 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
             // connect 模式首开的响应 connect_mode 误报 false(实测 9222 有调试
             // Chrome 时单测 open_reuse_existing_returns_3002_or_succeeds 命中)。
             let connected_now = BrowserManager::global().is_connect_mode().await;
-            // 2026-10-14:整页抹除记账(非 connect;new_page 内部已含「首航 blank
-            // 原地重导航一次」,此处记的是最终落地)。连续 ≥2 次自动进冷却(6004)。
-            let wipe_outcome = if !connected_now {
+            // 2026-10-14:整页抹除记账(launch 与 laew relaunch 调试实例记账;用户
+            // 日常 Chrome 不记防误伤;new_page 内部已含「首航 blank 原地重导航
+            // 一次」,此处记的是最终落地)。连续 ≥2 次自动进冷却(6004)。
+            let count_wipes = !connected_now
+                || BrowserManager::global().connect_is_laew_relaunch().await;
+            let mut wipe_outcome = if count_wipes {
                 crate::agent::browser_pace::WebPace::global()
                     .note_navigation_outcome(url, &final_url)
             } else {
                 None
             };
+            // 2026-10-14 第二轮:延迟抹除复查(open 返回后数秒才被抹除的形态,
+            // 猎聘实测)。有抹除史的域等 3.5s 复读落地 URL;命中则改写 final_url
+            // 让下方 page_health 给出 site_wipe 结构化证据,LLM 不必再瞎猜。
+            let mut final_url = final_url;
+            let mut title = title;
+            if !final_url.trim().eq_ignore_ascii_case("about:blank") {
+                if let Some(page) = BrowserManager::global().page(&page_id).await {
+                    if let Some((landed, late)) =
+                        deferred_wipe_check(&page, url, count_wipes).await
+                    {
+                        final_url = landed;
+                        title = String::new();
+                        wipe_outcome = merge_wipe_outcome(wipe_outcome, late);
+                    }
+                }
+            }
             // 第 142 轮:connect 模式(接管外部浏览器)判定,供 guard/overlay 字段分路提示。
             // 第 143 轮:管控状态双字段(读实例真实期望态,理由见 guard_response_fields)。
             let (guard_field, overlay_field) =
@@ -1545,13 +1651,31 @@ async fn run_close(args: Value) -> Result<String> {
         return envelope(1001, "缺少 page_id", json!({}));
     };
     if id == "all" {
+        // 2026-10-14 第二轮:当前 connect 的是 laew 自起的 auto_relaunch 调试
+        // 实例时,close(all) 连同进程一起回收 —— 它是 laew 身份(laew 对自己
+        // 拉起的实例有生杀权,doc 08 红线),只断连会残留空白 Chrome 窗口在用户
+        // 桌面并继续占用调试端口(实测同时残留 2 台)。用户日常 Chrome 仍只断连。
+        let relaunch_pid = if BrowserManager::global().connect_is_laew_relaunch().await {
+            crate::agent::browser_reuse::relaunch_instance_pid()
+        } else {
+            None
+        };
         let n = BrowserManager::global().list_pages().await.len();
         BrowserManager::global().shutdown().await;
+        if let Some(pid) = relaunch_pid {
+            crate::agent::browser_reuse::kill_relaunch_browser(pid);
+        }
         // 2026-10-14:回收浏览器 = 全新 profile(新 cookie/新指纹)= 全新会话身份,
-        // 原会话的频控/整页抹除冷却全部清零,紧随其后的 open 不被自己的熔断卡住
-        // (site_wipe 恢复路径闭环:6004 建议 close(all) → 重开 → 冷却已解除)。
+        // 原会话的频控/抹除**连击与冷却**清零,紧随其后的 open 不被自己的熔断
+        // 卡住;**抹除总账 wipe_total 保留**(clear_all 不清)—— 指纹级打标站点
+        // 换新实例照样被抹,总账若随之清零会形成「拉起 Chrome → 被抹 → close →
+        // 再拉起」的风暴(实测 9 分钟拉起 8 台,见 browser_pace 模块头 4.)。
         crate::agent::browser_pace::WebPace::global().clear_all();
-        return envelope(0, "closed", json!({"page_id": "all", "closed": n}));
+        let mut data = json!({"page_id": "all", "closed": n});
+        if relaunch_pid.is_some() {
+            data["relaunch_instance_killed"] = json!(true);
+        }
+        return envelope(0, "closed", data);
     }
     if id == "background" {
         return match page_activity::close_background_pages().await {

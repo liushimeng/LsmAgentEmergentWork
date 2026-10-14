@@ -472,6 +472,56 @@ pub struct RelaunchOutcome {
     pub child_pid: u32,
 }
 
+/// laew 自起调试实例登记表(进程级;2026-10-14 第二轮)。
+///
+/// auto_relaunch 拉起的调试 Chrome **不是用户日常浏览器** —— 它是 laew 身份
+/// (CDP 拉起 + 复制 profile),指纹级打标站点(猎聘实测)对它的抹除必须计入
+/// `browser_pace` 总账;close(page_id="all") 时也应对它有生杀权(doc 08 红线:
+/// laew 只对自己拉起的实例有生杀权)。登记:relaunch 成功时写入;
+/// 清除:接管失败回收 / close(all) 回收时。
+#[derive(Debug, Clone, Copy)]
+struct RelaunchInstance {
+    pid: u32,
+    port: u16,
+}
+
+static RELAUNCH_INSTANCE: std::sync::OnceLock<
+    std::sync::Mutex<Option<RelaunchInstance>>,
+> = std::sync::OnceLock::new();
+
+fn relaunch_instance_slot(
+) -> &'static std::sync::Mutex<Option<RelaunchInstance>> {
+    RELAUNCH_INSTANCE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn register_relaunch_instance(pid: u32, port: u16) {
+    if let Ok(mut slot) = relaunch_instance_slot().lock() {
+        *slot = Some(RelaunchInstance { pid, port });
+    }
+}
+
+fn clear_relaunch_instance() {
+    if let Ok(mut slot) = relaunch_instance_slot().lock() {
+        *slot = None;
+    }
+}
+
+/// 该端口号当前是否是 laew 自起的调试实例(connect 记账/生杀权判定)。
+pub fn is_laew_relaunch_port(port: u16) -> bool {
+    relaunch_instance_slot()
+        .lock()
+        .map(|slot| slot.is_some_and(|inst| inst.port == port))
+        .unwrap_or(false)
+}
+
+/// 当前登记实例的 PID(close(all) 回收用);无登记返回 None。
+pub fn relaunch_instance_pid() -> Option<u32> {
+    relaunch_instance_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.map(|inst| inst.pid))
+}
+
 /// auto_relaunch 全流程(第 144 轮起**不退出用户 Chrome**):
 /// 复制登录态(运行中 best-effort)→ 独立调试 profile 另启实例 → 等端口就绪。
 ///
@@ -504,6 +554,8 @@ pub async fn relaunch_and_wait(port: u16) -> Option<RelaunchOutcome> {
     let child_pid = child.id();
     // 3. 等端口就绪。
     let info = wait_for_debug_port(port).await?;
+    // 4. 登记 laew 自起身份(connect 记账/close(all) 生杀权判定,见结构体注释)。
+    register_relaunch_instance(child_pid, info.port);
     Some(RelaunchOutcome {
         info,
         login_state_copied: copied,
@@ -523,7 +575,9 @@ pub fn kill_relaunch_browser(pid: u32) {
     if pid == 0 {
         return;
     }
-    tracing::info!(pid, "回收接管失败的 auto_relaunch 调试 Chrome 实例");
+    tracing::info!(pid, "回收 auto_relaunch 调试 Chrome 实例");
+    // 登记随实例回收一并清除(端口已释放,后续 probe 不再视其为 laew 身份)。
+    clear_relaunch_instance();
     crate::agent::browser_watchdog::terminate_process(pid);
 }
 
@@ -681,6 +735,23 @@ mod tests {
         let (copied, skipped) = copy_profile_secrets(&tmp.path().join("nope"), &tmp.path().join("dst"));
         assert_eq!((copied, skipped), (0, 0));
         assert!(!tmp.path().join("dst").exists(), "源缺失不应创建目标");
+    }
+
+    #[test]
+    fn relaunch_instance_registry_register_query_clear() {
+        // 无登记时查询为空
+        clear_relaunch_instance();
+        assert!(!is_laew_relaunch_port(9222));
+        assert_eq!(relaunch_instance_pid(), None);
+        // 登记后按端口命中、可取 PID
+        register_relaunch_instance(4321, 9222);
+        assert!(is_laew_relaunch_port(9222));
+        assert!(!is_laew_relaunch_port(9333), "其它端口不命中");
+        assert_eq!(relaunch_instance_pid(), Some(4321));
+        // 清除后不再命中
+        clear_relaunch_instance();
+        assert!(!is_laew_relaunch_port(9222));
+        assert_eq!(relaunch_instance_pid(), None);
     }
 
     #[tokio::test]

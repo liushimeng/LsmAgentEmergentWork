@@ -582,6 +582,19 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
     // 焦点租约收口:人工介入结束,键盘焦点归还提问前的前台应用(fail-open)。
     focus_lease.release();
     use crate::agent::human_assist::{AssistVia, HumanAssistOutcome};
+    // 第 172 轮:人工完成验证 = 风控挑战已解除 —— 清掉该域的风险挑战冷却
+    // (baxia punish 命中时 probe/inspect 双通道会标记;不解除的话,人工拖完
+    // 滑块后后续正常导航反而被 6004 拦)。只清 risk_challenge 成因的条目,
+    // 不动 rate_limited / site_wipe。Cancel/Timeout 不清 —— 挑战未解。
+    if matches!(outcome, HumanAssistOutcome::Answered { .. }) {
+        if let Some(page) = crate::agent::browser::BrowserManager::global().page(id).await {
+            if let Some(u) = page.url().await.ok().flatten() {
+                if let Some(host) = crate::agent::browser_pace::host_of(&u) {
+                    crate::agent::browser_pace::WebPace::global().clear_risk_challenge(&host);
+                }
+            }
+        }
+    }
     match outcome {
         HumanAssistOutcome::Answered { text: answer, via } => HitlReport {
             code: 0,

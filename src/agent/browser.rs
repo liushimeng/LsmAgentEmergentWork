@@ -110,6 +110,11 @@ struct BrowserInner {
     /// 进程外 parent-death watchdog（仅 launch 模式）。
     watchdog: Option<std::process::Child>,
     connect_mode: bool,
+    /// connect 模式下对端的调试端口(2026-10-14 第二轮:判定本次接管的是否
+    /// laew 自起的 auto_relaunch 调试实例 —— 它是 laew 身份(CDP 拉起+复制
+    /// profile),指纹级打标站点对它的抹除要计入总账;用户日常 Chrome 不记)。
+    /// launch 模式恒 None。
+    connected_port: Option<u16>,
     pages: HashMap<String, PageEntry>,
     /// launch 模式的一次性 user-data-dir(关闭浏览器时整目录清理)。
     user_data_dir: Option<PathBuf>,
@@ -474,6 +479,7 @@ impl BrowserManager {
                         handler: None,
                         watchdog: None,
                         connect_mode: false,
+                        connected_port: None,
                         pages: HashMap::new(),
                         user_data_dir: None,
                         mode: BrowserMode::Hidden,
@@ -625,6 +631,7 @@ impl BrowserManager {
                 }
                 inner.pages.clear();
                 inner.connect_mode = false;
+                inner.connected_port = None;
             }
         }
         // 第 159 轮:本次调用是否首次拉起浏览器 —— 决定注册完本页后是否清扫
@@ -663,6 +670,12 @@ impl BrowserManager {
                         }
                     }
                 });
+                // 记录对端调试端口(laew 身份判定,见 BrowserInner 字段注释)。
+                // 取最后一个 `:` 后的段(兼容 `[::1]:9222` 形式;rsplit 不会被
+                // scheme 的 `http:` 干扰)。此处已持有 inner 锁,直接赋值。
+                inner.connected_port = connect_url
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok());
                 (browser, task, true)
             } else {
                 let exe = detect_browser().ok_or_else(|| {
@@ -2369,9 +2382,22 @@ impl BrowserManager {
             spawn_watchdog_reaper(child);
         }
         inner.connect_mode = false;
+        inner.connected_port = None;
         inner.mode = BrowserMode::Hidden;
         inner.highlight = true;
         inner.guard = super::browser_overlay::PageGuardConfig::from_env_default();
+    }
+
+    /// 当前 connect 实例是否 laew 自起的 auto_relaunch 调试实例(2026-10-14
+    /// 第二轮)。它是 laew 身份(CDP 拉起 + 复制 profile):指纹级打标站点对它
+    /// 的抹除计入 `browser_pace` 总账,close(page_id="all") 时对它有生杀权;
+    /// 用户日常 Chrome(真实指纹)两个判定均不成立。
+    pub async fn connect_is_laew_relaunch(&self) -> bool {
+        let inner = self.inner.lock().await;
+        inner.connect_mode
+            && inner
+                .connected_port
+                .is_some_and(crate::agent::browser_reuse::is_laew_relaunch_port)
     }
 
     /// 同步清理入口(供 atexit / panic hook / signal handler 调用)。
