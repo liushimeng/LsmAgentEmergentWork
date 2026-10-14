@@ -752,16 +752,19 @@ pub async fn apply_page_guard(
     // 第 169 轮:视觉元素住进 closed Shadow DOM,主文档只剩无文本 host,
     // 探针改为「host 在场(影子树同建)或 fallback light DOM 元素任一在场」。
     // 第 171 轮:两条栏(屏蔽页面状态栏/进度栏)有独立 host,一并计入在场性。
+    // 2026-10-14:两条栏各自独立 host,两个都要探。
     let visual_present = page
         .evaluate(format!(
             "!!(document.getElementById('{}') \
+             || document.getElementById('{}') \
              || document.getElementById('{}') \
              || document.getElementById('{}') \
              || document.getElementById('{}'))",
             guard_ui_host_id(),
             overlay_element_id(),
             shields_element_id(),
-            crate::agent::browser_status::status_host_id()
+            crate::agent::browser_status::status_host_id(),
+            crate::agent::browser_status::progress_host_id()
         ))
         .await
         .ok()

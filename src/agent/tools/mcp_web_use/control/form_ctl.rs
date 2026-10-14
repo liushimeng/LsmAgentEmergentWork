@@ -7,6 +7,9 @@ use super::*;
 pub(super) async fn act_select_option(id: &str, p: &Value) -> std::result::Result<Value, String> {
     let Some(sel) = str_arg(p, "selector") else { return Err("缺少 selector".into()); };
     let page = ensure_page(id).await?;
+    // 2026-10-14:与 select_dropdown 同款 —— 渲染依赖型动作入口先自动置前,
+    // 后台 tab 渲染节流会让下拉面板/自定义控件不渲染(见 page_activity 注释)。
+    let auto_fg = super::page_activity::auto_foreground_if_backgrounded(id).await;
 
     // 第 158 轮:自定义控件回退 —— selector 指向的不是原生 <select> 时,自动走文本匹配路径。
     // 检测方式:元素不存在 el.options 即为自定义控件(Ant Design / Element UI / 自研组件库)。
@@ -37,11 +40,17 @@ pub(super) async fn act_select_option(id: &str, p: &Value) -> std::result::Resul
         let result: Value = eval_js_string(&page, &js).await?;
         let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
         if !ok {
+            let lead = if auto_fg.unwrap_or(false) {
+                "已自动置前后仍未命中;"
+            } else {
+                "若页面在后台请先 control(bring_to_front)(后台 tab 渲染被节流);"
+            };
             return Err(format!(
-                "select_option: 在「{sel}」范围内未找到文本匹配「{t}」的可见叶子节点"
+                "select_option: 在「{sel}」范围内未找到文本匹配「{t}」的可见叶子节点；{lead}\
+                 或确认控件面板已展开、选项文本一致"
             ));
         }
-        return Ok(json!({"selected": ok, "selector": sel, "mode": "custom_fallback", "text": t}));
+        return Ok(json!({"selected": ok, "selector": sel, "mode": "custom_fallback", "text": t, "auto_foreground": auto_fg.unwrap_or(false)}));
     }
 
     // 四种选择方式(value/values/text/index)归一化为 JS 字面量(第 76 轮重写)。
@@ -73,7 +82,7 @@ pub(super) async fn act_select_option(id: &str, p: &Value) -> std::result::Resul
             txt = js_str(t),
         );
         let ok = eval_js_string(&page, &js).await?;
-        return Ok(json!({"selected": ok, "selector": sel, "mode": "text"}));
+        return Ok(json!({"selected": ok, "selector": sel, "mode": "text", "auto_foreground": auto_fg.unwrap_or(false)}));
     } else if let Some(i) = p.get("index").and_then(Value::as_i64) {
         // 索引选择:在 JS 端直接设 selectedIndex
         let js = format!(
@@ -89,7 +98,7 @@ pub(super) async fn act_select_option(id: &str, p: &Value) -> std::result::Resul
             i = i,
         );
         let ok = eval_js_string(&page, &js).await?;
-        return Ok(json!({"selected": ok, "selector": sel, "mode": "index", "index": i}));
+        return Ok(json!({"selected": ok, "selector": sel, "mode": "index", "index": i, "auto_foreground": auto_fg.unwrap_or(false)}));
     } else {
         return Err("缺 value/values/text/index 之一".into());
     };
@@ -104,7 +113,7 @@ pub(super) async fn act_select_option(id: &str, p: &Value) -> std::result::Resul
         sel = js_str(sel), v = value_js
     );
     let ok = eval_js_string(&page, &js).await?;
-    Ok(json!({"selected": ok, "selector": sel, "mode": "value"}))
+    Ok(json!({"selected": ok, "selector": sel, "mode": "value", "auto_foreground": auto_fg.unwrap_or(false)}))
 }
 
 // =================== 第 158 轮:自定义下拉/级联选择器(select_dropdown) ===================
@@ -327,6 +336,10 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
         return Err("缺少 option_text".into());
     };
     let page = ensure_page(id).await?;
+    // 2026-10-14 闲鱼实测:后台 tab 渲染被节流 → 下拉面板不渲染 → 可见性探测
+    // 必然 0 命中。渲染依赖型动作入口先自动置前(与 screenshot 的 focus 逃生口
+    // 同语义,只是这里缺省就做,不再要求调用方记得传 focus=true)。
+    let auto_fg = super::page_activity::auto_foreground_if_backgrounded(id).await;
     let trigger_text = str_arg(p, "trigger_text");
     let cascader_text = str_arg(p, "cascader_text");
     let scope_sel = str_arg(p, "selector");
@@ -398,9 +411,22 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
                 result.get("hint").and_then(Value::as_str).unwrap_or("?")
             );
             if attempt == 2 {
+                // 归因分流(2026-10-14):后台渲染节流是本类失败的首要嫌疑,别再让
+                // 「面板可能已收合/选项文本不一致」把 Agent 带偏。
+                let bg_lead = match auto_fg {
+                    Some(true) => "已自动置前后仍未命中(若仍反复失败,先确认下拉面板真的展开了)",
+                    Some(false) => "",
+                    None => "",
+                };
+                let bg_lead = if bg_lead.is_empty() {
+                    String::new()
+                } else {
+                    format!("{bg_lead}；")
+                };
                 return Err(format!(
-                    "select_dropdown: 选项「{option_text}」未找到可见元素（scope={scope_sel:?}，{last_diag}）；\
-                     处置:面板可能已收合(组件库常保留 visibility:hidden 的挂载副本)或选项文本不一致——\
+                    "select_dropdown: 选项「{option_text}」未找到可见元素（scope={scope_sel:?}，{last_diag}）；{bg_lead}\
+                     处置:①先 control(bring_to_front) 确认页面在前台(后台 tab 渲染被节流,下拉面板不渲染);\
+                     ②面板可能已收合(组件库常保留 visibility:hidden 的挂载副本)或选项文本不一致——\
                      先 inspect(info=elements, selector=<面板容器>) 确认选项真实文本与面板状态,或改用 eval_js 直接点击"
                 ));
             }
@@ -501,6 +527,9 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
         "confirm_text": confirm_text,
         "trigger_after": trigger_after,
         "value_after": value_after,
+        // 2026-10-14:入口自动置前对账(true=本次动作前页面在后台,已自动置前;
+        // 后台 tab 渲染被节流会让下拉面板不渲染,这是本类失败的首要嫌疑)。
+        "auto_foreground": auto_fg.unwrap_or(false),
         "applied_hint": "selected 为事实判定:触发器已回显选中值(trigger_after.found=false)、面板/容器文本回显了选项原文、或已点确认按钮,任一成立即 true;selected=false 说明筛选**未生效**——不要对同一选项重复盲点(toggle 会取消选中),改换排序/级联第二级,或先 inspect(elements) 看面板是否还开着",
         "mode": "custom_dropdown",
     }))

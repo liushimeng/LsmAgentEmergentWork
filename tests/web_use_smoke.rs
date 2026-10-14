@@ -844,6 +844,29 @@ async fn stealth_selfcheck_smoke() {
     assert_eq!(sp["progress"], json!(true), "屏蔽页面进度栏应在场:{sprobe}");
     assert_eq!(sp["status_display"], json!(""), "状态栏应可见:{sprobe}");
     assert_eq!(sp["progress_display"], json!(""), "进度栏应可见:{sprobe}");
+    // 2026-10-14 Windows 1080p 实测:两条栏必须**在视口内可见**且各自
+    // `position:fixed` 角落锚定(不再共用全屏 inset:0 宿主 —— 页面 transform 会
+    // 劫持 fixed 包含块导致「显示不出来」)。
+    assert!(sp["viewport"]["w"].as_i64().unwrap_or(0) > 0, "应报 viewport:{sprobe}");
+    for g in sp["geom"].as_array().cloned().unwrap_or_default() {
+        if g.is_null() {
+            continue;
+        }
+        assert_eq!(g["in_view"], json!(true), "两条栏都必须在视口内可见:{sprobe}");
+        // 定位在 host 上(每条栏独立 position:fixed 角落锚定),内层 bar 是普通块
+        assert_eq!(
+            g["host_position"], json!("fixed"),
+            "两条栏的 host 须 position:fixed 角落锚定(不再共用全屏 inset:0 宿主):{sprobe}"
+        );
+        assert_eq!(g["computed"]["display"], json!("block"), "两条栏不得被 display:none:{sprobe}");
+        assert!(
+            g["w"].as_i64().unwrap_or(0) > 0 && g["h"].as_i64().unwrap_or(0) > 0,
+            "两条栏包围盒不得为零(行高塌陷回归锁):{sprobe}"
+        );
+    }
+    // 独立 host 在场(REV 3)
+    assert_eq!(sp["host"], json!(true), "状态栏独立 host 应在场:{sprobe}");
+    assert_eq!(sp["host_progress"], json!(true), "进度栏独立 host 应在场:{sprobe}");
     // 动作标签已推到进度栏(本用例刚跑完 open → control eval_js 两次动作)
     assert!(
         sp["action"].as_str().unwrap_or("").contains("eval_js"),
@@ -1337,6 +1360,84 @@ async fn mcp_web_use_site_wipe_governance_smoke() {
     assert_eq!(
         v["data"]["site_wipe"]["streak"], 1,
         "新身份连击应重新计数: {out}"
+    );
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}
+
+/// 2026-10-14 闲鱼实测:同一商品页被点击/自愈点击重复打开 7~8 次,单任务残留
+/// 12 个标签页(`adopt_spawned_pages` 逐个收编成独立 page_id,响应只回第一个,
+/// Agent 不知道有堆积)。本用例验证:
+/// ① 同 URL 派生页被**去重关闭**(响应 `deduped_pages`),不新增 page_id;
+/// ② 不同 URL 派生页照常收编(合法双开不误杀);
+/// ③ `spawned_page_ids` 全量回报(不再是只回第一个)。
+#[tokio::test]
+#[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
+async fn mcp_web_use_spawned_page_dedup_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let url = spawn_html_server(
+        "<html><head><title>dedup</title></head><body>dedup base</body></html>",
+    )
+    .await;
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "open 基页失败: {out}");
+    let page_id = v["data"]["page_id"].as_str().unwrap_or_default().to_string();
+
+    // ① 同 URL 派生 → 去重关闭(不新增 page_id)
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "eval_js",
+            "params": {"expression": format!("window.open({}); 'opened'", serde_json::to_string(&url).unwrap())}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "eval_js 开页失败: {out}");
+    let deduped = v["data"]["deduped_pages"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !deduped.is_empty(),
+        "同 URL 派生页应被去重关闭并回报 deduped_pages: {out}"
+    );
+    assert!(
+        v["data"]["spawned_page_ids"].is_null(),
+        "去重后不应再收编为 spawned_page_ids: {out}"
+    );
+
+    // ② 不同 URL 派生 → 照常收编(合法双开不误杀)
+    let other = spawn_html_server(
+        "<html><head><title>other</title></head><body>other page</body></html>",
+    )
+    .await;
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "eval_js",
+            "params": {"expression": format!("window.open({}); 'opened'", serde_json::to_string(&other).unwrap())}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "eval_js 开异页失败: {out}");
+    let ids = v["data"]["spawned_page_ids"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !ids.is_empty(),
+        "不同 URL 派生页应被正常收编: {out}"
+    );
+    // ③ 全量回报:spawned_page_id 与数组首元素一致
+    assert_eq!(
+        v["data"]["spawned_page_id"].as_str().unwrap_or_default(),
+        ids.first().and_then(|x| x.as_str()).unwrap_or_default(),
+        "spawned_page_id 应与 spawned_page_ids[0] 一致: {out}"
     );
 
     let _ = McpWebUseTool

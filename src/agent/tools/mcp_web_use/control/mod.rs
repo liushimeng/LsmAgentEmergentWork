@@ -430,17 +430,31 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     // 名单按「动作可能触发浏览器开新 tab/window」保守圈定:点击(链接/target=_blank)、
     // 键盘(Enter 提交表单跳转)、导航类、select/upload(表单提交)、dispatch_event(自定义事件);
     // eval_js 按表达式是否可变更动态判定(见 action_may_spawn_page 注释)。
-    let spawned = if action_may_spawn_page(&action, &params) {
-        crate::agent::browser::BrowserManager::global().adopt_spawned_pages().await
+    // 2026-10-14:收编走扩展版(同 URL 去重 + Tab 上限),并把**全量**结果透出 ——
+    // 旧实现只回 `spawned.first()` 一个 id,Agent 不知道同页被重复打开了多少个
+    // (闲鱼实测同一商品页被开 7~8 次、单任务残留 12 个 tab)。
+    let adopted = if action_may_spawn_page(&action, &params) {
+        crate::agent::browser::BrowserManager::global()
+            .adopt_spawned_pages_ex()
+            .await
     } else {
-        Vec::new()
+        crate::agent::browser::AdoptOutcome::default()
     };
+    let spawned = adopted.adopted.clone();
     // 派生新标签页通常会抢走前台:有派生且闸门未附标注时,探测本页是否已转后台
     // (仍前台/探测失败/开关关闭均返回 None 零噪声),让 Agent 当轮即知
     // 「原页面转入后台,后续操作先 bring_to_front」。
+    // 2026-10-14:收编后**焦点归还原工作页** —— 新 tab 抢前台把工作页挤到后台,
+    // 叠加 Chrome 后台渲染节流,会让 select_dropdown 这类依赖渲染的下拉面板
+    // 不渲染而必然失败(负反馈循环)。fail-open:归还失败不影响动作结果。
     let mut bg_note = background_note;
-    if !spawned.is_empty() && bg_note.is_none() {
-        bg_note = super::page_activity::note_if_backgrounded(id).await;
+    if !spawned.is_empty() {
+        let _ = crate::agent::browser::BrowserManager::global()
+            .bring_page_to_front(id)
+            .await;
+        if bg_note.is_none() {
+            bg_note = super::page_activity::note_if_backgrounded(id).await;
+        }
     }
     // 第 147 轮:推送式自动阻断感知 —— 输入类/wait/导航类动作收尾后探测人工验证
     // 挑战(图片选择/语义题等关键词扫不出的形态,见 blocker_probe),命中才把
@@ -458,11 +472,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     }
     match result {
         Ok(mut data) => {
-            if let Some(new_id) = spawned.first() {
-                if let Value::Object(ref mut m) = data {
-                    m.insert("spawned_page_id".into(), Value::String(new_id.clone()));
-                }
-            }
+            attach_spawn_report(&mut data, &adopted);
             if let Some(note) = bg_note {
                 data["page_background"] = note;
             }
@@ -470,9 +480,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         }
         Err(e) => {
             let mut data = json!({});
-            if let Some(new_id) = spawned.first() {
-                data["spawned_page_id"] = json!(new_id);
-            }
+            attach_spawn_report(&mut data, &adopted);
             // 失败路径同样附后台标注:动作失败 + 页面在后台是「为何失败」的直接诊断。
             if let Some(note) = bg_note {
                 data["page_background"] = note;
@@ -490,6 +498,49 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
 }
 
 // =================== control_action 实现(逐行平移自 tools/browser.rs) ===================
+
+/// 派生/去重/丢弃标签页的全量对账(2026-10-14)。
+///
+/// 旧实现只回 `spawned.first()` 一个 `spawned_page_id`,Agent 看不到堆积 ——
+/// 闲鱼实测同一商品页被重复打开 7~8 次、单任务残留 12 个 tab,Agent 一直不知道。
+/// 现在回:①`spawned_page_id`(兼容旧字段,第一个);②`spawned_page_ids` 全量;
+/// ③`deduped_pages` 与注册表内同 URL 被直接关闭的重复页;④`dropped_pages`
+/// 超 `LAEW_WEB_MAX_TABS` 被丢弃的;⑤多于 1 个派生时附收口提示。
+fn attach_spawn_report(data: &mut Value, adopted: &crate::agent::browser::AdoptOutcome) {
+    let Some(obj) = data.as_object_mut() else { return };
+    if !adopted.adopted.is_empty() {
+        obj.insert(
+            "spawned_page_id".into(),
+            Value::String(adopted.adopted[0].clone()),
+        );
+        obj.insert("spawned_page_ids".into(), json!(adopted.adopted));
+        obj.insert("spawned_count".into(), json!(adopted.adopted.len()));
+        if adopted.adopted.len() > 1 {
+            obj.insert(
+                "spawned_hint".into(),
+                json!(format!(
+                    "本次动作派生了 {} 个新标签页,疑似重复打开同一页;\
+                     建议 close(page_id=\"others\") 收口,只保留工作页",
+                    adopted.adopted.len()
+                )),
+            );
+        }
+    }
+    if !adopted.deduped.is_empty() {
+        obj.insert("deduped_pages".into(), json!(adopted.deduped));
+        obj.insert(
+            "deduped_hint".into(),
+            json!("检测到与已打开页面同 URL 的重复标签页,已自动关闭(同页不去重分页参数,?page=1 与 ?page=2 视为不同页)"),
+        );
+    }
+    if !adopted.dropped.is_empty() {
+        obj.insert("dropped_pages".into(), json!(adopted.dropped));
+        obj.insert(
+            "dropped_hint".into(),
+            json!("已达到 LAEW_WEB_MAX_TABS 上限,超出的新标签页被丢弃关闭;需要更多并行页请调大该环境变量"),
+        );
+    }
+}
 
 /// 该 control_action 是否可能派生新标签页/窗口(第 140 轮;第 152 轮收口)。
 ///

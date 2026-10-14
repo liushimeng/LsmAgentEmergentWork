@@ -455,6 +455,25 @@ pub(super) async fn act_bring_to_front(id: &str) -> std::result::Result<Value, S
     })
 }
 
+/// 渲染依赖型表单动作(`select_dropdown`/`select_option` 等)的**前置自动前台化**
+/// (2026-10-14 闲鱼实测)。
+///
+/// 背景:Chrome 后台 tab 的渲染 / rAF / 懒加载全被节流,下拉面板**根本不渲染**,
+/// 可见性探测必然 0 命中。screenshot/ocr 有 6003 闸 + `params.focus=true` 前台化,
+/// 表单动作此前没有任何前置处置,失败主消息还把人往「面板收合/文本不一致」带。
+/// 实测 `select_dropdown("北京")` 连续 6 次 2002,Agent 烧 8 轮迭代在同一个动作上。
+///
+/// 返回 `Some(true)` = 本次自动前台化了(调用方应回 `auto_foreground:true`)。
+/// 探测失败/页面取不到 fail-open 返回 `None`,不阻断动作。
+pub(super) async fn auto_foreground_if_backgrounded(id: &str) -> Option<bool> {
+    let page = super::ensure_page(id).await.ok()?;
+    let act = probe_foreground(&page).await?;
+    if act.foreground() {
+        return Some(false);
+    }
+    Some(bring_to_front_core(id).await.is_ok())
+}
+
 async fn bring_to_front_core(id: &str) -> std::result::Result<Value, String> {
     crate::agent::browser::BrowserManager::global()
         .bring_page_to_front(id)

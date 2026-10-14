@@ -231,6 +231,12 @@ pub struct PaceState {
     /// `force=true` 逃生口同样返 6004 —— 强制导航不改变站点侧指纹级打标,
     /// 只多弹 Chrome 多吃风控(实测连闯 2 次总账 3→5)。
     forced_nav: HashMap<String, u32>,
+    /// 风控挑战冷却的**清除后抑制窗**(2026-10-14 闲鱼实测)。人工 Answered 后
+    /// `clear_risk_challenge` 解除冷却,但 Agent 按 `next_hint` 跑的复验探针会因
+    /// 挑战残留/登录弹层再次 `mark_risk_challenge` 把冷却重置回满值 —— 清冷却与
+    /// 复验探针互相打架,冷却永无解除窗口(实测 `remaining_secs` 三次恒 299)。
+    /// 抑制窗内同域一律不再打标;挑战是**状态**不是**事件**,复验观测不该续命。
+    risk_suppressed_until: HashMap<String, Instant>,
 }
 
 impl Default for PaceState {
@@ -242,9 +248,14 @@ impl Default for PaceState {
             wipe_streak: HashMap::new(),
             wipe_total: HashMap::new(),
             forced_nav: HashMap::new(),
+            risk_suppressed_until: HashMap::new(),
         }
     }
 }
+
+/// `clear_risk_challenge` 之后的打标抑制时长(秒)。够覆盖「人工解完 → Agent
+/// 复验 blockers → 进入下一轮动作」的窗口;真新挑战在窗后重新出现仍会打标。
+const RISK_SUPPRESS_SECS: u64 = 90;
 
 /// 持久熔断下 force 强制导航的单域预算(第 174 轮)。
 const FORCE_BUDGET: u32 = 2;
@@ -293,11 +304,30 @@ impl WebPace {
     }
 
     /// 标记某域进入**风控挑战冷却**(baxia 滑块 punish 实测形态;第 172 轮)。
-    /// 幂等取更晚截止时刻;成因跟随实际生效的标记。语义与频控冷却共用一张表,
-    /// 6004 按成因分流文案 —— 频控靠等,挑战/抹除靠换策略。
+    ///
+    /// **取更早**(2026-10-14 闲鱼实测修正):挑战是**状态**不是**事件** ——
+    /// 探测命中只是再次观测到同一挑战,不该把冷却续命。旧实现「幂等取更晚」在
+    /// 挑战弹层存活期间每次探测都 +300s,叠加清除后复验重打标,冷却永无解除窗口
+    /// (实测 `remaining_secs` 三次恒 299)。现改为:已有 `risk_challenge` 条目时
+    /// **保持原截止时刻**;条目不存在(新挑战/已过期/已清)才起算。
+    /// 与频控的「取更晚」刻意不同:频控是**事件**(还在被限流就该继续等)。
+    ///
+    /// 另: [`Self::clear_risk_challenge`] 之后的抑制窗内一律不打标。
     pub fn mark_risk_challenge_for(&self, host: &str, secs: Duration) {
-        let until = Instant::now() + secs;
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // 抑制窗(人工刚解完验证):复验探针不得反手锁死。
+        if let Some(until) = guard.risk_suppressed_until.get(host) {
+            if Instant::now() < *until {
+                return;
+            }
+        }
+        // 已有 risk_challenge 冷却在飞:取更早,不续期。
+        if guard.cooldown_cause.get(host) == Some(&CAUSE_RISK_CHALLENGE) {
+            if guard.cooldown_until.contains_key(host) {
+                return;
+            }
+        }
+        let until = Instant::now() + secs;
         let entry = guard.cooldown_until.entry(host.to_string()).or_insert(until);
         // `>=`:全新域首记时必须写入成因,否则裸冷却落回频控默认文案(见
         // mark_rate_limited_for 同款注释)。
@@ -316,12 +346,17 @@ impl WebPace {
 
     /// 解除某域的风控挑战冷却(`request_human` 收口人工已完成验证时调用)。
     /// 只清 `risk_challenge` 成因的条目,不动 rate_limited / site_wipe。
+    /// 清除后开启抑制窗([`RISK_SUPPRESS_SECS`]),复验探针不会立刻反手重打标。
     pub fn clear_risk_challenge(&self, host: &str) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if guard.cooldown_cause.get(host) == Some(&CAUSE_RISK_CHALLENGE) {
             guard.cooldown_cause.remove(host);
             guard.cooldown_until.remove(host);
         }
+        guard.risk_suppressed_until.insert(
+            host.to_string(),
+            Instant::now() + Duration::from_secs(RISK_SUPPRESS_SECS),
+        );
     }
 
     /// 显式导航落地记账(整页抹除连击;2026-10-14 猎聘实测形态,见模块头 3.)。
@@ -509,6 +544,7 @@ impl WebPace {
         guard.cooldown_until.clear();
         guard.cooldown_cause.clear();
         guard.wipe_streak.clear();
+        guard.risk_suppressed_until.clear();
     }
 
     /// 频控剩余冷却;`None` = 无冷却。
@@ -1258,6 +1294,56 @@ mod tests {
         p.mark_risk_challenge_for("taobao.com", Duration::from_secs(300));
         p.clear_all();
         assert_eq!(p.cooldown_cause_for("taobao.com"), None);
+    }
+
+    #[test]
+    fn 风控挑战_重复探测取更早不续期() {
+        // 2026-10-14 闲鱼实测:旧实现「取更晚」让每次复验探针都把冷却续命
+        // (remaining_secs 三次恒 299)。现改为:同成因在飞时保持原截止时刻。
+        let p = pace();
+        p.mark_risk_challenge_for("goofish.com", Duration::from_secs(300));
+        let first = p.cooldown_remaining_for("goofish.com").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        // 第二次探测命中同一挑战:不得续期
+        p.mark_risk_challenge_for("goofish.com", Duration::from_secs(300));
+        let second = p.cooldown_remaining_for("goofish.com").unwrap();
+        assert!(
+            second <= first,
+            "重复探测不得续期:first={first:?} second={second:?}"
+        );
+        assert_eq!(p.cooldown_cause_for("goofish.com"), Some(CAUSE_RISK_CHALLENGE));
+    }
+
+    #[test]
+    fn 风控挑战_清除后抑制窗内不重打标() {
+        // 人工 Answered → clear 后,Agent 按指引跑的复验探针不得反手锁死。
+        let p = pace();
+        p.mark_risk_challenge_for("goofish.com", Duration::from_secs(300));
+        p.clear_risk_challenge("goofish.com");
+        assert_eq!(p.cooldown_cause_for("goofish.com"), None);
+        // 复验探针再次命中(残留指纹/登录弹层):抑制窗内一律不打标
+        p.mark_risk_challenge_for("goofish.com", Duration::from_secs(300));
+        assert_eq!(
+            p.cooldown_cause_for("goofish.com"),
+            None,
+            "清除后抑制窗内不得重新打标"
+        );
+        assert!(matches!(p.decide("goofish.com"), PaceDecision::Allow));
+    }
+
+    #[test]
+    fn 风控挑战_抑制窗过期后真新挑战仍可打标() {
+        let p = pace();
+        // 先建立再清除,打开抑制窗
+        p.mark_risk_challenge_for("goofish.com", Duration::from_secs(300));
+        p.clear_risk_challenge("goofish.com");
+        // 直接清抑制窗模拟窗口过期(真实路径是等 90s)
+        {
+            let mut guard = p.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.risk_suppressed_until.clear();
+        }
+        p.mark_risk_challenge_for("goofish.com", Duration::from_secs(300));
+        assert_eq!(p.cooldown_cause_for("goofish.com"), Some(CAUSE_RISK_CHALLENGE));
     }
 
     #[test]

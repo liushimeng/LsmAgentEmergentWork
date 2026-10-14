@@ -229,6 +229,37 @@ fn new_page_id() -> String {
     )
 }
 
+/// 标签页总量上限(`LAEW_WEB_MAX_TABS`,默认 8)。
+///
+/// 与 `LAEW_WEB_MAX_WINDOWS`(按去重 windowId 计额,同窗口多 Tab 不占额度)互补:
+/// 2026-10-14 闲鱼实测同一商品页被重复打开,单任务残留 12 个 tab 一个上限都没触发。
+/// `0`/非法回退默认;上限至少 2(保留工作页 + 一个新页)。
+fn max_tabs_from_env() -> usize {
+    std::env::var("LAEW_WEB_MAX_TABS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 2)
+        .unwrap_or(8)
+}
+
+/// 一次标签页收编的结果(2026-10-14 扩展:同 URL 去重 + Tab 上限的对账口径)。
+#[derive(Debug, Default)]
+pub struct AdoptOutcome {
+    /// 收编成功的 page_id(可直接操作)
+    pub adopted: Vec<String>,
+    /// 与注册表内页**同 URL**而被直接关闭的重复页(重复打开的商品页)
+    pub deduped: Vec<String>,
+    /// 超出 `LAEW_WEB_MAX_TABS` 被丢弃关闭的候选页 URL
+    pub dropped: Vec<String>,
+}
+
+impl AdoptOutcome {
+    /// 有无任何处置(收编/去重/丢弃),供调用方决定是否回传明细。
+    pub fn any(&self) -> bool {
+        !self.adopted.is_empty() || !self.deduped.is_empty() || !self.dropped.is_empty()
+    }
+}
+
 /// Agent 高亮蓝框注入脚本(2026-09-20 第 100 轮):
 ///
 /// headed 可视化模式下,桌面上可能同时存在多个浏览器窗口,人工介入时必须一眼
@@ -2225,20 +2256,44 @@ impl BrowserManager {
     ///    laew 自己开的那几个;照旧逻辑会把用户的私人标签页一次性收编并注入
     ///    管控脚本,`spawned_page_id` 还会指向用户的私人页面。
     pub async fn adopt_spawned_pages(&self) -> Vec<String> {
+        self.adopt_spawned_pages_ex().await.adopted
+    }
+
+    /// 收编浏览器里「有、注册表里没有」的标签页(2026-10-14 扩展版)。
+    ///
+    /// 扩展点(闲鱼实测,同一商品页被重复打开 7~8 次 / 单任务残留 12 个 tab):
+    /// 1. **同 URL 去重** —— 新页与注册表内页 URL 身份键相同则**不收编、直接关掉**
+    ///    (见 [`super::browser_noise::page_url_key`]);`?page=1` 与 `?page=2` 这类
+    ///    合法分页键不同,不去重;
+    /// 2. **Tab 总量上限** —— `LAEW_WEB_MAX_TABS`(默认 8),超限只丢弃**本次新候选**
+    ///    (不关既有工作页);`LAEW_WEB_MAX_WINDOWS` 按 windowId 计额,同窗口多 Tab
+    ///    不占额度,12 个 tab 一个上限都没触发,这里补上 tab 维度;
+    /// 3. 回报 `deduped`/`dropped`,由工具层全量透出(旧实现只回 `spawned.first()` 一个,
+    ///    Agent 不知道有堆积)。
+    pub async fn adopt_spawned_pages_ex(&self) -> AdoptOutcome {
         let mut inner = self.inner.lock().await;
+        let mut outcome = AdoptOutcome::default();
         let Some(browser) = inner.browser.as_ref() else {
-            return Vec::new();
+            return outcome;
         };
         if inner.connect_mode {
             // 接管模式:浏览器归用户所有,laew 不认领也不关闭任何未知页面。
-            return Vec::new();
+            return outcome;
         }
         let Ok(pages) = browser.pages().await else {
-            return Vec::new();
+            return outcome;
         };
         let known: std::collections::HashSet<String> =
             inner.pages.values().map(|e| e.target_id.clone()).collect();
-        let mut adopted = Vec::new();
+        // 注册表内已知页的 URL 身份键(同页去重基准)。fail-open:取不到 URL 跳过。
+        let mut known_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in inner.pages.values() {
+            if let Ok(Some(u)) = entry.page.url().await {
+                if let Some(k) = super::browser_noise::page_url_key(&u) {
+                    known_keys.insert(k);
+                }
+            }
+        }
         let mut candidates: Vec<chromiumoxide::Page> = Vec::new();
         let mut noise: Vec<chromiumoxide::Page> = Vec::new();
         for page in pages {
@@ -2251,9 +2306,18 @@ impl BrowserManager {
             let title = Self::page_title(&page).await;
             if super::browser_noise::is_noise_page(&url, &title) {
                 noise.push(page);
-            } else {
-                candidates.push(page);
+                continue;
             }
+            // 同 URL 去重:与注册表内某页同身份 → 不收编,直接关(重复打开的商品页)。
+            if let Some(k) = super::browser_noise::page_url_key(&url) {
+                if known_keys.contains(&k) {
+                    let _ = page.close().await;
+                    outcome.deduped.push(url);
+                    continue;
+                }
+                known_keys.insert(k);
+            }
+            candidates.push(page);
         }
         // 给刚打开的窗口一次导航时间再复查,避免误杀 `target=_blank` 真页面。
         // 2026-10-12 闲鱼实测修正:原条件 `!candidates.is_empty()` 导致「只有新标签页
@@ -2269,6 +2333,15 @@ impl BrowserManager {
                 if super::browser_noise::is_noise_page(&url, &title) {
                     still_noise.push(page);
                 } else {
+                    // 复查后是真页面:同 URL 去重同样适用
+                    if let Some(k) = super::browser_noise::page_url_key(&url) {
+                        if known_keys.contains(&k) {
+                            let _ = page.close().await;
+                            outcome.deduped.push(url);
+                            continue;
+                        }
+                        known_keys.insert(k);
+                    }
                     candidates.push(page);
                 }
             }
@@ -2298,6 +2371,19 @@ impl BrowserManager {
             }
             scored.sort_by(|a, b| b.0.cmp(&a.0));
             candidates = scored.into_iter().map(|(_, p)| p).collect();
+        }
+        // Tab 总量上限(2026-10-14):只丢弃**本次新候选**的超额部分,不碰既有工作页。
+        // `LAEW_WEB_MAX_WINDOWS` 按 windowId 计额(同窗口多 Tab 不占额度),实测 12 个
+        // tab 一个上限都没触发,这里补 tab 维度。
+        let max_tabs = max_tabs_from_env();
+        while inner.pages.len() + outcome.adopted.len() + candidates.len() > max_tabs {
+            if let Some(extra) = candidates.pop() {
+                let url = extra.url().await.ok().flatten().unwrap_or_default();
+                let _ = extra.close().await;
+                outcome.dropped.push(url);
+            } else {
+                break;
+            }
         }
         for page in candidates {
             let tid: String = page.target_id().clone().into();
@@ -2340,9 +2426,9 @@ impl BrowserManager {
                     events,
                 },
             );
-            adopted.push(id);
+            outcome.adopted.push(id);
         }
-        adopted
+        outcome
     }
 
     /// 关闭页面;最后一个页面关闭时回收 launch 模式浏览器进程。

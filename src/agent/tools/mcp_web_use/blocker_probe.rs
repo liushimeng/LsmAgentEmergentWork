@@ -305,16 +305,30 @@ fn vendor_label(name: &str) -> &'static str {
 /// 命中条目是否需要域级风控冷却:仅 baxia punish 容器(会话/指纹级打标)。
 /// nc 是登录/验证流程的正常组件、geetest/yidun 是普通第三方验证,命中≠被惩罚,
 /// 不冷却(冷却会把正常登录后的导航也拦住)。
+///
+/// 2026-10-14 闲鱼实测:`login_like` 的 baxia 容器是**登录弹层**(阿里 passport 登录
+/// 组件挂 baxia SDK 类名),不是滑块 punish,同样不冷却 —— 否则登录弹层存活期间每次
+/// 探测都会把域冷却续命,登录后导航反被 6004 拦死。
 pub(super) fn punish_vendor_hit(alert: &Value) -> bool {
     alert
         .get("evidence")
         .and_then(|e| e.get("vendors"))
         .and_then(Value::as_array)
         .map(|a| {
-            a.iter()
-                .any(|v| v.get("name").and_then(Value::as_str) == Some("baxia"))
+            a.iter().any(|v| {
+                v.get("name").and_then(Value::as_str) == Some("baxia")
+                    && v.get("login_like").and_then(Value::as_bool) != Some(true)
+            })
         })
         .unwrap_or(false)
+}
+
+/// 厂商容器是否呈现**登录弹层**语义(而非验证挑战)。
+pub(super) fn vendor_login_like(vendors: &[Value]) -> bool {
+    !vendors.is_empty()
+        && vendors
+            .iter()
+            .all(|v| v.get("login_like").and_then(Value::as_bool) == Some(true))
 }
 
 /// 弹层元数据是否构成语义挑战;命中返回 blocker 条目(含结构证据)。
@@ -407,9 +421,11 @@ pub(super) fn analyze(probe: &Value) -> Vec<Value> {
         .cloned()
         .unwrap_or_default();
     let mut challenge = detect_challenge(probe.get("overlay").unwrap_or(&Value::Null));
-    if !vendors.is_empty() {
+    if !vendors.is_empty() && !vendor_login_like(&vendors) {
         // 第 172 轮:厂商容器指纹(挑战本体在跨域 iframe 内时弹层结构信号残缺,
         // 天猫 baxia 实测 score 仅 4 且 slider_like/iframe_like 均 false → Unknown)。
+        // 2026-10-14:容器呈登录弹层语义时**整体跳过本段** —— 不合成滑块挑战,
+        // 交给下方关键词通道的 login 条目领跑(登录墙才是事实)。
         let first_vendor = vendors
             .first()
             .and_then(|v| v.get("name"))
@@ -466,6 +482,24 @@ pub(super) fn analyze(probe: &Value) -> Vec<Value> {
         // 关键词通道可能已产出同 kind 条目(captcha),保留带 evidence 的挑战版本
         out.retain(|b| b.get("kind").and_then(Value::as_str) != Some("captcha"));
         out.insert(0, challenge);
+    } else if vendor_login_like(&vendors)
+        && !out
+            .iter()
+            .any(|b| b.get("kind").and_then(Value::as_str) == Some("login"))
+    {
+        // 登录弹层兜底:容器语义是登录、但关键词通道一条 login 都没产出
+        // (文案在 shadow/iframe 内读不到时)。合成登录墙条目,让 Agent 走
+        // request_human(reason=login),而不是看到 vendors 就当挑战硬闯。
+        out.insert(
+            0,
+            json!({
+                "kind": "login",
+                "matched": "vendor_login_form",
+                "snippet": "登录弹层",
+                "advice": "登录墙:用户已提供凭证则自动登录;否则 control(request_human, reason=login) 让人工在窗口登录",
+                "evidence": { "vendors": vendors },
+            }),
+        );
     }
     out
 }
@@ -497,14 +531,40 @@ fn probe_js() -> String {
       ['yidun', '[class*="yidun_popup"], [class*="yidun_panel"], [id^="yidun_"]'],
     ];
     const vendors = [];
+    // 2026-10-14 闲鱼实测:阿里 passport 登录组件本身挂 baxia SDK 类名
+    // (`.baxia-dialog`/`[id^="baxia-"]`),厂商选择器命中的是**登录弹层**而非滑块挑战。
+    // 只看类名就会把「短信登录/扫码登录」错报成「按住滑块拖到最右」,人工被指引去
+    // 找根本不存在的滑块。这里对每个命中容器做**内容语义判定**:登录形态(密码/手机
+    // 号输入框、二维码、登录文案、登录按钮)一律标 login_like,由 Rust 侧降级为
+    // 登录墙,不合成滑块挑战、不触发域级风控冷却。
+    const loginLike = (vel) => {
+      try {
+        if (vel.querySelector('input[type="password"], input[type="tel"], input[name*="password" i], input[name*="mobile" i], input[placeholder*="手机" i], input[placeholder*="密码" i]')) return true;
+        const imgs = vel.querySelectorAll('img,canvas');
+        for (let i = 0; i < imgs.length; i++) {
+          const ir = imgs[i].getBoundingClientRect();
+          // 二维码典型见方 120~280px;滑块轨道是长条,不会同时命中尺寸与登录文案
+          if (ir.width >= 110 && ir.height >= 110 && Math.abs(ir.width - ir.height) < 40) return true;
+        }
+        const t = (vel.innerText || '') + ' ' + (vel.getAttribute('aria-label') || '');
+        if (/短信登录|密码登录|扫码登录|手机扫码|手机登录|立即登录|请先登录|登录后|账号登录/.test(t)) return true;
+        const btns = vel.querySelectorAll('button, [role="button"], input[type="submit"], a');
+        for (let i = 0; i < btns.length; i++) {
+          const bt = (btns[i].innerText || btns[i].value || '').trim();
+          if (bt === '登录' || bt === '登 录' || bt === '立即登录' || bt === 'Sign in') return true;
+        }
+      } catch (e) {}
+      return false;
+    };
     for (const pair of VENDOR_SELS) {
-      let vhits = 0;
+      let vhits = 0, vlogin = 0;
       document.querySelectorAll(pair[1]).forEach((vel) => {
         const vcs = window.getComputedStyle(vel);
         if (vcs.display === 'none' || vcs.visibility === 'hidden' || parseFloat(vcs.opacity) < 0.05) return;
         vhits++;
+        if (loginLike(vel)) vlogin++;
       });
-      if (vhits > 0) vendors.push({name: pair[0], hits: vhits});
+      if (vhits > 0) vendors.push({name: pair[0], hits: vhits, login_like: vlogin > 0, login_hits: vlogin});
     }
     // 词表候选:命中 modal/dialog/captcha/verify 等**语义类名**的模态。
     const SEL = 'dialog[open], [role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i], [class*="popup" i], [class*="mask" i], [class*="overlay" i], [class*="captcha" i], [class*="verify" i], [class*="challenge" i]';

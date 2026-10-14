@@ -41,9 +41,18 @@ use serde_json::{json, Value};
 use crate::agent::browser_ns::{inject_ns, ns_global, render_ns};
 use crate::agent::browser_overlay::PageGuardConfig;
 
-/// 两条栏的 closed Shadow DOM host id（主文档 light DOM 只留这个无文本 host）。
+/// 屏蔽页面状态栏的 closed Shadow DOM host id（右上角；主文档 light DOM 只留
+/// 这个无文本 host）。2026-10-14 起两条栏**各自独立 host**（`position:fixed`
+/// 角落锚定），不再共用全屏 `inset:0` 宿主 —— 共用宿主会被页面 html/body 的
+/// `transform` 劫持 `position:fixed` 包含块，Windows 1080p 上表现为「显示不出来」。
 pub fn status_host_id() -> String {
-    format!("{}status_ui__", inject_ns())
+    format!("{}status_host__", inject_ns())
+}
+
+/// 屏蔽页面进度栏的 closed Shadow DOM host id（左下角）。与 [`status_host_id`]
+/// 同构、互不相同。
+pub fn progress_host_id() -> String {
+    format!("{}progress_host__", inject_ns())
 }
 
 /// 屏蔽页面状态栏元素 id（右上角）。
@@ -108,76 +117,134 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
     // REV 2(2026-10-14):状态栏加 `window.top === window` 顶层门 —— 本脚本会注入
     // 每个新文档(含跨域 iframe),baxia 滑块挑战 iframe 内的状态栏把人工核验控件
     // 罩死(实测天猫任务);子 frame 一律不渲染任何一条栏。
-    const REV = 2;
+    const REV = 3;
     if (window.%NS%StatusRev >= REV) {
         try { if (window.%NS%StatusEnsure) window.%NS%StatusEnsure(); } catch (e) {}
         return;
     }
     window.%NS%StatusRev = REV;
-    const HOST_ID = '%NS%status_ui__';
     const STATUS_ID = '%NS%guard_status__';
     const PROGRESS_ID = '%NS%guard_progress__';
+    // 2026-10-14(Windows 1080p 实测):两条栏改**各自独立的 `position:fixed` 角落
+    // 锚定 host**,不再共用全屏 `inset:0` 宿主。旧结构里两条栏是全屏 host 的
+    // closed-shadow 子元素,一旦页面对 html/body 施加 transform/will-change/filter
+    // (SPA 常见 GPU 加速手法),`position:fixed` 的包含块会被劫持到该祖先,整条栏
+    // 落到视口外或错位 —— Windows 上表现为「显示不出来」。host 自己就是那条栏,
+    // containing block 直接是视口,与页面布局无关;窗口缩放自适应走
+    // `max-width:min(vw,px)` + shadow 内 `@media` 紧凑档。
+    const STATUS_HOST_ID = '%NS%status_host__';
+    const PROGRESS_HOST_ID = '%NS%progress_host__';
     const FONT = 'system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif';
     const MAX_EVENTS = 6;
-    let SH = null;
+    let SHS = null;   // 状态栏 host 的 closed shadow
+    let SHP = null;   // 进度栏 host 的 closed shadow
     let events = [];
     let last = null;
     let visible = true;
     let suspended = false;
+    // 挂起来源记账(2026-10-14):截图/HITL/挑战探测三条挂起链路若中途被打断,
+    // `suspended` 会永久留在页面侧导致两条栏隐身。超时自愈(见 onTick)。
+    let suspend_since = 0;
     const root = () => document.documentElement || document.body;
-    const el = (id) => (SH && SH.getElementById(id)) || document.getElementById(id);
+    // 两条栏分属两个 shadow,查找要跨两边(再兜底 light DOM,兼容 attachShadow 失败)
+    const el = (id) => {
+        if (SHS && SHS.getElementById) { const e = SHS.getElementById(id); if (e) return e; }
+        if (SHP && SHP.getElementById) { const e = SHP.getElementById(id); if (e) return e; }
+        return document.getElementById(id);
+    };
+    // shadow 内样式表:自适应档(1080p 标准 / 窄视口紧凑),`@media` 挂在 shadow 内
+    // 与外层文档隔离,不受页面 CSS 影响。
+    const STYLE_CSS = [
+        ':host{all:initial;}',
+        '.bar{box-sizing:border-box;margin:0;pointer-events:none;',
+        'background:rgba(15,23,42,0.88);color:#e2e8f0;border-radius:10px;',
+        'box-shadow:0 4px 16px rgba(0,0,0,0.35);z-index:2147483646;}',
+        '.row{font:400 12px/1.6 ' + FONT + ';color:inherit;white-space:nowrap;',
+        'overflow:hidden;text-overflow:ellipsis;max-width:min(46vw,560px);margin:0;}',
+        '.row.title{font:700 13px/1.6 ' + FONT + ';font-weight:700;}',
+        '.bar{padding:8px 14px;}',
+        // 1080p 及以下:收紧内边距与字号,保证在 1920×1080 视口角落完整可见
+        '@media (max-width:1280px){.bar{padding:6px 10px;border-radius:8px;}',
+        '.row{font-size:11px;max-width:min(52vw,420px);}.row.title{font-size:12px;}}',
+        '@media (max-width:820px){.bar{padding:5px 8px;}.row{font-size:10px;',
+        'max-width:min(58vw,320px);}.row.title{font-size:11px;}}',
+    ].join('');
     const row = (parent, cls, color) => {
         const d = document.createElement('div');
         d.setAttribute('data-%NS%agent', '1');
-        d.className = cls;
-        d.style.cssText = 'font:' + (cls.indexOf('title') >= 0 ? '700 13px/1.6 ' : '400 12px/1.6 ')
-            + FONT + ';color:' + color
-            + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:min(46vw,560px);';
+        d.className = 'row ' + cls;
+        d.style.color = color;
         parent.appendChild(d);
         return d;
     };
-    const ensure = () => {
-        const r = root();
-        if (!r) return;
-        if (!document.getElementById(HOST_ID) || !SH) {
-            let h = document.getElementById(HOST_ID);
-            if (!h) {
-                h = document.createElement('div');
-                h.id = HOST_ID;
-                h.setAttribute('data-%NS%agent', '1');
-                h.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483644;';
-                r.appendChild(h);
-            }
-            try { SH = h.attachShadow ? h.attachShadow({ mode: 'closed' }) : null; } catch (e) { SH = null; }
+    const makeHost = (hostId, cssText) => {
+        let h = document.getElementById(hostId);
+        if (h && h.__%NS%sh) return h;
+        if (!h) {
+            h = document.createElement('div');
+            h.id = hostId;
+            h.setAttribute('data-%NS%agent', '1');
+            h.style.cssText = cssText;
+            const r = root();
+            if (!r) return null;
+            r.appendChild(h);
         }
-        // 顶层门(与下方进度栏同款):子 frame(含跨域挑战 iframe)不渲染状态栏。
-        if (window.top === window && !el(STATUS_ID)) {
+        let sh = h.__%NS%sh || null;
+        if (!sh) {
+            try { sh = h.attachShadow ? h.attachShadow({ mode: 'closed' }) : null; } catch (e) { sh = null; }
+            h.__%NS%sh = sh;
+        }
+        return h;
+    };
+    const shadowOf = (hostId, shRef) => {
+        const h = document.getElementById(hostId);
+        return (h && h.__%NS%sh) || null;
+    };
+    const ensure = () => {
+        if (!root()) return;
+        // 顶层门(与 REV 2 同款):子 frame(含跨域挑战 iframe)不渲染任何一条栏。
+        if (window.top !== window) return;
+        const stHost = makeHost(STATUS_HOST_ID,
+            'position:fixed;top:12px;right:12px;margin:0;padding:0;pointer-events:none;'
+            + 'z-index:2147483646;max-width:min(50vw,620px);');
+        const pgHost = makeHost(PROGRESS_HOST_ID,
+            'position:fixed;left:18px;bottom:18px;margin:0;padding:0;pointer-events:none;'
+            + 'z-index:2147483646;max-width:min(46vw,560px);');
+        SHS = (stHost && stHost.__%NS%sh) || SHS;
+        SHP = (pgHost && pgHost.__%NS%sh) || SHP;
+        const mountStyle = (sh) => {
+            if (!sh) return;
+            let st = sh.querySelector('style');
+            if (!st) {
+                st = document.createElement('style');
+                st.setAttribute('data-%NS%agent', '1');
+                st.textContent = STYLE_CSS;
+                sh.appendChild(st);
+            }
+        };
+        mountStyle(SHS);
+        mountStyle(SHP);
+        // ---- 状态栏内容(右上角) ----
+        if (!el(STATUS_ID)) {
             const c = document.createElement('div');
             c.id = STATUS_ID;
             c.setAttribute('data-%NS%agent', '1');
-            c.style.cssText = 'position:fixed;top:12px;right:12px;margin:0;padding:8px 14px;'
-                + 'background:rgba(15,23,42,0.86);color:#e2e8f0;border-radius:10px;'
-                + 'box-shadow:0 4px 16px rgba(0,0,0,0.35);pointer-events:none;z-index:2147483646;'
-                + 'max-width:min(50vw,620px);';
+            c.className = 'bar';
             // ①谁在控制（蓝底强调）②管控档位 ③静态注意事项 ④guard_note
             const t = row(c, '%NS%sb_title__', '#60a5fa');
-            t.style.cssText += 'font-weight:700;';
             const m = row(c, '%NS%sb_mode__', '#e2e8f0');
             const n = row(c, '%NS%sb_notice__', '#94a3b8');
             const o = row(c, '%NS%sb_note__', '#cbd5e1');
-            mount(c);
+            (SHS || root()).appendChild(c);
         }
-        if (window.top === window && !el(PROGRESS_ID)) {
+        // ---- 进度栏内容(左下角) ----
+        if (!el(PROGRESS_ID)) {
             const c = document.createElement('div');
             c.id = PROGRESS_ID;
             c.setAttribute('data-%NS%agent', '1');
-            c.style.cssText = 'position:fixed;left:18px;bottom:18px;margin:0;padding:8px 14px;'
-                + 'background:rgba(15,23,42,0.86);color:#e2e8f0;border-radius:10px;'
-                + 'box-shadow:0 4px 16px rgba(0,0,0,0.35);pointer-events:none;z-index:2147483646;'
-                + 'max-width:min(46vw,560px);';
+            c.className = 'bar';
             // ①当前动作 ②迭代/耗时/进度条 ③任务摘要 ④事件时间线
             const a = row(c, '%NS%pb_action__', '#a7f3d0');
-            a.style.cssText += 'font-weight:700;';
             const p = row(c, '%NS%pb_progress__', '#94a3b8');
             const bar = document.createElement('div');
             bar.setAttribute('data-%NS%agent', '1');
@@ -190,11 +257,10 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
             const k = row(c, '%NS%pb_task__', '#cbd5e1');
             const e = row(c, '%NS%pb_events__', '#94a3b8');
             c.appendChild(a); c.appendChild(p); c.appendChild(bar); c.appendChild(k); c.appendChild(e);
-            mount(c);
+            (SHP || root()).appendChild(c);
         }
         if (last) render();
     };
-    const mount = (node) => (SH || root()).appendChild(node);
     const findIn = (id, cls) => {
         const box = el(id);
         if (!box) return null;
@@ -266,9 +332,14 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
             e.title = e.textContent;
         }
         const on = visible && !suspended;
+        // host 自身就是那条栏的定位盒,显隐作用到 host(否则空壳仍占角落)
         const sb = el(STATUS_ID), pb = el(PROGRESS_ID);
         if (sb) sb.style.display = on ? '' : 'none';
         if (pb) pb.style.display = on ? '' : 'none';
+        const sbHost = document.getElementById(STATUS_HOST_ID);
+        const pgHost = document.getElementById(PROGRESS_HOST_ID);
+        if (sbHost) sbHost.style.display = on ? '' : 'none';
+        if (pgHost) pgHost.style.display = on ? '' : 'none';
     };
     // ---- 页面侧 API(全部 ns 随机化 + 不可枚举化,与 guard/highlight 同款) ----
     window.%NS%StatusUpdate = (payload) => {
@@ -289,29 +360,37 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
         return true;
     };
     window.%NS%StatusVisible = (v) => { visible = !!v; render(); return visible; };
-    window.%NS%StatusSuspend = (v) => { suspended = !!v; render(); return suspended; };
+    window.%NS%StatusSuspend = (v) => {
+        suspended = !!v;
+        suspend_since = suspended ? Date.now() : 0;
+        render();
+        return suspended;
+    };
     // DOM 自愈入口(SPA 整树替换把 host 冲掉时重建两条栏并重绘当前内容)
     window.%NS%StatusEnsure = () => { ensure(); render(); return true; };
     // 影子树自探(非枚举,与 `%NS%GuardUiProbe` 同款):closed shadow 对页面/evaluate
     // 都不可读,真浏览器回归测试经此读两条栏的在场性与显示态。
-    window.%NS%StatusProbe = () => ({
-        host: !!document.getElementById(HOST_ID),
-        status: !!el(STATUS_ID),
-        progress: !!el(PROGRESS_ID),
-        status_display: el(STATUS_ID) ? (el(STATUS_ID).style.display || '') : 'missing',
-        progress_display: el(PROGRESS_ID) ? (el(PROGRESS_ID).style.display || '') : 'missing',
-        agent: (last && last.agent) || '',
-        action: (last && last.action) || '',
-        events: events.length,
-        // 几何:两条栏盒子与各行的包围盒(排版回归锁 —— 曾出现行高塌成一条)
-        geom: [STATUS_ID, PROGRESS_ID].map((id) => {
+    // 2026-10-14 增补:viewport/in_view/computed —— 「显示不出来」要能一眼分清
+    // 是没渲染、被 display:none、还是被挤出视口。
+    window.%NS%StatusProbe = () => {
+        const boxGeom = (id) => {
             const b = el(id);
             if (!b) return null;
             const r = b.getBoundingClientRect();
+            const cs = window.getComputedStyle(b);
+            // 定位在 host(每条栏独立 position:fixed 角落锚定),内层 bar 是普通块
+            const hostEl = (b.getRootNode && b.getRootNode().host) || null;
+            const hcs = hostEl ? window.getComputedStyle(hostEl) : null;
             return {
                 id: id.slice(-18),
                 x: Math.round(r.left), y: Math.round(r.top),
                 w: Math.round(r.width), h: Math.round(r.height),
+                in_view: r.width > 0 && r.height > 0
+                    && r.right > 0 && r.bottom > 0
+                    && r.left < window.innerWidth && r.top < window.innerHeight,
+                computed: { display: cs.display, position: cs.position, zIndex: cs.zIndex, opacity: cs.opacity },
+                host_position: hcs ? hcs.position : 'none',
+                host_display: hcs ? hcs.display : 'none',
                 rows: Array.prototype.map.call(b.children, (c) => ({
                     tag: c.tagName,
                     h: Math.round(c.getBoundingClientRect().height),
@@ -319,16 +398,56 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
                     text: (c.textContent || '').slice(0, 24),
                 })),
             };
-        }),
-    });
-    // 动作执行期耗时自刷新(0.5s),避免 Rust 侧为「秒数跳动」反复推送
+        };
+        return {
+            host: !!document.getElementById(STATUS_HOST_ID),
+            host_progress: !!document.getElementById(PROGRESS_HOST_ID),
+            status: !!el(STATUS_ID),
+            progress: !!el(PROGRESS_ID),
+            status_display: el(STATUS_ID) ? (el(STATUS_ID).style.display || '') : 'missing',
+            progress_display: el(PROGRESS_ID) ? (el(PROGRESS_ID).style.display || '') : 'missing',
+            agent: (last && last.agent) || '',
+            action: (last && last.action) || '',
+            events: events.length,
+            visible: visible,
+            suspended: suspended,
+            viewport: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1 },
+            geom: [STATUS_ID, PROGRESS_ID].map(boxGeom),
+        };
+    };
+    // 动作执行期耗时自刷新(0.5s) + DOM 自愈(2026-10-14:SPA 整树替换会把 host
+    // 冲掉,旧实现只 render 不 ensure,两条栏消失后到下次注入前一直空窗)。
     try {
         if (!window.%NS%StatusTimer) {
-            window.%NS%StatusTimer = setInterval(() => { if (last) render(); }, 500);
+            window.%NS%StatusTimer = setInterval(() => {
+                try { ensure(); } catch (e) {}
+                // 挂起自愈:截图/HITL/挑战探测三条挂起链路若中途被打断(进程被杀、
+                // 异常路径漏复显),suspended 会永久留在页面侧导致两条栏隐身。
+                // 超过 3 分钟未复显则自动恢复(挂起语义是「拍那一下别入镜」,不是长期隐藏)。
+                if (suspended && suspend_since && (Date.now() - suspend_since) > 180000) {
+                    suspended = false;
+                    suspend_since = 0;
+                }
+                render();
+            }, 500);
+        }
+    } catch (e) {}
+    // SPA 整树替换自愈:documentElement 子树被重挂时重建(MutationObserver 比轮询更快)
+    try {
+        if (!window.%NS%StatusMO && document.documentElement) {
+            window.%NS%StatusMO = new MutationObserver(() => {
+                try {
+                    if (!document.getElementById(STATUS_HOST_ID) || !document.getElementById(PROGRESS_HOST_ID)) {
+                        ensure();
+                        render();
+                    }
+                } catch (e) {}
+            });
+            window.%NS%StatusMO.observe(document.documentElement, { childList: true, subtree: true });
         }
     } catch (e) {}
     try {
-        ['%NS%StatusUpdate', '%NS%StatusGuard', '%NS%StatusVisible', '%NS%StatusSuspend', '%NS%StatusEnsure', '%NS%StatusProbe', '%NS%StatusTimer', '%NS%StatusRev']
+        ['%NS%StatusUpdate', '%NS%StatusGuard', '%NS%StatusVisible', '%NS%StatusSuspend', '%NS%StatusEnsure', '%NS%StatusProbe', '%NS%StatusTimer', '%NS%StatusMO', '%NS%StatusRev']
             .forEach((k) => {
                 if (window[k] !== undefined) {
                     Object.defineProperty(window, k,
@@ -587,10 +706,12 @@ mod tests {
 
     #[test]
     fn 两条栏元素id含命名空间且互不相同() {
-        assert!(status_host_id().ends_with("status_ui__"));
+        assert!(status_host_id().ends_with("status_host__"));
+        assert!(progress_host_id().ends_with("progress_host__"));
         assert!(status_bar_id().ends_with("guard_status__"));
         assert!(progress_bar_id().ends_with("guard_progress__"));
         assert_ne!(status_bar_id(), progress_bar_id());
+        assert_ne!(status_host_id(), progress_host_id(), "两条栏各自独立 host");
         assert!(!status_bar_id().contains("laew"), "不得含固定签名");
     }
 
@@ -671,29 +792,48 @@ mod tests {
     #[test]
     fn 注入脚本版本门单实例且带dom自愈入口() {
         let js = render_ns(AGENT_STATUS_JS_TEMPLATE);
-        assert!(js.contains("const REV = 2;"));
+        assert!(js.contains("const REV = 3;"));
         assert!(js.contains("StatusRev >= REV"), "重注入必须走版本门(否则闭包状态被重置)");
         assert!(js.contains("StatusEnsure"), "应暴露 DOM 自愈入口");
+        assert!(js.contains("MutationObserver"), "SPA 整树替换需要 MutationObserver 自愈");
     }
 
     #[test]
     fn 两条栏都只在顶层frame渲染() {
         // 2026-10-14 天猫 baxia 实测:注入脚本会进每个新文档(含跨域挑战 iframe),
         // 状态栏在小 iframe 里罩死人工核验控件 —— 两条栏都必须有顶层门。
+        // REV 3 起顶层门收敛为 ensure() 入口的单一早退(两条栏一次管住)。
         let js = render_ns(AGENT_STATUS_JS_TEMPLATE);
         assert!(
-            js.matches("window.top === window").count() >= 2,
-            "状态栏与进度栏都需要 window.top === window 顶层门"
+            js.contains("if (window.top !== window) return;"),
+            "ensure() 入口必须有顶层早退门(子 frame 不渲染任何一条栏)"
         );
-        // 状态栏创建点必须被顶层门包裹(进度栏本就有;逐条核对创建语句)。
+        // 两条栏的创建都发生在该门之后(ensure 内),不在别的路径上。
+        assert!(js.contains("makeHost(STATUS_HOST_ID"));
+        assert!(js.contains("makeHost(PROGRESS_HOST_ID"));
+    }
+
+    #[test]
+    fn 两条栏独立fixed锚定并自适应视口() {
+        // 2026-10-14 Windows 1080p 实测:共用全屏 host 会被页面 transform 劫持
+        // position:fixed 包含块 → 显示不出来。每条栏 host 自己角落锚定。
+        let js = render_ns(AGENT_STATUS_JS_TEMPLATE);
         assert!(
-            js.contains("if (window.top === window && !el(STATUS_ID))"),
-            "状态栏创建必须带顶层门"
+            js.contains("top:12px;right:12px"),
+            "状态栏须右上角视口锚定"
         );
         assert!(
-            js.contains("if (window.top === window && !el(PROGRESS_ID))"),
-            "进度栏创建必须带顶层门"
+            js.contains("left:18px;bottom:18px"),
+            "进度栏须左下角视口锚定"
         );
+        assert!(
+            !js.contains("position:fixed;inset:0"),
+            "不得再用全屏 inset:0 宿主(position:fixed 包含块陷阱)"
+        );
+        // 自适应:vw 上限 + 窄视口紧凑档
+        assert!(js.contains("max-width:min(50vw,620px)"), "状态栏随视口收窄");
+        assert!(js.contains("max-width:min(46vw,560px)"), "进度栏随视口收窄");
+        assert!(js.contains("@media (max-width:1280px)"), "1080p 及以下要有紧凑档");
     }
 
     #[test]

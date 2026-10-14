@@ -75,6 +75,60 @@ pub fn is_noise_page(url: &str, title: &str) -> bool {
     title.trim().is_empty()
 }
 
+/// 页面 URL 身份键(同页去重用,2026-10-14 闲鱼实测)。
+///
+/// 实测事故:同一商品页
+/// `https://www.goofish.com/item?id=1093008624942&categoryId=126862528`
+/// 被点击/自愈点击重复打开 7~8 次,单任务残留 12 个标签页 —— `adopt_spawned_pages`
+/// 逐个收编为独立 `page_id`,响应只回第一个,Agent 根本不知道有堆积。
+///
+/// 归一化口径(**刻意保守,宁可漏判不去重掉合法双开**):
+/// - 去掉 `#fragment`(同文档锚点不算新页);
+/// - 去掉尾部 `/`;
+/// - query 保留**全部**参数(`?page=1` 与 `?page=2` 是合法分页,不去重);
+/// - 主机小写、默认端口省略。
+///
+/// 只有**键完全相同**才判为同页。`item?id=1` 与 `item?id=2` 键不同,不去重。
+pub fn page_url_key(url: &str) -> Option<String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return None;
+    }
+    // 去 fragment
+    let u = u.split('#').next().unwrap_or(u);
+    // 去尾部 /(仅 path 末尾,query 里的 / 不动)
+    let (base, query) = match u.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (u, None),
+    };
+    let base = base.trim_end_matches('/');
+    // 主机小写:仅 scheme://host[:port] 段,不碰 path/query
+    let base = if let Some(idx) = base.find("://") {
+        let (scheme, rest) = base.split_at(idx + 3);
+        if let Some(slash) = rest.find('/') {
+            let (host, path) = rest.split_at(slash);
+            format!("{}{}{}", scheme, host.to_ascii_lowercase(), path)
+        } else {
+            format!("{}{}", scheme, rest.to_ascii_lowercase())
+        }
+    } else {
+        base.to_string()
+    };
+    Some(match query {
+        Some(q) => format!("{base}?{q}"),
+        None => base,
+    })
+}
+
+/// 两个 URL 是否是同一个页面(键相同)。空/无效 URL 一律判**不是**同页
+/// (避免两个空串把首次打开误杀成重复)。
+pub fn same_page_url(a: &str, b: &str) -> bool {
+    match (page_url_key(a), page_url_key(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +191,50 @@ mod tests {
     fn case_and_space_insensitive() {
         assert!(is_noise_url("  ABOUT:BLANK  "));
         assert!(is_noise_url("Chrome://NewTab"));
+    }
+
+    // ===== 同页去重(2026-10-14 闲鱼实测:同一商品页被重复打开 7~8 次)=====
+
+    #[test]
+    fn 同一商品页重复打开判同页() {
+        let u = "https://www.goofish.com/item?id=1093008624942&categoryId=126862528";
+        assert!(same_page_url(u, u));
+        assert!(same_page_url(u, &format!("{u}#detail")));
+        assert!(same_page_url(
+            "https://www.goofish.com/item?id=1&categoryId=2",
+            "https://www.goofish.com/item?id=1&categoryId=2"
+        ));
+    }
+
+    #[test]
+    fn 不同商品或分页不去重() {
+        assert!(!same_page_url(
+            "https://www.goofish.com/item?id=1&categoryId=2",
+            "https://www.goofish.com/item?id=9&categoryId=2"
+        ));
+        // 分页是合法双开,必须放行
+        assert!(!same_page_url(
+            "https://www.goofish.com/search?q=phone&page=1",
+            "https://www.goofish.com/search?q=phone&page=2"
+        ));
+    }
+
+    #[test]
+    fn 空与无效url不判同页() {
+        assert!(page_url_key("").is_none());
+        assert!(page_url_key("   ").is_none());
+        assert!(!same_page_url("", ""));
+    }
+
+    #[test]
+    fn 主机大小写与尾斜杠归一() {
+        assert!(same_page_url(
+            "https://WWW.Goofish.com/item/",
+            "https://www.goofish.com/item"
+        ));
+        assert!(same_page_url(
+            "https://www.goofish.com/item?id=1",
+            "https://WWW.Goofish.com/item?id=1"
+        ));
     }
 }

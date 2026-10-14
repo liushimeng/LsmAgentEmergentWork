@@ -238,8 +238,9 @@ struct WinState {
     submit: HWND,
     extend: HWND,
     guard: HWND,
-    /// 2026-10-13(二):「🎮 侵入式」互切按钮。
-    intrusive: HWND,
+    /// 2026-10-13(二):「🎮 侵入式」互切按钮(句柄;模式位另见 `intrusive: bool`,
+    /// 与 macOS 版 views.intrusive / st.intrusive 的拆分对齐)。
+    intrusive_btn: HWND,
     /// 2026-10-13(二):侵入式触控板子窗口(缺省隐藏)。
     pad: HWND,
     copy: HWND,
@@ -313,7 +314,7 @@ impl Controls {
             submit: st.submit,
             extend: st.extend,
             guard: st.guard,
-            intrusive: st.intrusive,
+            intrusive: st.intrusive_btn,
             pad: st.pad,
             copy: st.copy,
         }
@@ -529,7 +530,7 @@ fn relay_toggle() {
         } else {
             super::dialog_main::INTRUSIVE_BTN_TITLE
         };
-        (line, title, st.intrusive, st.pad, st.msg, st.input, st.opts.clone(), now_on)
+        (line, title, st.intrusive_btn, st.pad, st.msg, st.input, st.opts.clone(), now_on)
     };
     println!("{line}");
     unsafe {
@@ -953,7 +954,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     );
     // 2026-10-13(二):「🎮 侵入式」互切按钮 + 触控板子窗口(缺省隐藏;事件经
     // pad_wnd_proc 归一化后以 relay 中间行回放为 CDP 可信物理输入)。
-    let intrusive = create_control(
+    let intrusive_btn = create_control(
         hwnd,
         hinst,
         "BUTTON",
@@ -1023,7 +1024,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         submit,
         extend,
         guard,
-        intrusive,
+        intrusive_btn,
         pad,
         copy,
         options: p.options.clone(),
