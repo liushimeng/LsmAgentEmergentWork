@@ -735,9 +735,17 @@ mod tests {
     }
 
     #[test]
-    fn 无filter_时脚本不含数值段() {
+    fn 无filter_时数值段以null注入且运行期守卫恒在() {
+        // 设计:数值三常量**恒注入**(build_js 不分支生成脚本),无 filter 时注入
+        // null,由运行期守卫 `NUM_MIN !== null || NUM_MAX !== null` 跳过数值段 ——
+        // 旧断言「无 filter 时脚本不含数值段」与该设计矛盾(实现恒注入),已对齐。
         let js = build_js(".item", "a", &[], &FilterSpec::default(), 100, 50);
-        assert!(!js.contains("NUM_MIN !== null"));
+        assert!(js.contains("NUM_MIN = null"), "无 filter 时 NUM_MIN 注入 null");
+        assert!(js.contains("NUM_MAX = null"), "无 filter 时 NUM_MAX 注入 null");
+        assert!(
+            js.contains("NUM_MIN !== null || NUM_MAX !== null"),
+            "运行期守卫恒在"
+        );
     }
 
     #[test]

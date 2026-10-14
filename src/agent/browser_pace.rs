@@ -909,6 +909,7 @@ mod tests {
 
     #[test]
     fn 账本快照_总账零时无字段_有史时含总数阈值与冷却() {
+        let _g = env_lock(); // env 解析测试并行会改阈值变量,读者同样持锁防竞态
         let p = pace();
         assert!(p.wipe_ledger_snapshot("liepin.com").is_none());
         p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
@@ -925,6 +926,7 @@ mod tests {
     /// 数秒后被抹」序列必须单调累积,持久熔断如期在阈值处触发。
     #[test]
     fn 补记账语义复演_落地假恢复不清账_攒到阈值熔断() {
+        let _g = env_lock(); // 同 账本快照 注:阈值变量读者持锁防并行竞态
         let p = pace();
         for _ in 0..3 {
             // 每次导航:open 结算落地非 blank(不清账)→ 10s 后看护判定被抹(+1)
@@ -989,6 +991,7 @@ mod tests {
 
     #[test]
     fn 整页抹除_总账达阈值后laew身份持久熔断_用户身份不受影响() {
+        let _g = env_lock(); // 阈值变量读者持锁防与 env 解析测试并行竞态(基线既有偶发)
         let p = pace();
         for _ in 0..wipe_total_threshold() {
             p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
@@ -1011,6 +1014,7 @@ mod tests {
 
     #[test]
     fn 整页抹除_存活过看护窗后总账清零恢复() {
+        let _g = env_lock(); // 同 账本快照 注:阈值变量读者持锁防并行竞态
         let p = pace();
         for _ in 0..wipe_total_threshold() {
             p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
