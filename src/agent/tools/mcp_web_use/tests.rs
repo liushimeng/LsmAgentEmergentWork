@@ -12,6 +12,64 @@ fn envelope_codes() {
     assert!(s.contains("\"x\":1"));
 }
 
+// ==================== 2026-10-14 第三轮:control 顶层参数别名归一化 ====================
+
+/// 猎聘实测(`llaew_20261014_145428.log`):模型按系统提示词自然写法把 request_human
+/// 的 message/reason/options 放顶层,Schema additionalProperties=false 三连拒,
+/// 烧 3 轮迭代 —— 别名提升后首个形态即可用。
+#[test]
+fn 顶层别名提升_request_human三键与通用键进入params() {
+    let args = json!({
+        "action": "control",
+        "control_action": "request_human",
+        "page_id": "p_x",
+        "message": "请在弹窗完成登录",
+        "reason": "login",
+        "options": ["我已完成", "页面是空的"],
+    });
+    let mut params = json!({});
+    control::lift_top_level_control_aliases(&args, &mut params);
+    assert_eq!(params["message"], "请在弹窗完成登录");
+    assert_eq!(params["reason"], "login");
+    assert_eq!(params["options"][1], "页面是空的");
+}
+
+/// url/timeout_ms/force 本就是顶层合法字段,但 control 读 params.* —— 顶层传入
+/// 曾静默丢失(navigate 1001 缺 url / wait 时长不生效 / force 逃生口失灵)。
+#[test]
+fn 顶层别名提升_url_timeout_force进入params() {
+    let args = json!({
+        "action": "control",
+        "control_action": "navigate",
+        "page_id": "p_x",
+        "url": "https://www.liepin.com/zhaopin/",
+        "timeout_ms": 1500,
+        "force": true,
+    });
+    let mut params = json!({});
+    control::lift_top_level_control_aliases(&args, &mut params);
+    assert_eq!(params["url"], "https://www.liepin.com/zhaopin/");
+    assert_eq!(params["timeout_ms"], 1500);
+    assert_eq!(params["force"], true);
+}
+
+/// 显式 params 永远优先;非别名键(如 selector)不提升。
+#[test]
+fn 顶层别名提升_显式params优先且不提升无关键() {
+    let args = json!({
+        "action": "control",
+        "control_action": "request_human",
+        "message": "顶层值",
+        "selector": "#login",
+        "params": {"message": "params 值", "unlock_page": false},
+    });
+    let mut params = args["params"].clone();
+    control::lift_top_level_control_aliases(&args, &mut params);
+    assert_eq!(params["message"], "params 值", "显式 params 优先");
+    assert_eq!(params["unlock_page"], false);
+    assert!(params.get("selector").is_none(), "selector 不是别名,不应提升");
+}
+
 // ==================== 第 140 轮:inspect 体积闸门 ====================
 
 #[test]

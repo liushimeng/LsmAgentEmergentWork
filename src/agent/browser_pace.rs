@@ -321,7 +321,9 @@ impl WebPace {
     ///   达 [`wipe_total_threshold`] 后对 laew 身份持久熔断);连击 ≥
     ///   [`WIPE_STREAK_THRESHOLD`] 触发 `cause=site_wipe` 冷却(幂等取更晚;
     ///   未过阈值不拦截,靠 page_health 证据引导);
-    /// - 落地非 blank → 连击与总账一并清零(瞬态首击/恢复均走这里);
+    /// - 落地非 blank → **不清账**(2026-10-14 第三轮:抹除实测发生在导航完成后
+    ///   4~10s,落地成功只是假恢复;清账只认 [`Self::note_navigation_survived`]
+    ///   的「存活过看护窗」证据);
     /// - 请求 URL 不可解析 host / 落地为空 → 不记账。
     ///
     /// 返回 `Some` 仅当本次落地被计为抹除连击(调用方据此在响应里附 `site_wipe` 段)。
@@ -335,10 +337,12 @@ impl WebPace {
         }
         let host = host_of(requested_url)?;
         if !landed_url.trim().eq_ignore_ascii_case("about:blank") {
-            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            guard.wipe_streak.remove(&host);
-            // 恢复证据:该域能正常落地 → 总账清零(laew 身份不再熔断)。
-            guard.wipe_total.remove(&host);
+            // 2026-10-14 第三轮:**落地非 blank 不清账**。抹除实测发生在导航完成后
+            // 4~10s(猎聘 `llaew_20261014_145428.log`),落地成功只说明「结算那一
+            // 刻没被抹」。若此处清零,后台看护补记的抹除会被下一次导航的假成功
+            // 清掉,总账永远归零、持久熔断(阈值 3)永不触发(实测轨迹
+            // 0→1→0→1→2→0)。清账改由 [`Self::note_navigation_survived`] 执行 ——
+            // 页面**存活过看护窗**才是真恢复证据。
             return None;
         }
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,9 +378,74 @@ impl WebPace {
             .unwrap_or(0)
     }
 
+    /// 恢复记账(2026-10-14 第三轮):页面**存活过看护窗**(后台看护复读落地 URL
+    /// 仍非 blank 且是 http(s))时,清该域连击与总账,并解除 `cause=site_wipe`
+    /// 冷却 —— 这是真实恢复证据(新会话没被打标),恢复路径不被自己的熔断卡住。
+    /// 仅「落地成功」不清账(抹除在其后 4~10s 发生,落地成功只是假恢复)。
+    /// 返回是否确有账目被清(供看护任务按需打日志/测试)。
+    pub fn note_navigation_survived(&self, requested_url: &str) -> bool {
+        if !enabled() {
+            return false;
+        }
+        let Some(host) = host_of(requested_url) else {
+            return false;
+        };
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let had_streak = guard.wipe_streak.remove(&host).is_some();
+        let had_total = guard.wipe_total.remove(&host).is_some();
+        // 只解抹除成因的冷却,频控冷却不动(频控靠时间,与本环境恢复无关)。
+        if guard.cooldown_cause.get(host.as_str()) == Some(&CAUSE_SITE_WIPE) {
+            guard.cooldown_until.remove(host.as_str());
+            guard.cooldown_cause.remove(host.as_str());
+        }
+        had_streak || had_total
+    }
+
     /// 该域是否已达 laew 身份持久熔断(总账 ≥ 阈值)。
     pub fn wipe_exhausted(&self, host: &str) -> bool {
         self.wipe_total_for(host) >= wipe_total_threshold()
+    }
+
+    /// 该域当前抹除连击数(2026-10-14 第三轮,供「连击域跳过徒劳重导航」判定)。
+    pub fn wipe_streak_for(&self, host: &str) -> u32 {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wipe_streak
+            .get(host)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 该域是否已被证实整页抹除(连击 ≥1 或冷却中)——**已证实的抹除域**再导航
+    /// 大概率照样被抹:① 跳过「首航落 blank 原地重导航」自愈(那是给瞬态 WAF
+    /// 首击设计的,对抹除域只是再吃一次风控请求、多闪一次窗口);② 响应附
+    /// 局势提示。瞬态首击(streak=0 且无冷却)不受影响,自愈照常。
+    pub fn wipe_flagged(&self, host: &str) -> bool {
+        self.wipe_streak_for(host) >= 1 || self.cooldown_remaining_for(host).is_some()
+    }
+
+    /// 该域抹除账本快照(2026-10-14 第三轮):总账 >0 才返回 `Some`,供 open/navigate
+    /// 响应附 `site_wipe_ledger` 字段 —— 落地成功但域有抹除史时,LLM 一眼看到
+    /// 「该域已被抹 N 次」的局势,不再按正常站点推进(实测:总账只在 6004 拦截
+    /// 或当场抹除时可见,成功落地时模型对风险零感知)。
+    pub fn wipe_ledger_snapshot(&self, host: &str) -> Option<serde_json::Value> {
+        let total = self.wipe_total_for(host);
+        if total == 0 {
+            return None;
+        }
+        let cooldown_secs = self
+            .cooldown_remaining_for(host)
+            .map(|d| d.as_secs().max(1))
+            .unwrap_or(0);
+        Some(serde_json::json!({
+            "total": total,
+            "streak": self.wipe_streak_for(host),
+            "threshold": wipe_total_threshold(),
+            "cooldown_remaining_secs": cooldown_secs,
+            "note": "该域曾对本环境整页抹除(站点反爬):本页当前正常不代表安全,数秒后仍可能被抹;\
+多次抹除达阈值后 laew 身份导航将被持久熔断;采集到的数据应尽快落盘",
+        }))
     }
 
     /// 冷却成因(`rate_limited` / `site_wipe`);无有效冷却返回 `None`。
@@ -398,8 +467,9 @@ impl WebPace {
     /// **不清 `wipe_total` 总账**(2026-10-14 第二轮):指纹级打标站点(猎聘实测)
     /// 对 CDP 拉起环境本身打标,close(all)+全新 profile 照样被抹 —— 总账若随
     /// clear_all 清零,LLM 每 close 一次就重置熔断,形成「拉起 Chrome → 被抹 →
-    /// close → 再拉起」的风暴(实测 9 分钟 8 台)。总账只在「该域落地非 blank」
-    /// (`note_navigation_outcome` 恢复路径)时清零。
+    /// close → 再拉起」的风暴(实测 9 分钟 8 台)。总账只在「页面存活过看护窗」
+    /// ([`Self::note_navigation_survived`],后台看护复读落地 URL 仍非 blank)
+    /// 时清零。
     pub fn clear_all(&self) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.cooldown_until.clear();
@@ -541,14 +611,23 @@ pub async fn guard_navigation(
 }
 
 /// 持久熔断信封(纯函数,便于单测):`total >= threshold` 才构造,否则 `None`。
+///
+/// 2026-10-14 第三轮:附 `relaunch_command`(用户日常 Chrome 以调试端口重启的命令,
+/// 纯字符串拼装)—— 之前模型要走一轮 3002 才拿到可转述命令,而日常 Chrome 无调试
+/// 端口时它只会 auto_relaunch(又是 laew 身份实例,照样被抹),指引不闭环。
 fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<String> {
     if total < threshold {
         return None;
     }
+    let relaunch_command = crate::agent::browser_reuse::relaunch_command_string(
+        crate::agent::browser_reuse::debug_port(),
+        &crate::agent::browser_reuse::debug_profile_dir(),
+    );
     let msg = format!(
         "站点整页抹除持久熔断({host}):已对 laew 拉起环境累计抹除 {total} 次(≥{threshold}),\
 判定为指纹级打标 —— close(all) 换全新 profile/调试实例重试均被实测无效且每试一次多弹一台 Chrome。\
-只剩两条出路:① open(reuse_existing=true) 接管**用户日常 Chrome**(真实指纹+登录态,不受此熔断);\
+只剩两条出路:① open(reuse_existing=true) 接管**用户日常 Chrome**(真实指纹+登录态,不受此熔断;\
+未开调试端口时把 data.relaunch_command 转述给用户执行后再接管,不要用 auto_relaunch —— 那仍是 laew 身份);\
 ② request_human 如实交还现场由人工处理;已采集数据先落盘。确需硬闯可 params.force=true"
     );
     let data = json!({
@@ -557,8 +636,12 @@ fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<St
         "persistent": true,
         "wipe_total": total,
         "wipe_total_threshold": threshold,
+        "relaunch_command": relaunch_command,
+        "relaunch_hint": "让用户以其日常 Chrome 执行 relaunch_command(独立调试 profile,不影响已打开窗口);\
+完成后 open(reuse_existing=true) 即接管真实指纹环境",
         "advice": "该域已对 laew 拉起的浏览器环境(含全新 profile 与 auto_relaunch 调试实例)做指纹级打标,\
-继续重试只会反复弹 Chrome 窗口并再次被抹除。处置:① open(reuse_existing=true) 接管用户日常 Chrome(真实指纹+登录态);\
+继续重试只会反复弹 Chrome 窗口并再次被抹除。处置:① 把 data.relaunch_command 转述给用户以其日常 Chrome 执行,\
+再 open(reuse_existing=true) 接管(真实指纹+登录态,不受此熔断;auto_relaunch 无效,别再试);\
 ② request_human 人工协助;已采集数据先落盘。确需立即导航可 params.force=true",
         "force_hint": "确认必须立即导航时,可在 params 加 force=true 跳过节奏闸强制执行",
     });
@@ -772,14 +855,20 @@ mod tests {
     }
 
     #[test]
-    fn 整页抹除_落地正常页面即清零连击() {
+    fn 整页抹除_落地非blank不清账_存活过看护窗才清零() {
         let p = pace();
         p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
-        // 瞬态首击形态:open 内部重导航成功 → 落地目标站 → 连击清零
+        // 2026-10-14 第三轮:落地非 blank 不清账(抹除发生在其后 4~10s,落地成功
+        // 只是假恢复 —— 清掉会让后台补记账归零、熔断永不触发)。
         assert_eq!(
             p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/"),
             None
         );
+        assert_eq!(p.wipe_streak_for("liepin.com"), 1, "落地成功不清连击");
+        // 后台看护复读仍存活 = 真实恢复证据 → 清零
+        assert!(p.note_navigation_survived("https://www.liepin.com/"));
+        assert_eq!(p.wipe_streak_for("liepin.com"), 0);
+        assert_eq!(p.wipe_total_for("liepin.com"), 0);
         // 再次单次 blank 仍是连击 1,不触发
         let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
         assert_eq!(o.map(|x| (x.streak, x.cooldown_triggered)), Some((1, false)));
@@ -800,6 +889,69 @@ mod tests {
         let p = pace();
         assert_eq!(p.note_navigation_outcome("about:blank", "about:blank"), None);
         assert_eq!(p.note_navigation_outcome("not a url", "about:blank"), None);
+    }
+
+    // ==================== 2026-10-14 第三轮:后台补记账 + 局势可见性 ====================
+
+    #[test]
+    fn wipe_flagged_连击或冷却成立为真_存活恢复后为假() {
+        let p = pace();
+        assert!(!p.wipe_flagged("liepin.com"), "无任何抹除记录不应判定为抹除域");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        assert!(p.wipe_flagged("liepin.com"), "连击 1 即已证实抹除(跳过重导航自愈)");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        assert!(p.wipe_flagged("liepin.com"), "冷却中同样为真");
+        // 存活过看护窗 = 真实恢复:连击清零后(冷却未到)不再判定为抹除域,
+        // 瞬态首击自愈照常。
+        p.note_navigation_survived("https://www.liepin.com/");
+        assert!(!p.wipe_flagged("liepin.com"));
+    }
+
+    #[test]
+    fn 账本快照_总账零时无字段_有史时含总数阈值与冷却() {
+        let p = pace();
+        assert!(p.wipe_ledger_snapshot("liepin.com").is_none());
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        let snap = p.wipe_ledger_snapshot("liepin.com").expect("有抹除史应有快照");
+        assert_eq!(snap["total"], 1);
+        assert_eq!(snap["streak"], 1);
+        assert_eq!(snap["threshold"], wipe_total_threshold());
+        // 存活过看护窗(恢复)清总账 → 快照恢复为 None
+        assert!(p.note_navigation_survived("https://www.liepin.com/"));
+        assert!(p.wipe_ledger_snapshot("liepin.com").is_none());
+    }
+
+    /// 猎聘实测总账轨迹 0→1→0→1→2→0 的复演:补记账(后台看护)后「落地成功→
+    /// 数秒后被抹」序列必须单调累积,持久熔断如期在阈值处触发。
+    #[test]
+    fn 补记账语义复演_落地假恢复不清账_攒到阈值熔断() {
+        let p = pace();
+        for _ in 0..3 {
+            // 每次导航:open 结算落地非 blank(不清账)→ 10s 后看护判定被抹(+1)
+            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/");
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        }
+        assert_eq!(p.wipe_total_for("liepin.com"), 3, "补记账后总账应单调累积");
+        assert!(p.wipe_exhausted("liepin.com"), "累计达阈值即熔断");
+        let env = persistent_wipe_envelope("liepin.com", 3, wipe_total_threshold())
+            .expect("达阈值构造熔断信封");
+        let v: serde_json::Value = serde_json::from_str(&env).unwrap();
+        assert_eq!(v["data"]["persistent"], true);
+        // 2026-10-14 第三轮:熔断信封必须附可转述给用户的重启命令
+        let cmd = v["data"]["relaunch_command"].as_str().unwrap_or("");
+        assert!(!cmd.trim().is_empty(), "relaunch_command 不得为空");
+        assert!(
+            v["data"]["advice"].as_str().unwrap_or("").contains("relaunch_command"),
+            "advice 须指引转述 relaunch_command"
+        );
+        // 真实恢复(存活过看护窗)后总账清零,熔断解除 —— 恢复路径不被卡死
+        p.note_navigation_survived("https://www.liepin.com/");
+        assert!(!p.wipe_exhausted("liepin.com"));
+    }
+
+    #[test]
+    fn 熔断信封_未达阈值为空() {
+        assert!(persistent_wipe_envelope("liepin.com", 2, wipe_total_threshold()).is_none());
     }
 
     #[test]
@@ -858,19 +1010,24 @@ mod tests {
     }
 
     #[test]
-    fn 整页抹除_落地正常后总账清零恢复() {
+    fn 整页抹除_存活过看护窗后总账清零恢复() {
         let p = pace();
         for _ in 0..wipe_total_threshold() {
             p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
         }
         assert!(p.wipe_exhausted("liepin.com"));
-        // 恢复证据(如接管用户日常 Chrome 后成功落地):总账清零
+        // 仅「落地成功」不算恢复(抹除发生在其后 4~10s):
         assert_eq!(
             p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/"),
             None
         );
+        assert!(p.wipe_exhausted("liepin.com"), "落地成功不解除熔断");
+        // 恢复证据(后台看护复读仍存活,如接管用户日常 Chrome 后稳定落地):
+        // 总账与抹除冷却一并清零
+        assert!(p.note_navigation_survived("https://www.liepin.com/"));
         assert!(!p.wipe_exhausted("liepin.com"));
         assert_eq!(p.wipe_total_for("liepin.com"), 0);
+        assert_eq!(p.cooldown_remaining_for("liepin.com"), None);
     }
 
     #[test]

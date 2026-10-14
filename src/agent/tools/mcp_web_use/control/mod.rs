@@ -244,6 +244,25 @@ fn parse_region(p: &Value) -> Option<(i64, i64, i64, i64)> {
 }
 
 /// control 分发入口。
+/// 2026-10-14 第三轮:control 顶层参数别名归一化(纯函数)。
+///
+/// 背景:系统提示词的 `control(request_human, reason=…, message=…)` 自然写法诱导
+/// 模型把字段放顶层,Schema additionalProperties=false 三连拒(猎聘实测
+/// `llaew_20261014_145428.log` 烧 3 轮迭代 + doom_loop 告警);`url/timeout_ms/force`
+/// 本就是顶层合法字段,但 control 读的是 params.* —— 顶层传入会静默丢失
+/// (navigate 1001 缺 url / wait 时长不生效 / force 逃生口失灵)。
+/// 规则:**仅当 params 缺该键时**把顶层值提升进 params,显式 params 永远优先。
+pub(super) fn lift_top_level_control_aliases(args: &Value, params: &mut Value) {
+    const LIFTABLE: [&str; 6] = ["message", "reason", "options", "url", "timeout_ms", "force"];
+    for key in LIFTABLE {
+        if params.get(key).is_none() {
+            if let Some(v) = args.get(key) {
+                params[key] = v.clone();
+            }
+        }
+    }
+}
+
 pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     let Some(id) = str_arg(&args, "page_id") else {
         return envelope(1001, "缺少 page_id", json!({}));
@@ -251,7 +270,9 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     let Some(action) = str_arg(&args, "control_action") else {
         return envelope(1001, "缺少 control_action", json!({}));
     };
-    let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
+    let mut params = args.get("params").cloned().unwrap_or_else(|| json!({}));
+    // 2026-10-14 第三轮:顶层别名归一化(见 lift_top_level_control_aliases 文档)。
+    lift_top_level_control_aliases(&args, &mut params);
     // 第 128 轮:任务锚点守卫 —— `navigate` / `new_tab` 是显式带 URL 的「主动选择目标站点」
     // 动作,与 `open` 同源(实测漂移发生点),必须同门把守。
     // 需要特殊信封(6001),不走通用 2002 映射,否则 LLM 会把越界当成「换 selector 重试」类
@@ -719,10 +740,19 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
             landed = late_landed;
             wipe_outcome = super::merge_wipe_outcome(wipe_outcome, late);
         }
+        // 2026-10-14 第三轮:落地非 blank → 后台 10s 抹除看护补账
+        // (延迟抹除实测 4~10s,同步复查覆盖不到;见 schedule_wipe_watch)。
+        if !landed.trim().eq_ignore_ascii_case("about:blank") {
+            super::schedule_wipe_watch(page.clone(), id, url, count_wipes);
+        }
     }
     if let Some(v) = super::site_wipe_field(wipe_outcome) {
         out["landed_url"] = json!(landed);
         out["site_wipe"] = v;
+    }
+    // 2026-10-14 第三轮:域有抹除史时附账本快照(落地成功也要看到局势)。
+    if let Some(v) = super::site_wipe_ledger_field(url) {
+        out["site_wipe_ledger"] = v;
     }
     if let Some(v) = super::page_health_field(id, &landed, url).await {
         out["landed_url"] = json!(landed);

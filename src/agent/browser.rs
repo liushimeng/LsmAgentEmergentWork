@@ -911,7 +911,12 @@ impl BrowserManager {
         // 仍 blank 才按原路径返回 page_health 诊断。launch/connect/new_window
         // 各路径统一受益;connect 模式同样做 —— open 语义本就是「此页导航到
         // url」,同 URL 原地刷新一次无害。
-        if final_url == "about:blank" {
+        // 2026-10-14 第三轮:已证实的抹除域(streak≥1/冷却中)跳过自愈 —— 重导航
+        // 只会再吃一次风控请求、多闪一次窗口;自愈是给瞬态 WAF 首击的。
+        let wipe_flagged = crate::agent::browser_pace::host_of(url)
+            .map(|h| crate::agent::browser_pace::WebPace::global().wipe_flagged(&h))
+            .unwrap_or(false);
+        if final_url == "about:blank" && !wipe_flagged {
             tracing::warn!(
                 url,
                 "open 首航落 about:blank(WAF 首击/导航竞态),原地重导航一次"

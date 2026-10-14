@@ -594,6 +594,120 @@ pub(super) async fn deferred_wipe_check(
     Some((landed, outcome))
 }
 
+// =================== 2026-10-14 第三轮:后台抹除看护(wipe watcher) ===================
+//
+// 缺口(猎聘实测 `llaew_20261014_145428.log`):整页抹除实测发生在导航完成后
+// 4~10s,而 deferred_wipe_check 只在有史域做一次 3.5s 同步复查,且「落地非 blank
+// 即清总账」让「先落地成功→数秒后被抹」的序列先清零后无补账 —— 总账轨迹实测
+// 0→1→0→1→2→0,持久熔断(阈值 3)永不触发,close(all)→重开的换 profile 循环
+// 不受限,Chrome 反复拉起(单任务 4 台)。本看护在每次 laew 身份导航落地非 blank
+// 后 spawn 10s 异步任务复读落地 URL,变 blank 即 note_navigation_outcome 补账,
+// 总账/连击/冷却/持久熔断全链路如期生效。
+
+/// 后台抹除看护代际表:page_id → 最新一次被看护导航的代际号。同页后续导航
+/// bump 代际,旧看护任务醒来后发现自己过期即放弃 —— 防止把「新导航的落地页」
+/// 误记为旧请求被抹。
+static WIPE_WATCH_GEN: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+/// 看护窗时长:覆盖实测 4~10s 的延迟抹除。
+const WIPE_WATCH_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn wipe_watch_bump(page_id: &str) -> u64 {
+    let map = WIPE_WATCH_GEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    let gen = guard.entry(page_id.to_string()).or_insert(0);
+    *gen += 1;
+    *gen
+}
+
+fn wipe_watch_stale(page_id: &str, gen: u64) -> bool {
+    WIPE_WATCH_GEN
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| g.get(page_id).copied())
+        .map(|cur| cur != gen)
+        .unwrap_or(true)
+}
+
+/// 后台延迟抹除看护:`count=true`(launch 实例 / laew relaunch 调试实例)的导航
+/// 落地非 blank 后调用。用户日常 Chrome 不看护(落地行为归用户,不进熔断账本)。
+pub(super) fn schedule_wipe_watch(
+    page: chromiumoxide::Page,
+    page_id: &str,
+    requested_url: &str,
+    count: bool,
+) {
+    if !count {
+        return;
+    }
+    if crate::agent::browser_pace::host_of(requested_url).is_none() {
+        return;
+    }
+    let gen = wipe_watch_bump(page_id);
+    let pid = page_id.to_string();
+    let url = requested_url.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(WIPE_WATCH_DELAY).await;
+        if wipe_watch_stale(&pid, gen) {
+            return; // 同页已有更新的导航接管,旧请求的看护作废
+        }
+        let landed = page.url().await.ok().flatten().unwrap_or_default();
+        if !landed.trim().eq_ignore_ascii_case("about:blank") {
+            // 存活过看护窗 = 真实恢复证据:清该域连击与总账(仅「落地成功」不清 ——
+            // 抹除发生在其后 4~10s,假成功会把补记账清掉,熔断永不触发)。
+            // 回读为空(句柄已死/页已关)不算存活,不清账。
+            if landed.starts_with("http") {
+                let cleared = crate::agent::browser_pace::WebPace::global()
+                    .note_navigation_survived(&url);
+                if cleared {
+                    tracing::info!(
+                        requested_url = %url,
+                        "后台抹除看护:页面存活过看护窗,清该域抹除连击与总账(恢复路径)"
+                    );
+                }
+            }
+            return;
+        }
+        let outcome = crate::agent::browser_pace::WebPace::global()
+            .note_navigation_outcome(&url, &landed);
+        tracing::warn!(
+            requested_url = %url,
+            streak = outcome.as_ref().map(|o| o.streak).unwrap_or(0),
+            "后台抹除看护命中:导航返回后约 10s 页面被站点脚本重定向到 about:blank(已补账:连击/总账/冷却)"
+        );
+    });
+}
+
+/// open/navigate 响应附抹除账本快照(2026-10-14 第三轮):该域总账 >0 时返回
+/// `site_wipe_ledger` 字段 —— 落地成功但域有抹除史时,LLM 一眼看到局势,
+/// 数据尽快落盘、别按正常站点推进。纯转发 [`WebPace::wipe_ledger_snapshot`]。
+pub(super) fn site_wipe_ledger_field(requested_url: &str) -> Option<Value> {
+    let host = crate::agent::browser_pace::host_of(requested_url)?;
+    crate::agent::browser_pace::WebPace::global().wipe_ledger_snapshot(&host)
+}
+
+/// auto_relaunch 成功信封补抹除预警(2026-10-14 第三轮):复制登录态的调试实例
+/// 仍属 CDP 拉起环境,指纹级打标站点照样被抹(猎聘实测)。该域有抹除史时在
+/// data 上附 `site_wipe_warning`,引导模型被抹后直接转用户日常 Chrome 接管,
+/// 不要再 close(all) 换 profile 硬闯一轮。只补 code=0 信封(失败信封自有指引)。
+fn annotate_wipe_warning(res: &str, url: &str) -> Option<String> {
+    let host = crate::agent::browser_pace::host_of(url)?;
+    let ledger = crate::agent::browser_pace::WebPace::global().wipe_ledger_snapshot(&host)?;
+    let mut v: Value = serde_json::from_str(res).ok()?;
+    if v.get("code").and_then(Value::as_i64) != Some(0) {
+        return None;
+    }
+    v["data"]["site_wipe_warning"] = json!({
+        "ledger": ledger,
+        "note": "该域曾整页抹除本环境:auto_relaunch 实例仍属 CDP 拉起环境,可能同样被抹;\
+若本页数秒后变 about:blank,不要再 close(all) 换 profile 硬闯 —— 把 3002/6004 信封里的 relaunch_command 转述给用户以其日常 Chrome 执行后 open(reuse_existing=true) 接管,或 request_human",
+    });
+    serde_json::to_string(&v).ok()
+}
+
 /// 第 161 轮:open 响应主文档健康诊断(fail-open;不命中不带字段,零噪声)。
 ///
 /// 背景(内网站点实测 llaew_20261012_160035 日志):主文档被 WAF 返回 HTTP 400 空
@@ -918,7 +1032,10 @@ async fn run_open_reuse(args: &Value, url: &str) -> Result<String> {
                         return Ok(rewritten);
                     }
                 }
-                Ok(res)
+                // 2026-10-14 第三轮:该域有抹除史时补 site_wipe_warning —— 复制登录态
+                // 的调试实例仍属 CDP 拉起环境,指纹级打标站点照样被抹(猎聘实测),
+                // 提前预警「被抹后转用户日常 Chrome 接管」,别再 close(all) 硬闯一轮。
+                Ok(annotate_wipe_warning(&res, url).unwrap_or(res))
             }
             None => envelope(
                 CODE_REUSE_UNAVAILABLE,
@@ -1129,7 +1246,14 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                         .unwrap_or_else(|| url.to_string());
                     // 第 170 轮:复用路径同享首航空白自愈(猎聘 WAF 首击实测:
                     // 首次导航落 about:blank,同页二次导航即成功)。
-                    if final_url == "about:blank" {
+                    // 2026-10-14 第三轮:已证实的抹除域(streak≥1/冷却中)跳过 ——
+                    // 重导航只会再吃一次风控请求、多闪一次窗口(自愈是给瞬态首击的)。
+                    let wipe_flagged = crate::agent::browser_pace::host_of(url)
+                        .map(|h| {
+                            crate::agent::browser_pace::WebPace::global().wipe_flagged(&h)
+                        })
+                        .unwrap_or(false);
+                    if final_url == "about:blank" && !wipe_flagged {
                         tracing::warn!(
                             url,
                             "open 复用路径首航落 about:blank,原地重导航一次"
@@ -1171,6 +1295,11 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                             title = page.get_title().await.ok().flatten().unwrap_or_default();
                             wipe_outcome = merge_wipe_outcome(wipe_outcome, late);
                         }
+                        // 2026-10-14 第三轮:落地非 blank → 后台 10s 抹除看护补账
+                        // (延迟抹除实测 4~10s,同步复查覆盖不到;见 schedule_wipe_watch)。
+                        if !final_url.trim().eq_ignore_ascii_case("about:blank") {
+                            schedule_wipe_watch(page.clone(), &pid, url, count_wipes);
+                        }
                     }
                     // 第 146 轮:访问台账记账(导航成功后;重复访问警示随响应附带)
                     visit_ledger::record_visit(
@@ -1198,6 +1327,10 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     }
                     if let Some(v) = site_wipe_field(wipe_outcome) {
                         payload["site_wipe"] = v;
+                    }
+                    // 2026-10-14 第三轮:域有抹除史时附账本快照(落地成功也要看到局势)。
+                    if let Some(v) = site_wipe_ledger_field(url) {
+                        payload["site_wipe_ledger"] = v;
                     }
                     if closed_blanks > 0 {
                         payload["closed_blank_pages"] = json!(closed_blanks);
@@ -1324,6 +1457,11 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                         title = String::new();
                         wipe_outcome = merge_wipe_outcome(wipe_outcome, late);
                     }
+                    // 2026-10-14 第三轮:落地非 blank → 后台 10s 抹除看护补账
+                    // (延迟抹除实测 4~10s,同步复查覆盖不到;见 schedule_wipe_watch)。
+                    if !final_url.trim().eq_ignore_ascii_case("about:blank") {
+                        schedule_wipe_watch(page.clone(), &page_id, url, count_wipes);
+                    }
                 }
             }
             // 第 142 轮:connect 模式(接管外部浏览器)判定,供 guard/overlay 字段分路提示。
@@ -1385,6 +1523,10 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
             }
             if let Some(v) = site_wipe_field(wipe_outcome) {
                 data["site_wipe"] = v;
+            }
+            // 2026-10-14 第三轮:域有抹除史时附账本快照(落地成功也要看到局势)。
+            if let Some(v) = site_wipe_ledger_field(url) {
+                data["site_wipe_ledger"] = v;
             }
             if closed_blanks > 0 {
                 data["closed_blank_pages"] = json!(closed_blanks);
@@ -2084,10 +2226,10 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 【多窗口并行(多站点同时工作)】同一窗口的后台 Tab 会被挂起(见上条),「天猫+京东双站同时比价/监控」类任务需要**两个站点同时活跃**:用 `open(url, new_window=true)` 或 `control(new_window, params={url})` 给每个站点一个**独立可见窗口** —— 单浏览器进程多窗口,profile/登录态/HITL/下载全共享;各窗口互不遮挡时页面同时活跃、互不挂起(窗口打开后自动横向平铺防互相遮挡,平铺报告见 data.windows;前后台状态看 list 的 foreground/window_id)。单 Agent 可跨窗口交替操作两个 page_id;任务可分解时也推荐 SubAgent 分工 —— 每个子 Agent 负责一个窗口的页面,天然并行。限制:仅 headed 模式;connect(接管用户浏览器)不支持;窗口数上限 LAEW_WEB_MAX_WINDOWS(默认 4);窗口内最后一页 close 后 Chrome 自动收窗。
 【焦点与操作节奏】CDP 操作(点击/输入/滚动/截图/读 DOM)全部不需要 Chrome 有键盘焦点,日常操作不要调用 bring_to_front;键盘焦点占用只发生在 open 启动浏览器、request_human 人工介入、6003 后台页取证这三处,且系统在动作收口后会把焦点自动归还给用户原先的应用(缺省行为,响应附 focus_restored 对账;用户要全程盯屏观看时可设 LAEW_WEB_FOCUS=always)。置前与人工介入是用户注意力被占用的时刻:动手前先用 explore/inspect 把现场与步骤规划好,再用 sequence/batch 一次打包做完,避免逐步置前、逐步试错来回打断人工;人工正在其它窗口打字时,更要避免触发置前类动作。
 【错误码对策】1001 修正参数(含 guard 档位类:partial 缺 allow_selectors/block_selectors 之一、两者互斥、locked/open 不收选择器);2000 page_id 失效→action=list 重新同步;2001 断连→重新 open;2002 换 selector 重试;input 类失败先看响应里的 value_after/fallbacks 判断卡在哪一级(input_text 已自动尝试 JS 赋值/CDP 逐键/慢速逐字三级阶梯);press_sequence 带 selector 会先聚焦再按键;key_press 键名大小写不敏感(enter/esc/space/del/方向键等),多字符按键名不是合法按键;3001 未安装浏览器→如实告知用户,不要编造结果;**3002 复用浏览器不可用(调试端口未开启)→ 把 data.relaunch_command 转述用户执行,或以 auto_relaunch=true 重试(自动复制登录态并另启独立调试实例,不退出用户已打开的浏览器);不要反复重试 open**;**6001 目标站点越界(任务锚点)→ 立即停止该路径,如实报告「目标站点不可达或未指定」并结束本单元;严禁改用其它站点、搜索引擎、缓存或名称相似的替代品 —— 可以失败,不可以乱跑**;**6002 人工核验弹窗在场,输入动作已拦截 → 不要重试、不要换 eval_js 绕过(可变更 eval 同样被拦);桌面环境下工具会**自动弹出人工介入弹窗**等人工处理(2026-10-13,应答结果在 data.auto_hitl,人工点「继续」后直接重试本动作即可;LAEW_HITL_AUTO=off 关闭回退提示模式,此时按 data.human_assist 载荷 request_human(reason=captcha) 让人工完成);确认是结构误判才可 params.force=true 强制执行**;**6003 页面后台挂起 → 截图/OCR 在后台标签页必然失真,严禁拿旧截图当证据;按 data.required_action 三选一(params.focus=true 重试自动前台化 / 先 control(bring_to_front) / 该页不再需要则 close 收口),确认后台截图可用才 params.force=true**。
-【页面管控三档(第 143 轮,仅 headed 可视化模式)】guard 决定人工对页面的操作权限,按用户意图选档:**用户没说要自己动手/缺省 → locked**(防交叉操作是安全基线,含支付/删除等高风险动作的任务必须 locked);**用户说「我自己操作/我来点/我先登录/你看着」→ open(guard_note 写清引导)**;**用户要分区协作(「我操作登录框,你管其余/锁住支付按钮」)→ partial + allow_selectors(白名单)或 block_selectors(黑名单)**;信号不明确时 locked 起步、需要人工参与时经 request_human 询问。open/partial 下人工与 Agent 并发操作页面,**关键写操作前先 inspect 验证现场**再动手。人工登录先行流:open(guard="open", guard_note="请登录后应答弹窗…") → request_human(reason="login", message=…) → 人工在页面完成登录并应答 → set_guard(mode="locked") 回到防交叉基线 → 继续任务。运行时随时 set_guard 切换;蒙层/盾区/屏蔽页面状态栏与进度栏是设计行为不是页面故障,不要试图用 eval_js 移除。
-【人工介入(HITL)】遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/人脸核身等无法自动完成的流程:可视化场景确认 data.mode=headed(缺省即是,无需显式传 mode=headed),让人工看到窗口(蓝色边框标识,页面默认有半透明蒙层锁定人工输入——这是设计行为不是页面故障),再 control(request_human, reason=..., message=说明要人工做什么, options=[...]);**提问期间安全全面解除屏蔽(unlock_page 默认 true;第 167 轮:缺省整页 open——屏蔽页面状态栏显示「🔓 页面开放」+ guard_note「人工介入中·页面已全面解锁,可自由操作;完成后回弹窗点『提交 / 继续』」,人工自由拖滑块/扫码/登录/填表,点『提交 / 继续』交还控制权;显式传 allow_selectors 才走 partial 挖洞,自动并入挑战层选择器+覆盖验证,洞没罩住挑战回退整页 open;应答/超时/取消后自动恢复该页解锁前管控档;inspect(info=blockers) 命中时 data.credential_zones 给出可传 allow_selectors 的区域选择器)**;macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时,人工在弹窗点选项/输入验证码;第 145 轮:主按钮「提交 / 继续」双语义,人工在浏览器完成操作后空输入点击即交棒 Agent 接管;「⏱ +2分钟」可延长等待,总上限 30 分钟,实测人工整链登录超 120s 分档超时的根治;弹窗文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,也有「📋 复制」一键复制全部信息),Linux 或弹窗不可用时 TUI 选择块行读;code=0 用 data.human_response 继续——**先看 next_hint 分流**(第 145 轮:human_response 是自由文本验证码/动态码 → 立即 input_text 填入并提交表单;是「N. 选项」形态(如「我已完成」)→ inspect 验证页面状态后继续),data.page_unlock 回报本次放行方式对账;4001=超时/弹窗与 TUI 均不可用,如实报告;4002=人工取消(弹窗取消/Esc/关窗),终止该路径。当前实例是无头而任务需要可视化时,先 close("all") 回收再以 mode=headed 重开。
+【页面管控三档(第 143 轮,仅 headed 可视化模式)】guard 决定人工对页面的操作权限,按用户意图选档:**用户没说要自己动手/缺省 → locked**(防交叉操作是安全基线,含支付/删除等高风险动作的任务必须 locked);**用户说「我自己操作/我来点/我先登录/你看着」→ open(guard_note 写清引导)**;**用户要分区协作(「我操作登录框,你管其余/锁住支付按钮」)→ partial + allow_selectors(白名单)或 block_selectors(黑名单)**;信号不明确时 locked 起步、需要人工参与时经 request_human 询问。open/partial 下人工与 Agent 并发操作页面,**关键写操作前先 inspect 验证现场**再动手。人工登录先行流:open(guard="open", guard_note="请登录后应答弹窗…") → control(request_human, params={reason:"login", message:…}) → 人工在页面完成登录并应答 → set_guard(mode="locked") 回到防交叉基线 → 继续任务。运行时随时 set_guard 切换;蒙层/盾区/屏蔽页面状态栏与进度栏是设计行为不是页面故障,不要试图用 eval_js 移除。
+【人工介入(HITL)】遇到滑块/图形验证码(OCR 不可读)/短信验证码/扫码登录/人脸核身等无法自动完成的流程:可视化场景确认 data.mode=headed(缺省即是,无需显式传 mode=headed),让人工看到窗口(蓝色边框标识,页面默认有半透明蒙层锁定人工输入——这是设计行为不是页面故障),再 control(request_human, params={reason:..., message:说明要人工做什么, options:[...]})(reason/message/options 三键也接受顶层便捷写法,等价放入 params);**提问期间安全全面解除屏蔽(unlock_page 默认 true;第 167 轮:缺省整页 open——屏蔽页面状态栏显示「🔓 页面开放」+ guard_note「人工介入中·页面已全面解锁,可自由操作;完成后回弹窗点『提交 / 继续』」,人工自由拖滑块/扫码/登录/填表,点『提交 / 继续』交还控制权;显式传 allow_selectors 才走 partial 挖洞,自动并入挑战层选择器+覆盖验证,洞没罩住挑战回退整页 open;应答/超时/取消后自动恢复该页解锁前管控档;inspect(info=blockers) 命中时 data.credential_zones 给出可传 allow_selectors 的区域选择器)**;macOS/Windows 桌面自动弹出人工介入弹窗(置顶+倒计时,人工在弹窗点选项/输入验证码;第 145 轮:主按钮「提交 / 继续」双语义,人工在浏览器完成操作后空输入点击即交棒 Agent 接管;「⏱ +2分钟」可延长等待,总上限 30 分钟,实测人工整链登录超 120s 分档超时的根治;弹窗文本可鼠标选中复制,输入框支持 ⌘C/⌘V/⌘A,也有「📋 复制」一键复制全部信息),Linux 或弹窗不可用时 TUI 选择块行读;code=0 用 data.human_response 继续——**先看 next_hint 分流**(第 145 轮:human_response 是自由文本验证码/动态码 → 立即 input_text 填入并提交表单;是「N. 选项」形态(如「我已完成」)→ inspect 验证页面状态后继续),data.page_unlock 回报本次放行方式对账;4001=超时/弹窗与 TUI 均不可用,如实报告;4002=人工取消(弹窗取消/Esc/关窗),终止该路径。当前实例是无头而任务需要可视化时,先 close("all") 回收再以 mode=headed 重开。
 【自动阻断感知(第 147 轮;第 151 轮升级)】输入类动作(click/input_text/key_press/drag 等 20 个)、wait(含等待超时失败)、导航类动作与 **eval_js**(含 await_promise 长轮询——「发出消息→风控弹窗」正是发生在这个窗口)完成后,工具**自动探测**人工验证挑战 —— 图片选择题(「选出在公园能看到的事物」/「选出卧室家具」类)/滑块/拖拽/语义题等**题面没有「验证码」关键词**的形态,靠弹层结构(高 z-index 模态层 + 九宫格小图或 CSS 背景图网格 / 验证码尺寸 iframe / canvas / 验证文案)识别,不依赖你主动调 inspect(blockers)。命中时(2026-10-13 起,桌面环境且非批量步骤中)**自动弹出人工介入弹窗**等人工处理(data.auto_hitl 回报应答结果,human_response 为人工答复),人工完成后按其应答继续;不能自动弹出的场景(批量步骤中/已有人在应答/开关关闭)响应 data 携带 `blocker_alert{kind,matched,snippet,evidence,hint}` + `next_action="request_human"` + `human_assist` 载荷(题面 snippet 直接进 message,人工在弹窗即知要验证什么):**立即停止继续输入/发消息/重试**(实测事故:验证弹窗在场,Agent 无感知连发 16 轮消息直到用户手动终止),按载荷 request_human(reason=captcha) 让人工完成;不确定弹窗内容可先 control(screenshot, params.ocr=true) 确认。页面干净时响应零附加;wait 超时 + blocker_alert 同时出现 = 「回复没来 + 弹窗在场」的最强信号,优先按 blocker_alert 处置而非加大等待重试。**第 151 轮输入硬闸**:输入类动作与可变更 eval_js(execCommand/dispatchEvent/合成事件等)**执行前**还会做一次结构判定探测,命中真实验证弹窗时直接返回 6002 拦截本动作(见错误码对策)—— 人工完成验证、应答弹窗后页面干净即自动恢复,不需要任何解锁操作。
-【作业要点】文本输入一律用 input_text(selector,text) —— 默认 auto 自动阶梯:JS 原生赋值(input/textarea/select/contenteditable 通用,受控组件兼容)→ 页内回读校验 → 未生效自动降级 CDP 逐键输入 → 再未生效降级慢速逐字,响应带 mode/applied/value_after(回读摘要)如实汇报生效路径,**不再需要传 use_js**;批量对话投放按 sequence 打包:input_text → key_press(enter) → wait(selector=回复容器,timeout_ms=60000) → eval_js 提取回复。key_press(key) 键名大小写不敏感且支持别名(enter/esc/tab/space/del/ins/pgup/方向键)与组合写法(ctrl+a、cmd+v);press_sequence(keys,selector?) 带 selector 会先点击聚焦再逐键,防止按键打进失焦页面;复杂页面先 inspect(info=elements) 探测真实 DOM 再操作,不要硬猜 selector;AI 对话类网站回复等待用 control(wait, selector=[class*=response]..., timeout_ms=60000);看图片里的文字(验证码/图表标签)一律 screenshot(params.ocr=true) 或 inspect(info=ocr),禁止 Read 图片文件、禁止用 Bash/python/tesseract 解码图片(文本模型无视觉,纯浪费迭代);验证码读码后不要刷新页面或点击验证码图(刷新即换码),提交报验证码错误才点图刷新重读;DOM 提取注意 truncated 标记分段。
+【作业要点】文本输入一律用 input_text(selector,text) —— 默认 auto 自动阶梯:JS 原生赋值(input/textarea/select/contenteditable 通用,受控组件兼容)→ 页内回读校验 → 未生效自动降级 CDP 逐键输入 → 再未生效降级慢速逐字,响应带 mode/applied/value_after(回读摘要)如实汇报生效路径,**不再需要传 use_js**;批量对话投放按 sequence 打包:input_text → key_press(enter) → wait(selector=回复容器,timeout_ms=60000) → eval_js 提取回复。key_press(key) 键名大小写不敏感且支持别名(enter/esc/tab/space/del/ins/pgup/方向键)与组合写法(ctrl+a、cmd+v);press_sequence(keys,selector?) 带 selector 会先点击聚焦再逐键,防止按键打进失焦页面;复杂页面先 inspect(info=elements) 探测真实 DOM 再操作,不要硬猜 selector;**要滚到页面上某个语义区块(评论区/商品参数/规格表/规格选择)用 control(scroll_to_text, params={text:"累计评价", block?:"center"})** —— 按可见文本自动定位并居中,免去先 inspect 拿选择器再 scroll_to 的往返,返回 {found,tag,text_len,head};找不到时说明该区块尚未渲染(先 wait/scroll 触发懒加载)、在**跨域** iframe 内(拿不到执行权,响应会报「已探测主 frame + N 个嵌套 frame」),或文案不同;响应 frame 字段回报命中位置(main / frame:N);**翻页/懒加载后要重复滚动**,只在顶部 DOM 里取到的元素往往是占位骨架;AI 对话类网站回复等待用 control(wait, selector=[class*=response]..., timeout_ms=60000);看图片里的文字(验证码/图表标签)一律 screenshot(params.ocr=true) 或 inspect(info=ocr),禁止 Read 图片文件、禁止用 Bash/python/tesseract 解码图片(文本模型无视觉,纯浪费迭代);验证码读码后不要刷新页面或点击验证码图(刷新即换码),提交报验证码错误才点图刷新重读;DOM 提取注意 truncated 标记分段。
 【安全红线】支付/删除/确认提交/登出等不可逆或高风险动作禁止放进 sequence,必须单步执行并检查页面状态;登录凭证只填用户明确提供的账号密码,不要编造;OCR 不可用的平台上验证码类任务如实报告等待人工,禁止猜测验证码;只读优先——能 inspect 回答的问题不做任何写操作。"#;
 
 #[async_trait]
@@ -2183,7 +2325,13 @@ impl Tool for McpWebUseTool {
                     "description": "explore 必填:批量观察的 inspect 维度列表(每项为单步 inspect 入参,如 {\"info\":\"elements\"}/{\"info\":\"dom\",\"params\":{\"selector\":\"form\"}}/{\"info\":\"screenshot\"}/{\"info\":\"blockers\"}),一次返回合并结果(节省 LLM round-trip)",
                     "items": { "type": "object", "additionalProperties": true }
                 },
-                "summary_hint": { "type": "string", "description": "explore 可选:附加提示,会出现在响应 data.summary_hint 字段,便于 LLM 在终答中引用" }
+                "summary_hint": { "type": "string", "description": "explore 可选:附加提示,会出现在响应 data.summary_hint 字段,便于 LLM 在终答中引用" },
+                // 2026-10-14 第三轮:control(request_human) 顶层便捷别名 —— 系统
+                // 提示词的自然写法诱导模型把这三个键放顶层,additionalProperties=false
+                // 曾三连拒(实测烧 3 轮迭代);放行后由 control 入口归一化提升进 params。
+                "message": { "type": "string", "maxLength": 600, "description": "control(request_human) 便捷别名:等价 params.message(要人工做什么的说明);其余动作的参数请放 params 对象" },
+                "reason": { "type": "string", "description": "control(request_human) 便捷别名:等价 params.reason(captcha|sms|qr_login|login|real_name|two_factor|oauth|manual_verify|custom)" },
+                "options": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "control(request_human) 便捷别名:等价 params.options(供人工选择的选项列表)" }
             },
             "required": ["action"],
             "additionalProperties": false
