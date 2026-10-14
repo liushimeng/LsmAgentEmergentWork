@@ -667,6 +667,23 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
     // 「去了哪个路由」,登录重定向不稀释覆盖)+ 重复访问警示
     super::visit_ledger::record_visit(id, url, "", super::visit_ledger::VisitSource::Navigate);
     let mut out = json!({"url": url});
+    // 第 170 轮:navigate 同享主文档健康诊断 —— 猎聘 IP 风控实测:goto 返回成功
+    // (HTTP 200)但落地**空文档**,页面恒白且 URL 显示目标站;此前只有 open 带
+    // page_health,navigate 后 Agent 只能 wait-selector 超时瞎猜,反复
+    // navigate/wait/HITL 空转 10 分钟。这里读回真实落地 URL,主文档错误/空
+    // 文档时附 data.page_health{blank, reason, main_doc_status, next_action}
+    // (命中才带字段,健康页零噪声), Agent 可第一时间如实判定「目标站对本环境
+    // 返回空文档」而不是盲试。
+    let landed = page
+        .url()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| url.to_string());
+    if let Some(v) = super::page_health_field(id, &landed).await {
+        out["landed_url"] = json!(landed);
+        out["page_health"] = v;
+    }
     if let Some(note) = super::visit_ledger::visit_note(url) {
         out["visit_note"] = note;
     }

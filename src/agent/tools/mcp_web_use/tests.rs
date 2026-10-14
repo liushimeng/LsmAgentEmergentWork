@@ -2827,3 +2827,46 @@ async fn real_browser_site_viewport_and_page_health() {
     }
     mgr.shutdown().await;
 }
+
+// ===================== 第 170 轮:复用失败信封改写 =====================
+
+#[test]
+fn 复用失败改写_命中2001注入提示() {
+    let env = r#"{"code":2001,"message":"receiver is gone","data":{}}"#;
+    let out = annotate_reuse_failure(env, "relaunch_killed", "已回收,普通 open 兜底".to_string())
+        .expect("2001 必须被改写");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], 2001);
+    assert_eq!(v["data"]["relaunch_killed"], true);
+    assert_eq!(v["data"]["hint"], "已回收,普通 open 兜底");
+    // 原 message 保留
+    assert_eq!(v["message"], "receiver is gone");
+}
+
+#[test]
+fn 复用失败改写_命中2002同样改写() {
+    let env = r#"{"code":2002,"message":"动作失败","data":{"x":1}}"#;
+    let out = annotate_reuse_failure(env, "probe_matched_but_dead", "端口残留".to_string())
+        .expect("2002 必须被改写");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["data"]["probe_matched_but_dead"], true);
+    assert_eq!(v["data"]["x"], 1, "原有 data 字段保留");
+}
+
+#[test]
+fn 复用失败改写_非断连错误原样放行() {
+    let env = r#"{"code":3002,"message":"未检测到调试端口","data":{}}"#;
+    assert!(
+        annotate_reuse_failure(env, "relaunch_killed", "x".to_string()).is_none(),
+        "3002 不属于断连类错误,不应改写"
+    );
+    let env1001 = r#"{"code":1001,"message":"参数错误","data":{}}"#;
+    assert!(annotate_reuse_failure(env1001, "k", "x".to_string()).is_none());
+}
+
+#[test]
+fn 复用失败改写_畸形JSON不透写() {
+    assert!(annotate_reuse_failure("not-json", "k", "x".to_string()).is_none());
+    // 合法 JSON 但缺信封结构(无 code 字段)→ 不改写
+    assert!(annotate_reuse_failure(r#"{"foo":1}"#, "k", "x".to_string()).is_none());
+}

@@ -792,3 +792,109 @@ async fn stealth_selfcheck_smoke() {
         .execute(json!({"action": "close", "page_id": page_id}))
         .await;
 }
+
+/// 第 170 轮:navigate 路径 page_health 回归 —— 服务器返回 200 空文档时
+/// (猎聘 IP 风控实测形态:goto 成功但页面恒白),navigate 响应必须带
+/// data.page_health{blank:true, reason:"empty_dom"} + landed_url,
+/// 让 Agent 第一时间如实判定,而不是 wait-selector 超时瞎猜。
+async fn serve_empty_html(socket: &mut TcpStream) -> std::io::Result<()> {
+    let mut buf = vec![0_u8; 4096];
+    let mut read = 0;
+    loop {
+        let n = socket.read(&mut buf[read..]).await?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") || read == buf.len() {
+            break;
+        }
+    }
+    // 200 + 空 HTML 文档:WAF 空文档形态的最小复刻(主文档无错误码,DOM 仅 html/head/body)。
+    socket
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    socket.shutdown().await
+}
+
+#[tokio::test]
+#[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
+async fn mcp_web_use_navigate_page_health_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    tokio::spawn(async move {
+                        let _ = serve_empty_html(&mut socket).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let empty_url = format!("http://{addr}/");
+
+    // 正常页打开,再 navigate 到空文档服务器。
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": "data:text/html,<title>base</title><h1>base</h1>"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "open 失败: {out}");
+    let page_id = v["data"]["page_id"].as_str().unwrap_or_default().to_string();
+    assert!(!page_id.is_empty());
+
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "navigate",
+            "params": {"url": empty_url}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "navigate 失败: {out}");
+    let health = &v["data"]["page_health"];
+    assert!(
+        health["blank"].as_bool().unwrap_or(false),
+        "200 空文档必须透出 page_health.blank: {out}"
+    );
+    assert_eq!(
+        health["reason"].as_str().unwrap_or_default(),
+        "empty_dom",
+        "200 空文档 reason 应为 empty_dom: {out}"
+    );
+    assert_eq!(
+        v["data"]["landed_url"].as_str().unwrap_or_default(),
+        empty_url,
+        "landed_url 应回传真实落地 URL: {out}"
+    );
+
+    // 对照:正常内容页 navigate 后**不带** page_health(零噪声)。
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "navigate",
+            "params": {"url": "data:text/html,<title>ok</title><h1>real content</h1>"}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "对照 navigate 失败: {out}");
+    assert!(
+        v["data"]["page_health"].is_null(),
+        "健康页不应带 page_health: {out}"
+    );
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}

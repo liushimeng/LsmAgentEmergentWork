@@ -337,10 +337,21 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
 // ===================== 调试重启(auto_relaunch 第 3 步) =====================
 
 /// 调试启动参数(纯函数,便于单测)。
+///
+/// 第 171 轮:补齐首启/默认浏览器/后台常驻治理旗标(与 launch 路径一致),
+/// 根治「欢迎使用 Google Chrome」对话框与 macOS Dock 图标驻留。
 pub fn relaunch_args(port: u16, profile_dir: &Path, headless: bool) -> Vec<String> {
     let mut args = vec![
         format!("--remote-debugging-port={port}"),
         format!("--user-data-dir={}", profile_dir.display()),
+        // 首启 / 默认浏览器 / 后台常驻治理
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-background-mode".to_string(),
+        "--no-service-autorun".to_string(),
+        "--disable-component-update".to_string(),
+        "--hide-crash-restore-bubble".to_string(),
+        "--disable-session-crashed-bubble".to_string(),
     ];
     if headless {
         args.push("--headless=new".to_string());
@@ -368,8 +379,9 @@ pub fn relaunch_command_string(port: u16, profile_dir: &Path) -> String {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| default_browser_command_name().to_string());
     let exe = quote_exe_path(&exe);
+    // 第 171 轮:手动命令同样补齐首启/后台常驻治理旗标,避免用户照抄后仍弹欢迎框。
     format!(
-        "{} --remote-debugging-port={} --user-data-dir={}",
+        "{} --remote-debugging-port={} --user-data-dir={} --no-first-run --no-default-browser-check --disable-background-mode --no-service-autorun",
         exe,
         port,
         profile_dir.display()
@@ -453,6 +465,11 @@ pub struct RelaunchOutcome {
     pub login_state_copied: usize,
     /// 跳过的登录态条目数(源缺失/复制失败)。
     pub login_state_skipped: usize,
+    /// 第 170 轮:本次拉起的调试 Chrome 主进程 PID。接管失败(2001)时
+    /// 工具层据此回收该实例 —— 它是 laew 自己拉起的,有完全生杀权;
+    /// 不回收会留下孤儿窗口(用户屏幕上多一个 about:blank Chrome)且
+    /// 后续 probe 9222 命中它造成 connect 死循环(实测连烧 3 次 2001)。
+    pub child_pid: u32,
 }
 
 /// auto_relaunch 全流程(第 144 轮起**不退出用户 Chrome**):
@@ -479,16 +496,35 @@ pub async fn relaunch_and_wait(port: u16) -> Option<RelaunchOutcome> {
             (0, 0)
         }
     };
+    // 第 171 轮:预置 profile 跳过首启体验(欢迎框 / 后台常驻 / 崩溃恢复)。
+    crate::agent::browser::seed_chrome_profile(&profile);
     // 2. 以调试参数另启独立 Chrome 实例(无 GUI 会话 → 无头)。
     let headless = !crate::agent::browser_mode::has_gui_session();
-    launch_debug_browser(port, &profile, headless)?;
+    let child = launch_debug_browser(port, &profile, headless)?;
+    let child_pid = child.id();
     // 3. 等端口就绪。
     let info = wait_for_debug_port(port).await?;
     Some(RelaunchOutcome {
         info,
         login_state_copied: copied,
         login_state_skipped: skipped,
+        child_pid,
     })
+}
+
+/// 第 170 轮:回收 auto_relaunch 拉起但接管失败的调试 Chrome。
+///
+/// 只对本函数拉起的实例调用(用户浏览器绝不触碰 —— 那是 connect 契约红线)。
+/// 回收后调试 profile 保留(登录态复制结果仍可被下次 relaunch 复用),
+/// 但进程与端口释放,杜绝:① 孤儿 about:blank 窗口残留在用户桌面;
+/// ② 后续 `probe_debug_endpoint` 命中这个不可接管的实例,connect 再失败,
+/// 形成 2001 死循环(猎聘任务实测连烧 3 次 + close(all) 白烧约 1 分钟)。
+pub fn kill_relaunch_browser(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    tracing::info!(pid, "回收接管失败的 auto_relaunch 调试 Chrome 实例");
+    crate::agent::browser_watchdog::terminate_process(pid);
 }
 
 #[cfg(test)]
@@ -526,13 +562,11 @@ mod tests {
     #[test]
     fn relaunch_args_port_and_profile() {
         let args = relaunch_args(9222, Path::new("/tmp/profile"), false);
-        assert_eq!(
-            args,
-            vec![
-                "--remote-debugging-port=9222".to_string(),
-                "--user-data-dir=/tmp/profile".to_string(),
-            ]
-        );
+        assert!(args.contains(&"--remote-debugging-port=9222".to_string()));
+        assert!(args.contains(&"--user-data-dir=/tmp/profile".to_string()));
+        // 第 171 轮:首启/后台常驻治理旗标必须存在
+        assert!(args.contains(&"--no-first-run".to_string()));
+        assert!(args.contains(&"--disable-background-mode".to_string()));
     }
 
     #[test]

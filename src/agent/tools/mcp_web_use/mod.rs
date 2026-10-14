@@ -680,7 +680,7 @@ async fn run_open_reuse(args: &Value, url: &str) -> Result<String> {
         .unwrap_or(false);
     // 档位一:自动探测接管。
     if let Some(info) = crate::agent::browser_reuse::probe_debug_endpoint(port).await {
-        return open_via_connect(
+        let res = open_via_connect(
             args,
             url,
             &info.connect_url,
@@ -690,14 +690,31 @@ async fn run_open_reuse(args: &Value, url: &str) -> Result<String> {
                 "browser_version": info.browser_version,
             }),
         )
-        .await;
+        .await?;
+        // 第 170 轮:端口命中的实例不可接管 —— 通常是上次 auto_relaunch 残留的
+        // 调试实例或不可用的用户 Chrome;错误信封补提示,引导模型走普通 open
+        // 兜底,不要对着同一端点反复重试(实测 receiver-gone 死循环)。
+        // 注意:run_open_inner 把浏览器失败封成 **Ok(2001 信封字符串)**,这里
+        // 必须解包信封看 code,Err 分支是真异常(不含 2001 信封)。
+        if let Some(rewritten) = annotate_reuse_failure(
+            &res,
+            "probe_matched_but_dead",
+            format!(
+                "端口 {} 上的 Chrome 不可接管(CDP 无响应);可能是上次残留的调试实例,直接用普通 open(url) 冷启动即可",
+                info.port
+            ),
+        ) {
+            return Ok(rewritten);
+        }
+        return Ok(res);
     }
     // 档位三:自动重启接管(显式 opt-in)。第 144 轮:不退出用户 Chrome ——
     // 复制登录态到独立调试 profile 并另启独立实例(与用户浏览器并存)。
     if auto_relaunch {
         return match crate::agent::browser_reuse::relaunch_and_wait(port).await {
             Some(out) => {
-                open_via_connect(
+                let child_pid = out.child_pid;
+                let res = open_via_connect(
                     args,
                     url,
                     &out.info.connect_url,
@@ -712,7 +729,27 @@ async fn run_open_reuse(args: &Value, url: &str) -> Result<String> {
                         "login_state_skipped": out.login_state_skipped,
                     }),
                 )
-                .await
+                .await?;
+                // 第 170 轮:接管失败(2001/2002)必须回收我们刚拉起的调试实例 ——
+                // 否则它成为孤儿 about:blank 窗口留在用户桌面,且后续 probe 9222
+                // 命中这个不可接管的实例,connect 再次失败形成死循环(猎聘任务
+                // 实测连烧 3 次 2001 + close(all) 白烧约 1 分钟)。回收后错误
+                // 信封改写为「已回收 + 普通 open 兜底」,让模型跳出复用路径。
+                // (run_open_inner 把浏览器失败封成 Ok(2001 信封),故解包看 code。)
+                if envelope_is_disconnect(&res) {
+                    crate::agent::browser_reuse::kill_relaunch_browser(child_pid);
+                    if let Some(rewritten) = annotate_reuse_failure(
+                        &res,
+                        "relaunch_killed",
+                        format!(
+                            "auto_relaunch 拉起的调试实例接管失败已回收(端口 {} 已释放);直接用普通 open(url) 冷启动即可,不要重试 reuse_existing",
+                            out.info.port
+                        ),
+                    ) {
+                        return Ok(rewritten);
+                    }
+                }
+                Ok(res)
             }
             None => envelope(
                 CODE_REUSE_UNAVAILABLE,
@@ -744,6 +781,26 @@ async fn run_open_reuse(args: &Value, url: &str) -> Result<String> {
             "hint": "把 relaunch_command 转述给用户执行(该命令以独立调试 profile 另启一个 Chrome 实例,不影响已打开的浏览器);或以 auto_relaunch=true 重试,由工具自动复制登录态并另启调试实例(不退出用户浏览器);Chrome 136+ 默认 profile 上调试端口会被忽略,必须用独立 --user-data-dir",
         }),
     )
+}
+
+/// 第 170 轮:复用路径(档位一/档位三)connect 失败时的错误信封判定+改写。
+/// `envelope_is_disconnect` 判定信封 code 是否为 2001/2002(CDP 断连/动作失败);
+/// `annotate_reuse_failure` 命中则注入 `key:true` + 兜底提示并返回改写后的信封 JSON,
+/// 未命中/畸形返回 None(调用方透传原信封)。
+fn envelope_is_disconnect(env_str: &str) -> bool {
+    serde_json::from_str::<Value>(env_str)
+        .map(|v| v["code"] == 2001 || v["code"] == 2002)
+        .unwrap_or(false)
+}
+
+fn annotate_reuse_failure(env_str: &str, key: &str, hint: String) -> Option<String> {
+    if !envelope_is_disconnect(env_str) {
+        return None;
+    }
+    let mut v = serde_json::from_str::<Value>(env_str).ok()?;
+    v["data"][key] = json!(true);
+    v["data"]["hint"] = json!(hint);
+    Some(serde_json::to_string(&v).unwrap_or_else(|_| env_str.to_string()))
 }
 
 /// 以 connect_url 走 run_open_inner 既有流程(注入 connect_url),响应附加复用元数据。
@@ -853,13 +910,35 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     // 第 152 轮:goto 产生新文档,自动跟随按实例期望态 re-assert
                     // (人工在 locked 档无法滚动,页面必须自己停在最新)
                     BrowserManager::global().reassert_auto_follow(&page).await;
-                    let title = page.get_title().await.ok().flatten().unwrap_or_default();
-                    let final_url = page
+                    let mut title = page.get_title().await.ok().flatten().unwrap_or_default();
+                    let mut final_url = page
                         .url()
                         .await
                         .ok()
                         .flatten()
                         .unwrap_or_else(|| url.to_string());
+                    // 第 170 轮:复用路径同享首航空白自愈(猎聘 WAF 首击实测:
+                    // 首次导航落 about:blank,同页二次导航即成功)。
+                    if final_url == "about:blank" {
+                        tracing::warn!(
+                            url,
+                            "open 复用路径首航落 about:blank,原地重导航一次"
+                        );
+                        let retry = tokio::time::timeout(
+                            std::time::Duration::from_millis(timeout_ms),
+                            page.goto(url.to_string()),
+                        )
+                        .await;
+                        if let Ok(Ok(_)) = retry {
+                            title = page.get_title().await.ok().flatten().unwrap_or_default();
+                            final_url = page
+                                .url()
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or(final_url);
+                        }
+                    }
                     // 第 146 轮:访问台账记账(导航成功后;重复访问警示随响应附带)
                     visit_ledger::record_visit(
                         &pid,

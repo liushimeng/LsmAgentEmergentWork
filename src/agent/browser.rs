@@ -387,6 +387,82 @@ pub fn detect_browser() -> Option<PathBuf> {
     .map(PathBuf::from)
 }
 
+/// laew 自定义 Chrome 启动开关集合(**裸名**,不含 `--` 前缀)。
+///
+/// 关键坑(第 171 轮):chromiumoxide `BrowserConfigBuilder::arg` 走
+/// `Arg::from(&str)`,把整串当 key 并在渲染时统一补 `--` 前缀(见其
+/// `browser/argument.rs::into_iter`)。因此这里只能传裸名 `no-first-run`;
+/// 若传 `--no-first-run` 会被渲染成 `----no-first-run`,Chrome 当未知开关
+/// **静默忽略** —— 实测正是如此,导致 `--no-first-run` 失效、每次冷启动都
+/// 弹「欢迎使用 Google Chrome」首启对话框,并因缺 `--disable-background-mode`
+/// 而在 macOS Dock 常驻图标。见 `tmpPlan/20261014_*`。
+pub(crate) fn custom_launch_flags(headless: bool, geo_prompt: bool) -> Vec<String> {
+    let mut flags = vec![
+        // 首启 / 默认浏览器 / 后台常驻治理(根治欢迎框 + Dock 图标驻留)
+        "no-first-run",
+        "no-default-browser-check",
+        "disable-background-mode",
+        "no-service-autorun",
+        "disable-component-update",
+        "hide-crash-restore-bubble",
+        "disable-session-crashed-bubble",
+        // 反检测 + 证书 + 后台节流
+        "disable-background-networking",
+        "disable-background-timer-throttling",
+        "disable-backgrounding-occluded-windows",
+        "disable-component-extensions-with-background-pages",
+        "disable-default-apps",
+        "disable-hang-monitor",
+        "disable-ipc-flooding-protection",
+        "disable-prompt-on-repost",
+        "disable-renderer-backgrounding",
+        "disable-sync",
+        "disable-popup-blocking",
+        "metrics-recording-only",
+        "ignore-certificate-errors",
+        "disable-blink-features=AutomationControlled",
+        "disable-features=LocalNetworkAccess,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessRestrictions,BlockLocalNetworkByDefault,PrivateNetworkAccessRespectPreflightResults,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,TranslateUI",
+    ];
+    if !geo_prompt {
+        flags.push("deny-permission-prompts");
+    }
+    if headless {
+        flags.extend(["disable-gpu", "no-sandbox", "disable-dev-shm-usage", "hide-scrollbars"]);
+    }
+    flags.into_iter().map(str::to_string).collect()
+}
+
+/// 预置 Chrome profile,跳过首启体验(欢迎对话框 / 后台常驻 / 崩溃恢复气泡)。
+///
+/// 双保险:即便 `--no-first-run` 因上游参数渲染问题失效,profile 侧的
+/// `First Run` 哨兵 + `Local State` 也能让 Chrome 判定「非首启」。
+pub(crate) fn seed_chrome_profile(dir: &Path) {
+    use std::fs;
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    // 1. First Run 哨兵:存在即非首启。
+    let _ = fs::write(dir.join("First Run"), b"");
+    // 2. Local State:关闭后台常驻 / 崩溃恢复 / 统计上报。
+    let local_state = r#"{
+  "background_mode": {"enabled": false},
+  "user_experience_metrics": {"stability": {"exited_cleanly": true}, "reporting_enabled": false},
+  "profile": {"info_cache": {"Default": {"name": "Profile1"}}}
+}"#;
+    let _ = fs::write(dir.join("Local State"), local_state);
+    // 3. Default/Preferences:跳过欢迎页 / 不设默认浏览器 / 不恢复会话。
+    let _ = fs::create_dir_all(dir.join("Default"));
+    let prefs = r#"{
+  "browser": {"has_seen_welcome_page": true, "should_reset_check_default_browser": false},
+  "distribution": {"skip_welcome_page": true, "import_search_engine": false, "make_chrome_default": false},
+  "first_run_tabs": [],
+  "session": {"restore_on_startup": 4},
+  "alternate_error_pages": {"enabled": false},
+  "safebrowsing": {"enabled": false}
+}"#;
+    let _ = fs::write(dir.join("Default/Preferences"), prefs);
+}
+
 impl BrowserManager {
     pub fn global() -> Arc<Self> {
         static MANAGER: OnceLock<Arc<BrowserManager>> = OnceLock::new();
@@ -512,6 +588,45 @@ impl BrowserManager {
         // launch 模式浏览器主进程 PID(第 127 轮):供 cleanup_registry 登记给
         // cleanup_sync 同步清理路径使用;connect 模式保持 0(不拥有外部进程)。
         let mut launch_pid: u32 = 0;
+        // 第 170 轮:僵尸句柄活探清尸。浏览器进程死亡( headed 窗口被人工关闭 /
+        // 外部因素退出)后 inner.browser 句柄不会被任何路径主动清理,此前
+        // new_page_impl 的 `if inner.browser.is_none()` 唯一入口判定恒为假 ——
+        // ① connect_url 被静默吞掉(auto_relaunch 拉起的调试 Chrome 成孤儿窗口,
+        //    用户桌面多出 about:blank Chrome,实测猎聘任务);
+        // ② 后续 open 的 goto 全打到僵尸句柄上,chromiumoxide handler 已终止,
+        //    必报 "receiver is gone"(2001)且重试无用(实测连烧 3 次)。
+        // 这里在入口做廉价活探(3s 超时,存活时通常 <100ms),死了就按
+        // close_page 末页回收同语义清尸,让本次调用走全新 launch/connect。
+        if inner.browser.is_some() {
+            let dead = {
+                let browser = inner.browser.as_ref().expect("checked is_some");
+                !Self::browser_handle_alive(browser).await
+            };
+            if dead {
+                tracing::warn!("检测到已死亡的浏览器句柄(CDP 无响应),清理后重新拉起");
+                if let Some(mut browser) = inner.browser.take() {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        browser.close(),
+                    )
+                    .await;
+                }
+                if let Some(handler) = inner.handler.take() {
+                    handler.abort();
+                }
+                if let Some(child) = inner.watchdog.take() {
+                    spawn_watchdog_reaper(child);
+                }
+                if !inner.connect_mode {
+                    cleanup_registry::clear();
+                    if let Some(dir) = inner.user_data_dir.take() {
+                        spawn_tempdir_cleanup(dir);
+                    }
+                }
+                inner.pages.clear();
+                inner.connect_mode = false;
+            }
+        }
         // 第 159 轮:本次调用是否首次拉起浏览器 —— 决定注册完本页后是否清扫
         // Chrome 启动自带的初始空标签页(launch 不带初始 URL,Chrome 必开一个
         // about:blank / new-tab-page,实测「先弹空页签再弹目标页签」即它)。
@@ -572,57 +687,24 @@ impl BrowserManager {
                 //    PermissionBlock 静默拦截,WAF 挑战脚本跑不完 → 永远空白页)与
                 //    HttpsUpgrades(自定义端口 https 站点不被静默降级/升级试探);
                 // ③ `--disable-blink-features=AutomationControlled`:压掉 webdriver 指纹。
-                let mut builder = builder
-                    .disable_default_args()
-                    .arg("--no-first-run")
-                    .arg("--no-default-browser-check")
-                    .arg("--disable-background-networking")
-                    .arg("--disable-background-timer-throttling")
-                    .arg("--disable-backgrounding-occluded-windows")
-                    .arg("--disable-component-extensions-with-background-pages")
-                    .arg("--disable-default-apps")
-                    .arg("--disable-hang-monitor")
-                    .arg("--disable-ipc-flooding-protection")
-                    .arg("--disable-prompt-on-repost")
-                    .arg("--disable-renderer-backgrounding")
-                    .arg("--disable-sync")
-                    .arg("--disable-popup-blocking")
-                    .arg("--metrics-recording-only")
-                    .arg("--ignore-certificate-errors")
-                    .arg("--disable-blink-features=AutomationControlled")
-                    .arg("--disable-features=LocalNetworkAccess,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessRestrictions,BlockLocalNetworkByDefault,PrivateNetworkAccessRespectPreflightResults,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,TranslateUI");
-                // 第 162 轮:`--deny-permission-prompts` 兜底拒掉原生权限弹窗
-                // (通知/摄像头等)——此类弹窗是浏览器 UI 层,blocker_probe/HITL
-                // 均不可见,会把 Agent 工具链拖死;地理位置由 browser_perm 按
-                // LAEW_WEB_GEO 预授权处置,与本兜底不冲突。
-                // LAEW_WEB_GEO=prompt(原生行为档)时不加,保持完全未干预语义。
-                if browser_perm::geo_mode_from_env() != GeoMode::Prompt {
-                    builder = builder.arg("--deny-permission-prompts");
+                let mut builder = builder.disable_default_args();
+                // 第 171 轮(chromiumoxide 参数双横杠坑):`.arg()` 走 `Arg::from`,
+                // 整串当 key 并统一补 `--`,故这里传**裸名**;详见 `custom_launch_flags`。
+                let headless = matches!(mode, BrowserMode::Hidden | BrowserMode::NewHeadless);
+                let geo_prompt = browser_perm::geo_mode_from_env() == GeoMode::Prompt;
+                for flag in custom_launch_flags(headless, geo_prompt) {
+                    builder = builder.arg(flag);
                 }
                 // 2026-09-17 第 74 轮:三档 mode 控制浏览器启动形态。
                 // 默认 Hidden(纯 CDP headless=new,系统级无窗口),
                 // 解决"误开 macOS 系统默认浏览器"问题。
                 match mode {
-                    BrowserMode::Hidden => {
-                        builder = builder.new_headless_mode();
-                    }
-                    BrowserMode::NewHeadless => {
+                    BrowserMode::Hidden | BrowserMode::NewHeadless => {
                         builder = builder.new_headless_mode();
                     }
                     BrowserMode::Headed => {
                         builder = builder.with_head();
                     }
-                }
-                // Hidden 模式下额外禁用 GPU 与 sandbox,降低嵌入式启动失败率;
-                // --hide-scrollbars(第 125 轮):headless 截图滚动条不再遮挡内容,
-                // 且 innerWidth 不再被经典滚动条蚕食(推荐启动参数矩阵,
-                // 参考 docs/Agent源码调研/专题/专题-第十三轮-GUI自动化与浏览器控制深度对比.md §6.1)
-                if matches!(mode, BrowserMode::Hidden | BrowserMode::NewHeadless) {
-                    builder = builder
-                        .arg("--disable-gpu")
-                        .arg("--no-sandbox")
-                        .arg("--disable-dev-shm-usage")
-                        .arg("--hide-scrollbars");
                 }
                 // 窗口尺寸(第 125 轮):显式参数优先;缺省**全模式 1920×1080(1080p)**
                 // ——hidden 原 1440×900 视口过窄,现代 Web 应用(min-width>1440 的管理后台/
@@ -665,6 +747,9 @@ impl BrowserManager {
                     b.iter().map(|x| format!("{x:02x}")).collect::<String>()
                 }));
                 builder = builder.user_data_dir(&dir);
+                // 第 171 轮:预置 profile 跳过首启体验(欢迎框 / 后台常驻 / 崩溃恢复),
+                // 与 `--no-first-run` 双保险。
+                seed_chrome_profile(&dir);
                 let config = builder
                     .build()
                     .map_err(chromiumoxide::error::CdpError::msg)?;
@@ -799,13 +884,36 @@ impl BrowserManager {
             let _ = super::browser_overlay::apply_page_guard(&page, &cfg).await;
         }
 
-        let title = page.get_title().await.ok().flatten().unwrap_or_default();
-        let final_url = page
+        let mut title = page.get_title().await.ok().flatten().unwrap_or_default();
+        let mut final_url = page
             .url()
             .await
             .ok()
             .flatten()
             .unwrap_or_else(|| url.to_string());
+        // 第 170 轮:首航空白自愈 —— 猎聘 WAF 首击实测 3/3:新标签页**首次**导航
+        // 不提交(落 about:blank 空文档),同页**第二次**导航即成功(此前只能靠
+        // LLM 自觉补 control(navigate),Plan/执行层每次都踩中,每轮白烧 2~4 次
+        // 迭代)。这里原地重导航一次(复用同页句柄,不新开页/不重复注入),
+        // 仍 blank 才按原路径返回 page_health 诊断。launch/connect/new_window
+        // 各路径统一受益;connect 模式同样做 —— open 语义本就是「此页导航到
+        // url」,同 URL 原地刷新一次无害。
+        if final_url == "about:blank" {
+            tracing::warn!(
+                url,
+                "open 首航落 about:blank(WAF 首击/导航竞态),原地重导航一次"
+            );
+            let retry = tokio::time::timeout(browser_timeout, page.goto(url.to_string())).await;
+            if let Ok(Ok(_)) = retry {
+                title = page.get_title().await.ok().flatten().unwrap_or_default();
+                final_url = page
+                    .url()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(final_url);
+            }
+        }
         let id = new_page_id();
         let target_id = page.target_id().clone().into();
         inner.pages.insert(
@@ -889,6 +997,53 @@ impl BrowserManager {
             }
         }
         Ok((id, title, final_url))
+    }
+
+    /// 第 170 轮:浏览器句柄活探(3s 超时)。`browser.pages()` 失败 = CDP 连接已死
+    /// (与 heal_page 同一判据);超时按死处理(fail-closed —— 宁可多清一次尸,
+    /// 不留僵尸句柄吞掉 connect_url / 制造 receiver-gone 风暴)。
+    async fn browser_handle_alive(browser: &chromiumoxide::Browser) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(3), browser.pages())
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+    }
+
+    /// 第 170 轮:外部可触发的僵尸句柄清尸(工具层 2001 恢复 / close("all") 复用)。
+    /// 活探通过则零副作用返回 false;探到死则按 new_page_impl 入口同语义清尸,
+    /// 使下一次 open 走全新 launch/connect,返回 true。
+    pub async fn drop_dead_browser(&self) -> bool {
+        let mut inner = self.inner.lock().await;
+        if inner.browser.is_none() {
+            return false;
+        }
+        let dead = {
+            let browser = inner.browser.as_ref().expect("checked is_some");
+            !Self::browser_handle_alive(browser).await
+        };
+        if !dead {
+            return false;
+        }
+        tracing::warn!("drop_dead_browser: 清理已死亡的浏览器句柄(CDP 无响应)");
+        if let Some(mut browser) = inner.browser.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), browser.close())
+                .await;
+        }
+        if let Some(handler) = inner.handler.take() {
+            handler.abort();
+        }
+        if let Some(child) = inner.watchdog.take() {
+            spawn_watchdog_reaper(child);
+        }
+        if !inner.connect_mode {
+            cleanup_registry::clear();
+            if let Some(dir) = inner.user_data_dir.take() {
+                spawn_tempdir_cleanup(dir);
+            }
+        }
+        inner.pages.clear();
+        inner.connect_mode = false;
+        true
     }
 
     /// 列出当前注册页面(带存活性探测,失效 entry 顺手清理)。
@@ -2553,6 +2708,19 @@ async fn spawn_event_listeners(page: &Page, events: EventBuffer) {
 mod tests {
     use super::*;
 
+    // ===== 第 170 轮:僵尸句柄清尸(drop_dead_browser) =====
+
+    #[tokio::test]
+    async fn drop_dead_browser_no_browser_is_noop() {
+        // 无浏览器实例时:零副作用返回 false(不 panic、不误清)。
+        // 全局单例可能被同进程其它用例触碰,故只在确认为无实例时断言。
+        let mgr = BrowserManager::global();
+        if mgr.has_browser().await {
+            return; // 并行用例持有实例,本用例让路(不断言以免互相干扰)
+        }
+        assert!(!mgr.drop_dead_browser().await);
+    }
+
     #[test]
     fn page_id_format() {
         let id = new_page_id();
@@ -2735,4 +2903,54 @@ mod tests {
     // 2026-09-17 第 74 轮:BrowserMode 三档枚举测试。
     // ★ 2026-10-09 第 139 轮:模式决策与 env 解析整体搬到 `super::browser_mode`,
     // 对应单测同步搬到 `browser_mode::tests`(默认语义也改为「可见模式」)。
+
+    // ===== 第 171 轮:chromiumoxide 参数双横杠坑 + profile 预置 =====
+
+    #[test]
+    fn custom_launch_flags_are_bare_names() {
+        // chromiumoxide 会统一补 `--`,故这里必须是裸名,绝不能带前导 `-`。
+        for headless in [false, true] {
+            for geo_prompt in [false, true] {
+                for f in custom_launch_flags(headless, geo_prompt) {
+                    assert!(
+                        !f.starts_with('-'),
+                        "启动开关必须是裸名(否则被渲染成 ----xxx 被 Chrome 忽略): {f}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_launch_flags_suppress_first_run_and_background() {
+        let flags = custom_launch_flags(false, false);
+        for key in [
+            "no-first-run",
+            "no-default-browser-check",
+            "disable-background-mode",
+            "no-service-autorun",
+        ] {
+            assert!(flags.iter().any(|f| f == key), "缺少治理旗标 {key}");
+        }
+        // geo_prompt=true 时不加 deny-permission-prompts(保持原生行为档)
+        assert!(!custom_launch_flags(false, true).contains(&"deny-permission-prompts".to_string()));
+        assert!(custom_launch_flags(false, false).contains(&"deny-permission-prompts".to_string()));
+        // headless 追加 GPU/sandbox 旗标
+        assert!(custom_launch_flags(true, false).contains(&"disable-gpu".to_string()));
+        assert!(!custom_launch_flags(false, false).contains(&"disable-gpu".to_string()));
+    }
+
+    #[test]
+    fn seed_chrome_profile_writes_first_run_and_prefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("prof");
+        seed_chrome_profile(&profile);
+        assert!(profile.join("First Run").is_file(), "First Run 哨兵应存在");
+        assert!(profile.join("Local State").is_file());
+        assert!(profile.join("Default/Preferences").is_file());
+        let prefs = std::fs::read_to_string(profile.join("Default/Preferences")).unwrap();
+        assert!(prefs.contains("has_seen_welcome_page"));
+        let local = std::fs::read_to_string(profile.join("Local State")).unwrap();
+        assert!(local.contains("background_mode"));
+    }
 }
