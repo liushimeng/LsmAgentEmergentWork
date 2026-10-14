@@ -114,12 +114,16 @@ impl MainWorkRunner {
             original_prompt,
             None,
             completed_digest,
+            None,
         )
         .await
     }
 
     /// 2026-09-16 第 59 轮:带 suggested_delegate 的重载,供 Orchestrator 传入 Yolo 推断结果。
     /// 第 146 轮:增 `completed_digest` —— 上一轮已完成且 QC 通过的单元摘要(断点续跑)。
+    /// 再规划(Plan 再规划/更新规划):增 `replan_context` —— 执行层遭遇规划缺口
+    /// (登录墙/表单/访问受阻)时,Orchestrator 把失败现场注入,要求**更新编排**
+    /// 而非盲重拆;`None` 走原有行为(调用方零改动)。
     pub async fn plan_workflows_with_delegate(
         &self,
         goal: &str,
@@ -129,6 +133,7 @@ impl MainWorkRunner {
         original_prompt: Option<&str>,
         suggested_delegate: Option<&str>,
         completed_digest: &str,
+        replan_context: Option<&str>,
     ) -> Result<(WorkFlowPlan, Usage)> {
         Self::plan_workflows_inner(
             self,
@@ -139,6 +144,7 @@ impl MainWorkRunner {
             original_prompt,
             suggested_delegate,
             completed_digest,
+            replan_context,
         )
         .await
     }
@@ -152,6 +158,7 @@ impl MainWorkRunner {
         original_prompt: Option<&str>,
         suggested_delegate: Option<&str>,
         completed_digest: &str,
+        replan_context: Option<&str>,
     ) -> Result<(WorkFlowPlan, Usage)> {
         let mut prompt = String::new();
         // 2026-09-19 第91轮 P0-1 改动1: 三条绝对关键约束 + 第一性事实优先 + 输出前自检清单
@@ -189,6 +196,19 @@ impl MainWorkRunner {
             prompt.push_str(&format!(
                 "\n【重要】上一轮已完成且 QC 通过的单元(产物已留存,**禁止重复规划/重跑**):\n{completed_digest}\n\
                  本轮只拆解**剩余**目标;依赖已完成单元结论的步骤,直接引用其产物要点,不要再执行。\n"
+            ));
+        }
+        // 再规划 / 更新规划:执行层遭遇规划缺口(登录墙 / 表单 / 访问受阻 / 现场与
+        // 规划假设不符)时,Orchestrator 把失败现场注入。要求**更新编排**而非盲重拆:
+        // 针对缺口补充受阻单元的前置步骤(登录前置 / 表单分步 / request_human 人工介入点),
+        // 已完成单元禁止重复规划,只输出剩余目标的编排 JSON。
+        if let Some(ctx) = replan_context.filter(|s| !s.trim().is_empty()) {
+            prompt.push_str(&format!(
+                "\n【再规划 / 更新计划】执行层按原计划执行时遭遇规划缺口,失败现场如下(如实转述):\n{}\n\
+                 请**更新编排**:① 已完成单元禁止重复规划;② 针对上述缺口补充 / 修订对应单元的 steps 与 acceptance\
+                 (登录前置步骤含 request_human 人工介入点 / 表单分步填写与字段核对 / 换路径换入口 / 访问受限的降级方案);\
+                 ③ 只拆解剩余目标,其余保持原计划。\n",
+                ctx.trim()
             ));
         }
         // 第 146 轮:遍历类任务拆解纪律 —— 「网页任务 2~3 个 wf」对全站走查是

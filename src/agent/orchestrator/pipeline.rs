@@ -206,6 +206,19 @@ impl MultiAgentOrchestrator {
         // 累计并注入 Plan/Main-Work 提示词,重试轮只规划/执行剩余部分,
         // 根治「档位重试从 wf-1 全量重跑、同批页面反复遍历」。
         let mut completed_digest = String::new();
+        // Plan 再规划/更新规划:执行层遭遇规划缺口(登录墙/表单/访问受阻)时,
+        // try_replan 产出 ReplanPending 跨轮暂存,下一轮 run_hard/run_medium 消费
+        // (跳过规划层重新生成,直接解析/执行新方案);消费后清空,只存活一个重试轮。
+        let mut replan_pending: Option<ReplanPending> = None;
+        // 再规划预算计数(每任务,默认 cfg.replan_budget 次)。
+        let mut replan_used = 0usize;
+        // hard 档最近一次生成的 Plan 文档路径 —— 再规划时的修订基础。
+        let mut last_plan_path: Option<std::path::PathBuf> = None;
+        // 再规划杀开关:LAEW_REPLAN=off 关闭(默认开启)。
+        let replan_enabled = !matches!(
+            std::env::var("LAEW_REPLAN").as_deref(),
+            Ok("off") | Ok("0") | Ok("false") | Ok("no")
+        );
         // 第 149 轮同因熔断:连续 2 轮失败原因相同 → force_fail,loop 顶部与
         // 「超 max_retry」共用失败收口(实现与单测见 types::SameCauseBreaker)。
         let mut same_cause = SameCauseBreaker::new();
@@ -467,6 +480,7 @@ impl MultiAgentOrchestrator {
                         &retry_hint,
                         &completed_digest,
                         &mut medium_plan_cache,
+                        &mut replan_pending,
                     )
                     .await
                 }
@@ -478,6 +492,8 @@ impl MultiAgentOrchestrator {
                         progress,
                         &retry_hint,
                         &completed_digest,
+                        &mut replan_pending,
+                        &mut last_plan_path,
                     )
                     .await
                     .map_err(ExecFailure::Quality),
@@ -697,6 +713,91 @@ impl MultiAgentOrchestrator {
                     let is_exec_level_failure = matches!(failure.source, AgentRole::SubAgent);
                     if !is_exec_level_failure {
                         medium_plan_cache = None;
+                    }
+
+                    // ===== Plan 再规划 / 更新规划(规划缺口机械路由) =====
+                    // 执行层按方案执行遭遇规划缺口(登录墙/表单/访问受阻/现场与假设不符)时,
+                    // 把失败现场回灌规划层修订方案,下一轮直接消费新方案 ——
+                    // 而不是带同一方案盲重试。条件:可重试 + 未取消 + 预算未满 +
+                    // 档位有规划层(hard=Plan / medium=Main-Work)+ 信号命中。
+                    // 再规划失败静默回落常规重试(不额外烧档位预算语义)。
+                    if replan_enabled
+                        && failure.retryable
+                        && !failure.cancelled
+                        && replan_used < self.cfg.replan_budget
+                        && !matches!(classification.task_level, TaskLevel::Simple)
+                    {
+                        let failure_signals = failure
+                            .trace
+                            .as_ref()
+                            .map(|t| t.failure_signals.clone())
+                            .unwrap_or_default();
+                        if let Some(signal) = crate::agent::replan::detect_replan_signal(
+                            &failure.reason,
+                            &failure.suggestion,
+                            &failure_signals,
+                        ) {
+                            info!(
+                                session = %session.id(),
+                                retry_count,
+                                trigger = %signal.trigger.as_str(),
+                                evidence = %crate::logging::clip(&signal.evidence),
+                                replan_used,
+                                "检测到规划缺口(决策):触发再规划"
+                            );
+                            emit_progress(
+                                progress,
+                                format!(
+                                    "检测到规划缺口({}),Plan 再规划 / 更新规划…",
+                                    signal.trigger.label()
+                                ),
+                            );
+                            match self
+                                .try_replan(
+                                    &classification,
+                                    session,
+                                    progress,
+                                    &failure,
+                                    &completed_digest,
+                                    last_plan_path.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok((pending, replan_usage)) => {
+                                    replan_used += 1;
+                                    total_usage = add_usage(total_usage, replan_usage);
+                                    // 再规划摘要 + 失败现场 → 下一轮档位级 retry_hint,
+                                    // 执行单元据此看到「规划已如何更新」。
+                                    retry_hint = clip_replan_summary(&format!(
+                                        "{}\n失败现场: {}",
+                                        pending.summary, failure.reason
+                                    ));
+                                    // 规划语境已变,同因计数复位(与 Yolo 回流同语义);
+                                    // 再规划产物由下一轮 run_hard/run_medium 消费。
+                                    same_cause.reset();
+                                    replan_pending = Some(pending);
+                                    // 再规划后原计划缓存作废(新方案替代)。
+                                    medium_plan_cache = None;
+                                    emit_progress(
+                                        progress,
+                                        format!("再规划完成(第 {replan_used} 次),按更新方案继续执行剩余单元…"),
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    // 再规划本身失败:静默回落常规重试,日志留痕。
+                                    tracing::warn!(
+                                        session = %session.id(),
+                                        error = %e,
+                                        "再规划失败,回落常规重试路径"
+                                    );
+                                    emit_progress(
+                                        progress,
+                                        format!("再规划失败({e}),回落常规重试…"),
+                                    );
+                                }
+                            }
+                        }
                     }
                     // retryable=true 留在当前档位继续重跑
                     // F3:记录失败原因,下一轮回灌 Main-Work / 供 Failed 呈现
@@ -964,8 +1065,24 @@ impl MultiAgentOrchestrator {
         retry_hint: &str,
         completed_digest: &str,
         plan_cache: &mut Option<WorkFlowPlan>,
+        replan_pending: &mut Option<ReplanPending>,
     ) -> std::result::Result<TaskResult, ExecFailure> {
-        // 0) 2026-09-16 第 67 轮:计划复用(效率优化)。
+        // 0) Plan 再规划/更新规划消费:再规划产出的新编排直接替代缓存进入复用分支
+        // (跳过 Main-Work 重拆;执行语义与计划复用完全一致 —— 失败反馈注入各单元)。
+        // 只存活一个重试轮:take 后即清空,过期方案不会被复用。
+        if let Some(p) = replan_pending.take() {
+            if let Some(plan) = p.plan {
+                emit_progress(
+                    progress,
+                    format!(
+                        "消费更新规划编排({} 个流程单元,跳过 Main-Work 重拆)",
+                        plan.workflows.len()
+                    ),
+                );
+                *plan_cache = Some(plan);
+            }
+        }
+        // 0.1) 2026-09-16 第 67 轮:计划复用(效率优化)。
         //    上一轮执行层失败(wf 单元 QC 拒)→ 计划本身没问题 → 跳过 Main-Work LLM 重拆,
         //    失败反馈注入每个执行单元的 description。失败单元也会因 retry_hint 调整策略。
         if retry_hint.trim().is_empty() {
@@ -1021,6 +1138,7 @@ impl MultiAgentOrchestrator {
                 original_prompt.as_deref(),
                 suggested_delegate,
                 completed_digest,
+                None,
             ),
         )
         .await
@@ -1216,27 +1334,61 @@ impl MultiAgentOrchestrator {
         progress: &Option<ProgressTx>,
         retry_hint: &str,
         completed_digest: &str,
+        replan_pending: &mut Option<ReplanPending>,
+        last_plan_path: &mut Option<std::path::PathBuf>,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 1) Plan 生成(2026-09-09 第 14 轮:带回 LLM Usage 用于累加)
         // I3(2026-09-14 第 51 轮):重试轮回灌上一轮 QC 拒绝理由,
         // Plan 针对性修复而非盲重生成(此前 hard 档重试链路唯一无反馈环)。
         // 第 146 轮:再回灌「已完成单元清单」—— 断点续跑,只规划剩余部分。
+        // Plan 再规划/更新规划:上一轮执行遭遇规划缺口时,try_replan 已产出修订方案,
+        // 这里直接消费(跳过 Plan 重新生成与计划级 QC;QC-Main 与单元 QC 照常把守)。
         emit_progress(progress, "Plan 规划中…");
         let plan_started = std::time::Instant::now();
-        let (plan_output, plan_usage) = self
-            .plan
-            .generate_with_retry_hint(
-                &c.goal_summary,
-                &c.purpose,
-                &c.intent,
-                &c.decomposition_plan,
-                session.id(),
-                retry_hint,
-                completed_digest,
-                &Self::task_user_prompt(session).unwrap_or_default(),
+        let replanned_path = replan_pending.take().and_then(|p| p.plan_path);
+        let (plan_output, plan_usage, from_replan) = if let Some(path) = replanned_path {
+            emit_progress(
+                progress,
+                format!("消费再规划方案({}),跳过 Plan 重新生成", path.display()),
+            );
+            let markdown = std::fs::read_to_string(&path).map_err(|e| QualityFailure {
+                source: AgentRole::Plan,
+                reason: format!("读取再规划方案失败: {e}"),
+                retryable: true,
+                suggestion: "重试".into(),
+                cancelled: false,
+                trace: None,
+                usage: Usage::default(),
+                completed_digest: String::new(),
+            })?;
+            // 二次再规划的修订基础 = 最新方案(而非最初方案)。
+            *last_plan_path = Some(path.clone());
+            (
+                crate::agent::plan::PlanOutput {
+                    path: path.clone(),
+                    markdown,
+                },
+                Usage::default(),
+                true,
             )
-            .await
-            .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;
+        } else {
+            let (output, usage) = self
+                .plan
+                .generate_with_retry_hint(
+                    &c.goal_summary,
+                    &c.purpose,
+                    &c.intent,
+                    &c.decomposition_plan,
+                    session.id(),
+                    retry_hint,
+                    completed_digest,
+                    &Self::task_user_prompt(session).unwrap_or_default(),
+                )
+                .await
+                .map_err(|e| QualityFailure::from_agent_error(AgentRole::Plan, "Plan 生成失败", &e))?;
+            *last_plan_path = Some(output.path.clone());
+            (output, usage, false)
+        };
         let plan_elapsed_ms = plan_started.elapsed().as_millis() as u64;
         emit_progress(
             progress,
@@ -1259,8 +1411,14 @@ impl MultiAgentOrchestrator {
         );
 
         // 2) Quality 校验 Plan
+        // 再规划方案跳过计划级 QC:再规划是带执行反馈的定向修订(非盲生成),
+        // 质量由 QC-Main 与逐单元 QC 照常把守(对齐 medium 档默认跳过 QC-main 的口径)。
         let qc_plan_started = std::time::Instant::now();
-        let (qc_plan, qc_plan_usage) = self
+        let (qc_plan, qc_plan_usage) = if from_replan {
+            emit_progress(progress, "再规划方案跳过计划级 QC(QC-Main 与单元 QC 照常)");
+            (QualityReport::pass(AgentRole::QualityCheck), Usage::default())
+        } else {
+            self
             .quality
             .check_plan(&plan_output.markdown, session.id())
             .await
@@ -1279,7 +1437,8 @@ impl MultiAgentOrchestrator {
                     usage: plan_usage,
                     completed_digest: String::new(),
                 }
-            })?;
+            })?
+        };
         let qc_plan_elapsed_ms = qc_plan_started.elapsed().as_millis() as u64;
         self.dbg_qc(&qc_plan);
         if qc_plan.verdict == Verdict::Fail {

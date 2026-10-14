@@ -134,6 +134,7 @@ fn merge_dynamic_usage(
 // 原私有项标 `pub(super)`(可见域 = orchestrator 子树,与拆分前单文件作用域等价)。
 // ===========================================================================
 mod pipeline;
+mod replan;
 mod types;
 mod usage;
 mod workflows;
@@ -143,7 +144,8 @@ pub use types::{
     LayerInfo, OrchestrationOutcome, OrchestratorConfig, RetryRecord, StageDuration, TaskResult,
     WorkflowResult,
 };
-use types::{ExecFailure, QualityFailure, SameCauseBreaker};
+use types::{ExecFailure, QualityFailure, ReplanPending, SameCauseBreaker};
+use replan::clip_replan_summary;
 use usage::{add_usage, failure_usage, tool_args_digest};
 use workflows::run_wf_unit;
 // 单测经 `use super::*` 取用;非测试构建无引用。

@@ -52,6 +52,7 @@ pub mod skills;
 pub mod profile;
 pub mod project_context;
 pub mod quality;
+pub mod replan;
 pub mod runtime_hints;
 pub mod safety;
 pub mod sandbox_hook;

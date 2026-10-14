@@ -31,6 +31,11 @@ pub struct OrchestratorConfig {
     /// 重试(loop / Yolo 回流)。零配置即生效,向后兼容。
     /// 实现见 tmpPlan/2026-09-19_06-单元级局部重试闭环方案.md。
     pub unit_retry_budget: usize,
+    /// 再规划预算(Plan 再规划/更新规划):执行层遭遇规划缺口(登录墙/表单/访问受阻)
+    /// 时,允许把失败现场回灌 Plan 修订方案的次数(每任务);默认 2,0 = 关闭。
+    /// 杀开关:`LAEW_REPLAN=off` 在 handle_inner 判定处零开销关闭。
+    /// 设计见 `docs/PlanAgent再规划与更新规划/01-设计与解决方案.md`。
+    pub replan_budget: usize,
     /// 调试事件采集器(`-debug` 调试模式时注入,默认 None 零开销)
     pub debug: Option<Arc<DebugCollector>>,
 }
@@ -47,6 +52,7 @@ impl Default for OrchestratorConfig {
             subagent_explore_budget,
             max_parallel_workflows: 3,
             unit_retry_budget: 2,
+            replan_budget: 2,
             debug: None,
         }
     }
@@ -215,6 +221,18 @@ impl From<QualityFailure> for ExecFailure {
     fn from(q: QualityFailure) -> Self {
         ExecFailure::Quality(q)
     }
+}
+
+/// 再规划待消费状态(Plan 再规划/更新规划):try_replan 成功后跨轮暂存,
+/// 下一轮 run_hard / run_medium 消费(直接解析新方案,跳过 Plan/Main-Work 重新生成),
+/// 消费后清空 —— 只存活一个重试轮,避免过期方案被复用。
+pub(super) struct ReplanPending {
+    /// hard 档:再规划产出的新 Plan 文档路径(下一轮 run_hard 直接解析)。
+    pub(super) plan_path: Option<PathBuf>,
+    /// medium 档:再规划产出的新 WorkFlowPlan(下一轮 run_medium 注入复用分支)。
+    pub(super) plan: Option<WorkFlowPlan>,
+    /// 再规划摘要(注入档位级 retry_hint,让执行单元看到「规划已如何更新」)。
+    pub(super) summary: String,
 }
 
 /// 同因熔断器 —— 连续 N 轮失败原因完全相同即熔断,提前终止重试。///
