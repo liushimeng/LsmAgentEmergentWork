@@ -52,6 +52,49 @@ async fn spawn_download_server() -> String {
 
 /// 第 162 轮:地理位置权限冒烟 —— 启动本地 HTTP 服务返回探测页,
 /// 页面把 `navigator.permissions.query({name:'geolocation'})` 的状态写进标题。
+/// 起一个返回固定 HTML 的一次性 HTTP 服务（第 174 轮）。
+///
+/// 用 `http://127.0.0.1`（而非 `data:` URL）是刻意的：loopback 属**安全上下文**，
+/// `navigator.userAgentData`（Client Hints）只有在那里才暴露 —— UA 去令牌路径要
+/// 连同 `Sec-CH-UA` 品牌表一起验证，就必须在这个上下文里跑。
+async fn spawn_html_server(html: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    tokio::spawn(async move {
+                        let mut buf = vec![0_u8; 4096];
+                        let mut read = 0;
+                        loop {
+                            match socket.read(&mut buf[read..]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    read += n;
+                                    if buf[..read].windows(4).any(|w| w == b"\r\n\r\n")
+                                        || read == buf.len()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            html.len(),
+                            html
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    format!("http://{addr}/")
+}
+
 async fn spawn_geo_server() -> String {
     let html = "<html><head><title>geo:pending</title><script>navigator.permissions.query({name:'geolocation'}).then(r => { document.title = 'geo:' + r.state; }).catch(() => { document.title = 'geo:error'; });</script></head><body>geo</body></html>";
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -807,6 +850,188 @@ async fn stealth_selfcheck_smoke() {
         "进度栏应显示当前动作:{sprobe}"
     );
 
+    // ============ 第 174 轮:反检测档位(非侵入式保真 / 侵入式原生化) ============
+    // ⑥ 保真档:插件/语言/chrome.runtime 非空(真实桌面 Chrome 恒有),UA 无无头令牌
+    let plugins = eval("String(navigator.plugins ? navigator.plugins.length : 0)".into()).await;
+    assert!(
+        plugins.parse::<u32>().unwrap_or(0) >= 3,
+        "plugins 应为真实桌面数量(空 = 典型无头特征):{plugins}"
+    );
+    let langs = eval("String(navigator.languages ? navigator.languages.length : 0)".into()).await;
+    assert!(langs.parse::<u32>().unwrap_or(0) >= 1, "languages 不得为空:{langs}");
+    let chrome_rt = eval("String(!!(window.chrome && window.chrome.runtime))".into()).await;
+    assert_eq!(chrome_rt, "true", "window.chrome.runtime 应在场");
+    let ua_headless = eval("String(navigator.userAgent.indexOf('Headless') >= 0)".into()).await;
+    assert_eq!(ua_headless, "false", "UA 不得残留 HeadlessChrome 令牌");
+
+    // ⑦ WebGL 不得是自动化兜底串(风控最常采的高风险项)
+    let renderer = eval(
+        r#"(() => { try { const c = document.createElement('canvas');
+            const g = c.getContext('webgl') || c.getContext('experimental-webgl');
+            if (!g) return 'no-webgl';
+            const e = g.getExtension('WEBGL_debug_renderer_info');
+            return String(e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : g.getParameter(g.RENDERER));
+        } catch (err) { return 'err'; } })()"#
+            .into(),
+    )
+    .await;
+    let low = renderer.to_ascii_lowercase();
+    assert!(
+        !low.contains("webkit") && !low.contains("swiftshader") && !low.contains("software"),
+        "WebGL renderer 不得是自动化兜底串:{renderer}"
+    );
+
+    // ⑧ 描述符形态还原:被改写的 WebGL 方法必须 enumerable(原生 WebIDL 形态,
+    //    否则 for…in 枚举原型链即可发现「改过」)
+    let enumerable = eval(
+        "String(Object.getOwnPropertyDescriptor(WebGLRenderingContext.prototype, 'getParameter').enumerable)"
+            .into(),
+    )
+    .await;
+    assert_eq!(enumerable, "true", "被改写方法描述符须与原生同形(enumerable)");
+
+    // ⑨ 响应回报 data.stealth / data.fingerprint(人工与 QC 的对账面)
+    assert_eq!(
+        v["data"]["stealth"]["mode"],
+        json!("fidelity"),
+        "缺省档应为非侵入式保真:{out}"
+    );
+    assert_eq!(v["data"]["stealth"]["fidelity"], json!(true), "保真块应生效:{out}");
+    let codes: Vec<String> = v["data"]["fingerprint"]["suspicious"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x["code"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !codes.contains(&"webdriver_true".to_string()),
+        "webdriver 覆写应生效:{codes:?}"
+    );
+    assert!(
+        !codes.contains(&"headless_ua".to_string()),
+        "UA 不应带无头令牌:{codes:?}"
+    );
+
+    // ⑩ 非侵入式档的分界线:不改函数身份(如实暴露源码)
+    let fid_src =
+        eval("Function.prototype.toString.call(WebGLRenderingContext.prototype.getParameter)".into())
+            .await;
+    assert!(
+        !fid_src.contains("[native code]"),
+        "保真档不得伪装函数身份(那是侵入式档的事):{fid_src}"
+    );
+
+    // ⑪ 升侵入式档:被改写函数身份原生化(含 toString 自反闭合)
+    let up = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id,
+            "control_action": "set_stealth", "params": {"mode": "hardened"}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(data_of(&up)["code"], json!(0), "set_stealth(hardened) 应成功:{up}");
+    let hard_src =
+        eval("Function.prototype.toString.call(WebGLRenderingContext.prototype.getParameter)".into())
+            .await;
+    assert!(
+        hard_src.contains("[native code]"),
+        "侵入式档应原生化被改写函数:{hard_src}"
+    );
+    let self_src =
+        eval("Function.prototype.toString.call(Function.prototype.toString)".into()).await;
+    assert!(self_src.contains("[native code]"), "toString 自反闭合:{self_src}");
+
+    // ⑫ 非法档位取值必须拒绝(不静默改档)
+    let bad = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id,
+            "control_action": "set_stealth", "params": {"mode": "turbo"}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(data_of(&bad)["code"], json!(2002), "非法档位应报错:{bad}");
+
+    // ⑬ 切回缺省档(后续用例与实例复用不受影响)
+    let down = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id,
+            "control_action": "set_stealth", "params": {"mode": "fidelity"}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(data_of(&down)["code"], json!(0), "切回保真档应成功:{down}");
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": page_id}))
+        .await;
+}
+
+/// 第 174 轮:无头档 UA 去自动化令牌回归。
+///
+/// 无头 Chrome 的 UA 里的 `HeadlessChrome` 令牌同时出现在 UA 串、网络请求头与
+/// `Sec-CH-UA` 品牌表三处,服务端一眼识别 —— 工具在首航**之前**经
+/// `Emulation.setUserAgentOverride` 清掉（见 `browser_ns::apply_ua_destealth`）。
+/// headed 档本无该令牌（零动作），故必须单独跑无头档才能覆盖这条路径。
+#[tokio::test]
+#[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
+async fn stealth_headless_ua_destealth_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let url = spawn_html_server("<html><head><title>ua</title></head><body>ua</body></html>").await;
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url, "mode": "hidden"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    if v["code"] == 3001 {
+        return; // 本机未安装浏览器:信封验证即完成
+    }
+    assert_eq!(v["code"], 0, "hidden 档 open 应成功: {out}");
+    assert_eq!(v["data"]["mode"], json!("hidden"), "应为无头档:{out}");
+    assert_eq!(
+        v["data"]["stealth"]["mode"],
+        json!("fidelity"),
+        "缺省档应为非侵入式保真:{out}"
+    );
+    let page_id = v["data"]["page_id"].as_str().unwrap().to_string();
+    let eval = |expr: String| {
+        let pid = page_id.clone();
+        async move {
+            let out = McpWebUseTool
+                .execute(json!({
+                    "action": "control", "page_id": pid, "control_action": "eval_js",
+                    "params": {"expression": expr}
+                }))
+                .await
+                .unwrap();
+            let v = data_of(&out);
+            assert_eq!(v["code"], 0, "eval_js 应成功: {out}");
+            v["data"]["result"].as_str().unwrap_or_default().to_string()
+        }
+    };
+    let ua = eval("navigator.userAgent".into()).await;
+    assert!(
+        !ua.contains("Headless"),
+        "无头档 UA 不得残留 HeadlessChrome 令牌(须在首航前经 CDP 覆盖清掉):{ua}"
+    );
+    assert!(ua.contains("Chrome/"), "清理后仍应是正常 Chrome UA:{ua}");
+    // Client Hints 品牌表同样不得残留无头品牌 —— 否则「UA 说 Chrome、Sec-CH-UA 说
+    // Headless」是比原状更显眼的新破绽(只改 UA 串不改品牌表 = 半吊子清理)。
+    let brands = eval(
+        "JSON.stringify((navigator.userAgentData && navigator.userAgentData.brands) || [])".into(),
+    )
+    .await;
+    let names = brands.to_ascii_lowercase();
+    assert!(
+        !names.contains("headless"),
+        "Sec-CH-UA 品牌表不得残留无头品牌:{brands}"
+    );
+    assert!(
+        brands.contains("Chromium") || brands.contains("Google Chrome"),
+        "品牌表应是正常 Chrome 品牌(Client Hints 元数据未被清空):{brands}"
+    );
     let _ = McpWebUseTool
         .execute(json!({"action": "close", "page_id": page_id}))
         .await;

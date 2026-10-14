@@ -367,27 +367,39 @@ pub async fn apply_ua_destealth(
             .user_agent(plan.user_agent.clone());
     // 品牌列表被滤空时只改 UA 字符串，不下发一个比真值更可疑的空品牌表。
     if plan.has_metadata() {
+        use chromiumoxide::cdp::browser_protocol::emulation::{
+            UserAgentBrandVersion as Brand, UserAgentMetadata as Meta,
+        };
         let brands = |list: &[(String, String)]| {
             list.iter()
-                .map(|(b, v)| {
-                    chromiumoxide::cdp::browser_protocol::emulation::UserAgentBrandVersion::new(
-                        b.clone(),
-                        v.clone(),
-                    )
-                })
+                .map(|(b, v)| Brand::new(b.clone(), v.clone()))
                 .collect::<Vec<_>>()
         };
-        let meta = chromiumoxide::cdp::browser_protocol::emulation::UserAgentMetadata::builder()
-            .brands(brands(&plan.brands))
-            .platform(plan.platform.clone())
-            .platform_version(plan.platform_version.clone())
-            .architecture(plan.architecture.clone())
-            .model(plan.model.clone())
-            .mobile(plan.mobile)
-            .build();
-        if let Ok(meta) = meta {
-            builder = builder.user_agent_metadata(meta);
-        }
+        // 直接构造结构体:chromiumoxide 0.9 的 builder 把 `full_version_list` 生成了
+        // 「取单个品牌」的签名(生成器缺陷),用它就表达不出「整张版本表」。
+        // 一并下发 Full-Version-List 是必要的:省略会让 `Sec-CH-UA-Full-Version-List`
+        // 退化成主版本号(真实 Chrome 报 `155.0.8059.40`),等于自己制造不一致。
+        let meta = Meta {
+            brands: Some(brands(&plan.brands)),
+            full_version_list: if plan.full_version_list.is_empty() {
+                None
+            } else {
+                Some(brands(&plan.full_version_list))
+            },
+            platform: plan.platform.clone(),
+            platform_version: plan.platform_version.clone(),
+            architecture: plan.architecture.clone(),
+            model: plan.model.clone(),
+            mobile: plan.mobile,
+            bitness: if plan.bitness.is_empty() {
+                None
+            } else {
+                Some(plan.bitness.clone())
+            },
+            wow64: None,
+            form_factors: None,
+        };
+        builder = builder.user_agent_metadata(meta);
     }
     match builder.build() {
         Ok(p) => match page.execute(p).await {
