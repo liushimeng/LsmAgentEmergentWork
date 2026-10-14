@@ -56,3 +56,4 @@ TestWorkSpace/
 
 # BashSpill(Bash 大输出落盘产物,D17 大对象溢出,自动落盘不入库)
 BashSpill/
+EvalSpill/
