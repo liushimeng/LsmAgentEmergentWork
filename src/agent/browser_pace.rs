@@ -226,6 +226,11 @@ pub struct PaceState {
     /// 根治「close(all) 清连击 → 换全新 profile 再被抹」的 Chrome 拉起风暴
     /// (猎聘对 CDP 拉起环境做指纹级打标,换新实例无效,2026-10-14 实测)。
     wipe_total: HashMap<String, u32>,
+    /// 每注册域**持久熔断下**的 force 强制导航计数(第 174 轮;`clear_all` 不清,
+    /// 与 `wipe_total` 同语义,仅恢复证据清零)。超过 [`FORCE_BUDGET`] 后
+    /// `force=true` 逃生口同样返 6004 —— 强制导航不改变站点侧指纹级打标,
+    /// 只多弹 Chrome 多吃风控(实测连闯 2 次总账 3→5)。
+    forced_nav: HashMap<String, u32>,
 }
 
 impl Default for PaceState {
@@ -236,9 +241,13 @@ impl Default for PaceState {
             cooldown_cause: HashMap::new(),
             wipe_streak: HashMap::new(),
             wipe_total: HashMap::new(),
+            forced_nav: HashMap::new(),
         }
     }
 }
+
+/// 持久熔断下 force 强制导航的单域预算(第 174 轮)。
+const FORCE_BUDGET: u32 = 2;
 
 /// 一次导航落地的抹除记账结果(供调用方附加到响应,如 open 的 `data.site_wipe`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +402,9 @@ impl WebPace {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let had_streak = guard.wipe_streak.remove(&host).is_some();
         let had_total = guard.wipe_total.remove(&host).is_some();
+        // 恢复证据同样清 force 预算(第 174 轮):环境已证明未被打标,
+        // force 语义回到「确需立即导航」的常规兜底。
+        guard.forced_nav.remove(&host);
         // 只解抹除成因的冷却,频控冷却不动(频控靠时间,与本环境恢复无关)。
         if guard.cooldown_cause.get(host.as_str()) == Some(&CAUSE_SITE_WIPE) {
             guard.cooldown_until.remove(host.as_str());
@@ -404,6 +416,28 @@ impl WebPace {
     /// 该域是否已达 laew 身份持久熔断(总账 ≥ 阈值)。
     pub fn wipe_exhausted(&self, host: &str) -> bool {
         self.wipe_total_for(host) >= wipe_total_threshold()
+    }
+
+    /// 持久熔断下登记一次 force 强制导航并判定预算(第 174 轮)。
+    ///
+    /// 返回 `Some(used)` = 本次是第 `used` 次且**已超预算**(应拦截);
+    /// `None` = 预算内(放行)。计数与 `wipe_total` 同生命周期(仅恢复证据清零)。
+    pub fn note_forced_nav(&self, host: &str) -> Option<u32> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let used = guard.forced_nav.entry(host.to_string()).or_insert(0);
+        *used += 1;
+        (*used > FORCE_BUDGET).then_some(*used)
+    }
+
+    /// 该域持久熔断下已用 force 次数(测试/信封回报用)。
+    pub fn force_used_for(&self, host: &str) -> u32 {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forced_nav
+            .get(host)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// 该域当前抹除连击数(2026-10-14 第三轮,供「连击域跳过徒劳重导航」判定)。
@@ -519,10 +553,22 @@ pub async fn guard_navigation(
     force: bool,
     laew_identity: bool,
 ) -> Option<crate::error::Result<String>> {
-    if !enabled() || force {
+    if !enabled() {
         return None;
     }
     let host = host_of(url)?;
+    // force 预算(第 174 轮):持久熔断下强制导航此前无上限,模型连闯只多弹
+    // Chrome 多吃风控(实测连闯 2 次总账 3→5)。预算内照常放行,用尽即拦。
+    // 仅约束 laew 身份导航 —— 用户日常 Chrome 的 force 是常规「确需立即导航」。
+    if force {
+        if laew_identity && WebPace::global().wipe_exhausted(&host) {
+            if let Some(used) = WebPace::global().note_forced_nav(&host) {
+                tracing::warn!(host = %host, used, "持久熔断 force 预算已用尽,拦截强制导航");
+                return Some(Ok(force_budget_envelope(&host, used, FORCE_BUDGET)));
+            }
+        }
+        return None;
+    }
     // 持久熔断(2026-10-14 第二轮):总账达阈值且目标是 laew 自起身份 ——
     // 换全新 profile/新实例对该域已被实测无效,不再放行(close(all) 逃逸无效)。
     if laew_identity && WebPace::global().wipe_exhausted(&host) {
@@ -612,23 +658,22 @@ pub async fn guard_navigation(
 
 /// 持久熔断信封(纯函数,便于单测):`total >= threshold` 才构造,否则 `None`。
 ///
-/// 2026-10-14 第三轮:附 `relaunch_command`(用户日常 Chrome 以调试端口重启的命令,
-/// 纯字符串拼装)—— 之前模型要走一轮 3002 才拿到可转述命令,而日常 Chrome 无调试
-/// 端口时它只会 auto_relaunch(又是 laew 身份实例,照样被抹),指引不闭环。
+/// 第 174 轮:删除 `relaunch_command`/`relaunch_hint` 与「接管日常 Chrome 不受
+/// 此熔断」的承诺 —— 三处不实(猎聘实测用户照抄命令执行、接管仍被拦、日常 Chrome
+/// 本身也被 IP 级打标):① 该命令与 auto_relaunch 用同一端口/同一调试 profile,
+/// laew 实例存活时用户命令只是并入该实例,照样按 laew 身份熔断;② Chrome 136+
+/// 默认 profile(真日常指纹)无法挂调试端口,「接管日常 Chrome」不可实现;③ 指纹级
+/// 打标站点对独立调试 profile 实例同样抹除。工具层建议是模型的唯一事实源,
+/// 假承诺让 QC/SubAgent 沿死路多烧 6+ 轮(实测)。
 fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<String> {
     if total < threshold {
         return None;
     }
-    let relaunch_command = crate::agent::browser_reuse::relaunch_command_string(
-        crate::agent::browser_reuse::debug_port(),
-        &crate::agent::browser_reuse::debug_profile_dir(),
-    );
     let msg = format!(
         "站点整页抹除持久熔断({host}):已对 laew 拉起环境累计抹除 {total} 次(≥{threshold}),\
-判定为指纹级打标 —— close(all) 换全新 profile/调试实例重试均被实测无效且每试一次多弹一台 Chrome。\
-只剩两条出路:① open(reuse_existing=true) 接管**用户日常 Chrome**(真实指纹+登录态,不受此熔断;\
-未开调试端口时把 data.relaunch_command 转述给用户执行后再接管,不要用 auto_relaunch —— 那仍是 laew 身份);\
-② request_human 如实交还现场由人工处理;已采集数据先落盘。确需硬闯可 params.force=true"
+判定为指纹级打标 —— close(all) 换全新 profile/auto_relaunch 调试实例/强制导航均被实测无效,\
+每试一次多弹一台 Chrome 并再吃一次风控。环境打标通常含 IP 维度,当日重试无意义。\
+唯一可行:request_human 交还人工(人工在自己浏览器完成任务或提供数据);已采集数据先落盘,如实失败收口"
     );
     let data = json!({
         "host": host,
@@ -636,14 +681,13 @@ fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<St
         "persistent": true,
         "wipe_total": total,
         "wipe_total_threshold": threshold,
-        "relaunch_command": relaunch_command,
-        "relaunch_hint": "让用户以其日常 Chrome 执行 relaunch_command(独立调试 profile,不影响已打开窗口);\
-完成后 open(reuse_existing=true) 即接管真实指纹环境",
-        "advice": "该域已对 laew 拉起的浏览器环境(含全新 profile 与 auto_relaunch 调试实例)做指纹级打标,\
-继续重试只会反复弹 Chrome 窗口并再次被抹除。处置:① 把 data.relaunch_command 转述给用户以其日常 Chrome 执行,\
-再 open(reuse_existing=true) 接管(真实指纹+登录态,不受此熔断;auto_relaunch 无效,别再试);\
-② request_human 人工协助;已采集数据先落盘。确需立即导航可 params.force=true",
-        "force_hint": "确认必须立即导航时,可在 params 加 force=true 跳过节奏闸强制执行",
+        "advice": "该域已对 laew 拉起的浏览器环境(全新 profile 与调试实例均在内)做指纹级打标,\
+继续 open/navigate/close(all)/force 重试只会反复弹 Chrome 并再次被抹除(实测均无效)。处置:\
+① 立即停止对该域的一切导航尝试,不要再让用户执行任何调试端口命令(同端口同 profile,结局相同);\
+② request_human 交还人工处理(人工在自己的浏览器完成任务,或提供已采集数据);\
+③ 已采集数据先落盘,如实向用户报告失败与环境判定;环境打标通常含 IP 维度,建议当日不再重试本域",
+        "force_hint": "持久熔断下 force 逃生口有预算(缺省 2 次),用尽后同样返回 6004 —— \
+强制导航不改变站点侧打标,只多弹 Chrome 多吃风控",
     });
     serde_json::to_string(&json!({
         "code": CODE_SITE_PACE_COOLDOWN,
@@ -651,6 +695,36 @@ fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<St
         "data": data,
     }))
     .ok()
+}
+
+/// force 预算用尽信封(纯函数,便于单测)。
+///
+/// 第 174 轮:持久熔断下 `force=true` 逃生口此前无上限,模型连闯 2 次(每次
+/// 多拉一台 Chrome + 再被抹一次,实测总账 3→5)。预算用尽后 force 也返 6004。
+fn force_budget_envelope(host: &str, used: u32, budget: u32) -> String {
+    let msg = format!(
+        "force 逃生口预算已用尽({host}):持久熔断下已强制导航 {used} 次(上限 {budget})均被站点抹除 —— \
+该域对 CDP 拉起环境本身打标,强制导航不改变站点侧判定,只多弹 Chrome 多吃风控。\
+请转 request_human 人工处理或如实失败收口"
+    );
+    let data = json!({
+        "host": host,
+        "cause": CAUSE_SITE_WIPE,
+        "persistent": true,
+        "force_exhausted": true,
+        "force_used": used,
+        "force_budget": budget,
+        "advice": "强制导航已证明无效(前 N 次均被抹除)。停止一切导航尝试;\
+request_human 交还人工处理;已采集数据先落盘,如实失败收口",
+    });
+    serde_json::to_string(&json!({
+        "code": CODE_SITE_PACE_COOLDOWN,
+        "message": msg,
+        "data": data,
+    }))
+    .unwrap_or_else(|_| {
+        "{\"code\":6004,\"message\":\"force 逃生口预算已用尽\"}".to_string()
+    })
 }
 
 #[cfg(test)]
@@ -939,12 +1013,18 @@ mod tests {
             .expect("达阈值构造熔断信封");
         let v: serde_json::Value = serde_json::from_str(&env).unwrap();
         assert_eq!(v["data"]["persistent"], true);
-        // 2026-10-14 第三轮:熔断信封必须附可转述给用户的重启命令
-        let cmd = v["data"]["relaunch_command"].as_str().unwrap_or("");
-        assert!(!cmd.trim().is_empty(), "relaunch_command 不得为空");
+        // 第 174 轮:熔断信封不再附 relaunch_command —— 该命令与 auto_relaunch
+        // 同端口同调试 profile,用户照抄执行也走不出去(实测),假承诺只会把
+        // 模型与用户引向死路;建议必须指向 request_human 与如实失败。
         assert!(
-            v["data"]["advice"].as_str().unwrap_or("").contains("relaunch_command"),
-            "advice 须指引转述 relaunch_command"
+            v["data"].get("relaunch_command").is_none(),
+            "持久熔断信封不得再附 relaunch_command"
+        );
+        let advice = v["data"]["advice"].as_str().unwrap_or("");
+        assert!(advice.contains("request_human"), "advice 须指向人工通道");
+        assert!(
+            advice.contains("不要再让用户执行任何调试端口命令"),
+            "advice 须明确劝阻调试端口命令死路"
         );
         // 真实恢复(存活过看护窗)后总账清零,熔断解除 —— 恢复路径不被卡死
         p.note_navigation_survived("https://www.liepin.com/");
@@ -1010,6 +1090,49 @@ mod tests {
         assert_eq!(v["data"]["persistent"], true);
         // 未达阈值不构造信封
         assert!(persistent_wipe_envelope("liepin.com", 1, wipe_total_threshold()).is_none());
+    }
+
+    /// 第 174 轮:持久熔断下 force 逃生口有预算 —— 前两次放行,第三次拦截;
+    /// 恢复证据(存活过看护窗)一并清零,预算复位。
+    #[test]
+    fn force预算_前两次放行第三次拦截_恢复证据清零() {
+        let p = pace();
+        // 攒到持久熔断(缺省阈值 3 次抹除)。
+        for _ in 0..wipe_total_threshold() {
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        }
+        assert!(p.wipe_exhausted("liepin.com"));
+        assert!(p.note_forced_nav("liepin.com").is_none(), "第 1 次 force 预算内放行");
+        assert!(p.note_forced_nav("liepin.com").is_none(), "第 2 次 force 预算内放行");
+        let used = p
+            .note_forced_nav("liepin.com")
+            .expect("第 3 次 force 超预算应拦截");
+        assert_eq!(used, 3);
+        assert_eq!(p.force_used_for("liepin.com"), 3);
+        // 未熔断域不受预算影响(计数独立)。
+        assert!(p.note_forced_nav("jd.com").is_none());
+        // 恢复证据清零:总账与 force 预算一并复位。
+        p.note_navigation_survived("https://www.liepin.com/");
+        assert!(!p.wipe_exhausted("liepin.com"));
+        assert_eq!(p.force_used_for("liepin.com"), 0, "恢复证据应清 force 预算");
+        assert!(p.note_forced_nav("liepin.com").is_none(), "复位后重新计数");
+    }
+
+    #[test]
+    fn force预算用尽信封_字段与文案() {
+        let env = force_budget_envelope("liepin.com", 3, FORCE_BUDGET);
+        let v: serde_json::Value = serde_json::from_str(&env).unwrap();
+        assert_eq!(v["code"], CODE_SITE_PACE_COOLDOWN);
+        assert_eq!(v["data"]["force_exhausted"], true);
+        assert_eq!(v["data"]["force_used"], 3);
+        assert_eq!(v["data"]["force_budget"], FORCE_BUDGET);
+        assert!(
+            v["data"]["advice"]
+                .as_str()
+                .unwrap_or("")
+                .contains("request_human"),
+            "预算用尽信封须指向人工通道"
+        );
     }
 
     #[test]

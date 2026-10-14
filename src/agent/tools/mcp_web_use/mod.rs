@@ -994,6 +994,19 @@ async fn run_open_reuse(args: &Value, url: &str) -> Result<String> {
     // 档位三:自动重启接管(显式 opt-in)。第 144 轮:不退出用户 Chrome ——
     // 复制登录态到独立调试 profile 并另启独立实例(与用户浏览器并存)。
     if auto_relaunch {
+        // 第 174 轮:熔断预检前移 —— 即将拉起的调试实例注定 laew 身份,若目标域
+        // 已持久熔断(指纹级打标),先复制登录态+spawn Chrome 再被 guard 拒绝是
+        // 「先斩后奏」:实例整场闲置还占住调试端口(猎聘实测 91614 全程未用)。
+        // 命中即原样返回 6004,不复制、不拉起、不登记。
+        if let Some(gated) = crate::agent::browser_pace::guard_navigation(
+            url,
+            args.get("force").and_then(Value::as_bool).unwrap_or(false),
+            true,
+        )
+        .await
+        {
+            return gated;
+        }
         return match crate::agent::browser_reuse::relaunch_and_wait(port).await {
             Some(out) => {
                 let child_pid = out.child_pid;

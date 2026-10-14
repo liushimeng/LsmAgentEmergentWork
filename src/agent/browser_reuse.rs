@@ -361,9 +361,14 @@ pub fn relaunch_args(port: u16, profile_dir: &Path, headless: bool) -> Vec<Strin
     args
 }
 
-/// Windows 下可执行文件路径含空格时加引号(纯函数,便于单测)。
+/// 可执行文件路径含空白字符时加引号(纯函数,便于单测)。
+///
+/// 第 174 轮:引号判定不再 Windows 专属 —— macOS 应用包路径
+/// `/Applications/Google Chrome.app/...` 同样含空格,用户把 relaunch_command
+/// 粘贴进 zsh 报 `no such file or directory: /Applications/Google`(实测)。
+/// 双引号在 POSIX shell 与 cmd.exe 下均为合法路径包裹。
 pub fn quote_exe_path(exe: &str) -> String {
-    if cfg!(target_os = "windows") && exe.contains(' ') {
+    if exe.chars().any(char::is_whitespace) {
         format!("\"{exe}\"")
     } else {
         exe.to_string()
@@ -507,11 +512,30 @@ fn clear_relaunch_instance() {
 }
 
 /// 该端口号当前是否是 laew 自起的调试实例(connect 记账/生杀权判定)。
+///
+/// 第 174 轮:登记 pid 已死时条目视为陈旧 —— 清除后返回 `false`。此前只按
+/// 端口比对,登记实例死亡(或被 watchdog 回收)后残留条目会把用户此后在同一
+/// 端口手工拉起的**真用户实例**误判为 laew 身份,被持久熔断拦死(猎聘实测
+/// 恢复路径被自己的注册表堵死)。
 pub fn is_laew_relaunch_port(port: u16) -> bool {
-    relaunch_instance_slot()
-        .lock()
-        .map(|slot| slot.is_some_and(|inst| inst.port == port))
-        .unwrap_or(false)
+    let stale = {
+        let Ok(slot) = relaunch_instance_slot().lock() else {
+            return false;
+        };
+        match *slot {
+            Some(inst) if inst.port == port => {
+                !crate::agent::browser_watchdog::process_alive(inst.pid)
+            }
+            // 其它端口:无登记,非 laew 身份。
+            _ => return false,
+        }
+    };
+    if stale {
+        tracing::warn!(port, "laew 调试实例登记已陈旧(pid 不存活),清除身份判定");
+        clear_relaunch_instance();
+        return false;
+    }
+    true
 }
 
 /// 当前登记实例的 PID(close(all) 回收用);无登记返回 None。
@@ -642,17 +666,56 @@ mod tests {
     }
 
     #[test]
-    fn quote_exe_path_wraps_windows_space_path() {
-        // Windows 路径常含空格(Program Files),必须引号包裹;
-        // 非 Windows 平台原样返回(平台门控与 relaunch_command_string 一致)。
-        let spaced = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
-        if cfg!(target_os = "windows") {
-            assert_eq!(quote_exe_path(spaced), format!("\"{spaced}\""));
-        } else {
-            assert_eq!(quote_exe_path(spaced), spaced);
-        }
+    fn quote_exe_path_wraps_any_space_path_on_all_platforms() {
+        // 第 174 轮:引号判定全平台统一 —— macOS 应用包路径
+        // `/Applications/Google Chrome.app/...` 含空格,zsh 粘贴执行会按首个
+        // 空格切词报 no such file or directory(实测),必须引号包裹。
+        let win_spaced = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        assert_eq!(quote_exe_path(win_spaced), format!("\"{win_spaced}\""));
+        let mac_spaced = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        assert_eq!(quote_exe_path(mac_spaced), format!("\"{mac_spaced}\""));
         // 无空格路径任何平台都不包裹。
         assert_eq!(quote_exe_path("chrome.exe"), "chrome.exe");
+        assert_eq!(
+            quote_exe_path("/usr/bin/google-chrome"),
+            "/usr/bin/google-chrome"
+        );
+    }
+
+    /// 注册表类测试互斥(全局单例,并行测试会互相覆盖登记)。
+    fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn relaunch_registry_stale_pid_cleared_and_not_laew_identity() {
+        let _g = registry_lock();
+        clear_relaunch_instance();
+        // u32::MAX 在 unix 上 i32 转换失败归 0、windows 上 OpenProcess 必败,
+        // 两平台均为「确定已死」的 pid。
+        register_relaunch_instance(u32::MAX, 9222);
+        assert!(
+            !is_laew_relaunch_port(9222),
+            "登记 pid 已死:端口应清除身份判定(用户后续在同端口拉起的实例不受熔断)"
+        );
+        assert!(
+            relaunch_instance_pid().is_none(),
+            "陈旧条目应被清除"
+        );
+        clear_relaunch_instance();
+    }
+
+    #[test]
+    fn relaunch_registry_live_pid_keeps_laew_identity() {
+        let _g = registry_lock();
+        clear_relaunch_instance();
+        // 本测试进程自身必存活。
+        register_relaunch_instance(std::process::id(), 9222);
+        assert!(is_laew_relaunch_port(9222), "登记 pid 存活:仍是 laew 身份");
+        assert!(!is_laew_relaunch_port(9333), "其它端口无登记,非 laew 身份");
+        assert_eq!(relaunch_instance_pid(), Some(std::process::id()));
+        clear_relaunch_instance();
     }
 
     #[test]
@@ -739,15 +802,18 @@ mod tests {
 
     #[test]
     fn relaunch_instance_registry_register_query_clear() {
+        let _g = registry_lock();
         // 无登记时查询为空
         clear_relaunch_instance();
         assert!(!is_laew_relaunch_port(9222));
         assert_eq!(relaunch_instance_pid(), None);
-        // 登记后按端口命中、可取 PID
-        register_relaunch_instance(4321, 9222);
+        // 登记后按端口命中、可取 PID(第 174 起须登记存活 pid ——
+        // 死 pid 条目视为陈旧会被自动清除,见 stale_pid 测试)
+        let live = std::process::id();
+        register_relaunch_instance(live, 9222);
         assert!(is_laew_relaunch_port(9222));
         assert!(!is_laew_relaunch_port(9333), "其它端口不命中");
-        assert_eq!(relaunch_instance_pid(), Some(4321));
+        assert_eq!(relaunch_instance_pid(), Some(live));
         // 清除后不再命中
         clear_relaunch_instance();
         assert!(!is_laew_relaunch_port(9222));
