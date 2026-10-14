@@ -260,6 +260,132 @@ pub(super) fn tabs_hint(count: usize) -> Option<Value> {
     }))
 }
 
+// ===================== 标签页生命周期治理(docs/MCP_Web_Use/25) =====================
+
+/// 单站点标签页堆积阈值:同 host 存活页数 **大于** 该值即附感知告警。
+///
+/// 背景:同站点多 Tab 是最典型的失控形态(同一路由反复打开/点击派生),而既有
+/// `tabs_hint` 阈值看全局总数(≥6),同站 5 个 Tab 完全无感知。取 3 与需求
+/// 「一个网站打开的 Chrome Tab 大于 3 个」对齐。
+pub(super) const ORIGIN_TAB_THRESHOLD: usize = 3;
+
+/// 单站点堆积告警(纯函数):`entries = [(page_id, host)]`(host 为空串的页跳过
+/// 统计——about:blank 等无 host 页面不该触发同站判定)。任一同源 Tab 数超过
+/// [`ORIGIN_TAB_THRESHOLD`] 返回告警 JSON(取堆积最多的站),否则 None。
+pub(super) fn origin_tabs_alert(entries: &[(String, String)]) -> Option<Value> {
+    use std::collections::BTreeMap;
+    let mut by_host: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (id, host) in entries {
+        if host.is_empty() {
+            continue;
+        }
+        by_host.entry(host.clone()).or_default().push(id.clone());
+    }
+    let (host, ids) = by_host
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > ORIGIN_TAB_THRESHOLD)
+        .max_by_key(|(_, ids)| ids.len())?;
+    Some(json!({
+        "host": host,
+        "tabs": ids.len(),
+        "page_ids": ids,
+        "hint": "同站点页签堆积:多为重复打开同一路由或点击派生未收口;请及时 close(page_id) 逐个收口,确定只留一个页时可用 close(page_id=\"others\", keep=\"保留的page_id\") 一次清掉其余",
+    }))
+}
+
+/// `close(page_id="others", keep="<page_id>")`:关闭除 `keep` 外全部存活页。
+///
+/// 与 `close(background)` 互补:后者只关后台页且需至少一个前台页;`others` 是
+/// 「收口时留一个工作页」的精确表达。`keep` 必须是存活 page_id(否则 1001 由
+/// 调用方产出);逐页走 `close_page` 公共 API —— 最后一页关闭自动回收浏览器
+/// 的语义不变,`keep` 存活保证不会触底。
+pub(super) async fn close_pages_except(keep: &str) -> std::result::Result<Vec<String>, String> {
+    let mgr = crate::agent::browser::BrowserManager::global();
+    let entries = mgr.list_pages().await;
+    if entries.iter().all(|(id, _, _, _)| id != keep) {
+        return Err(format!(
+            "keep=\"{keep}\" 不是存活 page_id(close(others) 必须显式保留一个页面,防止一锅端)"
+        ));
+    }
+    let mut closed = Vec::new();
+    for (id, _, _, _) in entries {
+        if id == keep {
+            continue;
+        }
+        if mgr.close_page(&id).await {
+            closed.push(id);
+        }
+    }
+    if !closed.is_empty() {
+        tracing::info!(keep, count = closed.len(), "MCP_Web_Use 关闭除保留页外全部标签页");
+    }
+    Ok(closed)
+}
+
+/// 任务收口自动清理(`MultiAgentOrchestrator` 任务边界调用):
+///
+/// - 输入 = `tab_ledger` 基线 diff 出的**本任务新开的页**(任务开始时已有的页
+///   一字不碰 —— 可能含用户/前序任务保留的对话型页面);
+/// - 处置:逐页探测前后台,**确认后台 → close**;前台/探测失败 → 保留
+///   (前台页人工可能正在看;探测失败 fail-safe 不杀);
+/// - 全程 fail-open:浏览器未启动/注册表锁异常返回 `enabled:false`,绝不阻断
+///   任务收口主流程;`LAEW_WEB_TAB_AUTOCLOSE=off` 关闭。
+///
+/// connect 模式(接管用户浏览器)同样生效 —— diff 只含本任务新开的 Tab,
+/// 用户原有页签在基线内,天然不被波及。
+pub(super) async fn finalize_task_tabs() -> Value {
+    if !crate::agent::tab_ledger::autoclose_enabled() {
+        return json!({"enabled": false, "reason": "LAEW_WEB_TAB_AUTOCLOSE=off"});
+    }
+    let ledger = crate::agent::tab_ledger::baseline_snapshot();
+    let mgr = crate::agent::browser::BrowserManager::global();
+    let alive = mgr.list_pages().await;
+    let candidates = crate::agent::tab_ledger::newly_opened(
+        &alive.iter().map(|(id, _, _, _)| id.clone()).collect::<Vec<_>>(),
+        &ledger,
+    );
+    if candidates.is_empty() {
+        crate::agent::tab_ledger::end_task();
+        return json!({"enabled": true, "opened": 0, "closed": [], "kept": [], "skipped": []});
+    }
+    let mut closed = Vec::new();
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for id in &candidates {
+        match mgr.page(id).await {
+            Some(page) => match probe_foreground(&page).await {
+                Some(act) if act.foreground() => kept.push(id.clone()),
+                // 确认后台或探测结果无 visibility:新开页无人在看,关掉
+                // (探测到页面但 visibility 缺失 ≠ 前台,按后台处置)。
+                _ => {
+                    if mgr.close_page(id).await {
+                        closed.push(id.clone());
+                    } else {
+                        skipped.push(id.clone());
+                    }
+                }
+            },
+            None => skipped.push(id.clone()),
+        }
+    }
+    crate::agent::tab_ledger::end_task();
+    if !closed.is_empty() {
+        tracing::info!(
+            opened = candidates.len(),
+            closed = closed.len(),
+            kept = kept.len(),
+            "任务收口自动清理本任务新开的后台标签页"
+        );
+    }
+    json!({
+        "enabled": true,
+        "opened": candidates.len(),
+        "closed": closed,
+        "kept": kept,
+        "skipped": skipped,
+    })
+}
+
 /// `close(background)` 安全阀(纯函数):一个前台页都没探测到(窗口全最小化/
 /// 探测全失败)时拒绝批量关闭,防止一锅端误杀全部页面。
 fn should_refuse_bulk_close(foreground_seen: usize) -> bool {
@@ -386,6 +512,51 @@ mod tests {
         }
         assert!(!action_bypasses_gate("screenshot"));
         assert!(!action_bypasses_gate("click"));
+    }
+
+    // ===================== 标签页生命周期治理(docs/MCP_Web_Use/25) =====================
+
+    fn host_entries(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(id, h)| (id.to_string(), h.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn 同站点堆积告警_超过3个才报且取堆积最多站() {
+        // 3 个不报(阈值是「大于 3」)
+        let e = host_entries(&[
+            ("p1", "detail.tmall.com"), ("p2", "detail.tmall.com"), ("p3", "detail.tmall.com"),
+        ]);
+        assert!(origin_tabs_alert(&e).is_none(), "恰 3 个不应告警");
+        // 4 个报,且多站堆积时取最多者
+        let e = host_entries(&[
+            ("p1", "detail.tmall.com"), ("p2", "detail.tmall.com"),
+            ("p3", "detail.tmall.com"), ("p4", "detail.tmall.com"),
+            ("p5", "list.jd.com"), ("p6", "list.jd.com"), ("p7", "list.jd.com"),
+            ("p8", "chat.baidu.com"),
+        ]);
+        let alert = origin_tabs_alert(&e).expect("同站 4 个应告警");
+        assert_eq!(alert["host"], json!("detail.tmall.com"));
+        assert_eq!(alert["tabs"], json!(4));
+        assert_eq!(alert["page_ids"].as_array().unwrap().len(), 4);
+        // 阈值边界:jd 恰 3 个不独立触发
+        let e = host_entries(&[
+            ("p1", "list.jd.com"), ("p2", "list.jd.com"), ("p3", "list.jd.com"),
+        ]);
+        assert!(origin_tabs_alert(&e).is_none());
+    }
+
+    #[test]
+    fn 同站点堆积告警_无host页面不参与统计() {
+        let e = host_entries(&[
+            ("p1", ""), ("p2", ""), ("p3", ""), ("p4", ""),
+        ]);
+        assert!(
+            origin_tabs_alert(&e).is_none(),
+            "about:blank 等无 host 页面不该触发同站判定"
+        );
     }
 
     #[test]

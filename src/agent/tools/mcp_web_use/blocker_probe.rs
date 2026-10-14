@@ -623,7 +623,42 @@ pub(super) const HITL_CHALLENGE_OPTIONS: [&str; 2] = ["我已完成人工操作,
 
 /// 探测并生成告警载荷(命中才 Some):`{blocker_alert, next_action, human_assist}` 三键,
 /// 供调用方并入响应 data(Ok 路走 [`attach_if_blocked`],wait 超时 Err 路由调用方手插)。
+///
+/// 包壳(docs/MCP_Web_Use/25):探测结果直接触发**状态栏挑战避让** —— 命中即挂起
+/// 两条栏(挑战弹窗常是顶层 frame 模态,REV 2 的 iframe 顶层门罩不到,不透明
+/// 状态栏会叠在挑战层上把弹窗控件/提示罩死),转干净自愈复显。原探测逻辑在
+/// [`probe_alert_impl`] 零改动。
 pub(super) async fn probe_alert(page_id: &str) -> Option<Value> {
+    let alert = probe_alert_impl(page_id).await;
+    sync_challenge_suspend(page_id, alert.is_some()).await;
+    alert
+}
+
+/// 挑战避让对账:命中挂起 / 干净复显(仅复显本机制自己挂起的页)。
+///
+/// 复显前置检查 `HumanAssistHub::is_pending()` —— 人工正在 HITL 弹窗里处理
+/// 挑战时不提前复显(复显权让位给 HITL 通道,收口时统一恢复)。fail-open:
+/// 页面丢失/探测失败只跳过本次对账,不影响告警本体。
+async fn sync_challenge_suspend(page_id: &str, blocked: bool) {
+    use crate::agent::browser_status as status;
+    if blocked {
+        if let Some(page) = BrowserManager::global().page(page_id).await {
+            status::challenge_suspend(&page, page_id, true).await;
+        }
+        return;
+    }
+    if !status::challenge_suspended(page_id) {
+        return;
+    }
+    if crate::agent::human_assist::HumanAssistHub::global().is_pending() {
+        return;
+    }
+    if let Some(page) = BrowserManager::global().page(page_id).await {
+        status::challenge_suspend(&page, page_id, false).await;
+    }
+}
+
+async fn probe_alert_impl(page_id: &str) -> Option<Value> {
     if !enabled() {
         return None;
     }

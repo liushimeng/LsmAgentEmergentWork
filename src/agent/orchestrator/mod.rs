@@ -292,7 +292,20 @@ impl MultiAgentOrchestrator {
         progress: Option<ProgressTx>,
     ) -> Result<OrchestrationOutcome> {
         let _gate_guard = self.cancel_gate.guard(cancel.clone());
+        // docs/MCP_Web_Use/25:标签页生命周期治理 —— 任务开始时快照基线,收口时
+        // 关闭本任务新开的后台标签页(前台页保留;fail-open,见 page_activity)。
+        crate::agent::tools::mcp_web_use::begin_task_tab_ledger().await;
         let outcome = self.handle_inner(session, cancel, &progress).await;
+        let tab_report = crate::agent::tools::mcp_web_use::finalize_task_tabs().await;
+        if tab_report.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            && tab_report.get("closed").and_then(serde_json::Value::as_array).map(|a| !a.is_empty()).unwrap_or(false)
+        {
+            tracing::info!(
+                opened = tab_report.get("opened").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                kept = tab_report.get("kept").and_then(serde_json::Value::as_array).map(|a| a.len()).unwrap_or(0),
+                "任务收口自动清理本任务新开的后台标签页(前台页保留)"
+            );
+        }
         // 动态子 Agent 用量回收(2026-09-22 第 114 轮):任务边界把会话级台账
         // 排空并计入本任务用量,保证 Yolo / Plan / Main-Work 等**非 SubAgent 角色**
         // 发起的子 Agent 消耗同样进入 `/cost` 与 Debug 统计(SubAgent 单元内的

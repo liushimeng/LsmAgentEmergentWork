@@ -500,6 +500,56 @@ pub async fn set_suspended(page: &Page, suspend: bool) {
     let _ = page.evaluate(js.as_str()).await;
 }
 
+// ===================== 挑战层驱动避让（docs/MCP_Web_Use/25） =====================
+
+/// 本机制挂起记账：`page_id → 由 blocker_probe 探测驱动挂起中`。
+///
+/// 为什么单独记账：挂起/复显的触发源有多个（HITL 解锁、截图取证、
+/// `set_highlight(false)`、挑战探测），互不隶属。探测驱动这条通道必须只恢复
+/// **自己挂起**的页 —— 否则挑战转干净时的复显会把 HITL 提问期间人工正在看的
+/// 页面栏提前唤回（或反过来）。幂等：重复挂起/重复清除均无副作用。
+static CHALLENGE_SUSPENDED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// 该页当前是否由挑战探测机制挂起中。
+pub fn challenge_suspended(page_id: &str) -> bool {
+    match CHALLENGE_SUSPENDED.lock() {
+        Ok(mut g) => {
+            let set = g.get_or_insert_with(std::collections::HashSet::new);
+            set.contains(page_id)
+        }
+        Err(_) => false,
+    }
+}
+
+/// 挑战探测驱动的挂起/复显（`blocker_probe::sync_challenge_suspend` 调用）：
+/// - `suspend=true`：记账并挂起两条栏（挑战弹窗在场，任何触发源都不该把
+///   Agent 视觉元素叠在挑战层上）。
+/// - `suspend=false`：仅当本机制挂起中才复显并销账；不是本机制挂起的页
+///   （如 HITL 挂起）零动作，不抢其它通道的主导权。
+pub async fn challenge_suspend(page: &Page, page_id: &str, suspend: bool) {
+    {
+        let Ok(mut g) = CHALLENGE_SUSPENDED.lock() else {
+            return;
+        };
+        let set = g.get_or_insert_with(std::collections::HashSet::new);
+        if suspend {
+            set.insert(page_id.to_string());
+        } else if !set.remove(page_id) {
+            return; // 非本机制挂起：不复显
+        }
+    }
+    set_suspended(page, suspend).await;
+}
+
+/// 测试辅助：清空记账（进程内单测互斥）。
+#[cfg(test)]
+pub(crate) fn reset_challenge_suspended_for_test() {
+    if let Ok(mut g) = CHALLENGE_SUSPENDED.lock() {
+        *g = None;
+    }
+}
+
 /// 向全部存活页面广播「动作开始」（无浏览器实例时零开销返回）。
 pub async fn broadcast_start(action: &str) {
     broadcast(action, None).await;
