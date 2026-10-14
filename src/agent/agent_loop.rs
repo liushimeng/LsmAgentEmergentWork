@@ -59,7 +59,30 @@ impl Agent {
     /// 不参与的角色(或 `LAEW_SELF_SPAWN=off`)返回 `None` → 原样直通,**零开销**。
     ///
     /// 注:原循环体一字未改,只是改名为 [`Self::run_session_body`] 并被本函数包裹。
+    ///
+    /// 第 171 轮:额外建立**活动台账作用域**(`web_activity`),把「本 Agent 是谁 /
+    /// 第几轮 / 当前在调什么工具」暴露给注入 UI 层(屏蔽页面状态栏与进度栏)。
+    /// 用 task_local 而非全局量:并行 SubAgent 各自读到自己的快照,不会互相覆盖。
     async fn run_session_inner(
+        &self,
+        session: &mut Session,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(String, Usage, ExecutionTrace)> {
+        let activity = crate::agent::web_activity::begin(
+            &self.profile.name,
+            session.id(),
+            &crate::agent::web_activity::task_summary_from_context(session.context()),
+            self.max_iterations,
+        );
+        crate::agent::web_activity::scope(
+            activity,
+            self.run_session_scoped(session, cancel),
+        )
+        .await
+    }
+
+    /// 活动台账作用域内的实际执行体(动态子 Agent 作用域 + 循环主体)。
+    async fn run_session_scoped(
         &self,
         session: &mut Session,
         cancel: Option<&CancelToken>,
@@ -196,6 +219,10 @@ impl Agent {
 
         for iter in 0..self.max_iterations {
             trace.iterations = iter + 1;
+            // 第 171 轮:活动台账逐轮推进(屏蔽页面进度栏展示「迭代 N/M · 模型思考」)。
+            if let Some(act) = crate::agent::web_activity::current() {
+                act.set_iter(iter + 1, &format!("第 {}/{} 轮 · 模型思考", iter + 1, self.max_iterations));
+            }
             // 第 118 轮:探索预算耗尽时在 trace 上打标,build_runtime_hints 会在
             // 后续 system 拼接时追加「进入执行期」提示到 LLM 上下文,引导 LLM 收敛
             // 到 input_text/click/wait 等写操作,减少 inspect/screenshot/eval_js 重复探查。

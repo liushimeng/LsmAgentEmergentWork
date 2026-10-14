@@ -109,6 +109,16 @@ impl Agent {
         }
         let executed = match self.profile.tools.get(name) {
             Ok(tool) => {
+                // 第 171 轮:活动台账埋点 —— 屏蔽页面进度栏第一行展示「当前动作」。
+                // 所有角色所有工具统一经此,浏览器相关动作由 `browser_status` 推页面。
+                if let Some(act) = crate::agent::web_activity::current() {
+                    act.set_tool(&format!(
+                        "{name} {}",
+                        crate::logging::clip(&crate::agent::runtime_hints::stable_json_string(
+                            &args
+                        ))
+                    ));
+                }
                 // Schema 预校验(校验失败 → 返回错误,不执行工具)
                 if let Err(e) = crate::agent::tool_schema_validator::validate_tool_args(
                     name,

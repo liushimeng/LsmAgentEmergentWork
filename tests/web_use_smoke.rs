@@ -786,7 +786,26 @@ async fn stealth_selfcheck_smoke() {
     .await;
     let p: Value = serde_json::from_str(&probe).unwrap_or(Value::Null);
     assert_eq!(p["mask"], json!(true), "蒙层应在场:{probe}");
-    assert_eq!(p["hint"], json!(true), "状态条应在场:{probe}");
+    assert_eq!(p["shields"], json!(true), "盾区容器应在场:{probe}");
+
+    // ⑤ 第 171 轮:屏蔽页面状态栏(右上角)+ 屏蔽页面进度栏(左下角)在影子树里在场。
+    //    左下角静态状态条已迁入状态栏,guard 探针不再有 `hint` 字段。
+    assert!(p.get("hint").is_none(), "静态状态条已迁至状态栏(第 171 轮):{probe}");
+    let sprobe = eval(
+        "JSON.stringify((window.%NS%StatusProbe && window.%NS%StatusProbe()) || null)"
+            .replace("%NS%", lsm_agent::agent::browser_ns::inject_ns()),
+    )
+    .await;
+    let sp: Value = serde_json::from_str(&sprobe).unwrap_or(Value::Null);
+    assert_eq!(sp["status"], json!(true), "屏蔽页面状态栏应在场:{sprobe}");
+    assert_eq!(sp["progress"], json!(true), "屏蔽页面进度栏应在场:{sprobe}");
+    assert_eq!(sp["status_display"], json!(""), "状态栏应可见:{sprobe}");
+    assert_eq!(sp["progress_display"], json!(""), "进度栏应可见:{sprobe}");
+    // 动作标签已推到进度栏(本用例刚跑完 open → control eval_js 两次动作)
+    assert!(
+        sp["action"].as_str().unwrap_or("").contains("eval_js"),
+        "进度栏应显示当前动作:{sprobe}"
+    );
 
     let _ = McpWebUseTool
         .execute(json!({"action": "close", "page_id": page_id}))

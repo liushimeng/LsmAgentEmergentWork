@@ -1520,7 +1520,7 @@ async fn real_browser_tool_overlay_end_to_end() {
 async fn real_browser_tool_guard_modes_end_to_end() {
     let url = "data:text/html,<button id='b' onclick='this.dataset.c=(+this.dataset.c||0)+1' \
                style='position:fixed;left:0;top:0;width:200px;height:100px'>x</button>";
-    // ① open(guard=open):响应应回报 guard.mode=open(状态条「页面开放」在页面上)
+    // ① open(guard=open):响应应回报 guard.mode=open(屏蔽页面状态栏显示「页面开放」)
     let out = McpWebUseTool
         .execute(json!({"action": "open", "url": url, "guard": "open",
                         "guard_note": "请登录后应答弹窗", "window_width": 800, "window_height": 600}))
@@ -1542,7 +1542,7 @@ async fn real_browser_tool_guard_modes_end_to_end() {
     assert_eq!(c["code"], 0, "open 档 click 应生效:{click}");
 
     // ③ set_guard 切 partial(黑名单罩住按钮):click 经「先隐盾后复盾」照常生效,
-    //    盾区容器内应有盾罩,状态条文案切换为「部分锁定」。
+    //    盾区容器内应有盾罩(档位文案已迁至屏蔽页面状态栏,第 171 轮)。
     let sg = McpWebUseTool
         .execute(json!({"action": "control", "page_id": pid, "control_action": "set_guard",
                         "params": {"mode": "partial", "block_selectors": ["#b"], "note": "支付区已锁定"}}))
@@ -1562,8 +1562,7 @@ async fn real_browser_tool_guard_modes_end_to_end() {
         .execute(json!({"action": "control", "page_id": pid, "control_action": "eval_js",
                         "params": {"expression":
                             "JSON.stringify({c:+document.getElementById('b').dataset.c||0, \
-                             sc:document.getElementById('__laew_guard_shields__').childElementCount, \
-                             chip:(document.querySelector('.__laew_guard_hint_title__')||{}).textContent||''})"}}))
+                             sc:document.getElementById('__laew_guard_shields__').childElementCount})"}}))
         .await
         .unwrap();
     let e: Value = serde_json::from_str(&check).unwrap();
@@ -1571,7 +1570,6 @@ async fn real_browser_tool_guard_modes_end_to_end() {
         serde_json::from_str(e["data"]["result"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
     assert_eq!(payload["c"], 2, "两次 click 都应真实生效:{check}");
     assert_eq!(payload["sc"], 1, "黑名单应生成 1 个盾罩:{check}");
-    assert!(payload["chip"].as_str().unwrap_or("").contains("部分锁定"), "状态条应切换文案:{check}");
 
     // ④ set_guard 切回 locked:输入锁恢复 + 蒙层回归。
     let sg2 = McpWebUseTool

@@ -5,7 +5,7 @@
 //!
 //! - **locked 屏蔽模式(缺省,第 141 轮)**:人工不可点击/操作(防交叉操作),
 //!   人工与页面的交互一律走「人工介入」弹窗(`request_human`,提问期间默认临时解锁);
-//! - **open 非屏蔽模式(第 143 轮)**:人工可直接操作页面(状态条明示「页面开放」),
+//! - **open 非屏蔽模式(第 143 轮)**:人工可直接操作页面(屏蔽页面状态栏明示「页面开放」),
 //!   用于人工亲自操作 / 人工登录先行流;
 //! - **partial 部分屏蔽模式(第 143 轮)**:盾区内人工不可操作、盾区外放行
 //!   (`allow_selectors` 白名单挖洞 / `block_selectors` 黑名单罩元素)。
@@ -28,6 +28,13 @@
 //!   挖好的洞从内部锁死;洞外区域由主文档条带盾照拦,安全性不降。
 //!   盾罩同样会吞 Agent 的 CDP 点击(hit-test 层不可区分),partial 下 Agent 输入
 //!   动作「先隐盾后复盾」(`%NS%GuardSuspend`,见 `control::guard_lift_for_input`)。
+//!
+//! **第 171 轮:告知性 UI 外迁**。原左下角静态状态条(档位文案 + 注意事项 +
+//! `guard_note`)与右上角「LAEW Agent 控制中」徽标已合并为两条语义清晰的栏,放在
+//! `browser_status.rs`:**屏蔽页面状态栏**(右上角,含具体 Agent 名)与
+//! **屏蔽页面进度栏**(左下角,动态进度)。本模块自此**不再持有任何文字元素**,
+//! 只保留「蒙层 + 盾区 + 输入闸 + 锁定 CSS」;档位切换经 [`apply_page_guard`]
+//! 收口时顺带把状态推给两条栏。详见 `docs/MCP_Web_Use/24-屏蔽页面状态栏与进度栏.md`。
 //!
 //! 为什么不用 DOM 蒙层(`pointer-events:auto`)拦**整页**输入:CDP 合成输入与真实
 //! 输入在 hit-test 层不可区分(`isTrusted` 均为 true),会把 Agent 自己的点击一并
@@ -57,18 +64,12 @@ pub fn overlay_element_id() -> String {
     format!("{}overlay__", crate::agent::browser_ns::inject_ns())
 }
 
-/// 状态条 id(三档共用,仅主文档注入,第 143 轮从蒙层子元素改为独立元素:
-/// 蒙层只在 locked 显示,而「人工可操作」的提示在 open/partial 也要在)。
-pub fn overlay_hint_id() -> String {
-    format!("{}overlay_hint__", crate::agent::browser_ns::inject_ns())
-}
-
 /// 盾区容器 id(partial 档,黑名单盾罩/白名单整屏挖洞盾的父节点)。
 pub fn shields_element_id() -> String {
     format!("{}guard_shields__", crate::agent::browser_ns::inject_ns())
 }
 
-/// 注入 UI 的 closed Shadow DOM host id(第 169 轮)。蒙层/状态条/盾区整体住在
+/// 注入 UI 的 closed Shadow DOM host id(第 169 轮)。蒙层/盾区整体住在
 /// 该 host 的影子树里(页面 JS 不可读,防风控采 innerText 拿到品牌签名),
 /// light DOM 只留这个无文本 host —— 故「视觉元素是否在场」的主文档探针查它。
 pub fn guard_ui_host_id() -> String {
@@ -81,7 +82,7 @@ pub const MAX_GUARD_SELECTORS: usize = 8;
 /// 单条选择器字符上限。
 pub const MAX_GUARD_SELECTOR_LEN: usize = 160;
 
-/// `guard_note` / `note` 字符上限(状态条第三行,超长静默截断)。
+/// `guard_note` / `note` 字符上限(屏蔽页面状态栏第四行,超长静默截断)。
 pub const MAX_GUARD_NOTE_LEN: usize = 60;
 
 // ===================== 第 143 轮:页面管控三档模型 =====================
@@ -91,7 +92,7 @@ pub const MAX_GUARD_NOTE_LEN: usize = 60;
 pub enum PageGuardMode {
     /// 屏蔽模式(缺省,= 第 141 轮蒙层):CDP 输入拦截 + 半透明蒙层,人工可看不可点。
     Locked,
-    /// 非屏蔽模式:无拦截无蒙层,状态条明示「页面开放·人工可直接操作」。
+    /// 非屏蔽模式:无拦截无蒙层,屏蔽页面状态栏明示「页面开放·人工可直接操作」。
     Open,
     /// 部分屏蔽模式:盾区内拦截(CDOM 盾罩),盾区外人工可操作。
     Partial,
@@ -137,7 +138,7 @@ pub struct PageGuardConfig {
     pub allow_selectors: Vec<String>,
     /// 黑名单(仅 partial):命中区域人工**不可**操作,其余放行(元素盾罩)。
     pub block_selectors: Vec<String>,
-    /// 状态条第三行自定义提示(三档通用,≤60 字符;人工登录先行流的 UI 载体)。
+    /// 屏蔽页面状态栏第四行自定义提示(三档通用,≤60 字符;人工登录先行流的 UI 载体)。
     pub note: Option<String>,
 }
 
@@ -253,17 +254,19 @@ impl PageGuardConfig {
     }
 }
 
-// ===================== 管控 JS(蒙层 + 状态条 + 盾区三件套) =====================
+// ===================== 管控 JS(蒙层 + 盾区两件套) =====================
+// 第 171 轮:第三件「左下角静态状态条」已迁 `browser_status.rs`(屏蔽页面状态栏 +
+// 屏蔽页面进度栏)。
 
 /// 管控 JS 模板:`{MODE}`/`{ALLOW}`/`{BLOCK}`/`{NOTE}`/`{SCROLLWATCH}` 占位符由
 /// [`guard_script`] 烘焙为初始配置,使运行期 `set_guard` 后发生的导航按「期望态」
 /// 重建(配合导航类动作收尾的 re-assert,与第 141 轮同构)。
 ///
 /// 设计要点:
-/// - 蒙层 `pointer-events:none`(纯视觉,零 hit-test 参与)与状态条
-///   `pointer-events:none`(三档都只是「告知」,不挡点击);
+/// - 蒙层 `pointer-events:none`(纯视觉,零 hit-test 参与,不挡点击);
 /// - 盾罩 `pointer-events:auto`(真拦截,只出现在 partial);
-/// - z-index 序:高亮蓝框 2147483647 > 蒙层/状态条 2147483646 > 盾区 2147483645;
+/// - z-index 序:高亮蓝框 2147483647 > 蒙层 2147483646 > 盾区 2147483645
+///   (第 171 轮:两条告知栏 z-index 2147483646 / host 2147483644,与蒙层同档不遮页面);
 /// - `data-%NS%agent="1"`:与高亮蓝框同款标记,`blockers` 正文扫描
 ///   (克隆 body 后剥 `[data-%NS%agent]`)与 elements/dom 提取天然排除;
 /// - 白名单 = 允许区并集的「垂直条带分解」补集矩形盾(x 去重分条带 → 条带内
@@ -315,22 +318,13 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         window.%NS%GuardGateReady = true;
     }
     const MASK_ID = '%NS%overlay__';
-    const HINT_ID = '%NS%overlay_hint__';
     const SHIELDS_ID = '%NS%guard_shields__';
     const STYLE_ID = '%NS%guard_style__';
     const HOST_ID = '%NS%guard_ui__';
-    const CHIP_TEXT = {
-        locked: window.%NS%GuardScrollWatch
-            ? ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看·可滚动)',
-               '人工可滚动浏览;点击/键盘/选中已拦截,如需操作请应答「人工介入」弹窗']
-            : ['🔒 LAEW Agent 控制中 · 页面已锁定(仅观看)',
-               '人工点击/键盘/选中已拦截;如需介入请应答「人工介入」弹窗'],
-        open:   ['🔓 页面开放 · 人工可直接操作',
-                 'Agent 协同中;人工完成操作后应答「人工介入」弹窗告知'],
-        partial:['🛡 部分锁定 · 盾区不可操作',
-                 '其余区域人工可直接操作;需要调整范围请告知 Agent'],
-    };
-    // 第 169 轮:注入 UI 挂 closed Shadow DOM —— 状态条(「LAEW Agent 控制中」)/
+    // 第 171 轮:左下角静态状态条(档位文案 + 注意事项 + guard_note)已整体迁到
+    // `browser_status.rs` 的**屏蔽页面状态栏(右上角)**;本脚本不再自建任何文字
+    // 元素 —— 告知性 UI 单一真源,避免同屏两处重复声明与两套 shadow host。
+    // 第 169 轮:注入 UI 挂 closed Shadow DOM —— 盾区标签(「🔒 已锁定(仅 Agent)」)
     // 盾区标签(「🔒 已锁定(仅 Agent)」)等文本若留在 light DOM,页面 JS 一行
     // `document.body.innerText` 即可枚举到自动化框架品牌签名(实测京东风控 JS
     // 采集该文本把设备判为自动化,`.jd-main-risk-fallback`「当前页面异常」)。
@@ -344,8 +338,8 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // 第 163 轮:document-start 时 `document.documentElement` 与 `document.body`
     // **都可能是 null**(`readyState === 'loading'`)。旧写法 `document.body ||
     // document.documentElement` 在此二者皆 null → `root().appendChild()` 抛
-    // TypeError,视觉层(蒙层/状态条/盾区)一个都没建。实测后果:此后任何一次
-    // navigate / 复用 open 的 goto 都继承空 DOM,蒙层与徽标**永久消失**,
+    // TypeError,视觉层(蒙层/盾区)一个都没建。实测后果:此后任何一次
+    // navigate / 复用 open 的 goto 都继承空 DOM,蒙层**永久消失**,
     // 而 `%NS%GuardSet` 已定义且返回非 null,`apply_page_guard` 照样回报
     // `visual_mask: true` —— 输入锁真锁了,屏幕上一丝视觉都没有,且系统自称成功。
     // `documentElement` 在 document-start 即存在,放前面即可。
@@ -374,29 +368,6 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
             m.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483646;'
                 + 'background:rgba(15,23,42,0.22);';
             mount(m);
-        }
-        if (window.top === window && !el(HINT_ID)) {
-            const c = document.createElement('div');
-            c.id = HINT_ID;
-            c.setAttribute('data-%NS%agent', '1');
-            c.style.cssText = 'position:fixed;left:18px;bottom:18px;margin:0;padding:8px 14px;'
-                + 'background:rgba(15,23,42,0.85);color:#e2e8f0;'
-                + 'font:600 13px/1.7 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;'
-                + 'border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.35);max-width:72%;'
-                + 'pointer-events:none;z-index:2147483646;';
-            const t = document.createElement('div');
-            t.setAttribute('data-%NS%agent', '1');
-            t.className = '%NS%guard_hint_title__';
-            const s = document.createElement('div');
-            s.setAttribute('data-%NS%agent', '1');
-            s.className = '%NS%guard_hint_sub__';
-            s.style.cssText = 'font-weight:400;color:#94a3b8;font-size:12px;';
-            const n = document.createElement('div');
-            n.setAttribute('data-%NS%agent', '1');
-            n.className = '%NS%guard_hint_note__';
-            n.style.cssText = 'font-weight:400;color:#cbd5e1;font-size:12px;margin-top:2px;';
-            c.appendChild(t); c.appendChild(s); c.appendChild(n);
-            mount(c);
         }
         if (!el(SHIELDS_ID)) {
             const sc = document.createElement('div');
@@ -433,17 +404,8 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
             st.remove();
         }
     };
-    const setChip = (mode, note) => {
-        const c = el(HINT_ID);
-        if (!c) return;
-        const pair = CHIP_TEXT[mode] || CHIP_TEXT.locked;
-        const t = c.querySelector('.%NS%guard_hint_title__');
-        const s = c.querySelector('.%NS%guard_hint_sub__');
-        const n = c.querySelector('.%NS%guard_hint_note__');
-        if (t) t.textContent = pair[0];
-        if (s) s.textContent = pair[1];
-        if (n) { n.textContent = note || ''; n.style.display = note ? '' : 'none'; }
-    };
+    // 第 171 轮:原 `setChip`(左下角静态状态条刷新)已随状态条整体迁到
+    // `browser_status.rs`;档位/注意事项/guard_note 由 Rust 侧 `sync` 推给状态栏。
     const rebuildShields = () => {
         const sc = el(SHIELDS_ID);
         if (!sc) return;
@@ -554,11 +516,6 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         applyLockCss();
         const m = el(MASK_ID);
         if (m) m.style.display = (mode === 'locked' && !susp) ? '' : 'none';
-        const c = el(HINT_ID);
-        if (c) {
-            c.style.display = susp ? 'none' : '';
-            if (!susp) setChip(mode, window.%NS%GuardNote);
-        }
         const sc = el(SHIELDS_ID);
         if (sc) {
             const want = (mode === 'partial' && !susp);
@@ -593,7 +550,6 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
         host: !!document.getElementById(HOST_ID),
         mask: !!el(MASK_ID),
         mask_display: el(MASK_ID) ? (el(MASK_ID).style.display || '') : 'missing',
-        hint: !!el(HINT_ID),
         shields: !!el(SHIELDS_ID),
         shields_count: el(SHIELDS_ID) ? el(SHIELDS_ID).childElementCount : -1,
         shields_display: el(SHIELDS_ID) ? (el(SHIELDS_ID).style.display || '') : 'missing',
@@ -641,7 +597,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // 旧顺序是 `refresh(); if (loading) addEventListener(DOMContentLoaded, refresh)`;
     // 但 document-start 时 refresh() 会因 root() 为 null 抛 TypeError,
     // 异常直接吞掉后面整段 —— DOMContentLoaded 补挂**永远不会被注册**,
-    // 视觉层就此永久缺失(实测:首开正常,首次 navigate 后蒙层与徽标全部消失)。
+    // 视觉层就此永久缺失(实测:首开正常,首次 navigate 后蒙层全部消失)。
     // `%NS%GuardOff` 同样定义在 refresh() 之后,抛异常后未定义,
     // 第 157 轮版本化重装一并哑火。
     const bootRetry = () => { try { armObserver(); refresh(); } catch (e) {} };
@@ -653,7 +609,7 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     armObserver();
     refresh();
     // 第 157 轮:卸载钩子 —— 高版本重装前移除旧实例的输入闸监听器、调度监听、
-    // 观察器与蒙层/状态条/盾区视觉元素,防监听器与视觉泄漏。
+    // 观察器与蒙层/盾区视觉元素,防监听器与视觉泄漏。
     window.%NS%GuardOff = () => {
         try { for (const t of GATE_EVTS) window.removeEventListener(t, gate, true); } catch (e) {}
         try { window.removeEventListener('scroll', schedule, true); } catch (e) {}
@@ -743,7 +699,9 @@ pub fn overlay_default_from_env() -> bool {
 ///
 /// 与 `browser.rs::inject_agent_highlight` 同款通道;参数为实例期望态,
 /// 导航后新文档按它重建,配合导航类动作收尾的 re-assert 使各层收敛。
-/// 第 143 轮起 headed(非 connect)全档注入(open 档也有状态条告知人工可操作)。
+/// 第 143 轮起 headed(非 connect)全档注入(open 档也有屏蔽页面状态栏告知人工可操作)。
+/// 第 171 轮:同步注入屏蔽页面状态栏/进度栏(告知性 UI 独立生命周期,不随 guard
+/// 版本化重装被拆掉)。
 pub async fn inject_agent_guard(page: &Page, cfg: &PageGuardConfig) {
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
     let _ = page
@@ -754,6 +712,7 @@ pub async fn inject_agent_guard(page: &Page, cfg: &PageGuardConfig) {
             run_immediately: Some(true),
         })
         .await;
+    crate::agent::browser_status::ensure(page).await;
 }
 
 /// 应用页面管控三档(L1 输入拦截按档 + JS 全量设置)。
@@ -763,8 +722,8 @@ pub async fn inject_agent_guard(page: &Page, cfg: &PageGuardConfig) {
 ///   清残留),人工滚轮可滚、点击/键盘被闸拦;
 /// - locked(闸不在场:`LAEW_WEB_LOCKED_SCROLL=off` / hidden / 注入失败):
 ///   fail-closed 回退第 141 轮 CDP 全量拦截 `setIgnoreInputEvents(true)`;
-/// - open:`setIgnoreInputEvents(false)` + `%NS%GuardSet('open',…)`(放行+开放状态条);
-/// - partial:`setIgnoreInputEvents(false)` + `%NS%GuardSet('partial',…)`(盾区+状态条)。
+/// - open:`setIgnoreInputEvents(false)` + `%NS%GuardSet('open',…)`(放行 + 状态栏显「页面开放」);
+/// - partial:`setIgnoreInputEvents(false)` + `%NS%GuardSet('partial',…)`(盾区 + 状态栏显「部分锁定」)。
 ///
 /// 返回应用结果(fail-open:单层失败不阻断另一层,如实回报);
 /// 未注入脚本的页面(hidden/connect/注入失败)JS 侧返回 null → applied=false。
@@ -791,7 +750,8 @@ pub async fn apply_page_guard(
     // 于是「函数可用」与「屏幕上看得见」被混为一谈,`visual_mask` 恒真。
     // 这里独立校验视觉元素是否真实存在于 DOM,让回报字段不再「嘴上说成功」。
     // 第 169 轮:视觉元素住进 closed Shadow DOM,主文档只剩无文本 host,
-    // 探针改为「host 在场(影子树同建)或 fallback light DOM 三件套任一在场」。
+    // 探针改为「host 在场(影子树同建)或 fallback light DOM 元素任一在场」。
+    // 第 171 轮:两条栏(屏蔽页面状态栏/进度栏)有独立 host,一并计入在场性。
     let visual_present = page
         .evaluate(format!(
             "!!(document.getElementById('{}') \
@@ -800,8 +760,8 @@ pub async fn apply_page_guard(
              || document.getElementById('{}'))",
             guard_ui_host_id(),
             overlay_element_id(),
-            overlay_hint_id(),
-            shields_element_id()
+            shields_element_id(),
+            crate::agent::browser_status::status_host_id()
         ))
         .await
         .ok()
@@ -809,10 +769,15 @@ pub async fn apply_page_guard(
         .unwrap_or(false);
     if locked && js_applied && !visual_present {
         tracing::warn!(
-            "页面管控脚本已注入但视觉元素缺失(输入闸可能已生效而蒙层/徽标未渲染);\
+            "页面管控脚本已注入但视觉元素缺失(输入闸可能已生效而蒙层未渲染);\
              多为 document-start 就绪时序问题,应重跑本轮根元素门与 DOMContentLoaded 补挂"
         );
     }
+    // 第 171 轮:屏蔽页面状态栏/进度栏全量刷新 —— 本函数是管控期望态的**唯一收口**
+    // (open 首航 / set_guard / HITL 解锁与恢复 / 导航后 re-assert 四条路径都经此),
+    // 顺带把「谁在控制 + 档位 + 注意事项 + 进度」推给页面侧(导航产生新文档后
+    // 两条栏虽由 addScript 自动重挂,内容需重推)。fail-open。
+    crate::agent::browser_status::push(page, Some(&cfg), None, None).await;
     // 闸在场性探测(第 155 轮):只有「locked + 滚动观看开启 + 脚本已注入且闸已装」
     // 才走 DOM 闸;任何一环缺失都回退 CDP 全量拦截(fail-closed)。
     let gate_ready = if locked && locked_scroll_watch_enabled() && js_applied {
@@ -883,7 +848,7 @@ pub async fn gate_suspend_input(page: &Page, suspend: bool) -> bool {
     }
 }
 
-/// 挂起/恢复全部管控视觉(蒙层 + 状态条 + 盾区;不动 CDP 输入拦截)。
+/// 挂起/恢复全部管控视觉(蒙层 + 盾区 + 屏蔽页面状态栏/进度栏;不动 CDP 输入拦截)。
 ///
 /// 三个使用点:截图/OCR/HITL 附图「拍前隐藏 → 拍完恢复」(证据链干净);
 /// partial 下 Agent 输入动作「先隐盾后复盾」;不关心 CDP 的纯视觉场景。
@@ -891,10 +856,14 @@ pub async fn gate_suspend_input(page: &Page, suspend: bool) -> bool {
 pub async fn guard_suspend_visuals(page: &Page, hide: bool) -> bool {
     let ns_suspend = crate::agent::browser_ns::ns_global("GuardSuspend");
     let js = format!("window.{ns_suspend} ? window.{ns_suspend}({hide}) : null");
-    match page.evaluate(js.as_str()).await {
+    let applied = match page.evaluate(js.as_str()).await {
         Ok(r) => !r.value().map(|v| v.is_null()).unwrap_or(true),
         Err(_) => false,
-    }
+    };
+    // 第 171 轮:两条栏是告知性 UI,截图/OCR 取证同样要避让(否则证据里永远带着
+    // 「正在 open …」的动态角标,人工核对截图时分不清是页面内容还是注入层)。
+    crate::agent::browser_status::set_suspended(page, hide).await;
+    applied
 }
 
 // ===================== 第 141 轮 legacy API(委托保留,路径零改动) =====================
@@ -911,7 +880,7 @@ pub async fn apply_page_overlay(page: &Page, active: bool) -> std::result::Resul
 }
 
 /// legacy:仅切换视觉可见性(第 141 轮截图避让通道;委托挂起通道,
-/// 现在连状态条一起隐藏 —— 证据更干净)。
+/// 现在连蒙层与两条告知栏一起隐藏 —— 证据更干净)。
 pub async fn mask_set_visible(page: &Page, visible: bool) -> bool {
     guard_suspend_visuals(page, !visible).await
 }
@@ -1139,8 +1108,11 @@ mod tests {
         }
     }
 
-    /// 杀开关关闭时:闸不安装、状态条回退旧文案;开启时:闸标记齐全且拦截清单
+    /// 杀开关关闭时:闸不安装;开启时:闸标记齐全且拦截清单
     /// **不含** wheel/scroll/mousemove(人工滚动通路的回归锁)。
+    ///
+    /// 第 171 轮:档位文案已迁到 `browser_status::guard_text`,本测试只锁闸安装
+    /// 与烘焙开关;文案断言改在 `browser_status` 的单测里。
     #[test]
     fn guard_script_gate_install_and_kill_switch() {
         let _g = env_lock();
@@ -1169,9 +1141,9 @@ mod tests {
         for evt in ["'wheel'", "'scroll'", "'mousemove'", "'pointermove'", "'touchmove'"] {
             assert!(!gate_list.contains(evt), "拦截清单不得含 {evt}(人工滚动通路):{gate_list}");
         }
-        // 可滚动状态条文案
-        assert!(on.contains("仅观看·可滚动"), "{on}");
-        assert!(on.contains("人工可滚动浏览"), "{on}");
+        // 第 171 轮:档位/注意事项文案不再烘焙进本脚本(迁至状态栏),此处确认脚本内无残留
+        assert!(!on.contains("页面已锁定"), "档位文案应由状态栏承载,guard 脚本不再自建:{on}");
+        assert!(!on.contains("人工可滚动浏览"), "注意事项应迁至状态栏:{on}");
 
         unsafe { std::env::set_var("LAEW_WEB_LOCKED_SCROLL", "off") };
         let off = guard_script(&PageGuardConfig::locked());
@@ -1183,17 +1155,16 @@ mod tests {
             off.contains(&format!("if (window.{}GuardScrollWatch) {{", inject_ns())),
             "闸安装必须以烘焙开关为门(不得无条件安装):{off}"
         );
-        assert!(
-            off.contains(&format!("window.{}GuardScrollWatch\n            ? [", inject_ns())),
-            "locked 状态条文案必须按开关分流(可滚动/不可滚动两态):{off}"
-        );
         unsafe {
             std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
         }
     }
 
-    /// 管控脚本关键标记锁死:三件套元素 id / 提取过滤(data-%NS%agent)/
-    /// 三档状态条文案 / 挖洞 clip-path / 挂载函数 / pointer-events 语义。
+    /// 管控脚本关键标记锁死:两件套元素 id(蒙层 + 盾区)/ 提取过滤(data-%NS%agent)/
+    /// 挖洞 clip-path / 挂载函数 / pointer-events 语义。
+    ///
+    /// 第 171 轮:第三件「左下角静态状态条」已迁至 `browser_status`(屏蔽页面状态栏 +
+    /// 屏蔽页面进度栏),本脚本不再含任何文字元素。
     #[test]
     fn guard_script_markers_locked() {
         let _g = env_lock();
@@ -1202,19 +1173,23 @@ mod tests {
         }
         let js = guard_script(&PageGuardConfig::locked());
         assert!(js.contains(&overlay_element_id()), "蒙层元素 id 应出现在脚本中");
-        assert!(js.contains(&overlay_hint_id()), "状态条 id 应出现在脚本中");
         assert!(js.contains(&shields_element_id()), "盾区容器 id 应出现在脚本中");
         assert!(js.contains(&format!("data-{}agent", inject_ns())));
-        assert!(js.contains("z-index:2147483646"), "蒙层/状态条 z-index");
+        assert!(js.contains("z-index:2147483646"), "蒙层 z-index");
         assert!(js.contains("z-index:2147483645"), "盾区 z-index 恰低一档");
         assert!(js.contains(&format!("window.{}GuardSet", inject_ns())));
         assert!(js.contains(&format!("window.{}GuardSuspend", inject_ns())));
         assert!(js.contains(&format!("window.{}OverlaySet", inject_ns())), "第 141 轮 legacy 别名保留");
-        assert!(js.contains("window.top === window"), "状态条仅主文档");
-        // 三档状态条文案(第 155 轮:locked 缺省可滚动观看)
-        assert!(js.contains("页面已锁定(仅观看·可滚动)"));
-        assert!(js.contains("页面开放 · 人工可直接操作"));
-        assert!(js.contains("盾区不可操作"));
+        assert!(
+            !js.contains("overlay_hint__"),
+            "左下角静态状态条已迁至 browser_status(第 171 轮),脚本内不得残留"
+        );
+        assert!(
+            js.contains(&crate::agent::browser_status::status_host_id()) == false,
+            "两条栏有独立 host,不在 guard 脚本内"
+        );
+        // 三档档位文案(第 171 轮迁至 browser_status 的屏蔽页面状态栏,此处只回归「不得回流」)
+        assert!(!js.contains("页面已锁定"), "档位文案不得回流 guard 脚本:{js}");
         // 盾区技术要点:白名单垂直条带分解求补集(纯矩形,零 clip-path 依赖)+
         // 黑名单红调盾罩 + 标签预算
         assert!(js.contains("垂直条带分解"));
@@ -1318,7 +1293,7 @@ mod tests {
     /// 第 163 轮回归锁死:document-start 注入时的就绪门与**重试注册顺序**。
     ///
     /// 实测事故(`llaew_20261012_175823.log` + 真机 Chrome 复现):首开正常,
-    /// 首次 navigate 后蒙层 / 徽标 / 盾区**永久消失**,而 `apply_page_guard`
+    /// 首次 navigate 后蒙层 / 盾区**永久消失**,而 `apply_page_guard`
     /// 仍回报 `visual_mask: true`。根因是 `root()` 写成 `document.body ||
     /// document.documentElement`(document-start 时两者皆 null → appendChild 抛
     /// TypeError),且 `refresh()` 排在 `DOMContentLoaded` 补挂注册**之前** ——
@@ -1412,7 +1387,7 @@ mod tests {
     // =================== 真浏览器集成验证(#[ignore],本地 --ignored 跑) ===================
     //
     // 覆盖第 141 轮三条关键链路(详案 docs/MCP_Web_Use/05 §10)+ 第 143 轮 partial:
-    // 1. 管控元素注入存在性(headed + locked;含三档共用状态条);
+    // 1. 管控元素注入存在性(headed + locked;蒙层 + 盾区);
     // 2. 输入锁语义:锁定时 CDP 合成点击被拦(实测 setIgnoreInputEvents 连合成
     //    输入一起拦)→ 解锁后恢复 —— 即「先解后锁」包装的必要性回归锁;
     // 3. 蒙层隐藏/恢复(截图避让通道);
@@ -1468,7 +1443,7 @@ mod tests {
             }
         };
 
-        // ① 管控元素存在(第 169 轮:蒙层/状态条/盾区住 closed Shadow DOM,
+        // ① 管控元素存在(第 169 轮:蒙层/盾区住 closed Shadow DOM,
         //    主文档探针读不到,经影子树自探 API 校验在场性)
         let mask_probe = page
             .evaluate(
@@ -1483,12 +1458,12 @@ mod tests {
             // 第 163 轮回归锁死:真实浏览器下也必须验「**导航之后**视觉层仍在」。
             // 旧用例只在 new_page 之后断言(load 后的安全窗口),从不 navigate ——
             // 于是 document-start 注入时就绪门缺失这个 P0 缺陷一直绿灯:
-            // 首开正常,首次 navigate 后蒙层/徽标/蓝色边框永久消失,
+            // 首开正常,首次 navigate 后蒙层/蓝色边框永久消失,
             // 而 apply_page_guard 仍回报 visual_mask:true(谎报成功)。
             // 用 data: URL 再导航一次,document-start 时机与真实站点一致。
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        assert!(mask_probe, "蒙层/状态条/盾区容器未注入");
+        assert!(mask_probe, "蒙层/盾区容器未注入");
 
         // ② 输入锁:new_page 已 apply(locked) → CDP 点击应被拦
         cdp_click(&page).await;
@@ -1628,7 +1603,7 @@ mod tests {
         // ④ 第 163 轮回归锁死:**导航之后**视觉层必须仍在。
         //     这是本次 P0 的判别点 —— document-start 注入时 root() 为 null 抛异常,
         //     若 `DOMContentLoaded` 重试注册排在首次 `refresh()` 之后就会被整段吃掉,
-        //     表现为「首开正常,首次 navigate 后蒙层/徽标/蓝色边框永久消失」,
+        //     表现为「首开正常,首次 navigate 后蒙层/蓝色边框永久消失」,
         //     而 `apply_page_guard` 仍回报 `visual_mask: true`(谎报成功)。
         //     放在收尾前:导航会重置页面内计数器,不能插在计数类断言中间。
         page.goto(url).await.expect("第 163 轮回归:再导航一次应成功");
@@ -1652,7 +1627,7 @@ mod tests {
                 && after_nav.contains("\"hint\":true")
                 && after_nav.contains("\"frame\":true")
                 && after_nav.contains("\"shields\":true"),
-            "第 163 轮回归:导航后蒙层/状态条/蓝色边框/盾区丢失(实际 {after_nav})"
+            "第 163 轮回归:导航后蒙层/蓝色边框/盾区丢失(实际 {after_nav})"
         );
 
         // 收尾:回收浏览器(全局单例,必须清干净防污染其它测试)

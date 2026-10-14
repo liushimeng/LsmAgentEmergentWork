@@ -224,10 +224,16 @@ fn new_page_id() -> String {
 ///
 /// headed 可视化模式下,桌面上可能同时存在多个浏览器窗口,人工介入时必须一眼
 /// 识别「哪个窗口被 Agent 控制」。本脚本在页面四周渲染一圈 Chrome 品牌蓝
-/// (#1a73e8)选中效果 + 右上角「LAEW Agent 控制中」徽标:
+/// (#1a73e8)选中效果:
 /// - `pointer-events:none` 不拦截任何鼠标/键盘事件,渲染与普通浏览器一致;
 /// - `data-%NS%agent="1"` 标记,MCP_Web_Use 的 elements/dom 提取自动过滤该子树;
 /// - 通过 `Page.addScriptToEvaluateOnNewDocument` 挂载,导航/派生新页自动重注入。
+///
+/// 第 171 轮:右上角原「LAEW Agent 控制中」徽标**已移除** —— 品牌文本改由
+/// `browser_status.rs` 的**屏蔽页面状态栏**(右上角)唯一承载,并进一步显示具体
+/// Agent 名(`LsmAgentEmergentWork-SubAgent-Work` 等)+ 管控档位 + 注意事项。
+/// 同屏出现两处同款品牌角标只会让人工分不清哪个是「身份」、哪个是「说明」,故此处
+/// 只留蓝框(窗口归属的纯视觉标识),文字交给状态栏。
 pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
     // 第 163 轮:早退门加 DOM 校验 —— 旧写法只在**抛异常之前**置
     // `%NS%AgentHighlightInstalled = true`,而 document-start 时 body/documentElement
@@ -246,17 +252,6 @@ pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
             frame.id = '%NS%agent_frame__';
             frame.setAttribute('data-%NS%agent', '1');
             frame.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;box-shadow:inset 0 0 0 3px #1a73e8;';
-            // 第 169 轮:徽标文本挂 closed Shadow DOM —— 人工截图/肉眼可见不变,
-            // 但页面 JS 的 innerText/textContent/DOM 枚举/innerHTML 序列化都读不到
-            // 「LAEW Agent 控制中」品牌签名(实测京东风控 JS 采 innerText 命中该
-            // 文案把设备判为自动化,见 browser_ns.rs STEALTH_JS 注释)。
-            // attachShadow 不可用时 fail-open 回退 light DOM(只损隐身不损功能)。
-            let sr = null;
-            try { sr = frame.attachShadow ? frame.attachShadow({ mode: 'closed' }) : null; } catch (e) {}
-            const badge = document.createElement('div');
-            badge.style.cssText = 'position:absolute;top:8px;right:8px;padding:2px 10px;background:#1a73e8;color:#fff;font:600 12px/1.6 system-ui,sans-serif;border-radius:10px;box-shadow:0 1px 4px rgba(26,115,232,.45);';
-            badge.textContent = 'LAEW Agent 控制中';
-            (sr || frame).appendChild(badge);
             root.appendChild(frame);
         }
         frame.style.display = window.%NS%AgentHighlight === false ? 'none' : '';
@@ -287,6 +282,8 @@ pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
 })()"#;
 
 /// 给页面注入 Agent 高亮蓝框(新文档自动重挂 + 当前文档立即执行)。
+/// 第 171 轮:顺带注入屏蔽页面状态栏/进度栏(connect 模式零注入契约不变,由调用方
+/// 的 `guard_visuals_active()` 判据把守 —— 本函数只在 headed 非 connect 调用)。
 async fn inject_agent_highlight(page: &Page) {
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
     let _ = page
@@ -299,6 +296,9 @@ async fn inject_agent_highlight(page: &Page) {
             run_immediately: Some(true),
         })
         .await;
+    // 第 171 轮:两条告知栏与蓝框同生命周期(highlight 关闭时见 `set_highlight`)。
+    super::browser_status::ensure(page).await;
+    super::browser_status::push(page, None, None, None).await;
 }
 
 /// 未安装浏览器哨兵:BrowserNew 据此返回错误码 3001。
@@ -1565,6 +1565,10 @@ impl BrowserManager {
             .evaluate(js)
             .await
             .map_err(|e| format!("切换高亮失败:{e}"))?;
+        // 第 171 轮:两条告知栏随高亮开关联动 —— `set_highlight(false)` 的语义是
+        // 「关掉页面上的 Agent 可视化标识」,人工明确不要看到注入层时,状态栏与
+        // 进度栏一并隐藏(guard 管控本身不受影响,输入锁照旧)。
+        super::browser_status::set_visible(&page, enabled).await;
         Ok(json!({
             "enabled": enabled,
             "applied": !r.value().map(|v| v.is_null()).unwrap_or(true),
