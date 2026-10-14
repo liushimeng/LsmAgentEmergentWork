@@ -85,7 +85,7 @@ impl Tool for TodoWriteTool {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": { "type": "integer", "minimum": 1, "description": "条目 ID(update 时必填;create 可省略自动分配)" },
+                            "id": { "type": ["integer", "string"], "minimum": 1, "description": "条目 ID(update 时必填;create 可省略自动分配;数字字符串如 \"1\" 自动转换)" },
                             "content": { "type": "string", "minLength": 1, "description": "任务描述,如 '读取 Cargo.toml'" },
                             "status": {
                                 "type": "string",

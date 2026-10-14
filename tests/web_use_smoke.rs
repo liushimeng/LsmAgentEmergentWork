@@ -1000,3 +1000,172 @@ async fn mcp_web_use_pace_cooldown_smoke() {
         .execute(json!({"action": "close", "page_id": "all"}))
         .await;
 }
+
+/// 2026-10-14:整页抹除(site_wipe)治理冒烟 —— 302→about:blank 确定性复刻
+/// 「显式导航最终落地 about:blank」形态(猎聘实测:主文档 200 后被站点脚本抹除,
+/// 此处用确定性 redirect 落地模拟同一终态)。验证链:
+/// ① open 落 blank → `data.site_wipe{streak:1}` + `page_health{reason:"site_wipe"}`
+///    (按**请求 URL** 扫网络缓冲给证据,主文档 302 可见 —— 诊断盲区根治);
+/// ② 第二次 open → `streak:2, cooldown_triggered:true`(连击熔断);
+///    且响应带 `closed_blank_pages`(死页清扫,防空白窗口堆积);
+/// ③ 冷却期内同域 open 返 6004 且 `data.cause=="site_wipe"`(专属建议,非频控等待);
+/// ④ `close(page_id="all")` 回收后冷却解除(全新 profile=全新身份,恢复路径不被
+///    自己的熔断卡住)。
+/// host 用 `localhost`(独立冷却键,与 127.0.0.1 / [::1] 用例互不污染)。
+#[tokio::test]
+#[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
+async fn mcp_web_use_site_wipe_governance_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    tokio::spawn(async move {
+                        let _ = serve_wipe_redirect(&mut socket).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let wipe_url = format!("http://localhost:{}/", addr.port());
+
+    // 清场:既跑用例可能残留的冷却/连击全清(本测试自己从零开始)。
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+
+    // ① 第一次 open:落 about:blank → 连击 1 + 证据段
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": wipe_url, "reuse": false}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "第一次 open 应成功(动作执行了,落地被抹): {out}");
+    assert_eq!(
+        v["data"]["final_url"].as_str().unwrap_or_default(),
+        "about:blank",
+        "302→about:blank 后 final_url 应为 about:blank: {out}"
+    );
+    let wipe = &v["data"]["site_wipe"];
+    assert_eq!(wipe["streak"], 1, "首次抹除连击应为 1: {out}");
+    assert_eq!(wipe["cooldown_triggered"], false, "阈值 2,首次不应触发冷却: {out}");
+    let health = &v["data"]["page_health"];
+    assert_eq!(
+        health["reason"].as_str().unwrap_or_default(),
+        "site_wipe",
+        "按请求 URL 扫网络缓冲应判 site_wipe: {out}"
+    );
+    assert_eq!(
+        health["main_doc_status"], 200,
+        "主文档 200 证据应可见(诊断盲区根治): {out}"
+    );
+
+    // ② 第二次 open:连击 2 → 触发冷却;并清扫上一页死页
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": wipe_url, "reuse": false}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "第二次 open 应成功: {out}");
+    assert_eq!(v["data"]["site_wipe"]["streak"], 2, "连击应累计到 2: {out}");
+    assert_eq!(
+        v["data"]["site_wipe"]["cooldown_triggered"], true,
+        "连击 2 应触发 site_wipe 冷却: {out}"
+    );
+    assert!(
+        v["data"]["closed_blank_pages"].as_i64().unwrap_or(0) >= 1,
+        "应清扫上一次抹除遗留的 about:blank 死页: {out}"
+    );
+
+    // ③ 冷却期内同域 open 返 6004,cause=site_wipe(专属建议)
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": wipe_url, "reuse": false}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 6004, "抹除冷却中 open 应返 6004: {out}");
+    assert_eq!(
+        v["data"]["cause"].as_str().unwrap_or_default(),
+        "site_wipe",
+        "6004 成因应为 site_wipe(建议=换 profile,非冷却等待): {out}"
+    );
+    let advice = v["data"]["advice"].as_str().unwrap_or_default();
+    assert!(
+        advice.contains("reuse_existing") || advice.contains("close(page_id=\"all\")"),
+        "site_wipe 建议应指路换身份: {advice}"
+    );
+
+    // ④ close(all) 回收浏览器 → 冷却解除(恢复路径闭环),新身份连击重来
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": wipe_url, "reuse": false}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "close(all) 后应放行(冷却已清): {out}");
+    assert_eq!(
+        v["data"]["site_wipe"]["streak"], 1,
+        "新身份连击应重新计数: {out}"
+    );
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}
+
+/// 整页抹除冒烟的测试服务器:200 HTML + 子资源齐全 + 解析完成后
+/// `location.replace('about:blank')` 整页抹除(猎聘实测形态的最小复刻;
+/// 主文档 200 与子资源进 Network 缓冲作 site_wipe 证据)。
+async fn serve_wipe_redirect(socket: &mut TcpStream) -> std::io::Result<()> {
+    let mut buf = vec![0_u8; 4096];
+    let mut read = 0;
+    loop {
+        let n = socket.read(&mut buf[read..]).await?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") || read == buf.len() {
+            break;
+        }
+    }
+    // 请求路径分流:/a.png 等回 1x1 PNG(子资源计数证据),主文档回自抹 HTML。
+    let path = String::from_utf8_lossy(&buf[..read]);
+    if path.starts_with("GET /w/") {
+        // 1x1 PNG
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+            0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+            0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            PNG.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(PNG);
+        socket.write_all(&resp).await?;
+    } else {
+        let html = r#"<!doctype html><html><head><title>wipe</title>
+<script>location.replace('about:blank');</script></head><body>
+<h1>loaded content</h1>
+<img src="/w/1.png"><img src="/w/2.png"><img src="/w/3.png"><img src="/w/4.png"><img src="/w/5.png">
+</body></html>"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            html.len(),
+            html
+        );
+        socket.write_all(resp.as_bytes()).await?;
+    }
+    socket.shutdown().await
+}

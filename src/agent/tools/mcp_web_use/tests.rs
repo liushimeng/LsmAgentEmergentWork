@@ -2835,13 +2835,13 @@ async fn real_browser_site_viewport_and_page_health() {
         .value()
         .and_then(|x| x.as_f64())
         .unwrap_or(-1.0) as i64;
-    let health = page_health_field(&pid, &final_url).await;
+    let health = page_health_field(&pid, &final_url, &final_url).await;
     println!("真实元素数 {real},page_health = {health:?}");
     if real <= 3 {
         let h = health.expect("空白页必须透出 page_health(不再让 Agent 盲试 reload)");
         let reason = h["reason"].as_str().unwrap_or_default();
         assert!(
-            reason == "main_doc_error" || reason == "empty_dom",
+            reason == "main_doc_error" || reason == "empty_dom" || reason == "site_wipe",
             "reason 应为结构性判定,实测 {reason}"
         );
         if reason == "main_doc_error" {
@@ -2900,4 +2900,95 @@ fn 复用失败改写_畸形JSON不透写() {
     assert!(annotate_reuse_failure("not-json", "k", "x".to_string()).is_none());
     // 合法 JSON 但缺信封结构(无 code 字段)→ 不改写
     assert!(annotate_reuse_failure(r#"{"foo":1}"#, "k", "x".to_string()).is_none());
+}
+
+// ========== 2026-10-14:整页抹除(site_wipe)治理 ==========
+
+#[test]
+fn 抹除证据_主文档有响应即判定() {
+    // 倒序(最新在前):主文档 200 + 同域子资源 2 条
+    let ev1 = json!({"phase":"response","status":200,"url":"https://www.liepin.com/"});
+    let ev2 = json!({"phase":"response","status":200,"url":"https://c.liepin.com/a.js"});
+    let ev3 = json!({"phase":"response","status":200,"url":"https://c.liepin.com/b.css"});
+    let events = vec![&ev2, &ev3, &ev1]; // 最新在前,主文档不在最前也该扫到
+    let ev = wipe_evidence_from_events(&events, "https://www.liepin.com/")
+        .expect("主文档有 response 即命中");
+    assert_eq!(ev.main_doc_status, Some(200));
+    assert_eq!(ev.subresources, 3);
+}
+
+#[test]
+fn 抹除证据_仅子资源足量也判定() {
+    // 主文档条目不在缓冲(被抹后缓冲滚动丢失),但同域子资源 ≥5 → 页面曾真实加载
+    let events: Vec<Value> = (0..5)
+        .map(|i| json!({"phase":"response","status":200,"url":format!("https://c.liepin.com/{i}.js")}))
+        .collect();
+    let refs: Vec<&Value> = events.iter().collect();
+    let ev = wipe_evidence_from_events(&refs, "https://www.liepin.com/zhaopin/")
+        .expect("子资源 ≥5 即命中");
+    assert_eq!(ev.main_doc_status, None);
+    assert_eq!(ev.subresources, 5);
+}
+
+#[test]
+fn 抹除证据_无网络痕迹不判定_维持empty_dom路径() {
+    let events: Vec<Value> = vec![
+        json!({"phase":"request","url":"https://www.liepin.com/"}),
+        json!({"phase":"response","status":200,"url":"https://other.com/x.js"}),
+    ];
+    let refs: Vec<&Value> = events.iter().collect();
+    assert!(wipe_evidence_from_events(&refs, "https://www.liepin.com/").is_none());
+}
+
+#[test]
+fn 抹除证据_子域按注册域归一计数() {
+    let events: Vec<Value> = vec![
+        json!({"phase":"response","status":403,"url":"https://www.liepin.com/"}),
+        json!({"phase":"response","status":200,"url":"https://api-c.liepin.com/x.png"}),
+    ];
+    let refs: Vec<&Value> = events.iter().collect();
+    let ev = wipe_evidence_from_events(&refs, "https://www.liepin.com/").unwrap();
+    assert_eq!(ev.main_doc_status, Some(403));
+    assert_eq!(ev.subresources, 2);
+}
+
+#[test]
+fn 抹除字段_有结果才生成() {
+    assert!(site_wipe_field(None).is_none());
+    let v = site_wipe_field(Some(crate::agent::browser_pace::WipeOutcome {
+        streak: 2,
+        cooldown_triggered: true,
+    }))
+    .unwrap();
+    assert_eq!(v["streak"], 2);
+    assert_eq!(v["cooldown_triggered"], true);
+    assert!(v["advice"].as_str().unwrap().contains("close(page_id=\"all\")"));
+}
+
+#[test]
+fn 步内open参数合并_params逐键并入顶层() {
+    let mut args = json!({
+        "action":"open",
+        "page_id":"$NEW",
+        "params":{"url":"https://www.liepin.com/","guard":"open","force":true}
+    });
+    merge_open_params(&mut args);
+    assert_eq!(args["url"], "https://www.liepin.com/");
+    assert_eq!(args["guard"], "open");
+    assert_eq!(args["force"], true);
+    // params 本体保留(不破坏其余读取方),顶层已有 url 时不合并
+    assert!(args["params"].is_object());
+    let mut keep = json!({"action":"open","url":"https://a.com/","params":{"url":"https://b.com/"}});
+    merge_open_params(&mut keep);
+    assert_eq!(keep["url"], "https://a.com/", "顶层 url 优先,不被 params 覆盖");
+}
+
+#[test]
+fn 步内open参数合并_无非效params零变化() {
+    let mut none = json!({"action":"open"});
+    merge_open_params(&mut none);
+    assert_eq!(none, json!({"action":"open"}));
+    let mut bad = json!({"action":"open","params":"not-object"});
+    merge_open_params(&mut bad);
+    assert_eq!(bad["params"], "not-object");
 }

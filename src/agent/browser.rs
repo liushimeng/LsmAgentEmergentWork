@@ -2282,6 +2282,44 @@ impl BrowserManager {
         true
     }
 
+    /// 关闭注册表内 URL 恰为 `about:blank` 的页面(2026-10-14,猎聘整页抹除实测)。
+    ///
+    /// 被站点脚本整页抹除的页面是死页面——网络证据已在此前 open/navigate 响应的
+    /// `page_health` 里透出,无需保留句柄;不清会随每次 open 新开页堆积(实测单任务
+    /// 残留 6 个 about:blank 窗口,占 `LAEW_WEB_MAX_WINDOWS` 额度又污染屏幕)。
+    /// connect 模式零动作(页面归用户所有);URL 查询失败的页面保守保留(fail-open)。
+    /// 走 [`Self::close_page`] 复用「最后一页关闭 → 回收浏览器」语义:blank 页恰为
+    /// 全部页面时自然触发全新 profile 重启,正是整页抹除的恢复路径。
+    pub async fn close_blank_pages(&self) -> usize {
+        let candidates: Vec<String> = {
+            let inner = self.inner.lock().await;
+            if inner.connect_mode {
+                return 0;
+            }
+            let mut ids = Vec::new();
+            for (id, entry) in inner.pages.iter() {
+                if let Ok(Some(url)) = entry.page.url().await {
+                    if url.trim().eq_ignore_ascii_case("about:blank") {
+                        ids.push(id.clone());
+                    }
+                }
+            }
+            ids
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+        let closed = candidates.len();
+        tracing::info!(
+            closed,
+            "MCP_Web_Use 清扫整页抹除遗留的 about:blank 空白页面(死页面,证据已透出)"
+        );
+        for id in candidates {
+            self.close_page(&id).await;
+        }
+        closed
+    }
+
     /// 主动关闭所有页面 + 浏览器进程 + handler + 清理 tempdir。
     ///
     /// 幂等:重复调用安全(首次调用后 inner.browser=None,后续为 no-op)。

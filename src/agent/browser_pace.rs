@@ -15,6 +15,13 @@
 //!    命中 `rate_limited` 时 [`WebPace::mark_rate_limited`] 该域,冷却期内同域导航
 //!    返回 **6004**(动作不执行,附剩余秒数与处置建议);剩余 ≤
 //!    [`AUTO_WAIT_SECS`] 时透明等待后放行;`params.force=true` 逃生口。
+//! 3. **整页抹除(site_wipe)冷却**(2026-10-14,猎聘实测 `llaew_20261014_125139.log`):
+//!    部分站点对 CDP 会话做**会话/指纹级打标**,被标会话每次页面完整加载(主文档
+//!    200 + 子资源齐全)后数秒内被站点脚本 `location→about:blank` 整页抹除,
+//!    人工登录同样被抹(「页面是黑的」)。[`WebPace::note_navigation_outcome`]
+//!    记录「显式导航落 about:blank」域级连击,连续 ≥[`WIPE_STREAK_THRESHOLD`]
+//!    次触发 `cause=site_wipe` 冷却(短于频控——目的不是等时间而是强制换策略:
+//!    close(all) 回收浏览器换全新 profile / reuse_existing 接管日常浏览器)。
 //!
 //! 杀开关 `LAEW_WEB_PACE=off/0/false/no` 整体关闭(严格向后兼容)。
 //!
@@ -30,6 +37,14 @@ use serde_json::json;
 
 /// 频控冷却信封码(6xxx 范围约束段,避开 5xxx Use_MCP 与 4xxx HITL)。
 pub const CODE_SITE_PACE_COOLDOWN: i32 = 6004;
+
+/// 整页抹除连击阈值:同注册域**连续** N 次显式导航落 about:blank 触发 site_wipe 冷却。
+///
+/// 取 2:第 170 轮实测的「首航 blank 同页二次导航即成功」瞬态首击在 open 内部
+/// 重导航后落地非 blank 即清零,不会误触发;只有「含内部重导航仍 blank」的完整
+/// 流程连击两次才熔断(第一次靠 page_health{site_wipe} 证据引导 LLM 自行改道,
+/// 第二次仍硬闯则强制冷却止损)。
+pub const WIPE_STREAK_THRESHOLD: u32 = 2;
 
 /// 总开关(默认开;`LAEW_WEB_PACE=off/0/false/no` 关闭)。
 pub fn enabled() -> bool {
@@ -48,6 +63,17 @@ pub fn min_interval_ms() -> u64 {
 pub fn rate_cooldown_secs() -> u64 {
     env_secs("LAEW_WEB_RATE_COOLDOWN_SECS", 240)
 }
+
+/// 整页抹除冷却时长(秒;默认 90,`0`/非法值回退默认)。短于频控:抹除是会话级
+/// 打标,等时间无意义,冷却的目的是**强制换策略**(close(all) 换全新 profile 会
+/// 经 [`WebPace::clear_all`] 立即解除冷却,reuse_existing 接管日常浏览器同理不受影响)。
+pub fn wipe_cooldown_secs() -> u64 {
+    env_secs("LAEW_WEB_WIPE_COOLDOWN_SECS", 90)
+}
+
+/// 冷却成因(信封 `data.cause` 与文案分流;频控靠等,抹除靠换身份)。
+pub const CAUSE_RATE_LIMITED: &str = "rate_limited";
+pub const CAUSE_SITE_WIPE: &str = "site_wipe";
 
 /// 自动等待上限(秒;冷却剩余 ≤ 此值时透明等待后放行;默认 45,`0` 关闭自动等待
 /// 一律走 6004 拦截)。
@@ -149,8 +175,12 @@ impl PaceDecision {
 pub struct PaceState {
     /// 每注册域最近一次显式导航时刻
     last_nav: HashMap<String, Instant>,
-    /// 每注册域频控冷却截止时刻
+    /// 每注册域冷却截止时刻(频控与整页抹除共用一张冷却表)
     cooldown_until: HashMap<String, Instant>,
+    /// 每注册域冷却成因(`rate_limited` / `site_wipe`,信封文案分流)
+    cooldown_cause: HashMap<String, &'static str>,
+    /// 每注册域「显式导航落 about:blank」连击计数(落地非 blank 即清零)
+    wipe_streak: HashMap<String, u32>,
 }
 
 impl Default for PaceState {
@@ -158,8 +188,19 @@ impl Default for PaceState {
         Self {
             last_nav: HashMap::new(),
             cooldown_until: HashMap::new(),
+            cooldown_cause: HashMap::new(),
+            wipe_streak: HashMap::new(),
         }
     }
+}
+
+/// 一次导航落地的抹除记账结果(供调用方附加到响应,如 open 的 `data.site_wipe`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WipeOutcome {
+    /// 本次落地后该域的连击次数
+    pub streak: u32,
+    /// 本次是否触发了 site_wipe 冷却
+    pub cooldown_triggered: bool,
 }
 
 /// 全局单例句柄。
@@ -175,19 +216,90 @@ impl WebPace {
         GLOBAL.get_or_init(WebPace::default)
     }
 
-    /// 标记某域进入频控冷却(幂等取更晚截止时刻)。
+    /// 标记某域进入频控冷却(幂等取更晚截止时刻;成因跟随实际生效的标记)。
     pub fn mark_rate_limited_for(&self, host: &str, secs: Duration) {
         let until = Instant::now() + secs;
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.cooldown_until.entry(host.to_string()).or_insert(until);
         if until > *entry {
             *entry = until;
+            guard
+                .cooldown_cause
+                .insert(host.to_string(), CAUSE_RATE_LIMITED);
         }
     }
 
     /// 按环境默认冷却时长标记。
     pub fn mark_rate_limited(&self, host: &str) {
         self.mark_rate_limited_for(host, Duration::from_secs(rate_cooldown_secs()));
+    }
+
+    /// 显式导航落地记账(整页抹除连击;2026-10-14 猎聘实测形态,见模块头 3.)。
+    ///
+    /// - 落地 `about:blank` → 该域连击 +1;连击 ≥ [`WIPE_STREAK_THRESHOLD`] 触发
+    ///   `cause=site_wipe` 冷却(幂等取更晚;未过阈值不拦截,靠 page_health 证据引导);
+    /// - 落地非 blank → 连击清零(瞬态首击/恢复均走这里);
+    /// - 请求 URL 不可解析 host / 落地为空 → 不记账。
+    ///
+    /// 返回 `Some` 仅当本次落地被计为抹除连击(调用方据此在响应里附 `site_wipe` 段)。
+    pub fn note_navigation_outcome(
+        &self,
+        requested_url: &str,
+        landed_url: &str,
+    ) -> Option<WipeOutcome> {
+        if !enabled() {
+            return None;
+        }
+        let host = host_of(requested_url)?;
+        if !landed_url.trim().eq_ignore_ascii_case("about:blank") {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .wipe_streak
+                .remove(&host);
+            return None;
+        }
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let streak = guard.wipe_streak.entry(host.clone()).or_insert(0);
+        *streak += 1;
+        let streak = *streak;
+        let mut triggered = false;
+        if streak >= WIPE_STREAK_THRESHOLD {
+            let until = Instant::now() + Duration::from_secs(wipe_cooldown_secs());
+            let entry = guard.cooldown_until.entry(host.clone()).or_insert(until);
+            if until > *entry {
+                *entry = until;
+            }
+            // 抹除与频控共用冷却表:后到的标记覆盖成因,信封按最近信号给建议。
+            guard.cooldown_cause.insert(host, CAUSE_SITE_WIPE);
+            triggered = true;
+        }
+        Some(WipeOutcome {
+            streak,
+            cooldown_triggered: triggered,
+        })
+    }
+
+    /// 冷却成因(`rate_limited` / `site_wipe`);无有效冷却返回 `None`。
+    pub fn cooldown_cause_for(&self, host: &str) -> Option<&'static str> {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .cooldown_until
+            .get(host)
+            .map(|until| until.saturating_duration_since(Instant::now()))
+            .filter(|d| *d > Duration::ZERO)?;
+        guard.cooldown_cause.get(host).copied()
+    }
+
+    /// 清空全部冷却与抹除连击(close(page_id="all") 回收浏览器时调用)。
+    ///
+    /// 全新 profile = 全新会话身份(新 cookie/新指纹),原会话的频控/抹除标记
+    /// 不再适用;不清 `last_nav`(最小间隔节奏与身份无关)。
+    pub fn clear_all(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.cooldown_until.clear();
+        guard.cooldown_cause.clear();
+        guard.wipe_streak.clear();
     }
 
     /// 频控剩余冷却;`None` = 无冷却。
@@ -218,6 +330,8 @@ impl WebPace {
 ///
 /// 返回 `Some` = 拦截信封(6004,动作不执行);`None` = 放行(透明等待已在内部完成,
 /// 导航账本已登记)。`force=true` 逃生口跳过全部节奏约束。
+/// 拦截文案按冷却成因分流:频控靠等(冷却后低频重试),抹除靠换身份(全新 profile
+/// / 接管日常浏览器)——建议错位会把 LLM 引向无效等待(猎聘实测硬闯 25+ 次的教训)。
 pub async fn guard_navigation(url: &str, force: bool) -> Option<crate::error::Result<String>> {
     if !enabled() || force {
         return None;
@@ -226,21 +340,43 @@ pub async fn guard_navigation(url: &str, force: bool) -> Option<crate::error::Re
     match WebPace::global().decide(&host) {
         PaceDecision::Block { remaining } => {
             let secs = remaining.as_secs().max(1);
-            let cooldown = rate_cooldown_secs();
+            let cause = WebPace::global()
+                .cooldown_cause_for(&host)
+                .unwrap_or(CAUSE_RATE_LIMITED);
+            let (cooldown, advice, msg) = if cause == CAUSE_SITE_WIPE {
+                (
+                    wipe_cooldown_secs(),
+                    "站点整页抹除(反爬,会话/指纹级打标):本会话内继续导航/重试均无效。\
+处置:① close(page_id=\"all\") 回收浏览器换全新 profile(冷却自动解除)后重新 open;\
+② open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态);\
+③ 人工在场可 request_human 协助;已采集数据先落盘",
+                    format!(
+                        "站点整页抹除冷却中({host}):剩余 {secs}s;同会话重试无效,\
+建议 close(page_id=\"all\") 回收浏览器(自动解除冷却)或 reuse_existing 接管日常浏览器;\
+确需原会话立即重试可 params.force=true",
+                    ),
+                )
+            } else {
+                (
+                    rate_cooldown_secs(),
+                    "站点频控/限流:不要对该站点继续连续导航/搜索(高频只会延长封锁);\
+先做本地整理或其它页面/站点工作,冷却后低频重试;已采集数据先落盘。\
+任何探针命中频控标记后工具层自动进入冷却",
+                    format!(
+                        "站点频控冷却中({host}):剩余 {secs}s 后放行;冷却期内不要对同站点连续导航/搜索;\
+确需立即导航可 params.force=true",
+                    ),
+                )
+            };
             let data = json!({
                 "host": host,
+                "cause": cause,
                 "remaining_secs": secs,
                 "cooldown_secs": cooldown,
                 "retry_after_secs": secs,
-                "advice": "站点频控/限流:不要对该站点继续连续导航/搜索(高频只会延长封锁);\
-先做本地整理或其它页面/站点工作,冷却后低频重试;已采集数据先落盘。\
-任何探针命中频控标记后工具层自动进入冷却",
+                "advice": advice,
                 "force_hint": "确认必须立即导航时,可在 params 加 force=true 跳过节奏闸强制执行",
             });
-            let msg = format!(
-                "站点频控冷却中({host}):剩余 {secs}s 后放行;冷却期内不要对同站点连续导航/搜索;\
-                 确需立即导航可 params.force=true",
-            );
             // 与 mcp_web_use::envelope 同形(该 helper 是 pub(super),跨模块不可见)
             serde_json::to_string(&json!({
                 "code": CODE_SITE_PACE_COOLDOWN,
@@ -433,5 +569,105 @@ mod tests {
         assert!(min_interval_ms() > 0);
         assert!(rate_cooldown_secs() > 0);
         assert!(auto_wait_secs() > 0);
+    }
+
+    // ========== 整页抹除(site_wipe)治理(2026-10-14,猎聘实测) ==========
+
+    #[test]
+    fn 整页抹除_落地about_blank累计连击() {
+        let p = pace();
+        // 第一次落 about:blank:连击 1,未过阈值不触发冷却
+        let o1 = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        assert_eq!(
+            o1,
+            Some(WipeOutcome {
+                streak: 1,
+                cooldown_triggered: false
+            })
+        );
+        assert_eq!(p.cooldown_remaining_for("liepin.com"), None);
+        // 第二次:连击 2 = 阈值,触发 site_wipe 冷却
+        let o2 = p.note_navigation_outcome("https://www.liepin.com/zhaopin/", "about:blank");
+        assert_eq!(
+            o2,
+            Some(WipeOutcome {
+                streak: 2,
+                cooldown_triggered: true
+            })
+        );
+        assert!(p.cooldown_remaining_for("liepin.com").is_some());
+        assert_eq!(p.cooldown_cause_for("liepin.com"), Some(CAUSE_SITE_WIPE));
+    }
+
+    #[test]
+    fn 整页抹除_落地正常页面即清零连击() {
+        let p = pace();
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        // 瞬态首击形态:open 内部重导航成功 → 落地目标站 → 连击清零
+        assert_eq!(
+            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/"),
+            None
+        );
+        // 再次单次 blank 仍是连击 1,不触发
+        let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        assert_eq!(o.map(|x| (x.streak, x.cooldown_triggered)), Some((1, false)));
+        assert_eq!(p.cooldown_remaining_for("liepin.com"), None);
+    }
+
+    #[test]
+    fn 整页抹除_子域共享注册域连击() {
+        let p = pace();
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        let o = p.note_navigation_outcome("https://api-c.liepin.com/x", "about:blank");
+        assert!(o.is_some_and(|x| x.cooldown_triggered));
+        assert_eq!(p.cooldown_cause_for("liepin.com"), Some(CAUSE_SITE_WIPE));
+    }
+
+    #[test]
+    fn 整页抹除_不可解析host不记账() {
+        let p = pace();
+        assert_eq!(p.note_navigation_outcome("about:blank", "about:blank"), None);
+        assert_eq!(p.note_navigation_outcome("not a url", "about:blank"), None);
+    }
+
+    #[test]
+    fn 整页抹除_冷却期导航决策为拦截() {
+        let p = pace();
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        // 冷却 90s > 自动等待 45s → Block
+        match p.decide("liepin.com") {
+            PaceDecision::Block { .. } => {}
+            other => panic!("期望 Block,实际 {other:?}"),
+        }
+        // 其它域不受影响
+        assert_eq!(p.decide("jd.com"), PaceDecision::Allow);
+    }
+
+    #[test]
+    fn 整页抹除_clear_all清空冷却与连击_保留间隔账本() {
+        let p = pace();
+        p.note_nav_for("liepin.com");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        assert!(p.cooldown_remaining_for("liepin.com").is_some());
+        // close(all) 回收浏览器:全新 profile = 全新身份
+        p.clear_all();
+        assert_eq!(p.cooldown_remaining_for("liepin.com"), None);
+        assert_eq!(p.cooldown_cause_for("liepin.com"), None);
+        // 连击同样清零:新身份单次 blank 不再直接熔断
+        let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        assert_eq!(o.map(|x| (x.streak, x.cooldown_triggered)), Some((1, false)));
+    }
+
+    #[test]
+    fn 冷却成因_频控标记覆盖抹除成因() {
+        let p = pace();
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        assert_eq!(p.cooldown_cause_for("liepin.com"), Some(CAUSE_SITE_WIPE));
+        // 频控横幅标记时长更长(240s > 90s)→ 成因随实际生效的标记切换
+        p.mark_rate_limited_for("liepin.com", Duration::from_secs(240));
+        assert_eq!(p.cooldown_cause_for("liepin.com"), Some(CAUSE_RATE_LIMITED));
     }
 }

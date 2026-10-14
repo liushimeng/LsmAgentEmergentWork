@@ -695,7 +695,18 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
         .ok()
         .flatten()
         .unwrap_or_else(|| url.to_string());
-    if let Some(v) = super::page_health_field(id, &landed).await {
+    // 2026-10-14:整页抹除记账(navigate 落 about:blank;非 connect 才记 —— 接管
+    // 用户浏览器时落地行为归用户,不进熔断账本防误伤)。连续 ≥2 次同域自动冷却(6004)。
+    let wipe_outcome = if !BrowserManager::global().is_connect_mode().await {
+        crate::agent::browser_pace::WebPace::global().note_navigation_outcome(url, &landed)
+    } else {
+        None
+    };
+    if let Some(v) = super::site_wipe_field(wipe_outcome) {
+        out["landed_url"] = json!(landed);
+        out["site_wipe"] = v;
+    }
+    if let Some(v) = super::page_health_field(id, &landed, url).await {
         out["landed_url"] = json!(landed);
         out["page_health"] = v;
     }

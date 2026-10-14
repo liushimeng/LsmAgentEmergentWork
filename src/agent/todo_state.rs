@@ -494,12 +494,54 @@ pub struct TodoItemInput {
     pub priority: Option<TodoPriority>,
 }
 
+/// `Option<u32>` 宽松反序列化(2026-10-14):数字字符串 `"1"` → `1`。
+///
+/// 实测猎聘任务 LLM 把 `todos[].id` 写成字符串,被 Schema 预校验拒后整轮白烧;
+/// schema 侧同步放开为 `["integer","string"]`,这里兜底转换。非数字字符串/
+/// 负数/小数仍走 serde 原生报错(错误信息本就清晰)。
+fn de_opt_u32_lenient<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|x| u32::try_from(x).ok())
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("id 数值超出 u32 范围")),
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom(format!("id 数字字符串无效: {s:?}"))),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "id 类型无效: {}",
+            json_brief_type(&other)
+        ))),
+    }
+}
+
+/// JSON 值的简短类型名(错误信息用;独立小函数避免与工具层耦合)。
+fn json_brief_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// 兼容性:从 `{"content":..., "status":"pending", "priority":"high"}`
 /// (无 id 字段) 也能解析 —— 自动化 / 手工构造常用。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum TodoItemInputRaw {
     WithId {
+        #[serde(default, deserialize_with = "de_opt_u32_lenient")]
         id: Option<u32>,
         content: Option<String>,
         #[serde(default)]
@@ -572,6 +614,7 @@ fn truncate_for_render(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn input(content: &str, status: TodoStatus) -> TodoItemInput {
         TodoItemInput {
@@ -852,5 +895,39 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         COUNTER.fetch_add(1, Ordering::Relaxed).to_string()
+    }
+
+    #[test]
+    fn 宽松id_数字字符串自动转换() {
+        // 2026-10-14:实测 LLM 把 todos[].id 写成字符串,schema 预校验拒绝整轮白烧
+        let raw: TodoItemInputRaw = serde_json::from_value(json!({
+            "id": "1", "content": "打开猎聘首页", "status": "pending"
+        }))
+        .unwrap();
+        match raw {
+            TodoItemInputRaw::WithId { id, .. } => assert_eq!(id, Some(1)),
+            other => panic!("期望 WithId,实际 {other:?}"),
+        }
+        // 数字类型不回归
+        let raw2: TodoItemInputRaw = serde_json::from_value(json!({
+            "id": 2, "content": "x", "status": "pending"
+        }))
+        .unwrap();
+        match raw2 {
+            TodoItemInputRaw::WithId { id, .. } => assert_eq!(id, Some(2)),
+            other => panic!("期望 WithId,实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 宽松id_缺失与null均为None() {
+        for v in [json!({"content": "x", "status": "pending"}),
+                  json!({"id": null, "content": "x", "status": "pending"})] {
+            let raw: TodoItemInputRaw = serde_json::from_value(v).unwrap();
+            match raw {
+                TodoItemInputRaw::WithId { id, .. } => assert_eq!(id, None),
+                other => panic!("期望 WithId,实际 {other:?}"),
+            }
+        }
     }
 }
