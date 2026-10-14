@@ -3139,3 +3139,55 @@ fn probe_js包含厂商容器选择器() {
     assert!(js.contains("yidun"), "易盾容器选择器必须在探针 JS 里");
     assert!(js.contains("vendors"), "探针必须输出 vendors 字段");
 }
+
+// ========================= 第 172 轮:连接级失败归一 / 登录墙 =========================
+
+#[test]
+fn 连接级失败识别覆盖底层英文错误() {
+    // 实测(2026-10-14 对照任务):接管已死调试实例后,冷启动 open 也统一返回
+    // futures 的 "oneshot canceled",模型原样重试 3 次全灭。
+    assert!(is_connection_level_failure("oneshot canceled"));
+    assert!(is_connection_level_failure(
+        "Session with given id not found"
+    ));
+    assert!(is_connection_level_failure("Target closed"));
+    assert!(is_connection_level_failure("WebSocket handshake failed"));
+    // 动作级失败不得误判为连接级(否则会被清句柄,徒增一次冷启动)
+    assert!(!is_connection_level_failure("缺少 url"));
+    assert!(!is_connection_level_failure("navigate 超时(30s): https://x"));
+    assert!(!is_connection_level_failure("page_id 不存在(标签页已关闭)"));
+}
+
+#[test]
+fn 登录墙信号_登录页与正常页() {
+    let mut d = json!({"final_url": "https://www.zhipin.com/web/user/"});
+    login_wall::attach(&mut d, "https://www.zhipin.com/web/user/", None);
+    assert!(d.get("login_wall").is_some(), "登录页必须透出登录墙信号");
+
+    let mut ok = json!({"final_url": "https://www.zhipin.com/beijing/"});
+    login_wall::attach(&mut ok, "https://www.zhipin.com/beijing/", Some("session_avatar"));
+    assert!(
+        ok.get("login_wall").is_none(),
+        "带会话标记的正常页不得误报登录墙"
+    );
+}
+
+#[test]
+fn 页面存活性信号_健康页零噪声() {
+    let id = "tests_liveness_quiet_page";
+    page_liveness::forget(id);
+    let mut data = json!({});
+    // 未采样/无自刷新 → 不写任何字段
+    page_liveness::attach(&mut data, id);
+    assert!(data.get("page_liveness").is_none());
+
+    page_liveness::observe(id, 1.0, "https://x.test/", false);
+    page_liveness::observe(id, 2.0, "https://x.test/", false);
+    page_liveness::observe(id, 3.0, "https://x.test/", false);
+    page_liveness::attach(&mut data, id);
+    assert!(data.get("page_liveness").is_some(), "连续自发重载应透出不稳定信号");
+    let v = &data["page_liveness"];
+    assert_eq!(v["unstable"], json!(true));
+    assert!(v["advice"].as_str().unwrap().contains("reuse_existing"));
+    page_liveness::forget(id);
+}

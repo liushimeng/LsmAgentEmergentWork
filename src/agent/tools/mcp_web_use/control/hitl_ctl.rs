@@ -251,6 +251,38 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
         ];
     }
     options.truncate(6);
+    // 第 172 轮:**提问前**页面存活性体检 —— BOSS 直聘实测坑死点:站点对自动化
+    // 环境做自杀式反爬(原地 reload / 抹成空白页),人工在弹窗里输入的字符随
+    // 文档销毁,连续 3 次 request_human 都被回「页面还是一直在刷新」(实测
+    // llaew_20261014_155234)。此前弹窗对页面正在被重载这件事**零感知**,
+    // 人工只能反复重来。这里在弹窗正文**首行**前置告警 + 给可行动的改道
+    // (接管用户已登录的真实浏览器 / 换稳定页面),把「为什么输入不了」讲清楚。
+    let liveness_warning = {
+        // 先采一次样再判定(HITL 是本页最需要准确判定的时刻,不受 5s 节流约束:
+        // 节流只在采样点生效,这里若被节流跳过则沿用上次台账,不会误报也不会漏报
+        // 已经记录在案的自刷新)。
+        crate::agent::tools::mcp_web_use::sample_liveness(id, false).await;
+        crate::agent::page_liveness::report(id)
+    }
+    .map(|v| {
+        let n = v["self_reloads"].as_u64().unwrap_or(0);
+        let reason = v["reason"].as_str().unwrap_or("self_reload_loop");
+        let why = match reason {
+            "self_reload_burst" => "短时间内被站点反复重载",
+            _ => "持续被站点反复重载",
+        };
+        format!(
+            "⚠️ 提醒:{why}(近窗口 {n} 次,URL={})\n\
+             您的输入可能随页面重建而丢失。建议:① 先换到稳定的页面完成登录再回来;\
+             ② 或改用 open(reuse_existing=true) 接管本机已登录的真实浏览器(connect 模式零注入、真实指纹);\
+             ③ 不要反复刷新页面 —— 刷新只会再吃一次站点风控并延长封锁。\n\n",
+            v["url"].as_str().unwrap_or(""),
+        )
+    });
+    let message = match liveness_warning {
+        Some(w) => format!("{w}{message}"),
+        None => message,
+    };
     let timeout_ms = spec.timeout_ms.unwrap_or_else(|| {
         // 第 118 轮:按 reason 分档默认超时(LLM 显式传 timeout_ms 仍走传入值)
         // - captcha / sms / two_factor:120_000(2 分钟)

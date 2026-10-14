@@ -122,6 +122,10 @@ struct BrowserInner {
     mode: BrowserMode,
     /// Agent 高亮蓝框是否启用(headed 可视化场景标识 Agent 控制的窗口)。
     highlight: bool,
+    /// 反检测档位期望态(第 174 轮):`open(stealth=…)` / `control(set_stealth)` 显式
+    /// 覆盖,缺省取进程级 `LAEW_WEB_STEALTH`(`stealth::mode()`)。页面创建/复用/
+    /// 自愈/派生四条路径共用同一次注入,与 `highlight` 同构。
+    stealth: super::stealth::StealthMode,
     /// 页面管控期望态(第 143 轮:locked 屏蔽/open 开放/partial 部分屏蔽;
     /// 第 141 轮的 `overlay: bool` 升级而来,locked 档语义与蒙层完全一致)。
     guard: super::browser_overlay::PageGuardConfig,
@@ -484,6 +488,7 @@ impl BrowserManager {
                         user_data_dir: None,
                         mode: BrowserMode::Hidden,
                         highlight: true,
+                        stealth: super::stealth::mode(),
                         guard: super::browser_overlay::PageGuardConfig::from_env_default(),
                         // 第 152 轮:默认开启跟随 —— 人工在 locked 档无法滚动,
                         // 页面必须自己停在最新,否则多轮对话只有第一屏可见。
@@ -642,6 +647,30 @@ impl BrowserManager {
         // Browser 操作超时(2026-09-16 第 66 轮):launch/connect/goto 统一 30s,
         // 防止页面挂起/Chrome 启动失败导致无限等待(用户反馈浏览器任务卡住 58.8s)。
         let browser_timeout = std::time::Duration::from_secs(30);
+
+        // 第 172 轮:死句柄预防(实测 2026-10-14 BOSS 直聘对照任务)。
+        //
+        // 事故:用户日常 Chrome 占用 9222,HTTP `/json/version` 探得到版本号,但 CDP
+        // WebSocket 已无响应;`Browser::connect` 把这个「探得到但已死」的实例写进
+        // 全局单例后,handler 任务立即退出 —— 之后**连纯冷启动的 `open` 也一律返回
+        // futures 的 `oneshot canceled`**,模型拿到一个不可理解的英文错误,只能反复
+        // 重试(实测连续 3 次全灭)。
+        //
+        // 对策:每次要新开页之前,先对已存在的句柄做活探;死了就地清尸,让本次调用
+        // 走真正的 launch/connect 路径。判据与 `browser_handle_alive` 一致
+        // (`browser.pages()` 往返失败 = CDP 连接已死),避免两套活探语义分叉。
+        if inner.browser.is_some() {
+            let alive = {
+                let browser = inner.browser.as_ref().expect("is_some");
+                Self::browser_handle_alive(browser).await
+            };
+            if !alive {
+                tracing::warn!(
+                    "MCP_Web_Use 检测到已注册的浏览器句柄 CDP 无响应,就地清尸后重新拉起(第 172 轮)"
+                );
+                Self::purge_browser(&mut inner).await;
+            }
+        }
 
         if inner.browser.is_none() {
             // 上一版进程内清理无法覆盖 kill -9；先做一次性迁移清扫，再交给新 watchdog。
@@ -857,6 +886,12 @@ impl BrowserManager {
             .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
             .await;
         spawn_event_listeners(&page, events.clone()).await;
+        // 第 174 轮:无头档 UA 清理必须**先于首次导航** —— 否则第一个文档的网络
+        // 请求头仍带 `HeadlessChrome` 令牌(JS 侧改 navigator.userAgent 只骗得过
+        // 页面、骗不过服务器)。connect 模式零注入契约不变(用户日常浏览器本无该令牌)。
+        if !inner.connect_mode {
+            super::browser_ns::apply_ua_destealth(&page, inner.stealth).await;
+        }
         tokio::time::timeout(browser_timeout, page.goto(url.to_string()))
             .await
             .map_err(|_| {
@@ -877,8 +912,9 @@ impl BrowserManager {
 
         // 第 169 轮:隐身覆写最先注入(document-start 执行序 = 注册序,先于高亮/管控),
         // 压掉 navigator.webdriver 指纹;connect 模式零注入契约不变(真实浏览器无此指纹)。
+        // 第 174 轮:按档位注入(非侵入式保真 / 侵入式原生化,open(stealth=…) 可覆盖)。
         if !inner.connect_mode {
-            super::browser_ns::inject_stealth(&page).await;
+            super::browser_ns::inject_stealth(&page, inner.stealth).await;
         }
         // 第 100 轮:headed 可视化模式注入 Agent 高亮蓝框(hidden 无窗口,注入无意义
         // 且污染 DOM 提取,跳过)。注意:浏览器已存在时以实例真实 mode 为准
@@ -1043,6 +1079,17 @@ impl BrowserManager {
             return false;
         }
         tracing::warn!("drop_dead_browser: 清理已死亡的浏览器句柄(CDP 无响应)");
+        Self::purge_browser(&mut inner).await;
+        true
+    }
+
+    /// 清空浏览器实例态(句柄 / handler / watchdog / profile 目录 / 页面表)。
+    ///
+    /// 第 172 轮抽出:`drop_dead_browser`(外部触发)与 `new_page_impl` 入口的
+    /// 「死句柄预防」共用同一份清理语义,避免两处漂移(漏清 handler 会残留
+    /// 僵尸任务、漏清 registry 会让 watchdog 杀不掉已退出的 Chrome)。
+    /// 调用方必须已持有 `inner` 锁。
+    async fn purge_browser(inner: &mut BrowserInner) {
         if let Some(mut browser) = inner.browser.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), browser.close())
                 .await;
@@ -1061,7 +1108,6 @@ impl BrowserManager {
         }
         inner.pages.clear();
         inner.connect_mode = false;
-        true
     }
 
     /// 列出当前注册页面(带存活性探测,失效 entry 顺手清理)。
@@ -1164,9 +1210,11 @@ impl BrowserManager {
             .await;
         spawn_event_listeners(&found, events.clone()).await;
         // 第 169 轮:自愈重建句柄的页面重挂隐身覆写(CDP 会话掉线重连后新文档
-        // 上下文需要重新挂载;connect 零注入不变)。
+        // 上下文需要重新挂载;connect 零注入不变)。第 174 轮:UA 清理同挂
+        // (重连后的下一次导航同样要无令牌,否则掉线一次就前功尽弃)。
         if !inner.connect_mode {
-            super::browser_ns::inject_stealth(&found).await;
+            super::browser_ns::apply_ua_destealth(&found, inner.stealth).await;
+            super::browser_ns::inject_stealth(&found, inner.stealth).await;
         }
         if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
             inject_agent_highlight(&found).await;
@@ -1199,6 +1247,38 @@ impl BrowserManager {
     }
 
     // =================== 第 100 轮:窗口可视化 / 人工介入支撑 ===================
+
+    /// 当前生效的反检测档位（第 174 轮）。connect 模式（接管用户浏览器）恒
+    /// 与实例期望态无关地零注入，但档位回报照旧，供对账。
+    pub async fn stealth_mode(&self) -> super::stealth::StealthMode {
+        self.inner.lock().await.stealth
+    }
+
+    /// 切换反检测档位（第 174 轮）：`open(stealth=…)` / `control(set_stealth)` 入口。
+    ///
+    /// **诚实语义**：升档即时生效（对全部存活页面重挂脚本 + 重下发 UA 覆盖）；
+    /// 降档只能阻止**新文档**注入 —— 已在旧文档执行过的覆写无法回退（原生对象一旦
+    /// 被改写就没有"还原"这个动作），响应据此如实回报，不假装已还原。
+    ///
+    /// 返回受影响页面数；connect 模式零动作（真实浏览器本无这些痕迹）。
+    pub async fn set_stealth(&self, mode: super::stealth::StealthMode) -> usize {
+        let (pages, connect_mode) = {
+            let mut inner = self.inner.lock().await;
+            inner.stealth = mode;
+            (
+                inner.pages.values().map(|e| e.page.clone()).collect::<Vec<_>>(),
+                inner.connect_mode,
+            )
+        };
+        if connect_mode {
+            return 0;
+        }
+        for page in &pages {
+            super::browser_ns::apply_ua_destealth(page, mode).await;
+            super::browser_ns::inject_stealth(page, mode).await;
+        }
+        pages.len()
+    }
 
     /// 把指定页面的标签页带到前台(`Page.bringToFront`),人工介入前调用,
     /// 保证用户能看到被 Agent 控制的页面。仅 headed 模式有视觉效果。
@@ -2230,8 +2310,10 @@ impl BrowserManager {
                 .await;
             spawn_event_listeners(&page, events.clone()).await;
             // 第 169 轮:派生/adopt 新标签页同样装隐身覆写(connect 零注入不变)。
+            // 第 174 轮:UA 清理同挂(无头档派生页同样不能带 HeadlessChrome 令牌)。
             if !inner.connect_mode {
-                super::browser_ns::inject_stealth(&page).await;
+                super::browser_ns::apply_ua_destealth(&page, inner.stealth).await;
+                super::browser_ns::inject_stealth(&page, inner.stealth).await;
             }
             // 第 100 轮:headed + highlight 时,派生/adopt 的新标签页同样注入蓝框。
             if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {

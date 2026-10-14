@@ -394,6 +394,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "set_guard" => return act_set_guard(id, &params).await,
         // 第 152 轮:自动跟随滚动(多轮对话时把页面停在最新,人工在 locked 档也能看到)
         "auto_follow" => act_auto_follow(id, &params).await,
+        // 第 174 轮:反检测档位运行时切换(全局,作用于全部存活页面)
+        "set_stealth" => act_set_stealth(&params).await,
         // request_human 需要特殊信封(4001/4002),不走通用 2002 映射
         "request_human" => return act_request_human(id, &params).await,
         other => return envelope(1001, "未知 control_action", json!({"control_action": other})),
@@ -761,6 +763,18 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
     if let Some(note) = super::visit_ledger::visit_note(url) {
         out["visit_note"] = note;
     }
+    // 第 172 轮:导航落地透明化 —— 旧实现只回请求 URL(`data.url`),服务端把页面
+    // 302 到登录页 / 302 回首页这类事实完全不可见(BOSS 直聘实测:请求
+    // `/web/geek/job?query=AI` 落地 `/web/user/` 登录页、请求 SEO 类目页落地首页,
+    // 模型连烧 3 轮才发现「要登录」,甚至把首页推荐位卡片当职位列表抓取)。
+    // 现在 `requested_url` / `final_url` / `redirected` 三件套齐全。
+    out["requested_url"] = json!(url);
+    out["final_url"] = json!(landed);
+    if !landed.trim().eq_ignore_ascii_case(url.trim()) {
+        out["redirected"] = json!(true);
+    }
+    // 第 172 轮:自刷新台账(Agent 主动导航)+ 登录墙信号。
+    super::enrich_after_navigation(id, &mut out, &landed, false).await;
     // 第 162 轮:跨 origin 导航后重放地理位置预授权(新 origin 弹窗不再卡流程;
     // connect 模式接管用户浏览器不干预;fail-open)。new_tab 派生页的跨站
     // 场景由 `--deny-permission-prompts` 兜底瞬时拒绝,不会挂起。
@@ -785,7 +799,13 @@ async fn act_history(id: &str, back: bool) -> std::result::Result<Value, String>
     // 第 140 轮:300ms→120ms —— history API 异步生效但 popstate 在 100ms 内
     // 必达,后续 inspect 的等待语义由调用方自行保证。
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    Ok(json!({"nav": if back {"back"} else {"forward"}}))
+    // 第 172 轮:history 导航同样要记账(主动导航)+ 登录墙复查。
+    let mut out = json!({"nav": if back {"back"} else {"forward"}});
+    if let Ok(Some(landed)) = page.url().await {
+        out["final_url"] = json!(landed.clone());
+        super::enrich_after_navigation(id, &mut out, &landed, false).await;
+    }
+    Ok(out)
 }
 
 async fn act_reload(id: &str, p: &Value) -> std::result::Result<Value, String> {
@@ -795,7 +815,14 @@ async fn act_reload(id: &str, p: &Value) -> std::result::Result<Value, String> {
         params.ignore_cache = Some(true);
     }
     page.execute(params).await.map_err(|e| e.to_string())?;
-    Ok(json!({"reloaded": true}))
+    // 第 172 轮:reload 后自刷新台账**必须记主动**(否则站点本来就爱 reload 的域
+    // 会把自己的反爬 reload 误记成我们发起的,统计失真)。
+    let mut out = json!({"reloaded": true});
+    if let Ok(Some(landed)) = page.url().await {
+        out["final_url"] = json!(landed.clone());
+        super::enrich_after_navigation(id, &mut out, &landed, false).await;
+    }
+    Ok(out)
 }
 
 async fn act_wait(id: &str, p: &Value) -> std::result::Result<Value, String> {
@@ -1287,6 +1314,34 @@ async fn act_set_highlight(id: &str, p: &Value) -> std::result::Result<Value, St
     crate::agent::browser::BrowserManager::global()
         .set_highlight(id, enabled)
         .await
+}
+
+/// 第 174 轮:反检测档位运行时切换(非侵入式保真 / 侵入式原生化 / off)。
+///
+/// 与页面无关(全局)—— 作用于全部存活页面,故 `page_id` 仅用于保持动作签名一致。
+/// **诚实语义**:升档即时生效;降档只能阻止**新文档**注入,已在旧文档执行过的覆写
+/// 无法回退(被改写的原生对象没有"还原"这个动作),响应据此回报,不假装已还原。
+async fn act_set_stealth(p: &Value) -> std::result::Result<Value, String> {
+    use crate::agent::stealth::StealthMode;
+    let raw = p.get("mode").or_else(|| p.get("stealth"));
+    let Some(v) = raw else {
+        return Err("set_stealth 需要 mode(fidelity=非侵入式 / hardened=侵入式 / off)".to_string());
+    };
+    let Some(mode) = StealthMode::from_value(v) else {
+        return Err(format!(
+            "set_stealth 取值非法:{v}(应为 fidelity / hardened / off,或布尔)"
+        ));
+    };
+    let mgr = crate::agent::browser::BrowserManager::global();
+    let affected = mgr.set_stealth(mode).await;
+    let mut out = crate::agent::stealth::status_json(mode);
+    out["affected_pages"] = json!(affected);
+    out["note"] = json!(if mode == StealthMode::Off {
+        "已切到 off:后续新文档不再注入任何脚本;当前文档里已执行的覆写无法回退(需 close 后重开页面才彻底干净)"
+    } else {
+        "档位已生效:对全部存活页面重挂脚本(同档重复注入由幂等闸拦住,零叠加)"
+    });
+    Ok(out)
 }
 
 
