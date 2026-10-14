@@ -264,6 +264,21 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             }
         }
     }
+    // 第 171 轮:站点导航节奏闸(6004)—— navigate 与 open 同源显式导航,频控
+    // 冷却中拦截 / 最小间隔透明补齐(语义与逃生口见 browser_pace 模块头;
+    // 京东 1W 组装机实测:频控命中后无冷却,Agent 连续导航硬闯 8 分钟)。
+    if action == "navigate" {
+        if let Some(url) = str_arg(&params, "url") {
+            if let Some(gated) = crate::agent::browser_pace::guard_navigation(
+                url,
+                params.get("force").and_then(Value::as_bool).unwrap_or(false),
+            )
+            .await
+            {
+                return gated;
+            }
+        }
+    }
     // 多窗口并行:`new_window` 在**独立新窗口**打开 params.url 并直接返回新
     // page_id(完整 open 语义)。它完全不操作当前页 —— 输入硬闸(6002)/HITL
     // 挂起闸(4003)/后台闸(6003)/guard 先解后锁对「开新窗口」均无意义,

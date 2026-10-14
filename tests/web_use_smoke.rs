@@ -917,3 +917,86 @@ async fn mcp_web_use_navigate_page_health_smoke() {
         .execute(json!({"action": "close", "page_id": "all"}))
         .await;
 }
+
+/// 第 171 轮:站点导航节奏闸冒烟 —— 用 `[::1]` 独立监听(其它冒烟测试全用
+/// `127.0.0.1`,host_of 折叠后互不共享冷却键,不污染后续用例),验证:
+/// ①频控冷却中 navigate/open 返 **6004**(动作不执行,附 host/remaining_secs);
+/// ②`params.force=true` 逃生口放行;③`force` 放行后页面正常落地。
+#[tokio::test]
+#[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
+async fn mcp_web_use_pace_cooldown_smoke() {
+    use lsm_agent::agent::browser_pace::WebPace;
+    use std::time::Duration;
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    tokio::spawn(async move {
+                        let _ = serve_empty_html(&mut socket).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let cool_url = format!("http://[::1]:{}/", addr.port());
+
+    // 基页(data: URL 无主机,天然不过节奏闸)
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": "data:text/html,<title>pace</title><h1>pace base</h1>"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "open 基页失败: {out}");
+    let page_id = v["data"]["page_id"].as_str().unwrap_or_default().to_string();
+
+    // 标记 [::1] 频控冷却 60s(> 自动等待默认 45s → 走 6004 拦截)
+    WebPace::global().mark_rate_limited_for("::1", Duration::from_secs(60));
+
+    // ① navigate 命中节奏闸
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "navigate",
+            "params": {"url": cool_url}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 6004, "频控冷却中 navigate 应返 6004: {out}");
+    assert_eq!(v["data"]["host"].as_str().unwrap_or_default(), "::1", "host 应为 ::1: {out}");
+    assert!(
+        v["data"]["remaining_secs"].as_i64().unwrap_or(0) > 0,
+        "remaining_secs 应 >0: {out}"
+    );
+
+    // ①' open 同闸(open 全路径共用节奏闸)
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": cool_url}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 6004, "频控冷却中 open 应返 6004: {out}");
+
+    // ② force 逃生口:navigate 放行且真实落地
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "navigate",
+            "params": {"url": cool_url, "force": true}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "force=true 应放行 navigate: {out}");
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}

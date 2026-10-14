@@ -1156,6 +1156,34 @@ fn detect_blockers_matches_common_walls() {
     assert!(clean.is_empty(), "误报:{clean:?}");
 }
 
+/// 第 171 轮:京东频控横幅(实测原文)必须命中 `rate_limited`,且为首条
+/// (阻断表序即优先级);评论类「频繁掉线」噪声不得误报。
+#[test]
+fn detect_blockers_rate_limited_banner() {
+    // 京东 2026-10-14 实测原文(OCR 抓取)
+    let banner = inspect::detect_blockers(
+        "抱歉由于访问频繁导致无法搜索，请稍后再试！\n若长时间无法搜索可[点此反馈]，平台将尽快处理~",
+    );
+    let first = banner.first().expect("频控横幅必须命中");
+    assert_eq!(first["kind"], "rate_limited", "实际:{banner:?}");
+    assert!(first["advice"].as_str().is_some_and(|s| s.contains("冷却")), "advice 必须给冷却指引");
+
+    // 变体:请求/操作频繁
+    let v2 = inspect::detect_blockers("请求过于频繁,请稍后再试");
+    assert!(v2.iter().any(|b| b["kind"] == "rate_limited"), "实际:{v2:?}");
+
+    // 噪声:商品评论里的「频繁」描述不得误报频控
+    let noise = inspect::detect_blockers("用了半个月频繁掉线,偶尔蓝屏,不推荐");
+    assert!(
+        !noise.iter().any(|b| b["kind"] == "rate_limited"),
+        "评论噪声误报:{noise:?}"
+    );
+
+    // 既有风控墙关键词语义不变(访问过于频繁仍归 manual_verify)
+    let wall = inspect::detect_blockers("当前页面异常,访问过于频繁,请刷新或切换账户");
+    assert!(wall.iter().any(|b| b["kind"] == "manual_verify"), "实际:{wall:?}");
+}
+
 /// 第 169 轮:模式表**处置建议**必须进告警载荷(advice 字段)——
 /// 风控墙命中要拿到「不要 reload / request_human 点刷新切换账号 / reuse_existing」
 /// 的专属指引,而不是通用「人工验证挑战(拖拽拼图/滑块)」错位文案(实测京东
@@ -2159,6 +2187,11 @@ fn step_has_blocker_alert_detection() {
     assert!(super::step_has_blocker_alert(&json!({"blocker_alert": null})));
     assert!(!super::step_has_blocker_alert(&json!({"slept_ms": 500})));
     assert!(!super::step_has_blocker_alert(&json!({})));
+    // 第 171 轮:login 关键词命中不中断 —— 频控降级壳页头「你好，请登录」实测
+    // 6 次误中断整批 sequence(登录态在,壳是登出样式);其余验证类仍中断。
+    assert!(!super::step_has_blocker_alert(&json!({"blocker_alert": {"kind": "login"}})));
+    assert!(super::step_has_blocker_alert(&json!({"blocker_alert": {"kind": "manual_verify"}})));
+    assert!(super::step_has_blocker_alert(&json!({"blocker_alert": {"kind": "rate_limited"}})));
 }
 
 #[test]

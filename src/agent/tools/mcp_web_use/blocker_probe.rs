@@ -631,6 +631,56 @@ pub(super) async fn probe_alert(page_id: &str) -> Option<Value> {
     let probe = collect_for_inspect(&page).await;
     let alerts = analyze(&probe);
     let first = alerts.first()?;
+    // 第 171 轮:频控命中即标记同域冷却(与 inspect(blockers) 同源,幂等取更晚
+    // 截止时刻)。京东实测「由于访问频繁导致无法搜索」横幅此前不在模式表,
+    // Agent 命中频控后继续硬闯 8 分钟直到人工终止。
+    let page_host = page
+        .url()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|u| crate::agent::browser_pace::host_of(&u));
+    let first_kind = first
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if alerts
+        .iter()
+        .any(|a| a.get("kind").and_then(Value::as_str) == Some("rate_limited"))
+    {
+        if let Some(h) = &page_host {
+            crate::agent::browser_pace::WebPace::global().mark_rate_limited(h);
+        }
+        // 频控专属载荷:不走 auto-HITL/human_assist(频控不是人工可解的挑战),
+        // 也不进指纹去重(冷却秒数逐次变化且载荷本身很短)。
+        if first_kind == "rate_limited" {
+            let advice = first
+                .get("advice")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut alert = first.clone();
+            if let Some(obj) = alert.as_object_mut() {
+                obj.insert("hint".into(), json!(advice));
+            }
+            let mut out = json!({
+                "blocker_alert": alert,
+                "next_action": "cooldown",
+            });
+            if let Some(h) = &page_host {
+                if let Some(rem) =
+                    crate::agent::browser_pace::WebPace::global().cooldown_remaining_for(h)
+                {
+                    out["cooldown"] = json!({
+                        "host": h,
+                        "remaining_secs": rem.as_secs().max(1),
+                    });
+                }
+            }
+            return Some(out);
+        }
+    }
     let kind = first
         .get("kind")
         .and_then(Value::as_str)
@@ -673,6 +723,19 @@ pub(super) async fn probe_alert(page_id: &str) -> Option<Value> {
     // 第 152 轮:重复告警不再重复长载荷 —— Agent 已经知道该干什么,只回事实
     if repeat_count.is_some() {
         return Some(json!({"blocker_alert": alert}));
+    }
+    // 第 171 轮:登录墙疑似降噪 —— 关键词「请登录」在频控降级壳页头恒在场而
+    // 登录态实际在(京东 list.jd.com 实测 6 次误报,每次误推 request_human),
+    // login 类关键词命中不再附 human_assist、不触发自动弹出;降为
+    // 「先复核登录态」提示,确未登录才由 LLM 显式 request_human(reason=login)。
+    if kind == "login" {
+        return Some(json!({
+            "blocker_alert": alert,
+            "next_action": "verify_login_state",
+            "login_check_hint": "关键词命中「请登录」可能只是频控降级壳的登出样式页头(登录态仍在):\
+先 inspect(dom/elements) 复核真实登录态(如顶部用户名容器/个人中心入口),\
+确未登录再 control(request_human, reason=login) 让人工登录",
+        }));
     }
     // 2026-10-13:**自动弹出(auto-HITL)** —— 首次命中且守卫放行(开关开 / 非
     // sequence 上下文 / hub 无 pending)时直接弹人工介入并等待应答,动作本体已

@@ -13,6 +13,16 @@ use super::control::act_screenshot;
 /// 阻断模式表:(kind, 关键词列表, 处置建议)。
 const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
     (
+        // 第 171 轮:站点频控/限流横幅(京东实测原文「抱歉由于访问频繁导致无法搜索,
+        // 请稍后再试!」——与 manual_verify 组的「访问过于频繁」互不为子串,旧表零命中,
+        // Agent 靠 OCR 偶然看到横幅后仍继续硬闯)。频控**不是人工可解的挑战**,
+        // 不进 HITL:命中即由工具层标记同域冷却(browser_pace),6004 拦截后续导航。
+        "rate_limited",
+        &["访问频繁", "频繁访问", "操作频繁", "请求频繁", "请求过于频繁"],
+        "站点频控/限流:立即停止对该站点连续导航/搜索(高频只会延长封锁);工具层已自动进入\
+冷却(冷却期内同域导航返 6004),先做本地整理/落盘或其它页面工作,冷却后低频重试",
+    ),
+    (
         "manual_verify",
         &[
             // 第 168 轮:站点风控拦截页(实测京东 `.jd-main-risk-fallback`,
@@ -417,6 +427,23 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                 json!({"text": body_text_without_agent_nodes(&page).await, "overlay": null})
             };
             let blockers = super::blocker_probe::analyze(&probe);
+            // 第 171 轮:频控命中即标记同域冷却(拉取式通道与推送探针同源);
+            // 频控不是人工可解的挑战,suggested_action 降为 cooldown,不推
+            // request_human(京东实测:频控横幅被当成登录墙/风控墙反复打扰)。
+            let rate_limited = blockers
+                .iter()
+                .any(|b| b.get("kind").and_then(Value::as_str) == Some("rate_limited"));
+            if rate_limited {
+                if let Some(host) = page
+                    .url()
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|u| crate::agent::browser_pace::host_of(&u))
+                {
+                    crate::agent::browser_pace::WebPace::global().mark_rate_limited(&host);
+                }
+            }
             // 暴露合法 reason 列表:LLM 拿到 blockers 后可直接挑一个去 request_human,
             // 不必反查工具 schema / 文档。新增 reason 时本列表自动跟随常量更新。
             let allowed_reasons: Vec<&'static str> =
@@ -424,50 +451,84 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             let mut out = json!({
                 "blockers": blockers,
                 "blocked": !blockers.is_empty(),
-                "suggested_action": if blockers.is_empty() { "continue" } else { "request_human" },
+                "suggested_action": if blockers.is_empty() {
+                    "continue"
+                } else if rate_limited {
+                    "cooldown"
+                } else {
+                    "request_human"
+                },
                 "available_reasons": allowed_reasons,
             });
             // 第 131 轮:命中阻断时,把「下一步=request_human」的完整载荷(推荐 reason /
             // message / options)一并挂上 —— 原先只有 `suggested_action` 一个裸字符串,
             // 模型仍要自己去猜 reason 与提示文案。
             if out["blocked"].as_bool() == Some(true) {
-                let kind = blockers
+                // 第 171 轮:首条命中为频控时不挂 request_human 载荷(冷却信息已由
+                // browser_pace 掌管,6004 会拦截后续同域导航),只回剩余秒数。
+                let first_kind = blockers
                     .first()
                     .and_then(|b| b.get("kind"))
                     .and_then(Value::as_str)
-                    .filter(|k| super::control::HUMAN_ASSIST_ALLOWED_REASONS.contains(k))
-                    .unwrap_or("manual_verify")
+                    .unwrap_or("")
                     .to_string();
-                let hint = super::human_assist_hint(
-                    &kind,
-                    "页面存在人工阻断(见 data.blockers),请人工完成该步骤后继续",
-                    &super::blocker_probe::HITL_CHALLENGE_OPTIONS,
-                );
-                super::merge_hint(&mut out, hint);
-                // 第 152 轮:挑战子类(拖拽/滑块/点选/文字码)顶层带一份,
-                // LLM 无需解析 evidence 就能挑对 request_human 的 reason。
-                if let Some(first) = blockers.first().and_then(|b| b.as_object()) {
-                    for k in ["challenge_type", "interaction", "needs_browser_action"] {
-                        if let Some(v) = first.get(k) {
-                            out[k.to_string()] = v.clone();
+                if first_kind == "rate_limited" {
+                    if let Some(host) = page
+                        .url()
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|u| crate::agent::browser_pace::host_of(&u))
+                    {
+                        if let Some(rem) =
+                            crate::agent::browser_pace::WebPace::global().cooldown_remaining_for(&host)
+                        {
+                            out["cooldown"] = json!({
+                                "host": host,
+                                "remaining_secs": rem.as_secs().max(1),
+                                "advice": "冷却期内同域导航会被 6004 拦截;先做本地整理/落盘或其它页面工作",
+                            });
                         }
                     }
-                }
-                // 第 144 轮:顺带探测凭证输入区(账号/密码/验证码),把选择器挂进
-                // 响应与人机载荷 —— LLM 可直接把 allow_selectors 传给 request_human
-                // 精准放行(自动档探测不命中时的人工兜底通道);fail-open,探测为空
-                // 不加字段(request_human 自动档还有一次机会)。
-                // 与 request_human 同享跨 frame 精化(跨域 iframe 内输入框的
-                // @rect 精确洞),保证此处给出的清单与自动放行实际生效的一致。
-                let probed = super::unlock_zone::probe_credential_zones_kinds(&page).await;
-                let zones =
-                    super::unlock_zone::enrich_allowlist_with_frame_holes(&page, probed).await;
-                if !zones.is_empty() {
-                    out["credential_zones"] = json!(zones.clone());
-                    if let Some(ha) = out.get_mut("human_assist").and_then(Value::as_object_mut) {
-                        ha.insert("allow_selectors".into(), json!(zones));
+                } else {
+                    let kind = blockers
+                        .first()
+                        .and_then(|b| b.get("kind"))
+                        .and_then(Value::as_str)
+                        .filter(|k| super::control::HUMAN_ASSIST_ALLOWED_REASONS.contains(k))
+                        .unwrap_or("manual_verify")
+                        .to_string();
+                    let hint = super::human_assist_hint(
+                        &kind,
+                        "页面存在人工阻断(见 data.blockers),请人工完成该步骤后继续",
+                        &super::blocker_probe::HITL_CHALLENGE_OPTIONS,
+                    );
+                    super::merge_hint(&mut out, hint);
+                    // 第 152 轮:挑战子类(拖拽/滑块/点选/文字码)顶层带一份,
+                    // LLM 无需解析 evidence 就能挑对 request_human 的 reason。
+                    if let Some(first) = blockers.first().and_then(|b| b.as_object()) {
+                        for k in ["challenge_type", "interaction", "needs_browser_action"] {
+                            if let Some(v) = first.get(k) {
+                                out[k.to_string()] = v.clone();
+                            }
+                        }
                     }
-                }
+                    // 第 144 轮:顺带探测凭证输入区(账号/密码/验证码),把选择器挂进
+                    // 响应与人机载荷 —— LLM 可直接把 allow_selectors 传给 request_human
+                    // 精准放行(自动档探测不命中时的人工兜底通道);fail-open,探测为空
+                    // 不加字段(request_human 自动档还有一次机会)。
+                    // 与 request_human 同享跨 frame 精化(跨域 iframe 内输入框的
+                    // @rect 精确洞),保证此处给出的清单与自动放行实际生效的一致。
+                    let probed = super::unlock_zone::probe_credential_zones_kinds(&page).await;
+                    let zones =
+                        super::unlock_zone::enrich_allowlist_with_frame_holes(&page, probed).await;
+                    if !zones.is_empty() {
+                        out["credential_zones"] = json!(zones.clone());
+                        if let Some(ha) = out.get_mut("human_assist").and_then(Value::as_object_mut) {
+                            ha.insert("allow_selectors".into(), json!(zones));
+                        }
+                    }
+                } // 第 171 轮:else(非频控)分支收口
             }
             Ok(out)
         }
