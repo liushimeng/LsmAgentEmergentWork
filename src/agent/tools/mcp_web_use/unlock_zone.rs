@@ -447,6 +447,9 @@ pub(super) fn spawn_unlock_reassert(
                 if installed {
                     let _ =
                         crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
+                    // 重放的是「人工放行态」:两条栏保持挂起(挂起标志随新文档闭包
+                    // 重置,这里补挂;收口恢复时统一复显,见 hitl_ctl)。
+                    crate::agent::browser_status::set_suspended(&page, true).await;
                     break;
                 }
             }

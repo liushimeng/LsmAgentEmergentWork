@@ -105,6 +105,11 @@ async fn apply_hitl_unlock(
         c
     };
     apply_page_guard(page, &cfg).await.ok()?;
+    // 2026-10-14(天猫 baxia 实测):人工核验期间挂起两条栏 —— 状态栏/进度栏以
+    // z-index 2147483646 叠在挑战蒙层上,把滑块/验证码控件与提示罩死,人工无法
+    // 操作(弹窗「页面已全面解锁」状态行已承担告知职责)。收口恢复管控时一并
+    // 恢复(fail-open:挂起失败不阻断提问)。
+    crate::agent::browser_status::set_suspended(page, true).await;
     Some(crate::agent::tools::mcp_web_use::unlock_zone::spawn_unlock_reassert(
         page.clone(), cfg,
     ))
@@ -431,6 +436,8 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
                     };
                     let _ =
                         crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
+                    // 人工手动「恢复屏蔽」:管控回档,两条栏同步复显(与收口同构)。
+                    crate::agent::browser_status::set_suspended(&page, false).await;
                 }
             });
         })));
@@ -500,6 +507,8 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
                         };
                         let _ =
                             crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
+                        // 侵入式中继收口:管控恢复,两条栏同步复显。
+                        crate::agent::browser_status::set_suspended(&page, false).await;
                     }
                     "down" | "move" | "up" | "tap" => {
                         let rect =
@@ -566,6 +575,8 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
                 None => crate::agent::browser::BrowserManager::global().current_guard().await,
             };
             let _ = crate::agent::browser_overlay::apply_page_guard(&page, &cfg).await;
+            // 人工操作窗口关闭:两条栏复显(挂起点在 apply_hitl_unlock,对称收口)。
+            crate::agent::browser_status::set_suspended(&page, false).await;
         }
     }
     // 焦点租约收口:人工介入结束,键盘焦点归还提问前的前台应用(fail-open)。

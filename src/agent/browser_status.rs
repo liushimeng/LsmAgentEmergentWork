@@ -23,6 +23,16 @@
 //! 命中测试：`pointer-events:none` + z-index 低于 guard 蒙层（2147483646），
 //! 既不挡人工点击，也不影响 partial 盾区（2147483645）与页面元素。
 //!
+//! 两条铁律（2026-10-14 天猫 baxia 实测事故）：
+//! - **只在顶层 frame 渲染**：`addScriptToEvaluateOnNewDocument` 会注入每个新文档（含
+//!   跨域 iframe），baxia 滑块挑战 iframe（~390px 宽）内也长出一条
+//!   `max-width:min(50vw,620px)` 的状态栏，把挑战控件罩死 —— 人工核验窗口被屏蔽、
+//!   滑块没法操作。状态栏与进度栏同样必须 `window.top === window` 门控（REV 2）。
+//! - **HITL 解锁期间挂起**：`request_human(unlock_page=true)` 人工操作期间两条栏
+//!   整体 `set_suspended(true)`（挂起点在 `hitl_ctl::apply_hitl_unlock` 与导航重放
+//!   协程，收口恢复）—— 人工核验期间页面里不该有任何 Agent 视觉元素叠在挑战层上，
+//!   「页面已解锁」等信息由原生 HITL 弹窗承担。
+//!
 //! 设计详案 `docs/MCP_Web_Use/24-屏蔽页面状态栏与进度栏.md`。
 
 use chromiumoxide::Page;
@@ -95,7 +105,10 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
     // `last/events/visible` 全部重置(实测:`set_highlight(false)` 隐藏后又被下一
     // 次注入的实例渲染回来;事件时间线清零)。改成与 guard 同款的版本门:
     // 同版本直接返回(仅补一次 DOM 自愈),高版本才重建。
-    const REV = 1;
+    // REV 2(2026-10-14):状态栏加 `window.top === window` 顶层门 —— 本脚本会注入
+    // 每个新文档(含跨域 iframe),baxia 滑块挑战 iframe 内的状态栏把人工核验控件
+    // 罩死(实测天猫任务);子 frame 一律不渲染任何一条栏。
+    const REV = 2;
     if (window.%NS%StatusRev >= REV) {
         try { if (window.%NS%StatusEnsure) window.%NS%StatusEnsure(); } catch (e) {}
         return;
@@ -137,7 +150,8 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
             }
             try { SH = h.attachShadow ? h.attachShadow({ mode: 'closed' }) : null; } catch (e) { SH = null; }
         }
-        if (!el(STATUS_ID)) {
+        // 顶层门(与下方进度栏同款):子 frame(含跨域挑战 iframe)不渲染状态栏。
+        if (window.top === window && !el(STATUS_ID)) {
             const c = document.createElement('div');
             c.id = STATUS_ID;
             c.setAttribute('data-%NS%agent', '1');
@@ -607,9 +621,29 @@ mod tests {
     #[test]
     fn 注入脚本版本门单实例且带dom自愈入口() {
         let js = render_ns(AGENT_STATUS_JS_TEMPLATE);
-        assert!(js.contains("const REV = 1;"));
+        assert!(js.contains("const REV = 2;"));
         assert!(js.contains("StatusRev >= REV"), "重注入必须走版本门(否则闭包状态被重置)");
         assert!(js.contains("StatusEnsure"), "应暴露 DOM 自愈入口");
+    }
+
+    #[test]
+    fn 两条栏都只在顶层frame渲染() {
+        // 2026-10-14 天猫 baxia 实测:注入脚本会进每个新文档(含跨域挑战 iframe),
+        // 状态栏在小 iframe 里罩死人工核验控件 —— 两条栏都必须有顶层门。
+        let js = render_ns(AGENT_STATUS_JS_TEMPLATE);
+        assert!(
+            js.matches("window.top === window").count() >= 2,
+            "状态栏与进度栏都需要 window.top === window 顶层门"
+        );
+        // 状态栏创建点必须被顶层门包裹(进度栏本就有;逐条核对创建语句)。
+        assert!(
+            js.contains("if (window.top === window && !el(STATUS_ID))"),
+            "状态栏创建必须带顶层门"
+        );
+        assert!(
+            js.contains("if (window.top === window && !el(PROGRESS_ID))"),
+            "进度栏创建必须带顶层门"
+        );
     }
 
     #[test]

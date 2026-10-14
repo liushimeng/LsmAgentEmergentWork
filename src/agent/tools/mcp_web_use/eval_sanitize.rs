@@ -23,6 +23,14 @@
 //! 关键取舍:**超限时不就地丢整块,先裁剪再落盘**。裁剪后的数组仍带着最有价值
 //! 的前若干条完整记录,模型看完 head 就能判断「数据够不够、要不要再用精确路径
 //! eval_js 取子集」,而不是面对一个空信封重新猜一遍。
+//!
+//! ## 2026-10-14:输入侧整形(顶层裸 `return` 自动包裹)
+//!
+//! 本模块只做了「返回值出」的闸门;LLM 的**输入形状**也有一个高频翻车点 —— 写出
+//! `const x=..; return JSON.stringify(x)` 这类顶层裸 `return` 表达式,`Runtime.evaluate`
+//! 是经典脚本环境,顶层 `return` 必然 `SyntaxError: Illegal return statement`
+//! (天猫任务实测 3 次,每次模型自行改写重试烧 1~2 轮迭代 + 一次 60~130s 网关往返)。
+//! [`wrap_bare_toplevel_return`] 在 `eval_js_string` 网关做零成本吸收。
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -55,6 +63,114 @@ fn spill_stem() -> String {
     let seq = SPILL_SEQ
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("laew_web_result_{}_{}", now_millis_safe(), seq)
+}
+
+/// eval_js 输入侧整形:顶层裸 `return` 自动包裹成 IIFE(2026-10-14)。
+///
+/// 背景(天猫任务实测 3 次,`llaew_20261014_122337.log`):LLM 会写出
+/// `const x=..; return JSON.stringify(x)` 这类顶层裸 `return` 表达式;
+/// `Runtime.evaluate` 是经典脚本环境,顶层 `return` 必然
+/// `SyntaxError: Illegal return statement`,模型每次自行改写成 `(()=>{…})()` 重试,
+/// 烧 1~2 轮迭代 + 一次 60~130s 网关往返(其中一次发生在 sequence 步里导致整批
+/// `completed:false`)。
+///
+/// 判定(保守):[`scan_toplevel_keywords`] 逐字符扫描,深度 0(`()[]{}` 配对之外)、
+/// 双侧词法边界完整(前后都不是 `[A-Za-z0-9_$.]`)的 `return` 才算顶层裸 return;
+/// 字符串字面量(`'`/`"`/`` ` ``,含 `\` 转义)与注释(`//`、`/* */`)整体跳过。
+/// 命中且**没有**顶层裸 `await` —— async 包裹会把返回值变成 Promise、改变
+/// `return_by_value` 语义,保守不碰(模型下一轮自纠,实测可自愈)—— 才返回
+/// `(() => { <原文> })()`;其余一律原样返回:IIFE / 函数体内 return / `obj.return`
+/// 属性名 / 字符串与注释里的 return 全部零扰动。
+///
+/// 已知盲区(可忽略):深度 0 的正则字面量含 `return`(如 `/return/.test(s)`)会被
+/// 误判命中 —— 包裹后仍是合法 JS,只是该表达式的值变成 `undefined`,模型下一轮
+/// 自纠;触发频率远低于裸 return 本身。
+pub(super) fn wrap_bare_toplevel_return(js: &str) -> String {
+    let (has_return, has_await) = scan_toplevel_keywords(js);
+    if !has_return || has_await {
+        return js.to_string();
+    }
+    format!("(() => {{ {js} }})()")
+}
+
+/// 深度 0 关键字扫描:返回 (顶层裸 return 在场, 顶层裸 await 在场)。
+///
+/// 不追求完整 JS 词法(正则/模板串 `${}` 简化按字面处理,见上方盲区说明),
+/// 只要求「合法表达式里的 return/await 一定位于某个 `()[]{}` 配对之内」——
+/// 这对所有正常的函数体/IIFE/对象字面量/调用式都成立。
+fn scan_toplevel_keywords(src: &str) -> (bool, bool) {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    let mut depth: i32 = 0;
+    let (mut has_return, mut has_await) = (false, false);
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    while i < n {
+        let c = b[i];
+        match c {
+            b'\'' | b'"' | b'`' => {
+                // 字符串字面量:跳到配对引号(`\` 转义连跳两字符)
+                let quote = c;
+                i += 1;
+                while i < n {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ if depth == 0 && (c == b'r' || c == b'a') => {
+                // 前边界:行首,或前一字符不是词符/`.`(后者排掉 obj.return)
+                let prev_ok = i == 0 || {
+                    let p = b[i - 1];
+                    !is_word(p) && p != b'.'
+                };
+                if prev_ok {
+                    // 后边界:关键字结尾的下一字符不是词符(`myreturn` 不算)
+                    let boundary_after = |len: usize| -> bool {
+                        let j = i + len;
+                        j >= n || !is_word(b[j])
+                    };
+                    if b[i..].starts_with(b"return") && boundary_after(6) {
+                        has_return = true;
+                    }
+                    if b[i..].starts_with(b"await") && boundary_after(5) {
+                        has_await = true;
+                    }
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    (has_return, has_await)
 }
 
 /// eval_js 返回值净化入口。
@@ -290,4 +406,72 @@ pub(super) fn percent_decode(s: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 顶层裸return自动包裹() {
+        assert_eq!(
+            wrap_bare_toplevel_return("return 1+1"),
+            "(() => { return 1+1 })()"
+        );
+        // 多语句 + 换行 + 前导空白:原文原样进 IIFE
+        let multi = "const x=1;\n  return JSON.stringify(x)";
+        assert_eq!(wrap_bare_toplevel_return(multi), format!("(() => {{ {multi} }})()"));
+    }
+
+    #[test]
+    fn IIFE与函数体内return不包裹() {
+        assert_eq!(wrap_bare_toplevel_return("(() => { return 1 })()"), "(() => { return 1 })()");
+        assert_eq!(
+            wrap_bare_toplevel_return("function f(){ return 1 }; f()"),
+            "function f(){ return 1 }; f()"
+        );
+        assert_eq!(
+            wrap_bare_toplevel_return("async function g(){ return await fetch(u) }"),
+            "async function g(){ return await fetch(u) }"
+        );
+    }
+
+    #[test]
+    fn 边界形态不误伤() {
+        // 属性名 / 词中段 / 字符串与模板串 / 注释 / 对象字面量键
+        assert_eq!(wrap_bare_toplevel_return("x.return"), "x.return");
+        assert_eq!(wrap_bare_toplevel_return("myreturn = 1"), "myreturn = 1");
+        assert_eq!(
+            wrap_bare_toplevel_return("var s = 'return 1'; s"),
+            "var s = 'return 1'; s"
+        );
+        assert_eq!(
+            wrap_bare_toplevel_return("var t = `tpl return ${x}`; t"),
+            "var t = `tpl return ${x}`; t"
+        );
+        assert_eq!(
+            wrap_bare_toplevel_return("// return 1\n1+1"),
+            "// return 1\n1+1"
+        );
+        assert_eq!(
+            wrap_bare_toplevel_return("/* return 1 */ 1+1"),
+            "/* return 1 */ 1+1"
+        );
+        assert_eq!(
+            wrap_bare_toplevel_return("JSON.stringify({a:1}).slice(0,2)"),
+            "JSON.stringify({a:1}).slice(0,2)"
+        );
+    }
+
+    #[test]
+    fn 顶层await与return并存不包裹() {
+        // async 包裹会改返回值语义(Promise),保守原样返回让模型自纠
+        let js = "await fetch(u); return 1";
+        assert_eq!(wrap_bare_toplevel_return(js), js);
+        // await 在函数体内不算顶层
+        assert_eq!(
+            wrap_bare_toplevel_return("async ()=>{ await x; return 1 }"),
+            "async ()=>{ await x; return 1 }"
+        );
+    }
 }

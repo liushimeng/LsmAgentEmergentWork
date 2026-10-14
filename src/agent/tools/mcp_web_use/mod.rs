@@ -117,6 +117,14 @@ pub(super) fn target_anchor_guard(url: &str) -> Option<Result<String>> {
             "anchor_evidence": violation.evidence,
             "required_action": "如实报告「目标站点不可达或未指定」并结束本单元;\
                                 禁止改用其它站点、搜索引擎或缓存替代 —— 可以失败,不可以乱跑。",
+            // 2026-10-14(天猫实测):锚点站点的组成部分常落在集团同域(如 tmall.com
+            // 的搜索/登录落地 s.taobao.com / login.taobao.com),显式 navigate 会被
+            // 本守卫拦(防漂移语义不变);合法正路是**由页面自身发起导航**。不指路
+            // 的话模型要花 1~2 轮自己悟出来(实测 Plan 探索期间白烧两轮)。
+            "workaround": "若该 URL 实为锚点站点的组成部分(集团同域搜索/登录跳转,\
+                           如 tmall.com 的搜索落地 s.taobao.com):改走页面内表单提交\
+                           (输入框填词+回车)或点击页面内链接,由页面自身发起导航,\
+                           不经 open/navigate/new_tab;除此之外不得绕行。",
         }),
     ))
 }
@@ -191,7 +199,9 @@ pub(super) async fn eval_js_string(
     // 第 168 轮:模板内 `%NS%` 占位符 → 进程级随机命名空间(隐身,见 browser_ns.rs)。
     // 集中在本网关替换,probe/inspect/page_health 等全部内部模板自动生效;
     // LLM 用户表达式含字面 %NS% 的概率可忽略,误替换也无害。
-    let js = crate::agent::browser_ns::render_ns(js);
+    // 2026-10-14:输入侧整形 —— 顶层裸 `return` 自动包裹成 IIFE(经典脚本环境必然
+    // SyntaxError,实测模型反复翻车;内部模板本就是 IIFE,零扰动)。
+    let js = crate::agent::browser_ns::render_ns(&eval_sanitize::wrap_bare_toplevel_return(js));
     let params = EvaluateParams::builder()
         .expression(js)
         .return_by_value(true)
