@@ -91,6 +91,10 @@ windows = { version = "0.58", features = [
     # 2026-10-13:人工介入弹窗多选收口(选项复选框勾选态读取)
     "Win32_UI_Controls",
     "Win32_System_DataExchange",
+    # 2026-10-14:人工介入弹窗 macOS 风格主题(DWM 标题栏同色/沉浸式深色/圆角
+    # + 注册表 AppsUseLightTheme 浅深外观检测)
+    "Win32_Graphics_Dwm",
+    "Win32_System_Registry",
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage",

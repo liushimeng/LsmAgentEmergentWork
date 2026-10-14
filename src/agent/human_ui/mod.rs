@@ -41,6 +41,10 @@ pub mod dialog_main;
 mod macos_dialog;
 #[cfg(target_os = "windows")]
 mod windows_dialog;
+/// 2026-10-14:Windows 弹窗 macOS 风格主题(观感唯一真源;新弹窗一律接入,
+/// 见 `windows_theme.rs` 模块文档与 docs/MCP_Web_Use/27)。
+#[cfg(target_os = "windows")]
+mod windows_theme;
 
 #[cfg(test)]
 mod tests;

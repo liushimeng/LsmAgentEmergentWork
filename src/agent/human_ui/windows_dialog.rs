@@ -9,6 +9,11 @@
 //! - 2026-10-13:验证码图片区随弹窗验证码功能移除(SS_BITMAP/STM_SETIMAGE/
 //!   image crate 解码链整链删除,零外部进程路径保持);「⛶ 最大化」按钮同步移除
 //!   (系统标题栏保留 WS_MAXIMIZEBOX,WM_SIZE 全量重排天然覆盖);
+//! - 2026-10-14:**macOS 风格主题接入**(`windows_theme.rs` 唯一真源,设计见
+//!   `docs/MCP_Web_Use/27-Windows弹窗macOS风格界面美化.md`):窗口类背景/按钮
+//!   owner-draw/WM_CTLCOLOR*/DWM chrome/每秒进程窗口自遍历全部经主题模块;
+//!   多选项勾选态由 `WinState::opt_checked` 台账单一真源(不再依赖系统勾选态)。
+//!   杀开关 `LAEW_WIN_THEME=off` 回退系统原生观感;
 //! - DPI:保持系统默认虚拟化(布局常量与 macOS 侧同值,见 macos_dialog.rs)。
 
 use std::sync::Mutex;
@@ -17,28 +22,31 @@ use std::time::Instant;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, GetSysColorBrush, HGDIOBJ, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_SWISS, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS,
-    HFONT,
+    CreateFontW, DeleteObject, GetSysColorBrush, HDC, HGDIOBJ, InvalidateRect,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH,
+    FF_SWISS, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS, HFONT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::UI::Controls::{IsDlgButtonChecked, BST_CHECKED};
+// 2026-10-14:owner-draw 自绘(WM_DRAWITEM 载荷 + ODS 状态位);多选项勾选态改由
+// opt_checked 台账单一真源,IsDlgButtonChecked/BST_CHECKED 不再使用。
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HWND_TOPMOST,
+    GetClientRect, GetDlgCtrlID, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HWND_TOPMOST,
     IsDialogMessageW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, BS_AUTOCHECKBOX,
-    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, HMENU, IDC_ARROW, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_SETFONT, WM_SETTEXT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_TOPMOST,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME,
-    WS_VISIBLE, WS_VSCROLL,
+    BS_DEFPUSHBUTTON, BS_OWNERDRAW, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, HMENU, IDC_ARROW, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_CTLCOLOREDIT, WM_DESTROY, WM_DRAWITEM,
+    WM_SETFONT, WM_SETTEXT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD,
+    WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_TABSTOP,
+    WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
 };
 // 2026-10-13(二):侵入式触控板的鼠标/焦点/显示 API(SetCapture/ReleaseCapture/
 // GetFocus 属 KeyboardAndMouse 模块;窗口消息常量属 WindowsAndMessaging)。
@@ -48,6 +56,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::dialog_main::{countdown_text, DialogPayload};
+// 2026-10-14:macOS 风格主题(观感唯一真源;窗口代码只按控件 ID 决定「画什么」)。
+use super::windows_theme::{theme, BtnKind, Surface};
 
 // ---------- 布局常量(与 macos_dialog.rs 保持同值;两平台观感一致) ----------
 // 2026-10-13:底行六键位 = 取消/继续/⏱+2分钟/解除屏蔽·恢复屏蔽(互切)‖ 复制。
@@ -260,6 +270,11 @@ struct WinState {
     guard_unblocked: bool,
     /// 2026-10-13:选项是否多选(BS_AUTOCHECKBOX 复选框组);收口时收集勾选。
     multi_select: bool,
+    /// 2026-10-14:多选项勾选台账(**单一真源**)。macOS 风格主题下选项是 owner-draw
+    /// 开关(不持有系统勾选态),点击在 [`on_command`] 翻转本台账 + 重绘;杀开关 off
+    /// 回退 BS_AUTOCHECKBOX(系统自翻转)时同样翻转本台账 —— 两种模式收口路径
+    /// 完全一致(只读本台账),不存在台账与系统勾选态漂移。
+    opt_checked: Vec<bool>,
     /// 2026-10-13(二):是否处于「侵入式」触控板模式。
     intrusive: bool,
     /// 2026-10-13(二):触控板内是否处于按下拖动中(WM_MOUSEMOVE 只在按下时中继)。
@@ -333,12 +348,48 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if wparam.0 as usize == TIMER_ID {
                 on_tick();
             }
+            // 2026-10-14:每秒自遍历本进程顶层窗口补挂 chrome(复用既有 1s 定时器,
+            // 零新定时器)—— 日后新增窗口即使创建路径忘了接入,最多 1s 后被兜底。
+            super::windows_theme::sweep_process_windows();
             LRESULT(0)
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
             on_command(id);
             LRESULT(0)
+        }
+        // 2026-10-14:owner-draw 自绘入口(所有 BS_OWNERDRAW 控件的 macOS 风格绘制)。
+        WM_DRAWITEM => {
+            on_draw_item(lparam);
+            LRESULT(1) // 已处理(Win32 约定:处理 WM_DRAWITEM 返回 TRUE)
+        }
+        // 2026-10-14:文本类控件配色(标题/时间轴/说明区/输入框);主题关闭时回退
+        // 系统默认(DefWindowProc)。lParam = 子控件句柄,wParam = 其 DC。
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+            if theme().enabled {
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                let child = HWND(lparam.0 as *mut core::ffi::c_void);
+                let ctrl_id = GetDlgCtrlID(child);
+                let surface = if msg == WM_CTLCOLOREDIT {
+                    Surface::Card // 输入框:卡片底 + 主文本色
+                } else {
+                    match ctrl_id {
+                        IDC_TITLE => Surface::Title,
+                        IDC_T1 | IDC_T2 => Surface::Timeline,
+                        IDC_MSG => Surface::Card, // 只读 EDIT 说明区走 WM_CTLCOLORSTATIC
+                        _ => Surface::Timeline,
+                    }
+                };
+                let brush = super::windows_theme::ctl_color(hdc, surface);
+                LRESULT(brush.0 as isize)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+        // 2026-10-14:系统外观/设置变更广播 → 重申本进程全部窗口 chrome。
+        WM_SETTINGCHANGE => {
+            super::windows_theme::sweep_process_windows();
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_CLOSE => {
             // 系统菜单关闭按钮 = 人工取消(与 Esc/「取消」同语义)
@@ -504,6 +555,17 @@ unsafe extern "system" fn pad_wnd_proc(
             println!("{}", super::dialog_main::relay_line(id, "key", 0.0, 0.0, name));
             LRESULT(0)
         }
+        // 2026-10-14:触控板提示 STATIC 的父窗是触控板本身,配色在此处理
+        // (次要文本色 + 卡片底;主题关闭回退系统默认)。
+        WM_CTLCOLORSTATIC => {
+            if theme().enabled {
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                let brush = super::windows_theme::ctl_color(hdc, Surface::CardSecondary);
+                LRESULT(brush.0 as isize)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -654,19 +716,120 @@ fn on_command(id: i32) {
         // 2026-10-13(二):「🎮 侵入式/⏹ 退出侵入式」互切(触控板物理输入中继)。
         IDC_INTRUSIVE => relay_toggle(),
         IDC_COPY => copy_info(),
-        // 2026-10-13:多选模式选项是 BS_AUTOCHECKBOX(点击系统自翻转,不收口,
-        // 收口动作 = 「继续」收集勾选);单选保持 push button 点击即应答。
+        // 2026-10-13:多选模式选项点击只翻转勾选态(不收口,收口动作 = 「继续」收集
+        // 勾选);单选保持 push button 点击即应答。
+        // 2026-10-14:勾选态由 opt_checked 台账单一真源 —— 主题开启时选项是
+        // owner-draw macOS 开关(点击翻转台账 + 重绘);杀开关 off 时系统
+        // BS_AUTOCHECKBOX 自翻转,台账同步翻转,收口路径两种模式完全一致。
         _ if id >= IDC_OPT_BASE => {
-            let multi = {
-                let guard = state();
-                guard.as_ref().map(|st| st.multi_select).unwrap_or(false)
+            let (is_multi, flip_target) = {
+                let mut guard = state();
+                let Some(st) = guard.as_mut() else { return };
+                if st.done {
+                    return;
+                }
+                let mut flip_target = None;
+                if st.multi_select {
+                    let idx = (id - IDC_OPT_BASE) as usize;
+                    if idx < st.opts.len() && idx < st.opt_checked.len() {
+                        st.opt_checked[idx] = !st.opt_checked[idx];
+                        flip_target = Some(st.opts[idx]);
+                    }
+                }
+                (st.multi_select, flip_target)
             };
-            if !multi {
+            if is_multi {
+                if theme().enabled {
+                    if let Some(option_hwnd) = flip_target {
+                        // SAFETY:option_hwnd 是本弹窗子控件句柄,STATE 生命周期内有效。
+                        let _ = unsafe { InvalidateRect(option_hwnd, None, true) };
+                    }
+                }
+            } else {
                 finish("answer", (id - IDC_OPT_BASE) as i64);
             }
         }
         _ => {}
     }
+}
+
+/// 2026-10-14:WM_DRAWITEM 分发 —— 所有 owner-draw 控件的 macOS 风格自绘入口。
+/// 图元绘制/配色在 [`super::windows_theme`];此处只按控件 ID 决定「画什么」:
+/// 继续=主按钮,取消/延长/管控/侵入式/复制=次按钮,单选选项=次按钮整行,
+/// 多选选项=macOS 开关行(勾选态读台账)。
+unsafe fn on_draw_item(lparam: LPARAM) {
+    if lparam.0 == 0 {
+        return;
+    }
+    let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+    if dis.hDC.0.is_null() || dis.hwndItem.0.is_null() {
+        return;
+    }
+    // ODS_* 是 ODS_FLAGS(u32 newtype)——按裸值比较,避免类型包装噪声。
+    let pressed = dis.itemState.0 & ODS_SELECTED.0 != 0;
+    let hot = dis.itemState.0 & ODS_HOTLIGHT.0 != 0;
+    let focused = dis.itemState.0 & ODS_FOCUS.0 != 0;
+    let text = window_text(dis.hwndItem);
+    let ctrl_id = dis.CtlID as i32;
+    match ctrl_id {
+        IDOK_ID => super::windows_theme::draw_button(
+            dis.hDC,
+            &dis.rcItem,
+            &text,
+            BtnKind::Primary,
+            pressed,
+            hot,
+            focused,
+        ),
+        IDCANCEL_ID | IDC_EXTEND | IDC_GUARD | IDC_INTRUSIVE | IDC_COPY => {
+            super::windows_theme::draw_button(
+                dis.hDC,
+                &dis.rcItem,
+                &text,
+                BtnKind::Secondary,
+                pressed,
+                hot,
+                focused,
+            )
+        }
+        other if other >= IDC_OPT_BASE => {
+            let (multi_select, checked) = {
+                let guard = state();
+                let idx = (other - IDC_OPT_BASE) as usize;
+                guard
+                    .as_ref()
+                    .map(|st| {
+                        (st.multi_select, st.opt_checked.get(idx).copied().unwrap_or(false))
+                    })
+                    .unwrap_or((false, false))
+            };
+            if multi_select {
+                super::windows_theme::draw_switch_row(dis.hDC, &dis.rcItem, &text, checked, focused);
+            } else {
+                super::windows_theme::draw_button(
+                    dis.hDC,
+                    &dis.rcItem,
+                    &text,
+                    BtnKind::Secondary,
+                    pressed,
+                    hot,
+                    focused,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 控件当前窗口文本(自绘用快照;与 [`read_input`] 无关)。
+unsafe fn window_text(hwnd: HWND) -> String {
+    let len = GetWindowTextLengthW(hwnd);
+    if len <= 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; len as usize + 1];
+    let n = GetWindowTextW(hwnd, &mut buf);
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
 /// 第 145 轮:「⏱ +2分钟」延长等待 —— 本地 `timeout_ms += EXTEND_STEP_MS`(总等待
@@ -765,12 +928,15 @@ fn finish(kind: &str, tag: i64) {
             if !typed.is_empty() {
                 ("answer".to_string(), typed)
             } else if st.multi_select {
-                // 2026-10-13:多选收口 —— 按控件 ID 收集全部勾选(空勾选回退选项 1 交棒)。
-                let picked: Vec<usize> = (0..st.opts.len() as i32)
-                    .filter(|&i| unsafe {
-                        IsDlgButtonChecked(st.hwnd, IDC_OPT_BASE + i) == BST_CHECKED.0
-                    })
-                    .map(|i| i as usize)
+                // 2026-10-13:多选收口 —— 收集全部勾选(空勾选回退选项 1 交棒)。
+                // 2026-10-14:勾选态读 opt_checked 台账(单一真源;主题开启的
+                // owner-draw 开关与杀开关 off 的 BS_AUTOCHECKBOX 两种模式同源)。
+                let picked: Vec<usize> = st
+                    .opt_checked
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &checked)| checked)
+                    .map(|(idx, _)| idx)
                     .collect();
                 let joined = super::dialog_main::join_multi_answer(&st.options, &picked);
                 (
@@ -849,6 +1015,8 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         Ok(h) => windows::Win32::Foundation::HINSTANCE(h.0),
         Err(_) => return ("error".into(), "GetModuleHandleW 失败".into()),
     };
+    // 2026-10-14:主题在类注册前初始化(背景刷取自主题;进程生命周期常驻)。
+    let ui_theme = theme();
     let class = to_wide(CLASS_NAME);
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -858,7 +1026,12 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         lpszClassName: PCWSTR(class.as_ptr()),
         hCursor: LoadCursorW(windows::Win32::Foundation::HINSTANCE::default(), IDC_ARROW)
             .unwrap_or_default(),
-        hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+        // 2026-10-14:macOS 窗口灰底(浅 #F2F2F7 / 深 #1E1E20);杀开关 off 回退系统色。
+        hbrBackground: if ui_theme.enabled {
+            ui_theme.bg_brush
+        } else {
+            GetSysColorBrush(COLOR_WINDOW)
+        },
         ..Default::default()
     };
     if RegisterClassExW(&wc) == 0 {
@@ -892,6 +1065,9 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     ) else {
         return ("error".into(), "窗口创建失败(可能无桌面会话)".into());
     };
+    // 2026-10-14:窗口级 chrome(标题栏与客户区同色/沉浸式深色/Win11 圆角;
+    // 每秒 WM_TIMER 的自遍历 sweep 兜底重申,幂等)。
+    super::windows_theme::apply_window_chrome(hwnd);
 
     // ---- 字体与控件 ----
     let font_normal = make_font(FW_NORMAL.0 as i32);
@@ -967,6 +1143,8 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     let copy = create_control(hwnd, hinst, "BUTTON", COPY_BTN_TITLE, style_button(false), IDC_COPY, font_normal);
 
     // ---- 2026-10-13(二):侵入式触控板(独立窗口类;缺省隐藏,进入侵入式才显示) ----
+    // 2026-10-14:主题启用时触控板 = 卡片观感(卡片底刷 + 无边框,与说明区一致);
+    // 杀开关 off 回退系统白底 + WS_BORDER。
     let pad_class = to_wide(PAD_CLASS_NAME);
     let pad_wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -976,15 +1154,24 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         lpszClassName: PCWSTR(pad_class.as_ptr()),
         hCursor: LoadCursorW(windows::Win32::Foundation::HINSTANCE::default(), IDC_ARROW)
             .unwrap_or_default(),
-        hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+        hbrBackground: if ui_theme.enabled {
+            ui_theme.card_brush
+        } else {
+            GetSysColorBrush(COLOR_WINDOW)
+        },
         ..Default::default()
     };
     let _ = RegisterClassExW(&pad_wc);
+    let pad_style = if ui_theme.enabled {
+        WINDOW_STYLE(WS_CHILD.0)
+    } else {
+        WINDOW_STYLE((WS_CHILD.0 | WS_BORDER.0) as u32)
+    };
     let pad = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         PCWSTR(pad_class.as_ptr()),
         PCWSTR::null(),
-        WINDOW_STYLE((WS_CHILD.0 | WS_BORDER.0) as u32),
+        pad_style,
         0,
         0,
         10,
@@ -1037,6 +1224,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         intrusive: false,
         pad_down: false,
         multi_select: p.multi_select,
+        opt_checked: vec![false; p.options.len()],
         started: Instant::now(),
         timeout_ms: p.timeout_ms,
         done: false,
@@ -1063,6 +1251,9 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     );
     let _ = SetForegroundWindow(hwnd);
     let _ = SetFocus(input); // 输入框初始焦点
+    // 2026-10-14:显示后自遍历本进程全部顶层窗口补挂 chrome(创建点单点已挂,
+    // 此处为统一入口的幂等重申;此后每秒 WM_TIMER 持续兜底)。
+    super::windows_theme::sweep_process_windows();
 
     // ---- 消息循环(IsDialogMessage:Tab/Enter/Esc 标准路由) ----
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
@@ -1111,18 +1302,28 @@ fn style_msg_edit() -> WINDOW_STYLE {
 fn style_input_edit() -> WINDOW_STYLE {
     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32)
 }
+/// 按钮样式:2026-10-14 主题启用时追加 `BS_OWNERDRAW`(macOS 风格自绘,
+/// WM_DRAWITEM → windows_theme::draw_button);杀开关 off 保持系统原生按钮。
 fn style_button(default: bool) -> WINDOW_STYLE {
-    let base = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
+    let mut base = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
     if default {
-        base | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32)
-    } else {
-        base
+        base |= WINDOW_STYLE(BS_DEFPUSHBUTTON as u32);
     }
+    if theme().enabled {
+        base |= WINDOW_STYLE(BS_OWNERDRAW as u32);
+    }
+    base
 }
 
-/// 2026-10-13:多选模式选项复选框(BS_AUTOCHECKBOX,系统自动翻转勾选态)。
+/// 多选模式选项样式:2026-10-14 主题启用时为 owner-draw macOS 开关(勾选态由
+/// opt_checked 台账记账);杀开关 off 回退 BS_AUTOCHECKBOX(系统自翻转)。
 fn style_check_option() -> WINDOW_STYLE {
-    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32)
+    let base = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+    if theme().enabled {
+        base | WINDOW_STYLE(BS_OWNERDRAW as u32)
+    } else {
+        base | WINDOW_STYLE(BS_AUTOCHECKBOX as u32)
+    }
 }
 
 unsafe fn create_control(
