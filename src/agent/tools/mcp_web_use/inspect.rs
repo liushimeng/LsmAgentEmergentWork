@@ -581,7 +581,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             {
                 out["note"] = json!(note);
                 out["required_action"] = json!(
-                    "control(scroll_to, params={position:'bottom'}) 或 control(auto_follow, params={enabled:true})"
+                    "control(scroll_to_text, params={text:'评价'}) 或 control(scroll, params={delta_y:2000}) 或 control(auto_follow, params={enabled:true})"
                 );
             }
             Ok(out)

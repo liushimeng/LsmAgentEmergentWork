@@ -317,12 +317,15 @@ fn parameters_control_action_enum_complete() {
         "bring_to_front",
         // 多窗口并行(双站同时工作):new_window(独立新窗口打开)
         "new_window",
+        // 文本定位滚动:scroll_to_text(按可见文本滚到语义区块)
+        "scroll_to_text",
     ] {
         assert!(names.contains(required), "control_action 枚举缺失 {required}");
     }
     // 第 143 轮 set_guard 使枚举 40 → 41;第 152 轮 auto_follow 使 41 → 42;第 158 轮 select_dropdown 使 42 → 43;
-    // 多标签页治理 bring_to_front 使 43 → 44;多窗口并行 new_window 使 44 → 45
-    assert_eq!(names.len(), 45, "control_action 应为 45 个,实际 {names:?}");
+    // 多标签页治理 bring_to_front 使 43 → 44;多窗口并行 new_window 使 44 → 45;
+    // 文本定位滚动 scroll_to_text 使 45 → 46
+    assert_eq!(names.len(), 46, "control_action 应为 46 个,实际 {names:?}");
 }
 
 #[test]

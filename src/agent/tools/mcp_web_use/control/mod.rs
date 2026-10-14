@@ -22,7 +22,8 @@ use super::guard_ctl::{
 // 第 155 轮:滚动 / 视口 / 自动跟随一族拆分至 follow_ctl.rs(control.rs 已越
 // 1800 行硬线),机械搬移零改写(visibility_note 接线第 155 轮新签名)。
 use super::follow_ctl::{
-    act_auto_follow, act_scroll, act_scroll_to, act_set_viewport, act_sync_viewport,
+    act_auto_follow, act_scroll, act_scroll_to, act_scroll_to_text, act_set_viewport,
+    act_sync_viewport,
 };
 
 // 第 164 轮:select_option / select_dropdown / pick_element_js 拆分至 form_ctl.rs
@@ -329,6 +330,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "hover" => act_hover(id, &params).await,
         "scroll" => act_scroll(id, &params).await,
         "scroll_to" => act_scroll_to(id, &params).await,
+        // 文本定位滚动:语义区块(评论区/规格参数)直达,免 inspect 往返
+        "scroll_to_text" => act_scroll_to_text(id, &params).await,
         "key_press" => super::input_ctl::act_key_press(id, &params).await,
         "press_sequence" => super::input_ctl::act_press_sequence(id, &params).await,
         "input_text" => super::input_ctl::act_input_text(id, &params).await,

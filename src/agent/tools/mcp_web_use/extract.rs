@@ -63,6 +63,12 @@ pub(super) struct FilterSpec {
     pub until: Option<String>,
     /// `field:asc` / `field:desc`
     pub sort: Option<String>,
+    /// 数值区间过滤的字段名;`None` = 第一条命名字段
+    pub numeric_field: Option<String>,
+    /// 数值闭区间下界(从字段文本抽取的第一个数值)
+    pub numeric_min: Option<f64>,
+    /// 数值闭区间上界
+    pub numeric_max: Option<f64>,
     /// 过滤后再截一刀
     pub limit_after_filter: Option<usize>,
 }
@@ -207,6 +213,20 @@ pub(super) fn parse_filter(v: Option<&Value>) -> FilterSpec {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        numeric_field: obj
+            .get("numeric")
+            .and_then(|n| n.get("field"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        numeric_min: obj
+            .get("numeric")
+            .and_then(|n| n.get("min"))
+            .and_then(Value::as_f64),
+        numeric_max: obj
+            .get("numeric")
+            .and_then(|n| n.get("max"))
+            .and_then(Value::as_f64),
         limit_after_filter: obj
             .get("limit_after_filter")
             .and_then(Value::as_u64)
@@ -257,6 +277,7 @@ pub(super) fn build_js(
     const FIELDS = {fields_js};
     const KW = {kw}, MATCH_ALL = {match_all}, KW_FIELDS = {kw_fields};
     const TIME_FIELD = {time_field}, SINCE_RAW = {since}, UNTIL_RAW = {until}, SORT = {sort};
+    const NUM_FIELD = {num_field}, NUM_MIN = {num_min}, NUM_MAX = {num_max};
 
     // 时间边界按**页面本地时区**换算(页面上显示的发布时间就是本地墙上时钟)
     const toMs = (b) => {{
@@ -297,6 +318,15 @@ pub(super) fn build_js(
            + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
     }};
     const flat = (s) => String(s === null || s === undefined ? '' : s).replace(/\s+/g, ' ').trim();
+    // 通用数值抽取:从字段文本里抓**第一个数值**(如 "¥10,999.00" / "32G(32)" /
+    // "销量 1.2万" 里取 1.2 —— 站点把「万」写成单位时按原值计,万位换算由模型按语境判断);
+    // 千分位逗号剥离;解析失败返回 null。
+    const parseNum = (s) => {{
+      const m = flat(s).match(/-?\d[\d,]*\.?\d*/);
+      if (!m) return null;
+      const n = parseFloat(m[0].replace(/,/g, ''));
+      return isNaN(n) ? null : n;
+    }};
 
     const roots = document.querySelectorAll(ITEM_SEL);
     let scanned = 0, dropped_required = 0, truncated = false;
@@ -332,6 +362,21 @@ pub(super) fn build_js(
       }});
     }}
 
+    // 数值区间过滤(通用:价格/销量/库存等任何含数字的字段)。
+    // 解析不出数值的条目**保留**(fail-open,防「一个字段格式异常 → 整页数据静默清空」),
+    // 由 unparsed_numeric_fields 告知模型再决定。
+    let unparsed_numeric_fields = 0;
+    if (NUM_MIN !== null || NUM_MAX !== null) {{
+      const numName = NUM_FIELD || (FIELDS.length ? FIELDS[0].name : '');
+      items = items.filter((it) => {{
+        const n = parseNum(it[numName]);
+        if (n === null) {{ unparsed_numeric_fields++; return true; }}
+        if (NUM_MIN !== null && n < NUM_MIN) return false;
+        if (NUM_MAX !== null && n > NUM_MAX) return false;
+        return true;
+      }});
+    }}
+
     // 时间窗过滤 + 归一化(time_range 只统计**命中窗口**的条目,与 hint 文案一致)
     let unparsed_time_fields = 0, minMs = null, maxMs = null;
     if (TIME_FIELD) {{
@@ -359,6 +404,10 @@ pub(super) fn build_js(
           if (av === null) av = 0; if (bv === null) bv = 0;
           return desc ? bv - av : av - bv;
         }}
+        // 时间字段走时间戳;其余字段**能解析成数值则按数值比较**(根治 "999" > "1299"
+        // 的字典序反序,价格/销量/评分排序因此可用),都解析不出才回退字典序。
+        const na = parseNum(a[key]), nb = parseNum(b[key]);
+        if (na !== null && nb !== null) return desc ? nb - na : na - nb;
         av = flat(av).toLowerCase(); bv = flat(bv).toLowerCase();
         return desc ? (bv < av ? -1 : bv > av ? 1 : 0) : (av < bv ? -1 : av > bv ? 1 : 0);
       }});
@@ -375,6 +424,7 @@ pub(super) fn build_js(
       dropped_required: dropped_required,
       matched_before_filter: matched_before_filter,
       unparsed_time_fields: unparsed_time_fields,
+      unparsed_numeric_fields: unparsed_numeric_fields,
       time_range: minMs === null ? null : {{ min: fmtLocal(minMs), max: fmtLocal(maxMs) }},
       field_names: FIELDS.map(f => f.name).concat(['__url']),
       hostname: window.location.hostname
@@ -395,6 +445,15 @@ pub(super) fn build_js(
         since = bound_js_literal(since_bound),
         until = bound_js_literal(until_bound),
         sort = js_str(filter.sort.as_deref().unwrap_or("")),
+        num_field = js_str(filter.numeric_field.as_deref().unwrap_or("")),
+        num_min = filter
+            .numeric_min
+            .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "null".into()))
+            .unwrap_or_else(|| "null".into()),
+        num_max = filter
+            .numeric_max
+            .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "null".into()))
+            .unwrap_or_else(|| "null".into()),
     )
 }
 
@@ -578,6 +637,19 @@ fn build_hints(out: &Value, fields: &[FieldSpec], filter: &FilterSpec) -> Vec<St
             }
         }
     }
+    if filter.numeric_min.is_some() || filter.numeric_max.is_some() {
+        let unparsed = out
+            .get("unparsed_numeric_fields")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if unparsed > 0 {
+            hints.push(format!(
+                "有 {unparsed} 条目的数值字段解析不出数字(可能是「1.2万」这类带单位写法)而未被筛掉;若该字段决定你的筛选,先用 inspect(dom) 看真实格式,必要时改 fields 里的 attr 或把区间放宽",
+            ));
+        } else {
+            hints.push("数值区间已生效(数值抽取自字段文本中的第一个数字)".to_string());
+        }
+    }
     if fields.len() == 1 && fields[0].selector.is_none() {
         hints.push(
             "当前是通用投影(只有 text + __url);按本页实际结构补 params.fields(如 {title:{selector:\"h3 a\",required:true},time:{selector:\"time\",attr:\"datetime\"}})再抽一次更准"
@@ -633,4 +705,46 @@ async fn run_probe(page: &chromiumoxide::Page) -> std::result::Result<Value, Str
         return Err(format!("extract(probe) 页面内脚本异常: {err}"));
     }
     Ok(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_filter_解析与注入() {
+        // 参数形态:filter.numeric{field?,min?,max?}
+        let v = json!({"numeric": {"field": "price", "min": 8000, "max": 13000}});
+        let f = parse_filter(Some(&v));
+        assert_eq!(f.numeric_field.as_deref(), Some("price"));
+        assert_eq!(f.numeric_min, Some(8000.0));
+        assert_eq!(f.numeric_max, Some(13000.0));
+        assert!(f.keywords.is_empty() && f.time_field.is_none());
+
+        // 缺省形态:不传 numeric → 三个字段都是 None,build_js 注入 null
+        let f2 = parse_filter(None);
+        assert!(f2.numeric_field.is_none() && f2.numeric_min.is_none() && f2.numeric_max.is_none());
+
+        // build_js:数值三常量 + 区间过滤段都在,且数值以字面量注入(防注入)
+        let js = build_js(".item", "a", &[], &f, 100, 50);
+        assert!(js.contains("\"price\""), "NUM_FIELD 注入字段名");
+        assert!(js.contains("NUM_MIN"), "NUM_MIN 常量存在");
+        assert!(js.contains("NUM_MAX"), "NUM_MAX 常量存在");
+        assert!(js.contains("parseNum"), "数值抽取函数存在");
+        assert!(js.contains("unparsed_numeric_fields"), "解析失败计数存在");
+    }
+
+    #[test]
+    fn 无filter_时脚本不含数值段() {
+        let js = build_js(".item", "a", &[], &FilterSpec::default(), 100, 50);
+        assert!(!js.contains("NUM_MIN !== null"));
+    }
+
+    #[test]
+    fn 时间窗参数解析不变() {
+        let v = json!({"time_field": "time", "since": "3小时前"});
+        let f = parse_filter(Some(&v));
+        assert_eq!(f.time_field.as_deref(), Some("time"));
+        assert_eq!(f.since.as_deref(), Some("3小时前"));
+    }
 }

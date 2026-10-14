@@ -351,21 +351,30 @@ async fn js_set_text(page: &chromiumoxide::Page, sel: &str, text: &str) -> std::
     readback(page, sel, text).await
 }
 
-/// sendkeys 级别:find_element + click 聚焦 + type_str 真实键事件。
+/// 输入前清空既有值(fail-open):降级键入路径是**追加**语义,若输入框里已有
+/// 旧文本(搜索框历史词、筛选框残留)会拼成「旧词+新词」导致回读永不 matched,
+/// 三级阶梯白烧。JS 原生赋值本身就是整体替换,故只补 sendkeys / human 两条。
+async fn clear_before_typing(page: &chromiumoxide::Page, sel: &str) {
+    let _ = eval_js_string(page, &native_set_js(sel, "''")).await;
+}
+
+/// sendkeys 级别:find_element + click 聚焦 + 清空既有值 + type_str 真实键事件。
 async fn sendkeys_text(page: &chromiumoxide::Page, sel: &str, text: &str) -> std::result::Result<Option<Readback>, String> {
     let el = page.find_element(sel.to_string()).await.map_err(|e| e.to_string())?;
     el.click().await.map_err(|e| e.to_string())?;
+    clear_before_typing(page, sel).await;
     el.type_str(text.to_string()).await.map_err(|e| e.to_string())?;
     readback(page, sel, text).await
 }
 
-/// human 级别:click 聚焦 + 逐字 Char 事件 + 50~200ms 随机间隔(类真实键入)。
+/// human 级别:click 聚焦 + 清空既有值 + 逐字 Char 事件 + 50~200ms 随机间隔(类真实键入)。
 async fn human_text(page: &chromiumoxide::Page, sel: &str, text: &str) -> std::result::Result<Option<Readback>, String> {
     if let Ok(el) = page.find_element(sel.to_string()).await {
         let _ = el.click().await;
     } else {
         return Ok(None);
     }
+    clear_before_typing(page, sel).await;
     for ch in text.chars() {
         let s = ch.to_string();
         let params = chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventParams::builder()

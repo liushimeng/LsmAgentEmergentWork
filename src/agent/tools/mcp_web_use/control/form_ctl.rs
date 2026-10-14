@@ -471,8 +471,28 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
         json!(null)
     };
 
+    // 契约修正:selected 必须**按事实计算**。旧实现恒为 true,模型会误判
+    // 「筛选已生效」—— 实测天猫筛选浮层「选项点到但面板未收合」时 Agent 反复盲点同一
+    // 选项(toggle 会取消选中),越点越错。
+    // 事实口径(任一即算生效):
+    //   ① 触发器已回显选中值(trigger_after.found=false)
+    //   ② 面板/容器内可见文本里出现了选项原文(回显到了别处,如「价格:5000以上」)
+    //   ③ 点了确认按钮(确认态=用户已收口选择)
+    let trigger_echoed = trigger_text.is_some()
+        && trigger_after
+            .as_object()
+            .and_then(|o| o.get("found"))
+            .and_then(Value::as_bool)
+            .map(|found| !found)
+            .unwrap_or(false);
+    let panel_echoed = !option_text.is_empty()
+        && value_after
+            .split_whitespace()
+            .any(|w| w.contains(&option_text));
+    let selected = trigger_echoed || panel_echoed || confirm_clicked;
+
     Ok(json!({
-        "selected": true,
+        "selected": selected,
         "option_text": option_text,
         "cascader_text": cascader_text,
         "trigger_clicked": trigger_clicked,
@@ -481,7 +501,7 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
         "confirm_text": confirm_text,
         "trigger_after": trigger_after,
         "value_after": value_after,
-        "applied_hint": "trigger_after.found=false 表示触发器文本已变化(多已回显选中值);仍为 true 且筛选未生效时,检查是否需切换排序/二次确认,勿对同一选项重复盲点(toggle 会取消选中)",
+        "applied_hint": "selected 为事实判定:触发器已回显选中值(trigger_after.found=false)、面板/容器文本回显了选项原文、或已点确认按钮,任一成立即 true;selected=false 说明筛选**未生效**——不要对同一选项重复盲点(toggle 会取消选中),改换排序/级联第二级,或先 inspect(elements) 看面板是否还开着",
         "mode": "custom_dropdown",
     }))
 }
