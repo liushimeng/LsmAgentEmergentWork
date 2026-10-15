@@ -12,7 +12,7 @@ use super::*;
 #[allow(unused_imports)]
 pub(super) use super::eval_sanitize::{
     data_ext_from_mime, data_mime, decode_data_url, percent_decode, sanitize_eval_result,
-    EVAL_INLINE_CHAR_LIMIT,
+    shield_toplevel_lexical, wrap_bare_toplevel_return, EVAL_INLINE_CHAR_LIMIT,
 };
 // 第 143 轮:页面管控 control_action(让路辅助 + set_overlay/set_guard)拆分至
 // guard_ctl.rs(control.rs 逼近 1800 行硬线),机械搬移零改写。
@@ -961,48 +961,29 @@ async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> 
         };
     let await_promise = p.get("await_promise").and_then(Value::as_bool).unwrap_or(false);
     use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
-    let evaluate = |expr: String| {
+    let build = |expr: &str| {
         let mut b = EvaluateParams::builder()
             .expression(expr)
             .return_by_value(true);
         if await_promise { b = b.await_promise(true); }
         b.build().map_err(|e| e.to_string())
     };
-    // 第 99 轮:return / 多语句容错 —— 首次按原样评估;失败且表达式不是函数形态时
-    // 自动包 IIFE(async 语境包 async IIFE)重试一次;仍失败则双错误上抛。
-    //
     // 第 135 轮:匿名 `function(){…}` 语句先就地转成 `(function(){…})()` 调用再评估 ——
     // 该形态必然 SyntaxError,旧实现误判为「已是函数形态」而跳过包裹,白烧一轮迭代
     // 还凭空派生一个野页面。
+    //
+    // 2026-10-15:入口统一输入整形(与 `eval_js_string` 网关同语义,此前本路径自拼
+    // EvaluateParams 绕过网关,裸 return / 全局词法泄漏均无人兜底)——
+    // ① 顶层裸 `return` → IIFE 包裹;② 顶层 `const/let/class` 声明 → 块级屏蔽
+    // (全局词法绑定跨 evaluate 常驻,同名再声明必 SyntaxError,实测 `const sleep`
+    // 二次声明白烧一轮迭代)。IIFE/函数体内声明零扰动。
     let expr = if is_anonymous_function_decl(&expr) {
         format!("(\n{expr}\n)()")
     } else {
         expr
     };
-    let first = evaluate(expr.clone());
-    let (built, wrapped, first_err) = match first {
-        Ok(params) => (params, false, None),
-        Err(e1) => {
-            if looks_like_function(&expr) {
-                return Err(format!("eval_js 失败: {}", err_head(&e1)));
-            }
-            let wrapped_expr = if await_promise {
-                format!("(async()=>{{\n{expr}\n}})()")
-            } else {
-                format!("(()=>{{\n{expr}\n}})()")
-            };
-            match evaluate(wrapped_expr) {
-                Ok(params) => (params, true, Some(e1)),
-                Err(e2) => {
-                    return Err(format!(
-                        "eval_js 失败(原始与 IIFE 包裹均失败): ① {} ② {}",
-                        err_head(&e1),
-                        err_head(&e2)
-                    ));
-                }
-            }
-        }
-    };
+    let shaped = wrap_bare_toplevel_return(&expr);
+    let shaped = shield_toplevel_lexical(&shaped);
     // 第 150 轮:evaluate 超时兜底(实测豆包验证弹窗卡死主线程 → 裸 await 卡 56s)。
     // 显式 params.timeout_ms 优先(上限 120s,对齐 wait 的 120s 上限,供页内
     // Promise 轮询等合法长等待);缺省按 await_promise 分档(false=env 默认 30s /
@@ -1018,11 +999,43 @@ async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> 
                 super::eval_timeout_from_env()
             }
         });
-    let v = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), page.evaluate(built))
-        .await
-        .map_err(|_| format!("eval_js 执行超时({timeout_ms}ms): {}", super::EVAL_TIMEOUT_HINT))?
-        .map_err(|e| e.to_string())?;
-    let raw = v.value().cloned().unwrap_or(Value::Null);
+    // 共享截止预算:IIFE 重试只消费剩余时间,不叠加整份预算(最坏情况不翻倍)。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let budget = || {
+        deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_millis(1))
+    };
+    // 2026-10-15:重试从 build 期下沉到求值期 —— 旧实现只在 EvaluateParams::build()
+    // 上判失败,而 build 不解析 JS 语法恒 Ok,「失败自动包 IIFE 重试」从未发生过;
+    // 现在首次 evaluate 真失败才按剩余预算重试(eval_attempt 见文件底部自由函数)。
+    let first_params = build(&shaped).map_err(|e| format!("eval_js 参数构建失败: {e}"))?;
+    let (raw, wrapped, first_err) = match eval_attempt(&page, first_params, budget()).await {
+        Ok(v) => (v, false, None),
+        Err(e1) => {
+            // 函数形态表达式不包 IIFE 重试(IIFE 化会改变函数语义)。
+            if looks_like_function(&shaped) {
+                return Err(format!("eval_js 失败: {}", err_head(&e1)));
+            }
+            let wrapped_expr = if await_promise {
+                format!("(async()=>{{\n{shaped}\n}})()")
+            } else {
+                format!("(()=>{{\n{shaped}\n}})()")
+            };
+            let retry_params = build(&wrapped_expr)
+                .map_err(|e| format!("eval_js 失败(重试包裹构建失败): {e}"))?;
+            match eval_attempt(&page, retry_params, budget()).await {
+                Ok(v) => (v, true, Some(e1)),
+                Err(e2) => {
+                    return Err(format!(
+                        "eval_js 失败(原始与 IIFE 包裹均失败): ① {} ② {}",
+                        err_head(&e1),
+                        err_head(&e2)
+                    ));
+                }
+            }
+        }
+    };
     // 第 99 轮:大结果 / data: URL 自动落盘,防上下文爆炸(实测 140KB 验证码
     // data-url 直灌上下文,还诱发后续工具参数超限被截断)。
     let val = sanitize_eval_result(raw);
@@ -1034,6 +1047,20 @@ async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> 
         }
     }
     Ok(out)
+}
+
+/// eval_js 求值期单次尝试(2026-10-15):带共享预算的超时竞争 + 错误归一。
+/// 超时按 `EVAL_TIMEOUT_HINT` 给处置指引(把模型推回 感知-人工 闭环)。
+async fn eval_attempt(
+    page: &chromiumoxide::Page,
+    params: chromiumoxide::cdp::js_protocol::runtime::EvaluateParams,
+    budget: std::time::Duration,
+) -> std::result::Result<Value, String> {
+    let v = tokio::time::timeout(budget, page.evaluate(params))
+        .await
+        .map_err(|_| format!("eval_js 执行超时({}ms): {}", budget.as_millis(), super::EVAL_TIMEOUT_HINT))?
+        .map_err(|e| e.to_string())?;
+    Ok(v.value().cloned().unwrap_or(Value::Null))
 }
 
 async fn act_set_cookie(id: &str, p: &Value) -> std::result::Result<Value, String> {

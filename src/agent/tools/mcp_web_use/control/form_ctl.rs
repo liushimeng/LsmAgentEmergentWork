@@ -265,6 +265,10 @@ pub(in crate::agent::tools::mcp_web_use) fn confirm_panel_js(scope_sel: Option<&
     format!(
         r#"(() => {{
             const CONFIRM = ['确定', '确认', '完成', '应用', 'OK', 'Ok', 'ok', '保存'];
+            // 2026-10-15:动作型确认按钮(闲鱼实测「查看999+件宝贝」)——选中态已置
+            // 但必须再点面板内动作按钮才把筛选落到 URL;词表型匹配覆盖不到这类
+            // 「查看N件/查看全部」文案,补正则通道(仍受面板状容器约束兜底)。
+            const CONFIRM_RE = [/^查看\s*[\d+]+\s*件/, /^查看全部/, /^(立即查看|去查看)$/];
             const scoped = {scoped};
             const scope = {scope} || document.body;
             const norm = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -281,7 +285,11 @@ pub(in crate::agent::tools::mcp_web_use) fn confirm_panel_js(scope_sel: Option<&
             }};
             const textOf = e => norm(e.textContent);
             const all = [...scope.querySelectorAll('button,a,span,div,li,label,i,p')];
-            const hit = e => CONFIRM.includes(textOf(e)) || CONFIRM.includes(ownText(e));
+            const hit = e => {{
+                const full = textOf(e), own = ownText(e);
+                return CONFIRM.includes(full) || CONFIRM.includes(own) ||
+                    CONFIRM_RE.some(re => re.test(full) || re.test(own));
+            }};
             let cands = all.filter(e => (e.children.length === 0 && hit(e)) || hit(e));
             cands = cands.filter(vis);
             if (!scoped) {{
@@ -352,6 +360,7 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
     // 若先去点触发器,组件库会把已开的面板 toggle 关回去,后续探测全部落空
     // (实测闲鱼区域面板:模型先点开面板,select_dropdown 再点触发器 → 面板关闭)。
     let mut trigger_clicked = false;
+    let mut trigger_rekicked = 0u32;
     let mut clicked_texts: Vec<String> = Vec::new();
     let mut option_ok = false;
     let mut last_diag = String::from("eval 未执行");
@@ -392,8 +401,21 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
         }
 
         // 选项搜索:最多 3 次探测,前两次失败补等待后再搜(容忍面板展开动画/异步渲染)。
+        // 2026-10-15:第 2/3 次探测前先重踢一次触发器 —— 组件库 toggle 语义下首次
+        // 点击可能把已开面板 toggle 关回(实测闲鱼:触发器点击后面板未挂 DOM,
+        // 3 次探测空转直接判失败),重踢一次让面板有机会重新展开;连续两次重踢
+        // 后面板状态与原始点击同相(toggle 两次回原状),不会引入新的抖动。
         for attempt in 0..3u32 {
             if attempt > 0 {
+                if trigger_clicked {
+                    if let Some(tt) = trigger_text {
+                        let js = pick_element_js(tt, None, false);
+                        let result: Value = eval_js_string(&page, &js).await?;
+                        if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                            trigger_rekicked += 1;
+                        }
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             }
             let js = pick_element_js(option_text, scope_sel, true);
@@ -427,7 +449,8 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
                     "select_dropdown: 选项「{option_text}」未找到可见元素（scope={scope_sel:?}，{last_diag}）；{bg_lead}\
                      处置:①先 control(bring_to_front) 确认页面在前台(后台 tab 渲染被节流,下拉面板不渲染);\
                      ②面板可能已收合(组件库常保留 visibility:hidden 的挂载副本)或选项文本不一致——\
-                     先 inspect(info=elements, selector=<面板容器>) 确认选项真实文本与面板状态,或改用 eval_js 直接点击"
+                     先 inspect(info=elements, selector=<面板容器>) 确认选项真实文本与面板状态,或改用 eval_js 直接点击;\
+                     ③级联面板(如省份→城市两级)确认第二级实际选项文本,重试时传 cascader_text 选第二级"
                 ));
             }
         }
@@ -525,6 +548,7 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
         "clicked_texts": clicked_texts,
         "confirm_clicked": confirm_clicked,
         "confirm_text": confirm_text,
+        "trigger_rekicked": trigger_rekicked,
         "trigger_after": trigger_after,
         "value_after": value_after,
         // 2026-10-14:入口自动置前对账(true=本次动作前页面在后台,已自动置前;

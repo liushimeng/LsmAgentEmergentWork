@@ -74,7 +74,7 @@ fn spill_stem() -> String {
 /// 烧 1~2 轮迭代 + 一次 60~130s 网关往返(其中一次发生在 sequence 步里导致整批
 /// `completed:false`)。
 ///
-/// 判定(保守):[`scan_toplevel_keywords`] 逐字符扫描,深度 0(`()[]{}` 配对之外)、
+/// 判定(保守):[`scan_toplevel_flags`] 逐字符扫描,深度 0(`()[]{}` 配对之外)、
 /// 双侧词法边界完整(前后都不是 `[A-Za-z0-9_$.]`)的 `return` 才算顶层裸 return;
 /// 字符串字面量(`'`/`"`/`` ` ``,含 `\` 转义)与注释(`//`、`/* */`)整体跳过。
 /// 命中且**没有**顶层裸 `await` —— async 包裹会把返回值变成 Promise、改变
@@ -86,24 +86,55 @@ fn spill_stem() -> String {
 /// 误判命中 —— 包裹后仍是合法 JS,只是该表达式的值变成 `undefined`,模型下一轮
 /// 自纠;触发频率远低于裸 return 本身。
 pub(super) fn wrap_bare_toplevel_return(js: &str) -> String {
-    let (has_return, has_await) = scan_toplevel_keywords(js);
-    if !has_return || has_await {
+    let scan = scan_toplevel_flags(js);
+    if !scan.has_return || scan.has_await {
         return js.to_string();
     }
     format!("(() => {{ {js} }})()")
 }
 
-/// 深度 0 关键字扫描:返回 (顶层裸 return 在场, 顶层裸 await 在场)。
+/// eval_js 输入侧整形:顶层 `const`/`let`/`class` 声明块级包裹(2026-10-15)。
+///
+/// 背景(闲鱼任务实测,`llaew_20261015_182610.log`):CDP `Runtime.evaluate` 在页面
+/// **全局词法环境**执行,顶层 `const`/`let`/`class` 声明创建的全局词法绑定
+/// **跨 evaluate 调用常驻**——模型给临时变量起名高度趋同(`sleep`/`result`/
+/// `items`/`data`),同名再次声明必然
+/// `SyntaxError: Identifier 'sleep' has already been declared`(实测 iter 3 声明
+/// `const sleep`,iter 5 再声明即炸,模型改写函数形态后成功,白烧 1 轮迭代)。
+///
+/// 处置:检测到顶层词法声明且无顶层裸 `await` 时,整个脚本包进块级作用域
+/// `{ <原文> }`——块级词法不泄漏到全局环境,重复调用互不污染;块完成值 = 最后
+/// 一条语句的值,与未包裹语义一致;`var`/`function` 声明可重复声明,不触发;
+/// 纯对象字面量表达式(无词法关键字)不触发。裸 return 已由
+/// [`wrap_bare_toplevel_return`] 走 IIFE 包裹(自带作用域),两者串联:
+/// has_return → IIFE;仅词法声明 → block。
+pub(super) fn shield_toplevel_lexical(js: &str) -> String {
+    let scan = scan_toplevel_flags(js);
+    if !scan.has_lexical || scan.has_await {
+        return js.to_string();
+    }
+    format!("{{\n{js}\n}}")
+}
+
+/// 顶层标志扫描结果(裸 return / 裸 await / 词法声明)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ToplevelFlags {
+    has_return: bool,
+    has_await: bool,
+    has_lexical: bool,
+}
+
+/// 深度 0 标志扫描:裸 `return` / 裸 `await` / `const`|`let`|`class` 声明。
 ///
 /// 不追求完整 JS 词法(正则/模板串 `${}` 简化按字面处理,见上方盲区说明),
-/// 只要求「合法表达式里的 return/await 一定位于某个 `()[]{}` 配对之内」——
-/// 这对所有正常的函数体/IIFE/对象字面量/调用式都成立。
-fn scan_toplevel_keywords(src: &str) -> (bool, bool) {
+/// 只要求「合法表达式里的关键字一定位于某个 `()[]{}` 配对之内」——
+/// 这对所有正常的函数体/IIFE/对象字面量/调用式/for 循环头都成立。
+fn scan_toplevel_flags(src: &str) -> ToplevelFlags {
     let b = src.as_bytes();
     let n = b.len();
     let mut i = 0usize;
     let mut depth: i32 = 0;
-    let (mut has_return, mut has_await) = (false, false);
+    let mut flags = ToplevelFlags::default();
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
     while i < n {
         let c = b[i];
@@ -144,7 +175,7 @@ fn scan_toplevel_keywords(src: &str) -> (bool, bool) {
                 depth -= 1;
                 i += 1;
             }
-            _ if depth == 0 && (c == b'r' || c == b'a') => {
+            _ if depth == 0 && (c == b'r' || c == b'a' || c == b'c' || c == b'l') => {
                 // 前边界:行首,或前一字符不是词符/`.`(后者排掉 obj.return)
                 let prev_ok = i == 0 || {
                     let p = b[i - 1];
@@ -157,10 +188,19 @@ fn scan_toplevel_keywords(src: &str) -> (bool, bool) {
                         j >= n || !is_word(b[j])
                     };
                     if b[i..].starts_with(b"return") && boundary_after(6) {
-                        has_return = true;
+                        flags.has_return = true;
                     }
                     if b[i..].starts_with(b"await") && boundary_after(5) {
-                        has_await = true;
+                        flags.has_await = true;
+                    }
+                    if b[i..].starts_with(b"const") && boundary_after(5) {
+                        flags.has_lexical = true;
+                    }
+                    if b[i..].starts_with(b"class") && boundary_after(5) {
+                        flags.has_lexical = true;
+                    }
+                    if b[i..].starts_with(b"let") && boundary_after(3) {
+                        flags.has_lexical = true;
                     }
                 }
                 i += 1;
@@ -170,7 +210,7 @@ fn scan_toplevel_keywords(src: &str) -> (bool, bool) {
             }
         }
     }
-    (has_return, has_await)
+    flags
 }
 
 /// eval_js 返回值净化入口。
@@ -473,5 +513,63 @@ mod tests {
             wrap_bare_toplevel_return("async ()=>{ await x; return 1 }"),
             "async ()=>{ await x; return 1 }"
         );
+    }
+
+    #[test]
+    fn 顶层词法声明块级屏蔽() {
+        // 实测事故:iter 3 声明 const sleep,iter 5 再声明 → SyntaxError
+        let js = "const sleep=ms=>new Promise(r=>setTimeout(r,ms)); (async()=>{await sleep(1); return 1})()";
+        assert_eq!(shield_toplevel_lexical(js), format!("{{\n{js}\n}}"));
+        // let / class 同样屏蔽
+        assert_eq!(shield_toplevel_lexical("let a=1; a"), "{\nlet a=1; a\n}");
+        assert_eq!(shield_toplevel_lexical("class Foo{}; Foo"), "{\nclass Foo{}; Foo\n}");
+        // 值语义:块完成值 = 最后一条语句值(与未包裹一致),模型无感
+        assert_eq!(shield_toplevel_lexical("const a=1; a+2"), "{\nconst a=1; a+2\n}");
+    }
+
+    #[test]
+    fn 词法屏蔽不误伤() {
+        // IIFE / 函数体内声明:词法在配对之内,零扰动
+        assert_eq!(
+            shield_toplevel_lexical("(() => { const a=1; return a })()"),
+            "(() => { const a=1; return a })()"
+        );
+        assert_eq!(
+            shield_toplevel_lexical("function f(){ let a=1; return a }; f()"),
+            "function f(){ let a=1; return a }; f()"
+        );
+        // for 循环头 const 在括号内,不算顶层
+        assert_eq!(
+            shield_toplevel_lexical("for (const x of [1]) { console.log(x) }"),
+            "for (const x of [1]) { console.log(x) }"
+        );
+        // 纯表达式 / 对象字面量(无词法关键字)不动
+        assert_eq!(shield_toplevel_lexical("JSON.stringify({a:1})"), "JSON.stringify({a:1})");
+        assert_eq!(shield_toplevel_lexical("({a:1})"), "({a:1})");
+        // 字符串 / 注释里的 const/let 不动
+        assert_eq!(shield_toplevel_lexical("var s='const x=1'; s"), "var s='const x=1'; s");
+        assert_eq!(shield_toplevel_lexical("// let a=1\n1+1"), "// let a=1\n1+1");
+        // 词中段(let-ter / constant)不是关键字
+        assert_eq!(shield_toplevel_lexical("letter + constant"), "letter + constant");
+        // var 可重复声明,不需要屏蔽
+        assert_eq!(shield_toplevel_lexical("var a=1; var a=2; a"), "var a=1; var a=2; a");
+    }
+
+    #[test]
+    fn 顶层await存在时词法屏蔽保守不碰() {
+        // await 在普通块里是 SyntaxError,模型自纠(与裸 return 保守口径一致)
+        let js = "const r = await fetch(u); r";
+        assert_eq!(shield_toplevel_lexical(js), js);
+    }
+
+    #[test]
+    fn 裸return与词法声明串联整形() {
+        // 裸 return 先走 IIFE(自带作用域),词法屏蔽对其零扰动
+        let shaped = wrap_bare_toplevel_return("const x=1; return JSON.stringify(x)");
+        assert_eq!(shield_toplevel_lexical(&shaped), shaped);
+        // 仅词法声明无 return:走 block 包裹
+        let js = "const x=1; JSON.stringify(x)";
+        let shaped = wrap_bare_toplevel_return(js);
+        assert_eq!(shield_toplevel_lexical(&shaped), format!("{{\n{js}\n}}"));
     }
 }

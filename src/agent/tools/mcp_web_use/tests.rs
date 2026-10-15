@@ -2720,6 +2720,18 @@ fn confirm_panel_js_guards_unscoped_click() {
     assert!(scoped.contains("querySelector(\"div.panel\")"), "scope 应注入脚本");
 }
 
+#[test]
+fn confirm_panel_js_covers_action_style_buttons() {
+    // 2026-10-15 闲鱼实测:区域面板选中后必须点「查看999+件宝贝」才把筛选落到
+    // URL,词表型匹配覆盖不到动作型文案,补正则通道。
+    let js = super::control::confirm_panel_js(None);
+    assert!(js.contains("CONFIRM_RE"), "应包含正则确认通道");
+    assert!(js.contains("^查看"), "应匹配「查看N件宝贝」类动作按钮");
+    assert!(js.contains("立即查看"), "应匹配「立即查看/去查看」");
+    // 正则通道仍受面板状容器约束(防误点页面级按钮)
+    assert!(js.contains("position === 'fixed'"), "正则通道不得绕过面板状约束");
+}
+
 // =================== 第 159 轮:注入 JS 语法缺陷回归测试 ===================
 
 /// wait(selector) 脚本必须整体 `(async () => …)()` 包裹。

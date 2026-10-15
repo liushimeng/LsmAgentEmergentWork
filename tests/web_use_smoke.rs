@@ -660,6 +660,77 @@ onclick='document.title=\"far-clicked\"'>F</button></body></html>";
         .await;
 }
 
+/// 2026-10-15:eval_js 顶层词法屏蔽真浏览器验证(闲鱼实测缺陷回归)。
+///
+/// 背景:`Runtime.evaluate` 在全局词法环境执行,顶层 `const` 声明跨调用常驻,
+/// 同名再声明必 `SyntaxError: Identifier 'sleep' has already been declared`
+/// (模型给临时变量起名高度趋同,会话越长越容易踩中)。修复后两次调用应都成功,
+/// 且第二次的全局词法环境不受第一次污染(window 级赋值不受影响)。
+#[tokio::test]
+#[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
+async fn mcp_web_use_eval_js_lexical_shield_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": PAGE}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert!(
+        v["code"] == 0 || v["code"] == 3001,
+        "open 返回码应为 0 或 3001: {out}"
+    );
+    if v["code"] == 3001 {
+        return; // 本机未安装浏览器:信封验证即完成
+    }
+    let page_id = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 第一次:顶层 const 声明(模型高频形态)。
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "eval_js",
+            "params": {"expression": "const sleep = ms => new Promise(r => setTimeout(r, ms)); window.__lex_probe = 41; window.__lex_probe + 1"}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "第一次顶层 const 声明应成功: {out}");
+    assert_eq!(v["data"]["result"], 42, "表达式值应为 42: {out}");
+
+    // 第二次:同名 const 再声明(修复前必 SyntaxError)。
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "eval_js",
+            "params": {"expression": "const sleep = ms => ms; window.__lex_probe + 1"}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "第二次同名 const 再声明不应 SyntaxError: {out}");
+    assert_eq!(v["data"]["result"], 42, "值语义不变: {out}");
+
+    // window 级赋值不受屏蔽影响(块级包裹只挡词法泄漏)。
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control",
+            "page_id": page_id,
+            "control_action": "eval_js",
+            "params": {"expression": "window.__lex_probe"}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["data"]["result"], 41, "window 赋值不受屏蔽影响: {out}");
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}
+
 #[tokio::test]
 #[ignore = "需要本机安装 Chrome/Edge(真浏览器冒烟)"]
 async fn mcp_web_use_multi_window_parallel_smoke() {

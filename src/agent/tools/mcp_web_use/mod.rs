@@ -205,7 +205,11 @@ pub(super) async fn eval_js_string(
     // LLM 用户表达式含字面 %NS% 的概率可忽略,误替换也无害。
     // 2026-10-14:输入侧整形 —— 顶层裸 `return` 自动包裹成 IIFE(经典脚本环境必然
     // SyntaxError,实测模型反复翻车;内部模板本就是 IIFE,零扰动)。
-    let js = crate::agent::browser_ns::render_ns(&eval_sanitize::wrap_bare_toplevel_return(js));
+    // 2026-10-15:二次整形 —— 顶层 `const`/`let`/`class` 声明块级包裹:全局词法
+    // 绑定跨 evaluate 常驻,同名再声明必炸(实测 `const sleep` 二次声明 SyntaxError
+    // 白烧一轮迭代);裸 return 已走 IIFE(自带作用域),此处对剩余形态生效。
+    let shaped = eval_sanitize::wrap_bare_toplevel_return(js);
+    let js = crate::agent::browser_ns::render_ns(&eval_sanitize::shield_toplevel_lexical(&shaped));
     let params = EvaluateParams::builder()
         .expression(js)
         .return_by_value(true)

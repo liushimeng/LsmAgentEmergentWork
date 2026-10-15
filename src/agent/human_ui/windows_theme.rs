@@ -23,8 +23,9 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, GetStockObject, RoundRect,
-    SelectObject, SetBkColor, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, DRAW_TEXT_FORMAT, HBRUSH, HDC, HGDIOBJ, NULL_BRUSH, NULL_PEN, PS_SOLID,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, BACKGROUND_MODE, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, HBRUSH, HDC, HGDIOBJ, NULL_BRUSH,
+    NULL_PEN, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
@@ -340,6 +341,11 @@ pub(super) unsafe fn draw_switch_row(
     if !t.enabled {
         return;
     }
+    // 2026-10-15:行底自绘 —— 此前行底依赖 draw_text_line 的 OPAQUE 擦除副作用
+    // (白色矩形恰好盖住系统默认按钮面);文字改透明模式绘制后该副作用消失,
+    // 行底必须显式填充,否则露出系统默认按钮面(深色板下白字压在浅灰面上
+    // 对比度极差)。填充形态与单选选项行(Secondary 按钮)保持一致。
+    fill_rounded_rect(hdc, rc, corner_radius_for(rc.bottom - rc.top), t.btn_bg, Some(t.btn_border));
     let geom = switch_geometry(rc.bottom - rc.top);
     let track_top = rc.top + (rc.bottom - rc.top - geom.track_h) / 2;
     let track = RECT {
@@ -522,15 +528,26 @@ unsafe fn fill_ellipse(hdc: HDC, rc: &RECT, color: COLORREF) {
     let _ = DeleteObject(HGDIOBJ(brush.0));
 }
 
-/// 单行文本(同色实底,画在刚绘制的控件面上)。
+/// 单行文本(透明背景,画在刚绘制的控件面上)。
+///
+/// 必须 `SetBkMode(TRANSPARENT)`:DC 默认 `OPAQUE` 模式 + 默认背景色纯白,
+/// `DrawTextW` 会先把传入矩形**整个用背景色擦白**再绘制文字 —— 实测 HITL
+/// 弹窗按钮被整矩形刷白、白字白底「看不清」(2026-10-15 人工报障)。自绘场景
+/// 调用处均已先用填充图元铺满控件面,透明模式直接往面上画字即可;画完恢复
+/// 旧模式,不影响同 DC 上的后续 OPAQUE 绘制(如 ctl_color 的实底文本)。
 unsafe fn draw_text_line(hdc: HDC, rc: &RECT, text: &str, color: COLORREF, format: DRAW_TEXT_FORMAT) {
     if text.is_empty() {
         return;
     }
     let mut wide: Vec<u16> = text.encode_utf16().collect();
     SetTextColor(hdc, color);
+    let old_mode = SetBkMode(hdc, TRANSPARENT);
     let mut area = *rc;
     let _ = DrawTextW(hdc, &mut wide, &mut area, format);
+    if old_mode != 0 {
+        // SetBkMode 返回 i32 旧模式,重设需包回 BACKGROUND_MODE。
+        let _ = SetBkMode(hdc, BACKGROUND_MODE(old_mode as u32));
+    }
 }
 
 // ---------- 纯函数单测 ----------
