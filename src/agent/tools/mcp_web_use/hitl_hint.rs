@@ -48,7 +48,7 @@ pub(super) fn looks_like_code_text(answer: &str) -> bool {
 /// - 其它 reason 自由文本 → 按 human_response 内容继续。
 pub(super) fn hitl_answer_hint(reason: &str, answer: &str) -> String {
     if is_option_pick_answer(answer) {
-        "人工点选了选项(如「我已完成人工操作,继续」)。请 inspect 验证页面当前状态后继续流程,不要重复 request_human;登录/人工操作完成后核实状态用 inspect,不要 reload —— 风控敏感站点(京东/天猫系)登录后 reload 会触发风控复核弹「当前页面异常」风控墙".to_string()
+        "人工点选了选项(如「确认我已完成人工操作,交棒」)。请 inspect 验证页面当前状态后继续流程,不要重复 request_human;登录/人工操作完成后核实状态用 inspect,不要 reload —— 风控敏感站点(京东/天猫系)登录后 reload 会触发风控复核弹「当前页面异常」风控墙".to_string()
     } else if matches!(reason, "captcha" | "sms" | "two_factor") {
         if looks_like_code_text(answer) {
             "人工在弹窗输入了验证码/动态码文本(human_response)。请立即用 control(input_text) 把它填入对应输入框并点击提交/登录按钮完成表单,不要仅 inspect 观望".to_string()
@@ -58,4 +58,39 @@ pub(super) fn hitl_answer_hint(reason: &str, answer: &str) -> String {
     } else {
         "人工回复了自由文本(human_response),按其内容继续流程;核实页面状态用 inspect,不要 reload(风控敏感站点登录后 reload 会触发「当前页面异常」风控墙)".to_string()
     }
+}
+
+/// 应答是否表达「我已完成人工操作」语义(2026-10-15 闲鱼实测止损输入):
+/// 选项 1 文本(新旧文案)或自由文本里的「已完成 / 完成登录 / 操作完成」。
+/// 不含单纯「完成」二字 —— 「任务完成」类泛词会误伤。
+pub(super) fn is_done_claim_answer(answer: &str) -> bool {
+    let t = answer.trim();
+    // 选项应答 "1. 确认我已完成人工操作,交棒" 取 ". " 之后的正文再判。
+    let body = if is_option_pick_answer(t) {
+        match t.find(". ") {
+            Some(i) => t[i + 2..].trim(),
+            None => t,
+        }
+    } else {
+        t
+    };
+    body.contains("已完成")
+        || body.contains("完成登录")
+        || body.contains("登录完成")
+        || body.contains("完成操作")
+        || body.contains("操作完成")
+}
+
+/// 重复「已完成」应答的止损提示(2026-10-15 闲鱼实测根治):同一 page+reason
+/// 反复 request_human、人工反复点「已完成」但复验始终未通过时,继续再问只会
+/// 空转烧迭代(实测 wf-1 两次空头应答之间烧 8 轮,单元 14 轮/185.9s)。
+/// 返回 `Some(追加提示)` 当且仅当:应答是「已完成」语义**且**本 reason 已重复
+/// 发起 ≥2 次。由 `hitl_ctl` 拼到 `next_hint` 尾部。
+pub(super) fn hitl_repeat_caveat(repeat_count: u32, answer: &str) -> Option<String> {
+    if repeat_count < 2 || !is_done_claim_answer(answer) {
+        return None;
+    }
+    Some(format!(
+        "⚠️ 此为第 {repeat_count} 次「已完成」应答:此前应答后复验均未通过。若本次 inspect 复验仍未通过,**不要再发起 request_human**(空转会耗尽单元迭代预算),按单元未完成如实收口并向用户说明人工操作未真正生效"
+    ))
 }

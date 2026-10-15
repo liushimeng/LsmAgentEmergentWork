@@ -409,12 +409,30 @@ impl ParseSink {
     }
 
     /// 终结:产生最终的 `Completion`。
+    ///
+    /// **流截断识别**(2026-10-15 闲鱼实测):HTTP body 结束但全程未收到任何终止信号
+    /// (`message_stop` / `message_delta.stop_reason` / OpenAI `[DONE]`·`finish_reason`
+    /// 均未到达 ⇒ [`Self::feed`] 从未收到 [`DeltaEvent::Stop`])时,半截 `text` /
+    /// 空参数 tool_call 会被当成完整响应流入下游 —— 实测 Plan 输出在 WorkFlow 5 中途
+    /// 被截、tool 参数落成 `{"_raw":""}`,`stop_reason` 为空且 `usage_out=0`,
+    /// 下游 QC 判「Markdown 不完整」触发再规划,白烧一轮全链路。
+    /// 此处按可重试网络错(`LlmNetwork`,弹性层恒重试)上抛,让截断当场重试,
+    /// 而不是把残缺内容伪装成合法响应。
     pub fn finish(self) -> Result<Completion> {
         if let Some((kind, message)) = self.errored {
             return Err(AgentError::LlmStream { kind, message });
         }
-        // 若流式未显式终止(例如 [DONE] 之前的最后一个 chunk 之后没新数据),
-        // 也把 in_flight 残留的 tool_calls 尝试 parse 出来,避免丢调用。
+        if !self.finished {
+            return Err(AgentError::LlmNetwork(format!(
+                "SSE 流未收到终止信号(message_stop/stop_reason/[DONE] 均缺失),疑似连接被截断:\
+                 已丢弃半截输出 text_len={} tool_calls={} in_flight={}",
+                self.text.chars().count(),
+                self.tool_calls.len(),
+                self.in_flight.len()
+            )));
+        }
+        // 流已正常终止但仍有 in-flight 残留(网关在 finish_reason 后补发 tool 片段等
+        // 边角形态):按现有 json_buf 解析补出,避免丢调用。
         let mut tool_calls = self.tool_calls;
         for call in self.in_flight {
             let arguments: Value = parse_tool_call_arguments(&call.json_buf);
@@ -618,6 +636,55 @@ mod tests {
         .unwrap();
         let err = sink.finish().unwrap_err();
         assert!(format!("{err}").contains("rate limited"));
+    }
+
+    /// 流全程未收到 Stop 信号 = 连接被截断:finish 必须按可重试网络错上抛,
+    /// 不得把半截 text 伪装成完整响应(2026-10-15 闲鱼实测 Plan 输出中途被截,
+    /// QC 判「Markdown 不完整」白烧一轮再规划)。
+    #[test]
+    fn sink_no_stop_event_is_retryable_truncation() {
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::InputUsage {
+            input_tokens: 100,
+            cache_read: 0,
+            cache_creation: 0,
+        })
+        .unwrap();
+        sink.feed(DeltaEvent::TextDelta("# 方案\n## WorkFlow 5: 步骤中途被截".into()))
+            .unwrap();
+        let err = sink.finish().unwrap_err();
+        match &err {
+            AgentError::LlmNetwork(msg) => {
+                assert!(msg.contains("未收到终止信号"), "msg={msg}");
+            }
+            other => panic!("期望 LlmNetwork,实际 {other:?}"),
+        }
+        assert!(crate::llm::resilient::is_retryable(&err));
+    }
+
+    /// tool_use 开始后没有任何 JSON 增量、也没有 Stop:不得产出 `{"_raw":""}`
+    /// 空参 tool_call 去撞工具参数校验,应按截断重试。
+    #[test]
+    fn sink_dangling_tool_call_without_stop_is_truncation() {
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "MCP_Web_Use".into(),
+        })
+        .unwrap();
+        let err = sink.finish().unwrap_err();
+        assert!(matches!(err, AgentError::LlmNetwork(_)));
+    }
+
+    /// 正常终止(收到 Stop)但 Stop 不带 stop_reason:仍应正常产出 Completion,
+    /// 不被截断判定误伤。
+    #[test]
+    fn sink_stop_without_reason_still_completes() {
+        let mut sink = ParseSink::new();
+        sink.feed(DeltaEvent::TextDelta("完整输出".into())).unwrap();
+        sink.feed(DeltaEvent::Stop { stop_reason: None }).unwrap();
+        let c = sink.finish().unwrap();
+        assert_eq!(c.text, "完整输出");
     }
 
     #[test]

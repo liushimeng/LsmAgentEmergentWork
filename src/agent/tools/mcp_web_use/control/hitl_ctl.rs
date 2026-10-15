@@ -40,6 +40,43 @@ pub const HUMAN_ASSIST_ALLOWED_REASONS: &[&str] = &[
     "custom",
 ];
 
+/// HITL 重复发起台账(2026-10-15 闲鱼实测根治):同一 page_id+reason 在滑动窗口内
+/// 被反复 `request_human`,而人工反复点「我已完成人工操作」后复验始终未通过 ——
+/// 弹窗与应答载荷都看不见「这是第 N 次」,人工一键点默认项、Agent 复验→再问,
+/// 空转烧迭代(实测 wf-1 两次空头应答之间烧 8 轮)。本台账给弹窗正文首行告警
+/// 与 `next_hint` 止损分支提供计数。fail-open:锁中毒按 1 次计,不阻断主流程。
+struct HitlRepeatLedger {
+    /// key = `"{page_id}|{reason}"` → (窗口内发起次数, 窗口起点)。
+    calls: std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
+}
+
+impl HitlRepeatLedger {
+    /// 滑动窗口长度:10 分钟。短于单元墙钟,长于典型 HITL 等待。
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    fn global() -> &'static Self {
+        static GLOBAL: std::sync::OnceLock<HitlRepeatLedger> = std::sync::OnceLock::new();
+        GLOBAL.get_or_init(|| HitlRepeatLedger {
+            calls: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// 自增并返回当前窗口内的发起次数(1=首次)。窗口外重新计数。
+    fn bump(&self, key: &str) -> u32 {
+        let mut map = match self.calls.lock() {
+            Ok(m) => m,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = std::time::Instant::now();
+        let entry = map.entry(key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) > Self::WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        entry.0
+    }
+}
+
 /// 2026-10-13:人工介入附图决策(原 `captcha_crop` 子模块的 `HitlImagePlan`/
 /// `hitl_image_plan`,随弹窗验证码功能移除一并收口到此处)。
 ///
@@ -238,6 +275,9 @@ pub(super) fn parse_relay_rect(v: &Option<Value>) -> Option<(f64, f64, f64, f64)
 async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
     let reason = spec.reason.as_str();
     let (label, default_message) = human_assist_defaults(reason);
+    // 2026-10-15:重复发起记账(同 page+reason 10 分钟窗口)。人工反复点默认项
+    // 「已完成」而复验不过时,弹窗首行与 next_hint 都要看见「第 N 次」。
+    let hitl_repeat_count = HitlRepeatLedger::global().bump(&format!("{id}|{reason}"));
     let message = if spec.message.trim().is_empty() {
         default_message.to_string()
     } else {
@@ -246,11 +286,23 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
     let mut options = spec.options.clone();
     if options.is_empty() {
         options = vec![
-            "我已完成人工操作,继续".to_string(),
+            // 文案去诱导(2026-10-15):旧「我已完成人工操作,继续」是首项 + 主按钮
+            // 一键可达,人工没做完也能交棒;把「确认」显性化,降低无脑点第一项概率。
+            "确认我已完成人工操作,交棒".to_string(),
             "取消任务".to_string(),
         ];
     }
     options.truncate(6);
+    // 重复发起告警:前置到弹窗正文首行,让人工看见这是第 N 次、上次应答已被复验否决。
+    let message = if hitl_repeat_count >= 2 {
+        format!(
+            "⚠️ 第 {hitl_repeat_count} 次人工介入(同一原因「{label}」)。此前应答「已完成」后复验均未通过 —— \
+             请**真实完成**页面上的操作(登录/验证/填表),确认生效后再点「确认我已完成人工操作,交棒」; \
+             若无法完成,请点「取消任务」,避免 Agent 反复空转。\n\n{message}"
+        )
+    } else {
+        message
+    };
     // 第 172 轮:**提问前**页面存活性体检 —— BOSS 直聘实测坑死点:站点对自动化
     // 环境做自杀式反爬(原地 reload / 抹成空白页),人工在弹窗里输入的字符随
     // 文档销毁,连续 3 次 request_human 都被回「页面还是一直在刷新」(实测
@@ -627,6 +679,17 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
             }
         }
     }
+    // next_hint:输码/指示/已完成分流 + 重复「已完成」应答的止损追加(2026-10-15)。
+    let next_hint_for = |answer: &str| -> String {
+        let base = crate::agent::tools::mcp_web_use::hitl_hint::hitl_answer_hint(reason, answer);
+        match crate::agent::tools::mcp_web_use::hitl_hint::hitl_repeat_caveat(
+            hitl_repeat_count,
+            answer,
+        ) {
+            Some(caveat) => format!("{base}\n{caveat}"),
+            None => base,
+        }
+    };
     match outcome {
         HumanAssistOutcome::Answered { text: answer, via } => HitlReport {
             code: 0,
@@ -664,9 +727,12 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
                 "image_clip": image_clip,
                 // 第 152 轮:提问前是否把验证弹层滚进了视口(人工能否看到)
                 "challenge_scrolled": challenge_scrolled,
+                // 2026-10-15:重复发起对账(同 page+reason 窗口内第 N 次)。
+                // ≥2 时 next_hint 追加止损分支,阻断「应答已完成→复验不过→再问」空转。
+                "hitl_repeat_count": hitl_repeat_count,
                 // 第 145 轮:按「输码 vs 已完成」分流 —— 自由文本(验证码)+ captcha/
                 // sms/two_factor → 立即 input_text 填码提交;选项应答 → inspect 验证。
-                "next_hint": crate::agent::tools::mcp_web_use::hitl_hint::hitl_answer_hint(reason, &answer),
+                "next_hint": next_hint_for(&answer),
             }),
         },
         HumanAssistOutcome::Timeout { via } => HitlReport {
@@ -677,6 +743,7 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
                 "reason": reason,
                 "kind_label": label,
                 "assist_channel": via.as_str(),
+                "hitl_repeat_count": hitl_repeat_count,
                 "hint": "等待人工响应超时。可再次 request_human 重试,或如实向用户报告需要人工配合后结束",
             }),
         },
@@ -688,6 +755,7 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
                 "reason": reason,
                 "kind_label": label,
                 "assist_channel": via.as_str(),
+                "hitl_repeat_count": hitl_repeat_count,
                 "hint": "人工选择取消。终止当前浏览器流程,汇总已完成部分向用户报告,不要继续重试",
             }),
         },
@@ -699,6 +767,7 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
                 "reason": reason,
                 "kind_label": label,
                 "assist_channel": AssistVia::Tui.as_str(),
+                "hitl_repeat_count": hitl_repeat_count,
                 // 第 131 轮:原信封只说「不可用」,用户无从判断是没弹、弹失败、
                 // 还是压根没走到这一步。附本机能力诊断以便排障。
                 "human_ui_diagnostics": crate::agent::human_ui::diagnostics(),
@@ -867,5 +936,51 @@ mod tests {
         );
         // 非对象 → None
         assert_eq!(parse_relay_rect(&Some(serde_json::json!("x"))), None);
+    }
+
+    /// 2026-10-15:重复发起台账计数(同 key 窗口内递增,不同 key 互不影响)。
+    #[test]
+    fn hitl_repeat_ledger_counts_per_key() {
+        let ledger = HitlRepeatLedger {
+            calls: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        assert_eq!(ledger.bump("p1|login"), 1);
+        assert_eq!(ledger.bump("p1|login"), 2);
+        assert_eq!(ledger.bump("p1|login"), 3);
+        // 不同 page / 不同 reason 各自计数
+        assert_eq!(ledger.bump("p2|login"), 1);
+        assert_eq!(ledger.bump("p1|captcha"), 1);
+    }
+
+    /// 2026-10-15:is_done_claim_answer 语义判定(新旧选项文案 + 自由文本 + 误伤防护)。
+    #[test]
+    fn is_done_claim_answer_matches_done_semantics() {
+        use crate::agent::tools::mcp_web_use::hitl_hint::is_done_claim_answer;
+        // 选项应答(旧文案 / 新文案)
+        assert!(is_done_claim_answer("1. 我已完成人工操作,继续"));
+        assert!(is_done_claim_answer("1. 确认我已完成人工操作,交棒"));
+        assert!(is_done_claim_answer("2. 我已登录完成"));
+        // 自由文本
+        assert!(is_done_claim_answer("登录完成,头像出来了"));
+        assert!(is_done_claim_answer("操作完成"));
+        // 不该误伤
+        assert!(!is_done_claim_answer("2. 取消任务"));
+        assert!(!is_done_claim_answer("先别动,我看看"));
+        assert!(!is_done_claim_answer("任务完成度待评估"));
+    }
+
+    /// 2026-10-15:重复「已完成」应答的止损提示只在 repeat≥2 且应答为已完成语义时出现。
+    #[test]
+    fn hitl_repeat_caveat_only_for_repeated_done_claims() {
+        use crate::agent::tools::mcp_web_use::hitl_hint::hitl_repeat_caveat;
+        // 首次「已完成」不告警
+        assert!(hitl_repeat_caveat(1, "1. 确认我已完成人工操作,交棒").is_none());
+        // 第 2 次「已完成」→ 止损提示
+        let c = hitl_repeat_caveat(2, "1. 我已完成人工操作,继续").expect("应有止损提示");
+        assert!(c.contains("第 2 次"), "c={c}");
+        assert!(c.contains("不要再发起 request_human"), "c={c}");
+        // 第 2 次但应答不是「已完成」语义(如取消/其它指示)→ 不告警
+        assert!(hitl_repeat_caveat(2, "2. 取消任务").is_none());
+        assert!(hitl_repeat_caveat(2, "先查北京天气").is_none());
     }
 }
