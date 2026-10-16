@@ -492,6 +492,11 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
                     }
                 }
             }
+            // 导航类失败(net::ERR_*)附诊断块:分类/可重试性/处置建议
+            let emsg = e.to_string();
+            if emsg.contains("net::ERR") || emsg.contains("HTTP_RESPONSE_CODE_FAILURE") {
+                data["nav_failure"] = super::nav_failure_diagnose(&emsg);
+            }
             envelope(2002, &e, data)
         }
     }

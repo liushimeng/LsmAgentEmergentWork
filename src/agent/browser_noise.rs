@@ -27,7 +27,7 @@ pub fn is_noise_url(url: &str) -> bool {
     if lower == "about:blank" || lower.starts_with("about:blank?") || lower == "about:newtab" {
         return true;
     }
-    // 浏览器内部页(用户手动开的新标签页 / 下载页 / 崩溃页)
+    // 浏览器内部页(用户手动开的新标签页 / 下载页 / 崩溃页 / 错误页)
     for p in [
         "chrome://newtab",
         "chrome://new-tab-page",
@@ -35,6 +35,7 @@ pub fn is_noise_url(url: &str) -> bool {
         "chrome://downloads",
         "chrome://crash",
         "chrome://version",
+        "chrome-error://",
         "edge://newtab",
         "brave://newtab",
         "devtools://",
@@ -143,6 +144,7 @@ mod tests {
             "chrome://newtab/",
             "chrome://new-tab-page/",
             "chrome://search-local-ntp/",
+            "chrome-error://chromewebdata/",
             "edge://newtab",
             "devtools://devtools/bundled/inspector.html",
         ] {

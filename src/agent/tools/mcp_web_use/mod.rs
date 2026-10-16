@@ -124,11 +124,15 @@ pub(super) fn target_anchor_guard(url: &str) -> Option<Result<String>> {
             // 的搜索/登录落地 s.taobao.com / login.taobao.com),显式 navigate 会被
             // 本守卫拦(防漂移语义不变);合法正路是**由页面自身发起导航**。不指路
             // 的话模型要花 1~2 轮自己悟出来(实测 Plan 探索期间白烧两轮)。
+            // 2026-10-16(LinkedIn 实测):同 SLD 跨 TLD 区域名(linkedin.com→linkedin.cn)
+            // 已自动放行,可直接 open/navigate 继续,不会再收到 6001。
             "workaround": "若该 URL 实为锚点站点的组成部分(集团同域搜索/登录/详情跳转,\
                            如 tmall.com 任务下的 s.taobao.com(搜索)/ login.taobao.com(登录)\
                            / taobao.com(集团首页)):改走页面内表单提交(输入框填词+回车)\
                            或点击页面内链接,由页面自身发起导航,\
-                           不经 open/navigate/new_tab;除此之外不得绕行。",
+                           不经 open/navigate/new_tab。\
+                           同 SLD 跨 TLD 区域名(如 linkedin.com→linkedin.cn)已自动放行,\
+                           可直接 open/navigate;除此之外不得绕行。",
         }),
     ))
 }
@@ -954,6 +958,71 @@ pub(super) fn is_connection_level_failure(msg: &str) -> bool {
     ];
     let m = msg.to_ascii_lowercase();
     MARKERS.iter().any(|k| m.contains(&k.to_ascii_lowercase()))
+}
+
+/// 导航失败分类与诊断(纯函数,可单测)。
+///
+/// 背景(2026-10-16 LinkedIn 实测):`net::ERR_HTTP_RESPONSE_CODE_FAILURE` 返回
+/// `{"code":2001,"data":{},"message":"net::ERR_HTTP_RESPONSE_CODE_FAILURE"}`,
+/// 零诊断 —— LLM 只能盲猜「可能是网络问题」,同错误连吃 3 次共烧 10 轮迭代。
+/// 该错误名的语义是「服务器返回了 HTTP 状态码但 Chrome 判为失败」(反爬/WAF
+/// 常见 403/429/999),与 `ERR_CONNECTION_RESET`(网络层,重试可恢复)处置完全不同。
+///
+/// 本函数按错误文本形态分类,产出 `nav_failure{class,status_hint,retryable,remedy}`
+/// 诊断块,挂进失败信封的 `data`,让 LLM 第一轮就能做正确决策。
+pub(super) fn nav_failure_diagnose(msg: &str) -> Value {
+    let m = msg.to_ascii_lowercase();
+    let class = if m.contains("http_response_code_failure") || m.contains("http response code") {
+        "http_response_failure"
+    } else if m.contains("err_connection")
+        || m.contains("err_name_not_resolved")
+        || m.contains("err_timed_out")
+        || m.contains("err_internet_disconnected")
+        || m.contains("err_address_unreachable")
+        || m.contains("err_tunnel_connection_failed")
+    {
+        "connection"
+    } else if m.contains("err_cert") || m.contains("err_ssl") || m.contains("err_tls") {
+        "tls"
+    } else if m.contains("timeout") || m.contains("超时") {
+        "timeout"
+    } else {
+        "other"
+    };
+    let (retryable, remedy) = match class {
+        "http_response_failure" => (
+            false,
+            "服务器已拒绝本次请求(反爬/WAF 返回非成功状态码,常见 403/429/999)。\
+             reload/同参数重试无效。首选 open(reuse_existing=true) 接管已登录的日常浏览器\
+             (真实指纹+登录态,connect 模式零注入);仍不可达时 request_human 请人工打开,\
+             或如实报告不可达并停止 —— 禁止改用 Bash curl/ping 绕行,禁止换站点替代",
+        ),
+        "connection" => (
+            true,
+            "网络层失败(连接被重置/DNS 解析失败/网络不可达)。直接重试同一条 open 一次;\
+             连续两次失败则如实报告网络不可达,不要反复重试同一参数",
+        ),
+        "tls" => (
+            true,
+            "TLS/证书校验失败。内网自签名证书场景设 LAEW_TLS_INSECURE=1;\
+             公网站点则可能是中间人拦截或证书过期,如实报告并停止",
+        ),
+        "timeout" => (
+            true,
+            "导航超时。检查网络连通性后重试一次;连续超时则如实报告站点响应超时",
+        ),
+        _ => (
+            true,
+            "导航失败(原因未归类)。重试一次;若同错误复现,改用 open(reuse_existing=true)\
+             接管已登录浏览器,或 request_human 请人工打开",
+        ),
+    };
+    json!({
+        "class": class,
+        "error_text": msg,
+        "retryable": retryable,
+        "remedy": remedy,
+    })
 }
 
 pub(super) fn site_wipe_ledger_field(requested_url: &str) -> Option<Value> {
@@ -1887,7 +1956,7 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     }),
                 )
             } else {
-                envelope(2001, &msg, json!({}))
+                envelope(2001, &msg, nav_failure_diagnose(&msg))
             }
         }
     }
@@ -2068,7 +2137,7 @@ async fn run_open_new_window(args: &Value, url: &str) -> Result<String> {
                     }),
                 )
             } else {
-                envelope(2001, &msg, json!({}))
+                envelope(2001, &msg, nav_failure_diagnose(&msg))
             }
         }
     }

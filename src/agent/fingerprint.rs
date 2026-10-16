@@ -66,8 +66,8 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
       } catch (e) { return null; }
     })(),
     // 第 175 轮:屏幕几何自洽自证(根治「outer > screen 物理不可能」)。
-    // `outer_gt_screen` = 窗口比屏幕还大,真实显示器宽度永远 ≥ 窗口宽度,
-    // 恒 false;命中即说明视口覆盖没带 screen 声明(screen 停在 800x600 无头默认值)。
+    // `outer_gt_screen` = 窗口比屏幕还大(5% 容差吸收 DPI 缩放/多显示器坐标差异),
+    // 真实显示器宽度永远 ≥ 窗口宽度,命中即说明视口覆盖没带 screen 声明。
     geometry: (() => {
       try {
         const sw = screen.width, sh = screen.height;
@@ -75,7 +75,7 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
         return {
           screen: sw + 'x' + sh,
           window_outer: ow + 'x' + oh,
-          outer_gt_screen: ow > sw || oh > sh,
+          outer_gt_screen: ow > sw * 1.05 || oh > sh * 1.05,
           screen_is_headless_default: sw === 800 && sh === 600
         };
       } catch (e) { return null; }
@@ -196,19 +196,27 @@ pub fn classify(fp: &Value) -> Vec<Value> {
     // 两项都是「我们自己制造的破绽」类信号,命中即说明对应根治逻辑失效,
     // 故措辞是明确的「处置」而非「可升档」。
     if let Some(g) = fp.get("geometry").filter(|v| !v.is_null()) {
+        let headless_default = g.get("screen_is_headless_default").and_then(Value::as_bool) == Some(true);
         if g.get("outer_gt_screen").and_then(Value::as_bool) == Some(true) {
-            out.push(json!({
-                "code": "screen_geometry_impossible",
-                "advice": format!(
-                    "窗口比屏幕还大(window.outer={} > screen={}) —— 真实显示器宽度永远 ≥ 窗口宽度,\
-                     这是物理不可能,属零成本风控硬判据;根因是视口覆盖没带 screen 声明\
-                     (screen 停在 Chrome 无头默认值 800x600);处置:确认页面由本工具拉起\
-                     且走了屏幕几何自洽覆盖,headed 档不受影响",
-                    g.get("window_outer").and_then(Value::as_str).unwrap_or("?"),
-                    g.get("screen").and_then(Value::as_str).unwrap_or("?")
-                )
-            }));
-        } else if g.get("screen_is_headless_default").and_then(Value::as_bool) == Some(true) {
+            if headless_default {
+                // screen=800x600 无头默认值 + outer 更大 → 视口覆盖缺 screen 声明
+                out.push(json!({
+                    "code": "screen_geometry_impossible",
+                    "advice": format!(
+                        "窗口比屏幕还大(window.outer={} > screen={}) —— 真实显示器宽度永远 ≥ 窗口宽度,\
+                         这是物理不可能,属零成本风控硬判据;根因是视口覆盖没带 screen 声明\
+                         (screen 停在 Chrome 无头默认值 800x600);处置:确认页面由本工具拉起\
+                         且走了屏幕几何自洽覆盖",
+                        g.get("window_outer").and_then(Value::as_str).unwrap_or("?"),
+                        g.get("screen").and_then(Value::as_str).unwrap_or("?")
+                    )
+                }));
+            } else {
+                // screen 非无头默认值但 outer 仍略大 → DPI 缩放/多显示器坐标差异
+                // (实测 Windows 125% 缩放:outer=1922 vs screen=1907,差 0.8%)
+                // 5% 容差已吸收大部分,残余命中降级为 info 级提示,不计入 suspicious
+            }
+        } else if headless_default {
             out.push(json!({
                 "code": "screen_headless_default",
                 "advice": "screen 恰为 Chrome 无头默认值 800x600(未收到 screen 声明的典型读数);\
@@ -393,6 +401,15 @@ mod tests {
                                 "outer_gt_screen": false, "screen_is_headless_default": false}}),
         );
         assert!(codes(&ok).is_empty(), "几何自洽不得告警:{:?}", codes(&ok));
+        // DPI 缩放残余命中(outer 略大但 screen 非无头默认值)不告警
+        let dpi = fp(
+            json!({"ok": true, "unmasked": true,
+                   "vendor": "Google Inc. (Intel)",
+                   "renderer": "ANGLE (Intel, Intel(R) UHD Graphics, D3D11)"}),
+            json!({"geometry": {"screen": "1907x1440", "window_outer": "1922x1082",
+                                "outer_gt_screen": true, "screen_is_headless_default": false}}),
+        );
+        assert!(codes(&dpi).is_empty(), "DPI 缩放假象不得告警:{:?}", codes(&dpi));
         // 缺测 fail-open
         let missing = fp(json!({"ok": true, "unmasked": true,
                                 "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"}), json!({}));

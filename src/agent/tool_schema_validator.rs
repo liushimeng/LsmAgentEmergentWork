@@ -54,11 +54,27 @@ fn validate_value(tool_name: &str, schema: &Value, value: &Value, path: &str) ->
     if let Some(enum_val) = schema.get("enum") {
         if let Some(arr) = enum_val.as_array() {
             if !arr.iter().any(|v| v == value) {
+                // 最近邻指路:实际值可能是子动作/嵌套参数(如 MCP_Web_Use 的
+                // `navigate` 实为 control_action),提示改用正确的字段层级。
+                let actual_str = value.as_str().unwrap_or("");
+                let hint = if !actual_str.is_empty()
+                    && arr.iter().any(|v| v.as_str() == Some("control"))
+                {
+                    format!(
+                        "取值于 {} (提示:'{}' 可能是 control_action 子动作,请改用 \
+                         {{\"action\":\"control\",\"control_action\":\"{}\",…}} 形式)",
+                        serde_json::to_string(arr).unwrap_or_default(),
+                        actual_str,
+                        actual_str
+                    )
+                } else {
+                    format!("取值于 {}", serde_json::to_string(arr).unwrap_or_default())
+                };
                 return Err(AgentError::ToolSchemaValidation {
                     tool: tool_name.into(),
                     path: path.into(),
                     reason: "取值不在允许范围内".into(),
-                    expected: format!("取值于 {}", serde_json::to_string(arr).unwrap_or_default()),
+                    expected: hint,
                     actual: value_to_brief(value),
                 });
             }

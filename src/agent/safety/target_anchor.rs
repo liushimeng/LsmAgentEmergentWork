@@ -214,18 +214,63 @@ pub fn registrable_domain_of_host(host: &str) -> String {
     last_two
 }
 
-/// host 是否落在 anchor 域内(后缀匹配,纯函数)。
+/// 从可注册域提取 SLD(二级域名首段,纯函数)。
 ///
-/// `news.anthropic.com` ∈ `anthropic.com` ✅;`anthropic.com` ∈ `anthropic.com` ✅;
-/// `ithome.com` ∉ `anthropic.com` ✅;`notanthropic.com` ∉ `anthropic.com` ✅
-/// (**必须是点边界后缀匹配,不能退化成子串匹配**)。
+/// - `linkedin.com` → `linkedin`
+/// - `google.co.jp` → `google`(`co.jp` 是公共后缀,可注册域为 `google.co.jp`)
+/// - `example.com.cn` → `example`(`com.cn` 是公共后缀)
+/// - IP 字面量原样返回(不做段裁剪)
+fn sld_of_domain(domain: &str) -> &str {
+    if domain.contains(':') || domain.starts_with('[') {
+        return domain;
+    }
+    domain.split('.').next().unwrap_or(domain)
+}
+
+/// host 是否落在 anchor 域内(纯函数)。
+///
+/// 三级匹配,任一成立即放行:
+/// 1. **精确/子域**:`news.anthropic.com` ∈ `anthropic.com` ✅;
+///    `anthropic.com` ∈ `anthropic.com` ✅(点边界后缀匹配,非子串)。
+/// 2. **同 SLD 跨 TLD 区域同站**:`linkedin.cn` ∈ `linkedin.com` ✅、
+///    `google.co.jp` ∈ `google.com` ✅ —— 服务端把用户从锚点站点重定向到
+///    同品牌的区域域名(LinkedIn 大陆访问即 302 到 linkedin.cn)是正常行为,
+///    不是「改派无关站点」。SLD 最短 3 字符防 `x.com`↔`x.org` 过度泛化。
+/// 3. 否则拒绝:`notanthropic.com` ∉ `anthropic.com` ✅;
+///    `ithome.com` ∉ `anthropic.com` ✅;
+///    `anthropic.com.evil.cn` ∉ `anthropic.com` ✅(可注册域是 `evil.cn`)。
 pub fn host_matches_anchor_domain(host: &str, anchor_domain: &str) -> bool {
     let host = registrable_domain_of_host(host);
     let anchor = registrable_domain_of_host(anchor_domain);
     if host.is_empty() || anchor.is_empty() {
         return false;
     }
-    host == anchor || host.ends_with(&format!(".{anchor}"))
+    if host == anchor || host.ends_with(&format!(".{anchor}")) {
+        return true;
+    }
+    // 同 SLD 跨 TLD(区域同站):linkedin.com ↔ linkedin.cn
+    let h_sld = sld_of_domain(&host);
+    let a_sld = sld_of_domain(&anchor);
+    h_sld == a_sld && h_sld.len() >= 3
+}
+
+/// 判断 host 是否为 anchor 的**同 SLD 跨 TLD 区域同站**(纯函数)。
+///
+/// 与 [`host_matches_anchor_domain`] 的区别:本函数只在「子域匹配**不成立**、
+/// 但同 SLD 匹配成立」时返回 `true`,供信封标注 `regional_companion:true`
+/// (审计对账:是跟随锚点站点自己的重定向,不是乱跑)。
+pub fn is_regional_companion(host: &str, anchor_domain: &str) -> bool {
+    let host_d = registrable_domain_of_host(host);
+    let anchor_d = registrable_domain_of_host(anchor_domain);
+    if host_d.is_empty() || anchor_d.is_empty() {
+        return false;
+    }
+    if host_d == anchor_d || host_d.ends_with(&format!(".{anchor_d}")) {
+        return false;
+    }
+    let h_sld = sld_of_domain(&host_d);
+    let a_sld = sld_of_domain(&anchor_d);
+    h_sld == a_sld && h_sld.len() >= 3
 }
 
 /// 扫描文本中的全部主机并归一去重(纯函数,可单测)。
@@ -809,6 +854,15 @@ mod tests {
         assert!(!host_matches_anchor_domain("notanthropic.com", "anthropic.com"));
         assert!(!host_matches_anchor_domain("ithome.com", "anthropic.com"));
         assert!(!host_matches_anchor_domain("anthropic.com.evil.cn", "anthropic.com"));
+        // 同 SLD 跨 TLD(区域同站)
+        assert!(host_matches_anchor_domain("linkedin.cn", "linkedin.com"));
+        assert!(host_matches_anchor_domain("www.linkedin.cn", "linkedin.com"));
+        assert!(host_matches_anchor_domain("google.co.jp", "google.com"));
+        assert!(host_matches_anchor_domain("amazon.cn", "amazon.com"));
+        // 同 SLD 但过短(<3 字符)不放行
+        assert!(!host_matches_anchor_domain("x.org", "x.com"));
+        // SLD 不同
+        assert!(!host_matches_anchor_domain("notlinkedin.com", "linkedin.com"));
     }
 
     #[test]

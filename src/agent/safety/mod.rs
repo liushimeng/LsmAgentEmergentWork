@@ -26,7 +26,8 @@ pub use target_anchor::{
     build_clarification_message, check_open_against_anchor, check_open_against_target_anchor,
     current_target_anchor, detect_target_drift, detect_unresolved_target_reference,
     extract_hosts_from_text,
-    host_matches_anchor_domain, install_target_anchor, parse_url_host, registrable_domain_of_host,
+    host_matches_anchor_domain, install_target_anchor, is_regional_companion, parse_url_host,
+    registrable_domain_of_host,
     registrable_domain_of_url, set_current_target_anchor, target_anchor_block_enabled,
     target_anchor_enabled, AnchorViolation, TargetAnchor, TargetAnchorScopeGuard,
 };
