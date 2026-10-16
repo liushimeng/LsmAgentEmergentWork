@@ -108,6 +108,7 @@ impl Db {
                 "quality" => AgentRole::QualityCheck,
                 "session" => AgentRole::SessionContext,
                 "compact" => AgentRole::Compact,
+                "reflection" => AgentRole::Reflection,
                 // 2026-09-18 第 84 轮:WindowUse Agent 已删除(能力降级为
                 // MCP_Window_Use 工具);存量库 role='windowuse' 历史行归并到 SubAgent。
                 // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_Use

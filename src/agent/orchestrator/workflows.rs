@@ -109,6 +109,7 @@ impl MultiAgentOrchestrator {
                 let outcome = run_wf_unit(
                     self.sub_agent.clone(),
                     self.quality.clone(),
+                    self.reflection.clone(),
                     self.cfg.debug.clone(),
                     input,
                     c.goal_summary.clone(),
@@ -127,6 +128,7 @@ impl MultiAgentOrchestrator {
                 for (wf, input) in units {
                     let sub_agent = self.sub_agent.clone();
                     let quality = self.quality.clone();
+                    let reflection = self.reflection.clone();
                     let debug = self.cfg.debug.clone();
                     let goal = c.goal_summary.clone();
                     let sid = session.id().to_string();
@@ -139,6 +141,7 @@ impl MultiAgentOrchestrator {
                         let outcome = run_wf_unit(
                             sub_agent,
                             quality,
+                            reflection,
                             debug,
                             input,
                             goal,
@@ -335,6 +338,7 @@ pub(super) struct WfUnitOk {
 pub(super) async fn run_wf_unit(
     sub_agent: Arc<SubAgentRunner>,
     quality: Arc<QualityRunner>,
+    reflection: Arc<crate::agent::reflection::ReflectionRunner>,
     debug: Option<Arc<DebugCollector>>,
     mut input: SubFlowInput,
     goal: String,
@@ -373,6 +377,12 @@ pub(super) async fn run_wf_unit(
     let mut acc_sub_elapsed_ms: u64 = 0;
     let mut acc_qc_elapsed_ms: u64 = 0;
     let mut acc_usage = Usage::default();
+    // Reflection(反思)模式:单元内跨 attempt 的教训账本 + 最近一次深度反思结论。
+    // 条件触发(只在即将带着错误重跑时深度反思),机械基线零 LLM 始终可合并;
+    // `LAEW_REFLECTION=off` 全关,行为与改造前一致。
+    let mut lessons_acc: Vec<String> = Vec::new();
+    let mut last_reflection: Option<crate::agent::reflection::ReflectionReport> = None;
+    let mut deep_reflections = 0usize;
 
     loop {
         if attempt > 0 {
@@ -582,6 +592,99 @@ pub(super) async fn run_wf_unit(
         );
 
         if qc.verdict == Verdict::Fail {
+            // ===== Reflection(反思)模式:复盘推理路径,产出跨 attempt 累积的教训 =====
+            // 机械基线零 LLM,每 attempt 都合并;深度反思条件触发(只在即将重跑时)。
+            // 全关(LAEW_REFLECTION=off)时本块零动作,行为与改造前一致。
+            if crate::agent::reflection::reflection_enabled() {
+                use crate::agent::reflection as reflect;
+                let mechanical = reflect::mechanical_lessons(&outcome.trace);
+                lessons_acc = reflect::merge_lessons(
+                    &lessons_acc,
+                    &reflect::ReflectionReport {
+                        lessons: mechanical,
+                        ..Default::default()
+                    },
+                );
+                let will_retry = qc.retryable && attempt < retry_budget;
+                let deep_allowed = will_retry
+                    && reflect::reflection_mode() == reflect::ReflectionMode::Deep
+                    && deep_reflections < reflect::reflection_budget();
+                if deep_allowed {
+                    let focus = if attempt == 0 {
+                        "这是第 1 次执行失败、局部重试前的复盘".to_string()
+                    } else {
+                        format!(
+                            "这是第 {} 次局部重试后仍失败、下一次重试前的复盘(此前教训已在重试提示中给出)",
+                            attempt
+                        )
+                    };
+                    let reflect_input = reflect::ReflectionInput {
+                        goal: &goal,
+                        unit_scope: &input.description,
+                        expected_output: &input.expected_output,
+                        actual_output: &outcome.text,
+                        qc_issues: &qc.issues,
+                        qc_suggestion: &qc.suggestion,
+                        trace: &outcome.trace,
+                        focus: &focus,
+                    };
+                    let reflect_started = std::time::Instant::now();
+                    match reflection.reflect(&reflect_input, &session_id).await {
+                        Ok((report, reflect_usage)) => {
+                            deep_reflections += 1;
+                            acc_usage = add_usage(acc_usage, reflect_usage);
+                            if let Some(r) = report {
+                                let max_score = r.max_dimension_score();
+                                let root_cause = r.root_cause.clone();
+                                let lesson_count = r.lessons.len();
+                                lessons_acc = reflect::merge_lessons(&lessons_acc, &r);
+                                last_reflection = Some(r);
+                                emit_progress(
+                                    &progress,
+                                    format!(
+                                        "[laew] {} 🔍 Reflection 复盘 | 根因: {} | 教训 {} 条 | 维度峰值 {}",
+                                        input.id,
+                                        truncate_progress_text_default(&root_cause, 80),
+                                        lesson_count,
+                                        max_score
+                                    ),
+                                );
+                                crate::agent::decision_audit::record_reflection(
+                                    &session_id,
+                                    &input.id,
+                                    attempt + 1,
+                                    true,
+                                    "deep",
+                                    max_score,
+                                    lesson_count,
+                                    &root_cause,
+                                );
+                            } else {
+                                emit_progress(
+                                    &progress,
+                                    format!(
+                                        "[laew] {} 🔍 Reflection 复盘(无增量结论,沿用机械教训)",
+                                        input.id
+                                    ),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // fail-open:反思失败不阻断重试,机械教训仍生效
+                            emit_progress(
+                                &progress,
+                                format!(
+                                    "[laew] {} 🔍 Reflection 调用失败(fail-open 落回机械教训): {}",
+                                    input.id,
+                                    truncate_progress_text_default(&e.to_string(), 80)
+                                ),
+                            );
+                        }
+                    }
+                    let _ = reflect_started; // 计时保留给未来 stage_durations 扩展
+                }
+            }
+
             // 2026-09-16 第 62 轮:QC 失败详情走 [laew] 立即冲刷,即使任务快速
             // 完成也保留 issues / suggestion,便于用户/QC 后续定位。
             if !qc.issues.is_empty() {
@@ -607,13 +710,20 @@ pub(super) async fn run_wf_unit(
             // ★第 95 轮:局部重试判定 —— retryable=true 且预算未满 → 注入本单元 QC 结论,
             // 仅重试该单元(attempt+1);否则升级为档位级失败。
             // QC 调用本身失败(LLM 层错)不消耗预算,直接抛(重试大概率同样失败)。
+            let reflection_block = crate::agent::reflection::render_reflection_block(
+                &lessons_acc,
+                last_reflection.as_ref(),
+            );
             if qc.retryable && attempt < retry_budget {
                 // hint 暂存,下一次循环开头统一覆盖 input(description hint 段原位替换 +
-                // retry_count 写入),不在此处覆盖以免与循环头职责重复
+                // retry_count 写入),不在此处覆盖以免与循环头职责重复。
+                // Reflection 教训段并入 hint(设计 docs/Reflection反思模式 §6.4):
+                // QC issues 说「哪里不达标」,反思教训说「下一轮策略怎么改」。
                 unit_retry_hint = format!(
-                    "{}\nqc suggestion: {}",
+                    "{}\nqc suggestion: {}{}",
                     qc.issues.join("; "),
-                    qc.suggestion
+                    qc.suggestion,
+                    reflection_block
                 );
                 emit_progress(
                     &progress,
@@ -629,21 +739,24 @@ pub(super) async fn run_wf_unit(
                     wf_id = %input.id,
                     attempt = attempt + 1,
                     hint_chars = unit_retry_hint.chars().count(),
+                    lessons = lessons_acc.len(),
                     "WorkFlow 单元局部重试"
                 );
                 attempt += 1;
                 continue;
             }
             // 预算耗尽或不可重试 → 升级为档位级失败(旧路径)
+            // 反思教训随失败原因上抛,档位级重试 / Yolo 回流同样看得到。
             let reason = if attempt > 0 {
                 format!(
-                    "wf={}: 单元局部重试 {} 次仍失败: {}",
+                    "wf={}: 单元局部重试 {} 次仍失败: {}{}",
                     input.id,
                     attempt,
-                    qc.issues.join("; ")
+                    qc.issues.join("; "),
+                    reflection_block
                 )
             } else {
-                format!("wf={}: {}", input.id, qc.issues.join("; "))
+                format!("wf={}: {}{}", input.id, qc.issues.join("; "), reflection_block)
             };
             return Err(QualityFailure {
                 source: AgentRole::SubAgent,
@@ -657,6 +770,26 @@ pub(super) async fn run_wf_unit(
                 //(本函数看不到兄弟单元结果)。
                 completed_digest: String::new(),
             });
+        }
+
+        // QC 通过但轨迹有失败信号/工具错误率高:机械轻量反思留痕(零 LLM,设计 §4
+        // 触发矩阵第二行)。本轮无重试消费者,教训只进审计供 Debug/人工回看与
+        // 同任务后续单元对照,不注入任何提示。
+        if crate::agent::reflection::reflection_enabled() {
+            use crate::agent::reflection as reflect;
+            let residual = reflect::mechanical_lessons(&outcome.trace);
+            if !residual.is_empty() {
+                crate::agent::decision_audit::record_reflection(
+                    &session_id,
+                    &input.id,
+                    attempt + 1,
+                    true,
+                    "light",
+                    0,
+                    residual.len(),
+                    "qc_pass_with_residual_signals",
+                );
+            }
         }
 
         return Ok(WfUnitOk {

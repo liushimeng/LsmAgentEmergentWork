@@ -940,6 +940,7 @@ impl MultiAgentOrchestrator {
         let ok = run_wf_unit(
             self.sub_agent.clone(),
             self.quality.clone(),
+            self.reflection.clone(),
             self.cfg.debug.clone(),
             input,
             c.goal_summary.clone(),

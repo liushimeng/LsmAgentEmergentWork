@@ -347,6 +347,44 @@ pub fn record_verdict(
     record(event);
 }
 
+/// 便捷函数:记录 Reflection（反思）决策。
+///
+/// 与 5 个既有决策点同构：记录触发与否、维度最高分、教训条数与根因（脱敏截断），
+/// fail-open 不影响主流程。设计见 `docs/Reflection反思模式/01-设计与解决方案.md`。
+#[allow(clippy::too_many_arguments)]
+pub fn record_reflection(
+    session_id: &str,
+    wf_id: &str,
+    attempt: usize,
+    triggered: bool,
+    mode: &str,
+    max_dim_score: u8,
+    lesson_count: usize,
+    root_cause: &str,
+) {
+    let event = AuditEvent::new(
+        session_id,
+        AgentRole::Reflection.as_str(),
+        "reflection",
+        format!("wf_id={} attempt={}", wf_id, attempt),
+        format!(
+            "triggered={} mode={} max_dim_score={} lessons={}",
+            triggered, mode, max_dim_score, lesson_count
+        ),
+        crate::logging::clip(root_cause),
+        0,
+    )
+    .with_meta(serde_json::json!({
+        "wf_id": wf_id,
+        "attempt": attempt,
+        "triggered": triggered,
+        "mode": mode,
+        "max_dim_score": max_dim_score,
+        "lesson_count": lesson_count,
+    }));
+    record(event);
+}
+
 /// 便捷函数:记录 Context 压缩决策。
 pub fn record_compact(
     session_id: &str,

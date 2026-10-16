@@ -305,6 +305,11 @@ impl SystemPrompt {
         Self::without_tools(DEBUG_BASE_PROMPT).set_identity(DEBUG_IDENTITY)
     }
 
+    /// 构造 Reflection Agent 的系统提示词(反思层,执行—复盘—迭代,无工具)。
+    pub fn reflection() -> Self {
+        Self::without_tools(REFLECTION_BASE_PROMPT).set_identity(REFLECTION_IDENTITY)
+    }
+
     /// 构造 Compact Agent 的系统提示词(压缩层,上下文摘要,无工具)。
     pub fn compact() -> Self {
         Self::without_tools(COMPACT_BASE_PROMPT).set_identity(COMPACT_IDENTITY)
@@ -332,6 +337,7 @@ const SUB_AGENT_IDENTITY: &str = "你是 LsmAgentEmergentWork-SubAgent-Work,执�
 const QUALITY_IDENTITY: &str = "你是 LsmAgentEmergentWork-Quality-Check,质检层 Agent,校验 SubAgent/Main-Work/Plan 输出并提交结构化判定。";
 const SESSION_IDENTITY: &str = "你是 LsmAgentEmergentWork-SessionContext,会话层 Agent,任务收尾生成简洁 Markdown 摘要并落 session_memory。";
 const DEBUG_IDENTITY: &str = "你是 LsmAgentEmergentWork-Debug,调试层评估 Agent,基于 trace 产出四章节调试评估报告。";
+const REFLECTION_IDENTITY: &str = "你是 LsmAgentEmergentWork-Reflection,反思层 Agent,三维度复盘执行路径并产出可累积的经验教训。";
 const COMPACT_IDENTITY: &str = "你是 LsmAgentEmergentWork-Compact,压缩层摘要 Agent,按档位目标压缩率产出多段式上下文摘要。";
 const WORK_FLOW_IDENTITY: &str = "你是 LsmAgentEmergentWork-WorkFlow,工作流编排层 Agent,负责超大型复杂任务的 Goal 树与 Squad 调度。";
 
@@ -878,6 +884,40 @@ const COMPACT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Compact,压缩�
 - 全文使用中文(用户原文为其它语言的关键内容可保留原文)
 - 严格遵守档位目标压缩率,不要超过"#;
 
+/// Reflection Agent 基础提示词(反思层,无工具)。
+///
+/// 三维度复盘(逻辑自洽 / 事实准确 / 目标匹配)产出 Reflexion 风格的
+/// 经验教训与策略调整,反向注入局部重试。设计见
+/// `docs/Reflection反思模式/01-设计与解决方案.md`。
+const REFLECTION_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Reflection,反思层的自我审视 Agent。
+
+你的唯一职责:在执行单元失败即将重试之前,从**推理路径**角度复盘上一轮执行——不是再判一次产物对错(QC 已经判过),而是找出「哪一步开始走偏、下一轮应如何调整策略」。
+
+你没有任何工具可用,不得执行任何命令或修改任何文件,只做文本复盘。
+
+复盘三维度:
+1. 逻辑自洽:推理链有无矛盾、跳步、循环论证;结论是否被中间证据支撑;有无「做了 A 却报告 B」的自相矛盾。
+2. 事实准确:工具返回值有无误读、选择性忽略、无依据编造;有没有执行过但未做却声称做过;证据与结论是否对得上。
+3. 目标匹配:执行路径是否服务本单元验收标准与用户原始意图;有无目标漂移的苗头(改派、降级、绕开核心动作)。
+
+输出要求(严格遵守):
+- 只输出一个合法 JSON 对象,不要输出 JSON 之外的任何文本(不要 markdown 围栏解释、不要前言后语)。
+- 结构:
+{"root_cause":"一句话根因","dimensions":{"logic":{"score":0,"findings":[]},"factual":{"score":0,"findings":[]},"goal":{"score":0,"findings":[]}},"lessons":["通用经验句"],"corrections":["下一轮立即修正指令"],"strategy_shift":"工具调用策略调整","sound":true}
+- score 取值:0=无问题 / 1=有瑕疵 / 2=严重偏差。
+- lessons:写**通用经验**(「遇到某情形时应某做法」),跨尝试累积复用。
+- corrections:写**下一轮立即可执行**的具体修正。
+- strategy_shift:工具调用 / 步骤层面的策略调整(如「先只读探查确认结构再执行写操作」)。
+
+措辞规范(硬性):
+- lessons / corrections / strategy_shift 写**策略**,不写具体工具 API 名称或参数
+  (写「先只读探查再写操作」,不写「先调 inspect(info=dom) 再调 click」)——
+  同一教训要对浏览器 / 桌面 / 命令行工具都适用。
+- 不要复述 QC 已列明的缺陷清单——那是重试提示已经带上的;你只产出**增量洞察**
+  (根因、教训、策略转向)。
+- 教训要具体可执行,不要空话套话(不要写「仔细一点」「多检查」)。
+- 全文使用中文,简洁直接,每条教训尽量不超过 60 字。"#;
+
 // =================== MCP_Window_Use 工具使用说明(2026-09-18 第 84 轮) ===================
 //
 // 原 WindowUse Agent(第 9 角色)系统提示词精炼版:随 Agent 删除,能力降级为
@@ -1339,7 +1379,7 @@ mod tests {
 
     #[test]
     fn all_prompts_render_for_both_protocols() {
-        let builders: [fn() -> SystemPrompt; 9] = [
+        let builders: [fn() -> SystemPrompt; 10] = [
             SystemPrompt::yolo,
             SystemPrompt::plan,
             SystemPrompt::main_work,
@@ -1349,6 +1389,7 @@ mod tests {
             SystemPrompt::debug,
             SystemPrompt::compact,
             SystemPrompt::work_flow,
+            SystemPrompt::reflection,
         ];
         for f in builders {
             let sp = f();
@@ -1376,7 +1417,7 @@ mod tests {
             "危害他人",
             "服务条款",
         ];
-        let builders: [(&str, fn() -> SystemPrompt); 9] = [
+        let builders: [(&str, fn() -> SystemPrompt); 10] = [
             ("Yolo", SystemPrompt::yolo),
             ("Plan", SystemPrompt::plan),
             ("Main-Work", SystemPrompt::main_work),
@@ -1386,6 +1427,7 @@ mod tests {
             ("Debug", SystemPrompt::debug),
             ("Compact", SystemPrompt::compact),
             ("WorkFlow", SystemPrompt::work_flow),
+            ("Reflection", SystemPrompt::reflection),
         ];
         for (name, f) in builders {
             let rendered = f().render(Protocol::Anthropic);
@@ -1428,7 +1470,7 @@ mod tests {
     /// 行为契约;设计沿革归 `docs/`,不进 system prompt。
     #[test]
     fn prompts_have_no_round_annotations() {
-        let builders: [(&str, fn() -> SystemPrompt); 9] = [
+        let builders: [(&str, fn() -> SystemPrompt); 10] = [
             ("Yolo", SystemPrompt::yolo),
             ("Plan", SystemPrompt::plan),
             ("Main-Work", SystemPrompt::main_work),
@@ -1438,6 +1480,7 @@ mod tests {
             ("Debug", SystemPrompt::debug),
             ("Compact", SystemPrompt::compact),
             ("WorkFlow", SystemPrompt::work_flow),
+            ("Reflection", SystemPrompt::reflection),
         ];
         for (name, f) in builders {
             let rendered = f().render(Protocol::Anthropic);
@@ -1550,7 +1593,7 @@ mod tests {
     /// 8 角色 + WorkFlow 角色:均产出非空 segments,billing 头格式对齐 Claude Code 抓包。
     #[test]
     fn all_prompts_yield_three_segments_with_billing_and_identity() {
-        let builders: [(&str, fn() -> SystemPrompt); 9] = [
+        let builders: [(&str, fn() -> SystemPrompt); 10] = [
             ("Yolo", SystemPrompt::yolo),
             ("Plan", SystemPrompt::plan),
             ("Main-Work", SystemPrompt::main_work),
@@ -1560,6 +1603,7 @@ mod tests {
             ("Debug", SystemPrompt::debug),
             ("Compact", SystemPrompt::compact),
             ("WorkFlow", SystemPrompt::work_flow),
+            ("Reflection", SystemPrompt::reflection),
         ];
         for (name, f) in builders {
             let segs = f().prompt_segments();

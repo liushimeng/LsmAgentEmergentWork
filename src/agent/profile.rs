@@ -16,8 +16,8 @@ use crate::agent::system_prompt::SystemPrompt;
 use crate::agent::self_awareness::{self as sa, SpawnPolicy};
 use crate::agent::tools::{
     builtin_registry, compact_registry, debug_registry, main_work_registry, plan_registry,
-    quality_registry, session_context_registry, sub_agent_work_registry, yolo_registry,
-    ToolRegistry,
+    quality_registry, reflection_registry, session_context_registry, sub_agent_work_registry,
+    yolo_registry, ToolRegistry,
 };
 
 // =================== Agent 名称常量 ===================
@@ -40,6 +40,8 @@ pub const DEBUG_AGENT_NAME: &str = "LsmAgentEmergentWork-Debug";
 pub const COMPACT_AGENT_NAME: &str = "LsmAgentEmergentWork-Compact";
 /// WorkFlow Agent(工作流编排层,第 10 角色:超大型复杂任务自动化编排)
 pub const WORK_FLOW_AGENT_NAME: &str = "LsmAgentEmergentWork-WorkFlow";
+/// Reflection Agent(反思层:执行—复盘—迭代的自我审视)
+pub const REFLECTION_AGENT_NAME: &str = "LsmAgentEmergentWork-Reflection";
 
 /// 兼容旧名(指向 SubAgent-Work)。
 pub const WORK_AGENT_NAME: &str = SUB_AGENT_WORK_NAME;
@@ -244,6 +246,21 @@ impl AgentProfile {
             name: COMPACT_AGENT_NAME.to_string(),
             system_prompt: SystemPrompt::compact(),
             tools: compact_registry(),
+            emit_tool: None,
+            spawn_policy: SpawnPolicy::Disabled,
+            defer_emit_force: false,
+        }
+    }
+
+    /// Reflection Agent profile(反思层,执行—复盘—迭代的自我审视,无工具)。
+    ///
+    /// 与 Debug/Compact 同形态:无工具、无 emit、禁用动态子 Agent。
+    /// 设计见 `docs/Reflection反思模式/01-设计与解决方案.md`。
+    pub fn reflection_profile() -> Self {
+        Self {
+            name: REFLECTION_AGENT_NAME.to_string(),
+            system_prompt: SystemPrompt::reflection(),
+            tools: reflection_registry(),
             emit_tool: None,
             spawn_policy: SpawnPolicy::Disabled,
             defer_emit_force: false,

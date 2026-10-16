@@ -39,6 +39,8 @@ pub enum AgentRole {
     Compact,
     /// 工作流编排层:超大型复杂任务自动化编排(第 10 角色)
     WorkFlow,
+    /// 反思层:执行—复盘—迭代的自我审视(Reflection 模式,三维度校验 + 教训累积)
+    Reflection,
 }
 
 impl AgentRole {
@@ -52,6 +54,7 @@ impl AgentRole {
             Self::SessionContext => "session",
             Self::Compact => "compact",
             Self::WorkFlow => "workflow",
+            Self::Reflection => "reflection",
         }
     }
 }
@@ -74,6 +77,7 @@ impl From<&str> for AgentRole {
             // 存量序列化值归并 SubAgent。
             "webuse" => Self::SubAgent,
             "workflow" => Self::WorkFlow,
+            "reflection" => Self::Reflection,
             _ => Self::SubAgent,
         }
     }
@@ -165,6 +169,8 @@ mod tests {
         assert_eq!(AgentRole::SessionContext.as_str(), "session");
         assert_eq!(AgentRole::Compact.as_str(), "compact");
         assert_eq!(AgentRole::from("workflow"), AgentRole::WorkFlow);
+        assert_eq!(AgentRole::Reflection.as_str(), "reflection");
+        assert_eq!(AgentRole::from("reflection"), AgentRole::Reflection);
     }
 
     #[test]

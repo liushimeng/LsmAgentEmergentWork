@@ -84,6 +84,7 @@ impl AgentMessage {
             AgentRole::SessionContext => "SessionContext",
             AgentRole::Compact => "Compact",
             AgentRole::WorkFlow => "WorkFlow",
+            AgentRole::Reflection => "Reflection",
         }
     }
 

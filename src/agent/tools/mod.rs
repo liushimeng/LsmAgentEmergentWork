@@ -470,6 +470,11 @@ pub fn compact_registry() -> ToolRegistry {
     ToolRegistry::new()
 }
 
+/// Reflection Agent 工具注册表:无工具(只做执行路径复盘,不修改系统状态)
+pub fn reflection_registry() -> ToolRegistry {
+    ToolRegistry::new()
+}
+
 #[cfg(test)]
 mod names_tests {
     use super::*;

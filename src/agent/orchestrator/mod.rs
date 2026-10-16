@@ -165,6 +165,8 @@ pub struct MultiAgentOrchestrator {
     sub_agent: Arc<SubAgentRunner>,
     /// Arc 化:同上(质检随执行单元并行)
     quality: Arc<QualityRunner>,
+    /// Arc 化:反思层(执行—复盘—迭代,条件触发;与质检随执行单元并行)
+    reflection: Arc<crate::agent::reflection::ReflectionRunner>,
     session_context: SessionContextRunner,
     compact: CompactRunner,
     db: Arc<Db>,
@@ -230,6 +232,10 @@ impl MultiAgentOrchestrator {
                 .with_max_iterations(cfg.subagent_max_iterations),
         );
         let quality = Arc::new(QualityRunner::new(llm.clone(), db.clone()));
+        let reflection = Arc::new(crate::agent::reflection::ReflectionRunner::new(
+            llm.clone(),
+            db.clone(),
+        ));
         let session_context = SessionContextRunner::new(llm.clone(), db.clone());
         let compact = CompactRunner::new(llm, db.clone());
         Self {
@@ -238,6 +244,7 @@ impl MultiAgentOrchestrator {
             main_work,
             sub_agent,
             quality,
+            reflection,
             session_context,
             compact,
             db,
