@@ -659,6 +659,7 @@ mod tests {
                     ..Usage::default()
                 },
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
         fn protocol(&self) -> Protocol {

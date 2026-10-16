@@ -140,6 +140,15 @@ impl PlanRunner {
 
         let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
 
+        // 2026-10-16 闲鱼实测:thinking-only 响应产出空文本,空文件写入 plans/
+        // 后 QC 判「正文完全缺失」白烧一轮。空文本直接报错,让调用方重试。
+        if text.trim().is_empty() {
+            return Err(AgentError::PlanGen(
+                "Plan 输出为空文本(thinking-only 或异常响应),拒绝写入空方案文件;请重试"
+                    .into(),
+            ));
+        }
+
         // 落盘
         let seq = self.db.next_session_seq(session_id)?;
         let path = self.plans_dir.join(format!("{}-{}.md", session_id, seq));
@@ -256,6 +265,14 @@ impl PlanRunner {
         sub_session.id = session_id.to_string();
 
         let (text, usage, _trace) = self.agent.run_session(&mut sub_session).await?;
+
+        // 2026-10-16 闲鱼实测:空文本守卫(与 generate 同步)
+        if text.trim().is_empty() {
+            return Err(AgentError::PlanGen(
+                "Plan 再规划输出为空文本(thinking-only 或异常响应),拒绝写入空方案文件;请重试"
+                    .into(),
+            ));
+        }
 
         // 落盘(新 seq,旧方案保留)
         let seq = self.db.next_session_seq(session_id)?;

@@ -301,6 +301,10 @@ pub enum DeltaEvent {
     OutputUsage { output_tokens: u32 },
     /// 文本增量。
     TextDelta(String),
+    /// 模型内部思考增量(Anthropic `thinking_delta`)。
+    /// 2026-10-16 闲鱼实测:thinking-only 响应(text 空 + tool_calls 空)被当
+    /// 空输出消费,Plan 写出 0 字节文件;现捕获到 `ParseSink.thinking` 供回退。
+    ThinkingDelta(String),
     /// 工具调用开始(携带 id / name)。
     ToolCallStart { id: String, name: String },
     /// 工具调用的 JSON 参数增量(原始 partial 字符串)。
@@ -318,6 +322,8 @@ pub enum DeltaEvent {
 #[derive(Debug, Default)]
 pub struct ParseSink {
     text: String,
+    /// 模型内部思考文本(thinking_delta 聚合;不混入 text)。
+    thinking: String,
     /// 当前正在拼接 JSON 的 tool_calls;队尾即"最近一个"。
     in_flight: VecDeque<InFlightToolCall>,
     /// 已完成的 tool_calls,按接收顺序。
@@ -370,6 +376,7 @@ impl ParseSink {
                 self.usage.output_tokens = output_tokens;
             }
             DeltaEvent::TextDelta(s) => self.text.push_str(&s),
+            DeltaEvent::ThinkingDelta(s) => self.thinking.push_str(&s),
             DeltaEvent::ToolCallStart { id, name } => {
                 // D21 L4: 清洗工具名伪标记（Harmony / 方括号 / XML-ish）
                 let name = sanitize_tool_name(&name);
@@ -447,6 +454,7 @@ impl ParseSink {
             tool_calls,
             usage: self.usage,
             stop_reason: self.stop_reason,
+            thinking: self.thinking,
         })
     }
 }

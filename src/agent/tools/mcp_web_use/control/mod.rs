@@ -293,7 +293,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         if let Some(url) = str_arg(&params, "url") {
             if let Some(gated) = crate::agent::browser_pace::guard_navigation(
                 url,
-                params.get("force").and_then(Value::as_bool).unwrap_or(false),
+                super::bool_param(params.get("force"), false),
                 // navigate 无 connect_url 参数:身份看当前浏览器实例(connect 模式
                 // 且非 laew relaunch 实例 = 用户日常 Chrome;launch 模式 = laew 身份)。
                 super::open_laew_identity(None).await,

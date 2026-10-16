@@ -829,10 +829,10 @@ pub(super) async fn act_request_human(
         message: str_arg(p, "message").unwrap_or_default().to_string(),
         options,
         // 2026-10-13:选项多选(弹窗复选框组;应答编码 `1. a；3. c`)。
-        multi_select: p.get("multi_select").and_then(Value::as_bool).unwrap_or(false),
+        multi_select: super::super::bool_param(p.get("multi_select"), false),
         timeout_ms: p.get("timeout_ms").and_then(Value::as_u64),
         bring_to_front: p.get("bring_to_front").and_then(Value::as_bool).unwrap_or(true),
-        unlock_page: p.get("unlock_page").and_then(Value::as_bool).unwrap_or(true),
+        unlock_page: super::super::bool_param(p.get("unlock_page"), true),
         allow_selectors,
         image_path: str_arg(p, "image_path").map(str::to_string),
         // 2026-10-13(二):侵入式映射区(可选;数值字段缺失/非法 → None 走自动探测)。

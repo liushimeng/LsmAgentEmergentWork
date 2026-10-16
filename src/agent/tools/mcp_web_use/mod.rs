@@ -137,6 +137,29 @@ pub(super) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
+/// 从 JSON Value 读取布尔参数,兼容 LLM 高频输出的字符串 `"true"`/`"false"`。
+///
+/// 2026-10-16 闲鱼实测:模型对 `extract(probe=…)` 等布尔参数反复传字符串 `"true"`,
+/// `Value::as_bool()` 对字符串返回 `None`,`unwrap_or(false)` 静默回退默认值,
+/// probe 模式未触发 → 落入必填检查 → 2002 白烧一轮。
+///
+/// 兼容规则:JSON `true`/`false` 直取;字符串 `"true"`/`"1"`/`"yes"`/`"on"` → `true`,
+/// `"false"`/`"0"`/`"no"`/`"off"`/`""` → `false`;数字 `0` → `false` 非零 → `true`;
+/// 其他/缺失 → `default`。
+pub(super) fn bool_param(v: Option<&Value>, default: bool) -> bool {
+    match v {
+        None => default,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" | "" => false,
+            _ => default,
+        },
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(default),
+        _ => default,
+    }
+}
+
 /// 把字符串安全嵌入 JS 字面量(转义 `\`, `'`, 控制字符)。
 pub(super) fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
@@ -1064,7 +1087,8 @@ fn parse_open_guard(args: &Value) -> std::result::Result<crate::agent::browser_o
         return Ok(cfg);
     }
     // 第 141 轮 legacy 布尔语义(true=屏蔽/false=开放)完整保留。
-    if let Some(ov) = args.get("overlay").and_then(Value::as_bool) {
+    if args.get("overlay").is_some() {
+        let ov = bool_param(args.get("overlay"), false);
         return Ok(PageGuardConfig::legacy_overlay(ov));
     }
     Ok(PageGuardConfig::from_env_default())
@@ -1182,7 +1206,7 @@ async fn run_open_reuse(args: &Value, url: &str) -> Result<String> {
         // 命中即原样返回 6004,不复制、不拉起、不登记。
         if let Some(gated) = crate::agent::browser_pace::guard_navigation(
             url,
-            args.get("force").and_then(Value::as_bool).unwrap_or(false),
+            bool_param(args.get("force"), false),
             true,
         )
         .await
@@ -1398,7 +1422,7 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
     // Chrome(真实指纹,指纹级打标站点通常不抹)。
     if let Some(gated) = crate::agent::browser_pace::guard_navigation(
         url,
-        args.get("force").and_then(Value::as_bool).unwrap_or(false),
+        bool_param(args.get("force"), false),
         open_laew_identity(str_arg(args, "connect_url")).await,
     )
     .await
@@ -1410,10 +1434,10 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
     // close_page 的「最后一页回收」语义自然换全新 profile —— 正是整页抹除的恢复
     // 路径,故放在 mode 探测/new_window 分发之前,响应里的 browser_reused 才真实。
     let closed_blanks = BrowserManager::global().close_blank_pages().await;
-    let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(true);
+    let reuse = bool_param(args.get("reuse"), true);
     // 多窗口并行(双站同时工作):独立新窗口路径,校验/收尾自成一支
     // (connect 禁用 / 仅 headed / 窗口上限 / 平铺代替单窗收边)。
-    if args.get("new_window").and_then(Value::as_bool).unwrap_or(false) {
+    if bool_param(args.get("new_window"), false) {
         return run_open_new_window(args, url).await;
     }
     // 第 103 轮:读取 timeout_ms 参数,控制页面加载超时(默认 60s)
@@ -1614,7 +1638,7 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
     // (全模式统一 1920×1080 = 1080p)。内容仍超视口时 open 后自动扩展
     // 视口到 2K(auto_expand_viewport,默认开)。
     let window_size = parse_window_size(args);
-    let highlight = args.get("highlight").and_then(Value::as_bool).unwrap_or(true);
+    let highlight = bool_param(args.get("highlight"), true);
     // 第 143 轮:页面管控三档(级联:显式 guard > legacy overlay > 环境变量缺省;
     // 仅最终 mode=headed 且非 connect 生效)。参数错误(非法档位/partial 缺选择器/
     // allow+block 互斥等)直接 1001 收口,不静默降级。
@@ -1858,7 +1882,7 @@ async fn run_open_new_window(args: &Value, url: &str) -> Result<String> {
     let ua = str_arg(args, "user_agent");
     // 窗口尺寸(显式参数 clamp 到安全区间;缺省由驱动层决定)。
     let window_size = parse_window_size(args);
-    let highlight = args.get("highlight").and_then(Value::as_bool).unwrap_or(true);
+    let highlight = bool_param(args.get("highlight"), true);
     let guard = match parse_open_guard(args) {
         Ok(g) => g,
         Err(e) => {

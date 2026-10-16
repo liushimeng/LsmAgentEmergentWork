@@ -49,6 +49,7 @@ impl crate::llm::LlmClient for ParallelReadLlm {
                     .collect(),
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         } else {
             Ok(Completion {
@@ -56,6 +57,7 @@ impl crate::llm::LlmClient for ParallelReadLlm {
                 tool_calls: vec![],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
     }
@@ -163,6 +165,7 @@ impl crate::llm::LlmClient for MixedBatchLlm {
                 ],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         } else {
             Ok(Completion {
@@ -170,6 +173,7 @@ impl crate::llm::LlmClient for MixedBatchLlm {
                 tool_calls: vec![],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
     }
@@ -229,6 +233,7 @@ impl crate::llm::LlmClient for SameReadLlm {
             }],
             usage: Usage::default(),
             stop_reason: None,
+            thinking: Default::default(),
         })
     }
     fn protocol(&self) -> crate::config::Protocol {
@@ -323,6 +328,7 @@ impl crate::llm::LlmClient for SystemCaptureLlm {
                 }],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         } else {
             Ok(Completion {
@@ -330,6 +336,7 @@ impl crate::llm::LlmClient for SystemCaptureLlm {
                 tool_calls: vec![],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
     }
@@ -719,6 +726,7 @@ impl crate::llm::LlmClient for MainWorkDoomLlm {
             }],
             usage: Usage::default(),
             stop_reason: None,
+            thinking: Default::default(),
         })
     }
     fn protocol(&self) -> crate::config::Protocol {

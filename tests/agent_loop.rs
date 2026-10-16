@@ -42,6 +42,7 @@ impl ScriptedClient {
             tool_calls: vec![],
             usage: Usage::default(),
             stop_reason: Some("end_turn".into()),
+            thinking: Default::default(),
         };
         Self { protocol, steps: std::sync::Mutex::new(steps), fallback }
     }
@@ -53,6 +54,7 @@ fn text_step(text: &str) -> Completion {
         tool_calls: vec![],
         usage: Usage::default(),
         stop_reason: Some("end_turn".into()),
+        thinking: Default::default(),
     }
 }
 
@@ -62,6 +64,7 @@ fn tool_step(name: &str, args: Value) -> Completion {
         tool_calls: vec![ToolCallReq { id: "call-1".into(), name: name.into(), arguments: args }],
         usage: Usage::default(),
         stop_reason: Some("tool_use".into()),
+        thinking: Default::default(),
     }
 }
 
@@ -144,6 +147,7 @@ async fn 同批多个只读工具_结果按原序回填() {
             ],
             usage: Usage::default(),
             stop_reason: Some("tool_use".into()),
+            thinking: Default::default(),
         },
         text_step("两个目录都找到了"),
     ]);
@@ -363,6 +367,7 @@ impl lsm_agent::llm::LlmClient for AlwaysToolClient {
             }],
             usage: Usage::default(),
             stop_reason: Some("tool_use".into()),
+            thinking: Default::default(),
         })
     }
 

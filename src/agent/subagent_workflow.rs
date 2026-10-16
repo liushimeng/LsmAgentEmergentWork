@@ -533,6 +533,7 @@ mod tests {
                     ..crate::llm::Usage::default()
                 },
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
 

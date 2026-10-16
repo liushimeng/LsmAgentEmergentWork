@@ -351,6 +351,9 @@ pub struct Completion {
     pub usage: Usage,
     /// 终止原因(Anthropic stop_reason / OpenAI finish_reason),可选。
     pub stop_reason: Option<String>,
+    /// 模型内部思考文本(Anthropic `thinking_delta`,2026-10-16 闲鱼实测:
+    /// thinking-only 响应产出空 text 导致 Plan 空文件,现捕获供回退与诊断)。
+    pub thinking: String,
 }
 
 impl Completion {

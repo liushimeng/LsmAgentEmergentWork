@@ -1120,6 +1120,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
         fn protocol(&self) -> crate::config::Protocol {

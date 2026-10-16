@@ -164,7 +164,7 @@ pub(super) async fn gate_visual_action(id: &str, action: &str, params: &Value) -
         return GateOutcome::Allow(None);
     }
     // 显式前台化逃生口:先把标签页带到前台再执行本动作。
-    if params.get("focus").and_then(Value::as_bool).unwrap_or(false) {
+    if super::bool_param(params.get("focus"), false) {
         // 第 166 轮:焦点租约 —— 前台化会抢 OS 键盘焦点,keep 档(缺省)借完
         // 即还(随后的截图/OCR 不需要焦点);响应附 focus_restored 对账。
         let lease = crate::agent::browser_focus::FocusLease::capture();
@@ -180,7 +180,7 @@ pub(super) async fn gate_visual_action(id: &str, action: &str, params: &Value) -
         return GateOutcome::Allow(Some(note));
     }
     let needs_fg = action_needs_foreground(action) || info_needs_foreground(action);
-    if needs_fg && !params.get("force").and_then(Value::as_bool).unwrap_or(false) {
+    if needs_fg && !super::bool_param(params.get("force"), false) {
         tracing::warn!(
             page_id = id,
             action = action,

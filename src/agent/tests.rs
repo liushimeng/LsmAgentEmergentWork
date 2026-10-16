@@ -50,6 +50,7 @@
                     }],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 })
             } else {
                 Ok(Completion {
@@ -57,6 +58,7 @@
                     tool_calls: vec![],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 })
             }
         }
@@ -235,6 +237,7 @@
                     }],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 })
             } else {
                 Ok(Completion {
@@ -242,6 +245,7 @@
                     tool_calls: vec![],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 })
             }
         }
@@ -292,6 +296,7 @@
                 }],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
         fn protocol(&self) -> crate::config::Protocol {
@@ -349,6 +354,7 @@
                 }],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
         fn protocol(&self) -> crate::config::Protocol {
@@ -417,6 +423,7 @@
                     }],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 })
             } else {
                 Ok(Completion {
@@ -424,6 +431,7 @@
                     tool_calls: vec![],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 })
             }
         }
@@ -501,6 +509,7 @@
                     tool_calls: vec![],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 })
             }
         }
@@ -672,6 +681,7 @@
                 tool_calls: vec![],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
         fn protocol(&self) -> crate::config::Protocol {
@@ -851,6 +861,7 @@
                 .collect(),
             usage: Usage::default(),
             stop_reason: Some("tool_use".into()),
+            thinking: Default::default(),
         }
     }
 
@@ -1044,6 +1055,7 @@
                     tool_calls: vec![],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 },
             ]),
             seen_forced: std::sync::Mutex::new(Vec::new()),
@@ -1120,6 +1132,7 @@
                         ..Usage::default()
                     },
                     stop_reason: None,
+                    thinking: Default::default(),
                 });
             }
             let n = self
@@ -1135,6 +1148,7 @@
                     }],
                     usage: Usage::default(),
                     stop_reason: None,
+                    thinking: Default::default(),
                 }),
                 1 => {
                     // list 的结果必须已在上下文里(自感知快照)
@@ -1153,6 +1167,7 @@
                         }],
                         usage: Usage::default(),
                         stop_reason: None,
+                        thinking: Default::default(),
                     })
                 }
                 _ => {
@@ -1170,6 +1185,7 @@
                         tool_calls: vec![],
                         usage: Usage::default(),
                         stop_reason: None,
+                        thinking: Default::default(),
                     })
                 }
             }
@@ -1281,6 +1297,7 @@ impl crate::llm::LlmClient for TruncatedWriteLlm {
                 }],
                 usage: Usage::default(),
                 stop_reason: Some("max_tokens".into()),
+                thinking: Default::default(),
             })
         } else {
             Ok(Completion {
@@ -1288,6 +1305,7 @@ impl crate::llm::LlmClient for TruncatedWriteLlm {
                 tool_calls: vec![],
                 usage: Usage::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
     }

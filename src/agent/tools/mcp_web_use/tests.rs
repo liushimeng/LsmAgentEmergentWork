@@ -3203,3 +3203,42 @@ fn 页面存活性信号_健康页零噪声() {
     assert!(v["advice"].as_str().unwrap().contains("reuse_existing"));
     page_liveness::forget(id);
 }
+
+// ==================== 2026-10-16:bool_param 布尔参数兼容 ====================
+
+/// 闲鱼实测:LLM 对 extract(probe=…) 反复传字符串 "true",as_bool() 返回 None
+/// 静默回退 false → probe 模式不触发 → 2002 白烧一轮。
+#[test]
+fn bool_param_accepts_string_true_false() {
+    // 字符串 "true"/"false"
+    assert!(bool_param(Some(&json!("true")), false));
+    assert!(bool_param(Some(&json!("false")), true) == false);
+    // 大小写与空白
+    assert!(bool_param(Some(&json!("True")), false));
+    assert!(bool_param(Some(&json!(" TRUE ")), false));
+    // 数字字符串
+    assert!(bool_param(Some(&json!("1")), false));
+    assert!(bool_param(Some(&json!("0")), true) == false);
+    // 常见别名
+    assert!(bool_param(Some(&json!("yes")), false));
+    assert!(bool_param(Some(&json!("on")), false));
+    assert!(bool_param(Some(&json!("no")), true) == false);
+    assert!(bool_param(Some(&json!("off")), true) == false);
+}
+
+#[test]
+fn bool_param_json_bool_and_number() {
+    // JSON 布尔
+    assert!(bool_param(Some(&json!(true)), false));
+    assert!(!bool_param(Some(&json!(false)), true));
+    // 数字
+    assert!(!bool_param(Some(&json!(0)), true));
+    assert!(bool_param(Some(&json!(1)), false));
+    assert!(bool_param(Some(&json!(42)), false));
+    // 缺失 / null / 未知字符串 → default
+    assert!(bool_param(None, true));
+    assert!(!bool_param(None, false));
+    assert!(bool_param(Some(&json!(null)), true));
+    assert!(bool_param(Some(&json!("maybe")), true));
+    assert!(!bool_param(Some(&json!("maybe")), false));
+}

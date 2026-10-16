@@ -1055,7 +1055,7 @@ pub(super) async fn input_gate(
     params: &Value,
 ) -> Option<crate::error::Result<String>> {
     if !enabled()
-        || params.get("force").and_then(Value::as_bool).unwrap_or(false)
+        || super::bool_param(params.get("force"), false)
         || !(crate::agent::browser_overlay::action_dispatches_input(action)
             || (action == "eval_js"
                 && params

@@ -391,7 +391,7 @@ impl Agent {
                     usage_in = completion.usage.input_tokens,
                     usage_out = completion.usage.output_tokens,
                     cache_read = completion.usage.cache_read_input_tokens,
-                    thinking = %crate::logging::clip(&completion.text),
+                    thinking = %crate::logging::clip(&completion.thinking),
                     tool_calls = %calls_desc,
                     "LLM 响应"
                 );
@@ -409,6 +409,25 @@ impl Agent {
                         .push(ChatMessage::assistant(vec![ContentBlock::text(
                             completion.text.clone(),
                         )]));
+                } else if !completion.thinking.trim().is_empty() {
+                    // 2026-10-16 闲鱼实测:thinking-only 响应(end_turn + text 空 +
+                    // tool_calls 空 + thinking 非空)被当空输出消费,Plan 写出 0 字节文件。
+                    // 将 thinking 作为回退文本计入,避免丢内容;加标记区分。
+                    let fallback = format!(
+                        "⚠ [模型内部思考回退 — 原始响应仅含 thinking 块,无可见文本]\n{}",
+                        completion.thinking.trim()
+                    );
+                    warn!(
+                        thinking_chars = completion.thinking.chars().count(),
+                        "end_turn 空文本但 thinking 非空,已回退为文本输出"
+                    );
+                    if !accumulated_text.is_empty() {
+                        accumulated_text.push('\n');
+                    }
+                    accumulated_text.push_str(&fallback);
+                    session.context_mut().push(ChatMessage::assistant(vec![
+                        ContentBlock::text(fallback),
+                    ]));
                 }
 
                 // 2026-09-16 第 68 轮 P1-C:连续无工具调用计数 —— 避免专项任务

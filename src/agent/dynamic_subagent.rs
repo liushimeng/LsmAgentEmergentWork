@@ -1602,6 +1602,7 @@ mod tests {
                     cache_creation_input_tokens: 2,
                 },
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
         fn protocol(&self) -> Protocol {

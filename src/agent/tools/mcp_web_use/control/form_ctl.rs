@@ -435,6 +435,8 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
             if attempt == 2 {
                 // 归因分流(2026-10-14):后台渲染节流是本类失败的首要嫌疑,别再让
                 // 「面板可能已收合/选项文本不一致」把 Agent 带偏。
+                // 2026-10-16:scope 内 3 次未命中时,自动扩展到 document 全局再搜一轮
+                // (portal/ant-popover 型面板挂在 body 下,不在 trigger 子树内)。
                 let bg_lead = match auto_fg {
                     Some(true) => "已自动置前后仍未命中(若仍反复失败,先确认下拉面板真的展开了)",
                     Some(false) => "",
@@ -445,6 +447,18 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
                 } else {
                     format!("{bg_lead}；")
                 };
+                // portal 全局搜索兜底
+                if scope_sel.is_some() {
+                    let js = pick_element_js(option_text, None, true);
+                    let result: Value = eval_js_string(&page, &js).await?;
+                    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    if ok {
+                        clicked_texts.push(option_text.to_string());
+                        option_ok = true;
+                        last_diag.clear();
+                        break;
+                    }
+                }
                 return Err(format!(
                     "select_dropdown: 选项「{option_text}」未找到可见元素（scope={scope_sel:?}，{last_diag}）；{bg_lead}\
                      处置:①先 control(bring_to_front) 确认页面在前台(后台 tab 渲染被节流,下拉面板不渲染);\
@@ -554,6 +568,7 @@ pub(super) async fn act_select_dropdown(id: &str, p: &Value) -> std::result::Res
         // 2026-10-14:入口自动置前对账(true=本次动作前页面在后台,已自动置前;
         // 后台 tab 渲染被节流会让下拉面板不渲染,这是本类失败的首要嫌疑)。
         "auto_foreground": auto_fg.unwrap_or(false),
+        "search_scope": if scope_sel.is_some() { "scope+portal_fallback" } else { "document" },
         "applied_hint": "selected 为事实判定:触发器已回显选中值(trigger_after.found=false)、面板/容器文本回显了选项原文、或已点确认按钮,任一成立即 true;selected=false 说明筛选**未生效**——不要对同一选项重复盲点(toggle 会取消选中),改换排序/级联第二级,或先 inspect(elements) 看面板是否还开着",
         "mode": "custom_dropdown",
     }))

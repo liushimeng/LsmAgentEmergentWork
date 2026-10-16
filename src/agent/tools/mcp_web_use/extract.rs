@@ -86,7 +86,8 @@ pub(super) async fn run(
     params: &Value,
 ) -> std::result::Result<Value, String> {
     // probe 模式:只做选择器侦查,不抽取数据
-    if params.get("probe").and_then(Value::as_bool).unwrap_or(false) {
+    // 2026-10-16:bool_param 兼容 LLM 传字符串 "true"/"false"(高频)
+    if super::bool_param(params.get("probe"), false) {
         return run_probe(page).await;
     }
 
@@ -150,7 +151,7 @@ pub(super) fn parse_fields(v: Option<&Value>) -> Vec<FieldSpec> {
     for (name, spec) in obj {
         let selector = spec.get("selector").and_then(Value::as_str).map(str::to_string);
         let attr = spec.get("attr").and_then(Value::as_str).map(str::to_string);
-        let required = spec.get("required").and_then(Value::as_bool).unwrap_or(false);
+        let required = super::bool_param(spec.get("required"), false);
         let max_chars = spec
             .get("max_chars")
             .and_then(Value::as_u64)

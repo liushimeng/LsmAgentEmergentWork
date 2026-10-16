@@ -131,6 +131,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: Default::default(),
                 stop_reason: None,
+                thinking: Default::default(),
             })
         }
         fn protocol(&self) -> Protocol {

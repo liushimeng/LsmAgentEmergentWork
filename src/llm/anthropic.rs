@@ -562,7 +562,14 @@ impl AnthropicParser {
                             sink.feed(DeltaEvent::ToolCallJsonDelta(pj.to_string()))?;
                         }
                     }
-                    // thinking_delta / signature_delta 本期不向 TUI 输出
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta["thinking"].as_str() {
+                            if !text.is_empty() {
+                                sink.feed(DeltaEvent::ThinkingDelta(text.to_string()))?;
+                            }
+                        }
+                    }
+                    // signature_delta 等其余类型本期不处理
                     _ => {}
                 }
             }

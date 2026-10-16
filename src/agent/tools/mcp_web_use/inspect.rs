@@ -341,8 +341,8 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             let sel = str_arg(&params, "selector")
                 .unwrap_or("input,button,select,textarea,a,[role=button],[role=link],[contenteditable=true],[role=combobox],[aria-haspopup=listbox],[class*=select],[class*=Select],[class*=dropdown],[class*=Dropdown],[class*=cascader],[class*=Cascader]");
             let nth = params.get("nth").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let include_text = params.get("include_text").and_then(Value::as_bool).unwrap_or(true);
-            let include_outer = params.get("include_outer_html").and_then(Value::as_bool).unwrap_or(false);
+            let include_text = super::bool_param(params.get("include_text"), true);
+            let include_outer = super::bool_param(params.get("include_outer_html"), false);
             let js = format!(
                 // 过滤 [data-%NS%agent] 子树:Agent 高亮蓝框 overlay 不参与元素观察
                 r#"(() => {{ const els=[...document.querySelectorAll({sel})].filter(e=>!e.closest('[data-%NS%agent]')); const el=els[{nth}];
@@ -668,7 +668,7 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
         "extract_links" => {
             let sel = str_arg(&params, "selector").unwrap_or("a");
             let max_n = params.get("max_links").and_then(Value::as_u64).unwrap_or(200).min(500) as usize;
-            let include_context = params.get("include_context").and_then(Value::as_bool).unwrap_or(true);
+            let include_context = super::bool_param(params.get("include_context"), true);
             let ctx_len = params.get("context_length").and_then(Value::as_u64).unwrap_or(200).min(500) as usize;
             let host = eval_js_string(&page, "window.location.hostname")
                 .await

@@ -52,7 +52,7 @@ pub(super) async fn gate(
     action: &str,
     params: &Value,
 ) -> Option<crate::error::Result<String>> {
-    if params.get("force").and_then(Value::as_bool).unwrap_or(false) {
+    if super::bool_param(params.get("force"), false) {
         return None;
     }
     if !should_suspend(action, params) {
