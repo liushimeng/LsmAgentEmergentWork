@@ -945,7 +945,7 @@ async fn stealth_selfcheck_smoke() {
     );
 
     // ============ 第 174 轮:反检测档位(非侵入式保真 / 侵入式原生化) ============
-    // ⑥ 保真档:插件/语言/chrome.runtime 非空(真实桌面 Chrome 恒有),UA 无无头令牌
+    // ⑥ 保真档:插件/语言非空(真实桌面 Chrome 恒有),UA 无无头令牌
     let plugins = eval("String(navigator.plugins ? navigator.plugins.length : 0)".into()).await;
     assert!(
         plugins.parse::<u32>().unwrap_or(0) >= 3,
@@ -954,7 +954,15 @@ async fn stealth_selfcheck_smoke() {
     let langs = eval("String(navigator.languages ? navigator.languages.length : 0)".into()).await;
     assert!(langs.parse::<u32>().unwrap_or(0) >= 1, "languages 不得为空:{langs}");
     let chrome_rt = eval("String(!!(window.chrome && window.chrome.runtime))".into()).await;
-    assert_eq!(chrome_rt, "true", "window.chrome.runtime 应在场");
+    // 第 175 轮真机实测纠正:全新 profile 的**真实 Chrome 就没有 chrome.runtime**
+    // (`Object.keys(chrome)` 恒为 [app,csi,loadTimes])。旧断言「应在场」逼着
+    // 保真块凭空补一个空 runtime —— 既违反「不伪造本机没有的信息」铁律,又可被
+    // 一行识破(真实扩展上下文的 runtime 必有 id/connect/sendMessage)。
+    // 现改为**断言不得凭空造出**:要么没有,要么真有扩展上下文的完整形态。
+    assert!(
+        chrome_rt == "false",
+        "不得凭空补 chrome.runtime(真机裸环境无此字段):{chrome_rt}"
+    );
     let ua_headless = eval("String(navigator.userAgent.indexOf('Headless') >= 0)".into()).await;
     assert_eq!(ua_headless, "false", "UA 不得残留 HeadlessChrome 令牌");
 
@@ -984,13 +992,72 @@ async fn stealth_selfcheck_smoke() {
     .await;
     assert_eq!(enumerable, "true", "被改写方法描述符须与原生同形(enumerable)");
 
-    // ⑨ 响应回报 data.stealth / data.fingerprint(人工与 QC 的对账面)
+    // ============ 第 175 轮:对象形态自洽 + 屏幕几何自洽 ============
+    // ⑨ plugins/mimeTypes 替身必须与原生同构。「形状错误的回填比不回填更危险」:
+    //    缺插件只是弱信号(受限环境本就没有),而 tag/instanceof 失配是强信号
+    //    (正常浏览器不会造错形状的对象)。真机实测十项判据全中即被识破。
+    let shape = eval(
+        r#"JSON.stringify({
+            tag: Object.prototype.toString.call(navigator.plugins),
+            inst: navigator.plugins instanceof PluginArray,
+            named: (() => { try { return !!navigator.plugins.namedItem('PDF Viewer'); } catch (e) { return false; } })(),
+            item0: (() => { try { return Object.prototype.toString.call(navigator.plugins.item(0)); } catch (e) { return 'err'; } })(),
+            mimeLen: navigator.mimeTypes.length,
+            elemInst: navigator.plugins[0] instanceof Plugin,
+            iter: typeof navigator.plugins[Symbol.iterator]
+        })"#
+            .into(),
+    )
+    .await;
+    let sh: Value = serde_json::from_str(&shape).unwrap_or(Value::Null);
+    assert_eq!(
+        sh["tag"],
+        json!("[object PluginArray]"),
+        "plugins 替身须报原生 toString 标签(失配即强信号):{shape}"
+    );
+    assert_eq!(sh["inst"], json!(true), "plugins 须 instanceof PluginArray:{shape}");
+    assert_eq!(
+        sh["named"],
+        json!(true),
+        "plugins.namedItem('PDF Viewer') 须回指实例具名键:{shape}"
+    );
+    assert_eq!(sh["item0"], json!("[object Plugin]"), "item(0) 须为 Plugin:{shape}");
+    assert_eq!(sh["elemInst"], json!(true), "plugins[0] 须 instanceof Plugin:{shape}");
+    assert_eq!(sh["iter"], json!("function"), "PluginArray 须可迭代:{shape}");
+    assert_eq!(
+        sh["mimeLen"], json!(2),
+        "mimeTypes 须按 type 去重为 2 条(按插件 push 会放大成 10 条):{shape}"
+    );
+
+    // ⑩ 屏幕几何自洽:`outer > screen` 是物理不可能(真实显示器宽度永远 ≥ 窗口
+    //     宽度),属零成本风控硬判据。chromiumoxide 视口覆盖不发 screen 字段,
+    //     补齐后此处应为 false。
+    let geom = eval(
+        r#"JSON.stringify({
+            screen: screen.width + 'x' + screen.height,
+            outer: outerWidth + 'x' + outerHeight,
+            outer_gt_screen: outerWidth > screen.width || outerHeight > screen.height,
+            headless_default: screen.width === 800 && screen.height === 600
+        })"#
+            .into(),
+    )
+    .await;
+    let g: Value = serde_json::from_str(&geom).unwrap_or(Value::Null);
+    assert_eq!(
+        g["outer_gt_screen"], json!(false),
+        "窗口不得比屏幕还大(物理不可能,风控硬判据):{geom}"
+    );
+
+    // ⑪ 响应回报 data.stealth / data.fingerprint(人工与 QC 的对账面)
+    // 缺省档自 2026-10-16(2f93414)起升为 hardened(侵入式原生化):BOSS 直聘实测
+    // fidelity 档下被改写函数的 toString 源码可读,被 geetest 类风控采集加权。
     assert_eq!(
         v["data"]["stealth"]["mode"],
-        json!("fidelity"),
-        "缺省档应为非侵入式保真:{out}"
+        json!("hardened"),
+        "缺省档应为侵入式原生化:{out}"
     );
     assert_eq!(v["data"]["stealth"]["fidelity"], json!(true), "保真块应生效:{out}");
+    assert_eq!(v["data"]["stealth"]["hardened"], json!(true), "原生化块应生效:{out}");
     let codes: Vec<String> = v["data"]["fingerprint"]["suspicious"]
         .as_array()
         .map(|a| {
@@ -1008,13 +1075,15 @@ async fn stealth_selfcheck_smoke() {
         "UA 不应带无头令牌:{codes:?}"
     );
 
-    // ⑩ 非侵入式档的分界线:不改函数身份(如实暴露源码)
+    // ⑩ 缺省档(hardened)的分界线:被改写函数的身份必须原生化 —— BOSS 直聘实测
+    //     fidelity 档下此处会吐出我们的源码,被 geetest 类风控采集加权后 302 到
+    //     verify.html。「改过」这件事本身不可反查,正是侵入式档的职责。
     let fid_src =
         eval("Function.prototype.toString.call(WebGLRenderingContext.prototype.getParameter)".into())
             .await;
     assert!(
-        !fid_src.contains("[native code]"),
-        "保真档不得伪装函数身份(那是侵入式档的事):{fid_src}"
+        fid_src.contains("[native code]"),
+        "缺省 hardened 档必须把被改写函数的身份原生化:{fid_src}"
     );
 
     // ⑪ 升侵入式档:被改写函数身份原生化(含 toString 自反闭合)
@@ -1086,8 +1155,8 @@ async fn stealth_headless_ua_destealth_smoke() {
     assert_eq!(v["data"]["mode"], json!("hidden"), "应为无头档:{out}");
     assert_eq!(
         v["data"]["stealth"]["mode"],
-        json!("fidelity"),
-        "缺省档应为非侵入式保真:{out}"
+        json!("hardened"),
+        "缺省档应为侵入式原生化(2026-10-16 起):{out}"
     );
     let page_id = v["data"]["page_id"].as_str().unwrap().to_string();
     let eval = |expr: String| {

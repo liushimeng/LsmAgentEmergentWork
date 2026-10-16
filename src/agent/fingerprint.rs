@@ -64,6 +64,34 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
         if (!p || !p.getParameter) return null;
         return /\[native code\]/.test(Function.prototype.toString.call(p.getParameter));
       } catch (e) { return null; }
+    })(),
+    // 第 175 轮:屏幕几何自洽自证(根治「outer > screen 物理不可能」)。
+    // `outer_gt_screen` = 窗口比屏幕还大,真实显示器宽度永远 ≥ 窗口宽度,
+    // 恒 false;命中即说明视口覆盖没带 screen 声明(screen 停在 800x600 无头默认值)。
+    geometry: (() => {
+      try {
+        const sw = screen.width, sh = screen.height;
+        const ow = window.outerWidth || 0, oh = window.outerHeight || 0;
+        return {
+          screen: sw + 'x' + sh,
+          window_outer: ow + 'x' + oh,
+          outer_gt_screen: ow > sw || oh > sh,
+          screen_is_headless_default: sw === 800 && sh === 600
+        };
+      } catch (e) { return null; }
+    })(),
+    // 第 175 轮:plugins/mimeTypes **对象形态**自证。回填动作只有与原生
+    // PluginArray 同构才安全(形状错误的回填比不回填更危险),故体检层必须能
+    // 看见形态失配:tag 不是 [object PluginArray] 或 instanceof 为 false
+    // 即说明我们造出了形状错误的替身。
+    plugin_shape_ok: (() => {
+      try {
+        if (!navigator.plugins || navigator.plugins.length === 0) return null; // 本就空,不判定
+        const tag = Object.prototype.toString.call(navigator.plugins);
+        const inst = (typeof PluginArray === 'function') ? (navigator.plugins instanceof PluginArray) : null;
+        const named = (() => { try { return !!navigator.plugins.namedItem('PDF Viewer'); } catch (e) { return false; } })();
+        return { tag, inst, named_item_ok: named };
+      } catch (e) { return null; }
     })()
   };
 })())"#;
@@ -124,6 +152,12 @@ pub fn classify(fp: &Value) -> Vec<Value> {
     // 全新 profile 冷启动)读它同样为 undefined —— 把它打成 suspicious 会把
     // 本机每一台合规启动的浏览器都标成可疑(2026-10-14 实测 oneshot 修复后的
     // example.com 探针误报)。故只采字段不告警,该项不进入 suspicious。
+    //
+    // 第 175 轮真机复核**确认了这条结论**:裸环境 `Object.keys(chrome)` 恒为
+    // `[app, csi, loadTimes]`,`chrome.runtime` 不存在。据此 `browser_ns::FIDELITY_JS`
+    // ④ 已删除「凭空补 runtime」的旧实现 —— 造一个空 `chrome.runtime` 既违反
+    // 「不伪造本机没有的信息」铁律,又可被一行识破(真实扩展上下文的 runtime
+    // 必有 id/connect/sendMessage,空 runtime 比没有 runtime 更可疑)。
     // Notification.permission = 'denied' 但 permissions.query 报告 'prompt'
     // 是知名检测组合;这里只做单侧提示(不额外发一次 permissions.query)。
     if fp.get("notification_permission").and_then(Value::as_str) == Some("denied") {
@@ -158,6 +192,51 @@ pub fn classify(fp: &Value) -> Vec<Value> {
                        需要更强隐蔽时升档 open(stealth=\"hardened\") —— 侵入式档会把这些函数的身份原生化"
         }));
     }
+    // ===================== 第 175 轮:屏幕几何与对象形态自证 =====================
+    // 两项都是「我们自己制造的破绽」类信号,命中即说明对应根治逻辑失效,
+    // 故措辞是明确的「处置」而非「可升档」。
+    if let Some(g) = fp.get("geometry").filter(|v| !v.is_null()) {
+        if g.get("outer_gt_screen").and_then(Value::as_bool) == Some(true) {
+            out.push(json!({
+                "code": "screen_geometry_impossible",
+                "advice": format!(
+                    "窗口比屏幕还大(window.outer={} > screen={}) —— 真实显示器宽度永远 ≥ 窗口宽度,\
+                     这是物理不可能,属零成本风控硬判据;根因是视口覆盖没带 screen 声明\
+                     (screen 停在 Chrome 无头默认值 800x600);处置:确认页面由本工具拉起\
+                     且走了屏幕几何自洽覆盖,headed 档不受影响",
+                    g.get("window_outer").and_then(Value::as_str).unwrap_or("?"),
+                    g.get("screen").and_then(Value::as_str).unwrap_or("?")
+                )
+            }));
+        } else if g.get("screen_is_headless_default").and_then(Value::as_bool) == Some(true) {
+            out.push(json!({
+                "code": "screen_headless_default",
+                "advice": "screen 恰为 Chrome 无头默认值 800x600(未收到 screen 声明的典型读数);\
+                           比 outer_gt_screen 更弱但同样指向无头环境,处置同 screen_geometry_impossible"
+            }));
+        }
+    }
+    // 形状错误的回填比不回填更危险 —— 形态失配是强信号(正常浏览器不会造错形状)。
+    // `plugin_shape_ok` 为 null 表示「插件本就为空 / 探测失败」,不参与判定。
+    if let Some(p) = fp.get("plugin_shape_ok").filter(|v| !v.is_null()) {
+        let tag_ok = p.get("tag").and_then(Value::as_str) == Some("[object PluginArray]");
+        let inst_bad = p.get("inst").and_then(Value::as_bool) == Some(false);
+        let named_bad = p.get("named_item_ok").and_then(Value::as_bool) == Some(false);
+        if !tag_ok || inst_bad || named_bad {
+            out.push(json!({
+                "code": "plugin_shape_mismatch",
+                "advice": format!(
+                    "plugins 替身与原生 PluginArray 形态不符(tag={} instanceof={} namedItem={})—— \
+                     形状错误的回填比不回填更危险(缺插件只是弱信号,错形状是强信号);\
+                     处置:确认注入的是最新 browser_ns::FIDELITY_JS(私有中间原型 + 真原型链),\
+                     旧的对象字面量实现会全线命中",
+                    p.get("tag").and_then(Value::as_str).unwrap_or("?"),
+                    p.get("inst").map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+                    p.get("named_item_ok").map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+                )
+            }));
+        }
+    }
     out
 }
 
@@ -173,6 +252,8 @@ pub fn build(fp: &Value) -> Value {
         "screen": fp.get("screen").cloned().unwrap_or(Value::Null),
         "timezone": fp.get("timezone").cloned().unwrap_or(Value::Null),
         "ua_brand": fp.get("ua_brand").cloned().unwrap_or(Value::Null),
+        "geometry": fp.get("geometry").cloned().unwrap_or(Value::Null),
+        "plugin_shape_ok": fp.get("plugin_shape_ok").cloned().unwrap_or(Value::Null),
         "suspicious": susp,
         "note": "suspicious 非空不代表一定被拦,但站点风控采这些字段加权很高;\
                  被拦时的首选改道是 open(reuse_existing=true) 接管用户已登录的真实浏览器"
@@ -277,6 +358,87 @@ mod tests {
                              "webgl": {"ok": true, "unmasked": true,
                                        "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"}});
         assert!(codes(&missing).is_empty(), "缺测不得告警:{:?}", codes(&missing));
+    }
+
+    #[test]
+    fn 屏幕几何不自洽命中() {
+        // 真机实测的坏形态:window.outer=1920x1080 但 screen 只有 800x600
+        // (视口覆盖没带 screen 声明,屏幕停在 Chrome 无头默认值)
+        let v = fp(
+            json!({"ok": true, "unmasked": true,
+                   "vendor": "Google Inc. (Intel)",
+                   "renderer": "ANGLE (Intel, Intel(R) UHD Graphics, D3D11)"}),
+            json!({"geometry": {"screen": "800x600", "window_outer": "1920x1080",
+                                "outer_gt_screen": true, "screen_is_headless_default": true}}),
+        );
+        let c = codes(&v);
+        // 两条信号强弱有别:物理不可能(outer>screen)是硬判据,优先报出并
+        // **不再叠加**较弱的「screen 恰为无头默认值」,避免同一根因刷两条告警。
+        assert_eq!(c, vec!["screen_geometry_impossible".to_string()], "{c:?}");
+        // 仅 screen 落在无头默认值、但未越界(弱信号单独成码)
+        let weak = fp(
+            json!({"ok": true, "unmasked": true,
+                   "vendor": "Google Inc. (Intel)",
+                   "renderer": "ANGLE (Intel, Intel(R) UHD Graphics, D3D11)"}),
+            json!({"geometry": {"screen": "800x600", "window_outer": "800x600",
+                                "outer_gt_screen": false, "screen_is_headless_default": true}}),
+        );
+        assert!(codes(&weak).contains(&"screen_headless_default".to_string()), "{:?}", codes(&weak));
+        // 自洽形态(补过 screen 声明)不得告警
+        let ok = fp(
+            json!({"ok": true, "unmasked": true,
+                   "vendor": "Google Inc. (Intel)",
+                   "renderer": "ANGLE (Intel, Intel(R) UHD Graphics, D3D11)"}),
+            json!({"geometry": {"screen": "1920x1080", "window_outer": "1920x1080",
+                                "outer_gt_screen": false, "screen_is_headless_default": false}}),
+        );
+        assert!(codes(&ok).is_empty(), "几何自洽不得告警:{:?}", codes(&ok));
+        // 缺测 fail-open
+        let missing = fp(json!({"ok": true, "unmasked": true,
+                                "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"}), json!({}));
+        assert!(codes(&missing).is_empty(), "缺 geometry 不得告警:{:?}", codes(&missing));
+    }
+
+    #[test]
+    fn 插件形态失配命中() {
+        let base = json!({"ok": true, "unmasked": true,
+                          "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"});
+        // 三种失配各命中一次
+        for bad in [
+            json!({"tag": "[object Object]", "inst": false, "named_item_ok": true}),
+            json!({"tag": "[object PluginArray]", "inst": false, "named_item_ok": true}),
+            json!({"tag": "[object PluginArray]", "inst": true, "named_item_ok": false}),
+        ] {
+            let v = fp(base.clone(), json!({"plugin_shape_ok": bad}));
+            assert!(
+                codes(&v).contains(&"plugin_shape_mismatch".to_string()),
+                "{bad} 应命中,实际 {:?}",
+                codes(&v)
+            );
+        }
+        // 形态正确 → 不告警
+        let good = fp(base.clone(), json!({"plugin_shape_ok": {
+            "tag": "[object PluginArray]", "inst": true, "named_item_ok": true }}));
+        assert!(codes(&good).is_empty(), "形态正确不得告警:{:?}", codes(&good));
+        // 插件本就为空(未触发回填)→ 不判定,fail-open
+        let empty = fp(base, json!({"plugin_shape_ok": serde_json::Value::Null}));
+        assert!(codes(&empty).is_empty(), "plugins 为空不得判定形态:{:?}", codes(&empty));
+    }
+
+    #[test]
+    fn chrome运行时恒不告警() {
+        // 第 175 轮真机实测:无扩展的真实 Chrome 就没有 chrome.runtime,
+        // 故无论读到什么都不得判为可疑(否则会把每台合规浏览器都标红)。
+        for rt in [json!(false), json!(true)] {
+            let v = fp(json!({"ok": true, "unmasked": true,
+                              "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"}),
+                       json!({"chrome_runtime": rt.clone()}));
+            assert!(
+                !codes(&v).contains(&"chrome_runtime".to_string()),
+                "chrome_runtime={rt} 不得告警:{:?}",
+                codes(&v)
+            );
+        }
     }
 
     #[test]

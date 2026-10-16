@@ -98,6 +98,50 @@ pub fn viewport_fit_plan(
     }
 }
 
+// =================== 第 175 轮:屏幕几何自洽(反检测) ===================
+
+/// 覆盖视口时**同尺寸声明屏幕**是否需要(纯函数,单测锁死)。
+///
+/// 背景(第 175 轮真机实测):`Emulation.setDeviceMetricsOverride` 若只带
+/// `width`/`height`,`screen.*` 保持 Chrome 的无头默认值 `800x600`,于是页面读到
+/// `screen.width(800) < window.outerWidth(1920)` —— **物理不可能**
+/// (真实显示器宽度永远 ≥ 窗口宽度),是一条零成本、零误伤的风控硬判据。
+/// chromiumoxide 0.9 的 `emulation.rs::init_commands` 正是只传 width/height。
+///
+/// 取值即本次覆盖的 width/height —— 不编造屏幕尺寸,只让「已知的窗口尺寸」与
+/// 「页面读到的屏幕尺寸」保持自洽(同 `browser_ns` 的保真原则)。
+pub fn screen_sync_needed(override_w: u32, override_h: u32) -> bool {
+    override_w > 0 && override_h > 0
+}
+
+/// 几何自洽探针(页面侧求值):返回 `screen` / `window` 实测与两条不自洽信号。
+///
+/// 供 `data.fingerprint` 自证用 —— 「屏幕几何不自洽」是本轮根治项,
+/// 体检层必须能看见它,否则回归了也没人知道。
+pub const GEOMETRY_PROBE_JS: &str = r#"JSON.stringify((() => {
+  try {
+    const sw = screen.width, sh = screen.height;
+    const ow = window.outerWidth || 0, oh = window.outerHeight || 0;
+    const iw = window.innerWidth || 0, ih = window.innerHeight || 0;
+    return {
+      screen: sw + 'x' + sh,
+      avail: (screen.availWidth || 0) + 'x' + (screen.availHeight || 0),
+      window_outer: ow + 'x' + oh,
+      window_inner: iw + 'x' + ih,
+      dpr: window.devicePixelRatio || 1,
+      // 物理不可能:窗口比屏幕还大
+      outer_gt_screen: ow > sw || oh > sh,
+      // 无头默认值残留(800x600 是 Chrome 未收到 screen 声明时的报值)
+      screen_is_headless_default: sw === 800 && sh === 600
+    };
+  } catch (e) { return null; }
+})())"#;
+
+/// 几何探针解析 → 体检可用的结构(缺测 fail-open 返回 `None`)。
+pub fn parse_geometry(raw: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(raw.trim()).ok()
+}
+
 // =================== 有头模式窗口收边与视口下限(第 139 轮) ===================
 
 /// 由 `outer*/inner*` 实测推导 chrome 高度,**对失真测量做可信性判定**(第 156 轮)。
@@ -516,6 +560,40 @@ mod tests {
             plausible_chrome_height(1920.0, 500.0, 1920.0, 900.0),
             HEADED_CHROME_FALLBACK_H as f64
         );
+    }
+
+    // =================== 第 175 轮:屏幕几何自洽 ===================
+
+    /// 真机实测(`verify.js`):`Emulation.setDeviceMetricsOverride` 只带 width/height
+    /// 时页面读到 `screen=800x600`(Chrome 无头默认值)而 `outer=1920x1080`,
+    /// `outer > screen` 是**物理不可能**(真实显示器宽度永远 ≥ 窗口宽度),
+    /// 属零成本零误伤的风控硬判据。补上 screen 声明后该信号消失。
+    #[test]
+    fn 屏幕几何自洽判据() {
+        assert!(screen_sync_needed(1920, 1080), "两档 headless 的 1080p 应补 screen 声明");
+        assert!(screen_sync_needed(2560, 1440), "2K 扩展档同样需要");
+        // 退化尺寸不触发(避免下发无意义的覆盖)
+        assert!(!screen_sync_needed(0, 1080));
+        assert!(!screen_sync_needed(1920, 0));
+    }
+
+    #[test]
+    fn 几何探针解析缺测fail_open() {
+        use serde_json::json;
+        let raw = r#"{"screen":"1920x1080","window_outer":"1920x1080","outer_gt_screen":false,"screen_is_headless_default":false}"#;
+        let g = parse_geometry(raw).expect("应解析成功");
+        assert_eq!(g["outer_gt_screen"], json!(false));
+        assert_eq!(g["screen"], json!("1920x1080"));
+        // 探测表达式故障 → None(fail-open,不告警)
+        assert!(parse_geometry("garbage").is_none());
+    }
+
+    #[test]
+    fn 几何探针脚本存在关键判据() {
+        assert!(GEOMETRY_PROBE_JS.contains("outer_gt_screen"));
+        assert!(GEOMETRY_PROBE_JS.contains("screen_is_headless_default"));
+        assert!(GEOMETRY_PROBE_JS.contains("outerWidth"));
+        assert!(GEOMETRY_PROBE_JS.contains("JSON.stringify"));
     }
 
     // =================== 铺满率复核 ===================

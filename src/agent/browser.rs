@@ -110,6 +110,13 @@ struct BrowserInner {
     /// 进程外 parent-death watchdog（仅 launch 模式）。
     watchdog: Option<std::process::Child>,
     connect_mode: bool,
+    /// 第 175 轮:屏幕几何自洽尺寸(两档 headless 才有值)——
+    /// chromiumoxide 的视口覆盖**不发** `screen_width`/`screen_height`,页面于是读到
+    /// 无头默认值 `screen=800x600` 而 `window.outerWidth=1920`(`outer > screen`
+    /// 物理不可能,是零成本的风控硬判据)。此处记账的是**已知窗口尺寸**,
+    /// 页面创建后据此补发一次同尺寸的 screen 声明,不是编造屏幕分辨率。
+    /// headed / connect 恒 `None`(不覆盖视口,页面视口=窗口内容区,本就自洽)。
+    screen_sync: Option<(u32, u32)>,
     /// connect 模式下对端的调试端口(2026-10-14 第二轮:判定本次接管的是否
     /// laew 自起的 auto_relaunch 调试实例 —— 它是 laew 身份(CDP 拉起+复制
     /// profile),指纹级打标站点对它的抹除要计入总账;用户日常 Chrome 不记)。
@@ -483,6 +490,39 @@ pub(crate) fn custom_launch_flags(headless: bool, geo_prompt: bool) -> Vec<Strin
     flags.into_iter().map(str::to_string).collect()
 }
 
+/// 第 175 轮:下发一次**同尺寸的 screen 声明**,让页面读到的 `screen.*` 与
+/// `window.outer*` 自洽(见 [`BrowserInner::screen_sync`] 的完整背景)。
+///
+/// 复用已有的 device metrics 覆盖通道:同一条命令补 `screen_width`/`screen_height`,
+/// 不新增 CDP 往返。fail-open(覆盖下发失败不阻断导航 —— 只损几何自洽,不损功能)。
+async fn apply_screen_sync_override(page: &chromiumoxide::Page, sync: Option<(u32, u32)>) {
+    let Some((w, h)) = sync else { return };
+    if !super::browser_viewport::screen_sync_needed(w, h) {
+        return;
+    }
+    let params =
+        match chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::builder()
+            .width(w as i64)
+            .height(h as i64)
+            .device_scale_factor(1.0)
+            .screen_width(w as i64)
+            .screen_height(h as i64)
+            .position_x(0)
+            .position_y(0)
+            .mobile(false)
+            .build()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("屏幕几何自洽覆盖参数构造失败(页面将读到 screen=800x600 无头默认值): {e}");
+                return;
+            }
+        };
+    if let Err(e) = page.execute(params).await {
+        tracing::warn!("屏幕几何自洽覆盖下发失败(outer>screen 的物理不可能仍会暴露): {e}");
+    }
+}
+
 /// 预置 Chrome profile,跳过首启体验(欢迎对话框 / 后台常驻 / 崩溃恢复气泡)。
 ///
 /// 双保险:即便 `--no-first-run` 因上游参数渲染问题失效,profile 侧的
@@ -526,6 +566,7 @@ impl BrowserManager {
                         watchdog: None,
                         connect_mode: false,
                         connected_port: None,
+                        screen_sync: None,
                         pages: HashMap::new(),
                         user_data_dir: None,
                         mode: BrowserMode::Hidden,
@@ -652,6 +693,9 @@ impl BrowserManager {
         let mut inner = self.inner.lock().await;
         let mut launch_dir: Option<PathBuf> = None;
         let mut launch_watchdog: Option<std::process::Child> = None;
+        // 第 175 轮:两档 headless 的屏幕几何自洽尺寸(见 builder 处的注释),
+        // 页面创建后据此补发一次带 screen 字段的 device metrics 覆盖。
+        let mut headless_screen_sync: Option<(u32, u32)> = None;
         // launch 模式浏览器主进程 PID(第 127 轮):供 cleanup_registry 登记给
         // cleanup_sync 同步清理路径使用;connect 模式保持 0(不拥有外部进程)。
         let mut launch_pid: u32 = 0;
@@ -837,6 +881,23 @@ impl BrowserManager {
                         })
                     }
                 };
+                // 第 175 轮:无头档**屏幕几何自洽**。chromiumoxide 0.9 的
+                // `emulation.rs::init_commands` 只发 width/height,**从不发
+                // screen_width/screen_height**(源码已核)→ 页面读到
+                // `screen.width = 800x600`(Chrome 无头默认值)而
+                // `window.outerWidth = 1920` —— 窗口比屏幕还大,**物理不可能**,
+                // 是零成本零误伤的风控硬判据(`verify.js` 实测:`outer_gt_screen`
+                // 由 true 变 false)。headed 档无此问题(不覆盖视口,页面视口=窗口
+                // 内容区),故只对两档 headless 在此补记屏幕尺寸,待页面创建后
+                // 由 `apply_screen_sync_override` 下发。
+                headless_screen_sync = match mode {
+                    BrowserMode::Hidden | BrowserMode::NewHeadless
+                        if super::browser_viewport::screen_sync_needed(win_w, win_h) =>
+                    {
+                        Some((win_w, win_h))
+                    }
+                    _ => None,
+                };
                 // 一次性 user-data-dir:避免 chromiumoxide 默认固定目录的 SingletonLock 冲突
                 // (并行/上次异常退出后残留锁会导致 Chrome 拒启),同时与用户日常 profile 隔离。
                 let dir = std::env::temp_dir().join(format!("laew_browser_{}", {
@@ -882,6 +943,8 @@ impl BrowserManager {
             inner.handler = Some(handler);
             inner.watchdog = launch_watchdog;
             inner.connect_mode = connect_mode;
+            // 第 175 轮:屏幕几何自洽尺寸随实例记账(两档 headless 才有值)。
+            inner.screen_sync = headless_screen_sync;
             inner.user_data_dir = launch_dir.clone();
             // 第 142 轮(复用已登录浏览器):connect 接管用户已启动的浏览器,请求
             // mode 只影响注入判断 —— 按有头处理;管控强制 open(不锁用户自己
@@ -952,6 +1015,10 @@ impl BrowserManager {
         if !inner.connect_mode {
             super::browser_ns::apply_ua_destealth(&page, inner.stealth).await;
         }
+        // 第 175 轮:屏幕几何自洽 —— 与 UA 清理同批(都在首次导航前下发),
+        // 让首个文档起就满足 `outer <= screen`(真机实测:不补则
+        // screen=800x600 < outer=1920,物理不可能,风控一行即可判定)。
+        apply_screen_sync_override(&page, inner.screen_sync).await;
         tokio::time::timeout(browser_timeout, page.goto(url.to_string()))
             .await
             .map_err(|_| {
@@ -1727,6 +1794,13 @@ impl BrowserManager {
             .width(tw as i64)
             .height(th as i64)
             .device_scale_factor(dpr.clamp(1.0, 4.0))
+            // 第 175 轮:同尺寸声明 screen —— 2K 扩展会把 innerWidth 撑到 2560,
+            // 而 screen 仍是无头默认值 800x600,`outer > screen` 物理不可能同样成立
+            // (与启动档同一根因,这里同样补齐)。
+            .screen_width(tw as i64)
+            .screen_height(th as i64)
+            .position_x(0)
+            .position_y(0)
             .mobile(false)
             .build()
             .map_err(|e| e.to_string())?;

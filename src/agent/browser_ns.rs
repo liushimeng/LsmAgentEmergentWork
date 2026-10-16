@@ -142,36 +142,119 @@ const FIDELITY_JS: &str = r#"
 
     // ② plugins / mimeTypes 空值回填:真实桌面 Chrome 恒 ≥5 个 PDF 查看器插件,
     //    为 0 是典型无头/受限环境特征(见 fingerprint.rs::no_plugins)。
+    //
+    //    【第 175 轮重写 · 原型自洽】旧实现用**对象字面量**造 PluginArray,实测十项
+    //    判据全被识破:toString 报 `[object Object]`(原生 `[object PluginArray]`),
+    //    `instanceof PluginArray` 为 false、constructor 为 Object、
+    //    `length/item/namedItem/refresh` 成了实例 own(原生全在原型上)、
+    //    无 Symbol.iterator、元素不是 Plugin、元素多出 name/filename 等 own 键。
+    //    **形状错误的回填比不回填更危险**:缺插件只是弱信号(受限环境本就没有),
+    //    而「形状错误的 PluginArray」是强信号(正常浏览器不会造错形状)。
+    //    另修一个逻辑错:mimeTypes 必须**按 type 去重**为 2 条,旧实现按插件各 push
+    //    一份会变成 10 条。
+    //    新做法 = 三层私有原型链,与原生逐字段同形:
+    //        实例(own 只有索引+具名键) → 私有中间原型(方法/getter/iterator/tag) → 真原型
     try {
-        if (!navigator.plugins || navigator.plugins.length === 0) {
+        if ((!navigator.plugins || navigator.plugins.length === 0)
+            && typeof PluginArray === 'function' && typeof Plugin === 'function'
+            && typeof MimeTypeArray === 'function' && typeof MimeType === 'function') {
             const MIMES = [
                 { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
                 { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' }
             ];
             const NAMES = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer',
                            'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'];
-            const makeMime = (m, plugin) => ({
-                type: m.type, suffixes: m.suffixes, description: m.description, enabledPlugin: plugin
+            // 每个数组体各有自己的私有中间原型,故 namedItem 的「按具名键回指实例」
+            // 用**每次调用独立的闭包变量**(不能共用一个 ctx.self:plugins 与
+            // mimeTypes 两个数组体先后构造会互相覆盖,实测 namedItem 恒查不到)。
+            const ctx = { plugins: [], mimeByType: new Map(), mimeOrder: [] };
+            const mimeOrder = ctx.mimeOrder;
+            const descriptorFor = {
+                getter: (name, fn) => ({ get: reg(fn, 'get ' + name), enumerable: true, configurable: true }),
+                method: (name, fn) => ({ value: reg(fn, name), writable: true, enumerable: true, configurable: true })
+            };
+            // MimeType 元素:四个字段全挂中间原型 getter,实例 own 为空(原生即如此)。
+            const makeMime = (spec, plugin) => {
+                const proto = Object.create(MimeType.prototype);
+                Object.defineProperties(proto, {
+                    type: descriptorFor.getter('type', function () { return spec.type; }),
+                    suffixes: descriptorFor.getter('suffixes', function () { return spec.suffixes; }),
+                    description: descriptorFor.getter('description', function () { return spec.description; }),
+                    enabledPlugin: descriptorFor.getter('enabledPlugin', function () { return plugin; })
+                });
+                return Object.create(proto);
+            };
+            NAMES.forEach((name) => {
+                const proto = Object.create(Plugin.prototype);
+                Object.defineProperties(proto, {
+                    name: descriptorFor.getter('name', function () { return name; }),
+                    filename: descriptorFor.getter('filename', function () { return 'internal-pdf-viewer'; }),
+                    description: descriptorFor.getter('description', function () { return 'Portable Document Format'; })
+                });
+                const plugin = Object.create(proto);
+                const own = MIMES.map((spec, i) => {
+                    let mime = ctx.mimeByType.get(spec.type);
+                    if (!mime) {
+                        mime = makeMime(spec, plugin);
+                        ctx.mimeByType.set(spec.type, mime);
+                        mimeOrder.push(mime);
+                    }
+                    return mime;
+                });
+                Object.defineProperties(proto, {
+                    length: descriptorFor.getter('length', function () { return own.length; }),
+                    item: descriptorFor.method('item', function item(i) {
+                        return (i >= 0 && i < own.length) ? own[i] : null;
+                    }),
+                    namedItem: descriptorFor.method('namedItem', function namedItem(n) {
+                        return (typeof n === 'string' && plugin[n]) ? plugin[n] : null;
+                    })
+                });
+                // 实例 own = mime 索引 + mime type 具名键(与原生 Plugin 实例同形)
+                own.forEach((mime, i) => {
+                    Object.defineProperty(plugin, String(i),
+                        { value: mime, enumerable: true, writable: false, configurable: true });
+                    Object.defineProperty(plugin, mime.type,
+                        { value: mime, enumerable: true, writable: false, configurable: true });
+                });
+                ctx.plugins.push(plugin);
             });
-            const plugins = NAMES.map((name) => {
-                const plugin = {
-                    name: name, filename: 'internal-pdf-viewer',
-                    description: 'Portable Document Format', length: MIMES.length
-                };
-                const mimes = MIMES.map((m) => makeMime(m, plugin));
-                plugin.item = (i) => (i >= 0 && i < mimes.length ? mimes[i] : null);
-                plugin.namedItem = (t) => mimes.filter((m) => m.type === t)[0] || null;
-                return plugin;
-            });
-            const mimeTypes = MIMES.map((m) => makeMime(m, plugins[0]));
-            const arrLike = (items) => {
-                const o = {
-                    length: items.length,
-                    item: (i) => (i >= 0 && i < items.length ? items[i] : null),
-                    namedItem: (n) => items.filter((x) => x.name === n || x.type === n)[0] || null,
-                    refresh: () => undefined
-                };
-                items.forEach((it, i) => { try { o[i] = it; } catch (e) {} });
+            // 数组体:实例 own 只有索引 + 具名键;length 与方法全在中间原型上。
+            const makeArrayLike = (items, RealProto, tag, nameOf) => {
+                const proto = Object.create(RealProto);
+                let selfRef = null;   // 本数组体实例的引用(namedItem 按具名键回指它)
+                Object.defineProperties(proto, {
+                    length: descriptorFor.getter('length', function () { return items.length; }),
+                    item: descriptorFor.method('item', function item(i) {
+                        return (i >= 0 && i < items.length) ? items[i] : null;
+                    }),
+                    namedItem: descriptorFor.method('namedItem', function namedItem(n) {
+                        return (typeof n === 'string' && selfRef && selfRef[n]) ? selfRef[n] : null;
+                    }),
+                    refresh: descriptorFor.method('refresh', function refresh() {})
+                });
+                Object.defineProperty(proto, Symbol.iterator, {
+                    value: reg(function () {
+                        let i = 0;
+                        return { next: () => i < items.length
+                            ? { value: items[i++], done: false }
+                            : { value: undefined, done: true } };
+                    }, '[Symbol.iterator]'),
+                    writable: true, enumerable: false, configurable: true
+                });
+                Object.defineProperty(proto, Symbol.toStringTag,
+                    { value: tag, enumerable: false, configurable: true });
+                const o = Object.create(proto);
+                items.forEach((it, i) => {
+                    Object.defineProperty(o, String(i),
+                        { value: it, enumerable: true, writable: false, configurable: true });
+                    const key = nameOf(it);
+                    if (key != null) {
+                        Object.defineProperty(o, key,
+                            { value: it, enumerable: true, writable: false, configurable: true });
+                    }
+                });
+                selfRef = o;
                 return o;
             };
             const defNav = (key, val) => {
@@ -182,8 +265,10 @@ const FIDELITY_JS: &str = r#"
                     });
                 } catch (e) {}
             };
-            defNav('plugins', arrLike(plugins));
-            defNav('mimeTypes', arrLike(mimeTypes));
+            defNav('plugins', makeArrayLike(ctx.plugins, PluginArray.prototype,
+                'PluginArray', (p) => p.name));
+            defNav('mimeTypes', makeArrayLike(mimeOrder, MimeTypeArray.prototype,
+                'MimeTypeArray', (m) => m.type));
         }
     } catch (e) {}
 
@@ -202,19 +287,38 @@ const FIDELITY_JS: &str = r#"
         }
     } catch (e) {}
 
-    // ④ window.chrome 缺失回填:真实桌面 Chrome 恒有(chrome.runtime 是常见检测项)。
+    // ④ window.chrome 缺失兜底。**第 175 轮实测修正**:真机裸环境(全新 profile、
+    //    无扩展)读到的是 `{app, csi, loadTimes}` —— **没有 `chrome.runtime`**。
+    //    它只在加载了扩展的页面暴露。旧实现在缺失时造一个空 `chrome.runtime`,
+    //    等于凭空造出「本机没有的身份信息」(违反工程铁律),且更糟的是**可被一行
+    //    识破**:真实扩展上下文的 `chrome.runtime` 必有 `id`/`connect`/`sendMessage`,
+    //    空 runtime 比没有 runtime 更可疑。故本分支只补真机实测存在的 csi/loadTimes/app。
+    //    注:该分支近乎不可达(真实 Chrome `window.chrome` 恒有),仅作防御保留。
     try {
         if (!window.chrome) {
+            const app = {
+                isInstalled: false,
+                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+            };
+            const csi = reg(function csi() {
+                const t = (typeof performance !== 'undefined' && performance.timing) || {};
+                return { onloadT: t.domContentLoadedEventEnd || 0, startE: t.navigationStart || 0, pageT: 0, tran: 15 };
+            }, 'csi');
+            const loadTimes = reg(function loadTimes() {
+                const t = (typeof performance !== 'undefined' && performance.timing) || {};
+                return {
+                    commitLoadTime: t.domContentLoadedEventEnd || 0,
+                    finishDocumentLoadTime: t.domContentLoadedEventEnd || 0,
+                    finishLoadTime: t.loadEventEnd || 0,
+                    navigationStart: t.navigationStart || 0,
+                    requestTime: t.navigationStart || 0
+                };
+            }, 'loadTimes');
             Object.defineProperty(window, 'chrome', {
-                value: { runtime: {}, app: { isInstalled: false } },
+                value: { app, csi, loadTimes },
                 configurable: true, enumerable: true, writable: true
             });
-        } else if (!window.chrome.runtime) {
-            try {
-                Object.defineProperty(window.chrome, 'runtime', {
-                    value: {}, configurable: true, enumerable: true
-                });
-            } catch (e) {}
         }
     } catch (e) {}
 
@@ -537,9 +641,10 @@ mod tests {
         assert!(f.contains("Chrome PDF Viewer"));
         // ③ languages 空值回填
         assert!(f.contains("get languages"));
-        // ④ window.chrome 缺失回填
+        // ④ window.chrome 缺失兜底(第 175 轮:只补真机实测存在的三件套)
         assert!(f.contains("'chrome'"));
-        assert!(f.contains("chrome.runtime"));
+        assert!(f.contains("chrome.app") || f.contains("InstallState"));
+        assert!(f.contains("csi") && f.contains("loadTimes"));
         // ⑤ permissions 一致性(只在不一致时就地改写返回对象 state)
         assert!(f.contains("Permissions.prototype.query"));
         assert!(f.contains("notifications"));
@@ -557,6 +662,89 @@ mod tests {
         // 原生描述符形态:toString 必须不可枚举
         assert!(h.contains("writable: true, enumerable: false"));
         assert!(h.contains("[native code]"));
+    }
+
+    // ===================== 第 175 轮:对象形态自洽(真机实测驱动) =====================
+
+    /// 第 175 轮真机实测(Chrome 155,`accept.js`):旧的对象字面量实现有十项判据
+    /// 全被识破(tag/instanceof/ctor/proto 链/own 键构成/iterator/元素形态…),
+    /// 而**形状错误的回填比不回填更危险** —— 缺插件只是弱信号(受限环境本就没有),
+    /// 形状错误的 PluginArray 是强信号(正常浏览器不会造错形状)。
+    /// 本测试锁死「必须走真原型链 + 方法挂中间原型」这两条根本判据。
+    #[test]
+    fn 保真块插件回填走真原型链而非对象字面量() {
+        use crate::agent::stealth::StealthMode;
+        let f = stealth_js_for(StealthMode::Fidelity).unwrap();
+        // 真实原型为祖先。PluginArray/MimeTypeArray 的真原型经 makeArrayLike 的
+        // `RealProto` 形参传入(两个数组体共用一段构造逻辑),Plugin/MimeType
+        // 则直接以字面量作为中间原型的祖先。
+        for proto in ["Plugin.prototype", "MimeType.prototype"] {
+            assert!(
+                f.contains(&format!("Object.create({proto})")),
+                "回填对象必须以 {proto} 为原型祖先,否则 instanceof / toString 标签全线失配"
+            );
+        }
+        assert!(
+            f.contains("Object.create(RealProto)") && f.contains("PluginArray.prototype"),
+            "数组体必须以传入的真原型为祖先(PluginArray.prototype / MimeTypeArray.prototype)"
+        );
+        // toStringTag 决定 `Object.prototype.toString.call()` 的读数
+        assert!(f.contains("'PluginArray'") && f.contains("'MimeTypeArray'"));
+        // Symbol.iterator:原生 PluginArray 可迭代,旧实现(普通对象)没有
+        assert!(f.contains("Symbol.iterator"));
+        // 缺型元素同样要形态正确(元素字段挂中间原型 getter,实例 own 为空)
+        assert!(f.contains("enabledPlugin") && f.contains("Object.defineProperties(proto"));
+    }
+
+    /// mimeTypes 必须**按 type 去重为 2 条**:旧实现按「每个插件各 push 一份」
+    /// 会变成 10 条,真机原生恒为 2(实测 `mimeTypes.length === 2`)。
+    #[test]
+    fn mime类型按type去重而非按插件数放大() {
+        use crate::agent::stealth::StealthMode;
+        let f = stealth_js_for(StealthMode::Fidelity).unwrap();
+        assert!(
+            f.contains("mimeByType"),
+            "必须用 type→mime 的映射去重,直接按插件 push 会把 2 条放大成 10 条"
+        );
+        assert!(
+            f.contains("ctx.mimeByType.get(spec.type)"),
+            "已建过的 type 必须复用而非新建"
+        );
+    }
+
+    /// 第 175 轮真机实测:全新 profile 的**真实 Chrome 没有 `chrome.runtime`**
+    /// (`Object.keys(chrome)` 恒为 `[app, csi, loadTimes]`)。凭空补一个空
+    /// `chrome.runtime` 既违反「不伪造本机没有的信息」铁律,又可被一行识破 ——
+    /// 真实扩展上下文的 runtime 必有 id/connect/sendMessage,空 runtime 更可疑。
+    #[test]
+    fn 不伪造本机没有的chrome运行时字段() {
+        use crate::agent::stealth::StealthMode;
+        for m in [StealthMode::Fidelity, StealthMode::Hardened] {
+            let s = stealth_js_for(m).unwrap();
+            assert!(
+                !s.contains("'runtime'"),
+                "保真块不得凭空补 chrome.runtime(真机裸环境无此字段,空 runtime 比没有更可疑)"
+            );
+            // 真机实测存在的两件套仍应保留
+            assert!(s.contains("csi") && s.contains("loadTimes"));
+        }
+    }
+
+    /// `namedItem` 必须按**实例的具名键**查找:具名键挂在实例上而方法挂在共享的
+    /// 中间原型上,故需要一个回指实例的闭包变量。早期实现查 `items[n]`
+    /// (数组的具名键不在数组上)恒返回 null —— 实测已复现该失效。
+    #[test]
+    fn 具名查找回指实例而非闭包数组() {
+        use crate::agent::stealth::StealthMode;
+        let f = stealth_js_for(StealthMode::Fidelity).unwrap();
+        assert!(
+            f.contains("selfRef"),
+            "namedItem 须经 selfRef 回指数组体实例(具名键在实例上,不在 items 数组上)"
+        );
+        assert!(
+            !f.contains("items[n]"),
+            "不得按数组下标做具名查找 —— 恒查不到,实测 namedItem 返回 null"
+        );
     }
 }
 
