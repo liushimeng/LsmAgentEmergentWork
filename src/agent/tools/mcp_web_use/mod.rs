@@ -234,7 +234,7 @@ pub(super) async fn eval_js_string(
     let shaped = eval_sanitize::wrap_bare_toplevel_return(js);
     let js = crate::agent::browser_ns::render_ns(&eval_sanitize::shield_toplevel_lexical(&shaped));
     let params = EvaluateParams::builder()
-        .expression(js)
+        .expression(js.clone())
         .return_by_value(true)
         .build()
         .map_err(|e| e.to_string())?;
@@ -245,8 +245,75 @@ pub(super) async fn eval_js_string(
     )
     .await
     .map_err(|_| format!("eval_js 执行超时({}ms): {EVAL_TIMEOUT_HINT}", eval_timeout_from_env()))?
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format_eval_err(&e, &js))?;
     Ok(v.value().cloned().unwrap_or(Value::Null))
+}
+
+/// eval_js 失败归一(2026-10-16,USA.gov 遍历实测):`CdpError::JavascriptException`
+/// 的 Display 是 `#[error("{0:?}")]` 结构体 Debug 裸串 —— 真正的错误文本
+/// (`exception.description`,如 `SyntaxError: Unexpected token ')'`)排在
+/// `script_id`/`hash` 之后,被首行 120 字符截断后模型只能靠列号盲猜(实测单次
+/// 语法错误白烧 1~2 轮迭代,24 步 sequence 内连环 2002 整批作废)。此处下钻出
+/// 「错误文本首行 + 行列 + 出错位置附近脚本摘录」;非 JS 异常回退首行截断语义。
+pub(super) fn format_eval_err(
+    e: &chromiumoxide::error::CdpError,
+    script: &str,
+) -> String {
+    use chromiumoxide::error::CdpError;
+    if let CdpError::JavascriptException(details) = e {
+        let desc = details
+            .exception
+            .as_ref()
+            .and_then(|ex| {
+                ex.description
+                    .clone()
+                    .or_else(|| ex.value.as_ref().and_then(|v| v.as_str().map(str::to_string)))
+            })
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| details.text.clone());
+        let head: String = desc.lines().next().unwrap_or("").trim().chars().take(160).collect();
+        let line = details.line_number.max(0) as usize;
+        let col = details.column_number.max(0) as usize;
+        return format!(
+            "JS异常[{head}] (line {line} col {col}) 出错位置附近: {}",
+            script_excerpt(script, line, col)
+        );
+    }
+    let s = e.to_string();
+    let first = s.lines().next().unwrap_or(&s);
+    let mut out: String = first.chars().take(120).collect();
+    if first.chars().count() > 120 {
+        out.push('…');
+    }
+    out
+}
+
+/// 出错位置附近脚本摘录(诊断用,F1):按 CDP 的 0-based line/col 定位,取
+/// [前 48, 后 24] 字符窗口;char 计数近似 UTF-16 列(BMP 内等价,代理对仅差
+/// 偏移少许,诊断场景可接受);越界/定位失败回退脚本尾部。
+fn script_excerpt(script: &str, line: usize, col: usize) -> String {
+    let chars: Vec<char> = script.chars().collect();
+    let mut offset = 0usize;
+    for _ in 0..line {
+        match chars.get(offset..).and_then(|rest| rest.iter().position(|&c| c == '\n')) {
+            Some(i) => offset += i + 1,
+            None => {
+                offset = chars.len();
+                break;
+            }
+        }
+    }
+    let pos = offset.saturating_add(col).min(chars.len());
+    let start = pos.saturating_sub(48);
+    let end = (pos + 24).min(chars.len());
+    let mut s: String = chars[start..end].iter().collect();
+    if start > 0 {
+        s.insert_str(0, "…");
+    }
+    if end < chars.len() {
+        s.push('…');
+    }
+    s.replace('\n', "\\n")
 }
 
 /// 找元素中心点 (x,y,w,h,visible);不存在返回 Err("not_found")。
@@ -1875,7 +1942,7 @@ async fn run_open_new_window(args: &Value, url: &str) -> Result<String> {
                 "windows": windows_now,
                 "max_windows": cap,
                 "env": "LAEW_WEB_MAX_WINDOWS",
-                "hint": "先 close(page_id=…) 关闭闲置页面(窗口内最后一页关闭时 Chrome 自动收窗),或提高上限后重试",
+                "hint": "先 close(page_id=…) 关闭闲置页面(窗口内最后一页关闭时 Chrome 自动收窗),或提高上限后重试;窗口都被其它 Agent 占用时可改用 open(url)(不带 new_window,在既有窗口开新 Tab;后台 Tab 渲染挂起,操作前 list 查 foreground / control(bring_to_front) 前台化)继续工作,不要原地反复重试",
             }),
         );
     }

@@ -1010,12 +1010,12 @@ async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> 
     // 上判失败,而 build 不解析 JS 语法恒 Ok,「失败自动包 IIFE 重试」从未发生过;
     // 现在首次 evaluate 真失败才按剩余预算重试(eval_attempt 见文件底部自由函数)。
     let first_params = build(&shaped).map_err(|e| format!("eval_js 参数构建失败: {e}"))?;
-    let (raw, wrapped, first_err) = match eval_attempt(&page, first_params, budget()).await {
+    let (raw, wrapped, first_err) = match eval_attempt(&page, first_params, budget(), &shaped).await {
         Ok(v) => (v, false, None),
         Err(e1) => {
             // 函数形态表达式不包 IIFE 重试(IIFE 化会改变函数语义)。
             if looks_like_function(&shaped) {
-                return Err(format!("eval_js 失败: {}", err_head(&e1)));
+                return Err(format!("eval_js 失败: {e1}"));
             }
             let wrapped_expr = if await_promise {
                 format!("(async()=>{{\n{shaped}\n}})()")
@@ -1024,13 +1024,11 @@ async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> 
             };
             let retry_params = build(&wrapped_expr)
                 .map_err(|e| format!("eval_js 失败(重试包裹构建失败): {e}"))?;
-            match eval_attempt(&page, retry_params, budget()).await {
+            match eval_attempt(&page, retry_params, budget(), &wrapped_expr).await {
                 Ok(v) => (v, true, Some(e1)),
                 Err(e2) => {
                     return Err(format!(
-                        "eval_js 失败(原始与 IIFE 包裹均失败): ① {} ② {}",
-                        err_head(&e1),
-                        err_head(&e2)
+                        "eval_js 失败(原始与 IIFE 包裹均失败): ① {e1} ② {e2}"
                     ));
                 }
             }
@@ -1051,15 +1049,18 @@ async fn act_eval_js(id: &str, p: &Value) -> std::result::Result<Value, String> 
 
 /// eval_js 求值期单次尝试(2026-10-15):带共享预算的超时竞争 + 错误归一。
 /// 超时按 `EVAL_TIMEOUT_HINT` 给处置指引(把模型推回 感知-人工 闭环)。
+/// 2026-10-16:JS 异常走 `super::format_eval_err` 下钻错误文本 + 出错位置摘录
+/// (Debug 裸串模型读不到错误原因,只能列号盲猜)。
 async fn eval_attempt(
     page: &chromiumoxide::Page,
     params: chromiumoxide::cdp::js_protocol::runtime::EvaluateParams,
     budget: std::time::Duration,
+    script: &str,
 ) -> std::result::Result<Value, String> {
     let v = tokio::time::timeout(budget, page.evaluate(params))
         .await
         .map_err(|_| format!("eval_js 执行超时({}ms): {}", budget.as_millis(), super::EVAL_TIMEOUT_HINT))?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| super::format_eval_err(&e, script))?;
     Ok(v.value().cloned().unwrap_or(Value::Null))
 }
 

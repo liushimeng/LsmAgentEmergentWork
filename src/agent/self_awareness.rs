@@ -187,7 +187,10 @@ impl SubAgentType {
             Self::Explore | Self::CodeReviewer => READ_ONLY_TOOLS,
             Self::Researcher => &["Read", "Glob", "Grep", "MCP_Web_Use"],
             Self::Plan => &["Read", "Glob", "Grep", "Write"],
-            Self::Operator => &["Bash", "Read", "MCP_Web_Use", "MCP_Window_Use"],
+            // 2026-10-16(USA.gov 遍历实测):operator 第一产出常是采集/执行结果落盘,
+            // 缺 Write 时被迫 Bash heredoc,Windows 长命令截断致多次断写补写白烧迭代
+            // (4 个采集分片各损失 1~2 轮);补 Write,Bash 仍保留兜底。
+            Self::Operator => &["Bash", "Read", "Write", "MCP_Web_Use", "MCP_Window_Use"],
         }
     }
 

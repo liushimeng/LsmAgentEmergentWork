@@ -3242,3 +3242,44 @@ fn bool_param_json_bool_and_number() {
     assert!(bool_param(Some(&json!("maybe")), true));
     assert!(!bool_param(Some(&json!("maybe")), false));
 }
+
+// ==================== F1(2026-10-16):eval_js 异常错误文本下钻 ====================
+
+/// USA.gov 遍历实测:`CdpError::JavascriptException` 的 Display 是结构体 Debug 裸串,
+/// `exception.description`(真正的 `SyntaxError: …` 文本)排在 script_id 之后被
+/// 首行截断,模型只能列号盲猜(单次语法错误白烧 1~2 轮迭代)。归一化后错误文本
+/// + 行列 + 出错位置摘录必须直接可读;非 JS 异常回退首行截断语义。
+#[test]
+fn eval_err_下钻js异常文本与脚本摘录() {
+    use chromiumoxide::cdp::js_protocol::runtime::{
+        ExceptionDetailsBuilder, RemoteObjectBuilder, RemoteObjectType,
+    };
+    let ex = RemoteObjectBuilder::default()
+        .r#type(RemoteObjectType::Object)
+        .description("SyntaxError: Unexpected token ')'".to_string())
+        .build()
+        .unwrap();
+    let details = ExceptionDetailsBuilder::default()
+        .exception_id(4)
+        .text("Uncaught".to_string())
+        .line_number(0)
+        .column_number(15)
+        .exception(ex)
+        .build()
+        .unwrap();
+    let err = chromiumoxide::error::CdpError::JavascriptException(Box::new(details));
+    let script = "const a = {x:1;;\nconst b = 2;";
+    let msg = format_eval_err(&err, script);
+    assert!(
+        msg.contains("SyntaxError: Unexpected token"),
+        "错误文本必须可见: {msg}"
+    );
+    assert!(msg.contains("line 0 col 15"), "行列信息: {msg}");
+    assert!(msg.contains("x:1"), "出错位置附近脚本摘录: {msg}");
+    // 非 JS 异常:回退 Display 首行截断(老语义)
+    let other = chromiumoxide::error::CdpError::NoResponse;
+    assert_eq!(
+        format_eval_err(&other, script),
+        "Received no response from the chromium instance."
+    );
+}

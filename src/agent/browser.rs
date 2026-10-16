@@ -138,6 +138,17 @@ struct BrowserInner {
     /// `true` = 用户/Agent 明确给了 `window` 参数,只做「不溢出屏幕」收边,不覆盖意图。
     /// connect 模式恒 false 且不参与决策(整路跳过)。
     explicit_window: bool,
+    /// F2(2026-10-16):每页「真实可见区」(视口 2K 扩展**覆盖前**的 inner 尺寸)。
+    /// `setDeviceMetricsOverride` 撑大布局视口后,`position:fixed;bottom` 锚定的
+    /// 注入层(进度栏)会落到布局视口底边 —— 在可见窗口之外(实测布局视口 1440、
+    /// 可见窗口 948,进度栏 y=1338 整条不可见)。告知栏据此把 bottom/right 重锚到
+    /// 可见区;覆盖被清除(sync_viewport / set_window_bounds)时移除,恢复自然锚定。
+    page_visible_box: HashMap<String, (f64, f64)>,
+    /// F3(2026-10-16):本浏览器实例是否已完成「默认窗口 1080p 一次性校正」。
+    /// `--window-size=1920,1080` 在 Windows 150% 缩放 + 多显示器下不被精确执行
+    /// (实测首开 outer 1922×1043,高短 37px,违背「默认 1080p」文档承诺);首开时
+    /// 主动 setWindowBounds 校正一次,之后保持「用户调整以其为准」(第 158 轮)。
+    default_size_applied: bool,
 }
 
 /// 浏览器会话管理器(进程内单例)。
@@ -338,7 +349,7 @@ async fn inject_agent_highlight(page: &Page) {
         .await;
     // 第 171 轮:两条告知栏与蓝框同生命周期(highlight 关闭时见 `set_highlight`)。
     super::browser_status::ensure(page).await;
-    super::browser_status::push(page, None, None, None).await;
+    super::browser_status::push(page, None, None, None, None).await;
 }
 
 /// 未安装浏览器哨兵:BrowserNew 据此返回错误码 3001。
@@ -525,6 +536,8 @@ impl BrowserManager {
                         // 页面必须自己停在最新,否则多轮对话只有第一屏可见。
                         auto_follow: true,
                         explicit_window: false,
+                        page_visible_box: HashMap::new(),
+                        default_size_applied: false,
                     }),
                 })
             })
@@ -540,6 +553,18 @@ impl BrowserManager {
     pub async fn current_mode(&self) -> Option<BrowserMode> {
         let inner = self.inner.lock().await;
         inner.browser.as_ref().map(|_| inner.mode)
+    }
+
+    /// F2(2026-10-16):读取页面「真实可见区」(视口 2K 扩展覆盖前的 inner 尺寸)。
+    /// None = 未扩展(告知栏自然锚定);Some = 布局视口被 setDeviceMetricsOverride
+    /// 撑大,bottom/right 锚定的注入层须按该可见区重锚。broadcast 逐页取用。
+    pub async fn page_visible_box(&self, page_id: &str) -> Option<(f64, f64)> {
+        self.inner
+            .lock()
+            .await
+            .page_visible_box
+            .get(page_id)
+            .copied()
     }
 
     /// 当前实例是否为 connect 模式(接管外部浏览器,第 142 轮)。
@@ -872,6 +897,10 @@ impl BrowserManager {
             // 是「按屏幕铺满」还是「保持请求尺寸只做不溢出收边」。
             // connect 模式恒 false(且 fit_headed_window 对 connect 整路跳过)。
             inner.explicit_window = !connect_mode && window_size.is_some();
+            // F2/F3(2026-10-16):新实例重置 —— 可见区记账清空(旧页面已不复存在),
+            // 1080p 一次性校正对新实例重新生效。
+            inner.page_visible_box.clear();
+            inner.default_size_applied = false;
             // 第 143 轮:页面管控期望态(connect 模式强制 open;hidden 下无意义,
             // 注入由下方 headed && 非 connect 门控跳过)。
             inner.guard = if connect_mode {
@@ -1163,6 +1192,8 @@ impl BrowserManager {
         }
         for id in dead {
             inner.pages.remove(&id);
+            // F2:可见区记账随页销毁,防泄漏。
+            inner.page_visible_box.remove(&id);
         }
         out
     }
@@ -1430,6 +1461,8 @@ impl BrowserManager {
             chromiumoxide::cdp::browser_protocol::emulation::ClearDeviceMetricsOverrideParams::default(),
         )
         .await;
+        // F2:覆盖已清除 → 告知栏恢复自然锚定。
+        self.inner.lock().await.page_visible_box.remove(page_id);
         // 窗口 resize 是异步的,短暂等待后回读真实值。
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let after = page
@@ -1474,6 +1507,8 @@ impl BrowserManager {
         )
         .await
         .map_err(|e| format!("清除视口覆盖失败:{e}"))?;
+        // F2:覆盖已清除 → 告知栏恢复自然锚定(bottom/right 直接锚窗口)。
+        self.inner.lock().await.page_visible_box.remove(page_id);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let viewport = page
             .evaluate(
@@ -1529,6 +1564,49 @@ impl BrowserManager {
             .page(page_id)
             .await
             .ok_or_else(|| "page_id 不存在".to_string())?;
+        // F3(2026-10-16):默认窗口 1080p 首开一次性校正。
+        // `--window-size=1920,1080` 在 Windows 150% 缩放 + 多显示器组合下不被
+        // Chrome 精确执行(实测首开 outer 1922×1043,高短 37px);第 158 轮的
+        // 「保持当前尺寸不铺满」把该错误结果也一并「保持」了。实例级一次性:
+        // 偏差超容差(4px,吸收 Windows DIP↔物理取整 ±2px)则 setWindowBounds
+        // 校正到「默认尺寸 ∩ 屏幕工作区」;此后不再触碰(用户手动调整以其为准)。
+        if !explicit_window {
+            let first_fix = {
+                let mut g = self.inner.lock().await;
+                if g.default_size_applied {
+                    None
+                } else {
+                    g.default_size_applied = true;
+                    Some(())
+                }
+            };
+            if first_fix.is_some() {
+                if let Ok(fm) = headed_window_metrics(&page).await {
+                    let gf = |k: &str| fm.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                    let (ow, oh, aw, ah) =
+                        (gf("outerWidth"), gf("outerHeight"), gf("availWidth"), gf("availHeight"));
+                    if aw > 0.0 && ah > 0.0 && ow > 0.0 && oh > 0.0 {
+                        let margin = HEADED_SCREEN_MARGIN as f64;
+                        let tw = (DEFAULT_WINDOW_W as f64).min(aw - margin * 2.0).max(320.0);
+                        let th = (DEFAULT_WINDOW_H as f64).min(ah - margin * 2.0).max(240.0);
+                        if (ow - tw).abs() > 4.0 || (oh - th).abs() > 4.0 {
+                            // 位置不动(尊重 Chrome/窗口管理器摆放);若校正后越出
+                            // 工作区,下方常规流程会按收边逻辑补 left/top。
+                            let _ = self
+                                .set_window_bounds(
+                                    page_id,
+                                    Some(tw as i64),
+                                    Some(th as i64),
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
         let m = headed_window_metrics(&page).await?;
         let f = |k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
         let (ow, oh) = (f("outerWidth"), f("outerHeight"));
@@ -1655,6 +1733,13 @@ impl BrowserManager {
         page.execute(params)
             .await
             .map_err(|e| format!("视口扩展失败: {e}"))?;
+        // F2(2026-10-16):登记「覆盖前可见区」(上面的 iw/ih 即真实窗口内容区)。
+        // 告知栏的 bottom/right 锚定据此重锚可见区,否则锚到撑大后的布局视口
+        // 底边落在可见窗口外;下一次 broadcast push 会把它带给页面侧注入层。
+        {
+            let mut g = self.inner.lock().await;
+            g.page_visible_box.insert(page_id.to_string(), (iw, ih));
+        }
         // 布局重排是异步的,短暂等待后回读真实视口。
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         let m2 = page_viewport_metrics(&page).await.unwrap_or(Value::Null);
@@ -2438,6 +2523,8 @@ impl BrowserManager {
         let Some(entry) = inner.pages.remove(page_id) else {
             return false;
         };
+        // F2:可见区记账随页销毁。
+        inner.page_visible_box.remove(page_id);
         let _ = entry.page.close().await;
         if inner.pages.is_empty() {
             if !inner.connect_mode {

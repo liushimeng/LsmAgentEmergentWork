@@ -86,7 +86,7 @@ impl Tool for TodoWriteTool {
                         "type": "object",
                         "properties": {
                             "id": { "type": ["integer", "string"], "minimum": 1, "description": "条目 ID(update 时必填;create 可省略自动分配;数字字符串如 \"1\" 自动转换)" },
-                            "content": { "type": "string", "minLength": 1, "description": "任务描述,如 '读取 Cargo.toml'" },
+                            "content": { "type": "string", "minLength": 1, "description": "任务描述,如 '读取 Cargo.toml'(create 必填;update 可省=保留原值)" },
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed", "cancelled"],
@@ -98,7 +98,7 @@ impl Tool for TodoWriteTool {
                                 "description": "优先级(可选,仅展示)"
                             }
                         },
-                        "required": ["content", "status"],
+                        "required": [],
                         "additionalProperties": false
                     }
                 }
@@ -139,7 +139,19 @@ impl Tool for TodoWriteTool {
 impl TodoWriteTool {
     fn handle_create(&self, args: &Value, state: &TodoState) -> Result<String> {
         let raw_inputs = parse_todos_field(args, "create")?;
-        let inputs: Vec<_> = raw_inputs.into_iter().map(Into::into).collect();
+        let inputs: Vec<todo_state::TodoItemInput> =
+            raw_inputs.into_iter().map(Into::into).collect();
+        // schema 已按 action 分流放宽(update 允许 {id,status} 最小形态,2026-10-16
+        // 实测最小 update 被 `content 必填` 预检拒掉白烧一轮);create 的 content
+        // 必填下沉到 handler 在此补齐。
+        for (idx, it) in inputs.iter().enumerate() {
+            if it.content.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                return Err(AgentError::ToolExecution {
+                    tool: self.name().into(),
+                    reason: format!("create 的 todos[{idx}] 缺少 content(任务描述)"),
+                });
+            }
+        }
         if inputs.len() > MAX_TODOS_PER_CALL {
             return Err(AgentError::ToolExecution {
                 tool: self.name().into(),
@@ -161,7 +173,17 @@ impl TodoWriteTool {
 
     fn handle_update(&self, args: &Value, state: &TodoState) -> Result<String> {
         let raw_inputs = parse_todos_field(args, "update")?;
-        let inputs: Vec<_> = raw_inputs.into_iter().map(Into::into).collect();
+        let inputs: Vec<todo_state::TodoItemInput> =
+            raw_inputs.into_iter().map(Into::into).collect();
+        // 同上:id 必填下沉到 handler(update 的定位键)。
+        for (idx, it) in inputs.iter().enumerate() {
+            if it.id.is_none() {
+                return Err(AgentError::ToolExecution {
+                    tool: self.name().into(),
+                    reason: format!("update 的 todos[{idx}] 缺少 id(定位键)"),
+                });
+            }
+        }
         if inputs.len() > MAX_TODOS_PER_CALL {
             return Err(AgentError::ToolExecution {
                 tool: self.name().into(),
@@ -475,4 +497,33 @@ mod tests {
         assert_eq!(parsed2.content.as_deref(), Some("y"));
         assert_eq!(parsed2.status, todo_state::TodoStatus::Cancelled);
     }
+
+/// F5(2026-10-16):update 最小形态 `{id,status}` 必须可用 —— USA.gov 实测该形态
+/// 被 schema `content 必填` 预检拒掉白烧一轮(工具描述却承诺「缺省保留原值」);
+/// schema 放宽后 create 的 content 必填由 handler 兜底。
+#[tokio::test]
+async fn todowrite_update_minimal_form_without_content() {
+    let state = fresh_state();
+    let tool = tool_with(state.clone());
+    tool.execute(json!({
+        "action": "create",
+        "todos": [{"content": "探查", "status": "pending"}]
+    }))
+    .await
+    .unwrap();
+    let r = tool
+        .execute(json!({
+            "action": "update",
+            "todos": [{"id": 1, "status": "completed"}]
+        }))
+        .await
+        .unwrap();
+    assert!(r.contains("✓ [1]"), "最小 update 应成功并渲染完成态: {r}");
+    // create 缺 content 由 handler 拒(错误信息可自解释)
+    let e = tool
+        .execute(json!({"action": "create", "todos": [{"status": "pending"}]}))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("缺少 content"));
+}
 }

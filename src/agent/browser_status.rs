@@ -340,6 +340,22 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
         const pgHost = document.getElementById(PROGRESS_HOST_ID);
         if (sbHost) sbHost.style.display = on ? '' : 'none';
         if (pgHost) pgHost.style.display = on ? '' : 'none';
+        // F2(2026-10-16):视口被 setDeviceMetricsOverride 撑大(2K 扩展)时,
+        // position:fixed 的 bottom/right 锚定落到**布局视口**底边/右缘 —— 在
+        // 可见窗口之外(实测布局视口 1440、可见 948,进度栏 y=1338 整条不可见,
+        // 右上状态栏因锚 top 幸存)。payload.visible 是 Rust 侧记录的「覆盖前
+        // 可见区」,据此把锚点收回可见区;未携带(未扩展/覆盖已清除)自然锚定。
+        const vb = (last && last.visible) ? last.visible : null;
+        const vw = vb ? Number(vb[0]) || 0 : 0;
+        const vh = vb ? Number(vb[1]) || 0 : 0;
+        if (pgHost) {
+            pgHost.style.bottom = (vh > 0 && vh < window.innerHeight)
+                ? Math.round(window.innerHeight - vh + 18) + 'px' : '18px';
+        }
+        if (sbHost) {
+            sbHost.style.right = (vw > 0 && vw < window.innerWidth)
+                ? Math.round(window.innerWidth - vw + 12) + 'px' : '12px';
+        }
     };
     // ---- 页面侧 API(全部 ns 随机化 + 不可枚举化,与 guard/highlight 同款) ----
     window.%NS%StatusUpdate = (payload) => {
@@ -517,7 +533,16 @@ pub fn describe_web_action(args: &Value) -> String {
 }
 
 /// 组装两条栏的全量载荷（状态栏 + 进度栏一次推完，页面侧幂等渲染）。
-pub fn build_payload(cfg: Option<&PageGuardConfig>, action: Option<&str>, event: Option<Value>) -> Value {
+/// `visible`(F2,2026-10-16):该页「真实可见区」(视口 2K 扩展覆盖前的 inner
+/// 尺寸);Some 时页面侧把 bottom/right 锚定重锚到可见区 —— `position:fixed`
+/// 锚的是被 setDeviceMetricsOverride 撑大的布局视口底边,实测落在可见窗口外
+/// (布局视口 1440 / 可见 948,进度栏 y=1338 整条不可见)。None = 自然锚定。
+pub fn build_payload(
+    cfg: Option<&PageGuardConfig>,
+    action: Option<&str>,
+    event: Option<Value>,
+    visible: Option<(f64, f64)>,
+) -> Value {
     let act = crate::agent::web_activity::current_snapshot();
     let (agent, session, iter, max_iter, task, phase, started_ms, tool) = match act {
         Some(a) => (
@@ -569,6 +594,12 @@ pub fn build_payload(cfg: Option<&PageGuardConfig>, action: Option<&str>, event:
             obj.insert("note".into(), json!(c.note.clone().unwrap_or_default()));
         }
     }
+    // F2:浅合并语义下 None 不携带该键(与档位字段同款),不覆盖页面侧既有值。
+    if let Some((vw, vh)) = visible {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("visible".into(), json!([vw, vh]));
+        }
+    }
     payload
 }
 
@@ -586,8 +617,15 @@ pub async fn ensure(page: &Page) {
 }
 
 /// 推一次全量刷新（导航后新文档 / 档位变更 / 动作前后共用）。
-pub async fn push(page: &Page, cfg: Option<&PageGuardConfig>, action: Option<&str>, event: Option<Value>) {
-    let payload = build_payload(cfg, action, event);
+/// `visible`(F2):见 [`build_payload`];大多数直呼场景传 None(自然锚定)。
+pub async fn push(
+    page: &Page,
+    cfg: Option<&PageGuardConfig>,
+    action: Option<&str>,
+    event: Option<Value>,
+    visible: Option<(f64, f64)>,
+) {
+    let payload = build_payload(cfg, action, event, visible);
     let js = format!(
         "window.{} ? window.{}({}) : false",
         ns_global("StatusUpdate"),
@@ -686,6 +724,7 @@ pub async fn broadcast_done(action: &str, ok: bool, elapsed_ms: u64) {
 }
 
 /// 广播实现：遍历存活页面逐个推（浏览器是进程级单实例，页面即全部现场）。
+/// F2:逐页附带该页「真实可见区」(视口 2K 扩展时重锚告知栏)。
 async fn broadcast(action: &str, event: Option<Value>) {
     let mgr = crate::agent::browser::BrowserManager::global();
     if !mgr.has_browser().await {
@@ -693,8 +732,9 @@ async fn broadcast(action: &str, event: Option<Value>) {
     }
     let cfg = mgr.current_guard().await;
     for (page_id, ..) in mgr.list_pages().await {
+        let visible = mgr.page_visible_box(&page_id).await;
         if let Some(page) = mgr.page(&page_id).await {
-            push(&page, Some(&cfg), Some(action), event.clone()).await;
+            push(&page, Some(&cfg), Some(action), event.clone(), visible).await;
         }
     }
 }
@@ -780,9 +820,9 @@ mod tests {
     #[test]
     fn 纯进度推送不带档位字段不覆盖状态栏() {
         let cfg = PageGuardConfig::locked();
-        let full = build_payload(Some(&cfg), None, None);
+        let full = build_payload(Some(&cfg), None, None, None);
         assert!(full["mode_text"].as_str().unwrap().contains("页面已锁定"));
-        let bare = build_payload(None, Some("inspect elements"), None);
+        let bare = build_payload(None, Some("inspect elements"), None, None);
         assert!(bare.get("mode_text").is_none(), "cfg=None 不得下发档位字段(否则浅合并覆盖空)");
         assert!(bare.get("notice").is_none());
         assert!(bare.get("note").is_none());
@@ -839,7 +879,7 @@ mod tests {
     #[test]
     fn 载荷含状态栏与进度栏全部字段() {
         let cfg = PageGuardConfig::locked();
-        let p = build_payload(Some(&cfg), Some("open https://a"), None);
+        let p = build_payload(Some(&cfg), Some("open https://a"), None, None);
         assert_eq!(p["mode"], "locked");
         assert!(p["mode_text"].as_str().unwrap().contains("页面已锁定"));
         assert!(!p["notice"].as_str().unwrap().is_empty(), "静态注意事项应下发");
@@ -847,7 +887,7 @@ mod tests {
         assert_eq!(p["tool"], "", "无活动台账时工具标签为空");
         // 无活动台账时回退品牌名,不报错
         assert_eq!(p["agent"], "LAEW Agent");
-        let e = build_payload(None, None, Some(json!({"t":1,"label":"x","ok":true,"ms":5})));
+        let e = build_payload(None, None, Some(json!({"t":1,"label":"x","ok":true,"ms":5})), None);
         assert!(e["event"].is_object());
     }
 
@@ -862,7 +902,7 @@ mod tests {
         a.set_iter(3, "第 3/12 轮 · 执行工具");
         a.set_tool("MCP_Web_Use control click #buy");
         let p = crate::agent::web_activity::scope(a, async {
-            build_payload(None, Some("control click #buy"), None)
+            build_payload(None, Some("control click #buy"), None, None)
         })
         .await;
         assert_eq!(p["agent"], "LsmAgentEmergentWork-SubAgent-Work");
@@ -872,5 +912,21 @@ mod tests {
         assert_eq!(p["task"], "调研双站价格");
         assert_eq!(p["phase"], "第 3/12 轮 · 执行工具");
         assert_eq!(p["tool"], "MCP_Web_Use control click #buy");
+    }
+
+    /// F2(2026-10-16):视口 2K 扩展页的可见区必须随载荷下发(浅合并语义:
+    /// None 不携带该键,不覆盖页面侧既有值),模板侧有对应的 bottom/right 重锚。
+    #[test]
+    fn 载荷携带可见区且模板含重锚逻辑() {
+        let cfg = crate::agent::browser_overlay::PageGuardConfig::from_env_default();
+        let p = build_payload(Some(&cfg), None, None, Some((1906.0, 948.0)));
+        assert_eq!(p["visible"], json!([1906.0, 948.0]));
+        // None → 不携带键(自然锚定,不清空页面侧既有值)
+        let bare = build_payload(Some(&cfg), None, None, None);
+        assert!(bare.get("visible").is_none());
+        // 模板重锚逻辑在场(进度栏 bottom / 状态栏 right 按可见区收回)
+        assert!(AGENT_STATUS_JS_TEMPLATE.contains("last.visible"));
+        assert!(AGENT_STATUS_JS_TEMPLATE.contains("pgHost.style.bottom"));
+        assert!(AGENT_STATUS_JS_TEMPLATE.contains("sbHost.style.right"));
     }
 }

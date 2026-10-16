@@ -780,7 +780,7 @@ pub async fn apply_page_guard(
     // (open 首航 / set_guard / HITL 解锁与恢复 / 导航后 re-assert 四条路径都经此),
     // 顺带把「谁在控制 + 档位 + 注意事项 + 进度」推给页面侧(导航产生新文档后
     // 两条栏虽由 addScript 自动重挂,内容需重推)。fail-open。
-    crate::agent::browser_status::push(page, Some(&cfg), None, None).await;
+    crate::agent::browser_status::push(page, Some(&cfg), None, None, None).await;
     // 闸在场性探测(第 155 轮):只有「locked + 滚动观看开启 + 脚本已注入且闸已装」
     // 才走 DOM 闸;任何一环缺失都回退 CDP 全量拦截(fail-closed)。
     let gate_ready = if locked && locked_scroll_watch_enabled() && js_applied {
