@@ -994,6 +994,9 @@ impl BrowserManager {
         // 多窗口并行:new_window=true 走 CDP `Target.createTarget(newWindow:true)`
         // 起独立可见窗口(单浏览器进程多窗口,profile/登录态/HITL 全复用);
         // false 保持同窗口新 Tab 形态。
+        // 2026-10-16:new_page 有界化 —— 它排队在 browser handler 事件循环上,
+        // 前一 target 导航卡死时(实测 github.com/commits 网络 stall)会无声挂死,
+        // 与下方 goto 的 30s 超时同属一级兜底。
         let page = if new_window {
             use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
             let params = CreateTargetParams::builder()
@@ -1001,21 +1004,42 @@ impl BrowserManager {
                 .new_window(true)
                 .build()
                 .map_err(chromiumoxide::error::CdpError::msg)?;
-            browser.new_page(params).await?
+            tokio::time::timeout(browser_timeout, browser.new_page(params))
+                .await
+                .map_err(|_| {
+                    chromiumoxide::error::CdpError::msg(format!(
+                        "browser.new_page 超时({}s):浏览器 handler 可能已卡死(某页面导航挂死会连坐新建),\
+                         建议先 MCP_Web_Use close(page_id=\"all\") 回收浏览器后重试",
+                        browser_timeout.as_secs()
+                    ))
+                })??
         } else {
-            browser.new_page(url.to_string()).await?
+            tokio::time::timeout(browser_timeout, browser.new_page(url.to_string()))
+                .await
+                .map_err(|_| {
+                    chromiumoxide::error::CdpError::msg(format!(
+                        "browser.new_page 超时({}s):浏览器 handler 可能已卡死(某页面导航挂死会连坐新建),\
+                         建议先 MCP_Web_Use close(page_id=\"all\") 回收浏览器后重试",
+                        browser_timeout.as_secs()
+                    ))
+                })??
         };
         // 第 159 轮:先开域挂监听、再 goto —— 主文档的请求/响应/失败才会进
         // Network 环形缓冲。旧顺序 goto 完成才 enable,首个文档的加载证据
         // (状态码/blocked_reason)全部丢失,空白页只能靠猜(内网站点实测 network
         // 事件里只有 favicon,主文档完全不可见)。
         let events = EventBuffer::default();
-        let _ = page
-            .execute(chromiumoxide::cdp::js_protocol::runtime::EnableParams::default())
-            .await;
-        let _ = page
-            .execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default())
-            .await;
+        // 2026-10-16:两个 Enable 同样有界化(排队在 handler 上,卡死时无声挂起)。
+        let _ = super::browser_cdp::cdp_with_timeout(
+            "open.runtime_enable",
+            page.execute(chromiumoxide::cdp::js_protocol::runtime::EnableParams::default()),
+        )
+        .await;
+        let _ = super::browser_cdp::cdp_with_timeout(
+            "open.network_enable",
+            page.execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default()),
+        )
+        .await;
         spawn_event_listeners(&page, events.clone()).await;
         // 第 174 轮:无头档 UA 清理必须**先于首次导航** —— 否则第一个文档的网络
         // 请求头仍带 `HeadlessChrome` 令牌(JS 侧改 navigator.userAgent 只骗得过
@@ -1068,11 +1092,12 @@ impl BrowserManager {
             let _ = super::browser_overlay::apply_page_guard(&page, &cfg).await;
         }
 
-        let mut title = page.get_title().await.ok().flatten().unwrap_or_default();
-        let mut final_url = page
-            .url()
+        let mut title = super::browser_cdp::cdp_with_timeout("open.get_title", page.get_title())
             .await
-            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut final_url = super::browser_cdp::cdp_with_timeout("open.url", page.url())
+            .await
             .flatten()
             .unwrap_or_else(|| url.to_string());
         // 第 170 轮:首航空白自愈 —— 猎聘 WAF 首击实测 3/3:新标签页**首次**导航
@@ -1094,13 +1119,16 @@ impl BrowserManager {
             );
             let retry = tokio::time::timeout(browser_timeout, page.goto(url.to_string())).await;
             if let Ok(Ok(_)) = retry {
-                title = page.get_title().await.ok().flatten().unwrap_or_default();
-                final_url = page
-                    .url()
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(final_url);
+                title =
+                    super::browser_cdp::cdp_with_timeout("open.retry.get_title", page.get_title())
+                        .await
+                        .flatten()
+                        .unwrap_or_default();
+                final_url =
+                    super::browser_cdp::cdp_with_timeout("open.retry.url", page.url())
+                        .await
+                        .flatten()
+                        .unwrap_or(final_url);
             }
         }
         let id = new_page_id();
@@ -1246,29 +1274,45 @@ impl BrowserManager {
     }
 
     /// 列出当前注册页面(带存活性探测,失效 entry 顺手清理)。
+    ///
+    /// 2026-10-16:快照-探测-清理三段式 —— CDP 探测(可能撞上卡死的 handler,
+    /// 见 browser_cdp 模块头)全程在全局锁外执行,杜绝「持锁跨无界 await」
+    /// 把单页卡死放大成整个 BrowserManager 死锁。
     pub async fn list_pages(&self) -> Vec<(String, String, String, String)> {
-        let mut inner = self.inner.lock().await;
+        let snapshot: Vec<(String, chromiumoxide::Page, String)> = {
+            let inner = self.inner.lock().await;
+            inner
+                .pages
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.page.clone(), entry.created_at.clone()))
+                .collect()
+        };
         let mut dead = Vec::new();
         let mut out = Vec::new();
-        for (id, entry) in &inner.pages {
-            match entry.page.url().await {
-                Ok(Some(url)) => {
-                    let title = entry
-                        .page
-                        .get_title()
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    out.push((id.clone(), url, title, entry.created_at.clone()));
+        for (id, page, created_at) in snapshot {
+            match super::browser_cdp::cdp_with_timeout("list_pages.url", page.url()).await {
+                Some(Some(url)) => {
+                    let title = super::browser_cdp::cdp_with_timeout(
+                        "list_pages.get_title",
+                        page.get_title(),
+                    )
+                    .await
+                    .flatten()
+                    .unwrap_or_default();
+                    out.push((id, url, title, created_at));
                 }
-                _ => dead.push(id.clone()),
+                // 出错/CDP 超时(可能 handler 卡死):保守按死页清理,
+                // 避免每次 list 都重新撞一次卡死 target。
+                _ => dead.push(id),
             }
         }
-        for id in dead {
-            inner.pages.remove(&id);
-            // F2:可见区记账随页销毁,防泄漏。
-            inner.page_visible_box.remove(&id);
+        if !dead.is_empty() {
+            let mut inner = self.inner.lock().await;
+            for id in dead {
+                inner.pages.remove(&id);
+                // F2:可见区记账随页销毁,防泄漏。
+                inner.page_visible_box.remove(&id);
+            }
         }
         out
     }
@@ -2607,11 +2651,20 @@ impl BrowserManager {
         };
         // F2:可见区记账随页销毁。
         inner.page_visible_box.remove(page_id);
-        let _ = entry.page.close().await;
+        // 2026-10-16:有界关闭 —— 卡死 target 的 page.close() 会排队在 wedged
+        // handler 上永久挂起;注册表已摘除,句柄关不掉由 close(all)/watchdog
+        // 的进程级回收兜底。
+        let _ = super::browser_cdp::cdp_with_timeout("close_page", entry.page.close()).await;
         if inner.pages.is_empty() {
             if !inner.connect_mode {
                 if let Some(mut browser) = inner.browser.take() {
-                    let _ = browser.close().await;
+                    // 2026-10-16:browser.close() 同样有界(handler 卡死时排队挂起),
+                    // 失败由下方进程级 kill 兜底。
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        browser.close(),
+                    )
+                    .await;
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(3),
                         browser.kill(),
@@ -2646,21 +2699,30 @@ impl BrowserManager {
     /// 走 [`Self::close_page`] 复用「最后一页关闭 → 回收浏览器」语义:blank 页恰为
     /// 全部页面时自然触发全新 profile 重启,正是整页抹除的恢复路径。
     pub async fn close_blank_pages(&self) -> usize {
-        let candidates: Vec<String> = {
+        // 2026-10-16:锁内只取快照(connect 判定 + Page 克隆),CDP 探测放到锁外
+        // 有界执行 —— 撞上卡死 handler 时按「非空白页」保守保留(fail-open),
+        // 绝不持全局锁跨无界 await(单页卡死 → 全局死锁的级联面,见 browser_cdp)。
+        let snapshot: Vec<(String, chromiumoxide::Page)> = {
             let inner = self.inner.lock().await;
             if inner.connect_mode {
                 return 0;
             }
-            let mut ids = Vec::new();
-            for (id, entry) in inner.pages.iter() {
-                if let Ok(Some(url)) = entry.page.url().await {
-                    if url.trim().eq_ignore_ascii_case("about:blank") {
-                        ids.push(id.clone());
-                    }
+            inner
+                .pages
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.page.clone()))
+                .collect()
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        for (id, page) in &snapshot {
+            if let Some(Some(url)) =
+                super::browser_cdp::cdp_with_timeout("close_blank_pages.url", page.url()).await
+            {
+                if url.trim().eq_ignore_ascii_case("about:blank") {
+                    candidates.push(id.clone());
                 }
             }
-            ids
-        };
+        }
         if candidates.is_empty() {
             return 0;
         }

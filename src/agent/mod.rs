@@ -14,6 +14,7 @@ pub mod agent_loop;
 pub mod agent_message;
 pub mod attachments;
 pub mod browser;
+pub(crate) mod browser_cdp;
 pub mod browser_focus;
 pub mod browser_mode;
 pub mod browser_follow;

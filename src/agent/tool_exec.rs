@@ -62,6 +62,40 @@ fn flush_batch(start: &mut Option<usize>, end: usize, out: &mut Vec<(usize, usiz
     }
 }
 
+/// 单条工具调用的总执行超时预算判定(2026-10-16,纯函数,可单测):
+/// - `Bash` → 无预算(Bash 自带进程级超时,默认 120s/上限 600s,外层再砍
+///   会误伤合法长命令);
+/// - `MCP_Web_Use` 的 `request_human` → 无预算(HITL 人工等待合法长,
+///   hub 自带 30 分钟总上限 + 逐次 +2 分钟,与 sequence 步级豁免同语义);
+/// - env `LAEW_TOOL_TIMEOUT_SECS`(默认 300,`0` = 关闭,回退旧行为)。
+fn tool_exec_budget(name: &str, args: &serde_json::Value) -> Option<std::time::Duration> {
+    if name == "Bash" {
+        return None;
+    }
+    if name == "MCP_Web_Use" && is_request_human_call(args) {
+        return None;
+    }
+    let secs = std::env::var("LAEW_TOOL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(Agent::DEFAULT_TOOL_TIMEOUT_SECS);
+    if secs == 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(secs))
+}
+
+/// `MCP_Web_Use` 调用是否为 `request_human`(扁平与 params 嵌套两种形态都认,
+/// 与 `merge_open_params` 的宽松解析同风格)。
+fn is_request_human_call(args: &serde_json::Value) -> bool {
+    let flat = args.get("control_action").and_then(serde_json::Value::as_str);
+    let nested = args
+        .get("params")
+        .and_then(|p| p.get("control_action"))
+        .and_then(serde_json::Value::as_str);
+    flat == Some("request_human") || nested == Some("request_human")
+}
+
 impl Agent {
     /// 对比工具 Schema 的 `required` 列表,返回 args 中缺失的必填字段名(第 148 轮)。
     ///
@@ -85,6 +119,14 @@ impl Agent {
             .filter(|f| args.get(f).is_none())
             .collect()
     }
+
+    /// 单条工具调用的总执行超时预算(2026-10-16,`LAEW_TOOL_TIMEOUT_SECS`)。
+    ///
+    /// 背景:实测(`llaew_20261016_160508.log`)`open github.com/commits` 因大陆
+    /// 网络导航 stall 把 chromiumoxide handler 卡死,后续无界 CDP 调用永久排队,
+    /// 单条工具挂死 → 整个 Agent 循环 22 分钟无声停摆直到人工杀进程。总超时是
+    /// 「单工具挂死 ≠ 任务挂死」的最后保险(各 CDP 点的有界化见 `browser_cdp`)。
+    const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
 
     /// 执行单条工具调用(第 120 轮自 agent_loop 主循环机械抽取,语义零变化)。
     pub(crate) async fn exec_tool_call(
@@ -127,15 +169,43 @@ impl Agent {
                 ) {
                     Some(Err(e))
                 } else {
-                    match cancel {
-                        Some(token) => {
-                            tokio::select! {
-                                biased;
-                                _ = token.cancelled() => None,
-                                r = tool.execute(args.clone()) => Some(r),
+                    // 2026-10-16:工具执行总超时(最后防线)——任何底层无界 await
+                    // (实测:导航 stall 卡死 chromiumoxide handler → CDP 调用永久排队)
+                    // 命中预算即返回结构化错误,Agent 循环继续,而不是无声停摆。
+                    // 豁免:Bash(自带进程级超时)与 request_human(HITL 30 分钟上限)。
+                    let fut = async {
+                        match cancel {
+                            Some(token) => {
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => None,
+                                    r = tool.execute(args.clone()) => Some(r),
+                                }
                             }
+                            None => Some(tool.execute(args.clone()).await),
                         }
-                        None => Some(tool.execute(args.clone()).await),
+                    };
+                    match tool_exec_budget(name, &args) {
+                        Some(budget) => match tokio::time::timeout(budget, fut).await {
+                            Ok(x) => x,
+                            Err(_) => {
+                                warn!(
+                                    tool = %name,
+                                    secs = budget.as_secs(),
+                                    "工具执行超时(总预算兜底):底层操作可能已挂死"
+                                );
+                                Some(Err(AgentError::ToolExecution {
+                                    tool: name.to_string(),
+                                    reason: format!(
+                                        "执行超时(>{}s),底层操作可能已挂死;\
+                                         若是浏览器操作,建议先 MCP_Web_Use close(page_id=\"all\") \
+                                         回收浏览器后重试,或改用其它路径",
+                                        budget.as_secs()
+                                    ),
+                                }))
+                            }
+                        },
+                        None => fut.await,
                     }
                 }
             }
@@ -524,5 +594,41 @@ mod tests {
         let d: ToolDef = t.def();
         assert_eq!(d.name, "Read");
         assert!(!d.description.is_empty());
+    }
+
+    /// request_human 判定:扁平与 params 嵌套两种形态都认(2026-10-16)。
+    #[test]
+    fn is_request_human_call_recognizes_flat_and_nested() {
+        assert!(is_request_human_call(
+            &json!({"action":"control","control_action":"request_human"})
+        ));
+        assert!(is_request_human_call(
+            &json!({"action":"control","params":{"control_action":"request_human"}})
+        ));
+        assert!(!is_request_human_call(
+            &json!({"action":"control","control_action":"click"})
+        ));
+        assert!(!is_request_human_call(&json!({"action":"open","url":"https://example.com"})));
+    }
+
+    /// 预算豁免:Bash 自带进程级超时;request_human 走 HITL hub 30 分钟上限(2026-10-16)。
+    /// 注:不测 env 未设时的默认值(读环境在并行测试下不稳定),豁免分支与 env 无关。
+    #[test]
+    fn tool_exec_budget_exemptions() {
+        assert_eq!(tool_exec_budget("Bash", &json!({"command":"sleep 1"})), None);
+        assert_eq!(
+            tool_exec_budget(
+                "MCP_Web_Use",
+                &json!({"action":"control","control_action":"request_human"})
+            ),
+            None
+        );
+        assert_eq!(
+            tool_exec_budget(
+                "MCP_Web_Use",
+                &json!({"action":"control","control_action":"click","selector":"#a"})
+            ),
+            tool_exec_budget("Read", &json!({"file_path":"x"}))
+        );
     }
 }

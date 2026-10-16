@@ -1593,8 +1593,7 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     page.goto(url.to_string()),
                 )
                 .await;
-                if let Ok(Ok(_)) = goto {
-                    // 第 100 轮:复用路径同样带单实例元数据(浏览器进程级复用 + 真实 mode)
+                if let Ok(Ok(_)) = goto {                    // 第 100 轮:复用路径同样带单实例元数据(浏览器进程级复用 + 真实 mode)
                     let (browser_reused, mode_label) = {
                         let mgr = BrowserManager::global();
                         let m = mgr.current_mode().await;
@@ -1609,13 +1608,18 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     // 第 152 轮:goto 产生新文档,自动跟随按实例期望态 re-assert
                     // (人工在 locked 档无法滚动,页面必须自己停在最新)
                     BrowserManager::global().reassert_auto_follow(&page).await;
-                    let mut title = page.get_title().await.ok().flatten().unwrap_or_default();
-                    let mut final_url = page
-                        .url()
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| url.to_string());
+                    // 2026-10-16:get_title/url 有界化(卡死 handler 上的裸 await
+                    // 会无声挂死整个工具调用,见 browser_cdp 模块头)。
+                    let mut title =
+                        crate::agent::browser_cdp::cdp_with_timeout("open.reuse.get_title", page.get_title())
+                            .await
+                            .flatten()
+                            .unwrap_or_default();
+                    let mut final_url =
+                        crate::agent::browser_cdp::cdp_with_timeout("open.reuse.url", page.url())
+                            .await
+                            .flatten()
+                            .unwrap_or_else(|| url.to_string());
                     // 第 170 轮:复用路径同享首航空白自愈(猎聘 WAF 首击实测:
                     // 首次导航落 about:blank,同页二次导航即成功)。
                     // 2026-10-14 第三轮:已证实的抹除域(streak≥1/冷却中)跳过 ——
@@ -1636,13 +1640,20 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                         )
                         .await;
                         if let Ok(Ok(_)) = retry {
-                            title = page.get_title().await.ok().flatten().unwrap_or_default();
-                            final_url = page
-                                .url()
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or(final_url);
+                            title = crate::agent::browser_cdp::cdp_with_timeout(
+                                "open.reuse.retry.get_title",
+                                page.get_title(),
+                            )
+                            .await
+                            .flatten()
+                            .unwrap_or_default();
+                            final_url = crate::agent::browser_cdp::cdp_with_timeout(
+                                "open.reuse.retry.url",
+                                page.url(),
+                            )
+                            .await
+                            .flatten()
+                            .unwrap_or(final_url);
                         }
                     }
                     // 2026-10-14:整页抹除记账(launch 与 laew relaunch 调试实例记账;
@@ -1744,6 +1755,17 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     }
                     return envelope(0, "ok", payload);
                 }
+                // 2026-10-16:复用导航失败(超时/断连)——该 target 的导航状态机可能已
+                // 卡死(实测 github.com/commits 网络 stall:goto 超时后 handler 侧残留
+                // 挂起态,后续一切 CDP 调用排队挂死,整个任务 22 分钟无声停摆)。
+                // 落新建路径前先剔除这颗死页:close_page 有界(best-effort),恰为最后
+                // 一页时触发浏览器整实例回收,新建路径自然换新实例,自愈合。
+                tracing::warn!(
+                    page_id = %pid,
+                    url,
+                    "open 复用路径导航失败,剔除该页后走新建路径"
+                );
+                let _ = BrowserManager::global().close_page(&pid).await;
             }
         }
     }
