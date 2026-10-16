@@ -36,12 +36,13 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FlashWindowEx,
     GetClientRect, GetDlgCtrlID, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HWND_TOPMOST,
     IsDialogMessageW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, BS_AUTOCHECKBOX,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, BS_AUTOCHECKBOX,
     BS_DEFPUSHBUTTON, BS_OWNERDRAW, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, HMENU, IDC_ARROW, SW_SHOW,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, FLASHW_ALL, FLASHW_TIMERNOFG,
+    FLASHWINFO, HMENU, IDC_ARROW, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_CTLCOLOREDIT, WM_DESTROY, WM_DRAWITEM,
     WM_SETFONT, WM_SETTEXT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD,
@@ -50,7 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 // 2026-10-13(二):侵入式触控板的鼠标/焦点/显示 API(SetCapture/ReleaseCapture/
 // GetFocus 属 KeyboardAndMouse 模块;窗口消息常量属 WindowsAndMessaging)。
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     SW_HIDE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WS_BORDER,
 };
@@ -484,7 +485,7 @@ fn pad_relay_at(lparam: LPARAM, kind: &str) {
     let _ = down;
     let nx = (x / w).clamp(0.0, 1.0);
     let ny = (y / h).clamp(0.0, 1.0);
-    println!("{}", super::dialog_main::relay_line(id, kind, nx, ny, ""));
+    super::dialog_main::emit_line_or_exit(&super::dialog_main::relay_line(id, kind, nx, ny, ""));
 }
 
 unsafe extern "system" fn pad_wnd_proc(
@@ -552,7 +553,7 @@ unsafe extern "system" fn pad_wnd_proc(
                     _ => return LRESULT(0),
                 }
             };
-            println!("{}", super::dialog_main::relay_line(id, "key", 0.0, 0.0, name));
+            super::dialog_main::emit_line_or_exit(&super::dialog_main::relay_line(id, "key", 0.0, 0.0, name));
             LRESULT(0)
         }
         // 2026-10-14:触控板提示 STATIC 的父窗是触控板本身,配色在此处理
@@ -594,7 +595,7 @@ fn relay_toggle() {
         };
         (line, title, st.intrusive_btn, st.pad, st.msg, st.input, st.opts.clone(), now_on)
     };
-    println!("{line}");
+    super::dialog_main::emit_line_or_exit(&line);
     unsafe {
         // 进入:隐藏说明区/选项区/输入框,显示触控板并聚焦;退出:反向还原
         // (触控板矩形由 relayout 按 pad_frame 重算)。
@@ -870,7 +871,7 @@ fn extend_wait() {
             timeline,
         )
     };
-    println!("{line}"); // Stdout 行缓冲:换行即 flush,父进程逐行读
+    super::dialog_main::emit_line_or_exit(&line); // 行缓冲:换行即 flush,父进程逐行读
     let title_w = to_wide(&title);
     let timeline_w = to_wide(&timeline);
     unsafe {
@@ -902,7 +903,7 @@ fn guard_toggle() {
             st.guard,
         )
     };
-    println!("{line}"); // Stdout 行缓冲:换行即 flush,父进程逐行读
+    super::dialog_main::emit_line_or_exit(&line); // 行缓冲:换行即 flush,父进程逐行读
     let wide = to_wide(title);
     unsafe {
         SendMessageW(btn, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
@@ -956,10 +957,13 @@ fn finish(kind: &str, tag: i64) {
         // 2026-10-13(二):侵入式会话随收口一并结束(父进程据此恢复页面管控;
         // 收口路径本身也会恢复,幂等双保险)。
         if st.intrusive && st.payload_id > 0 {
-            println!(
-                "{}",
-                super::dialog_main::relay_line(st.payload_id, "session_end", 0.0, 0.0, "")
-            );
+            super::dialog_main::emit_line_or_exit(&super::dialog_main::relay_line(
+                st.payload_id,
+                "session_end",
+                0.0,
+                0.0,
+                "",
+            ));
         }
         st.hwnd
     };
@@ -1109,7 +1113,11 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     let cancel = create_control(hwnd, hinst, "BUTTON", "取消", style_button(false), IDCANCEL_ID, font_normal);
     // 2026-10-13:主按钮「继续」 —— 人工操作完成后点击,把流程与控制权交还 Agent
     // (空输入=选项1「我已完成人工操作,继续」;有输入=把补充说明交给 Agent)。
-    let submit = create_control(hwnd, hinst, "BUTTON", "继续", style_button(true), IDOK_ID, font_normal);
+    // 2026-10-16:去掉 BS_DEFPUSHBUTTON —— 实测弹窗抢键盘焦点后,用户在其它窗口
+    // 敲 Enter 被 IsDialogMessageW 路由到默认按钮,20~48s 内产生「假人工应答」
+    // (选项1空输入交棒),Agent 复验不过→再弹窗→再误触,人机协作闭环被机械绕过。
+    // 提交必须鼠标点击;「输入框持有焦点时的 Enter」由消息循环显式转发(真交互)。
+    let submit = create_control(hwnd, hinst, "BUTTON", "继续", style_button(false), IDOK_ID, font_normal);
     // 第 145 轮:「⏱ +2分钟」延长等待。
     let extend = create_control(hwnd, hinst, "BUTTON", super::dialog_main::EXTEND_BTN_TITLE, style_button(false), IDC_EXTEND, font_normal);
     // 2026-10-13:「解除屏蔽/恢复屏蔽」互切(初始标题按页面实际放行态)。
@@ -1249,8 +1257,21 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
     );
-    let _ = SetForegroundWindow(hwnd);
-    let _ = SetFocus(input); // 输入框初始焦点
+    // 2026-10-16:不再抢键盘焦点 —— 删除 SetForegroundWindow + 创建期 SetFocus。
+    // 实测事故(BOSS 直聘任务):弹窗弹出瞬间抢占前台,用户正在其它窗口打字,
+    // 下一次敲 Enter 落进弹窗触发默认按钮提交 →「假人工已响应」(选项1空输入
+    // 交棒),复验不过→再弹窗→再误触,20~48s 一轮空转。与「焦点租约」治理的
+    // Chrome 抢焦是同一类病。现改:置顶显示(不激活) + 闪烁任务栏提示;人工
+    // 点击弹窗任意位置后键盘焦点自然进入,输入框 Enter 提交由消息循环显式
+    // 转发(见下方 WM_KEYDOWN 拦截)。
+    let flash = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd,
+        dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        uCount: 4,
+        dwTimeout: 0,
+    };
+    let _ = FlashWindowEx(&flash);
     // 2026-10-14:显示后自遍历本进程全部顶层窗口补挂 chrome(创建点单点已挂,
     // 此处为统一入口的幂等重申;此后每秒 WM_TIMER 持续兜底)。
     super::windows_theme::sweep_process_windows();
@@ -1261,6 +1282,26 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         let r = GetMessageW(&mut msg, HWND::default(), 0, 0);
         if r.0 == 0 || r.0 == -1 {
             break;
+        }
+        // 2026-10-16:输入框持有键盘焦点时的 Enter = 提交(人工真在打字的信号)。
+        // 主按钮已无 BS_DEFPUSHBUTTON,IsDialogMessageW 不再把 Enter 路由到提交;
+        // 这里显式转发,保住「打完字按回车」的自然交互。焦点在其它控件/触控板
+        // 时 Enter 无操作(防误触:焦点不在弹窗内的键盘消息本就到不了这里)。
+        if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_RETURN.0 as usize {
+            let f = GetFocus();
+            let input_focused = {
+                let guard = state();
+                guard.as_ref().map(|st| st.input == f).unwrap_or(false)
+            };
+            if input_focused {
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    WPARAM(IDOK_ID as usize),
+                    LPARAM(0),
+                );
+                continue;
+            }
         }
         // 2026-10-13(二):触控板持有焦点时跳过对话框键导航 —— 否则 Enter/Esc
         // 会被 IsDialogMessageW 当作「默认按钮/取消」吃掉,无法回放给页面

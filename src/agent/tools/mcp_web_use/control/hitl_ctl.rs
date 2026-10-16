@@ -777,6 +777,41 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
     }
 }
 
+/// HITL `options` 宽松解析(2026-10-16):接受直接数组 `["a","b"]`,也接受 LLM
+/// 常见输出的嵌套对象形状 `{"item":[…]}` / `{"options":[…]}`(含双层嵌套)。
+///
+/// 实测(BOSS 直聘任务,llaew_20261016_125732)LLM 两次把 options 写成
+/// `{"item":[…]}` 与 `{"item":{"item":[…]}}`,旧解析只认 `Value::as_array`,
+/// 静默丢弃 LLM 定制选项回退默认档。无字符串数组字段时返回空数组(调用方
+/// 沿用默认选项兜底,语义不变)。
+pub(super) fn parse_hitl_options(v: Option<&Value>) -> Vec<String> {
+    fn extract(val: &Value, depth: u8) -> Vec<String> {
+        match val {
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+            Value::Object(map) if depth > 0 => map
+                .values()
+                .map(|inner| extract(inner, depth - 1))
+                .max_by_key(|v| v.len())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+    v.map(|x| extract(x, 2)).unwrap_or_default()
+}
+
+/// HITL `timeout_ms` 宽松解析:数字 + 数字字符串 `"300000"`(LLM 偶发把数值
+/// 序列化成字符串,与 `options` 同轮实测;对齐 todo_state 的 lenient 先例)。
+pub(super) fn de_u64_lenient_json(v: Option<&Value>) -> Option<u64> {
+    match v {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
 /// control_action=request_human:人工介入请求(HITL 闭环,LLM 显式调用入口)。
 ///
 /// 流程:可选 `bring_to_front`(默认 true)把浏览器窗口带到前台 → 附图仅显式
@@ -805,16 +840,7 @@ pub(super) async fn act_request_human(
             json!({"reason": reason, "allowed": HUMAN_ASSIST_ALLOWED_REASONS}),
         );
     }
-    let options: Vec<String> = p
-        .get("options")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let options: Vec<String> = parse_hitl_options(p.get("options"));
     let allow_selectors = p
         .get("allow_selectors")
         .and_then(Value::as_array)
@@ -830,7 +856,7 @@ pub(super) async fn act_request_human(
         options,
         // 2026-10-13:选项多选(弹窗复选框组;应答编码 `1. a；3. c`)。
         multi_select: super::super::bool_param(p.get("multi_select"), false),
-        timeout_ms: p.get("timeout_ms").and_then(Value::as_u64),
+        timeout_ms: de_u64_lenient_json(p.get("timeout_ms")),
         bring_to_front: p.get("bring_to_front").and_then(Value::as_bool).unwrap_or(true),
         unlock_page: super::super::bool_param(p.get("unlock_page"), true),
         allow_selectors,
@@ -982,5 +1008,52 @@ mod tests {
         // 第 2 次但应答不是「已完成」语义(如取消/其它指示)→ 不告警
         assert!(hitl_repeat_caveat(2, "2. 取消任务").is_none());
         assert!(hitl_repeat_caveat(2, "先查北京天气").is_none());
+    }
+
+    /// 2026-10-16:options 宽松解析 —— 实测形状(直接数组 / item 嵌套 / 双层嵌套)全兼容。
+    #[test]
+    fn parse_hitl_options_accepts_llm_shapes() {
+        use serde_json::json;
+        // 直接数组(规范形状)
+        assert_eq!(
+            parse_hitl_options(Some(&json!(["我已完成登录", "取消"]))),
+            vec!["我已完成登录".to_string(), "取消".to_string()]
+        );
+        // 实测形状一:{"item":[…]}(BOSS 直聘任务第一次)
+        assert_eq!(
+            parse_hitl_options(Some(&json!({"item": ["我已完成人工操作,继续", "取消任务"]}))),
+            vec!["我已完成人工操作,继续".to_string(), "取消任务".to_string()]
+        );
+        // 实测形状二:双层嵌套 {"item":{"item":[…]}}(同任务第二次)
+        assert_eq!(
+            parse_hitl_options(Some(&json!({"item": {"item": ["我已完成人工操作,继续", "取消任务"]}}))),
+            vec!["我已完成人工操作,继续".to_string(), "取消任务".to_string()]
+        );
+        // 多字段对象取条目最多的数组字段
+        assert_eq!(
+            parse_hitl_options(Some(&json!({"kind": "options", "list": ["a", "b", "c"]}))),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // 非法形状回退空数组(调用方沿用默认选项)
+        assert!(parse_hitl_options(None).is_empty());
+        assert!(parse_hitl_options(Some(&json!("options"))).is_empty());
+        assert!(parse_hitl_options(Some(&json!({"item": "无选项"}))).is_empty());
+        // 数组内非字符串条目被过滤
+        assert_eq!(parse_hitl_options(Some(&json!([1, "ok", null]))).len(), 1);
+    }
+
+    /// 2026-10-16:timeout_ms 宽松解析 —— 数字字符串与数字同义。
+    #[test]
+    fn de_u64_lenient_json_accepts_numeric_string() {
+        use serde_json::json;
+        assert_eq!(de_u64_lenient_json(Some(&json!(300000))), Some(300000));
+        // 实测形状:LLM 把数值写成字符串
+        assert_eq!(de_u64_lenient_json(Some(&json!("300000"))), Some(300000));
+        assert_eq!(de_u64_lenient_json(Some(&json!(" 120000 "))), Some(120000));
+        // 非法值 → None(调用方回退 reason 分档默认超时)
+        assert_eq!(de_u64_lenient_json(Some(&json!("abc"))), None);
+        assert_eq!(de_u64_lenient_json(Some(&json!(true))), None);
+        assert_eq!(de_u64_lenient_json(Some(&json!(-5))), None);
+        assert_eq!(de_u64_lenient_json(None), None);
     }
 }

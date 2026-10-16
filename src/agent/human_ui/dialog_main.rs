@@ -285,8 +285,26 @@ pub fn run(payload_path: &Path) -> i32 {
     if !text.is_empty() {
         obj.insert("text".into(), serde_json::Value::String(text));
     }
-    println!("{}", serde_json::Value::Object(obj));
+    emit_line_or_exit(&serde_json::Value::Object(obj).to_string());
     0
+}
+
+/// 子进程写一行到 stdout(收口行 / extend / guard / relay 中间行)。
+///
+/// 写失败 = 父进程管道已关闭(父进程被 Ctrl-C/强杀时不保证先回收弹窗)——弹窗
+/// 已是孤儿,静默退出进程(窗口随进程销毁),不再 panic。2026-10-16 实测事故:
+/// 父进程终止后子进程 `println!` panic `failed printing to stdout:
+/// 管道正在被关闭。 (os error 232)` 并生成 CrashReport
+/// (CrashReport/crash_report_20261016_123408_737423.md,backtrace 落在本模块 run)。
+pub(super) fn emit_line_or_exit(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if out.write_all(line.as_bytes()).is_err()
+        || out.write_all(b"\n").is_err()
+        || out.flush().is_err()
+    {
+        std::process::exit(0);
+    }
 }
 
 fn read_payload(path: &Path) -> Result<serde_json::Value, String> {

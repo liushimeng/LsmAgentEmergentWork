@@ -24,10 +24,16 @@ use std::sync::OnceLock;
 pub enum StealthMode {
     /// 不做任何环境处置（回退到裸 CDP 环境，供排障对照）。
     Off,
-    /// 非侵入式：只移除自动化泄漏 + 回填本机真值。缺省档。
-    #[default]
+    /// 非侵入式：只移除自动化泄漏 + 回填本机真值。
     Fidelity,
-    /// 侵入式：保真档全部 + 被替换函数的身份原生化。
+    /// 侵入式：保真档全部 + 被替换函数的身份原生化。缺省档(2026-10-16)。
+    ///
+    /// 缺省从 fidelity 升档依据:BOSS 直聘实测(2026-10-16,llaew_20261016_125732)
+    /// fidelity 档下被改写函数的 `Function.prototype.toString` 源码可读
+    /// (`patched_functions_visible`)——geetest 类风控 SDK 采集该信号加权,
+    /// 匿名访问首页即被 302 到 verify.html;hardened 把「我们改过」本身不可
+    /// 反查,该签名从根上消失。`LAEW_WEB_STEALTH=fidelity` 可显式降档。
+    #[default]
     Hardened,
 }
 
@@ -87,7 +93,7 @@ pub fn fingerprint_kill_switch() -> bool {
     })
 }
 
-/// 进程级生效档位（`LAEW_WEB_STEALTH` > 缺省 `fidelity`）。
+/// 进程级生效档位（`LAEW_WEB_STEALTH` > 缺省 `hardened`，2026-10-16 升档）。
 ///
 /// 进程级单例：同一进程内所有页面共用（`open(stealth=…)` / `control(set_stealth)` 的
 /// 显式覆盖存在 `BrowserInner.stealth`，见 `browser.rs`）。
@@ -118,8 +124,8 @@ pub fn status_json(effective: StealthMode) -> Value {
         "fidelity": effective != StealthMode::Off && !kill,
         "hardened": effective == StealthMode::Hardened,
         "kill_switch": kill,
-        "note": "fidelity=非侵入式(只移除自动化泄漏+回填本机真值)/hardened=侵入式(保真+被替换函数身份原生化);\
-                 LAEW_WEB_STEALTH=off 可整体关闭,LAEW_WEB_FINGERPRINT=off 只关保真回填与体检",
+        "note": "缺省=hardened(2026-10-16 升档);fidelity=非侵入式(只移除自动化泄漏+回填本机真值)/hardened=侵入式(保真+被替换函数身份原生化);\
+                 LAEW_WEB_STEALTH=fidelity 可显式降档,=off 可整体关闭,LAEW_WEB_FINGERPRINT=off 只关保真回填与体检",
     })
 }
 
@@ -275,7 +281,9 @@ mod tests {
 
     #[test]
     fn 档位名稳定() {
-        assert_eq!(StealthMode::default(), StealthMode::Fidelity, "缺省必须是非侵入式保真档");
+        // 2026-10-16 缺省升档:hardened(toString 原生化)根治 patched_functions_visible
+        // 可被 geetest 类风控反查(BOSS 直聘实测匿名访问即被打标 302 verify.html)。
+        assert_eq!(StealthMode::default(), StealthMode::Hardened, "缺省必须是侵入式原生化档");
         assert_eq!(StealthMode::Off.as_str(), "off");
         assert_eq!(StealthMode::Fidelity.as_str(), "fidelity");
         assert_eq!(StealthMode::Hardened.as_str(), "hardened");

@@ -419,7 +419,7 @@ extern "C" fn on_extend(_self: Id, _cmd: Sel, _sender: Id) {
             timeline,
         )
     };
-    println!("{line}");
+    super::dialog_main::emit_line_or_exit(&line);
     unsafe {
         if !extend_btn.is_null() {
             send_void_id(extend_btn, sel(b"setTitle:\0"), ns_str(&title));
@@ -454,7 +454,7 @@ extern "C" fn on_guard_toggle(_self: Id, _cmd: Sel, _sender: Id) {
             st.views.guard,
         )
     };
-    println!("{line}"); // Stdout 行缓冲:换行即 flush,父进程逐行读
+    super::dialog_main::emit_line_or_exit(&line); // 行缓冲:换行即 flush,父进程逐行读
     unsafe {
         if !btn.is_null() {
             send_void_id(btn, sel(b"setTitle:\0"), ns_str(title));
@@ -610,10 +610,7 @@ fn pad_relay(event: Id, kind: &str) {
     let h = rect.size.height.max(1.0);
     let nx = ((p.x - rect.origin.x) / w).clamp(0.0, 1.0);
     let ny = (1.0 - (p.y - rect.origin.y) / h).clamp(0.0, 1.0);
-    println!(
-        "{}",
-        super::dialog_main::relay_line(id, kind, nx, ny, "")
-    );
+    super::dialog_main::emit_line_or_exit(&super::dialog_main::relay_line(id, kind, nx, ny, ""));
 }
 
 extern "C" fn on_pad_down(_self: Id, _cmd: Sel, event: Id) {
@@ -649,7 +646,7 @@ extern "C" fn on_pad_key(_self: Id, _cmd: Sel, event: Id) {
             _ => return,
         }
     };
-    println!("{}", super::dialog_main::relay_line(id, "key", 0.0, 0.0, name));
+    super::dialog_main::emit_line_or_exit(&super::dialog_main::relay_line(id, "key", 0.0, 0.0, name));
 }
 
 /// 触控板必须能成为第一响应者才能收到 keyDown:(YES = 1 的 BOOL)。
@@ -781,7 +778,7 @@ extern "C" fn on_relay_toggle(_self: Id, _cmd: Sel, _sender: Id) {
             pad_rect,
         )
     };
-    println!("{line}");
+    super::dialog_main::emit_line_or_exit(&line);
     unsafe {
         send_void_bool(msg_scroll, sel(b"setHidden:\0"), now_on);
         for o in &opts {
@@ -865,10 +862,9 @@ fn finish(kind: &str, tag: i64) {
             guard.as_ref().map(|st| st.payload_id).unwrap_or(0)
         };
         if id > 0 {
-            println!(
-                "{}",
-                super::dialog_main::relay_line(id, "session_end", 0.0, 0.0, "")
-            );
+            super::dialog_main::emit_line_or_exit(&super::dialog_main::relay_line(
+                id, "session_end", 0.0, 0.0, "",
+            ));
         }
     }
     unsafe { stop_run_loop() };
@@ -1220,10 +1216,15 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
     let frames = layout_frames(fw, fh, geo, p.options.len());
     apply_frames(&snapshot, &frames, geo);
 
-    // ---- 焦点与激活 ----
-    send_void_id(window, sel(b"makeKeyAndOrderFront:\0"), std::ptr::null_mut());
-    send_void_bool(nsapp_ptr(), sel(b"activateIgnoringOtherApps:\0"), true);
-    send_bool_id(window, sel(b"makeFirstResponder:\0"), input);
+    // ---- 置前显示(2026-10-16:不再抢键盘焦点) ----
+    // 实测事故(Windows 侧同病,BOSS 直聘任务):弹窗弹出瞬间抢占系统键盘焦点,
+    // 用户在其它窗口打字,下一次 Enter 落进弹窗触发提交 →「假人工已响应」,
+    // 复验不过→再弹窗→再误触空转。macOS 同构根治:
+    // - orderFrontRegardless:置前可见但**不夺 key window**;
+    // - 不 activateIgnoringOtherApps(不强抢 app 激活);
+    // - 不预设 makeFirstResponder(人工点击弹窗后窗口自然 becomeKey,点输入框
+    //   才聚焦;输入框 Enter → submit: 仍是真交互提交路径,见 1118 行 setAction)。
+    send_void_id(window, sel(b"orderFrontRegardless\0"), std::ptr::null_mut());
 
     // ---- 定时器 ----
     let tick = send_id_f64_id_sel_id_bool(
@@ -1235,16 +1236,9 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
         std::ptr::null_mut(),
         true,
     );
-    let focus_once = send_id_f64_id_sel_id_bool(
-        cls(b"NSTimer\0"),
-        sel(b"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:\0"),
-        0.05,
-        ctrl,
-        sel(b"focusOnce:\0"),
-        std::ptr::null_mut(),
-        false,
-    );
-    let _ = focus_once; // 一次性 timer fire 后自动失效,无需手工清理
+    let _ = tick; // 事件循环跑完由 NSWindow 释放;state 置空后 tick 空转无害
+    // 2026-10-16:删除 focusOnce(0.05s 二次断言 first responder)——弹窗不再
+    // 预设键盘焦点后,该断言只会把焦点抢回输入框,重新制造误触面。
 
     // ---- 状态入位 + 跑事件循环 ----
     *state() = Some(MacState {

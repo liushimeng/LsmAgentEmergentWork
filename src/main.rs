@@ -700,8 +700,14 @@ async fn run_one_shot(
             // 再 std::process::exit(130) —— 这是「已经 graceful 过了」+ 退出码
             // 130 (128+SIGINT 惯例, e2e 用例断言 rc=130)。atexit handler
             // (libc::atexit 装的 BrowserManager::cleanup_sync) 仍会跑兜底。
+            //
+            // 2026-10-16:补回收挂起的人工介入请求(与下方 Err 路径/正常收口路径
+            // 对齐)。实测缺口:Ctrl-C 时 HITL 弹窗子进程不随任务取消回收,孤儿
+            // 弹窗继续存活,管道关闭后其收口 println! panic 生成 CrashReport
+            // (os error 232;CrashReport/crash_report_20261016_123408_737423.md)。
             lsm_agent::shutdown::terminal_restore_sync();
             lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
+            lsm_agent::agent::human_assist::HumanAssistHub::global().cancel_pending();
             eprintln!("[laew] 任务已取消(用户中断)");
             std::process::exit(130);
         }
