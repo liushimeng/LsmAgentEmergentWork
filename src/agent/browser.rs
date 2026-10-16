@@ -518,8 +518,16 @@ async fn apply_screen_sync_override(page: &chromiumoxide::Page, sync: Option<(u3
                 return;
             }
         };
-    if let Err(e) = page.execute(params).await {
-        tracing::warn!("屏幕几何自洽覆盖下发失败(outer>screen 的物理不可能仍会暴露): {e}");
+    // 有界超时:本覆盖只影响几何自洽(纯反检测收益),绝不能拖住首次导航。
+    // CDP 无响应时 fail-open,降级为「读到 800x600 无头默认值」的老行为。
+    match tokio::time::timeout(std::time::Duration::from_secs(5), page.execute(params)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("屏幕几何自洽覆盖下发失败(outer>screen 的物理不可能仍会暴露): {e}");
+        }
+        Err(_) => {
+            tracing::warn!("屏幕几何自洽覆盖超时(5s,fail-open 不阻断导航;outer>screen 仍会暴露)");
+        }
     }
 }
 
