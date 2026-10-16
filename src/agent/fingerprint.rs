@@ -92,6 +92,22 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
         const named = (() => { try { return !!navigator.plugins.namedItem('PDF Viewer'); } catch (e) { return false; } })();
         return { tag, inst, named_item_ok: named };
       } catch (e) { return null; }
+    })(),
+    // 第 176 轮:languages 回填形态自证。原生 WebIDL sequence<DOMString>
+    // 返回**非 frozen**数组(Object.isFrozen===false);若为 true 说明我们 freeze 了
+    // (严格模式 push 抛 TypeError,原生不抛)—— 零成本形态判据。
+    languages_frozen: (() => {
+      try { return Object.isFrozen(navigator.languages || []); } catch (e) { return null; }
+    })(),
+    // 第 176 轮:迭代器自反性自证。原生 Iterator 的迭代器本身 iterable
+    // (iterator[Symbol.iterator] 是函数);若为 undefined 说明我们返回的裸对象
+    // 没补自反方法 —— 零成本形态判据。
+    iterator_self_iterable: (() => {
+      try {
+        if (!navigator.plugins || navigator.plugins.length === 0) return null;
+        const it = navigator.plugins[Symbol.iterator]();
+        return typeof (it && it[Symbol.iterator]);
+      } catch (e) { return null; }
     })()
   };
 })())"#;
@@ -245,6 +261,28 @@ pub fn classify(fp: &Value) -> Vec<Value> {
             }));
         }
     }
+    // ===================== 第 176 轮:languages/迭代器形态自证 =====================
+    // 两项都是「我们自己制造的形态破绽」类信号,命中即说明对应根治逻辑失效。
+    if fp.get("languages_frozen").and_then(Value::as_bool) == Some(true) {
+        out.push(json!({
+            "code": "languages_frozen",
+            "advice": "navigator.languages 被 freeze(原生 WebIDL sequence 返回非 frozen 数组);\
+                       严格模式 push 会抛 TypeError(原生不抛),是零成本形态判据;\
+                       处置:确认注入的是最新 browser_ns::FIDELITY_JS(第 176 轮已去 freeze)"
+        }));
+    }
+    // iterator_self_iterable 缺测(null = 插件本就空 / 探测失败) = fail-open 不告警;
+    // 只有明确读到非 'function'(即 undefined,裸对象没补自反)才告警。
+    if let Some(v) = fp.get("iterator_self_iterable") {
+        if !v.is_null() && v.as_str() != Some("function") {
+            out.push(json!({
+                "code": "iterator_not_self_iterable",
+                "advice": "plugins[Symbol.iterator]() 返回的迭代器不自反(原生 Iterator 迭代器\
+                           本身 iterable,iterator[Symbol.iterator] 是函数);\
+                           处置:确认注入的是最新 browser_ns::FIDELITY_JS(第 176 轮已补自反)"
+            }));
+        }
+    }
     out
 }
 
@@ -262,6 +300,8 @@ pub fn build(fp: &Value) -> Value {
         "ua_brand": fp.get("ua_brand").cloned().unwrap_or(Value::Null),
         "geometry": fp.get("geometry").cloned().unwrap_or(Value::Null),
         "plugin_shape_ok": fp.get("plugin_shape_ok").cloned().unwrap_or(Value::Null),
+        "languages_frozen": fp.get("languages_frozen").cloned().unwrap_or(Value::Null),
+        "iterator_self_iterable": fp.get("iterator_self_iterable").cloned().unwrap_or(Value::Null),
         "suspicious": susp,
         "note": "suspicious 非空不代表一定被拦,但站点风控采这些字段加权很高;\
                  被拦时的首选改道是 open(reuse_existing=true) 接管用户已登录的真实浏览器"
@@ -467,5 +507,70 @@ mod tests {
         assert!(b["suspicious"].as_array().unwrap().is_empty());
         assert!(b["note"].as_str().unwrap().contains("reuse_existing"));
         assert!(parse("garbage").is_none());
+    }
+
+    // ===================== 第 176 轮:languages/迭代器形态自证 =====================
+
+    #[test]
+    fn 语言列表冻结命中告警() {
+        let base = json!({"ok": true, "unmasked": true,
+                          "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"});
+        // languages_frozen=true → 命中(我们 freeze 了,原生不 freeze)
+        let v = fp(base.clone(), json!({"languages_frozen": true}));
+        assert!(
+            codes(&v).contains(&"languages_frozen".to_string()),
+            "languages_frozen=true 应命中:{:?}",
+            codes(&v)
+        );
+        // 原生态 false → 不告警
+        let ok = fp(base.clone(), json!({"languages_frozen": false}));
+        assert!(
+            !codes(&ok).contains(&"languages_frozen".to_string()),
+            "原生非 frozen 不得告警:{:?}",
+            codes(&ok)
+        );
+        // 缺测 fail-open
+        let missing = fp(base, json!({}));
+        assert!(
+            !codes(&missing).contains(&"languages_frozen".to_string()),
+            "缺测不得告警:{:?}",
+            codes(&missing)
+        );
+    }
+
+    #[test]
+    fn 迭代器不自反命中告警() {
+        let base = json!({"ok": true, "unmasked": true,
+                          "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"});
+        // iterator_self_iterable='undefined'(裸对象没补自反)→ 命中
+        let v = fp(base.clone(), json!({"iterator_self_iterable": "undefined"}));
+        assert!(
+            codes(&v).contains(&"iterator_not_self_iterable".to_string()),
+            "迭代器不自反应命中:{:?}",
+            codes(&v)
+        );
+        // 修复后 'function' → 不告警
+        let ok = fp(base.clone(), json!({"iterator_self_iterable": "function"}));
+        assert!(
+            !codes(&ok).contains(&"iterator_not_self_iterable".to_string()),
+            "自反后不得告警:{:?}",
+            codes(&ok)
+        );
+        // 缺测(null = 插件本就空)→ fail-open 不告警
+        let missing = fp(base, json!({}));
+        assert!(
+            !codes(&missing).contains(&"iterator_not_self_iterable".to_string()),
+            "缺测不得告警:{:?}",
+            codes(&missing)
+        );
+    }
+
+    #[test]
+    fn 自证项回报到build() {
+        let raw = r#"{"languages_frozen":false,"iterator_self_iterable":"function"}"#;
+        let v = parse(raw).unwrap();
+        let b = build(&v);
+        assert_eq!(b["languages_frozen"], json!(false));
+        assert_eq!(b["iterator_self_iterable"], json!("function"));
     }
 }

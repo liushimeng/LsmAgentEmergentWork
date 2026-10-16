@@ -236,9 +236,16 @@ const FIDELITY_JS: &str = r#"
                 Object.defineProperty(proto, Symbol.iterator, {
                     value: reg(function () {
                         let i = 0;
-                        return { next: () => i < items.length
+                        // 第 176 轮:原生 Iterator 的迭代器本身也是 iterable 的
+                        // (`iterator[Symbol.iterator]()` 返回自身,ECMAScript 规范要求)。
+                        // 我们返回的裸对象必须补这个自反方法,否则
+                        // `plugins[Symbol.iterator]()[Symbol.iterator]` 读到 undefined
+                        // (原生是函数)是零成本形态判据。
+                        const iter = { next: () => i < items.length
                             ? { value: items[i++], done: false }
                             : { value: undefined, done: true } };
+                        iter[Symbol.iterator] = function () { return iter; };
+                        return iter;
                     }, '[Symbol.iterator]'),
                     writable: true, enumerable: false, configurable: true
                 });
@@ -273,6 +280,10 @@ const FIDELITY_JS: &str = r#"
     } catch (e) {}
 
     // ③ navigator.languages 空值回填:取页面自报的 navigator.language 及其基语言。
+    //    第 176 轮:去掉 Object.freeze —— 原生 WebIDL sequence<DOMString> 返回的数组
+    //    **不是 frozen**(实测 Object.isFrozen(navigator.languages)===false,数组可写);
+    //    freeze 后严格模式 navigator.languages.push(x) 会抛 TypeError(原生不抛),
+    //    是零成本形态判据。返回普通数组与原生同形。
     try {
         if (!navigator.languages || navigator.languages.length === 0) {
             const lang = navigator.language || 'en-US';
@@ -280,7 +291,7 @@ const FIDELITY_JS: &str = r#"
             const list = base && base !== lang ? [lang, base] : [lang];
             try {
                 Object.defineProperty(Navigator.prototype, 'languages', {
-                    get: reg(function () { return Object.freeze(list); }, 'get languages'),
+                    get: reg(function () { return list; }, 'get languages'),
                     configurable: true, enumerable: true
                 });
             } catch (e) {}
@@ -323,19 +334,28 @@ const FIDELITY_JS: &str = r#"
     } catch (e) {}
 
     // ⑤ Notification.permission 与 permissions.query 一致性:两者矛盾是经典无头检测
-    //    组合。只在**确认不一致**时就地改写返回对象的 state(保留原生 PermissionStatus
-    //    身份,不做对象替换),其余一切情况零动作。
+    //    组合。第 176 轮:覆盖全部三种 Notification.permission 值,用**精确映射**判定
+    //    不一致 —— Notification.permission 取值 default/denied/granted,而 query 返回
+    //    的 state 取值 prompt/denied/granted,**default 与 prompt 语义一致**(都表示
+    //    「未决定」)。简单用 !== 比较会把 default vs prompt 误判为不一致并改写,反而
+    //    制造不一致。映射:granted↔granted / denied↔denied / default↔prompt。
+    //    只在**偏离映射**时就地改写返回对象的 state(以 Notification.permission 为准,
+    //    保留原生 PermissionStatus 身份,零伪造),其余一切情况零动作。
     try {
         if (window.Permissions && Permissions.prototype.query
-            && typeof Notification !== 'undefined' && Notification.permission === 'denied') {
+            && typeof Notification !== 'undefined'
+            && Notification.permission !== 'unsupported') {
+            // default 与 prompt 语义一致(都表示「未决定」),granted/denied 原样。
+            const want = Notification.permission === 'default' ? 'prompt'
+                                                        : Notification.permission;
             const origQuery = Permissions.prototype.query;
             const wrappedQuery = reg(function query(p) {
                 const r = origQuery.apply(this, arguments);
                 return Promise.resolve(r).then(function (st) {
                     try {
-                        if (p && p.name === 'notifications' && st && st.state !== Notification.permission) {
+                        if (p && p.name === 'notifications' && st && st.state !== want) {
                             Object.defineProperty(st, 'state', {
-                                get: () => Notification.permission, configurable: true
+                                get: () => want, configurable: true
                             });
                         }
                     } catch (e) {}
@@ -744,6 +764,59 @@ mod tests {
         assert!(
             !f.contains("items[n]"),
             "不得按数组下标做具名查找 —— 恒查不到,实测 namedItem 返回 null"
+        );
+    }
+
+    // ===================== 第 176 轮:回填形态自洽 =====================
+
+    /// 第 176 轮:Notification 一致性必须覆盖全部三种 permission 值,并用精确映射
+    /// (default↔prompt)判定不一致 —— 简单 !== 会把语义一致的 default vs prompt
+    /// 误判为不一致并改写,反而制造不一致。
+    #[test]
+    fn 通知权限一致性全量覆盖且用精确映射() {
+        use crate::agent::stealth::StealthMode;
+        for m in [StealthMode::Fidelity, StealthMode::Hardened] {
+            let s = stealth_js_for(m).unwrap();
+            // 触发条件不再只限 denied:覆盖 granted/denied/default 全部
+            assert!(
+                s.contains("Notification.permission !== 'unsupported'"),
+                "必须覆盖全部三种 Notification.permission 值(不只 denied)"
+            );
+            // 精确映射:default → prompt(语义一致),granted/denied 原样
+            assert!(
+                s.contains("Notification.permission === 'default' ? 'prompt'"),
+                "default 必须映射到 prompt(两者都表示未决定)"
+            );
+            assert!(s.contains("const want"), "必须用 want 变量承载映射结果");
+            // 判据与改写都以 want 为准
+            assert!(s.contains("st.state !== want"), "不一致判据必须用 want");
+            assert!(s.contains("get: () => want"), "改写必须以 want 为准");
+        }
+    }
+
+    /// 第 176 轮:navigator.languages 回填不得 freeze —— 原生 WebIDL sequence
+    /// 返回非 frozen 数组,freeze 后严格模式 push 抛 TypeError(原生不抛)。
+    #[test]
+    fn 语言列表回填不得冻结() {
+        use crate::agent::stealth::StealthMode;
+        for m in [StealthMode::Fidelity, StealthMode::Hardened] {
+            let s = stealth_js_for(m).unwrap();
+            assert!(
+                !s.contains("Object.freeze(list)"),
+                "回填不得 freeze(原生 languages 非 frozen,freeze 后严格模式 push 抛错)"
+            );
+        }
+    }
+
+    /// 第 176 轮:plugins/mimeTypes 的 Symbol.iterator 返回的迭代器必须自反
+    /// (iterator[Symbol.iterator] 是函数,ECMAScript 规范要求)。
+    #[test]
+    fn 插件迭代器自反() {
+        use crate::agent::stealth::StealthMode;
+        let f = stealth_js_for(StealthMode::Fidelity).unwrap();
+        assert!(
+            f.contains("iter[Symbol.iterator] = function () { return iter; }"),
+            "迭代器必须补 Symbol.iterator 自反方法(原生 Iterator 迭代器本身 iterable)"
         );
     }
 }
