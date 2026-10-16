@@ -124,7 +124,8 @@ pub fn status_json(effective: StealthMode) -> Value {
         "fidelity": effective != StealthMode::Off && !kill,
         "hardened": effective == StealthMode::Hardened,
         "kill_switch": kill,
-        "note": "缺省=hardened(2026-10-16 升档);fidelity=非侵入式(只移除自动化泄漏+回填本机真值)/hardened=侵入式(保真+被替换函数身份原生化);\
+        "note": "缺省=hardened(侵入式);fidelity=非侵入式(只移除自动化泄漏+回填本机真值)/hardened=侵入式(保真+被替换函数身份原生化,含跨档升级时对上一轮改写的重新认领);\
+                 档位只影响新注入,运行时切档为升档即时生效;\
                  LAEW_WEB_STEALTH=fidelity 可显式降档,=off 可整体关闭,LAEW_WEB_FINGERPRINT=off 只关保真回填与体检",
     })
 }

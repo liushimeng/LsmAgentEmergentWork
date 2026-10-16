@@ -1051,6 +1051,15 @@ impl BrowserManager {
         // 让首个文档起就满足 `outer <= screen`(真机实测:不补则
         // screen=800x600 < outer=1920,物理不可能,风控一行即可判定)。
         apply_screen_sync_override(&page, inner.screen_sync).await;
+        // 第 177 轮:隐身脚本必须在**导航之前**注册。`addScriptToEvaluateOnNewDocument`
+        // 只有在 goto 之前下发才能拿到 document-start 执行序;原先它排在 goto 之后,
+        // 靠 `run_immediately` 补救 —— 那只对**当前文档**生效,首个文档的页面脚本早已在
+        // document-start 跑完,读到的是未处置的 `navigator.webdriver=true` 与空 plugins,
+        // 并已把风控信标发出去(风险 SDK 一律在文档最早期采指纹)。移到这里后首个文档
+        // 也从一开始就是处置过的环境。connect 模式零注入契约不变。
+        if !inner.connect_mode {
+            super::browser_ns::inject_stealth(&page, inner.stealth).await;
+        }
         tokio::time::timeout(browser_timeout, page.goto(url.to_string()))
             .await
             .map_err(|_| {
@@ -1069,12 +1078,8 @@ impl BrowserManager {
             let _ = page.execute(params).await;
         }
 
-        // 第 169 轮:隐身覆写最先注入(document-start 执行序 = 注册序,先于高亮/管控),
-        // 压掉 navigator.webdriver 指纹;connect 模式零注入契约不变(真实浏览器无此指纹)。
-        // 第 174 轮:按档位注入(非侵入式保真 / 侵入式原生化,open(stealth=…) 可覆盖)。
-        if !inner.connect_mode {
-            super::browser_ns::inject_stealth(&page, inner.stealth).await;
-        }
+        // 第 169/174/177 轮:隐身覆写已在 goto **之前**注册(见上),此处不再重复注入 ——
+        // 重复注册会把同一份脚本再挂一遍(靠脚本内按块位掩码的幂等闸兜底,但没有意义)。
         // 第 100 轮:headed 可视化模式注入 Agent 高亮蓝框(hidden 无窗口,注入无意义
         // 且污染 DOM 提取,跳过)。注意:浏览器已存在时以实例真实 mode 为准
         // (inner.mode),而非本次 open 请求的 mode —— 单实例复用,不新启浏览器。

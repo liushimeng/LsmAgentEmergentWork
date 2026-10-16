@@ -108,6 +108,73 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
         const it = navigator.plugins[Symbol.iterator]();
         return typeof (it && it[Symbol.iterator]);
       } catch (e) { return null; }
+    })(),
+    // ===================== 第 177 轮:漏检与自造破绽自证 =====================
+    // ① 已知自动化框架的全局泄漏扫描。第三方驱动/框架(driver、playwright、puppeteer、
+    //    phantom、selenium)会在 window 上挂固定名全局,一行 `getOwnPropertyNames` 即可
+    //    枚举。我们自己经 CDP 驱动不产生这些键 —— 非空即说明页面里有第三方自动化痕迹。
+    automation_globals: (() => {
+      try {
+        const re = /^(cdc_|domAutomation|_phantom$|callPhantom$|__selenium|__nightmare|__playwright|__pw|__puppeteer|__driver|__fxdriver|webdriver$)/i;
+        return Object.getOwnPropertyNames(window).filter((n) => re.test(n));
+      } catch (e) { return null; }
+    })(),
+    // ② 我们自己改写过的函数里**仍能被 toString 读到源码**的那些(原生化登记漏网)。
+    //    逐个走页面可触达的稳定入口取引用再问 toString;非 `[native code]` 即漏登记。
+    //    保真档下命中属预期(该档不改函数身份),侵入档命中即说明登记表没兜住。
+    patched_fn_leak: (() => {
+      try {
+        const sites = [];
+        const add = (label, fn) => {
+          try {
+            if (typeof fn !== 'function') return;
+            if (/\[native code\]/.test(Function.prototype.toString.call(fn))) return;
+            sites.push(label);
+          } catch (e) {}
+        };
+        try { add('webgl_getParameter', WebGLRenderingContext.prototype.getParameter); } catch (e) {}
+        try { add('permissions_query', Permissions.prototype.query); } catch (e) {}
+        try {
+          const d = Object.getOwnPropertyDescriptor(Navigator.prototype, 'plugins');
+          if (d && d.get) add('nav_plugins_getter', d.get);
+          const w = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
+          if (w && w.get) add('nav_webdriver_getter', w.get);
+        } catch (e) {}
+        try {
+          const it = navigator.plugins && navigator.plugins[Symbol.iterator] && navigator.plugins[Symbol.iterator]();
+          if (it) { add('plugins_iter_next', it.next); add('plugins_iter_self', it[Symbol.iterator]); }
+        } catch (e) {}
+        return sites;
+      } catch (e) { return null; }
+    })(),
+    // ③ 焦点/可见性自洽:文档自报 visible 却拿不到焦点,是「无头/无人值守」的经典组合。
+    focus_visibility: (() => {
+      try {
+        return { visibility: document.visibilityState || '', has_focus: document.hasFocus() === true };
+      } catch (e) { return null; }
+    })(),
+    // ④ 回填替身的**子对象**形态:`Plugin.mimeTypes` 是原生必带字段,漏了它就与同页
+    //    `navigator.mimeTypes` 直接矛盾(第 177 轮已补,这里做自证)。
+    plugin_mimetypes_shape: (() => {
+      try {
+        if (!navigator.plugins || !navigator.plugins.length) return null;
+        const p = navigator.plugins[0];
+        const m = p ? p.mimeTypes : null;
+        if (!m) return { present: false, length: 0, tag: '', inst: null };
+        return {
+          present: true,
+          length: m.length,
+          tag: Object.prototype.toString.call(m),
+          inst: (typeof MimeTypeArray === 'function') ? (m instanceof MimeTypeArray) : null
+        };
+      } catch (e) { return null; }
+    })(),
+    // ⑤ 我们注入的 ns 全局键数量(不可枚举但 getOwnPropertyNames 可见)。
+    //    **只观测不告警**:要彻底消除只能让 window 变成 Proxy(不可能)。如实回报让
+    //    人工/QC 知道有这一层痕迹,而不是假装没有。
+    injected_ns_keys: (() => {
+      try { return Object.getOwnPropertyNames(window).filter((n) => /^__lz[0-9a-f]{8}/.test(n)).length; }
+      catch (e) { return null; }
     })()
   };
 })())"#;
@@ -283,13 +350,114 @@ pub fn classify(fp: &Value) -> Vec<Value> {
             }));
         }
     }
+    // ===================== 第 177 轮:漏检与自造破绽 =====================
+    // 第三方自动化框架的全局泄漏:我们经 CDP 驱动不产生这些键,非空即说明页面上还有
+    // 别的自动化痕迹(或站点自己埋的同名脚本)。这是**硬判据**,优先级与 webdriver 同级。
+    if let Some(leaked) = fp.get("automation_globals").and_then(Value::as_array) {
+        if !leaked.is_empty() {
+            out.push(json!({
+                "code": "automation_global_leak",
+                "advice": format!(
+                    "window 上存在已知自动化框架的全局: {} —— 本工具经 CDP 驱动不会产生这些键,\
+                     命中说明页面上还有第三方自动化痕迹(或站点脚本同名),\
+                     处置:open(reuse_existing=true) 接管用户已登录的真实浏览器",
+                    leaked.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+                )
+            }));
+        }
+    }
+    // 自造破绽:被改写函数仍可被 toString 读到源码。侵入档命中即登记表漏网(处置=查注入),
+    // 保真档命中属该档语义(它压根不改函数身份)——措辞按「可升档」而非「故障」。
+    if let Some(sites) = fp.get("patched_fn_leak").and_then(Value::as_array) {
+        if !sites.is_empty() {
+            out.push(json!({
+                "code": "patched_function_source_visible",
+                "advice": format!(
+                    "这些被改写的函数能被 Function.prototype.toString 读到源码(压制手法本身成为签名): {}\
+                     —— 保真档下这是该档语义;若已在 data.stealth.mode=hardened 仍命中,\
+                     说明身份登记表漏了这些入口,处置:确认注入的是最新 browser_ns::PRELUDE_JS/HARDENED_JS",
+                    sites.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+                )
+            }));
+        }
+    }
+    // 焦点/可见性自洽:visible 却无焦点 = 经典「无人值守」组合(真机有焦点时二者一致)。
+    if let Some(fv) = fp.get("focus_visibility").filter(|v| !v.is_null()) {
+        let visible = fv.get("visibility").and_then(Value::as_str) == Some("visible");
+        let focused = fv.get("has_focus").and_then(Value::as_bool) == Some(true);
+        if visible && !focused {
+            out.push(json!({
+                "code": "focus_visibility_mismatch",
+                "advice": "文档自报 visibilityState=visible 却 document.hasFocus()=false —— \
+                           真机前台页面二者一致,这是「无头/无人值守」的经典组合判据;\
+                           处置:确认窗口已置前(control bring_to_front)或改用 \
+                           open(reuse_existing=true) 接管用户已登录的真实浏览器"
+            }));
+        }
+    }
+    // 回填替身的子对象形态:`Plugin.mimeTypes` 缺失或形态错同样一眼可辨。
+    if let Some(m) = fp.get("plugin_mimetypes_shape").filter(|v| !v.is_null()) {
+        let present = m.get("present").and_then(Value::as_bool) == Some(true);
+        let len_ok = m.get("length").and_then(Value::as_u64) == Some(2);
+        let tag_ok = m.get("tag").and_then(Value::as_str) == Some("[object MimeTypeArray]");
+        let inst_ok = m.get("inst").and_then(Value::as_bool) != Some(false);
+        if !present || !len_ok || !tag_ok || !inst_ok {
+            out.push(json!({
+                "code": "plugin_mimetypes_shape_mismatch",
+                "advice": format!(
+                    "plugins[0].mimeTypes 与原生不符(present={} length={} tag={} instanceof={})—— \
+                     原生必带该字段且恒为 2 条 [object MimeTypeArray];\
+                     与同页 navigator.mimeTypes 的长度直接矛盾,一行即可判定替身造假;\
+                     处置:确认注入的是最新 browser_ns::FIDELITY_JS(第 177 轮已补该字段)",
+                    m.get("present").map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+                    m.get("length").map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+                    m.get("tag").and_then(Value::as_str).unwrap_or("?"),
+                    m.get("inst").map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+                )
+            }));
+        }
+    }
     out
+}
+
+/// 硬判据集合：命中任一即 `risk_tier=high`（建议直接改道 `open(reuse_existing=true)`
+/// 接管用户已登录的真实浏览器，而不是继续在拉起环境上调参）。
+const HARD_CODES: &[&str] = &[
+    "webdriver_true",
+    "headless_ua",
+    "webgl_default_strings",
+    "automation_global_leak",
+    "screen_geometry_impossible",
+    "screen_headless_default",
+    "plugin_shape_mismatch",
+    "plugin_mimetypes_shape_mismatch",
+    "focus_visibility_mismatch",
+];
+
+/// 环境风险档（`ok` / `warn` / `high`）——把一长串 `suspicious` 收敛成**一个可执行信号**
+/// 给 Agent：high 就别在拉起环境上继续调参了，直接换真实浏览器指纹。
+pub fn risk_tier(susp: &[Value]) -> &'static str {
+    if susp.is_empty() {
+        return "ok";
+    }
+    let hard = susp.iter().any(|s| {
+        s.get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|c| HARD_CODES.contains(&c))
+    });
+    if hard {
+        "high"
+    } else {
+        "warn"
+    }
 }
 
 /// 组装完整 `data.fingerprint` 响应段(健康环境也返回,供人工/QC 对账)。
 pub fn build(fp: &Value) -> Value {
     let susp = classify(fp);
+    let tier = risk_tier(&susp);
     json!({
+        "risk_tier": tier,
         "webdriver": fp.get("webdriver").cloned().unwrap_or(Value::Null),
         "webgl": fp.get("webgl").cloned().unwrap_or(Value::Null),
         "plugins": fp.get("plugins").cloned().unwrap_or(Value::Null),
@@ -302,9 +470,17 @@ pub fn build(fp: &Value) -> Value {
         "plugin_shape_ok": fp.get("plugin_shape_ok").cloned().unwrap_or(Value::Null),
         "languages_frozen": fp.get("languages_frozen").cloned().unwrap_or(Value::Null),
         "iterator_self_iterable": fp.get("iterator_self_iterable").cloned().unwrap_or(Value::Null),
+        "automation_globals": fp.get("automation_globals").cloned().unwrap_or(Value::Null),
+        "patched_fn_leak": fp.get("patched_fn_leak").cloned().unwrap_or(Value::Null),
+        "focus_visibility": fp.get("focus_visibility").cloned().unwrap_or(Value::Null),
+        "plugin_mimetypes_shape": fp.get("plugin_mimetypes_shape").cloned().unwrap_or(Value::Null),
+        "injected_ns_keys": fp.get("injected_ns_keys").cloned().unwrap_or(Value::Null),
         "suspicious": susp,
-        "note": "suspicious 非空不代表一定被拦,但站点风控采这些字段加权很高;\
-                 被拦时的首选改道是 open(reuse_existing=true) 接管用户已登录的真实浏览器"
+        "note": "risk_tier=high 表示环境在风控眼里已是硬判据级别,继续在本环境调参收益极低,\
+                 应直接 open(reuse_existing=true) 接管用户已登录的真实浏览器;\
+                 warn=有可升档/可复核项;suspicious 非空不代表一定被拦,但站点风控采这些字段加权很高。\
+                 injected_ns_keys 是我们注入层的 window 键数(不可枚举但 getOwnPropertyNames 可见),\
+                 只观测不告警 —— 彻底消除需让 window 变 Proxy,不可行"
     })
 }
 
@@ -572,5 +748,157 @@ mod tests {
         let b = build(&v);
         assert_eq!(b["languages_frozen"], json!(false));
         assert_eq!(b["iterator_self_iterable"], json!("function"));
+    }
+
+    // ===================== 第 177 轮:漏检与自造破绽自证 =====================
+
+    fn healthy_base() -> Value {
+        json!({"ok": true, "unmasked": true,
+               "vendor": "Google Inc. (Apple)",
+               "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified)"})
+    }
+
+    /// 第三方自动化框架的全局泄漏是**硬判据**:我们经 CDP 驱动不产生 `cdc_*` /
+    /// `__selenium*` / `__playwright*` 这类键,命中即说明页面上还有别的自动化痕迹。
+    #[test]
+    fn 自动化全局泄漏命中且给出具体键名() {
+        let v = fp(
+            healthy_base(),
+            json!({"automation_globals": ["cdc_adoQpoasnfa76pfcZLmcfl_Array", "domAutomation"]}),
+        );
+        let c = classify(&v);
+        let item = c
+            .iter()
+            .find(|x| x["code"] == "automation_global_leak")
+            .expect("非空全局必须命中");
+        let advice = item["advice"].as_str().unwrap();
+        assert!(advice.contains("cdc_adoQpoasnfa76pfcZLmcfl_Array"), "须回报具体键名:{advice}");
+        assert!(advice.contains("reuse_existing"), "须给出改道建议:{advice}");
+        // 空数组(干净环境)不得告警
+        let clean = fp(healthy_base(), json!({"automation_globals": []}));
+        assert!(!codes(&clean).contains(&"automation_global_leak".to_string()));
+        // 缺测 fail-open
+        assert!(!codes(&fp(healthy_base(), json!({})))
+            .contains(&"automation_global_leak".to_string()));
+    }
+
+    /// 我们改写过的函数仍能被 toString 读到源码 = 压制手法本身成为签名。
+    /// 保真档下这是该档语义(它压根不改函数身份),措辞必须落在「可升档」而非「故障」。
+    #[test]
+    fn 改写函数源码可见命中() {
+        let v = fp(
+            healthy_base(),
+            json!({"patched_fn_leak": ["permissions_query", "plugins_iter_next"]}),
+        );
+        let c = classify(&v);
+        let item = c
+            .iter()
+            .find(|x| x["code"] == "patched_function_source_visible")
+            .expect("非空漏登记必须命中");
+        let advice = item["advice"].as_str().unwrap();
+        assert!(advice.contains("permissions_query"), "须回报具体入口:{advice}");
+        assert!(advice.contains("保真档"), "保真档下这是语义而非故障:{advice}");
+        // 空数组(侵入档登记完整)不得告警
+        let ok = fp(healthy_base(), json!({"patched_fn_leak": []}));
+        assert!(!codes(&ok).contains(&"patched_function_source_visible".to_string()));
+    }
+
+    /// 焦点/可见性自洽:真机前台页面二者一致,visible 却无焦点是「无人值守」判据。
+    #[test]
+    fn 焦点可见性不自洽命中() {
+        let bad = fp(
+            healthy_base(),
+            json!({"focus_visibility": {"visibility": "visible", "has_focus": false}}),
+        );
+        assert!(codes(&bad).contains(&"focus_visibility_mismatch".to_string()));
+        // 有焦点 / 不可见(后台页,浏览器治理的常态)都不告警
+        for good in [
+            json!({"visibility": "visible", "has_focus": true}),
+            json!({"visibility": "hidden", "has_focus": false}),
+            json!({"visibility": "hidden", "has_focus": true}),
+        ] {
+            let v = fp(healthy_base(), json!({"focus_visibility": good.clone()}));
+            assert!(
+                !codes(&v).contains(&"focus_visibility_mismatch".to_string()),
+                "{good} 不该告警"
+            );
+        }
+        // 缺测 fail-open
+        assert!(!codes(&fp(healthy_base(), json!({})))
+            .contains(&"focus_visibility_mismatch".to_string()));
+    }
+
+    /// `Plugin.mimeTypes` 缺失/形态错同样一眼可辨(与同页 `navigator.mimeTypes` 矛盾)。
+    #[test]
+    fn 插件子对象形态失配命中() {
+        for bad in [
+            json!({"present": false, "length": 0, "tag": "", "inst": null}),
+            json!({"present": true, "length": 0, "tag": "[object MimeTypeArray]", "inst": true}),
+            json!({"present": true, "length": 2, "tag": "[object Object]", "inst": true}),
+            json!({"present": true, "length": 2, "tag": "[object MimeTypeArray]", "inst": false}),
+        ] {
+            let v = fp(healthy_base(), json!({"plugin_mimetypes_shape": bad.clone()}));
+            assert!(
+                codes(&v).contains(&"plugin_mimetypes_shape_mismatch".to_string()),
+                "{bad} 应命中,实际 {:?}",
+                codes(&v)
+            );
+        }
+        // 补齐后的原生形态 → 不告警
+        let good = fp(
+            healthy_base(),
+            json!({"plugin_mimetypes_shape": {
+                "present": true, "length": 2,
+                "tag": "[object MimeTypeArray]", "inst": true}}),
+        );
+        assert!(!codes(&good).contains(&"plugin_mimetypes_shape_mismatch".to_string()));
+        // 插件本就为空 → 不判定
+        assert!(!codes(&fp(healthy_base(), json!({"plugin_mimetypes_shape": Value::Null})))
+            .contains(&"plugin_mimetypes_shape_mismatch".to_string()));
+    }
+
+    /// `risk_tier` 把一长串 suspicious 收敛成**一个可执行信号**:high = 别在拉起
+    /// 环境上继续调参了,直接换真实浏览器指纹。软项(如保真档的源码可见)只到 warn。
+    #[test]
+    fn 风险档三档收敛() {
+        assert_eq!(risk_tier(&[]), "ok");
+        // 软项 → warn
+        let soft = classify(&fp(
+            healthy_base(),
+            json!({"patched_fn_leak": ["permissions_query"]}),
+        ));
+        assert_eq!(risk_tier(&soft), "warn", "{:?}", codes(&fp(healthy_base(), json!({"patched_fn_leak": ["permissions_query"]}))));
+        // 硬项 → high
+        let hard = classify(&fp(
+            healthy_base(),
+            json!({"automation_globals": ["cdc_x"]}),
+        ));
+        assert_eq!(risk_tier(&hard), "high");
+        // healthy_base 下 WebGL 是真串,不会额外触发 webgl_default_strings
+        assert!(!codes(&fp(healthy_base(), json!({}))).contains(&"webgl_default_strings".to_string()));
+    }
+
+    /// `build()` 必须把新自证项与 `risk_tier` 一并回报,否则探针白采集。
+    #[test]
+    fn 新自证项回报到build() {
+        let raw = r#"{"automation_globals":[],"patched_fn_leak":["permissions_query"],
+            "focus_visibility":{"visibility":"visible","has_focus":false},
+            "plugin_mimetypes_shape":{"present":true,"length":2,
+                "tag":"[object MimeTypeArray]","inst":true},
+            "injected_ns_keys":3}"#;
+        let b = build(&parse(raw).unwrap());
+        assert_eq!(b["automation_globals"], json!([]));
+        assert_eq!(b["patched_fn_leak"], json!(["permissions_query"]));
+        assert_eq!(b["injected_ns_keys"], json!(3));
+        assert_eq!(b["focus_visibility"]["has_focus"], json!(false));
+        // visible+无焦点是硬项 → high
+        assert_eq!(b["risk_tier"], "high");
+        // 注入层 ns 键只观测不告警(消除它需让 window 变 Proxy,不可行)
+        assert!(!b["suspicious"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["code"] == "injected_ns_keys"));
+        assert!(b["note"].as_str().unwrap().contains("injected_ns_keys"));
     }
 }

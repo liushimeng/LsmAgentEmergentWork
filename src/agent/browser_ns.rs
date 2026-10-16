@@ -18,6 +18,12 @@ use std::sync::OnceLock;
 /// 模板占位符（不是合法 JS 标识符，绝不会与模板内代码碰撞）。
 pub const NS_TOKEN: &str = "%NS%";
 
+/// 幂等闸的块位（第 177 轮）：`window.<ns>StealthRev` 是**块位掩码**而非单一版本号，
+/// 跨档升级时只补跑缺位对应的块。
+pub const BLOCK_CORE: u32 = 1;
+pub const BLOCK_FIDELITY: u32 = 2;
+pub const BLOCK_HARDENED: u32 = 4;
+
 /// 渲染注入模板：把模板内 `%NS%` 占位符替换为本进程命名空间。
 pub fn render_ns(template: &str) -> String {
     template.replace(NS_TOKEN, inject_ns())
@@ -63,6 +69,91 @@ const PRELUDE_JS: &str = r#"
     const reg = (fn, name) => {
         try { __fd.set(fn, 'function ' + name + '() { [native code] }'); } catch (e) {}
         return fn;
+    };
+    // 第 177 轮:「重新认领」—— 本脚本每次重注入都新建一个 `__fd`(闭包常量,
+    // 不落 window 故零可枚举键)。跨档升级时(保真→侵入)新表看不见**上一轮**注入
+    // 的那些改写函数,它们会退回可读的源码形态。解法不是把表挂到 window(那会新增
+    // 一个 `getOwnPropertyNames` 可见的全局键,本身即签名),而是在装原生化之前把
+    // 「上一轮可能改过、且页面可触达」的固定位置重新扫一遍并登记进新表 ——
+    // 页面能拿到的引用只有这些入口,扫全它们即等价于跨轮继承登记表。
+    const __adopt = (obj, key) => {
+        try {
+            if (!obj) return;
+            const d = Object.getOwnPropertyDescriptor(obj, key);
+            if (!d) return;
+            if (typeof d.get === 'function') reg(d.get, 'get ' + key);
+            if (typeof d.value === 'function') reg(d.value, key);
+        } catch (e) {}
+    };
+    const __adoptProto = (proto) => {
+        try {
+            if (!proto) return;
+            for (const k of ['item', 'namedItem', 'refresh']) __adopt(proto, k);
+            __adopt(proto, Symbol.iterator);
+        } catch (e) {}
+    };
+    // 迭代器工厂:保真块与「重装迭代器」共用同一份实现,保证两侧产出的 next /
+    // 自反方法永远在**当前这张表**里登记(第 177 轮)。
+    const __mkIterator = (items) => {
+        let i = 0;
+        const iter = { next: reg(function next() {
+            return i < items.length
+                ? { value: items[i++], done: false }
+                : { value: undefined, done: true };
+        }, 'next') };
+        iter[Symbol.iterator] = reg(function () { return iter; }, '[Symbol.iterator]');
+        return iter;
+    };
+    // 跨轮认领的例外:迭代器的 next / 自反方法是**每次调用现造的新对象**,原型上
+    // 根本没有引用,认领不到。解法不是给原型挂引用(那会新增可枚举痕迹),而是把
+    // 迭代器工厂**重装**一遍 —— items 用原生 `item()` 逐位反查回来(不额外存状态)。
+    // 只重装**我们自己造的中间原型**,真原型(PluginArray.prototype 等)一律不碰:
+    // 在真实插件存在的环境里替换原生迭代器是把好环境改坏。
+    const __rehardenIterator = (arr, RealProto) => {
+        try {
+            if (!arr || typeof arr.length !== 'number' || !RealProto) return;
+            const proto = Object.getPrototypeOf(arr);
+            if (!proto || proto === RealProto) return;
+            const items = [];
+            for (let i = 0; i < arr.length; i++) {
+                const one = proto.item ? proto.item.call(arr, i) : null;
+                if (!one) return;
+                items.push(one);
+            }
+            Object.defineProperty(proto, Symbol.iterator, {
+                value: reg(function () { return __mkIterator(items); }, '[Symbol.iterator]'),
+                writable: true, enumerable: false, configurable: true
+            });
+        } catch (e) {}
+    };
+    const __adoptAll = () => {
+        try {
+            __adopt(Navigator.prototype, 'webdriver');
+            __adopt(Navigator.prototype, 'plugins');
+            __adopt(Navigator.prototype, 'mimeTypes');
+            __adopt(Navigator.prototype, 'languages');
+            __adopt(window, 'chrome');
+            __adopt(window.Permissions && Permissions.prototype, 'query');
+            __adopt(window.WebGLRenderingContext && WebGLRenderingContext.prototype, 'getParameter');
+            __adopt(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype, 'getParameter');
+            // 回填的 plugins 数组体与其元素/子数组的**中间原型**(方法都挂在那儿)
+            const arr = navigator.plugins;
+            const PA = window.PluginArray && PluginArray.prototype;
+            const MA = window.MimeTypeArray && MimeTypeArray.prototype;
+            if (arr && arr.length) {
+                __adoptProto(Object.getPrototypeOf(arr));
+                __rehardenIterator(arr, PA);
+                __rehardenIterator(navigator.mimeTypes, MA);
+                const p0 = arr[0];
+                if (p0) {
+                    __adoptProto(Object.getPrototypeOf(p0));
+                    const mt = p0.mimeTypes;
+                    if (mt) { __adoptProto(Object.getPrototypeOf(mt)); __rehardenIterator(mt, MA); }
+                }
+                const m0 = arr[0] && arr[0][0];
+                if (m0) __adoptProto(Object.getPrototypeOf(m0));
+            }
+        } catch (e) {}
     };"#;
 
 /// 核心块：document-start 压掉 `navigator.webdriver`（第 169 轮，`off` 之外恒注入）。
@@ -173,6 +264,47 @@ const FIDELITY_JS: &str = r#"
                 getter: (name, fn) => ({ get: reg(fn, 'get ' + name), enumerable: true, configurable: true }),
                 method: (name, fn) => ({ value: reg(fn, name), writable: true, enumerable: true, configurable: true })
             };
+            // 数组体:实例 own 只有索引 + 具名键;length 与方法全在中间原型上。
+            // 第 177 轮:本构造器上移到 forEach 之前 —— `Plugin.mimeTypes` 也要走它,
+            // 而 `Plugin` 的中间原型是 forEach 内才拿得到的。
+            const makeArrayLike = (items, RealProto, tag, nameOf) => {
+                const proto = Object.create(RealProto);
+                let selfRef = null;   // 本数组体实例的引用(namedItem 按具名键回指它)
+                Object.defineProperties(proto, {
+                    length: descriptorFor.getter('length', function () { return items.length; }),
+                    item: descriptorFor.method('item', function item(i) {
+                        return (i >= 0 && i < items.length) ? items[i] : null;
+                    }),
+                    namedItem: descriptorFor.method('namedItem', function namedItem(n) {
+                        return (typeof n === 'string' && selfRef && selfRef[n]) ? selfRef[n] : null;
+                    }),
+                    refresh: descriptorFor.method('refresh', function refresh() {})
+                });
+                Object.defineProperty(proto, Symbol.iterator, {
+                    // 第 176 轮:原生 Iterator 的迭代器本身也是 iterable 的
+                    // (`iterator[Symbol.iterator]()` 返回自身,ECMAScript 规范要求),
+                    // 且其 next 必须可用 —— 由共用的 __mkIterator 统一产出。
+                    // 第 177 轮:next 与自反方法此前是**未登记的箭头/普通函数**,
+                    // 页面 `String(it.next)` / `String(it[Symbol.iterator])` 一行即可
+                    // 读到我们的源码 —— 原生化只登记了外层生成器,漏了迭代器本身。
+                    value: reg(function () { return __mkIterator(items); }, '[Symbol.iterator]'),
+                    writable: true, enumerable: false, configurable: true
+                });
+                Object.defineProperty(proto, Symbol.toStringTag,
+                    { value: tag, enumerable: false, configurable: true });
+                const o = Object.create(proto);
+                items.forEach((it, i) => {
+                    Object.defineProperty(o, String(i),
+                        { value: it, enumerable: true, writable: false, configurable: true });
+                    const key = nameOf(it);
+                    if (key != null) {
+                        Object.defineProperty(o, key,
+                            { value: it, enumerable: true, writable: false, configurable: true });
+                    }
+                });
+                selfRef = o;
+                return o;
+            };
             // MimeType 元素:四个字段全挂中间原型 getter,实例 own 为空(原生即如此)。
             const makeMime = (spec, plugin) => {
                 const proto = Object.create(MimeType.prototype);
@@ -201,6 +333,15 @@ const FIDELITY_JS: &str = r#"
                     }
                     return mime;
                 });
+                // 第 177 轮:原生 `Plugin` 必带 `mimeTypes` 属性。旧回填漏了它 →
+                // `navigator.plugins[0].mimeTypes` 为 undefined,与同页
+                // `navigator.mimeTypes.length === 2` 直接矛盾(一行即可判定替身造假)。
+                // 补法:每个插件各持一份**独立的** MimeTypeArray 视图(原生亦如此 ——
+                // `plugins[0].mimeTypes !== plugins[1].mimeTypes`),元素仍是同一批
+                // 按 type 去重后的 MimeType 实例(与 `navigator.mimeTypes[i]` 同一对象,
+                // 原生的 `enabledPlugin` 回指语义才成立)。
+                const mimeView = makeArrayLike(own, MimeTypeArray.prototype,
+                    'MimeTypeArray', (m) => m.type);
                 Object.defineProperties(proto, {
                     length: descriptorFor.getter('length', function () { return own.length; }),
                     item: descriptorFor.method('item', function item(i) {
@@ -208,7 +349,8 @@ const FIDELITY_JS: &str = r#"
                     }),
                     namedItem: descriptorFor.method('namedItem', function namedItem(n) {
                         return (typeof n === 'string' && plugin[n]) ? plugin[n] : null;
-                    })
+                    }),
+                    mimeTypes: descriptorFor.getter('mimeTypes', function () { return mimeView; })
                 });
                 // 实例 own = mime 索引 + mime type 具名键(与原生 Plugin 实例同形)
                 own.forEach((mime, i) => {
@@ -219,51 +361,6 @@ const FIDELITY_JS: &str = r#"
                 });
                 ctx.plugins.push(plugin);
             });
-            // 数组体:实例 own 只有索引 + 具名键;length 与方法全在中间原型上。
-            const makeArrayLike = (items, RealProto, tag, nameOf) => {
-                const proto = Object.create(RealProto);
-                let selfRef = null;   // 本数组体实例的引用(namedItem 按具名键回指它)
-                Object.defineProperties(proto, {
-                    length: descriptorFor.getter('length', function () { return items.length; }),
-                    item: descriptorFor.method('item', function item(i) {
-                        return (i >= 0 && i < items.length) ? items[i] : null;
-                    }),
-                    namedItem: descriptorFor.method('namedItem', function namedItem(n) {
-                        return (typeof n === 'string' && selfRef && selfRef[n]) ? selfRef[n] : null;
-                    }),
-                    refresh: descriptorFor.method('refresh', function refresh() {})
-                });
-                Object.defineProperty(proto, Symbol.iterator, {
-                    value: reg(function () {
-                        let i = 0;
-                        // 第 176 轮:原生 Iterator 的迭代器本身也是 iterable 的
-                        // (`iterator[Symbol.iterator]()` 返回自身,ECMAScript 规范要求)。
-                        // 我们返回的裸对象必须补这个自反方法,否则
-                        // `plugins[Symbol.iterator]()[Symbol.iterator]` 读到 undefined
-                        // (原生是函数)是零成本形态判据。
-                        const iter = { next: () => i < items.length
-                            ? { value: items[i++], done: false }
-                            : { value: undefined, done: true } };
-                        iter[Symbol.iterator] = function () { return iter; };
-                        return iter;
-                    }, '[Symbol.iterator]'),
-                    writable: true, enumerable: false, configurable: true
-                });
-                Object.defineProperty(proto, Symbol.toStringTag,
-                    { value: tag, enumerable: false, configurable: true });
-                const o = Object.create(proto);
-                items.forEach((it, i) => {
-                    Object.defineProperty(o, String(i),
-                        { value: it, enumerable: true, writable: false, configurable: true });
-                    const key = nameOf(it);
-                    if (key != null) {
-                        Object.defineProperty(o, key,
-                            { value: it, enumerable: true, writable: false, configurable: true });
-                    }
-                });
-                selfRef = o;
-                return o;
-            };
             const defNav = (key, val) => {
                 try {
                     Object.defineProperty(Navigator.prototype, key, {
@@ -354,8 +451,12 @@ const FIDELITY_JS: &str = r#"
                 return Promise.resolve(r).then(function (st) {
                     try {
                         if (p && p.name === 'notifications' && st && st.state !== want) {
+                            // 第 177 轮:此前是 `get: () => want` 的**未登记箭头函数**,
+                            // 页面 `Object.getOwnPropertyDescriptor(st,'state').get.toString()`
+                            // 一行即可读到我们的源码(且原生化只登记外层 query)。
                             Object.defineProperty(st, 'state', {
-                                get: () => want, configurable: true
+                                get: reg(function state() { return want; }, 'get state'),
+                                configurable: true
                             });
                         }
                     } catch (e) {}
@@ -376,7 +477,13 @@ const FIDELITY_JS: &str = r#"
 /// `Function.prototype.toString.call(Function.prototype.toString)` 同样报 native，
 /// 不会因「toString 是自己的源码」而暴露。描述符与原生同形
 /// （`writable: true, enumerable: false, configurable: true` —— 此处**必须**不可枚举）。
+///
+/// 第 177 轮:装原生化**之前**先 `__adoptAll()` 重新认领上一轮注入遗留的改写函数 ——
+/// 跨档升级(保真→侵入)时本轮的 `__fd` 是全新表,看不见上一轮登记过的函数,
+/// 不认领它们就会退回可读的源码形态(而页面照样能通过 `Permissions.prototype.query`
+/// 这类稳定入口拿到引用)。
 const HARDENED_JS: &str = r#"
+    try { __adoptAll(); } catch (e) {}
     try {
         const origToString = Function.prototype.toString;
         const wrappedToString = function toString() {
@@ -402,30 +509,54 @@ pub fn stealth_js_for(mode: crate::agent::stealth::StealthMode) -> Option<String
     if mode == StealthMode::Off {
         return None;
     }
-    let mut blocks: Vec<&str> = vec![PRELUDE_JS, CORE_JS];
+    let mut want: u32 = BLOCK_CORE;
     if !fingerprint_kill_switch() {
-        blocks.push(FIDELITY_JS);
+        want |= BLOCK_FIDELITY;
     }
     if mode == StealthMode::Hardened {
-        blocks.push(HARDENED_JS);
+        want |= BLOCK_HARDENED;
     }
-    // 幂等闸(第 174 轮):同一文档**同档重复注入必须零动作** ——
-    // `set_stealth` 会在每次 open 与运行时切档时对存活页面重挂脚本，而重复注入
-    // 会叠加包装(第二份 `__fd` 登记表看不见第一份的函数 → 原生化被判为非 native,
-    // 且 getParameter 被套两层)。升档(rev 变大)才允许重跑。标记本身不可枚举,
-    // 不引入新的可枚举全局(隐身自检只查 laew 字样,但少一个键少一分痕迹)。
-    let rev: u32 = if mode == StealthMode::Hardened { 2 } else { 1 };
-    Some(render_ns(&format!(
-        "(() => {{\n\
-         \x20   try {{\n\
-         \x20       if (window.{NS_TOKEN}StealthRev >= {rev}) return;\n\
-         \x20       Object.defineProperty(window, '{NS_TOKEN}StealthRev', \
-         {{ value: {rev}, configurable: true, enumerable: false }});\n\
-         \x20   }} catch (e) {{}}\n\
-         {}\n\
-         }})()",
-        blocks.join("\n")
-    )))
+    // 幂等闸按**块位掩码**(第 177 轮,原为单一 rev 整数):同一文档重复注入必须零动作。
+    // `set_stealth` 会在每次 open 与运行时切档时对存活页面重挂脚本,整脚本重跑会把包装器
+    // 叠加(第二份 `__fd` 看不见第一份的函数 -> 原生化被判为非 native,且 getParameter
+    // 被套两层)。位掩码让**跨档升级只跑缺的那几块**:保真->侵入时核心/保真两块的位已置位,
+    // 只有原生化块执行 —— 既不叠加包装,又能借 `__adoptAll()` 把上一轮的改写函数认领进新表
+    // (登记表是闭包常量,跨重注入本就是新表)。标记沿用同一个不可枚举 window 键(不新增
+    // 全局键),值仍是整数。
+    // 模板里一律用 `%TOKEN%` 占位（不是合法 JS 标识符，天然零碰撞），不用 `format!` ——
+    // 模板正文含大量 JS 花括号，`format!` 的 `{{}}` 转义会把 JS 本身搅乱。
+    // 只有 `want` 里置位的块才会被拼进脚本文本：既让脚本体积随档位最小化，也让
+    // 「保真档脚本文本里根本没有原生化代码」这件事在源码层可断言（运行时闸只是
+    // 兜底，不能替代「压根不装」）。
+    let head = r#"(() => {
+  try {
+    var __cur = 0;
+    try { __cur = window.%NS%StealthRev || 0; } catch (e) {}
+    var __need = %WANT% & ~__cur;
+    if (__need === 0) return;
+    Object.defineProperty(window, '%NS%StealthRev', { value: %WANT%, configurable: true, enumerable: false });
+  } catch (e) {}
+"#;
+    let mut out = String::with_capacity(head.len() + 4096);
+    out.push_str(&head.replace("%WANT%", &want.to_string()));
+    out.push('\n');
+    out.push_str(PRELUDE_JS);
+    for (bit, block) in [
+        (BLOCK_CORE, CORE_JS),
+        (BLOCK_FIDELITY, FIDELITY_JS),
+        (BLOCK_HARDENED, HARDENED_JS),
+    ] {
+        if want & bit == 0 {
+            continue;
+        }
+        out.push_str("\n  if (__need & ");
+        out.push_str(&bit.to_string());
+        out.push_str(") {\n");
+        out.push_str(block);
+        out.push_str("\n  }\n");
+    }
+    out.push_str("})()");
+    Some(render_ns(&out))
 }
 
 /// 给页面安装隐身覆写（`Page.addScriptToEvaluateOnNewDocument`：导航/派生新文档
@@ -808,16 +939,196 @@ mod tests {
         }
     }
 
-    /// 第 176 轮:plugins/mimeTypes 的 Symbol.iterator 返回的迭代器必须自反
-    /// (iterator[Symbol.iterator] 是函数,ECMAScript 规范要求)。
+    /// 第 176/177 轮:plugins/mimeTypes 的 Symbol.iterator 返回的迭代器必须自反
+    /// (iterator[Symbol.iterator] 是函数,ECMAScript 规范要求),且迭代器上的
+    /// `next` 与自反方法**必须一并登记进身份表** —— 否则页面 `String(it.next)`
+    /// 一行即可读到我们的源码(原生化此前只登记了外层生成器,漏了迭代器本身)。
     #[test]
-    fn 插件迭代器自反() {
+    fn 插件迭代器自反且迭代器本身已登记() {
+        use crate::agent::stealth::StealthMode;
+        let f = stealth_js_for(StealthMode::Fidelity).unwrap();
+        // 迭代器工厂抽到前置块的 __mkIterator:保真块与「重装迭代器」共用同一份,
+        // 保证两侧产出的 next / 自反方法永远登记在**当前这张表**里。
+        assert!(
+            f.contains("const __mkIterator = (items) =>"),
+            "迭代器工厂必须抽成共用实现(否则跨档重装的迭代器不在当前登记表里)"
+        );
+        assert!(f.contains("next: reg(function next()"), "next 必须登记身份(reg)");
+        assert!(
+            f.contains("iter[Symbol.iterator] = reg(function () { return iter; }"),
+            "自反方法必须登记身份(reg)"
+        );
+        assert!(
+            f.contains("value: reg(function () { return __mkIterator(items); }"),
+            "保真块的迭代器入口必须走共用工厂并自行登记"
+        );
+        assert!(
+            !f.contains("next: () => i < items.length"),
+            "不得留下未登记的箭头函数形态"
+        );
+    }
+
+    /// 跨轮认领的例外:迭代器的 next/自反方法是**每次调用现造的新对象**,原型上没有
+    /// 引用可认领。解法是把迭代器工厂重装一遍(items 由原生 item() 反查回来),
+    /// 且**只重装自造的中间原型** —— 在真实插件存在的环境里替换原生迭代器是改坏。
+    #[test]
+    fn 迭代器跨档靠重装而非认领() {
+        use crate::agent::stealth::StealthMode;
+        let h = stealth_js_for(StealthMode::Hardened).unwrap();
+        assert!(h.contains("const __rehardenIterator = (arr, RealProto) =>"));
+        // 真原型不碰
+        assert!(
+            h.contains("if (!proto || proto === RealProto) return;"),
+            "必须跳过真原型(真实插件存在时替换原生迭代器会把好环境改坏)"
+        );
+        // items 由原生 item() 反查,不额外往原型上挂状态(那会新增可枚举痕迹)
+        assert!(
+            h.contains("const one = proto.item ? proto.item.call(arr, i) : null;"),
+            "items 必须由原生 item() 反查,不得额外存状态"
+        );
+        // 三个数组体都要重装:plugins / mimeTypes / 每个插件的 mimeTypes
+        assert!(h.contains("__rehardenIterator(arr, PA);"));
+        assert!(h.contains("__rehardenIterator(navigator.mimeTypes, MA);"));
+        assert!(h.contains("__rehardenIterator(mt, MA);"));
+    }
+
+    // ===================== 第 177 轮:注入时序 / 跨档自洽 / 子对象形态 =====================
+
+    /// 幂等闸必须是**块位掩码**:同档重复注入零动作,跨档升级只补跑缺位对应的块。
+    /// 若退化成单一 rev 整数,保真→侵入时整脚本重跑会把 `getParameter` 套两层
+    /// (两层包装下外层看到内层已回填的读数即原样放行,行为对,但包装链越滚越深,
+    /// 且第二份登记表看不见第一份的函数 → 原生化被误判为失败)。
+    #[test]
+    fn 幂等闸按块位掩码而非单一版本号() {
+        use crate::agent::stealth::StealthMode;
+        assert_eq!((BLOCK_CORE, BLOCK_FIDELITY, BLOCK_HARDENED), (1, 2, 4), "位必须互不相同且单");
+        for m in [StealthMode::Fidelity, StealthMode::Hardened] {
+            let s = stealth_js_for(m).unwrap();
+            // 读旧值 → 算缺位 → 缺位为零直接 return,再写回新值
+            assert!(s.contains("window.__lzn"), "必须读回既有标记:{s}");
+            assert!(s.contains("var __need ="), "必须按位算缺块:{s}");
+            assert!(s.contains("if (__need === 0) return;"), "零缺块必须直接返回:{s}");
+            // 每个装上的块都套一道同一位判的运行期闸
+            assert!(s.contains("if (__need & 1) {"), "核心块须带位闸:{s}");
+            if m == StealthMode::Hardened {
+                assert!(s.contains("if (__need & 2) {"), "保真块须带位闸:{s}");
+                assert!(s.contains("if (__need & 4) {"), "原生化块须带位闸:{s}");
+            } else {
+                assert!(
+                    !s.contains("if (__need & 4) {"),
+                    "保真档不得装原生化块(位闸只是兜底,文本层就该没有)"
+                );
+            }
+            // 标记仍是同一个不可枚举 window 键(不因位掩码新增全局键)
+            assert_eq!(
+                s.matches("StealthRev").count(),
+                2,
+                "标记键只应出现读+写两处,不得新增全局键"
+            );
+        }
+    }
+
+    /// 跨档升级时新表看不见上一轮登记的函数 → 原生化必须先「重新认领」。
+    /// 认领入口就是页面能拿到引用的那一组稳定位置(原型上的属性/方法/迭代器)。
+    #[test]
+    fn 原生化前先重新认领上一轮改写() {
+        use crate::agent::stealth::StealthMode;
+        let h = stealth_js_for(StealthMode::Hardened).unwrap();
+        // 认领动作必须在包装 toString 之前发生
+        let adopt = h.find("__adoptAll();").expect("原生化前必须先认领");
+        let wrap = h.find("Function.prototype.toString").expect("原生化块");
+        assert!(adopt < wrap, "认领必须早于原生化,否则上一轮函数仍泄露源码");
+        // 认领面覆盖「页面可触达」的固定位置,一个都不能少
+        for spot in [
+            "Navigator.prototype, 'webdriver'",
+            "Navigator.prototype, 'plugins'",
+            "Navigator.prototype, 'mimeTypes'",
+            "Navigator.prototype, 'languages'",
+            "window, 'chrome'",
+            "Permissions.prototype, 'query'",
+            "WebGLRenderingContext.prototype, 'getParameter'",
+            "WebGL2RenderingContext.prototype, 'getParameter'",
+        ] {
+            assert!(
+                h.contains(spot),
+                "认领面漏了 {spot} —— 该位置的改写函数会退回可读源码形态"
+            );
+        }
+        // 回填替身的中间原型(方法挂在那儿)也要认领,否则 namedItem/item 泄露
+        assert!(h.contains("__adoptProto(Object.getPrototypeOf(arr))"));
+        assert!(h.contains("__adoptProto(Object.getPrototypeOf(p0))"));
+        // getter 与 value 两种形态都要登记(前者是访问器,后者是普通函数属性)
+        assert!(h.contains("if (typeof d.get === 'function')"));
+        assert!(h.contains("if (typeof d.value === 'function')"));
+    }
+
+    /// 原生 `Plugin` 必带 `mimeTypes`。漏了它就与同页 `navigator.mimeTypes` 长度
+    /// 直接矛盾(一行判定替身造假)—— 形状错误的回填比不回填更危险。
+    #[test]
+    fn 插件替身补齐mimeTypes子对象() {
         use crate::agent::stealth::StealthMode;
         let f = stealth_js_for(StealthMode::Fidelity).unwrap();
         assert!(
-            f.contains("iter[Symbol.iterator] = function () { return iter; }"),
-            "迭代器必须补 Symbol.iterator 自反方法(原生 Iterator 迭代器本身 iterable)"
+            f.contains("mimeTypes: descriptorFor.getter('mimeTypes'"),
+            "Plugin 中间原型必须带 mimeTypes getter(原生必带)"
+        );
+        // 每个插件各持一份独立视图(原生 plugins[0].mimeTypes !== plugins[1].mimeTypes),
+        // 元素仍是同一批按 type 去重后的 MimeType(enabledPlugin 回指才成立)
+        assert!(
+            f.contains("const mimeView = makeArrayLike(own, MimeTypeArray.prototype"),
+            "子对象必须走同一套真原型链构造,不能造对象字面量"
+        );
+        // 构造器必须排在 forEach 之前(Plugin 的中间原型是 forEach 内才拿到的)
+        assert!(
+            f.find("const makeArrayLike =").unwrap() < f.find("NAMES.forEach(").unwrap(),
+            "makeArrayLike 必须在 forEach 之前定义,否则 TDZ 报错"
+        );
+    }
+
+    /// 注入时序：隐身脚本必须在 `goto` **之前**注册,否则首个文档的页面脚本已在
+    /// document-start 读到未处置的 `navigator.webdriver=true` 并把风控信标发出去。
+    /// 这条锁在 browser.rs 的 open 路径上(源码顺序断言),纯静态但能防回归。
+    #[test]
+    fn 隐身脚本注册早于首次导航() {
+        let src = include_str!("browser.rs");
+        let inject = src
+            .find("browser_ns::inject_stealth(&page, inner.stealth).await;")
+            .expect("open 路径必须注册隐身脚本");
+        let goto = src
+            .find("page.goto(url.to_string())")
+            .expect("open 路径必须导航");
+        assert!(inject < goto, "隐身脚本注册必须早于首次导航");
+        // 移位后不得残留「goto 之后再注入一次」的旧调用(重复注册无意义,
+        // 且会让首个文档之外的白等一次 CDP 往返)
+        let after = &src[goto..];
+        let next_goto = after[1..].find("page.goto(url.to_string())");
+        let window = match next_goto {
+            Some(i) => &after[..i],
+            None => after,
+        };
+        assert!(
+            !window.contains("browser_ns::inject_stealth(&page, inner.stealth).await;"),
+            "首次导航与下一次导航之间不得重复注册隐身脚本"
         );
     }
 }
 
+
+#[cfg(test)]
+mod js_dump {
+    /// 把渲染后的隐身脚本落到 `target/stealth_<档>.js`,供 `node --check` / 真机注入复核。
+    /// 非断言型辅助(默认不跑),仅在需要时手工执行:
+    /// `cargo test --lib js_dump -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn 导出渲染脚本供语法复核() {
+        use crate::agent::browser_ns::stealth_js_for;
+        use crate::agent::stealth::StealthMode;
+        for (name, m) in [("fidelity", StealthMode::Fidelity), ("hardened", StealthMode::Hardened)] {
+            let js = stealth_js_for(m).unwrap();
+            let p = format!("target/stealth_{name}.js");
+            std::fs::write(&p, js).unwrap();
+            println!("wrote {p}");
+        }
+    }
+}
