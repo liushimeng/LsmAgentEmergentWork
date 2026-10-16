@@ -1484,8 +1484,44 @@ pub(super) async fn dispatch_mouse(
 ///
 /// 返回:`{code:0, data:{page_id, results:[{info,code,message,data},...], summary_hint, total}}`。
 pub(super) async fn run_explore(args: Value) -> crate::error::Result<String> {
-    let Some(id) = str_arg(&args, "page_id") else {
-        return envelope(1001, "缺少 page_id", json!({}));
+    // 2026-10-16:explore 允许直接带 url —— page_id 缺失/失效时自动 open 后再观察
+    // (实测 Plan 首轮 `explore(url=…)` 被 1001「缺少 page_id」白烧一轮 LLM 迭代;
+    // explore 是「进入新页面先收集完整状态」的入口,自动开页与其定位一致)。
+    let args = args;
+    let mut auto_opened = false;
+    // page_id 显式给出但不存在 → 维持 2000 契约(见 tests.rs explore_unknown_page_returns_2000);
+    // 仅 page_id 缺省/为空时才允许 url 自动开页。
+    let id: String = match str_arg(&args, "page_id") {
+        Some(id) if !id.trim().is_empty() => id.to_string(),
+        _ => {
+            let url = str_arg(&args, "url").unwrap_or("").trim().to_string();
+            if url.is_empty() {
+                return envelope(
+                    1001,
+                    "缺少 page_id(新页面可直接给 url,explore 会自动打开)",
+                    json!({}),
+                );
+            }
+            // 复用 open 全路径(浏览器探活/管控/stealth/导航节奏闸一应俱全),
+            // 失败时原样透传 open 的信封(不伪造成功)。
+            let open_out = super::run_open(args.clone()).await?;
+            let parsed: Value = match serde_json::from_str(&open_out) {
+                Ok(v) => v,
+                Err(_) => return Ok(open_out),
+            };
+            if parsed.get("code").and_then(Value::as_i64) != Some(0) {
+                return Ok(open_out);
+            }
+            let Some(new_id) = parsed
+                .pointer("/data/page_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return Ok(open_out);
+            };
+            auto_opened = true;
+            new_id
+        }
     };
     let queries = match args.get("queries").and_then(Value::as_array) {
         Some(q) if !q.is_empty() => q,
@@ -1500,12 +1536,15 @@ pub(super) async fn run_explore(args: Value) -> crate::error::Result<String> {
         );
     }
     // 校验 page_id 有效性(2000 语义),所有 query 共用一次失败检查
-    if BrowserManager::global().page(id).await.is_none() {
+    if BrowserManager::global().page(&id).await.is_none() {
         return envelope(2000, "page_id 不存在", json!({"page_id": id}));
     }
 
+    // 2026-10-16:summary 是 summary_hint 的别名(模型自然写法漂移,实测被 schema
+    // additionalProperties=false 硬拒白烧一轮;与 request_human 顶层别名同策略)。
     let summary_hint = args
         .get("summary_hint")
+        .or_else(|| args.get("summary"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
@@ -1618,18 +1657,18 @@ pub(super) async fn run_explore(args: Value) -> crate::error::Result<String> {
         }
     }
 
-    envelope(
-        0,
-        "ok",
-        json!({
-            "page_id": id,
-            "results": results,
-            "summary_hint": summary_hint,
-            "ok_count": ok_count,
-            "err_count": err_count,
-            "total": queries.len(),
-        }),
-    )
+    let mut data = json!({
+        "page_id": id,
+        "results": results,
+        "summary_hint": summary_hint,
+        "ok_count": ok_count,
+        "err_count": err_count,
+        "total": queries.len(),
+    });
+    if auto_opened {
+        data["auto_opened"] = json!(true);
+    }
+    envelope(0, "ok", data)
 }
 
 /// `action=batch`:批量混合执行。复用 sequence 执行器逻辑(内部调用 `run_sequence`),

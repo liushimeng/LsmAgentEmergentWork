@@ -264,6 +264,8 @@ pub(super) fn detect_blockers(text: &str) -> Vec<Value> {
 }
 
 /// inspect 分发入口。
+/// 2026-10-16:queries[] 批量形态误传 inspect 的兼容分流在 `dispatch_web_action`
+/// (mod.rs)做 —— 放这里会与 explore→inspect 形成 async 递归要求 boxing。
 pub(super) async fn run(args: Value) -> crate::error::Result<String> {
     let Some(id) = str_arg(&args, "page_id") else {
         return envelope(1001, "缺少 page_id", json!({}));

@@ -449,6 +449,64 @@
         assert_eq!(plan.workflows[1].depends_on, vec!["wf-1"]);
     }
 
+    /// 2026-10-16 BOSS直聘实测回归:Plan 步骤内嵌 ``` 代码块(交付物 Markdown 模板)时,
+    /// 块内的 `## 岗位1:...` 标题行曾被误当作「下一段」触发提前 break,导致末单元
+    /// 后续的 步骤/依赖/验收标准 全部静默丢失(wf-5 的 `依赖:wf-4` 丢失 → 与 wf-1
+    /// 同层并发提前执行,白烧一轮单元重试)。围栏内行不得参与结构解析。
+    #[test]
+    fn parse_plan_markdown_ignores_headings_inside_code_fence() {
+        let md = r#"
+# 任务方案:test
+
+## 一、目标
+目标内容
+
+## 二、WorkFlow 拆解
+### WorkFlow 1: 采集数据
+- 步骤:
+  - [ ] 打开站点采集
+- 委派 Agent: SubAgent-Work
+- 依赖: 无
+- 验收标准: 采集完成
+
+### WorkFlow 2: 写入结果文档
+- 步骤:
+  - [ ] 将结果编排为 Markdown,格式如下:
+    ```
+    # 结果列表
+    > 说明
+
+    ## 岗位1: {名称} - {公司}
+    - **薪资**: xx
+    ---
+    ```
+  - [ ] 使用 Write 工具写入 `结果.md`
+  - [ ] Read 回读验证
+- 委派 Agent: SubAgent-Work
+- 依赖: wf-1
+- 验收标准: 文件存在且内容完整
+
+## 三、关键决策
+决策
+"#;
+        let plan = parse_plan_markdown(md).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(plan.workflows.len(), 2, "应解析出 2 个 WorkFlow(围栏内 ## 不得截断)");
+        let wf2 = &plan.workflows[1];
+        assert_eq!(wf2.id, "wf-2");
+        assert_eq!(
+            wf2.steps.len(),
+            3,
+            "wf-2 应有 3 个步骤(围栏不得吞掉步骤 2/3),实际: {:?}",
+            wf2.steps
+        );
+        assert_eq!(
+            wf2.depends_on,
+            vec!["wf-1"],
+            "wf-2 的依赖不得因围栏提前 break 而丢失"
+        );
+        assert_eq!(wf2.acceptance.len(), 1, "验收标准也不得丢失");
+    }
+
     /// I2(2026-09-14 第 51 轮):Plan 提示词漂移兜底 —— 粗体 bullet 变体
     /// `- **wf-N …**`(无 `### WorkFlow N:` 标题)也必须解析出 workflow,
     /// 否则 hard 任务「Plan 文档未解析出任何 WorkFlow」整链失败(fl10 实测)。

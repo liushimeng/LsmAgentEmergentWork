@@ -83,9 +83,14 @@ pub fn check_bash_readonly(command: &str) -> Result<()> {
 }
 
 fn deny(reason: String) -> AgentError {
+    // 2026-10-16:不写死 "Main-Work" —— readonly 模式由编排层多角色(Yolo/Plan/Main-Work)
+    // 共用(实测 Plan Agent 触发拒绝时文案张冠李戴,误导排障)。当前 Agent 身份由
+    // 上层会话日志标识,此处只陈述模式事实 + 给改道建议。
     AgentError::PermissionDenied {
         tool: "Bash".into(),
-        reason: format!("Main-Work Bash 处于只读模式: {reason}"),
+        reason: format!(
+            "当前 Agent 的 Bash 处于只读模式(编排层只读侦察,写盘请委派执行层 SubAgent-Work): {reason}"
+        ),
     }
 }
 

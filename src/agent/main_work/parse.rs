@@ -184,8 +184,21 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
     let mut workflows = Vec::new();
     let mut in_workflows_section = false;
     let mut current: Option<WorkFlowSpec> = None;
+    // 2026-10-16:代码围栏感知 —— Plan 步骤内嵌 ``` 代码块(如交付物 Markdown 模板)时,
+    // 块内的 `## 岗位1:...` 标题行会被误当作「下一段」触发提前 break,导致末单元
+    // 后续的 步骤/依赖/验收标准 全部静默丢失(实测 BOSS直聘方案 wf-5 的 `依赖:wf-4`
+    // 即因此丢失,wf-5 与 wf-1 同层并发提前执行,白烧一整轮单元重试)。
+    // 围栏内行一律不参与结构解析;围栏不闭合(畸形文档)时后续行全部跳过,宁缺毋滥。
+    let mut in_fence = false;
     for line in content.lines() {
         let t = line.trim();
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         if !in_workflows_section && (t.starts_with("## 二") || t.contains("WorkFlow 拆解")) {
             in_workflows_section = true;
             continue;

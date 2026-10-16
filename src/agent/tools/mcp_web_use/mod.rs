@@ -2565,7 +2565,7 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 【extract 详解(抓文章列表/新闻流/商品列表优先用它,不要手写 eval_js 猜字段)】params:item_selector*(列表项根节点 CSS 选择器,不知填什么先 probe=true)、fields(字段投影,形如 {"title":{"selector":"h3 a","required":true},"time":{"selector":"time","attr":"datetime"},"summary":{"selector":".descript","max_chars":300}},省略则只回通用 text+__url)、url_from(取链接的选择器,默认 "a",结果落在 __url)、limit(默认 200 上限 1000)、scan_cap(内部扫描上限,默认 1000)、filter{keywords[],match_all,fields[],time_field,since,until,sort("time:desc"),limit_after_filter}。**数值过滤/排序(通用,不限价格)**:filter.numeric{field?,min?,max?} —— 从字段文本抽取第一个数值(如 "¥10,999" / "32G" / "1.2万")按闭区间过滤;解析不出数字的条目**保留**(fail-open),响应 unparsed_numeric_fields 告知条数,防「字段格式异常→数据静默清空」;sort 对能解析成数值的字段**按数值比较**(根治字典序下 "999">"1299" 的反序,价格/销量/评分排序可直接用),字段未指定 field 时取第一条命名字段。返回 {items,total,returned,scanned,truncated,dropped_required,matched_before_filter,unparsed_time_fields,unparsed_numeric_fields,time_range,field_names,hostname,hint}。**时间字段支持中文相对时间**("3小时前"/"昨天")、ISO、"YYYY-MM-DD HH:mm" 与 Unix 秒;since/until 是闭区间。probe=true 时不抽数据,只返回 {repeated_classes,likely_item_classes,common_selectors} 供你选 item_selector,免去盲试选择器。过滤在页面内完成,返回值天然精简,不会撑爆上下文。
 【page_state 详解】params:keys?(候选全局变量名,默认 __NEXT_DATA__/__NUXT__/__INITIAL_STATE__/__APOLLO_STATE__/__PRELOADED_STATE__/__remixContext/initialState/__INITIAL_DATA__)、probe_window?(默认 true,扫出 window 上所有 __ 前缀键名+一层结构,让你不必先猜名字)、max_bytes?(默认 20000)、max_depth?(默认 8)、max_array_items?(默认 200)。返回 {found,globals,window_globals,jsonld,dropped_paths,truncated,hostname,hint}。**被裁掉的内容会列进 dropped_paths** —— 别误以为数据就这么多;按 globals 的结构选定路径后,用 eval_js 取精确子集(如 JSON.stringify(window.__NEXT_DATA__.props.pageProps.list.slice(0,20)))。
 - sequence(steps*, stop_on_error?): 连续执行模式。steps 最多 24 个,每项结构与单步调用相同(open/list/close/control/inspect),**action 可省略**(第 147 轮:含 control_action 默认 control、含 info 默认 inspect),禁止嵌套 sequence;**step 可省略 page_id**(第 157 轮:自动继承顶层 page_id,顶层也没有时继承上一步/派生页),批内显式 page_id 仍优先;字符串参数里仍可用 "$page_id"/"${page_id}" 占位,点击派生新页可用 "$spawned_page_id"/"${spawned_page_id}",默认自动跟随 spawned_page_id,单步可 follow_spawned=false 保持原页。响应逐步返回 code/message/data(成功步 message 截 300 字符、失败步截 2000),并给出最终 page_id。**第 150 轮步级防护**:任一步数据带 blocker_alert(验证弹窗命中)立即中断整批并顶层透出 blocker_alert/human_assist/next_action —— 收到后必须停止继续输入,立即 request_human 让人工完成验证、交棒后再续跑剩余步骤;单步超 150s 按步骤错误处理(request_human 步豁免);等待 AI 站点回复请用 control(wait),不要把多轮提问无超时地堆进同一批。
-- explore(page_id*, queries*, summary_hint?)(第 118 轮):批量观察。一次调用合并多个 inspect 维度(elements/dom/screenshot/blockers 等),queries 数组最多 8 项,每项为单步 inspect 入参(如 {"info":"elements"} / {"info":"dom","params":{"selector":"form"}} / {"info":"screenshot"} / {"info":"blockers"});返回 {results:[{info,code,message,data},...], summary_hint, ok_count, err_count}。**进入新页面先用 1 次 explore 收集完整状态**(对比单步 inspect 节省 3-5 次 LLM round-trip);blockers 命中会附带 next_action hint 指引走 request_human。
+- explore(page_id?, queries*, summary_hint?)(第 118 轮):批量观察。一次调用合并多个 inspect 维度(elements/dom/screenshot/blockers 等),queries 数组最多 8 项,每项为单步 inspect 入参(如 {"info":"elements"} / {"info":"dom","params":{"selector":"form"}} / {"info":"screenshot"} / {"info":"blockers"});返回 {results:[{info,code,message,data},...], summary_hint, ok_count, err_count}。**进入新页面先用 1 次 explore 收集完整状态**(对比单步 inspect 节省 3-5 次 LLM round-trip);新页面也可直接传 url(省略 page_id,explore 自动打开后再观察,响应附 auto_opened);blockers 命中会附带 next_action hint 指引走 request_human。
 - batch(page_id*, steps*, stop_on_error?)(第 118 轮):批量混合执行,与 sequence 同语义但推荐用于「inspect + control 混合的稳定流程」(登录/表单类:inspect 验证 → input × N → click → wait → inspect 验证)。一次调用最多 24 步,允许任意 control + inspect 顺序;step 可省略 page_id(第 157 轮自动继承)。**对比 sequence 推荐用于批量执行场景**。
 
 【select_dropdown 操作范式(第 158 轮)】自定义下拉/级联选择器(Ant Design / Element UI / 自研组件库)不能用 select_option(后者只支持原生 `<select>`),改用 select_dropdown。参数:option_text(必填,选项文本如"北京")、trigger_text(可选,触发器文本如"区域",点击展开面板)、cascader_text(可选,级联第二级如"全北京")、wait_ms(可选,等待面板出现,默认 800ms)、selector(可选,面板容器选择器限定查找范围)。典型用法:闲鱼城市选择 → control(select_dropdown, params={"trigger_text":"区域","option_text":"北京","cascader_text":"全北京"})。响应回读 value_after 确认选中值。自愈与诊断(第 164 轮):**选项优先**——先探测选项,面板已被前序动作点开时直接选,不再点触发器(避免把已开面板 toggle 关回去);选项未命中才点触发器展开,随后选项搜索自动重试 3 次(含补等待);选中后自动探测面板内「确定/完成」类确认按钮并点击(响应 confirm_clicked),并回读触发器文本(trigger_after——found=false 表示触发器已回显选中值);**切勿对同一选项重复盲点**(toggle 控件会取消选中),筛选未生效时先看 trigger_after/value_after 事实再换策略(如切换排序或级联第二级);仍失败时错误携带诊断(文本命中数/可见数)——「命中但隐藏」多为面板收合的 visibility:hidden 挂载副本,先点击触发器展开再重试;可见性判定走计算样式,「文本+图标」非叶子触发器(如 <span>区域<img></span>)也能命中。select_option 在 selector 指向非原生 select 时也会自动回退到文本匹配路径(需传 text 参数),但推荐用 select_dropdown 语义更清晰。
@@ -2676,6 +2676,10 @@ impl Tool for McpWebUseTool {
                     "items": { "type": "object", "additionalProperties": true }
                 },
                 "summary_hint": { "type": "string", "description": "explore 可选:附加提示,会出现在响应 data.summary_hint 字段,便于 LLM 在终答中引用" },
+                // 2026-10-16:summary 是 summary_hint 的别名(explore 可选;模型自然写法
+                // 漂移,additionalProperties=false 曾硬拒白烧一轮迭代,与下方 request_human
+                // 顶层别名同策略)。
+                "summary": { "type": "string", "description": "explore 可选:等价 summary_hint(别名兼容)" },
                 // 2026-10-14 第三轮:control(request_human) 顶层便捷别名 —— 系统
                 // 提示词的自然写法诱导模型把这三个键放顶层,additionalProperties=false
                 // 曾三连拒(实测烧 3 轮迭代);放行后由 control 入口归一化提升进 params。
@@ -2717,7 +2721,24 @@ async fn dispatch_web_action(action: &str, args: Value) -> Result<String> {
         "list" => run_list(args).await,
         "close" => run_close(args).await,
         "control" => control::run(args).await,
-        "inspect" => inspect::run(args).await,
+        "inspect" => {
+            // 2026-10-16:参数形态兼容 —— 模型常把 explore 的 queries[] 批量观察形态
+            // 误传给 inspect(实测返回 1001「缺少 info」白烧一轮 LLM 迭代)。info 缺失
+            // 且 queries 为非空数组时机械转交 explore,语义完全等价(explore 即批量
+            // inspect)。分流放这里而非 inspect::run 入口,避免 explore→inspect
+            // async 递归(E0733 requires boxing)。
+            if str_arg(&args, "info").is_none()
+                && args
+                    .get("queries")
+                    .and_then(Value::as_array)
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            {
+                control::run_explore(args).await
+            } else {
+                inspect::run(args).await
+            }
+        }
         "sequence" => run_sequence(args).await,
         "explore" => control::run_explore(args).await,
         "batch" => control::run_batch(args).await,

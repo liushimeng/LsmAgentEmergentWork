@@ -1450,6 +1450,37 @@ async fn explore_unknown_page_returns_2000() {
 }
 
 #[tokio::test]
+async fn inspect_with_queries_array_delegates_to_explore() {
+    // 2026-10-16:模型常把 explore 的 queries[] 批量形态误传给 inspect ——
+    // 入口应机械转交 explore(不再 1001「缺少 info」白烧一轮 LLM 迭代)。
+    // 转交后 explore 的守卫生效:无 page_id 无 url → 1001(带自动开页提示)。
+    let res = McpWebUseTool
+        .execute(json!({
+            "action": "inspect",
+            "queries": [{"info": "elements"}, {"info": "blockers"}]
+        }))
+        .await
+        .unwrap();
+    assert!(
+        res.contains("\"code\":1001") && res.contains("url"),
+        "inspect+queries 应转交 explore 并给出 url 自动开页提示: {res}"
+    );
+    // 显式给了 page_id 的 queries 形态同样转交(explore 报 2000 而非 1001 缺 info)
+    let res2 = McpWebUseTool
+        .execute(json!({
+            "action": "inspect",
+            "page_id": "p_nonexist0",
+            "queries": [{"info": "elements"}]
+        }))
+        .await
+        .unwrap();
+    assert!(
+        res2.contains("\"code\":2000"),
+        "inspect+queries+显式 page_id 应转交 explore 报 2000: {res2}"
+    );
+}
+
+#[tokio::test]
 async fn batch_missing_steps_returns_error() {
     // batch 是 sequence 的语义别名;缺 steps 应确定性报错(1001)
     let res = McpWebUseTool
