@@ -1635,3 +1635,173 @@ async fn serve_wipe_redirect(socket: &mut TcpStream) -> std::io::Result<()> {
     }
     socket.shutdown().await
 }
+
+/// 隐身脚本**注入时序**真机冒烟（第 177 轮）。
+///
+/// 这是本轮价值最高的一条改动，此前只有源码顺序断言：把 `inject_stealth` 从
+/// `page.goto` 之后移到之前。静态断言只能证明「代码顺序对」，证明不了「首个文档
+/// 真的在 document-start 就是处置过的环境」—— 而这恰恰是全部价值所在。
+///
+/// 判据设计：页面 `<head>` 内联脚本在**解析期**（document-start 之后立即）把读数写进
+/// `window.__early`。若隐身脚本仍在 goto 之后注入，本读数会是未处置的真值
+/// （`webdriver=true`）；移到 goto 之前则应为处置过的读数。关键在于**取样点必须在页面
+/// 脚本里**，事后 eval 取不到时序信息。
+#[tokio::test]
+#[ignore]
+async fn stealth_document_start_timing_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    const HTML: &str = r#"<html><head><script>
+window.__early = {
+  webdriver: navigator.webdriver,
+  plugins: navigator.plugins ? navigator.plugins.length : -1,
+  mimeTypes: navigator.mimeTypes ? navigator.mimeTypes.length : -1,
+  languages: navigator.languages ? navigator.languages.length : -1
+};
+</script></head><body>timing</body></html>"#;
+    let url = spawn_html_server(HTML).await;
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url, "guard": "locked"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    if v["code"] == 3001 {
+        return; // 本机未安装浏览器
+    }
+    assert_eq!(v["code"], 0, "open 应成功: {out}");
+    let page_id = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    let eval_on = |pid: String, expr: String| async move {
+        let out = McpWebUseTool
+            .execute(json!({
+                "action": "control", "page_id": pid, "control_action": "eval_js",
+                "params": {"expression": expr}
+            }))
+            .await
+            .unwrap();
+        let v = data_of(&out);
+        assert_eq!(v["code"], 0, "eval_js 应成功: {out}");
+        v["data"]["result"].as_str().unwrap_or_default().to_string()
+    };
+
+    // —— 核心判据：解析期读到的必须是处置过的值 ——
+    let early_raw = eval_on(page_id.clone(), "JSON.stringify(window.__early || null)".into()).await;
+    let early: serde_json::Value =
+        serde_json::from_str(&early_raw).unwrap_or(serde_json::Value::Null);
+    assert!(
+        !early.is_null(),
+        "页面 head 内联脚本未留下 document-start 读数,冒烟判据失效: {early}"
+    );
+    assert_eq!(
+        early["webdriver"], serde_json::json!(false),
+        "document-start 读数里 navigator.webdriver 仍为 true —— 隐身脚本没赶在页面脚本之前生效: {early}"
+    );
+    assert!(
+        early["plugins"].as_i64().unwrap_or(0) >= 1,
+        "document-start 读数里 plugins 为空: {early}"
+    );
+    assert!(
+        early["mimeTypes"].as_i64().unwrap_or(0) >= 1,
+        "document-start 读数里 mimeTypes 为空: {early}"
+    );
+    assert!(
+        early["languages"].as_i64().unwrap_or(0) >= 1,
+        "document-start 读数里 languages 为空: {early}"
+    );
+
+    // —— 侵入式档升档后,新文档在 document-start 就该是原生化的 ——
+    let up = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id, "control_action": "set_stealth",
+            "params": {"mode": "hardened"}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(data_of(&up)["code"], 0, "升档应成功: {up}");
+    let nav = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id, "control_action": "navigate",
+            "params": {"url": url}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(data_of(&nav)["code"], 0, "重导航应成功: {nav}");
+    let after_raw = eval_on(page_id, "JSON.stringify(window.__early || null)".into()).await;
+    let after: serde_json::Value =
+        serde_json::from_str(&after_raw).unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        after["webdriver"], serde_json::json!(false),
+        "升档后新文档解析期读数异常: {after}"
+    );
+    assert!(
+        after["plugins"].as_i64().unwrap_or(0) >= 1,
+        "升档后新文档解析期读数异常: {after}"
+    );
+}
+
+/// **原生形态基线**（第 177 轮真机实测，Chrome 155 本机 headed）。
+///
+/// 这条不是测我们的代码，而是把「原生 Chrome 到底长什么样」钉成断言，作用是
+/// **防止又一次凭想象补字段**。本轮就栽过一次：据「原生 `Plugin` 必带 `mimeTypes`」
+/// 给回填替身补了该字段，而真机读数 `'mimeTypes' in navigator.plugins[0]` 为
+/// **false** —— WebIDL 的 `Plugin` 接口压根没有这个属性。同批实测还确认
+/// `refresh` **只属 `PluginArray`**、不属 `MimeTypeArray`。
+///
+/// 走 `stealth=off` 的裸环境取基线：注入关闭时读到的就是原生形态。
+#[tokio::test]
+#[ignore]
+async fn stealth_native_shape_baseline_smoke() {
+    let _smoke_guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let url = spawn_html_server("<html><head><title>baseline</title></head><body>baseline</body></html>")
+        .await;
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url, "stealth": "off", "guard": "locked"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    if v["code"] == 3001 {
+        return;
+    }
+    assert_eq!(v["code"], 0, "open 应成功: {out}");
+    let page_id = v["data"]["page_id"].as_str().unwrap().to_string();
+    let out2 = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id, "control_action": "eval_js",
+            "params": {"expression":
+                "JSON.stringify({\
+                  plugin_has_mimetypes: navigator.plugins.length ? ('mimeTypes' in navigator.plugins[0]) : null,\
+                  plugin_proto: Object.getOwnPropertyNames(Plugin.prototype),\
+                  mime_type_array_proto: Object.getOwnPropertyNames(MimeTypeArray.prototype),\
+                  plugin_array_proto: Object.getOwnPropertyNames(PluginArray.prototype),\
+                  mime_type_proto: Object.getOwnPropertyNames(MimeType.prototype)\
+                })"}
+        }))
+        .await
+        .unwrap();
+    let raw = data_of(&out2)["data"]["result"].as_str().unwrap_or_default().to_string();
+    let shape: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    assert!(!shape.is_null(), "取基线失败: {raw}");
+
+    // `Plugin` 没有 `mimeTypes` —— 本轮曾据相反的臆测补过该字段,真机否掉
+    assert_eq!(
+        shape["plugin_has_mimetypes"], serde_json::json!(false),
+        "WebIDL 的 Plugin 接口没有 mimeTypes 属性(实测基线变化,请重新核实): {shape}"
+    );
+    assert_eq!(
+        shape["plugin_proto"],
+        serde_json::json!(["name", "filename", "description", "length", "item", "namedItem", "constructor"]),
+        "Plugin.prototype 自有属性基线变化: {shape}"
+    );
+    // MimeTypeArray 没有 refresh,PluginArray 才有
+    assert_eq!(
+        shape["mime_type_array_proto"],
+        serde_json::json!(["length", "item", "namedItem", "constructor"]),
+        "MimeTypeArray.prototype 无 refresh(基线变化): {shape}"
+    );
+    assert_eq!(
+        shape["plugin_array_proto"],
+        serde_json::json!(["length", "item", "namedItem", "refresh", "constructor"]),
+        "PluginArray.prototype 有 refresh(基线变化): {shape}"
+    );
+}

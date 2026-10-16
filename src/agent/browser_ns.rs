@@ -265,9 +265,15 @@ const FIDELITY_JS: &str = r#"
                 method: (name, fn) => ({ value: reg(fn, name), writable: true, enumerable: true, configurable: true })
             };
             // 数组体:实例 own 只有索引 + 具名键;length 与方法全在中间原型上。
-            // 第 177 轮:本构造器上移到 forEach 之前 —— `Plugin.mimeTypes` 也要走它,
-            // 而 `Plugin` 的中间原型是 forEach 内才拿得到的。
-            const makeArrayLike = (items, RealProto, tag, nameOf) => {
+            //
+            // 第 177 轮真机实测修正:`refresh` **只属 PluginArray**。原生
+            // `MimeTypeArray.prototype` 的自有属性实测恒为
+            // `length / item / namedItem / constructor` —— **没有 refresh**
+            // (`PluginArray.prototype` 才有,实测同样四个 + refresh)。旧实现对两个
+            // 数组体一律挂 refresh,于是
+            // `Object.getOwnPropertyNames(Object.getPrototypeOf(navigator.mimeTypes))`
+            // 会多出一个原生没有的键 —— 形状错误的回填比不回填更危险。
+            const makeArrayLike = (items, RealProto, tag, nameOf, withRefresh) => {
                 const proto = Object.create(RealProto);
                 let selfRef = null;   // 本数组体实例的引用(namedItem 按具名键回指它)
                 Object.defineProperties(proto, {
@@ -277,9 +283,12 @@ const FIDELITY_JS: &str = r#"
                     }),
                     namedItem: descriptorFor.method('namedItem', function namedItem(n) {
                         return (typeof n === 'string' && selfRef && selfRef[n]) ? selfRef[n] : null;
-                    }),
-                    refresh: descriptorFor.method('refresh', function refresh() {})
+                    })
                 });
+                if (withRefresh) {
+                    Object.defineProperty(proto, 'refresh',
+                        descriptorFor.method('refresh', function refresh() {}));
+                }
                 Object.defineProperty(proto, Symbol.iterator, {
                     // 第 176 轮:原生 Iterator 的迭代器本身也是 iterable 的
                     // (`iterator[Symbol.iterator]()` 返回自身,ECMAScript 规范要求),
@@ -333,15 +342,6 @@ const FIDELITY_JS: &str = r#"
                     }
                     return mime;
                 });
-                // 第 177 轮:原生 `Plugin` 必带 `mimeTypes` 属性。旧回填漏了它 →
-                // `navigator.plugins[0].mimeTypes` 为 undefined,与同页
-                // `navigator.mimeTypes.length === 2` 直接矛盾(一行即可判定替身造假)。
-                // 补法:每个插件各持一份**独立的** MimeTypeArray 视图(原生亦如此 ——
-                // `plugins[0].mimeTypes !== plugins[1].mimeTypes`),元素仍是同一批
-                // 按 type 去重后的 MimeType 实例(与 `navigator.mimeTypes[i]` 同一对象,
-                // 原生的 `enabledPlugin` 回指语义才成立)。
-                const mimeView = makeArrayLike(own, MimeTypeArray.prototype,
-                    'MimeTypeArray', (m) => m.type);
                 Object.defineProperties(proto, {
                     length: descriptorFor.getter('length', function () { return own.length; }),
                     item: descriptorFor.method('item', function item(i) {
@@ -349,8 +349,7 @@ const FIDELITY_JS: &str = r#"
                     }),
                     namedItem: descriptorFor.method('namedItem', function namedItem(n) {
                         return (typeof n === 'string' && plugin[n]) ? plugin[n] : null;
-                    }),
-                    mimeTypes: descriptorFor.getter('mimeTypes', function () { return mimeView; })
+                    })
                 });
                 // 实例 own = mime 索引 + mime type 具名键(与原生 Plugin 实例同形)
                 own.forEach((mime, i) => {
@@ -370,9 +369,9 @@ const FIDELITY_JS: &str = r#"
                 } catch (e) {}
             };
             defNav('plugins', makeArrayLike(ctx.plugins, PluginArray.prototype,
-                'PluginArray', (p) => p.name));
+                'PluginArray', (p) => p.name, true));
             defNav('mimeTypes', makeArrayLike(mimeOrder, MimeTypeArray.prototype,
-                'MimeTypeArray', (m) => m.type));
+                'MimeTypeArray', (m) => m.type, false));
         }
     } catch (e) {}
 
@@ -1062,27 +1061,54 @@ mod tests {
         assert!(h.contains("if (typeof d.value === 'function')"));
     }
 
-    /// 原生 `Plugin` 必带 `mimeTypes`。漏了它就与同页 `navigator.mimeTypes` 长度
-    /// 直接矛盾(一行判定替身造假)—— 形状错误的回填比不回填更危险。
+    /// 第 177 轮真机实测（Chrome 155，本机 headed）：原生
+    /// `MimeTypeArray.prototype` 的自有属性恒为 `length/item/namedItem/constructor`
+    /// —— **没有 refresh**（`PluginArray.prototype` 才有）。回填替身必须照此分档，
+    /// 多挂一个原生没有的键就是「形状错误的回填」，比不回填更危险。
+    ///
+    /// 同一次实测否掉了一个看似成立的「缺口」：曾据「原生 `Plugin` 必带
+    /// `mimeTypes`」给替身补了该字段，真机读数 `'mimeTypes' in navigator.plugins[0]`
+    /// 为 **false** —— WebIDL 的 `Plugin` 接口压根没有这个属性。故不得再补。
     #[test]
-    fn 插件替身补齐mimeTypes子对象() {
+    fn 数组体refresh按原生分档() {
         use crate::agent::stealth::StealthMode;
         let f = stealth_js_for(StealthMode::Fidelity).unwrap();
+        // 构造器带 withRefresh 形参,按档传值
         assert!(
-            f.contains("mimeTypes: descriptorFor.getter('mimeTypes'"),
-            "Plugin 中间原型必须带 mimeTypes getter(原生必带)"
+            f.contains("const makeArrayLike = (items, RealProto, tag, nameOf, withRefresh) =>"),
+            "数组体构造器必须带 withRefresh 形参"
         );
-        // 每个插件各持一份独立视图(原生 plugins[0].mimeTypes !== plugins[1].mimeTypes),
-        // 元素仍是同一批按 type 去重后的 MimeType(enabledPlugin 回指才成立)
         assert!(
-            f.contains("const mimeView = makeArrayLike(own, MimeTypeArray.prototype"),
-            "子对象必须走同一套真原型链构造,不能造对象字面量"
+            f.contains("'PluginArray', (p) => p.name, true)"),
+            "PluginArray 有 refresh(真机实测)"
         );
-        // 构造器必须排在 forEach 之前(Plugin 的中间原型是 forEach 内才拿到的)
         assert!(
-            f.find("const makeArrayLike =").unwrap() < f.find("NAMES.forEach(").unwrap(),
-            "makeArrayLike 必须在 forEach 之前定义,否则 TDZ 报错"
+            f.contains("'MimeTypeArray', (m) => m.type, false)"),
+            "MimeTypeArray 没有 refresh(真机实测),挂了就是多一个原生没有的键"
         );
+        assert!(
+            f.contains("if (withRefresh) {"),
+            "refresh 必须条件挂载,不得无条件进数组"
+        );
+    }
+
+    /// 不得凭空给替身加原生接口没有的属性。`Plugin` 的 WebIDL 接口只有
+    /// name/filename/description + 索引取值,**没有 `mimeTypes`**;
+    /// 真机 `'mimeTypes' in navigator.plugins[0] === false`。
+    #[test]
+    fn 不给插件替身虚构原生没有的属性() {
+        use crate::agent::stealth::StealthMode;
+        for m in [StealthMode::Fidelity, StealthMode::Hardened] {
+            let s = stealth_js_for(m).unwrap();
+            assert!(
+                !s.contains("descriptorFor.getter('mimeTypes'"),
+                "Plugin 原生没有 mimeTypes 属性(真机实测),补了反而制造破绽"
+            );
+            assert!(
+                !s.contains("p.mimeTypes") || s.contains("__rehardenIterator"),
+                "不得凭空读 Plugin.mimeTypes"
+            );
+        }
     }
 
     /// 注入时序：隐身脚本必须在 `goto` **之前**注册,否则首个文档的页面脚本已在

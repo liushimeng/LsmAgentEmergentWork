@@ -153,22 +153,6 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
         return { visibility: document.visibilityState || '', has_focus: document.hasFocus() === true };
       } catch (e) { return null; }
     })(),
-    // ④ 回填替身的**子对象**形态:`Plugin.mimeTypes` 是原生必带字段,漏了它就与同页
-    //    `navigator.mimeTypes` 直接矛盾(第 177 轮已补,这里做自证)。
-    plugin_mimetypes_shape: (() => {
-      try {
-        if (!navigator.plugins || !navigator.plugins.length) return null;
-        const p = navigator.plugins[0];
-        const m = p ? p.mimeTypes : null;
-        if (!m) return { present: false, length: 0, tag: '', inst: null };
-        return {
-          present: true,
-          length: m.length,
-          tag: Object.prototype.toString.call(m),
-          inst: (typeof MimeTypeArray === 'function') ? (m instanceof MimeTypeArray) : null
-        };
-      } catch (e) { return null; }
-    })(),
     // ⑤ 我们注入的 ns 全局键数量(不可枚举但 getOwnPropertyNames 可见)。
     //    **只观测不告警**:要彻底消除只能让 window 变成 Proxy(不可能)。如实回报让
     //    人工/QC 知道有这一层痕迹,而不是假装没有。
@@ -395,28 +379,6 @@ pub fn classify(fp: &Value) -> Vec<Value> {
             }));
         }
     }
-    // 回填替身的子对象形态:`Plugin.mimeTypes` 缺失或形态错同样一眼可辨。
-    if let Some(m) = fp.get("plugin_mimetypes_shape").filter(|v| !v.is_null()) {
-        let present = m.get("present").and_then(Value::as_bool) == Some(true);
-        let len_ok = m.get("length").and_then(Value::as_u64) == Some(2);
-        let tag_ok = m.get("tag").and_then(Value::as_str) == Some("[object MimeTypeArray]");
-        let inst_ok = m.get("inst").and_then(Value::as_bool) != Some(false);
-        if !present || !len_ok || !tag_ok || !inst_ok {
-            out.push(json!({
-                "code": "plugin_mimetypes_shape_mismatch",
-                "advice": format!(
-                    "plugins[0].mimeTypes 与原生不符(present={} length={} tag={} instanceof={})—— \
-                     原生必带该字段且恒为 2 条 [object MimeTypeArray];\
-                     与同页 navigator.mimeTypes 的长度直接矛盾,一行即可判定替身造假;\
-                     处置:确认注入的是最新 browser_ns::FIDELITY_JS(第 177 轮已补该字段)",
-                    m.get("present").map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
-                    m.get("length").map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
-                    m.get("tag").and_then(Value::as_str).unwrap_or("?"),
-                    m.get("inst").map(|v| v.to_string()).unwrap_or_else(|| "?".into())
-                )
-            }));
-        }
-    }
     out
 }
 
@@ -430,7 +392,6 @@ const HARD_CODES: &[&str] = &[
     "screen_geometry_impossible",
     "screen_headless_default",
     "plugin_shape_mismatch",
-    "plugin_mimetypes_shape_mismatch",
     "focus_visibility_mismatch",
 ];
 
@@ -473,7 +434,6 @@ pub fn build(fp: &Value) -> Value {
         "automation_globals": fp.get("automation_globals").cloned().unwrap_or(Value::Null),
         "patched_fn_leak": fp.get("patched_fn_leak").cloned().unwrap_or(Value::Null),
         "focus_visibility": fp.get("focus_visibility").cloned().unwrap_or(Value::Null),
-        "plugin_mimetypes_shape": fp.get("plugin_mimetypes_shape").cloned().unwrap_or(Value::Null),
         "injected_ns_keys": fp.get("injected_ns_keys").cloned().unwrap_or(Value::Null),
         "suspicious": susp,
         "note": "risk_tier=high 表示环境在风控眼里已是硬判据级别,继续在本环境调参收益极低,\
@@ -828,35 +788,6 @@ mod tests {
             .contains(&"focus_visibility_mismatch".to_string()));
     }
 
-    /// `Plugin.mimeTypes` 缺失/形态错同样一眼可辨(与同页 `navigator.mimeTypes` 矛盾)。
-    #[test]
-    fn 插件子对象形态失配命中() {
-        for bad in [
-            json!({"present": false, "length": 0, "tag": "", "inst": null}),
-            json!({"present": true, "length": 0, "tag": "[object MimeTypeArray]", "inst": true}),
-            json!({"present": true, "length": 2, "tag": "[object Object]", "inst": true}),
-            json!({"present": true, "length": 2, "tag": "[object MimeTypeArray]", "inst": false}),
-        ] {
-            let v = fp(healthy_base(), json!({"plugin_mimetypes_shape": bad.clone()}));
-            assert!(
-                codes(&v).contains(&"plugin_mimetypes_shape_mismatch".to_string()),
-                "{bad} 应命中,实际 {:?}",
-                codes(&v)
-            );
-        }
-        // 补齐后的原生形态 → 不告警
-        let good = fp(
-            healthy_base(),
-            json!({"plugin_mimetypes_shape": {
-                "present": true, "length": 2,
-                "tag": "[object MimeTypeArray]", "inst": true}}),
-        );
-        assert!(!codes(&good).contains(&"plugin_mimetypes_shape_mismatch".to_string()));
-        // 插件本就为空 → 不判定
-        assert!(!codes(&fp(healthy_base(), json!({"plugin_mimetypes_shape": Value::Null})))
-            .contains(&"plugin_mimetypes_shape_mismatch".to_string()));
-    }
-
     /// `risk_tier` 把一长串 suspicious 收敛成**一个可执行信号**:high = 别在拉起
     /// 环境上继续调参了,直接换真实浏览器指纹。软项(如保真档的源码可见)只到 warn。
     #[test]
@@ -883,8 +814,6 @@ mod tests {
     fn 新自证项回报到build() {
         let raw = r#"{"automation_globals":[],"patched_fn_leak":["permissions_query"],
             "focus_visibility":{"visibility":"visible","has_focus":false},
-            "plugin_mimetypes_shape":{"present":true,"length":2,
-                "tag":"[object MimeTypeArray]","inst":true},
             "injected_ns_keys":3}"#;
         let b = build(&parse(raw).unwrap());
         assert_eq!(b["automation_globals"], json!([]));
