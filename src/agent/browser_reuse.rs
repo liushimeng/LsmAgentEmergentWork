@@ -88,6 +88,41 @@ pub async fn probe_debug_endpoint(port: u16) -> Option<DebugEndpointInfo> {
     None
 }
 
+/// 多端口探测候选列表(第 175 轮:增强 connect 模式探测)。
+///
+/// 背景:用户可能使用非标准端口启动 Chrome 调试实例,单端口探测容易遗漏。
+/// 本函数返回默认端口及其相邻端口的候选列表,按优先级排序。
+pub fn multi_port_candidates(base_port: u16) -> Vec<u16> {
+    let mut ports = vec![base_port];
+    // 尝试相邻端口(±1, ±2),覆盖用户自定义端口的常见情况
+    for offset in [1u16, 2, 255, 254] {
+        let p = base_port.wrapping_add(offset);
+        if p != base_port && p > 0 && !ports.contains(&p) {
+            ports.push(p);
+        }
+        let p = base_port.wrapping_sub(offset);
+        if p > 0 && !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    ports
+}
+
+/// 多端口探测本机 CDP 调试端点(第 175 轮:增强 connect 模式探测)。
+///
+/// 依次尝试多个端口的候选地址,命中即返回。
+/// 背景:BOSS 直聘等站点需要人工登录,connect 模式是复用登录态的关键路径,
+/// 多端口探测提高命中率,减少人工介入成本。
+pub async fn probe_debug_endpoint_multi(base_port: u16) -> Option<DebugEndpointInfo> {
+    for port in multi_port_candidates(base_port) {
+        if let Some(info) = probe_debug_endpoint(port).await {
+            tracing::info!(port, "多端口探测命中 CDP 调试端点");
+            return Some(info);
+        }
+    }
+    None
+}
+
 /// 单地址探测:`GET {base}/json/version` 并解析端点信息。
 async fn probe_url(port: u16, base: &str) -> Option<DebugEndpointInfo> {
     let url = format!("{base}/json/version");
@@ -686,6 +721,47 @@ mod tests {
     fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ===================== 多端口探测(第 175 轮) =====================
+
+    #[test]
+    fn 多端口候选列表_包含默认端口和相邻端口() {
+        let ports = multi_port_candidates(9222);
+        assert!(ports.contains(&9222), "必须包含默认端口");
+        assert!(ports.contains(&9223), "必须包含 +1 端口");
+        assert!(ports.contains(&9224), "必须包含 +2 端口");
+        assert!(ports.contains(&9221), "必须包含 -1 端口");
+        assert!(ports.contains(&9220), "必须包含 -2 端口");
+        assert!(ports.contains(&9477), "必须包含 +255 端口");
+        assert!(ports.contains(&8967), "必须包含 -255 端口");
+        assert!(ports.contains(&9476), "必须包含 +254 端口");
+        assert!(ports.contains(&8968), "必须包含 -254 端口");
+        // 默认端口排首位
+        assert_eq!(ports[0], 9222);
+    }
+
+    #[test]
+    fn 多端口候选列表_小端口号不溢出() {
+        let ports = multi_port_candidates(1);
+        // 端口 1 的相邻端口不应出现 0 或溢出
+        assert!(!ports.contains(&0), "不应包含端口 0");
+        assert!(ports.contains(&1), "必须包含默认端口");
+    }
+
+    #[test]
+    fn 多端口候选列表_大端口号不溢出() {
+        let ports = multi_port_candidates(65535);
+        // 端口 65535 的相邻端口不应溢出
+        assert!(!ports.contains(&0), "不应包含端口 0");
+        assert!(ports.contains(&65535), "必须包含默认端口");
+    }
+
+    #[test]
+    fn 多端口候选列表_去重() {
+        let ports = multi_port_candidates(9222);
+        let unique: std::collections::HashSet<_> = ports.iter().collect();
+        assert_eq!(ports.len(), unique.len(), "端口列表不应有重复");
     }
 
     #[test]

@@ -115,6 +115,77 @@ pub fn attach(data: &mut Value, final_url: &str, dom_probe: Option<&str>) {
     }
 }
 
+/// 登录状态检测结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoginState {
+    /// 已登录(检测到会话标记)。
+    LoggedIn,
+    /// 未登录(检测到登录墙)。
+    NotLoggedIn,
+    /// 未知(无法判定)。
+    Unknown,
+}
+
+/// 检测页面登录状态(第 175 轮)。
+///
+/// 背景:BOSS 直聘等站点需要人工登录,未登录状态下职位列表 DOM 不渲染。
+/// 本函数提供结构化的登录状态检测,供 Agent 判断是否需要人工介入。
+///
+/// 判据:
+/// - URL 路:路径 / 查询串出现登录语义 token → 未登录
+/// - DOM 路:存在会话标记(avatar/user-info 等)→ 已登录
+/// - DOM 路:存在密码框或登录按钮且无会话标记 → 未登录
+///
+/// 返回:
+/// - `LoggedIn`:检测到会话标记
+/// - `NotLoggedIn`:检测到登录墙(URL 或 DOM)
+/// - `Unknown`:无法判定(无明确证据)
+pub fn detect_login_state(final_url: &str, dom_probe: Option<&str>) -> LoginState {
+    // URL 路命中登录页 → 未登录
+    if match_url_token(final_url).is_some() {
+        return LoginState::NotLoggedIn;
+    }
+    // DOM 路检测
+    if let Some(dom) = dom_probe {
+        let lower = dom.to_ascii_lowercase();
+        // 会话标记 → 已登录
+        if SESSION_MARKERS.iter().any(|m| lower.contains(m)) {
+            return LoginState::LoggedIn;
+        }
+        // 密码框或登录按钮 → 未登录
+        let has_password = lower.contains("type=\"password\"")
+            || lower.contains("type='password'")
+            || lower.contains("type=password");
+        if has_password {
+            return LoginState::NotLoggedIn;
+        }
+        if LOGIN_TEXTS
+            .iter()
+            .any(|t| lower.contains(&t.to_ascii_lowercase()))
+        {
+            return LoginState::NotLoggedIn;
+        }
+    }
+    LoginState::Unknown
+}
+
+/// 生成登录状态检测报告(供 Agent 判断是否需要人工介入)。
+pub fn login_state_report(final_url: &str, dom_probe: Option<&str>) -> Option<Value> {
+    let state = detect_login_state(final_url, dom_probe);
+    match state {
+        LoginState::LoggedIn => Some(json!({
+            "login_state": "logged_in",
+            "message": "页面已登录,无需人工介入",
+        })),
+        LoginState::NotLoggedIn => Some(json!({
+            "login_state": "not_logged_in",
+            "message": "页面未登录,需要人工登录",
+            "next_action": "control(request_human, reason=\"login\") 或 open(reuse_existing=true)",
+        })),
+        LoginState::Unknown => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +238,82 @@ mod tests {
         assert!(d.get("login_wall").is_none());
         attach(&mut d, "https://x.test/login", None);
         assert!(d.get("login_wall").is_some());
+    }
+
+    // ===================== 登录状态检测(第 175 轮) =====================
+
+    #[test]
+    fn 登录状态检测_url路登录页判定未登录() {
+        assert_eq!(
+            detect_login_state("https://www.zhipin.com/web/user/", None),
+            LoginState::NotLoggedIn
+        );
+        assert_eq!(
+            detect_login_state("https://example.com/login", None),
+            LoginState::NotLoggedIn
+        );
+    }
+
+    #[test]
+    fn 登录状态检测_dom路会话标记判定已登录() {
+        assert_eq!(
+            detect_login_state(
+                "https://www.zhipin.com/web/geek/jobs",
+                Some("<div class='user-avatar'>张三</div>")
+            ),
+            LoginState::LoggedIn
+        );
+        assert_eq!(
+            detect_login_state(
+                "https://www.zhipin.com/web/geek/jobs",
+                Some("<a href='/logout'>退出登录</a>")
+            ),
+            LoginState::LoggedIn
+        );
+    }
+
+    #[test]
+    fn 登录状态检测_dom路密码框判定未登录() {
+        assert_eq!(
+            detect_login_state(
+                "https://www.zhipin.com/web/geek/jobs",
+                Some("<input type='password'>")
+            ),
+            LoginState::NotLoggedIn
+        );
+    }
+
+    #[test]
+    fn 登录状态检测_无证据判定未知() {
+        assert_eq!(
+            detect_login_state("https://www.zhipin.com/web/geek/jobs", Some("<div>职位列表</div>")),
+            LoginState::Unknown
+        );
+        assert_eq!(
+            detect_login_state("https://www.zhipin.com/web/geek/jobs", None),
+            LoginState::Unknown
+        );
+    }
+
+    #[test]
+    fn 登录状态报告_已登录() {
+        let report = login_state_report(
+            "https://www.zhipin.com/web/geek/jobs",
+            Some("<div class='user-avatar'>张三</div>"),
+        )
+        .unwrap();
+        assert_eq!(report["login_state"], json!("logged_in"));
+    }
+
+    #[test]
+    fn 登录状态报告_未登录() {
+        let report = login_state_report("https://www.zhipin.com/web/user/", None).unwrap();
+        assert_eq!(report["login_state"], json!("not_logged_in"));
+        assert!(report["next_action"].as_str().unwrap().contains("request_human"));
+    }
+
+    #[test]
+    fn 登录状态报告_未知时不产出() {
+        assert!(login_state_report("https://www.zhipin.com/web/geek/jobs", None).is_none());
     }
 }
