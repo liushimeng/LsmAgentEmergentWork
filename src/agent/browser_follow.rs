@@ -35,6 +35,8 @@ pub const AT_BOTTOM_TOLERANCE_PX: f64 = 96.0;
 /// 元素,退化到 `document.scrollingElement`。
 pub const AUTO_FOLLOW_JS: &str = r#"(() => {
   try {
+    // 第 179 轮:窗口面 API 挂符号命名空间对象(零 window 字符串键)。
+    const NS = window[Symbol.for('%NS%')] || (window[Symbol.for('%NS%')] = {});
     if (window.%NS%AutoFollow) { return true; }
     const TOL = 96;
     const state = { on: false, timer: null, lastH: -1, lastAtBottom: true };
@@ -146,12 +148,12 @@ pub fn should_follow(enabled: bool, at_bottom: bool) -> bool {
 /// 给导航后的新文档执行跟随设置(配合 `addScriptToEvaluateOnNewDocument`)。
 pub async fn install(page: &chromiumoxide::Page, enabled: bool) {
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
-    // 第 168 轮:%NS% 占位符 → 进程级随机命名空间（隐身，见 browser_ns.rs）。
-    let ns = crate::agent::browser_ns::inject_ns();
+    // 第 179 轮:窗口面 API 走符号命名空间(零 window 字符串键)。
+    let follow = crate::agent::browser_ns::ns_member_expr("AutoFollow");
     let js = crate::agent::browser_ns::render_ns(AUTO_FOLLOW_JS);
     let _ = page
         .execute(AddScriptToEvaluateOnNewDocumentParams {
-            source: format!("{js}\nwindow.{ns}AutoFollow && window.{ns}AutoFollow({enabled}, {FOLLOW_INTERVAL_MS});"),
+            source: format!("{js}\n{follow} && {follow}({enabled}, {FOLLOW_INTERVAL_MS});"),
             world_name: None,
             include_command_line_api: None,
             run_immediately: Some(true),
@@ -161,10 +163,10 @@ pub async fn install(page: &chromiumoxide::Page, enabled: bool) {
 
 /// 在当前文档上开关跟随(导航后新文档按 [`install`] 的期望态自动重挂)。
 pub async fn set(page: &chromiumoxide::Page, enabled: bool) -> bool {
-    let ns = crate::agent::browser_ns::ns_global("AutoFollow");
+    let ns = crate::agent::browser_ns::ns_member_expr("AutoFollow");
     match page
         .evaluate(format!(
-            "window.{ns} ? window.{ns}({enabled}, {FOLLOW_INTERVAL_MS}) : null"
+            "{ns} ? {ns}({enabled}, {FOLLOW_INTERVAL_MS}) : null"
         ))
         .await
     {
@@ -296,7 +298,12 @@ mod tests {
         assert!(AUTO_FOLLOW_JS.contains("%NS%AutoFollow"));
         assert!(AUTO_FOLLOW_JS.contains("%NS%AutoFollowStatus"));
         let rendered = crate::agent::browser_ns::render_ns(AUTO_FOLLOW_JS);
-        assert!(rendered.contains(&format!("{}AutoFollow", inject_ns())));
+        // 第 179 轮:窗口面 API 收敛到 symbol 命名空间对象
+        assert!(rendered.contains("NS.AutoFollow"));
+        assert!(
+            !rendered.contains(&format!("window.{}AutoFollow", inject_ns())),
+            "不得残留 window.<ns>AutoFollow 字符串键"
+        );
         assert!(!rendered.contains("laew"), "渲染后不得残留固定签名");
         assert!(AUTO_FOLLOW_JS.contains("const TOL = 96"));
         assert!(AUTO_FOLLOW_JS.contains("atBottom(el)"));

@@ -516,8 +516,9 @@ fn probe_js() -> String {
         super::inspect::VISIBLE_TEXT_FN_JS,
         r#"(() => {
   try {
+    const NS = window[Symbol.for('%NS%')] || {};
     if (!document.body) return {text: '', overlay: null, vendors: []};
-    const text = %NS%BodyVisibleText();
+    const text = NS.BodyVisibleText();
     const vw = window.innerWidth, vh = window.innerHeight;
     // 第 172 轮:已知第三方验证容器指纹全文档扫描。挑战本体常在跨域 iframe 内,
     // 外层 innerText 读不到滑块文案,overlay 结构信号(iframe 尺寸/按钮/画布)也

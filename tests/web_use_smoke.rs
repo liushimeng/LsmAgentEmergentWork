@@ -894,19 +894,29 @@ async fn stealth_selfcheck_smoke() {
     assert_eq!(leaked, "0", "window 不应有可枚举 laew 键");
 
     // ④ 管控视觉层在影子树里真实存在(隐身不牺牲管控功能)
+    // 第 179 轮:窗口面 API 走 symbol 命名空间对象(不再是 window.<ns>Foo 字符串键)。
     let probe = eval(
-        "JSON.stringify((window.%NS%GuardUiProbe && window.%NS%GuardUiProbe()) || null)".replace("%NS%", lsm_agent::agent::browser_ns::inject_ns()),
+        "JSON.stringify(((window[Symbol.for('%NS%')]||{}).GuardUiProbe && window[Symbol.for('%NS%')].GuardUiProbe()) || null)"
+            .replace("%NS%", lsm_agent::agent::browser_ns::inject_ns()),
     )
     .await;
     let p: Value = serde_json::from_str(&probe).unwrap_or(Value::Null);
     assert_eq!(p["mask"], json!(true), "蒙层应在场:{probe}");
     assert_eq!(p["shields"], json!(true), "盾区容器应在场:{probe}");
+    // ④b 第 179 轮:高亮蓝框的 DOM id 用独立 DOM token(不再是窗口命名空间前缀),
+    // 且脚本本身仍正常工作。
+    let frame_id = format!(
+        "{}agent_frame__",
+        lsm_agent::agent::browser_ns::dom_ns()
+    );
+    let has_frame = eval(format!("String(!!document.getElementById('{frame_id}'))")).await;
+    assert_eq!(has_frame, "true", "高亮蓝框应仍在场(独立 DOM token:{frame_id})");
 
     // ⑤ 第 171 轮:屏蔽页面状态栏(右上角)+ 屏蔽页面进度栏(左下角)在影子树里在场。
     //    左下角静态状态条已迁入状态栏,guard 探针不再有 `hint` 字段。
     assert!(p.get("hint").is_none(), "静态状态条已迁至状态栏(第 171 轮):{probe}");
     let sprobe = eval(
-        "JSON.stringify((window.%NS%StatusProbe && window.%NS%StatusProbe()) || null)"
+        "JSON.stringify(((window[Symbol.for('%NS%')]||{}).StatusProbe && window[Symbol.for('%NS%')].StatusProbe()) || null)"
             .replace("%NS%", lsm_agent::agent::browser_ns::inject_ns()),
     )
     .await;
@@ -1073,6 +1083,50 @@ async fn stealth_selfcheck_smoke() {
     assert!(
         !codes.contains(&"headless_ua".to_string()),
         "UA 不应带无头令牌:{codes:?}"
+    );
+    // ⑪b 第 179 轮:注入面收敛 —— window 字符串键 0 个、符号键 1 个。
+    // 旧实现有头档每页留 30 个同前缀字符串键,`getOwnPropertyNames(window)`
+    // 一行即可枚举;收敛后只剩一个 symbol 命名空间对象。
+    let surface = eval(
+        r#"JSON.stringify({
+            ns_keys: Object.getOwnPropertyNames(window).filter((n) => /^__lzn[0-9a-f]{8}/.test(n)),
+            symbols: Object.getOwnPropertySymbols(window).length,
+            ns_present: Object.getOwnPropertySymbols(window).some((s) => {
+                try { const v = window[s]; return !!(v && typeof v.StealthRev === 'number'); }
+                catch (e) { return false; }
+            }),
+            dom_ns_ids: Array.from(document.querySelectorAll('[id]'))
+                .filter((e) => /^__lzn[0-9a-f]{8}/.test(e.id)).length
+        })"#
+        .into(),
+    )
+    .await;
+    let sf: Value = serde_json::from_str(&surface).unwrap_or(Value::Null);
+    assert_eq!(
+        sf["ns_keys"],
+        json!([]),
+        "注入层不得残留 window 字符串键(30→0):{surface}"
+    );
+    assert_eq!(
+        sf["symbols"],
+        json!(1),
+        "注入层须收敛为单一 symbol 键(0→1):{surface}"
+    );
+    assert_eq!(sf["ns_present"], json!(true), "命名空间对象须在场:{surface}");
+    assert_eq!(
+        sf["dom_ns_ids"],
+        json!(0),
+        "DOM id 不得复用窗口命名空间前缀(已换独立 token):{surface}"
+    );
+    assert_eq!(
+        v["data"]["fingerprint"]["injected_ns_keys"],
+        json!(0),
+        "open 响应自证项应回报 0 个字符串键:{out}"
+    );
+    assert_eq!(
+        v["data"]["fingerprint"]["injected_ns_symbols"],
+        json!(1),
+        "open 响应自证项应回报 1 个符号键:{out}"
     );
 
     // ⑩ 缺省档(hardened)的分界线:被改写函数的身份必须原生化 —— BOSS 直聘实测

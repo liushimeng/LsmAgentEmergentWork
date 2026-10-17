@@ -72,11 +72,18 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
       try {
         const sw = screen.width, sh = screen.height;
         const ow = window.outerWidth || 0, oh = window.outerHeight || 0;
+        const iw = window.innerWidth || 0, ih = window.innerHeight || 0;
         return {
           screen: sw + 'x' + sh,
           window_outer: ow + 'x' + oh,
+          window_inner: iw + 'x' + ih,
           outer_gt_screen: ow > sw * 1.05 || oh > sh * 1.05,
-          screen_is_headless_default: sw === 800 && sh === 600
+          screen_is_headless_default: sw === 800 && sh === 600,
+          // 第 179 轮:无头档窗口几何 signature —— 真实有头窗口有标题栏/工具栏,
+          // outer 恒 > inner;outer === inner 是无头环境的典型读数(全屏窗口同样命中,
+          // 故只作软提示,不当硬判据)。
+          outer_equals_inner: ow > 0 && oh > 0 && iw > 0 && ih > 0
+              && ow === iw && oh === ih
         };
       } catch (e) { return null; }
     })(),
@@ -116,6 +123,19 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
     })(),
     injected_ns_symbols: (() => {
       try { return Object.getOwnPropertySymbols(window).length; } catch (e) { return null; }
+    })(),
+    // 第 179 轮:注入面收敛的**正向**判据 —— window 上存在一个 symbol 键,其值
+    // 带 `StealthRev` 数字位掩码,即命名空间对象在场。字符串键应恒为 0
+    // (`injected_ns_keys`),符号键应为 1。
+    ns_symbol_present: (() => {
+      try {
+        return Object.getOwnPropertySymbols(window).some((s) => {
+          try {
+            const v = window[s];
+            return !!(v && typeof v === 'object' && typeof v.StealthRev === 'number');
+          } catch (e) { return false; }
+        });
+      } catch (e) { return null; }
     })(),
     // 第 176 轮:迭代器自反性自证。原生 Iterator 的迭代器本身 iterable
     // (iterator[Symbol.iterator] 是函数);若为 undefined 说明我们返回的裸对象
@@ -157,6 +177,12 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
           if (d && d.get) add('nav_plugins_getter', d.get);
           const w = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
           if (w && w.get) add('nav_webdriver_getter', w.get);
+          // 第 179 轮:补齐另外三个会被保真块改写的入口(漏检面收全)
+          const lg = Object.getOwnPropertyDescriptor(Navigator.prototype, 'languages');
+          if (lg && lg.get) add('nav_languages_getter', lg.get);
+          const pv = Object.getOwnPropertyDescriptor(Navigator.prototype, 'pdfViewerEnabled');
+          if (pv && pv.get) add('nav_pdf_viewer_getter', pv.get);
+          add('function_toString', Function.prototype.toString);
         } catch (e) {}
         try {
           const it = navigator.plugins && navigator.plugins[Symbol.iterator] && navigator.plugins[Symbol.iterator]();
@@ -402,6 +428,37 @@ pub fn classify(fp: &Value) -> Vec<Value> {
     // 第 178 轮:**焦点/可见性自洽退出告警面**。第 177 轮把它当硬判据,真机四档
     // 实测推翻(详见 PROBE_JS 内该字段注释):有头档因我们的焦点租约恒无焦点、
     // 无头档反有焦点,且真实用户窗口被遮挡时同样是 visible+无焦点。字段只回报不判定。
+    //
+    // ===================== 第 179 轮:注入面收敛自证 =====================
+    // 注入层窗口面 API 已全部收敛到一个 symbol 命名空间对象。`injected_ns_keys`
+    // 非零 = 有代码倒退回了 `window.<ns>Foo` 字符串键形态(真机基线:收敛前有头档
+    // 30 / 无头档 1 / 裸环境 0;收敛后应**恒为 0**)。这是**我们自己制造的**签名,
+    // 命中即应修注入,而不是去调风控策略。
+    if let Some(keys) = fp.get("injected_ns_keys").and_then(Value::as_u64) {
+        if keys > 0 {
+            out.push(json!({
+                "code": "injected_ns_string_keys",
+                "advice": format!(
+                    "window 上残留 {keys} 个注入层字符串键(`__lzn…` 前缀)—— 注入面收敛被破坏,\
+                     风控一行 `getOwnPropertyNames(window)` 即可枚举;\
+                     处置:确认注入脚本走 browser_ns::render_ns(窗口面 API 必须改写成 `NS.<Suffix>`),\
+                     新增窗口 API 时同步登记 NS_WINDOW_SUFFIXES"
+                )
+            }));
+        }
+    }
+    // 无头档窗口几何 signature。真实有头窗口有标题栏/工具栏,outer 恒 > inner;
+    // outer === inner 是无头环境的典型读数。全屏的真实窗口也会命中,故只作软提示。
+    if let Some(g) = fp.get("geometry").filter(|v| !v.is_null()) {
+        if g.get("outer_equals_inner").and_then(Value::as_bool) == Some(true) {
+            out.push(json!({
+                "code": "outer_equals_inner",
+                "advice": "window.outer 与 inner 完全相等(真实有头窗口因标题栏/工具栏恒 outer>inner),\
+                           属无头档窗口几何特征;关键站点优先 headed 可见模式或 open(reuse_existing=true)。\
+                           注:真实全屏窗口同样会命中,故只作提示"
+            }));
+        }
+    }
     out
 }
 
@@ -462,13 +519,14 @@ pub fn build(fp: &Value) -> Value {
         "focus_visibility": fp.get("focus_visibility").cloned().unwrap_or(Value::Null),
         "injected_ns_keys": fp.get("injected_ns_keys").cloned().unwrap_or(Value::Null),
         "injected_ns_symbols": fp.get("injected_ns_symbols").cloned().unwrap_or(Value::Null),
+        "ns_symbol_present": fp.get("ns_symbol_present").cloned().unwrap_or(Value::Null),
         "suspicious": susp,
         "note": "risk_tier=high 表示环境在风控眼里已是硬判据级别,继续在本环境调参收益极低,\
                  应直接 open(reuse_existing=true) 接管用户已登录的真实浏览器;\
                  warn=有可升档/可复核项;suspicious 非空不代表一定被拦,但站点风控采这些字段加权很高。\
-                 injected_ns_keys 是我们注入层的 window 字符串键数(真机实测:有头档 30 / 无头档 1 / 裸环境 0;\
-                 getOwnPropertyNames 可见,Object.keys 与 for…in 不可见),只观测不告警;\
-                 injected_ns_symbols 是 window 自有符号键数(原生基线 0),收敛方向见 docs/MCP_Web_Use/32 §六。\
+                 第 179 轮起注入层窗口面 API 收敛到一个 symbol 命名空间对象:\
+                 injected_ns_keys 应为 0(非零=渲染链路倒退,命中会给出 injected_ns_string_keys),\
+                 injected_ns_symbols 应为 1、ns_symbol_present 应为 true(裸环境/stealth=off 时为 0/false)。\
                  focus_visibility 自第 178 轮起只回报不判定(真机复核:真实用户窗口被遮挡时同样是 visible+无焦点)"
     })
 }
@@ -888,24 +946,70 @@ mod tests {
     fn 新自证项回报到build() {
         let raw = r#"{"automation_globals":[],"patched_fn_leak":["permissions_query"],
             "focus_visibility":{"visibility":"visible","has_focus":false},
-            "injected_ns_keys":30,"injected_ns_symbols":0,"pdf_viewer_enabled":true}"#;
+            "injected_ns_keys":0,"injected_ns_symbols":1,"ns_symbol_present":true,
+            "pdf_viewer_enabled":true}"#;
         let b = build(&parse(raw).unwrap());
         assert_eq!(b["automation_globals"], json!([]));
         assert_eq!(b["patched_fn_leak"], json!(["permissions_query"]));
-        assert_eq!(b["injected_ns_keys"], json!(30));
-        assert_eq!(b["injected_ns_symbols"], json!(0));
+        assert_eq!(b["injected_ns_keys"], json!(0));
+        assert_eq!(b["injected_ns_symbols"], json!(1));
+        assert_eq!(b["ns_symbol_present"], json!(true));
         assert_eq!(b["pdf_viewer_enabled"], json!(true));
         assert_eq!(b["focus_visibility"]["has_focus"], json!(false));
         // 只余软项(改写函数源码可见)⇒ warn;不得因 focus_visibility 抬成 high
         assert_eq!(b["risk_tier"], "warn", "{b}");
-        // 注入层键面计量只观测不告警
+        // 收敛后的干净基线:0 个字符串键 / 1 个符号键时**不得**新增告警
         assert!(!b["suspicious"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|x| x["code"] == "injected_ns_keys"));
+            .any(|x| x["code"] == "injected_ns_string_keys"));
         assert!(b["note"].as_str().unwrap().contains("injected_ns_symbols"));
         assert!(b["note"].as_str().unwrap().contains("focus_visibility"));
+    }
+
+    /// 第 179 轮:注入面收敛的回归判据 —— 字符串键非零即说明渲染链路倒退,
+    /// 必须给出可行动建议(而不是"只观测")。
+    #[test]
+    fn 注入层字符串键泄漏命中() {
+        let v = fp(healthy_base(), json!({"injected_ns_keys": 30, "injected_ns_symbols": 0}));
+        let c = classify(&v);
+        let item = c
+            .iter()
+            .find(|x| x["code"] == "injected_ns_string_keys")
+            .expect("字符串键非零必须告警");
+        let advice = item["advice"].as_str().unwrap();
+        assert!(advice.contains("getOwnPropertyNames"), "须说明可枚举性:{advice}");
+        assert!(advice.contains("render_ns"), "须指向根因与修法:{advice}");
+        // 0 个字符串键(收敛后基线)不得告警
+        assert!(!codes(&fp(healthy_base(), json!({"injected_ns_keys": 0})))
+            .contains(&"injected_ns_string_keys".to_string()));
+        // 缺测 fail-open
+        assert!(!codes(&fp(healthy_base(), json!({})))
+            .contains(&"injected_ns_string_keys".to_string()));
+    }
+
+    /// 第 179 轮:无头档窗口几何 signature —— outer === inner 只作软提示,
+    /// 不得升级成 high(真实全屏窗口同样命中)。
+    #[test]
+    fn 窗口内外尺寸相等只作软提示() {
+        let v = fp(
+            healthy_base(),
+            json!({"geometry": {"screen": "1920x1080", "window_outer": "1920x1080",
+                                 "window_inner": "1920x1080", "outer_gt_screen": false,
+                                 "screen_is_headless_default": false, "outer_equals_inner": true}}),
+        );
+        let c = classify(&v);
+        assert!(c.iter().any(|x| x["code"] == "outer_equals_inner"));
+        assert_eq!(risk_tier(&c), "warn", "只作软提示,不得升 high");
+        // 有头窗口(outer > inner)不告警
+        let v2 = fp(
+            healthy_base(),
+            json!({"geometry": {"screen": "1920x1080", "window_outer": "1920x1040",
+                                 "window_inner": "1920x940", "outer_gt_screen": false,
+                                 "screen_is_headless_default": false, "outer_equals_inner": false}}),
+        );
+        assert!(!codes(&v2).contains(&"outer_equals_inner".to_string()));
     }
 
     /// 第 178 轮:注入层 window 键面的计量正则必须撞得上**真实命名空间形态**

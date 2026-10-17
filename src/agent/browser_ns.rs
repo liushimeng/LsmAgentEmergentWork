@@ -12,6 +12,15 @@
 //!
 //! 模板约定：JS 模板内一律写占位符 `%NS%`（非法 JS 标识符，模板内天然零碰撞），
 //! 渲染时 `.replace(NS_TOKEN, ns)` —— 不用 `format!`，避免 JS 大括号转义地狱。
+//!
+//! **第 179 轮：注入面收敛**。此前每个注入 API 都是 `window.<ns>Foo` 形式的
+//! **字符串全局键** —— 真机实测有头档每页在 `window` 上留 30 个同前缀键，
+//! `Object.getOwnPropertyNames(window)` 一行即可枚举（这是比 `webdriver`、
+//! WebGL 兜底串更独有的一处签名）。现在所有窗口面 API 收敛到**一个**
+//! `window[Symbol.for('<ns>')]` 命名空间对象上：字符串键 30 → 0，符号键 0 → 1
+//! （`Object.keys` / `for…in` / `getOwnPropertyNames` 全部不可见）。
+//! DOM 面（element id / class / `data-*` 属性）换用**独立的第二个随机 token**
+//! —— 否则「枚举 DOM id 前缀」与「读符号描述」能把两处痕迹串成同一个签名。
 
 use std::sync::OnceLock;
 
@@ -24,13 +33,147 @@ pub const BLOCK_CORE: u32 = 1;
 pub const BLOCK_FIDELITY: u32 = 2;
 pub const BLOCK_HARDENED: u32 = 4;
 
-/// 渲染注入模板：把模板内 `%NS%` 占位符替换为本进程命名空间。
-pub fn render_ns(template: &str) -> String {
-    template.replace(NS_TOKEN, inject_ns())
+/// window 面上承载注入 API 的全局后缀白名单（第 179 轮）。
+///
+/// 渲染期把 `window.<ns><Suffix>` 改写成 `NS.<Suffix>` —— `NS` 是各模板闭包内
+/// 绑定的**命名空间对象**（由 `window[Symbol.for('<ns>')]` 承载）。页面侧
+/// `getOwnPropertyNames(window)` 因此看不到任何注入层字符串键。
+///
+/// 新增窗口面 API 时**必须**把后缀加进本表，否则它会退回 `window.<ns>Foo`
+/// 字符串键形态（单测 `渲染后不得残留窗口字符串键` 会拦住）。
+const NS_WINDOW_SUFFIXES: &[&str] = &[
+    // 高亮蓝框
+    "AgentApplyHighlight",
+    "AgentHighlightInstalled",
+    "AgentHighlight",
+    // 自动跟随
+    "AutoFollowStatus",
+    "AutoFollow",
+    // 页面管控
+    "GuardInputSuspended",
+    "GuardInputSuspend",
+    "GuardGateReady",
+    "GuardScrollWatch",
+    "GuardSuspended",
+    "GuardInstalled",
+    "GuardUiProbe",
+    "GuardAllow",
+    "GuardBlock",
+    "GuardNote",
+    "GuardMode",
+    "GuardRev",
+    "GuardRO",
+    "GuardMO",
+    "GuardSet",
+    "GuardSuspend",
+    "GuardOff",
+    "OverlaySet",
+    // 屏蔽页面状态栏 / 进度栏
+    "StatusUpdate",
+    "StatusGuard",
+    "StatusVisible",
+    "StatusSuspend",
+    "StatusEnsure",
+    "StatusProbe",
+    "StatusTimer",
+    "StatusMO",
+    "StatusRev",
+    // 隐身幂等闸 / 可见文本读取
+    "StealthRev",
+    "BodyVisibleText",
+];
+
+/// DOM 面上带命名空间前缀的 id / class / `data-*` 后缀（第 179 轮）。
+///
+/// 这些**留在 DOM 面**（元素 id 仍然要按 id 查找），但换用与 window 符号无关的
+/// 第二个随机 token —— 否则枚举 DOM id 前缀 + 读符号描述就能把两处痕迹串起来。
+const NS_DOM_SUFFIXES: &[&str] = &[
+    "agent_frame__",
+    "guard_shields__",
+    "guard_status__",
+    "guard_progress__",
+    "guard_style__",
+    "guard_ui__",
+    "status_host__",
+    "progress_host__",
+    "overlay__",
+    "locked__",
+    "sb_title__",
+    "sb_mode__",
+    "sb_notice__",
+    "sb_note__",
+    "pb_action__",
+    "pb_progress__",
+    "pb_fill__",
+    "pb_task__",
+    "pb_events__",
+    // 短后缀放最后（必须先替换掉上面的长后缀，否则 `agent` 会把
+    // `agent_frame__` 截成 `<dom>agent_frame__` 的两段拼接）
+    "agent",
+    "sh",
+];
+
+/// 按长度降序取窗口面后缀（长后缀优先，避免 `GuardSuspend` 抢 `GuardSuspended`、
+/// `AutoFollow` 抢 `AutoFollowStatus`、`agent` 抢 `agent_frame__`）。
+fn sorted_suffixes(list: &'static [&'static str]) -> Vec<&'static str> {
+    let mut v = list.to_vec();
+    v.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    v
 }
+
+fn window_suffixes() -> &'static [&'static str] {
+    static V: OnceLock<Vec<&'static str>> = OnceLock::new();
+    V.get_or_init(|| sorted_suffixes(NS_WINDOW_SUFFIXES))
+}
+
+fn dom_suffixes() -> &'static [&'static str] {
+    static V: OnceLock<Vec<&'static str>> = OnceLock::new();
+    V.get_or_init(|| sorted_suffixes(NS_DOM_SUFFIXES))
+}
+
+/// 渲染注入模板（第 179 轮三步）：
+///
+/// 1. `%NS%` → 窗口面命名空间（symbol 描述）；
+/// 2. `window.<ns><Suffix>` → `NS.<Suffix>`（窗口面 API 收敛到命名空间对象，
+///    模板需在闭包顶部绑定 `const NS = window[Symbol.for('%NS%')] || (… = {})`）；
+/// 3. `<ns><DomSuffix>` → `<dom_ns><DomSuffix>`（DOM 面换用第二个随机 token）。
+///
+/// 不用 `format!`（JS 大括号太多），全部走字符串替换。
+pub fn render_ns(template: &str) -> String {
+    render_with(template, inject_ns(), dom_ns())
+}
+
+fn render_with(template: &str, ns: &str, dom: &str) -> String {
+    let mut out = template.replace(NS_TOKEN, ns);
+    for suffix in window_suffixes() {
+        let needle = format!("window.{ns}{suffix}");
+        if out.contains(&needle) {
+            out = out.replace(&needle, &format!("NS.{suffix}"));
+        }
+    }
+    for suffix in dom_suffixes() {
+        let needle = format!("{ns}{suffix}");
+        if out.contains(&needle) {
+            out = out.replace(&needle, &format!("{dom}{suffix}"));
+        }
+    }
+    out
+}
+
+/// 模板闭包顶部的命名空间绑定片段（各模板内联同一行，零全局键）。
+///
+/// `const NS` 是**闭包局部**，不落 `window`；命名空间对象本身由 symbol 键承载。
+pub const NS_BINDING_JS: &str =
+    "const NS = window[Symbol.for('%NS%')] || (window[Symbol.for('%NS%')] = {});";
 
 /// 进程级注入命名空间，惰性生成一次：`__lzn` + 8 位十六进制（如 `__lzn8f3a2b1`）。
 static NS: OnceLock<String> = OnceLock::new();
+
+/// 进程级 **DOM 面**命名空间（第 179 轮）：与窗口面 token 独立。
+///
+/// 形如 `d1a2b3c4`（字母开头，保证可作 CSS class / id 选择器），不含 `__lzn`
+/// 前缀 —— DOM 枚举与符号描述之间不再有可关联的字符串。
+static DOM_NS: OnceLock<String> = OnceLock::new();
 
 /// 取（或首取生成）本进程的注入命名空间。
 pub fn inject_ns() -> &'static str {
@@ -44,14 +187,41 @@ pub fn inject_ns() -> &'static str {
     })
 }
 
-/// 命名空间内的 window 全局名：`ns_global("GuardSuspend")` → `__lzn8f3a2b1GuardSuspend`。
-pub fn ns_global(suffix: &str) -> String {
-    format!("{}{}", inject_ns(), suffix)
+/// 取（或首取生成）本进程的 **DOM 面**命名空间（与窗口面 token 独立）。
+pub fn dom_ns() -> &'static str {
+    DOM_NS.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 17))
+            .unwrap_or(0x1d0c0de);
+        let pid = std::process::id() as u64;
+        // 字母开头：`#id` / `.class` 选择器要求首字符不能是数字。
+        format!("d{:08x}", (nanos ^ pid.wrapping_mul(0x85eb_ca6b)) & 0xffff_ffff)
+    })
 }
 
-/// 注入层 DOM 过滤属性名：`data-__lzn8f3a2b1agent`（替代固定 `data-laew-agent`）。
+/// 命名空间对象表达式（第 179 轮）：`window[Symbol.for('<ns>')]`。
+pub fn ns_object_expr() -> String {
+    format!("window[Symbol.for('{}')]", inject_ns())
+}
+
+/// 命名空间成员**读**表达式（供 Rust 侧拼 eval 字符串，零全局字符串键）。
+///
+/// `ns_member_expr("GuardSet")` → `(window[Symbol.for('<ns>')]||{}).GuardSet` ——
+/// 命名空间不存在时读到 `undefined` 而非抛错（与旧 `window.<ns>GuardSet` 同语义）。
+pub fn ns_member_expr(suffix: &str) -> String {
+    format!("(window[Symbol.for('{}')]||{{}}).{}", inject_ns(), suffix)
+}
+
+/// 命名空间对象初始化语句（供 Rust 侧拼多行脚本时使用）。
+pub fn ns_bootstrap_js() -> String {
+    let ns = inject_ns();
+    format!("window[Symbol.for('{ns}')] || (window[Symbol.for('{ns}')] = {{}});")
+}
+
+/// 注入层 DOM 过滤属性名：`data-<dom_ns>agent`（替代固定 `data-laew-agent`）。
 pub fn agent_attr() -> String {
-    format!("data-{}agent", inject_ns())
+    format!("data-{}agent", dom_ns())
 }
 
 /// 注入层 DOM 过滤选择器：`[data-__lzn8f3a2b1agent]`。
@@ -561,13 +731,17 @@ pub fn stealth_js_for(mode: crate::agent::stealth::StealthMode) -> Option<String
     // 只有 `want` 里置位的块才会被拼进脚本文本：既让脚本体积随档位最小化，也让
     // 「保真档脚本文本里根本没有原生化代码」这件事在源码层可断言（运行时闸只是
     // 兜底，不能替代「压根不装」）。
+    // 幂等闸标记挂在**符号命名空间对象**上（第 179 轮）：`window` 上不再有
+    // `<ns>StealthRev` 字符串键。`Symbol.for` 是全局符号注册表，同一页面内
+    // 各注入脚本拿到同一个 symbol；`getOwnPropertySymbols(window)` 只见 1 个。
     let head = r#"(() => {
   try {
+    var __nsObj = window[Symbol.for('%NS%')] || (window[Symbol.for('%NS%')] = {});
     var __cur = 0;
-    try { __cur = window.%NS%StealthRev || 0; } catch (e) {}
+    try { __cur = __nsObj.StealthRev || 0; } catch (e) {}
     var __need = %WANT% & ~__cur;
     if (__need === 0) return;
-    Object.defineProperty(window, '%NS%StealthRev', { value: %WANT%, configurable: true, enumerable: false });
+    Object.defineProperty(__nsObj, 'StealthRev', { value: %WANT%, configurable: true, enumerable: false });
   } catch (e) {}
 "#;
     let mut out = String::with_capacity(head.len() + 4096);
@@ -791,14 +965,26 @@ mod tests {
 
     #[test]
     fn 全局名与属性名拼接() {
-        assert_eq!(ns_global("GuardSuspend"), format!("{}GuardSuspend", inject_ns()));
-        assert_eq!(agent_attr(), format!("data-{}agent", inject_ns()));
+        // 第 179 轮:窗口面 API 走 symbol 命名空间成员,不再有 `window.<ns>Foo` 字符串键
+        assert_eq!(
+            ns_member_expr("GuardSuspend"),
+            format!("(window[Symbol.for('{}')]||{{}}).GuardSuspend", inject_ns())
+        );
+        assert_eq!(
+            ns_object_expr(),
+            format!("window[Symbol.for('{}')]", inject_ns())
+        );
+        assert!(ns_bootstrap_js().contains("Symbol.for"));
+        // DOM 面换用独立 token,且不带 `__lzn` 前缀
+        assert_eq!(agent_attr(), format!("data-{}agent", dom_ns()));
         assert_eq!(
             agent_attr_selector(),
-            format!("[data-{}agent]", inject_ns())
+            format!("[data-{}agent]", dom_ns())
         );
+        assert_ne!(dom_ns(), inject_ns(), "DOM 面与窗口面 token 必须独立");
+        assert!(!dom_ns().starts_with("__lzn"), "DOM 面不得复用窗口前缀:{}", dom_ns());
         assert!(!agent_attr().contains("laew"), "属性名不得含固定签名 laew");
-        assert!(!ns_global("X").contains("laew"));
+        assert!(!ns_member_expr("X").contains("laew"));
     }
 
     #[test]
@@ -1084,8 +1270,8 @@ mod tests {
         assert_eq!((BLOCK_CORE, BLOCK_FIDELITY, BLOCK_HARDENED), (1, 2, 4), "位必须互不相同且单");
         for m in [StealthMode::Fidelity, StealthMode::Hardened] {
             let s = stealth_js_for(m).unwrap();
-            // 读旧值 → 算缺位 → 缺位为零直接 return,再写回新值
-            assert!(s.contains("window.__lzn"), "必须读回既有标记:{s}");
+            // 读旧值 → 算缺位 → 缺位为零直接 return,再写回新值(标记挂 symbol 命名空间)
+            assert!(s.contains("Symbol.for("), "标记必须挂符号命名空间:{s}");
             assert!(s.contains("var __need ="), "必须按位算缺块:{s}");
             assert!(s.contains("if (__need === 0) return;"), "零缺块必须直接返回:{s}");
             // 每个装上的块都套一道同一位判的运行期闸
@@ -1099,13 +1285,69 @@ mod tests {
                     "保真档不得装原生化块(位闸只是兜底,文本层就该没有)"
                 );
             }
-            // 标记仍是同一个不可枚举 window 键(不因位掩码新增全局键)
+            // 标记只出现读+写两处,且**不再**是 window 字符串键
             assert_eq!(
                 s.matches("StealthRev").count(),
                 2,
-                "标记键只应出现读+写两处,不得新增全局键"
+                "标记键只应出现读+写两处"
+            );
+            assert!(
+                !s.contains(&format!("window.{}StealthRev", inject_ns())),
+                "StealthRev 不得再是 window 字符串键:{s}"
             );
         }
+    }
+
+    /// 第 179 轮核心判据:窗口面注入 API 全部收敛到**一个 symbol 命名空间**,
+    /// 渲染后不得残留任何 `window.<ns><Suffix>` 字符串键;DOM 面必须换用独立 token,
+    /// 且长后缀优先替换（`agent_frame__` 不得被 `agent` 截断）。
+    #[test]
+    fn 渲染后窗口面零字符串键且DOM面独立() {
+        let ns = inject_ns();
+        let dom = dom_ns();
+        let template = [
+            "(() => { const NS = window[Symbol.for('%NS%')] || (window[Symbol.for('%NS%')] = {});",
+            "window.%NS%GuardMode = 'locked';",
+            "if (window.%NS%GuardInputSuspended) window.%NS%GuardInputSuspend(true);",
+            "const a = document.getElementById('%NS%agent_frame__');",
+            "const b = document.querySelector('[data-%NS%agent]');",
+            "el.classList.add('%NS%locked__');",
+            "h.__%NS%sh = null;",
+            "})()",
+        ]
+        .join("\n");
+        let out = render_with(&template, ns, dom);
+        // 窗口面:全部改写为 NS.<Suffix>
+        assert!(out.contains("NS.GuardMode = 'locked';"), "{out}");
+        assert!(out.contains("NS.GuardInputSuspend(true)"), "{out}");
+        // 不得残留任何 window.<ns> 字符串键形态
+        assert!(
+            !out.contains(&format!("window.{ns}")),
+            "渲染后不得残留 window.<ns> 字符串键:{out}"
+        );
+        // DOM 面:独立 token,且 `agent_frame__` 未被 `agent` 截断
+        assert!(out.contains(&format!("'{dom}agent_frame__'")), "{out}");
+        assert!(out.contains(&format!("[data-{dom}agent]")), "{out}");
+        assert!(out.contains(&format!("'{dom}locked__'")), "{out}");
+        assert!(out.contains(&format!("__{dom}sh")), "{out}");
+        assert!(!out.contains(&format!("{ns}agent")), "DOM 面不得残留窗口 token:{out}");
+        // 符号描述本身保留(每个文档一个 symbol)
+        assert!(out.contains(&format!("Symbol.for('{ns}')")));
+    }
+
+    /// 后缀白名单排序必须长优先:`GuardSuspended` / `AutoFollowStatus` /
+    /// `AgentHighlightInstalled` 不得被它们的短前缀抢走。
+    #[test]
+    fn 后缀按长度降序匹配() {
+        let list = sorted_suffixes(NS_WINDOW_SUFFIXES);
+        let pos = |s: &str| list.iter().position(|x| *x == s).unwrap();
+        assert!(pos("GuardSuspended") < pos("GuardSuspend"));
+        assert!(pos("GuardInputSuspended") < pos("GuardInputSuspend"));
+        assert!(pos("AutoFollowStatus") < pos("AutoFollow"));
+        assert!(pos("AgentHighlightInstalled") < pos("AgentHighlight"));
+        let doms = sorted_suffixes(NS_DOM_SUFFIXES);
+        let dpos = |s: &str| doms.iter().position(|x| *x == s).unwrap();
+        assert!(dpos("agent_frame__") < dpos("agent"));
     }
 
     /// 跨档升级时新表看不见上一轮登记的函数 → 原生化必须先「重新认领」。
@@ -1279,5 +1521,21 @@ mod js_dump {
             std::fs::write(&p, js).unwrap();
             println!("wrote {p}");
         }
+        // 第 179 轮:注入面收敛后,其余四套注入脚本一并导出做 `node --check`
+        // (窗口面 API 全部改写成 `NS.<Suffix>`,语法错误只会在真机注入时才暴露)。
+        let guard = crate::agent::browser_overlay::guard_script(
+            &crate::agent::browser_overlay::PageGuardConfig::locked(),
+        );
+        std::fs::write("target/guard.js", guard).unwrap();
+        println!("wrote target/guard.js");
+        let status = crate::agent::browser_ns::render_ns(crate::agent::browser_status::AGENT_STATUS_JS_TEMPLATE);
+        std::fs::write("target/status.js", status).unwrap();
+        println!("wrote target/status.js");
+        let highlight = crate::agent::browser_ns::render_ns(crate::agent::browser::AGENT_HIGHLIGHT_JS);
+        std::fs::write("target/highlight.js", highlight).unwrap();
+        println!("wrote target/highlight.js");
+        let follow = crate::agent::browser_ns::render_ns(crate::agent::browser_follow::AUTO_FOLLOW_JS);
+        std::fs::write("target/follow.js", follow).unwrap();
+        println!("wrote target/follow.js");
     }
 }

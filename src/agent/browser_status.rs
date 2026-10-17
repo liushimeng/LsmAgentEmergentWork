@@ -38,7 +38,7 @@
 use chromiumoxide::Page;
 use serde_json::{json, Value};
 
-use crate::agent::browser_ns::{inject_ns, ns_global, render_ns};
+use crate::agent::browser_ns::{dom_ns, ns_member_expr, render_ns};
 use crate::agent::browser_overlay::PageGuardConfig;
 
 /// 屏蔽页面状态栏的 closed Shadow DOM host id（右上角；主文档 light DOM 只留
@@ -46,23 +46,23 @@ use crate::agent::browser_overlay::PageGuardConfig;
 /// 角落锚定），不再共用全屏 `inset:0` 宿主 —— 共用宿主会被页面 html/body 的
 /// `transform` 劫持 `position:fixed` 包含块，Windows 1080p 上表现为「显示不出来」。
 pub fn status_host_id() -> String {
-    format!("{}status_host__", inject_ns())
+    format!("{}status_host__", dom_ns())
 }
 
 /// 屏蔽页面进度栏的 closed Shadow DOM host id（左下角）。与 [`status_host_id`]
 /// 同构、互不相同。
 pub fn progress_host_id() -> String {
-    format!("{}progress_host__", inject_ns())
+    format!("{}progress_host__", dom_ns())
 }
 
 /// 屏蔽页面状态栏元素 id（右上角）。
 pub fn status_bar_id() -> String {
-    format!("{}guard_status__", inject_ns())
+    format!("{}guard_status__", dom_ns())
 }
 
 /// 屏蔽页面进度栏元素 id（左下角）。
 pub fn progress_bar_id() -> String {
-    format!("{}guard_progress__", inject_ns())
+    format!("{}guard_progress__", dom_ns())
 }
 
 /// 事件时间线在页面侧的保留条数（JS `MAX_EVENTS` 同步值，见下方模板；超出后
@@ -108,6 +108,8 @@ pub fn guard_text(mode: &str, scroll_watch: bool, human_unlocked: bool) -> (Stri
 /// Rust 侧只推 JSON —— **不在模板里烘焙任何文案**，保证「档位/动作/Agent」三类
 /// 信息只有一个真源（Rust 侧 `sync` / `broadcast`）。
 pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
+    // 第 179 轮:窗口面 API 收敛到一个 symbol 命名空间对象(零 window 字符串键)。
+    const NS = window[Symbol.for('%NS%')] || (window[Symbol.for('%NS%')] = {});
     // 第 171 轮:版本化单实例 —— 本脚本会被多次注入(highlight 与 guard 两条通道
     // 各注入一次,派生页/重注入再来),而事件时间线/耗时起点/显隐标志都是**闭包
     // 状态**。旧实现每次注入都新建一份闭包并覆盖 window 上的 API,后注入者把
@@ -462,13 +464,14 @@ pub const AGENT_STATUS_JS_TEMPLATE: &str = r#"(() => {
             window.%NS%StatusMO.observe(document.documentElement, { childList: true, subtree: true });
         }
     } catch (e) {}
+    // 第 179 轮:命名空间对象内部的键同样不可枚举(防止枚举 symbol 值后一眼看全)。
     try {
-        ['%NS%StatusUpdate', '%NS%StatusGuard', '%NS%StatusVisible', '%NS%StatusSuspend', '%NS%StatusEnsure', '%NS%StatusProbe', '%NS%StatusTimer', '%NS%StatusMO', '%NS%StatusRev']
+        ['StatusUpdate', 'StatusGuard', 'StatusVisible', 'StatusSuspend', 'StatusEnsure', 'StatusProbe', 'StatusTimer', 'StatusMO', 'StatusRev']
             .forEach((k) => {
-                if (window[k] !== undefined) {
-                    Object.defineProperty(window, k,
-                        { enumerable: false, configurable: true, writable: true, value: window[k] });
-                }
+                const d = Object.getOwnPropertyDescriptor(NS, k);
+                if (!d) return;
+                Object.defineProperty(NS, k,
+                    { enumerable: false, configurable: true, writable: true, value: d.value });
             });
     } catch (e) {}
     // 就绪重试:document-start 时 documentElement/body 可能皆 null(同 guard 门)
@@ -626,21 +629,16 @@ pub async fn push(
     visible: Option<(f64, f64)>,
 ) {
     let payload = build_payload(cfg, action, event, visible);
-    let js = format!(
-        "window.{} ? window.{}({}) : false",
-        ns_global("StatusUpdate"),
-        ns_global("StatusUpdate"),
-        payload
-    );
+    let update = ns_member_expr("StatusUpdate");
+    let js = format!("{update} ? {update}({}) : false", payload);
     let _ = page.evaluate(js.as_str()).await;
 }
 
 /// 显隐两条栏（`set_highlight(false)` 之外的显式开关通道，fail-open）。
 pub async fn set_visible(page: &Page, visible: bool) {
+    let api = ns_member_expr("StatusVisible");
     let js = format!(
-        "window.{} ? window.{}({}) : false",
-        ns_global("StatusVisible"),
-        ns_global("StatusVisible"),
+        "{api} ? {api}({}) : false",
         if visible { "true" } else { "false" }
     );
     let _ = page.evaluate(js.as_str()).await;
@@ -648,10 +646,9 @@ pub async fn set_visible(page: &Page, visible: bool) {
 
 /// 挂起/恢复两条栏（截图/OCR/HITL 附图「拍前隐藏 → 拍完恢复」，证据链干净）。
 pub async fn set_suspended(page: &Page, suspend: bool) {
+    let api = ns_member_expr("StatusSuspend");
     let js = format!(
-        "window.{} ? window.{}({}) : false",
-        ns_global("StatusSuspend"),
-        ns_global("StatusSuspend"),
+        "{api} ? {api}({}) : false",
         if suspend { "true" } else { "false" }
     );
     let _ = page.evaluate(js.as_str()).await;

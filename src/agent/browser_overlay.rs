@@ -61,19 +61,19 @@ use serde_json::{json, Value};
 /// `data-<ns>agent` 过滤)。第 168 轮:id 前缀随进程级随机命名空间(隐身,见
 /// `browser_ns`),由模板 `%NS%` 渲染 —— 故为函数而非常量。
 pub fn overlay_element_id() -> String {
-    format!("{}overlay__", crate::agent::browser_ns::inject_ns())
+    format!("{}overlay__", crate::agent::browser_ns::dom_ns())
 }
 
 /// 盾区容器 id(partial 档,黑名单盾罩/白名单整屏挖洞盾的父节点)。
 pub fn shields_element_id() -> String {
-    format!("{}guard_shields__", crate::agent::browser_ns::inject_ns())
+    format!("{}guard_shields__", crate::agent::browser_ns::dom_ns())
 }
 
 /// 注入 UI 的 closed Shadow DOM host id(第 169 轮)。蒙层/盾区整体住在
 /// 该 host 的影子树里(页面 JS 不可读,防风控采 innerText 拿到品牌签名),
 /// light DOM 只留这个无文本 host —— 故「视觉元素是否在场」的主文档探针查它。
 pub fn guard_ui_host_id() -> String {
-    format!("{}guard_ui__", crate::agent::browser_ns::inject_ns())
+    format!("{}guard_ui__", crate::agent::browser_ns::dom_ns())
 }
 
 /// 单侧选择器(allow/block)数量上限。
@@ -275,6 +275,8 @@ impl PageGuardConfig {
 ///   `[data-%NS%agent]` 自身节点的变更(防自激循环);
 /// - `document.body` 未就绪(极早期文档)时挂 documentElement,DOMContentLoaded 补挂。
 pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
+    // 第 179 轮:窗口面 API 收敛到一个 symbol 命名空间对象(零 window 字符串键)。
+    const NS = window[Symbol.for('%NS%')] || (window[Symbol.for('%NS%')] = {});
     const REV = {REV};
     // 第 157 轮:版本化重装 —— 同一页面多次注册脚本(重复 open / rearm 重注入)后,
     // 「先注册的脚本抢先安装、后注册的脚本被 early-return」会让旧档在导航后复活
@@ -629,15 +631,18 @@ pub const AGENT_GUARD_JS_TEMPLATE: &str = r#"(() => {
     // 根因之一是风控 JS 枚举 window 拿到 __laew* 固定签名;不可枚举后与装了
     // 用户脚本的正常浏览器同水位(puppeteer-extra-stealth 同款策略)。fail-open:
     // defineProperty 失败仅损失隐身,不影响管控功能。
+    // 第 179 轮:命名空间对象内部的键同样不可枚举(防止枚举 symbol 值后一眼看全)。
     try {
-        ['%NS%GuardRev', '%NS%GuardInstalled', '%NS%GuardMode', '%NS%GuardAllow',
-         '%NS%GuardBlock', '%NS%GuardNote', '%NS%GuardSuspended', '%NS%GuardScrollWatch',
-         '%NS%GuardInputSuspended', '%NS%GuardGateReady', '%NS%GuardInputSuspend',
-         '%NS%GuardOff', '%NS%GuardSet', '%NS%GuardSuspend', '%NS%GuardMO', '%NS%GuardRO',
-         '%NS%GuardUiProbe', '%NS%OverlaySet']
+        ['GuardRev', 'GuardInstalled', 'GuardMode', 'GuardAllow',
+         'GuardBlock', 'GuardNote', 'GuardSuspended', 'GuardScrollWatch',
+         'GuardInputSuspended', 'GuardGateReady', 'GuardInputSuspend',
+         'GuardOff', 'GuardSet', 'GuardSuspend', 'GuardMO', 'GuardRO',
+         'GuardUiProbe', 'OverlaySet']
             .forEach((k) => {
-                Object.defineProperty(window, k,
-                    { enumerable: false, configurable: true, writable: true, value: window[k] });
+                const d = Object.getOwnPropertyDescriptor(NS, k);
+                if (!d) return;
+                Object.defineProperty(NS, k,
+                    { enumerable: false, configurable: true, writable: true, value: d.value });
             });
     } catch (e) {}
 })()"#;
@@ -657,15 +662,17 @@ pub fn guard_script(cfg: &PageGuardConfig) -> String {
     let block = serde_json::to_string(&cfg.block_selectors).unwrap_or_else(|_| "[]".into());
     let note = serde_json::to_string(&cfg.note).unwrap_or_else(|_| "null".into());
     let scroll_watch = if locked_scroll_watch_enabled() { "true" } else { "false" };
-    AGENT_GUARD_JS_TEMPLATE
+    let baked = AGENT_GUARD_JS_TEMPLATE
         .replace("{REV}", &rev.to_string())
         .replace("{MODE}", &mode)
         .replace("{ALLOW}", &allow)
         .replace("{BLOCK}", &block)
         .replace("{NOTE}", &note)
-        .replace("{SCROLLWATCH}", scroll_watch)
-        // 第 168 轮：%NS% 占位符 → 进程级随机命名空间（隐身，见 browser_ns.rs）。
-        .replace(crate::agent::browser_ns::NS_TOKEN, crate::agent::browser_ns::inject_ns())
+        .replace("{SCROLLWATCH}", scroll_watch);
+    // 第 168 轮：%NS% 占位符 → 进程级随机命名空间（隐身，见 browser_ns.rs）。
+    // 第 179 轮：统一走 render_ns —— 窗口面 API 收敛到 symbol 命名空间、
+    // DOM 面换成独立 token（只做 `%NS%` 直替会留下 19 个 window 字符串键）。
+    crate::agent::browser_ns::render_ns(&baked)
 }
 
 /// `LAEW_WEB_LOCKED_SCROLL`(第 155 轮):`off/0/false/no` → 关闭 locked 档
@@ -738,8 +745,8 @@ pub async fn apply_page_guard(
     let block = serde_json::to_string(&cfg.block_selectors).unwrap_or_else(|_| "[]".into());
     let note = serde_json::to_string(&cfg.note).unwrap_or_else(|_| "null".into());
     let mode = serde_json::to_string(cfg.mode.as_str()).unwrap_or_else(|_| "\"locked\"".into());
-    let ns_set = crate::agent::browser_ns::ns_global("GuardSet");
-    let js = format!("window.{ns_set} ? window.{ns_set}({mode}, {allow}, {block}, {note}) : null");
+    let ns_set = crate::agent::browser_ns::ns_member_expr("GuardSet");
+    let js = format!("{ns_set} ? {ns_set}({mode}, {allow}, {block}, {note}) : null");
     let r = page
         .evaluate(js.as_str())
         .await
@@ -786,8 +793,8 @@ pub async fn apply_page_guard(
     let gate_ready = if locked && locked_scroll_watch_enabled() && js_applied {
         page
             .evaluate(format!(
-                "!!window.{}",
-                crate::agent::browser_ns::ns_global("GuardGateReady")
+                "!!{}",
+                crate::agent::browser_ns::ns_member_expr("GuardGateReady")
             ))
             .await
             .ok()
@@ -813,8 +820,8 @@ pub async fn apply_page_guard(
     if locked {
         let actual = page
             .evaluate(format!(
-                "window.{} || null",
-                crate::agent::browser_ns::ns_global("GuardMode")
+                "{} || null",
+                crate::agent::browser_ns::ns_member_expr("GuardMode")
             ))
             .await
             .ok()
@@ -842,9 +849,9 @@ pub async fn apply_page_guard(
 /// 闸不在场(未注入 / 杀开关关闭 / `%NS%GuardGateReady` 未置位)返回 false,
 /// 调用方(`guard_ctl::guard_lift_for_input`)据此回退 CDP 解锁路径。
 pub async fn gate_suspend_input(page: &Page, suspend: bool) -> bool {
-    let ready = crate::agent::browser_ns::ns_global("GuardGateReady");
-    let suspend_fn = crate::agent::browser_ns::ns_global("GuardInputSuspend");
-    let js = format!("window.{ready} ? window.{suspend_fn}({suspend}) : null");
+    let ready = crate::agent::browser_ns::ns_member_expr("GuardGateReady");
+    let suspend_fn = crate::agent::browser_ns::ns_member_expr("GuardInputSuspend");
+    let js = format!("{ready} ? {suspend_fn}({suspend}) : null");
     match page.evaluate(js.as_str()).await {
         Ok(r) => !r.value().map(|v| v.is_null()).unwrap_or(true),
         Err(_) => false,
@@ -857,8 +864,8 @@ pub async fn gate_suspend_input(page: &Page, suspend: bool) -> bool {
 /// partial 下 Agent 输入动作「先隐盾后复盾」;不关心 CDP 的纯视觉场景。
 /// 返回是否实际应用(未注入脚本 = false)。
 pub async fn guard_suspend_visuals(page: &Page, hide: bool) -> bool {
-    let ns_suspend = crate::agent::browser_ns::ns_global("GuardSuspend");
-    let js = format!("window.{ns_suspend} ? window.{ns_suspend}({hide}) : null");
+    let ns_suspend = crate::agent::browser_ns::ns_member_expr("GuardSuspend");
+    let js = format!("{ns_suspend} ? {ns_suspend}({hide}) : null");
     let applied = match page.evaluate(js.as_str()).await {
         Ok(r) => !r.value().map(|v| v.is_null()).unwrap_or(true),
         Err(_) => false,
@@ -939,7 +946,7 @@ pub fn action_needs_overlay_reassert(action: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::browser_ns::inject_ns;
+    use crate::agent::browser_ns::dom_ns;
 
     /// 环境变量类测试互斥(browser_mode.rs 同款,防并行 set_var 互踩)。
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1069,23 +1076,23 @@ mod tests {
         let mut cfg = PageGuardConfig::partial(vec![".login-box".into()], vec![]);
         cfg.note = Some("请登录后应答弹窗".into());
         let js = guard_script(&cfg);
-        assert!(js.contains(&format!("window.{}GuardMode = \"partial\";", inject_ns())), "{js}");
-        assert!(js.contains(&format!("window.{}GuardAllow = [\".login-box\"];", inject_ns())), "{js}");
-        assert!(js.contains(&format!("window.{}GuardBlock = [];", inject_ns())), "{js}");
+        assert!(js.contains(&format!("NS.GuardMode = \"partial\";")), "{js}");
+        assert!(js.contains(&format!("NS.GuardAllow = [\".login-box\"];")), "{js}");
+        assert!(js.contains(&format!("NS.GuardBlock = [];")), "{js}");
         assert!(
-            js.contains(&format!("window.{}GuardNote = \"请登录后应答弹窗\";", inject_ns())),
+            js.contains(&format!("NS.GuardNote = \"请登录后应答弹窗\";")),
             "{js}"
         );
         // 第 155 轮:滚动观看开关烘焙(缺省开启)
-        assert!(js.contains(&format!("window.{}GuardScrollWatch = true;", inject_ns())), "{js}");
+        assert!(js.contains(&format!("NS.GuardScrollWatch = true;")), "{js}");
         // 占位符全部被烘焙
         for ph in ["{MODE}", "{ALLOW}", "{BLOCK}", "{NOTE}", "{SCROLLWATCH}", "{REV}"] {
             assert!(!js.contains(ph), "占位符 {ph} 未烘焙");
         }
         // locked 缺省烘焙
         let js2 = guard_script(&PageGuardConfig::locked());
-        assert!(js2.contains(&format!("window.{}GuardMode = \"locked\";", inject_ns())));
-        assert!(js2.contains(&format!("window.{}GuardNote = null;", inject_ns())));
+        assert!(js2.contains(&format!("NS.GuardMode = \"locked\";")));
+        assert!(js2.contains(&format!("NS.GuardNote = null;")));
     }
 
     // =================== 第 155 轮:locked 档 DOM 输入闸(可滚动观看) ===================
@@ -1123,9 +1130,9 @@ mod tests {
             std::env::remove_var("LAEW_WEB_LOCKED_SCROLL");
         }
         let on = guard_script(&PageGuardConfig::locked());
-        assert!(on.contains(&format!("window.{}GuardScrollWatch = true;", inject_ns())), "{on}");
-        assert!(on.contains(&format!("window.{}GuardGateReady = true;", inject_ns())), "{on}");
-        assert!(on.contains(&format!("window.{}GuardInputSuspend", inject_ns())), "{on}");
+        assert!(on.contains(&format!("NS.GuardScrollWatch = true;")), "{on}");
+        assert!(on.contains(&format!("NS.GuardGateReady = true;")), "{on}");
+        assert!(on.contains(&format!("NS.GuardInputSuspend")), "{on}");
         // isTrusted 判据:页面自合成事件(isTrusted=false)必须放行
         assert!(on.contains("if (!e.isTrusted) return;"), "{on}");
         // 拦截清单含交互事件,不含滚动/移动通路(断言收窄到 GATE_EVTS 数组段,
@@ -1153,9 +1160,9 @@ mod tests {
         // 杀开关关闭:烘焙 false → 闸安装 if 块为死代码(运行时不注册监听,
         // %NS%GuardGateReady 保持 false → apply_page_guard 探测失败回退 CDP)。
         // 模板是静态文本,if 块源码仍在,只能断言烘焙结果本身。
-        assert!(off.contains(&format!("window.{}GuardScrollWatch = false;", inject_ns())), "{off}");
+        assert!(off.contains(&format!("NS.GuardScrollWatch = false;")), "{off}");
         assert!(
-            off.contains(&format!("if (window.{}GuardScrollWatch) {{", inject_ns())),
+            off.contains(&format!("if (NS.GuardScrollWatch) {{")),
             "闸安装必须以烘焙开关为门(不得无条件安装):{off}"
         );
         unsafe {
@@ -1177,12 +1184,12 @@ mod tests {
         let js = guard_script(&PageGuardConfig::locked());
         assert!(js.contains(&overlay_element_id()), "蒙层元素 id 应出现在脚本中");
         assert!(js.contains(&shields_element_id()), "盾区容器 id 应出现在脚本中");
-        assert!(js.contains(&format!("data-{}agent", inject_ns())));
+        assert!(js.contains(&format!("data-{}agent", dom_ns())));
         assert!(js.contains("z-index:2147483646"), "蒙层 z-index");
         assert!(js.contains("z-index:2147483645"), "盾区 z-index 恰低一档");
-        assert!(js.contains(&format!("window.{}GuardSet", inject_ns())));
-        assert!(js.contains(&format!("window.{}GuardSuspend", inject_ns())));
-        assert!(js.contains(&format!("window.{}OverlaySet", inject_ns())), "第 141 轮 legacy 别名保留");
+        assert!(js.contains(&format!("NS.GuardSet")));
+        assert!(js.contains(&format!("NS.GuardSuspend")));
+        assert!(js.contains(&format!("NS.OverlaySet")), "第 141 轮 legacy 别名保留");
         assert!(
             !js.contains("overlay_hint__"),
             "左下角静态状态条已迁至 browser_status(第 171 轮),脚本内不得残留"
@@ -1212,12 +1219,12 @@ mod tests {
         assert!(js.contains("cursor:not-allowed !important"), "锁定态应有 not-allowed 光标");
         assert!(js.contains("user-select:none !important"), "锁定态应禁选");
         assert!(js.contains("-webkit-user-select:none !important"), "WebKit 前缀禁选");
-        assert!(js.contains(&format!("{}locked__", inject_ns())), "锁定 class 标记");
-        assert!(js.contains(&format!("STYLE_ID = '{}guard_style__'", inject_ns())), "锁定样式元素 id");
+        assert!(js.contains(&format!("{}locked__", dom_ns())), "锁定 class 标记");
+        assert!(js.contains(&format!("STYLE_ID = '{}guard_style__'", dom_ns())), "锁定样式元素 id");
         assert!(js.contains("applyLockCss"), "CSS 锁应有统一应用函数");
         // CSS 锁与输入闸挂起联动(Agent 输入动作期间同步放开,需求 2)
         let suspend_seg = js
-            .split(&format!("window.{}GuardInputSuspend = (s) =>", inject_ns()))
+            .split(&format!("NS.GuardInputSuspend = (s) =>"))
             .nth(1)
             .unwrap_or_default()
             .split("return true;")
@@ -1243,11 +1250,11 @@ mod tests {
         );
         // 卸载钩子清理 CSS 锁(防旧 class/style 泄漏到新实例)
         let off_seg = js
-            .split(&format!("window.{}GuardOff = () =>", inject_ns()))
+            .split(&format!("NS.GuardOff = () =>"))
             .nth(1)
             .unwrap_or_default();
         assert!(off_seg.contains("STYLE_ID"), "卸载应移除锁定样式:{off_seg}");
-        assert!(off_seg.contains(&format!("{}locked__", inject_ns())), "卸载应移除锁定 class:{off_seg}");
+        assert!(off_seg.contains(&format!("{}locked__", dom_ns())), "卸载应移除锁定 class:{off_seg}");
         // 蒙层纯视觉:蒙层本身 pointer-events:none;盾罩 pointer-events:auto
         let mask_seg = js
             .split("if (!el(MASK_ID))")
@@ -1451,7 +1458,7 @@ mod tests {
         let mask_probe = page
             .evaluate(
                 crate::agent::browser_ns::render_ns(
-                    "(function(){const p = window.%NS%GuardUiProbe && window.%NS%GuardUiProbe(); \
+                    "(function(){const p = (window[Symbol.for('%NS%')]||{}).GuardUiProbe && (window[Symbol.for('%NS%')]||{}).GuardUiProbe(); \
                  return !!(p && p.mask && p.hint && p.shields);})()",
                 ),
             )
@@ -1488,7 +1495,7 @@ mod tests {
         //     页面自合成点击(isTrusted=false,eval_js 驱动)始终放行(Agent
         //     能力面与 CDP 拦截等价);wheel 不在拦截清单(人工滚动通路)。
         let gate_probe = page
-            .evaluate(crate::agent::browser_ns::render_ns("!!window.%NS%GuardGateReady && !!window.%NS%GuardInputSuspend"))
+            .evaluate(crate::agent::browser_ns::render_ns("!!(window[Symbol.for('%NS%')]||{}).GuardGateReady && !!(window[Symbol.for('%NS%')]||{}).GuardInputSuspend"))
             .await
             .ok()
             .and_then(|r| r.value().cloned())
@@ -1531,7 +1538,7 @@ mod tests {
         // ③ 蒙层隐藏/恢复(截图避让通道)
         assert!(mask_set_visible(&page, false).await, "蒙层隐藏应实际应用");
         let hidden = page
-            .evaluate(crate::agent::browser_ns::render_ns("(window.%NS%GuardUiProbe()||{}).mask_display"))
+            .evaluate(crate::agent::browser_ns::render_ns("((window[Symbol.for('%NS%')]||{}).GuardUiProbe()||{}).mask_display"))
             .await
             .ok()
             .and_then(|r| r.value().cloned())
@@ -1549,7 +1556,7 @@ mod tests {
         let shields = page
             .evaluate(
                 crate::agent::browser_ns::render_ns(
-                    "(function(){const p = window.%NS%GuardUiProbe && window.%NS%GuardUiProbe(); \
+                    "(function(){const p = (window[Symbol.for('%NS%')]||{}).GuardUiProbe && (window[Symbol.for('%NS%')]||{}).GuardUiProbe(); \
                  return p ? p.shields_display + '/' + p.shields_count : 'missing';})()",
                 ),
             )
@@ -1614,7 +1621,7 @@ mod tests {
         let after_nav = page
             .evaluate(
                 crate::agent::browser_ns::render_ns(
-                    "JSON.stringify((function(){const p = window.%NS%GuardUiProbe && window.%NS%GuardUiProbe(); \
+                    "JSON.stringify((function(){const p = (window[Symbol.for('%NS%')]||{}).GuardUiProbe && (window[Symbol.for('%NS%')]||{}).GuardUiProbe(); \
                  return {mask: !!(p && p.mask), hint: !!(p && p.hint), \
                  frame: !!document.getElementById('%NS%agent_frame__'), \
                  shields: !!(p && p.shields)};})())",

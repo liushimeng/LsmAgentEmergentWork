@@ -293,6 +293,8 @@ impl AdoptOutcome {
 /// 同屏出现两处同款品牌角标只会让人工分不清哪个是「身份」、哪个是「说明」,故此处
 /// 只留蓝框(窗口归属的纯视觉标识),文字交给状态栏。
 pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
+    // 第 179 轮:窗口面 API 收敛到一个 symbol 命名空间对象,`window` 上零字符串键。
+    const NS = window[Symbol.for('%NS%')] || (window[Symbol.for('%NS%')] = {});
     // 第 163 轮:早退门加 DOM 校验 —— 旧写法只在**抛异常之前**置
     // `%NS%AgentHighlightInstalled = true`,而 document-start 时 body/documentElement
     // 可能都 null,ensure() 抛异常后标志却是「已装」,后续任何补挂重试都被这道门挡住,
@@ -329,12 +331,14 @@ pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
         window.addEventListener('load', boot, { once: true });
     }
     boot();
-    // 第 168 轮:隐身收敛 —— 高亮 API 入口不可枚举(与 guard 同款,见 browser_ns.rs)。
+    // 第 179 轮:命名空间对象内部的键同样不可枚举(防止枚举 symbol 值后一眼看全)。
     try {
-        ['%NS%AgentHighlightInstalled', '%NS%AgentHighlight', '%NS%AgentApplyHighlight']
+        ['AgentHighlightInstalled', 'AgentHighlight', 'AgentApplyHighlight']
             .forEach((k) => {
-                Object.defineProperty(window, k,
-                    { enumerable: false, configurable: true, writable: true, value: window[k] });
+                const d = Object.getOwnPropertyDescriptor(NS, k);
+                if (!d) return;
+                Object.defineProperty(NS, k,
+                    { enumerable: false, configurable: true, writable: true, value: d.value });
             });
     } catch (e) {}
 })()"#;
@@ -1940,8 +1944,8 @@ impl BrowserManager {
             let mut inner = self.inner.lock().await;
             inner.highlight = enabled;
         }
-        let ns = super::browser_ns::ns_global("AgentApplyHighlight");
-        let js = format!("window.{ns} ? window.{ns}({enabled}) : null");
+        let ns = super::browser_ns::ns_member_expr("AgentApplyHighlight");
+        let js = format!("{ns} ? {ns}({enabled}) : null");
         let r = page
             .evaluate(js)
             .await

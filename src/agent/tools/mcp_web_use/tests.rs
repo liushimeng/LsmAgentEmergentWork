@@ -299,9 +299,10 @@ fn guard_script_rev_monotonic_and_off_hook() {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .expect("REV 应烘焙为数字");
     assert!(rev_b > rev_a, "两次生成 REV 应单调递增:{rev_a} vs {rev_b}");
-    // 第 168 轮:全局名随进程级命名空间(见 browser_ns.rs),断言用真实渲染名。
-    let off = format!("window.{}GuardOff = () =>", crate::agent::browser_ns::ns_global(""));
-    let rev = format!("window.{}GuardRev >= REV", crate::agent::browser_ns::ns_global(""));
+    // 第 179 轮:窗口面 API 收敛到 symbol 命名空间对象(见 browser_ns.rs),
+    // 断言用真实的 `NS.<Suffix>` 渲染形态。
+    let off = "NS.GuardOff = () =>".to_string();
+    let rev = "NS.GuardRev >= REV".to_string();
     assert!(a.contains(&off), "卸载钩子缺失");
     assert!(a.contains(&rev), "版本比较缺失");
     assert!(!a.contains("{REV}"), "REV 占位符未烘焙");
@@ -3313,4 +3314,30 @@ fn eval_err_下钻js异常文本与脚本摘录() {
         format_eval_err(&other, script),
         "Received no response from the chromium instance."
     );
+}
+
+#[cfg(test)]
+mod js_dump {
+    /// 第 179 轮:可见文本读取脚本(挂在 symbol 命名空间上)导出做 `node --check`。
+    /// `cargo test --lib 导出可见文本脚本 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn 导出可见文本脚本供语法复核() {
+        let js = crate::agent::browser_ns::render_ns(super::inspect::VISIBLE_TEXT_FN_JS);
+        std::fs::write("target/visible_text_fn.js", &js).unwrap();
+        println!("wrote target/visible_text_fn.js");
+    }
+
+    /// 渲染后的可见文本脚本必须已把窗口 API 收敛到命名空间对象。
+    #[test]
+    fn 可见文本脚本挂符号命名空间() {
+        let js = crate::agent::browser_ns::render_ns(super::inspect::VISIBLE_TEXT_FN_JS);
+        assert!(!js.contains("%NS%"), "占位符应全部渲染");
+        assert!(js.contains("Object.defineProperty(NS, 'BodyVisibleText'"));
+        assert!(js.contains("Symbol.for("));
+        assert!(
+            !js.contains(&format!("window.{}BodyVisibleText", crate::agent::browser_ns::inject_ns())),
+            "不得再落成 window 字符串键"
+        );
+    }
 }

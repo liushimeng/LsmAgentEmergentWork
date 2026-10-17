@@ -102,24 +102,35 @@ const BLOCKER_PATTERNS: &[(&str, &[&str], &str)] = &[
 /// QC 判 fail)。活 body 的 `innerText` 由浏览器按渲染结果过滤,隐藏子树
 /// 自动排除;摘除/放回在同一同步任务内完成,页面无渲染间隙,节点事件与
 /// 相对顺序全部保留(先正序摘除、后逆序放回,兄弟节点原位引用不失效)。
-pub(super) const VISIBLE_TEXT_FN_JS: &str = r#"function %NS%BodyVisibleText() {
-    if (!document.body) return '';
-    const stripped = [];
-    for (const e of Array.from(document.body.querySelectorAll('[data-%NS%agent]'))) {
-        if (e.parentNode) stripped.push([e.parentNode, e.nextSibling, e]);
-    }
-    for (const [parent, , e] of stripped) parent.removeChild(e);
-    let text = '';
-    try {
-        text = (document.body.innerText || '').slice(0, 20000);
-    } finally {
-        for (let i = stripped.length - 1; i >= 0; i--) {
-            const [parent, next, e] = stripped[i];
-            parent.insertBefore(e, next);
+pub(super) const VISIBLE_TEXT_FN_JS: &str = r#"(function () {
+    // 第 179 轮:函数挂到 symbol 命名空间对象上 —— 旧实现是顶层
+    // `function %NS%BodyVisibleText()` 声明,在经典脚本里会**落成 window 字符串键**
+    // (注入面收敛的漏网项)。
+    const NS = window[Symbol.for('%NS%')] || (window[Symbol.for('%NS%')] = {});
+    // 键也做成不可枚举(枚举 symbol 值后 `Object.keys` 看不到注入面)。
+    Object.defineProperty(NS, 'BodyVisibleText', {
+      configurable: true, writable: true, enumerable: false,
+      value: function BodyVisibleText() {
+        if (!document.body) return '';
+        const stripped = [];
+        // DOM 面属性用独立 token(见 browser_ns::dom_ns),不随窗口命名空间。
+        for (const e of Array.from(document.body.querySelectorAll('[data-%NS%agent]'))) {
+            if (e.parentNode) stripped.push([e.parentNode, e.nextSibling, e]);
         }
-    }
-    return text;
-}"#;
+        for (const [parent, , e] of stripped) parent.removeChild(e);
+        let text = '';
+        try {
+            text = (document.body.innerText || '').slice(0, 20000);
+        } finally {
+            for (let i = stripped.length - 1; i >= 0; i--) {
+                const [parent, next, e] = stripped[i];
+                parent.insertBefore(e, next);
+            }
+        }
+        return text;
+      }
+    });
+})();"#;
 
 /// 读页面可见全文:Agent 高亮徽标文本(「LAEW Agent 控制中」)不参与阻断判定,
 /// 同时**只收可见文本**(隐藏 DOM 残留文案不进来,见 [`VISIBLE_TEXT_FN_JS`])。
@@ -132,7 +143,7 @@ pub(super) async fn body_text_without_agent_nodes(
         &format!(
             "{}{}",
             VISIBLE_TEXT_FN_JS,
-            r#"(() => { try { return %NS%BodyVisibleText(); } catch(e) { return ''; } })()"#
+            r#"(() => { try { const NS = window[Symbol.for('%NS%')] || {}; return NS.BodyVisibleText(); } catch(e) { return ''; } })()"#
         ),
     )
     .await

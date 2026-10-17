@@ -265,11 +265,12 @@ async fn stealth_plugin_backfill_real_machine_diff_smoke() {
     );
 
     // ② 强制触发回填:置空 → 清幂等闸 → 注入保真档脚本文本
-    let ns_rev = lsm_agent::agent::browser_ns::ns_global("StealthRev");
+    // 第 179 轮:幂等闸标记挂在符号命名空间对象上(不再是 window 字符串键)。
+    let ns = lsm_agent::agent::browser_ns::inject_ns();
     let force = format!(
         "(() => {{ Object.defineProperty(Navigator.prototype, 'plugins', {{ get: () => [], configurable: true }});\
           Object.defineProperty(Navigator.prototype, 'mimeTypes', {{ get: () => [], configurable: true }});\
-          try {{ delete window['{ns_rev}']; }} catch (e) {{}}\
+          try {{ const NS = window[Symbol.for('{ns}')]; if (NS) delete NS.StealthRev; }} catch (e) {{}}\
           return JSON.stringify({{ len: navigator.plugins.length, mlen: navigator.mimeTypes.length }}); }})()"
     );
     let forced: Value = serde_json::from_str(&eval(force).await).unwrap_or(Value::Null);

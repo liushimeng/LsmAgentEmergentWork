@@ -436,8 +436,8 @@ pub(super) fn spawn_unlock_reassert(
                 }
                 let installed = page
                     .evaluate(format!(
-                        "!!(window.{})",
-                        crate::agent::browser_ns::ns_global("GuardSet")
+                        "!!({})",
+                        crate::agent::browser_ns::ns_member_expr("GuardSet")
                     ))
                     .await
                     .ok()
@@ -471,6 +471,7 @@ pub(super) async fn page_guard_snapshot(
 ) -> Option<crate::agent::browser_overlay::PageGuardConfig> {
     const JS_TEMPLATE: &str = r#"(() => {
   try {
+    const NS = window[Symbol.for('%NS%')] || {};
     const m = window.%NS%GuardMode;
     if (typeof m !== 'string' || !m) return null;
     return JSON.stringify({
